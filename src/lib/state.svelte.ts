@@ -13,6 +13,9 @@ import {
 } from './protocol';
 import { fingerprint, fingerprintEquals, type ContentFingerprint } from './util/hash';
 import { fileKindFor, type FileKind } from './util/fileKind';
+import { isMarkdownPath } from './util/markdown';
+
+export type MarkdownView = 'source' | 'preview';
 
 export type { SplitSide } from './protocol';
 
@@ -70,6 +73,13 @@ class WorkspaceState {
 	// is treated as immutable for reactivity — replace the whole thing
 	// on update, never mutate in place.
 	editorConfigs = $state<Map<string, EditorConfig>>(new Map());
+
+	// Source vs. rendered Preview, scoped to the buffer (not the pane:
+	// each path gets one mode shared across panes — same as the buffer
+	// itself). Markdown files default to Preview, every other path to
+	// Source. Not persisted: `previewMode` is a UI affordance, not part
+	// of the file or session.
+	private previewModes = $state<Map<string, MarkdownView>>(new Map());
 
 	// Monotonic counter the active editor view watches to refocus itself.
 	// Bumped whenever the user "navigates" to a file (tab click, tree click,
@@ -289,6 +299,32 @@ class WorkspaceState {
 		return this.editorConfigs.get(path) ?? defaultEditorConfig;
 	}
 
+	previewModeFor(path: string): MarkdownView {
+		const stored = this.previewModes.get(path);
+		if (stored) {
+			return stored;
+		}
+		// Default markdown buffers to Preview (Cursor convention); every
+		// other path renders Source. Non-markdown paths never see the
+		// toggle, so the default for them is academic — pick Source so
+		// flipping the toggle on by mistake does the safer thing.
+		return isMarkdownPath(path) ? 'preview' : 'source';
+	}
+
+	setPreviewMode(path: string, mode: MarkdownView) {
+		const current = this.previewModeFor(path);
+		if (current === mode) {
+			return;
+		}
+		const next = new Map(this.previewModes);
+		next.set(path, mode);
+		this.previewModes = next;
+	}
+
+	togglePreviewMode(path: string) {
+		this.setPreviewMode(path, this.previewModeFor(path) === 'preview' ? 'source' : 'preview');
+	}
+
 	/**
 	 * Fetch the resolved `.editorconfig` for `path` and stash it. Idempotent
 	 * after the first successful call (the server caches per directory, but
@@ -402,6 +438,11 @@ class WorkspaceState {
 		// entry would short-circuit the load).
 		if (!this.leftTabs.includes(path) && !this.rightTabs.includes(path)) {
 			this.openFiles = this.openFiles.filter((f) => f.path !== path);
+			if (this.previewModes.has(path)) {
+				const next = new Map(this.previewModes);
+				next.delete(path);
+				this.previewModes = next;
+			}
 		}
 
 		if (fallback !== null) {
@@ -504,6 +545,18 @@ class WorkspaceState {
 		this.focusedSide = 'left';
 		if (dropped.length > 0) {
 			this.openFiles = this.openFiles.filter((f) => !dropped.includes(f.path));
+			let modes: Map<string, MarkdownView> | null = null;
+			for (const path of dropped) {
+				if (this.previewModes.has(path)) {
+					if (!modes) {
+						modes = new Map(this.previewModes);
+					}
+					modes.delete(path);
+				}
+			}
+			if (modes) {
+				this.previewModes = modes;
+			}
 		}
 		this.persistAppState();
 	}

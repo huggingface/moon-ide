@@ -2,6 +2,7 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { workspace } from './state.svelte';
 import { ipc } from './ipc';
 import { formatError, type FileSearchResult, type ContentSearchHit } from './protocol';
+import { isMarkdownPath } from './util/markdown';
 
 export type Command = {
 	id: string;
@@ -12,6 +13,13 @@ export type Command = {
 	 */
 	title: string | (() => string);
 	shortcut?: string;
+	/**
+	 * When set, the command is hidden from the palette unless it returns
+	 * true. Use for commands that only make sense in a particular
+	 * context (e.g. "Toggle Markdown Preview" needs an active markdown
+	 * tab). Same cheap-read rule as `title` — called once per filter.
+	 */
+	visible?: () => boolean;
 	run: () => void | Promise<void>;
 };
 
@@ -108,14 +116,41 @@ export const builtInCommands: Command[] = [
 		title: () => (workspace.theme === 'dark' ? 'Switch to Light Theme' : 'Switch to Dark Theme'),
 		run: () => workspace.toggleTheme(),
 	},
+	{
+		id: 'markdown.togglePreview',
+		// Label flips with the current mode for the active path so the
+		// palette doubles as a status indicator. Only visible when the
+		// active tab is a markdown file — for every other path, the
+		// toggle button at the right end of the tab strip wouldn't be
+		// shown either, so the command shouldn't be reachable.
+		title: () => {
+			const path = workspace.activePath;
+			if (path !== null && workspace.previewModeFor(path) === 'preview') {
+				return 'Markdown: Show Source';
+			}
+			return 'Markdown: Show Preview';
+		},
+		visible: () => {
+			const path = workspace.activePath;
+			return path !== null && isMarkdownPath(path);
+		},
+		run: () => {
+			const path = workspace.activePath;
+			if (path === null) {
+				return;
+			}
+			workspace.togglePreviewMode(path);
+		},
+	},
 ];
 
 export function filterCommands(query: string): Command[] {
+	const visible = builtInCommands.filter((c) => (c.visible ? c.visible() : true));
 	const q = query.trim().toLowerCase();
 	if (!q) {
-		return builtInCommands;
+		return visible;
 	}
-	return builtInCommands
+	return visible
 		.map((c) => ({ c, score: scoreString(commandTitle(c).toLowerCase(), q) }))
 		.filter((x) => x.score > 0)
 		.toSorted((a, b) => b.score - a.score)

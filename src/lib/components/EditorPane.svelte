@@ -2,9 +2,11 @@
 	import EditorTabs from './EditorTabs.svelte';
 	import Editor from './Editor.svelte';
 	import ImageView from './ImageView.svelte';
+	import MarkdownView from './MarkdownView.svelte';
 	import Welcome from './Welcome.svelte';
 	import { open } from '@tauri-apps/plugin-dialog';
 	import { workspace, type SplitSide } from '../state.svelte';
+	import { isMarkdownPath } from '../util/markdown';
 
 	type Props = { side: SplitSide };
 	let { side }: Props = $props();
@@ -17,6 +19,12 @@
 		return workspace.openFiles.find((f) => f.path === activePath) ?? null;
 	});
 	const focused = $derived(workspace.focusedSide === side);
+	const showMarkdownPreview = $derived(
+		activeFile !== null &&
+			activeFile.kind === 'text' &&
+			isMarkdownPath(activeFile.path) &&
+			workspace.previewModeFor(activeFile.path) === 'preview',
+	);
 
 	async function pickFolder() {
 		const selected = await open({ directory: true, multiple: false });
@@ -36,6 +44,8 @@
 	<div class="body">
 		{#if activeFile?.kind === 'image'}
 			<ImageView file={activeFile} />
+		{:else if activeFile && showMarkdownPreview}
+			<MarkdownView file={activeFile} />
 		{:else if activeFile}
 			<Editor file={activeFile} {side} />
 		{:else}

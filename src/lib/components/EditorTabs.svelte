@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { workspace, type OpenFile, type SplitSide } from '../state.svelte';
+	import { workspace, type MarkdownView, type OpenFile, type SplitSide } from '../state.svelte';
+	import { isMarkdownPath } from '../util/markdown';
 
 	type Props = { side: SplitSide };
 	let { side }: Props = $props();
@@ -20,6 +21,18 @@
 			return file ? [file] : [];
 		}),
 	);
+	// Source/Preview switcher only shows up for the active markdown
+	// tab. Per-buffer (not per-pane), see `WorkspaceState.previewModeFor`
+	// for the rationale.
+	const activeIsMarkdown = $derived(activePath !== null && isMarkdownPath(activePath));
+	const previewMode: MarkdownView = $derived(activePath !== null ? workspace.previewModeFor(activePath) : 'source');
+
+	function setPreview(mode: MarkdownView) {
+		if (activePath === null) {
+			return;
+		}
+		workspace.setPreviewMode(activePath, mode);
+	}
 
 	// MIME type used to identify our own tab drags. Drag-between-panes
 	// is intentionally not supported yet — we tag the side onto the
@@ -160,55 +173,85 @@
 	to satisfy svelte-check now that the strip carries `ondragover`/
 	`ondrop` (which classify it as interactive).
 -->
-<div
-	class="tabs"
-	class:drop-end={dropAtEnd}
-	role="tablist"
-	tabindex="-1"
-	ondragover={onStripDragOver}
-	ondrop={onDrop}
-	ondragleave={() => {
-		dropBeforePath = null;
-		dropAtEnd = false;
-	}}
->
-	{#each tabs as file (file.path)}
-		<div
-			role="tab"
-			class="tab"
-			class:active={activePath === file.path}
-			class:active-blurred={activePath === file.path && !paneFocused}
-			class:dragging={draggingPath === file.path}
-			class:drop-before={dropBeforePath === file.path}
-			aria-selected={activePath === file.path}
-			title={file.path}
-			tabindex="0"
-			draggable="true"
-			onclick={() => workspace.setActive(file.path, side)}
-			onkeydown={(e) => onTabKey(e, file.path)}
-			ondragstart={(e) => onTabDragStart(e, file.path)}
-			ondragover={(e) => onTabDragOver(e, file.path)}
-			ondragend={onDragEnd}
-		>
-			<span class="name">{file.name}</span>
-			{#if file.isDirty}
-				<span class="dirty" aria-label="unsaved changes">●</span>
-			{/if}
-			<button type="button" class="close" aria-label="Close tab" onclick={(e) => close(e, file.path)}>×</button>
+<div class="strip">
+	<div
+		class="tabs"
+		class:drop-end={dropAtEnd}
+		role="tablist"
+		tabindex="-1"
+		ondragover={onStripDragOver}
+		ondrop={onDrop}
+		ondragleave={() => {
+			dropBeforePath = null;
+			dropAtEnd = false;
+		}}
+	>
+		{#each tabs as file (file.path)}
+			<div
+				role="tab"
+				class="tab"
+				class:active={activePath === file.path}
+				class:active-blurred={activePath === file.path && !paneFocused}
+				class:dragging={draggingPath === file.path}
+				class:drop-before={dropBeforePath === file.path}
+				aria-selected={activePath === file.path}
+				title={file.path}
+				tabindex="0"
+				draggable="true"
+				onclick={() => workspace.setActive(file.path, side)}
+				onkeydown={(e) => onTabKey(e, file.path)}
+				ondragstart={(e) => onTabDragStart(e, file.path)}
+				ondragover={(e) => onTabDragOver(e, file.path)}
+				ondragend={onDragEnd}
+			>
+				<span class="name">{file.name}</span>
+				{#if file.isDirty}
+					<span class="dirty" aria-label="unsaved changes">●</span>
+				{/if}
+				<button type="button" class="close" aria-label="Close tab" onclick={(e) => close(e, file.path)}>×</button>
+			</div>
+		{/each}
+	</div>
+	{#if activeIsMarkdown}
+		<div class="view-toggle" role="group" aria-label="Markdown view">
+			<button
+				type="button"
+				class="view-btn"
+				class:selected={previewMode === 'source'}
+				aria-pressed={previewMode === 'source'}
+				onclick={() => setPreview('source')}
+			>
+				Source
+			</button>
+			<button
+				type="button"
+				class="view-btn"
+				class:selected={previewMode === 'preview'}
+				aria-pressed={previewMode === 'preview'}
+				onclick={() => setPreview('preview')}
+			>
+				Preview
+			</button>
 		</div>
-	{/each}
+	{/if}
 </div>
 
 <style>
-	.tabs {
+	.strip {
 		display: flex;
 		align-items: stretch;
 		height: 32px;
 		background: var(--m-bg-1);
 		border-bottom: 1px solid var(--m-border);
+		flex-shrink: 0;
+	}
+	.tabs {
+		display: flex;
+		align-items: stretch;
+		flex: 1;
+		min-width: 0;
 		overflow-x: auto;
 		overflow-y: hidden;
-		flex-shrink: 0;
 		position: relative;
 		/* Hide the scrollbar entirely. The native (GTK/WebKit2) bar grew
 		on hover and stole the tab's bottom 4px every time the cursor
@@ -304,5 +347,39 @@
 	.close:hover {
 		background: var(--m-bg-3);
 		color: var(--m-fg);
+	}
+	/* Source/Preview toggle, anchored to the right end of the tab
+	strip whenever the active tab is markdown. Pure UI affordance; the
+	state lives on the buffer (per-path), so the same file in two
+	panes shows the same mode. */
+	.view-toggle {
+		display: flex;
+		align-items: center;
+		gap: 2px;
+		padding: 4px 8px;
+		flex-shrink: 0;
+		border-left: 1px solid var(--m-border);
+	}
+	.view-btn {
+		font-family: var(--m-font-ui);
+		font-size: 11px;
+		font-weight: 500;
+		color: var(--m-fg-muted);
+		background: transparent;
+		border: 1px solid transparent;
+		border-radius: 3px;
+		padding: 2px 8px;
+		cursor: pointer;
+		user-select: none;
+		-webkit-user-select: none;
+	}
+	.view-btn:hover {
+		color: var(--m-fg);
+		background: var(--m-bg-overlay);
+	}
+	.view-btn.selected {
+		color: var(--m-fg);
+		background: var(--m-bg-3);
+		border-color: var(--m-border);
 	}
 </style>
