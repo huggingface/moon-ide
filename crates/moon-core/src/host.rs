@@ -20,6 +20,20 @@ pub trait WorkspaceHost: Send + Sync {
 	async fn write_file(&self, path: &Utf8Path, text: &str) -> MoonResult<WriteFileResult>;
 	async fn stat(&self, path: &Utf8Path) -> MoonResult<StatResult>;
 
+	/// Move a file or directory to the OS trash / recycle bin (XDG
+	/// trash on Linux, Finder Trash on macOS, Recycle Bin on Windows).
+	/// This is the default destructive action — `Delete` in the file
+	/// tree maps here. Reversible via the OS UI; callers still confirm
+	/// to make sure the user picked the right row.
+	async fn trash_path(&self, path: &Utf8Path) -> MoonResult<()>;
+
+	/// Permanently delete a file or directory, bypassing the trash.
+	/// Directories are removed recursively. Reachable via `Shift+Delete`
+	/// in the file tree; the team's recovery story for tracked files
+	/// is git, so the only safety net is the confirmation prompt the
+	/// caller is expected to show.
+	async fn delete_path(&self, path: &Utf8Path) -> MoonResult<()>;
+
 	/// Returns an absolute, canonical, host-side path for `path`. The string
 	/// is shaped for the **host** that owns the file (the OS path on local;
 	/// the in-container path on remote). Used by the UI to feed Tauri's asset
@@ -244,6 +258,54 @@ impl WorkspaceHost for LocalHost {
 		Ok(self.resolve(path)?.to_string())
 	}
 
+	async fn trash_path(&self, path: &Utf8Path) -> MoonResult<()> {
+		let resolved = self.resolve(path)?;
+		if resolved == self.root {
+			return Err(MoonError::invalid("refusing to trash the workspace root"));
+		}
+		// `trash` is sync; offload to the blocking pool so we don't
+		// stall the tokio runtime on slow trash backends (XDG trash
+		// over a network mount, Finder calls, etc.).
+		let target = resolved.into_std_path_buf();
+		tokio::task::spawn_blocking(move || trash::delete(&target))
+			.await
+			.map_err(|e| MoonError::Internal(format!("trash join error: {e}")))?
+			.map_err(|e| MoonError::IoError(format!("trash failed: {e}")))?;
+		// Mirrors `delete_path`: editorconfig resolution may have
+		// indexed something we just sent to the trash, easier to clear
+		// the cache than walk it.
+		self.editorconfig.clear().await;
+		Ok(())
+	}
+
+	async fn delete_path(&self, path: &Utf8Path) -> MoonResult<()> {
+		let resolved = self.resolve(path)?;
+		// Refuse to delete the workspace root itself. `resolve` already
+		// blocks paths that escape via `..`, but a literal `.` resolves
+		// to the root — and erasing your own workspace from inside the
+		// IDE is never what you wanted.
+		if resolved == self.root {
+			return Err(MoonError::invalid("refusing to delete the workspace root"));
+		}
+		let metadata = tokio::fs::symlink_metadata(resolved.as_std_path())
+			.await
+			.map_err(MoonError::from)?;
+		if metadata.is_dir() {
+			tokio::fs::remove_dir_all(resolved.as_std_path())
+				.await
+				.map_err(MoonError::from)?;
+		} else {
+			tokio::fs::remove_file(resolved.as_std_path())
+				.await
+				.map_err(MoonError::from)?;
+		}
+		// Editorconfig cache may reference the deleted path (or, for a
+		// directory delete, anything under it). Cheaper to clear and
+		// re-resolve on demand than to walk the cache.
+		self.editorconfig.clear().await;
+		Ok(())
+	}
+
 	async fn editorconfig_for(&self, path: &Utf8Path) -> MoonResult<EditorConfig> {
 		self.editorconfig.for_path(path).await
 	}
@@ -298,6 +360,50 @@ mod tests {
 		h.write_file(Utf8Path::new("a.txt"), "updated").await.unwrap();
 		let r2 = h.read_file(Utf8Path::new("a.txt")).await.unwrap();
 		assert_eq!(r2.text, "updated");
+	}
+
+	#[tokio::test]
+	async fn delete_removes_file() {
+		let dir = TempDir::new().unwrap();
+		let h = host(&dir);
+		std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+
+		h.delete_path(Utf8Path::new("a.txt")).await.unwrap();
+		assert!(!dir.path().join("a.txt").exists());
+	}
+
+	#[tokio::test]
+	async fn delete_removes_directory_recursively() {
+		let dir = TempDir::new().unwrap();
+		let h = host(&dir);
+		std::fs::create_dir_all(dir.path().join("sub/nested")).unwrap();
+		std::fs::write(dir.path().join("sub/nested/x.txt"), "x").unwrap();
+
+		h.delete_path(Utf8Path::new("sub")).await.unwrap();
+		assert!(!dir.path().join("sub").exists());
+	}
+
+	#[tokio::test]
+	async fn delete_refuses_workspace_root() {
+		let dir = TempDir::new().unwrap();
+		let h = host(&dir);
+
+		let result = h.delete_path(Utf8Path::new(".")).await;
+		assert!(matches!(result, Err(MoonError::InvalidArgument(_))));
+		assert!(dir.path().exists());
+	}
+
+	#[tokio::test]
+	async fn delete_rejects_path_traversal() {
+		let dir = TempDir::new().unwrap();
+		let outside = dir.path().parent().unwrap().join("escape-delete.txt");
+		std::fs::write(&outside, "x").unwrap();
+
+		let h = host(&dir);
+		let result = h.delete_path(Utf8Path::new("../escape-delete.txt")).await;
+		assert!(matches!(result, Err(MoonError::PermissionDenied(_))));
+		assert!(outside.exists(), "outside file must be untouched");
+		std::fs::remove_file(&outside).ok();
 	}
 
 	#[tokio::test]

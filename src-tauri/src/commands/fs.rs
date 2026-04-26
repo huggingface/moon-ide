@@ -50,3 +50,17 @@ pub async fn fs_absolute_path(state: State<'_, AppState>, path: String) -> Resul
 	let path = Utf8PathBuf::from(path);
 	ws.host.absolute_path(&path).await
 }
+
+#[tauri::command]
+pub async fn fs_trash(state: State<'_, AppState>, path: String) -> Result<(), MoonError> {
+	let ws = state.workspaces.require_active().await?;
+	let path = Utf8PathBuf::from(path);
+	ws.host.trash_path(&path).await
+}
+
+#[tauri::command]
+pub async fn fs_delete(state: State<'_, AppState>, path: String) -> Result<(), MoonError> {
+	let ws = state.workspaces.require_active().await?;
+	let path = Utf8PathBuf::from(path);
+	ws.host.delete_path(&path).await
+}

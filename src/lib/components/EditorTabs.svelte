@@ -190,7 +190,7 @@
 				class:dragging={draggingPath === file.path}
 				class:drop-before={dropBeforePath === file.path}
 				aria-selected={activePath === file.path}
-				title={file.path}
+				title={file.isUntitled ? file.name : file.path}
 				tabindex="0"
 				draggable="true"
 				onclick={() => workspace.setActive(file.path, side)}

@@ -76,10 +76,38 @@ export const builtInCommands: Command[] = [
 		run: () => void workspace.loadPaths(),
 	},
 	{
+		id: 'editor.newFile',
+		title: 'New File',
+		shortcut: 'Ctrl+N',
+		// Mirrors the Ctrl+N handler in App.svelte — we refuse to spawn
+		// untitled tabs without a workspace because there's no editor
+		// pane to host them. The keyboard handler shows a toast in that
+		// case; doing nothing here is fine since the command is
+		// reachable from the palette only after a folder is open
+		// anyway, but the guard is cheap and keeps the two entry
+		// points symmetric.
+		run: () => {
+			if (!workspace.workspace) {
+				workspace.flash('Open a folder before creating a new file.');
+				return;
+			}
+			workspace.newUntitledTab();
+		},
+	},
+	{
 		id: 'editor.save',
 		title: 'Save File',
 		shortcut: 'Ctrl+S',
 		run: () => void workspace.saveActive(),
+	},
+	{
+		id: 'editor.saveAs',
+		// "Save As" promotes an untitled buffer or rebinds an existing
+		// file to a new path. No keyboard shortcut yet: Ctrl+Shift+S is
+		// the natural pick but we hold off until someone asks (scope
+		// discipline). Discoverable from the palette in the meantime.
+		title: 'Save File As…',
+		run: () => void workspace.saveActiveAs(),
 	},
 	{
 		id: 'palette.quickOpen',

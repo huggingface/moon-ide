@@ -48,19 +48,43 @@
 	});
 
 	$effect(() => {
+		// Reactive dependency: any save-as bumps `renameTick` so this
+		// effect re-runs even if `file` is the same object reference
+		// (Svelte 5 wouldn't otherwise notice the path field changing
+		// on an existing buffer because we replace the object via map).
+		workspace.renameTick;
 		const v = view;
 		if (!v) {
 			return;
 		}
 		if (file.path !== currentPath) {
+			// "Save As" / first save of an untitled buffer rebinds the
+			// path on the same `OpenFile`; preserve selection, scroll,
+			// and undo history. We trust an explicit rename signal
+			// rather than content equality because the pre-save
+			// pipeline (final newline, trailing-whitespace trim, line
+			// endings) can leave the freshly-read text differing from
+			// the live view doc — content equality would silently
+			// mis-classify those saves as tab switches and reset state.
+			const renamed = workspace.isRename(currentPath, file.path);
+			currentPath = file.path;
 			void workspace.ensureEditorConfig(file.path);
+			void applyLanguage(file.path);
+			if (renamed) {
+				// Pipeline may have rewritten the bytes; sync the doc
+				// without rebuilding state.
+				if (file.text !== v.state.doc.toString()) {
+					v.dispatch({
+						changes: { from: 0, to: v.state.doc.length, insert: file.text },
+					});
+				}
+				return;
+			}
 			const next = EditorState.create({
 				doc: file.text,
 				extensions: baseExtensions(),
 			});
 			v.setState(next);
-			currentPath = file.path;
-			void applyLanguage(file.path);
 			return;
 		}
 		// Same path, but the in-memory text may differ if state was mutated externally.

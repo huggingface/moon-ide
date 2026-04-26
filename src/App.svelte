@@ -40,6 +40,20 @@
 				workspace.closeActive();
 				return;
 			}
+			if (!event.shiftKey && key === 'n') {
+				// Refuse to open an untitled tab when there is no
+				// workspace: untitled buffers piggyback on the same
+				// editor pane scaffolding, which only renders inside an
+				// open folder. The toast tells the user what to do
+				// rather than silently doing nothing.
+				event.preventDefault();
+				if (!workspace.workspace) {
+					workspace.flash('Open a folder before creating a new file.');
+					return;
+				}
+				workspace.newUntitledTab();
+				return;
+			}
 			if (event.shiftKey && key === 'p') {
 				event.preventDefault();
 				palette.show('commands');

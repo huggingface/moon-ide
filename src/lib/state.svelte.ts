@@ -1,5 +1,5 @@
 import { convertFileSrc } from '@tauri-apps/api/core';
-import { confirm } from '@tauri-apps/plugin-dialog';
+import { confirm, save as saveDialog } from '@tauri-apps/plugin-dialog';
 import { ipc } from './ipc';
 import {
 	defaultEditorConfig,
@@ -20,16 +20,32 @@ export type MarkdownView = 'source' | 'preview';
 export type { SplitSide } from './protocol';
 
 export type OpenFile = {
+	// Stable identifier used as the key in `openFiles`, the per-pane tab
+	// arrays, the active path fields, and the editorconfig / preview-mode
+	// caches. For real files it's the workspace-relative path on disk.
+	// For untitled buffers it's a synthetic `untitled:N` string — no
+	// collision with real paths is possible because workspace paths
+	// never start with `untitled:`. The first save flips `isUntitled`
+	// to `false` and rewrites `path` to the chosen real path everywhere
+	// the synthetic ID was used.
 	path: string;
 	name: string;
 	kind: FileKind;
+	// True only for buffers created via `Ctrl+N` / "New File" that have
+	// never been saved. Drives the save-as flow on `Ctrl+S` and excludes
+	// the buffer from session persistence — untitled state never survives
+	// a restart by design.
+	isUntitled: boolean;
 	text: string;
-	// Tauri asset:// URL for image files; empty string for text. Text files
-	// stream their contents through `text`, image files render via this URL.
+	// Tauri asset:// URL for image files; empty string for text and
+	// untitled buffers. Text and untitled buffers stream their contents
+	// through `text`, image files render via this URL.
 	previewUrl: string;
 	// Fingerprint of the bytes last known to be on disk. Comparing the
 	// current text's fingerprint against this lets us derive `isDirty`
-	// without keeping a second full copy of the file in memory.
+	// without keeping a second full copy of the file in memory. Untitled
+	// buffers seed this with the fingerprint of the empty string so the
+	// first keystroke flips `isDirty`.
 	loadedFingerprint: ContentFingerprint;
 	loadedMtimeMs: number | null;
 	isDirty: boolean;
@@ -104,6 +120,24 @@ class WorkspaceState {
 	// to disk on every `openFile` call.
 	private persistScheduled = false;
 	private suppressPersist = false;
+
+	// Monotonic, per-process counter for untitled buffer IDs. Resets on
+	// app start because untitled buffers don't persist; numbering is just
+	// a UI affordance ("Untitled-1", "Untitled-2"…) and starting from 1
+	// every launch is the expected behaviour.
+	private untitledCounter = 0;
+
+	// Bumped by `saveActiveAs` whenever it rebinds a buffer to a new path.
+	// `lastRename` captures the (from, to) pair for that rebind. The editor
+	// view watches the tick as a reactive dependency and consults
+	// `isRename(...)` to decide whether a path change is a tab switch
+	// (rebuild state) or a rename (keep state, swap language). Content
+	// equality alone isn't reliable here — the pre-save pipeline can
+	// touch line endings / trailing whitespace / final newline before the
+	// re-read populates the buffer with bytes that differ from the live
+	// view.
+	renameTick = $state(0);
+	private lastRename: { from: string; to: string } | null = null;
 
 	activePath: string | null = $derived(this.focusedSide === 'left' ? this.leftActive : this.rightActive);
 
@@ -239,13 +273,20 @@ class WorkspaceState {
 				return;
 			}
 			const ws = this.workspace;
+			// Untitled buffers never persist: their text is in-memory only,
+			// and there's no path to point session JSON at. Strip them
+			// from both tab lists and from the active fields before we
+			// serialise. The user-facing trade-off — `Ctrl+N`, type, quit
+			// without saving = work is gone — matches every other editor.
+			const realPaths = (paths: string[]) => paths.filter((p) => !isUntitledPath(p));
+			const realActive = (path: string | null) => (path !== null && !isUntitledPath(path) ? path : null);
 			const session: WorkspaceSession | null = ws
 				? {
 						workspace_path: ws.root,
-						open_files_left: [...this.leftTabs],
-						open_files_right: this.hasSplit ? [...this.rightTabs] : [],
-						active_left: this.leftActive,
-						active_right: this.hasSplit ? this.rightActive : null,
+						open_files_left: realPaths(this.leftTabs),
+						open_files_right: this.hasSplit ? realPaths(this.rightTabs) : [],
+						active_left: realActive(this.leftActive),
+						active_right: this.hasSplit ? realActive(this.rightActive) : null,
 						has_split: this.hasSplit,
 						focused_side: this.focusedSide,
 					}
@@ -290,6 +331,35 @@ class WorkspaceState {
 	 * raises focus on Enter / double-click. `focusedSide` updates
 	 * either way so subsequent operations target the same pane.
 	 */
+	/**
+	 * Open a fresh untitled buffer in `side`. Generates a synthetic
+	 * `untitled:N` path so it can flow through every code path that
+	 * keys on `OpenFile.path` (tab arrays, active fields, drag/drop)
+	 * without special-casing. The buffer becomes active and pulls
+	 * editor focus immediately — Ctrl+N is always a deliberate
+	 * gesture, so no `{ focus: false }` opt-out here.
+	 */
+	newUntitledTab(side: SplitSide = this.focusedSide) {
+		this.untitledCounter += 1;
+		const n = this.untitledCounter;
+		const path = `untitled:${n}`;
+		const file: OpenFile = {
+			path,
+			name: `Untitled-${n}`,
+			kind: 'text',
+			isUntitled: true,
+			text: '',
+			previewUrl: '',
+			loadedFingerprint: fingerprint(''),
+			loadedMtimeMs: null,
+			isDirty: false,
+		};
+		this.openFiles = [...this.openFiles, file];
+		const tabs = this.tabsFor(side);
+		this.setTabsFor(side, [...tabs, path]);
+		this.setActive(path, side);
+	}
+
 	async openFile(path: string, side: SplitSide = this.focusedSide, options: { focus?: boolean } = {}) {
 		const existing = this.openFiles.find((f) => f.path === path);
 		if (!existing) {
@@ -351,6 +421,14 @@ class WorkspaceState {
 	 * which is the same shape `EditorConfig::default()` produces server-side.
 	 */
 	async ensureEditorConfig(path: string) {
+		// Untitled buffers have no on-disk path to resolve against — the
+		// `.editorconfig` cascade only makes sense once a save has bound
+		// the buffer to a real location. Until then the editor falls back
+		// to `defaultEditorConfig`, same as it does during the first paint
+		// of any tab before its IPC roundtrip resolves.
+		if (isUntitledPath(path)) {
+			return;
+		}
 		if (this.editorConfigs.has(path)) {
 			return;
 		}
@@ -386,6 +464,7 @@ class WorkspaceState {
 			path,
 			name: basename(path),
 			kind: 'text',
+			isUntitled: false,
 			text: result.text,
 			previewUrl: '',
 			loadedFingerprint: fingerprint(result.text),
@@ -400,12 +479,167 @@ class WorkspaceState {
 			path,
 			name: basename(path),
 			kind: 'image',
+			isUntitled: false,
 			text: '',
 			previewUrl: convertFileSrc(absolute),
 			loadedFingerprint: fingerprint(''),
 			loadedMtimeMs: null,
 			isDirty: false,
 		};
+	}
+
+	/**
+	 * Move `paths` (files and/or directories) to the OS trash after
+	 * confirming. The default destructive action — what `Delete` in the
+	 * file tree maps to. Reversible via the OS UI; the confirm exists
+	 * so an accidental keypress on the wrong selection is recoverable
+	 * in one dialog rather than digging through the trash bin.
+	 */
+	async trashPaths(paths: string[]) {
+		await this.removePaths(paths, 'trash');
+	}
+
+	/**
+	 * Permanently delete `paths` (files and/or directories). Reachable
+	 * via `Shift+Delete` in the file tree. Bypasses the OS trash
+	 * entirely; the team's recovery story for tracked files is git,
+	 * untracked files are gone for good. The confirm dialog warns
+	 * explicitly.
+	 */
+	async deletePaths(paths: string[]) {
+		await this.removePaths(paths, 'delete');
+	}
+
+	/**
+	 * Shared backbone for `trashPaths` and `deletePaths`. Drops
+	 * descendants of selected ancestors (deleting `src/` + `src/foo.ts`
+	 * is the same as deleting just `src/`), confirms with the user,
+	 * dispatches to the matching IPC method per remaining path, then
+	 * drops every open buffer the operation just invalidated (the
+	 * paths themselves and — for directories — anything under them)
+	 * and refreshes the tree. Dirty-discard prompts are intentionally
+	 * skipped: the user just confirmed they want these gone, asking
+	 * again per-tab would be noise.
+	 *
+	 * Untitled buffers in the input list are no-ops for IPC (they only
+	 * live in memory) but their tabs are still closed so the keystroke
+	 * isn't a silent miss when one slips into a multi-selection.
+	 */
+	private async removePaths(rawPaths: string[], mode: 'trash' | 'delete') {
+		if (rawPaths.length === 0) {
+			return;
+		}
+		// Pull untitled buffers aside: they need a tab close, not an
+		// IPC call. Real paths get descendant-flattened so the user
+		// can shift-click `src/` plus a few files inside without us
+		// double-firing on already-doomed entries (and risking a
+		// "no such file" error when the parent removal cleans up
+		// the children first).
+		const untitled = rawPaths.filter((p) => isUntitledPath(p));
+		const real = dropDescendantPaths(rawPaths.filter((p) => !isUntitledPath(p)));
+		if (real.length === 0 && untitled.length === 0) {
+			return;
+		}
+
+		// Display strings strip the trailing slash dir convention so
+		// the dialog and toast read the way the user expects.
+		const displays = real.map((p) => (p.endsWith('/') ? p.replace(/\/$/, '') : p));
+		const total = displays.length;
+		const message = buildRemovalMessage(displays, real, mode);
+
+		if (total > 0) {
+			const ok = await confirm(message, {
+				title: mode === 'trash' ? 'Move to trash' : 'Permanently delete',
+				okLabel: mode === 'trash' ? 'Move to trash' : 'Delete',
+				cancelLabel: 'Cancel',
+			});
+			if (!ok) {
+				return;
+			}
+		}
+
+		// Run IPC calls in parallel; collect failures so a single bad
+		// path (locked file, permission denied) doesn't drop the rest.
+		// We still tear down the in-memory state below for paths that
+		// _did_ go through, so the editor stays consistent with disk.
+		const ipcCall = mode === 'trash' ? ipc.fs.trash : ipc.fs.delete;
+		const results = await Promise.allSettled(displays.map((p) => ipcCall(p)));
+		const removed: string[] = [];
+		const failures: { path: string; err: unknown }[] = [];
+		results.forEach((r, i) => {
+			const p = displays[i] ?? '';
+			if (r.status === 'fulfilled') {
+				removed.push(p);
+			} else {
+				failures.push({ path: p, err: r.reason });
+			}
+		});
+
+		// Build a single "was this path removed" predicate covering
+		// every successfully-removed real path *and* the untitled
+		// buffers we're closing. Dir removals nuke everything
+		// underneath; we match by path prefix with the trailing slash
+		// so e.g. removing `src/` doesn't accidentally drop `src.ts`
+		// from the editor.
+		const removedSet = new Set<string>(removed);
+		for (const u of untitled) {
+			removedSet.add(u);
+		}
+		const dirPrefixes = real
+			.map((p, i) => ({ p, display: displays[i] ?? '' }))
+			.filter(({ p }) => p.endsWith('/'))
+			.filter(({ display }) => removedSet.has(display))
+			.map(({ display }) => display + '/');
+		const wasRemoved = (p: string) => removedSet.has(p) || dirPrefixes.some((pre) => p.startsWith(pre));
+
+		this.openFiles = this.openFiles.filter((f) => !wasRemoved(f.path));
+		this.leftTabs = this.leftTabs.filter((p) => !wasRemoved(p));
+		this.rightTabs = this.rightTabs.filter((p) => !wasRemoved(p));
+		if (this.leftActive !== null && wasRemoved(this.leftActive)) {
+			this.leftActive = this.leftTabs[this.leftTabs.length - 1] ?? null;
+		}
+		if (this.rightActive !== null && wasRemoved(this.rightActive)) {
+			this.rightActive = this.rightTabs[this.rightTabs.length - 1] ?? null;
+		}
+		// Drop preview-mode + editorconfig entries for the removed paths
+		// so a future file at the same path starts with default modes.
+		let modesChanged = false;
+		const modes = new Map(this.previewModes);
+		for (const key of modes.keys()) {
+			if (wasRemoved(key)) {
+				modes.delete(key);
+				modesChanged = true;
+			}
+		}
+		if (modesChanged) {
+			this.previewModes = modes;
+		}
+		let ecsChanged = false;
+		const ecs = new Map(this.editorConfigs);
+		for (const key of ecs.keys()) {
+			if (wasRemoved(key)) {
+				ecs.delete(key);
+				ecsChanged = true;
+			}
+		}
+		if (ecsChanged) {
+			this.editorConfigs = ecs;
+		}
+
+		if (failures.length > 0) {
+			// One toast covers the lot. We don't list every failure
+			// because there's nowhere good to put a multi-line error
+			// in the current UI; for now the count + first reason is
+			// enough to debug. Promote to a problems-panel entry in
+			// Phase 8 when one exists.
+			const first = failures[0];
+			const prefix = mode === 'trash' ? 'Move to trash' : 'Delete';
+			const reason = first ? formatError(first.err) : 'unknown error';
+			this.flash(`${prefix} failed for ${failures.length} of ${displays.length}: ${reason}`);
+		}
+
+		await this.loadPaths();
+		this.persistAppState();
 	}
 
 	async closeFile(path: string, side: SplitSide = this.focusedSide) {
@@ -591,6 +825,23 @@ class WorkspaceState {
 		this.persistAppState();
 	}
 
+	/**
+	 * True when the editor's last-known `currentPath` was just rebound
+	 * to `newPath` by a save-as. Read by `Editor.svelte`'s reactive
+	 * effect to decide whether a `file.path` change is a rename (keep
+	 * view state) or a tab switch (rebuild). The window is only open
+	 * for as long as `lastRename` survives — which is until the next
+	 * save-as, since we don't proactively clear it. That's good enough:
+	 * any later path mismatch on the same editor is, by definition, a
+	 * different change.
+	 */
+	isRename(fromPath: string | null, toPath: string): boolean {
+		if (fromPath === null || !this.lastRename) {
+			return false;
+		}
+		return this.lastRename.from === fromPath && this.lastRename.to === toPath;
+	}
+
 	requestEditorFocus() {
 		this.focusTick += 1;
 	}
@@ -687,7 +938,18 @@ class WorkspaceState {
 
 	async saveActive() {
 		const file = this.activeFile;
-		if (!file || !file.isDirty) {
+		if (!file) {
+			return;
+		}
+		// Untitled buffers route through the save-as flow on every save
+		// until they get a real path. `Ctrl+S` and the "Save File"
+		// command both hit this path — there is no separate "Save"
+		// surface for untitled.
+		if (file.isUntitled) {
+			await this.saveActiveAs();
+			return;
+		}
+		if (!file.isDirty) {
 			return;
 		}
 		try {
@@ -716,6 +978,129 @@ class WorkspaceState {
 			if (file.name === '.editorconfig') {
 				await this.refreshEditorConfigs();
 			}
+		} catch (err) {
+			this.flash(`Save failed: ${formatError(err)}`);
+		}
+	}
+
+	/**
+	 * Save the active buffer to a path the user picks via the native
+	 * dialog. Used both to commit untitled buffers and to do a true
+	 * "Save As" for an existing file (rebinding the buffer to the new
+	 * path; the original on-disk file is left untouched).
+	 *
+	 * The path swap that follows the write is the same dance Ctrl+N
+	 * relies on: every place that keys on `OpenFile.path` (tab arrays,
+	 * active fields, preview-mode map) is rewritten in lockstep so the
+	 * buffer remains the single source of truth. The editor view detects
+	 * the rename via content equality and swaps language extensions
+	 * without rebuilding state, preserving selection / scroll / undo.
+	 */
+	async saveActiveAs() {
+		const file = this.activeFile;
+		if (!file) {
+			return;
+		}
+		const ws = this.workspace;
+		if (!ws) {
+			this.flash('Open a folder before saving.');
+			return;
+		}
+		if (file.kind === 'image') {
+			// Image buffers are read-only previews; "Save As" would need
+			// us to copy bytes through the host, which nobody has asked
+			// for yet. Refuse loudly rather than half-implement.
+			this.flash('Save As is not supported for image files.');
+			return;
+		}
+
+		const defaultPath = file.isUntitled
+			? `${ws.root}/${file.name}.txt`
+			: await ipc.fs.absolutePath(file.path).catch(() => `${ws.root}/${file.path}`);
+		const target = await saveDialog({
+			title: file.isUntitled ? 'Save Untitled File' : 'Save As',
+			defaultPath,
+		});
+		if (!target) {
+			return;
+		}
+
+		// Workspace-bound: the host-side fs commands all take workspace-
+		// relative paths, and our session model assumes every open file
+		// lives inside the current root. Refuse out-of-tree saves with a
+		// toast — supporting them would mean a multi-root model, which
+		// is Phase 7's problem, not ours.
+		const root = ws.root.replace(/\/+$/, '');
+		const newPath = relativeToRoot(target, root);
+		if (newPath === null) {
+			this.flash('Save target must be inside the current workspace.');
+			return;
+		}
+
+		// Refuse to merge with another open buffer at the same path. The
+		// alternative is to close the existing tab silently and replace
+		// its buffer with ours, which is surprising; better to ask the
+		// user to close the conflicting tab first.
+		const oldPath = file.path;
+		if (newPath !== oldPath && this.openFiles.some((f) => f.path === newPath)) {
+			this.flash(`A buffer for ${newPath} is already open. Close it before saving here.`);
+			return;
+		}
+
+		try {
+			const result = await ipc.fs.writeFile(newPath, file.text);
+			const fresh = await ipc.fs.readFile(newPath);
+			const newName = basename(newPath);
+			const newKind = fileKindFor(newPath);
+			const freshText = fresh.is_binary ? file.text : fresh.text;
+			this.openFiles = this.openFiles.map((f) =>
+				f.path === oldPath
+					? {
+							...f,
+							path: newPath,
+							name: newName,
+							kind: newKind,
+							isUntitled: false,
+							text: freshText,
+							isDirty: false,
+							loadedFingerprint: fingerprint(freshText),
+							loadedMtimeMs: result.mtime_ms,
+						}
+					: f,
+			);
+			if (newPath !== oldPath) {
+				this.leftTabs = this.leftTabs.map((p) => (p === oldPath ? newPath : p));
+				this.rightTabs = this.rightTabs.map((p) => (p === oldPath ? newPath : p));
+				if (this.leftActive === oldPath) {
+					this.leftActive = newPath;
+				}
+				if (this.rightActive === oldPath) {
+					this.rightActive = newPath;
+				}
+				if (this.previewModes.has(oldPath)) {
+					const next = new Map(this.previewModes);
+					const mode = next.get(oldPath);
+					next.delete(oldPath);
+					if (mode) {
+						next.set(newPath, mode);
+					}
+					this.previewModes = next;
+				}
+				// Signal the rename to live editor views so they can
+				// preserve selection / scroll / undo across the path
+				// swap. See the comment on `renameTick`.
+				this.lastRename = { from: oldPath, to: newPath };
+				this.renameTick += 1;
+			}
+
+			await this.ensureEditorConfig(newPath);
+			if (newName === '.editorconfig') {
+				await this.refreshEditorConfigs();
+			}
+			// Refresh the file tree so the new file appears (or moves) in
+			// the listing without requiring a manual refresh.
+			await this.loadPaths();
+			this.persistAppState();
 		} catch (err) {
 			this.flash(`Save failed: ${formatError(err)}`);
 		}
@@ -775,6 +1160,80 @@ async function collectPaths(rel: string, out: string[], depth: number): Promise<
 function basename(path: string): string {
 	const i = path.lastIndexOf('/');
 	return i >= 0 ? path.slice(i + 1) : path;
+}
+
+/**
+ * Convert an absolute path returned by the native save dialog into a
+ * workspace-relative path, or `null` if the target is outside `root`.
+ * Trailing slashes on `root` are normalised by the caller. We deliberately
+ * don't resolve symlinks here — the host will canonicalise on write
+ * if it needs to.
+ */
+function relativeToRoot(absolute: string, root: string): string | null {
+	if (absolute === root) {
+		// Saving to the workspace root itself isn't meaningful (it's a
+		// directory); the dialog shouldn't return this, but handle it
+		// defensively.
+		return null;
+	}
+	const prefix = root + '/';
+	if (!absolute.startsWith(prefix)) {
+		return null;
+	}
+	return absolute.slice(prefix.length);
+}
+
+export function isUntitledPath(path: string): boolean {
+	return path.startsWith('untitled:');
+}
+
+/**
+ * Drop any path whose ancestor (a directory path with trailing slash)
+ * is also in the input. Used when the user multi-selects e.g. `src/`
+ * and `src/foo.ts` — we only need to issue one IPC call for `src/`,
+ * the directory delete subsumes the file. The shorter ancestor path
+ * sorts first lexicographically, which is why a single ascending
+ * sort + linear scan is enough.
+ */
+function dropDescendantPaths(paths: string[]): string[] {
+	const sorted = paths.toSorted();
+	const kept: string[] = [];
+	for (const p of sorted) {
+		const ancestor = kept.find((k) => k.endsWith('/') && p.startsWith(k));
+		if (!ancestor) {
+			kept.push(p);
+		}
+	}
+	return kept;
+}
+
+/**
+ * Build the body text for the trash / delete confirm dialog. Single
+ * selections get the precise filename or "the folder X" wording so
+ * the user can sanity-check the row. Multi-selections fall back to a
+ * count — listing every path doesn't fit a native dialog cleanly and
+ * the visible tree highlight already shows what's selected.
+ */
+function buildRemovalMessage(displays: string[], realPaths: string[], mode: 'trash' | 'delete'): string {
+	if (displays.length === 0) {
+		return '';
+	}
+	if (displays.length === 1) {
+		const display = displays[0] ?? '';
+		const isDir = realPaths[0]?.endsWith('/') ?? false;
+		if (mode === 'trash') {
+			return isDir
+				? `Move the folder ${display} (and everything inside it) to the trash?`
+				: `Move ${display} to the trash?`;
+		}
+		return isDir
+			? `Permanently delete the folder ${display} and everything inside it? This cannot be undone (recover via git if it was tracked).`
+			: `Permanently delete ${display}? This cannot be undone (recover via git if it was tracked).`;
+	}
+	const noun = `${displays.length} items`;
+	return mode === 'trash'
+		? `Move ${noun} to the trash?`
+		: `Permanently delete ${noun}? This cannot be undone (recover via git if any of them were tracked).`;
 }
 
 export const workspace = new WorkspaceState();

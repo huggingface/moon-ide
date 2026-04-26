@@ -26,6 +26,8 @@ export const ipc = {
 		writeFile: (path: string, text: string) => invoke<WriteFileResult>('fs_write_file', { path, text }),
 		stat: (path: string) => invoke<StatResult>('fs_stat', { path }),
 		absolutePath: (path: string) => invoke<string>('fs_absolute_path', { path }),
+		trash: (path: string) => invoke<void>('fs_trash', { path }),
+		delete: (path: string) => invoke<void>('fs_delete', { path }),
 	},
 	search: {
 		files: (options: FileSearchOptions) => invoke<FileSearchResult[]>('search_files', { options }),

@@ -42,46 +42,77 @@
 		};
 	});
 
-	// Reactively reset paths when the workspace path list changes.
+	// Reactively reset paths when the workspace path list changes, then
+	// replay the active path so Save As (which mutates `activePath`
+	// *before* the new file lands in `paths`, with an `await` between
+	// the two) doesn't end up with the new row unselected, the keyboard
+	// cursor stuck on row 0, and the list scrolled to the top.
+	//
+	// We can't rely on the activePath effect to re-fire here — its only
+	// dep is `activePath`, which didn't change. And we can't merge the
+	// two effects, because `resetPaths` is expensive enough that running
+	// it on every tab switch would be wasteful.
 	$effect(() => {
 		const paths = workspace.paths;
 		if (!tree) {
 			return;
 		}
 		tree.resetPaths(paths);
+		// `untrack`: this effect is for `paths`. Without it, every
+		// tab switch would wedge resetPaths between the activePath
+		// change and its handler.
+		const target = untrack(() => workspace.activePath);
+		applySelection(tree, target, { afterReset: true });
 	});
 
 	// Mirror the active file in the tree's selection so the row stays
-	// highlighted as the user switches tabs (or restores a session). Two
-	// invariants:
-	//   1. If a file is active, exactly that file's row is selected.
-	//   2. If no file is active (closed last tab, fresh workspace), the
-	//      selection is cleared — leaving a stale row selected makes
-	//      re-clicking the same row a no-op (Pierre only fires
-	//      `onSelectionChange` on real changes).
-	// We early-return when already in sync so a user click (which already
-	// produces the desired selection via Pierre) doesn't trigger a
-	// feedback loop through programmatic `select()`.
+	// highlighted as the user switches tabs (or restores a session).
 	$effect(() => {
 		const target = workspace.activePath;
 		if (!tree) {
 			return;
 		}
-		const current = tree.getSelectedPaths();
+		applySelection(tree, target, { afterReset: false });
+	});
+
+	// Two invariants:
+	//   1. If a file is active, exactly that file's row is selected
+	//      and (when the row is virtualized) Pierre's focused index
+	//      tracks it via the scroll fallback below.
+	//   2. If no file is active, the selection is cleared — leaving a
+	//      stale row selected makes re-clicking the same row a no-op
+	//      (Pierre only fires `onSelectionChange` on real changes).
+	//
+	// `afterReset` widens the work we do: a tab switch can early-return
+	// when selection already matches (avoids a feedback loop with the
+	// click → onSelectionChange → activePath path), but a paths reset
+	// must always re-scroll even if Pierre happened to preserve
+	// selection by path string.
+	//
+	// We deliberately do **not** call `focusNearestPath(target)` here.
+	// `scrollPathIntoView`'s fallback path needs `focusedPathChanged`
+	// to be live when it focuses the shadow scroll container, so
+	// Pierre's layout effect runs `scrollFocusedRowIntoView`. Calling
+	// `focusNearestPath` up-front consumes the change with
+	// `shouldOwnDomFocus=false` (focus still in the editor), and the
+	// fallback's second call becomes a no-op — scroll never fires.
+	// The fallback already updates the focused index for us.
+	function applySelection(local: FileTree, target: string | null, opts: { afterReset: boolean }) {
+		const current = local.getSelectedPaths();
 		const alreadyInSync = target === null ? current.length === 0 : current.length === 1 && current[0] === target;
-		if (alreadyInSync) {
+		if (alreadyInSync && !opts.afterReset) {
 			return;
 		}
 		for (const sel of current) {
 			if (sel !== target) {
-				tree.getItem(sel)?.deselect();
+				local.getItem(sel)?.deselect();
 			}
 		}
 		if (target !== null) {
-			tree.getItem(target)?.select();
-			void scrollPathIntoView(tree, target);
+			local.getItem(target)?.select();
+			void scrollPathIntoView(local, target);
 		}
-	});
+	}
 
 	// Bring `path` into the tree's viewport, regardless of whether DOM focus
 	// currently lives in the tree. Pierre virtualizes rows aggressively, so
@@ -132,6 +163,12 @@
 		// the layout effect that runs after `focusNearestPath`'s emit sees
 		// both flags true on the same pass.
 		scrollEl.focus({ preventScroll: true });
+		// Force `focusedPathChanged` to be true even if the controller
+		// already happens to point at `path` (Pierre can preserve the
+		// focused index across `resetPaths` when the path still exists,
+		// in which case a single `focusNearestPath(path)` would dedupe
+		// and skip the scroll).
+		local.focusNearestPath(null);
 		local.focusNearestPath(path);
 
 		await tick();
@@ -273,15 +310,81 @@
 
 	// Pierre stops propagation for keys it handles (arrows, Home/End,
 	// Ctrl+A, Ctrl+Space, Esc/Enter inside search and renaming). Plain
-	// Enter on a row falls through to us. We don't need to filter input
-	// elements here for the same reason — Pierre's search/rename inputs
-	// own their own Enter behaviour and never let it bubble.
+	// Enter and Delete on a row fall through to us. We still defensively
+	// bail out for Delete/Backspace when an `<input>` or `<textarea>`
+	// holds focus inside the tree's shadow DOM (Pierre's search box and
+	// future rename input), so typing inside those fields can never
+	// trigger a delete confirm.
+	//
+	// `Delete` (and `Backspace` for macOS hardware that lacks a Delete
+	// key) moves to the OS trash — reversible from the file manager.
+	// `Shift+Delete` / `Shift+Backspace` skip the trash and remove the
+	// path permanently; the confirm dialog wording differs accordingly.
+	//
+	// Targeting policy: act on the full multi-selection when there is
+	// one (Pierre supports Ctrl+A, Shift+click, Ctrl+click ranges).
+	// Fall back to the focused row when nothing is selected — Pierre
+	// only updates selection on click, so a user who just arrowed onto
+	// a row still gets to delete it without an extra Space first.
 	function onKeyDown(event: KeyboardEvent) {
-		if (event.key !== 'Enter') {
+		if (event.key === 'Enter') {
+			event.preventDefault();
+			activateFocusedRow();
 			return;
 		}
-		event.preventDefault();
-		activateFocusedRow();
+		if (event.key === 'Delete' || event.key === 'Backspace') {
+			if (isTextInputFocused()) {
+				return;
+			}
+			if (!tree) {
+				return;
+			}
+			const targets = collectRemovalTargets(tree);
+			if (targets.length === 0) {
+				return;
+			}
+			event.preventDefault();
+			if (event.shiftKey) {
+				void workspace.deletePaths(targets);
+			} else {
+				void workspace.trashPaths(targets);
+			}
+		}
+	}
+
+	// Pierre tracks selection (click-driven) and focus (arrow-key cursor)
+	// independently. We act on the full selection only when the keyboard
+	// cursor sits on a selected row — that's the multi-delete case
+	// (Ctrl+click / Shift+click / Ctrl+A then Delete). When the cursor
+	// has moved off the selection via arrow keys, fall back to the
+	// focused row alone so Delete acts where the user thinks they are
+	// rather than on the originally-clicked file.
+	function collectRemovalTargets(local: FileTree): string[] {
+		const focused = local.getFocusedPath();
+		// Pierre returns `readonly string[]`; we hand the result on to
+		// `WorkspaceState`, which mutates intermediate copies further
+		// down — defensively clone here rather than sprinkle reads of
+		// the readonly view across the call chain.
+		const selected = [...local.getSelectedPaths()];
+		if (focused && selected.includes(focused)) {
+			return selected;
+		}
+		if (focused) {
+			return [focused];
+		}
+		return selected;
+	}
+
+	function isTextInputFocused(): boolean {
+		const active = getDeepActiveElement();
+		if (!active) {
+			return false;
+		}
+		if (active.isContentEditable) {
+			return true;
+		}
+		const tag = active.tagName;
+		return tag === 'INPUT' || tag === 'TEXTAREA';
 	}
 
 	function onDblClick() {
