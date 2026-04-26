@@ -7,7 +7,7 @@
 	import Welcome from './lib/components/Welcome.svelte';
 	import CommandPalette from './lib/components/CommandPalette.svelte';
 	import { workspace } from './lib/state.svelte';
-	import { palette } from './lib/commands.svelte';
+	import { palette, reloadWindow } from './lib/commands.svelte';
 	import { ipc } from './lib/ipc';
 
 	let sidebarWidth = $state(280);
@@ -53,6 +53,11 @@
 				} else {
 					workspace.splitActive('right');
 				}
+				return;
+			}
+			if (!event.shiftKey && key === 'r') {
+				event.preventDefault();
+				await reloadWindow();
 				return;
 			}
 		};

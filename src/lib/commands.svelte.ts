@@ -1,4 +1,4 @@
-import { open } from '@tauri-apps/plugin-dialog';
+import { confirm, open } from '@tauri-apps/plugin-dialog';
 import { workspace } from './state.svelte';
 import { ipc } from './ipc';
 import { formatError, type FileSearchResult, type ContentSearchHit } from './protocol';
@@ -117,6 +117,21 @@ export const builtInCommands: Command[] = [
 		run: () => workspace.toggleTheme(),
 	},
 	{
+		id: 'view.reloadWindow',
+		// Refreshes the webview only — the Rust shell stays alive.
+		// Persisted state (workspace + tabs + active + theme) replays
+		// from AppState on the way back up, so visually the only
+		// difference is in-memory edits to dirty buffers vanish (we
+		// prompt for confirmation when there are any). Mirrors the
+		// browser-level "reload" the team currently triggers from the
+		// webview's right-click menu; lives here so the right-click
+		// menu can be locked down later without losing the escape
+		// hatch.
+		title: 'Reload Window',
+		shortcut: 'Ctrl+R',
+		run: () => reloadWindow(),
+	},
+	{
 		id: 'markdown.togglePreview',
 		// Label flips with the current mode for the active path so the
 		// palette doubles as a status indicator. Only visible when the
@@ -178,6 +193,25 @@ function scoreString(haystack: string, needle: string): number {
 		i = idx + 1;
 	}
 	return score;
+}
+
+/**
+ * Confirm-and-reload. Exported so App.svelte's `Ctrl+Shift+R`
+ * handler can share the dirty-buffer prompt with the palette
+ * command — keep the two entry points calling the same function.
+ */
+export async function reloadWindow() {
+	const dirty = workspace.openFiles.filter((f) => f.isDirty);
+	if (dirty.length > 0) {
+		const ok = await confirm(
+			`${dirty.length} file${dirty.length === 1 ? ' has' : 's have'} unsaved changes. Reload and discard them?`,
+			{ title: 'Unsaved changes', okLabel: 'Reload', cancelLabel: 'Cancel' },
+		);
+		if (!ok) {
+			return;
+		}
+	}
+	location.reload();
 }
 
 export async function runFileSearch(query: string) {
