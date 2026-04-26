@@ -1,7 +1,6 @@
 # Test plan NNNN: <short title>
 
 - **Date**: YYYY-MM-DD
-- **Commit / branch**: <sha or branch name; fill in once committed>
 - **Phase**: <e.g. Phase 1.5, or "post-Phase 1 polish">
 
 ## What shipped

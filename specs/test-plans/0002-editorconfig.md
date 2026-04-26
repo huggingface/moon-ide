@@ -1,7 +1,6 @@
 # Test plan 0002: `.editorconfig` honored end-to-end
 
 - **Date**: 2026-04-26
-- **Commit / branch**: <fill in once committed>
 - **Phase**: Phase 1.5
 
 ## What shipped

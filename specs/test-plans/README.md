@@ -32,7 +32,7 @@ When in doubt: write one. They are cheap.
 
 Each file is a single markdown document. Use `0000-template.md` as the starting point. The required headers are:
 
-- **Date** and **commit / branch** the plan covers.
+- **Date** the plan was written. Commit-level identification is left to `git blame` / `git log` — the file's history in the repo is the source of truth for "which commit introduced or last touched this plan", so duplicating that in the front-matter just creates a stale field nobody fills in.
 - **What shipped** — bullets, terse, no marketing.
 - **How to test** — numbered steps a human can run end-to-end. Include exact paths, commands, and expected outputs where they matter.
 - **What must keep working** — regression checks. The reason this file is in the repo and not a chat.

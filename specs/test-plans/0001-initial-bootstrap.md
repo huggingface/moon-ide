@@ -1,7 +1,6 @@
 # Test plan 0001: Initial bootstrap (Phases 0, 1, and 1.5 polish)
 
 - **Date**: 2026-04-26
-- **Commit / branch**: `main` — second commit, after the empty-README seed
 - **Phase**: Phase 0 + Phase 1, plus the post-Phase 1 polish that closes the gaps surfaced while testing
 
 ## What shipped

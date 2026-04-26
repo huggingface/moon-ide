@@ -1,7 +1,6 @@
 # Test plan 0003: per-pane open file lists
 
 - **Date**: 2026-04-26
-- **Commit / branch**: <fill in once committed>
 - **Phase**: Phase 1.5
 
 ## What shipped
