@@ -24,7 +24,8 @@ The full phased plan. Update the **Status** column as phases land.
 | 7     | Multi-repo + cross-repo queries | scaffolded  |
 | 8     | Linting / formatting            | scaffolded  |
 | 9     | Custom tool plugins             | scaffolded  |
-| 10+   | Innovation track                | open-ended  |
+| 10    | Theming                         | scaffolded  |
+| 11+   | Innovation track                | open-ended  |
 
 "Scaffolded" means: the module/spec slot exists but the feature is not real code yet. Each phase replaces "scaffolded" with "implemented" when its acceptance criteria are met.
 
@@ -92,6 +93,14 @@ LSP multiplexer in `moon-core`. TS, Svelte, CSS, HTML, JSON, MD servers. Diagnos
 
 Tree behavior: gitignored directories are **collapsed by default** (and faded), so noise like `node_modules/`, `target/`, `dist/` doesn't render thousands of entries on first paint. Expanding one is still cheap and remembered for the session.
 
+**Tree markers via Pierre's `gitStatus`.** Hand Pierre an array of `{ path, status: 'added' | 'modified' | 'deleted' }` via `tree.setGitStatus(entries)`; folder bubble-up (`data-item-contains-git-change="true"`) and per-row attributes (`data-item-git-status="…"`) come for free. The only behaviours we layer on top:
+
+- **Deleted rows stay visible.** Pierre only renders paths we keep in the tree's `paths` array, so the array we hand it is `union(workdir, status_only_deletions)` — deleted-but-not-committed entries persist with their `deleted` marker until the deletion is committed, breaking VSCode's convention of dropping them. Restoring is `git checkout HEAD -- <path>` (palette command); after the working tree matches HEAD the next refresh strips the ghost row.
+- **Renames** map naturally to a `deleted` row at the old path and an `added` row at the new path; we don't try to be cleverer than git here.
+- **Conflicts** can't ride Pierre's three-state model; surface them in the SCM panel and the editor gutter, and leave the tree row in whatever working-tree state it actually has.
+
+Refresh on fs-watch events plus an explicit `setGitStatus` call after any moon-ide-issued git op. Once the change reaches a commit, the markers and ghost rows disappear in the same refresh tick — no stale state surviving across commits.
+
 Until this phase lands, the file tree shows everything except the `.git/` directory itself. Dotfiles like `.editorconfig` and `.husky/` are real working files and stay visible by design.
 
 ## Phase 6 — ACP
@@ -112,7 +121,23 @@ oxlint, oxfmt, prettier, eslint as sidecar processes. Debounced. Diagnostics mer
 
 Plugin manifest declares webview URL or sidecar binary, capabilities, display target. Tiny JSON-RPC API plugins call into the core. Mongoku-as-plugin is the first integration.
 
-## Phase 10+ — Innovation track
+## Phase 10 — Theming
+
+A single theme definition drives every coloured surface in the IDE — file tree, diff view, editor, terminal, SCM gutters, status bar — instead of three separate styling regimes. Pierre publishes [`@pierre/theme`](https://github.com/pierrecomputer/theme) (VS Code + Shiki + Zed + Cursor compatible, light/dark/vibrant variants); we adopt its theme file shape as the canonical format so anything Shiki understands works out of the box.
+
+Surfaces this phase wires up:
+
+- **File tree** (`@pierre/trees`) — already CSS-variable driven; map the active theme's role colours onto its tokens.
+- **Diff view** (`@pierre/diffs`) — consumes Pierre/Shiki themes natively; pass the same theme JSON.
+- **Editor** — CodeMirror 6 today, with our own dark/light theme. Either:
+  - Bridge: a tiny adapter that converts a Shiki theme's `tokenColors` into a CodeMirror `EditorView.theme` + Lezer highlight style. Keeps the Lezer pipeline.
+  - Or rip-and-replace: drop CodeMirror in favour of a Shiki-backed custom editor (open-ended; lives in Phase 11+ if it ever happens). Until then, the bridge keeps everything visually consistent.
+- **Terminal** (`xterm.js`) — Pierre themes already include ANSI palettes; feed them straight in.
+- **Editor chrome** — status bar, command palette, sidebar background, scrollbar corner — already CSS-variable driven from `app.css`; rename variables once so a single map covers everything.
+
+User-facing model: themes are **machine-local**, picked from the status-bar theme switcher (which today only flips dark/light) and persisted in `AppState`. No per-workspace overrides — the team agrees on personal preference here, like font size. Custom themes are JSON files dropped into a discoverable user dir; bundled themes ship in the binary. Future-fancy bits (live reload of edited theme files, per-tab theme overrides for screenshots, etc.) wait until somebody asks.
+
+## Phase 11+ — Innovation track
 
 Open-ended. Examples:
 
