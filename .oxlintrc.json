@@ -1,0 +1,49 @@
+{
+	"$schema": "./node_modules/oxlint/configuration_schema.json",
+	"plugins": ["typescript", "oxc", "unicorn", "import"],
+	"categories": {
+		"correctness": "error",
+		"suspicious": "warn",
+		"perf": "warn",
+		"style": "off"
+	},
+	"rules": {
+		"curly": ["error", "all"],
+		"eqeqeq": ["error", "always"],
+		"no-console": "warn",
+		"no-debugger": "error",
+		"prefer-const": "error",
+		"no-var": "error",
+		"no-await-in-loop": "off",
+		"no-unassigned-import": "off",
+		"no-unused-expressions": "warn",
+		"no-unassigned-vars": "warn",
+		"@typescript-eslint/no-explicit-any": "warn",
+		"@typescript-eslint/no-unused-vars": ["warn", { "argsIgnorePattern": "^_", "varsIgnorePattern": "^_" }],
+		"unicorn/no-await-expression-member": "off"
+	},
+	"ignorePatterns": [
+		"dist/**",
+		"build/**",
+		"target/**",
+		"node_modules/**",
+		"src-tauri/gen/**",
+		"crates/moon-protocol/bindings/**"
+	],
+	"overrides": [
+		{
+			"files": ["*.config.ts", "*.config.js", "vite.config.ts"],
+			"rules": {
+				"no-console": "off"
+			}
+		},
+		{
+			"files": ["*.svelte"],
+			"rules": {
+				"prefer-const": "off",
+				"no-unassigned-vars": "off",
+				"no-unused-expressions": "off"
+			}
+		}
+	]
+}

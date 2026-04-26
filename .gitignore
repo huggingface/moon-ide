@@ -1,0 +1,26 @@
+
+node_modules/
+dist/
+.vite/
+
+target/
+**/*.rs.bk
+
+src-tauri/gen/
+src-tauri/target/
+
+.env
+.env.local
+*.log
+
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+
+bun.lockb
+
+# Per-workspace state moon-ide writes when run on this repo.
+# It is dev artifact, never project config — see specs/decisions/0005-bootstrap.md.
+.moon/

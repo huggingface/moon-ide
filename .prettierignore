@@ -1,0 +1,9 @@
+# Prettier in this repo is **only** used for files oxfmt cannot format yet
+# (Svelte). Scripts call prettier with an explicit `**/*.svelte` glob.
+
+node_modules/
+dist/
+build/
+target/
+src-tauri/gen/
+**/.svelte-kit/

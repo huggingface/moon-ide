@@ -1,0 +1,5 @@
+{
+	"*.{ts,tsx,js,jsx,mjs,cjs,json,jsonc,json5,md,mdx,yaml,yml,css,scss,html,toml}": ["oxfmt"],
+	"*.svelte": ["prettier --write"],
+	"*.rs": ["rustfmt --edition 2021"]
+}

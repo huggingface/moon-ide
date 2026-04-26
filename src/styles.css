@@ -1,0 +1,122 @@
+/* Theme tokens. Override in light mode by toggling the `.light` class on :root. */
+:root {
+	/* Surfaces */
+	--m-bg: #0d1017;
+	--m-bg-1: #11151f;
+	--m-bg-2: #161c2a;
+	--m-bg-3: #1c2436;
+	--m-bg-overlay: rgba(255, 255, 255, 0.03);
+	--m-border: #232a3d;
+	--m-border-strong: #313a52;
+
+	/* Text */
+	--m-fg: #d6dcec;
+	--m-fg-muted: #8a93ab;
+	--m-fg-subtle: #5a6480;
+
+	/* Accents */
+	--m-accent: #7ea3ff;
+	--m-accent-strong: #a8c0ff;
+	--m-success: #5fd6a3;
+	--m-warning: #f0b86e;
+	--m-danger: #ff7a8a;
+
+	/* Editor */
+	--m-editor-bg: var(--m-bg);
+	--m-editor-gutter: var(--m-fg-subtle);
+	--m-editor-selection: rgba(126, 163, 255, 0.18);
+	--m-editor-line-active: rgba(255, 255, 255, 0.025);
+
+	/* Pierre Trees tokens. The lib reads `--trees-*-override` CSS vars on the
+	   host element and forwards them into its shadow root. Names per the
+	   @pierre/trees README; see also `--trees-theme-*` for the second set. */
+	--trees-bg-override: var(--m-bg-1);
+	--trees-fg-override: var(--m-fg);
+	--trees-fg-muted-override: var(--m-fg-muted);
+	--trees-bg-muted-override: var(--m-bg-overlay);
+	--trees-search-bg-override: var(--m-bg-2);
+	--trees-search-fg-override: var(--m-fg);
+	--trees-selected-bg-override: rgba(126, 163, 255, 0.18);
+	--trees-selected-fg-override: var(--m-fg);
+	--trees-selected-focused-border-color-override: var(--m-accent);
+	--trees-border-color-override: var(--m-border);
+	--trees-focus-ring-color-override: var(--m-accent);
+
+	--m-font-ui: -apple-system, 'Inter', system-ui, 'Segoe UI', Roboto, sans-serif;
+	--m-font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+}
+
+:root.light {
+	--m-bg: #fafbfd;
+	--m-bg-1: #f1f3f8;
+	--m-bg-2: #e9edf5;
+	--m-bg-3: #dde2ee;
+	--m-bg-overlay: rgba(0, 0, 0, 0.04);
+	--m-border: #d6dbe6;
+	--m-border-strong: #b8c0d2;
+	--m-fg: #16192a;
+	--m-fg-muted: #5e6885;
+	--m-fg-subtle: #8a93ab;
+	--m-accent: #4360c8;
+	--m-accent-strong: #2a3fa1;
+	--m-editor-bg: var(--m-bg);
+	--m-editor-line-active: rgba(0, 0, 0, 0.02);
+	--m-editor-selection: rgba(67, 96, 200, 0.15);
+}
+
+* {
+	box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+	margin: 0;
+	padding: 0;
+	height: 100%;
+	width: 100%;
+	background: var(--m-bg);
+	color: var(--m-fg);
+	font-family: var(--m-font-ui);
+	font-size: 13px;
+	line-height: 1.4;
+	-webkit-font-smoothing: antialiased;
+	text-rendering: optimizeLegibility;
+}
+
+button {
+	font: inherit;
+	color: inherit;
+	background: transparent;
+	border: 1px solid transparent;
+	border-radius: 4px;
+	padding: 4px 10px;
+	cursor: pointer;
+	/* Button labels are not content; click-dragging across them to "select"
+	   is always a misclick. Killing it globally is simpler than per-button. */
+	user-select: none;
+}
+
+button:hover {
+	background: var(--m-bg-overlay);
+}
+
+button:focus-visible {
+	outline: 1px solid var(--m-accent);
+	outline-offset: 1px;
+}
+
+::-webkit-scrollbar {
+	width: 10px;
+	height: 10px;
+}
+::-webkit-scrollbar-track {
+	background: transparent;
+}
+::-webkit-scrollbar-thumb {
+	background: var(--m-border);
+	border-radius: 5px;
+}
+::-webkit-scrollbar-thumb:hover {
+	background: var(--m-border-strong);
+}

@@ -1,0 +1,19 @@
+{
+	"$schema": "./node_modules/oxfmt/configuration_schema.json",
+	"useTabs": true,
+	"tabWidth": 2,
+	"printWidth": 120,
+	"semi": true,
+	"singleQuote": true,
+	"trailingComma": "all",
+	"endOfLine": "lf",
+	"insertFinalNewline": true,
+	"ignorePatterns": [
+		"**/dist/**",
+		"**/build/**",
+		"**/target/**",
+		"**/node_modules/**",
+		"src-tauri/gen/**",
+		"crates/moon-protocol/bindings/**"
+	]
+}
