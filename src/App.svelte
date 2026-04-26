@@ -8,6 +8,7 @@
 	import CommandPalette from './lib/components/CommandPalette.svelte';
 	import { workspace } from './lib/state.svelte';
 	import { palette, reloadWindow } from './lib/commands.svelte';
+	import { cycleFocus } from './lib/focus';
 	import { ipc } from './lib/ipc';
 
 	let sidebarWidth = $state(280);
@@ -16,6 +17,14 @@
 	onMount(() => {
 		void hydrate();
 		const onKey = async (event: KeyboardEvent) => {
+			// F6 cycle is unmodified. Shift+F6 goes the other way.
+			// Treat F6 specially so it works the same way regardless of
+			// whether other modifiers are held — we only branch on Shift.
+			if (event.key === 'F6') {
+				event.preventDefault();
+				cycleFocus(!event.shiftKey);
+				return;
+			}
 			const ctrl = event.ctrlKey || event.metaKey;
 			if (!ctrl) {
 				return;
@@ -58,6 +67,17 @@
 			if (!event.shiftKey && key === 'r') {
 				event.preventDefault();
 				await reloadWindow();
+				return;
+			}
+			// Don't filter by Shift: French AZERTY needs Shift to type
+			// a literal `0` (the digit row produces accented letters
+			// otherwise), so the natural binding there is Ctrl+Shift+0.
+			// On QWERTY it's plain Ctrl+0. Matching on the typed
+			// character (`key`) lets both presses fire the same
+			// shortcut without us caring about layout.
+			if (key === '0') {
+				event.preventDefault();
+				workspace.requestSidebarFocus();
 				return;
 			}
 		};

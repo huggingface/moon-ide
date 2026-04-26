@@ -117,6 +117,19 @@ export const builtInCommands: Command[] = [
 		run: () => workspace.toggleTheme(),
 	},
 	{
+		// `Focus File Tree` is the only discrete focus command — it
+		// always means the same thing wherever you invoke it from.
+		// The cycle commands (`F6` / `Shift+F6`) are intentionally
+		// keyboard-only: the palette is off-region for the cycle, so
+		// invoking them from there always re-enters at the same edge
+		// rather than advancing relative to where the user was. Use
+		// the keys directly.
+		id: 'focus.sidebar',
+		title: 'Focus File Tree',
+		shortcut: 'Ctrl+0',
+		run: () => workspace.requestSidebarFocus(),
+	},
+	{
 		id: 'view.reloadWindow',
 		// Refreshes the webview only — the Rust shell stays alive.
 		// Persisted state (workspace + tabs + active + theme) replays

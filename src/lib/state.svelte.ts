@@ -88,6 +88,14 @@ class WorkspaceState {
 	// lives here — not in Editor.svelte — so non-editor surfaces (file tree,
 	// command palette, future shortcuts) can request it uniformly.
 	focusTick = $state(0);
+	// Sibling tickers for the sidebar (file tree) and status bar. F6 /
+	// Ctrl+0 / Esc-from-tree all just bump these and the relevant
+	// component pulls focus in. Same pattern as `focusTick`; keeping
+	// the tickers in WorkspaceState (rather than passing component
+	// refs around) lets every region focus-shift call site stay
+	// declarative.
+	sidebarFocusTick = $state(0);
+	statusFocusTick = $state(0);
 
 	// Persistence guards. `persistScheduled` coalesces bursts of mutations
 	// (e.g. closeFile mutates openFiles + leftActive in the same tick) into
@@ -272,7 +280,17 @@ class WorkspaceState {
 		}
 	}
 
-	async openFile(path: string, side: SplitSide = this.focusedSide) {
+	/**
+	 * Open `path` in the given pane. By default, opening a file pulls
+	 * editor focus — that's what tab clicks, the quick-open palette,
+	 * and session restore want. Pass `{ focus: false }` for surfaces
+	 * where the user is still navigating *around* files (most notably
+	 * the file tree, where arrow-key selection should preview-open
+	 * without yanking focus out of the tree); the tree separately
+	 * raises focus on Enter / double-click. `focusedSide` updates
+	 * either way so subsequent operations target the same pane.
+	 */
+	async openFile(path: string, side: SplitSide = this.focusedSide, options: { focus?: boolean } = {}) {
 		const existing = this.openFiles.find((f) => f.path === path);
 		if (!existing) {
 			const kind = fileKindFor(path);
@@ -291,7 +309,7 @@ class WorkspaceState {
 		if (!tabs.includes(path)) {
 			this.setTabsFor(side, [...tabs, path]);
 		}
-		this.setActive(path, side);
+		this.setActive(path, side, options);
 		void this.ensureEditorConfig(path);
 	}
 
@@ -555,7 +573,7 @@ class WorkspaceState {
 		this.persistAppState();
 	}
 
-	setActive(path: string, side: SplitSide = this.focusedSide) {
+	setActive(path: string, side: SplitSide = this.focusedSide, options: { focus?: boolean } = {}) {
 		if (!this.tabsFor(side).includes(path)) {
 			return;
 		}
@@ -565,12 +583,24 @@ class WorkspaceState {
 			this.rightActive = path;
 		}
 		this.focusedSide = side;
-		this.requestEditorFocus();
+		// `focus` defaults to true; the tree opts out via `{ focus: false }`
+		// so arrow-key navigation can preview-browse without stealing focus.
+		if (options.focus !== false) {
+			this.requestEditorFocus();
+		}
 		this.persistAppState();
 	}
 
 	requestEditorFocus() {
 		this.focusTick += 1;
+	}
+
+	requestSidebarFocus() {
+		this.sidebarFocusTick += 1;
+	}
+
+	requestStatusFocus() {
+		this.statusFocusTick += 1;
 	}
 
 	focusSide(side: SplitSide) {

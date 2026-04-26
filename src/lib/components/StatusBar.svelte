@@ -1,8 +1,22 @@
 <script lang="ts">
 	import { workspace } from '../state.svelte';
+
+	let themeBtn: HTMLButtonElement | undefined = $state();
+
+	// F6 cycle can land on the status bar; the only interactive control
+	// here today is the theme toggle, so that's the focus target. If we
+	// add more controls later, switch this to a generic
+	// "first focusable" lookup like Sidebar.svelte does.
+	$effect(() => {
+		const tick = workspace.statusFocusTick;
+		if (tick === 0) {
+			return;
+		}
+		queueMicrotask(() => themeBtn?.focus());
+	});
 </script>
 
-<div class="status">
+<div class="status" data-region="status">
 	<div class="left">
 		{#if workspace.workspace}
 			<span class="item">{workspace.workspace.host}</span>
@@ -24,6 +38,7 @@
 			 applied. Independent dispatch path from the command palette,
 			 so a broken palette doesn't hide theme state. -->
 		<button
+			bind:this={themeBtn}
 			type="button"
 			class="theme"
 			title="Theme: {workspace.theme} (click to toggle)"

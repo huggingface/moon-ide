@@ -4,8 +4,55 @@ import { fileURLToPath } from 'node:url';
 
 const TAURI_DEV_HOST = process.env['TAURI_DEV_HOST'];
 
-export default defineConfig(async () => ({
-	plugins: [svelte()],
+export default defineConfig(async ({ command }) => ({
+	plugins: [
+		svelte({
+			// In dev, inline component styles into the JS module instead
+			// of emitting a separate `?svelte&type=style&lang.css` virtual
+			// module. Sidesteps a known race in vite-plugin-svelte where
+			// the browser parallel-fetches JS and virtual CSS and the CSS
+			// request occasionally lands at Vite before the JS transform
+			// has been cached, causing "failed to load virtual css module"
+			// and unstyled UI on launch under Tauri/WebKitGTK.
+			// (sveltejs/vite-plugin-svelte#1032, tauri-apps/tauri#10173.)
+			// Build keeps the default — production benefits from external
+			// CSS extraction, and the race is dev-server-only.
+			emitCss: command !== 'serve',
+		}),
+		// WebKitGTK persists ~/.local/share/dev.moon-ide.desktop/WebKitCache
+		// across launches and revalidates lazily. After config changes that
+		// alter what modules a Svelte component imports (e.g. flipping
+		// `emitCss`), stale cached JS resurrects requests for modules that
+		// no longer exist, which Vite logs as "failed to load virtual css
+		// module" warnings. `Cache-Control: no-store` tells WebKit not to
+		// keep dev responses on disk at all, so each launch gets a fresh
+		// view of whatever Vite is currently serving. Vite's defaults send
+		// `no-cache`, which still allows on-disk storage subject to
+		// revalidation — not what we want for a dev server.
+		//
+		// We override `setHeader` instead of pre/post middleware because
+		// Vite's transformMiddleware stamps `Cache-Control: no-cache` on
+		// its own responses *after* route middlewares run, so a plain
+		// `res.setHeader('Cache-Control', 'no-store')` would just be
+		// overwritten. Intercepting `setHeader` itself rewrites the value
+		// at the moment Vite tries to set it.
+		{
+			name: 'moon-ide:no-store-in-dev',
+			apply: 'serve',
+			configureServer(server) {
+				server.middlewares.use((_req, res, next) => {
+					const original = res.setHeader.bind(res);
+					res.setHeader = function (name, value) {
+						if (typeof name === 'string' && name.toLowerCase() === 'cache-control') {
+							return original(name, 'no-store');
+						}
+						return original(name, value);
+					};
+					next();
+				});
+			},
+		},
+	],
 
 	resolve: {
 		alias: {

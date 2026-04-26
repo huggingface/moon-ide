@@ -38,7 +38,14 @@
 	}
 </script>
 
-<div class="pane" role="group" tabindex="-1" onpointerdown={focus} onfocusin={focus}>
+<div
+	class="pane"
+	role="group"
+	tabindex="-1"
+	data-region={side === 'left' ? 'editor-left' : 'editor-right'}
+	onpointerdown={focus}
+	onfocusin={focus}
+>
 	<EditorTabs {side} />
 	<div class="body">
 		{#if activeFile?.kind === 'image'}
