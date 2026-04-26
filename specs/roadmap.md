@@ -60,7 +60,7 @@ A small, scoped phase that closes Phase 1's loose ends and adds the bare minimum
   - `indent_style`, `indent_size` / `tab_width` drive CodeMirror's tab size and the Tab keymap, replacing the hardcoded constants currently in `Editor.svelte`.
   - `end_of_line`, `insert_final_newline`, `trim_trailing_whitespace` are applied as pre-save hooks.
   - `charset` is utf-8 only for v1; anything else logs a warning.
-  - Reload happens on `.editorconfig` save (uses the existing fs watcher).
+  - Reload happens on `.editorconfig` save (the host clears its resolution cache when moon-ide writes a `.editorconfig`; external edits — git pull, another editor — wait for restart until Phase 5 ships the fs watcher).
 - Precedence: `.editorconfig` over moon-ide defaults. There is no project-level overlay file; per [ADR 0006](decisions/0006-no-settings-file.md) `settings.json` is gone.
 - No per-language `tab_size` default — let `.editorconfig` and the file's language decide.
 - Pre-save hook pipeline is generic (a list of `BeforeSaveTransform`s) so Phase 8 can drop format-on-save into the same pipeline without re-architecting it.

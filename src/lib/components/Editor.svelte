@@ -15,6 +15,7 @@
 	import { workspace, type OpenFile, type SplitSide } from '../state.svelte';
 	import { languageFor } from '../editor/language';
 	import { moonTheme } from '../editor/theme';
+	import { type EditorConfig } from '../protocol';
 
 	type Props = { file: OpenFile; side: SplitSide };
 	let { file, side }: Props = $props();
@@ -22,18 +23,17 @@
 	let host: HTMLDivElement;
 	let view: EditorView | undefined;
 	const languageCompartment = new Compartment();
-
-	// Editor defaults are hardcoded until Phase 1.5 wires `.editorconfig`.
-	// House style is tabs at width 2 with tab markers visible. There is
-	// deliberately no `settings.json` knob for these — see ADR 0006.
-	const TAB_SIZE = 2;
-	const INDENT_UNIT = '\t';
+	// Editorconfig settings live in their own compartment because they
+	// can change without the file changing — saving a `.editorconfig`
+	// invalidates the resolved settings for every open buffer.
+	const editorConfigCompartment = new Compartment();
 
 	// Each Editor instance owns one CM view that we re-target as the active file changes.
 	// We track the path the view currently holds so we know when to swap state.
 	let currentPath: string | null = null;
 
 	onMount(() => {
+		void workspace.ensureEditorConfig(file.path);
 		const state = EditorState.create({
 			doc: file.text,
 			extensions: baseExtensions(),
@@ -53,6 +53,7 @@
 			return;
 		}
 		if (file.path !== currentPath) {
+			void workspace.ensureEditorConfig(file.path);
 			const next = EditorState.create({
 				doc: file.text,
 				extensions: baseExtensions(),
@@ -68,6 +69,21 @@
 				changes: { from: 0, to: v.state.doc.length, insert: file.text },
 			});
 		}
+	});
+
+	// Reactive: when the resolved editorconfig for the active file
+	// changes (first fetch, or refresh after the user saved a
+	// `.editorconfig`), reconfigure the compartment in place. We don't
+	// rebuild the editor state — only tabSize / indentUnit need to flip.
+	$effect(() => {
+		const ec = workspace.editorConfigFor(file.path);
+		const v = view;
+		if (!v) {
+			return;
+		}
+		v.dispatch({
+			effects: editorConfigCompartment.reconfigure(editorConfigExtensions(ec)),
+		});
 	});
 
 	// Pull focus into the editor whenever the workspace bumps `focusTick`.
@@ -95,6 +111,7 @@
 	});
 
 	function baseExtensions() {
+		const ec = workspace.editorConfigFor(file.path);
 		return [
 			lineNumbers(),
 			highlightActiveLine(),
@@ -107,8 +124,7 @@
 			keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap, indentWithTab]),
 			moonTheme,
 			languageCompartment.of([]),
-			EditorState.tabSize.of(TAB_SIZE),
-			indentUnit.of(INDENT_UNIT),
+			editorConfigCompartment.of(editorConfigExtensions(ec)),
 			highlightTabs(),
 			EditorView.updateListener.of((update) => {
 				if (update.docChanged) {
@@ -119,6 +135,15 @@
 				}
 			}),
 		];
+	}
+
+	function editorConfigExtensions(ec: EditorConfig) {
+		// `indent_style = tab` → Tab inserts `\t`. `indent_style = space`
+		// → Tab inserts `indent_size` spaces. CodeMirror's `indentMore`
+		// (bound to Tab via `indentWithTab`) reads `indentUnit` for the
+		// per-level width, and `tabSize` for visual rendering of `\t`.
+		const unit = ec.indent_style === 'tab' ? '\t' : ' '.repeat(Math.max(1, ec.indent_size));
+		return [EditorState.tabSize.of(Math.max(1, ec.tab_width)), indentUnit.of(unit)];
 	}
 
 	async function applyLanguage(path: string) {

@@ -75,6 +75,42 @@ export type ThemeMode = 'dark' | 'light';
 
 export type SplitSide = 'left' | 'right';
 
+export type IndentStyle = 'tab' | 'space';
+
+export type EndOfLine = 'lf' | 'crlf' | 'cr';
+
+/**
+ * Fully resolved editorconfig for one file. Mirrors `moon_protocol::editorconfig::EditorConfig`.
+ * The host walks `.editorconfig` from the file up to the workspace root and
+ * returns this struct — callers don't traverse the cascade themselves.
+ */
+export type EditorConfig = {
+	indent_style: IndentStyle;
+	indent_size: number;
+	tab_width: number;
+	end_of_line: EndOfLine | null;
+	insert_final_newline: boolean;
+	trim_trailing_whitespace: boolean;
+	charset: string;
+	max_line_length: number | null;
+};
+
+/**
+ * Same defaults as `EditorConfig::default()` in moon-protocol. Surfaced
+ * to the editor when the host hasn't answered yet (first paint of a
+ * fresh tab) so we don't flicker between two indentation regimes.
+ */
+export const defaultEditorConfig: EditorConfig = {
+	indent_style: 'tab',
+	indent_size: 2,
+	tab_width: 2,
+	end_of_line: 'lf',
+	insert_final_newline: true,
+	trim_trailing_whitespace: true,
+	charset: 'utf-8',
+	max_line_length: null,
+};
+
 /**
  * Persisted UI session. Frontend-owned shape; the backend is pure
  * storage. Workspace-relative paths (relative to `workspace_path`).

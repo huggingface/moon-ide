@@ -6,9 +6,12 @@
 
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
+use moon_protocol::editorconfig::EditorConfig;
 use moon_protocol::fs::{DirEntry, EntryKind, ReadFileResult, StatResult, WriteFileResult};
 use moon_protocol::{MoonError, MoonResult};
 use std::time::SystemTime;
+
+use crate::editorconfig::EditorConfigService;
 
 #[async_trait]
 pub trait WorkspaceHost: Send + Sync {
@@ -25,15 +28,26 @@ pub trait WorkspaceHost: Send + Sync {
 	/// cannot dereference directly; that's their problem to handle (e.g. by
 	/// streaming bytes back over JSON-RPC instead).
 	async fn absolute_path(&self, path: &Utf8Path) -> MoonResult<String>;
+
+	/// Effective `.editorconfig` for `path`. The cascade is fully
+	/// resolved host-side; the caller gets the resulting struct, never
+	/// the chain. RemoteHost (Phase 2) serves this over JSON-RPC, so
+	/// agents and devcontainer-hosted tools see the same answer the UI
+	/// does — this is the single point where the rules are decided.
+	async fn editorconfig_for(&self, path: &Utf8Path) -> MoonResult<EditorConfig>;
 }
 
 pub struct LocalHost {
 	root: Utf8PathBuf,
+	editorconfig: EditorConfigService,
 }
 
 impl LocalHost {
 	pub fn new(root: Utf8PathBuf) -> Self {
-		Self { root }
+		Self {
+			editorconfig: EditorConfigService::new(root.clone()),
+			root,
+		}
 	}
 
 	pub fn root(&self) -> &Utf8Path {
@@ -174,15 +188,24 @@ impl WorkspaceHost for LocalHost {
 
 		// The parent must already exist; we don't auto-mkdir here.
 		let resolved_parent = self.resolve(parent)?;
-		let resolved = resolved_parent.join(
-			candidate
-				.file_name()
-				.ok_or_else(|| MoonError::invalid("path has no file name"))?,
-		);
+		let file_name = candidate
+			.file_name()
+			.ok_or_else(|| MoonError::invalid("path has no file name"))?;
+		let resolved = resolved_parent.join(file_name);
 
 		tokio::fs::write(resolved.as_std_path(), text.as_bytes())
 			.await
 			.map_err(MoonError::from)?;
+
+		// `.editorconfig` saves invalidate the resolution cache; the
+		// next `editorconfig_for` call picks up the new rules. We clear
+		// the whole cache rather than the affected subtree because
+		// editorconfig's upward-walk semantics mean a single file can
+		// influence anything below it; figuring out exactly which
+		// directories that touches isn't worth the bookkeeping.
+		if file_name == ".editorconfig" {
+			self.editorconfig.clear().await;
+		}
 
 		let metadata = tokio::fs::metadata(resolved.as_std_path())
 			.await
@@ -219,6 +242,10 @@ impl WorkspaceHost for LocalHost {
 
 	async fn absolute_path(&self, path: &Utf8Path) -> MoonResult<String> {
 		Ok(self.resolve(path)?.to_string())
+	}
+
+	async fn editorconfig_for(&self, path: &Utf8Path) -> MoonResult<EditorConfig> {
+		self.editorconfig.for_path(path).await
 	}
 }
 

@@ -31,6 +31,7 @@ pub fn run() {
 			commands::search::search_content,
 			commands::app_state::app_state_load,
 			commands::app_state::app_state_save,
+			commands::editorconfig::editorconfig_for_path,
 		])
 		.setup(|app| {
 			let config_dir = app

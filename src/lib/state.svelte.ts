@@ -2,8 +2,10 @@ import { convertFileSrc } from '@tauri-apps/api/core';
 import { confirm } from '@tauri-apps/plugin-dialog';
 import { ipc } from './ipc';
 import {
+	defaultEditorConfig,
 	formatError,
 	type AppState,
+	type EditorConfig,
 	type SplitSide,
 	type ThemeMode,
 	type Workspace,
@@ -49,6 +51,13 @@ class WorkspaceState {
 	// There is no project-level theme override; if a workspace ever needs
 	// one, that'd live in `.editorconfig` extensions, not here.
 	theme = $state<ThemeMode>('dark');
+
+	// Resolved `.editorconfig` per open file. Populated lazily when a
+	// file is opened and refreshed when the user saves a `.editorconfig`
+	// (which invalidates server-side, then we refetch every entry). Map
+	// is treated as immutable for reactivity — replace the whole thing
+	// on update, never mutate in place.
+	editorConfigs = $state<Map<string, EditorConfig>>(new Map());
 
 	// Monotonic counter the active editor view watches to refocus itself.
 	// Bumped whenever the user "navigates" to a file (tab click, tree click,
@@ -153,6 +162,11 @@ class WorkspaceState {
 		if (this.activePath !== null) {
 			this.requestEditorFocus();
 		}
+		// Warm the editorconfig cache for every restored tab so the
+		// initial paint already shows the right indent settings (without
+		// this, the active editor pops between defaults and the resolved
+		// values on the first frame).
+		await Promise.all(this.openFiles.map((f) => this.ensureEditorConfig(f.path)));
 	}
 
 	private persistAppState() {
@@ -225,6 +239,44 @@ class WorkspaceState {
 			}
 		}
 		this.setActive(path, side);
+		void this.ensureEditorConfig(path);
+	}
+
+	editorConfigFor(path: string): EditorConfig {
+		return this.editorConfigs.get(path) ?? defaultEditorConfig;
+	}
+
+	/**
+	 * Fetch the resolved `.editorconfig` for `path` and stash it. Idempotent
+	 * after the first successful call (the server caches per directory, but
+	 * we still want to avoid an IPC roundtrip on every focus change).
+	 * Failures are silent — the editor falls back to `defaultEditorConfig`,
+	 * which is the same shape `EditorConfig::default()` produces server-side.
+	 */
+	async ensureEditorConfig(path: string) {
+		if (this.editorConfigs.has(path)) {
+			return;
+		}
+		try {
+			const ec = await ipc.editorconfig.forPath(path);
+			const next = new Map(this.editorConfigs);
+			next.set(path, ec);
+			this.editorConfigs = next;
+		} catch {
+			// Leave the map untouched; subsequent calls will retry.
+		}
+	}
+
+	/**
+	 * Drop every cached editorconfig and refetch for currently open files.
+	 * Called after a `.editorconfig` save: the server invalidated its
+	 * cache during `write_file`, so the next `for_path` call returns the
+	 * new rules. We refresh open files eagerly so the active editor's
+	 * indent/tab handling updates without waiting for a tab switch.
+	 */
+	async refreshEditorConfigs() {
+		this.editorConfigs = new Map();
+		await Promise.all(this.openFiles.map((f) => this.ensureEditorConfig(f.path)));
 	}
 
 	private async loadTextFile(path: string): Promise<OpenFile | null> {
@@ -408,11 +460,30 @@ class WorkspaceState {
 		}
 		try {
 			const result = await ipc.fs.writeFile(file.path, file.text);
+			// The pre-save pipeline (line endings, trim trailing ws, final
+			// newline) runs server-side, so the bytes on disk may not equal
+			// `file.text`. Re-read so the in-memory buffer matches disk and
+			// the dirty fingerprint reflects the canonical form. Otherwise
+			// "save then save again" would still mark dirty if the pipeline
+			// changed anything.
+			const fresh = await ipc.fs.readFile(file.path);
 			this.openFiles = this.openFiles.map((f) =>
 				f.path === file.path
-					? { ...f, isDirty: false, loadedFingerprint: fingerprint(f.text), loadedMtimeMs: result.mtime_ms }
+					? {
+							...f,
+							text: fresh.is_binary ? f.text : fresh.text,
+							isDirty: false,
+							loadedFingerprint: fingerprint(fresh.is_binary ? f.text : fresh.text),
+							loadedMtimeMs: result.mtime_ms,
+						}
 					: f,
 			);
+			// Saving a `.editorconfig` invalidated the host-side cache;
+			// refresh frontend copies so the active editor immediately
+			// honours the new indent/tab rules.
+			if (file.name === '.editorconfig') {
+				await this.refreshEditorConfigs();
+			}
 		} catch (err) {
 			this.flash(`Save failed: ${formatError(err)}`);
 		}

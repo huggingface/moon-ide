@@ -20,6 +20,7 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 notify = { workspace = true }
 ignore = { workspace = true }
+ec4rs = { workspace = true }
 uuid = { version = "1.18", features = ["v4", "serde"] }
 grep-matcher = "0.1"
 grep-regex = "0.1"
