@@ -35,7 +35,19 @@ export type OpenFile = {
 class WorkspaceState {
 	workspace = $state<Workspace | null>(null);
 	paths = $state<string[]>([]);
+
+	// Loaded text/image buffers, keyed by workspace-relative path. A
+	// buffer is shared across panes — typing in pane A updates the same
+	// `OpenFile` that pane B is rendering, so the dirty marker and text
+	// stay in lockstep. A buffer is dropped from this list when it falls
+	// out of every pane's tab list (`closeFile` does the GC).
 	openFiles = $state<OpenFile[]>([]);
+
+	// Per-pane tab order. The two lists are independent (VSCode/Zed
+	// convention): a path can live in one pane, both, or neither, and
+	// reordering on one strip never touches the other.
+	leftTabs = $state<string[]>([]);
+	rightTabs = $state<string[]>([]);
 
 	// Primary and (optional) secondary editor each track their own active path.
 	// Phase 1 is two-pane only; Phase 2+ can grow to N panes.
@@ -90,6 +102,8 @@ class WorkspaceState {
 			this.workspace = ws;
 			this.paths = [];
 			this.openFiles = [];
+			this.leftTabs = [];
+			this.rightTabs = [];
 			this.leftActive = null;
 			this.rightActive = null;
 			this.hasSplit = false;
@@ -100,6 +114,18 @@ class WorkspaceState {
 			this.persistAppState();
 		} catch (err) {
 			this.flash(`Failed to open: ${formatError(err)}`);
+		}
+	}
+
+	tabsFor(side: SplitSide): string[] {
+		return side === 'left' ? this.leftTabs : this.rightTabs;
+	}
+
+	private setTabsFor(side: SplitSide, tabs: string[]) {
+		if (side === 'left') {
+			this.leftTabs = tabs;
+		} else {
+			this.rightTabs = tabs;
 		}
 	}
 
@@ -132,8 +158,11 @@ class WorkspaceState {
 
 		this.suppressPersist = true;
 		try {
+			// Load each unique path exactly once; both panes can share the
+			// resulting buffer.
+			const unique = new Set<string>([...session.open_files_left, ...session.open_files_right]);
 			const loaded: OpenFile[] = [];
-			for (const path of session.open_files) {
+			for (const path of unique) {
 				try {
 					const kind = fileKindFor(path);
 					const file = kind === 'image' ? await this.loadImageFile(path) : await this.loadTextFile(path);
@@ -146,12 +175,21 @@ class WorkspaceState {
 					// cleaned-up list so it stops haunting future launches.
 				}
 			}
+			const isLoaded = (p: string) => loaded.some((f) => f.path === p);
 			this.openFiles = loaded;
+			this.leftTabs = session.open_files_left.filter(isLoaded);
+			this.rightTabs = session.open_files_right.filter(isLoaded);
 
-			const isOpen = (p: string | null) => p !== null && loaded.some((f) => f.path === p);
-			this.leftActive = isOpen(session.active_left) ? session.active_left : (loaded[0]?.path ?? null);
-			this.rightActive = session.has_split && isOpen(session.active_right) ? session.active_right : null;
-			this.hasSplit = this.rightActive !== null;
+			const isOpenIn = (side: SplitSide, p: string | null) =>
+				p !== null && (side === 'left' ? this.leftTabs.includes(p) : this.rightTabs.includes(p));
+			this.leftActive = isOpenIn('left', session.active_left) ? session.active_left : (this.leftTabs[0] ?? null);
+			this.hasSplit = session.has_split && this.rightTabs.length > 0;
+			this.rightActive =
+				this.hasSplit && isOpenIn('right', session.active_right)
+					? session.active_right
+					: this.hasSplit
+						? (this.rightTabs[0] ?? null)
+						: null;
 			this.focusedSide = session.focused_side === 'right' && this.hasSplit ? 'right' : 'left';
 		} finally {
 			this.suppressPersist = false;
@@ -186,7 +224,8 @@ class WorkspaceState {
 			const session: WorkspaceSession | null = ws
 				? {
 						workspace_path: ws.root,
-						open_files: this.openFiles.map((f) => f.path),
+						open_files_left: [...this.leftTabs],
+						open_files_right: this.hasSplit ? [...this.rightTabs] : [],
 						active_left: this.leftActive,
 						active_right: this.hasSplit ? this.rightActive : null,
 						has_split: this.hasSplit,
@@ -237,6 +276,10 @@ class WorkspaceState {
 				this.flash(`Failed to open ${path}: ${formatError(err)}`);
 				return;
 			}
+		}
+		const tabs = this.tabsFor(side);
+		if (!tabs.includes(path)) {
+			this.setTabsFor(side, [...tabs, path]);
 		}
 		this.setActive(path, side);
 		void this.ensureEditorConfig(path);
@@ -311,12 +354,18 @@ class WorkspaceState {
 		};
 	}
 
-	async closeFile(path: string) {
+	async closeFile(path: string, side: SplitSide = this.focusedSide) {
 		const file = this.openFiles.find((f) => f.path === path);
 		if (!file) {
 			return;
 		}
-		if (file.isDirty) {
+		const otherSide: SplitSide = side === 'left' ? 'right' : 'left';
+		const otherHasIt = this.tabsFor(otherSide).includes(path);
+
+		// Dirty prompt only fires when this is the last copy: if pane B
+		// still has the buffer open, closing pane A's tab discards
+		// nothing (the buffer stays alive and reachable from B).
+		if (file.isDirty && !otherHasIt) {
 			// 2-button native dialog. We don't (yet) offer "Save" here:
 			// Ctrl+S already saves, and a 3-way dialog would need a custom
 			// in-app modal (`@tauri-apps/plugin-dialog` is OK/Cancel only).
@@ -330,19 +379,31 @@ class WorkspaceState {
 				return;
 			}
 		}
-		const idx = this.openFiles.findIndex((f) => f.path === path);
+
+		const tabs = this.tabsFor(side);
+		const idx = tabs.indexOf(path);
 		if (idx < 0) {
 			return;
 		}
-		this.openFiles = this.openFiles.filter((f) => f.path !== path);
+		const remaining = tabs.filter((p) => p !== path);
+		this.setTabsFor(side, remaining);
 
-		const fallback = this.openFiles[Math.max(0, idx - 1)]?.path ?? null;
-		if (this.leftActive === path) {
+		const fallback = remaining[Math.max(0, idx - 1)] ?? null;
+		if (side === 'left' && this.leftActive === path) {
 			this.leftActive = fallback;
 		}
-		if (this.rightActive === path) {
+		if (side === 'right' && this.rightActive === path) {
 			this.rightActive = fallback;
 		}
+
+		// GC the buffer when no pane references it anymore. Keeping
+		// stale entries in `openFiles` would leak the loaded text and
+		// break the "re-click an already-open file" flow (the existing
+		// entry would short-circuit the load).
+		if (!this.leftTabs.includes(path) && !this.rightTabs.includes(path)) {
+			this.openFiles = this.openFiles.filter((f) => f.path !== path);
+		}
+
 		if (fallback !== null) {
 			this.requestEditorFocus();
 		}
@@ -350,42 +411,38 @@ class WorkspaceState {
 	}
 
 	/**
-	 * Move an open tab so it sits immediately before `beforePath`, or to
-	 * the end of the strip if `beforePath` is null. Tab order is shared
-	 * across both panes for now (left and right show the same `openFiles`
-	 * list), so reordering on either strip reorders the other. Active
-	 * selections stay pointed at the same files.
-	 *
-	 * Phase 1.5 splits this into per-pane lists (see specs/roadmap.md);
-	 * once that lands, this method takes a `side: SplitSide` and only
-	 * touches the matching pane's list.
+	 * Move a tab on `side` so it sits immediately before `beforePath`,
+	 * or to the end of the strip if `beforePath` is null. Reordering is
+	 * scoped to the pane — the other pane's tab order is unaffected
+	 * (VSCode/Zed convention). Drag-between-panes is intentionally not
+	 * supported yet; surface it when someone actually asks for it.
 	 */
-	moveFile(fromPath: string, beforePath: string | null) {
-		const file = this.openFiles.find((f) => f.path === fromPath);
-		if (!file) {
-			return;
-		}
+	moveFile(fromPath: string, beforePath: string | null, side: SplitSide = this.focusedSide) {
 		if (beforePath === fromPath) {
 			return;
 		}
-		const without = this.openFiles.filter((f) => f.path !== fromPath);
+		const tabs = this.tabsFor(side);
+		if (!tabs.includes(fromPath)) {
+			return;
+		}
+		const without = tabs.filter((p) => p !== fromPath);
 		if (beforePath === null) {
-			this.openFiles = [...without, file];
+			this.setTabsFor(side, [...without, fromPath]);
 			this.persistAppState();
 			return;
 		}
-		const beforeIdx = without.findIndex((f) => f.path === beforePath);
+		const beforeIdx = without.indexOf(beforePath);
 		if (beforeIdx < 0) {
-			this.openFiles = [...without, file];
+			this.setTabsFor(side, [...without, fromPath]);
 			this.persistAppState();
 			return;
 		}
-		this.openFiles = [...without.slice(0, beforeIdx), file, ...without.slice(beforeIdx)];
+		this.setTabsFor(side, [...without.slice(0, beforeIdx), fromPath, ...without.slice(beforeIdx)]);
 		this.persistAppState();
 	}
 
 	setActive(path: string, side: SplitSide = this.focusedSide) {
-		if (!this.openFiles.some((f) => f.path === path)) {
+		if (!this.tabsFor(side).includes(path)) {
 			return;
 		}
 		if (side === 'left') {
@@ -416,8 +473,19 @@ class WorkspaceState {
 			this.persistAppState();
 			return;
 		}
+		// Open the split with the active tab mirrored on the right. Per-
+		// pane lists are independent from this point on: the user can
+		// open / close / reorder tabs on each strip without affecting the
+		// other. Mirroring just one tab (rather than copying the full
+		// left list) keeps the split visually clean — the second pane is
+		// for "look at this file alongside that one", not "duplicate my
+		// whole tab strip".
 		this.hasSplit = true;
-		this.rightActive = this.leftActive;
+		const seed = this.leftActive;
+		if (seed !== null && !this.rightTabs.includes(seed)) {
+			this.rightTabs = [...this.rightTabs, seed];
+		}
+		this.rightActive = seed;
 		this.focusedSide = 'right';
 		this.persistAppState();
 	}
@@ -426,9 +494,17 @@ class WorkspaceState {
 		if (!this.hasSplit) {
 			return;
 		}
+		// Drop the right pane's tabs entirely. Buffers that are still in
+		// the left pane stay loaded; ones that lived only on the right
+		// fall out of `openFiles` via the same GC pass `closeFile` uses.
+		const dropped = this.rightTabs.filter((p) => !this.leftTabs.includes(p));
+		this.rightTabs = [];
 		this.hasSplit = false;
 		this.rightActive = null;
 		this.focusedSide = 'left';
+		if (dropped.length > 0) {
+			this.openFiles = this.openFiles.filter((f) => !dropped.includes(f.path));
+		}
 		this.persistAppState();
 	}
 

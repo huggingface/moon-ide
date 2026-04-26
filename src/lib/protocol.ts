@@ -114,10 +114,13 @@ export const defaultEditorConfig: EditorConfig = {
 /**
  * Persisted UI session. Frontend-owned shape; the backend is pure
  * storage. Workspace-relative paths (relative to `workspace_path`).
+ * The two `open_files_*` lists are independent — a path can live in
+ * one pane, both, or neither (VSCode/Zed convention).
  */
 export type WorkspaceSession = {
 	workspace_path: string;
-	open_files: string[];
+	open_files_left: string[];
+	open_files_right: string[];
 	active_left: string | null;
 	active_right: string | null;
 	has_split: boolean;

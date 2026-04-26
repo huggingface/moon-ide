@@ -64,7 +64,8 @@ mod tests {
 	fn sample_session() -> WorkspaceSession {
 		WorkspaceSession {
 			workspace_path: "/tmp/example".into(),
-			open_files: vec!["src/main.rs".into(), "Cargo.toml".into()],
+			open_files_left: vec!["src/main.rs".into(), "Cargo.toml".into()],
+			open_files_right: vec![],
 			active_left: Some("src/main.rs".into()),
 			active_right: None,
 			has_split: false,
@@ -95,7 +96,8 @@ mod tests {
 		let loaded = load(&cfg).await.unwrap();
 		let session = loaded.last_session.expect("session present");
 		assert_eq!(session.workspace_path, "/tmp/example");
-		assert_eq!(session.open_files, vec!["src/main.rs", "Cargo.toml"]);
+		assert_eq!(session.open_files_left, vec!["src/main.rs", "Cargo.toml"]);
+		assert!(session.open_files_right.is_empty());
 		assert_eq!(session.active_left.as_deref(), Some("src/main.rs"));
 		assert_eq!(loaded.theme, ThemeMode::Light);
 	}

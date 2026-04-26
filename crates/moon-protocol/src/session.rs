@@ -26,11 +26,16 @@ pub struct WorkspaceSession {
 	/// workspace on the next launch and to invalidate stale sessions
 	/// when the user opens a different folder.
 	pub workspace_path: String,
-	/// Paths of files that were open in tabs, in tab order, relative to
+	/// Tabs open in the left pane, in tab order, relative to
 	/// `workspace_path`. May reference files that no longer exist; the
 	/// frontend filters those out at restore time.
-	pub open_files: Vec<String>,
-	/// Active tab on the left pane, if any. Must appear in `open_files`.
+	pub open_files_left: Vec<String>,
+	/// Tabs open in the right pane, in tab order, relative to
+	/// `workspace_path`. Empty when no split is active. The two lists
+	/// are independent — a file can live in one pane, both, or neither
+	/// (VSCode/Zed convention).
+	pub open_files_right: Vec<String>,
+	/// Active tab on the left pane, if any. Must appear in `open_files_left`.
 	pub active_left: Option<String>,
 	/// Active tab on the right pane, if any. `None` when the split is
 	/// closed; `Some` only makes sense alongside `has_split = true`.

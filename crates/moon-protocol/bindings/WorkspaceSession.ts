@@ -9,13 +9,20 @@ export type WorkspaceSession = {
  */
 workspace_path: string, 
 /**
- * Paths of files that were open in tabs, in tab order, relative to
+ * Tabs open in the left pane, in tab order, relative to
  * `workspace_path`. May reference files that no longer exist; the
  * frontend filters those out at restore time.
  */
-open_files: Array<string>, 
+open_files_left: Array<string>, 
 /**
- * Active tab on the left pane, if any. Must appear in `open_files`.
+ * Tabs open in the right pane, in tab order, relative to
+ * `workspace_path`. Empty when no split is active. The two lists
+ * are independent — a file can live in one pane, both, or neither
+ * (VSCode/Zed convention).
+ */
+open_files_right: Array<string>, 
+/**
+ * Active tab on the left pane, if any. Must appear in `open_files_left`.
  */
 active_left: string | null, 
 /**

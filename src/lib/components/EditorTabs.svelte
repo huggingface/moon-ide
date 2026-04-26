@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { workspace, type SplitSide } from '../state.svelte';
+	import { workspace, type OpenFile, type SplitSide } from '../state.svelte';
 
 	type Props = { side: SplitSide };
 	let { side }: Props = $props();
@@ -11,13 +11,24 @@
 	// muted underline so the user can still tell which tab is active
 	// over there.
 	const paneFocused = $derived(workspace.focusedSide === side);
+	// Tab list is per pane (Phase 1.5): the strip renders only the
+	// paths assigned to this side, in this side's order.
+	const tabPaths: string[] = $derived(workspace.tabsFor(side));
+	const tabs: OpenFile[] = $derived(
+		tabPaths.flatMap((p) => {
+			const file = workspace.openFiles.find((f) => f.path === p);
+			return file ? [file] : [];
+		}),
+	);
 
-	// MIME type used to identify our own tab drags. Reading the actual
-	// payload is restricted to the `drop` handler by browser policy, but
-	// `dataTransfer.types` is readable in `dragover` — we use that to
-	// reject drags that didn't start in our tab strip (random files
-	// dropped from outside).
+	// MIME type used to identify our own tab drags. Drag-between-panes
+	// is intentionally not supported yet — we tag the side onto the
+	// payload and bail in `onDrop` if the source pane doesn't match.
+	// `dataTransfer.types` is readable in `dragover`, so the type
+	// channel still works as a "is this our drag?" gate; the side
+	// payload is only readable on drop.
 	const TAB_MIME = 'application/x-moon-tab';
+	const TAB_SIDE_MIME = 'application/x-moon-tab-side';
 
 	let draggingPath = $state<string | null>(null);
 	let dropBeforePath = $state<string | null>(null);
@@ -29,7 +40,7 @@
 
 	function close(event: Event, path: string) {
 		event.stopPropagation();
-		void workspace.closeFile(path);
+		void workspace.closeFile(path, side);
 	}
 
 	function onTabKey(event: KeyboardEvent, path: string) {
@@ -58,6 +69,7 @@
 		}
 		event.dataTransfer.effectAllowed = 'move';
 		event.dataTransfer.setData(TAB_MIME, path);
+		event.dataTransfer.setData(TAB_SIDE_MIME, side);
 		// Plain-text fallback so dragging a tab into a text field does
 		// something sensible instead of silently failing.
 		event.dataTransfer.setData('text/plain', path);
@@ -84,10 +96,10 @@
 			dropAtEnd = false;
 			return;
 		}
-		const idx = workspace.openFiles.findIndex((f) => f.path === path);
-		const next = workspace.openFiles[idx + 1];
+		const idx = tabPaths.indexOf(path);
+		const next = idx >= 0 ? tabPaths[idx + 1] : undefined;
 		if (next) {
-			dropBeforePath = next.path;
+			dropBeforePath = next;
 			dropAtEnd = false;
 			return;
 		}
@@ -116,6 +128,7 @@
 		}
 		event.preventDefault();
 		const fromPath = event.dataTransfer?.getData(TAB_MIME) ?? '';
+		const fromSide = event.dataTransfer?.getData(TAB_SIDE_MIME) ?? '';
 		const target = dropAtEnd ? null : dropBeforePath;
 		dropBeforePath = null;
 		dropAtEnd = false;
@@ -123,7 +136,14 @@
 		if (fromPath === '') {
 			return;
 		}
-		workspace.moveFile(fromPath, target);
+		// Drag-between-panes is intentionally not supported yet — drops
+		// from the other pane are silently ignored. Adding it later is
+		// a `moveFile` that knows how to remove from one side and
+		// insert into the other; we'll do that when there's a request.
+		if (fromSide !== '' && fromSide !== side) {
+			return;
+		}
+		workspace.moveFile(fromPath, target, side);
 	}
 
 	function onDragEnd() {
@@ -152,7 +172,7 @@
 		dropAtEnd = false;
 	}}
 >
-	{#each workspace.openFiles as file (file.path)}
+	{#each tabs as file (file.path)}
 		<div
 			role="tab"
 			class="tab"
