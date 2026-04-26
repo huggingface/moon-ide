@@ -57,8 +57,10 @@ sudo apt install -y libwebkit2gtk-4.1-dev libsoup-3.0-dev libgtk-3-dev \
 
 ```bash
 bun install
-bun run tauri dev
+bun run dev
 ```
+
+`bun run dev` boots the Tauri shell (Rust backend + the Vite-served Svelte UI as one window). On the first run, expect a noticeable Cargo build before the window appears.
 
 `bun run fmt` / `lint` / `check` / `test` cover both the JS/TS and Rust sides; `:js` / `:rust` variants exist if you only want one. Code style and tooling rationale lives in [ADR 0004](specs/decisions/0004-code-style.md); a pre-commit hook auto-formats staged files.
 

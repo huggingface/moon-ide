@@ -68,15 +68,15 @@ bun run fmt:check
 bun run lint
 bun run check
 bun run test
-bun run build
+bun run build:vite
 ```
 
-Expected: all five exit 0, **and** `bun run build` is silent (no Vite warnings, no `INEFFECTIVE_DYNAMIC_IMPORT`, no chunk-size warning).
+Expected: all five exit 0, **and** `bun run build:vite` is silent (no Vite warnings, no `INEFFECTIVE_DYNAMIC_IMPORT`, no chunk-size warning). (The full `bun run build` runs `tauri build`, which bundles the Rust shell — slow and not what we want for a quick gate.)
 
 ### App smoke test
 
 ```bash
-bun run tauri dev
+bun run dev
 ```
 
 1. **Open folder.** Either `Ctrl+P` → "Open Folder…" or click the welcome-screen button. Pick `~/code/moon-ide` itself.
@@ -136,7 +136,7 @@ bun run tauri dev
 ### Session restore (folder + tabs + active)
 
 1. Open a folder. Open three files; switch to the second so it's active. Quit the app.
-2. Relaunch via `bun run tauri dev`. Same folder reopens, same three tabs in the same order, the second one is active. Caret is in the editor (arrow keys move the caret immediately, no extra click).
+2. Relaunch via `bun run dev`. Same folder reopens, same three tabs in the same order, the second one is active. Caret is in the editor (arrow keys move the caret immediately, no extra click).
 3. The matching tree row is highlighted as the active file (you should not have to scroll-and-click in the tree to confirm which file is which).
 4. With multiple tabs open, click each one in turn. The tree-row highlight follows the active tab.
 5. Close all tabs. Tree selection clears. Click any file in the tree → it opens (selection-change event fires correctly).
@@ -150,7 +150,7 @@ bun run tauri dev
 - The UI must not call `tauri.invoke` for anything outside `src/lib/ipc.ts`. (Grep for `invoke<` outside that file — should return zero hits.)
 - The dirty marker is correct in three cases: (a) edit then revert via undo → not dirty; (b) edit then revert by retyping the original → not dirty; (c) two edits that each toggle a character but result in same length / different bytes → dirty.
 - Image opens never call `fs.readFile`. Verify by adding a `console.log` in the IPC layer if regressions are suspected.
-- `bun run build` stays silent; new warnings are bugs.
+- `bun run build:vite` stays silent; new warnings are bugs.
 - Workspace-relative paths are the only thing the UI sees. Absolute paths only enter the UI via `ipc.fs.absolutePath()` and only for the asset-protocol case.
 - `.git/` stays hidden in the tree. No other directories are filtered host-side.
 - File-name language matches happen **before** extension matches, so `Cargo.lock` is TOML, not no-language.

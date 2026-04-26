@@ -4,8 +4,8 @@
 	"version": "0.0.0",
 	"identifier": "dev.moon-ide.desktop",
 	"build": {
-		"beforeDevCommand": "bun run dev",
-		"beforeBuildCommand": "bun run build",
+		"beforeDevCommand": "bun run dev:vite",
+		"beforeBuildCommand": "bun run build:vite",
 		"devUrl": "http://localhost:1420",
 		"frontendDist": "../dist"
 	},

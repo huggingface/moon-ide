@@ -454,9 +454,7 @@ class WorkspaceState {
 	/**
 	 * Move a tab on `side` so it sits immediately before `beforePath`,
 	 * or to the end of the strip if `beforePath` is null. Reordering is
-	 * scoped to the pane — the other pane's tab order is unaffected
-	 * (VSCode/Zed convention). Drag-between-panes is intentionally not
-	 * supported yet; surface it when someone actually asks for it.
+	 * scoped to the pane. For cross-pane moves use `moveTab`.
 	 */
 	moveFile(fromPath: string, beforePath: string | null, side: SplitSide = this.focusedSide) {
 		if (beforePath === fromPath) {
@@ -479,6 +477,81 @@ class WorkspaceState {
 			return;
 		}
 		this.setTabsFor(side, [...without.slice(0, beforeIdx), fromPath, ...without.slice(beforeIdx)]);
+		this.persistAppState();
+	}
+
+	/**
+	 * Move a tab between panes (or reorder within one pane when
+	 * `fromSide === toSide`). Buffer is shared so we never reload —
+	 * just shuffle the path between the per-pane tab lists. After the
+	 * move, the dragged tab becomes active on the destination side and
+	 * focus follows (VSCode convention).
+	 *
+	 * If the destination pane already had `fromPath` open, we treat the
+	 * drop as "consolidate here": the tab is removed from the source
+	 * and the destination keeps its existing copy at the drop position
+	 * (or untouched if dropping on itself).
+	 */
+	moveTab(fromPath: string, fromSide: SplitSide, toSide: SplitSide, beforePath: string | null) {
+		if (fromSide === toSide) {
+			this.moveFile(fromPath, beforePath, toSide);
+			return;
+		}
+		const fromTabs = this.tabsFor(fromSide);
+		if (!fromTabs.includes(fromPath)) {
+			return;
+		}
+		const toTabs = this.tabsFor(toSide);
+		const alreadyInTarget = toTabs.includes(fromPath);
+
+		const fromIdx = fromTabs.indexOf(fromPath);
+		const newFromTabs = fromTabs.filter((p) => p !== fromPath);
+
+		let newToTabs: string[];
+		if (alreadyInTarget) {
+			// Drop landed on the dragged tab itself or past the end:
+			// don't shuffle the destination, just remove from source.
+			if (beforePath === null || beforePath === fromPath) {
+				newToTabs = toTabs;
+			} else {
+				const without = toTabs.filter((p) => p !== fromPath);
+				const beforeIdx = without.indexOf(beforePath);
+				newToTabs =
+					beforeIdx < 0
+						? [...without, fromPath]
+						: [...without.slice(0, beforeIdx), fromPath, ...without.slice(beforeIdx)];
+			}
+		} else if (beforePath === null) {
+			newToTabs = [...toTabs, fromPath];
+		} else {
+			const beforeIdx = toTabs.indexOf(beforePath);
+			newToTabs =
+				beforeIdx < 0 ? [...toTabs, fromPath] : [...toTabs.slice(0, beforeIdx), fromPath, ...toTabs.slice(beforeIdx)];
+		}
+
+		this.setTabsFor(fromSide, newFromTabs);
+		this.setTabsFor(toSide, newToTabs);
+
+		// Source loses the active tab — pick the same fallback `closeFile`
+		// would (sibling immediately to the left, or null if pane went empty).
+		const wasActiveOnSource = (fromSide === 'left' ? this.leftActive : this.rightActive) === fromPath;
+		if (wasActiveOnSource) {
+			const fallback = newFromTabs[Math.max(0, fromIdx - 1)] ?? null;
+			if (fromSide === 'left') {
+				this.leftActive = fallback;
+			} else {
+				this.rightActive = fallback;
+			}
+		}
+
+		// Destination becomes active + focused on the dropped tab.
+		if (toSide === 'left') {
+			this.leftActive = fromPath;
+		} else {
+			this.rightActive = fromPath;
+		}
+		this.focusedSide = toSide;
+		this.requestEditorFocus();
 		this.persistAppState();
 	}
 

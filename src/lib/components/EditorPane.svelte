@@ -18,7 +18,6 @@
 		}
 		return workspace.openFiles.find((f) => f.path === activePath) ?? null;
 	});
-	const focused = $derived(workspace.focusedSide === side);
 	const showMarkdownPreview = $derived(
 		activeFile !== null &&
 			activeFile.kind === 'text' &&
@@ -39,7 +38,7 @@
 	}
 </script>
 
-<div class="pane" class:focused role="group" tabindex="-1" onpointerdown={focus} onfocusin={focus}>
+<div class="pane" role="group" tabindex="-1" onpointerdown={focus} onfocusin={focus}>
 	<EditorTabs {side} />
 	<div class="body">
 		{#if activeFile?.kind === 'image'}
@@ -62,15 +61,13 @@
 		min-width: 0;
 		min-height: 0;
 		background: var(--m-bg);
-		position: relative;
 	}
-	.pane.focused::before {
-		content: '';
-		position: absolute;
-		inset: 0;
-		border-top: 2px solid var(--m-accent);
-		pointer-events: none;
-	}
+	/* Focus indicator lives on the active tab's underline (bright on
+	the focused side, muted on the unfocused side via `.active-blurred`).
+	We used to also paint a 2px accent border-top on the focused pane,
+	but in single-pane mode that was a redundant second copy of the same
+	signal, and in split mode the bright-vs-muted tab underline already
+	tells the panes apart at a glance. Removed for visual quiet. */
 	.body {
 		flex: 1;
 		min-height: 0;

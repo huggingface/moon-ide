@@ -34,12 +34,11 @@
 		workspace.setPreviewMode(activePath, mode);
 	}
 
-	// MIME type used to identify our own tab drags. Drag-between-panes
-	// is intentionally not supported yet — we tag the side onto the
-	// payload and bail in `onDrop` if the source pane doesn't match.
-	// `dataTransfer.types` is readable in `dragover`, so the type
-	// channel still works as a "is this our drag?" gate; the side
-	// payload is only readable on drop.
+	// MIME type used to identify our own tab drags. The side payload
+	// lets the drop target know which pane the tab came from (so it
+	// can call `moveTab` with the right source); only readable on
+	// drop, but `dataTransfer.types` is readable in `dragover`, so
+	// the TAB_MIME entry doubles as the "is this our drag?" gate.
 	const TAB_MIME = 'application/x-moon-tab';
 	const TAB_SIDE_MIME = 'application/x-moon-tab-side';
 
@@ -141,7 +140,7 @@
 		}
 		event.preventDefault();
 		const fromPath = event.dataTransfer?.getData(TAB_MIME) ?? '';
-		const fromSide = event.dataTransfer?.getData(TAB_SIDE_MIME) ?? '';
+		const fromSideRaw = event.dataTransfer?.getData(TAB_SIDE_MIME) ?? '';
 		const target = dropAtEnd ? null : dropBeforePath;
 		dropBeforePath = null;
 		dropAtEnd = false;
@@ -149,14 +148,10 @@
 		if (fromPath === '') {
 			return;
 		}
-		// Drag-between-panes is intentionally not supported yet — drops
-		// from the other pane are silently ignored. Adding it later is
-		// a `moveFile` that knows how to remove from one side and
-		// insert into the other; we'll do that when there's a request.
-		if (fromSide !== '' && fromSide !== side) {
-			return;
-		}
-		workspace.moveFile(fromPath, target, side);
+		// Older drags or drops from a non-tab source may not carry the
+		// side payload — fall back to "same side" so we just reorder.
+		const fromSide: SplitSide = fromSideRaw === 'left' || fromSideRaw === 'right' ? fromSideRaw : side;
+		workspace.moveTab(fromPath, fromSide, side, target);
 	}
 
 	function onDragEnd() {

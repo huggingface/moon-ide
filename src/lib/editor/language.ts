@@ -12,10 +12,42 @@ const FILENAME_LANGUAGES: Record<string, string> = {
 	'.npmrc': 'properties',
 };
 
+// `.gitignore`, `.dockerignore`, `.prettierignore`, `.eslintignore`,
+// `.npmignore`, etc. — anything matching `.<word>ignore` is treated as
+// a gitignore-flavored file. They all share the "patterns + `#` line
+// comments" syntax, so highlighting comments is the bare minimum we
+// owe the user (the rest is plain text — pattern characters like
+// `*` / `!` / `/` aren't meaningfully colorable without a proper
+// grammar, and that's not worth shipping today).
+const IGNORE_FILENAME_RE = /^\.[\w-]*ignore$/;
+
+// Lazy ignore-file mode. CodeMirror's `StreamLanguage` is a thin
+// per-line tokenizer; for ignore files we only need one rule: a `#`
+// at start-of-line opens a comment that runs to end-of-line. `!` at
+// start-of-line is *not* a comment (it's a gitignore negation marker)
+// — we leave it plain.
+const ignoreLanguage = StreamLanguage.define({
+	name: 'gitignore',
+	token(stream) {
+		if (stream.sol() && stream.peek() === '#') {
+			stream.skipToEnd();
+			return 'comment';
+		}
+		stream.skipToEnd();
+		return null;
+	},
+	languageData: {
+		commentTokens: { line: '#' },
+	},
+});
+
 // Language extensions are loaded lazily so we don't bundle every grammar
 // up front. Returning [] means "no syntax extension yet, plain text is fine".
 export async function languageFor(filename: string): Promise<Extension[]> {
 	const baseName = filename.split('/').pop() ?? filename;
+	if (IGNORE_FILENAME_RE.test(baseName)) {
+		return [ignoreLanguage];
+	}
 	const ext = FILENAME_LANGUAGES[baseName] ?? baseName.split('.').pop()?.toLowerCase() ?? '';
 
 	switch (ext) {
