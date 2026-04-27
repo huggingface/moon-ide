@@ -135,6 +135,7 @@ export type WorkspaceSession = {
 export type SlackAppState = {
 	active_bot: SlackBotProfile | null;
 	panel_visible: boolean;
+	active_thread_ts: string | null;
 };
 
 /**
@@ -151,7 +152,7 @@ export type AppState = {
 export const defaultAppState: AppState = {
 	last_session: null,
 	theme: 'dark',
-	slack: { active_bot: null, panel_visible: false },
+	slack: { active_bot: null, panel_visible: false, active_thread_ts: null },
 };
 
 /**
@@ -187,6 +188,31 @@ export type SlackBotProfile = {
 export type SlackStatus = {
 	connected: boolean;
 	identity: SlackIdentity | null;
+};
+
+/**
+ * One row in the chat panel's session list — a top-level DM message
+ * with (or capable of having) a thread under it. Mirrors
+ * `moon_protocol::slack::SlackSession`.
+ */
+export type SlackSession = {
+	thread_ts: string;
+	latest_ts: string;
+	preview: string;
+	reply_count: number;
+	user_id: string | null;
+};
+
+/**
+ * One message inside a thread. Mirrors
+ * `moon_protocol::slack::SlackMessage`.
+ */
+export type SlackMessage = {
+	ts: string;
+	user_id: string | null;
+	text: string;
+	edited_ts: string | null;
+	is_bot: boolean;
 };
 
 /**

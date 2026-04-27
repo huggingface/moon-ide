@@ -242,8 +242,10 @@ Two paths write to `AppState`:
 - The frontend session-persist path (`app_state_save`) owns
   `last_session` and `theme`.
 - The Slack tauri commands (`slack_select_bot`, `slack_clear_bot`,
-  `slack_set_panel_visible`, plus the auth-failure cleanup in
-  `slack_status` / `slack_clear_token`) own the `slack` slice.
+  `slack_set_panel_visible`, `slack_set_active_thread`, plus the
+  auth-failure cleanup in `slack_status` / `slack_clear_token`) own
+  the `slack` slice (`active_bot`, `panel_visible`,
+  `active_thread_ts`).
 
 `app_state_save` merges: it loads the on-disk state, takes
 `last_session` + `theme` from the payload, and **preserves the
@@ -395,7 +397,25 @@ The panel itself, top-to-bottom:
 ```
 
 In 11.0 the panel renders the connect/disconnect state and the
-resolved bot profile only — sessions, messages, input come in 11.1+.
+resolved bot profile only. 11.1 adds the sessions list (top-level DM
+messages with the active bot, newest-first; preview text capped to
+80 chars server-side) and the active-thread view (read-only message
+bubbles, bot bubbles get a tinted background, no markdown yet — that's
+11.4). The active thread's `thread_ts` round-trips through
+`AppState.slack.active_thread_ts` so a relaunch with the panel open
+lands the user back inside the same conversation.
+
+The panel uses two generation counters (one for the sessions list,
+one for the active thread) so a stale `conversations.history` /
+`conversations.replies` response can't repaint the panel when the
+user has moved on (different bot, different thread). Switching bots
+clears both — sessions live inside one bot's DM channel, so the new
+bot has no business inheriting the previous one's open thread.
+
+Sending and polling join in 11.2/11.3, but the data model already
+supports them: `SlackMessage.edited_ts` is exposed so the future
+poll loop can diff successive snapshots without re-comparing
+message bodies.
 
 ## Frontend ↔ backend boundary
 
@@ -411,8 +431,9 @@ Tauri commands in `src-tauri/src/commands/slack.rs`:
 | `slack_clear_bot()`                            | Drop the saved pick; trigger picker on next render   |
 | `slack_get_active_bot()`                       | Read the persisted bot pick, if any                  |
 | `slack_set_panel_visible(visible)`             | Persist the chat panel's open/closed state           |
-| `slack_list_sessions(channel)` (11.1)          | Top-level DM messages                                |
-| `slack_get_thread(channel, ts)` (11.1)         | All messages in a thread                             |
+| `slack_list_sessions(channel)`                 | `conversations.history` filtered to top-level        |
+| `slack_get_thread(channel, ts)`                | `conversations.replies` for one thread               |
+| `slack_set_active_thread(thread_ts \| null)`   | Persist the open thread in `AppState.slack`          |
 | `slack_post(channel, thread_ts?, text)` (11.3) | Post a message                                       |
 | `slack_mark_read(channel, ts)` (11.2)          | `conversations.mark`                                 |
 

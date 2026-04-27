@@ -2,8 +2,10 @@
 //!
 //! Phase 11.0 surface: connect (paste token + validate), status check,
 //! disconnect, scan the user's DMs for bots, persist the picked bot.
-//! See `specs/slack-chat.md` and
-//! `specs/test-plans/0008-slack-foundation.md`.
+//! Phase 11.1 surface: list sessions (top-level DM messages), read a
+//! thread, persist the active thread.
+//! See `specs/slack-chat.md`, `specs/test-plans/0008-slack-foundation.md`,
+//! and `specs/test-plans/0009-slack-read-only-chat.md`.
 //!
 //! All token I/O goes through the OS keyring; nothing about the token
 //! ever lands in `app_state.json` or the session blob. The picked bot
@@ -11,7 +13,7 @@
 //! metadata, no secrets) so the picker doesn't reappear on every launch.
 
 use moon_core::app_state as app_state_store;
-use moon_protocol::slack::{SlackBotProfile, SlackIdentity, SlackStatus};
+use moon_protocol::slack::{SlackBotProfile, SlackIdentity, SlackMessage, SlackSession, SlackStatus};
 use moon_protocol::MoonError;
 use moon_slack::SlackClient;
 use tauri::State;
@@ -96,11 +98,22 @@ pub async fn slack_list_dm_bots(state: State<'_, AppState>) -> Result<Vec<SlackB
 }
 
 /// Record the bot the user picked. Stored verbatim in `app_state.json`
-/// so the picker doesn't run again on next launch.
+/// so the picker doesn't run again on next launch. Clears any
+/// previously-active thread — sessions live inside one bot's DM
+/// channel, so a different bot inherits a fresh "no session selected"
+/// state.
 #[tauri::command]
 pub async fn slack_select_bot(state: State<'_, AppState>, profile: SlackBotProfile) -> Result<(), MoonError> {
 	let mut current = app_state_store::load(&state.config_dir).await?;
+	let bot_changed = current
+		.slack
+		.active_bot
+		.as_ref()
+		.is_none_or(|bot| bot.user_id != profile.user_id);
 	current.slack.active_bot = Some(profile);
+	if bot_changed {
+		current.slack.active_thread_ts = None;
+	}
 	app_state_store::save(&state.config_dir, &current).await
 }
 
@@ -136,13 +149,55 @@ pub async fn slack_set_panel_visible(state: State<'_, AppState>, visible: bool) 
 	app_state_store::save(&state.config_dir, &current).await
 }
 
+/// `conversations.history` of the bot's DM channel, filtered to
+/// top-level messages. Returns at most
+/// `moon_slack::SESSION_HISTORY_LIMIT` entries newest-first. The
+/// channel ID comes from the picked [`SlackBotProfile`] — passed
+/// explicitly (rather than read from `AppState`) so the command stays
+/// stateless and the frontend's "wait, which bot?" race is impossible.
+#[tauri::command]
+pub async fn slack_list_sessions(state: State<'_, AppState>, channel: String) -> Result<Vec<SlackSession>, MoonError> {
+	let Some(client) = state.slack.client().await else {
+		return Err(MoonError::HostUnavailable("slack: not connected".into()));
+	};
+	client.list_sessions(&channel).await.map_err(MoonError::from)
+}
+
+/// `conversations.replies` of one thread in the bot's DM channel.
+/// Returns parent + replies, oldest-first (Slack's natural order, the
+/// reading order the panel wants).
+#[tauri::command]
+pub async fn slack_get_thread(
+	state: State<'_, AppState>,
+	channel: String,
+	thread_ts: String,
+) -> Result<Vec<SlackMessage>, MoonError> {
+	let Some(client) = state.slack.client().await else {
+		return Err(MoonError::HostUnavailable("slack: not connected".into()));
+	};
+	client.get_thread(&channel, &thread_ts).await.map_err(MoonError::from)
+}
+
+/// Persist the `thread_ts` of the session the user has open. `None`
+/// clears the pick (e.g. they hit "back to sessions"). Idempotent.
+#[tauri::command]
+pub async fn slack_set_active_thread(state: State<'_, AppState>, thread_ts: Option<String>) -> Result<(), MoonError> {
+	let mut current = app_state_store::load(&state.config_dir).await?;
+	if current.slack.active_thread_ts == thread_ts {
+		return Ok(());
+	}
+	current.slack.active_thread_ts = thread_ts;
+	app_state_store::save(&state.config_dir, &current).await
+}
+
 async fn clear_active_bot_on_disk(state: &AppState) {
 	match app_state_store::load(&state.config_dir).await {
 		Ok(mut current) => {
-			if current.slack.active_bot.is_none() {
+			if current.slack.active_bot.is_none() && current.slack.active_thread_ts.is_none() {
 				return;
 			}
 			current.slack.active_bot = None;
+			current.slack.active_thread_ts = None;
 			if let Err(err) = app_state_store::save(&state.config_dir, &current).await {
 				tracing::warn!(error = %err, "failed to clear persisted slack bot");
 			}

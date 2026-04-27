@@ -50,4 +50,11 @@ pub struct SlackAppState {
 	/// `false` (closed) for first-run users, who shouldn't have a
 	/// chat panel hijacking their workspace until they ask for it.
 	pub panel_visible: bool,
+	/// `thread_ts` of the session the user last had open in the chat
+	/// panel. Restored on launch so reopening the panel jumps back
+	/// into the same conversation. Cleared on bot switch and on
+	/// disconnect — bot pick and active thread are coupled (the
+	/// thread lives inside the bot's DM channel, ID encoded in
+	/// `active_bot.dm_channel_id`).
+	pub active_thread_ts: Option<String>,
 }

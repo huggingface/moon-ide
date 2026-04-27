@@ -100,8 +100,10 @@
 						<li><code>files:write</code> — upload images / files to the bot</li>
 					</ul>
 					<span class="scopes-note">
-						(Only the first five are exercised today — the rest are claimed upfront so you don't need to revisit the
-						Slack app as Phase 11 lands.)
+						All nine are claimed upfront so you don't have to revisit OAuth &amp; Permissions every time a new
+						capability ships. If you ever see a <code>missing_scope</code>
+						error in the panel, add the scope here, click <strong>Reinstall to Workspace</strong>, then disconnect &amp;
+						reconnect from the IDE.
 					</span>
 				</li>
 				<li>

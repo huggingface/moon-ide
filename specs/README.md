@@ -10,6 +10,7 @@ Living design docs for moon-ide. Read these before changing the system. Update t
 - [frontend.md](frontend.md) — Svelte UI structure, state model, editor wiring
 - [roadmap.md](roadmap.md) — phased plan and current status
 - [decisions/](decisions/) — ADRs (numbered architecture decision records)
+- [test-plans/](test-plans/) — written test plans for non-trivial commits
 
 ## Status legend
 

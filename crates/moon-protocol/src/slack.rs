@@ -61,3 +61,61 @@ pub struct SlackStatus {
 	pub connected: bool,
 	pub identity: Option<SlackIdentity>,
 }
+
+/// One row in the chat panel's session list — a top-level DM message
+/// that has (or could have) a thread underneath. Sessions correspond
+/// 1:1 to threads in Slack: posting a top-level message starts a new
+/// session, and bot replies live inside that thread (`thread_ts`).
+///
+/// Returned newest-first. The preview text is truncated server-side so
+/// the UI doesn't have to. `latest_ts` is what we use to render
+/// "2 min ago" and to drive future polling cadence.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SlackSession {
+	/// `thread_ts` of the top-level message. Doubles as the session's
+	/// stable ID — also equal to the parent message's own `ts` in
+	/// Slack's data model.
+	pub thread_ts: String,
+	/// Timestamp of the most recent activity on the thread (the
+	/// parent's own `ts` if there are no replies yet, otherwise the
+	/// last reply's `ts`). Drives "2 min ago" and the
+	/// future cadence ladder.
+	pub latest_ts: String,
+	/// First ~80 chars of the parent message, single-line. Empty if
+	/// the parent is image-only / file-only (Slack returns no text in
+	/// that case).
+	pub preview: String,
+	/// Number of replies (excluding the parent). 0 means "fresh
+	/// session, bot hasn't replied yet".
+	pub reply_count: u32,
+	/// Slack user ID who posted the parent. Usually us, but can be
+	/// the bot (e.g. an automated daily summary). Used by the panel
+	/// to render a tiny "you" / bot label on each session row.
+	pub user_id: Option<String>,
+}
+
+/// One message inside a thread (or the parent itself). Phase 11.1
+/// renders these read-only as bubbles; 11.2 will diff successive
+/// snapshots to detect edits via `edited_ts`.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SlackMessage {
+	/// Stable Slack message ID. Sortable lexicographically.
+	pub ts: String,
+	/// Author's Slack user ID. `None` only for system / unknown
+	/// messages, which we still render but flag as "unknown sender".
+	pub user_id: Option<String>,
+	/// Plain text body. Slack's mrkdwn dialect is *not* parsed here —
+	/// 11.4 swaps in proper rendering. For now it's literally what
+	/// Slack returned, with `\n` preserved.
+	pub text: String,
+	/// `edited.ts` when the message has been edited. Lets the UI
+	/// surface "(edited)" and lets 11.2's polling diff identify
+	/// changes without comparing the full body.
+	pub edited_ts: Option<String>,
+	/// True when the author is a bot (per Slack's `bot_id` field on
+	/// the message). Used for bubble alignment + colour. Doesn't
+	/// distinguish *which* bot.
+	pub is_bot: bool,
+}

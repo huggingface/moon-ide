@@ -304,7 +304,7 @@ class WorkspaceState {
 			const payload: AppState = {
 				last_session: session,
 				theme: this.theme,
-				slack: { active_bot: null, panel_visible: false },
+				slack: { active_bot: null, panel_visible: false, active_thread_ts: null },
 			};
 			// AppState writes are best-effort. A toast on every failure
 			// would be too noisy (this fires on every navigation); a

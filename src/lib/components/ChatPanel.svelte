@@ -1,8 +1,9 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, untrack } from 'svelte';
 	import { confirm } from '@tauri-apps/plugin-dialog';
 	import { slack } from '../slack.svelte';
-	import { botLabel, type SlackBotProfile } from '../protocol';
+	import { botLabel, type SlackBotProfile, type SlackSession } from '../protocol';
+	import { formatSlackRelative, formatSlackTime } from '../util/slackTime';
 	import ChatConnectModal from './ChatConnectModal.svelte';
 
 	onMount(() => {
@@ -11,6 +12,59 @@
 		// state regardless of whether the user has opened the panel.
 		void slack.refreshStatus();
 	});
+
+	// Auto-fetch sessions and the active thread whenever we have a
+	// connected bot and the panel is actually visible. Wrapped in
+	// `untrack` for the bot-id read so a single bot-card render
+	// doesn't pull `sessions` into this effect's dep set.
+	$effect(() => {
+		const visible = slack.panelVisible;
+		const bot = slack.activeBot;
+		const connected = slack.connected;
+		if (!visible || !connected || bot === null) {
+			return;
+		}
+		untrack(() => {
+			if (slack.sessions === null && !slack.loadingSessions) {
+				void slack.loadSessions();
+			}
+			const ts = slack.activeThreadTs;
+			if (ts !== null && slack.threadMessages === null && !slack.loadingThread) {
+				void slack.loadThread(ts);
+			}
+		});
+	});
+
+	// Re-render relative timestamps every minute so "2 min" doesn't
+	// stay frozen at "just now". Cheap; only the strings change.
+	let nowTick = $state(new Date());
+	$effect(() => {
+		const id = setInterval(() => {
+			nowTick = new Date();
+		}, 30_000);
+		return () => clearInterval(id);
+	});
+
+	const activeSession = $derived(
+		slack.activeThreadTs === null ? null : (slack.sessions?.find((s) => s.thread_ts === slack.activeThreadTs) ?? null),
+	);
+
+	function previewOf(session: SlackSession): string {
+		if (session.preview.length > 0) {
+			return session.preview;
+		}
+		return session.reply_count > 0 ? '(no preview, see thread)' : '(empty message)';
+	}
+
+	function senderLabel(userId: string | null, isBot: boolean): string {
+		if (isBot) {
+			return slack.activeBot ? botLabel(slack.activeBot) : 'Bot';
+		}
+		if (userId !== null && userId === slack.status?.identity?.user_id) {
+			return 'You';
+		}
+		return userId ?? 'Unknown';
+	}
 
 	async function onDisconnect() {
 		const ok = await confirm('Disconnect Slack? Your token will be removed from the OS keyring.', {
@@ -26,10 +80,30 @@
 
 	async function onPickBot(profile: SlackBotProfile) {
 		await slack.selectBot(profile);
+		void slack.loadSessions();
 	}
 
 	async function onSwitchBot() {
 		await slack.clearBotSelection();
+	}
+
+	function onSelectSession(threadTs: string) {
+		slack.selectThread(threadTs);
+	}
+
+	function onBackToSessions() {
+		slack.selectThread(null);
+	}
+
+	function onRefreshSessions() {
+		void slack.loadSessions();
+	}
+
+	function onRefreshThread() {
+		const ts = slack.activeThreadTs;
+		if (ts !== null) {
+			void slack.loadThread(ts);
+		}
 	}
 </script>
 
@@ -82,7 +156,100 @@
 						<button type="button" class="link" onclick={onSwitchBot}>Switch bot</button>
 					</header>
 				</section>
-				<p class="placeholder">Sessions and messages will appear here in 11.1.</p>
+
+				{#if slack.activeThreadTs === null}
+					<section class="card sessions-card">
+						<header class="section-header">
+							<span class="section-title">Sessions</span>
+							<button
+								type="button"
+								class="link"
+								onclick={onRefreshSessions}
+								disabled={slack.loadingSessions}
+								title="Reload sessions">Refresh</button
+							>
+						</header>
+						{#if slack.loadingSessions && slack.sessions === null}
+							<div class="muted-row">
+								<div class="spinner" aria-hidden="true"></div>
+								<span>Loading sessions…</span>
+							</div>
+						{:else if slack.sessionsError}
+							<p class="card-error">{slack.sessionsError}</p>
+						{:else if slack.sessions && slack.sessions.length === 0}
+							<p class="card-detail">
+								No sessions yet. Start one by DMing
+								<strong>{botLabel(slack.activeBot)}</strong>
+								from regular Slack — sending will land in the IDE in 11.3.
+							</p>
+						{:else if slack.sessions}
+							<ul class="session-list">
+								{#each slack.sessions as session (session.thread_ts)}
+									<li>
+										<button type="button" class="session-row" onclick={() => onSelectSession(session.thread_ts)}>
+											<div class="session-preview">{previewOf(session)}</div>
+											<div class="session-meta">
+												{#key nowTick}
+													<span class="session-time">{formatSlackRelative(session.latest_ts)}</span>
+												{/key}
+												{#if session.reply_count > 0}
+													<span class="session-replies"
+														>{session.reply_count} {session.reply_count === 1 ? 'reply' : 'replies'}</span
+													>
+												{/if}
+											</div>
+										</button>
+									</li>
+								{/each}
+							</ul>
+						{/if}
+					</section>
+				{:else}
+					<section class="card thread-card">
+						<header class="section-header">
+							<button type="button" class="back-button" onclick={onBackToSessions} title="Back to sessions">
+								← Sessions
+							</button>
+							<button
+								type="button"
+								class="link"
+								onclick={onRefreshThread}
+								disabled={slack.loadingThread}
+								title="Reload thread">Refresh</button
+							>
+						</header>
+						{#if activeSession}
+							<p class="thread-subject">{previewOf(activeSession)}</p>
+						{/if}
+						{#if slack.loadingThread && slack.threadMessages === null}
+							<div class="muted-row">
+								<div class="spinner" aria-hidden="true"></div>
+								<span>Loading thread…</span>
+							</div>
+						{:else if slack.threadError}
+							<p class="card-error">{slack.threadError}</p>
+						{:else if slack.threadMessages && slack.threadMessages.length === 0}
+							<p class="card-detail">No messages in this thread yet.</p>
+						{:else if slack.threadMessages}
+							<ol class="message-list">
+								{#each slack.threadMessages as message (message.ts)}
+									<li class="message" class:from-bot={message.is_bot}>
+										<header class="message-header">
+											<span class="message-author">{senderLabel(message.user_id, message.is_bot)}</span>
+											<span class="message-time">
+												{formatSlackTime(message.ts)}
+												{#if message.edited_ts}
+													<span class="message-edited" title="Edited">· edited</span>
+												{/if}
+											</span>
+										</header>
+										<div class="message-body">{message.text}</div>
+									</li>
+								{/each}
+							</ol>
+						{/if}
+					</section>
+				{/if}
 			{:else if slack.loadingBots}
 				<section class="card center">
 					<div class="spinner" aria-hidden="true"></div>
@@ -351,12 +518,142 @@
 		padding: 0;
 		font-size: 12px;
 	}
-	.placeholder {
+	.section-header {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 8px;
+		padding: 0;
+		border-bottom: 0;
+	}
+	.section-title {
 		font-size: 11px;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		color: var(--m-fg-muted);
+	}
+	.muted-row {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		color: var(--m-fg-muted);
+		font-size: 12px;
+	}
+	.session-list,
+	.message-list {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+	}
+	.session-row {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 4px;
+		width: 100%;
+		padding: 6px 8px;
+		background: transparent;
+		border: 1px solid transparent;
+		border-radius: 4px;
+		cursor: pointer;
+		text-align: left;
+		font: inherit;
+		color: inherit;
+	}
+	.session-row:hover {
+		background: var(--m-bg-3);
+		border-color: var(--m-border);
+	}
+	.session-preview {
+		font-size: 12px;
+		color: var(--m-fg);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		display: -webkit-box;
+		-webkit-line-clamp: 2;
+		line-clamp: 2;
+		-webkit-box-orient: vertical;
+		line-height: 1.4;
+		max-width: 100%;
+	}
+	.session-meta {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		font-size: 11px;
+		color: var(--m-fg-muted);
+	}
+	.session-replies::before {
+		content: '·';
+		margin-right: 8px;
 		color: var(--m-fg-subtle);
-		text-align: center;
-		margin: 8px 0 0;
+	}
+	.thread-card {
+		gap: 8px;
+	}
+	.back-button {
+		font: inherit;
+		background: transparent;
+		border: 0;
+		color: var(--m-accent);
+		cursor: pointer;
+		padding: 0;
+		font-size: 12px;
+	}
+	.thread-subject {
+		margin: 0;
+		font-size: 12px;
+		color: var(--m-fg-muted);
 		font-style: italic;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		display: -webkit-box;
+		-webkit-line-clamp: 2;
+		line-clamp: 2;
+		-webkit-box-orient: vertical;
+		padding-bottom: 4px;
+		border-bottom: 1px solid var(--m-border);
+	}
+	.message {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		padding: 6px 8px;
+		border-radius: 4px;
+	}
+	.message.from-bot {
+		background: var(--m-bg-3);
+	}
+	.message-header {
+		display: flex;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: 8px;
+	}
+	.message-author {
+		font-size: 11px;
+		font-weight: 600;
+		color: var(--m-fg);
+	}
+	.message-time {
+		font-size: 10px;
+		color: var(--m-fg-muted);
+		font-variant-numeric: tabular-nums;
+	}
+	.message-edited {
+		margin-left: 4px;
+		color: var(--m-fg-subtle);
+	}
+	.message-body {
+		font-size: 12px;
+		color: var(--m-fg);
+		line-height: 1.5;
+		white-space: pre-wrap;
+		word-wrap: break-word;
 	}
 	.spinner {
 		width: 18px;

@@ -10,6 +10,8 @@ import type {
 	ReadFileResult,
 	SlackBotProfile,
 	SlackIdentity,
+	SlackMessage,
+	SlackSession,
 	SlackStatus,
 	StatResult,
 	Workspace,
@@ -52,5 +54,8 @@ export const ipc = {
 		clearBot: () => invoke<void>('slack_clear_bot'),
 		getActiveBot: () => invoke<SlackBotProfile | null>('slack_get_active_bot'),
 		setPanelVisible: (visible: boolean) => invoke<void>('slack_set_panel_visible', { visible }),
+		listSessions: (channel: string) => invoke<SlackSession[]>('slack_list_sessions', { channel }),
+		getThread: (channel: string, threadTs: string) => invoke<SlackMessage[]>('slack_get_thread', { channel, threadTs }),
+		setActiveThread: (threadTs: string | null) => invoke<void>('slack_set_active_thread', { threadTs }),
 	},
 } as const;

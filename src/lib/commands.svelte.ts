@@ -179,6 +179,7 @@ export const builtInCommands: Command[] = [
 		// the theme toggle, and means the user knows which way the
 		// command goes before clicking.
 		title: () => (slack.panelVisible ? 'Chat: Hide Panel' : 'Chat: Show Panel'),
+		shortcut: 'Ctrl+L',
 		run: () => slack.togglePanel(),
 	},
 	{

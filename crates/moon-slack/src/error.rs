@@ -25,8 +25,18 @@ pub enum SlackError {
 	/// raw Slack error string (`invalid_auth`, `not_authed`, `missing_scope`,
 	/// `account_inactive`, `token_revoked`, `ratelimited`, ...). Callers
 	/// should match on it to decide whether to clear the keyring entry.
-	#[error("Slack API error ({method}): {code}")]
-	Api { method: String, code: String },
+	///
+	/// `needed` carries Slack's `needed` envelope field when the error is
+	/// `missing_scope` (Slack's API tells us exactly which scope it
+	/// wanted). Surfacing it in the Display string turns
+	/// `missing_scope` from a head-scratcher into "right, add
+	/// `im:history` and reinstall".
+	#[error("Slack API error ({method}): {code}{}", needed.as_ref().map(|n| format!(" (need {n})")).unwrap_or_default())]
+	Api {
+		method: String,
+		code: String,
+		needed: Option<String>,
+	},
 
 	/// JSON parse error. Either a Slack response shape changed on us, or
 	/// the response body wasn't JSON at all.

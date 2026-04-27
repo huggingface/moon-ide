@@ -1,8 +1,9 @@
 //! moon-slack — Slack Web API client + token storage for the chat panel.
 //!
-//! Phase 11.0 surface (foundation): authenticate, scan the user's DMs
-//! for bots, persist the user's `xoxp-` token in the OS keyring.
-//! Sessions / threads / sending messages join in 11.1+.
+//! Phase 11.0–11.1 surface: authenticate, scan the user's DMs for
+//! bots, persist the `xoxp-` token in the OS keyring, list sessions
+//! (top-level DM messages), and read a thread's messages. Sending
+//! and polling join in 11.2+.
 //!
 //! See [`specs/slack-chat.md`](../../specs/slack-chat.md).
 //!
@@ -17,6 +18,6 @@ mod client;
 mod error;
 mod storage;
 
-pub use client::{SlackClient, DM_SCAN_LIMIT};
+pub use client::{SlackClient, DM_SCAN_LIMIT, PREVIEW_MAX_CHARS, SESSION_HISTORY_LIMIT, THREAD_REPLY_LIMIT};
 pub use error::SlackError;
 pub use storage::TokenStore;

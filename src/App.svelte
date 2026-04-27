@@ -87,6 +87,15 @@
 				await reloadWindow();
 				return;
 			}
+			if (!event.shiftKey && key === 'l') {
+				// Browsers usually grab Ctrl+L for the address bar — in
+				// the Tauri webview there's no address bar, so it's
+				// free. Echoes Cursor's "Ctrl+L = open chat" muscle
+				// memory, which is the chat panel users will reach for.
+				event.preventDefault();
+				slack.togglePanel();
+				return;
+			}
 			// Don't filter by Shift: French AZERTY needs Shift to type
 			// a literal `0` (the digit row produces accented letters
 			// otherwise), so the natural binding there is Ctrl+Shift+0.

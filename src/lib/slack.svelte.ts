@@ -1,11 +1,12 @@
 //! Reactive state for the Slack chat panel.
 //!
-//! Phase 11.0 models connect / disconnect / bot picker — sessions,
-//! threads, and message lists join in 11.1+. Kept in its own file
-//! (rather than bolted onto `WorkspaceState`) because the chat panel's
-//! lifecycle is independent of the workspace: it survives "open
-//! another folder", and a future "no folder open, just chatting" flow
-//! doesn't need the workspace to exist at all.
+//! Phases 11.0–11.1 cover: connect / disconnect, bot picker,
+//! sessions list (top-level DM messages), and active thread (read-only
+//! message bubbles). Polling, edits, sending join in 11.2+. Kept in
+//! its own file (rather than bolted onto `WorkspaceState`) because the
+//! chat panel's lifecycle is independent of the workspace: it
+//! survives "open another folder", and a future "no folder open, just
+//! chatting" flow doesn't need the workspace to exist at all.
 
 import { ipc } from './ipc';
 import {
@@ -13,6 +14,8 @@ import {
 	type SlackAppState,
 	type SlackBotProfile,
 	type SlackIdentity,
+	type SlackMessage,
+	type SlackSession,
 	type SlackStatus,
 } from './protocol';
 
@@ -50,6 +53,48 @@ class SlackPanelState {
 	/** Whether the "Connect Slack" modal is mounted. */
 	showConnectModal = $state(false);
 
+	/**
+	 * Top-level DM messages with the active bot, newest-first. `null`
+	 * before the first load. The frontend never paginates — see the
+	 * `SESSION_HISTORY_LIMIT` cap in `moon-slack`.
+	 */
+	sessions = $state<SlackSession[] | null>(null);
+
+	/** UI flag while `slack_list_sessions` is in flight. */
+	loadingSessions = $state(false);
+
+	/** Latest sessions error; cleared on success (incl. zero results). */
+	sessionsError = $state<string | null>(null);
+
+	/**
+	 * `thread_ts` of the session the user is currently reading. `null`
+	 * means "show the session list, no thread open". Persisted in
+	 * `AppState.slack.active_thread_ts`.
+	 */
+	activeThreadTs = $state<string | null>(null);
+
+	/**
+	 * Messages of the active thread (parent + replies, oldest-first).
+	 * `null` before the first load — the panel renders a "Loading
+	 * thread…" affordance while we fetch.
+	 */
+	threadMessages = $state<SlackMessage[] | null>(null);
+
+	/** UI flag while `slack_get_thread` is in flight. */
+	loadingThread = $state(false);
+
+	/** Latest thread error; cleared on success. */
+	threadError = $state<string | null>(null);
+
+	/**
+	 * Generation counters used to discard late-arriving network
+	 * responses when the user has moved on (different bot, different
+	 * thread). The frontend reads `current === captured` after each
+	 * await before mutating reactive state.
+	 */
+	#sessionsGeneration = 0;
+	#threadGeneration = 0;
+
 	get connected(): boolean {
 		return this.status?.connected ?? false;
 	}
@@ -65,6 +110,7 @@ class SlackPanelState {
 	hydrate(state: SlackAppState) {
 		this.activeBot = state.active_bot;
 		this.panelVisible = state.panel_visible;
+		this.activeThreadTs = state.active_thread_ts;
 	}
 
 	togglePanel() {
@@ -101,6 +147,7 @@ class SlackPanelState {
 				this.activeBot = null;
 				this.botCandidates = [];
 				this.botError = null;
+				this.#resetThreadView();
 				return;
 			}
 			// Connected. Reload the persisted bot pick first; only fall
@@ -157,6 +204,7 @@ class SlackPanelState {
 		this.activeBot = null;
 		this.botCandidates = [];
 		this.botError = null;
+		this.#resetThreadView();
 	}
 
 	/**
@@ -179,10 +227,16 @@ class SlackPanelState {
 
 	/**
 	 * Persist the user's pick. Subsequent launches skip the picker and
-	 * jump straight to the active-bot card.
+	 * jump straight to the active-bot card. Switching bots invalidates
+	 * the session list and active thread — they live inside the
+	 * previous bot's DM channel, so the new bot starts fresh.
 	 */
 	async selectBot(profile: SlackBotProfile): Promise<void> {
+		const previous = this.activeBot;
 		this.activeBot = profile;
+		if (previous?.user_id !== profile.user_id) {
+			this.#resetThreadView();
+		}
 		try {
 			await ipc.slack.selectBot(profile);
 		} catch (err) {
@@ -199,12 +253,128 @@ class SlackPanelState {
 	 */
 	async clearBotSelection(): Promise<void> {
 		this.activeBot = null;
+		this.#resetThreadView();
 		try {
 			await ipc.slack.clearBot();
 		} catch (err) {
 			this.botError = formatError(err);
 		}
 		void this.discoverBots();
+	}
+
+	/**
+	 * Load the session list for the active bot's DM channel. Cheap to
+	 * call repeatedly — the panel's `onMount` triggers it after every
+	 * status / bot change. Late responses for a stale bot are
+	 * discarded via the generation counter so a fast bot-switch
+	 * doesn't stomp the new bot's state with the old one's.
+	 */
+	async loadSessions(): Promise<void> {
+		const bot = this.activeBot;
+		if (bot === null) {
+			return;
+		}
+		this.loadingSessions = true;
+		this.sessionsError = null;
+		const generation = ++this.#sessionsGeneration;
+		const captured = bot.user_id;
+		try {
+			const sessions = await ipc.slack.listSessions(bot.dm_channel_id);
+			if (generation !== this.#sessionsGeneration || captured !== this.activeBot?.user_id) {
+				return;
+			}
+			this.sessions = sessions;
+		} catch (err) {
+			if (generation !== this.#sessionsGeneration || captured !== this.activeBot?.user_id) {
+				return;
+			}
+			this.sessions = [];
+			this.sessionsError = formatError(err);
+		} finally {
+			if (generation === this.#sessionsGeneration) {
+				this.loadingSessions = false;
+			}
+		}
+	}
+
+	/**
+	 * Open a thread (or `null` to return to the session list). Persists
+	 * the pick so it survives a relaunch. Loading the messages is
+	 * fire-and-forget; callers don't await it.
+	 */
+	selectThread(threadTs: string | null): void {
+		if (this.activeThreadTs === threadTs) {
+			if (threadTs !== null && this.threadMessages === null) {
+				void this.loadThread(threadTs);
+			}
+			return;
+		}
+		this.activeThreadTs = threadTs;
+		this.threadMessages = null;
+		this.threadError = null;
+		// Bump the generation so any in-flight load for the previous
+		// thread can't race us back into the panel.
+		this.#threadGeneration += 1;
+		void ipc.slack.setActiveThread(threadTs).catch(() => {});
+		if (threadTs !== null) {
+			void this.loadThread(threadTs);
+		}
+	}
+
+	/**
+	 * Pull the messages for one thread. Used both by `selectThread`
+	 * and by the panel's "auto-load the persisted thread on mount"
+	 * path. Safe to call concurrently — generation counter ensures
+	 * only the latest result paints.
+	 */
+	async loadThread(threadTs: string): Promise<void> {
+		const bot = this.activeBot;
+		if (bot === null) {
+			return;
+		}
+		this.loadingThread = true;
+		this.threadError = null;
+		const generation = ++this.#threadGeneration;
+		const capturedBot = bot.user_id;
+		const capturedThread = threadTs;
+		try {
+			const messages = await ipc.slack.getThread(bot.dm_channel_id, threadTs);
+			if (
+				generation !== this.#threadGeneration ||
+				capturedBot !== this.activeBot?.user_id ||
+				capturedThread !== this.activeThreadTs
+			) {
+				return;
+			}
+			this.threadMessages = messages;
+		} catch (err) {
+			if (
+				generation !== this.#threadGeneration ||
+				capturedBot !== this.activeBot?.user_id ||
+				capturedThread !== this.activeThreadTs
+			) {
+				return;
+			}
+			this.threadMessages = [];
+			this.threadError = formatError(err);
+		} finally {
+			if (generation === this.#threadGeneration) {
+				this.loadingThread = false;
+			}
+		}
+	}
+
+	#resetThreadView(): void {
+		// Bump generations so any in-flight loads can't repaint.
+		this.#sessionsGeneration += 1;
+		this.#threadGeneration += 1;
+		this.sessions = null;
+		this.loadingSessions = false;
+		this.sessionsError = null;
+		this.activeThreadTs = null;
+		this.threadMessages = null;
+		this.loadingThread = false;
+		this.threadError = null;
 	}
 }
 
