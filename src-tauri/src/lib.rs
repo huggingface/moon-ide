@@ -43,6 +43,7 @@ pub fn run() {
 			commands::slack::slack_select_bot,
 			commands::slack::slack_clear_bot,
 			commands::slack::slack_get_active_bot,
+			commands::slack::slack_set_panel_visible,
 		])
 		.setup(|app| {
 			let config_dir = app

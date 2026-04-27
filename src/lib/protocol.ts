@@ -134,6 +134,7 @@ export type WorkspaceSession = {
  */
 export type SlackAppState = {
 	active_bot: SlackBotProfile | null;
+	panel_visible: boolean;
 };
 
 /**
@@ -150,7 +151,7 @@ export type AppState = {
 export const defaultAppState: AppState = {
 	last_session: null,
 	theme: 'dark',
-	slack: { active_bot: null },
+	slack: { active_bot: null, panel_visible: false },
 };
 
 /**

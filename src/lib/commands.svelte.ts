@@ -189,7 +189,7 @@ export const builtInCommands: Command[] = [
 		// affordance inside the panel itself.
 		visible: () => !slack.connected,
 		run: () => {
-			slack.panelVisible = true;
+			slack.setPanelVisible(true);
 			slack.openConnectModal();
 		},
 	},

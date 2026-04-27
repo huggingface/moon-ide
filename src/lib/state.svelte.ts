@@ -11,6 +11,7 @@ import {
 	type Workspace,
 	type WorkspaceSession,
 } from './protocol';
+import { slack } from './slack.svelte';
 import { fingerprint, fingerprintEquals, type ContentFingerprint } from './util/hash';
 import { fileKindFor, type FileKind } from './util/fileKind';
 import { isMarkdownPath } from './util/markdown';
@@ -199,6 +200,11 @@ class WorkspaceState {
 
 		this.theme = state.theme;
 		applyTheme(state.theme);
+		// Restore the chat panel state up-front: the panel may have been
+		// open at the last shutdown, in which case it mounts (and probes
+		// `slack_status`) on this same paint without the user lifting a
+		// finger.
+		slack.hydrate(state.slack);
 
 		const ws = this.workspace;
 		const session = state.last_session;
@@ -293,11 +299,12 @@ class WorkspaceState {
 				: null;
 			// `slack` is owned by `slack.svelte.ts` + the Slack tauri
 			// commands; the backend's `app_state_save` ignores whatever
-			// we send here and preserves the on-disk value.
+			// we send here and preserves the on-disk value. The
+			// placeholder satisfies the shared type only.
 			const payload: AppState = {
 				last_session: session,
 				theme: this.theme,
-				slack: { active_bot: null },
+				slack: { active_bot: null, panel_visible: false },
 			};
 			// AppState writes are best-effort. A toast on every failure
 			// would be too noisy (this fires on every navigation); a

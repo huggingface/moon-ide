@@ -8,7 +8,13 @@
 //! doesn't need the workspace to exist at all.
 
 import { ipc } from './ipc';
-import { formatError, type SlackBotProfile, type SlackIdentity, type SlackStatus } from './protocol';
+import {
+	formatError,
+	type SlackAppState,
+	type SlackBotProfile,
+	type SlackIdentity,
+	type SlackStatus,
+} from './protocol';
 
 export type ConnectResult = { ok: true; identity: SlackIdentity } | { ok: false; error: string };
 
@@ -48,11 +54,35 @@ class SlackPanelState {
 		return this.status?.connected ?? false;
 	}
 
+	/**
+	 * Apply persisted panel state at startup. Called once from
+	 * `WorkspaceState.restoreAppState`. Pre-loads `activeBot` from disk
+	 * so the chat panel's first paint already shows the active-bot card
+	 * (skipping the spinner + DM scan that `refreshStatus` would
+	 * otherwise kick off). Panel visibility is restored verbatim — if
+	 * the user had the chat panel open last session, it stays open.
+	 */
+	hydrate(state: SlackAppState) {
+		this.activeBot = state.active_bot;
+		this.panelVisible = state.panel_visible;
+	}
+
 	togglePanel() {
-		this.panelVisible = !this.panelVisible;
+		this.setPanelVisible(!this.panelVisible);
+	}
+
+	setPanelVisible(visible: boolean) {
+		if (this.panelVisible === visible) {
+			return;
+		}
+		this.panelVisible = visible;
 		if (this.panelVisible && this.status === null) {
 			void this.refreshStatus();
 		}
+		// Persistence is fire-and-forget — a failed write only means the
+		// panel forgets its state on the next launch, which is at worst
+		// mildly annoying. The chat panel itself still works.
+		void ipc.slack.setPanelVisible(visible).catch(() => {});
 	}
 
 	openConnectModal() {

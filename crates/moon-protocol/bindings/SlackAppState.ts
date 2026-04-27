@@ -13,4 +13,12 @@ export type SlackAppState = {
  * a different bot" gesture or when `auth.test` reports the token
  * is dead.
  */
-active_bot: SlackBotProfile | null, };
+active_bot: SlackBotProfile | null, 
+/**
+ * Whether the right-side chat panel was open at last shutdown.
+ * We restore visibility on launch so users who live with the
+ * panel open don't have to re-open it every session. Defaults to
+ * `false` (closed) for first-run users, who shouldn't have a
+ * chat panel hijacking their workspace until they ask for it.
+ */
+panel_visible: boolean, };

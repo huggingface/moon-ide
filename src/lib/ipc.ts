@@ -51,5 +51,6 @@ export const ipc = {
 		selectBot: (profile: SlackBotProfile) => invoke<void>('slack_select_bot', { profile }),
 		clearBot: () => invoke<void>('slack_clear_bot'),
 		getActiveBot: () => invoke<SlackBotProfile | null>('slack_get_active_bot'),
+		setPanelVisible: (visible: boolean) => invoke<void>('slack_set_panel_visible', { visible }),
 	},
 } as const;

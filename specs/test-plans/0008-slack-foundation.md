@@ -25,16 +25,22 @@
 - `moon_slack::TokenStore`: thin wrapper over the `keyring` crate
   (libsecret / Keychain / Credential Manager). Service `moon-ide`,
   account `slack-user-token`. `NoEntry` is mapped to `Ok(None)` /
-  `Ok(())` so absence is never an error.
+  `Ok(())` so absence is never an error. The workspace `Cargo.toml`
+  pins `keyring`'s `apple-native + windows-native +
+sync-secret-service + crypto-rust` features — the default feature
+  set is `[]`, which gives a mock backend that silently no-ops on
+  Linux. (See `specs/slack-chat.md#token-storage`.)
 - Tauri state: `AppState.slack` (`SlackState`) holds the `TokenStore`
   and a `RwLock<Option<SlackClient>>` cache. The startup `setup` hook
   rehydrates the cache from the keyring without contacting Slack — the
   first frontend `slack_status` call is what actually validates.
-- `AppState` (machine-local, `state.json`) now carries `slack.active_bot`:
-  the bot the user has picked from their DM list, persisted as plain
-  IDs + display metadata (no secrets). The two writers — frontend
-  session-persist and Slack tauri commands — own disjoint slices, and
-  `app_state_save` merges so neither can clobber the other.
+- `AppState` (machine-local, `state.json`) now carries
+  `slack.active_bot` (the bot the user has picked, IDs + display
+  metadata only, no secrets) and `slack.panel_visible` (whether the
+  chat panel was open at shutdown — restored verbatim on launch). The
+  two writers — frontend session-persist and Slack tauri commands —
+  own disjoint slices, and `app_state_save` merges so neither can
+  clobber the other.
 - Tauri commands in `src-tauri/src/commands/slack.rs`:
   - `slack_set_token(token)` — refuses non-`xoxp-` strings up front,
     validates via `auth.test`, persists to keyring, populates the
@@ -52,6 +58,9 @@
   - `slack_clear_bot()` — drops the persisted pick (triggers the picker
     on next render).
   - `slack_get_active_bot()` — reads the persisted pick.
+  - `slack_set_panel_visible(visible)` — persists the chat panel's
+    open/closed state so the panel re-mounts in the same place after
+    a relaunch.
 - Frontend:
   - `src/lib/slack.svelte.ts` — `SlackPanelState` singleton with
     reactive `panelVisible`, `status`, `activeBot`, `botCandidates`,
@@ -99,7 +108,7 @@
   session blob, or in any frontend state save. Inspect the AppState
   file after connecting:
   ```bash
-  cat ~/.config/com.moon-ide.app/state.json | jq
+  cat ~/.config/dev.moon-ide.desktop/state.json | jq
   ```
   Confirm there's no `xoxp-` substring anywhere. The `slack.active_bot`
   field should hold IDs + display metadata only (after picking). Inspect
@@ -175,7 +184,7 @@ account slack-user-token` if you've already connected before).
 7. The status-bar chat pip turns green.
 8. Confirm persistence:
    ```bash
-   cat ~/.config/com.moon-ide.app/state.json | jq .slack
+   cat ~/.config/dev.moon-ide.desktop/state.json | jq .slack
    ```
    should print the picked bot's `user_id`, `dm_channel_id`,
    `username`, `real_name`, `display_name`, `image_url`. No `xoxp-`
@@ -207,15 +216,31 @@ account slack-user-token` if you've already connected before).
    card disappears. `state.json` should now have `slack.active_bot:
 null`. Pick a different bot; persistence updates accordingly.
 
-### 11.0e — restart persists connection + bot pick
+### 11.0e — restart persists token, bot pick, and panel visibility
 
-1. With a valid connection and a picked bot, fully quit the app (`Ctrl+Q`).
+1. With a valid connection and a picked bot, **leave the chat panel
+   open** and fully quit the app (`Ctrl+Q`).
 2. Relaunch.
-3. Open the chat panel. Without prompting for a token _and without
-   re-running discovery_, the panel should jump straight to the active-bot
-   card with the same bot you picked before quitting. (This is the
-   reason we persist `slack.active_bot` — discovery is slow and we
-   don't want to re-run it on every launch.)
+3. The chat panel should already be visible on first paint (no need
+   to click the status-bar pip). Without prompting for a token _and
+   without re-running discovery_, it should jump straight to the
+   active-bot card with the same bot you picked before quitting.
+4. Confirm the keyring entry is intact:
+   ```bash
+   secret-tool lookup service moon-ide account slack-user-token
+   ```
+   should print the same `xoxp-…` token. If `secret-tool` itself is
+   missing on Linux, `apt install libsecret-tools` (the underlying
+   D-Bus interface is what keyring talks to and is already present).
+5. Confirm `state.json`:
+   ```bash
+   cat ~/.config/dev.moon-ide.desktop/state.json | jq .slack
+   ```
+   should show `panel_visible: true`, the same `active_bot` you
+   picked, and no `xoxp-` substring anywhere in the file.
+6. Hide the panel (status-bar pip), quit, relaunch. Panel should
+   stay closed. `state.json`'s `slack.panel_visible` should now be
+   `false`.
 
 ### 11.0f — token revoked externally
 
@@ -231,7 +256,7 @@ null`. Pick a different bot; persistence updates accordingly.
    should print nothing (and exit non-zero). Confirm the persisted
    bot pick is gone:
    ```bash
-   cat ~/.config/com.moon-ide.app/state.json | jq .slack
+   cat ~/.config/dev.moon-ide.desktop/state.json | jq .slack
    ```
    should print `{"active_bot": null}`.
 

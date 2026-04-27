@@ -121,7 +121,20 @@ User tokens are credentials. They live in the **OS keyring** — never
 in `app_state.json` and never in any session blob. The `keyring`
 crate gives us libsecret on Linux, Keychain on macOS, and Credential
 Manager on Windows. The keyring entry uses service `moon-ide` and
-account `slack-user-token`. Clearing happens on:
+account `slack-user-token`.
+
+> **Backend features matter.** keyring 3.x ships with **no platform
+> backend** unless you opt in via Cargo features. Without those the
+> mock backend silently no-ops on every save and every read, so
+> tokens "succeed" but never persist. We pin
+> `apple-native + windows-native + sync-secret-service + crypto-rust`
+> in `workspace.dependencies` for that reason. On Linux the user
+> needs a running Secret Service daemon (gnome-keyring, KWallet's
+> compatibility shim, KeePassXC, …). All mainstream desktops ship
+> one by default — but if a user reports tokens not persisting,
+> check that first.
+
+Clearing happens on:
 
 - Explicit "Disconnect" from the chat panel.
 - `auth.test` returning `not_authed` / `invalid_auth` (token revoked
@@ -207,14 +220,37 @@ concrete report, not on a hunch.
 
 ### Persistence
 
-The selected bot is stored in `AppState.slack.active_bot`
-(machine-local, non-secret — just an ID + DM channel ID + display
-metadata). On launch, if the field is set, the panel shows that bot
-directly and skips the picker. Switching bots ("Pick a different
-bot" affordance) clears the field and re-runs discovery.
+`AppState.slack` carries everything needed to put the chat panel
+back where the user left it:
 
-Tokens stay in the keyring; this field is the only Slack state in
-`AppState`.
+- `active_bot`: the picked bot's ID + DM channel ID + display
+  metadata. On launch, if it's set, the panel shows that bot
+  directly and skips the picker. Switching bots ("Pick a different
+  bot" affordance) clears the field and re-runs discovery.
+- `panel_visible`: whether the right-side chat panel was open at
+  shutdown. Restored verbatim. Defaults to `false` so first-run
+  users don't get a chat panel they haven't asked for.
+
+Both fields are non-secret. The token itself stays in the keyring;
+nothing about it (or its hash, or its prefix) ends up in
+`app_state.json`.
+
+#### Multi-writer story
+
+Two paths write to `AppState`:
+
+- The frontend session-persist path (`app_state_save`) owns
+  `last_session` and `theme`.
+- The Slack tauri commands (`slack_select_bot`, `slack_clear_bot`,
+  `slack_set_panel_visible`, plus the auth-failure cleanup in
+  `slack_status` / `slack_clear_token`) own the `slack` slice.
+
+`app_state_save` merges: it loads the on-disk state, takes
+`last_session` + `theme` from the payload, and **preserves the
+on-disk `slack` slice verbatim**. The frontend still has to send a
+placeholder `slack` field to satisfy the shared TS type, but the
+backend ignores it. This stops a session-persist coalesce from
+clobbering a bot pick that just landed.
 
 ### Why not also paginate `users.list` for bots the user hasn't DMd?
 
@@ -373,6 +409,8 @@ Tauri commands in `src-tauri/src/commands/slack.rs`:
 | `slack_list_dm_bots()`                         | Scan user's DMs, return the bot users among them     |
 | `slack_select_bot(profile)`                    | Persist user's pick into `AppState.slack.active_bot` |
 | `slack_clear_bot()`                            | Drop the saved pick; trigger picker on next render   |
+| `slack_get_active_bot()`                       | Read the persisted bot pick, if any                  |
+| `slack_set_panel_visible(visible)`             | Persist the chat panel's open/closed state           |
 | `slack_list_sessions(channel)` (11.1)          | Top-level DM messages                                |
 | `slack_get_thread(channel, ts)` (11.1)         | All messages in a thread                             |
 | `slack_post(channel, thread_ts?, text)` (11.3) | Post a message                                       |
