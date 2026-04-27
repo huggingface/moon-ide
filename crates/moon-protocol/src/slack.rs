@@ -95,6 +95,23 @@ pub struct SlackSession {
 	pub user_id: Option<String>,
 }
 
+/// Minimal user record for resolving `<@U12345>` mentions in
+/// rendered Slack mrkdwn. Cached per-user on the frontend; the
+/// backend just wraps `users.info`.
+///
+/// `display_name` is what Slack shows next to the avatar; falls back
+/// to `real_name` and finally `name` (the username slug). Callers
+/// should prefer that order — see `bestLabel` on the frontend.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SlackUserSummary {
+	pub user_id: String,
+	pub name: String,
+	pub real_name: String,
+	pub display_name: Option<String>,
+	pub is_bot: bool,
+}
+
 /// One message inside a thread (or the parent itself). Phase 11.1
 /// renders these read-only as bubbles; 11.2 will diff successive
 /// snapshots to detect edits via `edited_ts`.

@@ -13,7 +13,7 @@
 //! metadata, no secrets) so the picker doesn't reappear on every launch.
 
 use moon_core::app_state as app_state_store;
-use moon_protocol::slack::{SlackBotProfile, SlackIdentity, SlackMessage, SlackSession, SlackStatus};
+use moon_protocol::slack::{SlackBotProfile, SlackIdentity, SlackMessage, SlackSession, SlackStatus, SlackUserSummary};
 use moon_protocol::MoonError;
 use moon_slack::SlackClient;
 use tauri::State;
@@ -176,6 +176,18 @@ pub async fn slack_get_thread(
 		return Err(MoonError::HostUnavailable("slack: not connected".into()));
 	};
 	client.get_thread(&channel, &thread_ts).await.map_err(MoonError::from)
+}
+
+/// Resolve a single `<@U…>` mention to a [`SlackUserSummary`]. Wraps
+/// `users.info`. Frontend caches the result per `user_id`, so this
+/// command fires at most once per distinct mentioned user per
+/// session — see `specs/slack-chat.md#mrkdwn-rendering`.
+#[tauri::command]
+pub async fn slack_get_user(state: State<'_, AppState>, user_id: String) -> Result<SlackUserSummary, MoonError> {
+	let Some(client) = state.slack.client().await else {
+		return Err(MoonError::HostUnavailable("slack: not connected".into()));
+	};
+	client.resolve_user(&user_id).await.map_err(MoonError::from)
 }
 
 /// Persist the `thread_ts` of the session the user has open. `None`

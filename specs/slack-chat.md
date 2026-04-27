@@ -287,6 +287,134 @@ of the user's prompt and the time of the latest reply.
 The "active session" is `conversations.replies(channel, ts)` for the
 selected thread.
 
+## Mrkdwn rendering
+
+### Block Kit precedence
+
+Bots that use rich layouts (moon-bot, Cursor, GitHub Slack app, …)
+put the _real_ message body in [Block Kit blocks][bk] and a flattened
+notification fallback in the `text` field. Slack's UI renders the
+blocks; the `text` field commonly loses newlines and structure.
+
+The Rust client (`moon-slack::client::text_from_blocks`) extracts a
+single Slack-mrkdwn string from the supported block types before
+returning a `SlackMessage` to the frontend, so the rest of the
+pipeline only ever sees one representation:
+
+| Block type                                                           | Behaviour                                                                  |
+| -------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `section`                                                            | Use `text.text` when `text.type == "mrkdwn"`. `plain_text` is skipped.     |
+| `markdown`                                                           | Forwarded as-is (CommonMark). `**bold**` / fenced language tags will leak. |
+| `divider`                                                            | Emits `———`.                                                               |
+| Anything else (image, header, context, actions, rich_text, table, …) | Skipped silently.                                                          |
+
+Blocks are joined with a blank line. If no block contributed any text
+(e.g. only `rich_text` from a human typer), the raw `text` field is
+used as fallback — this is the common path for human DMs.
+
+Same precedence applies to the session-list preview (`to_session`),
+so a bot's session row also reads its blocks instead of the flattened
+fallback.
+
+[bk]: https://api.slack.com/reference/block-kit/blocks
+
+### Frontend tokenizer
+
+Slack's `text` field is **mrkdwn**, not CommonMark. The differences
+matter enough that `markdown-it` would mis-render every other token:
+single asterisks for bold (`*bold*`), single underscores for italic
+(`_italic_`), single tildes for strike (`~strike~`), and every link
+/ mention / channel / broadcast / date as an angle-bracket token
+(`<@U123>`, `<https://…|label>`, `<#C123|name>`, `<!here>`,
+`<!date^…>`).
+
+We hand-roll a parser in `src/lib/util/slackMrkdwn.ts`. Pure function;
+returns a `BlockNode[]` tree that `SlackMessageBody.svelte` walks.
+Two-layer design:
+
+- **Block layer:** split on triple-backtick fences (code blocks
+  are top-priority and short-circuit further parsing); group
+  remaining lines into text vs. `>`-prefixed quotes.
+- **Inline layer:** scan for `<…>` structured tokens (recognising
+  user/channel/broadcast/usergroup/date/link shapes) and inline
+  `` `code` ``; everything else feeds a recursive-descent
+  formatter that handles `*`/`_`/`~` with Slack's
+  word-boundary rules. Same marker can't nest inside itself
+  (Slack's parser agrees); different markers nest freely.
+
+`<@U…>` mentions resolve through a per-process reactive cache
+(`SlackPanelState.userCache`). Reads and writes are split to keep
+Svelte's render path pure (mutating `userCache` from a snippet trips
+`state_unsafe_mutation`):
+
+- `slack.peekUser(user_id)` — synchronous read, no side effects.
+  Safe to call from `$derived` or template expressions.
+- `slack.requestUser(user_id)` — idempotent fetch trigger; mutates
+  the cache to `loading` and fires `slack_get_user`. Must be called
+  from outside render (a Svelte `$effect`, an event handler, or
+  after a network response).
+
+The mrkdwn renderer collects user IDs via `collectMentionedUserIds`
+in a `$derived`, kicks off `requestUser` for each from an `$effect`,
+and reads results back through `peekUser` in the template. Once
+`users.info` resolves the cache write triggers a re-render and labels
+swap in. The connected user (`auth.test`) and active bot are seeded
+into the cache eagerly on connect / bot select / hydrate, so they
+never go through the network at all. The cache flushes on disconnect.
+
+Session-list previews flatten the same tree to plain text via
+`slackPlainText`. The preview accepts an optional `resolveUserId`
+hook so cached `<@U…>` mentions render as `@username` instead of
+`@U123`; misses fall back to the embedded `|label`, then the raw ID.
+`ChatPanel.svelte` parses every visible session preview once, calls
+`slack.requestUser` for each unique ID from an `$effect`, and reads
+back through `peekUser` in `previewOf`.
+
+`slackPlainText` also strips the trailing `<…` when Slack's preview
+truncation cuts mid-token: an unclosed `<` would otherwise leak as
+literal text into the row. The cut tail is replaced with an ellipsis.
+
+Out of scope: custom emoji (passed through as `:shortcode:`),
+channel name resolution (we trust Slack's `|name` cache and fall
+back to `#C123` when absent), Block Kit attachments / files / images
+(Phase 11.4+).
+
+### Known limitations of the deferred markdown-block path
+
+`markdown` blocks (Slack's CommonMark variant, used by moon-bot for
+messages > 3000 chars) are forwarded to the frontend tokenizer
+unchanged. The tokenizer renders most of CommonMark correctly through
+overlap (text, links, inline `` `code` ``, fenced code), but:
+
+- `**bold**` / `__italic__` show literal asterisks / underscores
+  (the tokenizer only knows single-marker forms).
+- `[label](url)` is not parsed (only the Slack `<url|label>` shape is).
+- A fenced code block with a language tag (` ```rust `) keeps the
+  tag as the first line of the rendered code block.
+
+Fix is a Rust `markdown_to_mrkdwn` that runs server-side before the
+frontend ever sees the text — deferred until a real long-message
+report comes in. See test `forwards_markdown_block_text_unchanged`
+in `crates/moon-slack/src/client.rs` for the current behaviour
+contract.
+
+### Link safety
+
+`<URL|label>` only emits a `link` node when the scheme is one of
+`http://`, `https://`, `mailto:`. Anything else is rendered as
+literal text. The renderer's click handler routes through
+`URL` parsing as a second line of defence and only opens externally
+when `protocol` is in the same allowlist (`opener:default` capability
+permits the same set). `javascript:` is impossible at both layers.
+
+### HTML entity decoding
+
+Slack escapes only `<`, `>`, `&` (per their docs), but we accept
+numeric `&#NN;` / `&#xHH;` for legacy messages. Decoding happens at
+text emission only — never inside a structured token's body — so a
+URL containing `&amp;` round-trips safely (`?a=1&amp;b=2` → real `&`
+in the rendered href).
+
 ## Real-time
 
 Slack's three push paths don't work for a user-token desktop app:
@@ -400,8 +528,10 @@ In 11.0 the panel renders the connect/disconnect state and the
 resolved bot profile only. 11.1 adds the sessions list (top-level DM
 messages with the active bot, newest-first; preview text capped to
 80 chars server-side) and the active-thread view (read-only message
-bubbles, bot bubbles get a tinted background, no markdown yet — that's
-11.4). The active thread's `thread_ts` round-trips through
+bubbles, bot bubbles get a tinted background). 11.1.1 then layers
+Slack mrkdwn rendering on top — see [Mrkdwn rendering](#mrkdwn-rendering)
+— so mentions/links/formatting render properly instead of as raw
+`<@U…>` tokens. The active thread's `thread_ts` round-trips through
 `AppState.slack.active_thread_ts` so a relaunch with the panel open
 lands the user back inside the same conversation.
 
@@ -434,6 +564,7 @@ Tauri commands in `src-tauri/src/commands/slack.rs`:
 | `slack_list_sessions(channel)`                 | `conversations.history` filtered to top-level        |
 | `slack_get_thread(channel, ts)`                | `conversations.replies` for one thread               |
 | `slack_set_active_thread(thread_ts \| null)`   | Persist the open thread in `AppState.slack`          |
+| `slack_get_user(user_id)`                      | `users.info` — resolve a `<@U…>` mention             |
 | `slack_post(channel, thread_ts?, text)` (11.3) | Post a message                                       |
 | `slack_mark_read(channel, ts)` (11.2)          | `conversations.mark`                                 |
 

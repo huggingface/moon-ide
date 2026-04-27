@@ -4,6 +4,7 @@
 //! - `auth.test` — identify the human whose token we hold (11.0)
 //! - `conversations.list?types=im` — list the user's open DMs (11.0)
 //! - `users.info` — pull `is_bot` + display metadata for each DM partner (11.0)
+//!   and resolve `<@U…>` mentions in rendered messages (11.1.1)
 //! - `conversations.history` — top-level DM messages = sessions (11.1)
 //! - `conversations.replies` — every message inside a thread (11.1)
 //!
@@ -15,7 +16,7 @@
 //! `slack_api`: those crates carry OAuth flows, signing, and a type
 //! universe we don't use, all on the user-token critical path.
 
-use moon_protocol::slack::{SlackBotProfile, SlackIdentity, SlackMessage, SlackSession};
+use moon_protocol::slack::{SlackBotProfile, SlackIdentity, SlackMessage, SlackSession, SlackUserSummary};
 use serde::{Deserialize, Serialize};
 
 use crate::error::SlackError;
@@ -168,6 +169,35 @@ impl SlackClient {
 		Ok(body.messages.into_iter().map(to_message).collect())
 	}
 
+	/// Look up one user by ID and return the trimmed summary used to
+	/// render `<@U…>` mentions. Wraps `users.info` and folds the
+	/// nested `profile.display_name` / `profile.real_name` fields so
+	/// the frontend doesn't have to know Slack's data model.
+	///
+	/// Frontend caches the result per user_id, so this method is
+	/// expected to fire at most once per distinct mentioned user per
+	/// session.
+	pub async fn resolve_user(&self, user_id: &str) -> Result<SlackUserSummary, SlackError> {
+		let user = self.users_info(user_id).await?;
+		let display_name = user
+			.profile
+			.as_ref()
+			.and_then(|p| p.display_name.clone())
+			.filter(|s| !s.is_empty());
+		let real_name = user
+			.real_name
+			.clone()
+			.or_else(|| user.profile.as_ref().and_then(|p| p.real_name.clone()))
+			.unwrap_or_default();
+		Ok(SlackUserSummary {
+			user_id: user.id,
+			name: user.name.unwrap_or_default(),
+			real_name,
+			display_name,
+			is_bot: user.is_bot.unwrap_or(false),
+		})
+	}
+
 	async fn list_im_channels(&self) -> Result<Vec<ImChannel>, SlackError> {
 		let limit = DM_SCAN_LIMIT.to_string();
 		let body: ConversationsListResponse = self
@@ -305,8 +335,7 @@ struct ConversationsRepliesResponse {
 
 /// Subset of Slack's `objects.Message`. Only the fields we touch are
 /// deserialised; the wire format is much wider (subtypes, reactions,
-/// attachments, blocks…) and we'll grow this struct as later phases
-/// need them.
+/// attachments…) and we'll grow this struct as later phases need them.
 #[derive(Debug, Deserialize, Serialize)]
 struct RawMessage {
 	ts: String,
@@ -326,11 +355,54 @@ struct RawMessage {
 	latest_reply: Option<String>,
 	#[serde(default)]
 	edited: Option<EditedMeta>,
+	/// Block Kit content. Bots that use rich layouts (moon-bot,
+	/// Cursor, GitHub) put the *real* message body here; the `text`
+	/// field above is just a notification fallback that often
+	/// strips newlines and structure. We extract a Slack-mrkdwn
+	/// representation from the supported block types and use that
+	/// in preference to `text` when present.
+	#[serde(default)]
+	blocks: Option<Vec<RawBlock>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct EditedMeta {
 	ts: String,
+}
+
+/// Subset of Slack's [Block Kit][1] block types. We only deserialise
+/// the shapes we render; everything else (image, header, context,
+/// actions, rich_text, table, …) falls into `Unknown` and contributes
+/// nothing to the rendered text.
+///
+/// `markdown` blocks are forwarded as-is even though they carry
+/// CommonMark, not Slack mrkdwn. The frontend tokenizer will render
+/// most of it correctly (text, links, code) but not `**bold**` /
+/// `__italic__` / fenced language tags. Acceptable while no real
+/// message hits the long-message path; revisit when someone reports
+/// a poorly rendered long bot reply.
+///
+/// [1]: https://api.slack.com/reference/block-kit/blocks
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum RawBlock {
+	Section {
+		#[serde(default)]
+		text: Option<RawBlockText>,
+	},
+	Markdown {
+		text: String,
+	},
+	Divider,
+	#[serde(other)]
+	Unknown,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RawBlockText {
+	#[serde(rename = "type")]
+	kind: String,
+	text: String,
 }
 
 /// Top-level test: parent of a thread (or a thread-less message).
@@ -345,7 +417,11 @@ fn is_top_level(msg: &RawMessage) -> bool {
 }
 
 fn to_session(msg: RawMessage) -> SlackSession {
-	let preview = preview_from(msg.text.as_deref().unwrap_or(""));
+	// Same blocks-vs-text precedence as `to_message`: bots put the
+	// real content in blocks, the `text` fallback often loses
+	// newlines and structure.
+	let body = text_from_blocks(msg.blocks.as_deref()).unwrap_or_else(|| msg.text.unwrap_or_default());
+	let preview = preview_from(&body);
 	let reply_count = msg.reply_count.unwrap_or(0);
 	let latest_ts = msg.latest_reply.unwrap_or_else(|| msg.ts.clone());
 	SlackSession {
@@ -359,13 +435,49 @@ fn to_session(msg: RawMessage) -> SlackSession {
 
 fn to_message(msg: RawMessage) -> SlackMessage {
 	let is_bot = msg.bot_id.is_some();
+	let text = text_from_blocks(msg.blocks.as_deref()).unwrap_or_else(|| msg.text.unwrap_or_default());
 	SlackMessage {
 		ts: msg.ts,
 		user_id: msg.user,
-		text: msg.text.unwrap_or_default(),
+		text,
 		edited_ts: msg.edited.map(|e| e.ts),
 		is_bot,
 	}
+}
+
+/// Build a single Slack-mrkdwn string from the Block Kit blocks we
+/// know how to render. Returns `None` if no block contributed any
+/// text, in which case the caller falls back to the raw `text` field.
+///
+/// Each block becomes one paragraph separated by a blank line — the
+/// same vertical rhythm Slack uses in its own renderer. Newlines
+/// inside a block (e.g. inside a `section` mrkdwn body) are preserved
+/// as-is.
+fn text_from_blocks(blocks: Option<&[RawBlock]>) -> Option<String> {
+	let blocks = blocks?;
+	let mut parts: Vec<String> = Vec::with_capacity(blocks.len());
+	for block in blocks {
+		match block {
+			RawBlock::Section { text: Some(text) } if text.kind == "mrkdwn" => {
+				parts.push(text.text.clone());
+			}
+			RawBlock::Markdown { text } => {
+				// CommonMark, not Slack mrkdwn. Forwarded as-is for
+				// now — the frontend tokenizer will render it
+				// best-effort. Long messages with `**bold**` will
+				// show literal asterisks; deferred until needed.
+				parts.push(text.clone());
+			}
+			RawBlock::Divider => {
+				parts.push("———".to_string());
+			}
+			_ => {}
+		}
+	}
+	if parts.is_empty() {
+		return None;
+	}
+	Some(parts.join("\n\n"))
 }
 
 /// Single-line preview, capped at [`PREVIEW_MAX_CHARS`]. Newlines
@@ -487,6 +599,143 @@ mod tests {
 		assert_eq!(messages[0].edited_ts, None);
 		assert!(messages[1].is_bot);
 		assert_eq!(messages[1].edited_ts.as_deref(), Some("1700000005.000500"));
+	}
+
+	#[test]
+	fn block_text_overrides_text_field_when_blocks_present() {
+		// Real moon-bot shape: `text` is a flattened notification
+		// fallback (newlines lost), `blocks` carries the actual rich
+		// content with newlines preserved. We must use the blocks.
+		let json = r#"{
+			"ts": "1700000002.000200",
+			"user": "U_BOT",
+			"thread_ts": "1700000001.000100",
+			"text": "Root cause: foo. Fix: bar.",
+			"bot_id": "B01",
+			"blocks": [
+				{ "type": "section", "text": { "type": "mrkdwn", "text": "*Root cause:* foo.\nstill same paragraph." } },
+				{ "type": "section", "text": { "type": "mrkdwn", "text": "*Fix:* bar." } }
+			]
+		}"#;
+		let raw: RawMessage = serde_json::from_str(json).unwrap();
+		let msg = to_message(raw);
+		assert_eq!(msg.text, "*Root cause:* foo.\nstill same paragraph.\n\n*Fix:* bar.");
+	}
+
+	#[test]
+	fn falls_back_to_text_when_blocks_absent() {
+		let json = r#"{
+			"ts": "1700000003.000300",
+			"user": "U_HUMAN",
+			"thread_ts": "1700000001.000100",
+			"text": "plain typed message"
+		}"#;
+		let msg = to_message(serde_json::from_str(json).unwrap());
+		assert_eq!(msg.text, "plain typed message");
+	}
+
+	#[test]
+	fn falls_back_to_text_when_no_block_contributed() {
+		// Slack auto-generates rich_text blocks for human typers; we
+		// don't render those (yet), so the typed `text` field has to
+		// win.
+		let json = r#"{
+			"ts": "1700000004.000400",
+			"user": "U_HUMAN",
+			"thread_ts": "1700000001.000100",
+			"text": "typed by a human",
+			"blocks": [
+				{ "type": "rich_text", "elements": [] }
+			]
+		}"#;
+		let msg = to_message(serde_json::from_str(json).unwrap());
+		assert_eq!(msg.text, "typed by a human");
+	}
+
+	#[test]
+	fn divider_renders_as_em_dashes() {
+		let json = r#"{
+			"ts": "1700000005.000500",
+			"bot_id": "B01",
+			"blocks": [
+				{ "type": "section", "text": { "type": "mrkdwn", "text": "before" } },
+				{ "type": "divider" },
+				{ "type": "section", "text": { "type": "mrkdwn", "text": "after" } }
+			]
+		}"#;
+		let msg = to_message(serde_json::from_str(json).unwrap());
+		assert_eq!(msg.text, "before\n\n———\n\nafter");
+	}
+
+	#[test]
+	fn skips_unsupported_blocks_silently() {
+		// `actions` (button rows) and `image` blocks contribute
+		// nothing to the rendered text — they're either separately
+		// rendered later (Phase 11.4+) or genuinely cosmetic.
+		let json = r#"{
+			"ts": "1700000006.000600",
+			"bot_id": "B01",
+			"blocks": [
+				{ "type": "section", "text": { "type": "mrkdwn", "text": "hello" } },
+				{ "type": "actions", "elements": [{ "type": "button" }] },
+				{ "type": "image", "image_url": "https://example.com/x.png", "alt_text": "x" }
+			]
+		}"#;
+		let msg = to_message(serde_json::from_str(json).unwrap());
+		assert_eq!(msg.text, "hello");
+	}
+
+	#[test]
+	fn ignores_section_with_plain_text_payload() {
+		// Section blocks can carry `plain_text` (no formatting); we
+		// only render mrkdwn — plain_text is rare and would conflict
+		// with the renderer's mrkdwn assumptions.
+		let json = r#"{
+			"ts": "1700000007.000700",
+			"bot_id": "B01",
+			"blocks": [
+				{ "type": "section", "text": { "type": "plain_text", "text": "ignored" } },
+				{ "type": "section", "text": { "type": "mrkdwn", "text": "kept" } }
+			]
+		}"#;
+		let msg = to_message(serde_json::from_str(json).unwrap());
+		assert_eq!(msg.text, "kept");
+	}
+
+	#[test]
+	fn session_preview_reads_blocks_not_text_fallback() {
+		// Same precedence as `to_message`: a bot session row should
+		// summarise the rich blocks, not the flattened text field.
+		let json = r#"{
+			"ts": "1700000010.001000",
+			"thread_ts": "1700000010.001000",
+			"user": "U_BOT",
+			"bot_id": "B01",
+			"text": "ignored fallback",
+			"blocks": [
+				{ "type": "section", "text": { "type": "mrkdwn", "text": "real preview body" } }
+			]
+		}"#;
+		let raw: RawMessage = serde_json::from_str(json).unwrap();
+		let session = to_session(raw);
+		assert_eq!(session.preview, "real preview body");
+	}
+
+	#[test]
+	fn forwards_markdown_block_text_unchanged() {
+		// `markdown` blocks carry CommonMark, not Slack mrkdwn. We
+		// hand them to the frontend as-is for now (deferred — see
+		// `text_from_blocks` doc comment). `**bold**` will leak as
+		// literal asterisks until conversion lands.
+		let json = r#"{
+			"ts": "1700000008.000800",
+			"bot_id": "B01",
+			"blocks": [
+				{ "type": "markdown", "text": "**bold** and a [link](https://x.io)" }
+			]
+		}"#;
+		let msg = to_message(serde_json::from_str(json).unwrap());
+		assert_eq!(msg.text, "**bold** and a [link](https://x.io)");
 	}
 
 	#[test]

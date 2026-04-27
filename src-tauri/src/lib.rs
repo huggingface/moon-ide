@@ -47,6 +47,7 @@ pub fn run() {
 			commands::slack::slack_list_sessions,
 			commands::slack::slack_get_thread,
 			commands::slack::slack_set_active_thread,
+			commands::slack::slack_get_user,
 		])
 		.setup(|app| {
 			let config_dir = app

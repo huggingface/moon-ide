@@ -13,6 +13,7 @@ import type {
 	SlackMessage,
 	SlackSession,
 	SlackStatus,
+	SlackUserSummary,
 	StatResult,
 	Workspace,
 	WriteFileResult,
@@ -57,5 +58,6 @@ export const ipc = {
 		listSessions: (channel: string) => invoke<SlackSession[]>('slack_list_sessions', { channel }),
 		getThread: (channel: string, threadTs: string) => invoke<SlackMessage[]>('slack_get_thread', { channel, threadTs }),
 		setActiveThread: (threadTs: string | null) => invoke<void>('slack_set_active_thread', { threadTs }),
+		getUser: (userId: string) => invoke<SlackUserSummary>('slack_get_user', { userId }),
 	},
 } as const;

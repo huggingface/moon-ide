@@ -8,6 +8,8 @@
 //! survives "open another folder", and a future "no folder open, just
 //! chatting" flow doesn't need the workspace to exist at all.
 
+import { SvelteMap } from 'svelte/reactivity';
+
 import { ipc } from './ipc';
 import {
 	formatError,
@@ -17,9 +19,23 @@ import {
 	type SlackMessage,
 	type SlackSession,
 	type SlackStatus,
+	type SlackUserSummary,
 } from './protocol';
 
 export type ConnectResult = { ok: true; identity: SlackIdentity } | { ok: false; error: string };
+
+/**
+ * Reactive cache entry for one Slack user. The mrkdwn renderer reads
+ * the entry, sees `loading` and renders a placeholder pill, then
+ * automatically re-renders when the cache transitions to `resolved`.
+ *
+ * `missing` is its own state (not just `null`): it lets the renderer
+ * fall back to the raw user_id without infinitely retrying a 404.
+ */
+export type SlackUserCacheEntry =
+	| { state: 'loading' }
+	| { state: 'resolved'; user: SlackUserSummary }
+	| { state: 'missing' };
 
 class SlackPanelState {
 	/** Whether the right-side panel is currently rendered. */
@@ -95,6 +111,16 @@ class SlackPanelState {
 	#sessionsGeneration = 0;
 	#threadGeneration = 0;
 
+	/**
+	 * Resolved-name cache for `<@U…>` mention rendering. Reactive so
+	 * placeholders auto-upgrade to the resolved label without the
+	 * renderer needing to re-trigger a load. Keyed by `user_id`. Never
+	 * cleared at runtime — Slack workspace user IDs don't churn, and
+	 * the cache lives only as long as the process. Disconnect resets
+	 * it via [`#resetUserCache`].
+	 */
+	userCache = new SvelteMap<string, SlackUserCacheEntry>();
+
 	get connected(): boolean {
 		return this.status?.connected ?? false;
 	}
@@ -111,6 +137,7 @@ class SlackPanelState {
 		this.activeBot = state.active_bot;
 		this.panelVisible = state.panel_visible;
 		this.activeThreadTs = state.active_thread_ts;
+		this.#seedActiveBot();
 	}
 
 	togglePanel() {
@@ -150,6 +177,7 @@ class SlackPanelState {
 				this.#resetThreadView();
 				return;
 			}
+			this.#seedSelf();
 			// Connected. Reload the persisted bot pick first; only fall
 			// back to the picker (DM scan) when there isn't one. A
 			// failure here is non-fatal — we just treat it as "no saved
@@ -159,6 +187,7 @@ class SlackPanelState {
 			if (this.activeBot === null) {
 				try {
 					this.activeBot = await ipc.slack.getActiveBot();
+					this.#seedActiveBot();
 				} catch {
 					// fall through to the picker
 				}
@@ -179,6 +208,7 @@ class SlackPanelState {
 		try {
 			const identity = await ipc.slack.setToken(token);
 			this.status = { connected: true, identity };
+			this.#seedSelf();
 			this.activeBot = null;
 			this.botCandidates = [];
 			this.botError = null;
@@ -205,6 +235,7 @@ class SlackPanelState {
 		this.botCandidates = [];
 		this.botError = null;
 		this.#resetThreadView();
+		this.#resetUserCache();
 	}
 
 	/**
@@ -234,6 +265,7 @@ class SlackPanelState {
 	async selectBot(profile: SlackBotProfile): Promise<void> {
 		const previous = this.activeBot;
 		this.activeBot = profile;
+		this.#seedActiveBot();
 		if (previous?.user_id !== profile.user_id) {
 			this.#resetThreadView();
 		}
@@ -362,6 +394,88 @@ class SlackPanelState {
 				this.loadingThread = false;
 			}
 		}
+	}
+
+	/**
+	 * Pure read of the user-cache entry. Safe to call from `$derived`
+	 * or template expressions — never mutates state, never triggers a
+	 * network call. Returns `undefined` when the user has never been
+	 * requested.
+	 *
+	 * Pair with [`requestUser`] from an `$effect`: the effect kicks
+	 * off the fetch on first paint, the resulting cache write triggers
+	 * a re-render, and `peekUser` then returns the resolved entry.
+	 *
+	 * Splitting reads from writes is what keeps Svelte's render path
+	 * pure (mutating `userCache` from inside a snippet trips
+	 * `state_unsafe_mutation`).
+	 */
+	peekUser(userId: string): SlackUserCacheEntry | undefined {
+		return this.userCache.get(userId);
+	}
+
+	/**
+	 * Mutating counterpart of [`peekUser`]. Idempotent — repeated calls
+	 * for the same user_id are free (the cache already has an entry).
+	 * Must be called *outside* render: from a Svelte `$effect`, an
+	 * event handler, or after a network response.
+	 */
+	requestUser(userId: string): void {
+		if (this.userCache.has(userId)) {
+			return;
+		}
+		this.userCache.set(userId, { state: 'loading' });
+		void this.#fetchUser(userId);
+	}
+
+	#seedSelf(): void {
+		const me = this.status?.identity;
+		if (me === undefined || me === null) {
+			return;
+		}
+		this.userCache.set(me.user_id, {
+			state: 'resolved',
+			user: {
+				user_id: me.user_id,
+				name: me.user_name,
+				real_name: me.user_name,
+				display_name: null,
+				is_bot: false,
+			},
+		});
+	}
+
+	#seedActiveBot(): void {
+		const bot = this.activeBot;
+		if (bot === null) {
+			return;
+		}
+		this.userCache.set(bot.user_id, {
+			state: 'resolved',
+			user: {
+				user_id: bot.user_id,
+				name: bot.username,
+				real_name: bot.real_name,
+				display_name: bot.display_name,
+				is_bot: bot.user_id !== this.status?.identity?.user_id,
+			},
+		});
+	}
+
+	async #fetchUser(userId: string): Promise<void> {
+		try {
+			const user = await ipc.slack.getUser(userId);
+			this.userCache.set(userId, { state: 'resolved', user });
+		} catch {
+			// `users.info` failure (most often `user_not_found` for
+			// deactivated members) → mark missing so the renderer falls
+			// back to the raw ID and we don't retry on every paint.
+			this.userCache.set(userId, { state: 'missing' });
+		}
+	}
+
+	#resetUserCache(): void {
+		this.userCache.clear();
 	}
 
 	#resetThreadView(): void {

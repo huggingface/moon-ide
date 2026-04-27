@@ -21,6 +21,15 @@
 	--m-warning: #f0b86e;
 	--m-danger: #ff7a8a;
 
+	/* Inline code accent — used by chat / Slack messages only.
+	   Distinct from `--m-fg` so `\`code\`` reads as a token at a
+	   glance; matches Slack's soft pink-red pill. The Markdown
+	   viewer keeps a neutral surface, so this token is intentionally
+	   not pulled in there. */
+	--m-code-fg: #ffadc7;
+	--m-code-bg: rgba(255, 173, 199, 0.12);
+	--m-code-border: rgba(255, 173, 199, 0.25);
+
 	/* Editor */
 	--m-editor-bg: var(--m-bg);
 	--m-editor-gutter: var(--m-fg-subtle);
@@ -62,6 +71,9 @@
 	--m-editor-bg: var(--m-bg);
 	--m-editor-line-active: rgba(0, 0, 0, 0.02);
 	--m-editor-selection: rgba(67, 96, 200, 0.15);
+	--m-code-fg: #c7254e;
+	--m-code-bg: rgba(199, 37, 78, 0.08);
+	--m-code-border: rgba(199, 37, 78, 0.18);
 }
 
 * {

@@ -2,9 +2,11 @@
 	import { onMount, untrack } from 'svelte';
 	import { confirm } from '@tauri-apps/plugin-dialog';
 	import { slack } from '../slack.svelte';
-	import { botLabel, type SlackBotProfile, type SlackSession } from '../protocol';
+	import { botLabel, userLabel, type SlackBotProfile, type SlackSession } from '../protocol';
 	import { formatSlackRelative, formatSlackTime } from '../util/slackTime';
+	import { collectMentionedUserIds, parseSlackMrkdwn, slackPlainText } from '../util/slackMrkdwn';
 	import ChatConnectModal from './ChatConnectModal.svelte';
+	import SlackMessageBody from './SlackMessageBody.svelte';
 
 	onMount(() => {
 		// Probe on mount whether the panel is visible or not — the
@@ -49,9 +51,47 @@
 		slack.activeThreadTs === null ? null : (slack.sessions?.find((s) => s.thread_ts === slack.activeThreadTs) ?? null),
 	);
 
+	// Collect every `<@U…>` referenced in the session list previews so
+	// we can pre-warm the user cache. Done from an `$effect` so the
+	// render path stays pure (mutating `userCache` during render trips
+	// `state_unsafe_mutation`). The resulting cache writes re-trigger
+	// `previewOf` below and the labels swap in once `users.info`
+	// resolves.
+	const sessionMentionUserIds = $derived.by(() => {
+		const sessions = slack.sessions;
+		if (sessions === null) {
+			return [];
+		}
+		const ids = new Set<string>();
+		for (const session of sessions) {
+			if (session.user_id !== null) {
+				ids.add(session.user_id);
+			}
+			for (const id of collectMentionedUserIds(parseSlackMrkdwn(session.preview))) {
+				ids.add(id);
+			}
+		}
+		return Array.from(ids);
+	});
+
+	$effect(() => {
+		for (const id of sessionMentionUserIds) {
+			slack.requestUser(id);
+		}
+	});
+
+	function resolveCachedUser(userId: string): string | null {
+		const entry = slack.peekUser(userId);
+		if (entry?.state === 'resolved') {
+			return userLabel(entry.user);
+		}
+		return null;
+	}
+
 	function previewOf(session: SlackSession): string {
-		if (session.preview.length > 0) {
-			return session.preview;
+		const flat = slackPlainText(session.preview, { resolveUserId: resolveCachedUser }).trim();
+		if (flat.length > 0) {
+			return flat;
 		}
 		return session.reply_count > 0 ? '(no preview, see thread)' : '(empty message)';
 	}
@@ -63,7 +103,10 @@
 		if (userId !== null && userId === slack.status?.identity?.user_id) {
 			return 'You';
 		}
-		return userId ?? 'Unknown';
+		if (userId !== null) {
+			return resolveCachedUser(userId) ?? userId;
+		}
+		return 'Unknown';
 	}
 
 	async function onDisconnect() {
@@ -243,7 +286,7 @@
 												{/if}
 											</span>
 										</header>
-										<div class="message-body">{message.text}</div>
+										<div class="message-body"><SlackMessageBody text={message.text} /></div>
 									</li>
 								{/each}
 							</ol>

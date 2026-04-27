@@ -216,6 +216,36 @@ export type SlackMessage = {
 };
 
 /**
+ * Trimmed user record used to render `<@U…>` mentions. Mirrors
+ * `moon_protocol::slack::SlackUserSummary`. Cached per-user on the
+ * frontend to avoid re-hitting `users.info` on every render — see
+ * `userCache` in `slack.svelte.ts`.
+ */
+export type SlackUserSummary = {
+	user_id: string;
+	name: string;
+	real_name: string;
+	display_name: string | null;
+	is_bot: boolean;
+};
+
+/**
+ * Best human-readable label for a `users.info` summary. Same fallback
+ * chain as [`botLabel`]: `display_name → real_name → username`.
+ * Returned without the `@` prefix; rendering decides whether to add
+ * one (mention pills do, message authorship lines don't).
+ */
+export function userLabel(user: SlackUserSummary): string {
+	if (user.display_name && user.display_name.length > 0) {
+		return user.display_name;
+	}
+	if (user.real_name.length > 0) {
+		return user.real_name;
+	}
+	return user.name || user.user_id;
+}
+
+/**
  * Best human-readable label for a bot profile. Falls back through
  * `display_name → real_name → username` so the panel always shows
  * *something* even when Slack returns sparse metadata.
