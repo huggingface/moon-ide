@@ -65,3 +65,75 @@ export function renderMarkdown(source: string): string {
 		RETURN_TRUSTED_TYPE: false,
 	});
 }
+
+/**
+ * Resolve a relative (or workspace-root-absolute) link from inside a
+ * markdown file to a workspace-relative path, mirroring how a browser
+ * resolves URLs against the document's base. Returns `null` when the
+ * link can't be resolved within the workspace — empty href, escapes
+ * the root via `..`, or invalid `%`-encoding.
+ *
+ * Conventions:
+ *   - `./foo.md` and `foo.md` resolve relative to the current file's
+ *     directory, like a normal browser would.
+ *   - `/foo.md` is treated as workspace-root-absolute. Markdown
+ *     authors writing `[…](/something)` mean "from the project root",
+ *     not the filesystem root — those are the same thing inside the
+ *     IDE because the host already pins paths under the workspace
+ *     root anyway.
+ *   - `?query` and `#fragment` are stripped before resolution; the
+ *     fragment is dropped on the floor for now (anchor-scroll inside
+ *     a freshly-opened file is a follow-up — the renderer doesn't
+ *     emit heading anchors yet either).
+ *   - The host re-validates path boundaries on the first IPC call, so
+ *     this function is only the first line of defence.
+ */
+export function resolveMarkdownLink(currentPath: string, href: string): string | null {
+	// Strip the fragment first so `?query=foo#bar` only loses the
+	// fragment (matches browser behavior); query then drops too.
+	const withoutFragment = href.split('#')[0] ?? '';
+	const withoutQuery = withoutFragment.split('?')[0] ?? '';
+	if (!withoutQuery) {
+		return null;
+	}
+	let decoded: string;
+	try {
+		decoded = decodeURIComponent(withoutQuery);
+	} catch {
+		return null;
+	}
+
+	// Build the base segment list. Workspace-root-absolute links bypass
+	// the current file's directory entirely; otherwise we splice the
+	// link into wherever the current file sits.
+	const segments: string[] = [];
+	if (decoded.startsWith('/')) {
+		segments.push(...decoded.split('/').filter(Boolean));
+	} else {
+		const slash = currentPath.lastIndexOf('/');
+		const dir = slash >= 0 ? currentPath.slice(0, slash) : '';
+		if (dir) {
+			segments.push(...dir.split('/').filter(Boolean));
+		}
+		segments.push(...decoded.split('/').filter(Boolean));
+	}
+
+	const resolved: string[] = [];
+	for (const segment of segments) {
+		if (segment === '.') {
+			continue;
+		}
+		if (segment === '..') {
+			if (resolved.length === 0) {
+				return null;
+			}
+			resolved.pop();
+			continue;
+		}
+		resolved.push(segment);
+	}
+	if (resolved.length === 0) {
+		return null;
+	}
+	return resolved.join('/');
+}

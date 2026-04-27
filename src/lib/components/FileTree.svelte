@@ -109,8 +109,45 @@
 			}
 		}
 		if (target !== null) {
+			// Expand collapsed ancestors first: select() works on a logical
+			// path even when the row isn't rendered, but scroll-into-view
+			// can only find DOM rows that actually exist. Without this,
+			// opening `crates/moon-core/src/host.rs` from a Markdown link
+			// (or after a session restore) leaves the file selected but
+			// hidden inside a collapsed `crates/moon-core/` segment.
+			expandAncestors(local, target);
 			local.getItem(target)?.select();
 			void scrollPathIntoView(local, target);
+		}
+	}
+
+	// Walk the ancestor chain from the workspace root down to the file's
+	// parent and call `expand()` on every directory handle that resolves.
+	// `flattenEmptyDirectories: true` means some intermediate path strings
+	// (`crates`, `crates/moon-core`) live as flattened segments without a
+	// standalone row; `getItem` returns `null` for those, which we just
+	// skip — expanding the deepest visible ancestor reveals the rest of
+	// the chain because Pierre re-projects the flatten on each expand.
+	function expandAncestors(local: FileTree, path: string) {
+		const segments = path.split('/').filter(Boolean);
+		if (segments.length <= 1) {
+			return;
+		}
+		let cumulative = '';
+		for (let i = 0; i < segments.length - 1; i++) {
+			cumulative = cumulative ? `${cumulative}/${segments[i]}` : (segments[i] ?? '');
+			const item = local.getItem(cumulative);
+			// `'expand' in item` is the cleanest narrow from
+			// `FileTreeItemHandle` to `FileTreeDirectoryHandle`:
+			// `isDirectory()` returns `boolean` and doesn't act as a
+			// type predicate, so TypeScript can't narrow off it on
+			// its own.
+			if (!item || !('expand' in item)) {
+				continue;
+			}
+			if (!item.isExpanded()) {
+				item.expand();
+			}
 		}
 	}
 

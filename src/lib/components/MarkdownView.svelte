@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { openUrl } from '@tauri-apps/plugin-opener';
-	import { renderMarkdown } from '../markdown';
-	import type { OpenFile } from '../state.svelte';
+	import { renderMarkdown, resolveMarkdownLink } from '../markdown';
+	import { isUntitledPath, workspace, type OpenFile } from '../state.svelte';
 
 	type Props = { file: OpenFile };
 	let { file }: Props = $props();
@@ -12,19 +12,21 @@
 	const html = $derived(renderMarkdown(file.text));
 
 	// Schemes that `opener:default` permits via `openUrl` — keep this
-	// list in sync with that capability set. Anything else gets
-	// swallowed: relative paths, `file://`, custom protocols. We can
-	// teach the handler to open neighbouring `.md` files in a new tab
-	// when somebody asks; today that's out of scope.
+	// list in sync with that capability set. Anything else with a
+	// recognised scheme is dropped on the floor (file://, custom
+	// protocols, etc.).
 	const EXTERNAL_SCHEMES = new Set(['http:', 'https:', 'mailto:', 'tel:']);
 
 	/**
 	 * Anchor clicks inside the rendered article must never navigate
 	 * the Tauri webview itself — that would replace the IDE shell
-	 * with the page. For external schemes we hand the URL to the OS
-	 * (default browser, mail client, dialer); for in-page `#anchors`
-	 * we let the browser do its native scroll; everything else is
-	 * dropped on the floor.
+	 * with the page. The handler routes by link shape:
+	 *   - external schemes (`http(s)://`, `mailto:`, `tel:`) → OS
+	 *     default app via `openUrl`
+	 *   - in-page `#anchors` → native browser scroll
+	 *   - relative or workspace-root-absolute paths → open the target
+	 *     file in a new tab inside the IDE
+	 *   - everything else → swallow
 	 */
 	function onArticleClick(event: MouseEvent) {
 		const target = event.target;
@@ -44,19 +46,35 @@
 			return;
 		}
 		event.preventDefault();
-		// `URL` parsing is the simplest scheme check that also rejects
-		// "javascript:foo" reliably (DOMPurify already blocks it, but
-		// the click handler is the second line of defense).
-		let url: URL;
+		// `URL` only parses absolute URLs; relative paths throw, which
+		// is how we tell them apart. Going through `URL` also rejects
+		// `javascript:foo` reliably (DOMPurify already blocks it, but
+		// this is the second line of defence).
+		let absolute: URL | null = null;
 		try {
-			url = new URL(href);
+			absolute = new URL(href);
 		} catch {
+			absolute = null;
+		}
+		if (absolute) {
+			if (EXTERNAL_SCHEMES.has(absolute.protocol)) {
+				void openUrl(absolute.toString());
+			}
 			return;
 		}
-		if (!EXTERNAL_SCHEMES.has(url.protocol)) {
+		// Relative link: resolve it against the current file's location
+		// and ask WorkspaceState to open it. Untitled buffers have no
+		// on-disk directory to resolve against — we'd never preview one
+		// in practice (preview requires a markdown extension), but be
+		// defensive in case that invariant slips later.
+		if (isUntitledPath(file.path)) {
 			return;
 		}
-		void openUrl(url.toString());
+		const targetPath = resolveMarkdownLink(file.path, href);
+		if (!targetPath) {
+			return;
+		}
+		void workspace.openFile(targetPath);
 	}
 </script>
 

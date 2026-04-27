@@ -10,14 +10,18 @@
   surprise auto-links), then run through DOMPurify for defense in
   depth. Every rendered `<a>` carries `rel="noopener noreferrer"`.
 - New `MarkdownView.svelte`: scrollable `.markdown-body` article
-  rendered from sanitised HTML. Click handler intercepts every
-  `<a>`: `http(s)://`, `mailto:`, and `tel:` URLs are forwarded to
+  rendered from sanitised HTML. Click handler routes anchors by
+  shape: `http(s)://`, `mailto:`, and `tel:` URLs are forwarded to
   the OS via `@tauri-apps/plugin-opener`'s `openUrl` (default
   browser, mail client, dialer); in-page `#anchors` get the native
-  scroll; everything else (relative paths, `file://`, custom
-  schemes) is dropped on the floor. The webview itself never
-  navigates, so a stray `https://…` click can't replace the IDE
-  shell with the page.
+  scroll; relative or workspace-root-absolute paths resolve via
+  `resolveMarkdownLink` (lexical, browser-style, `..` past the
+  workspace root → reject) and get handed to `workspace.openFile`;
+  unrecognised schemes (`file://`, custom protocols) are dropped on
+  the floor. The webview itself never navigates, so a stray
+  `https://…` click can't replace the IDE shell with the page, and
+  the host re-validates path bounds on the IPC roundtrip even if
+  the lexical resolver lets something through.
 - `EditorPane` picks `MarkdownView` over `Editor` whenever the
   active path is markdown and `previewModeFor(path) === 'preview'`.
 - `EditorTabs` grows a Source/Preview toggle anchored to the right
@@ -91,13 +95,32 @@ Prerequisites: `bun install`, host deps installed per `README.md`,
     the IDE webview itself stays on the README, the active tab
     doesn't change, no new IDE window. `mailto:` and `tel:` links
     behave the same way (mail client / dialer instead of browser).
-11. Click a relative-path link (e.g. `[other](./other.md)`) or a
-    custom-scheme link. Expected: nothing happens — those still
-    fall through the click handler. Linked-workspace-file
-    navigation is a deliberate follow-up.
-12. Click an in-page `[link](#anchor)` (or use any of the auto-
-    generated heading anchors once we ship them). Expected: the
-    article scrolls to the target without leaving the tab.
+11. **Linked workspace files.** In `README.md`, click the link to
+    `specs/roadmap.md` (or any other markdown file referenced by a
+    relative path). Expected: a new tab opens for that file in the
+    focused pane, defaulting to Preview if the target is markdown,
+    and the file tree selects the new path. If the target lives in
+    a collapsed directory, the tree expands every ancestor on the
+    way down so the row is actually visible (the same applies to
+    any other openFile flow — session restore, Save As, etc.).
+    `[code](./src/App.svelte)` works the same way and opens the
+    source in the code editor.
+12. **Workspace-root-absolute links.** Edit a markdown file
+    somewhere deep in the tree to include `[root](/README.md)` and
+    click it. Expected: opens the workspace's `README.md`, not the
+    filesystem root. Trailing `?query` and `#fragment` parts are
+    stripped before resolution; the fragment is dropped (anchor-
+    scroll inside a freshly-opened file is a follow-up).
+13. **Escape attempt.** Edit a markdown file to include
+    `[escape](../../../etc/passwd)` and click it. Expected: nothing
+    happens — the lexical resolver rejects the link before any IPC
+    call. Even if it didn't, the host would refuse on resolve.
+14. **In-page anchors.** Click an in-page `[link](#anchor)` (or
+    use any of the auto-generated heading anchors once we ship
+    them). Expected: the article scrolls to the target without
+    leaving the tab.
+15. **Custom-scheme links.** A link with an unknown scheme
+    (`steam://run/123`, `vscode://…`) does nothing.
 
 ## What must keep working
 
@@ -123,10 +146,13 @@ Prerequisites: `bun install`, host deps installed per `README.md`,
   markdown file inside the workspace renders a broken image — we'd
   need to rewrite the URL to `convertFileSrc(absolutePath)`. Lands
   with the broader "linked assets" follow-up.
-- **Relative-path and `file://` links are not openable.** Linking
-  to a sibling `.md` does nothing in preview today — landing that
-  cleanly means resolving paths against the workspace and opening
-  a tab, which is the broader "linked assets" follow-up.
+- **Anchor-scroll inside a freshly-opened file is a follow-up.**
+  Clicking `[other](./other.md#section)` opens `other.md` and
+  drops the fragment; the renderer doesn't emit heading anchors
+  yet either, so there's nothing to scroll to inside the same
+  document beyond what the markdown source provides explicitly.
+- **`file://` and custom-scheme links** are still swallowed —
+  same posture as before.
 - **Per-pane preview mode is not supported.** Same buffer in two
   panes shows the same mode. Splitting a markdown file with one
   pane in Source and one in Preview is on the follow-up list.
