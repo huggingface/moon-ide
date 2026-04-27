@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { openUrl } from '@tauri-apps/plugin-opener';
 	import { renderMarkdown } from '../markdown';
 	import type { OpenFile } from '../state.svelte';
 
@@ -10,13 +11,20 @@
 	// and forth pay nothing for the round trip.
 	const html = $derived(renderMarkdown(file.text));
 
+	// Schemes that `opener:default` permits via `openUrl` — keep this
+	// list in sync with that capability set. Anything else gets
+	// swallowed: relative paths, `file://`, custom protocols. We can
+	// teach the handler to open neighbouring `.md` files in a new tab
+	// when somebody asks; today that's out of scope.
+	const EXTERNAL_SCHEMES = new Set(['http:', 'https:', 'mailto:', 'tel:']);
+
 	/**
-	 * Intercept clicks inside the rendered article. Without this, an
-	 * `<a href="https://…">` would navigate the Tauri webview itself
-	 * (replacing the IDE shell with the page) — anything from a typo
-	 * to a malicious markdown file could brick the window. We swallow
-	 * the click for now; an "open externally" follow-up will wire
-	 * `@tauri-apps/plugin-opener` once we install it.
+	 * Anchor clicks inside the rendered article must never navigate
+	 * the Tauri webview itself — that would replace the IDE shell
+	 * with the page. For external schemes we hand the URL to the OS
+	 * (default browser, mail client, dialer); for in-page `#anchors`
+	 * we let the browser do its native scroll; everything else is
+	 * dropped on the floor.
 	 */
 	function onArticleClick(event: MouseEvent) {
 		const target = event.target;
@@ -24,9 +32,31 @@
 			return;
 		}
 		const anchor = target.closest('a');
-		if (anchor) {
-			event.preventDefault();
+		if (!anchor) {
+			return;
 		}
+		const href = anchor.getAttribute('href');
+		if (!href) {
+			event.preventDefault();
+			return;
+		}
+		if (href.startsWith('#')) {
+			return;
+		}
+		event.preventDefault();
+		// `URL` parsing is the simplest scheme check that also rejects
+		// "javascript:foo" reliably (DOMPurify already blocks it, but
+		// the click handler is the second line of defense).
+		let url: URL;
+		try {
+			url = new URL(href);
+		} catch {
+			return;
+		}
+		if (!EXTERNAL_SCHEMES.has(url.protocol)) {
+			return;
+		}
+		void openUrl(url.toString());
 	}
 </script>
 

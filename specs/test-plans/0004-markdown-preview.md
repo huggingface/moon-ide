@@ -11,10 +11,13 @@
   depth. Every rendered `<a>` carries `rel="noopener noreferrer"`.
 - New `MarkdownView.svelte`: scrollable `.markdown-body` article
   rendered from sanitised HTML. Click handler intercepts every
-  `<a>` and `event.preventDefault()`s — clicking a link in preview
-  is a no-op for now (would otherwise navigate the Tauri webview
-  itself and brick the IDE shell). "Open in browser" lands when
-  we install `@tauri-apps/plugin-opener`.
+  `<a>`: `http(s)://`, `mailto:`, and `tel:` URLs are forwarded to
+  the OS via `@tauri-apps/plugin-opener`'s `openUrl` (default
+  browser, mail client, dialer); in-page `#anchors` get the native
+  scroll; everything else (relative paths, `file://`, custom
+  schemes) is dropped on the floor. The webview itself never
+  navigates, so a stray `https://…` click can't replace the IDE
+  shell with the page.
 - `EditorPane` picks `MarkdownView` over `Editor` whenever the
   active path is markdown and `previewModeFor(path) === 'preview'`.
 - `EditorTabs` grows a Source/Preview toggle anchored to the right
@@ -83,9 +86,18 @@ Prerequisites: `bun install`, host deps installed per `README.md`,
    - The `data:text/html,…` link is dropped by DOMPurify
      (`ALLOW_UNKNOWN_PROTOCOLS: false`).
 
-10. Click any link in the preview. Expected: nothing happens (no
-    navigation, no new window). Right-click → "Copy link" still
-    works for getting the URL out manually.
+10. Click an `https://` link in the preview (e.g. one in the
+    README). Expected: the URL opens in your default OS browser;
+    the IDE webview itself stays on the README, the active tab
+    doesn't change, no new IDE window. `mailto:` and `tel:` links
+    behave the same way (mail client / dialer instead of browser).
+11. Click a relative-path link (e.g. `[other](./other.md)`) or a
+    custom-scheme link. Expected: nothing happens — those still
+    fall through the click handler. Linked-workspace-file
+    navigation is a deliberate follow-up.
+12. Click an in-page `[link](#anchor)` (or use any of the auto-
+    generated heading anchors once we ship them). Expected: the
+    article scrolls to the target without leaving the tab.
 
 ## What must keep working
 
@@ -111,9 +123,10 @@ Prerequisites: `bun install`, host deps installed per `README.md`,
   markdown file inside the workspace renders a broken image — we'd
   need to rewrite the URL to `convertFileSrc(absolutePath)`. Lands
   with the broader "linked assets" follow-up.
-- **Link clicks are swallowed.** Until `@tauri-apps/plugin-opener`
-  is installed, clicking any link in preview does nothing. Until
-  then this is the safe default.
+- **Relative-path and `file://` links are not openable.** Linking
+  to a sibling `.md` does nothing in preview today — landing that
+  cleanly means resolving paths against the workspace and opening
+  a tab, which is the broader "linked assets" follow-up.
 - **Per-pane preview mode is not supported.** Same buffer in two
   panes shows the same mode. Splitting a markdown file with one
   pane in Source and one in Preview is on the follow-up list.
