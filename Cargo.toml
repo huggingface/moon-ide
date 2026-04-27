@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["src-tauri", "crates/moon-protocol", "crates/moon-core", "crates/moon-agent"]
+members = ["src-tauri", "crates/moon-protocol", "crates/moon-core", "crates/moon-agent", "crates/moon-slack"]
 
 [workspace.package]
 edition = "2021"
@@ -11,6 +11,7 @@ publish = false
 [workspace.dependencies]
 moon-core = { path = "crates/moon-core" }
 moon-protocol = { path = "crates/moon-protocol" }
+moon-slack = { path = "crates/moon-slack" }
 
 anyhow = "1.0"
 async-trait = "0.1"
@@ -26,6 +27,8 @@ notify = "8.0"
 ignore = "0.4"
 ec4rs = "1.2"
 trash = "5.2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+keyring = "3"
 ts-rs = { version = "12.0", features = ["serde-compat", "serde-json-impl"] }
 
 [profile.release]

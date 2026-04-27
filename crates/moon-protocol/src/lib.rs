@@ -9,6 +9,7 @@ pub mod error;
 pub mod fs;
 pub mod search;
 pub mod session;
+pub mod slack;
 pub mod theme;
 pub mod workspace;
 

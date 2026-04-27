@@ -90,6 +90,7 @@ mod tests {
 		let s = AppState {
 			last_session: Some(sample_session()),
 			theme: ThemeMode::Light,
+			..Default::default()
 		};
 		save(&cfg, &s).await.unwrap();
 

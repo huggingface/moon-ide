@@ -1,5 +1,6 @@
 import { confirm, open } from '@tauri-apps/plugin-dialog';
 import { workspace } from './state.svelte';
+import { slack } from './slack.svelte';
 import { ipc } from './ipc';
 import { formatError, type FileSearchResult, type ContentSearchHit } from './protocol';
 import { isMarkdownPath } from './util/markdown';
@@ -171,6 +172,32 @@ export const builtInCommands: Command[] = [
 		title: 'Reload Window',
 		shortcut: 'Ctrl+R',
 		run: () => reloadWindow(),
+	},
+	{
+		id: 'chat.togglePanel',
+		// Wording flips with panel state — same diagnostic value as
+		// the theme toggle, and means the user knows which way the
+		// command goes before clicking.
+		title: () => (slack.panelVisible ? 'Chat: Hide Panel' : 'Chat: Show Panel'),
+		run: () => slack.togglePanel(),
+	},
+	{
+		id: 'chat.connect',
+		title: 'Chat: Connect Slack…',
+		// Only useful before the user has connected — once a token is
+		// in the keyring, the modal is replaced by the Disconnect
+		// affordance inside the panel itself.
+		visible: () => !slack.connected,
+		run: () => {
+			slack.panelVisible = true;
+			slack.openConnectModal();
+		},
+	},
+	{
+		id: 'chat.disconnect',
+		title: 'Chat: Disconnect Slack',
+		visible: () => slack.connected,
+		run: () => void slack.disconnect(),
 	},
 	{
 		id: 'markdown.togglePreview',

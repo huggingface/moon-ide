@@ -291,9 +291,13 @@ class WorkspaceState {
 						focused_side: this.focusedSide,
 					}
 				: null;
+			// `slack` is owned by `slack.svelte.ts` + the Slack tauri
+			// commands; the backend's `app_state_save` ignores whatever
+			// we send here and preserves the on-disk value.
 			const payload: AppState = {
 				last_session: session,
 				theme: this.theme,
+				slack: { active_bot: null },
 			};
 			// AppState writes are best-effort. A toast on every failure
 			// would be too noisy (this fires on every navigation); a

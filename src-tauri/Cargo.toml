@@ -17,6 +17,7 @@ tauri-build = { version = "2.5", features = [] }
 [dependencies]
 moon-core = { workspace = true }
 moon-protocol = { workspace = true }
+moon-slack = { workspace = true }
 
 tauri = { version = "2.10", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2.4"

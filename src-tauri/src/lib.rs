@@ -5,6 +5,7 @@ mod state;
 
 use camino::Utf8PathBuf;
 use moon_core::app_state as core_app_state;
+use moon_slack::SlackClient;
 use state::AppState;
 use tauri::Manager;
 
@@ -35,6 +36,13 @@ pub fn run() {
 			commands::app_state::app_state_load,
 			commands::app_state::app_state_save,
 			commands::editorconfig::editorconfig_for_path,
+			commands::slack::slack_set_token,
+			commands::slack::slack_status,
+			commands::slack::slack_clear_token,
+			commands::slack::slack_list_dm_bots,
+			commands::slack::slack_select_bot,
+			commands::slack::slack_clear_bot,
+			commands::slack::slack_get_active_bot,
 		])
 		.setup(|app| {
 			let config_dir = app
@@ -72,6 +80,21 @@ pub fn run() {
 					Err(e) => {
 						tracing::warn!(error = %e, "failed to load app state");
 					}
+				}
+
+				// Rehydrate the Slack client from the keyring if the
+				// user had previously connected. We don't validate the
+				// token at startup — `slack_status` will do that on the
+				// frontend's first poll, and clear the keyring entry if
+				// the token has gone bad. Avoiding a blocking round-trip
+				// to slack.com here keeps the splash time snappy.
+				match state.slack.tokens.load() {
+					Ok(Some(token)) => match SlackClient::new(token) {
+						Ok(client) => state.slack.set_client(client).await,
+						Err(e) => tracing::warn!(error = %e, "failed to build Slack client from stored token"),
+					},
+					Ok(None) => {}
+					Err(e) => tracing::warn!(error = %e, "failed to read Slack token from keyring"),
 				}
 			});
 

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { workspace } from '../state.svelte';
+	import { slack } from '../slack.svelte';
 
 	let themeBtn: HTMLButtonElement | undefined = $state();
 
@@ -31,6 +32,19 @@
 				{workspace.activeFile.name}{workspace.activeFile.isDirty ? ' •' : ''}
 			</span>
 		{/if}
+		<!-- Chat panel toggle. Pip indicator shows connection state so
+			 the user can see "Slack: connected" without opening the
+			 panel. Independent dispatch from the command palette. -->
+		<button
+			type="button"
+			class="chat"
+			class:active={slack.panelVisible}
+			title={slack.connected ? 'Chat (connected)' : 'Chat (not connected)'}
+			onclick={() => slack.togglePanel()}
+		>
+			<span class="pip" class:on={slack.connected}></span>
+			chat
+		</button>
 		<!-- Theme indicator + toggle. The label flips on every click,
 			 which is also a useful diagnostic: if you click and the icon
 			 doesn't change, `toggleTheme()` didn't fire; if the icon
@@ -96,5 +110,36 @@
 	.theme:hover {
 		background: var(--m-bg-overlay);
 		color: var(--m-fg);
+	}
+	.chat {
+		font: inherit;
+		color: var(--m-fg-muted);
+		background: transparent;
+		border: 1px solid transparent;
+		border-radius: 4px;
+		padding: 0 6px;
+		height: 18px;
+		line-height: 18px;
+		display: flex;
+		align-items: center;
+		gap: 5px;
+		cursor: pointer;
+	}
+	.chat:hover {
+		background: var(--m-bg-overlay);
+		color: var(--m-fg);
+	}
+	.chat.active {
+		color: var(--m-fg);
+	}
+	.pip {
+		display: inline-block;
+		width: 6px;
+		height: 6px;
+		border-radius: 50%;
+		background: var(--m-fg-subtle);
+	}
+	.pip.on {
+		background: var(--m-success);
 	}
 </style>

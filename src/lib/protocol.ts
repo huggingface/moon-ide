@@ -128,6 +128,15 @@ export type WorkspaceSession = {
 };
 
 /**
+ * Slack-specific slice of [`AppState`]. Only stores derived,
+ * non-secret pointers — the `xoxp-` token itself stays in the OS
+ * keyring. Mirrors `moon_protocol::app_state::SlackAppState`.
+ */
+export type SlackAppState = {
+	active_bot: SlackBotProfile | null;
+};
+
+/**
  * Per-machine, per-user app state. There is intentionally no `Settings`
  * type — project-level code style lives in `.editorconfig` (Phase 1.5);
  * everything moon-ide stores about a user goes here.
@@ -135,12 +144,64 @@ export type WorkspaceSession = {
 export type AppState = {
 	last_session: WorkspaceSession | null;
 	theme: ThemeMode;
+	slack: SlackAppState;
 };
 
 export const defaultAppState: AppState = {
 	last_session: null,
 	theme: 'dark',
+	slack: { active_bot: null },
 };
+
+/**
+ * Result of `auth.test`. Identifies the human whose token we hold.
+ * Mirrors `moon_protocol::slack::SlackIdentity`.
+ */
+export type SlackIdentity = {
+	user_id: string;
+	user_name: string;
+	team_id: string;
+	team: string;
+	url: string;
+};
+
+/**
+ * A bot we can DM, discovered by scanning the user's own DM list (see
+ * `specs/slack-chat.md#bot-resolution`). Mirrors
+ * `moon_protocol::slack::SlackBotProfile`.
+ */
+export type SlackBotProfile = {
+	user_id: string;
+	dm_channel_id: string;
+	username: string;
+	real_name: string;
+	display_name: string | null;
+	image_url: string | null;
+};
+
+/**
+ * Lightweight connection probe for the chat panel. Mirrors
+ * `moon_protocol::slack::SlackStatus`.
+ */
+export type SlackStatus = {
+	connected: boolean;
+	identity: SlackIdentity | null;
+};
+
+/**
+ * Best human-readable label for a bot profile. Falls back through
+ * `display_name → real_name → username` so the panel always shows
+ * *something* even when Slack returns sparse metadata.
+ */
+export function botLabel(profile: SlackBotProfile): string {
+	if (profile.display_name && profile.display_name.length > 0) {
+		return profile.display_name;
+	}
+	if (profile.real_name.length > 0) {
+		return profile.real_name;
+	}
+	return profile.username || profile.user_id;
+}
 
 export type MoonError =
 	| { code: 'NotFound'; message: string }

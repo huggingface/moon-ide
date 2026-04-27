@@ -1,0 +1,414 @@
+# Slack chat panel
+
+The right-side chat panel is a thin Slack Web API client that lets a
+moon-ide user DM a bot (Hugging Face's [Moonbot](https://github.com/huggingface/moon-bot)
+by default, any DM-able bot in v1.4+) without leaving the IDE. We're a
+chat client, not an agent host: the bot already runs somewhere (Pi
+agent on a Hugging Face cluster, in Moonbot's case) and Slack is the
+transport. The IDE's job is rendering the conversation cleanly,
+posting messages, and keeping the bot's edits live.
+
+The bot has **zero visibility into local IDE state**. No file context,
+no LSP, no skill installation — anything the user wants the bot to
+see they paste into the message themselves. Real "agent in the IDE
+with context" is Phase 6 (ACP) and stays separate.
+
+## Why Slack, why now
+
+A team's bots already live in Slack. Adding a second deployment
+target ("now also speak HTTP to moon-ide") means each bot grows a new
+auth surface and we end up either reinventing the bot wheel
+(authorization, audit, history retention, parallel sessions across
+team members) or writing a moon-ide-specific bot. Both are large
+projects. By treating Slack as the API, we get all of that for free —
+including the property that the bot's behaviour is exactly the same
+whether the user is in moon-ide, on their phone, or at lunch.
+
+The trade-off: we don't get push events. See "Real-time" below.
+
+## Auth model
+
+The user pastes a Slack **user OAuth token** (`xoxp-…`). Not a bot
+token (`xoxb-…`); not the Moonbot token. The token represents the
+human, scoped to _their own DMs_ with the bots they want to talk to.
+
+Why a user token instead of a moon-ide-specific Slack app:
+
+- Posting must look like the user, not a second bot. Bot-token posts
+  via `chat.postMessage` would show up in Slack as "moon-ide" in the
+  thread, which is wrong — the user is the participant.
+- Reading the user's DMs requires user-side scopes (`im:history`).
+  The bot's token can read its own DMs, but only via the bot's
+  identity, which is a different conversation tree (the bot sees
+  _its_ DMs with everyone; the IDE wants _this user's_ DM with the
+  bot).
+- Skipping the moon-ide-shipped Slack app means we don't host an
+  OAuth callback, don't embed a client ID/secret in the binary, and
+  don't take on the support burden of "your Slack app is unavailable
+  — please rotate the secret". When somebody asks for one-click
+  install, we revisit.
+
+### Required scopes (user token)
+
+We ask for the **full Phase 11 scope set upfront**, not the
+per-sub-phase minimum. Every scope add in Slack means revisiting
+_OAuth & Permissions → Reinstall_, which is friction the user
+absorbs every time we ship a sub-phase. Granting upfront trades a
+slightly broader initial prompt for zero re-installs through 11.4.
+
+| Scope             | Used by | What it gets us                                                   |
+| ----------------- | ------- | ----------------------------------------------------------------- |
+| `chat:write`      | 11.3    | Post messages as the user                                         |
+| `im:history`      | 11.1    | Read DM history (= the bot's replies)                             |
+| `im:read`         | 11.0    | List the user's DM channels (find the bot's DM)                   |
+| `im:write`        | 11.2    | `conversations.mark` — clear the unread badge                     |
+| `users:read`      | 11.0    | Resolve the bot's user ID, display name, avatar                   |
+| `reactions:read`  | 11.4    | See Moonbot's status emoji (✅ / ⚠️ / ❌)                         |
+| `reactions:write` | 11.4+   | React to messages from the IDE (👍 / 👎 / …)                      |
+| `files:read`      | 11.4+   | Render image / file attachments the bot sends                     |
+| `files:write`     | 11.4+   | Upload images / files (e.g. screenshots so the bot can read them) |
+
+The walk-through in `ChatConnectModal.svelte` lists these and flags
+which are exercised today vs. claimed upfront.
+
+#### Scopes deliberately left out (for now)
+
+These are not in the upfront grant — adding any of them later is a
+one-time scope add + reinstall. Listed here so we don't have to
+rediscover the option space when a request comes in. **Nothing
+below is committed**; each entry is "would unlock", not "we'll do".
+
+| Scope                                                   | Would unlock                                                                                                            |
+| ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `bookmarks:read` / `bookmarks:write`                    | Slack bookmarks as an IDE todo list (Eli's personal workflow). Render them in the chat panel sidebar / a dedicated tab. |
+| `pins:read` / `pins:write`                              | Pin a Moonbot reply to keep it visible (e.g. "current branch plan"). Pins are per-channel including DMs.                |
+| `reminders:read` / `reminders:write`                    | Surface Slack reminders in the status bar / panel; create a reminder from a chat message.                               |
+| `search:read`                                           | Search across the whole DM history (and beyond) from the IDE — Slack server-side, not local.                            |
+| `stars:read` / `stars:write` (legacy "saved items")     | Probably skip; bookmarks supersede this for our use case.                                                               |
+| `mpim:read` / `mpim:history` / `mpim:write`             | Group DMs — relevant if we ever want a "shared bot session" across teammates.                                           |
+| `channels:read` / `channels:history` / `channels:write` | Public channels. Heavy surface; would only make sense if the panel grows beyond DMs.                                    |
+| `groups:read` / `groups:history` / `groups:write`       | Private channels. Same caveat as `channels:*`.                                                                          |
+| `users:read.email`                                      | Resolve bots/users by email instead of display name (more stable IDs across renames).                                   |
+| `usergroups:read`                                       | Render `@team` mentions correctly.                                                                                      |
+| `emoji:read`                                            | Render custom workspace emoji in messages and reactions instead of falling back to `:shortcode:`.                       |
+| `team:read`                                             | Workspace metadata (icon, domain) for nicer panel chrome.                                                               |
+| `dnd:read` / `dnd:write`                                | Mute the unread pip while the user is in DND; let the IDE pause Moonbot's reactions during focus blocks.                |
+| `links:read` / `links:write`                            | Custom link unfurls — probably never needed for our flow.                                                               |
+
+Anything not in either table needs a one-line entry here before it
+gets added — same rule as the rest of `specs/`.
+
+### Setup walk-through (in-IDE)
+
+The "Connect Slack" affordance opens an in-app modal with these
+steps, each with a one-click "Open in browser" link:
+
+1. Create a Slack app at <https://api.slack.com/apps> ("From scratch").
+2. **OAuth & Permissions → User Token Scopes** → add the scopes
+   listed above.
+3. **Install App** → install to your workspace and authorize.
+4. Copy the **User OAuth Token** (`xoxp-…`) — _not_ the Bot token.
+5. Paste it into the field below and click "Connect".
+
+We validate via `auth.test` before persisting. On success the panel
+loads the bot picker — see [Bot resolution](#bot-resolution) — which
+scans the user's DM list (not the workspace directory) and lets them
+click the bot they want to chat with.
+
+### Token storage
+
+User tokens are credentials. They live in the **OS keyring** — never
+in `app_state.json` and never in any session blob. The `keyring`
+crate gives us libsecret on Linux, Keychain on macOS, and Credential
+Manager on Windows. The keyring entry uses service `moon-ide` and
+account `slack-user-token`. Clearing happens on:
+
+- Explicit "Disconnect" from the chat panel.
+- `auth.test` returning `not_authed` / `invalid_auth` (token revoked
+  by the user, app uninstalled, workspace SSO timeout). The panel
+  drops back to the "Connect Slack" empty state.
+
+`AppState` only stores derived, non-secret pointers: the resolved
+bot user ID, DM channel ID, last active thread ts, panel-visible
+flag.
+
+## Bot resolution
+
+### What doesn't work
+
+The intuitive design — "user types `@Moon Bot`, we look it up" —
+falls apart on real workspaces:
+
+- **No public user-search endpoint.** `users.search`, `search.users`,
+  `search.modules.users` all return `unknown_method` for `xoxp-`
+  tokens. Slack's web Ctrl+K is instant only because the web client
+  preloads the entire user directory and keeps it warm via Socket
+  Mode events; we have neither.
+- **`users.list` doesn't scale.** Hugging Face's workspace has more
+  than 5 000 users and pagination starts hitting tier-2 rate limits
+  after ~3 000 entries. Even with backoff and full pagination, a
+  first-time connect would take 30–60 s and burn the rate-limit
+  budget for the rest of the session.
+- **`users.lookupByEmail`** exists but bots don't have public emails,
+  and asking the user for a bot's email is a UX dead-end.
+
+### What we do instead: pick from your 50 most recent DMs
+
+The user's **own DM list** is several orders of magnitude smaller
+than the workspace directory and naturally scoped to bots they
+already use. The connect flow becomes:
+
+1. Pre-condition (surfaced in the connect modal): the user has DMd
+   the bot at least once from regular Slack, and the conversation
+   sits in their **50 most recent DMs**. The "50 most recent" cap is
+   stated upfront so users with stale bot DMs know to send a quick
+   "hi" from regular Slack to bump it before connecting.
+2. After token validation, we call `conversations.list?types=im&limit=50`
+   to get the 50 most recently active DMs (Slack returns them
+   newest-first).
+3. For each DM partner, we call `users.info` and keep only those
+   with `is_bot: true && !deleted`.
+4. The chat panel renders these as a picker. The user clicks the
+   bot they want; we store the resolved `(user_id, dm_channel_id,
+real_name, display_name, image_url)` tuple in `AppState` so the
+   picker doesn't reappear on next launch.
+
+This works for any DM-able bot — Moonbot, Cursor, GitHub, Linear,
+custom team bots — without code changes. The original "default to
+@Moon Bot for HF" is gone; the team's bot landscape is what it is.
+
+The single source of truth for the cap is the
+[`DM_SCAN_LIMIT`](../crates/moon-slack/src/client.rs) constant in
+`moon-slack`. The number is hardcoded in the connect-modal copy and
+the picker UI for clarity; if the constant ever moves, those two
+strings update too.
+
+### Cost
+
+One `conversations.list?types=im&limit=50` call (tier-2,
+20+ /minute — fine for an interactive flow) plus 50 sequential
+`users.info` calls (tier-4, 100+ /minute — well inside budget).
+End-to-end the discovery finishes in ~10–20 s on a warm network.
+The picker shows a single spinner card while it runs; streaming
+bots into the UI as each `users.info` returns is a 11.1 polish
+item.
+
+#### Why 50 and not 200 or 1 000?
+
+We tried 200 first. The honest answer is: bigger windows trade
+mediocre wins ("we'd find a bot the user hasn't DM'd in a year")
+for a much worse first-connect experience (slow scan, ambient API
+spend, and a bigger picker list to scroll). 50 covers anyone
+actively using the bot, the cap is small enough to disclose
+upfront without it sounding scary, and the recovery story for
+older bot DMs ("send a hi from Slack first") is one gesture. If
+this turns out to be too tight, we revisit — but only with a
+concrete report, not on a hunch.
+
+### Persistence
+
+The selected bot is stored in `AppState.slack.active_bot`
+(machine-local, non-secret — just an ID + DM channel ID + display
+metadata). On launch, if the field is set, the panel shows that bot
+directly and skips the picker. Switching bots ("Pick a different
+bot" affordance) clears the field and re-runs discovery.
+
+Tokens stay in the keyring; this field is the only Slack state in
+`AppState`.
+
+### Why not also paginate `users.list` for bots the user hasn't DMd?
+
+Because the constraint "you've DMd the bot at least once from
+regular Slack" is fine — every bot we want to support has a UI in
+Slack for starting a DM, the gesture is one click, and it gives us a
+universal resolution path that doesn't depend on workspace size. If
+this turns out to be wrong (someone wants to chat with a bot from
+the IDE without ever opening regular Slack), we add a
+`users.list`-scan fallback later — but only when that request comes
+in, with concrete UX requirements (small workspace? cache the result?).
+
+## Data model
+
+In Slack a **DM channel** has a flat list of top-level messages, each
+of which can have a **thread**. Moonbot uses one thread per agent
+session: it replies in-thread to the user's first message and keeps
+all subsequent context inside that thread. So:
+
+| moon-ide concept | Slack concept                                                          |
+| ---------------- | ---------------------------------------------------------------------- |
+| **Bot profile**  | `(user_id, dm_channel_id)` + display metadata, picked from the DM list |
+| **Session**      | A thread in the DM channel (`thread_ts`)                               |
+| **Message**      | A Slack message inside the thread                                      |
+| **New session**  | Posting a top-level message (no `thread_ts`)                           |
+
+The "session list" in the panel is `conversations.history` of the
+DM channel, filtered to messages where `ts === thread_ts || !thread_ts`
+(top-level only), newest first. Each row shows the first ~80 chars
+of the user's prompt and the time of the latest reply.
+
+The "active session" is `conversations.replies(channel, ts)` for the
+selected thread.
+
+## Real-time
+
+Slack's three push paths don't work for a user-token desktop app:
+
+- **Events API** needs a public HTTPS endpoint. We're a desktop app.
+- **Socket Mode** is bot-token + app-level-token only (`xoxb-` /
+  `xapp-`). Won't accept `xoxp-`.
+- **RTM** used to support user tokens but new apps can't enable it,
+  it's been "deprecated" for years, and Slack signals it's going.
+
+So we **poll**. The cost we're paying: ~12 requests/min while
+actively waiting on a reply, dropping to ~1 / 5 min once the thread
+goes quiet. Slack's tier-3 limit (`conversations.replies`,
+`conversations.history`) is 50+ req/min, so we're an order of
+magnitude under even with three threads being watched.
+
+### What we poll
+
+Only the **currently selected thread** in the **currently visible
+panel**. One `conversations.replies(channel, thread_ts,
+oldest=last_seen_ts)` call per tick. Edits to existing messages
+surface via Slack's `edited.ts` field on the message — same call,
+no separate "edits" endpoint.
+
+We do _not_ poll the DM channel itself for new top-level messages.
+Top-level messages only appear when the user starts a new session,
+which the IDE itself initiates (Phase 11.3). If the user starts a
+session from another Slack client (mobile, web), we'll discover it
+the next time they open the IDE and the panel runs the one-shot
+`conversations.history` that populates the session list. Tracking
+that in real time would mean polling the channel as well — not
+worth the budget for an edge case.
+
+### Cadence ladder
+
+Per-thread cadence based on time since the last new message or
+edit on that thread:
+
+| Time since last activity | Poll every                                                                                |
+| ------------------------ | ----------------------------------------------------------------------------------------- |
+| < 30 s ("hot")           | 3 s                                                                                       |
+| 30 s – 2 min ("warm")    | 5 s                                                                                       |
+| 2 min – 10 min           | 15 s                                                                                      |
+| 10 min – 1 h             | 60 s                                                                                      |
+| > 1 h ("cold")           | paused — refresh on user interaction (focus the panel, click the thread, switch sessions) |
+
+The clock resets on any new message or edit, so a thread bumps
+straight from "cold" back to "hot" the moment the bot replies.
+The whole loop pauses when the chat panel is hidden, on `unfocus`
+of the OS window, or when no session is selected.
+
+When we resume a "cold" thread (user clicks back into it), we run
+one immediate `conversations.replies` to catch up before re-entering
+the cadence — that's the read-receipt trigger too (next section).
+
+### Read receipts
+
+`conversations.mark(channel, ts=last_visible_message_ts)` runs in
+three spots so the unread badge in the user's actual Slack client
+(mobile, web, desktop Slack app) clears as soon as they've seen the
+message in moon-ide:
+
+1. On opening the panel, for the active session.
+2. On switching sessions.
+3. After each poll tick where new messages arrived _and_ the panel
+   is currently focused (= the user is actively reading).
+
+If the panel is visible but the OS window is unfocused, we _don't_
+mark — the user hasn't actually seen the message yet, and silently
+clearing the badge in that case loses information.
+
+Phase 11.0 doesn't ship this — it lands in 11.2 alongside the
+polling loop. The `im:write` scope is already in the upfront grant
+so the user doesn't reinstall.
+
+## UI placement
+
+A right-side panel docked to the editor area. Resizable horizontal
+splitter (will use `paneforge` once Phase 1.5 adopts it; hand-rolled
+splitter until then). Toggleable from:
+
+- Status bar button (chat-bubble icon, active when connected).
+- Command palette: "Chat: Toggle Panel".
+- Keyboard: TBD in 11.1 — the focus-region cycle (`F6`) gains the
+  chat panel as a region when it's visible.
+
+The panel itself, top-to-bottom:
+
+```
+┌──────────────────────────────────────┐
+│ Bot tabs (11.4): [Moonbot] [+]       │
+├──────────────────────────────────────┤
+│ Sessions ▾  | + New session          │  ← session picker (11.1)
+│ "list new files…"  · 2 min           │
+│ "weekly report…"   · yesterday       │
+├──────────────────────────────────────┤
+│                                      │
+│  [user] you said                     │
+│  …                                   │
+│  [bot]  moonbot replied              │  ← active thread (11.1)
+│  …                                   │
+│                                      │
+├──────────────────────────────────────┤
+│ ┌──────────────────────────────────┐ │
+│ │ Type a message — Ctrl+Enter      │ │  ← input (11.3)
+│ └──────────────────────────────────┘ │
+└──────────────────────────────────────┘
+```
+
+In 11.0 the panel renders the connect/disconnect state and the
+resolved bot profile only — sessions, messages, input come in 11.1+.
+
+## Frontend ↔ backend boundary
+
+Tauri commands in `src-tauri/src/commands/slack.rs`:
+
+| Command                                        | Purpose                                              |
+| ---------------------------------------------- | ---------------------------------------------------- |
+| `slack_set_token(token)`                       | Validate, persist to keyring, return `SlackIdentity` |
+| `slack_status()`                               | `connected: bool`, identity if connected             |
+| `slack_clear_token()`                          | Drop keyring entry; return to disconnected state     |
+| `slack_list_dm_bots()`                         | Scan user's DMs, return the bot users among them     |
+| `slack_select_bot(profile)`                    | Persist user's pick into `AppState.slack.active_bot` |
+| `slack_clear_bot()`                            | Drop the saved pick; trigger picker on next render   |
+| `slack_list_sessions(channel)` (11.1)          | Top-level DM messages                                |
+| `slack_get_thread(channel, ts)` (11.1)         | All messages in a thread                             |
+| `slack_post(channel, thread_ts?, text)` (11.3) | Post a message                                       |
+| `slack_mark_read(channel, ts)` (11.2)          | `conversations.mark`                                 |
+
+Push events from backend → frontend (11.2):
+
+- `slack:thread-update` — `{ channel, thread_ts, messages: [...] }`
+  (full thread snapshot, frontend reconciles).
+- `slack:disconnected` — token went bad, panel returns to empty.
+
+## Failure modes
+
+| Scenario                            | UI behaviour                                                                                |
+| ----------------------------------- | ------------------------------------------------------------------------------------------- |
+| User has no token configured        | "Connect Slack" empty state                                                                 |
+| Token rejected by `auth.test`       | Inline error in connect modal; token not saved                                              |
+| Token revoked mid-session           | Toast + panel returns to empty state; keyring entry cleared                                 |
+| User has no bots in their DMs       | Picker shows "No bots found in your DMs. DM your bot from Slack first, then click Refresh." |
+| Network down                        | Polling backs off (5s → 15s → 30s) and shows a small "offline" pip in the bot tab           |
+| `chat.postMessage` rate-limited     | Surface Slack's `Retry-After`; queue locally; toast on retry                                |
+| Bot's reply spans multiple messages | Render in order; no special grouping (Slack already chunks for us)                          |
+
+## What this phase deliberately doesn't do
+
+- **No agent context bridge.** The bot doesn't see open files, the
+  diagnostic stream, the cursor, anything. Phase 6 (ACP) is where we
+  build "agent that has the IDE under its hands". 11 stays chat-only.
+- **No moon-ide Slack app.** Until somebody asks for one-click
+  install, the user installs their own personal Slack app and pastes
+  a user token. Documented in the connect walk-through.
+- **No file/image attachments.** Slack supports both, we don't render
+  them in v1. The conversation degrades to "(image)" placeholder for
+  now.
+- **No multi-account.** One Slack workspace per moon-ide install.
+  Multi-workspace is a Phase 12 problem.
+- **No bot-side message reactions yet.** Moonbot uses ✅ / ⚠️ / ❌
+  reactions for status; we don't render those in 11.0–11.3. Adds in
+  11.4 if it's actually useful.

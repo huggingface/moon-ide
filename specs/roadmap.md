@@ -25,7 +25,8 @@ The full phased plan. Update the **Status** column as phases land.
 | 8     | Linting / formatting            | scaffolded  |
 | 9     | Custom tool plugins             | scaffolded  |
 | 10    | Theming                         | scaffolded  |
-| 11+   | Innovation track                | open-ended  |
+| 11    | Slack chat panel                | scaffolded  |
+| 12+   | Innovation track                | open-ended  |
 
 "Scaffolded" means: the module/spec slot exists but the feature is not real code yet. Each phase replaces "scaffolded" with "implemented" when its acceptance criteria are met.
 
@@ -137,7 +138,23 @@ Surfaces this phase wires up:
 
 User-facing model: themes are **machine-local**, picked from the status-bar theme switcher (which today only flips dark/light) and persisted in `AppState`. No per-workspace overrides — the team agrees on personal preference here, like font size. Custom themes are JSON files dropped into a discoverable user dir; bundled themes ship in the binary. Future-fancy bits (live reload of edited theme files, per-tab theme overrides for screenshots, etc.) wait until somebody asks.
 
-## Phase 11+ — Innovation track
+## Phase 11 — Slack chat panel
+
+A right-side panel that DMs a Slack bot (defaults to Hugging Face's [Moonbot](https://github.com/huggingface/moon-bot), pluggable to any DM-able bot — Cursor, GitHub, etc.). One Slack thread = one bot session; each top-level DM message starts a new session, replies stay inside the thread. We don't pretend to host the agent — we're a chat client over the Slack Web API. The bot has zero visibility into local IDE context; this is pure pass-through. Detailed design: [slack-chat.md](slack-chat.md).
+
+User-facing setup is a one-time `xoxp-` user OAuth token paste with an in-IDE walk-through (the Slack app the user installs is theirs, not ours — we don't ship a moon-ide Slack app yet). The token lives in the OS keyring (libsecret / Keychain / Credential Manager). Real-time updates run on `conversations.history` polling (~5 s, gated on panel-visible + active-thread) since Slack's push paths (Events API, Socket Mode, RTM) aren't workable for a desktop user-token client.
+
+Sub-phases:
+
+- **11.0 — Foundation.** `moon-slack` crate (Web API client: `auth.test`, `users.list`, `users.info`, `conversations.open`). Token storage in OS keyring. Tauri commands `slack_set_token` / `slack_status` / `slack_resolve_bot` / `slack_clear_token`. Right-side panel scaffolding with a "Connect Slack" affordance that walks the user through scopes, accepts the token, validates it via `auth.test`, and resolves a default bot profile (`@Moon Bot` for HF). End state: the panel says "Connected as Eli — Moon Bot found" and persists across restarts. Test plan: `0008-slack-foundation.md`.
+- **11.1 — Read-only chat.** Render the DM session list (top-level messages, newest first) and the active thread (read-only message bubbles, bot avatar pulled from `users.info`). Active thread + panel visibility persist in `AppState`.
+- **11.2 — Polling + read receipts.** Backend tokio polling loop driven by panel-visible + active-thread, with a per-thread cadence ladder (3 s hot → paused for cold threads — see [`slack-chat.md`](slack-chat.md#cadence-ladder)). Detect new messages and edits (Slack's `edited.ts`); push deltas to the frontend via Tauri events. `conversations.mark` fires on view, on session switch, and on poll-tick-while-focused so unread badges clear in the user's actual Slack client.
+- **11.3 — Send messages.** Input box + Ctrl+Enter to send. "+ New session" posts a top-level message; replies inside an open thread post with `thread_ts`. Optimistic UI, reconciled on the next poll tick.
+- **11.4 — Multi-bot + polish.** Configurable bot profiles (Moonbot is the default; user adds Cursor / GitHub / any DM-able bot by handle). Tab strip inside the panel when there's more than one. Markdown rendering for bot messages (reuse `markdown.ts`).
+
+Deliberately deferred until somebody asks: file/image attachments, an OAuth flow that ships a moon-ide Slack app (replacing the manual user-token paste), and exposing local IDE context to the bot — Phase 11 stays a pure chat passthrough.
+
+## Phase 12+ — Innovation track
 
 Open-ended. Examples:
 

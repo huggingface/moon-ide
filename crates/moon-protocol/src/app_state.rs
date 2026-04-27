@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::session::WorkspaceSession;
+use crate::slack::SlackBotProfile;
 use crate::theme::ThemeMode;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
@@ -25,4 +26,22 @@ pub struct AppState {
 	pub last_session: Option<WorkspaceSession>,
 	/// Active UI theme. Per-machine; survives workspace switches.
 	pub theme: ThemeMode,
+	/// Per-machine, non-secret Slack panel state. The `xoxp-` token
+	/// itself never lives here — it stays in the OS keyring (see
+	/// `specs/slack-chat.md`).
+	pub slack: SlackAppState,
+}
+
+/// Slack-specific slice of [`AppState`]. Only stores derived,
+/// non-secret pointers so we can reload the chat panel on launch
+/// without re-running the bot picker.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(default, deny_unknown_fields)]
+pub struct SlackAppState {
+	/// Bot the user picked from the DM list. `None` means "show the
+	/// picker on next chat-panel render". Cleared by an explicit "Pick
+	/// a different bot" gesture or when `auth.test` reports the token
+	/// is dead.
+	pub active_bot: Option<SlackBotProfile>,
 }

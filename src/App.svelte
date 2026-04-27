@@ -6,13 +6,17 @@
 	import StatusBar from './lib/components/StatusBar.svelte';
 	import Welcome from './lib/components/Welcome.svelte';
 	import CommandPalette from './lib/components/CommandPalette.svelte';
+	import ChatPanel from './lib/components/ChatPanel.svelte';
 	import { workspace } from './lib/state.svelte';
+	import { slack } from './lib/slack.svelte';
 	import { palette, reloadWindow } from './lib/commands.svelte';
 	import { cycleFocus } from './lib/focus';
 	import { ipc } from './lib/ipc';
 
 	let sidebarWidth = $state(280);
+	let chatWidth = $state(320);
 	let resizing = $state(false);
+	let resizingChat = $state(false);
 
 	onMount(() => {
 		void hydrate();
@@ -135,6 +139,27 @@
 		window.addEventListener('pointermove', onMove);
 		window.addEventListener('pointerup', onUp);
 	}
+
+	function startChatResize(event: PointerEvent) {
+		// Drag direction is mirrored vs. the sidebar handle: dragging the
+		// chat handle left grows the panel (it's on the right edge of
+		// the editor area).
+		resizingChat = true;
+		const startX = event.clientX;
+		const startW = chatWidth;
+
+		const onMove = (e: PointerEvent) => {
+			const next = startW - (e.clientX - startX);
+			chatWidth = Math.max(240, Math.min(640, next));
+		};
+		const onUp = () => {
+			resizingChat = false;
+			window.removeEventListener('pointermove', onMove);
+			window.removeEventListener('pointerup', onUp);
+		};
+		window.addEventListener('pointermove', onMove);
+		window.addEventListener('pointerup', onUp);
+	}
 </script>
 
 <div class="app">
@@ -163,6 +188,20 @@
 			<Welcome onPickFolder={pickFolder} />
 		{/if}
 	</main>
+	{#if slack.panelVisible}
+		<div
+			class="resize chat-resize"
+			class:active={resizingChat}
+			role="separator"
+			aria-orientation="vertical"
+			aria-label="Resize chat panel"
+			tabindex="-1"
+			onpointerdown={startChatResize}
+		></div>
+		<aside class="chat" style:width="{chatWidth}px">
+			<ChatPanel />
+		</aside>
+	{/if}
 </div>
 <StatusBar />
 <CommandPalette />
@@ -193,6 +232,13 @@
 		background: transparent;
 		z-index: 5;
 	}
+	.chat-resize {
+		/* Splitter sits between the editor area and the chat panel.
+		   Bleed into both sides so the hit target is wide enough to
+		   grab without picking the editor scrollbar by accident. */
+		margin-left: -2px;
+		margin-right: -2px;
+	}
 	.resize:hover,
 	.resize.active {
 		background: var(--m-accent);
@@ -204,6 +250,15 @@
 		display: flex;
 		flex-direction: column;
 		background: var(--m-bg);
+	}
+
+	.chat {
+		flex-shrink: 0;
+		background: var(--m-bg-1);
+		border-left: 1px solid var(--m-border);
+		overflow: hidden;
+		display: flex;
+		flex-direction: column;
 	}
 
 	.editor-area {

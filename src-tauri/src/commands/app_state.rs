@@ -1,8 +1,16 @@
 //! Tauri commands wrapping [`moon_core::app_state`].
 //!
-//! AppState is one small struct (last UI session + theme); the frontend
-//! is the only writer. We expose load + save and let the frontend
-//! manage read-modify-write itself — there is no per-field setter.
+//! AppState is split across two writers:
+//! - The frontend's session-persist path owns `last_session` + `theme`
+//!   and hits this `app_state_save` command on every navigation.
+//! - The Slack tauri commands own `slack.*` and write via their own
+//!   load-mutate-save path (see `commands::slack`).
+//!
+//! To stop the frontend's writes from clobbering the Slack slice (or
+//! vice versa), `app_state_save` merges: it loads the on-disk state,
+//! takes `last_session` + `theme` from the payload, and preserves
+//! whatever `slack` was already on disk. Anything the frontend sends
+//! in `payload.slack` is ignored on this path.
 
 use moon_core::app_state as core_app_state;
 use moon_protocol::app_state::AppState as AppStatePayload;
@@ -18,5 +26,11 @@ pub async fn app_state_load(state: State<'_, AppState>) -> Result<AppStatePayloa
 
 #[tauri::command]
 pub async fn app_state_save(state: State<'_, AppState>, app_state: AppStatePayload) -> Result<(), MoonError> {
-	core_app_state::save(&state.config_dir, &app_state).await
+	let existing = core_app_state::load(&state.config_dir).await?;
+	let merged = AppStatePayload {
+		last_session: app_state.last_session,
+		theme: app_state.theme,
+		slack: existing.slack,
+	};
+	core_app_state::save(&state.config_dir, &merged).await
 }

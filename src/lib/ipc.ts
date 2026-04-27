@@ -8,6 +8,9 @@ import type {
 	FileSearchOptions,
 	FileSearchResult,
 	ReadFileResult,
+	SlackBotProfile,
+	SlackIdentity,
+	SlackStatus,
 	StatResult,
 	Workspace,
 	WriteFileResult,
@@ -39,5 +42,14 @@ export const ipc = {
 	},
 	editorconfig: {
 		forPath: (path: string) => invoke<EditorConfig>('editorconfig_for_path', { path }),
+	},
+	slack: {
+		setToken: (token: string) => invoke<SlackIdentity>('slack_set_token', { token }),
+		status: () => invoke<SlackStatus>('slack_status'),
+		clearToken: () => invoke<void>('slack_clear_token'),
+		listDmBots: () => invoke<SlackBotProfile[]>('slack_list_dm_bots'),
+		selectBot: (profile: SlackBotProfile) => invoke<void>('slack_select_bot', { profile }),
+		clearBot: () => invoke<void>('slack_clear_bot'),
+		getActiveBot: () => invoke<SlackBotProfile | null>('slack_get_active_bot'),
 	},
 } as const;
