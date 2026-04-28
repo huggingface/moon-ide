@@ -16,7 +16,7 @@ The full phased plan. Update the **Status** column as phases land.
 | 0     | Skeleton (open / edit / save)   | implemented |
 | 1     | Editor + navigation             | implemented |
 | 1.5   | Editor polish                   | scaffolded  |
-| 2     | Devcontainer / remote split     | scaffolded  |
+| 2     | Containerised dev shells        | scaffolded  |
 | 3     | Terminal                        | scaffolded  |
 | 4     | LSP                             | scaffolded  |
 | 5     | Git layer                       | scaffolded  |
@@ -74,11 +74,13 @@ A small, scoped phase that closes Phase 1's loose ends and adds the bare minimum
 
 Keybindings remain hardcoded for now. We add user-rebindable keymaps when there's a concrete team request for it, not before.
 
-## Phase 2 — Devcontainer / remote split
+## Phase 2 — Containerised dev shells
 
-**Acceptance**: open a folder with `.devcontainer/devcontainer.json`, get prompted to "open in container", everything (terminal, fs, lint, LSP-once-it-exists) routes through the container. Forward a port via the palette and reach the in-container service from the host. See [devcontainers.md](devcontainers.md).
+**Acceptance**: opening a workspace provisions a single Docker container (one per workspace, not per project) from a moon-published `moon-base` image (Debian + DinD pre-baked + polyglot toolchain). Project tooling — terminals, LSP, lint/format, builds — runs inside the container; the Tauri shell, Slack, and agent runtimes stay on the host. Closing the workspace pauses the container; reopening unpauses it. Declared port forwards are reachable from the host and surfaced in the IDE.
 
-**Bootstrap concern** (per [ADR 0005](decisions/0005-bootstrap.md)): the devcontainer image used by Moon IDE itself ships with `rustup`, `bun`, and the WebKitGTK dev libraries so a fresh checkout of moon-ide is buildable with no host-side tooling.
+System architecture: [containers.md](containers.md). Sub-phase work breakdown: [roadmaps/phase-02-containers.md](roadmaps/phase-02-containers.md). Format / image strategy decision: [ADR 0007](decisions/0007-compose-and-moon-base.md).
+
+**Bootstrap concern** (per [ADR 0005](decisions/0005-bootstrap.md)): `moon-base` ships with `rustup`, `bun`, and the WebKitGTK dev libraries so a fresh moon-ide checkout is buildable inside its own container.
 
 ## Phase 3 — Terminal
 

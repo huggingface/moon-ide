@@ -11,8 +11,8 @@ Moon IDE is written in Rust + TypeScript + Svelte and uses native binaries
 
 Eventually the team will use Moon IDE to develop Moon IDE itself. That
 means a fresh checkout, opened with the IDE, must be a fully working dev
-environment — including inside a devcontainer. The IDE has to support
-the languages it is itself written in.
+environment — including inside the workspace's container (Phase 2). The
+IDE has to support the languages it is itself written in.
 
 ## Decision
 
@@ -33,18 +33,23 @@ own their UX end-to-end:
 
 These also drive Phase 4 (LSP) and Phase 8 (lint/format) priority.
 
-### Devcontainer image for Moon IDE itself
+### Container image for Moon IDE itself
 
-The repo ships a `.devcontainer/devcontainer.json` (added in Phase 2)
-that installs:
+Moon IDE is itself a workspace; per
+[`containers.md`](../containers.md) it ships a
+`<workspace>/.moon/compose.yaml` (added in Phase 2) referencing the
+moon-published `moon-base` image, which carries:
 
-- A modern Linux base with `libwebkit2gtk-4.1-dev`, `libsoup-3.0-dev`,
-  `libgtk-3-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`,
-  `libssl-dev`, `pkg-config`.
+- A modern Linux base (Debian stable) with `libwebkit2gtk-4.1-dev`,
+  `libsoup-3.0-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev`,
+  `librsvg2-dev`, `libssl-dev`, `pkg-config`.
 - `rustup` with the workspace's `rust-version`.
 - `bun` (or `node` LTS as fallback) for the frontend toolchain.
 - `oxlint`, `oxfmt`, `prettier`, `tsgo` cached as dev dependencies of
   the JS workspace — no global installs.
+- Docker-in-Docker pre-configured (the canonical
+  `fuse-overlayfs` + `iptables-legacy` recipe — see
+  [`containers.md`](../containers.md#the-moon-base-image)).
 - A non-privileged user with sudo so the contributor can install extra
   tooling as they go.
 
@@ -68,11 +73,16 @@ port. Everything else stays inside the container.
 
 ## Consequences
 
-- Phase 2 spec is upgraded: the devcontainer must produce a usable Rust
-  - JS/TS dev environment, not just a terminal. The LSP and lint phases
-    inherit this requirement.
+- Phase 2 spec is upgraded: the workspace's container must produce a
+  usable Rust + JS/TS dev environment, not just a terminal. The LSP
+  and lint phases inherit this requirement.
+- `moon-base`'s release CI runs a smoke test that does
+  `git clone moon-ide && bun install && cargo check` inside the
+  freshly built image — green is a release gate. Documented in
+  [phase-02-containers.md](../roadmaps/phase-02-containers.md#bootstrap-concern).
 - We resist adding a third primary language (Go, Python, etc.) until
   the existing ones feel right.
 - The bootstrap test is concrete: open the moon-ide repo with moon-ide,
-  hit "Reopen in container", and you can edit, lint, format, build and
-  run the app from the in-container tooling alone.
+  accept the "Run this project in a container?" prompt, and you can
+  edit, lint, format, build and run the app from the in-container
+  tooling alone.

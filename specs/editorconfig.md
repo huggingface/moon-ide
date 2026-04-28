@@ -33,7 +33,7 @@ A new module `moon_core::editorconfig`:
 - Caches per-directory configs; invalidates on any `.editorconfig` change reported by the existing fs watcher.
 - Returns the same struct shape regardless of whether the host is local or remote (Phase 2). The remote host serves it over JSON-RPC.
 
-This keeps the rule that the UI never reaches into the filesystem; it asks the host. It also means agents and devcontainer-hosted tools see the same config.
+This keeps the rule that the UI never reaches into the filesystem; it asks the host. It also means agents and container-hosted tools see the same config.
 
 ### Pre-save pipeline
 
