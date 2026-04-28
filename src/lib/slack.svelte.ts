@@ -2,12 +2,17 @@
 //!
 //! Phases 11.0–11.1 cover: connect / disconnect, bot picker,
 //! sessions list (top-level DM messages), and active thread (read-only
-//! message bubbles). Polling, edits, sending join in 11.2+. Kept in
-//! its own file (rather than bolted onto `WorkspaceState`) because the
-//! chat panel's lifecycle is independent of the workspace: it
-//! survives "open another folder", and a future "no folder open, just
+//! message bubbles). 11.2 adds the polling loop + read receipts: the
+//! Rust side runs `conversations.replies` on a cadence ladder and
+//! pushes [`THREAD_UPDATE_EVENT`] to us; we reconcile when the event
+//! matches the open thread, and ignore it otherwise. Kept in its own
+//! file (rather than bolted onto `WorkspaceState`) because the chat
+//! panel's lifecycle is independent of the workspace: it survives
+//! "open another folder", and a future "no folder open, just
 //! chatting" flow doesn't need the workspace to exist at all.
 
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { SvelteMap } from 'svelte/reactivity';
 
 import { ipc } from './ipc';
@@ -21,6 +26,22 @@ import {
 	type SlackStatus,
 	type SlackUserSummary,
 } from './protocol';
+
+/** Tauri event payload emitted by the Rust polling loop. Mirrors `slack_poller::ThreadUpdatePayload`. */
+type ThreadUpdatePayload = {
+	channel: string;
+	thread_ts: string;
+	messages: SlackMessage[];
+};
+
+/** Tauri event names — must match the Rust constants in `slack_poller`. */
+const THREAD_UPDATE_EVENT = 'slack:thread-update';
+const DISCONNECTED_EVENT = 'slack:disconnected';
+
+/** Stable cache key for `(channel, thread_ts)`. */
+function markKey(channel: string, threadTs: string): string {
+	return `${channel}\u0000${threadTs}`;
+}
 
 export type ConnectResult = { ok: true; identity: SlackIdentity } | { ok: false; error: string };
 
@@ -121,6 +142,22 @@ class SlackPanelState {
 	 */
 	userCache = new SvelteMap<string, SlackUserCacheEntry>();
 
+	/** Most recent `ts` we passed to `conversations.mark`, per
+	 * `(channel, thread_ts)`. Lets us avoid re-marking the same
+	 * message on repeated thread loads (e.g. when reopening the
+	 * panel). The poller does its own dedup on the backend tick
+	 * path; this is just for the frontend's view + switch triggers. */
+	#lastMarkedByThread = new SvelteMap<string, string>();
+
+	/** Cleanup handles for Tauri event listeners + window focus. Set
+	 * once on `wireRuntime`, dropped on app teardown (which doesn't
+	 * happen in practice, but be defensive). */
+	#unlisten: UnlistenFn[] = [];
+
+	/** True iff `wireRuntime` has run — guards against double-binding
+	 * if the workspace state restores twice in dev with HMR. */
+	#runtimeWired = false;
+
 	get connected(): boolean {
 		return this.status?.connected ?? false;
 	}
@@ -138,6 +175,58 @@ class SlackPanelState {
 		this.panelVisible = state.panel_visible;
 		this.activeThreadTs = state.active_thread_ts;
 		this.#seedActiveBot();
+	}
+
+	/**
+	 * Bind Tauri push events + OS focus listeners. Call once at app
+	 * startup, after the Tauri runtime is up. Idempotent.
+	 *
+	 * - `slack:thread-update` from the Rust poller → reconcile
+	 *   `threadMessages` when it's for the open thread.
+	 * - `slack:disconnected` → drop in-memory state, identical path
+	 *   to `disconnect()` minus the keyring delete (Rust already did
+	 *   it).
+	 * - Window `tauri://focus` / `tauri://blur` → drive the poller's
+	 *   read-receipt gate. Polling itself doesn't depend on focus —
+	 *   updates still arrive while you're elsewhere — but
+	 *   `conversations.mark` only fires when the user is actually
+	 *   looking, so an unfocused panel doesn't silently clear the
+	 *   unread badge.
+	 */
+	async wireRuntime(): Promise<void> {
+		if (this.#runtimeWired) {
+			return;
+		}
+		this.#runtimeWired = true;
+		try {
+			const unlistenThread = await listen<ThreadUpdatePayload>(THREAD_UPDATE_EVENT, (event) => {
+				this.#applyThreadUpdate(event.payload);
+			});
+			const unlistenDisconnect = await listen<unknown>(DISCONNECTED_EVENT, () => {
+				void this.#handleBackendDisconnect();
+			});
+			this.#unlisten.push(unlistenThread, unlistenDisconnect);
+		} catch {
+			// Tauri event-bus bind failed. Polling still works
+			// transparently — the panel just won't auto-refresh; the
+			// "Refresh" affordance covers it. No actionable surface.
+		}
+
+		// Track OS focus for the read-receipt gate. Tauri emits these
+		// as `tauri://focus` / `tauri://blur`. Initial focus is
+		// assumed-true on the backend; we only correct on blur.
+		try {
+			const win = getCurrentWindow();
+			const unlistenFocus = await win.onFocusChanged(({ payload: focused }) => {
+				void ipc.slack.setWindowFocused(focused).catch(() => {});
+			});
+			this.#unlisten.push(unlistenFocus);
+		} catch {
+			// Same fallback — without focus tracking the read-receipt
+			// gate stays "assume focused", which over-reports rather
+			// than under-reports (Slack badge clears too eagerly, not
+			// too rarely).
+		}
 	}
 
 	togglePanel() {
@@ -236,6 +325,7 @@ class SlackPanelState {
 		this.botError = null;
 		this.#resetThreadView();
 		this.#resetUserCache();
+		this.#lastMarkedByThread.clear();
 	}
 
 	/**
@@ -379,6 +469,10 @@ class SlackPanelState {
 				return;
 			}
 			this.threadMessages = messages;
+			// View / session-switch read-receipt trigger. Idempotent
+			// per (channel, ts) thanks to `#markIfNeeded`'s dedup, so
+			// reopening an already-marked thread doesn't ping Slack.
+			void this.#markIfNeeded(bot.dm_channel_id, threadTs, messages);
 		} catch (err) {
 			if (
 				generation !== this.#threadGeneration ||
@@ -426,6 +520,71 @@ class SlackPanelState {
 		}
 		this.userCache.set(userId, { state: 'loading' });
 		void this.#fetchUser(userId);
+	}
+
+	/**
+	 * Reconcile a backend push for the active thread. Drops events
+	 * for stale threads (user already moved on) and stale bots
+	 * (wrong channel) without painting. Also fires a read receipt
+	 * if the panel is open — same trigger as the on-tick mark in
+	 * the poller, but driven from the frontend so we mark in
+	 * lockstep with the user's render.
+	 */
+	#applyThreadUpdate(payload: ThreadUpdatePayload): void {
+		const bot = this.activeBot;
+		if (bot === null || payload.channel !== bot.dm_channel_id) {
+			return;
+		}
+		if (payload.thread_ts !== this.activeThreadTs) {
+			return;
+		}
+		this.threadMessages = payload.messages;
+		this.threadError = null;
+		this.loadingThread = false;
+		// Bump generation so any racing manual `loadThread` doesn't
+		// then overwrite us with stale data.
+		this.#threadGeneration += 1;
+		void this.#markIfNeeded(payload.channel, payload.thread_ts, payload.messages);
+	}
+
+	/**
+	 * Backend told us the cached token is dead. Mirror what
+	 * `disconnect()` does in-memory; the keyring + persisted bot
+	 * have already been cleared on the Rust side.
+	 */
+	async #handleBackendDisconnect(): Promise<void> {
+		this.status = { connected: false, identity: null };
+		this.activeBot = null;
+		this.botCandidates = [];
+		this.botError = null;
+		this.#resetThreadView();
+		this.#resetUserCache();
+		this.#lastMarkedByThread.clear();
+	}
+
+	/** Fire `conversations.mark` for the latest message of a thread,
+	 * de-duplicating per `(channel, thread_ts)` so we don't spam
+	 * Slack when the user toggles back and forth between sessions
+	 * with no new traffic. Best-effort — failure is silent. */
+	async #markIfNeeded(channel: string, threadTs: string, messages: SlackMessage[]): Promise<void> {
+		const last = messages.at(-1);
+		if (last === undefined) {
+			return;
+		}
+		const key = markKey(channel, threadTs);
+		if (this.#lastMarkedByThread.get(key) === last.ts) {
+			return;
+		}
+		this.#lastMarkedByThread.set(key, last.ts);
+		try {
+			await ipc.slack.markRead(channel, last.ts);
+		} catch {
+			// Roll back the dedupe key so a future change can retry.
+			// `conversations.mark` failures are typically transient
+			// (network) — silent failure is fine, the next poll tick
+			// or session re-open will redo it.
+			this.#lastMarkedByThread.delete(key);
+		}
 	}
 
 	#seedSelf(): void {

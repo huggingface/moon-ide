@@ -25,9 +25,12 @@ thread_ts: string,
  */
 latest_ts: string, 
 /**
- * First ~80 chars of the parent message, single-line. Empty if
- * the parent is image-only / file-only (Slack returns no text in
- * that case).
+ * Single-line, whitespace-collapsed body of the parent message,
+ * capped at `moon_slack::PREVIEW_MAX_CHARS` (transport safety
+ * only — the panel handles visible-width truncation through CSS
+ * `line-clamp: 2` *after* it has flattened mrkdwn tokens to
+ * plain text). Empty if the parent is image-only / file-only
+ * (Slack returns no text in that case).
  */
 preview: string, 
 /**

@@ -176,6 +176,25 @@ impl SlackClient {
 		Ok(body.messages.into_iter().map(to_message).collect())
 	}
 
+	/// `conversations.mark` — clear the unread badge for `channel` up
+	/// to `ts`. Used by the polling loop on view / session-switch /
+	/// focused-tick-with-new-content so the user's other Slack clients
+	/// (mobile, web, desktop) drop the unread count as soon as they've
+	/// seen the message in moon-ide. Requires the `im:write` scope
+	/// (granted upfront in the connect walkthrough).
+	///
+	/// Idempotent server-side — calling with the same `ts` twice is
+	/// fine. We still de-dupe in the poller to avoid burning quota
+	/// when a thread is busy.
+	pub async fn mark_as_read(&self, channel: &str, ts: &str) -> Result<(), SlackError> {
+		// `conversations.mark` returns an envelope with no payload of
+		// its own, so we discard via `serde::de::IgnoredAny`.
+		let _: serde::de::IgnoredAny = self
+			.call("conversations.mark", &[("channel", channel), ("ts", ts)])
+			.await?;
+		Ok(())
+	}
+
 	/// Look up one user by ID and return the trimmed summary used to
 	/// render `<@U…>` mentions. Wraps `users.info` and folds the
 	/// nested `profile.display_name` / `profile.real_name` fields so

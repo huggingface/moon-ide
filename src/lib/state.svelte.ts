@@ -205,6 +205,10 @@ class WorkspaceState {
 		// `slack_status`) on this same paint without the user lifting a
 		// finger.
 		slack.hydrate(state.slack);
+		// Bind Tauri push events + window-focus listener once the
+		// Tauri runtime is up. Idempotent — `wireRuntime` early-returns
+		// on subsequent calls (HMR-safe).
+		void slack.wireRuntime();
 
 		const ws = this.workspace;
 		const session = state.last_session;

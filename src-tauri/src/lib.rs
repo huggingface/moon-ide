@@ -1,11 +1,12 @@
 //! Tauri shell for moon-ide. Wires Tauri commands to `moon-core`.
 
 mod commands;
+mod slack_poller;
 mod state;
 
 use camino::Utf8PathBuf;
 use moon_core::app_state as core_app_state;
-use moon_slack::SlackClient;
+use moon_slack::{SlackClient, TokenStore};
 use state::AppState;
 use tauri::Manager;
 
@@ -44,10 +45,12 @@ pub fn run() {
 			commands::slack::slack_clear_bot,
 			commands::slack::slack_get_active_bot,
 			commands::slack::slack_set_panel_visible,
+			commands::slack::slack_set_window_focused,
 			commands::slack::slack_list_sessions,
 			commands::slack::slack_get_thread,
 			commands::slack::slack_set_active_thread,
 			commands::slack::slack_get_user,
+			commands::slack::slack_mark_read,
 		])
 		.setup(|app| {
 			let config_dir = app
@@ -57,7 +60,19 @@ pub fn run() {
 			let config_dir =
 				Utf8PathBuf::from_path_buf(config_dir).map_err(|p| format!("non-utf8 app config dir: {}", p.display()))?;
 
-			let state = AppState::new(config_dir.clone());
+			// Build the shared client cell first, spawn the Slack
+			// poller against it, then hand the same Arc to AppState
+			// so commands and the poller always see the same live
+			// `Option<SlackClient>`.
+			let client_cell = std::sync::Arc::new(tokio::sync::RwLock::new(None::<SlackClient>));
+			let poller = slack_poller::spawn(
+				app.handle().clone(),
+				client_cell.clone(),
+				TokenStore::default(),
+				config_dir.clone(),
+			);
+			let slack_state = state::SlackState::new(client_cell, poller.clone());
+			let state = AppState::new(config_dir.clone(), slack_state);
 
 			// Restore the last session's workspace synchronously so the
 			// frontend's first call to `workspace_active` already sees it. The
@@ -81,11 +96,26 @@ pub fn run() {
 								}
 							}
 						}
+
+						// Seed the poller from persisted Slack inputs
+						// so a relaunch with the panel previously open
+						// resumes polling without waiting for the
+						// frontend to re-issue every setter.
+						poller.set_panel_visible(s.slack.panel_visible);
+						if let Some(bot) = s.slack.active_bot.as_ref() {
+							poller.set_active_channel(Some(bot.dm_channel_id.clone()));
+							poller.set_active_thread_ts(s.slack.active_thread_ts.clone());
+						}
 					}
 					Err(e) => {
 						tracing::warn!(error = %e, "failed to load app state");
 					}
 				}
+
+				// OS focus starts true: the user just launched the
+				// app, the window is in front. Frontend will correct
+				// us on the next blur via `slack_set_window_focused`.
+				poller.set_os_focused(true);
 
 				// Rehydrate the Slack client from the keyring if the
 				// user had previously connected. We don't validate the

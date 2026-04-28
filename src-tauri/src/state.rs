@@ -1,7 +1,11 @@
+use std::sync::Arc;
+
 use camino::Utf8PathBuf;
 use moon_core::WorkspaceRegistry;
 use moon_slack::{SlackClient, TokenStore};
 use tokio::sync::RwLock;
+
+use crate::slack_poller::PollerHandle;
 
 pub struct AppState {
 	pub workspaces: WorkspaceRegistry,
@@ -15,23 +19,36 @@ pub struct AppState {
 }
 
 impl AppState {
-	pub fn new(config_dir: Utf8PathBuf) -> Self {
+	pub fn new(config_dir: Utf8PathBuf, slack: SlackState) -> Self {
 		Self {
 			workspaces: WorkspaceRegistry::new(),
 			config_dir,
-			slack: SlackState::default(),
+			slack,
 		}
 	}
 }
 
-#[derive(Default)]
 pub struct SlackState {
 	pub tokens: TokenStore,
-	client: RwLock<Option<SlackClient>>,
+	/// `Arc<RwLock<…>>` so the poll task can clone a handle and read
+	/// the live client without going back through Tauri's state map.
+	pub client: Arc<RwLock<Option<SlackClient>>>,
+	/// Drives the background polling loop — set panel visibility,
+	/// active thread, OS focus from the matching commands and the
+	/// loop wakes up. See [`crate::slack_poller`].
+	pub poller: PollerHandle,
 }
 
 impl SlackState {
-	pub async fn client(&self) -> Option<SlackClient> {
+	pub fn new(client: Arc<RwLock<Option<SlackClient>>>, poller: PollerHandle) -> Self {
+		Self {
+			tokens: TokenStore::default(),
+			client,
+			poller,
+		}
+	}
+
+	pub async fn current_client(&self) -> Option<SlackClient> {
 		self.client.read().await.clone()
 	}
 

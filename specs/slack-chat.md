@@ -581,6 +581,7 @@ Tauri commands in `src-tauri/src/commands/slack.rs`:
 | `slack_clear_bot()`                            | Drop the saved pick; trigger picker on next render   |
 | `slack_get_active_bot()`                       | Read the persisted bot pick, if any                  |
 | `slack_set_panel_visible(visible)`             | Persist the chat panel's open/closed state           |
+| `slack_set_window_focused(focused)` (11.2)     | OS focus signal for the read-receipt gate            |
 | `slack_list_sessions(channel)`                 | `conversations.history` filtered to top-level        |
 | `slack_get_thread(channel, ts)`                | `conversations.replies` for one thread               |
 | `slack_set_active_thread(thread_ts \| null)`   | Persist the open thread in `AppState.slack`          |
@@ -591,8 +592,13 @@ Tauri commands in `src-tauri/src/commands/slack.rs`:
 Push events from backend → frontend (11.2):
 
 - `slack:thread-update` — `{ channel, thread_ts, messages: [...] }`
-  (full thread snapshot, frontend reconciles).
+  (full thread snapshot, frontend reconciles by replacing
+  `threadMessages` iff `(channel, thread_ts)` matches the open
+  session — stale pushes for previously-open threads are dropped).
 - `slack:disconnected` — token went bad, panel returns to empty.
+  The keyring + persisted bot pick are already cleared on the
+  Rust side by the time this fires; the frontend just mirrors the
+  in-memory disconnect.
 
 ## Failure modes
 

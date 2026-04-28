@@ -55,9 +55,11 @@ export const ipc = {
 		clearBot: () => invoke<void>('slack_clear_bot'),
 		getActiveBot: () => invoke<SlackBotProfile | null>('slack_get_active_bot'),
 		setPanelVisible: (visible: boolean) => invoke<void>('slack_set_panel_visible', { visible }),
+		setWindowFocused: (focused: boolean) => invoke<void>('slack_set_window_focused', { focused }),
 		listSessions: (channel: string) => invoke<SlackSession[]>('slack_list_sessions', { channel }),
 		getThread: (channel: string, threadTs: string) => invoke<SlackMessage[]>('slack_get_thread', { channel, threadTs }),
 		setActiveThread: (threadTs: string | null) => invoke<void>('slack_set_active_thread', { threadTs }),
 		getUser: (userId: string) => invoke<SlackUserSummary>('slack_get_user', { userId }),
+		markRead: (channel: string, ts: string) => invoke<void>('slack_mark_read', { channel, ts }),
 	},
 } as const;

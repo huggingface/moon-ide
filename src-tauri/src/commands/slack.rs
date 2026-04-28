@@ -37,6 +37,10 @@ pub async fn slack_set_token(state: State<'_, AppState>, token: String) -> Resul
 	let identity = client.auth_test().await.map_err(MoonError::from)?;
 	state.slack.tokens.save(&token).map_err(MoonError::from)?;
 	state.slack.set_client(client).await;
+	// Wake the poller — its `has_client()` check turns true now,
+	// so if the user was already mid-thread before the token went
+	// bad it can resume polling without waiting for the next setter.
+	state.slack.poller.poke();
 	Ok(identity)
 }
 
@@ -46,7 +50,7 @@ pub async fn slack_set_token(state: State<'_, AppState>, token: String) -> Resul
 /// the next launch shows the empty state instead of failing again.
 #[tauri::command]
 pub async fn slack_status(state: State<'_, AppState>) -> Result<SlackStatus, MoonError> {
-	let Some(client) = state.slack.client().await else {
+	let Some(client) = state.slack.current_client().await else {
 		return Ok(SlackStatus {
 			connected: false,
 			identity: None,
@@ -62,6 +66,7 @@ pub async fn slack_status(state: State<'_, AppState>) -> Result<SlackStatus, Moo
 				tracing::warn!(error = %err, "slack token rejected; clearing keyring entry");
 				let _ = state.slack.tokens.clear();
 				state.slack.clear_client().await;
+				state.slack.poller.set_active_channel(None);
 				clear_active_bot_on_disk(&state).await;
 			}
 			Ok(SlackStatus {
@@ -78,6 +83,7 @@ pub async fn slack_status(state: State<'_, AppState>) -> Result<SlackStatus, Moo
 pub async fn slack_clear_token(state: State<'_, AppState>) -> Result<(), MoonError> {
 	state.slack.tokens.clear().map_err(MoonError::from)?;
 	state.slack.clear_client().await;
+	state.slack.poller.set_active_channel(None);
 	clear_active_bot_on_disk(&state).await;
 	Ok(())
 }
@@ -91,7 +97,7 @@ pub async fn slack_clear_token(state: State<'_, AppState>) -> Result<(), MoonErr
 /// of the picker.
 #[tauri::command]
 pub async fn slack_list_dm_bots(state: State<'_, AppState>) -> Result<Vec<SlackBotProfile>, MoonError> {
-	let Some(client) = state.slack.client().await else {
+	let Some(client) = state.slack.current_client().await else {
 		return Err(MoonError::HostUnavailable("slack: not connected".into()));
 	};
 	client.list_dm_bots().await.map_err(MoonError::from)
@@ -110,11 +116,16 @@ pub async fn slack_select_bot(state: State<'_, AppState>, profile: SlackBotProfi
 		.active_bot
 		.as_ref()
 		.is_none_or(|bot| bot.user_id != profile.user_id);
+	let dm_channel_id = profile.dm_channel_id.clone();
 	current.slack.active_bot = Some(profile);
 	if bot_changed {
 		current.slack.active_thread_ts = None;
 	}
-	app_state_store::save(&state.config_dir, &current).await
+	app_state_store::save(&state.config_dir, &current).await?;
+	// Feed the poller too. `set_active_channel` clears any pending
+	// thread anyway, matching the persisted-state invariant above.
+	state.slack.poller.set_active_channel(Some(dm_channel_id));
+	Ok(())
 }
 
 /// Drop the persisted bot pick. Triggers the picker on next chat-panel
@@ -122,6 +133,7 @@ pub async fn slack_select_bot(state: State<'_, AppState>, profile: SlackBotProfi
 #[tauri::command]
 pub async fn slack_clear_bot(state: State<'_, AppState>) -> Result<(), MoonError> {
 	clear_active_bot_on_disk(&state).await;
+	state.slack.poller.set_active_channel(None);
 	Ok(())
 }
 
@@ -142,11 +154,23 @@ pub async fn slack_get_active_bot(state: State<'_, AppState>) -> Result<Option<S
 #[tauri::command]
 pub async fn slack_set_panel_visible(state: State<'_, AppState>, visible: bool) -> Result<(), MoonError> {
 	let mut current = app_state_store::load(&state.config_dir).await?;
+	state.slack.poller.set_panel_visible(visible);
 	if current.slack.panel_visible == visible {
 		return Ok(());
 	}
 	current.slack.panel_visible = visible;
 	app_state_store::save(&state.config_dir, &current).await
+}
+
+/// OS-level focus tracking. Frontend listens to Tauri's
+/// `tauri://focus` / `tauri://blur` events and forwards the boolean
+/// here; the poller uses this to gate `conversations.mark` (we only
+/// clear the unread badge when the user is actually looking at the
+/// window — see `specs/slack-chat.md#read-receipts`). Not persisted.
+#[tauri::command]
+pub async fn slack_set_window_focused(state: State<'_, AppState>, focused: bool) -> Result<(), MoonError> {
+	state.slack.poller.set_os_focused(focused);
+	Ok(())
 }
 
 /// `conversations.history` of the bot's DM channel, filtered to
@@ -157,7 +181,7 @@ pub async fn slack_set_panel_visible(state: State<'_, AppState>, visible: bool) 
 /// stateless and the frontend's "wait, which bot?" race is impossible.
 #[tauri::command]
 pub async fn slack_list_sessions(state: State<'_, AppState>, channel: String) -> Result<Vec<SlackSession>, MoonError> {
-	let Some(client) = state.slack.client().await else {
+	let Some(client) = state.slack.current_client().await else {
 		return Err(MoonError::HostUnavailable("slack: not connected".into()));
 	};
 	client.list_sessions(&channel).await.map_err(MoonError::from)
@@ -172,10 +196,22 @@ pub async fn slack_get_thread(
 	channel: String,
 	thread_ts: String,
 ) -> Result<Vec<SlackMessage>, MoonError> {
-	let Some(client) = state.slack.client().await else {
+	let Some(client) = state.slack.current_client().await else {
 		return Err(MoonError::HostUnavailable("slack: not connected".into()));
 	};
 	client.get_thread(&channel, &thread_ts).await.map_err(MoonError::from)
+}
+
+/// `conversations.mark` — clear the unread badge for the active
+/// session up to `ts`. Frontend fires this on view + on session
+/// switch; the polling loop handles the on-tick case automatically.
+/// See `specs/slack-chat.md#read-receipts`.
+#[tauri::command]
+pub async fn slack_mark_read(state: State<'_, AppState>, channel: String, ts: String) -> Result<(), MoonError> {
+	let Some(client) = state.slack.current_client().await else {
+		return Err(MoonError::HostUnavailable("slack: not connected".into()));
+	};
+	client.mark_as_read(&channel, &ts).await.map_err(MoonError::from)
 }
 
 /// Resolve a single `<@U…>` mention to a [`SlackUserSummary`]. Wraps
@@ -184,7 +220,7 @@ pub async fn slack_get_thread(
 /// session — see `specs/slack-chat.md#mrkdwn-rendering`.
 #[tauri::command]
 pub async fn slack_get_user(state: State<'_, AppState>, user_id: String) -> Result<SlackUserSummary, MoonError> {
-	let Some(client) = state.slack.client().await else {
+	let Some(client) = state.slack.current_client().await else {
 		return Err(MoonError::HostUnavailable("slack: not connected".into()));
 	};
 	client.resolve_user(&user_id).await.map_err(MoonError::from)
@@ -195,6 +231,7 @@ pub async fn slack_get_user(state: State<'_, AppState>, user_id: String) -> Resu
 #[tauri::command]
 pub async fn slack_set_active_thread(state: State<'_, AppState>, thread_ts: Option<String>) -> Result<(), MoonError> {
 	let mut current = app_state_store::load(&state.config_dir).await?;
+	state.slack.poller.set_active_thread_ts(thread_ts.clone());
 	if current.slack.active_thread_ts == thread_ts {
 		return Ok(());
 	}
