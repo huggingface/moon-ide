@@ -213,6 +213,18 @@ export type SlackMessage = {
 	text: string;
 	edited_ts: string | null;
 	is_bot: boolean;
+	actions: SlackAction[];
+};
+
+/**
+ * One link button extracted from an `actions` block at the bottom of
+ * a message (moon-bot's "Response" / "Download" / "Session" footer).
+ * Mirrors `moon_protocol::slack::SlackAction`.
+ */
+export type SlackAction = {
+	label: string;
+	url: string;
+	style: string | null;
 };
 
 /**

@@ -16,7 +16,7 @@
 //! `slack_api`: those crates carry OAuth flows, signing, and a type
 //! universe we don't use, all on the user-token critical path.
 
-use moon_protocol::slack::{SlackBotProfile, SlackIdentity, SlackMessage, SlackSession, SlackUserSummary};
+use moon_protocol::slack::{SlackAction, SlackBotProfile, SlackIdentity, SlackMessage, SlackSession, SlackUserSummary};
 use serde::{Deserialize, Serialize};
 
 use crate::error::SlackError;
@@ -372,8 +372,7 @@ struct EditedMeta {
 
 /// Subset of Slack's [Block Kit][1] block types. We only deserialise
 /// the shapes we render; everything else (image, header, context,
-/// actions, rich_text, table, …) falls into `Unknown` and contributes
-/// nothing to the rendered text.
+/// rich_text, table, …) falls into `Unknown` and contributes nothing.
 ///
 /// `markdown` blocks are forwarded as-is even though they carry
 /// CommonMark, not Slack mrkdwn. The frontend tokenizer will render
@@ -394,6 +393,14 @@ enum RawBlock {
 		text: String,
 	},
 	Divider,
+	/// Footer button row (moon-bot's "Response" / "Download" /
+	/// "Session" links). We only extract URL-bearing buttons —
+	/// interactive ones need a `block_actions` callback that this
+	/// read-only panel can't dispatch.
+	Actions {
+		#[serde(default)]
+		elements: Vec<RawAction>,
+	},
 	#[serde(other)]
 	Unknown,
 }
@@ -403,6 +410,28 @@ struct RawBlockText {
 	#[serde(rename = "type")]
 	kind: String,
 	text: String,
+}
+
+/// Subset of Slack's [block element][1] types that can appear inside
+/// an `actions` block. Only `button` is recognised — other element
+/// types (date pickers, selects, overflow menus) need server-side
+/// callbacks we don't have. Captured as `Unknown` and dropped.
+///
+/// [1]: https://api.slack.com/reference/block-kit/block-elements
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum RawAction {
+	Button {
+		text: RawBlockText,
+		/// Set on link buttons. Absent on interactive buttons (which
+		/// carry `value` instead) — those we drop.
+		#[serde(default)]
+		url: Option<String>,
+		#[serde(default)]
+		style: Option<String>,
+	},
+	#[serde(other)]
+	Unknown,
 }
 
 /// Top-level test: parent of a thread (or a thread-less message).
@@ -435,13 +464,16 @@ fn to_session(msg: RawMessage) -> SlackSession {
 
 fn to_message(msg: RawMessage) -> SlackMessage {
 	let is_bot = msg.bot_id.is_some();
-	let text = text_from_blocks(msg.blocks.as_deref()).unwrap_or_else(|| msg.text.unwrap_or_default());
+	let blocks = msg.blocks.as_deref();
+	let text = text_from_blocks(blocks).unwrap_or_else(|| msg.text.unwrap_or_default());
+	let actions = actions_from_blocks(blocks);
 	SlackMessage {
 		ts: msg.ts,
 		user_id: msg.user,
 		text,
 		edited_ts: msg.edited.map(|e| e.ts),
 		is_bot,
+		actions,
 	}
 }
 
@@ -478,6 +510,41 @@ fn text_from_blocks(blocks: Option<&[RawBlock]>) -> Option<String> {
 		return None;
 	}
 	Some(parts.join("\n\n"))
+}
+
+/// Pull link buttons out of every `actions` block in the message.
+/// Order is preserved across blocks and within each block (Slack
+/// renders them left-to-right), so the frontend can render them as
+/// one flat row underneath the body.
+///
+/// Buttons without a `url` are dropped — see [`SlackAction`] for the
+/// rationale.
+fn actions_from_blocks(blocks: Option<&[RawBlock]>) -> Vec<SlackAction> {
+	let Some(blocks) = blocks else {
+		return Vec::new();
+	};
+	let mut out = Vec::new();
+	for block in blocks {
+		let RawBlock::Actions { elements } = block else {
+			continue;
+		};
+		for element in elements {
+			let RawAction::Button {
+				text,
+				url: Some(url),
+				style,
+			} = element
+			else {
+				continue;
+			};
+			out.push(SlackAction {
+				label: text.text.clone(),
+				url: url.clone(),
+				style: style.clone(),
+			});
+		}
+	}
+	out
 }
 
 /// Single-line preview, capped at [`PREVIEW_MAX_CHARS`]. Newlines
@@ -669,16 +736,16 @@ mod tests {
 
 	#[test]
 	fn skips_unsupported_blocks_silently() {
-		// `actions` (button rows) and `image` blocks contribute
-		// nothing to the rendered text — they're either separately
-		// rendered later (Phase 11.4+) or genuinely cosmetic.
+		// `image` / `header` / `context` contribute nothing to the
+		// rendered text right now — either separately rendered later
+		// (Phase 11.4+) or genuinely cosmetic.
 		let json = r#"{
 			"ts": "1700000006.000600",
 			"bot_id": "B01",
 			"blocks": [
 				{ "type": "section", "text": { "type": "mrkdwn", "text": "hello" } },
-				{ "type": "actions", "elements": [{ "type": "button" }] },
-				{ "type": "image", "image_url": "https://example.com/x.png", "alt_text": "x" }
+				{ "type": "image", "image_url": "https://example.com/x.png", "alt_text": "x" },
+				{ "type": "header", "text": { "type": "plain_text", "text": "title" } }
 			]
 		}"#;
 		let msg = to_message(serde_json::from_str(json).unwrap());
@@ -719,6 +786,94 @@ mod tests {
 		let raw: RawMessage = serde_json::from_str(json).unwrap();
 		let session = to_session(raw);
 		assert_eq!(session.preview, "real preview body");
+	}
+
+	#[test]
+	fn extracts_link_buttons_from_actions_block() {
+		// moon-bot's footer: three URL buttons. We surface them as
+		// `SlackAction` rows under the message body. Order and style
+		// are preserved.
+		let json = r#"{
+			"ts": "1700000020.002000",
+			"bot_id": "B01",
+			"blocks": [
+				{ "type": "section", "text": { "type": "mrkdwn", "text": "done." } },
+				{
+					"type": "actions",
+					"elements": [
+						{ "type": "button", "text": { "type": "plain_text", "text": "Response" }, "url": "https://hf.co/r" },
+						{ "type": "button", "text": { "type": "plain_text", "text": "Download" }, "url": "https://hf.co/d" },
+						{ "type": "button", "style": "primary", "text": { "type": "plain_text", "text": "Session" }, "url": "https://hf.co/s" }
+					]
+				}
+			]
+		}"#;
+		let msg = to_message(serde_json::from_str(json).unwrap());
+		assert_eq!(msg.text, "done.");
+		assert_eq!(msg.actions.len(), 3);
+		assert_eq!(msg.actions[0].label, "Response");
+		assert_eq!(msg.actions[0].url, "https://hf.co/r");
+		assert_eq!(msg.actions[0].style, None);
+		assert_eq!(msg.actions[2].label, "Session");
+		assert_eq!(msg.actions[2].style.as_deref(), Some("primary"));
+	}
+
+	#[test]
+	fn drops_interactive_buttons_without_url() {
+		// `value`-only buttons (interactive — would post
+		// block_actions) can't be dispatched from a read-only panel.
+		// Drop them, keep the link buttons in the same row.
+		let json = r#"{
+			"ts": "1700000021.002100",
+			"bot_id": "B01",
+			"blocks": [
+				{
+					"type": "actions",
+					"elements": [
+						{ "type": "button", "text": { "type": "plain_text", "text": "Approve" }, "value": "approve" },
+						{ "type": "button", "text": { "type": "plain_text", "text": "Open" }, "url": "https://hf.co/o" }
+					]
+				}
+			]
+		}"#;
+		let msg = to_message(serde_json::from_str(json).unwrap());
+		assert_eq!(msg.actions.len(), 1);
+		assert_eq!(msg.actions[0].label, "Open");
+	}
+
+	#[test]
+	fn drops_unknown_action_element_types() {
+		// Date pickers, selects, overflow menus etc. need server-side
+		// callbacks; silently drop without breaking the rest of the
+		// row.
+		let json = r#"{
+			"ts": "1700000022.002200",
+			"bot_id": "B01",
+			"blocks": [
+				{
+					"type": "actions",
+					"elements": [
+						{ "type": "datepicker", "action_id": "d", "initial_date": "2026-01-01" },
+						{ "type": "button", "text": { "type": "plain_text", "text": "Open" }, "url": "https://hf.co/o" }
+					]
+				}
+			]
+		}"#;
+		let msg = to_message(serde_json::from_str(json).unwrap());
+		assert_eq!(msg.actions.len(), 1);
+	}
+
+	#[test]
+	fn no_actions_yields_empty_vec() {
+		let json = r#"{
+			"ts": "1700000023.002300",
+			"bot_id": "B01",
+			"blocks": [
+				{ "type": "section", "text": { "type": "mrkdwn", "text": "no buttons here" } }
+			]
+		}"#;
+		let msg = to_message(serde_json::from_str(json).unwrap());
+		assert!(msg.actions.is_empty());
 	}
 
 	#[test]

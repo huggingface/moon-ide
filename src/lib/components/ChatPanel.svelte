@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount, untrack } from 'svelte';
 	import { confirm } from '@tauri-apps/plugin-dialog';
+	import { openUrl } from '@tauri-apps/plugin-opener';
 	import { slack } from '../slack.svelte';
 	import { botLabel, userLabel, type SlackBotProfile, type SlackSession } from '../protocol';
 	import { formatSlackRelative, formatSlackTime } from '../util/slackTime';
@@ -148,6 +149,27 @@
 			void slack.loadThread(ts);
 		}
 	}
+
+	// Same scheme allowlist as the message-body link handler — bot
+	// footers always point at `https://` URLs (HF Hub, trace viewer,
+	// download), but the renderer is paranoid by design and also
+	// rejects anything Slack returns with a `value`-only payload
+	// (those buttons are filtered server-side, but cheap to belt-and-
+	// suspenders here too).
+	const ACTION_SCHEMES = new Set(['http:', 'https:', 'mailto:']);
+
+	function onActionClick(event: MouseEvent, url: string) {
+		event.preventDefault();
+		try {
+			const parsed = new URL(url);
+			if (ACTION_SCHEMES.has(parsed.protocol)) {
+				void openUrl(parsed.toString());
+			}
+		} catch {
+			// Malformed URL — silently swallow rather than crashing
+			// the click handler.
+		}
+	}
 </script>
 
 <aside class="chat-panel" data-region="chat" aria-label="Chat panel">
@@ -287,6 +309,20 @@
 											</span>
 										</header>
 										<div class="message-body"><SlackMessageBody text={message.text} /></div>
+										{#if message.actions.length > 0}
+											<div class="message-actions">
+												{#each message.actions as action, i (i)}
+													<button
+														type="button"
+														class="action-btn"
+														class:primary={action.style === 'primary'}
+														class:danger={action.style === 'danger'}
+														onclick={(e) => onActionClick(e, action.url)}
+														title={action.url}>{action.label}</button
+													>
+												{/each}
+											</div>
+										{/if}
 									</li>
 								{/each}
 							</ol>
@@ -697,6 +733,43 @@
 		line-height: 1.5;
 		white-space: pre-wrap;
 		word-wrap: break-word;
+	}
+	.message-actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 6px;
+		margin-top: 4px;
+	}
+	.action-btn {
+		font-size: 11px;
+		font-weight: 500;
+		padding: 4px 10px;
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		background: var(--m-bg-1);
+		color: var(--m-fg);
+		cursor: pointer;
+		line-height: 1.2;
+	}
+	.action-btn:hover {
+		background: var(--m-bg-2);
+		border-color: var(--m-border-strong);
+	}
+	.action-btn.primary {
+		color: var(--m-accent);
+		border-color: color-mix(in srgb, var(--m-accent) 40%, var(--m-border));
+		background: color-mix(in srgb, var(--m-accent) 10%, transparent);
+	}
+	.action-btn.primary:hover {
+		background: color-mix(in srgb, var(--m-accent) 18%, transparent);
+	}
+	.action-btn.danger {
+		color: var(--m-danger);
+		border-color: color-mix(in srgb, var(--m-danger) 40%, var(--m-border));
+		background: color-mix(in srgb, var(--m-danger) 10%, transparent);
+	}
+	.action-btn.danger:hover {
+		background: color-mix(in srgb, var(--m-danger) 18%, transparent);
 	}
 	.spinner {
 		width: 18px;

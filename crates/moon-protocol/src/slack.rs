@@ -123,9 +123,10 @@ pub struct SlackMessage {
 	/// Author's Slack user ID. `None` only for system / unknown
 	/// messages, which we still render but flag as "unknown sender".
 	pub user_id: Option<String>,
-	/// Plain text body. Slack's mrkdwn dialect is *not* parsed here —
-	/// 11.4 swaps in proper rendering. For now it's literally what
-	/// Slack returned, with `\n` preserved.
+	/// Slack mrkdwn body. Synthesised from Block Kit blocks when the
+	/// bot uses them (the common case for moon-bot, Cursor, GitHub),
+	/// otherwise the raw `text` field. See
+	/// `crates/moon-slack::client::text_from_blocks`.
 	pub text: String,
 	/// `edited.ts` when the message has been edited. Lets the UI
 	/// surface "(edited)" and lets 11.2's polling diff identify
@@ -135,4 +136,28 @@ pub struct SlackMessage {
 	/// the message). Used for bubble alignment + colour. Doesn't
 	/// distinguish *which* bot.
 	pub is_bot: bool,
+	/// Link buttons extracted from `actions` blocks at the bottom of
+	/// the message — moon-bot uses these for "Response", "Download",
+	/// "Session" footer links. Empty when the message has no action
+	/// row. Buttons without a `url` (interactive `value` buttons that
+	/// require a webhook to handle) are filtered out — we'd need to
+	/// post `block_actions` back to the bot's app, which is out of
+	/// scope for the read-only chat panel.
+	pub actions: Vec<SlackAction>,
+}
+
+/// One link button rendered under a message body. Always points at a
+/// URL; we don't model interactive (`value`-only) buttons because a
+/// read-only chat panel can't dispatch them anywhere useful.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SlackAction {
+	/// Button label (`text.text` from Slack — always `plain_text`).
+	pub label: String,
+	/// Destination URL. Opened externally via `tauri-plugin-opener`,
+	/// same allowlist as message links (`http(s)` / `mailto`).
+	pub url: String,
+	/// Optional Slack styling hint: `"primary"` / `"danger"`. The
+	/// renderer tints the button accordingly; missing means default.
+	pub style: Option<String>,
 }

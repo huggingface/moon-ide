@@ -109,6 +109,13 @@ the raw `<@U…>` and `<https://…|label>` tokens were unreadable.
   picking a recent multi-paragraph moon-bot answer and confirming
   the IDE matches Slack's own rendering line-for-line.
 - A `divider` block renders as a centred `———` between sections.
+- A moon-bot reply with the standard footer renders three pill
+  buttons under the body — "Response" / "Download" / "Session" —
+  each opening the underlying URL externally via the OS browser.
+  `style: "primary"` / `"danger"` buttons use the accent / danger
+  tint. Buttons without a URL (interactive `value`-only) and other
+  element types (datepicker, select, overflow) are silently dropped
+  from the row.
 - A bot reply long enough to use `markdown` blocks (> ~3 kB
   post-conversion, unusual but possible) shows literal `**` and
   `[label](url)` until the deferred Rust converter lands. This is a

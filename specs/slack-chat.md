@@ -301,12 +301,13 @@ single Slack-mrkdwn string from the supported block types before
 returning a `SlackMessage` to the frontend, so the rest of the
 pipeline only ever sees one representation:
 
-| Block type                                                           | Behaviour                                                                  |
-| -------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| `section`                                                            | Use `text.text` when `text.type == "mrkdwn"`. `plain_text` is skipped.     |
-| `markdown`                                                           | Forwarded as-is (CommonMark). `**bold**` / fenced language tags will leak. |
-| `divider`                                                            | Emits `———`.                                                               |
-| Anything else (image, header, context, actions, rich_text, table, …) | Skipped silently.                                                          |
+| Block type                                                  | Behaviour                                                                                                                                                                                                                          |
+| ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `section`                                                   | Use `text.text` when `text.type == "mrkdwn"`. `plain_text` is skipped.                                                                                                                                                             |
+| `markdown`                                                  | Forwarded as-is (CommonMark). `**bold**` / fenced language tags will leak.                                                                                                                                                         |
+| `divider`                                                   | Emits `———`.                                                                                                                                                                                                                       |
+| `actions`                                                   | Link buttons (`button` elements with a `url`) become `SlackAction`s on the message. Interactive `value`-only buttons and other element types (datepicker, select, …) are dropped — a read-only panel can't dispatch them anywhere. |
+| Anything else (image, header, context, rich_text, table, …) | Skipped silently.                                                                                                                                                                                                                  |
 
 Blocks are joined with a blank line. If no block contributed any text
 (e.g. only `rich_text` from a human typer), the raw `text` field is
@@ -315,6 +316,13 @@ used as fallback — this is the common path for human DMs.
 Same precedence applies to the session-list preview (`to_session`),
 so a bot's session row also reads its blocks instead of the flattened
 fallback.
+
+`actions` blocks contribute to a separate `actions: Vec<SlackAction>`
+field on `SlackMessage` rather than the body text. The frontend
+renders them as a row of pill buttons under the message body, opened
+externally via `tauri-plugin-opener` (same `http(s)` / `mailto`
+allowlist as inline links). Slack's `style: "primary" | "danger"`
+hint tints the button.
 
 [bk]: https://api.slack.com/reference/block-kit/blocks
 
