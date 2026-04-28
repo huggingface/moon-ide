@@ -97,13 +97,16 @@ means, by construction, the published image builds moon-ide.
 
 ### Required secrets
 
-| Secret               | What                                                                         |
-| -------------------- | ---------------------------------------------------------------------------- |
-| `DOCKERHUB_USERNAME` | Org/bot Docker Hub account with write access to `huggingface/moon-base`.     |
-| `DOCKERHUB_TOKEN`    | Access token (not the account password) with read+write+delete on that repo. |
+| Secret               | What                                                                     |
+| -------------------- | ------------------------------------------------------------------------ |
+| `DOCKERHUB_USERNAME` | Org/bot Docker Hub account with write access to `huggingface/moon-base`. |
+| `DOCKERHUB_PASSWORD` | Access token / password for that account.                                |
 
-Neither is referenced in PR-mode runs, so PRs from forks build
-and smoke-test cleanly without secret access.
+Names match the existing `huggingface/Mongoku` publish
+workflow, so the org-level secret pair (if configured) covers
+both repos without setup. Neither secret is referenced in
+PR-mode runs, so PRs from forks build and smoke-test cleanly
+without secret access.
 
 ### Versioned releases (later)
 
