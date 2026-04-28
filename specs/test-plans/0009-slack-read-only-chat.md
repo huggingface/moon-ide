@@ -18,9 +18,14 @@
     [`SlackMessage`](../../crates/moon-protocol/src/slack.rs)
     `(ts, user_id, text, edited_ts, is_bot)`. `is_bot` comes
     straight off Slack's `bot_id` field.
-  - Preview text is truncated server-side at 80 chars
-    (`PREVIEW_MAX_CHARS`) with whitespace runs collapsed; the panel
-    just renders what it gets.
+  - Preview body has whitespace runs collapsed and is capped at
+    `PREVIEW_MAX_CHARS` (transport safety only — runaway bot
+    replies). Visible-width truncation is the panel's job: it
+    parses the mrkdwn through `slackPlainText`, flattening
+    `<https://…|label>` to `label` and `<@U…>` to the cached
+    display name, then `line-clamp: 2` cuts to the row width.
+    Truncating mrkdwn server-side would cut mid-token and the JS
+    dangling-trim would silently swallow the link.
 - New protocol types
   ([`crates/moon-protocol/src/slack.rs`](../../crates/moon-protocol/src/slack.rs)):
   `SlackSession`, `SlackMessage`. Both are `#[derive(TS)]`-exported.
@@ -247,7 +252,8 @@ test cases for the new history/replies deserialisers:
 
 - `deserializes_history_and_filters_top_level`
 - `deserializes_replies_with_edits_and_bots`
-- `preview_truncates_and_collapses_whitespace`
+- `preview_collapses_whitespace_without_visual_truncation`
+- `preview_caps_runaway_bodies_with_ellipsis`
 
 ## Known limitations
 

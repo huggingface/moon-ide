@@ -82,9 +82,12 @@ pub struct SlackSession {
 	/// last reply's `ts`). Drives "2 min ago" and the
 	/// future cadence ladder.
 	pub latest_ts: String,
-	/// First ~80 chars of the parent message, single-line. Empty if
-	/// the parent is image-only / file-only (Slack returns no text in
-	/// that case).
+	/// Single-line, whitespace-collapsed body of the parent message,
+	/// capped at `moon_slack::PREVIEW_MAX_CHARS` (transport safety
+	/// only — the panel handles visible-width truncation through CSS
+	/// `line-clamp: 2` *after* it has flattened mrkdwn tokens to
+	/// plain text). Empty if the parent is image-only / file-only
+	/// (Slack returns no text in that case).
 	pub preview: String,
 	/// Number of replies (excluding the parent). 0 means "fresh
 	/// session, bot hasn't replied yet".

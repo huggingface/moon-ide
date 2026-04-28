@@ -46,10 +46,17 @@ pub const SESSION_HISTORY_LIMIT: usize = 100;
 /// chat where we mostly care about the latest exchange.
 pub const THREAD_REPLY_LIMIT: usize = 200;
 
-/// Length cap for the session-row preview text. Slack does not truncate
-/// for us; this keeps long parent messages from blowing out the panel
-/// width before the UI's `text-overflow: ellipsis` kicks in.
-pub const PREVIEW_MAX_CHARS: usize = 80;
+/// Transport-safety cap on the session-row preview *body*. Visual
+/// truncation belongs to the panel — it's CSS `line-clamp: 2` on the
+/// rendered, mrkdwn-flattened output, *after* `<https://…>` /
+/// `<@U…|alice>` tokens have become plain text. Truncating the raw
+/// mrkdwn here used to cut mid-token at 80 chars and then leak a
+/// dangling `<` into the preview (or, post-`trimDanglingAngle`,
+/// silently swallow the link). 500 chars is well over any typical
+/// thread-starter (a status line, a one-paragraph prompt) but small
+/// enough that we're not shipping the bot's full essay just to
+/// render a 2-line summary.
+pub const PREVIEW_MAX_CHARS: usize = 500;
 
 #[derive(Clone)]
 pub struct SlackClient {
@@ -547,11 +554,18 @@ fn actions_from_blocks(blocks: Option<&[RawBlock]>) -> Vec<SlackAction> {
 	out
 }
 
-/// Single-line preview, capped at [`PREVIEW_MAX_CHARS`]. Newlines
+/// Single-line preview body, capped at [`PREVIEW_MAX_CHARS`]. Newlines
 /// collapse to spaces (the panel renders one row per session) and
 /// runs of whitespace are squashed so "user pressed enter twice"
-/// doesn't leave a wide gap. Truncation appends a single `…` so the
-/// row reads like "first line of the message…".
+/// doesn't leave a wide gap.
+///
+/// We deliberately *over-shoot* the visible width: visual truncation is
+/// the frontend's job — it parses the mrkdwn, flattens
+/// `<https://…|label>` to `label`, resolves `<@U…>` mentions, then
+/// CSS `line-clamp: 2` cuts to the actual panel width. Truncating
+/// here would cut mid-token (`<https://…cu` → JS dangling-trim → no
+/// link visible at all). The 500-char cap is a transport safety net
+/// for runaway bot replies, not a UI knob.
 fn preview_from(raw: &str) -> String {
 	let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
 	if collapsed.chars().count() <= PREVIEW_MAX_CHARS {
@@ -894,13 +908,27 @@ mod tests {
 	}
 
 	#[test]
-	fn preview_truncates_and_collapses_whitespace() {
+	fn preview_collapses_whitespace_without_visual_truncation() {
+		// Whitespace collapse is the main job — keeps the panel from
+		// spending two lines on a blank-line-separated paragraph.
 		assert_eq!(preview_from("hello world"), "hello world");
 		assert_eq!(preview_from("hello\n\nworld"), "hello world");
 		assert_eq!(preview_from("  hello   world  "), "hello world");
 		assert_eq!(preview_from(""), "");
 
-		let long = "a".repeat(200);
+		// A typical thread-starter (a one-paragraph status line plus a
+		// long URL) sails under the transport cap and ships intact.
+		// CSS `line-clamp: 2` is what the user actually sees; we
+		// must not pre-cut and lose the `<…>` link envelope.
+		let starter = "This space is in runtime error: <https://huggingface.co/spaces/CohereLabs/review-global-mmlu-lite>";
+		assert_eq!(preview_from(starter), starter);
+	}
+
+	#[test]
+	fn preview_caps_runaway_bodies_with_ellipsis() {
+		// Transport safety net only — bot replies that dump their full
+		// essay as the thread starter would otherwise ship 10 kB+.
+		let long = "a".repeat(PREVIEW_MAX_CHARS + 200);
 		let cut = preview_from(&long);
 		assert_eq!(cut.chars().count(), PREVIEW_MAX_CHARS + 1);
 		assert!(cut.ends_with('…'));
