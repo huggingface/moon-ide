@@ -62,26 +62,30 @@ port. Everything else stays inside the container.
 
 ### Per-host bootstrap
 
-The container handles every cross-platform concern (Rust, the JS
-toolchain, lint/format, tests, the Linux Tauri build). What stays on
-the host is the **platform-native moon-ide build** — the macOS or Linux
-binary the contributor actually launches. Tauri's build chain has to
-match the host's OS for that one artefact.
+The moon-ide binary is host-native on every platform — it links
+against a platform-provided webview (WebKitGTK on Linux, WKWebView on
+macOS) at startup. That makes the moon-ide _build chain_ host-resident
+too: a Tauri build inside a Linux container can't produce a macOS
+`.app`, and even a Linux binary built inside the container has to find
+WebKitGTK on the host at launch. What the container _does_ cover is
+everything around that build — Rust + JS toolchain for project
+tooling, lint, format, tests, sidecar processes.
 
 **macOS contributors (Apple Silicon — the team's primary platform).**
 Host needs: Xcode Command Line Tools (`xcode-select --install`),
-Docker Desktop with VirtIO file sharing enabled (for the bind-mount
-performance story in
-[`containers.md`](../containers.md#failure-modes)), `rustup`, `bun`.
-Everything else is in the container. The macOS app builds via Tauri
-on the host; the container is for project tooling and the cross-built
-Linux artefact.
+`rustup`, `bun`, Docker Desktop with VirtIO file sharing enabled (for
+the bind-mount performance story in
+[`containers.md`](../containers.md#failure-modes)). macOS provides
+WebKit, so no extra package is needed for the webview itself. The
+container handles project tooling (`bun run check`, lint, format,
+tests) and, when wanted, the cross-built Linux artefact.
 
-**Linux contributors.** Host needs: Docker Engine + Compose v2.
-Nothing else — `bun install`, `cargo check`, the Tauri build all run
-inside the container. The host-side webkit2gtk libraries listed above
-are still required _inside_ the image (not on the host) for the Linux
-Tauri build to succeed.
+**Linux contributors.** Host needs: WebKitGTK dev libraries (the
+`libwebkit2gtk-4.1-dev` apt set listed in
+[the README](../../README.md#linux)) — required at both build time
+and runtime — plus `rustup`, `bun`, Docker Engine + Compose v2. The
+container handles project tooling. WebKitGTK doesn't move inside the
+image because the binary loads it at launch on the host.
 
 **Windows host.** Not supported. Surface if/when somebody picks it
 up — see [`containers.md`'s out-of-scope](../containers.md#out-of-scope-for-phase-2-and-when-to-revisit).
@@ -90,12 +94,11 @@ up — see [`containers.md`'s out-of-scope](../containers.md#out-of-scope-for-ph
 
 - Rust support cannot be a second-class citizen; Phase 4 (LSP) ships
   `rust-analyzer` integration alongside the TS/Svelte stack.
-- Toolchain bootstrap (rustup/bun install) for general project work
-  must run **inside the active `WorkspaceHost`**, not on the host. A
-  first-run task is acceptable. Linux contributors don't need
-  pre-installed Rust / Node / Bun on the host at all; macOS
-  contributors do (the platform-native Tauri build runs on the host),
-  and that's documented in the per-host bootstrap above.
+- Toolchain bootstrap for **arbitrary project work** runs inside the
+  active `WorkspaceHost`. moon-ide-on-moon-ide is the special case:
+  the moon-ide Tauri build chain itself stays host-side on both
+  platforms because the binary it produces is host-native. The
+  per-host bootstrap above lists what that means in package terms.
 - The terminal (Phase 3) defaults to a shell with the toolchain on
   `PATH` inside the container.
 - The editor itself must respect the repo's `.editorconfig` so that

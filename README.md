@@ -77,8 +77,13 @@ sudo apt install -y libwebkit2gtk-4.1-dev libsoup-3.0-dev libgtk-3-dev \
     libayatana-appindicator3-dev librsvg2-dev libssl-dev pkg-config
 ```
 
-(Once Phase 2 lands these libraries live inside the `moon-base` image,
-not on the host — but until then the host-build path needs them.)
+WebKitGTK is required on the host **even after Phase 2 lands** — it's
+what the moon-ide Tauri binary loads as its webview when it starts.
+Phase 2 only moves the _project_ toolchain (lint, format, tests,
+project builds) into the container; the moon-ide binary itself stays
+host-native, so its runtime dependencies stay host-side. The Mac
+equivalent is "macOS ships its own WebKit" — neither platform escapes
+having a host-side webview library.
 
 ## Run
 

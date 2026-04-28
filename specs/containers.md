@@ -270,23 +270,39 @@ where the container earns its keep.
 
 ### When the project _is_ moon-ide
 
-Building moon-ide itself is a Tauri-matrix story:
+moon-ide is itself a Tauri app, so its build matrix is
+platform-coupled in a way most workspaces aren't. The shape:
 
-- **macOS contributors** build the macOS `.app` on the host
-  (Xcode + macOS WebKit framework — neither can run inside a
-  Linux container). The container is still useful: it owns
-  the Linux-side toolchain for the cross-compiled / Linux
-  release artefact, plus all the project tooling that doesn't
-  care which platform binary gets built (rust-analyzer, oxlint,
-  oxfmt, prettier, `bun run check`, tests).
-- **Linux contributors** build everything inside the container.
-  The host needs nothing beyond Docker.
+- The moon-ide binary the contributor launches is **host-native**
+  on every platform. The webview it loads at startup is a
+  system library: WebKitGTK on Linux, WKWebView on macOS.
+- The platform-native toolchain that produces that binary (Rust
+  - bun + the platform's webview dev headers + the platform's
+    linker) therefore lives on the host as well — putting it
+    inside a Linux container can't produce a macOS `.app`, and a
+    Linux binary built inside the container would still need
+    WebKitGTK on the host to actually launch.
+- Everything else — project tooling that doesn't care which
+  platform binary the build pipeline targets (rust-analyzer,
+  oxlint, oxfmt, prettier, `bun run check`, tests, the
+  `bun install` step itself) — lives in the container.
+
+Concretely:
+
+- **macOS contributors**: host gets Xcode CLT + rustup + bun +
+  Docker Desktop. macOS provides WebKit. The container handles
+  project tooling and (if needed) the cross-built Linux artefact.
+- **Linux contributors**: host gets WebKitGTK dev libraries
+  (`libwebkit2gtk-4.1-dev` + the rest listed in the
+  [README](../README.md#linux)) + rustup + bun + Docker Engine.
+  The container handles project tooling. WebKitGTK can't move
+  into the container because the binary needs it at launch on
+  the host.
 
 In practice the moon-ide repo's `package.json` and `Cargo.toml`
-work the same in both modes — Tauri's CLI picks the platform
-target automatically based on whoever's running the build.
-Documented host-side prerequisites per platform live in the
-top-level [README](../README.md#prerequisites).
+work the same on both — Tauri's CLI picks the platform target
+automatically based on whoever's running the build. The
+container is the equaliser for everything _around_ that build.
 
 ## Path mapping
 
