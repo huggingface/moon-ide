@@ -3,14 +3,15 @@
 # moon-base — the workspace dev image for moon-ide.
 #
 # What lives here today: WebKitGTK dev libraries (so a fresh
-# moon-ide checkout is buildable per ADR 0005), rustup with
-# the stable toolchain, bun, git, and a non-root `dev` user
-# with passwordless sudo. The container runs unprivileged with
-# the default Docker capability set; project services come up
-# as siblings on the host's daemon via compose `include:`
-# rather than nested inside this container (ADR 0008). Polyglot
-# extras (uv / hf / gh CLI) and the multi-arch CI workflow
-# arrive in subsequent commits.
+# moon-ide checkout is buildable per ADR 0005), rustup with the
+# stable toolchain, bun, the polyglot CLIs we use across most
+# repos in the org (gh, uv, hf) plus comfort tooling (ripgrep,
+# fzf, bat, jq), and a non-root `dev` user with passwordless
+# sudo. The container runs unprivileged with the default Docker
+# capability set; project services come up as siblings on the
+# host's daemon via compose `include:` rather than nested inside
+# this container (ADR 0008). The multi-arch CI workflow lands
+# in a subsequent commit.
 #
 # Specs: ../../specs/containers.md
 # ADRs:  ../../specs/decisions/0007-compose-and-moon-base.md
@@ -54,6 +55,32 @@ RUN apt-get update \
         xz-utils \
  && rm -rf /var/lib/apt/lists/*
 
+# Comfort tooling that's stable enough to live in the base image:
+# ripgrep / fzf / bat / jq. `bat` ships as `batcat` on Debian to
+# avoid a name clash with `bacula-tools`; symlink it back so
+# muscle memory works.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ripgrep \
+        fzf \
+        bat \
+        jq \
+ && rm -rf /var/lib/apt/lists/* \
+ && ln -s /usr/bin/batcat /usr/local/bin/bat
+
+# GitHub CLI from its official apt repo (Debian's `gh` is usually
+# behind upstream by a release or two, and `gh` cuts releases
+# frequently enough that the lag matters for newer commands).
+RUN install -m 0755 -d /etc/apt/keyrings \
+ && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+ && chmod a+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends gh \
+ && rm -rf /var/lib/apt/lists/*
+
 # Non-root user. UID 1000 lines up with the conventional "first user"
 # on Linux contributors' hosts; on Docker Desktop for macOS the
 # host->container user mapping fronts whatever the Mac contributor's
@@ -81,6 +108,25 @@ ENV BUN_INSTALL=/home/${USERNAME}/.bun \
     PATH=/home/${USERNAME}/.bun/bin:${PATH}
 
 RUN curl -fsSL https://bun.sh/install | bash
+
+# uv (Astral's Python toolchain manager). Standalone installer
+# detects the right arch automatically and lands at
+# ~/.local/bin/uv. We pin to a known version so the image is
+# reproducible; bumps are intentional.
+ENV UV_VERSION=0.5.18 \
+    PATH=/home/${USERNAME}/.local/bin:${PATH}
+
+RUN curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh \
+ && uv --version
+
+# hf (Hugging Face Hub CLI). Installed as a uv-managed tool so
+# its dependency tree is isolated from any project venvs the
+# user later creates. uv fetches the pinned Python interpreter
+# itself; we don't want to depend on whatever python the base
+# image happens to have.
+RUN uv python install 3.12 \
+ && uv tool install --python 3.12 huggingface_hub \
+ && hf --version
 
 WORKDIR /workspace
 

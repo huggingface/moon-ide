@@ -39,6 +39,14 @@ Decisions:
 - **`rustup` (stable, minimal profile)** with `clippy` and
   `rustfmt`.
 - **`bun`**.
+- **`uv`** (pinned to a specific version for reproducibility),
+  managing Python toolchains and tool installs.
+- **`hf`** (Hugging Face Hub CLI), installed via `uv tool` so
+  its dependency tree stays isolated from any project venv.
+- **`gh`** from GitHub's official apt repo (Debian's `gh`
+  trails upstream by a release or two).
+- **Comfort tooling**: `ripgrep` (`rg`), `fzf`, `bat` (the
+  Debian `batcat` symlinked back to `bat`), `jq`.
 - **Standard plumbing**: `git`, `curl`, `wget`, `ca-certificates`,
   `build-essential`, `less`, `sudo`, `unzip`, `xz-utils`.
 - **Non-root `dev` user** (uid 1000, gid 1000) with passwordless
@@ -54,19 +62,21 @@ What is **not** here, deliberately:
   CLI inside the workspace later, it's a forwarded socket +
   `apt-get install docker-ce-cli` line in that project's own
   Dockerfile-on-top, not a base-image concern.
+- No `node` / `npm` / `yarn`. `bun` runs `package.json`
+  scripts and `bun install` is drop-in for `npm install` for
+  the workflows we run; layering Node back on is one apt line
+  in a project's own Dockerfile when somebody hits the corner
+  case.
 
 ## What's coming (later commits in Phase 2.0)
 
-1. **Polyglot CLIs.** `uv` (Python), `hf` (Hugging Face Hub),
-   `gh` (GitHub), plus comfort tooling (`ripgrep`, `fzf`,
-   `bat`, `jq`).
-2. **GitHub Actions workflow.** Multi-arch native builds
+1. **GitHub Actions workflow.** Multi-arch native builds
    (`linux/amd64` + `linux/arm64`) with
    `docker buildx imagetools create` to publish a combined
    manifest to `huggingface/moon-base` on Docker Hub.
    Matrix-runs on `ubuntu-24.04` + `ubuntu-24.04-arm` (both
    free for public repos, so no QEMU emulation tax).
-3. **Smoke test.** `git clone moon-ide && bun install && cargo check`
+2. **Smoke test.** `git clone moon-ide && bun install && cargo check`
    inside the freshly built image — green is the release gate
    per ADR 0005.
 
@@ -80,22 +90,28 @@ docker build -t moon-base:dev images/moon-base/
 
 (Run from the repo root.)
 
-Verify the toolchain landed:
+Verify everything landed:
 
 ```bash
 docker run --rm moon-base:dev bash -c '
-  rustc --version
-  cargo --version
-  bun --version
+  rustc --version && cargo --version && bun --version
+  uv --version && hf --version
+  gh --version | head -1
+  rg --version | head -1
+  fzf --version
+  bat --version
+  jq --version
   pkg-config --modversion webkit2gtk-4.1
 '
 ```
 
-First-build size lands around 2.5–3 GB (WebKitGTK + GTK 3 dev
-libs are ~1.4 GB on their own; rustup with the stable toolchain
-pulls another ~1 GB). We'll look at slimming if it gets
-unwieldy, but a multi-GB workspace base image is normal for the
-"polyglot toolchain" tradeoff we picked in ADR 0007.
+First-build size lands around 3 GB (WebKitGTK + GTK 3 dev
+libs are ~1.4 GB on their own; rustup with the stable
+toolchain pulls another ~1 GB; uv-managed Python 3.12 + the
+hf CLI's dep tree adds ~250 MB; gh + comfort tooling adds
+~50 MB). We'll look at slimming if it gets unwieldy, but a
+multi-GB workspace base image is normal for the "polyglot
+toolchain" tradeoff we picked in ADR 0007.
 
 ## Versioning
 

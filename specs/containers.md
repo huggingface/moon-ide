@@ -170,12 +170,17 @@ What `moon-base` ships:
   `mcr.microsoft.com/devcontainers/...` family — those are
   fine, but for a long-lived workspace container we'd rather
   control the base ourselves.
-- **Polyglot toolchain**: bun, node (current LTS), rustup with
-  the stable toolchain, `uv`-managed Python, `hf` CLI, `gh`,
-  the usual `git` + `ripgrep` + `fzf` + `bat`. No language
-  locks the version itself — teams add `rustup toolchain
-install nightly` or `uv python install 3.10` in their own
-  Dockerfile when they need to.
+- **Polyglot toolchain**: `bun`, rustup with the stable
+  toolchain, `uv` (Astral's Python toolchain manager), the
+  `hf` CLI installed via `uv tool` so its dep tree stays
+  isolated, and `gh` from GitHub's official apt repo. No
+  bundled `node` — `bun` covers the workflows we run; project
+  Dockerfiles add Node back when they need it. Comfort
+  tooling: `git`, `ripgrep`, `fzf`, `bat`, `jq`. None of these
+  lock a language version — teams add
+  `rustup toolchain install nightly` or
+  `uv python install 3.10` in their own Dockerfile when they
+  need to.
 - **WebKitGTK dev libraries** so a fresh moon-ide checkout is
   buildable inside its own container (the bootstrap concern
   from [ADR 0005](decisions/0005-bootstrap.md)).
