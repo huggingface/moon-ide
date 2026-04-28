@@ -2574,6 +2574,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "moon-container"
+version = "0.0.0"
+dependencies = [
+ "camino",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "moon-core"
 version = "0.0.0"
 dependencies = [
