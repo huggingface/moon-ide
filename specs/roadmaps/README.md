@@ -36,4 +36,6 @@ manual.
 
 ## Index
 
+- [phase-01.5-editor-polish.md](phase-01.5-editor-polish.md)
 - [phase-02-containers.md](phase-02-containers.md)
+- [phase-11-slack-chat.md](phase-11-slack-chat.md)
