@@ -13,12 +13,13 @@ registry / image-strategy decision:
 
 ## Status
 
-- **In tree** — first scaffold, iterating on the recipe.
+- **In tree** — iterating on the recipe.
 - **Not yet published** — no Docker Hub tags exist yet. Local
   `docker build` only.
-- **DinD pending** — Docker-in-Docker isn't wired in yet. The
-  current image is rust + bun + WebKitGTK dev libs and nothing
-  more.
+- **DinD wired in** — the canonical recipe (fuse-overlayfs +
+  iptables-legacy + the Docker 29+ snapshotter flag) lands in
+  this commit. `docker run hello-world` works inside a
+  privileged container.
 
 ## What's in the image (today)
 
@@ -30,32 +31,36 @@ registry / image-strategy decision:
 - **`rustup` (stable, minimal profile)** with `clippy` and
   `rustfmt`.
 - **`bun`**.
+- **Docker-in-Docker**: `docker-ce`, `docker-ce-cli`,
+  `containerd.io`, `docker-buildx-plugin`, `docker-compose-plugin`,
+  `fuse-overlayfs`, `iptables`. iptables alternatives pinned to
+  legacy at build time; `/etc/docker/daemon.json` selects
+  `fuse-overlayfs` and disables the containerd snapshotter
+  (the Docker 29+ default doesn't nest cleanly under DinD). An
+  entrypoint script backgrounds `dockerd` on container start
+  and waits for the socket before handing off to CMD.
 - **Standard plumbing**: `git`, `curl`, `wget`, `ca-certificates`,
   `build-essential`, `less`, `sudo`, `unzip`, `xz-utils`.
 - **Non-root `dev` user** (uid 1000, gid 1000) with passwordless
-  sudo. The uid lines up with the conventional first user on
-  Debian/Ubuntu hosts; Docker Desktop for macOS handles the
-  uid translation transparently.
+  sudo and `docker` group membership (so `docker ...` works
+  without sudo). The uid lines up with the conventional first
+  user on Debian/Ubuntu hosts; Docker Desktop for macOS handles
+  the uid translation transparently.
 
 ## What's coming (later commits in Phase 2.0)
 
-1. **Docker-in-Docker.** The canonical recipe — `fuse-overlayfs`
-   storage driver, `iptables-legacy` alternative, the Docker
-   29+ `containerd-snapshotter: false` flag — so users' own
-   `docker compose up` works inside the container. See
-   `specs/containers.md#the-moon-base-image`.
-2. **Polyglot CLIs.** `uv` (Python), `hf` (Hugging Face Hub),
+1. **Polyglot CLIs.** `uv` (Python), `hf` (Hugging Face Hub),
    `gh` (GitHub), plus comfort tooling (`ripgrep`, `fzf`,
    `bat`, `jq`).
-3. **GitHub Actions workflow.** Multi-arch native builds
-   (`linux/amd64` + `linux/arm64`) with `docker buildx
-imagetools create` to publish a combined manifest to
-   `huggingface/moon-base` on Docker Hub. Matrix-runs on
-   `ubuntu-24.04` + `ubuntu-24.04-arm` (both free for public
-   repos, so no QEMU emulation tax).
-4. **Smoke test.** `git clone moon-ide && bun install &&
-cargo check` inside the freshly built image — green is the
-   release gate per ADR 0005.
+2. **GitHub Actions workflow.** Multi-arch native builds
+   (`linux/amd64` + `linux/arm64`) with
+   `docker buildx imagetools create` to publish a combined
+   manifest to `huggingface/moon-base` on Docker Hub.
+   Matrix-runs on `ubuntu-24.04` + `ubuntu-24.04-arm` (both
+   free for public repos, so no QEMU emulation tax).
+3. **Smoke test.** `git clone moon-ide && bun install && cargo check`
+   inside the freshly built image — green is the release gate
+   per ADR 0005.
 
 Tracker: [`specs/roadmaps/phase-02-containers.md`](../../specs/roadmaps/phase-02-containers.md).
 
@@ -78,10 +83,21 @@ docker run --rm moon-base:dev bash -c '
 '
 ```
 
-First-build size lands around 2.5–3 GB (WebKitGTK + GTK 3
-dev libs are ~1.4 GB on their own; rustup with the stable
-toolchain pulls another ~1 GB). DinD adds a small amount in
-the next commit; we'll look at slimming if it gets unwieldy.
+Verify Docker-in-Docker works (needs `--privileged`):
+
+```bash
+docker run --rm --privileged moon-base:dev bash -c '
+  sleep 5  # let the entrypoint start dockerd
+  docker run --rm hello-world
+'
+```
+
+First-build size lands around 3–3.5 GB (WebKitGTK + GTK 3 dev
+libs are ~1.4 GB on their own; rustup with the stable toolchain
+pulls another ~1 GB; the Docker engine + buildx + compose
+plugins add ~500 MB). We'll look at slimming if it gets
+unwieldy, but a multi-GB workspace base image is normal for the
+"polyglot toolchain" tradeoff we picked in ADR 0007.
 
 ## Versioning
 
@@ -92,8 +108,9 @@ the next commit; we'll look at slimming if it gets unwieldy.
 | `latest`          | Casual use only — generated `compose.yaml` never points here.                                 |
 | `dev`             | Pre-release / WIP builds — used by CI for smoke-tests before promoting to a real version tag. |
 
-The first stable tag will be `0.1.0` (released once DinD + the
-smoke test land). Pre-`0.1.0` everything is via `:dev` or local
+The first stable tag will be `0.1.0`, released once the
+multi-arch CI workflow and the `bun install && cargo check`
+smoke test land. Pre-`0.1.0` everything is via `:dev` or local
 `:dev` builds.
 
 ## Extending it
