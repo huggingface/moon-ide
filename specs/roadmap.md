@@ -155,7 +155,13 @@ Sub-phases:
 - **11.3.1 — Reaction display.** Render the `reactions` array on each message as a row of small `<emoji> <count>` chips below the message body and above any action buttons. Slack shortcodes go through the existing `slackEmoji.resolveReactionName` helper (which strips `::skin-tone-N` modifiers and falls back to `:name:` for custom workspace emoji). Read-only — tapping a chip doesn't toggle the user's own reaction yet; that needs an emoji picker and lives behind the next concrete request.
 - **11.4 — Multi-bot + polish.** Configurable bot profiles (Moonbot is the default; user adds Cursor / GitHub / any DM-able bot by handle). Tab strip inside the panel when there's more than one.
 
-Deliberately deferred until somebody asks: file/image attachments, an OAuth flow that ships a moon-ide Slack app (replacing the manual user-token paste), and exposing local IDE context to the bot — Phase 11 stays a pure chat passthrough.
+Deliberately deferred until somebody asks (see [`slack-chat.md`'s deferred-features section](slack-chat.md#what-this-phase-deliberately-doesnt-do) for the per-feature design notes):
+
+- **File / image attachments.** Both inbound rendering (bots posting screenshots / log dumps) and outbound upload (drag-and-drop into the composer). Scopes already granted; the missing piece is a `files[]` renderer + a paste/drop handler.
+- **Auto-scroll to the latest message.** Threads currently open scrolled to the oldest reply. Tabled until the team picks bottom-anchor vs. last-read-marker as the default.
+- **AI-generated session titles.** Replace the raw-first-line preview with a 3–6 word LLM summary; bring back a sticky thread header above the message list once the summary is good enough to anchor the view.
+- **OAuth flow that ships a moon-ide Slack app.** Today the user installs their own personal app; replacing that with a one-click "Sign in with Slack" needs a hosted callback we don't have.
+- **Local IDE context for the bot.** Phase 11 is pure pass-through. ACP (Phase 6) is where context-aware agents live.
 
 ## Phase 12+ — Innovation track
 

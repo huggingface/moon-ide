@@ -671,9 +671,30 @@ Push events from backend → frontend (11.2):
 - **No moon-ide Slack app.** Until somebody asks for one-click
   install, the user installs their own personal Slack app and pastes
   a user token. Documented in the connect walk-through.
-- **No file/image attachments.** Slack supports both, we don't render
-  them in v1. The conversation degrades to "(image)" placeholder for
-  now.
+- **No file/image attachments.** Slack supports both upload
+  (`files.upload`) and inline rendering (`message.files[]`); we
+  do neither in v1. The conversation degrades to a placeholder
+  for image-only / file-only messages today (`preview` is empty
+  on the backend, the frontend shows nothing). Picked up
+  whenever moon-bot starts attaching screenshots / log dumps
+  that the user actually wants to see in the IDE — at which
+  point we'll need `files:read` (already in the upfront grant)
+  for inline rendering, and `files:write` (also granted) plus a
+  drag-and-drop / paste handler for upload.
+- **No auto-scroll to the latest message.** The thread opens
+  scrolled to the top, so a long thread requires a manual scroll
+  down to read the most recent reply. Trivial to add (one
+  `$effect` that watches `threadMessages.length` and snaps
+  `scrollTop` to `scrollHeight`, with a sticky-bottom heuristic
+  so we don't yank the user away from older context they're
+  reading). Tabled until the team decides whether bottom-anchor
+  or last-read-marker is the right default.
+- **No AI-generated session titles.** The session list shows the
+  raw first line of each thread today. Once we have an LLM in
+  the loop (Phase 6, ACP), summarise each thread to a 3–6 word
+  title and persist alongside `thread_ts`. Sticky AI title above
+  the message list is the natural re-introduction of the thread
+  subject we removed in `4a11305`.
 - **No multi-account.** One Slack workspace per moon-ide install.
   Multi-workspace is a Phase 12 problem.
 - **No reaction add/remove from the panel yet.** 11.3.1 ships
