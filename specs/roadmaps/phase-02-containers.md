@@ -28,15 +28,17 @@ What ships:
 - `moon-base` Dockerfile + GitHub Actions workflow publishing
   a multi-arch manifest (`linux/amd64` + `linux/arm64`, both
   built natively on `ubuntu-24.04` / `ubuntu-24.04-arm` —
-  no QEMU) to `ghcr.io/huggingface/moon-base:<sha>` and
-  `ghcr.io/huggingface/moon-base:<major>.<minor>`. arm64 is
-  the team's primary target (Mac-majority, Apple Silicon);
-  amd64 covers Linux contributors and CI. Builds run only on
+  no QEMU) to **Docker Hub** at `huggingface/moon-base:<sha>`
+  and `huggingface/moon-base:<major>.<minor>`. arm64 is the
+  team's primary target (Mac-majority, Apple Silicon); amd64
+  covers Linux contributors and CI. Builds run only on
   changes to `moon-base`'s sources, not on every moon-ide
   commit. Image contents per
   [`containers.md`](../containers.md#the-moon-base-image),
   distribution per
-  [`containers.md`](../containers.md#distribution).
+  [`containers.md`](../containers.md#distribution),
+  registry rationale per
+  [ADR 0007](../decisions/0007-compose-and-moon-base.md#registry-docker-hub).
 - Container name derived from a stable hash of the workspace
   path: `moon-ws-<short-hash>`.
 - Tauri commands `container_status` / `container_setup` /

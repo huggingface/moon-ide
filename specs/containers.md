@@ -42,9 +42,9 @@ See [Out of scope](#out-of-scope-for-phase-2-and-when-to-revisit).
 
 ### The `moon-base` image
 
-moon-ide publishes its own base image to GHCR
-(`ghcr.io/huggingface/moon-base:<tag>`). Teams `FROM moon-base`
-to add their own toolchain on top.
+moon-ide publishes its own base image to Docker Hub
+(`huggingface/moon-base:<tag>`). Teams `FROM moon-base` to add
+their own toolchain on top.
 
 What `moon-base` ships:
 
@@ -79,7 +79,8 @@ points at a specific tag, not `latest`.
 
 ### Distribution
 
-`moon-base` ships as a **multi-arch manifest**:
+`moon-base` ships as a **multi-arch manifest** to **Docker
+Hub** (`huggingface/moon-base`):
 
 - `linux/amd64` — Linux contributors and CI smoke tests.
 - `linux/arm64` — the team's primary target (Mac-majority,
@@ -89,14 +90,39 @@ Built natively on both architectures via GitHub Actions
 (`ubuntu-24.04` + `ubuntu-24.04-arm` — both free for public
 repos, so no QEMU emulation in the path). Two parallel build
 jobs feed a `docker buildx imagetools create` step that
-publishes the combined manifest to GHCR. Docker pulls the
-right arch automatically based on the host.
+publishes the combined manifest. Docker pulls the right arch
+automatically based on the host.
 
 Builds run only on changes to `moon-base`'s sources (its
 Dockerfile, the bootstrap scripts, the workflow itself) — not
 on every moon-ide commit. The "infrequent build" model is
 fine because `moon-base` deliberately doesn't track moon-ide
-versions; it tracks toolchain versions.
+versions; it tracks toolchain versions. Concretely, the
+release-gate smoke test (`bun install && cargo check` inside
+the freshly built image) only runs when `moon-base` itself
+changes — moon-ide commits land without it. The contract is
+"`moon-base` builds moon-ide cleanly when published", not
+"every moon-ide commit re-validates `moon-base`".
+
+#### Why Docker Hub, not GHCR or HF Hub
+
+Trade-offs we walked through, with their rejection reasons:
+
+- **GHCR**: ties the workspace's runtime base image to a
+  GitHub/Microsoft account. We'd rather not bake that
+  dependency into every team member's `docker pull` path
+  for a foundational artefact.
+- **Private Docker registry**: image needs to be public so
+  contributors and downstream users can pull it without
+  credential setup. Rules out anything self-hosted-and-gated.
+- **Hugging Face Spaces "run locally"**: HF Spaces only
+  ship `linux/amd64` artefacts; using them as the
+  distribution channel would lock arm64 (the primary target)
+  out of the picture.
+- **Docker Hub**: vendor-neutral relative to our existing
+  GitHub dependencies, public, multi-arch-native, idiomatic
+  (`docker pull huggingface/moon-base` works without a
+  registry prefix). Chosen.
 
 ### Why not devcontainer.json features
 
@@ -112,7 +138,7 @@ moon-base AS team-dev` extension; we lose nothing.
 ### How teams extend it
 
 ```dockerfile
-FROM ghcr.io/huggingface/moon-base:1.0
+FROM huggingface/moon-base:1.0
 
 # Team-specific tooling
 RUN apt-get update && apt-get install -y \
@@ -144,7 +170,7 @@ A minimal generated config:
 # <workspace>/.moon/compose.yaml
 services:
   shell:
-    image: ghcr.io/huggingface/moon-base:1.0
+    image: huggingface/moon-base:1.0
     volumes:
       - ../:/workspace:cached
     working_dir: /workspace
@@ -241,6 +267,26 @@ remote APIs; running them inside the container would force
 every API call through the container's network namespace for
 no upside. The user's own dev tooling is project-level — that's
 where the container earns its keep.
+
+### When the project _is_ moon-ide
+
+Building moon-ide itself is a Tauri-matrix story:
+
+- **macOS contributors** build the macOS `.app` on the host
+  (Xcode + macOS WebKit framework — neither can run inside a
+  Linux container). The container is still useful: it owns
+  the Linux-side toolchain for the cross-compiled / Linux
+  release artefact, plus all the project tooling that doesn't
+  care which platform binary gets built (rust-analyzer, oxlint,
+  oxfmt, prettier, `bun run check`, tests).
+- **Linux contributors** build everything inside the container.
+  The host needs nothing beyond Docker.
+
+In practice the moon-ide repo's `package.json` and `Cargo.toml`
+work the same in both modes — Tauri's CLI picks the platform
+target automatically based on whoever's running the build.
+Documented host-side prerequisites per platform live in the
+top-level [README](../README.md#prerequisites).
 
 ## Path mapping
 

@@ -7,12 +7,16 @@ Status: accepted
 
 Moon IDE is written in Rust + TypeScript + Svelte and uses native binaries
 (Tauri shell, `cargo`, `bun`/`node`, `tsgo`, `oxlint`, `oxfmt`,
-`prettier`) plus system libraries (`libwebkit2gtk-4.1`, etc.).
+`prettier`) plus platform-specific system libraries (the macOS WebKit
+framework on Apple Silicon Macs, `libwebkit2gtk-4.1` on Linux).
 
 Eventually the team will use Moon IDE to develop Moon IDE itself. That
 means a fresh checkout, opened with the IDE, must be a fully working dev
-environment — including inside the workspace's container (Phase 2). The
-IDE has to support the languages it is itself written in.
+environment. Most of the toolchain runs inside the workspace's container
+(Phase 2 — see [`containers.md`](../containers.md)); the parts that
+genuinely have to live on the host (the platform-native Tauri binary
+build chain, principally) are explicit and minimal. The IDE has to
+support the languages it is itself written in.
 
 ## Decision
 
@@ -56,14 +60,42 @@ moon-published `moon-base` image, which carries:
 Forwarded ports are explicit: only Vite (1420) and the Tauri devtools
 port. Everything else stays inside the container.
 
+### Per-host bootstrap
+
+The container handles every cross-platform concern (Rust, the JS
+toolchain, lint/format, tests, the Linux Tauri build). What stays on
+the host is the **platform-native moon-ide build** — the macOS or Linux
+binary the contributor actually launches. Tauri's build chain has to
+match the host's OS for that one artefact.
+
+**macOS contributors (Apple Silicon — the team's primary platform).**
+Host needs: Xcode Command Line Tools (`xcode-select --install`),
+Docker Desktop with VirtIO file sharing enabled (for the bind-mount
+performance story in
+[`containers.md`](../containers.md#failure-modes)), `rustup`, `bun`.
+Everything else is in the container. The macOS app builds via Tauri
+on the host; the container is for project tooling and the cross-built
+Linux artefact.
+
+**Linux contributors.** Host needs: Docker Engine + Compose v2.
+Nothing else — `bun install`, `cargo check`, the Tauri build all run
+inside the container. The host-side webkit2gtk libraries listed above
+are still required _inside_ the image (not on the host) for the Linux
+Tauri build to succeed.
+
+**Windows host.** Not supported. Surface if/when somebody picks it
+up — see [`containers.md`'s out-of-scope](../containers.md#out-of-scope-for-phase-2-and-when-to-revisit).
+
 ### What this implies for the IDE features
 
 - Rust support cannot be a second-class citizen; Phase 4 (LSP) ships
   `rust-analyzer` integration alongside the TS/Svelte stack.
-- Toolchain bootstrap (rustup/bun install) must run **inside the active
-  `WorkspaceHost`**, not on the host. A first-run task is acceptable
-  but the host machine should not need any pre-installed Rust / Node /
-  Bun for the dev workflow.
+- Toolchain bootstrap (rustup/bun install) for general project work
+  must run **inside the active `WorkspaceHost`**, not on the host. A
+  first-run task is acceptable. Linux contributors don't need
+  pre-installed Rust / Node / Bun on the host at all; macOS
+  contributors do (the platform-native Tauri build runs on the host),
+  and that's documented in the per-host bootstrap above.
 - The terminal (Phase 3) defaults to a shell with the toolchain on
   `PATH` inside the container.
 - The editor itself must respect the repo's `.editorconfig` so that

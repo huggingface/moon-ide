@@ -62,10 +62,11 @@ that.
 
 ### 2. moon-ide publishes its own base image
 
-`ghcr.io/huggingface/moon-base:<tag>`, built from Debian stable
-in the moon-ide repo's CI, shipping a polyglot toolchain plus a
-pre-baked DinD setup (the canonical recipe). Teams `FROM
-moon-base` to add their own tooling on top.
+`huggingface/moon-base:<tag>` on Docker Hub, built from Debian
+stable in the moon-ide repo's CI, shipping a polyglot toolchain
+plus a pre-baked DinD setup (the canonical recipe). Teams
+`FROM moon-base` to add their own tooling on top. Multi-arch
+(`linux/amd64` + `linux/arm64`); see [Distribution](../containers.md#distribution).
 
 Versioning: `:<commit-sha>` for reproducibility, `:<major>.<minor>`
 for human convenience, `:latest` for casual use. Generated
@@ -81,6 +82,29 @@ Why our own image, not Microsoft's:
 - The bootstrap concern (ADR 0005 — moon-ide must build
   inside its own container) gets a clean home: it's just a
   layer in moon-base's Dockerfile.
+
+### Registry: Docker Hub
+
+Published to **Docker Hub** at `huggingface/moon-base`, not
+GHCR or HF Hub. Trade-offs walked through:
+
+- **GHCR (rejected)**: ties the workspace's runtime base image
+  to a GitHub/Microsoft account. moon-ide already lives on
+  GitHub — having both source hosting _and_ the runtime image
+  go through the same vendor concentrates the dependency.
+  We'd rather not bake that into every team member's
+  `docker pull` path for a foundational artefact.
+- **Private Docker registry (rejected)**: image needs to be
+  public so contributors and downstream users can pull
+  without credential setup. Rules out anything self-hosted-and-
+  gated.
+- **HF Spaces "run locally" (rejected)**: HF Spaces only ship
+  `linux/amd64` artefacts; using them as the distribution
+  channel would lock arm64 (the primary target) out.
+- **Docker Hub (chosen)**: vendor-neutral relative to our
+  GitHub dependency, public, multi-arch-native, idiomatic
+  (`docker pull huggingface/moon-base` works without a
+  registry prefix, the syntax most teams already know).
 
 ## Why these two are bundled
 
@@ -147,11 +171,6 @@ Reversible, with cost.
 
 ## Open follow-ups
 
-- Image registry choice (GHCR vs. HF Hub) — defaulting to GHCR
-  because moon-ide is on GitHub and CI ergonomics are simplest
-  there. Reversible by changing the publish workflow + the
-  generated compose's image reference. Pin a final answer when
-  Phase 2.0 ships.
 - Whether `moon-base` becomes its own repo or stays in-tree.
   Lean: stay in-tree until "publish moon-base" outweighs
   "moon-ide and moon-base versions drift". The smoke test

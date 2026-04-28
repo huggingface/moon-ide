@@ -82,4 +82,4 @@ Any host operation can fail because the host is gone (container stopped, network
 
 - Whether to use `tower-lsp`'s client-side helpers or roll a thinner LSP client. Decide at Phase 4 start.
 - Whether `moon-core` should own its own tokio runtime or share Tauri's. Currently shares Tauri's.
-- `moon-base` image registry (GHCR vs. HF Hub) — currently leaning GHCR; finalised when Phase 2.0 publishes (see [ADR 0007](decisions/0007-compose-and-moon-base.md)).
+- Whether `moon-base` becomes its own repo or stays in-tree (see [ADR 0007](decisions/0007-compose-and-moon-base.md#open-follow-ups)). Registry is settled: Docker Hub at `huggingface/moon-base`.
