@@ -5,13 +5,18 @@ STATUS: planned — designed for Phase 2.
 ## Goal
 
 The user opens a workspace; moon-ide provisions a single Docker
-container that hosts the dev environment for **the whole
-workspace** (not for any single project inside it). All project
-tooling — terminals, LSPs, linters, formatters, build commands —
-runs inside that container; the IDE shell and workspace-level
-features (Slack, agents, the Tauri host) stay on the host.
+container that holds **the project's tooling** — terminals,
+LSPs, linters, formatters, build commands, the user's own
+`docker compose up` — for that workspace as a whole, not for
+any single project inside it.
 
-The goal is to make `bun dev`, `cargo run`, etc. work the same
+The IDE itself does not move into the container. The Tauri
+shell, moon-core, Slack, agent runtimes — everything that _is_
+moon-ide — stays host-side. The container is a sandbox the IDE
+shells into to run project commands; nothing about moon-ide's
+own runtime crosses into it.
+
+The point is to make `bun dev`, `cargo run`, etc. work the same
 on every team member's machine without polluting the host's
 ports, polluting the host's `apt` / `pip` / `npm` global state,
 or rediscovering the same Docker-in-Docker incantations every
@@ -260,13 +265,24 @@ state thrown away.
 | Build commands (`cargo`, `bun`, `npm`, `make`)         |                                | ✓                          |
 | `docker compose up` from the user's project            |                                | ✓ (via DinD)               |
 
-The split lines up with "is this about the project, or is this
-about the workspace?". Slack is workspace-level — credentials
-live in the OS keyring, not in the container. Agents talk to
-remote APIs; running them inside the container would force
-every API call through the container's network namespace for
-no upside. The user's own dev tooling is project-level — that's
-where the container earns its keep.
+The split is "host = the IDE; container = the project's
+tooling". Slack credentials live in the OS keyring; agent
+runtimes talk to remote APIs from the host (routing them
+through the container's network namespace would buy us
+nothing). The user's own tooling is project-level, and that's
+the container's entire job.
+
+There is **no persistent moon-ide process inside the container**
+— no agent, no socket, no companion daemon. Every
+container-side process is either the user's (a shell, a build,
+an LSP they configured) or a short-lived `docker exec` the host
+kicks off on demand. The container is a sandbox the IDE shells
+into; it is not a place the IDE lives. If a future workload
+genuinely benefits from a sandboxed long-running companion (a
+moon-core-as-server for cross-repo indexing, an agent runner we
+want network-isolated, etc.) it'll be a separately-introduced
+process colocated with the project tooling — and that decision
+gets made when the use case shows up, not before.
 
 ### When the project _is_ moon-ide
 
@@ -408,6 +424,17 @@ filesystem (SSH, Codespaces) and is preserved as the future
 is simpler, faster, and avoids shipping a static-musl binary
 into the user's container.
 
+What this looks like for terminals (Phase 3): the IDE
+allocates a host-side PTY via `portable-pty` and bridges it
+to a `docker exec -it <container> <user-shell>`. One
+`docker exec` per terminal pane; closing the pane terminates
+the exec, which reaps the inner shell as its child. There's
+no shared listener inside the container, no socket to
+multiplex, no terminal server. The same pattern applies to
+LSP launches (Phase 4) and lint/format sidecars (Phase 8) —
+they're all just `docker exec`s parented to host-side
+process handles.
+
 ## Frontend ↔ backend boundary
 
 New tauri commands (Phase 2.0):
@@ -418,7 +445,6 @@ New tauri commands (Phase 2.0):
 | `container_setup`                      | First-time bootstrap: write default `compose.yaml`, pull image, create + start. Idempotent.          |
 | `container_pause` / `container_resume` | Lifecycle hooks.                                                                                     |
 | `container_rebuild`                    | `down` + recreate. Drops in-container state.                                                         |
-| `container_open_dockerfile`            | Convenience: opens `<workspace>/.moon/Dockerfile` (or `compose.yaml`) in a new tab.                  |
 
 Push events:
 
