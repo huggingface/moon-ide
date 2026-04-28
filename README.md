@@ -43,31 +43,20 @@ See [specs/architecture.md](specs/architecture.md) for the high-level design and
 
 ## Prerequisites
 
-The team's primary platforms are **macOS on Apple Silicon** and
-**Linux** (x86_64 and arm64). Windows isn't supported — see
-[`specs/containers.md`](specs/containers.md#out-of-scope-for-phase-2-and-when-to-revisit).
+Supported hosts: **macOS on Apple Silicon** and **Linux** (x86_64 and arm64). Windows isn't supported.
 
 Common to both:
 
 - Rust 1.90+ (`rustup default stable`)
 - Node 20+ (we use 24)
 - Bun (preferred) or pnpm
-- Docker (Engine + Compose v2 on Linux, Docker Desktop on macOS — once Phase 2 lands the workspace's project tooling runs inside a container)
 
 ### macOS (Apple Silicon)
 
 ```bash
 xcode-select --install
-brew install rust bun docker
-# or use Docker Desktop for Mac with VirtIO file sharing enabled
+brew install rust bun
 ```
-
-The macOS Tauri build chain is host-side — the macOS WebKit framework
-shipped with Xcode CLT is what links against the app. The container
-covers everything else (lint, format, tests, the cross-built Linux
-artefact). See
-[`specs/decisions/0005-bootstrap.md`](specs/decisions/0005-bootstrap.md#per-host-bootstrap)
-for the per-host split.
 
 ### Linux
 
@@ -77,13 +66,7 @@ sudo apt install -y libwebkit2gtk-4.1-dev libsoup-3.0-dev libgtk-3-dev \
     libayatana-appindicator3-dev librsvg2-dev libssl-dev pkg-config
 ```
 
-WebKitGTK is required on the host **even after Phase 2 lands** — it's
-what the moon-ide Tauri binary loads as its webview when it starts.
-Phase 2 only moves the _project_ toolchain (lint, format, tests,
-project builds) into the container; the moon-ide binary itself stays
-host-native, so its runtime dependencies stay host-side. The Mac
-equivalent is "macOS ships its own WebKit" — neither platform escapes
-having a host-side webview library.
+WebKitGTK provides the webview the Tauri app loads at runtime, so this set is required at both build and launch time.
 
 ## Run
 
