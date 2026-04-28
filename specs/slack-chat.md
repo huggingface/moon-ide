@@ -382,10 +382,22 @@ back through `peekUser` in `previewOf`.
 truncation cuts mid-token: an unclosed `<` would otherwise leak as
 literal text into the row. The cut tail is replaced with an ellipsis.
 
-Out of scope: custom emoji (passed through as `:shortcode:`),
-channel name resolution (we trust Slack's `|name` cache and fall
-back to `#C123` when absent), Block Kit attachments / files / images
-(Phase 11.4+).
+Standard Unicode emoji shortcodes (`:tada:`, `:robot_face:`, …) are
+resolved by `src/lib/util/slackEmoji.ts` in a final tree-walk pass
+on the parser output. The resolver layers a small Slack-only alias
+table on top of `node-emoji` (Slack still uses the gemoji-era
+`_face` / `tools` / `thinking_face` names that CLDR has since
+renamed), and skips `code` / `codeblock` nodes so a literal `:foo:`
+inside source the bot pasted survives intact. Mention / link /
+channel _labels_ do go through the rewriter because Slack itself
+substitutes shortcodes inside them. Unknown names (typos, custom
+workspace emoji) pass through as the original `:shortcode:` text.
+
+Out of scope: custom workspace emoji (would need `emoji:read` and
+an `<img>` resolver — Phase 11.4+; we surface the raw `:shortcode:`
+until then), channel name resolution (we trust Slack's `|name`
+cache and fall back to `#C123` when absent), Block Kit attachments
+/ files / images (Phase 11.4+).
 
 ### Known limitations of the deferred markdown-block path
 

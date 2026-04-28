@@ -15,7 +15,9 @@
 // only carries the raw user ID — no async work in the parser.
 //
 // What this parser deliberately *does not* handle (yet):
-// - Custom emoji (`:tada:`) — passed through as text, font handles them.
+// - Custom workspace emoji — surfaced as their `:shortcode:` text;
+//   standard Unicode shortcodes (`:tada:`, `:robot_face:`, …) are
+//   resolved by `slackEmoji.emojify` in the post-parse tree walk.
 // - Lists / headers — Slack mrkdwn doesn't support them.
 // - Channel name resolution — we trust Slack's cached label
 //   (`<#C123|general>`) and fall back to `#C123` when missing.
@@ -23,6 +25,8 @@
 //   them; revisit if needed.
 //
 // [1]: https://api.slack.com/reference/surfaces/formatting
+
+import { emojify } from './slackEmoji';
 
 export type InlineNode =
 	| { type: 'text'; value: string }
@@ -72,7 +76,64 @@ export function parseSlackMrkdwn(raw: string): BlockNode[] {
 		blocks.push({ type: 'codeblock', value: decodeEntities(stripFenceLeadingNewline(code)) });
 		cursor = fenceEnd + 3;
 	}
-	return blocks;
+	return blocks.map(emojifyBlock);
+}
+
+/**
+ * Resolve `:shortcode:` emoji in every text-bearing node. Code spans
+ * and code blocks are skipped — bots habitually paste source that
+ * contains literal `:foo:` (e.g. `os.environ[":foo:"]`) and we must
+ * not mangle it. Mention/link/channel labels *are* rewritten because
+ * Slack itself substitutes shortcodes inside them.
+ */
+function emojifyBlock(block: BlockNode): BlockNode {
+	if (block.type === 'codeblock') {
+		return block;
+	}
+	return { type: block.type, children: emojifyInline(block.children) };
+}
+
+function emojifyInline(nodes: InlineNode[]): InlineNode[] {
+	return nodes.map(emojifyNode);
+}
+
+function emojifyNode(node: InlineNode): InlineNode {
+	// `code` / `date` carry no user-visible text we want to rewrite,
+	// so they pass through. Everything else either substitutes in a
+	// `value` / `label` field or recurses into formatted children.
+	if (node.type === 'text') {
+		return { type: 'text', value: emojify(node.value) };
+	}
+	if (node.type === 'bold' || node.type === 'italic' || node.type === 'strike') {
+		return { type: node.type, children: emojifyInline(node.children) };
+	}
+	if (node.type === 'link') {
+		return { type: 'link', url: node.url, label: emojifyLabel(node.label) };
+	}
+	if (node.type === 'userMention') {
+		return { type: 'userMention', userId: node.userId, label: emojifyLabel(node.label) };
+	}
+	if (node.type === 'channelMention') {
+		return {
+			type: 'channelMention',
+			channelId: node.channelId,
+			label: emojifyLabel(node.label),
+		};
+	}
+	if (node.type === 'broadcast') {
+		return { type: 'broadcast', kind: node.kind, label: emojifyLabel(node.label) };
+	}
+	if (node.type === 'usergroup') {
+		return { type: 'usergroup', id: node.id, label: emojifyLabel(node.label) };
+	}
+	return node;
+}
+
+function emojifyLabel(label: string | null): string | null {
+	if (label === null) {
+		return null;
+	}
+	return emojify(label);
 }
 
 /**

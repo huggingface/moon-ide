@@ -128,13 +128,39 @@ the raw `<@U…>` and `<https://…|label>` tokens were unreadable.
   preview should be the readable summary, not the flattened
   fallback).
 
+### Emoji shortcodes
+
+- A standard CLDR shortcode (`:tada:`, `:wave:`, `:rocket:`,
+  `:white_check_mark:`) renders as the matching glyph.
+- A Slack-only alias (`:robot_face:`, `:thumbsup:`, `:thumbsdown:`,
+  `:tools:`, `:thinking_face:`) also renders — the `SLACK_ALIASES`
+  table in `slackEmoji.ts` patches these, so 🤖 / 👍 / 👎 / 🛠️ / 🤔
+  appear instead of the raw text.
+- Multiple shortcodes in one message all resolve.
+- An unknown shortcode (typo, custom workspace emoji like
+  `:hf-pixel-logo:`) passes through verbatim — no broken glyph, no
+  swallowed text. Custom emoji rendering is Phase 11.4+.
+- A literal colon-bracketed string inside an inline code span (e.g.
+  `` `os.environ[":wave:"]` ``) or a fenced code block stays as the
+  literal text — we never substitute inside code so pasted source
+  survives.
+- Emoji inside mention / link / channel _labels_ (`<@U1|alice :wave:>`,
+  `<https://x.com|hi :tada:>`) render the glyph in the label — Slack
+  itself substitutes there too.
+- A formatted run that surrounds emoji (`*shipped :rocket:*`)
+  renders as bold-with-glyph, not bold-with-shortcode-text.
+- Session-list previews resolve emoji too (the same flatten path
+  runs through `parseSlackMrkdwn`).
+
 ### Unit tests
 
 - `bun run test:js` exercises the frontend parser end-to-end:
   `src/lib/util/slackMrkdwn.test.ts` covers formatting rules,
-  angle-token shapes, entity decoding, mention collection, and the
-  preview flatten path (including dangling-token trimming).
-  Re-run after any change to `slackMrkdwn.ts`.
+  angle-token shapes, entity decoding, mention collection, the
+  preview flatten path (including dangling-token trimming), and the
+  emoji-shortcode pass (known + Slack-aliased + unknown, code-skip,
+  label substitution). Re-run after any change to `slackMrkdwn.ts`
+  or `slackEmoji.ts`.
 - `cargo test -p moon-slack` covers Block Kit extraction (`section`
   / `markdown` / `divider`, fallback to `text`, `rich_text`
   skipping, mrkdwn-vs-plain_text) — see `crates/moon-slack/src/client.rs`
@@ -143,7 +169,12 @@ the raw `<@U…>` and `<https://…|label>` tokens were unreadable.
 
 ## Known limitations
 
-- Custom emoji (`:tada:`) render as their `:shortcode:` text.
+- Custom workspace emoji (e.g. `:hf-pixel-logo:`) render as their
+  `:shortcode:` text — we don't fetch `emoji.list`. Phase 11.4+.
+- Skin-tone modifier suffixes (`:wave::skin-tone-2:`) render as the
+  base glyph followed by the literal `:skin-tone-2:` shortcode.
+  Stitching the modifier onto the base would require parsing the
+  full Unicode joiner sequence; skipped until requested.
 - Channel names without Slack-cached labels show `#C…` instead of
   the human name. Adding a `conversations.info` lookup would mean a
   second async cache and more API calls; skipped until requested.

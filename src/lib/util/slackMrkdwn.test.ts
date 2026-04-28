@@ -388,3 +388,74 @@ describe('slackPlainText', () => {
 		expect(slackPlainText('Tom &amp; Jerry')).toBe('Tom & Jerry');
 	});
 });
+
+describe('parseSlackMrkdwn — emoji shortcodes', () => {
+	it('replaces a known shortcode with the matching glyph', () => {
+		const inline = singleText(parseSlackMrkdwn('hi :wave:'));
+		expect(inline).toEqual([{ type: 'text', value: 'hi 👋' }]);
+	});
+
+	it('replaces a Slack-only alias (`:robot_face:` → 🤖)', () => {
+		const inline = singleText(parseSlackMrkdwn('beep :robot_face: boop'));
+		expect(inline).toEqual([{ type: 'text', value: 'beep 🤖 boop' }]);
+	});
+
+	it('replaces multiple shortcodes in one segment', () => {
+		const inline = singleText(parseSlackMrkdwn('shipping :rocket: with :tada:'));
+		expect(inline).toEqual([{ type: 'text', value: 'shipping 🚀 with 🎉' }]);
+	});
+
+	it('passes unknown shortcodes through unchanged', () => {
+		const inline = singleText(parseSlackMrkdwn('custom :totally_not_a_real_emoji: here'));
+		expect(inline).toEqual([{ type: 'text', value: 'custom :totally_not_a_real_emoji: here' }]);
+	});
+
+	it('substitutes inside formatted runs', () => {
+		const inline = singleText(parseSlackMrkdwn('*pumped :tada:*'));
+		expect(inline).toEqual([{ type: 'bold', children: [{ type: 'text', value: 'pumped 🎉' }] }]);
+	});
+
+	it('skips inline code spans', () => {
+		const inline = singleText(parseSlackMrkdwn('use `os.environ[":wave:"]` literally'));
+		expect(inline).toEqual([
+			{ type: 'text', value: 'use ' },
+			{ type: 'code', value: 'os.environ[":wave:"]' },
+			{ type: 'text', value: ' literally' },
+		]);
+	});
+
+	it('skips fenced code blocks', () => {
+		const blocks = parseSlackMrkdwn('```\n:wave: stays as text\n```');
+		expect(blocks).toEqual([{ type: 'codeblock', value: ':wave: stays as text\n' }]);
+	});
+
+	it('substitutes inside link labels but not URLs', () => {
+		const inline = singleText(parseSlackMrkdwn('go <https://example.com/:wave:|wave :wave:>'));
+		expect(inline).toEqual([
+			{ type: 'text', value: 'go ' },
+			{ type: 'link', url: 'https://example.com/:wave:', label: 'wave 👋' },
+		]);
+	});
+
+	it('substitutes inside mention labels', () => {
+		const inline = singleText(parseSlackMrkdwn('hi <@U1|alice :wave:>'));
+		expect(inline).toEqual([
+			{ type: 'text', value: 'hi ' },
+			{ type: 'userMention', userId: 'U1', label: 'alice 👋' },
+		]);
+	});
+
+	it('substitutes inside quote blocks', () => {
+		const inline = singleQuote(parseSlackMrkdwn('> shipped :rocket:'));
+		expect(inline).toEqual([{ type: 'text', value: 'shipped 🚀' }]);
+	});
+
+	it('flows through slackPlainText with shortcodes resolved', () => {
+		expect(slackPlainText('shipped :rocket: with :tada:')).toBe('shipped 🚀 with 🎉');
+	});
+
+	it('leaves a stray colon alone', () => {
+		const inline = singleText(parseSlackMrkdwn('time: 12:34'));
+		expect(inline).toEqual([{ type: 'text', value: 'time: 12:34' }]);
+	});
+});
