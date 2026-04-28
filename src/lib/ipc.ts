@@ -61,5 +61,7 @@ export const ipc = {
 		setActiveThread: (threadTs: string | null) => invoke<void>('slack_set_active_thread', { threadTs }),
 		getUser: (userId: string) => invoke<SlackUserSummary>('slack_get_user', { userId }),
 		markRead: (channel: string, ts: string) => invoke<void>('slack_mark_read', { channel, ts }),
+		postMessage: (channel: string, threadTs: string | null, text: string) =>
+			invoke<SlackMessage>('slack_post_message', { channel, threadTs, text }),
 	},
 } as const;

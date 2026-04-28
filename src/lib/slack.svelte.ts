@@ -111,6 +111,21 @@ class SlackPanelState {
 	activeThreadTs = $state<string | null>(null);
 
 	/**
+	 * Whether the user is composing a fresh top-level message — not
+	 * inside any existing session. Toggled by the panel's
+	 * "+ New session" button. Hides the session list and shows an
+	 * empty composer; the first successful post pivots to the
+	 * resulting `thread_ts`. Frontend-only; not persisted.
+	 */
+	composingNewSession = $state(false);
+
+	/** UI flag while `slack_post_message` is in flight. */
+	sending = $state(false);
+
+	/** Latest send error; cleared on successful post or composer close. */
+	sendError = $state<string | null>(null);
+
+	/**
 	 * Messages of the active thread (parent + replies, oldest-first).
 	 * `null` before the first load — the panel renders a "Loading
 	 * thread…" affordance while we fetch.
@@ -491,6 +506,83 @@ class SlackPanelState {
 	}
 
 	/**
+	 * Send a message as the connected user. Top-level when
+	 * `composingNewSession` is set (resulting `thread_ts` becomes
+	 * the new active thread); a reply otherwise.
+	 *
+	 * Returns `true` on success so callers can clear the input box.
+	 * The error path stores the message in `sendError` and leaves
+	 * the input untouched so the user doesn't lose their typing.
+	 */
+	async sendMessage(text: string): Promise<boolean> {
+		const trimmed = text.trim();
+		if (trimmed.length === 0) {
+			return false;
+		}
+		const bot = this.activeBot;
+		if (bot === null) {
+			this.sendError = 'No bot selected';
+			return false;
+		}
+		const channel = bot.dm_channel_id;
+		const replyTo = this.composingNewSession ? null : this.activeThreadTs;
+		this.sending = true;
+		this.sendError = null;
+		const generation = this.#threadGeneration;
+		try {
+			const message = await ipc.slack.postMessage(channel, replyTo, trimmed);
+			if (replyTo === null) {
+				// New session: pivot the panel into the freshly
+				// created thread, refresh the sessions list so the
+				// new row shows up at the top, and let the polling
+				// loop take over from here.
+				this.composingNewSession = false;
+				this.threadMessages = [message];
+				this.activeThreadTs = message.ts;
+				void ipc.slack.setActiveThread(message.ts).catch(() => {});
+				void this.loadSessions();
+			} else if (generation === this.#threadGeneration && replyTo === this.activeThreadTs) {
+				// Reply: append optimistically. The next poll tick
+				// sees the same `(ts, edited_ts)` fingerprint and
+				// no-ops, so this won't visibly flicker. If the user
+				// has already moved to a different thread by the
+				// time we land, the generation check protects us.
+				const current = this.threadMessages ?? [];
+				this.threadMessages = [...current, message];
+			}
+			return true;
+		} catch (err) {
+			this.sendError = formatError(err);
+			return false;
+		} finally {
+			this.sending = false;
+		}
+	}
+
+	/**
+	 * Open the new-session composer. Closes any open thread so the
+	 * panel renders the empty composer state.
+	 */
+	startNewSession(): void {
+		this.composingNewSession = true;
+		this.activeThreadTs = null;
+		this.threadMessages = null;
+		this.threadError = null;
+		this.sendError = null;
+		this.#threadGeneration += 1;
+		void ipc.slack.setActiveThread(null).catch(() => {});
+	}
+
+	/**
+	 * Cancel the new-session composer without sending. Returns to
+	 * the session list. Clears any pending send error.
+	 */
+	cancelNewSession(): void {
+		this.composingNewSession = false;
+		this.sendError = null;
+	}
+
+	/**
 	 * Pure read of the user-cache entry. Safe to call from `$derived`
 	 * or template expressions — never mutates state, never triggers a
 	 * network call. Returns `undefined` when the user has never been
@@ -648,6 +740,9 @@ class SlackPanelState {
 		this.threadMessages = null;
 		this.loadingThread = false;
 		this.threadError = null;
+		this.composingNewSession = false;
+		this.sending = false;
+		this.sendError = null;
 	}
 }
 

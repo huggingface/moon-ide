@@ -153,7 +153,7 @@ impl PollerHandle {
 	fn update<F: FnOnce(&mut PollerInputs)>(&self, f: F) {
 		{
 			let mut guard = self.inputs.lock().expect("poller inputs mutex poisoned");
-			f(&mut *guard);
+			f(&mut guard);
 		}
 		self.wakeup.notify_one();
 	}
@@ -189,7 +189,14 @@ pub fn spawn(
 		last_activity_at: Instant::now(),
 		last_marked_ts: None,
 	};
-	tokio::spawn(task.run());
+	// `tauri::async_runtime::spawn` rather than `tokio::spawn` —
+	// `setup` runs synchronously, *before* the tokio runtime is
+	// bound to the current thread. `tokio::spawn` panics with
+	// "there is no reactor running" in that context, even though
+	// the runtime itself exists (every async command call later
+	// happily uses it). Tauri's wrapper drops the task onto the
+	// same tokio runtime via the right entry point.
+	tauri::async_runtime::spawn(task.run());
 	handle
 }
 

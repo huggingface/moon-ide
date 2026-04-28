@@ -42,7 +42,7 @@ pub struct SlackState {
 impl SlackState {
 	pub fn new(client: Arc<RwLock<Option<SlackClient>>>, poller: PollerHandle) -> Self {
 		Self {
-			tokens: TokenStore::default(),
+			tokens: TokenStore,
 			client,
 			poller,
 		}

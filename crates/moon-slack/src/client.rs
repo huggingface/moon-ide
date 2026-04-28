@@ -176,6 +176,42 @@ impl SlackClient {
 		Ok(body.messages.into_iter().map(to_message).collect())
 	}
 
+	/// Post a message as the authenticated user. Wraps
+	/// [`chat.postMessage`](https://api.slack.com/methods/chat.postMessage).
+	///
+	/// `thread_ts` is the parent's `ts` for a reply, or `None` to
+	/// start a new top-level message. The returned [`SlackMessage`]
+	/// carries the `ts` Slack assigned — the frontend uses it to
+	/// pivot to the freshly-created session (when `thread_ts` was
+	/// `None`) or to optimistically append to the open thread.
+	///
+	/// We send `text` as Slack mrkdwn (the user types `*bold*`, not
+	/// HTML / Markdown). Slack auto-renders mrkdwn for messages
+	/// posted via `chat.postMessage` as long as `mrkdwn: true` (the
+	/// default for user tokens); we don't override.
+	///
+	/// Requires `chat:write`, granted upfront in the connect modal.
+	pub async fn post_message(
+		&self,
+		channel: &str,
+		thread_ts: Option<&str>,
+		text: &str,
+	) -> Result<SlackMessage, SlackError> {
+		let body = ChatPostMessageRequest {
+			channel,
+			text,
+			thread_ts,
+		};
+		let resp: ChatPostMessageResponse = self.call_post_json("chat.postMessage", &body).await?;
+		// Slack returns the synthesised message including the bot
+		// rendering of our mrkdwn (Block Kit `rich_text`). We only
+		// need `to_message`'s normalised view of it — the same
+		// post-process every other path goes through, so the
+		// reconciliation logic on the frontend can treat the result
+		// identically to a polled snapshot.
+		Ok(to_message(resp.message))
+	}
+
 	/// `conversations.mark` — clear the unread badge for `channel` up
 	/// to `ts`. Used by the polling loop on view / session-switch /
 	/// focused-tick-with-new-content so the user's other Slack clients
@@ -239,11 +275,31 @@ impl SlackClient {
 
 	async fn call<R: for<'de> Deserialize<'de>>(&self, method: &str, params: &[(&str, &str)]) -> Result<R, SlackError> {
 		let url = format!("{SLACK_API_BASE}/{method}");
-		let response = self
-			.http
-			.get(&url)
-			.bearer_auth(&self.token)
-			.query(params)
+		let request = self.http.get(&url).bearer_auth(&self.token).query(params);
+		self.execute(request, method).await
+	}
+
+	/// `POST application/json` variant of [`Self::call`]. Used by
+	/// methods where the body would be cumbersome on the query
+	/// string (`chat.postMessage`'s `text` is the obvious one — long
+	/// bot prompts blow past common URL length caps and would also
+	/// need careful encoding for `+` / `&` / newlines).
+	async fn call_post_json<B: Serialize + ?Sized, R: for<'de> Deserialize<'de>>(
+		&self,
+		method: &str,
+		body: &B,
+	) -> Result<R, SlackError> {
+		let url = format!("{SLACK_API_BASE}/{method}");
+		let request = self.http.post(&url).bearer_auth(&self.token).json(body);
+		self.execute(request, method).await
+	}
+
+	async fn execute<R: for<'de> Deserialize<'de>>(
+		&self,
+		request: reqwest::RequestBuilder,
+		method: &str,
+	) -> Result<R, SlackError> {
+		let response = request
 			.send()
 			.await
 			.map_err(|err| SlackError::Transport(err.to_string()))?;
@@ -357,6 +413,23 @@ struct ConversationsHistoryResponse {
 #[derive(Debug, Deserialize)]
 struct ConversationsRepliesResponse {
 	messages: Vec<RawMessage>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatPostMessageRequest<'a> {
+	channel: &'a str,
+	text: &'a str,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	thread_ts: Option<&'a str>,
+}
+
+/// Trimmed [`chat.postMessage`](https://api.slack.com/methods/chat.postMessage)
+/// response. The full envelope also includes the team / channel IDs
+/// (which we already know) and a `response_metadata` block we don't
+/// surface; only `message` carries the data the frontend needs.
+#[derive(Debug, Deserialize)]
+struct ChatPostMessageResponse {
+	message: RawMessage,
 }
 
 /// Subset of Slack's `objects.Message`. Only the fields we touch are
@@ -924,6 +997,60 @@ mod tests {
 		}"#;
 		let msg = to_message(serde_json::from_str(json).unwrap());
 		assert_eq!(msg.text, "**bold** and a [link](https://x.io)");
+	}
+
+	#[test]
+	fn post_message_request_omits_thread_ts_for_top_level() {
+		// Top-level post: `thread_ts` MUST be absent rather than
+		// `null` — Slack treats `thread_ts: null` as "reply to thread
+		// null" and rejects with `invalid_thread_ts`.
+		let req = ChatPostMessageRequest {
+			channel: "C123",
+			text: "hi",
+			thread_ts: None,
+		};
+		let json = serde_json::to_string(&req).unwrap();
+		assert_eq!(json, r#"{"channel":"C123","text":"hi"}"#);
+	}
+
+	#[test]
+	fn post_message_request_includes_thread_ts_for_replies() {
+		let req = ChatPostMessageRequest {
+			channel: "C123",
+			text: "hi",
+			thread_ts: Some("1700000000.000100"),
+		};
+		let json = serde_json::to_string(&req).unwrap();
+		assert_eq!(
+			json,
+			r#"{"channel":"C123","text":"hi","thread_ts":"1700000000.000100"}"#
+		);
+	}
+
+	#[test]
+	fn post_message_response_yields_a_normalised_slack_message() {
+		// Slack echoes back our text plus the `rich_text` block it
+		// builds for rendering. `to_message` skips `rich_text` and
+		// falls back to the `text` field — same behaviour as a polled
+		// human reply, so the frontend reconciliation path is
+		// uniform.
+		let json = r#"{
+			"ok": true,
+			"message": {
+				"ts": "1700000010.000900",
+				"user": "U1",
+				"text": "hello *world*",
+				"blocks": [
+					{ "type": "rich_text", "elements": [] }
+				]
+			}
+		}"#;
+		let resp: ChatPostMessageResponse = serde_json::from_str(json).unwrap();
+		let msg = to_message(resp.message);
+		assert_eq!(msg.ts, "1700000010.000900");
+		assert_eq!(msg.text, "hello *world*");
+		assert_eq!(msg.user_id.as_deref(), Some("U1"));
+		assert!(!msg.is_bot);
 	}
 
 	#[test]

@@ -214,6 +214,28 @@ pub async fn slack_mark_read(state: State<'_, AppState>, channel: String, ts: St
 	client.mark_as_read(&channel, &ts).await.map_err(MoonError::from)
 }
 
+/// Post a message as the connected user. `thread_ts = None` starts
+/// a new top-level message (a new session in panel terms);
+/// `thread_ts = Some(ts)` posts a reply inside the open thread.
+/// Returns the freshly-created [`SlackMessage`] so the frontend can
+/// pivot to the new session (top-level case) or reconcile its
+/// optimistic UI without waiting for the next poll tick.
+#[tauri::command]
+pub async fn slack_post_message(
+	state: State<'_, AppState>,
+	channel: String,
+	thread_ts: Option<String>,
+	text: String,
+) -> Result<SlackMessage, MoonError> {
+	let Some(client) = state.slack.current_client().await else {
+		return Err(MoonError::HostUnavailable("slack: not connected".into()));
+	};
+	client
+		.post_message(&channel, thread_ts.as_deref(), &text)
+		.await
+		.map_err(MoonError::from)
+}
+
 /// Resolve a single `<@U…>` mention to a [`SlackUserSummary`]. Wraps
 /// `users.info`. Frontend caches the result per `user_id`, so this
 /// command fires at most once per distinct mentioned user per

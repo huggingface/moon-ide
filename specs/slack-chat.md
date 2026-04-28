@@ -510,6 +510,50 @@ Phase 11.0 doesn't ship this — it lands in 11.2 alongside the
 polling loop. The `im:write` scope is already in the upfront grant
 so the user doesn't reinstall.
 
+## Sending messages (Phase 11.3)
+
+The composer is a fixed-bottom textarea, plus a Send button.
+**Ctrl+Enter** (or **Cmd+Enter** on macOS) fires
+`slack_post_message`; plain Enter inserts a newline (matching
+Slack's own composer — multi-line code snippets and paragraphs
+need it). Esc cancels the new-session composer and returns to the
+session list. The composer disables itself while `chat.postMessage`
+is in flight; on success the textarea clears, on failure the draft
+sticks around with a small error line above the input.
+
+Two posting modes:
+
+- **Reply** — there's an active thread (`activeThreadTs !== null`)
+  and the composer is below the message list. The post carries
+  `thread_ts = activeThreadTs`. The frontend appends the returned
+  `SlackMessage` to `threadMessages` immediately (optimistic). The
+  next poll tick sees the same `(ts, edited_ts)` fingerprint and
+  no-ops, so there's no flicker.
+- **New session** — `+ New session` toggles
+  `composingNewSession = true`, hiding the session list and showing
+  an empty composer. The post is top-level (`thread_ts = None`).
+  On success, the panel pivots into the new thread:
+  `activeThreadTs` becomes the returned `ts`, `threadMessages`
+  becomes `[message]`, and `loadSessions()` is re-run so the new
+  row shows up at the top of the session list. The poller's
+  `set_active_thread_ts` is updated through the existing
+  `slack_set_active_thread` path, so the cadence ladder kicks in
+  immediately.
+
+We deliberately do _not_ render the user's optimistic message
+with a "sending..." pip — the API call is fast enough (~200 ms)
+that the round-trip feels instant, and adding a separate "in
+flight" UI state for that brief window costs more than it pays.
+A failed post leaves the draft in the textarea with the error
+above; the user retries with another Ctrl+Enter.
+
+Slack's `chat.postMessage` accepts mrkdwn directly (the API doc
+calls it `text`, but renders `*bold*`, `<https://x|y>`, code
+fences, etc., the same way it renders incoming messages). We
+don't translate the user's input — what they type is what the
+bot sees, and what they see in the rendered bubble after
+reconciliation.
+
 ## UI placement
 
 A right-side panel docked to the editor area. Resizable horizontal
@@ -571,23 +615,23 @@ message bodies.
 
 Tauri commands in `src-tauri/src/commands/slack.rs`:
 
-| Command                                        | Purpose                                              |
-| ---------------------------------------------- | ---------------------------------------------------- |
-| `slack_set_token(token)`                       | Validate, persist to keyring, return `SlackIdentity` |
-| `slack_status()`                               | `connected: bool`, identity if connected             |
-| `slack_clear_token()`                          | Drop keyring entry; return to disconnected state     |
-| `slack_list_dm_bots()`                         | Scan user's DMs, return the bot users among them     |
-| `slack_select_bot(profile)`                    | Persist user's pick into `AppState.slack.active_bot` |
-| `slack_clear_bot()`                            | Drop the saved pick; trigger picker on next render   |
-| `slack_get_active_bot()`                       | Read the persisted bot pick, if any                  |
-| `slack_set_panel_visible(visible)`             | Persist the chat panel's open/closed state           |
-| `slack_set_window_focused(focused)` (11.2)     | OS focus signal for the read-receipt gate            |
-| `slack_list_sessions(channel)`                 | `conversations.history` filtered to top-level        |
-| `slack_get_thread(channel, ts)`                | `conversations.replies` for one thread               |
-| `slack_set_active_thread(thread_ts \| null)`   | Persist the open thread in `AppState.slack`          |
-| `slack_get_user(user_id)`                      | `users.info` — resolve a `<@U…>` mention             |
-| `slack_post(channel, thread_ts?, text)` (11.3) | Post a message                                       |
-| `slack_mark_read(channel, ts)` (11.2)          | `conversations.mark`                                 |
+| Command                                                | Purpose                                              |
+| ------------------------------------------------------ | ---------------------------------------------------- |
+| `slack_set_token(token)`                               | Validate, persist to keyring, return `SlackIdentity` |
+| `slack_status()`                                       | `connected: bool`, identity if connected             |
+| `slack_clear_token()`                                  | Drop keyring entry; return to disconnected state     |
+| `slack_list_dm_bots()`                                 | Scan user's DMs, return the bot users among them     |
+| `slack_select_bot(profile)`                            | Persist user's pick into `AppState.slack.active_bot` |
+| `slack_clear_bot()`                                    | Drop the saved pick; trigger picker on next render   |
+| `slack_get_active_bot()`                               | Read the persisted bot pick, if any                  |
+| `slack_set_panel_visible(visible)`                     | Persist the chat panel's open/closed state           |
+| `slack_set_window_focused(focused)` (11.2)             | OS focus signal for the read-receipt gate            |
+| `slack_list_sessions(channel)`                         | `conversations.history` filtered to top-level        |
+| `slack_get_thread(channel, ts)`                        | `conversations.replies` for one thread               |
+| `slack_set_active_thread(thread_ts \| null)`           | Persist the open thread in `AppState.slack`          |
+| `slack_get_user(user_id)`                              | `users.info` — resolve a `<@U…>` mention             |
+| `slack_post_message(channel, thread_ts?, text)` (11.3) | Post a message; returns the new `SlackMessage`       |
+| `slack_mark_read(channel, ts)` (11.2)                  | `conversations.mark`                                 |
 
 Push events from backend → frontend (11.2):
 

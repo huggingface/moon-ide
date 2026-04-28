@@ -97,15 +97,28 @@
 		return session.reply_count > 0 ? '(no preview, see thread)' : '(empty message)';
 	}
 
-	function senderLabel(userId: string | null, isBot: boolean): string {
-		if (isBot) {
-			return slack.activeBot ? botLabel(slack.activeBot) : 'Bot';
-		}
-		if (userId !== null && userId === slack.status?.identity?.user_id) {
+	// Slack attaches `bot_id` to messages posted via `chat.postMessage`
+	// from a *user* token if the token belongs to an app — and our
+	// `xoxp-…` flow installs exactly such an app. So our own outbound
+	// messages come back with `is_bot=true` (via `to_message`'s
+	// `bot_id.is_some()` heuristic). To avoid mis-attributing them
+	// to moonbot, "is this me?" wins over "is this a bot service?":
+	// we check `user_id == self.user_id` first, and only fall back
+	// to the bot label if it really isn't us.
+	function isOwnMessage(message: { user_id: string | null }): boolean {
+		const self = slack.status?.identity?.user_id ?? null;
+		return self !== null && message.user_id === self;
+	}
+
+	function senderLabel(message: { user_id: string | null; is_bot: boolean }): string {
+		if (isOwnMessage(message)) {
 			return 'You';
 		}
-		if (userId !== null) {
-			return resolveCachedUser(userId) ?? userId;
+		if (message.is_bot) {
+			return slack.activeBot ? botLabel(slack.activeBot) : 'Bot';
+		}
+		if (message.user_id !== null) {
+			return resolveCachedUser(message.user_id) ?? message.user_id;
 		}
 		return 'Unknown';
 	}
@@ -170,6 +183,52 @@
 			// the click handler.
 		}
 	}
+
+	// --- Composer ----------------------------------------------------------
+	let draft = $state('');
+	let composer: HTMLTextAreaElement | null = $state(null);
+
+	function onStartNewSession() {
+		slack.startNewSession();
+		draft = '';
+		// Focus the composer once Svelte mounts it. `tick()` would
+		// also work but `setTimeout(0)` is enough — the bind:this
+		// lands on the same microtask the new-session block paints.
+		queueMicrotask(() => composer?.focus());
+	}
+
+	function onCancelNewSession() {
+		slack.cancelNewSession();
+		draft = '';
+	}
+
+	async function onSubmitDraft() {
+		const ok = await slack.sendMessage(draft);
+		if (ok) {
+			draft = '';
+		}
+	}
+
+	// Ctrl/Cmd+Enter sends; plain Enter inserts a newline (matches
+	// Slack's own composer). Shift+Enter is also a newline. Esc cancels
+	// the new-session composer.
+	function onComposerKeydown(event: KeyboardEvent) {
+		if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+			event.preventDefault();
+			void onSubmitDraft();
+			return;
+		}
+		if (event.key === 'Escape' && slack.composingNewSession) {
+			event.preventDefault();
+			onCancelNewSession();
+		}
+	}
+
+	const composerPlaceholder = $derived(
+		slack.composingNewSession ? 'Start a new conversation — Ctrl+Enter to send' : 'Reply — Ctrl+Enter to send',
+	);
+	const composerDisabled = $derived(slack.sending);
+	const sendDisabled = $derived(slack.sending || draft.trim().length === 0);
 </script>
 
 <aside class="chat-panel" data-region="chat" aria-label="Chat panel">
@@ -222,17 +281,34 @@
 					</header>
 				</section>
 
-				{#if slack.activeThreadTs === null}
+				{#if slack.composingNewSession}
+					<section class="card thread-card composer-card">
+						<header class="section-header">
+							<button type="button" class="back-button" onclick={onCancelNewSession} title="Back to sessions">
+								← Cancel
+							</button>
+							<span class="section-title">New session</span>
+						</header>
+						<p class="card-detail">
+							Posting will create a new top-level message in your DM with
+							<strong>{botLabel(slack.activeBot)}</strong>. The reply lands as a thread under it — moon-bot, Cursor and
+							similar bots are designed for that.
+						</p>
+					</section>
+				{:else if slack.activeThreadTs === null}
 					<section class="card sessions-card">
 						<header class="section-header">
 							<span class="section-title">Sessions</span>
-							<button
-								type="button"
-								class="link"
-								onclick={onRefreshSessions}
-								disabled={slack.loadingSessions}
-								title="Reload sessions">Refresh</button
-							>
+							<div class="header-actions">
+								<button type="button" class="primary-link" onclick={onStartNewSession}>+ New session</button>
+								<button
+									type="button"
+									class="link"
+									onclick={onRefreshSessions}
+									disabled={slack.loadingSessions}
+									title="Reload sessions">Refresh</button
+								>
+							</div>
 						</header>
 						{#if slack.loadingSessions && slack.sessions === null}
 							<div class="muted-row">
@@ -243,9 +319,8 @@
 							<p class="card-error">{slack.sessionsError}</p>
 						{:else if slack.sessions && slack.sessions.length === 0}
 							<p class="card-detail">
-								No sessions yet. Start one by DMing
-								<strong>{botLabel(slack.activeBot)}</strong>
-								from regular Slack — sending will land in the IDE in 11.3.
+								No sessions yet. Click <strong>+ New session</strong> above to start your first conversation with
+								<strong>{botLabel(slack.activeBot)}</strong>.
 							</p>
 						{:else if slack.sessions}
 							<ul class="session-list">
@@ -298,9 +373,9 @@
 						{:else if slack.threadMessages}
 							<ol class="message-list">
 								{#each slack.threadMessages as message (message.ts)}
-									<li class="message" class:from-bot={message.is_bot}>
+									<li class="message" class:from-bot={message.is_bot && !isOwnMessage(message)}>
 										<header class="message-header">
-											<span class="message-author">{senderLabel(message.user_id, message.is_bot)}</span>
+											<span class="message-author">{senderLabel(message)}</span>
 											<span class="message-time">
 												{formatSlackTime(message.ts)}
 												{#if message.edited_ts}
@@ -327,6 +402,32 @@
 								{/each}
 							</ol>
 						{/if}
+					</section>
+				{/if}
+
+				{#if slack.composingNewSession || slack.activeThreadTs !== null}
+					<section class="composer">
+						{#if slack.sendError}
+							<p class="composer-error">{slack.sendError}</p>
+						{/if}
+						<div class="composer-row">
+							<textarea
+								bind:this={composer}
+								bind:value={draft}
+								placeholder={composerPlaceholder}
+								disabled={composerDisabled}
+								onkeydown={onComposerKeydown}
+								rows="3"
+								class="composer-input"
+							></textarea>
+							<button
+								type="button"
+								class="primary composer-send"
+								disabled={sendDisabled}
+								onclick={() => void onSubmitDraft()}
+								title="Send (Ctrl+Enter)">{slack.sending ? 'Sending…' : 'Send'}</button
+							>
+						</div>
 					</section>
 				{/if}
 			{:else if slack.loadingBots}
@@ -611,6 +712,73 @@
 		text-transform: uppercase;
 		letter-spacing: 0.04em;
 		color: var(--m-fg-muted);
+	}
+	.header-actions {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+	.primary-link {
+		font: inherit;
+		font-size: 11px;
+		font-weight: 600;
+		background: transparent;
+		color: var(--m-accent);
+		border: 0;
+		padding: 0;
+		cursor: pointer;
+	}
+	.primary-link:hover {
+		text-decoration: underline;
+	}
+	.composer {
+		flex-shrink: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		padding: 10px 12px;
+		border-top: 1px solid var(--m-border);
+		background: var(--m-bg-1);
+	}
+	.composer-row {
+		display: flex;
+		align-items: flex-end;
+		gap: 8px;
+	}
+	.composer-input {
+		flex: 1;
+		min-height: 56px;
+		max-height: 200px;
+		resize: vertical;
+		font: inherit;
+		font-size: 12px;
+		line-height: 1.4;
+		padding: 8px 10px;
+		background: var(--m-bg-0);
+		color: var(--m-fg);
+		border: 1px solid var(--m-border);
+		border-radius: 6px;
+		outline: none;
+	}
+	.composer-input:focus {
+		border-color: var(--m-accent);
+	}
+	.composer-input:disabled {
+		opacity: 0.6;
+		cursor: not-allowed;
+	}
+	.composer-send {
+		flex-shrink: 0;
+		font-size: 12px;
+		padding: 8px 14px;
+	}
+	.composer-error {
+		margin: 0;
+		font-size: 11px;
+		color: var(--m-danger, #f08080);
+	}
+	.composer-card .card-detail {
+		margin: 0;
 	}
 	.muted-row {
 		display: flex;

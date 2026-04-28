@@ -51,6 +51,7 @@ pub fn run() {
 			commands::slack::slack_set_active_thread,
 			commands::slack::slack_get_user,
 			commands::slack::slack_mark_read,
+			commands::slack::slack_post_message,
 		])
 		.setup(|app| {
 			let config_dir = app
@@ -68,7 +69,7 @@ pub fn run() {
 			let poller = slack_poller::spawn(
 				app.handle().clone(),
 				client_cell.clone(),
-				TokenStore::default(),
+				TokenStore,
 				config_dir.clone(),
 			);
 			let slack_state = state::SlackState::new(client_cell, poller.clone());
