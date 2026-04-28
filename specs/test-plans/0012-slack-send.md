@@ -24,10 +24,16 @@ start a fresh top-level thread. Detailed design lives in
   - **Enter** sends; **Shift+Enter** inserts a newline;
     **Ctrl/Cmd+Enter** also sends (muscle-memory carry-over from
     other tools); **Esc** cancels the new-session composer.
-  - Disabled while a post is in flight; shows "Sending…" on the
-    Send button.
+  - Disabled while a post is in flight (the textarea greys out
+    and rejects keypresses; no send button to click).
   - Send error renders inline above the textarea; draft is
     preserved so the user can retry.
+  - Auto-grows from 1-line height up to a 120 px cap as the user
+    types; shrinks back when lines are deleted.
+  - Pinned to the bottom of the panel via the `connected-scroll`
+    - `composer` flex split — empty thread space lives above
+      the textarea, never between the textarea and the bottom of
+      the window.
 - "+ New session" button at the top of the session list when no
   thread is open. Toggles `composingNewSession`; first post pivots
   the panel into the new thread (sets `activeThreadTs` to the
@@ -62,14 +68,13 @@ start a fresh top-level thread. Detailed design lives in
 
 1. Click any session in the list. Wait for messages to load.
 2. The textarea appears below the message list with placeholder
-   "Reply — Enter to send, Shift+Enter for a new line". Click
-   into it.
+   `Reply…`. Click into it.
 3. Type `hello world`. Press **Enter**.
-   - Expected: the textarea clears, the user's message appears
-     immediately at the bottom of the message list with the
-     **"You"** label (a `formatSlackTime` stamp, plain text body,
-     no bot styling), the Send button briefly says "Sending…"
-     then returns.
+   - Expected: the textarea clears and shrinks back to its 1-line
+     resting height; the user's message appears immediately at
+     the bottom of the message list with the **"You"** label
+     (regular text colour, not the accent reserved for the bot
+     name); a `formatSlackTime` stamp on the right.
    - **Regression watch — `bot_id`-on-self attribution.** Slack
      attaches a `bot_id` to messages posted via `chat.postMessage`
      from a user token bound to an app (which is what our
@@ -95,8 +100,9 @@ start a fresh top-level thread. Detailed design lives in
    - Expected: the session list disappears; the panel shows a
      "New session" card explaining the new top-level post will
      create a thread, plus an empty composer focused
-     automatically. The placeholder reads "Start a new
-     conversation — Enter to send, Shift+Enter for a new line".
+     automatically. The placeholder reads `Message Moon Bot` (or
+     whatever the active bot's display name is — short,
+     Slack-style).
 2. Type `please review src/lib/foo.ts`. Press **Enter**.
    - Expected: the new-session card disappears; the panel pivots
      into a fresh thread containing only your message. The
@@ -133,11 +139,12 @@ start a fresh top-level thread. Detailed design lives in
 
 1. Open a thread. Click into the composer.
 2. Without typing, press **Enter**.
-   - Expected: nothing happens. Send button stays disabled until
-     there's a non-whitespace character. (`sendMessage` short-
-     circuits on `text.trim().length === 0`.)
+   - Expected: nothing happens. `sendMessage` short-circuits on
+     `text.trim().length === 0`, so the keypress is just
+     swallowed.
 3. Type three spaces, press **Enter**.
-   - Expected: Send button stays disabled; nothing is posted.
+   - Expected: same — nothing is posted, the spaces stay in the
+     textarea.
 
 ### F — Send while disconnected
 

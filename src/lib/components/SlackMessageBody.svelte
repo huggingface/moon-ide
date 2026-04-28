@@ -133,8 +133,32 @@
 		font-size: 11px;
 		line-height: 1.45;
 		overflow-x: auto;
+		/* `overflow-x: auto` with the default `overflow-y: visible`
+		   gets silently coerced to `overflow-y: auto` per CSS spec —
+		   which is why one-line snippets were sprouting a vertical
+		   scrollbar (and a chunky corner square where the two bars
+		   met). Pin Y to `hidden` to break that coercion. */
+		overflow-y: hidden;
 		white-space: pre;
 		color: var(--m-fg);
+		/* Thin native scrollbar for both Firefox + Chromium / Tauri's
+		   webview. Default WebKit scrollbar is too tall for a chat
+		   bubble; this drops it to ~6 px. */
+		scrollbar-width: thin;
+		scrollbar-color: var(--m-border) transparent;
+	}
+	.codeblock::-webkit-scrollbar {
+		height: 6px;
+	}
+	.codeblock::-webkit-scrollbar-thumb {
+		background: var(--m-border);
+		border-radius: 3px;
+	}
+	.codeblock::-webkit-scrollbar-thumb:hover {
+		background: var(--m-fg-muted);
+	}
+	.codeblock::-webkit-scrollbar-track {
+		background: transparent;
 	}
 	.codeblock code {
 		font: inherit;

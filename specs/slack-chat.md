@@ -512,7 +512,11 @@ so the user doesn't reinstall.
 
 ## Sending messages (Phase 11.3)
 
-The composer is a fixed-bottom textarea, plus a Send button.
+The composer is a single fixed-bottom textarea — no separate
+Send button. Enter is the send affordance and we'd rather not
+double up on the click target. The textarea auto-grows from a
+single-line resting height up to a ~120 px cap as the user
+types, then scrolls internally.
 **Enter** fires `slack_post_message` (the team's preference —
 one-key send beats Slack's own Ctrl+Enter default for the
 short, conversational messages this panel is built around).

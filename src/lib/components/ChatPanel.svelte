@@ -49,10 +49,6 @@
 		return () => clearInterval(id);
 	});
 
-	const activeSession = $derived(
-		slack.activeThreadTs === null ? null : (slack.sessions?.find((s) => s.thread_ts === slack.activeThreadTs) ?? null),
-	);
-
 	// Collect every `<@U…>` referenced in the session list previews so
 	// we can pre-warm the user cache. Done from an `$effect` so the
 	// render path stays pure (mutating `userCache` during render trips
@@ -228,13 +224,47 @@
 		}
 	}
 
+	// Short, single-line placeholder à la Slack ("Message <user>") /
+	// Cursor ("Plan, Build, …"). Enter-to-send / Shift+Enter-for-newline
+	// is a well-known chat convention; the button tooltip on the
+	// disconnect/refresh links is enough discovery.
 	const composerPlaceholder = $derived(
-		slack.composingNewSession
-			? 'Start a new conversation — Enter to send, Shift+Enter for a new line'
-			: 'Reply — Enter to send, Shift+Enter for a new line',
+		slack.composingNewSession ? `Message ${slack.activeBot ? botLabel(slack.activeBot) : 'bot'}` : 'Reply…',
 	);
 	const composerDisabled = $derived(slack.sending);
-	const sendDisabled = $derived(slack.sending || draft.trim().length === 0);
+
+	// Auto-grow the textarea up to a max height so a multi-line
+	// draft expands inline without a separate "expand" button. Reset
+	// to `auto` first so the height shrinks back when the user
+	// deletes lines (otherwise scrollHeight stays at the high-water
+	// mark). The `120px` cap matches `.composer-input` `max-height`
+	// and lets the textarea's own scrollbar take over for very long
+	// drafts.
+	//
+	// `overflow-y` is set imperatively rather than left at CSS
+	// `auto` because the browser otherwise renders a flicker of
+	// scrollbar at the resting one-line height (line-height + padding
+	// rounds 1 px above `min-height`) — `hidden` until we genuinely
+	// hit the cap is cleaner.
+	const COMPOSER_MAX_HEIGHT = 120;
+
+	function autoGrow(el: HTMLTextAreaElement) {
+		el.style.height = 'auto';
+		const desired = el.scrollHeight;
+		const next = Math.min(desired, COMPOSER_MAX_HEIGHT);
+		el.style.height = `${next}px`;
+		el.style.overflowY = desired > COMPOSER_MAX_HEIGHT ? 'auto' : 'hidden';
+	}
+
+	$effect(() => {
+		// Re-trigger on every draft mutation, including the post-send
+		// reset to empty — otherwise the textarea would stay tall
+		// after sending a multi-line reply.
+		void draft;
+		if (composer !== null) {
+			autoGrow(composer);
+		}
+	});
 </script>
 
 <aside class="chat-panel" data-region="chat" aria-label="Chat panel">
@@ -258,244 +288,236 @@
 		</div>
 	{:else}
 		<div class="connected">
-			<section class="card">
-				<div class="card-row">
-					<span class="card-label">Connected as</span>
-					<span class="card-value">{slack.status.identity?.user_name ?? '—'}</span>
-				</div>
-				<div class="card-row muted">
-					<span class="card-label">Workspace</span>
-					<span class="card-value">{slack.status.identity?.team ?? '—'}</span>
-				</div>
-			</section>
-
-			{#if slack.activeBot}
-				<section class="card bot-card">
-					<header class="bot-header">
-						<div class="bot-id">
-							{#if slack.activeBot.image_url}
-								<img src={slack.activeBot.image_url} alt="" class="avatar" />
-							{:else}
-								<div class="avatar avatar-placeholder" aria-hidden="true">{botLabel(slack.activeBot)[0] ?? '?'}</div>
-							{/if}
-							<div class="bot-text">
-								<div class="bot-name">{botLabel(slack.activeBot)}</div>
-								<div class="bot-handle">@{slack.activeBot.username}</div>
-							</div>
-						</div>
-						<button type="button" class="link" onclick={onSwitchBot}>Switch bot</button>
-					</header>
+			<div class="connected-scroll">
+				<section class="card">
+					<div class="card-row">
+						<span class="card-label">Connected as</span>
+						<span class="card-value">{slack.status.identity?.user_name ?? '—'}</span>
+					</div>
+					<div class="card-row muted">
+						<span class="card-label">Workspace</span>
+						<span class="card-value">{slack.status.identity?.team ?? '—'}</span>
+					</div>
 				</section>
 
-				{#if slack.composingNewSession}
-					<section class="card thread-card composer-card">
-						<header class="section-header">
-							<button type="button" class="back-button" onclick={onCancelNewSession} title="Back to sessions">
-								← Cancel
-							</button>
-							<span class="section-title">New session</span>
+				{#if slack.activeBot}
+					<section class="card bot-card">
+						<header class="bot-header">
+							<div class="bot-id">
+								{#if slack.activeBot.image_url}
+									<img src={slack.activeBot.image_url} alt="" class="avatar" />
+								{:else}
+									<div class="avatar avatar-placeholder" aria-hidden="true">{botLabel(slack.activeBot)[0] ?? '?'}</div>
+								{/if}
+								<div class="bot-text">
+									<div class="bot-name">{botLabel(slack.activeBot)}</div>
+									<div class="bot-handle">@{slack.activeBot.username}</div>
+								</div>
+							</div>
+							<button type="button" class="link" onclick={onSwitchBot}>Switch bot</button>
 						</header>
-						<p class="card-detail">
-							Posting will create a new top-level message in your DM with
-							<strong>{botLabel(slack.activeBot)}</strong>. The reply lands as a thread under it — moon-bot, Cursor and
-							similar bots are designed for that.
-						</p>
 					</section>
-				{:else if slack.activeThreadTs === null}
-					<section class="card sessions-card">
-						<header class="section-header">
-							<span class="section-title">Sessions</span>
-							<div class="header-actions">
-								<button type="button" class="primary-link" onclick={onStartNewSession}>+ New session</button>
+
+					{#if slack.composingNewSession}
+						<div class="thread">
+							<header class="thread-header">
+								<button type="button" class="back-button" onclick={onCancelNewSession} title="Back to sessions">
+									← Cancel
+								</button>
+								<span class="section-title">New session</span>
+							</header>
+							<p class="thread-empty">
+								Posting will create a new top-level message in your DM with
+								<strong>{botLabel(slack.activeBot)}</strong>. The reply lands as a thread under it — moon-bot, Cursor
+								and similar bots are designed for that.
+							</p>
+						</div>
+					{:else if slack.activeThreadTs === null}
+						<section class="card sessions-card">
+							<header class="section-header">
+								<span class="section-title">Sessions</span>
+								<div class="header-actions">
+									<button type="button" class="primary-link" onclick={onStartNewSession}>+ New session</button>
+									<button
+										type="button"
+										class="link"
+										onclick={onRefreshSessions}
+										disabled={slack.loadingSessions}
+										title="Reload sessions">Refresh</button
+									>
+								</div>
+							</header>
+							{#if slack.loadingSessions && slack.sessions === null}
+								<div class="muted-row">
+									<div class="spinner" aria-hidden="true"></div>
+									<span>Loading sessions…</span>
+								</div>
+							{:else if slack.sessionsError}
+								<p class="card-error">{slack.sessionsError}</p>
+							{:else if slack.sessions && slack.sessions.length === 0}
+								<p class="card-detail">
+									No sessions yet. Click <strong>+ New session</strong> above to start your first conversation with
+									<strong>{botLabel(slack.activeBot)}</strong>.
+								</p>
+							{:else if slack.sessions}
+								<ul class="session-list">
+									{#each slack.sessions as session (session.thread_ts)}
+										<li>
+											<button type="button" class="session-row" onclick={() => onSelectSession(session.thread_ts)}>
+												<div class="session-preview">{previewOf(session)}</div>
+												<div class="session-meta">
+													{#key nowTick}
+														<span class="session-time">{formatSlackRelative(session.latest_ts)}</span>
+													{/key}
+													{#if session.reply_count > 0}
+														<span class="session-replies"
+															>{session.reply_count} {session.reply_count === 1 ? 'reply' : 'replies'}</span
+														>
+													{/if}
+												</div>
+											</button>
+										</li>
+									{/each}
+								</ul>
+							{/if}
+						</section>
+					{:else}
+						<div class="thread">
+							<header class="thread-header">
+								<button type="button" class="back-button" onclick={onBackToSessions} title="Back to sessions">
+									← Sessions
+								</button>
 								<button
 									type="button"
 									class="link"
-									onclick={onRefreshSessions}
-									disabled={slack.loadingSessions}
-									title="Reload sessions">Refresh</button
+									onclick={onRefreshThread}
+									disabled={slack.loadingThread}
+									title="Reload thread">Refresh</button
 								>
-							</div>
-						</header>
-						{#if slack.loadingSessions && slack.sessions === null}
-							<div class="muted-row">
-								<div class="spinner" aria-hidden="true"></div>
-								<span>Loading sessions…</span>
-							</div>
-						{:else if slack.sessionsError}
-							<p class="card-error">{slack.sessionsError}</p>
-						{:else if slack.sessions && slack.sessions.length === 0}
-							<p class="card-detail">
-								No sessions yet. Click <strong>+ New session</strong> above to start your first conversation with
-								<strong>{botLabel(slack.activeBot)}</strong>.
-							</p>
-						{:else if slack.sessions}
-							<ul class="session-list">
-								{#each slack.sessions as session (session.thread_ts)}
-									<li>
-										<button type="button" class="session-row" onclick={() => onSelectSession(session.thread_ts)}>
-											<div class="session-preview">{previewOf(session)}</div>
-											<div class="session-meta">
-												{#key nowTick}
-													<span class="session-time">{formatSlackRelative(session.latest_ts)}</span>
-												{/key}
-												{#if session.reply_count > 0}
-													<span class="session-replies"
-														>{session.reply_count} {session.reply_count === 1 ? 'reply' : 'replies'}</span
-													>
-												{/if}
-											</div>
-										</button>
-									</li>
-								{/each}
-							</ul>
-						{/if}
+							</header>
+							{#if slack.loadingThread && slack.threadMessages === null}
+								<div class="muted-row">
+									<div class="spinner" aria-hidden="true"></div>
+									<span>Loading thread…</span>
+								</div>
+							{:else if slack.threadError}
+								<p class="thread-error">{slack.threadError}</p>
+							{:else if slack.threadMessages && slack.threadMessages.length === 0}
+								<p class="thread-empty">No messages in this thread yet.</p>
+							{:else if slack.threadMessages}
+								<ol class="message-list">
+									{#each slack.threadMessages as message (message.ts)}
+										<li class="message">
+											<header class="message-header">
+												<span class="message-author" class:bot={message.is_bot && !isOwnMessage(message)}
+													>{senderLabel(message)}</span
+												>
+												<span class="message-time">
+													{formatSlackTime(message.ts)}
+													{#if message.edited_ts}
+														<span class="message-edited" title="Edited">· edited</span>
+													{/if}
+												</span>
+											</header>
+											<div class="message-body"><SlackMessageBody text={message.text} /></div>
+											{#if message.reactions.length > 0}
+												<div class="reactions">
+													{#each message.reactions as reaction (reaction.name)}
+														<span class="reaction-chip" title=":{reaction.name}:">
+															<span class="reaction-emoji">{resolveReactionName(reaction.name)}</span>
+															<span class="reaction-count">{reaction.count}</span>
+														</span>
+													{/each}
+												</div>
+											{/if}
+											{#if message.actions.length > 0}
+												<div class="message-actions">
+													{#each message.actions as action, i (i)}
+														<button
+															type="button"
+															class="action-btn"
+															class:primary={action.style === 'primary'}
+															class:danger={action.style === 'danger'}
+															onclick={(e) => onActionClick(e, action.url)}
+															title={action.url}>{action.label}</button
+														>
+													{/each}
+												</div>
+											{/if}
+										</li>
+									{/each}
+								</ol>
+							{/if}
+						</div>
+					{/if}
+				{:else if slack.loadingBots}
+					<section class="card center">
+						<div class="spinner" aria-hidden="true"></div>
+						<p class="card-lede">Scanning your 50 most recent DMs for bots…</p>
+						<p class="card-detail">
+							One-time setup — your pick is saved across launches. Slack doesn't expose a user-search API for
+							<code>xoxp-</code>
+							tokens, so we walk your DM list instead.
+						</p>
+					</section>
+				{:else if slack.botError}
+					<section class="card">
+						<p class="card-lede">Couldn't load bots from your 50 most recent DMs.</p>
+						<p class="card-error">{slack.botError}</p>
+						<button type="button" class="link" onclick={() => slack.discoverBots()}>Retry</button>
+					</section>
+				{:else if slack.botCandidates.length === 0}
+					<section class="card">
+						<p class="card-lede">No bots in your 50 most recent DMs.</p>
+						<p class="card-detail">
+							DM your bot from regular Slack (or send a quick "hi" if your DM with it is older than your 50 most
+							recent), then click Refresh.
+						</p>
+						<button type="button" class="link" onclick={() => slack.discoverBots()}>Refresh</button>
 					</section>
 				{:else}
-					<section class="card thread-card">
-						<header class="section-header">
-							<button type="button" class="back-button" onclick={onBackToSessions} title="Back to sessions">
-								← Sessions
-							</button>
-							<button
-								type="button"
-								class="link"
-								onclick={onRefreshThread}
-								disabled={slack.loadingThread}
-								title="Reload thread">Refresh</button
-							>
-						</header>
-						{#if activeSession}
-							<p class="thread-subject">{previewOf(activeSession)}</p>
-						{/if}
-						{#if slack.loadingThread && slack.threadMessages === null}
-							<div class="muted-row">
-								<div class="spinner" aria-hidden="true"></div>
-								<span>Loading thread…</span>
-							</div>
-						{:else if slack.threadError}
-							<p class="card-error">{slack.threadError}</p>
-						{:else if slack.threadMessages && slack.threadMessages.length === 0}
-							<p class="card-detail">No messages in this thread yet.</p>
-						{:else if slack.threadMessages}
-							<ol class="message-list">
-								{#each slack.threadMessages as message (message.ts)}
-									<li class="message" class:from-bot={message.is_bot && !isOwnMessage(message)}>
-										<header class="message-header">
-											<span class="message-author">{senderLabel(message)}</span>
-											<span class="message-time">
-												{formatSlackTime(message.ts)}
-												{#if message.edited_ts}
-													<span class="message-edited" title="Edited">· edited</span>
-												{/if}
-											</span>
-										</header>
-										<div class="message-body"><SlackMessageBody text={message.text} /></div>
-										{#if message.reactions.length > 0}
-											<div class="reactions">
-												{#each message.reactions as reaction (reaction.name)}
-													<span class="reaction-chip" title=":{reaction.name}:">
-														<span class="reaction-emoji">{resolveReactionName(reaction.name)}</span>
-														<span class="reaction-count">{reaction.count}</span>
-													</span>
-												{/each}
-											</div>
+					<section class="card picker">
+						<p class="card-lede">Pick a bot to chat with</p>
+						<p class="card-detail">
+							Bots from your 50 most recent Slack DMs. Click one to make it the active bot for this IDE.
+						</p>
+						<ul class="bot-list">
+							{#each slack.botCandidates as bot (bot.user_id)}
+								<li>
+									<button type="button" class="bot-row" onclick={() => onPickBot(bot)}>
+										{#if bot.image_url}
+											<img src={bot.image_url} alt="" class="avatar" />
+										{:else}
+											<div class="avatar avatar-placeholder" aria-hidden="true">{botLabel(bot)[0] ?? '?'}</div>
 										{/if}
-										{#if message.actions.length > 0}
-											<div class="message-actions">
-												{#each message.actions as action, i (i)}
-													<button
-														type="button"
-														class="action-btn"
-														class:primary={action.style === 'primary'}
-														class:danger={action.style === 'danger'}
-														onclick={(e) => onActionClick(e, action.url)}
-														title={action.url}>{action.label}</button
-													>
-												{/each}
-											</div>
-										{/if}
-									</li>
-								{/each}
-							</ol>
-						{/if}
+										<div class="bot-text">
+											<div class="bot-name">{botLabel(bot)}</div>
+											<div class="bot-handle">@{bot.username}</div>
+										</div>
+									</button>
+								</li>
+							{/each}
+						</ul>
+						<button type="button" class="link refresh" onclick={() => slack.discoverBots()}>Rescan DMs</button>
 					</section>
 				{/if}
+			</div>
 
-				{#if slack.composingNewSession || slack.activeThreadTs !== null}
-					<section class="composer">
-						{#if slack.sendError}
-							<p class="composer-error">{slack.sendError}</p>
-						{/if}
-						<div class="composer-row">
-							<textarea
-								bind:this={composer}
-								bind:value={draft}
-								placeholder={composerPlaceholder}
-								disabled={composerDisabled}
-								onkeydown={onComposerKeydown}
-								rows="3"
-								class="composer-input"
-							></textarea>
-							<button
-								type="button"
-								class="primary composer-send"
-								disabled={sendDisabled}
-								onclick={() => void onSubmitDraft()}
-								title="Send (Enter)">{slack.sending ? 'Sending…' : 'Send'}</button
-							>
-						</div>
-					</section>
-				{/if}
-			{:else if slack.loadingBots}
-				<section class="card center">
-					<div class="spinner" aria-hidden="true"></div>
-					<p class="card-lede">Scanning your 50 most recent DMs for bots…</p>
-					<p class="card-detail">
-						One-time setup — your pick is saved across launches. Slack doesn't expose a user-search API for
-						<code>xoxp-</code>
-						tokens, so we walk your DM list instead.
-					</p>
-				</section>
-			{:else if slack.botError}
-				<section class="card">
-					<p class="card-lede">Couldn't load bots from your 50 most recent DMs.</p>
-					<p class="card-error">{slack.botError}</p>
-					<button type="button" class="link" onclick={() => slack.discoverBots()}>Retry</button>
-				</section>
-			{:else if slack.botCandidates.length === 0}
-				<section class="card">
-					<p class="card-lede">No bots in your 50 most recent DMs.</p>
-					<p class="card-detail">
-						DM your bot from regular Slack (or send a quick "hi" if your DM with it is older than your 50 most recent),
-						then click Refresh.
-					</p>
-					<button type="button" class="link" onclick={() => slack.discoverBots()}>Refresh</button>
-				</section>
-			{:else}
-				<section class="card picker">
-					<p class="card-lede">Pick a bot to chat with</p>
-					<p class="card-detail">
-						Bots from your 50 most recent Slack DMs. Click one to make it the active bot for this IDE.
-					</p>
-					<ul class="bot-list">
-						{#each slack.botCandidates as bot (bot.user_id)}
-							<li>
-								<button type="button" class="bot-row" onclick={() => onPickBot(bot)}>
-									{#if bot.image_url}
-										<img src={bot.image_url} alt="" class="avatar" />
-									{:else}
-										<div class="avatar avatar-placeholder" aria-hidden="true">{botLabel(bot)[0] ?? '?'}</div>
-									{/if}
-									<div class="bot-text">
-										<div class="bot-name">{botLabel(bot)}</div>
-										<div class="bot-handle">@{bot.username}</div>
-									</div>
-								</button>
-							</li>
-						{/each}
-					</ul>
-					<button type="button" class="link refresh" onclick={() => slack.discoverBots()}>Rescan DMs</button>
-				</section>
+			{#if slack.composingNewSession || slack.activeThreadTs !== null}
+				<div class="composer">
+					{#if slack.sendError}
+						<p class="composer-error">{slack.sendError}</p>
+					{/if}
+					<textarea
+						bind:this={composer}
+						bind:value={draft}
+						placeholder={composerPlaceholder}
+						disabled={composerDisabled}
+						onkeydown={onComposerKeydown}
+						rows="1"
+						class="composer-input"
+					></textarea>
+				</div>
 			{/if}
 		</div>
 	{/if}
@@ -562,6 +584,13 @@
 	}
 	.connected {
 		flex: 1;
+		min-height: 0;
+		display: flex;
+		flex-direction: column;
+	}
+	.connected-scroll {
+		flex: 1;
+		min-height: 0;
 		overflow-y: auto;
 		padding: 12px;
 		display: flex;
@@ -751,21 +780,23 @@
 		flex-shrink: 0;
 		display: flex;
 		flex-direction: column;
-		gap: 6px;
-		padding: 10px 12px;
+		gap: 4px;
+		padding: 8px 12px 10px;
 		border-top: 1px solid var(--m-border);
 		background: var(--m-bg-1);
 	}
-	.composer-row {
-		display: flex;
-		align-items: flex-end;
-		gap: 8px;
-	}
 	.composer-input {
-		flex: 1;
-		min-height: 56px;
-		max-height: 200px;
-		resize: vertical;
+		width: 100%;
+		min-height: 34px;
+		max-height: 120px;
+		resize: none;
+		/* Drive `overflow-y` from JS via `autoGrow` — see ChatPanel
+		   script. `hidden` is the steady-state for any draft that
+		   fits under the 120 px cap; `auto` only kicks in when the
+		   user types past it. Otherwise CSS `auto` flickers a 1 px
+		   scrollbar at the resting one-line height because line-
+		   height + padding rounds just past `min-height`. */
+		overflow-y: hidden;
 		font: inherit;
 		font-size: 12px;
 		line-height: 1.4;
@@ -775,6 +806,24 @@
 		border: 1px solid var(--m-border);
 		border-radius: 6px;
 		outline: none;
+		box-sizing: border-box;
+		/* Match the codeblock thin scrollbar treatment for
+		   consistency when the textarea does need to scroll. */
+		scrollbar-width: thin;
+		scrollbar-color: var(--m-border) transparent;
+	}
+	.composer-input::-webkit-scrollbar {
+		width: 6px;
+	}
+	.composer-input::-webkit-scrollbar-thumb {
+		background: var(--m-border);
+		border-radius: 3px;
+	}
+	.composer-input::-webkit-scrollbar-thumb:hover {
+		background: var(--m-fg-muted);
+	}
+	.composer-input::-webkit-scrollbar-track {
+		background: transparent;
 	}
 	.composer-input:focus {
 		border-color: var(--m-accent);
@@ -783,18 +832,10 @@
 		opacity: 0.6;
 		cursor: not-allowed;
 	}
-	.composer-send {
-		flex-shrink: 0;
-		font-size: 12px;
-		padding: 8px 14px;
-	}
 	.composer-error {
 		margin: 0;
 		font-size: 11px;
 		color: var(--m-danger, #f08080);
-	}
-	.composer-card .card-detail {
-		margin: 0;
 	}
 	.muted-row {
 		display: flex;
@@ -810,6 +851,8 @@
 		padding: 0;
 		display: flex;
 		flex-direction: column;
+	}
+	.session-list {
 		gap: 2px;
 	}
 	.session-row {
@@ -855,7 +898,16 @@
 		margin-right: 8px;
 		color: var(--m-fg-subtle);
 	}
-	.thread-card {
+	.thread {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		min-width: 0;
+	}
+	.thread-header {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
 		gap: 8px;
 	}
 	.back-button {
@@ -867,29 +919,25 @@
 		padding: 0;
 		font-size: 12px;
 	}
-	.thread-subject {
+	.thread-empty {
 		margin: 0;
 		font-size: 12px;
 		color: var(--m-fg-muted);
-		font-style: italic;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		display: -webkit-box;
-		-webkit-line-clamp: 2;
-		line-clamp: 2;
-		-webkit-box-orient: vertical;
-		padding-bottom: 4px;
-		border-bottom: 1px solid var(--m-border);
+		line-height: 1.5;
+	}
+	.thread-error {
+		margin: 0;
+		font-size: 12px;
+		color: var(--m-danger, #f08080);
 	}
 	.message {
 		display: flex;
 		flex-direction: column;
 		gap: 2px;
-		padding: 6px 8px;
-		border-radius: 4px;
+		padding: 0;
 	}
-	.message.from-bot {
-		background: var(--m-bg-3);
+	.message + .message {
+		margin-top: 10px;
 	}
 	.message-header {
 		display: flex;
@@ -901,6 +949,9 @@
 		font-size: 11px;
 		font-weight: 600;
 		color: var(--m-fg);
+	}
+	.message-author.bot {
+		color: var(--m-accent);
 	}
 	.message-time {
 		font-size: 10px;
