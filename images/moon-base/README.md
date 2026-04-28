@@ -44,10 +44,11 @@ Decisions:
   (moon-landing pins `24.14.1`, for example) auto-switch on
   `cd` — and auto-install the missing version too, so the
   first `cd` after a team-wide bump Just Works rather than
-  printing "version not installed". Corepack is enabled and
-  `pnpm` is pre-staged; each project's actual `pnpm`/`yarn`
-  version resolves from its `packageManager` field on first
-  use, so we don't bake a version that'll drift.
+  printing "version not installed". Corepack is enabled so
+  the `pnpm` / `yarn` shims are on PATH; the actual version
+  resolves from each project's `packageManager` field on
+  first use, so nothing in this image drifts vs. what teams
+  pin in their repos.
 - **`uv`** (pinned to a specific version for reproducibility),
   managing Python toolchains and tool installs.
 - **`hf`** (Hugging Face Hub CLI), installed via `uv tool` so

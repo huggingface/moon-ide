@@ -132,13 +132,13 @@ RUN curl -fsSL https://fnm.vercel.app/install \
 # After `fnm default`, the alias symlink chain
 # `aliases/default -> aliases/lts-latest -> .../v<x.y.z>/installation`
 # is in place, and the ENV PATH set above keeps Node + npm + corepack
-# resolved for every subsequent `docker exec`. Enable corepack and
-# pre-stage pnpm now so `pnpm --version` works without a project.
+# resolved for every subsequent `docker exec`. Enable corepack so the
+# `pnpm` / `yarn` shims are on PATH; the actual pnpm/yarn version
+# downloads on first use from each project's `packageManager` field.
 RUN corepack enable \
- && corepack prepare pnpm@latest --activate \
  && node --version \
  && npm --version \
- && pnpm --version
+ && corepack --version
 
 # Auto-switch + auto-install Node when the user `cd`s into a
 # directory with a .nvmrc / .node-version. fnm's bundled hook
