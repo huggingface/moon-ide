@@ -39,6 +39,15 @@ Decisions:
 - **`rustup` (stable, minimal profile)** with `clippy` and
   `rustfmt`.
 - **`bun`**.
+- **`fnm` + Node LTS + Corepack**. fnm reads `.nvmrc` /
+  `.node-version`, so projects that pin a specific Node
+  (moon-landing pins `24.14.1`, for example) auto-switch on
+  `cd` — and auto-install the missing version too, so the
+  first `cd` after a team-wide bump Just Works rather than
+  printing "version not installed". Corepack is enabled and
+  `pnpm` is pre-staged; each project's actual `pnpm`/`yarn`
+  version resolves from its `packageManager` field on first
+  use, so we don't bake a version that'll drift.
 - **`uv`** (pinned to a specific version for reproducibility),
   managing Python toolchains and tool installs.
 - **`hf`** (Hugging Face Hub CLI), installed via `uv tool` so
@@ -62,11 +71,6 @@ What is **not** here, deliberately:
   CLI inside the workspace later, it's a forwarded socket +
   `apt-get install docker-ce-cli` line in that project's own
   Dockerfile-on-top, not a base-image concern.
-- No `node` / `npm` / `yarn`. `bun` runs `package.json`
-  scripts and `bun install` is drop-in for `npm install` for
-  the workflows we run; layering Node back on is one apt line
-  in a project's own Dockerfile when somebody hits the corner
-  case.
 
 ## What's coming (later commits in Phase 2.0)
 
@@ -95,6 +99,8 @@ Verify everything landed:
 ```bash
 docker run --rm moon-base:dev bash -c '
   rustc --version && cargo --version && bun --version
+  node --version && npm --version && pnpm --version
+  fnm --version
   uv --version && hf --version
   gh --version | head -1
   rg --version | head -1
@@ -105,13 +111,27 @@ docker run --rm moon-base:dev bash -c '
 '
 ```
 
-First-build size lands around 3 GB (WebKitGTK + GTK 3 dev
+Verify `.nvmrc` auto-install + auto-switch end-to-end against
+a checkout that pins a non-default Node:
+
+```bash
+docker run --rm -v "$(pwd):/workspace:ro" moon-base:dev bash -ic '
+  cd /workspace
+  cat .nvmrc 2>/dev/null && node --version
+'
+```
+
+(The `-i` is required so `.bashrc` gets sourced; the cd alias
+is what triggers the fnm install + use.)
+
+First-build size lands around 3.3 GB (WebKitGTK + GTK 3 dev
 libs are ~1.4 GB on their own; rustup with the stable
 toolchain pulls another ~1 GB; uv-managed Python 3.12 + the
-hf CLI's dep tree adds ~250 MB; gh + comfort tooling adds
-~50 MB). We'll look at slimming if it gets unwieldy, but a
-multi-GB workspace base image is normal for the "polyglot
-toolchain" tradeoff we picked in ADR 0007.
+hf CLI's dep tree adds ~250 MB; Node + corepack + pnpm pre-stage
+adds ~300 MB; gh + comfort tooling adds ~50 MB). We'll look
+at slimming if it gets unwieldy, but a multi-GB workspace base
+image is normal for the "polyglot toolchain" tradeoff we picked
+in ADR 0007.
 
 ## Versioning
 

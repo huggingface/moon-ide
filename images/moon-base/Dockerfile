@@ -109,6 +109,51 @@ ENV BUN_INSTALL=/home/${USERNAME}/.bun \
 
 RUN curl -fsSL https://bun.sh/install | bash
 
+# fnm + Node — fnm reads `.nvmrc` and `.node-version`, so projects
+# that pin a specific Node (moon-landing pins 24.14.1, for
+# instance) pick up automatically when the user `cd`s into them.
+# Single Rust binary, shell-agnostic, faster than the bash-based
+# nvm and saner inside non-interactive `docker exec`. The image
+# ships the current LTS as the default Node.
+#
+# Corepack (bundled with Node 16+) is enabled here, with `pnpm`
+# pre-staged via `corepack prepare`. Each project's actual
+# pnpm/yarn version resolves on demand from its `packageManager`
+# field in package.json, so we don't bake a pnpm version that'll
+# drift.
+ENV FNM_DIR=/home/${USERNAME}/.fnm \
+    PATH=/home/${USERNAME}/.fnm/aliases/default/bin:/home/${USERNAME}/.fnm:${PATH}
+
+RUN curl -fsSL https://fnm.vercel.app/install \
+      | bash -s -- --install-dir "${FNM_DIR}" --skip-shell \
+ && fnm install --lts \
+ && fnm default lts-latest
+
+# After `fnm default`, the alias symlink chain
+# `aliases/default -> aliases/lts-latest -> .../v<x.y.z>/installation`
+# is in place, and the ENV PATH set above keeps Node + npm + corepack
+# resolved for every subsequent `docker exec`. Enable corepack and
+# pre-stage pnpm now so `pnpm --version` works without a project.
+RUN corepack enable \
+ && corepack prepare pnpm@latest --activate \
+ && node --version \
+ && npm --version \
+ && pnpm --version
+
+# Auto-switch + auto-install Node when the user `cd`s into a
+# directory with a .nvmrc / .node-version. fnm's bundled hook
+# calls `fnm use --silent-if-unchanged` (no auto-install); we
+# override the hook function to also `--install-if-missing` so a
+# `cd ~/code/moon-landing` after the team bumps `.nvmrc` Just
+# Works rather than printing a "version not installed" error.
+#
+# Sourced for interactive shells only; `docker exec` non-interactive
+# calls get the default Node from $PATH.
+RUN { \
+        echo 'eval "$(fnm env --use-on-cd --version-file-strategy=recursive --shell bash)"'; \
+        echo '__fnm_use_if_file_found() { fnm use --install-if-missing --silent-if-unchanged; }'; \
+    } >> /home/${USERNAME}/.bashrc
+
 # uv (Astral's Python toolchain manager). Standalone installer
 # detects the right arch automatically and lands at
 # ~/.local/bin/uv. We pin to a known version so the image is
