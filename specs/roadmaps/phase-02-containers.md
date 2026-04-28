@@ -37,20 +37,28 @@ What ships:
   with the discovered files in `include:` plus a `dev`
   service. Generation runs once on first opt-in; the file
   is user-owned thereafter.
-- `moon-base` Dockerfile + GitHub Actions workflow publishing
-  a multi-arch manifest (`linux/amd64` + `linux/arm64`, both
-  built natively on `ubuntu-24.04` / `ubuntu-24.04-arm` —
-  no QEMU) to **Docker Hub** at `huggingface/moon-base:<sha>`
-  and `huggingface/moon-base:<major>.<minor>`. arm64 is the
-  team's primary target (Mac-majority, Apple Silicon); amd64
-  covers Linux contributors and CI. Builds run only on
-  changes to `moon-base`'s sources, not on every moon-ide
-  commit. Image contents per
+- `moon-base` Dockerfile (✅ in tree) + GitHub Actions workflow
+  (✅ [`.github/workflows/moon-base.yml`](../../.github/workflows/moon-base.yml))
+  publishing a multi-arch manifest
+  (`linux/amd64` + `linux/arm64`, both built natively on
+  `ubuntu-24.04` / `ubuntu-24.04-arm` — no QEMU) to
+  **Docker Hub** at `huggingface/moon-base`. Push events to
+  `main` publish `:dev` (rolling) and `:sha-<long>` (immutable);
+  PRs build and smoke-test without pushing. arm64 is the team's
+  primary target (Mac-majority, Apple Silicon); amd64 covers
+  Linux contributors and CI. Builds run only on changes to
+  `moon-base`'s sources, not on every moon-ide commit. Versioned
+  tags (`:0.1`, `:0.1.0`, `:latest`) wait until 2.0 ships
+  end-to-end and we cut a real release. Image contents per
   [`containers.md`](../containers.md#the-moon-base-image),
   distribution per
   [`containers.md`](../containers.md#distribution),
   registry rationale per
   [ADR 0007](../decisions/0007-compose-and-moon-base.md#registry-docker-hub).
+- Each per-arch CI job runs the ADR 0005 release gate before
+  publishing: `bun install --frozen-lockfile` and
+  `cargo check --workspace --locked` against a moon-ide checkout
+  bind-mounted into the freshly built image. Red = no push.
 - Compose project name derived from a stable hash of the
   workspace path: `moon-ws-<short-hash>`. The `dev`
   container's name follows compose's
@@ -218,6 +226,9 @@ Per [ADR 0005](../decisions/0005-bootstrap.md), `moon-base`
 must ship the toolchain a fresh moon-ide checkout needs:
 `rustup`, `bun`, the WebKitGTK dev libraries, plus whatever
 else moon-ide picks up between now and 2.0 landing. The
-moon-base GitHub workflow runs a smoke test that does
-`git clone moon-ide && bun install && cargo check` inside the
-freshly built image — green is a release gate.
+moon-base GitHub workflow encodes this as a release gate —
+each per-arch run mounts the moon-ide checkout into the freshly
+built image and runs `bun install --frozen-lockfile` followed
+by `cargo check --workspace --locked`. A failing gate blocks
+the digest push, so by construction `huggingface/moon-base:dev`
+and the matching `:sha-<long>` always build moon-ide.

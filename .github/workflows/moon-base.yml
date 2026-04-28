@@ -1,0 +1,205 @@
+# Build, smoke-test, and publish the `moon-base` workspace dev
+# image to Docker Hub at `huggingface/moon-base`.
+#
+# Trigger: only on changes to images/moon-base/** or this
+# workflow itself. Per ADR 0007 the image tracks toolchain
+# versions, not moon-ide commits — there's no value in rebuilding
+# moon-base for every IDE PR.
+#
+# Topology: per-arch native build on the matching GitHub-hosted
+# runner (amd64 on ubuntu-24.04, arm64 on ubuntu-24.04-arm — both
+# free for public repos, no QEMU emulation tax). Each arch
+# pushes its image by digest, then a `manifest` job assembles
+# the multi-arch tag list with `docker buildx imagetools create`.
+#
+# The smoke test (`bun install` + `cargo check --workspace
+# --locked` against the moon-ide checkout) is the release gate
+# from ADR 0005 — a published image, by construction, builds
+# moon-ide cleanly.
+#
+# Docker Hub credentials live in repo secrets:
+#   DOCKERHUB_USERNAME — bot or org account
+#   DOCKERHUB_TOKEN    — access token with read+write+delete on
+#                        the huggingface/moon-base repository
+
+name: moon-base
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'images/moon-base/**'
+      - '.github/workflows/moon-base.yml'
+  pull_request:
+    paths:
+      - 'images/moon-base/**'
+      - '.github/workflows/moon-base.yml'
+  workflow_dispatch:
+
+env:
+  REGISTRY_IMAGE: huggingface/moon-base
+
+jobs:
+  build:
+    name: Build & smoke (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - name: Sanitise platform pair
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+
+      - name: Checkout moon-ide
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 1. Build the image into the local docker daemon so the
+      #    smoke step can `docker run` it. Single-platform builds
+      #    are required for `load: true`. Cache layers via GHA so
+      #    the subsequent push-by-digest build below reuses them
+      #    nearly entirely.
+      - name: Build (load locally)
+        uses: docker/build-push-action@v6
+        with:
+          context: images/moon-base
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: moon-base:smoke
+          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
+
+      - name: Smoke — toolchain versions
+        run: |
+          docker run --rm moon-base:smoke bash -c '
+            set -e
+            rustc --version
+            cargo --version
+            bun --version
+            node --version
+            npm --version
+            corepack --version
+            fnm --version
+            uv --version
+            hf --version
+            gh --version | head -1
+            rg --version | head -1
+            fzf --version
+            jq --version
+            pkg-config --modversion webkit2gtk-4.1
+          '
+
+      # 2. The release gate from ADR 0005: a fresh image must
+      #    cleanly build moon-ide. We bind-mount the checkout
+      #    and `chown` it to uid 1000 so the container's `dev`
+      #    user can write `target/` and `node_modules/` without
+      #    permission gymnastics.
+      - name: Smoke — bun install && cargo check
+        run: |
+          sudo chown -R 1000:1000 .
+          docker run --rm \
+            -v "$PWD:/workspace" -w /workspace \
+            moon-base:smoke \
+            bash -c '
+              set -e
+              bun install --frozen-lockfile
+              cargo check --workspace --locked
+            '
+
+      - name: Login to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 3. With the smoke green, push by digest. The cache-from
+      #    GHA scope means almost every layer is a cache hit —
+      #    this step is mostly the export.
+      - name: Build & push by digest
+        id: push
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: images/moon-base
+          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
+          outputs: |
+            type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.push.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    name: Push multi-arch manifest
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Tag list:
+      # - `:dev`     for every push to main (moves with HEAD)
+      # - `:sha-<>`  immutable per-commit pin
+      # Versioned tags (`:0.1`, `:latest`) come later via tag-based
+      # releases; deferred until 0.1.0 ships.
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=dev,enable={{is_default_branch}}
+
+      - name: Create & push manifest
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          # shellcheck disable=SC2046,SC2086
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${{ env.REGISTRY_IMAGE }}@sha256:%s " *)
+
+      - name: Inspect
+        run: |
+          docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:${{ steps.meta.outputs.version }}

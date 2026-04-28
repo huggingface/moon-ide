@@ -21,8 +21,11 @@ Decisions:
 ## Status
 
 - **In tree** — iterating on the recipe.
-- **Not yet published** — no Docker Hub tags exist yet. Local
-  `docker build` only.
+- **CI wired but unpublished.** Multi-arch builds run on PRs
+  (no push) and on push to `main`
+  (push to `huggingface/moon-base:dev` + `:sha-<long>`). No
+  versioned tag exists yet; `0.1.0` will be cut once Phase 2.0
+  ships end-to-end.
 - **Unprivileged.** `moon-base` does not embed Docker-in-Docker.
   An earlier commit landed the canonical DinD recipe; we
   reverted it after walking the supply-chain threat model
@@ -73,17 +76,41 @@ What is **not** here, deliberately:
   `apt-get install docker-ce-cli` line in that project's own
   Dockerfile-on-top, not a base-image concern.
 
-## What's coming (later commits in Phase 2.0)
+## CI / publishing
 
-1. **GitHub Actions workflow.** Multi-arch native builds
-   (`linux/amd64` + `linux/arm64`) with
-   `docker buildx imagetools create` to publish a combined
-   manifest to `huggingface/moon-base` on Docker Hub.
-   Matrix-runs on `ubuntu-24.04` + `ubuntu-24.04-arm` (both
-   free for public repos, so no QEMU emulation tax).
-2. **Smoke test.** `git clone moon-ide && bun install && cargo check`
-   inside the freshly built image — green is the release gate
-   per ADR 0005.
+The image rebuilds on changes to `images/moon-base/**` (or to
+the workflow itself), triggered by pushes to `main`, pull
+requests touching the same paths, or manual dispatch. PR builds
+run the smoke test but do not push — they're a safety net for
+recipe changes. Pushes to `main` go further: they push each
+arch's image by digest to Docker Hub and assemble a multi-arch
+manifest under `:dev` (rolling) and `:sha-<commit>` (immutable).
+
+The workflow ([.github/workflows/moon-base.yml](../../.github/workflows/moon-base.yml))
+runs natively on `ubuntu-24.04` (amd64) and `ubuntu-24.04-arm`
+(arm64) — both are free for public repos, so we skip QEMU
+emulation entirely. The release gate from ADR 0005 lives inside
+each per-arch job: `bun install --frozen-lockfile` and
+`cargo check --workspace --locked` against a moon-ide checkout
+mounted into the freshly built image. A green merge to `main`
+means, by construction, the published image builds moon-ide.
+
+### Required secrets
+
+| Secret               | What                                                                         |
+| -------------------- | ---------------------------------------------------------------------------- |
+| `DOCKERHUB_USERNAME` | Org/bot Docker Hub account with write access to `huggingface/moon-base`.     |
+| `DOCKERHUB_TOKEN`    | Access token (not the account password) with read+write+delete on that repo. |
+
+Neither is referenced in PR-mode runs, so PRs from forks build
+and smoke-test cleanly without secret access.
+
+### Versioned releases (later)
+
+Tag-based releases (`:0.1.0`, `:0.1`, `:latest`) come once the
+recipe stabilises. The mechanic will be a git tag like
+`moon-base-0.1.0` driving an extra `metadata-action` config —
+out of scope until Phase 2.0 ships end-to-end.
 
 Tracker: [`specs/roadmaps/phase-02-containers.md`](../../specs/roadmaps/phase-02-containers.md).
 
@@ -100,7 +127,7 @@ Verify everything landed:
 ```bash
 docker run --rm moon-base:dev bash -c '
   rustc --version && cargo --version && bun --version
-  node --version && npm --version && pnpm --version
+  node --version && npm --version && corepack --version
   fnm --version
   uv --version && hf --version
   gh --version | head -1
@@ -128,11 +155,10 @@ is what triggers the fnm install + use.)
 First-build size lands around 3.3 GB (WebKitGTK + GTK 3 dev
 libs are ~1.4 GB on their own; rustup with the stable
 toolchain pulls another ~1 GB; uv-managed Python 3.12 + the
-hf CLI's dep tree adds ~250 MB; Node + corepack + pnpm pre-stage
-adds ~300 MB; gh + comfort tooling adds ~50 MB). We'll look
-at slimming if it gets unwieldy, but a multi-GB workspace base
-image is normal for the "polyglot toolchain" tradeoff we picked
-in ADR 0007.
+hf CLI's dep tree adds ~250 MB; Node LTS + corepack adds ~250 MB;
+gh + comfort tooling adds ~50 MB). We'll look at slimming if it
+gets unwieldy, but a multi-GB workspace base image is normal for
+the "polyglot toolchain" tradeoff we picked in ADR 0007.
 
 ## Versioning
 
