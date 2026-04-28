@@ -51,11 +51,13 @@ moon-published `moon-base` image, which carries:
 - `bun` (or `node` LTS as fallback) for the frontend toolchain.
 - `oxlint`, `oxfmt`, `prettier`, `tsgo` cached as dev dependencies of
   the JS workspace — no global installs.
-- Docker-in-Docker pre-configured (the canonical
-  `fuse-overlayfs` + `iptables-legacy` recipe — see
-  [`containers.md`](../containers.md#the-moon-base-image)).
-- A non-privileged user with sudo so the contributor can install extra
-  tooling as they go.
+- A non-root `dev` user with passwordless sudo so the contributor
+  can install extra tooling as they go. The container itself runs
+  unprivileged with the default Docker capability set; project
+  side-services (databases, caches, …) come up as siblings on the
+  host's daemon via compose `include:` rather than nested inside
+  the workspace — see
+  [ADR 0008](0008-host-shared-daemon.md).
 
 Forwarded ports are explicit: only Vite (1420) and the Tauri devtools
 port. Everything else stays inside the container.

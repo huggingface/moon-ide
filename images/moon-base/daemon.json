@@ -1,6 +1,0 @@
-{
-	"storage-driver": "fuse-overlayfs",
-	"features": {
-		"containerd-snapshotter": false
-	}
-}

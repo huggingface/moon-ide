@@ -10,18 +10,24 @@ A desktop IDE where every workspace operation works the same whether the workspa
 
 ```
 +----------------------------------+        +----------------------------+
-|  Host machine                    |        |  Container (Phase 2)       |
-|                                  |        |                            |
+|  Host machine                    |        |  Workspace `dev` container |
+|                                  |        |  (Phase 2, unprivileged)   |
 |  +---------+    +-------------+  | docker |  +----------------------+  |
 |  | Svelte  |<-->| moon-core   |<-+--exec--+->| project tooling      |  |
 |  |  UI     |    |  (local)    |  |  +     |  | (LSPs, PTYs, build,  |  |
-|  +---------+    +-------------+  | bind   |  |  lint, user's docker |  |
-|                  |               |  mount |  |  via DinD)           |  |
-|                  | Tauri IPC     |        |  +----------------------+  |
-|                  v               |        |    workspace at /workspace |
-|                                  |        +----------------------------+
-+----------------------------------+                  |
-                                          explicitly forwarded ports
+|  +---------+    +-------------+  | bind   |  |  lint)               |  |
+|                  |               |  mount |  +----------------------+  |
+|                  | Tauri IPC     |        |    workspace at /workspace |
+|                  v               |        +----------------------------+
+|                                  |
+|  Host's Docker daemon            |        +----------------------------+
+|  also runs the project's         |        |  Project services          |
+|  service containers as           +--------+  (postgres, redis, mongo,  |
+|  siblings on the same compose    |        |   …) — pulled in via       |
+|  network                         |        |   compose `include:`       |
++----------------------------------+        +----------------------------+
+                                                            |
+                                                explicitly forwarded ports
 ```
 
 For local containers, the host filesystem is the source of truth — moon-core reads/writes files directly on the host, and the container sees the same bytes through a bind mount. Process and PTY work shells through `docker exec`. A future remote variant (no shared filesystem) will reuse the same `WorkspaceHost` trait through a JSON-RPC channel to a `moon-agent` running on the remote machine.

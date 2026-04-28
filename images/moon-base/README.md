@@ -3,23 +3,31 @@
 The base image for moon-ide workspace containers. Every team
 that opts into Phase 2's containerised dev shells builds
 `FROM huggingface/moon-base:<tag>` to inherit a working dev
-environment without relitigating Tauri build deps, the
-Docker-in-Docker recipe, or toolchain installs.
+environment without relitigating Tauri build deps or
+toolchain installs.
+
+The container runs **unprivileged** with the default Docker
+capability set. Project services (postgres, redis, etc.)
+come up as siblings on the host's daemon via compose
+`include:` rather than nested inside the workspace — see
+ADR 0008 for the threat-model reasoning.
 
 Architectural spec:
-[`specs/containers.md`](../../specs/containers.md). Format /
-registry / image-strategy decision:
-[ADR 0007](../../specs/decisions/0007-compose-and-moon-base.md).
+[`specs/containers.md`](../../specs/containers.md).
+Decisions:
+[ADR 0007 — compose + moon-base](../../specs/decisions/0007-compose-and-moon-base.md),
+[ADR 0008 — host-shared daemon](../../specs/decisions/0008-host-shared-daemon.md).
 
 ## Status
 
 - **In tree** — iterating on the recipe.
 - **Not yet published** — no Docker Hub tags exist yet. Local
   `docker build` only.
-- **DinD wired in** — the canonical recipe (fuse-overlayfs +
-  iptables-legacy + the Docker 29+ snapshotter flag) lands in
-  this commit. `docker run hello-world` works inside a
-  privileged container.
+- **Unprivileged.** `moon-base` does not embed Docker-in-Docker.
+  An earlier commit landed the canonical DinD recipe; we
+  reverted it after walking the supply-chain threat model
+  through (ADR 0008). The image is smaller and the workspace
+  container runs with normal Docker capabilities.
 
 ## What's in the image (today)
 
@@ -31,21 +39,21 @@ registry / image-strategy decision:
 - **`rustup` (stable, minimal profile)** with `clippy` and
   `rustfmt`.
 - **`bun`**.
-- **Docker-in-Docker**: `docker-ce`, `docker-ce-cli`,
-  `containerd.io`, `docker-buildx-plugin`, `docker-compose-plugin`,
-  `fuse-overlayfs`, `iptables`. iptables alternatives pinned to
-  legacy at build time; `/etc/docker/daemon.json` selects
-  `fuse-overlayfs` and disables the containerd snapshotter
-  (the Docker 29+ default doesn't nest cleanly under DinD). An
-  entrypoint script backgrounds `dockerd` on container start
-  and waits for the socket before handing off to CMD.
 - **Standard plumbing**: `git`, `curl`, `wget`, `ca-certificates`,
   `build-essential`, `less`, `sudo`, `unzip`, `xz-utils`.
 - **Non-root `dev` user** (uid 1000, gid 1000) with passwordless
-  sudo and `docker` group membership (so `docker ...` works
-  without sudo). The uid lines up with the conventional first
-  user on Debian/Ubuntu hosts; Docker Desktop for macOS handles
-  the uid translation transparently.
+  sudo. The uid lines up with the conventional first user on
+  Debian/Ubuntu hosts; Docker Desktop for macOS handles the uid
+  translation transparently.
+
+What is **not** here, deliberately:
+
+- No Docker daemon, no Docker CLI. Generated `compose.yaml`
+  uses the host's daemon, so the workspace container never
+  needs to talk to one. If a project genuinely wants a Docker
+  CLI inside the workspace later, it's a forwarded socket +
+  `apt-get install docker-ce-cli` line in that project's own
+  Dockerfile-on-top, not a base-image concern.
 
 ## What's coming (later commits in Phase 2.0)
 
@@ -83,19 +91,9 @@ docker run --rm moon-base:dev bash -c '
 '
 ```
 
-Verify Docker-in-Docker works (needs `--privileged`):
-
-```bash
-docker run --rm --privileged moon-base:dev bash -c '
-  sleep 5  # let the entrypoint start dockerd
-  docker run --rm hello-world
-'
-```
-
-First-build size lands around 3–3.5 GB (WebKitGTK + GTK 3 dev
+First-build size lands around 2.5–3 GB (WebKitGTK + GTK 3 dev
 libs are ~1.4 GB on their own; rustup with the stable toolchain
-pulls another ~1 GB; the Docker engine + buildx + compose
-plugins add ~500 MB). We'll look at slimming if it gets
+pulls another ~1 GB). We'll look at slimming if it gets
 unwieldy, but a multi-GB workspace base image is normal for the
 "polyglot toolchain" tradeoff we picked in ADR 0007.
 

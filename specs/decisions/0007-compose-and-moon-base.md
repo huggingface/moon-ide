@@ -1,7 +1,10 @@
 # ADR 0007 — Compose-native config + moon-published base image
 
 Date: 2026-04-28
-Status: accepted
+Status: accepted (with amendments — the
+[DinD-in-`moon-base`](#2-moon-ide-publishes-its-own-base-image)
+aspect of this decision was reverted by
+[ADR 0008](0008-host-shared-daemon.md))
 
 ## Context
 
@@ -144,12 +147,19 @@ one model.
   the team's primary target (Mac-majority, Apple Silicon);
   amd64 covers Linux contributors and CI. Detail in
   [`containers.md`](../containers.md#distribution).
-- The DinD recipe is now version-controlled in moon-ide
+- ~~The DinD recipe is now version-controlled in moon-ide
   itself — when Docker N+1 changes the storage-driver story
-  again, there's one place to fix it.
+  again, there's one place to fix it.~~ Superseded by
+  [ADR 0008](0008-host-shared-daemon.md): we no longer
+  embed dockerd in `moon-base`. Project services run as
+  siblings on the host's daemon via compose `include:`. The
+  rest of this ADR — compose as the native format, moon-ide
+  publishing its own base image, Docker Hub as the registry,
+  the polyglot toolchain in `moon-base`, devcontainer.json
+  interop deferred to 2.3 — stands.
 - `compose.yaml` is the format the team already knows; we
   inherit ecosystem conventions (override files, profiles,
-  env interpolation) for free.
+  env interpolation, **`include:`**) for free.
 - Devcontainer.json interop becomes a translator that runs
   on workspace open (Phase 2.3). Translation is a one-way
   read; we never write devcontainer.json files.

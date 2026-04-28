@@ -60,9 +60,9 @@ Closes Phase 1's loose ends and adds the bare minimum needed for moon-ide to fee
 
 ## Phase 2 — Containerised dev shells
 
-**Acceptance**: opening a workspace provisions a single Docker container (one per workspace, not per project) from a moon-published `moon-base` image (Debian + DinD pre-baked + polyglot toolchain). Project tooling — terminals, LSP, lint/format, builds — runs inside the container; the Tauri shell, Slack, and agent runtimes stay on the host. Closing the workspace pauses the container; reopening unpauses it. Declared port forwards are reachable from the host and surfaced in the IDE.
+**Acceptance**: opening a workspace provisions a single unprivileged Docker container (one per workspace, not per project) from a moon-published `moon-base` image (Debian + polyglot toolchain). The workspace's compose file `include:`s the project's existing `docker-compose.yml`(s) so side-services (postgres, redis, mongo, …) come up as siblings on the host's daemon — no nested Docker. Project tooling — terminals, LSP, lint/format, builds — runs inside the workspace container; the Tauri shell, Slack, and agent runtimes stay on the host. Closing the workspace pauses the whole compose project; reopening unpauses it. Declared port forwards are reachable from the host and surfaced in the IDE.
 
-System architecture: [containers.md](containers.md). Sub-phase work breakdown: [roadmaps/phase-02-containers.md](roadmaps/phase-02-containers.md). Format / image strategy decision: [ADR 0007](decisions/0007-compose-and-moon-base.md).
+System architecture: [containers.md](containers.md). Sub-phase work breakdown: [roadmaps/phase-02-containers.md](roadmaps/phase-02-containers.md). Decisions: [ADR 0007 — compose + moon-base](decisions/0007-compose-and-moon-base.md), [ADR 0008 — host-shared daemon](decisions/0008-host-shared-daemon.md).
 
 **Bootstrap concern** (per [ADR 0005](decisions/0005-bootstrap.md)): `moon-base` ships with `rustup`, `bun`, and the WebKitGTK dev libraries so a fresh moon-ide checkout is buildable inside its own container.
 

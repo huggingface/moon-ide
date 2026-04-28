@@ -13,11 +13,17 @@ defer to specific milestones.
 **Acceptance**: opening a workspace that has no `.moon/`
 folder shows a "Run this project in a container? [Set up | Not
 now]" prompt in a new "Container" status-bar pip. "Set up"
-writes a default `compose.yaml`, pulls `moon-base`, and creates
-
-- starts the container. Subsequent opens unpause an existing
-  container; closing the window pauses it. The status pip cycles
-  through `absent → creating → running → paused → running` cleanly.
+writes a default `<workspace>/.moon/compose.yaml` (with an
+`include:` block for any sibling `docker-compose.yml` files
+moon-ide spotted), pulls `moon-base`, and brings up the whole
+compose project — the workspace's `dev` service _and_ the
+included project services as siblings on the host's daemon.
+Subsequent opens unpause the project; closing the window
+pauses the project (compose-wide). The status pip cycles
+through `absent → creating → running → paused → running`
+cleanly. Concrete acceptance: opening moon-landing brings up
+all eleven services (`dev` + the project's ten) on the host's
+daemon with a single "Set up" click.
 
 What ships:
 
@@ -25,6 +31,12 @@ What ships:
   shells out to `docker compose` via `bollard` or
   `tokio::process` (decide at implementation start; bollard
   preferred if it doesn't drag in too much).
+- Compose discovery + generation logic: scan the workspace
+  root and one level deep for `docker-compose.yml` /
+  `compose.yaml`, write `<workspace>/.moon/compose.yaml`
+  with the discovered files in `include:` plus a `dev`
+  service. Generation runs once on first opt-in; the file
+  is user-owned thereafter.
 - `moon-base` Dockerfile + GitHub Actions workflow publishing
   a multi-arch manifest (`linux/amd64` + `linux/arm64`, both
   built natively on `ubuntu-24.04` / `ubuntu-24.04-arm` —
@@ -39,27 +51,39 @@ What ships:
   [`containers.md`](../containers.md#distribution),
   registry rationale per
   [ADR 0007](../decisions/0007-compose-and-moon-base.md#registry-docker-hub).
-- Container name derived from a stable hash of the workspace
-  path: `moon-ws-<short-hash>`.
+- Compose project name derived from a stable hash of the
+  workspace path: `moon-ws-<short-hash>`. The `dev`
+  container's name follows compose's
+  `<project>-<service>-<n>` convention.
 - Tauri commands `container_status` / `container_setup` /
   `container_pause` / `container_resume` / `container_rebuild`.
+  Each operates on the **whole compose project**, not just
+  the `dev` service — pausing the workspace pauses included
+  services with it.
 - Push events `container:state` / `container:logs` /
   `container:error`.
 - Status-bar pip that surfaces state + logs panel. No
   redesign of the status bar itself.
-- ADR [0007](../decisions/0007-compose-and-moon-base.md) for
-  the compose-over-devcontainer.json + own-base-image calls.
+- ADRs [0007](../decisions/0007-compose-and-moon-base.md)
+  (compose + moon-base) and
+  [0008](../decisions/0008-host-shared-daemon.md) (host-shared
+  daemon, no nested Docker — the reason "Set up" creates
+  sibling services rather than DinD'ing them).
 
 What doesn't ship in 2.0:
 
 - Routed execution. Until 2.1, terminals/LSPs/etc. still run
   on the host. 2.0's "running" container just sits there with
   `sleep infinity` and confirms the lifecycle works.
+- Per-service UI (start/stop/restart `mongo` independently of
+  the rest, per-service log tails, etc.). 2.0's status pip
+  shows compose-project-level state only; richer per-service
+  UI lands in 2.4.
 - Port forwarding UI (just whatever compose declares natively).
 - Devcontainer.json reading.
 
 Test plan: `0014-container-lifecycle.md` (TBD at implementation
-start).
+start). Includes opening moon-landing as a smoke target.
 
 ### 2.1 — Routed execution
 
@@ -152,16 +176,28 @@ Likely outcome: A for the common subset, with a "this key
 isn't supported, edit compose.yaml directly" warning for
 anything weird.
 
-### 2.4 — Multi-service compose UI
+### 2.4 — Per-service UI
 
-**Status**: deferred until concrete request.
+**Status**: planned, lives behind 2.0–2.3.
 
-When a workspace's `compose.yaml` declares more than one
-service (`shell` + `db` + `cache`), the IDE needs to know
-which one new terminals attach to and which ones it just
-keeps alive. The `x-moon.shell-service` extension key
-([containers.md](../containers.md#x-moon-extension-keys-in-compose))
-covers the data side; the UI side waits for a real workflow.
+Multi-service compose itself works from 2.0 (the `include:`
+model puts the project's services alongside `dev` from day
+one). What 2.4 adds is the UI surface: a per-service status
+panel listing every service in the compose project (`dev`,
+`mongo`, `redis`, …) with state, log tail, and one-click
+restart. Includes:
+
+- A "Project services" subsection in the sidebar showing
+  every compose service with state and a small log tail.
+- Per-service `start` / `stop` / `restart` actions.
+- A picker for "which service do new terminals attach to?"
+  backed by the `x-moon.shell-service` extension key
+  ([containers.md](../containers.md#x-moon-extension-keys-in-compose)).
+- Surfacing service-level health checks in the UI (compose
+  already exposes `healthy` / `unhealthy`; we just have to
+  display it).
+
+Test plan: `0017-container-services-ui.md` (TBD).
 
 ## Out of scope (Phase 2, full list)
 
