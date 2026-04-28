@@ -214,6 +214,7 @@ export type SlackMessage = {
 	edited_ts: string | null;
 	is_bot: boolean;
 	actions: SlackAction[];
+	reactions: SlackReaction[];
 };
 
 /**
@@ -225,6 +226,18 @@ export type SlackAction = {
 	label: string;
 	url: string;
 	style: string | null;
+};
+
+/**
+ * One reaction group on a message. Mirrors
+ * `moon_protocol::slack::SlackReaction`. `name` is the Slack
+ * shortcode without colons (e.g. `"thumbsup"`); the renderer feeds
+ * it through `slackEmoji.emojify` to get a Unicode glyph and falls
+ * back to `:name:` for custom workspace emoji we can't resolve.
+ */
+export type SlackReaction = {
+	name: string;
+	count: number;
 };
 
 /**

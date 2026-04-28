@@ -462,11 +462,28 @@ struct RawMessage {
 	/// in preference to `text` when present.
 	#[serde(default)]
 	blocks: Option<Vec<RawBlock>>,
+	/// Reaction groups attached to the message. Slack collapses
+	/// repeated reactions of the same emoji into one entry with
+	/// `count` and a `users` list. We surface only `name` + `count`
+	/// in v1 (read-only chips) — the `users` list lives here in
+	/// case a tooltip / "you reacted" highlight wants it later.
+	#[serde(default)]
+	reactions: Option<Vec<RawReaction>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct EditedMeta {
 	ts: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RawReaction {
+	name: String,
+	#[serde(default)]
+	count: u32,
+	#[serde(default)]
+	#[allow(dead_code)] // Kept for future tooltip / "you reacted" UX.
+	users: Vec<String>,
 }
 
 /// Subset of Slack's [Block Kit][1] block types. We only deserialise
@@ -566,6 +583,16 @@ fn to_message(msg: RawMessage) -> SlackMessage {
 	let blocks = msg.blocks.as_deref();
 	let text = text_from_blocks(blocks).unwrap_or_else(|| msg.text.unwrap_or_default());
 	let actions = actions_from_blocks(blocks);
+	let reactions = msg
+		.reactions
+		.unwrap_or_default()
+		.into_iter()
+		.filter(|r| r.count > 0)
+		.map(|r| moon_protocol::slack::SlackReaction {
+			name: r.name,
+			count: r.count,
+		})
+		.collect();
 	SlackMessage {
 		ts: msg.ts,
 		user_id: msg.user,
@@ -573,6 +600,7 @@ fn to_message(msg: RawMessage) -> SlackMessage {
 		edited_ts: msg.edited.map(|e| e.ts),
 		is_bot,
 		actions,
+		reactions,
 	}
 }
 
@@ -997,6 +1025,63 @@ mod tests {
 		}"#;
 		let msg = to_message(serde_json::from_str(json).unwrap());
 		assert_eq!(msg.text, "**bold** and a [link](https://x.io)");
+	}
+
+	#[test]
+	fn reactions_are_extracted_and_zero_count_dropped() {
+		// Real Slack payload: per-emoji entry with a name, a user
+		// list (we don't surface yet) and a denormalised count.
+		// We collapse to `(name, count)` and drop any entry with
+		// count 0 — Slack should never emit one but the wire format
+		// allows it and we'd rather not render a 0-count chip.
+		let json = r#"{
+			"ts": "1700000000.000900",
+			"user": "U1",
+			"text": "ship it",
+			"reactions": [
+				{ "name": "thumbsup", "users": ["U2", "U3"], "count": 2 },
+				{ "name": "rocket", "users": ["U4"], "count": 1 },
+				{ "name": "ghost", "users": [], "count": 0 }
+			]
+		}"#;
+		let msg = to_message(serde_json::from_str(json).unwrap());
+		assert_eq!(msg.reactions.len(), 2);
+		assert_eq!(msg.reactions[0].name, "thumbsup");
+		assert_eq!(msg.reactions[0].count, 2);
+		assert_eq!(msg.reactions[1].name, "rocket");
+		assert_eq!(msg.reactions[1].count, 1);
+	}
+
+	#[test]
+	fn missing_reactions_field_is_empty_vec() {
+		// `reactions` is omitted entirely on a message that has none
+		// — we must not require the field.
+		let json = r#"{
+			"ts": "1700000001.000000",
+			"user": "U1",
+			"text": "no reactions yet"
+		}"#;
+		let msg = to_message(serde_json::from_str(json).unwrap());
+		assert!(msg.reactions.is_empty());
+	}
+
+	#[test]
+	fn skin_tone_modifier_passes_through_verbatim() {
+		// Slack puts skin-toned reactors under
+		// `name: "+1::skin-tone-3"`. Frontend `slackEmoji` doesn't
+		// resolve that yet — we render the raw shortcode in that
+		// case. Either way the wire shape must round-trip.
+		let json = r#"{
+			"ts": "1700000002.000000",
+			"user": "U1",
+			"text": "with skin tones",
+			"reactions": [
+				{ "name": "+1::skin-tone-3", "users": ["U2"], "count": 1 }
+			]
+		}"#;
+		let msg = to_message(serde_json::from_str(json).unwrap());
+		assert_eq!(msg.reactions.len(), 1);
+		assert_eq!(msg.reactions[0].name, "+1::skin-tone-3");
 	}
 
 	#[test]

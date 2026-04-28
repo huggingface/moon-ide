@@ -1,8 +1,8 @@
 # 0012 — Slack send messages (Phase 11.3)
 
 The chat panel can finally talk back. Composer at the bottom,
-Ctrl+Enter to send, "+ New session" to start a fresh top-level
-thread. Detailed design lives in
+Enter to send (Shift+Enter for a newline), "+ New session" to
+start a fresh top-level thread. Detailed design lives in
 [`slack-chat.md`](../slack-chat.md#sending-messages-phase-113).
 
 ## What ships
@@ -21,8 +21,9 @@ thread. Detailed design lives in
   - Textarea pinned to the bottom of the panel; visible when
     `activeThreadTs !== null` (reply mode) or
     `composingNewSession === true` (new-session mode).
-  - **Ctrl+Enter** / **Cmd+Enter** sends; plain Enter inserts a
-    newline; **Esc** cancels the new-session composer.
+  - **Enter** sends; **Shift+Enter** inserts a newline;
+    **Ctrl/Cmd+Enter** also sends (muscle-memory carry-over from
+    other tools); **Esc** cancels the new-session composer.
   - Disabled while a post is in flight; shows "Sending…" on the
     Send button.
   - Send error renders inline above the textarea; draft is
@@ -61,8 +62,9 @@ thread. Detailed design lives in
 
 1. Click any session in the list. Wait for messages to load.
 2. The textarea appears below the message list with placeholder
-   "Reply — Ctrl+Enter to send". Click into it.
-3. Type `hello world`. Press **Ctrl+Enter**.
+   "Reply — Enter to send, Shift+Enter for a new line". Click
+   into it.
+3. Type `hello world`. Press **Enter**.
    - Expected: the textarea clears, the user's message appears
      immediately at the bottom of the message list with the
      **"You"** label (a `formatSlackTime` stamp, plain text body,
@@ -94,8 +96,8 @@ thread. Detailed design lives in
      "New session" card explaining the new top-level post will
      create a thread, plus an empty composer focused
      automatically. The placeholder reads "Start a new
-     conversation — Ctrl+Enter to send".
-2. Type `please review src/lib/foo.ts`. Press **Ctrl+Enter**.
+     conversation — Enter to send, Shift+Enter for a new line".
+2. Type `please review src/lib/foo.ts`. Press **Enter**.
    - Expected: the new-session card disappears; the panel pivots
      into a fresh thread containing only your message. The
      session list (when you go back to it) now has a new row at
@@ -115,22 +117,26 @@ thread. Detailed design lives in
 ### D — Multi-line message
 
 1. Open any thread. Click into the composer.
-2. Type `line one`, press **Enter**, type `line two`.
+2. Type `line one`, press **Shift+Enter**, type `line two`.
    - Expected: a literal newline goes in the textarea — Send is
      **not** triggered.
-3. Press **Ctrl+Enter**.
+3. Press **Enter** (without Shift).
    - Expected: the message is sent with the newline preserved.
      In the rendered bubble after reconciliation, the two lines
      show on separate visual lines.
+4. Optional muscle-memory check: instead of plain Enter, finish
+   with **Ctrl+Enter** / **Cmd+Enter**.
+   - Expected: also sends. The send chord is preserved for users
+     coming from Slack's defaults.
 
 ### E — Empty / whitespace draft
 
 1. Open a thread. Click into the composer.
-2. Without typing, press **Ctrl+Enter**.
+2. Without typing, press **Enter**.
    - Expected: nothing happens. Send button stays disabled until
      there's a non-whitespace character. (`sendMessage` short-
      circuits on `text.trim().length === 0`.)
-3. Type three spaces, press **Ctrl+Enter**.
+3. Type three spaces, press **Enter**.
    - Expected: Send button stays disabled; nothing is posted.
 
 ### F — Send while disconnected
@@ -166,7 +172,7 @@ composer. Two ways to hit it:
 End-to-end "first conversation with the bot" flow:
 
 1. Disconnect + reconnect Slack to start with a clean panel.
-2. **+ New session** → type `ping` → Ctrl+Enter.
+2. **+ New session** → type `ping` → Enter.
 3. Watch the panel pivot into the new thread.
 4. Without further interaction, wait for moon-bot's reply.
    - Expected: within one to two cadence ticks (3–6 s) the bot's
@@ -194,5 +200,8 @@ in `app_state.json`, so the panel reopens on the same thread.
 - Slack's mrkdwn is sent as-is. We don't translate Markdown
   (`**bold**` etc.) into mrkdwn (`*bold*`) — what the user types
   is what the bot sees.
-- Plain Enter is a newline, not Send (matches Slack's own
-  composer). If the team wants to flip this, it's one keybinding.
+- Plain Enter is Send, not a newline — diverges from Slack's
+  own composer (where Enter is a newline and Ctrl+Enter sends).
+  We followed team feedback and prioritised one-key send;
+  Shift+Enter handles the multi-line case. Ctrl/Cmd+Enter is
+  also accepted for users carrying Slack's muscle memory.

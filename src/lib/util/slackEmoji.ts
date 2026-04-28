@@ -79,3 +79,20 @@ function resolveShortcode(name: string): string | undefined {
 	}
 	return get(aliased);
 }
+
+/**
+ * Resolve a bare reaction `name` (no surrounding colons; possibly
+ * with a `::skin-tone-N` modifier) to its rendered form. Returns
+ * the Unicode glyph when known, otherwise `":name:"` so the user
+ * still sees the bot's intent.
+ *
+ * Skin-tone modifiers are stripped before lookup — `node-emoji`
+ * doesn't speak them and applying the colourised variants is a lot
+ * of code for a niche case. The base emoji is close enough for v1.
+ */
+export function resolveReactionName(name: string): string {
+	// `::skin-tone-N` (1-5) is Slack's modifier suffix for people
+	// emoji. Strip and look up the base.
+	const base = name.replace(/::skin-tone-\d+$/, '');
+	return resolveShortcode(base) ?? `:${name}:`;
+}

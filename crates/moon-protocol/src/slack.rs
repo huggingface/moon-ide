@@ -147,6 +147,31 @@ pub struct SlackMessage {
 	/// post `block_actions` back to the bot's app, which is out of
 	/// scope for the read-only chat panel.
 	pub actions: Vec<SlackAction>,
+	/// Reactions attached to the message, in the order Slack returns
+	/// them (which is roughly first-reacted-first). Empty when the
+	/// message has no reactions. Read-only in v1 — tapping a chip
+	/// doesn't toggle the user's own reaction yet.
+	pub reactions: Vec<SlackReaction>,
+}
+
+/// One reaction group on a message — Slack collapses repeated
+/// reactions of the same emoji into a single entry with a count.
+/// We don't surface the per-reactor user list yet (no tooltip in
+/// the read-only-minus-tooltip cut); when somebody asks, swap in a
+/// `pub users: Vec<String>` and resolve via the existing
+/// `userCache`.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SlackReaction {
+	/// Slack emoji shortcode without the surrounding colons
+	/// (e.g. `"thumbsup"`, `"rocket"`, `"custom_team_emoji"`).
+	/// May include a `::skin-tone-N` suffix on people emoji that
+	/// the reactor applied a skin-tone modifier to.
+	pub name: String,
+	/// Number of users who reacted with this emoji. Always ≥ 1
+	/// (Slack drops the entry when the last reactor removes
+	/// theirs).
+	pub count: u32,
 }
 
 /// One link button rendered under a message body. Always points at a

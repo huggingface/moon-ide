@@ -513,13 +513,16 @@ so the user doesn't reinstall.
 ## Sending messages (Phase 11.3)
 
 The composer is a fixed-bottom textarea, plus a Send button.
-**Ctrl+Enter** (or **Cmd+Enter** on macOS) fires
-`slack_post_message`; plain Enter inserts a newline (matching
-Slack's own composer — multi-line code snippets and paragraphs
-need it). Esc cancels the new-session composer and returns to the
-session list. The composer disables itself while `chat.postMessage`
-is in flight; on success the textarea clears, on failure the draft
-sticks around with a small error line above the input.
+**Enter** fires `slack_post_message` (the team's preference —
+one-key send beats Slack's own Ctrl+Enter default for the
+short, conversational messages this panel is built around).
+**Shift+Enter** inserts a newline; **Ctrl/Cmd+Enter** also
+sends, so users carrying muscle memory from Slack don't have to
+relearn anything. Esc cancels the new-session composer and
+returns to the session list. The composer disables itself while
+`chat.postMessage` is in flight; on success the textarea clears,
+on failure the draft sticks around with a small error line above
+the input.
 
 Two posting modes:
 
@@ -545,7 +548,7 @@ with a "sending..." pip — the API call is fast enough (~200 ms)
 that the round-trip feels instant, and adding a separate "in
 flight" UI state for that brief window costs more than it pays.
 A failed post leaves the draft in the textarea with the error
-above; the user retries with another Ctrl+Enter.
+above; the user retries with another Enter.
 
 Slack's `chat.postMessage` accepts mrkdwn directly (the API doc
 calls it `text`, but renders `*bold*`, `<https://x|y>`, code
@@ -583,7 +586,7 @@ The panel itself, top-to-bottom:
 │                                      │
 ├──────────────────────────────────────┤
 │ ┌──────────────────────────────────┐ │
-│ │ Type a message — Ctrl+Enter      │ │  ← input (11.3)
+│ │ Type a message — Enter to send   │ │  ← input (11.3)
 │ └──────────────────────────────────┘ │
 └──────────────────────────────────────┘
 ```
@@ -669,6 +672,16 @@ Push events from backend → frontend (11.2):
   now.
 - **No multi-account.** One Slack workspace per moon-ide install.
   Multi-workspace is a Phase 12 problem.
-- **No bot-side message reactions yet.** Moonbot uses ✅ / ⚠️ / ❌
-  reactions for status; we don't render those in 11.0–11.3. Adds in
-  11.4 if it's actually useful.
+- **No reaction add/remove from the panel yet.** 11.3.1 ships
+  _display_ (small chips with emoji + count below the message
+  body). Tapping a chip to toggle the user's own reaction needs
+  `reactions:write` (already in the upfront grant), an emoji
+  picker, and a "you reacted" highlight; deferred until somebody
+  asks. Skin-tone modifiers (`::skin-tone-N`) render as the base
+  emoji because `node-emoji` doesn't speak the colourised
+  variants — close enough.
+- **No custom workspace emoji.** Slack lets workspaces upload
+  their own emoji (`:moonbot-thumbsup:`); we render those as the
+  raw `:shortcode:` text. Resolving them needs `emoji.list`
+  (cheap) and an `<img>` per chip, which is more code than the
+  feature currently warrants.

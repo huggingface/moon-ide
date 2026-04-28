@@ -6,6 +6,7 @@
 	import { botLabel, userLabel, type SlackBotProfile, type SlackSession } from '../protocol';
 	import { formatSlackRelative, formatSlackTime } from '../util/slackTime';
 	import { collectMentionedUserIds, parseSlackMrkdwn, slackPlainText } from '../util/slackMrkdwn';
+	import { resolveReactionName } from '../util/slackEmoji';
 	import ChatConnectModal from './ChatConnectModal.svelte';
 	import SlackMessageBody from './SlackMessageBody.svelte';
 
@@ -209,11 +210,14 @@
 		}
 	}
 
-	// Ctrl/Cmd+Enter sends; plain Enter inserts a newline (matches
-	// Slack's own composer). Shift+Enter is also a newline. Esc cancels
-	// the new-session composer.
+	// Plain Enter sends; Shift+Enter inserts a newline. Same as
+	// chat clients that prioritise speed over multi-line drafts —
+	// the team explicitly preferred this over Slack's
+	// Ctrl+Enter-to-send default. Esc cancels the new-session
+	// composer. Cmd/Ctrl+Enter still works as a send chord for
+	// muscle memory carried over from other tools.
 	function onComposerKeydown(event: KeyboardEvent) {
-		if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+		if (event.key === 'Enter' && !event.shiftKey && !event.altKey) {
 			event.preventDefault();
 			void onSubmitDraft();
 			return;
@@ -225,7 +229,9 @@
 	}
 
 	const composerPlaceholder = $derived(
-		slack.composingNewSession ? 'Start a new conversation — Ctrl+Enter to send' : 'Reply — Ctrl+Enter to send',
+		slack.composingNewSession
+			? 'Start a new conversation — Enter to send, Shift+Enter for a new line'
+			: 'Reply — Enter to send, Shift+Enter for a new line',
 	);
 	const composerDisabled = $derived(slack.sending);
 	const sendDisabled = $derived(slack.sending || draft.trim().length === 0);
@@ -384,6 +390,16 @@
 											</span>
 										</header>
 										<div class="message-body"><SlackMessageBody text={message.text} /></div>
+										{#if message.reactions.length > 0}
+											<div class="reactions">
+												{#each message.reactions as reaction (reaction.name)}
+													<span class="reaction-chip" title=":{reaction.name}:">
+														<span class="reaction-emoji">{resolveReactionName(reaction.name)}</span>
+														<span class="reaction-count">{reaction.count}</span>
+													</span>
+												{/each}
+											</div>
+										{/if}
 										{#if message.actions.length > 0}
 											<div class="message-actions">
 												{#each message.actions as action, i (i)}
@@ -425,7 +441,7 @@
 								class="primary composer-send"
 								disabled={sendDisabled}
 								onclick={() => void onSubmitDraft()}
-								title="Send (Ctrl+Enter)">{slack.sending ? 'Sending…' : 'Send'}</button
+								title="Send (Enter)">{slack.sending ? 'Sending…' : 'Send'}</button
 							>
 						</div>
 					</section>
@@ -907,6 +923,33 @@
 		flex-wrap: wrap;
 		gap: 6px;
 		margin-top: 4px;
+	}
+	.reactions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 4px;
+		margin-top: 4px;
+	}
+	.reaction-chip {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		padding: 1px 6px;
+		background: var(--m-bg-2);
+		border: 1px solid var(--m-border);
+		border-radius: 10px;
+		font-size: 11px;
+		line-height: 1.4;
+		color: var(--m-fg-muted);
+		user-select: none;
+	}
+	.reaction-emoji {
+		font-size: 12px;
+		line-height: 1;
+	}
+	.reaction-count {
+		font-variant-numeric: tabular-nums;
+		font-weight: 500;
 	}
 	.action-btn {
 		font-size: 11px;
