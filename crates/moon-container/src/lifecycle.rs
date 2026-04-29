@@ -512,13 +512,14 @@ impl From<PsEntry> for ServiceStatus {
 /// 1. `Paused` — any container paused.
 /// 2. `Failed` —
 ///    - any container `dead` or in an unrecognised state, OR
-///    - any container exited with a non-zero code, OR
-///    - mixed: at least one running with at least one stuck
-///      in `created` or `exited` alongside it (interrupted
-///      `compose up` or stalled `depends_on`).
-/// 3. `Creating` — any container `restarting` (actively
-///    transitioning; `created` on its own does **not** count,
-///    that's an inert "exists but never started" state).
+///    - any container exited with a non-zero code (including
+///      a previously-failed init container blocking `cas` or
+///      similar `depends_on: service_completed_successfully`
+///      consumers from ever starting).
+/// 3. `Creating` — any container `restarting`, or a mix of
+///    `running` + `created` (depends_on chains take time to
+///    resolve during `compose up`; absent any non-zero exit
+///    we lean toward "still coming up" rather than failed).
 /// 4. `Running` — at least one container running and the rest
 ///    are healthy zero-exit init containers.
 /// 5. `Stopped` — everything is `created` or zero-exit
@@ -562,15 +563,15 @@ pub(crate) fn aggregate_state(services: &[ServiceStatus]) -> ContainerState {
 	if any_dead_or_unknown || any_exited_nonzero {
 		return ContainerState::Failed;
 	}
-	// Mixed-state detection: a running service alongside a
-	// `created` (stalled `depends_on`, interrupted `compose
-	// up`) means the project isn't all the way up. Init
-	// containers that exited 0 don't trip this — that's the
-	// expected end state for a one-shot.
-	if any_running && any_created {
-		return ContainerState::Failed;
-	}
-	if any_restarting {
+	// `running` + `created` is the normal in-progress state
+	// during `compose up`: long-running upstreams are up while
+	// downstreams sit in `created` waiting on their `depends_on`
+	// chain to resolve (e.g. `cas` waits on `cas-deps` to exit
+	// 0). Absent any non-zero-exit signal we treat that as
+	// Creating, not Failed — a genuinely stuck consumer surfaces
+	// via the per-service indicator and via the upstream's
+	// non-zero exit when it eventually fails.
+	if any_restarting || (any_running && any_created) {
 		return ContainerState::Creating;
 	}
 	if any_running {
@@ -725,18 +726,36 @@ mod tests {
 	}
 
 	#[test]
-	fn aggregate_running_with_stalled_created_is_failed() {
-		// The user-reported bug: compose up -d --wait was killed
-		// mid-startup, leaving five services running and three
-		// stuck in `created` because their `depends_on` chain
-		// never satisfied. Old aggregation said "Creating" forever;
-		// new aggregation flags it as Failed so the popover's
-		// rebuild / tear-down affordances surface.
+	fn aggregate_running_with_created_is_creating() {
+		// Mid-startup snapshot: long-running upstreams (`dev`,
+		// `redis`) are already up, downstreams (`cas`, `mongo`)
+		// are still in `created` because their `depends_on`
+		// chain hasn't resolved yet. Lean toward Creating —
+		// flagging this as Failed would misfire on every
+		// healthy compose up. Genuinely stuck downstreams
+		// surface as `exited(non-zero)` upstream of them, which
+		// the rule above already maps to Failed.
 		let services = [
 			svc("dev", "running"),
 			svc("redis", "running"),
 			svc("cas", "created"),
 			svc("mongo", "created"),
+		];
+		assert_eq!(aggregate_state(&services), ContainerState::Creating);
+	}
+
+	#[test]
+	fn aggregate_running_with_created_and_failed_init_is_failed() {
+		// The diagnostic version: the same `running + created`
+		// shape but with a failed init container upstream
+		// (e.g. `cas-deps` exited 255, blocking `cas` from
+		// ever starting). The non-zero exit is the unambiguous
+		// "this project needs attention" signal.
+		let services = [
+			svc("dev", "running"),
+			svc("redis", "running"),
+			exited("cas-deps", 255),
+			svc("cas", "created"),
 		];
 		assert_eq!(aggregate_state(&services), ContainerState::Failed);
 	}
