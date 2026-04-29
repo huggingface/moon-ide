@@ -5,17 +5,30 @@
 //! [`Workspace`] handle that captures *the same three things every
 //! `docker compose` invocation needs*:
 //!
-//! - the workspace root (so we can discover sibling compose files
-//!   the first time we generate `.moon/compose.yaml`),
-//! - the compose project name (`moon-ws-<hash>` — see
-//!   [`crate::project`]),
-//! - the absolute path to `<root>/.moon/compose.yaml`.
+//! - the workspace's compose project name (`moon-ws-<id>` —
+//!   see [`crate::project`]),
+//! - the absolute path to the generated `compose.yaml`,
+//! - the bound-folder list, which is what gets bind-mounted into
+//!   the dev container and what gets scanned for project compose
+//!   files.
 //!
 //! From those, every command is `docker compose -f <path> -p
 //! <name> <subcommand>`. Both flags are always set explicitly so
 //! the working-directory of the spawned process never matters,
 //! and so `docker compose` doesn't accidentally pick up a
 //! different default project name from a `.env` file.
+//!
+//! State directory layout
+//! ----------------------
+//!
+//! Pre-2.5 the file lived at `<workspace>/.moon/compose.yaml`.
+//! Post-2.5 it's at `<state_dir>/compose.yaml` where `state_dir`
+//! is `~/.local/share/moon-ide/workspaces/<id>/` — outside any
+//! repo, decoupled from any specific folder. Sibling
+//! `bound-folders.json` records the bound-folder set the
+//! `compose.yaml` was generated from; the lifecycle layer treats
+//! both as fully generated (the user's customisation point is
+//! their projects' own compose files, which we `include:`).
 //!
 //! Why a thin shell-out, not bollard
 //! ---------------------------------
@@ -33,12 +46,10 @@
 //!
 //! - **Log streaming.** [`Workspace::status`] is a snapshot.
 //!   Streaming `docker compose logs --follow` into a tokio
-//!   channel for the UI lands with the Tauri-events commit.
+//!   channel for the UI lands with the per-service UI in 2.4.
 //! - **Cancellation.** A `setup` mid-flight that the user wants
 //!   to abort — also Tauri-layer, so it can be wired to the
 //!   status pip's "Cancel" button.
-//! - **Per-service operations.** 2.4's per-service start/stop/
-//!   restart UI surface; not relevant until the UI exists.
 
 use std::ffi::OsStr;
 
@@ -48,22 +59,24 @@ use moon_protocol::MoonError;
 use thiserror::Error;
 use tokio::process::Command;
 
-use crate::compose::{generate_compose, ComposeRender, ComposeRenderOptions};
-use crate::discovery::discover_compose_files;
-use crate::project::{project_name_for, ProjectName};
+use crate::compose::{generate_compose, BoundMount, ComposeRender, ComposeRenderOptions};
+use crate::discovery::discover_compose_files_for_folders;
+use crate::project::{project_name_for_id, ProjectName, ProjectNameError};
 
 /// The image reference written into a freshly generated
-/// `.moon/compose.yaml` if the caller doesn't override it.
+/// `compose.yaml` if the caller doesn't override it.
 ///
 /// Currently a *local* tag (`moon-base:dev`) because moon-base
 /// hasn't been published yet — see ADR 0007. Once the GitHub
 /// Actions workflow ships its first image to Docker Hub this
-/// flips to `huggingface/moon-base:0.1` (or similar). The default
-/// is intentionally a single-source constant rather than a config
-/// knob: per ADR 0005, "what image does a fresh moon-ide
-/// workspace build against?" is a release-time decision, not a
-/// per-user preference.
+/// flips to `huggingface/moon-base:0.1` (or similar).
 pub const DEFAULT_DEV_IMAGE: &str = "moon-base:dev";
+
+/// Filename of the bound-folder sidecar inside the state dir.
+pub const BOUND_FOLDERS_FILE: &str = "bound-folders.json";
+
+/// Filename of the generated compose file inside the state dir.
+pub const COMPOSE_FILE: &str = "compose.yaml";
 
 /// Errors the lifecycle layer surfaces to callers.
 ///
@@ -84,6 +97,9 @@ pub enum LifecycleError {
 
 	#[error("could not parse `docker compose ps` output: {0}")]
 	ParseError(String),
+
+	#[error("invalid workspace id: {0}")]
+	InvalidWorkspaceId(#[from] ProjectNameError),
 
 	#[error("io error: {0}")]
 	Io(#[from] std::io::Error),
@@ -109,36 +125,52 @@ impl From<LifecycleError> for MoonError {
 				MoonError::internal(format!("docker compose failed (exit {code}): {stderr}"))
 			}
 			LifecycleError::ParseError(msg) => MoonError::internal(format!("could not parse docker compose output: {msg}")),
+			LifecycleError::InvalidWorkspaceId(err) => MoonError::invalid(err.to_string()),
 			LifecycleError::Io(err) => MoonError::from(err),
 		}
 	}
 }
 
+/// Inputs the caller resolves before constructing a [`Workspace`].
+#[derive(Debug, Clone)]
+pub struct WorkspaceConfig {
+	/// Stable, validated workspace identifier (`default` for now).
+	/// Becomes the suffix on the compose project name and the
+	/// directory name under `<workspaces_dir>/`.
+	pub workspace_id: String,
+	/// Where the workspace's `compose.yaml` and
+	/// `bound-folders.json` live. Created on first write.
+	pub state_dir: Utf8PathBuf,
+	/// Absolute paths to every folder the workspace has bound,
+	/// in user-chosen order. Each is bind-mounted at
+	/// `/workspace/<basename>` inside the dev container.
+	pub bound_folders: Vec<Utf8PathBuf>,
+}
+
 /// Handle on a workspace's compose project. Cheap to construct
-/// (no I/O), cheap to clone (`Arc`-able strings under the hood).
+/// (no I/O).
 #[derive(Debug, Clone)]
 pub struct Workspace {
-	root: Utf8PathBuf,
+	state_dir: Utf8PathBuf,
+	bound_folders: Vec<Utf8PathBuf>,
 	project: ProjectName,
 	compose_path: Utf8PathBuf,
+	bound_folders_path: Utf8PathBuf,
 }
 
 impl Workspace {
-	/// Construct a handle for the workspace rooted at `root`.
-	/// Doesn't touch disk; safe to call before the workspace has
-	/// been "set up".
-	pub fn for_root(root: Utf8PathBuf) -> Self {
-		let project = project_name_for(&root);
-		let compose_path = root.join(".moon").join("compose.yaml");
-		Self {
-			root,
+	/// Construct a handle from validated inputs.
+	pub fn new(config: WorkspaceConfig) -> Result<Self, LifecycleError> {
+		let project = project_name_for_id(&config.workspace_id)?;
+		let compose_path = config.state_dir.join(COMPOSE_FILE);
+		let bound_folders_path = config.state_dir.join(BOUND_FOLDERS_FILE);
+		Ok(Self {
+			state_dir: config.state_dir,
+			bound_folders: config.bound_folders,
 			project,
 			compose_path,
-		}
-	}
-
-	pub fn root(&self) -> &Utf8Path {
-		&self.root
+			bound_folders_path,
+		})
 	}
 
 	pub fn project(&self) -> &ProjectName {
@@ -149,45 +181,71 @@ impl Workspace {
 		&self.compose_path
 	}
 
-	/// True iff `<root>/.moon/compose.yaml` exists. Doesn't say
+	pub fn bound_folders_path(&self) -> &Utf8Path {
+		&self.bound_folders_path
+	}
+
+	pub fn bound_folders(&self) -> &[Utf8PathBuf] {
+		&self.bound_folders
+	}
+
+	/// True iff `<state_dir>/compose.yaml` exists. Doesn't say
 	/// anything about whether the containers are up.
 	pub fn is_initialized(&self) -> bool {
 		self.compose_path.is_file()
 	}
 
-	/// Render what `<root>/.moon/compose.yaml` *would* look like
-	/// if we generated it right now. Useful for an "Inspect"
-	/// affordance before the user clicks "Set up".
+	/// Render what `compose.yaml` *would* look like if we
+	/// generated it right now from the current bound-folder set.
+	/// Useful for an "Inspect" affordance before the user clicks
+	/// "Set up".
 	pub fn render_compose(&self, dev_image: &str) -> ComposeRender {
-		let discovery = discover_compose_files(&self.root);
-		let includes: Vec<&Utf8Path> = discovery.files.iter().map(|f| f.relative_path.as_path()).collect();
+		let mounts = self.bound_mounts();
+		let discovery = discover_compose_files_for_folders(&self.bound_folders);
+		let includes: Vec<&Utf8Path> = discovery.files.iter().map(|f| f.absolute_path.as_path()).collect();
 		generate_compose(ComposeRenderOptions {
 			project: &self.project,
 			dev_image,
+			bound_mounts: &mounts,
 			include_files: &includes,
 		})
 	}
 
-	/// Generate `.moon/compose.yaml` if it doesn't already exist.
-	/// Returns `Ok(true)` if the file was written this call,
-	/// `Ok(false)` if it was already present.
-	pub async fn write_compose_if_missing(&self, dev_image: &str) -> Result<bool, LifecycleError> {
-		if self.compose_path.is_file() {
-			return Ok(false);
-		}
+	/// Compute the volume-mount entries from the bound-folder
+	/// list. The basename becomes the `/workspace/<name>` segment
+	/// — duplicates across the workspace are the registry layer's
+	/// problem to refuse, this layer trusts the input.
+	fn bound_mounts(&self) -> Vec<BoundMount> {
+		self
+			.bound_folders
+			.iter()
+			.map(|path| BoundMount {
+				host_path: path.clone(),
+				mount_name: mount_name_for(path),
+			})
+			.collect()
+	}
+
+	/// Persist the current bound-folder set + regenerated compose
+	/// file to disk. Idempotent — writes the same bytes every
+	/// time the input is the same. Returns `Ok(true)` if either
+	/// file's contents changed (so callers can decide whether to
+	/// re-apply via `docker compose up`).
+	pub async fn write_state(&self, dev_image: &str) -> Result<bool, LifecycleError> {
+		tokio::fs::create_dir_all(self.state_dir.as_std_path()).await?;
 		let render = self.render_compose(dev_image);
-		if let Some(parent) = self.compose_path.parent() {
-			tokio::fs::create_dir_all(parent.as_std_path()).await?;
-		}
-		tokio::fs::write(self.compose_path.as_std_path(), render.yaml).await?;
-		Ok(true)
+		let bound_json = render_bound_folders_json(&self.bound_folders);
+
+		let compose_changed = write_if_changed(&self.compose_path, render.yaml.as_bytes()).await?;
+		let bound_changed = write_if_changed(&self.bound_folders_path, bound_json.as_bytes()).await?;
+		Ok(compose_changed || bound_changed)
 	}
 
 	/// Snapshot the compose project's state.
 	///
 	/// `Absent` is returned without invoking docker if there's no
-	/// `.moon/compose.yaml` yet — opening a fresh workspace is
-	/// the common case and we don't want to pay a `docker compose`
+	/// `compose.yaml` yet — opening a fresh workspace is the
+	/// common case and we don't want to pay a `docker compose`
 	/// invocation per open just to confirm "no, still nothing".
 	pub async fn status(&self) -> Result<ContainerStatus, LifecycleError> {
 		if !self.compose_path.is_file() {
@@ -202,12 +260,36 @@ impl Workspace {
 		Ok(ContainerStatus { state, services })
 	}
 
-	/// First-time opt-in: generate `.moon/compose.yaml` if
-	/// missing, then `docker compose up -d --wait` so we don't
-	/// return until everything is healthy (or has failed).
+	/// First-time opt-in: regenerate the workspace's compose
+	/// state from the current bound-folder set, then `docker
+	/// compose up -d --wait` so we don't return until everything
+	/// is healthy (or has failed).
 	pub async fn setup(&self, dev_image: &str) -> Result<(), LifecycleError> {
-		self.write_compose_if_missing(dev_image).await?;
+		self.write_state(dev_image).await?;
 		self.docker_compose(["up", "-d", "--wait"]).await?;
+		Ok(())
+	}
+
+	/// Refresh `compose.yaml` + `bound-folders.json` from the
+	/// current bound-folder set, then — if the project is
+	/// already running — apply the diff with `up -d --wait`.
+	///
+	/// Used by the IDE after the user adds or removes a folder.
+	/// If the project isn't running yet (status `Absent`,
+	/// `Paused`, `Stopped`, or `Failed`), we only persist the
+	/// new files and let the next explicit lifecycle action
+	/// (`setup` / `rebuild`) bring the change in. This avoids
+	/// surprise-recreating containers while the user has them
+	/// paused on purpose.
+	pub async fn apply_bound_folders(&self, dev_image: &str) -> Result<(), LifecycleError> {
+		let changed = self.write_state(dev_image).await?;
+		if !changed {
+			return Ok(());
+		}
+		let status = self.status().await?;
+		if matches!(status.state, ContainerState::Running) {
+			self.docker_compose(["up", "-d", "--wait"]).await?;
+		}
 		Ok(())
 	}
 
@@ -230,7 +312,12 @@ impl Workspace {
 	/// changed, when an included compose changed in a way `up`
 	/// didn't pick up, or when the user just wants to start
 	/// over.
-	pub async fn rebuild(&self) -> Result<(), LifecycleError> {
+	pub async fn rebuild(&self, dev_image: &str) -> Result<(), LifecycleError> {
+		// Make sure the file on disk reflects the current
+		// bound-folder set before forcing a recreate — otherwise
+		// "Rebuild" could end up resurrecting the previous
+		// generation's mounts.
+		self.write_state(dev_image).await?;
 		self
 			.docker_compose(["up", "-d", "--force-recreate", "--pull", "always", "--wait"])
 			.await?;
@@ -293,6 +380,53 @@ impl Workspace {
 
 struct DockerOutput {
 	stdout: Vec<u8>,
+}
+
+/// Pick the container-side directory name for a host-side folder.
+///
+/// Always the basename. Callers (i.e. the workspace registry) are
+/// responsible for refusing to bind two folders that would
+/// collide on the same name; this layer falls back to a generic
+/// `root` name if the basename is missing (e.g. binding `/` —
+/// nonsensical in practice, but we don't want to emit an empty
+/// mount segment).
+fn mount_name_for(path: &Utf8Path) -> String {
+	path
+		.file_name()
+		.filter(|s| !s.is_empty())
+		.map(str::to_owned)
+		.unwrap_or_else(|| "root".to_owned())
+}
+
+fn render_bound_folders_json(folders: &[Utf8PathBuf]) -> String {
+	// Hand-rolled JSON — the structure is one array of strings,
+	// stable ordering, and we'd rather not pull `serde_json` into
+	// the rendering path just for that.
+	let mut out = String::from("{\n  \"folders\": [");
+	for (i, folder) in folders.iter().enumerate() {
+		if i > 0 {
+			out.push(',');
+		}
+		out.push_str("\n    ");
+		// Re-use serde_json for escaping the path string itself
+		// (serde is already a dep of this crate via moon-protocol).
+		out.push_str(&serde_json::to_string(folder.as_str()).expect("UTF-8 path serializes"));
+	}
+	if folders.is_empty() {
+		out.push_str("]\n}\n");
+	} else {
+		out.push_str("\n  ]\n}\n");
+	}
+	out
+}
+
+async fn write_if_changed(path: &Utf8Path, contents: &[u8]) -> Result<bool, std::io::Error> {
+	match tokio::fs::read(path.as_std_path()).await {
+		Ok(existing) if existing == contents => return Ok(false),
+		Ok(_) | Err(_) => {}
+	}
+	tokio::fs::write(path.as_std_path(), contents).await?;
+	Ok(true)
 }
 
 // Pure helpers — extracted so the parsing + aggregation logic is
@@ -407,6 +541,15 @@ mod tests {
 		}
 	}
 
+	fn workspace_in(state_dir: Utf8PathBuf, folders: Vec<Utf8PathBuf>) -> Workspace {
+		Workspace::new(WorkspaceConfig {
+			workspace_id: "default".into(),
+			state_dir,
+			bound_folders: folders,
+		})
+		.expect("default is a valid id")
+	}
+
 	#[test]
 	fn parse_ps_empty_stdout_is_empty_list() {
 		assert!(parse_ps_output(b"").unwrap().is_empty());
@@ -456,9 +599,6 @@ mod tests {
 
 	#[test]
 	fn aggregate_any_paused_dominates() {
-		// A single paused service flips the whole project to
-		// paused — matches the UX spec ("the project is paused
-		// when any container is paused").
 		let services = [svc("dev", "running"), svc("mongo", "paused")];
 		assert_eq!(aggregate_state(&services), ContainerState::Paused);
 	}
@@ -485,8 +625,6 @@ mod tests {
 
 	#[test]
 	fn aggregate_unknown_state_falls_to_failed() {
-		// Forward-compat: a future Docker version inventing a
-		// new status shouldn't show up as a happy "running".
 		assert_eq!(aggregate_state(&[svc("dev", "wat")]), ContainerState::Failed,);
 	}
 
@@ -500,36 +638,90 @@ mod tests {
 
 	#[test]
 	fn workspace_handle_derives_paths_without_io() {
-		let root = Utf8PathBuf::from("/tmp/non-existent-moon-x");
-		let ws = Workspace::for_root(root.clone());
-		assert_eq!(ws.root(), &root);
-		assert_eq!(ws.compose_path(), root.join(".moon/compose.yaml"));
-		assert!(ws.project().as_str().starts_with("moon-ws-"));
+		let state_dir = Utf8PathBuf::from("/tmp/non-existent-moon-x");
+		let ws = workspace_in(state_dir.clone(), vec![Utf8PathBuf::from("/tmp/folder")]);
+		assert_eq!(ws.compose_path(), state_dir.join("compose.yaml"));
+		assert_eq!(ws.bound_folders_path(), state_dir.join("bound-folders.json"));
+		assert_eq!(ws.project().as_str(), "moon-ws-default");
 		assert!(!ws.is_initialized());
 	}
 
 	#[tokio::test]
 	async fn status_on_uninitialised_workspace_is_absent() {
 		let tmp = tempfile::tempdir().unwrap();
-		let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
-		let ws = Workspace::for_root(root);
+		let state_dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let ws = workspace_in(state_dir, vec![]);
 		let status = ws.status().await.unwrap();
 		assert_eq!(status.state, ContainerState::Absent);
 		assert!(status.services.is_empty());
 	}
 
 	#[tokio::test]
-	async fn write_compose_if_missing_is_idempotent() {
+	async fn write_state_creates_state_dir_and_files() {
 		let tmp = tempfile::tempdir().unwrap();
-		let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
-		let ws = Workspace::for_root(root);
+		// Pick a deeper state_dir to confirm `create_dir_all`
+		// applies — the parent doesn't exist yet.
+		let state_dir = Utf8PathBuf::from_path_buf(tmp.path().join("a").join("b")).unwrap();
+		let folder = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let ws = workspace_in(state_dir.clone(), vec![folder.clone()]);
 
-		assert!(ws.write_compose_if_missing(DEFAULT_DEV_IMAGE).await.unwrap());
+		let changed = ws.write_state(DEFAULT_DEV_IMAGE).await.unwrap();
+		assert!(changed);
 		assert!(ws.is_initialized());
+		// Bound-folders sidecar lands alongside.
+		let bound_json = tokio::fs::read_to_string(ws.bound_folders_path().as_std_path())
+			.await
+			.unwrap();
+		assert!(bound_json.contains(folder.as_str()));
+	}
 
-		// Second call doesn't rewrite — caller-driven state, not
-		// "regenerate on every status check".
-		assert!(!ws.write_compose_if_missing(DEFAULT_DEV_IMAGE).await.unwrap());
+	#[tokio::test]
+	async fn write_state_is_idempotent_when_inputs_unchanged() {
+		let tmp = tempfile::tempdir().unwrap();
+		let state_dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let folder = Utf8PathBuf::from("/tmp/some/folder");
+		let ws = workspace_in(state_dir, vec![folder]);
+
+		assert!(ws.write_state(DEFAULT_DEV_IMAGE).await.unwrap());
+		// Second call: same inputs, no change to bytes on disk
+		// → returns `false` so callers can skip a `compose up`.
+		assert!(!ws.write_state(DEFAULT_DEV_IMAGE).await.unwrap());
+	}
+
+	#[test]
+	fn render_bound_folders_json_emits_minimal_structure() {
+		let json = render_bound_folders_json(&[]);
+		assert_eq!(json, "{\n  \"folders\": []\n}\n");
+
+		let json = render_bound_folders_json(&[
+			Utf8PathBuf::from("/home/me/code/moon-landing"),
+			Utf8PathBuf::from("/home/me/code/moon-ide"),
+		]);
+		assert!(json.contains("\"/home/me/code/moon-landing\""));
+		assert!(json.contains("\"/home/me/code/moon-ide\""));
+		// Comma between the two entries, no trailing comma.
+		let body_only = json.split("[").nth(1).unwrap();
+		assert_eq!(body_only.matches(',').count(), 1);
+	}
+
+	#[test]
+	fn mount_name_falls_back_to_dashed_path_for_root_input() {
+		// `/` has no basename — we should still produce a
+		// directory-name-shaped string rather than an empty mount
+		// segment.
+		let path = Utf8Path::new("/");
+		assert!(!mount_name_for(path).is_empty());
+	}
+
+	#[test]
+	fn invalid_workspace_id_is_a_typed_error() {
+		let err = Workspace::new(WorkspaceConfig {
+			workspace_id: "Invalid Id".into(),
+			state_dir: Utf8PathBuf::from("/tmp/x"),
+			bound_folders: vec![],
+		})
+		.unwrap_err();
+		assert!(matches!(err, LifecycleError::InvalidWorkspaceId(_)));
 	}
 
 	// Real-Docker integration smoke. `--ignored` so `cargo test`
@@ -539,8 +731,9 @@ mod tests {
 	#[ignore = "requires a running Docker daemon and pulls alpine:latest"]
 	async fn container_smoke_setup_pause_resume_teardown() {
 		let tmp = tempfile::tempdir().unwrap();
-		let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
-		let ws = Workspace::for_root(root);
+		let state_dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let folder = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let ws = workspace_in(state_dir, vec![folder]);
 
 		// alpine is 3 MB and on every developer's machine
 		// already; `sleep infinity` keeps it up.

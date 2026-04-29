@@ -12,6 +12,13 @@ pub struct AppState {
 	/// Where global, machine-local app state lives (last opened folder, etc.).
 	/// Set once at startup from Tauri's `app_config_dir`.
 	pub config_dir: Utf8PathBuf,
+	/// Root of moon-ide's per-workspace state directories — one
+	/// subdirectory per workspace id holds that workspace's
+	/// `compose.yaml` and `bound-folders.json`. Resolved once at
+	/// startup as `<dirs::data_local_dir>/moon-ide/workspaces/`.
+	/// Decoupled from the workspace folder set so the compose
+	/// project survives folder switches (see ADR 0007 amendment).
+	pub workspaces_dir: Utf8PathBuf,
 	/// Slack chat panel state. The token itself lives in the OS keyring;
 	/// this is the in-memory client cache (populated at startup if the
 	/// keyring has a token, otherwise lazily on first `slack_set_token`).
@@ -19,12 +26,22 @@ pub struct AppState {
 }
 
 impl AppState {
-	pub fn new(config_dir: Utf8PathBuf, slack: SlackState) -> Self {
+	pub fn new(config_dir: Utf8PathBuf, workspaces_dir: Utf8PathBuf, slack: SlackState) -> Self {
 		Self {
 			workspaces: WorkspaceRegistry::new(),
 			config_dir,
+			workspaces_dir,
 			slack,
 		}
+	}
+
+	/// Path of the per-workspace state directory for the given
+	/// id (e.g. `<workspaces_dir>/default/`). The directory itself
+	/// is created lazily on first compose write — the existence
+	/// check belongs in `moon-container`'s lifecycle layer, not
+	/// here.
+	pub fn workspace_state_dir(&self, workspace_id: &str) -> Utf8PathBuf {
+		self.workspaces_dir.join(workspace_id)
 	}
 }
 

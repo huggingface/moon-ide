@@ -5,20 +5,27 @@
 //! siblings via compose `include:` (see ADR 0008). To make that
 //! one-click, we need to find the existing compose files
 //! automatically — anything moon-landing-shaped (a workspace
-//! that contains one or more project subdirectories, each with
-//! its own `docker-compose.yml`) should Just Work.
+//! folder that contains one or more project subdirectories, each
+//! with its own `docker-compose.yml`) should Just Work.
 //!
 //! Scope of the scan
 //! -----------------
 //!
-//! - Workspace root.
+//! Per bound folder:
+//!
+//! - The folder root.
 //! - Each immediate child directory (depth = 1).
 //!
 //! That's it. We deliberately do **not** recurse — `node_modules`
 //! and `target` would be expensive to walk, and a deeply nested
 //! compose file isn't something moon-ide should auto-include
 //! anyway: if a user genuinely wants a sub-sub-directory's compose,
-//! they can edit `.moon/compose.yaml` by hand.
+//! they can put a top-level `compose.yaml` in their folder that
+//! `include:`s it.
+//!
+//! Multiple bound folders are scanned independently; results are
+//! merged in folder-input order, with intra-folder ordering
+//! sorted by path. See [`discover_compose_files_for_folders`].
 //!
 //! What we recognise
 //! -----------------
@@ -54,14 +61,17 @@ use std::collections::BTreeMap;
 
 use camino::{Utf8Path, Utf8PathBuf};
 
-/// One compose file discovered inside a workspace.
+/// One compose file discovered inside a bound folder.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DiscoveredCompose {
-	/// Absolute, canonicalised path to the compose file.
-	pub absolute_path: Utf8PathBuf,
-	/// Path relative to the workspace root (forward slashes).
-	/// This is the form the generated `compose.yaml` consumes when
+	/// Absolute, canonicalised path to the compose file. The
+	/// generated `compose.yaml` consumes this verbatim when
 	/// building `include:` entries — see [`crate::compose`].
+	pub absolute_path: Utf8PathBuf,
+	/// Path relative to the folder it was discovered under
+	/// (forward slashes). Useful for UI display ("found
+	/// `services/api/docker-compose.yml`") but not for include
+	/// generation, which uses absolute paths.
 	pub relative_path: Utf8PathBuf,
 }
 
@@ -75,20 +85,20 @@ pub struct ComposeDiscovery {
 	pub files: Vec<DiscoveredCompose>,
 }
 
-/// Walk `workspace_root` (depth ≤ 1) and return every recognised
+/// Walk `folder_root` (depth ≤ 1) and return every recognised
 /// compose file. Missing or non-directory inputs return an empty
 /// discovery — opening a file or a non-existent path is a
 /// degenerate case the UI should surface elsewhere, not an error
 /// here.
 ///
 /// Output is sorted by `relative_path`, so callers can rely on
-/// stable ordering for diffing the generated `.moon/compose.yaml`.
-pub fn discover_compose_files(workspace_root: &Utf8Path) -> ComposeDiscovery {
+/// stable ordering for diffing the generated `compose.yaml`.
+pub fn discover_compose_files(folder_root: &Utf8Path) -> ComposeDiscovery {
 	let mut by_dir: BTreeMap<Utf8PathBuf, FoundFile> = BTreeMap::new();
 
-	scan_dir(workspace_root, workspace_root, &mut by_dir);
-	for child in immediate_subdirs(workspace_root) {
-		scan_dir(&child, workspace_root, &mut by_dir);
+	scan_dir(folder_root, folder_root, &mut by_dir);
+	for child in immediate_subdirs(folder_root) {
+		scan_dir(&child, folder_root, &mut by_dir);
 	}
 
 	let files = by_dir
@@ -99,6 +109,27 @@ pub fn discover_compose_files(workspace_root: &Utf8Path) -> ComposeDiscovery {
 		})
 		.collect();
 
+	ComposeDiscovery { files }
+}
+
+/// Scan every bound folder and concatenate their discoveries.
+///
+/// Per-folder ordering is preserved (so the resulting `include:`
+/// list mirrors the order folders were added to the workspace);
+/// intra-folder ordering remains sorted by relative path.
+/// Duplicates across folders aren't deduplicated — if two bound
+/// folders happen to be parent/child of each other, both get
+/// listed and compose flags the duplicate include itself.
+pub fn discover_compose_files_for_folders<I, P>(folder_roots: I) -> ComposeDiscovery
+where
+	I: IntoIterator<Item = P>,
+	P: AsRef<Utf8Path>,
+{
+	let mut files = Vec::new();
+	for root in folder_roots {
+		let mut sub = discover_compose_files(root.as_ref());
+		files.append(&mut sub.files);
+	}
 	ComposeDiscovery { files }
 }
 
@@ -334,5 +365,33 @@ mod tests {
 	fn non_existent_root_returns_empty() {
 		let path = Utf8PathBuf::from("/definitely/not/here/moon-x");
 		assert!(discover_compose_files(&path).files.is_empty());
+	}
+
+	#[test]
+	fn multi_folder_discovery_concatenates_in_input_order() {
+		let tmp = tempdir().unwrap();
+		let base = root(&tmp);
+		let landing = base.join("moon-landing");
+		let infra = base.join("infra");
+		touch(&landing.join("docker-compose.yml"));
+		touch(&infra.join("compose.yaml"));
+		// Bind a third folder with no compose file at all — the
+		// helper should tolerate it.
+		let docs = base.join("docs");
+		std::fs::create_dir_all(&docs).unwrap();
+
+		let result = discover_compose_files_for_folders([&landing, &infra, &docs]);
+		let abs: Vec<_> = result
+			.files
+			.iter()
+			.map(|f| f.absolute_path.as_str().to_owned())
+			.collect();
+		assert_eq!(
+			abs,
+			vec![
+				landing.join("docker-compose.yml").as_str().to_owned(),
+				infra.join("compose.yaml").as_str().to_owned(),
+			],
+		);
 	}
 }

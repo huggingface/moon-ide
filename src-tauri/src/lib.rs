@@ -45,6 +45,7 @@ pub fn run() {
 			commands::container::container_resume,
 			commands::container::container_rebuild,
 			commands::container::container_teardown,
+			commands::container::container_apply_bound_folders,
 			commands::container::container_render_compose,
 			commands::slack::slack_set_token,
 			commands::slack::slack_status,
@@ -70,6 +71,18 @@ pub fn run() {
 			let config_dir =
 				Utf8PathBuf::from_path_buf(config_dir).map_err(|p| format!("non-utf8 app config dir: {}", p.display()))?;
 
+			// Per the ADR 0007 amendment, workspace state (compose.yaml +
+			// bound-folders.json) lives outside any specific repo, in
+			// `<XDG_DATA_HOME>/moon-ide/workspaces/<id>/`. Resolved once
+			// at startup; commands compose the per-workspace directory
+			// from the workspace id at call time.
+			let local_data_dir =
+				dirs::data_local_dir().ok_or_else(|| "could not resolve local data dir for the current platform".to_owned())?;
+			let workspaces_dir = Utf8PathBuf::from_path_buf(local_data_dir)
+				.map_err(|p| format!("non-utf8 local data dir: {}", p.display()))?
+				.join("moon-ide")
+				.join("workspaces");
+
 			// Build the shared client cell first, spawn the Slack
 			// poller against it, then hand the same Arc to AppState
 			// so commands and the poller always see the same live
@@ -82,7 +95,7 @@ pub fn run() {
 				config_dir.clone(),
 			);
 			let slack_state = state::SlackState::new(client_cell, poller.clone());
-			let state = AppState::new(config_dir.clone(), slack_state);
+			let state = AppState::new(config_dir.clone(), workspaces_dir, slack_state);
 
 			// Restore the last session's workspace synchronously so the
 			// frontend's first call to `workspace_active` already sees it. The

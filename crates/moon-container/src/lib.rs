@@ -22,7 +22,7 @@ pub mod discovery;
 pub mod lifecycle;
 pub mod project;
 
-pub use compose::{generate_compose, ComposeRender, ComposeRenderOptions};
-pub use discovery::{discover_compose_files, ComposeDiscovery, DiscoveredCompose};
-pub use lifecycle::{LifecycleError, Workspace, DEFAULT_DEV_IMAGE};
-pub use project::{project_name_for, ProjectName};
+pub use compose::{generate_compose, BoundMount, ComposeRender, ComposeRenderOptions};
+pub use discovery::{discover_compose_files, discover_compose_files_for_folders, ComposeDiscovery, DiscoveredCompose};
+pub use lifecycle::{LifecycleError, Workspace, WorkspaceConfig, BOUND_FOLDERS_FILE, COMPOSE_FILE, DEFAULT_DEV_IMAGE};
+pub use project::{project_name_for_id, ProjectName, ProjectNameError};

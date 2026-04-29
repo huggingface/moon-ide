@@ -1,34 +1,28 @@
-//! Workspace path → compose project name.
+//! Workspace ID → compose project name.
 //!
 //! Compose's `name:` key disambiguates concurrent projects on a
 //! single Docker daemon (it prefixes container names, the project
 //! network, and the `docker compose` filter that lifecycle commands
-//! use). We derive it from a stable hash of the workspace's
-//! canonical absolute path so:
+//! use). Pre-2.5 we derived it from a hash of the workspace's path
+//! — fine when "the workspace" was just whichever folder the user
+//! had open, brittle the moment a workspace contains _multiple_
+//! folders (the project would have churned every time the active
+//! folder switched). Post-2.5 the workspace has a stable identity
+//! of its own, so the project name is just `moon-ws-<id>`.
 //!
-//! - opening the same workspace twice always yields the same name
-//!   (so `pause` / `resume` find the right containers),
-//! - opening two different workspaces never collides
-//!   (FNV-1a 32-bit ≈ 4×10⁹ buckets — the number of moon-ide
-//!   workspaces a single dev keeps around fits in a one-digit
-//!   collision-impossibility margin),
-//! - the name is always valid per Docker's project-name rules
-//!   (lowercase letter or digit lead, then `[a-z0-9_-]`).
-//!
-//! We use FNV-1a 32-bit by hand rather than pulling in a hash crate
-//! — the frontend already does the same thing for content
-//! fingerprints in `src/lib/util/hash.ts`, and keeping the two
-//! sides on the same primitive means a debug check ("does the
-//! frontend agree on the project name for this workspace?") is
-//! a literal string comparison.
+//! For now the IDE only ever uses the literal workspace ID
+//! `default`; multi-workspace support (Phase 7) will introduce
+//! more, at which point the validation here is the gate that
+//! makes sure those IDs survive a `docker compose -p ...`
+//! interpolation without quoting.
 
 use std::fmt;
 
-use camino::Utf8Path;
+use thiserror::Error;
 
-/// A validated Docker compose project name (`moon-ws-<8 hex>`).
+/// A validated Docker compose project name (`moon-ws-<id>`).
 ///
-/// Construct via [`project_name_for`]; never store an arbitrary
+/// Construct via [`project_name_for_id`]; never store an arbitrary
 /// string in this type — its existence is the proof that the
 /// name is safe to interpolate into a `docker compose -p ...`
 /// command line.
@@ -47,24 +41,53 @@ impl fmt::Display for ProjectName {
 	}
 }
 
-/// Derive the project name for a workspace at `path`.
+/// Reasons a workspace ID can't be turned into a project name.
 ///
-/// The input does not need to be absolute / canonical — we hash the
-/// raw bytes verbatim, so callers should canonicalise first if they
-/// want two equivalent paths (e.g. `~/code/foo` vs `/home/me/code/foo`)
-/// to map to the same project.
-pub fn project_name_for(path: &Utf8Path) -> ProjectName {
-	let hash = fnv1a32(path.as_str().as_bytes());
-	ProjectName(format!("moon-ws-{hash:08x}"))
+/// The ID is the user-visible (Phase 7) handle for a workspace,
+/// so we reject inputs that compose itself would refuse before
+/// they reach the daemon — gives a clean error at the IDE
+/// boundary instead of an opaque docker-compose stderr.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ProjectNameError {
+	#[error("workspace id must not be empty")]
+	Empty,
+
+	#[error("workspace id {id:?} contains an invalid character; allowed: lowercase letters, digits, '-', '_'")]
+	InvalidChar { id: String },
+
+	#[error("workspace id {id:?} must start with a lowercase letter or digit")]
+	InvalidStart { id: String },
 }
 
-fn fnv1a32(bytes: &[u8]) -> u32 {
-	let mut hash: u32 = 0x811c_9dc5;
-	for &b in bytes {
-		hash ^= u32::from(b);
-		hash = hash.wrapping_mul(0x0100_0193);
+/// Derive the compose project name for a workspace.
+///
+/// Compose project names must match `^[a-z0-9][a-z0-9_-]*$`
+/// (Docker enforces this at command time). We pre-validate so a
+/// bad ID surfaces as a typed error in the lifecycle layer
+/// rather than as a `docker compose failed (exit ...)` noise
+/// downstream.
+pub fn project_name_for_id(workspace_id: &str) -> Result<ProjectName, ProjectNameError> {
+	if workspace_id.is_empty() {
+		return Err(ProjectNameError::Empty);
 	}
-	hash
+	// Validate the full set first; that way an input like
+	// "Default" surfaces as `InvalidChar` (the actionable
+	// problem) rather than `InvalidStart`, even though its first
+	// character also fails the start rule.
+	for c in workspace_id.chars() {
+		if !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_') {
+			return Err(ProjectNameError::InvalidChar {
+				id: workspace_id.to_owned(),
+			});
+		}
+	}
+	let first = workspace_id.chars().next().expect("non-empty checked above");
+	if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+		return Err(ProjectNameError::InvalidStart {
+			id: workspace_id.to_owned(),
+		});
+	}
+	Ok(ProjectName(format!("moon-ws-{workspace_id}")))
 }
 
 #[cfg(test)]
@@ -72,45 +95,58 @@ mod tests {
 	use super::*;
 
 	#[test]
+	fn default_id_yields_expected_name() {
+		let name = project_name_for_id("default").unwrap();
+		assert_eq!(name.as_str(), "moon-ws-default");
+	}
+
+	#[test]
 	fn name_is_stable_across_calls() {
-		let path = Utf8Path::new("/home/dev/code/moon-landing");
-		assert_eq!(project_name_for(path), project_name_for(path));
+		let a = project_name_for_id("scratch").unwrap();
+		let b = project_name_for_id("scratch").unwrap();
+		assert_eq!(a, b);
 	}
 
 	#[test]
-	fn name_starts_with_letter_so_compose_accepts_it() {
-		let name = project_name_for(Utf8Path::new("/x"));
-		assert!(name.as_str().starts_with("moon-ws-"));
-		// Compose project names must match `^[a-z0-9][a-z0-9_-]*$`.
-		assert!(name
-			.as_str()
-			.chars()
-			.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
-	}
-
-	#[test]
-	fn distinct_paths_yield_distinct_names() {
-		let a = project_name_for(Utf8Path::new("/home/dev/code/moon-landing"));
-		let b = project_name_for(Utf8Path::new("/home/dev/code/moon-ide"));
+	fn distinct_ids_yield_distinct_names() {
+		let a = project_name_for_id("default").unwrap();
+		let b = project_name_for_id("scratch").unwrap();
 		assert_ne!(a, b);
 	}
 
 	#[test]
-	fn known_vector_matches_handrolled_fnv1a32() {
-		// FNV-1a 32-bit reference: empty input is the offset basis.
-		assert_eq!(fnv1a32(b""), 0x811c_9dc5);
-		// Single-byte 'a' = (0x811c9dc5 ^ 0x61) * 0x01000193.
-		assert_eq!(fnv1a32(b"a"), 0xe40c_292c);
-		// Spec test vector for "foobar".
-		assert_eq!(fnv1a32(b"foobar"), 0xbf9c_f968);
+	fn empty_id_is_rejected() {
+		assert_eq!(project_name_for_id(""), Err(ProjectNameError::Empty));
 	}
 
 	#[test]
-	fn matches_frontend_hash_convention() {
-		// `src/lib/util/hash.ts` runs the same FNV-1a 32-bit over
-		// UTF-8 bytes. If a future contributor changes one side
-		// without the other, this test catches it via the canonical
-		// "foobar" vector — both sides must agree on it.
-		assert_eq!(fnv1a32("foobar".as_bytes()), 0xbf9c_f968);
+	fn id_with_uppercase_is_rejected() {
+		assert!(matches!(
+			project_name_for_id("Default"),
+			Err(ProjectNameError::InvalidChar { .. }),
+		));
+	}
+
+	#[test]
+	fn id_starting_with_dash_is_rejected() {
+		assert!(matches!(
+			project_name_for_id("-foo"),
+			Err(ProjectNameError::InvalidStart { .. }),
+		));
+	}
+
+	#[test]
+	fn id_with_dot_is_rejected() {
+		// Compose would refuse `moon-ws-foo.bar` — disallow up front.
+		assert!(matches!(
+			project_name_for_id("foo.bar"),
+			Err(ProjectNameError::InvalidChar { .. }),
+		));
+	}
+
+	#[test]
+	fn underscores_and_dashes_are_allowed() {
+		let name = project_name_for_id("foo_bar-2").unwrap();
+		assert_eq!(name.as_str(), "moon-ws-foo_bar-2");
 	}
 }

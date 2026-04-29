@@ -2,13 +2,17 @@
 //!
 //! Phase 2.0 surface: snapshot the active workspace's compose
 //! project, drive its lifecycle (set up, pause, resume, rebuild,
-//! tear down), and preview the would-be `.moon/compose.yaml`
-//! before committing to "Set up".
+//! tear down), and preview the would-be `compose.yaml` before
+//! committing to "Set up".
 //!
-//! Every command resolves the active workspace via
-//! [`crate::state::AppState::workspaces`], so the frontend never
-//! has to thread a workspace id through the call site — the same
-//! shape the `fs_*` and `search_*` commands use.
+//! Post-2.5 the workspace's identity is decoupled from any
+//! specific folder — the compose project (`moon-ws-<id>`)
+//! survives folder switches; only its bound-mount set changes
+//! when folders are added or removed. The
+//! [`container_apply_bound_folders`] command lets the frontend
+//! re-emit `compose.yaml` after a folder add/remove and
+//! transparently apply the diff if the project happens to be
+//! running.
 //!
 //! Lifecycle-mutating commands (everything but `container_status`
 //! and `container_render_compose`) emit a [`CONTAINER_STATE_EVENT`]
@@ -16,7 +20,7 @@
 //! stay in lockstep without polling.
 
 use camino::Utf8PathBuf;
-use moon_container::{Workspace as ContainerWorkspace, DEFAULT_DEV_IMAGE};
+use moon_container::{Workspace as ContainerWorkspace, WorkspaceConfig, DEFAULT_DEV_IMAGE};
 use moon_protocol::container::{ContainerStateChange, ContainerStatus};
 use moon_protocol::MoonError;
 use tauri::{AppHandle, Emitter, State};
@@ -27,21 +31,23 @@ use crate::state::AppState;
 /// [`ContainerStateChange`].
 pub const CONTAINER_STATE_EVENT: &str = "container:state";
 
-/// Resolve the active folder and turn it into a
-/// [`ContainerWorkspace`] handle. Returns the workspace ID alongside
-/// so the broadcast helper can label the event without a second
-/// registry lookup.
+/// Build the container workspace handle from current app state —
+/// workspace id, bound-folder list, per-workspace state dir.
 ///
-/// Phase 2.0 still keys the compose project off the active folder
-/// path — that's the bridge implementation. The
-/// [phase-02 redesign](../../../specs/roadmaps/phase-02-containers.md#pending-redesign-workspace--folder)
-/// pulls this out to one project per workspace once 2.5's multi-
-/// folder UX is in tree.
+/// Returns the workspace ID alongside so the broadcast helper
+/// can label the event without a second registry lookup. Doesn't
+/// touch disk; cheap to call per command.
 async fn workspace_handle(state: &AppState) -> Result<(String, ContainerWorkspace), MoonError> {
-	let entry = state.workspaces.require_active_folder().await?;
-	let workspace_id = state.workspaces.workspace_id().await;
-	let root = Utf8PathBuf::from(&entry.folder.path);
-	Ok((workspace_id, ContainerWorkspace::for_root(root)))
+	let snapshot = state.workspaces.snapshot().await;
+	let workspace_id = snapshot.id.clone();
+	let bound_folders: Vec<Utf8PathBuf> = snapshot.folders.iter().map(|f| Utf8PathBuf::from(&f.path)).collect();
+	let state_dir = state.workspace_state_dir(&workspace_id);
+	let container = ContainerWorkspace::new(WorkspaceConfig {
+		workspace_id: workspace_id.clone(),
+		state_dir,
+		bound_folders,
+	})?;
+	Ok((workspace_id, container))
 }
 
 /// Snapshot status and broadcast the resulting `container:state`
@@ -75,10 +81,10 @@ pub async fn container_status(state: State<'_, AppState>) -> Result<ContainerSta
 	Ok(container.status().await?)
 }
 
-/// First-time opt-in: generate `.moon/compose.yaml` if missing,
-/// then `docker compose up -d --wait`. The await blocks until
-/// every service is healthy or one has failed — exactly what the
-/// "Set up" button promises.
+/// First-time opt-in: regenerate `compose.yaml` from the current
+/// bound-folder set, then `docker compose up -d --wait`. The await
+/// blocks until every service is healthy or one has failed —
+/// exactly what the "Set up" button promises.
 #[tauri::command]
 pub async fn container_setup(app: AppHandle, state: State<'_, AppState>) -> Result<ContainerStatus, MoonError> {
 	let (workspace_id, container) = workspace_handle(&state).await?;
@@ -103,7 +109,7 @@ pub async fn container_resume(app: AppHandle, state: State<'_, AppState>) -> Res
 #[tauri::command]
 pub async fn container_rebuild(app: AppHandle, state: State<'_, AppState>) -> Result<ContainerStatus, MoonError> {
 	let (workspace_id, container) = workspace_handle(&state).await?;
-	container.rebuild().await?;
+	container.rebuild(DEFAULT_DEV_IMAGE).await?;
 	snapshot_and_emit(&app, workspace_id, &container).await
 }
 
@@ -114,10 +120,34 @@ pub async fn container_teardown(app: AppHandle, state: State<'_, AppState>) -> R
 	snapshot_and_emit(&app, workspace_id, &container).await
 }
 
-/// Render what `<workspace>/.moon/compose.yaml` *would* contain
-/// without writing it. Backs an "Inspect compose.yaml" affordance
-/// for users who want to see what `container_setup` will commit
-/// to disk before they click.
+/// Re-emit `compose.yaml` + `bound-folders.json` from the current
+/// bound-folder set, and — if the project is running — apply the
+/// diff with `docker compose up -d --wait`.
+///
+/// Called by the frontend after every successful folder add /
+/// remove. Idempotent: if the bound-folder set hasn't actually
+/// changed and the project isn't running, this is a no-op.
+/// Returns the post-call status so the pip can refresh in the
+/// same round trip.
+#[tauri::command]
+pub async fn container_apply_bound_folders(
+	app: AppHandle,
+	state: State<'_, AppState>,
+) -> Result<ContainerStatus, MoonError> {
+	let (workspace_id, container) = workspace_handle(&state).await?;
+	// `apply_bound_folders` writes the file unconditionally and
+	// only `compose up -d --wait`s if the project is currently
+	// `Running`. That keeps add/remove cheap when the user
+	// hasn't opted in yet (status: Absent) or has paused on
+	// purpose.
+	container.apply_bound_folders(DEFAULT_DEV_IMAGE).await?;
+	snapshot_and_emit(&app, workspace_id, &container).await
+}
+
+/// Render what `compose.yaml` *would* contain without writing it.
+/// Backs an "Inspect compose.yaml" affordance for users who want
+/// to see what `container_setup` will commit to disk before they
+/// click.
 #[tauri::command]
 pub async fn container_render_compose(state: State<'_, AppState>) -> Result<String, MoonError> {
 	let (_, container) = workspace_handle(&state).await?;

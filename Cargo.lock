@@ -2620,6 +2620,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "camino",
+ "dirs",
  "moon-container",
  "moon-core",
  "moon-protocol",
