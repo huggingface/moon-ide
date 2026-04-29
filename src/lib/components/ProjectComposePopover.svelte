@@ -52,6 +52,7 @@
 
 	const snapshot = $derived(projectCompose.snapshotFor(folderPath));
 	const inFlight = $derived(projectCompose.inFlightFor(folderPath));
+	const inFlightService = $derived(projectCompose.inFlightServiceFor(folderPath));
 	const lastError = $derived(projectCompose.errorFor(folderPath));
 	const services = $derived(snapshot?.status.services ?? []);
 	const state = $derived(snapshot?.status.state ?? null);
@@ -82,10 +83,31 @@
 				return 'Resuming services…';
 			case 'down':
 				return 'Tearing down services…';
+			case 'service-start':
+				return inFlightService ? `Starting ${inFlightService}…` : null;
+			case 'service-stop':
+				return inFlightService ? `Stopping ${inFlightService}…` : null;
+			case 'service-restart':
+				return inFlightService ? `Restarting ${inFlightService}…` : null;
 			default:
 				return null;
 		}
 	});
+
+	// Per-row capability checks — mirror what `docker compose
+	// {start,stop,restart} <svc>` accepts. Restart on a `created`
+	// (never-started) container errors with "no such service
+	// container", so we gate it; for those rows the user wants
+	// project-level `up` instead.
+	function canStart(svc: ServiceStatus): boolean {
+		return svc.raw_state === 'created' || svc.raw_state === 'exited';
+	}
+	function canStop(svc: ServiceStatus): boolean {
+		return svc.raw_state === 'running' || svc.raw_state === 'restarting';
+	}
+	function canRestart(svc: ServiceStatus): boolean {
+		return svc.raw_state === 'running' || svc.raw_state === 'exited' || svc.raw_state === 'restarting';
+	}
 
 	function handleKeydown(event: KeyboardEvent) {
 		if (event.key === 'Escape') {
@@ -189,7 +211,8 @@
 				<summary>Services ({services.length})</summary>
 				<ul>
 					{#each services as svc (svc.name)}
-						{@const waiting = busy && isWaitingService(svc)}
+						{@const targeted = inFlightService === svc.name}
+						{@const waiting = (busy && isWaitingService(svc)) || targeted}
 						{@const failed = isFailedService(svc)}
 						<li class:waiting class:failed>
 							<span class="svc-marker" aria-hidden="true">
@@ -202,6 +225,38 @@
 								{/if}
 							</span>
 							<span class="svc-name">{svc.name}</span>
+							<span class="svc-controls" aria-label="{svc.name} actions">
+								<button
+									type="button"
+									class="svc-btn"
+									title="Start {svc.name}"
+									aria-label="Start {svc.name}"
+									disabled={busy || !canStart(svc)}
+									onclick={() => projectCompose.startService(folderPath, svc.name)}
+								>
+									▶
+								</button>
+								<button
+									type="button"
+									class="svc-btn"
+									title="Restart {svc.name}"
+									aria-label="Restart {svc.name}"
+									disabled={busy || !canRestart(svc)}
+									onclick={() => projectCompose.restartService(folderPath, svc.name)}
+								>
+									↻
+								</button>
+								<button
+									type="button"
+									class="svc-btn"
+									title="Stop {svc.name}"
+									aria-label="Stop {svc.name}"
+									disabled={busy || !canStop(svc)}
+									onclick={() => projectCompose.stopService(folderPath, svc.name)}
+								>
+									◼
+								</button>
+							</span>
 							<span class="svc-state svc-{svc.raw_state}" class:svc-bad-exit={failed}>
 								{svc.raw_state}{svc.raw_state === 'exited' ? ` (${svc.exit_code})` : ''}{svc.health
 									? ` · ${svc.health}`
@@ -399,10 +454,45 @@
 	}
 	.services li {
 		display: grid;
-		grid-template-columns: 10px 1fr max-content;
-		align-items: baseline;
+		grid-template-columns: 10px 1fr max-content max-content;
+		align-items: center;
 		gap: 6px;
 		font-variant-numeric: tabular-nums;
+		min-height: 22px;
+	}
+	/* Per-row action toolbar. Visible at low contrast by default,
+	   pops on row hover to keep the list readable but discoverable.
+	   Buttons stay individually accessible via tab/keyboard at all
+	   times — visibility is purely a visual nudge. */
+	.svc-controls {
+		display: inline-flex;
+		gap: 2px;
+		opacity: 0.35;
+		transition: opacity 0.12s ease;
+	}
+	.services li:hover .svc-controls,
+	.services li:focus-within .svc-controls {
+		opacity: 1;
+	}
+	.svc-btn {
+		font: inherit;
+		font-size: 10px;
+		line-height: 1;
+		background: transparent;
+		color: var(--m-fg-muted);
+		border: 1px solid transparent;
+		border-radius: 3px;
+		padding: 2px 5px;
+		cursor: pointer;
+	}
+	.svc-btn:hover:not(:disabled) {
+		background: var(--m-bg-overlay);
+		border-color: var(--m-border);
+		color: var(--m-fg);
+	}
+	.svc-btn:disabled {
+		opacity: 0.4;
+		cursor: not-allowed;
 	}
 	.svc-marker {
 		display: inline-flex;

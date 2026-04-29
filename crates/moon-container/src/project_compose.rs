@@ -173,6 +173,37 @@ impl ProjectCompose {
 		Ok(())
 	}
 
+	/// `docker compose start <service>` — transition an existing
+	/// (created/stopped/exited) service container to `running`
+	/// **without** recreating it.
+	///
+	/// Used by the per-service "▶" affordance in the popover. If
+	/// the service has never been brought up (no container record
+	/// on the daemon yet) the daemon will error; that's the
+	/// caller's signal to use the project-level `up` instead.
+	pub async fn start_service(&self, service: &str) -> Result<(), LifecycleError> {
+		self.docker_compose(["start", service]).await?;
+		Ok(())
+	}
+
+	/// `docker compose stop <service>` — send SIGTERM to a single
+	/// service's container, leaving the container record so the
+	/// user can `start_service` it again without losing state.
+	pub async fn stop_service(&self, service: &str) -> Result<(), LifecycleError> {
+		self.docker_compose(["stop", service]).await?;
+		Ok(())
+	}
+
+	/// `docker compose restart <service>` — stop + start one
+	/// service's container, preserving its image and volumes.
+	/// This is the cheap "did the config flake out, try again"
+	/// affordance. Use [`Self::rebuild`] for the heavier
+	/// "recreate from a fresh image" workflow.
+	pub async fn restart_service(&self, service: &str) -> Result<(), LifecycleError> {
+		self.docker_compose(["restart", service]).await?;
+		Ok(())
+	}
+
 	async fn docker_compose<I, S>(&self, args: I) -> Result<crate::lifecycle::DockerOutput, LifecycleError>
 	where
 		I: IntoIterator<Item = S>,

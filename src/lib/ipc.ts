@@ -67,6 +67,12 @@ export const ipc = {
 		resume: (folderPath: string) => invoke<ProjectComposeStatus>('project_compose_resume', { folderPath }),
 		rebuild: (folderPath: string) => invoke<ProjectComposeStatus>('project_compose_rebuild', { folderPath }),
 		down: (folderPath: string) => invoke<ProjectComposeStatus>('project_compose_down', { folderPath }),
+		serviceStart: (folderPath: string, service: string) =>
+			invoke<ProjectComposeStatus>('project_compose_service_start', { folderPath, service }),
+		serviceStop: (folderPath: string, service: string) =>
+			invoke<ProjectComposeStatus>('project_compose_service_stop', { folderPath, service }),
+		serviceRestart: (folderPath: string, service: string) =>
+			invoke<ProjectComposeStatus>('project_compose_service_restart', { folderPath, service }),
 	},
 	slack: {
 		setToken: (token: string) => invoke<SlackIdentity>('slack_set_token', { token }),

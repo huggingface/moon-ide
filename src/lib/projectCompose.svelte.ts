@@ -33,8 +33,23 @@ import { formatError, type ProjectComposeStateChange, type ProjectComposeStatus 
 /** Tauri event name — must match `PROJECT_COMPOSE_STATE_EVENT` in `src-tauri/src/commands/project_compose.rs`. */
 const PROJECT_COMPOSE_STATE_EVENT = 'project_compose:state';
 
-/** Mutating actions a folder bar can dispatch. */
-export type ProjectComposeAction = 'up' | 'pause' | 'resume' | 'rebuild' | 'down';
+/** Project-level compose lifecycle verbs the folder bar can fire. */
+export type ProjectComposeProjectAction = 'up' | 'pause' | 'resume' | 'rebuild' | 'down';
+
+/** Per-service compose lifecycle verbs fired from a service row. */
+export type ProjectComposeServiceAction = 'service-start' | 'service-stop' | 'service-restart';
+
+export type ProjectComposeAction = ProjectComposeProjectAction | ProjectComposeServiceAction;
+
+/** What's currently in flight against a folder, if anything.
+ * Keeps a single per-folder lock so a service-level command and
+ * a project-level command can't race on the same compose project
+ * (e.g. user clicks Restart-gitaly while `up -d --wait` is still
+ * running) — but `service` lets the UI say _which_ service is
+ * being acted on, so the right row gets the spinner. */
+export type ProjectComposeInFlight =
+	| { action: ProjectComposeProjectAction; service?: undefined }
+	| { action: ProjectComposeServiceAction; service: string };
 
 /**
  * How often the popover re-polls `project_compose_status` while
@@ -52,7 +67,7 @@ class ProjectComposeStateStore {
 	#snapshots = new SvelteMap<string, ProjectComposeStatus>();
 
 	/** Per-folder in-flight tracker — at most one mutation per folder. */
-	#inFlight = new SvelteMap<string, ProjectComposeAction>();
+	#inFlight = new SvelteMap<string, ProjectComposeInFlight>();
 
 	/** Per-folder last-error string. Cleared on successful mutation. */
 	#errors = new SvelteMap<string, string>();
@@ -97,7 +112,14 @@ class ProjectComposeStateStore {
 	}
 
 	inFlightFor(folderPath: string): ProjectComposeAction | undefined {
-		return this.#inFlight.get(folderPath);
+		return this.#inFlight.get(folderPath)?.action;
+	}
+
+	/** When a service-level mutation is in flight, name the
+	 * service it targets — the popover uses this to spotlight
+	 * the row. `undefined` for project-level actions. */
+	inFlightServiceFor(folderPath: string): string | undefined {
+		return this.#inFlight.get(folderPath)?.service;
 	}
 
 	errorFor(folderPath: string): string | undefined {
@@ -189,26 +211,48 @@ class ProjectComposeStateStore {
 	}
 
 	async up(folderPath: string): Promise<void> {
-		await this.#run(folderPath, 'up', () => ipc.projectCompose.up(folderPath));
+		await this.#run(folderPath, { action: 'up' }, () => ipc.projectCompose.up(folderPath));
 	}
 
 	async pause(folderPath: string): Promise<void> {
-		await this.#run(folderPath, 'pause', () => ipc.projectCompose.pause(folderPath));
+		await this.#run(folderPath, { action: 'pause' }, () => ipc.projectCompose.pause(folderPath));
 	}
 
 	async resume(folderPath: string): Promise<void> {
-		await this.#run(folderPath, 'resume', () => ipc.projectCompose.resume(folderPath));
+		await this.#run(folderPath, { action: 'resume' }, () => ipc.projectCompose.resume(folderPath));
 	}
 
 	async rebuild(folderPath: string): Promise<void> {
-		await this.#run(folderPath, 'rebuild', () => ipc.projectCompose.rebuild(folderPath));
+		await this.#run(folderPath, { action: 'rebuild' }, () => ipc.projectCompose.rebuild(folderPath));
 	}
 
 	async down(folderPath: string): Promise<void> {
-		await this.#run(folderPath, 'down', () => ipc.projectCompose.down(folderPath));
+		await this.#run(folderPath, { action: 'down' }, () => ipc.projectCompose.down(folderPath));
 	}
 
-	async #run(folderPath: string, label: ProjectComposeAction, op: () => Promise<ProjectComposeStatus>): Promise<void> {
+	async startService(folderPath: string, service: string): Promise<void> {
+		await this.#run(folderPath, { action: 'service-start', service }, () =>
+			ipc.projectCompose.serviceStart(folderPath, service),
+		);
+	}
+
+	async stopService(folderPath: string, service: string): Promise<void> {
+		await this.#run(folderPath, { action: 'service-stop', service }, () =>
+			ipc.projectCompose.serviceStop(folderPath, service),
+		);
+	}
+
+	async restartService(folderPath: string, service: string): Promise<void> {
+		await this.#run(folderPath, { action: 'service-restart', service }, () =>
+			ipc.projectCompose.serviceRestart(folderPath, service),
+		);
+	}
+
+	async #run(
+		folderPath: string,
+		label: ProjectComposeInFlight,
+		op: () => Promise<ProjectComposeStatus>,
+	): Promise<void> {
 		if (this.#inFlight.get(folderPath)) {
 			return;
 		}

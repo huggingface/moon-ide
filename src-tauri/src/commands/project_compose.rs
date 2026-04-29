@@ -185,3 +185,49 @@ pub async fn project_compose_down(
 	pc.down().await?;
 	snapshot_and_emit(&app, workspace_id, &folder_path, &pc).await
 }
+
+/// `docker compose start <service>` — bring a single created /
+/// stopped service into `running` without recreating.
+#[tauri::command]
+pub async fn project_compose_service_start(
+	app: AppHandle,
+	state: State<'_, AppState>,
+	folder_path: String,
+	service: String,
+) -> Result<ProjectComposeStatus, MoonError> {
+	let folder_path = Utf8PathBuf::from(folder_path);
+	let (workspace_id, pc) = require_project_handle(&state, &folder_path).await?;
+	pc.start_service(&service).await?;
+	snapshot_and_emit(&app, workspace_id, &folder_path, &pc).await
+}
+
+/// `docker compose stop <service>` — SIGTERM a single service's
+/// container while leaving its record on the daemon.
+#[tauri::command]
+pub async fn project_compose_service_stop(
+	app: AppHandle,
+	state: State<'_, AppState>,
+	folder_path: String,
+	service: String,
+) -> Result<ProjectComposeStatus, MoonError> {
+	let folder_path = Utf8PathBuf::from(folder_path);
+	let (workspace_id, pc) = require_project_handle(&state, &folder_path).await?;
+	pc.stop_service(&service).await?;
+	snapshot_and_emit(&app, workspace_id, &folder_path, &pc).await
+}
+
+/// `docker compose restart <service>` — stop + start a single
+/// service's container without recreating it. The cheap "did
+/// gitaly flake, try again" knob.
+#[tauri::command]
+pub async fn project_compose_service_restart(
+	app: AppHandle,
+	state: State<'_, AppState>,
+	folder_path: String,
+	service: String,
+) -> Result<ProjectComposeStatus, MoonError> {
+	let folder_path = Utf8PathBuf::from(folder_path);
+	let (workspace_id, pc) = require_project_handle(&state, &folder_path).await?;
+	pc.restart_service(&service).await?;
+	snapshot_and_emit(&app, workspace_id, &folder_path, &pc).await
+}
