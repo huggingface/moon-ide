@@ -3,12 +3,14 @@
 	import { composeLogs } from '../composeLogs.svelte';
 	import { projectCompose, projectComposeStateLabel } from '../projectCompose.svelte';
 
-	// Heuristic "waiting on this service" used to pulse the rows
-	// `compose up -d --wait` is still blocked on, so the user can
-	// see which specific service is the hold-up. Mirrors what
-	// compose itself waits for: created (blocked on depends_on),
-	// restarting (failing + retrying), or running+health=starting
-	// (the healthcheck hasn't flipped to healthy yet).
+	// Heuristic "this service is still settling" used to pulse
+	// the row regardless of whether a moon-ide command happens to
+	// be in flight: a service in `created` (blocked on
+	// depends_on), `restarting` (failing + retrying), or
+	// `running` with health `starting` (the healthcheck hasn't
+	// flipped to healthy yet) is intrinsically transient — the
+	// pulse helps the user spot the hold-up at a glance even if
+	// they opened the popover after `up -d --wait` returned.
 	function isWaitingService(svc: ServiceStatus): boolean {
 		if (svc.raw_state === 'created') {
 			return true;
@@ -268,7 +270,7 @@
 				<ul>
 					{#each services as svc (svc.name)}
 						{@const targeted = inFlightService === svc.name}
-						{@const waiting = (busy && isWaitingService(svc)) || targeted}
+						{@const waiting = isWaitingService(svc) || targeted}
 						{@const failed = isFailedService(svc)}
 						<li class:waiting class:failed>
 							<span class="svc-marker" aria-hidden="true">
