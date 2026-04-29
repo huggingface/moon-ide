@@ -27,16 +27,18 @@ daemon with a single "Set up" click.
 
 What ships:
 
-- New crate `moon-container` (`crates/moon-container/`) that
-  shells out to `docker compose` via `bollard` or
-  `tokio::process` (decide at implementation start; bollard
-  preferred if it doesn't drag in too much).
-- Compose discovery + generation logic: scan the workspace
-  root and one level deep for `docker-compose.yml` /
-  `compose.yaml`, write `<workspace>/.moon/compose.yaml`
-  with the discovered files in `include:` plus a `dev`
-  service. Generation runs once on first opt-in; the file
-  is user-owned thereafter.
+- New crate `moon-container` (`crates/moon-container/`)
+  ✅ — shells out to `docker compose` via `tokio::process`
+  (bollard would have dragged in hyper/h2 transitively for one
+  feature; the shell-out is one screen of code and stays
+  honest about what compose actually accepts).
+- Compose discovery + generation logic ✅
+  (`crates/moon-container/src/{discovery,compose,project}.rs`):
+  scans the workspace root and one level deep for
+  `docker-compose.yml` / `compose.yaml`, writes
+  `<workspace>/.moon/compose.yaml` with the discovered files
+  in `include:` plus a `dev` service. Generation runs once on
+  first opt-in; the file is user-owned thereafter.
 - `moon-base` Dockerfile (✅ in tree) + GitHub Actions workflow
   (✅ [`.github/workflows/moon-base.yml`](../../.github/workflows/moon-base.yml))
   publishing a multi-arch manifest
@@ -64,14 +66,22 @@ What ships:
   container's name follows compose's
   `<project>-<service>-<n>` convention.
 - Tauri commands `container_status` / `container_setup` /
-  `container_pause` / `container_resume` / `container_rebuild`.
-  Each operates on the **whole compose project**, not just
-  the `dev` service — pausing the workspace pauses included
-  services with it.
-- Push events `container:state` / `container:logs` /
-  `container:error`.
-- Status-bar pip that surfaces state + logs panel. No
-  redesign of the status bar itself.
+  `container_pause` / `container_resume` / `container_rebuild`
+  / `container_teardown` / `container_render_compose` ✅
+  (`src-tauri/src/commands/container.rs`). Each operates on the
+  **whole compose project**, not just the `dev` service —
+  pausing the workspace pauses included services with it.
+- Push event `container:state` ✅ — broadcast after every
+  lifecycle command. Logs/error events deferred to 2.4 with
+  the per-service UI; 2.0's pip only needs state, and a single
+  event keeps the channel narrow.
+- Status-bar pip + popover that surfaces state and the action
+  vocabulary appropriate to it ✅ (`src/lib/components/StatusBar.svelte`
+  - `src/lib/components/ContainerPanel.svelte` +
+    `src/lib/container.svelte.ts`). Includes an "Inspect
+    compose.yaml" preview that calls `container_render_compose`
+    so the user sees what "Set up" will write before they click.
+    No redesign of the status bar itself.
 - ADRs [0007](../decisions/0007-compose-and-moon-base.md)
   (compose + moon-base) and
   [0008](../decisions/0008-host-shared-daemon.md) (host-shared

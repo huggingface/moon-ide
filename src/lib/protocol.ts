@@ -285,6 +285,46 @@ export function botLabel(profile: SlackBotProfile): string {
 	return profile.username || profile.user_id;
 }
 
+/**
+ * High-level state of the workspace's compose project. Mirrors
+ * `moon_protocol::container::ContainerState`. See
+ * `crates/moon-container/src/lifecycle.rs#aggregate_state` for
+ * the precedence rules behind each variant.
+ */
+export type ContainerState = 'absent' | 'creating' | 'running' | 'paused' | 'stopped' | 'failed';
+
+/**
+ * One container in the compose project, as reported by
+ * `docker compose ps --format json`. Mirrors
+ * `moon_protocol::container::ServiceStatus`.
+ */
+export type ServiceStatus = {
+	name: string;
+	/** Raw Docker container state (`running`, `paused`, `exited`, `created`, `restarting`, `dead`). */
+	raw_state: string;
+};
+
+/**
+ * Snapshot returned by `container_status` and embedded in every
+ * `container:state` event. Mirrors
+ * `moon_protocol::container::ContainerStatus`.
+ */
+export type ContainerStatus = {
+	state: ContainerState;
+	services: ServiceStatus[];
+};
+
+/**
+ * Payload of the `container:state` Tauri event. Includes
+ * `workspace_id` so once multi-window arrives the right pip
+ * updates; in 2.0 it always matches the active workspace.
+ * Mirrors `moon_protocol::container::ContainerStateChange`.
+ */
+export type ContainerStateChange = {
+	workspace_id: string;
+	status: ContainerStatus;
+};
+
 export type MoonError =
 	| { code: 'NotFound'; message: string }
 	| { code: 'IoError'; message: string }

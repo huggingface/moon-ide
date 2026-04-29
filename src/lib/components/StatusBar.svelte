@@ -1,8 +1,20 @@
 <script lang="ts">
 	import { workspace } from '../state.svelte';
 	import { slack } from '../slack.svelte';
+	import { container, containerStateLabel } from '../container.svelte';
+	import ContainerPanel from './ContainerPanel.svelte';
 
 	let themeBtn: HTMLButtonElement | undefined = $state();
+	let containerWrap: HTMLDivElement | undefined = $state();
+
+	// Optimistic state during the two long-running ops (setup,
+	// rebuild) so the pip transitions immediately rather than
+	// staying on the previous glyph for a few minutes while
+	// `up -d --wait` is in flight. Pause / resume / teardown are
+	// quick enough that flicker isn't worth the extra branching.
+	const effectiveState = $derived(
+		container.inFlight === 'setup' || container.inFlight === 'rebuild' ? 'creating' : container.state,
+	);
 
 	// F6 cycle can land on the status bar; the only interactive control
 	// here today is the theme toggle, so that's the focus target. If we
@@ -14,6 +26,32 @@
 			return;
 		}
 		queueMicrotask(() => themeBtn?.focus());
+	});
+
+	// Click outside the popover closes it. The pip button itself is
+	// inside `containerWrap`, so clicks on it are excluded from the
+	// "outside" check — `togglePanel` handles open/close on the pip.
+	$effect(() => {
+		if (!container.panelOpen) {
+			return;
+		}
+		const onPointerDown = (event: PointerEvent) => {
+			if (containerWrap && containerWrap.contains(event.target as Node)) {
+				return;
+			}
+			container.closePanel();
+		};
+		const onKey = (event: KeyboardEvent) => {
+			if (event.key === 'Escape') {
+				container.closePanel();
+			}
+		};
+		window.addEventListener('pointerdown', onPointerDown);
+		window.addEventListener('keydown', onKey);
+		return () => {
+			window.removeEventListener('pointerdown', onPointerDown);
+			window.removeEventListener('keydown', onKey);
+		};
 	});
 </script>
 
@@ -31,6 +69,27 @@
 			<span class="item">
 				{workspace.activeFile.name}{workspace.activeFile.isDirty ? ' •' : ''}
 			</span>
+		{/if}
+		<!-- Container status pip. Hidden until we have a status snapshot
+			 (no flash of "absent" while we're still resolving the
+			 active workspace at startup). Click toggles the
+			 ContainerPanel popover anchored just above. -->
+		{#if container.visible}
+			<div class="container-wrap" bind:this={containerWrap}>
+				<button
+					type="button"
+					class="container"
+					class:active={container.panelOpen}
+					title="Container: {containerStateLabel(effectiveState)}"
+					onclick={() => container.togglePanel()}
+				>
+					<span class="pip pip-{effectiveState}"></span>
+					container
+				</button>
+				{#if container.panelOpen}
+					<ContainerPanel />
+				{/if}
+			</div>
 		{/if}
 		<!-- Chat panel toggle. Pip indicator shows connection state so
 			 the user can see "Slack: connected" without opening the
@@ -132,6 +191,33 @@
 	.chat.active {
 		color: var(--m-fg);
 	}
+	.container-wrap {
+		position: relative;
+		display: flex;
+		align-items: center;
+	}
+	.container {
+		font: inherit;
+		color: var(--m-fg-muted);
+		background: transparent;
+		border: 1px solid transparent;
+		border-radius: 4px;
+		padding: 0 6px;
+		height: 18px;
+		line-height: 18px;
+		display: flex;
+		align-items: center;
+		gap: 5px;
+		cursor: pointer;
+	}
+	.container:hover {
+		background: var(--m-bg-overlay);
+		color: var(--m-fg);
+	}
+	.container.active {
+		color: var(--m-fg);
+		background: var(--m-bg-overlay);
+	}
 	.pip {
 		display: inline-block;
 		width: 6px;
@@ -141,5 +227,37 @@
 	}
 	.pip.on {
 		background: var(--m-success);
+	}
+	/* Container pip colour-codes the high-level state. Same palette
+	   as the ContainerPanel header so the two read as one signal. */
+	.pip-absent {
+		background: var(--m-fg-subtle);
+	}
+	.pip-creating {
+		background: var(--m-warning, #d4a017);
+		animation: pulse 1.6s ease-in-out infinite;
+	}
+	.pip-running {
+		background: var(--m-success);
+	}
+	.pip-paused {
+		background: var(--m-fg-muted);
+		box-shadow: inset 0 0 0 1px var(--m-fg-subtle);
+	}
+	.pip-stopped {
+		background: var(--m-fg-subtle);
+		box-shadow: inset 0 0 0 1px var(--m-fg-muted);
+	}
+	.pip-failed {
+		background: var(--m-danger);
+	}
+	@keyframes pulse {
+		0%,
+		100% {
+			opacity: 1;
+		}
+		50% {
+			opacity: 0.4;
+		}
 	}
 </style>

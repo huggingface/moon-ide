@@ -11,6 +11,7 @@ import {
 	type Workspace,
 	type WorkspaceSession,
 } from './protocol';
+import { container } from './container.svelte';
 import { slack } from './slack.svelte';
 import { fingerprint, fingerprintEquals, type ContentFingerprint } from './util/hash';
 import { fileKindFor, type FileKind } from './util/fileKind';
@@ -165,6 +166,11 @@ class WorkspaceState {
 			// Drop any tabs persisted for the previous workspace; the new
 			// folder gets a clean session blob (theme is preserved).
 			this.persistAppState();
+			// Container pip is workspace-specific: clear the previous
+			// workspace's snapshot so the bar doesn't briefly show the
+			// old state, then pull the new one.
+			container.resetForWorkspaceSwitch();
+			void container.refresh();
 		} catch (err) {
 			this.flash(`Failed to open: ${formatError(err)}`);
 		}
@@ -209,6 +215,11 @@ class WorkspaceState {
 		// Tauri runtime is up. Idempotent — `wireRuntime` early-returns
 		// on subsequent calls (HMR-safe).
 		void slack.wireRuntime();
+		// Same pattern for the container status pip — bind the
+		// `container:state` event subscription once, then pull the
+		// current snapshot for whatever workspace is open.
+		void container.wireRuntime();
+		void container.refresh();
 
 		const ws = this.workspace;
 		const session = state.last_session;

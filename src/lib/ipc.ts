@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import type {
 	AppState,
+	ContainerStatus,
 	ContentSearchOptions,
 	ContentSearchResult,
 	DirEntry,
@@ -45,6 +46,15 @@ export const ipc = {
 	},
 	editorconfig: {
 		forPath: (path: string) => invoke<EditorConfig>('editorconfig_for_path', { path }),
+	},
+	container: {
+		status: () => invoke<ContainerStatus>('container_status'),
+		setup: () => invoke<ContainerStatus>('container_setup'),
+		pause: () => invoke<ContainerStatus>('container_pause'),
+		resume: () => invoke<ContainerStatus>('container_resume'),
+		rebuild: () => invoke<ContainerStatus>('container_rebuild'),
+		teardown: () => invoke<ContainerStatus>('container_teardown'),
+		renderCompose: () => invoke<string>('container_render_compose'),
 	},
 	slack: {
 		setToken: (token: string) => invoke<SlackIdentity>('slack_set_token', { token }),
