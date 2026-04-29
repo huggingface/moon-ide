@@ -7,8 +7,10 @@
 	import Welcome from './lib/components/Welcome.svelte';
 	import CommandPalette from './lib/components/CommandPalette.svelte';
 	import ChatPanel from './lib/components/ChatPanel.svelte';
+	import BottomPanel from './lib/components/BottomPanel.svelte';
 	import { workspace } from './lib/state.svelte';
 	import { slack } from './lib/slack.svelte';
+	import { bottomPanel } from './lib/bottomPanel.svelte';
 	import { palette, reloadWindow } from './lib/commands.svelte';
 	import { cycleFocus } from './lib/focus';
 	import { ipc } from './lib/ipc';
@@ -17,6 +19,7 @@
 	let chatWidth = $state(320);
 	let resizing = $state(false);
 	let resizingChat = $state(false);
+	let resizingBottom = $state(false);
 
 	onMount(() => {
 		void hydrate();
@@ -96,6 +99,15 @@
 				slack.togglePanel();
 				return;
 			}
+			if (!event.shiftKey && key === 'j') {
+				// VSCode-style "show panel" toggle. Picks up service
+				// log streams (and eventually terminals) — both live
+				// in the bottom panel. We swallow the event regardless
+				// of focus so the user can hit it from anywhere.
+				event.preventDefault();
+				bottomPanel.toggle();
+				return;
+			}
 			// Don't filter by Shift: French AZERTY needs Shift to type
 			// a literal `0` (the digit row produces accented letters
 			// otherwise), so the natural binding there is Ctrl+Shift+0.
@@ -153,6 +165,26 @@
 		window.addEventListener('pointerup', onUp);
 	}
 
+	function startBottomResize(event: PointerEvent) {
+		// Vertical resize: dragging the handle up grows the panel.
+		// Subtract the delta because the panel is anchored to the
+		// bottom of `.main`. Clamp lives in `bottomPanel.setHeight`.
+		resizingBottom = true;
+		const startY = event.clientY;
+		const startH = bottomPanel.height;
+
+		const onMove = (e: PointerEvent) => {
+			bottomPanel.setHeight(startH - (e.clientY - startY));
+		};
+		const onUp = () => {
+			resizingBottom = false;
+			window.removeEventListener('pointermove', onMove);
+			window.removeEventListener('pointerup', onUp);
+		};
+		window.addEventListener('pointermove', onMove);
+		window.addEventListener('pointerup', onUp);
+	}
+
 	function startChatResize(event: PointerEvent) {
 		// Drag direction is mirrored vs. the sidebar handle: dragging the
 		// chat handle left grows the panel (it's on the right edge of
@@ -199,6 +231,20 @@
 			</div>
 		{:else}
 			<Welcome onPickFolder={pickFolder} />
+		{/if}
+		{#if bottomPanel.visible}
+			<div
+				class="resize bottom-resize"
+				class:active={resizingBottom}
+				role="separator"
+				aria-orientation="horizontal"
+				aria-label="Resize bottom panel"
+				tabindex="-1"
+				onpointerdown={startBottomResize}
+			></div>
+			<div class="bottom-host" style:height="{bottomPanel.height}px">
+				<BottomPanel />
+			</div>
 		{/if}
 	</main>
 	{#if slack.panelVisible}
@@ -252,6 +298,15 @@
 		margin-left: -2px;
 		margin-right: -2px;
 	}
+	/* Horizontal splitter between the editor area and the bottom
+	   panel. Same hit-target bleed trick as the vertical handles
+	   so it's grabbable without snagging the tab strip. */
+	.bottom-resize {
+		width: auto;
+		height: 4px;
+		margin: -2px 0;
+		cursor: row-resize;
+	}
 	.resize:hover,
 	.resize.active {
 		background: var(--m-accent);
@@ -278,6 +333,16 @@
 		flex: 1;
 		min-height: 0;
 		display: flex;
+	}
+	/* Bottom panel host. Fixed height set via inline style by the
+	   resize handler; the inner component owns its own scroll
+	   surfaces (tab body, log viewer, etc.) so the host just
+	   provides a flexbox slot of the requested size. */
+	.bottom-host {
+		flex-shrink: 0;
+		min-height: 0;
+		display: flex;
+		flex-direction: column;
 	}
 
 	.pane-divider {

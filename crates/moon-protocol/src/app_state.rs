@@ -30,6 +30,11 @@ pub struct AppState {
 	/// itself never lives here — it stays in the OS keyring (see
 	/// `specs/slack-chat.md`).
 	pub slack: SlackAppState,
+	/// Bottom-panel visibility + height. Hosts service-log streams and
+	/// (Phase 5) terminals, so it's worth restoring across launches —
+	/// users tend to live with it open or closed and resent the panel
+	/// re-jumping to a default height every restart.
+	pub bottom_panel: BottomPanelAppState,
 }
 
 /// Slack-specific slice of [`AppState`]. Only stores derived,
@@ -57,4 +62,38 @@ pub struct SlackAppState {
 	/// thread lives inside the bot's DM channel, ID encoded in
 	/// `active_bot.dm_channel_id`).
 	pub active_thread_ts: Option<String>,
+}
+
+/// Bottom-panel slice of [`AppState`].
+///
+/// Tab contents (open log streams, terminal sessions) are intentionally
+/// not persisted: they're tied to running `docker compose logs -f`
+/// processes that don't survive a launch, and re-spawning them blindly
+/// on startup would surprise the user. Visibility + height are pure
+/// chrome and safe to restore.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(default, deny_unknown_fields)]
+pub struct BottomPanelAppState {
+	/// Whether the bottom panel was open at last shutdown. Defaults to
+	/// `false` — first-run users shouldn't have an empty panel
+	/// occupying screen real estate before they ask for it.
+	pub visible: bool,
+	/// Panel height in CSS pixels. Clamped to a sane range on the
+	/// frontend so a saved 0 / huge value can't render the editor
+	/// invisible.
+	pub height: u32,
+}
+
+impl Default for BottomPanelAppState {
+	fn default() -> Self {
+		Self {
+			visible: false,
+			// Matches `DEFAULT_BOTTOM_PANEL_HEIGHT` in
+			// `src/lib/bottomPanel.svelte.ts`. Tall enough to show ~12
+			// lines of log output at the default editor font size on
+			// a typical 1080p screen, without crowding the editor.
+			height: 240,
+		}
+	}
 }

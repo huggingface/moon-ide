@@ -9,9 +9,10 @@
 // matching component to pull focus in via a ticker on `WorkspaceState`,
 // and lets the component decide *what* to focus (Pierre Trees row,
 // CodeMirror view, theme button…).
+import { bottomPanel } from './bottomPanel.svelte';
 import { workspace } from './state.svelte';
 
-export type Region = 'sidebar' | 'editor-left' | 'editor-right' | 'status';
+export type Region = 'sidebar' | 'editor-left' | 'editor-right' | 'bottom-panel' | 'status';
 
 export function regionOrder(): Region[] {
 	const list: Region[] = ['sidebar'];
@@ -20,6 +21,12 @@ export function regionOrder(): Region[] {
 		if (workspace.hasSplit) {
 			list.push('editor-right');
 		}
+	}
+	// Bottom panel only enters the cycle when it's actually
+	// visible. Otherwise F6 would land on a region the user can't
+	// see, which is more confusing than helpful.
+	if (bottomPanel.visible) {
+		list.push('bottom-panel');
 	}
 	list.push('status');
 	return list;
@@ -32,7 +39,7 @@ export function currentRegion(): Region | null {
 	}
 	const host = ae.closest<HTMLElement>('[data-region]');
 	const id = host?.dataset.region;
-	if (id === 'sidebar' || id === 'editor-left' || id === 'editor-right' || id === 'status') {
+	if (id === 'sidebar' || id === 'editor-left' || id === 'editor-right' || id === 'bottom-panel' || id === 'status') {
 		return id;
 	}
 	return null;
@@ -45,6 +52,16 @@ export function focusRegion(target: Region) {
 	}
 	if (target === 'status') {
 		workspace.requestStatusFocus();
+		return;
+	}
+	if (target === 'bottom-panel') {
+		// The panel itself doesn't yet have a richer focus model
+		// (no editor / log-viewer body in slice 2). Pull DOM focus
+		// to the region root so subsequent Tab navigation lands
+		// inside the tab strip; future tab kinds will install
+		// their own focus tickers.
+		const root = document.querySelector<HTMLElement>('[data-region="bottom-panel"]');
+		root?.focus();
 		return;
 	}
 	const side = target === 'editor-left' ? 'left' : 'right';

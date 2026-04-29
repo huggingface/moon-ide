@@ -5,12 +5,15 @@
 //!   and hits this `app_state_save` command on every navigation.
 //! - The Slack tauri commands own `slack.*` and write via their own
 //!   load-mutate-save path (see `commands::slack`).
+//! - `bottom_panel` is pure UI chrome owned by the frontend
+//!   (visibility + height). The frontend writes it through this
+//!   path; the Slack writers don't touch it.
 //!
 //! To stop the frontend's writes from clobbering the Slack slice (or
-//! vice versa), `app_state_save` merges: it loads the on-disk state,
-//! takes `last_session` + `theme` from the payload, and preserves
-//! whatever `slack` was already on disk. Anything the frontend sends
-//! in `payload.slack` is ignored on this path.
+//! vice versa), `app_state_save` merges: it takes everything from
+//! the payload **except** `slack`, which is preserved from disk
+//! verbatim. Anything the frontend sends in `payload.slack` is
+//! ignored on this path.
 
 use moon_core::app_state as core_app_state;
 use moon_protocol::app_state::AppState as AppStatePayload;
@@ -31,6 +34,7 @@ pub async fn app_state_save(state: State<'_, AppState>, app_state: AppStatePaylo
 		last_session: app_state.last_session,
 		theme: app_state.theme,
 		slack: existing.slack,
+		bottom_panel: app_state.bottom_panel,
 	};
 	core_app_state::save(&state.config_dir, &merged).await
 }

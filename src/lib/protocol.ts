@@ -174,12 +174,23 @@ export type AppState = {
 	last_session: WorkspaceSession | null;
 	theme: ThemeMode;
 	slack: SlackAppState;
+	bottom_panel: BottomPanelAppState;
+};
+
+/** Bottom-panel chrome state. Tabs/log streams are intentionally
+ * not persisted — they're tied to running compose log processes
+ * that don't survive a launch. Mirrors
+ * `moon_protocol::app_state::BottomPanelAppState`. */
+export type BottomPanelAppState = {
+	visible: boolean;
+	height: number;
 };
 
 export const defaultAppState: AppState = {
 	last_session: null,
 	theme: 'dark',
 	slack: { active_bot: null, panel_visible: false, active_thread_ts: null },
+	bottom_panel: { visible: false, height: 240 },
 };
 
 /**

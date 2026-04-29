@@ -14,6 +14,7 @@ import {
 	type WorkspaceFolder,
 	type WorkspaceSession,
 } from './protocol';
+import { bottomPanel } from './bottomPanel.svelte';
 import { container } from './container.svelte';
 import { projectCompose } from './projectCompose.svelte';
 import { slack } from './slack.svelte';
@@ -505,6 +506,13 @@ class WorkspaceState {
 		// `slack_status`) on this same paint without the user lifting a
 		// finger.
 		slack.hydrate(state.slack);
+		// Same for the bottom panel — visibility and height. Tab
+		// contents (log streams) are not persisted by design: they
+		// back onto running processes that don't survive a launch.
+		// Bind the change handler before hydrating so the first user
+		// interaction triggers a save.
+		bottomPanel.bindOnChange(() => this.persistAppState());
+		bottomPanel.hydrate(state.bottom_panel);
 		// Bind Tauri push events + window-focus listener once the
 		// Tauri runtime is up. Idempotent — `wireRuntime` early-returns
 		// on subsequent calls (HMR-safe).
@@ -674,6 +682,7 @@ class WorkspaceState {
 				last_session: session,
 				theme: this.theme,
 				slack: { active_bot: null, panel_visible: false, active_thread_ts: null },
+				bottom_panel: bottomPanel.serialise(),
 			};
 			// AppState writes are best-effort. A toast on every failure
 			// would be too noisy (this fires on every navigation); a
