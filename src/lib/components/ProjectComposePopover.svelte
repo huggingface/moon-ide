@@ -56,13 +56,23 @@
 	const inFlightService = $derived(projectCompose.inFlightServiceFor(folderPath));
 	const lastError = $derived(projectCompose.errorFor(folderPath));
 	const services = $derived(snapshot?.status.services ?? []);
-	const state = $derived(snapshot?.status.state ?? null);
+	// Named `projectState` (not `state`) so the local doesn't
+	// shadow the `$state` rune for tsgo, which otherwise resolves
+	// `$state(true)` as `$<store>state` legacy auto-subscription.
+	const projectState = $derived(snapshot?.status.state ?? null);
 	const composeFile = $derived(snapshot?.compose_file ?? null);
 	const projectName = $derived(snapshot?.project_name ?? null);
 	// Mirror ContainerPanel: in-flight is the source of truth for
 	// disabling buttons, not the state — `creating` while we're
 	// awaiting `up -d --wait` is the optimistic state.
 	const busy = $derived(inFlight !== undefined);
+
+	// Local UI state for the services <details>. Default open so
+	// the user sees the per-service rows on first popover open;
+	// `bind:open` lets manual toggles stick across the 2s polling
+	// re-renders (a stateless `open={...}` attribute would get
+	// re-asserted on every snapshot refresh and re-collapse it).
+	let servicesOpen = $state(true);
 
 	// Human-readable banner shown above the action set while a
 	// command is mid-flight. Without this the popover renders the
@@ -127,9 +137,9 @@
 		<span class="title">{folderName} services</span>
 		<span
 			class="status-text"
-			class:state-running={state === 'running'}
-			class:state-failed={state === 'failed'}
-			class:state-paused={state === 'paused'}
+			class:state-running={projectState === 'running'}
+			class:state-failed={projectState === 'failed'}
+			class:state-paused={projectState === 'paused'}
 		>
 			{projectComposeStateLabel(snapshot)}
 		</span>
@@ -163,13 +173,13 @@
 			{/if}
 		</dl>
 
-		{#if state === 'absent'}
+		{#if projectState === 'absent'}
 			<div class="actions">
 				<button type="button" class="primary" disabled={busy} onclick={() => projectCompose.up(folderPath)}>
 					{inFlight === 'up' ? 'Starting…' : 'Start services'}
 				</button>
 			</div>
-		{:else if state === 'stopped'}
+		{:else if projectState === 'stopped'}
 			<div class="actions">
 				<button type="button" class="primary" disabled={busy} onclick={() => projectCompose.up(folderPath)}>
 					{inFlight === 'up' ? 'Starting…' : 'Start services'}
@@ -184,9 +194,9 @@
 					{inFlight === 'down' ? 'Tearing down…' : 'Tear down'}
 				</button>
 			</div>
-		{:else if state === 'creating'}
+		{:else if projectState === 'creating'}
 			<p class="copy">Bringing up services — this can take a few minutes the first time.</p>
-		{:else if state === 'running'}
+		{:else if projectState === 'running'}
 			<div class="actions">
 				<button type="button" disabled={busy} onclick={() => projectCompose.pause(folderPath)}>
 					{inFlight === 'pause' ? 'Pausing…' : 'Pause'}
@@ -212,7 +222,7 @@
 					{inFlight === 'down' ? 'Tearing down…' : 'Tear down'}
 				</button>
 			</div>
-		{:else if state === 'paused'}
+		{:else if projectState === 'paused'}
 			<div class="actions">
 				<button type="button" class="primary" disabled={busy} onclick={() => projectCompose.resume(folderPath)}>
 					{inFlight === 'resume' ? 'Resuming…' : 'Resume'}
@@ -235,7 +245,7 @@
 					{inFlight === 'down' ? 'Tearing down…' : 'Tear down'}
 				</button>
 			</div>
-		{:else if state === 'failed'}
+		{:else if projectState === 'failed'}
 			<div class="actions">
 				<button type="button" disabled={busy} onclick={() => projectCompose.rebuild(folderPath)}>
 					{inFlight === 'rebuild' ? 'Rebuilding…' : 'Rebuild'}
@@ -253,7 +263,7 @@
 		{/if}
 
 		{#if services.length > 0}
-			<details class="services" open={state === 'failed' || busy}>
+			<details class="services" bind:open={servicesOpen}>
 				<summary>Services ({services.length})</summary>
 				<ul>
 					{#each services as svc (svc.name)}
