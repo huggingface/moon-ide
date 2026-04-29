@@ -234,40 +234,58 @@ with their re-visit triggers; the short list:
 - Cross-platform (macOS / Windows) verification.
 - On-demand port forwarding without editing compose.
 
-## Pending redesign: workspace ≠ folder
+## 2.0.5 — workspace ≠ folder (shipped)
 
-The 2.0 implementation in tree (status pip, popover, lifecycle
-plumbing) treats the active folder _as_ the workspace —
-state at `<workspace>/.moon/compose.yaml`, project name hashed
-from folder path, container recreated on folder switch. That
-mistake only becomes visible once we sit with multi-folder UX.
-The architectural correction is recorded in
+The original 2.0 wiring keyed compose state off the active
+folder: state at `<workspace>/.moon/compose.yaml`, project
+name hashed from the folder path, container recreated on every
+folder switch. That conflation is incoherent the moment a
+single moon-ide window holds multiple folders, so once
+[Phase 2.5](phase-02.5-multi-folder.md) shipped multi-folder
+UX we landed the corresponding container redesign on top of
+it. The shape is locked in by the
+[ADR 0007 state-dir + multi-folder amendment](../decisions/0007-compose-and-moon-base.md#amendment-2026-04-29--state-dir-and-multi-folder-mounts)
+and described in
 [`containers.md` § Multi-folder workspace](../containers.md#multi-folder-workspace-the-command-centre-ux);
 the short version:
 
-- Workspace state moves to
-  `~/.local/share/moon-ide/workspaces/<id>/{compose.yaml,bound-folders.json}`
-  (`<id>` = `"default"` until multi-workspace ships).
-- Compose project name becomes `moon-ws-<id>`, decoupled from
-  any folder hash. The project survives folder switches; only
-  the bound-folder set in compose changes.
-- `bound-folders.json` is the source of truth; the generator
-  reads it and emits absolute-path includes + bind mounts.
-- Single-folder switches go through an explicit
-  "Switch workspace to this folder" button (no auto-tear-down
-  on folder change). Multi-folder adds become additive on the
-  same compose project.
-- `resetForWorkspaceSwitch` becomes a no-op once the workspace
-  doesn't ride on the active folder.
-- ADR 0007 needs an amendment (or a successor) to land the
-  state-dir change.
+- Workspace state lives at
+  `<dirs::data_local_dir>/moon-ide/workspaces/<id>/`
+  (`compose.yaml` + `bound-folders.json`), with `<id>` =
+  `"default"` until multi-workspace ships.
+- Compose project name is `moon-ws-<id>`, decoupled from any
+  folder path. The project survives folder switches and
+  folder add / remove; only the contents of `compose.yaml`
+  change.
+- Bound folders mount at `/workspace/<basename>` with
+  `working_dir: /workspace`; `include:` and `volumes:` are
+  absolute paths.
+- Folder add / remove regenerates `compose.yaml`; if the
+  project is currently running, `docker compose up -d --wait`
+  applies the diff. Pre-opt-in (no `compose.yaml` yet) and
+  paused / stopped states are a no-op until the next explicit
+  lifecycle action.
+- `resetForWorkspaceSwitch` is gone — folder switches don't
+  touch the compose project. Compose-preview cache
+  invalidation moved to the bound-folder sync path so a
+  re-open of "Inspect" reflects the new mounts.
 
-This redesign is held until multi-folder workspace UX exists in
-the IDE — designing a bound-folder set for "exactly one folder"
-is an exercise in pretending. The current 2.0 wiring stays as
-the bridge implementation for testing.
-[Phase 2.5](phase-02.5-multi-folder.md) ships that prerequisite;
-this phase's redesign sub-task picks up afterwards.
+What deliberately doesn't ship in 2.0.5:
+
+- Cache volumes (`~/.cargo`, `~/.bun`, `~/.cache`) — lands with
+  Phase 3 once routed terminals make caches matter; the 2.0
+  `sleep infinity` `dev` container has no cache state worth
+  preserving.
+- Auto-pruning of project services orphaned by a removed
+  folder. Visible enough via `docker compose ps`; surprise
+  removal is worse than leftover noise. Add when somebody
+  asks.
+- Multi-workspace inventory UI. The naming scheme is forward-
+  compatible (one `moon-ws-<id>` per workspace), so when
+  Phase 7 grows multiple workspaces a single inventory pane
+  drops in without re-keying anything.
+
+Test plan: `0011-container-state-dir.md`.
 
 ## Bootstrap concern
 

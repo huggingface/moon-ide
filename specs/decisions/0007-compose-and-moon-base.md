@@ -4,7 +4,9 @@ Date: 2026-04-28
 Status: accepted (with amendments — the
 [DinD-in-`moon-base`](#2-moon-ide-publishes-its-own-base-image)
 aspect of this decision was reverted by
-[ADR 0008](0008-host-shared-daemon.md))
+[ADR 0008](0008-host-shared-daemon.md), and the
+[state-directory + multi-folder shape](#amendment-2026-04-29--state-dir-and-multi-folder-mounts)
+was added as part of Phase 2.5).
 
 ## Context
 
@@ -186,3 +188,72 @@ Reversible, with cost.
   "moon-ide and moon-base versions drift". The smoke test
   (`bun install && cargo check` inside the freshly built
   image) is a release gate either way.
+
+## Amendment (2026-04-29) — state dir and multi-folder mounts
+
+The original wording put `compose.yaml` inside the workspace
+itself (`<workspace>/.moon/compose.yaml`), and described the
+"workspace" as if it were one folder. Phase 2.5's multi-folder
+UX makes that conflation incoherent: a workspace is now a list
+of folders, the active one swaps without compose-project
+churn, and the file we generate has to mount _every_ bound
+folder. The amendment below lands that shift; the rest of the
+ADR (compose as the native format, `huggingface/moon-base` on
+Docker Hub, polyglot toolchain in the base image,
+devcontainer.json interop deferred to 2.3) is unchanged.
+
+What moves:
+
+- **State dir**. `compose.yaml` lives at
+  `<dirs::data_local_dir>/moon-ide/workspaces/<id>/compose.yaml`
+  — outside any specific repo, decoupled from any specific
+  folder. `<id>` is the constant `"default"` until multi-
+  workspace UI ships (Phase 7); the layout is forward-compatible
+  with named workspaces under sibling subdirectories. A
+  sibling `bound-folders.json` records the list of folder paths
+  the file was generated from, so the generator stays
+  deterministic and the workspace's bound set survives an IDE
+  crash without consulting `app_state.json`.
+- **Project name**. `moon-ws-<id>` (so `moon-ws-default`),
+  derived from the workspace id, not a hash of any path. The
+  compose project survives folder switches and folder add /
+  remove; what changes is the contents of `compose.yaml`, not
+  its identity.
+- **Mount layout**. Each bound folder is bind-mounted at
+  `/workspace/<basename>` inside the dev container, with
+  `working_dir: /workspace`. Single-folder workspaces (the
+  common case today) get one mount; multi-folder is the same
+  shape with more entries.
+- **Path resolution**. Every path inside the generated
+  `compose.yaml` is **absolute** — host-side absolute for
+  bind mounts and `include:` entries. The earlier `../`-based
+  layout was meaningful only when the file lived next to a
+  repo; from a state-dir under `dirs::data_local_dir`, no
+  base path makes the relative form clearer than the absolute
+  one.
+- **User-owned thereafter**. The original ADR called the file
+  "user-owned after first generation". That contract no longer
+  holds: the IDE rewrites `compose.yaml` whenever the bound-
+  folder set changes, because the bound set _is_ what the file
+  encodes. Per-project customisations belong in each project's
+  own `docker-compose.yml`, which we `include:` and never
+  rewrite. Bound-folder edits go through `bound-folders.json`
+  (or, in practice, the IDE's add / remove folder gestures);
+  the compose file is a derived artefact. The file header is
+  reworded accordingly.
+
+What stays:
+
+- Compose itself, `huggingface/moon-base` on Docker Hub, the
+  multi-arch publishing pipeline, the bootstrap-via-`moon-base`
+  story, and the Phase 2.3 devcontainer.json interop deferral.
+- `WorkspaceHost::ContainerHost` (Phase 2.1) still uses bind-
+  mount + `docker exec`; the only difference is that the bind
+  source is now per-folder rather than the workspace root.
+
+Consequence beyond Phase 2: this is the layout multi-workspace
+(Phase 7) inherits. `workspaces/<id>/` is the shared root; a
+new workspace is a new id with its own state dir; `compose.yaml`
+generation, project naming, and lifecycle commands are already
+keyed on id and don't need to change shape when more than one
+exists at a time.
