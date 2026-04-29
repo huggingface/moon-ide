@@ -5,16 +5,10 @@
 	import { highlightTabs } from '../editor/highlightTabs';
 	import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 	import { searchKeymap, highlightSelectionMatches } from '@codemirror/search';
-	import {
-		bracketMatching,
-		indentOnInput,
-		syntaxHighlighting,
-		defaultHighlightStyle,
-		indentUnit,
-	} from '@codemirror/language';
+	import { bracketMatching, indentOnInput, indentUnit } from '@codemirror/language';
 	import { workspace, type OpenFile, type SplitSide } from '../state.svelte';
 	import { languageFor } from '../editor/language';
-	import { moonTheme } from '../editor/theme';
+	import { moonEditorTheme } from '../editor/theme';
 	import { type EditorConfig } from '../protocol';
 
 	type Props = { file: OpenFile; side: SplitSide };
@@ -27,6 +21,10 @@
 	// can change without the file changing — saving a `.editorconfig`
 	// invalidates the resolved settings for every open buffer.
 	const editorConfigCompartment = new Compartment();
+	// Theme + syntax highlight live together: CodeMirror reads a
+	// `dark: boolean` flag on the chrome theme that we can't fake from
+	// CSS, so flipping `workspace.theme` rebuilds both.
+	const themeCompartment = new Compartment();
 
 	// Each Editor instance owns one CM view that we re-target as the active file changes.
 	// We track the path the view currently holds so we know when to swap state.
@@ -110,6 +108,23 @@
 		});
 	});
 
+	// Light/dark flip. The chrome theme reads CSS variables for almost
+	// everything, but CodeMirror also takes a `dark: boolean` flag at
+	// theme-build time (used for built-in defaults like the drop cursor
+	// color). We rebuild the theme + highlight bundle whenever the
+	// user toggles `workspace.theme`. The HighlightStyle itself is
+	// static — its CSS-variable colors re-resolve for free.
+	$effect(() => {
+		const mode = workspace.theme;
+		const v = view;
+		if (!v) {
+			return;
+		}
+		v.dispatch({
+			effects: themeCompartment.reconfigure(moonEditorTheme(mode)),
+		});
+	});
+
 	// Pull focus into the editor whenever the workspace bumps `focusTick`.
 	// That covers tab clicks, tree clicks (re-opening a closed file
 	// included), and post-close fallback. Microtask-deferred so the click
@@ -144,9 +159,8 @@
 			indentOnInput(),
 			history(),
 			highlightSelectionMatches(),
-			syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
 			keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap, indentWithTab]),
-			moonTheme,
+			themeCompartment.of(moonEditorTheme(workspace.theme)),
 			languageCompartment.of([]),
 			editorConfigCompartment.of(editorConfigExtensions(ec)),
 			highlightTabs(),

@@ -36,6 +36,33 @@
 	--m-editor-selection: rgba(126, 163, 255, 0.18);
 	--m-editor-line-active: rgba(255, 255, 255, 0.025);
 
+	/* Syntax highlighting tokens. The CodeMirror HighlightStyle is
+	   defined once and resolves these via `var(...)`, so flipping
+	   `:root.light` re-skins the editor without touching JS. Names map
+	   to broad token families; we collapse close cousins (e.g. integer
+	   / float / bool all hit `--m-syntax-number`) on purpose — the
+	   palette stays readable. The Lezer tag → var mapping lives in
+	   `editor/theme.ts`. */
+	--m-syntax-comment: #6a7490;
+	--m-syntax-keyword: #c792ea;
+	--m-syntax-string: #a3e9a4;
+	--m-syntax-number: #f0b86e;
+	--m-syntax-function: #7ea3ff;
+	--m-syntax-type: #5fd6a3;
+	--m-syntax-property: #a8c0ff;
+	--m-syntax-attribute-value: #a3e9a4;
+	--m-syntax-tag: #ff7a8a;
+	--m-syntax-constant: #f0b86e;
+	--m-syntax-operator: #8a93ab;
+	--m-syntax-regexp: #ffadc7;
+	--m-syntax-meta: #8a93ab;
+	--m-syntax-link: #7ea3ff;
+	--m-syntax-heading: #d6dcec;
+	--m-syntax-invalid: #ff7a8a;
+	--m-syntax-inserted: #5fd6a3;
+	--m-syntax-deleted: #ff7a8a;
+	--m-syntax-changed: #f0b86e;
+
 	/* Pierre Trees tokens. The lib reads `--trees-*-override` CSS vars on the
 	   host element and forwards them into its shadow root. Names per the
 	   @pierre/trees README; see also `--trees-theme-*` for the second set. */
@@ -74,6 +101,26 @@
 	--m-code-fg: #c7254e;
 	--m-code-bg: rgba(199, 37, 78, 0.08);
 	--m-code-border: rgba(199, 37, 78, 0.18);
+
+	--m-syntax-comment: #8a93ab;
+	--m-syntax-keyword: #7c3aed;
+	--m-syntax-string: #1f7a3a;
+	--m-syntax-number: #a8470c;
+	--m-syntax-function: #2a3fa1;
+	--m-syntax-type: #0b6b56;
+	--m-syntax-property: #4360c8;
+	--m-syntax-attribute-value: #1f7a3a;
+	--m-syntax-tag: #a3204e;
+	--m-syntax-constant: #a8470c;
+	--m-syntax-operator: #5e6885;
+	--m-syntax-regexp: #c7254e;
+	--m-syntax-meta: #5e6885;
+	--m-syntax-link: #2a3fa1;
+	--m-syntax-heading: #16192a;
+	--m-syntax-invalid: #a3204e;
+	--m-syntax-inserted: #0b6b56;
+	--m-syntax-deleted: #a3204e;
+	--m-syntax-changed: #a8470c;
 }
 
 * {
