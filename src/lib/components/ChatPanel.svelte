@@ -713,6 +713,13 @@
 		flex: 1;
 		min-height: 0;
 		overflow-y: auto;
+		/* `overflow-x: hidden` is required by `.thread-header`'s
+		   negative horizontal margins (which extend its background +
+		   bottom divider full-width). Without it, browsers promote
+		   `overflow-x` to `auto` because `overflow-y` is non-visible,
+		   and the thread-header's overflow into the padding region
+		   would surface a horizontal scrollbar. */
+		overflow-x: hidden;
 		/* No `padding-top`: the sticky `.thread-header` anchors against
 		   this element's content-box edge, so any padding-top here would
 		   sit *above* the stuck header and let scroll content show
@@ -1057,14 +1064,22 @@
 		/* Pin to the top of `.connected-scroll` so back / new /
 		   refresh stay reachable while scrolling a long thread. The
 		   bot card and earlier replies scroll up behind the solid
-		   `--m-bg-1` fill. `padding-bottom` keeps a small visual
-		   gutter between the header and whatever message is at the
-		   top of the scroll-under stack. */
+		   `--m-bg-1` fill. Negative horizontal margins extend the
+		   fill + divider edge-to-edge across the scroll container's
+		   horizontal padding so the bottom border doesn't look like
+		   an inset rule; the matching positive padding keeps the
+		   icon buttons visually aligned with the rest of the column.
+		   `--m-bg-1` matches the panel's primary bg (so when the
+		   header sits in its natural position at the top of the
+		   thread the strip is invisible) and gives a clean cover
+		   over scrolled content when the header is stuck. */
 		position: sticky;
 		top: 0;
 		z-index: 1;
 		background: var(--m-bg-1);
-		padding-bottom: 6px;
+		margin: 0 -12px;
+		padding: 0 12px 6px;
+		border-bottom: 1px solid var(--m-border);
 	}
 	.back-button {
 		font: inherit;
