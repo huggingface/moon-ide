@@ -15,6 +15,7 @@ import {
 	type WorkspaceSession,
 } from './protocol';
 import { container } from './container.svelte';
+import { projectCompose } from './projectCompose.svelte';
 import { slack } from './slack.svelte';
 import { fingerprint, fingerprintEquals, type ContentFingerprint } from './util/hash';
 import { fileKindFor, type FileKind } from './util/fileKind';
@@ -389,11 +390,19 @@ class WorkspaceState {
 		try {
 			const ws = await ipc.workspace.removeFolder(path);
 			this.folderStates.delete(path);
+			// Drop the folder's compose snapshot from the per-folder
+			// store. We don't `compose down` its services on the
+			// daemon — the user may have removed the folder for a
+			// session purely to declutter the sidebar, and tearing
+			// down running services as a side effect would surprise.
+			// They still show up in `docker compose ls` and can be
+			// torn down by re-binding the folder if needed.
+			projectCompose.forget(path);
 			await this.adoptWorkspaceSnapshot(ws);
 			this.persistAppState();
-			// Bound-folder set shrunk: re-emit `compose.yaml`. The
-			// backend rebuilds the dev container's mounts on the next
-			// `up -d --wait` (handled inside `applyBoundFolders`).
+			// Bound-folder set shrunk: re-emit `compose.yaml` so the
+			// dev shell drops the now-unmounted folder on its next
+			// `up -d --wait` cycle.
 			void container.syncBoundFolders();
 		} catch (err) {
 			this.flash(`Could not remove folder: ${formatError(err)}`);
@@ -453,6 +462,12 @@ class WorkspaceState {
 		if (this.activeFolderState && this.activeFolderState.paths.length === 0) {
 			await this.loadPaths();
 		}
+		// Warm the per-folder compose snapshot for every bound
+		// folder so the bars paint with real data on first frame
+		// (rather than blank-then-flash). Cheap when most folders
+		// have no compose.yaml — the backend short-circuits to
+		// `Absent` without invoking docker.
+		void projectCompose.refreshAll(snapshot.folders.map((f) => f.path));
 	}
 
 	tabsFor(side: SplitSide): string[] {
@@ -499,6 +514,12 @@ class WorkspaceState {
 		// current snapshot for whatever workspace is open.
 		void container.wireRuntime();
 		void container.refresh();
+		// Per-folder compose snapshots use a parallel event
+		// subscription keyed on `folder_path`. The folder bars'
+		// indicators read from `projectCompose.snapshotFor(path)`,
+		// which gets populated lazily via `refreshAll` whenever
+		// the workspace shape changes.
+		void projectCompose.wireRuntime();
 
 		const ws = this.workspace;
 		const session = state.last_session;

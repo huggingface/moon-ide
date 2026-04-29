@@ -8,6 +8,7 @@ import type {
 	EditorConfig,
 	FileSearchOptions,
 	FileSearchResult,
+	ProjectComposeStatus,
 	ReadFileResult,
 	SlackBotProfile,
 	SlackIdentity,
@@ -58,6 +59,14 @@ export const ipc = {
 		teardown: () => invoke<ContainerStatus>('container_teardown'),
 		applyBoundFolders: () => invoke<ContainerStatus>('container_apply_bound_folders'),
 		renderCompose: () => invoke<string>('container_render_compose'),
+	},
+	projectCompose: {
+		status: (folderPath: string) => invoke<ProjectComposeStatus>('project_compose_status', { folderPath }),
+		up: (folderPath: string) => invoke<ProjectComposeStatus>('project_compose_up', { folderPath }),
+		pause: (folderPath: string) => invoke<ProjectComposeStatus>('project_compose_pause', { folderPath }),
+		resume: (folderPath: string) => invoke<ProjectComposeStatus>('project_compose_resume', { folderPath }),
+		rebuild: (folderPath: string) => invoke<ProjectComposeStatus>('project_compose_rebuild', { folderPath }),
+		down: (folderPath: string) => invoke<ProjectComposeStatus>('project_compose_down', { folderPath }),
 	},
 	slack: {
 		setToken: (token: string) => invoke<SlackIdentity>('slack_set_token', { token }),

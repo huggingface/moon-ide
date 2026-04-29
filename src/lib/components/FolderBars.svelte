@@ -1,13 +1,20 @@
 <script lang="ts">
+	import { projectCompose, projectComposeStateLabel } from '../projectCompose.svelte';
 	import { workspace } from '../state.svelte';
+	import ProjectComposePopover from './ProjectComposePopover.svelte';
 
 	// Stacked folder bars — one row per folder bound into the workspace
-	// — plus an `+ Add folder` row at the bottom. Phase 2.5 surface:
-	// click a bar to make it active, hover for the `×` (remove) button,
-	// click the `+` to pick another folder. Compose status indicators
-	// for each folder land with the Phase 2 container redesign and
-	// will fill the empty `.indicator` slot — placed here now so the
-	// row layout doesn't shift when they arrive.
+	// — plus an `+ Add folder` row at the bottom. Click a bar to make
+	// it active, hover for the `×` (remove) button, click the `+` to
+	// pick another folder.
+	//
+	// `.indicator` slot: when the folder has its own
+	// `docker-compose.yml`, a small dot reflects the per-folder
+	// compose project's status (running / failed / paused / etc.).
+	// Click opens a per-folder popover with start/stop/rebuild
+	// actions and a service list. Folders without a compose file
+	// get an empty (transparent) indicator so the row layout stays
+	// stable across folders.
 	//
 	// The active row's chevron points down (`▾`) and the file tree
 	// renders directly underneath the bar in `Sidebar.svelte`. Inactive
@@ -25,6 +32,11 @@
 <ul class="bars" role="list">
 	{#each folders as folder (folder.path)}
 		{@const isActive = folder.path === activePath}
+		{@const snap = projectCompose.snapshotFor(folder.path)}
+		{@const hasCompose = snap?.compose_file != null}
+		{@const composeState = snap?.status.state ?? null}
+		{@const composeBusy = projectCompose.inFlightFor(folder.path) !== undefined}
+		{@const popoverOpen = projectCompose.isPanelOpen(folder.path)}
 		<li class="bar" class:active={isActive}>
 			<button
 				type="button"
@@ -36,12 +48,30 @@
 			>
 				<span class="chev" aria-hidden="true">{isActive ? '▾' : '▸'}</span>
 				<span class="name">{folder.name}</span>
-				<!-- Reserved slot for the Phase 2 container redesign:
-				     a per-folder compose status indicator + quick
-				     start/stop buttons. Empty in 2.5; the spacer keeps
-				     the layout stable when 2.x lands. -->
-				<span class="indicator" aria-hidden="true"></span>
 			</button>
+			{#if hasCompose}
+				<button
+					type="button"
+					class="indicator state-{composeState ?? 'absent'}"
+					class:busy={composeBusy}
+					class:open={popoverOpen}
+					title="Services: {projectComposeStateLabel(snap)}"
+					aria-label="Services for {folder.name}: {projectComposeStateLabel(snap)}"
+					aria-haspopup="dialog"
+					aria-expanded={popoverOpen}
+					onclick={(event) => {
+						event.stopPropagation();
+						projectCompose.togglePanel(folder.path);
+					}}
+				>
+					<span class="dot" aria-hidden="true"></span>
+				</button>
+			{:else}
+				<!-- Layout placeholder: keeps row width identical to
+				     folders that do have a compose file so the `×`
+				     button doesn't shift on hover. -->
+				<span class="indicator placeholder" aria-hidden="true"></span>
+			{/if}
 			<button
 				type="button"
 				class="remove"
@@ -54,6 +84,13 @@
 			>
 				×
 			</button>
+			{#if popoverOpen && hasCompose}
+				<ProjectComposePopover
+					folderPath={folder.path}
+					folderName={folder.name}
+					onClose={() => projectCompose.closePanel(folder.path)}
+				/>
+			{/if}
 		</li>
 	{/each}
 	<li class="add">
@@ -130,8 +167,75 @@
 	}
 	.indicator {
 		flex-shrink: 0;
-		min-width: 0;
-		min-height: 0;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 18px;
+		height: 100%;
+		background: transparent;
+		border: none;
+		padding: 0;
+		cursor: pointer;
+		color: var(--m-fg-muted);
+	}
+	.indicator.placeholder {
+		cursor: default;
+	}
+	.indicator:not(.placeholder):hover,
+	.indicator.open {
+		background: var(--m-bg-1);
+	}
+	.indicator .dot {
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		background: currentColor;
+		display: inline-block;
+		transition: background 80ms;
+	}
+	/* Per-state colouring for the dot. Mirrors the state-text
+	   colours used by the workspace status pip + popover so the
+	   visual vocabulary stays consistent between the bottom bar
+	   and the folder bars. `absent` (compose file present but
+	   never brought up) is muted — neutral, "ready to start". */
+	.indicator.state-absent .dot {
+		background: var(--m-fg-subtle);
+	}
+	.indicator.state-creating .dot {
+		background: var(--m-warning, var(--m-fg-muted));
+		animation: pulse 1.6s ease-in-out infinite;
+	}
+	.indicator.state-running .dot {
+		background: var(--m-success);
+	}
+	.indicator.state-paused .dot {
+		background: var(--m-warning, var(--m-fg-muted));
+	}
+	.indicator.state-stopped .dot {
+		background: var(--m-fg-muted);
+	}
+	.indicator.state-failed .dot {
+		background: var(--m-danger);
+	}
+	/* `busy` = a per-folder lifecycle command (`up`, `pause`,
+	   `down`, …) is in flight. Override both the colour and the
+	   animation so the dot reads as "transitioning" rather than
+	   layering a pulse on top of whatever the previous state was
+	   — without this, a retry after a `failed` startup would
+	   show a blinking _red_ dot, which conflates "actively
+	   working on it" with "broken". */
+	.indicator.busy .dot {
+		background: var(--m-warning, var(--m-fg-muted));
+		animation: pulse 1.2s ease-in-out infinite;
+	}
+	@keyframes pulse {
+		0%,
+		100% {
+			opacity: 1;
+		}
+		50% {
+			opacity: 0.4;
+		}
 	}
 	.remove {
 		flex-shrink: 0;
