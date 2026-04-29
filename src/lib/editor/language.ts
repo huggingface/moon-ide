@@ -52,6 +52,8 @@ export async function languageFor(filename: string): Promise<Extension[]> {
 
 	switch (ext) {
 		case 'ts':
+		case 'mts':
+		case 'cts':
 		case 'tsx': {
 			const { javascript } = await import('@codemirror/lang-javascript');
 			return [javascript({ typescript: true, jsx: ext === 'tsx' })];
@@ -98,6 +100,12 @@ export async function languageFor(filename: string): Promise<Extension[]> {
 		case 'properties': {
 			const { properties } = await import('@codemirror/legacy-modes/mode/properties');
 			return [StreamLanguage.define(properties)];
+		}
+		case 'sh':
+		case 'bash':
+		case 'zsh': {
+			const { shell } = await import('@codemirror/legacy-modes/mode/shell');
+			return [StreamLanguage.define(shell)];
 		}
 		default:
 			return [];
