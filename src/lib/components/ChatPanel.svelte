@@ -1078,7 +1078,7 @@
 		z-index: 1;
 		background: var(--m-bg-1);
 		margin: 0 -12px;
-		padding: 0 12px 6px;
+		padding: 6px 12px;
 		border-bottom: 1px solid var(--m-border);
 	}
 	.back-button {
