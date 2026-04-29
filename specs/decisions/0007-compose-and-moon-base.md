@@ -236,10 +236,14 @@ What moves:
   holds: the IDE rewrites `compose.yaml` whenever the bound-
   folder set changes, because the bound set _is_ what the file
   encodes. Per-project customisations belong in each project's
-  own `docker-compose.yml`, which we `include:` and never
-  rewrite. Bound-folder edits go through `bound-folders.json`
-  (or, in practice, the IDE's add / remove folder gestures);
-  the compose file is a derived artefact. The file header is
+  own `docker-compose.yml`. _Update under the
+  [2026-04-29 second amendment](#amendment-2026-04-29--workspace-shell-vs-project-services):
+  those project compose files are no longer pulled in via
+  `include:` — they run as separate compose projects, managed
+  per folder. moon-ide still never rewrites them._
+  Bound-folder edits go through `bound-folders.json` (or, in
+  practice, the IDE's add / remove folder gestures); the
+  compose file is a derived artefact. The file header is
   reworded accordingly.
 
 What stays:
@@ -257,3 +261,84 @@ new workspace is a new id with its own state dir; `compose.yaml`
 generation, project naming, and lifecycle commands are already
 keyed on id and don't need to change shape when more than one
 exists at a time.
+
+## Amendment (2026-04-29) — workspace shell vs project services
+
+The first amendment landed multi-folder shape but kept a single
+compose project per workspace, with each bound folder's
+`docker-compose.yml` pulled in via `include:`. That model
+conflated two concerns the user thinks about separately:
+
+- The **workspace shell** — the moon-ide `dev` container that
+  hosts terminals, LSP servers, agents. One per workspace,
+  IDE-managed, expected to be up almost always.
+- **Project services** — a folder's own `docker-compose.yml`
+  (gitaly, mongo, redis, …). Per folder, started/stopped on
+  demand by the user from the folder bar.
+
+In production this conflation made a stalled gitaly container
+in moon-landing block the IDE's own ability to give the user a
+terminal — `compose up -d --wait` waited on every included
+service, not just `dev`. Once one project broke, the workspace
+was unusable, and the status pip reported "setting up…" for as
+long as the daemon refused to settle.
+
+What changes:
+
+- The workspace's generated `compose.yaml` is **dev-only**. No
+  more `include:`. The file just defines the `dev` service and
+  bind-mounts each bound folder under `/workspace/<basename>`.
+  Setup is fast (one image pull, no project-service health
+  waits) and doesn't depend on any user project's correctness.
+- Each bound folder's own root-level compose file
+  (`<folder>/docker-compose.yml` or `compose.yaml`) is run as
+  a **separate** compose project. moon-ide doesn't generate or
+  modify that file — it just shells out with
+  `docker compose -f <user's file> -p moon-ws-<id>-<slug> ...`.
+- Project name namespacing: the workspace shell stays at
+  `moon-ws-<id>`, per-folder projects sit at
+  `moon-ws-<id>-<folder-slug>` (slug is the lower-cased
+  basename with non-alnum collapsed to `-`). A single
+  `docker compose ls --filter name=moon-ws-default-`
+  enumerates everything the workspace owns.
+- Folder-bar UX: each bound folder grows a small status
+  indicator (visible only when the folder has a compose
+  file at its root). Click opens a per-folder popover with
+  Start / Pause / Resume / Rebuild / Stop and a service
+  list, mirroring the workspace shell's status pip but
+  scoped to that one project.
+- Networking: the dev shell and per-folder services run on
+  separate compose networks by default. Cross-talk via
+  `host.docker.internal:<port>` if the user's compose
+  exposes host ports; an explicit external network is the
+  escape hatch. Phase 2.2 will formalise routing.
+- Discovery scope: per-folder lifecycle uses **only** the
+  folder's root compose file. Sub-directory composes that
+  the previous `include:`-based discovery would have picked
+  up are out of scope for the per-folder UX — the user can
+  bind the sub-directory as its own workspace folder if
+  they want to manage it from moon-ide.
+
+What stays:
+
+- The workspace state dir (`<dirs::data_local_dir>/moon-ide/
+workspaces/<id>/`), the `bound-folders.json` sidecar, and
+  the workspace project name (`moon-ws-<id>`). The
+  `compose.yaml` we write there is just narrower now.
+- `huggingface/moon-base` on Docker Hub, the multi-arch
+  publishing pipeline, the bootstrap-via-`moon-base` story,
+  and the devcontainer.json-interop deferral.
+- The host-shared Docker daemon (no DinD), per
+  [ADR 0008](0008-host-shared-daemon.md).
+
+Migration: the previous unified project (`moon-ws-default`
+with the `dev` service plus every included project's
+services) doesn't auto-clean up. After upgrading, the user's
+old containers from moon-landing's `include:` are orphaned
+under `moon-ws-default`; the rewritten `compose.yaml` only
+declares `dev`. A one-time
+`docker compose -p moon-ws-default down --remove-orphans`
+clears them, and the new per-folder UI takes over for
+moon-landing's services. Test plan
+[0012-workspace-shell-vs-project-services](../test-plans/0012-workspace-shell-vs-project-services.md)
+documents the upgrade path.

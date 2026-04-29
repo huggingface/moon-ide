@@ -61,7 +61,7 @@ Closes Phase 1's loose ends and adds the bare minimum needed for moon-ide to fee
 
 ## Phase 2 — Containerised dev shells
 
-**Acceptance**: opening a workspace provisions a single unprivileged Docker container (one per workspace, not per project) from a moon-published `moon-base` image (Debian + polyglot toolchain). The workspace's compose file `include:`s the project's existing `docker-compose.yml`(s) so side-services (postgres, redis, mongo, …) come up as siblings on the host's daemon — no nested Docker. Project tooling — terminals, LSP, lint/format, builds — runs inside the workspace container; the Tauri shell, Slack, and agent runtimes stay on the host. Closing the workspace pauses the whole compose project; reopening unpauses it. Declared port forwards are reachable from the host and surfaced in the IDE.
+**Acceptance**: opening a workspace provisions a single unprivileged Docker container (one per workspace, not per project) from a moon-published `moon-base` image (Debian + polyglot toolchain). The workspace shell (`moon-ws-<id>`, dev-only) handles terminals, LSP, lint/format, and builds; the Tauri shell, Slack, and agent runtimes stay on the host. Each bound folder's own `docker-compose.yml` runs as a **separate** compose project (`moon-ws-<id>-<folder-slug>`), launched per-folder from the folder bar — keeps a stalled project service from blocking the workspace shell. Closing the workspace pauses the shell; per-folder projects are user-driven. Declared port forwards are reachable from the host and surfaced in the IDE.
 
 System architecture: [containers.md](containers.md). Sub-phase work breakdown: [roadmaps/phase-02-containers.md](roadmaps/phase-02-containers.md). Decisions: [ADR 0007 — compose + moon-base](decisions/0007-compose-and-moon-base.md), [ADR 0008 — host-shared daemon](decisions/0008-host-shared-daemon.md).
 
@@ -73,7 +73,7 @@ The "command centre" foundation: a workspace becomes a list of folders rather th
 
 **Acceptance**: opening a folder adds it to the workspace as a new folder bar in the sidebar instead of replacing the active workspace; clicking a bar makes it active and swaps the file tree + tabs to that folder's persisted state; an inline `+ Add folder` row picks a new folder; an `×` per bar removes it (with confirm) including its session entry; per-folder tab/active state survives restart. One workspace (`"default"`) with N folders — multi-workspace UI stays a Phase 7 concern.
 
-What deliberately doesn't ship in 2.5: showing more than one folder's tree at once, cross-folder search, drag-to-reorder bars, folder rename, compose indicators on the folder bars (those land with the Phase 2 container redesign that follows).
+What deliberately doesn't ship in 2.5: showing more than one folder's tree at once, cross-folder search, drag-to-reorder bars, folder rename. (Compose indicators on the folder bars shipped right after, with Phase 2.0.6 — see the [`phase-02-containers.md` § 2.0.6 — workspace shell vs project services](roadmaps/phase-02-containers.md#206--workspace-shell-vs-project-services-shipped) section.)
 
 ## Phase 3 — Terminal
 

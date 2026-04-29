@@ -196,30 +196,38 @@ anything weird.
 
 ### 2.4 — Per-service UI
 
-**Status**: planned, lives behind 2.0–2.3.
+**Status**: partially shipped (2.0.6 lands the project-side
+surface). Remaining work for the workspace shell and the
+deeper per-service controls lives behind 2.1–2.3.
 
-Multi-service compose itself works from 2.0 (the `include:`
-model puts the project's services alongside `dev` from day
-one). What 2.4 adds is the UI surface: a per-service status
-panel listing every service in the compose project (`dev`,
-`mongo`, `redis`, …) with state, log tail, and one-click
-restart. Includes:
+Phase 2.0.6 ([above](#206--workspace-shell-vs-project-services-shipped))
+lands the per-folder compose popover: each bound folder
+gets its own status indicator + Start / Pause / Resume /
+Rebuild / Stop affordances + a service list with state,
+exit code, and health. That covers the "which services
+are up and how do I drive them?" question for project
+compose files.
 
-- A "Project services" subsection in the sidebar showing
-  every compose service with state and a small log tail.
-- Per-service `start` / `stop` / `restart` actions.
-- Per-service "Pull latest" (in-place image refresh + recreate
-  for a single service, without disturbing the rest of the
-  project) — the case for `mongo` getting a new tag without
-  rebuilding everything.
+What 2.4 still adds on top:
+
+- Per-service drilldowns: log tails, one-click restart, an
+  in-place "Pull latest" that recreates `mongo` (or
+  whichever) without disturbing the rest of the project.
 - A picker for "which service do new terminals attach to?"
   backed by the `x-moon.shell-service` extension key
   ([containers.md](../containers.md#x-moon-extension-keys-in-compose)).
-- Surfacing service-level health checks in the UI (compose
-  already exposes `healthy` / `unhealthy`; we just have to
-  display it).
+  Today `dev` is the only service in the workspace shell
+  project so this is academic; lands when 2.1+ adds
+  alternate shell services or per-folder shell routing.
+- Periodic / push-based status polling so a manual
+  `docker compose stop` from the user's terminal updates
+  the UI without a focus-driven refresh. Today
+  per-folder snapshots come from the command response and
+  the docker events watcher (Phase 2.2) will close the
+  loop.
 
-Test plan: `0017-container-services-ui.md` (TBD).
+Test plan: `0017-container-services-ui.md` (TBD; folds in
+the deltas above on top of `0012`).
 
 ## Out of scope (Phase 2, full list)
 
@@ -286,6 +294,72 @@ What deliberately doesn't ship in 2.0.5:
   drops in without re-keying anything.
 
 Test plan: `0011-container-state-dir.md`.
+
+## 2.0.6 — workspace shell vs project services (shipped)
+
+The 2.0 / 2.0.5 model put one compose project per workspace,
+with each bound folder's `docker-compose.yml` pulled in via
+`include:`. Two real-world failure modes pushed back:
+
+- A stalled project service (e.g. moon-landing's `gitaly`
+  failing a volume permission check) blocked the whole
+  `compose up --wait`, so the workspace shell — and any
+  hope of opening a terminal — was held hostage to project
+  health.
+- Mental model mismatch: users think of "is the IDE
+  running?" and "are this project's services running?" as
+  two separate questions. Surfacing them as one status pip
+  was confusing and made the popover do double duty for
+  too many states.
+
+The shape locked in by the
+[ADR 0007 workspace-shell-vs-project-services amendment](../decisions/0007-compose-and-moon-base.md#amendment-2026-04-29--workspace-shell-vs-project-services)
+and described in
+[`containers.md` § Workspace shell vs project services](../containers.md#workspace-shell-vs-project-services):
+
+- The workspace's generated `compose.yaml` is **dev-only**.
+  No `include:`. "Set up" pulls the moon-base image and
+  brings up `dev` — fast, doesn't touch any project image.
+- Each bound folder's own root-level
+  `docker-compose.yml` runs as a **separate** compose
+  project named `moon-ws-<id>-<folder-slug>`. moon-ide
+  shells out with `-f <user's file> -p <project name>`;
+  it never modifies the user's file.
+- Folder bars grow a small status indicator (visible only
+  when the folder has a compose file). Click opens a
+  per-folder popover with Start / Pause / Resume / Rebuild
+  / Stop and a service list — same vocabulary as the
+  workspace shell's pip but scoped to one folder.
+- New Tauri commands `project_compose_status` /
+  `project_compose_up` / `project_compose_pause` /
+  `project_compose_resume` / `project_compose_rebuild` /
+  `project_compose_down`, all keyed on `folder_path`.
+  Lifetime-mutating commands emit
+  `project_compose:state` events keyed on the same field
+  so each folder bar updates independently.
+- Networking: workspace shell and per-folder services run
+  on separate compose networks. Cross-talk via host ports
+  (`host.docker.internal:<port>`) for now; explicit
+  external networks for users who need service-name
+  resolution. Phase 2.2 formalises.
+
+What deliberately doesn't ship in 2.0.6:
+
+- Auto-cleanup of the previous unified
+  `moon-ws-default`'s orphaned project containers. After
+  upgrading, those leftovers are visible in
+  `docker compose ls` and the user runs
+  `docker compose -p moon-ws-default down --remove-orphans`
+  once. Test plan documents the migration step.
+- Sub-directory compose discovery for the per-folder UX.
+  The folder runner uses only the root-level compose; a
+  sub-directory compose belongs to its own bound folder
+  if the user wants to manage it from moon-ide.
+- Network-routing UX. Documented as "isolated by default,
+  use host ports for cross-talk"; the formalised picker
+  lands with Phase 2.2 ports.
+
+Test plan: `0012-workspace-shell-vs-project-services.md`.
 
 ## Bootstrap concern
 
