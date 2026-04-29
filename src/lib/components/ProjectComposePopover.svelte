@@ -1,5 +1,40 @@
 <script lang="ts">
+	import type { ServiceStatus } from '../protocol';
 	import { projectCompose, projectComposeStateLabel } from '../projectCompose.svelte';
+
+	// Heuristic "waiting on this service" used to pulse the rows
+	// `compose up -d --wait` is still blocked on, so the user can
+	// see which specific service is the hold-up. Mirrors what
+	// compose itself waits for: created (blocked on depends_on),
+	// restarting (failing + retrying), or running+health=starting
+	// (the healthcheck hasn't flipped to healthy yet).
+	function isWaitingService(svc: ServiceStatus): boolean {
+		if (svc.raw_state === 'created') {
+			return true;
+		}
+		if (svc.raw_state === 'restarting') {
+			return true;
+		}
+		if (svc.raw_state === 'running' && svc.health === 'starting') {
+			return true;
+		}
+		return false;
+	}
+
+	// Failed _and_ won't recover on its own — these stay solid red
+	// (no pulse), to distinguish "broken" from "still working on it".
+	function isFailedService(svc: ServiceStatus): boolean {
+		if (svc.raw_state === 'exited' && svc.exit_code !== 0) {
+			return true;
+		}
+		if (svc.raw_state === 'dead') {
+			return true;
+		}
+		if (svc.raw_state === 'running' && svc.health === 'unhealthy') {
+			return true;
+		}
+		return false;
+	}
 
 	// Per-folder popover anchored to the folder bar's compose
 	// indicator. Mirrors `ContainerPanel.svelte` but scoped to a
@@ -150,16 +185,24 @@
 		{/if}
 
 		{#if services.length > 0}
-			<details class="services" open={state === 'failed'}>
+			<details class="services" open={state === 'failed' || busy}>
 				<summary>Services ({services.length})</summary>
 				<ul>
 					{#each services as svc (svc.name)}
-						<li>
+						{@const waiting = busy && isWaitingService(svc)}
+						{@const failed = isFailedService(svc)}
+						<li class:waiting class:failed>
+							<span class="svc-marker" aria-hidden="true">
+								{#if waiting}
+									<span class="dot waiting-dot"></span>
+								{:else if failed}
+									<span class="dot failed-dot"></span>
+								{:else}
+									<span class="dot done-dot"></span>
+								{/if}
+							</span>
 							<span class="svc-name">{svc.name}</span>
-							<span
-								class="svc-state svc-{svc.raw_state}"
-								class:svc-bad-exit={svc.raw_state === 'exited' && svc.exit_code !== 0}
-							>
+							<span class="svc-state svc-{svc.raw_state}" class:svc-bad-exit={failed}>
 								{svc.raw_state}{svc.raw_state === 'exited' ? ` (${svc.exit_code})` : ''}{svc.health
 									? ` · ${svc.health}`
 									: ''}
@@ -355,13 +398,43 @@
 		gap: 2px;
 	}
 	.services li {
-		display: flex;
-		justify-content: space-between;
-		gap: 8px;
+		display: grid;
+		grid-template-columns: 10px 1fr max-content;
+		align-items: baseline;
+		gap: 6px;
 		font-variant-numeric: tabular-nums;
+	}
+	.svc-marker {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+	}
+	.svc-marker .dot {
+		width: 6px;
+		height: 6px;
+		border-radius: 50%;
+		background: var(--m-fg-subtle);
+	}
+	.svc-marker .done-dot {
+		background: var(--m-fg-subtle);
+	}
+	.svc-marker .failed-dot {
+		background: var(--m-danger);
+	}
+	.svc-marker .waiting-dot {
+		background: var(--m-warning, var(--m-fg-muted));
+	}
+	/* Pulse the rows compose is still blocked on so the user can
+	   spot the hold-up at a glance. Solid red rows are failures
+	   that won't recover on their own — never pulse those. */
+	.services li.waiting {
+		animation: busy-pulse 1.4s ease-in-out infinite;
 	}
 	.svc-name {
 		color: var(--m-fg);
+	}
+	.services li.waiting .svc-name {
+		color: var(--m-warning, var(--m-fg));
 	}
 	.svc-state {
 		color: var(--m-fg-muted);
@@ -378,10 +451,10 @@
 	.svc-restarting {
 		color: var(--m-warning, var(--m-fg-muted));
 	}
-	/* Long-running services that exited with a non-zero code, or
-	   anything `dead`/unknown — these are the actionable
-	   problems. Plain `exited` (code 0) stays muted because it's
-	   the expected end state for init containers. */
+	/* Long-running services that exited with a non-zero code, an
+	   unhealthy healthcheck, or `dead`/unknown — these are the
+	   actionable problems. Plain `exited` (code 0) stays muted
+	   because it's the expected end state for init containers. */
 	.svc-bad-exit,
 	.svc-dead {
 		color: var(--m-danger);
