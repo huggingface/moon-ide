@@ -332,9 +332,6 @@
 <aside class="chat-panel" data-region="chat" aria-label="Chat panel">
 	<header>
 		<div class="title">Chat</div>
-		{#if slack.connected && slack.status?.identity}
-			<button type="button" class="link" onclick={onDisconnect}>Disconnect</button>
-		{/if}
 	</header>
 
 	{#if !slack.status}
@@ -351,15 +348,18 @@
 	{:else}
 		<div class="connected">
 			<div class="connected-scroll" bind:this={scrollEl} onscroll={onScrollContainer}>
-				<section class="card">
-					<div class="card-row">
-						<span class="card-label">Connected as</span>
-						<span class="card-value">{slack.status.identity?.user_name ?? '—'}</span>
+				<section class="card workspace-card">
+					<div class="workspace-info">
+						<div class="card-row">
+							<span class="card-label">Connected as</span>
+							<span class="card-value">{slack.status.identity?.user_name ?? '—'}</span>
+						</div>
+						<div class="card-row muted">
+							<span class="card-label">Workspace</span>
+							<span class="card-value">{slack.status.identity?.team ?? '—'}</span>
+						</div>
 					</div>
-					<div class="card-row muted">
-						<span class="card-label">Workspace</span>
-						<span class="card-value">{slack.status.identity?.team ?? '—'}</span>
-					</div>
+					<button type="button" class="link" onclick={onDisconnect}>Disconnect</button>
 				</section>
 
 				{#if slack.activeBot}
@@ -788,6 +788,23 @@
 		font-size: 12px;
 		color: var(--m-danger);
 		margin: 0;
+	}
+	/* `.card` defaults to `flex-direction: column` for the label/value
+	   stacks; the workspace card overrides that to put the identity
+	   info on the left and the Disconnect link on the right, mirroring
+	   the bot card's "info | action" pattern. */
+	.workspace-card {
+		flex-direction: row;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+	}
+	.workspace-info {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		min-width: 0;
+		flex: 1;
 	}
 	.bot-card {
 		gap: 10px;
