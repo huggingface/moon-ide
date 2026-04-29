@@ -36,6 +36,17 @@ const PROJECT_COMPOSE_STATE_EVENT = 'project_compose:state';
 /** Mutating actions a folder bar can dispatch. */
 export type ProjectComposeAction = 'up' | 'pause' | 'resume' | 'rebuild' | 'down';
 
+/**
+ * How often the popover re-polls `project_compose_status` while
+ * it's open. The Tauri event only fires when a *mutation*
+ * resolves, but `compose up -d --wait` can block for minutes —
+ * without polling, the user's open popover would freeze on the
+ * pre-`up` snapshot until the entire command returns. 2 s is
+ * cheap (a single `docker compose ps` per folder) and keeps the
+ * "which service are we waiting on" display live.
+ */
+const PANEL_POLL_INTERVAL_MS = 2000;
+
 class ProjectComposeStateStore {
 	/** Per-folder snapshot cache. Key is the folder's absolute path. */
 	#snapshots = new SvelteMap<string, ProjectComposeStatus>();
@@ -49,6 +60,11 @@ class ProjectComposeStateStore {
 	/** Per-folder popover open flag — folder bars share the panel
 	 * implementation but each tracks its own visibility. */
 	#openPanel = new SvelteMap<string, boolean>();
+
+	/** Per-folder live-polling handles. Set while the popover is
+	 * open so service-level state updates without waiting for the
+	 * mutation to resolve. */
+	#pollers = new Map<string, ReturnType<typeof setInterval>>();
 
 	#unlisten: UnlistenFn[] = [];
 	#runtimeWired = false;
@@ -101,17 +117,22 @@ class ProjectComposeStateStore {
 		for (const key of this.#openPanel.keys()) {
 			if (key !== folderPath) {
 				this.#openPanel.set(key, false);
+				this.#stopPolling(key);
 			}
 		}
 		const next = !wasOpen;
 		this.#openPanel.set(folderPath, next);
 		if (next) {
 			void this.refresh(folderPath);
+			this.#startPolling(folderPath);
+		} else {
+			this.#stopPolling(folderPath);
 		}
 	}
 
 	closePanel(folderPath: string): void {
 		this.#openPanel.set(folderPath, false);
+		this.#stopPolling(folderPath);
 	}
 
 	/** Drop a folder's cached state — called when it leaves the workspace. */
@@ -120,6 +141,26 @@ class ProjectComposeStateStore {
 		this.#inFlight.delete(folderPath);
 		this.#errors.delete(folderPath);
 		this.#openPanel.delete(folderPath);
+		this.#stopPolling(folderPath);
+	}
+
+	#startPolling(folderPath: string): void {
+		if (this.#pollers.has(folderPath)) {
+			return;
+		}
+		const handle = setInterval(() => {
+			void this.refresh(folderPath);
+		}, PANEL_POLL_INTERVAL_MS);
+		this.#pollers.set(folderPath, handle);
+	}
+
+	#stopPolling(folderPath: string): void {
+		const handle = this.#pollers.get(folderPath);
+		if (handle === undefined) {
+			return;
+		}
+		clearInterval(handle);
+		this.#pollers.delete(folderPath);
 	}
 
 	/**
