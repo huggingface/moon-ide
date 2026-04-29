@@ -464,6 +464,10 @@ fn parse_ps_output(stdout: &[u8]) -> Result<Vec<ServiceStatus>, String> {
 struct PsEntry {
 	service: String,
 	state: String,
+	#[serde(default)]
+	exit_code: i32,
+	#[serde(default)]
+	health: String,
 }
 
 impl From<PsEntry> for ServiceStatus {
@@ -471,6 +475,8 @@ impl From<PsEntry> for ServiceStatus {
 		ServiceStatus {
 			name: entry.service,
 			raw_state: entry.state,
+			exit_code: entry.exit_code,
+			health: entry.health,
 		}
 	}
 }
@@ -481,11 +487,20 @@ impl From<PsEntry> for ServiceStatus {
 /// Precedence (highest wins):
 ///
 /// 1. `Paused` — any container paused.
-/// 2. `Creating` — any container in `created`/`restarting`.
-/// 3. `Failed` — any container `dead` or in an unrecognised
-///    state.
-/// 4. `Running` — at least one running and none of the above.
-/// 5. `Stopped` — every container `exited`.
+/// 2. `Failed` —
+///    - any container `dead` or in an unrecognised state, OR
+///    - any container exited with a non-zero code, OR
+///    - mixed: at least one running with at least one stuck
+///      in `created` or `exited` alongside it (interrupted
+///      `compose up` or stalled `depends_on`).
+/// 3. `Creating` — any container `restarting` (actively
+///    transitioning; `created` on its own does **not** count,
+///    that's an inert "exists but never started" state).
+/// 4. `Running` — at least one container running and the rest
+///    are healthy zero-exit init containers.
+/// 5. `Stopped` — everything is `created` or zero-exit
+///    `exited` (project never came up, or the user stopped it
+///    manually). Init-only projects that completed land here.
 /// 6. `Absent` — no containers reported.
 fn aggregate_state(services: &[ServiceStatus]) -> ContainerState {
 	if services.is_empty() {
@@ -493,40 +508,63 @@ fn aggregate_state(services: &[ServiceStatus]) -> ContainerState {
 	}
 	let mut any_paused = false;
 	let mut any_running = false;
-	let mut any_creating = false;
-	let mut any_failed = false;
-	let mut any_exited = false;
+	let mut any_restarting = false;
+	let mut any_dead_or_unknown = false;
+	let mut any_exited_zero = false;
+	let mut any_exited_nonzero = false;
+	let mut any_created = false;
 	for svc in services {
 		match svc.raw_state.as_str() {
 			"paused" => any_paused = true,
 			"running" => any_running = true,
-			"created" | "restarting" => any_creating = true,
-			"dead" => any_failed = true,
-			"exited" => any_exited = true,
+			"restarting" => any_restarting = true,
+			"created" => any_created = true,
+			"exited" => {
+				if svc.exit_code == 0 {
+					any_exited_zero = true;
+				} else {
+					any_exited_nonzero = true;
+				}
+			}
+			"dead" => any_dead_or_unknown = true,
 			// Anything we don't recognise is treated as
 			// "something's wrong" rather than silently dropped.
-			_ => any_failed = true,
+			_ => any_dead_or_unknown = true,
 		}
 	}
+
 	if any_paused {
 		return ContainerState::Paused;
 	}
-	if any_creating {
-		return ContainerState::Creating;
-	}
-	if any_failed {
+	if any_dead_or_unknown || any_exited_nonzero {
 		return ContainerState::Failed;
+	}
+	// Mixed-state detection: a running service alongside a
+	// `created` (stalled `depends_on`, interrupted `compose
+	// up`) means the project isn't all the way up. Init
+	// containers that exited 0 don't trip this — that's the
+	// expected end state for a one-shot.
+	if any_running && any_created {
+		return ContainerState::Failed;
+	}
+	if any_restarting {
+		return ContainerState::Creating;
 	}
 	if any_running {
 		return ContainerState::Running;
 	}
-	if any_exited {
+	// At this point the only remaining states are `created`
+	// and zero-exit `exited`. Both are inert: project was
+	// either stopped or never started fully. Either way the
+	// status pip's "Stopped" affordance is the right next
+	// step.
+	if any_created || any_exited_zero {
 		return ContainerState::Stopped;
 	}
 	// Unreachable in practice: the loop covers every observed
-	// state and all unknowns flip `any_failed`. Defaulting to
-	// `Failed` here is the safe choice if a future Docker
-	// version adds a new status string.
+	// state and all unknowns flip `any_dead_or_unknown`.
+	// Defaulting to `Failed` here is the safe choice if a
+	// future Docker version adds a new status string.
 	ContainerState::Failed
 }
 
@@ -538,6 +576,17 @@ mod tests {
 		ServiceStatus {
 			name: name.into(),
 			raw_state: raw.into(),
+			exit_code: 0,
+			health: String::new(),
+		}
+	}
+
+	fn exited(name: &str, code: i32) -> ServiceStatus {
+		ServiceStatus {
+			name: name.into(),
+			raw_state: "exited".into(),
+			exit_code: code,
+			health: String::new(),
 		}
 	}
 
@@ -558,8 +607,8 @@ mod tests {
 
 	#[test]
 	fn parse_ps_jsonl_one_per_line() {
-		let stdout = br#"{"Service":"dev","State":"running"}
-{"Service":"mongo","State":"paused"}
+		let stdout = br#"{"Service":"dev","State":"running","ExitCode":0,"Health":""}
+{"Service":"mongo","State":"paused","ExitCode":0,"Health":""}
 "#;
 		let parsed = parse_ps_output(stdout).unwrap();
 		assert_eq!(parsed, vec![svc("dev", "running"), svc("mongo", "paused")]);
@@ -569,14 +618,34 @@ mod tests {
 	fn parse_ps_array_form() {
 		// Some docker compose versions emit a single JSON array
 		// (`--format json` on older 2.x).
-		let stdout = br#"[{"Service":"dev","State":"running"},{"Service":"mongo","State":"exited"}]"#;
+		let stdout = br#"[{"Service":"dev","State":"running","ExitCode":0,"Health":""},{"Service":"mongo","State":"exited","ExitCode":0,"Health":""}]"#;
 		let parsed = parse_ps_output(stdout).unwrap();
-		assert_eq!(parsed, vec![svc("dev", "running"), svc("mongo", "exited")]);
+		assert_eq!(parsed, vec![svc("dev", "running"), exited("mongo", 0)]);
+	}
+
+	#[test]
+	fn parse_ps_captures_exit_code_and_health() {
+		let stdout = br#"{"Service":"gitaly","State":"exited","ExitCode":1,"Health":""}
+{"Service":"meilisearch","State":"running","ExitCode":0,"Health":"healthy"}
+"#;
+		let parsed = parse_ps_output(stdout).unwrap();
+		assert_eq!(parsed[0].exit_code, 1);
+		assert_eq!(parsed[1].health, "healthy");
+	}
+
+	#[test]
+	fn parse_ps_tolerates_missing_optional_fields() {
+		// Older compose versions may omit ExitCode / Health. The
+		// `#[serde(default)]` on the struct should make us tolerate
+		// that without erroring.
+		let stdout = br#"{"Service":"dev","State":"running"}"#;
+		let parsed = parse_ps_output(stdout).unwrap();
+		assert_eq!(parsed, vec![svc("dev", "running")]);
 	}
 
 	#[test]
 	fn parse_ps_tolerates_blank_lines() {
-		let stdout = b"\n{\"Service\":\"dev\",\"State\":\"running\"}\n\n";
+		let stdout = b"\n{\"Service\":\"dev\",\"State\":\"running\",\"ExitCode\":0,\"Health\":\"\"}\n\n";
 		assert_eq!(parse_ps_output(stdout).unwrap(), vec![svc("dev", "running")]);
 	}
 
@@ -604,13 +673,17 @@ mod tests {
 	}
 
 	#[test]
-	fn aggregate_creating_beats_running_but_not_paused() {
+	fn aggregate_restarting_is_creating() {
 		assert_eq!(
-			aggregate_state(&[svc("dev", "created"), svc("mongo", "running")]),
+			aggregate_state(&[svc("dev", "running"), svc("mongo", "restarting")]),
 			ContainerState::Creating,
 		);
+	}
+
+	#[test]
+	fn aggregate_paused_dominates_restarting() {
 		assert_eq!(
-			aggregate_state(&[svc("dev", "created"), svc("mongo", "paused")]),
+			aggregate_state(&[svc("dev", "restarting"), svc("mongo", "paused")]),
 			ContainerState::Paused,
 		);
 	}
@@ -629,9 +702,59 @@ mod tests {
 	}
 
 	#[test]
-	fn aggregate_all_exited_is_stopped() {
+	fn aggregate_running_with_stalled_created_is_failed() {
+		// The user-reported bug: compose up -d --wait was killed
+		// mid-startup, leaving five services running and three
+		// stuck in `created` because their `depends_on` chain
+		// never satisfied. Old aggregation said "Creating" forever;
+		// new aggregation flags it as Failed so the popover's
+		// rebuild / tear-down affordances surface.
+		let services = [
+			svc("dev", "running"),
+			svc("redis", "running"),
+			svc("cas", "created"),
+			svc("mongo", "created"),
+		];
+		assert_eq!(aggregate_state(&services), ContainerState::Failed);
+	}
+
+	#[test]
+	fn aggregate_init_container_zero_exit_does_not_failbreak_running() {
+		// One-shot init containers (e.g. `keyfile-generator`) are
+		// expected to exit 0 alongside running long-running
+		// services. That's a healthy `Running` state, not Failed.
+		let services = [
+			svc("dev", "running"),
+			svc("redis", "running"),
+			exited("keyfile-generator", 0),
+		];
+		assert_eq!(aggregate_state(&services), ContainerState::Running);
+	}
+
+	#[test]
+	fn aggregate_nonzero_exit_is_failed() {
+		// `gitaly` exited 1 → project is broken even if other
+		// services are running.
+		let services = [svc("dev", "running"), exited("gitaly", 1)];
+		assert_eq!(aggregate_state(&services), ContainerState::Failed);
+	}
+
+	#[test]
+	fn aggregate_all_exited_zero_is_stopped() {
 		assert_eq!(
-			aggregate_state(&[svc("dev", "exited"), svc("mongo", "exited")]),
+			aggregate_state(&[exited("dev", 0), exited("mongo", 0)]),
+			ContainerState::Stopped,
+		);
+	}
+
+	#[test]
+	fn aggregate_all_created_is_stopped() {
+		// `compose create` (without `up`) puts every service in
+		// `created` — the project exists but never started. Map
+		// to Stopped so the user sees a clean "press Set up"
+		// affordance rather than a forever-spinning "setting up".
+		assert_eq!(
+			aggregate_state(&[svc("dev", "created"), svc("mongo", "created")]),
 			ContainerState::Stopped,
 		);
 	}

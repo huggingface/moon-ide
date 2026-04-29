@@ -15,4 +15,19 @@ name: string,
  * verbatim so the UI can show it without us re-encoding
  * nuance away.
  */
-raw_state: string, };
+raw_state: string, 
+/**
+ * Process exit code. Compose emits `0` for non-exited
+ * states too, so this is meaningful only when
+ * `raw_state == "exited"`. The aggregation layer uses it
+ * to distinguish a successful init container (exit 0)
+ * from a failed long-running service (exit ≠ 0); the UI
+ * surfaces it next to the state for `exited` services.
+ */
+exit_code: number, 
+/**
+ * Healthcheck verdict, when one is declared (`healthy`,
+ * `unhealthy`, `starting`). Empty string when the service
+ * has no healthcheck.
+ */
+health: string, };

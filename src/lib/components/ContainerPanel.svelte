@@ -90,7 +90,14 @@
 				{#each services as svc (svc.name)}
 					<li>
 						<span class="svc-name">{svc.name}</span>
-						<span class="svc-state svc-{svc.raw_state}">{svc.raw_state}</span>
+						<span
+							class="svc-state svc-{svc.raw_state}"
+							class:svc-bad-exit={svc.raw_state === 'exited' && svc.exit_code !== 0}
+						>
+							{svc.raw_state}{svc.raw_state === 'exited' ? ` (${svc.exit_code})` : ''}{svc.health
+								? ` · ${svc.health}`
+								: ''}
+						</span>
 					</li>
 				{/each}
 			</ul>
@@ -252,10 +259,19 @@
 	.svc-running {
 		color: var(--m-success);
 	}
-	.svc-paused {
+	.svc-paused,
+	.svc-exited,
+	.svc-created {
 		color: var(--m-fg-muted);
 	}
-	.svc-exited,
+	.svc-restarting {
+		color: var(--m-warning, var(--m-fg-muted));
+	}
+	/* Long-running services that exited with a non-zero code, or
+	   anything `dead`/unknown — these are the actionable
+	   problems. Plain `exited` (code 0) stays muted because it's
+	   the expected end state for init containers. */
+	.svc-bad-exit,
 	.svc-dead {
 		color: var(--m-danger);
 	}

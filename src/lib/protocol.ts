@@ -329,6 +329,10 @@ export type ServiceStatus = {
 	name: string;
 	/** Raw Docker container state (`running`, `paused`, `exited`, `created`, `restarting`, `dead`). */
 	raw_state: string;
+	/** Process exit code. Compose emits `0` for non-exited states too — only meaningful when `raw_state === 'exited'`. */
+	exit_code: number;
+	/** Healthcheck verdict (`healthy`, `unhealthy`, `starting`); empty string when no healthcheck declared. */
+	health: string;
 };
 
 /**

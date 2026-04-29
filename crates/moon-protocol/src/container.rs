@@ -24,12 +24,17 @@ use ts_rs::TS;
 #[serde(rename_all = "lowercase")]
 pub enum ContainerState {
 	/// No compose project exists for this workspace (no
-	/// containers, no `.moon/compose.yaml`, or both).
+	/// containers, no `compose.yaml`, or both).
 	Absent,
-	/// `up -d` is in flight, or one or more containers are
-	/// `created` / `restarting`.
+	/// One or more containers are `restarting` — actively
+	/// transitioning. (A container that exists but has never
+	/// started, i.e. compose's `created`, is **not** mapped to
+	/// this — that means a `depends_on` precondition stalled,
+	/// which is a `Failed` symptom.)
 	Creating,
 	/// At least one container is running and none are paused.
+	/// Init containers that exited with code 0 alongside the
+	/// running services don't disturb this.
 	Running,
 	/// At least one container is `paused`. Compose's pause is
 	/// project-wide for our usage, so under normal moon-ide
@@ -37,14 +42,18 @@ pub enum ContainerState {
 	/// states only show up when a user paused individual
 	/// containers outside the IDE.
 	Paused,
-	/// Containers exist but every one is `exited`. moon-ide
-	/// itself never drives into this — `Workspace::pause` uses
-	/// pause, not stop — but we surface it if the user ran
-	/// `docker compose stop` from outside.
+	/// Every container is `exited` (zero exit code) or `created`
+	/// without ever having started. moon-ide itself never drives
+	/// into this — `Workspace::pause` uses pause, not stop — but
+	/// we surface it if the user ran `docker compose stop` /
+	/// `compose create` from outside.
 	Stopped,
-	/// A container is `dead`, the daemon reported a state we
-	/// don't recognise, or compose itself errored. The UI shows
-	/// the per-service detail so the user can decide.
+	/// One of: a container is `dead`, the daemon reported a
+	/// state we don't recognise, a service exited with a
+	/// non-zero code, or the project is in a mixed state where
+	/// some services are running while others are stuck in
+	/// `created` (stalled `depends_on`) or have exited. The UI
+	/// shows the per-service detail so the user can decide.
 	Failed,
 }
 
@@ -60,6 +69,17 @@ pub struct ServiceStatus {
 	/// verbatim so the UI can show it without us re-encoding
 	/// nuance away.
 	pub raw_state: String,
+	/// Process exit code. Compose emits `0` for non-exited
+	/// states too, so this is meaningful only when
+	/// `raw_state == "exited"`. The aggregation layer uses it
+	/// to distinguish a successful init container (exit 0)
+	/// from a failed long-running service (exit ≠ 0); the UI
+	/// surfaces it next to the state for `exited` services.
+	pub exit_code: i32,
+	/// Healthcheck verdict, when one is declared (`healthy`,
+	/// `unhealthy`, `starting`). Empty string when the service
+	/// has no healthcheck.
+	pub health: String,
 }
 
 /// Snapshot returned by `container_status` and embedded in
