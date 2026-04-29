@@ -218,6 +218,24 @@ describe('parseSlackMrkdwn — quotes', () => {
 			{ type: 'bold', children: [{ type: 'text', value: 'bold' }] },
 		]);
 	});
+
+	it('parses an HTML-encoded `&gt;` line as a quote', () => {
+		// Slack always escapes `>` to `&gt;` in API responses, so this
+		// is the shape we see in practice for user/bot-typed quote
+		// prefixes that traversed `chat.postMessage`.
+		const inline = singleQuote(parseSlackMrkdwn('&gt; a quoted line'));
+		expect(inline).toEqual([{ type: 'text', value: 'a quoted line' }]);
+	});
+
+	it('groups consecutive `&gt;` lines into one block', () => {
+		const inline = singleQuote(parseSlackMrkdwn('&gt; first\n&gt; second'));
+		expect(inline).toEqual([{ type: 'text', value: 'first\nsecond' }]);
+	});
+
+	it('mixes `&gt;` and unencoded `>` quote lines into one block', () => {
+		const inline = singleQuote(parseSlackMrkdwn('&gt; first\n> second'));
+		expect(inline).toEqual([{ type: 'text', value: 'first\nsecond' }]);
+	});
 });
 
 describe('parseSlackMrkdwn — angle tokens', () => {

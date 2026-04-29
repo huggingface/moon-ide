@@ -138,8 +138,8 @@ function emojifyLabel(label: string | null): string | null {
 
 /**
  * Group consecutive lines into quote / text blocks. A line is a quote
- * line iff it starts with `>` (Slack's mrkdwn syntax). The single
- * leading `>` (and one optional space) is stripped before re-joining.
+ * line iff it starts with `>` (Slack's mrkdwn syntax). The marker
+ * (and one optional trailing space) is stripped before re-joining.
  */
 function pushTextSegment(blocks: BlockNode[], segment: string): void {
 	if (segment.length === 0) {
@@ -166,19 +166,49 @@ function pushTextSegment(blocks: BlockNode[], segment: string): void {
 		buf = [];
 	};
 	for (const line of lines) {
-		const isQuote = line.startsWith('>');
-		const lineMode: 'text' | 'quote' = isQuote ? 'quote' : 'text';
+		const marker = detectQuoteMarker(line);
+		const lineMode: 'text' | 'quote' = marker !== null ? 'quote' : 'text';
 		if (lineMode !== mode) {
 			flush();
 			mode = lineMode;
 		}
-		if (isQuote) {
-			buf.push(line.startsWith('> ') ? line.slice(2) : line.slice(1));
+		if (marker !== null) {
+			buf.push(line.slice(marker.length));
 		} else {
 			buf.push(line);
 		}
 	}
 	flush();
+}
+
+/**
+ * Detect a leading quote marker. Returns the marker text (so the
+ * caller can `slice` it off) or `null` for non-quote lines.
+ *
+ * Two forms are accepted:
+ *
+ *   - The literal `>` — appears when something has already decoded
+ *     entities upstream (or the bot composes against an unescaped
+ *     surface).
+ *   - The HTML-encoded `&gt;` — Slack's API always escapes `<`, `>`
+ *     and `&` in message bodies, so this is the form we see in
+ *     practice for any user-typed or bot-typed quote prefix that
+ *     went through `chat.postMessage`. Without this branch we'd
+ *     render `> something` as a plain paragraph that happens to
+ *     start with `&gt;`.
+ *
+ * One trailing space is consumed when present (Slack's own renderer
+ * does the same: `> foo` and `>foo` both quote `foo`, but `>  foo`
+ * quotes ` foo` with a leading space).
+ */
+function detectQuoteMarker(line: string): string | null {
+	if (line.startsWith('>')) {
+		return line.startsWith('> ') ? '> ' : '>';
+	}
+	if (line.startsWith('&gt;')) {
+		return line.startsWith('&gt; ') ? '&gt; ' : '&gt;';
+	}
+	return null;
 }
 
 /** Trim one leading newline that Slack's UI adds after the opening fence. */
