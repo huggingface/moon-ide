@@ -174,6 +174,22 @@ pub async fn project_compose_rebuild(
 	snapshot_and_emit(&app, workspace_id, &folder_path, &pc).await
 }
 
+/// `docker compose stop` — SIGTERM every service in the project
+/// without removing the containers. The cheaper counterpart to
+/// `project_compose_down`: a follow-up `up` resumes from the
+/// same containers and skips the image pull / build steps.
+#[tauri::command]
+pub async fn project_compose_stop(
+	app: AppHandle,
+	state: State<'_, AppState>,
+	folder_path: String,
+) -> Result<ProjectComposeStatus, MoonError> {
+	let folder_path = Utf8PathBuf::from(folder_path);
+	let (workspace_id, pc) = require_project_handle(&state, &folder_path).await?;
+	pc.stop().await?;
+	snapshot_and_emit(&app, workspace_id, &folder_path, &pc).await
+}
+
 #[tauri::command]
 pub async fn project_compose_down(
 	app: AppHandle,

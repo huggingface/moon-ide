@@ -52,6 +52,7 @@ pub fn run() {
 			commands::project_compose::project_compose_pause,
 			commands::project_compose::project_compose_resume,
 			commands::project_compose::project_compose_rebuild,
+			commands::project_compose::project_compose_stop,
 			commands::project_compose::project_compose_down,
 			commands::project_compose::project_compose_service_start,
 			commands::project_compose::project_compose_service_stop,

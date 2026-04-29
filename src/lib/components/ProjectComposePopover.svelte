@@ -82,8 +82,10 @@
 				return 'Pausing services…';
 			case 'resume':
 				return 'Resuming services…';
+			case 'stop':
+				return 'Stopping services…';
 			case 'down':
-				return 'Tearing down services…';
+				return 'Tearing down services — removing containers and network…';
 			case 'service-start':
 				return inFlightService ? `Starting ${inFlightService}…` : null;
 			case 'service-stop':
@@ -161,16 +163,26 @@
 			{/if}
 		</dl>
 
-		{#if state === 'absent' || state === 'stopped'}
+		{#if state === 'absent'}
 			<div class="actions">
 				<button type="button" class="primary" disabled={busy} onclick={() => projectCompose.up(folderPath)}>
 					{inFlight === 'up' ? 'Starting…' : 'Start services'}
 				</button>
-				{#if state === 'stopped'}
-					<button type="button" class="danger" disabled={busy} onclick={() => projectCompose.down(folderPath)}>
-						{inFlight === 'down' ? 'Tearing down…' : 'Tear down'}
-					</button>
-				{/if}
+			</div>
+		{:else if state === 'stopped'}
+			<div class="actions">
+				<button type="button" class="primary" disabled={busy} onclick={() => projectCompose.up(folderPath)}>
+					{inFlight === 'up' ? 'Starting…' : 'Start services'}
+				</button>
+				<button
+					type="button"
+					class="danger"
+					disabled={busy}
+					title="docker compose down — removes containers and network. Volumes are preserved."
+					onclick={() => projectCompose.down(folderPath)}
+				>
+					{inFlight === 'down' ? 'Tearing down…' : 'Tear down'}
+				</button>
 			</div>
 		{:else if state === 'creating'}
 			<p class="copy">Bringing up services — this can take a few minutes the first time.</p>
@@ -182,8 +194,22 @@
 				<button type="button" disabled={busy} onclick={() => projectCompose.rebuild(folderPath)}>
 					{inFlight === 'rebuild' ? 'Rebuilding…' : 'Rebuild'}
 				</button>
-				<button type="button" class="danger" disabled={busy} onclick={() => projectCompose.down(folderPath)}>
-					{inFlight === 'down' ? 'Tearing down…' : 'Stop services'}
+				<button
+					type="button"
+					disabled={busy}
+					title="docker compose stop — SIGTERM containers, keep them on the daemon for a fast restart."
+					onclick={() => projectCompose.stop(folderPath)}
+				>
+					{inFlight === 'stop' ? 'Stopping…' : 'Stop'}
+				</button>
+				<button
+					type="button"
+					class="danger"
+					disabled={busy}
+					title="docker compose down — removes containers and network. Volumes are preserved."
+					onclick={() => projectCompose.down(folderPath)}
+				>
+					{inFlight === 'down' ? 'Tearing down…' : 'Tear down'}
 				</button>
 			</div>
 		{:else if state === 'paused'}
@@ -191,17 +217,36 @@
 				<button type="button" class="primary" disabled={busy} onclick={() => projectCompose.resume(folderPath)}>
 					{inFlight === 'resume' ? 'Resuming…' : 'Resume'}
 				</button>
-				<button type="button" class="danger" disabled={busy} onclick={() => projectCompose.down(folderPath)}>
-					{inFlight === 'down' ? 'Tearing down…' : 'Stop services'}
+				<button
+					type="button"
+					disabled={busy}
+					title="docker compose stop — SIGTERM containers, keep them on the daemon for a fast restart."
+					onclick={() => projectCompose.stop(folderPath)}
+				>
+					{inFlight === 'stop' ? 'Stopping…' : 'Stop'}
+				</button>
+				<button
+					type="button"
+					class="danger"
+					disabled={busy}
+					title="docker compose down — removes containers and network. Volumes are preserved."
+					onclick={() => projectCompose.down(folderPath)}
+				>
+					{inFlight === 'down' ? 'Tearing down…' : 'Tear down'}
 				</button>
 			</div>
 		{:else if state === 'failed'}
-			<p class="copy">One or more services are unhealthy. See per-service detail below.</p>
 			<div class="actions">
 				<button type="button" disabled={busy} onclick={() => projectCompose.rebuild(folderPath)}>
 					{inFlight === 'rebuild' ? 'Rebuilding…' : 'Rebuild'}
 				</button>
-				<button type="button" class="danger" disabled={busy} onclick={() => projectCompose.down(folderPath)}>
+				<button
+					type="button"
+					class="danger"
+					disabled={busy}
+					title="docker compose down — removes containers and network. Volumes are preserved."
+					onclick={() => projectCompose.down(folderPath)}
+				>
 					{inFlight === 'down' ? 'Tearing down…' : 'Tear down'}
 				</button>
 			</div>
@@ -227,36 +272,42 @@
 							</span>
 							<span class="svc-name">{svc.name}</span>
 							<span class="svc-controls" aria-label="{svc.name} actions">
-								<button
-									type="button"
-									class="svc-btn"
-									title="Start {svc.name}"
-									aria-label="Start {svc.name}"
-									disabled={busy || !canStart(svc)}
-									onclick={() => projectCompose.startService(folderPath, svc.name)}
-								>
-									▶
-								</button>
-								<button
-									type="button"
-									class="svc-btn"
-									title="Restart {svc.name}"
-									aria-label="Restart {svc.name}"
-									disabled={busy || !canRestart(svc)}
-									onclick={() => projectCompose.restartService(folderPath, svc.name)}
-								>
-									↻
-								</button>
-								<button
-									type="button"
-									class="svc-btn"
-									title="Stop {svc.name}"
-									aria-label="Stop {svc.name}"
-									disabled={busy || !canStop(svc)}
-									onclick={() => projectCompose.stopService(folderPath, svc.name)}
-								>
-									◼
-								</button>
+								{#if canStart(svc)}
+									<button
+										type="button"
+										class="svc-btn"
+										title="Start {svc.name}"
+										aria-label="Start {svc.name}"
+										disabled={busy}
+										onclick={() => projectCompose.startService(folderPath, svc.name)}
+									>
+										▶
+									</button>
+								{/if}
+								{#if canRestart(svc)}
+									<button
+										type="button"
+										class="svc-btn"
+										title="Restart {svc.name}"
+										aria-label="Restart {svc.name}"
+										disabled={busy}
+										onclick={() => projectCompose.restartService(folderPath, svc.name)}
+									>
+										↻
+									</button>
+								{/if}
+								{#if canStop(svc)}
+									<button
+										type="button"
+										class="svc-btn"
+										title="Stop {svc.name}"
+										aria-label="Stop {svc.name}"
+										disabled={busy}
+										onclick={() => projectCompose.stopService(folderPath, svc.name)}
+									>
+										◼
+									</button>
+								{/if}
 								<button
 									type="button"
 									class="svc-btn"
@@ -268,9 +319,18 @@
 								</button>
 							</span>
 							<span class="svc-state svc-{svc.raw_state}" class:svc-bad-exit={failed}>
-								{svc.raw_state}{svc.raw_state === 'exited' ? ` (${svc.exit_code})` : ''}{svc.health
-									? ` · ${svc.health}`
-									: ''}
+								<span class="state-text">
+									{svc.raw_state}{svc.raw_state === 'exited' ? ` (${svc.exit_code})` : ''}
+								</span>
+								{#if svc.health === 'healthy'}
+									<span class="health-ok" aria-label="healthy" title="healthy">✓</span>
+								{:else if svc.health === 'starting'}
+									<span class="health-warn">· starting</span>
+								{:else if svc.health === 'unhealthy'}
+									<span class="health-bad">· unhealthy</span>
+								{:else if svc.health}
+									<span class="health-text">· {svc.health}</span>
+								{/if}
 							</span>
 						</li>
 					{/each}
@@ -288,6 +348,11 @@
 		margin-top: 4px;
 		min-width: 280px;
 		max-width: 420px;
+		/* Cap so the popover never extends past the viewport on
+		   tall service lists. The internal services list takes
+		   the slack via flex; everything above (header, errors,
+		   meta, actions) stays anchored at the top. */
+		max-height: calc(100vh - 64px);
 		background: var(--m-bg-2);
 		border: 1px solid var(--m-border-strong);
 		border-radius: 6px;
@@ -448,11 +513,22 @@
 	}
 	.services {
 		margin-top: 2px;
+		/* Take all remaining vertical space so the inner list can
+		   scroll when long. The fixed-height items above keep
+		   their natural size; only the services list flexes. */
+		flex: 1;
+		min-height: 0;
+		display: flex;
+		flex-direction: column;
+	}
+	.services[open] {
+		overflow: hidden;
 	}
 	.services summary {
 		cursor: pointer;
 		color: var(--m-fg-muted);
 		user-select: none;
+		flex-shrink: 0;
 	}
 	.services ul {
 		list-style: none;
@@ -461,6 +537,9 @@
 		display: flex;
 		flex-direction: column;
 		gap: 2px;
+		overflow-y: auto;
+		min-height: 0;
+		flex: 1;
 	}
 	.services li {
 		display: grid;
@@ -471,12 +550,13 @@
 		min-height: 22px;
 	}
 	/* Per-row action toolbar. Visible at low contrast by default,
-	   pops on row hover to keep the list readable but discoverable.
-	   Buttons stay individually accessible via tab/keyboard at all
-	   times — visibility is purely a visual nudge. */
+	   pops on row hover to keep the list readable but
+	   discoverable. Non-applicable buttons aren't rendered at
+	   all — fewer greyed glyphs to look at, and nothing the user
+	   could click but shouldn't. */
 	.svc-controls {
 		display: inline-flex;
-		gap: 2px;
+		gap: 0;
 		opacity: 0.35;
 		transition: opacity 0.12s ease;
 	}
@@ -492,7 +572,7 @@
 		color: var(--m-fg-muted);
 		border: 1px solid transparent;
 		border-radius: 3px;
-		padding: 2px 5px;
+		padding: 2px 4px;
 		cursor: pointer;
 	}
 	.svc-btn:hover:not(:disabled) {
@@ -542,6 +622,33 @@
 	}
 	.svc-running {
 		color: var(--m-success);
+	}
+	/* Healthy is the steady-state default for `running`; render
+	   it as a small check next to the state word rather than the
+	   `· healthy` text so the right column stays compact. The
+	   transient/bad health states keep explicit text in their
+	   own colours because a row in those states needs attention
+	   — the suffix is what tells the user something's off when
+	   the row word still says "running". */
+	.health-ok {
+		color: var(--m-success);
+		font-size: 11px;
+		margin-left: 4px;
+	}
+	.health-warn {
+		color: var(--m-warning, var(--m-fg-muted));
+		font-size: 11px;
+		margin-left: 4px;
+	}
+	.health-bad {
+		color: var(--m-danger);
+		font-size: 11px;
+		margin-left: 4px;
+	}
+	.health-text {
+		color: var(--m-fg-muted);
+		font-size: 11px;
+		margin-left: 4px;
 	}
 	.svc-paused,
 	.svc-exited,

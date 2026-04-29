@@ -34,7 +34,7 @@ import { formatError, type ProjectComposeStateChange, type ProjectComposeStatus 
 const PROJECT_COMPOSE_STATE_EVENT = 'project_compose:state';
 
 /** Project-level compose lifecycle verbs the folder bar can fire. */
-export type ProjectComposeProjectAction = 'up' | 'pause' | 'resume' | 'rebuild' | 'down';
+export type ProjectComposeProjectAction = 'up' | 'pause' | 'resume' | 'rebuild' | 'stop' | 'down';
 
 /** Per-service compose lifecycle verbs fired from a service row. */
 export type ProjectComposeServiceAction = 'service-start' | 'service-stop' | 'service-restart';
@@ -224,6 +224,10 @@ class ProjectComposeStateStore {
 
 	async rebuild(folderPath: string): Promise<void> {
 		await this.#run(folderPath, { action: 'rebuild' }, () => ipc.projectCompose.rebuild(folderPath));
+	}
+
+	async stop(folderPath: string): Promise<void> {
+		await this.#run(folderPath, { action: 'stop' }, () => ipc.projectCompose.stop(folderPath));
 	}
 
 	async down(folderPath: string): Promise<void> {

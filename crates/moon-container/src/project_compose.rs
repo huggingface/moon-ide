@@ -165,9 +165,22 @@ impl ProjectCompose {
 		Ok(())
 	}
 
+	/// `docker compose stop` — SIGTERM all of the folder's
+	/// service containers but **leave the records on the
+	/// daemon**. Cheaper to undo than [`Self::down`]: a follow-up
+	/// `up` resumes from the same containers without rebuilding
+	/// or re-pulling images. This is the right "I'm done for
+	/// now, I'll come back to this project soon" knob.
+	pub async fn stop(&self) -> Result<(), LifecycleError> {
+		self.docker_compose(["stop"]).await?;
+		Ok(())
+	}
+
 	/// `docker compose down` — stop and remove containers,
-	/// networks, and the project entry. The user's compose file
-	/// stays put on disk; this is purely a daemon-side teardown.
+	/// networks, and the project entry. Named volumes (and any
+	/// host bind mounts) are *preserved*: this isn't a data
+	/// nuke, just a daemon-side teardown of the runtime
+	/// resources. The user's compose file stays put on disk.
 	pub async fn down(&self) -> Result<(), LifecycleError> {
 		self.docker_compose(["down"]).await?;
 		Ok(())

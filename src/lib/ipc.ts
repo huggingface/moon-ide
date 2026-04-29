@@ -66,6 +66,7 @@ export const ipc = {
 		pause: (folderPath: string) => invoke<ProjectComposeStatus>('project_compose_pause', { folderPath }),
 		resume: (folderPath: string) => invoke<ProjectComposeStatus>('project_compose_resume', { folderPath }),
 		rebuild: (folderPath: string) => invoke<ProjectComposeStatus>('project_compose_rebuild', { folderPath }),
+		stop: (folderPath: string) => invoke<ProjectComposeStatus>('project_compose_stop', { folderPath }),
 		down: (folderPath: string) => invoke<ProjectComposeStatus>('project_compose_down', { folderPath }),
 		serviceStart: (folderPath: string, service: string) =>
 			invoke<ProjectComposeStatus>('project_compose_service_start', { folderPath, service }),
