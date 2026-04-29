@@ -317,10 +317,19 @@ class WorkspaceState {
 	 * the `EditorPane` empty-state button all funnel through here.
 	 */
 	async openLocal(path: string) {
+		const beforeCount = this.workspace?.folders.length ?? 0;
 		try {
 			const ws = await ipc.workspace.openLocal(path);
 			await this.adoptWorkspaceSnapshot(ws);
 			this.persistAppState();
+			// Backend's `add_folder` is idempotent on duplicate paths
+			// (and we *want* it to flip active in that case). The folder
+			// count is the cleanest "did we actually add a new folder?"
+			// signal — paths the user picked may not equal what the
+			// backend canonicalised, so a string compare is unreliable.
+			if (ws.folders.length === beforeCount) {
+				this.flash(`Folder is already in the workspace.`);
+			}
 		} catch (err) {
 			this.flash(`Failed to open: ${formatError(err)}`);
 		}
