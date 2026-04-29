@@ -74,6 +74,10 @@ export const ipc = {
 		serviceRestart: (folderPath: string, service: string) =>
 			invoke<ProjectComposeStatus>('project_compose_service_restart', { folderPath, service }),
 	},
+	composeLogs: {
+		open: (folderPath: string, service: string) => invoke<string>('compose_logs_open', { folderPath, service }),
+		close: (streamId: string) => invoke<void>('compose_logs_close', { streamId }),
+	},
 	slack: {
 		setToken: (token: string) => invoke<SlackIdentity>('slack_set_token', { token }),
 		status: () => invoke<SlackStatus>('slack_status'),

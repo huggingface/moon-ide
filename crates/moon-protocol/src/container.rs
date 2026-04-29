@@ -145,3 +145,34 @@ pub struct ProjectComposeStateChange {
 	pub folder_path: String,
 	pub project: ProjectComposeStatus,
 }
+
+/// Single line of `docker compose logs` output streamed to the
+/// frontend. Emitted on the `compose_logs:line` Tauri event;
+/// the frontend buffers per `stream_id` so multiple log tabs
+/// don't interleave.
+///
+/// `channel` is `"stdout"` or `"stderr"` so the renderer can
+/// colour them differently (compose itself only writes to
+/// stdout for service output, but errors from the docker CLI
+/// arrive on stderr — keeping them separated lets the UI
+/// surface those distinctly).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LogStreamLine {
+	pub stream_id: String,
+	pub channel: String,
+	pub text: String,
+}
+
+/// Final event for a log stream, fired exactly once when the
+/// underlying `docker compose logs -f` child exits. `code` is
+/// the process's exit code if we caught it, or `None` if the
+/// supervisor was cancelled before it could observe the wait()
+/// result. Either way the frontend should mark the tab as no
+/// longer streaming and stop sending close calls for this id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LogStreamClosed {
+	pub stream_id: String,
+	pub code: Option<i32>,
+}

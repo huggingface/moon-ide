@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { ServiceStatus } from '../protocol';
+	import { composeLogs } from '../composeLogs.svelte';
 	import { projectCompose, projectComposeStateLabel } from '../projectCompose.svelte';
 
 	// Heuristic "waiting on this service" used to pulse the rows
@@ -255,6 +256,15 @@
 									onclick={() => projectCompose.stopService(folderPath, svc.name)}
 								>
 									◼
+								</button>
+								<button
+									type="button"
+									class="svc-btn"
+									title="Stream logs for {svc.name}"
+									aria-label="Logs for {svc.name}"
+									onclick={() => void composeLogs.open(folderPath, svc.name)}
+								>
+									≡
 								</button>
 							</span>
 							<span class="svc-state svc-{svc.raw_state}" class:svc-bad-exit={failed}>

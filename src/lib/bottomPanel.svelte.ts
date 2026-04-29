@@ -52,13 +52,26 @@ export const DEFAULT_BOTTOM_PANEL_HEIGHT = 240;
 /** Tabs the bottom panel can host.
  *
  * The discriminated `kind` field lets the renderer pick a body
- * component without runtime introspection. Slice 3 adds a `log`
- * variant; until then the only inhabitant is the placeholder
- * the panel falls back to when no real tabs are open. */
-export type BottomPanelTab = {
+ * component without runtime introspection. Tabs are intentionally
+ * lean shells — kind-specific content (log line buffers, future
+ * terminal session handles) lives in a sibling store keyed on
+ * `id` so adding new kinds doesn't bloat this type. */
+export type BottomPanelTab = PlaceholderTab | LogTab;
+
+export type PlaceholderTab = {
 	id: string;
 	title: string;
 	kind: 'placeholder';
+};
+
+export type LogTab = {
+	id: string;
+	title: string;
+	kind: 'log';
+	/** Absolute path of the bound folder this stream belongs to. */
+	folderPath: string;
+	/** Compose service name being tailed. */
+	service: string;
 };
 
 class BottomPanelStore {
@@ -143,6 +156,28 @@ class BottomPanelStore {
 		if (this.#tabs.some((t) => t.id === id)) {
 			this.#activeId = id;
 		}
+	}
+
+	/** Append `tab` to the strip and make it active. Caller is
+	 * responsible for picking a unique id (typically a stream
+	 * UUID for log tabs). Existing tabs with the same id are
+	 * left alone — use [`findLogTab`] before opening to avoid
+	 * duplicates. */
+	addTab(tab: BottomPanelTab): void {
+		if (this.#tabs.some((t) => t.id === tab.id)) {
+			this.#activeId = tab.id;
+			return;
+		}
+		this.#tabs = [...this.#tabs, tab];
+		this.#activeId = tab.id;
+	}
+
+	/** Find an existing log tab for `(folderPath, service)`, or
+	 * `null` if none. Used by the Logs button to focus the
+	 * existing stream rather than spawning a duplicate. */
+	findLogTab(folderPath: string, service: string): LogTab | null {
+		const tab = this.#tabs.find((t) => t.kind === 'log' && t.folderPath === folderPath && t.service === service);
+		return tab && tab.kind === 'log' ? tab : null;
 	}
 
 	closeTab(id: string): void {

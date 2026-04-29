@@ -186,6 +186,21 @@ export type BottomPanelAppState = {
 	height: number;
 };
 
+/** One line of streamed `docker compose logs` output. Mirrors
+ * `moon_protocol::container::LogStreamLine`. */
+export type LogStreamLine = {
+	stream_id: string;
+	channel: string;
+	text: string;
+};
+
+/** Final event for a log stream when its child process exits.
+ * Mirrors `moon_protocol::container::LogStreamClosed`. */
+export type LogStreamClosed = {
+	stream_id: string;
+	code: number | null;
+};
+
 export const defaultAppState: AppState = {
 	last_session: null,
 	theme: 'dark',

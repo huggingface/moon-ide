@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { bottomPanel, type BottomPanelTab } from '../bottomPanel.svelte';
 	import { workspace } from '../state.svelte';
+	import LogTab from './LogTab.svelte';
 
 	// Bottom panel region. Hosts long-lived auxiliary surfaces —
 	// service-log streams (slice 3) and, in Phase 5, terminals.
@@ -75,11 +76,13 @@
 		{#if activeTab}
 			{#if activeTab.kind === 'placeholder'}
 				<p class="empty">{placeholderCopy(activeTab)}</p>
+			{:else if activeTab.kind === 'log'}
+				<LogTab tab={activeTab} />
 			{/if}
 		{:else}
 			<p class="empty">
-				<!-- Slice 3 swaps this for a "click Logs on a service row to start streaming" hint. -->
-				No tabs open. Toggle this panel with Ctrl+J.
+				No tabs open. Click <strong>Logs</strong> on a service in the project popover to start streaming, or toggle this panel
+				with Ctrl+J.
 			</p>
 		{/if}
 	</div>
@@ -191,11 +194,12 @@
 	.body {
 		flex: 1;
 		min-height: 0;
-		overflow: auto;
-		padding: 8px 12px;
+		display: flex;
+		flex-direction: column;
 	}
 	.empty {
 		margin: 0;
+		padding: 8px 12px;
 		color: var(--m-fg-muted);
 		line-height: 1.4;
 	}

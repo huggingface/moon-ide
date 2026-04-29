@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use camino::Utf8PathBuf;
 use moon_core::WorkspaceRegistry;
 use moon_slack::{SlackClient, TokenStore};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
+use tokio::task::AbortHandle;
 
 use crate::slack_poller::PollerHandle;
 
@@ -23,6 +25,13 @@ pub struct AppState {
 	/// this is the in-memory client cache (populated at startup if the
 	/// keyring has a token, otherwise lazily on first `slack_set_token`).
 	pub slack: SlackState,
+	/// Registry of active `docker compose logs -f` streams, keyed
+	/// by the stream ID returned to the frontend. Each entry holds
+	/// the `AbortHandle` of the supervisor task that owns the
+	/// child process — aborting it drops the child, which is
+	/// spawned with `kill_on_drop(true)` so the SIGKILL goes out
+	/// immediately. See [`crate::commands::compose_logs`].
+	pub log_streams: Arc<Mutex<HashMap<String, AbortHandle>>>,
 }
 
 impl AppState {
@@ -32,6 +41,7 @@ impl AppState {
 			config_dir,
 			workspaces_dir,
 			slack,
+			log_streams: Arc::new(Mutex::new(HashMap::new())),
 		}
 	}
 

@@ -15,6 +15,7 @@ import {
 	type WorkspaceSession,
 } from './protocol';
 import { bottomPanel } from './bottomPanel.svelte';
+import { composeLogs } from './composeLogs.svelte';
 import { container } from './container.svelte';
 import { projectCompose } from './projectCompose.svelte';
 import { slack } from './slack.svelte';
@@ -528,6 +529,11 @@ class WorkspaceState {
 		// which gets populated lazily via `refreshAll` whenever
 		// the workspace shape changes.
 		void projectCompose.wireRuntime();
+		// Streamed `docker compose logs` lines come in over their
+		// own event channel. Wire idempotently here so the bottom
+		// panel's log tabs receive lines as soon as the user opens
+		// one — no per-tab subscription dance.
+		void composeLogs.wireRuntime();
 
 		const ws = this.workspace;
 		const session = state.last_session;

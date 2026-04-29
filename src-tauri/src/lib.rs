@@ -56,6 +56,8 @@ pub fn run() {
 			commands::project_compose::project_compose_service_start,
 			commands::project_compose::project_compose_service_stop,
 			commands::project_compose::project_compose_service_restart,
+			commands::compose_logs::compose_logs_open,
+			commands::compose_logs::compose_logs_close,
 			commands::slack::slack_set_token,
 			commands::slack::slack_status,
 			commands::slack::slack_clear_token,
