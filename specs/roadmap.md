@@ -100,6 +100,8 @@ Workspace = ordered list of repo roots. Multi-root tree (multiple Pierre Trees i
 
 App state grows with this phase: today's single `last_session` (one workspace + its tabs) becomes a list of recently-opened workspaces and the most recent multi-repo set, with each workspace keeping its own session. The `AppState` struct in `moon-core` is the natural place for this.
 
+This is also the phase that pulls Phase 2's container lifecycle out of the single status-bar pip and into per-folder bars: each folder gets its own container indicator, and "close folder" becomes the per-folder lifecycle hook (pause / tear down — TBD) so cycling through folders doesn't leak running compose projects on the daemon. See [containers.md § Multi-folder workspace](containers.md#multi-folder-workspace-the-command-centre-ux).
+
 ## Phase 8 — Lint / format
 
 oxlint, oxfmt, prettier, eslint as sidecar processes. Debounced. Diagnostics merged with LSP diagnostics in a single problems panel. Format on save with per-language chooser.

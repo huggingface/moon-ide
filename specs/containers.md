@@ -644,6 +644,46 @@ Two future shapes are explicitly preserved:
   (multi-repo) lands. The persistence layer is structured
   so this is a UI/lifecycle change, not a data-model rewrite.
 
+### Multi-folder workspace (the "command centre" UX)
+
+Phase 2.0's mental model is one folder = one workspace = one
+compose project. The single status-bar pip controls the only
+project that exists. That model strains as soon as we move to
+the command-centre UX where a single moon-ide window holds
+several open folders side-by-side (Phase 7 territory). At
+that point:
+
+- "Open folder" stops switching the workspace; it adds a new
+  folder bar alongside the existing one(s).
+- Each folder bar carries its own container indicator —
+  effectively one "container pip" per folder, since the
+  compose project is keyed by folder path
+  (`moon-ws-<hash>`) and that key already differs between
+  folders by construction.
+- "Close folder" becomes the per-folder lifecycle hook the
+  spec hand-waves about today: removing the folder from the
+  workspace stops (or pauses, TBD) its compose project so
+  cycling through folders doesn't leak running projects on
+  the daemon.
+
+There is no GC in 2.0 — closing the moon-ide window leaves
+every compose project running on the daemon, and switching
+the active folder doesn't pause the previous one. That's
+acceptable while there's exactly one folder at a time and
+the user can reach for `Tear down` explicitly. Once
+multi-folder UX lands the per-folder close hook is the
+natural place to retire stale projects without the user
+juggling `docker compose ls`. Until then, the explicit
+buttons + `docker compose ls` are the inventory.
+
+A separate "container management" surface (list every
+`moon-ws-*` project the daemon knows about, with bulk
+"tear down stale" affordances) is the broader-scope
+companion to the per-folder hook — useful even outside
+multi-folder mode for cleaning up containers from
+workspaces the user has stopped opening. Add when the
+inventory genuinely sprawls.
+
 ### Remote hosts
 
 `ContainerHost` is the local variant. The `RemoteHost`
