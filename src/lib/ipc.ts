@@ -56,6 +56,7 @@ export const ipc = {
 		resume: () => invoke<ContainerStatus>('container_resume'),
 		rebuild: () => invoke<ContainerStatus>('container_rebuild'),
 		teardown: () => invoke<ContainerStatus>('container_teardown'),
+		applyBoundFolders: () => invoke<ContainerStatus>('container_apply_bound_folders'),
 		renderCompose: () => invoke<string>('container_render_compose'),
 	},
 	slack: {

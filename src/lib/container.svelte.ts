@@ -22,7 +22,7 @@ import { formatError, type ContainerStateChange, type ContainerStatus } from './
 const CONTAINER_STATE_EVENT = 'container:state';
 
 /** Identifies which mutating command is currently in flight. */
-export type ContainerInFlight = null | 'setup' | 'pause' | 'resume' | 'rebuild' | 'teardown';
+export type ContainerInFlight = null | 'setup' | 'pause' | 'resume' | 'rebuild' | 'teardown' | 'sync-folders';
 
 class ContainerPanelState {
 	/** Last known status. `null` before the first `refresh()`. */
@@ -92,42 +92,30 @@ class ContainerPanelState {
 	}
 
 	/**
-	 * Reset to the "no workspace" state. Called when the workspace
-	 * changes so the pip never shows a stale snapshot from the
-	 * previous workspace mid-transition.
+	 * Drop the cached compose preview. Called when the bound-folder
+	 * set changes so a re-open of the "Inspect" panel re-renders
+	 * with the new mounts. The high-level status doesn't get
+	 * cleared — the compose project survives folder add/remove,
+	 * so the pip should continue to reflect whatever containers
+	 * are actually up.
 	 */
-	resetForWorkspaceSwitch() {
-		this.status = null;
-		this.lastError = null;
+	invalidateComposePreview() {
 		this.composePreview = null;
-		this.previewVisible = false;
-		this.previewError = null;
-		// Don't clear `inFlight` — the previous workspace's command
-		// has its own await chain; let it complete and clean itself
-		// up. (In practice the user can't switch workspaces while a
-		// container command is in flight because the buttons are
-		// disabled, but the invariant is cheap to keep.)
+		if (this.previewVisible) {
+			void this.loadComposePreview();
+		}
 	}
 
 	/**
 	 * Pull the latest status from the backend. Called on workspace
 	 * change, on panel open, and as the after-step of every mutating
-	 * command. No-op if there's no active workspace — the backend
-	 * would error with `InvalidArgument`, which we shouldn't surface
-	 * as a user-visible failure.
+	 * command.
 	 */
 	async refresh(): Promise<void> {
 		try {
 			this.status = await ipc.container.status();
 			this.lastError = null;
 		} catch (err) {
-			// `InvalidArgument: no active workspace` happens before
-			// any workspace is open — that's not a real error, just
-			// "we don't have a status to show yet".
-			if (formatError(err).includes('no active workspace')) {
-				this.status = null;
-				return;
-			}
 			this.lastError = formatError(err);
 		}
 	}
@@ -150,6 +138,21 @@ class ContainerPanelState {
 
 	async teardown(): Promise<void> {
 		await this.#run('teardown', () => ipc.container.teardown());
+	}
+
+	/**
+	 * Re-emit `compose.yaml` from the current bound-folder set,
+	 * and apply via `compose up -d --wait` if the project is
+	 * already running. Called after `WorkspaceState.openLocal` /
+	 * `removeFolder` succeeds. Cheap when the compose project
+	 * isn't running — the backend just rewrites the file.
+	 *
+	 * Drops the cached compose preview either way so a follow-up
+	 * "Inspect" reflects the new mounts.
+	 */
+	async syncBoundFolders(): Promise<void> {
+		this.invalidateComposePreview();
+		await this.#run('sync-folders', () => ipc.container.applyBoundFolders());
 	}
 
 	/**

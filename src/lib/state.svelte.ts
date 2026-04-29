@@ -329,7 +329,14 @@ class WorkspaceState {
 			// backend canonicalised, so a string compare is unreliable.
 			if (ws.folders.length === beforeCount) {
 				this.flash(`Folder is already in the workspace.`);
+				return;
 			}
+			// New folder bound: re-emit `compose.yaml` and (if the
+			// project is running) apply the diff via
+			// `compose up -d --wait`. The backend treats the no-op
+			// case (no compose.yaml yet) as a free pass, so this is
+			// cheap pre-opt-in.
+			void container.syncBoundFolders();
 		} catch (err) {
 			this.flash(`Failed to open: ${formatError(err)}`);
 		}
@@ -384,6 +391,10 @@ class WorkspaceState {
 			this.folderStates.delete(path);
 			await this.adoptWorkspaceSnapshot(ws);
 			this.persistAppState();
+			// Bound-folder set shrunk: re-emit `compose.yaml`. The
+			// backend rebuilds the dev container's mounts on the next
+			// `up -d --wait` (handled inside `applyBoundFolders`).
+			void container.syncBoundFolders();
 		} catch (err) {
 			this.flash(`Could not remove folder: ${formatError(err)}`);
 		}
@@ -393,9 +404,7 @@ class WorkspaceState {
 	 * Apply a freshly returned `Workspace` snapshot from the backend:
 	 * update `this.workspace`, ensure each bound folder has a
 	 * matching `FolderState`, and (re)load the active folder's tree
-	 * if it isn't already populated. Also nudges the container pip
-	 * to refetch — which folder owns the compose project may have
-	 * changed.
+	 * if it isn't already populated.
 	 *
 	 * Public because `App.svelte`'s startup hydrate reaches for it
 	 * after the backend's first `workspace_active` returns the
@@ -408,6 +417,12 @@ class WorkspaceState {
 	 * `restoreAppState()` is about to overwrite the on-disk session
 	 * with the *replayed* shape and a premature persist here would
 	 * race with the load and erase the session before we read it.
+	 *
+	 * Container syncing (rewriting `compose.yaml`, applying via
+	 * `compose up -d --wait` if running) is **not** triggered here
+	 * — folder switches don't change the bound-folder set. Add /
+	 * remove call sites are responsible for nudging
+	 * `container.syncBoundFolders()` after they persist.
 	 *
 	 * Empty snapshot (no folders) collapses to the welcome-screen
 	 * state.
@@ -438,12 +453,6 @@ class WorkspaceState {
 		if (this.activeFolderState && this.activeFolderState.paths.length === 0) {
 			await this.loadPaths();
 		}
-		// Container pip is workspace-specific (and folder-keyed under
-		// the Phase 2.0 bridge implementation): clear the previous
-		// snapshot so the bar doesn't briefly show the old state,
-		// then pull the new one.
-		container.resetForWorkspaceSwitch();
-		void container.refresh();
 	}
 
 	tabsFor(side: SplitSide): string[] {
