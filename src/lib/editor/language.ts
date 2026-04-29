@@ -10,7 +10,15 @@ const FILENAME_LANGUAGES: Record<string, string> = {
 	'bun.lock': 'json',
 	'.editorconfig': 'properties',
 	'.npmrc': 'properties',
+	Dockerfile: 'dockerfile',
+	Containerfile: 'dockerfile',
 };
+
+// `Dockerfile.dev`, `Dockerfile.prod`, `app.Dockerfile`, etc. all map
+// to the same grammar. We treat them as Dockerfiles whenever
+// `Dockerfile` appears as either the leading segment or the trailing
+// segment of the dotted name.
+const DOCKERFILE_VARIANT_RE = /(?:^Dockerfile\.|\.Dockerfile$)/;
 
 // `.gitignore`, `.dockerignore`, `.prettierignore`, `.eslintignore`,
 // `.npmignore`, etc. — anything matching `.<word>ignore` is treated as
@@ -66,6 +74,9 @@ export async function languageFor(filename: string, firstLine?: string): Promise
 		return [ignoreLanguage];
 	}
 	let ext = FILENAME_LANGUAGES[baseName] ?? baseName.split('.').pop()?.toLowerCase() ?? '';
+	if (DOCKERFILE_VARIANT_RE.test(baseName)) {
+		ext = 'dockerfile';
+	}
 	// Fall back to shebang sniffing only when the basename has no `.`
 	// in it — i.e. there was no extension to consult. A file called
 	// `script.txt` that happens to start with `#!/bin/sh` is still a
@@ -134,6 +145,15 @@ export async function languageFor(filename: string, firstLine?: string): Promise
 		case 'zsh': {
 			const { shell } = await import('@codemirror/legacy-modes/mode/shell');
 			return [StreamLanguage.define(shell)];
+		}
+		case 'yaml':
+		case 'yml': {
+			const { yaml } = await import('@codemirror/legacy-modes/mode/yaml');
+			return [StreamLanguage.define(yaml)];
+		}
+		case 'dockerfile': {
+			const { dockerFile } = await import('@codemirror/legacy-modes/mode/dockerfile');
+			return [StreamLanguage.define(dockerFile)];
 		}
 		default:
 			return [];
