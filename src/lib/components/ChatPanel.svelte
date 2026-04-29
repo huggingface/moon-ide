@@ -1045,6 +1045,17 @@
 		align-items: center;
 		justify-content: space-between;
 		gap: 8px;
+		/* Pin to the top of `.connected-scroll` so back / new /
+		   refresh stay reachable while scrolling a long thread. The
+		   bot card and earlier replies scroll up behind the solid
+		   `--m-bg-1` fill. `padding-bottom` keeps a small visual
+		   gutter between the header and whatever message is at the
+		   top of the scroll-under stack. */
+		position: sticky;
+		top: 0;
+		z-index: 1;
+		background: var(--m-bg-1);
+		padding-bottom: 6px;
 	}
 	.back-button {
 		font: inherit;
