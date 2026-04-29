@@ -90,8 +90,6 @@
 				return 'Starting services — this can take a few minutes the first time.';
 			case 'rebuild':
 				return 'Rebuilding services — recreating containers and pulling fresh images.';
-			case 'pause':
-				return 'Pausing services…';
 			case 'resume':
 				return 'Resuming services…';
 			case 'stop':
@@ -175,91 +173,56 @@
 			{/if}
 		</dl>
 
-		{#if projectState === 'absent'}
-			<div class="actions">
-				<button type="button" class="primary" disabled={busy} onclick={() => projectCompose.up(folderPath)}>
-					{inFlight === 'up' ? 'Starting…' : 'Start services'}
-				</button>
-			</div>
-		{:else if projectState === 'stopped'}
-			<div class="actions">
-				<button type="button" class="primary" disabled={busy} onclick={() => projectCompose.up(folderPath)}>
-					{inFlight === 'up' ? 'Starting…' : 'Start services'}
-				</button>
+		{#if projectState !== null}
+			{@const canStart =
+				projectState === 'absent' ||
+				projectState === 'stopped' ||
+				projectState === 'failed' ||
+				projectState === 'paused'}
+			{@const canStop = projectState === 'running' || projectState === 'paused' || projectState === 'failed'}
+			{@const canRecreate =
+				projectState === 'running' ||
+				projectState === 'paused' ||
+				projectState === 'failed' ||
+				projectState === 'stopped'}
+			{@const canDown = projectState !== 'absent'}
+			<div class="actions" role="toolbar" aria-label="Project actions">
 				<button
 					type="button"
-					class="danger"
-					disabled={busy}
-					title="docker compose down — removes containers and network. Volumes are preserved."
-					onclick={() => projectCompose.down(folderPath)}
+					class="action"
+					disabled={busy || !canStart}
+					title="Start services (docker compose up -d, or unpause if paused)"
+					onclick={() =>
+						projectState === 'paused' ? projectCompose.resume(folderPath) : projectCompose.up(folderPath)}
 				>
-					{inFlight === 'down' ? 'Tearing down…' : 'Tear down'}
-				</button>
-			</div>
-		{:else if projectState === 'creating'}
-			<p class="copy">Bringing up services — this can take a few minutes the first time.</p>
-		{:else if projectState === 'running'}
-			<div class="actions">
-				<button type="button" disabled={busy} onclick={() => projectCompose.pause(folderPath)}>
-					{inFlight === 'pause' ? 'Pausing…' : 'Pause'}
-				</button>
-				<button type="button" disabled={busy} onclick={() => projectCompose.rebuild(folderPath)}>
-					{inFlight === 'rebuild' ? 'Rebuilding…' : 'Rebuild'}
+					Start
 				</button>
 				<button
 					type="button"
-					disabled={busy}
-					title="docker compose stop — SIGTERM containers, keep them on the daemon for a fast restart."
+					class="action"
+					disabled={busy || !canStop}
+					title="Stop services (docker compose stop). Containers stay on the daemon for a fast restart."
 					onclick={() => projectCompose.stop(folderPath)}
 				>
-					{inFlight === 'stop' ? 'Stopping…' : 'Stop'}
+					Stop
 				</button>
 				<button
 					type="button"
-					class="danger"
-					disabled={busy}
-					title="docker compose down — removes containers and network. Volumes are preserved."
+					class="action"
+					disabled={busy || !canRecreate}
+					title="Recreate services (docker compose up -d --build --force-recreate). Pulls fresh images and recreates containers."
+					onclick={() => projectCompose.rebuild(folderPath)}
+				>
+					Recreate
+				</button>
+				<button
+					type="button"
+					class="action danger"
+					disabled={busy || !canDown}
+					title="Bring services down (docker compose down). Removes containers and the network. Volumes are preserved."
 					onclick={() => projectCompose.down(folderPath)}
 				>
-					{inFlight === 'down' ? 'Tearing down…' : 'Tear down'}
-				</button>
-			</div>
-		{:else if projectState === 'paused'}
-			<div class="actions">
-				<button type="button" class="primary" disabled={busy} onclick={() => projectCompose.resume(folderPath)}>
-					{inFlight === 'resume' ? 'Resuming…' : 'Resume'}
-				</button>
-				<button
-					type="button"
-					disabled={busy}
-					title="docker compose stop — SIGTERM containers, keep them on the daemon for a fast restart."
-					onclick={() => projectCompose.stop(folderPath)}
-				>
-					{inFlight === 'stop' ? 'Stopping…' : 'Stop'}
-				</button>
-				<button
-					type="button"
-					class="danger"
-					disabled={busy}
-					title="docker compose down — removes containers and network. Volumes are preserved."
-					onclick={() => projectCompose.down(folderPath)}
-				>
-					{inFlight === 'down' ? 'Tearing down…' : 'Tear down'}
-				</button>
-			</div>
-		{:else if projectState === 'failed'}
-			<div class="actions">
-				<button type="button" disabled={busy} onclick={() => projectCompose.rebuild(folderPath)}>
-					{inFlight === 'rebuild' ? 'Rebuilding…' : 'Rebuild'}
-				</button>
-				<button
-					type="button"
-					class="danger"
-					disabled={busy}
-					title="docker compose down — removes containers and network. Volumes are preserved."
-					onclick={() => projectCompose.down(folderPath)}
-				>
-					{inFlight === 'down' ? 'Tearing down…' : 'Tear down'}
+					Down
 				</button>
 			</div>
 		{/if}
@@ -475,40 +438,45 @@
 		text-overflow: ellipsis;
 		white-space: nowrap;
 	}
+	/* Project-level actions: a fixed row of four uniform text
+	   buttons that always render. Disabling (rather than hiding)
+	   the inapplicable ones keeps muscle memory steady — the
+	   button you want is always in the same slot. Each button
+	   flexes to share the row width equally so the popover reads
+	   as a single toolbar regardless of available width.
+	   Tooltips spell out the literal `docker compose` verb so the
+	   precise effect is one hover away; the danger button keeps a
+	   red tint as the only colour cue users need to slow down. */
 	.actions {
 		display: flex;
-		gap: 6px;
-		flex-wrap: wrap;
+		gap: 4px;
 	}
-	.actions button {
+	.action {
+		flex: 1 1 0;
+		min-width: 0;
 		font: inherit;
+		font-size: 12px;
+		line-height: 1;
 		background: var(--m-bg-overlay);
 		color: var(--m-fg);
 		border: 1px solid var(--m-border);
 		border-radius: 4px;
-		padding: 4px 10px;
+		padding: 5px 6px;
+		text-align: center;
 		cursor: pointer;
 	}
-	.actions button:hover:not(:disabled) {
+	.action:hover:not(:disabled) {
 		background: var(--m-bg-1);
 		border-color: var(--m-border-strong);
 	}
-	.actions button:disabled {
-		opacity: 0.5;
-		cursor: progress;
+	.action:disabled {
+		opacity: 0.45;
+		cursor: not-allowed;
 	}
-	.actions .primary {
-		background: var(--m-accent);
-		border-color: var(--m-accent);
-		color: var(--m-accent-fg, #fff);
-	}
-	.actions .primary:hover:not(:disabled) {
-		filter: brightness(1.1);
-	}
-	.actions .danger {
+	.action.danger {
 		color: var(--m-danger);
 	}
-	.actions .danger:hover:not(:disabled) {
+	.action.danger:hover:not(:disabled) {
 		background: var(--m-danger);
 		color: var(--m-bg);
 		border-color: var(--m-danger);
