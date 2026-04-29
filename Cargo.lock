@@ -2578,6 +2578,7 @@ name = "moon-container"
 version = "0.0.0"
 dependencies = [
  "camino",
+ "moon-protocol",
  "serde",
  "serde_json",
  "tempfile",
@@ -2619,6 +2620,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "camino",
+ "moon-container",
  "moon-core",
  "moon-protocol",
  "moon-slack",

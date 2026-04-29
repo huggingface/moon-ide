@@ -24,5 +24,5 @@ pub mod project;
 
 pub use compose::{generate_compose, ComposeRender, ComposeRenderOptions};
 pub use discovery::{discover_compose_files, ComposeDiscovery, DiscoveredCompose};
-pub use lifecycle::{ContainerState, ContainerStatus, LifecycleError, ServiceStatus, Workspace, DEFAULT_DEV_IMAGE};
+pub use lifecycle::{LifecycleError, Workspace, DEFAULT_DEV_IMAGE};
 pub use project::{project_name_for, ProjectName};

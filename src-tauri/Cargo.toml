@@ -15,6 +15,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2.5", features = [] }
 
 [dependencies]
+moon-container = { workspace = true }
 moon-core = { workspace = true }
 moon-protocol = { workspace = true }
 moon-slack = { workspace = true }

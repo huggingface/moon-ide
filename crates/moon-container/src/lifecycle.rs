@@ -43,6 +43,8 @@
 use std::ffi::OsStr;
 
 use camino::{Utf8Path, Utf8PathBuf};
+use moon_protocol::container::{ContainerState, ContainerStatus, ServiceStatus};
+use moon_protocol::MoonError;
 use thiserror::Error;
 use tokio::process::Command;
 
@@ -62,62 +64,6 @@ use crate::project::{project_name_for, ProjectName};
 /// workspace build against?" is a release-time decision, not a
 /// per-user preference.
 pub const DEFAULT_DEV_IMAGE: &str = "moon-base:dev";
-
-/// High-level lifecycle state of the compose project.
-///
-/// The roadmap pins the visible cycle to
-/// `absent → creating → running → paused → running` (with
-/// `stopped` and `failed` as exits the IDE detects but doesn't
-/// drive into). Anything more granular (per-service, per-image-
-/// pull progress) is a 2.4 concern.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ContainerState {
-	/// No compose project exists for this workspace (no
-	/// containers, no `.moon/compose.yaml`, or both).
-	Absent,
-	/// `up -d` is in flight, or one or more containers are
-	/// `created` / `restarting` (compose's transitional states).
-	Creating,
-	/// At least one container is running and none are paused —
-	/// the steady-state we drive toward.
-	Running,
-	/// At least one container is `paused`. Compose's pause is
-	/// project-wide for our usage, so this should be all-or-
-	/// nothing under our control; mixed-paused states are
-	/// possible only if a user ran `docker pause` directly on a
-	/// single container.
-	Paused,
-	/// Containers exist but every one is `exited`. We never
-	/// drive into this — `Workspace::pause` uses pause, not
-	/// stop — but if a user ran `docker compose stop` outside
-	/// the IDE, the next `status` reports it.
-	Stopped,
-	/// A container is `dead`, or the daemon reported a state we
-	/// don't recognise. The UI surfaces this with the raw
-	/// per-service detail so the user can decide what to do.
-	Failed,
-}
-
-/// One container in the compose project, as reported by
-/// `docker compose ps --format json`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct ServiceStatus {
-	/// Compose service name (`dev`, `mongo`, `redis`, …).
-	pub name: String,
-	/// Raw Docker container state (`running`, `paused`,
-	/// `exited`, `created`, `restarting`, `dead`). Kept as the
-	/// upstream string rather than re-encoded so the UI can show
-	/// it verbatim if it wants without us losing info.
-	pub raw_state: String,
-}
-
-/// Snapshot returned by [`Workspace::status`].
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct ContainerStatus {
-	pub state: ContainerState,
-	pub services: Vec<ServiceStatus>,
-}
 
 /// Errors the lifecycle layer surfaces to callers.
 ///
@@ -141,6 +87,31 @@ pub enum LifecycleError {
 
 	#[error("io error: {0}")]
 	Io(#[from] std::io::Error),
+}
+
+/// Map lifecycle errors onto the protocol-level `MoonError` the
+/// Tauri command boundary expects.
+///
+/// `DockerMissing` and `DaemonUnreachable` both flatten to
+/// `HostUnavailable` — that's the same variant fs / search
+/// commands use when the workspace host can't be reached, so
+/// the UI's existing "host disconnected" affordance covers
+/// "Docker isn't running" without a new code path. The genuine
+/// "compose itself failed" and "ps stdout was malformed" cases
+/// stay as `Internal`, carrying the daemon's stderr so the user
+/// can copy-paste it into a support thread.
+impl From<LifecycleError> for MoonError {
+	fn from(err: LifecycleError) -> Self {
+		match err {
+			LifecycleError::DockerMissing => MoonError::HostUnavailable("docker is not installed or not on PATH".into()),
+			LifecycleError::DaemonUnreachable(msg) => MoonError::HostUnavailable(msg),
+			LifecycleError::ComposeFailed { code, stderr } => {
+				MoonError::internal(format!("docker compose failed (exit {code}): {stderr}"))
+			}
+			LifecycleError::ParseError(msg) => MoonError::internal(format!("could not parse docker compose output: {msg}")),
+			LifecycleError::Io(err) => MoonError::from(err),
+		}
+	}
 }
 
 /// Handle on a workspace's compose project. Cheap to construct

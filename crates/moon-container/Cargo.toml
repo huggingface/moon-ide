@@ -7,6 +7,8 @@ license.workspace = true
 publish = false
 
 [dependencies]
+moon-protocol = { workspace = true }
+
 camino = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

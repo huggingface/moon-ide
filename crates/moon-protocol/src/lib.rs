@@ -4,6 +4,7 @@
 //! See [specs/protocol.md](../../specs/protocol.md).
 
 pub mod app_state;
+pub mod container;
 pub mod editorconfig;
 pub mod error;
 pub mod fs;

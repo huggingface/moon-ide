@@ -198,6 +198,10 @@ restart. Includes:
 - A "Project services" subsection in the sidebar showing
   every compose service with state and a small log tail.
 - Per-service `start` / `stop` / `restart` actions.
+- Per-service "Pull latest" (in-place image refresh + recreate
+  for a single service, without disturbing the rest of the
+  project) — the case for `mongo` getting a new tag without
+  rebuilding everything.
 - A picker for "which service do new terminals attach to?"
   backed by the `x-moon.shell-service` extension key
   ([containers.md](../containers.md#x-moon-extension-keys-in-compose)).
