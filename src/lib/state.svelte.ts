@@ -1,14 +1,17 @@
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { confirm, save as saveDialog } from '@tauri-apps/plugin-dialog';
+import { SvelteMap } from 'svelte/reactivity';
 import { ipc } from './ipc';
 import {
 	defaultEditorConfig,
 	formatError,
 	type AppState,
 	type EditorConfig,
+	type FolderSession,
 	type SplitSide,
 	type ThemeMode,
 	type Workspace,
+	type WorkspaceFolder,
 	type WorkspaceSession,
 } from './protocol';
 import { container } from './container.svelte';
@@ -53,15 +56,24 @@ export type OpenFile = {
 	isDirty: boolean;
 };
 
-class WorkspaceState {
-	workspace = $state<Workspace | null>(null);
+/**
+ * Per-folder slice of UI state. One `FolderState` per folder bound
+ * into the workspace — the user's tab strip, active file, split
+ * layout, and untitled-buffer counter all swap when the active
+ * folder changes. The workspace-wide things (theme, editorconfig
+ * cache, focus tickers, toast) stay on `WorkspaceState`.
+ *
+ * Tab paths are folder-relative — same as in Phase 0–2's single-folder
+ * world; multi-folder just gives each folder its own copy.
+ */
+class FolderState {
 	paths = $state<string[]>([]);
 
-	// Loaded text/image buffers, keyed by workspace-relative path. A
+	// Loaded text/image buffers, keyed by folder-relative path. A
 	// buffer is shared across panes — typing in pane A updates the same
 	// `OpenFile` that pane B is rendering, so the dirty marker and text
-	// stay in lockstep. A buffer is dropped from this list when it falls
-	// out of every pane's tab list (`closeFile` does the GC).
+	// stay in lockstep. A buffer is dropped from this list when it
+	// falls out of every pane's tab list (`closeFile` does the GC).
 	openFiles = $state<OpenFile[]>([]);
 
 	// Per-pane tab order. The two lists are independent (VSCode/Zed
@@ -70,12 +82,36 @@ class WorkspaceState {
 	leftTabs = $state<string[]>([]);
 	rightTabs = $state<string[]>([]);
 
-	// Primary and (optional) secondary editor each track their own active path.
-	// Phase 1 is two-pane only; Phase 2+ can grow to N panes.
+	// Primary and (optional) secondary editor each track their own
+	// active path. Phase 1 is two-pane only.
 	leftActive = $state<string | null>(null);
 	rightActive = $state<string | null>(null);
 	hasSplit = $state(false);
 	focusedSide = $state<SplitSide>('left');
+
+	// Source vs. rendered Preview, scoped to the buffer (not the pane:
+	// each path gets one mode shared across panes — same as the buffer
+	// itself). Per folder so a `README.md` in folder A and folder B
+	// keep independent toggles.
+	previewModes = $state<Map<string, MarkdownView>>(new Map());
+
+	// Per-folder counter for `Untitled-N` IDs. Per-folder so each
+	// folder's untitled sequence starts at 1 — independent of how
+	// many untitled buffers any other folder has produced.
+	untitledCounter = $state(0);
+
+	constructor(public readonly folderPath: string) {}
+}
+
+class WorkspaceState {
+	workspace = $state<Workspace | null>(null);
+
+	// Per-folder UI state. Keyed by absolute folder path — same as
+	// `Workspace.active_folder` and `WorkspaceFolder.path`. Survives
+	// folder switches: switching to a folder whose state already
+	// exists rebinds the proxied accessors below to that folder's
+	// buffers / tabs without rebuilding them.
+	folderStates = new SvelteMap<string, FolderState>();
 
 	loadingPaths = $state(false);
 	toast = $state<string | null>(null);
@@ -90,14 +126,11 @@ class WorkspaceState {
 	// (which invalidates server-side, then we refetch every entry). Map
 	// is treated as immutable for reactivity — replace the whole thing
 	// on update, never mutate in place.
+	//
+	// Workspace-wide rather than per-folder: `editorconfig_for_path`
+	// is folder-relative on the wire today, but file paths are unique
+	// per folder so the cross-folder cache stays consistent.
 	editorConfigs = $state<Map<string, EditorConfig>>(new Map());
-
-	// Source vs. rendered Preview, scoped to the buffer (not the pane:
-	// each path gets one mode shared across panes — same as the buffer
-	// itself). Markdown files default to Preview, every other path to
-	// Source. Not persisted: `previewMode` is a UI affordance, not part
-	// of the file or session.
-	private previewModes = $state<Map<string, MarkdownView>>(new Map());
 
 	// Monotonic counter the active editor view watches to refocus itself.
 	// Bumped whenever the user "navigates" to a file (tab click, tree click,
@@ -123,12 +156,6 @@ class WorkspaceState {
 	private persistScheduled = false;
 	private suppressPersist = false;
 
-	// Monotonic, per-process counter for untitled buffer IDs. Resets on
-	// app start because untitled buffers don't persist; numbering is just
-	// a UI affordance ("Untitled-1", "Untitled-2"…) and starting from 1
-	// every launch is the expected behaviour.
-	private untitledCounter = 0;
-
 	// Bumped by `saveActiveAs` whenever it rebinds a buffer to a new path.
 	// `lastRename` captures the (from, to) pair for that rebind. The editor
 	// view watches the tick as a reactive dependency and consults
@@ -141,6 +168,136 @@ class WorkspaceState {
 	renameTick = $state(0);
 	private lastRename: { from: string; to: string } | null = null;
 
+	/**
+	 * Active folder path, derived from the workspace shape. `null`
+	 * when the workspace has no folders or no active folder. Updates
+	 * whenever the backend snapshot lands on `this.workspace`.
+	 */
+	activeFolderPath: string | null = $derived(this.workspace?.active_folder ?? null);
+
+	/**
+	 * Active folder record. Components reach for `.path`, `.name`,
+	 * `.host` here instead of the workspace-level fields the
+	 * single-folder shape used to expose.
+	 */
+	activeFolder: WorkspaceFolder | null = $derived.by(() => {
+		const ws = this.workspace;
+		if (!ws || ws.active_folder === null) {
+			return null;
+		}
+		return ws.folders.find((f) => f.path === ws.active_folder) ?? null;
+	});
+
+	/**
+	 * Active folder's reactive state. All the per-folder accessor
+	 * proxies below route through this. `null` when no folder is
+	 * active — proxied reads return defaults, proxied writes are
+	 * silent no-ops.
+	 */
+	private activeFolderState: FolderState | null = $derived.by(() => {
+		const path = this.activeFolderPath;
+		if (path === null) {
+			return null;
+		}
+		return this.folderStates.get(path) ?? null;
+	});
+
+	// Per-folder accessor proxies. Components (and most methods on
+	// this class) keep reaching for `workspace.openFiles` etc. — those
+	// reads transparently forward to the active folder's `FolderState`
+	// and writes mutate that state in place. Reactivity flows because
+	// the underlying fields are `$state` on `FolderState`.
+
+	get paths(): string[] {
+		return this.activeFolderState?.paths ?? [];
+	}
+	set paths(value: string[]) {
+		if (this.activeFolderState) {
+			this.activeFolderState.paths = value;
+		}
+	}
+
+	get openFiles(): OpenFile[] {
+		return this.activeFolderState?.openFiles ?? [];
+	}
+	set openFiles(value: OpenFile[]) {
+		if (this.activeFolderState) {
+			this.activeFolderState.openFiles = value;
+		}
+	}
+
+	get leftTabs(): string[] {
+		return this.activeFolderState?.leftTabs ?? [];
+	}
+	set leftTabs(value: string[]) {
+		if (this.activeFolderState) {
+			this.activeFolderState.leftTabs = value;
+		}
+	}
+
+	get rightTabs(): string[] {
+		return this.activeFolderState?.rightTabs ?? [];
+	}
+	set rightTabs(value: string[]) {
+		if (this.activeFolderState) {
+			this.activeFolderState.rightTabs = value;
+		}
+	}
+
+	get leftActive(): string | null {
+		return this.activeFolderState?.leftActive ?? null;
+	}
+	set leftActive(value: string | null) {
+		if (this.activeFolderState) {
+			this.activeFolderState.leftActive = value;
+		}
+	}
+
+	get rightActive(): string | null {
+		return this.activeFolderState?.rightActive ?? null;
+	}
+	set rightActive(value: string | null) {
+		if (this.activeFolderState) {
+			this.activeFolderState.rightActive = value;
+		}
+	}
+
+	get hasSplit(): boolean {
+		return this.activeFolderState?.hasSplit ?? false;
+	}
+	set hasSplit(value: boolean) {
+		if (this.activeFolderState) {
+			this.activeFolderState.hasSplit = value;
+		}
+	}
+
+	get focusedSide(): SplitSide {
+		return this.activeFolderState?.focusedSide ?? 'left';
+	}
+	set focusedSide(value: SplitSide) {
+		if (this.activeFolderState) {
+			this.activeFolderState.focusedSide = value;
+		}
+	}
+
+	private get previewModes(): Map<string, MarkdownView> {
+		return this.activeFolderState?.previewModes ?? new Map();
+	}
+	private set previewModes(value: Map<string, MarkdownView>) {
+		if (this.activeFolderState) {
+			this.activeFolderState.previewModes = value;
+		}
+	}
+
+	private get untitledCounter(): number {
+		return this.activeFolderState?.untitledCounter ?? 0;
+	}
+	private set untitledCounter(value: number) {
+		if (this.activeFolderState) {
+			this.activeFolderState.untitledCounter = value;
+		}
+	}
+
 	activePath: string | null = $derived(this.focusedSide === 'left' ? this.leftActive : this.rightActive);
 
 	activeFile: OpenFile | null = $derived.by(() => {
@@ -150,30 +307,134 @@ class WorkspaceState {
 		return this.openFiles.find((f) => f.path === this.activePath) ?? null;
 	});
 
+	/**
+	 * Add `path` as a folder in the workspace and make it active.
+	 * Idempotent on duplicate path — the backend silently flips the
+	 * existing entry to active, and we re-load its tree if it had
+	 * never been populated. Per Phase 2.5 this is the single
+	 * "open folder" code path: the welcome screen, the sidebar's
+	 * `+ Add folder` row, the command palette's "Open Folder…", and
+	 * the `EditorPane` empty-state button all funnel through here.
+	 */
 	async openLocal(path: string) {
 		try {
 			const ws = await ipc.workspace.openLocal(path);
-			this.workspace = ws;
-			this.paths = [];
-			this.openFiles = [];
-			this.leftTabs = [];
-			this.rightTabs = [];
-			this.leftActive = null;
-			this.rightActive = null;
-			this.hasSplit = false;
-			this.focusedSide = 'left';
-			await this.loadPaths();
-			// Drop any tabs persisted for the previous workspace; the new
-			// folder gets a clean session blob (theme is preserved).
+			await this.adoptWorkspaceSnapshot(ws);
 			this.persistAppState();
-			// Container pip is workspace-specific: clear the previous
-			// workspace's snapshot so the bar doesn't briefly show the
-			// old state, then pull the new one.
-			container.resetForWorkspaceSwitch();
-			void container.refresh();
 		} catch (err) {
 			this.flash(`Failed to open: ${formatError(err)}`);
 		}
+	}
+
+	/**
+	 * Set `path` as the active folder. Tab strip + tree swap to that
+	 * folder's persisted state without losing the previous folder's
+	 * buffers.
+	 */
+	async setActiveFolder(path: string) {
+		if (this.activeFolderPath === path) {
+			return;
+		}
+		try {
+			const ws = await ipc.workspace.setActiveFolder(path);
+			await this.adoptWorkspaceSnapshot(ws);
+			this.persistAppState();
+		} catch (err) {
+			this.flash(`Could not switch folder: ${formatError(err)}`);
+		}
+	}
+
+	/**
+	 * Drop a folder from the workspace. Confirms first; bails if the
+	 * folder has any dirty buffers and the user declines to discard.
+	 * The folder's `FolderState` (and every buffer in it) is dropped
+	 * — those tabs were exclusive to the folder.
+	 */
+	async removeFolder(path: string) {
+		const folder = this.workspace?.folders.find((f) => f.path === path);
+		if (!folder) {
+			return;
+		}
+		const folderState = this.folderStates.get(path);
+		const dirty = folderState?.openFiles.filter((f) => f.isDirty) ?? [];
+		const ok = await confirm(
+			dirty.length > 0
+				? `Remove ${folder.name} from the workspace?\n\n${dirty.length} unsaved buffer(s) will be discarded.`
+				: `Remove ${folder.name} from the workspace?`,
+			{
+				title: 'Remove folder',
+				okLabel: 'Remove',
+				cancelLabel: 'Cancel',
+			},
+		);
+		if (!ok) {
+			return;
+		}
+		try {
+			const ws = await ipc.workspace.removeFolder(path);
+			this.folderStates.delete(path);
+			await this.adoptWorkspaceSnapshot(ws);
+			this.persistAppState();
+		} catch (err) {
+			this.flash(`Could not remove folder: ${formatError(err)}`);
+		}
+	}
+
+	/**
+	 * Apply a freshly returned `Workspace` snapshot from the backend:
+	 * update `this.workspace`, ensure each bound folder has a
+	 * matching `FolderState`, and (re)load the active folder's tree
+	 * if it isn't already populated. Also nudges the container pip
+	 * to refetch — which folder owns the compose project may have
+	 * changed.
+	 *
+	 * Public because `App.svelte`'s startup hydrate reaches for it
+	 * after the backend's first `workspace_active` returns the
+	 * replayed shape — same code path mutating commands take, just
+	 * from the launch flow rather than a user gesture.
+	 *
+	 * Does **not** persist on its own — caller is responsible. User
+	 * gestures (open / switch / remove) call `persistAppState()`
+	 * afterwards; the launch hydrate skips it because
+	 * `restoreAppState()` is about to overwrite the on-disk session
+	 * with the *replayed* shape and a premature persist here would
+	 * race with the load and erase the session before we read it.
+	 *
+	 * Empty snapshot (no folders) collapses to the welcome-screen
+	 * state.
+	 */
+	async adoptWorkspaceSnapshot(snapshot: Workspace) {
+		this.workspace = snapshot.folders.length === 0 ? null : snapshot;
+		// Drop FolderStates whose folders aren't bound anymore. Two-pass
+		// (collect-then-delete) so we never mutate the map while
+		// iterating — the spec allows it, but oxlint flags the spread
+		// alternative and the explicit two-pass is clearer about intent.
+		const drop: string[] = [];
+		const bound = new Set(snapshot.folders.map((f) => f.path));
+		for (const path of this.folderStates.keys()) {
+			if (!bound.has(path)) {
+				drop.push(path);
+			}
+		}
+		for (const path of drop) {
+			this.folderStates.delete(path);
+		}
+		// Allocate FolderStates for any new folders.
+		for (const folder of snapshot.folders) {
+			if (!this.folderStates.has(folder.path)) {
+				this.folderStates.set(folder.path, new FolderState(folder.path));
+			}
+		}
+		// Hydrate the active folder's tree if it's a fresh state.
+		if (this.activeFolderState && this.activeFolderState.paths.length === 0) {
+			await this.loadPaths();
+		}
+		// Container pip is workspace-specific (and folder-keyed under
+		// the Phase 2.0 bridge implementation): clear the previous
+		// snapshot so the bar doesn't briefly show the old state,
+		// then pull the new one.
+		container.resetForWorkspaceSwitch();
+		void container.refresh();
 	}
 
 	tabsFor(side: SplitSide): string[] {
@@ -223,47 +484,92 @@ class WorkspaceState {
 
 		const ws = this.workspace;
 		const session = state.last_session;
-		if (!ws || !session || session.workspace_path !== ws.root) {
-			// Session is for a different workspace (or there's none). Leave
-			// it on disk untouched — the next mutation will overwrite it.
+		if (!ws || !session) {
 			return;
 		}
 
+		// Replay each persisted folder's tabs into its `FolderState`.
+		// The backend has already restored the workspace shape (folder
+		// list + active folder) on launch, and `App.svelte`'s hydrate
+		// has populated `this.workspace`; here we only fill in the
+		// per-folder UI state that lives entirely on the frontend.
 		this.suppressPersist = true;
 		try {
-			// Load each unique path exactly once; both panes can share the
-			// resulting buffer.
-			const unique = new Set<string>([...session.open_files_left, ...session.open_files_right]);
-			const loaded: OpenFile[] = [];
-			for (const path of unique) {
+			for (const folderSession of session.folders) {
+				const folder = ws.folders.find((f) => f.path === folderSession.folder_path);
+				if (!folder) {
+					// Persisted folder no longer in the workspace (renamed
+					// / removed externally between launches). Skip.
+					continue;
+				}
+				const fs = this.folderStates.get(folder.path);
+				if (!fs) {
+					continue;
+				}
+				const previousActive = this.activeFolderPath;
 				try {
-					const kind = fileKindFor(path);
-					const file = kind === 'image' ? await this.loadImageFile(path) : await this.loadTextFile(path);
-					if (file) {
-						loaded.push(file);
+					// Temporarily redirect proxied accessors at this
+					// folder so `loadTextFile` / `loadImageFile` (which
+					// route through the active folder's host on the
+					// backend) read from the right tree. Restored at
+					// the end via the `finally`.
+					await ipc.workspace.setActiveFolder(folder.path);
+					const unique = new Set<string>([...folderSession.open_files_left, ...folderSession.open_files_right]);
+					const loaded: OpenFile[] = [];
+					for (const path of unique) {
+						try {
+							const kind = fileKindFor(path);
+							const file = kind === 'image' ? await this.loadImageFile(path) : await this.loadTextFile(path);
+							if (file) {
+								loaded.push(file);
+							}
+						} catch {
+							// File was moved/deleted since the last session.
+							// Silently drop it; the post-restore
+							// `persistAppState` writes the cleaned-up list
+							// so it stops haunting future launches.
+						}
 					}
-				} catch {
-					// File was moved/deleted since the last session. Silently
-					// drop it; the post-restore `persistAppState` writes the
-					// cleaned-up list so it stops haunting future launches.
+					const isLoaded = (p: string) => loaded.some((f) => f.path === p);
+					fs.openFiles = loaded;
+					fs.leftTabs = folderSession.open_files_left.filter(isLoaded);
+					fs.rightTabs = folderSession.open_files_right.filter(isLoaded);
+					const isOpenIn = (side: SplitSide, p: string | null) =>
+						p !== null && (side === 'left' ? fs.leftTabs.includes(p) : fs.rightTabs.includes(p));
+					fs.leftActive = isOpenIn('left', folderSession.active_left)
+						? folderSession.active_left
+						: (fs.leftTabs[0] ?? null);
+					fs.hasSplit = folderSession.has_split && fs.rightTabs.length > 0;
+					fs.rightActive =
+						fs.hasSplit && isOpenIn('right', folderSession.active_right)
+							? folderSession.active_right
+							: fs.hasSplit
+								? (fs.rightTabs[0] ?? null)
+								: null;
+					fs.focusedSide = folderSession.focused_side === 'right' && fs.hasSplit ? 'right' : 'left';
+				} finally {
+					if (previousActive !== null && previousActive !== folder.path) {
+						try {
+							await ipc.workspace.setActiveFolder(previousActive);
+						} catch {
+							// Active-folder restore failed — the backend
+							// already logs; we leave whatever the loop
+							// left as active rather than crash startup.
+						}
+					}
 				}
 			}
-			const isLoaded = (p: string) => loaded.some((f) => f.path === p);
-			this.openFiles = loaded;
-			this.leftTabs = session.open_files_left.filter(isLoaded);
-			this.rightTabs = session.open_files_right.filter(isLoaded);
-
-			const isOpenIn = (side: SplitSide, p: string | null) =>
-				p !== null && (side === 'left' ? this.leftTabs.includes(p) : this.rightTabs.includes(p));
-			this.leftActive = isOpenIn('left', session.active_left) ? session.active_left : (this.leftTabs[0] ?? null);
-			this.hasSplit = session.has_split && this.rightTabs.length > 0;
-			this.rightActive =
-				this.hasSplit && isOpenIn('right', session.active_right)
-					? session.active_right
-					: this.hasSplit
-						? (this.rightTabs[0] ?? null)
-						: null;
-			this.focusedSide = session.focused_side === 'right' && this.hasSplit ? 'right' : 'left';
+			// Restore the active-folder pointer last so the UI lands on
+			// the right folder regardless of replay order.
+			if (session.active_folder_path && ws.folders.some((f) => f.path === session.active_folder_path)) {
+				try {
+					const updated = await ipc.workspace.setActiveFolder(session.active_folder_path);
+					this.workspace = updated;
+				} catch {
+					// Active-folder restore failed — the backend already
+					// logs; the existing default-active handling stands.
+				}
+			}
 		} finally {
 			this.suppressPersist = false;
 		}
@@ -273,10 +579,9 @@ class WorkspaceState {
 		if (this.activePath !== null) {
 			this.requestEditorFocus();
 		}
-		// Warm the editorconfig cache for every restored tab so the
-		// initial paint already shows the right indent settings (without
-		// this, the active editor pops between defaults and the resolved
-		// values on the first frame).
+		// Warm the editorconfig cache for every restored tab in the
+		// active folder so the initial paint already shows the right
+		// indent settings.
 		await Promise.all(this.openFiles.map((f) => this.ensureEditorConfig(f.path)));
 	}
 
@@ -301,16 +606,26 @@ class WorkspaceState {
 			// without saving = work is gone — matches every other editor.
 			const realPaths = (paths: string[]) => paths.filter((p) => !isUntitledPath(p));
 			const realActive = (path: string | null) => (path !== null && !isUntitledPath(path) ? path : null);
-			const session: WorkspaceSession | null = ws
-				? {
-						workspace_path: ws.root,
-						open_files_left: realPaths(this.leftTabs),
-						open_files_right: this.hasSplit ? realPaths(this.rightTabs) : [],
-						active_left: realActive(this.leftActive),
-						active_right: this.hasSplit ? realActive(this.rightActive) : null,
-						has_split: this.hasSplit,
-						focused_side: this.focusedSide,
+			const folderSessions: FolderSession[] = [];
+			if (ws) {
+				for (const folder of ws.folders) {
+					const fs = this.folderStates.get(folder.path);
+					if (!fs) {
+						continue;
 					}
+					folderSessions.push({
+						folder_path: folder.path,
+						open_files_left: realPaths(fs.leftTabs),
+						open_files_right: fs.hasSplit ? realPaths(fs.rightTabs) : [],
+						active_left: realActive(fs.leftActive),
+						active_right: fs.hasSplit ? realActive(fs.rightActive) : null,
+						has_split: fs.hasSplit,
+						focused_side: fs.focusedSide,
+					});
+				}
+			}
+			const session: WorkspaceSession | null = ws
+				? { folders: folderSessions, active_folder_path: ws.active_folder }
 				: null;
 			// `slack` is owned by `slack.svelte.ts` + the Slack tauri
 			// commands; the backend's `app_state_save` ignores whatever
@@ -332,7 +647,7 @@ class WorkspaceState {
 	}
 
 	async loadPaths() {
-		if (!this.workspace) {
+		if (!this.activeFolder) {
 			return;
 		}
 		this.loadingPaths = true;
@@ -1027,8 +1342,8 @@ class WorkspaceState {
 		if (!file) {
 			return;
 		}
-		const ws = this.workspace;
-		if (!ws) {
+		const folder = this.activeFolder;
+		if (!folder) {
 			this.flash('Open a folder before saving.');
 			return;
 		}
@@ -1041,8 +1356,8 @@ class WorkspaceState {
 		}
 
 		const defaultPath = file.isUntitled
-			? `${ws.root}/${file.name}.txt`
-			: await ipc.fs.absolutePath(file.path).catch(() => `${ws.root}/${file.path}`);
+			? `${folder.path}/${file.name}.txt`
+			: await ipc.fs.absolutePath(file.path).catch(() => `${folder.path}/${file.path}`);
 		const target = await saveDialog({
 			title: file.isUntitled ? 'Save Untitled File' : 'Save As',
 			defaultPath,
@@ -1051,15 +1366,17 @@ class WorkspaceState {
 			return;
 		}
 
-		// Workspace-bound: the host-side fs commands all take workspace-
-		// relative paths, and our session model assumes every open file
-		// lives inside the current root. Refuse out-of-tree saves with a
-		// toast — supporting them would mean a multi-root model, which
-		// is Phase 7's problem, not ours.
-		const root = ws.root.replace(/\/+$/, '');
+		// Folder-bound: the host-side fs commands all take folder-
+		// relative paths against the active folder's host, and our
+		// session model assumes every open file lives inside the
+		// folder it was opened from. Refuse out-of-folder saves with
+		// a toast — those would conceptually want to land in a
+		// different folder of the workspace, and we don't have a
+		// "move buffer to folder X" UX.
+		const root = folder.path.replace(/\/+$/, '');
 		const newPath = relativeToRoot(target, root);
 		if (newPath === null) {
-			this.flash('Save target must be inside the current workspace.');
+			this.flash('Save target must be inside the active folder.');
 			return;
 		}
 

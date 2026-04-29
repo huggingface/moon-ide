@@ -23,6 +23,8 @@ pub fn run() {
 		.plugin(tauri_plugin_opener::init())
 		.invoke_handler(tauri::generate_handler![
 			commands::workspace::workspace_open_local,
+			commands::workspace::workspace_remove_folder,
+			commands::workspace::workspace_set_active_folder,
 			commands::workspace::workspace_active,
 			commands::workspace::workspace_list,
 			commands::fs::fs_read_dir,
@@ -93,16 +95,31 @@ pub fn run() {
 			tauri::async_runtime::block_on(async {
 				match core_app_state::load(&config_dir).await {
 					Ok(s) => {
+						// Restore each bound folder from the persisted
+						// session, in insertion order. The active folder
+						// is set last so it wins over the natural
+						// "newest add becomes active" behaviour. Any
+						// folder whose path no longer exists is logged
+						// and skipped; the post-restore frontend re-save
+						// strips stale entries from disk.
 						if let Some(session) = s.last_session.as_ref() {
-							let path = Utf8PathBuf::from(&session.workspace_path);
-							match state.workspaces.open_local(path.clone()).await {
-								Ok(ws) => {
-									tracing::info!(workspace = %ws.record.root, "restored last workspace");
-								}
-								Err(e) => {
-									tracing::warn!(error = %e, path = %path, "failed to restore last workspace");
+							for folder in &session.folders {
+								let path = Utf8PathBuf::from(&folder.folder_path);
+								if let Err(e) = state.workspaces.add_folder(path.clone()).await {
+									tracing::warn!(error = %e, path = %path, "failed to restore folder");
 								}
 							}
+							if let Some(active) = session.active_folder_path.as_ref() {
+								if let Err(e) = state.workspaces.set_active_folder(active).await {
+									tracing::warn!(error = %e, path = %active, "failed to restore active folder");
+								}
+							}
+							let snap = state.workspaces.snapshot().await;
+							tracing::info!(
+								folders = snap.folders.len(),
+								active = ?snap.active_folder,
+								"restored workspace folders"
+							);
 						}
 
 						// Seed the poller from persisted Slack inputs

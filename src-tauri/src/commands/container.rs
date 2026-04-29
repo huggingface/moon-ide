@@ -27,14 +27,21 @@ use crate::state::AppState;
 /// [`ContainerStateChange`].
 pub const CONTAINER_STATE_EVENT: &str = "container:state";
 
-/// Resolve the active workspace and turn it into a
-/// [`ContainerWorkspace`] handle. Returns the workspace ID
-/// alongside so the broadcast helper can label the event without
-/// a second registry lookup.
+/// Resolve the active folder and turn it into a
+/// [`ContainerWorkspace`] handle. Returns the workspace ID alongside
+/// so the broadcast helper can label the event without a second
+/// registry lookup.
+///
+/// Phase 2.0 still keys the compose project off the active folder
+/// path — that's the bridge implementation. The
+/// [phase-02 redesign](../../../specs/roadmaps/phase-02-containers.md#pending-redesign-workspace--folder)
+/// pulls this out to one project per workspace once 2.5's multi-
+/// folder UX is in tree.
 async fn workspace_handle(state: &AppState) -> Result<(String, ContainerWorkspace), MoonError> {
-	let ws = state.workspaces.require_active().await?;
-	let root = Utf8PathBuf::from(&ws.record.root);
-	Ok((ws.record.id.clone(), ContainerWorkspace::for_root(root)))
+	let entry = state.workspaces.require_active_folder().await?;
+	let workspace_id = state.workspaces.workspace_id().await;
+	let root = Utf8PathBuf::from(&entry.folder.path);
+	Ok((workspace_id, ContainerWorkspace::for_root(root)))
 }
 
 /// Snapshot status and broadcast the resulting `container:state`

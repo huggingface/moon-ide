@@ -57,19 +57,22 @@ pub async fn save(config_dir: &Utf8Path, state: &AppState) -> MoonResult<()> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use moon_protocol::session::{SplitSide, WorkspaceSession};
+	use moon_protocol::session::{FolderSession, SplitSide, WorkspaceSession};
 	use moon_protocol::theme::ThemeMode;
 	use tempfile::TempDir;
 
 	fn sample_session() -> WorkspaceSession {
 		WorkspaceSession {
-			workspace_path: "/tmp/example".into(),
-			open_files_left: vec!["src/main.rs".into(), "Cargo.toml".into()],
-			open_files_right: vec![],
-			active_left: Some("src/main.rs".into()),
-			active_right: None,
-			has_split: false,
-			focused_side: SplitSide::Left,
+			folders: vec![FolderSession {
+				folder_path: "/tmp/example".into(),
+				open_files_left: vec!["src/main.rs".into(), "Cargo.toml".into()],
+				open_files_right: vec![],
+				active_left: Some("src/main.rs".into()),
+				active_right: None,
+				has_split: false,
+				focused_side: SplitSide::Left,
+			}],
+			active_folder_path: Some("/tmp/example".into()),
 		}
 	}
 
@@ -96,10 +99,13 @@ mod tests {
 
 		let loaded = load(&cfg).await.unwrap();
 		let session = loaded.last_session.expect("session present");
-		assert_eq!(session.workspace_path, "/tmp/example");
-		assert_eq!(session.open_files_left, vec!["src/main.rs", "Cargo.toml"]);
-		assert!(session.open_files_right.is_empty());
-		assert_eq!(session.active_left.as_deref(), Some("src/main.rs"));
+		assert_eq!(session.folders.len(), 1);
+		let folder = &session.folders[0];
+		assert_eq!(folder.folder_path, "/tmp/example");
+		assert_eq!(folder.open_files_left, vec!["src/main.rs", "Cargo.toml"]);
+		assert!(folder.open_files_right.is_empty());
+		assert_eq!(folder.active_left.as_deref(), Some("src/main.rs"));
+		assert_eq!(session.active_folder_path.as_deref(), Some("/tmp/example"));
 		assert_eq!(loaded.theme, ThemeMode::Light);
 	}
 

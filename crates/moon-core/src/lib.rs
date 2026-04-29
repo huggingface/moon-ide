@@ -13,6 +13,6 @@ pub mod search;
 pub mod workspace;
 
 pub use host::{LocalHost, WorkspaceHost};
-pub use workspace::{Workspace, WorkspaceRegistry};
+pub use workspace::{WorkspaceFolderEntry, WorkspaceRegistry, DEFAULT_WORKSPACE_ID};
 
 pub use moon_protocol as protocol;

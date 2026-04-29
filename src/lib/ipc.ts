@@ -24,6 +24,8 @@ import type {
 export const ipc = {
 	workspace: {
 		openLocal: (path: string) => invoke<Workspace>('workspace_open_local', { path }),
+		removeFolder: (path: string) => invoke<Workspace>('workspace_remove_folder', { path }),
+		setActiveFolder: (path: string) => invoke<Workspace>('workspace_set_active_folder', { path }),
 		active: () => invoke<Workspace | null>('workspace_active'),
 		list: () => invoke<Workspace[]>('workspace_list'),
 	},

@@ -32,11 +32,25 @@ export type StatResult = {
 
 export type HostKind = 'local' | 'devcontainer';
 
+/**
+ * One folder bound into a workspace. Mirrors
+ * `moon_protocol::workspace::WorkspaceFolder`.
+ */
+export type WorkspaceFolder = {
+	path: string;
+	name: string;
+	host: HostKind;
+};
+
+/**
+ * The full workspace shape — a singleton `"default"` workspace
+ * holding zero or more folders, with at most one currently active.
+ * Mirrors `moon_protocol::workspace::Workspace`.
+ */
 export type Workspace = {
 	id: string;
-	name: string;
-	root: string;
-	host: HostKind;
+	folders: WorkspaceFolder[];
+	active_folder: string | null;
 };
 
 export type FileSearchOptions = {
@@ -112,19 +126,32 @@ export const defaultEditorConfig: EditorConfig = {
 };
 
 /**
- * Persisted UI session. Frontend-owned shape; the backend is pure
- * storage. Workspace-relative paths (relative to `workspace_path`).
- * The two `open_files_*` lists are independent — a path can live in
- * one pane, both, or neither (VSCode/Zed convention).
+ * One folder's slice of UI state. Mirrors
+ * `moon_protocol::session::FolderSession`. Tab paths are
+ * folder-relative (relative to `folder_path`); the two
+ * `open_files_*` lists are independent — a path can live in one
+ * pane, both, or neither (VSCode/Zed convention).
  */
-export type WorkspaceSession = {
-	workspace_path: string;
+export type FolderSession = {
+	folder_path: string;
 	open_files_left: string[];
 	open_files_right: string[];
 	active_left: string | null;
 	active_right: string | null;
 	has_split: boolean;
 	focused_side: SplitSide;
+};
+
+/**
+ * Persisted UI session for the singleton workspace. Frontend-owned
+ * shape; the backend is pure storage. Mirrors
+ * `moon_protocol::session::WorkspaceSession`. Holds one
+ * [`FolderSession`] per bound folder, plus a pointer to which folder
+ * was active at last save.
+ */
+export type WorkspaceSession = {
+	folders: FolderSession[];
+	active_folder_path: string | null;
 };
 
 /**

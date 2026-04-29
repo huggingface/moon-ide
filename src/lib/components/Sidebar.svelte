@@ -50,9 +50,9 @@
 			title="Open another folder"
 			onclick={() => void onPickFolder()}
 		>
-			{#if workspace.workspace}
+			{#if workspace.activeFolder}
 				<span class="dot"></span>
-				<span class="name">{workspace.workspace.name}</span>
+				<span class="name">{workspace.activeFolder.name}</span>
 			{:else}
 				<span class="empty">Open folder</span>
 			{/if}

@@ -57,10 +57,10 @@
 
 <div class="status" data-region="status">
 	<div class="left">
-		{#if workspace.workspace}
-			<span class="item">{workspace.workspace.host}</span>
-			<span class="item path" title={workspace.workspace.root}>
-				{workspace.workspace.root}
+		{#if workspace.activeFolder}
+			<span class="item">{workspace.activeFolder.host}</span>
+			<span class="item path" title={workspace.activeFolder.path}>
+				{workspace.activeFolder.path}
 			</span>
 		{/if}
 	</div>

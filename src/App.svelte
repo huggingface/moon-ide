@@ -113,10 +113,14 @@
 	});
 
 	async function hydrate() {
+		// The backend has already replayed the persisted folder list and
+		// active-folder pointer at launch (see src-tauri/src/lib.rs),
+		// so the first call to `workspace_active` returns the full,
+		// correct shape. We then let `restoreAppState` fill in the
+		// per-folder UI state (open tabs etc.) from `app_state.json`.
 		const ws = await ipc.workspace.active();
 		if (ws) {
-			workspace.workspace = ws;
-			await workspace.loadPaths();
+			await workspace.adoptWorkspaceSnapshot(ws);
 		}
 		// Always restore app state — theme applies even with no workspace
 		// (the welcome screen still respects the saved theme).
