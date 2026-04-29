@@ -356,6 +356,33 @@ export type ContainerStateChange = {
 	status: ContainerStatus;
 };
 
+/**
+ * Status of one bound folder's compose project (its own
+ * `docker-compose.yml`). The folder bar's compose indicator
+ * reads this; `compose_file == null` means the folder has no
+ * compose file at its root and the indicator stays hidden.
+ * Mirrors `moon_protocol::container::ProjectComposeStatus`.
+ */
+export type ProjectComposeStatus = {
+	folder_path: string;
+	compose_file: string | null;
+	project_name: string | null;
+	status: ContainerStatus;
+};
+
+/**
+ * Payload of the `project_compose:state` Tauri event,
+ * broadcast after every per-folder lifecycle command. The
+ * `folder_path` field is the routing key — the UI updates only
+ * the matching folder bar without re-querying the others.
+ * Mirrors `moon_protocol::container::ProjectComposeStateChange`.
+ */
+export type ProjectComposeStateChange = {
+	workspace_id: string;
+	folder_path: string;
+	project: ProjectComposeStatus;
+};
+
 export type MoonError =
 	| { code: 'NotFound'; message: string }
 	| { code: 'IoError'; message: string }

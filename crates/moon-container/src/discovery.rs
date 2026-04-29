@@ -112,6 +112,24 @@ pub fn discover_compose_files(folder_root: &Utf8Path) -> ComposeDiscovery {
 	ComposeDiscovery { files }
 }
 
+/// Find the single compose file directly at `folder_root` (no
+/// subdirectory recursion).
+///
+/// Used by the per-folder lifecycle ([`crate::project_compose`]):
+/// a folder gets at most one "primary" compose project, anchored
+/// at its root. Anything in `subdir/docker-compose.yml` is
+/// ignored here — if a user wants to manage a nested compose,
+/// they can bind that nested directory as its own workspace
+/// folder.
+pub fn discover_root_compose(folder_root: &Utf8Path) -> Option<DiscoveredCompose> {
+	let mut by_dir: BTreeMap<Utf8PathBuf, FoundFile> = BTreeMap::new();
+	scan_dir(folder_root, folder_root, &mut by_dir);
+	by_dir.into_values().next().map(|found| DiscoveredCompose {
+		absolute_path: found.absolute,
+		relative_path: found.relative,
+	})
+}
+
 /// Scan every bound folder and concatenate their discoveries.
 ///
 /// Per-folder ordering is preserved (so the resulting `include:`
@@ -365,6 +383,34 @@ mod tests {
 	fn non_existent_root_returns_empty() {
 		let path = Utf8PathBuf::from("/definitely/not/here/moon-x");
 		assert!(discover_compose_files(&path).files.is_empty());
+	}
+
+	#[test]
+	fn discover_root_compose_picks_root_only() {
+		let tmp = tempdir().unwrap();
+		let root = root(&tmp);
+		touch(&root.join("docker-compose.yml"));
+		// Subdirectory compose deliberately ignored by the
+		// per-folder helper.
+		touch(&root.join("svc/compose.yaml"));
+
+		let found = discover_root_compose(&root).expect("root compose found");
+		assert_eq!(found.relative_path, "docker-compose.yml");
+		assert_eq!(found.absolute_path, root.join("docker-compose.yml"));
+	}
+
+	#[test]
+	fn discover_root_compose_returns_none_when_only_subdir_has_one() {
+		let tmp = tempdir().unwrap();
+		let root = root(&tmp);
+		touch(&root.join("svc/compose.yaml"));
+		assert!(discover_root_compose(&root).is_none());
+	}
+
+	#[test]
+	fn discover_root_compose_returns_none_for_missing_path() {
+		let path = Utf8PathBuf::from("/definitely/not/here/moon-x");
+		assert!(discover_root_compose(&path).is_none());
 	}
 
 	#[test]

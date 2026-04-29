@@ -104,3 +104,44 @@ pub struct ContainerStateChange {
 	pub workspace_id: String,
 	pub status: ContainerStatus,
 }
+
+/// Status of a single bound folder's compose project (its own
+/// `docker-compose.yml`).
+///
+/// Distinct from [`ContainerStatus`]: a folder may not have a
+/// compose file at all (most folders the user opens just to edit
+/// code). When that's the case, `compose_file` and
+/// `project_name` are `None` and the UI hides the folder-bar
+/// indicator entirely. When they're `Some`, the inner `status`
+/// follows the same `Absent` / `Running` / `Failed` / etc.
+/// vocabulary as the workspace shell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ProjectComposeStatus {
+	/// Absolute path to the bound folder this snapshot refers to.
+	pub folder_path: String,
+	/// Absolute path to the user-owned compose file driving the
+	/// folder's services, or `None` if the folder has none.
+	pub compose_file: Option<String>,
+	/// Compose project name on the daemon
+	/// (`moon-ws-<id>-<folder-slug>`). `None` when
+	/// `compose_file` is `None`.
+	pub project_name: Option<String>,
+	/// Aggregated state of the folder's compose project.
+	/// `Absent` covers both "no compose file" and "compose file
+	/// present, never brought up". The UI distinguishes the two
+	/// via `compose_file.is_some()`.
+	pub status: ContainerStatus,
+}
+
+/// Payload of the `project_compose:state` Tauri event,
+/// broadcast after every per-folder lifecycle mutation. Keyed
+/// on `folder_path` so the UI can update one folder bar without
+/// re-querying the others.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ProjectComposeStateChange {
+	pub workspace_id: String,
+	pub folder_path: String,
+	pub project: ProjectComposeStatus,
+}

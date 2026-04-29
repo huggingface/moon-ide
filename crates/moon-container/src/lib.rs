@@ -1,28 +1,34 @@
 //! moon-container — Phase 2 workspace container plumbing.
 //!
-//! This crate owns the "is this workspace running in a moon-base
-//! container?" lifecycle: compose-file discovery, project naming,
-//! `.moon/compose.yaml` generation, and (in later commits) the
-//! `docker compose` lifecycle commands the Tauri shell exposes
-//! to the UI.
+//! Two compose-project surfaces live here:
+//!
+//! - **Workspace shell** ([`Workspace`]) — the `dev` container the
+//!   IDE uses for terminals, LSP, agents. One per workspace,
+//!   project name `moon-ws-<id>`, IDE-managed.
+//! - **Project services** ([`ProjectCompose`]) — each bound
+//!   folder's own `docker-compose.yml`, run as a separate compose
+//!   project (`moon-ws-<id>-<folder-slug>`). Started/stopped
+//!   on demand by the user from the folder bar.
 //!
 //! The architectural backdrop is in
 //! [`specs/containers.md`](../../../specs/containers.md); the
-//! decision to use a host-shared Docker daemon with compose
-//! `include:` (rather than nesting Docker inside the workspace
-//! container) is [ADR 0008](../../../specs/decisions/0008-host-shared-daemon.md).
-//!
-//! This first slice of the crate is pure logic — no Docker
-//! shell-out, no Tauri, no I/O beyond directory scans. The
-//! orchestration that wires `docker compose up`/`pause`/etc.
-//! lands on top in a follow-up commit.
+//! decision to use a host-shared Docker daemon (rather than
+//! nesting Docker inside the workspace container) is
+//! [ADR 0008](../../../specs/decisions/0008-host-shared-daemon.md).
+//! The split between workspace shell and project services is the
+//! [2026-04-29 amendment to ADR 0007](../../../specs/decisions/0007-compose-and-moon-base.md#amendment-2026-04-29--workspace-shell-vs-project-services).
 
 pub mod compose;
 pub mod discovery;
 pub mod lifecycle;
 pub mod project;
+pub mod project_compose;
 
 pub use compose::{generate_compose, BoundMount, ComposeRender, ComposeRenderOptions};
-pub use discovery::{discover_compose_files, discover_compose_files_for_folders, ComposeDiscovery, DiscoveredCompose};
+pub use discovery::{
+	discover_compose_files, discover_compose_files_for_folders, discover_root_compose, ComposeDiscovery,
+	DiscoveredCompose,
+};
 pub use lifecycle::{LifecycleError, Workspace, WorkspaceConfig, BOUND_FOLDERS_FILE, COMPOSE_FILE, DEFAULT_DEV_IMAGE};
-pub use project::{project_name_for_id, ProjectName, ProjectNameError};
+pub use project::{folder_slug, project_name_for_folder, project_name_for_id, ProjectName, ProjectNameError};
+pub use project_compose::{slug_for_folder_basename, ProjectCompose, ProjectComposeSnapshot};

@@ -27,8 +27,19 @@
 //! repo, decoupled from any specific folder. Sibling
 //! `bound-folders.json` records the bound-folder set the
 //! `compose.yaml` was generated from; the lifecycle layer treats
-//! both as fully generated (the user's customisation point is
-//! their projects' own compose files, which we `include:`).
+//! both as fully generated.
+//!
+//! Workspace shell vs project services
+//! -----------------------------------
+//!
+//! This module owns the **workspace shell** — i.e. the `dev`
+//! container moon-ide uses to run terminals, LSPs, etc. It
+//! deliberately doesn't `include:` per-folder `docker-compose.yml`
+//! files anymore: those are managed as separate compose projects
+//! per folder, by [`crate::project_compose`]. That split lets the
+//! user start/stop their project services independently of the
+//! IDE's shell — gitaly being broken in `moon-landing` doesn't
+//! prevent you from opening a terminal in the workspace.
 //!
 //! Why a thin shell-out, not bollard
 //! ---------------------------------
@@ -60,7 +71,6 @@ use thiserror::Error;
 use tokio::process::Command;
 
 use crate::compose::{generate_compose, BoundMount, ComposeRender, ComposeRenderOptions};
-use crate::discovery::discover_compose_files_for_folders;
 use crate::project::{project_name_for_id, ProjectName, ProjectNameError};
 
 /// The image reference written into a freshly generated
@@ -201,13 +211,10 @@ impl Workspace {
 	/// "Set up".
 	pub fn render_compose(&self, dev_image: &str) -> ComposeRender {
 		let mounts = self.bound_mounts();
-		let discovery = discover_compose_files_for_folders(&self.bound_folders);
-		let includes: Vec<&Utf8Path> = discovery.files.iter().map(|f| f.absolute_path.as_path()).collect();
 		generate_compose(ComposeRenderOptions {
 			project: &self.project,
 			dev_image,
 			bound_mounts: &mounts,
-			include_files: &includes,
 		})
 	}
 
@@ -337,49 +344,63 @@ impl Workspace {
 		I: IntoIterator<Item = S>,
 		S: AsRef<OsStr>,
 	{
-		let mut cmd = Command::new("docker");
-		cmd.arg("compose");
-		cmd.arg("-f").arg(self.compose_path.as_std_path());
-		cmd.arg("-p").arg(self.project.as_str());
-		for arg in args {
-			cmd.arg(arg);
-		}
-
-		tracing::debug!(
-			project = %self.project,
-			compose = %self.compose_path,
-			"running docker compose",
-		);
-
-		let output = cmd.output().await.map_err(|err| {
-			if err.kind() == std::io::ErrorKind::NotFound {
-				LifecycleError::DockerMissing
-			} else {
-				LifecycleError::Io(err)
-			}
-		})?;
-
-		if !output.status.success() {
-			let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-			// Surfaced verbatim from the engine; the substring is
-			// stable across recent Docker versions and lets the
-			// UI distinguish "Docker is installed but the daemon
-			// isn't running" from a genuine compose error.
-			if stderr.contains("Cannot connect to the Docker daemon") {
-				return Err(LifecycleError::DaemonUnreachable(stderr));
-			}
-			return Err(LifecycleError::ComposeFailed {
-				code: output.status.code().unwrap_or(-1),
-				stderr,
-			});
-		}
-
-		Ok(DockerOutput { stdout: output.stdout })
+		run_docker_compose(&self.compose_path, &self.project, args).await
 	}
 }
 
-struct DockerOutput {
-	stdout: Vec<u8>,
+pub(crate) struct DockerOutput {
+	pub(crate) stdout: Vec<u8>,
+}
+
+/// Run `docker compose -f <compose> -p <project> <args...>`.
+///
+/// Used by both the workspace shell ([`Workspace`]) and the
+/// per-folder project runner ([`crate::project_compose`]) — both
+/// pin `-f` and `-p` explicitly so the spawned process's CWD or
+/// any ambient `.env` never colours the result.
+pub(crate) async fn run_docker_compose<I, S>(
+	compose_path: &Utf8Path,
+	project: &ProjectName,
+	args: I,
+) -> Result<DockerOutput, LifecycleError>
+where
+	I: IntoIterator<Item = S>,
+	S: AsRef<OsStr>,
+{
+	let mut cmd = Command::new("docker");
+	cmd.arg("compose");
+	cmd.arg("-f").arg(compose_path.as_std_path());
+	cmd.arg("-p").arg(project.as_str());
+	for arg in args {
+		cmd.arg(arg);
+	}
+
+	tracing::debug!(
+		%project,
+		compose = %compose_path,
+		"running docker compose",
+	);
+
+	let output = cmd.output().await.map_err(|err| {
+		if err.kind() == std::io::ErrorKind::NotFound {
+			LifecycleError::DockerMissing
+		} else {
+			LifecycleError::Io(err)
+		}
+	})?;
+
+	if !output.status.success() {
+		let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+		if stderr.contains("Cannot connect to the Docker daemon") {
+			return Err(LifecycleError::DaemonUnreachable(stderr));
+		}
+		return Err(LifecycleError::ComposeFailed {
+			code: output.status.code().unwrap_or(-1),
+			stderr,
+		});
+	}
+
+	Ok(DockerOutput { stdout: output.stdout })
 }
 
 /// Pick the container-side directory name for a host-side folder.
@@ -430,14 +451,16 @@ async fn write_if_changed(path: &Utf8Path, contents: &[u8]) -> Result<bool, std:
 }
 
 // Pure helpers — extracted so the parsing + aggregation logic is
-// testable without a Docker daemon.
+// testable without a Docker daemon. Shared with the per-folder
+// runner in `project_compose`, which goes through the same JSON
+// shape.
 
 /// Parse the stdout of `docker compose ps --format json`.
 ///
 /// Compose's output format has shifted between versions: some
 /// emit JSON-Lines (one container object per line), others emit
 /// a single JSON array. We accept both.
-fn parse_ps_output(stdout: &[u8]) -> Result<Vec<ServiceStatus>, String> {
+pub(crate) fn parse_ps_output(stdout: &[u8]) -> Result<Vec<ServiceStatus>, String> {
 	let s = std::str::from_utf8(stdout).map_err(|e| e.to_string())?;
 	let trimmed = s.trim_start();
 	if trimmed.is_empty() {
@@ -502,7 +525,7 @@ impl From<PsEntry> for ServiceStatus {
 ///    `exited` (project never came up, or the user stopped it
 ///    manually). Init-only projects that completed land here.
 /// 6. `Absent` — no containers reported.
-fn aggregate_state(services: &[ServiceStatus]) -> ContainerState {
+pub(crate) fn aggregate_state(services: &[ServiceStatus]) -> ContainerState {
 	if services.is_empty() {
 		return ContainerState::Absent;
 	}
