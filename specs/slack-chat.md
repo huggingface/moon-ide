@@ -493,9 +493,9 @@ the cadence — that's the read-receipt trigger too (next section).
 ### Read receipts
 
 `conversations.mark(channel, ts=last_visible_message_ts)` runs in
-three spots so the unread badge in the user's actual Slack client
-(mobile, web, desktop Slack app) clears as soon as they've seen the
-message in moon-ide:
+three spots so the **channel-level** unread cursor in the user's
+actual Slack client (mobile, web, desktop Slack app) advances as
+soon as they've seen the message in moon-ide:
 
 1. On opening the panel, for the active session.
 2. On switching sessions.
@@ -504,11 +504,38 @@ message in moon-ide:
 
 If the panel is visible but the OS window is unfocused, we _don't_
 mark — the user hasn't actually seen the message yet, and silently
-clearing the badge in that case loses information.
+moving the cursor in that case loses information.
 
 Phase 11.0 doesn't ship this — it lands in 11.2 alongside the
 polling loop. The `im:write` scope is already in the upfront grant
 so the user doesn't reinstall.
+
+#### What `conversations.mark` actually clears
+
+Slack tracks two read states for any DM that contains threaded
+replies, and the public API only exposes one of them:
+
+- **Channel cursor** — the `last_read` on the DM. `conversations.mark`
+  moves it. This is what drives "unread DM" counts in the sidebar
+  and the workspace-wide "any unread DM" indicator.
+- **Per-thread unread / Activity feed** — once you reply in a thread,
+  Slack auto-subscribes you and every new reply increments a
+  per-thread unread that surfaces in the **Activity** view (and
+  contributes to the desktop app's red dot). The internal endpoint
+  Slack's own client uses for this is `subscriptions.thread.mark`,
+  which is **not in the public API** — it requires a browser-session
+  `xoxc` cookie. With our `xoxp-` user token plus every relevant
+  scope, calling it returns `not_allowed_token_type`.
+
+Practical consequence: in this panel, where every conversation _is_ a
+thread, the user's Activity badge for a bot reply will remain red
+until they open the thread inside real Slack, even though we've
+already cleared the channel cursor. We accept this gap rather than
+ship a `xoxc` workaround — capturing a session cookie is too invasive
+for the value, and Slack actively breaks third-party use of `xoxc`.
+
+If Slack ever exposes thread-mark in the public API, wire it in as a
+second call inside `mark_as_read`.
 
 ## Sending messages (Phase 11.3)
 
@@ -681,14 +708,14 @@ Push events from backend → frontend (11.2):
   point we'll need `files:read` (already in the upfront grant)
   for inline rendering, and `files:write` (also granted) plus a
   drag-and-drop / paste handler for upload.
-- **No auto-scroll to the latest message.** The thread opens
-  scrolled to the top, so a long thread requires a manual scroll
-  down to read the most recent reply. Trivial to add (one
-  `$effect` that watches `threadMessages.length` and snaps
-  `scrollTop` to `scrollHeight`, with a sticky-bottom heuristic
-  so we don't yank the user away from older context they're
-  reading). Tabled until the team decides whether bottom-anchor
-  or last-read-marker is the right default.
+- **No last-read marker line.** Opening a thread snaps to the
+  bottom (the latest reply), and incoming messages keep us pinned
+  there if we already were. There's no horizontal "new messages
+  since you last looked" rule between the previously-seen tail and
+  the unread tail — common in chat clients but not yet asked for.
+  Cheap to add later: persist `last_seen_ts` per thread and render a
+  divider above the first message with `ts > last_seen_ts` while the
+  thread is open.
 - **No AI-generated session titles.** The session list shows the
   raw first line of each thread today. Once we have an LLM in
   the loop (Phase 6, ACP), summarise each thread to a 3–6 word

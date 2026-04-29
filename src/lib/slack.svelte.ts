@@ -164,6 +164,13 @@ class SlackPanelState {
 	 * path; this is just for the frontend's view + switch triggers. */
 	#lastMarkedByThread = new SvelteMap<string, string>();
 
+	/** Thread the user was inside when they triggered "+ New
+	 * session", so [`cancelNewSession`] can put them back. `null`
+	 * if they started from the session list (or if the new session
+	 * was actually posted, in which case we pivot to the new thread
+	 * and the saved value would be stale anyway). */
+	#preNewSessionThreadTs: string | null = null;
+
 	/** Cleanup handles for Tauri event listeners + window focus. Set
 	 * once on `wireRuntime`, dropped on app teardown (which doesn't
 	 * happen in practice, but be defensive). */
@@ -535,8 +542,12 @@ class SlackPanelState {
 				// New session: pivot the panel into the freshly
 				// created thread, refresh the sessions list so the
 				// new row shows up at the top, and let the polling
-				// loop take over from here.
+				// loop take over from here. The pre-new-session
+				// thread snapshot is stale at this point — we're
+				// not going back to wherever the user came from,
+				// they're now inside a brand-new thread.
 				this.composingNewSession = false;
+				this.#preNewSessionThreadTs = null;
 				this.threadMessages = [message];
 				this.activeThreadTs = message.ts;
 				void ipc.slack.setActiveThread(message.ts).catch(() => {});
@@ -561,9 +572,14 @@ class SlackPanelState {
 
 	/**
 	 * Open the new-session composer. Closes any open thread so the
-	 * panel renders the empty composer state.
+	 * panel renders the empty composer state. Remembers the thread
+	 * we navigated away from so [`cancelNewSession`] can drop the
+	 * user back into it — invoking "+ New session" from inside an
+	 * existing session and then changing your mind shouldn't dump
+	 * you all the way back to the session list.
 	 */
 	startNewSession(): void {
+		this.#preNewSessionThreadTs = this.activeThreadTs;
 		this.composingNewSession = true;
 		this.activeThreadTs = null;
 		this.threadMessages = null;
@@ -575,11 +591,18 @@ class SlackPanelState {
 
 	/**
 	 * Cancel the new-session composer without sending. Returns to
-	 * the session list. Clears any pending send error.
+	 * the thread the user was inside when they hit "+ New session"
+	 * (if any), otherwise to the session list. Clears any pending
+	 * send error.
 	 */
 	cancelNewSession(): void {
 		this.composingNewSession = false;
 		this.sendError = null;
+		const previous = this.#preNewSessionThreadTs;
+		this.#preNewSessionThreadTs = null;
+		if (previous !== null) {
+			this.selectThread(previous);
+		}
 	}
 
 	/**
@@ -741,6 +764,7 @@ class SlackPanelState {
 		this.loadingThread = false;
 		this.threadError = null;
 		this.composingNewSession = false;
+		this.#preNewSessionThreadTs = null;
 		this.sending = false;
 		this.sendError = null;
 	}

@@ -265,6 +265,68 @@
 			autoGrow(composer);
 		}
 	});
+
+	// --- Scroll behaviour --------------------------------------------------
+	// Sticky-bottom: opening a session lands at the latest reply, and
+	// new messages (poll push or our own send) keep the scroll pinned
+	// there iff the user was already at the bottom. Scrolling up to
+	// read older context unpins, so a bot reply that arrives while
+	// the user is reading scrollback doesn't yank them away.
+	//
+	// `lastThreadTs` / `lastSeenLength` are intentionally plain `let`
+	// (not `$state`): the effect mutates them after each run and we
+	// don't want those writes to retrigger it.
+	let scrollEl: HTMLDivElement | null = $state(null);
+	let pinnedToBottom = true;
+	let lastSeenLength = 0;
+	let lastThreadTs: string | null = null;
+
+	// Distance-from-bottom threshold for "still at the bottom". Has
+	// to be > one line-height worth of slack so a freshly-snapped
+	// scroll position (which can land a pixel or two above the
+	// mathematical max due to subpixel rounding) doesn't immediately
+	// flip `pinnedToBottom` off on the next scroll event.
+	const PIN_THRESHOLD = 24;
+
+	function onScrollContainer() {
+		if (scrollEl === null) {
+			return;
+		}
+		const remaining = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
+		pinnedToBottom = remaining < PIN_THRESHOLD;
+	}
+
+	function snapToBottom() {
+		if (scrollEl === null) {
+			return;
+		}
+		scrollEl.scrollTop = scrollEl.scrollHeight;
+	}
+
+	$effect(() => {
+		const ts = slack.activeThreadTs;
+		const length = slack.threadMessages?.length ?? 0;
+		if (scrollEl === null) {
+			return;
+		}
+		if (ts !== lastThreadTs) {
+			lastThreadTs = ts;
+			lastSeenLength = length;
+			pinnedToBottom = true;
+			if (length > 0) {
+				snapToBottom();
+			}
+			return;
+		}
+		if (length > lastSeenLength) {
+			lastSeenLength = length;
+			if (pinnedToBottom) {
+				snapToBottom();
+			}
+		} else if (length < lastSeenLength) {
+			lastSeenLength = length;
+		}
+	});
 </script>
 
 <aside class="chat-panel" data-region="chat" aria-label="Chat panel">
@@ -288,7 +350,7 @@
 		</div>
 	{:else}
 		<div class="connected">
-			<div class="connected-scroll">
+			<div class="connected-scroll" bind:this={scrollEl} onscroll={onScrollContainer}>
 				<section class="card">
 					<div class="card-row">
 						<span class="card-label">Connected as</span>
@@ -337,14 +399,25 @@
 							<header class="section-header">
 								<span class="section-title">Sessions</span>
 								<div class="header-actions">
-									<button type="button" class="primary-link" onclick={onStartNewSession}>+ New session</button>
 									<button
 										type="button"
-										class="link"
+										class="icon-button"
+										onclick={onStartNewSession}
+										title="New session"
+										aria-label="New session"
+									>
+										{@render newSessionIcon()}
+									</button>
+									<button
+										type="button"
+										class="icon-button"
 										onclick={onRefreshSessions}
 										disabled={slack.loadingSessions}
-										title="Reload sessions">Refresh</button
+										title="Reload sessions"
+										aria-label="Reload sessions"
 									>
+										{@render refreshIcon()}
+									</button>
 								</div>
 							</header>
 							{#if slack.loadingSessions && slack.sessions === null}
@@ -387,13 +460,27 @@
 								<button type="button" class="back-button" onclick={onBackToSessions} title="Back to sessions">
 									← Sessions
 								</button>
-								<button
-									type="button"
-									class="link"
-									onclick={onRefreshThread}
-									disabled={slack.loadingThread}
-									title="Reload thread">Refresh</button
-								>
+								<div class="header-actions">
+									<button
+										type="button"
+										class="icon-button"
+										onclick={onStartNewSession}
+										title="New session"
+										aria-label="New session"
+									>
+										{@render newSessionIcon()}
+									</button>
+									<button
+										type="button"
+										class="icon-button"
+										onclick={onRefreshThread}
+										disabled={slack.loadingThread}
+										title="Reload thread"
+										aria-label="Reload thread"
+									>
+										{@render refreshIcon()}
+									</button>
+								</div>
 							</header>
 							{#if slack.loadingThread && slack.threadMessages === null}
 								<div class="muted-row">
@@ -524,6 +611,40 @@
 </aside>
 
 <ChatConnectModal />
+
+{#snippet refreshIcon()}
+	<svg
+		viewBox="0 0 16 16"
+		width="14"
+		height="14"
+		fill="none"
+		stroke="currentColor"
+		stroke-width="1.5"
+		stroke-linecap="round"
+		stroke-linejoin="round"
+		aria-hidden="true"
+	>
+		<path d="M14 8a6 6 0 1 1-1.76-4.24" />
+		<path d="M14 2v4h-4" />
+	</svg>
+{/snippet}
+
+{#snippet newSessionIcon()}
+	<svg
+		viewBox="0 0 16 16"
+		width="14"
+		height="14"
+		fill="none"
+		stroke="currentColor"
+		stroke-width="1.5"
+		stroke-linecap="round"
+		stroke-linejoin="round"
+		aria-hidden="true"
+	>
+		<path d="M8 3v10" />
+		<path d="M3 8h10" />
+	</svg>
+{/snippet}
 
 <style>
 	.chat-panel {
@@ -761,20 +882,35 @@
 	.header-actions {
 		display: flex;
 		align-items: center;
-		gap: 8px;
+		gap: 4px;
 	}
-	.primary-link {
-		font: inherit;
-		font-size: 11px;
-		font-weight: 600;
-		background: transparent;
-		color: var(--m-accent);
-		border: 0;
+	/* Square icon affordance shared by both header rows (Sessions list
+	   and active thread). Sized to match the cap height of `.section-title`
+	   so the row visually aligns. Uses `currentColor` on the SVG strokes
+	   so hover / disabled states are a single CSS swap. */
+	.icon-button {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 22px;
+		height: 22px;
 		padding: 0;
+		background: transparent;
+		border: 0;
+		border-radius: 4px;
+		color: var(--m-fg-muted);
 		cursor: pointer;
 	}
-	.primary-link:hover {
-		text-decoration: underline;
+	.icon-button:hover:not(:disabled) {
+		background: var(--m-bg-3);
+		color: var(--m-fg);
+	}
+	.icon-button:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+	.icon-button svg {
+		display: block;
 	}
 	.composer {
 		flex-shrink: 0;
