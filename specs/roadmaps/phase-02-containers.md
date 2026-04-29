@@ -266,6 +266,8 @@ This redesign is held until multi-folder workspace UX exists in
 the IDE — designing a bound-folder set for "exactly one folder"
 is an exercise in pretending. The current 2.0 wiring stays as
 the bridge implementation for testing.
+[Phase 2.5](phase-02.5-multi-folder.md) ships that prerequisite;
+this phase's redesign sub-task picks up afterwards.
 
 ## Bootstrap concern
 

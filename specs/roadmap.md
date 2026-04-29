@@ -17,6 +17,7 @@ The full phased plan. Update the **Status** column as phases land.
 | 1     | Editor + navigation             | implemented |
 | 1.5   | Editor polish                   | scaffolded  |
 | 2     | Containerised dev shells        | scaffolded  |
+| 2.5   | Multi-folder workspace UX       | scaffolded  |
 | 3     | Terminal                        | scaffolded  |
 | 4     | LSP                             | scaffolded  |
 | 5     | Git layer                       | scaffolded  |
@@ -66,6 +67,14 @@ System architecture: [containers.md](containers.md). Sub-phase work breakdown: [
 
 **Bootstrap concern** (per [ADR 0005](decisions/0005-bootstrap.md)): `moon-base` ships with `rustup`, `bun`, and the WebKitGTK dev libraries so a fresh moon-ide checkout is buildable inside its own container.
 
+## Phase 2.5 — Multi-folder workspace UX
+
+The "command centre" foundation: a workspace becomes a list of folders rather than _being_ a folder. Pulled forward from Phase 7 because the Phase 2 container redesign — workspace state lives outside any repo, compose project survives across folder switches — is incoherent without it. See [`roadmaps/phase-02.5-multi-folder.md`](roadmaps/phase-02.5-multi-folder.md) for the work breakdown and [`containers.md` § Multi-folder workspace](containers.md#multi-folder-workspace-the-command-centre-ux) for the container redesign that lights up on top.
+
+**Acceptance**: opening a folder adds it to the workspace as a new folder bar in the sidebar instead of replacing the active workspace; clicking a bar makes it active and swaps the file tree + tabs to that folder's persisted state; an inline `+ Add folder` row picks a new folder; an `×` per bar removes it (with confirm) including its session entry; per-folder tab/active state survives restart. One workspace (`"default"`) with N folders — multi-workspace UI stays a Phase 7 concern.
+
+What deliberately doesn't ship in 2.5: showing more than one folder's tree at once, cross-folder search, drag-to-reorder bars, folder rename, compose indicators on the folder bars (those land with the Phase 2 container redesign that follows).
+
 ## Phase 3 — Terminal
 
 xterm.js + portable-pty terminals, multiple sessions, splits. Spawned via active host so they run inside the container when remote.
@@ -94,13 +103,11 @@ Until this phase lands, the file tree shows everything except the `.git/` direct
 
 ACP host using the `agent-client-protocol` crate. Agent panel in the UI: chat, tool stream, edit preview. Pluggable agent binary (settings select opencode / claude code / etc.). Tool calls route through the active host so containerized agents only touch container resources.
 
-## Phase 7 — Multi-repo
+## Phase 7 — Multi-repo coordination
 
-Workspace = ordered list of repo roots. Multi-root tree (multiple Pierre Trees instances). Cross-repo search via per-repo `tantivy` index, parallel query. ACP gets a `workspace.repos` tool; agents can target `@repo-name`.
+Phase 2.5 already shipped the multi-folder workspace shape. What Phase 7 adds on top: cross-folder search via per-folder `tantivy` indices with a parallel query layer, ACP's `workspace.repos` tool so agents can target `@repo-name`, and named multi-workspace UI (today's singleton `"default"` becomes one of many, with `Open Workspace…` / `Switch Workspace…` affordances).
 
-App state grows with this phase: today's single `last_session` (one workspace + its tabs) becomes a list of recently-opened workspaces and the most recent multi-repo set, with each workspace keeping its own session. The `AppState` struct in `moon-core` is the natural place for this.
-
-This is also the phase that pulls Phase 2's container lifecycle out of the single status-bar pip and into per-folder bars: each folder gets its own container indicator, and "close folder" becomes the per-folder lifecycle hook (pause / tear down — TBD) so cycling through folders doesn't leak running compose projects on the daemon. See [containers.md § Multi-folder workspace](containers.md#multi-folder-workspace-the-command-centre-ux).
+App state grows with this phase: today's single workspace (folders + active) becomes a list of named workspaces with the most recent set of folders per workspace. The `AppState` struct in `moon-core` is the natural place for this.
 
 ## Phase 8 — Lint / format
 
