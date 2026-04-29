@@ -713,10 +713,19 @@
 		flex: 1;
 		min-height: 0;
 		overflow-y: auto;
-		padding: 12px;
+		/* No `padding-top`: the sticky `.thread-header` anchors against
+		   this element's content-box edge, so any padding-top here would
+		   sit *above* the stuck header and let scroll content show
+		   through that strip. Top breathing room moves to the first
+		   child via `:first-child { margin-top }`, where it scrolls
+		   away with the rest of the content as it should. */
+		padding: 0 12px 12px;
 		display: flex;
 		flex-direction: column;
 		gap: 12px;
+	}
+	.connected-scroll > :first-child {
+		margin-top: 12px;
 	}
 	.card {
 		background: var(--m-bg-2);
