@@ -41,14 +41,42 @@ const ignoreLanguage = StreamLanguage.define({
 	},
 });
 
+// Match a `#!` interpreter line and capture the basename of the
+// interpreter (the last path segment, ignoring `env <prog>` and any
+// trailing arguments / flags). Used as a last-resort signal for files
+// that lack a useful extension — `.husky/pre-commit` being the
+// canonical example: it's shell content with no `.sh` to go on.
+const SHEBANG_RE = /^#!\s*(?:\S+\/)?(?:env\s+)?([\w.-]+)/;
+const SHEBANG_LANGUAGES: Record<string, string> = {
+	sh: 'sh',
+	bash: 'sh',
+	zsh: 'sh',
+	dash: 'sh',
+	ash: 'sh',
+};
+
 // Language extensions are loaded lazily so we don't bundle every grammar
 // up front. Returning [] means "no syntax extension yet, plain text is fine".
-export async function languageFor(filename: string): Promise<Extension[]> {
+//
+// `firstLine` is consulted only when filename + extension don't match
+// anything; it lets us pick up shebang scripts that lack an extension.
+export async function languageFor(filename: string, firstLine?: string): Promise<Extension[]> {
 	const baseName = filename.split('/').pop() ?? filename;
 	if (IGNORE_FILENAME_RE.test(baseName)) {
 		return [ignoreLanguage];
 	}
-	const ext = FILENAME_LANGUAGES[baseName] ?? baseName.split('.').pop()?.toLowerCase() ?? '';
+	let ext = FILENAME_LANGUAGES[baseName] ?? baseName.split('.').pop()?.toLowerCase() ?? '';
+	// Fall back to shebang sniffing only when the basename has no `.`
+	// in it — i.e. there was no extension to consult. A file called
+	// `script.txt` that happens to start with `#!/bin/sh` is still a
+	// `.txt` file by the user's intent.
+	if (firstLine && !baseName.includes('.')) {
+		const match = SHEBANG_RE.exec(firstLine);
+		const interp = match?.[1]?.toLowerCase();
+		if (interp && SHEBANG_LANGUAGES[interp]) {
+			ext = SHEBANG_LANGUAGES[interp];
+		}
+	}
 
 	switch (ext) {
 		case 'ts':

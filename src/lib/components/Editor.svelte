@@ -40,7 +40,7 @@
 		});
 		view = new EditorView({ state, parent: host });
 		currentPath = file.path;
-		void applyLanguage(file.path);
+		void applyLanguage(file.path, file.text);
 		return () => {
 			view?.destroy();
 			view = undefined;
@@ -69,7 +69,7 @@
 			const renamed = workspace.isRename(currentPath, file.path);
 			currentPath = file.path;
 			void workspace.ensureEditorConfig(file.path);
-			void applyLanguage(file.path);
+			void applyLanguage(file.path, file.text);
 			if (renamed) {
 				// Pipeline may have rewritten the bytes; sync the doc
 				// without rebuilding state.
@@ -170,8 +170,14 @@
 		return [EditorState.tabSize.of(Math.max(1, ec.tab_width)), indentUnit.of(unit)];
 	}
 
-	async function applyLanguage(path: string) {
-		const ext = await languageFor(path);
+	async function applyLanguage(path: string, text: string) {
+		// `text` is consulted only as a shebang source for extension-less
+		// scripts (e.g. `.husky/pre-commit`); we pass it explicitly rather
+		// than reading from `view.state.doc` because at switch time the
+		// doc still holds the previous file.
+		const newlineIdx = text.indexOf('\n');
+		const firstLine = newlineIdx === -1 ? text : text.slice(0, newlineIdx);
+		const ext = await languageFor(path, firstLine);
 		view?.dispatch({
 			effects: languageCompartment.reconfigure(ext),
 		});
