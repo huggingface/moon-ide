@@ -646,43 +646,106 @@ Two future shapes are explicitly preserved:
 
 ### Multi-folder workspace (the "command centre" UX)
 
-Phase 2.0's mental model is one folder = one workspace = one
-compose project. The single status-bar pip controls the only
-project that exists. That model strains as soon as we move to
-the command-centre UX where a single moon-ide window holds
-several open folders side-by-side (Phase 7 territory). At
-that point:
+The Phase 2.0 implementation in tree treats the active folder
+_as_ the workspace: state at `<workspace>/.moon/compose.yaml`,
+compose project name hashed from the folder path, container
+recreated on every folder switch. That's wrong on principle —
+workspaces are a moon-ide concept, not a repo concept — and
+becomes actively bad once a single moon-ide window holds
+several open folders side-by-side. The redesign below is the
+target shape; it lands once the multi-folder UX itself does
+(see [phase-02 roadmap](roadmaps/phase-02-containers.md#pending-redesign-workspace--folder)).
 
-- "Open folder" stops switching the workspace; it adds a new
-  folder bar alongside the existing one(s).
-- Each folder bar carries its own container indicator —
-  effectively one "container pip" per folder, since the
-  compose project is keyed by folder path
-  (`moon-ws-<hash>`) and that key already differs between
-  folders by construction.
-- "Close folder" becomes the per-folder lifecycle hook the
-  spec hand-waves about today: removing the folder from the
-  workspace stops (or pauses, TBD) its compose project so
-  cycling through folders doesn't leak running projects on
-  the daemon.
+#### Workspace state lives outside any repo
 
-There is no GC in 2.0 — closing the moon-ide window leaves
-every compose project running on the daemon, and switching
-the active folder doesn't pause the previous one. That's
-acceptable while there's exactly one folder at a time and
-the user can reach for `Tear down` explicitly. Once
-multi-folder UX lands the per-folder close hook is the
-natural place to retire stale projects without the user
-juggling `docker compose ls`. Until then, the explicit
-buttons + `docker compose ls` are the inventory.
+```
+~/.local/share/moon-ide/workspaces/<id>/   # dirs::data_local_dir on each platform
+├── compose.yaml                           # generated; derived from bound-folders.json
+└── bound-folders.json                     # source of truth for what's bound
+```
 
-A separate "container management" surface (list every
-`moon-ws-*` project the daemon knows about, with bulk
-"tear down stale" affordances) is the broader-scope
-companion to the per-folder hook — useful even outside
-multi-folder mode for cleaning up containers from
-workspaces the user has stopped opening. Add when the
-inventory genuinely sprawls.
+`<id>` is `"default"` until multi-workspace UX exists. The
+layout is forward-compatible with named workspaces — they just
+become other entries under `workspaces/`, with a small
+`workspaces/index.json` mapping ids to display names.
+
+#### One compose project per workspace, not per folder
+
+Project name is `moon-ws-<id>` (so `moon-ws-default` for the
+single workspace today), independent of any folder path. The
+workspace's compose project survives folder switches; what
+changes when the bound-folder set changes is the contents of
+`compose.yaml`, not its identity.
+
+#### Bound-folder set is the source of truth
+
+`bound-folders.json` is a list of absolute paths the user has
+bound into the workspace. The compose generator reads it and
+emits, for each entry:
+
+- An `include:` of any `docker-compose.yml` / `compose.yaml`
+  discovered at the folder root or one level deep, paths
+  absolute (no `../` games — the compose file no longer lives
+  near the repos so relative paths buy nothing).
+- A bind mount on the `dev` service: `<absolute>:/workspace/<basename>`.
+
+`working_dir: /workspace` for the `dev` service so multi-folder
+isn't a special case — terminals just `cd workspace/<name>`
+into whichever folder they were spawned from. The Phase 3
+terminal owns picking the right cwd; the compose layout stays
+the same whether one or many folders are bound.
+
+#### Folder lifecycle within a workspace
+
+- **Single-folder today**: opening a different folder offers an
+  explicit "Switch workspace to this folder" affordance in the
+  container popover (visible only when the active folder ≠
+  the bound folder). Doing it: rewrite `bound-folders.json` +
+  `compose.yaml` to the new folder, `docker compose down`, then
+  `up -d --wait`. No automatic switching — the dev container
+  may be running a build / dev server / test suite, and
+  surprise tearing it down because the user clicked a sibling
+  folder is too magical.
+- **Multi-folder (Phase 7)**: opening a folder _adds_ it to the
+  bound set. Compose grows another `include:` and another bind
+  mount; `docker compose up -d --wait` handles the diff —
+  unchanged services stay running, the `dev` container is
+  recreated because its mount list changed, new project
+  services start. Closing a folder is the inverse and prunes
+  on `up --remove-orphans`.
+
+#### Caches across `dev` recreation
+
+Recreating the `dev` container on every folder add/remove would
+nuke `~/.cargo`, `~/.bun`, `~/.cache` etc. and make multi-folder
+unusable. The fix is named volumes for those paths, mounted on
+`dev`, so the bytes survive container recreation. Land alongside
+Phase 3 (terminal) — the 2.0 `sleep infinity` dev container has
+no cache state worth preserving, so the named volumes can wait
+until they actually buy something.
+
+#### What's missing today
+
+- Workspace state still lives in `<workspace>/.moon/compose.yaml`
+  with `../` relative paths — wrong on principle but functional
+  for testing single-folder. Migrating costs a `moon-container`
+  refactor + ADR 0007 update; doing it before multi-folder UX
+  exists buys nothing because the file would still be bound to
+  one folder. Defer.
+- `resetForWorkspaceSwitch` in the frontend tears the pip down
+  on folder change. Once workspaces are real, this becomes a
+  no-op — the singleton workspace doesn't change when the
+  active folder does.
+- No GC. Per the previous bullet, the today-buggy
+  `moon-ws-<hash-of-folder>` project names mean cycling folders
+  in the current build leaves dead compose projects on the
+  daemon. Fixed in passing by the redesign (one project name
+  per workspace, not per folder). Until then, explicit
+  `Tear down` + `docker compose ls` from a terminal are the
+  inventory tools. A "container management" surface listing
+  every `moon-ws-*` project on the daemon with bulk
+  "tear down stale" affordances stays useful even after the
+  redesign — add when the inventory genuinely sprawls.
 
 ### Remote hosts
 

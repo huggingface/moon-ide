@@ -234,6 +234,39 @@ with their re-visit triggers; the short list:
 - Cross-platform (macOS / Windows) verification.
 - On-demand port forwarding without editing compose.
 
+## Pending redesign: workspace ≠ folder
+
+The 2.0 implementation in tree (status pip, popover, lifecycle
+plumbing) treats the active folder _as_ the workspace —
+state at `<workspace>/.moon/compose.yaml`, project name hashed
+from folder path, container recreated on folder switch. That
+mistake only becomes visible once we sit with multi-folder UX.
+The architectural correction is recorded in
+[`containers.md` § Multi-folder workspace](../containers.md#multi-folder-workspace-the-command-centre-ux);
+the short version:
+
+- Workspace state moves to
+  `~/.local/share/moon-ide/workspaces/<id>/{compose.yaml,bound-folders.json}`
+  (`<id>` = `"default"` until multi-workspace ships).
+- Compose project name becomes `moon-ws-<id>`, decoupled from
+  any folder hash. The project survives folder switches; only
+  the bound-folder set in compose changes.
+- `bound-folders.json` is the source of truth; the generator
+  reads it and emits absolute-path includes + bind mounts.
+- Single-folder switches go through an explicit
+  "Switch workspace to this folder" button (no auto-tear-down
+  on folder change). Multi-folder adds become additive on the
+  same compose project.
+- `resetForWorkspaceSwitch` becomes a no-op once the workspace
+  doesn't ride on the active folder.
+- ADR 0007 needs an amendment (or a successor) to land the
+  state-dir change.
+
+This redesign is held until multi-folder workspace UX exists in
+the IDE — designing a bound-folder set for "exactly one folder"
+is an exercise in pretending. The current 2.0 wiring stays as
+the bridge implementation for testing.
+
 ## Bootstrap concern
 
 Per [ADR 0005](../decisions/0005-bootstrap.md), `moon-base`
