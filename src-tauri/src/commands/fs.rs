@@ -1,5 +1,6 @@
 use camino::Utf8PathBuf;
 use moon_protocol::fs::{DirEntry, ReadFileResult, StatResult, WriteFileResult};
+use moon_protocol::git::GitStatusEntry;
 use moon_protocol::MoonError;
 use tauri::State;
 
@@ -17,6 +18,18 @@ pub async fn fs_read_dir(state: State<'_, AppState>, path: String) -> Result<Vec
 	let entry = state.workspaces.require_active_folder().await?;
 	let path = Utf8PathBuf::from(path);
 	entry.host.read_dir(&path).await
+}
+
+/// Recursively walk the active folder and return every path in
+/// one shot. The tree's refresh used to fire one `fs_read_dir`
+/// per directory which, at Tauri's ~15-30ms IPC framing cost per
+/// call, dominated refresh latency on anything bigger than a toy
+/// repo. This command does the same walk backend-side and returns
+/// the full path list in a single roundtrip.
+#[tauri::command]
+pub async fn fs_collect_paths(state: State<'_, AppState>, max_depth: u32) -> Result<Vec<String>, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.collect_paths(max_depth).await
 }
 
 #[tauri::command]
@@ -72,13 +85,16 @@ pub async fn fs_delete(state: State<'_, AppState>, path: String) -> Result<(), M
 	entry.host.delete_path(&path).await
 }
 
-/// Classify a batch of workspace-relative paths against the effective
-/// gitignore rules. Returns the ignored subset — used by the file
-/// tree to fade rows and keep ignored top-level folders collapsed on
-/// first paint. Batched rather than per-path so the walker only runs
-/// once per `loadPaths`.
+/// Per-path git status for the file tree. Inside a git repo the
+/// full add / modify / delete / untracked / ignored vocabulary is
+/// reported; outside one, only ignored entries (via the walker
+/// fallback against `paths`). Batched so `loadPaths` triggers a
+/// single git invocation rather than one per row.
 #[tauri::command]
-pub async fn fs_git_ignored_paths(state: State<'_, AppState>, paths: Vec<String>) -> Result<Vec<String>, MoonError> {
+pub async fn fs_git_status_entries(
+	state: State<'_, AppState>,
+	paths: Vec<String>,
+) -> Result<Vec<GitStatusEntry>, MoonError> {
 	let entry = state.workspaces.require_active_folder().await?;
-	entry.host.git_ignored_paths(&paths).await
+	entry.host.git_status_entries(&paths).await
 }

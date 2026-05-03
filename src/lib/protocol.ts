@@ -101,6 +101,25 @@ export type ThemeMode = 'system' | 'dark' | 'light';
  */
 export type SystemTheme = 'dark' | 'light' | 'unspecified';
 
+/**
+ * One path's git status. The vocabulary matches Pierre Trees' own
+ * `GitStatus` type so frontend code can pass `GitStatusEntry[]`
+ * straight through to `tree.setGitStatus`. Mirrors
+ * `moon_protocol::git::GitFileStatus`.
+ */
+export type GitFileStatus = 'added' | 'modified' | 'deleted' | 'untracked' | 'ignored';
+
+/**
+ * One row's git classification. `path` follows the usual trailing-
+ * slash convention for directories; `deleted` rows never carry one
+ * (git tracks files, not dirs, in this model). Mirrors
+ * `moon_protocol::git::GitStatusEntry`.
+ */
+export type GitStatusEntry = {
+	path: string;
+	status: GitFileStatus;
+};
+
 export type SplitSide = 'left' | 'right';
 
 export type IndentStyle = 'tab' | 'space';

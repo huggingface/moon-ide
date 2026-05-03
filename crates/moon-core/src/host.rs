@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use moon_protocol::editorconfig::EditorConfig;
 use moon_protocol::fs::{DirEntry, EntryKind, ReadFileResult, StatResult, WriteFileResult};
+use moon_protocol::git::{GitFileStatus, GitStatusEntry};
 use moon_protocol::{MoonError, MoonResult};
 use std::time::SystemTime;
 
@@ -50,14 +51,37 @@ pub trait WorkspaceHost: Send + Sync {
 	/// does — this is the single point where the rules are decided.
 	async fn editorconfig_for(&self, path: &Utf8Path) -> MoonResult<EditorConfig>;
 
-	/// Workspace-relative paths (directories carry a trailing `/`, to
-	/// match `read_dir` output and the tree's path format) that match
-	/// the effective gitignore rules — `.gitignore` files at any depth,
-	/// `.git/info/exclude`, and the user's global excludes. The frontend
-	/// feeds the result to Pierre Trees as ignored rows so they paint
-	/// faded rather than vanish; hiding ignored files outright would
-	/// miss the common "peek at `target/` or `node_modules/`" workflow.
-	async fn git_ignored_paths(&self, paths: &[String]) -> MoonResult<Vec<String>>;
+	/// Recursively enumerate every path inside the workspace root,
+	/// returning the same string format the file tree consumes
+	/// (directories carry a trailing `/`, files don't, `.git/` is
+	/// skipped). `max_depth` bounds how deep we recurse so very
+	/// nested trees can't stall the UI on first load; entries at
+	/// the cap are included but their children aren't.
+	///
+	/// Exists separately from `read_dir` because the tree's walker
+	/// would otherwise fire one IPC roundtrip per directory —
+	/// dominating the refresh latency on anything bigger than a
+	/// handful of folders. One call collapses hundreds of
+	/// roundtrips into a single backend walk, which is the actual
+	/// work; everything else was IPC framing.
+	async fn collect_paths(&self, max_depth: u32) -> MoonResult<Vec<String>>;
+
+	/// Per-path git status for the file tree — added, modified,
+	/// deleted, untracked, and ignored. Deleted entries are included
+	/// even when the frontend hasn't enumerated them on disk; the
+	/// tree re-adds those phantom rows so working-tree deletions
+	/// don't silently disappear before the commit lands.
+	///
+	/// `paths` is only consulted in the walker fallback path (no git
+	/// binary / no repo) where the tree's own enumeration is the
+	/// only source of candidates. Inside a git repo we trust `git
+	/// status` to surface the complete set of changed + ignored
+	/// entries and ignore `paths` altogether.
+	///
+	/// Directories in the returned set carry a trailing `/`, to
+	/// match `read_dir` output and Pierre's path convention; deleted
+	/// entries never do (git can't track a directory).
+	async fn git_status_entries(&self, paths: &[String]) -> MoonResult<Vec<GitStatusEntry>>;
 }
 
 pub struct LocalHost {
@@ -319,117 +343,258 @@ impl WorkspaceHost for LocalHost {
 		self.editorconfig.for_path(path).await
 	}
 
-	async fn git_ignored_paths(&self, paths: &[String]) -> MoonResult<Vec<String>> {
-		// The ignore walker is synchronous, so hop to the blocking pool
-		// to keep the Tokio reactor free. `ignore` fans out its own
-		// threads if we use `build_parallel`, but the single-threaded
-		// walk is already fast enough for IDE-sized trees (tens of
-		// thousands of files) and keeps the code straight-line.
+	async fn git_status_entries(&self, paths: &[String]) -> MoonResult<Vec<GitStatusEntry>> {
+		// Both the `git status` subprocess and the walker fallback
+		// are blocking work, so hop onto the blocking pool. The git
+		// path is dominated by git itself anyway; the walker is
+		// single-threaded but fast enough for IDE-sized trees (tens
+		// of thousands of files) without `build_parallel`'s wiring.
 		let root = self.root.clone();
 		let paths = paths.to_vec();
-		tokio::task::spawn_blocking(move || classify_git_ignored(&root, &paths))
+		tokio::task::spawn_blocking(move || classify_git_status(&root, &paths))
 			.await
-			.map_err(|e| MoonError::Internal(format!("git_ignored_paths join error: {e}")))?
+			.map_err(|e| MoonError::Internal(format!("git_status_entries join error: {e}")))?
+	}
+
+	async fn collect_paths(&self, max_depth: u32) -> MoonResult<Vec<String>> {
+		// Pure `std::fs` walk on the blocking pool. Tried using
+		// `tokio::fs::read_dir` recursively here — it kept the
+		// reactor busy with tiny awaits per entry and wound up
+		// slower than the sync version, presumably because the
+		// actual read_dir syscall is already non-blocking-ish on
+		// modern kernels.
+		let root = self.root.clone();
+		tokio::task::spawn_blocking(move || {
+			let mut out = Vec::new();
+			walk_paths(&root, "", &mut out, 0, max_depth);
+			Ok(out)
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("collect_paths join error: {e}")))?
 	}
 }
 
-/// Returns the subset of `paths` (workspace-relative, directories
-/// optionally terminated by `/`) that git / the walker treat as
-/// ignored.
+/// Depth-first recursion into the workspace root. Order mirrors the
+/// previous frontend walker (dirs push-and-recurse immediately, files
+/// push inline) so Pierre's tree diff stays stable across the
+/// per-dir-IPC → single-call migration.
 ///
-/// Primary strategy inside a git repo: ask `git ls-files` itself.
-/// That path respects the index, so a file matching a `.gitignore`
-/// pattern but already tracked (committed, or `git add -f`'d) is
-/// correctly reported as _not_ ignored — the walker below can't make
-/// that distinction on its own because `ignore::WalkBuilder` has no
-/// view of the index.
-///
-/// Fallback (no git repo / git binary missing): walk the tree with
-/// the standard gitignore filters and treat anything the walker
-/// doesn't yield as ignored. Good enough for pre-`git init` folders;
-/// loses the index-aware behaviour above, which is the price of not
-/// requiring git to be installed.
-fn classify_git_ignored(root: &Utf8Path, paths: &[String]) -> MoonResult<Vec<String>> {
-	if let Some(ignored) = classify_via_git_ls_files(root) {
-		return Ok(filter_to_inputs(&ignored, paths));
+/// Errors are swallowed per-entry rather than bubbled up: a single
+/// unreadable symlink or permission-denied directory shouldn't blow
+/// up a whole refresh. The entries we _can_ read still make the cut.
+fn walk_paths(root: &Utf8Path, rel: &str, out: &mut Vec<String>, depth: u32, max_depth: u32) {
+	let dir_path = if rel.is_empty() {
+		root.as_std_path().to_path_buf()
+	} else {
+		root.as_std_path().join(rel)
+	};
+	let iter = match std::fs::read_dir(&dir_path) {
+		Ok(i) => i,
+		Err(_) => return,
+	};
+	for entry in iter.flatten() {
+		let Ok(file_type) = entry.file_type() else {
+			continue;
+		};
+		let name = entry.file_name().to_string_lossy().into_owned();
+		let child_rel = if rel.is_empty() {
+			name.clone()
+		} else {
+			format!("{rel}/{name}")
+		};
+		if file_type.is_dir() {
+			// `.git/` hides on purpose — see `read_dir`'s matching
+			// skip. Once Phase 5's git layer fully lands this may
+			// move to a gitignore-aware filter, but right now the
+			// tree would drown in refs/ churn if we surfaced it.
+			if name == ".git" {
+				continue;
+			}
+			out.push(format!("{child_rel}/"));
+			if depth < max_depth {
+				walk_paths(root, &child_rel, out, depth + 1, max_depth);
+			}
+		} else if file_type.is_file() || file_type.is_symlink() {
+			out.push(child_rel);
+		}
 	}
-	classify_via_walker(root, paths)
 }
 
-/// Run `git ls-files --others --ignored --exclude-standard` in the
-/// workspace root. The combination lists paths that (a) aren't in
-/// the index and (b) match an exclude rule — i.e. the exact set git
-/// considers ignored for a rendering pass. `--directory` collapses
-/// fully-ignored directories to a single entry (`target/`) instead
-/// of enumerating every file below.
+/// Per-path git status for every interesting entry in the tree —
+/// changed tracked files, untracked files, collapsed-ignored
+/// directories, and deletions the frontend hasn't enumerated. See
+/// the trait docs for what `paths` is for.
 ///
-/// Returns `None` if the command can't run or exits non-zero — the
-/// caller falls back to the walker so a non-repo folder still gets a
-/// reasonable answer. Stderr is intentionally swallowed; git's
-/// "not a git repository" complaint is expected and not interesting.
-fn classify_via_git_ls_files(root: &Utf8Path) -> Option<std::collections::HashSet<String>> {
-	use std::collections::HashSet;
+/// Primary strategy inside a git repo: `git status --porcelain=v1`.
+/// That path respects the index, so a `.gitignore`-matching file
+/// that's already tracked is reported as clean (not faded) — the
+/// walker below can't make that distinction on its own because
+/// `ignore::WalkBuilder` has no view of the index.
+///
+/// Fallback (no git repo / `git` binary missing): walk the tree
+/// with the standard gitignore filters and flag anything the walker
+/// doesn't yield as `Ignored`. Good enough for pre-`git init`
+/// folders; loses the rest of the state machine (no add / modify /
+/// delete / untracked), which is fine because without git those
+/// concepts don't exist.
+fn classify_git_status(root: &Utf8Path, paths: &[String]) -> MoonResult<Vec<GitStatusEntry>> {
+	if let Some(entries) = classify_via_git_status(root) {
+		return Ok(entries);
+	}
+	classify_ignored_via_walker(root, paths)
+}
+
+/// Read `git status --porcelain=v1 -z --ignored=matching --untracked-files=all --no-renames`
+/// and turn the XY status bytes into our flat enum.
+///
+/// Flags, one more time because they're load-bearing:
+/// - `-z` uses `\0` as the record separator; no filenames get
+///   mangled by spaces, tabs, or quoting.
+/// - `--porcelain=v1` pins the format; the default porcelain is
+///   defined to be stable forever, but pinning is free.
+/// - `--ignored=matching` reports only entries that directly hit
+///   an ignore rule — meaning an ignored *directory* comes through
+///   as a single collapsed `target/` row. The default
+///   (`=traditional`) collapses the same way on its own, but
+///   _combined_ with `--untracked-files=all` it reverts to listing
+///   every file inside an ignored dir (git's own docs spell this
+///   out). `=matching` is the one mode that keeps ignored dirs
+///   collapsed while still expanding untracked dirs.
+/// - `--untracked-files=all` lists individual files inside new
+///   untracked directories rather than collapsing them to `foo/` —
+///   users expect every new file to appear in the tree.
+/// - `--no-renames` has git report renames as an atomic
+///   `delete(old) + add(new)`. Matches the tree's rendering
+///   contract and sidesteps the two-path `RN` porcelain record
+///   that'd otherwise complicate parsing.
+///
+/// Returns `None` if git fails to start or exits non-zero — the
+/// "not a git repository" complaint is expected on pre-init folders
+/// and triggers the walker fallback. Stderr is swallowed on purpose.
+fn classify_via_git_status(root: &Utf8Path) -> Option<Vec<GitStatusEntry>> {
 	use std::process::Command;
 
 	let output = Command::new("git")
 		.arg("-C")
 		.arg(root.as_std_path())
 		.args([
-			"ls-files",
+			"status",
+			"--porcelain=v1",
 			"-z",
-			"--others",
-			"--ignored",
-			"--exclude-standard",
-			"--directory",
+			"--ignored=matching",
+			"--untracked-files=all",
+			"--no-renames",
 		])
 		.output()
 		.ok()?;
 	if !output.status.success() {
 		return None;
 	}
-	let mut ignored: HashSet<String> = HashSet::new();
-	for raw in output.stdout.split(|b| *b == 0) {
-		if raw.is_empty() {
-			continue;
-		}
-		let Ok(s) = std::str::from_utf8(raw) else {
-			continue;
-		};
-		// `git ls-files --directory` emits `foo/` for directory
-		// entries. Insert both the slashed and bare form so the
-		// filter loop can match either convention without second-
-		// guessing what the caller sent.
-		let normalised = s.replace('\\', "/");
-		if let Some(bare) = normalised.strip_suffix('/') {
-			ignored.insert(bare.to_string());
-			ignored.insert(normalised);
-		} else {
-			ignored.insert(normalised);
-		}
-	}
-	Some(ignored)
+	Some(parse_porcelain_v1(&output.stdout))
 }
 
-fn classify_via_walker(root: &Utf8Path, paths: &[String]) -> MoonResult<Vec<String>> {
+/// Splits a `-z` porcelain v1 buffer into `GitStatusEntry`s.
+///
+/// Each record is `XY<space>path\0` where `X` is the index status
+/// and `Y` the worktree status. We map that to a single label with
+/// this priority:
+///
+/// 1. Either column is `D` → `Deleted` (dominates so stage-then-
+///    revert doesn't mask the on-disk state).
+/// 2. Either column is `A` → `Added` (staged-for-commit new file).
+/// 3. Either column is `M` / `T` → `Modified`.
+/// 4. `??` → `Untracked`.
+/// 5. `!!` → `Ignored`.
+///
+/// Anything else (`UU` conflicts, `C` copies we didn't disable) is
+/// silently dropped — conflicts surface in the SCM panel per the
+/// roadmap, and we don't want a stray `copy` byte to paint an
+/// arbitrary row.
+fn parse_porcelain_v1(buf: &[u8]) -> Vec<GitStatusEntry> {
+	let mut out = Vec::new();
+	// Porcelain records are `\0`-terminated but we can't just
+	// `split(b'\0')` because the `R` rename record emits _two_
+	// zero-separated paths; a scan keeps the grammar local in case
+	// we ever drop `--no-renames`.
+	let mut cursor = 0;
+	while cursor < buf.len() {
+		// Need at least `XY<space>` before a path can start.
+		if buf.len() - cursor < 3 {
+			break;
+		}
+		let x = buf[cursor] as char;
+		let y = buf[cursor + 1] as char;
+		cursor += 3;
+		let path_start = cursor;
+		while cursor < buf.len() && buf[cursor] != 0 {
+			cursor += 1;
+		}
+		let raw = &buf[path_start..cursor];
+		if cursor < buf.len() {
+			cursor += 1;
+		}
+		let Ok(path) = std::str::from_utf8(raw) else {
+			continue;
+		};
+		if path.is_empty() {
+			continue;
+		}
+		let Some(status) = map_porcelain_status(x, y) else {
+			continue;
+		};
+		// Git writes ignored dirs with a trailing `/`; every other
+		// status refers to a file and doesn't. Don't massage the
+		// path — the frontend's path convention already expects
+		// this.
+		out.push(GitStatusEntry {
+			path: path.replace('\\', "/"),
+			status,
+		});
+	}
+	out
+}
+
+fn map_porcelain_status(x: char, y: char) -> Option<GitFileStatus> {
+	if x == 'D' || y == 'D' {
+		return Some(GitFileStatus::Deleted);
+	}
+	if x == 'A' || y == 'A' {
+		return Some(GitFileStatus::Added);
+	}
+	if x == 'M' || y == 'M' || x == 'T' || y == 'T' {
+		return Some(GitFileStatus::Modified);
+	}
+	if x == '?' && y == '?' {
+		return Some(GitFileStatus::Untracked);
+	}
+	if x == '!' && y == '!' {
+		return Some(GitFileStatus::Ignored);
+	}
+	None
+}
+
+/// Walker fallback for folders without a usable `.git/`. The walker
+/// can only tell us "would git ignore this?" — it has no tracked /
+/// modified / untracked axis — so every entry we tag comes out
+/// `Ignored`. That's the honest answer: the other statuses require
+/// an index, which doesn't exist in this codepath.
+fn classify_ignored_via_walker(root: &Utf8Path, paths: &[String]) -> MoonResult<Vec<GitStatusEntry>> {
 	use ignore::WalkBuilder;
 	use std::collections::HashSet;
 
 	let mut visible: HashSet<String> = HashSet::new();
 	// `hidden(false)` keeps dotfiles like `.gitignore` itself in the
-	// visible set; `git_ignore` / `git_exclude` / `git_global` turn on
-	// the three ignore sources users expect. `ignore(true)` also
+	// visible set; `git_ignore` / `git_exclude` / `git_global` turn
+	// on the three ignore sources users expect. `ignore(true)` also
 	// respects `.ignore` files, which is the ripgrep convention and
-	// aligns with our own `search_files` command.
+	// aligns with our own `search_files` command. `require_git(false)`
+	// applies `.gitignore` even before `git init` — a folder with a
+	// `.gitignore` at its root still expects those patterns to fade.
 	let walker = WalkBuilder::new(root.as_std_path())
 		.hidden(false)
 		.git_ignore(true)
 		.git_exclude(true)
 		.git_global(true)
-		// Apply `.gitignore` even when `.git/` isn't present. A folder
-		// with a `.gitignore` at its root is a common pre-init
-		// scenario, and users still expect those patterns to fade the
-		// tree — the alternative (nothing fades until `git init` runs)
-		// is a surprising trap.
 		.require_git(false)
 		.ignore(true)
 		.parents(true)
@@ -453,59 +618,20 @@ fn classify_via_walker(root: &Utf8Path, paths: &[String]) -> MoonResult<Vec<Stri
 		}
 	}
 
-	let mut ignored = Vec::new();
+	let mut out = Vec::new();
 	for path in paths {
 		let trimmed = path.trim_end_matches('/');
 		if trimmed.is_empty() {
 			continue;
 		}
 		if !visible.contains(path.as_str()) && !visible.contains(trimmed) {
-			ignored.push(path.clone());
+			out.push(GitStatusEntry {
+				path: path.clone(),
+				status: GitFileStatus::Ignored,
+			});
 		}
 	}
-	Ok(ignored)
-}
-
-/// Reduce the "everything git considers ignored" set to just the
-/// paths the frontend asked about, matching either slash convention.
-///
-/// Directory matching is a little fuzzy on purpose: git reports
-/// ignored folders as `foo/` (via `--directory`), but if the frontend
-/// only asked about a file _inside_ that folder, we still want to
-/// flag it. We climb each input's ancestors and flag the whole path
-/// if any ancestor is in the ignored set.
-fn filter_to_inputs(ignored: &std::collections::HashSet<String>, paths: &[String]) -> Vec<String> {
-	let mut out = Vec::new();
-	for path in paths {
-		if is_path_ignored(ignored, path) {
-			out.push(path.clone());
-		}
-	}
-	out
-}
-
-fn is_path_ignored(ignored: &std::collections::HashSet<String>, path: &str) -> bool {
-	let trimmed = path.trim_end_matches('/');
-	if trimmed.is_empty() {
-		return false;
-	}
-	if ignored.contains(path) || ignored.contains(trimmed) {
-		return true;
-	}
-	// Walk ancestors: `target/debug/build` is ignored if `target/` or
-	// `target/debug/` is. Stops at the workspace root (no leading
-	// slash to worry about — paths are workspace-relative).
-	let mut cursor = trimmed;
-	while let Some(slash) = cursor.rfind('/') {
-		cursor = &cursor[..slash];
-		if cursor.is_empty() {
-			break;
-		}
-		if ignored.contains(cursor) || ignored.contains(&format!("{cursor}/")) {
-			return true;
-		}
-	}
-	false
+	Ok(out)
 }
 
 fn system_time_to_ms(t: SystemTime) -> Option<i64> {
@@ -615,7 +741,44 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn git_ignored_paths_matches_gitignore() {
+	async fn collect_paths_walks_recursively_and_skips_dotgit() {
+		let dir = TempDir::new().unwrap();
+		std::fs::create_dir(dir.path().join("src")).unwrap();
+		std::fs::create_dir(dir.path().join("src").join("nested")).unwrap();
+		std::fs::create_dir(dir.path().join(".git")).unwrap();
+		std::fs::write(dir.path().join(".git").join("HEAD"), "ref").unwrap();
+		std::fs::write(dir.path().join("README.md"), "hi").unwrap();
+		std::fs::write(dir.path().join("src").join("lib.rs"), "").unwrap();
+		std::fs::write(dir.path().join("src").join("nested").join("deep.rs"), "").unwrap();
+
+		let paths = host(&dir).collect_paths(6).await.unwrap();
+		let set: std::collections::HashSet<_> = paths.into_iter().collect();
+		assert!(set.contains("README.md"), "got {set:?}");
+		assert!(set.contains("src/"), "got {set:?}");
+		assert!(set.contains("src/lib.rs"), "got {set:?}");
+		assert!(set.contains("src/nested/"), "got {set:?}");
+		assert!(set.contains("src/nested/deep.rs"), "got {set:?}");
+		// `.git/` and everything inside it stays off the tree.
+		assert!(!set.iter().any(|p| p.starts_with(".git")), "got {set:?}");
+	}
+
+	#[tokio::test]
+	async fn collect_paths_respects_max_depth() {
+		let dir = TempDir::new().unwrap();
+		std::fs::create_dir_all(dir.path().join("a").join("b").join("c")).unwrap();
+		std::fs::write(dir.path().join("a").join("b").join("c").join("deep.txt"), "").unwrap();
+
+		// depth=0 → only the immediate children are enumerated;
+		// `a/` is listed but `a/b/` isn't recursed.
+		let paths = host(&dir).collect_paths(0).await.unwrap();
+		let set: std::collections::HashSet<_> = paths.into_iter().collect();
+		assert!(set.contains("a/"), "got {set:?}");
+		assert!(!set.contains("a/b/"), "got {set:?}");
+		assert!(!set.contains("a/b/c/deep.txt"), "got {set:?}");
+	}
+
+	#[tokio::test]
+	async fn git_status_entries_walker_fallback_flags_ignored() {
 		let dir = TempDir::new().unwrap();
 		std::fs::write(dir.path().join(".gitignore"), "target/\nsecrets.txt\n").unwrap();
 		std::fs::create_dir(dir.path().join("target")).unwrap();
@@ -633,26 +796,113 @@ mod tests {
 			"target/".to_string(),
 			"target/binary".to_string(),
 		];
-		let ignored = host(&dir).git_ignored_paths(&input).await.unwrap();
-		let ignored: std::collections::HashSet<_> = ignored.into_iter().collect();
-		assert!(ignored.contains("secrets.txt"));
-		assert!(ignored.contains("target/"));
-		assert!(ignored.contains("target/binary"));
-		assert!(!ignored.contains("README.md"));
-		assert!(!ignored.contains("src/"));
-		assert!(!ignored.contains("src/lib.rs"));
+		let entries = host(&dir).git_status_entries(&input).await.unwrap();
+		let ignored: std::collections::HashSet<_> = entries
+			.iter()
+			.filter(|e| matches!(e.status, GitFileStatus::Ignored))
+			.map(|e| e.path.clone())
+			.collect();
+		assert!(ignored.contains("secrets.txt"), "got {ignored:?}");
+		assert!(ignored.contains("target/"), "got {ignored:?}");
+		assert!(ignored.contains("target/binary"), "got {ignored:?}");
+		assert!(!ignored.contains("README.md"), "got {ignored:?}");
+		assert!(!ignored.contains("src/"), "got {ignored:?}");
+		assert!(!ignored.contains("src/lib.rs"), "got {ignored:?}");
+		// No git repo → nothing else should come back with a non-
+		// ignored status; the walker can't synthesize add/modify.
+		let non_ignored: Vec<_> = entries
+			.iter()
+			.filter(|e| !matches!(e.status, GitFileStatus::Ignored))
+			.collect();
+		assert!(
+			non_ignored.is_empty(),
+			"walker should only report ignored, got {non_ignored:?}"
+		);
 	}
 
-	// A file that matches a `.gitignore` pattern but has already been
-	// added to the index (think `.env.example` under a `.env*` rule)
-	// must _not_ render as ignored — that's what makes the index-aware
-	// `git ls-files` path exist in the first place. The walker fallback
-	// wouldn't catch this, which is why we skip it when git isn't on
-	// PATH (CI's `git` is always available, so the assertion holds).
 	#[tokio::test]
-	async fn git_ignored_paths_respects_index() {
+	async fn git_status_entries_reports_all_porcelain_states() {
 		let Some(git) = which_git() else {
-			eprintln!("git not on PATH — skipping index-aware gitignore test");
+			eprintln!("git not on PATH — skipping porcelain-driven git status test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		// Initial repo: a tracked file we'll modify, a tracked file
+		// we'll delete, and a `.gitignore`.
+		std::fs::write(dir.path().join(".gitignore"), "target/\n.env\n").unwrap();
+		std::fs::write(dir.path().join("tracked.txt"), "one\n").unwrap();
+		std::fs::write(dir.path().join("to_delete.txt"), "gone\n").unwrap();
+		std::fs::write(dir.path().join("README.md"), "hi\n").unwrap();
+
+		run_git(&git, dir.path(), &["init", "-q"]);
+		run_git(&git, dir.path(), &["config", "user.email", "test@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "test"]);
+		run_git(
+			&git,
+			dir.path(),
+			&["add", ".gitignore", "tracked.txt", "to_delete.txt", "README.md"],
+		);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "init"]);
+
+		// Now make each porcelain state happen exactly once:
+		//   - tracked.txt: modify worktree → Modified
+		//   - to_delete.txt: `rm` worktree → Deleted
+		//   - staged.txt: create + `git add` → Added
+		//   - new.txt: create, no `git add` → Untracked
+		//   - target/: ignored dir with content → Ignored
+		//   - .env: ignored file → Ignored
+		std::fs::write(dir.path().join("tracked.txt"), "two\n").unwrap();
+		std::fs::remove_file(dir.path().join("to_delete.txt")).unwrap();
+		std::fs::write(dir.path().join("staged.txt"), "staged\n").unwrap();
+		run_git(&git, dir.path(), &["add", "staged.txt"]);
+		std::fs::write(dir.path().join("new.txt"), "new\n").unwrap();
+		std::fs::create_dir(dir.path().join("target")).unwrap();
+		std::fs::write(dir.path().join("target").join("out"), "").unwrap();
+		std::fs::write(dir.path().join(".env"), "SECRET=1\n").unwrap();
+
+		let entries = host(&dir).git_status_entries(&[]).await.unwrap();
+		let by_path: std::collections::HashMap<String, GitFileStatus> =
+			entries.iter().map(|e| (e.path.clone(), e.status)).collect();
+
+		assert_eq!(
+			by_path.get("tracked.txt"),
+			Some(&GitFileStatus::Modified),
+			"got {by_path:?}"
+		);
+		assert_eq!(
+			by_path.get("to_delete.txt"),
+			Some(&GitFileStatus::Deleted),
+			"got {by_path:?}"
+		);
+		assert_eq!(
+			by_path.get("staged.txt"),
+			Some(&GitFileStatus::Added),
+			"got {by_path:?}"
+		);
+		assert_eq!(
+			by_path.get("new.txt"),
+			Some(&GitFileStatus::Untracked),
+			"got {by_path:?}"
+		);
+		// Ignored directory collapses to a single `target/` entry;
+		// individual children aren't reported separately.
+		assert_eq!(by_path.get("target/"), Some(&GitFileStatus::Ignored), "got {by_path:?}");
+		assert_eq!(by_path.get(".env"), Some(&GitFileStatus::Ignored), "got {by_path:?}");
+		// Clean tracked files don't show up at all — keeps the
+		// payload small (big repos can have tens of thousands of
+		// clean entries).
+		assert!(!by_path.contains_key("README.md"), "got {by_path:?}");
+		assert!(!by_path.contains_key(".gitignore"), "got {by_path:?}");
+	}
+
+	// A file that matches a `.gitignore` pattern but is tracked must
+	// not render as ignored. `.env.example` under a `.env*` rule is
+	// the canonical real-world case. Needs `git` on PATH (CI always
+	// does).
+	#[tokio::test]
+	async fn git_status_entries_respects_index() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping index-aware git status test");
 			return;
 		};
 		let dir = TempDir::new().unwrap();
@@ -665,28 +915,17 @@ mod tests {
 		run_git(&git, dir.path(), &["config", "user.email", "test@example.com"]);
 		run_git(&git, dir.path(), &["config", "user.name", "test"]);
 		run_git(&git, dir.path(), &["add", ".gitignore", "README.md"]);
-		// `.env.example` matches the `.env*` rule; `-f` force-adds it.
-		// Mirrors the real-world "I want the template file in git but
-		// keep .env out" pattern we're trying to special-case.
 		run_git(&git, dir.path(), &["add", "-f", ".env.example"]);
 		run_git(&git, dir.path(), &["commit", "-q", "-m", "init"]);
 
-		let input = vec![
-			".env".to_string(),
-			".env.example".to_string(),
-			"README.md".to_string(),
-			".gitignore".to_string(),
-		];
-		let ignored = host(&dir).git_ignored_paths(&input).await.unwrap();
-		let ignored: std::collections::HashSet<_> = ignored.into_iter().collect();
-		// `.env` still matches the rule and isn't tracked → ignored.
-		assert!(ignored.contains(".env"), "got {ignored:?}");
-		// `.env.example` matches the rule but is tracked → NOT ignored.
-		// This is the whole reason we prefer `git ls-files` over the
-		// pattern-only walker.
-		assert!(!ignored.contains(".env.example"), "got {ignored:?}");
-		assert!(!ignored.contains("README.md"), "got {ignored:?}");
-		assert!(!ignored.contains(".gitignore"), "got {ignored:?}");
+		let entries = host(&dir).git_status_entries(&[]).await.unwrap();
+		let by_path: std::collections::HashMap<String, GitFileStatus> =
+			entries.iter().map(|e| (e.path.clone(), e.status)).collect();
+		assert_eq!(by_path.get(".env"), Some(&GitFileStatus::Ignored), "got {by_path:?}");
+		// Tracked — not ignored, not dirty → absent from the map.
+		assert!(!by_path.contains_key(".env.example"), "got {by_path:?}");
+		assert!(!by_path.contains_key("README.md"), "got {by_path:?}");
+		assert!(!by_path.contains_key(".gitignore"), "got {by_path:?}");
 	}
 
 	fn which_git() -> Option<std::path::PathBuf> {

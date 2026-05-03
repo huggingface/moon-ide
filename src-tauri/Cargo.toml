@@ -30,6 +30,7 @@ tauri-plugin-window-state = "2.4"
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 camino = { workspace = true }
+notify = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

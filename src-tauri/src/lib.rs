@@ -1,6 +1,7 @@
 //! Tauri shell for moon-ide. Wires Tauri commands to `moon-core`.
 
 mod commands;
+mod fs_watcher;
 mod shutdown;
 mod slack_poller;
 mod state;
@@ -35,13 +36,14 @@ pub fn run() {
 			commands::workspace::workspace_active,
 			commands::workspace::workspace_list,
 			commands::fs::fs_read_dir,
+			commands::fs::fs_collect_paths,
 			commands::fs::fs_read_file,
 			commands::fs::fs_write_file,
 			commands::fs::fs_stat,
 			commands::fs::fs_absolute_path,
 			commands::fs::fs_trash,
 			commands::fs::fs_delete,
-			commands::fs::fs_git_ignored_paths,
+			commands::fs::fs_git_status_entries,
 			commands::search::search_files,
 			commands::search::search_content,
 			commands::app_state::app_state_load,
@@ -121,7 +123,13 @@ pub fn run() {
 				config_dir.clone(),
 			);
 			let slack_state = state::SlackState::new(client_cell, poller.clone());
-			let state = AppState::new(config_dir.clone(), workspaces_dir, slack_state);
+			// Spawn the fs watcher before restoring workspace state
+			// so the `set_root` below can point it at the active
+			// folder as part of the same synchronous startup path —
+			// avoids a "welcome screen with a watcher attached to
+			// nothing" in-between state.
+			let fs_watcher = fs_watcher::spawn(app.handle().clone());
+			let state = AppState::new(config_dir.clone(), workspaces_dir, slack_state, fs_watcher);
 
 			// Live OS colour-scheme tracking (Linux only — on macOS
 			// and Windows the webview's own `onThemeChanged` fires).
@@ -164,6 +172,13 @@ pub fn run() {
 								active = ?snap.active_folder,
 								"restored workspace folders"
 							);
+							// Point the fs watcher at the restored
+							// active folder so the tree picks up
+							// external edits from the first paint
+							// — not just after the first folder
+							// switch.
+							let active_root = snap.active_folder.as_ref().map(std::path::PathBuf::from);
+							state.fs_watcher.set_root(active_root);
 						}
 
 						// Seed the poller from persisted Slack inputs

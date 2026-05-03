@@ -10,6 +10,7 @@ import {
 	type AppState,
 	type EditorConfig,
 	type FolderSession,
+	type GitStatusEntry,
 	type SplitSide,
 	type SystemTheme,
 	type ThemeMode,
@@ -592,6 +593,12 @@ class WorkspaceState {
 		// the first `+ Terminal` click responds without bus-bind
 		// latency.
 		void terminal.wireRuntime();
+		// Refresh the file tree + git status when the user comes
+		// back to the window. Covers the common "I ran `git
+		// checkout`/`stash pop` in an external terminal" workflow
+		// without requiring an fs-watcher (Phase 5). Idempotent:
+		// bound once, survives HMR.
+		void this.bindFolderChangeRefresh();
 
 		const ws = this.workspace;
 		const session = state.last_session;
@@ -764,14 +771,18 @@ class WorkspaceState {
 		}
 		this.loadingPaths = true;
 		try {
-			const collected: string[] = [];
-			await collectPaths('', collected, 0);
+			// One IPC call, full recursive walk backend-side. The
+			// previous implementation fired one `readDir` per
+			// directory which at Tauri's per-call framing cost
+			// dominated refresh latency (the walk itself is a
+			// sub-hundred-ms `read_dir` storm).
+			const collected = await ipc.fs.collectPaths(MAX_TREE_DEPTH);
 			this.paths = collected;
-			// Classify gitignore status in the background — the tree can
-			// paint before we know the answer. Pierre reconciles the
-			// `gitStatus` update in place, so late-arriving entries just
-			// fade the affected rows without a reflow.
-			void this.refreshGitIgnored(collected);
+			// Classify git status in the background — the tree can
+			// paint before we know the answer. Pierre reconciles
+			// `setGitStatus` updates in place, so late-arriving
+			// entries fade / tint the affected rows without a reflow.
+			void this.refreshGitStatus(collected);
 		} catch (err) {
 			this.flash(`Failed to read folder: ${formatError(err)}`);
 		} finally {
@@ -779,24 +790,106 @@ class WorkspaceState {
 		}
 	}
 
-	// Workspace-relative paths (with the same trailing-`/`-for-
-	// directories convention as `paths`) that the backend flagged as
-	// gitignored. FileTree.svelte reads this as a `Set` and feeds it
-	// into Pierre Trees' `setGitStatus` API. Empty on a workspace with
-	// no `.gitignore` rules.
-	gitIgnoredPaths = $state<readonly string[]>([]);
+	/**
+	 * Per-path git classification, as reported by
+	 * `WorkspaceHost::git_status_entries`. Covers added / modified /
+	 * deleted / untracked / ignored. `FileTree.svelte` hands this
+	 * straight to Pierre's `setGitStatus`, and separately walks it
+	 * for `Deleted` rows to merge back into the visible path list.
+	 */
+	gitStatusEntries = $state<readonly GitStatusEntry[]>([]);
 
-	private async refreshGitIgnored(paths: readonly string[]) {
+	private async refreshGitStatus(paths: readonly string[]) {
 		try {
-			const ignored = await ipc.fs.gitIgnoredPaths([...paths]);
-			this.gitIgnoredPaths = ignored;
+			this.gitStatusEntries = await ipc.fs.gitStatusEntries([...paths]);
 		} catch {
-			// Non-fatal — we'd rather leave the tree unfaded than noise
-			// up the toast for a git probe failure. If git is absent the
-			// command still succeeds (returns []), so the common case
-			// where this throws is a legitimate filesystem error worth
+			// Non-fatal — we'd rather leave the tree untinted than
+			// noise up the toast for a git probe failure. If git is
+			// absent the command still succeeds (returns []), so
+			// throwing here is a legitimate filesystem error worth
 			// ignoring for tree cosmetics.
-			this.gitIgnoredPaths = [];
+			this.gitStatusEntries = [];
+		}
+	}
+
+	/**
+	 * Re-enumerate the active folder's paths and re-classify git
+	 * status against them. A full re-walk is deliberate: a purely-
+	 * git-side refresh would miss files the user restored on disk
+	 * (`git checkout HEAD -- foo`) because they wouldn't appear in
+	 * the tree's `paths` list until `collectPaths` runs again.
+	 *
+	 * Cheap enough to call on window-focus events and the palette
+	 * command — the walk is bounded by `MAX_DEPTH` and
+	 * `collectPaths` already runs on every folder open without
+	 * complaint. If it ever grows hot enough to matter, the next
+	 * step is an fs-watcher (roadmap Phase 5) rather than hand-
+	 * written diffing here.
+	 *
+	 * Collapses with an in-flight walk — firing two focus events
+	 * back-to-back (alt-tab flurry) doesn't stack two concurrent
+	 * recursions.
+	 */
+	async refreshActiveFolder(): Promise<void> {
+		if (!this.activeFolder) {
+			return;
+		}
+		if (this.loadingPaths) {
+			return;
+		}
+		await this.loadPaths();
+	}
+
+	/** Set to true after `bindFolderChangeRefresh` installs the
+	 * fs-watch + focus listeners, so a subsequent HMR-driven
+	 * `restoreAppState` doesn't stack duplicate handlers. */
+	#folderRefreshWired = false;
+
+	/**
+	 * Wire the "something changed → refresh the active folder"
+	 * hooks. Two independent triggers, each covers a case the
+	 * other doesn't:
+	 *
+	 * - `fs:changed` Tauri event: the backend's `notify` watcher
+	 *   fires this on debounced filesystem activity inside the
+	 *   active folder. Covers the integrated terminal (where
+	 *   window focus never changes) and background processes
+	 *   (formatters, build output) changing files while moon-ide
+	 *   stays focused.
+	 * - Window focus: fires when the user alt-tabs back in. Covers
+	 *   the `fs:changed` fallback path — on a folder with too many
+	 *   files for inotify, or when the watcher fails to attach,
+	 *   this is the only refresh signal we'll get. Also covers
+	 *   NFS / SSHFS / Docker-bind-mount scenarios where notify
+	 *   can't observe changes at all.
+	 *
+	 * Both feed the same `refreshActiveFolder`, which internally
+	 * coalesces with an in-flight walk.
+	 */
+	async bindFolderChangeRefresh(): Promise<void> {
+		if (this.#folderRefreshWired) {
+			return;
+		}
+		this.#folderRefreshWired = true;
+		try {
+			await listen('fs:changed', () => {
+				void this.refreshActiveFolder();
+			});
+		} catch {
+			// Event bus unavailable (tests / non-Tauri). Focus
+			// listener still has a shot below.
+		}
+		try {
+			const win = getCurrentWindow();
+			await win.onFocusChanged(({ payload: focused }) => {
+				if (!focused) {
+					return;
+				}
+				void this.refreshActiveFolder();
+			});
+		} catch {
+			// No Tauri window. Palette command is the last
+			// resort.
 		}
 	}
 
@@ -1742,26 +1835,14 @@ function resolveSystemTheme(theme: SystemTheme): boolean {
 	return theme === 'dark';
 }
 
-async function collectPaths(rel: string, out: string[], depth: number): Promise<void> {
-	// We cap depth so very deep trees can't lock the UI on first load. Dirs beyond the
-	// cap are still listed at their level but not recursed into. Phase 1 will add lazy
-	// expansion to remove this cap.
-	const MAX_DEPTH = 6;
-	const path = rel === '' ? '.' : rel;
-	const entries = await ipc.fs.readDir(path);
-	for (const entry of entries) {
-		if (entry.kind === 'dir') {
-			const dirPath = rel === '' ? entry.name : `${rel}/${entry.name}`;
-			out.push(dirPath + '/');
-			if (depth < MAX_DEPTH) {
-				await collectPaths(dirPath, out, depth + 1);
-			}
-		} else if (entry.kind === 'file' || entry.kind === 'symlink') {
-			const filePath = rel === '' ? entry.name : `${rel}/${entry.name}`;
-			out.push(filePath);
-		}
-	}
-}
+/**
+ * How deep `fs_collect_paths` recurses. Cap exists so very deep
+ * trees can't stall the UI on first load or on refresh. Entries
+ * beyond the cap are listed at their level but their children
+ * aren't enumerated — Phase 1 will add lazy expansion to remove
+ * this cap, at which point the constant goes away.
+ */
+const MAX_TREE_DEPTH = 6;
 
 function basename(path: string): string {
 	const i = path.lastIndexOf('/');

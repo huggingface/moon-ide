@@ -20,7 +20,7 @@ The full phased plan. Update the **Status** column as phases land.
 | 2.5   | Multi-folder workspace UX       | scaffolded  |
 | 3     | Terminal                        | scaffolded  |
 | 4     | LSP                             | scaffolded  |
-| 5     | Git layer                       | scaffolded  |
+| 5     | Git layer                       | in progress |
 | 6     | ACP integration                 | scaffolded  |
 | 7     | Multi-repo + cross-repo queries | scaffolded  |
 | 8     | Linting / formatting            | scaffolded  |
@@ -98,6 +98,14 @@ Tree behavior: gitignored directories are **collapsed by default** (and faded), 
 Refresh on fs-watch events plus an explicit `setGitStatus` call after any moon-ide-issued git op. Once the change reaches a commit, the markers and ghost rows disappear in the same refresh tick — no stale state surviving across commits.
 
 Until this phase lands, the file tree shows everything except the `.git/` directory itself. Dotfiles like `.editorconfig` and `.husky/` are real working files and stay visible by design.
+
+**What has landed so far** (see `specs/test-plans/0020-*.md` and `0021-*.md`):
+
+- Tree markers via Pierre's `gitStatus` for added / modified / deleted / untracked / ignored, backed by `git status --porcelain=v1` with a `WalkBuilder` fallback for non-repo folders.
+- Deleted rows stay visible by union-ing git's `deleted` set into the tree's `paths` array, matching the contract above.
+- Auto-refresh: a `notify::RecommendedWatcher` rooted at the active folder emits debounced `fs:changed` Tauri events; window-focus events are a second-class fallback for when inotify is exhausted or the folder lives on NFS / SSHFS. Palette has "Refresh File Tree" as a manual escape hatch for the integrated terminal.
+
+**Still outstanding for this phase**: blame (CM6 inline decoration), diff view (`@pierre/diffs`), the SCM panel, conflict markers, and palette-driven git actions like `git checkout HEAD -- <path>` to restore a deleted row.
 
 ## Phase 6 — ACP
 

@@ -2669,6 +2669,7 @@ dependencies = [
  "moon-protocol",
  "moon-slack",
  "moon-terminal",
+ "notify",
  "serde",
  "serde_json",
  "tauri",

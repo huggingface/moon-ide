@@ -188,6 +188,19 @@ export const builtInCommands: Command[] = [
 		run: () => reloadWindow(),
 	},
 	{
+		id: 'files.refreshTree',
+		// Re-enumerate the active folder's files and re-classify git
+		// status. The window-focus auto-refresh covers changes made
+		// in an external terminal, but the integrated terminal
+		// doesn't trigger focus events, so commands like `git
+		// checkout HEAD -- foo` run inside the IDE need this
+		// explicit nudge to update the tree's badges and ghost
+		// rows. No shortcut by default — the refresh is
+		// usually unnecessary.
+		title: 'Refresh File Tree',
+		run: () => workspace.refreshActiveFolder(),
+	},
+	{
 		id: 'chat.togglePanel',
 		// Wording flips with panel state — same diagnostic value as
 		// the theme toggle, and means the user knows which way the

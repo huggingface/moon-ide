@@ -16,7 +16,9 @@ use crate::state::AppState;
 pub async fn workspace_open_local(state: State<'_, AppState>, path: String) -> Result<WorkspaceRecord, MoonError> {
 	let path = Utf8PathBuf::from(path);
 	state.workspaces.add_folder(path).await?;
-	Ok(state.workspaces.snapshot().await)
+	let snap = state.workspaces.snapshot().await;
+	repoint_fs_watcher(&state, &snap);
+	Ok(snap)
 }
 
 /// Drop a folder from the workspace. If it was the active folder,
@@ -25,7 +27,9 @@ pub async fn workspace_open_local(state: State<'_, AppState>, path: String) -> R
 #[tauri::command]
 pub async fn workspace_remove_folder(state: State<'_, AppState>, path: String) -> Result<WorkspaceRecord, MoonError> {
 	state.workspaces.remove_folder(&path).await?;
-	Ok(state.workspaces.snapshot().await)
+	let snap = state.workspaces.snapshot().await;
+	repoint_fs_watcher(&state, &snap);
+	Ok(snap)
 }
 
 /// Set the active folder. Errors if `path` isn't already a member of
@@ -37,7 +41,18 @@ pub async fn workspace_set_active_folder(
 	path: String,
 ) -> Result<WorkspaceRecord, MoonError> {
 	state.workspaces.set_active_folder(&path).await?;
-	Ok(state.workspaces.snapshot().await)
+	let snap = state.workspaces.snapshot().await;
+	repoint_fs_watcher(&state, &snap);
+	Ok(snap)
+}
+
+/// Keep the filesystem watcher aimed at whichever folder is
+/// currently active. No-ops when the active folder hasn't changed
+/// (the watcher itself dedupes). Called after every command that
+/// mutates the workspace shape.
+fn repoint_fs_watcher(state: &AppState, snap: &WorkspaceRecord) {
+	let active = snap.active_folder.as_ref().map(std::path::PathBuf::from);
+	state.fs_watcher.set_root(active);
 }
 
 /// Snapshot the current workspace (singleton until Phase 7).

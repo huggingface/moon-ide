@@ -1,7 +1,15 @@
 <script lang="ts">
+	// Heads up: Svelte's compiler lexes this file's script body as
+	// raw text looking for a closing script tag, and it will mistake
+	// any stringified HTML tag — even in a code comment or template
+	// literal — for one, bailing out with "script was left open".
+	// If you need to reference an HTML element by name in prose,
+	// write it out (e.g. "the style element") rather than wrapping
+	// its tag name in angle brackets.
 	import { onMount, tick, untrack } from 'svelte';
-	import { FileTree } from '@pierre/trees';
+	import { FileTree, type GitStatusEntry as PierreGitStatusEntry } from '@pierre/trees';
 	import { workspace } from '../state.svelte';
+	import type { GitStatusEntry } from '../protocol';
 
 	let mount: HTMLDivElement;
 	let tree: FileTree | undefined;
@@ -11,7 +19,10 @@
 			return;
 		}
 		tree = new FileTree({
-			paths: untrack(() => workspace.paths),
+			paths: mergedPathsWithDeletions(
+				untrack(() => workspace.paths),
+				untrack(() => workspace.gitStatusEntries),
+			),
 			flattenEmptyDirectories: true,
 			// Start every folder collapsed. The previous default
 			// (`initialExpansion: 1`) eagerly opened gitignored folders
@@ -22,7 +33,7 @@
 			// simpler default; users open what they actually want.
 			initialExpansion: 0,
 			search: true,
-			gitStatus: toGitStatusEntries(untrack(() => workspace.gitIgnoredPaths)),
+			gitStatus: toTrackedEntries(untrack(() => workspace.gitStatusEntries)),
 			onSelectionChange: (selectedPaths) => {
 				if (selectedPaths.length === 0) {
 					return;
@@ -44,50 +55,252 @@
 			},
 		});
 		tree.render({ containerWrapper: mount });
+		applyGitOverlay(
+			tree,
+			untrack(() => workspace.gitStatusEntries),
+		);
 		return () => {
 			tree?.cleanUp();
 			tree = undefined;
 		};
 	});
 
-	// Feed gitignore status into Pierre whenever the backend classifier
-	// returns a new list. Pierre folds this into its `data-item-git-
-	// status="ignored"` attribute on rows, which fades both the icon
-	// and the label via its built-in styles.
+	// Feed git status into Pierre whenever the backend classifier
+	// returns a new list. We strip `ignored` entries first (see
+	// `toTrackedEntries`) so Pierre's internal `directoriesWithChanges`
+	// bubble only reflects real edits — otherwise every ancestor of
+	// an ignored file (e.g. `front/` above `front/node_modules/`)
+	// lights up with a dot that has no actionable meaning. Ignored
+	// fading is re-applied via `applyGitOverlay` below.
 	$effect(() => {
-		const ignored = workspace.gitIgnoredPaths;
+		const entries = workspace.gitStatusEntries;
 		if (!tree) {
 			return;
 		}
-		tree.setGitStatus(toGitStatusEntries(ignored));
+		tree.setGitStatus(toTrackedEntries(entries));
+		applyGitOverlay(tree, entries);
 	});
 
-	function toGitStatusEntries(ignored: readonly string[]) {
-		return ignored.map((path) => ({ path, status: 'ignored' as const }));
+	// Pierre's `gitStatus` prop treats every entry the same way:
+	// set `data-item-git-status` on the matching row, *and* walk each
+	// entry's ancestors to fill `directoriesWithChanges`. That second
+	// pass is what puts a dot next to `front/` just because
+	// `front/node_modules/` is in the list. We don't get to opt
+	// individual entries out of the ancestor pass, so we opt the
+	// whole `ignored` class out of Pierre's gitStatus and re-create
+	// the fade ourselves via `applyGitOverlay` below.
+	function toTrackedEntries(entries: readonly GitStatusEntry[]): readonly PierreGitStatusEntry[] {
+		return entries.filter((entry) => entry.status !== 'ignored');
 	}
 
-	// Reactively reset paths when the workspace path list changes, then
-	// replay the active path so Save As (which mutates `activePath`
-	// *before* the new file lands in `paths`, with an `await` between
-	// the two) doesn't end up with the new row unselected, the keyboard
-	// cursor stuck on row 0, and the list scrolled to the top.
+	type TrackedStatus = 'added' | 'modified' | 'deleted' | 'untracked';
+
+	// Severity of a subtree's "worst" change. Mirrors Pierre's own
+	// ordering of status tokens so the dot color on a folder matches
+	// what the user would see if they opened the folder and scanned
+	// the rows.
+	const SEVERITY: Record<TrackedStatus, number> = {
+		deleted: 4,
+		modified: 3,
+		added: 2,
+		untracked: 1,
+	};
+
+	// Recompute the shadow-DOM overlay: ignored fade + per-folder dot
+	// color. Runs on every git-status refresh; the injected
+	// stylesheet is re-used so subsequent updates are a single
+	// textContent swap.
+	function applyGitOverlay(local: FileTree, entries: readonly GitStatusEntry[]) {
+		const host = local.getFileTreeContainer();
+		const shadow = host?.shadowRoot;
+		if (!shadow) {
+			return;
+		}
+		const css = buildOverlayCss(entries);
+		let el = shadow.querySelector('style[data-moon-git-overlay]') as HTMLStyleElement | null;
+		if (!el) {
+			el = document.createElement('style');
+			el.setAttribute('data-moon-git-overlay', '');
+			shadow.appendChild(el);
+		}
+		if (el.textContent !== css) {
+			el.textContent = css;
+		}
+	}
+
+	function buildOverlayCss(entries: readonly GitStatusEntry[]): string {
+		// Pierre materializes directory paths with a trailing slash
+		// (`materializeNodePath` in `path-store/src/canonical.ts`
+		// appends `/` for every directory node), so `data-item-path`
+		// reads `target/` for folder rows and `target/foo.rs` for
+		// files. Our selectors have to match that verbatim — earlier
+		// iterations stripped the slash and silently missed the
+		// folder row itself (plus every ancestor dot).
+		const ignoredFiles: string[] = [];
+		const ignoredDirs: string[] = [];
+		// `folderSeverity` is keyed by the ancestor's `data-item-path`
+		// form (with trailing slash) and stores the worst status
+		// found anywhere below it. Pierre still carries its
+		// `[data-item-contains-git-change="true"]` flag on those
+		// folders; we only override the color the built-in dot picks
+		// up from CSS custom properties.
+		const folderSeverity = new Map<string, TrackedStatus>();
+		for (const entry of entries) {
+			if (entry.path.length === 0) {
+				continue;
+			}
+			if (entry.status === 'ignored') {
+				if (entry.path.endsWith('/')) {
+					ignoredDirs.push(entry.path);
+				} else {
+					ignoredFiles.push(entry.path);
+				}
+				continue;
+			}
+			const stripped = entry.path.replace(/\/+$/, '');
+			const segments = stripped.split('/');
+			let cumulative = '';
+			for (let i = 0; i < segments.length - 1; i++) {
+				const seg = segments[i] ?? '';
+				cumulative = cumulative === '' ? seg : `${cumulative}/${seg}`;
+				const key = `${cumulative}/`;
+				const existing = folderSeverity.get(key);
+				if (existing === undefined || SEVERITY[entry.status] > SEVERITY[existing]) {
+					folderSeverity.set(key, entry.status);
+				}
+			}
+		}
+
+		const rules: string[] = [];
+
+		// Fade rules replicate Pierre's built-in ignored styling —
+		// muted icon color plus 50% opacity on the icon cell — so the
+		// swap is invisible to the eye. Chevrons are excluded so
+		// expand/collapse arrows on ignored folders stay legible. The
+		// prefix selector (`^=` on a directory path ending in `/`)
+		// fades every descendant row in a single rule.
+		if (ignoredFiles.length > 0 || ignoredDirs.length > 0) {
+			const rowSelectors: string[] = [];
+			for (const path of ignoredFiles) {
+				rowSelectors.push(`[data-item-path="${escapeAttr(path)}"]`);
+			}
+			for (const dir of ignoredDirs) {
+				rowSelectors.push(`[data-item-path="${escapeAttr(dir)}"]`);
+				rowSelectors.push(`[data-item-path^="${escapeAttr(dir)}"]`);
+			}
+			const rowSelector = rowSelectors.join(', ');
+			const iconSelector = rowSelectors.map((s) => `${s} > [data-item-section="icon"]`).join(', ');
+			const glyphSelector = rowSelectors
+				.map((s) => `${s} > [data-item-section="icon"] > :where(:not([data-icon-name="file-tree-icon-chevron"]))`)
+				.join(', ');
+			rules.push(`${rowSelector} {\n\t--trees-item-git-status-color: var(--trees-git-ignored-color);\n}`);
+			rules.push(`${iconSelector} {\n\topacity: 0.5;\n}`);
+			rules.push(`${glyphSelector} {\n\tcolor: var(--trees-item-git-status-color);\n}`);
+		}
+
+		// One rule per status bucket so we emit at most four rules
+		// for the per-folder dot color. Unlayered rules beat Pierre's
+		// `@layer base` default — which hard-codes the modified color
+		// — because unlayered rules always win over layered ones at
+		// equal specificity.
+		const buckets = new Map<TrackedStatus, string[]>();
+		for (const [folder, status] of folderSeverity) {
+			const list = buckets.get(status) ?? [];
+			list.push(folder);
+			buckets.set(status, list);
+		}
+		for (const [status, folders] of buckets) {
+			const selector = folders
+				.map(
+					(f) =>
+						`[data-item-path="${escapeAttr(f)}"][data-item-contains-git-change="true"] > [data-item-section="git"]`,
+				)
+				.join(', ');
+			rules.push(`${selector} {\n\tcolor: var(--trees-git-${status}-color);\n}`);
+		}
+
+		return rules.join('\n\n');
+	}
+
+	// Escape a string for use inside a CSS attribute value in double
+	// quotes. `CSS.escape` is for identifiers (too aggressive for
+	// attribute values — it would escape `/` and `.` which are legal
+	// inside `"…"`), so just neutralise the two characters that would
+	// actually break out of the quoted literal.
+	function escapeAttr(value: string): string {
+		return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+	}
+
+	// Deleted files have no filesystem entry — they only exist in
+	// git's view of the world — so `collectPaths` on the backend
+	// can't surface them. Union them in so Pierre renders ghost rows
+	// at the deleted path; its `deleted` status styling handles the
+	// strikethrough. Added/modified/untracked paths come from the
+	// filesystem walk already, so they don't need to be merged here.
+	function mergedPathsWithDeletions(paths: readonly string[], entries: readonly GitStatusEntry[]): string[] {
+		const present = new Set(paths);
+		const out = paths.slice();
+		for (const entry of entries) {
+			if (entry.status !== 'deleted') {
+				continue;
+			}
+			if (present.has(entry.path)) {
+				continue;
+			}
+			present.add(entry.path);
+			out.push(entry.path);
+		}
+		return out;
+	}
+
+	// `resetPaths` is expensive (Pierre rebuilds its virtualised
+	// path model), so we gate it to changes that actually restructure
+	// the tree: the filesystem list, plus the set of deleted ghost
+	// rows. We deliberately read `gitStatusEntries` via a scoped
+	// derived so a pure add/modify refresh (no deletion change)
+	// doesn't trigger a rebuild — `setGitStatus` above handles those
+	// in-place.
+	const deletedSignature = $derived(deletedPathsSignature(workspace.gitStatusEntries));
+
+	// Reactively reset paths when the workspace path list (or its
+	// deleted-row set) changes, then replay the active path so
+	// Save As (which mutates `activePath` *before* the new file
+	// lands in `paths`, with an `await` between the two) doesn't end
+	// up with the new row unselected, the keyboard cursor stuck on
+	// row 0, and the list scrolled to the top.
 	//
-	// We can't rely on the activePath effect to re-fire here — its only
-	// dep is `activePath`, which didn't change. And we can't merge the
-	// two effects, because `resetPaths` is expensive enough that running
-	// it on every tab switch would be wasteful.
+	// We can't rely on the activePath effect to re-fire here — its
+	// only dep is `activePath`, which didn't change.
 	$effect(() => {
 		const paths = workspace.paths;
+		// Track the signature so a deletion appearing/disappearing
+		// re-runs this effect. We immediately untrack to re-read
+		// `gitStatusEntries` for the merge — the signature already
+		// captured "what changed".
+		void deletedSignature;
 		if (!tree) {
 			return;
 		}
-		tree.resetPaths(paths);
-		// `untrack`: this effect is for `paths`. Without it, every
-		// tab switch would wedge resetPaths between the activePath
-		// change and its handler.
+		const entries = untrack(() => workspace.gitStatusEntries);
+		tree.resetPaths(mergedPathsWithDeletions(paths, entries));
 		const target = untrack(() => workspace.activePath);
 		applySelection(tree, target, { afterReset: true });
 	});
+
+	// Stable string summary of the deleted-path subset. Changes if
+	// and only if the set of deleted paths changes — add/modify/
+	// untracked refreshes produce the same signature, so the
+	// dependent effect doesn't re-run.
+	function deletedPathsSignature(entries: readonly GitStatusEntry[]): string {
+		const deleted: string[] = [];
+		for (const entry of entries) {
+			if (entry.status === 'deleted') {
+				deleted.push(entry.path);
+			}
+		}
+		deleted.sort();
+		return deleted.join('\0');
+	}
 
 	// Mirror the active file in the tree's selection so the row stays
 	// highlighted as the user switches tabs (or restores a session).

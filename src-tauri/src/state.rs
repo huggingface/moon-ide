@@ -7,6 +7,7 @@ use moon_slack::{SlackClient, TokenStore};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::AbortHandle;
 
+use crate::fs_watcher::FsWatcherHandle;
 use crate::slack_poller::PollerHandle;
 
 pub struct AppState {
@@ -40,6 +41,13 @@ pub struct AppState {
 	/// drops the `PtySession` which kills the child process
 	/// (host shell or `docker exec`) immediately.
 	pub terminal_streams: Arc<Mutex<HashMap<String, TerminalStreamHandle>>>,
+	/// Filesystem watcher actor. Re-pointed to the active folder
+	/// whenever `workspace_open_local` /
+	/// `workspace_set_active_folder` / `workspace_remove_folder`
+	/// runs; emits `fs:changed` on debounced file activity so the
+	/// tree + git status can refresh without waiting for window
+	/// focus or a palette command. See [`crate::fs_watcher`].
+	pub fs_watcher: FsWatcherHandle,
 }
 
 /// Owning handle the terminal commands keep per stream. The
@@ -60,7 +68,12 @@ pub enum TerminalCommand {
 }
 
 impl AppState {
-	pub fn new(config_dir: Utf8PathBuf, workspaces_dir: Utf8PathBuf, slack: SlackState) -> Self {
+	pub fn new(
+		config_dir: Utf8PathBuf,
+		workspaces_dir: Utf8PathBuf,
+		slack: SlackState,
+		fs_watcher: FsWatcherHandle,
+	) -> Self {
 		Self {
 			workspaces: WorkspaceRegistry::new(),
 			config_dir,
@@ -68,6 +81,7 @@ impl AppState {
 			slack,
 			log_streams: Arc::new(Mutex::new(HashMap::new())),
 			terminal_streams: Arc::new(Mutex::new(HashMap::new())),
+			fs_watcher,
 		}
 	}
 

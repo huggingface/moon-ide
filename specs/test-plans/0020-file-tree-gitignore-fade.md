@@ -1,7 +1,7 @@
 # Test plan 0020: file tree gitignore fade
 
 - **Date**: 2026-05-03
-- **Phase**: post-Phase 1 polish
+- **Phase**: Phase 5 (Git layer) — first slice
 
 ## What shipped
 
