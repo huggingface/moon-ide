@@ -4,6 +4,7 @@
 	import Sidebar from './lib/components/Sidebar.svelte';
 	import EditorPane from './lib/components/EditorPane.svelte';
 	import StatusBar from './lib/components/StatusBar.svelte';
+	import Splash from './lib/components/Splash.svelte';
 	import Welcome from './lib/components/Welcome.svelte';
 	import CommandPalette from './lib/components/CommandPalette.svelte';
 	import ChatPanel from './lib/components/ChatPanel.svelte';
@@ -130,13 +131,20 @@
 		// so the first call to `workspace_active` returns the full,
 		// correct shape. We then let `restoreAppState` fill in the
 		// per-folder UI state (open tabs etc.) from `app_state.json`.
-		const ws = await ipc.workspace.active();
-		if (ws) {
-			await workspace.adoptWorkspaceSnapshot(ws);
+		try {
+			const ws = await ipc.workspace.active();
+			if (ws) {
+				await workspace.adoptWorkspaceSnapshot(ws);
+			}
+			// Always restore app state — theme applies even with no workspace
+			// (the welcome screen still respects the saved theme).
+			await workspace.restoreAppState();
+		} finally {
+			// Belt-and-braces: `restoreAppState` already flips the flag
+			// on every exit it controls, but if anything upstream throws
+			// we still need to leave the splash. Idempotent.
+			workspace.hydrated = true;
 		}
-		// Always restore app state — theme applies even with no workspace
-		// (the welcome screen still respects the saved theme).
-		await workspace.restoreAppState();
 	}
 
 	async function pickFolder() {
@@ -207,65 +215,73 @@
 	}
 </script>
 
-<div class="app">
-	<aside class="sidebar" style:width="{sidebarWidth}px">
-		<Sidebar onPickFolder={pickFolder} />
-	</aside>
-	<div
-		class="resize"
-		class:active={resizing}
-		role="separator"
-		aria-orientation="vertical"
-		aria-label="Resize sidebar"
-		tabindex="-1"
-		onpointerdown={startResize}
-	></div>
-	<main class="main">
-		{#if workspace.workspace}
-			<div class="editor-area">
-				<EditorPane side="left" />
-				{#if workspace.hasSplit}
-					<div class="pane-divider"></div>
-					<EditorPane side="right" />
-				{/if}
-			</div>
-		{:else}
-			<Welcome onPickFolder={pickFolder} />
-		{/if}
-		{#if bottomPanel.visible}
-			<div
-				class="resize bottom-resize"
-				class:active={resizingBottom}
-				role="separator"
-				aria-orientation="horizontal"
-				aria-label="Resize bottom panel"
-				tabindex="-1"
-				onpointerdown={startBottomResize}
-			></div>
-			<div class="bottom-host" style:height="{bottomPanel.height}px">
-				<BottomPanel />
-			</div>
-		{/if}
-	</main>
-	{#if slack.panelVisible}
+{#if !workspace.hydrated}
+	<!-- Holds the viewport until we know whether there's a workspace
+	     and which theme to paint in. Otherwise the Welcome screen
+	     flashes "Open folder" under dark themes on every launch of a
+	     project that was already open. -->
+	<Splash />
+{:else}
+	<div class="app">
+		<aside class="sidebar" style:width="{sidebarWidth}px">
+			<Sidebar onPickFolder={pickFolder} />
+		</aside>
 		<div
-			class="resize chat-resize"
-			class:active={resizingChat}
+			class="resize"
+			class:active={resizing}
 			role="separator"
 			aria-orientation="vertical"
-			aria-label="Resize chat panel"
+			aria-label="Resize sidebar"
 			tabindex="-1"
-			onpointerdown={startChatResize}
+			onpointerdown={startResize}
 		></div>
-		<aside class="chat" style:width="{chatWidth}px">
-			<ChatPanel />
-		</aside>
+		<main class="main">
+			{#if workspace.workspace}
+				<div class="editor-area">
+					<EditorPane side="left" />
+					{#if workspace.hasSplit}
+						<div class="pane-divider"></div>
+						<EditorPane side="right" />
+					{/if}
+				</div>
+			{:else}
+				<Welcome onPickFolder={pickFolder} />
+			{/if}
+			{#if bottomPanel.visible}
+				<div
+					class="resize bottom-resize"
+					class:active={resizingBottom}
+					role="separator"
+					aria-orientation="horizontal"
+					aria-label="Resize bottom panel"
+					tabindex="-1"
+					onpointerdown={startBottomResize}
+				></div>
+				<div class="bottom-host" style:height="{bottomPanel.height}px">
+					<BottomPanel />
+				</div>
+			{/if}
+		</main>
+		{#if slack.panelVisible}
+			<div
+				class="resize chat-resize"
+				class:active={resizingChat}
+				role="separator"
+				aria-orientation="vertical"
+				aria-label="Resize chat panel"
+				tabindex="-1"
+				onpointerdown={startChatResize}
+			></div>
+			<aside class="chat" style:width="{chatWidth}px">
+				<ChatPanel />
+			</aside>
+		{/if}
+	</div>
+	<StatusBar />
+	<CommandPalette />
+	{#if workspace.toast}
+		<div class="toast" role="status">{workspace.toast}</div>
 	{/if}
-</div>
-<StatusBar />
-<CommandPalette />
-{#if workspace.toast}
-	<div class="toast" role="status">{workspace.toast}</div>
 {/if}
 
 <style>

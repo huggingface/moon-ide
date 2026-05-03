@@ -4,9 +4,115 @@
 		<meta charset="UTF-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
 		<title>moon-ide</title>
+		<!--
+			Apply the last-resolved theme before the body parses so the
+			inline splash below paints in the right palette. The JS app
+			writes `moon-theme-applied` on every `applyTheme`; on a fresh
+			install with no entry yet, we fall through to the dark
+			defaults in the inline <style> (matches `styles.css`).
+		-->
+		<script>
+			try {
+				if (localStorage.getItem('moon-theme-applied') === 'light') {
+					document.documentElement.classList.add('light');
+				}
+			} catch (_err) {
+				/* storage disabled — default palette still looks fine */
+			}
+		</script>
+		<!--
+			Self-contained splash markup + styles so the window paints
+			something the moment the HTML arrives, _before_ the JS
+			bundle has even parsed. Svelte's `main.ts` clears `#app`
+			on mount and the Svelte `<Splash />` component takes over
+			(using the same visual language) until `workspace.hydrated`
+			flips.
+		-->
+		<style>
+			:root {
+				background: #0d1017;
+				color: #d6dcec;
+			}
+			:root.light {
+				background: #fafbfd;
+				color: #16192a;
+			}
+			html,
+			body,
+			#app {
+				margin: 0;
+				padding: 0;
+				height: 100%;
+				width: 100%;
+			}
+			body {
+				font-family: -apple-system, 'Inter', system-ui, 'Segoe UI', Roboto, sans-serif;
+			}
+			.moon-boot-splash {
+				width: 100%;
+				height: 100%;
+				display: flex;
+				flex-direction: column;
+				align-items: center;
+				justify-content: center;
+				gap: 18px;
+			}
+			.moon-boot-splash .wordmark {
+				font-size: 22px;
+				font-weight: 600;
+				letter-spacing: -0.01em;
+				color: #8a93ab;
+			}
+			:root.light .moon-boot-splash .wordmark {
+				color: #5e6885;
+			}
+			.moon-boot-splash .bar {
+				width: 140px;
+				height: 2px;
+				background: #232a3d;
+				border-radius: 1px;
+				overflow: hidden;
+			}
+			:root.light .moon-boot-splash .bar {
+				background: #d6dbe6;
+			}
+			.moon-boot-splash .bar-fill {
+				display: block;
+				width: 40%;
+				height: 100%;
+				background: #7ea3ff;
+				animation: moon-boot-slide 1.2s ease-in-out infinite;
+			}
+			:root.light .moon-boot-splash .bar-fill {
+				background: #4360c8;
+			}
+			@keyframes moon-boot-slide {
+				0% {
+					transform: translateX(-100%);
+				}
+				50% {
+					transform: translateX(200%);
+				}
+				100% {
+					transform: translateX(350%);
+				}
+			}
+			@media (prefers-reduced-motion: reduce) {
+				.moon-boot-splash .bar-fill {
+					animation: none;
+					width: 100%;
+					opacity: 0.4;
+				}
+			}
+		</style>
 	</head>
 	<body>
-		<div id="app"></div>
+		<div id="app">
+			<div class="moon-boot-splash" aria-hidden="true">
+				<div class="wordmark">moon-ide</div>
+				<div class="bar"><span class="bar-fill"></span></div>
+			</div>
+		</div>
 		<script type="module" src="/src/main.ts"></script>
 	</body>
 </html>

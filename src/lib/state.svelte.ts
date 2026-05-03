@@ -123,6 +123,14 @@ class WorkspaceState {
 	loadingPaths = $state(false);
 	toast = $state<string | null>(null);
 
+	// False until the first paint has a reliable workspace shape + the
+	// applied theme. App.svelte uses this to show a splash instead of
+	// flashing the Welcome screen while `restoreAppState` is still
+	// settling the OS theme probe and reading `state.json`. Flips true
+	// once those two are done; session / tab restoration continues
+	// afterwards in the background (empty panes fill in as files load).
+	hydrated = $state(false);
+
 	// Per-machine UI theme. Persisted alongside the session in AppState.
 	// There is no project-level theme override; if a workspace ever needs
 	// one, that'd live in `.editorconfig` extensions, not here.
@@ -518,26 +526,35 @@ class WorkspaceState {
 	 * re-saved. Called once on startup from `App.svelte`.
 	 */
 	async restoreAppState() {
-		// Subscribe to OS theme changes (and probe the initial value)
-		// up front so `effectiveTheme` reflects live OS preference
-		// regardless of whether the AppState load below succeeds. Awaited
-		// so the `applyTheme` calls below read a trustworthy
+		// Probe the OS theme (XDG portal / native API) and read the
+		// persisted `state.json` in parallel — they're independent
+		// and both block the first meaningful paint. `bindSystemPreference`
+		// is awaited so `applyTheme` below reads a trustworthy
 		// `systemPrefersDark`: on Linux WebKitGTK the synchronous
 		// `matchMedia` answer seeded during class construction is
-		// unreliable, and only Tauri's own theme probe knows for sure.
+		// unreliable, and only the portal probe knows for sure.
+		const appStatePromise = ipc.appState.load().then(
+			(state) => ({ ok: true, state }) as const,
+			(err) => ({ ok: false, err }) as const,
+		);
 		await this.bindSystemPreference();
-
-		let state: AppState;
-		try {
-			state = await ipc.appState.load();
-		} catch (err) {
-			this.flash(`Could not restore state: ${formatError(err)}`);
+		const appStateResult = await appStatePromise;
+		if (!appStateResult.ok) {
+			this.flash(`Could not restore state: ${formatError(appStateResult.err)}`);
 			applyTheme(this.effectiveTheme);
+			this.hydrated = true;
 			return;
 		}
+		const state = appStateResult.state;
 
 		this.theme = state.theme;
 		applyTheme(this.effectiveTheme);
+		// Flip `hydrated` before we start chewing on the persisted
+		// session so the main layout (Welcome or editor shell) paints
+		// immediately. Per-tab file reads below can take hundreds of
+		// ms on a large session; no reason to gate the first paint on
+		// them — empty panes fill in as each file loads.
+		this.hydrated = true;
 		// Restore the chat panel state up-front: the panel may have been
 		// open at the last shutdown, in which case it mounts (and probes
 		// `slack_status`) on this same paint without the user lifting a
@@ -1664,6 +1681,16 @@ function applyTheme(mode: 'dark' | 'light') {
 		root.classList.add('light');
 	} else {
 		root.classList.remove('light');
+	}
+	// Stash the resolved palette so `index.html`'s inline boot script
+	// can pick the right background on the very next launch — before
+	// JS even parses. Resolved value (not the `'system'` choice),
+	// because the boot splash has no ashpd / `matchMedia` yet.
+	try {
+		localStorage.setItem('moon-theme-applied', mode);
+	} catch {
+		// Storage disabled — boot splash just defaults to dark next
+		// time. Not worth surfacing.
 	}
 	// The editor scrollbar corner (the moon easter egg) does NOT follow
 	// theme toggles on WebKitGTK — see the note in `lib/editor/theme.ts`
