@@ -349,17 +349,28 @@
 		<div class="connected">
 			<div class="connected-scroll" bind:this={scrollEl} onscroll={onScrollContainer}>
 				<section class="card workspace-card">
-					<div class="workspace-info">
-						<div class="card-row">
-							<span class="card-label">Connected as</span>
-							<span class="card-value">{slack.status.identity?.user_name ?? '—'}</span>
-						</div>
-						<div class="card-row muted">
-							<span class="card-label">Workspace</span>
-							<span class="card-value">{slack.status.identity?.team ?? '—'}</span>
+					<div class="workspace-id">
+						{#if slack.status.identity?.icon_url}
+							<img src={slack.status.identity.icon_url} alt="" class="avatar" />
+						{:else}
+							<div class="avatar avatar-placeholder" aria-hidden="true">
+								{(slack.status.identity?.team ?? '?')[0]?.toUpperCase() ?? '?'}
+							</div>
+						{/if}
+						<div class="workspace-text">
+							<div class="workspace-name">{slack.status.identity?.team ?? '—'}</div>
+							<div class="workspace-user">{slack.status.identity?.user_name ?? '—'}</div>
 						</div>
 					</div>
-					<button type="button" class="link" onclick={onDisconnect}>Disconnect</button>
+					<button
+						type="button"
+						class="icon-button"
+						onclick={onDisconnect}
+						title="Disconnect Slack"
+						aria-label="Disconnect Slack"
+					>
+						{@render disconnectIcon()}
+					</button>
 				</section>
 
 				{#if slack.activeBot}
@@ -376,7 +387,15 @@
 									<div class="bot-handle">@{slack.activeBot.username}</div>
 								</div>
 							</div>
-							<button type="button" class="link" onclick={onSwitchBot}>Switch bot</button>
+							<button
+								type="button"
+								class="icon-button"
+								onclick={onSwitchBot}
+								title="Switch bot"
+								aria-label="Switch bot"
+							>
+								{@render switchBotIcon()}
+							</button>
 						</header>
 					</section>
 
@@ -395,8 +414,8 @@
 							</p>
 						</div>
 					{:else if slack.activeThreadTs === null}
-						<section class="card sessions-card">
-							<header class="section-header">
+						<section class="sessions">
+							<header class="sessions-header">
 								<span class="section-title">Sessions</span>
 								<div class="header-actions">
 									<button
@@ -426,9 +445,9 @@
 									<span>Loading sessions…</span>
 								</div>
 							{:else if slack.sessionsError}
-								<p class="card-error">{slack.sessionsError}</p>
+								<p class="thread-error">{slack.sessionsError}</p>
 							{:else if slack.sessions && slack.sessions.length === 0}
-								<p class="card-detail">
+								<p class="thread-empty">
 									No sessions yet. Click <strong>+ New session</strong> above to start your first conversation with
 									<strong>{botLabel(slack.activeBot)}</strong>.
 								</p>
@@ -646,6 +665,43 @@
 	</svg>
 {/snippet}
 
+{#snippet disconnectIcon()}
+	<svg
+		viewBox="0 0 16 16"
+		width="14"
+		height="14"
+		fill="none"
+		stroke="currentColor"
+		stroke-width="1.5"
+		stroke-linecap="round"
+		stroke-linejoin="round"
+		aria-hidden="true"
+	>
+		<path d="M9.5 3h-5A1.5 1.5 0 0 0 3 4.5v7A1.5 1.5 0 0 0 4.5 13h5" />
+		<path d="M11 11l3-3-3-3" />
+		<path d="M14 8H6.5" />
+	</svg>
+{/snippet}
+
+{#snippet switchBotIcon()}
+	<svg
+		viewBox="0 0 16 16"
+		width="14"
+		height="14"
+		fill="none"
+		stroke="currentColor"
+		stroke-width="1.5"
+		stroke-linecap="round"
+		stroke-linejoin="round"
+		aria-hidden="true"
+	>
+		<path d="M3 5h9" />
+		<path d="M9 2l3 3-3 3" />
+		<path d="M13 11H4" />
+		<path d="M7 8l-3 3 3 3" />
+	</svg>
+{/snippet}
+
 <style>
 	.chat-panel {
 		display: flex;
@@ -713,19 +769,20 @@
 		flex: 1;
 		min-height: 0;
 		overflow-y: auto;
-		/* `overflow-x: hidden` is required by `.thread-header`'s
-		   negative horizontal margins (which extend its background +
-		   bottom divider full-width). Without it, browsers promote
-		   `overflow-x` to `auto` because `overflow-y` is non-visible,
-		   and the thread-header's overflow into the padding region
-		   would surface a horizontal scrollbar. */
+		/* `overflow-x: hidden` is required by the sessions / thread
+		   sticky headers' negative horizontal margins (which extend
+		   their background + bottom divider full-width). Without it,
+		   browsers promote `overflow-x` to `auto` because `overflow-y`
+		   is non-visible, and the headers' overflow into the padding
+		   region would surface a horizontal scrollbar. */
 		overflow-x: hidden;
-		/* No `padding-top`: the sticky `.thread-header` anchors against
-		   this element's content-box edge, so any padding-top here would
-		   sit *above* the stuck header and let scroll content show
-		   through that strip. Top breathing room moves to the first
-		   child via `:first-child { margin-top }`, where it scrolls
-		   away with the rest of the content as it should. */
+		/* No `padding-top`: the sticky sessions / thread headers
+		   anchor against this element's content-box edge, so any
+		   padding-top here would sit *above* the stuck header and
+		   let scroll content show through that strip. Top breathing
+		   room moves to the first child via `:first-child { margin-top }`,
+		   where it scrolls away with the rest of the content as it
+		   should. */
 		padding: 0 12px 12px;
 		display: flex;
 		flex-direction: column;
@@ -749,30 +806,6 @@
 		gap: 10px;
 		padding: 16px 12px;
 	}
-	.card-row {
-		display: flex;
-		justify-content: space-between;
-		align-items: baseline;
-		gap: 12px;
-	}
-	.card-row.muted {
-		color: var(--m-fg-muted);
-	}
-	.card-label {
-		font-size: 11px;
-		text-transform: uppercase;
-		letter-spacing: 0.04em;
-		color: var(--m-fg-muted);
-	}
-	.card-value {
-		font-size: 12px;
-		color: var(--m-fg);
-		text-align: right;
-		min-width: 0;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-	}
 	.card-lede {
 		margin: 0;
 		font-size: 12px;
@@ -791,20 +824,41 @@
 	}
 	/* `.card` defaults to `flex-direction: column` for the label/value
 	   stacks; the workspace card overrides that to put the identity
-	   info on the left and the Disconnect link on the right, mirroring
-	   the bot card's "info | action" pattern. */
+	   info on the left and a small Disconnect icon-button on the
+	   right, mirroring the bot card's "avatar + name | action" pattern. */
 	.workspace-card {
 		flex-direction: row;
 		align-items: center;
 		justify-content: space-between;
-		gap: 12px;
+		gap: 8px;
 	}
-	.workspace-info {
+	.workspace-id {
 		display: flex;
-		flex-direction: column;
-		gap: 6px;
+		align-items: center;
+		gap: 10px;
 		min-width: 0;
 		flex: 1;
+	}
+	.workspace-text {
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+	}
+	.workspace-name {
+		font-size: 13px;
+		font-weight: 600;
+		color: var(--m-fg);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.workspace-user {
+		font-size: 11px;
+		color: var(--m-fg-muted);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 	.bot-card {
 		gap: 10px;
@@ -896,14 +950,6 @@
 		cursor: pointer;
 		padding: 0;
 		font-size: 12px;
-	}
-	.section-header {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 8px;
-		padding: 0;
-		border-bottom: 0;
 	}
 	.section-title {
 		font-size: 11px;
@@ -1067,29 +1113,32 @@
 		margin-right: 8px;
 		color: var(--m-fg-subtle);
 	}
-	.thread {
+	.thread,
+	.sessions {
 		display: flex;
 		flex-direction: column;
 		gap: 8px;
 		min-width: 0;
 	}
-	.thread-header {
+	/* Sessions list and thread view share an identical header
+	   treatment: sticky at the top of `.connected-scroll` so the
+	   header controls (back, new, refresh) stay reachable while
+	   long content scrolls underneath. The bot card and any
+	   earlier rows scroll up behind the solid `--m-bg-1` fill.
+	   Negative horizontal margins extend the fill + divider edge-
+	   to-edge across the scroll container's horizontal padding so
+	   the bottom border doesn't look like an inset rule; the
+	   matching positive padding keeps the icon buttons visually
+	   aligned with the rest of the column. `--m-bg-1` matches the
+	   panel's primary bg, so when the header sits in its natural
+	   position at the top of the section the strip is invisible
+	   and only appears as a divider once it actually sticks. */
+	.thread-header,
+	.sessions-header {
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
 		gap: 8px;
-		/* Pin to the top of `.connected-scroll` so back / new /
-		   refresh stay reachable while scrolling a long thread. The
-		   bot card and earlier replies scroll up behind the solid
-		   `--m-bg-1` fill. Negative horizontal margins extend the
-		   fill + divider edge-to-edge across the scroll container's
-		   horizontal padding so the bottom border doesn't look like
-		   an inset rule; the matching positive padding keeps the
-		   icon buttons visually aligned with the rest of the column.
-		   `--m-bg-1` matches the panel's primary bg (so when the
-		   header sits in its natural position at the top of the
-		   thread the strip is invisible) and gives a clean cover
-		   over scrolled content when the header is stuck. */
 		position: sticky;
 		top: 0;
 		z-index: 1;

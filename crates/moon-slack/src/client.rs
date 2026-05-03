@@ -2,6 +2,7 @@
 //!
 //! Endpoints implemented so far:
 //! - `auth.test` — identify the human whose token we hold (11.0)
+//! - `team.info` — workspace icon for the chat-panel header (11.0)
 //! - `conversations.list?types=im` — list the user's open DMs (11.0)
 //! - `users.info` — pull `is_bot` + display metadata for each DM partner (11.0)
 //!   and resolve `<@U…>` mentions in rendered messages (11.1.1)
@@ -73,18 +74,47 @@ impl SlackClient {
 		Ok(Self { http, token })
 	}
 
-	/// `auth.test` — succeeds iff the token is valid; returns the
-	/// human's identity. Used for the connect handshake and the
-	/// periodic "still connected?" check.
+	/// Validate the token (`auth.test`) and pull the workspace's
+	/// branding (`team.info`). Used for the connect handshake and
+	/// the panel's "still connected?" probe — both want the same
+	/// `SlackIdentity` shape, including the workspace icon, so the
+	/// extra round-trip stays here rather than at every call site.
+	///
+	/// `team.info` is rate-limit Tier-3 (≈50/min) and the panel
+	/// only triggers this on mount + after explicit
+	/// connect/disconnect, so the doubled HTTP cost is fine. If
+	/// `team.info` ever fails (e.g. the workspace just revoked
+	/// `team:read`) we still return a usable identity with
+	/// `icon_url = None`; the panel falls back to its initial-letter
+	/// placeholder. We deliberately don't fail the connect handshake
+	/// on a missing icon — chrome shouldn't gate auth.
 	pub async fn auth_test(&self) -> Result<SlackIdentity, SlackError> {
 		let body: AuthTestResponse = self.call("auth.test", &[]).await?;
+		let icon_url = match self.team_icon_url().await {
+			Ok(url) => url,
+			Err(err) => {
+				tracing::warn!(error = %err, "team.info failed; falling back to placeholder workspace icon");
+				None
+			}
+		};
 		Ok(SlackIdentity {
 			user_id: body.user_id,
 			user_name: body.user,
 			team_id: body.team_id,
 			team: body.team,
 			url: body.url,
+			icon_url,
 		})
+	}
+
+	/// `team.info` — workspace branding. We only consume `icon`,
+	/// which Slack returns as a set of pre-rendered URLs at
+	/// 34/44/68/88/102/132 px plus an `image_default` flag.
+	/// Selection logic lives in [`pick_team_icon`] so it's unit-
+	/// testable without a live HTTP round-trip.
+	async fn team_icon_url(&self) -> Result<Option<String>, SlackError> {
+		let body: TeamInfoResponse = self.call("team.info", &[]).await?;
+		Ok(pick_team_icon(body.team.icon))
 	}
 
 	/// Scan the authenticated user's [`DM_SCAN_LIMIT`] most recently
@@ -354,6 +384,49 @@ struct AuthTestResponse {
 	team_id: String,
 	team: String,
 	url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamInfoResponse {
+	team: TeamInfoTeam,
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamInfoTeam {
+	#[serde(default)]
+	icon: TeamIcon,
+}
+
+/// Subset of `team.info` `team.icon` we read. Slack also returns
+/// `image_34`, `image_44`, `image_230`, `image_original` — we don't
+/// need them. The `image_default` flag is true when the workspace
+/// hasn't uploaded a custom icon and Slack is serving its
+/// auto-generated glyph; we treat that as "no icon" so the panel's
+/// own placeholder shows instead.
+#[derive(Debug, Default, Deserialize)]
+struct TeamIcon {
+	#[serde(default)]
+	image_default: Option<bool>,
+	#[serde(default)]
+	image_68: Option<String>,
+	#[serde(default)]
+	image_88: Option<String>,
+	#[serde(default)]
+	image_102: Option<String>,
+	#[serde(default)]
+	image_132: Option<String>,
+}
+
+/// Pick the best workspace-icon URL out of the Slack `team.icon`
+/// payload. Prefers 132 px (HiDPI on the panel's 32 px slot) and
+/// falls back to smaller renditions; returns `None` when Slack
+/// flagged the icon as its auto-generated default so the UI can
+/// show its own initial-letter placeholder.
+fn pick_team_icon(icon: TeamIcon) -> Option<String> {
+	if icon.image_default.unwrap_or(false) {
+		return None;
+	}
+	icon.image_132.or(icon.image_102).or(icon.image_88).or(icon.image_68)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1183,6 +1256,80 @@ mod tests {
 
 		let transport = SlackError::Transport("dns failure".into());
 		assert!(!transport.is_auth_failure());
+	}
+
+	#[test]
+	fn team_info_picks_132_when_present() {
+		let json = r#"{
+			"ok": true,
+			"team": {
+				"id": "T01",
+				"icon": {
+					"image_default": false,
+					"image_68": "https://example.com/68.png",
+					"image_88": "https://example.com/88.png",
+					"image_102": "https://example.com/102.png",
+					"image_132": "https://example.com/132.png"
+				}
+			}
+		}"#;
+		let r: TeamInfoResponse = serde_json::from_str(json).unwrap();
+		assert_eq!(
+			pick_team_icon(r.team.icon).as_deref(),
+			Some("https://example.com/132.png")
+		);
+	}
+
+	#[test]
+	fn team_info_falls_back_to_smaller_icons() {
+		let json = r#"{
+			"ok": true,
+			"team": {
+				"id": "T01",
+				"icon": {
+					"image_default": false,
+					"image_68": "https://example.com/68.png"
+				}
+			}
+		}"#;
+		let r: TeamInfoResponse = serde_json::from_str(json).unwrap();
+		assert_eq!(
+			pick_team_icon(r.team.icon).as_deref(),
+			Some("https://example.com/68.png")
+		);
+	}
+
+	#[test]
+	fn team_info_default_icon_returns_none() {
+		// `image_default: true` means Slack's auto-generated glyph.
+		// We drop it so the panel's initial-letter placeholder
+		// shows instead — embedding Slack's generic icon would be
+		// a worse UI than a clean letter tile.
+		let json = r#"{
+			"ok": true,
+			"team": {
+				"id": "T01",
+				"icon": {
+					"image_default": true,
+					"image_132": "https://example.com/slack-default-132.png"
+				}
+			}
+		}"#;
+		let r: TeamInfoResponse = serde_json::from_str(json).unwrap();
+		assert_eq!(pick_team_icon(r.team.icon), None);
+	}
+
+	#[test]
+	fn team_info_missing_icon_block_returns_none() {
+		// Older / partial responses might omit the `icon` field
+		// entirely. Must not be a parse error — the helper just
+		// returns `None` and the panel falls back to the placeholder.
+		let json = r#"{
+			"ok": true,
+			"team": { "id": "T01" }
+		}"#;
+		let r: TeamInfoResponse = serde_json::from_str(json).unwrap();
+		assert_eq!(pick_team_icon(r.team.icon), None);
 	}
 
 	#[test]

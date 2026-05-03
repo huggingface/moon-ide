@@ -11,7 +11,10 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-/// Result of `auth.test`. Identifies the human whose token we hold.
+/// Identifies the human whose token we hold, plus enough chrome
+/// (workspace icon) for the chat-panel header. Synthesised from
+/// `auth.test` (user fields) plus `team.info` (icon). The latter
+/// requires the `team:read` scope; it's part of the upfront grant.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct SlackIdentity {
@@ -25,6 +28,13 @@ pub struct SlackIdentity {
 	pub team: String,
 	/// Workspace base URL (e.g. `https://huggingface.slack.com/`).
 	pub url: String,
+	/// Workspace icon URL (`team.info.icon.image_132` preferred,
+	/// falling back to smaller sizes). `None` when the workspace
+	/// uses Slack's auto-generated default icon (`image_default:
+	/// true`) — the panel renders a local initial-letter
+	/// placeholder instead, which is cleaner than embedding
+	/// Slack's generic glyph.
+	pub icon_url: Option<String>,
 }
 
 /// A bot we can DM, discovered by scanning the authenticated user's

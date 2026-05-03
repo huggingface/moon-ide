@@ -63,6 +63,7 @@ slightly broader initial prompt for zero re-installs through 11.4.
 | `im:read`         | 11.0    | List the user's DM channels (find the bot's DM)                   |
 | `im:write`        | 11.2    | `conversations.mark` — clear the unread badge                     |
 | `users:read`      | 11.0    | Resolve the bot's user ID, display name, avatar                   |
+| `team:read`       | 11.0    | Workspace icon + display name on the chat-panel workspace card    |
 | `reactions:read`  | 11.4    | See Moonbot's status emoji (✅ / ⚠️ / ❌)                         |
 | `reactions:write` | 11.4+   | React to messages from the IDE (👍 / 👎 / …)                      |
 | `files:read`      | 11.4+   | Render image / file attachments the bot sends                     |
@@ -91,7 +92,6 @@ below is committed**; each entry is "would unlock", not "we'll do".
 | `users:read.email`                                      | Resolve bots/users by email instead of display name (more stable IDs across renames).                                   |
 | `usergroups:read`                                       | Render `@team` mentions correctly.                                                                                      |
 | `emoji:read`                                            | Render custom workspace emoji in messages and reactions instead of falling back to `:shortcode:`.                       |
-| `team:read`                                             | Workspace metadata (icon, domain) for nicer panel chrome.                                                               |
 | `dnd:read` / `dnd:write`                                | Mute the unread pip while the user is in DND; let the IDE pause Moonbot's reactions during focus blocks.                |
 | `links:read` / `links:write`                            | Custom link unfurls — probably never needed for our flow.                                                               |
 
@@ -110,10 +110,16 @@ steps, each with a one-click "Open in browser" link:
 4. Copy the **User OAuth Token** (`xoxp-…`) — _not_ the Bot token.
 5. Paste it into the field below and click "Connect".
 
-We validate via `auth.test` before persisting. On success the panel
-loads the bot picker — see [Bot resolution](#bot-resolution) — which
-scans the user's DM list (not the workspace directory) and lets them
-click the bot they want to chat with.
+We validate via `auth.test` before persisting; the same handshake
+also calls `team.info` so the workspace card can render the real
+workspace icon (Slack-default icons are dropped — we render an
+initial-letter placeholder instead, see [`SlackIdentity.icon_url`]).
+On success the panel loads the bot picker — see
+[Bot resolution](#bot-resolution) — which scans the user's DM list
+(not the workspace directory) and lets them click the bot they want
+to chat with.
+
+[`SlackIdentity.icon_url`]: ../crates/moon-protocol/src/slack.rs
 
 ### Token storage
 

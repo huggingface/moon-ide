@@ -94,14 +94,15 @@
 						<li><code>im:read</code> — list DM channels</li>
 						<li><code>im:write</code> — mark messages read</li>
 						<li><code>users:read</code> — read DM partners' profiles (find which are bots)</li>
+						<li><code>team:read</code> — show your workspace icon on the chat panel</li>
 						<li><code>reactions:read</code> — see bot status reactions (✅ ⚠️ ❌)</li>
 						<li><code>reactions:write</code> — react to messages</li>
 						<li><code>files:read</code> — see attachments the bot sends</li>
 						<li><code>files:write</code> — upload images / files to the bot</li>
 					</ul>
 					<span class="scopes-note">
-						All nine are claimed upfront so you don't have to revisit OAuth &amp; Permissions every time a new
-						capability ships. If you ever see a <code>missing_scope</code>
+						All ten are claimed upfront so you don't have to revisit OAuth &amp; Permissions every time a new capability
+						ships. If you ever see a <code>missing_scope</code>
 						error in the panel, add the scope here, click <strong>Reinstall to Workspace</strong>, then disconnect &amp;
 						reconnect from the IDE.
 					</span>

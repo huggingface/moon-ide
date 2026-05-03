@@ -248,8 +248,9 @@ export const defaultAppState: AppState = {
 };
 
 /**
- * Result of `auth.test`. Identifies the human whose token we hold.
- * Mirrors `moon_protocol::slack::SlackIdentity`.
+ * Identifies the human whose token we hold, plus enough chrome
+ * (workspace icon) for the chat-panel header. Mirrors
+ * `moon_protocol::slack::SlackIdentity`.
  */
 export type SlackIdentity = {
 	user_id: string;
@@ -257,6 +258,7 @@ export type SlackIdentity = {
 	team_id: string;
 	team: string;
 	url: string;
+	icon_url: string | null;
 };
 
 /**
