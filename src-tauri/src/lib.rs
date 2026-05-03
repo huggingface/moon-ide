@@ -41,6 +41,7 @@ pub fn run() {
 			commands::fs::fs_absolute_path,
 			commands::fs::fs_trash,
 			commands::fs::fs_delete,
+			commands::fs::fs_git_ignored_paths,
 			commands::search::search_files,
 			commands::search::search_content,
 			commands::app_state::app_state_load,

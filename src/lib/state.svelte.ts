@@ -767,10 +767,36 @@ class WorkspaceState {
 			const collected: string[] = [];
 			await collectPaths('', collected, 0);
 			this.paths = collected;
+			// Classify gitignore status in the background — the tree can
+			// paint before we know the answer. Pierre reconciles the
+			// `gitStatus` update in place, so late-arriving entries just
+			// fade the affected rows without a reflow.
+			void this.refreshGitIgnored(collected);
 		} catch (err) {
 			this.flash(`Failed to read folder: ${formatError(err)}`);
 		} finally {
 			this.loadingPaths = false;
+		}
+	}
+
+	// Workspace-relative paths (with the same trailing-`/`-for-
+	// directories convention as `paths`) that the backend flagged as
+	// gitignored. FileTree.svelte reads this as a `Set` and feeds it
+	// into Pierre Trees' `setGitStatus` API. Empty on a workspace with
+	// no `.gitignore` rules.
+	gitIgnoredPaths = $state<readonly string[]>([]);
+
+	private async refreshGitIgnored(paths: readonly string[]) {
+		try {
+			const ignored = await ipc.fs.gitIgnoredPaths([...paths]);
+			this.gitIgnoredPaths = ignored;
+		} catch {
+			// Non-fatal — we'd rather leave the tree unfaded than noise
+			// up the toast for a git probe failure. If git is absent the
+			// command still succeeds (returns []), so the common case
+			// where this throws is a legitimate filesystem error worth
+			// ignoring for tree cosmetics.
+			this.gitIgnoredPaths = [];
 		}
 	}
 

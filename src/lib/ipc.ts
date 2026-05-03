@@ -40,6 +40,7 @@ export const ipc = {
 		absolutePath: (path: string) => invoke<string>('fs_absolute_path', { path }),
 		trash: (path: string) => invoke<void>('fs_trash', { path }),
 		delete: (path: string) => invoke<void>('fs_delete', { path }),
+		gitIgnoredPaths: (paths: string[]) => invoke<string[]>('fs_git_ignored_paths', { paths }),
 	},
 	search: {
 		files: (options: FileSearchOptions) => invoke<FileSearchResult[]>('search_files', { options }),

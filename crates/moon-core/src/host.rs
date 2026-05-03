@@ -49,6 +49,15 @@ pub trait WorkspaceHost: Send + Sync {
 	/// agents and devcontainer-hosted tools see the same answer the UI
 	/// does — this is the single point where the rules are decided.
 	async fn editorconfig_for(&self, path: &Utf8Path) -> MoonResult<EditorConfig>;
+
+	/// Workspace-relative paths (directories carry a trailing `/`, to
+	/// match `read_dir` output and the tree's path format) that match
+	/// the effective gitignore rules — `.gitignore` files at any depth,
+	/// `.git/info/exclude`, and the user's global excludes. The frontend
+	/// feeds the result to Pierre Trees as ignored rows so they paint
+	/// faded rather than vanish; hiding ignored files outright would
+	/// miss the common "peek at `target/` or `node_modules/`" workflow.
+	async fn git_ignored_paths(&self, paths: &[String]) -> MoonResult<Vec<String>>;
 }
 
 pub struct LocalHost {
@@ -309,6 +318,194 @@ impl WorkspaceHost for LocalHost {
 	async fn editorconfig_for(&self, path: &Utf8Path) -> MoonResult<EditorConfig> {
 		self.editorconfig.for_path(path).await
 	}
+
+	async fn git_ignored_paths(&self, paths: &[String]) -> MoonResult<Vec<String>> {
+		// The ignore walker is synchronous, so hop to the blocking pool
+		// to keep the Tokio reactor free. `ignore` fans out its own
+		// threads if we use `build_parallel`, but the single-threaded
+		// walk is already fast enough for IDE-sized trees (tens of
+		// thousands of files) and keeps the code straight-line.
+		let root = self.root.clone();
+		let paths = paths.to_vec();
+		tokio::task::spawn_blocking(move || classify_git_ignored(&root, &paths))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_ignored_paths join error: {e}")))?
+	}
+}
+
+/// Returns the subset of `paths` (workspace-relative, directories
+/// optionally terminated by `/`) that git / the walker treat as
+/// ignored.
+///
+/// Primary strategy inside a git repo: ask `git ls-files` itself.
+/// That path respects the index, so a file matching a `.gitignore`
+/// pattern but already tracked (committed, or `git add -f`'d) is
+/// correctly reported as _not_ ignored — the walker below can't make
+/// that distinction on its own because `ignore::WalkBuilder` has no
+/// view of the index.
+///
+/// Fallback (no git repo / git binary missing): walk the tree with
+/// the standard gitignore filters and treat anything the walker
+/// doesn't yield as ignored. Good enough for pre-`git init` folders;
+/// loses the index-aware behaviour above, which is the price of not
+/// requiring git to be installed.
+fn classify_git_ignored(root: &Utf8Path, paths: &[String]) -> MoonResult<Vec<String>> {
+	if let Some(ignored) = classify_via_git_ls_files(root) {
+		return Ok(filter_to_inputs(&ignored, paths));
+	}
+	classify_via_walker(root, paths)
+}
+
+/// Run `git ls-files --others --ignored --exclude-standard` in the
+/// workspace root. The combination lists paths that (a) aren't in
+/// the index and (b) match an exclude rule — i.e. the exact set git
+/// considers ignored for a rendering pass. `--directory` collapses
+/// fully-ignored directories to a single entry (`target/`) instead
+/// of enumerating every file below.
+///
+/// Returns `None` if the command can't run or exits non-zero — the
+/// caller falls back to the walker so a non-repo folder still gets a
+/// reasonable answer. Stderr is intentionally swallowed; git's
+/// "not a git repository" complaint is expected and not interesting.
+fn classify_via_git_ls_files(root: &Utf8Path) -> Option<std::collections::HashSet<String>> {
+	use std::collections::HashSet;
+	use std::process::Command;
+
+	let output = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args([
+			"ls-files",
+			"-z",
+			"--others",
+			"--ignored",
+			"--exclude-standard",
+			"--directory",
+		])
+		.output()
+		.ok()?;
+	if !output.status.success() {
+		return None;
+	}
+	let mut ignored: HashSet<String> = HashSet::new();
+	for raw in output.stdout.split(|b| *b == 0) {
+		if raw.is_empty() {
+			continue;
+		}
+		let Ok(s) = std::str::from_utf8(raw) else {
+			continue;
+		};
+		// `git ls-files --directory` emits `foo/` for directory
+		// entries. Insert both the slashed and bare form so the
+		// filter loop can match either convention without second-
+		// guessing what the caller sent.
+		let normalised = s.replace('\\', "/");
+		if let Some(bare) = normalised.strip_suffix('/') {
+			ignored.insert(bare.to_string());
+			ignored.insert(normalised);
+		} else {
+			ignored.insert(normalised);
+		}
+	}
+	Some(ignored)
+}
+
+fn classify_via_walker(root: &Utf8Path, paths: &[String]) -> MoonResult<Vec<String>> {
+	use ignore::WalkBuilder;
+	use std::collections::HashSet;
+
+	let mut visible: HashSet<String> = HashSet::new();
+	// `hidden(false)` keeps dotfiles like `.gitignore` itself in the
+	// visible set; `git_ignore` / `git_exclude` / `git_global` turn on
+	// the three ignore sources users expect. `ignore(true)` also
+	// respects `.ignore` files, which is the ripgrep convention and
+	// aligns with our own `search_files` command.
+	let walker = WalkBuilder::new(root.as_std_path())
+		.hidden(false)
+		.git_ignore(true)
+		.git_exclude(true)
+		.git_global(true)
+		// Apply `.gitignore` even when `.git/` isn't present. A folder
+		// with a `.gitignore` at its root is a common pre-init
+		// scenario, and users still expect those patterns to fade the
+		// tree — the alternative (nothing fades until `git init` runs)
+		// is a surprising trap.
+		.require_git(false)
+		.ignore(true)
+		.parents(true)
+		.build();
+	for entry in walker.flatten() {
+		let Ok(rel) = entry.path().strip_prefix(root.as_std_path()) else {
+			continue;
+		};
+		let Some(rel_str) = rel.to_str() else {
+			continue;
+		};
+		if rel_str.is_empty() {
+			continue;
+		}
+		let is_dir = entry.file_type().map(|f| f.is_dir()).unwrap_or(false);
+		let normalised = rel_str.replace('\\', "/");
+		if is_dir {
+			visible.insert(format!("{normalised}/"));
+		} else {
+			visible.insert(normalised);
+		}
+	}
+
+	let mut ignored = Vec::new();
+	for path in paths {
+		let trimmed = path.trim_end_matches('/');
+		if trimmed.is_empty() {
+			continue;
+		}
+		if !visible.contains(path.as_str()) && !visible.contains(trimmed) {
+			ignored.push(path.clone());
+		}
+	}
+	Ok(ignored)
+}
+
+/// Reduce the "everything git considers ignored" set to just the
+/// paths the frontend asked about, matching either slash convention.
+///
+/// Directory matching is a little fuzzy on purpose: git reports
+/// ignored folders as `foo/` (via `--directory`), but if the frontend
+/// only asked about a file _inside_ that folder, we still want to
+/// flag it. We climb each input's ancestors and flag the whole path
+/// if any ancestor is in the ignored set.
+fn filter_to_inputs(ignored: &std::collections::HashSet<String>, paths: &[String]) -> Vec<String> {
+	let mut out = Vec::new();
+	for path in paths {
+		if is_path_ignored(ignored, path) {
+			out.push(path.clone());
+		}
+	}
+	out
+}
+
+fn is_path_ignored(ignored: &std::collections::HashSet<String>, path: &str) -> bool {
+	let trimmed = path.trim_end_matches('/');
+	if trimmed.is_empty() {
+		return false;
+	}
+	if ignored.contains(path) || ignored.contains(trimmed) {
+		return true;
+	}
+	// Walk ancestors: `target/debug/build` is ignored if `target/` or
+	// `target/debug/` is. Stops at the workspace root (no leading
+	// slash to worry about — paths are workspace-relative).
+	let mut cursor = trimmed;
+	while let Some(slash) = cursor.rfind('/') {
+		cursor = &cursor[..slash];
+		if cursor.is_empty() {
+			break;
+		}
+		if ignored.contains(cursor) || ignored.contains(&format!("{cursor}/")) {
+			return true;
+		}
+	}
+	false
 }
 
 fn system_time_to_ms(t: SystemTime) -> Option<i64> {
@@ -415,5 +612,103 @@ mod tests {
 		let h = host(&dir);
 		let result = h.read_file(Utf8Path::new("../escape.txt")).await;
 		assert!(matches!(result, Err(MoonError::PermissionDenied(_))));
+	}
+
+	#[tokio::test]
+	async fn git_ignored_paths_matches_gitignore() {
+		let dir = TempDir::new().unwrap();
+		std::fs::write(dir.path().join(".gitignore"), "target/\nsecrets.txt\n").unwrap();
+		std::fs::create_dir(dir.path().join("target")).unwrap();
+		std::fs::write(dir.path().join("target").join("binary"), "").unwrap();
+		std::fs::write(dir.path().join("secrets.txt"), "shh").unwrap();
+		std::fs::write(dir.path().join("README.md"), "").unwrap();
+		std::fs::create_dir(dir.path().join("src")).unwrap();
+		std::fs::write(dir.path().join("src").join("lib.rs"), "").unwrap();
+
+		let input = vec![
+			"README.md".to_string(),
+			"secrets.txt".to_string(),
+			"src/".to_string(),
+			"src/lib.rs".to_string(),
+			"target/".to_string(),
+			"target/binary".to_string(),
+		];
+		let ignored = host(&dir).git_ignored_paths(&input).await.unwrap();
+		let ignored: std::collections::HashSet<_> = ignored.into_iter().collect();
+		assert!(ignored.contains("secrets.txt"));
+		assert!(ignored.contains("target/"));
+		assert!(ignored.contains("target/binary"));
+		assert!(!ignored.contains("README.md"));
+		assert!(!ignored.contains("src/"));
+		assert!(!ignored.contains("src/lib.rs"));
+	}
+
+	// A file that matches a `.gitignore` pattern but has already been
+	// added to the index (think `.env.example` under a `.env*` rule)
+	// must _not_ render as ignored — that's what makes the index-aware
+	// `git ls-files` path exist in the first place. The walker fallback
+	// wouldn't catch this, which is why we skip it when git isn't on
+	// PATH (CI's `git` is always available, so the assertion holds).
+	#[tokio::test]
+	async fn git_ignored_paths_respects_index() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping index-aware gitignore test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		std::fs::write(dir.path().join(".gitignore"), ".env*\n").unwrap();
+		std::fs::write(dir.path().join(".env"), "SECRET=1\n").unwrap();
+		std::fs::write(dir.path().join(".env.example"), "SECRET=\n").unwrap();
+		std::fs::write(dir.path().join("README.md"), "").unwrap();
+
+		run_git(&git, dir.path(), &["init", "-q"]);
+		run_git(&git, dir.path(), &["config", "user.email", "test@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "test"]);
+		run_git(&git, dir.path(), &["add", ".gitignore", "README.md"]);
+		// `.env.example` matches the `.env*` rule; `-f` force-adds it.
+		// Mirrors the real-world "I want the template file in git but
+		// keep .env out" pattern we're trying to special-case.
+		run_git(&git, dir.path(), &["add", "-f", ".env.example"]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "init"]);
+
+		let input = vec![
+			".env".to_string(),
+			".env.example".to_string(),
+			"README.md".to_string(),
+			".gitignore".to_string(),
+		];
+		let ignored = host(&dir).git_ignored_paths(&input).await.unwrap();
+		let ignored: std::collections::HashSet<_> = ignored.into_iter().collect();
+		// `.env` still matches the rule and isn't tracked → ignored.
+		assert!(ignored.contains(".env"), "got {ignored:?}");
+		// `.env.example` matches the rule but is tracked → NOT ignored.
+		// This is the whole reason we prefer `git ls-files` over the
+		// pattern-only walker.
+		assert!(!ignored.contains(".env.example"), "got {ignored:?}");
+		assert!(!ignored.contains("README.md"), "got {ignored:?}");
+		assert!(!ignored.contains(".gitignore"), "got {ignored:?}");
+	}
+
+	fn which_git() -> Option<std::path::PathBuf> {
+		std::process::Command::new("git")
+			.arg("--version")
+			.output()
+			.ok()
+			.filter(|o| o.status.success())
+			.map(|_| std::path::PathBuf::from("git"))
+	}
+
+	fn run_git(git: &std::path::Path, cwd: &std::path::Path, args: &[&str]) {
+		let out = std::process::Command::new(git)
+			.arg("-C")
+			.arg(cwd)
+			.args(args)
+			.output()
+			.expect("spawn git");
+		assert!(
+			out.status.success(),
+			"git {args:?} failed: {}",
+			String::from_utf8_lossy(&out.stderr)
+		);
 	}
 }

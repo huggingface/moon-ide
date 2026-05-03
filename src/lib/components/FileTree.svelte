@@ -13,8 +13,16 @@
 		tree = new FileTree({
 			paths: untrack(() => workspace.paths),
 			flattenEmptyDirectories: true,
-			initialExpansion: 1,
+			// Start every folder collapsed. The previous default
+			// (`initialExpansion: 1`) eagerly opened gitignored folders
+			// like `node_modules/` / `target/` before we knew they were
+			// ignored, and once we did there was no clean "uncollapse
+			// only the non-ignored ones" story that didn't fight the
+			// user's own expansions. A fully-collapsed root is the
+			// simpler default; users open what they actually want.
+			initialExpansion: 0,
 			search: true,
+			gitStatus: toGitStatusEntries(untrack(() => workspace.gitIgnoredPaths)),
 			onSelectionChange: (selectedPaths) => {
 				if (selectedPaths.length === 0) {
 					return;
@@ -41,6 +49,22 @@
 			tree = undefined;
 		};
 	});
+
+	// Feed gitignore status into Pierre whenever the backend classifier
+	// returns a new list. Pierre folds this into its `data-item-git-
+	// status="ignored"` attribute on rows, which fades both the icon
+	// and the label via its built-in styles.
+	$effect(() => {
+		const ignored = workspace.gitIgnoredPaths;
+		if (!tree) {
+			return;
+		}
+		tree.setGitStatus(toGitStatusEntries(ignored));
+	});
+
+	function toGitStatusEntries(ignored: readonly string[]) {
+		return ignored.map((path) => ({ path, status: 'ignored' as const }));
+	}
 
 	// Reactively reset paths when the workspace path list changes, then
 	// replay the active path so Save As (which mutates `activePath`

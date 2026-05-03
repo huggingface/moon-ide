@@ -71,3 +71,14 @@ pub async fn fs_delete(state: State<'_, AppState>, path: String) -> Result<(), M
 	let path = Utf8PathBuf::from(path);
 	entry.host.delete_path(&path).await
 }
+
+/// Classify a batch of workspace-relative paths against the effective
+/// gitignore rules. Returns the ignored subset — used by the file
+/// tree to fade rows and keep ignored top-level folders collapsed on
+/// first paint. Batched rather than per-path so the walker only runs
+/// once per `loadPaths`.
+#[tauri::command]
+pub async fn fs_git_ignored_paths(state: State<'_, AppState>, paths: Vec<String>) -> Result<Vec<String>, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.git_ignored_paths(&paths).await
+}
