@@ -82,6 +82,22 @@ pub trait WorkspaceHost: Send + Sync {
 	/// match `read_dir` output and Pierre's path convention; deleted
 	/// entries never do (git can't track a directory).
 	async fn git_status_entries(&self, paths: &[String]) -> MoonResult<Vec<GitStatusEntry>>;
+
+	/// Discard working-tree *and* index changes for `paths` by
+	/// restoring them to `HEAD`. Runs
+	/// `git restore --source=HEAD --staged --worktree -- <paths>`
+	/// in one subprocess so a multi-selection is atomic from git's
+	/// perspective.
+	///
+	/// Callers are responsible for routing: only `modified` and
+	/// `deleted` paths should come through here. Untracked files
+	/// belong in `trash_path` (the backend has no special "discard"
+	/// for them — removing them from disk *is* the discard). Added
+	/// files (staged new files not yet in HEAD) would be *deleted*
+	/// from disk by this call because HEAD doesn't know them; the
+	/// frontend currently omits them from the menu rather than pick
+	/// a default between "unstage" and "delete".
+	async fn git_restore_paths(&self, paths: &[String]) -> MoonResult<()>;
 }
 
 pub struct LocalHost {
@@ -372,6 +388,105 @@ impl WorkspaceHost for LocalHost {
 		.await
 		.map_err(|e| MoonError::Internal(format!("collect_paths join error: {e}")))?
 	}
+
+	async fn git_restore_paths(&self, paths: &[String]) -> MoonResult<()> {
+		if paths.is_empty() {
+			return Ok(());
+		}
+		// Containment check runs before we hand anything to git. We
+		// can't reuse `resolve` here because deleted files don't
+		// exist on disk and `canonicalize` would 404 on them — which
+		// is the whole point of restoring them. Lexical check is
+		// enough: reject absolute paths, and reject any path whose
+		// segments climb out of the root via `..`.
+		let mut rels = Vec::with_capacity(paths.len());
+		for raw in paths {
+			let trimmed = raw.trim_end_matches('/');
+			if trimmed.is_empty() {
+				continue;
+			}
+			let rel = Utf8PathBuf::from(trimmed);
+			if rel.is_absolute() {
+				return Err(MoonError::invalid(format!(
+					"git_restore_paths rejects absolute path: {rel}"
+				)));
+			}
+			// Walk segments and bail if we ever climb above depth 0.
+			// Extra-defensive: this also rejects `a/../b` even though
+			// it's technically in-root, because a path that needs
+			// normalisation is almost always a bug in the caller.
+			let mut depth = 0i32;
+			for seg in rel.components() {
+				match seg {
+					camino::Utf8Component::ParentDir => {
+						depth -= 1;
+						if depth < 0 {
+							return Err(MoonError::invalid(format!(
+								"git_restore_paths rejects path escape: {rel}"
+							)));
+						}
+					}
+					camino::Utf8Component::Normal(_) => depth += 1,
+					camino::Utf8Component::CurDir => {}
+					// Prefix / RootDir are absolute-path markers we
+					// already rejected via `is_absolute` above, but
+					// be explicit so a future camino change doesn't
+					// silently re-admit them.
+					camino::Utf8Component::Prefix(_) | camino::Utf8Component::RootDir => {
+						return Err(MoonError::invalid(format!(
+							"git_restore_paths rejects rooted path: {rel}"
+						)));
+					}
+				}
+			}
+			rels.push(rel);
+		}
+		if rels.is_empty() {
+			return Ok(());
+		}
+		let root = self.root.clone();
+		tokio::task::spawn_blocking(move || run_git_restore(&root, &rels))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_restore_paths join error: {e}")))??;
+		// Restored files may have been open in the editor; the
+		// editorconfig cache doesn't key on content, so no entry is
+		// stale, but staying symmetric with trash/delete keeps future
+		// maintainers from wondering why this one skips the clear.
+		self.editorconfig.clear().await;
+		Ok(())
+	}
+}
+
+/// `git restore --source=HEAD --staged --worktree -- <paths>`.
+///
+/// Pulling both the index entry and the worktree back to `HEAD` in
+/// one call is the safe discard semantics: a modified file is reset
+/// to its committed content, a deleted file reappears, and a
+/// staged-modification is unstaged-and-reverted in the same pass.
+///
+/// Invoked from the blocking pool; everything inside is synchronous.
+fn run_git_restore(root: &Utf8Path, paths: &[Utf8PathBuf]) -> MoonResult<()> {
+	use std::process::Command;
+
+	let mut cmd = Command::new("git");
+	cmd
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["restore", "--source=HEAD", "--staged", "--worktree", "--"]);
+	for p in paths {
+		cmd.arg(p.as_std_path());
+	}
+	let output = cmd
+		.output()
+		.map_err(|e| MoonError::IoError(format!("git restore failed to launch: {e}")))?;
+	if !output.status.success() {
+		let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+		return Err(MoonError::IoError(format!(
+			"git restore exited {}: {stderr}",
+			output.status.code().unwrap_or(-1)
+		)));
+	}
+	Ok(())
 }
 
 /// Depth-first recursion into the workspace root. Order mirrors the
@@ -926,6 +1041,54 @@ mod tests {
 		assert!(!by_path.contains_key(".env.example"), "got {by_path:?}");
 		assert!(!by_path.contains_key("README.md"), "got {by_path:?}");
 		assert!(!by_path.contains_key(".gitignore"), "got {by_path:?}");
+	}
+
+	#[tokio::test]
+	async fn git_restore_paths_reverts_modified_and_deleted_files() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping git restore test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		std::fs::write(dir.path().join("README.md"), "original\n").unwrap();
+		std::fs::write(dir.path().join("keep.md"), "keep\n").unwrap();
+
+		run_git(&git, dir.path(), &["init", "-q"]);
+		run_git(&git, dir.path(), &["config", "user.email", "test@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "test"]);
+		run_git(&git, dir.path(), &["add", "README.md", "keep.md"]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "init"]);
+
+		// Modify one file and delete another (worktree only, not
+		// staged). After `git_restore_paths` both should be back to
+		// the committed content.
+		std::fs::write(dir.path().join("README.md"), "edited\n").unwrap();
+		std::fs::remove_file(dir.path().join("keep.md")).unwrap();
+
+		host(&dir)
+			.git_restore_paths(&["README.md".to_string(), "keep.md".to_string()])
+			.await
+			.unwrap();
+
+		assert_eq!(
+			std::fs::read_to_string(dir.path().join("README.md")).unwrap(),
+			"original\n"
+		);
+		assert_eq!(std::fs::read_to_string(dir.path().join("keep.md")).unwrap(), "keep\n");
+
+		let entries = host(&dir).git_status_entries(&[]).await.unwrap();
+		let dirty: Vec<_> = entries.iter().filter(|e| e.status != GitFileStatus::Ignored).collect();
+		assert!(dirty.is_empty(), "expected clean worktree, got {dirty:?}");
+	}
+
+	#[tokio::test]
+	async fn git_restore_paths_rejects_path_escapes() {
+		let dir = TempDir::new().unwrap();
+		let err = host(&dir)
+			.git_restore_paths(&["../secret.txt".to_string()])
+			.await
+			.unwrap_err();
+		assert!(matches!(err, MoonError::InvalidArgument(_)), "got {err:?}");
 	}
 
 	fn which_git() -> Option<std::path::PathBuf> {

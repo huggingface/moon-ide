@@ -1083,6 +1083,143 @@ class WorkspaceState {
 	}
 
 	/**
+	 * Discard the user's local changes to `paths`. Routing depends on
+	 * each path's git status:
+	 *
+	 * - `modified` / `deleted` → `git restore --source=HEAD --staged
+	 *   --worktree` brings the file back to its committed content (or
+	 *   un-deletes it).
+	 * - `untracked` → sent to the OS trash. `git restore` has nothing
+	 *   to restore them *to*; the only "undo the change" move is to
+	 *   make the file go away. Reversible from the OS trash bin.
+	 * - `added` / `ignored` → silently dropped. Added files are a
+	 *   conscious `git add` choice whose correct reversal ("unstage"
+	 *   vs "delete") is ambiguous; the menu omits this action for
+	 *   them. Ignored files aren't a "change" in any meaningful
+	 *   sense.
+	 *
+	 * The confirm dialog always fires: `git restore` is irreversible,
+	 * and trashing an untracked file is only reversible via the OS
+	 * UI. Dirty open buffers for restored paths are discarded without
+	 * a per-tab prompt for the same reason `removePaths` skips them —
+	 * the user just confirmed they want changes gone.
+	 */
+	async discardPaths(paths: readonly string[]) {
+		if (paths.length === 0) {
+			return;
+		}
+		const statusMap = new Map(this.gitStatusEntries.map((e) => [e.path, e.status]));
+		const toRestore: string[] = [];
+		const toTrash: string[] = [];
+		for (const path of paths) {
+			const status = statusMap.get(path);
+			if (status === 'modified' || status === 'deleted') {
+				toRestore.push(path);
+			} else if (status === 'untracked') {
+				toTrash.push(path);
+			}
+		}
+		const total = toRestore.length + toTrash.length;
+		if (total === 0) {
+			return;
+		}
+
+		const message = buildDiscardMessage(toRestore, toTrash);
+		const ok = await confirm(message, {
+			title: 'Discard changes',
+			okLabel: 'Discard',
+			cancelLabel: 'Cancel',
+		});
+		if (!ok) {
+			return;
+		}
+
+		// Order matters only in so far as the folder refresh we fire
+		// at the end should see the final state on disk. Both calls
+		// are independent git/fs operations; fire them in parallel.
+		const restorePromise =
+			toRestore.length > 0
+				? ipc.fs.gitRestorePaths(toRestore).then(
+						() => ({ kind: 'restore' as const, ok: true }),
+						(err: unknown) => ({ kind: 'restore' as const, ok: false, err }),
+					)
+				: Promise.resolve({ kind: 'restore' as const, ok: true });
+		const trashSettled =
+			toTrash.length > 0 ? Promise.allSettled(toTrash.map((p) => ipc.fs.trash(p))) : Promise.resolve([]);
+		const [restoreResult, trashResults] = await Promise.all([restorePromise, trashSettled]);
+
+		const failures: { path: string; err: unknown }[] = [];
+		if (!restoreResult.ok) {
+			// `git restore` is batched — we get one verdict for the
+			// whole set. Attribute the failure to the first path so
+			// the toast has something concrete to name.
+			const first = toRestore[0] ?? 'unknown';
+			failures.push({ path: first, err: 'err' in restoreResult ? restoreResult.err : 'unknown' });
+		}
+		const trashedOk: string[] = [];
+		trashResults.forEach((r, i) => {
+			const p = toTrash[i] ?? '';
+			if (r.status === 'fulfilled') {
+				trashedOk.push(p);
+			} else {
+				failures.push({ path: p, err: r.reason });
+			}
+		});
+
+		// Reload open buffers for restored paths so the editor
+		// reflects the committed content rather than the (now
+		// discarded) working-tree text.
+		if (restoreResult.ok && toRestore.length > 0) {
+			const restoredSet = new Set(toRestore);
+			await Promise.all(
+				this.openFiles
+					.filter((f) => f.kind === 'text' && restoredSet.has(f.path))
+					.map((f) => this.reloadOpenFileFromDisk(f.path)),
+			);
+		}
+
+		// Close any tabs for untracked files we just trashed (same
+		// logic `removePaths` applies — the file no longer exists, so
+		// the tab is pointing at nothing).
+		if (trashedOk.length > 0) {
+			const removedSet = new Set(trashedOk);
+			this.openFiles = this.openFiles.filter((f) => !removedSet.has(f.path));
+			this.leftTabs = this.leftTabs.filter((p) => !removedSet.has(p));
+			this.rightTabs = this.rightTabs.filter((p) => !removedSet.has(p));
+			if (this.leftActive !== null && removedSet.has(this.leftActive)) {
+				this.leftActive = this.leftTabs[this.leftTabs.length - 1] ?? null;
+			}
+			if (this.rightActive !== null && removedSet.has(this.rightActive)) {
+				this.rightActive = this.rightTabs[this.rightTabs.length - 1] ?? null;
+			}
+		}
+
+		if (failures.length > 0) {
+			const first = failures[0];
+			const reason = first ? formatError(first.err) : 'unknown error';
+			this.flash(`Discard failed for ${failures.length} of ${total}: ${reason}`);
+		}
+
+		await this.loadPaths();
+		this.persistAppState();
+	}
+
+	/**
+	 * Pull the on-disk text for `path` into the matching open buffer.
+	 * Used by `discardPaths` after a `git restore`: the buffer's
+	 * cached `text` is now stale and the editor needs the committed
+	 * content to render. Silently no-ops if the buffer was closed
+	 * between the restore kicking off and this call resolving.
+	 */
+	private async reloadOpenFileFromDisk(path: string) {
+		const next = await this.loadTextFile(path);
+		if (!next) {
+			return;
+		}
+		this.openFiles = this.openFiles.map((f) => (f.path === path ? next : f));
+	}
+
+	/**
 	 * Shared backbone for `trashPaths` and `deletePaths`. Drops
 	 * descendants of selected ancestors (deleting `src/` + `src/foo.ts`
 	 * is the same as deleting just `src/`), confirms with the user,
@@ -1901,6 +2038,37 @@ function dropDescendantPaths(paths: string[]): string[] {
  * count — listing every path doesn't fit a native dialog cleanly and
  * the visible tree highlight already shows what's selected.
  */
+function buildDiscardMessage(toRestore: string[], toTrash: string[]): string {
+	const total = toRestore.length + toTrash.length;
+	if (total === 1) {
+		if (toRestore.length === 1) {
+			const p = toRestore[0] ?? '';
+			return `Discard your changes to ${p}? This cannot be undone.`;
+		}
+		const p = toTrash[0] ?? '';
+		const isDir = p.endsWith('/');
+		const noun = isDir ? 'untracked folder' : 'untracked file';
+		return `Move the ${noun} ${p} to the trash? This deletes it since git has nothing to restore it to.`;
+	}
+	const parts: string[] = [];
+	if (toRestore.length > 0) {
+		parts.push(`restore ${toRestore.length} tracked file${toRestore.length === 1 ? '' : 's'} to HEAD`);
+	}
+	if (toTrash.length > 0) {
+		const dirs = toTrash.filter((p) => p.endsWith('/')).length;
+		const files = toTrash.length - dirs;
+		const untrackedParts: string[] = [];
+		if (files > 0) {
+			untrackedParts.push(`${files} file${files === 1 ? '' : 's'}`);
+		}
+		if (dirs > 0) {
+			untrackedParts.push(`${dirs} folder${dirs === 1 ? '' : 's'}`);
+		}
+		parts.push(`move ${untrackedParts.join(' and ')} to the trash`);
+	}
+	return `Discard ${total} change${total === 1 ? '' : 's'}? This will ${parts.join(' and ')}. The restore step cannot be undone.`;
+}
+
 function buildRemovalMessage(displays: string[], realPaths: string[], mode: 'trash' | 'delete'): string {
 	if (displays.length === 0) {
 		return '';

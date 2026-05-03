@@ -6,16 +6,52 @@
 	// If you need to reference an HTML element by name in prose,
 	// write it out (e.g. "the style element") rather than wrapping
 	// its tag name in angle brackets.
-	import { onMount, tick, untrack } from 'svelte';
-	import { FileTree, type GitStatusEntry as PierreGitStatusEntry } from '@pierre/trees';
+	import { mount as mountComponent, unmount, onMount, tick, untrack } from 'svelte';
+	import {
+		FileTree,
+		type ContextMenuItem as PierreContextMenuItem,
+		type ContextMenuOpenContext as PierreContextMenuOpenContext,
+		type GitStatusEntry as PierreGitStatusEntry,
+	} from '@pierre/trees';
+	import ContextMenu from './ContextMenu.svelte';
+	import type { ContextMenuItem } from './contextMenu';
 	import { workspace } from '../state.svelte';
-	import type { GitStatusEntry } from '../protocol';
+	import type { GitFileStatus, GitStatusEntry } from '../protocol';
 
-	let mount: HTMLDivElement;
+	let treeMount: HTMLDivElement;
 	let tree: FileTree | undefined;
 
+	// Tracks the Svelte component instance currently rendered inside
+	// Pierre's context-menu slot so we can tear it down when Pierre
+	// tells us to close (and when the menu is replaced with a new one
+	// for a different row). Pierre removes the DOM node on close, but
+	// the Svelte instance still holds reactive state + event wiring
+	// and needs an explicit `unmount` to free it.
+	let activeMenuInstance: ReturnType<typeof mountComponent> | null = null;
+	// Portaled menu host. We render the menu into `document.body`
+	// rather than into Pierre's slot because Pierre's scroll container
+	// has `overflow: hidden` and clips a slotted popover — even when
+	// the popover itself is `position: fixed`, the sticky-row ancestor
+	// has `will-change: transform` which turns it into a containing
+	// block for fixed descendants. Portaling sidesteps both problems.
+	let activeMenuHost: HTMLDivElement | null = null;
+
+	// Nudges we inject into Pierre's shadow DOM via `@layer unsafe`.
+	// Kept deliberately tiny — every rule here is one we'd rather
+	// upstream once Pierre exposes a cleaner hook.
+	//
+	// 1. Pierre's default 6px flex gap plus the 12px git lane puts
+	//    the git dot uncomfortably close to the hover ellipsis; the
+	//    extra right-margin on the git cell restores ~10px of visual
+	//    breathing room without touching the global row gap.
+	const PIERRE_OVERRIDES_CSS = `
+[data-item-section='git'] {
+	margin-right: 8px;
+}
+`;
+
 	onMount(() => {
-		if (!mount) {
+		if (!treeMount) {
 			return;
 		}
 		tree = new FileTree({
@@ -24,6 +60,7 @@
 				untrack(() => workspace.gitStatusEntries),
 			),
 			flattenEmptyDirectories: true,
+			unsafeCSS: PIERRE_OVERRIDES_CSS,
 			// Start every folder collapsed. The previous default
 			// (`initialExpansion: 1`) eagerly opened gitignored folders
 			// like `node_modules/` / `target/` before we knew they were
@@ -53,17 +90,212 @@
 				// handlers below).
 				void workspace.openFile(path, undefined, { focus: false });
 			},
+			composition: {
+				contextMenu: {
+					// Both triggers so mouse users get the right-click
+					// path they expect from a file tree and the hover
+					// ellipsis button covers keyboard / trackpad users
+					// who'd rather click than two-finger-tap. Button
+					// visibility defaults to `when-needed` — the
+					// ellipsis only appears on the hovered / focused
+					// row, keeping the tree visually quiet at rest.
+					enabled: true,
+					triggerMode: 'both',
+					buttonVisibility: 'when-needed',
+					render: renderRowContextMenu,
+					onClose: () => {
+						disposeActiveMenu();
+					},
+				},
+			},
 		});
-		tree.render({ containerWrapper: mount });
+		tree.render({ containerWrapper: treeMount });
 		applyGitOverlay(
 			tree,
 			untrack(() => workspace.gitStatusEntries),
 		);
 		return () => {
+			disposeActiveMenu();
 			tree?.cleanUp();
 			tree = undefined;
 		};
 	});
+
+	// Build the menu DOM for Pierre. Two elements involved: a zero-
+	// sized **anchor** we hand back so Pierre's own bookkeeping
+	// (slot population, focus-restore target, re-open toggling) stays
+	// happy, and a **portaled host** in `document.body` where the
+	// real popover lives. The popover can't render inside Pierre's
+	// shadow DOM: the sticky-row wrapper has `will-change: transform`
+	// (which makes it the containing block for our `position: fixed`
+	// popover) and the scroll container has `overflow: hidden`, so
+	// either clips the menu. `data-file-tree-context-menu-root` goes
+	// on both so Pierre's outside-click detection treats clicks
+	// inside the portaled menu as "inside the menu surface".
+	//
+	// Returning `null` skips the menu altogether for rows with no
+	// applicable actions (e.g. a clean row in a non-git folder).
+	function renderRowContextMenu(
+		item: PierreContextMenuItem,
+		context: PierreContextMenuOpenContext,
+	): HTMLElement | null {
+		const items = buildMenuItems(item);
+		if (items.length === 0) {
+			return null;
+		}
+		// A second `render` call replaces the first. Tear down the
+		// previous instance before mounting the new one so we don't
+		// leak Svelte components or orphan the portaled host.
+		disposeActiveMenu();
+
+		const anchor = document.createElement('div');
+		anchor.setAttribute('data-file-tree-context-menu-root', 'true');
+
+		const host = document.createElement('div');
+		host.setAttribute('data-file-tree-context-menu-root', 'true');
+		// Zero-size portaled container. The popover inside uses
+		// `position: fixed` and positions itself against the viewport,
+		// so the host doesn't need any layout of its own — making it
+		// 0×0 guarantees it never intercepts pointer events outside
+		// the popover's own bounding box. `position: fixed` here is
+		// only so an unstyled child-without-fixed wouldn't end up
+		// anchored to the document flow.
+		host.style.position = 'fixed';
+		host.style.top = '0';
+		host.style.left = '0';
+		host.style.width = '0';
+		host.style.height = '0';
+		host.style.zIndex = '9999';
+		document.body.appendChild(host);
+
+		const instance = mountComponent(ContextMenu, {
+			target: host,
+			props: {
+				items,
+				anchorRect: context.anchorRect,
+				onClose: () => {
+					context.close();
+				},
+			},
+		});
+		activeMenuInstance = instance;
+		activeMenuHost = host;
+		return anchor;
+	}
+
+	function disposeActiveMenu() {
+		if (activeMenuInstance) {
+			void unmount(activeMenuInstance);
+			activeMenuInstance = null;
+		}
+		if (activeMenuHost) {
+			activeMenuHost.remove();
+			activeMenuHost = null;
+		}
+	}
+
+	// Map a row + its backend git status to menu items. Kept small
+	// and deliberately asymmetric: "Discard changes" is the reason
+	// this menu exists, "Copy path" is a staple discovery tool. If a
+	// third action shows up and proves useful we'll add it; until
+	// then more items is more cognitive load for worse focus.
+	function buildMenuItems(item: PierreContextMenuItem): ContextMenuItem[] {
+		const items: ContextMenuItem[] = [];
+		const discardPaths = collectDiscardPaths(item);
+		if (discardPaths.length > 0) {
+			items.push({
+				id: 'discard',
+				label: discardLabel(item, discardPaths),
+				kind: 'danger',
+				onSelect: () => {
+					void workspace.discardPaths(discardPaths);
+				},
+			});
+		}
+		items.push({
+			id: 'copy-path',
+			label: 'Copy path',
+			onSelect: () => {
+				void navigator.clipboard?.writeText(item.path).catch(() => {
+					// Clipboard can reject when the window isn't
+					// focused during the prompt; the close already
+					// fired, so all we can do is drop the action.
+					// Not a user-facing error — any reason this
+					// would fail is a browser-policy boundary.
+				});
+			},
+		});
+		return items;
+	}
+
+	/**
+	 * Paths that `workspace.discardPaths` should see when the user
+	 * picks "Discard" on `item`. Files resolve to the file itself
+	 * (if its own git status is discardable); folders fan out into
+	 * every non-ignored, non-added change under them. 'added'
+	 * descendants are skipped for the same reason the file-level
+	 * action omits them — reverting staged-new is ambiguous between
+	 * "unstage" and "delete" and we don't want a folder-scoped click
+	 * to silently pick one. Ignored descendants are skipped because
+	 * they aren't meaningfully a "change". An empty list means the
+	 * menu should not offer a discard entry at all.
+	 */
+	function collectDiscardPaths(item: PierreContextMenuItem): string[] {
+		const entries = workspace.gitStatusEntries;
+		if (item.kind === 'file') {
+			for (const entry of entries) {
+				if (entry.path !== item.path) {
+					continue;
+				}
+				if (isDiscardable(entry.status)) {
+					return [entry.path];
+				}
+				return [];
+			}
+			return [];
+		}
+		// Directory: match the folder row itself (e.g. a wholly-
+		// untracked `foo/`) plus every descendant. Pierre's
+		// `data-item-path` for directories carries a trailing slash
+		// which matches the backend's output, so `startsWith`
+		// unambiguously means "strictly under this folder".
+		const out: string[] = [];
+		for (const entry of entries) {
+			const isMatch = entry.path === item.path || entry.path.startsWith(item.path);
+			if (!isMatch) {
+				continue;
+			}
+			if (isDiscardable(entry.status)) {
+				out.push(entry.path);
+			}
+		}
+		return out;
+	}
+
+	function isDiscardable(status: GitFileStatus): boolean {
+		return status === 'modified' || status === 'deleted' || status === 'untracked';
+	}
+
+	function discardLabel(item: PierreContextMenuItem, paths: readonly string[]): string {
+		if (item.kind === 'file') {
+			// Single-path path: use the exact status to tailor copy.
+			// An untracked row is more honest as "move to trash" than
+			// "discard" since git has nothing to revert — the label
+			// tracks that.
+			const entry = workspace.gitStatusEntries.find((e) => e.path === item.path);
+			if (entry?.status === 'untracked') {
+				return 'Discard (move untracked file to trash)';
+			}
+			return 'Discard changes';
+		}
+		// Directory: a count clarifies the scope so the user can
+		// predict whether the confirm dialog is going to list one or
+		// fifty paths. Singular/plural is worth the branch.
+		if (paths.length === 1) {
+			return 'Discard 1 change in this folder';
+		}
+		return `Discard ${paths.length} changes in this folder`;
+	}
 
 	// Feed git status into Pierre whenever the backend classifier
 	// returns a new list. We strip `ignored` entries first (see
@@ -667,7 +899,7 @@
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="tree" bind:this={mount} onkeydown={onKeyDown} ondblclick={onDblClick}></div>
+<div class="tree" bind:this={treeMount} onkeydown={onKeyDown} ondblclick={onDblClick}></div>
 
 <style>
 	.tree {

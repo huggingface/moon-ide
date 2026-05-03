@@ -98,3 +98,14 @@ pub async fn fs_git_status_entries(
 	let entry = state.workspaces.require_active_folder().await?;
 	entry.host.git_status_entries(&paths).await
 }
+
+/// Discard working-tree + index changes for `paths` by restoring
+/// them to `HEAD`. Batched so a multi-select discard is one git
+/// invocation; the frontend is responsible for routing untracked
+/// paths through `fs_trash` instead (HEAD has nothing to restore
+/// them to).
+#[tauri::command]
+pub async fn fs_git_restore_paths(state: State<'_, AppState>, paths: Vec<String>) -> Result<(), MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.git_restore_paths(&paths).await
+}

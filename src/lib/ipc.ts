@@ -43,6 +43,7 @@ export const ipc = {
 		trash: (path: string) => invoke<void>('fs_trash', { path }),
 		delete: (path: string) => invoke<void>('fs_delete', { path }),
 		gitStatusEntries: (paths: string[]) => invoke<GitStatusEntry[]>('fs_git_status_entries', { paths }),
+		gitRestorePaths: (paths: string[]) => invoke<void>('fs_git_restore_paths', { paths }),
 	},
 	search: {
 		files: (options: FileSearchOptions) => invoke<FileSearchResult[]>('search_files', { options }),
