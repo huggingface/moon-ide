@@ -16,6 +16,7 @@ import {
 } from './protocol';
 import { bottomPanel } from './bottomPanel.svelte';
 import { composeLogs } from './composeLogs.svelte';
+import { terminal } from './terminal.svelte';
 import { container } from './container.svelte';
 import { projectCompose } from './projectCompose.svelte';
 import { slack } from './slack.svelte';
@@ -534,6 +535,11 @@ class WorkspaceState {
 		// panel's log tabs receive lines as soon as the user opens
 		// one — no per-tab subscription dance.
 		void composeLogs.wireRuntime();
+		// Terminal output rides on its own event channel —
+		// see `terminal.svelte.ts`. Wired once at startup so
+		// the first `+ Terminal` click responds without bus-bind
+		// latency.
+		void terminal.wireRuntime();
 
 		const ws = this.workspace;
 		const session = state.last_session;

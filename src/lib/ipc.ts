@@ -17,6 +17,7 @@ import type {
 	SlackStatus,
 	SlackUserSummary,
 	StatResult,
+	TerminalOpenRequest,
 	Workspace,
 	WriteFileResult,
 } from './protocol';
@@ -79,6 +80,12 @@ export const ipc = {
 	composeLogs: {
 		open: (folderPath: string, service: string) => invoke<string>('compose_logs_open', { folderPath, service }),
 		close: (streamId: string) => invoke<void>('compose_logs_close', { streamId }),
+	},
+	terminal: {
+		open: (request: TerminalOpenRequest) => invoke<string>('terminal_open', { request }),
+		write: (streamId: string, data: string) => invoke<void>('terminal_write', { streamId, data }),
+		resize: (streamId: string, cols: number, rows: number) => invoke<void>('terminal_resize', { streamId, cols, rows }),
+		close: (streamId: string) => invoke<void>('terminal_close', { streamId }),
 	},
 	slack: {
 		setToken: (token: string) => invoke<SlackIdentity>('slack_set_token', { token }),

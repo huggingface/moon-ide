@@ -19,6 +19,7 @@ moon-container = { workspace = true }
 moon-core = { workspace = true }
 moon-protocol = { workspace = true }
 moon-slack = { workspace = true }
+moon-terminal = { workspace = true }
 
 tauri = { version = "2.10", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2.4"
@@ -35,3 +36,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 dirs = "6.0.0"
 uuid = { version = "1.18", features = ["v4"] }
+# Terminal IPC ferries arbitrary 8-bit PTY bytes (escape sequences,
+# UTF-8 fragments split mid-codepoint on read boundaries) over Tauri's
+# JSON payload codec; base64 framing keeps the wire format honest.
+# `base64` 0.22 ships the `Engine` trait we use directly.
+base64 = "0.22"

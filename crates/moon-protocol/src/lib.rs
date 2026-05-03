@@ -11,6 +11,7 @@ pub mod fs;
 pub mod search;
 pub mod session;
 pub mod slack;
+pub mod terminal;
 pub mod theme;
 pub mod workspace;
 

@@ -31,6 +31,22 @@ use crate::state::AppState;
 /// loop keeps the shutdown logs readable when the user is staring
 /// at a "closing…" overlay.
 pub async fn stop_all(state: &AppState) {
+	// Abort every open terminal supervisor first. Each abort
+	// drops the supervisor's `PtySession`, which SIGKILLs the
+	// child process (host shell or `docker exec`) eagerly.
+	// Without this step `docker exec` children survive the
+	// IDE process and accumulate as orphans on the daemon.
+	{
+		let mut registry = state.terminal_streams.lock().await;
+		let count = registry.len();
+		for (_, handle) in registry.drain() {
+			handle.abort.abort();
+		}
+		if count > 0 {
+			tracing::info!(count, "stop_all: aborted terminal supervisors");
+		}
+	}
+
 	let snapshot = state.workspaces.snapshot().await;
 	let workspace_id = snapshot.id.clone();
 	let bound: Vec<Utf8PathBuf> = snapshot.folders.iter().map(|f| Utf8PathBuf::from(&f.path)).collect();

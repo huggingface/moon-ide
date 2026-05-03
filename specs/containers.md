@@ -551,6 +551,54 @@ container are rare, and the user's next attempt to bring
 the project up will surface any persistent failure
 anyway.
 
+## Terminals
+
+Phase 3 ([roadmap](roadmaps/phase-03-terminal.md), [ADR 0009](decisions/0009-terminal-pty-and-targets.md))
+adds PTY-backed terminal sessions to the bottom panel. They
+matter to the container story because container terminals
+_are_ the workspace shell from the user's point of view —
+"what can I run inside the dev container right now" —
+and their lifecycle is tied to the workspace container's.
+
+Two targets, picked at open time and immutable per tab:
+
+- **Host** — spawns the user's `$SHELL` (fallback
+  `/bin/bash`) directly on the user's machine. cwd is the
+  active folder's host path. Independent of the workspace
+  container; survives a workspace container Stop / Down.
+- **Container** — `docker exec -it
+moon-ws-<id>-dev-1 <shell>` against the workspace
+  container. cwd is `/workspace/<basename>` for the active
+  folder. Disabled in the launcher popover when the
+  workspace container isn't running. **Does not** survive
+  a Stop / Down / Recreate of the container — the
+  `docker exec` dies with its parent and the tab flips to
+  `[exited (N)]`. The user opens a fresh tab against the
+  new container.
+
+The asymmetry is intentional: Host terminals are
+"my machine right now"; Container terminals are
+"this specific container right now". Migrating between
+them at lifecycle events would be confusing — better to
+make the relationship explicit and let the user
+re-establish it when they care.
+
+PTY plumbing uses [`portable-pty`](https://docs.rs/portable-pty);
+both targets allocate a host-side master PTY and run their
+command (host shell, or `docker exec`) as the child. SIGWINCH
+propagates correctly through `docker exec`, so xterm-addon-fit
+resizes both the host PTY and the in-container TTY in one
+hop. See `crates/moon-terminal/` for the spawn helper and
+`src-tauri/src/commands/terminal.rs` for the supervisor that
+ferries bytes over Tauri events.
+
+`stop_all` (the IDE-quit path) aborts every open terminal
+supervisor before it does anything else — the supervisor's
+`PtySession` drops, the SIGKILL goes to the host shell or
+`docker exec`, and neither survives the IDE process. This
+is what keeps the daemon clean of orphaned exec sessions
+across IDE quits.
+
 ## What runs where
 
 | Concern                                                | Host (Tauri / moon-ide proper)                       | Workspace `dev` container  | Project service containers (compose siblings) |

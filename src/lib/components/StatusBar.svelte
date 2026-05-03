@@ -3,6 +3,7 @@
 	import { slack } from '../slack.svelte';
 	import { container, containerStateLabel } from '../container.svelte';
 	import ContainerPanel from './ContainerPanel.svelte';
+	import TerminalLauncher from './TerminalLauncher.svelte';
 
 	let themeBtn: HTMLButtonElement | undefined = $state();
 	let containerWrap: HTMLDivElement | undefined = $state();
@@ -91,6 +92,10 @@
 				{/if}
 			</div>
 		{/if}
+		<!-- Terminal launcher. Same popover the bottom-panel
+			 strip uses; placed here so the user can spawn a
+			 shell without opening the panel first. -->
+		<TerminalLauncher anchor="above" variant="compact" title="Open terminal" />
 		<!-- Chat panel toggle. Pip indicator shows connection state so
 			 the user can see "Slack: connected" without opening the
 			 panel. Independent dispatch from the command palette. -->

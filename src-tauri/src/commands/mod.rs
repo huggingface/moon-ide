@@ -6,4 +6,5 @@ pub mod fs;
 pub mod project_compose;
 pub mod search;
 pub mod slack;
+pub mod terminal;
 pub mod workspace;

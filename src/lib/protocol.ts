@@ -201,6 +201,45 @@ export type LogStreamClosed = {
 	code: number | null;
 };
 
+/**
+ * Where a terminal's shell process runs. Picked at open time
+ * and immutable for the tab's life. Mirrors
+ * `moon_protocol::terminal::TerminalTarget`.
+ *
+ * - `host`: the user's machine. `cwd` is an absolute host
+ *   path; `null` falls back to `$HOME`.
+ * - `container`: the workspace container (`moon-ws-<id>-dev-1`).
+ *   `cwd` is a path inside the container — the frontend
+ *   computes `/workspace/<basename>` for the active folder
+ *   before dispatching the open call.
+ */
+export type TerminalTarget =
+	| { kind: 'host'; cwd: string | null }
+	| { kind: 'container'; workspace_id: string; cwd: string };
+
+/** Open-call payload. Mirrors
+ * `moon_protocol::terminal::TerminalOpenRequest`. */
+export type TerminalOpenRequest = {
+	target: TerminalTarget;
+	cols: number;
+	rows: number;
+};
+
+/** One chunk of terminal output. Bytes are base64-encoded —
+ * decode with `atob` before feeding xterm.js's `write`.
+ * Mirrors `moon_protocol::terminal::TerminalOutput`. */
+export type TerminalOutput = {
+	stream_id: string;
+	data: string;
+};
+
+/** Final event for a terminal session when its child exits.
+ * Mirrors `moon_protocol::terminal::TerminalClosed`. */
+export type TerminalClosed = {
+	stream_id: string;
+	code: number | null;
+};
+
 export const defaultAppState: AppState = {
 	last_session: null,
 	theme: 'dark',

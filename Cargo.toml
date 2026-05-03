@@ -7,6 +7,7 @@ members = [
 	"crates/moon-agent",
 	"crates/moon-slack",
 	"crates/moon-container",
+	"crates/moon-terminal",
 ]
 
 [workspace.package]
@@ -20,6 +21,7 @@ moon-core = { path = "crates/moon-core" }
 moon-protocol = { path = "crates/moon-protocol" }
 moon-slack = { path = "crates/moon-slack" }
 moon-container = { path = "crates/moon-container" }
+moon-terminal = { path = "crates/moon-terminal" }
 
 anyhow = "1.0"
 async-trait = "0.1"

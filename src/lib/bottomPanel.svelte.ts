@@ -35,7 +35,7 @@
 //! launch, and silently re-spawning them at startup would
 //! surprise the user.
 
-import type { BottomPanelAppState } from './protocol';
+import type { BottomPanelAppState, TerminalTarget } from './protocol';
 
 /** Minimum panel height (px). Below this the tab strip and a
  * single line of body content stop being legible. */
@@ -56,7 +56,7 @@ export const DEFAULT_BOTTOM_PANEL_HEIGHT = 240;
  * lean shells — kind-specific content (log line buffers, future
  * terminal session handles) lives in a sibling store keyed on
  * `id` so adding new kinds doesn't bloat this type. */
-export type BottomPanelTab = PlaceholderTab | LogTab;
+export type BottomPanelTab = PlaceholderTab | LogTab | TerminalTab;
 
 export type PlaceholderTab = {
 	id: string;
@@ -72,6 +72,17 @@ export type LogTab = {
 	folderPath: string;
 	/** Compose service name being tailed. */
 	service: string;
+};
+
+/** Terminal session tab. The `target` is captured at open time
+ * and immutable for the tab's life — see ADR 0009. The store
+ * (`terminal.svelte.ts`) holds the live xterm instance keyed
+ * on `id`. */
+export type TerminalTab = {
+	id: string;
+	title: string;
+	kind: 'terminal';
+	target: TerminalTarget;
 };
 
 class BottomPanelStore {

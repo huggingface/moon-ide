@@ -32,6 +32,31 @@ pub struct AppState {
 	/// spawned with `kill_on_drop(true)` so the SIGKILL goes out
 	/// immediately. See [`crate::commands::compose_logs`].
 	pub log_streams: Arc<Mutex<HashMap<String, AbortHandle>>>,
+	/// Registry of active terminal sessions, keyed by stream id.
+	/// Each entry holds the supervisor's [`AbortHandle`] alongside
+	/// a tokio mpsc sender that ferries `terminal_write` bytes
+	/// from the command thread into the supervisor — see
+	/// [`crate::commands::terminal`]. Aborting the supervisor
+	/// drops the `PtySession` which kills the child process
+	/// (host shell or `docker exec`) immediately.
+	pub terminal_streams: Arc<Mutex<HashMap<String, TerminalStreamHandle>>>,
+}
+
+/// Owning handle the terminal commands keep per stream. The
+/// `tx` channel is read by the supervisor task; sending fails
+/// once the supervisor exits (process dead) so write commands
+/// translate that to a no-op.
+pub struct TerminalStreamHandle {
+	pub tx: tokio::sync::mpsc::Sender<TerminalCommand>,
+	pub abort: AbortHandle,
+}
+
+/// Inputs the terminal supervisor accepts on its mpsc channel.
+/// Resize is in-band so we don't need a second mutex around the
+/// `PtySession`.
+pub enum TerminalCommand {
+	Write(Vec<u8>),
+	Resize { cols: u16, rows: u16 },
 }
 
 impl AppState {
@@ -42,6 +67,7 @@ impl AppState {
 			workspaces_dir,
 			slack,
 			log_streams: Arc::new(Mutex::new(HashMap::new())),
+			terminal_streams: Arc::new(Mutex::new(HashMap::new())),
 		}
 	}
 
