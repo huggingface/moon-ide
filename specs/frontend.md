@@ -75,6 +75,35 @@ State per editor:
 
 Saves go through `ipc.fs.writeFile`. The editor only tracks dirty state; persistence is owned by the workspace state module.
 
+### Extensions baseline
+
+`baseExtensions()` in `Editor.svelte` is the single source of truth for what every editor instance gets. It's deliberately explicit rather than pulled from `codemirror`'s kitchen-sink `basicSetup` — we want to know exactly which behaviours are on:
+
+- **Line numbers + active line/gutter** — structural.
+- **`bracketMatching` + `closeBrackets`** — matches the paren/bracket/brace under the caret, and auto-inserts the matching close glyph on opener input. `closeBracketsKeymap` is merged into the keymap so backspace on an empty pair deletes both sides.
+- **`indentOnInput` + `history`** — language-aware reindent after tokens and full undo/redo.
+- **`highlightSelectionMatches`** — highlights other occurrences of the current selection in the buffer (matches VSCode's "selection highlights").
+- **`autocompletion({ activateOnTyping: false })`** — completion surface only; no source is registered yet. Opens explicitly on Ctrl-Space or when a future LSP source dispatches one. We keep the popover off the typing path because the built-in identifier-from-document source is too noisy to show unprompted, and the real sources (LSP, snippets) arrive in a later phase.
+- **Tab / indent** — `indentWithTab` keyed, indent unit and tab size driven by the `editorConfigCompartment`.
+
+Anything not in that list is intentionally off. Notably **no** folding, **no** rectangular selection, **no** rainbow brackets (deferred — wants a Lezer-aware scan to skip strings/comments; will land as a small standalone extension when it's someone's actual itch).
+
+### Diff and conflict surfaces
+
+Different jobs, different tools:
+
+- **Read-only diffs** (commit detail, SCM review panel, PR hover): `@pierre/diffs`. Shiki-rendered with built-in split/unified toggle, line wrap, and annotation hooks for review actions.
+- **Editable merge conflicts**: `@codemirror/merge`. Its `MergeView` is a real CM editor with a diff gutter, so the same keybindings, theme, selection, and undo stack apply — a conflict-resolution buffer is just a CM buffer with extra chrome. Not yet wired; lands alongside the SCM "resolve conflicts" flow.
+- **Main editor buffer**: CodeMirror 6, as above.
+
+The split matters because Pierre Diffs is display-only — forcing it to also edit would either duplicate CM's work or give us a second inferior editor. Keeping CM for every editable surface keeps "what works in the main editor" identical to "what works in the conflict editor".
+
+### LSP hook
+
+Planned shape (not yet built): a per-file `ViewPlugin` subscribes to moon-core's LSP broker (one adapter per capability — hover, go-to-def, diagnostics, completions). The adapter translates LSP events into CM's `hoverTooltip`, `gotoDefinition` command, `setDiagnostics` effect, and `autocompletion` source respectively. Nothing goes to the UI that didn't come through moon-core — no direct LSP process ownership on the frontend.
+
+Git blame is shaped the same way: a `ViewPlugin` that reads per-line blame from moon-core and decorates the gutter with a soft right-aligned annotation. Both ride the same infra that discard-changes already uses (workspace state → IPC → rust core → surface).
+
 ## File tree
 
 `@pierre/trees` `FileTree` class is instantiated in `FileTree.svelte`'s `onMount`. Mounted into a div via `tree.render({ containerWrapper })`. Selection and double-click are wired to `workspace.openFile(path)`. The component cleans up via `tree.cleanUp()` in `onDestroy`.

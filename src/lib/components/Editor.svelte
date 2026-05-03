@@ -6,6 +6,7 @@
 	import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 	import { searchKeymap, highlightSelectionMatches } from '@codemirror/search';
 	import { bracketMatching, indentOnInput, indentUnit } from '@codemirror/language';
+	import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from '@codemirror/autocomplete';
 	import { workspace, type OpenFile, type SplitSide } from '../state.svelte';
 	import { languageFor } from '../editor/language';
 	import { moonEditorTheme } from '../editor/theme';
@@ -157,10 +158,28 @@
 			highlightActiveLine(),
 			highlightActiveLineGutter(),
 			bracketMatching(),
+			closeBrackets(),
 			indentOnInput(),
 			history(),
 			highlightSelectionMatches(),
-			keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap, indentWithTab]),
+			// Autocompletion with `activateOnTyping: false` means the
+			// popover only opens on an explicit trigger (Ctrl-Space) or
+			// when a future LSP source emits a completion. That keeps
+			// the editor from flashing identifier suggestions at the
+			// user while they type — without a real language server
+			// feeding it, the builtin word-from-buffer source is more
+			// annoying than helpful. Structure is in place now so that
+			// the LSP client we wire in a later phase has a CM surface
+			// to mount itself on without re-shaping the extension list.
+			autocompletion({ activateOnTyping: false }),
+			keymap.of([
+				...closeBracketsKeymap,
+				...defaultKeymap,
+				...historyKeymap,
+				...searchKeymap,
+				...completionKeymap,
+				indentWithTab,
+			]),
 			themeCompartment.of(moonEditorTheme(workspace.effectiveTheme)),
 			languageCompartment.of([]),
 			editorConfigCompartment.of(editorConfigExtensions(ec)),
