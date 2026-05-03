@@ -5,52 +5,31 @@
 
 ## What shipped
 
-### Phase 0 — Skeleton
+Phase 0 + Phase 1 + post-Phase 1 polish, landed as one cut:
 
-- Tauri 2 shell (`src-tauri/`) + Svelte 5 frontend (`src/`).
-- `WorkspaceHost` trait with a `LocalHost` implementation in `crates/moon-core/`.
-- `moon-protocol` crate is the single source of truth for IPC types; TS types in `src/lib/protocol.ts` mirror it.
-- IPC commands: workspace open/list/active, fs read-dir/read-file/write-file/stat, app-state load/save.
-- File tree (Pierre Trees, vanilla JS) wired to `LocalHost::read_dir`.
-- CodeMirror 6 editor with lazy-loaded language extensions. Open / edit / save round-trip works.
+- **Shell + IDE bones.** Tauri 2 + Svelte 5 app, `WorkspaceHost`
+  trait with a `LocalHost`, a single-source `moon-protocol` crate
+  for IPC, file tree (Pierre Trees), and a CodeMirror 6 editor
+  with lazy language extensions.
+- **Editing.** Open / edit / save round-trip; dirty marker
+  reverts on undo-to-disk via a length + FNV fingerprint
+  (no second copy of the text); pre-save pipeline; image viewer
+  over the Tauri asset protocol.
+- **Navigation.** Horizontal split, tabs per pane with drag-to-
+  reorder, command palette, file-name search, ripgrep content
+  search, editor focus ticker so tree/tab clicks land the caret
+  straight in CodeMirror.
+- **Persistence.** `AppState` (`<app_config_dir>/state.json`)
+  restores workspace, open tabs, active pane, split, and theme
+  across launches. Corrupt / schema-drifted files warn and fall
+  back to defaults — no migration shims (per AGENTS.md).
+- **Process.** `specs/test-plans/` introduced (this is the first
+  entry). AGENTS.md gains the "no pre-existing warnings" and
+  "no premature migrations" rules.
 
-### Phase 1 — Editor + navigation
-
-- Horizontal split (left / right pane) with focus tracking.
-- Editor tabs per pane, with dirty marker.
-- Custom command palette (`Ctrl+P` / `Ctrl+Shift+P`).
-- File-name search and ripgrep-backed content search (Rust backend in `crates/moon-core/src/search.rs`).
-- Hardcoded keybindings: `Ctrl+P`, `Ctrl+Shift+P`, `Ctrl+S`, `Ctrl+W`, `Alt+Left/Right` (planned, not yet wired).
-
-### Phase 1.5 polish (post-test fixes)
-
-- Editor indentation is hardcoded in `Editor.svelte`: `tab_size = 2`, tabs (not spaces). Phase 1.5 replaces this with per-file `.editorconfig` resolution. There is no `settings.json` — see [ADR 0006](../decisions/0006-no-settings-file.md).
-- Tab rendering: tab markers are always on. Tabs show a small muted arrow at their left edge. We do **not** mark spaces — CM6's space dots were too noisy on this theme, and the team uses tabs for indentation so the spaces signal carried little value. Implemented as a custom `highlightTabs()` extension in `src/lib/editor/highlightTabs.ts` (a `MatchDecorator` over `/\t/g`), not CM6's `highlightWhitespace`. There used to be an `editor.render_tabs` knob; it had no concrete consumer at toggle-off time, so it was inlined as part of the `settings.json` deletion (ADR 0006). If the team wants it back, add a constant in `Editor.svelte` first; promote to `.editorconfig` only when a per-file flip is actually needed.
-- Restore last opened workspace on launch. Workspace path is part of `AppState.last_session` and persisted to `<app_config_dir>/state.json` after every relevant mutation; restored synchronously in Tauri's `setup` so the frontend's first `workspace.active()` call already sees it. Missing folders are logged but the saved entry is **not** cleared (covers the unmount-USB-drive case). The `moon-core::app_state` module owns load / save and has its own tests. Phase 7 grows `last_session` into a recent list — see the Phase 7 entry in the roadmap.
-- File tree dark theme: corrected `--trees-*-override` CSS variables in `src/styles.css`.
-- Search-input top padding restored.
-- Dotfiles (`.editorconfig`, `.husky/`, etc.) are visible in the tree; only `.git/` is hidden host-side. Real `.gitignore`-aware fading is deferred to Phase 5.
-- `Ctrl+W` closes the active tab.
-- Dirty marker now reverts when the buffer matches the saved bytes (e.g. after `Ctrl+Z` undo). Uses an FNV-1a 32-bit fingerprint + length, not a second copy of the full text — see `src/lib/util/hash.ts`.
-- Rust syntax highlighting (`@codemirror/lang-rust`).
-- TOML syntax highlighting via `@codemirror/legacy-modes`.
-- Filename-based language map for files without useful extensions: `Cargo.lock` → TOML, `bun.lock` → JSON, `.editorconfig` / `.npmrc` → properties (INI).
-- Image viewer for `png/jpg/jpeg/gif/webp/svg/bmp/ico/avif`. Uses Tauri's asset protocol via a new `WorkspaceHost::absolute_path` and `convertFileSrc` on the frontend; no image bytes flow through the IPC.
-- New IPC: `fs.absolutePath(path)` exposes `WorkspaceHost::absolute_path` to the UI.
-- Bundler warning fix: `@tauri-apps/plugin-dialog` is now statically imported in `commands.svelte.ts` (it was already static elsewhere — `INEFFECTIVE_DYNAMIC_IMPORT` is gone).
-- `vite.config.ts` raises `chunkSizeWarningLimit` to 1500 with a comment explaining why a Tauri-served bundle is a different beast from a web app.
-- Editor focus follows file activation. New `WorkspaceState.focusTick` counter that the active `Editor.svelte` reads as a reactive dependency; bumped from `setActive` (tab clicks, tree clicks, command palette) and from `closeFile` when a fallback tab takes over. Editor calls `view.focus()` via microtask so the click that triggered the bump finishes settling first. This means arrow keys / typing land in the editor immediately after opening or switching files instead of staying in the tree or on the tab strip.
-- File tree mirrors the active file. The previous "deselect closed files" effect was generalised: a single `$effect` in `FileTree.svelte` keeps Pierre's selection equal to `{ activePath }` (or empty when no file is active). Tab click → row highlight follows. Closing the last tab → row clears so the next tree click is a real selection change. Early-returns when already in sync to avoid feedback loops with the tree's own `onSelectionChange`.
-- Closing a dirty file shows a native confirm dialog ("Discard / Cancel"). `closeFile` is now async; it only proceeds past the dialog on Discard. Two-button rather than three because `@tauri-apps/plugin-dialog` is OK/Cancel only; the "Save" path stays at `Ctrl+S` for now (a custom 3-way modal can land later if anyone trips over the omission). Capabilities updated: `dialog:allow-confirm`.
-- Tab strip is draggable. Tabs carry `draggable="true"`; an HTML5 drag exchanges a small `application/x-moon-tab` payload (path) and the strip's `dragover` decides drop position by the cursor's left/right halves of the hovered tab (or "after the last tab" when over empty strip space). A new `WorkspaceState.moveFile(fromPath, beforePath | null)` does the immutable reorder. `user-select: none` on tabs stops the click-and-drag-selects-text bug. Drop position is shown with a 2px accent stripe at the leading edge of the target (or trailing edge of the strip for "drop at end"). Out of scope for now: dragging across panes, dragging the close button, dropping outside moon-ide.
-- Session persistence (open files + active tab) extended beyond just the folder path. New `WorkspaceSession` type in `crates/moon-protocol/src/session.rs` (with `SplitSide`); `AppState` now carries `last_session: Option<WorkspaceSession>` plus `theme: ThemeMode`. Frontend persists on every mutation that changes the visible state — `openLocal`, `openFile` (via `setActive`), `closeFile`, `setActive`, `splitActive`, `closeSplit`, `focusSide`, `toggleTheme` — through a microtask-coalesced `persistAppState()` that lands a single IPC roundtrip per tick. On launch, `App.svelte` calls `workspace.restoreAppState()` after the workspace is mounted; files that no longer exist are dropped silently and the cleaned-up list is saved back. Per AGENTS.md "no premature migrations" we did not add a fallback for any previous on-disk shape — corrupted/old `state.json` parses fail gracefully (warn + default).
-- `Settings` (and the `<workspace>/.moon/settings.json` file) deleted entirely. Project style is `.editorconfig` (Phase 1.5); per-machine state (theme + last session) is `AppState`. See [ADR 0006](../decisions/0006-no-settings-file.md). Tauri now exposes a single `app_state_load` / `app_state_save` pair instead of separate `settings_*` and `session_*` commands.
-
-### Process additions
-
-- AGENTS.md gains a "no pre-existing warnings" rule and a bootstrap exception clause in "Scope discipline".
-- AGENTS.md gains a "no premature migrations" rule: until the roadmap's last phase ships, schemas (settings, persisted app state, JSON-RPC) can be renamed/restructured/deleted freely without compat shims. A best-effort warn + default fallback is fine; crashing on startup is not.
-- `specs/test-plans/` introduced. This file is the first entry. README explains when to write one and when to skip.
+Hardcoded-for-now decisions live in ADR 0006 (no `settings.json`
+— project style moves to `.editorconfig` in 1.5, per-machine
+state stays in `AppState`).
 
 ## How to test
 

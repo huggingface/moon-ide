@@ -5,53 +5,26 @@ Enter to send (Shift+Enter for a newline), "+ New session" to
 start a fresh top-level thread. Detailed design lives in
 [`slack-chat.md`](../slack-chat.md#sending-messages-phase-113).
 
-## What ships
+## What shipped
 
+- Chat panel can finally talk back. Auto-growing composer
+  pinned at the bottom; Enter sends, Shift+Enter newlines,
+  Ctrl/Cmd+Enter also sends (muscle memory), Esc cancels the
+  new-session composer.
+- `+ New session` at the top of the session list starts a fresh
+  top-level thread; first send pivots the panel into the new
+  thread and refreshes the sessions list.
 - New `SlackClient::post_message(channel, thread_ts?, text)`
-  wrapping
-  [`chat.postMessage`](https://api.slack.com/methods/chat.postMessage).
-  The `chat:write` scope was granted upfront in 11.0 so no
-  reinstall is needed. Returns the freshly-posted
-  [`SlackMessage`] (normalised through the same `to_message` path
-  every other read goes through, so the frontend doesn't need a
-  reconciliation special case).
-- New tauri command `slack_post_message(channel, thread_ts?, text)`
-  - matching `ipc.slack.postMessage` binding.
-- Frontend composer in `ChatPanel.svelte`:
-  - Textarea pinned to the bottom of the panel; visible when
-    `activeThreadTs !== null` (reply mode) or
-    `composingNewSession === true` (new-session mode).
-  - **Enter** sends; **Shift+Enter** inserts a newline;
-    **Ctrl/Cmd+Enter** also sends (muscle-memory carry-over from
-    other tools); **Esc** cancels the new-session composer.
-  - Disabled while a post is in flight (the textarea greys out
-    and rejects keypresses; no send button to click).
-  - Send error renders inline above the textarea; draft is
-    preserved so the user can retry.
-  - Auto-grows from 1-line height up to a 120 px cap as the user
-    types; shrinks back when lines are deleted.
-  - Pinned to the bottom of the panel via the `connected-scroll`
-    - `composer` flex split — empty thread space lives above
-      the textarea, never between the textarea and the bottom of
-      the window.
-- "+ New session" button at the top of the session list when no
-  thread is open. Toggles `composingNewSession`; first post pivots
-  the panel into the new thread (sets `activeThreadTs` to the
-  returned `ts`, replaces `threadMessages` with `[message]`,
-  re-runs `loadSessions()`).
-- New `slack.svelte.ts` actions: `sendMessage(text)`,
-  `startNewSession()`, `cancelNewSession()`. State additions:
-  `composingNewSession`, `sending`, `sendError`. All cleared by
-  `disconnect` / bot-change so a stale draft can't leak across
-  workspaces.
-- Unit tests on the request shape:
-  - `post_message_request_omits_thread_ts_for_top_level` — the
-    JSON body MUST NOT contain `thread_ts: null` (Slack rejects
-    that with `invalid_thread_ts`).
-  - `post_message_request_includes_thread_ts_for_replies`.
-  - `post_message_response_yields_a_normalised_slack_message` —
-    the `chat.postMessage` echo round-trips through `to_message`
-    cleanly.
+  wrapping `chat.postMessage`, normalised through the same
+  `to_message` path as reads so the optimistic append and the
+  next poll tick reconcile cleanly (no special-case).
+- Send errors render inline above the composer; the draft is
+  preserved so retry is one keypress. Blank / whitespace-only
+  sends are swallowed.
+- `sendMessage` / `startNewSession` / `cancelNewSession` plus
+  `sending` / `sendError` / `composingNewSession` state; all
+  cleared on disconnect and bot switch so drafts can't leak
+  across workspaces.
 
 ## Setup
 

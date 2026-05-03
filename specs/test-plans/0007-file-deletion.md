@@ -5,57 +5,25 @@
 
 ## What shipped
 
-- `WorkspaceHost::trash_path` (move to OS trash) and `WorkspaceHost::delete_path`
-  (permanent removal). `LocalHost` implements both:
-  - `trash_path` calls the cross-platform [`trash`](https://crates.io/crates/trash)
-    crate via `tokio::task::spawn_blocking` (it's a sync API and some backends
-    — XDG trash on a network mount, Finder calls — can stall). On Linux this
-    uses the FreeDesktop Trash spec v1.0; macOS uses Finder Trash; Windows uses
-    the Recycle Bin.
-  - `delete_path` uses `tokio::fs::remove_file` / `remove_dir_all`.
-  - Both refuse to act on the workspace root and rely on `resolve()` to block
-    `..` traversal.
-  - Both clear the editorconfig cache after a successful op.
-- Tauri commands `fs_trash` and `fs_delete` and matching IPC wrappers
-  (`ipc.fs.trash`, `ipc.fs.delete`).
-- `WorkspaceState.trashPaths(paths)` and `WorkspaceState.deletePaths(paths)`
-  share a private `removePaths(paths, mode)` that:
-  - Drops descendants of selected ancestors (selecting `src/` plus
-    `src/foo.ts` collapses to one IPC call against `src/`) via the
-    file-local `dropDescendantPaths` helper — the directory removal subsumes
-    the children, and removing the children first risks "no such file"
-    errors when the parent removal cleans them up.
-  - Confirms via the native dialog with mode-specific wording. Single-target
-    selections keep the precise filename / "the folder X" wording; multi
-    falls back to "Move N items to the trash?" / "Permanently delete N
-    items? This cannot be undone (recover via git if any of them were
-    tracked)." (no enumeration — native dialogs don't render long lists
-    cleanly and the tree highlight already shows the targets).
-  - Issues IPC calls in parallel via `Promise.allSettled` so one bad path
-    (locked, perms) doesn't abort the rest. Failures are summarised in a
-    single toast (count + first error) — the problems-panel home for
-    multi-line errors arrives in Phase 8.
-  - Drops every open buffer the operation invalidates (the paths themselves,
-    plus descendants for directories) from `openFiles`, both panes' tab
-    arrays, `previewModes`, and `editorConfigs`. Active paths fall back to
-    the last surviving tab on the same side.
-  - Refreshes the file tree via `loadPaths()` and persists the session.
-  - Skips the dirty-discard prompt — the user just confirmed they want the
-    paths gone, asking again per-tab would be noise.
-  - Closes any synthetic `untitled:N` paths in the input as plain tab
-    closes (no IPC call) so multi-selecting an untitled buffer alongside
-    real files still does the obvious thing.
-- `FileTree.svelte` keybindings:
-  - `Delete` / `Backspace` → trash.
-  - `Shift+Delete` / `Shift+Backspace` → permanent delete.
-  - Targeting via `collectRemovalTargets`: when the keyboard cursor sits
-    on a selected row the entire selection is the target (multi-delete);
-    otherwise just the focused row is, so arrow keys after a click act
-    where the user expects rather than on the originally-clicked file.
-  - All variants are suppressed if focus is inside an `<input>` or
-    `<textarea>` in the tree's shadow DOM (Pierre's search box, future
-    rename input), so typing inside those fields can never trigger a
-    delete.
+- Two new `WorkspaceHost` operations: `trash_path` (OS trash via
+  the `trash` crate; FreeDesktop / Finder / Recycle Bin) and
+  `delete_path` (permanent). Both refuse the workspace root,
+  block `..` traversal, and clear the editorconfig cache.
+- File-tree keybindings: `Delete` / `Backspace` trashes;
+  `Shift+Delete` / `Shift+Backspace` deletes permanently.
+  Targeting follows the keyboard cursor, so arrow-after-click
+  acts where the user is looking. Suppressed while focus is in
+  Pierre's search/rename input.
+- Multi-select does one pass: descendants of a selected
+  directory are dropped before IPC (directory removal subsumes
+  them), calls run in parallel via `Promise.allSettled` so one
+  bad path doesn't abort the rest, and partial failures
+  surface as a single toast.
+- Removal cleans up every in-memory buffer the paths or their
+  descendants touch (open files, both panes' tab arrays,
+  preview-mode, editorconfig). Untitled tabs in a multi-select
+  close without IPC. No per-tab dirty-discard prompt — the
+  confirm already covers intent.
 
 ## How to test
 

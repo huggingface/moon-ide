@@ -5,86 +5,31 @@
 
 ## What shipped
 
-- New crate `crates/moon-slack/`. Hand-rolled Slack Web API client (no
-  `slack-morphism` dependency cone). Endpoints implemented:
-  - `auth.test` → [`SlackIdentity`](../../crates/moon-protocol/src/slack.rs)
-    `(user_id, user_name, team_id, team, url)`.
-  - `conversations.list?types=im&limit=50` — single page; the cap
-    [`DM_SCAN_LIMIT = 50`](../../crates/moon-slack/src/client.rs) is
-    surfaced in the connect-modal and picker copy so the user knows
-    upfront how far back we look. See `specs/slack-chat.md#cost` for
-    the rationale.
-  - `users.info(user)` per DM partner.
-  - `SlackClient::list_dm_bots()` ties them together: scan the 50
-    newest DMs, look each partner up, filter to `is_bot && !deleted`,
-    return matches in Slack's DM ordering (newest activity first).
-  - All errors flow through `SlackError`, with `is_auth_failure()`
-    classifying the family that should clear the keyring entry
-    (`invalid_auth`, `not_authed`, `account_inactive`, `token_revoked`,
-    `token_expired`).
-- `moon_slack::TokenStore`: thin wrapper over the `keyring` crate
-  (libsecret / Keychain / Credential Manager). Service `moon-ide`,
-  account `slack-user-token`. `NoEntry` is mapped to `Ok(None)` /
-  `Ok(())` so absence is never an error. The workspace `Cargo.toml`
-  pins `keyring`'s `apple-native + windows-native +
-sync-secret-service + crypto-rust` features — the default feature
-  set is `[]`, which gives a mock backend that silently no-ops on
-  Linux. (See `specs/slack-chat.md#token-storage`.)
-- Tauri state: `AppState.slack` (`SlackState`) holds the `TokenStore`
-  and a `RwLock<Option<SlackClient>>` cache. The startup `setup` hook
-  rehydrates the cache from the keyring without contacting Slack — the
-  first frontend `slack_status` call is what actually validates.
-- `AppState` (machine-local, `state.json`) now carries
-  `slack.active_bot` (the bot the user has picked, IDs + display
-  metadata only, no secrets) and `slack.panel_visible` (whether the
-  chat panel was open at shutdown — restored verbatim on launch). The
-  two writers — frontend session-persist and Slack tauri commands —
-  own disjoint slices, and `app_state_save` merges so neither can
+- New right-side chat panel gated on an opt-in Slack connect
+  flow. Empty / connecting / picker / active-bot / error states
+  all live in `ChatPanel.svelte`; status-bar pip turns green
+  when connected.
+- New `moon-slack` crate: hand-rolled Web API client wrapping
+  `auth.test`, `conversations.list` (DM types), `users.info`,
+  plus `list_dm_bots` which scans the 50 most recent DMs and
+  filters to bots. Errors classify into `is_auth_failure()` to
+  drive the clear-and-reset path.
+- Tokens live in the OS keyring (`libsecret` / Keychain /
+  Credential Manager) under `moon-ide` / `slack-user-token`;
+  never written to `state.json`. `AppState.slack` holds only
+  IDs + display metadata for the picked bot plus the panel's
+  open/closed state.
+- Bot discovery is bounded at 50 DMs (`DM_SCAN_LIMIT`) with the
+  cap surfaced upfront in the connect modal and picker copy;
+  there's no hardcoded default bot — the user picks from their
+  own DM list.
+- Auth-failure recovery is consistent: any `auth.test` that
+  returns an auth-family error (revoked, expired, invalid)
+  clears keyring + cache + persisted bot in one shot, so the
+  next render drops back to the empty state.
+- Persisted slack slice and the frontend session persist are
+  disjoint writers; `app_state_save` merges so neither can
   clobber the other.
-- Tauri commands in `src-tauri/src/commands/slack.rs`:
-  - `slack_set_token(token)` — refuses non-`xoxp-` strings up front,
-    validates via `auth.test`, persists to keyring, populates the
-    cache, returns `SlackIdentity`. Nothing is persisted on failure.
-  - `slack_status()` — returns `connected: bool` + identity. When the
-    cached token's `auth.test` fails for an auth reason (per
-    `is_auth_failure()`), the keyring entry, the cache, and the
-    persisted active-bot pick are all cleared in the same call so the
-    next launch shows the empty state.
-  - `slack_clear_token()` — idempotent disconnect. Also clears the
-    persisted bot pick.
-  - `slack_list_dm_bots()` — returns `Vec<SlackBotProfile>` from a DM
-    scan.
-  - `slack_select_bot(profile)` — persists to `AppState.slack.active_bot`.
-  - `slack_clear_bot()` — drops the persisted pick (triggers the picker
-    on next render).
-  - `slack_get_active_bot()` — reads the persisted pick.
-  - `slack_set_panel_visible(visible)` — persists the chat panel's
-    open/closed state so the panel re-mounts in the same place after
-    a relaunch.
-- Frontend:
-  - `src/lib/slack.svelte.ts` — `SlackPanelState` singleton with
-    reactive `panelVisible`, `status`, `activeBot`, `botCandidates`,
-    `connecting`, `loadingBots`, `botError`, `showConnectModal`. There
-    is no hardcoded default bot — the user picks from their DMs.
-  - `src/lib/components/ChatPanel.svelte` — right-side panel with
-    five states: loading (`status === null`), empty (`!connected`),
-    active bot card (when picked), bot picker (when discovery returned
-    candidates and none is selected), and the various edge cases
-    (loading, scan error, "no bots in your DMs"). Header has Disconnect
-    when connected; the active-bot card has a "Switch bot" affordance.
-  - `src/lib/components/ChatConnectModal.svelte` — paste-token modal
-    with a setup walk-through. Lede now flags both the "DM the bot
-    from regular Slack first" pre-condition and the "in your 50 most
-    recent DMs" cap, so the user knows what discovery actually does.
-    External links open via `@tauri-apps/plugin-opener`.
-  - `App.svelte` — adds the resizable right-side dock (240–640 px,
-    default 320), gated on `slack.panelVisible`.
-  - `StatusBar.svelte` — adds a `chat` toggle button with a green pip
-    when connected. Independent dispatch from the command palette so a
-    broken palette doesn't hide chat state.
-  - `commands.svelte.ts` — `chat.togglePanel` (always visible, label
-    flips), `chat.connect` (visible when disconnected), `chat.disconnect`
-    (visible when connected).
 
 ## What must keep working
 

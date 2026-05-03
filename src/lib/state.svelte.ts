@@ -1,4 +1,6 @@
 import { convertFileSrc } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { confirm, save as saveDialog } from '@tauri-apps/plugin-dialog';
 import { SvelteMap } from 'svelte/reactivity';
 import { ipc } from './ipc';
@@ -9,6 +11,7 @@ import {
 	type EditorConfig,
 	type FolderSession,
 	type SplitSide,
+	type SystemTheme,
 	type ThemeMode,
 	type Workspace,
 	type WorkspaceFolder,
@@ -123,7 +126,29 @@ class WorkspaceState {
 	// Per-machine UI theme. Persisted alongside the session in AppState.
 	// There is no project-level theme override; if a workspace ever needs
 	// one, that'd live in `.editorconfig` extensions, not here.
-	theme = $state<ThemeMode>('dark');
+	//
+	// `'system'` is the stored value; `effectiveTheme` resolves it to
+	// `'dark'` / `'light'` by reading `prefers-color-scheme`. Consumers
+	// that paint pixels (editor, terminal, CSS class on `:root`) should
+	// read the effective value, not this one.
+	theme = $state<ThemeMode>('system');
+
+	// Current OS preference. Updated by a `matchMedia` listener wired
+	// in `restoreAppState` so a system-wide dark-mode flip repaints the
+	// IDE without any further input. Only consulted when
+	// `theme === 'system'`.
+	systemPrefersDark = $state(detectSystemPrefersDark());
+
+	// Resolved theme actually used to paint the UI. Reads
+	// `systemPrefersDark` when the user's choice is `'system'`, and
+	// their explicit choice otherwise. Editor / terminal / the `.light`
+	// class on `:root` all key off this.
+	effectiveTheme: 'dark' | 'light' = $derived.by(() => {
+		if (this.theme === 'system') {
+			return this.systemPrefersDark ? 'dark' : 'light';
+		}
+		return this.theme;
+	});
 
 	// Resolved `.editorconfig` per open file. Populated lazily when a
 	// file is opened and refreshed when the user saves a `.editorconfig`
@@ -493,16 +518,26 @@ class WorkspaceState {
 	 * re-saved. Called once on startup from `App.svelte`.
 	 */
 	async restoreAppState() {
+		// Subscribe to OS theme changes (and probe the initial value)
+		// up front so `effectiveTheme` reflects live OS preference
+		// regardless of whether the AppState load below succeeds. Awaited
+		// so the `applyTheme` calls below read a trustworthy
+		// `systemPrefersDark`: on Linux WebKitGTK the synchronous
+		// `matchMedia` answer seeded during class construction is
+		// unreliable, and only Tauri's own theme probe knows for sure.
+		await this.bindSystemPreference();
+
 		let state: AppState;
 		try {
 			state = await ipc.appState.load();
 		} catch (err) {
 			this.flash(`Could not restore state: ${formatError(err)}`);
+			applyTheme(this.effectiveTheme);
 			return;
 		}
 
 		this.theme = state.theme;
-		applyTheme(state.theme);
+		applyTheme(this.effectiveTheme);
 		// Restore the chat panel state up-front: the panel may have been
 		// open at the last shutdown, in which case it mounts (and probes
 		// `slack_status`) on this same paint without the user lifting a
@@ -1509,12 +1544,102 @@ class WorkspaceState {
 		}
 	}
 
-	toggleTheme() {
-		const next: ThemeMode = this.theme === 'dark' ? 'light' : 'dark';
-		this.theme = next;
-		applyTheme(next);
+	/**
+	 * Persist `mode` as the user's theme choice and repaint. Same
+	 * shape `toggleTheme` used to take, just for a three-valued
+	 * enum — picking `'system'` defers the resolved dark/light
+	 * flip to [`effectiveTheme`], which also reacts to OS theme
+	 * changes without a save.
+	 */
+	setTheme(mode: ThemeMode) {
+		if (this.theme === mode) {
+			return;
+		}
+		this.theme = mode;
+		applyTheme(this.effectiveTheme);
 		this.persistAppState();
 	}
+
+	/**
+	 * Probe the OS colour-scheme preference and subscribe to further
+	 * changes. Safe to call multiple times — guarded by
+	 * `systemPreferenceBound`.
+	 *
+	 * Primary source is the `system_theme` Tauri command, which on
+	 * Linux walks the XDG Desktop Portal `color-scheme` D-Bus setting
+	 * (same channel modern browsers use). That detour is load-bearing:
+	 * WebKitGTK's own `matchMedia('(prefers-color-scheme: dark)')`
+	 * answer and `getCurrentWindow().theme()` _both_ ignore the GTK
+	 * / GNOME / KDE theme and default to light, so using either as
+	 * the truth flips the UI to light on startup for every user on a
+	 * Linux dark desktop.
+	 *
+	 * `getCurrentWindow().onThemeChanged` covers macOS / Windows
+	 * runtime flips (where the webview _does_ track the OS); on
+	 * Linux the event rarely fires but harmlessly double-pings a
+	 * value we already re-read on every poll. matchMedia is left in
+	 * purely as a fallback for non-Tauri dev shells (vite-only).
+	 *
+	 * Not bound on construction because the Tauri runtime isn't
+	 * necessarily up yet at module-eval; `restoreAppState` awaits
+	 * this before touching `applyTheme`.
+	 */
+	private async bindSystemPreference() {
+		if (this.systemPreferenceBound) {
+			return;
+		}
+		this.systemPreferenceBound = true;
+
+		if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+			const mq = window.matchMedia('(prefers-color-scheme: dark)');
+			mq.addEventListener('change', (event) => {
+				this.updateSystemPrefersDark(event.matches);
+			});
+		}
+
+		try {
+			const theme = await ipc.system.theme();
+			this.updateSystemPrefersDark(resolveSystemTheme(theme));
+		} catch {
+			// Backend probe unavailable (tests, vite-only shell, or the
+			// XDG portal is genuinely not reachable). Fall back to
+			// whatever matchMedia already seeded.
+		}
+
+		try {
+			// Linux runtime flips arrive via this event (the desktop
+			// shell's ashpd watcher re-emits the XDG portal signal).
+			await listen<SystemTheme>('system:theme-changed', ({ payload }) => {
+				this.updateSystemPrefersDark(resolveSystemTheme(payload));
+			});
+		} catch {
+			// Not under Tauri; nothing to subscribe to.
+		}
+
+		try {
+			// macOS / Windows deliver runtime flips through the webview
+			// directly, so this covers what the Linux watcher doesn't.
+			const win = getCurrentWindow();
+			await win.onThemeChanged(({ payload }) => {
+				this.updateSystemPrefersDark(payload === 'dark');
+			});
+		} catch {
+			// Not running under Tauri; change notifications are
+			// matchMedia-only.
+		}
+	}
+
+	private updateSystemPrefersDark(next: boolean) {
+		if (this.systemPrefersDark === next) {
+			return;
+		}
+		this.systemPrefersDark = next;
+		if (this.theme === 'system') {
+			applyTheme(this.effectiveTheme);
+		}
+	}
+
+	private systemPreferenceBound = false;
 
 	flash(msg: string) {
 		this.toast = msg;
@@ -1526,7 +1651,14 @@ class WorkspaceState {
 	}
 }
 
-function applyTheme(mode: ThemeMode) {
+/**
+ * Paint `mode` (always resolved dark/light, never `'system'`) on
+ * `:root`. The `.light` class flip is the one stylesheet-global
+ * signal — CSS variables defined in `styles.css` key off it and
+ * every component reads through them, so one class toggle reskins
+ * the whole IDE.
+ */
+function applyTheme(mode: 'dark' | 'light') {
 	const root = document.documentElement;
 	if (mode === 'light') {
 		root.classList.add('light');
@@ -1537,6 +1669,24 @@ function applyTheme(mode: ThemeMode) {
 	// theme toggles on WebKitGTK — see the note in `lib/editor/theme.ts`
 	// for the full list of invalidation paths we tried. We accept the
 	// stale-corner-after-toggle behaviour rather than ship more hacks.
+}
+
+function detectSystemPrefersDark(): boolean {
+	if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
+		return true;
+	}
+	return window.matchMedia('(prefers-color-scheme: dark)').matches;
+}
+
+function resolveSystemTheme(theme: SystemTheme): boolean {
+	// `unspecified` comes from the XDG portal when the user hasn't
+	// set a preference at all. Mapping it to dark keeps moon-ide's
+	// default chrome (dark) visible on a fresh desktop instead of
+	// flashing to light.
+	if (theme === 'unspecified') {
+		return true;
+	}
+	return theme === 'dark';
 }
 
 async function collectPaths(rel: string, out: string[], depth: number): Promise<void> {

@@ -112,10 +112,11 @@
 	// everything, but CodeMirror also takes a `dark: boolean` flag at
 	// theme-build time (used for built-in defaults like the drop cursor
 	// color). We rebuild the theme + highlight bundle whenever the
-	// user toggles `workspace.theme`. The HighlightStyle itself is
-	// static — its CSS-variable colors re-resolve for free.
+	// *effective* theme (dark/light resolved from the user's choice +
+	// system preference) flips. The HighlightStyle itself is static —
+	// its CSS-variable colors re-resolve for free.
 	$effect(() => {
-		const mode = workspace.theme;
+		const mode = workspace.effectiveTheme;
 		const v = view;
 		if (!v) {
 			return;
@@ -160,7 +161,7 @@
 			history(),
 			highlightSelectionMatches(),
 			keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap, indentWithTab]),
-			themeCompartment.of(moonEditorTheme(workspace.theme)),
+			themeCompartment.of(moonEditorTheme(workspace.effectiveTheme)),
 			languageCompartment.of([]),
 			editorConfigCompartment.of(editorConfigExtensions(ec)),
 			highlightTabs(),

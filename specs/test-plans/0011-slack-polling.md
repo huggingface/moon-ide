@@ -6,63 +6,30 @@ Slack clients drop the unread badge as soon as they've seen the
 message in moon-ide. Detailed design lives in
 [`slack-chat.md`](../slack-chat.md#cadence-ladder).
 
-## What ships
+## What shipped
 
-- New `SlackClient::mark_as_read(channel, ts)` wrapping
-  [`conversations.mark`](https://api.slack.com/methods/conversations.mark).
-  The `im:write` scope was granted upfront in 11.0 so no
-  reinstall is needed.
-- New `slack_poller` module in `src-tauri/`, spawned once at
-  startup. Owns:
-  - The cadence ladder (3 s hot → 5 s warm → 15 s → 60 s → paused
-    cold). Tested as a pure function in
-    `cadence_ladder_matches_spec`.
-  - Per-thread `last_seen` (a `(ts, edited_ts)` fingerprint) and
-    `last_marked_ts` so we don't re-mark or re-emit unchanged
-    snapshots.
-  - Two Tauri events:
-    - `slack:thread-update` — `{ channel, thread_ts, messages }`
-      pushed when fingerprints diverge from `last_seen`.
-    - `slack:disconnected` — pushed when a poll surfaces
-      `invalid_auth` / `token_revoked` / `account_inactive`.
-  - On auth failure: clear the cached client, the keyring entry,
-    and the persisted bot pick — same path as `slack_status`'s
-    auth-failure branch but driven from the loop instead of a
-    user-initiated probe.
-- New tauri commands:
-  - `slack_mark_read(channel, ts)` — frontend fires on view +
-    session-switch.
-  - `slack_set_window_focused(focused)` — frontend forwards
-    `tauri://focus` / `tauri://blur` so the poller's read-receipt
-    gate knows whether the user is actually looking. Not
-    persisted.
-- Existing tauri commands now feed the poller too:
-  - `slack_select_bot` / `slack_clear_bot` → `set_active_channel`
-  - `slack_clear_token` / auth-failure path of `slack_status` →
-    `set_active_channel(None)` (clears thread implicitly)
-  - `slack_set_active_thread` → `set_active_thread_ts`
-  - `slack_set_panel_visible` → `set_panel_visible`
-  - `slack_set_token` → `poke()` (wakes the loop so the resumed
-    thread can re-poll without waiting for the next setter)
-- Frontend `slack.svelte.ts`:
-  - `wireRuntime()` (idempotent) binds the two Tauri events and a
-    `getCurrentWindow().onFocusChanged` listener at app boot.
-  - `#applyThreadUpdate` reconciles only when
-    `(channel, thread_ts)` matches the open session — stale
-    pushes for previously-open threads get dropped. Also runs the
-    view-trigger `mark_read` for the freshly-painted snapshot.
-  - `#handleBackendDisconnect` mirrors `disconnect()` in-memory
-    (the keyring + bot are already gone on the Rust side).
-  - `loadThread` fires `markRead` on success too — covers the
-    direct manual-fetch path that doesn't go through the event
-    bus (e.g. clicking a session for the first time).
-  - `#lastMarkedByThread` dedupes per-`(channel, thread_ts)` so
-    reopening an already-read thread doesn't spam Slack.
-- Startup hook (`lib.rs`) seeds the poller from disk:
-  `panel_visible`, `active_bot.dm_channel_id`, and
-  `active_thread_ts` are all replayed into the poll task before
-  the frontend mounts, so a relaunch with the panel previously
-  open polls within 3 s of first paint.
+- Active thread stays fresh without manual refresh: a new
+  `slack_poller` Tokio task runs a cadence ladder (3 s hot → 5 s
+  warm → 15 s → 60 s → paused cold) and pushes
+  `slack:thread-update` events when the `(ts, edited_ts)`
+  fingerprint moves.
+- Read receipts: `conversations.mark` fires on view and on the
+  next poll tick of a focused, panel-visible thread, so unread
+  badges on the user's other Slack clients clear in real time.
+  Deduped per-`(channel, thread_ts)` so session switches don't
+  spam.
+- Window focus is forwarded from the frontend (`tauri://focus` /
+  `blur`) and gates the read-receipt write — polling still
+  runs in the background, but marks only fire when the user is
+  actually looking.
+- Auth failures discovered by the poll loop take the same
+  clear-and-reset path as `slack_status` (drop cache, keyring,
+  bot pick, emit `slack:disconnected`), so a revoked token
+  lands the user back on the empty state without a manual
+  probe.
+- Startup hook replays `panel_visible`, `active_bot.dm_channel_id`,
+  and `active_thread_ts` into the poller before the frontend
+  mounts, so a relaunch polls within 3 s of first paint.
 
 ## Setup
 

@@ -6,26 +6,19 @@ tapping a chip doesn't toggle anything yet. Detailed scope lives
 in `slack-chat.md` (look for "No reaction add/remove from the
 panel yet.").
 
-## What ships
+## What shipped
 
-- `RawMessage::reactions` parsed in `moon-slack`, mapped to a new
-  `SlackReaction { name, count }` on the protocol
-  (`crates/moon-protocol/src/slack.rs`). The full Slack reactor
-  list is parsed but not surfaced — kept on the Rust side via
-  `#[allow(dead_code)]` so the next phase that wants a "you
-  reacted" highlight or hover tooltip doesn't have to re-touch
-  the wire types.
-- New `resolveReactionName(name)` helper in
-  `src/lib/util/slackEmoji.ts` — strips `::skin-tone-N`
-  modifiers, runs the existing CLDR + `SLACK_ALIASES` resolution,
-  falls back to `:name:` for custom workspace emoji.
-- `ChatPanel.svelte` renders chips below the message body, above
-  any action buttons. Small pill styling using the existing
-  `--m-bg-2` / `--m-border` tokens; no new theme entries.
-- 3 Rust unit tests:
-  - `reactions_are_extracted_and_zero_count_dropped`
-  - `missing_reactions_field_is_empty_vec`
-  - `skin_tone_modifier_passes_through_verbatim`
+- Chat bubbles now render the `reactions` array Slack already
+  returns as small chips below the body (glyph + count). Chips
+  are read-only — tapping one doesn't toggle yet.
+- New `SlackReaction { name, count }` on the protocol; the full
+  reactor-user list is parsed on the Rust side but not surfaced,
+  so a future "you reacted" highlight doesn't need a wire
+  change.
+- `resolveReactionName` strips `::skin-tone-N` modifiers and
+  reuses the existing CLDR + Slack alias resolver; custom
+  workspace emoji fall back to `:name:` text with a matching
+  tooltip.
 
 ## Setup
 

@@ -5,11 +5,20 @@
 
 ## What shipped
 
-- A hand-rolled CodeMirror `HighlightStyle` (`moonHighlight` in `src/lib/editor/theme.ts`) that covers the full common Lezer tag set: keywords, strings, numbers, functions, types, properties/attributes, tags, regexp, operators, meta, and the markdown / diff token families.
-- Syntax colors are sourced from new `--m-syntax-*` CSS tokens defined in both `:root` (dark) and `:root.light` in `src/styles.css`. Toggling theme re-skins the editor for free — the highlight stylesheet itself is static.
-- The chrome theme (`moonTheme`) is now a function of `dark: boolean`. The Editor wraps `moonTheme + syntaxHighlighting` in a `themeCompartment` and reconfigures it whenever `workspace.theme` flips, so CodeMirror's internal `dark` flag stays accurate too.
-- Light/dark styling for the search panel (`Ctrl+F`), goto-line panel, and shared CM buttons / textfields, also via CSS variables.
-- New direct runtime dep: `@lezer/highlight` (was already transitive via `@codemirror/language`; promoted to a real dep so the import is honest).
+- Editor gets a hand-rolled `HighlightStyle` (`moonHighlight`)
+  covering keywords, strings, numbers, functions, types,
+  properties, tags, regex, operators, meta, and the markdown /
+  diff token families.
+- Syntax colours are driven by new `--m-syntax-*` CSS tokens
+  defined in both `:root` and `:root.light`, so toggling theme
+  re-skins the editor for free — the highlight style itself
+  stays static.
+- Chrome theme becomes a function of `dark: boolean`, wrapped in
+  a dedicated `themeCompartment` that reconfigures on theme
+  flip so CodeMirror's internal `dark` flag tracks the palette.
+- Search and goto-line panels pick up the same CSS-variable
+  treatment (light + dark), as do shared CM buttons / text
+  fields.
 
 ## How to test
 

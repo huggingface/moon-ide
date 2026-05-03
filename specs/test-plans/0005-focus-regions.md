@@ -5,90 +5,24 @@
 
 ## What shipped
 
-- New `src/lib/focus.ts`: pure module that owns the region cycle.
-  Exports `regionOrder()`, `currentRegion()`, `focusRegion(id)`, and
-  `cycleFocus(forward)`. Cycle order is computed from current
-  layout (sidebar always; left pane only when a workspace is open;
-  right pane only when split; status always) so F6 never lands on
-  a region that doesn't exist.
-- Region marker convention: each top-level region root carries a
-  `data-region` attribute (`sidebar`, `editor-left`, `editor-right`,
-  `status`). `currentRegion()` reads it from `document.activeElement`'s
-  closest ancestor.
-- `WorkspaceState` gains `sidebarFocusTick` and `statusFocusTick`
-  alongside the existing `focusTick`. `requestSidebarFocus()` /
-  `requestStatusFocus()` bump them; the matching component pulls
-  focus in via a `$effect`. Same pattern as the editor's existing
-  focus ticker, kept symmetrical for the next region we add.
-- `Sidebar.svelte`:
-  - Roots a `data-region="sidebar"` wrapper with `tabindex="-1"`.
-  - Watches `workspace.sidebarFocusTick` and focuses **a tree
-    row directly** (the active `[role="treeitem"][tabindex="0"]`
-    when one exists, otherwise the first row). Earlier versions
-    landed on the "Open folder" header button or Pierre's
-    search input, forcing a Tab dance to reach the file list;
-    we now skip straight to the rows. The header button is the
-    fallback only when there are no rows at all (no workspace).
-  - `Esc` while focused inside the sidebar yanks focus back to
-    the active editor — but only when the user isn't typing in
-    an `<input>`/`<textarea>`, so Pierre's search input keeps its
-    native Esc-to-clear behaviour.
-- `StatusBar.svelte`: `data-region="status"` + a tick-driven
-  `$effect` that focuses the theme toggle (the only interactive
-  control on the bar today).
-- `EditorPane.svelte`: `data-region="editor-left"` /
-  `data-region="editor-right"` so the cycle can locate the focused
-  pane. The existing `focusSide(side)` + editor focus ticker is
-  reused; `focusRegion('editor-left')` calls both.
-- `App.svelte` keybindings:
-  - `F6` → `cycleFocus(true)`.
-  - `Shift+F6` → `cycleFocus(false)`.
-  - `Ctrl+0` → `workspace.requestSidebarFocus()`. We don't
-    filter by Shift state for this one: French AZERTY needs
-    Shift to type a literal `0`, so AZERTY users hit
-    `Ctrl+Shift+0` and QWERTY users hit `Ctrl+0` — both
-    produce `event.key === '0'`, so the same handler fires on
-    either layout without caring about Shift.
-- Palette command for discoverability: `Focus File Tree`
-  (Ctrl+0). The cycle commands (F6 / Shift+F6) are
-  deliberately **not** in the palette — F6 is relative to the
-  current region, and the palette is "off-region", so a palette
-  entry would always re-enter the cycle at the same edge
-  instead of advancing. The keys themselves work fine; the
-  palette button would have been a misleading ghost shortcut.
-- **Tree preview-open without focus steal.** Single-click and
-  arrow-key selection in the tree now open the file in the
-  editor _without_ moving DOM focus out of the tree, so the
-  user can keep arrow-browsing through siblings. `openFile()`
-  / `setActive()` learned an `{ focus?: boolean }` option;
-  callsites that drive a deliberate jump (tab clicks, palette
-  pick, session restore) keep the default `focus: true`, the
-  tree opts out with `focus: false`. **Enter** on the focused
-  row, and **double-click** anywhere in the tree, hand focus
-  to the editor (Enter also opens the row if it wasn't already
-  open — useful after pure arrow-key navigation, since Pierre
-  only updates selection on click).
-- **Tab → tree scroll.** Switching the active file (clicking a
-  tab, palette pick, splitting) now scrolls the tree to the
-  matching row even when Pierre has virtualized it out of the
-  rendered window. Implementation: a fast path that calls
-  `scrollIntoView` on the row when it's already mounted, and a
-  slow path that briefly parks DOM focus on Pierre's scroll
-  container so the controller's layout effect runs
-  `scrollFocusedRowIntoView` (Pierre gates that effect on
-  "focus is inside the tree" — without the focus park, a
-  programmatic `focusNearestPath` on its own does nothing).
-  Original focus is restored once the scroll commits.
-- **Vite dev-server cache headers.** A small dev-only plugin
-  rewrites `Cache-Control` to `no-store` on every response so
-  WebKitGTK doesn't persist dev artifacts. Without it, a
-  config change that alters which modules a Svelte component
-  imports leaves stale JS in
-  `~/.local/share/dev.moon-ide.desktop/WebKitCache` that
-  resurrects requests for modules Vite no longer produces,
-  surfacing as `failed to load virtual css module` warnings on
-  every launch. `Cache-Control: no-store` keeps every dev
-  fetch fresh, no manual cache wipes needed.
+- Keyboard focus cycles through four named regions — sidebar,
+  left pane, right pane, status — via `F6` / `Shift+F6`. Order
+  is computed from the live layout, so regions that aren't
+  mounted (split closed, no workspace) are skipped.
+- `Ctrl+0` jumps straight to a file-tree row (not the header
+  button or Pierre's search input); `Esc` from anywhere in the
+  sidebar yanks focus back to the active editor, unless the
+  user is typing in an `<input>`.
+- Tree preview-open: single-click and arrow-key selection open
+  the file without stealing focus from the tree, so arrow-
+  browsing previews siblings. Enter / double-click hand focus
+  to the editor.
+- Switching the active file scrolls the tree to the matching
+  row, even when Pierre has virtualized it out.
+- Dev-server hygiene: a no-store `Cache-Control` Vite plugin
+  stops WebKitGTK from persisting stale dev chunks across
+  launches (fixes the `failed to load virtual css module`
+  warning storm).
 
 ## How to test
 

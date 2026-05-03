@@ -137,13 +137,27 @@ export const builtInCommands: Command[] = [
 		shortcut: 'Ctrl+\\',
 		run: () => workspace.closeSplit(),
 	},
+	// Three explicit entries rather than a cycling toggle: the
+	// underlying setting is a three-way enum (System / Dark /
+	// Light) and "cycle" has no obvious order. Keeping one item
+	// per value also makes each mode fuzzy-searchable from the
+	// palette. The currently-active one is suffixed with
+	// "(current)" so filtering on e.g. "dark" surfaces whether
+	// you're already there.
 	{
-		id: 'theme.toggle',
-		// Label reflects what the click *will do*, not the current state.
-		// When the palette is reopened after a click, the wording flips —
-		// useful as a sanity check that the toggle actually fired.
-		title: () => (workspace.theme === 'dark' ? 'Switch to Light Theme' : 'Switch to Dark Theme'),
-		run: () => workspace.toggleTheme(),
+		id: 'theme.system',
+		title: () => (workspace.theme === 'system' ? 'Theme: System (current)' : 'Theme: System'),
+		run: () => workspace.setTheme('system'),
+	},
+	{
+		id: 'theme.dark',
+		title: () => (workspace.theme === 'dark' ? 'Theme: Dark (current)' : 'Theme: Dark'),
+		run: () => workspace.setTheme('dark'),
+	},
+	{
+		id: 'theme.light',
+		title: () => (workspace.theme === 'light' ? 'Theme: Light (current)' : 'Theme: Light'),
+		run: () => workspace.setTheme('light'),
 	},
 	{
 		// `Focus File Tree` is the only discrete focus command — it

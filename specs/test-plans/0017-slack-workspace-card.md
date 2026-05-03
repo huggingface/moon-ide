@@ -5,54 +5,25 @@
 
 ## What shipped
 
-- `team:read` is now part of the upfront Slack scope grant
-  (`specs/slack-chat.md`). The connect-modal scope checklist
-  in `src/lib/components/ChatConnectModal.svelte` lists it
-  with the other nine.
-- `SlackIdentity` (`crates/moon-protocol/src/slack.rs`) gained
-  an `icon_url: Option<String>` field. TS bindings regenerated
-  via `cargo test -p moon-protocol`; `src/lib/protocol.ts`
-  hand-mirror updated to match.
-- `SlackClient::auth_test` (`crates/moon-slack/src/client.rs`)
-  now calls `team.info` after `auth.test` and populates the
-  workspace icon URL. `team.info` failures (e.g. workspace
-  revoked the scope) log a warning and fall back to
-  `icon_url = None` rather than failing the connect handshake
-  — chrome shouldn't gate auth.
-- Icon picking lives in a free `pick_team_icon` helper so the
-  preference order (132 → 102 → 88 → 68 px, drop
-  `image_default: true`) is unit-testable without HTTP.
-- Chat panel workspace card (`src/lib/components/ChatPanel.svelte`):
-  - Layout is now `[avatar] [workspace name / user name stack]
-[icon-button disconnect]`, mirroring the bot card.
-  - The avatar uses the real `team.info` icon when available
-    and falls back to an initial-letter placeholder (same
-    `.avatar-placeholder` style as the bot card) when the
-    workspace uses Slack's auto-generated default icon, when
-    `team:read` is missing, or when `team.info` fails.
-  - The Disconnect text link became a square icon button
-    (`disconnectIcon` snippet + the existing `.icon-button`
-    class) with an accessible `aria-label` and tooltip. The
-    confirm dialog wording is unchanged.
-  - Same treatment for the bot card's "Switch bot" text
-    link: now an icon button using a horizontal two-arrow
-    swap glyph (`switchBotIcon` snippet) with the same
-    `.icon-button` class and an aria-label / tooltip pair.
-    Both card "action" slots now read identically as
-    square icon buttons.
-  - Sessions list moved out of its `.card.sessions-card`
-    wrapper into a `.sessions` section that flows directly
-    in the panel, mirroring how the active-thread view is
-    laid out. The sessions header is now sticky and edge-
-    to-edge (sharing styles with `.thread-header`) so the
-    "New session" / "Reload sessions" controls stay
-    reachable while the bot card scrolls up. Empty / error
-    states use `.thread-empty` / `.thread-error` for
-    consistency with the thread view's flush copy.
-  - Removed unused `.card-row` / `.card-label` /
-    `.card-value` / `.section-header` CSS — those classes
-    were only used by the old workspace-card and sessions-
-    card markup.
+- Chat panel's workspace card now mirrors the bot card:
+  `[avatar] [workspace / user stack] [icon button]`. Real
+  `team.info` icon renders when available; an initial-letter
+  placeholder covers the default-icon / missing-scope / failed
+  lookup cases.
+- `team:read` joins the upfront scope grant so `team.info` can
+  fetch the icon on connect. A failing `team.info` logs a warn
+  and falls back to `icon_url = None` — chrome shouldn't gate
+  auth.
+- `SlackIdentity` grows `icon_url: Option<String>`. Icon
+  picking (132 → 102 → 88 → 68 px, drop `image_default: true`)
+  lives in a free `pick_team_icon` helper so it's unit-testable
+  without HTTP.
+- Disconnect and Switch-bot text links are now square icon
+  buttons with accessible labels + tooltips; both card "action"
+  slots read identically.
+- Sessions list moves out of its card wrapper and flows
+  directly in the panel behind a sticky edge-to-edge header,
+  matching the thread view's layout.
 
 ## How to test
 

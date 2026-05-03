@@ -36,6 +36,19 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 dirs = "6.0.0"
 uuid = { version = "1.18", features = ["v4"] }
+futures-util = "0.3"
+
+# ashpd is the XDG Desktop Portal client. Linux-only because:
+# - WebKitGTK's `matchMedia('(prefers-color-scheme: dark)')` and
+#   Tauri's `getCurrentWindow().theme()` both ignore GTK / GNOME /
+#   KDE theme on Linux and default to light, so we read and watch
+#   the portal's `org.freedesktop.appearance color-scheme` setting
+#   directly.
+# - macOS / Windows don't need it — the webview's native theme API
+#   answers correctly and fires change events — so the dep stays
+#   Linux-gated.
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
+ashpd = "0.10"
 # Terminal IPC ferries arbitrary 8-bit PTY bytes (escape sequences,
 # UTF-8 fragments split mid-codepoint on read boundaries) over Tauri's
 # JSON payload codec; base64 framing keeps the wire format honest.

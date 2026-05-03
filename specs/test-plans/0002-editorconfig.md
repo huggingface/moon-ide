@@ -5,28 +5,16 @@
 
 ## What shipped
 
-- New `moon_protocol::editorconfig::EditorConfig` struct + matching
-  `EditorConfig.ts` binding and a hand-mirrored `protocol.ts` type with
-  a `defaultEditorConfig` constant.
-- `moon_core::editorconfig::EditorConfigService` walks `.editorconfig`
-  via `ec4rs`, applies the spec's indent_size / tab_width fallback,
-  and caches per-directory.
-- `WorkspaceHost::editorconfig_for(path)` exposes resolved configs.
-  `LocalHost::write_file` clears the cache when the saved file is
-  named `.editorconfig`.
-- `moon_core::pre_save` ships three pure transforms (line endings,
-  trim trailing whitespace, ensure final newline) and an `apply_pipeline`
-  helper. Server-side `fs_write_file` runs the pipeline before every
-  save.
-- New Tauri command `editorconfig_for_path(path)` (`ipc.editorconfig.forPath`).
-- `Editor.svelte` reads the active file's resolved `EditorConfig` from
-  `WorkspaceState.editorConfigs` and feeds tabSize / indentUnit through
-  a dedicated CodeMirror compartment. Saving a `.editorconfig` triggers
-  `WorkspaceState.refreshEditorConfigs`, which refetches every open
-  file's config so the live editor flips immediately.
-- Hardcoded `TAB_SIZE = 2` / `INDENT_UNIT = '\t'` constants in
-  `Editor.svelte` are gone; the moon-ide defaults now live in one
-  place (`EditorConfig::default()` and its TS twin).
+- `.editorconfig` is resolved end-to-end via `ec4rs` in
+  `moon-core`, cached per directory, and fed into CodeMirror
+  through a dedicated compartment so `indent_size` / `tab_width`
+  flip live when you save a `.editorconfig`.
+- Server-side save pipeline in `moon-core::pre_save` applies
+  line-ending, trim-trailing-whitespace, and final-newline rules
+  from the resolved config on every write.
+- Replaces the hardcoded `TAB_SIZE = 2` / `INDENT_UNIT = '\t'`
+  constants with `EditorConfig::default()` — the moon-ide
+  defaults now live in one place (Rust + TS twin).
 
 ## How to test
 

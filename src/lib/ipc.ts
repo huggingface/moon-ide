@@ -17,6 +17,7 @@ import type {
 	SlackStatus,
 	SlackUserSummary,
 	StatResult,
+	SystemTheme,
 	TerminalOpenRequest,
 	Workspace,
 	WriteFileResult,
@@ -47,6 +48,9 @@ export const ipc = {
 	appState: {
 		load: () => invoke<AppState>('app_state_load'),
 		save: (appState: AppState) => invoke<void>('app_state_save', { appState }),
+	},
+	system: {
+		theme: () => invoke<SystemTheme>('system_theme'),
 	},
 	editorconfig: {
 		forPath: (path: string) => invoke<EditorConfig>('editorconfig_for_path', { path }),

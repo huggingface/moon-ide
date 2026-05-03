@@ -33,8 +33,8 @@ When in doubt: write one. They are cheap.
 Each file is a single markdown document. Use `0000-template.md` as the starting point. The required headers are:
 
 - **Date** the plan was written. Commit-level identification is left to `git blame` / `git log` — the file's history in the repo is the source of truth for "which commit introduced or last touched this plan", so duplicating that in the front-matter just creates a stale field nobody fills in.
-- **What shipped** — bullets, terse, no marketing.
-- **How to test** — numbered steps a human can run end-to-end. Include exact paths, commands, and expected outputs where they matter.
+- **What shipped** — a handful of **high-level** bullets (aim for ≤ 6, one line each) that describe the user-visible outcome and the main architectural moves. This is not a changelog and not a file-by-file diff — `git log -p` already does that better. If you find yourself listing every helper function you touched, stop and compress. A reader should understand _what the commit does_ without opening any code.
+- **How to test** — numbered steps a human can run end-to-end. Include exact paths, commands, and expected outputs where they matter. This section is allowed (and expected) to be longer than "What shipped"; it's the section that earns the file its keep.
 - **What must keep working** — regression checks. The reason this file is in the repo and not a chat.
 - **Known limitations** — anything we deliberately didn't do.
 - **Related** — links to specs, ADRs, prior test plans.

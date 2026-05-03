@@ -5,6 +5,9 @@
 
 ## What shipped
 
+High-level, ≤ 6 bullets, one line each. User-visible outcome
+and main architectural moves — not a file-by-file diff.
+
 - Bullet 1.
 - Bullet 2.
 

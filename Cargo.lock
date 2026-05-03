@@ -109,6 +109,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "ashpd"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de3d60bee1a1d38c2077030f4788e1b4e31058d2e79a8cfc8f2b440bd44db290"
+dependencies = [
+ "enumflags2",
+ "futures-channel",
+ "futures-util",
+ "rand 0.8.6",
+ "serde",
+ "serde_repr",
+ "tokio",
+ "url",
+ "zbus 5.15.0",
+]
+
+[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2641,10 +2658,12 @@ name = "moon-desktop"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "ashpd",
  "async-trait",
  "base64 0.22.1",
  "camino",
  "dirs",
+ "futures-util",
  "moon-container",
  "moon-core",
  "moon-protocol",
@@ -5150,6 +5169,7 @@ dependencies = [
  "signal-hook-registry",
  "socket2",
  "tokio-macros",
+ "tracing",
  "windows-sys 0.61.2",
 ]
 
@@ -6726,6 +6746,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_repr",
+ "tokio",
  "tracing",
  "uds_windows",
  "uuid",
@@ -6908,6 +6929,7 @@ dependencies = [
  "endi",
  "enumflags2",
  "serde",
+ "url",
  "winnow 1.0.2",
  "zvariant_derive 5.10.1",
  "zvariant_utils 3.3.1",

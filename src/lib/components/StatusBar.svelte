@@ -4,8 +4,9 @@
 	import { container, containerStateLabel } from '../container.svelte';
 	import ContainerPanel from './ContainerPanel.svelte';
 	import TerminalLauncher from './TerminalLauncher.svelte';
+	import ThemePicker from './ThemePicker.svelte';
 
-	let themeBtn: HTMLButtonElement | undefined = $state();
+	let themePicker: ThemePicker | undefined = $state();
 	let containerWrap: HTMLDivElement | undefined = $state();
 
 	// Optimistic state during the two long-running ops (setup,
@@ -17,16 +18,16 @@
 		container.inFlight === 'setup' || container.inFlight === 'rebuild' ? 'creating' : container.state,
 	);
 
-	// F6 cycle can land on the status bar; the only interactive control
-	// here today is the theme toggle, so that's the focus target. If we
-	// add more controls later, switch this to a generic
-	// "first focusable" lookup like Sidebar.svelte does.
+	// F6 cycle can land on the status bar; focus the theme picker
+	// (the right-most interactive control). If we add more controls
+	// here, switch to a generic "first focusable" lookup like
+	// Sidebar.svelte does.
 	$effect(() => {
 		const tick = workspace.statusFocusTick;
 		if (tick === 0) {
 			return;
 		}
-		queueMicrotask(() => themeBtn?.focus());
+		queueMicrotask(() => themePicker?.focus());
 	});
 
 	// Click outside the popover closes it. The pip button itself is
@@ -109,21 +110,14 @@
 			<span class="pip" class:on={slack.connected}></span>
 			chat
 		</button>
-		<!-- Theme indicator + toggle. The label flips on every click,
-			 which is also a useful diagnostic: if you click and the icon
-			 doesn't change, `toggleTheme()` didn't fire; if the icon
-			 changes but the colors don't, the CSS variables aren't being
-			 applied. Independent dispatch path from the command palette,
-			 so a broken palette doesn't hide theme state. -->
-		<button
-			bind:this={themeBtn}
-			type="button"
-			class="theme"
-			title="Theme: {workspace.theme} (click to toggle)"
-			onclick={() => workspace.toggleTheme()}
-		>
-			{workspace.theme === 'dark' ? '☾ dark' : '☀ light'}
-		</button>
+		<!-- Theme picker popover. Three options: System (OS-driven),
+			 Light, Dark. The trigger label reflects the stored choice
+			 and its `title` tooltip also exposes the currently-
+			 resolved mode when `System` is active — a useful
+			 diagnostic if the IDE's colours diverge from the user's
+			 expectation. Independent dispatch path from the command
+			 palette, so a broken palette doesn't hide theme state. -->
+		<ThemePicker bind:this={themePicker} />
 	</div>
 </div>
 
@@ -159,21 +153,6 @@
 	.path {
 		max-width: 60ch;
 		color: var(--m-fg-subtle);
-	}
-	.theme {
-		font: inherit;
-		color: var(--m-fg-muted);
-		background: transparent;
-		border: 1px solid transparent;
-		border-radius: 4px;
-		padding: 0 6px;
-		height: 18px;
-		line-height: 18px;
-		cursor: pointer;
-	}
-	.theme:hover {
-		background: var(--m-bg-overlay);
-		color: var(--m-fg);
 	}
 	.chat {
 		font: inherit;

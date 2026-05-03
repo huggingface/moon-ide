@@ -4,6 +4,7 @@ mod commands;
 mod shutdown;
 mod slack_poller;
 mod state;
+mod system_theme_watcher;
 
 use camino::Utf8PathBuf;
 use moon_core::app_state as core_app_state;
@@ -39,6 +40,7 @@ pub fn run() {
 			commands::search::search_content,
 			commands::app_state::app_state_load,
 			commands::app_state::app_state_save,
+			commands::system::system_theme,
 			commands::editorconfig::editorconfig_for_path,
 			commands::container::container_status,
 			commands::container::container_setup,
@@ -114,6 +116,11 @@ pub fn run() {
 			);
 			let slack_state = state::SlackState::new(client_cell, poller.clone());
 			let state = AppState::new(config_dir.clone(), workspaces_dir, slack_state);
+
+			// Live OS colour-scheme tracking (Linux only — on macOS
+			// and Windows the webview's own `onThemeChanged` fires).
+			// Compiles to a no-op shim on non-Linux targets.
+			system_theme_watcher::spawn(app.handle().clone());
 
 			// Restore the last session's workspace synchronously so the
 			// frontend's first call to `workspace_active` already sees it. The

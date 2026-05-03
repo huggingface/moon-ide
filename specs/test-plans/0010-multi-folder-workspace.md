@@ -5,31 +5,23 @@
 
 ## What shipped
 
-- A workspace stops being a single folder. The singleton
-  `"default"` workspace now holds zero or more bound folders,
-  with at most one active at a time.
-- Sidebar renders a stacked list of folder bars (one row per
-  bound folder) plus an inline `+ Add folder` row at the bottom.
-  The active bar shows `▾` and renders that folder's file tree
-  immediately underneath; inactive bars show `▸` (header-only).
+- A workspace can now hold multiple bound folders, surfaced as
+  a stacked list of folder bars in the sidebar (active bar
+  expands its tree inline; others stay collapsed). One folder
+  is active at a time.
 - Per-folder UI state (open tabs, active tab, split layout,
-  focused side, untitled-buffer counter) is preserved across
-  folder switches via `WorkspaceState.folderStates`. Editor pane
-  - tab strip swap when the active folder changes.
-- `×` on each bar (revealed on hover, kept visible on focus)
-  drops the folder with a confirm dialog. Dirty buffers in the
-  removed folder are discarded after a separate warn line in the
-  confirm.
-- Re-picking a folder already in the workspace flips it to
-  active and flashes a `Folder is already in the workspace.`
-  toast — no duplicate row.
-- Removing the last folder collapses to the welcome screen.
-- Persisted session is per-folder: `WorkspaceSession` carries a
-  list of `FolderSession` entries plus an `active_folder_path`.
-  Both folder list + active pointer survive restart.
-- `Ctrl+P` (file search), `Ctrl+Shift+F` (content search), and
-  the file tree all scope to the active folder. Cross-folder
-  search stays a Phase 7 concern.
+  focused side, untitled counter) is preserved across folder
+  switches; the editor pane and tab strip swap when the active
+  folder changes.
+- Folder add / remove flows: `+ Add folder` row at the bottom;
+  hovering a bar reveals a confirm-gated `×`. Duplicate adds
+  toast and flip to active instead of creating a row. Removing
+  the last folder collapses back to the welcome screen.
+- Session persistence grows a list of `FolderSession` entries
+  plus an `active_folder_path`, so the whole multi-folder
+  layout survives restart.
+- File tree, `Ctrl+P`, and `Ctrl+Shift+F` all scope to the
+  active folder. Cross-folder search stays a Phase 7 concern.
 
 ## How to test
 

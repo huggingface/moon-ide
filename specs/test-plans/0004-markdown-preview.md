@@ -5,37 +5,20 @@
 
 ## What shipped
 
-- New `src/lib/markdown.ts`: tiny markdown-it pipeline configured
-  with `html: false` (raw HTML escaped) + `linkify: false` (no
-  surprise auto-links), then run through DOMPurify for defense in
-  depth. Every rendered `<a>` carries `rel="noopener noreferrer"`.
-- New `MarkdownView.svelte`: scrollable `.markdown-body` article
-  rendered from sanitised HTML. Click handler routes anchors by
-  shape: `http(s)://`, `mailto:`, and `tel:` URLs are forwarded to
-  the OS via `@tauri-apps/plugin-opener`'s `openUrl` (default
-  browser, mail client, dialer); in-page `#anchors` get the native
-  scroll; relative or workspace-root-absolute paths resolve via
-  `resolveMarkdownLink` (lexical, browser-style, `..` past the
-  workspace root → reject) and get handed to `workspace.openFile`;
-  unrecognised schemes (`file://`, custom protocols) are dropped on
-  the floor. The webview itself never navigates, so a stray
-  `https://…` click can't replace the IDE shell with the page, and
-  the host re-validates path bounds on the IPC roundtrip even if
-  the lexical resolver lets something through.
-- `EditorPane` picks `MarkdownView` over `Editor` whenever the
-  active path is markdown and `previewModeFor(path) === 'preview'`.
-- `EditorTabs` grows a Source/Preview toggle anchored to the right
-  end of the strip. The toggle only renders when the active tab is
-  markdown; switching tabs hides it again.
-- `WorkspaceState` learns `previewModeFor(path)`,
-  `setPreviewMode(path, mode)`, `togglePreviewMode(path)`. The mode
-  is stored per buffer (not per pane), defaults to `preview` for
-  `.md`/`.markdown`/`.mdown`, and is GC'd along with the buffer
-  when the last pane drops it.
-- New palette command "Markdown: Show Preview" / "Markdown: Show
-  Source" (label flips with the current state). Hidden when the
-  active tab isn't markdown via the new optional `Command.visible`
-  predicate.
+- Markdown files now open in a rendered preview by default via a
+  sandboxed markdown-it + DOMPurify pipeline (`html: false`,
+  `linkify: false`, `rel="noopener noreferrer"` on every `<a>`).
+- Tab-strip Source / Preview toggle (and matching palette
+  command, hidden for non-markdown tabs) flips per-buffer;
+  preview mode is stored on the buffer, not the pane.
+- Link click handler is scheme-aware: `http(s)` / `mailto` /
+  `tel` open in the OS default via Tauri's opener; in-page
+  `#anchors` scroll natively; workspace-relative and root-
+  absolute paths open in the editor after lexical + host-side
+  validation; every other scheme is dropped.
+- New optional `Command.visible` predicate gives the palette a
+  way to hide context-dependent commands — used for the
+  markdown toggle, reusable for later.
 
 ## How to test
 

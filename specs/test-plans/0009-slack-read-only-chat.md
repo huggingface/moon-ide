@@ -5,70 +5,23 @@
 
 ## What shipped
 
-- Two new endpoints on `SlackClient`
-  ([`crates/moon-slack/src/client.rs`](../../crates/moon-slack/src/client.rs)):
-  - `list_sessions(channel)` — wraps `conversations.history?limit=100`
-    (`SESSION_HISTORY_LIMIT`), filters to top-level messages
-    (`thread_ts == ts || thread_ts is None`), maps to
-    [`SlackSession`](../../crates/moon-protocol/src/slack.rs)
-    `(thread_ts, latest_ts, preview, reply_count, user_id)`. No
-    cursor walks — one page is enough until somebody asks for more.
-  - `get_thread(channel, ts)` — wraps `conversations.replies?limit=200`
-    (`THREAD_REPLY_LIMIT`), maps to
-    [`SlackMessage`](../../crates/moon-protocol/src/slack.rs)
-    `(ts, user_id, text, edited_ts, is_bot)`. `is_bot` comes
-    straight off Slack's `bot_id` field.
-  - Preview body has whitespace runs collapsed and is capped at
-    `PREVIEW_MAX_CHARS` (transport safety only — runaway bot
-    replies). Visible-width truncation is the panel's job: it
-    parses the mrkdwn through `slackPlainText`, flattening
-    `<https://…|label>` to `label` and `<@U…>` to the cached
-    display name, then `line-clamp: 2` cuts to the row width.
-    Truncating mrkdwn server-side would cut mid-token and the JS
-    dangling-trim would silently swallow the link.
-- New protocol types
-  ([`crates/moon-protocol/src/slack.rs`](../../crates/moon-protocol/src/slack.rs)):
-  `SlackSession`, `SlackMessage`. Both are `#[derive(TS)]`-exported.
-- `AppState.slack` grows an `active_thread_ts: Option<String>`. Cleared
-  on bot switch (sessions live inside one bot's DM channel — a new
-  bot inherits no thread) and on disconnect.
-- Three new tauri commands
-  ([`src-tauri/src/commands/slack.rs`](../../src-tauri/src/commands/slack.rs)):
-  - `slack_list_sessions(channel)` — fronts `list_sessions`.
-  - `slack_get_thread(channel, threadTs)` — fronts `get_thread`.
-  - `slack_set_active_thread(threadTs | null)` — load-mutate-save of
-    `AppState.slack.active_thread_ts`. Idempotent (early return if
-    unchanged).
-  - `slack_select_bot` now also clears `active_thread_ts` whenever
-    the bot identity actually changes.
-- Frontend
-  ([`src/lib/slack.svelte.ts`](../../src/lib/slack.svelte.ts)):
-  - `SlackPanelState` grows `sessions`, `loadingSessions`,
-    `sessionsError`, `activeThreadTs`, `threadMessages`,
-    `loadingThread`, `threadError`. Two private generation
-    counters discard late responses when the user has switched
-    bots or threads.
-  - `loadSessions()`, `selectThread(threadTs | null)`,
-    `loadThread(threadTs)`. `selectThread` persists via
-    `slack_set_active_thread` fire-and-forget.
-  - `hydrate(state)` now restores `active_thread_ts` alongside
-    `active_bot` and `panel_visible`.
-- UI ([`src/lib/components/ChatPanel.svelte`](../../src/lib/components/ChatPanel.svelte)):
-  - Sessions section under the bot card: clickable rows with
-    preview + relative time + reply count.
-  - Thread view: bubble per message, bot bubbles get a tinted
-    background, `(edited)` marker on `edited_ts`, monospace
-    timestamp, "← Sessions" back button.
-  - `$effect` block auto-loads sessions / the persisted thread
-    whenever the panel becomes visible with a connected bot.
-  - Per-minute `nowTick` re-renders relative timestamps.
-  - Tiny new utility
-    [`src/lib/util/slackTime.ts`](../../src/lib/util/slackTime.ts):
-    `formatSlackRelative` (cap at "1 week ago", switches to date
-    after) and `formatSlackTime` (24-hour `HH:MM`).
-- Spec updates: roadmap row for 11.0 was rewritten to reflect what
-  actually shipped (DM-first picker, keyring backends), and the 11.1
-  description points at this test plan.
+- Chat panel now renders a read-only sessions + thread view for
+  the picked bot: session list under the bot card, clickable
+  thread bubbles with `(edited)` markers and monospace `HH:MM`
+  stamps.
+- Two new `SlackClient` calls — `list_sessions` (wraps
+  `conversations.history`, filters to top-level messages) and
+  `get_thread` (wraps `conversations.replies`). Single page each;
+  no cursor walks until someone asks.
+- Persisted `AppState.slack.active_thread_ts` restores the open
+  thread across launches; cleared on bot switch and disconnect.
+- Frontend guards against stale responses via per-bot and
+  per-thread generation counters, so rapid bot / session
+  switches never paint the wrong thread.
+- Preview trimming is split in half: Rust collapses whitespace
+  and caps body length for transport, the panel renders the
+  user-visible 2-line clamp through the mrkdwn parser (keeps
+  `<https://…|label>` tokens intact).
 
 ## Out of scope (deferred to later 11.x)
 

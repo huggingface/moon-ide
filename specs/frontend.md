@@ -83,7 +83,14 @@ We don't wrap Pierre Trees behind an adapter — we use it directly. If we need 
 
 ## Theming
 
-CSS custom properties only. Default dark theme; light theme is a class on `:root`. Pierre Trees is themed via the same custom properties (it reads CSS vars from the host).
+CSS custom properties only. The only stylesheet-global signal is the `.light` class on `:root`: present → light palette, absent → dark palette. Pierre Trees is themed via the same custom properties (it reads CSS vars from the host).
+
+The user picks one of three modes in the status-bar theme picker — **System**, **Dark**, **Light** — persisted in `AppState.theme` (see `crates/moon-protocol/src/theme.rs`). System is the default for fresh installs.
+
+- The picked mode is stored verbatim. The painted palette is the _resolved_ `WorkspaceState.effectiveTheme`, which is `dark` / `light` when the user picked one of those and the OS preference when they picked `System`.
+- The OS preference is resolved by the desktop shell via the `system_theme` Tauri command. On Linux / BSD the command talks to the XDG Desktop Portal (`org.freedesktop.appearance color-scheme`) through `ashpd`, which is the same channel Firefox and Chromium listen on; on macOS / Windows it forwards `tauri::WebviewWindow::theme()`. The detour matters because in a WebKitGTK webview both `matchMedia('(prefers-color-scheme: dark)')` and Tauri's own `getCurrentWindow().theme()` ignore the GTK / GNOME / KDE preference and default to light, so System mode flipped to light on every launch for users on a dark desktop. `restoreAppState` awaits the probe before the first `applyTheme` call so the UI doesn't flash.
+- Live OS-theme flips go through the same platform split. On Linux a tokio task in the desktop shell subscribes to `Settings.receive_color_scheme_changed` via ashpd and re-broadcasts each change as the `system:theme-changed` Tauri event, which the frontend `listen`s for. On macOS / Windows `getCurrentWindow().onThemeChanged` fires directly on the webview, so the Linux watcher compiles to a no-op there. `matchMedia` is left wired as a last-resort fallback for non-Tauri dev shells (vite-only).
+- Surfaces that can't read CSS variables (CodeMirror's `dark: boolean` build-time flag, xterm.js's option-bag palette) have their own `$effect` blocks keyed on `effectiveTheme` and reconfigure when it flips.
 
 ## Keymap
 

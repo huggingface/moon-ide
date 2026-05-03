@@ -5,30 +5,19 @@
 
 ## What shipped
 
-- `WorkspaceState.openFiles` keeps every loaded buffer (one
-  `OpenFile` per path), but tab order is now stored separately in
-  `leftTabs` and `rightTabs`. The two arrays are independent.
-- `WorkspaceState.openFile` adds the path to the focused pane's tab
-  list if it isn't already there, and only that pane.
-- `WorkspaceState.closeFile(path, side)` removes the path from one
-  pane only. The dirty-discard prompt is skipped when the buffer is
-  still open in the other pane (no data is at risk). Buffers that
-  fall out of every pane are GC'd from `openFiles`.
-- `WorkspaceState.moveFile(from, before, side)` reorders within one
-  pane only.
-- `WorkspaceState.splitActive` mirrors only the focused pane's
-  active tab into the new pane (one tab to start; the user opens
-  more from the file tree).
-- `WorkspaceState.closeSplit` clears `rightTabs` and GCs any buffers
-  it owned exclusively.
-- `EditorTabs` renders `workspace.tabsFor(side)` instead of the
-  shared list. Tab drag is locked to its source pane (drag-between-
-  panes is intentionally not supported yet — drops from the other
-  pane silently no-op).
-- `WorkspaceSession` schema replaced `open_files` with
-  `open_files_left` + `open_files_right`. Restore loads each path
-  exactly once (Set deduplication) and reconstructs each pane's
-  tab order from its own list.
+- Tab order is now per pane (`leftTabs` / `rightTabs`). Buffers
+  are still shared via `WorkspaceState.openFiles`, so a file
+  opened in both panes loads once and edits stay in sync.
+- Open / close / reorder / split actions all scope to a single
+  pane. The dirty-discard prompt is skipped when the buffer is
+  still open in the other pane (no data at risk); buffers that
+  drop out of every pane are GC'd.
+- Tab drag is locked to its source pane — drops onto the other
+  pane silently no-op (drag-between-panes is a deliberate
+  follow-up).
+- Persisted session schema swaps `open_files` for
+  `open_files_left` / `open_files_right`, restoring each pane's
+  tab order independently.
 
 ## How to test
 

@@ -5,64 +5,25 @@
 
 ## What shipped
 
-- `OpenFile` gains an `isUntitled: boolean` discriminator. The buffer's
-  `path` field doubles as the stable identifier for tab arrays / active
-  fields / preview-mode / editorconfig caches; for untitled buffers
-  it's a synthetic `untitled:N` string (workspace paths never start
-  with that prefix, so collisions are impossible). Real-file paths
-  stay workspace-relative.
-- `WorkspaceState.newUntitledTab(side?)`: creates a fresh untitled
-  buffer (`Untitled-N`, empty text, `isDirty=false`), appends it to
-  the pane's tab list, sets it active, and pulls editor focus. A
-  per-process `untitledCounter` provides `N`; numbering resets on
-  app launch because untitled state never persists.
-- `WorkspaceState.saveActiveAs()`: opens the native Tauri save dialog
-  (default path = workspace root + `Untitled-N.txt` for untitled,
-  current absolute path for existing files), validates that the chosen
-  path lives inside the workspace, refuses to merge with an already-
-  open buffer at the destination, writes the file, re-reads it through
-  the existing post-save pipeline (so the dirty fingerprint reflects
-  trailing-newline / whitespace transforms), and rebinds the buffer
-  in lockstep across `openFiles`, `leftTabs` / `rightTabs`,
-  `leftActive` / `rightActive`, and the preview-mode map. The file
-  tree is refreshed so the new file shows up without a manual reload.
-- `saveActive()` now delegates to `saveActiveAs()` whenever the active
-  buffer `isUntitled` — first `Ctrl+S` against a fresh tab opens the
-  native dialog, every subsequent save (after the rebind) takes the
-  normal write path.
-- `WorkspaceState.renameTick` + `lastRename` + `isRename(from, to)`:
-  explicit rename signal. `Editor.svelte`'s reactive effect watches
-  the tick and, when `file.path` changes, asks `isRename` whether the
-  swap was a save-as (preserve view state, swap language) or a tab
-  switch (rebuild state). Content-equality detection was rejected
-  because the pre-save pipeline (final newline insertion, trailing
-  whitespace trim, line-ending normalisation) can leave the
-  freshly-read text differing from the live view doc — that would
-  silently mis-classify saves as tab switches.
-- Editor language extension swaps in place via the existing
-  `languageCompartment.reconfigure(...)` after a rename, so an
-  untitled buffer saved as `foo.svelte` immediately gets HTML/Svelte
-  highlighting (and same for `.ts` → `.svelte`, etc.).
-- Persistence: `persistAppState` filters untitled paths out of both
-  `open_files_left` / `open_files_right` and the active fields.
-  Untitled buffers vanish on restart by design — the user-visible
-  contract matches every other editor.
-- `Ctrl+N` keybinding (`App.svelte`) and `New File` palette command
-  (`commands.svelte.ts`). Both refuse when no workspace is open and
-  flash a toast — untitled buffers piggyback on the editor pane
-  scaffolding which only renders inside a workspace.
-- `Save File As…` palette command. No keyboard shortcut yet
-  (Ctrl+Shift+S is the obvious pick but waits for a concrete request,
-  per the scope-discipline rule).
-- `EditorTabs.svelte`: tab tooltip falls back to `file.name` for
-  untitled buffers (so the hover doesn't read `untitled:1`); real
-  files keep showing the workspace-relative path.
-- `ensureEditorConfig` short-circuits on `untitled:` paths — the
-  `.editorconfig` cascade has nothing to anchor to until a real path
-  exists. The buffer uses `defaultEditorConfig` until first save.
-- New `dialog:allow-save` permission in
-  `src-tauri/capabilities/default.json` so the native save dialog is
-  reachable from JS.
+- `Ctrl+N` / `New File` palette command creates an untitled
+  tab (`Untitled-N`) in the focused pane. Untitled buffers use
+  a synthetic `untitled:N` path internally and never persist —
+  they vanish on restart by design.
+- First `Ctrl+S` on an untitled tab detours through the native
+  Save As dialog; `Save File As…` palette command covers the
+  same flow on real files. Saves are refused outside the
+  workspace, and refused when they'd collide with another
+  open buffer.
+- Save-as rebinds the buffer across open-file maps, tab arrays,
+  active-side pointers, preview-mode, and editorconfig caches
+  in lockstep. Editor view state (cursor, undo) is preserved;
+  the language extension swaps via the existing
+  `languageCompartment` so renames pick up the new filetype's
+  syntax highlighting immediately.
+- New `WorkspaceState.renameTick` + `isRename(from, to)` gives
+  `Editor.svelte` a reliable signal to distinguish save-as from
+  a tab switch (content-equality would misclassify, because the
+  pre-save pipeline canonicalises bytes).
 
 ## How to test
 

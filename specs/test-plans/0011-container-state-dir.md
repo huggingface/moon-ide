@@ -6,27 +6,21 @@
 
 ## What shipped
 
-- Workspace container state moved out of any specific repo to
-  `<dirs::data_local_dir>/moon-ide/workspaces/<id>/{compose.yaml,bound-folders.json}`
-  (with `<id> = "default"` until multi-workspace lands).
-- Compose project name is now the constant `moon-ws-default`
-  rather than `moon-ws-<hash-of-folder>`. Survives folder
-  switches and folder add / remove.
-- `compose.yaml` is generated from the bound-folder list
-  every time it changes. Volumes use absolute host paths,
-  one entry per bound folder mounted at `/workspace/<basename>`.
-  `working_dir: /workspace`. Includes (discovered project
-  compose files) use absolute paths now too.
-- Folder add (sidebar `+`, welcome) and folder remove (per-bar
-  `×`) trigger `container_apply_bound_folders`. The backend
-  rewrites both files; if the compose project happens to be
-  `Running`, it follows up with `docker compose up -d --wait`
-  so the dev container is recreated against the new mount
-  list. `Absent` / `Paused` / `Stopped` / `Failed` are pure
-  file-rewrites — no surprise daemon work while the user
-  has them paused on purpose.
-- Folder switch is a zero-cost UI swap; the container pip is
-  no longer reset on each switch.
+- Container state moves out of any specific repo to
+  `<dirs::data_local_dir>/moon-ide/workspaces/<id>/` —
+  `compose.yaml` + `bound-folders.json`, with `<id> = "default"`
+  until multi-workspace lands.
+- Compose project name is now the constant `moon-ws-default`,
+  so folder add / remove / switch no longer rename or recreate
+  the project.
+- `compose.yaml` is regenerated from the bound-folder list
+  (absolute paths, one bind mount per folder at
+  `/workspace/<basename>`, `working_dir: /workspace`); folder
+  add and remove rewrite the files and — only when the project
+  is already `Running` — run `docker compose up -d --wait` to
+  refresh the container. Paused / Stopped / Absent stay put.
+- Folder switch is a zero-cost UI swap — the container pip
+  stops flickering on each switch.
 
 ## How to test
 

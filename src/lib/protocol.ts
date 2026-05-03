@@ -85,7 +85,21 @@ export type ContentSearchResult = {
 	truncated: boolean;
 };
 
-export type ThemeMode = 'dark' | 'light';
+/**
+ * What the user picked in the theme switcher. `'system'` means
+ * "follow the OS" and gets resolved to dark/light at render time
+ * on the frontend — see `WorkspaceState.effectiveTheme`. Mirrors
+ * `moon_protocol::theme::ThemeMode`.
+ */
+export type ThemeMode = 'system' | 'dark' | 'light';
+
+/**
+ * Resolved OS colour-scheme preference from the desktop shell.
+ * `'unspecified'` maps to the XDG portal's "no preference" value,
+ * which we treat as dark (moon-ide defaults to dark chrome).
+ * Mirrors `moon_protocol::theme::SystemTheme`.
+ */
+export type SystemTheme = 'dark' | 'light' | 'unspecified';
 
 export type SplitSide = 'left' | 'right';
 
@@ -242,7 +256,7 @@ export type TerminalClosed = {
 
 export const defaultAppState: AppState = {
 	last_session: null,
-	theme: 'dark',
+	theme: 'system',
 	slack: { active_bot: null, panel_visible: false, active_thread_ts: null },
 	bottom_panel: { visible: false, height: 240 },
 };

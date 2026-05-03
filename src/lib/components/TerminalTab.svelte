@@ -7,6 +7,7 @@
 
 	import type { TerminalTab } from '../bottomPanel.svelte';
 	import { terminal as terminalStore } from '../terminal.svelte';
+	import { workspace } from '../state.svelte';
 
 	// Body component for a `kind: 'terminal'` bottom-panel tab.
 	// Mounts an xterm.js Terminal wired to the store's IO bus:
@@ -42,9 +43,11 @@
 
 		// `convertEol: false` — we never inject text ourselves;
 		// the host shell takes care of CR/LF semantics. Theme
-		// values mirror the dark CodeMirror palette so terminal
-		// and editor coexist visually; once Phase 8 ships
-		// Pierre's themes, this gets sourced from one place.
+		// values are read from the same CSS tokens the editor
+		// uses so terminal and editor coexist visually; a
+		// separate `$effect` below re-applies them when the
+		// active theme flips. Once Phase 8 ships Pierre's
+		// themes, this gets sourced from one place.
 		term = new Terminal({
 			fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace',
 			fontSize: 12,
@@ -92,6 +95,20 @@
 			refit();
 		});
 		resizeObserver.observe(hostEl);
+	});
+
+	// Re-theme on every dark/light flip. Xterm.js has no CSS-
+	// variable pathway for its colours; the palette is copied into
+	// the Terminal's option bag at construction and stays stale
+	// until we overwrite it. Reading `workspace.effectiveTheme`
+	// (not `workspace.theme`) so "System" also repaints when the
+	// OS preference changes mid-session.
+	$effect(() => {
+		workspace.effectiveTheme;
+		if (!term) {
+			return;
+		}
+		term.options.theme = terminalThemeFromCss();
 	});
 
 	onDestroy(() => {
