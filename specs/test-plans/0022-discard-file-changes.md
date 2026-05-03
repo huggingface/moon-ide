@@ -102,8 +102,13 @@ with at least one commit.
   (as Pierre's context menu is per-row); the trash call is a
   recursive move for directory rows.
 - No undo. "Discard" on a tracked file is irreversible — that's
-  why the confirm is always-on. Untracked files go to the OS
-  trash, recoverable there.
+  why the confirm fires whenever live edits are on the line.
+  Untracked files go to the OS trash, recoverable there.
+- Pure un-delete skips the confirm: if every target is a
+  `deleted` row (i.e. the action is just `git restore --source
+=HEAD`), the dialog is noise and we go straight through. The
+  moment a modified or untracked path joins the set the confirm
+  comes back.
 - Keyboard shortcut intentionally omitted. A palette command was
   considered and dropped — the context menu is the single
   discovery surface, and a hotkey would need a distinct "discard

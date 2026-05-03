@@ -1124,14 +1124,25 @@ class WorkspaceState {
 			return;
 		}
 
-		const message = buildDiscardMessage(toRestore, toTrash);
-		const ok = await confirm(message, {
-			title: 'Discard changes',
-			okLabel: 'Discard',
-			cancelLabel: 'Cancel',
-		});
-		if (!ok) {
-			return;
+		// Skip confirm when the user is doing a pure un-delete:
+		// every target is a `deleted` path being restored from HEAD.
+		// Nothing is thrown away, nothing lands in the trash, and
+		// git already holds the exact content we're bringing back —
+		// the dialog adds friction without adding safety. Any other
+		// mix (modified, untracked) still fires it: modified means
+		// we're discarding live edits, untracked means a trash trip
+		// with no git recovery path.
+		const isPureUndelete = toTrash.length === 0 && toRestore.every((p) => statusMap.get(p) === 'deleted');
+		if (!isPureUndelete) {
+			const message = buildDiscardMessage(toRestore, toTrash);
+			const ok = await confirm(message, {
+				title: 'Discard changes',
+				okLabel: 'Discard',
+				cancelLabel: 'Cancel',
+			});
+			if (!ok) {
+				return;
+			}
 		}
 
 		// Order matters only in so far as the folder refresh we fire
@@ -1256,7 +1267,16 @@ class WorkspaceState {
 		const total = displays.length;
 		const message = buildRemovalMessage(displays, real, mode);
 
-		if (total > 0) {
+		// Skip the confirm dialog when every target is safely
+		// recoverable via git — i.e. tracked-clean files, or folders
+		// whose descendants are all tracked-clean. The "are you
+		// sure?" dialog exists as a safety net against accidental
+		// keypresses; for paths git can bring back unchanged in one
+		// command the net is net annoyance, not protection. Dirty
+		// paths, untracked paths, and anything outside a git repo
+		// still fire the dialog — there, an accidental delete _is_
+		// a data-loss event.
+		if (total > 0 && !canSkipRemovalConfirm(real, this.gitStatusEntries)) {
 			const ok = await confirm(message, {
 				title: mode === 'trash' ? 'Move to trash' : 'Permanently delete',
 				okLabel: mode === 'trash' ? 'Move to trash' : 'Delete',
@@ -2067,6 +2087,53 @@ function buildDiscardMessage(toRestore: string[], toTrash: string[]): string {
 		parts.push(`move ${untrackedParts.join(' and ')} to the trash`);
 	}
 	return `Discard ${total} change${total === 1 ? '' : 's'}? This will ${parts.join(' and ')}. The restore step cannot be undone.`;
+}
+
+/**
+ * Whether the user's pending removal is safe to execute without a
+ * confirm dialog. "Safe" here means git can un-do the removal with
+ * one command: for a file, that it's tracked-clean; for a folder,
+ * that no descendant carries a non-ignored status. The moment a
+ * dirty, untracked, or outside-a-repo path shows up we fall back to
+ * the dialog — the user's only recovery there is the OS trash
+ * (reversible but annoying) or nothing at all (permanent delete),
+ * and an accidental keypress shouldn't silently commit to either.
+ *
+ * The presence of `gitStatusEntries` is also our "am I in a repo?"
+ * proxy: outside a repo the backend emits only ignored entries
+ * (walker fallback), which we treat as unsafe by default because
+ * git has no recovery story to offer.
+ */
+function canSkipRemovalConfirm(realPaths: readonly string[], entries: readonly GitStatusEntry[]): boolean {
+	if (entries.length === 0) {
+		return false;
+	}
+	const hasDirty = entries.some((e) => e.status !== 'ignored');
+	if (!hasDirty) {
+		// An all-ignored entry set means we never saw a real git
+		// status signal — treat as "not a repo" from a safety
+		// standpoint.
+		return false;
+	}
+	for (const path of realPaths) {
+		if (path.endsWith('/')) {
+			for (const entry of entries) {
+				if (entry.status === 'ignored') {
+					continue;
+				}
+				if (entry.path === path || entry.path.startsWith(path)) {
+					return false;
+				}
+			}
+			continue;
+		}
+		for (const entry of entries) {
+			if (entry.path === path && entry.status !== 'ignored') {
+				return false;
+			}
+		}
+	}
+	return true;
 }
 
 function buildRemovalMessage(displays: string[], realPaths: string[], mode: 'trash' | 'delete'): string {
