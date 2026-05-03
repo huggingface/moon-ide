@@ -92,6 +92,10 @@ The user picks one of three modes in the status-bar theme picker — **System**,
 - Live OS-theme flips go through the same platform split. On Linux a tokio task in the desktop shell subscribes to `Settings.receive_color_scheme_changed` via ashpd and re-broadcasts each change as the `system:theme-changed` Tauri event, which the frontend `listen`s for. On macOS / Windows `getCurrentWindow().onThemeChanged` fires directly on the webview, so the Linux watcher compiles to a no-op there. `matchMedia` is left wired as a last-resort fallback for non-Tauri dev shells (vite-only).
 - Surfaces that can't read CSS variables (CodeMirror's `dark: boolean` build-time flag, xterm.js's option-bag palette) have their own `$effect` blocks keyed on `effectiveTheme` and reconfigure when it flips.
 
+## Window state
+
+Window size, position, maximized, and fullscreen state are persisted by the official `tauri-plugin-window-state` plugin. It writes its own JSON next to `state.json` and hooks window creation / close automatically — we don't roll our own because it handles monitor placement and DPI edge cases we'd rather not reimplement. That means this slice of UI state lives outside `AppState`; everything else (theme, last session, bottom panel) stays in `state.json`.
+
 ## Keymap
 
 Cm6 default keymap + a small layer of app-level shortcuts wired in `App.svelte`:

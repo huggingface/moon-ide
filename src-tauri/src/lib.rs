@@ -23,6 +23,11 @@ pub fn run() {
 	tauri::Builder::default()
 		.plugin(tauri_plugin_dialog::init())
 		.plugin(tauri_plugin_opener::init())
+		// Persists window size / position / maximized / fullscreen
+		// state to a plugin-owned JSON next to `state.json` and
+		// restores it on next launch. No code on our side — the
+		// plugin hooks into window creation and close events.
+		.plugin(tauri_plugin_window_state::Builder::new().build())
 		.invoke_handler(tauri::generate_handler![
 			commands::workspace::workspace_open_local,
 			commands::workspace::workspace_remove_folder,
