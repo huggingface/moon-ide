@@ -362,6 +362,41 @@ export type ServiceStatus = {
 };
 
 /**
+ * `true` for the conventional "process was terminated by a stop
+ * signal" exit codes — `130` (SIGINT), `137` (SIGKILL), `143`
+ * (SIGTERM). These are what `docker compose stop` (and the IDE's
+ * shutdown hook) produce; they are *not* application failures, so
+ * the per-service indicator stays muted instead of going red.
+ *
+ * Mirrors `is_stop_signal` in
+ * `crates/moon-container/src/lifecycle.rs` — keep the two in sync.
+ * SIGSEGV (139), SIGABRT (134), SIGBUS (135), and friends are
+ * deliberately *not* on this list: those are real crashes the
+ * user should see surfaced.
+ */
+export function isStopSignal(exitCode: number): boolean {
+	return exitCode === 130 || exitCode === 137 || exitCode === 143;
+}
+
+/**
+ * `true` when a service row should be rendered as "this is broken
+ * and won't recover on its own" (solid red dot, no pulse). Plain
+ * `exited (0)` and signal-terminated exits stay muted.
+ */
+export function isFailedService(svc: ServiceStatus): boolean {
+	if (svc.raw_state === 'exited' && svc.exit_code !== 0 && !isStopSignal(svc.exit_code)) {
+		return true;
+	}
+	if (svc.raw_state === 'dead') {
+		return true;
+	}
+	if (svc.raw_state === 'running' && svc.health === 'unhealthy') {
+		return true;
+	}
+	return false;
+}
+
+/**
  * Snapshot returned by `container_status` and embedded in every
  * `container:state` event. Mirrors
  * `moon_protocol::container::ContainerStatus`.

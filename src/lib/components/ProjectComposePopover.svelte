@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { ServiceStatus } from '../protocol';
+	import { isFailedService, type ServiceStatus } from '../protocol';
 	import { composeLogs } from '../composeLogs.svelte';
 	import { projectCompose, projectComposeStateLabel } from '../projectCompose.svelte';
 
@@ -19,21 +19,6 @@
 			return true;
 		}
 		if (svc.raw_state === 'running' && svc.health === 'starting') {
-			return true;
-		}
-		return false;
-	}
-
-	// Failed _and_ won't recover on its own — these stay solid red
-	// (no pulse), to distinguish "broken" from "still working on it".
-	function isFailedService(svc: ServiceStatus): boolean {
-		if (svc.raw_state === 'exited' && svc.exit_code !== 0) {
-			return true;
-		}
-		if (svc.raw_state === 'dead') {
-			return true;
-		}
-		if (svc.raw_state === 'running' && svc.health === 'unhealthy') {
 			return true;
 		}
 		return false;

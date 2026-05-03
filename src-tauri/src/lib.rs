@@ -1,6 +1,7 @@
 //! Tauri shell for moon-ide. Wires Tauri commands to `moon-core`.
 
 mod commands;
+mod shutdown;
 mod slack_poller;
 mod state;
 
@@ -8,7 +9,7 @@ use camino::Utf8PathBuf;
 use moon_core::app_state as core_app_state;
 use moon_slack::{SlackClient, TokenStore};
 use state::AppState;
-use tauri::Manager;
+use tauri::{Manager, RunEvent};
 
 pub fn run() {
 	tracing_subscriber::fmt()
@@ -44,6 +45,7 @@ pub fn run() {
 			commands::container::container_pause,
 			commands::container::container_resume,
 			commands::container::container_rebuild,
+			commands::container::container_stop,
 			commands::container::container_teardown,
 			commands::container::container_apply_bound_folders,
 			commands::container::container_render_compose,
@@ -185,9 +187,49 @@ pub fn run() {
 
 			app.manage(state);
 
+			// If the previous session ran the graceful shutdown
+			// hook (the common case once the user has opted into
+			// the workspace shell), bring it back up in the
+			// background. The pip will track the transition from
+			// `stopped` → `creating` → `running` automatically via
+			// the normal status poll.
+			let app_handle = app.handle().clone();
+			tauri::async_runtime::spawn(async move {
+				let state = app_handle.state::<AppState>();
+				shutdown::auto_resume_shell(&state).await;
+			});
+
 			tracing::info!(protocol_version = moon_protocol::PROTOCOL_VERSION, "moon-ide started");
 			Ok(())
 		})
-		.run(tauri::generate_context!())
-		.expect("error while running moon-ide");
+		.build(tauri::generate_context!())
+		.expect("error while building moon-ide")
+		.run(|app, event| {
+			// moon-ide treats itself as the command centre for
+			// every Docker project it spawned. On quit, hide the
+			// window first (so the UI doesn't look frozen while
+			// `compose stop` runs) then stop the workspace shell
+			// and every bound-folder compose project before
+			// exiting. Best-effort: any per-step failure is logged
+			// but doesn't block the exit.
+			if let RunEvent::ExitRequested { api, code, .. } = event {
+				if code.is_some() {
+					// Programmatic exit (already in our shutdown
+					// path). Don't recurse.
+					return;
+				}
+				api.prevent_exit();
+				if let Some(window) = app.get_webview_window("main") {
+					if let Err(err) = window.hide() {
+						tracing::warn!(error = %err, "failed to hide main window during shutdown");
+					}
+				}
+				let app_handle = app.clone();
+				tauri::async_runtime::spawn(async move {
+					let state = app_handle.state::<AppState>();
+					shutdown::stop_all(&state).await;
+					app_handle.exit(0);
+				});
+			}
+		});
 }

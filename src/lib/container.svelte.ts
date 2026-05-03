@@ -22,7 +22,7 @@ import { formatError, type ContainerStateChange, type ContainerStatus } from './
 const CONTAINER_STATE_EVENT = 'container:state';
 
 /** Identifies which mutating command is currently in flight. */
-export type ContainerInFlight = null | 'setup' | 'pause' | 'resume' | 'rebuild' | 'teardown' | 'sync-folders';
+export type ContainerInFlight = null | 'setup' | 'pause' | 'resume' | 'rebuild' | 'stop' | 'teardown' | 'sync-folders';
 
 class ContainerPanelState {
 	/** Last known status. `null` before the first `refresh()`. */
@@ -134,6 +134,10 @@ class ContainerPanelState {
 
 	async rebuild(): Promise<void> {
 		await this.#run('rebuild', () => ipc.container.rebuild());
+	}
+
+	async stop(): Promise<void> {
+		await this.#run('stop', () => ipc.container.stop());
 	}
 
 	async teardown(): Promise<void> {

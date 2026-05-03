@@ -1,20 +1,32 @@
 <script lang="ts">
 	import { container, containerStateLabel } from '../container.svelte';
 
-	// Phase 2.0 popover that pops above the status-bar pip. State-
-	// dependent action set: each branch is small and the duplication
-	// is intentional — the action vocabulary genuinely differs and
-	// inlining it makes the affordances easier to reason about than
-	// a giant button-config matrix would.
+	// Workspace shell popover, anchored above the status-bar pip.
+	// Mirrors `ProjectComposePopover.svelte`: a fixed row of four
+	// always-visible text buttons (Start / Stop / Recreate / Down)
+	// where the slot is constant per state — only enablement
+	// changes. Disabling rather than hiding keeps muscle memory
+	// steady; tooltips spell out the literal `docker compose`
+	// verb each button shells to.
 
 	const state = $derived(container.state);
 	const inFlight = $derived(container.inFlight);
-	const services = $derived(container.status?.services ?? []);
 	// "creating" while a setup is in flight is actually the optimistic
 	// state — the real state arrives when the await resolves. Treat
 	// `inFlight !== null` as the source of truth for disabling buttons
 	// rather than the state enum.
 	const busy = $derived(inFlight !== null);
+
+	// `Start` is the user-visible verb across multiple states:
+	// `setup` for absent/stopped/failed (writes compose then
+	// `up -d --wait`), `resume` for paused (`unpause`). Centralise
+	// the dispatch so the button stays in the same slot.
+	function startAction(): Promise<void> {
+		if (state === 'paused') {
+			return container.resume();
+		}
+		return container.setup();
+	}
 </script>
 
 <div class="panel" role="dialog" aria-label="Container controls">
@@ -33,75 +45,57 @@
 
 	{#if state === 'absent'}
 		<p class="copy">No container yet for this workspace.</p>
-		<div class="actions">
-			<button type="button" class="primary" disabled={busy} onclick={() => container.setup()}>
-				{inFlight === 'setup' ? 'Setting up…' : 'Set up'}
-			</button>
-		</div>
 	{:else if state === 'creating'}
 		<p class="copy">Bringing up containers — this can take a few minutes the first time.</p>
-	{:else if state === 'running'}
-		<div class="actions">
-			<button type="button" disabled={busy} onclick={() => container.pause()}>
-				{inFlight === 'pause' ? 'Pausing…' : 'Pause'}
-			</button>
-			<button type="button" disabled={busy} onclick={() => container.rebuild()}>
-				{inFlight === 'rebuild' ? 'Rebuilding…' : 'Rebuild'}
-			</button>
-			<button type="button" class="danger" disabled={busy} onclick={() => container.teardown()}>
-				{inFlight === 'teardown' ? 'Tearing down…' : 'Tear down'}
-			</button>
-		</div>
-	{:else if state === 'paused'}
-		<div class="actions">
-			<button type="button" class="primary" disabled={busy} onclick={() => container.resume()}>
-				{inFlight === 'resume' ? 'Resuming…' : 'Resume'}
-			</button>
-			<button type="button" class="danger" disabled={busy} onclick={() => container.teardown()}>
-				{inFlight === 'teardown' ? 'Tearing down…' : 'Tear down'}
-			</button>
-		</div>
 	{:else if state === 'stopped'}
 		<p class="copy">Containers exist but are stopped (someone ran <code>docker compose stop</code>?).</p>
-		<div class="actions">
-			<button type="button" class="primary" disabled={busy} onclick={() => container.setup()}>
-				{inFlight === 'setup' ? 'Starting…' : 'Start'}
-			</button>
-			<button type="button" class="danger" disabled={busy} onclick={() => container.teardown()}>
-				{inFlight === 'teardown' ? 'Tearing down…' : 'Tear down'}
-			</button>
-		</div>
 	{:else if state === 'failed'}
 		<p class="copy">One or more containers are unhealthy. See per-service detail below.</p>
-		<div class="actions">
-			<button type="button" disabled={busy} onclick={() => container.rebuild()}>
-				{inFlight === 'rebuild' ? 'Rebuilding…' : 'Rebuild'}
-			</button>
-			<button type="button" class="danger" disabled={busy} onclick={() => container.teardown()}>
-				{inFlight === 'teardown' ? 'Tearing down…' : 'Tear down'}
-			</button>
-		</div>
 	{/if}
 
-	{#if services.length > 0}
-		<details class="services" open={state === 'failed'}>
-			<summary>Services ({services.length})</summary>
-			<ul>
-				{#each services as svc (svc.name)}
-					<li>
-						<span class="svc-name">{svc.name}</span>
-						<span
-							class="svc-state svc-{svc.raw_state}"
-							class:svc-bad-exit={svc.raw_state === 'exited' && svc.exit_code !== 0}
-						>
-							{svc.raw_state}{svc.raw_state === 'exited' ? ` (${svc.exit_code})` : ''}{svc.health
-								? ` · ${svc.health}`
-								: ''}
-						</span>
-					</li>
-				{/each}
-			</ul>
-		</details>
+	{#if state !== null}
+		{@const canStart = state === 'absent' || state === 'stopped' || state === 'failed' || state === 'paused'}
+		{@const canStop = state === 'running' || state === 'paused' || state === 'failed'}
+		{@const canRecreate = state === 'running' || state === 'paused' || state === 'failed' || state === 'stopped'}
+		{@const canDown = state !== 'absent'}
+		<div class="actions" role="toolbar" aria-label="Workspace shell actions">
+			<button
+				type="button"
+				class="action"
+				disabled={busy || !canStart}
+				title="Start the workspace shell (docker compose up -d, or unpause if paused). On first run this writes compose.yaml then waits for the container to be healthy."
+				onclick={() => void startAction()}
+			>
+				Start
+			</button>
+			<button
+				type="button"
+				class="action"
+				disabled={busy || !canStop}
+				title="Stop the workspace shell (docker compose stop). Containers stay on the daemon for a fast restart, but in-container processes (LSPs, terminals, dev servers) are SIGTERMed — use docker compose pause from a terminal if you need to keep them in memory."
+				onclick={() => container.stop()}
+			>
+				Stop
+			</button>
+			<button
+				type="button"
+				class="action"
+				disabled={busy || !canRecreate}
+				title="Recreate the workspace shell (docker compose up -d --force-recreate --pull always). Pulls a fresh moon-base image and recreates from current bound folders."
+				onclick={() => container.rebuild()}
+			>
+				Recreate
+			</button>
+			<button
+				type="button"
+				class="action danger"
+				disabled={busy || !canDown}
+				title="Bring the workspace shell down (docker compose down). Removes containers and the network. Volumes are preserved."
+				onclick={() => container.teardown()}
+			>
+				Down
+			</button>
+		</div>
 	{/if}
 
 	<details class="preview">
@@ -177,40 +171,39 @@
 		border-radius: 3px;
 		color: var(--m-fg);
 	}
+	/* Match the per-folder popover (`ProjectComposePopover.svelte`):
+	   four uniform text buttons that always render and flex to share
+	   the row, disabled when not applicable to the current state. */
 	.actions {
 		display: flex;
-		gap: 6px;
-		flex-wrap: wrap;
+		gap: 4px;
 	}
-	.actions button {
+	.action {
+		flex: 1 1 0;
+		min-width: 0;
 		font: inherit;
+		font-size: 12px;
+		line-height: 1;
 		background: var(--m-bg-overlay);
 		color: var(--m-fg);
 		border: 1px solid var(--m-border);
 		border-radius: 4px;
-		padding: 4px 10px;
+		padding: 5px 6px;
+		text-align: center;
 		cursor: pointer;
 	}
-	.actions button:hover:not(:disabled) {
+	.action:hover:not(:disabled) {
 		background: var(--m-bg-1);
 		border-color: var(--m-border-strong);
 	}
-	.actions button:disabled {
-		opacity: 0.5;
-		cursor: progress;
+	.action:disabled {
+		opacity: 0.45;
+		cursor: not-allowed;
 	}
-	.actions .primary {
-		background: var(--m-accent);
-		border-color: var(--m-accent);
-		color: var(--m-accent-fg, #fff);
-	}
-	.actions .primary:hover:not(:disabled) {
-		filter: brightness(1.1);
-	}
-	.actions .danger {
+	.action.danger {
 		color: var(--m-danger);
 	}
-	.actions .danger:hover:not(:disabled) {
+	.action.danger:hover:not(:disabled) {
 		background: var(--m-danger);
 		color: var(--m-bg);
 		border-color: var(--m-danger);
@@ -225,55 +218,13 @@
 		max-height: 8em;
 		overflow: auto;
 	}
-	.services,
 	.preview {
 		margin-top: 2px;
 	}
-	.services summary,
 	.preview summary {
 		cursor: pointer;
 		color: var(--m-fg-muted);
 		user-select: none;
-	}
-	.services ul {
-		list-style: none;
-		padding: 4px 0 0;
-		margin: 0;
-		display: flex;
-		flex-direction: column;
-		gap: 2px;
-	}
-	.services li {
-		display: flex;
-		justify-content: space-between;
-		gap: 8px;
-		font-variant-numeric: tabular-nums;
-	}
-	.svc-name {
-		color: var(--m-fg);
-	}
-	.svc-state {
-		color: var(--m-fg-muted);
-		font-size: 11px;
-	}
-	.svc-running {
-		color: var(--m-success);
-	}
-	.svc-paused,
-	.svc-exited,
-	.svc-created {
-		color: var(--m-fg-muted);
-	}
-	.svc-restarting {
-		color: var(--m-warning, var(--m-fg-muted));
-	}
-	/* Long-running services that exited with a non-zero code, or
-	   anything `dead`/unknown — these are the actionable
-	   problems. Plain `exited` (code 0) stays muted because it's
-	   the expected end state for init containers. */
-	.svc-bad-exit,
-	.svc-dead {
-		color: var(--m-danger);
 	}
 	.yaml {
 		margin: 6px 0 0;

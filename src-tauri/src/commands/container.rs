@@ -114,6 +114,13 @@ pub async fn container_rebuild(app: AppHandle, state: State<'_, AppState>) -> Re
 }
 
 #[tauri::command]
+pub async fn container_stop(app: AppHandle, state: State<'_, AppState>) -> Result<ContainerStatus, MoonError> {
+	let (workspace_id, container) = workspace_handle(&state).await?;
+	container.stop().await?;
+	snapshot_and_emit(&app, workspace_id, &container).await
+}
+
+#[tauri::command]
 pub async fn container_teardown(app: AppHandle, state: State<'_, AppState>) -> Result<ContainerStatus, MoonError> {
 	let (workspace_id, container) = workspace_handle(&state).await?;
 	container.teardown().await?;

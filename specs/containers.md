@@ -59,8 +59,8 @@ on the host's daemon. The split is locked in by the
 - **Workspace shell** — the moon-ide `dev` container. One per
   workspace. Hosts terminals, language servers, agents, the
   bound folders' bind mounts. Lifetime managed by the IDE
-  (the bottom-bar status pip's "Set up / Pause / Rebuild /
-  Tear down"). Compose project name: `moon-ws-<id>`.
+  (the bottom-bar status pip's "Start / Stop / Recreate /
+  Down"). Compose project name: `moon-ws-<id>`.
 - **Project services** — each bound folder's own
   `docker-compose.yml` (mongo, redis, gitaly, …). Run as
   **separate** compose projects, named
@@ -112,10 +112,9 @@ brings up just the workspace shell.
 
 When a bound folder has a root-level `docker-compose.yml` (or
 `compose.yaml`), the folder bar in the sidebar grows a small
-status indicator. Click opens a popover with Start / Pause /
-Resume / Rebuild / Stop and a service list — same vocabulary
-as the workspace shell's pip, scoped to that one folder's
-project.
+status indicator. Click opens a popover with Start / Stop /
+Recreate / Down and a service list — same vocabulary as the
+workspace shell's pip, scoped to that one folder's project.
 
 Under the hood the IDE just shells out:
 
@@ -160,7 +159,7 @@ After binding moon-landing into a moon-ide workspace:
 - If gitaly fails the volume permission check, the folder bar
   flips its dot to red and the popover lists `gitaly · exited
 (1)`. The workspace shell stays up — the user can still
-  open a terminal — and "Rebuild" / "Tear down" sit on the
+  open a terminal — and "Recreate" / "Down" sit on the
   popover.
 - The user's app continues to run wherever it ran before —
   on the host (reaching services through published host
@@ -415,33 +414,142 @@ full trade-off discussion.
 
 ## Lifecycle
 
-| Event                                                          | What moon-ide does                                                                                                                                          |
-| -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| First workspace open (no container yet)                        | Pull image if absent → `docker compose -f <workspace>/.moon/compose.yaml create` → `docker compose start`. Run `postCreateCommand` if compose declares one. |
-| Subsequent workspace opens                                     | Look up container by name (`moon-ws-<short-hash>`). Unpause if paused, no-op if running.                                                                    |
-| Workspace close (window close, app quit, host suspend)         | `docker pause`. Container survives moon-ide restart, host reboot, suspend.                                                                                  |
-| User clicks "Rebuild"                                          | `docker compose down` → recreate from current `compose.yaml`. Drops state inside the container.                                                             |
-| Compose file edited externally                                 | Detected on next workspace open via mtime; prompt for "Rebuild now?" before reattaching.                                                                    |
-| Container deleted out-of-band (`docker rm` from another shell) | Detected on next open via `docker inspect` failure; recreate transparently.                                                                                 |
-| Image tag changed in `compose.yaml`                            | Treated as "Rebuild" — recreate from new image.                                                                                                             |
+| Event                                                          | What moon-ide does                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| First workspace open (no container yet)                        | Pull image if absent → `docker compose -f <workspace>/.moon/compose.yaml create` → `docker compose start`. Run `postCreateCommand` if compose declares one.                                                                                                                                                                                                                                                                                |
+| Subsequent workspace opens                                     | Look up container by name (`moon-ws-<short-hash>`). If `stopped` (the common case after a clean previous quit), auto-`compose up -d --wait`. No-op if already running, leave alone if `failed`/`absent`.                                                                                                                                                                                                                                   |
+| App quit / window close                                        | The IDE is the command centre: hide the window, then `docker compose stop` the workspace shell **and** every bound-folder compose project moon-ide knows about, then exit. Best-effort — per-step failures are logged and don't block exit. Per-folder projects stay stopped on next launch (the user manages those individually); only the workspace shell auto-resumes. See [`Why moon-ide owns shutdown`](#why-moon-ide-owns-shutdown). |
+| User clicks "Recreate"                                         | `docker compose up -d --force-recreate --pull always --wait` — recreate from current `compose.yaml`, pulling a fresh image first. Drops in-container state.                                                                                                                                                                                                                                                                                |
+| Compose file edited externally                                 | Detected on next workspace open via mtime; prompt for "Rebuild now?" before reattaching.                                                                                                                                                                                                                                                                                                                                                   |
+| Container deleted out-of-band (`docker rm` from another shell) | Detected on next open via `docker inspect` failure; recreate transparently.                                                                                                                                                                                                                                                                                                                                                                |
+| Image tag changed in `compose.yaml`                            | Treated as "Rebuild" — recreate from new image.                                                                                                                                                                                                                                                                                                                                                                                            |
 
-### Why pause, not stop
+### Stop semantics, and how to keep in-memory state
 
-`docker pause` uses the kernel's cgroup freezer. Processes are
-frozen in place — language servers, the user's shell history,
-a running `bun dev` waiting for a save — all in memory. Resume
-is essentially instant (cgroup thaw, no re-init). The same
-applies to the `include:`d service containers: pausing the
-compose project pauses the workspace's `dev` container _and_
-the project's mongo/redis/etc. as one unit, so the user's
-work-in-progress query state, in-flight migrations, and
-populated caches all survive workspace close.
+The workspace shell's "Stop" button shells to `docker compose
+stop`: SIGTERM to the `dev` container, then to its services if
+they're part of the same project. Processes shut down,
+language servers re-init on next "Start", a running `bun dev`
+needs to be re-launched. That's the predictable, "I'm done
+for now" knob — and it matches the per-project popover, so
+the verb has the same meaning everywhere in the IDE.
 
-`docker stop` sends SIGTERM, processes shut down, init runs
-again on restart, services need to do their startup dance
-again (mongo replica-set init, meilisearch index reload, …).
-We use `stop` only on rebuilds where we _want_ that state
-thrown away.
+We considered Pause (`docker pause`, cgroup freezer) as the
+default instead. It preserves in-memory state — LSPs, shell
+history, the `bun dev` save loop, populated caches — for
+free. The argument for keeping it default was real: dev
+containers carry expensive warm state.
+
+We didn't. Two reasons:
+
+- Per-project compose popovers don't have a Pause story
+  (mongo/redis/gitaly init dances are cheap, and pause+resume
+  there means "kernel-frozen mongo with paused replication" —
+  surprising). Aligning the workspace shell's vocabulary with
+  the per-project one means one mental model.
+- Pause is a debugging tool more than a "log off for the
+  evening" tool. The kernel freezer leaves zombie sockets,
+  half-written file descriptors, and confused tooling outside
+  the container that tries to talk to the paused processes.
+  Most users who reach for it want a quick suspend; "Stop"
+  followed by "Start" is fine for that and gives the system
+  a chance to clean up.
+
+The `pause` / `resume` Tauri commands and `Workspace::pause`
+/ `resume` methods stay on the backend so power users can
+shell to `docker compose pause <project>` from a terminal
+when they really do want to keep state in memory across a
+laptop suspend, but the UI doesn't expose them.
+
+`Recreate` (the third button) shells to `up -d
+--force-recreate --pull always --wait` — that's the "throw
+state away on purpose" knob, used after a moon-base bump or
+when something's wedged.
+
+### Why moon-ide owns shutdown
+
+When the user quits the IDE, moon-ide doesn't just exit — it
+runs `docker compose stop` against:
+
+- the workspace shell (`moon-ws-<id>`), and
+- every bound folder's compose project (`moon-ws-<id>-<slug>`)
+  that has a discoverable `docker-compose.yml` at its root.
+
+Then it exits. The window is hidden first so the UI doesn't
+look frozen for the ~10s of SIGTERM grace period; the actual
+stops run in a background tokio task off the Tauri event
+loop, and the process calls `app.exit(0)` once they finish.
+
+This makes the IDE the **command centre** for everything it
+spawned. The user's mental model is "I closed moon-ide,
+nothing should be using my CPU and RAM that I can't see in
+moon-ide". The alternative — leaving every compose project
+running after quit — collects ghost projects on the daemon
+that are tedious to enumerate (`docker compose ls --filter
+name=moon-ws-`) and, more importantly, easy for the user to
+**forget** they're paying for.
+
+Asymmetry on the way back in: only the workspace shell
+auto-resumes on next launch (via [`auto_resume_shell`] in
+`src-tauri/src/shutdown.rs`). Per-folder projects stay
+stopped — the user starts them explicitly from the folder
+bar's popover, because they're often started **for a reason**
+("I'm about to run e2e", "I need gitaly for this PR") that
+moon-ide can't infer.
+
+Failure modes are deliberately non-fatal:
+
+- `compose stop` on a project that doesn't exist on the
+  daemon yet: warning, exit continues. (Common: user opened
+  a folder, never started its services, then closed the
+  IDE.)
+- IDE killed via SIGKILL, OS shutdown, kernel panic: the
+  shutdown hook never runs. Containers stay running; next
+  launch sees them as `Running` and leaves them alone.
+  `compose stop` is idempotent so this never causes
+  divergence.
+- Auto-resume `setup` on launch fails (image gone, daemon
+  down): logged at `warn`, the IDE itself launches normally
+  and the failure surfaces in the status pip popover when
+  the user opens it.
+
+#### Signal-termination exits aren't failures
+
+Plenty of long-running services (JVMs especially —
+DynamoDB, MongoDB, MeiliSearch) exit with code `143` on
+SIGTERM, or `137` on SIGKILL escalation, when `compose
+stop` reaches them. A naive aggregator would surface that
+as `Failed`, which is wrong for two reasons:
+
+- **Visual noise.** The user clicked Stop. They don't want
+  to come back to a red panel five seconds later.
+- **Auto-resume regression.** `auto_resume_shell` only
+  brings the workspace shell back if the previous state
+  was exactly `Stopped`. With every JVM exiting `143` on
+  shutdown, the project lands in `Failed` and the next
+  launch silently refuses to resume.
+
+`is_stop_signal` (in `crates/moon-container/src/lifecycle.rs`,
+mirrored as `isStopSignal` in `src/lib/protocol.ts`)
+treats exit codes `130` (SIGINT), `137` (SIGKILL), and
+`143` (SIGTERM) as a clean stop. The aggregator counts
+them with the zero-exit bucket; the per-service
+indicator stays muted instead of red. SIGSEGV (`139`),
+SIGABRT (`134`), SIGBUS (`135`) and other genuine
+crashes are deliberately _not_ on the list — those still
+flip to `Failed`.
+
+The trade-off: a service that gets OOM-killed (also exit
+`137`) after start-up will look indistinguishable from
+"compose stop escalated to SIGKILL after the grace
+period". The user can still see the literal exit code in
+the per-service row text (`exited (137)`); it's the _dot
+colour and project-level aggregate_ that's been moved to
+the optimistic interpretation. We accept the false
+negative because in practice, OOM-kills inside a dev
+container are rare, and the user's next attempt to bring
+the project up will surface any persistent failure
+anyway.
 
 ## What runs where
 

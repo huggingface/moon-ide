@@ -331,6 +331,18 @@ impl Workspace {
 		Ok(())
 	}
 
+	/// `docker compose stop` — SIGTERM every container in the
+	/// project but leave the records on the daemon. Cheaper to
+	/// undo than [`Self::teardown`]: a follow-up `setup` resumes
+	/// from the same containers without re-pulling images. The
+	/// in-container process state is lost (LSPs restart, shells
+	/// re-init) — users who need that to survive can reach for
+	/// `docker compose pause` from a terminal.
+	pub async fn stop(&self) -> Result<(), LifecycleError> {
+		self.docker_compose(["stop"]).await?;
+		Ok(())
+	}
+
 	/// `docker compose down` — stop and remove containers,
 	/// networks, and the project entry. The compose file itself
 	/// stays on disk; the next `setup` resurrects from there.
@@ -504,6 +516,30 @@ impl From<PsEntry> for ServiceStatus {
 	}
 }
 
+/// True for the conventional "process was terminated by a
+/// stop signal" exit codes:
+///
+/// - `130` = 128 + SIGINT (Ctrl+C)
+/// - `137` = 128 + SIGKILL (`docker kill`, OOM-killer, or
+///   `compose stop` after the SIGTERM grace period elapsed)
+/// - `143` = 128 + SIGTERM (`docker stop` / `compose stop`)
+///
+/// These show up the moment the user clicks "Stop" in moon-ide
+/// (or quits the IDE, which runs `compose stop` against
+/// everything it knows). They aren't application failures, so
+/// we treat them as a clean stop in [`aggregate_state`] —
+/// otherwise a JVM that exits 143 on SIGTERM would leave the
+/// project pinned to `Failed` after the user explicitly asked
+/// for it to stop, and break the `auto_resume_shell` path on
+/// next IDE launch.
+///
+/// SIGSEGV (139), SIGABRT (134), SIGBUS (135), and friends are
+/// deliberately *not* on this list: those are real crashes the
+/// user should see surfaced.
+pub(crate) fn is_stop_signal(exit_code: i32) -> bool {
+	matches!(exit_code, 130 | 137 | 143)
+}
+
 /// Roll the per-service state list up into a single
 /// [`ContainerState`] for the status pip.
 ///
@@ -512,19 +548,24 @@ impl From<PsEntry> for ServiceStatus {
 /// 1. `Paused` — any container paused.
 /// 2. `Failed` —
 ///    - any container `dead` or in an unrecognised state, OR
-///    - any container exited with a non-zero code (including
-///      a previously-failed init container blocking `cas` or
-///      similar `depends_on: service_completed_successfully`
-///      consumers from ever starting).
+///    - any container exited with a non-zero, non-signal code
+///      (including a previously-failed init container blocking
+///      `cas` or similar
+///      `depends_on: service_completed_successfully` consumers
+///      from ever starting). Signal-termination codes
+///      (130/137/143; see [`is_stop_signal`]) are treated as a
+///      clean stop, not a failure.
 /// 3. `Creating` — any container `restarting`, or a mix of
 ///    `running` + `created` (depends_on chains take time to
 ///    resolve during `compose up`; absent any non-zero exit
 ///    we lean toward "still coming up" rather than failed).
 /// 4. `Running` — at least one container running and the rest
 ///    are healthy zero-exit init containers.
-/// 5. `Stopped` — everything is `created` or zero-exit
-///    `exited` (project never came up, or the user stopped it
-///    manually). Init-only projects that completed land here.
+/// 5. `Stopped` — everything is `created`, zero-exit `exited`,
+///    or signal-exited (project never came up, or the user
+///    stopped it manually, or the IDE quit and ran
+///    `compose stop` against everything). Init-only projects
+///    that completed land here.
 /// 6. `Absent` — no containers reported.
 pub(crate) fn aggregate_state(services: &[ServiceStatus]) -> ContainerState {
 	if services.is_empty() {
@@ -534,8 +575,8 @@ pub(crate) fn aggregate_state(services: &[ServiceStatus]) -> ContainerState {
 	let mut any_running = false;
 	let mut any_restarting = false;
 	let mut any_dead_or_unknown = false;
-	let mut any_exited_zero = false;
-	let mut any_exited_nonzero = false;
+	let mut any_exited_clean = false;
+	let mut any_exited_failed = false;
 	let mut any_created = false;
 	for svc in services {
 		match svc.raw_state.as_str() {
@@ -544,10 +585,10 @@ pub(crate) fn aggregate_state(services: &[ServiceStatus]) -> ContainerState {
 			"restarting" => any_restarting = true,
 			"created" => any_created = true,
 			"exited" => {
-				if svc.exit_code == 0 {
-					any_exited_zero = true;
+				if svc.exit_code == 0 || is_stop_signal(svc.exit_code) {
+					any_exited_clean = true;
 				} else {
-					any_exited_nonzero = true;
+					any_exited_failed = true;
 				}
 			}
 			"dead" => any_dead_or_unknown = true,
@@ -560,7 +601,7 @@ pub(crate) fn aggregate_state(services: &[ServiceStatus]) -> ContainerState {
 	if any_paused {
 		return ContainerState::Paused;
 	}
-	if any_dead_or_unknown || any_exited_nonzero {
+	if any_dead_or_unknown || any_exited_failed {
 		return ContainerState::Failed;
 	}
 	// `running` + `created` is the normal in-progress state
@@ -578,11 +619,11 @@ pub(crate) fn aggregate_state(services: &[ServiceStatus]) -> ContainerState {
 		return ContainerState::Running;
 	}
 	// At this point the only remaining states are `created`
-	// and zero-exit `exited`. Both are inert: project was
-	// either stopped or never started fully. Either way the
-	// status pip's "Stopped" affordance is the right next
-	// step.
-	if any_created || any_exited_zero {
+	// and clean-exited (zero or stop-signal). Both are inert:
+	// project was either stopped or never started fully.
+	// Either way the status pip's "Stopped" affordance is the
+	// right next step.
+	if any_created || any_exited_clean {
 		return ContainerState::Stopped;
 	}
 	// Unreachable in practice: the loop covers every observed
@@ -786,6 +827,49 @@ mod tests {
 		assert_eq!(
 			aggregate_state(&[exited("dev", 0), exited("mongo", 0)]),
 			ContainerState::Stopped,
+		);
+	}
+
+	#[test]
+	fn aggregate_signal_termination_exits_are_stopped_not_failed() {
+		// After moon-ide's shutdown hook (or the user clicking
+		// "Stop" in the popover) sends `compose stop`, JVMs and
+		// long-running services typically exit 143 (SIGTERM)
+		// or 137 (SIGKILL after the grace period). Treating
+		// those as Failed leaves the project pinned to red
+		// and breaks `auto_resume_shell`'s
+		// `state == Stopped` precondition on next launch.
+		let services = [
+			exited("dev", 143),
+			exited("mongo", 143),
+			exited("gitaly", 137),
+			exited("init-container", 0),
+		];
+		assert_eq!(aggregate_state(&services), ContainerState::Stopped);
+	}
+
+	#[test]
+	fn aggregate_signal_termination_does_not_mask_real_failure() {
+		// One service exited via SIGTERM (clean stop), another
+		// crashed with code 1 (real application failure). The
+		// real failure must still flip the project to Failed —
+		// the signal-exit allowance only applies to "everyone
+		// got cleanly stopped together".
+		let services = [exited("dev", 143), exited("gitaly", 1)];
+		assert_eq!(aggregate_state(&services), ContainerState::Failed);
+	}
+
+	#[test]
+	fn aggregate_segfault_stays_failed() {
+		// SIGSEGV (139) and SIGABRT (134) are crashes, not stop
+		// signals — keep surfacing them as Failed.
+		assert_eq!(
+			aggregate_state(&[svc("dev", "running"), exited("worker", 139)]),
+			ContainerState::Failed,
+		);
+		assert_eq!(
+			aggregate_state(&[svc("dev", "running"), exited("worker", 134)]),
+			ContainerState::Failed,
 		);
 	}
 
