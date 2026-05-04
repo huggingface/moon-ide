@@ -71,6 +71,40 @@ pub struct LspDiagnosticsEvent {
 	pub diagnostics: Vec<LspDiagnostic>,
 }
 
+/// Target of a `textDocument/definition` (or equivalent) jump.
+///
+/// Two shapes are possible:
+///
+/// - **In-workspace**: `path` is the same workspace-relative form the
+///   frontend opens files with. The UI routes through its normal open-file
+///   machinery so the tab strip, focus ring, and editor state all come up
+///   exactly like a manual open.
+/// - **External**: the definition lives outside the workspace root (e.g.
+///   a type in `node_modules/`, a `.d.ts` in the Rust toolchain). We set
+///   `external_uri` to the original `file://…` URI and leave `path`
+///   empty. The UI currently surfaces a muted toast (`"goto-definition:
+///   outside workspace"`) rather than silently opening nothing — full
+///   external-file support lands when we grow a read-only viewer.
+///
+/// Exactly one of `path` / `external_uri` is non-empty. We encode that
+/// as two optionally-empty fields rather than an enum because `ts-rs`'
+/// externally-tagged enums are clunky to consume from CodeMirror's
+/// view callbacks.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct LspLocation {
+	/// Workspace-relative path, or empty string when the target is
+	/// outside the workspace root.
+	pub path: String,
+	/// Range to select / reveal in the target file. `range.start` is
+	/// where we place the caret.
+	pub range: LspRange,
+	/// Original LSP URI when the target is outside the workspace.
+	/// Empty for in-workspace hits.
+	pub external_uri: String,
+}
+
 /// Response to a hover request. `contents` is pre-rendered Markdown
 /// the UI can drop into a markdown-it instance; we normalise
 /// `MarkedString` / `MarkupContent` / plaintext on the broker side so

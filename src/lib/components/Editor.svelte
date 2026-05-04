@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { EditorState, Compartment } from '@codemirror/state';
+	import { EditorState, Compartment, EditorSelection } from '@codemirror/state';
 	import { EditorView, highlightActiveLine, highlightActiveLineGutter, keymap, lineNumbers } from '@codemirror/view';
 	import { highlightTabs } from '../editor/highlightTabs';
 	import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
@@ -14,10 +14,11 @@
 		lspDiagnosticsExtension,
 		lspHoverExtension,
 	} from '../editor/lsp';
+	import { lspGotoDefinitionExtension } from '../editor/lspGotoDefinition';
 	import { workspace, type OpenFile, type SplitSide } from '../state.svelte';
 	import { languageFor } from '../editor/language';
 	import { moonEditorTheme } from '../editor/theme';
-	import { type EditorConfig } from '../protocol';
+	import { type EditorConfig, type LspPosition } from '../protocol';
 
 	type Props = { file: OpenFile; side: SplitSide };
 	let { file, side }: Props = $props();
@@ -167,6 +168,41 @@
 		applyDiagnostics(v, list);
 	});
 
+	// Consume a pending jump (Ctrl/Cmd-click on an identifier lands
+	// here): `workspace.jumpTo` stashed the target position, and the
+	// Editor that ends up owning `file.path` applies the selection
+	// change + scrolls on its first render for this path. The jump
+	// is one-shot — once consumed, the entry is dropped so the
+	// caret doesn't snap back if the user moves on.
+	//
+	// Critical: scheduled after a microtask so a state-rebuild from
+	// the path-change effect (which calls `setState` wholesale)
+	// finishes first; dispatching into a `setState`-mid-flight view
+	// no-ops silently. Microtask order: path effect runs → setState
+	// clears old doc → this effect runs → dispatch lands.
+	$effect(() => {
+		const v = view;
+		if (!v) {
+			return;
+		}
+		const pending = workspace.pendingJumps.get(file.path);
+		if (!pending) {
+			return;
+		}
+		queueMicrotask(() => {
+			const offset = offsetFromLspPosition(v, pending);
+			if (offset === null) {
+				workspace.consumePendingJump(file.path);
+				return;
+			}
+			v.dispatch({
+				selection: EditorSelection.cursor(offset),
+				effects: EditorView.scrollIntoView(offset, { y: 'center' }),
+			});
+			workspace.consumePendingJump(file.path);
+		});
+	});
+
 	// Pull focus into the editor whenever the workspace bumps `focusTick`.
 	// That covers tab clicks, tree clicks (re-opening a closed file
 	// included), and post-close fallback. Microtask-deferred so the click
@@ -207,6 +243,10 @@
 			// reactive `$effect` below.
 			...lspDiagnosticsExtension(),
 			lspHoverExtension(),
+			lspGotoDefinitionExtension({
+				jumpTo: (path, position) => workspace.jumpTo(path, position, side),
+				flash: (msg) => workspace.flash(msg),
+			}),
 			lspPathCompartment.of(filePathFacet.of(file.path)),
 			// Autocompletion popover. `activateOnTyping: false` keeps
 			// it off the typing path so we don't leak the built-in
@@ -219,6 +259,34 @@
 				override: [lspCompletionSource],
 			}),
 			keymap.of([
+				// Navigation history: Alt+Left / Alt+Right step through
+				// file history browser-style. On macOS, Option+Arrow
+				// is the default CM binding for word-by-word caret
+				// motion — we only override when there's somewhere to
+				// navigate. The `run` callback returns `false` (== CM
+				// continues looking for another handler) when the
+				// stack is empty, which lets word-motion keep working
+				// for a user who's never switched tabs in this session.
+				{
+					key: 'Alt-ArrowLeft',
+					run: () => {
+						if (!workspace.canNavigateBack) {
+							return false;
+						}
+						void workspace.navigateBack();
+						return true;
+					},
+				},
+				{
+					key: 'Alt-ArrowRight',
+					run: () => {
+						if (!workspace.canNavigateForward) {
+							return false;
+						}
+						void workspace.navigateForward();
+						return true;
+					},
+				},
 				...closeBracketsKeymap,
 				...defaultKeymap,
 				...historyKeymap,
@@ -248,6 +316,21 @@
 		// per-level width, and `tabSize` for visual rendering of `\t`.
 		const unit = ec.indent_style === 'tab' ? '\t' : ' '.repeat(Math.max(1, ec.indent_size));
 		return [EditorState.tabSize.of(Math.max(1, ec.tab_width)), indentUnit.of(unit)];
+	}
+
+	// LSP position → CM offset, clamped so a range that pointed
+	// past a shorter file (rare, but can happen if the file shrank
+	// between the LSP response and this dispatch) doesn't crash.
+	function offsetFromLspPosition(v: EditorView, position: LspPosition): number | null {
+		const doc = v.state.doc;
+		if (position.line < 0) {
+			return 0;
+		}
+		if (position.line >= doc.lines) {
+			return doc.length;
+		}
+		const lineInfo = doc.line(position.line + 1);
+		return lineInfo.from + Math.min(position.character, lineInfo.length);
 	}
 
 	async function applyLanguage(path: string, text: string) {

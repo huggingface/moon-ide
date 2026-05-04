@@ -1,10 +1,10 @@
 # LSP
 
-Status: partial — TypeScript diagnostics + hover + completion shipped as the stage-1 slice of Phase 4. Every other language (Rust, Svelte, CSS, HTML, JSON) is architecturally in scope and not yet wired.
+Status: partial — TypeScript diagnostics + hover + completion + goto-definition + nav history shipped across the stage-1 and stage-2 slices of Phase 4. Every other language (Rust, Svelte, CSS, HTML, JSON) is architecturally in scope and not yet wired.
 
 ## The non-negotiable invariant
 
-LSP lives in `moon-core`. Nothing in the UI speaks LSP JSON-RPC directly. The frontend sees **moon-shaped** types (`LspDiagnostic`, `LspHover`, `LspCompletionList`, `LspStatusEvent` — see `crates/moon-protocol/src/lsp.rs`) and Tauri commands (`lsp_open` / `lsp_update` / `lsp_close` / `lsp_hover` / `lsp_completion`) that forward to the broker.
+LSP lives in `moon-core`. Nothing in the UI speaks LSP JSON-RPC directly. The frontend sees **moon-shaped** types (`LspDiagnostic`, `LspHover`, `LspCompletionList`, `LspLocation`, `LspStatusEvent` — see `crates/moon-protocol/src/lsp.rs`) and Tauri commands (`lsp_open` / `lsp_update` / `lsp_close` / `lsp_hover` / `lsp_completion` / `lsp_definition`) that forward to the broker.
 
 This mirrors the Phase 5 git layer's discipline: one translation wall between upstream protocol types and the UI, one place to fix things when either side moves.
 
@@ -97,6 +97,35 @@ Phase 2 (containers) will pre-install the server in `moon-base` so the container
 
 We only advertise what's wired up (`hover`, `completion`, `publishDiagnostics`, synchronisation). Adding a capability is a localised change: flip the flag in `server::initialize`, add the command in `commands/lsp.rs`, add the CM adapter in `src/lib/editor/lsp.ts`.
 
+### Go-to-definition is Ctrl/Cmd-click + a link-preview hover
+
+The "hold modifier, mouse over identifier, see underline, click to jump" UX (from VS Code, Cursor, and every IDE the team already uses) is baked into the editor itself rather than a palette command. Lives in `src/lib/editor/lspGotoDefinition.ts`:
+
+- A `ViewPlugin` tracks modifier state (`Ctrl` on Linux/Windows, `Cmd` on macOS) by listening on the window — not the editor — so focus changes during a modifier-hold don't drop the state.
+- `mousemove` with the modifier held resolves the word under the cursor, calls `ipc.lsp.definition`, and paints an underline (`Decoration.mark` → `.cm-lsp-link`) if the server offers a target.
+- Probes are cheap-cached: re-hovering inside the same word span is a no-op; each probe carries an `epoch` that's invalidated if the pointer moves on, so a slow LSP response never lands stale.
+- `mouseup` with the modifier held re-calls `definition` (the earlier response may have been discarded) and routes through `workspace.jumpTo(path, position)`.
+- **External targets** (paths outside the workspace root — `node_modules/`, TS built-in lib, etc.) come back with `path: ''` and `externalUri` populated. The UI surfaces a toast rather than silently failing. A read-only external-file viewer is a later deliverable.
+
+Server-side capability advertisement is `definition: { linkSupport: true }`; we take `LocationLink`'s `targetSelectionRange` (the identifier) over `targetRange` (the whole body) so the caret lands on the name, not inside a function body.
+
+### Navigation history (Alt+Left / Alt+Right)
+
+Linear, browser-style file history lives on `WorkspaceState`:
+
+- `navStack: string[]` + `navIndex: number` — path list, oldest to newest.
+- `setActive` pushes onto the stack on every genuine user navigation (file-tree click, tab click, goto-def jump). Pushes during `navigateBack` / `navigateForward` / `jumpTo` are suppressed via a private `suppressNavPush` flag so stepping through history doesn't re-record itself.
+- Opening a new file while not at the tip truncates the forward stack — same semantics as a browser URL bar.
+- `canNavigateBack` / `canNavigateForward` are `$derived` so keybindings can fall through to CM's default when history is empty (on macOS, Option+Arrow is word-motion in the default keymap; we only shadow it when there's somewhere to go).
+
+**Stage 2 scope is path-only.** Caret positions aren't preserved across back/forward — a revisit opens the file at (0, 0) or wherever CM rebuilds to. Per-file caret memory through nav history is a reasonable upgrade (store `{ path, line, character }` in `navStack`, and hand each entry through the `pendingJumps` map the same way go-to-definition already does) — shipping it now would double the test surface for a small QoL gain. File-level history is what everyone actually uses most of the time anyway.
+
+### One-shot caret hand-off via `pendingJumps`
+
+Goto-definition and any future "open file at specific position" callers set an entry in `WorkspaceState.pendingJumps: Map<path, { line, character }>` before calling `openFile`. The `Editor` component has a `$effect` that consumes the entry for the file it's currently displaying, dispatches a selection-change + `scrollIntoView(…, 'center')`, and drops the entry.
+
+Microtask-deferred: the path-change effect's `setState` has to finish first, otherwise the selection dispatch lands in the outgoing view.
+
 ### Server → client requests get `null`
 
 tsserver issues `workspace/configuration`, `window/workDoneProgress/create`, and `client/registerCapability` during initialisation. We respond `null` to all of them; tsserver treats that as "no config / OK / nothing to do" and continues. When we need to answer (e.g. the future linting rule config for rust-analyzer), a server-request-handler slot lives in `client.rs` and we can special-case methods individually.
@@ -119,11 +148,12 @@ Two Tauri events, both keyed by language-agnostic payloads so the UI doesn't nee
   - `lspDiagnosticsExtension()` — just `lintGutter()`; the actual diagnostics come in via `applyDiagnostics(view, list)` which `Editor.svelte` calls from a reactive `$effect`.
   - `lspHoverExtension()` — CM `hoverTooltip` delegating to `ipc.lsp.hover`. Rendered inside `.cm-lsp-hover` which the editor chrome theme styles.
   - `lspCompletionSource` — CM `CompletionSource` registered as an `override` on the editor's `autocompletion` extension. Never auto-opens; Ctrl-Space or a panel re-query triggers it.
+- **`src/lib/editor/lspGotoDefinition.ts`** — Ctrl/Cmd-hover link preview + Ctrl/Cmd-click jump. Takes a `{ jumpTo, flash }` callback bag so it doesn't import `state.svelte.ts`. `Editor.svelte` wires the real workspace methods through.
 - **`src/lib/editor/lspLanguage.ts`** — path → LSP language-id mapping. Also the feature-flag: returning `null` means "no LSP here", so adding Rust is literally one entry plus a wire-in on the backend.
 
 ## Non-goals of stage 1
 
-- Go-to-definition, find-references, rename, code actions — stage 4+.
+- ~~Go-to-definition~~ — shipped in stage 2 (this section). Find-references, rename, code actions — stage 4+.
 - Workspace symbols. Requires a separate UI surface (palette split).
 - Signature help, selection range, semantic tokens — nice, not needed.
 - Snippets in completion — `snippet_support: false` in client capabilities. Turning it on requires a snippet-renderer extension on the frontend.

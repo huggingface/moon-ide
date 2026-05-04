@@ -11,6 +11,7 @@ import type {
 	GitStatusEntry,
 	LspCompletionList,
 	LspHover,
+	LspLocation,
 	LspPosition,
 	ProjectComposeStatus,
 	ReadFileResult,
@@ -106,6 +107,8 @@ export const ipc = {
 			invoke<LspHover | null>('lsp_hover', { path, languageId, position }),
 		completion: (path: string, languageId: string, position: LspPosition) =>
 			invoke<LspCompletionList>('lsp_completion', { path, languageId, position }),
+		definition: (path: string, languageId: string, position: LspPosition) =>
+			invoke<LspLocation | null>('lsp_definition', { path, languageId, position }),
 	},
 	slack: {
 		setToken: (token: string) => invoke<SlackIdentity>('slack_set_token', { token }),

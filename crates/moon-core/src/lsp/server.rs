@@ -238,6 +238,14 @@ impl LspServer {
 					dynamic_registration: Some(false),
 					content_format: Some(vec![lt::MarkupKind::Markdown, lt::MarkupKind::PlainText]),
 				}),
+				definition: Some(lt::GotoCapability {
+					dynamic_registration: Some(false),
+					// `LocationLink` response lets servers distinguish
+					// the full definition range from the identifier
+					// span — our translator uses the identifier span
+					// so the caret lands right.
+					link_support: Some(true),
+				}),
 				completion: Some(lt::CompletionClientCapabilities {
 					dynamic_registration: Some(false),
 					completion_item: Some(lt::CompletionItemCapability {
@@ -369,6 +377,29 @@ impl LspServer {
 		};
 		let resp: Option<lt::Hover> = self.client.request("textDocument/hover", params).await?;
 		Ok(resp.and_then(translate::hover))
+	}
+
+	/// Send `textDocument/definition`. Returns `None` if the server
+	/// didn't know where the symbol was (common for literals,
+	/// whitespace, arbitrary hovers) — not an error, just a
+	/// silent-skip signal the UI uses to leave the identifier
+	/// un-underlined.
+	pub async fn definition(
+		&self,
+		rel_path: &str,
+		position: mp::LspPosition,
+	) -> Result<Option<mp::LspLocation>, LspClientError> {
+		let uri = self.relative_to_uri(rel_path);
+		let params = lt::GotoDefinitionParams {
+			text_document_position_params: lt::TextDocumentPositionParams {
+				text_document: lt::TextDocumentIdentifier { uri },
+				position: translate::to_lsp_position(position),
+			},
+			work_done_progress_params: lt::WorkDoneProgressParams::default(),
+			partial_result_params: lt::PartialResultParams::default(),
+		};
+		let resp: Option<lt::GotoDefinitionResponse> = self.client.request("textDocument/definition", params).await?;
+		Ok(resp.and_then(|r| translate::definition_response(r, self.root.as_std_path())))
 	}
 
 	pub async fn completion(

@@ -8,6 +8,7 @@
 
 use lsp_types as lt;
 use moon_protocol::lsp as mp;
+use std::path::Path;
 
 pub fn diagnostic(d: lt::Diagnostic) -> mp::LspDiagnostic {
 	mp::LspDiagnostic {
@@ -158,6 +159,70 @@ pub fn completion_item(item: lt::CompletionItem) -> mp::LspCompletionItem {
 	}
 }
 
+/// Project a `textDocument/definition` (or `typeDefinition`,
+/// `implementation`) response down to a single `LspLocation`.
+///
+/// LSP lets servers return an array or a `LocationLink` list. When
+/// more than one target is offered (rare for definition, common for
+/// implementations), we take the first — the UI is "jump" not "pick
+/// one of several", and a disambiguation dropdown is a later-stage
+/// UX feature.
+///
+/// Returns `None` for an empty response or when a target can't be
+/// translated to either a workspace-relative path or a `file://` URI
+/// the UI can display.
+///
+/// `root` is used to make in-workspace targets relative; external
+/// targets are surfaced via `external_uri`.
+pub fn definition_response(resp: lt::GotoDefinitionResponse, root: &Path) -> Option<mp::LspLocation> {
+	match resp {
+		lt::GotoDefinitionResponse::Scalar(loc) => location(loc, root),
+		lt::GotoDefinitionResponse::Array(locs) => locs.into_iter().find_map(|l| location(l, root)),
+		lt::GotoDefinitionResponse::Link(links) => links.into_iter().find_map(|l| location_link(l, root)),
+	}
+}
+
+fn location(loc: lt::Location, root: &Path) -> Option<mp::LspLocation> {
+	let (path, external_uri) = resolve_uri(&loc.uri, root);
+	Some(mp::LspLocation {
+		path,
+		range: range(loc.range),
+		external_uri,
+	})
+}
+
+fn location_link(link: lt::LocationLink, root: &Path) -> Option<mp::LspLocation> {
+	let (path, external_uri) = resolve_uri(&link.target_uri, root);
+	// Servers provide both `target_range` (full definition span,
+	// e.g. the whole function body) and `target_selection_range`
+	// (just the identifier). The UI jumps to the identifier — that
+	// matches what every other editor does and lands the caret where
+	// the user can actually rename / paste / type.
+	Some(mp::LspLocation {
+		path,
+		range: range(link.target_selection_range),
+		external_uri,
+	})
+}
+
+/// Turn an LSP URI into `(workspace_relative_path, external_uri)`.
+/// Exactly one of the two returned strings is non-empty.
+fn resolve_uri(uri: &lt::Uri, root: &Path) -> (String, String) {
+	// `lsp_types::Uri` is a `fluent_uri` newtype with no
+	// `to_file_path` helper. Parse through `url::Url` instead; the
+	// LSP string form is identical to the URL crate's parse input.
+	let Ok(parsed) = url::Url::parse(uri.as_str()) else {
+		return (String::new(), uri.as_str().to_owned());
+	};
+	let Ok(abs) = parsed.to_file_path() else {
+		return (String::new(), uri.as_str().to_owned());
+	};
+	match abs.strip_prefix(root) {
+		Ok(rel) => (rel.to_string_lossy().replace('\\', "/"), String::new()),
+		Err(_) => (String::new(), uri.as_str().to_owned()),
+	}
+}
+
 pub fn completion_response(resp: lt::CompletionResponse) -> mp::LspCompletionList {
 	match resp {
 		lt::CompletionResponse::Array(items) => mp::LspCompletionList {
@@ -198,6 +263,42 @@ mod tests {
 			range: None,
 		};
 		assert!(hover(h).is_none());
+	}
+
+	/// In-workspace target → `path` populated, `external_uri` blank.
+	#[test]
+	fn definition_in_workspace_becomes_relative() {
+		use std::str::FromStr;
+		let tmp = tempfile::tempdir().unwrap();
+		let file = tmp.path().join("src").join("lib.rs");
+		std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+		std::fs::write(&file, b"").unwrap();
+		let uri_str = format!("file://{}", file.display());
+		let loc = lt::Location {
+			uri: lt::Uri::from_str(&uri_str).unwrap(),
+			range: lt::Range::default(),
+		};
+		let resp = definition_response(lt::GotoDefinitionResponse::Scalar(loc), tmp.path()).expect("location");
+		assert_eq!(resp.path, "src/lib.rs");
+		assert!(resp.external_uri.is_empty());
+	}
+
+	/// External target (outside the workspace root) → `external_uri`
+	/// populated, `path` blank. UI surfaces a toast rather than
+	/// opening a nonexistent tab.
+	#[test]
+	fn definition_outside_workspace_keeps_uri() {
+		use std::str::FromStr;
+		let tmp = tempfile::tempdir().unwrap();
+		let outside = tmp.path().parent().unwrap().join("somewhere-else.rs");
+		let uri_str = format!("file://{}", outside.display());
+		let loc = lt::Location {
+			uri: lt::Uri::from_str(&uri_str).unwrap(),
+			range: lt::Range::default(),
+		};
+		let resp = definition_response(lt::GotoDefinitionResponse::Scalar(loc), tmp.path()).expect("location");
+		assert!(resp.path.is_empty());
+		assert!(resp.external_uri.starts_with("file://"));
 	}
 
 	#[test]

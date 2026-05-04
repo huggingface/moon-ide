@@ -179,6 +179,18 @@ export type LspHover = {
 };
 
 /**
+ * Definition jump target. Exactly one of `path` / `externalUri` is
+ * non-empty — in-workspace targets use `path`, external targets
+ * (node_modules, toolchain sources) use `externalUri`. Mirrors
+ * `moon_protocol::lsp::LspLocation`.
+ */
+export type LspLocation = {
+	path: string;
+	range: LspRange;
+	externalUri: string;
+};
+
+/**
  * Kind of a completion item. Mirrors LSP's list 1:1; the frontend
  * uses it for iconography. Extending this set requires adding to
  * `moon_protocol::lsp::LspCompletionKind` and the `translate` match.

@@ -203,6 +203,21 @@ impl LspBroker {
 		server.hover(path, position).await
 	}
 
+	pub async fn definition(
+		&self,
+		path: &str,
+		language_id: &str,
+		position: mp::LspPosition,
+	) -> Result<Option<mp::LspLocation>, LspClientError> {
+		let Some(spec) = Self::spec_for(language_id) else {
+			return Ok(None);
+		};
+		let Some(server) = self.ensure_server(spec).await? else {
+			return Ok(None);
+		};
+		server.definition(path, position).await
+	}
+
 	pub async fn completion(
 		&self,
 		path: &str,

@@ -214,6 +214,34 @@ class WorkspaceState {
 	sidebarFocusTick = $state(0);
 	statusFocusTick = $state(0);
 
+	// Linear file-level navigation history, browser-style. Each entry is
+	// a path; `navIndex` points at the currently-active one (so
+	// `navStack[navIndex]` typically matches `activePath`). Entries
+	// are pushed on `openFile` when the path transitions, and Alt+Left
+	// / Alt+Right step the index. Opening a new file while not at the
+	// tip truncates the forward stack — same as a browser.
+	//
+	// Stage 1 scope: path-only. No caret-position memory across
+	// back/forward (the editor rebuilds state on path change). The
+	// per-jump position for go-to-definition goes through
+	// `pendingJumps` instead; see below.
+	navStack: string[] = $state([]);
+	navIndex = $state(-1);
+	// Guard flag: set while we're the ones driving an openFile (from
+	// navBack / navForward / jumpTo) so the standard push path
+	// doesn't record the very navigation we just performed. Cleared
+	// by the method that sets it.
+	private suppressNavPush = false;
+
+	// One-shot carets the Editor component consumes on its next render
+	// for a given path. `jumpTo` (and anything else that wants to land
+	// the caret somewhere specific after opening a file) sets an entry
+	// keyed by path; the Editor's `$effect` watching this map dispatches
+	// the selection-change and removes the entry. A `Map` (not an
+	// object field) so multiple buffers can have pending jumps queued
+	// independently when a split has two editors.
+	pendingJumps: SvelteMap<string, { line: number; character: number }> = $state(new SvelteMap());
+
 	// Persistence guards. `persistScheduled` coalesces bursts of mutations
 	// (e.g. closeFile mutates openFiles + leftActive in the same tick) into
 	// a single IPC roundtrip. `suppressPersist` is set during startup
@@ -1758,12 +1786,118 @@ class WorkspaceState {
 			this.rightActive = path;
 		}
 		this.focusedSide = side;
+		// Nav history: only push on genuine user navigation. We're
+		// inside `navBack` / `navForward` / `jumpTo` when
+		// `suppressNavPush` is set; skipping the push there prevents
+		// the immediate-rewind loop ("back arrow pushes the previous
+		// page onto history, so the next back arrow comes back here
+		// forever").
+		if (!this.suppressNavPush) {
+			this.pushNavigationEntry(path);
+		}
 		// `focus` defaults to true; the tree opts out via `{ focus: false }`
 		// so arrow-key navigation can preview-browse without stealing focus.
 		if (options.focus !== false) {
 			this.requestEditorFocus();
 		}
 		this.persistAppState();
+	}
+
+	/**
+	 * Append `path` to the nav stack, truncating any forward entries
+	 * (browser-style). Skipped when `path` is already the tip — rapid
+	 * re-clicks on the same tab don't inflate history.
+	 */
+	private pushNavigationEntry(path: string) {
+		if (this.navIndex >= 0 && this.navStack[this.navIndex] === path) {
+			return;
+		}
+		// Truncate forward stack: opening a file while not at the tip
+		// invalidates the "forward" entries — same semantics as a
+		// browser's URL bar.
+		const trimmed = this.navStack.slice(0, this.navIndex + 1);
+		trimmed.push(path);
+		this.navStack = trimmed;
+		this.navIndex = trimmed.length - 1;
+	}
+
+	/** True when Alt+Left has somewhere to go. */
+	canNavigateBack = $derived(this.navIndex > 0);
+	/** True when Alt+Right has somewhere to go. */
+	canNavigateForward = $derived(this.navIndex >= 0 && this.navIndex < this.navStack.length - 1);
+
+	/**
+	 * Step back one entry in nav history. Opens the previous file on
+	 * the currently-focused side, preserving focus. No-op when we're
+	 * already at the oldest entry — the keybinding falls through to
+	 * CM's default (word-motion on mac, nothing on win/linux) via the
+	 * return value.
+	 */
+	async navigateBack(): Promise<boolean> {
+		if (!this.canNavigateBack) {
+			return false;
+		}
+		this.navIndex -= 1;
+		const path = this.navStack[this.navIndex];
+		if (path === undefined) {
+			return false;
+		}
+		this.suppressNavPush = true;
+		try {
+			await this.openFile(path);
+		} finally {
+			this.suppressNavPush = false;
+		}
+		return true;
+	}
+
+	async navigateForward(): Promise<boolean> {
+		if (!this.canNavigateForward) {
+			return false;
+		}
+		this.navIndex += 1;
+		const path = this.navStack[this.navIndex];
+		if (path === undefined) {
+			return false;
+		}
+		this.suppressNavPush = true;
+		try {
+			await this.openFile(path);
+		} finally {
+			this.suppressNavPush = false;
+		}
+		return true;
+	}
+
+	/**
+	 * Open `path` and land the caret at `position`. Used by
+	 * Ctrl/Cmd-click go-to-definition: stashes the position in
+	 * `pendingJumps` so the Editor's reactive effect dispatches a
+	 * selection-change after the state-rebuild settles.
+	 *
+	 * Records a normal nav-stack entry — back/forward works across
+	 * definition jumps. Caret *position* isn't preserved through
+	 * back/forward yet (stage 2 work), only file identity.
+	 */
+	async jumpTo(path: string, position: { line: number; character: number }, side: SplitSide = this.focusedSide) {
+		const next = new SvelteMap(this.pendingJumps);
+		next.set(path, position);
+		this.pendingJumps = next;
+		await this.openFile(path, side);
+	}
+
+	/**
+	 * Called by the Editor once it's applied a pending jump for
+	 * `path`. The entry is one-shot — next paint shouldn't re-jump
+	 * the caret if the user moved it away.
+	 */
+	consumePendingJump(path: string) {
+		if (!this.pendingJumps.has(path)) {
+			return;
+		}
+		const next = new SvelteMap(this.pendingJumps);
+		next.delete(path);
+		this.pendingJumps = next;
 	}
 
 	/**

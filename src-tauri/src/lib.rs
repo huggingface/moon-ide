@@ -81,6 +81,7 @@ pub fn run() {
 			commands::lsp::lsp_close,
 			commands::lsp::lsp_hover,
 			commands::lsp::lsp_completion,
+			commands::lsp::lsp_definition,
 			commands::slack::slack_set_token,
 			commands::slack::slack_status,
 			commands::slack::slack_clear_token,

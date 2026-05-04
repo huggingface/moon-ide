@@ -83,6 +83,16 @@ function moonTheme(dark: boolean): Extension {
 			'.cm-lsp-hover > :last-child': {
 				marginBottom: '0',
 			},
+			// Ctrl/Cmd-hover affordance: identifiers the LSP knows
+			// how to jump to get underlined while the modifier is
+			// held. `pointer` cursor in tandem so users who learned
+			// the pattern from other editors see the same signal.
+			'.cm-lsp-link': {
+				textDecoration: 'underline',
+				textDecorationColor: 'var(--m-accent)',
+				textUnderlineOffset: '2px',
+				cursor: 'pointer',
+			},
 			// Search panel (Ctrl+F) and goto-line panel. CM6 ships its
 			// own light-grey defaults that look out of place in either
 			// theme; we override them with our palette tokens. Inputs

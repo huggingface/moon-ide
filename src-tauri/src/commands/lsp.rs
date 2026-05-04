@@ -17,7 +17,7 @@
 
 use camino::Utf8PathBuf;
 use moon_core::lsp::{LspBroker, LspServerEvent};
-use moon_protocol::lsp::{LspCompletionList, LspHover, LspPosition};
+use moon_protocol::lsp::{LspCompletionList, LspHover, LspLocation, LspPosition};
 use moon_protocol::MoonError;
 use tauri::{AppHandle, Emitter, State};
 use tokio::task::JoinHandle;
@@ -108,6 +108,25 @@ pub async fn lsp_completion(
 	let broker = ensure_broker(&state, &app).await?;
 	broker
 		.completion(&path, &language_id, position)
+		.await
+		.map_err(|e| MoonError::internal(e.to_string()))
+}
+
+/// Resolve `textDocument/definition` for the symbol at `position`.
+/// Returns `Ok(None)` when the server doesn't know (e.g. the cursor
+/// is on whitespace, a keyword with no jump, or a literal). The UI
+/// treats that as "no link underline" rather than an error.
+#[tauri::command]
+pub async fn lsp_definition(
+	state: State<'_, AppState>,
+	app: AppHandle,
+	path: String,
+	language_id: String,
+	position: LspPosition,
+) -> Result<Option<LspLocation>, MoonError> {
+	let broker = ensure_broker(&state, &app).await?;
+	broker
+		.definition(&path, &language_id, position)
 		.await
 		.map_err(|e| MoonError::internal(e.to_string()))
 }
