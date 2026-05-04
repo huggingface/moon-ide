@@ -28,12 +28,10 @@ pub struct ContentSearchOptions {
 	pub case_sensitive: bool,
 	#[serde(default)]
 	pub regex: bool,
-	/// Cap to keep the UI responsive. The first `max_matches` matches are returned.
+	/// Cap to keep the UI responsive. The first `max_matches` matches are
+	/// returned and the rest is reported back via `truncated = true`.
 	#[serde(default = "default_max_matches")]
 	pub max_matches: usize,
-	/// Cap on number of lines of context per match.
-	#[serde(default = "default_max_files")]
-	pub max_files: usize,
 }
 
 fn default_limit() -> usize {
@@ -41,9 +39,6 @@ fn default_limit() -> usize {
 }
 fn default_max_matches() -> usize {
 	500
-}
-fn default_max_files() -> usize {
-	1000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

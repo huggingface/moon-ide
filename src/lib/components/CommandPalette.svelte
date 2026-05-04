@@ -100,7 +100,17 @@
 			return;
 		}
 		palette.hide();
-		void workspace.openFile(hit.path);
+		// Search hits return 1-indexed `line` / `column` (grep-searcher
+		// convention); `jumpTo` consumes 0-indexed LSP positions. The
+		// `character` is a UTF-8 byte offset on the line — exact for
+		// ASCII content, off by a few units when non-ASCII precedes the
+		// match. Acceptable until we wire a proper byte→UTF-16 mapper;
+		// landing on the wrong column on the right line beats not
+		// landing at all (the prior behavior).
+		void workspace.jumpTo(hit.path, {
+			line: Math.max(0, hit.line - 1),
+			character: Math.max(0, hit.column - 1),
+		});
 	}
 
 	function onKey(event: KeyboardEvent) {

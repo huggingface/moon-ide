@@ -68,7 +68,6 @@ export type ContentSearchOptions = {
 	case_sensitive?: boolean;
 	regex?: boolean;
 	max_matches?: number;
-	max_files?: number;
 };
 
 export type ContentSearchHit = {

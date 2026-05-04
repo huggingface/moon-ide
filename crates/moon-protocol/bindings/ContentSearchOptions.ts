@@ -2,10 +2,7 @@
 
 export type ContentSearchOptions = { query: string, case_sensitive: boolean, regex: boolean, 
 /**
- * Cap to keep the UI responsive. The first `max_matches` matches are returned.
+ * Cap to keep the UI responsive. The first `max_matches` matches are
+ * returned and the rest is reported back via `truncated = true`.
  */
-max_matches: number, 
-/**
- * Cap on number of lines of context per match.
- */
-max_files: number, };
+max_matches: number, };

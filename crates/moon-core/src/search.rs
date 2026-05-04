@@ -129,11 +129,9 @@ pub fn search_content(root: &Utf8Path, opts: &ContentSearchOptions) -> MoonResul
 	.map_err(|e| MoonError::invalid(format!("invalid regex: {e}")))?;
 
 	let max_matches = opts.max_matches.clamp(1, 10_000);
-	let max_files = opts.max_files.clamp(1, 50_000);
 
 	let mut hits = Vec::new();
 	let mut truncated = false;
-	let mut files_visited = 0usize;
 
 	let walker = WalkBuilder::new(root.as_std_path())
 		.hidden(false)
@@ -146,11 +144,6 @@ pub fn search_content(root: &Utf8Path, opts: &ContentSearchOptions) -> MoonResul
 		let path = entry.path();
 		if !path.is_file() {
 			continue;
-		}
-		files_visited += 1;
-		if files_visited > max_files {
-			truncated = true;
-			break;
 		}
 
 		let rel = match path.strip_prefix(root.as_std_path()) {
@@ -244,10 +237,34 @@ mod tests {
 			case_sensitive: false,
 			regex: false,
 			max_matches: 100,
-			max_files: 1000,
 		};
 		let r = search_content(&root(&dir), &opts).unwrap();
 		assert_eq!(r.hits.len(), 2);
+		assert!(!r.truncated);
+	}
+
+	#[test]
+	fn content_search_visits_files_past_old_default_cap() {
+		// Regression: a previous default `max_files = 1000` silently
+		// bailed out of the walk before reaching anything past the
+		// 1000th file in walk order, surfacing as "no results" on
+		// any real-sized workspace. Plant a target match well past
+		// that boundary and assert it still surfaces.
+		let dir = TempDir::new().unwrap();
+		for i in 0..1500 {
+			std::fs::write(dir.path().join(format!("noise-{i:04}.txt")), "lorem ipsum\n").unwrap();
+		}
+		std::fs::write(dir.path().join("zzz-target.txt"), "ReadRepoContent\n").unwrap();
+
+		let opts = ContentSearchOptions {
+			query: "ReadRepoContent".into(),
+			case_sensitive: false,
+			regex: false,
+			max_matches: 500,
+		};
+		let r = search_content(&root(&dir), &opts).unwrap();
+		assert_eq!(r.hits.len(), 1);
+		assert_eq!(r.hits[0].path, "zzz-target.txt");
 		assert!(!r.truncated);
 	}
 }
