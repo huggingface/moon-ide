@@ -81,8 +81,8 @@ On Linux/Windows, `Alt+Left` is unbound by default, so the shadowing question do
 
 ## Known limitations
 
-- Back/forward preserves **file identity** only, not caret position. Re-visiting a file via `Alt+Left` opens it at wherever CM rebuilds to (usually doc start). The `pendingJumps` plumbing is already there; extending nav entries to `{ path, line, character }` is a follow-up.
-- External definitions (node_modules types, toolchain sources) show a toast rather than opening a read-only view. A real external-file viewer is a later stage.
+- ~~Back/forward preserves **file identity** only, not caret position.~~ Shipped in test plan `0028`: nav entries now carry `{ folder, path, line, character }`, update on clicks + keyboard motion, and restore across folders.
+- External definitions (node*modules types, toolchain sources) show a toast rather than opening a read-only view. A real external-file viewer is a later stage. (Test plan `0028` adds cross-folder resolution: definitions that fall inside \_another* bound folder do open; only genuinely-external targets still toast.)
 - The "peek definition" inline UI (VSCode-style preview without leaving the current file) isn't here. Jumps are hard — they replace the active tab's contents.
 - No go-to-references / go-to-implementation / rename / code-actions yet. Stage 3+.
 - First Ctrl/Cmd-hover probe on a cold tsgo has the same ~1–3 s latency as the first hover request; the link shows up once the server replies. No spinner — the underline just appears when ready.

@@ -92,7 +92,7 @@ Architectural spec: [lsp.md](lsp.md). The [`tower-lsp` vs thin-client open quest
 - `moon-core::lsp` module: Content-Length framing, thin JSON-RPC client with actor-pattern reader/writer, per-language `LspServer` actor, multi-language `LspBroker` with lazy spawn and graceful `NotAvailable` fallback when no copy of the binary can be found anywhere.
 - `moon-protocol::lsp` carries moon-shaped subsets of upstream LSP types so the UI never sees raw `lsp-types`.
 - Per-language availability pill in the status bar (`starting…`, `not available`, `crashed`, `stopped`) — `running` stays invisible. Tooltip reveals the resolved binary path (project-local vs global) on hover.
-- Stage 2 slice: **goto-definition** via Ctrl/Cmd-hover link preview + Ctrl/Cmd-click jump, routed through a browser-style file-level nav history (`Alt+Left` / `Alt+Right`). External targets (`node_modules/`, toolchain sources) surface a toast until a read-only external viewer lands.
+- Stage 2 slice: **goto-definition** via Ctrl/Cmd-hover link preview + Ctrl/Cmd-click jump, routed through a **position-aware, cross-folder** navigation history (`Alt+Left` / `Alt+Right`). Nav entries carry `{ folder, path, line, character }`; clicks push, keyboard motion updates the tip, and folder swaps happen transparently on back/forward. Goto-definition into a sibling bound folder opens in that folder; only targets outside every bound folder still surface a toast.
 
 **Still outstanding for this phase**: Rust (rust-analyzer), Svelte (svelte-language-server), CSS / HTML / JSON / MD servers; go-to-definition with Ctrl-click underline; find-references panel; rename; code actions; navigation history (Alt-Left / Alt-Right); incremental document sync; signature help.
 

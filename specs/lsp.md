@@ -111,20 +111,26 @@ Server-side capability advertisement is `definition: { linkSupport: true }`; we 
 
 ### Navigation history (Alt+Left / Alt+Right)
 
-Linear, browser-style file history lives on `WorkspaceState`:
+Position-aware, browser-style history lives on `WorkspaceState`. Each entry carries enough to re-establish both the active buffer and the caret inside it — VS Code-style — and the entries are folder-tagged so a multi-folder workspace can walk back through files in folder B while folder A is active.
 
-- `navStack: string[]` + `navIndex: number` — path list, oldest to newest.
-- `setActive` pushes onto the stack on every genuine user navigation (file-tree click, tab click, goto-def jump). Pushes during `navigateBack` / `navigateForward` / `jumpTo` are suppressed via a private `suppressNavPush` flag so stepping through history doesn't re-record itself.
-- Opening a new file while not at the tip truncates the forward stack — same semantics as a browser URL bar.
+- `navStack: NavEntry[]` + `navIndex: number`. `NavEntry = { folder, path, line, character }`. `folder` is the absolute host path of the bound folder (the same value as `WorkspaceFolder.path`); `path` is folder-relative the way `openFiles` entries already are. The pair survives folder switches and tab close/re-open.
+- Two mutation modes feed the stack:
+  - **Push** on genuine navigations: a mouse click inside the editor (CM transaction annotated `select.pointer`), a file switch (`setActive`), or a `jumpTo` call truncate any forward entries and append. VS Code's behaviour: if you're at line 10 and click line 50, the entry at line 10 becomes the bookmark Alt+Left returns to.
+  - **Tip update** on every other selection change: arrow keys, selection extension, the programmatic dispatch from our own `pendingJumps` consumer. These update `navStack[navIndex]` in place. Net result: when you go back and explore with arrow keys, Alt+Right returns you to where you actually ended up, not where the original click landed.
+- `pushFileSwitchEntry` records a fresh `(folder, path)` at `(0, 0)` on tab/tree clicks and goto-def jumps; the first `updateNavTip` after the file renders corrects the position. It skips the push when `(folder, path)` already matches the tip, so rapid re-clicks on the same tab don't inflate history.
+- `pushClickNavigation` always pushes a fresh entry unless the click lands on the exact same caret as the tip (a refocus gesture). Truncates the forward stack, matching browser semantics.
+- Pushes during `navigateBack` / `navigateForward` / `jumpTo` are suppressed via a private `suppressNavPush` flag so stepping through history doesn't re-record itself.
 - `canNavigateBack` / `canNavigateForward` are `$derived` so keybindings can fall through to CM's default when history is empty (on macOS, Option+Arrow is word-motion in the default keymap; we only shadow it when there's somewhere to go).
 
-**Stage 2 scope is path-only.** Caret positions aren't preserved across back/forward — a revisit opens the file at (0, 0) or wherever CM rebuilds to. Per-file caret memory through nav history is a reasonable upgrade (store `{ path, line, character }` in `navStack`, and hand each entry through the `pendingJumps` map the same way go-to-definition already does) — shipping it now would double the test surface for a small QoL gain. File-level history is what everyone actually uses most of the time anyway.
+**Cross-folder restores.** `restoreNavEntry` awaits `setActiveFolder(entry.folder)` before `openFile(entry.path)` when the active folder differs. It also bails gracefully (with a flash) when the target folder was removed from the workspace since the entry was recorded; `removeFolder` prunes stale entries on the way out so this bail path is rare.
+
+**Cross-folder goto-definition.** When `textDocument/definition` returns a target outside the active folder's root, the broker hands back an `externalUri`. The frontend `resolveExternalUri` walks the bound-folder list (longest-prefix first, so nested bindings beat their parent) and, if a bound folder contains the target, rewrites it to `{ folder, relative-path }` and calls `jumpTo(path, pos, side, folder)`. Only genuinely-external targets (node_modules, Rust toolchain, `ts://` pseudo URIs) keep surfacing as a toast.
 
 ### One-shot caret hand-off via `pendingJumps`
 
-Goto-definition and any future "open file at specific position" callers set an entry in `WorkspaceState.pendingJumps: Map<path, { line, character }>` before calling `openFile`. The `Editor` component has a `$effect` that consumes the entry for the file it's currently displaying, dispatches a selection-change + `scrollIntoView(…, 'center')`, and drops the entry.
+Goto-definition and any "open file at specific position" caller (including `navigateBack` / `navigateForward`) set an entry in `WorkspaceState.pendingJumps: Map<"${folder}::${path}", { line, character }>` before calling `openFile`. The `Editor` component has a `$effect` that consumes the entry for the `(folder, path)` it's currently displaying, dispatches a selection-change + `scrollIntoView(…, 'center')`, and drops the entry.
 
-Microtask-deferred: the path-change effect's `setState` has to finish first, otherwise the selection dispatch lands in the outgoing view.
+Key includes the folder so folder A's `src/lib.rs` and folder B's `src/lib.rs` don't cross the streams. Microtask-deferred: the path-change effect's `setState` has to finish first, otherwise the selection dispatch lands in the outgoing view.
 
 ### Server → client requests get `null`
 

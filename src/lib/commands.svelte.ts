@@ -137,6 +137,24 @@ export const builtInCommands: Command[] = [
 		shortcut: 'Ctrl+\\',
 		run: () => workspace.closeSplit(),
 	},
+	// Nav-history entry points. Hidden when there's nowhere to go —
+	// an always-visible "Go Back" that sometimes does nothing trains
+	// users to ignore it. The shortcut label is what most users will
+	// actually rely on; the palette entry is mostly for discovery.
+	{
+		id: 'nav.goBack',
+		title: 'Go Back',
+		shortcut: 'Alt+Left',
+		visible: () => workspace.canNavigateBack,
+		run: () => void workspace.navigateBack(),
+	},
+	{
+		id: 'nav.goForward',
+		title: 'Go Forward',
+		shortcut: 'Alt+Right',
+		visible: () => workspace.canNavigateForward,
+		run: () => void workspace.navigateForward(),
+	},
 	// Three explicit entries rather than a cycling toggle: the
 	// underlying setting is a three-way enum (System / Dark /
 	// Light) and "cycle" has no obvious order. Keeping one item

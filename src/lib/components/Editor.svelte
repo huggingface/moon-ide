@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { EditorState, Compartment, EditorSelection } from '@codemirror/state';
+	import { EditorState, Compartment, EditorSelection, Transaction } from '@codemirror/state';
 	import { EditorView, highlightActiveLine, highlightActiveLineGutter, keymap, lineNumbers } from '@codemirror/view';
 	import { highlightTabs } from '../editor/highlightTabs';
 	import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
@@ -182,24 +182,26 @@
 	// clears old doc → this effect runs → dispatch lands.
 	$effect(() => {
 		const v = view;
-		if (!v) {
+		const folder = workspace.activeFolderPath;
+		if (!v || folder === null) {
 			return;
 		}
-		const pending = workspace.pendingJumps.get(file.path);
+		const key = `${folder}::${file.path}`;
+		const pending = workspace.pendingJumps.get(key);
 		if (!pending) {
 			return;
 		}
 		queueMicrotask(() => {
 			const offset = offsetFromLspPosition(v, pending);
 			if (offset === null) {
-				workspace.consumePendingJump(file.path);
+				workspace.consumePendingJump(folder, file.path);
 				return;
 			}
 			v.dispatch({
 				selection: EditorSelection.cursor(offset),
 				effects: EditorView.scrollIntoView(offset, { y: 'center' }),
 			});
-			workspace.consumePendingJump(file.path);
+			workspace.consumePendingJump(folder, file.path);
 		});
 	});
 
@@ -244,7 +246,8 @@
 			...lspDiagnosticsExtension(),
 			lspHoverExtension(),
 			lspGotoDefinitionExtension({
-				jumpTo: (path, position) => workspace.jumpTo(path, position, side),
+				jumpTo: (path, position, folder) => workspace.jumpTo(path, position, side, folder),
+				resolveExternalUri: (uri) => workspace.resolveExternalUri(uri),
 				flash: (msg) => workspace.flash(msg),
 			}),
 			lspPathCompartment.of(filePathFacet.of(file.path)),
@@ -305,6 +308,31 @@
 						workspace.updateText(currentPath, text);
 					}
 				}
+				if (!update.selectionSet || currentPath === null) {
+					return;
+				}
+				const folder = workspace.activeFolderPath;
+				if (folder === null) {
+					return;
+				}
+				const pos = lspPositionFromOffset(update.state, update.state.selection.main.head);
+				// Classify the selection change: a mouse click produces
+				// a transaction annotated `select.pointer`, in which case
+				// we push a fresh nav entry (the "you were reading line
+				// 10, clicked line 50" bookmark). Everything else —
+				// arrow keys, find-next, programmatic selection updates
+				// from our own pendingJump dispatch — just drags the
+				// current tip along so Alt+Right after a back-nav
+				// restores the caret where the user last left it.
+				const isClick = update.transactions.some((tr) => {
+					const evt = tr.annotation(Transaction.userEvent);
+					return typeof evt === 'string' && evt.startsWith('select.pointer');
+				});
+				if (isClick) {
+					workspace.pushClickNavigation(folder, currentPath, pos);
+				} else {
+					workspace.updateNavTip(folder, currentPath, pos);
+				}
 			}),
 		];
 	}
@@ -331,6 +359,15 @@
 		}
 		const lineInfo = doc.line(position.line + 1);
 		return lineInfo.from + Math.min(position.character, lineInfo.length);
+	}
+
+	// CM offset → LSP position. Line numbers are 0-indexed in LSP /
+	// the protocol; CM's `line(n)` is 1-indexed, so we subtract.
+	// Character is UTF-16 codeunits from line start — matches both
+	// CM's internal model and LSP's encoding, so no conversion.
+	function lspPositionFromOffset(state: EditorState, offset: number): LspPosition {
+		const line = state.doc.lineAt(offset);
+		return { line: line.number - 1, character: offset - line.from };
 	}
 
 	async function applyLanguage(path: string, text: string) {

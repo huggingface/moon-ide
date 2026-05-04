@@ -37,6 +37,28 @@ export type MarkdownView = 'source' | 'preview';
 
 export type { SplitSide } from './protocol';
 
+/**
+ * One slot in the navigation history. Captures enough to re-establish
+ * both the editor's active buffer and the caret inside it.
+ *
+ * `folder` is the absolute host path of the bound folder — `.path` is
+ * folder-relative the same way `openFiles` paths are. The pair acts
+ * as the stable identity of a position across folder switches and
+ * tab close/re-open cycles.
+ *
+ * UTF-16 encoding for `line` / `character` to match LSP + CodeMirror.
+ */
+export type NavEntry = {
+	folder: string;
+	path: string;
+	line: number;
+	character: number;
+};
+
+function navKey(folder: string, path: string): string {
+	return `${folder}::${path}`;
+}
+
 export type OpenFile = {
 	// Stable identifier used as the key in `openFiles`, the per-pane tab
 	// arrays, the active path fields, and the editorconfig / preview-mode
@@ -214,32 +236,48 @@ class WorkspaceState {
 	sidebarFocusTick = $state(0);
 	statusFocusTick = $state(0);
 
-	// Linear file-level navigation history, browser-style. Each entry is
-	// a path; `navIndex` points at the currently-active one (so
-	// `navStack[navIndex]` typically matches `activePath`). Entries
-	// are pushed on `openFile` when the path transitions, and Alt+Left
-	// / Alt+Right step the index. Opening a new file while not at the
-	// tip truncates the forward stack — same as a browser.
+	// Linear navigation history, browser-style but position-aware (each
+	// entry pins a caret inside a file rather than just a path).
 	//
-	// Stage 1 scope: path-only. No caret-position memory across
-	// back/forward (the editor rebuilds state on path change). The
-	// per-jump position for go-to-definition goes through
-	// `pendingJumps` instead; see below.
-	navStack: string[] = $state([]);
+	// Entries carry the absolute `folder` path so history works across
+	// multi-folder workspaces: navigating back to an entry in folder B
+	// while folder A is active switches folders first. `path` is
+	// folder-relative — the same form `openFiles` / tabs use.
+	//
+	// Two mutation modes:
+	//
+	// 1. **Push** (append + truncate forward): clicks (`select.pointer`
+	//    transactions) and file switches create a new entry and bump
+	//    `navIndex`. Opening a file while not at the tip truncates the
+	//    forward stack — same as a browser URL bar.
+	// 2. **Update in place** (tip tracking): keyboard arrow motion,
+	//    selection extension, programmatic selection changes — none of
+	//    these are "navigations", but the *last-known caret* per entry
+	//    has to track them or Alt+Right forward-navigate would land at
+	//    an old position the user moved away from.
+	//
+	// Matches VS Code's feel: clicks and file switches are history
+	// events; arrow keys and typing just drag the tip along. A small
+	// threshold + same-file coalescing prevents accidental double
+	// entries when a click barely shifts the caret.
+	navStack: NavEntry[] = $state([]);
 	navIndex = $state(-1);
 	// Guard flag: set while we're the ones driving an openFile (from
-	// navBack / navForward / jumpTo) so the standard push path
-	// doesn't record the very navigation we just performed. Cleared
-	// by the method that sets it.
+	// navigateBack / navigateForward / jumpTo) so the standard push
+	// path doesn't record the very navigation we just performed.
+	// Cleared by the method that sets it.
 	private suppressNavPush = false;
 
 	// One-shot carets the Editor component consumes on its next render
-	// for a given path. `jumpTo` (and anything else that wants to land
-	// the caret somewhere specific after opening a file) sets an entry
-	// keyed by path; the Editor's `$effect` watching this map dispatches
-	// the selection-change and removes the entry. A `Map` (not an
-	// object field) so multiple buffers can have pending jumps queued
-	// independently when a split has two editors.
+	// for a given (folder, path) key. `jumpTo` / `navigateBack` /
+	// `navigateForward` set an entry; the Editor's `$effect` watching
+	// this map dispatches the selection-change + scroll-into-view and
+	// removes the entry.
+	//
+	// Key is `"${folder}::${path}"` rather than just `path` because
+	// folder A and folder B can each have a `src/lib.rs` open in a
+	// multi-folder workspace; using a bare path would cross the
+	// streams.
 	pendingJumps: SvelteMap<string, { line: number; character: number }> = $state(new SvelteMap());
 
 	// Persistence guards. `persistScheduled` coalesces bursts of mutations
@@ -483,6 +521,7 @@ class WorkspaceState {
 		try {
 			const ws = await ipc.workspace.removeFolder(path);
 			this.folderStates.delete(path);
+			this.pruneNavEntriesForFolder(path);
 			// Drop the folder's compose snapshot from the per-folder
 			// store. We don't `compose down` its services on the
 			// daemon — the user may have removed the folder for a
@@ -1787,13 +1826,13 @@ class WorkspaceState {
 		}
 		this.focusedSide = side;
 		// Nav history: only push on genuine user navigation. We're
-		// inside `navBack` / `navForward` / `jumpTo` when
+		// inside `navigateBack` / `navigateForward` / `jumpTo` when
 		// `suppressNavPush` is set; skipping the push there prevents
 		// the immediate-rewind loop ("back arrow pushes the previous
 		// page onto history, so the next back arrow comes back here
 		// forever").
 		if (!this.suppressNavPush) {
-			this.pushNavigationEntry(path);
+			this.pushFileSwitchEntry(path);
 		}
 		// `focus` defaults to true; the tree opts out via `{ focus: false }`
 		// so arrow-key navigation can preview-browse without stealing focus.
@@ -1804,21 +1843,83 @@ class WorkspaceState {
 	}
 
 	/**
-	 * Append `path` to the nav stack, truncating any forward entries
-	 * (browser-style). Skipped when `path` is already the tip — rapid
-	 * re-clicks on the same tab don't inflate history.
+	 * Record a file-switch. Captures the caret from the previous tip
+	 * (so forward navigation lands where the user actually was, not
+	 * where a tool last parked the caret) and pushes a fresh entry
+	 * for `path` at line 0 by default. The Editor's first selection
+	 * update after the file opens will correct the entry to the real
+	 * caret position.
 	 */
-	private pushNavigationEntry(path: string) {
-		if (this.navIndex >= 0 && this.navStack[this.navIndex] === path) {
+	private pushFileSwitchEntry(path: string) {
+		const folder = this.activeFolderPath;
+		if (folder === null) {
 			return;
 		}
-		// Truncate forward stack: opening a file while not at the tip
-		// invalidates the "forward" entries — same semantics as a
-		// browser's URL bar.
+		const tip = this.navIndex >= 0 ? this.navStack[this.navIndex] : undefined;
+		if (tip && tip.folder === folder && tip.path === path) {
+			// Already the tip — arrow-key selection updates maintain
+			// caret, no need to push.
+			return;
+		}
+		// Truncate forward and append. Initial caret is (0, 0); Editor
+		// will refine via `updateNavTip` as soon as its selection
+		// settles (or the pendingJumps consumer lands a specific
+		// position).
 		const trimmed = this.navStack.slice(0, this.navIndex + 1);
-		trimmed.push(path);
+		trimmed.push({ folder, path, line: 0, character: 0 });
 		this.navStack = trimmed;
 		this.navIndex = trimmed.length - 1;
+	}
+
+	/**
+	 * Record a mouse click / explicit jump inside a file. Unlike
+	 * `pushFileSwitchEntry`, this always pushes a fresh entry even
+	 * when the path is already the tip — the whole point of position
+	 * history is that clicking at line 50 while you were reading
+	 * line 10 leaves a bookmark at 10 you can Alt+Left back to.
+	 *
+	 * The only suppression is the no-move case: a click that lands on
+	 * the exact same caret position as the tip is a focus/refocus
+	 * gesture, not a navigation. Record every real caret move.
+	 */
+	pushClickNavigation(folder: string, path: string, position: { line: number; character: number }) {
+		if (this.suppressNavPush) {
+			return;
+		}
+		const tip = this.navIndex >= 0 ? this.navStack[this.navIndex] : undefined;
+		if (
+			tip &&
+			tip.folder === folder &&
+			tip.path === path &&
+			tip.line === position.line &&
+			tip.character === position.character
+		) {
+			return;
+		}
+		const trimmed = this.navStack.slice(0, this.navIndex + 1);
+		trimmed.push({ folder, path, line: position.line, character: position.character });
+		this.navStack = trimmed;
+		this.navIndex = trimmed.length - 1;
+	}
+
+	/**
+	 * Selection moved without a genuine "navigation" gesture (arrow
+	 * keys, selection extension, programmatic setSelection). Mutate
+	 * the tip so Alt+Right after a back-nav restores the caret where
+	 * the user actually left it, not where the original click landed.
+	 * No-op if the tip doesn't match (editor is rendering some other
+	 * file, which shouldn't happen but is cheap to guard).
+	 */
+	updateNavTip(folder: string, path: string, position: { line: number; character: number }) {
+		if (this.suppressNavPush) {
+			return;
+		}
+		const tip = this.navIndex >= 0 ? this.navStack[this.navIndex] : undefined;
+		if (!tip || tip.folder !== folder || tip.path !== path) {
+			return;
+		}
+		tip.line = position.line;
+		tip.character = position.character;
 	}
 
 	/** True when Alt+Left has somewhere to go. */
@@ -1827,8 +1928,9 @@ class WorkspaceState {
 	canNavigateForward = $derived(this.navIndex >= 0 && this.navIndex < this.navStack.length - 1);
 
 	/**
-	 * Step back one entry in nav history. Opens the previous file on
-	 * the currently-focused side, preserving focus. No-op when we're
+	 * Step back one entry in nav history. Switches folder first if
+	 * the target entry belongs to a different bound folder, then
+	 * opens the file and restores the stored caret. No-op when we're
 	 * already at the oldest entry — the keybinding falls through to
 	 * CM's default (word-motion on mac, nothing on win/linux) via the
 	 * return value.
@@ -1838,16 +1940,11 @@ class WorkspaceState {
 			return false;
 		}
 		this.navIndex -= 1;
-		const path = this.navStack[this.navIndex];
-		if (path === undefined) {
+		const entry = this.navStack[this.navIndex];
+		if (!entry) {
 			return false;
 		}
-		this.suppressNavPush = true;
-		try {
-			await this.openFile(path);
-		} finally {
-			this.suppressNavPush = false;
-		}
+		await this.restoreNavEntry(entry);
 		return true;
 	}
 
@@ -1856,17 +1953,68 @@ class WorkspaceState {
 			return false;
 		}
 		this.navIndex += 1;
-		const path = this.navStack[this.navIndex];
-		if (path === undefined) {
+		const entry = this.navStack[this.navIndex];
+		if (!entry) {
 			return false;
 		}
+		await this.restoreNavEntry(entry);
+		return true;
+	}
+
+	/**
+	 * Open the file referenced by `entry` and restore its caret.
+	 * Handles the cross-folder case: if `entry.folder` differs from
+	 * the active folder, we swap active folders first (which
+	 * rehydrates its buffers / tree / terminal), then open the file.
+	 * `suppressNavPush` is held across the whole transaction so the
+	 * setActiveFolder + openFile chain doesn't push duplicate entries
+	 * as the folder-switch drags the caret around.
+	 *
+	 * Bails (with a flash) if the target folder has been removed from
+	 * the workspace since the entry was recorded — nav-history
+	 * cleanup on `removeFolder` prunes most of these, but a stale
+	 * forward-stack slice can outlive the prune, so we belt-and-brace.
+	 */
+	private async restoreNavEntry(entry: NavEntry): Promise<void> {
+		const folderExists = this.workspace?.folders.some((f) => f.path === entry.folder) ?? false;
+		if (!folderExists) {
+			this.flash(`Folder no longer in workspace: ${entry.folder}`);
+			return;
+		}
+		const key = navKey(entry.folder, entry.path);
+		const next = new SvelteMap(this.pendingJumps);
+		next.set(key, { line: entry.line, character: entry.character });
+		this.pendingJumps = next;
 		this.suppressNavPush = true;
 		try {
-			await this.openFile(path);
+			if (this.activeFolderPath !== entry.folder) {
+				await this.setActiveFolder(entry.folder);
+			}
+			await this.openFile(entry.path);
 		} finally {
 			this.suppressNavPush = false;
 		}
-		return true;
+	}
+
+	/**
+	 * Drop any nav-stack entries pointing at a folder that no longer
+	 * lives in the workspace. Called from `removeFolder` so Alt+Left
+	 * doesn't try to navigate into a folder the user just kicked out.
+	 * Adjusts `navIndex` to keep pointing at the relatively-equivalent
+	 * current position (or -1 if every entry got pruned).
+	 */
+	private pruneNavEntriesForFolder(folderPath: string) {
+		if (this.navStack.length === 0) {
+			return;
+		}
+		const current = this.navIndex >= 0 ? this.navStack[this.navIndex] : undefined;
+		const filtered = this.navStack.filter((entry) => entry.folder !== folderPath);
+		this.navStack = filtered;
+		if (!current || current.folder === folderPath) {
+			this.navIndex = filtered.length - 1;
+		} else {
+			this.navIndex = filtered.indexOf(current);
+		}
 	}
 
 	/**
@@ -1875,28 +2023,95 @@ class WorkspaceState {
 	 * `pendingJumps` so the Editor's reactive effect dispatches a
 	 * selection-change after the state-rebuild settles.
 	 *
-	 * Records a normal nav-stack entry — back/forward works across
-	 * definition jumps. Caret *position* isn't preserved through
-	 * back/forward yet (stage 2 work), only file identity.
+	 * `folder` defaults to the active folder. Pass an explicit folder
+	 * for cross-folder jumps (e.g. goto-definition resolving into a
+	 * different bound folder); the method switches folders first.
+	 * Records a normal nav entry — back/forward works across
+	 * definition jumps and carries the exact caret.
 	 */
-	async jumpTo(path: string, position: { line: number; character: number }, side: SplitSide = this.focusedSide) {
+	async jumpTo(
+		path: string,
+		position: { line: number; character: number },
+		side: SplitSide = this.focusedSide,
+		folder: string = this.activeFolderPath ?? '',
+	) {
+		if (!folder) {
+			return;
+		}
+		const key = navKey(folder, path);
 		const next = new SvelteMap(this.pendingJumps);
-		next.set(path, position);
+		next.set(key, position);
 		this.pendingJumps = next;
+		if (this.activeFolderPath !== folder) {
+			await this.setActiveFolder(folder);
+		}
 		await this.openFile(path, side);
+		// Record the arrival position explicitly. setActive already
+		// pushed a file-switch entry at (0, 0); overwrite it with the
+		// real target so Alt+Left from here jumps to *this* spot, not
+		// the top of the file.
+		const tip = this.navIndex >= 0 ? this.navStack[this.navIndex] : undefined;
+		if (tip && tip.folder === folder && tip.path === path) {
+			tip.line = position.line;
+			tip.character = position.character;
+		}
+	}
+
+	/**
+	 * Resolve an LSP-returned external URI (the active-folder broker
+	 * marks everything outside its root as "external") against every
+	 * bound folder in the workspace. Returns `{ folder, path }` when
+	 * the URI falls under some bound folder so a cross-folder jump
+	 * can happen; `null` means it's genuinely outside the workspace
+	 * (node_modules / toolchain / http-scheme).
+	 *
+	 * Only accepts `file://` URIs — anything else (e.g. `ts://` pseudo
+	 * URIs for TS built-ins) is inherently outside the workspace.
+	 * Matches longest folder-prefix first so nested folder bindings
+	 * (root + `root/subcrate`) resolve against the inner folder.
+	 */
+	resolveExternalUri(externalUri: string): { folder: string; path: string } | null {
+		if (!externalUri.startsWith('file://')) {
+			return null;
+		}
+		let abs: string;
+		try {
+			abs = decodeURIComponent(new URL(externalUri).pathname);
+		} catch {
+			return null;
+		}
+		const ws = this.workspace;
+		if (!ws) {
+			return null;
+		}
+		// Sort by descending length so `root/sub` beats `root` when
+		// both are bound — otherwise a file inside the nested folder
+		// would resolve against the outer one.
+		const sorted = ws.folders.toSorted((a, b) => b.path.length - a.path.length);
+		for (const folder of sorted) {
+			const root = folder.path.endsWith('/') ? folder.path : `${folder.path}/`;
+			if (abs === folder.path) {
+				return { folder: folder.path, path: '' };
+			}
+			if (abs.startsWith(root)) {
+				return { folder: folder.path, path: abs.slice(root.length) };
+			}
+		}
+		return null;
 	}
 
 	/**
 	 * Called by the Editor once it's applied a pending jump for
-	 * `path`. The entry is one-shot — next paint shouldn't re-jump
-	 * the caret if the user moved it away.
+	 * `(folder, path)`. The entry is one-shot — next paint shouldn't
+	 * re-jump the caret if the user moved it away.
 	 */
-	consumePendingJump(path: string) {
-		if (!this.pendingJumps.has(path)) {
+	consumePendingJump(folder: string, path: string) {
+		const key = navKey(folder, path);
+		if (!this.pendingJumps.has(key)) {
 			return;
 		}
 		const next = new SvelteMap(this.pendingJumps);
-		next.delete(path);
+		next.delete(key);
 		this.pendingJumps = next;
 	}
 

@@ -67,7 +67,16 @@ const linkField = StateField.define<DecorationSet>({
 });
 
 export type GotoDefinitionDeps = {
-	jumpTo: (path: string, position: LspPosition) => void | Promise<void>;
+	jumpTo: (path: string, position: LspPosition, folder?: string) => void | Promise<void>;
+	/**
+	 * Try to map an LSP-returned external URI (outside the active
+	 * folder's root) to one of the other bound folders in the
+	 * workspace. When a bound folder contains the target, returns
+	 * `{ folder, path }` ready to feed into `jumpTo` for a
+	 * cross-folder jump. `null` means the target sits outside every
+	 * bound folder — the caller surfaces a toast instead.
+	 */
+	resolveExternalUri: (externalUri: string) => { folder: string; path: string } | null;
 	flash: (message: string) => void;
 };
 
@@ -248,10 +257,22 @@ export function lspGotoDefinitionExtension(deps: GotoDefinitionDeps): Extension 
 					return;
 				}
 				if (location.path === '') {
-					// External target — node_modules, toolchain source, or
-					// a synthetic `ts://` URI for built-in types. No
-					// read-only viewer yet, so surface the URI and move on.
-					deps.flash(`Definition outside workspace: ${location.externalUri}`);
+					// External to the active folder — might still live
+					// inside another bound folder. Try to resolve before
+					// giving up: a devcontainer / monorepo setup with
+					// two bound folders will hand us targets in the
+					// sibling folder all day long.
+					const resolved = deps.resolveExternalUri(location.externalUri);
+					if (!resolved) {
+						// Genuinely outside every bound folder (node_modules,
+						// toolchain source, or a synthetic `ts://` URI for
+						// built-in types). No read-only viewer yet, so
+						// surface the URI and move on.
+						deps.flash(`Definition outside workspace: ${location.externalUri}`);
+						return;
+					}
+					this.clearLink();
+					await deps.jumpTo(resolved.path, location.range.start, resolved.folder);
 					return;
 				}
 				this.clearLink();
