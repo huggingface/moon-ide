@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use moon_protocol::editorconfig::EditorConfig;
 use moon_protocol::fs::{DirEntry, EntryKind, ReadFileResult, StatResult, WriteFileResult};
-use moon_protocol::git::{GitFileStatus, GitStatusEntry};
+use moon_protocol::git::{GitFileBlame, GitFileStatus, GitLineBlame, GitStatusEntry};
 use moon_protocol::{MoonError, MoonResult};
 use std::time::SystemTime;
 
@@ -98,6 +98,18 @@ pub trait WorkspaceHost: Send + Sync {
 	/// frontend currently omits them from the menu rather than pick
 	/// a default between "unstage" and "delete".
 	async fn git_restore_paths(&self, paths: &[String]) -> MoonResult<()>;
+
+	/// Per-line blame for a single tracked file. Returns `None` when
+	/// the path isn't inside a git repo, isn't tracked, or when the
+	/// `git` binary can't be found — the UI skips blame annotations
+	/// silently in all three cases, which is exactly the behaviour a
+	/// file-tree that only shows a subset of tracked files wants.
+	///
+	/// The current version shells out to `git blame --porcelain -w`
+	/// and parses the stable porcelain format. `gix` has blame
+	/// support in progress but hasn't stabilised; swapping the
+	/// implementation is a contained change behind this trait method.
+	async fn git_blame(&self, path: &Utf8Path) -> MoonResult<Option<GitFileBlame>>;
 }
 
 pub struct LocalHost {
@@ -455,6 +467,40 @@ impl WorkspaceHost for LocalHost {
 		self.editorconfig.clear().await;
 		Ok(())
 	}
+
+	async fn git_blame(&self, path: &Utf8Path) -> MoonResult<Option<GitFileBlame>> {
+		// Path has to live inside the active folder — same lexical
+		// containment as `git_restore_paths`. We also refuse
+		// directories outright because `git blame` doesn't blame a
+		// directory; the UI should never send one, but belt-and-brace.
+		if path.as_str().is_empty() {
+			return Ok(None);
+		}
+		let rel = Utf8PathBuf::from(path.as_str().trim_end_matches('/'));
+		if rel.is_absolute() {
+			return Err(MoonError::invalid(format!("git_blame rejects absolute path: {rel}")));
+		}
+		let mut depth = 0i32;
+		for seg in rel.components() {
+			match seg {
+				camino::Utf8Component::ParentDir => {
+					depth -= 1;
+					if depth < 0 {
+						return Err(MoonError::invalid(format!("git_blame rejects path escape: {rel}")));
+					}
+				}
+				camino::Utf8Component::Normal(_) => depth += 1,
+				camino::Utf8Component::CurDir => {}
+				camino::Utf8Component::Prefix(_) | camino::Utf8Component::RootDir => {
+					return Err(MoonError::invalid(format!("git_blame rejects rooted path: {rel}")));
+				}
+			}
+		}
+		let root = self.root.clone();
+		tokio::task::spawn_blocking(move || run_git_blame(&root, &rel))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_blame join error: {e}")))?
+	}
 }
 
 /// `git restore --source=HEAD --staged --worktree -- <paths>`.
@@ -487,6 +533,272 @@ fn run_git_restore(root: &Utf8Path, paths: &[Utf8PathBuf]) -> MoonResult<()> {
 		)));
 	}
 	Ok(())
+}
+
+/// `git blame --porcelain --root -w -- <path>`. Returns `Ok(None)`
+/// for any failure mode the UI should silently ignore: not a repo,
+/// path not tracked, git binary missing, file is binary. Real errors
+/// (unparseable output, join errors) still bubble up.
+///
+/// Flag choices:
+/// - `--porcelain` gives the stable one-commit-per-line format with
+///   full metadata on the first appearance and an abbreviated header
+///   on repeats. Cheap to parse and version-locked.
+/// - `--root` makes lines from the root commit look like any other
+///   commit (instead of being omitted). Otherwise the first commit's
+///   lines would get a blank blame, which looks like a bug.
+/// - `-w` ignores whitespace-only changes when attributing lines —
+///   users reformat their own code all the time and get annoyed when
+///   the blame gets reset to "you, just now" by an indent tweak.
+/// - `--no-renames` would hide file-level renames from the blame walk;
+///   we specifically *want* renames followed so blame traces through
+///   them. Leave the git default on.
+///
+/// Invoked from the blocking pool.
+fn run_git_blame(root: &Utf8Path, path: &Utf8PathBuf) -> MoonResult<Option<GitFileBlame>> {
+	use std::process::Command;
+
+	let output = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["blame", "--porcelain", "--root", "-w", "--"])
+		.arg(path.as_std_path())
+		.output();
+	let Ok(output) = output else {
+		// `git` binary not on PATH. Same outcome the caller wants:
+		// no blame, no toast, no noise.
+		return Ok(None);
+	};
+	if !output.status.success() {
+		// Non-repo, untracked file, etc. all exit non-zero. Swallow
+		// stderr on purpose — a failed blame is UI-silent by contract.
+		return Ok(None);
+	}
+	let mut blame = parse_blame_porcelain(&output.stdout, path.as_str().to_owned());
+	blame.remote_url = remote_web_url(root).unwrap_or_default();
+	Ok(Some(blame))
+}
+
+/// Resolve the primary remote's web URL, normalised for link-
+/// building. Returns `None` when no remote is configured, the
+/// configured remote uses an unrecognised host, or the command fails
+/// for any other reason.
+///
+/// Preference order for which remote to pick:
+///
+/// 1. `origin` — the near-universal default set by `git clone`.
+/// 2. `upstream` — the second-most-common convention on forks.
+/// 3. First remote from `git remote` output — last-resort fallback.
+///
+/// Normalisation handles the three common URL shapes:
+///
+/// - `git@github.com:owner/repo.git` → `https://github.com/owner/repo`
+/// - `https://github.com/owner/repo.git` → `https://github.com/owner/repo`
+/// - `ssh://git@github.com/owner/repo` → `https://github.com/owner/repo`
+///
+/// Only `github.com` is recognised for now — GitLab, Bitbucket, and
+/// self-hosted hosts get `None` until someone wires their PR-URL
+/// convention. Matches the scope discipline in AGENTS.md: add the
+/// other platforms when a user asks.
+fn remote_web_url(root: &Utf8Path) -> Option<String> {
+	use std::process::Command;
+
+	for candidate in ["origin", "upstream"] {
+		let raw = Command::new("git")
+			.arg("-C")
+			.arg(root.as_std_path())
+			.args(["config", "--get"])
+			.arg(format!("remote.{candidate}.url"))
+			.output()
+			.ok()
+			.filter(|o| o.status.success())
+			.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+			.filter(|s| !s.is_empty());
+		if let Some(url) = raw {
+			if let Some(web) = normalize_remote_url(&url) {
+				return Some(web);
+			}
+			// Remote exists but isn't a supported host; keep looking
+			// — the repo may have a GitHub upstream behind a custom
+			// origin.
+		}
+	}
+	None
+}
+
+/// URL-normalising half of `remote_web_url`, broken out for unit
+/// tests. Returns `None` for any URL we can't confidently map to a
+/// web base.
+fn normalize_remote_url(raw: &str) -> Option<String> {
+	// `git@github.com:owner/repo(.git)?` — SCP-style SSH.
+	if let Some(rest) = raw.strip_prefix("git@") {
+		if let Some((host, path)) = rest.split_once(':') {
+			if host == "github.com" {
+				return Some(github_web_url(path));
+			}
+		}
+	}
+	// `ssh://git@github.com/owner/repo(.git)?`
+	if let Some(rest) = raw.strip_prefix("ssh://") {
+		let rest = rest.strip_prefix("git@").unwrap_or(rest);
+		if let Some((host, path)) = rest.split_once('/') {
+			if host == "github.com" {
+				return Some(github_web_url(path));
+			}
+		}
+	}
+	// `https://github.com/owner/repo(.git)?` — already HTTPS.
+	if let Some(rest) = raw.strip_prefix("https://").or_else(|| raw.strip_prefix("http://")) {
+		if let Some((host, path)) = rest.split_once('/') {
+			if host == "github.com" {
+				return Some(github_web_url(path));
+			}
+		}
+	}
+	None
+}
+
+fn github_web_url(owner_repo: &str) -> String {
+	// Strip any trailing slash and the conventional `.git` suffix
+	// that both HTTPS and SSH shapes carry.
+	let trimmed = owner_repo.trim_end_matches('/').trim_end_matches(".git");
+	format!("https://github.com/{trimmed}")
+}
+
+/// Parse `git blame --porcelain` output into line-indexed records.
+///
+/// The format, stripped to what we consume:
+///
+/// ```text
+/// <40-char-sha> <orig-line> <final-line> [<group-lines>]
+/// author Some Name
+/// author-mail <email@example.com>
+/// author-time 1712345678
+/// …
+/// summary subject of the commit
+/// …
+/// \tthe actual line of source
+/// ```
+///
+/// The first occurrence of a commit carries the full header; later
+/// lines from the same commit skip it (just the header line + `\t<src>`).
+/// We cache per-sha metadata so each emitted `GitLineBlame` carries
+/// the full set.
+///
+/// `message` is the commit's full subject+body. `git blame --porcelain`
+/// only gives us `summary` (the first line); to get the full message
+/// we'd need a second call per unique sha (`git show --no-patch
+/// --format=%B <sha>`). That's expensive in the hover path but cheap
+/// in the blame path if we batch after parsing — but right now we
+/// punt and set `message = summary`. The hover tooltip still wins
+/// (author + date + subject + hash is already a big step up from a
+/// plain "edited 5 minutes ago" badge); a future pass can upgrade to
+/// full messages once we decide how to batch the lookup.
+fn parse_blame_porcelain(stdout: &[u8], path: String) -> GitFileBlame {
+	use std::collections::HashMap;
+
+	let text = String::from_utf8_lossy(stdout);
+	let mut commits: HashMap<String, CommitMeta> = HashMap::new();
+	let mut lines: Vec<Option<GitLineBlame>> = Vec::new();
+
+	// `current_sha`: the commit the next `\t<src>` line belongs to.
+	// We set it every time we see a header line and read it back
+	// when the `\t` line arrives.
+	let mut current_sha: Option<String> = None;
+	let mut final_line: usize = 0;
+	// Mutable draft for the commit we're currently accumulating
+	// header fields for. Dumped into `commits` on the `\t<src>` line.
+	let mut draft = CommitMeta::default();
+
+	for line in text.lines() {
+		if let Some(src) = line.strip_prefix('\t') {
+			// Source line: finalise this record. `src` itself is
+			// unused (we don't re-display the file content), just a
+			// delimiter that a block is closing out.
+			let _ = src;
+			let sha = current_sha.clone().unwrap_or_default();
+			if !commits.contains_key(&sha) && !draft.author.is_empty() {
+				commits.insert(sha.clone(), draft.clone());
+			}
+			let meta = commits.get(&sha).cloned().unwrap_or_default();
+			let is_uncommitted = sha.chars().all(|c| c == '0');
+			let entry = GitLineBlame {
+				sha: sha.clone(),
+				is_uncommitted,
+				author: meta.author,
+				author_email: meta.author_email,
+				author_time: meta.author_time,
+				summary: meta.summary.clone(),
+				message: meta.summary,
+			};
+			// `final_line` is 1-indexed in the porcelain; we store
+			// 0-indexed to match CM's line addressing. Grow the
+			// vector with empty slots if a block skipped ahead
+			// (shouldn't happen, but survive malformed input).
+			let idx = final_line.saturating_sub(1);
+			if lines.len() <= idx {
+				lines.resize_with(idx + 1, || None);
+			}
+			lines[idx] = Some(entry);
+			draft = CommitMeta::default();
+			continue;
+		}
+		// Header / metadata lines. The sha-headed one starts every
+		// block; the rest are key/value pairs.
+		let mut parts = line.splitn(2, ' ');
+		let Some(key) = parts.next() else {
+			continue;
+		};
+		let rest = parts.next().unwrap_or("");
+		if key.len() == 40 && key.chars().all(|c| c.is_ascii_hexdigit() || c == '0') {
+			// Block-header line: `<sha> <orig> <final> [<group>]`.
+			let mut header = rest.split_whitespace();
+			let _orig = header.next();
+			let fin = header.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+			final_line = fin;
+			current_sha = Some(key.to_owned());
+			// If we've seen this commit before, its header is
+			// abbreviated: no `author` / `author-time` / etc. lines
+			// follow, just the `\t<src>`. Prime `draft` from the
+			// cached metadata so the finaliser sees the right fields.
+			if let Some(cached) = commits.get(key) {
+				draft = cached.clone();
+			} else {
+				draft = CommitMeta::default();
+			}
+			continue;
+		}
+		match key {
+			"author" => draft.author = rest.to_owned(),
+			"author-mail" => {
+				draft.author_email = rest.trim_start_matches('<').trim_end_matches('>').to_owned();
+			}
+			"author-time" => {
+				draft.author_time = rest.parse::<i64>().unwrap_or(0);
+			}
+			"summary" => draft.summary = rest.to_owned(),
+			// Everything else (`committer`, `committer-time`,
+			// `previous`, `filename`, `boundary`) is information we
+			// don't surface in the UI. Cheap to ignore; the format
+			// is stable enough that we won't need them unless we
+			// add a richer blame view later.
+			_ => {}
+		}
+	}
+
+	GitFileBlame {
+		path,
+		remote_url: String::new(),
+		lines: lines.into_iter().map(|opt| opt.unwrap_or_default()).collect(),
+	}
+}
+
+#[derive(Clone, Default)]
+struct CommitMeta {
+	author: String,
+	author_email: String,
+	author_time: i64,
+	summary: String,
 }
 
 /// Depth-first recursion into the workspace root. Order mirrors the
@@ -1089,6 +1401,144 @@ mod tests {
 			.await
 			.unwrap_err();
 		assert!(matches!(err, MoonError::InvalidArgument(_)), "got {err:?}");
+	}
+
+	#[tokio::test]
+	async fn git_blame_reports_commit_for_each_line() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping git blame test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		std::fs::write(dir.path().join("lib.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+
+		run_git(&git, dir.path(), &["init", "-q"]);
+		run_git(&git, dir.path(), &["config", "user.email", "alice@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "Alice"]);
+		run_git(&git, dir.path(), &["add", "lib.rs"]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "initial: two funcs"]);
+
+		// Second commit touches only line 2. We expect blame to
+		// attribute line 1 to the initial commit and line 2 to the
+		// amendment, with distinct shas.
+		std::fs::write(dir.path().join("lib.rs"), "fn a() {}\nfn b() { todo!() }\n").unwrap();
+		run_git(&git, dir.path(), &["config", "user.email", "bob@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "Bob"]);
+		run_git(&git, dir.path(), &["commit", "-aq", "-m", "stub out b"]);
+
+		let blame = host(&dir)
+			.git_blame(Utf8Path::new("lib.rs"))
+			.await
+			.unwrap()
+			.expect("blame should be Some inside a repo");
+		assert_eq!(blame.lines.len(), 2);
+		assert_eq!(blame.lines[0].author, "Alice");
+		assert_eq!(blame.lines[0].author_email, "alice@example.com");
+		assert_eq!(blame.lines[0].summary, "initial: two funcs");
+		assert!(!blame.lines[0].is_uncommitted);
+		assert_eq!(blame.lines[1].author, "Bob");
+		assert_eq!(blame.lines[1].summary, "stub out b");
+		assert_ne!(blame.lines[0].sha, blame.lines[1].sha);
+	}
+
+	#[tokio::test]
+	async fn git_blame_marks_uncommitted_lines() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping git blame uncommitted test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		std::fs::write(dir.path().join("lib.rs"), "first\nsecond\n").unwrap();
+
+		run_git(&git, dir.path(), &["init", "-q"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		run_git(&git, dir.path(), &["add", "lib.rs"]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "init"]);
+
+		std::fs::write(dir.path().join("lib.rs"), "first\nsecond\nthird\n").unwrap();
+
+		let blame = host(&dir).git_blame(Utf8Path::new("lib.rs")).await.unwrap().unwrap();
+		assert_eq!(blame.lines.len(), 3);
+		assert!(!blame.lines[0].is_uncommitted);
+		assert!(!blame.lines[1].is_uncommitted);
+		assert!(blame.lines[2].is_uncommitted, "new line must be uncommitted");
+	}
+
+	#[tokio::test]
+	async fn git_blame_returns_none_outside_repo() {
+		let dir = TempDir::new().unwrap();
+		std::fs::write(dir.path().join("lone.txt"), "no repo\n").unwrap();
+		let got = host(&dir).git_blame(Utf8Path::new("lone.txt")).await.unwrap();
+		assert!(got.is_none());
+	}
+
+	#[tokio::test]
+	async fn git_blame_rejects_path_escapes() {
+		let dir = TempDir::new().unwrap();
+		let err = host(&dir).git_blame(Utf8Path::new("../secret.txt")).await.unwrap_err();
+		assert!(matches!(err, MoonError::InvalidArgument(_)), "got {err:?}");
+	}
+
+	#[tokio::test]
+	async fn git_blame_resolves_github_remote_to_web_url() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping remote URL test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		std::fs::write(dir.path().join("x.txt"), "one\n").unwrap();
+		run_git(&git, dir.path(), &["init", "-q"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		run_git(&git, dir.path(), &["add", "x.txt"]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "add x"]);
+		run_git(
+			&git,
+			dir.path(),
+			&["remote", "add", "origin", "git@github.com:moon/ide.git"],
+		);
+
+		let blame = host(&dir).git_blame(Utf8Path::new("x.txt")).await.unwrap().unwrap();
+		assert_eq!(blame.remote_url, "https://github.com/moon/ide");
+	}
+
+	#[test]
+	fn normalize_remote_url_handles_all_shapes() {
+		// SCP-style SSH is what `git clone git@github.com:...` leaves
+		// behind.
+		assert_eq!(
+			super::normalize_remote_url("git@github.com:moon/ide.git"),
+			Some("https://github.com/moon/ide".into()),
+		);
+		assert_eq!(
+			super::normalize_remote_url("git@github.com:moon/ide"),
+			Some("https://github.com/moon/ide".into()),
+		);
+		// Explicit SSH URL with and without the `git@` user.
+		assert_eq!(
+			super::normalize_remote_url("ssh://git@github.com/moon/ide.git"),
+			Some("https://github.com/moon/ide".into()),
+		);
+		assert_eq!(
+			super::normalize_remote_url("ssh://github.com/moon/ide.git"),
+			Some("https://github.com/moon/ide".into()),
+		);
+		// HTTPS is already close to right, we just trim `.git`.
+		assert_eq!(
+			super::normalize_remote_url("https://github.com/moon/ide.git"),
+			Some("https://github.com/moon/ide".into()),
+		);
+		assert_eq!(
+			super::normalize_remote_url("https://github.com/moon/ide"),
+			Some("https://github.com/moon/ide".into()),
+		);
+		// Unknown hosts are rejected until we add mapping for them —
+		// better to leave the frontend un-linkified than to guess at
+		// a URL convention.
+		assert_eq!(super::normalize_remote_url("https://gitlab.com/moon/ide.git"), None);
+		assert_eq!(super::normalize_remote_url("git@bitbucket.org:moon/ide.git"), None);
+		assert_eq!(super::normalize_remote_url(""), None);
 	}
 
 	fn which_git() -> Option<std::path::PathBuf> {

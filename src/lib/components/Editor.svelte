@@ -15,6 +15,7 @@
 		lspHoverExtension,
 	} from '../editor/lsp';
 	import { lspGotoDefinitionExtension } from '../editor/lspGotoDefinition';
+	import { blameExtension, blameFacet } from '../editor/blame';
 	import { workspace, type OpenFile, type SplitSide } from '../state.svelte';
 	import { languageFor } from '../editor/language';
 	import { moonEditorTheme } from '../editor/theme';
@@ -39,6 +40,12 @@
 	// completion sources always talk about the file the user is
 	// looking at.
 	const lspPathCompartment = new Compartment();
+	// Current git blame data, reconfigured in-place when the
+	// workspace cache updates for this path. Kept in its own
+	// compartment (rather than rebuilt into baseExtensions) so a
+	// late-arriving blame response doesn't rebuild editor state —
+	// reconfiguring a facet is a zero-cost transaction.
+	const blameCompartment = new Compartment();
 
 	// Each Editor instance owns one CM view that we re-target as the active file changes.
 	// We track the path the view currently holds so we know when to swap state.
@@ -168,6 +175,23 @@
 		applyDiagnostics(v, list);
 	});
 
+	// Blame data. Reconfiguring the facet is what makes the
+	// ViewPlugin's `update.startState.facet(blameFacet) !==
+	// update.state.facet(blameFacet)` branch fire — which is how
+	// the current-line annotation appears / refreshes after the
+	// async IPC resolves. `null` is the "no blame" signal and
+	// yields an empty decoration set.
+	$effect(() => {
+		const v = view;
+		if (!v) {
+			return;
+		}
+		const blame = workspace.blameByPath.get(file.path) ?? null;
+		v.dispatch({
+			effects: blameCompartment.reconfigure(blameFacet.of(blame)),
+		});
+	});
+
 	// Consume a pending jump (Ctrl/Cmd-click on an identifier lands
 	// here): `workspace.jumpTo` stashed the target position, and the
 	// Editor that ends up owning `file.path` applies the selection
@@ -251,6 +275,11 @@
 				flash: (msg) => workspace.flash(msg),
 			}),
 			lspPathCompartment.of(filePathFacet.of(file.path)),
+			// Git blame annotation for the caret's current line.
+			// The compartment reconfigures to feed new blame data
+			// as `workspace.blameByPath` updates.
+			blameExtension(),
+			blameCompartment.of(blameFacet.of(workspace.blameByPath.get(file.path) ?? null)),
 			// Autocompletion popover. `activateOnTyping: false` keeps
 			// it off the typing path so we don't leak the built-in
 			// identifier source; `override` routes explicit

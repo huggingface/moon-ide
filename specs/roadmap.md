@@ -118,8 +118,9 @@ Until this phase lands, the file tree shows everything except the `.git/` direct
 - Deleted rows stay visible by union-ing git's `deleted` set into the tree's `paths` array, matching the contract above.
 - Auto-refresh: a `notify::RecommendedWatcher` rooted at the active folder emits debounced `fs:changed` Tauri events; window-focus events are a second-class fallback for when inotify is exhausted or the folder lives on NFS / SSHFS. Palette has "Refresh File Tree" as a manual escape hatch for the integrated terminal.
 - Per-row "Discard changes" via a hover / right-click context menu on changed rows: routes modified + deleted through `git restore --source=HEAD --staged --worktree` and untracked rows to the OS trash, confirming every time. First consumer of Pierre's `composition.contextMenu` API, via a reusable `ContextMenu.svelte` popover.
+- **Inline blame** for the active line (GitLens-style): a dim `author, relative-date • summary` badge sits at end-of-line for the caret's current row, and hovering the badge opens a tooltip with the full author, commit date, short hash, and commit subject. Backed by `WorkspaceHost::git_blame` / `fs_git_blame` shelling out to `git blame --porcelain -w`. Uncommitted edits render as `Uncommitted changes`; blame refreshes on save. Stale across live edits by design — the widget is a glance, not a ground truth.
 
-**Still outstanding for this phase**: blame (CM6 inline decoration), diff view (`@pierre/diffs`), the SCM panel, conflict markers, and the "unstage" half of discarding staged-new files.
+**Still outstanding for this phase**: diff view (`@pierre/diffs`), the SCM panel, conflict markers, and the "unstage" half of discarding staged-new files.
 
 ## Phase 6 — ACP
 

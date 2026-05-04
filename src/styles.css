@@ -375,3 +375,54 @@ button:focus-visible {
 	color: var(--m-syntax-invalid);
 	text-decoration: underline wavy;
 }
+
+/* Git blame hover popover. Lives at document.body level (see
+   blame.ts) rather than inside the editor's DOM, so the .cm-*
+   scoped rules don't reach it. Kept close to the editor's own
+   tooltip palette so hovers across the UI feel cohesive. */
+.cm-blame-hover {
+	position: absolute;
+	z-index: 40;
+	min-width: 260px;
+	max-width: 520px;
+	background: var(--m-bg-2);
+	border: 1px solid var(--m-border-strong);
+	border-radius: 6px;
+	box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+	padding: 10px 12px;
+	font-size: 12px;
+	line-height: 1.5;
+	color: var(--m-fg);
+	pointer-events: auto;
+}
+.cm-blame-hover-title {
+	font-weight: 600;
+	margin-bottom: 6px;
+	overflow-wrap: anywhere;
+}
+.cm-blame-hover-meta {
+	color: var(--m-fg-muted);
+	font-size: 11px;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+}
+.cm-blame-hover-body {
+	margin-top: 8px;
+	padding-top: 8px;
+	border-top: 1px solid var(--m-border);
+	white-space: pre-wrap;
+	color: var(--m-fg);
+	font-family: var(--m-font-mono);
+	font-size: 11px;
+	max-height: 200px;
+	overflow-y: auto;
+}
+.cm-blame-pr-link {
+	color: var(--m-accent);
+	text-decoration: none;
+	cursor: pointer;
+}
+.cm-blame-pr-link:hover {
+	text-decoration: underline;
+}

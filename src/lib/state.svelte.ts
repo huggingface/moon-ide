@@ -10,6 +10,7 @@ import {
 	type AppState,
 	type EditorConfig,
 	type FolderSession,
+	type GitFileBlame,
 	type GitStatusEntry,
 	type LspDiagnostic,
 	type LspDiagnosticsEvent,
@@ -205,6 +206,23 @@ class WorkspaceState {
 	// means "server hasn't reported yet". The editor binds its lint
 	// gutter to this; the status bar reads the active path's entry.
 	diagnostics = $state<Map<string, LspDiagnostic[]>>(new Map());
+
+	// Per-file git blame, indexed by line. The inline current-line
+	// annotation and its hover tooltip read from here. Populated on
+	// demand when a file is opened; refreshed on save so a freshly-
+	// committed line shows the new commit's metadata without a
+	// refresh.
+	//
+	// Scoped to the active folder by convention (the cache is
+	// cleared on folder swap, same deal as `diagnostics`). Stale
+	// entries after a rename are pruned via `rebindBlameForRename`.
+	blameByPath = $state<Map<string, GitFileBlame>>(new Map());
+	// Per-file coalescing timers for the post-save blame refresh.
+	// A Rust commit that edits the target file can trigger two or
+	// three saves in a second (pre-save pipeline, editorconfig tweak,
+	// then the user's Ctrl+S); batching means one `git blame`
+	// subprocess instead of a cascade.
+	#blameTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
 	// Per-language server state, keyed by LSP language id (`'typescript'`,
 	// later `'rust'` / `'svelte'` / …). Populated by `lsp:status`
 	// broker events. The status bar renders one pill per entry whose
@@ -569,6 +587,20 @@ class WorkspaceState {
 	 * state.
 	 */
 	async adoptWorkspaceSnapshot(snapshot: Workspace) {
+		// A folder swap invalidates the per-path blame cache: the
+		// same relative path can mean different files in folders A
+		// and B (both `src/lib.rs` in a multi-folder workspace), and
+		// even when it's the same file the commit history is
+		// scoped to the folder's repo. Drop the cache and let the
+		// opened-file effects refetch for the new folder.
+		const previousActive = this.workspace?.active_folder ?? null;
+		if (previousActive !== null && previousActive !== snapshot.active_folder) {
+			for (const timer of this.#blameTimers.values()) {
+				clearTimeout(timer);
+			}
+			this.#blameTimers.clear();
+			this.blameByPath = new Map();
+		}
 		this.workspace = snapshot.folders.length === 0 ? null : snapshot;
 		// Drop FolderStates whose folders aren't bound anymore. Two-pass
 		// (collect-then-delete) so we never mutate the map while
@@ -1163,6 +1195,82 @@ class WorkspaceState {
 	}
 
 	/**
+	 * Kick off a blame fetch for `path` and cache the result. Fire-
+	 * and-forget: the inline-blame extension binds reactively to
+	 * `blameByPath`, so whenever this resolves the widget updates
+	 * itself without the caller having to await.
+	 *
+	 * Skips untitled buffers (no on-disk path to blame) and silently
+	 * caches `null` for paths the backend rejects (non-repo,
+	 * untracked, binary). Safe to call repeatedly — the backend is
+	 * fast for a single file, and we're debounced on the save-refresh
+	 * path anyway.
+	 */
+	refreshBlame(path: string) {
+		if (path.startsWith('untitled:')) {
+			return;
+		}
+		void ipc.fs
+			.gitBlame(path)
+			.then((blame) => {
+				// Ignore stale responses: the active folder can have
+				// swapped while we were awaiting. `this.openFiles`
+				// reflects the current folder, so if the path isn't
+				// there any more we drop the answer on the floor.
+				if (!this.openFiles.some((f) => f.path === path)) {
+					return;
+				}
+				const next = new Map(this.blameByPath);
+				if (blame) {
+					next.set(path, blame);
+				} else {
+					next.delete(path);
+				}
+				this.blameByPath = next;
+			})
+			.catch(() => {
+				// Non-fatal. No blame = no widget; toast here would be
+				// noise every time the user opens a file outside a
+				// repo or one git can't attribute.
+			});
+	}
+
+	/**
+	 * Debounced version of `refreshBlame` for post-save refreshes.
+	 * Save cascades (editorconfig normalisation + user Ctrl+S +
+	 * watcher-triggered reloads) can land two or three writes back-
+	 * to-back; one `git blame` subprocess at the end of the burst is
+	 * enough.
+	 */
+	scheduleBlameRefresh(path: string) {
+		if (path.startsWith('untitled:')) {
+			return;
+		}
+		const existing = this.#blameTimers.get(path);
+		if (existing !== undefined) {
+			clearTimeout(existing);
+		}
+		const timer = setTimeout(() => {
+			this.#blameTimers.delete(path);
+			this.refreshBlame(path);
+		}, 250);
+		this.#blameTimers.set(path, timer);
+	}
+
+	private clearBlameFor(path: string) {
+		const timer = this.#blameTimers.get(path);
+		if (timer !== undefined) {
+			clearTimeout(timer);
+			this.#blameTimers.delete(path);
+		}
+		if (this.blameByPath.has(path)) {
+			const next = new Map(this.blameByPath);
+			next.delete(path);
+			this.blameByPath = next;
+		}
+	}
+
+	/**
 	 * Open `path` in the given pane. By default, opening a file pulls
 	 * editor focus — that's what tab clicks, the quick-open palette,
 	 * and session restore want. Pass `{ focus: false }` for surfaces
@@ -1216,6 +1324,10 @@ class WorkspaceState {
 				// event, the server still holds its open state.
 				if (next.kind === 'text') {
 					this.lspOpen(next.path, next.text);
+					// Kick off the initial blame fetch. Fire-and-forget:
+					// the current-line widget picks up the cache entry
+					// whenever the IPC resolves.
+					this.refreshBlame(next.path);
 				}
 			} catch (err) {
 				this.flash(`Failed to open ${path}: ${formatError(err)}`);
@@ -1703,6 +1815,10 @@ class WorkspaceState {
 			// so a later reopen of the same path starts clean rather
 			// than flashing stale squigglies.
 			this.lspClose(path);
+			// Drop blame cache + any pending refresh timer. If the
+			// user reopens the file later a fresh blame fetch runs;
+			// no point keeping the old one warm.
+			this.clearBlameFor(path);
 		}
 
 		if (fallback !== null) {
@@ -2273,6 +2389,11 @@ class WorkspaceState {
 			if (file.name === '.editorconfig') {
 				await this.refreshEditorConfigs();
 			}
+			// A fresh commit or amended working tree changes what
+			// `git blame` reports for most lines in this file. The
+			// in-memory buffer won't magically re-attribute itself
+			// — kick a debounced refresh so the widget catches up.
+			this.scheduleBlameRefresh(file.path);
 		} catch (err) {
 			this.flash(`Save failed: ${formatError(err)}`);
 		}

@@ -121,6 +121,45 @@ export type GitStatusEntry = {
 };
 
 /**
+ * Per-line blame for the inline current-line annotation and its
+ * hover tooltip. Mirrors `moon_protocol::git::GitLineBlame`. The
+ * `isUncommitted` flag is a convenience peel-off of the all-zero
+ * sha sentinel git emits for local edits; frontend code shouldn't
+ * need to know the sentinel string.
+ */
+export type GitLineBlame = {
+	sha: string;
+	isUncommitted: boolean;
+	author: string;
+	authorEmail: string;
+	/** Unix timestamp in seconds (UTC). */
+	authorTime: number;
+	summary: string;
+	message: string;
+};
+
+/**
+ * Per-file blame report, one entry per source line, 0-indexed to
+ * match CodeMirror's line addressing after the `line(n + 1)`
+ * adjustment. Mirrors `moon_protocol::git::GitFileBlame`.
+ *
+ * `path` is echoed back so a late-arriving response (the user
+ * switched files while a blame subprocess was still running) can be
+ * discarded at the call site without leaking stale annotations.
+ */
+export type GitFileBlame = {
+	path: string;
+	/**
+	 * Canonical HTTPS base URL of the repo's primary remote when it's
+	 * a host we know how to build PR / issue links for (currently
+	 * `github.com` only). Empty string means "no link target" — the
+	 * frontend falls back to rendering `#NNN` as plain text.
+	 */
+	remoteUrl: string;
+	lines: GitLineBlame[];
+};
+
+/**
  * LSP diagnostic severity. Mirrors `moon_protocol::lsp::LspSeverity`.
  * The four-level gradient matches LSP's own enum; the UI maps each
  * level to an icon + gutter colour.

@@ -8,6 +8,7 @@ import type {
 	EditorConfig,
 	FileSearchOptions,
 	FileSearchResult,
+	GitFileBlame,
 	GitStatusEntry,
 	LspCompletionList,
 	LspHover,
@@ -48,6 +49,7 @@ export const ipc = {
 		delete: (path: string) => invoke<void>('fs_delete', { path }),
 		gitStatusEntries: (paths: string[]) => invoke<GitStatusEntry[]>('fs_git_status_entries', { paths }),
 		gitRestorePaths: (paths: string[]) => invoke<void>('fs_git_restore_paths', { paths }),
+		gitBlame: (path: string) => invoke<GitFileBlame | null>('fs_git_blame', { path }),
 	},
 	search: {
 		files: (options: FileSearchOptions) => invoke<FileSearchResult[]>('search_files', { options }),

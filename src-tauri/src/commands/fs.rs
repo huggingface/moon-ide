@@ -1,6 +1,6 @@
 use camino::Utf8PathBuf;
 use moon_protocol::fs::{DirEntry, ReadFileResult, StatResult, WriteFileResult};
-use moon_protocol::git::GitStatusEntry;
+use moon_protocol::git::{GitFileBlame, GitStatusEntry};
 use moon_protocol::MoonError;
 use tauri::State;
 
@@ -108,4 +108,14 @@ pub async fn fs_git_status_entries(
 pub async fn fs_git_restore_paths(state: State<'_, AppState>, paths: Vec<String>) -> Result<(), MoonError> {
 	let entry = state.workspaces.require_active_folder().await?;
 	entry.host.git_restore_paths(&paths).await
+}
+
+/// Per-line blame for `path`. Returns `None` (serialised as `null`)
+/// for anything that isn't a tracked file inside a git repo; the
+/// frontend treats a null response as "no inline annotation".
+#[tauri::command]
+pub async fn fs_git_blame(state: State<'_, AppState>, path: String) -> Result<Option<GitFileBlame>, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	let path = Utf8PathBuf::from(path);
+	entry.host.git_blame(&path).await
 }

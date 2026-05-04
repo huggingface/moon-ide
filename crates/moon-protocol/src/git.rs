@@ -56,3 +56,75 @@ pub struct GitStatusEntry {
 	pub path: String,
 	pub status: GitFileStatus,
 }
+
+/// Per-line blame: who last touched this line, when, and with what
+/// commit. The inline current-line annotation uses `author_short` +
+/// a frontend-computed relative date + `summary`; the hover tooltip
+/// consumes the full set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct GitLineBlame {
+	/// 40-char commit hash, or 40 zero characters for a line that's
+	/// been edited locally but not yet committed. Frontend checks
+	/// for `is_uncommitted` rather than comparing the string.
+	pub sha: String,
+	/// True iff `sha` is the all-zero "Not Committed Yet" sentinel
+	/// that `git blame` emits for local edits. Peeled out for the UI
+	/// so a "You, uncommitted" badge doesn't have to know the
+	/// convention.
+	pub is_uncommitted: bool,
+	/// Full author name as recorded on the commit.
+	pub author: String,
+	/// Author e-mail without the angle brackets `git blame` puts
+	/// around it. Frontend rarely shows this beyond the hover
+	/// tooltip; useful for gravatars / SCM-tool links later.
+	pub author_email: String,
+	/// Unix timestamp (UTC seconds) of the commit's author-time
+	/// (not committer-time — blame tools universally prefer the
+	/// original authorship moment over a later rebase's stamp).
+	pub author_time: i64,
+	/// First line of the commit message. Subjects run the gamut from
+	/// 10 to 200 chars; the widget renderer ellipsizes locally.
+	pub summary: String,
+	/// Full commit message (subject + body, unwrapped). Rendered
+	/// verbatim in the hover tooltip with `white-space: pre-wrap`,
+	/// so line breaks survive. Markdown is intentionally *not*
+	/// interpreted — commit messages aren't meant to be rich text
+	/// and rendering them as Markdown would be surprising when e.g.
+	/// list-style bullets get chewed up.
+	pub message: String,
+}
+
+/// Per-file blame report, one entry per source line. Indexing is
+/// 0-based so it lines up directly with CM's `doc.line(n + 1)`
+/// accessor; empty trailing lines (the "no-newline-at-EOF" corner
+/// case) are not represented — `git blame` skips them.
+///
+/// `None` is returned to callers when blame is genuinely unavailable
+/// for this file (outside a repo, path never tracked, or `git`
+/// itself isn't on PATH). The UI treats "no blame" as "no widget",
+/// which is the right outcome for all three.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct GitFileBlame {
+	/// Workspace-relative path the blame was computed against.
+	/// Echoed back so a late-arriving response can be ignored when
+	/// the active buffer has moved on.
+	pub path: String,
+	/// Canonical HTTPS base URL of the repo's primary remote, when
+	/// it's a host we know how to build PR / issue links for
+	/// (currently `github.com` only). Trailing slash omitted — the
+	/// frontend appends `/pull/<N>` or similar. Empty string when
+	/// the remote isn't set, isn't a recognised host, or points at a
+	/// protocol we don't normalise (e.g. `file://`, raw SSH to an
+	/// arbitrary server).
+	///
+	/// Scoped per-file rather than per-workspace so a
+	/// multi-folder workspace where each folder has a different
+	/// remote keeps the link target correct without the frontend
+	/// having to cross-reference folder bindings.
+	pub remote_url: String,
+	pub lines: Vec<GitLineBlame>,
+}
