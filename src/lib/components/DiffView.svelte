@@ -1,227 +1,332 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { FileDiff, type FileContents } from '@pierre/diffs';
+	import { Compartment, EditorState, Prec, type Extension } from '@codemirror/state';
+	import { EditorView, highlightActiveLine, highlightActiveLineGutter, keymap, lineNumbers } from '@codemirror/view';
+	import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
+	import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
+	import { bracketMatching, indentOnInput, indentUnit } from '@codemirror/language';
+	import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from '@codemirror/autocomplete';
+	import { MergeView, goToNextChunk, goToPreviousChunk } from '@codemirror/merge';
 	import { ipc } from '../ipc';
 	import { workspace, type OpenFile, type SplitSide } from '../state.svelte';
-
-	function basename(path: string): string {
-		const i = path.lastIndexOf('/');
-		return i >= 0 ? path.slice(i + 1) : path;
-	}
+	import { highlightTabs } from '../editor/highlightTabs';
+	import { languageFor } from '../editor/language';
+	import { moonEditorTheme } from '../editor/theme';
+	import {
+		applyDiagnostics,
+		filePathFacet,
+		lspCompletionSource,
+		lspDiagnosticsExtension,
+		lspHoverExtension,
+	} from '../editor/lsp';
+	import { lspGotoDefinitionExtension } from '../editor/lspGotoDefinition';
+	import type { EditorConfig } from '../protocol';
 
 	type Props = { file: OpenFile; side: SplitSide };
 	let { file, side }: Props = $props();
 
-	// Wrapper element we keep focusable + programmatically focus.
-	// Without this, opening a diff tab from the file tree leaves
-	// focus on the tree row — which means Pierre's tree consumes
-	// Alt+Arrow (not to mention regular arrow keys) and the user
-	// sees the tree row light up as the "focused" thing rather
-	// than the pane they just opened.
-	let wrapper: HTMLDivElement;
 	let host: HTMLDivElement;
-	// `$state` so the render effect below picks up the assignment
-	// in `onMount` — a plain `let` isn't tracked by effects, so the
-	// effect would see `undefined` forever and never call `render`.
-	let instance = $state<FileDiff<undefined> | undefined>();
-	// HEAD content for the "before" side. For a deleted buffer
-	// `file.text` already holds it (see `loadDeletedFile` in
-	// state.svelte.ts); for a modified buffer or a dedicated diff
-	// tab we fetch on mount / path-change. `null` means "still
-	// loading" and suppresses rendering to avoid a one-frame flash
-	// of empty-vs-empty.
-	let headText = $state<string | null>(null);
-	// Echoed so a stale fetch can't overwrite a newer one. Keyed on
-	// the *real* path (not the synthetic `moon-diff:` tab id) so the
-	// cache keys line up with `workspace.headByPath` and a slow
-	// `git show` during a fast tab swap can't paint the wrong side.
-	let headPath = $state<string | null>(null);
-	// "After" side for diff tabs of modified files. Prefer the live
-	// editor buffer if one exists — typing in the regular tab then
-	// flipping to the diff tab should reflect unsaved edits — else
-	// fall back to a one-shot `readFile` on mount.
-	let diskAfterText = $state<string | null>(null);
+	let merge: MergeView | undefined;
 
-	// Workspace-relative path this DiffView's "before/after" pair
-	// is computed against. Deleted buffers and the (no-longer-used)
-	// legacy in-place toggle key on `file.path` itself; a dedicated
-	// diff tab keys on `file.realPath`.
-	const targetPath = $derived(file.isDiffTab ? file.realPath : file.path);
-	const targetName = $derived(file.isDiffTab ? basename(file.realPath) : file.name);
+	// Compartments are per-side: each `EditorView` inside the
+	// MergeView owns its own EditorState and can't share a Compartment
+	// with the other. Mirror everything that flips at runtime —
+	// theme, language, editorconfig — so we never have to rebuild
+	// the merge view to react to a setting change.
+	const langA = new Compartment();
+	const langB = new Compartment();
+	const themeA = new Compartment();
+	const themeB = new Compartment();
+	const ecA = new Compartment();
+	const ecB = new Compartment();
 
-	// Prefer the open editor tab's text for the "after" side of a
-	// diff tab. Matches users' mental model — the diff reflects the
-	// buffer they'd hit `Ctrl+S` on, not a stale snapshot from when
-	// the tab was opened.
-	const liveAfterText = $derived.by(() => {
-		if (!file.isDiffTab) {
-			return null;
-		}
-		const editorTab = workspace.openFiles.find((f) => f.path === file.realPath && f.kind === 'text' && !f.isDiffTab);
-		return editorTab ? editorTab.text : null;
-	});
+	// In single-tab model, `file.path` is stable for the lifetime of
+	// this DiffView instance — the EditorPane swaps Editor ↔ DiffView
+	// based on `diffModeFor(path)`, which remounts DiffView on each
+	// flip. So we build once in `onMount` and don't worry about
+	// path swaps inside the view.
+	let buildToken = 0;
+	// Cached HEAD content currently rendered in the left side. Lets
+	// us short-circuit no-op dispatches when the headByPath cache
+	// fires reactively without the value actually changing.
+	let currentHead: string | null = null;
 
 	onMount(() => {
-		instance = new FileDiff({
-			// Shiki themes: `pierre-light` / `pierre-dark` ship in the
-			// package and mostly match the VSCode/Cursor theme family
-			// the team uses. Swap the mapping when we grow a proper
-			// Pierre-theme adoption in a later phase; for now a fixed
-			// pair keeps light/dark readable and consistent with the
-			// CodeMirror editor's colour palette.
-			theme: { dark: 'pierre-dark', light: 'pierre-light' },
-			themeType: workspace.effectiveTheme,
-			diffStyle: 'split',
-			diffIndicators: 'bars',
-			// The editor already has its own toolbar header (tab +
-			// pane chrome); Pierre's file header would be a second
-			// filename banner immediately below it. Suppress it —
-			// the user already knows which file they're looking at.
-			disableFileHeader: true,
-		});
+		void buildMerge();
 		return () => {
-			instance?.cleanUp();
-			instance = undefined;
+			// Bump the build token so any in-flight `buildMerge`
+			// resolves into a no-op instead of attaching to a
+			// destroyed host node.
+			buildToken++;
+			merge?.destroy();
+			merge = undefined;
 		};
 	});
 
-	// Fetch the HEAD "before" text whenever the bound real path
-	// changes. Deleted buffers bypass the IPC entirely: `file.text`
-	// is the HEAD content, captured at open time. Diff tabs and
-	// modified-file toggles both route through `git show` here.
-	$effect(() => {
-		const path = targetPath;
-		const deletedText = file.isDeleted ? file.text : null;
-		if (deletedText !== null) {
-			headPath = path;
-			headText = deletedText;
-			return;
-		}
-		// Reuse workspace-level cache when present — the gutter
-		// extension keeps it warm for any open file, so a diff tab
-		// opened right after the editor tab paints instantly.
+	async function buildMerge() {
+		const token = ++buildToken;
+		const path = file.path;
+		// Editorconfig + language load are async (the latter dynamic-
+		// imports the grammar). Resolve both before constructing CM
+		// state so we don't paint with the wrong settings for a frame.
+		await workspace.ensureEditorConfig(path);
+		const ec = workspace.editorConfigFor(path);
+		const text = file.text;
+		const newlineIdx = text.indexOf('\n');
+		const firstLine = newlineIdx === -1 ? text : text.slice(0, newlineIdx);
+		const lang = await languageFor(path, firstLine);
+
+		// HEAD: prefer the warm cache (the gutter extension and
+		// `setActive` keep it loaded for any open file). For deleted
+		// buffers the HEAD content was captured at open time and
+		// lives on `file.text` itself — but those render with empty
+		// right side, so we still pull HEAD via the cache for the
+		// left side and let the caller (EditorPane) decide.
 		const cached = workspace.headByPath.get(path);
+		let head: string;
 		if (cached !== undefined) {
-			headPath = path;
-			headText = cached ?? '';
-			return;
-		}
-		headPath = null;
-		headText = null;
-		void (async () => {
-			const fetched = await ipc.fs.gitHeadContent(path);
-			if (targetPath !== path) {
-				return;
-			}
-			headPath = path;
-			headText = fetched ?? '';
-		})();
-	});
-
-	// Fetch the on-disk "after" side for diff tabs whose `realPath`
-	// isn't currently open in an editor tab. One-shot: the user can
-	// close and reopen the diff tab to re-pull, or (more likely)
-	// open the regular editor tab and watch it update live.
-	$effect(() => {
-		if (!file.isDiffTab || liveAfterText !== null) {
-			diskAfterText = null;
-			return;
-		}
-		const path = targetPath;
-		diskAfterText = null;
-		void (async () => {
-			try {
-				const result = await ipc.fs.readFile(path);
-				if (targetPath !== path) {
-					return;
-				}
-				// Binary paths will land here as `is_binary = true`
-				// — for diff purposes we treat the working-tree
-				// side as empty in that case, matching how
-				// `git_head_content` handles binaries server-side.
-				diskAfterText = result.is_binary ? '' : result.text;
-			} catch {
-				// Real path no longer exists on disk (externally
-				// deleted after the diff tab opened). Empty string
-				// paints the whole file as a deletion, which is
-				// the honest answer.
-				if (targetPath !== path) {
-					return;
-				}
-				diskAfterText = '';
-			}
-		})();
-	});
-
-	// Render (and re-render) whenever any of the inputs change.
-	// `render` is Pierre's "accept this new state" call — internal
-	// diffing re-runs with the new file pair. Guarded on
-	// `headText !== null` so the first paint waits for HEAD.
-	$effect(() => {
-		const inst = instance;
-		if (!inst || !host || headText === null || headPath !== targetPath) {
-			return;
-		}
-		// Pick the most authoritative "after" side we have. Order:
-		// 1) Deleted buffer → empty (the file is gone; its HEAD
-		//    side renders as one big deletion block).
-		// 2) Diff tab with live editor buffer → live buffer.
-		// 3) Diff tab without an open editor → on-disk snapshot.
-		// 4) Neither — this path shouldn't be reachable now that
-		//    the legacy in-place toggle is gone; guard with `''`.
-		let afterContents: string;
-		if (file.isDeleted) {
-			afterContents = '';
-		} else if (file.isDiffTab) {
-			if (liveAfterText !== null) {
-				afterContents = liveAfterText;
-			} else if (diskAfterText !== null) {
-				afterContents = diskAfterText;
-			} else {
-				return;
-			}
+			head = cached ?? '';
+		} else if (file.isDeleted) {
+			head = file.text;
 		} else {
-			afterContents = file.text;
+			const fetched = await ipc.fs.gitHeadContent(path);
+			if (token !== buildToken) {
+				return;
+			}
+			head = fetched ?? '';
 		}
-		const oldFile: FileContents = {
-			name: targetName,
-			contents: headText,
-		};
-		const newFile: FileContents = {
-			name: targetName,
-			contents: afterContents,
-		};
-		inst.render({ oldFile, newFile, containerWrapper: host });
-	});
 
-	// Flip Pierre's theme without rebuilding the component when
-	// the IDE's effective theme changes.
+		if (token !== buildToken) {
+			return;
+		}
+
+		// Deleted buffers have no working tree to edit, so right
+		// side renders empty and is read-only. Everything else gets
+		// the live `file.text` and the same edit affordances as
+		// the regular editor.
+		const rightText = file.isDeleted ? '' : text;
+
+		currentHead = head;
+
+		// `Escape` flips the buffer back to the editor view. Wrapped
+		// in `Prec.low` so CM's built-in Escape bindings (close the
+		// search panel, dismiss an autocompletion popover) take
+		// priority — only a "plain" Escape with no panel / popup
+		// open trickles down to us. Bound on both sides so the
+		// gesture works regardless of which pane currently has
+		// keyboard focus. Skipped entirely for deleted buffers
+		// because there's no editor mode to flip *to*.
+		const escapeBinding = file.isDeleted
+			? []
+			: [
+					Prec.low(
+						keymap.of([
+							{
+								key: 'Escape',
+								run: () => {
+									workspace.setDiffMode(file.path, false);
+									return true;
+								},
+							},
+						]),
+					),
+				];
+
+		const sharedLeft: Extension[] = [
+			lineNumbers(),
+			EditorState.readOnly.of(true),
+			EditorView.editable.of(false),
+			highlightSelectionMatches(),
+			highlightTabs(),
+			themeA.of(moonEditorTheme(workspace.effectiveTheme)),
+			langA.of(lang),
+			ecA.of(editorConfigExtensions(ec)),
+			...escapeBinding,
+		];
+
+		// LSP wiring: the buffer's `didOpen` was already issued by
+		// `workspace.openFile`, and Editor + DiffView are mutually
+		// exclusive for any given path (EditorPane mounts one or
+		// the other based on `diffModeFor`), so wiring the same
+		// hover / completion / goto-def adapters into the
+		// MergeView's right-hand editor doesn't risk a duplicate
+		// `didOpen`. Edits route through `workspace.updateText` →
+		// `lspScheduleUpdate` exactly like the editor view, and
+		// the diagnostics list re-renders below via `applyDiagnostics`.
+		// Deleted buffers skip the whole stack: there's no live
+		// LSP open for a path that isn't on disk.
+		const lspExtensions: Extension[] = file.isDeleted
+			? []
+			: [
+					filePathFacet.of(path),
+					...lspDiagnosticsExtension(),
+					lspHoverExtension(),
+					lspGotoDefinitionExtension({
+						jumpTo: (target, position, folder) => workspace.jumpTo(target, position, side, folder),
+						resolveExternalUri: (uri) => workspace.resolveExternalUri(uri),
+						flash: (msg) => workspace.flash(msg),
+					}),
+					autocompletion({
+						activateOnTyping: false,
+						override: [lspCompletionSource],
+					}),
+				];
+
+		const rightExtensions: Extension[] = [
+			lineNumbers(),
+			highlightActiveLine(),
+			highlightActiveLineGutter(),
+			bracketMatching(),
+			closeBrackets(),
+			indentOnInput(),
+			history(),
+			highlightSelectionMatches(),
+			highlightTabs(),
+			...lspExtensions,
+			keymap.of([
+				// Alt+Left / Alt+Right ride the global handler in
+				// `App.svelte` so they swallow consistently across
+				// view kinds (no fallback to CM word-motion).
+				...closeBracketsKeymap,
+				...defaultKeymap,
+				...historyKeymap,
+				...searchKeymap,
+				...completionKeymap,
+				indentWithTab,
+				// F7 / Shift-F7 mirror the CodeMirror reference
+				// merge example. Quick way to hop between hunks
+				// without leaving the keyboard.
+				{ key: 'F7', run: goToNextChunk },
+				{ key: 'Shift-F7', run: goToPreviousChunk },
+			]),
+			themeB.of(moonEditorTheme(workspace.effectiveTheme)),
+			langB.of(lang),
+			ecB.of(editorConfigExtensions(ec)),
+			...escapeBinding,
+			EditorView.updateListener.of((update) => {
+				if (!update.docChanged) {
+					return;
+				}
+				const next = update.state.doc.toString();
+				// Pipe edits through the same `updateText` path as
+				// the regular editor — sets isDirty, lets the tab
+				// strip render the dirty dot, and (because we share
+				// the OpenFile buffer with the editor view) keeps
+				// state coherent across the diff/edit toggle.
+				workspace.updateText(path, next);
+			}),
+			...(file.isDeleted ? [EditorState.readOnly.of(true), EditorView.editable.of(false)] : []),
+		];
+
+		merge = new MergeView({
+			a: { doc: head, extensions: sharedLeft },
+			b: { doc: rightText, extensions: rightExtensions },
+			parent: host,
+			gutter: true,
+			highlightChanges: true,
+			collapseUnchanged: { margin: 3, minSize: 4 },
+			revertControls: 'a-to-b',
+		});
+	}
+
+	// External text edits to the right-side buffer (e.g. save-time
+	// pipeline rewrite, or the Editor view editing the same buffer
+	// while we're hidden) need to reach the MergeView's right editor
+	// without rebuilding state. Guard on equality so our own
+	// updateListener-driven dispatch doesn't ping-pong.
 	$effect(() => {
-		const themeType = workspace.effectiveTheme;
-		instance?.setThemeType(themeType);
+		const text = file.text;
+		const m = merge;
+		if (!m) {
+			return;
+		}
+		const current = m.b.state.doc.toString();
+		if (current === text) {
+			return;
+		}
+		m.b.dispatch({
+			changes: { from: 0, to: m.b.state.doc.length, insert: text },
+		});
 	});
 
-	// Pull focus into the diff pane whenever the workspace bumps
-	// `focusTick` (mirrors `Editor.svelte`'s pattern). Microtask-
-	// deferred so the click that triggered the bump — typically a
-	// context-menu select in the file tree — finishes settling
-	// its own focus first; without the defer the browser often
-	// hands focus back to the original click target.
+	// HEAD updates from `workspace.headByPath` (e.g. fs watcher fired
+	// after `git commit` / `git checkout`). Keep `currentHead` in
+	// lockstep with the dispatched doc so the next reactive run
+	// short-circuits when nothing actually changed.
+	$effect(() => {
+		const cached = workspace.headByPath.get(file.path);
+		const m = merge;
+		if (!m || cached === undefined) {
+			return;
+		}
+		const head = cached ?? '';
+		if (currentHead === head) {
+			return;
+		}
+		currentHead = head;
+		m.a.dispatch({
+			changes: { from: 0, to: m.a.state.doc.length, insert: head },
+		});
+	});
+
+	$effect(() => {
+		const mode = workspace.effectiveTheme;
+		const m = merge;
+		if (!m) {
+			return;
+		}
+		m.a.dispatch({ effects: themeA.reconfigure(moonEditorTheme(mode)) });
+		m.b.dispatch({ effects: themeB.reconfigure(moonEditorTheme(mode)) });
+	});
+
+	// LSP diagnostics: push the latest list for this path into the
+	// right-side editor's lint state. Mirror of `Editor.svelte`'s
+	// effect; the same backend cache (`workspace.diagnostics`) feeds
+	// both views so flipping diff ↔ source carries the squigglies
+	// across without re-fetching.
+	$effect(() => {
+		const m = merge;
+		if (!m || file.isDeleted) {
+			return;
+		}
+		const list = workspace.diagnostics.get(file.path) ?? [];
+		applyDiagnostics(m.b, list);
+	});
+
+	$effect(() => {
+		const ec = workspace.editorConfigFor(file.path);
+		const m = merge;
+		if (!m) {
+			return;
+		}
+		m.a.dispatch({ effects: ecA.reconfigure(editorConfigExtensions(ec)) });
+		m.b.dispatch({ effects: ecB.reconfigure(editorConfigExtensions(ec)) });
+	});
+
+	// Pull keyboard focus into the right-side editor (the editable
+	// one) whenever the workspace bumps focusTick for our side.
+	// Mirrors `Editor.svelte`'s pattern; the microtask defer lets
+	// the click that triggered the bump finish settling first so
+	// the browser doesn't hand focus back to the original target.
 	$effect(() => {
 		workspace.focusTick;
 		if (workspace.focusedSide !== side) {
 			return;
 		}
-		const el = wrapper;
-		if (!el) {
+		const m = merge;
+		if (!m) {
 			return;
 		}
-		queueMicrotask(() => el.focus({ preventScroll: true }));
+		queueMicrotask(() => m.b.focus());
 	});
+
+	function editorConfigExtensions(ec: EditorConfig): Extension {
+		const unit = ec.indent_style === 'tab' ? '\t' : ' '.repeat(Math.max(1, ec.indent_size));
+		return [EditorState.tabSize.of(Math.max(1, ec.tab_width)), indentUnit.of(unit)];
+	}
 </script>
 
-<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-<div class="diff-view" tabindex="0" bind:this={wrapper}>
+<div class="diff-view">
 	<div class="diff-host" bind:this={host}></div>
 </div>
 
@@ -234,11 +339,32 @@
 		flex-direction: column;
 		background: var(--m-bg);
 		color: var(--m-fg);
-		overflow: auto;
+		overflow: hidden;
 	}
 	.diff-host {
 		flex: 1;
 		min-width: 0;
 		min-height: 0;
+		display: flex;
+		overflow: hidden;
+	}
+	/* `@codemirror/merge` ships its own layout: the outer `.cm-mergeView`
+	 * is `overflow-y: auto`, the two `.cm-mergeViewEditor` columns are
+	 * `flex: 1 0; overflow: hidden`, and inner `.cm-scroller`s render at
+	 * natural height so the outer container drives a single, aligned
+	 * scrollbar across both sides. We just need to bound the outer
+	 * height — the rest of the chain is already correct. Don't set
+	 * `display` or `flex-direction` here, that clobbers the package
+	 * defaults and silently kills scrolling. */
+	.diff-host :global(.cm-mergeView) {
+		flex: 1;
+		min-width: 0;
+		min-height: 0;
+	}
+	.diff-host :global(.cm-editor.cm-focused) {
+		outline: none;
+	}
+	.diff-host :global(.cm-mergeViewEditor) {
+		min-width: 0;
 	}
 </style>

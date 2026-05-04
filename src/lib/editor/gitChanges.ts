@@ -325,7 +325,41 @@ class GitOverviewPlugin implements PluginValue {
 
 const gitOverviewPlugin = ViewPlugin.fromClass(GitOverviewPlugin);
 
-export function gitChangesExtension(): Extension {
+/**
+ * Optional config injected by `Editor.svelte`:
+ *
+ * - `onGutterClick`: invoked when the user clicks a per-line marker
+ *   in the change gutter (added / modified / deletion wedge). The
+ *   editor passes a closure that toggles diff mode for the buffer,
+ *   so the gutter doubles as an "open diff" affordance for the line
+ *   you cared about. Clicks on rows without a marker are ignored.
+ */
+export type GitChangesConfig = {
+	onGutterClick?: () => void;
+};
+
+export function gitChangesExtension(config: GitChangesConfig = {}): Extension {
+	const onGutterClick = config.onGutterClick;
+	const handlers = onGutterClick
+		? {
+				click: (view: EditorView, line: { from: number }) => {
+					const changes = view.state.field(gitChangesField, false);
+					if (!changes) {
+						return false;
+					}
+					const lineNo = view.state.doc.lineAt(line.from).number;
+					// Only react on rows that actually have a change
+					// marker — clicks on the spacer (clean rows)
+					// should fall through to CodeMirror's default
+					// gutter handling.
+					if (markerFor(changes, lineNo) === null) {
+						return false;
+					}
+					onGutterClick();
+					return true;
+				},
+			}
+		: {};
 	return [
 		gitChangesField,
 		gutter({
@@ -344,6 +378,7 @@ export function gitChangesExtension(): Extension {
 			// Keep a constant-width gutter so the first appearance of
 			// a change doesn't nudge the editor content sideways.
 			initialSpacer: () => SPACER_MARKER,
+			domEventHandlers: handlers,
 		}),
 		gitOverviewPlugin,
 	];

@@ -21,15 +21,16 @@
 	});
 	// Diff-view wins over markdown-preview. A buffer hits the diff
 	// pane when it's either:
-	//   - a dedicated diff tab (synthetic `moon-diff:<path>` created
-	//     by "View diff" from the tree / palette), or
-	//   - a deleted-file tab (nothing to edit; showing the HEAD
-	//     blob as a diff is the only sensible view).
-	// Both cases live on `OpenFile` flags so EditorPane doesn't
-	// need its own parallel toggle state.
-	const showDiff = $derived(
-		activeFile !== null && activeFile.kind === 'text' && (activeFile.isDiffTab || activeFile.isDeleted),
-	);
+	//   - in diff mode (the user toggled it via tab button / palette
+	//     / Ctrl-Shift-D / gutter click — `workspace.diffModes`), or
+	//   - a deleted-file tab (nothing to edit; the HEAD blob shown
+	//     as an against-empty diff is the only sensible view).
+	const showDiff = $derived.by(() => {
+		if (activeFile === null || activeFile.kind !== 'text') {
+			return false;
+		}
+		return activeFile.isDeleted || workspace.diffModeFor(activeFile.path);
+	});
 	const showMarkdownPreview = $derived(
 		activeFile !== null &&
 			activeFile.kind === 'text' &&

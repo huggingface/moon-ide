@@ -272,21 +272,28 @@ export const builtInCommands: Command[] = [
 		},
 	},
 	{
-		id: 'git.viewDiff',
-		title: 'Git: View Diff',
-		// Visible only when the active file is a **modified**
-		// working-tree change. Deleted files already render in diff
-		// view on their own, and untracked / added / ignored files
-		// have no `HEAD` side worth rendering. Diff tabs themselves
-		// hide the command — there's nothing to toggle *to* from
-		// within the diff.
+		id: 'git.toggleDiffView',
+		// Title flips with the current mode so the palette entry is
+		// self-describing. Deleted files always render in diff view,
+		// so the command isn't shown for them — there's no toggle
+		// to flip.
+		title: () => {
+			const path = workspace.activePath;
+			return path !== null && workspace.diffModeFor(path) ? 'Git: Hide Diff View' : 'Git: View Diff';
+		},
+		shortcut: 'Ctrl+Shift+D',
+		// Visible when the active file is a **modified** working-
+		// tree change (the only case where there's a meaningful HEAD
+		// vs working tree diff to flip into). Untracked / added /
+		// ignored files have no `HEAD` side. Deleted files are
+		// always in diff view — no toggle needed.
 		visible: () => {
 			const path = workspace.activePath;
 			if (path === null) {
 				return false;
 			}
 			const file = workspace.openFiles.find((f) => f.path === path);
-			if (!file || file.isDeleted || file.isDiffTab) {
+			if (!file || file.kind !== 'text' || file.isDeleted || file.isUntitled) {
 				return false;
 			}
 			const entry = workspace.gitStatusEntries.find((e) => e.path === path);
@@ -297,7 +304,7 @@ export const builtInCommands: Command[] = [
 			if (path === null) {
 				return;
 			}
-			void workspace.openDiffTab(path);
+			workspace.toggleDiffMode(path);
 		},
 	},
 ];

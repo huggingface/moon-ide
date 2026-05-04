@@ -121,6 +121,30 @@
 				palette.show('search');
 				return;
 			}
+			if (event.shiftKey && key === 'd') {
+				// Git: Toggle Diff View. Hidden by the command's
+				// own visibility check when there's nothing to
+				// diff (clean / untracked / added / deleted /
+				// untitled / non-text), so press-and-no-op is the
+				// honest fallback when the user fires it on a
+				// buffer that doesn't qualify. Always swallow so
+				// the press doesn't leak through to anything else.
+				event.preventDefault();
+				const path = workspace.activePath;
+				if (path === null) {
+					return;
+				}
+				const file = workspace.openFiles.find((f) => f.path === path);
+				if (!file || file.kind !== 'text' || file.isDeleted || file.isUntitled) {
+					return;
+				}
+				const status = workspace.gitStatusEntries.find((e) => e.path === path)?.status;
+				if (status !== 'modified') {
+					return;
+				}
+				workspace.toggleDiffMode(path);
+				return;
+			}
 			if (key === '\\') {
 				event.preventDefault();
 				if (workspace.hasSplit) {

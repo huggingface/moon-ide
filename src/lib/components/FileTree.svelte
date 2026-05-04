@@ -205,13 +205,14 @@
 				id: 'view-diff',
 				label: 'View diff',
 				onSelect: () => {
-					// Opens a dedicated diff tab alongside any
-					// existing editor tab for this file, so
-					// `Alt+Left` walks back to the regular editor
-					// view. Idempotent: if a diff tab is already
-					// open for this path, it gets focused rather
-					// than duplicated.
-					void workspace.openDiffTab(item.path);
+					// Single-tab + mode toggle: flipping the diff
+					// flag and opening the file lands the user in
+					// the diff view of the same buffer the editor
+					// otherwise renders. The toggle is also exposed
+					// as a tab button (Source / Diff) and a
+					// keybind (Ctrl/Cmd-Shift-D).
+					workspace.setDiffMode(item.path, true);
+					void workspace.openFile(item.path);
 				},
 			});
 		}

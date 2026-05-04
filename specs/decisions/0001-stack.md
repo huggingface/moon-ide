@@ -20,7 +20,7 @@ We need to pick a stack for a team-specialized IDE built from scratch with these
 - **Frontend**: Svelte 5 + TypeScript + Vite.
 - **Editor**: CodeMirror 6.
 - **File tree**: `@pierre/trees` (vanilla mode entry).
-- **Diff view**: `@pierre/diffs`.
+- **Diff view**: `@codemirror/merge` — CodeMirror's official side-by-side merge view. Reuses the editor's existing language / theme / editorconfig extensions on both sides; the right (working tree) side is editable so the user can fix things up inline. We tried `@pierre/diffs` first (Shiki-rendered, prettier) but found the Shiki cold-start dominated open-tab latency on larger files, and once we wanted edit-in-place that pushed us to a CM-native solution anyway.
 - **Terminal**: xterm.js front, `portable-pty` back.
 - **Git**: `gix` (gitoxide).
 - **Indexing**: `tantivy`.

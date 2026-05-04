@@ -21,17 +21,57 @@
 			return file ? [file] : [];
 		}),
 	);
-	// Source/Preview switcher only shows up for the active markdown
-	// tab. Per-buffer (not per-pane), see `WorkspaceState.previewModeFor`
-	// for the rationale.
+	// Right-edge view toggle: a single tri-state group covering
+	// `Source` / `Preview` / `Diff`. Per-buffer (not per-pane), see
+	// `WorkspaceState.previewModeFor` and `diffModeFor` for the
+	// rationale. Buttons that don't apply to the active buffer
+	// drop out of the strip.
+	type ViewMode = 'source' | 'preview' | 'diff';
+
+	const activeFile = $derived.by(() => {
+		if (activePath === null) {
+			return null;
+		}
+		return workspace.openFiles.find((f) => f.path === activePath) ?? null;
+	});
 	const activeIsMarkdown = $derived(activePath !== null && isMarkdownPath(activePath));
 	const previewMode: MarkdownView = $derived(activePath !== null ? workspace.previewModeFor(activePath) : 'source');
+	const diffMode: boolean = $derived(activePath !== null && workspace.diffModeFor(activePath));
+	const activeIsDeleted = $derived(activeFile?.kind === 'text' && activeFile.isDeleted);
+	// "Diff" button is meaningful only when there's something to
+	// diff: a tracked file with working-tree differences (`modified`
+	// or `deleted`). Untracked / added / clean / ignored / image
+	// buffers don't surface it. Deleted buffers are *always* in
+	// diff mode (no editor view exists), so the toggle would just
+	// be a noisy "Source" button that does nothing — hide it too.
+	const canDiff = $derived.by(() => {
+		if (activeFile === null || activeFile.kind !== 'text') {
+			return false;
+		}
+		if (activeFile.isUntitled || activeFile.isDeleted) {
+			return false;
+		}
+		const status = workspace.gitStatusEntries.find((e) => e.path === activePath)?.status;
+		return status === 'modified';
+	});
+	const currentView: ViewMode = $derived(diffMode ? 'diff' : previewMode === 'preview' ? 'preview' : 'source');
+	const showViewToggle = $derived(!activeIsDeleted && (activeIsMarkdown || canDiff));
 
-	function setPreview(mode: MarkdownView) {
+	function setView(mode: ViewMode) {
 		if (activePath === null) {
 			return;
 		}
-		workspace.setPreviewMode(activePath, mode);
+		// `diff` is exclusive with markdown preview: showDiff wins
+		// inside `EditorPane`, but we also flip `previewMode` to
+		// `source` when leaving diff so a re-enter into "Source"
+		// (from Diff) doesn't accidentally land in Preview just
+		// because that was the mode before.
+		if (mode === 'diff') {
+			workspace.setDiffMode(activePath, true);
+			return;
+		}
+		workspace.setDiffMode(activePath, false);
+		workspace.setPreviewMode(activePath, mode === 'preview' ? 'preview' : 'source');
 	}
 
 	// MIME type used to identify our own tab drags. The side payload
@@ -207,26 +247,40 @@
 			</div>
 		{/each}
 	</div>
-	{#if activeIsMarkdown}
-		<div class="view-toggle" role="group" aria-label="Markdown view">
+	{#if showViewToggle}
+		<div class="view-toggle" role="group" aria-label="View mode">
 			<button
 				type="button"
 				class="view-btn"
-				class:selected={previewMode === 'source'}
-				aria-pressed={previewMode === 'source'}
-				onclick={() => setPreview('source')}
+				class:selected={currentView === 'source'}
+				aria-pressed={currentView === 'source'}
+				onclick={() => setView('source')}
 			>
 				Source
 			</button>
-			<button
-				type="button"
-				class="view-btn"
-				class:selected={previewMode === 'preview'}
-				aria-pressed={previewMode === 'preview'}
-				onclick={() => setPreview('preview')}
-			>
-				Preview
-			</button>
+			{#if activeIsMarkdown}
+				<button
+					type="button"
+					class="view-btn"
+					class:selected={currentView === 'preview'}
+					aria-pressed={currentView === 'preview'}
+					onclick={() => setView('preview')}
+				>
+					Preview
+				</button>
+			{/if}
+			{#if canDiff}
+				<button
+					type="button"
+					class="view-btn"
+					class:selected={currentView === 'diff'}
+					aria-pressed={currentView === 'diff'}
+					onclick={() => setView('diff')}
+					title="Show diff against HEAD (Ctrl+Shift+D)"
+				>
+					Diff
+				</button>
+			{/if}
 		</div>
 	{/if}
 </div>

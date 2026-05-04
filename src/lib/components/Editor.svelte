@@ -304,8 +304,18 @@
 			blameExtension(),
 			blameCompartment.of(blameFacet.of(workspace.blameByPath.get(file.path) ?? null)),
 			// Git-change wedges in a dedicated gutter, paired with the
-			// HEAD facet populated from `workspace.headByPath`.
-			gitChangesExtension(),
+			// HEAD facet populated from `workspace.headByPath`. A
+			// click on any per-line marker flips the buffer into diff
+			// mode so the user can see the full chunk in context —
+			// matches "open diff" via the tab toggle / Ctrl-Shift-D /
+			// palette, just keyed off a more direct affordance.
+			gitChangesExtension({
+				onGutterClick: () => {
+					if (currentPath !== null) {
+						workspace.setDiffMode(currentPath, true);
+					}
+				},
+			}),
 			headCompartment.of(headTextFacet.of(workspace.headByPath.get(file.path) ?? null)),
 			// Autocompletion popover. `activateOnTyping: false` keeps
 			// it off the typing path so we don't leak the built-in
