@@ -57,20 +57,31 @@ function moonTheme(dark: boolean): Extension {
 				backgroundColor: 'var(--m-accent)',
 				color: 'var(--m-bg)',
 			},
-			// LSP hover popover. Padded + wrapped so Markdown-formatted
-			// hover bodies (signatures, docstrings, fenced code blocks)
-			// don't run off the edge of the tooltip. `max-width` caps at
-			// 60ch which matches the rule-of-thumb for prose legibility
-			// and tends to keep hover cards from spanning the full
-			// window on wide monitors.
+			// LSP hover popover. Acts as the *tooltip container* for
+			// an element whose inner DOM is rendered Markdown (it
+			// also carries the shared `markdown-body` class — see
+			// `editor/lsp.ts`). Only things that genuinely belong to
+			// "this is a CodeMirror tooltip" live here — sizing caps,
+			// padding, base font size. Headings / lists / code-block
+			// chrome come from the shared `.markdown-body` rules in
+			// `src/styles.css`.
 			'.cm-lsp-hover': {
-				padding: '6px 8px',
-				maxWidth: '60ch',
-				whiteSpace: 'pre-wrap',
+				padding: '8px 10px',
+				maxWidth: '72ch',
+				maxHeight: '360px',
 				overflow: 'auto',
 				fontSize: '12px',
-				lineHeight: '1.4',
+				lineHeight: '1.5',
 				color: 'var(--m-fg)',
+			},
+			// Keep the first and last children of a hover tight
+			// against the padding — Markdown's default 0.6em margin
+			// on `<p>` / `<pre>` / `<ul>` looks odd in a tooltip.
+			'.cm-lsp-hover > :first-child': {
+				marginTop: '0',
+			},
+			'.cm-lsp-hover > :last-child': {
+				marginBottom: '0',
 			},
 			// Search panel (Ctrl+F) and goto-line panel. CM6 ships its
 			// own light-grey defaults that look out of place in either

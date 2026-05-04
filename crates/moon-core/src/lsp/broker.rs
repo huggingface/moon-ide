@@ -128,7 +128,10 @@ impl LspBroker {
 				let _ = self.events.send(LspServerEvent::StatusChanged(mp::LspStatusEvent {
 					language_id: spec.language_id.to_owned(),
 					status: mp::LspServerStatus::NotAvailable,
-					detail: Some(format!("install `{}` on PATH", spec.bin_name)),
+					// Surface the install command directly in the pill tooltip
+					// so the user has copy-pasteable next steps without
+					// leaving the IDE.
+					detail: Some(spec.install_hint.to_owned()),
 				}));
 				Ok(None)
 			}

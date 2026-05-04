@@ -88,9 +88,10 @@ Architectural spec: [lsp.md](lsp.md). The [`tower-lsp` vs thin-client open quest
 **What has landed so far** (see `specs/test-plans/0024-*.md`):
 
 - Stage 1 slice for **TypeScript only**: diagnostics (red squigglies + gutter markers + status-bar error/warn counts), hover tooltip, explicit-invocation completion source registered on the existing `autocompletion` extension.
-- `moon-core::lsp` module: Content-Length framing, thin JSON-RPC client with actor-pattern reader/writer, per-language `LspServer` actor, multi-language `LspBroker` with lazy spawn and graceful `NotAvailable` fallback when the server binary isn't on PATH.
+- Server is `tsgo` (Microsoft's native TS 7 port, shipped as `@typescript/native-preview` — already in moon-ide's devDependencies). Project-local discovery walks up from the active folder looking for `node_modules/.bin/tsgo` before falling back to `$PATH`, so a fresh `bun install` is all a contributor needs.
+- `moon-core::lsp` module: Content-Length framing, thin JSON-RPC client with actor-pattern reader/writer, per-language `LspServer` actor, multi-language `LspBroker` with lazy spawn and graceful `NotAvailable` fallback when no copy of the binary can be found anywhere.
 - `moon-protocol::lsp` carries moon-shaped subsets of upstream LSP types so the UI never sees raw `lsp-types`.
-- Per-language availability pill in the status bar (`starting…`, `not available`, `crashed`, `stopped`) — `running` stays invisible.
+- Per-language availability pill in the status bar (`starting…`, `not available`, `crashed`, `stopped`) — `running` stays invisible. Tooltip reveals the resolved binary path (project-local vs global) on hover.
 
 **Still outstanding for this phase**: Rust (rust-analyzer), Svelte (svelte-language-server), CSS / HTML / JSON / MD servers; go-to-definition with Ctrl-click underline; find-references panel; rename; code actions; navigation history (Alt-Left / Alt-Right); incremental document sync; signature help.
 

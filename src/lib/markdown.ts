@@ -1,11 +1,15 @@
 import MarkdownIt from 'markdown-it';
 import DOMPurify from 'dompurify';
+import { extractFenceLanguages, highlightCode, loadHighlighters } from './editor/highlightCode';
 
 // Markdown rendering pipeline. Intentionally narrow: we want a
 // preview that's safe to drop into `innerHTML`, not a full GitHub-
-// flavored renderer. Anything fancier (syntax highlighting in code
-// fences, math, mermaid, footnotes) is a follow-up — add it when
-// someone on the team asks.
+// flavored renderer. Anything fancier (math, mermaid, footnotes) is
+// a follow-up — add it when someone on the team asks.
+//
+// Fenced code blocks are syntax-highlighted via CodeMirror's own
+// grammars (see `./editor/highlightCode.ts`). Same parser → same
+// colors as the live editor.
 //
 // XSS posture (defense in depth):
 //   1. `html: false` tells markdown-it to escape any raw HTML in the
@@ -16,8 +20,10 @@ import DOMPurify from 'dompurify';
 //      goes through markdown-it's URL validator, which already
 //      rejects `javascript:` and `vbscript:`.
 //   3. DOMPurify runs on the resulting HTML and strips anything
-//      markdown-it might have let through (it's been audited; we
-//      have not).
+//      markdown-it (or our highlighter's span injection) might have
+//      let through (it's been audited; we have not). We allow the
+//      `class` attribute explicitly so syntax-highlighter spans
+//      survive the sanitiser.
 //
 // We render once per source change. The component caches the result
 // so toggling between Source and Preview without edits is free.
@@ -27,6 +33,12 @@ const md = new MarkdownIt({
 	linkify: false,
 	breaks: false,
 	typographer: false,
+	// `highlight` must be synchronous. Callers preload grammars via
+	// `loadHighlighters` before invoking `renderMarkdown`; inside the
+	// synchronous render `highlightCode` hits the cache and emits
+	// coloured HTML or returns `''` to fall back to markdown-it's
+	// default `<pre><code>` rendering.
+	highlight: (code, lang) => highlightCode(code, lang),
 });
 
 // Force every link to open in a new context and carry safe `rel`
@@ -52,7 +64,19 @@ md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
 	return defaultLinkRender(tokens, idx, options, env, self);
 };
 
-export function renderMarkdown(source: string): string {
+/**
+ * Render a Markdown string to sanitised HTML. Async because the
+ * syntax-highlighter pre-loads the CodeMirror grammar for every
+ * fenced-code language before the synchronous render — dynamic
+ * imports can't happen mid-render.
+ *
+ * Typical call sites (`MarkdownView.svelte`, LSP hover popover) are
+ * already async, so the Promise is cheap. A second render for the
+ * same set of fence languages short-circuits immediately because
+ * the parser cache is hot.
+ */
+export async function renderMarkdown(source: string): Promise<string> {
+	await loadHighlighters(extractFenceLanguages(source));
 	const html = md.render(source);
 	return DOMPurify.sanitize(html, {
 		// Block any URI scheme that isn't on the known-safe list.

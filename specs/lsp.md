@@ -34,8 +34,9 @@ This mirrors the Phase 5 git layer's discipline: one translation wall between up
 └───────────┬─────────────────────┘
             │ LSP JSON-RPC over stdin/stdout
 ┌───────────▼─────────────────────┐
-│ typescript-language-server      │  ← child process; stderr → tracing::debug
-│   --stdio                       │
+│ tsgo --lsp --stdio              │  ← child process; stderr → tracing::debug
+│ (Microsoft TS 7 native port,    │
+│  @typescript/native-preview)    │
 └─────────────────────────────────┘
 ```
 
@@ -49,7 +50,7 @@ Resolves the corresponding open question in `architecture.md` (`tower-lsp` vs th
 
 ### One process per `(workspace, language_id)`
 
-Not per file, not global. `typescript-language-server` handles multi-tsconfig via internal tsserver project pools — firing up a server per file would defeat that cache and cost seconds of boot per open.
+Not per file, not global. `tsgo` (like `tsserver` before it) handles multi-tsconfig via internal project pools — firing up a server per file would defeat that cache and cost seconds of boot per open.
 
 Workspace close (the Tauri ExitRequested hook) calls `LspBroker::shutdown_all` which sends `shutdown` + `exit`, waits up to 2s per server, and drops. `kill_on_drop(true)` on the child is the escape hatch so even a wedged server can't outlive the IDE.
 
@@ -69,9 +70,28 @@ LSP's default. CodeMirror's native string offsets are UTF-16 code units too (JS 
 
 Switching the active folder drops the broker and rebuilds. The frontend's `openFile` handles re-issuing `didOpen` naturally — tabs that survive the switch will re-open against the new broker the first time the editor re-renders them. Not atomic across the switch; the user sees a short "starting…" pill and diagnostics return when tsserver finishes its first pass.
 
-### Binary discovery: PATH lookup only
+### TypeScript server: `tsgo`, not `typescript-language-server`
 
-`which::which("typescript-language-server")`. If it's missing, the broker caches a `NotAvailable` slot per language and emits `lsp:status { status: 'notavailable' }`. The status bar paints a quiet pill. We don't bundle a binary or auto-install — that's an unsolved trust question and `npm i -g typescript-language-server` is a one-liner. Phase 2 (containers) pre-installs it in `moon-base` so the container-backed story is pill-free.
+We target Microsoft's native TS 7 port (`@typescript/native-preview`, binary name `tsgo`) rather than the community `typescript-language-server` wrapper. Rationale:
+
+1. **Already installed.** `@typescript/native-preview` is in moon-ide's `devDependencies` for the `check:ts` script. Discovery finds it in `node_modules/.bin/tsgo` without any extra setup, and every contributor gets LSP on their first `bun install`.
+2. **Upstream alignment.** The `typescript-language-server` README states it expects to be superseded by TS 7 + tsgo. Adopting the native port now avoids a migration later.
+3. **No Node runtime.** `tsgo` is a prebuilt native binary distributed via npm's optionalDependencies (one per platform). For future container-backed workspaces that don't otherwise need Node, this removes a dependency.
+4. **Performance.** ~10× speed-up on the compile path, meaningful latency improvements on every LSP request. The whole stack (Rust host + Go language service + Tauri UI) is native.
+
+Trade-off: tsgo is still a preview channel. The `API over LSP implementation` PR (`microsoft/typescript-go#2302`) is in draft; a few LSP features may be incomplete or behave differently from `typescript-language-server`. If we hit a gap that blocks us, the migration path is a **one-string change** in `moon-core/src/lsp/server.rs`'s `TS_SERVER` spec — our client code is wire-protocol-agnostic.
+
+### Binary discovery: project-local first, then PATH
+
+`moon-core::lsp::server::discover_binary` walks up from the broker's root looking for `<ancestor>/node_modules/.bin/<bin_name>` at every level, then falls back to `which::which(bin_name)`. Matches Node's own resolution algorithm — so a pnpm-hoisted monorepo (single top-level `node_modules`) works the same as a classic per-package layout.
+
+The first match wins: a project-pinned copy always beats a global install. This lets a monorepo freeze a specific LSP version without affecting other projects on the same machine.
+
+On Windows we look for `<bin>.cmd` rather than `<bin>` because that's how npm's `.bin` wrapper lands on that platform. Spawning the `.cmd` is a regular `CreateProcess` call; no special handling needed.
+
+If nothing is found on disk, the broker caches a `NotAvailable` slot per language and emits `lsp:status { status: 'notavailable' }`. The status bar paints a quiet pill whose tooltip is the spec's `install_hint` field (e.g. `bun add -D @typescript/native-preview`) — copy-pasteable into a terminal.
+
+Phase 2 (containers) will pre-install the server in `moon-base` so the container-backed story is pill-free without relying on the host's package manager.
 
 ### Client capabilities are minimal
 

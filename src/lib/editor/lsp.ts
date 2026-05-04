@@ -25,6 +25,7 @@ import { setDiagnostics, type Diagnostic as CmDiagnostic, lintGutter } from '@co
 import { Facet, type Extension } from '@codemirror/state';
 import { EditorView, hoverTooltip, type Tooltip } from '@codemirror/view';
 import { ipc } from '../ipc';
+import { renderMarkdown } from '../markdown';
 import type { LspDiagnostic, LspSeverity } from '../protocol';
 import { lspLanguageFor } from './lspLanguage';
 
@@ -143,6 +144,16 @@ export function lspHoverExtension(): Extension {
 			if (!hover) {
 				return null;
 			}
+			// Pre-render here (async) so the synchronous `create`
+			// callback can hand CM the fully-baked DOM. Rendering
+			// inside `create` would leave a visible empty popover
+			// for a frame while grammars load on first use.
+			let html: string;
+			try {
+				html = await renderMarkdown(hover.contents);
+			} catch {
+				return null;
+			}
 			const { from, to } = hoverRange(view, hover.range, pos);
 			const tooltip: Tooltip = {
 				pos: from,
@@ -150,14 +161,14 @@ export function lspHoverExtension(): Extension {
 				above: true,
 				create: () => {
 					const dom = document.createElement('div');
-					dom.className = 'cm-lsp-hover';
-					// `workspace.renderMarkdown` doesn't exist yet; the
-					// backend has already normalised the contents to a
-					// Markdown string, so plain text render is enough
-					// for stage 1 (it preserves newlines and fenced
-					// blocks the UI CSS styles). Swapping in markdown-it
-					// is a one-liner when someone asks for rich hover.
-					dom.textContent = hover.contents;
+					// `markdown-body` picks up the shared Markdown CSS
+					// from `src/styles.css` (headings, lists, tables,
+					// blockquote, `<pre>` code-block chrome). The
+					// `cm-lsp-hover` class adds the tooltip-specific
+					// caps (max-width, max-height, padding) from
+					// `editor/theme.ts`.
+					dom.className = 'cm-lsp-hover markdown-body';
+					dom.innerHTML = html;
 					return { dom };
 				},
 			};

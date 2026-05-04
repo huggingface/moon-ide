@@ -1,11 +1,10 @@
 //! Per-language LSP server actor.
 //!
-//! One [`LspServer`] owns one child process (e.g.
-//! `typescript-language-server --stdio`), an [`LspClient`] on top of
-//! its stdio, and a map of open documents. Its public surface is
-//! narrow: `open` / `update` / `close` / `hover` / `completion`.
-//! Nothing here knows about multiple languages — the broker picks the
-//! right server for a language id.
+//! One [`LspServer`] owns one child process (e.g. `tsgo --lsp --stdio`),
+//! an [`LspClient`] on top of its stdio, and a map of open documents.
+//! Its public surface is narrow: `open` / `update` / `close` /
+//! `hover` / `completion`. Nothing here knows about multiple
+//! languages — the broker picks the right server for a language id.
 //!
 //! Lifecycle:
 //! 1. `LspServer::spawn` locates the binary, starts the child,
@@ -25,7 +24,7 @@
 //! the user log at INFO.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -50,16 +49,38 @@ pub enum LspServerEvent {
 /// Which binary to spawn for a given LSP language. One entry per
 /// language id we intend to support. For stage 1 only `typescript`
 /// is populated.
+///
+/// `install_hint` is what the status bar's "not available" pill
+/// suggests — short and actionable, no prose. On the happy path the
+/// hint is never shown; it only surfaces when discovery failed.
 pub struct LspBinarySpec {
 	pub language_id: &'static str,
 	pub bin_name: &'static str,
 	pub args: &'static [&'static str],
+	pub install_hint: &'static str,
 }
 
+/// TypeScript / JavaScript server.
+///
+/// We target `tsgo` (Microsoft's native Go port of TypeScript, shipped
+/// as `@typescript/native-preview`) rather than the community
+/// `typescript-language-server` wrapper. Two reasons:
+///
+/// 1. It's already in moon-ide's devDependencies (used by the
+///    `check:ts` script) — no extra setup cost. Discovery finds it in
+///    `node_modules/.bin/` automatically.
+/// 2. `typescript-language-server`'s own README says it expects to be
+///    superseded by TS 7 / `tsgo`. Adopting the native port now avoids
+///    a migration later and gets the ~10× speed-up for free.
+///
+/// If a project ships `typescript-language-server` instead, flip this
+/// spec — the LSP wire format is identical and nothing else has to
+/// change. See [`specs/lsp.md`].
 pub const TS_SERVER: LspBinarySpec = LspBinarySpec {
 	language_id: "typescript",
-	bin_name: "typescript-language-server",
-	args: &["--stdio"],
+	bin_name: "tsgo",
+	args: &["--lsp", "--stdio"],
+	install_hint: "bun add -D @typescript/native-preview",
 };
 
 pub struct LspServer {
@@ -80,18 +101,30 @@ struct DocState {
 
 impl LspServer {
 	/// Locate and spawn the server binary. Returns `Ok(None)` when
-	/// the binary is not on PATH — caller surfaces a
+	/// no copy can be found on disk — caller surfaces a
 	/// `NotAvailable` status instead of treating this as an error.
+	///
+	/// Discovery order:
+	/// 1. Walk up from `root` looking for `node_modules/.bin/<bin>`
+	///    (matching Node's own resolution algorithm — this also
+	///    handles pnpm-hoisted monorepos where `node_modules` lives
+	///    at the repo root rather than the active folder).
+	/// 2. `$PATH` lookup via `which`.
+	///
+	/// The first match wins. A project-pinned copy always beats a
+	/// global install, which is what the ecosystem expects (lets a
+	/// monorepo freeze a specific LSP version without affecting
+	/// other projects on the same machine).
 	pub async fn spawn(
 		spec: &LspBinarySpec,
 		root: Utf8PathBuf,
 		events: broadcast::Sender<LspServerEvent>,
 	) -> Result<Option<Arc<Self>>, LspClientError> {
-		let Some(resolved) = which::which(spec.bin_name).ok() else {
+		let Some(resolved) = discover_binary(spec.bin_name, root.as_std_path()) else {
 			tracing::info!(
 				bin = spec.bin_name,
 				lang = spec.language_id,
-				"lsp: binary not on PATH, server unavailable"
+				"lsp: binary not found in any node_modules or on PATH, server unavailable"
 			);
 			return Ok(None);
 		};
@@ -410,6 +443,50 @@ impl LspServer {
 	}
 }
 
+/// Locate `bin_name` on disk, preferring a project-local copy over a
+/// global install.
+///
+/// Walks up from `start` looking for `<ancestor>/node_modules/.bin/<bin_name>`
+/// at every level, then falls back to `which`. Matches Node's own
+/// `node_modules` resolution so a pnpm-hoisted monorepo (single
+/// top-level `node_modules`) resolves the same way as a classic
+/// per-package layout.
+///
+/// Returns `None` when nothing is found — caller treats that as
+/// `NotAvailable`.
+///
+/// Platform note: Node's `.bin` entry is a symlink to the real script
+/// on *nix (shebang resolved by the kernel) and a `.cmd` wrapper on
+/// Windows. We pick the right suffix so `tokio::process::Command`
+/// gets a spawn-able path on both.
+fn discover_binary(bin_name: &str, start: &Path) -> Option<PathBuf> {
+	let filename = if cfg!(windows) {
+		format!("{bin_name}.cmd")
+	} else {
+		bin_name.to_owned()
+	};
+
+	for ancestor in start.ancestors() {
+		let candidate = ancestor.join("node_modules").join(".bin").join(&filename);
+		if candidate.exists() {
+			tracing::debug!(
+				bin = bin_name,
+				path = %candidate.display(),
+				"lsp: resolved via project-local node_modules"
+			);
+			return Some(candidate);
+		}
+	}
+
+	match which::which(bin_name) {
+		Ok(path) => {
+			tracing::debug!(bin = bin_name, path = %path.display(), "lsp: resolved via PATH");
+			Some(path)
+		}
+		Err(_) => None,
+	}
+}
+
 fn path_to_file_uri(path: &Path) -> lt::Uri {
 	// `url::Url::from_file_path` handles the OS-specific cases
 	// (Windows drive letters, percent-escaping) correctly; we then
@@ -425,4 +502,90 @@ fn path_to_file_uri(path: &Path) -> lt::Uri {
 		tracing::warn!(path = %path.display(), error = %e, "lsp: failed to parse file URL as URI");
 		lt::Uri::from_str("file:///").expect("static parse")
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::fs;
+
+	#[cfg(unix)]
+	fn make_executable(path: &Path) {
+		use std::os::unix::fs::PermissionsExt;
+		let mut perms = fs::metadata(path).unwrap().permissions();
+		perms.set_mode(0o755);
+		fs::set_permissions(path, perms).unwrap();
+	}
+
+	#[cfg(not(unix))]
+	fn make_executable(_: &Path) {}
+
+	/// Binary nestled in the start directory itself resolves.
+	#[test]
+	fn discover_finds_binary_in_same_dir() {
+		let tmp = tempfile::tempdir().unwrap();
+		let bin_dir = tmp.path().join("node_modules").join(".bin");
+		fs::create_dir_all(&bin_dir).unwrap();
+		let bin_name = if cfg!(windows) { "my-lsp.cmd" } else { "my-lsp" };
+		let bin_path = bin_dir.join(bin_name);
+		fs::write(&bin_path, b"#!/bin/sh\n").unwrap();
+		make_executable(&bin_path);
+
+		let found = discover_binary("my-lsp", tmp.path());
+		assert_eq!(found.as_deref(), Some(bin_path.as_path()));
+	}
+
+	/// Binary in an ancestor directory resolves — mimics pnpm's
+	/// hoisted monorepo layout where `node_modules` lives at the
+	/// repo root, not the active subdirectory.
+	#[test]
+	fn discover_walks_up_to_ancestor_node_modules() {
+		let tmp = tempfile::tempdir().unwrap();
+		let bin_dir = tmp.path().join("node_modules").join(".bin");
+		fs::create_dir_all(&bin_dir).unwrap();
+		let bin_name = if cfg!(windows) { "my-lsp.cmd" } else { "my-lsp" };
+		let bin_path = bin_dir.join(bin_name);
+		fs::write(&bin_path, b"#!/bin/sh\n").unwrap();
+		make_executable(&bin_path);
+
+		// Start from a nested subfolder; discovery should walk up
+		// to tmp and find the bin there.
+		let nested = tmp.path().join("apps").join("web");
+		fs::create_dir_all(&nested).unwrap();
+
+		let found = discover_binary("my-lsp", &nested);
+		assert_eq!(found.as_deref(), Some(bin_path.as_path()));
+	}
+
+	/// A project-local copy beats whatever happens to be on PATH.
+	/// Regression guard: if someone ever "optimises" discovery by
+	/// checking PATH first, this test flips red.
+	#[test]
+	fn discover_prefers_project_local_over_path() {
+		let tmp = tempfile::tempdir().unwrap();
+		let bin_dir = tmp.path().join("node_modules").join(".bin");
+		fs::create_dir_all(&bin_dir).unwrap();
+		// Pick a binary every CI box has on PATH (sh/cmd.exe) so the
+		// test's "beats PATH" assertion is actually observable.
+		let (probe_name, probe_file) = if cfg!(windows) {
+			("cmd", "cmd.cmd")
+		} else {
+			("sh", "sh")
+		};
+		let local = bin_dir.join(probe_file);
+		fs::write(&local, b"#!/bin/sh\n").unwrap();
+		make_executable(&local);
+
+		let found = discover_binary(probe_name, tmp.path()).expect("project-local should resolve");
+		assert_eq!(found, local, "project-local copy must win over PATH");
+	}
+
+	/// Missing binary returns None rather than erroring — that's the
+	/// contract the broker relies on to surface `NotAvailable`.
+	#[test]
+	fn discover_returns_none_when_missing_everywhere() {
+		let tmp = tempfile::tempdir().unwrap();
+		let found = discover_binary("definitely-not-a-real-lsp-server-xyzzy", tmp.path());
+		assert!(found.is_none());
+	}
 }

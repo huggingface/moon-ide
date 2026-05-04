@@ -6,10 +6,26 @@
 	type Props = { file: OpenFile };
 	let { file }: Props = $props();
 
-	// Render is pure of `file.text`, so `$derived` memoises across
-	// re-renders that don't touch the source. Source-mode toggles back
-	// and forth pay nothing for the round trip.
-	const html = $derived(renderMarkdown(file.text));
+	// `renderMarkdown` is async because it pre-loads the CM grammar for
+	// every fenced-code language in the source before handing to
+	// markdown-it (dynamic imports can't happen mid-render). The
+	// effect races naturally: if `file.text` changes before the
+	// previous render resolves, `stale` flips and the older result is
+	// dropped on the floor. A `$derived` can't express this.
+	let html = $state('');
+	$effect(() => {
+		let stale = false;
+		const source = file.text;
+		void (async () => {
+			const rendered = await renderMarkdown(source);
+			if (!stale) {
+				html = rendered;
+			}
+		})();
+		return () => {
+			stale = true;
+		};
+	});
 
 	// Schemes that `opener:default` permits via `openUrl` — keep this
 	// list in sync with that capability set. Anything else with a
@@ -97,6 +113,10 @@
 </div>
 
 <style>
+	/* Most `.markdown-body` rules live in `src/styles.css` so the LSP
+	   hover popover inherits the same look — MarkdownView keeps only
+	   the layout-specific bits (scrolling wrapper, reading-width
+	   column, generous padding) that belong to this view. */
 	.preview {
 		flex: 1;
 		min-width: 0;
@@ -109,103 +129,6 @@
 		max-width: 880px;
 		margin: 0 auto;
 		padding: 32px 40px 80px;
-		font-family: var(--m-font-ui);
 		font-size: 14px;
-		line-height: 1.6;
-	}
-	.markdown-body :global(h1),
-	.markdown-body :global(h2),
-	.markdown-body :global(h3),
-	.markdown-body :global(h4),
-	.markdown-body :global(h5),
-	.markdown-body :global(h6) {
-		margin: 1.6em 0 0.6em;
-		line-height: 1.25;
-		font-weight: 600;
-	}
-	.markdown-body :global(h1):first-child,
-	.markdown-body :global(h2):first-child {
-		margin-top: 0;
-	}
-	.markdown-body :global(h1) {
-		font-size: 1.8em;
-		border-bottom: 1px solid var(--m-border);
-		padding-bottom: 0.3em;
-	}
-	.markdown-body :global(h2) {
-		font-size: 1.4em;
-		border-bottom: 1px solid var(--m-border);
-		padding-bottom: 0.25em;
-	}
-	.markdown-body :global(h3) {
-		font-size: 1.2em;
-	}
-	.markdown-body :global(p),
-	.markdown-body :global(ul),
-	.markdown-body :global(ol),
-	.markdown-body :global(blockquote),
-	.markdown-body :global(table) {
-		margin: 0.6em 0;
-	}
-	.markdown-body :global(ul),
-	.markdown-body :global(ol) {
-		padding-left: 1.6em;
-	}
-	.markdown-body :global(li + li) {
-		margin-top: 0.2em;
-	}
-	.markdown-body :global(code) {
-		font-family: var(--m-font-mono);
-		font-size: 0.92em;
-		background: var(--m-bg-overlay);
-		padding: 0.15em 0.35em;
-		border-radius: 3px;
-	}
-	.markdown-body :global(pre) {
-		background: var(--m-bg-1);
-		border: 1px solid var(--m-border);
-		border-radius: 4px;
-		padding: 12px 14px;
-		overflow-x: auto;
-		margin: 0.8em 0;
-	}
-	.markdown-body :global(pre code) {
-		background: transparent;
-		padding: 0;
-	}
-	.markdown-body :global(a) {
-		color: var(--m-accent);
-		text-decoration: none;
-	}
-	.markdown-body :global(a:hover) {
-		text-decoration: underline;
-	}
-	.markdown-body :global(blockquote) {
-		border-left: 3px solid var(--m-border);
-		color: var(--m-fg-muted);
-		padding: 0.2em 0.8em;
-		margin-left: 0;
-	}
-	.markdown-body :global(hr) {
-		border: none;
-		border-top: 1px solid var(--m-border);
-		margin: 1.4em 0;
-	}
-	.markdown-body :global(table) {
-		border-collapse: collapse;
-		width: 100%;
-		font-size: 0.95em;
-	}
-	.markdown-body :global(th),
-	.markdown-body :global(td) {
-		border: 1px solid var(--m-border);
-		padding: 6px 10px;
-		text-align: left;
-	}
-	.markdown-body :global(th) {
-		background: var(--m-bg-1);
-	}
-	.markdown-body :global(img) {
-		max-width: 100%;
 	}
 </style>

@@ -179,3 +179,199 @@ button:focus-visible {
 ::-webkit-scrollbar-thumb:hover {
 	background: var(--m-border-strong);
 }
+
+/* Shared rendered-Markdown styles.
+ *
+ * Used by the `.md` file viewer (`MarkdownView.svelte`) and the LSP
+ * hover popover (`editor/lsp.ts`, built via DOM APIs). Both mount
+ * sanitised HTML inside an element with class `markdown-body` and
+ * inherit this stylesheet. Keeping the styles global (not scoped to
+ * the Svelte component) is what lets the hover popover share them
+ * without duplicating CSS — it's not a Svelte component, it's a
+ * CodeMirror tooltip. */
+.markdown-body {
+	font-family: var(--m-font-ui);
+	line-height: 1.6;
+	color: var(--m-fg);
+}
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4,
+.markdown-body h5,
+.markdown-body h6 {
+	margin: 1.6em 0 0.6em;
+	line-height: 1.25;
+	font-weight: 600;
+}
+.markdown-body h1:first-child,
+.markdown-body h2:first-child,
+.markdown-body h3:first-child {
+	margin-top: 0;
+}
+.markdown-body h1 {
+	font-size: 1.8em;
+	border-bottom: 1px solid var(--m-border);
+	padding-bottom: 0.3em;
+}
+.markdown-body h2 {
+	font-size: 1.4em;
+	border-bottom: 1px solid var(--m-border);
+	padding-bottom: 0.25em;
+}
+.markdown-body h3 {
+	font-size: 1.2em;
+}
+.markdown-body p,
+.markdown-body ul,
+.markdown-body ol,
+.markdown-body blockquote,
+.markdown-body table {
+	margin: 0.6em 0;
+}
+.markdown-body ul,
+.markdown-body ol {
+	padding-left: 1.6em;
+}
+.markdown-body li + li {
+	margin-top: 0.2em;
+}
+.markdown-body code {
+	font-family: var(--m-font-mono);
+	font-size: 0.92em;
+	background: var(--m-bg-overlay);
+	padding: 0.15em 0.35em;
+	border-radius: 3px;
+}
+.markdown-body pre {
+	background: var(--m-bg-1);
+	border: 1px solid var(--m-border);
+	border-radius: 4px;
+	padding: 12px 14px;
+	overflow-x: auto;
+	margin: 0.8em 0;
+	font-family: var(--m-font-mono);
+	font-size: 0.9em;
+	line-height: 1.5;
+}
+.markdown-body pre code {
+	background: transparent;
+	padding: 0;
+	font-size: inherit;
+}
+.markdown-body a {
+	color: var(--m-accent);
+	text-decoration: none;
+}
+.markdown-body a:hover {
+	text-decoration: underline;
+}
+.markdown-body blockquote {
+	border-left: 3px solid var(--m-border);
+	color: var(--m-fg-muted);
+	padding: 0.2em 0.8em;
+	margin-left: 0;
+}
+.markdown-body hr {
+	border: none;
+	border-top: 1px solid var(--m-border);
+	margin: 1.4em 0;
+}
+.markdown-body table {
+	border-collapse: collapse;
+	width: 100%;
+	font-size: 0.95em;
+}
+.markdown-body th,
+.markdown-body td {
+	border: 1px solid var(--m-border);
+	padding: 6px 10px;
+	text-align: left;
+}
+.markdown-body th {
+	background: var(--m-bg-1);
+}
+.markdown-body img {
+	max-width: 100%;
+}
+
+/* Syntax highlighting for fenced code blocks. Classes are emitted by
+ * `@lezer/highlight`'s `classHighlighter` (see
+ * `src/lib/editor/highlightCode.ts`). Colours reuse the editor's
+ * `--m-syntax-*` tokens so a fenced block and the live editor agree
+ * on what a keyword looks like. A `:root.light` flip re-skins both
+ * without touching JS. */
+.tok-keyword,
+.tok-atom,
+.tok-bool {
+	color: var(--m-syntax-keyword);
+}
+.tok-string,
+.tok-string2 {
+	color: var(--m-syntax-string);
+}
+.tok-number,
+.tok-literal {
+	color: var(--m-syntax-number);
+}
+.tok-variableName {
+	color: var(--m-fg);
+}
+.tok-variableName.tok-definition,
+.tok-propertyName.tok-definition,
+.tok-variableName2 {
+	color: var(--m-syntax-function);
+}
+.tok-typeName,
+.tok-className {
+	color: var(--m-syntax-type);
+}
+.tok-propertyName {
+	color: var(--m-syntax-property);
+}
+.tok-namespace {
+	color: var(--m-syntax-type);
+}
+.tok-macroName {
+	color: var(--m-syntax-function);
+}
+.tok-labelName {
+	color: var(--m-syntax-constant);
+}
+.tok-operator,
+.tok-punctuation {
+	color: var(--m-syntax-operator);
+}
+.tok-comment {
+	color: var(--m-syntax-comment);
+	font-style: italic;
+}
+.tok-meta {
+	color: var(--m-syntax-meta);
+	font-style: italic;
+}
+.tok-link,
+.tok-url {
+	color: var(--m-syntax-link);
+	text-decoration: underline;
+}
+.tok-heading {
+	color: var(--m-syntax-heading);
+	font-weight: bold;
+}
+.tok-emphasis {
+	font-style: italic;
+}
+.tok-strong {
+	font-weight: bold;
+}
+.tok-inserted {
+	color: var(--m-syntax-inserted);
+}
+.tok-deleted {
+	color: var(--m-syntax-deleted);
+}
+.tok-invalid {
+	color: var(--m-syntax-invalid);
+	text-decoration: underline wavy;
+}
