@@ -9,6 +9,9 @@ import type {
 	FileSearchOptions,
 	FileSearchResult,
 	GitStatusEntry,
+	LspCompletionList,
+	LspHover,
+	LspPosition,
 	ProjectComposeStatus,
 	ReadFileResult,
 	SlackBotProfile,
@@ -94,6 +97,15 @@ export const ipc = {
 		write: (streamId: string, data: string) => invoke<void>('terminal_write', { streamId, data }),
 		resize: (streamId: string, cols: number, rows: number) => invoke<void>('terminal_resize', { streamId, cols, rows }),
 		close: (streamId: string) => invoke<void>('terminal_close', { streamId }),
+	},
+	lsp: {
+		open: (path: string, languageId: string, text: string) => invoke<void>('lsp_open', { path, languageId, text }),
+		update: (path: string, languageId: string, text: string) => invoke<void>('lsp_update', { path, languageId, text }),
+		close: (path: string, languageId: string) => invoke<void>('lsp_close', { path, languageId }),
+		hover: (path: string, languageId: string, position: LspPosition) =>
+			invoke<LspHover | null>('lsp_hover', { path, languageId, position }),
+		completion: (path: string, languageId: string, position: LspPosition) =>
+			invoke<LspCompletionList>('lsp_completion', { path, languageId, position }),
 	},
 	slack: {
 		setToken: (token: string) => invoke<SlackIdentity>('slack_set_token', { token }),

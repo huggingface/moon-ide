@@ -11,6 +11,9 @@ import {
 	type EditorConfig,
 	type FolderSession,
 	type GitStatusEntry,
+	type LspDiagnostic,
+	type LspDiagnosticsEvent,
+	type LspStatusEvent,
 	type SplitSide,
 	type SystemTheme,
 	type ThemeMode,
@@ -18,6 +21,7 @@ import {
 	type WorkspaceFolder,
 	type WorkspaceSession,
 } from './protocol';
+import { lspLanguageFor } from './editor/lspLanguage';
 import { bottomPanel } from './bottomPanel.svelte';
 import { composeLogs } from './composeLogs.svelte';
 import { terminal } from './terminal.svelte';
@@ -169,6 +173,29 @@ class WorkspaceState {
 	// is folder-relative on the wire today, but file paths are unique
 	// per folder so the cross-folder cache stays consistent.
 	editorConfigs = $state<Map<string, EditorConfig>>(new Map());
+
+	// LSP diagnostics per path. Full-replacement semantics: each
+	// `lsp:diagnostics` event overwrites the entry for its path with
+	// the server's new truth, matching how language servers model
+	// `publishDiagnostics`. An empty array means "server has run on
+	// this file, clean slate" — distinct from "not present" which
+	// means "server hasn't reported yet". The editor binds its lint
+	// gutter to this; the status bar reads the active path's entry.
+	diagnostics = $state<Map<string, LspDiagnostic[]>>(new Map());
+	// Per-language server state, keyed by LSP language id (`'typescript'`,
+	// later `'rust'` / `'svelte'` / …). Populated by `lsp:status`
+	// broker events. The status bar renders one pill per entry whose
+	// state is anything other than `'running'`; `'notavailable'`
+	// specifically surfaces as "install the server" guidance.
+	lspStatuses = $state<Map<string, LspStatusEvent>>(new Map());
+	/** Guards against re-subscribing to `lsp:*` events. */
+	#lspListenersWired = false;
+	/**
+	 * Per-file coalescing timers for `textDocument/didChange`. Typing
+	 * is bursty; we batch updates into one IPC per ~150ms tick so the
+	 * server isn't chasing each keystroke.
+	 */
+	#lspUpdateTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
 
 	// Monotonic counter the active editor view watches to refocus itself.
 	// Bumped whenever the user "navigates" to a file (tab click, tree click,
@@ -599,6 +626,10 @@ class WorkspaceState {
 		// without requiring an fs-watcher (Phase 5). Idempotent:
 		// bound once, survives HMR.
 		void this.bindFolderChangeRefresh();
+		// LSP event stream: we subscribe unconditionally so a
+		// later `lsp_*` call (triggered by opening a TS file) has
+		// a listener in place before the broker starts emitting.
+		void this.bindLspListeners();
 
 		const ws = this.workspace;
 		const session = state.last_session;
@@ -894,6 +925,114 @@ class WorkspaceState {
 	}
 
 	/**
+	 * Subscribe to the LSP broker's two event streams:
+	 *
+	 * - `lsp:diagnostics` — per-file diagnostic list, full
+	 *   replacement. We overwrite the map entry; an empty list
+	 *   clears the gutter (server went "you're clean now").
+	 * - `lsp:status` — server lifecycle transition. The status bar
+	 *   reads these to paint the "install typescript-language-server"
+	 *   pill or a "starting…" indicator during the initial tsserver
+	 *   boot.
+	 *
+	 * Idempotent: we only register listeners once per app session,
+	 * regardless of how many workspaces open and close. Svelte's
+	 * event bus cleans them up when the window shuts down.
+	 */
+	async bindLspListeners(): Promise<void> {
+		if (this.#lspListenersWired) {
+			return;
+		}
+		this.#lspListenersWired = true;
+		try {
+			await listen<LspDiagnosticsEvent>('lsp:diagnostics', ({ payload }) => {
+				const next = new Map(this.diagnostics);
+				next.set(payload.path, payload.diagnostics);
+				this.diagnostics = next;
+			});
+			await listen<LspStatusEvent>('lsp:status', ({ payload }) => {
+				const next = new Map(this.lspStatuses);
+				next.set(payload.languageId, payload);
+				this.lspStatuses = next;
+			});
+		} catch {
+			// Event bus unavailable (tests / non-Tauri). The
+			// editor will show no diagnostics and the status
+			// pill will stay hidden — acceptable degradation.
+		}
+	}
+
+	/**
+	 * Notify the LSP broker that `path` is now open. No-op for file
+	 * types without a wired LSP server (see `lspLanguageFor`). The
+	 * broker owns everything from here: spawning the server if this
+	 * is its first file, sending `textDocument/didOpen`, and
+	 * publishing diagnostics back through the event stream.
+	 *
+	 * Untitled buffers are skipped: they have no on-disk URI, and a
+	 * synthetic `untitled:N` URI wouldn't survive a `file://` →
+	 * `PathBuf` round-trip on the server side.
+	 */
+	lspOpen(path: string, text: string) {
+		const languageId = lspLanguageFor(path);
+		if (!languageId || path.startsWith('untitled:')) {
+			return;
+		}
+		// Swallow failures: if the server crashes mid-session or
+		// the backend transiently rejects the call, it's caught by
+		// `lsp:status` which surfaces the state in the status bar.
+		// A toast on every failed open would be noise — and most
+		// "failures" here are the expected graceful degradation
+		// (NotAvailable reported with an Ok(())).
+		void ipc.lsp.open(path, languageId, text).catch(() => {});
+	}
+
+	/**
+	 * Debounced `textDocument/didChange`. 150ms matches typical type
+	 * cadence without making the server feel sluggish; longer and
+	 * diagnostics lag behind what you see on screen, shorter and we
+	 * spam the server during bursts (paste, autocomplete accept).
+	 */
+	lspScheduleUpdate(path: string, text: string) {
+		const languageId = lspLanguageFor(path);
+		if (!languageId || path.startsWith('untitled:')) {
+			return;
+		}
+		const existing = this.#lspUpdateTimers.get(path);
+		if (existing !== undefined) {
+			clearTimeout(existing);
+		}
+		const timer = setTimeout(() => {
+			this.#lspUpdateTimers.delete(path);
+			void ipc.lsp.update(path, languageId, text).catch(() => {});
+		}, 150);
+		this.#lspUpdateTimers.set(path, timer);
+	}
+
+	/**
+	 * Close notification + drop the cached diagnostics for `path`.
+	 * The buffer has no more observers in moon-ide, so showing its
+	 * stale problem count on next reopen would be wrong.
+	 */
+	lspClose(path: string) {
+		const languageId = lspLanguageFor(path);
+		const timer = this.#lspUpdateTimers.get(path);
+		if (timer !== undefined) {
+			clearTimeout(timer);
+			this.#lspUpdateTimers.delete(path);
+		}
+		if (this.diagnostics.has(path)) {
+			const next = new Map(this.diagnostics);
+			next.delete(path);
+			this.diagnostics = next;
+		}
+		if (!languageId || path.startsWith('untitled:')) {
+			return;
+		}
+		void ipc.lsp.close(path, languageId).catch(() => {});
+	}
+
+	/**
 	 * Open `path` in the given pane. By default, opening a file pulls
 	 * editor focus — that's what tab clicks, the quick-open palette,
 	 * and session restore want. Pass `{ focus: false }` for surfaces
@@ -942,6 +1081,12 @@ class WorkspaceState {
 					return;
 				}
 				this.openFiles = [...this.openFiles, next];
+				// Notify the LSP broker only on first open — reopening
+				// an already-loaded buffer is a pure UI navigation
+				// event, the server still holds its open state.
+				if (next.kind === 'text') {
+					this.lspOpen(next.path, next.text);
+				}
 			} catch (err) {
 				this.flash(`Failed to open ${path}: ${formatError(err)}`);
 				return;
@@ -1424,6 +1569,10 @@ class WorkspaceState {
 				next.delete(path);
 				this.previewModes = next;
 			}
+			// Tell the LSP broker *and* drop any cached diagnostics
+			// so a later reopen of the same path starts clean rather
+			// than flashing stale squigglies.
+			this.lspClose(path);
 		}
 
 		if (fallback !== null) {
@@ -1655,6 +1804,11 @@ class WorkspaceState {
 				text.length !== f.loadedFingerprint.length || !fingerprintEquals(fingerprint(text), f.loadedFingerprint);
 			return { ...f, text, isDirty: dirty };
 		});
+		// Debounced didChange: one IPC per burst of keystrokes. The
+		// backend does the serialisation with the LSP server, so a
+		// dropped update (e.g. closeFile racing) can never leave us
+		// in a state that disagrees with the server's last version.
+		this.lspScheduleUpdate(path, text);
 	}
 
 	closeActive() {

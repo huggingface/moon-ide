@@ -120,6 +120,125 @@ export type GitStatusEntry = {
 	status: GitFileStatus;
 };
 
+/**
+ * LSP diagnostic severity. Mirrors `moon_protocol::lsp::LspSeverity`.
+ * The four-level gradient matches LSP's own enum; the UI maps each
+ * level to an icon + gutter colour.
+ */
+export type LspSeverity = 'error' | 'warning' | 'info' | 'hint';
+
+/**
+ * LSP position (zero-based line + UTF-16 character offset). Same
+ * encoding CodeMirror uses natively for `Line` + `col`; we pass
+ * values through both directions without conversion. Mirrors
+ * `moon_protocol::lsp::LspPosition`.
+ */
+export type LspPosition = {
+	line: number;
+	character: number;
+};
+
+export type LspRange = {
+	start: LspPosition;
+	end: LspPosition;
+};
+
+/**
+ * One diagnostic from a language server. `source` and `code` are
+ * surfaced in the tooltip so a user can tell which producer emitted
+ * the warning (e.g. `"ts"` vs `"eslint"`). Mirrors
+ * `moon_protocol::lsp::LspDiagnostic`.
+ */
+export type LspDiagnostic = {
+	range: LspRange;
+	severity: LspSeverity;
+	message: string;
+	source: string | null;
+	code: string | null;
+};
+
+/**
+ * Event payload delivered on `lsp:diagnostics`. Full replacement
+ * semantics: the list is the server's new truth for `path`, so the
+ * UI overwrites instead of merging. Mirrors
+ * `moon_protocol::lsp::LspDiagnosticsEvent`.
+ */
+export type LspDiagnosticsEvent = {
+	path: string;
+	diagnostics: LspDiagnostic[];
+};
+
+/**
+ * Normalised hover response: Markdown body + optional range. Empty
+ * hovers are coalesced to `null` on the backend so the UI never
+ * opens a blank tooltip. Mirrors `moon_protocol::lsp::LspHover`.
+ */
+export type LspHover = {
+	contents: string;
+	range: LspRange | null;
+};
+
+/**
+ * Kind of a completion item. Mirrors LSP's list 1:1; the frontend
+ * uses it for iconography. Extending this set requires adding to
+ * `moon_protocol::lsp::LspCompletionKind` and the `translate` match.
+ */
+export type LspCompletionKind =
+	| 'text'
+	| 'method'
+	| 'function'
+	| 'constructor'
+	| 'field'
+	| 'variable'
+	| 'class'
+	| 'interface'
+	| 'module'
+	| 'property'
+	| 'unit'
+	| 'value'
+	| 'enum'
+	| 'keyword'
+	| 'snippet'
+	| 'color'
+	| 'file'
+	| 'reference'
+	| 'folder'
+	| 'enummember'
+	| 'constant'
+	| 'struct'
+	| 'event'
+	| 'operator'
+	| 'typeparameter';
+
+export type LspCompletionItem = {
+	label: string;
+	kind: LspCompletionKind | null;
+	detail: string | null;
+	documentation: string | null;
+	insertText: string | null;
+	sortText: string | null;
+	filterText: string | null;
+};
+
+export type LspCompletionList = {
+	isIncomplete: boolean;
+	items: LspCompletionItem[];
+};
+
+/**
+ * Per-language server state. Emitted on `lsp:status` whenever the
+ * broker transitions a server between states. UI caches the latest
+ * per language id and paints a status-bar pill when it's anything
+ * but `running`. Mirrors `moon_protocol::lsp::LspServerStatus`.
+ */
+export type LspServerStatus = 'notavailable' | 'starting' | 'running' | 'crashed' | 'stopped';
+
+export type LspStatusEvent = {
+	languageId: string;
+	status: LspServerStatus;
+	detail: string | null;
+};
+
 export type SplitSide = 'left' | 'right';
 
 export type IndentStyle = 'tab' | 'space';

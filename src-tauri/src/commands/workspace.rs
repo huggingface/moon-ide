@@ -18,6 +18,7 @@ pub async fn workspace_open_local(state: State<'_, AppState>, path: String) -> R
 	state.workspaces.add_folder(path).await?;
 	let snap = state.workspaces.snapshot().await;
 	repoint_fs_watcher(&state, &snap);
+	reset_lsp_if_root_changed(&state, &snap).await;
 	Ok(snap)
 }
 
@@ -29,6 +30,7 @@ pub async fn workspace_remove_folder(state: State<'_, AppState>, path: String) -
 	state.workspaces.remove_folder(&path).await?;
 	let snap = state.workspaces.snapshot().await;
 	repoint_fs_watcher(&state, &snap);
+	reset_lsp_if_root_changed(&state, &snap).await;
 	Ok(snap)
 }
 
@@ -43,6 +45,7 @@ pub async fn workspace_set_active_folder(
 	state.workspaces.set_active_folder(&path).await?;
 	let snap = state.workspaces.snapshot().await;
 	repoint_fs_watcher(&state, &snap);
+	reset_lsp_if_root_changed(&state, &snap).await;
 	Ok(snap)
 }
 
@@ -53,6 +56,41 @@ pub async fn workspace_set_active_folder(
 fn repoint_fs_watcher(state: &AppState, snap: &WorkspaceRecord) {
 	let active = snap.active_folder.as_ref().map(std::path::PathBuf::from);
 	state.fs_watcher.set_root(active);
+}
+
+/// Tear down the LSP broker when the active folder moves to a
+/// different root. The broker captures its root at spawn time and
+/// file URIs are absolute-path-anchored, so a root switch invalidates
+/// everything it knows. Next `lsp_*` command lazily rebuilds against
+/// the new root; the frontend re-issues `didOpen` for all open
+/// buffers when it sees the workspace change (see
+/// `state.svelte.ts` → `applyWorkspaceSnapshot`).
+///
+/// No-op if no broker is alive, or if the active folder is
+/// unchanged from the broker's current root. Also no-op if the
+/// workspace has no active folder (folder just removed) — the next
+/// `lsp_*` call will fail with a clear error instead.
+async fn reset_lsp_if_root_changed(state: &AppState, snap: &WorkspaceRecord) {
+	let Some(active) = snap.active_folder.as_ref() else {
+		// Active folder gone (last folder removed). Tear down
+		// the broker so a subsequent re-open gets a clean state.
+		let handle = { state.lsp.lock().await.take() };
+		if let Some(old) = handle {
+			old.broker.shutdown_all().await;
+		}
+		return;
+	};
+	let new_root = Utf8PathBuf::from(active);
+	let handle = {
+		let mut guard = state.lsp.lock().await;
+		match guard.as_ref() {
+			Some(existing) if existing.root == new_root => None,
+			_ => guard.take(),
+		}
+	};
+	if let Some(old) = handle {
+		old.broker.shutdown_all().await;
+	}
 }
 
 /// Snapshot the current workspace (singleton until Phase 7).

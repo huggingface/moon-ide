@@ -7,6 +7,7 @@ use moon_slack::{SlackClient, TokenStore};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::AbortHandle;
 
+use crate::commands::lsp::LspHandle;
 use crate::fs_watcher::FsWatcherHandle;
 use crate::slack_poller::PollerHandle;
 
@@ -48,6 +49,14 @@ pub struct AppState {
 	/// tree + git status can refresh without waiting for window
 	/// focus or a palette command. See [`crate::fs_watcher`].
 	pub fs_watcher: FsWatcherHandle,
+	/// LSP broker plus its event-pump task. Lazily created the
+	/// first time the frontend calls an `lsp_*` command so we
+	/// don't pay the TS server startup cost for folders that
+	/// happen to contain no TypeScript. Torn down when the
+	/// workspace closes (via `lsp_shutdown` in the shutdown
+	/// hook) or when the active folder switches (see
+	/// [`crate::commands::lsp`]).
+	pub lsp: Arc<Mutex<Option<LspHandle>>>,
 }
 
 /// Owning handle the terminal commands keep per stream. The
@@ -82,6 +91,7 @@ impl AppState {
 			log_streams: Arc::new(Mutex::new(HashMap::new())),
 			terminal_streams: Arc::new(Mutex::new(HashMap::new())),
 			fs_watcher,
+			lsp: Arc::new(Mutex::new(None)),
 		}
 	}
 

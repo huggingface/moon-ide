@@ -7,6 +7,13 @@
 	import { searchKeymap, highlightSelectionMatches } from '@codemirror/search';
 	import { bracketMatching, indentOnInput, indentUnit } from '@codemirror/language';
 	import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from '@codemirror/autocomplete';
+	import {
+		applyDiagnostics,
+		filePathFacet,
+		lspCompletionSource,
+		lspDiagnosticsExtension,
+		lspHoverExtension,
+	} from '../editor/lsp';
 	import { workspace, type OpenFile, type SplitSide } from '../state.svelte';
 	import { languageFor } from '../editor/language';
 	import { moonEditorTheme } from '../editor/theme';
@@ -26,6 +33,11 @@
 	// `dark: boolean` flag on the chrome theme that we can't fake from
 	// CSS, so flipping `workspace.theme` rebuilds both.
 	const themeCompartment = new Compartment();
+	// Current buffer path, exposed to LSP adapters via `filePathFacet`.
+	// Reconfigured whenever the active tab swaps so the hover and
+	// completion sources always talk about the file the user is
+	// looking at.
+	const lspPathCompartment = new Compartment();
 
 	// Each Editor instance owns one CM view that we re-target as the active file changes.
 	// We track the path the view currently holds so we know when to swap state.
@@ -127,6 +139,34 @@
 		});
 	});
 
+	// LSP path facet: keep it in sync with the active buffer so hover
+	// and completion adapters target the right file. We reconfigure on
+	// every path change rather than tunnelling the path through CM
+	// state so the facet value stays authoritative.
+	$effect(() => {
+		const v = view;
+		if (!v) {
+			return;
+		}
+		v.dispatch({
+			effects: lspPathCompartment.reconfigure(filePathFacet.of(file.path)),
+		});
+	});
+
+	// LSP diagnostics: push the latest list for this path into CM's
+	// lint state. Untracked file types (no LSP wired up) never get
+	// an entry in the map, so the fallback `[]` clears the gutter
+	// — exactly what we want when switching from a TS file to a
+	// markdown one.
+	$effect(() => {
+		const v = view;
+		if (!v) {
+			return;
+		}
+		const list = workspace.diagnostics.get(file.path) ?? [];
+		applyDiagnostics(v, list);
+	});
+
 	// Pull focus into the editor whenever the workspace bumps `focusTick`.
 	// That covers tab clicks, tree clicks (re-opening a closed file
 	// included), and post-close fallback. Microtask-deferred so the click
@@ -162,16 +202,22 @@
 			indentOnInput(),
 			history(),
 			highlightSelectionMatches(),
-			// Autocompletion with `activateOnTyping: false` means the
-			// popover only opens on an explicit trigger (Ctrl-Space) or
-			// when a future LSP source emits a completion. That keeps
-			// the editor from flashing identifier suggestions at the
-			// user while they type — without a real language server
-			// feeding it, the builtin word-from-buffer source is more
-			// annoying than helpful. Structure is in place now so that
-			// the LSP client we wire in a later phase has a CM surface
-			// to mount itself on without re-shaping the extension list.
-			autocompletion({ activateOnTyping: false }),
+			// LSP diagnostics: the gutter extension paints severity
+			// markers; `setDiagnostics` gets dispatched by the
+			// reactive `$effect` below.
+			...lspDiagnosticsExtension(),
+			lspHoverExtension(),
+			lspPathCompartment.of(filePathFacet.of(file.path)),
+			// Autocompletion popover. `activateOnTyping: false` keeps
+			// it off the typing path so we don't leak the built-in
+			// identifier source; `override` routes explicit
+			// invocations (Ctrl-Space) to the LSP source when a
+			// server is wired up, and returns null otherwise so
+			// CM falls back to its defaults (empty list).
+			autocompletion({
+				activateOnTyping: false,
+				override: [lspCompletionSource],
+			}),
 			keymap.of([
 				...closeBracketsKeymap,
 				...defaultKeymap,

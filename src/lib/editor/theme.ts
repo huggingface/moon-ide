@@ -57,6 +57,21 @@ function moonTheme(dark: boolean): Extension {
 				backgroundColor: 'var(--m-accent)',
 				color: 'var(--m-bg)',
 			},
+			// LSP hover popover. Padded + wrapped so Markdown-formatted
+			// hover bodies (signatures, docstrings, fenced code blocks)
+			// don't run off the edge of the tooltip. `max-width` caps at
+			// 60ch which matches the rule-of-thumb for prose legibility
+			// and tends to keep hover cards from spanning the full
+			// window on wide monitors.
+			'.cm-lsp-hover': {
+				padding: '6px 8px',
+				maxWidth: '60ch',
+				whiteSpace: 'pre-wrap',
+				overflow: 'auto',
+				fontSize: '12px',
+				lineHeight: '1.4',
+				color: 'var(--m-fg)',
+			},
 			// Search panel (Ctrl+F) and goto-line panel. CM6 ships its
 			// own light-grey defaults that look out of place in either
 			// theme; we override them with our palette tokens. Inputs

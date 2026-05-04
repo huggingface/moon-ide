@@ -86,6 +86,9 @@ Any host operation can fail because the host is gone (container stopped, network
 
 ## Open questions
 
-- Whether to use `tower-lsp`'s client-side helpers or roll a thinner LSP client. Decide at Phase 4 start.
 - Whether `moon-core` should own its own tokio runtime or share Tauri's. Currently shares Tauri's.
 - Whether `moon-base` becomes its own repo or stays in-tree (see [ADR 0007](decisions/0007-compose-and-moon-base.md#open-follow-ups)). Registry is settled: Docker Hub at `huggingface/moon-base`.
+
+## Resolved
+
+- **LSP client shape.** `tower-lsp` is a server framework and doesn't help a client. We use `lsp-types` for message shapes and roll a thin custom client — framing + actor tasks, ~300 LOC. See [specs/lsp.md](lsp.md).

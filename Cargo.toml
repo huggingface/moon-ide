@@ -43,6 +43,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # disappear between launches. `crypto-rust` keeps us off system OpenSSL.
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 ts-rs = { version = "12.0", features = ["serde-compat", "serde-json-impl"] }
+lsp-types = "0.97"
+which = "8.0"
+url = "2.5"
 
 [profile.release]
 lto = "thin"

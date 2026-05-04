@@ -8,6 +8,7 @@
 pub mod app_state;
 pub mod editorconfig;
 pub mod host;
+pub mod lsp;
 pub mod pre_save;
 pub mod search;
 pub mod workspace;

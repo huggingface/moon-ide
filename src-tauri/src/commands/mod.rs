@@ -3,6 +3,7 @@ pub mod compose_logs;
 pub mod container;
 pub mod editorconfig;
 pub mod fs;
+pub mod lsp;
 pub mod project_compose;
 pub mod search;
 pub mod slack;

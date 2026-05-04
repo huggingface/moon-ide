@@ -19,7 +19,7 @@ The full phased plan. Update the **Status** column as phases land.
 | 2     | Containerised dev shells        | scaffolded  |
 | 2.5   | Multi-folder workspace UX       | scaffolded  |
 | 3     | Terminal                        | scaffolded  |
-| 4     | LSP                             | scaffolded  |
+| 4     | LSP                             | in progress |
 | 5     | Git layer                       | in progress |
 | 6     | ACP integration                 | scaffolded  |
 | 7     | Multi-repo + cross-repo queries | scaffolded  |
@@ -82,6 +82,17 @@ xterm.js + portable-pty terminals, multiple sessions, splits. Spawned via active
 ## Phase 4 — LSP
 
 LSP multiplexer in `moon-core`. TS, Svelte, CSS, HTML, JSON, MD servers. Diagnostics, completion, hover, goto-def, find-refs, rename, code actions. Navigation history (alt+left/right).
+
+Architectural spec: [lsp.md](lsp.md). The [`tower-lsp` vs thin-client open question](architecture.md#resolved) is resolved — we roll ~300 LOC on top of `lsp-types`.
+
+**What has landed so far** (see `specs/test-plans/0024-*.md`):
+
+- Stage 1 slice for **TypeScript only**: diagnostics (red squigglies + gutter markers + status-bar error/warn counts), hover tooltip, explicit-invocation completion source registered on the existing `autocompletion` extension.
+- `moon-core::lsp` module: Content-Length framing, thin JSON-RPC client with actor-pattern reader/writer, per-language `LspServer` actor, multi-language `LspBroker` with lazy spawn and graceful `NotAvailable` fallback when the server binary isn't on PATH.
+- `moon-protocol::lsp` carries moon-shaped subsets of upstream LSP types so the UI never sees raw `lsp-types`.
+- Per-language availability pill in the status bar (`starting…`, `not available`, `crashed`, `stopped`) — `running` stays invisible.
+
+**Still outstanding for this phase**: Rust (rust-analyzer), Svelte (svelte-language-server), CSS / HTML / JSON / MD servers; go-to-definition with Ctrl-click underline; find-references panel; rename; code actions; navigation history (Alt-Left / Alt-Right); incremental document sync; signature help.
 
 ## Phase 5 — Git
 
