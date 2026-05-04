@@ -80,7 +80,13 @@ What doesn't ship in 3.0 (and when to revisit):
   shells with stale state would surprise the user; if
   someone asks for it specifically, we can persist tab
   metadata (title, target, cwd) and re-spawn fresh
-  shells on next launch.
+  shells on next launch. (Post-3.0 polish: when launch
+  finds the bottom panel visible-but-empty, we now
+  auto-spawn one default terminal — container if the
+  workspace shell is up, host otherwise — to avoid the
+  "empty strip" UX. That's a default, not persistence,
+  and it sidesteps the surprise risk above. See
+  [test plan 0026](../test-plans/0026-bottom-panel-auto-terminal.md).)
 - **Splits.** xterm.js doesn't have a built-in pane
   manager; we'd need to layer one. Defer until someone
   wants two terminals visible at once badly enough to

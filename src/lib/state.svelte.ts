@@ -26,6 +26,7 @@ import { bottomPanel } from './bottomPanel.svelte';
 import { composeLogs } from './composeLogs.svelte';
 import { terminal } from './terminal.svelte';
 import { container } from './container.svelte';
+import { canOpenContainerTerminal, openContainerTerminal, openHostTerminal } from './openTerminal';
 import { projectCompose } from './projectCompose.svelte';
 import { slack } from './slack.svelte';
 import { fingerprint, fingerprintEquals, type ContentFingerprint } from './util/hash';
@@ -601,9 +602,12 @@ class WorkspaceState {
 		void slack.wireRuntime();
 		// Same pattern for the container status pip — bind the
 		// `container:state` event subscription once, then pull the
-		// current snapshot for whatever workspace is open.
+		// current snapshot for whatever workspace is open. Capture
+		// the refresh promise so the auto-terminal step at the
+		// end of this method can read the resolved status rather
+		// than racing with the in-flight call.
 		void container.wireRuntime();
-		void container.refresh();
+		const containerRefresh = container.refresh();
 		// Per-folder compose snapshots use a parallel event
 		// subscription keyed on `folder_path`. The folder bars'
 		// indicators read from `projectCompose.snapshotFor(path)`,
@@ -618,8 +622,10 @@ class WorkspaceState {
 		// Terminal output rides on its own event channel —
 		// see `terminal.svelte.ts`. Wired once at startup so
 		// the first `+ Terminal` click responds without bus-bind
-		// latency.
-		void terminal.wireRuntime();
+		// latency. Hold the bind promise so the auto-terminal
+		// spawn below waits for the listener to actually attach
+		// instead of racing with the first PTY output bytes.
+		const terminalRuntime = terminal.wireRuntime();
 		// Refresh the file tree + git status when the user comes
 		// back to the window. Covers the common "I ran `git
 		// checkout`/`stash pop` in an external terminal" workflow
@@ -634,6 +640,12 @@ class WorkspaceState {
 		const ws = this.workspace;
 		const session = state.last_session;
 		if (!ws || !session) {
+			// Even without a session to replay we still want to give
+			// the bottom-panel auto-spawn a shot — the panel's
+			// visibility is in `state` (just hydrated above) and is
+			// independent from the per-folder tab session restored
+			// below.
+			void this.spawnInitialBottomPanelTerminal(containerRefresh, terminalRuntime);
 			return;
 		}
 
@@ -732,6 +744,57 @@ class WorkspaceState {
 		// active folder so the initial paint already shows the right
 		// indent settings.
 		await Promise.all(this.openFiles.map((f) => this.ensureEditorConfig(f.path)));
+		// Auto-spawn one terminal when the bottom panel was
+		// restored as visible but came back without any tabs. Tab
+		// contents aren't persisted by design (ADR 0009), so a
+		// panel the user left open at last shutdown otherwise
+		// reappears as a meaningless empty strip.
+		void this.spawnInitialBottomPanelTerminal(containerRefresh, terminalRuntime);
+	}
+
+	/**
+	 * Open one terminal into the bottom panel iff the panel was
+	 * restored as visible but no tab kind populated it during
+	 * launch. Picks `container` over `host` whenever the workspace
+	 * shell is up — that's the environment the user's active folder
+	 * actually runs in. Falls back to `host` otherwise (container
+	 * down, paused, or workspace lacks a container project).
+	 *
+	 * Awaits `containerRefresh` first so the target choice reflects
+	 * the daemon's current truth rather than the pre-hydrate `null`
+	 * status. Awaits `terminalRuntime` so the `terminal:output`
+	 * listener is attached before we spawn — otherwise the first
+	 * prompt bytes would be dropped on the floor.
+	 *
+	 * Skips silently when there's no workspace bound (a
+	 * `$HOME`-rooted host shell with no folder context isn't
+	 * useful) or when something else has populated the panel
+	 * between hydrate and the awaits resolving (a log stream
+	 * starting itself, a follow-up gesture from the user).
+	 */
+	private async spawnInitialBottomPanelTerminal(
+		containerRefresh: Promise<void>,
+		terminalRuntime: Promise<void>,
+	): Promise<void> {
+		if (!this.workspace) {
+			return;
+		}
+		if (!bottomPanel.visible) {
+			return;
+		}
+		if (bottomPanel.tabs.length > 0) {
+			return;
+		}
+		await containerRefresh;
+		await terminalRuntime;
+		if (bottomPanel.tabs.length > 0) {
+			return;
+		}
+		if (canOpenContainerTerminal()) {
+			openContainerTerminal();
+			return;
+		}
+		openHostTerminal();
 	}
 
 	private persistAppState() {

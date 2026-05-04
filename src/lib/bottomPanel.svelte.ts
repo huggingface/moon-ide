@@ -32,8 +32,16 @@
 //! through `WorkspaceState.persistAppState`. Tab contents are
 //! deliberately not persisted — they're backed by running
 //! processes (`docker compose logs -f`, …) that don't survive a
-//! launch, and silently re-spawning them at startup would
-//! surprise the user.
+//! launch, and silently re-spawning the user's previous tabs at
+//! startup would surprise.
+//!
+//! One exception: when launch finds the panel visible with no
+//! tabs (the user left it open last shutdown), `WorkspaceState`'s
+//! `restoreAppState` auto-spawns a single terminal so the panel
+//! has a sensible default body instead of an empty strip. Container
+//! terminal when the workspace shell is running, host otherwise.
+//! That's a default, not a replay — what gets opened is decided
+//! at launch time, not read from disk.
 
 import type { BottomPanelAppState, TerminalTarget } from './protocol';
 
