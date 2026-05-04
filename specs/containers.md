@@ -739,6 +739,79 @@ section of the status bar / sidebar (Phase 2.2):
 
 Clicking opens the URL in the host's default browser.
 
+## SSH agent forwarding
+
+`git fetch`, `git push`, `gh auth status`, and any other tool the
+user runs in a container terminal needs to reach the host's
+keys without copying private material across the host/container
+boundary. moon-ide solves this with **SSH agent forwarding**: the
+host's running agent socket is bind-mounted into the dev
+container at a fixed path and `SSH_AUTH_SOCK` is set to point at
+it. Private keys never enter the container — only the agent's
+"sign this challenge" RPC.
+
+The generated `compose.yaml` carries the forward as a volume +
+environment pair on the `dev` service:
+
+```yaml
+services:
+  dev:
+    volumes:
+      - <host-socket>:/run/host-services/ssh-auth.sock
+    environment:
+      SSH_AUTH_SOCK: /run/host-services/ssh-auth.sock
+```
+
+Host-side resolution differs per platform:
+
+- **macOS (Docker Desktop)** uses the magic socket at
+  `/run/host-services/ssh-auth.sock`. Docker Desktop
+  special-cases that path and forwards reads to whatever agent
+  is running on the host (Keychain via `ssh-agent`,
+  `1password-cli`, etc.) — moon-ide just emits the mount
+  unconditionally.
+- **Linux** reads `$SSH_AUTH_SOCK` from the IDE's environment.
+  If it's set and the socket exists we bind it directly. If
+  not (no agent running, headless launch from a unit file), we
+  skip the volume + env block; the dev container still comes
+  up, just without agent access. A `tracing::warn!` flags the
+  silent skip so the user can correlate with "git fetch
+  doesn't work" later.
+
+The in-container path is `/run/host-services/ssh-auth.sock` on
+both platforms — we re-use Docker Desktop's convention so any
+tooling that already understands it works without per-OS
+branching inside the container.
+
+`moon-base` ships `openssh-client` (so `ssh` itself is on
+`PATH`) and a system-wide `/etc/ssh/ssh_known_hosts` pre-seeded
+with `github.com` and `gitlab.com` via `ssh-keyscan` at image
+build time. That keeps the first `git fetch` from prompting
+`Are you sure you want to continue connecting?` — important
+because non-interactive `docker exec` invocations would fail
+that prompt outright.
+
+The forward is re-evaluated every time `compose.yaml` is
+written (first set up, folder add/remove, `Rebuild`). Starting
+an agent after the IDE is already open means the user has to
+hit `Rebuild` to recreate the dev container with the mount in
+place. We accept that — Phase 2 doesn't have the lifecycle
+machinery to hot-swap volumes, and the case is rare enough
+that the manual rebuild step isn't a UX wart.
+
+What this **doesn't** do (deferred until somebody asks):
+
+- Forward the user's `~/.ssh/config` (Host aliases,
+  `IdentityFile` paths, `ProxyCommand`s). Anyone whose git
+  remotes use a custom Host alias has to either rewrite the
+  remote URL or mount their `~/.ssh/config` themselves via a
+  team Dockerfile-on-top.
+- Forward GPG agents for signed commits. Same story — easy to
+  layer on per-team if it shows up.
+- Toggle the forward off via UI. Hardcoded on by default; an
+  `x-moon` key (or top-level setting) can come back when a
+  second concrete need appears.
+
 ## `WorkspaceHost::ContainerHost`
 
 The trait already exists from Phase 0:

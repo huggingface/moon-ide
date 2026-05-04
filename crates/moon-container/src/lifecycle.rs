@@ -70,7 +70,7 @@ use moon_protocol::MoonError;
 use thiserror::Error;
 use tokio::process::Command;
 
-use crate::compose::{generate_compose, BoundMount, ComposeRender, ComposeRenderOptions};
+use crate::compose::{generate_compose, BoundMount, ComposeRender, ComposeRenderOptions, SshAgentForward};
 use crate::project::{project_name_for_id, ProjectName, ProjectNameError};
 
 /// The image reference written into a freshly generated
@@ -209,12 +209,21 @@ impl Workspace {
 	/// generated it right now from the current bound-folder set.
 	/// Useful for an "Inspect" affordance before the user clicks
 	/// "Set up".
+	///
+	/// SSH agent forwarding is resolved per call from the host
+	/// environment (see [`detect_ssh_agent_forward`]), so the
+	/// rendered file always reflects the agent the IDE could
+	/// reach at this moment. If the host has no agent the
+	/// dev-service still renders correctly, just without the
+	/// volume + environment block.
 	pub fn render_compose(&self, dev_image: &str) -> ComposeRender {
 		let mounts = self.bound_mounts();
+		let agent = detect_ssh_agent_forward();
 		generate_compose(ComposeRenderOptions {
 			project: &self.project,
 			dev_image,
 			bound_mounts: &mounts,
+			ssh_agent: agent.as_ref(),
 		})
 	}
 
@@ -429,6 +438,50 @@ fn mount_name_for(path: &Utf8Path) -> String {
 		.filter(|s| !s.is_empty())
 		.map(str::to_owned)
 		.unwrap_or_else(|| "root".to_owned())
+}
+
+/// Resolve the host-side SSH agent socket to bind into the dev
+/// container, if one is reachable.
+///
+/// Two paths:
+///
+/// - **macOS**: Docker Desktop special-cases
+///   `/run/host-services/ssh-auth.sock` and forwards reads to the
+///   host's running agent. We always emit that mount on macOS;
+///   the path's existence inside the VM is Docker Desktop's
+///   responsibility, not ours.
+/// - **Linux**: read `$SSH_AUTH_SOCK` and bind it directly. If
+///   the env var is unset or the socket file doesn't exist we
+///   skip the forward (the user gets a working container, just
+///   without ssh-agent — `tracing::warn!` flags it once on
+///   compose write).
+///
+/// Re-evaluated every time we render or write `compose.yaml`,
+/// so a contributor who starts an agent after the IDE is open
+/// just needs to recreate the dev container (palette → "Rebuild
+/// container") to pick it up.
+pub(crate) fn detect_ssh_agent_forward() -> Option<SshAgentForward> {
+	if cfg!(target_os = "macos") {
+		return Some(SshAgentForward {
+			host_socket: Utf8PathBuf::from("/run/host-services/ssh-auth.sock"),
+		});
+	}
+	let raw = match std::env::var("SSH_AUTH_SOCK") {
+		Ok(s) if !s.is_empty() => s,
+		_ => {
+			tracing::debug!("SSH_AUTH_SOCK not set; skipping ssh agent forwarding");
+			return None;
+		}
+	};
+	let path = Utf8PathBuf::from(raw);
+	if !path.exists() {
+		tracing::warn!(
+			%path,
+			"SSH_AUTH_SOCK is set but path doesn't exist; skipping ssh agent forwarding",
+		);
+		return None;
+	}
+	Some(SshAgentForward { host_socket: path })
 }
 
 fn render_bound_folders_json(folders: &[Utf8PathBuf]) -> String {

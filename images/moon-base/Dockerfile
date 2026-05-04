@@ -50,10 +50,29 @@ RUN apt-get update \
         wget \
         git \
         less \
+        openssh-client \
         sudo \
         unzip \
         xz-utils \
  && rm -rf /var/lib/apt/lists/*
+
+# Pre-seed system-wide known_hosts with the SSH host keys for the
+# git providers we actually use, so the first `git fetch` /
+# `git clone` in a container terminal doesn't prompt
+# `Are you sure you want to continue connecting?` (or worse, fail
+# under non-interactive `docker exec`). The keys are fetched
+# fresh from each provider at image build time; if they rotate
+# between rebuilds the user falls back to the same prompt-based
+# accept flow they'd see on a clean host.
+#
+# moon-ide forwards the host's SSH agent into the dev container
+# (mount + `SSH_AUTH_SOCK` injected by the generated compose
+# file) so private keys never leave the host. See
+# specs/containers.md § "SSH agent forwarding".
+RUN install -m 0755 -d /etc/ssh \
+ && ssh-keyscan -t rsa,ecdsa,ed25519 github.com gitlab.com \
+      >> /etc/ssh/ssh_known_hosts \
+ && chmod 0644 /etc/ssh/ssh_known_hosts
 
 # Comfort tooling that's stable enough to live in the base image:
 # ripgrep / fzf / bat / jq. `bat` ships as `batcat` on Debian to

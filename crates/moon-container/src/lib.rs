@@ -24,7 +24,9 @@ pub mod lifecycle;
 pub mod project;
 pub mod project_compose;
 
-pub use compose::{generate_compose, BoundMount, ComposeRender, ComposeRenderOptions};
+pub use compose::{
+	generate_compose, BoundMount, ComposeRender, ComposeRenderOptions, SshAgentForward, SSH_AGENT_CONTAINER_PATH,
+};
 pub use discovery::{
 	discover_compose_files, discover_compose_files_for_folders, discover_root_compose, ComposeDiscovery,
 	DiscoveredCompose,

@@ -70,6 +70,36 @@ pub struct BoundMount {
 	pub mount_name: String,
 }
 
+/// SSH agent forwarding into the dev container.
+///
+/// Bind-mounts the host's SSH agent socket inside the container
+/// at a fixed path and points `SSH_AUTH_SOCK` at it, so
+/// `git fetch`, `gh auth ...`, and any other SSH-using tool the
+/// user runs in a container terminal can reach the host's keys
+/// without copying private material into the container.
+///
+/// Source path is resolved at the lifecycle layer:
+///
+/// - **macOS (Docker Desktop)** uses the magic
+///   `/run/host-services/ssh-auth.sock` — Docker Desktop
+///   special-cases that path and forwards it to the host's
+///   running agent.
+/// - **Linux** uses `$SSH_AUTH_SOCK` if it's set and the socket
+///   exists, otherwise we skip the forward entirely (a
+///   `tracing::warn!` flags the silent skip; the rest of the
+///   container still works, just without the agent).
+///
+/// In-container path is the same regardless of platform — we
+/// re-use Docker Desktop's convention so any tooling that
+/// already understands it Just Works inside the workspace shell.
+pub const SSH_AGENT_CONTAINER_PATH: &str = "/run/host-services/ssh-auth.sock";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshAgentForward {
+	/// Absolute host-side path to the SSH agent's unix socket.
+	pub host_socket: Utf8PathBuf,
+}
+
 /// How the generator should populate the `dev` service.
 #[derive(Debug, Clone)]
 pub struct ComposeRenderOptions<'a> {
@@ -86,6 +116,10 @@ pub struct ComposeRenderOptions<'a> {
 	/// the generator's output is consistent. In practice the IDE
 	/// only writes this file once at least one folder is bound.
 	pub bound_mounts: &'a [BoundMount],
+	/// Optional SSH agent forwarding. `None` skips the volume
+	/// and environment block entirely (no `SSH_AUTH_SOCK` set
+	/// inside the container, no agent socket mounted).
+	pub ssh_agent: Option<&'a SshAgentForward>,
 }
 
 /// Result of [`generate_compose`].
@@ -119,10 +153,10 @@ pub fn generate_compose(options: ComposeRenderOptions<'_>) -> ComposeRender {
 	let _ = writeln!(yaml, "    init: true");
 	let _ = writeln!(yaml, "    working_dir: /workspace");
 	let _ = writeln!(yaml, "    volumes:");
-	if options.bound_mounts.is_empty() {
+	if options.bound_mounts.is_empty() && options.ssh_agent.is_none() {
 		// Empty list is valid YAML and compose accepts it; this
-		// keeps the structure consistent for the no-folder edge
-		// case.
+		// keeps the structure consistent for the no-folder /
+		// no-ssh-agent edge case.
 		let _ = writeln!(yaml, "      []");
 	} else {
 		for mount in options.bound_mounts {
@@ -133,6 +167,21 @@ pub fn generate_compose(options: ComposeRenderOptions<'_>) -> ComposeRender {
 				name = mount.mount_name,
 			);
 		}
+		if let Some(agent) = options.ssh_agent {
+			// Bind the host's SSH agent socket so `git fetch`,
+			// `gh`, etc. inside the container reach the host's
+			// keys without copying any private material.
+			let _ = writeln!(
+				yaml,
+				"      - {host}:{container}",
+				host = agent.host_socket.as_str(),
+				container = SSH_AGENT_CONTAINER_PATH,
+			);
+		}
+	}
+	if options.ssh_agent.is_some() {
+		let _ = writeln!(yaml, "    environment:");
+		let _ = writeln!(yaml, "      SSH_AUTH_SOCK: {SSH_AGENT_CONTAINER_PATH}");
 	}
 	// `sleep infinity` is the conventional "keep this container
 	// alive so we can `docker exec` into it" command. Phase 2.1
@@ -174,6 +223,7 @@ mod tests {
 			project: &project,
 			dev_image: "moon-base:dev",
 			bound_mounts: &[],
+			ssh_agent: None,
 		});
 
 		assert!(render.yaml.contains("name: moon-ws-default"));
@@ -181,6 +231,8 @@ mod tests {
 		// Workspace compose no longer pulls in project services —
 		// they're managed per-folder now.
 		assert!(!render.yaml.contains("include:"));
+		// No agent forward → no environment block on the dev service.
+		assert!(!render.yaml.contains("SSH_AUTH_SOCK"));
 	}
 
 	#[test]
@@ -194,6 +246,7 @@ mod tests {
 			project: &project,
 			dev_image: "moon-base:dev",
 			bound_mounts: &mounts,
+			ssh_agent: None,
 		});
 
 		assert!(render
@@ -211,6 +264,7 @@ mod tests {
 			project: &project,
 			dev_image: "moon-base:dev",
 			bound_mounts: &mounts,
+			ssh_agent: None,
 		};
 		let a = generate_compose(opts.clone());
 		let b = generate_compose(opts);
@@ -225,6 +279,7 @@ mod tests {
 			project: &project,
 			dev_image: "huggingface/moon-base:0.1",
 			bound_mounts: &[mount("/x", "x")],
+			ssh_agent: None,
 		});
 		assert!(render.yaml.contains("image: huggingface/moon-base:0.1"));
 	}
@@ -236,7 +291,52 @@ mod tests {
 			project: &project,
 			dev_image: "moon-base:dev",
 			bound_mounts: &[],
+			ssh_agent: None,
 		});
 		assert!(render.yaml.contains("name: moon-ws-scratch"));
+	}
+
+	#[test]
+	fn ssh_agent_forward_emits_volume_and_environment_block() {
+		let project = project();
+		let agent = SshAgentForward {
+			host_socket: Utf8PathBuf::from("/tmp/ssh-XXXX/agent.42"),
+		};
+		let render = generate_compose(ComposeRenderOptions {
+			project: &project,
+			dev_image: "moon-base:dev",
+			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
+			ssh_agent: Some(&agent),
+		});
+
+		assert!(render
+			.yaml
+			.contains("- /tmp/ssh-XXXX/agent.42:/run/host-services/ssh-auth.sock"));
+		assert!(render.yaml.contains("SSH_AUTH_SOCK: /run/host-services/ssh-auth.sock"));
+		// The bound-folder mount still lands above the agent mount.
+		assert!(render.yaml.contains("- /home/me/code/moon-ide:/workspace/moon-ide"));
+	}
+
+	#[test]
+	fn ssh_agent_forward_renders_with_no_bound_folders() {
+		// Pre-opt-in shape: no folders bound yet but the agent
+		// is still available — the renderer must not regress to
+		// `volumes: []` and drop the agent mount.
+		let project = project();
+		let agent = SshAgentForward {
+			host_socket: Utf8PathBuf::from("/run/user/1000/keyring/ssh"),
+		};
+		let render = generate_compose(ComposeRenderOptions {
+			project: &project,
+			dev_image: "moon-base:dev",
+			bound_mounts: &[],
+			ssh_agent: Some(&agent),
+		});
+
+		assert!(!render.yaml.contains("    volumes:\n      []"));
+		assert!(render
+			.yaml
+			.contains("- /run/user/1000/keyring/ssh:/run/host-services/ssh-auth.sock"));
+		assert!(render.yaml.contains("SSH_AUTH_SOCK: /run/host-services/ssh-auth.sock"));
 	}
 }

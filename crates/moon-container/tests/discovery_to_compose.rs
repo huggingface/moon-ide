@@ -60,6 +60,7 @@ fn workspace_compose_is_dev_only_with_one_mount_per_folder() {
 		project: &project,
 		dev_image: "moon-base:dev",
 		bound_mounts: &mounts,
+		ssh_agent: None,
 	});
 
 	let yaml = &render.yaml;

@@ -61,7 +61,17 @@ Decisions:
 - **Comfort tooling**: `ripgrep` (`rg`), `fzf`, `bat` (the
   Debian `batcat` symlinked back to `bat`), `jq`.
 - **Standard plumbing**: `git`, `curl`, `wget`, `ca-certificates`,
-  `build-essential`, `less`, `sudo`, `unzip`, `xz-utils`.
+  `build-essential`, `less`, `sudo`, `unzip`, `xz-utils`,
+  `openssh-client` (so `git` over SSH works inside the container
+  when moon-ide forwards the host's agent — see
+  [`specs/containers.md` § SSH agent forwarding](../../specs/containers.md#ssh-agent-forwarding)).
+- **Pre-seeded `/etc/ssh/ssh_known_hosts`** for `github.com` and
+  `gitlab.com`, populated via `ssh-keyscan` at image build time.
+  Lets the first `git fetch` / `git clone` over SSH succeed
+  without an interactive prompt — important because non-interactive
+  `docker exec` invocations would otherwise fail the host-key
+  check. If a provider rotates keys between rebuilds, the
+  prompt-based flow takes over until the next image rebuild.
 - **Non-root `dev` user** (uid 1000, gid 1000) with passwordless
   sudo. The uid lines up with the conventional first user on
   Debian/Ubuntu hosts; Docker Desktop for macOS handles the uid
