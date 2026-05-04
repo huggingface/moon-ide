@@ -34,8 +34,8 @@
 //     belong in the SCM panel (Phase 5, later slice); the gutter
 //     is an at-a-glance indicator, not an editing surface.
 
-import { Facet, StateField, type Extension, type Transaction } from '@codemirror/state';
-import { gutter, GutterMarker } from '@codemirror/view';
+import { EditorSelection, Facet, StateField, type Extension, type Transaction } from '@codemirror/state';
+import { EditorView, gutter, GutterMarker, ViewPlugin, type PluginValue, type ViewUpdate } from '@codemirror/view';
 import { diffLines } from 'diff';
 
 /**
@@ -213,6 +213,118 @@ function markerFor(changes: GitLineChanges, lineNo: number): GutterMarker | null
 	return null;
 }
 
+/**
+ * Overview-ruler ViewPlugin: a thin strip pinned to the editor's
+ * right edge that maps every git-change line onto a scaled-down
+ * position, so the user can see *where* in the file changes live
+ * without scrolling. Markers are clickable — dispatching a
+ * `scrollIntoView` jumps the editor to that line, centred.
+ *
+ * The strip overlays the native scrollbar. `pointer-events: none`
+ * on the container passes scrollbar drag / track-click through to
+ * the browser, while each marker re-enables pointer events so it
+ * can handle its own click. That gives us a discoverable indicator
+ * without commandeering the scrollbar or stealing layout width.
+ */
+class GitOverviewPlugin implements PluginValue {
+	private readonly overlay: HTMLDivElement;
+	private readonly onClick: (event: MouseEvent) => void;
+	private lastChanges: GitLineChanges | null = null;
+	private lastLines = -1;
+
+	constructor(private readonly view: EditorView) {
+		this.overlay = document.createElement('div');
+		this.overlay.className = 'cm-git-overview';
+		// Mount under `.cm-editor` rather than `.cm-scroller` so the
+		// strip stays anchored to the editor frame regardless of
+		// scroll position — we want a global overview, not a
+		// per-viewport indicator.
+		view.dom.appendChild(this.overlay);
+		this.onClick = (event) => this.handleClick(event);
+		this.overlay.addEventListener('click', this.onClick);
+		this.render();
+	}
+
+	update(update: ViewUpdate): void {
+		// Only re-render when the underlying diff or line count
+		// changes. `gitChangesField`'s `update` returns the previous
+		// value by reference when there was no docChange or facet
+		// change, so identity works as our "did anything move?"
+		// check — avoids thrashing the DOM on every keystroke.
+		const changes = update.state.field(gitChangesField, false) ?? null;
+		const lines = update.state.doc.lines;
+		if (changes === this.lastChanges && lines === this.lastLines) {
+			return;
+		}
+		this.lastChanges = changes;
+		this.lastLines = lines;
+		this.render();
+	}
+
+	destroy(): void {
+		this.overlay.removeEventListener('click', this.onClick);
+		this.overlay.remove();
+	}
+
+	private render(): void {
+		const changes = this.view.state.field(gitChangesField, false) ?? null;
+		const lines = this.view.state.doc.lines;
+		// Cheaper than `innerHTML = ''` and avoids the HTML-parsing
+		// cost for each re-render, but functionally the same.
+		while (this.overlay.firstChild) {
+			this.overlay.removeChild(this.overlay.firstChild);
+		}
+		if (!changes || lines <= 0) {
+			return;
+		}
+		const frag = document.createDocumentFragment();
+		const paint = (set: Set<number>, cls: string) => {
+			for (const lineNo of set) {
+				const el = document.createElement('div');
+				el.className = `cm-git-overview-marker ${cls}`;
+				// Centre the marker on its line within the file's
+				// vertical extent. `(lineNo - 0.5) / lines` gives
+				// the fractional midline of a 1-based line number.
+				el.style.top = `${((lineNo - 0.5) / lines) * 100}%`;
+				el.dataset.line = String(lineNo);
+				frag.appendChild(el);
+			}
+		};
+		paint(changes.added, 'cm-git-overview-added');
+		paint(changes.modified, 'cm-git-overview-modified');
+		// Fold both deletion variants into one colour bucket; the
+		// overview's job is "here's where deletions were", not
+		// "distinguish above-from-below". The gutter already
+		// differentiates them visually.
+		paint(changes.deletedAbove, 'cm-git-overview-deleted');
+		paint(changes.deletedBelow, 'cm-git-overview-deleted');
+		this.overlay.appendChild(frag);
+	}
+
+	private handleClick(event: MouseEvent): void {
+		const target = event.target;
+		if (!(target instanceof HTMLElement)) {
+			return;
+		}
+		const lineStr = target.dataset.line;
+		if (lineStr === undefined) {
+			return;
+		}
+		const lineNo = Number(lineStr);
+		if (!Number.isFinite(lineNo) || lineNo < 1 || lineNo > this.view.state.doc.lines) {
+			return;
+		}
+		const line = this.view.state.doc.line(lineNo);
+		this.view.dispatch({
+			selection: EditorSelection.cursor(line.from),
+			effects: EditorView.scrollIntoView(line.from, { y: 'center' }),
+		});
+		this.view.focus();
+	}
+}
+
+const gitOverviewPlugin = ViewPlugin.fromClass(GitOverviewPlugin);
+
 export function gitChangesExtension(): Extension {
 	return [
 		gitChangesField,
@@ -233,5 +345,6 @@ export function gitChangesExtension(): Extension {
 			// a change doesn't nudge the editor content sideways.
 			initialSpacer: () => SPACER_MARKER,
 		}),
+		gitOverviewPlugin,
 	];
 }

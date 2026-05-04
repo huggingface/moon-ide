@@ -6,6 +6,7 @@
 ## What shipped
 
 - A dedicated CodeMirror gutter that paints per-line git change markers (green bar for additions, blue bar for modifications, red wedge for deletions) in the regular editor view.
+- A thin **overview ruler** pinned to the editor's right edge, overlaying the native scrollbar, showing every change in the file at a scaled-down position. Markers are clickable — a click jumps the viewport to that line, centred.
 - Per-file `HEAD` blob cache (`WorkspaceState.headByPath`) fed by the existing `fs_git_head_content` command; lazy-seeded on first activation and re-fetched whenever `refreshGitStatus` runs, so external `git commit` / `checkout` work flows back into the gutter.
 - New extension `src/lib/editor/gitChanges.ts` uses `jsdiff::diffLines` in a StateField that recomputes on every transaction, so markers stay in sync while the user types.
 - New dependency: `diff` (`jsdiff`).
@@ -42,6 +43,14 @@ Prerequisites: `bun install`, `bun run tauri dev`, a bound folder that is a git 
 2. Open an untracked file. The gutter is blank and stays blank after edits (no `HEAD` side to compare against).
 3. Open an untitled buffer (`Ctrl+N`). Gutter is blank.
 4. Open a file inside a folder that isn't a git repo. Gutter is blank. No errors in the dev console / Rust log.
+
+### Overview ruler
+
+1. With a modified file open, a column of tiny coloured ticks appears on the right edge of the editor (overlaid on the scrollbar track). Green / blue / red map to the same semantics as the gutter.
+2. Hovering a tick fattens it slightly (visual cue that it's interactive).
+3. Click a tick. The editor scrolls so the corresponding line is centred, and the caret lands on that line.
+4. Scrollbar drag / wheel scroll still work normally — the overlay passes pointer events through except directly on the markers themselves.
+5. On a file with many changes, ticks stack at the same approximate y-position; that's fine — the overview is a heat map, not a precise list.
 
 ### Visual polish
 

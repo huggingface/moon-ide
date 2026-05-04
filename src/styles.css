@@ -497,3 +497,50 @@ button:focus-visible {
 .cm-git-change-deleted-below::before {
 	bottom: -3px;
 }
+
+/* Git-change overview ruler. A thin column pinned to the editor's
+   right edge, overlaying the native scrollbar, where every change
+   in the file is plotted at its scaled vertical position. Invisible
+   until a change exists, `pointer-events: none` on the container
+   passes scrollbar interactions through to the browser, and each
+   marker re-enables its own events so a click jumps the viewport
+   to that line. Colour families match the per-line gutter so the
+   eye reads "green = add, blue = modify, red = delete" in both
+   places. */
+.cm-editor .cm-git-overview {
+	position: absolute;
+	top: 0;
+	right: 0;
+	bottom: 0;
+	width: 10px;
+	z-index: 5;
+	pointer-events: none;
+}
+.cm-git-overview-marker {
+	position: absolute;
+	right: 1px;
+	width: 6px;
+	/* Minimum visual height so a single-line change in a multi-
+	   thousand-line file still shows up. Fractional positioning
+	   stays intact because `top` is set in %; `height` is absolute. */
+	height: 3px;
+	margin-top: -1px;
+	border-radius: 1px;
+	pointer-events: auto;
+	cursor: pointer;
+	opacity: 0.75;
+}
+.cm-git-overview-marker:hover {
+	opacity: 1;
+	width: 8px;
+	right: 0;
+}
+.cm-git-overview-added {
+	background: var(--m-success);
+}
+.cm-git-overview-modified {
+	background: var(--m-accent);
+}
+.cm-git-overview-deleted {
+	background: var(--m-danger);
+}
