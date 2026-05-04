@@ -456,6 +456,9 @@ function buildDecorations(view: EditorView): DecorationSet {
 	}
 	const head = view.state.selection.main.head;
 	const line = view.state.doc.lineAt(head);
+	// The buffer can grow past the last-saved blame when the user
+	// types newlines without saving; those lines legitimately have
+	// no entry. Normal; the widget reappears after save.
 	const entry = blame.lines[line.number - 1];
 	if (!entry) {
 		return Decoration.none;

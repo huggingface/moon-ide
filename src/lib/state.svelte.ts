@@ -223,6 +223,13 @@ class WorkspaceState {
 	// then the user's Ctrl+S); batching means one `git blame`
 	// subprocess instead of a cascade.
 	#blameTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+	// Paths whose blame IPC is currently outstanding. Prevents a
+	// redundant second fetch when both `openFile` (first load) and
+	// `setActive` (tab focus) fire in the same microtask, or when a
+	// file is open in both splits and each Editor instance triggers
+	// its own refresh. Cleared by `refreshBlame` itself on resolve/
+	// reject.
+	#blameInFlight: Set<string> = new Set();
 	// Per-language server state, keyed by LSP language id (`'typescript'`,
 	// later `'rust'` / `'svelte'` / …). Populated by `lsp:status`
 	// broker events. The status bar renders one pill per entry whose
@@ -839,6 +846,24 @@ class WorkspaceState {
 		if (this.activePath !== null) {
 			this.requestEditorFocus();
 		}
+		// Seed git blame for the initially-visible buffers on both
+		// splits. Session restore bypasses `setActive` (it assigns
+		// `leftActive` / `rightActive` directly while loading), so
+		// the normal "buffer became active → fetch blame" trigger
+		// never fires for the first tab. Doing it here runs after
+		// the backend's active folder has been finalised by
+		// `setActiveFolder(session.active_folder_path)` above, so
+		// the IPC hits the right folder's host. Non-active tabs
+		// fetch lazily on first click through `setActive`.
+		for (const activePath of [this.leftActive, this.rightActive]) {
+			if (activePath === null) {
+				continue;
+			}
+			const file = this.openFiles.find((f) => f.path === activePath);
+			if (file && file.kind === 'text') {
+				this.refreshBlame(activePath);
+			}
+		}
 		// Warm the editorconfig cache for every restored tab in the
 		// active folder so the initial paint already shows the right
 		// indent settings.
@@ -1210,6 +1235,14 @@ class WorkspaceState {
 		if (path.startsWith('untitled:')) {
 			return;
 		}
+		if (this.#blameInFlight.has(path)) {
+			// Another trigger (first-open + activate, dual-split
+			// mount, etc.) already kicked off the fetch. Skipping
+			// here avoids a redundant subprocess — the in-flight one
+			// will populate the cache for both callers.
+			return;
+		}
+		this.#blameInFlight.add(path);
 		void ipc.fs
 			.gitBlame(path)
 			.then((blame) => {
@@ -1229,9 +1262,12 @@ class WorkspaceState {
 				this.blameByPath = next;
 			})
 			.catch(() => {
-				// Non-fatal. No blame = no widget; toast here would be
-				// noise every time the user opens a file outside a
-				// repo or one git can't attribute.
+				// Non-fatal. No blame = no widget. Backend logs the
+				// reason at tracing::debug so `RUST_LOG=moon_core=debug`
+				// recovers the detail when triaging.
+			})
+			.finally(() => {
+				this.#blameInFlight.delete(path);
 			});
 	}
 
@@ -1324,10 +1360,10 @@ class WorkspaceState {
 				// event, the server still holds its open state.
 				if (next.kind === 'text') {
 					this.lspOpen(next.path, next.text);
-					// Kick off the initial blame fetch. Fire-and-forget:
-					// the current-line widget picks up the cache entry
-					// whenever the IPC resolves.
-					this.refreshBlame(next.path);
+					// Blame fetch is handled by `setActive` (called a
+					// few lines below). Routing through there covers
+					// session-restored files and cross-folder jumps
+					// too, none of which come through this branch.
 				}
 			} catch (err) {
 				this.flash(`Failed to open ${path}: ${formatError(err)}`);
@@ -1941,6 +1977,16 @@ class WorkspaceState {
 			this.rightActive = path;
 		}
 		this.focusedSide = side;
+		// Lazy-seed blame for the newly-active buffer. Covers all
+		// paths into `openFiles`: fresh `openFile`, session restore
+		// (which bulk-populates the list without calling openFile),
+		// cross-folder go-to-definition, and so on. The in-flight
+		// guard in `refreshBlame` keeps this cheap — once the cache
+		// has an entry or a fetch is pending, this call is a no-op.
+		const file = this.openFiles.find((f) => f.path === path);
+		if (file && file.kind === 'text' && !this.blameByPath.has(path)) {
+			this.refreshBlame(path);
+		}
 		// Nav history: only push on genuine user navigation. We're
 		// inside `navigateBack` / `navigateForward` / `jumpTo` when
 		// `suppressNavPush` is set; skipping the push there prevents

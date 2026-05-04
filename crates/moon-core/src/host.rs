@@ -570,12 +570,32 @@ fn run_git_blame(root: &Utf8Path, path: &Utf8PathBuf) -> MoonResult<Option<GitFi
 		return Ok(None);
 	};
 	if !output.status.success() {
-		// Non-repo, untracked file, etc. all exit non-zero. Swallow
-		// stderr on purpose — a failed blame is UI-silent by contract.
+		// Non-repo, untracked file, etc. all exit non-zero. The UI
+		// stays silent by contract (no toast), but we log stderr at
+		// debug so a developer chasing "why is blame missing for
+		// this one file?" has a breadcrumb without recompiling.
+		let stderr = String::from_utf8_lossy(&output.stderr);
+		tracing::debug!(
+			path = %path,
+			code = output.status.code().unwrap_or(-1),
+			stderr = %stderr.trim(),
+			"git blame exited non-zero"
+		);
 		return Ok(None);
 	}
 	let mut blame = parse_blame_porcelain(&output.stdout, path.as_str().to_owned());
 	blame.remote_url = remote_web_url(root).unwrap_or_default();
+	// Sanity-log the parse outcome. If every line has `sha=""` the
+	// parser fell off the porcelain happy path — useful to know when
+	// the UI shows "no blame" despite a successful exit.
+	let filled = blame.lines.iter().filter(|l| !l.sha.is_empty()).count();
+	tracing::debug!(
+		path = %path,
+		lines = blame.lines.len(),
+		filled,
+		stdout_bytes = output.stdout.len(),
+		"git blame parsed"
+	);
 	Ok(Some(blame))
 }
 
