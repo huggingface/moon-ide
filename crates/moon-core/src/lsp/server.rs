@@ -47,8 +47,7 @@ pub enum LspServerEvent {
 }
 
 /// Which binary to spawn for a given LSP language. One entry per
-/// language id we intend to support. For stage 1 only `typescript`
-/// is populated.
+/// language id we intend to support.
 ///
 /// `install_hint` is what the status bar's "not available" pill
 /// suggests — short and actionable, no prose. On the happy path the
@@ -58,6 +57,29 @@ pub struct LspBinarySpec {
 	pub bin_name: &'static str,
 	pub args: &'static [&'static str],
 	pub install_hint: &'static str,
+	pub discovery: DiscoveryStrategy,
+}
+
+/// Where to look for `bin_name` before falling through to `$PATH`.
+///
+/// Each strategy picks one ecosystem-idiomatic location: Node users
+/// expect `node_modules/.bin/` to win even when there's a global
+/// install, Rust users expect `~/.cargo/bin/` to be found even when
+/// the Tauri process didn't inherit the shell's `PATH` (which
+/// happens on GUI-launched apps on macOS / some Linux DEs).
+#[derive(Clone, Copy)]
+pub enum DiscoveryStrategy {
+	/// Walk ancestors from the workspace root looking for
+	/// `node_modules/.bin/<bin>`, then `$PATH`. Matches Node's own
+	/// resolution so pnpm-hoisted monorepos work without special
+	/// casing.
+	NodeModules,
+	/// Check `$CARGO_HOME/bin/<bin>` (falling back to
+	/// `$HOME/.cargo/bin/<bin>`), then `$PATH`. Covers
+	/// `rustup component add rust-analyzer` whose default install
+	/// location isn't always on the launched Tauri process's
+	/// inherited `PATH`.
+	CargoHome,
 }
 
 /// TypeScript / JavaScript server.
@@ -81,6 +103,28 @@ pub const TS_SERVER: LspBinarySpec = LspBinarySpec {
 	bin_name: "tsgo",
 	args: &["--lsp", "--stdio"],
 	install_hint: "bun add -D @typescript/native-preview",
+	discovery: DiscoveryStrategy::NodeModules,
+};
+
+/// Rust server — `rust-analyzer`, the ecosystem-standard LSP.
+///
+/// No per-project install exists for Rust LSPs (unlike `tsgo`), so we
+/// rely on the system toolchain: `rustup component add rust-analyzer`
+/// drops it at `$CARGO_HOME/bin/rust-analyzer`, which is where we
+/// look first. A `cargo install rust-analyzer` build lands in the
+/// same place. `$PATH` is the last resort for hand-compiled or
+/// package-manager-installed copies.
+///
+/// No args: `rust-analyzer` defaults to stdio + LSP, which is
+/// exactly the contract we want. The binary auto-detects the
+/// workspace layout from `initialize.workspaceFolders`, which the
+/// generic `initialize` below already sends.
+pub const RUST_SERVER: LspBinarySpec = LspBinarySpec {
+	language_id: "rust",
+	bin_name: "rust-analyzer",
+	args: &[],
+	install_hint: "rustup component add rust-analyzer",
+	discovery: DiscoveryStrategy::CargoHome,
 };
 
 pub struct LspServer {
@@ -120,11 +164,11 @@ impl LspServer {
 		root: Utf8PathBuf,
 		events: broadcast::Sender<LspServerEvent>,
 	) -> Result<Option<Arc<Self>>, LspClientError> {
-		let Some(resolved) = discover_binary(spec.bin_name, root.as_std_path()) else {
+		let Some(resolved) = discover_binary(spec.bin_name, spec.discovery, root.as_std_path()) else {
 			tracing::info!(
 				bin = spec.bin_name,
 				lang = spec.language_id,
-				"lsp: binary not found in any node_modules or on PATH, server unavailable"
+				"lsp: binary not found via discovery strategy or $PATH, server unavailable"
 			);
 			return Ok(None);
 		};
@@ -474,48 +518,147 @@ impl LspServer {
 	}
 }
 
-/// Locate `bin_name` on disk, preferring a project-local copy over a
-/// global install.
-///
-/// Walks up from `start` looking for `<ancestor>/node_modules/.bin/<bin_name>`
-/// at every level, then falls back to `which`. Matches Node's own
-/// `node_modules` resolution so a pnpm-hoisted monorepo (single
-/// top-level `node_modules`) resolves the same way as a classic
-/// per-package layout.
+/// Locate `bin_name` on disk, preferring an ecosystem-idiomatic
+/// location over a bare `$PATH` lookup.
 ///
 /// Returns `None` when nothing is found — caller treats that as
-/// `NotAvailable`.
+/// `NotAvailable` and surfaces the spec's `install_hint`.
 ///
-/// Platform note: Node's `.bin` entry is a symlink to the real script
-/// on *nix (shebang resolved by the kernel) and a `.cmd` wrapper on
-/// Windows. We pick the right suffix so `tokio::process::Command`
-/// gets a spawn-able path on both.
-fn discover_binary(bin_name: &str, start: &Path) -> Option<PathBuf> {
+/// Platform note: Node's `.bin` entry is a symlink to the real
+/// script on *nix (shebang resolved by the kernel) and a `.cmd`
+/// wrapper on Windows. We pick the right suffix so
+/// `tokio::process::Command` gets a spawn-able path on both. Cargo's
+/// `bin/` has no such dance — both targets install a native executable
+/// (with `.exe` on Windows, which `which`-style resolution and the
+/// explicit check below both handle).
+fn discover_binary(bin_name: &str, strategy: DiscoveryStrategy, start: &Path) -> Option<PathBuf> {
+	match strategy {
+		DiscoveryStrategy::NodeModules => {
+			let filename = if cfg!(windows) {
+				format!("{bin_name}.cmd")
+			} else {
+				bin_name.to_owned()
+			};
+			for ancestor in start.ancestors() {
+				let candidate = ancestor.join("node_modules").join(".bin").join(&filename);
+				if candidate.exists() {
+					tracing::debug!(
+						bin = bin_name,
+						path = %candidate.display(),
+						"lsp: resolved via project-local node_modules"
+					);
+					return Some(candidate);
+				}
+			}
+			match which::which(bin_name) {
+				Ok(path) => {
+					tracing::debug!(bin = bin_name, path = %path.display(), "lsp: resolved via PATH");
+					Some(path)
+				}
+				Err(_) => None,
+			}
+		}
+		DiscoveryStrategy::CargoHome => {
+			// 1. Ask rustup directly. When the tool is a rustup
+			//    component that's installed, this returns the real
+			//    toolchain binary path (bypassing the shim in
+			//    `~/.cargo/bin/`). When the component isn't installed,
+			//    `rustup which` exits non-zero and we fall through —
+			//    critically, we also want to avoid spawning the raw
+			//    shim here because it'd die at startup with
+			//    `Unknown binary '<tool>' in official toolchain`,
+			//    which the broker would report as "Crashed" instead
+			//    of the more useful "install this component" hint.
+			if let Some(path) = rustup_which(bin_name) {
+				tracing::debug!(bin = bin_name, path = %path.display(), "lsp: resolved via rustup which");
+				return Some(path);
+			}
+			// 2. `cargo install` builds land in `~/.cargo/bin/` as
+			//    real executables (not symlinks to rustup). Accept
+			//    those; reject anything that looks like a rustup
+			//    shim for the reason above.
+			if let Some(candidate) = cargo_bin_candidate(bin_name) {
+				if candidate.exists() && !is_rustup_shim(&candidate) {
+					tracing::debug!(
+						bin = bin_name,
+						path = %candidate.display(),
+						"lsp: resolved via cargo home"
+					);
+					return Some(candidate);
+				}
+			}
+			// 3. `$PATH` — last resort for package-manager installs
+			//    or hand-compiled binaries living outside cargo-home.
+			//    Still filter out rustup shims here: `~/.cargo/bin/`
+			//    is typically on `$PATH`, so a naive `which` will
+			//    happily hand us the same broken shim.
+			match which::which(bin_name) {
+				Ok(path) if !is_rustup_shim(&path) => {
+					tracing::debug!(bin = bin_name, path = %path.display(), "lsp: resolved via PATH");
+					Some(path)
+				}
+				_ => None,
+			}
+		}
+	}
+}
+
+/// Probe `rustup which <tool>` and return its reported path. Returns
+/// `None` when rustup isn't on PATH, when the requested tool isn't
+/// installed in the active toolchain, or any other failure mode —
+/// all of which should gracefully surface as "server unavailable"
+/// rather than treated as an error.
+fn rustup_which(tool: &str) -> Option<PathBuf> {
+	let out = std::process::Command::new("rustup")
+		.args(["which", tool])
+		.output()
+		.ok()?;
+	if !out.status.success() {
+		return None;
+	}
+	let raw = String::from_utf8(out.stdout).ok()?;
+	let trimmed = raw.trim();
+	if trimmed.is_empty() {
+		return None;
+	}
+	Some(PathBuf::from(trimmed))
+}
+
+/// Is `path` a rustup proxy shim (i.e. `~/.cargo/bin/<tool>` that's
+/// really a symlink to the `rustup` binary)? A shim spawns rustup
+/// with `argv[0] == <tool>`, which demands that the tool is a known
+/// component in the active toolchain — not a contract we can
+/// satisfy just because the file exists.
+///
+/// Only symlinks can be detected cheaply this way. On Windows
+/// rustup installs per-tool `.exe` shims that are separate binaries
+/// and harder to identify without running them. The `rustup_which`
+/// probe above handles the Windows case by giving us the real path
+/// before we look in `cargo_bin_candidate` at all, so missing
+/// Windows-shim detection here is a small residual risk at most.
+fn is_rustup_shim(path: &Path) -> bool {
+	match std::fs::read_link(path) {
+		Ok(target) => target.file_name() == Some(std::ffi::OsStr::new("rustup")),
+		Err(_) => false,
+	}
+}
+
+/// Resolve `$CARGO_HOME/bin/<bin_name>` with the `$HOME/.cargo/bin/`
+/// fallback that rustup uses when `$CARGO_HOME` isn't set. Returns
+/// `None` only when we can't build any candidate at all (no
+/// `$CARGO_HOME`, no `$HOME` / `$USERPROFILE`) — caller still has
+/// the `$PATH` escape hatch after this.
+fn cargo_bin_candidate(bin_name: &str) -> Option<PathBuf> {
 	let filename = if cfg!(windows) {
-		format!("{bin_name}.cmd")
+		format!("{bin_name}.exe")
 	} else {
 		bin_name.to_owned()
 	};
-
-	for ancestor in start.ancestors() {
-		let candidate = ancestor.join("node_modules").join(".bin").join(&filename);
-		if candidate.exists() {
-			tracing::debug!(
-				bin = bin_name,
-				path = %candidate.display(),
-				"lsp: resolved via project-local node_modules"
-			);
-			return Some(candidate);
-		}
-	}
-
-	match which::which(bin_name) {
-		Ok(path) => {
-			tracing::debug!(bin = bin_name, path = %path.display(), "lsp: resolved via PATH");
-			Some(path)
-		}
-		Err(_) => None,
-	}
+	let base = std::env::var_os("CARGO_HOME")
+		.map(PathBuf::from)
+		.or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))
+		.or_else(|| std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join(".cargo")))?;
+	Some(base.join("bin").join(filename))
 }
 
 fn path_to_file_uri(path: &Path) -> lt::Uri {
@@ -562,7 +705,7 @@ mod tests {
 		fs::write(&bin_path, b"#!/bin/sh\n").unwrap();
 		make_executable(&bin_path);
 
-		let found = discover_binary("my-lsp", tmp.path());
+		let found = discover_binary("my-lsp", DiscoveryStrategy::NodeModules, tmp.path());
 		assert_eq!(found.as_deref(), Some(bin_path.as_path()));
 	}
 
@@ -584,7 +727,7 @@ mod tests {
 		let nested = tmp.path().join("apps").join("web");
 		fs::create_dir_all(&nested).unwrap();
 
-		let found = discover_binary("my-lsp", &nested);
+		let found = discover_binary("my-lsp", DiscoveryStrategy::NodeModules, &nested);
 		assert_eq!(found.as_deref(), Some(bin_path.as_path()));
 	}
 
@@ -607,7 +750,8 @@ mod tests {
 		fs::write(&local, b"#!/bin/sh\n").unwrap();
 		make_executable(&local);
 
-		let found = discover_binary(probe_name, tmp.path()).expect("project-local should resolve");
+		let found =
+			discover_binary(probe_name, DiscoveryStrategy::NodeModules, tmp.path()).expect("project-local should resolve");
 		assert_eq!(found, local, "project-local copy must win over PATH");
 	}
 
@@ -616,7 +760,103 @@ mod tests {
 	#[test]
 	fn discover_returns_none_when_missing_everywhere() {
 		let tmp = tempfile::tempdir().unwrap();
-		let found = discover_binary("definitely-not-a-real-lsp-server-xyzzy", tmp.path());
+		let found = discover_binary(
+			"definitely-not-a-real-lsp-server-xyzzy",
+			DiscoveryStrategy::NodeModules,
+			tmp.path(),
+		);
 		assert!(found.is_none());
+	}
+
+	/// Rustup pre-creates a symlink at `$CARGO_HOME/bin/<tool>` for
+	/// every known component, regardless of whether the component is
+	/// actually installed. Running the shim when the component is
+	/// missing fails with `Unknown binary`. Discovery must see
+	/// through that and refuse the shim so the broker surfaces the
+	/// right install hint.
+	///
+	/// Unix-only: on Windows rustup uses per-tool `.exe` shims that
+	/// aren't cheaply distinguishable without running them. The
+	/// `rustup_which` probe handles that case before we get here.
+	#[cfg(unix)]
+	#[test]
+	fn discover_rejects_rustup_shim_in_cargo_home() {
+		use std::os::unix::fs::symlink;
+
+		let tmp = tempfile::tempdir().unwrap();
+		let bin_dir = tmp.path().join("bin");
+		fs::create_dir_all(&bin_dir).unwrap();
+		// Create a fake `rustup` binary first — it's the symlink
+		// target we check for. Contents don't matter for the shim
+		// test; we never spawn it here.
+		let rustup_path = bin_dir.join("rustup");
+		fs::write(&rustup_path, b"#!/bin/sh\nexit 101\n").unwrap();
+		make_executable(&rustup_path);
+		// Now drop a shim that points at it — exactly what rustup
+		// does for known-but-not-installed components.
+		let shim = bin_dir.join("phantom-tool");
+		symlink("rustup", &shim).unwrap();
+
+		let prev = std::env::var_os("CARGO_HOME");
+		// SAFETY: single-threaded env mutation for this test; previous
+		// value restored below. See `discover_uses_cargo_home_when_set`
+		// for the rationale.
+		unsafe {
+			std::env::set_var("CARGO_HOME", tmp.path());
+		}
+		let found = discover_binary("phantom-tool", DiscoveryStrategy::CargoHome, tmp.path());
+		// SAFETY: see above.
+		unsafe {
+			match prev {
+				Some(v) => std::env::set_var("CARGO_HOME", v),
+				None => std::env::remove_var("CARGO_HOME"),
+			}
+		}
+		assert!(
+			found.is_none(),
+			"a rustup shim must not be reported as a usable LSP binary"
+		);
+	}
+
+	/// CargoHome strategy resolves `$CARGO_HOME/bin/<bin>` when set.
+	/// Test pattern: mutating process env is a global concern, so we
+	/// set the var for just this test's duration (and pick a binary
+	/// name nothing else would ever find, so leaked state never
+	/// masks a real failure elsewhere).
+	#[test]
+	fn discover_uses_cargo_home_when_set() {
+		let tmp = tempfile::tempdir().unwrap();
+		let bin_dir = tmp.path().join("bin");
+		fs::create_dir_all(&bin_dir).unwrap();
+		let bin_name = if cfg!(windows) { "fake-ra.exe" } else { "fake-ra" };
+		let bin_path = bin_dir.join(bin_name);
+		fs::write(&bin_path, b"#!/bin/sh\n").unwrap();
+		make_executable(&bin_path);
+
+		// `CARGO_HOME` points at the temp dir; the file under
+		// `$CARGO_HOME/bin/` must win over any PATH lookup that
+		// might find a real rust-analyzer on the dev's machine.
+		//
+		// SAFETY: `std::env::set_var` was marked unsafe in Rust
+		// 1.90 because multi-threaded writes to the env table can
+		// race with libc readers. This test binary is
+		// single-threaded for this read/write, and we restore the
+		// original value on exit; no other test in this module
+		// touches `CARGO_HOME`. Accepted trade-off for the
+		// coverage.
+		let prev = std::env::var_os("CARGO_HOME");
+		// SAFETY: see above.
+		unsafe {
+			std::env::set_var("CARGO_HOME", tmp.path());
+		}
+		let found = discover_binary("fake-ra", DiscoveryStrategy::CargoHome, tmp.path());
+		// SAFETY: see above.
+		unsafe {
+			match prev {
+				Some(v) => std::env::set_var("CARGO_HOME", v),
+				None => std::env::remove_var("CARGO_HOME"),
+			}
+		}
+		assert_eq!(found.as_deref(), Some(bin_path.as_path()));
 	}
 }

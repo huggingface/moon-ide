@@ -27,7 +27,7 @@ use moon_protocol::lsp as mp;
 use tokio::sync::{broadcast, Mutex};
 
 use super::client::LspClientError;
-use super::server::{LspBinarySpec, LspServer, LspServerEvent, TS_SERVER};
+use super::server::{LspBinarySpec, LspServer, LspServerEvent, RUST_SERVER, TS_SERVER};
 
 pub struct LspBroker {
 	root: Utf8PathBuf,
@@ -75,11 +75,12 @@ impl LspBroker {
 	/// than surface "unknown language" errors — plenty of file
 	/// types have no LSP (e.g. Markdown in stage 1).
 	fn spec_for(language_id: &str) -> Option<&'static LspBinarySpec> {
-		// typescript-language-server handles all four JS/TS flavours
-		// through one process; internally tsserver will spawn a
-		// second project for JS if needed.
+		// One entry per broker server, not per file-extension: `tsgo`
+		// handles all four JS/TS flavours in a single process, and
+		// `rust-analyzer` handles everything a `.rs` file asks for.
 		match language_id {
 			"typescript" | "typescriptreact" | "javascript" | "javascriptreact" => Some(&TS_SERVER),
+			"rust" => Some(&RUST_SERVER),
 			_ => None,
 		}
 	}

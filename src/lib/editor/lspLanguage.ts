@@ -8,8 +8,8 @@
 //
 // Return `null` for file types that have no wired-up LSP server —
 // callers skip LSP calls entirely rather than surface "no server"
-// errors. Markdown, Rust, Svelte, etc. get `null` until their
-// servers land in a later stage.
+// errors. Markdown, Svelte, etc. get `null` until their servers
+// land in a later stage.
 
 const BY_EXTENSION: Record<string, string> = {
 	ts: 'typescript',
@@ -20,6 +20,7 @@ const BY_EXTENSION: Record<string, string> = {
 	mjs: 'javascript',
 	cjs: 'javascript',
 	jsx: 'javascriptreact',
+	rs: 'rust',
 };
 
 export function lspLanguageFor(path: string): string | null {

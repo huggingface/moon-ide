@@ -1,6 +1,6 @@
 # LSP
 
-Status: partial — TypeScript diagnostics + hover + completion + goto-definition + nav history shipped across the stage-1 and stage-2 slices of Phase 4. Every other language (Rust, Svelte, CSS, HTML, JSON) is architecturally in scope and not yet wired.
+Status: partial — TypeScript + Rust both have diagnostics + hover + completion + goto-definition + nav history wired via the stage-1/stage-2 slices of Phase 4. Every other language (Svelte, CSS, HTML, JSON) is architecturally in scope and not yet wired.
 
 ## The non-negotiable invariant
 
@@ -70,6 +70,18 @@ LSP's default. CodeMirror's native string offsets are UTF-16 code units too (JS 
 
 Switching the active folder drops the broker and rebuilds. The frontend's `openFile` handles re-issuing `didOpen` naturally — tabs that survive the switch will re-open against the new broker the first time the editor re-renders them. Not atomic across the switch; the user sees a short "starting…" pill and diagnostics return when tsserver finishes its first pass.
 
+### Rust server: `rust-analyzer`
+
+The ecosystem-standard LSP. No per-project install exists for Rust LSPs (unlike `tsgo`), so we rely on the system toolchain. Install on the developer's host:
+
+```
+rustup component add rust-analyzer
+```
+
+This drops `rust-analyzer` at `$CARGO_HOME/bin/rust-analyzer` (typically `~/.cargo/bin/rust-analyzer`). A `cargo install rust-analyzer` build or a distro package manager install both land on `$PATH`; both shapes resolve without extra work.
+
+No startup args: `rust-analyzer` defaults to stdio + LSP when invoked with no flags, which is exactly what we want. It auto-detects workspace layout from `initialize.workspaceFolders`, so the generic init we already send suffices. Advanced configuration (`checkOnSave`, `cargo.features`, proc-macro toggles, etc.) is left at defaults for now — we'll add `workspace/didChangeConfiguration` plumbing when a real need surfaces.
+
 ### TypeScript server: `tsgo`, not `typescript-language-server`
 
 We target Microsoft's native TS 7 port (`@typescript/native-preview`, binary name `tsgo`) rather than the community `typescript-language-server` wrapper. Rationale:
@@ -81,17 +93,18 @@ We target Microsoft's native TS 7 port (`@typescript/native-preview`, binary nam
 
 Trade-off: tsgo is still a preview channel. The `API over LSP implementation` PR (`microsoft/typescript-go#2302`) is in draft; a few LSP features may be incomplete or behave differently from `typescript-language-server`. If we hit a gap that blocks us, the migration path is a **one-string change** in `moon-core/src/lsp/server.rs`'s `TS_SERVER` spec — our client code is wire-protocol-agnostic.
 
-### Binary discovery: project-local first, then PATH
+### Binary discovery: ecosystem-idiomatic first, then PATH
 
-`moon-core::lsp::server::discover_binary` walks up from the broker's root looking for `<ancestor>/node_modules/.bin/<bin_name>` at every level, then falls back to `which::which(bin_name)`. Matches Node's own resolution algorithm — so a pnpm-hoisted monorepo (single top-level `node_modules`) works the same as a classic per-package layout.
+Discovery is per-language via `LspBinarySpec::discovery`:
 
-The first match wins: a project-pinned copy always beats a global install. This lets a monorepo freeze a specific LSP version without affecting other projects on the same machine.
+- **`DiscoveryStrategy::NodeModules`** (TS / JS): walks up from the broker's root looking for `<ancestor>/node_modules/.bin/<bin_name>` at every level, then falls back to `which::which(bin_name)`. Matches Node's own resolution algorithm — pnpm-hoisted monorepos (single top-level `node_modules`) work identically to classic per-package layouts. The first match wins: a project-pinned copy always beats a global install, letting a monorepo freeze a specific LSP version without affecting other projects on the same machine.
+- **`DiscoveryStrategy::CargoHome`** (Rust): checks `$CARGO_HOME/bin/<bin_name>` (fallback `$HOME/.cargo/bin/<bin_name>`, or `$USERPROFILE/.cargo/bin/` on Windows), then `$PATH`. Covers `rustup component add rust-analyzer` — the default install location isn't always on a GUI-launched process's inherited `PATH`, especially on macOS and some Linux desktop environments.
 
-On Windows we look for `<bin>.cmd` rather than `<bin>` because that's how npm's `.bin` wrapper lands on that platform. Spawning the `.cmd` is a regular `CreateProcess` call; no special handling needed.
+On Windows we adjust the filename per strategy: `<bin>.cmd` for the Node case (npm's `.bin` wrapper), `<bin>.exe` for Cargo (native executables).
 
-If nothing is found on disk, the broker caches a `NotAvailable` slot per language and emits `lsp:status { status: 'notavailable' }`. The status bar paints a quiet pill whose tooltip is the spec's `install_hint` field (e.g. `bun add -D @typescript/native-preview`) — copy-pasteable into a terminal.
+If nothing is found on disk, the broker caches a `NotAvailable` slot per language and emits `lsp:status { status: 'notavailable' }`. The status bar paints a quiet pill whose tooltip is the spec's `install_hint` field (e.g. `bun add -D @typescript/native-preview` or `rustup component add rust-analyzer`) — copy-pasteable into a terminal.
 
-Phase 2 (containers) will pre-install the server in `moon-base` so the container-backed story is pill-free without relying on the host's package manager.
+Phase 2 (containers) will pre-install each wired language server in `moon-base` so the container-backed story is pill-free without relying on the host's package manager. Today the LSP broker spawns children on the host only — the `cargo` / `tsgo` binaries inside a devcontainer don't participate; routing LSP stdio through the container host is a deliberate later scope.
 
 ### Client capabilities are minimal
 
