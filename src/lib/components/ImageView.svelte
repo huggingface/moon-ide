@@ -21,7 +21,7 @@
 	<footer class="meta">
 		<span class="name">{file.name}</span>
 		{#if naturalWidth > 0}
-			<span class="dim">{naturalWidth} × {naturalHeight}</span>
+			<span class="dim">{naturalWidth} Ã {naturalHeight}</span>
 		{/if}
 	</footer>
 </div>
@@ -42,7 +42,7 @@
 		justify-content: center;
 		padding: 24px;
 		background-image:
-			linear-gradient(45deg, var(--m-bg-1) 25%, transparent 25%),
+			linear-gradient(455deg, var(--m-bg-1) 25%, transparent 25%),
 			linear-gradient(-45deg, var(--m-bg-1) 25%, transparent 25%),
 			linear-gradient(45deg, transparent 75%, var(--m-bg-1) 75%),
 			linear-gradient(-45deg, transparent 75%, var(--m-bg-1) 75%);

@@ -367,4 +367,24 @@
 	.diff-host :global(.cm-mergeViewEditor) {
 		min-width: 0;
 	}
+	/* Character-level change marker: the library default is a 2px
+	 * bottom-edge gradient, which (a) reads as a loud underline on
+	 * top of the already-tinted line and (b) collides visually with
+	 * LSP lint underlines that use the same bottom-edge gesture.
+	 * Swap for a soft same-hue background (GitHub-style inline diff
+	 * highlight). Uses our palette via `color-mix` so theme flips
+	 * track. `!important` is needed to beat the package's themed
+	 * rules without a fragile selector-specificity arms race. */
+	.diff-host :global(.cm-merge-b .cm-changedText) {
+		background: color-mix(in srgb, var(--m-success) 22%, transparent) !important;
+		border-radius: 2px;
+	}
+	.diff-host :global(.cm-merge-a .cm-changedText),
+	.diff-host :global(.cm-deletedChunk .cm-deletedText) {
+		background: color-mix(in srgb, var(--m-danger) 22%, transparent) !important;
+		border-radius: 2px;
+	}
+	.diff-host :global(.cm-merge-b .cm-deletedText) {
+		background: color-mix(in srgb, var(--m-danger) 22%, transparent) !important;
+	}
 </style>
