@@ -22,6 +22,25 @@
 	let resizingChat = $state(false);
 	let resizingBottom = $state(false);
 
+	// True when the keyboard event originated in a surface where
+	// native word-motion (Alt+Arrow) is what the user actually
+	// wants — the command palette search, the Slack composer, any
+	// HTML form field. Used by the window-level Alt+Arrow handler
+	// to opt out so CM's own keymap / the browser default still
+	// runs in those cases. CM editors are NOT in this list by
+	// design: Alt+Left there is our "navigate back" gesture, not
+	// word-motion.
+	function isTextInputTarget(target: EventTarget | null): boolean {
+		if (!(target instanceof HTMLElement)) {
+			return false;
+		}
+		if (target.isContentEditable && !target.closest('.cm-editor')) {
+			return true;
+		}
+		const tag = target.tagName;
+		return tag === 'INPUT' || tag === 'TEXTAREA';
+	}
+
 	onMount(() => {
 		void hydrate();
 		const onKey = async (event: KeyboardEvent) => {
@@ -32,6 +51,31 @@
 				event.preventDefault();
 				cycleFocus(!event.shiftKey);
 				return;
+			}
+			// Alt+Left / Alt+Right = navigate back / forward through
+			// file history. Intentionally global rather than an
+			// editor-scoped keymap so it works from a diff tab, an
+			// image tab, or the tree — anywhere a user might want
+			// to step back to the previous place they were
+			// reading. Always swallows the event (preventDefault +
+			// stopPropagation), regardless of whether there's
+			// anywhere to navigate to: a stale "Alt+Left on a fresh
+			// session" shouldn't leak through to CM's word-motion
+			// default and silently move the caret. Inputs /
+			// textareas are exempt so word-motion still works inside
+			// the command palette and similar surfaces.
+			if (event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey) {
+				const arrow = event.key === 'ArrowLeft' ? 'back' : event.key === 'ArrowRight' ? 'forward' : null;
+				if (arrow !== null && !isTextInputTarget(event.target)) {
+					event.preventDefault();
+					event.stopPropagation();
+					if (arrow === 'back' && workspace.canNavigateBack) {
+						void workspace.navigateBack();
+					} else if (arrow === 'forward' && workspace.canNavigateForward) {
+						void workspace.navigateForward();
+					}
+					return;
+				}
 			}
 			const ctrl = event.ctrlKey || event.metaKey;
 			if (!ctrl) {
@@ -121,8 +165,19 @@
 				return;
 			}
 		};
-		window.addEventListener('keydown', onKey);
-		return () => window.removeEventListener('keydown', onKey);
+		// Capture-phase listener. Pierre's `@pierre/trees` web
+		// component (and occasionally other focusable surfaces)
+		// swallow ArrowLeft / ArrowRight for their own internal
+		// navigation via `stopPropagation()`. Capturing at the
+		// window means our `Alt+Arrow` handler runs *before* any
+		// descendant component sees the event, so navigation works
+		// from the tree and anywhere else focus might have
+		// wandered. The rest of the shortcuts in this listener are
+		// Ctrl/Cmd-based and wouldn't collide with descendant
+		// handlers either way; capture is strictly a fix for the
+		// Alt+Arrow case but doesn't harm the others.
+		window.addEventListener('keydown', onKey, true);
+		return () => window.removeEventListener('keydown', onKey, true);
 	});
 
 	async function hydrate() {

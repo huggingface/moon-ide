@@ -272,45 +272,32 @@ export const builtInCommands: Command[] = [
 		},
 	},
 	{
-		id: 'git.toggleDiffView',
-		// Label mirrors the current mode so the palette doubles as a
-		// status indicator. Deleted buffers are held in diff view
-		// (there's no editor to flip back to — the file is gone),
-		// so the "exit" form is suppressed there.
-		title: () => {
-			const path = workspace.activePath;
-			if (path !== null && workspace.diffModeFor(path)) {
-				return 'Git: Exit Diff View';
-			}
-			return 'Git: View Diff';
-		},
-		// Visible only when the active file has something diffable:
-		// a modified working-tree change or a deleted row still open
-		// in a tab. Untracked / added / ignored files have no `HEAD`
-		// side; offering the command on them would just show an
-		// empty-vs-current "everything is new" view that isn't
-		// useful beyond the editor itself.
+		id: 'git.viewDiff',
+		title: 'Git: View Diff',
+		// Visible only when the active file is a **modified**
+		// working-tree change. Deleted files already render in diff
+		// view on their own, and untracked / added / ignored files
+		// have no `HEAD` side worth rendering. Diff tabs themselves
+		// hide the command — there's nothing to toggle *to* from
+		// within the diff.
 		visible: () => {
 			const path = workspace.activePath;
 			if (path === null) {
 				return false;
 			}
 			const file = workspace.openFiles.find((f) => f.path === path);
-			if (file?.isDeleted) {
-				// Visible but essentially informational — the run()
-				// is a no-op (see toggleDiffMode). Leave it listed so
-				// the palette reflects current state.
-				return true;
+			if (!file || file.isDeleted || file.isDiffTab) {
+				return false;
 			}
 			const entry = workspace.gitStatusEntries.find((e) => e.path === path);
-			return entry?.status === 'modified' || entry?.status === 'deleted';
+			return entry?.status === 'modified';
 		},
 		run: () => {
 			const path = workspace.activePath;
 			if (path === null) {
 				return;
 			}
-			workspace.toggleDiffMode(path);
+			void workspace.openDiffTab(path);
 		},
 	},
 ];

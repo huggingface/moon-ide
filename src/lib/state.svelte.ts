@@ -97,6 +97,18 @@ export type OpenFile = {
 	// the session so a deleted row the user left open pops back up
 	// in diff mode after a restart.
 	isDeleted: boolean;
+	// True for buffers that are a dedicated diff tab for an
+	// underlying real path (see `DIFF_TAB_PREFIX`). The tab
+	// identity is the synthetic `moon-diff:<realPath>` string;
+	// `realPath` carries the path this tab's diff is computed
+	// against. Deliberately independent from `isDeleted` so deleted
+	// files keep their single-tab shape (nothing to diff against,
+	// there's only one reasonable pane).
+	isDiffTab: boolean;
+	// Workspace-relative path the diff tab wraps. Empty string when
+	// `isDiffTab` is false — the field exists unconditionally so
+	// destructuring / persistence stays uniform across all buffers.
+	realPath: string;
 };
 
 /**
@@ -137,16 +149,6 @@ class FolderState {
 	// itself). Per folder so a `README.md` in folder A and folder B
 	// keep independent toggles.
 	previewModes = $state<Map<string, MarkdownView>>(new Map());
-
-	// Per-buffer git-diff view toggle. Modified files default to
-	// `false` (show the normal editor); deleted files default to
-	// `true` and stay that way for the buffer's lifetime (there's
-	// nothing editable to fall back to). Scoped per folder for the
-	// same reason `previewModes` is — a `README.md` open in folder
-	// A and folder B keeps independent toggles. Not persisted:
-	// diff-view is a transient "show me what changed" gesture, not
-	// part of the user's layout.
-	diffModes = $state<Map<string, boolean>>(new Map());
 
 	// Per-folder counter for `Untitled-N` IDs. Per-folder so each
 	// folder's untitled sequence starts at 1 — independent of how
@@ -475,15 +477,6 @@ class WorkspaceState {
 	private set previewModes(value: Map<string, MarkdownView>) {
 		if (this.activeFolderState) {
 			this.activeFolderState.previewModes = value;
-		}
-	}
-
-	private get diffModes(): Map<string, boolean> {
-		return this.activeFolderState?.diffModes ?? new Map();
-	}
-	private set diffModes(value: Map<string, boolean>) {
-		if (this.activeFolderState) {
-			this.activeFolderState.diffModes = value;
 		}
 	}
 
@@ -828,8 +821,21 @@ class WorkspaceState {
 					const loaded: OpenFile[] = [];
 					for (const path of unique) {
 						try {
-							const kind = fileKindFor(path);
-							const file = kind === 'image' ? await this.loadImageFile(path) : await this.loadTextFile(path);
+							const diffReal = realPathFromDiffTab(path);
+							let file: OpenFile | null;
+							if (diffReal !== null) {
+								// Synthetic diff-tab path: materialise
+								// directly. We don't touch `realPath`
+								// on disk here — DiffView handles the
+								// fetch on mount, and a missing-on-
+								// disk `realPath` just means empty-
+								// vs-HEAD, which is still a
+								// meaningful diff.
+								file = this.loadDiffTab(diffReal);
+							} else {
+								const kind = fileKindFor(path);
+								file = kind === 'image' ? await this.loadImageFile(path) : await this.loadTextFile(path);
+							}
 							if (file) {
 								loaded.push(file);
 							}
@@ -904,9 +910,15 @@ class WorkspaceState {
 			}
 			const file = this.openFiles.find((f) => f.path === activePath);
 			if (file && file.kind === 'text') {
-				this.refreshBlame(activePath);
-				if (!file.isDeleted) {
-					this.refreshHead(activePath);
+				if (file.isDiffTab) {
+					// Diff tab: no blame, but its "before" side
+					// needs the HEAD blob for `realPath`.
+					this.refreshHead(file.realPath);
+				} else {
+					this.refreshBlame(activePath);
+					if (!file.isDeleted) {
+						this.refreshHead(activePath);
+					}
 				}
 			}
 		}
@@ -1080,12 +1092,14 @@ class WorkspaceState {
 		// "everything's modified" back to clean once the user's
 		// commit lands. Scoped to open files — there's no point
 		// warming `HEAD` for files the user isn't looking at, and
-		// the list is typically < 20.
+		// the list is typically < 20. Diff tabs key their fetch on
+		// `realPath`, not the synthetic `moon-diff:…` tab path.
 		for (const file of this.openFiles) {
 			if (file.kind !== 'text' || file.isDeleted) {
 				continue;
 			}
-			this.refreshHead(file.path);
+			const target = file.isDiffTab ? file.realPath : file.path;
+			this.refreshHead(target);
 		}
 	}
 
@@ -1221,7 +1235,7 @@ class WorkspaceState {
 	 */
 	lspOpen(path: string, text: string) {
 		const languageId = lspLanguageFor(path);
-		if (!languageId || path.startsWith('untitled:')) {
+		if (!languageId || path.startsWith('untitled:') || isDiffTabPath(path)) {
 			return;
 		}
 		// Swallow failures: if the server crashes mid-session or
@@ -1241,7 +1255,7 @@ class WorkspaceState {
 	 */
 	lspScheduleUpdate(path: string, text: string) {
 		const languageId = lspLanguageFor(path);
-		if (!languageId || path.startsWith('untitled:')) {
+		if (!languageId || path.startsWith('untitled:') || isDiffTabPath(path)) {
 			return;
 		}
 		const existing = this.#lspUpdateTimers.get(path);
@@ -1272,7 +1286,7 @@ class WorkspaceState {
 			next.delete(path);
 			this.diagnostics = next;
 		}
-		if (!languageId || path.startsWith('untitled:')) {
+		if (!languageId || path.startsWith('untitled:') || isDiffTabPath(path)) {
 			return;
 		}
 		void ipc.lsp.close(path, languageId).catch(() => {});
@@ -1291,7 +1305,7 @@ class WorkspaceState {
 	 * path anyway.
 	 */
 	refreshBlame(path: string) {
-		if (path.startsWith('untitled:')) {
+		if (path.startsWith('untitled:') || isDiffTabPath(path)) {
 			return;
 		}
 		if (this.#blameInFlight.has(path)) {
@@ -1338,7 +1352,7 @@ class WorkspaceState {
 	 * enough.
 	 */
 	scheduleBlameRefresh(path: string) {
-		if (path.startsWith('untitled:')) {
+		if (path.startsWith('untitled:') || isDiffTabPath(path)) {
 			return;
 		}
 		const existing = this.#blameTimers.get(path);
@@ -1379,7 +1393,7 @@ class WorkspaceState {
 	 * focus, and the extension treats `null` as "no gutter" anyway.
 	 */
 	refreshHead(path: string) {
-		if (path.startsWith('untitled:')) {
+		if (path.startsWith('untitled:') || isDiffTabPath(path)) {
 			return;
 		}
 		if (this.#headInFlight.has(path)) {
@@ -1449,6 +1463,8 @@ class WorkspaceState {
 			loadedMtimeMs: null,
 			isDirty: false,
 			isDeleted: false,
+			isDiffTab: false,
+			realPath: '',
 		};
 		this.openFiles = [...this.openFiles, file];
 		const tabs = this.tabsFor(side);
@@ -1459,9 +1475,17 @@ class WorkspaceState {
 	async openFile(path: string, side: SplitSide = this.focusedSide, options: { focus?: boolean } = {}) {
 		const existing = this.openFiles.find((f) => f.path === path);
 		if (!existing) {
+			const diffReal = realPathFromDiffTab(path);
 			const kind = fileKindFor(path);
 			try {
-				const next = kind === 'image' ? await this.loadImageFile(path) : await this.loadTextFile(path);
+				let next: OpenFile | null;
+				if (diffReal !== null) {
+					next = this.loadDiffTab(diffReal);
+				} else if (kind === 'image') {
+					next = await this.loadImageFile(path);
+				} else {
+					next = await this.loadTextFile(path);
+				}
 				if (!next) {
 					return;
 				}
@@ -1469,10 +1493,12 @@ class WorkspaceState {
 				// Notify the LSP broker only on first open — reopening
 				// an already-loaded buffer is a pure UI navigation
 				// event, the server still holds its open state. Skip
-				// for deleted buffers: feeding a phantom document to
-				// the server would produce fictitious diagnostics for
-				// a path that no longer exists on disk.
-				if (next.kind === 'text' && !next.isDeleted) {
+				// for deleted buffers and for diff tabs: neither has a
+				// document the server should know about (deleted
+				// paths aren't on disk; diff tabs are a read-only
+				// view of an editor buffer that already owns the
+				// LSP open handshake).
+				if (next.kind === 'text' && !next.isDeleted && !next.isDiffTab) {
 					this.lspOpen(next.path, next.text);
 					// Blame fetch is handled by `setActive` (called a
 					// few lines below). Routing through there covers
@@ -1523,47 +1549,24 @@ class WorkspaceState {
 	}
 
 	/**
-	 * True when `path`'s buffer should render the git-diff view
-	 * instead of the normal editor. Deleted files are always in
-	 * diff mode regardless of the map — the HEAD content is all
-	 * there is to show.
+	 * Open a dedicated diff tab for `realPath` in `side` and focus
+	 * it. The tab lives at the synthetic path `moon-diff:<realPath>`
+	 * so it sits alongside any regular editor tab for the same file
+	 * — alt+left walks back to the editor naturally.
+	 *
+	 * Idempotent: if a diff tab already exists for this `realPath`,
+	 * we just focus it instead of opening a second one.
 	 */
-	diffModeFor(path: string): boolean {
-		const file = this.openFiles.find((f) => f.path === path);
-		if (file?.isDeleted) {
-			return true;
-		}
-		return this.diffModes.get(path) ?? false;
-	}
-
-	setDiffMode(path: string, enabled: boolean) {
-		const current = this.diffModeFor(path);
-		if (current === enabled) {
+	async openDiffTab(realPath: string, side: SplitSide = this.focusedSide) {
+		// Deleted buffers already *are* a diff view (their sole
+		// reason for existing). Route the request back to plain
+		// `openFile` so the caller doesn't have to differentiate.
+		const statusMap = new Map(this.gitStatusEntries.map((e) => [e.path, e.status]));
+		if (statusMap.get(realPath) === 'deleted') {
+			await this.openFile(realPath, side);
 			return;
 		}
-		const next = new Map(this.diffModes);
-		if (enabled) {
-			next.set(path, true);
-		} else {
-			next.delete(path);
-		}
-		this.diffModes = next;
-	}
-
-	/**
-	 * Flip the diff view on or off for `path`. Deleted buffers
-	 * swallow the toggle — there's no editor state to flip *to*,
-	 * and the menus that would trigger this don't offer the option
-	 * on deleted rows anyway. Untracked / ignored files similarly
-	 * have no `HEAD` content; they're filtered out upstream
-	 * (context menu), but guarding here keeps a stray call safe.
-	 */
-	toggleDiffMode(path: string) {
-		const file = this.openFiles.find((f) => f.path === path);
-		if (file?.isDeleted) {
-			return;
-		}
-		this.setDiffMode(path, !this.diffModeFor(path));
+		await this.openFile(diffTabPathFor(realPath), side);
 	}
 
 	/**
@@ -1579,7 +1582,7 @@ class WorkspaceState {
 		// the buffer to a real location. Until then the editor falls back
 		// to `defaultEditorConfig`, same as it does during the first paint
 		// of any tab before its IPC roundtrip resolves.
-		if (isUntitledPath(path)) {
+		if (isUntitledPath(path) || isDiffTabPath(path)) {
 			return;
 		}
 		if (this.editorConfigs.has(path)) {
@@ -1640,6 +1643,8 @@ class WorkspaceState {
 			loadedMtimeMs: result.mtime_ms,
 			isDirty: false,
 			isDeleted: false,
+			isDiffTab: false,
+			realPath: '',
 		};
 	}
 
@@ -1656,6 +1661,37 @@ class WorkspaceState {
 			loadedMtimeMs: null,
 			isDirty: false,
 			isDeleted: false,
+			isDiffTab: false,
+			realPath: '',
+		};
+	}
+
+	/**
+	 * Construct the `OpenFile` for a dedicated diff tab. The `text`
+	 * field is unused (DiffView.svelte reads its two sides from
+	 * `workspace.headByPath` and, for the working-tree side, the
+	 * matching editor buffer if open — else a one-shot fs read).
+	 * Stays consistent with the other loaders so `openFile` can
+	 * stash the result into `openFiles` without special-casing.
+	 */
+	private loadDiffTab(realPath: string): OpenFile {
+		return {
+			path: diffTabPathFor(realPath),
+			// " (diff)" suffix so the tab strip reads as
+			// distinct from the regular editor tab without us
+			// adding a second icon column. Short enough to leave
+			// room for the filename on typical tab widths.
+			name: `${basename(realPath)} (diff)`,
+			kind: 'text',
+			isUntitled: false,
+			text: '',
+			previewUrl: '',
+			loadedFingerprint: fingerprint(''),
+			loadedMtimeMs: null,
+			isDirty: false,
+			isDeleted: false,
+			isDiffTab: true,
+			realPath,
 		};
 	}
 
@@ -1688,6 +1724,8 @@ class WorkspaceState {
 			loadedMtimeMs: null,
 			isDirty: false,
 			isDeleted: true,
+			isDiffTab: false,
+			realPath: '',
 		};
 	}
 
@@ -2193,14 +2231,23 @@ class WorkspaceState {
 		// guard in `refreshBlame` keeps this cheap — once the cache
 		// has an entry or a fetch is pending, this call is a no-op.
 		const file = this.openFiles.find((f) => f.path === path);
-		if (file && file.kind === 'text' && !file.isDeleted && !this.blameByPath.has(path)) {
+		const isRegularEditor = file && file.kind === 'text' && !file.isDeleted && !file.isDiffTab;
+		if (isRegularEditor && !this.blameByPath.has(path)) {
 			this.refreshBlame(path);
 		}
 		// Same lazy-seed for the git-changes gutter. `isDeleted`
 		// buffers render in diff view unconditionally, so the inline
-		// gutter would be redundant — skip them.
-		if (file && file.kind === 'text' && !file.isDeleted && !this.headByPath.has(path)) {
+		// gutter would be redundant — skip them. Diff tabs likewise
+		// render DiffView, not an editor, so there's no gutter to
+		// feed; the backing editor tab (if open) handles its own.
+		if (isRegularEditor && !this.headByPath.has(path)) {
 			this.refreshHead(path);
+		}
+		// Diff tabs *do* need the HEAD cache warm for their own
+		// real path — that's the "before" side of the split view.
+		// No blame; a diff tab has no caret line to annotate.
+		if (file && file.kind === 'text' && file.isDiffTab && !this.headByPath.has(file.realPath)) {
+			this.refreshHead(file.realPath);
 		}
 		// Nav history: only push on genuine user navigation. We're
 		// inside `navigateBack` / `navigateForward` / `jumpTo` when
@@ -2583,6 +2630,14 @@ class WorkspaceState {
 	}
 
 	updateText(path: string, text: string) {
+		// Guard: diff tabs don't have a writable text buffer — the
+		// editor extension is gated by `isDiffTab` but a stray
+		// `updateText` (e.g. via a programmatic dispatch) would
+		// otherwise pollute `file.text` with empty strings and
+		// blow away the placeholder invariant DiffView relies on.
+		if (isDiffTabPath(path)) {
+			return;
+		}
 		this.openFiles = this.openFiles.map((f) => {
 			if (f.path !== path) {
 				return f;
@@ -2611,6 +2666,14 @@ class WorkspaceState {
 	async saveActive() {
 		const file = this.activeFile;
 		if (!file) {
+			return;
+		}
+		// Diff tabs are a read-only view; there's nothing
+		// meaningful to write back — `file.text` is a placeholder,
+		// and the synthetic `moon-diff:` path isn't a real FS
+		// location. Silently no-op so `Ctrl+S` in a diff tab is
+		// harmless rather than surprising.
+		if (file.isDiffTab) {
 			return;
 		}
 		// Untitled buffers route through the save-as flow on every save
@@ -2983,6 +3046,30 @@ function relativeToRoot(absolute: string, root: string): string | null {
 
 export function isUntitledPath(path: string): boolean {
 	return path.startsWith('untitled:');
+}
+
+/**
+ * Synthetic-path prefix for dedicated git diff tabs. Tab identity
+ * is `moon-diff:<realPath>`, which lets the existing tab / active-
+ * path / persistence infrastructure treat a diff tab as just
+ * another tab without special-casing. Workspace paths never
+ * contain `:` after the first segment in practice, but even if one
+ * did, the prefix matching is anchored at the string start so
+ * collisions require a file *literally named* `moon-diff:…` — not
+ * a real concern.
+ */
+export const DIFF_TAB_PREFIX = 'moon-diff:';
+
+export function isDiffTabPath(path: string): boolean {
+	return path.startsWith(DIFF_TAB_PREFIX);
+}
+
+export function diffTabPathFor(realPath: string): string {
+	return DIFF_TAB_PREFIX + realPath;
+}
+
+export function realPathFromDiffTab(path: string): string | null {
+	return path.startsWith(DIFF_TAB_PREFIX) ? path.slice(DIFF_TAB_PREFIX.length) : null;
 }
 
 /**

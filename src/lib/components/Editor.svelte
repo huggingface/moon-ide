@@ -318,34 +318,15 @@
 				override: [lspCompletionSource],
 			}),
 			keymap.of([
-				// Navigation history: Alt+Left / Alt+Right step through
-				// file history browser-style. On macOS, Option+Arrow
-				// is the default CM binding for word-by-word caret
-				// motion — we only override when there's somewhere to
-				// navigate. The `run` callback returns `false` (== CM
-				// continues looking for another handler) when the
-				// stack is empty, which lets word-motion keep working
-				// for a user who's never switched tabs in this session.
-				{
-					key: 'Alt-ArrowLeft',
-					run: () => {
-						if (!workspace.canNavigateBack) {
-							return false;
-						}
-						void workspace.navigateBack();
-						return true;
-					},
-				},
-				{
-					key: 'Alt-ArrowRight',
-					run: () => {
-						if (!workspace.canNavigateForward) {
-							return false;
-						}
-						void workspace.navigateForward();
-						return true;
-					},
-				},
+				// Alt+Left / Alt+Right (= file-history back / forward)
+				// are handled at the window level in `App.svelte`,
+				// not here — they need to fire on diff tabs, image
+				// tabs, and anywhere else the user might be focused,
+				// not just inside a CodeMirror editor. Keeping the
+				// binding out of CM's keymap also avoids the stack-
+				// empty-fallback to CM's word-motion default, which
+				// was a confusing escape hatch users weren't
+				// actually using.
 				...closeBracketsKeymap,
 				...defaultKeymap,
 				...historyKeymap,

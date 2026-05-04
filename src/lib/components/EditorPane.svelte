@@ -19,13 +19,16 @@
 		}
 		return workspace.openFiles.find((f) => f.path === activePath) ?? null;
 	});
-	// Diff-view wins over markdown-preview: the user explicitly
-	// asked for the diff, and a rendered README-vs-HEAD diff isn't
-	// meaningful anyway — you want to see what you changed in the
-	// raw source. Markdown-preview stays available via the tab
-	// toolbar once they flip diff back off.
+	// Diff-view wins over markdown-preview. A buffer hits the diff
+	// pane when it's either:
+	//   - a dedicated diff tab (synthetic `moon-diff:<path>` created
+	//     by "View diff" from the tree / palette), or
+	//   - a deleted-file tab (nothing to edit; showing the HEAD
+	//     blob as a diff is the only sensible view).
+	// Both cases live on `OpenFile` flags so EditorPane doesn't
+	// need its own parallel toggle state.
 	const showDiff = $derived(
-		activeFile !== null && activeFile.kind === 'text' && workspace.diffModeFor(activeFile.path),
+		activeFile !== null && activeFile.kind === 'text' && (activeFile.isDiffTab || activeFile.isDeleted),
 	);
 	const showMarkdownPreview = $derived(
 		activeFile !== null &&
@@ -61,7 +64,7 @@
 		{#if activeFile?.kind === 'image'}
 			<ImageView file={activeFile} />
 		{:else if activeFile && showDiff}
-			<DiffView file={activeFile} />
+			<DiffView file={activeFile} {side} />
 		{:else if activeFile && showMarkdownPreview}
 			<MarkdownView file={activeFile} />
 		{:else if activeFile}

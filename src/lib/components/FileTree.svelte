@@ -205,12 +205,13 @@
 				id: 'view-diff',
 				label: 'View diff',
 				onSelect: () => {
-					// Open the file (noop if already open) and force
-					// its diff view on. The two calls are ordered so
-					// a fresh-open flashes diff-view immediately
-					// rather than briefly showing the editor.
-					workspace.setDiffMode(item.path, true);
-					void workspace.openFile(item.path);
+					// Opens a dedicated diff tab alongside any
+					// existing editor tab for this file, so
+					// `Alt+Left` walks back to the regular editor
+					// view. Idempotent: if a diff tab is already
+					// open for this path, it gets focused rather
+					// than duplicated.
+					void workspace.openDiffTab(item.path);
 				},
 			});
 		}
