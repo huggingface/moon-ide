@@ -1,6 +1,6 @@
 # LSP
 
-Status: partial — TypeScript + Rust both have diagnostics + hover + completion + goto-definition + nav history wired via the stage-1/stage-2 slices of Phase 4. Every other language (Svelte, CSS, HTML, JSON) is architecturally in scope and not yet wired.
+Status: partial — TypeScript + Rust both have diagnostics + hover + completion + goto-definition + nav history wired via the stage-1/stage-2 slices of Phase 4. Both additionally route **inside the workspace container** when one is up and the binary is reachable there (see [Container-backed LSP](#container-backed-lsp)); the broker falls back to host LSP per-language when it isn't. Every other language (Svelte, CSS, HTML, JSON) is architecturally in scope and not yet wired.
 
 ## The non-negotiable invariant
 
@@ -104,7 +104,45 @@ On Windows we adjust the filename per strategy: `<bin>.cmd` for the Node case (n
 
 If nothing is found on disk, the broker caches a `NotAvailable` slot per language and emits `lsp:status { status: 'notavailable' }`. The status bar paints a quiet pill whose tooltip is the spec's `install_hint` field (e.g. `bun add -D @typescript/native-preview` or `rustup component add rust-analyzer`) — copy-pasteable into a terminal.
 
-Phase 2 (containers) will pre-install each wired language server in `moon-base` so the container-backed story is pill-free without relying on the host's package manager. Today the LSP broker spawns children on the host only — the `cargo` / `tsgo` binaries inside a devcontainer don't participate; routing LSP stdio through the container host is a deliberate later scope.
+Container-backed workspaces (ADR 0008) skip host discovery entirely for languages whose server the container already ships — see [Container-backed LSP](#container-backed-lsp). Rust is the first (and currently only) such language: `moon-base` pre-installs `rust-analyzer` via `rustup component add`, and the broker pipes stdio through `docker exec` when the container is `Running`. Falling back to the host is automatic when the container is down, not configured, or doesn't have the server.
+
+### Container-backed LSP
+
+When the workspace shell container is `Running`, the broker spawns its language servers **inside** the container via `docker exec` rather than on the host. That makes the server see the same filesystem the build commands see (`/workspace/<basename>/...`) and removes the "have you installed rust-analyzer locally?" step from a new contributor's first hour.
+
+**Routing table.** The Tauri layer picks a **primary** target per-broker at construction time (`ensure_broker` in `src-tauri/src/commands/lsp.rs`). The broker itself keeps a **host fallback** whenever the primary is `DockerExec`, and retries on it per-language if the primary can't resolve / probe / spawn that server's binary:
+
+| Workspace shape      | Container state                    | Primary   | Per-server outcome inside the broker                                                                       |
+| -------------------- | ---------------------------------- | --------- | ---------------------------------------------------------------------------------------------------------- |
+| No container config  | n/a                                | Host      | Host LSP (no fallback needed).                                                                             |
+| Container configured | Absent / Stopped / Paused / Failed | Host      | Host LSP (no fallback needed).                                                                             |
+| Container configured | Running                            | Container | Container LSP when the binary is reachable + `--version` probe succeeds; else host fallback automatically. |
+| Container configured | Running                            | Container | If both container AND host fallback lack the binary, `NotAvailable` pill with the spec's install hint.     |
+
+The per-server fallback covers two separate cases without a user setting:
+
+1. **Custom image dropped the server** (e.g. `moon-base` rebuilt from a fork that removed `rust-analyzer`) — container probe fails → broker retries on host, with a `tracing::info!` breadcrumb.
+2. **Binary isn't reachable inside the container at all** — most commonly `tsgo`, whose real binary sits in `node_modules/.bin/tsgo` and is a Linux-specific shim installed by `bun install`. When the host `node_modules` sits **inside** the bind mount (the normal case for moon-ide itself), container-side LSP works; when it's hoisted to a parent of the active folder (some pnpm monorepos), the path is outside the mount and the broker falls back to host for that language.
+
+In-container binary-path resolution lives in `moon_core::lsp::server::container_binary_path`. It walks host ancestors for `NodeModules`-strategy specs and translates matches through the `HostMount` translator; for `CargoHome`-strategy specs it hands back the basename because `moon-base` installs `rust-analyzer` on the container's `$PATH` via rustup.
+
+**Pieces.**
+
+- `moon_core::lsp::LspSpawner` (in `spawn.rs`) is the ADT: `Local` runs `Command::new(bin)`; `DockerExec { container_name }` wraps it as `docker exec -i <container> <bin> <args...>`. `-i` (no `-t`) is critical — LSP framing is raw bytes over stdio, a TTY would mangle them.
+- `moon_core::lsp::server::PathTranslator` bridges the two filesystem views. `Identity` is a no-op; `HostMount { host_root, server_root }` rewrites paths in both directions so the server sees `/workspace/<basename>` URIs while the UI and tree stay in host absolute-path land. Every URI that crosses the boundary (initialize's rootUri, didOpen, diagnostics, goto-def) goes through the translator.
+- `LspBroker::new_with_spawner(root, spawner, translator)` is what Tauri calls. `LspBroker::new(root)` still works — it's the host-only helper used by tests. Constructing with a `DockerExec` spawner auto-populates the host fallback; constructing with `Local` leaves it empty.
+- `LspSpawner::probe(bin)` runs `<bin> --version` via the same build-command pipeline that the real spawn uses, and reports whether it exited cleanly. The broker calls it per-server on each route it tries; the first success wins. Cached outcome lives in the existing per-language `ServerSlot` map.
+- `TerminalTarget::container_cwd_for_folder` (in `moon-terminal`) is the single place that defines the in-container mount convention (`/workspace/<basename>`). `ensure_broker` reuses it so terminals and LSP never drift.
+
+**Teardown on container transitions.** Every mutating container command (`container_setup`, `container_stop`, `container_pause`, `container_resume`, `container_rebuild`, `container_teardown`, `container_apply_bound_folders`) calls `reset_lsp_broker` after the compose action completes. That drops the current broker; the next `lsp_open` rebuilds against whatever state the container is in now. Cheaper and more deterministic than trying to mutate the broker in place.
+
+**Image responsibility.** `moon-base` pre-installs language servers the broker knows how to route in a container. Today that's `rust-analyzer` via `rustup component add`. Python and the others land here when each language gets wired; see [`containers.md`](containers.md#the-moon-base-image) for the current tool inventory.
+
+**Known non-goals for this slice.**
+
+- Python / Svelte / CSS / HTML / JSON — wire up when the language itself ships in the broker. Routing through the container follows the same template at that point.
+- Remote (SSH / Codespaces) LSP — `DockerExec` doesn't generalise; a future `RemoteHost` spawner is its own design.
+- Containers the user starts outside moon-ide — we only know how to route into the workspace's own compose project.
 
 ### Client capabilities are minimal
 

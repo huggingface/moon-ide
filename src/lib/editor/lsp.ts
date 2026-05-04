@@ -25,7 +25,7 @@ import { setDiagnostics, type Diagnostic as CmDiagnostic, lintGutter } from '@co
 import { Facet, type Extension } from '@codemirror/state';
 import { EditorView, hoverTooltip, type Tooltip } from '@codemirror/view';
 import { ipc } from '../ipc';
-import { renderMarkdown } from '../markdown';
+import { openExternalMarkdownLink, renderMarkdown } from '../markdown';
 import type { LspDiagnostic, LspSeverity } from '../protocol';
 import { lspLanguageFor } from './lspLanguage';
 
@@ -169,6 +169,35 @@ export function lspHoverExtension(): Extension {
 					// `editor/theme.ts`.
 					dom.className = 'cm-lsp-hover markdown-body';
 					dom.innerHTML = html;
+					// Intercept every anchor click so MDN refs, doc
+					// links, `@link` crossrefs etc. open in the OS
+					// browser via the Tauri opener plugin instead of
+					// navigating the IDE window — a raw anchor click
+					// inside the webview would replace the whole IDE
+					// with the target page. Delegated on the tooltip
+					// root so new anchors added later (none today,
+					// but cheap insurance) still get caught.
+					dom.addEventListener('click', (ev) => {
+						const t = ev.target;
+						if (!(t instanceof Element)) {
+							return;
+						}
+						const anchor = t.closest('a');
+						if (!anchor) {
+							return;
+						}
+						ev.preventDefault();
+						const href = anchor.getAttribute('href');
+						if (!href) {
+							return;
+						}
+						// Hover popovers have no meaningful "current
+						// file" to resolve relative links against,
+						// and the popover itself isn't long enough
+						// to benefit from in-page anchors. Anything
+						// that isn't an external link we swallow.
+						openExternalMarkdownLink(href);
+					});
 					return { dom };
 				},
 			};

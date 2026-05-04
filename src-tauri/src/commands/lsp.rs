@@ -16,9 +16,13 @@
 //! share the same behaviour.
 
 use camino::Utf8PathBuf;
-use moon_core::lsp::{LspBroker, LspServerEvent};
+use moon_container::{Workspace as ContainerWorkspace, WorkspaceConfig};
+use moon_core::lsp::server::PathTranslator;
+use moon_core::lsp::{LspBroker, LspServerEvent, LspSpawner};
+use moon_protocol::container::ContainerState;
 use moon_protocol::lsp::{LspCompletionList, LspHover, LspLocation, LspPosition};
 use moon_protocol::MoonError;
+use moon_terminal::{container_name_for_workspace, TerminalTarget};
 use tauri::{AppHandle, Emitter, State};
 use tokio::task::JoinHandle;
 
@@ -139,13 +143,36 @@ pub async fn lsp_definition(
 pub struct LspHandle {
 	pub broker: std::sync::Arc<LspBroker>,
 	pub root: Utf8PathBuf,
+	/// What the broker is pointing at — host, or a specific
+	/// container. Cached so `ensure_broker` can notice when the
+	/// container state has changed underneath us (came up, went
+	/// down, or recreated with a different name) and rebuild
+	/// instead of handing back a stale handle.
+	pub target: BrokerTarget,
 	_pump: JoinHandle<()>,
+}
+
+/// What a given broker was built against. `Container` carries the
+/// compose-assigned container name so we can tell apart "same
+/// project, fresh container" from "still the same container".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrokerTarget {
+	Host,
+	Container { container_name: String },
 }
 
 /// Get or create the broker for the current active folder. Spawned
 /// lazily so no LSP process starts until the user actually opens a
-/// file. If the active folder has changed since last time, the old
-/// broker is shut down and a new one is built.
+/// file. If the active folder *or* the broker target (host vs.
+/// container) has changed since last time, the old broker is shut
+/// down and a new one is built.
+///
+/// Routing decision: when the workspace container is `Running`,
+/// build a `DockerExec` spawner + `HostMount` translator so the
+/// LSP runs **inside** the container and sees `/workspace/<basename>`.
+/// Otherwise — container not up, no container config, or container
+/// failed — fall back to the host spawner. The routing table is
+/// documented in [`specs/lsp.md#container-backed-lsp`].
 async fn ensure_broker(state: &AppState, app: &AppHandle) -> Result<std::sync::Arc<LspBroker>, MoonError> {
 	let snap = state.workspaces.snapshot().await;
 	let active = snap
@@ -153,12 +180,25 @@ async fn ensure_broker(state: &AppState, app: &AppHandle) -> Result<std::sync::A
 		.ok_or_else(|| MoonError::invalid("lsp: no active folder; open a workspace before using LSP"))?;
 	let root = Utf8PathBuf::from(active);
 
+	let target = resolve_target(
+		state,
+		&snap.id,
+		&snap
+			.folders
+			.iter()
+			.map(|f| Utf8PathBuf::from(&f.path))
+			.collect::<Vec<_>>(),
+	)
+	.await;
+
 	let mut guard = state.lsp.lock().await;
 	if let Some(existing) = guard.as_ref() {
-		if existing.root == root {
+		if existing.root == root && existing.target == target {
 			return Ok(existing.broker.clone());
 		}
-		// Active folder changed. Tear down and rebuild.
+		// Active folder or container target changed. Tear down
+		// and rebuild so the next `lsp_open` lands on a fresh
+		// broker pointed at the right place.
 		let old = guard.take().expect("guard.take after is_some");
 		old.broker.shutdown_all().await;
 		// `old` dropped here: its `_pump` receiver will return
@@ -166,7 +206,32 @@ async fn ensure_broker(state: &AppState, app: &AppHandle) -> Result<std::sync::A
 		// drops below, and the pump exits.
 	}
 
-	let broker = LspBroker::new(root.clone());
+	let (spawner, translator) = match &target {
+		BrokerTarget::Host => {
+			let translator = PathTranslator::Identity {
+				host_root: root.clone(),
+			};
+			(LspSpawner::Local, translator)
+		}
+		BrokerTarget::Container { container_name } => {
+			// Mirrors the terminal layer's basename-under-
+			// `/workspace` mount convention; falls back to
+			// `/workspace` for the pathological no-basename
+			// case, matching `moon-terminal`'s own fallback.
+			let server_root =
+				TerminalTarget::container_cwd_for_folder(&root).unwrap_or_else(|| Utf8PathBuf::from("/workspace"));
+			let translator = PathTranslator::HostMount {
+				host_root: root.clone(),
+				server_root,
+			};
+			let spawner = LspSpawner::DockerExec {
+				container_name: container_name.clone(),
+			};
+			(spawner, translator)
+		}
+	};
+
+	let broker = LspBroker::new_with_spawner(root.clone(), spawner, translator);
 	let mut rx = broker.subscribe();
 	let app_clone = app.clone();
 	let pump = tokio::spawn(async move {
@@ -195,7 +260,40 @@ async fn ensure_broker(state: &AppState, app: &AppHandle) -> Result<std::sync::A
 	*guard = Some(LspHandle {
 		broker: broker.clone(),
 		root,
+		target,
 		_pump: pump,
 	});
 	Ok(broker)
+}
+
+/// Figure out whether the workspace container is running and
+/// should host the LSP. Purely a query — doesn't start or stop
+/// anything. Any failure (missing container config, docker
+/// daemon unreachable, state other than `Running`) resolves to
+/// `Host` rather than bubbling an error up to the `lsp_open`
+/// caller: a container problem shouldn't prevent the user from
+/// getting diagnostics on host-installed Rust.
+async fn resolve_target(state: &AppState, workspace_id: &str, bound_folders: &[Utf8PathBuf]) -> BrokerTarget {
+	let state_dir = state.workspace_state_dir(workspace_id);
+	let ws = match ContainerWorkspace::new(WorkspaceConfig {
+		workspace_id: workspace_id.to_owned(),
+		state_dir,
+		bound_folders: bound_folders.to_vec(),
+	}) {
+		Ok(ws) => ws,
+		Err(err) => {
+			tracing::debug!(%err, "lsp: container config unavailable, using host spawner");
+			return BrokerTarget::Host;
+		}
+	};
+	match ws.status().await {
+		Ok(status) if matches!(status.state, ContainerState::Running) => BrokerTarget::Container {
+			container_name: container_name_for_workspace(workspace_id),
+		},
+		Ok(_) => BrokerTarget::Host,
+		Err(err) => {
+			tracing::debug!(%err, "lsp: container status query failed, using host spawner");
+			BrokerTarget::Host
+		}
+	}
 }

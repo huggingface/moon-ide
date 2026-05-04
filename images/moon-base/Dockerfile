@@ -99,9 +99,14 @@ ENV RUSTUP_HOME=/home/${USERNAME}/.rustup \
     CARGO_HOME=/home/${USERNAME}/.cargo \
     PATH=/home/${USERNAME}/.cargo/bin:${PATH}
 
+# `rust-analyzer` ships with the LSP broker's in-container fallback
+# (moon-core::lsp::spawn::LspSpawner::DockerExec). We install it here
+# rather than lazily so a user's first `.rs` file open doesn't pay a
+# download cost — the image build already ate that bandwidth and we
+# can spawn the server as soon as the container is up.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
       | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path \
- && rustup component add clippy rustfmt
+ && rustup component add clippy rustfmt rust-analyzer
 
 # bun
 ENV BUN_INSTALL=/home/${USERNAME}/.bun \

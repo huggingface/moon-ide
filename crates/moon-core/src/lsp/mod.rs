@@ -8,8 +8,10 @@ pub mod broker;
 pub mod client;
 pub mod framing;
 pub mod server;
+pub mod spawn;
 pub mod translate;
 
 pub use broker::{LspBroker, LspEventRx};
 pub use client::LspClientError;
 pub use server::LspServerEvent;
+pub use spawn::LspSpawner;

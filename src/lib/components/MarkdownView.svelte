@@ -1,6 +1,5 @@
 <script lang="ts">
-	import { openUrl } from '@tauri-apps/plugin-opener';
-	import { renderMarkdown, resolveMarkdownLink } from '../markdown';
+	import { openExternalMarkdownLink, renderMarkdown, resolveMarkdownLink } from '../markdown';
 	import { isUntitledPath, workspace, type OpenFile } from '../state.svelte';
 
 	type Props = { file: OpenFile };
@@ -27,18 +26,12 @@
 		};
 	});
 
-	// Schemes that `opener:default` permits via `openUrl` — keep this
-	// list in sync with that capability set. Anything else with a
-	// recognised scheme is dropped on the floor (file://, custom
-	// protocols, etc.).
-	const EXTERNAL_SCHEMES = new Set(['http:', 'https:', 'mailto:', 'tel:']);
-
 	/**
 	 * Anchor clicks inside the rendered article must never navigate
 	 * the Tauri webview itself — that would replace the IDE shell
 	 * with the page. The handler routes by link shape:
 	 *   - external schemes (`http(s)://`, `mailto:`, `tel:`) → OS
-	 *     default app via `openUrl`
+	 *     default app via `openExternalMarkdownLink`
 	 *   - in-page `#anchors` → native browser scroll
 	 *   - relative or workspace-root-absolute paths → open the target
 	 *     file in a new tab inside the IDE
@@ -62,20 +55,7 @@
 			return;
 		}
 		event.preventDefault();
-		// `URL` only parses absolute URLs; relative paths throw, which
-		// is how we tell them apart. Going through `URL` also rejects
-		// `javascript:foo` reliably (DOMPurify already blocks it, but
-		// this is the second line of defence).
-		let absolute: URL | null = null;
-		try {
-			absolute = new URL(href);
-		} catch {
-			absolute = null;
-		}
-		if (absolute) {
-			if (EXTERNAL_SCHEMES.has(absolute.protocol)) {
-				void openUrl(absolute.toString());
-			}
+		if (openExternalMarkdownLink(href)) {
 			return;
 		}
 		// Relative link: resolve it against the current file's location

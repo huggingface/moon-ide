@@ -32,10 +32,11 @@ use camino::Utf8PathBuf;
 use lsp_types as lt;
 use moon_protocol::lsp as mp;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::{broadcast, Mutex};
 
 use super::client::{LspClient, LspClientError, ServerNotification};
+use super::spawn::LspSpawner;
 use super::translate;
 
 /// What the broker hears when something interesting happens in a
@@ -131,12 +132,90 @@ pub struct LspServer {
 	language_id: String,
 	client: LspClient,
 	child: Mutex<Option<Child>>,
-	// Workspace-relative to file://URI mapping.
-	root: Utf8PathBuf,
+	/// Maps between host-relative paths and server-side file URIs.
+	/// `Identity` for [`LspSpawner::Local`], `HostMount` when the
+	/// server runs inside a container and sees `/workspace/<basename>`
+	/// instead of the host absolute path. Replaces the old bare
+	/// `root` field; all URI construction + parsing routes through
+	/// here so the wire format matches what the server expects.
+	translator: PathTranslator,
 	// Per-document version counter. LSP requires monotonically
 	// increasing versions per didChange to detect out-of-order
 	// updates; we start at 1 on open and tick each change.
 	docs: Mutex<HashMap<String, DocState>>,
+}
+
+/// Bridge between host-relative workspace paths and the
+/// `file://`-URIs exchanged with the LSP server.
+///
+/// - `Identity`: host and server see the same absolute paths.
+///   `absolutise(rel)` = `host_root.join(rel)`;
+///   `relativise(abs)` = `abs.strip_prefix(host_root)`.
+/// - `HostMount`: server runs inside a container where the
+///   workspace is bind-mounted under a different absolute root
+///   (`/workspace/<basename>`). We keep the host root for
+///   tree-side lookups and the server root for URI construction,
+///   mapping between them symmetrically.
+///
+/// Only hosts / container variants live here. Remote / SSH
+/// targets get their own variant when that lands; the enum is
+/// the extension point.
+#[derive(Debug, Clone)]
+pub enum PathTranslator {
+	Identity {
+		host_root: Utf8PathBuf,
+	},
+	HostMount {
+		host_root: Utf8PathBuf,
+		server_root: Utf8PathBuf,
+	},
+}
+
+impl PathTranslator {
+	/// Host-relative → server-absolute path. Always joined; no
+	/// normalisation. The caller is responsible for passing
+	/// forward-slash-separated relatives (which is the moon-ide
+	/// tree convention already).
+	pub fn absolutise(&self, rel_path: &str) -> Utf8PathBuf {
+		match self {
+			PathTranslator::Identity { host_root } => host_root.join(rel_path),
+			PathTranslator::HostMount { server_root, .. } => server_root.join(rel_path),
+		}
+	}
+
+	/// Server-absolute → host-relative path. Returns `None` when
+	/// the URI points outside the workspace (e.g. `rust-analyzer`
+	/// publishing a diagnostic against a dep inside the container's
+	/// `~/.cargo/registry/…`): the UI has no buffer for those so we
+	/// silently drop them.
+	pub fn relativise(&self, abs: &Path) -> Option<String> {
+		let server_root = match self {
+			PathTranslator::Identity { host_root } => host_root.as_std_path(),
+			PathTranslator::HostMount { server_root, .. } => server_root.as_std_path(),
+		};
+		let rel = abs.strip_prefix(server_root).ok()?;
+		Some(rel.to_string_lossy().replace('\\', "/"))
+	}
+
+	/// Absolute server root — what `initialize.rootUri` and
+	/// `workspaceFolders[0].uri` need to point at so the server
+	/// opens the right tree.
+	pub fn server_root(&self) -> &Utf8PathBuf {
+		match self {
+			PathTranslator::Identity { host_root } => host_root,
+			PathTranslator::HostMount { server_root, .. } => server_root,
+		}
+	}
+
+	/// Host-side workspace root. Used by callers that need to
+	/// cross-reference tree state (e.g. goto-definition response
+	/// translation). Never use this for URI construction.
+	pub fn host_root(&self) -> &Utf8PathBuf {
+		match self {
+			PathTranslator::Identity { host_root } => host_root,
+			PathTranslator::HostMount { host_root, .. } => host_root,
+		}
+	}
 }
 
 struct DocState {
@@ -148,33 +227,26 @@ impl LspServer {
 	/// no copy can be found on disk — caller surfaces a
 	/// `NotAvailable` status instead of treating this as an error.
 	///
-	/// Discovery order:
-	/// 1. Walk up from `root` looking for `node_modules/.bin/<bin>`
-	///    (matching Node's own resolution algorithm — this also
-	///    handles pnpm-hoisted monorepos where `node_modules` lives
-	///    at the repo root rather than the active folder).
-	/// 2. `$PATH` lookup via `which`.
+	/// Discovery order for [`LspSpawner::Local`]:
+	/// 1. The spec's `DiscoveryStrategy` (project-local
+	///    `node_modules/.bin`, or `$CARGO_HOME/bin` etc.).
+	/// 2. `$PATH` via `which`.
 	///
-	/// The first match wins. A project-pinned copy always beats a
-	/// global install, which is what the ecosystem expects (lets a
-	/// monorepo freeze a specific LSP version without affecting
-	/// other projects on the same machine).
+	/// For [`LspSpawner::DockerExec`] we skip host discovery
+	/// entirely — the in-container binary is on the container's
+	/// `$PATH` (moon-base handles installation) and we hand
+	/// `docker exec` the basename so the container resolves it.
+	/// The broker will have already run a `--version` probe to
+	/// confirm availability before this spawn.
 	pub async fn spawn(
 		spec: &LspBinarySpec,
-		root: Utf8PathBuf,
+		bin_path: &Path,
+		spawner: &LspSpawner,
+		translator: PathTranslator,
 		events: broadcast::Sender<LspServerEvent>,
 	) -> Result<Option<Arc<Self>>, LspClientError> {
-		let Some(resolved) = discover_binary(spec.bin_name, spec.discovery, root.as_std_path()) else {
-			tracing::info!(
-				bin = spec.bin_name,
-				lang = spec.language_id,
-				"lsp: binary not found via discovery strategy or $PATH, server unavailable"
-			);
-			return Ok(None);
-		};
-
-		let mut child = Command::new(&resolved)
-			.args(spec.args)
+		let mut child = spawner
+			.build_command(bin_path, spec.args)
 			.stdin(Stdio::piped())
 			.stdout(Stdio::piped())
 			.stderr(Stdio::piped())
@@ -212,7 +284,7 @@ impl LspServer {
 			language_id: spec.language_id.to_owned(),
 			client,
 			child: Mutex::new(Some(child)),
-			root,
+			translator,
 			docs: Mutex::new(HashMap::new()),
 		});
 
@@ -251,7 +323,7 @@ impl LspServer {
 			.send(LspServerEvent::StatusChanged(mp::LspStatusEvent {
 				language_id: spec.language_id.to_owned(),
 				status: mp::LspServerStatus::Running,
-				detail: Some(resolved.display().to_string()),
+				detail: Some(bin_path.display().to_string()),
 			}))
 			.ok();
 
@@ -307,7 +379,12 @@ impl LspServer {
 			..Default::default()
 		};
 
-		let root_uri = path_to_file_uri(self.root.as_std_path());
+		// Initialize with the **server-side** root — container
+		// servers see `/workspace/<basename>`, host servers see
+		// the host absolute path. The translator bridges which
+		// one we're talking to; the LSP surface is agnostic.
+		let server_root = self.translator.server_root();
+		let root_uri = path_to_file_uri(server_root.as_std_path());
 
 		#[allow(deprecated)]
 		let params = lt::InitializeParams {
@@ -319,7 +396,7 @@ impl LspServer {
 			trace: None,
 			workspace_folders: Some(vec![lt::WorkspaceFolder {
 				uri: root_uri,
-				name: self.root.file_name().unwrap_or("workspace").to_owned(),
+				name: server_root.file_name().unwrap_or("workspace").to_owned(),
 			}]),
 			client_info: Some(lt::ClientInfo {
 				name: "moon-ide".into(),
@@ -443,7 +520,12 @@ impl LspServer {
 			partial_result_params: lt::PartialResultParams::default(),
 		};
 		let resp: Option<lt::GotoDefinitionResponse> = self.client.request("textDocument/definition", params).await?;
-		Ok(resp.and_then(|r| translate::definition_response(r, self.root.as_std_path())))
+		// The server reports URIs in its own filesystem view
+		// (container paths under `HostMount`), so strip against
+		// the server root — otherwise every goto-def inside a
+		// containerised project would be mis-classified as
+		// "external" and surface as a toast.
+		Ok(resp.and_then(|r| translate::definition_response(r, self.translator.server_root().as_std_path())))
 	}
 
 	pub async fn completion(
@@ -498,7 +580,7 @@ impl LspServer {
 	}
 
 	fn relative_to_uri(&self, rel_path: &str) -> lt::Uri {
-		let abs = self.root.join(rel_path);
+		let abs = self.translator.absolutise(rel_path);
 		path_to_file_uri(abs.as_std_path())
 	}
 
@@ -509,12 +591,7 @@ impl LspServer {
 		// accept the same file URI syntax.
 		let parsed = url::Url::parse(uri.as_str()).ok()?;
 		let path = parsed.to_file_path().ok()?;
-		let rel = path.strip_prefix(self.root.as_std_path()).ok()?;
-		// Normalise to forward slashes: moon-ide's workspace
-		// paths use `/` on every OS so the frontend doesn't have
-		// to branch on `std::path::MAIN_SEPARATOR`.
-		let s = rel.to_string_lossy().replace('\\', "/");
-		Some(s)
+		self.translator.relativise(&path)
 	}
 }
 
@@ -531,7 +608,7 @@ impl LspServer {
 /// `bin/` has no such dance — both targets install a native executable
 /// (with `.exe` on Windows, which `which`-style resolution and the
 /// explicit check below both handle).
-fn discover_binary(bin_name: &str, strategy: DiscoveryStrategy, start: &Path) -> Option<PathBuf> {
+pub fn discover_binary(bin_name: &str, strategy: DiscoveryStrategy, start: &Path) -> Option<PathBuf> {
 	match strategy {
 		DiscoveryStrategy::NodeModules => {
 			let filename = if cfg!(windows) {
@@ -600,6 +677,85 @@ fn discover_binary(bin_name: &str, strategy: DiscoveryStrategy, start: &Path) ->
 				_ => None,
 			}
 		}
+	}
+}
+
+/// Resolve the in-container absolute path of `spec`'s binary for a
+/// DockerExec broker. Container terminals / LSPs don't inherit a
+/// login shell, so `$PATH` only covers what the image itself puts
+/// there (moon-base's rustup + fnm + bun prefixes) — a Node-ecosystem
+/// binary installed via `bun install` into
+/// `node_modules/.bin/<bin>` won't be found by a plain basename
+/// invocation.
+///
+/// For `NodeModules` we mirror the host-side ancestor walk against
+/// the filesystem, then translate the resulting host path into the
+/// container's view. The walk has to happen against host paths
+/// because the actual `exists()` check is done on the host (the
+/// bind-mount is the same bytes, so existence is equivalent —
+/// we just can't `stat()` container paths directly from here).
+///
+/// Only the active folder's own `node_modules` + its descendants
+/// within the mount are reachable from the container: a hoisted
+/// monorepo that stores `node_modules` **above** the active folder
+/// lives outside the bind-mount and returns `None`, in which case
+/// the broker falls back to the host spawner for that server.
+///
+/// For `CargoHome` we return the basename — `moon-base` installs
+/// `rust-analyzer` via `rustup component add` at
+/// `$CARGO_HOME/bin/rust-analyzer`, which the image's `PATH` env
+/// covers — and let the container's own resolution do the rest.
+pub fn container_binary_path(spec: &LspBinarySpec, translator: &PathTranslator) -> Option<PathBuf> {
+	let (host_root, server_root) = match translator {
+		PathTranslator::HostMount { host_root, server_root } => (host_root.as_std_path(), server_root.as_std_path()),
+		// Callers should only hit this for a DockerExec broker,
+		// which always carries a HostMount translator. Keep the
+		// guard so a wire-up bug surfaces as None (→ NotAvailable
+		// pill) rather than a silent host-path leak.
+		PathTranslator::Identity { .. } => return None,
+	};
+
+	match spec.discovery {
+		DiscoveryStrategy::NodeModules => {
+			// Container is always Linux (moon-base is debian) —
+			// no `.cmd` suffix dance the host path needs.
+			let filename = spec.bin_name;
+			for ancestor in host_root.ancestors() {
+				let candidate = ancestor.join("node_modules").join(".bin").join(filename);
+				if !candidate.exists() {
+					continue;
+				}
+				// Only accept matches that sit inside the bind
+				// mount. Hoisted monorepos with `node_modules`
+				// at a parent of the active folder aren't
+				// reachable from inside the container; the
+				// caller then falls back to the host spawner.
+				let Ok(rel) = candidate.strip_prefix(host_root) else {
+					tracing::debug!(
+						bin = spec.bin_name,
+						host_path = %candidate.display(),
+						host_root = %host_root.display(),
+						"lsp: node_modules match sits outside the bind mount, \
+						 container can't reach it — falling back to host"
+					);
+					return None;
+				};
+				let path = server_root.join(rel);
+				tracing::debug!(
+					bin = spec.bin_name,
+					path = %path.display(),
+					"lsp: resolved via container-side node_modules"
+				);
+				return Some(path);
+			}
+			tracing::debug!(
+				bin = spec.bin_name,
+				host_root = %host_root.display(),
+				"lsp: no node_modules/.bin/<bin> found below the mount root"
+			);
+			None
+		}
+		DiscoveryStrategy::CargoHome => Some(PathBuf::from(spec.bin_name)),
 	}
 }
 
@@ -682,6 +838,14 @@ fn path_to_file_uri(path: &Path) -> lt::Uri {
 mod tests {
 	use super::*;
 	use std::fs;
+	use std::sync::Mutex;
+
+	/// Tests that mutate `$CARGO_HOME` serialise on this mutex.
+	/// `cargo test` runs tests in parallel by default and process
+	/// env is global, so without the lock the two
+	/// `CARGO_HOME`-mutating tests below race and one sporadically
+	/// sees the other's value.
+	static CARGO_HOME_LOCK: Mutex<()> = Mutex::new(());
 
 	#[cfg(unix)]
 	fn make_executable(path: &Path) {
@@ -783,6 +947,7 @@ mod tests {
 	fn discover_rejects_rustup_shim_in_cargo_home() {
 		use std::os::unix::fs::symlink;
 
+		let _guard = CARGO_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 		let tmp = tempfile::tempdir().unwrap();
 		let bin_dir = tmp.path().join("bin");
 		fs::create_dir_all(&bin_dir).unwrap();
@@ -825,6 +990,7 @@ mod tests {
 	/// masks a real failure elsewhere).
 	#[test]
 	fn discover_uses_cargo_home_when_set() {
+		let _guard = CARGO_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 		let tmp = tempfile::tempdir().unwrap();
 		let bin_dir = tmp.path().join("bin");
 		fs::create_dir_all(&bin_dir).unwrap();
@@ -858,5 +1024,130 @@ mod tests {
 			}
 		}
 		assert_eq!(found.as_deref(), Some(bin_path.as_path()));
+	}
+
+	/// `Identity` translator is a plain join / strip. Round-tripping
+	/// a workspace-relative path through absolutise → relativise
+	/// must come back identical or the LSP layer silently loses
+	/// track of which buffer a diagnostic belongs to.
+	#[test]
+	fn translator_identity_round_trip() {
+		let t = PathTranslator::Identity {
+			host_root: Utf8PathBuf::from("/home/dev/code/moon-ide"),
+		};
+		let abs = t.absolutise("src/lib/state.svelte.ts");
+		assert_eq!(
+			abs,
+			Utf8PathBuf::from("/home/dev/code/moon-ide/src/lib/state.svelte.ts")
+		);
+		let rel = t.relativise(abs.as_std_path()).expect("round-trip");
+		assert_eq!(rel, "src/lib/state.svelte.ts");
+		assert_eq!(t.host_root(), t.server_root());
+	}
+
+	/// `HostMount` round-trip: what the server sees is
+	/// `/workspace/<basename>/...`, what the tree and the frontend
+	/// see is the host absolute path, and the forward-slash
+	/// workspace-relative string must be identical across both
+	/// views.
+	#[test]
+	fn translator_host_mount_round_trip() {
+		let t = PathTranslator::HostMount {
+			host_root: Utf8PathBuf::from("/home/dev/code/moon-ide"),
+			server_root: Utf8PathBuf::from("/workspace/moon-ide"),
+		};
+		let abs = t.absolutise("crates/moon-core/src/lsp/server.rs");
+		assert_eq!(
+			abs,
+			Utf8PathBuf::from("/workspace/moon-ide/crates/moon-core/src/lsp/server.rs")
+		);
+		let rel = t.relativise(abs.as_std_path()).expect("round-trip");
+		assert_eq!(rel, "crates/moon-core/src/lsp/server.rs");
+		// Callers that need tree state use host_root, not the
+		// containerised server_root.
+		assert_eq!(t.host_root(), &Utf8PathBuf::from("/home/dev/code/moon-ide"));
+		assert_eq!(t.server_root(), &Utf8PathBuf::from("/workspace/moon-ide"));
+	}
+
+	/// Diagnostics against files outside the server's view (e.g.
+	/// rust-analyzer publishing against `/usr/local/.../core.rs`
+	/// inside the container) are dropped silently — the UI has no
+	/// buffer for them. Regression guard for the `strip_prefix`
+	/// guard in `relativise`.
+	#[test]
+	fn translator_relativise_rejects_paths_outside_root() {
+		let t = PathTranslator::HostMount {
+			host_root: Utf8PathBuf::from("/home/dev/code/moon-ide"),
+			server_root: Utf8PathBuf::from("/workspace/moon-ide"),
+		};
+		let outside = Path::new("/usr/local/lib/rustlib/src/rust/library/core/src/lib.rs");
+		assert!(t.relativise(outside).is_none());
+	}
+
+	/// Regression for the original user bug: a container-backed
+	/// broker was handing `docker exec` a bare `tsgo` basename,
+	/// which isn't on the container's `$PATH`. The fix resolves
+	/// the binary to the in-container `node_modules/.bin/<bin>`
+	/// path built from the host's ancestor walk.
+	#[test]
+	fn container_binary_path_resolves_node_modules_inside_mount() {
+		let tmp = tempfile::tempdir().unwrap();
+		let host_root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let bin_dir = host_root.join("node_modules").join(".bin");
+		fs::create_dir_all(bin_dir.as_std_path()).unwrap();
+		let bin_path = bin_dir.join("tsgo");
+		fs::write(bin_path.as_std_path(), b"#!/usr/bin/env node\n").unwrap();
+		make_executable(bin_path.as_std_path());
+
+		let translator = PathTranslator::HostMount {
+			host_root: host_root.clone(),
+			server_root: Utf8PathBuf::from("/workspace/moon-ide"),
+		};
+		let resolved = container_binary_path(&TS_SERVER, &translator).expect("resolves when node_modules is in the mount");
+		assert_eq!(resolved, Path::new("/workspace/moon-ide/node_modules/.bin/tsgo"));
+	}
+
+	/// pnpm-hoisted monorepos keep `node_modules` at a parent of
+	/// the active folder. That parent isn't bind-mounted, so the
+	/// container can't see the binary. `container_binary_path`
+	/// must say so cleanly — `None` — rather than handing back a
+	/// mount-escaping server path. The broker then cascades to
+	/// the host fallback.
+	#[test]
+	fn container_binary_path_rejects_node_modules_above_mount() {
+		let tmp = tempfile::tempdir().unwrap();
+		let monorepo = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let bin_dir = monorepo.join("node_modules").join(".bin");
+		fs::create_dir_all(bin_dir.as_std_path()).unwrap();
+		let bin_path = bin_dir.join("tsgo");
+		fs::write(bin_path.as_std_path(), b"#!/usr/bin/env node\n").unwrap();
+		make_executable(bin_path.as_std_path());
+
+		let active = monorepo.join("packages").join("app");
+		fs::create_dir_all(active.as_std_path()).unwrap();
+
+		let translator = PathTranslator::HostMount {
+			host_root: active,
+			server_root: Utf8PathBuf::from("/workspace/app"),
+		};
+		assert!(
+			container_binary_path(&TS_SERVER, &translator).is_none(),
+			"hoisted node_modules sits above the bind mount — container can't reach it"
+		);
+	}
+
+	/// `CargoHome`-strategy specs return the basename: `moon-base`
+	/// installs `rust-analyzer` on the container's `$PATH` via
+	/// rustup, so `docker exec` can resolve it without an
+	/// absolute path.
+	#[test]
+	fn container_binary_path_cargo_home_returns_basename() {
+		let translator = PathTranslator::HostMount {
+			host_root: Utf8PathBuf::from("/home/dev/code/moon-ide"),
+			server_root: Utf8PathBuf::from("/workspace/moon-ide"),
+		};
+		let resolved =
+			container_binary_path(&RUST_SERVER, &translator).expect("rust-analyzer always returns Some for CargoHome");
+		assert_eq!(resolved, Path::new("rust-analyzer"));
 	}
 }

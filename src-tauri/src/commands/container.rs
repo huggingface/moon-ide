@@ -72,6 +72,28 @@ async fn snapshot_and_emit(
 	Ok(status)
 }
 
+/// Drop any live LSP broker after a container mutation. The next
+/// `lsp_open` call rebuilds against the current state (container
+/// up → `DockerExec` spawner; container down → host fallback).
+/// Cheaper and more deterministic than trying to mutate the
+/// broker in place: the alternative would need per-language
+/// cache invalidation plus mid-flight teardown of any server
+/// that was attached to the old target, and those are the
+/// exact shapes we want to avoid in moon-core.
+///
+/// Called by every `container_*` mutating command after the
+/// compose action completes, regardless of whether the command
+/// succeeded — a half-failed recreate still produces a new
+/// container id, and we'd rather rebuild the broker than leak a
+/// stale `docker exec` pointed at a container name that no
+/// longer exists.
+async fn reset_lsp_broker(state: &crate::state::AppState) {
+	let handle = state.lsp.lock().await.take();
+	if let Some(handle) = handle {
+		handle.broker.shutdown_all().await;
+	}
+}
+
 /// Pure query — does not emit. The UI polls this on focus and
 /// after long-running operations the user might have invoked
 /// outside the IDE.
@@ -89,6 +111,7 @@ pub async fn container_status(state: State<'_, AppState>) -> Result<ContainerSta
 pub async fn container_setup(app: AppHandle, state: State<'_, AppState>) -> Result<ContainerStatus, MoonError> {
 	let (workspace_id, container) = workspace_handle(&state).await?;
 	container.setup(DEFAULT_DEV_IMAGE).await?;
+	reset_lsp_broker(&state).await;
 	snapshot_and_emit(&app, workspace_id, &container).await
 }
 
@@ -96,6 +119,7 @@ pub async fn container_setup(app: AppHandle, state: State<'_, AppState>) -> Resu
 pub async fn container_pause(app: AppHandle, state: State<'_, AppState>) -> Result<ContainerStatus, MoonError> {
 	let (workspace_id, container) = workspace_handle(&state).await?;
 	container.pause().await?;
+	reset_lsp_broker(&state).await;
 	snapshot_and_emit(&app, workspace_id, &container).await
 }
 
@@ -103,6 +127,7 @@ pub async fn container_pause(app: AppHandle, state: State<'_, AppState>) -> Resu
 pub async fn container_resume(app: AppHandle, state: State<'_, AppState>) -> Result<ContainerStatus, MoonError> {
 	let (workspace_id, container) = workspace_handle(&state).await?;
 	container.resume().await?;
+	reset_lsp_broker(&state).await;
 	snapshot_and_emit(&app, workspace_id, &container).await
 }
 
@@ -110,6 +135,7 @@ pub async fn container_resume(app: AppHandle, state: State<'_, AppState>) -> Res
 pub async fn container_rebuild(app: AppHandle, state: State<'_, AppState>) -> Result<ContainerStatus, MoonError> {
 	let (workspace_id, container) = workspace_handle(&state).await?;
 	container.rebuild(DEFAULT_DEV_IMAGE).await?;
+	reset_lsp_broker(&state).await;
 	snapshot_and_emit(&app, workspace_id, &container).await
 }
 
@@ -117,6 +143,7 @@ pub async fn container_rebuild(app: AppHandle, state: State<'_, AppState>) -> Re
 pub async fn container_stop(app: AppHandle, state: State<'_, AppState>) -> Result<ContainerStatus, MoonError> {
 	let (workspace_id, container) = workspace_handle(&state).await?;
 	container.stop().await?;
+	reset_lsp_broker(&state).await;
 	snapshot_and_emit(&app, workspace_id, &container).await
 }
 
@@ -124,6 +151,7 @@ pub async fn container_stop(app: AppHandle, state: State<'_, AppState>) -> Resul
 pub async fn container_teardown(app: AppHandle, state: State<'_, AppState>) -> Result<ContainerStatus, MoonError> {
 	let (workspace_id, container) = workspace_handle(&state).await?;
 	container.teardown().await?;
+	reset_lsp_broker(&state).await;
 	snapshot_and_emit(&app, workspace_id, &container).await
 }
 
@@ -148,6 +176,11 @@ pub async fn container_apply_bound_folders(
 	// hasn't opted in yet (status: Absent) or has paused on
 	// purpose.
 	container.apply_bound_folders(DEFAULT_DEV_IMAGE).await?;
+	// Bound-folder mutation can trigger a `compose up -d --wait`
+	// that recreates the dev container. That invalidates any
+	// `docker exec` the LSP broker was piping into — safer to
+	// tear down unconditionally and rebuild on next `lsp_open`.
+	reset_lsp_broker(&state).await;
 	snapshot_and_emit(&app, workspace_id, &container).await
 }
 

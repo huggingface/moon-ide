@@ -1,5 +1,6 @@
 import MarkdownIt from 'markdown-it';
 import DOMPurify from 'dompurify';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import { extractFenceLanguages, highlightCode, loadHighlighters } from './editor/highlightCode';
 
 // Markdown rendering pipeline. Intentionally narrow: we want a
@@ -88,6 +89,45 @@ export async function renderMarkdown(source: string): Promise<string> {
 		// `innerHTML` so a string is what we want.
 		RETURN_TRUSTED_TYPE: false,
 	});
+}
+
+/**
+ * Schemes whose links we route to the OS default app via the Tauri
+ * opener plugin. Anything else (file:, javascript:, custom
+ * protocols, bare relative paths) is handled by the caller or
+ * silently swallowed — never followed as a raw navigation inside
+ * the Tauri webview, which would replace the IDE shell with the
+ * target page.
+ *
+ * Keep this list in sync with the `opener:default` capability set.
+ */
+export const EXTERNAL_MARKDOWN_SCHEMES = new Set(['http:', 'https:', 'mailto:', 'tel:']);
+
+/**
+ * If `href` parses as an absolute URL with an allow-listed scheme,
+ * open it via the Tauri opener plugin and return `true`. Returns
+ * `false` for in-page fragments (`#foo`), relative paths, and
+ * schemes that aren't in [`EXTERNAL_MARKDOWN_SCHEMES`] — the caller
+ * decides what to do with those.
+ *
+ * Shared by the Markdown file preview (`MarkdownView.svelte`) and
+ * the LSP hover popover (`editor/lsp.ts`) so both render paths end
+ * up with identical click semantics: MDN references, `rust-analyzer`
+ * doc links, `@link` crossrefs in JS/TS tooltips all open in the
+ * user's browser instead of navigating the IDE window.
+ */
+export function openExternalMarkdownLink(href: string): boolean {
+	let url: URL;
+	try {
+		url = new URL(href);
+	} catch {
+		return false;
+	}
+	if (!EXTERNAL_MARKDOWN_SCHEMES.has(url.protocol)) {
+		return false;
+	}
+	void openUrl(url.toString());
+	return true;
 }
 
 /**
