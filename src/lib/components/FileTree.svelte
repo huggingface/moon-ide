@@ -11,7 +11,6 @@
 		FileTree,
 		type ContextMenuItem as PierreContextMenuItem,
 		type ContextMenuOpenContext as PierreContextMenuOpenContext,
-		type GitStatusEntry as PierreGitStatusEntry,
 	} from '@pierre/trees';
 	import ContextMenu from './ContextMenu.svelte';
 	import type { ContextMenuItem } from './contextMenu';
@@ -70,7 +69,7 @@
 			// simpler default; users open what they actually want.
 			initialExpansion: 0,
 			search: true,
-			gitStatus: toTrackedEntries(untrack(() => workspace.gitStatusEntries)),
+			gitStatus: untrack(() => workspace.gitStatusEntries),
 			onSelectionChange: (selectedPaths) => {
 				if (selectedPaths.length === 0) {
 					return;
@@ -298,32 +297,26 @@
 	}
 
 	// Feed git status into Pierre whenever the backend classifier
-	// returns a new list. We strip `ignored` entries first (see
-	// `toTrackedEntries`) so Pierre's internal `directoriesWithChanges`
-	// bubble only reflects real edits — otherwise every ancestor of
-	// an ignored file (e.g. `front/` above `front/node_modules/`)
-	// lights up with a dot that has no actionable meaning. Ignored
-	// fading is re-applied via `applyGitOverlay` below.
+	// returns a new list. We pass ignored entries through too so
+	// Pierre's native row styling kicks in — its
+	// `[data-item-git-status='ignored']` selector colours the icon,
+	// filename, and git lane in one consistent stroke that we'd
+	// otherwise have to recreate by hand (and miss bits of, like the
+	// content text colour). The trade-off is that Pierre's
+	// `directoriesWithChanges` pass adds `data-item-contains-git-
+	// change` to ancestors of ignored entries, so a folder like
+	// `front/` lights up with a dot just because `front/node_modules/`
+	// is ignored. `applyGitOverlay` below hides that dot for
+	// ignored-only ancestors and tints the rest by the worst tracked
+	// descendant status.
 	$effect(() => {
 		const entries = workspace.gitStatusEntries;
 		if (!tree) {
 			return;
 		}
-		tree.setGitStatus(toTrackedEntries(entries));
+		tree.setGitStatus(entries);
 		applyGitOverlay(tree, entries);
 	});
-
-	// Pierre's `gitStatus` prop treats every entry the same way:
-	// set `data-item-git-status` on the matching row, *and* walk each
-	// entry's ancestors to fill `directoriesWithChanges`. That second
-	// pass is what puts a dot next to `front/` just because
-	// `front/node_modules/` is in the list. We don't get to opt
-	// individual entries out of the ancestor pass, so we opt the
-	// whole `ignored` class out of Pierre's gitStatus and re-create
-	// the fade ourselves via `applyGitOverlay` below.
-	function toTrackedEntries(entries: readonly GitStatusEntry[]): readonly PierreGitStatusEntry[] {
-		return entries.filter((entry) => entry.status !== 'ignored');
-	}
 
 	type TrackedStatus = 'added' | 'modified' | 'deleted' | 'untracked';
 
@@ -338,10 +331,9 @@
 		untracked: 1,
 	};
 
-	// Recompute the shadow-DOM overlay: ignored fade + per-folder dot
-	// color. Runs on every git-status refresh; the injected
-	// stylesheet is re-used so subsequent updates are a single
-	// textContent swap.
+	// Recompute the shadow-DOM overlay for folder dots. Runs on every
+	// git-status refresh; the injected stylesheet is re-used so
+	// subsequent updates are a single textContent swap.
 	function applyGitOverlay(local: FileTree, entries: readonly GitStatusEntry[]) {
 		const host = local.getFileTreeContainer();
 		const shadow = host?.shadowRoot;
@@ -368,25 +360,24 @@
 		// files. Our selectors have to match that verbatim — earlier
 		// iterations stripped the slash and silently missed the
 		// folder row itself (plus every ancestor dot).
-		const ignoredFiles: string[] = [];
-		const ignoredDirs: string[] = [];
-		// `folderSeverity` is keyed by the ancestor's `data-item-path`
-		// form (with trailing slash) and stores the worst status
-		// found anywhere below it. Pierre still carries its
-		// `[data-item-contains-git-change="true"]` flag on those
-		// folders; we only override the color the built-in dot picks
-		// up from CSS custom properties.
+		//
+		// We track two ancestor sets:
+		//   - `folderSeverity` → folders with at least one tracked
+		//     (added/modified/deleted/untracked) descendant, mapped
+		//     to that descendant's worst status. These get a
+		//     coloured dot tinted by that status.
+		//   - `ignoredAncestors` → folders with at least one ignored
+		//     descendant. Pierre still flags them with
+		//     `data-item-contains-git-change="true"` and would render
+		//     a modified-coloured dot by default, but a
+		//     "node_modules/ contains 1000 ignored files" dot has no
+		//     actionable signal — pure visual noise. We hide the dot
+		//     when a folder appears here but not in
+		//     `folderSeverity`.
 		const folderSeverity = new Map<string, TrackedStatus>();
+		const ignoredAncestors = new Set<string>();
 		for (const entry of entries) {
 			if (entry.path.length === 0) {
-				continue;
-			}
-			if (entry.status === 'ignored') {
-				if (entry.path.endsWith('/')) {
-					ignoredDirs.push(entry.path);
-				} else {
-					ignoredFiles.push(entry.path);
-				}
 				continue;
 			}
 			const stripped = entry.path.replace(/\/+$/, '');
@@ -396,6 +387,10 @@
 				const seg = segments[i] ?? '';
 				cumulative = cumulative === '' ? seg : `${cumulative}/${seg}`;
 				const key = `${cumulative}/`;
+				if (entry.status === 'ignored') {
+					ignoredAncestors.add(key);
+					continue;
+				}
 				const existing = folderSeverity.get(key);
 				if (existing === undefined || SEVERITY[entry.status] > SEVERITY[existing]) {
 					folderSeverity.set(key, entry.status);
@@ -405,29 +400,27 @@
 
 		const rules: string[] = [];
 
-		// Fade rules replicate Pierre's built-in ignored styling —
-		// muted icon color plus 50% opacity on the icon cell — so the
-		// swap is invisible to the eye. Chevrons are excluded so
-		// expand/collapse arrows on ignored folders stay legible. The
-		// prefix selector (`^=` on a directory path ending in `/`)
-		// fades every descendant row in a single rule.
-		if (ignoredFiles.length > 0 || ignoredDirs.length > 0) {
-			const rowSelectors: string[] = [];
-			for (const path of ignoredFiles) {
-				rowSelectors.push(`[data-item-path="${escapeAttr(path)}"]`);
+		// Hide the descendant-change dot on ancestors whose only
+		// descendants are ignored. `visibility: hidden` keeps the
+		// 12px lane reserved so filenames don't shift around as the
+		// rule toggles on/off across refreshes. Pierre never renders
+		// a label inside `[data-item-section='git']` for folders
+		// (only files with a tracked status get a letter), so
+		// hiding the whole section is equivalent to hiding the dot.
+		const ignoredOnly: string[] = [];
+		for (const folder of ignoredAncestors) {
+			if (!folderSeverity.has(folder)) {
+				ignoredOnly.push(folder);
 			}
-			for (const dir of ignoredDirs) {
-				rowSelectors.push(`[data-item-path="${escapeAttr(dir)}"]`);
-				rowSelectors.push(`[data-item-path^="${escapeAttr(dir)}"]`);
-			}
-			const rowSelector = rowSelectors.join(', ');
-			const iconSelector = rowSelectors.map((s) => `${s} > [data-item-section="icon"]`).join(', ');
-			const glyphSelector = rowSelectors
-				.map((s) => `${s} > [data-item-section="icon"] > :where(:not([data-icon-name="file-tree-icon-chevron"]))`)
+		}
+		if (ignoredOnly.length > 0) {
+			const selector = ignoredOnly
+				.map(
+					(f) =>
+						`[data-item-path="${escapeAttr(f)}"][data-item-contains-git-change="true"] > [data-item-section="git"]`,
+				)
 				.join(', ');
-			rules.push(`${rowSelector} {\n\t--trees-item-git-status-color: var(--trees-git-ignored-color);\n}`);
-			rules.push(`${iconSelector} {\n\topacity: 0.5;\n}`);
-			rules.push(`${glyphSelector} {\n\tcolor: var(--trees-item-git-status-color);\n}`);
+			rules.push(`${selector} {\n\tvisibility: hidden;\n}`);
 		}
 
 		// One rule per status bucket so we emit at most four rules

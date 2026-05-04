@@ -14,12 +14,15 @@
 - Deleted files are merged back into the tree's path list so a
   worktree deletion persists as a strikethrough ghost row until
   the commit lands, per the roadmap's Phase 5 contract.
-- Ignored entries bypass Pierre's `setGitStatus` so they don't
-  propagate a "contains change" dot up to ancestor folders; a
-  small shadow-DOM overlay stylesheet re-creates the fade on
-  ignored rows and tints each real-change folder dot by the
-  worst descendant status (`deleted > modified > added >
-untracked`).
+- Ignored entries flow through Pierre's `setGitStatus` so its
+  built-in `[data-item-git-status='ignored']` fade applies to the
+  whole row (icon, filename, git lane) without us having to
+  recreate it. A small shadow-DOM overlay stylesheet hides the
+  descendant-change dot on ancestor folders whose only descendants
+  are ignored (otherwise `front/` would light up just because
+  `front/node_modules/` exists), and tints each real-change folder
+  dot by the worst tracked descendant status (`deleted > modified
+  > added > untracked`).
 - Live refresh via a `notify` watcher rooted at the active folder:
   500ms-debounced `fs:changed` events re-trigger the full
   enumerate + classify pass. Window-focus events are a second-
