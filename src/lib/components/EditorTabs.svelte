@@ -56,6 +56,23 @@
 	});
 	const currentView: ViewMode = $derived(diffMode ? 'diff' : previewMode === 'preview' ? 'preview' : 'source');
 	const showViewToggle = $derived(!activeIsDeleted && (activeIsMarkdown || canDiff));
+	// Revert icon: shows whenever there's a HEAD state to fall back
+	// to (modified or deleted). Untracked / added / clean don't get
+	// the icon — for those, "revert" either means trashing the file
+	// (file-tree menu still offers it) or doesn't apply. The icon
+	// rides next to the view toggle and brings up the same confirm
+	// dialog as the file-tree's "Discard changes" entry.
+	const canRevert = $derived.by(() => {
+		if (activeFile === null || activeFile.kind !== 'text') {
+			return false;
+		}
+		if (activeFile.isUntitled) {
+			return false;
+		}
+		const status = workspace.gitStatusEntries.find((e) => e.path === activePath)?.status;
+		return status === 'modified' || status === 'deleted';
+	});
+	const showToolbar = $derived(showViewToggle || canRevert);
 
 	function setView(mode: ViewMode) {
 		if (activePath === null) {
@@ -72,6 +89,13 @@
 		}
 		workspace.setDiffMode(activePath, false);
 		workspace.setPreviewMode(activePath, mode === 'preview' ? 'preview' : 'source');
+	}
+
+	function revertActive() {
+		if (activePath === null) {
+			return;
+		}
+		void workspace.discardPaths([activePath]);
 	}
 
 	// MIME type used to identify our own tab drags. The side payload
@@ -247,38 +271,65 @@
 			</div>
 		{/each}
 	</div>
-	{#if showViewToggle}
+	{#if showToolbar}
 		<div class="view-toggle" role="group" aria-label="View mode">
-			<button
-				type="button"
-				class="view-btn"
-				class:selected={currentView === 'source'}
-				aria-pressed={currentView === 'source'}
-				onclick={() => setView('source')}
-			>
-				Source
-			</button>
-			{#if activeIsMarkdown}
+			{#if showViewToggle}
 				<button
 					type="button"
 					class="view-btn"
-					class:selected={currentView === 'preview'}
-					aria-pressed={currentView === 'preview'}
-					onclick={() => setView('preview')}
+					class:selected={currentView === 'source'}
+					aria-pressed={currentView === 'source'}
+					onclick={() => setView('source')}
 				>
-					Preview
+					Source
 				</button>
+				{#if activeIsMarkdown}
+					<button
+						type="button"
+						class="view-btn"
+						class:selected={currentView === 'preview'}
+						aria-pressed={currentView === 'preview'}
+						onclick={() => setView('preview')}
+					>
+						Preview
+					</button>
+				{/if}
+				{#if canDiff}
+					<button
+						type="button"
+						class="view-btn"
+						class:selected={currentView === 'diff'}
+						aria-pressed={currentView === 'diff'}
+						onclick={() => setView('diff')}
+						title="Show diff against HEAD (Ctrl+Shift+D)"
+					>
+						Diff
+					</button>
+				{/if}
 			{/if}
-			{#if canDiff}
+			{#if canRevert}
 				<button
 					type="button"
-					class="view-btn"
-					class:selected={currentView === 'diff'}
-					aria-pressed={currentView === 'diff'}
-					onclick={() => setView('diff')}
-					title="Show diff against HEAD (Ctrl+Shift+D)"
+					class="view-icon-btn"
+					onclick={revertActive}
+					title={activeIsDeleted ? 'Restore file from HEAD' : 'Revert file to HEAD'}
+					aria-label={activeIsDeleted ? 'Restore file from HEAD' : 'Revert file to HEAD'}
 				>
-					Diff
+					<svg
+						xmlns="http://www.w3.org/2000/svg"
+						width="14"
+						height="14"
+						viewBox="0 0 24 24"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="2"
+						stroke-linecap="round"
+						stroke-linejoin="round"
+						aria-hidden="true"
+					>
+						<path d="M3 7v6h6" />
+						<path d="M21 17a9 9 0 0 0-15-6.7L3 13" />
+					</svg>
 				</button>
 			{/if}
 		</div>
@@ -430,5 +481,32 @@
 		color: var(--m-fg);
 		background: var(--m-bg-3);
 		border-color: var(--m-border);
+	}
+	/* Icon-only button alongside the Source/Diff text buttons. Same
+	   hit-target height as `.view-btn` (24px = 11px text + 6px+6px pad
+	   + 1+1px border equivalents) so the row stays aligned, but a
+	   square footprint instead of text padding. */
+	.view-icon-btn {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 22px;
+		height: 22px;
+		margin-left: 4px;
+		color: var(--m-fg-muted);
+		background: transparent;
+		border: 1px solid transparent;
+		border-radius: 3px;
+		padding: 0;
+		cursor: pointer;
+		user-select: none;
+		-webkit-user-select: none;
+	}
+	.view-icon-btn:hover {
+		color: var(--m-fg);
+		background: var(--m-bg-overlay);
+	}
+	.view-icon-btn:active {
+		background: var(--m-bg-3);
 	}
 </style>

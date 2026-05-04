@@ -313,10 +313,14 @@
 			// Single-path path: use the exact status to tailor copy.
 			// An untracked row is more honest as "move to trash" than
 			// "discard" since git has nothing to revert — the label
-			// tracks that.
+			// tracks that. A deleted row recreates the file from
+			// HEAD, which reads as "Restore" not "Discard".
 			const entry = workspace.gitStatusEntries.find((e) => e.path === item.path);
 			if (entry?.status === 'untracked') {
 				return 'Discard (move untracked file to trash)';
+			}
+			if (entry?.status === 'deleted') {
+				return 'Restore file';
 			}
 			return 'Discard changes';
 		}

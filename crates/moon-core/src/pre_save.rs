@@ -60,31 +60,36 @@ pub fn ensure_line_endings(text: &str, ec: &EditorConfig) -> String {
 /// concrete bite.
 pub fn trim_trailing_whitespace(text: &str) -> String {
 	let mut out = String::with_capacity(text.len());
-	let mut buffer = String::new();
 	let bytes = text.as_bytes();
+	let mut line_start = 0;
 	let mut i = 0;
 
+	// Scan by bytes for `\n` / `\r` (both ASCII, so they always sit on
+	// a UTF-8 char boundary) and accumulate by *slicing the original
+	// `&str`* between separators. Slicing is safe because `i` and
+	// `line_start` only ever land on ASCII separators or at offset 0;
+	// every other byte inside a multi-byte UTF-8 sequence is ≥ 0x80
+	// and can't be confused with `\n` (0x0A) or `\r` (0x0D).
 	while i < bytes.len() {
 		let b = bytes[i];
-		if b == b'\n' || b == b'\r' {
-			let trimmed = buffer.trim_end_matches([' ', '\t']);
-			out.push_str(trimmed);
-			buffer.clear();
-			out.push(b as char);
-			if b == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-				out.push('\n');
-				i += 2;
-				continue;
-			}
+		if b != b'\n' && b != b'\r' {
 			i += 1;
 			continue;
 		}
-		buffer.push(b as char);
-		i += 1;
+		let line = &text[line_start..i];
+		out.push_str(line.trim_end_matches([' ', '\t']));
+		if b == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+			out.push_str("\r\n");
+			i += 2;
+		} else {
+			out.push(b as char);
+			i += 1;
+		}
+		line_start = i;
 	}
 
-	let trimmed = buffer.trim_end_matches([' ', '\t']);
-	out.push_str(trimmed);
+	let tail = &text[line_start..];
+	out.push_str(tail.trim_end_matches([' ', '\t']));
 	out
 }
 
@@ -203,5 +208,20 @@ mod tests {
 		let mut ec = ec();
 		ec.trim_trailing_whitespace = false;
 		assert_eq!(apply_pipeline("a   \n", &ec), "a   \n");
+	}
+
+	#[test]
+	fn trim_preserves_utf8_multibyte() {
+		// Regression: the previous implementation iterated bytes and
+		// did `b as char`, which mangled every byte ≥ 0x80 (turning
+		// `é` into `Ã©`, `日本` into garbage, emoji into 4× junk
+		// codepoints). The new slice-based scan must round-trip every
+		// non-ASCII codepoint exactly, including ones embedded in
+		// trailing-whitespace-bearing lines.
+		assert_eq!(trim_trailing_whitespace("café   \nrésumé\t\n"), "café\nrésumé\n");
+		assert_eq!(trim_trailing_whitespace("日本語  \n"), "日本語\n");
+		assert_eq!(trim_trailing_whitespace("emoji 🚀  \nnext"), "emoji 🚀\nnext");
+		// And the no-separator path through the trailing tail.
+		assert_eq!(trim_trailing_whitespace("café   "), "café");
 	}
 }
