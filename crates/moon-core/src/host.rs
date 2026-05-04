@@ -110,6 +110,19 @@ pub trait WorkspaceHost: Send + Sync {
 	/// support in progress but hasn't stabilised; swapping the
 	/// implementation is a contained change behind this trait method.
 	async fn git_blame(&self, path: &Utf8Path) -> MoonResult<Option<GitFileBlame>>;
+
+	/// Contents of `path` at `HEAD`. Used as the "before" side of the
+	/// editor's git diff view, and as the displayable text for a
+	/// working-tree-deleted file whose bytes aren't on disk anymore.
+	///
+	/// Returns `Ok(None)` for anything the UI should surface as "no
+	/// diff to show" rather than as an error: the path isn't inside a
+	/// git repo, the file doesn't exist in `HEAD` (freshly-added /
+	/// untracked), or the `git` binary can't be found. Binary files
+	/// in `HEAD` also return `None` — the diff view only deals in
+	/// text. Real errors (join failures, unreadable UTF-8 from a file
+	/// we thought was text) still bubble up.
+	async fn git_head_content(&self, path: &Utf8Path) -> MoonResult<Option<String>>;
 }
 
 pub struct LocalHost {
@@ -501,6 +514,46 @@ impl WorkspaceHost for LocalHost {
 			.await
 			.map_err(|e| MoonError::Internal(format!("git_blame join error: {e}")))?
 	}
+
+	async fn git_head_content(&self, path: &Utf8Path) -> MoonResult<Option<String>> {
+		// Same containment envelope as `git_blame`: reject absolute,
+		// reject `..` escapes, reject rooted paths. The diff view
+		// never legitimately asks for anything outside the active
+		// folder.
+		if path.as_str().is_empty() {
+			return Ok(None);
+		}
+		let rel = Utf8PathBuf::from(path.as_str().trim_end_matches('/'));
+		if rel.is_absolute() {
+			return Err(MoonError::invalid(format!(
+				"git_head_content rejects absolute path: {rel}"
+			)));
+		}
+		let mut depth = 0i32;
+		for seg in rel.components() {
+			match seg {
+				camino::Utf8Component::ParentDir => {
+					depth -= 1;
+					if depth < 0 {
+						return Err(MoonError::invalid(format!(
+							"git_head_content rejects path escape: {rel}"
+						)));
+					}
+				}
+				camino::Utf8Component::Normal(_) => depth += 1,
+				camino::Utf8Component::CurDir => {}
+				camino::Utf8Component::Prefix(_) | camino::Utf8Component::RootDir => {
+					return Err(MoonError::invalid(format!(
+						"git_head_content rejects rooted path: {rel}"
+					)));
+				}
+			}
+		}
+		let root = self.root.clone();
+		tokio::task::spawn_blocking(move || run_git_head_content(&root, &rel))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_head_content join error: {e}")))?
+	}
 }
 
 /// `git restore --source=HEAD --staged --worktree -- <paths>`.
@@ -597,6 +650,61 @@ fn run_git_blame(root: &Utf8Path, path: &Utf8PathBuf) -> MoonResult<Option<GitFi
 		"git blame parsed"
 	);
 	Ok(Some(blame))
+}
+
+/// `git show HEAD:<path>`. Returns `Ok(None)` for the "no diff to
+/// show" states the UI treats silently: not a repo, path isn't in
+/// `HEAD` (freshly added / untracked), or `git` itself is missing.
+/// Binary contents at `HEAD` collapse to `None` too — the diff view
+/// only renders text. UTF-8 decode failures on something we *thought*
+/// was text are the one real error path and bubble up.
+///
+/// Invoked from the blocking pool.
+fn run_git_head_content(root: &Utf8Path, path: &Utf8PathBuf) -> MoonResult<Option<String>> {
+	use std::process::Command;
+
+	// `HEAD:<path>` uses forward slashes regardless of host OS —
+	// git's pathspec grammar isn't the platform's. The path is
+	// already workspace-relative + UTF-8 so the conversion is
+	// lossless; Windows paths with backslashes would confuse git
+	// silently otherwise.
+	// `git show <rev>:<path>` is the stable way to pull a committed
+	// blob by path. `--` isn't used here: `git show` treats args
+	// after `--` as pathspecs rather than as rev-parse inputs, and
+	// the blob would come back empty.
+	let spec = format!("HEAD:{}", path.as_str().replace('\\', "/"));
+	let output = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.arg("show")
+		.arg(&spec)
+		.output();
+	let Ok(output) = output else {
+		return Ok(None);
+	};
+	if !output.status.success() {
+		// Two common shapes collapse to `None` here:
+		// - "fatal: not a git repository" → outside a repo.
+		// - "fatal: path 'foo' exists on disk, but not in 'HEAD'"
+		//   → untracked / newly-added. The diff for those is
+		//   "everything is new", which the frontend renders by
+		//   passing an empty "before" side itself; we don't need
+		//   to fake a success here.
+		let stderr = String::from_utf8_lossy(&output.stderr);
+		tracing::debug!(
+			path = %path,
+			code = output.status.code().unwrap_or(-1),
+			stderr = %stderr.trim(),
+			"git show HEAD:<path> exited non-zero"
+		);
+		return Ok(None);
+	}
+	if looks_binary(&output.stdout) {
+		return Ok(None);
+	}
+	String::from_utf8(output.stdout)
+		.map(Some)
+		.map_err(|e| MoonError::IoError(format!("git show HEAD:<path> produced non-UTF-8 text: {e}")))
 }
 
 /// Resolve the primary remote's web URL, normalised for link-
@@ -1559,6 +1667,81 @@ mod tests {
 		assert_eq!(super::normalize_remote_url("https://gitlab.com/moon/ide.git"), None);
 		assert_eq!(super::normalize_remote_url("git@bitbucket.org:moon/ide.git"), None);
 		assert_eq!(super::normalize_remote_url(""), None);
+	}
+
+	#[tokio::test]
+	async fn git_head_content_returns_committed_text() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping head content test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		std::fs::write(dir.path().join("greet.txt"), "hello\n").unwrap();
+		run_git(&git, dir.path(), &["init", "-q"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		run_git(&git, dir.path(), &["add", "greet.txt"]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "add greet"]);
+		std::fs::write(dir.path().join("greet.txt"), "hello there\n").unwrap();
+
+		let got = host(&dir).git_head_content(Utf8Path::new("greet.txt")).await.unwrap();
+		assert_eq!(got, Some("hello\n".to_string()));
+	}
+
+	#[tokio::test]
+	async fn git_head_content_returns_text_for_deleted_file() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping deleted-head test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		std::fs::write(dir.path().join("gone.txt"), "was here\n").unwrap();
+		run_git(&git, dir.path(), &["init", "-q"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		run_git(&git, dir.path(), &["add", "gone.txt"]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "add gone"]);
+		std::fs::remove_file(dir.path().join("gone.txt")).unwrap();
+
+		let got = host(&dir).git_head_content(Utf8Path::new("gone.txt")).await.unwrap();
+		assert_eq!(got, Some("was here\n".to_string()));
+	}
+
+	#[tokio::test]
+	async fn git_head_content_returns_none_for_untracked_file() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping untracked-head test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		std::fs::write(dir.path().join("keep.txt"), "keep\n").unwrap();
+		run_git(&git, dir.path(), &["init", "-q"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		run_git(&git, dir.path(), &["add", "keep.txt"]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "initial"]);
+		std::fs::write(dir.path().join("fresh.txt"), "new\n").unwrap();
+
+		let got = host(&dir).git_head_content(Utf8Path::new("fresh.txt")).await.unwrap();
+		assert!(got.is_none());
+	}
+
+	#[tokio::test]
+	async fn git_head_content_returns_none_outside_repo() {
+		let dir = TempDir::new().unwrap();
+		std::fs::write(dir.path().join("lone.txt"), "no repo\n").unwrap();
+		let got = host(&dir).git_head_content(Utf8Path::new("lone.txt")).await.unwrap();
+		assert!(got.is_none());
+	}
+
+	#[tokio::test]
+	async fn git_head_content_rejects_path_escapes() {
+		let dir = TempDir::new().unwrap();
+		let err = host(&dir)
+			.git_head_content(Utf8Path::new("../secret.txt"))
+			.await
+			.unwrap_err();
+		assert!(matches!(err, MoonError::InvalidArgument(_)), "got {err:?}");
 	}
 
 	fn which_git() -> Option<std::path::PathBuf> {

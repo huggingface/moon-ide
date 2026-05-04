@@ -90,6 +90,13 @@ export type OpenFile = {
 	loadedFingerprint: ContentFingerprint;
 	loadedMtimeMs: number | null;
 	isDirty: boolean;
+	// True for buffers opened against a working-tree-deleted path:
+	// the bytes aren't on disk, `text` holds the `HEAD` content, and
+	// the UI renders the diff view unconditionally (a plain editor
+	// couldn't save back — there's nowhere to save to). Persisted in
+	// the session so a deleted row the user left open pops back up
+	// in diff mode after a restart.
+	isDeleted: boolean;
 };
 
 /**
@@ -130,6 +137,16 @@ class FolderState {
 	// itself). Per folder so a `README.md` in folder A and folder B
 	// keep independent toggles.
 	previewModes = $state<Map<string, MarkdownView>>(new Map());
+
+	// Per-buffer git-diff view toggle. Modified files default to
+	// `false` (show the normal editor); deleted files default to
+	// `true` and stay that way for the buffer's lifetime (there's
+	// nothing editable to fall back to). Scoped per folder for the
+	// same reason `previewModes` is — a `README.md` open in folder
+	// A and folder B keeps independent toggles. Not persisted:
+	// diff-view is a transient "show me what changed" gesture, not
+	// part of the user's layout.
+	diffModes = $state<Map<string, boolean>>(new Map());
 
 	// Per-folder counter for `Untitled-N` IDs. Per-folder so each
 	// folder's untitled sequence starts at 1 — independent of how
@@ -230,6 +247,21 @@ class WorkspaceState {
 	// its own refresh. Cleared by `refreshBlame` itself on resolve/
 	// reject.
 	#blameInFlight: Set<string> = new Set();
+	// Per-file `HEAD` blob contents, keyed by workspace-relative
+	// path. Feeds the CodeMirror gutter that paints
+	// added/modified/deleted wedges against the last commit. `null`
+	// in the map means "we asked and there's nothing in HEAD"
+	// (untracked, outside a repo, binary) — distinct from absent,
+	// which means "we haven't asked yet". Lifecycle: cleared on
+	// folder swap, evicted on close, seeded on open, and re-fetched
+	// whenever `refreshGitStatus` runs (external commits /
+	// checkouts, tree refresh, window focus).
+	headByPath = $state<Map<string, string | null>>(new Map());
+	// In-flight guard for `refreshHead` — `openFile` and `setActive`
+	// can fire in the same tick, and a buffer open in both splits
+	// would otherwise kick two parallel `git show` subprocesses
+	// against the same blob.
+	#headInFlight: Set<string> = new Set();
 	// Per-language server state, keyed by LSP language id (`'typescript'`,
 	// later `'rust'` / `'svelte'` / …). Populated by `lsp:status`
 	// broker events. The status bar renders one pill per entry whose
@@ -446,6 +478,15 @@ class WorkspaceState {
 		}
 	}
 
+	private get diffModes(): Map<string, boolean> {
+		return this.activeFolderState?.diffModes ?? new Map();
+	}
+	private set diffModes(value: Map<string, boolean>) {
+		if (this.activeFolderState) {
+			this.activeFolderState.diffModes = value;
+		}
+	}
+
 	private get untitledCounter(): number {
 		return this.activeFolderState?.untitledCounter ?? 0;
 	}
@@ -607,6 +648,8 @@ class WorkspaceState {
 			}
 			this.#blameTimers.clear();
 			this.blameByPath = new Map();
+			this.headByPath = new Map();
+			this.#headInFlight.clear();
 		}
 		this.workspace = snapshot.folders.length === 0 ? null : snapshot;
 		// Drop FolderStates whose folders aren't bound anymore. Two-pass
@@ -862,6 +905,9 @@ class WorkspaceState {
 			const file = this.openFiles.find((f) => f.path === activePath);
 			if (file && file.kind === 'text') {
 				this.refreshBlame(activePath);
+				if (!file.isDeleted) {
+					this.refreshHead(activePath);
+				}
 			}
 		}
 		// Warm the editorconfig cache for every restored tab in the
@@ -1027,6 +1073,19 @@ class WorkspaceState {
 			// throwing here is a legitimate filesystem error worth
 			// ignoring for tree cosmetics.
 			this.gitStatusEntries = [];
+		}
+		// `HEAD` moves whenever a git status refresh is warranted
+		// (commit, checkout, pull, reset). Re-fetch the content
+		// backing every open text buffer so the gutter flips from
+		// "everything's modified" back to clean once the user's
+		// commit lands. Scoped to open files — there's no point
+		// warming `HEAD` for files the user isn't looking at, and
+		// the list is typically < 20.
+		for (const file of this.openFiles) {
+			if (file.kind !== 'text' || file.isDeleted) {
+				continue;
+			}
+			this.refreshHead(file.path);
 		}
 	}
 
@@ -1307,6 +1366,57 @@ class WorkspaceState {
 	}
 
 	/**
+	 * Pull the file's `HEAD` blob into `headByPath` so the editor's
+	 * git-changes gutter has something to diff the current buffer
+	 * against. Fire-and-forget: the CodeMirror extension binds
+	 * reactively to the cache, so whenever this resolves the gutter
+	 * redraws.
+	 *
+	 * Skips untitled buffers (no on-disk path → no `HEAD` blob) and
+	 * caches `null` when the backend has nothing to offer (untracked,
+	 * not in a repo, binary). The `null` is load-bearing: it prevents
+	 * the lazy-fetch guard in `setActive` from re-asking on every
+	 * focus, and the extension treats `null` as "no gutter" anyway.
+	 */
+	refreshHead(path: string) {
+		if (path.startsWith('untitled:')) {
+			return;
+		}
+		if (this.#headInFlight.has(path)) {
+			return;
+		}
+		this.#headInFlight.add(path);
+		void ipc.fs
+			.gitHeadContent(path)
+			.then((head) => {
+				// Stale-response guard, same reasoning as `refreshBlame`:
+				// the active folder can have swapped during the await,
+				// in which case this answer is for a file that's no
+				// longer open.
+				if (!this.openFiles.some((f) => f.path === path)) {
+					return;
+				}
+				const next = new Map(this.headByPath);
+				next.set(path, head ?? null);
+				this.headByPath = next;
+			})
+			.catch(() => {
+				// Best-effort. No HEAD = empty gutter.
+			})
+			.finally(() => {
+				this.#headInFlight.delete(path);
+			});
+	}
+
+	private clearHeadFor(path: string) {
+		if (this.headByPath.has(path)) {
+			const next = new Map(this.headByPath);
+			next.delete(path);
+			this.headByPath = next;
+		}
+	}
+
+	/**
 	 * Open `path` in the given pane. By default, opening a file pulls
 	 * editor focus — that's what tab clicks, the quick-open palette,
 	 * and session restore want. Pass `{ focus: false }` for surfaces
@@ -1338,6 +1448,7 @@ class WorkspaceState {
 			loadedFingerprint: fingerprint(''),
 			loadedMtimeMs: null,
 			isDirty: false,
+			isDeleted: false,
 		};
 		this.openFiles = [...this.openFiles, file];
 		const tabs = this.tabsFor(side);
@@ -1357,8 +1468,11 @@ class WorkspaceState {
 				this.openFiles = [...this.openFiles, next];
 				// Notify the LSP broker only on first open — reopening
 				// an already-loaded buffer is a pure UI navigation
-				// event, the server still holds its open state.
-				if (next.kind === 'text') {
+				// event, the server still holds its open state. Skip
+				// for deleted buffers: feeding a phantom document to
+				// the server would produce fictitious diagnostics for
+				// a path that no longer exists on disk.
+				if (next.kind === 'text' && !next.isDeleted) {
 					this.lspOpen(next.path, next.text);
 					// Blame fetch is handled by `setActive` (called a
 					// few lines below). Routing through there covers
@@ -1409,6 +1523,50 @@ class WorkspaceState {
 	}
 
 	/**
+	 * True when `path`'s buffer should render the git-diff view
+	 * instead of the normal editor. Deleted files are always in
+	 * diff mode regardless of the map — the HEAD content is all
+	 * there is to show.
+	 */
+	diffModeFor(path: string): boolean {
+		const file = this.openFiles.find((f) => f.path === path);
+		if (file?.isDeleted) {
+			return true;
+		}
+		return this.diffModes.get(path) ?? false;
+	}
+
+	setDiffMode(path: string, enabled: boolean) {
+		const current = this.diffModeFor(path);
+		if (current === enabled) {
+			return;
+		}
+		const next = new Map(this.diffModes);
+		if (enabled) {
+			next.set(path, true);
+		} else {
+			next.delete(path);
+		}
+		this.diffModes = next;
+	}
+
+	/**
+	 * Flip the diff view on or off for `path`. Deleted buffers
+	 * swallow the toggle — there's no editor state to flip *to*,
+	 * and the menus that would trigger this don't offer the option
+	 * on deleted rows anyway. Untracked / ignored files similarly
+	 * have no `HEAD` content; they're filtered out upstream
+	 * (context menu), but guarding here keeps a stray call safe.
+	 */
+	toggleDiffMode(path: string) {
+		const file = this.openFiles.find((f) => f.path === path);
+		if (file?.isDeleted) {
+			return;
+		}
+		this.setDiffMode(path, !this.diffModeFor(path));
+	}
+
+	/**
 	 * Fetch the resolved `.editorconfig` for `path` and stash it. Idempotent
 	 * after the first successful call (the server caches per directory, but
 	 * we still want to avoid an IPC roundtrip on every focus change).
@@ -1450,7 +1608,23 @@ class WorkspaceState {
 	}
 
 	private async loadTextFile(path: string): Promise<OpenFile | null> {
-		const result = await ipc.fs.readFile(path);
+		// Missing-on-disk is the expected shape for a working-tree
+		// deletion that the user still wants to read (`git rm`'d or
+		// just deleted from the tree). We fall through to a HEAD
+		// read before surfacing the error, so a click on a deleted
+		// row in the tree — and a session-restored tab whose file
+		// vanished between launches — both land in diff view
+		// instead of flashing "Failed to open".
+		let result;
+		try {
+			result = await ipc.fs.readFile(path);
+		} catch (err) {
+			const deleted = await this.loadDeletedFile(path);
+			if (deleted) {
+				return deleted;
+			}
+			throw err;
+		}
 		if (result.is_binary) {
 			this.flash(`Cannot open binary file: ${path}`);
 			return null;
@@ -1465,6 +1639,7 @@ class WorkspaceState {
 			loadedFingerprint: fingerprint(result.text),
 			loadedMtimeMs: result.mtime_ms,
 			isDirty: false,
+			isDeleted: false,
 		};
 	}
 
@@ -1480,6 +1655,39 @@ class WorkspaceState {
 			loadedFingerprint: fingerprint(''),
 			loadedMtimeMs: null,
 			isDirty: false,
+			isDeleted: false,
+		};
+	}
+
+	/**
+	 * Build an `OpenFile` for a path whose working-tree copy is gone
+	 * but that still has a `HEAD` revision. `text` holds the `HEAD`
+	 * content so the diff view has a stable "before" side without a
+	 * second fetch.
+	 *
+	 * Returns `null` silently when there's no `HEAD` content (the
+	 * path isn't in a repo, or was never tracked). Callers fall
+	 * back to their own error reporting — the most common caller is
+	 * `loadTextFile`'s deleted-file recovery path, where "no HEAD
+	 * either" means the original disk-read error is the right
+	 * message to surface.
+	 */
+	private async loadDeletedFile(path: string): Promise<OpenFile | null> {
+		const headText = await ipc.fs.gitHeadContent(path);
+		if (headText === null) {
+			return null;
+		}
+		return {
+			path,
+			name: basename(path),
+			kind: 'text',
+			isUntitled: false,
+			text: headText,
+			previewUrl: '',
+			loadedFingerprint: fingerprint(headText),
+			loadedMtimeMs: null,
+			isDirty: false,
+			isDeleted: true,
 		};
 	}
 
@@ -1855,6 +2063,7 @@ class WorkspaceState {
 			// user reopens the file later a fresh blame fetch runs;
 			// no point keeping the old one warm.
 			this.clearBlameFor(path);
+			this.clearHeadFor(path);
 		}
 
 		if (fallback !== null) {
@@ -1984,8 +2193,14 @@ class WorkspaceState {
 		// guard in `refreshBlame` keeps this cheap — once the cache
 		// has an entry or a fetch is pending, this call is a no-op.
 		const file = this.openFiles.find((f) => f.path === path);
-		if (file && file.kind === 'text' && !this.blameByPath.has(path)) {
+		if (file && file.kind === 'text' && !file.isDeleted && !this.blameByPath.has(path)) {
 			this.refreshBlame(path);
+		}
+		// Same lazy-seed for the git-changes gutter. `isDeleted`
+		// buffers render in diff view unconditionally, so the inline
+		// gutter would be redundant — skip them.
+		if (file && file.kind === 'text' && !file.isDeleted && !this.headByPath.has(path)) {
+			this.refreshHead(path);
 		}
 		// Nav history: only push on genuine user navigation. We're
 		// inside `navigateBack` / `navigateForward` / `jumpTo` when
@@ -2440,6 +2655,12 @@ class WorkspaceState {
 			// in-memory buffer won't magically re-attribute itself
 			// — kick a debounced refresh so the widget catches up.
 			this.scheduleBlameRefresh(file.path);
+			// The git-changes gutter doesn't need a save-time refresh:
+			// `HEAD` doesn't move when we write the working tree, and
+			// the buffer's own reactive update already re-diffs on
+			// the new text. Refresh is driven by `refreshGitStatus`
+			// instead (which *does* fire after external `git commit`
+			// / `checkout` via filesystem watcher events).
 		} catch (err) {
 			this.flash(`Save failed: ${formatError(err)}`);
 		}

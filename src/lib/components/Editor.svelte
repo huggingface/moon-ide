@@ -16,6 +16,7 @@
 	} from '../editor/lsp';
 	import { lspGotoDefinitionExtension } from '../editor/lspGotoDefinition';
 	import { blameExtension, blameFacet } from '../editor/blame';
+	import { gitChangesExtension, headTextFacet } from '../editor/gitChanges';
 	import { workspace, type OpenFile, type SplitSide } from '../state.svelte';
 	import { languageFor } from '../editor/language';
 	import { moonEditorTheme } from '../editor/theme';
@@ -46,6 +47,12 @@
 	// late-arriving blame response doesn't rebuild editor state —
 	// reconfiguring a facet is a zero-cost transaction.
 	const blameCompartment = new Compartment();
+	// `HEAD` blob for the current buffer, feeding the git-changes
+	// gutter. Same zero-rebuild reconfigure pattern as blame — late-
+	// arriving `git show HEAD:<path>` responses just flip the facet
+	// value and the StateField re-runs its line diff on the next
+	// transaction.
+	const headCompartment = new Compartment();
 
 	// Each Editor instance owns one CM view that we re-target as the active file changes.
 	// We track the path the view currently holds so we know when to swap state.
@@ -192,6 +199,22 @@
 		});
 	});
 
+	// `HEAD` content for the git-changes gutter. `undefined` in the
+	// map means "not asked yet"; `null` means "asked, no HEAD
+	// available" (untracked / outside-repo / binary). Both collapse
+	// to `null` on the facet, which the extension treats as "no
+	// gutter paints today".
+	$effect(() => {
+		const v = view;
+		if (!v) {
+			return;
+		}
+		const head = workspace.headByPath.get(file.path) ?? null;
+		v.dispatch({
+			effects: headCompartment.reconfigure(headTextFacet.of(head)),
+		});
+	});
+
 	// Consume a pending jump (Ctrl/Cmd-click on an identifier lands
 	// here): `workspace.jumpTo` stashed the target position, and the
 	// Editor that ends up owning `file.path` applies the selection
@@ -280,6 +303,10 @@
 			// as `workspace.blameByPath` updates.
 			blameExtension(),
 			blameCompartment.of(blameFacet.of(workspace.blameByPath.get(file.path) ?? null)),
+			// Git-change wedges in a dedicated gutter, paired with the
+			// HEAD facet populated from `workspace.headByPath`.
+			gitChangesExtension(),
+			headCompartment.of(headTextFacet.of(workspace.headByPath.get(file.path) ?? null)),
 			// Autocompletion popover. `activateOnTyping: false` keeps
 			// it off the typing path so we don't leak the built-in
 			// identifier source; `override` routes explicit

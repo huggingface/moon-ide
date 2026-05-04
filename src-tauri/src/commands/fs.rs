@@ -119,3 +119,17 @@ pub async fn fs_git_blame(state: State<'_, AppState>, path: String) -> Result<Op
 	let path = Utf8PathBuf::from(path);
 	entry.host.git_blame(&path).await
 }
+
+/// `HEAD` content for `path`. Feeds the "before" side of the editor's
+/// git diff view, and doubles as the displayable text for a
+/// working-tree-deleted file whose bytes are no longer on disk.
+/// `None` (serialised as `null`) means "the path isn't in `HEAD`" —
+/// the frontend interprets that as "no diff context; render current
+/// text against an empty before side", so the null case isn't an
+/// error.
+#[tauri::command]
+pub async fn fs_git_head_content(state: State<'_, AppState>, path: String) -> Result<Option<String>, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	let path = Utf8PathBuf::from(path);
+	entry.host.git_head_content(&path).await
+}

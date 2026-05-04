@@ -426,3 +426,74 @@ button:focus-visible {
 .cm-blame-pr-link:hover {
 	text-decoration: underline;
 }
+
+/* Git-change gutter. A narrow strip between line numbers and the
+   editor content carrying thin vertical bars for added / modified
+   lines and sharp wedges where a pure deletion occurred. Sized
+   tightly (3px bars, ~6px gutter) so it reads as a marginal cue
+   rather than a second gutter the eye has to track. Colour families:
+   green for additions, blue for modifications (matching the VSCode/
+   Cursor convention the team already has muscle memory for), and
+   red for deletions. */
+.cm-gutter.cm-git-changes-gutter {
+	/* Gutter background is transparent so the editor row background
+	   bleeds through — the highlightActiveLine tint still reads on
+	   this line for the active row. */
+	background: transparent;
+	padding: 0;
+	width: 6px;
+}
+.cm-gutter.cm-git-changes-gutter .cm-gutterElement {
+	padding: 0;
+	height: 100%;
+}
+.cm-git-change {
+	display: block;
+	width: 100%;
+	height: 100%;
+	position: relative;
+}
+.cm-git-change-spacer {
+	visibility: hidden;
+}
+/* The main-color bar on the left edge: `::after` paints a 3px
+   coloured rail, separate from any `::before` deletion wedge so
+   modified + deletion-above can coexist on the same row. */
+.cm-git-change-added::after,
+.cm-git-change-modified::after {
+	content: '';
+	position: absolute;
+	left: 0;
+	top: 0;
+	bottom: 0;
+	width: 3px;
+}
+.cm-git-change-added::after {
+	background: var(--m-success);
+}
+.cm-git-change-modified::after {
+	background: var(--m-accent);
+}
+/* Pure-deletion wedges. `deleted-above` points at the top edge
+   of the line that follows a removal; `deleted-below` anchors to
+   the bottom edge of the last line when the removal was at EOF.
+   Rendered as a small triangle peeking into the gutter so it
+   reads as "lines used to be here" without competing visually
+   with the solid bars. */
+.cm-git-change-deleted-above::before,
+.cm-git-change-deleted-below::before {
+	content: '';
+	position: absolute;
+	left: 0;
+	width: 0;
+	height: 0;
+	border-left: 4px solid var(--m-danger);
+	border-top: 3px solid transparent;
+	border-bottom: 3px solid transparent;
+}
+.cm-git-change-deleted-above::before {
+	top: -3px;
+}
+.cm-git-change-deleted-below::before {
+	bottom: -3px;
+}

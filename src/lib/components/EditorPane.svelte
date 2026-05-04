@@ -1,6 +1,7 @@
 <script lang="ts">
 	import EditorTabs from './EditorTabs.svelte';
 	import Editor from './Editor.svelte';
+	import DiffView from './DiffView.svelte';
 	import ImageView from './ImageView.svelte';
 	import MarkdownView from './MarkdownView.svelte';
 	import Welcome from './Welcome.svelte';
@@ -18,11 +19,20 @@
 		}
 		return workspace.openFiles.find((f) => f.path === activePath) ?? null;
 	});
+	// Diff-view wins over markdown-preview: the user explicitly
+	// asked for the diff, and a rendered README-vs-HEAD diff isn't
+	// meaningful anyway — you want to see what you changed in the
+	// raw source. Markdown-preview stays available via the tab
+	// toolbar once they flip diff back off.
+	const showDiff = $derived(
+		activeFile !== null && activeFile.kind === 'text' && workspace.diffModeFor(activeFile.path),
+	);
 	const showMarkdownPreview = $derived(
 		activeFile !== null &&
 			activeFile.kind === 'text' &&
 			isMarkdownPath(activeFile.path) &&
-			workspace.previewModeFor(activeFile.path) === 'preview',
+			workspace.previewModeFor(activeFile.path) === 'preview' &&
+			!showDiff,
 	);
 
 	async function pickFolder() {
@@ -50,6 +60,8 @@
 	<div class="body">
 		{#if activeFile?.kind === 'image'}
 			<ImageView file={activeFile} />
+		{:else if activeFile && showDiff}
+			<DiffView file={activeFile} />
 		{:else if activeFile && showMarkdownPreview}
 			<MarkdownView file={activeFile} />
 		{:else if activeFile}

@@ -200,6 +200,20 @@
 	// then more items is more cognitive load for worse focus.
 	function buildMenuItems(item: PierreContextMenuItem): ContextMenuItem[] {
 		const items: ContextMenuItem[] = [];
+		if (item.kind === 'file' && canViewDiff(item.path)) {
+			items.push({
+				id: 'view-diff',
+				label: 'View diff',
+				onSelect: () => {
+					// Open the file (noop if already open) and force
+					// its diff view on. The two calls are ordered so
+					// a fresh-open flashes diff-view immediately
+					// rather than briefly showing the editor.
+					workspace.setDiffMode(item.path, true);
+					void workspace.openFile(item.path);
+				},
+			});
+		}
 		const discardPaths = collectDiscardPaths(item);
 		if (discardPaths.length > 0) {
 			items.push({
@@ -225,6 +239,23 @@
 			},
 		});
 		return items;
+	}
+
+	/**
+	 * True when "View diff" makes sense for `path`. We show it for
+	 * modified files (HEAD vs working tree is a real diff) and for
+	 * deleted files (HEAD vs empty — the shape a deletion takes in
+	 * the diff view). Added / untracked / ignored rows have no
+	 * `HEAD` side worth rendering and are excluded: git's own story
+	 * for them is "new file from nothing", which is better served
+	 * by just opening the file in the editor.
+	 */
+	function canViewDiff(path: string): boolean {
+		const entry = workspace.gitStatusEntries.find((e) => e.path === path);
+		if (!entry) {
+			return false;
+		}
+		return entry.status === 'modified' || entry.status === 'deleted';
 	}
 
 	/**
