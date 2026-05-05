@@ -321,6 +321,11 @@
 		justify-content: center;
 		width: 22px;
 		height: 22px;
+		/* Drop the user-agent button padding so the 22×22 box is
+		   actually 22×22 of content. Without this the inner SVG
+		   (a flex item with default `flex-shrink: 1`) collapses to
+		   the leftover content area and renders as a sliver. */
+		padding: 0;
 		border: none;
 		background: transparent;
 		color: var(--m-fg-muted);
@@ -409,6 +414,7 @@
 		justify-content: center;
 		width: 20px;
 		height: 20px;
+		padding: 0;
 		border: 1px solid transparent;
 		border-radius: 4px;
 		background: transparent;
