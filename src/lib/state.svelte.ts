@@ -1831,6 +1831,108 @@ class WorkspaceState {
 	}
 
 	/**
+	 * Create an empty file at `path` (workspace-relative). Surfaces
+	 * backend errors via `flash` rather than swallowing them — the
+	 * file-tree's New File flow opens an inline-rename input and
+	 * the user expects feedback when their chosen name collides
+	 * with an existing file or hits a permission boundary. On
+	 * success, the fs-watcher's `fs:changed` event triggers the
+	 * usual tree refresh and the new path lights up; we also open
+	 * the file so the next keystroke goes into the right buffer.
+	 */
+	async createFile(path: string) {
+		try {
+			await ipc.fs.createFile(path);
+			await this.openFile(path);
+		} catch (err) {
+			this.flash(`Create file failed: ${formatError(err)}`);
+		}
+	}
+
+	/**
+	 * Create an empty directory at `path` (workspace-relative).
+	 * Same error-surfacing semantics as `createFile`. We don't open
+	 * the directory in the editor — directories aren't opened, only
+	 * folder-bar-bound. The post-create tree refresh reveals it in
+	 * the file tree.
+	 */
+	async createDir(path: string) {
+		try {
+			await ipc.fs.createDir(path);
+		} catch (err) {
+			this.flash(`Create folder failed: ${formatError(err)}`);
+		}
+	}
+
+	/**
+	 * Rename a file or directory from `from` to `to` (both
+	 * workspace-relative). Open buffers whose path matched `from`
+	 * — or, for a directory rename, lived inside `from` — get
+	 * their path field rewritten in place so the editor doesn't
+	 * lose the buffer. The fs-watcher's refresh propagates the
+	 * rename into the tree and git status. Errors surface as a
+	 * toast; the user can retry from the inline input or use a
+	 * manual move.
+	 */
+	async renamePath(from: string, to: string) {
+		if (from === to) {
+			return;
+		}
+		try {
+			await ipc.fs.rename(from, to);
+		} catch (err) {
+			this.flash(`Rename failed: ${formatError(err)}`);
+			return;
+		}
+		const fromIsDir = from.endsWith('/');
+		const fromPrefix = fromIsDir ? from : `${from}/`;
+		const toPrefix = to.endsWith('/') ? to : `${to}/`;
+		const remap = (p: string): string => {
+			if (p === from) {
+				return to;
+			}
+			if (p.startsWith(fromPrefix)) {
+				return toPrefix + p.slice(fromPrefix.length);
+			}
+			return p;
+		};
+		const renamedPaths: { from: string; to: string }[] = [];
+		this.openFiles = this.openFiles.map((f) => {
+			const newPath = remap(f.path);
+			if (newPath === f.path) {
+				return f;
+			}
+			renamedPaths.push({ from: f.path, to: newPath });
+			return { ...f, path: newPath, name: basename(newPath) };
+		});
+		this.leftTabs = this.leftTabs.map(remap);
+		this.rightTabs = this.rightTabs.map(remap);
+		if (this.leftActive !== null) {
+			this.leftActive = remap(this.leftActive);
+		}
+		if (this.rightActive !== null) {
+			this.rightActive = remap(this.rightActive);
+		}
+		// Stamp the most-recently-renamed file/folder pair so the
+		// Editor's `isRename` check can tell "this path swap is a
+		// rename" from "this path swap is a tab switch". For a
+		// directory rename that touched several open buffers we
+		// pick the active one (or the last one in iteration order)
+		// — the Editor only consults `isRename` for whichever
+		// buffer is currently mounted, and a multi-file rename
+		// always resolves through this code path before any
+		// individual editor effect runs.
+		const stamp =
+			renamedPaths.find((p) => p.to === this.leftActive || p.to === this.rightActive) ??
+			renamedPaths[renamedPaths.length - 1] ??
+			null;
+		if (stamp !== null) {
+			this.lastRename = stamp;
+			this.renameTick += 1;
+		}
+	}
+
+	/**
 	 * Move `paths` (files and/or directories) to the OS trash after
 	 * confirming. The default destructive action — what `Delete` in the
 	 * file tree maps to. Reversible via the OS UI; the confirm exists

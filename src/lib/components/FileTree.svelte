@@ -11,6 +11,9 @@
 		FileTree,
 		type ContextMenuItem as PierreContextMenuItem,
 		type ContextMenuOpenContext as PierreContextMenuOpenContext,
+		type FileTreeBatchOperation,
+		type FileTreeMutationEvent,
+		type FileTreeRenameEvent,
 	} from '@pierre/trees';
 	import ContextMenu from './ContextMenu.svelte';
 	import type { ContextMenuItem } from './contextMenu';
@@ -89,6 +92,12 @@
 				// handlers below).
 				void workspace.openFile(path, undefined, { focus: false });
 			},
+			renaming: {
+				onRename: handleRename,
+				onError: (message) => {
+					workspace.flash(message);
+				},
+			},
 			composition: {
 				contextMenu: {
 					// Both triggers so mouse users get the right-click
@@ -108,6 +117,13 @@
 				},
 			},
 		});
+		// Mirror Pierre's own mutations into `lastTreePaths` so the
+		// reactive diff effect doesn't try to re-add a placeholder
+		// the user just confirmed (or re-remove one they cancelled).
+		// Pierre fires these for every internal change — our
+		// `tree.batch` calls included — so the bookkeeping is
+		// uniform regardless of who triggered the mutation.
+		tree.onMutation('*', mirrorMutation);
 		tree.render({ containerWrapper: treeMount });
 		applyGitOverlay(
 			tree,
@@ -117,6 +133,8 @@
 			disposeActiveMenu();
 			tree?.cleanUp();
 			tree = undefined;
+			lastTreePaths = null;
+			pendingNewKind.clear();
 		};
 	});
 
@@ -193,13 +211,50 @@
 		}
 	}
 
-	// Map a row + its backend git status to menu items. Kept small
-	// and deliberately asymmetric: "Discard changes" is the reason
-	// this menu exists, "Copy path" is a staple discovery tool. If a
-	// third action shows up and proves useful we'll add it; until
-	// then more items is more cognitive load for worse focus.
+	// Map a row + its backend git status to menu items. Order is
+	// chosen so common-case actions (New File / New Folder, the
+	// reason most users right-click) sit at the top, with destructive
+	// or status-conditional items below. The menu intentionally
+	// stays small — every line is one the user has to scan.
 	function buildMenuItems(item: PierreContextMenuItem): ContextMenuItem[] {
 		const items: ContextMenuItem[] = [];
+		// "New File" and "New Folder" always appear, on file rows
+		// and folder rows alike. VSCode/Cursor convention: a
+		// right-click on a file creates the new entry as a sibling
+		// in the same parent directory; a right-click on a folder
+		// creates it inside that folder. `targetDirectoryFor` does
+		// the resolution so the menu callback can call into the
+		// inline-rename flow with the right anchor.
+		const targetDir = targetDirectoryFor(item);
+		items.push({
+			id: 'new-file',
+			label: 'New file',
+			onSelect: () => {
+				void startNewItem(targetDir, 'file');
+			},
+		});
+		items.push({
+			id: 'new-folder',
+			label: 'New folder',
+			onSelect: () => {
+				void startNewItem(targetDir, 'folder');
+			},
+		});
+		// Rename uses Pierre's built-in inline-rename flow; the row
+		// becomes an editable input, Enter commits, Esc cancels.
+		// The workspace root itself can't be renamed via the tree
+		// (it's a folder bar, not a path inside the tree), but every
+		// other row qualifies.
+		items.push({
+			id: 'rename',
+			label: 'Rename',
+			onSelect: () => {
+				if (!tree) {
+					return;
+				}
+				tree.startRenaming(item.path);
+			},
+		});
 		if (item.kind === 'file' && canViewDiff(item.path)) {
 			items.push({
 				id: 'view-diff',
@@ -241,6 +296,222 @@
 			},
 		});
 		return items;
+	}
+
+	/**
+	 * Where a "New file" / "New folder" gesture should anchor when
+	 * the user right-clicked `item`. Folder rows yield themselves
+	 * (creating inside that folder); file rows yield their parent
+	 * directory (creating as a sibling). `''` means "create at the
+	 * workspace root" — Pierre's empty path string, by convention.
+	 */
+	function targetDirectoryFor(item: PierreContextMenuItem): string {
+		if (item.kind === 'directory') {
+			// Pierre's directory paths carry a trailing slash; we
+			// keep it because both `tree.add` and our own backend
+			// walk treat `foo/` as the canonical directory id.
+			return item.path;
+		}
+		const lastSlash = item.path.lastIndexOf('/');
+		if (lastSlash < 0) {
+			// Top-level file → create new sibling at the root.
+			return '';
+		}
+		return item.path.slice(0, lastSlash + 1);
+	}
+
+	/**
+	 * Kick off Pierre's inline-rename flow for a not-yet-existing
+	 * file or folder under `targetDir`. The placeholder gets a
+	 * unique synthetic name, gets added to the tree, gets recorded
+	 * in `pendingNewKind` so `handleRename` knows the upcoming
+	 * commit is a creation (not a rename of an existing path), and
+	 * gets handed to `startRenaming`. `removeIfCanceled` makes the
+	 * Esc-cancel path throw the placeholder away cleanly; our
+	 * `mirrorMutation` listener picks up the implicit `remove` and
+	 * drops the pending entry.
+	 */
+	async function startNewItem(targetDir: string, kind: 'file' | 'folder') {
+		if (!tree) {
+			return;
+		}
+		// Make sure the parent is expanded so the inline input is
+		// visible. Without this, "new file inside `src/`" while
+		// `src/` is collapsed silently puts the input off-screen.
+		if (targetDir !== '') {
+			const parent = tree.getItem(targetDir);
+			if (parent && 'expand' in parent && !parent.isExpanded()) {
+				parent.expand();
+			}
+		}
+		const placeholder = uniquePlaceholder(targetDir, kind);
+		pendingNewKind.set(placeholder, kind);
+		tree.add(placeholder);
+		await tick();
+		const ok = tree.startRenaming(placeholder, { removeIfCanceled: true });
+		if (!ok) {
+			// Pierre refused (rare — the only reason it returns
+			// false today is the path not being in the tree, which
+			// we just added). Drop the bookkeeping; the placeholder
+			// is harmless on its own.
+			pendingNewKind.delete(placeholder);
+		}
+	}
+
+	/**
+	 * Build a placeholder path under `targetDir` that doesn't
+	 * collide with any existing tree entry. We use a `~moon-new-…`
+	 * prefix so the synthetic row is obviously transient if the
+	 * UI ever surfaces it (it shouldn't — `startRenaming` swaps
+	 * the row for an inline input immediately).
+	 */
+	function uniquePlaceholder(targetDir: string, kind: 'file' | 'folder'): string {
+		const suffix = kind === 'folder' ? '/' : '';
+		const base = `${targetDir}~moon-new`;
+		let candidate = `${base}${suffix}`;
+		let counter = 2;
+		while (tree?.getItem(candidate) !== null && tree?.getItem(candidate) !== undefined) {
+			candidate = `${base}-${counter}${suffix}`;
+			counter += 1;
+		}
+		return candidate;
+	}
+
+	/**
+	 * Called when Pierre completes an inline rename (Enter on the
+	 * input). Two cases share this entry point:
+	 *
+	 * 1. The row was a real, on-disk path: this is a true rename.
+	 *    Dispatch to `workspace.renamePath` which handles the
+	 *    backend `fs_rename`, fixes up open buffers, and triggers
+	 *    a tree refresh.
+	 *
+	 * 2. The row was a placeholder we added via `startNewItem`:
+	 *    `pendingNewKind` carries the entry. Dispatch to
+	 *    `workspace.createFile` / `workspace.createDir` instead;
+	 *    the placeholder is purely client-side and was never on
+	 *    disk, so there's nothing to rename.
+	 *
+	 * In both cases Pierre has already moved the row in its store
+	 * by the time we land here (the move is synchronous within
+	 * `commit`); our backend call just needs to make disk match.
+	 */
+	function handleRename(event: FileTreeRenameEvent) {
+		const pending = pendingNewKind.get(event.sourcePath);
+		if (pending !== undefined) {
+			pendingNewKind.delete(event.sourcePath);
+			// The destination Pierre handed us carries a trailing
+			// slash for folders, no slash for files — exactly what
+			// our backend expects. Strip the placeholder from
+			// `pendingNewKind` first so a follow-up failure toast
+			// doesn't leave it lying around.
+			if (pending === 'file') {
+				const cleanDest = event.destinationPath.endsWith('/')
+					? event.destinationPath.slice(0, -1)
+					: event.destinationPath;
+				void workspace.createFile(cleanDest);
+			} else {
+				const cleanDest = event.destinationPath.endsWith('/') ? event.destinationPath : `${event.destinationPath}/`;
+				void workspace.createDir(cleanDest);
+			}
+			return;
+		}
+		void workspace.renamePath(event.sourcePath, event.destinationPath);
+	}
+
+	/**
+	 * Tracks paths the user is in the middle of creating. Maps the
+	 * synthetic placeholder we hand to `tree.add` → the kind they
+	 * picked from the menu, so `handleRename` can route the commit
+	 * to `createFile` vs `createDir`. Cleared on commit, on cancel
+	 * (via `mirrorMutation`'s `remove` branch), and on tree teardown.
+	 */
+	const pendingNewKind = new Map<string, 'file' | 'folder'>();
+
+	/**
+	 * Mirror every Pierre-side mutation into `lastTreePaths`. The
+	 * reactive diff effect needs `lastTreePaths` to reflect Pierre's
+	 * actual current path-set, not just the post-batch result of
+	 * our own writes — when the user kicks off a New File flow,
+	 * Pierre adds a placeholder, then renames it, then either
+	 * commits (we IPC-create the file and the next watcher tick
+	 * lands the same path in `workspace.paths`) or cancels (Pierre
+	 * removes the placeholder). Without mirroring, the diff effect
+	 * would see `workspace.paths` not contain the placeholder and
+	 * try to remove a path Pierre already moved or removed — a
+	 * batch error. Listening on `onMutation('*')` keeps the mirror
+	 * consistent regardless of which method (`add`, `move`,
+	 * `remove`, even our own `batch`) caused the change.
+	 */
+	function mirrorMutation(event: FileTreeMutationEvent) {
+		if (lastTreePaths === null) {
+			return;
+		}
+		const next = new Set(lastTreePaths);
+		applyMutationToSet(event, next);
+		lastTreePaths = next;
+	}
+
+	function applyMutationToSet(event: FileTreeMutationEvent, set: Set<string>) {
+		switch (event.operation) {
+			case 'add':
+				set.add(event.path);
+				break;
+			case 'remove':
+				set.delete(event.path);
+				if (event.recursive && event.path.endsWith('/')) {
+					// Pierre dropped every descendant in one shot; mirror that.
+					// We collect-then-delete instead of iterating-and-mutating
+					// so the iterator's invalidation invariants don't bite.
+					const descendants: string[] = [];
+					for (const p of set) {
+						if (p.startsWith(event.path)) {
+							descendants.push(p);
+						}
+					}
+					for (const p of descendants) {
+						set.delete(p);
+					}
+				}
+				// Cancellation cleanup: the placeholder we tracked
+				// for a not-yet-committed New File / New Folder is
+				// gone now, drop the bookkeeping.
+				pendingNewKind.delete(event.path);
+				break;
+			case 'move': {
+				set.delete(event.from);
+				set.add(event.to);
+				const fromPrefix = event.from.endsWith('/') ? event.from : `${event.from}/`;
+				const toPrefix = event.to.endsWith('/') ? event.to : `${event.to}/`;
+				// Same collect-then-mutate pattern as the recursive
+				// remove branch above — rewriting descendant paths
+				// in place would invalidate the set's iterator.
+				const moved: { from: string; to: string }[] = [];
+				for (const p of set) {
+					if (p.startsWith(fromPrefix)) {
+						moved.push({ from: p, to: toPrefix + p.slice(fromPrefix.length) });
+					}
+				}
+				for (const m of moved) {
+					set.delete(m.from);
+					set.add(m.to);
+				}
+				break;
+			}
+			case 'reset':
+				// Wholesale reset wipes every path; the diff effect
+				// itself ran through our code path with a fresh set
+				// it'll write back next, so we just clear here and
+				// let `lastTreePaths` get rewritten on the next
+				// batch / reset call.
+				set.clear();
+				break;
+			case 'batch':
+				for (const sub of event.events) {
+					applyMutationToSet(sub, set);
+				}
+				break;
+		}
 	}
 
 	/**
@@ -516,23 +787,29 @@
 	}
 
 	// `resetPaths` is expensive (Pierre rebuilds its virtualised
-	// path model), so we gate it to changes that actually restructure
-	// the tree: the filesystem list, plus the set of deleted ghost
-	// rows. We deliberately read `gitStatusEntries` via a scoped
-	// derived so a pure add/modify refresh (no deletion change)
-	// doesn't trigger a rebuild — `setGitStatus` above handles those
-	// in-place.
-	const deletedSignature = $derived(deletedPathsSignature(workspace.gitStatusEntries));
-
-	// Reactively reset paths when the workspace path list (or its
-	// deleted-row set) changes, then replay the active path so
-	// Save As (which mutates `activePath` *before* the new file
-	// lands in `paths`, with an `await` between the two) doesn't end
-	// up with the new row unselected, the keyboard cursor stuck on
-	// row 0, and the list scrolled to the top.
+	// path model and drops every internal flag — expansion state,
+	// focused row, selection memory). We gate it to two cases:
 	//
-	// We can't rely on the activePath effect to re-fire here — its
-	// only dep is `activePath`, which didn't change.
+	//   1. First paint after mount (no previous path set).
+	//   2. The catastrophic-diff fallback when an incremental batch
+	//      throws (Pierre's path-store invariant violation we
+	//      didn't anticipate — should never happen with well-formed
+	//      diffs, but better to recover than to leave a half-applied
+	//      tree).
+	//
+	// Every other refresh diffs `lastTreePaths` against the new path
+	// list and applies the result via `tree.batch(...)`. Pierre keeps
+	// every other path's expansion / focus / selection memory intact
+	// — deleting one file no longer collapses every expanded folder.
+	//
+	// Driven by the same trigger set as before: the filesystem path
+	// list, plus the set of deleted ghost rows from git status.
+	// `setGitStatus` handles status-only refreshes in place; this
+	// effect only fires when the actual set of paths to render
+	// changes.
+	const deletedSignature = $derived(deletedPathsSignature(workspace.gitStatusEntries));
+	let lastTreePaths: ReadonlySet<string> | null = null;
+
 	$effect(() => {
 		const paths = workspace.paths;
 		// Track the signature so a deletion appearing/disappearing
@@ -544,10 +821,93 @@
 			return;
 		}
 		const entries = untrack(() => workspace.gitStatusEntries);
-		tree.resetPaths(mergedPathsWithDeletions(paths, entries));
+		const merged = mergedPathsWithDeletions(paths, entries);
+		const nextSet = new Set(merged);
+
+		if (lastTreePaths === null) {
+			tree.resetPaths(merged);
+		} else {
+			applyPathsDiff(tree, lastTreePaths, nextSet, merged);
+		}
+		lastTreePaths = nextSet;
+
+		// Replay the active path so Save As (which mutates
+		// `activePath` *before* the new file lands in `paths`, with
+		// an `await` between the two) doesn't end up with the new
+		// row unselected. The activePath effect's only dep is
+		// `activePath`, which didn't change here.
 		const target = untrack(() => workspace.activePath);
 		applySelection(tree, target, { afterReset: true });
 	});
+
+	/**
+	 * Apply the symmetric diff of `prev` and `next` to `local` via a
+	 * single `batch` call. Removes are emitted deepest-first because
+	 * Pierre's `removePath` throws if the path doesn't exist — when
+	 * a directory and its descendants both disappear from the walk,
+	 * removing the descendants first leaves the directory empty so
+	 * its own removal lands cleanly. Adds run in any order; Pierre's
+	 * `addPath` creates intermediate parent segments as needed, but
+	 * shortest-first keeps the path-store's internal node-creation
+	 * count deterministic.
+	 *
+	 * On any internal Pierre error the whole batch is rolled back
+	 * and we fall back to `resetPaths(merged)` so the tree's
+	 * displayed paths still match `merged`. Expansion state is lost
+	 * in that fallback path (same semantics as before this change),
+	 * but the tree is at least correct.
+	 */
+	function applyPathsDiff(
+		local: FileTree,
+		prev: ReadonlySet<string>,
+		next: ReadonlySet<string>,
+		merged: readonly string[],
+	) {
+		const removed: string[] = [];
+		const added: string[] = [];
+		for (const path of prev) {
+			if (!next.has(path)) {
+				removed.push(path);
+			}
+		}
+		for (const path of next) {
+			if (!prev.has(path)) {
+				added.push(path);
+			}
+		}
+		if (removed.length === 0 && added.length === 0) {
+			return;
+		}
+		removed.sort((a, b) => depthOf(b) - depthOf(a));
+		added.sort((a, b) => depthOf(a) - depthOf(b));
+		const ops: FileTreeBatchOperation[] = [];
+		for (const path of removed) {
+			ops.push({ type: 'remove', path });
+		}
+		for (const path of added) {
+			ops.push({ type: 'add', path });
+		}
+		try {
+			local.batch(ops);
+		} catch (err) {
+			// eslint-disable-next-line no-console
+			console.warn('moon-ide: incremental tree update failed; falling back to full reset', err);
+			local.resetPaths(merged);
+		}
+	}
+
+	function depthOf(path: string): number {
+		// `foo/bar/` and `foo/bar` both report depth 2 — trailing
+		// slashes only mean "this is a directory" and shouldn't
+		// inflate the count by an empty segment.
+		let depth = 0;
+		for (let i = 0; i < path.length; i++) {
+			if (path[i] === '/' && i < path.length - 1) {
+				depth++;
+			}
+		}
+		return depth + 1;
+	}
 
 	// Stable string summary of the deleted-path subset. Changes if
 	// and only if the set of deleted paths changes — add/modify/

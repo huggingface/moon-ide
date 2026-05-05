@@ -23,6 +23,32 @@ pub trait WorkspaceHost: Send + Sync {
 	async fn read_file(&self, path: &Utf8Path) -> MoonResult<ReadFileResult>;
 	async fn write_file(&self, path: &Utf8Path, text: &str) -> MoonResult<WriteFileResult>;
 
+	/// Create an empty file at `path`. Errors if any path component
+	/// inside the workspace is missing (we don't auto-mkdir parent
+	/// directories — the caller is responsible for creating those
+	/// via `create_dir` first; a typo like `srrc/foo.ts` should
+	/// surface as an error rather than silently land a stray file
+	/// under a new directory). Errors if the target already exists,
+	/// so the file-tree's "new file" flow can't accidentally clobber
+	/// a sibling. The caller picks up the post-create state via the
+	/// usual fs-watcher / `loadPaths` refresh.
+	async fn create_file(&self, path: &Utf8Path) -> MoonResult<()>;
+
+	/// Create a directory at `path`. Errors if it already exists.
+	/// Like `create_file` we don't auto-mkdir parents; the caller
+	/// can issue multiple `create_dir` calls when nesting is
+	/// intentional, and a typo should surface as an error rather
+	/// than create a chain of unintended dirs.
+	async fn create_dir(&self, path: &Utf8Path) -> MoonResult<()>;
+
+	/// Atomic rename of `from` to `to`. Both must live inside the
+	/// workspace root. Errors if `from` doesn't exist or `to`
+	/// already exists. Used by the file-tree's inline rename and
+	/// by any future "Move to…" command. RemoteHost (Phase 2)
+	/// serves this over JSON-RPC so the move happens entirely
+	/// inside the container.
+	async fn rename_path(&self, from: &Utf8Path, to: &Utf8Path) -> MoonResult<()>;
+
 	/// Write `text` after running it through the save pipeline:
 	/// `.editorconfig` line-ending / trim-ws / final-newline normalization,
 	/// then the lint-staged formatter (oxfmt / prettier / rustfmt) for
@@ -363,6 +389,135 @@ impl WorkspaceHost for LocalHost {
 			mtime_ms: metadata.modified().ok().and_then(system_time_to_ms),
 			bytes_written: text.len() as u64,
 		})
+	}
+
+	async fn create_file(&self, path: &Utf8Path) -> MoonResult<()> {
+		let candidate = if path.is_absolute() {
+			path.to_path_buf()
+		} else {
+			self.root.join(path)
+		};
+		let parent = candidate
+			.parent()
+			.ok_or_else(|| MoonError::invalid("path has no parent directory"))?;
+		let resolved_parent = self.resolve(parent)?;
+		let file_name = candidate
+			.file_name()
+			.ok_or_else(|| MoonError::invalid("path has no file name"))?;
+		let resolved = resolved_parent.join(file_name);
+
+		// `OpenOptions::create_new(true)` is the atomic "create or
+		// fail-if-exists" primitive — sidesteps the TOCTOU window of
+		// a separate `metadata` check followed by `write`.
+		let std_path = resolved.into_std_path_buf();
+		tokio::task::spawn_blocking(move || {
+			std::fs::OpenOptions::new()
+				.write(true)
+				.create_new(true)
+				.open(&std_path)
+				.map(drop)
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("create_file join error: {e}")))?
+		.map_err(MoonError::from)?;
+
+		// Newly created `.editorconfig` / `.lintstagedrc.json` /
+		// `package.json` files invalidate caches the same way a save
+		// of an existing one would — the upward walks need to find
+		// the new file on the next lookup.
+		if file_name == ".editorconfig" {
+			self.editorconfig.clear().await;
+		}
+		if file_name == ".lintstagedrc.json" || file_name == "package.json" {
+			self.lint_staged.clear().await;
+		}
+
+		Ok(())
+	}
+
+	async fn create_dir(&self, path: &Utf8Path) -> MoonResult<()> {
+		let candidate = if path.is_absolute() {
+			path.to_path_buf()
+		} else {
+			self.root.join(path)
+		};
+		let parent = candidate
+			.parent()
+			.ok_or_else(|| MoonError::invalid("path has no parent directory"))?;
+		let resolved_parent = self.resolve(parent)?;
+		let dir_name = candidate
+			.file_name()
+			.ok_or_else(|| MoonError::invalid("path has no name"))?;
+		let resolved = resolved_parent.join(dir_name);
+
+		// `create_dir` (vs `create_dir_all`) errors when the target
+		// already exists — exactly the strict semantics the file-tree
+		// "New folder" flow wants: if the user typed an existing
+		// directory's name, surface the error rather than silently
+		// no-op. Parents are required to exist; `resolve(parent)`
+		// above enforces that.
+		tokio::fs::create_dir(resolved.as_std_path())
+			.await
+			.map_err(MoonError::from)?;
+		Ok(())
+	}
+
+	async fn rename_path(&self, from: &Utf8Path, to: &Utf8Path) -> MoonResult<()> {
+		let resolved_from = self.resolve(from)?;
+		if resolved_from == self.root {
+			return Err(MoonError::invalid("refusing to rename the workspace root"));
+		}
+
+		let to_candidate = if to.is_absolute() {
+			to.to_path_buf()
+		} else {
+			self.root.join(to)
+		};
+		let to_parent = to_candidate
+			.parent()
+			.ok_or_else(|| MoonError::invalid("rename target has no parent directory"))?;
+		let resolved_to_parent = self.resolve(to_parent)?;
+		let to_name = to_candidate
+			.file_name()
+			.ok_or_else(|| MoonError::invalid("rename target has no name"))?;
+		let resolved_to = resolved_to_parent.join(to_name);
+
+		if resolved_to == resolved_from {
+			return Ok(());
+		}
+
+		// `rename(2)` on Linux silently replaces a regular-file
+		// target. We pre-check existence so the rename feels
+		// symmetric with `create_file` / `create_dir`: clobber-by-
+		// accident is the worst failure mode for a UI-driven rename.
+		// Tiny TOCTOU window remains; acceptable for an interactive
+		// gesture.
+		if tokio::fs::metadata(resolved_to.as_std_path()).await.is_ok() {
+			return Err(MoonError::invalid(format!(
+				"rename target already exists: {resolved_to}"
+			)));
+		}
+
+		tokio::fs::rename(resolved_from.as_std_path(), resolved_to.as_std_path())
+			.await
+			.map_err(MoonError::from)?;
+
+		// Either side of the rename might be a cache-affecting
+		// config file. We clear conservatively when the *name* on
+		// either end matches; tracking which directory was affected
+		// adds bookkeeping for no real win, since the caches are
+		// cheap to refill.
+		let from_name = resolved_from.file_name();
+		if to_name == ".editorconfig" || from_name == Some(".editorconfig") {
+			self.editorconfig.clear().await;
+		}
+		let from_lintstaged = matches!(from_name, Some(".lintstagedrc.json") | Some("package.json"));
+		let to_lintstaged = matches!(to_name, ".lintstagedrc.json" | "package.json");
+		if from_lintstaged || to_lintstaged {
+			self.lint_staged.clear().await;
+		}
+
+		Ok(())
 	}
 
 	async fn stat(&self, path: &Utf8Path) -> MoonResult<StatResult> {

@@ -54,6 +54,39 @@ pub async fn fs_write_file(
 	entry.host.save_file(&path, &text).await
 }
 
+/// Create an empty file at `path`. Errors if the path already
+/// exists or any parent directory is missing — the file-tree's
+/// "New file" flow uses this and surfaces those errors to the
+/// user. Distinct from `fs_write_file` because we want strict
+/// "fail-on-exists" semantics that `save_file`'s create-or-
+/// truncate doesn't give.
+#[tauri::command]
+pub async fn fs_create_file(state: State<'_, AppState>, path: String) -> Result<(), MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	let path = Utf8PathBuf::from(path);
+	entry.host.create_file(&path).await
+}
+
+/// Create a directory at `path`. Errors if the path already
+/// exists or any parent directory is missing.
+#[tauri::command]
+pub async fn fs_create_dir(state: State<'_, AppState>, path: String) -> Result<(), MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	let path = Utf8PathBuf::from(path);
+	entry.host.create_dir(&path).await
+}
+
+/// Atomically rename `from` to `to`. Both must live inside the
+/// active folder; the target must not already exist (we refuse to
+/// clobber). Used by the file-tree's inline rename flow.
+#[tauri::command]
+pub async fn fs_rename(state: State<'_, AppState>, from: String, to: String) -> Result<(), MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	let from = Utf8PathBuf::from(from);
+	let to = Utf8PathBuf::from(to);
+	entry.host.rename_path(&from, &to).await
+}
+
 #[tauri::command]
 pub async fn fs_stat(state: State<'_, AppState>, path: String) -> Result<StatResult, MoonError> {
 	let entry = state.workspaces.require_active_folder().await?;
