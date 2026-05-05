@@ -1,6 +1,7 @@
 <script lang="ts">
 	import FileTree from './FileTree.svelte';
 	import FolderBars from './FolderBars.svelte';
+	import ScmPanel from './ScmPanel.svelte';
 	import { workspace } from '../state.svelte';
 
 	type Props = {
@@ -49,6 +50,15 @@
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div class="sidebar" data-region="sidebar" tabindex="-1" bind:this={sidebar} onkeydown={onKeyDown}>
 	<FolderBars {onPickFolder} />
+	{#if workspace.activeFolder}
+		<!-- SCM panel: branch label + commit-message input. Hidden
+		     when no folder is bound — there's nothing to commit. We
+		     re-mount per active folder so the input draft and the
+		     branch label can't leak across folder switches. -->
+		{#key workspace.activeFolderPath}
+			<ScmPanel />
+		{/key}
+	{/if}
 	<div class="tree">
 		{#if workspace.activeFolder}
 			<!-- Re-mount the tree on folder switch. Per-folder tree

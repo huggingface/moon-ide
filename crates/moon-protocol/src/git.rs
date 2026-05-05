@@ -96,6 +96,41 @@ pub struct GitLineBlame {
 	pub message: String,
 }
 
+/// Lightweight info the SCM panel renders next to its commit
+/// input: the active branch name and a short HEAD hash for the
+/// detached state. `None` on either field means "this signal isn't
+/// available right now"; the panel renders the empty case as an
+/// inert label rather than a hard error.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBranchInfo {
+	/// Branch name, e.g. `"main"`. `None` when HEAD is detached,
+	/// the folder isn't a git repo, or `git` itself isn't on PATH —
+	/// the SCM panel falls back to `head_short_sha` for the
+	/// detached case and to a plain "no branch" label otherwise.
+	pub name: Option<String>,
+	/// First seven characters of the HEAD commit's SHA. `None` when
+	/// the repo has no commits yet (a fresh `git init`), HEAD is
+	/// unreadable, or the folder isn't a git repo.
+	pub head_short_sha: Option<String>,
+}
+
+/// Outcome of a successful `git_commit`. The SCM panel renders
+/// `short_sha` + `summary` in the post-commit toast so the user
+/// can verify the commit landed without opening a terminal.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct GitCommitResult {
+	/// First seven characters of the new commit's SHA.
+	pub short_sha: String,
+	/// First line of the commit message we just wrote, echoed back
+	/// for display. Same string the user typed (modulo trailing
+	/// whitespace), so callers don't have to round-trip it.
+	pub summary: String,
+}
+
 /// Per-file blame report, one entry per source line. Indexing is
 /// 0-based so it lines up directly with CM's `doc.line(n + 1)`
 /// accessor; empty trailing lines (the "no-newline-at-EOF" corner

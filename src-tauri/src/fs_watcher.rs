@@ -305,12 +305,19 @@ fn apply_set_root(watcher: &mut RecommendedWatcher, current: &mut Option<PathBuf
 /// (a single commit writes dozens of ref / index / log files) and
 /// `Access` events (read-only stat bumps from rust-analyzer,
 /// tsgo, anything walking `.gitignore`) — neither moves what the
-/// tree should render. Surviving paths are made workspace-relative
-/// before storage; anything outside the current root is dropped
-/// so we don't accidentally publish paths from a previous root
-/// after a swap. Sticky-flips `topology` to `true` for any
-/// Create / Remove / Rename — the frontend uses that to decide
-/// whether the recursive `collect_paths` walk is needed.
+/// tree should render. The one `.git/` exception is `.git/HEAD`
+/// itself: external `git switch` / `git checkout <branch>` writes
+/// no working-tree files when the new branch's content matches
+/// the old one's, but always rewrites `.git/HEAD`. Letting that
+/// path through is how the SCM panel's branch label notices the
+/// terminal flipped to a different branch.
+///
+/// Surviving paths are made workspace-relative before storage;
+/// anything outside the current root is dropped so we don't
+/// accidentally publish paths from a previous root after a swap.
+/// Sticky-flips `topology` to `true` for any Create / Remove /
+/// Rename — the frontend uses that to decide whether the
+/// recursive `collect_paths` walk is needed.
 fn collect_event_paths(
 	res: &notify::Result<Event>,
 	root: Option<&Path>,
@@ -332,7 +339,7 @@ fn collect_event_paths(
 	};
 	let mut took_a_path = false;
 	for raw in &event.paths {
-		if is_in_dotgit(raw) {
+		if is_in_dotgit(raw) && !is_dotgit_head(raw) {
 			continue;
 		}
 		let Ok(rel) = raw.strip_prefix(root) else {
@@ -350,10 +357,31 @@ fn collect_event_paths(
 	}
 	// Only classify topology when at least one in-root path
 	// survived filtering. Otherwise every `.git/`-only event
-	// would flip the flag for nothing.
+	// would flip the flag for nothing. `.git/HEAD` writes are
+	// always plain modifications, so this branch never trips
+	// for them — `is_topology_event(Modify(_))` returns `false`.
 	if took_a_path && is_topology_event(&event.kind) {
 		*topology = true;
 	}
+}
+
+/// `true` for the watched `.git/HEAD` file specifically. We
+/// match by the last two path components rather than full-path
+/// equality so worktrees rooted at any depth match — and so we
+/// don't accidentally pick up `.git/refs/heads/HEAD`-style
+/// paths the day someone introduces them.
+fn is_dotgit_head(path: &Path) -> bool {
+	let mut components = path.components().rev();
+	let Some(last) = components.next() else {
+		return false;
+	};
+	if last.as_os_str() != "HEAD" {
+		return false;
+	}
+	let Some(parent) = components.next() else {
+		return false;
+	};
+	parent.as_os_str() == ".git"
 }
 
 /// `true` for events that change which entries the tree should

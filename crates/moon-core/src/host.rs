@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use moon_protocol::editorconfig::EditorConfig;
 use moon_protocol::fs::{DirEntry, EntryKind, ReadFileResult, StatResult, WriteFileResult};
-use moon_protocol::git::{GitFileBlame, GitFileStatus, GitLineBlame, GitStatusEntry};
+use moon_protocol::git::{GitBranchInfo, GitCommitResult, GitFileBlame, GitFileStatus, GitLineBlame, GitStatusEntry};
 use moon_protocol::{MoonError, MoonResult};
 use std::time::SystemTime;
 
@@ -174,6 +174,51 @@ pub trait WorkspaceHost: Send + Sync {
 	/// text. Real errors (join failures, unreadable UTF-8 from a file
 	/// we thought was text) still bubble up.
 	async fn git_head_content(&self, path: &Utf8Path) -> MoonResult<Option<String>>;
+
+	/// Lightweight branch / HEAD info for the SCM panel header.
+	/// Returns the all-`None` default when the active folder isn't
+	/// a git repo or `git` itself can't run — the UI treats that
+	/// as "show no branch label" rather than a hard error so
+	/// non-git workspaces still render cleanly.
+	async fn git_branch(&self) -> MoonResult<GitBranchInfo>;
+
+	/// Stage every working-tree change (`git add -A`) and commit
+	/// with `message`. When `amend` is `true`, `git commit --amend`
+	/// replaces the previous commit instead of creating a new one;
+	/// an empty `message` in that mode falls through to
+	/// `--no-edit` (keep the previous commit's message verbatim,
+	/// just absorb the newly-staged changes).
+	///
+	/// Errors with a useful message when:
+	///   - The active folder isn't a git repo.
+	///   - `message` is empty *and* `amend` is false (a fresh commit
+	///     needs a subject; an amend without a new message is
+	///     valid via `--no-edit`).
+	///   - There's nothing to commit (clean tree, non-amend mode).
+	///   - The author identity isn't configured (`user.name` /
+	///     `user.email` missing) — we surface git's own complaint
+	///     so the user can fix it from the terminal.
+	///
+	/// The "stage everything" gesture matches the SCM panel's
+	/// "commit current changes" affordance — same behaviour as
+	/// `git commit -a` plus untracked-file inclusion. Per-file
+	/// staging UI is a later phase.
+	async fn git_commit(&self, message: &str, amend: bool) -> MoonResult<GitCommitResult>;
+
+	/// `git push` with no arguments — uses the configured upstream
+	/// for the current branch. Errors propagate git's own stderr
+	/// verbatim so messages like "the current branch X has no
+	/// upstream branch" stay actionable. We don't try to
+	/// auto-set-upstream: that's a multi-remote decision the user
+	/// should make explicitly (the SCM panel surfaces git's hint
+	/// telling them the exact `git push -u origin <branch>` to run).
+	async fn git_push(&self) -> MoonResult<()>;
+
+	/// `git pull` with no arguments — uses the user's configured
+	/// `pull.rebase` setting. Errors propagate git's stderr;
+	/// conflict markers in the working tree, dirty-tree refusals,
+	/// and missing-upstream messages all stay readable.
+	async fn git_pull(&self) -> MoonResult<()>;
 }
 
 pub struct LocalHost {
@@ -795,6 +840,212 @@ impl WorkspaceHost for LocalHost {
 			.await
 			.map_err(|e| MoonError::Internal(format!("git_head_content join error: {e}")))?
 	}
+
+	async fn git_branch(&self) -> MoonResult<GitBranchInfo> {
+		let root = self.root.clone();
+		tokio::task::spawn_blocking(move || Ok(run_git_branch(&root)))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_branch join error: {e}")))?
+	}
+
+	async fn git_commit(&self, message: &str, amend: bool) -> MoonResult<GitCommitResult> {
+		let trimmed = message.trim();
+		if trimmed.is_empty() && !amend {
+			return Err(MoonError::invalid("commit message is empty"));
+		}
+		let root = self.root.clone();
+		let owned = trimmed.to_owned();
+		tokio::task::spawn_blocking(move || run_git_commit(&root, &owned, amend))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_commit join error: {e}")))?
+	}
+
+	async fn git_push(&self) -> MoonResult<()> {
+		let root = self.root.clone();
+		tokio::task::spawn_blocking(move || run_git_simple(&root, &["push"], "git push"))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_push join error: {e}")))?
+	}
+
+	async fn git_pull(&self) -> MoonResult<()> {
+		let root = self.root.clone();
+		tokio::task::spawn_blocking(move || run_git_simple(&root, &["pull"], "git pull"))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_pull join error: {e}")))?
+	}
+}
+
+/// `git symbolic-ref --short HEAD` for the branch name plus
+/// `git rev-parse --short HEAD` for the commit hash. Both can fail
+/// independently — fresh `git init` with no commits has a
+/// resolvable branch name but no HEAD, and a detached HEAD has the
+/// reverse — so we run them separately and return whichever
+/// succeeded. Any failure (including the folder not being a git
+/// repo) leaves the corresponding field as `None`; the SCM panel
+/// renders the all-`None` case as "no branch".
+fn run_git_branch(root: &Utf8Path) -> GitBranchInfo {
+	use std::process::Command;
+
+	let name = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+		.output()
+		.ok()
+		.filter(|o| o.status.success())
+		.and_then(|o| String::from_utf8(o.stdout).ok())
+		.map(|s| s.trim().to_owned())
+		.filter(|s| !s.is_empty());
+
+	let head_short_sha = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["rev-parse", "--short", "HEAD"])
+		.output()
+		.ok()
+		.filter(|o| o.status.success())
+		.and_then(|o| String::from_utf8(o.stdout).ok())
+		.map(|s| s.trim().to_owned())
+		.filter(|s| !s.is_empty());
+
+	GitBranchInfo { name, head_short_sha }
+}
+
+/// `git add -A && git commit [-m <message> | --amend [-m <message>|--no-edit]]`.
+/// Stages every working-tree change (including untracked) before
+/// committing — matches the SCM panel's "commit current changes"
+/// affordance. The two invocations are sequential rather than
+/// `git commit -a` so untracked files are picked up too (`-a`
+/// skips them).
+///
+/// Amend mode replaces the most recent commit instead of creating
+/// a new one. Empty message + amend → `--no-edit` (preserve the
+/// previous commit's message). Non-empty message + amend → `-m`
+/// rewrites the message. Allows the SCM panel's amend toggle to
+/// double as both "absorb these changes into HEAD without
+/// changing the message" and "rewrite the last commit's message
+/// while you're at it".
+///
+/// Errors propagate git's own stderr; for the empty-tree case we
+/// detect git's "nothing to commit" preamble and rewrite into a
+/// friendlier message. Amend with no staged changes and no
+/// message change is a no-op git refuses with the same preamble;
+/// the rewrite covers it too.
+fn run_git_commit(root: &Utf8Path, message: &str, amend: bool) -> MoonResult<GitCommitResult> {
+	use std::process::Command;
+
+	let stage = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["add", "-A"])
+		.output()
+		.map_err(|e| MoonError::IoError(format!("git add failed to launch: {e}")))?;
+	if !stage.status.success() {
+		let stderr = String::from_utf8_lossy(&stage.stderr).trim().to_string();
+		return Err(MoonError::IoError(format!(
+			"git add exited {}: {stderr}",
+			stage.status.code().unwrap_or(-1)
+		)));
+	}
+
+	let mut commit = Command::new("git");
+	commit.arg("-C").arg(root.as_std_path()).arg("commit");
+	if amend {
+		commit.arg("--amend");
+		if message.is_empty() {
+			commit.arg("--no-edit");
+		} else {
+			commit.arg("-m").arg(message);
+		}
+	} else {
+		commit.arg("-m").arg(message);
+	}
+	let commit = commit
+		.output()
+		.map_err(|e| MoonError::IoError(format!("git commit failed to launch: {e}")))?;
+	if !commit.status.success() {
+		let stdout = String::from_utf8_lossy(&commit.stdout).to_string();
+		let stderr = String::from_utf8_lossy(&commit.stderr).trim().to_string();
+		// `git commit` prints "nothing to commit, working tree clean"
+		// (or one of several variants) on stdout when the index has
+		// no staged changes after our `add -A` pass — typically
+		// because every "change" the user saw was actually ignored
+		// or already committed. Surface a friendlier message.
+		if stdout.contains("nothing to commit") {
+			return Err(MoonError::invalid("nothing to commit"));
+		}
+		// Author identity errors land on stderr with the standard
+		// "Please tell me who you are" preamble. Pass them through
+		// verbatim — the user needs the actionable hints git
+		// itself gives ("git config --global user.email ...").
+		let combined = if stderr.is_empty() { stdout } else { stderr };
+		return Err(MoonError::IoError(format!(
+			"git commit exited {}: {}",
+			commit.status.code().unwrap_or(-1),
+			combined.trim()
+		)));
+	}
+
+	let short_sha = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["rev-parse", "--short", "HEAD"])
+		.output()
+		.ok()
+		.filter(|o| o.status.success())
+		.and_then(|o| String::from_utf8(o.stdout).ok())
+		.map(|s| s.trim().to_owned())
+		.unwrap_or_default();
+
+	// Echo back the **head commit's** subject when amend ran
+	// without a fresh message — the SCM panel's success toast
+	// should reflect what git actually recorded, not the empty
+	// string the user passed in. The non-amend path uses the
+	// message we just sent (it's by construction the new
+	// subject).
+	let summary = if amend && message.is_empty() {
+		Command::new("git")
+			.arg("-C")
+			.arg(root.as_std_path())
+			.args(["log", "-1", "--pretty=%s"])
+			.output()
+			.ok()
+			.filter(|o| o.status.success())
+			.and_then(|o| String::from_utf8(o.stdout).ok())
+			.map(|s| s.trim().to_owned())
+			.unwrap_or_default()
+	} else {
+		message.lines().next().unwrap_or("").trim().to_owned()
+	};
+
+	Ok(GitCommitResult { short_sha, summary })
+}
+
+/// Run `git <args>` from `root` and surface stderr verbatim on
+/// failure. Used by `git_push` and `git_pull` (and any future
+/// "shoot a git command and see if it worked" SCM action) so
+/// network / auth / merge-conflict messages reach the user
+/// without us second-guessing their wording.
+fn run_git_simple(root: &Utf8Path, args: &[&str], label: &str) -> MoonResult<()> {
+	use std::process::Command;
+
+	let output = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(args)
+		.output()
+		.map_err(|e| MoonError::IoError(format!("{label} failed to launch: {e}")))?;
+	if !output.status.success() {
+		let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+		let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+		let combined = match (stderr.is_empty(), stdout.is_empty()) {
+			(false, _) => stderr,
+			(true, false) => stdout,
+			(true, true) => format!("exit {}", output.status.code().unwrap_or(-1)),
+		};
+		return Err(MoonError::IoError(format!("{label}: {combined}")));
+	}
+	Ok(())
 }
 
 /// `git restore --source=HEAD --staged --worktree -- <paths>`.

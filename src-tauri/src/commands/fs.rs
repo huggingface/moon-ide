@@ -1,6 +1,6 @@
 use camino::Utf8PathBuf;
 use moon_protocol::fs::{DirEntry, ReadFileResult, StatResult, WriteFileResult};
-use moon_protocol::git::{GitFileBlame, GitStatusEntry};
+use moon_protocol::git::{GitBranchInfo, GitCommitResult, GitFileBlame, GitStatusEntry};
 use moon_protocol::MoonError;
 use tauri::State;
 
@@ -162,4 +162,47 @@ pub async fn fs_git_head_content(state: State<'_, AppState>, path: String) -> Re
 	let entry = state.workspaces.require_active_folder().await?;
 	let path = Utf8PathBuf::from(path);
 	entry.host.git_head_content(&path).await
+}
+
+/// Branch + HEAD info for the active folder's SCM panel header.
+/// All-`None` is the "no branch label" fallback (non-repo folder,
+/// detached HEAD with unreadable commit, etc.).
+#[tauri::command]
+pub async fn fs_git_branch(state: State<'_, AppState>) -> Result<GitBranchInfo, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.git_branch().await
+}
+
+/// Stage every working-tree change and commit with `message`.
+/// `amend` flips the call to `git commit --amend`, replacing
+/// HEAD's commit instead of stacking a new one (the SCM panel's
+/// "Amend" toggle drives this). Errors (empty message, nothing
+/// to commit, missing author identity) surface as a flash toast
+/// so the user can retry from the same input.
+#[tauri::command]
+pub async fn fs_git_commit(
+	state: State<'_, AppState>,
+	message: String,
+	amend: bool,
+) -> Result<GitCommitResult, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.git_commit(&message, amend).await
+}
+
+/// Push the active folder's current branch to its configured
+/// upstream. Returns `Ok(())` on success; failures (no upstream,
+/// non-fast-forward, auth) propagate git's stderr.
+#[tauri::command]
+pub async fn fs_git_push(state: State<'_, AppState>) -> Result<(), MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.git_push().await
+}
+
+/// Pull from the active folder's configured upstream using the
+/// user's `pull.rebase` preference. Failures (conflicts, dirty
+/// tree, no upstream) propagate git's stderr.
+#[tauri::command]
+pub async fn fs_git_pull(state: State<'_, AppState>) -> Result<(), MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.git_pull().await
 }

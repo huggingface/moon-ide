@@ -10,6 +10,7 @@ import {
 	type AppState,
 	type EditorConfig,
 	type FolderSession,
+	type GitBranchInfo,
 	type GitFileBlame,
 	type GitStatusEntry,
 	type LspDiagnostic,
@@ -1151,7 +1152,102 @@ class WorkspaceState {
 	 */
 	gitStatusEntries = $state<readonly GitStatusEntry[]>([]);
 
+	/**
+	 * Active folder's branch + HEAD info. The SCM panel reads
+	 * `name` for its header; `headShortSha` is the fallback the
+	 * panel shows when the repo is in detached-HEAD state. Both
+	 * `null` means "no branch label" — non-repo folder, repo with
+	 * no commits, or git unavailable. Refreshed on folder switch,
+	 * after our own commits, and on every `refreshGitStatus` pass
+	 * so external `git checkout` / `git switch` from a terminal
+	 * eventually surfaces (within the watcher's debounce window).
+	 */
+	gitBranch = $state<GitBranchInfo>({ name: null, headShortSha: null });
+
+	private async refreshGitBranch() {
+		try {
+			this.gitBranch = await ipc.fs.gitBranch();
+		} catch {
+			this.gitBranch = { name: null, headShortSha: null };
+		}
+	}
+
+	/**
+	 * Stage every working-tree change and commit with `message`.
+	 * `amend` rewrites HEAD instead of creating a new commit; an
+	 * empty message in amend mode falls through to git's
+	 * `--no-edit` (preserve the previous subject). The SCM panel
+	 * gates this on the toggle's state. Surfaces backend errors
+	 * via `flash` so the input can stay focused for a quick
+	 * retry. On success, triggers a folder refresh + branch
+	 * re-fetch so the tree's git status, blame, and the branch
+	 * label all settle.
+	 */
+	async commitChanges(message: string, amend = false) {
+		const trimmed = message.trim();
+		if (trimmed.length === 0 && !amend) {
+			this.flash('Commit message is empty.');
+			return false;
+		}
+		try {
+			const result = await ipc.fs.gitCommit(trimmed, amend);
+			const verb = amend ? 'Amended' : 'Committed';
+			this.flash(`${verb} ${result.shortSha}: ${result.summary}`);
+			await this.refreshGitBranch();
+			void this.refreshActiveFolder();
+			return true;
+		} catch (err) {
+			this.flash(`Commit failed: ${formatError(err)}`);
+			return false;
+		}
+	}
+
+	/**
+	 * `git push` for the active folder's current branch. Errors
+	 * (no upstream, auth, non-fast-forward) surface as a flash
+	 * with git's own stderr — the user gets the actionable hint
+	 * verbatim. On success, refresh git status so any
+	 * remote-tracking-branch indicators update.
+	 */
+	async pushChanges() {
+		try {
+			await ipc.fs.gitPush();
+			this.flash('Push succeeded.');
+			void this.refreshActiveFolder();
+			return true;
+		} catch (err) {
+			this.flash(`Push failed: ${formatError(err)}`);
+			return false;
+		}
+	}
+
+	/**
+	 * `git pull`. Failures (conflicts, dirty tree, no upstream)
+	 * surface via flash; success triggers a full refresh so any
+	 * pulled-in changes light up the tree.
+	 */
+	async pullChanges() {
+		try {
+			await ipc.fs.gitPull();
+			this.flash('Pull succeeded.');
+			void this.refreshActiveFolder();
+			return true;
+		} catch (err) {
+			this.flash(`Pull failed: ${formatError(err)}`);
+			return false;
+		}
+	}
+
 	private async refreshGitStatus(paths: readonly string[], changedSubset: ReadonlySet<string> | null) {
+		// Refresh the branch label opportunistically alongside the
+		// status fetch — `git symbolic-ref` is cheap and we want the
+		// SCM panel header to update when external `git checkout` /
+		// `git switch` runs from a terminal. (We can't observe the
+		// `.git/HEAD` write directly: the fs-watcher filters `.git/`
+		// out to suppress the per-commit storm, so this opportunistic
+		// refresh on every status pass is how branch changes
+		// propagate back to the UI.)
+		void this.refreshGitBranch();
 		try {
 			this.gitStatusEntries = await ipc.fs.gitStatusEntries([...paths]);
 		} catch {

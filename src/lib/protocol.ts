@@ -146,6 +146,27 @@ export type GitLineBlame = {
  * switched files while a blame subprocess was still running) can be
  * discarded at the call site without leaking stale annotations.
  */
+/**
+ * Branch + HEAD info for the SCM panel header. All-`null` is the
+ * "no branch label" fallback (folder isn't a git repo, detached
+ * HEAD with unreadable commit, etc.). Mirrors
+ * `moon_protocol::git::GitBranchInfo`.
+ */
+export type GitBranchInfo = {
+	name: string | null;
+	headShortSha: string | null;
+};
+
+/**
+ * Outcome of `git_commit`. Echoed back to the SCM panel so the
+ * post-commit toast can show the short SHA and confirm the
+ * subject line. Mirrors `moon_protocol::git::GitCommitResult`.
+ */
+export type GitCommitResult = {
+	shortSha: string;
+	summary: string;
+};
+
 export type GitFileBlame = {
 	path: string;
 	/**
