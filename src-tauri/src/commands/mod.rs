@@ -10,4 +10,5 @@ pub mod search;
 pub mod slack;
 pub mod system;
 pub mod terminal;
+pub mod ui;
 pub mod workspace;

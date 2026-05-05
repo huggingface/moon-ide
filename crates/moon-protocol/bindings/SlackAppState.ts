@@ -4,7 +4,9 @@ import type { SlackBotProfile } from "./SlackBotProfile";
 /**
  * Slack-specific slice of [`AppState`]. Only stores derived,
  * non-secret pointers so we can reload the chat panel on launch
- * without re-running the bot picker.
+ * without re-running the bot picker. Panel visibility lives at the
+ * top level on [`AppState::right_panel`] — chat and coder share
+ * one slot.
  */
 export type SlackAppState = { 
 /**
@@ -14,14 +16,6 @@ export type SlackAppState = {
  * is dead.
  */
 active_bot: SlackBotProfile | null, 
-/**
- * Whether the right-side chat panel was open at last shutdown.
- * We restore visibility on launch so users who live with the
- * panel open don't have to re-open it every session. Defaults to
- * `false` (closed) for first-run users, who shouldn't have a
- * chat panel hijacking their workspace until they ask for it.
- */
-panel_visible: boolean, 
 /**
  * `thread_ts` of the session the user last had open in the chat
  * panel. Restored on launch so reopening the panel jumps back

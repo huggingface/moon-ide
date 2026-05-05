@@ -32,8 +32,10 @@ the OS keyring (`keyring` crate, `apple-native +
 windows-native + sync-secret-service + crypto-rust`). Tauri
 commands `slack_set_token` / `slack_status` /
 `slack_clear_token` / `slack_list_dm_bots` / `slack_select_bot`
-/ `slack_clear_bot` / `slack_get_active_bot` /
-`slack_set_panel_visible`. Right-side panel scaffolding with a
+/ `slack_clear_bot` / `slack_get_active_bot`. Right-side panel
+visibility (chat or coder) is owned by `ui_set_right_panel` —
+chat shares the right slot with the coder panel. Right-side
+panel scaffolding with a
 "Connect Slack" walkthrough listing all upfront-granted scopes,
 validation via `auth.test`, and a "DM-first" bot picker that
 scans the user's 50 most recent DMs (`DM_SCAN_LIMIT`). End

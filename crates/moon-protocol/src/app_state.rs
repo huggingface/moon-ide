@@ -35,11 +35,31 @@ pub struct AppState {
 	/// users tend to live with it open or closed and resent the panel
 	/// re-jumping to a default height every restart.
 	pub bottom_panel: BottomPanelAppState,
+	/// Which surface — chat or coder — is mounted in the single
+	/// right-side panel slot. `None` means the slot is closed. Chat
+	/// and coder are mutually exclusive: opening one swaps the other
+	/// out rather than stacking. Persisted so the user lands back in
+	/// whichever surface they had open at last shutdown. Defaults to
+	/// `None` (closed) for first-run users.
+	pub right_panel: Option<RightPanelKind>,
+}
+
+/// Surface mounted in the right-side panel. Chat and coder are
+/// mutually exclusive; this enum encodes the pick. The slot can also
+/// be closed entirely (`None` on `AppState::right_panel`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum RightPanelKind {
+	Chat,
+	Coder,
 }
 
 /// Slack-specific slice of [`AppState`]. Only stores derived,
 /// non-secret pointers so we can reload the chat panel on launch
-/// without re-running the bot picker.
+/// without re-running the bot picker. Panel visibility lives at the
+/// top level on [`AppState::right_panel`] — chat and coder share
+/// one slot.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
 #[ts(export)]
 #[serde(default, deny_unknown_fields)]
@@ -49,12 +69,6 @@ pub struct SlackAppState {
 	/// a different bot" gesture or when `auth.test` reports the token
 	/// is dead.
 	pub active_bot: Option<SlackBotProfile>,
-	/// Whether the right-side chat panel was open at last shutdown.
-	/// We restore visibility on launch so users who live with the
-	/// panel open don't have to re-open it every session. Defaults to
-	/// `false` (closed) for first-run users, who shouldn't have a
-	/// chat panel hijacking their workspace until they ask for it.
-	pub panel_visible: bool,
 	/// `thread_ts` of the session the user last had open in the chat
 	/// panel. Restored on launch so reopening the panel jumps back
 	/// into the same conversation. Cleared on bot switch and on

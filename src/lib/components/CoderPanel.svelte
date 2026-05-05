@@ -74,7 +74,7 @@
 	<header class="header">
 		<div class="title">
 			<span class="dot" class:on={coder.signedIn}></span>
-			<span class="label">coder</span>
+			<span class="label">Coder</span>
 			{#if coder.identity}
 				<span class="who">{coder.identity.username}</span>
 			{/if}
@@ -204,15 +204,23 @@
 		align-items: center;
 		justify-content: space-between;
 		gap: 8px;
-		padding: 8px 10px;
+		padding: 8px 12px;
 		border-bottom: 1px solid var(--m-border);
 	}
+	/* Mirror `ChatPanel`'s header font: uppercase, letter-spaced,
+	   11 px / muted. The coder panel layers a status dot, identity,
+	   and a target chip on top of that — uniform typography keeps
+	   the two right-slot tenants visually consistent without
+	   stripping the extra controls coder needs. */
 	.title {
 		display: flex;
 		align-items: center;
 		gap: 6px;
 		min-width: 0;
-		font-size: 12px;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		font-size: 11px;
 		color: var(--m-fg-muted);
 	}
 	.dot {
@@ -221,15 +229,18 @@
 		height: 6px;
 		border-radius: 50%;
 		background: var(--m-fg-subtle);
+		flex-shrink: 0;
 	}
 	.dot.on {
 		background: var(--m-success);
 	}
 	.label {
-		font-weight: 600;
 		color: var(--m-fg);
 	}
 	.who {
+		text-transform: none;
+		letter-spacing: 0;
+		font-weight: 400;
 		color: var(--m-fg-muted);
 		overflow: hidden;
 		text-overflow: ellipsis;

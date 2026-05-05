@@ -234,32 +234,38 @@ back where the user left it:
   metadata. On launch, if it's set, the panel shows that bot
   directly and skips the picker. Switching bots ("Pick a different
   bot" affordance) clears the field and re-runs discovery.
-- `panel_visible`: whether the right-side chat panel was open at
-  shutdown. Restored verbatim. Defaults to `false` so first-run
-  users don't get a chat panel they haven't asked for.
+- `active_thread_ts`: the open session's `thread_ts`, if any.
 
 Both fields are non-secret. The token itself stays in the keyring;
 nothing about it (or its hash, or its prefix) ends up in
 `app_state.json`.
 
+The right-side panel's open/closed state lives at the top level on
+`AppState.right_panel` (`'chat' | 'coder' | null`) — chat shares
+that slot with the coder panel, so it's not a slack-only field
+anymore.
+
 #### Multi-writer story
 
-Two paths write to `AppState`:
+Three paths write to `AppState`:
 
 - The frontend session-persist path (`app_state_save`) owns
-  `last_session` and `theme`.
+  `last_session`, `theme`, and `bottom_panel`.
 - The Slack tauri commands (`slack_select_bot`, `slack_clear_bot`,
-  `slack_set_panel_visible`, `slack_set_active_thread`, plus the
-  auth-failure cleanup in `slack_status` / `slack_clear_token`) own
-  the `slack` slice (`active_bot`, `panel_visible`,
-  `active_thread_ts`).
+  `slack_set_active_thread`, plus the auth-failure cleanup in
+  `slack_status` / `slack_clear_token`) own the `slack` slice
+  (`active_bot`, `active_thread_ts`).
+- `ui_set_right_panel` owns `right_panel` and is the single writer
+  for which surface (chat / coder / closed) is mounted in the
+  right-side slot.
 
 `app_state_save` merges: it loads the on-disk state, takes
-`last_session` + `theme` from the payload, and **preserves the
-on-disk `slack` slice verbatim**. The frontend still has to send a
-placeholder `slack` field to satisfy the shared TS type, but the
-backend ignores it. This stops a session-persist coalesce from
-clobbering a bot pick that just landed.
+`last_session` + `theme` + `bottom_panel` from the payload, and
+**preserves `slack` and `right_panel` verbatim** from disk. The
+frontend still has to send placeholder fields to satisfy the shared
+TS type, but the backend ignores them. This stops a session-persist
+coalesce from clobbering a bot pick or panel toggle that just
+landed.
 
 ### Why not also paginate `users.list` for bots the user hasn't DMd?
 
@@ -665,7 +671,6 @@ Tauri commands in `src-tauri/src/commands/slack.rs`:
 | `slack_select_bot(profile)`                            | Persist user's pick into `AppState.slack.active_bot` |
 | `slack_clear_bot()`                                    | Drop the saved pick; trigger picker on next render   |
 | `slack_get_active_bot()`                               | Read the persisted bot pick, if any                  |
-| `slack_set_panel_visible(visible)`                     | Persist the chat panel's open/closed state           |
 | `slack_set_window_focused(focused)` (11.2)             | OS focus signal for the read-receipt gate            |
 | `slack_list_sessions(channel)`                         | `conversations.history` filtered to top-level        |
 | `slack_get_thread(channel, ts)`                        | `conversations.replies` for one thread               |

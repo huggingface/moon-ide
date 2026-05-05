@@ -30,6 +30,7 @@ import { coder } from './coder.svelte';
 import { container } from './container.svelte';
 import { canOpenContainerTerminal, openContainerTerminal, openHostTerminal } from './openTerminal';
 import { projectCompose } from './projectCompose.svelte';
+import { rightPanel } from './rightPanel.svelte';
 import { slack } from './slack.svelte';
 import { fingerprint, fingerprintEquals, type ContentFingerprint } from './util/hash';
 import { fileKindFor, type FileKind } from './util/fileKind';
@@ -732,10 +733,12 @@ class WorkspaceState {
 		// ms on a large session; no reason to gate the first paint on
 		// them — empty panes fill in as each file loads.
 		this.hydrated = true;
-		// Restore the chat panel state up-front: the panel may have been
-		// open at the last shutdown, in which case it mounts (and probes
-		// `slack_status`) on this same paint without the user lifting a
-		// finger.
+		// Restore the right-side slot pick first so chat/coder can
+		// hydrate against the right baseline. The slot may have been
+		// open at the last shutdown, in which case the relevant
+		// surface mounts (and runs its first probe) on this same
+		// paint without the user lifting a finger.
+		rightPanel.hydrate(state.right_panel);
 		slack.hydrate(state.slack);
 		// Same for the bottom panel — visibility and height. Tab
 		// contents (log streams) are not persisted by design: they
@@ -1013,15 +1016,17 @@ class WorkspaceState {
 			const session: WorkspaceSession | null = ws
 				? { folders: folderSessions, active_folder_path: ws.active_folder }
 				: null;
-			// `slack` is owned by `slack.svelte.ts` + the Slack tauri
-			// commands; the backend's `app_state_save` ignores whatever
-			// we send here and preserves the on-disk value. The
-			// placeholder satisfies the shared type only.
+			// `slack` and `right_panel` are written through their own
+			// Tauri commands (`slack_*`, `ui_set_right_panel`); the
+			// backend's `app_state_save` ignores whatever we send for
+			// those fields and preserves the on-disk value. The
+			// placeholders satisfy the shared type only.
 			const payload: AppState = {
 				last_session: session,
 				theme: this.theme,
-				slack: { active_bot: null, panel_visible: false, active_thread_ts: null },
+				slack: { active_bot: null, active_thread_ts: null },
 				bottom_panel: bottomPanel.serialise(),
+				right_panel: null,
 			};
 			// AppState writes are best-effort. A toast on every failure
 			// would be too noisy (this fires on every navigation); a

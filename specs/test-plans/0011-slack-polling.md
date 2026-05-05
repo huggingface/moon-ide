@@ -27,9 +27,11 @@ message in moon-ide. Detailed design lives in
   bot pick, emit `slack:disconnected`), so a revoked token
   lands the user back on the empty state without a manual
   probe.
-- Startup hook replays `panel_visible`, `active_bot.dm_channel_id`,
-  and `active_thread_ts` into the poller before the frontend
-  mounts, so a relaunch polls within 3 s of first paint.
+- Startup hook replays `right_panel == 'chat'`,
+  `active_bot.dm_channel_id`, and `active_thread_ts` into the
+  poller before the frontend mounts, so a relaunch polls within
+  3 s of first paint when chat was the surface mounted at last
+  shutdown.
 
 ## Setup
 

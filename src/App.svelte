@@ -11,19 +11,23 @@
 	import CoderPanel from './lib/components/CoderPanel.svelte';
 	import BottomPanel from './lib/components/BottomPanel.svelte';
 	import { workspace } from './lib/state.svelte';
+	import { rightPanel } from './lib/rightPanel.svelte';
 	import { slack } from './lib/slack.svelte';
-	import { coder } from './lib/coder.svelte';
 	import { bottomPanel } from './lib/bottomPanel.svelte';
 	import { palette, reloadWindow } from './lib/commands.svelte';
 	import { cycleFocus } from './lib/focus';
 	import { ipc } from './lib/ipc';
 
 	let sidebarWidth = $state(280);
-	let chatWidth = $state(320);
-	let coderWidth = $state(380);
+	// The right-side slot is shared between chat and coder
+	// (`rightPanel.kind`); a single width covers either tenant. The
+	// coder panel ships a few extra header controls so its content
+	// reads better at a slightly wider default than chat alone
+	// needed, but the gap isn't worth the cost of two parallel
+	// sticky widths the user has to mentally model.
+	let rightPanelWidth = $state(380);
 	let resizing = $state(false);
-	let resizingChat = $state(false);
-	let resizingCoder = $state(false);
+	let resizingRightPanel = $state(false);
 	let resizingBottom = $state(false);
 
 	// True when the keyboard event originated in a surface where
@@ -276,42 +280,21 @@
 		window.addEventListener('pointerup', onUp);
 	}
 
-	function startChatResize(event: PointerEvent) {
-		// Drag direction is mirrored vs. the sidebar handle: dragging the
-		// chat handle left grows the panel (it's on the right edge of
-		// the editor area).
-		resizingChat = true;
+	function startRightPanelResize(event: PointerEvent) {
+		// Drag direction is mirrored vs. the sidebar handle: dragging
+		// the handle left grows the panel (it sits on the right edge
+		// of the editor area). One width covers both tenants of the
+		// right-side slot — see `rightPanelWidth`.
+		resizingRightPanel = true;
 		const startX = event.clientX;
-		const startW = chatWidth;
+		const startW = rightPanelWidth;
 
 		const onMove = (e: PointerEvent) => {
 			const next = startW - (e.clientX - startX);
-			chatWidth = Math.max(240, Math.min(640, next));
+			rightPanelWidth = Math.max(240, Math.min(720, next));
 		};
 		const onUp = () => {
-			resizingChat = false;
-			window.removeEventListener('pointermove', onMove);
-			window.removeEventListener('pointerup', onUp);
-		};
-		window.addEventListener('pointermove', onMove);
-		window.addEventListener('pointerup', onUp);
-	}
-
-	function startCoderResize(event: PointerEvent) {
-		// Same mirrored gesture as `startChatResize`. The coder
-		// panel's handle sits between the editor and the panel, or
-		// between the chat panel and the coder panel when both are
-		// open. Coder owns the rightmost slot in the layout.
-		resizingCoder = true;
-		const startX = event.clientX;
-		const startW = coderWidth;
-
-		const onMove = (e: PointerEvent) => {
-			const next = startW - (e.clientX - startX);
-			coderWidth = Math.max(280, Math.min(720, next));
-		};
-		const onUp = () => {
-			resizingCoder = false;
+			resizingRightPanel = false;
 			window.removeEventListener('pointermove', onMove);
 			window.removeEventListener('pointerup', onUp);
 		};
@@ -367,32 +350,26 @@
 				</div>
 			{/if}
 		</main>
-		{#if slack.panelVisible}
+		<!-- Single right-side slot. Chat and coder are mutually
+			 exclusive tenants of it (`rightPanel.kind`); both share
+			 the same width so toggling between them doesn't reflow
+			 the editor area. -->
+		{#if rightPanel.kind !== null}
 			<div
 				class="resize chat-resize"
-				class:active={resizingChat}
+				class:active={resizingRightPanel}
 				role="separator"
 				aria-orientation="vertical"
-				aria-label="Resize chat panel"
+				aria-label="Resize side panel"
 				tabindex="-1"
-				onpointerdown={startChatResize}
+				onpointerdown={startRightPanelResize}
 			></div>
-			<aside class="chat" style:width="{chatWidth}px">
-				<ChatPanel />
-			</aside>
-		{/if}
-		{#if coder.panelVisible}
-			<div
-				class="resize chat-resize"
-				class:active={resizingCoder}
-				role="separator"
-				aria-orientation="vertical"
-				aria-label="Resize coder panel"
-				tabindex="-1"
-				onpointerdown={startCoderResize}
-			></div>
-			<aside class="chat" style:width="{coderWidth}px">
-				<CoderPanel />
+			<aside class="right-panel" style:width="{rightPanelWidth}px">
+				{#if rightPanel.kind === 'chat'}
+					<ChatPanel />
+				{:else if rightPanel.kind === 'coder'}
+					<CoderPanel />
+				{/if}
 			</aside>
 		{/if}
 	</div>
@@ -455,7 +432,7 @@
 		background: var(--m-bg);
 	}
 
-	.chat {
+	.right-panel {
 		flex-shrink: 0;
 		background: var(--m-bg-1);
 		border-left: 1px solid var(--m-border);

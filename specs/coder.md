@@ -570,11 +570,15 @@ Open questions for when this lands:
 
 ## UI placement
 
-A right-side panel docked to the editor area, **separate from the
-Slack panel**. Both panels can coexist; users typically pick one.
-Resizable horizontal splitter (uses the same hand-rolled splitter
-the Slack panel currently uses; will switch to `paneforge` when
-that lands repo-wide).
+A right-side panel docked to the editor area. Chat and coder are
+**mutually exclusive tenants** of a single right-side slot — the
+two panels share one width and the user toggles between them; we
+don't stack two narrow columns on top of each other. Which surface
+is mounted (or `null` for closed) lives on `AppState.right_panel`
+and is restored across launches via the dedicated
+`ui_set_right_panel` Tauri command. Resizable horizontal splitter
+(uses the same hand-rolled splitter the Slack panel currently
+uses; will switch to `paneforge` when that lands repo-wide).
 
 Toggleable from:
 
@@ -582,8 +586,8 @@ Toggleable from:
   session is open).
 - Command palette: `Coder: Toggle Panel`.
 - Keyboard: `F6` / `Shift+F6` cycle (the chat panel is in this
-  rotation today; the coder panel slots in alongside it when
-  visible).
+  rotation today; whichever surface is mounted in the right slot
+  takes that focus stop).
 
 Top-to-bottom layout:
 

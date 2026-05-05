@@ -94,7 +94,6 @@ pub fn run() {
 			commands::slack::slack_select_bot,
 			commands::slack::slack_clear_bot,
 			commands::slack::slack_get_active_bot,
-			commands::slack::slack_set_panel_visible,
 			commands::slack::slack_set_window_focused,
 			commands::slack::slack_list_sessions,
 			commands::slack::slack_get_thread,
@@ -108,6 +107,7 @@ pub fn run() {
 			commands::coder::coder_sign_out,
 			commands::coder::coder_send,
 			commands::coder::coder_abort,
+			commands::ui::ui_set_right_panel,
 		])
 		.setup(|app| {
 			let config_dir = app
@@ -216,11 +216,19 @@ pub fn run() {
 							state.fs_watcher.set_root(active_root);
 						}
 
-						// Seed the poller from persisted Slack inputs
-						// so a relaunch with the panel previously open
-						// resumes polling without waiting for the
-						// frontend to re-issue every setter.
-						poller.set_panel_visible(s.slack.panel_visible);
+						// Seed the poller from persisted UI state so a
+						// relaunch with the chat panel previously
+						// active resumes polling without waiting for
+						// the frontend to re-issue every setter. The
+						// poller's `panel_visible` input is the
+						// boolean "is *chat* the surface mounted in
+						// the right slot", not "is *anything*
+						// mounted" — opening the coder panel must
+						// not keep slack polling.
+						poller.set_panel_visible(matches!(
+							s.right_panel,
+							Some(moon_protocol::app_state::RightPanelKind::Chat)
+						));
 						if let Some(bot) = s.slack.active_bot.as_ref() {
 							poller.set_active_channel(Some(bot.dm_channel_id.clone()));
 							poller.set_active_thread_ts(s.slack.active_thread_ts.clone());

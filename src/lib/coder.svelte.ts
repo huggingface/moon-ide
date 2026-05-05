@@ -12,6 +12,7 @@
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { ipc } from './ipc';
 import { formatError, type CoderEvent, type CoderStatus, type DeviceCode, type HfIdentity } from './protocol';
+import { rightPanel } from './rightPanel.svelte';
 
 const CODER_EVENT_CHANNEL = 'coder:event';
 
@@ -27,8 +28,12 @@ export type CoderRow =
 	| { kind: 'aborted'; id: string };
 
 class CoderPanelState {
-	/** Whether the right-side coder panel is currently rendered. */
-	panelVisible = $state(false);
+	/** Whether the right-side slot is currently mounted with the
+	 *  coder surface. Derived from the shared `rightPanel.kind` —
+	 *  chat and coder share one slot. */
+	get panelVisible(): boolean {
+		return rightPanel.kind === 'coder';
+	}
 
 	/** Latest `coder_status`. `null` before the first call. */
 	status = $state<CoderStatus | null>(null);
@@ -81,7 +86,7 @@ class CoderPanelState {
 	}
 
 	togglePanel(): void {
-		this.panelVisible = !this.panelVisible;
+		rightPanel.toggle('coder');
 	}
 
 	closeModal(): void {

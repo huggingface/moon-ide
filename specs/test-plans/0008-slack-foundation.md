@@ -179,13 +179,14 @@ null`. Pick a different bot; persistence updates accordingly.
    D-Bus interface is what keyring talks to and is already present).
 5. Confirm `state.json`:
    ```bash
-   cat ~/.config/dev.moon-ide.desktop/state.json | jq .slack
+   cat ~/.config/dev.moon-ide.desktop/state.json | jq '.slack, .right_panel'
    ```
-   should show `panel_visible: true`, the same `active_bot` you
-   picked, and no `xoxp-` substring anywhere in the file.
+   should show the same `active_bot` you picked (and no `xoxp-`
+   substring anywhere in the file), plus `right_panel: "chat"` —
+   chat shares the right-side slot with the coder panel and that
+   pick lives at the top level now.
 6. Hide the panel (status-bar pip), quit, relaunch. Panel should
-   stay closed. `state.json`'s `slack.panel_visible` should now be
-   `false`.
+   stay closed. `state.json`'s `right_panel` should now be `null`.
 
 ### 11.0f — token revoked externally
 

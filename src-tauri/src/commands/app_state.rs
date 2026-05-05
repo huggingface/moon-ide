@@ -1,19 +1,21 @@
 //! Tauri commands wrapping [`moon_core::app_state`].
 //!
-//! AppState is split across two writers:
-//! - The frontend's session-persist path owns `last_session` + `theme`
-//!   and hits this `app_state_save` command on every navigation.
+//! AppState is split across multiple writers:
+//! - The frontend's session-persist path owns `last_session`, `theme`,
+//!   and `bottom_panel` and hits this `app_state_save` command on
+//!   every navigation.
 //! - The Slack tauri commands own `slack.*` and write via their own
 //!   load-mutate-save path (see `commands::slack`).
-//! - `bottom_panel` is pure UI chrome owned by the frontend
-//!   (visibility + height). The frontend writes it through this
-//!   path; the Slack writers don't touch it.
+//! - The right-panel pick (`right_panel`) is owned by the frontend
+//!   but written through the dedicated `ui_set_right_panel` command
+//!   so the slack poller can react synchronously to chat being
+//!   opened/closed without waiting for the next persist tick.
 //!
 //! To stop the frontend's writes from clobbering the Slack slice (or
 //! vice versa), `app_state_save` merges: it takes everything from
-//! the payload **except** `slack`, which is preserved from disk
-//! verbatim. Anything the frontend sends in `payload.slack` is
-//! ignored on this path.
+//! the payload **except** `slack` and `right_panel`, both of which
+//! are preserved from disk verbatim. Anything the frontend sends in
+//! those fields is ignored on this path.
 
 use moon_core::app_state as core_app_state;
 use moon_protocol::app_state::AppState as AppStatePayload;
@@ -35,6 +37,7 @@ pub async fn app_state_save(state: State<'_, AppState>, app_state: AppStatePaylo
 		theme: app_state.theme,
 		slack: existing.slack,
 		bottom_panel: app_state.bottom_panel,
+		right_panel: existing.right_panel,
 	};
 	core_app_state::save(&state.config_dir, &merged).await
 }

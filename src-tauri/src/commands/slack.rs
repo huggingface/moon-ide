@@ -146,22 +146,6 @@ pub async fn slack_get_active_bot(state: State<'_, AppState>) -> Result<Option<S
 	Ok(current.slack.active_bot)
 }
 
-/// Persist whether the chat panel is currently shown. Called from the
-/// frontend on every show/hide so a relaunch lands the user back in the
-/// same layout. Frontend-owned state (no token / Slack work involved)
-/// but we keep it in the slack slice because it's conceptually part of
-/// the chat panel's session.
-#[tauri::command]
-pub async fn slack_set_panel_visible(state: State<'_, AppState>, visible: bool) -> Result<(), MoonError> {
-	let mut current = app_state_store::load(&state.config_dir).await?;
-	state.slack.poller.set_panel_visible(visible);
-	if current.slack.panel_visible == visible {
-		return Ok(());
-	}
-	current.slack.panel_visible = visible;
-	app_state_store::save(&state.config_dir, &current).await
-}
-
 /// OS-level focus tracking. Frontend listens to Tauri's
 /// `tauri://focus` / `tauri://blur` events and forwards the boolean
 /// here; the poller uses this to gate `conversations.mark` (we only

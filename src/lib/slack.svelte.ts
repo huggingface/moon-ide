@@ -26,6 +26,7 @@ import {
 	type SlackStatus,
 	type SlackUserSummary,
 } from './protocol';
+import { rightPanel } from './rightPanel.svelte';
 
 /** Tauri event payload emitted by the Rust polling loop. Mirrors `slack_poller::ThreadUpdatePayload`. */
 type ThreadUpdatePayload = {
@@ -59,8 +60,12 @@ export type SlackUserCacheEntry =
 	| { state: 'missing' };
 
 class SlackPanelState {
-	/** Whether the right-side panel is currently rendered. */
-	panelVisible = $state(false);
+	/** Whether the right-side slot is currently mounted with chat.
+	 *  Derived from the shared `rightPanel.kind` — chat and coder
+	 *  share one slot, so visibility for either lives in one place. */
+	get panelVisible(): boolean {
+		return rightPanel.kind === 'chat';
+	}
 
 	/** Last result of `slack_status`. `null` before the first poll. */
 	status = $state<SlackStatus | null>(null);
@@ -185,16 +190,16 @@ class SlackPanelState {
 	}
 
 	/**
-	 * Apply persisted panel state at startup. Called once from
-	 * `WorkspaceState.restoreAppState`. Pre-loads `activeBot` from disk
-	 * so the chat panel's first paint already shows the active-bot card
-	 * (skipping the spinner + DM scan that `refreshStatus` would
-	 * otherwise kick off). Panel visibility is restored verbatim — if
-	 * the user had the chat panel open last session, it stays open.
+	 * Apply persisted slack state at startup. Called once from
+	 * `WorkspaceState.restoreAppState`. Pre-loads `activeBot` from
+	 * disk so the chat panel's first paint already shows the
+	 * active-bot card (skipping the spinner + DM scan that
+	 * `refreshStatus` would otherwise kick off). Panel visibility is
+	 * not in here anymore — it lives on `rightPanel` which has its
+	 * own hydrate call.
 	 */
 	hydrate(state: SlackAppState) {
 		this.activeBot = state.active_bot;
-		this.panelVisible = state.panel_visible;
 		this.activeThreadTs = state.active_thread_ts;
 		this.#seedActiveBot();
 	}
@@ -252,21 +257,28 @@ class SlackPanelState {
 	}
 
 	togglePanel() {
-		this.setPanelVisible(!this.panelVisible);
-	}
-
-	setPanelVisible(visible: boolean) {
-		if (this.panelVisible === visible) {
-			return;
-		}
-		this.panelVisible = visible;
+		rightPanel.toggle('chat');
 		if (this.panelVisible && this.status === null) {
 			void this.refreshStatus();
 		}
-		// Persistence is fire-and-forget — a failed write only means the
-		// panel forgets its state on the next launch, which is at worst
-		// mildly annoying. The chat panel itself still works.
-		void ipc.slack.setPanelVisible(visible).catch(() => {});
+	}
+
+	/** Force the chat panel into the right-side slot, swapping out
+	 *  the coder panel if it was open. Used by the "Chat: Connect
+	 *  Slack…" command-palette entry, which wants the modal to
+	 *  appear *with* the panel, not replace it. */
+	setPanelVisible(visible: boolean) {
+		const next = visible ? 'chat' : null;
+		if (visible && this.panelVisible) {
+			return;
+		}
+		if (!visible && rightPanel.kind !== 'chat') {
+			return;
+		}
+		rightPanel.set(next);
+		if (visible && this.status === null) {
+			void this.refreshStatus();
+		}
 	}
 
 	openConnectModal() {

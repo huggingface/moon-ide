@@ -19,6 +19,7 @@ import type {
 	LspPosition,
 	ProjectComposeStatus,
 	ReadFileResult,
+	RightPanelKind,
 	SlackBotProfile,
 	SlackIdentity,
 	SlackMessage,
@@ -124,7 +125,6 @@ export const ipc = {
 		selectBot: (profile: SlackBotProfile) => invoke<void>('slack_select_bot', { profile }),
 		clearBot: () => invoke<void>('slack_clear_bot'),
 		getActiveBot: () => invoke<SlackBotProfile | null>('slack_get_active_bot'),
-		setPanelVisible: (visible: boolean) => invoke<void>('slack_set_panel_visible', { visible }),
 		setWindowFocused: (focused: boolean) => invoke<void>('slack_set_window_focused', { focused }),
 		listSessions: (channel: string) => invoke<SlackSession[]>('slack_list_sessions', { channel }),
 		getThread: (channel: string, threadTs: string) => invoke<SlackMessage[]>('slack_get_thread', { channel, threadTs }),
@@ -141,5 +141,8 @@ export const ipc = {
 		signOut: () => invoke<void>('coder_sign_out'),
 		send: (text: string) => invoke<void>('coder_send', { text }),
 		abort: () => invoke<void>('coder_abort'),
+	},
+	ui: {
+		setRightPanel: (kind: RightPanelKind | null) => invoke<void>('ui_set_right_panel', { kind }),
 	},
 } as const;

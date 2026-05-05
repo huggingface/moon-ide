@@ -360,12 +360,22 @@ export type WorkspaceSession = {
  * Slack-specific slice of [`AppState`]. Only stores derived,
  * non-secret pointers — the `xoxp-` token itself stays in the OS
  * keyring. Mirrors `moon_protocol::app_state::SlackAppState`.
+ *
+ * Right-panel visibility lives on [`AppState.right_panel`] now (chat
+ * and coder share one slot); this slice no longer carries it.
  */
 export type SlackAppState = {
 	active_bot: SlackBotProfile | null;
-	panel_visible: boolean;
 	active_thread_ts: string | null;
 };
+
+/**
+ * Surface mounted in the right-side panel. Chat and coder are
+ * mutually exclusive: opening one swaps the other out. The slot can
+ * also be closed entirely (`null` on `AppState.right_panel`).
+ * Mirrors `moon_protocol::app_state::RightPanelKind`.
+ */
+export type RightPanelKind = 'chat' | 'coder';
 
 /**
  * Per-machine, per-user app state. There is intentionally no `Settings`
@@ -377,6 +387,7 @@ export type AppState = {
 	theme: ThemeMode;
 	slack: SlackAppState;
 	bottom_panel: BottomPanelAppState;
+	right_panel: RightPanelKind | null;
 };
 
 /** Bottom-panel chrome state. Tabs/log streams are intentionally
@@ -445,8 +456,9 @@ export type TerminalClosed = {
 export const defaultAppState: AppState = {
 	last_session: null,
 	theme: 'system',
-	slack: { active_bot: null, panel_visible: false, active_thread_ts: null },
+	slack: { active_bot: null, active_thread_ts: null },
 	bottom_panel: { visible: false, height: 240 },
+	right_panel: null,
 };
 
 /**

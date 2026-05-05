@@ -119,10 +119,14 @@ Slack — sending will land in the IDE in 11.3." That's also a pass.
    ```json
    {
      "active_bot": { "user_id": "U…", "dm_channel_id": "D…", … },
-     "panel_visible": true,
      "active_thread_ts": "1700000001.000100"
    }
    ```
+
+   Right-side panel visibility now lives at `state.right_panel`
+   (top-level), not inside `slack`. Cross-check with
+   `jq '.right_panel' state.json` — should print `"chat"` while the
+   chat panel is open.
 
 6. Click "← Sessions" so no thread is selected. Quit + relaunch.
 7. **Expected**: panel opens on the sessions list (no thread).
