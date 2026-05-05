@@ -21,7 +21,7 @@ The full phased plan. Update the **Status** column as phases land.
 | 3     | Terminal                        | scaffolded  |
 | 4     | LSP                             | in progress |
 | 5     | Git layer                       | in progress |
-| 6     | ACP integration                 | scaffolded  |
+| 6     | Coder (in-process AI agent)     | scaffolded  |
 | 7     | Multi-repo + cross-repo queries | scaffolded  |
 | 8     | Linting / formatting            | scaffolded  |
 | 9     | Custom tool plugins             | scaffolded  |
@@ -124,13 +124,17 @@ Until this phase lands, the file tree shows everything except the `.git/` direct
 
 **Still outstanding for this phase**: the SCM panel, conflict markers, per-hunk stage / discard, and the "unstage" half of discarding staged-new files.
 
-## Phase 6 — ACP
+## Phase 6 — Coder (in-process AI agent)
 
-ACP host using the `agent-client-protocol` crate. Agent panel in the UI: chat, tool stream, edit preview. Pluggable agent binary (settings select opencode / claude code / etc.). Tool calls route through the active host so containerized agents only touch container resources.
+A right-side coder panel that owns its loop end-to-end: streams from Hugging Face Inference Providers, dispatches its own tool calls, routes every tool through the active `WorkspaceHost` so a containerised workspace gets a containerised agent for free. Sessions persist as append-only JSONL and sync to a per-user private HF bucket (`<user>/moon-ide-sessions`) via `hf-xet`.
+
+Architectural spec: [`coder.md`](coder.md). Sub-phase work breakdown: [`roadmaps/phase-06-coder.md`](roadmaps/phase-06-coder.md). Decisions: [ADR 0010 — coder rewrite, not ACP](decisions/0010-coder-rewrite-not-acp.md), [ADR 0011 — rename `moon-agent` → `moon-remote`](decisions/0011-rename-moon-agent-to-moon-remote.md).
+
+**Acceptance** (per sub-phase): HF OAuth device-flow sign-in + read-only tool surface (6.0); SSE streaming + abort (6.1); mutating tools + container-aware bash (6.2); on-disk JSONL sessions + sidebar (6.3); model picker (6.4); steering + follow-up queues (6.5); `AGENTS.md` / `SYSTEM.md` / `SKILL.md` system-prompt assembly + compaction (6.6); per-user private HF bucket sync via `hf-xet` (6.7). Deliberately deferred (sub-agents, OpenRouter / custom providers, Anthropic OAuth, bucket browser, MCP, plan mode, permission popups) — see [`coder.md` § "Out of scope"](coder.md#out-of-scope-explicitly).
 
 ## Phase 7 — Multi-repo coordination
 
-Phase 2.5 already shipped the multi-folder workspace shape. What Phase 7 adds on top: cross-folder search via per-folder `tantivy` indices with a parallel query layer, ACP's `workspace.repos` tool so agents can target `@repo-name`, and named multi-workspace UI (today's singleton `"default"` becomes one of many, with `Open Workspace…` / `Switch Workspace…` affordances).
+Phase 2.5 already shipped the multi-folder workspace shape. What Phase 7 adds on top: cross-folder search via per-folder `tantivy` indices with a parallel query layer, a `workspace_list` / `workspace_grep` tool surface for the coder so it can target `@folder-name`, and named multi-workspace UI (today's singleton `"default"` becomes one of many, with `Open Workspace…` / `Switch Workspace…` affordances).
 
 App state grows with this phase: today's single workspace (folders + active) becomes a list of named workspaces with the most recent set of folders per workspace. The `AppState` struct in `moon-core` is the natural place for this.
 

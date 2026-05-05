@@ -26,13 +26,13 @@ trait WorkspaceHost: Send + Sync {
 Two implementations:
 
 - `LocalHost` — uses `tokio::fs`, `tokio::process`, `notify`, `portable-pty` directly.
-- `RemoteHost` — JSON-RPC client to `moon-agent` running inside a container.
+- `RemoteHost` — JSON-RPC client to `moon-remote` running on the remote machine (SSH / Codespaces).
 
 The Tauri-exposed commands (and later the JSON-RPC server) always look up the active host and route through it. UI never knows or cares which it is.
 
 ## Consequences
 
-- LSP, git, ACP, lint, terminal, search — all of them must use `WorkspaceHost` for any I/O that touches the workspace. They can spawn local processes (e.g. running an LSP binary that lives on the host or in the container) but the choice is made by the host.
+- LSP, git, the coder, lint, terminal, search — all of them must use `WorkspaceHost` for any I/O that touches the workspace. They can spawn local processes (e.g. running an LSP binary that lives on the host or in the container) but the choice is made by the host.
 - Phase 0 ships only `LocalHost`. The trait still exists; this is intentional pre-investment.
 - Process supervision (long-running children) is owned by `WorkspaceHost::spawn`, not by ad-hoc `tokio::spawn` calls.
 

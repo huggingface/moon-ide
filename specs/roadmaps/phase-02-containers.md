@@ -238,7 +238,7 @@ with their re-visit triggers; the short list:
 - Auto-rebuild on `Dockerfile` mtime change.
 - Podman / non-Docker engines.
 - Remote (non-local) Docker hosts — revives the
-  moon-agent-over-socket model from `architecture.md`.
+  `moon-remote`-over-socket model from `architecture.md`.
 - Cross-platform (macOS / Windows) verification.
 - On-demand port forwarding without editing compose.
 

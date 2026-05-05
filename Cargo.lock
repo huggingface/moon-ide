@@ -2623,16 +2623,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "moon-agent"
+name = "moon-coder"
 version = "0.0.0"
 dependencies = [
- "anyhow",
- "clap",
+ "async-trait",
+ "camino",
+ "keyring",
  "moon-core",
  "moon-protocol",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
- "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -2689,6 +2695,7 @@ dependencies = [
  "camino",
  "dirs",
  "futures-util",
+ "moon-coder",
  "moon-container",
  "moon-core",
  "moon-protocol",
@@ -2717,6 +2724,19 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "ts-rs",
+]
+
+[[package]]
+name = "moon-remote"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "moon-core",
+ "moon-protocol",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

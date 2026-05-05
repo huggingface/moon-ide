@@ -11,7 +11,8 @@ posting messages, and keeping the bot's edits live.
 The bot has **zero visibility into local IDE state**. No file context,
 no LSP, no skill installation — anything the user wants the bot to
 see they paste into the message themselves. Real "agent in the IDE
-with context" is Phase 6 (ACP) and stays separate.
+with context" is the [coder panel](coder.md) (Phase 6) and stays
+separate.
 
 ## Why Slack, why now
 
@@ -699,8 +700,9 @@ Push events from backend → frontend (11.2):
 ## What this phase deliberately doesn't do
 
 - **No agent context bridge.** The bot doesn't see open files, the
-  diagnostic stream, the cursor, anything. Phase 6 (ACP) is where we
-  build "agent that has the IDE under its hands". 11 stays chat-only.
+  diagnostic stream, the cursor, anything. Phase 6 ([coder](coder.md))
+  is where we build "agent that has the IDE under its hands". 11
+  stays chat-only.
 - **No moon-ide Slack app.** Until somebody asks for one-click
   install, the user installs their own personal Slack app and pastes
   a user token. Documented in the connect walk-through.
@@ -724,8 +726,9 @@ Push events from backend → frontend (11.2):
   thread is open.
 - **No AI-generated session titles.** The session list shows the
   raw first line of each thread today. Once we have an LLM in
-  the loop (Phase 6, ACP), summarise each thread to a 3–6 word
-  title and persist alongside `thread_ts`. Sticky AI title above
+  the loop (Phase 6, [coder](coder.md)), summarise each thread to
+  a 3–6 word title and persist alongside `thread_ts`. Sticky AI
+  title above
   the message list is the natural re-introduction of the thread
   subject we removed in `4a11305`.
 - **No multi-account.** One Slack workspace per moon-ide install.

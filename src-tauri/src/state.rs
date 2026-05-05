@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use camino::Utf8PathBuf;
+use moon_coder::CoderHandle;
 use moon_core::WorkspaceRegistry;
 use moon_slack::{SlackClient, TokenStore};
 use tokio::sync::{Mutex, RwLock};
@@ -12,7 +13,11 @@ use crate::fs_watcher::FsWatcherHandle;
 use crate::slack_poller::PollerHandle;
 
 pub struct AppState {
-	pub workspaces: WorkspaceRegistry,
+	/// Shared with the coder loop (via [`CoderHandle`]) so tool
+	/// dispatch sees the same active folder every other command
+	/// does. Held as an `Arc` so the coder can hang on to its own
+	/// clone without a separate registry pass-through.
+	pub workspaces: Arc<WorkspaceRegistry>,
 	/// Where global, machine-local app state lives (last opened folder, etc.).
 	/// Set once at startup from Tauri's `app_config_dir`.
 	pub config_dir: Utf8PathBuf,
@@ -57,6 +62,12 @@ pub struct AppState {
 	/// hook) or when the active folder switches (see
 	/// [`crate::commands::lsp`]).
 	pub lsp: Arc<Mutex<Option<LspHandle>>>,
+	/// In-process AI coding agent (Phase 6). Cheap-to-clone handle;
+	/// every `coder_*` command goes through it. Constructed once at
+	/// startup against the same `WorkspaceRegistry` everything else
+	/// uses, so the agent's tool dispatch lands on the active folder
+	/// without a separate registry hop. See `specs/coder.md`.
+	pub coder: CoderHandle,
 }
 
 /// Owning handle the terminal commands keep per stream. The
@@ -82,9 +93,11 @@ impl AppState {
 		workspaces_dir: Utf8PathBuf,
 		slack: SlackState,
 		fs_watcher: FsWatcherHandle,
+		workspaces: Arc<WorkspaceRegistry>,
+		coder: CoderHandle,
 	) -> Self {
 		Self {
-			workspaces: WorkspaceRegistry::new(),
+			workspaces,
 			config_dir,
 			workspaces_dir,
 			slack,
@@ -92,6 +105,7 @@ impl AppState {
 			terminal_streams: Arc::new(Mutex::new(HashMap::new())),
 			fs_watcher,
 			lsp: Arc::new(Mutex::new(None)),
+			coder,
 		}
 	}
 

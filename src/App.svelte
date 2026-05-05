@@ -8,9 +8,11 @@
 	import Welcome from './lib/components/Welcome.svelte';
 	import CommandPalette from './lib/components/CommandPalette.svelte';
 	import ChatPanel from './lib/components/ChatPanel.svelte';
+	import CoderPanel from './lib/components/CoderPanel.svelte';
 	import BottomPanel from './lib/components/BottomPanel.svelte';
 	import { workspace } from './lib/state.svelte';
 	import { slack } from './lib/slack.svelte';
+	import { coder } from './lib/coder.svelte';
 	import { bottomPanel } from './lib/bottomPanel.svelte';
 	import { palette, reloadWindow } from './lib/commands.svelte';
 	import { cycleFocus } from './lib/focus';
@@ -18,8 +20,10 @@
 
 	let sidebarWidth = $state(280);
 	let chatWidth = $state(320);
+	let coderWidth = $state(380);
 	let resizing = $state(false);
 	let resizingChat = $state(false);
+	let resizingCoder = $state(false);
 	let resizingBottom = $state(false);
 
 	// True when the keyboard event originated in a surface where
@@ -292,6 +296,28 @@
 		window.addEventListener('pointermove', onMove);
 		window.addEventListener('pointerup', onUp);
 	}
+
+	function startCoderResize(event: PointerEvent) {
+		// Same mirrored gesture as `startChatResize`. The coder
+		// panel's handle sits between the editor and the panel, or
+		// between the chat panel and the coder panel when both are
+		// open. Coder owns the rightmost slot in the layout.
+		resizingCoder = true;
+		const startX = event.clientX;
+		const startW = coderWidth;
+
+		const onMove = (e: PointerEvent) => {
+			const next = startW - (e.clientX - startX);
+			coderWidth = Math.max(280, Math.min(720, next));
+		};
+		const onUp = () => {
+			resizingCoder = false;
+			window.removeEventListener('pointermove', onMove);
+			window.removeEventListener('pointerup', onUp);
+		};
+		window.addEventListener('pointermove', onMove);
+		window.addEventListener('pointerup', onUp);
+	}
 </script>
 
 {#if !workspace.hydrated}
@@ -353,6 +379,20 @@
 			></div>
 			<aside class="chat" style:width="{chatWidth}px">
 				<ChatPanel />
+			</aside>
+		{/if}
+		{#if coder.panelVisible}
+			<div
+				class="resize chat-resize"
+				class:active={resizingCoder}
+				role="separator"
+				aria-orientation="vertical"
+				aria-label="Resize coder panel"
+				tabindex="-1"
+				onpointerdown={startCoderResize}
+			></div>
+			<aside class="chat" style:width="{coderWidth}px">
+				<CoderPanel />
 			</aside>
 		{/if}
 	</div>

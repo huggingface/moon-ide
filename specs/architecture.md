@@ -30,19 +30,20 @@ A desktop IDE where every workspace operation works the same whether the workspa
                                                 explicitly forwarded ports
 ```
 
-For local containers, the host filesystem is the source of truth — moon-core reads/writes files directly on the host, and the container sees the same bytes through a bind mount. Process and PTY work shells through `docker exec`. A future remote variant (no shared filesystem) will reuse the same `WorkspaceHost` trait through a JSON-RPC channel to a `moon-agent` running on the remote machine.
+For local containers, the host filesystem is the source of truth — moon-core reads/writes files directly on the host, and the container sees the same bytes through a bind mount. Process and PTY work shells through `docker exec`. A future remote variant (no shared filesystem) will reuse the same `WorkspaceHost` trait through a JSON-RPC channel to a `moon-remote` runtime running on the remote machine.
 
 ## Components
 
 - **Svelte UI** (`src/`) — runs in the Tauri webview. Owns rendering, layout, keymap, and editor state. Calls into the core via Tauri commands.
-- **`moon-core`** (`crates/moon-core/`) — the workspace brain. Owns the workspace registry, the `WorkspaceHost` abstraction, the LSP multiplexer, the git layer, the ACP host, and the cross-repo indexer. Linked into both the Tauri app and the in-container agent.
+- **`moon-core`** (`crates/moon-core/`) — the workspace brain. Owns the workspace registry, the `WorkspaceHost` abstraction, the LSP multiplexer, the git layer, and the cross-repo indexer. Linked into both the Tauri app and the in-container runtime.
 - **`moon-container`** (`crates/moon-container/`, Phase 2) — the local-container `WorkspaceHost` impl: shells out to `docker compose` for lifecycle, `docker exec` for spawn / PTY, and bind-mount-aware path translation. See [`containers.md`](containers.md).
-- **`moon-agent`** (`crates/moon-agent/`, future) — a tiny binary that links `moon-core` in agent mode for the **remote** host story (SSH / Codespaces). Listens on a Unix socket, serves JSON-RPC. Not used by Phase 2's local-container model — that one uses bind-mount + exec because the filesystem is shared.
+- **`moon-coder`** (`crates/moon-coder/`, Phase 6) — the in-process AI coding agent: HF OAuth device flow + Inference Providers HTTP client, tool dispatcher routed through the active `WorkspaceHost`, append-only JSONL sessions synced to an HF private bucket via `hf-xet`. See [`coder.md`](coder.md). The "agent panel" in the UI is owned here, not by an external ACP binary.
+- **`moon-remote`** (`crates/moon-remote/`, future) — a tiny binary that links `moon-core` in remote mode for the SSH / Codespaces host story. Listens on a Unix socket, serves JSON-RPC. Not used by Phase 2's local-container model — that one uses bind-mount + exec because the filesystem is shared.
 - **`moon-protocol`** (`crates/moon-protocol/`) — Serde-typed JSON-RPC schema. Single source of truth. TS types are generated from it (or kept in lockstep manually for now).
 
 ## The non-negotiable invariant
 
-**Nothing in the UI directly touches git, LSP, fs, the terminal, or ACP.** Every such call is a JSON-RPC method on the core. The core picks the active `WorkspaceHost` and routes the call.
+**Nothing in the UI directly touches git, LSP, fs, the terminal, the coder, or any LLM.** Every such call is a JSON-RPC method on the core. The core picks the active `WorkspaceHost` and routes the call.
 
 This is what makes local-container support cheap (Phase 2). It is also what will make remote SSH / Codespaces-style modes cheap when we add them. Violating it is the single biggest architectural risk.
 
@@ -64,7 +65,7 @@ Three implementations:
 
 - `LocalHost` — uses `tokio::fs`, `tokio::process`, `notify`, `portable-pty` directly. Phase 0.
 - `ContainerHost` — fs ops are direct host I/O (the container's bind mount makes host paths and container paths point at the same bytes); `spawn` / `open_pty` route through `docker exec`. Phase 2. See [`containers.md`](containers.md#workspacehostcontainerhost).
-- `RemoteHost` — JSON-RPC client to `moon-agent` over a forwarded socket, for hosts where the filesystem isn't shared (SSH / Codespaces). Future.
+- `RemoteHost` — JSON-RPC client to `moon-remote` over a forwarded socket, for hosts where the filesystem isn't shared (SSH / Codespaces). Future.
 
 Phase 0 ships only `LocalHost` and exposes it through Tauri commands directly. The trait still exists so the UI's call sites don't need to change later.
 
@@ -72,7 +73,8 @@ Phase 0 ships only `LocalHost` and exposes it through Tauri commands directly. T
 
 - One Tauri webview process (the UI).
 - One `moon-core` instance running in-process inside the Tauri app (local mode).
-- LSP servers, PTYs, ACP agents, lint sidecars: child processes spawned via the active host. Long-running ones are managed by the core's process supervisor (Phase 4+).
+- LSP servers, PTYs, lint sidecars: child processes spawned via the active host. Long-running ones are managed by the core's process supervisor (Phase 4+).
+- The coder loop (Phase 6) runs in-process inside `moon-core`; its tool calls go through the same `WorkspaceHost` as everything else, so a containerised workspace gives the agent containerised tools without extra plumbing.
 
 ## Threading
 

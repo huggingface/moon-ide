@@ -609,18 +609,18 @@ across IDE quits.
 
 ## What runs where
 
-| Concern                                                | Host (Tauri / moon-ide proper)                       | Workspace `dev` container  | Project service containers (compose siblings) |
-| ------------------------------------------------------ | ---------------------------------------------------- | -------------------------- | --------------------------------------------- |
-| UI rendering, Tauri shell, IPC routing                 | ✓                                                    |                            |                                               |
-| Slack panel, Slack API calls                           | ✓                                                    |                            |                                               |
-| ACP / agent runtimes (Phase 6)                         | ✓                                                    |                            |                                               |
-| Git operations on the workspace                        | ✓                                                    | (read-only via bind mount) |                                               |
-| `docker compose up` for the project's compose          | ✓ (moon-ide drives the host's daemon via `include:`) |                            |                                               |
-| Project terminals                                      |                                                      | ✓                          |                                               |
-| LSP servers                                            |                                                      | ✓                          |                                               |
-| Linters / formatters (oxlint, oxfmt, prettier, eslint) |                                                      | ✓                          |                                               |
-| Build commands (`cargo`, `bun`, `npm`, `make`)         |                                                      | ✓                          |                                               |
-| postgres / redis / mongo / …                           |                                                      |                            | ✓                                             |
+| Concern                                                | Host (Tauri / moon-ide proper)                       | Workspace `dev` container  | Project service containers (compose siblings)                                                                                        |
+| ------------------------------------------------------ | ---------------------------------------------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| UI rendering, Tauri shell, IPC routing                 | ✓                                                    |                            |                                                                                                                                      |
+| Slack panel, Slack API calls                           | ✓                                                    |                            |                                                                                                                                      |
+| Coder loop / LLM HTTP calls (Phase 6)                  | ✓                                                    |                            | Tools the loop dispatches (`bash`, `read_file`, …) cross to the container via `WorkspaceHost::spawn` exactly like the terminal does. |
+| Git operations on the workspace                        | ✓                                                    | (read-only via bind mount) |                                                                                                                                      |
+| `docker compose up` for the project's compose          | ✓ (moon-ide drives the host's daemon via `include:`) |                            |                                                                                                                                      |
+| Project terminals                                      |                                                      | ✓                          |                                                                                                                                      |
+| LSP servers                                            |                                                      | ✓                          |                                                                                                                                      |
+| Linters / formatters (oxlint, oxfmt, prettier, eslint) |                                                      | ✓                          |                                                                                                                                      |
+| Build commands (`cargo`, `bun`, `npm`, `make`)         |                                                      | ✓                          |                                                                                                                                      |
+| postgres / redis / mongo / …                           |                                                      |                            | ✓                                                                                                                                    |
 
 The split is "host = the IDE; container = the project's
 tooling". Slack credentials live in the OS keyring; agent
@@ -846,13 +846,15 @@ trait WorkspaceHost: Send + Sync {
   the host can watch a bind-mounted directory; the container's
   writes are reflected instantly.
 
-This deliberately doesn't use the moon-agent injection model
-the old `specs/devcontainers.md` sketched. That model is
-correct for **remote** hosts where there's no shared
-filesystem (SSH, Codespaces) and is preserved as the future
-`RemoteHost` variant. For local containers, bind-mount + exec
-is simpler, faster, and avoids shipping a static-musl binary
-into the user's container.
+This deliberately doesn't use the in-container agent injection
+model the old `specs/devcontainers.md` sketched (now
+`moon-remote`, see [ADR 0011](decisions/0011-rename-moon-agent-to-moon-remote.md)).
+That model is correct for **remote** hosts where there's no
+shared filesystem (SSH, Codespaces) and is preserved as the
+future `RemoteHost` variant. For local containers, bind-mount
+
+- exec is simpler, faster, and avoids shipping a static-musl
+  binary into the user's container.
 
 What this looks like for terminals (Phase 3): the IDE
 allocates a host-side PTY via `portable-pty` and bridges it
@@ -923,7 +925,7 @@ Push events:
 - **Podman / non-Docker engines.** Should mostly work via
   `DOCKER_HOST`, but unverified. Address when somebody asks.
 - **Remote (non-local) Docker hosts.** Different problem
-  shape (no bind mount); revives the moon-agent injection
+  shape (no bind mount); revives the `moon-remote` injection
   model for that variant.
 - **Windows host.** Nobody on the team uses Windows; Docker
   Desktop should mostly work but is unverified. Surface
@@ -1058,7 +1060,7 @@ sprawls — add when the inventory genuinely needs it.
 
 `ContainerHost` is the local variant. The `RemoteHost`
 sketched in `architecture.md` (JSON-RPC over a forwarded
-socket to a `moon-agent` running on a remote machine) is
+socket to a `moon-remote` runtime on the remote machine) is
 deferred until somebody asks. It reuses the same
 `WorkspaceHost` trait, so adopting it later is additive.
 

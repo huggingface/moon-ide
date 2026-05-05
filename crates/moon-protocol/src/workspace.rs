@@ -47,6 +47,7 @@ pub struct Workspace {
 pub enum HostKind {
 	/// Folder lives directly on the user's host filesystem.
 	Local,
-	/// Folder lives inside a devcontainer; ops route through `moon-agent`.
+	/// Folder lives inside a devcontainer; ops route through `moon-remote`
+	/// (or, for local docker, through bind-mount + `docker exec`).
 	Devcontainer,
 }

@@ -1,15 +1,18 @@
 import { invoke } from '@tauri-apps/api/core';
 import type {
 	AppState,
+	CoderStatus,
 	ContainerStatus,
 	ContentSearchOptions,
 	ContentSearchResult,
+	DeviceCode,
 	DirEntry,
 	EditorConfig,
 	FileSearchOptions,
 	FileSearchResult,
 	GitFileBlame,
 	GitStatusEntry,
+	HfIdentity,
 	LspCompletionList,
 	LspHover,
 	LspLocation,
@@ -130,5 +133,13 @@ export const ipc = {
 		markRead: (channel: string, ts: string) => invoke<void>('slack_mark_read', { channel, ts }),
 		postMessage: (channel: string, threadTs: string | null, text: string) =>
 			invoke<SlackMessage>('slack_post_message', { channel, threadTs, text }),
+	},
+	coder: {
+		status: () => invoke<CoderStatus>('coder_status'),
+		startDeviceFlow: () => invoke<DeviceCode>('coder_start_device_flow'),
+		pollDeviceCode: (code: DeviceCode) => invoke<HfIdentity>('coder_poll_device_code', { code }),
+		signOut: () => invoke<void>('coder_sign_out'),
+		send: (text: string) => invoke<void>('coder_send', { text }),
+		abort: () => invoke<void>('coder_abort'),
 	},
 } as const;

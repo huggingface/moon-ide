@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { workspace } from '../state.svelte';
 	import { slack } from '../slack.svelte';
+	import { coder } from '../coder.svelte';
 	import { container, containerStateLabel } from '../container.svelte';
 	import ContainerPanel from './ContainerPanel.svelte';
 	import TerminalLauncher from './TerminalLauncher.svelte';
@@ -193,6 +194,19 @@
 		>
 			<span class="pip" class:on={slack.connected}></span>
 			chat
+		</button>
+		<!-- Coder panel toggle. Same shape as the chat pip; pip lights
+			 once the user has signed in to Hugging Face. The label
+			 stays "coder" to mirror the panel header. -->
+		<button
+			type="button"
+			class="chat"
+			class:active={coder.panelVisible}
+			title={coder.signedIn ? 'Coder (signed in)' : 'Coder (signed out)'}
+			onclick={() => coder.togglePanel()}
+		>
+			<span class="pip" class:on={coder.signedIn}></span>
+			coder
 		</button>
 		<!-- Theme picker popover. Three options: System (OS-driven),
 			 Light, Dark. The trigger label reflects the stored choice

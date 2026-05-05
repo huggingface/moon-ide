@@ -34,7 +34,7 @@ STATUS: partial — Phase 0 ships fs operations via Tauri commands. Streams (`fs
 - `editor.save({ id })`
 - `editor.close({ id })`
 
-### `git.*` (Phase 5), `lsp.*` (Phase 4), `acp.*` (Phase 6), `term.*` (Phase 3), `lint.*` (Phase 8)
+### `git.*` (Phase 5), `lsp.*` (Phase 4), `coder.*` (Phase 6), `term.*` (Phase 3), `lint.*` (Phase 8)
 
 Defined per-phase. Each follows the same pattern: requests with structured params, streaming events for long-lived subscriptions.
 
@@ -45,7 +45,8 @@ Pushed by the core to the UI. In Tauri this maps to events; in remote mode to JS
 - `fs.event` — `{ subscriptionId, kind: 'create'|'modify'|'remove'|'rename', path }`
 - `lsp.diagnostics` (Phase 4)
 - `term.output` (Phase 3)
-- `acp.message` (Phase 6)
+- `coder.event` (Phase 6 — every loop event: `agent_start`, `turn_start`, `message_*`, `tool_execution_*`, `turn_end`, `agent_end`, `error`)
+- `coder.sync_state` (Phase 6 — bucket-sync status pip)
 
 ## Error model
 

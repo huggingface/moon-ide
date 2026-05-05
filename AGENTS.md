@@ -66,7 +66,7 @@ When the final roadmap phase lands and we declare a stable surface, this rule fl
 
 These are enforced by reviewers and CI; breaking them is a real bug:
 
-1. The UI never directly calls git, LSP, fs, ACP, or the terminal. Everything goes through the workspace core.
+1. The UI never directly calls git, LSP, fs, the coder / any LLM, or the terminal. Everything goes through the workspace core.
 2. Anything that does I/O on the workspace must go through the active `WorkspaceHost` so it works the same locally and inside a devcontainer.
 3. Container port forwarding is **explicit** — never auto-forward all listening ports.
 4. `crates/moon-protocol/` is the single source of truth for the JSON-RPC schema. UI types (in TS) are generated/synced from it; do not hand-edit divergent copies.

@@ -26,6 +26,7 @@ import { lspLanguageFor } from './editor/lspLanguage';
 import { bottomPanel } from './bottomPanel.svelte';
 import { composeLogs } from './composeLogs.svelte';
 import { terminal } from './terminal.svelte';
+import { coder } from './coder.svelte';
 import { container } from './container.svelte';
 import { canOpenContainerTerminal, openContainerTerminal, openHostTerminal } from './openTerminal';
 import { projectCompose } from './projectCompose.svelte';
@@ -747,6 +748,11 @@ class WorkspaceState {
 		// Tauri runtime is up. Idempotent — `wireRuntime` early-returns
 		// on subsequent calls (HMR-safe).
 		void slack.wireRuntime();
+		// Same pattern for the coder loop's `coder:event` channel.
+		// Bind even when the user hasn't opened the panel yet so
+		// that an in-flight turn (e.g. resumed across HMR reloads)
+		// keeps streaming into `coder.rows`.
+		void coder.wireRuntime();
 		// Same pattern for the container status pip — bind the
 		// `container:state` event subscription once, then pull the
 		// current snapshot for whatever workspace is open. Capture

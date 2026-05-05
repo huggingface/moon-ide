@@ -1,5 +1,5 @@
 [package]
-name = "moon-agent"
+name = "moon-remote"
 version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -7,7 +7,7 @@ license.workspace = true
 publish = false
 
 [[bin]]
-name = "moon-agent"
+name = "moon-remote"
 path = "src/main.rs"
 
 [dependencies]

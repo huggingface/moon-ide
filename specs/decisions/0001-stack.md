@@ -1,7 +1,7 @@
 # ADR 0001 — Stack
 
 Date: 2026-04-26
-Status: accepted
+Status: accepted (the "ACP-native" goal and `agent-client-protocol` line are superseded by [ADR 0010](0010-coder-rewrite-not-acp.md); everything else stands)
 
 ## Context
 

@@ -1,0 +1,23 @@
+[package]
+name = "moon-coder"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+moon-core = { workspace = true }
+moon-protocol = { workspace = true }
+
+async-trait = { workspace = true }
+camino = { workspace = true }
+keyring = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }

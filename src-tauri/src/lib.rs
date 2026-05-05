@@ -7,8 +7,11 @@ mod slack_poller;
 mod state;
 mod system_theme_watcher;
 
+use std::sync::Arc;
+
 use camino::Utf8PathBuf;
-use moon_core::app_state as core_app_state;
+use moon_coder::CoderHandle;
+use moon_core::{app_state as core_app_state, WorkspaceRegistry};
 use moon_slack::{SlackClient, TokenStore};
 use state::AppState;
 use tauri::{Manager, RunEvent};
@@ -99,6 +102,12 @@ pub fn run() {
 			commands::slack::slack_get_user,
 			commands::slack::slack_mark_read,
 			commands::slack::slack_post_message,
+			commands::coder::coder_status,
+			commands::coder::coder_start_device_flow,
+			commands::coder::coder_poll_device_code,
+			commands::coder::coder_sign_out,
+			commands::coder::coder_send,
+			commands::coder::coder_abort,
 		])
 		.setup(|app| {
 			let config_dir = app
@@ -138,7 +147,23 @@ pub fn run() {
 			// avoids a "welcome screen with a watcher attached to
 			// nothing" in-between state.
 			let fs_watcher = fs_watcher::spawn(app.handle().clone());
-			let state = AppState::new(config_dir.clone(), workspaces_dir, slack_state, fs_watcher);
+
+			// The coder loop and every other command share the same
+			// `WorkspaceRegistry` instance — without that, the agent
+			// would dispatch tools against an empty registry and
+			// every `read_file` would fail with `NoActiveFolder`.
+			let workspaces = Arc::new(WorkspaceRegistry::new());
+			let coder = CoderHandle::new(workspaces.clone()).map_err(|err| format!("could not init moon-coder: {err}"))?;
+			commands::coder::spawn_event_pump(app.handle().clone(), coder.clone());
+
+			let state = AppState::new(
+				config_dir.clone(),
+				workspaces_dir,
+				slack_state,
+				fs_watcher,
+				workspaces,
+				coder,
+			);
 
 			// Live OS colour-scheme tracking (Linux only — on macOS
 			// and Windows the webview's own `onThemeChanged` fires).

@@ -133,9 +133,10 @@ one model.
 - The old `specs/devcontainers.md` is replaced by
   [`specs/containers.md`](../containers.md). Its
   process-injection design (`docker cp` a static-musl
-  `moon-agent` into an arbitrary base image) is preserved as
-  the future `RemoteHost` story (SSH / Codespaces) but is not
-  what local containers do.
+  `moon-remote` into an arbitrary base image — see
+  [ADR 0011](0011-rename-moon-agent-to-moon-remote.md)) is
+  preserved as the future `RemoteHost` story (SSH /
+  Codespaces) but is not what local containers do.
 - The `WorkspaceHost::ContainerHost` impl uses bind-mount
   (filesystem ops are direct host I/O) plus `docker exec`
   (process / PTY ops). Simpler and faster than running an

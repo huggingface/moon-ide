@@ -687,6 +687,54 @@ export type ProjectComposeStateChange = {
 	project: ProjectComposeStatus;
 };
 
+/**
+ * Hugging Face user identity returned by `coder_status` and the
+ * device-flow completion. Mirrors `moon_coder::auth::HfIdentity`.
+ */
+export type HfIdentity = {
+	username: string;
+	name: string | null;
+	avatar_url: string | null;
+	email: string | null;
+};
+
+/**
+ * Device-code response from `coder_start_device_flow`. The frontend
+ * shows `user_code`, opens `verification_uri_complete` (falling back
+ * to `verification_uri`) in the system browser, then awaits
+ * `coder_poll_device_code`. Mirrors `moon_coder::auth::DeviceCode`.
+ */
+export type DeviceCode = {
+	user_code: string;
+	verification_uri: string;
+	verification_uri_complete: string | null;
+	expires_in: number;
+	interval: number;
+	device_code: string;
+};
+
+/** Snapshot returned by `coder_status`. Mirrors `moon_coder::CoderStatus`. */
+export type CoderStatus = {
+	signed_in: boolean;
+	identity: HfIdentity | null;
+	busy: boolean;
+};
+
+/**
+ * Tagged-union of agent-loop events emitted on the `coder:event`
+ * Tauri channel. Mirrors `moon_coder::CoderEvent`. The frontend
+ * builds its message list from the running stream — no REST replay,
+ * because 6.0 doesn't persist the session.
+ */
+export type CoderEvent =
+	| { kind: 'user_message'; id: string; text: string }
+	| { kind: 'assistant_message'; id: string; text: string }
+	| { kind: 'tool_call'; id: string; name: string; args: unknown }
+	| { kind: 'tool_result'; id: string; result: unknown; is_error: boolean }
+	| { kind: 'turn_complete' }
+	| { kind: 'aborted' }
+	| { kind: 'error'; message: string };
+
 export type MoonError =
 	| { code: 'NotFound'; message: string }
 	| { code: 'IoError'; message: string }

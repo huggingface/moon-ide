@@ -1,4 +1,5 @@
 pub mod app_state;
+pub mod coder;
 pub mod compose_logs;
 pub mod container;
 pub mod editorconfig;

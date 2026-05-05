@@ -1,7 +1,9 @@
 //! moon-core — workspace brain.
 //!
 //! Hosts the `WorkspaceHost` trait + implementations and the workspace registry.
-//! Linked into both the Tauri app (local mode) and `moon-agent` (in-container mode).
+//! Linked into both the Tauri app (local mode) and `moon-remote` (the future
+//! remote-host runtime). The in-process AI agent (`moon-coder`) drives this
+//! same trait via the host of the active folder.
 //!
 //! See [specs/architecture.md](../../../specs/architecture.md).
 

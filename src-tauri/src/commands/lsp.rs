@@ -12,8 +12,8 @@
 //! through `MoonError` and every parameter is forwarded to the broker
 //! unchanged. "No policy" is the policy. Path validation, language-id
 //! mapping, and graceful `NotAvailable` fallback all live in
-//! `moon_core::lsp` so `moon-agent` (remote mode) and the Tauri shell
-//! share the same behaviour.
+//! `moon_core::lsp` so `moon-remote` (future remote runtime) and the
+//! Tauri shell share the same behaviour.
 
 use camino::Utf8PathBuf;
 use moon_container::{Workspace as ContainerWorkspace, WorkspaceConfig};

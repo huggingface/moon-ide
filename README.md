@@ -7,7 +7,7 @@ A team-specialized IDE built from scratch by assembling best-in-class components
 - TypeScript-first (TS, Svelte, JSX/TSX, MD, JSON, CSS, HTML)
 - Native git-blame-on-hover
 - First-class linters/formatters: oxlint, oxfmt, prettier, eslint (+ plugins)
-- ACP-native: pluggable coding agents (opencode, claude code, pi code, cursor-agent, custom)
+- In-process coding agent ("coder"): Hugging Face Inference Providers via OAuth device-flow sign-in, container-aware tools, sessions backed by an HF private bucket
 - LSP nav (Ctrl+click, alt+left/right history)
 - Multi-repo workspaces with cross-repo agent queries
 - Containerised dev shells as a first-class concept: terminal/LSP/lint/format/build run in a single per-workspace container, only explicitly forwarded ports cross to the host
@@ -19,8 +19,8 @@ A team-specialized IDE built from scratch by assembling best-in-class components
 - Svelte 5 + TypeScript + Vite frontend
 - CodeMirror 6 editor
 - `@pierre/trees` (vanilla mode) for the file tree
-- Rust workspace: `moon-core` (shared), `moon-protocol` (JSON-RPC schema), `moon-slack` (Slack chat panel client), `moon-agent` (future remote-host agent — not used by the local-container path)
-- `gix` for git, `tantivy` for indexed search, `agent-client-protocol` for ACP
+- Rust workspace: `moon-core` (shared), `moon-protocol` (JSON-RPC schema), `moon-slack` (Slack chat panel client), `moon-coder` (in-process AI coding agent — Phase 6), `moon-remote` (future remote-host runtime for SSH / Codespaces — not used by the local-container path)
+- `gix` for git, `tantivy` for indexed search, `hf-xet` for the coder's session bucket sync
 
 See [specs/architecture.md](specs/architecture.md) for the high-level design and [specs/](specs/) for everything else.
 
@@ -31,10 +31,11 @@ See [specs/architecture.md](specs/architecture.md) for the high-level design and
 ├── src/                    Svelte 5 UI source
 ├── src-tauri/              Tauri shell (Rust main, capabilities, config)
 ├── crates/
-│   ├── moon-core/          Workspace ops, LSP mux, git, ACP host, indexer
+│   ├── moon-core/          Workspace ops, LSP mux, git, indexer
 │   ├── moon-protocol/      JSON-RPC schema shared by both ends
 │   ├── moon-slack/         Slack Web API client for the chat panel
-│   └── moon-agent/         Binary for the future remote-host story (SSH / Codespaces)
+│   ├── moon-coder/         In-process AI coding agent (Phase 6)
+│   └── moon-remote/        Binary for the future remote-host story (SSH / Codespaces)
 ├── specs/                  Living design docs
 ├── AGENTS.md               Instructions for AI coding agents working in this repo
 ├── Cargo.toml              Cargo workspace root

@@ -119,4 +119,4 @@ notes) lives in
 At a glance: file/image attachments, auto-scroll to the latest
 message, AI-generated session titles, OAuth flow that ships a
 moon-ide Slack app, local IDE context for the bot (that one
-belongs to ACP — Phase 6).
+belongs to the [coder panel](../coder.md) — Phase 6).
