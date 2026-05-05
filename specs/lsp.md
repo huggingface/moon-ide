@@ -146,7 +146,18 @@ In-container binary-path resolution lives in `moon_core::lsp::server::container_
 
 ### Client capabilities are minimal
 
-We only advertise what's wired up (`hover`, `completion`, `publishDiagnostics`, synchronisation). Adding a capability is a localised change: flip the flag in `server::initialize`, add the command in `commands/lsp.rs`, add the CM adapter in `src/lib/editor/lsp.ts`.
+We only advertise what's wired up (`hover`, `completion`, push + pull diagnostics, synchronisation). Adding a capability is a localised change: flip the flag in `server::initialize`, add the command in `commands/lsp.rs`, add the CM adapter in `src/lib/editor/lsp.ts`.
+
+### Diagnostics: push and pull, both feed one event
+
+LSP 3.17 carries two diagnostic delivery modes and we support both:
+
+- **Push** (`textDocument/publishDiagnostics`): the server fires unsolicited notifications whenever its analysis finishes. `rust-analyzer` and `typescript-language-server` use this. The notification pump in `lsp::server` translates the URI to a workspace-relative path and forwards a `LspServerEvent::Diagnostics` to the broker's broadcast channel.
+- **Pull** (`textDocument/diagnostic` request → `DocumentDiagnosticReport`): the client asks for the current report after every `didOpen` / `didChange`. We do this fire-and-forget from `LspServer::open` / `update`, on a detached task so the notification path doesn't wait. `tsgo` (`@typescript/native-preview`) [explicitly does not implement push diagnostics](https://github.com/microsoft/typescript-go/issues/2362) and only answers pull requests, which is the whole reason we wired this in.
+
+Servers that implement only one of the two are handled symmetrically: a push-only server returns `MethodNotFound` (-32601) for the pull request and we drop the error at debug; a pull-only server simply never sends `publishDiagnostics`. Both paths feed the **same** `LspServerEvent::Diagnostics` event, and the frontend's `lsp:diagnostics` listener doesn't care which mode produced any given report.
+
+The `result_id` round-trip from a previous pull (which would let a server reply `Unchanged` and skip resending unmodified diagnostics) is not threaded through yet — we always fire a fresh full pull. Extension slot when latency starts to matter; today the per-request cost is negligible compared to the type-check itself.
 
 ### Go-to-definition is Ctrl/Cmd-click + a link-preview hover
 
@@ -191,7 +202,7 @@ tsserver issues `workspace/configuration`, `window/workDoneProgress/create`, and
 
 Two Tauri events, both keyed by language-agnostic payloads so the UI doesn't need a per-language dispatch:
 
-- **`lsp:diagnostics`** — `LspDiagnosticsEvent { path, diagnostics: [] }`. Full replacement. Every `textDocument/publishDiagnostics` notification from any running server becomes one of these.
+- **`lsp:diagnostics`** — `LspDiagnosticsEvent { path, diagnostics: [] }`. Full replacement. Either a `textDocument/publishDiagnostics` notification from a push-mode server _or_ a `Full` `DocumentDiagnosticReport` returned by a pull-mode server (see "Diagnostics: push and pull" above) becomes one of these — the frontend can't tell the modes apart and shouldn't have to.
 - **`lsp:status`** — `LspStatusEvent { languageId, status, detail? }`. Emitted on every server-state transition (spawn attempt, initialise success, crash, shutdown). The UI caches the latest per language id and only renders the pill when the status is anything other than `running`.
 
 ## Frontend architecture

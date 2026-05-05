@@ -143,6 +143,11 @@ pub struct LspServer {
 	// increasing versions per didChange to detect out-of-order
 	// updates; we start at 1 on open and tick each change.
 	docs: Mutex<HashMap<String, DocState>>,
+	/// Fan-out sink the server uses to publish its own events
+	/// (diagnostics, status changes). Cloned from the broker's
+	/// channel so the pull-diagnostics task can shove `LspDiagnostics`
+	/// events directly through the same surface as the push pump.
+	events: broadcast::Sender<LspServerEvent>,
 }
 
 /// Bridge between host-relative workspace paths and the
@@ -286,6 +291,7 @@ impl LspServer {
 			child: Mutex::new(Some(child)),
 			translator,
 			docs: Mutex::new(HashMap::new()),
+			events: events.clone(),
 		});
 
 		// Notification pump: translate the ones we care about,
@@ -294,6 +300,14 @@ impl LspServer {
 		// actually surface them.
 		let server_ref = server.clone();
 		let events_sink = events.clone();
+		// Push-diagnostics path. Most LSP servers (rust-analyzer,
+		// typescript-language-server) deliver `publishDiagnostics`
+		// notifications unsolicited; we forward them straight through.
+		// `tsgo` (TypeScript native preview) deliberately does not
+		// implement push diagnostics — see
+		// <https://github.com/microsoft/typescript-go/issues/2362> —
+		// so it relies on the pull path below (`pull_diagnostics`)
+		// driven by `update` after every `didOpen` / `didChange`.
 		tokio::spawn(async move {
 			while let Ok(notif) = notif_rx.recv().await {
 				if notif.method.as_str() != "textDocument/publishDiagnostics" {
@@ -374,6 +388,17 @@ impl LspServer {
 					context_support: Some(true),
 					..Default::default()
 				}),
+				// LSP 3.17 pull-diagnostics. We declare support so
+				// servers that prefer pull (notably `tsgo`, which
+				// deliberately skips `publishDiagnostics`) know we'll
+				// call `textDocument/diagnostic` ourselves after
+				// every `didOpen` / `didChange`. Servers that only
+				// support push (e.g. `rust-analyzer`) ignore this
+				// flag and keep delivering notifications.
+				diagnostic: Some(lt::DiagnosticClientCapabilities {
+					dynamic_registration: Some(false),
+					related_document_support: Some(false),
+				}),
 				..Default::default()
 			}),
 			..Default::default()
@@ -415,14 +440,16 @@ impl LspServer {
 	/// the same path is routed as a change — editors that reopen
 	/// a closed tab expect the server to pick up where they left
 	/// off, not crash on a duplicate open.
-	pub async fn open(&self, rel_path: &str, text: String, language_id: &str) -> Result<(), LspClientError> {
+	pub async fn open(self: &Arc<Self>, rel_path: &str, text: String, language_id: &str) -> Result<(), LspClientError> {
 		let mut docs = self.docs.lock().await;
 		let uri = self.relative_to_uri(rel_path);
 		if let Some(state) = docs.get_mut(rel_path) {
 			state.version += 1;
 			let version = state.version;
 			drop(docs);
-			return self.apply_change(&uri, version, text).await;
+			self.apply_change(&uri, version, text).await?;
+			self.spawn_pull_diagnostics(rel_path);
+			return Ok(());
 		}
 		let version = 1;
 		let params = lt::DidOpenTextDocumentParams {
@@ -435,10 +462,12 @@ impl LspServer {
 		};
 		docs.insert(rel_path.to_owned(), DocState { version });
 		drop(docs);
-		self.client.notify("textDocument/didOpen", params).await
+		self.client.notify("textDocument/didOpen", params).await?;
+		self.spawn_pull_diagnostics(rel_path);
+		Ok(())
 	}
 
-	pub async fn update(&self, rel_path: &str, text: String) -> Result<(), LspClientError> {
+	pub async fn update(self: &Arc<Self>, rel_path: &str, text: String) -> Result<(), LspClientError> {
 		let mut docs = self.docs.lock().await;
 		let state = match docs.get_mut(rel_path) {
 			Some(s) => s,
@@ -452,7 +481,92 @@ impl LspServer {
 		let version = state.version;
 		let uri = self.relative_to_uri(rel_path);
 		drop(docs);
-		self.apply_change(&uri, version, text).await
+		self.apply_change(&uri, version, text).await?;
+		self.spawn_pull_diagnostics(rel_path);
+		Ok(())
+	}
+
+	/// Fire `textDocument/diagnostic` for `rel_path` in a detached
+	/// task. Callers don't await — the pull is best-effort and must
+	/// not block the originating `didOpen` / `didChange` notification
+	/// path. Servers that don't implement pull diagnostics return
+	/// `MethodNotFound`, which we silently ignore (push diagnostics
+	/// are the fallback for those servers).
+	///
+	/// The `result_id` round-trip from a previous pull is **not**
+	/// threaded through yet; servers that reuse it gain "did anything
+	/// change since last pull?" caching, but for our minimal slice
+	/// the unconditional full pull keeps the implementation small —
+	/// extension slot when latency matters.
+	fn spawn_pull_diagnostics(self: &Arc<Self>, rel_path: &str) {
+		let server = Arc::clone(self);
+		let path = rel_path.to_owned();
+		tokio::spawn(async move {
+			if let Err(err) = server.pull_diagnostics(&path).await {
+				// `MethodNotFound` (-32601) from servers that don't
+				// implement pull is the expected fallback path for
+				// `rust-analyzer` and any other push-only server;
+				// quiet at debug rather than warn-spam every save.
+				match &err {
+					LspClientError::Rpc(rpc) if rpc.code == -32601 => {
+						tracing::debug!(path = %path, "lsp: pull diagnostics unsupported (push-only server)");
+					}
+					_ => {
+						tracing::debug!(path = %path, %err, "lsp: pull diagnostics failed");
+					}
+				}
+			}
+		});
+	}
+
+	async fn pull_diagnostics(&self, rel_path: &str) -> Result<(), LspClientError> {
+		let uri = self.relative_to_uri(rel_path);
+		// Hand-shaped params instead of `lt::DocumentDiagnosticParams`:
+		// `lsp-types`'s definition serialises `Option::None` as
+		// `null`, but tsgo's Go-side protobuf decoder rejects that
+		// for the `identifier` and `previousResultId` fields with
+		// "null value is not allowed for field". The LSP spec says
+		// these are optional and absent ≠ null; we serialise with
+		// `skip_serializing_if` to honour that.
+		#[derive(serde::Serialize)]
+		#[serde(rename_all = "camelCase")]
+		struct DiagnosticParams<'a> {
+			text_document: &'a lt::TextDocumentIdentifier,
+			#[serde(skip_serializing_if = "Option::is_none")]
+			identifier: Option<&'a str>,
+			#[serde(skip_serializing_if = "Option::is_none")]
+			previous_result_id: Option<&'a str>,
+		}
+		let text_document = lt::TextDocumentIdentifier { uri };
+		let params = DiagnosticParams {
+			text_document: &text_document,
+			identifier: None,
+			previous_result_id: None,
+		};
+		let resp: lt::DocumentDiagnosticReportResult = self.client.request("textDocument/diagnostic", params).await?;
+		let items = match resp {
+			lt::DocumentDiagnosticReportResult::Report(lt::DocumentDiagnosticReport::Full(full)) => {
+				full.full_document_diagnostic_report.items
+			}
+			// `Unchanged` means the server has nothing new to say
+			// since the last pull — we keep whatever the UI is
+			// currently showing instead of clobbering it.
+			lt::DocumentDiagnosticReportResult::Report(lt::DocumentDiagnosticReport::Unchanged(_)) => {
+				return Ok(());
+			}
+			// Streaming response; we don't wire the partial-result
+			// channel today. Servers can fall back to a single
+			// `Full` payload, which the branch above handles.
+			lt::DocumentDiagnosticReportResult::Partial(_) => {
+				return Ok(());
+			}
+		};
+		let diagnostics = items.into_iter().map(translate::diagnostic).collect();
+		let _ = self.events.send(LspServerEvent::Diagnostics(mp::LspDiagnosticsEvent {
+			path: rel_path.to_owned(),
+			diagnostics,
+		}));
+		Ok(())
 	}
 
 	async fn apply_change(&self, uri: &lt::Uri, version: i32, text: String) -> Result<(), LspClientError> {

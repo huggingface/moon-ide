@@ -909,6 +909,25 @@ class WorkspaceState {
 					fs.openFiles = loaded;
 					fs.leftTabs = folderSession.open_files_left.filter(isLoaded);
 					fs.rightTabs = folderSession.open_files_right.filter(isLoaded);
+					// `openFile` would normally call `lspOpen` on the
+					// first load, but session restore writes
+					// `openFiles` directly to skip the per-file IPC
+					// roundtrip. Without this catch-up loop the LSP
+					// broker would never see `didOpen` for restored
+					// buffers — the user would have to close + reopen
+					// each tab before diagnostics started arriving.
+					// Only the active folder's restore wires up the
+					// LSP because the `LspBroker` is rooted at the
+					// active folder, not the whole workspace; inactive
+					// folders' files are loaded into memory but their
+					// LSPs spawn lazily on the first folder switch.
+					if (folder.path === ws.active_folder) {
+						for (const file of loaded) {
+							if (file.kind === 'text' && !file.isDeleted) {
+								this.lspOpen(file.path, file.text);
+							}
+						}
+					}
 					const isOpenIn = (side: SplitSide, p: string | null) =>
 						p !== null && (side === 'left' ? fs.leftTabs.includes(p) : fs.rightTabs.includes(p));
 					fs.leftActive = isOpenIn('left', folderSession.active_left)
