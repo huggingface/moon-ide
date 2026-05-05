@@ -107,6 +107,11 @@ pub fn run() {
 			commands::coder::coder_sign_out,
 			commands::coder::coder_send,
 			commands::coder::coder_abort,
+			commands::coder::coder_list_sessions,
+			commands::coder::coder_active_session,
+			commands::coder::coder_new_session,
+			commands::coder::coder_open_session,
+			commands::coder::coder_delete_session,
 			commands::ui::ui_set_right_panel,
 		])
 		.setup(|app| {

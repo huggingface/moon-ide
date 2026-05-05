@@ -1,20 +1,25 @@
 //! The agent loop.
 //!
 //! `Coder` owns the in-memory session, the inference client, the
-//! tool registry, and the cancellation handle for the active turn.
-//! All UI-facing state changes happen via [`CoderEvent`] pushes on
-//! the broadcast channel the Tauri layer subscribes to.
+//! tool registry, the cancellation handle for the active turn, and
+//! the per-workspace session-storage layer. UI-facing state changes
+//! happen via [`CoderEvent`] pushes on the broadcast channel the
+//! Tauri layer subscribes to.
 //!
 //! Loop shape (see `specs/coder.md` § Loop shape):
 //!
-//! 1. Append the user message to `messages`.
-//! 2. POST `chat/completions` with `messages` + tool defs.
+//! 1. Append the user message to `messages` + the JSONL session.
+//! 2. Stream `chat/completions` and emit `assistant_message_*`
+//!    events as deltas land.
 //! 3. If the response has tool calls, dispatch each via
 //!    [`ToolRegistry`], append the assistant message + tool result
-//!    messages to `messages`, loop.
+//!    messages to `messages` + the JSONL session, loop.
 //! 4. If the response is text-only, append the assistant message,
 //!    emit `TurnComplete`, exit.
-//! 5. Cap iterations at [`MAX_TURN_ITERATIONS`] so a misbehaving
+//! 5. After the *first* successful turn, kick off an
+//!    auto-rename pass that asks the fast model for a 4-6 word
+//!    title and persists it.
+//! 6. Cap iterations at [`MAX_TURN_ITERATIONS`] so a misbehaving
 //!    model can't run forever.
 
 use std::sync::Arc;
@@ -26,10 +31,14 @@ use tokio::sync::{broadcast, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::{Authenticator, DeviceCode, HfIdentity};
-use crate::defaults::{DEFAULT_LARGE_MODEL, MAX_TURN_ITERATIONS, PHASE_6_0_SYSTEM_PROMPT};
+use crate::defaults::{DEFAULT_FAST_MODEL, DEFAULT_LARGE_MODEL, MAX_TURN_ITERATIONS, PHASE_6_0_SYSTEM_PROMPT};
 use crate::error::CoderError;
 use crate::event::{CoderEvent, CoderStatus};
 use crate::inference::{AssistantResponse, ChatMessage, FunctionCall, InferenceClient, StreamEvent};
+use crate::sessions::{
+	self, current_time_ms, new_session_id, session_title_from_prompt, LoadedSession, SessionHeader, SessionRecord,
+	SessionSummary, SESSION_SCHEMA_VERSION,
+};
 use crate::tools::ToolRegistry;
 
 /// Capacity for the broadcast channel the Tauri layer subscribes to.
@@ -63,8 +72,6 @@ struct CoderState {
 	/// lives (`<workspaces_dir>/<workspace_id>/compose.yaml`). Used
 	/// by [`crate::tools::resolve_bash_target`] to ask
 	/// `moon_container::Workspace` whether the container is running.
-	/// Same path AppState computes once at startup and `lsp.rs`
-	/// already consumes — see [`AppState::workspace_state_dir`].
 	workspaces_dir: Utf8PathBuf,
 }
 
@@ -77,18 +84,66 @@ struct TurnState {
 	cancel: Option<CancellationToken>,
 }
 
-/// In-memory session. 6.0 holds one session for the lifetime of the
-/// process; persistence + multi-session land in 6.3.
+/// In-memory session. Per AGENTS.md "no premature migrations" we
+/// keep one active session at a time; switching to another
+/// session is "open it, replace this struct's contents".
 struct Session {
+	/// Per-session metadata. The header is in memory from the
+	/// moment the session is created; it lands on disk only after
+	/// the first record append (lazy persist, see `sessions.rs`).
+	header: SessionHeader,
+	/// Workspace folder root the session is bound to. `None` for
+	/// a fresh session that hasn't been associated with a folder
+	/// yet (the binding happens on first `send`, taking the
+	/// active folder at that moment). Without it we can't write
+	/// to disk and `list_sessions` won't see the file.
+	folder_root: Option<Utf8PathBuf>,
+	/// The full chat history sent to the model. Always starts
+	/// with the system prompt; everything else appends in turn
+	/// order. The system prompt is **not** persisted — re-opening
+	/// a session re-adds the current default at load time, so
+	/// prompt updates between releases apply retroactively.
 	messages: Vec<ChatMessage>,
+	/// Records appended since session start. Mirrors `messages`
+	/// minus the system prompt; kept separately so writing a new
+	/// JSONL file when persisting a previously-empty session
+	/// doesn't have to filter `messages`.
+	persisted_records: u32,
+	/// `true` until the auto-rename pass has run (or been skipped
+	/// because the model failed). Avoids re-renaming on every
+	/// subsequent turn.
+	auto_rename_pending: bool,
 }
 
 impl Session {
-	fn new() -> Self {
+	/// Make a fresh session shell — id allocated, title empty
+	/// pending the first prompt, no folder bound.
+	fn new_blank() -> Self {
+		let now = current_time_ms();
 		Self {
+			header: SessionHeader {
+				schema: SESSION_SCHEMA_VERSION,
+				id: new_session_id(),
+				title: String::new(),
+				created_at_ms: now,
+				updated_at_ms: now,
+				model: DEFAULT_LARGE_MODEL.to_string(),
+			},
+			folder_root: None,
 			messages: vec![ChatMessage::System {
 				content: PHASE_6_0_SYSTEM_PROMPT.to_string(),
 			}],
+			persisted_records: 0,
+			auto_rename_pending: false,
+		}
+	}
+
+	fn summary(&self) -> SessionSummary {
+		SessionSummary {
+			id: self.header.id.clone(),
+			title: self.header.title.clone(),
+			created_at_ms: self.header.created_at_ms,
+			updated_at_ms: self.header.updated_at_ms,
 		}
 	}
 }
@@ -110,7 +165,7 @@ impl CoderHandle {
 				tools,
 				events,
 				turn: Arc::new(Mutex::new(TurnState::default())),
-				session: Arc::new(Mutex::new(Session::new())),
+				session: Arc::new(Mutex::new(Session::new_blank())),
 				workspaces,
 				workspaces_dir,
 			}),
@@ -154,9 +209,151 @@ impl CoderHandle {
 		self.abort_inner().await;
 		self.state.auth.sign_out().await?;
 		// Reset the in-memory session — a re-sign-in is conceptually
-		// a fresh conversation. Keeps the panel simple (no leftover
-		// "[user] hi" from a previous user when account-switching).
-		*self.state.session.lock().await = Session::new();
+		// a fresh conversation. On-disk sessions are untouched (they
+		// belong to the workspace, not the user identity).
+		*self.state.session.lock().await = Session::new_blank();
+		Ok(())
+	}
+
+	/// Snapshot of the active session. `None` when the session is
+	/// blank (no user message yet) — the panel uses this to render
+	/// the empty / "send your first message" state.
+	pub async fn active_session(&self) -> Option<SessionSummary> {
+		let session = self.state.session.lock().await;
+		if session.header.title.is_empty() && session.persisted_records == 0 {
+			return None;
+		}
+		Some(session.summary())
+	}
+
+	/// List sessions on disk for the active workspace folder.
+	/// Empty when the folder has none — including when no folder
+	/// is active at all (chat-only sessions aren't supported).
+	pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, CoderError> {
+		let Some(folder) = self.state.workspaces.active_folder().await else {
+			return Ok(Vec::new());
+		};
+		let root = Utf8PathBuf::from(folder.folder.path.clone());
+		sessions::list_sessions(&root).await
+	}
+
+	/// Discard the current in-memory session and start a blank
+	/// one. Doesn't touch disk — empty sessions never get a file
+	/// in the first place. Returns the new session's metadata so
+	/// the panel can reference it before the first send.
+	pub async fn new_session(&self) -> Result<SessionSummary, CoderError> {
+		self.abort_inner().await;
+		let mut session = self.state.session.lock().await;
+		*session = Session::new_blank();
+		let summary = session.summary();
+		drop(session);
+		// Empty sessions don't fire `SessionLoaded` (frontend
+		// reconciles to "blank state" on its own), but the list
+		// hasn't actually changed either — no disk impact yet.
+		Ok(summary)
+	}
+
+	/// Replace the active session with the persisted one
+	/// identified by `id` under the active workspace folder.
+	/// Replays the JSONL records as live events so the panel's
+	/// existing event handlers populate the transcript without a
+	/// special "loaded" code path beyond the initial reset.
+	pub async fn open_session(&self, id: String) -> Result<SessionSummary, CoderError> {
+		sessions::validate_session_id(&id)?;
+		let folder = self
+			.state
+			.workspaces
+			.active_folder()
+			.await
+			.ok_or(CoderError::NoActiveFolder)?;
+		let root = Utf8PathBuf::from(folder.folder.path.clone());
+		let LoadedSession { header, records } = sessions::load(&root, &id).await?;
+
+		self.abort_inner().await;
+		let mut messages: Vec<ChatMessage> = vec![ChatMessage::System {
+			content: PHASE_6_0_SYSTEM_PROMPT.to_string(),
+		}];
+		// Reconstruct the chat history from the persisted records.
+		// Tool messages need to know their `tool_call_id`, which
+		// the persisted Assistant record carries verbatim — we
+		// echo it onto the rebuilt `ChatMessage::Tool`.
+		for record in &records {
+			match record {
+				SessionRecord::User { text } => {
+					messages.push(ChatMessage::User { content: text.clone() });
+				}
+				SessionRecord::Assistant {
+					content,
+					tool_calls,
+					thinking: _,
+				} => {
+					messages.push(ChatMessage::Assistant {
+						content: content.clone(),
+						tool_calls: tool_calls.clone(),
+					});
+				}
+				SessionRecord::Tool { tool_call_id, content } => {
+					messages.push(ChatMessage::Tool {
+						tool_call_id: tool_call_id.clone(),
+						content: content.clone(),
+					});
+				}
+				SessionRecord::TitleUpdate { .. } => {}
+			}
+		}
+		let summary = SessionSummary {
+			id: header.id.clone(),
+			title: header.title.clone(),
+			created_at_ms: header.created_at_ms,
+			updated_at_ms: header.updated_at_ms,
+		};
+		let session = Session {
+			header,
+			folder_root: Some(root),
+			messages,
+			persisted_records: records.len() as u32,
+			auto_rename_pending: false,
+		};
+		*self.state.session.lock().await = session;
+
+		// Tell the panel to clear + reload, then fan out the
+		// records as the same events a live turn would emit.
+		// `SessionLoaded` carries the metadata so the sticky
+		// header doesn't need a follow-up IPC round trip.
+		let _ = self.state.events.send(CoderEvent::SessionLoaded {
+			id: summary.id.clone(),
+			title: summary.title.clone(),
+			created_at_ms: summary.created_at_ms,
+			updated_at_ms: summary.updated_at_ms,
+		});
+		for record in records {
+			emit_replay_events(&self.state.events, record);
+		}
+		Ok(summary)
+	}
+
+	/// Delete a persisted session under the active workspace
+	/// folder. Idempotent. If the deleted session is the one
+	/// currently mounted in memory, replace the in-memory session
+	/// with a blank one and emit `SessionLoaded` for it so the
+	/// panel resets.
+	pub async fn delete_session(&self, id: String) -> Result<(), CoderError> {
+		sessions::validate_session_id(&id)?;
+		let folder = self
+			.state
+			.workspaces
+			.active_folder()
+			.await
+			.ok_or(CoderError::NoActiveFolder)?;
+		let root = Utf8PathBuf::from(folder.folder.path.clone());
+		sessions::delete(&root, &id).await?;
+		{
+			let mut session = self.state.session.lock().await;
+			if session.header.id == id {
+				*session = Session::new_blank();
+			}
+		}
+		let _ = self.state.events.send(CoderEvent::SessionListChanged);
 		Ok(())
 	}
 
@@ -175,6 +372,13 @@ impl CoderHandle {
 		if !self.state.auth.has_valid_session().await {
 			return Err(CoderError::NotSignedIn);
 		}
+		let folder = self
+			.state
+			.workspaces
+			.active_folder()
+			.await
+			.ok_or(CoderError::NoActiveFolder)?;
+		let folder_root = Utf8PathBuf::from(folder.folder.path.clone());
 
 		let cancel = CancellationToken::new();
 		{
@@ -182,12 +386,67 @@ impl CoderHandle {
 			turn.cancel = Some(cancel.clone());
 		}
 
-		let user_id = new_message_id();
+		// Bind / prep the session: first `send` allocates the
+		// title and locks the folder; subsequent sends just append.
+		let (auto_rename_after, summary_to_announce) = {
+			let mut session = self.state.session.lock().await;
+			let needs_loaded_event = session.header.title.is_empty() && session.persisted_records == 0;
+			if session.folder_root.is_none() {
+				session.folder_root = Some(folder_root.clone());
+			}
+			if session.header.title.is_empty() {
+				session.header.title = session_title_from_prompt(&text);
+				session.auto_rename_pending = true;
+			}
+			session.header.updated_at_ms = current_time_ms();
+			let auto_rename = session.auto_rename_pending;
+			let summary = if needs_loaded_event {
+				Some(session.summary())
+			} else {
+				None
+			};
+			(auto_rename, summary)
+		};
+		if let Some(summary) = summary_to_announce {
+			// Fresh session graduating to "first message landed".
+			// Tell the UI so the sticky header switches from
+			// "untitled" → the truncated prompt and the sessions
+			// list picks it up.
+			let _ = self.state.events.send(CoderEvent::SessionLoaded {
+				id: summary.id.clone(),
+				title: summary.title.clone(),
+				created_at_ms: summary.created_at_ms,
+				updated_at_ms: summary.updated_at_ms,
+			});
+			let _ = self.state.events.send(CoderEvent::SessionListChanged);
+		}
+
+		// Append the user message to in-memory chat history + the
+		// session JSONL. The disk write is best-effort: a failure
+		// only loses the user's prompt from the saved transcript,
+		// the in-memory turn proceeds.
 		{
 			let mut session = self.state.session.lock().await;
 			session.messages.push(ChatMessage::User { content: text.clone() });
+			let header = session.header.clone();
+			let root = session
+				.folder_root
+				.clone()
+				.expect("folder_root set above before this point");
+			drop(session);
+			if let Err(err) = sessions::append_record(&root, &header, &SessionRecord::User { text: text.clone() }).await {
+				tracing::warn!(error = %err, "failed to persist user message");
+			} else {
+				let mut session = self.state.session.lock().await;
+				session.persisted_records = session.persisted_records.saturating_add(1);
+			}
 		}
-		let _ = self.state.events.send(CoderEvent::UserMessage { id: user_id, text });
+
+		let user_id = new_message_id();
+		let _ = self.state.events.send(CoderEvent::UserMessage {
+			id: user_id,
+			text: text.clone(),
+		});
 
 		let state = self.state.clone();
 		let cancel_outer = cancel.clone();
@@ -197,6 +456,9 @@ impl CoderHandle {
 			match result {
 				Ok(()) => {
 					let _ = state.events.send(CoderEvent::TurnComplete);
+					if auto_rename_after {
+						spawn_auto_rename(state.clone());
+					}
 				}
 				Err(CoderError::Aborted) => {
 					let _ = state.events.send(CoderEvent::Aborted);
@@ -300,6 +562,7 @@ async fn run_turn(state: &Arc<CoderState>, cancel: CancellationToken) -> Result<
 			.await?;
 
 		state.session.lock().await.messages.push(response_to_message(&response));
+		persist_assistant_record(state, &response).await;
 
 		// Always emit `End` *if* we ever started a bubble; otherwise
 		// the frontend would be stuck with an empty placeholder.
@@ -352,21 +615,24 @@ async fn run_turn(state: &Arc<CoderState>, cancel: CancellationToken) -> Result<
 					});
 					state.session.lock().await.messages.push(ChatMessage::Tool {
 						tool_call_id: call.id.clone(),
-						content,
+						content: content.clone(),
 					});
+					persist_tool_record(state, &call.id, &content).await;
 				}
 				Err(CoderError::Aborted) => return Err(CoderError::Aborted),
 				Err(err) => {
 					let payload = serde_json::json!({ "error": err.to_string() });
+					let content = payload.to_string();
 					let _ = state.events.send(CoderEvent::ToolResult {
 						id: call.id.clone(),
-						result: payload.clone(),
+						result: payload,
 						is_error: true,
 					});
 					state.session.lock().await.messages.push(ChatMessage::Tool {
 						tool_call_id: call.id.clone(),
-						content: payload.to_string(),
+						content: content.clone(),
 					});
+					persist_tool_record(state, &call.id, &content).await;
 				}
 			}
 		}
@@ -381,6 +647,256 @@ async fn run_turn(state: &Arc<CoderState>, cancel: CancellationToken) -> Result<
 		"loop iteration cap reached ({})",
 		MAX_TURN_ITERATIONS
 	)))
+}
+
+/// Append an `Assistant` record to the active session's JSONL.
+/// Best-effort: a write failure logs but doesn't fail the turn.
+async fn persist_assistant_record(state: &Arc<CoderState>, response: &AssistantResponse) {
+	let (root, header) = {
+		let session = state.session.lock().await;
+		let Some(root) = session.folder_root.clone() else {
+			return;
+		};
+		(root, session.header.clone())
+	};
+	let record = SessionRecord::Assistant {
+		content: response.content.clone(),
+		thinking: response.thinking.clone(),
+		tool_calls: response.tool_calls.clone(),
+	};
+	if let Err(err) = sessions::append_record(&root, &header, &record).await {
+		tracing::warn!(error = %err, "failed to persist assistant message");
+		return;
+	}
+	let mut session = state.session.lock().await;
+	session.persisted_records = session.persisted_records.saturating_add(1);
+}
+
+async fn persist_tool_record(state: &Arc<CoderState>, tool_call_id: &str, content: &str) {
+	let (root, header) = {
+		let session = state.session.lock().await;
+		let Some(root) = session.folder_root.clone() else {
+			return;
+		};
+		(root, session.header.clone())
+	};
+	let record = SessionRecord::Tool {
+		tool_call_id: tool_call_id.to_string(),
+		content: content.to_string(),
+	};
+	if let Err(err) = sessions::append_record(&root, &header, &record).await {
+		tracing::warn!(error = %err, "failed to persist tool result");
+		return;
+	}
+	let mut session = state.session.lock().await;
+	session.persisted_records = session.persisted_records.saturating_add(1);
+}
+
+/// Spawn the post-first-turn auto-rename pass. Calls the fast
+/// model with a tight prompt asking for a 4-6 word title, then
+/// persists the result via a `TitleUpdate` record + a
+/// `SessionTitleUpdated` event. Failures are logged at info level
+/// — the truncated-prompt title is a perfectly serviceable
+/// fallback.
+fn spawn_auto_rename(state: Arc<CoderState>) {
+	tokio::spawn(async move {
+		// Snapshot the chat history without holding the session
+		// lock across the LLM call — turns / aborts must be able
+		// to grab it freely while we wait on the network.
+		let (root, header_snapshot, transcript) = {
+			let mut session = state.session.lock().await;
+			session.auto_rename_pending = false;
+			let Some(root) = session.folder_root.clone() else {
+				return;
+			};
+			(root, session.header.clone(), summarise_transcript(&session.messages))
+		};
+		if transcript.is_empty() {
+			return;
+		}
+		let messages = vec![
+			ChatMessage::System {
+				content: AUTO_RENAME_SYSTEM_PROMPT.to_string(),
+			},
+			ChatMessage::User { content: transcript },
+		];
+		let cancel = CancellationToken::new();
+		let response = match state
+			.inference
+			.chat_completion(DEFAULT_FAST_MODEL, &messages, &[], &cancel)
+			.await
+		{
+			Ok(resp) => resp,
+			Err(err) => {
+				tracing::info!(error = %err, "auto-rename: fast-model call failed; keeping fallback title");
+				return;
+			}
+		};
+		let Some(raw_title) = response.content else {
+			return;
+		};
+		let new_title = sanitise_auto_title(&raw_title);
+		if new_title.is_empty() {
+			return;
+		}
+		// Re-check: the user might have opened a different
+		// session while we were waiting on the model. Only apply
+		// when the active session is still the one we started.
+		let mut session = state.session.lock().await;
+		if session.header.id != header_snapshot.id {
+			return;
+		}
+		if session.header.title == new_title {
+			return;
+		}
+		session.header.title = new_title.clone();
+		session.header.updated_at_ms = current_time_ms();
+		let header_for_disk = session.header.clone();
+		drop(session);
+		if let Err(err) = sessions::append_record(
+			&root,
+			&header_for_disk,
+			&SessionRecord::TitleUpdate {
+				title: new_title.clone(),
+			},
+		)
+		.await
+		{
+			tracing::warn!(error = %err, "auto-rename: failed to persist new title");
+			return;
+		}
+		let _ = state.events.send(CoderEvent::SessionTitleUpdated {
+			id: header_for_disk.id,
+			title: new_title,
+		});
+		let _ = state.events.send(CoderEvent::SessionListChanged);
+	});
+}
+
+/// One-shot system prompt for the auto-rename pass. Kept tight on
+/// purpose — we want a flat string, not a paragraph of preamble.
+const AUTO_RENAME_SYSTEM_PROMPT: &str = "You are a title generator. Given a short transcript of one turn between a user and a coding assistant, return a 4 to 6 word title for the conversation. Output the title only, with no quotes, no period, no markdown, and no preamble.";
+
+/// Cheap projection of `messages` for the rename pass: collapse
+/// everything to plain "user: …" / "assistant: …" lines, capped
+/// to a few thousand chars so we don't pass an entire turn's
+/// worth of tool I/O to the fast model.
+fn summarise_transcript(messages: &[ChatMessage]) -> String {
+	const TRANSCRIPT_MAX_CHARS: usize = 4_000;
+	let mut out = String::new();
+	for msg in messages {
+		match msg {
+			ChatMessage::System { .. } => continue,
+			ChatMessage::User { content } => {
+				out.push_str("user: ");
+				out.push_str(content);
+				out.push('\n');
+			}
+			ChatMessage::Assistant { content, .. } => {
+				if let Some(text) = content {
+					out.push_str("assistant: ");
+					out.push_str(text);
+					out.push('\n');
+				}
+			}
+			ChatMessage::Tool { .. } => continue,
+		}
+		if out.len() >= TRANSCRIPT_MAX_CHARS {
+			break;
+		}
+	}
+	if out.len() > TRANSCRIPT_MAX_CHARS {
+		let mut idx = TRANSCRIPT_MAX_CHARS;
+		while idx > 0 && !out.is_char_boundary(idx) {
+			idx -= 1;
+		}
+		out.truncate(idx);
+	}
+	out
+}
+
+/// Strip the rough edges off an LLM-generated title — surrounding
+/// quotes, trailing punctuation, leading list bullets — and cap
+/// length. We don't try to translate ALL CAPS to title case; the
+/// model picks its own style and that's fine.
+fn sanitise_auto_title(raw: &str) -> String {
+	const MAX_CHARS: usize = 80;
+	let trimmed = raw.trim();
+	let trimmed = trimmed.trim_matches(|c: char| c == '"' || c == '\'' || c == '`' || c == '*');
+	let trimmed = trimmed.trim_end_matches(['.', ',', ':', ';']);
+	let collapsed = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+	if collapsed.chars().count() <= MAX_CHARS {
+		return collapsed;
+	}
+	let mut out: String = collapsed.chars().take(MAX_CHARS).collect();
+	out.push('…');
+	out
+}
+
+/// Re-emit the events the panel would have seen for one persisted
+/// session record. Fires assistant content as one final
+/// (Start, End) pair — no per-token replay, since the user has
+/// already seen it stream and we don't have the original timing.
+fn emit_replay_events(events: &broadcast::Sender<CoderEvent>, record: SessionRecord) {
+	match record {
+		SessionRecord::User { text } => {
+			let _ = events.send(CoderEvent::UserMessage {
+				id: new_message_id(),
+				text,
+			});
+		}
+		SessionRecord::Assistant {
+			content,
+			thinking,
+			tool_calls,
+		} => {
+			let id = new_message_id();
+			let has_text = content.as_deref().map(|t| !t.is_empty()).unwrap_or(false);
+			let has_thinking = thinking.as_deref().map(|t| !t.is_empty()).unwrap_or(false);
+			if has_text || has_thinking {
+				let _ = events.send(CoderEvent::AssistantMessageStart { id: id.clone() });
+				let _ = events.send(CoderEvent::AssistantMessageEnd {
+					id,
+					text: content.unwrap_or_default(),
+					thinking: thinking.filter(|t| !t.is_empty()),
+				});
+			}
+			for call in tool_calls {
+				let args = parse_tool_args(&call.function);
+				let _ = events.send(CoderEvent::ToolCall {
+					id: call.id.clone(),
+					name: call.function.name,
+					args,
+				});
+			}
+		}
+		SessionRecord::Tool { tool_call_id, content } => {
+			// `content` may not be valid JSON (the model wrote
+			// raw bytes for a tool output we serialised as a
+			// fallback). In that case, surface the raw string —
+			// the panel renders it inside a `<pre>` either way.
+			let result = match serde_json::from_str::<Value>(&content) {
+				Ok(value) => value,
+				Err(_) => Value::String(content),
+			};
+			// We don't persist `is_error` — derive it: the result
+			// looks like `{"error":"…"}` for failures and
+			// arbitrary JSON otherwise. Close enough for replay
+			// purposes (the panel's sole use is the red-tinted
+			// styling on the `tool` row).
+			let is_error = matches!(&result, Value::Object(map) if map.contains_key("error") && map.len() == 1);
+			let _ = events.send(CoderEvent::ToolResult {
+				id: tool_call_id,
+				result,
+				is_error,
+			});
+		}
+		SessionRecord::TitleUpdate { .. } => {
+			// Title is already reflected in the header we sent
+			// with `SessionLoaded`; no follow-up needed at the
+			// per-record level.
+		}
+	}
 }
 
 fn response_to_message(response: &AssistantResponse) -> ChatMessage {
@@ -419,4 +935,51 @@ fn new_message_id() -> String {
 		.map(|d| d.as_nanos())
 		.unwrap_or(0);
 	format!("m-{now:x}")
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn sanitise_strips_decorations() {
+		assert_eq!(
+			sanitise_auto_title("\"Implement bucket sync\""),
+			"Implement bucket sync"
+		);
+		assert_eq!(sanitise_auto_title("**Rename moon-agent.**"), "Rename moon-agent");
+		assert_eq!(sanitise_auto_title("  spaced  out  "), "spaced out");
+	}
+
+	#[test]
+	fn sanitise_truncates_long_titles() {
+		let long = "word ".repeat(50);
+		let out = sanitise_auto_title(&long);
+		assert!(out.ends_with('…'));
+	}
+
+	#[test]
+	fn summarise_skips_system_and_tool_messages() {
+		let msgs = vec![
+			ChatMessage::System {
+				content: "system prompt body".into(),
+			},
+			ChatMessage::User {
+				content: "do thing".into(),
+			},
+			ChatMessage::Tool {
+				tool_call_id: "x".into(),
+				content: "tool body".into(),
+			},
+			ChatMessage::Assistant {
+				content: Some("done".into()),
+				tool_calls: Vec::new(),
+			},
+		];
+		let summary = summarise_transcript(&msgs);
+		assert!(!summary.contains("system prompt body"));
+		assert!(!summary.contains("tool body"));
+		assert!(summary.contains("user: do thing"));
+		assert!(summary.contains("assistant: done"));
+	}
 }

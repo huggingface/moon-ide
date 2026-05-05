@@ -5,7 +5,8 @@
 //! `coder:event` Tauri channel. See
 //! `specs/test-plans/0039-coder-skeleton.md`.
 
-use moon_coder::{CoderHandle, CoderStatus, DeviceCode, HfIdentity};
+use moon_coder::{CoderHandle, CoderStatus, DeviceCode, HfIdentity, SessionSummary};
+use moon_core::app_state as app_state_store;
 use moon_protocol::MoonError;
 use tauri::{AppHandle, Emitter, State};
 
@@ -89,4 +90,73 @@ pub async fn coder_send(state: State<'_, AppState>, text: String) -> Result<(), 
 #[tauri::command]
 pub fn coder_abort(state: State<'_, AppState>) {
 	state.coder.abort();
+}
+
+/// List persisted sessions for the active workspace folder. Empty
+/// when the folder has none — including when no folder is active.
+#[tauri::command]
+pub async fn coder_list_sessions(state: State<'_, AppState>) -> Result<Vec<SessionSummary>, MoonError> {
+	state.coder.list_sessions().await.map_err(MoonError::from)
+}
+
+/// Snapshot of the active in-memory session, if any. `None` for a
+/// blank session — the panel uses this to decide between "show
+/// the sessions list" and "show this session's transcript" on
+/// mount.
+#[tauri::command]
+pub async fn coder_active_session(state: State<'_, AppState>) -> Result<Option<SessionSummary>, MoonError> {
+	Ok(state.coder.active_session().await)
+}
+
+/// Drop the in-memory session and start a blank one. Doesn't
+/// touch disk — empty sessions never write a file.
+#[tauri::command]
+pub async fn coder_new_session(state: State<'_, AppState>) -> Result<SessionSummary, MoonError> {
+	state.coder.new_session().await.map_err(MoonError::from)
+}
+
+/// Replace the in-memory session with the persisted one
+/// identified by `id`. Backend emits `session_loaded` + per-record
+/// replay events on the `coder:event` channel; the frontend reacts
+/// to those rather than getting the records back inline.
+#[tauri::command]
+pub async fn coder_open_session(state: State<'_, AppState>, id: String) -> Result<SessionSummary, MoonError> {
+	let summary = state.coder.open_session(id).await.map_err(MoonError::from)?;
+	persist_last_session(&state.config_dir, Some(summary.id.clone())).await;
+	Ok(summary)
+}
+
+/// Delete a persisted session for the active workspace folder.
+/// Idempotent. Emits `session_list_changed` afterwards.
+#[tauri::command]
+pub async fn coder_delete_session(state: State<'_, AppState>, id: String) -> Result<(), MoonError> {
+	state.coder.delete_session(id.clone()).await.map_err(MoonError::from)?;
+	let mut current = app_state_store::load(&state.config_dir).await?;
+	if current.coder.last_session_id.as_deref() == Some(id.as_str()) {
+		current.coder.last_session_id = None;
+		app_state_store::save(&state.config_dir, &current).await?;
+	}
+	Ok(())
+}
+
+/// Persist the last-opened session id so a relaunch lands the
+/// user back in the right transcript. Best-effort: a write
+/// failure logs but doesn't fail the open call. `None` clears
+/// the pointer (e.g. the user just deleted the session).
+async fn persist_last_session(config_dir: &camino::Utf8Path, id: Option<String>) {
+	let current = match app_state_store::load(config_dir).await {
+		Ok(state) => state,
+		Err(err) => {
+			tracing::warn!(error = %err, "could not load app state to persist last_session_id");
+			return;
+		}
+	};
+	if current.coder.last_session_id == id {
+		return;
+	}
+	let mut next = current;
+	next.coder.last_session_id = id;
+	if let Err(err) = app_state_store::save(config_dir, &next).await {
+		tracing::warn!(error = %err, "could not persist last_session_id");
+	}
 }

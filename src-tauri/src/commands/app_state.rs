@@ -10,12 +10,16 @@
 //!   but written through the dedicated `ui_set_right_panel` command
 //!   so the slack poller can react synchronously to chat being
 //!   opened/closed without waiting for the next persist tick.
+//! - The coder slice (`coder.last_session_id`) is owned by the
+//!   coder Tauri commands — set when `coder_open_session` lands
+//!   so the relaunch path can re-open the right session.
 //!
-//! To stop the frontend's writes from clobbering the Slack slice (or
-//! vice versa), `app_state_save` merges: it takes everything from
-//! the payload **except** `slack` and `right_panel`, both of which
-//! are preserved from disk verbatim. Anything the frontend sends in
-//! those fields is ignored on this path.
+//! To stop the frontend's writes from clobbering the Slack slice
+//! (or vice versa), `app_state_save` merges: it takes everything
+//! from the payload **except** `slack`, `right_panel`, and
+//! `coder`, all of which are preserved from disk verbatim.
+//! Anything the frontend sends in those fields is ignored on this
+//! path.
 
 use moon_core::app_state as core_app_state;
 use moon_protocol::app_state::AppState as AppStatePayload;
@@ -38,6 +42,7 @@ pub async fn app_state_save(state: State<'_, AppState>, app_state: AppStatePaylo
 		slack: existing.slack,
 		bottom_panel: app_state.bottom_panel,
 		right_panel: existing.right_panel,
+		coder: existing.coder,
 	};
 	core_app_state::save(&state.config_dir, &merged).await
 }

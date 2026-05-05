@@ -134,6 +134,23 @@ impl From<keyring::Error> for CoderError {
 	}
 }
 
+impl From<std::io::Error> for CoderError {
+	fn from(err: std::io::Error) -> Self {
+		// I/O errors at this layer come from session storage
+		// (`tokio::fs::*`). The host classification is the closest
+		// match — these are filesystem failures, not network
+		// failures, and the `MoonError` flattening downstream maps
+		// `Host` onto `Internal` which is what the panel expects.
+		Self::Host(err.to_string())
+	}
+}
+
+impl From<serde_json::Error> for CoderError {
+	fn from(err: serde_json::Error) -> Self {
+		Self::Internal(format!("serde_json: {err}"))
+	}
+}
+
 impl From<MoonError> for CoderError {
 	fn from(err: MoonError) -> Self {
 		Self::Host(err.to_string())

@@ -378,6 +378,17 @@ export type SlackAppState = {
 export type RightPanelKind = 'chat' | 'coder';
 
 /**
+ * Coder-specific slice of [`AppState`]. Only frontend-side
+ * affordance pointers — actual session content lives under each
+ * workspace folder at
+ * `<folder>/.moon/agent-sessions/<id>.jsonl`. Mirrors
+ * `moon_protocol::app_state::CoderAppState`.
+ */
+export type CoderAppState = {
+	last_session_id: string | null;
+};
+
+/**
  * Per-machine, per-user app state. There is intentionally no `Settings`
  * type — project-level code style lives in `.editorconfig` (Phase 1.5);
  * everything moon-ide stores about a user goes here.
@@ -388,6 +399,7 @@ export type AppState = {
 	slack: SlackAppState;
 	bottom_panel: BottomPanelAppState;
 	right_panel: RightPanelKind | null;
+	coder: CoderAppState;
 };
 
 /** Bottom-panel chrome state. Tabs/log streams are intentionally
@@ -459,6 +471,7 @@ export const defaultAppState: AppState = {
 	slack: { active_bot: null, active_thread_ts: null },
 	bottom_panel: { visible: false, height: 240 },
 	right_panel: null,
+	coder: { last_session_id: null },
 };
 
 /**
@@ -754,7 +767,22 @@ export type CoderEvent =
 	| { kind: 'tool_result'; id: string; result: unknown; is_error: boolean }
 	| { kind: 'turn_complete' }
 	| { kind: 'aborted' }
-	| { kind: 'error'; message: string };
+	| { kind: 'error'; message: string }
+	| { kind: 'session_loaded'; id: string; title: string; created_at_ms: number; updated_at_ms: number }
+	| { kind: 'session_title_updated'; id: string; title: string }
+	| { kind: 'session_list_changed' };
+
+/**
+ * Lightweight summary of a persisted coder session — what the
+ * panel needs to render the sessions list and the sticky session
+ * header. Mirrors `moon_coder::sessions::SessionSummary`.
+ */
+export type CoderSessionSummary = {
+	id: string;
+	title: string;
+	created_at_ms: number;
+	updated_at_ms: number;
+};
 
 export type MoonError =
 	| { code: 'NotFound'; message: string }

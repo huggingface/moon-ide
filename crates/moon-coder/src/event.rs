@@ -82,6 +82,33 @@ pub enum CoderEvent {
 	/// stream, decode error from the router, etc. The panel renders
 	/// this as a system-level toast + error block.
 	Error { message: String },
+
+	/// A different session was just opened (or a fresh one
+	/// created). Frontend clears its row list and starts replaying
+	/// the new session's records into it. Carries a snapshot of
+	/// the active session's metadata so the sticky header can
+	/// render without a separate IPC round trip.
+	SessionLoaded {
+		id: String,
+		title: String,
+		created_at_ms: i64,
+		updated_at_ms: i64,
+	},
+
+	/// The active session's title was rewritten — either by the
+	/// auto-rename pass after the first turn, or (Phase 6.4+) by
+	/// an explicit user rename. Frontend updates the sticky
+	/// header + the row in the sessions list. The new title is
+	/// also persisted as a
+	/// [`crate::sessions::SessionRecord::TitleUpdate`] on disk so
+	/// re-opening sees it.
+	SessionTitleUpdated { id: String, title: String },
+
+	/// The on-disk session list changed (new file, deleted file,
+	/// title bump). Frontend re-fetches via `coder_list_sessions`
+	/// rather than us pushing the full list — keeps the wire
+	/// shape small at the cost of one extra round trip.
+	SessionListChanged,
 }
 
 /// Snapshot of the agent's auth + session state. Returned from

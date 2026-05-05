@@ -42,6 +42,9 @@ pub struct AppState {
 	/// whichever surface they had open at last shutdown. Defaults to
 	/// `None` (closed) for first-run users.
 	pub right_panel: Option<RightPanelKind>,
+	/// Per-machine coder state — picks up where the user left off
+	/// without forcing them to navigate the sessions list again.
+	pub coder: CoderAppState,
 }
 
 /// Surface mounted in the right-side panel. Chat and coder are
@@ -76,6 +79,29 @@ pub struct SlackAppState {
 	/// thread lives inside the bot's DM channel, ID encoded in
 	/// `active_bot.dm_channel_id`).
 	pub active_thread_ts: Option<String>,
+}
+
+/// Coder-specific slice of [`AppState`].
+///
+/// Only frontend-side affordance pointers — the actual session
+/// content lives under each workspace folder at
+/// `<folder>/.moon/agent-sessions/<id>.jsonl`, not here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(default, deny_unknown_fields)]
+pub struct CoderAppState {
+	/// Session id the user had open at last shutdown. Restored on
+	/// launch *if* the file still exists in the active workspace
+	/// folder; otherwise the panel falls back to the sessions list
+	/// view. Cleared when the user deletes the matching session
+	/// or when an `open_session` call lands a different id.
+	///
+	/// Stored as a flat `Option<String>` rather than a per-folder
+	/// map because users rarely keep multiple folders mounted at
+	/// once and the simpler shape pays off in code; if the
+	/// workflow lands where it matters, switch to a map and
+	/// don't ship a migration shim.
+	pub last_session_id: Option<String>,
 }
 
 /// Bottom-panel slice of [`AppState`].

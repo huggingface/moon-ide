@@ -18,7 +18,14 @@
 
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { ipc } from './ipc';
-import { formatError, type CoderEvent, type CoderStatus, type DeviceCode, type HfIdentity } from './protocol';
+import {
+	formatError,
+	type CoderEvent,
+	type CoderSessionSummary,
+	type CoderStatus,
+	type DeviceCode,
+	type HfIdentity,
+} from './protocol';
 import { rightPanel } from './rightPanel.svelte';
 
 const CODER_EVENT_CHANNEL = 'coder:event';
@@ -39,6 +46,11 @@ export type CoderRow =
 	| { kind: 'error'; id: string; text: string }
 	| { kind: 'aborted'; id: string };
 
+/** Which view of the Coder panel is mounted. `'list'` shows the
+ *  sessions list (mirrors the Slack panel's "← Sessions" gesture);
+ *  `'session'` shows an active session's transcript + composer. */
+export type CoderView = 'list' | 'session';
+
 class CoderPanelState {
 	/** Whether the right-side slot is currently mounted with the
 	 *  coder surface. Derived from the shared `rightPanel.kind` —
@@ -49,6 +61,25 @@ class CoderPanelState {
 
 	/** Latest `coder_status`. `null` before the first call. */
 	status = $state<CoderStatus | null>(null);
+
+	/** Sessions list snapshot, refreshed on `session_list_changed`
+	 *  or after `coder_open_session` / `coder_delete_session`.
+	 *  `null` until the first fetch lands so the UI can show a
+	 *  loading state vs. "no sessions yet". */
+	sessions = $state<CoderSessionSummary[] | null>(null);
+
+	/** Metadata for the session currently mounted in memory. `null`
+	 *  for a fresh session that hasn't received its first user
+	 *  message yet — the panel renders the "send a prompt to
+	 *  start" state in that case. */
+	activeSession = $state<CoderSessionSummary | null>(null);
+
+	/** Which view of the panel to render — sessions list vs
+	 *  transcript. Defaults to `'session'` so a relaunch with a
+	 *  remembered session id lands the user back in their last
+	 *  conversation; the panel switches to `'list'` when the user
+	 *  hits "← Sessions". */
+	view = $state<CoderView>('session');
 
 	/** Active device-flow code, while the connect modal is open. */
 	deviceCode = $state<DeviceCode | null>(null);
@@ -99,6 +130,87 @@ class CoderPanelState {
 
 	togglePanel(): void {
 		rightPanel.toggle('coder');
+	}
+
+	/** Refresh the persisted sessions list. Best-effort: a
+	 *  failure leaves the previous snapshot visible. */
+	async refreshSessions(): Promise<void> {
+		try {
+			this.sessions = await ipc.coder.listSessions();
+		} catch (err) {
+			// eslint-disable-next-line no-console
+			console.warn('coder: failed to list sessions', err);
+		}
+	}
+
+	/** Open a persisted session by id. The backend emits
+	 *  `session_loaded` + per-record replay events on the
+	 *  `coder:event` channel; we just react to those, so this
+	 *  method only needs to flip the panel into the session view. */
+	async openSession(id: string): Promise<void> {
+		this.rows = [];
+		this.busy = false;
+		try {
+			const summary = await ipc.coder.openSession(id);
+			this.activeSession = summary;
+			this.view = 'session';
+		} catch (err) {
+			this.rows = [
+				{
+					kind: 'error',
+					id: `local-${Date.now()}`,
+					text: formatError(err),
+				},
+			];
+		}
+	}
+
+	/** Drop the in-memory session and start a blank one. The
+	 *  panel renders the empty-session state until the user sends
+	 *  the first prompt; that prompt creates the disk-backed file
+	 *  via the `coder_send` path. */
+	async newSession(): Promise<void> {
+		try {
+			await ipc.coder.newSession();
+			this.rows = [];
+			this.activeSession = null;
+			this.view = 'session';
+			this.busy = false;
+		} catch (err) {
+			this.rows = [{ kind: 'error', id: `local-${Date.now()}`, text: formatError(err) }];
+		}
+	}
+
+	/** Delete a persisted session (with no extra UI confirmation
+	 *  here — callers wrap in a `confirm()` dialog). Idempotent
+	 *  on the backend, so a double-click is safe. */
+	async deleteSession(id: string): Promise<void> {
+		try {
+			await ipc.coder.deleteSession(id);
+			await this.refreshSessions();
+			if (this.activeSession?.id === id) {
+				this.activeSession = null;
+				this.rows = [];
+			}
+		} catch (err) {
+			// eslint-disable-next-line no-console
+			console.warn('coder: failed to delete session', err);
+		}
+	}
+
+	/** Switch to the sessions-list view. Doesn't drop the
+	 *  in-memory session — the user can come back via a click. */
+	showSessionsList(): void {
+		this.view = 'list';
+		void this.refreshSessions();
+	}
+
+	/** Switch to the transcript view of the current session. If
+	 *  there's no in-memory session at all, this still flips the
+	 *  view (the panel renders the "send your first message"
+	 *  state). */
+	showSessionView(): void {
+		this.view = 'session';
 	}
 
 	closeModal(): void {
@@ -153,6 +265,46 @@ class CoderPanelState {
 			// (folder switch, manual reload) reconciles.
 		}
 		await this.refreshStatus();
+		await this.#hydrateSession();
+	}
+
+	/** First-mount session hydration. Tries to restore the active
+	 *  session the runner already has (in dev, HMR keeps it
+	 *  across reloads); if there's none, falls back to the
+	 *  remembered `last_session_id` from `AppState`; if that's
+	 *  also missing or no longer exists in the active folder,
+	 *  shows the sessions list view. Best-effort throughout. */
+	async #hydrateSession(): Promise<void> {
+		try {
+			const active = await ipc.coder.activeSession();
+			if (active) {
+				this.activeSession = active;
+				this.view = 'session';
+				return;
+			}
+		} catch {
+			// fall through to last-session pointer
+		}
+		try {
+			const appState = await ipc.appState.load();
+			const id = appState.coder.last_session_id;
+			if (id) {
+				try {
+					await this.openSession(id);
+					return;
+				} catch {
+					// Stale pointer — the session was deleted, or
+					// we just switched to a folder that doesn't
+					// have it. Drop into the list view.
+				}
+			}
+		} catch {
+			// AppState load failures are already toast-surfaced
+			// from `state.svelte.ts:restoreAppState` on the main
+			// path; no need to double-toast here.
+		}
+		await this.refreshSessions();
+		this.view = (this.sessions?.length ?? 0) > 0 ? 'list' : 'session';
 	}
 
 	async startDeviceFlow(): Promise<void> {
@@ -305,6 +457,33 @@ class CoderPanelState {
 						text: event.message,
 					},
 				];
+				return;
+			case 'session_loaded':
+				// Reset the transcript and adopt the new session's
+				// metadata. Replay events arrive immediately after
+				// this one (fired by the backend on the same
+				// `coder:event` channel), so the rows fill in on
+				// the next handlers.
+				this.rows = [];
+				this.busy = false;
+				this.activeSession = {
+					id: event.id,
+					title: event.title,
+					created_at_ms: event.created_at_ms,
+					updated_at_ms: event.updated_at_ms,
+				};
+				this.view = 'session';
+				return;
+			case 'session_title_updated':
+				if (this.activeSession?.id === event.id) {
+					this.activeSession = { ...this.activeSession, title: event.title };
+				}
+				if (this.sessions !== null) {
+					this.sessions = this.sessions.map((s) => (s.id === event.id ? { ...s, title: event.title } : s));
+				}
+				return;
+			case 'session_list_changed':
+				void this.refreshSessions();
 				return;
 		}
 	}

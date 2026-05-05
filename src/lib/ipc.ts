@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import type {
 	AppState,
+	CoderSessionSummary,
 	CoderStatus,
 	ContainerStatus,
 	ContentSearchOptions,
@@ -141,6 +142,11 @@ export const ipc = {
 		signOut: () => invoke<void>('coder_sign_out'),
 		send: (text: string) => invoke<void>('coder_send', { text }),
 		abort: () => invoke<void>('coder_abort'),
+		listSessions: () => invoke<CoderSessionSummary[]>('coder_list_sessions'),
+		activeSession: () => invoke<CoderSessionSummary | null>('coder_active_session'),
+		newSession: () => invoke<CoderSessionSummary>('coder_new_session'),
+		openSession: (id: string) => invoke<CoderSessionSummary>('coder_open_session', { id }),
+		deleteSession: (id: string) => invoke<void>('coder_delete_session', { id }),
 	},
 	ui: {
 		setRightPanel: (kind: RightPanelKind | null) => invoke<void>('ui_set_right_panel', { kind }),

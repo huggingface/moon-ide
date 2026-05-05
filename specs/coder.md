@@ -424,44 +424,67 @@ the supported directories.
 ### On disk
 
 Append-only JSONL at
-`<workspace>/.moon/agent-sessions/<session-id>.jsonl`. One line per
-event. The first line is a header:
+`<workspace>/.moon/agent-sessions/<session-id>.jsonl`. The first
+line is a header; every subsequent line is one
+[`SessionRecord`](../crates/moon-coder/src/sessions.rs):
 
-```json
-{
-	"type": "header",
-	"schema": 1,
-	"id": "01HXY…",
-	"created_at": 1714896000,
-	"workspace": "<absolute path>",
-	"model": "Qwen/…:scaleway",
-	"fast_model": "google/…:scaleway"
-}
+```jsonl
+{"schema":1,"id":"sess-1746440000123-9e3779b1","title":"implement bucket sync","created_at_ms":1746440000123,"updated_at_ms":1746440045871,"model":"Qwen/Qwen3.5-397B-A17B:scaleway"}
+{"kind":"user","text":"do the thing"}
+{"kind":"assistant","content":"sure…","thinking":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{...}"}}]}
+{"kind":"tool","tool_call_id":"call_1","content":"…"}
+{"kind":"assistant","content":"done"}
+{"kind":"title_update","title":"add bucket sync upload task"}
 ```
 
-After that, every event from the loop's vocabulary is appended as
-it fires. A crash loses at most the in-flight event.
+The system prompt isn't persisted: re-opening a session re-adds
+the current default at load time, so prompt updates between
+releases apply retroactively. The header carries metadata
+(`schema`, `id`, `title`, `created_at_ms`, `updated_at_ms`,
+`model`); a `title_update` record overrides the header's title on
+load (auto-rename uses this — see below).
+
+Lazy persistence: an empty session has no file on disk. The
+header is written on the first `append_record` call so spamming
+the `+` button doesn't litter the directory with empty sessions.
+
+A crash loses at most the in-flight event.
+
+### Auto-rename
+
+After the _first_ successful turn of a fresh session, the runner
+fires a one-shot fast-model call asking for a 4-6 word title.
+That title:
+
+- Replaces the truncated-prompt fallback in the header (in memory).
+- Gets persisted as a [`TitleUpdate`] record so re-opening sees it.
+- Emits `session_title_updated` so the sticky header + sessions
+  list update without a re-fetch.
+
+Failures (model down, response empty / over-long, session
+switched mid-flight) keep the truncated-prompt title — it's a
+serviceable fallback. The pass only runs once per session.
 
 ### Sidebar UI
 
-A session list in the panel sidebar (collapsible). One row per
-session, newest first, showing:
+The panel has two views — they share the existing right-side
+slot via `rightPanel.kind === 'coder'`:
 
-- The first user message truncated to ~80 chars (matches the
-  Slack-panel preview).
-- Timestamp of the latest event (relative — "2m", "yesterday").
+- **Session view** (`coder.view === 'session'`). The transcript
+  - composer, plus a sticky `← Sessions | <title> | +` strip
+    above. Default view on panel mount: if the runner already has
+    a session in memory or `AppState.coder.last_session_id` points
+    at an existing one, the session view opens to that.
+- **Sessions list** (`coder.view === 'list'`). Sticky
+  `Sessions | +` header; a row per persisted session showing the
+  title plus a relative `updated_at_ms`. Hovering a row reveals
+  the trash icon (with a confirm dialog on click). Clicking the
+  body of a row opens the session.
 
-Clicking a row opens that session into the main view. The panel's
-sticky-bottom scroll behaviour mirrors the Slack panel's — opening
-a session lands at the latest reply; the agent's own streamed
-messages keep the scroll pinned iff the user was already at the
-bottom.
-
-`+ New session` creates a fresh `<session-id>.jsonl` and seeds the
-header. Deleting a session removes the file from disk and from the
-bucket on next sync (a one-line `tombstone:<id>` is appended to a
-`<workspace>/.moon/agent-sessions/.tombstones` file so the sync
-loop knows to delete on the remote side).
+`+` from either view drops into a fresh empty session and lands
+focus in the composer. Empty sessions don't persist until the
+first user message lands; that message creates the JSONL file
+and seeds the title from the prompt.
 
 ### Compaction
 

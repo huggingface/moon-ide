@@ -171,34 +171,65 @@ What ships:
   would just add bookkeeping. The trait method earns its keep
   when `RemoteHost` lands and there's a second implementor.
 
-### 6.3 — Sessions on disk + todo list tool
+### 6.3 — Sessions on disk + auto-rename — **done** (todo_write deferred)
 
 **Acceptance**: every prompt/turn is persisted to JSONL under
-`<workspace>/.moon/agent-sessions/`. The panel sidebar shows a
-session list, "+ New session" creates one, clicking a session
-opens it, deleting confirms-then-removes. `last_coder_session`
-round-trips through `AppState`. The agent has a `todo_write`
-tool whose state is part of the session and renders as a sticky
-checklist in the panel.
+`<workspace>/.moon/agent-sessions/`. The panel surfaces a
+sessions list (with a sticky `+` button) and an in-session
+header (with `← Sessions | title | +`). Clicking a session opens
+it; hover-revealed trash icon + confirm dialog deletes.
+`AppState.coder.last_session_id` round-trips and is restored on
+relaunch. After the _first_ turn of a fresh session, the fast
+model is asked for a 4-6 word title that replaces the
+truncated-prompt fallback.
 
-What ships:
+What shipped:
 
-- JSONL writer in `crates/moon-coder/src/sessions/` with the
-  header line + append-only events from
-  [`coder.md`](../coder.md#sessions).
-- `coder_list_sessions`, `coder_open_session`,
-  `coder_delete_session` Tauri commands.
-- `CoderSessionList.svelte` with the same sticky / scroll
-  treatment as the Slack panel's session list.
-- `AppState.coder = { last_session_id, sync_disabled_workspaces:
-[] }` slice. The `sync_disabled_workspaces` list is wired in
-  6.7 but the field exists from 6.3 to keep schema additions
-  monotonic.
-- `todo_write` tool per
-  [`coder.md`](../coder.md#todo-list-tool). State lives in the
-  session struct; replayed from JSONL when an old session is
-  reopened. Sticky `CoderTodoList.svelte` widget at the top of
-  the transcript.
+- `crates/moon-coder/src/sessions.rs` — JSONL writer/reader, lazy
+  persistence (header written on first record append), `load_summary`
+  fast path for the list view, and `validate_session_id` to keep
+  user-supplied ids inside the sessions directory.
+- Runner refactored to track session metadata (`SessionHeader`,
+  `folder_root`, `auto_rename_pending`). On send the session
+  binds to the active workspace folder + title-from-prompt; on
+  every chat-history append the corresponding `SessionRecord`
+  flushes to disk. Open-session replays records as the same
+  events a live turn would emit so the panel's existing
+  handlers populate the transcript without a special "loaded"
+  code path.
+- New event variants: `session_loaded`,
+  `session_title_updated`, `session_list_changed`.
+- New Tauri commands: `coder_list_sessions`,
+  `coder_active_session`, `coder_new_session`,
+  `coder_open_session`, `coder_delete_session`. The open command
+  also writes `AppState.coder.last_session_id`.
+- `AppState.coder = { last_session_id }` slice + matching merge
+  rule in `app_state_save` (preserved from disk like `slack`
+  and `right_panel`).
+- `CoderPanel.svelte` gains the two-view layout (`coder.view`
+  enum: `'list' | 'session'`), sticky session-bar with
+  `← Sessions | title | +`, hover-revealed delete on session
+  rows, and an `Intl.RelativeTimeFormat` time format on the
+  list rows.
+- Auto-rename pass: spawned after the first turn completes,
+  uses `DEFAULT_FAST_MODEL` with a tight system prompt asking
+  for a 4-6 word title. Result is sanitised (trim quotes,
+  ellipsis-truncate, collapse whitespace) before it lands in
+  the header. Failures keep the truncated-prompt fallback.
+
+Deferred to a follow-up commit (still in the 6.3 spirit, not
+rolled into 6.4):
+
+- `todo_write` tool. The schema and UX are already in
+  [`coder.md`](../coder.md#todo-list-tool); the implementation
+  is independent of the persistence work and ships next.
+- Per-folder `last_session_id`. Today the slot is flat — if
+  the user switches workspace folder, the relaunch points at
+  a session id that probably doesn't exist in the new folder
+  and the panel falls back to the list view. Switch to a
+  per-folder map when somebody actually feels this.
+- Session search / inline rename / `last_n_turns` truncation.
+  Add when asked.
 
 ### 6.4 — Model picker
 

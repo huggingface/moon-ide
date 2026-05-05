@@ -6,6 +6,7 @@
 	import { workspace } from '../state.svelte';
 	import CoderConnectModal from './CoderConnectModal.svelte';
 	import CoderMarkdown from './CoderMarkdown.svelte';
+	import CoderThinking from './CoderThinking.svelte';
 	import TerminalTargetIcon from './TerminalTargetIcon.svelte';
 
 	let scrollEl: HTMLDivElement | undefined = $state();
@@ -68,6 +69,62 @@
 		} catch {
 			return String(value);
 		}
+	}
+
+	async function onNewSession(): Promise<void> {
+		await coder.newSession();
+		// Land focus in the composer so a fresh session is one
+		// keystroke away from being filled in.
+		await tick();
+		composer?.focus();
+	}
+
+	async function onPickSession(id: string): Promise<void> {
+		await coder.openSession(id);
+		await tick();
+		composer?.focus();
+	}
+
+	async function onDeleteSession(event: MouseEvent, id: string, title: string): Promise<void> {
+		// Stop the click from propagating into the row's "open"
+		// button — without this, deleting a session would also
+		// open it for a brief moment.
+		event.stopPropagation();
+		const ok = await confirm(`Delete session "${title || '(untitled)'}"? This cannot be undone.`, {
+			title: 'Delete session',
+			kind: 'warning',
+		});
+		if (!ok) {
+			return;
+		}
+		await coder.deleteSession(id);
+	}
+
+	const RELATIVE_FORMATTER = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' });
+
+	function formatRelative(ms: number): string {
+		const diff = Date.now() - ms;
+		// Coarse buckets — sessions usually span minutes to days,
+		// not seconds. Mirrors the chat panel's "2m" / "3h" feel
+		// without pulling in date-fns.
+		const seconds = Math.round(diff / 1000);
+		if (seconds < 60) {
+			return RELATIVE_FORMATTER.format(-seconds, 'second');
+		}
+		const minutes = Math.round(seconds / 60);
+		if (minutes < 60) {
+			return RELATIVE_FORMATTER.format(-minutes, 'minute');
+		}
+		const hours = Math.round(minutes / 60);
+		if (hours < 24) {
+			return RELATIVE_FORMATTER.format(-hours, 'hour');
+		}
+		const days = Math.round(hours / 24);
+		if (days < 30) {
+			return RELATIVE_FORMATTER.format(-days, 'day');
+		}
+		const months = Math.round(days / 30);
+		return RELATIVE_FORMATTER.format(-months, 'month');
 	}
 </script>
 
@@ -159,7 +216,60 @@
 				<p class="error">{coder.signInError}</p>
 			{/if}
 		</div>
+	{:else if coder.view === 'list'}
+		<!-- Sessions list view (mirrors the Slack panel's "← Sessions"
+			 affordance). Sticky header has the "+" button; the list
+			 itself takes care of empty state. -->
+		<div class="sessions">
+			<header class="sessions-header">
+				<span class="section-title">Sessions</span>
+				<div class="header-actions">
+					<button type="button" class="icon" onclick={onNewSession} title="New session" aria-label="New session">
+						{@render plusIcon()}
+					</button>
+				</div>
+			</header>
+			{#if coder.sessions === null}
+				<p class="hint">Loading sessions…</p>
+			{:else if coder.sessions.length === 0}
+				<p class="hint">
+					No sessions yet. Click <strong>+</strong> above (or send a prompt) to start a fresh conversation.
+				</p>
+			{:else}
+				<ul class="session-list">
+					{#each coder.sessions as session (session.id)}
+						<li class="session-row" class:active={coder.activeSession?.id === session.id}>
+							<button type="button" class="session-pick" onclick={() => onPickSession(session.id)} title="Open session">
+								<div class="session-title">{session.title || '(untitled)'}</div>
+								<div class="session-meta">{formatRelative(session.updated_at_ms)}</div>
+							</button>
+							<button
+								type="button"
+								class="icon session-delete"
+								title="Delete session"
+								aria-label="Delete session"
+								onclick={(event) => onDeleteSession(event, session.id, session.title)}
+							>
+								{@render trashIcon()}
+							</button>
+						</li>
+					{/each}
+				</ul>
+			{/if}
+		</div>
 	{:else}
+		<!-- Sticky in-session header: "← Sessions" + title + "+ new". -->
+		<header class="session-bar">
+			<button type="button" class="back" onclick={() => coder.showSessionsList()} title="Back to sessions">
+				← Sessions
+			</button>
+			<span class="session-bar-title" title={coder.activeSession?.title ?? ''}>
+				{coder.activeSession?.title ?? 'New session'}
+			</span>
+			<button type="button" class="icon" onclick={onNewSession} title="New session" aria-label="New session">
+				{@render plusIcon()}
+			</button>
+		</header>
 		<div class="transcript" bind:this={scrollEl}>
 			{#if coder.rows.length === 0}
 				<p class="hint">
@@ -176,17 +286,18 @@
 					<div class="row assistant">
 						<div class="row-label">coder</div>
 						{#if row.thinking.length > 0}
-							<!-- Reasoning trace from the underlying model. Open
-								 while streaming so the user sees thoughts land,
-								 collapsed once the message finishes (the
-								 `assistant_message_end` handler flips
-								 `thinkingOpen`). The user can re-expand it
-								 manually any time. We bind `open` so manual
-								 toggles persist across re-renders. -->
-							<details class="thinking" bind:open={row.thinkingOpen}>
-								<summary>thinking{row.text.length === 0 ? '…' : ''}</summary>
-								<div class="thinking-body"><CoderMarkdown text={row.thinking} /></div>
-							</details>
+							<!-- Reasoning trace. Open while streaming so the user
+								 sees thoughts land, collapsed once the message
+								 finishes (the `assistant_message_end` handler
+								 flips `thinkingOpen`). The component pins the
+								 inner scroll to the bottom only while pinned by
+								 the user, same gesture as a chat thread. -->
+							<CoderThinking
+								text={row.thinking}
+								open={row.thinkingOpen}
+								onOpenChange={(next) => (row.thinkingOpen = next)}
+								streaming={row.text.length === 0}
+							/>
 						{/if}
 						{#if row.text.length > 0}
 							<div class="bubble assistant-bubble">
@@ -233,6 +344,41 @@
 {#if coder.deviceCode || coder.awaitingApproval}
 	<CoderConnectModal />
 {/if}
+
+{#snippet plusIcon()}
+	<svg
+		viewBox="0 0 16 16"
+		width="14"
+		height="14"
+		fill="none"
+		stroke="currentColor"
+		stroke-width="1.5"
+		stroke-linecap="round"
+		stroke-linejoin="round"
+		aria-hidden="true"
+	>
+		<path d="M8 3v10" />
+		<path d="M3 8h10" />
+	</svg>
+{/snippet}
+
+{#snippet trashIcon()}
+	<svg
+		viewBox="0 0 16 16"
+		width="14"
+		height="14"
+		fill="none"
+		stroke="currentColor"
+		stroke-width="1.4"
+		stroke-linecap="round"
+		stroke-linejoin="round"
+		aria-hidden="true"
+	>
+		<path d="M3 4h10" />
+		<path d="M5 4V3a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v1" />
+		<path d="M4.5 4l.7 9a1 1 0 0 0 1 1h3.6a1 1 0 0 0 1-1l.7-9" />
+	</svg>
+{/snippet}
 
 <style>
 	.panel {
@@ -333,6 +479,130 @@
 	.icon:hover {
 		color: var(--m-fg);
 	}
+	/* Sticky in-session header with "← Sessions" + title + "+
+	   new". Mirrors the chat panel's `.thread-header` shape so
+	   the two right-slot tenants feel consistent. */
+	.session-bar {
+		flex-shrink: 0;
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding: 6px 12px;
+		border-bottom: 1px solid var(--m-border);
+		background: var(--m-bg-1);
+	}
+	.session-bar .back {
+		font: inherit;
+		font-size: 12px;
+		background: transparent;
+		border: 0;
+		color: var(--m-accent);
+		cursor: pointer;
+		padding: 0;
+		flex-shrink: 0;
+	}
+	.session-bar-title {
+		flex: 1;
+		min-width: 0;
+		font-size: 12px;
+		color: var(--m-fg);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		text-align: center;
+	}
+	/* Sessions list view. Sticky header pattern matches the chat
+	   panel — the section title + actions row stays glued to the
+	   top while the list scrolls underneath. */
+	.sessions {
+		flex: 1;
+		min-height: 0;
+		overflow-y: auto;
+		padding: 0 12px 12px;
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+	.sessions-header {
+		position: sticky;
+		top: 0;
+		z-index: 1;
+		background: var(--m-bg-1);
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 8px;
+		margin: 0 -12px;
+		padding: 6px 12px;
+		border-bottom: 1px solid var(--m-border);
+	}
+	.section-title {
+		font-size: 11px;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		color: var(--m-fg-muted);
+	}
+	.header-actions {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+	}
+	.session-list {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+	}
+	.session-row {
+		display: flex;
+		align-items: stretch;
+		border-radius: 4px;
+		border: 1px solid transparent;
+	}
+	.session-row:hover {
+		background: var(--m-bg-3);
+		border-color: var(--m-border);
+	}
+	.session-row.active {
+		background: color-mix(in srgb, var(--m-accent) 12%, transparent);
+		border-color: color-mix(in srgb, var(--m-accent) 50%, transparent);
+	}
+	.session-pick {
+		flex: 1;
+		min-width: 0;
+		text-align: left;
+		font: inherit;
+		color: inherit;
+		background: transparent;
+		border: 0;
+		cursor: pointer;
+		padding: 6px 8px;
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+	}
+	.session-title {
+		font-size: 12px;
+		color: var(--m-fg);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.session-meta {
+		font-size: 11px;
+		color: var(--m-fg-subtle);
+	}
+	.session-delete {
+		opacity: 0;
+		transition: opacity 0.1s;
+	}
+	.session-row:hover .session-delete,
+	.session-row:focus-within .session-delete {
+		opacity: 1;
+	}
 	.empty {
 		flex: 1;
 		display: flex;
@@ -419,37 +689,6 @@
 	}
 	.row.user .bubble {
 		background: color-mix(in srgb, var(--m-accent) 18%, transparent);
-	}
-	/* Reasoning-trace disclosure. Sits between the row label and
-	   the answer bubble. Muted typography so it visually de-prioritises
-	   itself once the answer is in — the model's chain of thought is
-	   diagnostic context, not the headline. */
-	.thinking {
-		font-size: 12px;
-		background: var(--m-bg-overlay);
-		border-radius: 6px;
-		padding: 6px 10px;
-		color: var(--m-fg-muted);
-	}
-	.thinking summary {
-		cursor: pointer;
-		font-size: 11px;
-		text-transform: uppercase;
-		letter-spacing: 0.04em;
-		color: var(--m-fg-subtle);
-		user-select: none;
-	}
-	.thinking[open] summary {
-		margin-bottom: 4px;
-		border-bottom: 1px solid var(--m-border);
-		padding-bottom: 4px;
-	}
-	.thinking-body {
-		font-size: 12px;
-		line-height: 1.5;
-		color: var(--m-fg-muted);
-		max-height: 320px;
-		overflow-y: auto;
 	}
 	.row.error .bubble {
 		background: color-mix(in srgb, var(--m-danger) 14%, transparent);

@@ -1016,17 +1016,19 @@ class WorkspaceState {
 			const session: WorkspaceSession | null = ws
 				? { folders: folderSessions, active_folder_path: ws.active_folder }
 				: null;
-			// `slack` and `right_panel` are written through their own
-			// Tauri commands (`slack_*`, `ui_set_right_panel`); the
-			// backend's `app_state_save` ignores whatever we send for
-			// those fields and preserves the on-disk value. The
-			// placeholders satisfy the shared type only.
+			// `slack`, `right_panel`, and `coder` are written through
+			// their own Tauri commands (`slack_*`, `ui_set_right_panel`,
+			// `coder_*`); the backend's `app_state_save` ignores
+			// whatever we send for those fields and preserves the
+			// on-disk value. The placeholders satisfy the shared type
+			// only.
 			const payload: AppState = {
 				last_session: session,
 				theme: this.theme,
 				slack: { active_bot: null, active_thread_ts: null },
 				bottom_panel: bottomPanel.serialise(),
 				right_panel: null,
+				coder: { last_session_id: null },
 			};
 			// AppState writes are best-effort. A toast on every failure
 			// would be too noisy (this fires on every navigation); a

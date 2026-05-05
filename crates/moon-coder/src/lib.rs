@@ -21,6 +21,7 @@ pub mod error;
 pub mod event;
 pub mod inference;
 pub mod runner;
+pub mod sessions;
 pub mod tools;
 
 pub use auth::{Authenticator, DeviceCode, HfIdentity, TokenStore};
@@ -29,4 +30,5 @@ pub use error::CoderError;
 pub use event::{CoderEvent, CoderStatus};
 pub use inference::InferenceClient;
 pub use runner::{Coder, CoderHandle};
+pub use sessions::SessionSummary;
 pub use tools::ToolRegistry;
