@@ -23,9 +23,17 @@ const FORMAT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Run the lint-staged `command` for `abs_file_path` against `text` and
 /// return the formatted output. `workspace_root` bounds the upward
 /// `node_modules/.bin` walk so we don't escape the workspace looking
-/// for tools.
+/// for tools. `config_dir` is the directory that hosts the
+/// `.lintstagedrc.json` / `package.json#lint-staged` whose `command`
+/// we're running — we use it as the subprocess cwd (so relative
+/// arguments like `--ignore-path ../.prettierignore` resolve from the
+/// same place lint-staged would resolve them) and as the starting
+/// point for the `node_modules/.bin` walk (matches lint-staged's own
+/// per-package binary discovery in pnpm-style monorepos where each
+/// workspace package carries its own `node_modules/.bin`).
 pub async fn run_formatter(
 	workspace_root: &Utf8Path,
+	config_dir: &Utf8Path,
 	abs_file_path: &Utf8Path,
 	command: &str,
 	text: &str,
@@ -41,11 +49,10 @@ pub async fn run_formatter(
 		return None;
 	};
 
-	let start_dir = abs_file_path.parent().unwrap_or(workspace_root);
-	let resolved_bin = resolve_binary(tool, start_dir, workspace_root)?;
+	let resolved_bin = resolve_binary(tool, config_dir, workspace_root)?;
 	let argv = tool.build_argv(user_args, abs_file_path);
 
-	spawn_and_capture(&resolved_bin, &argv, text).await
+	spawn_and_capture(&resolved_bin, &argv, config_dir, text).await
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -106,7 +113,12 @@ impl KnownTool {
 }
 
 fn is_mode_flag(arg: &str) -> bool {
-	matches!(arg, "--write" | "--check" | "--list-different")
+	// `--write` / `-w` and friends force file-mutation mode; combined
+	// with `--stdin-filepath` prettier rejects the invocation outright,
+	// so we strip the short forms too. oxfmt accepts the long forms but
+	// not the shorts; rustfmt has neither — both safe to strip
+	// universally.
+	matches!(arg, "--write" | "-w" | "--check" | "-c" | "--list-different" | "-l")
 }
 
 /// Whitespace split. Lint-staged commands are simple — no shell pipes,
@@ -167,10 +179,11 @@ fn find_node_modules_bin(name: &str, start: &Utf8Path, root: &Utf8Path) -> Optio
 	None
 }
 
-async fn spawn_and_capture(bin: &Utf8Path, argv: &[String], text: &str) -> Option<String> {
+async fn spawn_and_capture(bin: &Utf8Path, argv: &[String], cwd: &Utf8Path, text: &str) -> Option<String> {
 	let mut cmd = Command::new(bin.as_str());
 	cmd
 		.args(argv)
+		.current_dir(cwd.as_str())
 		.stdin(Stdio::piped())
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped());
@@ -307,6 +320,31 @@ mod tests {
 		let user = vec!["--check".to_owned(), "--list-different".to_owned()];
 		let argv = KnownTool::Prettier.build_argv(&user, Utf8Path::new("/x/y.ts"));
 		assert_eq!(argv, vec!["--stdin-filepath".to_owned(), "/x/y.ts".to_owned()]);
+	}
+
+	#[test]
+	fn build_argv_strips_short_mode_flags() {
+		// Regression: `prettier -w --ignore-path ../.prettierignore` is
+		// the lint-staged command used by moon-landing's `server/`
+		// package; without short-flag stripping we'd ship `-w` to
+		// prettier alongside `--stdin-filepath`, which prettier
+		// rejects with a non-zero exit and we'd silently fall back to
+		// the un-formatted text.
+		let user = vec![
+			"-w".to_owned(),
+			"--ignore-path".to_owned(),
+			"../.prettierignore".to_owned(),
+		];
+		let argv = KnownTool::Prettier.build_argv(&user, Utf8Path::new("/abs/server/ambient.d.ts"));
+		assert_eq!(
+			argv,
+			vec![
+				"--ignore-path".to_owned(),
+				"../.prettierignore".to_owned(),
+				"--stdin-filepath".to_owned(),
+				"/abs/server/ambient.d.ts".to_owned(),
+			]
+		);
 	}
 
 	#[test]

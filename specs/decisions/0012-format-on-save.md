@@ -86,10 +86,26 @@ flowchart LR
     saveActive[saveActive] --> fs_write_file[fs_write_file]
     coderTool[coder write/edit] --> save_file
     fs_write_file --> save_file["host.save_file"]
-    save_file --> editorconfig[editorconfig pre-save]
-    editorconfig --> formatter["lint-staged formatter (best-effort)"]
-    formatter --> write_file["host.write_file (raw)"]
+    save_file --> formatter{"lint-staged formatter?"}
+    formatter -- hit --> write["host.write_file (raw)"]
+    formatter -- miss --> editorconfig[editorconfig pre-save]
+    editorconfig --> write
 ```
+
+Formatter takes priority: if `lint_staged_for(path)` returned a rule
+**and** the resulting subprocess succeeded, its output goes to disk
+unmodified. The editorconfig pipeline (line endings → trim trailing
+whitespace → final newline) is the **fallback** for files without a
+formatter — running it before the formatter would be wasted work
+(every supported tool already canonicalises those concerns) and risks
+fighting a formatter that has its own opinion on line-ending style.
+
+`Ctrl+S` is always a valid "run the pipeline" gesture even on a clean
+buffer; the front-end no longer short-circuits unchanged buffers
+because format-on-save can legitimately rewrite already-saved bytes
+when the file isn't yet canonical. Cost: one IPC roundtrip per save
+on already-clean content; the formatter is idempotent so the second
+save lands the same bytes and the tab stays clean.
 
 Raw `write_file` stays available for callers that want exactly the
 bytes they hand in (mostly tests). User-initiated Ctrl+S, Save As,

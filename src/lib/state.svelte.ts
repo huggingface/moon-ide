@@ -1098,7 +1098,7 @@ class WorkspaceState {
 		});
 	}
 
-	async loadPaths() {
+	async loadPaths(changedSubset: ReadonlySet<string> | null = null) {
 		if (!this.activeFolder) {
 			return;
 		}
@@ -1115,7 +1115,7 @@ class WorkspaceState {
 			// paint before we know the answer. Pierre reconciles
 			// `setGitStatus` updates in place, so late-arriving
 			// entries fade / tint the affected rows without a reflow.
-			void this.refreshGitStatus(collected);
+			void this.refreshGitStatus(collected, changedSubset);
 		} catch (err) {
 			this.flash(`Failed to read folder: ${formatError(err)}`);
 		} finally {
@@ -1132,7 +1132,7 @@ class WorkspaceState {
 	 */
 	gitStatusEntries = $state<readonly GitStatusEntry[]>([]);
 
-	private async refreshGitStatus(paths: readonly string[]) {
+	private async refreshGitStatus(paths: readonly string[], changedSubset: ReadonlySet<string> | null) {
 		try {
 			this.gitStatusEntries = await ipc.fs.gitStatusEntries([...paths]);
 		} catch {
@@ -1145,11 +1145,9 @@ class WorkspaceState {
 		}
 		// `HEAD` moves whenever a git status refresh is warranted
 		// (commit, checkout, pull, reset). Re-fetch the content
-		// backing every open text buffer so the gutter flips from
+		// backing open text buffers so the gutter flips from
 		// "everything's modified" back to clean once the user's
-		// commit lands. Scoped to open files — there's no point
-		// warming `HEAD` for files the user isn't looking at, and
-		// the list is typically < 20.
+		// commit lands.
 		//
 		// Same pass also reloads clean buffers from disk: an external
 		// mutation (chat agent tool, formatter, integrated terminal)
@@ -1158,12 +1156,19 @@ class WorkspaceState {
 		// would mark the row `(M)` (because `git status` looks at
 		// disk) while the gutter / blame / LSP keep showing the
 		// pre-edit content. Dirty buffers are left alone: we don't
-		// silently clobber unsaved user edits. `reloadOpenFileFromDisk`
-		// short-circuits when on-disk and in-memory are already
-		// equal so the watcher's debounced bursts don't churn the
-		// reactive graph for files we just wrote ourselves.
+		// silently clobber unsaved user edits.
+		//
+		// `changedSubset` is the path list the watcher actually
+		// observed during this debounce window; we narrow the
+		// per-buffer reload to the open files that intersect it.
+		// `null` means "we don't know which paths moved" (window
+		// focus, palette `Refresh File Tree`) — fall back to the
+		// conservative loop over every open buffer.
 		for (const file of this.openFiles) {
 			if (file.kind !== 'text' || file.isDeleted) {
+				continue;
+			}
+			if (changedSubset !== null && !changedSubset.has(file.path)) {
 				continue;
 			}
 			this.refreshHead(file.path);
@@ -1191,20 +1196,60 @@ class WorkspaceState {
 	 * back-to-back (alt-tab flurry) doesn't stack two concurrent
 	 * recursions.
 	 */
-	async refreshActiveFolder(): Promise<void> {
+	async refreshActiveFolder(changedSubset: ReadonlySet<string> | null = null, topologyChanged = true): Promise<void> {
 		if (!this.activeFolder) {
 			return;
 		}
 		if (this.loadingPaths) {
 			return;
 		}
-		await this.loadPaths();
+		if (topologyChanged) {
+			await this.loadPaths(changedSubset);
+			return;
+		}
+		// Modify-only batch: every changed entry already exists in
+		// the tree's `paths` snapshot, so the recursive
+		// `collect_paths` walk is wasted work. Refresh git status
+		// (cheap aggregate IPC) and run the per-buffer loop against
+		// the existing path list. The narrowed loop visits only
+		// open files in `changedSubset`, so the user's own Ctrl+S
+		// becomes one `git status` call and one re-read instead of
+		// a tree walk plus N×(git show + read).
+		await this.refreshGitStatus(this.paths, changedSubset);
 	}
 
 	/** Set to true after `bindFolderChangeRefresh` installs the
 	 * fs-watch + focus listeners, so a subsequent HMR-driven
 	 * `restoreAppState` doesn't stack duplicate handlers. */
 	#folderRefreshWired = false;
+
+	/**
+	 * Trailing-debounce timer for `refreshActiveFolder`. The
+	 * backend's `notify` watcher fires `fs:changed` once per
+	 * filesystem event, and a single user-visible save commonly
+	 * produces a small flurry (open/write/close, mtime touches,
+	 * directory entry updates, plus our own post-save HEAD content
+	 * fetch hitting `.git/`). Without coalescing, each event
+	 * triggered a fresh `loadPaths` + `refreshGitStatus` pass; the
+	 * latter loops every open buffer through `git show HEAD:` and
+	 * `reloadOpenFileFromDisk`, multiplying IPC traffic by N tabs
+	 * for what should be one refresh. The trailing debounce holds
+	 * 200ms after the last event before firing — enough to absorb
+	 * the typical write-burst, short enough that an actual external
+	 * mutation (terminal-driven `git checkout`, formatter-by-file)
+	 * still feels live.
+	 */
+	// No frontend debounce: the backend's `notify` watcher already
+	// coalesces a single save's burst into one `fs:changed` event,
+	// and the topology-aware refresh path is cheap enough that two
+	// back-to-back events (rare — a build storm exceeding one
+	// 250ms window) doing twice the work doesn't hurt. Earlier
+	// revisions trail-debounced here for an extra 100–200ms of
+	// padding; once `refreshActiveFolder` learned to skip the
+	// recursive `collect_paths` walk for modify-only batches that
+	// padding became pure perceived latency on every save with no
+	// real benefit. See `fs_watcher.rs#DEBOUNCE` for the backend
+	// half.
 
 	/**
 	 * Wire the "something changed → refresh the active folder"
@@ -1224,8 +1269,14 @@ class WorkspaceState {
 	 *   NFS / SSHFS / Docker-bind-mount scenarios where notify
 	 *   can't observe changes at all.
 	 *
-	 * Both feed the same `refreshActiveFolder`, which internally
-	 * coalesces with an in-flight walk.
+	 * Both feed `refreshActiveFolder` directly. `fs:changed`
+	 * carries the changed paths plus the topology flag so we can
+	 * narrow / skip work; the focus path has no payload and falls
+	 * back to a conservative full refresh. Concurrent calls
+	 * coalesce via the `loadingPaths` guard inside
+	 * `refreshActiveFolder` for the topology-true path; for the
+	 * cheap modify-only path we let any redundant fires run — the
+	 * IPCs are idempotent and the cost is negligible.
 	 */
 	async bindFolderChangeRefresh(): Promise<void> {
 		if (this.#folderRefreshWired) {
@@ -1233,8 +1284,9 @@ class WorkspaceState {
 		}
 		this.#folderRefreshWired = true;
 		try {
-			await listen('fs:changed', () => {
-				void this.refreshActiveFolder();
+			await listen<{ paths: string[]; topologyChanged: boolean }>('fs:changed', ({ payload }) => {
+				const subset = payload.paths.length > 0 ? new Set(payload.paths) : null;
+				void this.refreshActiveFolder(subset, payload.topologyChanged);
 			});
 		} catch {
 			// Event bus unavailable (tests / non-Tauri). Focus
@@ -1246,6 +1298,9 @@ class WorkspaceState {
 				if (!focused) {
 					return;
 				}
+				// Focus-driven refresh: no payload, so we don't
+				// know what moved. Fall back to the conservative
+				// full sweep (null subset + topologyChanged=true).
 				void this.refreshActiveFolder();
 			});
 		} catch {
@@ -2723,9 +2778,16 @@ class WorkspaceState {
 			await this.saveActiveAs();
 			return;
 		}
-		if (!file.isDirty) {
-			return;
-		}
+		// Clean buffers used to short-circuit here, but with the
+		// format-on-save pipeline (specs/decisions/0012) the host's
+		// `save_file` can rewrite even unchanged bytes — the user's
+		// expected mental model is "Ctrl+S formats my file regardless
+		// of whether I just typed something". The cost is one IPC
+		// roundtrip per save; cheap and the pre-save pipeline /
+		// formatter / re-read are all idempotent on already-canonical
+		// content (the writes that come back equal don't bump dirty
+		// state, the LSP didChange is a no-op, the fingerprint stays
+		// stable).
 		try {
 			const result = await ipc.fs.writeFile(file.path, file.text);
 			// The pre-save pipeline (line endings, trim trailing ws, final

@@ -63,8 +63,9 @@ Prerequisites: `bun install`, `cargo build`, `bun run tauri dev`. Open the moon-
 
 ### Pipeline ordering
 
-16. Take a `.ts` file with `\r\n` line endings (force it: `unix2dos` on a temp copy, then open). With `.editorconfig`'s `end_of_line = lf` for the repo, save the file. The file ends up `\n`-only on disk and oxfmt-formatted — meaning the editorconfig step ran first (so the formatter saw `\n` input) and the formatter ran second.
-17. Confirm `cargo test -p moon-core lint_staged` and `cargo test -p moon-core format::tests` are both green: 9 + 7 unit tests covering basename matching, separator-anchored matching, package.json-vs-lintstagedrc precedence, brace expansion, glob malformations, cache invalidation, command parsing, and the per-tool argv translation.
+16. Take a `.ts` file with `\r\n` line endings (force it: `unix2dos` on a temp copy, then open). Save it. The file ends up `\n`-only on disk because oxfmt enforces LF — the formatter is the canonical normaliser and the editorconfig fallback never runs for files that have a formatter rule.
+17. For a file the formatter doesn't cover (no matching glob in `.lintstagedrc.json`), the editorconfig fallback still strips trailing whitespace, normalises line endings, and adds the final newline — the legacy editorconfig contract is preserved for unformatted files.
+18. Confirm `cargo test -p moon-core lint_staged` and `cargo test -p moon-core format::tests` are both green: 9 + 8 unit tests covering basename matching, separator-anchored matching, package.json-vs-lintstagedrc precedence, brace expansion, glob malformations, cache invalidation, command parsing, the per-tool argv translation, and the `-w` short-flag stripping regression for moon-landing's `prettier -w` lint-staged command.
 
 ## What must keep working
 

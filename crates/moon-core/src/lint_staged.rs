@@ -91,6 +91,15 @@ impl LintStagedRules {
 	pub fn is_empty(&self) -> bool {
 		self.rules.is_empty()
 	}
+
+	/// Directory the matched config file lives in. `None` for the empty
+	/// "no config" case. Callers run the formatter subprocess with this
+	/// as its `cwd` so relative arguments inside the lint-staged command
+	/// (`--ignore-path ../.prettierignore`, `--config ./prettier.cjs`,
+	/// etc.) resolve from the same directory lint-staged itself uses.
+	pub fn config_dir(&self) -> Option<&Utf8Path> {
+		self.config_dir.as_deref()
+	}
 }
 
 #[derive(Default)]

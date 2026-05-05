@@ -46,14 +46,14 @@ trait BeforeSaveTransform {
 }
 ```
 
-The default pipeline is, in order:
+The save pipeline is, in priority order:
 
-1. `EnsureLineEndings` — `end_of_line`.
-2. `TrimTrailingWhitespace` — `trim_trailing_whitespace`.
-3. `EnsureFinalNewline` — `insert_final_newline`.
-4. `RunFormatter` — pulled forward from Phase 8 as a bootstrap concern. See [ADR 0012 — Format on save via lint-staged](decisions/0012-format-on-save.md). Driven by the project's `.lintstagedrc.json` (or `package.json#lint-staged`); supersedes the speculative direction in [ADR 0006](decisions/0006-no-settings-file.md) where the knob would have been a moon-specific `.editorconfig` extension.
+1. `RunFormatter` — pulled forward from Phase 8 as a bootstrap concern. See [ADR 0012 — Format on save via lint-staged](decisions/0012-format-on-save.md). Driven by the project's `.lintstagedrc.json` (or `package.json#lint-staged`); supersedes the speculative direction in [ADR 0006](decisions/0006-no-settings-file.md) where the knob would have been a moon-specific `.editorconfig` extension. **Wins outright when it ran successfully**: oxfmt / prettier / rustfmt all canonicalise line endings, trailing whitespace, and the final newline themselves, so the formatter's output goes straight to disk and the editorconfig steps below are skipped.
+2. `EnsureLineEndings` — `end_of_line`. Fallback for files without a formatter.
+3. `TrimTrailingWhitespace` — `trim_trailing_whitespace`. Fallback for files without a formatter.
+4. `EnsureFinalNewline` — `insert_final_newline`. Fallback for files without a formatter.
 
-The full save seam is the `WorkspaceHost::save_file` trait method, not `WorkspaceHost::write_file`. `save_file` runs the four steps above and then delegates to `write_file` for the raw bytes. Every editor save (`fs_write_file`) and every coder/agent edit funnels through `save_file`; raw `write_file` stays available for tests and any future caller that wants exactly the bytes it hands in.
+The full save seam is the `WorkspaceHost::save_file` trait method, not `WorkspaceHost::write_file`. `save_file` runs the priority order above and then delegates to `write_file` for the raw bytes. Every editor save (`fs_write_file`) and every coder/agent edit funnels through `save_file`; raw `write_file` stays available for tests and any future caller that wants exactly the bytes it hands in.
 
 ### Editor (CodeMirror) integration
 

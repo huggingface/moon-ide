@@ -186,7 +186,11 @@ impl LocalHost {
 		let abs_str = self.absolute_path(rel).await.ok()?;
 		let abs = Utf8PathBuf::from(abs_str);
 		let cmd = rules.match_command(abs.as_std_path())?.to_owned();
-		format::run_formatter(&self.root, &abs, &cmd, text).await
+		// `config_dir` is `Some` whenever `match_command` returned a hit
+		// (the rule came from a real file on disk); the workspace root
+		// is just a defensive fallback the type system asks for.
+		let cwd = rules.config_dir().unwrap_or(&self.root).to_path_buf();
+		format::run_formatter(&self.root, &cwd, &abs, &cmd, text).await
 	}
 
 	/// Resolve a workspace-relative or absolute path against the workspace root.
@@ -447,13 +451,22 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn save_file(&self, path: &Utf8Path, text: &str) -> MoonResult<WriteFileResult> {
-		// Editorconfig normalization is mandatory and cheap; the
-		// formatter step is best-effort and falls back to the
-		// normalized text on any failure (see specs/decisions/0012).
+		// Formatter wins: oxfmt / prettier / rustfmt all canonicalise
+		// line endings, trim trailing whitespace, and ensure a final
+		// newline themselves. Running the editorconfig pipeline first
+		// is wasted work (and risks fighting a formatter that has a
+		// different opinion on, say, line-ending style — formatters
+		// are the canonical source of truth for files they own). The
+		// editorconfig pipeline only kicks in as the fallback when no
+		// formatter ran: no lint-staged rule for this file, the rule
+		// pointed at an unsupported tool, or the formatter subprocess
+		// failed. See specs/decisions/0012-format-on-save.md.
+		if let Some(formatted) = self.maybe_run_formatter(path, text).await {
+			return self.write_file(path, &formatted).await;
+		}
 		let ec = self.editorconfig.for_path(path).await?;
 		let normalized = pre_save::apply_pipeline(text, &ec);
-		let formatted = self.maybe_run_formatter(path, &normalized).await.unwrap_or(normalized);
-		self.write_file(path, &formatted).await
+		self.write_file(path, &normalized).await
 	}
 
 	async fn git_status_entries(&self, paths: &[String]) -> MoonResult<Vec<GitStatusEntry>> {

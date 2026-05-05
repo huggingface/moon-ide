@@ -19,29 +19,63 @@
 //! inotify, macOS FSEvents, Windows ReadDirectoryChangesW) doesn't
 //! leak past this file.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::time::Duration;
 
+use notify::event::ModifyKind;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{sleep_until, Instant, Sleep};
 
-/// Name of the Tauri event the frontend listens on. No payload —
-/// the frontend re-fetches `paths` and `gitStatusEntries` from
-/// scratch. See `src/lib/state.svelte.ts#bindFolderChangeRefresh`.
+/// Name of the Tauri event the frontend listens on. The payload
+/// (`FsChangedPayload`) carries the workspace-relative paths that
+/// changed inside the debounce window so the frontend can narrow
+/// per-buffer refresh (HEAD content + working-tree reload) to the
+/// files that actually moved instead of looping every open tab.
+/// See `src/lib/state.svelte.ts#bindFolderChangeRefresh`.
 pub const FS_CHANGED_EVENT: &str = "fs:changed";
 
-/// How long we let events pile up before emitting one
-/// `fs:changed`. Long enough to swallow a `cargo build`'s
-/// per-millisecond churn without the frontend melting; short
-/// enough that a deliberate edit in an external terminal feels
-/// instantly reflected in the tree.
+/// Wire payload for `fs:changed`. `paths` are workspace-relative,
+/// always forward-slash-separated to match `collect_paths` output.
+/// Empty `paths` means "the watcher saw activity but none of it
+/// resolved to a path inside the workspace root" (rare; an unwatch
+/// race or a symlinked path that escapes the root) — the frontend
+/// falls back to a conservative full-tab refresh in that case.
 ///
-/// Tune: the frontend's `refreshActiveFolder` itself takes ~100ms
-/// on a medium repo, so shorter windows double up refreshes.
-/// Longer windows make interactive ops feel laggy.
-const DEBOUNCE: Duration = Duration::from_millis(500);
+/// `topology_changed` is `true` when at least one event in the
+/// batch was a Create / Remove / Rename — those change which
+/// entries the tree should render and the frontend must re-walk
+/// `collect_paths`. `false` means every event was an in-place
+/// content / metadata edit on existing entries; the frontend can
+/// skip the recursive walk and run only the cheap per-buffer
+/// refresh. We classify conservatively: anything we can't
+/// recognise (`EventKind::Any`, `EventKind::Other`) flips it true.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FsChangedPayload {
+	paths: Vec<String>,
+	topology_changed: bool,
+}
+
+/// Minimum gap between two consecutive `fs:changed` emits. We
+/// run a leading-and-trailing debounce: the first event after an
+/// idle period fires the frontend instantly (so a user-visible
+/// save feels live), and any further events arriving inside the
+/// window collapse into one trailing emit. The debounce also
+/// caps how often we can fire during a `cargo build` / formatter
+/// storm — once per `DEBOUNCE` rather than once per event.
+///
+/// 250ms is the sweet spot now that the frontend skips the
+/// recursive `collect_paths` walk for modify-only batches: the
+/// per-fire cost dropped from "tens to hundreds of ms" to a
+/// single `git status --porcelain` invocation, so doubling up on
+/// a `cargo build` storm doesn't melt anything. Was 500ms when
+/// every fire walked the whole tree.
+const DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Public handle held by `AppState`. Cloneable; sends are
 /// lock-free and non-blocking.
@@ -104,12 +138,28 @@ async fn run(app: AppHandle, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
 	};
 
 	let mut current_root: Option<PathBuf> = None;
-	let mut pending = false;
-	let mut tick = interval(DEBOUNCE);
-	// Skip-first so the idle tick doesn't immediately emit a
-	// phantom event on startup — the first meaningful tick comes
-	// after a real fs change queues `pending = true`.
-	tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+	// Workspace-relative paths accumulated since the last emit. We
+	// dedup with a `HashSet` because notify routinely fires several
+	// events for the same path inside one debounce window (open,
+	// write, attribute touch, close); the frontend doesn't need to
+	// see each. Cleared after every successful emit. When the actor
+	// resets `current_root`, any stale paths are dropped — they no
+	// longer mean anything outside the workspace they came from.
+	let mut pending_paths: HashSet<PathBuf> = HashSet::new();
+	// Sticky-true flag: any topology event in the batch flips the
+	// payload's `topologyChanged` so the frontend re-walks the
+	// tree. Modify-only batches (the common Ctrl+S case) keep it
+	// false and let the frontend skip `collect_paths` entirely.
+	let mut pending_topology = false;
+	// Wall-clock time of the most recent emit, used to gate the
+	// leading edge: an event arriving more than `DEBOUNCE` after
+	// the last emit is treated as a fresh burst and fires the
+	// frontend immediately.
+	let mut last_emit: Option<Instant> = None;
+	// Trailing-edge timer: armed on the first in-window event after
+	// a leading emit, fires once at `last_emit + DEBOUNCE` to flush
+	// any paths accumulated during the cooldown. `None` while idle.
+	let mut trailing: Option<Pin<Box<Sleep>>> = None;
 
 	loop {
 		tokio::select! {
@@ -122,6 +172,12 @@ async fn run(app: AppHandle, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
 				match cmd {
 					Some(Command::SetRoot(new)) => {
 						apply_set_root(&mut watcher, &mut current_root, new);
+						// Stale paths from the previous root mean
+						// nothing to the new one's frontend.
+						pending_paths.clear();
+						pending_topology = false;
+						trailing = None;
+						last_emit = None;
 					}
 					None => {
 						// Sender dropped — AppState went away,
@@ -132,25 +188,80 @@ async fn run(app: AppHandle, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
 			}
 
 			Some(res) = event_rx.recv() => {
-				if should_flag(&res) {
-					pending = true;
+				let prev_count = pending_paths.len();
+				collect_event_paths(
+					&res,
+					current_root.as_deref(),
+					&mut pending_paths,
+					&mut pending_topology,
+				);
+				if pending_paths.len() == prev_count {
+					// Event was filtered (`.git/`, access bump,
+					// out-of-root) — nothing to emit, nothing to
+					// schedule.
+					continue;
+				}
+				let now = Instant::now();
+				let cooled_down = last_emit.is_none_or(|t| now.duration_since(t) >= DEBOUNCE);
+				if cooled_down {
+					// Leading edge: emit now, then start the
+					// trailing window so any follow-up events in
+					// this same save burst collapse into one
+					// flush at the end.
+					emit_pending(&app, &mut pending_paths, &mut pending_topology);
+					last_emit = Some(now);
+					trailing = None;
+				} else if trailing.is_none() {
+					// Inside the cooldown — accumulate. Schedule
+					// the trailing flush relative to the leading
+					// emit so two saves 50ms apart still fire at
+					// most twice (lead + trail).
+					let until = last_emit.unwrap_or(now) + DEBOUNCE;
+					trailing = Some(Box::pin(sleep_until(until)));
 				}
 			}
 
-			_ = tick.tick() => {
-				if !pending {
+			_ = poll_optional_sleep(&mut trailing) => {
+				trailing = None;
+				if pending_paths.is_empty() {
 					continue;
 				}
-				pending = false;
-				if let Err(e) = app.emit(FS_CHANGED_EVENT, ()) {
-					// Webview hasn't attached yet (early startup)
-					// or has been torn down. Either way we just
-					// drop this batch — the next fs change will
-					// rearm `pending` and we'll retry.
-					tracing::debug!(error = %e, "failed to emit fs:changed");
-				}
+				emit_pending(&app, &mut pending_paths, &mut pending_topology);
+				last_emit = Some(Instant::now());
 			}
 		}
+	}
+}
+
+/// Drain `pending_paths` + `pending_topology` into a single
+/// `fs:changed` emit. Pulled into a helper so the leading and
+/// trailing call sites match exactly. Logs at debug on emit
+/// failure (webview not attached / torn down) — the next event
+/// will re-arm the watcher and we'll retry.
+fn emit_pending(app: &AppHandle, paths: &mut HashSet<PathBuf>, topology: &mut bool) {
+	if paths.is_empty() {
+		return;
+	}
+	let payload = FsChangedPayload {
+		paths: paths.drain().map(path_to_forward_slash).collect(),
+		topology_changed: *topology,
+	};
+	*topology = false;
+	if let Err(e) = app.emit(FS_CHANGED_EVENT, &payload) {
+		tracing::debug!(error = %e, "failed to emit fs:changed");
+	}
+}
+
+/// Await an optional `Sleep` inside `tokio::select!`. When the
+/// option is `None` we want the branch to never resolve — the
+/// classic `pending` sentinel — so the select loop blocks on the
+/// other arms instead. Hand-rolled rather than using
+/// `tokio::time::sleep(Duration::MAX)` because that allocates a
+/// timer every iteration even when no trailing flush is armed.
+async fn poll_optional_sleep(slot: &mut Option<Pin<Box<Sleep>>>) {
+	match slot.as_mut() {
+		Some(s) => s.as_mut().await,
+		None => std::future::pending::<()>().await,
 	}
 }
 
@@ -190,29 +301,90 @@ fn apply_set_root(watcher: &mut RecommendedWatcher, current: &mut Option<PathBuf
 	*current = new;
 }
 
-/// Whether an event should count toward a pending refresh. We
-/// swallow `.git/` churn outright because a single commit writes
-/// dozens of refs/index/logs files in a burst, and every one
-/// would otherwise trigger the frontend to re-scan the whole
-/// tree. Other filtering (build-output directories, gitignored
-/// subtrees) is left for later — the debounce keeps the frontend
-/// sane enough in the meantime.
-fn should_flag(res: &notify::Result<Event>) -> bool {
+/// Sift one notify event into `pending`. Drops `.git/` churn
+/// (a single commit writes dozens of ref / index / log files) and
+/// `Access` events (read-only stat bumps from rust-analyzer,
+/// tsgo, anything walking `.gitignore`) — neither moves what the
+/// tree should render. Surviving paths are made workspace-relative
+/// before storage; anything outside the current root is dropped
+/// so we don't accidentally publish paths from a previous root
+/// after a swap. Sticky-flips `topology` to `true` for any
+/// Create / Remove / Rename — the frontend uses that to decide
+/// whether the recursive `collect_paths` walk is needed.
+fn collect_event_paths(
+	res: &notify::Result<Event>,
+	root: Option<&Path>,
+	pending: &mut HashSet<PathBuf>,
+	topology: &mut bool,
+) {
 	let event = match res {
 		Ok(e) => e,
 		Err(err) => {
 			tracing::debug!(error = %err, "fs watcher error event");
-			return false;
+			return;
 		}
 	};
-	// `Access` events (read-only stat bumps) don't change what
-	// the tree would render. Skip them so tools that `stat` every
-	// file in the repo (rust-analyzer, tsgo, editors reading
-	// `.gitignore`) don't keep the watcher armed.
 	if matches!(event.kind, EventKind::Access(_)) {
-		return false;
+		return;
 	}
-	event.paths.iter().any(|p| !is_in_dotgit(p))
+	let Some(root) = root else {
+		return;
+	};
+	let mut took_a_path = false;
+	for raw in &event.paths {
+		if is_in_dotgit(raw) {
+			continue;
+		}
+		let Ok(rel) = raw.strip_prefix(root) else {
+			continue;
+		};
+		// `notify` sometimes reports the watched root itself for
+		// directory-attribute events; the empty relative path
+		// isn't useful to the frontend (it can't intersect any
+		// open buffer) so we drop it.
+		if rel.as_os_str().is_empty() {
+			continue;
+		}
+		pending.insert(rel.to_path_buf());
+		took_a_path = true;
+	}
+	// Only classify topology when at least one in-root path
+	// survived filtering. Otherwise every `.git/`-only event
+	// would flip the flag for nothing.
+	if took_a_path && is_topology_event(&event.kind) {
+		*topology = true;
+	}
+}
+
+/// `true` for events that change which entries the tree should
+/// render: file or directory creation, removal, rename. Plain
+/// content / metadata edits stay `false`. The catch-alls
+/// (`EventKind::Any`, `EventKind::Other`, and the corresponding
+/// "we don't know" sub-kinds) classify as topology to err on the
+/// side of correctness — a missed re-walk is a worse failure mode
+/// than an unnecessary one.
+fn is_topology_event(kind: &EventKind) -> bool {
+	match kind {
+		EventKind::Create(_) | EventKind::Remove(_) => true,
+		EventKind::Modify(ModifyKind::Name(_)) => true,
+		EventKind::Modify(ModifyKind::Any) => true,
+		EventKind::Any | EventKind::Other => true,
+		EventKind::Modify(_) => false,
+		EventKind::Access(_) => false,
+	}
+}
+
+/// Convert a workspace-relative path to the forward-slash string
+/// shape every other moon-ide IPC uses (matches `collect_paths`'s
+/// output and Pierre's path convention). On Windows this normalises
+/// `\` to `/`; on Unix it's effectively a `to_string_lossy` clone.
+fn path_to_forward_slash(p: PathBuf) -> String {
+	let s = p.to_string_lossy();
+	if std::path::MAIN_SEPARATOR != '/' {
+		s.replace(std::path::MAIN_SEPARATOR, "/")
+	} else {
+		s.into_owned()
+	}
 }
 
 fn is_in_dotgit(path: &Path) -> bool {
