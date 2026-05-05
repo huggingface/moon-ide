@@ -60,6 +60,11 @@
 			buildToken++;
 			merge?.destroy();
 			merge = undefined;
+			// Drop any selection snapshot the right pane published
+			// while we were live — symmetric with `Editor.svelte`'s
+			// teardown so the floating "Add to Coder" hint can't
+			// outlive the surface that produced its selection.
+			workspace.setActiveSelection(null);
 		};
 	});
 
@@ -204,16 +209,27 @@
 			ecB.of(editorConfigExtensions(ec)),
 			...escapeBinding,
 			EditorView.updateListener.of((update) => {
-				if (!update.docChanged) {
-					return;
+				if (update.docChanged) {
+					const next = update.state.doc.toString();
+					// Pipe edits through the same `updateText` path as
+					// the regular editor — sets isDirty, lets the tab
+					// strip render the dirty dot, and (because we share
+					// the OpenFile buffer with the editor view) keeps
+					// state coherent across the diff/edit toggle.
+					workspace.updateText(path, next);
 				}
-				const next = update.state.doc.toString();
-				// Pipe edits through the same `updateText` path as
-				// the regular editor — sets isDirty, lets the tab
-				// strip render the dirty dot, and (because we share
-				// the OpenFile buffer with the editor view) keeps
-				// state coherent across the diff/edit toggle.
-				workspace.updateText(path, next);
+				if (update.selectionSet) {
+					// Mirror the regular editor's selection-publish
+					// hook so `Ctrl+L` can attach a selection from the
+					// diff view's right-hand pane to the coder.
+					// Deleted buffers skip this — the right pane is
+					// read-only and rendered empty for them, so any
+					// selection there is meaningless.
+					if (file.isDeleted) {
+						return;
+					}
+					publishDiffSelection(update.state);
+				}
 			}),
 			...(file.isDeleted ? [EditorState.readOnly.of(true), EditorView.editable.of(false)] : []),
 		];
@@ -323,6 +339,32 @@
 	function editorConfigExtensions(ec: EditorConfig): Extension {
 		const unit = ec.indent_style === 'tab' ? '\t' : ' '.repeat(Math.max(1, ec.indent_size));
 		return [EditorState.tabSize.of(Math.max(1, ec.tab_width)), indentUnit.of(unit)];
+	}
+
+	/**
+	 * Mirror of `Editor.svelte`'s `publishSelection` for the diff
+	 * view's right-hand (working-tree) editor. Same line-trimming
+	 * heuristic — when the user's drag ends at a line's `from`,
+	 * snap back so a `89-101` drag doesn't accidentally publish
+	 * `89-102`. Empty selections clear the snapshot.
+	 */
+	function publishDiffSelection(state: EditorState) {
+		const sel = state.selection.main;
+		if (sel.empty) {
+			workspace.setActiveSelection(null);
+			return;
+		}
+		const fromLine = state.doc.lineAt(sel.from);
+		const toLine = state.doc.lineAt(sel.to);
+		const effectiveToLineNumber =
+			sel.to === toLine.from && toLine.number > fromLine.number ? toLine.number - 1 : toLine.number;
+		const text = state.doc.sliceString(sel.from, sel.to);
+		workspace.setActiveSelection({
+			path: file.path,
+			startLine: fromLine.number,
+			endLine: effectiveToLineNumber,
+			text,
+		});
 	}
 </script>
 

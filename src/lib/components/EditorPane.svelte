@@ -40,8 +40,13 @@
 	);
 	// Show the "Add to Coder" hint only when this pane is showing
 	// the file the workspace's `activeSelection` points at, and
-	// only over the live editor surface (image / diff / markdown
-	// preview don't expose CodeMirror selections we can attach).
+	// only over surfaces that actually expose a CodeMirror
+	// selection. Image and Markdown-preview can't produce one;
+	// diff view's right (working-tree) pane can — see
+	// `DiffView.svelte`'s `publishDiffSelection` — so we let it
+	// through. The hint anchors to the pane's top-right corner,
+	// which lands over the right pane in diff mode (where the
+	// editable side lives).
 	const showCoderHint = $derived.by(() => {
 		const selection = workspace.activeSelection;
 		if (selection === null) {
@@ -50,7 +55,7 @@
 		if (activeFile === null || activeFile.kind !== 'text') {
 			return false;
 		}
-		if (showDiff || showMarkdownPreview) {
+		if (showMarkdownPreview) {
 			return false;
 		}
 		return selection.path === activeFile.path;
