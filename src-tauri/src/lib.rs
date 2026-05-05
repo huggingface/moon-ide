@@ -153,7 +153,8 @@ pub fn run() {
 			// would dispatch tools against an empty registry and
 			// every `read_file` would fail with `NoActiveFolder`.
 			let workspaces = Arc::new(WorkspaceRegistry::new());
-			let coder = CoderHandle::new(workspaces.clone()).map_err(|err| format!("could not init moon-coder: {err}"))?;
+			let coder = CoderHandle::new(workspaces.clone(), workspaces_dir.clone())
+				.map_err(|err| format!("could not init moon-coder: {err}"))?;
 			commands::coder::spawn_event_pump(app.handle().clone(), coder.clone());
 
 			let state = AppState::new(

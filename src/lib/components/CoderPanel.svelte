@@ -5,6 +5,7 @@
 	import { workspace } from '../state.svelte';
 	import CoderConnectModal from './CoderConnectModal.svelte';
 	import CoderMarkdown from './CoderMarkdown.svelte';
+	import TerminalTargetIcon from './TerminalTargetIcon.svelte';
 
 	let scrollEl: HTMLDivElement | undefined = $state();
 	let composer: HTMLTextAreaElement | undefined = $state();
@@ -82,10 +83,11 @@
 					class="target"
 					class:container={coder.bashTarget === 'container'}
 					title={coder.bashTarget === 'container'
-						? 'bash and shell tools run inside the workspace devcontainer'
+						? 'bash and shell tools run inside the workspace container'
 						: 'bash and shell tools run on the host machine'}
+					aria-label={coder.bashTarget === 'container' ? 'shell target: container' : 'shell target: host'}
 				>
-					{coder.bashTarget}
+					<TerminalTargetIcon kind={coder.bashTarget} size={12} />
 				</span>
 			{/if}
 		</div>
@@ -233,26 +235,26 @@
 		text-overflow: ellipsis;
 		white-space: nowrap;
 	}
-	/* Host-vs-container indicator pip. The colour-mix-tinted
-	   background makes the container case visually distinct so the
-	   user notices when bash crosses the host/container boundary —
-	   running `rm -rf .` on the wrong target is the kind of mistake
-	   the indicator earns its keep on. */
+	/* Host-vs-container indicator chip. Same monitor / container
+	   glyphs the terminal tabs use (`TerminalTargetIcon`) so the
+	   user reads the same visual language across the IDE. The
+	   colour-mix tint on the container case keeps the boundary
+	   visually obvious — running `rm -rf .` on the wrong target is
+	   the kind of mistake the indicator earns its keep on. */
 	.target {
-		font-size: 10px;
-		text-transform: uppercase;
-		letter-spacing: 0.06em;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
 		color: var(--m-fg-subtle);
 		border: 1px solid var(--m-border);
 		border-radius: 3px;
-		padding: 0 5px;
-		height: 16px;
-		line-height: 14px;
+		padding: 1px 4px;
+		height: 18px;
 	}
 	.target.container {
-		color: var(--m-accent);
-		border-color: color-mix(in srgb, var(--m-accent) 50%, transparent);
-		background: color-mix(in srgb, var(--m-accent) 10%, transparent);
+		color: var(--m-success);
+		border-color: color-mix(in srgb, var(--m-success) 50%, transparent);
+		background: color-mix(in srgb, var(--m-success) 10%, transparent);
 	}
 	.actions {
 		display: flex;

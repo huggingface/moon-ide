@@ -21,13 +21,16 @@ mtime_ms }`. Path-traversal outside the workspace folder is
 - 6.2 sub-phase split in [`phase-06-coder.md`](../roadmaps/phase-06-coder.md):
   mutating tools and container-aware bash both land here.
 - `bash` tool now routes through `docker exec -w <container_cwd>
-<name> sh -lc <cmd>` when the active folder is a devcontainer,
-  reusing `moon-terminal`'s helpers so the framing matches
-  terminals and LSP. Result carries a `target` field
-  (`"host"` / `"container"`).
-- Panel header has a host-vs-container indicator pip next to the
-  username; surfaces from `CoderStatus.bash_target` and re-probes
-  when the active folder switches.
+<name> sh -lc <cmd>` whenever the workspace shell container is
+  `Running` (queried via `moon_container::Workspace::status()` —
+  the same call `lsp.rs::resolve_target` makes, so terminals,
+  LSP, and the coder share one source of truth). Result carries
+  a `target` field (`"host"` / `"container"`).
+- Panel header has a monitor / container glyph next to the
+  username (reuses `TerminalTargetIcon`). Surfaces from
+  `CoderStatus.bash_target`; re-probes on `container:state`
+  events so it flips the moment the workspace container starts,
+  pauses, or stops.
 - Three unit tests for `byte_offsets_of` covering the corner
   cases `edit_file` relies on (multi-match, empty needle, no
   overlap loop).
@@ -124,17 +127,19 @@ scratch/edit-target.md.`
    failure and asks whether to create the file with `write_file`
    instead.
 
-8. **Container-aware bash (host folder).**
-   With a host-mounted workspace folder open, the panel header
-   shows a subdued `host` pip next to the username. Prompt:
-   `Run "uname -a" via bash and tell me the kernel.`
+8. **Bash on host (container not running).**
+   Make sure the workspace container is **not** running (status
+   pip shows Absent / Stopped / Paused — anything but Running).
+   The coder panel's header glyph shows the subdued **monitor**
+   icon. Prompt: `Run "uname -a" via bash and tell me the kernel.`
    Expected: tool result's `target` is `"host"`; `stdout` is the
-   user's host kernel (matches `uname -a` from a host shell).
+   user's host kernel.
 
-9. **Container-aware bash (devcontainer folder).**
-   Open a workspace folder backed by `moon-container` (devcontainer
-   running). The panel-header pip flips to an accent-tinted
-   `container` pip without manual refresh. Prompt:
+9. **Bash inside the workspace container.**
+   Click "Set up" / "Resume" on the container status pip and wait
+   until it reads Running. The coder panel's header glyph flips
+   to the accent-tinted **container** icon **without** a manual
+   refresh — driven by the `container:state` event. Prompt:
    `Run "cat /etc/os-release | head -1" via bash and report the
 distro.`
    Expected: tool result's `target` is `"container"`. `stdout`
@@ -143,12 +148,20 @@ GNU/Linux 12 (bookworm)"` for `moon-base`), **not** the host
    distro. Confirms `docker exec` routing with the
    `/workspace/<basename>` cwd.
 
-10. **Switching folders flips the pip.**
-    With both a host and a devcontainer folder bound in the
-    workspace, click the folder bar to switch active folder. The
-    panel-header pip should toggle between `host` and `container`
-    immediately (within one tick). The next bash call follows the
-    pip — no stale routing.
+10. **Pausing / stopping the container flips the icon back.**
+    With a turn idle, click "Pause" on the container popover.
+    Within a tick the coder glyph reverts to the monitor icon
+    and the next bash call routes to the host. Resume the
+    container — glyph and routing flip back to container. No
+    page reload needed.
+
+11. **Lifecycle hiccups don't break bash.**
+    Stop the docker daemon (`sudo systemctl stop docker` on
+    Linux). The next coder status probe is allowed to fail
+    silently — the glyph falls back to host, and bash still runs
+    via the host shell. Restart the daemon and confirm the
+    routing self-recovers on the next state event or folder
+    switch.
 
 ## What must keep working
 

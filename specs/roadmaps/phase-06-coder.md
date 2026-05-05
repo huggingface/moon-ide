@@ -90,28 +90,42 @@ What ships:
 ### 6.2.x — Container-aware bash
 
 **Acceptance**: `bash` runs **inside the workspace shell
-container** when the active folder is a devcontainer, on the
-host otherwise. The panel header surfaces the active target as a
-small `host` / `container` pip next to the username.
+container** when that container is `Running`, on the host
+otherwise. The panel header surfaces the active target as a
+monitor / container glyph (same `TerminalTargetIcon` the bottom-
+panel terminal tabs use) next to the username.
 
 What ships:
 
-- `tools::bash` checks the active folder's
-  `WorkspaceFolder.host`. `Local` → `tokio::process::Command::new("sh") -lc <cmd>`
-  rooted at the folder, exactly as before. `Devcontainer` →
-  `docker exec -w <container_cwd> <name> sh -lc <cmd>` against
-  the workspace shell container compose already brought up.
-- Reuses `moon_terminal::container_name_for_workspace` and
-  `TerminalTarget::container_cwd_for_folder` so the framing
-  matches terminals + LSP. No new trait method on
-  `WorkspaceHost`; one is justified once a second host
-  implementor (`RemoteHost`/`ContainerHost`) lands.
+- `tools::resolve_bash_target` queries
+  `moon_container::Workspace::status()` — the same lifecycle
+  call `lsp.rs::resolve_target` makes. Routes to container only
+  when the project state is `Running`; any failure (no compose
+  project, daemon unreachable, parse error) falls back to host
+  so the agent is never made unusable by a flaky docker daemon.
+- `WorkspaceFolder.host` (`Local` / `Devcontainer`) is **not**
+  the routing signal. That field is for the orthogonal "the
+  folder's filesystem lives in a remote container" case (Phase
+  2-ish via `RemoteHost`); it doesn't track the workspace shell
+  container's runtime state and is always `Local` today. The
+  signal we want is "did the user click Set up / Resume?", which
+  is `ContainerStatus.state == Running`.
+- Container path: `docker exec -w <container_cwd> <name> sh -lc <cmd>`,
+  using `moon_terminal::container_name_for_workspace` and
+  `TerminalTarget::container_cwd_for_folder` so terminals, LSP,
+  and the coder all agree on the framing. No `-it` (we want
+  captured I/O, not a TTY).
 - `CoderStatus.bash_target: "host" | "container" | null` mirrors
-  the bash tool result's `target` field. Status re-probes when
-  the active folder switches so the pip stays fresh.
-- Panel-header indicator pip in `CoderPanel.svelte`: subdued
-  "host" border-only, accent-tinted "container" pip so the
-  boundary is impossible to miss.
+  the bash tool result's `target` field. The frontend listens to
+  the `container:state` Tauri event and re-probes status on
+  every state change, so the pip flips immediately when the user
+  uses the container popover or runs `docker compose down` from
+  a terminal.
+- No new `WorkspaceHost::spawn` trait method. The "container is
+  up" check belongs to the lifecycle layer, not to a host
+  abstraction; adding `spawn` to a single-implementor trait
+  would just add bookkeeping. The trait method earns its keep
+  when `RemoteHost` lands and there's a second implementor.
 
 ### 6.3 — Sessions on disk + todo list tool
 

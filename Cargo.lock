@@ -2629,6 +2629,7 @@ dependencies = [
  "async-trait",
  "camino",
  "keyring",
+ "moon-container",
  "moon-core",
  "moon-protocol",
  "moon-terminal",

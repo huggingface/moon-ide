@@ -120,6 +120,21 @@ class CoderPanelState {
 			// eslint-disable-next-line no-console
 			console.warn('coder: failed to bind event channel');
 		}
+		// Re-probe status whenever the workspace shell container
+		// changes state — the bash-target pip needs to flip the
+		// moment the user clicks "Set up" / "Pause" / "Resume" or
+		// the daemon transitions on its own. Same `container:state`
+		// channel `container.svelte.ts` listens to.
+		try {
+			const unlisten = await listen('container:state', () => {
+				void this.refreshStatus();
+			});
+			this.#unlisten.push(unlisten);
+		} catch {
+			// Same swallow as above — container events failing means
+			// the pip just won't auto-update; the next status probe
+			// (folder switch, manual reload) reconciles.
+		}
 		await this.refreshStatus();
 	}
 

@@ -15,6 +15,12 @@ moon-protocol = { workspace = true }
 # method, until there's a second host implementor that would actually
 # benefit from the abstraction.
 moon-terminal = { workspace = true }
+# `moon_container::Workspace::status()` answers "is the workspace shell
+# container running?" — the same query `lsp.rs::resolve_target` makes
+# to decide whether to host the LSP locally or via `docker exec`. The
+# coder's `bash` tool reuses it so terminals/LSP/coder all agree on
+# the routing target.
+moon-container = { workspace = true }
 
 async-trait = { workspace = true }
 camino = { workspace = true }

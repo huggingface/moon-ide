@@ -22,9 +22,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use camino::{Utf8Path, Utf8PathBuf};
+use moon_container::{Workspace as ContainerWorkspace, WorkspaceConfig};
 use moon_core::{WorkspaceFolderEntry, WorkspaceRegistry};
+use moon_protocol::container::ContainerState;
 use moon_protocol::search::{ContentSearchHit, ContentSearchOptions};
-use moon_protocol::workspace::HostKind;
 use moon_terminal::{container_name_for_workspace, TerminalTarget};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -52,16 +53,22 @@ const READ_FILE_MAX_BYTES: usize = 200_000;
 const BASH_OUTPUT_MAX_BYTES: usize = 64_000;
 
 /// Tools are dispatched by name. The registry holds the JSON-schema
-/// descriptors handed to the LLM and a handle to the workspace
-/// registry the runtime needs to resolve the active folder.
+/// descriptors handed to the LLM, the workspace registry the
+/// runtime needs to resolve the active folder, and the workspaces
+/// state-dir parent so `bash` can ask `moon-container` whether the
+/// workspace shell container is running.
 #[derive(Clone)]
 pub struct ToolRegistry {
 	workspaces: Arc<WorkspaceRegistry>,
+	workspaces_dir: Utf8PathBuf,
 }
 
 impl ToolRegistry {
-	pub fn new(workspaces: Arc<WorkspaceRegistry>) -> Self {
-		Self { workspaces }
+	pub fn new(workspaces: Arc<WorkspaceRegistry>, workspaces_dir: Utf8PathBuf) -> Self {
+		Self {
+			workspaces,
+			workspaces_dir,
+		}
 	}
 
 	/// Tool definitions to advertise to the model on every chat call.
@@ -457,53 +464,88 @@ impl ToolRegistry {
 	}
 
 	/// Build the platform-correct `bash` command for the active
-	/// folder. Local folders run `sh -lc <cmd>` directly with the
-	/// folder as `cwd`; devcontainer folders go through `docker exec
-	/// -w <container_cwd> <name> sh -lc <cmd>` against the workspace
-	/// shell container that compose / `moon-container` already
-	/// brought up. Same convention used by `moon-terminal` (terminals)
-	/// and `crates/moon-core/src/lsp/spawn.rs` (LSP servers); we
-	/// reuse the helpers in `moon_terminal::target` for the
-	/// container-name + in-container-cwd derivation so all three
-	/// stay in lockstep.
+	/// folder. Routing decision flows through
+	/// [`resolve_bash_target`] so it stays in lockstep with what the
+	/// panel header / `CoderStatus.bash_target` advertises:
 	///
-	/// Returns the wire-friendly target label (`"host"` /
-	/// `"container"`) so the tool result and the panel header
-	/// indicator pip read the same value.
+	/// - **Container** (workspace shell container is `Running`):
+	///   `docker exec -w <container_cwd> <name> sh -lc <cmd>`.
+	///   Reuses `moon_terminal::container_name_for_workspace` +
+	///   `TerminalTarget::container_cwd_for_folder` so the framing
+	///   matches terminals and LSP exactly.
+	/// - **Host** (otherwise): `sh -lc <cmd>` rooted at the folder.
 	async fn build_bash_command(
 		&self,
 		folder: &WorkspaceFolderEntry,
 		cmd: &str,
 	) -> Result<(tokio::process::Command, &'static str), CoderError> {
-		match folder.folder.host {
-			HostKind::Local => {
-				let mut command = tokio::process::Command::new("sh");
-				command.arg("-lc").arg(cmd).current_dir(folder.folder.path.as_str());
-				Ok((command, BASH_TARGET_HOST))
-			}
-			HostKind::Devcontainer => {
-				let workspace_id = self.workspaces.workspace_id().await;
-				let container_name = container_name_for_workspace(&workspace_id);
-				// Fall back to `/workspace` if the host path has no
-				// basename — same fallback `moon-terminal` uses for
-				// pathological inputs (`/`). Devcontainer folders
-				// nearly always have one, so this is belt-and-braces.
-				let container_cwd = TerminalTarget::container_cwd_for_folder(Utf8Path::new(&folder.folder.path))
-					.unwrap_or_else(|| Utf8PathBuf::from("/workspace"));
-				// `docker exec` (no `-it`): we want captured
-				// stdout/stderr, not a TTY. Terminals get `-it`;
-				// the bash tool doesn't.
-				let mut command = tokio::process::Command::new("docker");
-				command
-					.arg("exec")
-					.arg("-w")
-					.arg(container_cwd.as_str())
-					.arg(&container_name)
-					.arg("sh")
-					.arg("-lc")
-					.arg(cmd);
-				Ok((command, BASH_TARGET_CONTAINER))
-			}
+		let target = resolve_bash_target(&self.workspaces, &self.workspaces_dir).await;
+		if target == BASH_TARGET_CONTAINER {
+			let workspace_id = self.workspaces.workspace_id().await;
+			let container_name = container_name_for_workspace(&workspace_id);
+			// Fall back to `/workspace` if the host path has no
+			// basename — same fallback `moon-terminal` uses for
+			// pathological inputs (`/`).
+			let container_cwd = TerminalTarget::container_cwd_for_folder(Utf8Path::new(&folder.folder.path))
+				.unwrap_or_else(|| Utf8PathBuf::from("/workspace"));
+			// `docker exec` (no `-it`): we want captured
+			// stdout/stderr, not a TTY. Terminals get `-it`; the
+			// bash tool doesn't.
+			let mut command = tokio::process::Command::new("docker");
+			command
+				.arg("exec")
+				.arg("-w")
+				.arg(container_cwd.as_str())
+				.arg(&container_name)
+				.arg("sh")
+				.arg("-lc")
+				.arg(cmd);
+			return Ok((command, BASH_TARGET_CONTAINER));
+		}
+		let mut command = tokio::process::Command::new("sh");
+		command.arg("-lc").arg(cmd).current_dir(folder.folder.path.as_str());
+		Ok((command, BASH_TARGET_HOST))
+	}
+}
+
+/// Single source of truth for "should bash route through the
+/// workspace shell container?". Mirrors `lsp.rs::resolve_target`
+/// almost line-for-line: build a [`ContainerWorkspace`] from the
+/// current bound-folder set + workspace id, ask its lifecycle
+/// `status()`, and route to the container only if the project is
+/// `Running`. Any failure (no compose project, daemon
+/// unreachable, parse error) falls back to host — the agent's
+/// bash should never become unusable just because docker
+/// isn't responding.
+///
+/// Called from both `tools::bash` and `runner::status` so the
+/// indicator pip and the actual command's `target` field can't
+/// drift.
+pub(crate) async fn resolve_bash_target(workspaces: &WorkspaceRegistry, workspaces_dir: &Utf8Path) -> &'static str {
+	let workspace_id = workspaces.workspace_id().await;
+	let bound: Vec<Utf8PathBuf> = workspaces
+		.folders()
+		.await
+		.iter()
+		.map(|entry| Utf8PathBuf::from(&entry.folder.path))
+		.collect();
+	let ws = match ContainerWorkspace::new(WorkspaceConfig {
+		workspace_id: workspace_id.clone(),
+		state_dir: workspaces_dir.join(&workspace_id),
+		bound_folders: bound,
+	}) {
+		Ok(ws) => ws,
+		Err(err) => {
+			tracing::debug!(%err, "coder: container config unavailable, routing bash to host");
+			return BASH_TARGET_HOST;
+		}
+	};
+	match ws.status().await {
+		Ok(status) if matches!(status.state, ContainerState::Running) => BASH_TARGET_CONTAINER,
+		Ok(_) => BASH_TARGET_HOST,
+		Err(err) => {
+			tracing::debug!(%err, "coder: container status query failed, routing bash to host");
+			BASH_TARGET_HOST
 		}
 	}
 }
