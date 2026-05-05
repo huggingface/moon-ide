@@ -253,6 +253,14 @@ button:focus-visible {
 	font-family: var(--m-font-mono);
 	font-size: 0.9em;
 	line-height: 1.5;
+	/* Render literal tabs at two columns. The default 8 columns
+	   is hostile to the kind of tightly-indented code the model
+	   tends to paste back at the user, and our own house style
+	   (ADR 0004) is two columns for display anyway — `.editorconfig`
+	   pins the editor display width to 2; this is the analogous
+	   knob for rendered markdown. */
+	-moz-tab-size: 2;
+	tab-size: 2;
 }
 .markdown-body pre code {
 	background: transparent;

@@ -258,10 +258,20 @@
 			{/if}
 		</div>
 	{:else}
-		<!-- Sticky in-session header: "← Sessions" + title + "+ new". -->
+		<!-- Sticky in-session header: a small back-to-list affordance,
+			 the session title (centre, prominent), and the "+ new"
+			 button. Both buttons inherit `.icon`'s muted styling so
+			 the title stays the visual focus — this strip is for
+			 navigation, not headline content. -->
 		<header class="session-bar">
-			<button type="button" class="back" onclick={() => coder.showSessionsList()} title="Back to sessions">
-				← Sessions
+			<button
+				type="button"
+				class="icon"
+				onclick={() => coder.showSessionsList()}
+				title="Back to sessions"
+				aria-label="Back to sessions"
+			>
+				{@render listIcon()}
 			</button>
 			<span class="session-bar-title" title={coder.activeSession?.title ?? ''}>
 				{coder.activeSession?.title ?? 'New session'}
@@ -299,7 +309,16 @@
 								streaming={row.text.length === 0}
 							/>
 						{/if}
-						{#if row.text.length > 0}
+						{#if row.text.trim().length > 0}
+							<!-- Trim before the visibility check so a
+								 model that ends with just whitespace
+								 (e.g. tool-only turn that emitted a
+								 trailing `\n`) doesn't render an
+								 empty grey rectangle below the
+								 thinking block. The actual text we
+								 hand to `CoderMarkdown` is untrimmed
+								 — preserving leading whitespace is
+								 the renderer's job. -->
 							<div class="bubble assistant-bubble">
 								<CoderMarkdown text={row.text} />
 							</div>
@@ -359,6 +378,26 @@
 	>
 		<path d="M8 3v10" />
 		<path d="M3 8h10" />
+	</svg>
+{/snippet}
+
+{#snippet listIcon()}
+	<svg
+		viewBox="0 0 16 16"
+		width="14"
+		height="14"
+		fill="none"
+		stroke="currentColor"
+		stroke-width="1.5"
+		stroke-linecap="round"
+		stroke-linejoin="round"
+		aria-hidden="true"
+	>
+		<!-- Three-line "list" glyph. Same visual language Slack /
+			 Discord / Cursor use for "all conversations". -->
+		<path d="M3 4h10" />
+		<path d="M3 8h10" />
+		<path d="M3 12h10" />
 	</svg>
 {/snippet}
 
@@ -491,20 +530,13 @@
 		border-bottom: 1px solid var(--m-border);
 		background: var(--m-bg-1);
 	}
-	.session-bar .back {
-		font: inherit;
-		font-size: 12px;
-		background: transparent;
-		border: 0;
-		color: var(--m-accent);
-		cursor: pointer;
-		padding: 0;
-		flex-shrink: 0;
-	}
+	/* Both "back" and "new" sit on the strip as `.icon` buttons —
+	   their styles come from the shared `.icon` rule below. */
 	.session-bar-title {
 		flex: 1;
 		min-width: 0;
 		font-size: 12px;
+		font-weight: 500;
 		color: var(--m-fg);
 		overflow: hidden;
 		text-overflow: ellipsis;

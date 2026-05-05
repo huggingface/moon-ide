@@ -424,8 +424,13 @@ the supported directories.
 ### On disk
 
 Append-only JSONL at
-`<workspace>/.moon/agent-sessions/<session-id>.jsonl`. The first
-line is a header; every subsequent line is one
+`<XDG_DATA_HOME>/moon-ide/coder-sessions/<project-slug>/<session-id>.jsonl`.
+The slug is `<basename>-<8-char FNV-1a hex>` derived
+deterministically from the workspace folder's absolute path —
+two folders that share a basename get distinct slugs, and the
+same folder always maps to the same slug across launches.
+
+The first line is a header; every subsequent line is one
 [`SessionRecord`](../crates/moon-coder/src/sessions.rs):
 
 ```jsonl
@@ -443,6 +448,15 @@ releases apply retroactively. The header carries metadata
 (`schema`, `id`, `title`, `created_at_ms`, `updated_at_ms`,
 `model`); a `title_update` record overrides the header's title on
 load (auto-rename uses this — see below).
+
+Sessions explicitly **don't** live inside the project tree
+(`<workspace>/.moon/...`). They're personal scratch / history
+rather than project artefacts: putting them under VCS would
+either litter `git status` or force a `.gitignore` entry every
+team adds blind, and tying them to the on-disk path rather than
+the user's account would make them follow a `git mv` of the repo
+in confusing ways. The shared `moon-ide/` data dir under
+`XDG_DATA_HOME` (next to compose state) is the right home.
 
 Lazy persistence: an empty session has no file on disk. The
 header is written on the first `append_record` call so spamming

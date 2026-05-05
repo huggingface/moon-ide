@@ -36,8 +36,8 @@ use crate::error::CoderError;
 use crate::event::{CoderEvent, CoderStatus};
 use crate::inference::{AssistantResponse, ChatMessage, FunctionCall, InferenceClient, StreamEvent};
 use crate::sessions::{
-	self, current_time_ms, new_session_id, session_title_from_prompt, LoadedSession, SessionHeader, SessionRecord,
-	SessionSummary, SESSION_SCHEMA_VERSION,
+	self, current_time_ms, new_session_id, session_title_from_prompt, sessions_dir, LoadedSession, SessionHeader,
+	SessionRecord, SessionSummary, SESSION_SCHEMA_VERSION,
 };
 use crate::tools::ToolRegistry;
 
@@ -73,6 +73,14 @@ struct CoderState {
 	/// by [`crate::tools::resolve_bash_target`] to ask
 	/// `moon_container::Workspace` whether the container is running.
 	workspaces_dir: Utf8PathBuf,
+	/// Per-machine root for persisted coder sessions —
+	/// `<XDG_DATA_HOME>/moon-ide/coder-sessions/`. Each workspace
+	/// folder gets a deterministic `<basename>-<hash>/` subdirectory
+	/// computed by [`sessions::project_slug`]; the JSONL files
+	/// live one level deeper still. Sessions deliberately don't
+	/// live inside the project tree any more — they're personal
+	/// scratch / history, not project artefacts.
+	coder_sessions_dir: Utf8PathBuf,
 }
 
 /// Per-turn cancellation token + "is anything running right now?"
@@ -92,12 +100,13 @@ struct Session {
 	/// moment the session is created; it lands on disk only after
 	/// the first record append (lazy persist, see `sessions.rs`).
 	header: SessionHeader,
-	/// Workspace folder root the session is bound to. `None` for
-	/// a fresh session that hasn't been associated with a folder
-	/// yet (the binding happens on first `send`, taking the
-	/// active folder at that moment). Without it we can't write
-	/// to disk and `list_sessions` won't see the file.
-	folder_root: Option<Utf8PathBuf>,
+	/// Resolved sessions directory the session writes to (typically
+	/// `<XDG_DATA_HOME>/moon-ide/coder-sessions/<project-slug>/`).
+	/// `None` for a fresh session that hasn't been associated with
+	/// a folder yet (the binding happens on first `send`, taking
+	/// the active folder at that moment). Without it we can't
+	/// write to disk and `list_sessions` won't see the file.
+	session_dir: Option<Utf8PathBuf>,
 	/// The full chat history sent to the model. Always starts
 	/// with the system prompt; everything else appends in turn
 	/// order. The system prompt is **not** persisted — re-opening
@@ -129,7 +138,7 @@ impl Session {
 				updated_at_ms: now,
 				model: DEFAULT_LARGE_MODEL.to_string(),
 			},
-			folder_root: None,
+			session_dir: None,
 			messages: vec![ChatMessage::System {
 				content: PHASE_6_0_SYSTEM_PROMPT.to_string(),
 			}],
@@ -153,7 +162,11 @@ impl Session {
 pub type Coder = CoderHandle;
 
 impl CoderHandle {
-	pub fn new(workspaces: Arc<WorkspaceRegistry>, workspaces_dir: Utf8PathBuf) -> Result<Self, CoderError> {
+	pub fn new(
+		workspaces: Arc<WorkspaceRegistry>,
+		workspaces_dir: Utf8PathBuf,
+		coder_sessions_dir: Utf8PathBuf,
+	) -> Result<Self, CoderError> {
 		let auth = Authenticator::new()?;
 		let inference = InferenceClient::new(auth.clone())?;
 		let tools = ToolRegistry::new(workspaces.clone(), workspaces_dir.clone());
@@ -168,6 +181,7 @@ impl CoderHandle {
 				session: Arc::new(Mutex::new(Session::new_blank())),
 				workspaces,
 				workspaces_dir,
+				coder_sessions_dir,
 			}),
 		})
 	}
@@ -233,8 +247,9 @@ impl CoderHandle {
 		let Some(folder) = self.state.workspaces.active_folder().await else {
 			return Ok(Vec::new());
 		};
-		let root = Utf8PathBuf::from(folder.folder.path.clone());
-		sessions::list_sessions(&root).await
+		let folder_root = Utf8PathBuf::from(folder.folder.path.clone());
+		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_root);
+		sessions::list_sessions(&dir).await
 	}
 
 	/// Discard the current in-memory session and start a blank
@@ -266,8 +281,9 @@ impl CoderHandle {
 			.active_folder()
 			.await
 			.ok_or(CoderError::NoActiveFolder)?;
-		let root = Utf8PathBuf::from(folder.folder.path.clone());
-		let LoadedSession { header, records } = sessions::load(&root, &id).await?;
+		let folder_root = Utf8PathBuf::from(folder.folder.path.clone());
+		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_root);
+		let LoadedSession { header, records } = sessions::load(&dir, &id).await?;
 
 		self.abort_inner().await;
 		let mut messages: Vec<ChatMessage> = vec![ChatMessage::System {
@@ -309,7 +325,7 @@ impl CoderHandle {
 		};
 		let session = Session {
 			header,
-			folder_root: Some(root),
+			session_dir: Some(dir),
 			messages,
 			persisted_records: records.len() as u32,
 			auto_rename_pending: false,
@@ -345,8 +361,9 @@ impl CoderHandle {
 			.active_folder()
 			.await
 			.ok_or(CoderError::NoActiveFolder)?;
-		let root = Utf8PathBuf::from(folder.folder.path.clone());
-		sessions::delete(&root, &id).await?;
+		let folder_root = Utf8PathBuf::from(folder.folder.path.clone());
+		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_root);
+		sessions::delete(&dir, &id).await?;
 		{
 			let mut session = self.state.session.lock().await;
 			if session.header.id == id {
@@ -379,6 +396,7 @@ impl CoderHandle {
 			.await
 			.ok_or(CoderError::NoActiveFolder)?;
 		let folder_root = Utf8PathBuf::from(folder.folder.path.clone());
+		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_root);
 
 		let cancel = CancellationToken::new();
 		{
@@ -387,12 +405,13 @@ impl CoderHandle {
 		}
 
 		// Bind / prep the session: first `send` allocates the
-		// title and locks the folder; subsequent sends just append.
+		// title and locks the sessions dir; subsequent sends just
+		// append.
 		let (auto_rename_after, summary_to_announce) = {
 			let mut session = self.state.session.lock().await;
 			let needs_loaded_event = session.header.title.is_empty() && session.persisted_records == 0;
-			if session.folder_root.is_none() {
-				session.folder_root = Some(folder_root.clone());
+			if session.session_dir.is_none() {
+				session.session_dir = Some(dir.clone());
 			}
 			if session.header.title.is_empty() {
 				session.header.title = session_title_from_prompt(&text);
@@ -429,12 +448,12 @@ impl CoderHandle {
 			let mut session = self.state.session.lock().await;
 			session.messages.push(ChatMessage::User { content: text.clone() });
 			let header = session.header.clone();
-			let root = session
-				.folder_root
+			let dir = session
+				.session_dir
 				.clone()
-				.expect("folder_root set above before this point");
+				.expect("session_dir set above before this point");
 			drop(session);
-			if let Err(err) = sessions::append_record(&root, &header, &SessionRecord::User { text: text.clone() }).await {
+			if let Err(err) = sessions::append_record(&dir, &header, &SessionRecord::User { text: text.clone() }).await {
 				tracing::warn!(error = %err, "failed to persist user message");
 			} else {
 				let mut session = self.state.session.lock().await;
@@ -652,19 +671,19 @@ async fn run_turn(state: &Arc<CoderState>, cancel: CancellationToken) -> Result<
 /// Append an `Assistant` record to the active session's JSONL.
 /// Best-effort: a write failure logs but doesn't fail the turn.
 async fn persist_assistant_record(state: &Arc<CoderState>, response: &AssistantResponse) {
-	let (root, header) = {
+	let (dir, header) = {
 		let session = state.session.lock().await;
-		let Some(root) = session.folder_root.clone() else {
+		let Some(dir) = session.session_dir.clone() else {
 			return;
 		};
-		(root, session.header.clone())
+		(dir, session.header.clone())
 	};
 	let record = SessionRecord::Assistant {
 		content: response.content.clone(),
 		thinking: response.thinking.clone(),
 		tool_calls: response.tool_calls.clone(),
 	};
-	if let Err(err) = sessions::append_record(&root, &header, &record).await {
+	if let Err(err) = sessions::append_record(&dir, &header, &record).await {
 		tracing::warn!(error = %err, "failed to persist assistant message");
 		return;
 	}
@@ -673,18 +692,18 @@ async fn persist_assistant_record(state: &Arc<CoderState>, response: &AssistantR
 }
 
 async fn persist_tool_record(state: &Arc<CoderState>, tool_call_id: &str, content: &str) {
-	let (root, header) = {
+	let (dir, header) = {
 		let session = state.session.lock().await;
-		let Some(root) = session.folder_root.clone() else {
+		let Some(dir) = session.session_dir.clone() else {
 			return;
 		};
-		(root, session.header.clone())
+		(dir, session.header.clone())
 	};
 	let record = SessionRecord::Tool {
 		tool_call_id: tool_call_id.to_string(),
 		content: content.to_string(),
 	};
-	if let Err(err) = sessions::append_record(&root, &header, &record).await {
+	if let Err(err) = sessions::append_record(&dir, &header, &record).await {
 		tracing::warn!(error = %err, "failed to persist tool result");
 		return;
 	}
@@ -703,13 +722,13 @@ fn spawn_auto_rename(state: Arc<CoderState>) {
 		// Snapshot the chat history without holding the session
 		// lock across the LLM call — turns / aborts must be able
 		// to grab it freely while we wait on the network.
-		let (root, header_snapshot, transcript) = {
+		let (dir, header_snapshot, transcript) = {
 			let mut session = state.session.lock().await;
 			session.auto_rename_pending = false;
-			let Some(root) = session.folder_root.clone() else {
+			let Some(dir) = session.session_dir.clone() else {
 				return;
 			};
-			(root, session.header.clone(), summarise_transcript(&session.messages))
+			(dir, session.header.clone(), summarise_transcript(&session.messages))
 		};
 		if transcript.is_empty() {
 			return;
@@ -754,7 +773,7 @@ fn spawn_auto_rename(state: Arc<CoderState>) {
 		let header_for_disk = session.header.clone();
 		drop(session);
 		if let Err(err) = sessions::append_record(
-			&root,
+			&dir,
 			&header_for_disk,
 			&SessionRecord::TitleUpdate {
 				title: new_title.clone(),

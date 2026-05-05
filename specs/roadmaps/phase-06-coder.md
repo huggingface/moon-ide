@@ -276,14 +276,16 @@ What ships:
   multi-select with a confirm button. Auto-scrolls into view when
   it appears.
 
-### 6.6 — System prompt + skills
+### 6.6 — System prompt + skills + context telemetry
 
 **Acceptance**: the agent's system prompt includes (a) the
 hardcoded base, (b) `AGENTS.md` walked from the active workspace
 folder, (c) `<workspace>/.moon/SYSTEM.md` if present, (d) a list
 of discovered `SKILL.md` files with their frontmatter
 descriptions. The agent can `read_file` a skill body when it
-decides to use one.
+decides to use one. The panel surfaces context-window usage as a
+ring around the new-session button so the user sees compaction
+coming before it lands.
 
 What ships:
 
@@ -298,6 +300,19 @@ What ships:
   `fast`-model call and replaced in-context.
 - The full JSONL on disk is untouched (compaction only affects
   what the LLM sees, not what we persist).
+- Context-usage telemetry: read the `usage.prompt_tokens` /
+  `usage.total_tokens` block from the final SSE chunk on every
+  turn (HF Inference Providers passes it through from the
+  underlying provider). Plumb that as a `CoderEvent::TurnUsage
+{ prompt_tokens, total_tokens, model_context_limit? }` into
+  the panel; render as a thin ring around the `+` button in the
+  session-bar (filled portion = `total / limit`). The
+  model-context-limit comes from a small hardcoded table in
+  `defaults.rs` keyed on the `model` slug — providers don't
+  echo their own limits and we don't want to force the user to
+  configure them. Unknown models render the ring at zero / no
+  fill; the compaction trigger still fires from the absolute
+  token count.
 
 ### 6.7 — Bucket sync
 

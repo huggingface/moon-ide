@@ -14,6 +14,7 @@
 	import { rightPanel } from './lib/rightPanel.svelte';
 	import { slack } from './lib/slack.svelte';
 	import { bottomPanel } from './lib/bottomPanel.svelte';
+	import { canOpenContainerTerminal, openContainerTerminal, openHostTerminal } from './lib/openTerminal';
 	import { palette, reloadWindow } from './lib/commands.svelte';
 	import { cycleFocus } from './lib/focus';
 	import { ipc } from './lib/ipc';
@@ -182,7 +183,21 @@
 				// in the bottom panel. We swallow the event regardless
 				// of focus so the user can hit it from anywhere.
 				event.preventDefault();
+				const wasVisible = bottomPanel.visible;
 				bottomPanel.toggle();
+				// Auto-spawn a terminal when the user opens an empty
+				// panel — same default the launch-time
+				// `spawnInitialBottomPanelTerminal` applies, just on
+				// the keystroke instead of at startup. Skip when the
+				// panel was already visible (we're hiding it) or
+				// when there's already at least one tab to focus.
+				if (!wasVisible && bottomPanel.tabs.length === 0 && workspace.workspace) {
+					if (canOpenContainerTerminal()) {
+						openContainerTerminal();
+					} else {
+						openHostTerminal();
+					}
+				}
 				return;
 			}
 			// Don't filter by Shift: French AZERTY needs Shift to type

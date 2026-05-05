@@ -29,7 +29,12 @@
 			const source = pendingSource;
 			const token = ++renderToken;
 			void (async () => {
-				const rendered = await renderMarkdown(source);
+				// `linkify: true` so raw URLs in the model's prose
+				// become clickable. Differs from file-content
+				// rendering (`MarkdownView.svelte`), which leaves
+				// linkify off because the author would have used
+				// `[text](url)` if they meant a link.
+				const rendered = await renderMarkdown(source, { linkify: true });
 				if (token !== renderToken) {
 					return;
 				}

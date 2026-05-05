@@ -132,6 +132,11 @@
 		font-family: var(--m-font-mono, monospace);
 		font-size: 11px;
 		line-height: 1.45;
+		/* Match the rendered-markdown defaults — two-column tabs in
+		   chat snippets reads better than the browser default of
+		   eight, and matches our own house style (ADR 0004). */
+		-moz-tab-size: 2;
+		tab-size: 2;
 		overflow-x: auto;
 		/* `overflow-x: auto` with the default `overflow-y: visible`
 		   gets silently coerced to `overflow-y: auto` per CSS spec —

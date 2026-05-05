@@ -29,41 +29,58 @@ import { extractFenceLanguages, highlightCode, loadHighlighters } from './editor
 // We render once per source change. The component caches the result
 // so toggling between Source and Preview without edits is free.
 
-const md = new MarkdownIt({
-	html: false,
-	linkify: false,
-	breaks: false,
-	typographer: false,
-	// `highlight` must be synchronous. Callers preload grammars via
-	// `loadHighlighters` before invoking `renderMarkdown`; inside the
-	// synchronous render `highlightCode` hits the cache and emits
-	// coloured HTML or returns `''` to fall back to markdown-it's
-	// default `<pre><code>` rendering.
-	highlight: (code, lang) => highlightCode(code, lang),
-});
+// Two parser instances differ only in whether bare URLs become
+// links: file-content / docs (the default) keeps `linkify: false`
+// so we don't mangle text the author didn't mean as a URL; chat
+// transcripts (the `Linkified` variant, used by the coder + slack
+// surfaces) opts in because the model / sender will routinely
+// drop raw URLs into prose. Sharing the highlighter + link
+// renderer config below keeps the two surfaces visually identical
+// for everything else.
+function buildMarkdownIt(linkify: boolean): MarkdownIt {
+	const md = new MarkdownIt({
+		html: false,
+		linkify,
+		breaks: false,
+		typographer: false,
+		// `highlight` must be synchronous. Callers preload grammars via
+		// `loadHighlighters` before invoking `renderMarkdown`; inside the
+		// synchronous render `highlightCode` hits the cache and emits
+		// coloured HTML or returns `''` to fall back to markdown-it's
+		// default `<pre><code>` rendering.
+		highlight: (code, lang) => highlightCode(code, lang),
+	});
+	applyLinkRules(md);
+	return md;
+}
+
+const md = buildMarkdownIt(false);
+const mdLinkified = buildMarkdownIt(true);
 
 // Force every link to open in a new context and carry safe `rel`
 // attributes. Prevents `target="_blank"` reverse-tabnabbing for
 // links that opt into a new tab via reference syntax, and makes
 // click-through behaviour predictable inside the IDE webview.
-const defaultLinkRender =
-	md.renderer.rules.link_open ?? ((tokens, idx, options, _env, self) => self.renderToken(tokens, idx, options));
-md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
-	const token = tokens[idx];
-	if (token) {
-		const safeRel = 'noopener noreferrer';
-		const relIdx = token.attrIndex('rel');
-		if (relIdx < 0) {
-			token.attrPush(['rel', safeRel]);
-		} else if (token.attrs) {
-			const attr = token.attrs[relIdx];
-			if (attr) {
-				attr[1] = safeRel;
+function applyLinkRules(parser: MarkdownIt): void {
+	const defaultLinkRender =
+		parser.renderer.rules.link_open ?? ((tokens, idx, options, _env, self) => self.renderToken(tokens, idx, options));
+	parser.renderer.rules.link_open = (tokens, idx, options, env, self) => {
+		const token = tokens[idx];
+		if (token) {
+			const safeRel = 'noopener noreferrer';
+			const relIdx = token.attrIndex('rel');
+			if (relIdx < 0) {
+				token.attrPush(['rel', safeRel]);
+			} else if (token.attrs) {
+				const attr = token.attrs[relIdx];
+				if (attr) {
+					attr[1] = safeRel;
+				}
 			}
 		}
-	}
-	return defaultLinkRender(tokens, idx, options, env, self);
-};
+		return defaultLinkRender(tokens, idx, options, env, self);
+	};
+}
 
 /**
  * Render a Markdown string to sanitised HTML. Async because the
@@ -75,10 +92,18 @@ md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
  * already async, so the Promise is cheap. A second render for the
  * same set of fence languages short-circuits immediately because
  * the parser cache is hot.
+ *
+ * `linkify`: turn bare URLs / emails into clickable links. Off
+ * for file content (the markdown author already wrote `[text](url)`
+ * for things they meant as links); on for chat-style transcripts
+ * where raw URLs in prose are the norm. Default is off so any
+ * existing caller keeps the old behaviour without thinking about
+ * the flag.
  */
-export async function renderMarkdown(source: string): Promise<string> {
+export async function renderMarkdown(source: string, options: { linkify?: boolean } = {}): Promise<string> {
 	await loadHighlighters(extractFenceLanguages(source));
-	const html = md.render(source);
+	const parser = options.linkify ? mdLinkified : md;
+	const html = parser.render(source);
 	return DOMPurify.sanitize(html, {
 		// Block any URI scheme that isn't on the known-safe list.
 		// DOMPurify defaults already cover the common cases; this is

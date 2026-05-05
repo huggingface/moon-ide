@@ -129,10 +129,20 @@ pub fn run() {
 			// from the workspace id at call time.
 			let local_data_dir =
 				dirs::data_local_dir().ok_or_else(|| "could not resolve local data dir for the current platform".to_owned())?;
-			let workspaces_dir = Utf8PathBuf::from_path_buf(local_data_dir)
+			let moon_ide_data = Utf8PathBuf::from_path_buf(local_data_dir)
 				.map_err(|p| format!("non-utf8 local data dir: {}", p.display()))?
-				.join("moon-ide")
-				.join("workspaces");
+				.join("moon-ide");
+			let workspaces_dir = moon_ide_data.join("workspaces");
+			// Coder sessions live alongside compose state under the
+			// shared `moon-ide/` data dir, organised by a slug
+			// derived from each workspace folder's absolute path
+			// (see `moon_coder::sessions::project_slug`). Sessions
+			// are personal scratch / history rather than project
+			// artefacts, so this is the right home — putting them
+			// inside the project tree would put them under VCS by
+			// default and tie them to the on-disk path rather than
+			// the user's account.
+			let coder_sessions_dir = moon_ide_data.join("coder-sessions");
 
 			// Build the shared client cell first, spawn the Slack
 			// poller against it, then hand the same Arc to AppState
@@ -158,7 +168,7 @@ pub fn run() {
 			// would dispatch tools against an empty registry and
 			// every `read_file` would fail with `NoActiveFolder`.
 			let workspaces = Arc::new(WorkspaceRegistry::new());
-			let coder = CoderHandle::new(workspaces.clone(), workspaces_dir.clone())
+			let coder = CoderHandle::new(workspaces.clone(), workspaces_dir.clone(), coder_sessions_dir)
 				.map_err(|err| format!("could not init moon-coder: {err}"))?;
 			commands::coder::spawn_event_pump(app.handle().clone(), coder.clone());
 

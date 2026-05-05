@@ -1,18 +1,33 @@
 //! Session persistence for the coder agent.
 //!
 //! Each session is a JSONL file at
-//! `<workspace folder>/.moon/agent-sessions/<id>.jsonl`. The first
-//! line is a header carrying metadata (id, title, timestamps,
-//! model); every subsequent line is one append-only
+//! `<XDG_DATA_HOME>/moon-ide/coder-sessions/<project-slug>/<id>.jsonl`.
+//! The first line is a header carrying metadata (id, title,
+//! timestamps, model); every subsequent line is one append-only
 //! [`SessionRecord`] capturing user input, assistant output, or
 //! tool I/O.
 //!
-//! Per-workspace placement (rather than a single global directory)
-//! pairs a session with the codebase it's about — switching
-//! folders surfaces only that folder's sessions, and a future
-//! bucket-sync scheme can mirror the folder tree to
-//! `<user>/moon-ide-sessions/<workspace-slug>/<id>.jsonl` without
-//! a slugging dance.
+//! ## Why a global data dir, not the project tree
+//!
+//! Storing sessions inside the project (`<workspace>/.moon/...`)
+//! puts them under version control by default and on the user's
+//! laptop rather than tied to their account. Both wrong:
+//! sessions are personal scratch / history, not project artefacts.
+//! The new layout sits next to compose state under
+//! `<XDG_DATA_HOME>/moon-ide/`, with a `<project-slug>/`
+//! subdirectory derived deterministically from the absolute
+//! folder path so the same project always maps to the same
+//! directory across launches and across teammates' machines maps
+//! to *different* directories (their absolute paths differ).
+//!
+//! ## Project slug
+//!
+//! `<basename>-<8-char FNV-1a hex>`. Basename keeps the directory
+//! readable when the user goes spelunking; the hex suffix
+//! disambiguates two folders that happen to share a basename
+//! (`projects/api` vs `clients/foo/api`). FNV-1a is small,
+//! deterministic, and pure-Rust — `sha2` would be overkill for
+//! eight bytes of disambiguation.
 //!
 //! ## Lazy persistence
 //!
@@ -40,9 +55,6 @@ use crate::inference::ToolCall;
 /// from older schemas are surfaced as parse errors at load time
 /// (the panel falls back to the empty state and logs a warning).
 pub const SESSION_SCHEMA_VERSION: u32 = 1;
-
-/// Subdirectory under each workspace folder where sessions live.
-const SESSIONS_DIRNAME: &str = ".moon/agent-sessions";
 
 /// File extension on every session file.
 const SESSION_EXT: &str = "jsonl";
@@ -118,10 +130,66 @@ pub struct LoadedSession {
 	pub records: Vec<SessionRecord>,
 }
 
-/// Resolve the per-folder sessions directory. Doesn't create it —
+/// Resolve the sessions directory for one workspace folder under
+/// the global coder-sessions root. Doesn't create the directory —
 /// that happens lazily when the first session writes its header.
-pub fn sessions_dir(folder_root: &Utf8Path) -> Utf8PathBuf {
-	folder_root.join(SESSIONS_DIRNAME)
+///
+/// `coder_sessions_root` is the per-machine
+/// `<XDG_DATA_HOME>/moon-ide/coder-sessions/` directory, owned by
+/// the Tauri layer; `folder_root` is the absolute workspace
+/// folder path the session is bound to.
+pub fn sessions_dir(coder_sessions_root: &Utf8Path, folder_root: &Utf8Path) -> Utf8PathBuf {
+	coder_sessions_root.join(project_slug(folder_root))
+}
+
+/// Deterministic short slug for a workspace folder: the basename
+/// suffixed with an 8-char FNV-1a hash of the canonical path.
+/// Same folder → same slug across launches; different folders →
+/// different slugs even when their basenames collide.
+pub fn project_slug(folder_root: &Utf8Path) -> String {
+	let raw = folder_root.as_str();
+	let basename = folder_root.file_name().unwrap_or("project");
+	let safe_basename = sanitise_basename(basename);
+	let hash = fnv1a32_hex(raw);
+	format!("{safe_basename}-{hash}")
+}
+
+/// Strip basename characters that would break a directory name on
+/// the host filesystem (`/`, `\`, control chars). Everything else
+/// passes through verbatim — sessions live on the user's own
+/// machine and we don't need to be aggressive.
+fn sanitise_basename(s: &str) -> String {
+	let cleaned: String = s
+		.chars()
+		.map(|c| {
+			if c.is_control() || c == '/' || c == '\\' {
+				'_'
+			} else {
+				c
+			}
+		})
+		.collect();
+	if cleaned.is_empty() {
+		"project".to_string()
+	} else {
+		cleaned
+	}
+}
+
+/// FNV-1a 32-bit hex hash. Eight characters of disambiguation;
+/// not cryptographic, but the only collision case we care about
+/// is "two folders whose basename happens to match", and the
+/// chance of a 32-bit collision there is well under one in a
+/// hundred million.
+fn fnv1a32_hex(s: &str) -> String {
+	const FNV_OFFSET: u32 = 0x811c_9dc5;
+	const FNV_PRIME: u32 = 0x0100_0193;
+	let mut h: u32 = FNV_OFFSET;
+	for b in s.bytes() {
+		h ^= u32::from(b);
+		h = h.wrapping_mul(FNV_PRIME);
+	}
+	format!("{h:08x}")
 }
 
 /// Generate a fresh session id. Prefixed with the local-date so
@@ -158,13 +226,12 @@ pub fn session_title_from_prompt(prompt: &str) -> String {
 	out
 }
 
-/// List every session under `folder_root`'s sessions directory.
-/// Returns summaries sorted by `updated_at_ms` descending — the
-/// most-recently-touched session is the most-likely-wanted one
-/// when the panel mounts. Missing directory yields an empty list,
-/// not an error: a fresh workspace just has no sessions yet.
-pub async fn list_sessions(folder_root: &Utf8Path) -> Result<Vec<SessionSummary>, CoderError> {
-	let dir = sessions_dir(folder_root);
+/// List every session in `dir`. Returns summaries sorted by
+/// `updated_at_ms` descending — the most-recently-touched session
+/// is the most-likely-wanted one when the panel mounts. Missing
+/// directory yields an empty list, not an error: a fresh workspace
+/// just has no sessions yet.
+pub async fn list_sessions(dir: &Utf8Path) -> Result<Vec<SessionSummary>, CoderError> {
 	if !tokio::fs::try_exists(dir.as_std_path()).await.unwrap_or(false) {
 		return Ok(Vec::new());
 	}
@@ -214,8 +281,8 @@ pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError>
 }
 
 /// Full read: every JSONL line into [`SessionRecord`]s.
-pub async fn load(folder_root: &Utf8Path, id: &str) -> Result<LoadedSession, CoderError> {
-	let path = session_path(folder_root, id);
+pub async fn load(dir: &Utf8Path, id: &str) -> Result<LoadedSession, CoderError> {
+	let path = session_path(dir, id);
 	let file = tokio::fs::File::open(path.as_std_path())
 		.await
 		.map_err(CoderError::from)?;
@@ -254,12 +321,8 @@ pub async fn load(folder_root: &Utf8Path, id: &str) -> Result<LoadedSession, Cod
 /// Append one record to a session's JSONL file. Creates the file
 /// (and the parent directory) on the first call so callers don't
 /// need to special-case "first write".
-pub async fn append_record(
-	folder_root: &Utf8Path,
-	header: &SessionHeader,
-	record: &SessionRecord,
-) -> Result<(), CoderError> {
-	let path = session_path(folder_root, &header.id);
+pub async fn append_record(dir: &Utf8Path, header: &SessionHeader, record: &SessionRecord) -> Result<(), CoderError> {
+	let path = session_path(dir, &header.id);
 	if let Some(parent) = path.parent() {
 		tokio::fs::create_dir_all(parent.as_std_path())
 			.await
@@ -287,8 +350,8 @@ pub async fn append_record(
 /// Delete a session file. Idempotent — a missing file is not an
 /// error so the UI's "delete then refresh" flow is well-defined
 /// even when two windows race.
-pub async fn delete(folder_root: &Utf8Path, id: &str) -> Result<(), CoderError> {
-	let path = session_path(folder_root, id);
+pub async fn delete(dir: &Utf8Path, id: &str) -> Result<(), CoderError> {
+	let path = session_path(dir, id);
 	match tokio::fs::remove_file(path.as_std_path()).await {
 		Ok(()) => Ok(()),
 		Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -296,10 +359,8 @@ pub async fn delete(folder_root: &Utf8Path, id: &str) -> Result<(), CoderError> 
 	}
 }
 
-fn session_path(folder_root: &Utf8Path, id: &str) -> Utf8PathBuf {
-	let mut path = sessions_dir(folder_root);
-	path.push(format!("{id}.{SESSION_EXT}"));
-	path
+fn session_path(dir: &Utf8Path, id: &str) -> Utf8PathBuf {
+	dir.join(format!("{id}.{SESSION_EXT}"))
 }
 
 pub fn current_time_ms() -> i64 {
@@ -387,8 +448,8 @@ mod tests {
 		// Round-trip a session through the JSONL writer + reader
 		// to make sure the schema survives serde defaults and
 		// `skip_serializing_if` settings.
-		let dir = tempfile::tempdir().unwrap();
-		let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
 		let header = SessionHeader {
 			schema: SESSION_SCHEMA_VERSION,
 			id: "sess-test".into(),
@@ -397,11 +458,11 @@ mod tests {
 			updated_at_ms: 1,
 			model: "test/model".into(),
 		};
-		append_record(&root, &header, &SessionRecord::User { text: "hi".into() })
+		append_record(&dir, &header, &SessionRecord::User { text: "hi".into() })
 			.await
 			.unwrap();
 		append_record(
-			&root,
+			&dir,
 			&header,
 			&SessionRecord::Assistant {
 				content: Some("hey".into()),
@@ -412,7 +473,7 @@ mod tests {
 		.await
 		.unwrap();
 		append_record(
-			&root,
+			&dir,
 			&header,
 			&SessionRecord::TitleUpdate {
 				title: "renamed by auto-pass".into(),
@@ -420,8 +481,20 @@ mod tests {
 		)
 		.await
 		.unwrap();
-		let loaded = load(&root, "sess-test").await.unwrap();
+		let loaded = load(&dir, "sess-test").await.unwrap();
 		assert_eq!(loaded.header.title, "renamed by auto-pass");
 		assert_eq!(loaded.records.len(), 3);
+	}
+
+	#[test]
+	fn project_slug_is_deterministic_and_disambiguates() {
+		let a = Utf8PathBuf::from("/home/me/code/moon-ide");
+		let b = Utf8PathBuf::from("/srv/projects/moon-ide");
+		// Same path → same slug, every run.
+		assert_eq!(project_slug(&a), project_slug(&a));
+		// Different paths with the same basename → different
+		// slugs (the FNV suffix disambiguates).
+		assert_eq!(a.file_name(), b.file_name());
+		assert_ne!(project_slug(&a), project_slug(&b));
 	}
 }
