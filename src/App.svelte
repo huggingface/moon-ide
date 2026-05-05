@@ -12,7 +12,7 @@
 	import BottomPanel from './lib/components/BottomPanel.svelte';
 	import { workspace } from './lib/state.svelte';
 	import { rightPanel } from './lib/rightPanel.svelte';
-	import { slack } from './lib/slack.svelte';
+	import { coder } from './lib/coder.svelte';
 	import { bottomPanel } from './lib/bottomPanel.svelte';
 	import { canOpenContainerTerminal, openContainerTerminal, openHostTerminal } from './lib/openTerminal';
 	import { palette, reloadWindow } from './lib/commands.svelte';
@@ -169,12 +169,23 @@
 				return;
 			}
 			if (!event.shiftKey && key === 'l') {
-				// Browsers usually grab Ctrl+L for the address bar — in
-				// the Tauri webview there's no address bar, so it's
-				// free. Echoes Cursor's "Ctrl+L = open chat" muscle
-				// memory, which is the chat panel users will reach for.
+				// Echoes Cursor's `Ctrl+L = open coder chat` muscle
+				// memory:
+				//   - if the editor has a non-empty selection, attach
+				//     it to the coder composer as a chip and open the
+				//     coder panel;
+				//   - otherwise just toggle coder visibility.
+				// Slack still has its status-bar pip + the
+				// speech-bubble swap icon in the coder header + the
+				// `chat.togglePanel` palette entry, so giving up its
+				// own Ctrl+L doesn't hide it from anybody.
 				event.preventDefault();
-				slack.togglePanel();
+				const selection = workspace.activeSelection;
+				if (selection !== null) {
+					coder.addAttachmentFromSelection(selection);
+				} else {
+					coder.togglePanel();
+				}
 				return;
 			}
 			if (!event.shiftKey && key === 'j') {

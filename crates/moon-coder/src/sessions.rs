@@ -205,9 +205,26 @@ pub fn new_session_id() -> String {
 /// non-empty line, drop trailing whitespace, cap at ~60 chars on a
 /// word boundary. Doesn't try hard — the auto-rename pass replaces
 /// this within a few seconds.
+///
+/// The prompt may carry a trailing `<context>...</context>` block
+/// produced by `Ctrl+L` attachments on the frontend (see
+/// `renderPromptWithAttachments` in `coder.svelte.ts`). That block
+/// is for the model only — it would surface as a literal
+/// `<context>` title here when the user sent an attachment-only
+/// message (empty prose + selections). Strip it before picking
+/// the first line so the fallback title is either real prose or
+/// empty (caller renders `(untitled)` for empty).
 pub fn session_title_from_prompt(prompt: &str) -> String {
 	const MAX_TITLE_CHARS: usize = 60;
-	let first_line = prompt.lines().find(|l| !l.trim().is_empty()).unwrap_or(prompt).trim();
+	let cleaned = strip_trailing_context_block(prompt);
+	let first_line = cleaned
+		.lines()
+		.find(|l| !l.trim().is_empty())
+		.map(str::trim)
+		.unwrap_or("");
+	if first_line.is_empty() {
+		return String::new();
+	}
 	if first_line.chars().count() <= MAX_TITLE_CHARS {
 		return first_line.to_string();
 	}
@@ -224,6 +241,22 @@ pub fn session_title_from_prompt(prompt: &str) -> String {
 	}
 	out.push('…');
 	out
+}
+
+/// Peel a trailing `<context>...</context>` block off `prompt`.
+/// Permissive: any `<context>` followed (eventually) by
+/// `</context>` at end-of-text counts. Returns the original
+/// borrow when no such block exists, so callers don't pay an
+/// allocation for the common no-attachment case.
+fn strip_trailing_context_block(prompt: &str) -> &str {
+	let trimmed = prompt.trim_end();
+	if !trimmed.ends_with("</context>") {
+		return prompt;
+	}
+	let Some(open_idx) = trimmed.rfind("<context>") else {
+		return prompt;
+	};
+	&prompt[..open_idx]
 }
 
 /// List every session in `dir`. Returns summaries sorted by
@@ -257,8 +290,20 @@ pub async fn list_sessions(dir: &Utf8Path) -> Result<Vec<SessionSummary>, CoderE
 	Ok(summaries)
 }
 
-/// Read just the JSONL header line of a session file and project
-/// it onto a [`SessionSummary`]. Cheap — one line only.
+/// Read the JSONL header line of a session file and project it onto
+/// a [`SessionSummary`]. Also scans the rest of the file for
+/// [`SessionRecord::TitleUpdate`] entries and folds the last one
+/// into the returned title — without that pass, the auto-rename
+/// (which only appends a `TitleUpdate` record rather than rewriting
+/// the header in place) would never surface in the sessions list,
+/// leaving the user staring at the truncated-prompt fallback even
+/// after the rename pass finished and persisted a real title.
+///
+/// Full-file scan is acceptable here: session files are append-only
+/// and small (typically a few hundred lines), and the list view
+/// runs once per relaunch / once per `SessionListChanged` event.
+/// We tolerate broken trailing lines (incomplete final record from
+/// a crash mid-write) rather than refuse the whole summary.
 pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError> {
 	let file = tokio::fs::File::open(path.as_std_path())
 		.await
@@ -266,12 +311,30 @@ pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError>
 	let mut reader = BufReader::new(file);
 	let mut header_line = String::new();
 	reader.read_line(&mut header_line).await.map_err(CoderError::from)?;
-	let header: SessionHeader = serde_json::from_str(header_line.trim_end()).map_err(|err| {
+	let mut header: SessionHeader = serde_json::from_str(header_line.trim_end()).map_err(|err| {
 		CoderError::decode(
 			path.as_str(),
 			format!("could not parse session header: {err}; raw_len={}", header_line.len()),
 		)
 	})?;
+	let mut line = String::new();
+	loop {
+		line.clear();
+		let read = reader.read_line(&mut line).await.map_err(CoderError::from)?;
+		if read == 0 {
+			break;
+		}
+		let trimmed = line.trim();
+		if trimmed.is_empty() {
+			continue;
+		}
+		let Ok(record) = serde_json::from_str::<SessionRecord>(trimmed) else {
+			continue;
+		};
+		if let SessionRecord::TitleUpdate { title } = record {
+			header.title = title;
+		}
+	}
 	Ok(SessionSummary {
 		id: header.id,
 		title: header.title,
@@ -430,6 +493,35 @@ mod tests {
 	}
 
 	#[test]
+	fn title_strips_trailing_context_block() {
+		// Prose plus an attachment block — title takes the prose line,
+		// not `<context>` from the trailing wrapper.
+		let prompt = "Refactor this for clarity.\n\n<context>\n<code_selection path=\"src/foo.ts\" lines=\"10-20\">\nbody\n</code_selection>\n</context>";
+		let title = session_title_from_prompt(prompt);
+		assert_eq!(title, "Refactor this for clarity.");
+	}
+
+	#[test]
+	fn title_attachment_only_send_returns_empty() {
+		// Empty prose, attachment-only send. With the context block
+		// stripped there's nothing else; caller falls back to its
+		// own "(untitled)" rendering and the auto-rename pass
+		// produces a real title once the first turn finishes.
+		let prompt = "<context>\n<code_selection path=\"src/foo.ts\" lines=\"10-20\">\nbody\n</code_selection>\n</context>";
+		let title = session_title_from_prompt(prompt);
+		assert_eq!(title, "");
+	}
+
+	#[test]
+	fn title_keeps_inline_context_word() {
+		// Only a *trailing* `</context>` triggers the stripper. A
+		// user asking literal questions about the word "context"
+		// keeps their prose intact.
+		let title = session_title_from_prompt("What does <context> mean here?");
+		assert_eq!(title, "What does <context> mean here?");
+	}
+
+	#[test]
 	fn title_uses_first_non_blank_line() {
 		let title = session_title_from_prompt("\n\n  do the thing  \n\nmore stuff");
 		assert_eq!(title, "do the thing");
@@ -484,6 +576,17 @@ mod tests {
 		let loaded = load(&dir, "sess-test").await.unwrap();
 		assert_eq!(loaded.header.title, "renamed by auto-pass");
 		assert_eq!(loaded.records.len(), 3);
+
+		// Regression: `load_summary` must surface the latest
+		// `TitleUpdate` too. Before this fix it returned the
+		// stale truncated-prompt title, and the sessions list
+		// in the panel showed `<context>` / `@path:line-line …`
+		// even after the auto-rename pass had persisted a real
+		// title.
+		let summary_path = session_path(&dir, "sess-test");
+		let summary = load_summary(&summary_path).await.unwrap();
+		assert_eq!(summary.title, "renamed by auto-pass");
+		assert_eq!(summary.id, "sess-test");
 	}
 
 	#[test]

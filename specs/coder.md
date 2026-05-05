@@ -500,6 +500,73 @@ focus in the composer. Empty sessions don't persist until the
 first user message lands; that message creates the JSONL file
 and seeds the title from the prompt.
 
+### Composer attachments
+
+The user can attach an editor selection to the composer via
+`Ctrl+L` (mirrors Cursor's "add to chat" gesture). Mechanics:
+
+- The active editor publishes its non-empty selection to a
+  workspace-level `activeSelection` snapshot (path + 1-based
+  inclusive line range + the selected text captured at the
+  moment of update). Empty selections clear the snapshot.
+- The editor pane shows a small floating `Ctrl+L Add selection
+to Coder` pill in its top-right corner while the snapshot
+  belongs to that pane's file. The pill is keyboard-only — its
+  job is to remind the user the gesture exists, not to
+  duplicate it as a click target.
+- `Ctrl+L` reads the snapshot and (a) inserts an inline
+  `@path:start-end` token at the textarea's caret, (b) adds a
+  matching `ComposerAttachment` to `coder.attachments`, (c)
+  opens the panel, (d) pulls focus to the composer. The chip
+  list dedupes by `(path, range)` so a hammered Ctrl+L only
+  adds one chip — but every press inserts a fresh inline
+  token, matching Cursor's "you can reference the same
+  selection at multiple spots in the prose" behaviour.
+- Each attachment renders as a chip above the textarea:
+  `[doc-icon] basename:start-end [×]`. Click the chip body to
+  jump to the captured range (`workspace.jumpTo`); click `×`
+  to drop the chip _and_ strip every inline token (`@token`
+  with at most one trailing whitespace) out of the draft so
+  the chip and the inline references stay in sync.
+
+#### Wire shape (matches Cursor)
+
+The user prose stays intact, with `@`-tokens inline at the
+positions the user picked. The captured snippet contents land
+in a trailing `<context>` block:
+
+```
+explain the difference between @src/lib/foo.ts:48-50 and
+@src/lib/foo.ts:63-67
+
+<context>
+<code_selection path="src/lib/foo.ts" lines="48-50">
+[lines 48-50 verbatim]
+</code_selection>
+<code_selection path="src/lib/foo.ts" lines="63-67">
+[lines 63-67 verbatim]
+</code_selection>
+</context>
+```
+
+Splitting the two means a multi-attachment prompt reads
+naturally instead of inflating the prose with a wall of code
+headers, and the `<code_selection path lines>` element is the
+same wire shape Cursor's composer ships, which the model has
+already seen plenty of in training. The wrapper element is a
+sufficient delimiter — no need to fence the body — so a
+snippet that contains its own triple-backticks rides through
+unmangled.
+
+Empty draft + non-empty attachments is a valid send (the
+context block ships on its own); empty + empty is a no-op.
+
+The text snapshot lives with the chip — a follow-up edit to
+the file does not change what the agent sees. That matches
+Cursor's behaviour and is the safer interpretation: the user
+asked about the code as it stood when they attached it, not as
+it stands at send time.
+
 ### Compaction
 
 Long sessions exceed the model's context window. moon-coder ships

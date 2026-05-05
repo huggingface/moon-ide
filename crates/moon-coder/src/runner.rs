@@ -345,6 +345,17 @@ impl CoderHandle {
 		for record in records {
 			emit_replay_events(&self.state.events, record);
 		}
+		// Clear the busy state on the frontend. Replayed `UserMessage`
+		// events flip `coder.busy = true` (mirroring the live-turn
+		// flow), but no `TurnComplete` is recorded in the session
+		// log, so without this final nudge the panel would render
+		// the "stop" button after every restore — even for a session
+		// whose last turn finished cleanly hours ago. Sending an
+		// explicit terminator at end-of-replay is correct in all
+		// cases: if the IDE was killed mid-turn we want busy=false
+		// anyway, since no real turn is running on the rehydrated
+		// session.
+		let _ = self.state.events.send(CoderEvent::TurnComplete);
 		Ok(summary)
 	}
 

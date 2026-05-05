@@ -41,6 +41,24 @@ export type MarkdownView = 'source' | 'preview';
 export type { SplitSide } from './protocol';
 
 /**
+ * One non-empty selection inside the active editor. Carries the
+ * path + line range + the captured text so consumers (the coder
+ * composer's "add to chat" affordance) can build a stable
+ * attachment that doesn't change when the user edits the file.
+ *
+ * Lines are 1-based and inclusive — same shape as `read_file`'s
+ * `start_line` / `end_line` arguments and `grep` hits, so a
+ * Cursor-style `@filename:start-end` reference round-trips
+ * straight into the agent's tool surface without conversion.
+ */
+export type EditorSelectionSnapshot = {
+	path: string;
+	startLine: number;
+	endLine: number;
+	text: string;
+};
+
+/**
  * One slot in the navigation history. Captures enough to re-establish
  * both the editor's active buffer and the caret inside it.
  *
@@ -504,6 +522,46 @@ class WorkspaceState {
 		}
 		return this.openFiles.find((f) => f.path === this.activePath) ?? null;
 	});
+
+	/**
+	 * Snapshot of the *non-empty* selection in the active editor,
+	 * if any. Updated by `Editor.svelte`'s selection listener and
+	 * cleared on any of: empty selection, file switch, focus loss
+	 * to a non-editor surface. Read by:
+	 *
+	 * - The `Ctrl+L` keymap, to attach the selected range to the
+	 *   coder composer ("add to chat" gesture, mirrors Cursor).
+	 * - The editor pane's floating "Add to Coder" hint pill.
+	 *
+	 * `text` is captured at update time so a follow-up edit to
+	 * the file doesn't change the agent context — what the user
+	 * attached is what the agent sees.
+	 */
+	activeSelection = $state<EditorSelectionSnapshot | null>(null);
+
+	setActiveSelection(snapshot: EditorSelectionSnapshot | null): void {
+		// Cheap stable equality: same path + same line range +
+		// same length text → no state mutation. The selection
+		// listener fires on every keystroke even when the
+		// selection didn't change (drag-select hits the same
+		// range repeatedly), and we don't want every keystroke to
+		// re-trigger reactive consumers.
+		const a = this.activeSelection;
+		if (a === null && snapshot === null) {
+			return;
+		}
+		if (
+			a !== null &&
+			snapshot !== null &&
+			a.path === snapshot.path &&
+			a.startLine === snapshot.startLine &&
+			a.endLine === snapshot.endLine &&
+			a.text === snapshot.text
+		) {
+			return;
+		}
+		this.activeSelection = snapshot;
+	}
 
 	/**
 	 * Add `path` as a folder in the workspace and make it active.
@@ -1092,11 +1150,26 @@ class WorkspaceState {
 		// commit lands. Scoped to open files — there's no point
 		// warming `HEAD` for files the user isn't looking at, and
 		// the list is typically < 20.
+		//
+		// Same pass also reloads clean buffers from disk: an external
+		// mutation (chat agent tool, formatter, integrated terminal)
+		// can change the file under us, and the in-memory buffer
+		// would otherwise drift from disk silently — the file tree
+		// would mark the row `(M)` (because `git status` looks at
+		// disk) while the gutter / blame / LSP keep showing the
+		// pre-edit content. Dirty buffers are left alone: we don't
+		// silently clobber unsaved user edits. `reloadOpenFileFromDisk`
+		// short-circuits when on-disk and in-memory are already
+		// equal so the watcher's debounced bursts don't churn the
+		// reactive graph for files we just wrote ourselves.
 		for (const file of this.openFiles) {
 			if (file.kind !== 'text' || file.isDeleted) {
 				continue;
 			}
 			this.refreshHead(file.path);
+			if (!file.isDirty) {
+				void this.reloadOpenFileFromDisk(file.path);
+			}
 		}
 	}
 
@@ -1840,14 +1913,21 @@ class WorkspaceState {
 
 	/**
 	 * Pull the on-disk text for `path` into the matching open buffer.
-	 * Used by `discardPaths` after a `git restore`: the buffer's
-	 * cached `text` is now stale and the editor needs the committed
-	 * content to render. Silently no-ops if the buffer was closed
-	 * between the restore kicking off and this call resolving.
+	 * Used by `discardPaths` after a `git restore` and by
+	 * `refreshGitStatus` to sync clean buffers with external
+	 * mutations (chat agent tools, formatters, terminal commands).
+	 * Silently no-ops if the buffer was closed between the call
+	 * kicking off and this resolving, or if the on-disk text already
+	 * matches the live buffer (avoids reactive churn on every
+	 * `fs:changed` event for files that *we* just wrote).
 	 */
 	private async reloadOpenFileFromDisk(path: string) {
 		const next = await this.loadTextFile(path);
 		if (!next) {
+			return;
+		}
+		const current = this.openFiles.find((f) => f.path === path);
+		if (current && current.kind === 'text' && next.kind === 'text' && current.text === next.text) {
 			return;
 		}
 		this.openFiles = this.openFiles.map((f) => (f.path === path ? next : f));

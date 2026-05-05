@@ -16,6 +16,21 @@
 		void coder.refreshStatus();
 	});
 
+	// Keep the store's `composerEl` reference in sync with the
+	// live textarea node — the store needs it so Ctrl+L can
+	// insert an `@`-token at the caret without prop-drilling a
+	// callback. Setting / clearing happens on every mount and
+	// unmount of the textarea (it remounts when the user swaps
+	// between session view and the sessions list).
+	$effect(() => {
+		coder.composerEl = composer ?? null;
+		return () => {
+			if (coder.composerEl === composer) {
+				coder.composerEl = null;
+			}
+		};
+	});
+
 	// Re-probe `coder_status` when the active folder switches so the
 	// host-vs-container indicator pip updates without waiting for the
 	// next user action. Reading `workspace.activeFolder?.host` here
@@ -36,6 +51,25 @@
 			if (scrollEl) {
 				scrollEl.scrollTop = scrollEl.scrollHeight;
 			}
+		});
+	});
+
+	// Pull focus into the composer whenever the store bumps its
+	// focus tick (e.g. Ctrl+L from the editor pushes a selection
+	// onto `coder.attachments` and wants the user typing
+	// straight away). Reads the count to register the dep; the
+	// `tick()` defers until after the panel re-renders the
+	// chips, otherwise the focus call could race the textarea
+	// being remounted.
+	let lastFocusTick = $state(0);
+	$effect(() => {
+		const t = coder.composerFocusTick;
+		if (t === lastFocusTick) {
+			return;
+		}
+		lastFocusTick = t;
+		void tick().then(() => {
+			composer?.focus();
 		});
 	});
 
@@ -98,6 +132,74 @@
 			return;
 		}
 		await coder.deleteSession(id);
+	}
+
+	function baseName(path: string): string {
+		const trimmed = path.replace(/\/+$/, '');
+		const idx = trimmed.lastIndexOf('/');
+		return idx >= 0 ? trimmed.slice(idx + 1) : trimmed;
+	}
+
+	async function onOpenAttachment(attachment: { path: string; startLine: number }): Promise<void> {
+		// Open the file and jump to the first line of the captured
+		// range. We don't try to restore the original column / end
+		// line — the chip is "show me the context I attached", not
+		// a full re-selection gesture. `jumpTo` handles the open
+		// + nav-history bookkeeping (same path Ctrl/Cmd-click
+		// goto-definition takes), so Alt+Left after the chip click
+		// returns to wherever the user was.
+		await workspace.jumpTo(attachment.path, { line: attachment.startLine - 1, character: 0 });
+	}
+
+	type ParsedAttachment = { path: string; startLine: number; endLine: number };
+
+	/** Pull the trailing `<context>...</context>` block out of a user
+	 *  message and parse its `<code_selection>` children into clickable
+	 *  references. The context block always sits at the very end of
+	 *  the prompt (see `renderPromptWithAttachments`), preceded by
+	 *  exactly two newlines — so we anchor the regex to `$` rather
+	 *  than scanning the whole text. Malformed input falls through:
+	 *  on a parse miss we just render the raw text and skip chip
+	 *  rendering, never crash on edge cases (model echoing back
+	 *  `<context>` in an answer, partial buffers during streaming,
+	 *  etc.). */
+	function parseUserPrompt(text: string): { prose: string; attachments: ParsedAttachment[] } {
+		const match = text.match(/(?:\n\n)?<context>\n([\s\S]*?)\n<\/context>\s*$/);
+		if (!match) {
+			return { prose: text, attachments: [] };
+		}
+		const proseEnd = match.index ?? 0;
+		const prose = text.slice(0, proseEnd);
+		const inner = match[1] ?? '';
+		const selectionRe = /<code_selection\s+path="([^"]*)"\s+lines="([^"]*)">/g;
+		const attachments: ParsedAttachment[] = [];
+		let m: RegExpExecArray | null;
+		while ((m = selectionRe.exec(inner)) !== null) {
+			const rawPath = m[1];
+			const range = m[2];
+			if (rawPath === undefined || range === undefined) {
+				continue;
+			}
+			const path = unescapeXmlAttr(rawPath);
+			const dash = range.indexOf('-');
+			let startLine: number;
+			let endLine: number;
+			if (dash >= 0) {
+				startLine = parseInt(range.slice(0, dash), 10);
+				endLine = parseInt(range.slice(dash + 1), 10);
+			} else {
+				startLine = parseInt(range, 10);
+				endLine = startLine;
+			}
+			if (Number.isFinite(startLine) && Number.isFinite(endLine) && startLine > 0) {
+				attachments.push({ path, startLine, endLine });
+			}
+		}
+		return { prose, attachments };
+	}
+
+	function unescapeXmlAttr(s: string): string {
+		return s.replaceAll('&quot;', '"').replaceAll('&lt;', '<').replaceAll('&gt;', '>').replaceAll('&amp;', '&');
 	}
 
 	const RELATIVE_FORMATTER = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' });
@@ -288,9 +390,47 @@
 			{/if}
 			{#each coder.rows as row (row.id)}
 				{#if row.kind === 'user'}
+					{@const parsed = parseUserPrompt(row.text)}
 					<div class="row user">
 						<div class="row-label">you</div>
-						<div class="bubble">{row.text}</div>
+						{#if parsed.prose.trim().length > 0}
+							<div class="bubble">{parsed.prose}</div>
+						{/if}
+						{#if parsed.attachments.length > 0}
+							<!-- The context block the user attached at send
+								 time, rendered as clickable chips instead
+								 of a verbatim XML wall in the bubble.
+								 Clicking opens the file at the captured
+								 starting line — the file may have changed
+								 since (the agent likely just edited it),
+								 so this is a "navigate to the spot I
+								 referenced" gesture, not "show me what I
+								 sent". -->
+							<div class="user-refs">
+								{#each parsed.attachments as ref, i (ref.path + ':' + ref.startLine + '-' + ref.endLine + ':' + i)}
+									<button
+										type="button"
+										class="user-ref"
+										title={`${ref.path}:${ref.startLine}-${ref.endLine}`}
+										onclick={() =>
+											onOpenAttachment({
+												path: ref.path,
+												startLine: ref.startLine,
+											})}
+									>
+										{@render fileIcon()}
+										<span class="user-ref-label">
+											<span class="user-ref-name">{baseName(ref.path)}</span>
+											<span class="user-ref-range"
+												>{ref.startLine === ref.endLine
+													? `:${ref.startLine}`
+													: `:${ref.startLine}-${ref.endLine}`}</span
+											>
+										</span>
+									</button>
+								{/each}
+							</div>
+						{/if}
 					</div>
 				{:else if row.kind === 'assistant'}
 					<div class="row assistant">
@@ -348,10 +488,52 @@
 			{/each}
 		</div>
 		<div class="composer">
+			{#if coder.attachments.length > 0}
+				<!-- Attached selections / files. Click the body to
+					 open the file at the captured range; click the
+					 × to remove the chip. The text snapshot the
+					 chip carries gets prepended to the prompt as a
+					 fenced code block on send. -->
+				<div class="attachments" role="list">
+					{#each coder.attachments as attachment (attachment.id)}
+						<div class="attachment" role="listitem">
+							<button
+								type="button"
+								class="attachment-open"
+								title={`${attachment.path}:${attachment.startLine}-${attachment.endLine}`}
+								onclick={() => onOpenAttachment(attachment)}
+							>
+								{@render fileIcon()}
+								<span class="attachment-label">
+									<span class="attachment-name">{baseName(attachment.path)}</span>
+									<span class="attachment-range">
+										{attachment.startLine === attachment.endLine
+											? `:${attachment.startLine}`
+											: `:${attachment.startLine}-${attachment.endLine}`}
+									</span>
+								</span>
+							</button>
+							<button
+								type="button"
+								class="attachment-remove"
+								title="Remove attachment"
+								aria-label="Remove attachment"
+								onclick={() => coder.removeAttachment(attachment.id)}
+							>
+								×
+							</button>
+						</div>
+					{/each}
+				</div>
+			{/if}
 			<textarea
 				bind:this={composer}
 				bind:value={coder.draft}
-				placeholder={coder.busy ? 'Press Esc to stop the turn…' : 'Ask the coder…'}
+				placeholder={coder.busy
+					? 'Press Esc to stop the turn…'
+					: coder.attachments.length > 0
+						? 'Ask about the attached selection…'
+						: 'Ask the coder…'}
 				rows="3"
 				disabled={coder.busy}
 				onkeydown={onComposerKey}
@@ -398,6 +580,26 @@
 		<path d="M3 4h10" />
 		<path d="M3 8h10" />
 		<path d="M3 12h10" />
+	</svg>
+{/snippet}
+
+{#snippet fileIcon()}
+	<svg
+		viewBox="0 0 16 16"
+		width="12"
+		height="12"
+		fill="none"
+		stroke="currentColor"
+		stroke-width="1.4"
+		stroke-linecap="round"
+		stroke-linejoin="round"
+		aria-hidden="true"
+	>
+		<!-- Generic document outline. We don't try to pick per-language
+			 icons here — the chip is small, the basename is more
+			 informative than a glyph. -->
+		<path d="M4 2h5l3 3v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1Z" />
+		<path d="M9 2v3h3" />
 	</svg>
 {/snippet}
 
@@ -722,6 +924,50 @@
 	.row.user .bubble {
 		background: color-mix(in srgb, var(--m-accent) 18%, transparent);
 	}
+	/* Inline references attached to a user message. Sit just below
+	   the prose bubble and read as quiet "links" rather than
+	   primary content — the referenced code may have been edited
+	   by the agent already, so these are nav affordances first,
+	   citations second. */
+	.user-refs {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 4px;
+	}
+	.user-ref {
+		font: inherit;
+		font-size: 11px;
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		padding: 2px 6px;
+		background: var(--m-bg-overlay);
+		color: var(--m-fg-muted);
+		border: 1px solid var(--m-border);
+		border-radius: 10px;
+		cursor: pointer;
+		max-width: 100%;
+	}
+	.user-ref:hover {
+		color: var(--m-fg);
+		background: color-mix(in srgb, var(--m-accent) 14%, transparent);
+		border-color: color-mix(in srgb, var(--m-accent) 40%, var(--m-border));
+	}
+	.user-ref-label {
+		display: inline-flex;
+		align-items: baseline;
+		gap: 1px;
+		min-width: 0;
+	}
+	.user-ref-name {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.user-ref-range {
+		color: var(--m-fg-subtle);
+		flex-shrink: 0;
+	}
 	.row.error .bubble {
 		background: color-mix(in srgb, var(--m-danger) 14%, transparent);
 		color: var(--m-danger);
@@ -764,6 +1010,71 @@
 		flex-shrink: 0;
 		border-top: 1px solid var(--m-border);
 		padding: 8px;
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+	}
+	.attachments {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 4px;
+	}
+	.attachment {
+		display: inline-flex;
+		align-items: stretch;
+		font-size: 11px;
+		background: var(--m-bg-overlay);
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		max-width: 100%;
+		min-width: 0;
+	}
+	.attachment-open {
+		font: inherit;
+		font-size: 11px;
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		padding: 2px 4px 2px 6px;
+		background: transparent;
+		border: 0;
+		color: var(--m-fg);
+		cursor: pointer;
+		min-width: 0;
+		max-width: 220px;
+	}
+	.attachment-open:hover {
+		background: color-mix(in srgb, var(--m-accent) 14%, transparent);
+	}
+	.attachment-label {
+		display: inline-flex;
+		align-items: baseline;
+		gap: 1px;
+		min-width: 0;
+	}
+	.attachment-name {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.attachment-range {
+		color: var(--m-fg-muted);
+		flex-shrink: 0;
+	}
+	.attachment-remove {
+		font: inherit;
+		font-size: 13px;
+		line-height: 1;
+		color: var(--m-fg-muted);
+		background: transparent;
+		border: 0;
+		border-left: 1px solid var(--m-border);
+		padding: 0 6px;
+		cursor: pointer;
+	}
+	.attachment-remove:hover {
+		color: var(--m-fg);
+		background: color-mix(in srgb, var(--m-danger) 14%, transparent);
 	}
 	textarea {
 		width: 100%;

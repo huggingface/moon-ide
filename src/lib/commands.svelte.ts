@@ -1,5 +1,6 @@
 import { confirm, open } from '@tauri-apps/plugin-dialog';
 import { workspace } from './state.svelte';
+import { coder } from './coder.svelte';
 import { slack } from './slack.svelte';
 import { ipc } from './ipc';
 import { formatError, type FileSearchResult, type ContentSearchHit } from './protocol';
@@ -219,12 +220,26 @@ export const builtInCommands: Command[] = [
 		run: () => workspace.refreshActiveFolder(),
 	},
 	{
+		id: 'coder.togglePanel',
+		// Ctrl+L mirrors Cursor's "open chat" gesture. With a
+		// selection in the editor it attaches the range as a chip;
+		// without one it just toggles visibility. The palette
+		// entry doesn't carry the selection-attach behaviour
+		// (palette dispatch isn't tied to editor focus), so it
+		// only ever toggles.
+		title: () => (coder.panelVisible ? 'Coder: Hide Panel' : 'Coder: Show Panel'),
+		shortcut: 'Ctrl+L',
+		run: () => coder.togglePanel(),
+	},
+	{
 		id: 'chat.togglePanel',
 		// Wording flips with panel state — same diagnostic value as
 		// the theme toggle, and means the user knows which way the
-		// command goes before clicking.
+		// command goes before clicking. No keyboard shortcut: Ctrl+L
+		// went to the coder panel (mirroring Cursor); slack reaches
+		// from the status-bar pip and the speech-bubble icon on the
+		// coder header.
 		title: () => (slack.panelVisible ? 'Chat: Hide Panel' : 'Chat: Show Panel'),
-		shortcut: 'Ctrl+L',
 		run: () => slack.togglePanel(),
 	},
 	{

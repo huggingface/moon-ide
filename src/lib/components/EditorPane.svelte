@@ -38,6 +38,23 @@
 			workspace.previewModeFor(activeFile.path) === 'preview' &&
 			!showDiff,
 	);
+	// Show the "Add to Coder" hint only when this pane is showing
+	// the file the workspace's `activeSelection` points at, and
+	// only over the live editor surface (image / diff / markdown
+	// preview don't expose CodeMirror selections we can attach).
+	const showCoderHint = $derived.by(() => {
+		const selection = workspace.activeSelection;
+		if (selection === null) {
+			return false;
+		}
+		if (activeFile === null || activeFile.kind !== 'text') {
+			return false;
+		}
+		if (showDiff || showMarkdownPreview) {
+			return false;
+		}
+		return selection.path === activeFile.path;
+	});
 
 	async function pickFolder() {
 		const selected = await open({ directory: true, multiple: false });
@@ -73,6 +90,21 @@
 		{:else}
 			<Welcome onPickFolder={pickFolder} />
 		{/if}
+		{#if showCoderHint}
+			<!-- Floating reminder for the Ctrl+L "add selection to
+				 coder" gesture. Visible only when the workspace's
+				 active selection belongs to *this* pane's file —
+				 otherwise the user might have selected text in the
+				 other split and we'd be advertising the gesture in
+				 the wrong corner. Pointer-events disabled because
+				 a click on the pill does nothing useful (the
+				 gesture is keyboard-only); the hint shouldn't trap
+				 a click that was meant to land in the editor. -->
+			<div class="coder-hint" aria-hidden="true">
+				<kbd>Ctrl+L</kbd>
+				<span>Add selection to Coder</span>
+			</div>
+		{/if}
 	</div>
 </div>
 
@@ -95,5 +127,39 @@
 		flex: 1;
 		min-height: 0;
 		display: flex;
+		position: relative;
+	}
+	/* Floating "Ctrl+L Add selection to Coder" hint. Anchored to
+	   the editor body's top-right corner, away from the file
+	   tabs (which sit above `.body`) and clear of the editor's
+	   own gutter / scrollbar. Pointer-events disabled — the
+	   gesture is keyboard-only, and we don't want a stray click
+	   on the pill to land here instead of the editor. */
+	.coder-hint {
+		position: absolute;
+		top: 6px;
+		right: 14px;
+		z-index: 4;
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		padding: 3px 6px 3px 4px;
+		background: color-mix(in srgb, var(--m-bg-1) 92%, transparent);
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		font-size: 11px;
+		color: var(--m-fg-muted);
+		pointer-events: none;
+		box-shadow: 0 1px 4px rgba(0, 0, 0, 0.16);
+	}
+	.coder-hint kbd {
+		font: inherit;
+		font-family: var(--m-font-mono, monospace);
+		font-size: 10px;
+		padding: 1px 4px;
+		background: var(--m-bg-overlay);
+		border: 1px solid var(--m-border);
+		border-radius: 3px;
+		color: var(--m-fg);
 	}
 </style>

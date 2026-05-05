@@ -68,6 +68,10 @@
 		currentPath = file.path;
 		void applyLanguage(file.path, file.text);
 		return () => {
+			// Clear any selection snapshot tied to this view so a
+			// re-mount (HMR, file-tab close) doesn't leave the
+			// "Add to Coder" hint hovering over a dead path.
+			workspace.setActiveSelection(null);
 			view?.destroy();
 			view = undefined;
 		};
@@ -93,6 +97,10 @@
 			// the live view doc — content equality would silently
 			// mis-classify those saves as tab switches and reset state.
 			const renamed = workspace.isRename(currentPath, file.path);
+			// Tab swap drops the previous file's selection
+			// snapshot — Ctrl+L should never attach a selection
+			// from a tab the user just left.
+			workspace.setActiveSelection(null);
 			currentPath = file.path;
 			void workspace.ensureEditorConfig(file.path);
 			void applyLanguage(file.path, file.text);
@@ -358,6 +366,13 @@
 				if (!update.selectionSet || currentPath === null) {
 					return;
 				}
+				// Publish the active editor's *non-empty* selection
+				// to the workspace store so Ctrl+L (and the floating
+				// "Add to Coder" hint) can read it without poking
+				// the CodeMirror view. Empty selections clear the
+				// snapshot — the coder hint shouldn't appear for a
+				// caret-only state.
+				publishSelection(update);
 				const folder = workspace.activeFolderPath;
 				if (folder === null) {
 					return;
@@ -391,6 +406,41 @@
 		// per-level width, and `tabSize` for visual rendering of `\t`.
 		const unit = ec.indent_style === 'tab' ? '\t' : ' '.repeat(Math.max(1, ec.indent_size));
 		return [EditorState.tabSize.of(Math.max(1, ec.tab_width)), indentUnit.of(unit)];
+	}
+
+	// Publish or clear the workspace-level `activeSelection` so
+	// `Ctrl+L` and the editor pane's "Add to Coder" hint can read
+	// the selection without round-tripping through CodeMirror.
+	// Empty (caret-only) selections clear the snapshot. We snapshot
+	// the *text* at update time on purpose — Cursor's behaviour:
+	// the agent sees what was selected when the user attached, not
+	// what the file looks like later.
+	function publishSelection(update: { state: EditorState }) {
+		if (currentPath === null) {
+			workspace.setActiveSelection(null);
+			return;
+		}
+		const sel = update.state.selection.main;
+		if (sel.empty) {
+			workspace.setActiveSelection(null);
+			return;
+		}
+		const fromLine = update.state.doc.lineAt(sel.from);
+		const toLine = update.state.doc.lineAt(sel.to);
+		// CodeMirror's `selection.main.to` lives just *past* the
+		// last selected character. When the user's drag ends at the
+		// start of a line they didn't actually intend to include,
+		// we snap back to the previous line so `89-101` doesn't
+		// accidentally become `89-102` for an off-by-one drag.
+		const effectiveToLineNumber =
+			sel.to === toLine.from && toLine.number > fromLine.number ? toLine.number - 1 : toLine.number;
+		const text = update.state.doc.sliceString(sel.from, sel.to);
+		workspace.setActiveSelection({
+			path: currentPath,
+			startLine: fromLine.number,
+			endLine: effectiveToLineNumber,
+			text,
+		});
 	}
 
 	// LSP position → CM offset, clamped so a range that pointed
