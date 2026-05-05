@@ -2,6 +2,7 @@
 	import { onMount, tick } from 'svelte';
 	import { confirm } from '@tauri-apps/plugin-dialog';
 	import { coder } from '../coder.svelte';
+	import { slack } from '../slack.svelte';
 	import { workspace } from '../state.svelte';
 	import CoderConnectModal from './CoderConnectModal.svelte';
 	import CoderMarkdown from './CoderMarkdown.svelte';
@@ -73,7 +74,6 @@
 <div class="panel" data-region="coder">
 	<header class="header">
 		<div class="title">
-			<span class="dot" class:on={coder.signedIn}></span>
 			<span class="label">Coder</span>
 			{#if coder.identity}
 				<span class="who">{coder.identity.username}</span>
@@ -95,6 +95,36 @@
 			{#if coder.busy}
 				<button type="button" class="stop" title="Stop turn (Esc)" onclick={() => coder.abort()}>stop</button>
 			{/if}
+			<!-- Swap the right-side slot from coder to chat. Same
+				 affordance the chat panel has in the other
+				 direction. -->
+			<button
+				type="button"
+				class="icon"
+				title="Switch to Chat"
+				aria-label="Switch to Chat"
+				onclick={() => slack.togglePanel()}
+			>
+				<svg
+					viewBox="0 0 16 16"
+					width="14"
+					height="14"
+					fill="none"
+					stroke="currentColor"
+					stroke-width="1.4"
+					stroke-linecap="round"
+					stroke-linejoin="round"
+					aria-hidden="true"
+				>
+					<!-- Speech bubble — generic "chat" rather than the
+						 trademarked Slack hash; the panel itself is
+						 chat regardless of the backend (we may add
+						 non-Slack chats later). -->
+					<path
+						d="M2.5 4a1.5 1.5 0 0 1 1.5-1.5h8A1.5 1.5 0 0 1 13.5 4v5a1.5 1.5 0 0 1-1.5 1.5H6.5L3.5 13v-2.5H4A1.5 1.5 0 0 1 2.5 9z"
+					/>
+				</svg>
+			</button>
 			{#if coder.signedIn}
 				<button type="button" class="icon" title="Sign out" aria-label="Sign out" onclick={onSignOut}>
 					<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
@@ -222,17 +252,6 @@
 		letter-spacing: 0.04em;
 		font-size: 11px;
 		color: var(--m-fg-muted);
-	}
-	.dot {
-		display: inline-block;
-		width: 6px;
-		height: 6px;
-		border-radius: 50%;
-		background: var(--m-fg-subtle);
-		flex-shrink: 0;
-	}
-	.dot.on {
-		background: var(--m-success);
 	}
 	.label {
 		color: var(--m-fg);

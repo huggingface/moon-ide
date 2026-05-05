@@ -76,13 +76,21 @@ impl ToolRegistry {
 		vec![
 			ToolDefinition::function(
 				"read_file",
-				"Read the contents of a file inside the active workspace folder. Returns the file's text. Refuses paths outside the workspace.",
+				"Read the contents of a file inside the active workspace folder. Returns the file's text, with each line prefixed by `<line_number>|<line>`. Treat the prefix as metadata — it is not part of the file. Optional `start_line` / `end_line` (1-based, inclusive) read just a slice; both omitted means read the whole file (capped at 200 kB). Refuses paths outside the workspace.",
 				json!({
 					"type": "object",
 					"properties": {
 						"path": {
 							"type": "string",
 							"description": "Workspace-relative path to the file."
+						},
+						"start_line": {
+							"type": "integer",
+							"description": "First line to include, 1-based and inclusive. Omit to start at line 1."
+						},
+						"end_line": {
+							"type": "integer",
+							"description": "Last line to include, 1-based and inclusive. Clamped silently if past EOF. Omit to read to EOF."
 						}
 					},
 					"required": ["path"]
@@ -104,7 +112,7 @@ impl ToolRegistry {
 			),
 			ToolDefinition::function(
 				"grep",
-				"Regex search across the workspace folder, gitignore-aware. Returns one match per line in `path:line: match` form.",
+				"Regex search across the workspace folder, gitignore-aware. Returns one match per line in `path:line: match` form. The `line` field is the 1-based line number, so a follow-up `read_file` can target it directly via `start_line` / `end_line`.",
 				json!({
 					"type": "object",
 					"properties": {
@@ -205,9 +213,24 @@ impl ToolRegistry {
 		#[derive(Deserialize)]
 		struct ReadFileArgs {
 			path: String,
+			#[serde(default)]
+			start_line: Option<u32>,
+			#[serde(default)]
+			end_line: Option<u32>,
 		}
 		let parsed: ReadFileArgs =
 			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("read_file", err.to_string()))?;
+		if let (Some(start), Some(end)) = (parsed.start_line, parsed.end_line) {
+			if start == 0 || end < start {
+				return Err(CoderError::invalid_args(
+					"read_file",
+					"start_line / end_line must be 1-based and end_line >= start_line",
+				));
+			}
+		}
+		if matches!(parsed.start_line, Some(0)) || matches!(parsed.end_line, Some(0)) {
+			return Err(CoderError::invalid_args("read_file", "line numbers are 1-based"));
+		}
 		let folder = self
 			.workspaces
 			.active_folder()
@@ -217,16 +240,24 @@ impl ToolRegistry {
 		if result.is_binary {
 			return Err(CoderError::tool_failed("read_file", "binary file"));
 		}
-		let (text, truncated) = if result.text.len() > READ_FILE_MAX_BYTES {
-			let cut = clamp_to_char_boundary(&result.text, READ_FILE_MAX_BYTES);
-			(result.text[..cut].to_string(), true)
+		let total_lines = if result.text.is_empty() {
+			0
 		} else {
-			(result.text, false)
+			result.text.lines().count() as u32
 		};
+		let start_line = parsed.start_line.unwrap_or(1);
+		let end_line = parsed.end_line.unwrap_or(u32::MAX);
+		let (rendered, byte_truncated) = format_numbered_lines(&result.text, start_line, end_line);
 		Ok(json!({
 			"path": parsed.path,
-			"content": text,
-			"truncated": truncated,
+			"content": rendered,
+			"start_line": start_line,
+			// `end_line` in the response is the *effective* end after
+			// clamping to EOF, so the model can tell when its
+			// requested range was shorter than asked for.
+			"end_line": end_line.min(total_lines.max(1)),
+			"total_lines": total_lines,
+			"truncated": byte_truncated,
 			"mtime_ms": result.mtime_ms,
 		}))
 	}
@@ -591,6 +622,60 @@ fn clamp_to_char_boundary(s: &str, max: usize) -> usize {
 	idx
 }
 
+/// Render `text` as `<line_no>|<line>` pairs, restricted to the
+/// 1-based inclusive range `[start_line, end_line]`. Out-of-range
+/// `end_line` values clamp silently to EOF; an empty file yields an
+/// empty string. The byte cap [`READ_FILE_MAX_BYTES`] applies to
+/// the rendered string — long ranges that go past it are cut at a
+/// char boundary and `truncated == true` is returned so the agent
+/// can ask for a smaller window.
+fn format_numbered_lines(text: &str, start_line: u32, end_line: u32) -> (String, bool) {
+	use std::fmt::Write as _;
+	if text.is_empty() {
+		return (String::new(), false);
+	}
+	let total: u32 = text.lines().count() as u32;
+	if total == 0 || start_line > total {
+		return (String::new(), false);
+	}
+	let effective_end = end_line.min(total);
+	// Right-align line numbers to the width of the largest one in
+	// the rendered range. Keeps narrow files narrow and widens up
+	// to whatever the file actually needs for big ones.
+	let width = digit_width(effective_end) as usize;
+	let mut out = String::new();
+	let mut truncated = false;
+	for (idx, line) in text.lines().enumerate() {
+		let line_no = (idx + 1) as u32;
+		if line_no < start_line {
+			continue;
+		}
+		if line_no > effective_end {
+			break;
+		}
+		let _ = writeln!(out, "{line_no:>width$}|{line}");
+		if out.len() > READ_FILE_MAX_BYTES {
+			let cut = clamp_to_char_boundary(&out, READ_FILE_MAX_BYTES);
+			out.truncate(cut);
+			truncated = true;
+			break;
+		}
+	}
+	(out, truncated)
+}
+
+fn digit_width(mut n: u32) -> u32 {
+	if n == 0 {
+		return 1;
+	}
+	let mut w = 0;
+	while n > 0 {
+		n /= 10;
+		w += 1;
+	}
+	w
+}
+
 fn format_grep_hits(hits: &[ContentSearchHit]) -> String {
 	let mut out = String::new();
 	for hit in hits {
@@ -635,7 +720,7 @@ fn clamp_to_char_boundary_bytes(bytes: &[u8], max: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-	use super::byte_offsets_of;
+	use super::{byte_offsets_of, format_numbered_lines};
 
 	#[test]
 	fn byte_offsets_of_finds_non_overlapping_hits() {
@@ -660,5 +745,47 @@ mod tests {
 		// `edit_file` deliberately treats overlapping matches as a
 		// non-issue: real-world `find` strings aren't pathological.
 		assert_eq!(byte_offsets_of("aaaa", "aa"), vec![0, 2]);
+	}
+
+	#[test]
+	fn format_numbered_lines_full_file_default() {
+		let (out, truncated) = format_numbered_lines("alpha\nbeta\ngamma\n", 1, u32::MAX);
+		assert!(!truncated);
+		assert_eq!(out, "1|alpha\n2|beta\n3|gamma\n");
+	}
+
+	#[test]
+	fn format_numbered_lines_slice() {
+		let (out, _) = format_numbered_lines("a\nb\nc\nd\ne\n", 2, 4);
+		assert_eq!(out, "2|b\n3|c\n4|d\n");
+	}
+
+	#[test]
+	fn format_numbered_lines_clamps_end_past_eof() {
+		let (out, _) = format_numbered_lines("only\n", 1, 99);
+		assert_eq!(out, "1|only\n");
+	}
+
+	#[test]
+	fn format_numbered_lines_pads_width_to_largest_in_range() {
+		// Range ends at line 12 → width 2 for every printed line,
+		// even the single-digit ones.
+		let text: String = (1..=15).map(|i| format!("L{i}\n")).collect();
+		let (out, _) = format_numbered_lines(&text, 8, 12);
+		let first = out.lines().next().unwrap();
+		assert_eq!(first, " 8|L8");
+	}
+
+	#[test]
+	fn format_numbered_lines_empty_file() {
+		let (out, truncated) = format_numbered_lines("", 1, 10);
+		assert_eq!(out, "");
+		assert!(!truncated);
+	}
+
+	#[test]
+	fn format_numbered_lines_start_past_eof_is_empty() {
+		let (out, _) = format_numbered_lines("a\nb\n", 5, 10);
+		assert_eq!(out, "");
 	}
 }

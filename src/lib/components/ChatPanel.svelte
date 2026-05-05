@@ -3,6 +3,7 @@
 	import { confirm } from '@tauri-apps/plugin-dialog';
 	import { openUrl } from '@tauri-apps/plugin-opener';
 	import { slack } from '../slack.svelte';
+	import { coder } from '../coder.svelte';
 	import { botLabel, userLabel, type SlackBotProfile, type SlackSession } from '../protocol';
 	import { formatSlackRelative, formatSlackTime } from '../util/slackTime';
 	import { collectMentionedUserIds, parseSlackMrkdwn, slackPlainText } from '../util/slackMrkdwn';
@@ -332,6 +333,20 @@
 <aside class="chat-panel" data-region="chat" aria-label="Chat panel">
 	<header>
 		<div class="title">Chat</div>
+		<div class="header-actions">
+			<!-- Swap the right-side slot from chat to coder. Cheaper
+				 than reaching for the status-bar pip when the user is
+				 already focused inside the panel. -->
+			<button
+				type="button"
+				class="icon-button"
+				title="Switch to Coder"
+				aria-label="Switch to Coder"
+				onclick={() => coder.togglePanel()}
+			>
+				{@render switchToCoderIcon()}
+			</button>
+		</div>
 	</header>
 
 	{#if !slack.status}
@@ -699,6 +714,26 @@
 		<path d="M9 2l3 3-3 3" />
 		<path d="M13 11H4" />
 		<path d="M7 8l-3 3 3 3" />
+	</svg>
+{/snippet}
+
+{#snippet switchToCoderIcon()}
+	<svg
+		viewBox="0 0 16 16"
+		width="14"
+		height="14"
+		fill="none"
+		stroke="currentColor"
+		stroke-width="1.5"
+		stroke-linecap="round"
+		stroke-linejoin="round"
+		aria-hidden="true"
+	>
+		<!-- `</>` glyph — same visual language as VS Code's "code"
+			 button, conventional shorthand for "code editor /
+			 coder". -->
+		<path d="M5.5 4.5 2 8l3.5 3.5" />
+		<path d="M10.5 4.5 14 8l-3.5 3.5" />
 	</svg>
 {/snippet}
 
