@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use camino::Utf8PathBuf;
 use moon_coder::CoderHandle;
-use moon_core::WorkspaceRegistry;
+use moon_core::{NextEditServerSupervisor, WorkspaceRegistry};
 use moon_slack::{SlackClient, TokenStore};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::AbortHandle;
@@ -68,6 +68,8 @@ pub struct AppState {
 	/// uses, so the agent's tool dispatch lands on the active folder
 	/// without a separate registry hop. See `specs/coder.md`.
 	pub coder: CoderHandle,
+	/// Optional `llama-server` child for local autocomplete (HF `--hf-repo`).
+	pub next_edit_server: Arc<NextEditServerSupervisor>,
 }
 
 /// Owning handle the terminal commands keep per stream. The
@@ -106,6 +108,7 @@ impl AppState {
 			fs_watcher,
 			lsp: Arc::new(Mutex::new(None)),
 			coder,
+			next_edit_server: Arc::new(NextEditServerSupervisor::default()),
 		}
 	}
 

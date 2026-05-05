@@ -34,6 +34,11 @@ import type {
 	TerminalOpenRequest,
 	Workspace,
 	WriteFileResult,
+	NextEditCompleteParams,
+	NextEditCompleteResult,
+	NextEditProbeResult,
+	NextEditServerSnapshot,
+	NextEditServerStartParams,
 } from './protocol';
 
 // Single auditable surface for all Tauri commands. Components MUST go through this.
@@ -115,6 +120,14 @@ export const ipc = {
 		write: (streamId: string, data: string) => invoke<void>('terminal_write', { streamId, data }),
 		resize: (streamId: string, cols: number, rows: number) => invoke<void>('terminal_resize', { streamId, cols, rows }),
 		close: (streamId: string) => invoke<void>('terminal_close', { streamId }),
+	},
+	nextEdit: {
+		probe: (baseUrl: string) => invoke<NextEditProbeResult>('next_edit_probe', { baseUrl: baseUrl.trim() }),
+		complete: (params: NextEditCompleteParams) => invoke<NextEditCompleteResult>('next_edit_complete', { params }),
+		serverStart: (params: NextEditServerStartParams) =>
+			invoke<NextEditServerSnapshot>('next_edit_server_start', { params }),
+		serverStop: () => invoke<NextEditServerSnapshot>('next_edit_server_stop'),
+		serverStatus: () => invoke<NextEditServerSnapshot>('next_edit_server_status'),
 	},
 	lsp: {
 		open: (path: string, languageId: string, text: string) => invoke<void>('lsp_open', { path, languageId, text }),

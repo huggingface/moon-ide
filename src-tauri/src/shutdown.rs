@@ -59,6 +59,12 @@ pub async fn stop_all(state: &AppState) {
 		}
 	}
 
+	if let Err(err) = state.next_edit_server.stop().await {
+		tracing::warn!(error = %err, "stop_all: next_edit_server stop failed");
+	} else {
+		tracing::info!("stop_all: stopped next_edit llama-server child (if any)");
+	}
+
 	let snapshot = state.workspaces.snapshot().await;
 	let workspace_id = snapshot.id.clone();
 	let bound: Vec<Utf8PathBuf> = snapshot.folders.iter().map(|f| Utf8PathBuf::from(&f.path)).collect();

@@ -5,6 +5,7 @@ pub mod container;
 pub mod editorconfig;
 pub mod fs;
 pub mod lsp;
+pub mod next_edit;
 pub mod project_compose;
 pub mod search;
 pub mod slack;

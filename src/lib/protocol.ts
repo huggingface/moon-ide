@@ -413,6 +413,56 @@ export type CoderAppState = {
 	last_session_id: string | null;
 };
 
+/** Local llama.cpp autocomplete. Mirrors `moon_protocol::next_edit::NextEditAppState`. */
+export type NextEditAppState = {
+	/** When non-empty, probes/completion use this URL; otherwise `http://{server_host}:{server_port}`. */
+	external_base_url: string;
+	/** Empty string means resolve `llama-server` from `PATH`. */
+	llama_binary: string;
+	/** Hugging Face repo id for `llama-server --hf-repo` (e.g. `sweepai/sweep-next-edit-1.5B`). */
+	hf_repo: string;
+	server_host: string;
+	server_port: number;
+	/** Managed server only: relaunch starts `llama-server` automatically. */
+	server_autostart: boolean;
+};
+
+export type NextEditServerStartParams = {
+	llamaBinary: string;
+	hfRepo: string;
+	serverHost: string;
+	serverPort: number;
+};
+
+export type NextEditServerSnapshot = {
+	running: boolean;
+	pid: number | null;
+	lastExitCode: number | null;
+	startError: string | null;
+	logTail: string[];
+};
+
+export type NextEditProbeKind = 'ready' | 'unreachable' | 'model_loading' | 'error';
+
+export type NextEditProbeResult = {
+	kind: NextEditProbeKind;
+	detail: string | null;
+};
+
+export type NextEditCompleteParams = {
+	baseUrl: string;
+	relativePath: string;
+	cursorLine: number;
+	documentText: string;
+	headText: string | null;
+};
+
+export type NextEditCompleteResult = {
+	replacement: string;
+	from_line: number;
+	to_line: number;
+};
+
 /**
  * Per-machine, per-user app state. There is intentionally no `Settings`
  * type — project-level code style lives in `.editorconfig` (Phase 1.5);
@@ -425,6 +475,7 @@ export type AppState = {
 	bottom_panel: BottomPanelAppState;
 	right_panel: RightPanelKind | null;
 	coder: CoderAppState;
+	next_edit: NextEditAppState;
 };
 
 /** Bottom-panel chrome state. Tabs/log streams are intentionally
@@ -490,6 +541,12 @@ export type TerminalClosed = {
 	code: number | null;
 };
 
+/** Default llama-server listen port (IANA dynamic range; avoids 8080 and similar). */
+export const DEFAULT_NEXT_EDIT_SERVER_PORT = 53281;
+export const DEFAULT_NEXT_EDIT_BASE_URL = `http://127.0.0.1:${DEFAULT_NEXT_EDIT_SERVER_PORT}`;
+/** Default Hugging Face repo for managed `llama-server --hf-repo`. */
+export const DEFAULT_NEXT_EDIT_HF_REPO = 'sweepai/sweep-next-edit-1.5B';
+
 export const defaultAppState: AppState = {
 	last_session: null,
 	theme: 'system',
@@ -497,6 +554,14 @@ export const defaultAppState: AppState = {
 	bottom_panel: { visible: false, height: 240 },
 	right_panel: null,
 	coder: { last_session_id: null },
+	next_edit: {
+		external_base_url: '',
+		llama_binary: '',
+		hf_repo: DEFAULT_NEXT_EDIT_HF_REPO,
+		server_host: '127.0.0.1',
+		server_port: DEFAULT_NEXT_EDIT_SERVER_PORT,
+		server_autostart: false,
+	},
 };
 
 /**

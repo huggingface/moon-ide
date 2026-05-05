@@ -40,6 +40,7 @@ tracing-subscriber = { workspace = true }
 dirs = "6.0.0"
 uuid = { version = "1.18", features = ["v4"] }
 futures-util = "0.3"
+reqwest = { workspace = true }
 
 # ashpd is the XDG Desktop Portal client. Linux-only because:
 # - WebKitGTK's `matchMedia('(prefers-color-scheme: dark)')` and

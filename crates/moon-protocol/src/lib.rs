@@ -10,6 +10,7 @@ pub mod error;
 pub mod fs;
 pub mod git;
 pub mod lsp;
+pub mod next_edit;
 pub mod search;
 pub mod session;
 pub mod slack;

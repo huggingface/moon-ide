@@ -38,6 +38,16 @@ STATUS: partial — Phase 0 ships fs operations via Tauri commands. Streams (`fs
 
 Defined per-phase. Each follows the same pattern: requests with structured params, streaming events for long-lived subscriptions.
 
+### `next_edit.*` (local llama.cpp)
+
+- `next_edit_probe({ baseUrl }) -> NextEditProbeResult` — `GET {baseUrl}/health` (llama.cpp server). Surfaces `ready` (200), `model_loading` (503), `unreachable` (connection/timeout), or `error`.
+- `next_edit_complete({ params }) -> NextEditCompleteResult` — builds a Sweep-style prompt (original / current / updated 21-line windows; see [Sweep next-edit post](https://blog.sweep.dev/posts/oss-next-edit)) and `POST {baseUrl}/completion`.
+- `next_edit_server_start({ params }) -> NextEditServerSnapshot` — spawns `llama-server` with `--host`, `--port`, `--hf-repo` (HF weights download on first run). Managed child lives in [`AppState`](src-tauri/src/state.rs) (`next_edit_server`); IDE exit runs `stop_all` → `SIGKILL`/`wait` the child.
+- `next_edit_server_stop() -> NextEditServerSnapshot` — kills the managed child if any.
+- `next_edit_server_status() -> NextEditServerSnapshot` — running flag, optional pid / last exit code, start error, tail of stdout/stderr lines.
+
+Spawn settings persist in [`AppState.next_edit`](crates/moon-protocol/src/app_state.rs) (`llama_binary`, `hf_repo`, `server_host`, `server_port`, optional `external_base_url`, **`server_autostart`**: managed mode only — true after **Start**, false after **Stop**; next IDE launch calls `next_edit_server_start` when autostart is on and `external_base_url` is empty). When `external_base_url` is empty, probes and `next_edit_complete` use `http://{server_host}:{server_port}` (default port **53281**, IANA dynamic range). When non-empty, that URL overrides the listen address for HTTP. In the editor, **Ctrl+T** (or the palette) calls `next_edit_complete` and **replaces the model’s line range in the buffer** (not CodeMirror completion). **Ctrl+Space** is LSP-only. The status bar **Autocomplete** control can show while `next_edit_complete` is in flight. `hf_repo` defaults to **sweepai/sweep-next-edit-1.5B** unless overridden.
+
 ## Events
 
 Pushed by the core to the UI. In Tauri this maps to events; in remote mode to JSON-RPC notifications.

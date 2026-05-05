@@ -43,6 +43,7 @@ pub async fn app_state_save(state: State<'_, AppState>, app_state: AppStatePaylo
 		bottom_panel: app_state.bottom_panel,
 		right_panel: existing.right_panel,
 		coder: existing.coder,
+		next_edit: app_state.next_edit,
 	};
 	core_app_state::save(&state.config_dir, &merged).await
 }

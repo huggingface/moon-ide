@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::next_edit::NextEditAppState;
 use crate::session::WorkspaceSession;
 use crate::slack::SlackBotProfile;
 use crate::theme::ThemeMode;
@@ -45,6 +46,9 @@ pub struct AppState {
 	/// Per-machine coder state — picks up where the user left off
 	/// without forcing them to navigate the sessions list again.
 	pub coder: CoderAppState,
+	/// Local llama.cpp autocomplete: managed `llama-server` spawn fields + optional external HTTP base.
+	#[serde(default)]
+	pub next_edit: NextEditAppState,
 }
 
 /// Surface mounted in the right-side panel. Chat and coder are

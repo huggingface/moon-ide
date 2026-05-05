@@ -179,6 +179,11 @@ export const builtInCommands: Command[] = [
 		run: () => workspace.setTheme('light'),
 	},
 	{
+		id: 'editor.autocomplete',
+		title: 'Editor: Autocomplete (Ctrl+T)',
+		run: () => workspace.requestAutocomplete(),
+	},
+	{
 		// `Focus File Tree` is the only discrete focus command — it
 		// always means the same thing wherever you invoke it from.
 		// The cycle commands (`F6` / `Shift+F6`) are intentionally

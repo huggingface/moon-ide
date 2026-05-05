@@ -13,6 +13,8 @@ pub mod format;
 pub mod host;
 pub mod lint_staged;
 pub mod lsp;
+pub mod next_edit;
+pub mod next_edit_server;
 pub mod pre_save;
 pub mod search;
 pub mod workspace;
@@ -21,3 +23,4 @@ pub use host::{LocalHost, WorkspaceHost};
 pub use workspace::{WorkspaceFolderEntry, WorkspaceRegistry, DEFAULT_WORKSPACE_ID};
 
 pub use moon_protocol as protocol;
+pub use next_edit_server::NextEditServerSupervisor;

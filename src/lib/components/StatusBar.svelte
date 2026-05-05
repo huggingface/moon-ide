@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { openUrl } from '@tauri-apps/plugin-opener';
 	import { workspace } from '../state.svelte';
 	import { slack } from '../slack.svelte';
 	import { coder } from '../coder.svelte';
@@ -10,6 +11,15 @@
 
 	let themePicker: ThemePicker | undefined = $state();
 	let containerWrap: HTMLDivElement | undefined = $state();
+	let autocompleteWrap: HTMLDivElement | undefined = $state();
+	let autocompletePanelOpen = $state(false);
+	let autocompleteExternalDraft = $state(workspace.nextEditExternalBaseUrl);
+	let autocompleteBinaryDraft = $state(workspace.nextEditLlamaBinary);
+	let autocompleteHfDraft = $state(workspace.nextEditHfRepo);
+	let autocompleteHostDraft = $state(workspace.nextEditServerHost);
+	let autocompletePortDraft = $state(String(workspace.nextEditServerPort));
+
+	const SWEEP_NEXT_EDIT_BLOG = 'https://blog.sweep.dev/posts/oss-next-edit';
 
 	// Error / warning counts for the current file. Info and hint
 	// diagnostics are intentionally omitted from the pill: tsserver
@@ -72,6 +82,161 @@
 	const effectiveState = $derived(
 		container.inFlight === 'setup' || container.inFlight === 'rebuild' ? 'creating' : container.state,
 	);
+
+	const autocompletePipClass = $derived.by(() => {
+		if (workspace.autocompleteInFlight) {
+			return 'pip-loading';
+		}
+		const k = workspace.nextEditProbe?.kind;
+		if (k === 'ready') {
+			return 'on';
+		}
+		if (k === 'model_loading') {
+			return 'pip-loading';
+		}
+		if (k === 'unreachable' || k === 'error') {
+			return 'pip-warn';
+		}
+		return '';
+	});
+
+	const autocompleteBarTitle = $derived.by(() => {
+		if (workspace.autocompleteInFlight) {
+			return 'Autocomplete — model running…';
+		}
+		const p = workspace.nextEditProbe;
+		if (workspace.nextEditProbeInFlight && p === null) {
+			return 'Autocomplete — checking…';
+		}
+		if (p?.kind === 'ready') {
+			return 'Autocomplete — ready';
+		}
+		if (p?.kind === 'model_loading') {
+			return 'Autocomplete — loading model';
+		}
+		if (p?.kind === 'unreachable' || p?.kind === 'error') {
+			return 'Autocomplete — not connected';
+		}
+		return 'Autocomplete — click to set up';
+	});
+
+	const autocompleteShortcutVisible = $derived.by(() => {
+		if (workspace.autocompleteInFlight) {
+			return true;
+		}
+		if (workspace.nextEditServerSnapshot?.running) {
+			return true;
+		}
+		const k = workspace.nextEditProbe?.kind;
+		return k === 'ready' || k === 'model_loading';
+	});
+
+	const autocompleteStatusText = $derived.by(() => {
+		if (workspace.autocompleteInFlight) {
+			return 'Calling the autocomplete model…';
+		}
+		if (workspace.nextEditProbeInFlight && workspace.nextEditProbe === null) {
+			return 'Checking…';
+		}
+		const p = workspace.nextEditProbe;
+		if (!p) {
+			return 'Status unknown — when ready, Ctrl+T applies an autocomplete patch (Ctrl+Space is LSP only).';
+		}
+		switch (p.kind) {
+			case 'ready':
+				return 'Ready — Ctrl+T patches the buffer from the local model. Ctrl+Space is LSP completion only.';
+			case 'unreachable':
+				return 'Not connected. Press Start, or use Advanced if the server runs elsewhere.';
+			case 'model_loading':
+				return 'Still loading — first launch can take a few minutes.';
+			case 'error':
+				return p.detail ?? 'Something went wrong.';
+			default:
+				return '';
+		}
+	});
+
+	function toggleAutocompletePanel() {
+		autocompletePanelOpen = !autocompletePanelOpen;
+		if (autocompletePanelOpen) {
+			autocompleteExternalDraft = workspace.nextEditExternalBaseUrl;
+			autocompleteBinaryDraft = workspace.nextEditLlamaBinary;
+			autocompleteHfDraft = workspace.nextEditHfRepo;
+			autocompleteHostDraft = workspace.nextEditServerHost;
+			autocompletePortDraft = String(workspace.nextEditServerPort);
+			void workspace.refreshNextEditServerStatus();
+			void workspace.refreshNextEditProbe();
+		}
+	}
+
+	function closeAutocompletePanel() {
+		autocompletePanelOpen = false;
+	}
+
+	function applyAutocompleteExternal() {
+		workspace.setNextEditExternalBaseUrl(autocompleteExternalDraft);
+		autocompleteExternalDraft = workspace.nextEditExternalBaseUrl;
+	}
+
+	function applyAutocompleteListen() {
+		const port = Number.parseInt(autocompletePortDraft, 10);
+		if (!Number.isFinite(port) || port < 1 || port > 65535) {
+			workspace.flash('Port must be between 1 and 65535.');
+			return;
+		}
+		workspace.setNextEditServerHost(autocompleteHostDraft);
+		workspace.setNextEditServerPort(port);
+	}
+
+	function applyAutocompleteBinary() {
+		workspace.setNextEditLlamaBinary(autocompleteBinaryDraft);
+	}
+
+	function applyAutocompleteHf() {
+		workspace.setNextEditHfRepo(autocompleteHfDraft);
+	}
+
+	function saveAutocompleteDrafts() {
+		applyAutocompleteListen();
+		applyAutocompleteBinary();
+		applyAutocompleteHf();
+	}
+
+	$effect(() => {
+		if (!autocompletePanelOpen) {
+			return;
+		}
+		const id = window.setInterval(() => {
+			void workspace.refreshNextEditServerStatus();
+			void workspace.refreshNextEditProbe();
+		}, 1000);
+		return () => {
+			window.clearInterval(id);
+		};
+	});
+
+	$effect(() => {
+		if (!autocompletePanelOpen) {
+			return;
+		}
+		const onPointerDown = (event: PointerEvent) => {
+			if (autocompleteWrap && autocompleteWrap.contains(event.target as Node)) {
+				return;
+			}
+			closeAutocompletePanel();
+		};
+		const onKey = (event: KeyboardEvent) => {
+			if (event.key === 'Escape') {
+				closeAutocompletePanel();
+			}
+		};
+		window.addEventListener('pointerdown', onPointerDown);
+		window.addEventListener('keydown', onKey);
+		return () => {
+			window.removeEventListener('pointerdown', onPointerDown);
+			window.removeEventListener('keydown', onKey);
+		};
+	});
 
 	// F6 cycle can land on the status bar; focus the theme picker
 	// (the right-most interactive control). If we add more controls
@@ -161,6 +326,122 @@
 			 (no flash of "absent" while we're still resolving the
 			 active workspace at startup). Click toggles the
 			 ContainerPanel popover anchored just above. -->
+		<div class="autocomplete-wrap" bind:this={autocompleteWrap}>
+			<button
+				type="button"
+				class="chat"
+				class:active={autocompletePanelOpen}
+				title={autocompleteBarTitle}
+				onclick={() => toggleAutocompletePanel()}
+			>
+				<span
+					class="pip"
+					class:on={autocompletePipClass === 'on'}
+					class:pip-warn={autocompletePipClass === 'pip-warn'}
+					class:pip-loading={autocompletePipClass === 'pip-loading'}
+				></span>
+				<span class="autocomplete-label">autocomplete</span>
+				{#if autocompleteShortcutVisible}
+					<kbd class="autocomplete-kbd">Ctrl+T</kbd>
+				{/if}
+			</button>
+			{#if autocompletePanelOpen}
+				<div class="autocomplete-panel" role="dialog" aria-label="Autocomplete">
+					<header class="ne-head">
+						<span class="ne-title">Autocomplete</span>
+					</header>
+					<p class="ne-status">{autocompleteStatusText}</p>
+					{#if workspace.nextEditExternalBaseUrl.trim().length > 0}
+						<p class="ne-hint ne-banner">Using your own server (Advanced). Clear that URL to use Start below.</p>
+					{/if}
+					<div class="ne-actions" role="toolbar" aria-label="Model server">
+						<button
+							type="button"
+							class="ne-apply"
+							disabled={workspace.nextEditServerActionInFlight ||
+								workspace.nextEditExternalBaseUrl.trim().length > 0 ||
+								(!autocompleteHfDraft.trim() && !workspace.nextEditHfRepo.trim()) ||
+								workspace.nextEditServerSnapshot?.running}
+							onclick={() => {
+								saveAutocompleteDrafts();
+								void workspace.startNextEditServer();
+							}}
+						>
+							Start
+						</button>
+						<button
+							type="button"
+							class="ne-apply"
+							disabled={workspace.nextEditServerActionInFlight || !workspace.nextEditServerSnapshot?.running}
+							onclick={() => void workspace.stopNextEditServer()}
+						>
+							Stop
+						</button>
+					</div>
+					<label class="ne-label" for="ne-bin">Server command</label>
+					<input
+						id="ne-bin"
+						class="ne-input ne-input-block"
+						type="text"
+						placeholder="llama-server"
+						bind:value={autocompleteBinaryDraft}
+					/>
+					<label class="ne-label" for="ne-hf">Model</label>
+					<input
+						id="ne-hf"
+						class="ne-input ne-input-block"
+						type="text"
+						placeholder="Hugging Face repo"
+						bind:value={autocompleteHfDraft}
+					/>
+					<label class="ne-label" for="ne-host">Listen address</label>
+					<div class="ne-url-row ne-listen-row">
+						<input id="ne-host" class="ne-input ne-host" type="text" bind:value={autocompleteHostDraft} />
+						<input
+							class="ne-input ne-port"
+							type="text"
+							inputmode="numeric"
+							aria-label="Port"
+							bind:value={autocompletePortDraft}
+						/>
+					</div>
+					<button type="button" class="ne-apply ne-save-all" onclick={() => saveAutocompleteDrafts()}>
+						Save settings
+					</button>
+					<details class="ne-advanced">
+						<summary>Advanced</summary>
+						<p class="ne-hint">Only if you start the server yourself — paste its URL here.</p>
+						<div class="ne-url-row">
+							<input
+								class="ne-input"
+								type="text"
+								placeholder="http://127.0.0.1:8080"
+								bind:value={autocompleteExternalDraft}
+							/>
+							<button type="button" class="ne-apply" onclick={() => applyAutocompleteExternal()}>Save</button>
+						</div>
+					</details>
+					{#if workspace.nextEditServerSnapshot && workspace.nextEditServerSnapshot.logTail.length > 0}
+						<details class="ne-logs">
+							<summary>Server log (recent)</summary>
+							<pre class="ne-log-pre">{workspace.nextEditServerSnapshot.logTail.join('\n')}</pre>
+						</details>
+					{/if}
+					<p class="ne-hint">
+						Needs a local
+						<code>llama-server</code>
+						(
+						<button type="button" class="ne-link" onclick={() => void openUrl('https://github.com/ggml-org/llama.cpp')}>
+							llama.cpp
+						</button>
+						). First run downloads the model; closing the app stops the server.
+						<button type="button" class="ne-link" onclick={() => void openUrl(SWEEP_NEXT_EDIT_BLOG)}>
+							Format notes
+						</button>
+					</p>
+				</div>
+			{/if}
+		</div>
 		{#if container.visible}
 			<div class="container-wrap" bind:this={containerWrap}>
 				<button
@@ -309,6 +590,218 @@
 	}
 	.pip.on {
 		background: var(--m-success);
+	}
+	.pip.pip-warn {
+		background: var(--m-warning, #d4a017);
+	}
+	.pip.pip-loading {
+		background: var(--m-warning, #d4a017);
+		animation: pulse 1.6s ease-in-out infinite;
+	}
+	.autocomplete-wrap {
+		position: relative;
+		display: flex;
+		align-items: center;
+	}
+	.autocomplete-label {
+		flex-shrink: 0;
+	}
+	.autocomplete-kbd {
+		font: inherit;
+		font-family: var(--m-font-mono, monospace);
+		font-size: 9px;
+		padding: 0 4px;
+		border-radius: 3px;
+		border: 1px solid var(--m-border);
+		background: var(--m-bg-overlay);
+		color: var(--m-fg-subtle);
+		line-height: 14px;
+	}
+	.autocomplete-panel {
+		position: absolute;
+		bottom: 100%;
+		right: 0;
+		margin-bottom: 6px;
+		min-width: 300px;
+		max-width: 440px;
+		background: var(--m-bg-2);
+		border: 1px solid var(--m-border-strong);
+		border-radius: 6px;
+		padding: 10px 12px;
+		box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+		font-size: 12px;
+		color: var(--m-fg);
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		z-index: 20;
+	}
+	.ne-head {
+		display: flex;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: 8px;
+	}
+	.ne-title {
+		font-weight: 600;
+		text-transform: lowercase;
+	}
+	.ne-sub {
+		color: var(--m-fg-muted);
+		font-variant-numeric: tabular-nums;
+	}
+	.ne-status {
+		margin: 0;
+		color: var(--m-fg-muted);
+		line-height: 1.4;
+	}
+	.ne-row {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		cursor: pointer;
+		color: var(--m-fg);
+	}
+	.ne-label {
+		font-size: 11px;
+		color: var(--m-fg-muted);
+		margin: 0;
+	}
+	.ne-url-row {
+		display: flex;
+		gap: 6px;
+	}
+	.ne-input {
+		flex: 1 1 auto;
+		min-width: 0;
+		font: inherit;
+		font-size: 12px;
+		padding: 4px 6px;
+		border-radius: 4px;
+		border: 1px solid var(--m-border);
+		background: var(--m-bg-1);
+		color: var(--m-fg);
+	}
+	.ne-input-block {
+		width: 100%;
+		box-sizing: border-box;
+	}
+	.ne-save-all {
+		width: 100%;
+		margin-top: 2px;
+	}
+	.ne-apply {
+		font: inherit;
+		font-size: 12px;
+		padding: 4px 10px;
+		border-radius: 4px;
+		border: 1px solid var(--m-border);
+		background: var(--m-bg-overlay);
+		color: var(--m-fg);
+		cursor: pointer;
+		flex-shrink: 0;
+	}
+	.ne-apply:hover {
+		border-color: var(--m-border-strong);
+	}
+	.ne-apply:disabled {
+		opacity: 0.45;
+		cursor: not-allowed;
+	}
+	.ne-actions {
+		display: flex;
+		gap: 6px;
+		flex-wrap: wrap;
+	}
+	.ne-listen-row {
+		align-items: stretch;
+	}
+	.ne-host {
+		flex: 2 1 120px;
+	}
+	.ne-port {
+		flex: 0 0 4.5rem;
+		max-width: 5rem;
+	}
+	.ne-logs {
+		margin: 0;
+		color: var(--m-fg-muted);
+		font-size: 11px;
+	}
+	.ne-logs summary {
+		cursor: pointer;
+		user-select: none;
+	}
+	.ne-log-pre {
+		margin: 6px 0 0;
+		padding: 8px;
+		max-height: 160px;
+		overflow: auto;
+		border-radius: 4px;
+		background: var(--m-bg-overlay);
+		border: 1px solid var(--m-border);
+		font-size: 10px;
+		line-height: 1.35;
+		white-space: pre-wrap;
+		word-break: break-word;
+		color: var(--m-fg);
+	}
+	.ne-hint {
+		margin: 0;
+		color: var(--m-fg-muted);
+		line-height: 1.4;
+		font-size: 11px;
+	}
+	.ne-hint code {
+		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+		background: var(--m-bg-overlay);
+		padding: 0 4px;
+		border-radius: 3px;
+		color: var(--m-fg);
+	}
+	.ne-banner {
+		padding: 6px 8px;
+		border-radius: 4px;
+		border: 1px solid var(--m-border);
+		background: var(--m-bg-overlay);
+		color: var(--m-fg-muted);
+	}
+	.ne-advanced {
+		margin: 0;
+		padding: 6px 0 0;
+		border-top: 1px solid var(--m-border);
+		color: var(--m-fg-muted);
+		font-size: 11px;
+	}
+	.ne-advanced summary {
+		cursor: pointer;
+		user-select: none;
+		color: var(--m-fg);
+		font-weight: 500;
+	}
+	.ne-code {
+		margin: 0;
+		padding: 8px;
+		border-radius: 4px;
+		background: var(--m-bg-overlay);
+		border: 1px solid var(--m-border);
+		font-size: 11px;
+		line-height: 1.35;
+		overflow-x: auto;
+		white-space: pre-wrap;
+		word-break: break-all;
+	}
+	.ne-link {
+		display: inline;
+		padding: 0;
+		margin: 0;
+		border: none;
+		background: none;
+		font: inherit;
+		color: var(--m-accent, #6b9eff);
+		cursor: pointer;
+		text-decoration: underline;
+		text-align: left;
 	}
 	/* Container pip colour-codes the high-level state. Same palette
 	   as the ContainerPanel header so the two read as one signal. */

@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { diffChars } from 'diff';
-	import { EditorState, Compartment, EditorSelection, Transaction } from '@codemirror/state';
+	import { EditorState, Compartment, EditorSelection, Prec, Transaction } from '@codemirror/state';
 	import { EditorView, highlightActiveLine, highlightActiveLineGutter, keymap, lineNumbers } from '@codemirror/view';
 	import { highlightTabs } from '../editor/highlightTabs';
 	import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
@@ -15,6 +15,7 @@
 		lspDiagnosticsExtension,
 		lspHoverExtension,
 	} from '../editor/lsp';
+	import { applyAutocompleteFromEditorView } from '../editor/autocompleteApply';
 	import { lspGotoDefinitionExtension } from '../editor/lspGotoDefinition';
 	import { blameExtension, blameFacet } from '../editor/blame';
 	import { gitChangesExtension, headTextFacet } from '../editor/gitChanges';
@@ -58,6 +59,12 @@
 	// Each Editor instance owns one CM view that we re-target as the active file changes.
 	// We track the path the view currently holds so we know when to swap state.
 	let currentPath: string | null = null;
+	let lastHandledAutocompleteEditorTick = 0;
+
+	function runAutocompleteFromShortcut(editorView: EditorView): boolean {
+		void applyAutocompleteFromEditorView(editorView);
+		return true;
+	}
 
 	onMount(() => {
 		void workspace.ensureEditorConfig(file.path);
@@ -277,6 +284,23 @@
 		queueMicrotask(() => v.focus());
 	});
 
+	// Command palette: focus editor and run local autocomplete (same path as Ctrl+T).
+	$effect(() => {
+		const t = workspace.autocompleteEditorTick;
+		if (workspace.focusedSide !== side) {
+			return;
+		}
+		const v = view;
+		if (!v || t === 0 || t === lastHandledAutocompleteEditorTick) {
+			return;
+		}
+		lastHandledAutocompleteEditorTick = t;
+		queueMicrotask(() => {
+			v.focus();
+			void applyAutocompleteFromEditorView(v);
+		});
+	});
+
 	function baseExtensions() {
 		const ec = workspace.editorConfigFor(file.path);
 		return [
@@ -318,16 +342,18 @@
 				},
 			}),
 			headCompartment.of(headTextFacet.of(workspace.headByPath.get(file.path) ?? null)),
-			// Autocompletion popover. `activateOnTyping: false` keeps
-			// it off the typing path so we don't leak the built-in
-			// identifier source; `override` routes explicit
-			// invocations (Ctrl-Space) to the LSP source when a
-			// server is wired up, and returns null otherwise so
-			// CM falls back to its defaults (empty list).
+			// Ctrl+Space → LSP only. Local autocomplete (Ctrl+T / palette) patches
+			// the buffer directly — it is not a CodeMirror completion source.
 			autocompletion({
 				activateOnTyping: false,
 				override: [lspCompletionSource],
 			}),
+			Prec.high(
+				keymap.of([
+					{ key: 'Ctrl-t', run: runAutocompleteFromShortcut },
+					{ mac: 'Ctrl-t', run: runAutocompleteFromShortcut },
+				]),
+			),
 			keymap.of([
 				// Alt+Left / Alt+Right (= file-history back / forward)
 				// are handled at the window level in `App.svelte`,
