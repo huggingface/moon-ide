@@ -875,14 +875,18 @@ impl WorkspaceHost for LocalHost {
 	}
 }
 
-/// `git symbolic-ref --short HEAD` for the branch name plus
-/// `git rev-parse --short HEAD` for the commit hash. Both can fail
-/// independently — fresh `git init` with no commits has a
-/// resolvable branch name but no HEAD, and a detached HEAD has the
-/// reverse — so we run them separately and return whichever
-/// succeeded. Any failure (including the folder not being a git
-/// repo) leaves the corresponding field as `None`; the SCM panel
-/// renders the all-`None` case as "no branch".
+/// `git symbolic-ref --short HEAD` for the branch name,
+/// `git rev-parse --short HEAD` for the commit hash, plus
+/// `git rev-list --count --left-right HEAD...@{u}` for the
+/// ahead/behind counts vs upstream. Each can fail independently
+/// — fresh `git init` with no commits has a resolvable branch
+/// name but no HEAD, a detached HEAD has the reverse, and a
+/// branch with no configured upstream errors on the rev-list
+/// — so we run them separately and return whichever succeeded.
+/// Any failure (including the folder not being a git repo)
+/// leaves the corresponding field at its `None` / `0` default;
+/// the SCM panel renders the all-default case as a bare "no
+/// branch" label with no count badges.
 fn run_git_branch(root: &Utf8Path) -> GitBranchInfo {
 	use std::process::Command;
 
@@ -908,7 +912,35 @@ fn run_git_branch(root: &Utf8Path) -> GitBranchInfo {
 		.map(|s| s.trim().to_owned())
 		.filter(|s| !s.is_empty());
 
-	GitBranchInfo { name, head_short_sha }
+	// `rev-list --count --left-right HEAD...@{u}` prints
+	// `<ahead>\t<behind>`: commits we have that upstream doesn't,
+	// then commits upstream has that we don't. Errors silently
+	// when no upstream is configured (a freshly-created branch
+	// not yet pushed, detached HEAD, fresh repo with no commits,
+	// etc.); the (0, 0) fallback is exactly the right "render no
+	// badges" signal for the UI in those cases.
+	let (ahead, behind) = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["rev-list", "--count", "--left-right", "HEAD...@{u}"])
+		.output()
+		.ok()
+		.filter(|o| o.status.success())
+		.and_then(|o| String::from_utf8(o.stdout).ok())
+		.and_then(|s| {
+			let mut parts = s.split_whitespace();
+			let ahead: u32 = parts.next()?.parse().ok()?;
+			let behind: u32 = parts.next()?.parse().ok()?;
+			Some((ahead, behind))
+		})
+		.unwrap_or((0, 0));
+
+	GitBranchInfo {
+		name,
+		head_short_sha,
+		ahead,
+		behind,
+	}
 }
 
 /// `git add -A && git commit [-m <message> | --amend [-m <message>|--no-edit]]`.

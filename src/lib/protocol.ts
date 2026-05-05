@@ -155,6 +155,10 @@ export type GitLineBlame = {
 export type GitBranchInfo = {
 	name: string | null;
 	headShortSha: string | null;
+	/** Commits the local branch has that upstream doesn't (push count). 0 when no upstream / no HEAD. */
+	ahead: number;
+	/** Commits upstream has that the local branch doesn't (pull count). 0 when no upstream / no HEAD. */
+	behind: number;
 };
 
 /**

@@ -1162,13 +1162,13 @@ class WorkspaceState {
 	 * so external `git checkout` / `git switch` from a terminal
 	 * eventually surfaces (within the watcher's debounce window).
 	 */
-	gitBranch = $state<GitBranchInfo>({ name: null, headShortSha: null });
+	gitBranch = $state<GitBranchInfo>({ name: null, headShortSha: null, ahead: 0, behind: 0 });
 
 	private async refreshGitBranch() {
 		try {
 			this.gitBranch = await ipc.fs.gitBranch();
 		} catch {
-			this.gitBranch = { name: null, headShortSha: null };
+			this.gitBranch = { name: null, headShortSha: null, ahead: 0, behind: 0 };
 		}
 	}
 

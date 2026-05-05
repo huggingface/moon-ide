@@ -152,11 +152,33 @@
 				<span class="branch-name">{branchLabel}</span>
 			</div>
 			<div class="actions">
-				<button type="button" class="icon-btn" title="Pull" aria-label="Pull" disabled={busy} onclick={pull}>
-					<span aria-hidden="true">↓</span>
+				<button
+					type="button"
+					class="icon-btn"
+					class:has-count={branch.behind > 0}
+					title={branch.behind > 0 ? `Pull (${branch.behind} behind)` : 'Pull'}
+					aria-label={branch.behind > 0 ? `Pull ${branch.behind} commits` : 'Pull'}
+					disabled={busy}
+					onclick={pull}
+				>
+					<span class="arrow" aria-hidden="true">↓</span>
+					{#if branch.behind > 0}
+						<span class="count">{branch.behind}</span>
+					{/if}
 				</button>
-				<button type="button" class="icon-btn" title="Push" aria-label="Push" disabled={busy} onclick={push}>
-					<span aria-hidden="true">↑</span>
+				<button
+					type="button"
+					class="icon-btn"
+					class:has-count={branch.ahead > 0}
+					title={branch.ahead > 0 ? `Push (${branch.ahead} ahead)` : 'Push'}
+					aria-label={branch.ahead > 0 ? `Push ${branch.ahead} commits` : 'Push'}
+					disabled={busy}
+					onclick={push}
+				>
+					<span class="arrow" aria-hidden="true">↑</span>
+					{#if branch.ahead > 0}
+						<span class="count">{branch.ahead}</span>
+					{/if}
 				</button>
 			</div>
 		</div>
@@ -237,8 +259,10 @@
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
-		width: 22px;
+		gap: 2px;
+		min-width: 22px;
 		height: 22px;
+		padding: 0 4px;
 		border: none;
 		background: transparent;
 		color: var(--m-fg-muted);
@@ -259,6 +283,23 @@
 	.icon-btn:disabled {
 		opacity: 0.4;
 		cursor: not-allowed;
+	}
+	/* Highlight the count-bearing button so the badge reads as
+	   "you have N commits to push/pull, click here". The accent
+	   tint maps onto the same colour used for the amend toggle's
+	   active state — visually consistent with "this button is
+	   meaningful right now". */
+	.icon-btn.has-count {
+		color: var(--m-fg);
+	}
+	.icon-btn .arrow {
+		font-size: 14px;
+		line-height: 1;
+	}
+	.icon-btn .count {
+		font-size: 11px;
+		font-variant-numeric: tabular-nums;
+		line-height: 1;
 	}
 	.input {
 		appearance: none;

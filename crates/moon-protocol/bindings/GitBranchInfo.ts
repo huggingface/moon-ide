@@ -2,10 +2,12 @@
 
 /**
  * Lightweight info the SCM panel renders next to its commit
- * input: the active branch name and a short HEAD hash for the
- * detached state. `None` on either field means "this signal isn't
- * available right now"; the panel renders the empty case as an
- * inert label rather than a hard error.
+ * input: the active branch name, a short HEAD hash for the
+ * detached state, and ahead/behind counts vs the upstream.
+ * `None` (for the strings) and `0` (for the counts) are the
+ * "this signal isn't available right now" fallbacks; the panel
+ * renders the empty case as an inert label rather than a hard
+ * error.
  */
 export type GitBranchInfo = { 
 /**
@@ -20,4 +22,17 @@ name: string | null,
  * the repo has no commits yet (a fresh `git init`), HEAD is
  * unreadable, or the folder isn't a git repo.
  */
-headShortSha: string | null, };
+headShortSha: string | null, 
+/**
+ * Number of commits the local branch has that its configured
+ * upstream doesn't — commits that would be sent on the next
+ * `git push`. `0` when there's no upstream configured, no
+ * HEAD, or the count couldn't be determined.
+ */
+ahead: number, 
+/**
+ * Number of commits the upstream has that the local branch
+ * doesn't — commits that would be merged in on the next
+ * `git pull`. Same `0`-fallback semantics as `ahead`.
+ */
+behind: number, };
