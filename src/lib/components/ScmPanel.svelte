@@ -153,6 +153,23 @@
 				<span class="branch-icon" aria-hidden="true">⎇</span>
 				<span class="branch-name">{branchLabel}</span>
 			</div>
+			{#if changeCount > 0 || workspace.scmFilterOn}
+				<button
+					type="button"
+					class="changes-badge"
+					class:active={workspace.scmFilterOn}
+					title={workspace.scmFilterOn
+						? `${changeCount} change${changeCount === 1 ? '' : 's'} (click to show all files)`
+						: `${changeCount} change${changeCount === 1 ? '' : 's'} (click to filter to changes only)`}
+					aria-label={workspace.scmFilterOn
+						? `Showing ${changeCount} changes — click to show all files`
+						: `${changeCount} changes — click to filter`}
+					aria-pressed={workspace.scmFilterOn}
+					onclick={() => workspace.toggleScmFilter()}
+				>
+					{changeCount}
+				</button>
+			{/if}
 			<div class="actions">
 				<button
 					type="button"
@@ -185,47 +202,30 @@
 			</div>
 		</div>
 	{/if}
-	<textarea
-		bind:this={textarea}
-		bind:value={message}
-		class="input"
-		rows="1"
-		placeholder={amend ? 'Amend message (leave empty to keep)' : 'Commit message'}
-		aria-label="Commit message"
-		disabled={busy}
-		onkeydown={onKeydown}
-		oninput={autoSize}
-	></textarea>
-	<div class="footer">
+	<div class="composer">
+		<textarea
+			bind:this={textarea}
+			bind:value={message}
+			class="input"
+			rows="1"
+			placeholder={amend ? 'Amend message (leave empty to keep)' : 'Commit message'}
+			aria-label="Commit message"
+			disabled={busy}
+			onkeydown={onKeydown}
+			oninput={autoSize}
+		></textarea>
 		<button
 			type="button"
-			class="amend-toggle"
+			class="amend-inset"
 			class:active={amend}
-			title={amend ? 'Amend HEAD on next commit' : 'Toggle amend mode'}
+			title={amend ? 'Amend HEAD on next commit (click to disable)' : 'Toggle amend mode'}
+			aria-label={amend ? 'Amend mode on' : 'Toggle amend mode'}
 			aria-pressed={amend}
 			disabled={busy}
 			onclick={() => (amend = !amend)}
 		>
-			<span class="amend-icon" aria-hidden="true">✎</span>
-			<span>Amend</span>
+			<span aria-hidden="true">✎</span>
 		</button>
-		{#if changeCount > 0 || workspace.scmFilterOn}
-			<button
-				type="button"
-				class="changes-badge"
-				class:active={workspace.scmFilterOn}
-				title={workspace.scmFilterOn
-					? `${changeCount} change${changeCount === 1 ? '' : 's'} (click to show all files)`
-					: `${changeCount} change${changeCount === 1 ? '' : 's'} (click to filter to changes only)`}
-				aria-label={workspace.scmFilterOn
-					? `Showing ${changeCount} changes — click to show all files`
-					: `${changeCount} changes — click to filter`}
-				aria-pressed={workspace.scmFilterOn}
-				onclick={() => workspace.toggleScmFilter()}
-			>
-				{changeCount}
-			</button>
-		{/if}
 	</div>
 </section>
 
@@ -320,6 +320,14 @@
 		font-variant-numeric: tabular-nums;
 		line-height: 1;
 	}
+	/* Composer wrapper hosts the textarea plus the inset amend
+	   icon — chat-composer pattern. The textarea stretches the
+	   full container; the icon button is absolutely positioned in
+	   the bottom-right and the textarea reserves padding-right so
+	   wrapping text doesn't run under it. */
+	.composer {
+		position: relative;
+	}
 	.input {
 		appearance: none;
 		display: block;
@@ -327,7 +335,7 @@
 		box-sizing: border-box;
 		min-height: 24px;
 		max-height: 240px;
-		padding: 4px 6px;
+		padding: 4px 28px 4px 6px;
 		border: 1px solid var(--m-border);
 		border-radius: 4px;
 		background: var(--m-bg-1);
@@ -354,49 +362,47 @@
 	.input:disabled {
 		opacity: 0.6;
 	}
-	.footer {
-		display: flex;
-		align-items: center;
-		gap: 4px;
-	}
-	.amend-toggle {
+	/* Inset amend toggle: a small square button sitting in the
+	   bottom-right of the composer. Off → muted ghost. On → accent
+	   ring matching the rest of the panel's "this control is
+	   driving" vocabulary. */
+	.amend-inset {
 		appearance: none;
+		position: absolute;
+		right: 4px;
+		bottom: 4px;
 		display: inline-flex;
 		align-items: center;
-		gap: 4px;
+		justify-content: center;
+		width: 20px;
+		height: 20px;
 		border: 1px solid transparent;
+		border-radius: 4px;
 		background: transparent;
 		color: var(--m-fg-muted);
 		font: inherit;
 		font-size: 12px;
 		line-height: 1;
-		padding: 3px 6px;
-		border-radius: 4px;
 		cursor: pointer;
 	}
-	.amend-toggle:hover:not(:disabled) {
+	.amend-inset:hover:not(:disabled) {
 		background: var(--m-bg-2);
 		color: var(--m-fg);
 	}
-	.amend-toggle:focus-visible {
+	.amend-inset:focus-visible {
 		outline: 1px solid var(--m-accent);
 		outline-offset: -1px;
 	}
-	.amend-toggle.active {
+	.amend-inset.active {
 		background: var(--m-bg-overlay);
 		border-color: var(--m-accent);
 		color: var(--m-fg);
 	}
-	.amend-toggle:disabled {
+	.amend-inset:disabled {
 		opacity: 0.4;
 		cursor: not-allowed;
 	}
-	.amend-icon {
-		font-size: 11px;
-		line-height: 1;
-		opacity: 0.85;
-	}
-	/* Pill badge that sits at the far right of the footer. Always
+	/* Pill badge in the header next to the branch name. Always
 	   carries the change count; visible iff the user has changes
 	   *or* the filter is on (so a count of 0 with the filter
 	   active still surfaces the toggle for "go back to all"). The
@@ -407,7 +413,6 @@
 	   weight. */
 	.changes-badge {
 		appearance: none;
-		margin-left: auto;
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
@@ -428,6 +433,7 @@
 		line-height: 1;
 		cursor: pointer;
 		font-variant-numeric: tabular-nums;
+		flex-shrink: 0;
 	}
 	.changes-badge:hover {
 		filter: brightness(1.1);
