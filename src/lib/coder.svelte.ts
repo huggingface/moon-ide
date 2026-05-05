@@ -71,6 +71,15 @@ class CoderPanelState {
 		return this.status?.identity ?? null;
 	}
 
+	/** Where the agent's `bash` tool will run for the active folder.
+	 *  Surfaced in the panel header so the user knows whether
+	 *  commands hit the host or the workspace container. `null`
+	 *  before the first status probe lands or when the workspace has
+	 *  no active folder. */
+	get bashTarget(): 'host' | 'container' | null {
+		return this.status?.bash_target ?? null;
+	}
+
 	togglePanel(): void {
 		this.panelVisible = !this.panelVisible;
 	}

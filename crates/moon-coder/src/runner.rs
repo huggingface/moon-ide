@@ -54,6 +54,10 @@ struct CoderState {
 	events: broadcast::Sender<CoderEvent>,
 	turn: Arc<Mutex<TurnState>>,
 	session: Arc<Mutex<Session>>,
+	/// Held here in addition to inside `ToolRegistry` so `status()`
+	/// can read the active folder's host kind for the panel-header
+	/// indicator without going through the tool dispatch path.
+	workspaces: Arc<WorkspaceRegistry>,
 }
 
 /// Per-turn cancellation token + "is anything running right now?"
@@ -89,7 +93,7 @@ impl CoderHandle {
 	pub fn new(workspaces: Arc<WorkspaceRegistry>) -> Result<Self, CoderError> {
 		let auth = Authenticator::new()?;
 		let inference = InferenceClient::new(auth.clone())?;
-		let tools = ToolRegistry::new(workspaces);
+		let tools = ToolRegistry::new(workspaces.clone());
 		let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 		Ok(Self {
 			state: Arc::new(CoderState {
@@ -99,6 +103,7 @@ impl CoderHandle {
 				events,
 				turn: Arc::new(Mutex::new(TurnState::default())),
 				session: Arc::new(Mutex::new(Session::new())),
+				workspaces,
 			}),
 		})
 	}
@@ -106,10 +111,25 @@ impl CoderHandle {
 	pub async fn status(&self) -> Result<CoderStatus, CoderError> {
 		let identity = self.state.auth.identity().await?;
 		let busy = self.state.turn.lock().await.cancel.is_some();
+		// `bash_target` mirrors what `tools::bash` would pick for
+		// the active folder. We compute it here so the panel header
+		// can show the indicator without needing to wait for the
+		// first `bash` call to land. `None` when no folder is
+		// active — chat still works, only tool calls would fail.
+		let bash_target = self
+			.state
+			.workspaces
+			.active_folder()
+			.await
+			.map(|folder| match folder.folder.host {
+				moon_protocol::workspace::HostKind::Local => crate::tools::BASH_TARGET_HOST.to_string(),
+				moon_protocol::workspace::HostKind::Devcontainer => crate::tools::BASH_TARGET_CONTAINER.to_string(),
+			});
 		Ok(CoderStatus {
 			signed_in: identity.is_some(),
 			identity,
 			busy,
+			bash_target,
 		})
 	}
 

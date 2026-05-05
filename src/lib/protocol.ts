@@ -718,6 +718,12 @@ export type CoderStatus = {
 	signed_in: boolean;
 	identity: HfIdentity | null;
 	busy: boolean;
+	/**
+	 * Where the agent's `bash` tool runs for the active folder. Mirrors
+	 * the `target` field on the bash tool result. `null` when the
+	 * workspace has no active folder yet.
+	 */
+	bash_target: 'host' | 'container' | null;
 };
 
 /**

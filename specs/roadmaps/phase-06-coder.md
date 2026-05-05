@@ -65,30 +65,53 @@ What ships:
 - Frontend `coderStream.ts` translates events into reactive
   state updates on `CoderPanel`'s message list.
 
-### 6.2 — Mutating tools + container-aware bash
+### 6.2 — Mutating tools
 
 **Acceptance**: the agent can `write_file` and `edit_file`, with
 edits showing up live in any open editor tab (CodeMirror picks
-them up via the existing fs-watch path). `bash` runs **inside the
-workspace shell container** when the workspace is containerised,
-on the host otherwise — the panel header surfaces the active
-target.
+them up via the existing fs-watch path).
 
 What ships:
 
 - `write_file` and `edit_file` tools. `edit_file` uses exact
   string match; failure throws so the LLM can retry with bigger
-  context. Open-buffer collision: if the target is a dirty open
-  tab, the agent overwrites and the editor reloads — the
-  workspace-state save path already handles "external mtime
-  changed".
-- `bash` tool wired to `WorkspaceHost::spawn`. Phase 2's
-  `ContainerHost` already routes spawn through `docker exec`;
-  the coder gets that for free.
+  context. Multi-match disambiguation via a 1-based `occurrence`
+  arg — passing it without a prior failure is fine, but the
+  prompt steers the model toward "add more context" first.
+  Open-buffer collision: if the target is a dirty open tab, the
+  agent overwrites and the editor reloads — the workspace-state
+  save path already handles "external mtime changed".
 - Tool-call render: each call shows up as a collapsible block
-  with `args` (input) and `result` (output) tabs.
-- Panel-header indicator pip: "running on host" vs "running in
-  container" based on the active host.
+  with `args` (input) and `result` (output) tabs (already in
+  6.0; no new UI surface needed).
+- System prompt updated to advertise edits and the
+  exact-string-match retry pattern.
+
+### 6.2.x — Container-aware bash
+
+**Acceptance**: `bash` runs **inside the workspace shell
+container** when the active folder is a devcontainer, on the
+host otherwise. The panel header surfaces the active target as a
+small `host` / `container` pip next to the username.
+
+What ships:
+
+- `tools::bash` checks the active folder's
+  `WorkspaceFolder.host`. `Local` → `tokio::process::Command::new("sh") -lc <cmd>`
+  rooted at the folder, exactly as before. `Devcontainer` →
+  `docker exec -w <container_cwd> <name> sh -lc <cmd>` against
+  the workspace shell container compose already brought up.
+- Reuses `moon_terminal::container_name_for_workspace` and
+  `TerminalTarget::container_cwd_for_folder` so the framing
+  matches terminals + LSP. No new trait method on
+  `WorkspaceHost`; one is justified once a second host
+  implementor (`RemoteHost`/`ContainerHost`) lands.
+- `CoderStatus.bash_target: "host" | "container" | null` mirrors
+  the bash tool result's `target` field. Status re-probes when
+  the active folder switches so the pip stays fresh.
+- Panel-header indicator pip in `CoderPanel.svelte`: subdued
+  "host" border-only, accent-tinted "container" pip so the
+  boundary is impossible to miss.
 
 ### 6.3 — Sessions on disk + todo list tool
 

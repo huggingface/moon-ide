@@ -1,16 +1,18 @@
 //! Tool surface dispatched by the agent loop.
 //!
-//! Phase 6.0 ships read-only tools (`read_file`, `list_dir`, `grep`)
-//! plus a host-side `bash`. Mutating tools (`write_file`,
-//! `edit_file`) and IDE-native tools (`goto_definition`, `git_*`)
-//! land as separate commits in 6.x as concrete need appears — see
-//! `specs/coder.md` § Tool surface.
+//! Phase 6.2 adds `write_file` and `edit_file` on top of the 6.0
+//! read-only set (`read_file`, `list_dir`, `grep`, `bash`). The
+//! agent can now create new files, overwrite existing ones, and do
+//! surgical exact-string edits without going through `bash`. IDE-
+//! native tools (`goto_definition`, `git_*`) and container-aware
+//! `bash` (via `WorkspaceHost::spawn`) land in later sub-phases as
+//! concrete need appears — see `specs/coder.md` § Tool surface.
 //!
 //! Every tool dispatches against the active workspace folder via
 //! [`moon_core::WorkspaceHost`] (or a service that takes its root,
 //! such as `moon_core::search`). That gives us container-aware
 //! routing for free once Phase 2 grows the [`WorkspaceHost`] impl
-//! for `ContainerHost`.
+//! for `ContainerHost` *and* `WorkspaceHost::spawn` exists.
 //!
 //! Per `specs/coder.md` § Error model: tools **throw**. Returning a
 //! string like "ERROR: ..." as content confuses the model. Errors
@@ -19,9 +21,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use camino::Utf8Path;
-use moon_core::WorkspaceRegistry;
+use camino::{Utf8Path, Utf8PathBuf};
+use moon_core::{WorkspaceFolderEntry, WorkspaceRegistry};
 use moon_protocol::search::{ContentSearchHit, ContentSearchOptions};
+use moon_protocol::workspace::HostKind;
+use moon_terminal::{container_name_for_workspace, TerminalTarget};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -131,6 +135,50 @@ impl ToolRegistry {
 					"required": ["cmd"]
 				}),
 			),
+			ToolDefinition::function(
+				"write_file",
+				"Overwrite a file with new content (or create it if missing). Use for new files or whole-file rewrites; prefer `edit_file` for surgical changes inside a large file. The file's parent directory must already exist. Throws on path-traversal attempts outside the workspace folder.",
+				json!({
+					"type": "object",
+					"properties": {
+						"path": {
+							"type": "string",
+							"description": "Workspace-relative path. Created if it does not exist."
+						},
+						"content": {
+							"type": "string",
+							"description": "Full file contents. Whatever you pass becomes the file verbatim — include the trailing newline if you want one."
+						}
+					},
+					"required": ["path", "content"]
+				}),
+			),
+			ToolDefinition::function(
+				"edit_file",
+				"Replace an exact substring inside a file. `find` must match the file *exactly* (including whitespace and line endings) and must be unique unless `occurrence` is given. To insert text, set `find` to the line you want to insert before/after and include it in `replace`. To delete, set `replace` to an empty string. Failure throws — when it does, retry with more surrounding context in `find` so the match becomes unique.",
+				json!({
+					"type": "object",
+					"properties": {
+						"path": {
+							"type": "string",
+							"description": "Workspace-relative path. The file must already exist."
+						},
+						"find": {
+							"type": "string",
+							"description": "Exact substring to locate. No regex; whitespace is significant."
+						},
+						"replace": {
+							"type": "string",
+							"description": "Replacement text. Pass an empty string to delete the matched span."
+						},
+						"occurrence": {
+							"type": "integer",
+							"description": "1-based index of which match to replace when `find` matches multiple times. Omit to require exactly one match."
+						}
+					},
+					"required": ["path", "find", "replace"]
+				}),
+			),
 		]
 	}
 
@@ -140,6 +188,8 @@ impl ToolRegistry {
 			"list_dir" => self.list_dir(args).await,
 			"grep" => self.grep(args).await,
 			"bash" => self.bash(args, cancel).await,
+			"write_file" => self.write_file(args).await,
+			"edit_file" => self.edit_file(args).await,
 			other => Err(CoderError::UnknownTool(other.to_string())),
 		}
 	}
@@ -252,6 +302,101 @@ impl ToolRegistry {
 		}))
 	}
 
+	async fn write_file(&self, args: &Value) -> Result<Value, CoderError> {
+		#[derive(Deserialize)]
+		struct WriteFileArgs {
+			path: String,
+			content: String,
+		}
+		let parsed: WriteFileArgs =
+			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("write_file", err.to_string()))?;
+		let folder = self
+			.workspaces
+			.active_folder()
+			.await
+			.ok_or(CoderError::NoActiveFolder)?;
+		let result = folder
+			.host
+			.write_file(Utf8Path::new(&parsed.path), &parsed.content)
+			.await?;
+		Ok(json!({
+			"path": parsed.path,
+			"bytes_written": parsed.content.len(),
+			"mtime_ms": result.mtime_ms,
+		}))
+	}
+
+	async fn edit_file(&self, args: &Value) -> Result<Value, CoderError> {
+		#[derive(Deserialize)]
+		struct EditFileArgs {
+			path: String,
+			find: String,
+			replace: String,
+			#[serde(default)]
+			occurrence: Option<usize>,
+		}
+		let parsed: EditFileArgs =
+			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("edit_file", err.to_string()))?;
+		if parsed.find.is_empty() {
+			return Err(CoderError::invalid_args("edit_file", "`find` must not be empty"));
+		}
+		let folder = self
+			.workspaces
+			.active_folder()
+			.await
+			.ok_or(CoderError::NoActiveFolder)?;
+		let path = Utf8Path::new(&parsed.path);
+		let original = folder.host.read_file(path).await?;
+		if original.is_binary {
+			return Err(CoderError::tool_failed("edit_file", "binary file"));
+		}
+
+		let matches: Vec<usize> = byte_offsets_of(&original.text, &parsed.find);
+		let target_idx = match (matches.len(), parsed.occurrence) {
+			(0, _) => {
+				return Err(CoderError::tool_failed(
+					"edit_file",
+					format!("`find` not found in {}", parsed.path),
+				));
+			}
+			(1, None | Some(1)) => matches[0],
+			(_, None) => {
+				return Err(CoderError::tool_failed(
+					"edit_file",
+					format!(
+						"`find` matched {} times in {}; pass `occurrence` (1-based) or include more surrounding context",
+						matches.len(),
+						parsed.path
+					),
+				));
+			}
+			(n, Some(idx)) if idx == 0 || idx > n => {
+				return Err(CoderError::tool_failed(
+					"edit_file",
+					format!("occurrence {idx} out of range — `find` matched {n} times"),
+				));
+			}
+			// `idx >= 1` and `idx <= n` here, so the subtraction can't
+			// underflow. `matches[idx - 1]` is always in bounds.
+			(_, Some(idx)) => matches[idx - 1],
+		};
+
+		let mut new_text = String::with_capacity(original.text.len() - parsed.find.len() + parsed.replace.len());
+		new_text.push_str(&original.text[..target_idx]);
+		new_text.push_str(&parsed.replace);
+		new_text.push_str(&original.text[target_idx + parsed.find.len()..]);
+
+		let result = folder.host.write_file(path, &new_text).await?;
+		Ok(json!({
+			"path": parsed.path,
+			"replaced_at_byte": target_idx,
+			"bytes_written": new_text.len(),
+			"mtime_ms": result.mtime_ms,
+			"occurrence": parsed.occurrence.unwrap_or(1),
+			"total_matches": matches.len(),
+		}))
+	}
+
 	async fn bash(&self, args: &Value, cancel: &CancellationToken) -> Result<Value, CoderError> {
 		#[derive(Deserialize)]
 		struct BashArgs {
@@ -272,15 +417,8 @@ impl ToolRegistry {
 			.unwrap_or(BASH_DEFAULT_TIMEOUT)
 			.min(BASH_MAX_TIMEOUT);
 
-		let mut command = tokio::process::Command::new("sh");
-		// Container-aware routing arrives in 6.2 (it'll route through
-		// `WorkspaceHost::spawn` once that exists). For now, bash
-		// always runs on the host — fine for the team's day-1 usage
-		// where the workspace is host-mounted.
+		let (mut command, target_kind) = self.build_bash_command(&folder, &parsed.cmd).await?;
 		command
-			.arg("-lc")
-			.arg(&parsed.cmd)
-			.current_dir(folder.folder.path.as_str())
 			.kill_on_drop(true)
 			.stdin(std::process::Stdio::null())
 			.stdout(std::process::Stdio::piped())
@@ -311,11 +449,93 @@ impl ToolRegistry {
 		let stderr = truncate_bytes(&output.stderr, BASH_OUTPUT_MAX_BYTES);
 		Ok(json!({
 			"cmd": parsed.cmd,
+			"target": target_kind,
 			"exit_code": output.status.code(),
 			"stdout": stdout,
 			"stderr": stderr,
 		}))
 	}
+
+	/// Build the platform-correct `bash` command for the active
+	/// folder. Local folders run `sh -lc <cmd>` directly with the
+	/// folder as `cwd`; devcontainer folders go through `docker exec
+	/// -w <container_cwd> <name> sh -lc <cmd>` against the workspace
+	/// shell container that compose / `moon-container` already
+	/// brought up. Same convention used by `moon-terminal` (terminals)
+	/// and `crates/moon-core/src/lsp/spawn.rs` (LSP servers); we
+	/// reuse the helpers in `moon_terminal::target` for the
+	/// container-name + in-container-cwd derivation so all three
+	/// stay in lockstep.
+	///
+	/// Returns the wire-friendly target label (`"host"` /
+	/// `"container"`) so the tool result and the panel header
+	/// indicator pip read the same value.
+	async fn build_bash_command(
+		&self,
+		folder: &WorkspaceFolderEntry,
+		cmd: &str,
+	) -> Result<(tokio::process::Command, &'static str), CoderError> {
+		match folder.folder.host {
+			HostKind::Local => {
+				let mut command = tokio::process::Command::new("sh");
+				command.arg("-lc").arg(cmd).current_dir(folder.folder.path.as_str());
+				Ok((command, BASH_TARGET_HOST))
+			}
+			HostKind::Devcontainer => {
+				let workspace_id = self.workspaces.workspace_id().await;
+				let container_name = container_name_for_workspace(&workspace_id);
+				// Fall back to `/workspace` if the host path has no
+				// basename — same fallback `moon-terminal` uses for
+				// pathological inputs (`/`). Devcontainer folders
+				// nearly always have one, so this is belt-and-braces.
+				let container_cwd = TerminalTarget::container_cwd_for_folder(Utf8Path::new(&folder.folder.path))
+					.unwrap_or_else(|| Utf8PathBuf::from("/workspace"));
+				// `docker exec` (no `-it`): we want captured
+				// stdout/stderr, not a TTY. Terminals get `-it`;
+				// the bash tool doesn't.
+				let mut command = tokio::process::Command::new("docker");
+				command
+					.arg("exec")
+					.arg("-w")
+					.arg(container_cwd.as_str())
+					.arg(&container_name)
+					.arg("sh")
+					.arg("-lc")
+					.arg(cmd);
+				Ok((command, BASH_TARGET_CONTAINER))
+			}
+		}
+	}
+}
+
+/// Wire labels for the `bash` target. Frontend reads these
+/// verbatim from the tool result (and from `CoderStatus`) so the
+/// strings are part of the protocol — don't rename without
+/// updating `src/lib/protocol.ts` in lockstep.
+pub(crate) const BASH_TARGET_HOST: &str = "host";
+pub(crate) const BASH_TARGET_CONTAINER: &str = "container";
+
+/// Find every byte-offset at which `needle` appears in `haystack`.
+/// Used by `edit_file` to (a) detect zero-match / multi-match cases
+/// before mutating, and (b) pick the right occurrence when the LLM
+/// disambiguates with `occurrence`.
+///
+/// Linear-scan with `str::find` advancement: O(n·m) but the inputs
+/// are LLM-sized (file contents + a few hundred bytes of `find`),
+/// not large-corpus. Same algorithm `pi-mono` uses for the same
+/// reason.
+fn byte_offsets_of(haystack: &str, needle: &str) -> Vec<usize> {
+	if needle.is_empty() {
+		return Vec::new();
+	}
+	let mut hits = Vec::new();
+	let mut start = 0;
+	while let Some(idx) = haystack[start..].find(needle) {
+		let absolute = start + idx;
+		hits.push(absolute);
+		start = absolute + needle.len();
+	}
+	hits
 }
 
 fn clamp_to_char_boundary(s: &str, max: usize) -> usize {
@@ -369,4 +589,34 @@ fn clamp_to_char_boundary_bytes(bytes: &[u8], max: usize) -> usize {
 		}
 	}
 	0
+}
+
+#[cfg(test)]
+mod tests {
+	use super::byte_offsets_of;
+
+	#[test]
+	fn byte_offsets_of_finds_non_overlapping_hits() {
+		// Two distinct hits at non-overlapping offsets — the
+		// behaviour `edit_file` relies on for the multi-match
+		// `occurrence` selector.
+		assert_eq!(byte_offsets_of("foo bar foo", "foo"), vec![0, 8]);
+	}
+
+	#[test]
+	fn byte_offsets_of_returns_empty_for_empty_needle() {
+		// `edit_file` already rejects an empty `find` upstream,
+		// but the helper stays safe on its own so a future caller
+		// can't get an infinite loop out of it.
+		assert!(byte_offsets_of("foo", "").is_empty());
+	}
+
+	#[test]
+	fn byte_offsets_of_advances_past_match_no_overlap_loop() {
+		// `aa` in `aaaa` — naive `start += 1` would emit 0, 1, 2.
+		// Our advancement is `+= needle.len()`, so we get 0, 2.
+		// `edit_file` deliberately treats overlapping matches as a
+		// non-issue: real-world `find` strings aren't pathological.
+		assert_eq!(byte_offsets_of("aaaa", "aa"), vec![0, 2]);
+	}
 }

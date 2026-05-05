@@ -62,4 +62,10 @@ pub struct CoderStatus {
 	/// stop button visible across reloads (the event stream alone
 	/// doesn't survive a webview refresh).
 	pub busy: bool,
+	/// Where the `bash` tool will run for the active folder —
+	/// `"host"` or `"container"`. `None` when no folder is active
+	/// (the panel still works for chat without a folder; tool calls
+	/// just fail with `NoActiveFolder`). Mirrors the `target` field
+	/// emitted in `bash` tool results.
+	pub bash_target: Option<String>,
 }

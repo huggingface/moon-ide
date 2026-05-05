@@ -2,6 +2,7 @@
 	import { onMount, tick } from 'svelte';
 	import { confirm } from '@tauri-apps/plugin-dialog';
 	import { coder } from '../coder.svelte';
+	import { workspace } from '../state.svelte';
 	import CoderConnectModal from './CoderConnectModal.svelte';
 	import CoderMarkdown from './CoderMarkdown.svelte';
 
@@ -9,6 +10,16 @@
 	let composer: HTMLTextAreaElement | undefined = $state();
 
 	onMount(() => {
+		void coder.refreshStatus();
+	});
+
+	// Re-probe `coder_status` when the active folder switches so the
+	// host-vs-container indicator pip updates without waiting for the
+	// next user action. Reading `workspace.activeFolder?.host` here
+	// makes the effect re-run on either path or host change.
+	$effect(() => {
+		const _kind = workspace.activeFolder?.host ?? null;
+		void _kind;
 		void coder.refreshStatus();
 	});
 
@@ -65,6 +76,17 @@
 			<span class="label">coder</span>
 			{#if coder.identity}
 				<span class="who">{coder.identity.username}</span>
+			{/if}
+			{#if coder.bashTarget}
+				<span
+					class="target"
+					class:container={coder.bashTarget === 'container'}
+					title={coder.bashTarget === 'container'
+						? 'bash and shell tools run inside the workspace devcontainer'
+						: 'bash and shell tools run on the host machine'}
+				>
+					{coder.bashTarget}
+				</span>
 			{/if}
 		</div>
 		<div class="actions">
@@ -210,6 +232,27 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+	}
+	/* Host-vs-container indicator pip. The colour-mix-tinted
+	   background makes the container case visually distinct so the
+	   user notices when bash crosses the host/container boundary —
+	   running `rm -rf .` on the wrong target is the kind of mistake
+	   the indicator earns its keep on. */
+	.target {
+		font-size: 10px;
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+		color: var(--m-fg-subtle);
+		border: 1px solid var(--m-border);
+		border-radius: 3px;
+		padding: 0 5px;
+		height: 16px;
+		line-height: 14px;
+	}
+	.target.container {
+		color: var(--m-accent);
+		border-color: color-mix(in srgb, var(--m-accent) 50%, transparent);
+		background: color-mix(in srgb, var(--m-accent) 10%, transparent);
 	}
 	.actions {
 		display: flex;

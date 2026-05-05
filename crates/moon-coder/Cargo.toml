@@ -9,6 +9,12 @@ publish = false
 [dependencies]
 moon-core = { workspace = true }
 moon-protocol = { workspace = true }
+# Used purely for the `container_name_for_workspace` + `container_cwd_for_folder`
+# helpers so the coder's `bash` tool builds the same `docker exec` framing
+# as terminals/LSP. Adding it here, not a `WorkspaceHost::spawn` trait
+# method, until there's a second host implementor that would actually
+# benefit from the abstraction.
+moon-terminal = { workspace = true }
 
 async-trait = { workspace = true }
 camino = { workspace = true }
