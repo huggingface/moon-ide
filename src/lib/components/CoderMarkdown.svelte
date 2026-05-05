@@ -8,21 +8,44 @@
 	// Same async-render dance as `MarkdownView.svelte`: `renderMarkdown`
 	// preloads CodeMirror grammars for every fenced-code language
 	// before the synchronous render, so the call has to be awaited.
-	// `stale` flips when `text` changes mid-render so the older HTML
-	// is dropped on the floor — relevant once streaming arrives in
-	// 6.1, harmless for the non-streaming 6.0 path.
+	//
+	// Streaming (Phase 6.1) lands ~30 deltas/second per assistant
+	// message. Re-running markdown-it + DOMPurify + grammar lookup
+	// once per delta is wasteful; coalesce to one render per
+	// animation frame and always pick up the *latest* source. The
+	// effect itself stays cheap — only `pendingSource` mutates per
+	// keystroke; the rAF callback does the actual work.
 	let html = $state('');
-	$effect(() => {
-		let stale = false;
-		const source = text;
-		void (async () => {
-			const rendered = await renderMarkdown(source);
-			if (!stale) {
+	let pendingSource = '';
+	let pendingFrame: number | null = null;
+	let renderToken = 0;
+
+	function scheduleRender(): void {
+		if (pendingFrame !== null) {
+			return;
+		}
+		pendingFrame = requestAnimationFrame(() => {
+			pendingFrame = null;
+			const source = pendingSource;
+			const token = ++renderToken;
+			void (async () => {
+				const rendered = await renderMarkdown(source);
+				if (token !== renderToken) {
+					return;
+				}
 				html = rendered;
-			}
-		})();
+			})();
+		});
+	}
+
+	$effect(() => {
+		pendingSource = text;
+		scheduleRender();
 		return () => {
-			stale = true;
+			if (pendingFrame !== null) {
+				cancelAnimationFrame(pendingFrame);
+				pendingFrame = null;
+			}
 		};
 	});
 

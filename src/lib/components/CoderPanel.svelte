@@ -175,9 +175,24 @@
 				{:else if row.kind === 'assistant'}
 					<div class="row assistant">
 						<div class="row-label">coder</div>
-						<div class="bubble assistant-bubble">
-							<CoderMarkdown text={row.text} />
-						</div>
+						{#if row.thinking.length > 0}
+							<!-- Reasoning trace from the underlying model. Open
+								 while streaming so the user sees thoughts land,
+								 collapsed once the message finishes (the
+								 `assistant_message_end` handler flips
+								 `thinkingOpen`). The user can re-expand it
+								 manually any time. We bind `open` so manual
+								 toggles persist across re-renders. -->
+							<details class="thinking" bind:open={row.thinkingOpen}>
+								<summary>thinking{row.text.length === 0 ? '…' : ''}</summary>
+								<div class="thinking-body"><CoderMarkdown text={row.thinking} /></div>
+							</details>
+						{/if}
+						{#if row.text.length > 0}
+							<div class="bubble assistant-bubble">
+								<CoderMarkdown text={row.text} />
+							</div>
+						{/if}
 					</div>
 				{:else if row.kind === 'tool'}
 					<div class="row tool" class:err={row.isError}>
@@ -404,6 +419,37 @@
 	}
 	.row.user .bubble {
 		background: color-mix(in srgb, var(--m-accent) 18%, transparent);
+	}
+	/* Reasoning-trace disclosure. Sits between the row label and
+	   the answer bubble. Muted typography so it visually de-prioritises
+	   itself once the answer is in — the model's chain of thought is
+	   diagnostic context, not the headline. */
+	.thinking {
+		font-size: 12px;
+		background: var(--m-bg-overlay);
+		border-radius: 6px;
+		padding: 6px 10px;
+		color: var(--m-fg-muted);
+	}
+	.thinking summary {
+		cursor: pointer;
+		font-size: 11px;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		color: var(--m-fg-subtle);
+		user-select: none;
+	}
+	.thinking[open] summary {
+		margin-bottom: 4px;
+		border-bottom: 1px solid var(--m-border);
+		padding-bottom: 4px;
+	}
+	.thinking-body {
+		font-size: 12px;
+		line-height: 1.5;
+		color: var(--m-fg-muted);
+		max-height: 320px;
+		overflow-y: auto;
 	}
 	.row.error .bubble {
 		background: color-mix(in srgb, var(--m-danger) 14%, transparent);

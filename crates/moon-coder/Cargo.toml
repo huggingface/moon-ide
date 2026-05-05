@@ -24,6 +24,7 @@ moon-container = { workspace = true }
 
 async-trait = { workspace = true }
 camino = { workspace = true }
+futures-util = { workspace = true }
 keyring = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

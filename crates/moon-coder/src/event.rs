@@ -16,11 +16,44 @@ pub enum CoderEvent {
 	/// echoing what it just sent.
 	UserMessage { id: String, text: String },
 
-	/// One assistant message landed. In 6.0 this fires once per
-	/// completion (non-streaming); in 6.1 it'll fire as deltas
-	/// roll in. `text` is the full content for the message — the
-	/// UI replaces, not appends.
-	AssistantMessage { id: String, text: String },
+	/// A new assistant message bubble has started in the current
+	/// turn — fires before the first `AssistantMessageDelta` for a
+	/// given `id`. The UI inserts an empty bubble; subsequent
+	/// deltas append. Splitting start from the first delta keeps
+	/// the empty-message case (model emits only tool calls, no
+	/// content) clean: no start, no deltas, no bubble.
+	AssistantMessageStart { id: String },
+
+	/// Append `delta` to the bubble identified by `id`. Fired per
+	/// SSE chunk. The frontend creates the bubble lazily if a delta
+	/// arrives without a prior `AssistantMessageStart` (defensive
+	/// against future provider quirks).
+	AssistantMessageDelta { id: String, delta: String },
+
+	/// Append `delta` to the *thinking* trace of the message
+	/// identified by `id`. Fires only when the underlying provider
+	/// streams a reasoning trace (DeepSeek `reasoning_content`,
+	/// some others under `reasoning`). The frontend renders this
+	/// in a collapsible block above the message body; if no
+	/// thinking deltas ever arrive, the block isn't shown at all.
+	/// No matching `Start` event — the frontend lazy-creates the
+	/// thinking section on the first delta.
+	AssistantThinkingDelta { id: String, delta: String },
+
+	/// The assistant message identified by `id` is complete. `text`
+	/// is the canonical full content; `thinking` is the canonical
+	/// full reasoning trace (`None` when the provider doesn't
+	/// expose one). The frontend replaces its accumulated strings
+	/// with these so any drift between concatenated deltas and the
+	/// final assembly heals on close. The UI also (re)runs
+	/// markdown rendering on the final text and auto-collapses the
+	/// thinking block.
+	AssistantMessageEnd {
+		id: String,
+		text: String,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		thinking: Option<String>,
+	},
 
 	/// The model issued a tool call. Fires before the tool runs so
 	/// the panel can render an "in progress" block.

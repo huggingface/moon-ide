@@ -746,7 +746,10 @@ export type CoderStatus = {
  */
 export type CoderEvent =
 	| { kind: 'user_message'; id: string; text: string }
-	| { kind: 'assistant_message'; id: string; text: string }
+	| { kind: 'assistant_message_start'; id: string }
+	| { kind: 'assistant_message_delta'; id: string; delta: string }
+	| { kind: 'assistant_thinking_delta'; id: string; delta: string }
+	| { kind: 'assistant_message_end'; id: string; text: string; thinking?: string | null }
 	| { kind: 'tool_call'; id: string; name: string; args: unknown }
 	| { kind: 'tool_result'; id: string; result: unknown; is_error: boolean }
 	| { kind: 'turn_complete' }

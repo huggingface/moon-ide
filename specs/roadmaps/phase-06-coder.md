@@ -46,24 +46,68 @@ What ships:
 
 Test plan: written before the commit.
 
-### 6.1 — Streaming
+### 6.1 — Streaming — **done**
 
 **Acceptance**: assistant messages stream into the panel as SSE
 chunks land, with `Esc` aborting the in-flight call cleanly
-(partial assistant message preserved). Thinking blocks (when the
-provider returns them) render collapsed under the assistant
-message.
+(partial assistant message preserved).
 
-What ships:
+What shipped:
 
-- SSE client in `inference/`. Push-based parsing into the loop's
-  event vocabulary (`message_update` for each delta).
-- Tauri event channel `coder:event` with the full event set.
-- Cancel propagation: `coder_abort` cancels the SSE read + any
-  in-flight tool, the loop emits `agent_end { aborted: true }`
-  and shuts down.
-- Frontend `coderStream.ts` translates events into reactive
-  state updates on `CoderPanel`'s message list.
+- SSE consumer in `inference.rs`. Inline `\n\n` / `\r\n\r\n` event
+  parsing + accumulator that re-assembles content + tool calls
+  from chunked OpenAI-shape deltas. Five unit tests cover the
+  parser (comment/keepalive skip, multi-`data:` events, tool-call
+  argument concatenation, LF + CRLF boundaries, empty-buffer
+  filtering).
+- New event vocabulary in `event.rs`: `AssistantMessageStart {
+id }` → N × `AssistantMessageDelta { id, delta }` →
+  `AssistantMessageEnd { id, text }` (`AssistantMessage` deleted
+  per "no premature migrations"). `End.text` carries the
+  canonical full content so any drift between concatenated
+  deltas and the final assembly heals on close. Tool-call
+  fragments are buffered server-side and only surfaced as
+  `ToolCall` once fully assembled — partial JSON arguments
+  aren't useful to render.
+- Runner uses `chat_completion_stream`. The same
+  `CancellationToken` that already cancels tool dispatch now
+  also drops the SSE byte stream; Esc-abort is one `select!`
+  arm in `consume_sse_stream`.
+- Frontend `coder.svelte.ts` reconciles deltas by id; new
+  `appendDelta` helper keeps the row mutation pure.
+- `CoderMarkdown.svelte` coalesces re-renders to one per
+  `requestAnimationFrame` tick. With ~30 deltas/sec, that caps
+  the markdown-it + DOMPurify + grammar-lookup work at one
+  render per paint frame; `End.text` triggers a final canonical
+  render.
+
+Reasoning / thinking deltas (added in the same sub-phase):
+
+- Backend accepts both `reasoning_content` (DeepSeek, Qwen) and
+  `reasoning` (other providers) under the same `thinking`
+  buffer, with serde aliases so the non-streaming path picks
+  them up too.
+- New `AssistantThinkingDelta { id, delta }` event, plus a
+  canonical `thinking: Option<String>` field on
+  `AssistantMessageEnd`. The runner fires
+  `AssistantMessageStart` on the first thinking _or_ content
+  delta, so the panel inserts the row before reasoning lands.
+- UI: collapsible `<details class="thinking">` block above the
+  answer, auto-collapsed on `assistant_message_end`. Empty
+  thinking is dropped server-side so non-reasoning models
+  don't get a useless empty disclosure.
+
+Deferred from the original 6.1 plan:
+
+- `coderStream.ts` extraction: the streaming logic ended up
+  small enough to live inline in `coder.svelte.ts`. Split out
+  if `applyEvent` grows past one screen.
+- Anthropic-style structured `thinking` blocks with
+  cryptographic signing: out of scope, the HF router doesn't
+  pass them through anyway.
+- Thinking-duration display ("Thought for 12 s"): cheap to add
+  if anyone asks, but the streaming animation already conveys
+  "the model is thinking" clearly enough.
 
 ### 6.2 — Mutating tools
 

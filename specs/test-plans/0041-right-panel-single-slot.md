@@ -145,13 +145,14 @@ prompts below and inspect the tool calls in the panel.
 
 14. **Grep → narrow read loop**
 
-    Prompt: `find every place we call write_file in moon-coder
-and show me the lines around the third hit`.
+        Prompt: `find every place we call write_file in moon-coder
 
-    Expected: the agent runs `grep` first, picks a `path:line:`
-    hit, then calls `read_file` with `start_line` / `end_line` a
-    few lines around it. Tool result for the read is small and
-    explicitly bounded.
+    and show me the lines around the third hit`.
+
+        Expected: the agent runs `grep` first, picks a `path:line:`
+        hit, then calls `read_file` with `start_line` / `end_line` a
+        few lines around it. Tool result for the read is small and
+        explicitly bounded.
 
 15. **Invalid range rejected cleanly**
 

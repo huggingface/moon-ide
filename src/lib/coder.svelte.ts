@@ -1,11 +1,18 @@
 //! Reactive state for the Coder panel.
 //!
-//! Phase 6.0 surface: device-flow sign-in, single in-memory session,
-//! send / abort. The panel rebuilds its message list from the
-//! `coder:event` Tauri stream — there's no persistence layer behind
-//! it yet (lands in 6.3). A page reload therefore loses the visible
-//! transcript; the loop's own session memory survives because it
-//! lives in the Rust process.
+//! Phase 6.1 surface: device-flow sign-in, single in-memory session,
+//! send / abort, **streaming assistant messages**. The panel rebuilds
+//! its message list from the `coder:event` Tauri stream — there's
+//! no persistence layer behind it yet (lands in 6.3). A page reload
+//! therefore loses the visible transcript; the loop's own session
+//! memory survives because it lives in the Rust process.
+//!
+//! Streaming wire shape (mirrors `moon_coder::CoderEvent`):
+//! `assistant_message_start { id }` → N × `assistant_message_delta
+//! { id, delta }` → `assistant_message_end { id, text }`. The end
+//! event carries the canonical full content; we replace the
+//! accumulated string with it on close so any drift between the
+//! deltas and the final assembly heals.
 //!
 //! See `specs/coder.md` and `specs/test-plans/0039-coder-skeleton.md`.
 
@@ -19,10 +26,15 @@ const CODER_EVENT_CHANNEL = 'coder:event';
 /** One row rendered in the panel transcript. The `kind` matches the
  *  loop event that produced it; the `id` is stable so the runner's
  *  `tool_call` → `tool_result` pair update the same DOM node when
- *  the tool finishes. */
+ *  the tool finishes.
+ *
+ *  Assistant rows track an optional `thinking` trace alongside
+ *  `text`. `thinkingOpen` controls the disclosure state: open while
+ *  the message is still streaming so the user can watch reasoning
+ *  land, auto-collapsed on `assistant_message_end`. */
 export type CoderRow =
 	| { kind: 'user'; id: string; text: string }
-	| { kind: 'assistant'; id: string; text: string }
+	| { kind: 'assistant'; id: string; text: string; thinking: string; thinkingOpen: boolean }
 	| { kind: 'tool'; id: string; name: string; args: unknown; result: unknown; hasResult: boolean; isError: boolean }
 	| { kind: 'error'; id: string; text: string }
 	| { kind: 'aborted'; id: string };
@@ -224,8 +236,36 @@ class CoderPanelState {
 				this.rows = [...this.rows, { kind: 'user', id: event.id, text: event.text }];
 				this.busy = true;
 				return;
-			case 'assistant_message':
-				this.rows = [...this.rows, { kind: 'assistant', id: event.id, text: event.text }];
+			case 'assistant_message_start':
+				// Insert the empty bubble so the user sees the row
+				// land instantly, even before the model emits its
+				// first token. Idempotent: the runner only fires
+				// `start` once per id, but we'd no-op a duplicate
+				// rather than insert a phantom row.
+				if (this.rows.some((r) => r.kind === 'assistant' && r.id === event.id)) {
+					return;
+				}
+				this.rows = [...this.rows, { kind: 'assistant', id: event.id, text: '', thinking: '', thinkingOpen: true }];
+				return;
+			case 'assistant_message_delta':
+				this.rows = appendDelta(this.rows, event.id, event.delta, 'text');
+				return;
+			case 'assistant_thinking_delta':
+				this.rows = appendDelta(this.rows, event.id, event.delta, 'thinking');
+				return;
+			case 'assistant_message_end':
+				// Canonical replacement at close — see the file
+				// header for the rationale (drift between
+				// concatenated deltas and the final assembly heals
+				// on close, plus markdown rendering re-runs once on
+				// the complete text). Auto-collapse the thinking
+				// block: the user already saw it stream, the answer
+				// is the takeaway.
+				this.rows = this.rows.map((row) =>
+					row.kind === 'assistant' && row.id === event.id
+						? { ...row, text: event.text, thinking: event.thinking ?? row.thinking, thinkingOpen: false }
+						: row,
+				);
 				return;
 			case 'tool_call':
 				this.rows = [
@@ -268,6 +308,34 @@ class CoderPanelState {
 				return;
 		}
 	}
+}
+
+/** Append `delta` to the assistant row identified by `id`. The
+ *  `field` selector picks which sub-string accumulates: `'text'`
+ *  for the visible answer, `'thinking'` for the reasoning trace.
+ *  If no row with that id exists yet (a delta arrived before the
+ *  matching `assistant_message_start` — defensive against future
+ *  provider quirks), insert a fresh row carrying just the delta. */
+function appendDelta(rows: CoderRow[], id: string, delta: string, field: 'text' | 'thinking'): CoderRow[] {
+	let found = false;
+	const next = rows.map((row) => {
+		if (row.kind === 'assistant' && row.id === id) {
+			found = true;
+			return { ...row, [field]: row[field] + delta };
+		}
+		return row;
+	});
+	if (!found) {
+		const seed: CoderRow = {
+			kind: 'assistant',
+			id,
+			text: field === 'text' ? delta : '',
+			thinking: field === 'thinking' ? delta : '',
+			thinkingOpen: true,
+		};
+		next.push(seed);
+	}
+	return next;
 }
 
 export const coder = new CoderPanelState();

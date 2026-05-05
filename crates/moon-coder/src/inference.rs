@@ -1,14 +1,19 @@
-//! HF Inference Providers HTTP client (non-streaming).
+//! HF Inference Providers HTTP client.
 //!
 //! OpenAI-compatible API surface against
 //! `https://router.huggingface.co/v1`. Authentication uses the OAuth
 //! access token from [`crate::auth::Authenticator`]; the client wraps
 //! its own `reqwest::Client` and refreshes-on-401 automatically.
 //!
-//! Streaming + provider routing knobs land in 6.1.
+//! Both the non-streaming `chat_completion` and the streaming
+//! `chat_completion_stream` paths exist. The runner uses the
+//! streaming variant for live tokens (Phase 6.1); the non-streaming
+//! one stays around for places that don't want a callback shape
+//! (sub-agents, future test fixtures).
 
 use std::sync::Arc;
 
+use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::Authenticator;
@@ -98,6 +103,10 @@ struct ChatCompletionRequest<'a> {
 	tools: &'a [ToolDefinition],
 	#[serde(skip_serializing_if = "Option::is_none")]
 	tool_choice: Option<&'static str>,
+	/// `true` requests SSE deltas. The router enforces "completions
+	/// without tool calls return a single delta" so we get the same
+	/// shape either way; just buffered when streaming is off.
+	stream: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -116,12 +125,102 @@ pub struct Choice {
 /// [`ChatMessage::Assistant`] because the wire shape uses a flat
 /// `role` field that we don't echo back; this keeps deserialisation
 /// simple without coupling to the input enum's tagging.
+///
+/// `thinking` carries the model's reasoning trace when the
+/// underlying provider exposes one. Different providers use
+/// different field names — DeepSeek and Qwen send
+/// `reasoning_content`, others send `reasoning` — so the
+/// deserializer accepts both as aliases. We don't echo it back to
+/// the model in subsequent chat turns: most providers don't expect
+/// their own reasoning in the history (and Anthropic-style
+/// "thinking blocks" with crypto-signing are out of scope here).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AssistantResponse {
 	#[serde(default)]
 	pub content: Option<String>,
+	#[serde(default, alias = "reasoning_content", alias = "reasoning")]
+	pub thinking: Option<String>,
 	#[serde(default)]
 	pub tool_calls: Vec<ToolCall>,
+}
+
+/// One SSE chunk in the OpenAI streaming shape. Fields use the same
+/// `delta` indirection: each chunk's `choices[0].delta` carries
+/// either a content fragment or a tool-call fragment, never both at
+/// once in practice (some providers do mix; the accumulator below
+/// handles both).
+#[derive(Debug, Clone, Deserialize)]
+struct StreamChunk {
+	#[serde(default)]
+	choices: Vec<StreamChoice>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StreamChoice {
+	#[serde(default)]
+	delta: StreamDelta,
+	/// Provider-reported reason for the stream end (`stop`,
+	/// `tool_calls`, `length`, …). The runner doesn't branch on
+	/// this — `tool_calls.is_empty()` already tells us whether to
+	/// recurse — but we accept the field so the parser doesn't
+	/// reject the chunk that carries it.
+	#[serde(default, rename = "finish_reason")]
+	#[allow(dead_code)]
+	_finish_reason: Option<String>,
+}
+
+/// Per-chunk delta. Every field is optional — a chunk may carry
+/// just `role`, just `content`, just `reasoning_content`, just
+/// `tool_calls`, or some mix.
+///
+/// `role` itself is not consumed by the runner (we always know we
+/// asked for an assistant turn) but we accept the field so its
+/// presence in a chunk doesn't trip `deny_unknown_fields` if a
+/// future Serde knob turns that on.
+///
+/// Reasoning streams under one of two field names depending on the
+/// provider — DeepSeek / Qwen use `reasoning_content`, others use
+/// `reasoning`. We accept both. A single chunk carrying both is
+/// theoretical; if it ever lands we concatenate both into the
+/// thinking buffer in `accumulate_chunk`.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct StreamDelta {
+	#[serde(default, rename = "role")]
+	#[allow(dead_code)]
+	_role: Option<String>,
+	#[serde(default)]
+	content: Option<String>,
+	#[serde(default)]
+	reasoning_content: Option<String>,
+	#[serde(default)]
+	reasoning: Option<String>,
+	#[serde(default)]
+	tool_calls: Vec<ToolCallDelta>,
+}
+
+/// A streaming tool call shows up across multiple chunks. `index`
+/// identifies *which* call this fragment belongs to (the model can
+/// emit multiple parallel tool calls); `id` and `function.name`
+/// arrive on the first fragment, then `function.arguments` arrives
+/// piecewise as a partial JSON string we concatenate.
+#[derive(Debug, Clone, Deserialize)]
+struct ToolCallDelta {
+	#[serde(default)]
+	index: usize,
+	#[serde(default)]
+	id: Option<String>,
+	#[serde(default, rename = "type")]
+	kind: Option<String>,
+	#[serde(default)]
+	function: Option<FunctionCallDelta>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct FunctionCallDelta {
+	#[serde(default)]
+	name: Option<String>,
+	#[serde(default)]
+	arguments: Option<String>,
 }
 
 /// Inference HTTP client. Cheap to clone; the underlying
@@ -170,6 +269,7 @@ impl InferenceClient {
 			messages,
 			tools,
 			tool_choice: if tools.is_empty() { None } else { Some("auto") },
+			stream: false,
 		};
 
 		let access = self.auth.current_access_token().await?;
@@ -201,6 +301,67 @@ impl InferenceClient {
 			.ok_or_else(|| CoderError::decode(&endpoint, "response had no choices"))
 	}
 
+	/// Streaming chat-completions round trip.
+	///
+	/// Calls `on_event` for every parsed delta as bytes arrive
+	/// (`StreamEvent::ContentDelta` / `StreamEvent::ToolCallDelta`),
+	/// then returns the assembled [`AssistantResponse`] once the
+	/// stream ends. The accumulated response is what the runner
+	/// pushes back into the chat history — the UI side already saw
+	/// the same content via the events.
+	///
+	/// Same auth-refresh story as [`Self::chat_completion`]: a 401
+	/// triggers one retry. SSE consumption itself is wrapped in
+	/// `tokio::select!` against `cancel` so an Esc-abort drops the
+	/// connection without waiting for the next chunk.
+	pub async fn chat_completion_stream<F>(
+		&self,
+		model: &str,
+		messages: &[ChatMessage],
+		tools: &[ToolDefinition],
+		cancel: &tokio_util::sync::CancellationToken,
+		mut on_event: F,
+	) -> Result<AssistantResponse, CoderError>
+	where
+		F: FnMut(StreamEvent<'_>),
+	{
+		let endpoint = format!("{}/chat/completions", self.base_url);
+		let body = ChatCompletionRequest {
+			model,
+			messages,
+			tools,
+			tool_choice: if tools.is_empty() { None } else { Some("auto") },
+			stream: true,
+		};
+
+		let access = self.auth.current_access_token().await?;
+		let mut response = self.send_once_stream(&endpoint, &access, &body, cancel).await?;
+
+		if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+			tracing::info!("inference returned 401; refreshing token and retrying once");
+			let refreshed = self.auth.refresh_now().await?;
+			response = self.send_once_stream(&endpoint, &refreshed, &body, cancel).await?;
+		}
+
+		let status = response.status();
+		if !status.is_success() {
+			// Drain the body for the error message; failures aren't
+			// SSE-shaped, they're a plain JSON error body.
+			let recv = response.text();
+			let text = tokio::select! {
+				biased;
+				_ = cancel.cancelled() => return Err(CoderError::Aborted),
+				out = recv => out.map_err(CoderError::from)?,
+			};
+			return Err(CoderError::http(endpoint, status.as_u16(), text));
+		}
+
+		consume_sse_stream(response, cancel, |chunk| {
+			apply_chunk(chunk, &mut on_event);
+		})
+		.await
+	}
+
 	async fn send_once(
 		&self,
 		endpoint: &str,
@@ -215,9 +376,386 @@ impl InferenceClient {
 			resp = send => resp.map_err(CoderError::from),
 		}
 	}
+
+	async fn send_once_stream(
+		&self,
+		endpoint: &str,
+		access_token: &str,
+		body: &ChatCompletionRequest<'_>,
+		cancel: &tokio_util::sync::CancellationToken,
+	) -> Result<reqwest::Response, CoderError> {
+		// Same shape as `send_once`; a separate method exists only to
+		// mirror it — no header difference today, but if the router
+		// ever wants `Accept: text/event-stream` set explicitly this
+		// is the spot.
+		let send = self
+			.http
+			.post(endpoint)
+			.bearer_auth(access_token)
+			.header("accept", "text/event-stream")
+			.json(body)
+			.send();
+		tokio::select! {
+			biased;
+			_ = cancel.cancelled() => Err(CoderError::Aborted),
+			resp = send => resp.map_err(CoderError::from),
+		}
+	}
+}
+
+/// One parsed delta, handed to the streaming caller's callback as
+/// bytes arrive. Borrowed strings keep the hot path allocation-free
+/// — the runner copies into owned `String`s only when it actually
+/// builds a `CoderEvent`.
+#[derive(Debug)]
+pub enum StreamEvent<'a> {
+	/// Append `delta` to the assistant's text content.
+	ContentDelta { delta: &'a str },
+	/// Append `delta` to the assistant's *reasoning* trace.
+	/// Provider-dependent: DeepSeek / Qwen reasoning models stream
+	/// thinking under `reasoning_content`, others under
+	/// `reasoning`. Both field names map to the same callback shape
+	/// here. Models that don't expose reasoning at all simply never
+	/// fire this variant.
+	ThinkingDelta { delta: &'a str },
+	/// A tool-call fragment landed. Mostly informational — the
+	/// runner does not surface these; the registry only dispatches
+	/// once the whole call is assembled at end-of-stream.
+	ToolCallDelta {
+		index: usize,
+		id: Option<&'a str>,
+		name: Option<&'a str>,
+		arguments_delta: Option<&'a str>,
+	},
+}
+
+/// Pulls the SSE byte stream off `response` and feeds parsed chunks
+/// to `on_chunk`. The accumulator state (`content_buf`,
+/// `thinking_buf`, `tool_call_bufs`) lives here too so the public
+/// API stays a single async function returning the assembled
+/// [`AssistantResponse`].
+async fn consume_sse_stream<F>(
+	response: reqwest::Response,
+	cancel: &tokio_util::sync::CancellationToken,
+	mut on_chunk: F,
+) -> Result<AssistantResponse, CoderError>
+where
+	F: FnMut(&StreamChunk),
+{
+	let mut content_buf = String::new();
+	let mut thinking_buf = String::new();
+	let mut tool_call_bufs: Vec<ToolCallBuffer> = Vec::new();
+	let mut byte_stream = response.bytes_stream();
+	let mut sse_buf: Vec<u8> = Vec::new();
+
+	loop {
+		let next = tokio::select! {
+			biased;
+			_ = cancel.cancelled() => return Err(CoderError::Aborted),
+			chunk = byte_stream.next() => chunk,
+		};
+		let Some(chunk) = next else {
+			break;
+		};
+		let bytes = chunk.map_err(CoderError::from)?;
+		sse_buf.extend_from_slice(&bytes);
+
+		// Drain whole events out of the buffer. SSE event boundaries
+		// are `\n\n` (and `\r\n\r\n` for chunked transfers via some
+		// proxies); we accept either by matching on the trailing
+		// blank line.
+		while let Some(end) = find_event_boundary(&sse_buf) {
+			let event_bytes = sse_buf.drain(..end.boundary_end).collect::<Vec<u8>>();
+			let event_text = std::str::from_utf8(&event_bytes[..end.body_end])
+				.map_err(|err| CoderError::decode("inference stream", format!("invalid utf-8 in SSE event: {err}")))?;
+			for data in extract_data_lines(event_text) {
+				if data == "[DONE]" {
+					return Ok(finalize_response(content_buf, thinking_buf, tool_call_bufs));
+				}
+				let chunk: StreamChunk = serde_json::from_str(data).map_err(|err| {
+					CoderError::decode(
+						"inference stream",
+						format!("could not parse SSE chunk: {err}; raw={}", truncate_for_log(data)),
+					)
+				})?;
+				accumulate_chunk(&chunk, &mut content_buf, &mut thinking_buf, &mut tool_call_bufs);
+				on_chunk(&chunk);
+			}
+		}
+	}
+
+	// Some providers close the stream without an explicit `[DONE]`
+	// — treat clean EOF as success.
+	Ok(finalize_response(content_buf, thinking_buf, tool_call_bufs))
+}
+
+/// Working state for one in-progress tool call. The model emits the
+/// `id` + `name` once and then streams `arguments` as a JSON-encoded
+/// string in arbitrary slices; we glue them back together here.
+#[derive(Debug, Default)]
+struct ToolCallBuffer {
+	id: String,
+	kind: String,
+	name: String,
+	arguments: String,
+}
+
+fn accumulate_chunk(
+	chunk: &StreamChunk,
+	content: &mut String,
+	thinking: &mut String,
+	tool_calls: &mut Vec<ToolCallBuffer>,
+) {
+	let Some(choice) = chunk.choices.first() else {
+		return;
+	};
+	if let Some(text) = choice.delta.content.as_deref() {
+		content.push_str(text);
+	}
+	if let Some(text) = choice.delta.reasoning_content.as_deref() {
+		thinking.push_str(text);
+	}
+	if let Some(text) = choice.delta.reasoning.as_deref() {
+		thinking.push_str(text);
+	}
+	for tc in &choice.delta.tool_calls {
+		while tool_calls.len() <= tc.index {
+			tool_calls.push(ToolCallBuffer::default());
+		}
+		let slot = &mut tool_calls[tc.index];
+		if let Some(id) = tc.id.as_deref() {
+			slot.id.push_str(id);
+		}
+		if let Some(kind) = tc.kind.as_deref() {
+			slot.kind = kind.to_string();
+		}
+		if let Some(func) = tc.function.as_ref() {
+			if let Some(name) = func.name.as_deref() {
+				slot.name.push_str(name);
+			}
+			if let Some(args) = func.arguments.as_deref() {
+				slot.arguments.push_str(args);
+			}
+		}
+	}
+}
+
+fn apply_chunk<F>(chunk: &StreamChunk, on_event: &mut F)
+where
+	F: FnMut(StreamEvent<'_>),
+{
+	let Some(choice) = chunk.choices.first() else {
+		return;
+	};
+	if let Some(text) = choice.delta.content.as_deref() {
+		if !text.is_empty() {
+			on_event(StreamEvent::ContentDelta { delta: text });
+		}
+	}
+	if let Some(text) = choice.delta.reasoning_content.as_deref() {
+		if !text.is_empty() {
+			on_event(StreamEvent::ThinkingDelta { delta: text });
+		}
+	}
+	if let Some(text) = choice.delta.reasoning.as_deref() {
+		if !text.is_empty() {
+			on_event(StreamEvent::ThinkingDelta { delta: text });
+		}
+	}
+	for tc in &choice.delta.tool_calls {
+		on_event(StreamEvent::ToolCallDelta {
+			index: tc.index,
+			id: tc.id.as_deref(),
+			name: tc.function.as_ref().and_then(|f| f.name.as_deref()),
+			arguments_delta: tc.function.as_ref().and_then(|f| f.arguments.as_deref()),
+		});
+	}
+}
+
+fn finalize_response(content: String, thinking: String, tool_calls: Vec<ToolCallBuffer>) -> AssistantResponse {
+	AssistantResponse {
+		content: if content.is_empty() { None } else { Some(content) },
+		thinking: if thinking.is_empty() { None } else { Some(thinking) },
+		tool_calls: tool_calls
+			.into_iter()
+			.filter(|b| !b.id.is_empty() || !b.name.is_empty())
+			.map(|b| ToolCall {
+				id: b.id,
+				kind: if b.kind.is_empty() { default_tool_type() } else { b.kind },
+				function: FunctionCall {
+					name: b.name,
+					arguments: b.arguments,
+				},
+			})
+			.collect(),
+	}
+}
+
+#[derive(Debug)]
+struct EventBoundary {
+	/// Offset (exclusive) of the last byte of the event body — i.e.
+	/// the position of the trailing `\n` that immediately precedes
+	/// the blank-line separator.
+	body_end: usize,
+	/// Offset (exclusive) of the byte *after* the blank-line
+	/// separator. Drain `0..boundary_end` to consume the event.
+	boundary_end: usize,
+}
+
+/// Find the next `\n\n` (or `\r\n\r\n`) boundary in the buffer.
+/// Returns `None` when the buffer doesn't yet contain a complete
+/// event — the caller pulls more bytes and tries again.
+fn find_event_boundary(buf: &[u8]) -> Option<EventBoundary> {
+	if let Some(idx) = find_subsequence(buf, b"\r\n\r\n") {
+		return Some(EventBoundary {
+			body_end: idx,
+			boundary_end: idx + 4,
+		});
+	}
+	if let Some(idx) = find_subsequence(buf, b"\n\n") {
+		return Some(EventBoundary {
+			body_end: idx,
+			boundary_end: idx + 2,
+		});
+	}
+	None
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+	haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Pull every `data: ...` line out of one SSE event. Lines starting
+/// with `:` are comments (provider keep-alives); blank lines never
+/// reach this function because `find_event_boundary` already
+/// trimmed at the boundary.
+fn extract_data_lines(event: &str) -> Vec<&str> {
+	let mut out = Vec::new();
+	for line in event.split('\n') {
+		let line = line.strip_suffix('\r').unwrap_or(line);
+		if line.is_empty() {
+			continue;
+		}
+		if line.starts_with(':') {
+			continue;
+		}
+		if let Some(rest) = line.strip_prefix("data:") {
+			out.push(rest.strip_prefix(' ').unwrap_or(rest));
+		}
+	}
+	out
+}
+
+fn truncate_for_log(s: &str) -> String {
+	const LIMIT: usize = 256;
+	if s.len() <= LIMIT {
+		return s.to_string();
+	}
+	let mut idx = LIMIT;
+	while idx > 0 && !s.is_char_boundary(idx) {
+		idx -= 1;
+	}
+	format!("{}…", &s[..idx])
 }
 
 /// Convenience wrapper used by the runner so the type can be dropped
 /// through `Arc<...>` without dragging the auth handle along
 /// separately.
 pub type SharedInference = Arc<InferenceClient>;
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn extract_data_skips_comments_and_keepalives() {
+		let event = ": ping\ndata: hello\n";
+		assert_eq!(extract_data_lines(event), vec!["hello"]);
+	}
+
+	#[test]
+	fn extract_data_handles_multi_data_lines() {
+		// SSE allows multiple `data:` lines per event; the spec
+		// joins them with `\n`. OpenAI doesn't do this in practice,
+		// but supporting it is free and prevents a future provider
+		// change from breaking us.
+		let event = "data: a\ndata: b\n";
+		assert_eq!(extract_data_lines(event), vec!["a", "b"]);
+	}
+
+	#[test]
+	fn finalize_response_drops_empty_buffers() {
+		// Some providers emit a "warm-up" tool-call slot that never
+		// gets an id or name. Filter it so the chat-history append
+		// doesn't carry a phantom call.
+		let buf = vec![ToolCallBuffer::default()];
+		let resp = finalize_response(String::new(), String::new(), buf);
+		assert!(resp.tool_calls.is_empty());
+		assert!(resp.content.is_none());
+		assert!(resp.thinking.is_none());
+	}
+
+	#[test]
+	fn accumulate_chunk_concatenates_arguments() {
+		// Realistic streaming sequence: id + name in chunk 1,
+		// arguments split across two chunks.
+		let chunks = [
+			r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"read_file","arguments":""}}]}}]}"#,
+			r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\""}}]}}]}"#,
+			r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"foo.rs\"}"}}]}}]}"#,
+		];
+		let mut content = String::new();
+		let mut thinking = String::new();
+		let mut tcs = Vec::new();
+		for raw in chunks {
+			let chunk: StreamChunk = serde_json::from_str(raw).unwrap();
+			accumulate_chunk(&chunk, &mut content, &mut thinking, &mut tcs);
+		}
+		let resp = finalize_response(content, thinking, tcs);
+		assert_eq!(resp.tool_calls.len(), 1);
+		assert_eq!(resp.tool_calls[0].id, "call_x");
+		assert_eq!(resp.tool_calls[0].function.name, "read_file");
+		assert_eq!(resp.tool_calls[0].function.arguments, r#"{"path":"foo.rs"}"#);
+	}
+
+	#[test]
+	fn accumulate_chunk_collects_reasoning_under_either_field_name() {
+		// Some providers emit `reasoning_content` (DeepSeek, Qwen),
+		// others use `reasoning`. We accept both; concatenation
+		// order follows wire order.
+		let chunks = [
+			r#"{"choices":[{"delta":{"reasoning_content":"Let me think. "}}]}"#,
+			r#"{"choices":[{"delta":{"reasoning":"Maybe a "}}]}"#,
+			r#"{"choices":[{"delta":{"reasoning_content":"plan helps."}}]}"#,
+			r#"{"choices":[{"delta":{"content":"Hello"}}]}"#,
+		];
+		let mut content = String::new();
+		let mut thinking = String::new();
+		let mut tcs = Vec::new();
+		for raw in chunks {
+			let chunk: StreamChunk = serde_json::from_str(raw).unwrap();
+			accumulate_chunk(&chunk, &mut content, &mut thinking, &mut tcs);
+		}
+		let resp = finalize_response(content, thinking, tcs);
+		assert_eq!(resp.content.as_deref(), Some("Hello"));
+		assert_eq!(resp.thinking.as_deref(), Some("Let me think. Maybe a plan helps."));
+	}
+
+	#[test]
+	fn assistant_response_message_form_accepts_reasoning_alias() {
+		// Non-streaming response shape: the underlying provider
+		// can return reasoning under either field name, and we
+		// must round-trip it as `thinking`.
+		let raw = r#"{"content":"hi","reasoning_content":"thought trail"}"#;
+		let resp: AssistantResponse = serde_json::from_str(raw).unwrap();
+		assert_eq!(resp.content.as_deref(), Some("hi"));
+		assert_eq!(resp.thinking.as_deref(), Some("thought trail"));
+	}
+
+	#[test]
+	fn find_event_boundary_handles_lf_and_crlf() {
+		assert!(find_event_boundary(b"data: x\n\nrest").is_some());
+		assert!(find_event_boundary(b"data: x\r\n\r\nrest").is_some());
+		assert!(find_event_boundary(b"data: x\n").is_none());
+	}
+}

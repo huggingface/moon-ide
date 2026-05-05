@@ -29,7 +29,7 @@ use crate::auth::{Authenticator, DeviceCode, HfIdentity};
 use crate::defaults::{DEFAULT_LARGE_MODEL, MAX_TURN_ITERATIONS, PHASE_6_0_SYSTEM_PROMPT};
 use crate::error::CoderError;
 use crate::event::{CoderEvent, CoderStatus};
-use crate::inference::{AssistantResponse, ChatMessage, FunctionCall, InferenceClient};
+use crate::inference::{AssistantResponse, ChatMessage, FunctionCall, InferenceClient, StreamEvent};
 use crate::tools::ToolRegistry;
 
 /// Capacity for the broadcast channel the Tauri layer subscribes to.
@@ -243,17 +243,86 @@ async fn run_turn(state: &Arc<CoderState>, cancel: CancellationToken) -> Result<
 			return Err(CoderError::Aborted);
 		}
 		let messages = state.session.lock().await.messages.clone();
+
+		// One stable id per assistant message, shared between the
+		// `start`, every content / thinking `delta`, and the final
+		// `end` event so the frontend can reconcile by id (see the
+		// `tool_call` / `tool_result` pattern). A fresh id every
+		// loop iteration — multi-iteration turns with tool calls
+		// produce multiple assistant messages.
+		let assistant_id = new_message_id();
+		let content_started = std::sync::atomic::AtomicBool::new(false);
+		let thinking_emitted = std::sync::atomic::AtomicBool::new(false);
+		let events = state.events.clone();
+		let id_for_cb = assistant_id.clone();
 		let response = state
 			.inference
-			.chat_completion(DEFAULT_LARGE_MODEL, &messages, &tool_defs, &cancel)
+			.chat_completion_stream(
+				DEFAULT_LARGE_MODEL,
+				&messages,
+				&tool_defs,
+				&cancel,
+				|event| match event {
+					StreamEvent::ContentDelta { delta } => {
+						if !content_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+							let _ = events.send(CoderEvent::AssistantMessageStart { id: id_for_cb.clone() });
+						}
+						let _ = events.send(CoderEvent::AssistantMessageDelta {
+							id: id_for_cb.clone(),
+							delta: delta.to_string(),
+						});
+					}
+					StreamEvent::ThinkingDelta { delta } => {
+						// Thinking arrives before content on every
+						// reasoning-model provider we know of. Fire
+						// `AssistantMessageStart` on the first thinking
+						// delta too — that way the panel inserts the
+						// row early, the user sees the thinking block
+						// land, and content streams into the same row
+						// when it eventually arrives.
+						if !content_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+							let _ = events.send(CoderEvent::AssistantMessageStart { id: id_for_cb.clone() });
+						}
+						thinking_emitted.store(true, std::sync::atomic::Ordering::Relaxed);
+						let _ = events.send(CoderEvent::AssistantThinkingDelta {
+							id: id_for_cb.clone(),
+							delta: delta.to_string(),
+						});
+					}
+					// Tool-call deltas are intentionally not surfaced.
+					// The runner buffers them inside the inference
+					// client and dispatches once the whole call is
+					// assembled — partial JSON arguments aren't
+					// useful to render.
+					StreamEvent::ToolCallDelta { .. } => {}
+				},
+			)
 			.await?;
 
 		state.session.lock().await.messages.push(response_to_message(&response));
 
-		if let Some(text) = response.content.as_ref() {
-			let _ = state.events.send(CoderEvent::AssistantMessage {
-				id: new_message_id(),
-				text: text.clone(),
+		// Always emit `End` *if* we ever started a bubble; otherwise
+		// the frontend would be stuck with an empty placeholder.
+		// The sequencing is `Start (once) → N × Delta (content
+		// and/or thinking) → End` — the UI uses `End.text` /
+		// `End.thinking` as the canonical replacements so any drift
+		// between concatenated deltas and the final assembly heals
+		// on close.
+		if content_started.into_inner() {
+			// Drop empty-string thinking on the canonical message —
+			// `Some("")` would force the UI to render an empty
+			// "Thoughts" disclosure for messages that didn't actually
+			// reason. Only carry the field when we genuinely saw
+			// reasoning bytes.
+			let canonical_thinking = if thinking_emitted.into_inner() {
+				response.thinking.clone()
+			} else {
+				None
+			};
+			let _ = state.events.send(CoderEvent::AssistantMessageEnd {
+				id: assistant_id,
+				text: response.content.clone().unwrap_or_default(),
+				thinking: canonical_thinking,
 			});
 		}
 

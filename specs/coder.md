@@ -28,35 +28,48 @@ tool be a moon-core method that already respects `WorkspaceHost`.
 
 ## Loop shape
 
-The vocabulary is borrowed from
+The conceptual vocabulary borrows from
 [pi-agent-core](https://github.com/badlogic/pi-mono/tree/main/packages/agent)
-because the event names are good and we have nothing to gain by
-inventing our own:
+but the wire shape we ship is flatter — pi's `message_start` /
+`message_end` framing was redundant once we picked stable IDs and
+delta accumulation:
 
 ```
 prompt(msg)
-├─ agent_start
-├─ turn_start
-├─ message_start    { role: "user", … }
-├─ message_end      { role: "user", … }
-├─ message_start    { role: "assistant" }
-├─ message_update   { delta: "…" }*           // SSE chunks
-├─ message_end      { role: "assistant", tool_calls?: […] }
-├─ tool_execution_start  { id, name, args }*  // per tool call
-├─ tool_execution_update { id, partial }*     // optional
-├─ tool_execution_end    { id, result | error }*
-├─ message_start    { role: "tool", … }       // tool result back to LLM
-├─ message_end
-├─ turn_end                                   // loop continues if tools were called
+├─ user_message               { id, text }
+├─ assistant_message_start    { id }                        // fires on first content OR thinking delta
+├─ assistant_thinking_delta   { id, delta }*                // optional, before/interleaved with content
+├─ assistant_message_delta    { id, delta }*                // SSE chunks of the answer
+├─ assistant_message_end      { id, text, thinking? }       // canonical full content + reasoning
+├─ tool_call                  { id, name, args }*           // one per call (assembled)
+├─ tool_result                { id, result, is_error }*     // when each tool finishes
 │
-├─ turn_start                                 // next turn
+├─ assistant_message_start    { id' }                       // next iteration if tools fired
 ├─ …
-└─ agent_end        { messages: […] }
+└─ turn_complete | aborted | error                          // exactly one of the three
 ```
 
-Tool calls in a single assistant turn run in **parallel** by default
-(the LLM gets the results back together on the next turn). Sequential
-mode is configurable per call but isn't surfaced in the UI initially.
+Mirrored 1:1 in `src/lib/protocol.ts:CoderEvent`. Stable IDs let
+the frontend reconcile a stream of deltas onto one bubble without
+buffering the order; `assistant_message_end.text` /
+`assistant_message_end.thinking` are authoritative in case the
+concatenated deltas drift (e.g. a mid-stream provider retry).
+
+Reasoning traces stream as `assistant_thinking_delta`. We accept
+both `reasoning_content` (DeepSeek, Qwen) and `reasoning` (other
+providers) on the wire; the frontend renders the accumulated
+trace in a collapsible block above the answer that auto-collapses
+when `assistant_message_end` fires. Models that don't expose a
+reasoning trace simply never emit thinking deltas — no special
+case in the runner or UI.
+
+Tool calls **stream incrementally** off the SSE wire (chunks carry
+partial JSON for `function.arguments`), but the loop buffers them
+in `inference.rs` and only fires `tool_call` once the call is fully
+assembled — partial JSON is not useful to render. Tool calls in a
+single assistant turn dispatch sequentially today; parallel
+dispatch lands when a real workload needs it (no measured benefit
+yet on the team's prompt patterns).
 
 States the panel needs to render:
 
