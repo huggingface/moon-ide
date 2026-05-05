@@ -43,6 +43,8 @@
 	let busy = $state(false);
 	let textarea: HTMLTextAreaElement | undefined = $state();
 
+	const changeCount = $derived(workspace.scmChangeCount);
+
 	// Amend-with-empty-message is valid (preserve previous
 	// subject); fresh commits still need a message. Push and pull
 	// buttons just need "not currently busy".
@@ -207,6 +209,23 @@
 			<span class="amend-icon" aria-hidden="true">✎</span>
 			<span>Amend</span>
 		</button>
+		{#if changeCount > 0 || workspace.scmFilterOn}
+			<button
+				type="button"
+				class="changes-badge"
+				class:active={workspace.scmFilterOn}
+				title={workspace.scmFilterOn
+					? `${changeCount} change${changeCount === 1 ? '' : 's'} (click to show all files)`
+					: `${changeCount} change${changeCount === 1 ? '' : 's'} (click to filter to changes only)`}
+				aria-label={workspace.scmFilterOn
+					? `Showing ${changeCount} changes — click to show all files`
+					: `${changeCount} changes — click to filter`}
+				aria-pressed={workspace.scmFilterOn}
+				onclick={() => workspace.toggleScmFilter()}
+			>
+				{changeCount}
+			</button>
+		{/if}
 	</div>
 </section>
 
@@ -338,6 +357,7 @@
 	.footer {
 		display: flex;
 		align-items: center;
+		gap: 4px;
 	}
 	.amend-toggle {
 		appearance: none;
@@ -375,5 +395,49 @@
 		font-size: 11px;
 		line-height: 1;
 		opacity: 0.85;
+	}
+	/* Pill badge that sits at the far right of the footer. Always
+	   carries the change count; visible iff the user has changes
+	   *or* the filter is on (so a count of 0 with the filter
+	   active still surfaces the toggle for "go back to all"). The
+	   accent fill makes it the loudest control on the panel —
+	   matches the user's "more obvious color" ask. The active
+	   state inverts to a hollow ring so the toggle reads as
+	   "currently driving the tree" without changing colour
+	   weight. */
+	.changes-badge {
+		appearance: none;
+		margin-left: auto;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		min-width: 20px;
+		height: 20px;
+		padding: 0 6px;
+		border: 1px solid var(--m-accent);
+		border-radius: 999px;
+		background: var(--m-accent);
+		/* `--m-bg` flips between near-black (dark theme) and
+		   near-white (light theme), so it always contrasts well
+		   against the accent fill — saves us inventing a new
+		   token just for this badge. */
+		color: var(--m-bg);
+		font: inherit;
+		font-size: 11px;
+		font-weight: 600;
+		line-height: 1;
+		cursor: pointer;
+		font-variant-numeric: tabular-nums;
+	}
+	.changes-badge:hover {
+		filter: brightness(1.1);
+	}
+	.changes-badge:focus-visible {
+		outline: 2px solid var(--m-accent);
+		outline-offset: 2px;
+	}
+	.changes-badge.active {
+		background: transparent;
+		color: var(--m-accent);
 	}
 </style>

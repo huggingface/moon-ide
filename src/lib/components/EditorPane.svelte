@@ -80,11 +80,28 @@
 	<EditorTabs {side} />
 	<div class="body">
 		{#if activeFile?.kind === 'image'}
-			<ImageView file={activeFile} />
+			<!-- Image / Diff / Markdown views build CodeMirror /
+			     image state in `onMount` and don't watch `file.path`
+			     internally — `Editor` is the only view that handles
+			     path swaps in-place. Key the others on the path so a
+			     tab change behind the same view kind (e.g. clicking
+			     another modified file while the current one is in
+			     diff mode) tears down the old instance and rebuilds.
+			     Without the key the right-side merge editor's
+			     update-listener still carries the original path in
+			     its closure and ends up writing the new file's text
+			     into the old file's buffer. -->
+			{#key activeFile.path}
+				<ImageView file={activeFile} />
+			{/key}
 		{:else if activeFile && showDiff}
-			<DiffView file={activeFile} {side} />
+			{#key activeFile.path}
+				<DiffView file={activeFile} {side} />
+			{/key}
 		{:else if activeFile && showMarkdownPreview}
-			<MarkdownView file={activeFile} />
+			{#key activeFile.path}
+				<MarkdownView file={activeFile} />
+			{/key}
 		{:else if activeFile}
 			<Editor file={activeFile} {side} />
 		{:else}

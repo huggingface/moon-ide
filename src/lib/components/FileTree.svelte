@@ -20,6 +20,20 @@
 	import { workspace } from '../state.svelte';
 	import type { GitFileStatus, GitStatusEntry } from '../protocol';
 
+	type Props = {
+		/**
+		 * `'all'` (default) renders the full workspace path list;
+		 * `'changes'` renders only paths with a non-ignored git
+		 * status entry, fully expanded, and clicks open in diff
+		 * mode. Used by the SCM panel's changes-only filter — the
+		 * sidebar mounts both modes simultaneously and toggles
+		 * visibility, so each tree's expansion state survives
+		 * round-trips through the toggle.
+		 */
+		mode?: 'all' | 'changes';
+	};
+	let { mode = 'all' }: Props = $props();
+
 	let treeMount: HTMLDivElement;
 	let tree: FileTree | undefined;
 
@@ -57,20 +71,17 @@
 			return;
 		}
 		tree = new FileTree({
-			paths: mergedPathsWithDeletions(
-				untrack(() => workspace.paths),
-				untrack(() => workspace.gitStatusEntries),
-			),
+			paths: currentPaths(),
 			flattenEmptyDirectories: true,
 			unsafeCSS: PIERRE_OVERRIDES_CSS,
-			// Start every folder collapsed. The previous default
-			// (`initialExpansion: 1`) eagerly opened gitignored folders
-			// like `node_modules/` / `target/` before we knew they were
-			// ignored, and once we did there was no clean "uncollapse
-			// only the non-ignored ones" story that didn't fight the
-			// user's own expansions. A fully-collapsed root is the
-			// simpler default; users open what they actually want.
-			initialExpansion: 0,
+			// `'all'` mode starts every folder collapsed (the old
+			// default; an `initialExpansion: 1` would eagerly open
+			// gitignored folders like `node_modules/` / `target/`
+			// before we knew they were ignored). `'changes'` mode
+			// is naturally short — only changed paths — so we
+			// expand fully so the user sees every change without
+			// having to drill in.
+			initialExpansion: mode === 'changes' ? 'open' : 0,
 			search: true,
 			gitStatus: untrack(() => workspace.gitStatusEntries),
 			onSelectionChange: (selectedPaths) => {
@@ -81,16 +92,20 @@
 				if (path === undefined) {
 					return;
 				}
-				const item = tree?.getItem(path);
-				if (!item || item.isDirectory()) {
+				// Both modes stay mounted (CSS-toggled visibility) so
+				// Pierre's `select()` calls — fired by our
+				// `applySelection` effect to keep both trees' tracked
+				// row in sync with `workspace.activePath` — produce
+				// `onSelectionChange` events on the *hidden* tree
+				// too. Without this gate the hidden changes-view
+				// tree would fire its own activate (with
+				// `mode: 'changes'`) on every active-path mirror,
+				// silently flipping diff mode on for files the user
+				// only ever clicked in the regular all-view.
+				if (!isVisibleMode()) {
 					return;
 				}
-				// Preview-open the file but keep DOM focus inside the tree
-				// so the user can keep arrowing/clicking through siblings
-				// without every selection yanking the caret into the
-				// editor. Enter or double-click hands focus over (see
-				// handlers below).
-				void workspace.openFile(path, undefined, { focus: false });
+				activateRowFromTree(path);
 			},
 			renaming: {
 				onRename: handleRename,
@@ -811,17 +826,31 @@
 	let lastTreePaths: ReadonlySet<string> | null = null;
 
 	$effect(() => {
-		const paths = workspace.paths;
-		// Track the signature so a deletion appearing/disappearing
-		// re-runs this effect. We immediately untrack to re-read
-		// `gitStatusEntries` for the merge — the signature already
-		// captured "what changed".
-		void deletedSignature;
+		// Both modes ultimately re-derive paths from workspace
+		// state, but the source signal differs. `'all'` keys off
+		// the tree's filesystem walk plus the deleted-rows merge;
+		// `'changes'` keys off `gitStatusEntries` directly (the
+		// `scmFilterPaths` accessor folds in deleted entries and
+		// strips ignored ones). Reading the right signal is what
+		// makes Svelte 5 re-run the effect on the right input.
+		let merged: readonly string[];
+		if (mode === 'changes') {
+			void workspace.gitStatusEntries;
+			void deletedSignature;
+			merged = workspace.scmFilterPaths;
+		} else {
+			const paths = workspace.paths;
+			// Track the signature so a deletion appearing/disappearing
+			// re-runs this effect. We immediately untrack to re-read
+			// `gitStatusEntries` for the merge — the signature already
+			// captured "what changed".
+			void deletedSignature;
+			const entries = untrack(() => workspace.gitStatusEntries);
+			merged = mergedPathsWithDeletions(paths, entries);
+		}
 		if (!tree) {
 			return;
 		}
-		const entries = untrack(() => workspace.gitStatusEntries);
-		const merged = mergedPathsWithDeletions(paths, entries);
 		const nextSet = new Set(merged);
 
 		if (lastTreePaths === null) {
@@ -839,6 +868,16 @@
 		const target = untrack(() => workspace.activePath);
 		applySelection(tree, target, { afterReset: true });
 	});
+
+	function currentPaths(): readonly string[] {
+		if (mode === 'changes') {
+			return untrack(() => workspace.scmFilterPaths);
+		}
+		return mergedPathsWithDeletions(
+			untrack(() => workspace.paths),
+			untrack(() => workspace.gitStatusEntries),
+		);
+	}
 
 	/**
 	 * Apply the symmetric diff of `prev` and `next` to `local` via a
@@ -1134,6 +1173,15 @@
 		// switch (which changes activePath) would yank focus into the
 		// tree once the tick has been bumped at least once.
 		const target = untrack(() => workspace.activePath);
+		// Both modes stay mounted (CSS-toggled visibility), so the
+		// focus shortcut needs to land in the *visible* tree, not
+		// in whichever instance happened to subscribe last. The
+		// scmFilterOn read is untracked for the same reason as
+		// activePath above — focusTick is the sole trigger.
+		const filterOn = untrack(() => workspace.scmFilterOn);
+		if ((mode === 'changes') !== filterOn) {
+			return;
+		}
 		void pullFocusIntoTree(target);
 	});
 
@@ -1286,10 +1334,84 @@
 	function onDblClick() {
 		activateFocusedRow();
 	}
+
+	/**
+	 * Apply the per-mode "tree click" semantics to `path`:
+	 *
+	 *  - `'all'` mode: clear any sticky diff-mode flag for this
+	 *    path (so a click in the regular tree always lands in
+	 *    Source view, even if the path was previously toggled to
+	 *    Diff via the changes-view click, the gutter, or the tab
+	 *    toolbar). Then preview-open without stealing focus.
+	 *  - `'changes'` mode: set the diff-mode flag for this path
+	 *    (the SCM panel already filters to "what changed", and
+	 *    diff is the natural follow-up). Then preview-open.
+	 *
+	 * Both `setDiffMode` and `openFile` are idempotent for "no
+	 * actual change" inputs, so this is safe to call from both
+	 * the `onSelectionChange` callback (fires only when selection
+	 * actually changes — a click on the already-selected row is
+	 * silently dropped by Pierre's selection-version check) and
+	 * the wrapper-click listener below (fires on every click,
+	 * including on the active row).
+	 */
+	function activateRowFromTree(path: string) {
+		const item = tree?.getItem(path);
+		if (!item || item.isDirectory()) {
+			return;
+		}
+		workspace.setDiffMode(path, mode === 'changes');
+		void workspace.openFile(path, undefined, { focus: false });
+	}
+
+	/**
+	 * Wrapper-level click handler. Pierre's `onSelectionChange`
+	 * only fires when the selection version increments, so a
+	 * click on the already-selected row is otherwise invisible to
+	 * us — and that path used to leave the file stuck in whatever
+	 * view mode it had on its previous open. Listening here too
+	 * (with `composedPath` to pierce Pierre's shadow root) lets us
+	 * apply the same per-mode reset on every click, regardless of
+	 * whether selection changed.
+	 */
+	function onTreeClick(event: MouseEvent) {
+		// Sidebar's `pointer-events: none` on the hidden pane
+		// already blocks real user clicks from reaching the
+		// off-screen tree, but mirroring the visibility check here
+		// keeps the contract uniform with `onSelectionChange` —
+		// any future "programmatic dispatchEvent into the tree"
+		// caller can't accidentally trip the wrong mode.
+		if (!isVisibleMode()) {
+			return;
+		}
+		const path = pathFromComposedClick(event);
+		if (path === null) {
+			return;
+		}
+		activateRowFromTree(path);
+	}
+
+	function isVisibleMode(): boolean {
+		const active = workspace.scmFilterOn ? 'changes' : 'all';
+		return mode === active;
+	}
+
+	function pathFromComposedClick(event: MouseEvent): string | null {
+		for (const node of event.composedPath()) {
+			if (!(node instanceof Element)) {
+				continue;
+			}
+			const path = node.getAttribute('data-item-path');
+			if (path !== null && path.length > 0) {
+				return path;
+			}
+		}
+		return null;
+	}
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="tree" bind:this={treeMount} onkeydown={onKeyDown} ondblclick={onDblClick}></div>
+<div class="tree" bind:this={treeMount} onkeydown={onKeyDown} ondblclick={onDblClick} onclick={onTreeClick}></div>
 
 <style>
 	.tree {

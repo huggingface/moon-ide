@@ -1164,6 +1164,58 @@ class WorkspaceState {
 	 */
 	gitBranch = $state<GitBranchInfo>({ name: null, headShortSha: null, ahead: 0, behind: 0 });
 
+	/**
+	 * SCM-filter toggle: when on, the sidebar swaps the regular
+	 * file tree for a changes-only view (only paths that appear in
+	 * `gitStatusEntries` with non-`ignored` status, fully expanded).
+	 * Click on a row in that view opens the file in diff mode.
+	 *
+	 * The toggle is per-session; not persisted in `AppState`. Two
+	 * tree instances stay mounted simultaneously (CSS visibility
+	 * toggle) so switching back doesn't lose the all-view's
+	 * expansion / scroll state — Pierre keeps each tree's
+	 * internal model intact across the visibility flip.
+	 */
+	scmFilterOn = $state(false);
+
+	toggleScmFilter() {
+		this.scmFilterOn = !this.scmFilterOn;
+	}
+
+	/**
+	 * Paths the SCM filter view should render. Strips ignored
+	 * entries (the changes view shouldn't surface
+	 * `node_modules/`-style noise) and folds in deleted ghost rows
+	 * the filesystem walk doesn't know about. Used by the changes-
+	 * only `FileTree` instance via its `paths` reactive source.
+	 */
+	get scmFilterPaths(): string[] {
+		const out: string[] = [];
+		const seen = new Set<string>();
+		for (const entry of this.gitStatusEntries) {
+			if (entry.status === 'ignored') {
+				continue;
+			}
+			if (seen.has(entry.path)) {
+				continue;
+			}
+			seen.add(entry.path);
+			out.push(entry.path);
+		}
+		return out;
+	}
+
+	/** Number of non-ignored entries the SCM badge should display. */
+	get scmChangeCount(): number {
+		let n = 0;
+		for (const entry of this.gitStatusEntries) {
+			if (entry.status !== 'ignored') {
+				n += 1;
+			}
+		}
+		return n;
+	}
+
 	private async refreshGitBranch() {
 		try {
 			this.gitBranch = await ipc.fs.gitBranch();
