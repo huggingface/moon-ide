@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { workspace, type MarkdownView, type OpenFile, type SplitSide } from '../state.svelte';
 	import { isMarkdownPath } from '../util/markdown';
+	import RevertIcon from './icons/RevertIcon.svelte';
 
 	type Props = { side: SplitSide };
 	let { side }: Props = $props();
@@ -315,21 +316,7 @@
 					title={activeIsDeleted ? 'Restore file from HEAD' : 'Revert file to HEAD'}
 					aria-label={activeIsDeleted ? 'Restore file from HEAD' : 'Revert file to HEAD'}
 				>
-					<svg
-						xmlns="http://www.w3.org/2000/svg"
-						width="14"
-						height="14"
-						viewBox="0 0 24 24"
-						fill="none"
-						stroke="currentColor"
-						stroke-width="2"
-						stroke-linecap="round"
-						stroke-linejoin="round"
-						aria-hidden="true"
-					>
-						<path d="M3 7v6h6" />
-						<path d="M21 17a9 9 0 0 0-15-6.7L3 13" />
-					</svg>
+					<RevertIcon />
 				</button>
 			{/if}
 		</div>

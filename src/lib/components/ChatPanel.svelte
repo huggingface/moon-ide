@@ -10,6 +10,11 @@
 	import { resolveReactionName } from '../util/slackEmoji';
 	import ChatConnectModal from './ChatConnectModal.svelte';
 	import SlackMessageBody from './SlackMessageBody.svelte';
+	import RefreshIcon from './icons/RefreshIcon.svelte';
+	import PlusIcon from './icons/PlusIcon.svelte';
+	import DisconnectIcon from './icons/DisconnectIcon.svelte';
+	import SwitchIcon from './icons/SwitchIcon.svelte';
+	import CodeIcon from './icons/CodeIcon.svelte';
 
 	onMount(() => {
 		// Probe on mount whether the panel is visible or not — the
@@ -344,7 +349,7 @@
 				aria-label="Switch to Coder"
 				onclick={() => coder.togglePanel()}
 			>
-				{@render switchToCoderIcon()}
+				<CodeIcon />
 			</button>
 		</div>
 	</header>
@@ -384,7 +389,7 @@
 						title="Disconnect Slack"
 						aria-label="Disconnect Slack"
 					>
-						{@render disconnectIcon()}
+						<DisconnectIcon />
 					</button>
 				</section>
 
@@ -409,7 +414,7 @@
 								title="Switch bot"
 								aria-label="Switch bot"
 							>
-								{@render switchBotIcon()}
+								<SwitchIcon />
 							</button>
 						</header>
 					</section>
@@ -440,7 +445,7 @@
 										title="New session"
 										aria-label="New session"
 									>
-										{@render newSessionIcon()}
+										<PlusIcon />
 									</button>
 									<button
 										type="button"
@@ -450,7 +455,7 @@
 										title="Reload sessions"
 										aria-label="Reload sessions"
 									>
-										{@render refreshIcon()}
+										<RefreshIcon />
 									</button>
 								</div>
 							</header>
@@ -502,7 +507,7 @@
 										title="New session"
 										aria-label="New session"
 									>
-										{@render newSessionIcon()}
+										<PlusIcon />
 									</button>
 									<button
 										type="button"
@@ -512,7 +517,7 @@
 										title="Reload thread"
 										aria-label="Reload thread"
 									>
-										{@render refreshIcon()}
+										<RefreshIcon />
 									</button>
 								</div>
 							</header>
@@ -645,97 +650,6 @@
 </aside>
 
 <ChatConnectModal />
-
-{#snippet refreshIcon()}
-	<svg
-		viewBox="0 0 16 16"
-		width="14"
-		height="14"
-		fill="none"
-		stroke="currentColor"
-		stroke-width="1.5"
-		stroke-linecap="round"
-		stroke-linejoin="round"
-		aria-hidden="true"
-	>
-		<path d="M14 8a6 6 0 1 1-1.76-4.24" />
-		<path d="M14 2v4h-4" />
-	</svg>
-{/snippet}
-
-{#snippet newSessionIcon()}
-	<svg
-		viewBox="0 0 16 16"
-		width="14"
-		height="14"
-		fill="none"
-		stroke="currentColor"
-		stroke-width="1.5"
-		stroke-linecap="round"
-		stroke-linejoin="round"
-		aria-hidden="true"
-	>
-		<path d="M8 3v10" />
-		<path d="M3 8h10" />
-	</svg>
-{/snippet}
-
-{#snippet disconnectIcon()}
-	<svg
-		viewBox="0 0 16 16"
-		width="14"
-		height="14"
-		fill="none"
-		stroke="currentColor"
-		stroke-width="1.5"
-		stroke-linecap="round"
-		stroke-linejoin="round"
-		aria-hidden="true"
-	>
-		<path d="M9.5 3h-5A1.5 1.5 0 0 0 3 4.5v7A1.5 1.5 0 0 0 4.5 13h5" />
-		<path d="M11 11l3-3-3-3" />
-		<path d="M14 8H6.5" />
-	</svg>
-{/snippet}
-
-{#snippet switchBotIcon()}
-	<svg
-		viewBox="0 0 16 16"
-		width="14"
-		height="14"
-		fill="none"
-		stroke="currentColor"
-		stroke-width="1.5"
-		stroke-linecap="round"
-		stroke-linejoin="round"
-		aria-hidden="true"
-	>
-		<path d="M3 5h9" />
-		<path d="M9 2l3 3-3 3" />
-		<path d="M13 11H4" />
-		<path d="M7 8l-3 3 3 3" />
-	</svg>
-{/snippet}
-
-{#snippet switchToCoderIcon()}
-	<svg
-		viewBox="0 0 16 16"
-		width="14"
-		height="14"
-		fill="none"
-		stroke="currentColor"
-		stroke-width="1.5"
-		stroke-linecap="round"
-		stroke-linejoin="round"
-		aria-hidden="true"
-	>
-		<!-- `</>` glyph — same visual language as VS Code's "code"
-			 button, conventional shorthand for "code editor /
-			 coder". -->
-		<path d="M5.5 4.5 2 8l3.5 3.5" />
-		<path d="M10.5 4.5 14 8l-3.5 3.5" />
-	</svg>
-{/snippet}
 
 <style>
 	.chat-panel {
@@ -1023,7 +937,7 @@
 		opacity: 0.5;
 		cursor: not-allowed;
 	}
-	.icon-button svg {
+	.icon-button :global(svg) {
 		display: block;
 	}
 	.composer {

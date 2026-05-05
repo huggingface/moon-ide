@@ -8,6 +8,12 @@
 	import CoderMarkdown from './CoderMarkdown.svelte';
 	import CoderThinking from './CoderThinking.svelte';
 	import TerminalTargetIcon from './TerminalTargetIcon.svelte';
+	import ChatBubbleIcon from './icons/ChatBubbleIcon.svelte';
+	import SignOutIcon from './icons/SignOutIcon.svelte';
+	import PlusIcon from './icons/PlusIcon.svelte';
+	import ListIcon from './icons/ListIcon.svelte';
+	import FileIcon from './icons/FileIcon.svelte';
+	import TrashIcon from './icons/TrashIcon.svelte';
 
 	let scrollEl: HTMLDivElement | undefined = $state();
 	let composer: HTMLTextAreaElement | undefined = $state();
@@ -264,45 +270,11 @@
 				aria-label="Switch to Chat"
 				onclick={() => slack.togglePanel()}
 			>
-				<svg
-					viewBox="0 0 16 16"
-					width="14"
-					height="14"
-					fill="none"
-					stroke="currentColor"
-					stroke-width="1.4"
-					stroke-linecap="round"
-					stroke-linejoin="round"
-					aria-hidden="true"
-				>
-					<!-- Speech bubble — generic "chat" rather than the
-						 trademarked Slack hash; the panel itself is
-						 chat regardless of the backend (we may add
-						 non-Slack chats later). -->
-					<path
-						d="M2.5 4a1.5 1.5 0 0 1 1.5-1.5h8A1.5 1.5 0 0 1 13.5 4v5a1.5 1.5 0 0 1-1.5 1.5H6.5L3.5 13v-2.5H4A1.5 1.5 0 0 1 2.5 9z"
-					/>
-				</svg>
+				<ChatBubbleIcon />
 			</button>
 			{#if coder.signedIn}
 				<button type="button" class="icon" title="Sign out" aria-label="Sign out" onclick={onSignOut}>
-					<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
-						<path
-							d="M9 1H4a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h5"
-							fill="none"
-							stroke="currentColor"
-							stroke-width="1.4"
-							stroke-linecap="round"
-						/>
-						<path
-							d="M11 5l3 3-3 3M14 8H7"
-							fill="none"
-							stroke="currentColor"
-							stroke-width="1.4"
-							stroke-linecap="round"
-							stroke-linejoin="round"
-						/>
-					</svg>
+					<SignOutIcon />
 				</button>
 			{/if}
 		</div>
@@ -327,7 +299,7 @@
 				<span class="section-title">Sessions</span>
 				<div class="header-actions">
 					<button type="button" class="icon" onclick={onNewSession} title="New session" aria-label="New session">
-						{@render plusIcon()}
+						<PlusIcon />
 					</button>
 				</div>
 			</header>
@@ -352,7 +324,7 @@
 								aria-label="Delete session"
 								onclick={(event) => onDeleteSession(event, session.id, session.title)}
 							>
-								{@render trashIcon()}
+								<TrashIcon />
 							</button>
 						</li>
 					{/each}
@@ -373,13 +345,13 @@
 				title="Back to sessions"
 				aria-label="Back to sessions"
 			>
-				{@render listIcon()}
+				<ListIcon />
 			</button>
 			<span class="session-bar-title" title={coder.activeSession?.title ?? ''}>
 				{coder.activeSession?.title ?? 'New session'}
 			</span>
 			<button type="button" class="icon" onclick={onNewSession} title="New session" aria-label="New session">
-				{@render plusIcon()}
+				<PlusIcon />
 			</button>
 		</header>
 		<div class="transcript" bind:this={scrollEl}>
@@ -418,7 +390,7 @@
 												startLine: ref.startLine,
 											})}
 									>
-										{@render fileIcon()}
+										<FileIcon />
 										<span class="user-ref-label">
 											<span class="user-ref-name">{baseName(ref.path)}</span>
 											<span class="user-ref-range"
@@ -503,7 +475,7 @@
 								title={`${attachment.path}:${attachment.startLine}-${attachment.endLine}`}
 								onclick={() => onOpenAttachment(attachment)}
 							>
-								{@render fileIcon()}
+								<FileIcon />
 								<span class="attachment-label">
 									<span class="attachment-name">{baseName(attachment.path)}</span>
 									<span class="attachment-range">
@@ -545,81 +517,6 @@
 {#if coder.deviceCode || coder.awaitingApproval}
 	<CoderConnectModal />
 {/if}
-
-{#snippet plusIcon()}
-	<svg
-		viewBox="0 0 16 16"
-		width="14"
-		height="14"
-		fill="none"
-		stroke="currentColor"
-		stroke-width="1.5"
-		stroke-linecap="round"
-		stroke-linejoin="round"
-		aria-hidden="true"
-	>
-		<path d="M8 3v10" />
-		<path d="M3 8h10" />
-	</svg>
-{/snippet}
-
-{#snippet listIcon()}
-	<svg
-		viewBox="0 0 16 16"
-		width="14"
-		height="14"
-		fill="none"
-		stroke="currentColor"
-		stroke-width="1.5"
-		stroke-linecap="round"
-		stroke-linejoin="round"
-		aria-hidden="true"
-	>
-		<!-- Three-line "list" glyph. Same visual language Slack /
-			 Discord / Cursor use for "all conversations". -->
-		<path d="M3 4h10" />
-		<path d="M3 8h10" />
-		<path d="M3 12h10" />
-	</svg>
-{/snippet}
-
-{#snippet fileIcon()}
-	<svg
-		viewBox="0 0 16 16"
-		width="12"
-		height="12"
-		fill="none"
-		stroke="currentColor"
-		stroke-width="1.4"
-		stroke-linecap="round"
-		stroke-linejoin="round"
-		aria-hidden="true"
-	>
-		<!-- Generic document outline. We don't try to pick per-language
-			 icons here — the chip is small, the basename is more
-			 informative than a glyph. -->
-		<path d="M4 2h5l3 3v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1Z" />
-		<path d="M9 2v3h3" />
-	</svg>
-{/snippet}
-
-{#snippet trashIcon()}
-	<svg
-		viewBox="0 0 16 16"
-		width="14"
-		height="14"
-		fill="none"
-		stroke="currentColor"
-		stroke-width="1.4"
-		stroke-linecap="round"
-		stroke-linejoin="round"
-		aria-hidden="true"
-	>
-		<path d="M3 4h10" />
-		<path d="M5 4V3a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v1" />
-		<path d="M4.5 4l.7 9a1 1 0 0 0 1 1h3.6a1 1 0 0 0 1-1l.7-9" />
-	</svg>
-{/snippet}
 
 <style>
 	.panel {

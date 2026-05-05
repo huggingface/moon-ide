@@ -23,6 +23,7 @@
 
 	import { tick } from 'svelte';
 	import { workspace } from '../state.svelte';
+	import RevertIcon from './icons/RevertIcon.svelte';
 
 	const branch = $derived(workspace.gitBranch);
 	const branchLabel = $derived.by(() => {
@@ -50,6 +51,25 @@
 	// buttons just need "not currently busy".
 	const canCommit = $derived(!busy && (amend || message.trim().length > 0));
 
+	// Smart sync button label. Falls back to `null` when there's
+	// nothing to do (no commits to push or pull) — the button is
+	// hidden in that case. Order is "pull then push", echoing
+	// VSCode's Source Control sync semantics.
+	const syncLabel = $derived.by(() => {
+		const a = branch.ahead;
+		const b = branch.behind;
+		if (a > 0 && b > 0) {
+			return `Sync changes  ↓${b}  ↑${a}`;
+		}
+		if (a > 0) {
+			return `Push ${a} commit${a === 1 ? '' : 's'}  ↑`;
+		}
+		if (b > 0) {
+			return `Pull ${b} commit${b === 1 ? '' : 's'}  ↓`;
+		}
+		return null;
+	});
+
 	async function commit() {
 		if (!canCommit) {
 			return;
@@ -69,25 +89,57 @@
 		}
 	}
 
-	async function push() {
+	/**
+	 * Single-button sync: pulls first if behind, then pushes if
+	 * the local branch was (or still is, after the pull) ahead.
+	 * If pull fails we bail early so the user doesn't end up with
+	 * a non-fast-forward push attempt on top of an unresolved
+	 * merge / conflict / dirty-tree situation.
+	 */
+	async function sync() {
 		if (busy) {
+			return;
+		}
+		const initialAhead = branch.ahead;
+		const initialBehind = branch.behind;
+		if (initialAhead === 0 && initialBehind === 0) {
 			return;
 		}
 		busy = true;
 		try {
-			await workspace.pushChanges();
+			if (initialBehind > 0) {
+				const ok = await workspace.pullChanges();
+				if (!ok) {
+					return;
+				}
+			}
+			if (initialAhead > 0) {
+				await workspace.pushChanges();
+			}
 		} finally {
 			busy = false;
 		}
 	}
 
-	async function pull() {
+	/**
+	 * "Revert all changes" — discards every non-ignored entry in
+	 * `gitStatusEntries`. Tracked-changed paths route through
+	 * `git restore --source=HEAD --staged --worktree`; untracked
+	 * paths route to the OS trash. `discardPaths` already wraps
+	 * the work in a confirm dialog, so this is just "build the
+	 * list and hand it over".
+	 */
+	async function revertAll() {
 		if (busy) {
+			return;
+		}
+		const paths = workspace.gitStatusEntries.filter((e) => e.status !== 'ignored').map((e) => e.path);
+		if (paths.length === 0) {
 			return;
 		}
 		busy = true;
 		try {
-			await workspace.pullChanges();
+			await workspace.discardPaths(paths);
 		} finally {
 			busy = false;
 		}
@@ -153,52 +205,36 @@
 				<span class="branch-icon" aria-hidden="true">⎇</span>
 				<span class="branch-name">{branchLabel}</span>
 			</div>
-			{#if changeCount > 0 || workspace.scmFilterOn}
-				<button
-					type="button"
-					class="changes-badge"
-					class:active={workspace.scmFilterOn}
-					title={workspace.scmFilterOn
-						? `${changeCount} change${changeCount === 1 ? '' : 's'} (click to show all files)`
-						: `${changeCount} change${changeCount === 1 ? '' : 's'} (click to filter to changes only)`}
-					aria-label={workspace.scmFilterOn
-						? `Showing ${changeCount} changes — click to show all files`
-						: `${changeCount} changes — click to filter`}
-					aria-pressed={workspace.scmFilterOn}
-					onclick={() => workspace.toggleScmFilter()}
-				>
-					{changeCount}
-				</button>
-			{/if}
 			<div class="actions">
-				<button
-					type="button"
-					class="icon-btn"
-					class:has-count={branch.behind > 0}
-					title={branch.behind > 0 ? `Pull (${branch.behind} behind)` : 'Pull'}
-					aria-label={branch.behind > 0 ? `Pull ${branch.behind} commits` : 'Pull'}
-					disabled={busy}
-					onclick={pull}
-				>
-					<span class="arrow" aria-hidden="true">↓</span>
-					{#if branch.behind > 0}
-						<span class="count">{branch.behind}</span>
-					{/if}
-				</button>
-				<button
-					type="button"
-					class="icon-btn"
-					class:has-count={branch.ahead > 0}
-					title={branch.ahead > 0 ? `Push (${branch.ahead} ahead)` : 'Push'}
-					aria-label={branch.ahead > 0 ? `Push ${branch.ahead} commits` : 'Push'}
-					disabled={busy}
-					onclick={push}
-				>
-					<span class="arrow" aria-hidden="true">↑</span>
-					{#if branch.ahead > 0}
-						<span class="count">{branch.ahead}</span>
-					{/if}
-				</button>
+				{#if changeCount > 0}
+					<button
+						type="button"
+						class="icon-btn danger"
+						title="Revert all changes"
+						aria-label="Revert all changes"
+						disabled={busy}
+						onclick={revertAll}
+					>
+						<RevertIcon />
+					</button>
+				{/if}
+				{#if changeCount > 0 || workspace.scmFilterOn}
+					<button
+						type="button"
+						class="changes-badge"
+						class:active={workspace.scmFilterOn}
+						title={workspace.scmFilterOn
+							? `${changeCount} change${changeCount === 1 ? '' : 's'} (click to show all files)`
+							: `${changeCount} change${changeCount === 1 ? '' : 's'} (click to filter to changes only)`}
+						aria-label={workspace.scmFilterOn
+							? `Showing ${changeCount} changes — click to show all files`
+							: `${changeCount} changes — click to filter`}
+						aria-pressed={workspace.scmFilterOn}
+						onclick={() => workspace.toggleScmFilter()}
+					>
+						{changeCount}
+					</button>
+				{/if}
 			</div>
 		</div>
 	{/if}
@@ -227,6 +263,11 @@
 			<span aria-hidden="true">✎</span>
 		</button>
 	</div>
+	{#if syncLabel !== null}
+		<button type="button" class="sync-btn" disabled={busy} onclick={sync}>
+			{syncLabel}
+		</button>
+	{/if}
 </section>
 
 <style>
@@ -278,10 +319,8 @@
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
-		gap: 2px;
-		min-width: 22px;
+		width: 22px;
 		height: 22px;
-		padding: 0 4px;
 		border: none;
 		background: transparent;
 		color: var(--m-fg-muted);
@@ -290,6 +329,7 @@
 		font-size: 14px;
 		line-height: 1;
 		border-radius: 4px;
+		flex-shrink: 0;
 	}
 	.icon-btn:hover:not(:disabled) {
 		background: var(--m-bg-2);
@@ -303,22 +343,15 @@
 		opacity: 0.4;
 		cursor: not-allowed;
 	}
-	/* Highlight the count-bearing button so the badge reads as
-	   "you have N commits to push/pull, click here". The accent
-	   tint maps onto the same colour used for the amend toggle's
-	   active state — visually consistent with "this button is
-	   meaningful right now". */
-	.icon-btn.has-count {
-		color: var(--m-fg);
-	}
-	.icon-btn .arrow {
-		font-size: 14px;
-		line-height: 1;
-	}
-	.icon-btn .count {
-		font-size: 11px;
-		font-variant-numeric: tabular-nums;
-		line-height: 1;
+	/* Destructive icon — revert / discard / delete. Hover reveals
+	   the danger color so the user gets a "this is destructive"
+	   warning before clicking. The neutral resting colour avoids
+	   permanently lighting up the panel like a fire-alarm; the
+	   confirm dialog inside `discardPaths` is the actual safety
+	   net. */
+	.icon-btn.danger:hover:not(:disabled) {
+		background: color-mix(in srgb, var(--m-danger) 14%, transparent);
+		color: var(--m-danger);
 	}
 	/* Composer wrapper hosts the textarea plus the inset amend
 	   icon — chat-composer pattern. The textarea stretches the
@@ -445,5 +478,40 @@
 	.changes-badge.active {
 		background: transparent;
 		color: var(--m-accent);
+	}
+	/* Full-width sync button beneath the composer — the unified
+	   alternative to separate push/pull icons. Hidden when the
+	   branch has nothing to push or pull (`syncLabel === null`).
+	   Accent fill matches the badge's "this is the loud control
+	   right now" vocabulary; the label rewrites itself based on
+	   ahead/behind state ("Sync changes ↓N ↑M" / "Push N commits"
+	   / "Pull N commits"). */
+	.sync-btn {
+		appearance: none;
+		display: block;
+		width: 100%;
+		min-height: 26px;
+		padding: 4px 8px;
+		border: 1px solid var(--m-accent);
+		border-radius: 4px;
+		background: var(--m-accent);
+		color: var(--m-bg);
+		font: inherit;
+		font-size: 12px;
+		font-weight: 600;
+		line-height: 1.2;
+		cursor: pointer;
+		font-variant-numeric: tabular-nums;
+	}
+	.sync-btn:hover:not(:disabled) {
+		filter: brightness(1.1);
+	}
+	.sync-btn:focus-visible {
+		outline: 2px solid var(--m-accent);
+		outline-offset: 2px;
+	}
+	.sync-btn:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
 	}
 </style>
