@@ -172,7 +172,7 @@ One HTTP client, OpenAI-compatible schema, against
 
 The model field carries HF's provider-routing slug verbatim:
 `Qwen/Qwen3.5-397B-A17B:scaleway`,
-`Qwen/Qwen3.6-35B-A3B:deepinfra`. The IDE doesn't parse it; the
+`Qwen/Qwen3-Coder-30B-A3B-Instruct:scaleway`. The IDE doesn't parse it; the
 router does.
 
 #### Default models
@@ -181,7 +181,7 @@ Hardcoded in `crates/moon-coder/src/defaults.rs`:
 
 - **`large`** → `Qwen/Qwen3.5-397B-A17B:scaleway` — the day-to-day
   default for chat / refactor / multi-step tasks.
-- **`fast`** → `Qwen/Qwen3.6-35B-A3B:deepinfra` — the cheap default,
+- **`fast`** → `Qwen/Qwen3-Coder-30B-A3B-Instruct:scaleway` — the cheap default,
   used as the sub-agent default once that lands.
 
 The "large" / "fast" abstraction lives at the moon-coder level so

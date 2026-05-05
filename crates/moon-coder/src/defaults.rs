@@ -31,7 +31,7 @@ pub const DEFAULT_LARGE_MODEL: &str = "Qwen/Qwen3.5-397B-A17B:scaleway";
 /// Default "fast" model — used for sub-agents and lightweight tasks.
 /// Not wired to the loop in 6.0 (sub-agents are deferred); kept here
 /// so 6.4 only needs to plumb the existing constant through.
-pub const DEFAULT_FAST_MODEL: &str = "Qwen/Qwen3.6-35B-A3B:deepinfra";
+pub const DEFAULT_FAST_MODEL: &str = "Qwen/Qwen3-Coder-30B-A3B-Instruct:scaleway";
 
 /// HF Hub base URL — the host serves OAuth endpoints, the API, and
 /// the bucket REST endpoints from the same origin.

@@ -41,7 +41,7 @@ What ships:
   the Slack panel's sticky-bottom scroll + auto-grow textarea.
 - Default models hardcoded in
   `crates/moon-coder/src/defaults.rs` (`Qwen/Qwen3.5-397B-A17B:scaleway`,
-  `Qwen/Qwen3.6-35B-A3B:deepinfra`).
+  `Qwen/Qwen3-Coder-30B-A3B-Instruct:scaleway`).
 - Single in-memory session. No persistence.
 
 Test plan: written before the commit.

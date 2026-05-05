@@ -58,7 +58,7 @@ Concretely:
 contribute-repos` scopes (deliberately weaker than `manage-repos`
   — see [`coder.md`](../coder.md#hf-oauth-device-authorization-grant-rfc-8628)). OpenAI-compatible HTTP adapter against
   `https://router.huggingface.co/v1`. Models carried verbatim
-  (`Qwen/Qwen3.5-397B-A17B:scaleway`, `Qwen/Qwen3.6-35B-A3B:deepinfra`,
+  (`Qwen/Qwen3.5-397B-A17B:scaleway`, `Qwen/Qwen3-Coder-30B-A3B-Instruct:scaleway`,
   …). OAuth tokens live in the OS keyring under
   `service=moon-ide`, `account=hf-oauth`. Refresh-token rotation is
   handled by an HTTP middleware on the inference client.
