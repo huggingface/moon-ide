@@ -9,7 +9,9 @@
 
 pub mod app_state;
 pub mod editorconfig;
+pub mod format;
 pub mod host;
+pub mod lint_staged;
 pub mod lsp;
 pub mod pre_save;
 pub mod search;

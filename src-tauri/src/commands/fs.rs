@@ -47,14 +47,11 @@ pub async fn fs_write_file(
 ) -> Result<WriteFileResult, MoonError> {
 	let entry = state.workspaces.require_active_folder().await?;
 	let path = Utf8PathBuf::from(path);
-	// All saves run through the editorconfig-driven pre-save pipeline:
-	// line-ending normalization, trim trailing whitespace, ensure final
-	// newline. Server-side enforcement keeps the rules consistent
-	// whether the writer is the editor, an agent, or (later) an external
-	// tool routed through this command. See specs/editorconfig.md.
-	let ec = entry.host.editorconfig_for(&path).await?;
-	let normalized = moon_core::pre_save::apply_pipeline(&text, &ec);
-	entry.host.write_file(&path, &normalized).await
+	// `save_file` is the single seam every editor / agent / future
+	// writer funnels through: editorconfig pre-save (line endings, trim
+	// ws, final newline) plus the lint-staged formatter. See
+	// specs/editorconfig.md and specs/decisions/0012-format-on-save.md.
+	entry.host.save_file(&path, &text).await
 }
 
 #[tauri::command]

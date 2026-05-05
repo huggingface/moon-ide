@@ -51,8 +51,9 @@ The default pipeline is, in order:
 1. `EnsureLineEndings` — `end_of_line`.
 2. `TrimTrailingWhitespace` — `trim_trailing_whitespace`.
 3. `EnsureFinalNewline` — `insert_final_newline`.
+4. `RunFormatter` — pulled forward from Phase 8 as a bootstrap concern. See [ADR 0012 — Format on save via lint-staged](decisions/0012-format-on-save.md). Driven by the project's `.lintstagedrc.json` (or `package.json#lint-staged`); supersedes the speculative direction in [ADR 0006](decisions/0006-no-settings-file.md) where the knob would have been a moon-specific `.editorconfig` extension.
 
-Phase 8 (lint/format) appends a `RunFormatter` step at the end of this list. Whether to run it is a Phase-8 decision (probably an `.editorconfig` extension key or a hardcoded per-language default — see [ADR 0006](decisions/0006-no-settings-file.md), there is no `Settings.editor.format_on_save` to consult).
+The full save seam is the `WorkspaceHost::save_file` trait method, not `WorkspaceHost::write_file`. `save_file` runs the four steps above and then delegates to `write_file` for the raw bytes. Every editor save (`fs_write_file`) and every coder/agent edit funnels through `save_file`; raw `write_file` stays available for tests and any future caller that wants exactly the bytes it hands in.
 
 ### Editor (CodeMirror) integration
 

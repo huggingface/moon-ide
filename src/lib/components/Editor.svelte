@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { diffChars } from 'diff';
 	import { EditorState, Compartment, EditorSelection, Transaction } from '@codemirror/state';
 	import { EditorView, highlightActiveLine, highlightActiveLineGutter, keymap, lineNumbers } from '@codemirror/view';
 	import { highlightTabs } from '../editor/highlightTabs';
@@ -107,11 +108,7 @@
 			if (renamed) {
 				// Pipeline may have rewritten the bytes; sync the doc
 				// without rebuilding state.
-				if (file.text !== v.state.doc.toString()) {
-					v.dispatch({
-						changes: { from: 0, to: v.state.doc.length, insert: file.text },
-					});
-				}
+				syncDocText(v, file.text);
 				return;
 			}
 			const next = EditorState.create({
@@ -122,11 +119,7 @@
 			return;
 		}
 		// Same path, but the in-memory text may differ if state was mutated externally.
-		if (file.text !== v.state.doc.toString()) {
-			v.dispatch({
-				changes: { from: 0, to: v.state.doc.length, insert: file.text },
-			});
-		}
+		syncDocText(v, file.text);
 	});
 
 	// Reactive: when the resolved editorconfig for the active file
@@ -465,6 +458,47 @@
 	function lspPositionFromOffset(state: EditorState, offset: number): LspPosition {
 		const line = state.doc.lineAt(offset);
 		return { line: line.number - 1, character: offset - line.from };
+	}
+
+	// Replace the editor's doc with `next` while preserving the
+	// caret, scroll, and any other selection-mapped state. The
+	// previous implementation dispatched a single
+	// `{ from: 0, to: doc.length, insert: next }` change, which
+	// CodeMirror is forced to interpret as "the whole document was
+	// deleted and replaced" — every selection inside that range
+	// collapses to offset 0, plus every per-transaction view
+	// extension (LSP didChange, git-changes line diff, blame,
+	// language tokeniser) recomputes against the entire new doc.
+	//
+	// Format-on-save typically rewrites a handful of bytes; a
+	// granular character diff anchors the cursor to surviving
+	// content and keeps each extension's incremental work
+	// proportional to what actually changed. The `diff` package is
+	// already a dependency (used by the git-change gutter).
+	function syncDocText(v: EditorView, next: string): void {
+		const current = v.state.doc.toString();
+		if (current === next) {
+			return;
+		}
+		const parts = diffChars(current, next);
+		const changes: { from: number; to: number; insert: string }[] = [];
+		let offset = 0;
+		for (const part of parts) {
+			if (part.added) {
+				changes.push({ from: offset, to: offset, insert: part.value });
+				continue;
+			}
+			if (part.removed) {
+				changes.push({ from: offset, to: offset + part.value.length, insert: '' });
+				offset += part.value.length;
+				continue;
+			}
+			offset += part.value.length;
+		}
+		if (changes.length === 0) {
+			return;
+		}
+		v.dispatch({ changes });
 	}
 
 	async function applyLanguage(path: string, text: string) {

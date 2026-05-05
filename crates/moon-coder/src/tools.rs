@@ -355,7 +355,7 @@ impl ToolRegistry {
 			.ok_or(CoderError::NoActiveFolder)?;
 		let result = folder
 			.host
-			.write_file(Utf8Path::new(&parsed.path), &parsed.content)
+			.save_file(Utf8Path::new(&parsed.path), &parsed.content)
 			.await?;
 		Ok(json!({
 			"path": parsed.path,
@@ -424,7 +424,7 @@ impl ToolRegistry {
 		new_text.push_str(&parsed.replace);
 		new_text.push_str(&original.text[target_idx + parsed.find.len()..]);
 
-		let result = folder.host.write_file(path, &new_text).await?;
+		let result = folder.host.save_file(path, &new_text).await?;
 		Ok(json!({
 			"path": parsed.path,
 			"replaced_at_byte": target_idx,

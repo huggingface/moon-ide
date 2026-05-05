@@ -13,12 +13,27 @@ use moon_protocol::{MoonError, MoonResult};
 use std::time::SystemTime;
 
 use crate::editorconfig::EditorConfigService;
+use crate::format;
+use crate::lint_staged::{LintStagedRules, LintStagedService};
+use crate::pre_save;
 
 #[async_trait]
 pub trait WorkspaceHost: Send + Sync {
 	async fn read_dir(&self, path: &Utf8Path) -> MoonResult<Vec<DirEntry>>;
 	async fn read_file(&self, path: &Utf8Path) -> MoonResult<ReadFileResult>;
 	async fn write_file(&self, path: &Utf8Path, text: &str) -> MoonResult<WriteFileResult>;
+
+	/// Write `text` after running it through the save pipeline:
+	/// `.editorconfig` line-ending / trim-ws / final-newline normalization,
+	/// then the lint-staged formatter (oxfmt / prettier / rustfmt) for
+	/// files that have one configured. Every editor save and every agent
+	/// write funnels through this, so the on-disk shape matches what
+	/// `bun run lint-staged` would produce regardless of who issued the
+	/// write. Failures inside the formatter step never abort the save —
+	/// callers are guaranteed to land at least the editorconfig-normalised
+	/// bytes. See [specs/decisions/0012-format-on-save.md](../../../specs/decisions/0012-format-on-save.md).
+	async fn save_file(&self, path: &Utf8Path, text: &str) -> MoonResult<WriteFileResult>;
+
 	async fn stat(&self, path: &Utf8Path) -> MoonResult<StatResult>;
 
 	/// Move a file or directory to the OS trash / recycle bin (XDG
@@ -50,6 +65,16 @@ pub trait WorkspaceHost: Send + Sync {
 	/// agents and devcontainer-hosted tools see the same answer the UI
 	/// does — this is the single point where the rules are decided.
 	async fn editorconfig_for(&self, path: &Utf8Path) -> MoonResult<EditorConfig>;
+
+	/// Effective lint-staged rules for `path`. The walk (closest
+	/// `.lintstagedrc.json`, then `package.json#lint-staged`, up to the
+	/// workspace root) happens host-side; the caller gets a compiled
+	/// matcher and runs `match_command` against the absolute path. An
+	/// empty `LintStagedRules` means "no formatter configured for any
+	/// file under this directory", not an error. RemoteHost (Phase 2)
+	/// serves this over JSON-RPC so the same rules reach agents and
+	/// devcontainer-hosted writers.
+	async fn lint_staged_for(&self, path: &Utf8Path) -> MoonResult<LintStagedRules>;
 
 	/// Recursively enumerate every path inside the workspace root,
 	/// returning the same string format the file tree consumes
@@ -128,18 +153,40 @@ pub trait WorkspaceHost: Send + Sync {
 pub struct LocalHost {
 	root: Utf8PathBuf,
 	editorconfig: EditorConfigService,
+	lint_staged: LintStagedService,
 }
 
 impl LocalHost {
 	pub fn new(root: Utf8PathBuf) -> Self {
 		Self {
 			editorconfig: EditorConfigService::new(root.clone()),
+			lint_staged: LintStagedService::new(root.clone()),
 			root,
 		}
 	}
 
 	pub fn root(&self) -> &Utf8Path {
 		&self.root
+	}
+
+	/// Run the lint-staged formatter for `rel` against `text`, if one is
+	/// configured. Returns `None` (caller falls back to the editorconfig-
+	/// normalised text) when there's no rule for the file or when the
+	/// formatter itself misses — every miss path is logged inside
+	/// [`crate::format::run_formatter`].
+	async fn maybe_run_formatter(&self, rel: &Utf8Path, text: &str) -> Option<String> {
+		let rules = self.lint_staged.for_path(rel).await.ok()?;
+		if rules.is_empty() {
+			return None;
+		}
+		// `absolute_path` is the only way to get the host-side absolute
+		// path for a workspace-relative input. On `RemoteHost` (Phase 2)
+		// this would be the in-container path — exactly what the
+		// in-container formatter wants on its `--stdin-filepath`.
+		let abs_str = self.absolute_path(rel).await.ok()?;
+		let abs = Utf8PathBuf::from(abs_str);
+		let cmd = rules.match_command(abs.as_std_path())?.to_owned();
+		format::run_formatter(&self.root, &abs, &cmd, text).await
 	}
 
 	/// Resolve a workspace-relative or absolute path against the workspace root.
@@ -294,6 +341,15 @@ impl WorkspaceHost for LocalHost {
 		if file_name == ".editorconfig" {
 			self.editorconfig.clear().await;
 		}
+		// Same story for the lint-staged map: `.lintstagedrc.json` and
+		// any `package.json` carrying a `lint-staged` field can change
+		// what formatter applies to files anywhere below them. We don't
+		// know whether a `package.json` was previously a config-source
+		// (it depends on whether it had the `lint-staged` field), so we
+		// clear unconditionally on any `package.json` save.
+		if file_name == ".lintstagedrc.json" || file_name == "package.json" {
+			self.lint_staged.clear().await;
+		}
 
 		let metadata = tokio::fs::metadata(resolved.as_std_path())
 			.await
@@ -349,6 +405,7 @@ impl WorkspaceHost for LocalHost {
 		// indexed something we just sent to the trash, easier to clear
 		// the cache than walk it.
 		self.editorconfig.clear().await;
+		self.lint_staged.clear().await;
 		Ok(())
 	}
 
@@ -377,11 +434,26 @@ impl WorkspaceHost for LocalHost {
 		// directory delete, anything under it). Cheaper to clear and
 		// re-resolve on demand than to walk the cache.
 		self.editorconfig.clear().await;
+		self.lint_staged.clear().await;
 		Ok(())
 	}
 
 	async fn editorconfig_for(&self, path: &Utf8Path) -> MoonResult<EditorConfig> {
 		self.editorconfig.for_path(path).await
+	}
+
+	async fn lint_staged_for(&self, path: &Utf8Path) -> MoonResult<LintStagedRules> {
+		self.lint_staged.for_path(path).await
+	}
+
+	async fn save_file(&self, path: &Utf8Path, text: &str) -> MoonResult<WriteFileResult> {
+		// Editorconfig normalization is mandatory and cheap; the
+		// formatter step is best-effort and falls back to the
+		// normalized text on any failure (see specs/decisions/0012).
+		let ec = self.editorconfig.for_path(path).await?;
+		let normalized = pre_save::apply_pipeline(text, &ec);
+		let formatted = self.maybe_run_formatter(path, &normalized).await.unwrap_or(normalized);
+		self.write_file(path, &formatted).await
 	}
 
 	async fn git_status_entries(&self, paths: &[String]) -> MoonResult<Vec<GitStatusEntry>> {
@@ -478,6 +550,7 @@ impl WorkspaceHost for LocalHost {
 		// stale, but staying symmetric with trash/delete keeps future
 		// maintainers from wondering why this one skips the clear.
 		self.editorconfig.clear().await;
+		self.lint_staged.clear().await;
 		Ok(())
 	}
 

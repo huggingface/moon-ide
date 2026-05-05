@@ -2667,6 +2667,7 @@ dependencies = [
  "async-trait",
  "camino",
  "ec4rs",
+ "globset",
  "grep-matcher",
  "grep-regex",
  "grep-searcher",

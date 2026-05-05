@@ -142,6 +142,8 @@ App state grows with this phase: today's single workspace (folders + active) bec
 
 oxlint, oxfmt, prettier, eslint as sidecar processes. Debounced. Diagnostics merged with LSP diagnostics in a single problems panel. Format on save with per-language chooser.
 
+**What has landed early** (see `specs/test-plans/0047-*.md` and [ADR 0012](decisions/0012-format-on-save.md)): format-on-save itself, pulled forward as a bootstrap concern. Driven by the project's `.lintstagedrc.json` / `package.json#lint-staged`, runs through `WorkspaceHost::save_file` as the final rung of the editorconfig pre-save pipeline, covers oxfmt / prettier / rustfmt via stdin/stdout. There's no per-language chooser UI — lint-staged's map is the picker. The remaining Phase 8 surface (debounced lint diagnostics, problems panel, multi-tool chains, format-on-save toggle if anyone asks) stays scaffolded.
+
 ## Phase 9 — Custom tool plugins
 
 Plugin manifest declares webview URL or sidecar binary, capabilities, display target. Tiny JSON-RPC API plugins call into the core. Mongoku-as-plugin is the first integration.

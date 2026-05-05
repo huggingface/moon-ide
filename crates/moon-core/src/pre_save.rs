@@ -3,11 +3,15 @@
 //! Runs server-side just before bytes hit disk. Each transform is a
 //! pure function on `(text, ec)`: idempotent, no I/O, no panic. The
 //! default pipeline (line endings → trim trailing whitespace → final
-//! newline) is what every save in moon-ide goes through; Phase 8 adds
-//! a `RunFormatter` step at the end for languages with a configured
-//! formatter.
+//! newline) is what every save in moon-ide goes through. The
+//! `RunFormatter` step that lint-staged drives lives in `crate::format`
+//! and is composed at the call site in `LocalHost::save_file` rather
+//! than being threaded through this module — the formatter is
+//! best-effort and async, while these transforms are mandatory and
+//! sync.
 //!
-//! See [specs/editorconfig.md](../../../specs/editorconfig.md).
+//! See [specs/editorconfig.md](../../../specs/editorconfig.md) and
+//! [specs/decisions/0012-format-on-save.md](../../../specs/decisions/0012-format-on-save.md).
 
 use moon_protocol::editorconfig::{EditorConfig, EndOfLine};
 
