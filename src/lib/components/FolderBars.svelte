@@ -109,7 +109,7 @@
 						projectCompose.togglePanel(folder.path);
 					}}
 				>
-					<ContainerIcon size={12} />
+					<ContainerIcon size={14} />
 				</button>
 			{:else}
 				<!-- Layout placeholder: keeps row width identical to
