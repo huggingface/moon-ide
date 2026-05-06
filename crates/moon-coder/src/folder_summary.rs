@@ -55,7 +55,14 @@ use tokio::sync::broadcast;
 /// list. Anything outside the canonical-spelling-with-extension
 /// convention (`README` no extension, `Readme.txt`, etc.) is
 /// intentionally ignored — those are outside our scope.
-const CANONICAL_MANIFEST_NAMES: &[&str] = &["AGENTS.md", "README.md", "Cargo.toml", "package.json", "pyproject.toml"];
+const CANONICAL_MANIFEST_NAMES: &[&str] = &[
+	"AGENTS.md",
+	"CLAUDE.md",
+	"README.md",
+	"Cargo.toml",
+	"package.json",
+	"pyproject.toml",
+];
 
 /// Per-file byte cap when concatenating inputs. Keeps the prompt
 /// size bounded — a 2 MB README would dominate the model's context
