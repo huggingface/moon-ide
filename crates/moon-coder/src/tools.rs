@@ -742,6 +742,17 @@ fn digit_width(mut n: u32) -> u32 {
 	w
 }
 
+/// Hard cap on the number of UTF-8 characters of a matched line we'll dump
+/// into the model's context. A single base64-embedded image, minified JS
+/// bundle, or pretty-printed JSON blob can produce a "line" that's tens of
+/// kilobytes long; without this cap a single `grep` call could blow the
+/// context window. 500 chars is generous for normal code (well past
+/// rustfmt's 100-column default and prettier's 80) while keeping a hit on
+/// an inlined base64 payload to a stub the model can still act on (the
+/// `path:line` is intact, so a follow-up `read_file` with `start_line` /
+/// `end_line` is the natural escape hatch).
+const GREP_MAX_LINE_CHARS: usize = 500;
+
 fn format_grep_hits(hits: &[ContentSearchHit]) -> String {
 	let mut out = String::new();
 	for hit in hits {
@@ -754,10 +765,35 @@ fn format_grep_hits(hits: &[ContentSearchHit]) -> String {
 		out.push(':');
 		out.push_str(&hit.line.to_string());
 		out.push_str(": ");
-		out.push_str(trimmed);
+		out.push_str(&truncate_grep_line(trimmed));
 		out.push('\n');
 	}
 	out
+}
+
+/// Cap a matched line at [`GREP_MAX_LINE_CHARS`] UTF-8 characters. Lines
+/// at or under the cap pass through unchanged; longer lines get the cap
+/// prefix plus a `[…line truncated, N chars total]` marker so the model
+/// can see the line is huge and reach for `read_file` if it needs the
+/// rest. Counting in characters (not bytes) keeps multi-byte UTF-8 from
+/// landing the slice mid-codepoint.
+fn truncate_grep_line(line: &str) -> std::borrow::Cow<'_, str> {
+	let mut count = 0usize;
+	let mut cut_byte = None;
+	for (idx, _) in line.char_indices() {
+		if count == GREP_MAX_LINE_CHARS {
+			cut_byte = Some(idx);
+			break;
+		}
+		count += 1;
+	}
+	match cut_byte {
+		None => std::borrow::Cow::Borrowed(line),
+		Some(cut) => {
+			let total = count + line[cut..].chars().count();
+			std::borrow::Cow::Owned(format!("{}… [line truncated, {total} chars total]", &line[..cut]))
+		}
+	}
 }
 
 fn truncate_bytes(bytes: &[u8], max: usize) -> String {
@@ -786,7 +822,8 @@ fn clamp_to_char_boundary_bytes(bytes: &[u8], max: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-	use super::{byte_offsets_of, format_numbered_lines};
+	use super::{byte_offsets_of, format_grep_hits, format_numbered_lines, truncate_grep_line, GREP_MAX_LINE_CHARS};
+	use moon_protocol::search::ContentSearchHit;
 
 	#[test]
 	fn byte_offsets_of_finds_non_overlapping_hits() {
@@ -853,5 +890,64 @@ mod tests {
 	fn format_numbered_lines_start_past_eof_is_empty() {
 		let (out, _) = format_numbered_lines("a\nb\n", 5, 10);
 		assert_eq!(out, "");
+	}
+
+	fn hit(path: &str, line: u64, line_text: &str) -> ContentSearchHit {
+		ContentSearchHit {
+			path: path.to_owned(),
+			line,
+			column: 1,
+			line_text: line_text.to_owned(),
+			match_start: 0,
+			match_end: 0,
+		}
+	}
+
+	#[test]
+	fn truncate_grep_line_passes_short_lines_through() {
+		let line = "fn foo() { todo!() }";
+		let out = truncate_grep_line(line);
+		assert_eq!(out.as_ref(), line);
+	}
+
+	#[test]
+	fn truncate_grep_line_caps_at_char_boundary() {
+		// Build a line longer than the cap with a multi-byte char near
+		// the boundary so a naive byte slice would land mid-codepoint.
+		let mut line = String::new();
+		for _ in 0..GREP_MAX_LINE_CHARS - 1 {
+			line.push('a');
+		}
+		// Push a 2-byte char at exactly the cap, then more content past it.
+		line.push('é');
+		for _ in 0..50 {
+			line.push('b');
+		}
+		let out = truncate_grep_line(&line);
+		assert!(out.starts_with("aaa"));
+		assert!(out.contains("[line truncated"));
+		assert!(out.contains(&format!("{} chars total", line.chars().count())));
+		assert!(!out.contains('b'));
+	}
+
+	#[test]
+	fn format_grep_hits_truncates_base64_blob() {
+		// Simulate a base64 image embedded as one giant single-line
+		// match — the regression case the cap was added for.
+		let blob = "A".repeat(50_000);
+		let hits = vec![hit("assets/data.json", 1, &blob)];
+		let out = format_grep_hits(&hits);
+		assert!(out.starts_with("assets/data.json:1: "));
+		assert!(out.contains("[line truncated, 50000 chars total]"));
+		// The on-the-wire payload should be ~ cap chars + a small marker —
+		// nowhere near the original 50k.
+		assert!(out.len() < GREP_MAX_LINE_CHARS + 200);
+	}
+
+	#[test]
+	fn format_grep_hits_does_not_touch_normal_lines() {
+		let hits = vec![hit("src/lib.rs", 42, "    let x = compute_thing(input);")];
+		let out = format_grep_hits(&hits);
+		assert_eq!(out, "src/lib.rs:42:     let x = compute_thing(input);\n");
 	}
 }
