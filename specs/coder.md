@@ -255,15 +255,15 @@ container-bound tools without the agent loop knowing.
 The schema is JSON-Schema in the request to the LLM; the
 implementations are typed Rust:
 
-| Tool             | Signature                                                                                                                                         | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `read_file`      | `(path, start_line?, end_line?) -> { content, start_line, end_line, total_lines, truncated, mtime_ms }`                                           | `content` is line-numbered: every line is prefixed with `<line_no>\|<line>` (right-aligned, width sized to the largest visible number). The prefix is metadata, not part of the file. `start_line` / `end_line` are 1-based and inclusive; `end_line` is clamped to EOF and the response echoes the _effective_ range so the model can detect short reads. Refuses paths outside the active workspace folder.                                                                                                                                                 |
-| `write_file`     | `(path, content) -> { path, bytes_written, mtime_ms }`                                                                                            | Creates parents only if they exist; agent does `bash mkdir -p` first when it needs to                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `edit_file`      | `(path, find, replace, occurrence?) -> { path, bytes_written, mtime_ms, occurrence, total_matches }`                                              | `find` is an exact substring (whitespace significant); empty `find` rejected; non-unique match without `occurrence` throws so the LLM retries with more context                                                                                                                                                                                                                                                                                                                                                                                               |
-| `list_dir`       | `(path) -> DirEntry[]`                                                                                                                            | Honours the same gitignore-aware walk the file tree uses                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `grep`           | `(pattern, case_sensitive?, max_matches?) -> { pattern, matches, count, truncated }`                                                              | `matches` is one hit per line in `path:line: text` form (line is 1-based). Lines longer than 500 chars are capped with a `… [line truncated, N chars total]` marker so a single hit on an inlined base64 image / minified bundle can't blow the context window — the path + line are intact, so `read_file` with `start_line` / `end_line` is the recovery path. The exact line numbers feed back into `read_file`'s `start_line` / `end_line` so the typical loop is `grep` → narrow `read_file` → `edit_file`. Backed by the existing `ignore`/ripgrep dep. |
-| `bash`           | `(cmd, timeout_ms?) -> { cmd, target, stdout, stderr, exit_code }`                                                                                | Routes to `docker exec -w <container_cwd> <name> sh -lc <cmd>` when the workspace shell container's lifecycle status is `Running`, else `sh -lc <cmd>` rooted at the active folder. The decision is made by `tools::resolve_bash_target`, which calls the same `moon_container::Workspace::status()` query `lsp.rs` already uses — so terminals, LSP, and the coder agree on the routing target. `target` field echoes `"host"` / `"container"` so the panel pip and the tool result can't drift                                                              |
-| `spawn_subagent` | `(task, folder?, mode?, model?, system_prompt?) -> { result, sub_session_id, tokens_used_estimate, mode, iterations_used, byte_budget_exceeded }` | Spawns a parallel sub-agent against a bound workspace folder (defaults to the parent's active folder). `mode` is `"research"` (read-only intent) or `"coder"` (default; full toolkit). `model` is `"fast"` (default) or `"large"`. Multiple `spawn_subagent` calls in one assistant message run in parallel (cap: 4 via `Semaphore`). Sub-agents cannot spawn sub-sub-agents — depth=1 cap is enforced by the parent's tool list including `spawn_subagent` while the sub-agent's does not. Available **only** to the top-level parent turn.                  |
+| Tool             | Signature                                                                                                                   | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `read_file`      | `(path, start_line?, end_line?) -> { content, start_line, end_line, total_lines, truncated, mtime_ms }`                     | `content` is line-numbered: every line is prefixed with `<line_no>\|<line>` (right-aligned, width sized to the largest visible number). The prefix is metadata, not part of the file. `start_line` / `end_line` are 1-based and inclusive; `end_line` is clamped to EOF and the response echoes the _effective_ range so the model can detect short reads. Refuses paths outside the active workspace folder.                                                                                                                                                 |
+| `write_file`     | `(path, content) -> { path, bytes_written, mtime_ms }`                                                                      | Creates parents only if they exist; agent does `bash mkdir -p` first when it needs to                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `edit_file`      | `(path, find, replace, occurrence?) -> { path, bytes_written, mtime_ms, occurrence, total_matches }`                        | `find` is an exact substring (whitespace significant); empty `find` rejected; non-unique match without `occurrence` throws so the LLM retries with more context                                                                                                                                                                                                                                                                                                                                                                                               |
+| `list_dir`       | `(path) -> DirEntry[]`                                                                                                      | Honours the same gitignore-aware walk the file tree uses                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `grep`           | `(pattern, case_sensitive?, max_matches?) -> { pattern, matches, count, truncated }`                                        | `matches` is one hit per line in `path:line: text` form (line is 1-based). Lines longer than 500 chars are capped with a `… [line truncated, N chars total]` marker so a single hit on an inlined base64 image / minified bundle can't blow the context window — the path + line are intact, so `read_file` with `start_line` / `end_line` is the recovery path. The exact line numbers feed back into `read_file`'s `start_line` / `end_line` so the typical loop is `grep` → narrow `read_file` → `edit_file`. Backed by the existing `ignore`/ripgrep dep. |
+| `bash`           | `(cmd, timeout_ms?) -> { cmd, target, stdout, stderr, exit_code }`                                                          | Routes to `docker exec -w <container_cwd> <name> sh -lc <cmd>` when the workspace shell container's lifecycle status is `Running`, else `sh -lc <cmd>` rooted at the active folder. The decision is made by `tools::resolve_bash_target`, which calls the same `moon_container::Workspace::status()` query `lsp.rs` already uses — so terminals, LSP, and the coder agree on the routing target. `target` field echoes `"host"` / `"container"` so the panel pip and the tool result can't drift                                                              |
+| `spawn_subagent` | `(task, folder?, mode?, model?, system_prompt?) -> { result, sub_session_id, tokens_used_estimate, mode, iterations_used }` | Spawns a parallel sub-agent against a bound workspace folder (defaults to the parent's active folder). `mode` is `"research"` (read-only intent) or `"coder"` (default; full toolkit). `model` is `"fast"` (default) or `"large"`. Multiple `spawn_subagent` calls in one assistant message run in parallel (cap: 4 via `Semaphore`). Sub-agents cannot spawn sub-sub-agents — depth=1 cap is enforced by the parent's tool list including `spawn_subagent` while the sub-agent's does not. Available **only** to the top-level parent turn.                  |
 
 Tools that arrive **as separate commits when proven needed**, not
 in the initial slice:
@@ -481,18 +481,15 @@ A crash loses at most the in-flight event.
 
 ### Auto-rename
 
-After the _first_ successful turn of a fresh session, the runner
-fires a one-shot fast-model call asking for a 4-6 word title.
-That title:
+After the first turn of a fresh session **finishes** — successfully, aborted, or errored — the runner fires a one-shot fast-model call asking for a 4-6 word title against whatever made it into the transcript so far. That title:
 
 - Replaces the truncated-prompt fallback in the header (in memory).
 - Gets persisted as a [`TitleUpdate`] record so re-opening sees it.
-- Emits `session_title_updated` so the sticky header + sessions
-  list update without a re-fetch.
+- Emits `session_title_updated` so the sticky header + sessions list update without a re-fetch.
 
-Failures (model down, response empty / over-long, session
-switched mid-flight) keep the truncated-prompt title — it's a
-serviceable fallback. The pass only runs once per session.
+The "any first-turn outcome triggers it" rule matters because long tool-heavy turns are routinely Esc'd by the user before the assistant produces its final wrap-up text. Under an "Ok-only" rule those sessions kept the truncated-prompt fallback forever; firing the rename on any outcome means even a session that was Esc'd seconds in still gets a real title from the user prompt + whatever assistant content + tool results landed.
+
+Concurrency: the `auto_rename_pending` flag is captured-and-cleared inside the same critical section that sets the truncated-prompt title, so a second `send` racing with the spawned rename task can't double-spawn it. Failures (model down, response empty / over-long, session switched mid-flight) keep the truncated-prompt title — it's a serviceable fallback. The pass only runs once per session.
 
 ### Sidebar UI
 
@@ -507,13 +504,37 @@ slot via `rightPanel.kind === 'coder'`:
 - **Sessions list** (`coder.view === 'list'`). Sticky
   `Sessions | +` header; a row per persisted session showing the
   title plus a relative `updated_at_ms`. Hovering a row reveals
-  the trash icon (with a confirm dialog on click). Clicking the
+  two icon buttons on the right: an "open trace" `</>` button and
+  a trash icon (with a confirm dialog on click). Clicking the
   body of a row opens the session.
 
 `+` from either view drops into a fresh empty session and lands
 focus in the composer. Empty sessions don't persist until the
 first user message lands; that message creates the JSONL file
 and seeds the title from the prompt.
+
+### Open the raw trace in the editor
+
+Each session row, the active-session header, and the sub-agent
+pop-out header all expose a `</>` icon that opens the session's
+on-disk JSONL as an editor tab. The button calls
+`coder_session_jsonl_path(id)` to resolve the absolute host path,
+then routes through `workspace.openHostFile` — the same
+host-direct file mechanism `Ctrl+O` uses for paths outside the
+active folder (see [test plan 0051](test-plans/0051-open-host-file.md)).
+This means traces open identically whether the project is local
+or running in a container: the JSONL always lives on the host's
+`XDG_DATA_HOME`, never inside the container, so there's no
+docker-exec round-trip and no path translation.
+
+The trace is editable by default — we don't lock it because the
+tab is for power-user inspection, and the cost of an edit guard
+isn't worth the value. A corrupted line at worst makes a future
+`coder_open_session` log a `tracing::warn!` and skip the record.
+Empty sessions (created with `+ new` and never sent to) have no
+file on disk, so the button surfaces a flash toast instead of
+opening a phantom tab. The buffer doesn't auto-tail: to see
+appended turns, close and re-open via the same button.
 
 ### Composer attachments
 
@@ -659,6 +680,75 @@ A failed upload is a `tracing::warn!` plus a small status-bar pip
   and therefore in the bucket. NDA workspaces should toggle sync
   off; the banner exists exactly for this case.
 
+## Token accounting and auto-compaction
+
+Long sessions end up larger than any model's context window if the loop is just left to run. We solve that with two layered mechanisms: a per-turn token-usage report (so the user can _see_ what's happening) and an auto-compaction pass (so the loop _keeps working_ when the prompt would otherwise exceed the window).
+
+### Token usage report
+
+After every LLM round-trip the runner emits one [`CoderEvent::TokenUsage`](../crates/moon-coder/src/event.rs):
+
+```ts
+{
+  kind: 'token_usage',
+  prompt_tokens: number,       // size of the prompt the model just saw
+  completion_tokens: number,   // size of the response we just got back
+  total_tokens: number,
+  context_window: number,      // hardcoded per model in `defaults::context_window_for`
+  source: 'provider' | 'estimate'
+}
+```
+
+The numbers come from the OpenAI-compatible streaming `usage` chunk that providers emit when we set `stream_options: { include_usage: true }` on the request. `source: 'provider'` means those figures are exact; `source: 'estimate'` means the provider didn't emit a `usage` chunk and we fell back to a `bytes / 4` approximation (the conventional ratio for English text + tool JSON across the Qwen / Llama / DeepSeek families). The frontend tints the panel ring identically in both cases and adds a `≈` to the tooltip when source is `estimate`.
+
+`context_window` is hardcoded per model (per AGENTS.md "hardcode first, configure later") in [`defaults::context_window_for`](../crates/moon-coder/src/defaults.rs). The lookup is by model-slug prefix because the HF router pins a `:scaleway` or other provider suffix onto the canonical model id; window size is a property of the underlying model. Unknown slugs fall back to 128 K with a `tracing::warn!`.
+
+The frontend's `ContextRing` component lives in the panel header — a small circular progress arc filled to `prompt_tokens / context_window`. Tone: muted under 60 %, warning under 80 %, danger at or above 80 %. Pulses while a compaction summary is being written (see below).
+
+### Auto-compaction
+
+When a [`TokenUsage`](../crates/moon-coder/src/event.rs) event reports `prompt_tokens / context_window ≥ 0.80`, the next iteration of the loop runs an auto-compaction pass before sending. The pass:
+
+1. Walks the in-memory message history backwards, counts the most recent **6 user turns**, and uses the oldest of those as the **cut point**.
+2. Calls the **fast model** with a fixed system prompt that asks it to summarise the prefix (`messages[1..cut]`) — covering user intent, decisions, files touched, current state, and what to do next. Output is plain markdown; the call is non-streaming and has no tools.
+3. Replaces the prefix with a single synthetic [`ChatMessage::System`](../crates/moon-coder/src/inference.rs) carrying the summary (with a header that distinguishes it from `messages[0]`, the composed system prompt). The leading system prompt is **not** reinjected — `runner::refresh_system_prompt` runs at the top of every turn anyway and recomposes it from `AGENTS.md` + bound-folder summaries + folder-summary cache, so the compaction summary at `messages[1]` rides under whatever the next turn's fresh system prompt produces.
+
+```text
+before:
+  [system: composed]                               messages[0]
+  user … assistant … tool … assistant … user …    long history
+  user (most recent)
+
+after:
+  [system: composed]                               messages[0]   (rewritten next turn)
+  [system: <summary of older middle>]              messages[1]   (new)
+  user … assistant … tool …                       last 6 user turns kept
+  user (most recent)
+```
+
+The on-disk JSONL transcript is **not** rewritten. The full history stays on disk so pop-out / debug / audit see everything; only the in-memory prompt the next round-trip sends gets compacted. As a consequence the on-disk file can be longer than what the agent currently has in front of it; that's intentional.
+
+Two events fire around the pass:
+
+```ts
+{ kind: 'compaction_started', messages_compacted: number }
+{ kind: 'compaction_complete', summary: string, prompt_tokens_after: number }
+```
+
+The frontend renders these as a single full-width row at the bottom of the transcript: a "compacting…" pip while the fast-model call is in flight, flipping to a `<details>` showing the summary once `compaction_complete` lands. The ring also pulses while compaction is running.
+
+If the fast-model call fails or returns an empty summary, compaction is skipped (the agent keeps going with the uncompacted prompt; a warn-level log gets dropped) and `compaction_complete` fires with an empty summary so the UI's "compacting…" pip clears.
+
+Sub-agents run the same compaction pass at the same threshold against their own message list. That's why the previous byte-budget cap was removed — auto-compaction handles the "context too big" failure mode that the byte cap was approximating, without forcing the sub-agent to bail with a partial result.
+
+Threshold ([`COMPACT_THRESHOLD`](../crates/moon-coder/src/compaction.rs) = `0.80`), retained recent turns (`RECENT_USER_TURNS_KEPT` = `6`), and the summary system prompt are hardcoded today. They become user-tweakable when a real workload demonstrates a need for it; until then "hardcode first, configure later".
+
+### Iteration cap and final wrap-up
+
+The parent loop is capped at [`MAX_TURN_ITERATIONS`](../crates/moon-coder/src/defaults.rs) = `200` tool-call roundtrips per user prompt. Hitting the cap does **not** bail with a bare error banner — the runner appends a sentinel user message (`[Tool-call budget exhausted: …]`) and runs one final tools-disabled round-trip with `tools = []` so the model can write its best answer using what it's gathered. The sentinel is persisted in the JSONL and rendered in the panel like any other user message, so it's obvious in the transcript why the assistant suddenly stopped using tools. Same for sub-agents (50 iterations).
+
+This is distinct from per-tool errors: those continue to be shipped back as `tool_result.is_error = true` JSON the model sees on the next iteration, so it can retry, choose a different tool, or recover. Only the loop-level "out of iterations" failure mode triggers the wrap-up; cancellation (`Esc` / `CoderError::Aborted`) and inference errors still bail without a wrap-up since the loop is already torn down.
+
 ## Sub-agents
 
 The parent's loop exposes `spawn_subagent` (see the [tool surface](#tool-surface) above for the schema). One call dispatches one sub-agent; the parent's tool call awaits the sub-agent's report, then the model continues with that text in its context. Multiple `spawn_subagent` calls in a single assistant message dispatch concurrently, bounded by a 4-permit semaphore so a stampede on the inference router stays well-behaved.
@@ -673,10 +763,9 @@ spawn_subagent(
 ) -> {
   result: string,                  // the only string the parent's model sees
   sub_session_id: string,          // the UI's pop-out lookup key, persists across IDE restarts
-  tokens_used_estimate: number,    // approximated from message bytes (precise tracking lands when streaming `usage` is plumbed)
+  tokens_used_estimate: number,    // provider-supplied total when available, falls back to bytes/4
   mode: "research" | "coder",      // echoes the mode the sub-agent actually ran under
-  iterations_used: number,         // tool-call roundtrips consumed
-  byte_budget_exceeded: boolean    // set when the cap kicked in and the result is a partial-findings stub
+  iterations_used: number          // tool-call roundtrips consumed
 }
 ```
 
@@ -706,7 +795,7 @@ Arbitrary HF slugs are not accepted at this boundary on purpose — sub-agent di
 
 ### Budget
 
-Each sub-agent is capped at 6 tool-call roundtrips and ~32 KB of cumulative message bytes (≈ 8 K tokens via the `bytes / 4` approximation). Both caps fail the sub-agent with a partial-result stub (`byte_budget_exceeded: true` for the byte cap; the iteration cap returns its own "stopped after N iterations" string). Numbers are deliberately conservative — bump when a real workload outgrows them.
+Each sub-agent is capped at 50 tool-call roundtrips ([`SUBAGENT_MAX_ITERATIONS`](../crates/moon-coder/src/subagent.rs)). Hitting the cap doesn't bail with a stub — the sub-agent runs one final tools-disabled round-trip (`tools = []`, sentinel user message asking for a wrap-up) so the parent gets a real summary back. The wrap-up is prefixed with a `[Sub-agent reached the N-iteration cap; final wrap-up follows.]` note so the parent's model knows the budget was exhausted; if the wrap-up call itself fails or returns empty, the sub-agent falls back to the historical canned `Sub-agent stopped after N iterations …` string. The previous byte-budget cap was removed when [auto-compaction](#auto-compaction) shipped — sub-agents now compact their own history at the same threshold the parent uses, which handles the "context too big" failure mode the byte cap was approximating without forcing the sub-agent to bail mid-flight.
 
 ### Persistence
 
@@ -786,18 +875,19 @@ States the panel renders at the top:
 
 Tauri commands in `src-tauri/src/commands/coder.rs`:
 
-| Command                                                    | Purpose                                                                                               |
-| ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `coder_start_device_flow()`                                | Returns `{ user_code, verification_uri, expires_in, interval }`. Background poll runs in `moon-coder` |
-| `coder_status()`                                           | `{ signed_in, identity?, has_session, sync_enabled }`                                                 |
-| `coder_sign_out()`                                         | Drops keyring + identity                                                                              |
-| `coder_list_sessions()`                                    | List of `{ id, first_line, latest_event_ts }`                                                         |
-| `coder_open_session(id?)`                                  | If `id` given, load it; else create a new one. Returns the new active id                              |
-| `coder_delete_session(id)`                                 | Removes JSONL + tombstones for sync                                                                   |
-| `coder_send(text, mode: "send" \| "steer" \| "follow_up")` | Routes to the loop                                                                                    |
-| `coder_abort()`                                            | Cancels the in-flight loop                                                                            |
-| `coder_set_model(slug)`                                    | Override on the active session                                                                        |
-| `coder_set_sync_enabled(enabled)`                          | Per-workspace bucket-sync toggle                                                                      |
+| Command                                                    | Purpose                                                                                                                                                                                                                                                  |
+| ---------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `coder_start_device_flow()`                                | Returns `{ user_code, verification_uri, expires_in, interval }`. Background poll runs in `moon-coder`                                                                                                                                                    |
+| `coder_status()`                                           | `{ signed_in, identity?, has_session, sync_enabled }`                                                                                                                                                                                                    |
+| `coder_sign_out()`                                         | Drops keyring + identity                                                                                                                                                                                                                                 |
+| `coder_list_sessions()`                                    | List of `{ id, first_line, latest_event_ts }`                                                                                                                                                                                                            |
+| `coder_open_session(id?)`                                  | If `id` given, load it; else create a new one. Returns the new active id                                                                                                                                                                                 |
+| `coder_delete_session(id)`                                 | Removes JSONL + tombstones for sync                                                                                                                                                                                                                      |
+| `coder_session_jsonl_path(id)`                             | Resolves a session id (parent or sub-agent) to its absolute on-disk JSONL path; powers the panel's `</>` "open trace" affordance, which then opens the file via the host-direct file mechanism (see [test plan 0051](test-plans/0051-open-host-file.md)) |
+| `coder_send(text, mode: "send" \| "steer" \| "follow_up")` | Routes to the loop                                                                                                                                                                                                                                       |
+| `coder_abort()`                                            | Cancels the in-flight loop                                                                                                                                                                                                                               |
+| `coder_set_model(slug)`                                    | Override on the active session                                                                                                                                                                                                                           |
+| `coder_set_sync_enabled(enabled)`                          | Per-workspace bucket-sync toggle                                                                                                                                                                                                                         |
 
 Push events from backend → frontend (Tauri event channel):
 

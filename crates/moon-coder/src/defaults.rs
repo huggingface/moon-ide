@@ -40,12 +40,39 @@ pub const HF_HUB_BASE: &str = "https://huggingface.co";
 /// Inference Providers router base. OpenAI-compatible API surface.
 pub const HF_ROUTER_BASE: &str = "https://router.huggingface.co/v1";
 
-/// Conservative cap on how many LLM round-trips one user prompt can
-/// trigger. Each iteration is "send messages → get tool calls → run
-/// them → send results back". 32 is enough for any plausible
-/// real-world refactor task while preventing a runaway loop from
-/// burning credits on a single typo.
-pub const MAX_TURN_ITERATIONS: usize = 32;
+/// Cap on how many LLM round-trips one user prompt can trigger.
+/// Each iteration is "send messages → get tool calls → run them →
+/// send results back". 200 leaves plenty of headroom for serious
+/// multi-step refactors (Pierre Trees migration, large-codebase
+/// renames, multi-file LSP-driven fixes) while still catching a
+/// genuine runaway. With auto-compaction the practical ceiling is
+/// the wall-clock cost of inference, not the iteration count.
+pub const MAX_TURN_ITERATIONS: usize = 200;
+
+/// Per-model context-window size in tokens. Drives the in-panel
+/// usage ring and the auto-compaction threshold. Hardcoded today
+/// per AGENTS.md "hardcode first, configure later" — the team
+/// uses two models and they're both 256k. Returns the conservative
+/// default when an unknown slug shows up so a future model swap
+/// degrades to "the ring works but undersells the window" rather
+/// than a panic.
+pub fn context_window_for(model_slug: &str) -> u32 {
+	// Slug lookup uses prefix matching because the router pins a
+	// `:scaleway` (or other-provider) suffix onto the canonical HF
+	// model id. The context window is a property of the underlying
+	// model, not the provider route.
+	const TABLE: &[(&str, u32)] = &[
+		("Qwen/Qwen3.5-397B-A17B", 256_000),
+		("Qwen/Qwen3-Coder-30B-A3B-Instruct", 256_000),
+	];
+	for (prefix, window) in TABLE {
+		if model_slug.starts_with(prefix) {
+			return *window;
+		}
+	}
+	tracing::warn!(model = model_slug, "no context_window entry; defaulting to 128k");
+	128_000
+}
 
 /// Phase-6.2 system prompt. A real version that pulls in `AGENTS.md`,
 /// `<workspace>/.moon/SYSTEM.md`, and discovered `SKILL.md` files

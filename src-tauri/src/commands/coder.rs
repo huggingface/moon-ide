@@ -145,6 +145,17 @@ pub async fn coder_open_session(state: State<'_, AppState>, id: String) -> Resul
 	Ok(summary)
 }
 
+/// Resolve the on-disk JSONL path of a session under the active
+/// workspace folder. Frontend uses this to open the raw trace in
+/// the editor via the host-direct file path (same mechanism as
+/// `Ctrl+O` for files outside the workspace). Works for sub-agent
+/// ids too — they share the parent folder's slug.
+#[tauri::command]
+pub async fn coder_session_jsonl_path(state: State<'_, AppState>, id: String) -> Result<String, MoonError> {
+	let path = state.coder.session_jsonl_path(id).await.map_err(MoonError::from)?;
+	Ok(path.into_string())
+}
+
 /// Delete a persisted session for the active workspace folder.
 /// Idempotent. Emits `session_list_changed` afterwards.
 #[tauri::command]

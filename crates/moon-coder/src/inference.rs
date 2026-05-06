@@ -107,11 +107,41 @@ struct ChatCompletionRequest<'a> {
 	/// without tool calls return a single delta" so we get the same
 	/// shape either way; just buffered when streaming is off.
 	stream: bool,
+	/// `include_usage: true` makes OpenAI-compatible providers emit
+	/// a final SSE chunk with `usage: { prompt_tokens, … }` right
+	/// before `[DONE]`. Powers the per-turn token counter and the
+	/// auto-compaction trigger. Some providers ignore this flag and
+	/// never emit usage; the runner falls back to a bytes/4 estimate
+	/// in that case.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	stream_options: Option<StreamOptions>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StreamOptions {
+	include_usage: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionResponse {
 	pub choices: Vec<Choice>,
+	#[serde(default)]
+	pub usage: Option<TokenUsage>,
+}
+
+/// OpenAI-compatible usage report. `prompt_tokens` is the
+/// load-bearing field for the project: it tells us *exactly* how
+/// much of the model's context window the next round-trip will
+/// have to fit the system prompt + history into. `completion_tokens`
+/// is just the model's output for this single response.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+pub struct TokenUsage {
+	#[serde(default)]
+	pub prompt_tokens: u32,
+	#[serde(default)]
+	pub completion_tokens: u32,
+	#[serde(default)]
+	pub total_tokens: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -142,6 +172,14 @@ pub struct AssistantResponse {
 	pub thinking: Option<String>,
 	#[serde(default)]
 	pub tool_calls: Vec<ToolCall>,
+	/// Provider-reported usage for the round-trip that produced
+	/// this response. `None` when the provider didn't emit a
+	/// usage chunk; the runner falls back to a bytes/4 estimate
+	/// in that case. Skipped on serialization (we don't echo this
+	/// back to the model) and not part of the wire `Assistant`
+	/// message — see `response_to_message` in `runner.rs`.
+	#[serde(default, skip_serializing)]
+	pub usage: Option<TokenUsage>,
 }
 
 /// One SSE chunk in the OpenAI streaming shape. Fields use the same
@@ -153,6 +191,13 @@ pub struct AssistantResponse {
 struct StreamChunk {
 	#[serde(default)]
 	choices: Vec<StreamChoice>,
+	/// Final-chunk usage report. Only present on the very last
+	/// chunk of a stream when `stream_options.include_usage` was
+	/// set in the request. Most chunks have `choices` and no
+	/// `usage`; the final usage chunk has empty `choices` and a
+	/// populated `usage`.
+	#[serde(default)]
+	usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -270,6 +315,7 @@ impl InferenceClient {
 			tools,
 			tool_choice: if tools.is_empty() { None } else { Some("auto") },
 			stream: false,
+			stream_options: None,
 		};
 
 		let access = self.auth.current_access_token().await?;
@@ -293,11 +339,16 @@ impl InferenceClient {
 		}
 
 		let parsed: ChatCompletionResponse = crate::auth::decode_body(&endpoint, &text)?;
+		let usage = parsed.usage;
 		parsed
 			.choices
 			.into_iter()
 			.next()
-			.map(|c| c.message)
+			.map(|c| {
+				let mut msg = c.message;
+				msg.usage = usage;
+				msg
+			})
 			.ok_or_else(|| CoderError::decode(&endpoint, "response had no choices"))
 	}
 
@@ -332,6 +383,13 @@ impl InferenceClient {
 			tools,
 			tool_choice: if tools.is_empty() { None } else { Some("auto") },
 			stream: true,
+			// `include_usage: true` makes the provider emit a final
+			// SSE chunk with the round-trip's `prompt_tokens` /
+			// `completion_tokens` / `total_tokens`. `consume_sse_stream`
+			// captures it; the runner reads
+			// `AssistantResponse.usage` to drive the context-usage
+			// indicator and the auto-compaction trigger.
+			stream_options: Some(StreamOptions { include_usage: true }),
 		};
 
 		let access = self.auth.current_access_token().await?;
@@ -445,6 +503,7 @@ where
 	let mut content_buf = String::new();
 	let mut thinking_buf = String::new();
 	let mut tool_call_bufs: Vec<ToolCallBuffer> = Vec::new();
+	let mut usage: Option<TokenUsage> = None;
 	let mut byte_stream = response.bytes_stream();
 	let mut sse_buf: Vec<u8> = Vec::new();
 
@@ -470,7 +529,7 @@ where
 				.map_err(|err| CoderError::decode("inference stream", format!("invalid utf-8 in SSE event: {err}")))?;
 			for data in extract_data_lines(event_text) {
 				if data == "[DONE]" {
-					return Ok(finalize_response(content_buf, thinking_buf, tool_call_bufs));
+					return Ok(finalize_response(content_buf, thinking_buf, tool_call_bufs, usage));
 				}
 				let chunk: StreamChunk = serde_json::from_str(data).map_err(|err| {
 					CoderError::decode(
@@ -479,6 +538,13 @@ where
 					)
 				})?;
 				accumulate_chunk(&chunk, &mut content_buf, &mut thinking_buf, &mut tool_call_bufs);
+				if let Some(u) = chunk.usage {
+					// Last-write-wins: providers occasionally emit a
+					// usage block on multiple chunks (e.g. thinking
+					// vs final phases). The terminal chunk's numbers
+					// are what we care about.
+					usage = Some(u);
+				}
 				on_chunk(&chunk);
 			}
 		}
@@ -486,7 +552,7 @@ where
 
 	// Some providers close the stream without an explicit `[DONE]`
 	// — treat clean EOF as success.
-	Ok(finalize_response(content_buf, thinking_buf, tool_call_bufs))
+	Ok(finalize_response(content_buf, thinking_buf, tool_call_bufs, usage))
 }
 
 /// Working state for one in-progress tool call. The model emits the
@@ -572,7 +638,12 @@ where
 	}
 }
 
-fn finalize_response(content: String, thinking: String, tool_calls: Vec<ToolCallBuffer>) -> AssistantResponse {
+fn finalize_response(
+	content: String,
+	thinking: String,
+	tool_calls: Vec<ToolCallBuffer>,
+	usage: Option<TokenUsage>,
+) -> AssistantResponse {
 	AssistantResponse {
 		content: if content.is_empty() { None } else { Some(content) },
 		thinking: if thinking.is_empty() { None } else { Some(thinking) },
@@ -588,6 +659,7 @@ fn finalize_response(content: String, thinking: String, tool_calls: Vec<ToolCall
 				},
 			})
 			.collect(),
+		usage,
 	}
 }
 
@@ -689,7 +761,7 @@ mod tests {
 		// gets an id or name. Filter it so the chat-history append
 		// doesn't carry a phantom call.
 		let buf = vec![ToolCallBuffer::default()];
-		let resp = finalize_response(String::new(), String::new(), buf);
+		let resp = finalize_response(String::new(), String::new(), buf, None);
 		assert!(resp.tool_calls.is_empty());
 		assert!(resp.content.is_none());
 		assert!(resp.thinking.is_none());
@@ -711,7 +783,7 @@ mod tests {
 			let chunk: StreamChunk = serde_json::from_str(raw).unwrap();
 			accumulate_chunk(&chunk, &mut content, &mut thinking, &mut tcs);
 		}
-		let resp = finalize_response(content, thinking, tcs);
+		let resp = finalize_response(content, thinking, tcs, None);
 		assert_eq!(resp.tool_calls.len(), 1);
 		assert_eq!(resp.tool_calls[0].id, "call_x");
 		assert_eq!(resp.tool_calls[0].function.name, "read_file");
@@ -736,7 +808,7 @@ mod tests {
 			let chunk: StreamChunk = serde_json::from_str(raw).unwrap();
 			accumulate_chunk(&chunk, &mut content, &mut thinking, &mut tcs);
 		}
-		let resp = finalize_response(content, thinking, tcs);
+		let resp = finalize_response(content, thinking, tcs, None);
 		assert_eq!(resp.content.as_deref(), Some("Hello"));
 		assert_eq!(resp.thinking.as_deref(), Some("Let me think. Maybe a plan helps."));
 	}

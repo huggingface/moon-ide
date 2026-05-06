@@ -146,6 +146,12 @@ export const builtInCommands: Command[] = [
 		run: () => palette.show('search'),
 	},
 	{
+		id: 'editor.toggleLineWrap',
+		title: 'Toggle Line Wrap',
+		shortcut: 'Alt+Z',
+		run: () => workspace.toggleLineWrap(),
+	},
+	{
 		id: 'editor.splitRight',
 		title: 'Split Editor Right',
 		// Same key handles both directions because `Ctrl+\` in App.svelte

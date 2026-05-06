@@ -55,6 +55,11 @@
 	// value and the StateField re-runs its line diff on the next
 	// transaction.
 	const headCompartment = new Compartment();
+	// Soft-wrap toggle. Holds either `EditorView.lineWrapping` (when
+	// `workspace.lineWrap` is on) or an empty extension array (off,
+	// the default). A single window-global toggle drives every
+	// editor pane through this compartment.
+	const lineWrapCompartment = new Compartment();
 
 	// Each Editor instance owns one CM view that we re-target as the active file changes.
 	// We track the path the view currently holds so we know when to swap state.
@@ -159,6 +164,20 @@
 		}
 		v.dispatch({
 			effects: themeCompartment.reconfigure(moonEditorTheme(mode)),
+		});
+	});
+
+	// Soft-wrap toggle. Reading `workspace.lineWrap` here registers
+	// the dependency so `Alt+Z` (or the palette command) flips every
+	// mounted Editor at once, including any panes that mount later.
+	$effect(() => {
+		const wrap = workspace.lineWrap;
+		const v = view;
+		if (!v) {
+			return;
+		}
+		v.dispatch({
+			effects: lineWrapCompartment.reconfigure(wrap ? EditorView.lineWrapping : []),
 		});
 	});
 
@@ -374,6 +393,7 @@
 			themeCompartment.of(moonEditorTheme(workspace.effectiveTheme)),
 			languageCompartment.of([]),
 			editorConfigCompartment.of(editorConfigExtensions(ec)),
+			lineWrapCompartment.of(workspace.lineWrap ? EditorView.lineWrapping : []),
 			highlightTabs(),
 			EditorView.updateListener.of((update) => {
 				if (update.docChanged) {

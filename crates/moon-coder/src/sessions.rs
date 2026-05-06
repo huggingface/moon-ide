@@ -450,7 +450,7 @@ pub async fn delete(dir: &Utf8Path, id: &str) -> Result<(), CoderError> {
 	}
 }
 
-fn session_path(dir: &Utf8Path, id: &str) -> Utf8PathBuf {
+pub fn session_path(dir: &Utf8Path, id: &str) -> Utf8PathBuf {
 	dir.join(format!("{id}.{SESSION_EXT}"))
 }
 

@@ -227,6 +227,17 @@ class WorkspaceState {
 	// `theme === 'system'`.
 	systemPrefersDark = $state(detectSystemPrefersDark());
 
+	// Soft-wrap toggle for every editor pane. Off by default (matches
+	// VS Code / Cursor) so source code stays on its tab-aligned grid;
+	// `Alt+Z` flips it on, which is the canonical use case when looking
+	// at long-lined buffers (coder session JSONL traces, minified
+	// output, log dumps). Window-global rather than per-buffer because
+	// the team only flips it occasionally — per-buffer state would
+	// pull in an extra map on the persistence layer for ~zero benefit.
+	// Not persisted across restarts: the on-vs-off cost is one
+	// keystroke and the team is small.
+	lineWrap = $state(false);
+
 	// Local autocomplete (llama.cpp / Sweep-style model). Persisted in AppState; probe runs on a timer.
 	nextEditExternalBaseUrl = $state('');
 	nextEditLlamaBinary = $state('');
@@ -2197,6 +2208,15 @@ class WorkspaceState {
 
 	toggleDiffMode(path: string) {
 		this.setDiffMode(path, !this.diffModes.has(path));
+	}
+
+	/** Flip soft-wrap for every editor pane. Each `Editor.svelte` has
+	 *  a `$effect` that reads `workspace.lineWrap` and reconfigures
+	 *  its line-wrap compartment, so a single state toggle propagates
+	 *  to every visible buffer (and to any buffer mounted later). */
+	toggleLineWrap() {
+		this.lineWrap = !this.lineWrap;
+		this.flash(this.lineWrap ? 'Line wrap on' : 'Line wrap off');
 	}
 
 	/**

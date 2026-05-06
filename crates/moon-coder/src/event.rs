@@ -161,13 +161,69 @@ pub enum CoderEvent {
 	/// A sub-agent has finished (success or error). Frontend flips
 	/// the collapsed card's status pip and stops accepting deltas
 	/// for the matching `subagent_id`. `tokens_used_estimate` is
-	/// approximated from message bytes today; precise tracking
-	/// arrives when streaming `usage` is plumbed.
+	/// the parent's view of the sub-agent's spend — precise when
+	/// the provider emitted a streaming `usage` chunk, falls back
+	/// to a bytes/4 estimate otherwise (`source` distinguishes the
+	/// two so the UI can mark the latter with a `≈`).
 	SubagentFinished {
 		subagent_id: String,
 		tokens_used_estimate: u32,
 		was_error: bool,
 	},
+
+	/// Per-iteration token-usage report. Fires once after every
+	/// LLM round-trip in the parent loop with the round-trip's
+	/// own `prompt_tokens` / `completion_tokens` / `total_tokens`
+	/// and the model's hardcoded `context_window`.
+	///
+	/// `source` is `"provider"` when the usage came from the
+	/// provider's streaming `usage` chunk, `"estimate"` when we
+	/// fell back to a bytes/4 approximation (some providers don't
+	/// emit usage even with `stream_options.include_usage`). The
+	/// ring uses the same numbers either way; the `≈` marker
+	/// distinguishes accuracy.
+	///
+	/// `prompt_tokens` is the load-bearing field for compaction:
+	/// once it crosses ~80% of `context_window`, the runner
+	/// schedules a compaction pass before the next user prompt
+	/// goes out.
+	TokenUsage {
+		prompt_tokens: u32,
+		completion_tokens: u32,
+		total_tokens: u32,
+		context_window: u32,
+		source: TokenUsageSource,
+	},
+
+	/// Auto-compaction is starting. Fires before the fast-model
+	/// summary call goes out; the panel renders a "compacting…"
+	/// row and dims the ring while this is running.
+	CompactionStarted {
+		/// How many older messages will be replaced by the
+		/// summary. The frontend renders this in the row's
+		/// disclosure so the user knows what's getting folded.
+		messages_compacted: u32,
+	},
+
+	/// Compaction finished. `summary` is the fast-model output
+	/// that's now standing in for the old prefix; `prompt_tokens_after`
+	/// is the next round-trip's expected prompt size (system
+	/// prompt + summary + retained recent turns). The frontend
+	/// flips the row from "compacting…" to a collapsible
+	/// disclosure showing the summary.
+	CompactionComplete { summary: String, prompt_tokens_after: u32 },
+}
+
+/// Where the token numbers in [`CoderEvent::TokenUsage`] came from.
+/// `Provider` is exact (the OpenAI-compatible `usage` chunk);
+/// `Estimate` is the bytes/4 fallback used when the provider
+/// doesn't emit one. The frontend tints the ring identically but
+/// adds a `≈` marker on the tooltip in the estimate case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TokenUsageSource {
+	Provider,
+	Estimate,
 }
 
 /// Snapshot of the agent's auth + session state. Returned from

@@ -179,6 +179,7 @@ export const ipc = {
 		newSession: () => invoke<CoderSessionSummary>('coder_new_session'),
 		openSession: (id: string) => invoke<CoderSessionSummary>('coder_open_session', { id }),
 		deleteSession: (id: string) => invoke<void>('coder_delete_session', { id }),
+		sessionJsonlPath: (id: string) => invoke<string>('coder_session_jsonl_path', { id }),
 	},
 	ui: {
 		setRightPanel: (kind: RightPanelKind | null) => invoke<void>('ui_set_right_panel', { kind }),

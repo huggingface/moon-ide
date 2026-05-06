@@ -85,6 +85,20 @@
 					}
 					return;
 				}
+				// Alt+Z: toggle soft-wrap on every editor pane. Same
+				// keystroke VS Code / Cursor use, so muscle memory
+				// carries over. Skipped inside text inputs / textareas
+				// (palette, Slack composer, etc.) so a literal `z`
+				// with the Alt modifier still types in those surfaces
+				// — the editor itself doesn't have a competing native
+				// behaviour for Alt+Z, but inputs do (German layout
+				// dead-keys, etc.) so this is the safer default.
+				if (event.key.toLowerCase() === 'z' && !isTextInputTarget(event.target)) {
+					event.preventDefault();
+					event.stopPropagation();
+					workspace.toggleLineWrap();
+					return;
+				}
 			}
 			const ctrl = event.ctrlKey || event.metaKey;
 			if (!ctrl) {

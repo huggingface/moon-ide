@@ -109,6 +109,19 @@ export async function languageFor(filename: string, firstLine?: string): Promise
 			const { json } = await import('@codemirror/lang-json');
 			return [json()];
 		}
+		case 'jsonl':
+		case 'ndjson': {
+			// Newline-delimited JSON. The `lang-json` Lezer grammar
+			// is single-value at the top, so multiple objects across
+			// lines parse as one big error and most highlighting
+			// drops out. The legacy stream-mode tokenizer is
+			// per-line, which is exactly what JSONL wants — each
+			// line is independently tokenized as a JSON value, the
+			// next line starts fresh, no cross-line state to break.
+			// Coder session traces are the canonical use case.
+			const { json } = await import('@codemirror/legacy-modes/mode/javascript');
+			return [StreamLanguage.define(json)];
+		}
 		case 'css':
 		case 'scss':
 		case 'less': {

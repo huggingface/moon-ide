@@ -20,9 +20,13 @@
 //!   [`DEFAULT_FAST_MODEL`] / [`DEFAULT_LARGE_MODEL`]. Arbitrary HF
 //!   slugs are not accepted at this boundary on purpose.
 //! - Iteration cap: [`SUBAGENT_MAX_ITERATIONS`] tool-roundtrips per
-//!   sub-agent. Token cap is approximated from message bytes
-//!   ([`SUBAGENT_MAX_BYTES`]); both fail the sub-agent with a
-//!   partial result rather than running unbounded.
+//!   sub-agent — generous because auto-compaction handles the
+//!   "context too big" failure mode that the older byte cap was
+//!   approximating.
+//! - Token-aware compaction kicks in at the same threshold as the
+//!   parent loop ([`crate::compaction::COMPACT_THRESHOLD`]); the
+//!   summary becomes a synthetic `system` message that replaces
+//!   the older prefix.
 //! - Depth cap: hardcoded to 1. The sub-agent's own tool list does
 //!   not include `spawn_subagent`, so a sub-agent literally cannot
 //!   spawn a sub-sub-agent.
@@ -34,31 +38,27 @@ use moon_core::WorkspaceFolderEntry;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
+use crate::compaction;
 use crate::defaults::{DEFAULT_FAST_MODEL, DEFAULT_LARGE_MODEL};
 use crate::error::CoderError;
 use crate::event::CoderEvent;
-use crate::inference::{AssistantResponse, ChatMessage, FunctionCall, InferenceClient, StreamEvent, ToolDefinition};
+use crate::inference::{
+	AssistantResponse, ChatMessage, FunctionCall, InferenceClient, StreamEvent, TokenUsage, ToolDefinition,
+};
 use crate::runner::FolderEventSink;
 use crate::sessions::{
 	self, current_time_ms, new_session_id, sessions_dir, SessionHeader, SessionRecord, SESSION_SCHEMA_VERSION,
 };
 use crate::tools::{CoderMode, ToolContext, ToolRegistry};
 
-/// Hard cap on tool-call roundtrips per sub-agent. The parent's
-/// [`MAX_TURN_ITERATIONS`](crate::defaults::MAX_TURN_ITERATIONS) is
-/// 32; sub-agents are scoped tasks and shouldn't need that many.
-/// Trip-wire that catches a stuck sub-agent before it eats the
-/// budget; the number is deliberately conservative — bump when a
-/// real workload outgrows it.
-pub const SUBAGENT_MAX_ITERATIONS: usize = 6;
-
-/// Approximated cap on cumulative message bytes (system prompt +
-/// task + every assistant + every tool result). Divided by 4 to
-/// estimate tokens for the report. We don't have streaming `usage`
-/// yet, so this is the practical knob to keep a runaway sub-agent
-/// from spending unbounded credits. Crossing the cap fails the
-/// sub-agent with a partial result.
-pub const SUBAGENT_MAX_BYTES: usize = 32_000;
+/// Hard cap on tool-call roundtrips per sub-agent. Lower than the
+/// parent's [`MAX_TURN_ITERATIONS`](crate::defaults::MAX_TURN_ITERATIONS)
+/// because sub-agents are scoped tasks (find a thing, fix one bug,
+/// summarize a folder), but high enough that a real multi-step
+/// inspection or refactor doesn't bail mid-flight. Auto-compaction
+/// handles the "context too big" half so we don't need a separate
+/// byte cap to backstop runaway growth.
+pub const SUBAGENT_MAX_ITERATIONS: usize = 50;
 
 /// Generated as `sub-<19-char-id>`. Different prefix from session
 /// ids (`sess-...`) so a tail of the events can tell them apart at
@@ -138,7 +138,6 @@ pub struct SubagentReport {
 	pub sub_session_id: String,
 	pub mode: CoderMode,
 	pub iterations_used: u32,
-	pub byte_budget_exceeded: bool,
 }
 
 /// JSON tool definition for `spawn_subagent`. Lives outside the
@@ -242,7 +241,12 @@ async fn run_subagent_inner(
 			content: spec.task.clone(),
 		},
 	];
-	let mut total_bytes: usize = system_prompt.len() + spec.task.len();
+	// Most-recent provider-supplied usage. Populated whenever an
+	// LLM call returns a `usage` block; `None` when every round
+	// fell back to the bytes/4 estimate. Used both to drive the
+	// compaction trigger and as the eventual `tokens_used_estimate`
+	// the parent sees back.
+	let mut last_usage: Option<TokenUsage> = None;
 
 	// JSONL transcript lives under the **parent** folder's slug,
 	// not the target folder's. Sub-agents belong to whichever
@@ -297,26 +301,21 @@ async fn run_subagent_inner(
 		if cancel.is_cancelled() {
 			return Err(CoderError::Aborted);
 		}
-		if total_bytes > SUBAGENT_MAX_BYTES {
-			tracing::info!(
-				subagent_id = %id,
-				iter,
-				total_bytes,
-				cap = SUBAGENT_MAX_BYTES,
-				"sub-agent budget exceeded; bailing with partial result",
-			);
-			return Ok(SubagentReport {
-				result: format!(
-					"Sub-agent stopped after {} bytes of context (cap: {}). Partial findings may be available in the transcript.",
-					total_bytes, SUBAGENT_MAX_BYTES,
-				),
-				tokens_used_estimate: estimate_tokens(total_bytes),
-				sub_session_id: id.clone(),
-				mode: spec.mode,
-				iterations_used: iter as u32,
-				byte_budget_exceeded: true,
-			});
-		}
+
+		// Compaction-before-send: if the last round's prompt size
+		// is bumping into the model's context window, fold the
+		// older messages into a synthetic system summary before
+		// the next request goes out. No-op early in the run.
+		compaction::compact_if_needed(
+			inference,
+			sink,
+			Some(&id),
+			spec.model_tier.slug(),
+			last_usage.as_ref(),
+			&mut messages,
+			&cancel,
+		)
+		.await;
 
 		let assistant_id = format!("{id}::msg-{iter}");
 		let id_for_cb = assistant_id.clone();
@@ -375,7 +374,13 @@ async fn run_subagent_inner(
 			));
 		}
 
-		total_bytes += response.content.as_deref().map(str::len).unwrap_or(0);
+		if let Some(u) = response.usage {
+			last_usage = Some(u);
+		}
+		// Wrap the parent runner's helper so the sub-agent's ring
+		// updates land on the same wire as parent updates. The
+		// envelope is `SubagentEvent { inner: TokenUsage … }`.
+		emit_subagent_token_usage(sink, &id, spec.model_tier.slug(), &messages, &response);
 		messages.push(response_to_message(&response));
 		persist_subagent(
 			&session_dir,
@@ -392,11 +397,10 @@ async fn run_subagent_inner(
 			let result_text = response.content.clone().unwrap_or_default();
 			return Ok(SubagentReport {
 				result: result_text,
-				tokens_used_estimate: estimate_tokens(total_bytes),
+				tokens_used_estimate: tokens_used_for_report(&messages, last_usage),
 				sub_session_id: id.clone(),
 				mode: spec.mode,
 				iterations_used: (iter + 1) as u32,
-				byte_budget_exceeded: false,
 			});
 		}
 
@@ -434,7 +438,6 @@ async fn run_subagent_inner(
 					is_error,
 				},
 			));
-			total_bytes += content.len();
 			messages.push(ChatMessage::Tool {
 				tool_call_id: call.id.clone(),
 				content: content.clone(),
@@ -451,17 +454,194 @@ async fn run_subagent_inner(
 		}
 	}
 
+	// Iteration cap reached. Mirror the parent's behaviour: ask
+	// the model for one final tools-disabled wrap-up turn so the
+	// parent gets a real answer back instead of a canned "stopped
+	// after N iterations" stub. The wrap-up reply becomes the
+	// sub-agent's `result` string (with a leading note so the
+	// parent's model knows the budget was exhausted).
+	let wrap_up = subagent_wrap_up(inference, sink, spec, &session_dir, &header, &mut messages, &cancel).await;
+	let result = match wrap_up {
+		Ok(text) if !text.trim().is_empty() => {
+			format!("[Sub-agent reached the {SUBAGENT_MAX_ITERATIONS}-iteration cap; final wrap-up follows.]\n\n{text}")
+		}
+		_ => format!("Sub-agent stopped after {SUBAGENT_MAX_ITERATIONS} iterations without producing a final answer.",),
+	};
 	Ok(SubagentReport {
-		result: format!(
-			"Sub-agent stopped after {} iterations without producing a final answer.",
-			SUBAGENT_MAX_ITERATIONS
-		),
-		tokens_used_estimate: estimate_tokens(total_bytes),
+		result,
+		tokens_used_estimate: tokens_used_for_report(&messages, last_usage),
 		sub_session_id: id.clone(),
 		mode: spec.mode,
 		iterations_used: SUBAGENT_MAX_ITERATIONS as u32,
-		byte_budget_exceeded: false,
 	})
+}
+
+/// Final tools-disabled round-trip the sub-agent runs after its
+/// iteration cap is hit. Same idea as the parent's
+/// [`wrap_up_final_answer`](crate::runner::wrap_up_final_answer):
+/// inject a sentinel user message asking the model to write its
+/// best answer with what it has, then call inference with
+/// `tools = []` so it can't loop again. Streams the response
+/// inside [`CoderEvent::SubagentEvent`] envelopes so the pop-out
+/// UI sees it land like any other sub-agent turn.
+///
+/// Returns the text of the wrap-up answer for the caller to wire
+/// into [`SubagentReport::result`]. Errors / empty responses fall
+/// back to the historical canned message in the caller.
+async fn subagent_wrap_up(
+	inference: &InferenceClient,
+	sink: &FolderEventSink,
+	spec: &Subagent,
+	session_dir: &Utf8Path,
+	header: &SessionHeader,
+	messages: &mut Vec<ChatMessage>,
+	cancel: &CancellationToken,
+) -> Result<String, CoderError> {
+	let id = spec.id.as_str();
+	tracing::info!(
+		subagent_id = %id,
+		iterations = SUBAGENT_MAX_ITERATIONS,
+		"sub-agent iteration cap reached; running final tools-disabled wrap-up",
+	);
+	let sentinel = format!(
+		"[Tool-call budget exhausted: you've used all {SUBAGENT_MAX_ITERATIONS} tool-call iterations available for this sub-agent. \
+Do not call any more tools. Write a final response now using only what you've already gathered: summarise findings, what's still unfinished, and any uncertainty.]"
+	);
+	messages.push(ChatMessage::User {
+		content: sentinel.clone(),
+	});
+	persist_subagent(session_dir, header, &SessionRecord::User { text: sentinel.clone() }).await;
+
+	let assistant_id = format!("{id}::wrap-up");
+	let id_for_cb = assistant_id.clone();
+	let id_for_subagent = id.to_string();
+	let sink_for_cb = sink.clone();
+	let started = std::sync::atomic::AtomicBool::new(false);
+	let response = inference
+		.chat_completion_stream(spec.model_tier.slug(), messages, &[], cancel, |event| match event {
+			StreamEvent::ContentDelta { delta } => {
+				if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+					sink_for_cb.send(wrap_inner(
+						&id_for_subagent,
+						CoderEvent::AssistantMessageStart { id: id_for_cb.clone() },
+					));
+				}
+				sink_for_cb.send(wrap_inner(
+					&id_for_subagent,
+					CoderEvent::AssistantMessageDelta {
+						id: id_for_cb.clone(),
+						delta: delta.to_string(),
+					},
+				));
+			}
+			StreamEvent::ThinkingDelta { delta } => {
+				if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+					sink_for_cb.send(wrap_inner(
+						&id_for_subagent,
+						CoderEvent::AssistantMessageStart { id: id_for_cb.clone() },
+					));
+				}
+				sink_for_cb.send(wrap_inner(
+					&id_for_subagent,
+					CoderEvent::AssistantThinkingDelta {
+						id: id_for_cb.clone(),
+						delta: delta.to_string(),
+					},
+				));
+			}
+			// Tools were disabled in the request; drop any stragglers.
+			StreamEvent::ToolCallDelta { .. } => {}
+		})
+		.await?;
+
+	if started.into_inner() {
+		sink.send(wrap_inner(
+			id,
+			CoderEvent::AssistantMessageEnd {
+				id: assistant_id,
+				text: response.content.clone().unwrap_or_default(),
+				thinking: response.thinking.clone(),
+			},
+		));
+	}
+
+	let final_text = response.content.clone().unwrap_or_default();
+	messages.push(response_to_message(&response));
+	persist_subagent(
+		session_dir,
+		header,
+		&SessionRecord::Assistant {
+			content: response.content.clone(),
+			thinking: response.thinking.clone(),
+			tool_calls: response.tool_calls.clone(),
+		},
+	)
+	.await;
+	Ok(final_text)
+}
+
+/// Sub-agent-specific wrapper around the parent runner's
+/// [`emit_token_usage`](crate::runner::emit_token_usage). The
+/// inner event is a [`CoderEvent::TokenUsage`] just like the
+/// parent's, but wrapped in [`CoderEvent::SubagentEvent`] so the
+/// frontend can target the right nested ring.
+fn emit_subagent_token_usage(
+	sink: &FolderEventSink,
+	subagent_id: &str,
+	model_slug: &str,
+	messages: &[ChatMessage],
+	response: &AssistantResponse,
+) {
+	let context_window = crate::defaults::context_window_for(model_slug);
+	let (prompt_tokens, completion_tokens, total_tokens, source) = match response.usage {
+		Some(u) => (
+			u.prompt_tokens,
+			u.completion_tokens,
+			u.total_tokens,
+			crate::event::TokenUsageSource::Provider,
+		),
+		None => {
+			let prompt = crate::runner::estimate_prompt_tokens(messages);
+			// Mirror the parent's bytes/4 for completion side; the
+			// inference module's helper isn't reachable here and
+			// duplicating four lines is cleaner than threading it.
+			let completion = (response.content.as_deref().map(str::len).unwrap_or(0)
+				+ response.thinking.as_deref().map(str::len).unwrap_or(0)
+				+ response
+					.tool_calls
+					.iter()
+					.map(|c| c.function.name.len() + c.function.arguments.len())
+					.sum::<usize>()) as u32
+				/ 4;
+			(
+				prompt,
+				completion,
+				prompt + completion,
+				crate::event::TokenUsageSource::Estimate,
+			)
+		}
+	};
+	sink.send(wrap_inner(
+		subagent_id,
+		CoderEvent::TokenUsage {
+			prompt_tokens,
+			completion_tokens,
+			total_tokens,
+			context_window,
+			source,
+		},
+	));
+}
+
+/// Choose the best available "tokens used" number for the report
+/// the parent's tool dispatch sees. Prefer the final
+/// provider-supplied usage; fall back to the parent runner's
+/// bytes/4 estimator computed from the message history.
+fn tokens_used_for_report(messages: &[ChatMessage], last_usage: Option<TokenUsage>) -> u32 {
+	if let Some(u) = last_usage {
+		return u.total_tokens.max(u.prompt_tokens + u.completion_tokens);
+	}
+	crate::runner::estimate_prompt_tokens(messages)
 }
 
 fn wrap_inner(subagent_id: &str, inner: CoderEvent) -> CoderEvent {
@@ -513,15 +693,6 @@ fn response_to_message(response: &AssistantResponse) -> ChatMessage {
 
 fn parse_tool_args(function: &FunctionCall) -> Value {
 	serde_json::from_str(&function.arguments).unwrap_or(Value::Null)
-}
-
-fn estimate_tokens(byte_count: usize) -> u32 {
-	// 4 bytes per token is the conventional rough conversion for
-	// English text; tool JSON tilts higher (more punctuation /
-	// short keys) so this is conservative. We surface this as
-	// "estimate" in the wire payload; precise tracking lands when
-	// streaming `usage` is plumbed through the chunk parser.
-	(byte_count / 4).min(u32::MAX as usize) as u32
 }
 
 const RESEARCH_SYSTEM_PROMPT: &str = r#"You are a research sub-agent inside moon-ide. You have been spawned by a parent agent to gather information from a workspace folder and report back. Your job is investigation, not editing.

@@ -902,7 +902,27 @@ export type CoderEvent =
 	| { kind: 'folder_summary_ready'; folder: string; description: string }
 	| { kind: 'subagent_spawned'; tool_call_id: string; subagent_id: string; target_folder: string; mode: SubagentMode }
 	| { kind: 'subagent_event'; subagent_id: string; inner: CoderEvent }
-	| { kind: 'subagent_finished'; subagent_id: string; tokens_used_estimate: number; was_error: boolean };
+	| { kind: 'subagent_finished'; subagent_id: string; tokens_used_estimate: number; was_error: boolean }
+	| {
+			kind: 'token_usage';
+			prompt_tokens: number;
+			completion_tokens: number;
+			total_tokens: number;
+			context_window: number;
+			source: TokenUsageSource;
+	  }
+	| { kind: 'compaction_started'; messages_compacted: number }
+	| { kind: 'compaction_complete'; summary: string; prompt_tokens_after: number };
+
+/**
+ * Where the numbers in a `token_usage` event came from. `provider`
+ * means the OpenAI-compatible streaming `usage` chunk gave us
+ * exact figures; `estimate` means we fell back to a `bytes / 4`
+ * approximation because the provider didn't emit one. The UI
+ * tints the ring identically and adds a `≈` marker on the
+ * tooltip for `estimate`.
+ */
+export type TokenUsageSource = 'provider' | 'estimate';
 
 /**
  * Two operational modes a sub-agent can run under. Mirrors

@@ -46,6 +46,11 @@
 	// glyphs, same clickable scrollbar strip — without rebuilding
 	// the editor when HEAD shifts under us.
 	const headB = new Compartment();
+	// Soft-wrap compartments, one per side. The MergeView locks the
+	// two scrollers in step, so flipping wrap on one side without
+	// the other would wreck alignment between hunks.
+	const wrapA = new Compartment();
+	const wrapB = new Compartment();
 
 	// In single-tab model, `file.path` is stable for the lifetime of
 	// this DiffView instance — the EditorPane swaps Editor ↔ DiffView
@@ -153,6 +158,7 @@
 			themeA.of(moonEditorTheme(workspace.effectiveTheme)),
 			langA.of(lang),
 			ecA.of(editorConfigExtensions(ec)),
+			wrapA.of(workspace.lineWrap ? EditorView.lineWrapping : []),
 			...escapeBinding,
 		];
 
@@ -245,6 +251,7 @@
 			themeB.of(moonEditorTheme(workspace.effectiveTheme)),
 			langB.of(lang),
 			ecB.of(editorConfigExtensions(ec)),
+			wrapB.of(workspace.lineWrap ? EditorView.lineWrapping : []),
 			...escapeBinding,
 			EditorView.updateListener.of((update) => {
 				if (update.docChanged) {
@@ -372,6 +379,20 @@
 		}
 		m.a.dispatch({ effects: themeA.reconfigure(moonEditorTheme(mode)) });
 		m.b.dispatch({ effects: themeB.reconfigure(moonEditorTheme(mode)) });
+	});
+
+	// Soft-wrap. Both sides of the merge get the same setting in the
+	// same dispatch — flipping just one side would desync the
+	// MergeView's gutter alignment between hunks.
+	$effect(() => {
+		const wrap = workspace.lineWrap;
+		const m = merge;
+		if (!m) {
+			return;
+		}
+		const ext = wrap ? EditorView.lineWrapping : [];
+		m.a.dispatch({ effects: wrapA.reconfigure(ext) });
+		m.b.dispatch({ effects: wrapB.reconfigure(ext) });
 	});
 
 	// LSP diagnostics: push the latest list for this path into the

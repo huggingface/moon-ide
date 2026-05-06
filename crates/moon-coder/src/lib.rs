@@ -16,6 +16,7 @@
 //! - [`specs/roadmaps/phase-06-coder.md`](../../../specs/roadmaps/phase-06-coder.md)
 
 pub mod auth;
+pub mod compaction;
 pub mod defaults;
 pub mod error;
 pub mod event;

@@ -129,6 +129,7 @@ pub fn run() {
 			commands::coder::coder_new_session,
 			commands::coder::coder_open_session,
 			commands::coder::coder_delete_session,
+			commands::coder::coder_session_jsonl_path,
 			commands::ui::ui_set_right_panel,
 		])
 		.setup(|app| {

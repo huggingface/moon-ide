@@ -135,7 +135,51 @@ class FolderViewState {
 	sessions = $state<CoderSessionSummary[] | null>(null);
 	draft = $state('');
 	attachments = $state<ComposerAttachment[]>([]);
+	/** Latest token usage report from the parent loop. `null`
+	 *  before the first turn; populated from `token_usage` events
+	 *  and used by [`ContextRing`] in the panel header. */
+	tokenUsage = $state<TokenUsageState | null>(null);
+	/** Auto-compaction status. `null` when nothing is in flight;
+	 *  `{ phase: 'running', ... }` while the fast-model summary
+	 *  call is out; `{ phase: 'done', ... }` after `compaction_complete`
+	 *  lands so the UI can render the disclosure with the summary
+	 *  body until the next compaction overwrites it. */
+	compaction = $state<CompactionState | null>(null);
 }
+
+/**
+ * One row of the rolling token-usage report.
+ *
+ * `prompt` is the load-bearing field — it tells the user (and the
+ * compaction trigger) how much of the model's context window the
+ * **next** round-trip is going to take to fit history into. The
+ * other numbers are informational; the ring uses
+ * `prompt / contextWindow` for the fill arc.
+ */
+export type TokenUsageState = {
+	prompt: number;
+	completion: number;
+	total: number;
+	contextWindow: number;
+	/** `'provider'` when the figures came from the OpenAI-compatible
+	 *  streaming `usage` chunk; `'estimate'` when we fell back to a
+	 *  bytes/4 approximation. The ring tints identically; the
+	 *  tooltip prefixes a `≈` for `'estimate'`. */
+	source: 'provider' | 'estimate';
+};
+
+/**
+ * Compaction event for the panel.
+ *
+ * `'running'` shows a "compacting…" pip in the panel header while
+ * the fast-model summary call is in flight; `'done'` flips the pip
+ * to a disclosure that, when expanded, reveals the synthetic
+ * summary the agent now sees in place of the older middle of the
+ * history.
+ */
+export type CompactionState =
+	| { phase: 'running'; messagesCompacted: number }
+	| { phase: 'done'; messagesCompacted: number; summary: string; promptTokensAfter: number };
 
 /** Sentinel folder key used when no workspace folder is active.
  *  Pre-binding the agent panel still lets the user start typing
@@ -306,6 +350,14 @@ class CoderPanelState {
 	}
 	set attachments(value: ComposerAttachment[]) {
 		this.current.attachments = value;
+	}
+
+	get tokenUsage(): TokenUsageState | null {
+		return this.current.tokenUsage;
+	}
+
+	get compaction(): CompactionState | null {
+		return this.current.compaction;
 	}
 
 	/** Counter the panel `$effect`s on to refocus the composer
@@ -940,6 +992,41 @@ class CoderPanelState {
 					subSessionId: summary.subSessionId,
 				});
 				bucket.subagentSummaries = summaries;
+				return;
+			}
+			case 'token_usage':
+				bucket.tokenUsage = {
+					prompt: event.prompt_tokens,
+					completion: event.completion_tokens,
+					total: event.total_tokens,
+					contextWindow: event.context_window,
+					source: event.source,
+				};
+				return;
+			case 'compaction_started':
+				bucket.compaction = {
+					phase: 'running',
+					messagesCompacted: event.messages_compacted,
+				};
+				return;
+			case 'compaction_complete': {
+				const previous = bucket.compaction;
+				bucket.compaction = {
+					phase: 'done',
+					messagesCompacted: previous?.phase === 'running' ? previous.messagesCompacted : 0,
+					summary: event.summary,
+					promptTokensAfter: event.prompt_tokens_after,
+				};
+				// Mirror the backend's "reset trigger after compaction
+				// runs" so the ring shows the new (lower) prompt size
+				// immediately rather than waiting for the next
+				// `token_usage` event to land.
+				if (bucket.tokenUsage) {
+					bucket.tokenUsage = {
+						...bucket.tokenUsage,
+						prompt: event.prompt_tokens_after,
+					};
+				}
 				return;
 			}
 		}

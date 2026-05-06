@@ -8,12 +8,16 @@
 	import CoderMarkdown from './CoderMarkdown.svelte';
 	import CoderThinking from './CoderThinking.svelte';
 	import TerminalTargetIcon from './TerminalTargetIcon.svelte';
+	import ContextRing from './ContextRing.svelte';
 	import ChatBubbleIcon from './icons/ChatBubbleIcon.svelte';
 	import SignOutIcon from './icons/SignOutIcon.svelte';
 	import PlusIcon from './icons/PlusIcon.svelte';
 	import ListIcon from './icons/ListIcon.svelte';
 	import FileIcon from './icons/FileIcon.svelte';
 	import TrashIcon from './icons/TrashIcon.svelte';
+	import CodeIcon from './icons/CodeIcon.svelte';
+	import { ipc } from '../ipc';
+	import { formatError } from '../protocol';
 
 	let scrollEl: HTMLDivElement | undefined = $state();
 	let composer: HTMLTextAreaElement | undefined = $state();
@@ -140,6 +144,28 @@
 		await coder.deleteSession(id);
 	}
 
+	/** Open a session's raw JSONL trace in the editor as a host-direct
+	 *  file (same machinery as Ctrl+O for files outside the workspace).
+	 *  Works for parent sessions and sub-agent ids alike — both live
+	 *  under the active folder's slug on disk. The trace lives on the
+	 *  *host* `XDG_DATA_HOME` even when the project is running in a
+	 *  container, which is exactly what the host-direct file path
+	 *  delivers.
+	 *
+	 *  Empty / never-persisted sessions surface as a flash via the
+	 *  backend's `not found` error; the user can keep working. */
+	async function onOpenTrace(event: MouseEvent | null, id: string): Promise<void> {
+		event?.stopPropagation();
+		let path: string;
+		try {
+			path = await ipc.coder.sessionJsonlPath(id);
+		} catch (err) {
+			workspace.flash(`Could not open trace: ${formatError(err)}`);
+			return;
+		}
+		await workspace.openHostFile(path);
+	}
+
 	function baseName(path: string): string {
 		const trimmed = path.replace(/\/+$/, '');
 		const idx = trimmed.lastIndexOf('/');
@@ -257,6 +283,11 @@
 			{/if}
 		</div>
 		<div class="actions">
+			<!-- Rolling context-window indicator: arc fills as the
+				 next round-trip's prompt grows, ticks into warning /
+				 danger before auto-compaction kicks in, and pulses
+				 while a compaction summary is being written. -->
+			<ContextRing usage={coder.tokenUsage} compaction={coder.compaction} />
 			{#if coder.busy}
 				<button type="button" class="stop" title="Stop turn (Esc)" onclick={() => coder.abort()}>stop</button>
 			{/if}
@@ -319,7 +350,16 @@
 							</button>
 							<button
 								type="button"
-								class="icon session-delete"
+								class="icon session-row-action"
+								title="Open trace in editor"
+								aria-label="Open trace in editor"
+								onclick={(event) => onOpenTrace(event, session.id)}
+							>
+								<CodeIcon />
+							</button>
+							<button
+								type="button"
+								class="icon session-row-action"
 								title="Delete session"
 								aria-label="Delete session"
 								onclick={(event) => onDeleteSession(event, session.id, session.title)}
@@ -350,6 +390,17 @@
 			<span class="session-bar-title" title={coder.activeSession?.title ?? ''}>
 				{coder.activeSession?.title ?? 'New session'}
 			</span>
+			{#if coder.activeSession}
+				<button
+					type="button"
+					class="icon"
+					onclick={() => onOpenTrace(null, coder.activeSession!.id)}
+					title="Open trace in editor"
+					aria-label="Open trace in editor"
+				>
+					<CodeIcon />
+				</button>
+			{/if}
 			<button type="button" class="icon" onclick={onNewSession} title="New session" aria-label="New session">
 				<PlusIcon />
 			</button>
@@ -363,6 +414,9 @@
 			{#each coder.rows as row (row.id)}
 				{@render rowMarkup(row, true)}
 			{/each}
+			{#if coder.compaction}
+				{@render compactionMarkup(coder.compaction)}
+			{/if}
 		</div>
 		<div class="composer">
 			{#if coder.attachments.length > 0}
@@ -443,6 +497,17 @@
 				<span class="subagent-mode" class:research={transcript.mode === 'research'} title="Sub-agent mode">
 					{transcript.mode}
 				</span>
+				{#if subId !== null}
+					<button
+						type="button"
+						class="icon"
+						onclick={() => onOpenTrace(null, subId)}
+						title="Open trace in editor"
+						aria-label="Open trace in editor"
+					>
+						<CodeIcon />
+					</button>
+				{/if}
 			{:else}
 				<span class="session-bar-title">Sub-agent</span>
 				<span></span>
@@ -473,6 +538,35 @@
 	 inline collapsed card; sub-agents themselves can't spawn
 	 sub-sub-agents (depth-1 cap), so the flag is `false` in the
 	 sub-agent view. -->
+{#snippet compactionMarkup(state: import('../coder.svelte').CompactionState)}
+	<!-- Compaction disclosure: a single full-width row at the
+		 bottom of the transcript so it doesn't push past the
+		 user's most recent turn. While the fast-model summary
+		 call is in flight the row shows a "compacting…" pip; on
+		 completion it flips to a `<details>` with the synthetic
+		 summary that the agent now sees in place of the older
+		 middle of the history. -->
+	<div class="row compaction" class:running={state.phase === 'running'}>
+		<div class="row-label">compaction</div>
+		{#if state.phase === 'running'}
+			<div class="bubble">
+				Compacting older turns into a summary
+				{#if state.messagesCompacted > 0}
+					({state.messagesCompacted} messages)
+				{/if}
+				…
+			</div>
+		{:else}
+			<details class="compaction-details">
+				<summary>
+					Compacted {state.messagesCompacted} earlier message{state.messagesCompacted === 1 ? '' : 's'} into a summary
+				</summary>
+				<CoderMarkdown text={state.summary} />
+			</details>
+		{/if}
+	</div>
+{/snippet}
+
 {#snippet rowMarkup(row: CoderRow, withSubagentCards: boolean)}
 	{#if row.kind === 'user'}
 		{@const parsed = parseUserPrompt(row.text)}
@@ -823,12 +917,12 @@
 		font-size: 11px;
 		color: var(--m-fg-subtle);
 	}
-	.session-delete {
+	.session-row-action {
 		opacity: 0;
 		transition: opacity 0.1s;
 	}
-	.session-row:hover .session-delete,
-	.session-row:focus-within .session-delete {
+	.session-row:hover .session-row-action,
+	.session-row:focus-within .session-row-action {
 		opacity: 1;
 	}
 	.empty {
@@ -965,6 +1059,37 @@
 	.row.error .bubble {
 		background: color-mix(in srgb, var(--m-danger) 14%, transparent);
 		color: var(--m-danger);
+	}
+	.row.compaction .bubble {
+		background: var(--m-bg-overlay);
+		color: var(--m-fg-muted);
+		font-style: italic;
+	}
+	.row.compaction.running .bubble {
+		animation: compaction-pulse 1.6s ease-in-out infinite;
+	}
+	@keyframes compaction-pulse {
+		0%,
+		100% {
+			opacity: 1;
+		}
+		50% {
+			opacity: 0.55;
+		}
+	}
+	.compaction-details {
+		font-size: 12px;
+		background: var(--m-bg-overlay);
+		border-radius: 6px;
+		padding: 6px 8px;
+		color: var(--m-fg-muted);
+	}
+	.compaction-details summary {
+		cursor: pointer;
+		color: var(--m-fg-muted);
+	}
+	.compaction-details[open] summary {
+		margin-bottom: 6px;
 	}
 	.row.tool details {
 		font-size: 12px;

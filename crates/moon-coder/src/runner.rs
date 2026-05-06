@@ -32,11 +32,13 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::{Authenticator, DeviceCode, HfIdentity};
-use crate::defaults::{DEFAULT_FAST_MODEL, DEFAULT_LARGE_MODEL, MAX_TURN_ITERATIONS, PHASE_6_0_SYSTEM_PROMPT};
+use crate::defaults::{
+	context_window_for, DEFAULT_FAST_MODEL, DEFAULT_LARGE_MODEL, MAX_TURN_ITERATIONS, PHASE_6_0_SYSTEM_PROMPT,
+};
 use crate::error::CoderError;
-use crate::event::{CoderEvent, CoderEventEnvelope, CoderStatus};
+use crate::event::{CoderEvent, CoderEventEnvelope, CoderStatus, TokenUsageSource};
 use crate::folder_summary::FolderSummaryService;
-use crate::inference::{AssistantResponse, ChatMessage, FunctionCall, InferenceClient, StreamEvent};
+use crate::inference::{AssistantResponse, ChatMessage, FunctionCall, InferenceClient, StreamEvent, TokenUsage};
 use crate::sessions::{
 	self, current_time_ms, new_session_id, session_title_from_prompt, sessions_dir, LoadedSession, SessionHeader,
 	SessionRecord, SessionSummary, SESSION_SCHEMA_VERSION,
@@ -198,6 +200,12 @@ struct Session {
 	/// because the model failed). Avoids re-renaming on every
 	/// subsequent turn.
 	auto_rename_pending: bool,
+	/// Last provider-supplied (or estimated) token usage from
+	/// the previous LLM round-trip. Carries across user turns so
+	/// the next turn's first iteration can decide whether to
+	/// compact before sending. `None` until the very first
+	/// response lands.
+	last_usage: Option<TokenUsage>,
 }
 
 impl Session {
@@ -224,6 +232,7 @@ impl Session {
 			}],
 			persisted_records: 0,
 			auto_rename_pending: false,
+			last_usage: None,
 		}
 	}
 
@@ -424,6 +433,39 @@ impl CoderHandle {
 		sessions::list_sessions(&dir).await
 	}
 
+	/// Resolve the on-disk JSONL path for a session id under the
+	/// active workspace folder. Used by the panel's "open trace"
+	/// affordance: the frontend takes the returned path, hands it
+	/// to `fs_read_file_host`, and the editor opens the trace as
+	/// a host-direct file (so it works the same whether the
+	/// project is local or running in a container — the JSONL
+	/// always lives on the host's `XDG_DATA_HOME`, never inside
+	/// the container).
+	///
+	/// `id` can be either a top-level session id or a sub-agent
+	/// id; both live under the parent folder's slug, so the
+	/// active folder is enough to resolve them. Errors with
+	/// `NotFound` if the file isn't on disk yet (empty sessions
+	/// aren't persisted until the first `send`); the panel
+	/// surfaces that as a flash so the user knows there's nothing
+	/// to open.
+	pub async fn session_jsonl_path(&self, id: String) -> Result<Utf8PathBuf, CoderError> {
+		sessions::validate_session_id(&id)?;
+		let Some(folder) = self.state.workspaces.active_folder().await else {
+			return Err(CoderError::NoActiveFolder);
+		};
+		let folder_root = Utf8PathBuf::from(folder.folder.path.clone());
+		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_root);
+		let path = sessions::session_path(&dir, &id);
+		if !tokio::fs::try_exists(path.as_std_path())
+			.await
+			.map_err(|err| CoderError::Internal(format!("could not stat session jsonl: {err}")))?
+		{
+			return Err(CoderError::Internal(format!("session jsonl not found: {path}")));
+		}
+		Ok(path)
+	}
+
 	/// Discard the active folder's in-memory session and start a
 	/// blank one. Doesn't touch disk — empty sessions never get a
 	/// file in the first place. Returns the new session's metadata
@@ -512,6 +554,7 @@ impl CoderHandle {
 			messages,
 			persisted_records: records.len() as u32,
 			auto_rename_pending: false,
+			last_usage: None,
 		};
 		*fs.session.lock().await = session;
 
@@ -604,7 +647,15 @@ impl CoderHandle {
 				session.auto_rename_pending = true;
 			}
 			session.header.updated_at_ms = current_time_ms();
+			// Capture-and-clear: snapshot whether we owe a rename,
+			// then immediately clear the flag so a second `send`
+			// running before the spawned rename task gets to flip
+			// the flag itself can't double-spawn. The actual call
+			// is fired below regardless of how the turn ends —
+			// even an Esc'd or errored first turn earns a title
+			// from whatever made it into the transcript.
 			let auto_rename = session.auto_rename_pending;
+			session.auto_rename_pending = false;
 			let summary = if needs_loaded_event {
 				Some(session.summary())
 			} else {
@@ -662,22 +713,28 @@ impl CoderHandle {
 		tokio::spawn(async move {
 			let result = run_turn(&state, &fs_for_turn, &folder_for_turn, &sink_for_turn, cancel_outer).await;
 			fs_for_turn.turn.lock().await.cancel = None;
-			match result {
-				Ok(()) => {
-					sink_for_turn.send(CoderEvent::TurnComplete);
-					if auto_rename_after {
-						spawn_auto_rename(state.clone(), fs_for_turn.clone(), sink_for_turn);
-					}
-				}
-				Err(CoderError::Aborted) => {
-					sink_for_turn.send(CoderEvent::Aborted);
-				}
+			match &result {
+				Ok(()) => sink_for_turn.send(CoderEvent::TurnComplete),
+				Err(CoderError::Aborted) => sink_for_turn.send(CoderEvent::Aborted),
 				Err(err) => {
 					tracing::warn!(error = %err, "coder turn failed");
 					sink_for_turn.send(CoderEvent::Error {
 						message: err.to_string(),
 					});
 				}
+			}
+			// Auto-rename fires regardless of how the turn ended.
+			// A successful turn gives the fast model the assistant's
+			// final answer to summarise into a title; an Esc'd or
+			// errored turn falls back to whatever bytes made it
+			// into the transcript (the user prompt at minimum,
+			// possibly some assistant content + tool results). The
+			// real-world failure mode this fixes: long tool-heavy
+			// turns the user often Esc's mid-flight — under the
+			// previous "Ok(())-only" rule those sessions kept the
+			// truncated-prompt fallback title forever.
+			if auto_rename_after {
+				spawn_auto_rename(state.clone(), fs_for_turn.clone(), sink_for_turn);
 			}
 		});
 
@@ -749,7 +806,31 @@ async fn run_turn(
 		if cancel.is_cancelled() {
 			return Err(CoderError::Aborted);
 		}
-		let messages = fs.session.lock().await.messages.clone();
+
+		// Token-aware compaction before each round-trip. Reads the
+		// session's last-seen usage; if it crossed the threshold,
+		// runs a fast-model summary and rewrites `messages` in
+		// place. The on-disk JSONL transcript is left untouched —
+		// only the in-memory prompt shrinks.
+		let last_usage = fs.session.lock().await.last_usage;
+		let mut messages = fs.session.lock().await.messages.clone();
+		let did_compact = crate::compaction::compact_if_needed(
+			&state.inference,
+			sink,
+			None,
+			DEFAULT_LARGE_MODEL,
+			last_usage.as_ref(),
+			&mut messages,
+			&cancel,
+		)
+		.await;
+		if did_compact {
+			let mut session = fs.session.lock().await;
+			session.messages = messages.clone();
+			// Reset the trigger so we don't re-compact next iteration
+			// before the next response's usage lands.
+			session.last_usage = None;
+		}
 
 		// One stable id per assistant message, shared between the
 		// `start`, every content / thinking `delta`, and the final
@@ -806,8 +887,32 @@ async fn run_turn(
 			)
 			.await?;
 
-		fs.session.lock().await.messages.push(response_to_message(&response));
+		{
+			let mut session = fs.session.lock().await;
+			session.messages.push(response_to_message(&response));
+			// Stash whatever usage we have for the next iteration's
+			// compaction decision. Provider-supplied is exact; we
+			// synthesise a `TokenUsage` from the bytes/4 estimate
+			// when missing so the threshold check still has a
+			// number to compare against.
+			session.last_usage = Some(response.usage.unwrap_or_else(|| {
+				let prompt = estimate_prompt_tokens(&messages);
+				let completion = estimate_completion_tokens(&response);
+				TokenUsage {
+					prompt_tokens: prompt,
+					completion_tokens: completion,
+					total_tokens: prompt + completion,
+				}
+			}));
+		}
 		persist_assistant_record(fs, &response).await;
+
+		// Per-iteration token usage report. Drives the in-panel
+		// usage ring + the auto-compaction trigger. Provider-supplied
+		// numbers are exact; falls back to a bytes/4 estimate when
+		// the provider didn't emit a streaming usage chunk so the
+		// ring still moves on every turn.
+		emit_token_usage(sink, DEFAULT_LARGE_MODEL, &messages, &response);
 
 		// Always emit `End` *if* we ever started a bubble; otherwise
 		// the frontend would be stuck with an empty placeholder.
@@ -840,16 +945,141 @@ async fn run_turn(
 
 		dispatch_tool_calls(state, fs, sink, &cx, &cancel, &response.tool_calls).await?;
 	}
-	sink.send(CoderEvent::Error {
-		message: format!(
-			"agent loop exceeded {} iterations without finishing",
-			MAX_TURN_ITERATIONS
-		),
+
+	// Iteration cap reached. Rather than just bailing with an
+	// error banner — which leaves the user staring at a wall of
+	// tool calls and no actual answer — we ask the model for one
+	// final, tools-disabled wrap-up turn. It sees the full history
+	// it just produced, the tool budget exhausted note, and is
+	// instructed to write its best answer with what it has.
+	wrap_up_final_answer(state, fs, sink, &cancel, &tool_defs).await
+}
+
+/// Final tools-disabled round-trip after the iteration cap is hit.
+/// Appends a sentinel user message asking the model to finish and
+/// streams the response with `tools = []` so the model literally
+/// cannot call another tool. The wrap-up message is persisted in
+/// the JSONL transcript like any other user turn — it's part of
+/// the conversation now, not a hidden side-channel; rereading the
+/// session later makes it obvious why the assistant suddenly
+/// stopped using tools.
+///
+/// The sentinel is also visible in the panel as a regular user
+/// row so the human running the session sees what happened.
+/// `tool_defs` is logged but unused on the wire — kept in scope so
+/// callers can grep for "the tools that were available at cap time".
+async fn wrap_up_final_answer(
+	state: &Arc<CoderState>,
+	fs: &Arc<FolderSession>,
+	sink: &FolderEventSink,
+	cancel: &CancellationToken,
+	tool_defs: &[crate::inference::ToolDefinition],
+) -> Result<(), CoderError> {
+	tracing::info!(
+		iterations = MAX_TURN_ITERATIONS,
+		tools_at_cap = tool_defs.len(),
+		"iteration cap reached; asking the model for a final tools-disabled wrap-up",
+	);
+
+	let sentinel_id = new_message_id();
+	let sentinel_text = format!(
+		"[Tool-call budget exhausted: you've used all {MAX_TURN_ITERATIONS} tool-call iterations available for this turn. \
+Do not call any more tools. Write a final response now using only what you've already gathered: summarise what was \
+done, what's still unfinished, and any uncertainty. If the user needs to take a follow-up action, say so explicitly.]"
+	);
+	{
+		let mut session = fs.session.lock().await;
+		session.messages.push(ChatMessage::User {
+			content: sentinel_text.clone(),
+		});
+	}
+	{
+		// Best-effort persist of the sentinel into the JSONL — same
+		// shape as a real user turn so re-loading the session shows
+		// it inline. Lives entirely inside the lock-then-drop dance
+		// the regular user-message path uses, just inlined since
+		// we don't need a separate helper for the one-off case.
+		let session = fs.session.lock().await;
+		let header = session.header.clone();
+		let dir = session.session_dir.clone();
+		drop(session);
+		if let Some(dir) = dir {
+			if let Err(err) = sessions::append_record(
+				&dir,
+				&header,
+				&SessionRecord::User {
+					text: sentinel_text.clone(),
+				},
+			)
+			.await
+			{
+				tracing::warn!(error = %err, "failed to persist tool-cap sentinel user message");
+			} else {
+				let mut session = fs.session.lock().await;
+				session.persisted_records = session.persisted_records.saturating_add(1);
+			}
+		}
+	}
+	sink.send(CoderEvent::UserMessage {
+		id: sentinel_id,
+		text: sentinel_text,
 	});
-	Err(CoderError::Internal(format!(
-		"loop iteration cap reached ({})",
-		MAX_TURN_ITERATIONS
-	)))
+
+	let messages = fs.session.lock().await.messages.clone();
+	let assistant_id = new_message_id();
+	let id_for_cb = assistant_id.clone();
+	let sink_for_cb = sink.clone();
+	let started = std::sync::atomic::AtomicBool::new(false);
+	let thinking_emitted = std::sync::atomic::AtomicBool::new(false);
+	let response = state
+		.inference
+		.chat_completion_stream(DEFAULT_LARGE_MODEL, &messages, &[], cancel, |event| match event {
+			StreamEvent::ContentDelta { delta } => {
+				if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+					sink_for_cb.send(CoderEvent::AssistantMessageStart { id: id_for_cb.clone() });
+				}
+				sink_for_cb.send(CoderEvent::AssistantMessageDelta {
+					id: id_for_cb.clone(),
+					delta: delta.to_string(),
+				});
+			}
+			StreamEvent::ThinkingDelta { delta } => {
+				if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+					sink_for_cb.send(CoderEvent::AssistantMessageStart { id: id_for_cb.clone() });
+				}
+				thinking_emitted.store(true, std::sync::atomic::Ordering::Relaxed);
+				sink_for_cb.send(CoderEvent::AssistantThinkingDelta {
+					id: id_for_cb.clone(),
+					delta: delta.to_string(),
+				});
+			}
+			StreamEvent::ToolCallDelta { .. } => {
+				// Tools were disabled in the request; if the model
+				// still emits a tool-call delta we silently drop it.
+				// The dispatcher won't run anything since we won't
+				// loop again.
+			}
+		})
+		.await?;
+
+	if started.into_inner() {
+		let canonical_thinking = if thinking_emitted.into_inner() {
+			response.thinking.clone()
+		} else {
+			None
+		};
+		sink.send(CoderEvent::AssistantMessageEnd {
+			id: assistant_id,
+			text: response.content.clone().unwrap_or_default(),
+			thinking: canonical_thinking,
+		});
+	}
+
+	fs.session.lock().await.messages.push(response_to_message(&response));
+	persist_assistant_record(fs, &response).await;
+	emit_token_usage(sink, DEFAULT_LARGE_MODEL, &messages, &response);
+
+	Ok(())
 }
 
 /// Limit on concurrent sub-agents per parent batch. A
@@ -1019,7 +1249,6 @@ async fn handle_spawn_subagent(
 		"tokens_used_estimate": report.tokens_used_estimate,
 		"mode": match report.mode { CoderMode::Research => "research", CoderMode::Coder => "coder" },
 		"iterations_used": report.iterations_used,
-		"byte_budget_exceeded": report.byte_budget_exceeded,
 	}))
 }
 
@@ -1233,10 +1462,12 @@ fn spawn_auto_rename(state: Arc<CoderState>, fs: Arc<FolderSession>, sink: Folde
 	tokio::spawn(async move {
 		// Snapshot the chat history without holding the session
 		// lock across the LLM call — turns / aborts must be able
-		// to grab it freely while we wait on the network.
+		// to grab it freely while we wait on the network. The
+		// `auto_rename_pending` flag was already cleared at the
+		// caller's send-time critical section so a second send
+		// can't double-spawn us.
 		let (dir, header_snapshot, transcript) = {
-			let mut session = fs.session.lock().await;
-			session.auto_rename_pending = false;
+			let session = fs.session.lock().await;
 			let Some(dir) = session.session_dir.clone() else {
 				return;
 			};
@@ -1245,6 +1476,7 @@ fn spawn_auto_rename(state: Arc<CoderState>, fs: Arc<FolderSession>, sink: Folde
 		if transcript.is_empty() {
 			return;
 		}
+		tracing::debug!(session = %header_snapshot.id, "auto-rename: requesting title from fast model");
 		let messages = vec![
 			ChatMessage::System {
 				content: AUTO_RENAME_SYSTEM_PROMPT.to_string(),
@@ -1435,6 +1667,83 @@ fn response_to_message(response: &AssistantResponse) -> ChatMessage {
 		content: response.content.clone(),
 		tool_calls: response.tool_calls.clone(),
 	}
+}
+
+/// Emit a [`CoderEvent::TokenUsage`] report for one LLM round-trip.
+///
+/// Provider-supplied numbers (`response.usage`) are exact and tagged
+/// `Provider`; when missing we approximate from message bytes (the
+/// ratio of ~4 bytes per BPE token is a good rule of thumb across
+/// the Qwen / Llama / DeepSeek families that the HF router serves)
+/// and tag `Estimate` so the UI can mark the ring with a `≈`.
+///
+/// `messages` is the *prompt* the model just saw — i.e. the full
+/// history fed in for this round-trip, **not** including the
+/// assistant response. Estimating the prompt token count from
+/// these bytes mirrors what the provider would have reported.
+pub(crate) fn emit_token_usage(
+	sink: &FolderEventSink,
+	model_slug: &str,
+	messages: &[ChatMessage],
+	response: &AssistantResponse,
+) {
+	let context_window = context_window_for(model_slug);
+	let (prompt_tokens, completion_tokens, total_tokens, source) = match response.usage {
+		Some(u) => (
+			u.prompt_tokens,
+			u.completion_tokens,
+			u.total_tokens,
+			TokenUsageSource::Provider,
+		),
+		None => {
+			let prompt = estimate_prompt_tokens(messages);
+			let completion = estimate_completion_tokens(response);
+			(prompt, completion, prompt + completion, TokenUsageSource::Estimate)
+		}
+	};
+	sink.send(CoderEvent::TokenUsage {
+		prompt_tokens,
+		completion_tokens,
+		total_tokens,
+		context_window,
+		source,
+	});
+}
+
+/// Rough byte-count of every chat message — covers system / user /
+/// assistant / tool. Includes `tool_calls` argument strings since
+/// those land in the prompt verbatim and can be substantial when
+/// the model emits long structured arguments.
+pub(crate) fn estimate_prompt_tokens(messages: &[ChatMessage]) -> u32 {
+	let mut bytes: usize = 0;
+	for msg in messages {
+		match msg {
+			ChatMessage::System { content } | ChatMessage::User { content } => bytes += content.len(),
+			ChatMessage::Assistant { content, tool_calls } => {
+				bytes += content.as_deref().map(str::len).unwrap_or(0);
+				for call in tool_calls {
+					bytes += call.function.name.len();
+					bytes += call.function.arguments.len();
+				}
+			}
+			ChatMessage::Tool { tool_call_id, content } => {
+				bytes += tool_call_id.len();
+				bytes += content.len();
+			}
+		}
+	}
+	(bytes / 4) as u32
+}
+
+fn estimate_completion_tokens(response: &AssistantResponse) -> u32 {
+	let mut bytes: usize = 0;
+	bytes += response.content.as_deref().map(str::len).unwrap_or(0);
+	bytes += response.thinking.as_deref().map(str::len).unwrap_or(0);
+	for call in &response.tool_calls {
+		bytes += call.function.name.len();
+		bytes += call.function.arguments.len();
+	}
+	(bytes / 4) as u32
 }
 
 /// `function.arguments` is a JSON-encoded string per OpenAI's wire
