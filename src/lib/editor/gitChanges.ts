@@ -50,6 +50,33 @@ export const headTextFacet = Facet.define<string | null, string | null>({
 	combine: (values) => values.findLast((v) => v !== null) ?? null,
 });
 
+/**
+ * Optional alternate parent for the overview-ruler overlay. The
+ * default attaches to the editor frame (`view.dom` = `.cm-editor`),
+ * which is the right thing in a regular Editor — the editor frame
+ * is fixed to the viewport because `.cm-scroller` scrolls inside.
+ *
+ * In a `@codemirror/merge` `MergeView`, though, the package sets
+ * `.cm-scroller { height: auto !important; overflow-y: visible
+ * !important }` and lets the OUTER `.cm-mergeView` scroll. That
+ * means `.cm-editor`'s height is the doc height, not the viewport
+ * height, so `top:0; bottom:0; right:0` against it lays the strip
+ * **inside** the scrolling content and the markers scroll with the
+ * code. Wrong layer.
+ *
+ * The DiffView fills this facet with a closure that finds the
+ * outer `.cm-mergeView`, so the overlay lands on the merge view's
+ * actual scrollbar gutter and stays pinned to the visible
+ * viewport. `null` (default) keeps the editor-frame attachment
+ * for the regular editor case.
+ */
+export const overviewMountFacet = Facet.define<
+	((view: EditorView) => HTMLElement | null) | null,
+	((view: EditorView) => HTMLElement | null) | null
+>({
+	combine: (values) => values.findLast((v) => v !== null) ?? null,
+});
+
 export type GitLineChanges = {
 	/** 1-based line numbers for pure additions (not replacing a removal). */
 	added: Set<number>;
@@ -235,11 +262,17 @@ class GitOverviewPlugin implements PluginValue {
 	constructor(private readonly view: EditorView) {
 		this.overlay = document.createElement('div');
 		this.overlay.className = 'cm-git-overview';
-		// Mount under `.cm-editor` rather than `.cm-scroller` so the
-		// strip stays anchored to the editor frame regardless of
-		// scroll position — we want a global overview, not a
-		// per-viewport indicator.
-		view.dom.appendChild(this.overlay);
+		// Default mount is the editor frame (`view.dom = .cm-editor`),
+		// which sits at the viewport height in a regular Editor —
+		// `.cm-scroller` scrolls inside `.cm-editor`, so the overlay
+		// stays pinned to the viewport. `overviewMountFacet` lets a
+		// host (the diff view) substitute a different parent when the
+		// editor frame's height isn't the viewport height; without
+		// that escape hatch the strip would scroll with the doc and
+		// land in the wrong layer.
+		const overrideMount = view.state.facet(overviewMountFacet);
+		const mount = overrideMount?.(view) ?? view.dom;
+		mount.appendChild(this.overlay);
 		this.onClick = (event) => this.handleClick(event);
 		this.overlay.addEventListener('click', this.onClick);
 		this.render();

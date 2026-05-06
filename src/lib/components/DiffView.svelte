@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { Compartment, EditorState, Prec, type Extension } from '@codemirror/state';
+	import { Compartment, EditorSelection, EditorState, Prec, type Extension } from '@codemirror/state';
 	import { EditorView, highlightActiveLine, highlightActiveLineGutter, keymap, lineNumbers } from '@codemirror/view';
 	import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 	import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
@@ -12,6 +12,7 @@
 	import { highlightTabs } from '../editor/highlightTabs';
 	import { languageFor } from '../editor/language';
 	import { moonEditorTheme } from '../editor/theme';
+	import { gitChangesExtension, headTextFacet, overviewMountFacet } from '../editor/gitChanges';
 	import {
 		applyDiagnostics,
 		filePathFacet,
@@ -39,6 +40,12 @@
 	const themeB = new Compartment();
 	const ecA = new Compartment();
 	const ecB = new Compartment();
+	// Right-pane HEAD facet for the change-bar gutter and the
+	// overview-ruler marks. Keeps the diff view's right side
+	// visually consistent with the regular editor — same gutter
+	// glyphs, same clickable scrollbar strip — without rebuilding
+	// the editor when HEAD shifts under us.
+	const headB = new Compartment();
 
 	// In single-tab model, `file.path` is stable for the lifetime of
 	// this DiffView instance — the EditorPane swaps Editor ↔ DiffView
@@ -177,6 +184,36 @@
 					}),
 				];
 
+		// Per-line change gutter + clickable overview-ruler. Same
+		// extension the regular editor uses, fed by the same
+		// `headByPath` cache, so diff and editor share one
+		// vocabulary for "where are the changes". `onGutterClick`
+		// is omitted: clicking a marker while already in diff mode
+		// would no-op anyway. Deleted buffers skip the gutter
+		// because their right pane is empty.
+		//
+		// `overviewMountFacet` re-parents the strip from the inner
+		// `.cm-editor` to **`.diff-host`** (a sibling of, not a
+		// descendant of, `.cm-mergeView`). Two layout reasons stack:
+		//
+		//   1. The merge package forces `.cm-scroller` to
+		//      `height: auto / overflow-y: visible` and scrolls on
+		//      `.cm-mergeView`. Inside `.cm-editor` the overlay
+		//      would render at doc height.
+		//   2. `position: absolute` children of an `overflow: auto`
+		//      ancestor still belong to the scrolling layer — they
+		//      scroll with the content even though they're absolutely
+		//      positioned. So just re-parenting to `.cm-mergeView`
+		//      isn't enough either.
+		//
+		// `.diff-host` doesn't scroll and is the positioned ancestor;
+		// `top:0; right:0; bottom:0` pins the strip to its right
+		// edge, which lines up with `.cm-mergeView`'s scrollbar
+		// because `.cm-mergeView` is `flex: 1` of `.diff-host`.
+		const gitChangeExtensions: Extension[] = file.isDeleted
+			? []
+			: [gitChangesExtension(), headB.of(headTextFacet.of(head)), overviewMountFacet.of(() => host)];
+
 		const rightExtensions: Extension[] = [
 			lineNumbers(),
 			highlightActiveLine(),
@@ -187,6 +224,7 @@
 			history(),
 			highlightSelectionMatches(),
 			highlightTabs(),
+			...gitChangeExtensions,
 			...lspExtensions,
 			keymap.of([
 				// Alt+Left / Alt+Right ride the global handler in
@@ -240,9 +278,42 @@
 			parent: host,
 			gutter: true,
 			highlightChanges: true,
-			collapseUnchanged: { margin: 3, minSize: 4 },
+			// Show the full file. Earlier we collapsed unchanged
+			// regions behind a `… N unchanged lines` placeholder,
+			// but with the change-bar gutter and the right-edge
+			// overview-ruler in place the user already has a
+			// "where are the changes" affordance — the placeholder
+			// just got in the way of `Ctrl+F`, scrolling, and
+			// reading code in context. Auto-scroll below jumps the
+			// editor to the first chunk so opening a 3000-line
+			// file with one edit at line 2500 still lands the
+			// user at the change.
 			revertControls: 'a-to-b',
 		});
+
+		const chunks = merge.chunks;
+		if (chunks.length > 0 && !file.isDeleted) {
+			const first = chunks[0];
+			if (first) {
+				const docLen = merge.b.state.doc.length;
+				const pos = Math.min(first.fromB, docLen);
+				// Defer the scroll into the next animation frame —
+				// dispatching synchronously inside the MergeView
+				// constructor's tail races with the library's own
+				// initial layout and the scroll target lands at 0
+				// instead of the chunk. One rAF after build is
+				// enough for the inner `.cm-scroller` to settle.
+				requestAnimationFrame(() => {
+					if (token !== buildToken || !merge) {
+						return;
+					}
+					merge.b.dispatch({
+						selection: EditorSelection.cursor(pos),
+						effects: EditorView.scrollIntoView(pos, { y: 'center' }),
+					});
+				});
+			}
+		}
 	}
 
 	// External text edits to the right-side buffer (e.g. save-time
@@ -283,6 +354,14 @@
 		m.a.dispatch({
 			changes: { from: 0, to: m.a.state.doc.length, insert: head },
 		});
+		// Keep the right pane's `headTextFacet` aligned with the
+		// left doc so the change-bar gutter and overview-ruler
+		// repaint instead of pointing at stale HEAD content.
+		// Skipped for deleted buffers — they don't carry the
+		// extension.
+		if (!file.isDeleted) {
+			m.b.dispatch({ effects: headB.reconfigure(headTextFacet.of(head)) });
+		}
 	});
 
 	$effect(() => {
@@ -389,6 +468,10 @@
 		min-height: 0;
 		display: flex;
 		overflow: hidden;
+		/* Positioning context for the re-parented git-overview
+		   strip. The strip lives here as a sibling of `.cm-mergeView`
+		   so it doesn't ride the merge view's scroll layer. */
+		position: relative;
 	}
 	/* `@codemirror/merge` ships its own layout: the outer `.cm-mergeView`
 	 * is `overflow-y: auto`, the two `.cm-mergeViewEditor` columns are

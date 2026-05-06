@@ -515,7 +515,12 @@ button:focus-visible {
    to that line. Colour families match the per-line gutter so the
    eye reads "green = add, blue = modify, red = delete" in both
    places. */
-.cm-editor .cm-git-overview {
+/* The overlay is normally a child of `.cm-editor` (regular editor
+   case), but the diff view re-parents it to `.cm-mergeView` so the
+   strip lands on the merge view's actual scrollbar gutter — the
+   inner editor frame is doc-height there. The class is unique to
+   this widget, so plain `.cm-git-overview` is unambiguous. */
+.cm-git-overview {
 	position: absolute;
 	top: 0;
 	right: 0;
