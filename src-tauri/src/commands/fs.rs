@@ -198,6 +198,17 @@ pub async fn fs_git_push(state: State<'_, AppState>) -> Result<(), MoonError> {
 	entry.host.git_push().await
 }
 
+/// `git push -u origin HEAD` — first push for a branch that
+/// doesn't yet have an upstream configured. The SCM panel calls
+/// this instead of `fs_git_push` when `GitBranchInfo.has_upstream`
+/// is `false`. Errors propagate git's stderr (no `origin` remote,
+/// auth, network).
+#[tauri::command]
+pub async fn fs_git_publish_branch(state: State<'_, AppState>) -> Result<(), MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.git_publish_branch().await
+}
+
 /// Pull from the active folder's configured upstream using the
 /// user's `pull.rebase` preference. Failures (conflicts, dirty
 /// tree, no upstream) propagate git's stderr.

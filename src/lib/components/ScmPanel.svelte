@@ -22,7 +22,10 @@
 	// retry.
 
 	import { tick } from 'svelte';
+	import { openUrl } from '@tauri-apps/plugin-opener';
 	import { workspace } from '../state.svelte';
+	import PullRequestIcon from './icons/PullRequestIcon.svelte';
+	import RefreshIcon from './icons/RefreshIcon.svelte';
 	import RevertIcon from './icons/RevertIcon.svelte';
 
 	const branch = $derived(workspace.gitBranch);
@@ -51,23 +54,68 @@
 	// buttons just need "not currently busy".
 	const canCommit = $derived(!busy && (amend || message.trim().length > 0));
 
-	// Smart sync button label. Falls back to `null` when there's
-	// nothing to do (no commits to push or pull) — the button is
-	// hidden in that case. Order is "pull then push", echoing
-	// VSCode's Source Control sync semantics.
-	const syncLabel = $derived.by(() => {
+	// "Publish branch" lives in the same slot as the sync button
+	// and takes priority: when a real branch is checked out but
+	// has no upstream configured (freshly-created locally, never
+	// pushed), `git push` would fail with "no upstream branch" —
+	// the user actually wants `git push -u origin <branch>` here.
+	// Detached HEAD (`branch.name === null`) is excluded; there's
+	// nothing to publish.
+	const needsPublish = $derived(branch.name !== null && !branch.hasUpstream);
+
+	// "Open PR" button visibility. We surface the affordance only
+	// when:
+	//   - the backend produced a PR URL (recognised remote host
+	//     and a non-detached branch, so `prUrl !== null`),
+	//   - the branch has been published (no point asking GitHub to
+	//     PR an upstream that doesn't exist),
+	//   - the branch isn't main / master (PR'ing the default branch
+	//     into itself is never the intent — and the extra click on
+	//     the branch you most often have checked out would be a
+	//     papercut).
+	// Hardcoding the default-branch names is the "hardcode first,
+	// configure later" rule from AGENTS.md; if a team uses a
+	// different default we'll add a config knob then.
+	const prUrl = $derived.by(() => {
+		if (branch.prUrl === null || !branch.hasUpstream) {
+			return null;
+		}
+		if (branch.name === 'main' || branch.name === 'master') {
+			return null;
+		}
+		return branch.prUrl;
+	});
+
+	function openPr() {
+		if (prUrl === null) {
+			return;
+		}
+		void openUrl(prUrl);
+	}
+
+	// `true` iff the branch has commits to pull or push — the sync
+	// button is hidden otherwise. Counts render as separate spans
+	// inside the button so each direction can carry its own glyph
+	// (`N↓` for behind, `M↑` for ahead). Diverged branches show
+	// both, matching Cursor's / VSCode's "Sync Changes" pattern.
+	const canSync = $derived(!needsPublish && (branch.ahead > 0 || branch.behind > 0));
+
+	// Tooltip detail for the sync button. Plain-text fallback for
+	// the (Push / Pull / Sync) labels that we used to bake into
+	// the button text.
+	const syncTitle = $derived.by(() => {
 		const a = branch.ahead;
 		const b = branch.behind;
 		if (a > 0 && b > 0) {
-			return `Sync changes  ↓${b}  ↑${a}`;
+			return `Pull ${b} and push ${a} commit${a === 1 && b === 1 ? '' : 's'}`;
 		}
 		if (a > 0) {
-			return `Push ${a} commit${a === 1 ? '' : 's'}  ↑`;
+			return `Push ${a} commit${a === 1 ? '' : 's'} to upstream`;
 		}
 		if (b > 0) {
-			return `Pull ${b} commit${b === 1 ? '' : 's'}  ↓`;
+			return `Pull ${b} commit${b === 1 ? '' : 's'} from upstream`;
 		}
-		return null;
+		return '';
 	});
 
 	async function commit() {
@@ -96,6 +144,18 @@
 	 * a non-fast-forward push attempt on top of an unresolved
 	 * merge / conflict / dirty-tree situation.
 	 */
+	async function publish() {
+		if (busy) {
+			return;
+		}
+		busy = true;
+		try {
+			await workspace.publishBranch();
+		} finally {
+			busy = false;
+		}
+	}
+
 	async function sync() {
 		if (busy) {
 			return;
@@ -218,6 +278,17 @@
 						<RevertIcon />
 					</button>
 				{/if}
+				{#if prUrl !== null}
+					<button
+						type="button"
+						class="icon-btn"
+						title={`Open pull request on GitHub (${prUrl})`}
+						aria-label="Open pull request on GitHub"
+						onclick={openPr}
+					>
+						<PullRequestIcon />
+					</button>
+				{/if}
 				{#if changeCount > 0 || workspace.scmFilterOn}
 					<button
 						type="button"
@@ -263,9 +334,32 @@
 			<span aria-hidden="true">✎</span>
 		</button>
 	</div>
-	{#if syncLabel !== null}
-		<button type="button" class="sync-btn" disabled={busy} onclick={sync}>
-			{syncLabel}
+	{#if needsPublish}
+		<button
+			type="button"
+			class="sync-btn"
+			title={`Push the local branch and set its upstream (git push -u origin ${branch.name ?? 'HEAD'})`}
+			disabled={busy}
+			onclick={publish}
+		>
+			<RefreshIcon size={12} />
+			<span class="sync-btn-label">Publish Branch</span>
+			<span class="sync-btn-arrow" aria-hidden="true">↑</span>
+		</button>
+	{:else if canSync}
+		<button type="button" class="sync-btn" title={syncTitle} disabled={busy} onclick={sync}>
+			<RefreshIcon size={12} />
+			<span class="sync-btn-label">Sync Changes</span>
+			{#if branch.behind > 0}
+				<span class="sync-btn-count">
+					{branch.behind}<span class="sync-btn-arrow" aria-hidden="true">↓</span>
+				</span>
+			{/if}
+			{#if branch.ahead > 0}
+				<span class="sync-btn-count">
+					{branch.ahead}<span class="sync-btn-arrow" aria-hidden="true">↑</span>
+				</span>
+			{/if}
 		</button>
 	{/if}
 </section>
@@ -494,10 +588,14 @@
 	   / "Pull N commits"). */
 	.sync-btn {
 		appearance: none;
-		display: block;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 6px;
 		width: 100%;
 		min-height: 26px;
-		padding: 4px 8px;
+		margin-top: 2px;
+		padding: 4px 10px;
 		border: 1px solid var(--m-accent);
 		border-radius: 4px;
 		background: var(--m-accent);
@@ -508,6 +606,21 @@
 		line-height: 1.2;
 		cursor: pointer;
 		font-variant-numeric: tabular-nums;
+	}
+	.sync-btn-label {
+		flex-shrink: 0;
+	}
+	/* Per-direction `N↓` / `M↑` chip. The number sits flush against
+	   the arrow (no whitespace) so they read as a single token; the
+	   gap on the parent flex spaces neighbouring chips apart. */
+	.sync-btn-count {
+		display: inline-flex;
+		align-items: baseline;
+		gap: 1px;
+	}
+	.sync-btn-arrow {
+		font-weight: 700;
+		opacity: 0.9;
 	}
 	.sync-btn:hover:not(:disabled) {
 		filter: brightness(1.1);

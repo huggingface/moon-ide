@@ -155,10 +155,28 @@ export type GitLineBlame = {
 export type GitBranchInfo = {
 	name: string | null;
 	headShortSha: string | null;
+	/**
+	 * Whether the current branch has a configured upstream. `false`
+	 * for a freshly-created local branch never pushed, detached
+	 * HEAD, non-repo folders, and folders without git available.
+	 * Lets the SCM panel pick between the sync button (upstream
+	 * exists) and a "Publish branch" affordance (no upstream yet).
+	 */
+	hasUpstream: boolean;
 	/** Commits the local branch has that upstream doesn't (push count). 0 when no upstream / no HEAD. */
 	ahead: number;
 	/** Commits upstream has that the local branch doesn't (pull count). 0 when no upstream / no HEAD. */
 	behind: number;
+	/**
+	 * Pre-built URL for opening a PR against the repo's primary
+	 * remote (e.g. `https://github.com/owner/repo/pull/new/<branch>`).
+	 * `null` when the remote isn't a recognised host (currently
+	 * only `github.com` is supported), HEAD is detached, or the
+	 * folder isn't a git repo. The SCM panel still gates the
+	 * "Open PR" button on UI policy (non-main / non-master,
+	 * `hasUpstream`).
+	 */
+	prUrl: string | null;
 };
 
 /**

@@ -116,6 +116,16 @@ pub struct GitBranchInfo {
 	/// the repo has no commits yet (a fresh `git init`), HEAD is
 	/// unreadable, or the folder isn't a git repo.
 	pub head_short_sha: Option<String>,
+	/// Whether the current branch has a configured upstream
+	/// (`branch.<name>.remote` + `branch.<name>.merge`). `false`
+	/// when the branch was just created locally and never pushed,
+	/// when HEAD is detached, when the folder isn't a git repo,
+	/// and when the branch's upstream is configured but currently
+	/// unreachable. Distinguishes "in sync with upstream" (push +
+	/// pull are no-ops, `ahead == behind == 0`, `has_upstream ==
+	/// true`) from "no upstream yet" (the SCM panel renders a
+	/// "Publish branch" affordance instead of the sync button).
+	pub has_upstream: bool,
 	/// Number of commits the local branch has that its configured
 	/// upstream doesn't — commits that would be sent on the next
 	/// `git push`. `0` when there's no upstream configured, no
@@ -125,6 +135,15 @@ pub struct GitBranchInfo {
 	/// doesn't — commits that would be merged in on the next
 	/// `git pull`. Same `0`-fallback semantics as `ahead`.
 	pub behind: u32,
+	/// Pre-built URL for opening a pull request against the
+	/// repo's primary remote. `Some` only when the remote is a
+	/// recognised host (currently `github.com`), HEAD is on a
+	/// named branch (not detached), and the branch name has
+	/// successfully URL-escaped. The SCM panel still gates the
+	/// "Open PR" button on UI policy (non-main / non-master,
+	/// `has_upstream`); the backend just produces the URL when
+	/// it has the inputs.
+	pub pr_url: Option<String>,
 }
 
 /// Outcome of a successful `git_commit`. The SCM panel renders

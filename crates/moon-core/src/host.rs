@@ -208,11 +208,18 @@ pub trait WorkspaceHost: Send + Sync {
 	/// `git push` with no arguments — uses the configured upstream
 	/// for the current branch. Errors propagate git's own stderr
 	/// verbatim so messages like "the current branch X has no
-	/// upstream branch" stay actionable. We don't try to
-	/// auto-set-upstream: that's a multi-remote decision the user
-	/// should make explicitly (the SCM panel surfaces git's hint
-	/// telling them the exact `git push -u origin <branch>` to run).
+	/// upstream branch" stay actionable. The SCM panel calls
+	/// `git_publish_branch` instead when no upstream is set; the
+	/// distinction is made client-side from `GitBranchInfo`.
 	async fn git_push(&self) -> MoonResult<()>;
+
+	/// `git push -u origin HEAD` — first-push affordance for a
+	/// freshly-created local branch with no upstream yet. Hardcoded
+	/// to `origin` (matching the "hardcode first, configure later"
+	/// rule); a multi-remote chooser is a later concern. Errors
+	/// (no `origin` remote, auth, network) propagate git's stderr
+	/// verbatim.
+	async fn git_publish_branch(&self) -> MoonResult<()>;
 
 	/// `git pull` with no arguments — uses the user's configured
 	/// `pull.rebase` setting. Errors propagate git's stderr;
@@ -867,6 +874,19 @@ impl WorkspaceHost for LocalHost {
 			.map_err(|e| MoonError::Internal(format!("git_push join error: {e}")))?
 	}
 
+	async fn git_publish_branch(&self) -> MoonResult<()> {
+		let root = self.root.clone();
+		tokio::task::spawn_blocking(move || {
+			run_git_simple(
+				&root,
+				&["push", "--set-upstream", "origin", "HEAD"],
+				"git push -u origin HEAD",
+			)
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_publish_branch join error: {e}")))?
+	}
+
 	async fn git_pull(&self) -> MoonResult<()> {
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || run_git_simple(&root, &["pull"], "git pull"))
@@ -912,6 +932,20 @@ fn run_git_branch(root: &Utf8Path) -> GitBranchInfo {
 		.map(|s| s.trim().to_owned())
 		.filter(|s| !s.is_empty());
 
+	// `rev-parse --abbrev-ref --symbolic-full-name @{u}` exits 0
+	// with the upstream short name iff one is configured; exits
+	// non-zero ("no upstream configured for branch X" /
+	// "HEAD does not point to a branch") otherwise. We only need
+	// the boolean — the actual upstream name isn't surfaced in
+	// the UI yet, and resolving it doesn't talk to the network.
+	let has_upstream = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+		.output()
+		.ok()
+		.is_some_and(|o| o.status.success());
+
 	// `rev-list --count --left-right HEAD...@{u}` prints
 	// `<ahead>\t<behind>`: commits we have that upstream doesn't,
 	// then commits upstream has that we don't. Errors silently
@@ -935,12 +969,48 @@ fn run_git_branch(root: &Utf8Path) -> GitBranchInfo {
 		})
 		.unwrap_or((0, 0));
 
+	// Compose the GitHub PR-create URL when we have both inputs:
+	// a recognised remote + a non-detached branch. URL-escaping
+	// follows GitHub's "branch name in path segment" rules: `/`
+	// stays literal (forward slashes appear in `feat/foo` style
+	// branches), the rest of the disallowed-in-path set goes
+	// percent-encoded. The frontend gates visibility on UI
+	// policy (`has_upstream`, non-main/master); we just produce
+	// the URL whenever it's well-defined.
+	let pr_url = match (remote_web_url(root), name.as_deref()) {
+		(Some(base), Some(branch)) => Some(format!("{base}/pull/new/{}", encode_branch_segment(branch))),
+		_ => None,
+	};
+
 	GitBranchInfo {
 		name,
 		head_short_sha,
+		has_upstream,
 		ahead,
 		behind,
+		pr_url,
 	}
+}
+
+/// Percent-encode a git branch name for use as a single path
+/// segment under `https://github.com/owner/repo/`. We deliberately
+/// leave `/` alone — branch names like `feat/foo` are valid and
+/// GitHub renders them as nested path segments — and only escape
+/// the bytes the URL spec disallows in a path. Branch names are
+/// already constrained by git's `check-ref-format` to a fairly
+/// narrow set, so this is mostly defensive.
+fn encode_branch_segment(branch: &str) -> String {
+	let mut out = String::with_capacity(branch.len());
+	for byte in branch.bytes() {
+		let safe = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/');
+		if safe {
+			out.push(byte as char);
+		} else {
+			out.push('%');
+			out.push_str(&format!("{byte:02X}"));
+		}
+	}
+	out
 }
 
 /// `git add -A && git commit [-m <message> | --amend [-m <message>|--no-edit]]`.
@@ -2191,6 +2261,22 @@ mod tests {
 		assert_eq!(super::normalize_remote_url("https://gitlab.com/moon/ide.git"), None);
 		assert_eq!(super::normalize_remote_url("git@bitbucket.org:moon/ide.git"), None);
 		assert_eq!(super::normalize_remote_url(""), None);
+	}
+
+	#[test]
+	fn encode_branch_segment_preserves_safe_chars_and_slashes() {
+		// Plain alphanumerics + `-_.~/` pass through verbatim — the
+		// "happy path" for nearly every branch name we'll see.
+		assert_eq!(super::encode_branch_segment("main"), "main");
+		assert_eq!(super::encode_branch_segment("feat/scm-publish"), "feat/scm-publish");
+		assert_eq!(super::encode_branch_segment("release-1.2.3"), "release-1.2.3");
+		// Anything outside that allow-list percent-encodes, including
+		// the rare branch names with `#` / `?` / spaces.
+		assert_eq!(super::encode_branch_segment("hot fix"), "hot%20fix");
+		assert_eq!(super::encode_branch_segment("ticket#42"), "ticket%2342");
+		// Multibyte UTF-8 — each byte percent-encodes individually,
+		// which is what GitHub's path encoder does too.
+		assert_eq!(super::encode_branch_segment("café"), "caf%C3%A9");
 	}
 
 	#[tokio::test]

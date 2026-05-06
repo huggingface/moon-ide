@@ -69,6 +69,7 @@ export const ipc = {
 		gitBranch: () => invoke<GitBranchInfo>('fs_git_branch'),
 		gitCommit: (message: string, amend: boolean) => invoke<GitCommitResult>('fs_git_commit', { message, amend }),
 		gitPush: () => invoke<void>('fs_git_push'),
+		gitPublishBranch: () => invoke<void>('fs_git_publish_branch'),
 		gitPull: () => invoke<void>('fs_git_pull'),
 	},
 	search: {

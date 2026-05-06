@@ -1225,7 +1225,14 @@ class WorkspaceState {
 	 * so external `git checkout` / `git switch` from a terminal
 	 * eventually surfaces (within the watcher's debounce window).
 	 */
-	gitBranch = $state<GitBranchInfo>({ name: null, headShortSha: null, ahead: 0, behind: 0 });
+	gitBranch = $state<GitBranchInfo>({
+		name: null,
+		headShortSha: null,
+		hasUpstream: false,
+		ahead: 0,
+		behind: 0,
+		prUrl: null,
+	});
 
 	/**
 	 * SCM-filter toggle: when on, the sidebar swaps the regular
@@ -1283,7 +1290,14 @@ class WorkspaceState {
 		try {
 			this.gitBranch = await ipc.fs.gitBranch();
 		} catch {
-			this.gitBranch = { name: null, headShortSha: null, ahead: 0, behind: 0 };
+			this.gitBranch = {
+				name: null,
+				headShortSha: null,
+				hasUpstream: false,
+				ahead: 0,
+				behind: 0,
+				prUrl: null,
+			};
 		}
 	}
 
@@ -1332,6 +1346,27 @@ class WorkspaceState {
 			return true;
 		} catch (err) {
 			this.flash(`Push failed: ${formatError(err)}`);
+			return false;
+		}
+	}
+
+	/**
+	 * `git push -u origin HEAD` — first-push affordance for a
+	 * freshly-created local branch with no upstream yet. The SCM
+	 * panel shows this as "Publish branch" in the slot the sync
+	 * button normally occupies. On success, refresh the branch
+	 * info so `hasUpstream` flips to `true` and subsequent pushes
+	 * route through `pushChanges`.
+	 */
+	async publishBranch() {
+		try {
+			await ipc.fs.gitPublishBranch();
+			this.flash('Branch published.');
+			await this.refreshGitBranch();
+			void this.refreshActiveFolder();
+			return true;
+		} catch (err) {
+			this.flash(`Publish failed: ${formatError(err)}`);
 			return false;
 		}
 	}
