@@ -81,6 +81,16 @@ pub enum DiscoveryStrategy {
 	/// location isn't always on the launched Tauri process's
 	/// inherited `PATH`.
 	CargoHome,
+	/// Walk ancestors from the workspace root looking for
+	/// `.venv/bin/<bin>` (Unix) / `.venv/Scripts/<bin>.exe`
+	/// (Windows), then `$PATH`. Mirrors `NodeModules` for the
+	/// Python ecosystem: `.venv/` is `uv`'s default virtualenv
+	/// layout (and the shape every modern Python project lands
+	/// on), so a `uv pip install ty` / `uv add --dev ty` lands
+	/// where we look first. The PATH fallback catches users who
+	/// did `uv tool install ty` instead and have `~/.local/bin`
+	/// on PATH.
+	PythonVenv,
 }
 
 /// TypeScript / JavaScript server.
@@ -126,6 +136,30 @@ pub const RUST_SERVER: LspBinarySpec = LspBinarySpec {
 	args: &[],
 	install_hint: "rustup component add rust-analyzer",
 	discovery: DiscoveryStrategy::CargoHome,
+};
+
+/// Python server — `ty`, Astral's native type checker + language
+/// server. Same vendor as `uv` and `ruff`, ships as a single
+/// statically-linked Rust binary, advertises an LSP under the
+/// `ty server` subcommand (matching `ruff server`'s convention).
+///
+/// Discovery prefers a project-local `.venv/bin/ty` (where
+/// `uv pip install ty` / `uv add --dev ty` lands) over a global
+/// install — same shape as `tsgo` / `node_modules/.bin/`, so a
+/// project that pins a specific `ty` release isn't shadowed by
+/// a different one on the user's `$PATH`. `uv tool install ty`
+/// (which writes to `~/.local/bin/ty`) is picked up via the
+/// PATH fallback.
+///
+/// `ty` is in beta as of 2026 — if a feature gap blocks us,
+/// switching to `pyright-langserver` / `pylsp` is a one-string
+/// edit on this spec, the rest of the broker is wire-agnostic.
+pub const PYTHON_SERVER: LspBinarySpec = LspBinarySpec {
+	language_id: "python",
+	bin_name: "ty",
+	args: &["server"],
+	install_hint: "uv add --dev ty (or uv tool install ty)",
+	discovery: DiscoveryStrategy::PythonVenv,
 };
 
 pub struct LspServer {
@@ -791,6 +825,39 @@ pub fn discover_binary(bin_name: &str, strategy: DiscoveryStrategy, start: &Path
 				_ => None,
 			}
 		}
+		DiscoveryStrategy::PythonVenv => {
+			let (subdir, filename) = python_venv_layout(bin_name);
+			for ancestor in start.ancestors() {
+				let candidate = ancestor.join(".venv").join(subdir).join(&filename);
+				if candidate.exists() {
+					tracing::debug!(
+						bin = bin_name,
+						path = %candidate.display(),
+						"lsp: resolved via project-local .venv"
+					);
+					return Some(candidate);
+				}
+			}
+			match which::which(bin_name) {
+				Ok(path) => {
+					tracing::debug!(bin = bin_name, path = %path.display(), "lsp: resolved via PATH");
+					Some(path)
+				}
+				Err(_) => None,
+			}
+		}
+	}
+}
+
+/// Per-platform `(subdir, filename)` inside `.venv/` that hosts an
+/// installed CLI. Unix venvs use `bin/<name>` (no extension), Windows
+/// venvs use `Scripts/<name>.exe`. Tracks Python's own venv module
+/// convention; `uv` follows the same layout.
+fn python_venv_layout(bin_name: &str) -> (&'static str, String) {
+	if cfg!(windows) {
+		("Scripts", format!("{bin_name}.exe"))
+	} else {
+		("bin", bin_name.to_owned())
 	}
 }
 
@@ -870,6 +937,40 @@ pub fn container_binary_path(spec: &LspBinarySpec, translator: &PathTranslator) 
 			None
 		}
 		DiscoveryStrategy::CargoHome => Some(PathBuf::from(spec.bin_name)),
+		DiscoveryStrategy::PythonVenv => {
+			// Container is always Linux — same `bin/<name>` layout
+			// every Unix venv uses.
+			let filename = spec.bin_name;
+			for ancestor in host_root.ancestors() {
+				let candidate = ancestor.join(".venv").join("bin").join(filename);
+				if !candidate.exists() {
+					continue;
+				}
+				let Ok(rel) = candidate.strip_prefix(host_root) else {
+					tracing::debug!(
+						bin = spec.bin_name,
+						host_path = %candidate.display(),
+						host_root = %host_root.display(),
+						"lsp: .venv match sits outside the bind mount, \
+						 container can't reach it — falling back to host"
+					);
+					return None;
+				};
+				let path = server_root.join(rel);
+				tracing::debug!(
+					bin = spec.bin_name,
+					path = %path.display(),
+					"lsp: resolved via container-side .venv"
+				);
+				return Some(path);
+			}
+			tracing::debug!(
+				bin = spec.bin_name,
+				host_root = %host_root.display(),
+				"lsp: no .venv/bin/<bin> found below the mount root"
+			);
+			None
+		}
 	}
 }
 
@@ -1263,5 +1364,97 @@ mod tests {
 		let resolved =
 			container_binary_path(&RUST_SERVER, &translator).expect("rust-analyzer always returns Some for CargoHome");
 		assert_eq!(resolved, Path::new("rust-analyzer"));
+	}
+
+	/// Project-local `.venv/bin/ty` resolves the same way
+	/// `node_modules/.bin/tsgo` does: walk ancestors, prefer a
+	/// project-local hit over `$PATH`. Mirrors the TS regression
+	/// test above.
+	#[test]
+	fn discover_python_venv_finds_binary_in_same_dir() {
+		let tmp = tempfile::tempdir().unwrap();
+		let (subdir, filename) = if cfg!(windows) {
+			("Scripts", "ty.exe")
+		} else {
+			("bin", "ty")
+		};
+		let bin_dir = tmp.path().join(".venv").join(subdir);
+		fs::create_dir_all(&bin_dir).unwrap();
+		let bin_path = bin_dir.join(filename);
+		fs::write(&bin_path, b"#!/bin/sh\n").unwrap();
+		make_executable(&bin_path);
+
+		let found = discover_binary("ty", DiscoveryStrategy::PythonVenv, tmp.path());
+		assert_eq!(found.as_deref(), Some(bin_path.as_path()));
+	}
+
+	/// uv's `workspace` layout puts `.venv` at the repo root and
+	/// individual packages a level or two below. The walk should
+	/// climb out of a nested package and find the parent venv.
+	#[test]
+	fn discover_python_venv_walks_up_to_ancestor_venv() {
+		let tmp = tempfile::tempdir().unwrap();
+		let (subdir, filename) = if cfg!(windows) {
+			("Scripts", "ty.exe")
+		} else {
+			("bin", "ty")
+		};
+		let bin_dir = tmp.path().join(".venv").join(subdir);
+		fs::create_dir_all(&bin_dir).unwrap();
+		let bin_path = bin_dir.join(filename);
+		fs::write(&bin_path, b"#!/bin/sh\n").unwrap();
+		make_executable(&bin_path);
+
+		let nested = tmp.path().join("packages").join("api");
+		fs::create_dir_all(&nested).unwrap();
+
+		let found = discover_binary("ty", DiscoveryStrategy::PythonVenv, &nested);
+		assert_eq!(found.as_deref(), Some(bin_path.as_path()));
+	}
+
+	/// A `.venv/` inside the bind mount translates through to its
+	/// container path the same way `node_modules/.bin/` does.
+	#[test]
+	fn container_binary_path_resolves_python_venv_inside_mount() {
+		let tmp = tempfile::tempdir().unwrap();
+		let host_root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let bin_dir = host_root.join(".venv").join("bin");
+		fs::create_dir_all(bin_dir.as_std_path()).unwrap();
+		let bin_path = bin_dir.join("ty");
+		fs::write(bin_path.as_std_path(), b"#!/usr/bin/env python\n").unwrap();
+		make_executable(bin_path.as_std_path());
+
+		let translator = PathTranslator::HostMount {
+			host_root: host_root.clone(),
+			server_root: Utf8PathBuf::from("/workspace/moon-py"),
+		};
+		let resolved = container_binary_path(&PYTHON_SERVER, &translator).expect("resolves when .venv is in the mount");
+		assert_eq!(resolved, Path::new("/workspace/moon-py/.venv/bin/ty"));
+	}
+
+	/// A venv at a parent of the active folder isn't visible from
+	/// inside the container — same monorepo escape logic as for
+	/// `node_modules`.
+	#[test]
+	fn container_binary_path_rejects_python_venv_above_mount() {
+		let tmp = tempfile::tempdir().unwrap();
+		let monorepo = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let bin_dir = monorepo.join(".venv").join("bin");
+		fs::create_dir_all(bin_dir.as_std_path()).unwrap();
+		let bin_path = bin_dir.join("ty");
+		fs::write(bin_path.as_std_path(), b"#!/usr/bin/env python\n").unwrap();
+		make_executable(bin_path.as_std_path());
+
+		let active = monorepo.join("packages").join("api");
+		fs::create_dir_all(active.as_std_path()).unwrap();
+
+		let translator = PathTranslator::HostMount {
+			host_root: active,
+			server_root: Utf8PathBuf::from("/workspace/api"),
+		};
+		assert!(
+			container_binary_path(&PYTHON_SERVER, &translator).is_none(),
+			"hoisted .venv sits above the bind mount — container can't reach it"
+		);
 	}
 }

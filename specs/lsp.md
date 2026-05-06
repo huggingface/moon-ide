@@ -1,6 +1,6 @@
 # LSP
 
-Status: partial — TypeScript + Rust both have diagnostics + hover + completion + goto-definition + nav history wired via the stage-1/stage-2 slices of Phase 4. Both additionally route **inside the workspace container** when one is up and the binary is reachable there (see [Container-backed LSP](#container-backed-lsp)); the broker falls back to host LSP per-language when it isn't. Every other language (Svelte, CSS, HTML, JSON) is architecturally in scope and not yet wired.
+Status: partial — TypeScript, Rust, and Python all have diagnostics + hover + completion + goto-definition + nav history wired via the stage-1/stage-2 slices of Phase 4. All three additionally route **inside the workspace container** when one is up and the binary is reachable there (see [Container-backed LSP](#container-backed-lsp)); the broker falls back to host LSP per-language when it isn't. Every other language (Svelte, CSS, HTML, JSON) is architecturally in scope and not yet wired.
 
 ## The non-negotiable invariant
 
@@ -70,6 +70,20 @@ LSP's default. CodeMirror's native string offsets are UTF-16 code units too (JS 
 
 Switching the active folder drops the broker and rebuilds. The frontend's `openFile` handles re-issuing `didOpen` naturally — tabs that survive the switch will re-open against the new broker the first time the editor re-renders them. Not atomic across the switch; the user sees a short "starting…" pill and diagnostics return when tsserver finishes its first pass.
 
+### Python server: `ty`
+
+We target [`ty`](https://github.com/astral-sh/ty), Astral's Rust-native Python type checker + language server. Same vendor as `uv` and `ruff`, distributed as a single statically-linked binary, advertises an LSP under the `ty server` subcommand (matching `ruff server`'s convention).
+
+Discovery treats `ty` like `tsgo`: project-local first via `.venv/bin/ty` (where `uv pip install ty` / `uv add --dev ty` lands), then `$PATH` (where `uv tool install ty` ends up via `~/.local/bin`). A monorepo with a single top-level `.venv/` works without configuration — same ancestor-walk semantics as `node_modules/.bin/`. Install hint:
+
+```
+uv add --dev ty (or uv tool install ty)
+```
+
+`ty` is in beta as of mid-2026 (`0.0.x` versions; the Astral team explicitly notes breaking changes between any two releases). If a feature gap blocks us, switching to `pyright-langserver` or `pylsp` is a one-string edit on `PYTHON_SERVER` in `crates/moon-core/src/lsp/server.rs` — the broker is wire-protocol-agnostic.
+
+We don't bake `ty` into the `moon-base` image. Python projects vary too much for a single global pin to be useful (some need `ty`, others want `pyright`, others need a project-pinned version), and the per-project install matches what `bun install` already does for `tsgo`. The container surfaces an unavailable-pill until the user runs `uv add --dev ty` or installs globally in the container; matches the TS UX.
+
 ### Rust server: `rust-analyzer`
 
 The ecosystem-standard LSP. No per-project install exists for Rust LSPs (unlike `tsgo`), so we rely on the system toolchain. Install on the developer's host:
@@ -99,8 +113,9 @@ Discovery is per-language via `LspBinarySpec::discovery`:
 
 - **`DiscoveryStrategy::NodeModules`** (TS / JS): walks up from the broker's root looking for `<ancestor>/node_modules/.bin/<bin_name>` at every level, then falls back to `which::which(bin_name)`. Matches Node's own resolution algorithm — pnpm-hoisted monorepos (single top-level `node_modules`) work identically to classic per-package layouts. The first match wins: a project-pinned copy always beats a global install, letting a monorepo freeze a specific LSP version without affecting other projects on the same machine.
 - **`DiscoveryStrategy::CargoHome`** (Rust): checks `$CARGO_HOME/bin/<bin_name>` (fallback `$HOME/.cargo/bin/<bin_name>`, or `$USERPROFILE/.cargo/bin/` on Windows), then `$PATH`. Covers `rustup component add rust-analyzer` — the default install location isn't always on a GUI-launched process's inherited `PATH`, especially on macOS and some Linux desktop environments.
+- **`DiscoveryStrategy::PythonVenv`** (Python): walks up from the broker's root looking for `<ancestor>/.venv/bin/<bin_name>` (Unix) / `<ancestor>/.venv/Scripts/<bin_name>.exe` (Windows), then `$PATH`. Mirrors the `NodeModules` shape for the Python ecosystem: `.venv/` is `uv`'s default virtualenv layout and where `uv pip install` / `uv add --dev` land. The PATH fallback catches users who installed via `uv tool install` (lands in `~/.local/bin`).
 
-On Windows we adjust the filename per strategy: `<bin>.cmd` for the Node case (npm's `.bin` wrapper), `<bin>.exe` for Cargo (native executables).
+On Windows we adjust the filename per strategy: `<bin>.cmd` for the Node case (npm's `.bin` wrapper), `<bin>.exe` for Cargo (native executables), `<bin>.exe` for Python (matches CPython's venv layout).
 
 If nothing is found on disk, the broker caches a `NotAvailable` slot per language and emits `lsp:status { status: 'notavailable' }`. The status bar paints a quiet pill whose tooltip is the spec's `install_hint` field (e.g. `bun add -D @typescript/native-preview` or `rustup component add rust-analyzer`) — copy-pasteable into a terminal.
 
@@ -124,7 +139,7 @@ The per-server fallback covers two separate cases without a user setting:
 1. **Custom image dropped the server** (e.g. `moon-base` rebuilt from a fork that removed `rust-analyzer`) — container probe fails → broker retries on host, with a `tracing::info!` breadcrumb.
 2. **Binary isn't reachable inside the container at all** — most commonly `tsgo`, whose real binary sits in `node_modules/.bin/tsgo` and is a Linux-specific shim installed by `bun install`. When the host `node_modules` sits **inside** the bind mount (the normal case for moon-ide itself), container-side LSP works; when it's hoisted to a parent of the active folder (some pnpm monorepos), the path is outside the mount and the broker falls back to host for that language.
 
-In-container binary-path resolution lives in `moon_core::lsp::server::container_binary_path`. It walks host ancestors for `NodeModules`-strategy specs and translates matches through the `HostMount` translator; for `CargoHome`-strategy specs it hands back the basename because `moon-base` installs `rust-analyzer` on the container's `$PATH` via rustup.
+In-container binary-path resolution lives in `moon_core::lsp::server::container_binary_path`. It walks host ancestors for `NodeModules`- and `PythonVenv`-strategy specs and translates matches through the `HostMount` translator; for `CargoHome`-strategy specs it hands back the basename because `moon-base` installs `rust-analyzer` on the container's `$PATH` via rustup.
 
 **Pieces.**
 
@@ -136,11 +151,11 @@ In-container binary-path resolution lives in `moon_core::lsp::server::container_
 
 **Teardown on container transitions.** Every mutating container command (`container_setup`, `container_stop`, `container_pause`, `container_resume`, `container_rebuild`, `container_teardown`, `container_apply_bound_folders`) calls `reset_lsp_broker` after the compose action completes. That drops the current broker; the next `lsp_open` rebuilds against whatever state the container is in now. Cheaper and more deterministic than trying to mutate the broker in place.
 
-**Image responsibility.** `moon-base` pre-installs language servers the broker knows how to route in a container. Today that's `rust-analyzer` via `rustup component add`. Python and the others land here when each language gets wired; see [`containers.md`](containers.md#the-moon-base-image) for the current tool inventory.
+**Image responsibility.** `moon-base` pre-installs language servers that benefit from a global pin: today that's `rust-analyzer` via `rustup component add` (Rust has no per-project install convention). TypeScript (`tsgo`) and Python (`ty`) are intentionally **not** pre-installed — both have first-class per-project install paths (`bun add -D @typescript/native-preview`, `uv add --dev ty`), and the per-project copy is what should win. The container surfaces an unavailable-pill until the user installs the server; matches the host UX. See [`containers.md`](containers.md#the-moon-base-image) for the current tool inventory.
 
 **Known non-goals for this slice.**
 
-- Python / Svelte / CSS / HTML / JSON — wire up when the language itself ships in the broker. Routing through the container follows the same template at that point.
+- Svelte / CSS / HTML / JSON — wire up when the language itself ships in the broker. Routing through the container follows the same template at that point.
 - Remote (SSH / Codespaces) LSP — `DockerExec` doesn't generalise; a future `RemoteHost` spawner is its own design.
 - Containers the user starts outside moon-ide — we only know how to route into the workspace's own compose project.
 

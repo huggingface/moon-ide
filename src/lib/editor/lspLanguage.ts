@@ -21,14 +21,19 @@ const BY_EXTENSION: Record<string, string> = {
 	cjs: 'javascript',
 	jsx: 'javascriptreact',
 	rs: 'rust',
+	py: 'python',
+	// `.pyi` is a type-stub file — same language id as a real
+	// `.py`, ty consumes both. (We don't surface a separate
+	// "python-stub" id; servers don't model that distinction.)
+	pyi: 'python',
 };
 
 export function lspLanguageFor(path: string): string | null {
 	// Strip anything past the last `.`; then match the known table.
 	// Dotless files (`Dockerfile`, `.editorconfig`) never map to an
-	// LSP here — the two shipped language servers only care about
-	// JS/TS, and the bootstrap files moon-ide handles specially are
-	// not language-server-backed.
+	// LSP here — the shipped language servers only care about
+	// JS/TS, Rust, and Python, and the bootstrap files moon-ide
+	// handles specially are not language-server-backed.
 	const base = path.split('/').pop() ?? path;
 	const dot = base.lastIndexOf('.');
 	if (dot < 0) {

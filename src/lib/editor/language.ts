@@ -132,6 +132,11 @@ export async function languageFor(filename: string, firstLine?: string): Promise
 			const { rust } = await import('@codemirror/lang-rust');
 			return [rust()];
 		}
+		case 'py':
+		case 'pyi': {
+			const { python } = await import('@codemirror/lang-python');
+			return [python()];
+		}
 		case 'toml': {
 			const { toml } = await import('@codemirror/legacy-modes/mode/toml');
 			return [StreamLanguage.define(toml)];

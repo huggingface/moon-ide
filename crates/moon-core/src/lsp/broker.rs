@@ -29,8 +29,8 @@ use tokio::sync::{broadcast, Mutex};
 
 use super::client::LspClientError;
 use super::server::{
-	container_binary_path, discover_binary, LspBinarySpec, LspServer, LspServerEvent, PathTranslator, RUST_SERVER,
-	TS_SERVER,
+	container_binary_path, discover_binary, LspBinarySpec, LspServer, LspServerEvent, PathTranslator, PYTHON_SERVER,
+	RUST_SERVER, TS_SERVER,
 };
 use super::spawn::LspSpawner;
 
@@ -156,6 +156,7 @@ impl LspBroker {
 		match language_id {
 			"typescript" | "typescriptreact" | "javascript" | "javascriptreact" => Some(&TS_SERVER),
 			"rust" => Some(&RUST_SERVER),
+			"python" => Some(&PYTHON_SERVER),
 			_ => None,
 		}
 	}
