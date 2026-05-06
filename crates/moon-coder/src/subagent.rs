@@ -148,11 +148,16 @@ pub struct SubagentReport {
 pub fn spawn_subagent_tool_definition() -> ToolDefinition {
 	ToolDefinition::function(
 		"spawn_subagent",
-		"Spawn a parallel sub-agent against a workspace folder. Returns the sub-agent's final text result. \
-Use `mode: \"research\"` for read-only investigation against an unfamiliar folder — the sub-agent gets `read_file`, `list_dir`, `grep`, and `bash` for inspection commands (`git log`, `git diff`, `cargo check`, `pytest --collect-only`, …) but is instructed not to mutate anything. \
-Use `mode: \"coder\"` (default) when the sub-agent should make edits — same toolkit plus `write_file` and `edit_file`. Prefer `research` when spawning into your own active folder unless you genuinely need parallel writes. \
-Two model tiers are available: `\"fast\"` (default) is the cheap / quick model and is the right pick for almost all sub-agents — focused reconnaissance, scoped edits, narrow tasks. Use `\"large\"` only when the sub-agent's task needs the same reasoning depth you'd want for a top-level chat turn (multi-file refactors, synthesis across many sources, ambiguous specs). \
-The sub-agent has no access to your conversation history; describe the task self-containedly. Multiple `spawn_subagent` calls in one assistant message run in parallel (capped at 4 concurrent).",
+		"Spawn a sub-agent against a workspace folder and get back a single summarised string. Three reasons to reach for this: \
+**(1) cross-folder access** — your own tools only see the active folder, so any work in a sibling bound folder must go through a sub-agent (`folder: \"<other-name>\"`); \
+**(2) parallelism** — multiple `spawn_subagent` calls in one assistant message run concurrently (capped at 4), so independent investigations or edits across folders finish in one round-trip; \
+**(3) context preservation** — a `research` sub-agent that reads 30 files and reports one paragraph spends its tokens, not yours, and your transcript stays clean for the synthesis turn. \
+\
+Mode: use `mode: \"research\"` (recommended for inspection tasks) for read-only investigation — the sub-agent gets `read_file`, `list_dir`, `grep`, and `bash` for inspection commands (`git log`, `git diff`, `cargo check`, `pytest --collect-only`, …) but is instructed not to mutate anything. Use `mode: \"coder\"` (default) when the sub-agent should make edits — same toolkit plus `write_file` and `edit_file`. \
+\
+Model tier: `\"fast\"` (default) is the cheap / quick model and is the right pick for almost all sub-agents — focused reconnaissance, scoped edits, narrow tasks. Use `\"large\"` only when the sub-agent's task needs the same reasoning depth you'd want for a top-level chat turn (multi-file refactors, synthesis across many sources, ambiguous specs). \
+\
+The sub-agent has no access to your conversation history; describe the task self-containedly. Sub-agents cannot spawn further sub-agents.",
 		json!({
 			"type": "object",
 			"properties": {
@@ -162,7 +167,7 @@ The sub-agent has no access to your conversation history; describe the task self
 				},
 				"folder": {
 					"type": "string",
-					"description": "Basename of a currently-bound workspace folder to target. Omit (or set to the active folder's basename) to target the parent's active folder. Targeting an unbound folder errors."
+					"description": "Basename of a currently-bound workspace folder to target (matches the `<name>` in `/workspace/<name>` from the Bound folders section). Omit (or set to the active folder's basename) to target the parent's active folder — useful for context-isolation even within the same folder. Targeting an unbound folder errors."
 				},
 				"mode": {
 					"type": "string",
@@ -697,14 +702,18 @@ fn parse_tool_args(function: &FunctionCall) -> Value {
 
 const RESEARCH_SYSTEM_PROMPT: &str = r#"You are a research sub-agent inside moon-ide. You have been spawned by a parent agent to gather information from a workspace folder and report back. Your job is investigation, not editing.
 
-Tools available: `read_file`, `list_dir`, `grep`, and `bash`. The shell is for read-only inspection only — `git log`, `git diff --stat`, `cargo check`, `pytest --collect-only`, `ls -la`, `cat`, `wc`, and similar. Do **not** run commands that mutate the filesystem, network state, or remote services. No `git commit`, `git push`, `cargo build` (it writes to `target/`), `mv`, `rm`, `npm install`, `pip install`, redirection-to-file (`> path`, `>> path`), or anything that would change persistent state.
+Tools available: `read_file`, `list_dir`, `grep`, and `bash`. They all operate against the single folder assigned to you (shown below) — you cannot reach the parent's other bound folders, and you cannot spawn further sub-agents. Address files relative to your folder (`src/foo.rs`) or with the synthetic `/workspace/<your-folder-name>/...` form; both work.
+
+The shell is for read-only inspection only — `git log`, `git diff --stat`, `cargo check`, `pytest --collect-only`, `ls -la`, `cat`, `wc`, and similar. Do **not** run commands that mutate the filesystem, network state, or remote services. No `git commit`, `git push`, `cargo build` (it writes to `target/`), `mv`, `rm`, `npm install`, `pip install`, redirection-to-file (`> path`, `>> path`), or anything that would change persistent state.
 
 Return your findings as a single coherent text result when you finish. The parent will see only that string; do not address them as "you" or assume shared context.
 "#;
 
 const CODER_SYSTEM_PROMPT: &str = r#"You are a coder sub-agent inside moon-ide. You have been spawned by a parent agent to perform a focused task in a workspace folder. You may read and edit files freely.
 
-Tools available: `read_file`, `list_dir`, `grep`, `bash`, `write_file`, `edit_file`. Read before you edit — don't invent file paths. Use `edit_file` for surgical changes inside large files; reach for `write_file` for new files and whole-file rewrites.
+Tools available: `read_file`, `list_dir`, `grep`, `bash`, `write_file`, `edit_file`. They all operate against the single folder assigned to you (shown below) — you cannot reach the parent's other bound folders, and you cannot spawn further sub-agents. Address files relative to your folder (`src/foo.rs`) or with the synthetic `/workspace/<your-folder-name>/...` form; both work.
+
+Read before you edit — don't invent file paths. Use `edit_file` for surgical changes inside large files; reach for `write_file` for new files and whole-file rewrites.
 
 Return a single coherent text result when you finish. The parent will see only that string and a short transcript of your tool calls; do not address them as "you" or assume shared context.
 "#;

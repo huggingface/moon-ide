@@ -140,18 +140,98 @@ impl ToolRegistry {
 		Ok(ToolContext::new(folder, mode))
 	}
 
+	/// Resolve a path argument against the synthetic `/workspace/`
+	/// surface the system prompt advertises and reject anything that
+	/// clearly belongs to a different bound folder. Three outcomes:
+	///
+	/// - **Active-folder absolute** (`/workspace/<active>/...`):
+	///   strip the prefix and return the remainder as a relative
+	///   path. The model can use either form — `src/foo.rs` or
+	///   `/workspace/<active>/src/foo.rs` — and they resolve the
+	///   same way.
+	/// - **Cross-folder absolute** (`/workspace/<other>/...`):
+	///   error with a sub-agent suggestion. The model sees the
+	///   guidance baked into the message and learns to spawn one
+	///   instead of guessing at sibling paths.
+	/// - **Cross-folder relative** (`<other>` or `<other>/...` where
+	///   `<other>` is a bound-folder basename ≠ active): same
+	///   error. We don't try to disambiguate a same-named directory
+	///   inside the active folder — if the model legitimately wants
+	///   that, prefixing with `./<other>` opts out of the check.
+	///
+	/// Anything else (`/abs/host/path`, `..` escapes, normal
+	/// relative paths) is left alone for `WorkspaceHost::resolve`
+	/// to validate. The cross-folder gate is purely a sub-agent
+	/// nudge layered on top of the existing host-level safety net.
+	async fn resolve_workspace_path(
+		&self,
+		raw: &str,
+		cx: &ToolContext,
+		tool: &'static str,
+	) -> Result<String, CoderError> {
+		let folders = self.workspaces.folders().await;
+		let active_name = cx.folder.folder.name.as_str();
+		let active_path = cx.folder.folder.path.as_str();
+		let path = Utf8Path::new(raw);
+
+		if path.is_absolute() {
+			if let Ok(rest) = path.strip_prefix("/workspace") {
+				let mut comps = rest.components();
+				if let Some(camino::Utf8Component::Normal(first)) = comps.next() {
+					if first == active_name {
+						let tail = rest.strip_prefix(first).unwrap_or(Utf8Path::new(""));
+						let s = tail.as_str();
+						return Ok(if s.is_empty() { ".".to_string() } else { s.to_string() });
+					}
+					if let Some(other) = folders
+						.iter()
+						.find(|f| f.folder.name == first && f.folder.path != active_path)
+					{
+						return Err(cross_folder_error(tool, raw, &other.folder.name));
+					}
+				}
+			}
+			return Ok(raw.to_string());
+		}
+
+		let mut comps = path.components();
+		match comps.next() {
+			// Leading `./` is the explicit "I mean a path *inside*
+			// the active folder, even if the first segment looks
+			// like a sibling's basename" opt-out the error message
+			// advertises. Pass through untouched.
+			Some(camino::Utf8Component::CurDir) => return Ok(raw.to_string()),
+			Some(camino::Utf8Component::Normal(name)) => {
+				if name != active_name
+					&& folders
+						.iter()
+						.any(|f| f.folder.name == name && f.folder.path != active_path)
+				{
+					let other = folders
+						.iter()
+						.find(|f| f.folder.name == name && f.folder.path != active_path)
+						.expect("just found above");
+					return Err(cross_folder_error(tool, raw, &other.folder.name));
+				}
+			}
+			_ => {}
+		}
+
+		Ok(raw.to_string())
+	}
+
 	/// Tool definitions to advertise to the model on every chat call.
 	pub fn definitions(&self) -> Vec<ToolDefinition> {
 		vec![
 			ToolDefinition::function(
 				"read_file",
-				"Read the contents of a file inside the active workspace folder. Returns the file's text, with each line prefixed by `<line_number>|<line>`. Treat the prefix as metadata — it is not part of the file. Optional `start_line` / `end_line` (1-based, inclusive) read just a slice; both omitted means read the whole file (capped at 200 kB). Refuses paths outside the workspace.",
+				"Read the contents of a file inside the **active** workspace folder. Returns the file's text, with each line prefixed by `<line_number>|<line>`. Treat the prefix as metadata — it is not part of the file. Optional `start_line` / `end_line` (1-based, inclusive) read just a slice; both omitted means read the whole file (capped at 200 kB). Refuses paths outside the active folder; to read files in a *different* bound folder, call `spawn_subagent` with `folder: \"<other-name>\"` instead of trying to reach across.",
 				json!({
 					"type": "object",
 					"properties": {
 						"path": {
 							"type": "string",
-							"description": "Workspace-relative path to the file."
+							"description": "Path inside the active workspace folder. Use a folder-relative path (`src/foo.rs`) or the synthetic absolute `/workspace/<active-name>/src/foo.rs`; both resolve the same way."
 						},
 						"start_line": {
 							"type": "integer",
@@ -167,13 +247,13 @@ impl ToolRegistry {
 			),
 			ToolDefinition::function(
 				"list_dir",
-				"List the immediate contents of a directory inside the active workspace folder. Returns one entry per line in `kind  name` form.",
+				"List the immediate contents of a directory inside the **active** workspace folder. Returns one entry per line in `kind  name` form. Refuses paths outside the active folder; spawn a sub-agent for sibling folders.",
 				json!({
 					"type": "object",
 					"properties": {
 						"path": {
 							"type": "string",
-							"description": "Workspace-relative path. Use \".\" for the workspace root.",
+							"description": "Path inside the active workspace folder. `.` for the active folder root; relative `src/` or absolute `/workspace/<active-name>/src/` both work.",
 							"default": "."
 						}
 					}
@@ -221,13 +301,13 @@ impl ToolRegistry {
 			),
 			ToolDefinition::function(
 				"write_file",
-				"Overwrite a file with new content (or create it if missing). Use for new files or whole-file rewrites; prefer `edit_file` for surgical changes inside a large file. The file's parent directory must already exist. Throws on path-traversal attempts outside the workspace folder.",
+				"Overwrite a file with new content (or create it if missing) inside the **active** workspace folder. Use for new files or whole-file rewrites; prefer `edit_file` for surgical changes inside a large file. The file's parent directory must already exist. Throws on paths outside the active folder; to write into a sibling bound folder, spawn a `coder`-mode sub-agent against it.",
 				json!({
 					"type": "object",
 					"properties": {
 						"path": {
 							"type": "string",
-							"description": "Workspace-relative path. Created if it does not exist."
+							"description": "Path inside the active workspace folder. Created if it does not exist. Relative or `/workspace/<active-name>/...`."
 						},
 						"content": {
 							"type": "string",
@@ -239,13 +319,13 @@ impl ToolRegistry {
 			),
 			ToolDefinition::function(
 				"edit_file",
-				"Replace an exact substring inside a file. `find` must match the file *exactly* (including whitespace and line endings) and must be unique unless `occurrence` is given. To insert text, set `find` to the line you want to insert before/after and include it in `replace`. To delete, set `replace` to an empty string. Failure throws — when it does, retry with more surrounding context in `find` so the match becomes unique.",
+				"Replace an exact substring inside a file in the **active** workspace folder. `find` must match the file *exactly* (including whitespace and line endings) and must be unique unless `occurrence` is given. To insert text, set `find` to the line you want to insert before/after and include it in `replace`. To delete, set `replace` to an empty string. Failure throws — when it does, retry with more surrounding context in `find` so the match becomes unique. Sibling bound folders are off-limits; spawn a `coder`-mode sub-agent if you need to edit one.",
 				json!({
 					"type": "object",
 					"properties": {
 						"path": {
 							"type": "string",
-							"description": "Workspace-relative path. The file must already exist."
+							"description": "Path inside the active workspace folder. The file must already exist. Relative or `/workspace/<active-name>/...`."
 						},
 						"find": {
 							"type": "string",
@@ -321,8 +401,9 @@ impl ToolRegistry {
 		if matches!(parsed.start_line, Some(0)) || matches!(parsed.end_line, Some(0)) {
 			return Err(CoderError::invalid_args("read_file", "line numbers are 1-based"));
 		}
+		let resolved_path = self.resolve_workspace_path(&parsed.path, cx, "read_file").await?;
 		let folder = &cx.folder;
-		let result = folder.host.read_file(Utf8Path::new(&parsed.path)).await?;
+		let result = folder.host.read_file(Utf8Path::new(&resolved_path)).await?;
 		if result.is_binary {
 			return Err(CoderError::tool_failed("read_file", "binary file"));
 		}
@@ -359,8 +440,9 @@ impl ToolRegistry {
 		}
 		let parsed: ListDirArgs =
 			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("list_dir", err.to_string()))?;
+		let resolved_path = self.resolve_workspace_path(&parsed.path, cx, "list_dir").await?;
 		let folder = &cx.folder;
-		let entries = folder.host.read_dir(Utf8Path::new(&parsed.path)).await?;
+		let entries = folder.host.read_dir(Utf8Path::new(&resolved_path)).await?;
 		let mut out = String::new();
 		for e in &entries {
 			let kind = match e.kind {
@@ -426,10 +508,11 @@ impl ToolRegistry {
 		}
 		let parsed: WriteFileArgs =
 			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("write_file", err.to_string()))?;
+		let resolved_path = self.resolve_workspace_path(&parsed.path, cx, "write_file").await?;
 		let folder = &cx.folder;
 		let result = folder
 			.host
-			.save_file(Utf8Path::new(&parsed.path), &parsed.content)
+			.save_file(Utf8Path::new(&resolved_path), &parsed.content)
 			.await?;
 		Ok(json!({
 			"path": parsed.path,
@@ -452,8 +535,9 @@ impl ToolRegistry {
 		if parsed.find.is_empty() {
 			return Err(CoderError::invalid_args("edit_file", "`find` must not be empty"));
 		}
+		let resolved_path = self.resolve_workspace_path(&parsed.path, cx, "edit_file").await?;
 		let folder = &cx.folder;
-		let path = Utf8Path::new(&parsed.path);
+		let path = Utf8Path::new(&resolved_path);
 		let original = folder.host.read_file(path).await?;
 		if original.is_binary {
 			return Err(CoderError::tool_failed("edit_file", "binary file"));
@@ -663,6 +747,26 @@ pub(crate) const BASH_TARGET_CONTAINER: &str = "container";
 /// are LLM-sized (file contents + a few hundred bytes of `find`),
 /// not large-corpus. Same algorithm `pi-mono` uses for the same
 /// reason.
+/// Build the "you tried to reach a sibling bound folder; spawn a
+/// sub-agent instead" error returned by [`ToolRegistry::resolve_workspace_path`].
+/// The wording is deliberately prescriptive — the message is what the model
+/// reads back as the tool's `is_error: true` content, and the next turn
+/// usually does what the sentence in front of its eyes says.
+fn cross_folder_error(tool: &'static str, raw_path: &str, other_name: &str) -> CoderError {
+	CoderError::tool_failed(
+		tool,
+		format!(
+			"`{raw_path}` lives in the bound folder `{other_name}`, which is *not* the active folder. \
+This tool only operates inside the active folder. \
+To inspect or edit `{other_name}`, call `spawn_subagent` with `folder: \"{other_name}\"` instead — \
+that gives the sub-agent its own tool context rooted at that folder, and you get a single summarised \
+result back without polluting your own context with its tool output. \
+If you actually meant a directory of the same name *inside* the active folder, prefix the path with `./` \
+(e.g. `./{other_name}/...`)."
+		),
+	)
+}
+
 fn byte_offsets_of(haystack: &str, needle: &str) -> Vec<usize> {
 	if needle.is_empty() {
 		return Vec::new();
@@ -949,5 +1053,161 @@ mod tests {
 		let hits = vec![hit("src/lib.rs", 42, "    let x = compute_thing(input);")];
 		let out = format_grep_hits(&hits);
 		assert_eq!(out, "src/lib.rs:42:     let x = compute_thing(input);\n");
+	}
+
+	mod cross_folder {
+		use super::super::{CoderMode, ToolContext, ToolRegistry};
+		use crate::error::CoderError;
+		use camino::Utf8PathBuf;
+		use moon_core::WorkspaceRegistry;
+		use std::sync::Arc;
+		use tempfile::TempDir;
+
+		async fn build_registry(paths: &[&camino::Utf8Path]) -> (Arc<WorkspaceRegistry>, ToolRegistry) {
+			let registry = Arc::new(WorkspaceRegistry::new());
+			for p in paths {
+				registry.add_folder(p.to_path_buf()).await.unwrap();
+			}
+			let workspaces_dir = Utf8PathBuf::from(paths[0].parent().unwrap_or(camino::Utf8Path::new("/tmp")));
+			let tool_registry = ToolRegistry::new(registry.clone(), workspaces_dir);
+			(registry, tool_registry)
+		}
+
+		async fn make_cx(registry: &Arc<WorkspaceRegistry>, idx: usize) -> ToolContext {
+			let folders = registry.folders().await;
+			ToolContext::new(folders[idx].clone(), CoderMode::Coder)
+		}
+
+		#[tokio::test]
+		async fn relative_path_inside_active_folder_passes_through() {
+			let one = TempDir::new().unwrap();
+			let one_path = camino::Utf8PathBuf::from_path_buf(one.path().to_path_buf()).unwrap();
+			let (registry, tools) = build_registry(&[one_path.as_path()]).await;
+			let cx = make_cx(&registry, 0).await;
+			let out = tools
+				.resolve_workspace_path("src/lib.rs", &cx, "read_file")
+				.await
+				.expect("relative path should pass through");
+			assert_eq!(out, "src/lib.rs");
+		}
+
+		#[tokio::test]
+		async fn synthetic_active_path_strips_to_relative() {
+			let one = TempDir::new().unwrap();
+			let one_path = camino::Utf8PathBuf::from_path_buf(one.path().to_path_buf()).unwrap();
+			let (registry, tools) = build_registry(&[one_path.as_path()]).await;
+			let cx = make_cx(&registry, 0).await;
+			let active_name = registry.folders().await[0].folder.name.clone();
+			let raw = format!("/workspace/{active_name}/src/foo.rs");
+			let out = tools
+				.resolve_workspace_path(&raw, &cx, "read_file")
+				.await
+				.expect("synthetic active-folder path should resolve");
+			assert_eq!(out, "src/foo.rs");
+		}
+
+		#[tokio::test]
+		async fn synthetic_active_path_with_no_tail_resolves_to_root() {
+			let one = TempDir::new().unwrap();
+			let one_path = camino::Utf8PathBuf::from_path_buf(one.path().to_path_buf()).unwrap();
+			let (registry, tools) = build_registry(&[one_path.as_path()]).await;
+			let cx = make_cx(&registry, 0).await;
+			let active_name = registry.folders().await[0].folder.name.clone();
+			let raw = format!("/workspace/{active_name}");
+			let out = tools
+				.resolve_workspace_path(&raw, &cx, "list_dir")
+				.await
+				.expect("synthetic root should resolve");
+			assert_eq!(out, ".");
+		}
+
+		#[tokio::test]
+		async fn synthetic_sibling_path_errors_with_subagent_hint() {
+			let one = TempDir::new().unwrap();
+			let two = TempDir::new().unwrap();
+			let one_path = camino::Utf8PathBuf::from_path_buf(one.path().to_path_buf()).unwrap();
+			let two_path = camino::Utf8PathBuf::from_path_buf(two.path().to_path_buf()).unwrap();
+			let (registry, tools) = build_registry(&[one_path.as_path(), two_path.as_path()]).await;
+			let cx = make_cx(&registry, 0).await;
+			let other_name = registry.folders().await[1].folder.name.clone();
+			let raw = format!("/workspace/{other_name}/src/foo.rs");
+			let err = tools.resolve_workspace_path(&raw, &cx, "read_file").await.unwrap_err();
+			match err {
+				CoderError::ToolFailed { tool, message } => {
+					assert_eq!(tool, "read_file");
+					assert!(message.contains("spawn_subagent"), "message: {message}");
+					assert!(message.contains(&other_name), "message: {message}");
+				}
+				other => panic!("expected ToolFailed, got {other:?}"),
+			}
+		}
+
+		#[tokio::test]
+		async fn relative_sibling_basename_errors_with_subagent_hint() {
+			let one = TempDir::new().unwrap();
+			let two = TempDir::new().unwrap();
+			let one_path = camino::Utf8PathBuf::from_path_buf(one.path().to_path_buf()).unwrap();
+			let two_path = camino::Utf8PathBuf::from_path_buf(two.path().to_path_buf()).unwrap();
+			let (registry, tools) = build_registry(&[one_path.as_path(), two_path.as_path()]).await;
+			let cx = make_cx(&registry, 0).await;
+			let other_name = registry.folders().await[1].folder.name.clone();
+			// The user's reported failure mode: agent wrote `read_file({path: "huggingface_hub/foo.py"})`.
+			let raw = format!("{other_name}/foo.rs");
+			let err = tools.resolve_workspace_path(&raw, &cx, "list_dir").await.unwrap_err();
+			assert!(matches!(err, CoderError::ToolFailed { .. }), "got {err:?}");
+		}
+
+		#[tokio::test]
+		async fn relative_sibling_basename_alone_errors() {
+			// Bare basename, no slash — also reported by the user.
+			let one = TempDir::new().unwrap();
+			let two = TempDir::new().unwrap();
+			let one_path = camino::Utf8PathBuf::from_path_buf(one.path().to_path_buf()).unwrap();
+			let two_path = camino::Utf8PathBuf::from_path_buf(two.path().to_path_buf()).unwrap();
+			let (registry, tools) = build_registry(&[one_path.as_path(), two_path.as_path()]).await;
+			let cx = make_cx(&registry, 0).await;
+			let other_name = registry.folders().await[1].folder.name.clone();
+			let err = tools
+				.resolve_workspace_path(&other_name, &cx, "list_dir")
+				.await
+				.unwrap_err();
+			assert!(matches!(err, CoderError::ToolFailed { .. }), "got {err:?}");
+		}
+
+		#[tokio::test]
+		async fn explicit_dot_slash_disambiguates_same_named_subdir() {
+			// A directory inside the active folder happens to share a
+			// sibling's basename. Prefixing with `./` opts out of the
+			// cross-folder check so the path passes through unchanged.
+			let one = TempDir::new().unwrap();
+			let two = TempDir::new().unwrap();
+			let one_path = camino::Utf8PathBuf::from_path_buf(one.path().to_path_buf()).unwrap();
+			let two_path = camino::Utf8PathBuf::from_path_buf(two.path().to_path_buf()).unwrap();
+			let (registry, tools) = build_registry(&[one_path.as_path(), two_path.as_path()]).await;
+			let cx = make_cx(&registry, 0).await;
+			let other_name = registry.folders().await[1].folder.name.clone();
+			let raw = format!("./{other_name}/foo.rs");
+			let out = tools
+				.resolve_workspace_path(&raw, &cx, "read_file")
+				.await
+				.expect("./<sibling-name> should pass through");
+			assert_eq!(out, raw);
+		}
+
+		#[tokio::test]
+		async fn unrelated_absolute_path_passes_through_for_host_to_reject() {
+			// Absolute paths that don't start with `/workspace` are
+			// none of our business — the host's `resolve` will reject
+			// them. We don't want to second-guess that.
+			let one = TempDir::new().unwrap();
+			let one_path = camino::Utf8PathBuf::from_path_buf(one.path().to_path_buf()).unwrap();
+			let (registry, tools) = build_registry(&[one_path.as_path()]).await;
+			let cx = make_cx(&registry, 0).await;
+			let out = tools
+				.resolve_workspace_path("/etc/passwd", &cx, "read_file")
+				.await
+				.expect("unrelated absolute paths should pass through");
+			assert_eq!(out, "/etc/passwd");
+		}
 	}
 }

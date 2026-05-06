@@ -1386,15 +1386,19 @@ async fn compose_system_prompt(
 	}
 	out.push('\n');
 	out.push_str("## Bound folders\n\n");
-	out.push_str("These workspace folders are bound and visible to sub-agents. Your own tools (`read_file`, `list_dir`, `grep`, `bash`, `write_file`, `edit_file`) operate against the **active** folder; spawn a sub-agent against a non-active folder when the task naturally lives there.\n\n");
+	out.push_str(
+		"All folders currently bound to this workspace, listed with the synthetic `/workspace/<name>` paths your tools recognise. Your tools resolve paths against the **active** folder only; for any other folder, use `spawn_subagent` with `folder: \"<name>\"`.\n\n",
+	);
 	for (name, _path, description, is_active) in &entries {
-		out.push_str("- **");
+		out.push_str("- `/workspace/");
 		out.push_str(name);
-		out.push_str("**");
+		out.push('`');
 		if *is_active {
-			out.push_str(" (active)");
+			out.push_str(" **(active — your tools operate here)**");
+		} else {
+			out.push_str(" — sibling, reach via `spawn_subagent`");
 		}
-		out.push_str(" — ");
+		out.push_str(" · ");
 		match description {
 			Some(text) => out.push_str(text.trim()),
 			None => out.push_str("(summary still generating)"),
