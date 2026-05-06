@@ -160,6 +160,7 @@ export const ipc = {
 	},
 	coder: {
 		status: () => invoke<CoderStatus>('coder_status'),
+		folderSummary: (folder: string) => invoke<string | null>('coder_folder_summary', { folder }),
 		startDeviceFlow: () => invoke<DeviceCode>('coder_start_device_flow'),
 		pollDeviceCode: (code: DeviceCode) => invoke<HfIdentity>('coder_poll_device_code', { code }),
 		signOut: () => invoke<void>('coder_sign_out'),

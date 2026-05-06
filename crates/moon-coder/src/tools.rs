@@ -52,11 +52,66 @@ const READ_FILE_MAX_BYTES: usize = 200_000;
 /// command's outcome.
 const BASH_OUTPUT_MAX_BYTES: usize = 64_000;
 
+/// Two flavours every dispatched tool runs under. The parent's
+/// top-level turn always uses [`CoderMode::Coder`]; sub-agents
+/// pick per spawn (Phase C of the multi-project plan). Surfaced
+/// to tools via [`ToolContext`] so write-side tools can self-gate
+/// without each one re-deriving the rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoderMode {
+	/// Read-only intent. `read_file` / `list_dir` / `grep` / `bash`
+	/// stay available; `write_file` / `edit_file` short-circuit
+	/// with [`CoderError::ReadOnlyMode`]. The "no mutation via
+	/// `bash`" half of the constraint is behavioural — we can't
+	/// usefully sandbox a shell — and lives in the sub-agent's
+	/// system prompt instead.
+	Research,
+	/// Full toolkit. Today's parent-turn behaviour.
+	Coder,
+}
+
+impl CoderMode {
+	pub fn allows_writes(self) -> bool {
+		matches!(self, Self::Coder)
+	}
+
+	/// Wire string used by event payloads (`SubagentSpawned.mode`,
+	/// the `mode` field on the `spawn_subagent` tool result, etc.).
+	/// Stable identifiers — `"research"` / `"coder"` — that the
+	/// frontend reads verbatim, so don't rename without also
+	/// updating `src/lib/protocol.ts`.
+	pub fn as_wire(self) -> &'static str {
+		match self {
+			Self::Research => "research",
+			Self::Coder => "coder",
+		}
+	}
+}
+
+/// Per-dispatch context. Replaces the previous "every tool calls
+/// `workspaces.active_folder()` itself" pattern: the dispatcher
+/// resolves the folder + mode once and hands them to each tool
+/// invocation. Lets the sub-agent runner (Phase C) point a
+/// concurrent dispatch at a different folder + mode pair without
+/// touching the global active-folder state.
+#[derive(Clone)]
+pub struct ToolContext {
+	pub folder: Arc<WorkspaceFolderEntry>,
+	pub mode: CoderMode,
+}
+
+impl ToolContext {
+	pub fn new(folder: Arc<WorkspaceFolderEntry>, mode: CoderMode) -> Self {
+		Self { folder, mode }
+	}
+}
+
 /// Tools are dispatched by name. The registry holds the JSON-schema
-/// descriptors handed to the LLM, the workspace registry the
-/// runtime needs to resolve the active folder, and the workspaces
+/// descriptors handed to the LLM, the workspace registry the runtime
+/// needs to resolve container state for `bash`, and the workspaces
 /// state-dir parent so `bash` can ask `moon-container` whether the
-/// workspace shell container is running.
+/// workspace shell container is running. The per-call folder + mode
+/// arrive via [`ToolContext`] on each [`dispatch`](Self::dispatch).
 #[derive(Clone)]
 pub struct ToolRegistry {
 	workspaces: Arc<WorkspaceRegistry>,
@@ -69,6 +124,20 @@ impl ToolRegistry {
 			workspaces,
 			workspaces_dir,
 		}
+	}
+
+	/// Build a [`ToolContext`] from the workspace's current active
+	/// folder. Callers that already know the folder (sub-agent
+	/// runner) construct `ToolContext::new` directly; this helper
+	/// is the convenience the parent's `run_turn` uses to keep its
+	/// "active folder is the parent folder" invariant in one spot.
+	pub async fn context_for_active(&self, mode: CoderMode) -> Result<ToolContext, CoderError> {
+		let folder = self
+			.workspaces
+			.active_folder()
+			.await
+			.ok_or(CoderError::NoActiveFolder)?;
+		Ok(ToolContext::new(folder, mode))
 	}
 
 	/// Tool definitions to advertise to the model on every chat call.
@@ -197,19 +266,40 @@ impl ToolRegistry {
 		]
 	}
 
-	pub async fn dispatch(&self, name: &str, args: &Value, cancel: &CancellationToken) -> Result<Value, CoderError> {
+	pub async fn dispatch(
+		&self,
+		name: &str,
+		args: &Value,
+		cx: &ToolContext,
+		cancel: &CancellationToken,
+	) -> Result<Value, CoderError> {
 		match name {
-			"read_file" => self.read_file(args).await,
-			"list_dir" => self.list_dir(args).await,
-			"grep" => self.grep(args).await,
-			"bash" => self.bash(args, cancel).await,
-			"write_file" => self.write_file(args).await,
-			"edit_file" => self.edit_file(args).await,
+			"read_file" => self.read_file(args, cx).await,
+			"list_dir" => self.list_dir(args, cx).await,
+			"grep" => self.grep(args, cx).await,
+			// `bash` deliberately is *not* mode-gated: a Research
+			// sub-agent gets to run inspection commands (`git log`,
+			// `cargo check`, `pytest --collect-only`, …). The
+			// "don't mutate" half is enforced via the sub-agent's
+			// system prompt — see Phase C's `run_subagent`.
+			"bash" => self.bash(args, cx, cancel).await,
+			"write_file" => {
+				if !cx.mode.allows_writes() {
+					return Err(CoderError::read_only_mode("write_file"));
+				}
+				self.write_file(args, cx).await
+			}
+			"edit_file" => {
+				if !cx.mode.allows_writes() {
+					return Err(CoderError::read_only_mode("edit_file"));
+				}
+				self.edit_file(args, cx).await
+			}
 			other => Err(CoderError::UnknownTool(other.to_string())),
 		}
 	}
 
-	async fn read_file(&self, args: &Value) -> Result<Value, CoderError> {
+	async fn read_file(&self, args: &Value, cx: &ToolContext) -> Result<Value, CoderError> {
 		#[derive(Deserialize)]
 		struct ReadFileArgs {
 			path: String,
@@ -231,11 +321,7 @@ impl ToolRegistry {
 		if matches!(parsed.start_line, Some(0)) || matches!(parsed.end_line, Some(0)) {
 			return Err(CoderError::invalid_args("read_file", "line numbers are 1-based"));
 		}
-		let folder = self
-			.workspaces
-			.active_folder()
-			.await
-			.ok_or(CoderError::NoActiveFolder)?;
+		let folder = &cx.folder;
 		let result = folder.host.read_file(Utf8Path::new(&parsed.path)).await?;
 		if result.is_binary {
 			return Err(CoderError::tool_failed("read_file", "binary file"));
@@ -262,7 +348,7 @@ impl ToolRegistry {
 		}))
 	}
 
-	async fn list_dir(&self, args: &Value) -> Result<Value, CoderError> {
+	async fn list_dir(&self, args: &Value, cx: &ToolContext) -> Result<Value, CoderError> {
 		#[derive(Deserialize)]
 		struct ListDirArgs {
 			#[serde(default = "default_dot")]
@@ -273,11 +359,7 @@ impl ToolRegistry {
 		}
 		let parsed: ListDirArgs =
 			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("list_dir", err.to_string()))?;
-		let folder = self
-			.workspaces
-			.active_folder()
-			.await
-			.ok_or(CoderError::NoActiveFolder)?;
+		let folder = &cx.folder;
 		let entries = folder.host.read_dir(Utf8Path::new(&parsed.path)).await?;
 		let mut out = String::new();
 		for e in &entries {
@@ -299,7 +381,7 @@ impl ToolRegistry {
 		}))
 	}
 
-	async fn grep(&self, args: &Value) -> Result<Value, CoderError> {
+	async fn grep(&self, args: &Value, cx: &ToolContext) -> Result<Value, CoderError> {
 		#[derive(Deserialize)]
 		struct GrepArgs {
 			pattern: String,
@@ -310,11 +392,7 @@ impl ToolRegistry {
 		}
 		let parsed: GrepArgs =
 			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("grep", err.to_string()))?;
-		let folder = self
-			.workspaces
-			.active_folder()
-			.await
-			.ok_or(CoderError::NoActiveFolder)?;
+		let folder = &cx.folder;
 		// We don't have a `WorkspaceHost::content_search` method yet —
 		// the existing `moon_core::search::search_content` is a free
 		// function that takes a `Utf8Path` root. For local hosts that
@@ -340,7 +418,7 @@ impl ToolRegistry {
 		}))
 	}
 
-	async fn write_file(&self, args: &Value) -> Result<Value, CoderError> {
+	async fn write_file(&self, args: &Value, cx: &ToolContext) -> Result<Value, CoderError> {
 		#[derive(Deserialize)]
 		struct WriteFileArgs {
 			path: String,
@@ -348,11 +426,7 @@ impl ToolRegistry {
 		}
 		let parsed: WriteFileArgs =
 			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("write_file", err.to_string()))?;
-		let folder = self
-			.workspaces
-			.active_folder()
-			.await
-			.ok_or(CoderError::NoActiveFolder)?;
+		let folder = &cx.folder;
 		let result = folder
 			.host
 			.save_file(Utf8Path::new(&parsed.path), &parsed.content)
@@ -364,7 +438,7 @@ impl ToolRegistry {
 		}))
 	}
 
-	async fn edit_file(&self, args: &Value) -> Result<Value, CoderError> {
+	async fn edit_file(&self, args: &Value, cx: &ToolContext) -> Result<Value, CoderError> {
 		#[derive(Deserialize)]
 		struct EditFileArgs {
 			path: String,
@@ -378,11 +452,7 @@ impl ToolRegistry {
 		if parsed.find.is_empty() {
 			return Err(CoderError::invalid_args("edit_file", "`find` must not be empty"));
 		}
-		let folder = self
-			.workspaces
-			.active_folder()
-			.await
-			.ok_or(CoderError::NoActiveFolder)?;
+		let folder = &cx.folder;
 		let path = Utf8Path::new(&parsed.path);
 		let original = folder.host.read_file(path).await?;
 		if original.is_binary {
@@ -435,7 +505,7 @@ impl ToolRegistry {
 		}))
 	}
 
-	async fn bash(&self, args: &Value, cancel: &CancellationToken) -> Result<Value, CoderError> {
+	async fn bash(&self, args: &Value, cx: &ToolContext, cancel: &CancellationToken) -> Result<Value, CoderError> {
 		#[derive(Deserialize)]
 		struct BashArgs {
 			cmd: String,
@@ -444,18 +514,14 @@ impl ToolRegistry {
 		}
 		let parsed: BashArgs =
 			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("bash", err.to_string()))?;
-		let folder = self
-			.workspaces
-			.active_folder()
-			.await
-			.ok_or(CoderError::NoActiveFolder)?;
+		let folder = &cx.folder;
 		let timeout = parsed
 			.timeout_ms
 			.map(Duration::from_millis)
 			.unwrap_or(BASH_DEFAULT_TIMEOUT)
 			.min(BASH_MAX_TIMEOUT);
 
-		let (mut command, target_kind) = self.build_bash_command(&folder, &parsed.cmd).await?;
+		let (mut command, target_kind) = self.build_bash_command(folder, &parsed.cmd).await?;
 		command
 			.kill_on_drop(true)
 			.stdin(std::process::Stdio::null())

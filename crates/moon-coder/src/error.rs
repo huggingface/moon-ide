@@ -73,6 +73,16 @@ pub enum CoderError {
 	#[error("tool {tool} failed: {message}")]
 	ToolFailed { tool: String, message: String },
 
+	/// A mutating tool was called from a sub-agent running in
+	/// `Research` mode. Surfaces back to the model as the tool's
+	/// `is_error: true` result so it learns to either spawn a
+	/// `coder`-mode sub-agent for the edit or report findings only.
+	/// Lives at the dispatch boundary as a hard gate (rather than
+	/// just a system-prompt instruction) so a confused model can't
+	/// silently mutate when the parent told the sub-agent not to.
+	#[error("tool {tool} not available in research mode (read-only sub-agent)")]
+	ReadOnlyMode { tool: String },
+
 	/// User aborted the turn via the panel's stop button / Esc. The
 	/// loop returns this as the `Err(_)` of the `prompt` future so
 	/// the caller can emit `CoderEvent::Aborted` with no further
@@ -119,6 +129,10 @@ impl CoderError {
 			tool: tool.into(),
 			message: message.into(),
 		}
+	}
+
+	pub fn read_only_mode(tool: impl Into<String>) -> Self {
+		Self::ReadOnlyMode { tool: tool.into() }
 	}
 }
 

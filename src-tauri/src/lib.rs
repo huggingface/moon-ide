@@ -115,6 +115,7 @@ pub fn run() {
 			commands::slack::slack_mark_read,
 			commands::slack::slack_post_message,
 			commands::coder::coder_status,
+			commands::coder::coder_folder_summary,
 			commands::coder::coder_start_device_flow,
 			commands::coder::coder_poll_device_code,
 			commands::coder::coder_sign_out,
@@ -156,6 +157,11 @@ pub fn run() {
 			// default and tie them to the on-disk path rather than
 			// the user's account.
 			let coder_sessions_dir = moon_ide_data.join("coder-sessions");
+			// Sibling cache for per-folder one-line descriptions
+			// fed into the parent's "Bound folders" system-prompt
+			// section. Same XDG root as sessions; same per-machine
+			// scope; managed entirely by `moon-coder`.
+			let folder_summaries_dir = moon_ide_data.join("folder-summaries");
 
 			// Build the shared client cell first, spawn the Slack
 			// poller against it, then hand the same Arc to AppState
@@ -181,8 +187,13 @@ pub fn run() {
 			// would dispatch tools against an empty registry and
 			// every `read_file` would fail with `NoActiveFolder`.
 			let workspaces = Arc::new(WorkspaceRegistry::new());
-			let coder = CoderHandle::new(workspaces.clone(), workspaces_dir.clone(), coder_sessions_dir)
-				.map_err(|err| format!("could not init moon-coder: {err}"))?;
+			let coder = CoderHandle::new(
+				workspaces.clone(),
+				workspaces_dir.clone(),
+				coder_sessions_dir,
+				folder_summaries_dir,
+			)
+			.map_err(|err| format!("could not init moon-coder: {err}"))?;
 			commands::coder::spawn_event_pump(app.handle().clone(), coder.clone());
 
 			let state = AppState::new(

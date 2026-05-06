@@ -21,10 +21,12 @@ import { ipc } from './ipc';
 import {
 	formatError,
 	type CoderEvent,
+	type CoderEventEnvelope,
 	type CoderSessionSummary,
 	type CoderStatus,
 	type DeviceCode,
 	type HfIdentity,
+	type SubagentMode,
 } from './protocol';
 import { rightPanel } from './rightPanel.svelte';
 
@@ -48,8 +50,45 @@ export type CoderRow =
 
 /** Which view of the Coder panel is mounted. `'list'` shows the
  *  sessions list (mirrors the Slack panel's "← Sessions" gesture);
- *  `'session'` shows an active session's transcript + composer. */
-export type CoderView = 'list' | 'session';
+ *  `'session'` shows an active session's transcript + composer;
+ *  `'subagent'` is the pop-out for a single sub-agent's full
+ *  transcript — back-arrow returns to the parent's session. */
+export type CoderView = 'list' | 'session' | 'subagent';
+
+/** Status of one sub-agent currently visible in the parent's
+ *  transcript. Drives the collapsed card under each `spawn_subagent`
+ *  tool row: `running` while events stream in, `done` /
+ *  `error` / `aborted` once `subagent_finished` lands. */
+export type SubagentStatus = 'running' | 'done' | 'error';
+
+/** Summary card displayed inline under a `spawn_subagent` tool
+ *  call in the parent's transcript. Keyed by `toolCallId` so the
+ *  card lookup matches the tool row's stable id. */
+export type SubagentSummary = {
+	id: string;
+	toolCallId: string;
+	targetFolder: string;
+	mode: SubagentMode;
+	status: SubagentStatus;
+	resultPreview: string | null;
+	tokensUsedEstimate: number;
+	subSessionId: string | null;
+};
+
+/** Full transcript for one sub-agent, populated incrementally
+ *  from `subagent_event` arrivals. The pop-out view (`view ===
+ *  'subagent'`) renders these rows with the same components the
+ *  parent transcript uses. In-memory only — closing + reopening
+ *  the parent session today does not reload prior sub-agent
+ *  transcripts from disk (lands when the sub-agent JSONL replay
+ *  hits the frontend). */
+export type SubagentTranscript = {
+	id: string;
+	toolCallId: string;
+	mode: SubagentMode;
+	targetFolder: string;
+	rows: CoderRow[];
+};
 
 /** One piece of editor context the user has attached to the
  *  composer via the Ctrl+L "add to chat" gesture (mirrors
@@ -73,6 +112,39 @@ export type ComposerAttachment = {
 	text: string;
 };
 
+/** Per-bound-folder UI state. One instance per folder we've ever
+ *  routed an event for; lazily created via
+ *  [`CoderPanelState.bucketFor`]. Held in `byFolder` map keyed by
+ *  the folder's absolute path (matches `WorkspaceFolder.path`).
+ *
+ *  Per-folder so that a turn running in folder X keeps streaming
+ *  rows / busy / sub-agent updates into X's bucket while the user
+ *  is browsing folder Y — switching active folder swaps which
+ *  bucket the panel reads from, no IPC, no state loss. Per the
+ *  multi-session decision: composer draft and attachments live
+ *  here too, so each project's typed-but-unsent prose survives a
+ *  folder hop. */
+class FolderViewState {
+	rows = $state<CoderRow[]>([]);
+	busy = $state(false);
+	activeSession = $state<CoderSessionSummary | null>(null);
+	view = $state<CoderView>('session');
+	viewSubagentId = $state<string | null>(null);
+	subagentSummaries = $state<Map<string, SubagentSummary>>(new Map());
+	subagentTranscripts = $state<Map<string, SubagentTranscript>>(new Map());
+	sessions = $state<CoderSessionSummary[] | null>(null);
+	draft = $state('');
+	attachments = $state<ComposerAttachment[]>([]);
+}
+
+/** Sentinel folder key used when no workspace folder is active.
+ *  Pre-binding the agent panel still lets the user start typing
+ *  into the composer; the draft stays under this key until a
+ *  folder gets bound (at which point fresh state spins up for
+ *  that folder). Empty string is convenient because it can never
+ *  collide with a real absolute path. */
+const NO_FOLDER_KEY = '';
+
 class CoderPanelState {
 	/** Whether the right-side slot is currently mounted with the
 	 *  coder surface. Derived from the shared `rightPanel.kind` —
@@ -81,29 +153,13 @@ class CoderPanelState {
 		return rightPanel.kind === 'coder';
 	}
 
-	/** Latest `coder_status`. `null` before the first call. */
+	/** Latest `coder_status`. `null` before the first call. Global
+	 *  (auth + bash_target are workspace-wide concepts). */
 	status = $state<CoderStatus | null>(null);
 
-	/** Sessions list snapshot, refreshed on `session_list_changed`
-	 *  or after `coder_open_session` / `coder_delete_session`.
-	 *  `null` until the first fetch lands so the UI can show a
-	 *  loading state vs. "no sessions yet". */
-	sessions = $state<CoderSessionSummary[] | null>(null);
-
-	/** Metadata for the session currently mounted in memory. `null`
-	 *  for a fresh session that hasn't received its first user
-	 *  message yet — the panel renders the "send a prompt to
-	 *  start" state in that case. */
-	activeSession = $state<CoderSessionSummary | null>(null);
-
-	/** Which view of the panel to render — sessions list vs
-	 *  transcript. Defaults to `'session'` so a relaunch with a
-	 *  remembered session id lands the user back in their last
-	 *  conversation; the panel switches to `'list'` when the user
-	 *  hits "← Sessions". */
-	view = $state<CoderView>('session');
-
-	/** Active device-flow code, while the connect modal is open. */
+	/** Active device-flow code, while the connect modal is open.
+	 *  Global — the device flow lives at the auth layer, not per
+	 *  project. */
 	deviceCode = $state<DeviceCode | null>(null);
 
 	/** UI flag while `coder_start_device_flow` is in flight. */
@@ -115,25 +171,142 @@ class CoderPanelState {
 	/** Latest sign-in error (device-flow expired, denied, network). */
 	signInError = $state<string | null>(null);
 
-	/** Whether a turn is currently running locally — drives the
-	 *  composer disable + the stop-button visibility. The backend's
-	 *  authoritative `busy` flag lands via `coder_status`; we keep a
-	 *  derived local copy that flips immediately on `send`/event so
-	 *  the UI doesn't lag. */
-	busy = $state(false);
+	/** Cached "Bound folders" descriptions populated by
+	 *  `folder_summary_ready` events. Folder absolute path →
+	 *  description text. Used by the project-bar tooltip
+	 *  (follow-up plan) and the sub-agent target picker preview.
+	 *  Shared across folder buckets — descriptions are inherently
+	 *  per-folder data, but every folder's UI may want to read any
+	 *  folder's description. */
+	folderDescriptions = $state<Map<string, string>>(new Map());
 
-	/** Transcript rows in display order. Cleared on sign-out. */
-	rows = $state<CoderRow[]>([]);
+	/** Per-folder UI state buckets. Keyed by absolute path.
+	 *  Lazily populated via [`bucketFor`]; never explicitly
+	 *  removed (cheap, and a folder rebound after removal gets
+	 *  the same bucket back, which is what the user expects).
+	 *  The map itself is **not** `$state` — only the inner
+	 *  `FolderViewState`'s `$state` fields drive component
+	 *  re-renders, so we don't need to re-allocate the map on
+	 *  every bucket access. */
+	byFolder = new Map<string, FolderViewState>();
 
-	/** Current composer draft. Frontend-only — not persisted in
-	 *  6.0 because the session itself isn't persisted. */
-	draft = $state('');
+	/** Absolute path of the currently active workspace folder, or
+	 *  `null` when none is bound. Updated externally via
+	 *  [`setActiveFolder`] from `state.svelte.ts` whenever the
+	 *  workspace switches active folder; `coder.svelte.ts` deliberately
+	 *  does not import `state.svelte.ts` to avoid the cycle. The
+	 *  `current` getter reads this so all per-folder accessors
+	 *  re-run via Svelte's reactivity when the user switches
+	 *  projects. */
+	activeFolderPath = $state<string | null>(null);
 
-	/** Editor selections / files the user has attached to the next
-	 *  outgoing message. Cleared on send. Each chip carries its
-	 *  text snapshot so a later edit to the file doesn't change
-	 *  the agent context. */
-	attachments = $state<ComposerAttachment[]>([]);
+	/** Convenience: forwards to `bucketFor(activeFolderPath)`.
+	 *  Reading any per-folder field through this getter sets up
+	 *  a reactivity dependency on `activeFolderPath`, so a folder
+	 *  switch re-renders the panel against the new bucket. */
+	get current(): FolderViewState {
+		return this.bucketFor(this.activeFolderPath ?? NO_FOLDER_KEY);
+	}
+
+	/** Look up (and lazily create) the bucket for a specific folder.
+	 *  Used by the event dispatcher to route incoming envelopes to
+	 *  the right folder's UI state, even for folders the user has
+	 *  never visited yet (a sub-agent spawn from another folder, a
+	 *  background turn finishing while the user is elsewhere, etc.). */
+	bucketFor(folder: string): FolderViewState {
+		let entry = this.byFolder.get(folder);
+		if (!entry) {
+			entry = new FolderViewState();
+			this.byFolder.set(folder, entry);
+		}
+		return entry;
+	}
+
+	/** Surface an "is anything running anywhere" flag for the
+	 *  status-bar pip / global indicators. Walks every bucket; cheap
+	 *  because we have at most a few folders bound at once. */
+	get anyBusy(): boolean {
+		for (const bucket of this.byFolder.values()) {
+			if (bucket.busy) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// Per-folder field forwards. Components keep reading
+	// `coder.rows`, `coder.busy`, etc. unchanged — the indirection
+	// through `current` keeps them on the right bucket while the
+	// user navigates between projects.
+	get sessions(): CoderSessionSummary[] | null {
+		return this.current.sessions;
+	}
+	set sessions(value: CoderSessionSummary[] | null) {
+		this.current.sessions = value;
+	}
+
+	get activeSession(): CoderSessionSummary | null {
+		return this.current.activeSession;
+	}
+	set activeSession(value: CoderSessionSummary | null) {
+		this.current.activeSession = value;
+	}
+
+	get view(): CoderView {
+		return this.current.view;
+	}
+	set view(value: CoderView) {
+		this.current.view = value;
+	}
+
+	get busy(): boolean {
+		return this.current.busy;
+	}
+	set busy(value: boolean) {
+		this.current.busy = value;
+	}
+
+	get rows(): CoderRow[] {
+		return this.current.rows;
+	}
+	set rows(value: CoderRow[]) {
+		this.current.rows = value;
+	}
+
+	get subagentSummaries(): Map<string, SubagentSummary> {
+		return this.current.subagentSummaries;
+	}
+	set subagentSummaries(value: Map<string, SubagentSummary>) {
+		this.current.subagentSummaries = value;
+	}
+
+	get subagentTranscripts(): Map<string, SubagentTranscript> {
+		return this.current.subagentTranscripts;
+	}
+	set subagentTranscripts(value: Map<string, SubagentTranscript>) {
+		this.current.subagentTranscripts = value;
+	}
+
+	get viewSubagentId(): string | null {
+		return this.current.viewSubagentId;
+	}
+	set viewSubagentId(value: string | null) {
+		this.current.viewSubagentId = value;
+	}
+
+	get draft(): string {
+		return this.current.draft;
+	}
+	set draft(value: string) {
+		this.current.draft = value;
+	}
+
+	get attachments(): ComposerAttachment[] {
+		return this.current.attachments;
+	}
+	set attachments(value: ComposerAttachment[]) {
+		this.current.attachments = value;
+	}
 
 	/** Counter the panel `$effect`s on to refocus the composer
 	 *  after we mutate it programmatically (e.g. attaching a
@@ -283,6 +456,9 @@ class CoderPanelState {
 	 *  method only needs to flip the panel into the session view. */
 	async openSession(id: string): Promise<void> {
 		this.rows = [];
+		this.subagentSummaries = new Map();
+		this.subagentTranscripts = new Map();
+		this.viewSubagentId = null;
 		this.busy = false;
 		try {
 			const summary = await ipc.coder.openSession(id);
@@ -307,6 +483,9 @@ class CoderPanelState {
 		try {
 			await ipc.coder.newSession();
 			this.rows = [];
+			this.subagentSummaries = new Map();
+			this.subagentTranscripts = new Map();
+			this.viewSubagentId = null;
 			this.activeSession = null;
 			this.view = 'session';
 			this.busy = false;
@@ -325,6 +504,9 @@ class CoderPanelState {
 			if (this.activeSession?.id === id) {
 				this.activeSession = null;
 				this.rows = [];
+				this.subagentSummaries = new Map();
+				this.subagentTranscripts = new Map();
+				this.viewSubagentId = null;
 			}
 		} catch (err) {
 			// eslint-disable-next-line no-console
@@ -357,6 +539,12 @@ class CoderPanelState {
 		try {
 			const next = await ipc.coder.status();
 			this.status = next;
+			// `next.busy` reflects the **active folder's** turn — the
+			// backend filters by active folder so other folders'
+			// background turns don't leak into this pip. The bucket
+			// keeps a per-folder `busy` that flips on the live
+			// event stream; this status probe just reconciles the
+			// active bucket on mount / container-state transitions.
 			this.busy = next.busy;
 		} catch {
 			// Status probe failures are silent: the panel still
@@ -365,14 +553,26 @@ class CoderPanelState {
 		}
 	}
 
+	/** Update the cached active-folder pointer. Called from
+	 *  `state.svelte.ts` whenever the workspace's active folder
+	 *  changes (initial bind, switch, removal). All per-folder
+	 *  field accessors (`coder.rows`, `coder.busy`, …) re-resolve
+	 *  through `current` after this update, so swapping projects
+	 *  is "render the new bucket's `$state` against the panel" —
+	 *  the previous folder's running turn keeps streaming events
+	 *  into its own bucket in the background. */
+	setActiveFolder(path: string | null): void {
+		this.activeFolderPath = path;
+	}
+
 	async wireRuntime(): Promise<void> {
 		if (this.#runtimeWired) {
 			return;
 		}
 		this.#runtimeWired = true;
 		try {
-			const unlisten = await listen<CoderEvent>(CODER_EVENT_CHANNEL, (event) => {
-				this.#applyEvent(event.payload);
+			const unlisten = await listen<CoderEventEnvelope>(CODER_EVENT_CHANNEL, (event) => {
+				this.#dispatchEnvelope(event.payload);
 			});
 			this.#unlisten.push(unlisten);
 		} catch {
@@ -402,12 +602,18 @@ class CoderPanelState {
 		await this.#hydrateSession();
 	}
 
-	/** First-mount session hydration. Tries to restore the active
-	 *  session the runner already has (in dev, HMR keeps it
-	 *  across reloads); if there's none, falls back to the
-	 *  remembered `last_session_id` from `AppState`; if that's
-	 *  also missing or no longer exists in the active folder,
-	 *  shows the sessions list view. Best-effort throughout. */
+	/** First-mount session hydration for the **active folder**.
+	 *  Tries to restore the active folder's in-memory session
+	 *  the backend already has (e.g. survived an HMR reload);
+	 *  if there's none, falls back to the remembered
+	 *  `last_session_by_folder[<active>]` from `AppState`;
+	 *  if that's also missing or no longer exists, shows the
+	 *  sessions list view. Best-effort throughout.
+	 *
+	 *  Per-folder per the multi-session design: each folder
+	 *  hydrates independently. Switching folders doesn't
+	 *  re-hydrate; folders the user has already visited keep
+	 *  their bucket as it stands. */
 	async #hydrateSession(): Promise<void> {
 		try {
 			const active = await ipc.coder.activeSession();
@@ -421,7 +627,8 @@ class CoderPanelState {
 		}
 		try {
 			const appState = await ipc.appState.load();
-			const id = appState.coder.last_session_id;
+			const folderKey = this.activeFolderPath ?? NO_FOLDER_KEY;
+			const id = appState.coder.last_session_by_folder[folderKey];
 			if (id) {
 				try {
 					await this.openSession(id);
@@ -477,6 +684,9 @@ class CoderPanelState {
 			return;
 		}
 		this.rows = [];
+		this.subagentSummaries = new Map();
+		this.subagentTranscripts = new Map();
+		this.viewSubagentId = null;
 		this.busy = false;
 		await this.refreshStatus();
 	}
@@ -522,11 +732,39 @@ class CoderPanelState {
 		}
 	}
 
-	#applyEvent(event: CoderEvent): void {
+	/** Top-level dispatch for an envelope arriving on
+	 *  `coder:event`. Splits handling between:
+	 *
+	 *  - **Global events** — `folder_summary_ready` updates the
+	 *    cross-folder description cache and is processed once,
+	 *    regardless of which bucket the envelope arrived in.
+	 *  - **Per-folder events** — everything else routes into the
+	 *    bucket named by `envelope.folder`. Sub-agent events
+	 *    naturally inherit their parent's folder (per the
+	 *    backend's tagging contract), so a sub-agent's
+	 *    transcript builds up in the same bucket as the parent
+	 *    that spawned it. */
+	#dispatchEnvelope(envelope: CoderEventEnvelope): void {
+		if (envelope.event.kind === 'folder_summary_ready') {
+			const next = new Map(this.folderDescriptions);
+			next.set(envelope.event.folder, envelope.event.description);
+			this.folderDescriptions = next;
+			return;
+		}
+		const bucket = this.bucketFor(envelope.folder);
+		this.#applyEventToBucket(bucket, envelope.folder, envelope.event);
+	}
+
+	/** Reduce one inner event into `bucket`. Mirrors the
+	 *  pre-multi-session `#applyEvent` body, with `this.X` reads
+	 *  replaced by `bucket.X`. The `folder` argument is needed
+	 *  for `session_list_changed` (we may need to refresh a
+	 *  non-active folder's session list). */
+	#applyEventToBucket(bucket: FolderViewState, folder: string, event: CoderEvent): void {
 		switch (event.kind) {
 			case 'user_message':
-				this.rows = [...this.rows, { kind: 'user', id: event.id, text: event.text }];
-				this.busy = true;
+				bucket.rows = [...bucket.rows, { kind: 'user', id: event.id, text: event.text }];
+				bucket.busy = true;
 				return;
 			case 'assistant_message_start':
 				// Insert the empty bubble so the user sees the row
@@ -534,16 +772,16 @@ class CoderPanelState {
 				// first token. Idempotent: the runner only fires
 				// `start` once per id, but we'd no-op a duplicate
 				// rather than insert a phantom row.
-				if (this.rows.some((r) => r.kind === 'assistant' && r.id === event.id)) {
+				if (bucket.rows.some((r) => r.kind === 'assistant' && r.id === event.id)) {
 					return;
 				}
-				this.rows = [...this.rows, { kind: 'assistant', id: event.id, text: '', thinking: '', thinkingOpen: true }];
+				bucket.rows = [...bucket.rows, { kind: 'assistant', id: event.id, text: '', thinking: '', thinkingOpen: true }];
 				return;
 			case 'assistant_message_delta':
-				this.rows = appendDelta(this.rows, event.id, event.delta, 'text');
+				bucket.rows = appendDelta(bucket.rows, event.id, event.delta, 'text');
 				return;
 			case 'assistant_thinking_delta':
-				this.rows = appendDelta(this.rows, event.id, event.delta, 'thinking');
+				bucket.rows = appendDelta(bucket.rows, event.id, event.delta, 'thinking');
 				return;
 			case 'assistant_message_end':
 				// Canonical replacement at close — see the file
@@ -553,15 +791,15 @@ class CoderPanelState {
 				// the complete text). Auto-collapse the thinking
 				// block: the user already saw it stream, the answer
 				// is the takeaway.
-				this.rows = this.rows.map((row) =>
+				bucket.rows = bucket.rows.map((row) =>
 					row.kind === 'assistant' && row.id === event.id
 						? { ...row, text: event.text, thinking: event.thinking ?? row.thinking, thinkingOpen: false }
 						: row,
 				);
 				return;
 			case 'tool_call':
-				this.rows = [
-					...this.rows,
+				bucket.rows = [
+					...bucket.rows,
 					{
 						kind: 'tool',
 						id: event.id,
@@ -574,23 +812,23 @@ class CoderPanelState {
 				];
 				return;
 			case 'tool_result':
-				this.rows = this.rows.map((row) =>
+				bucket.rows = bucket.rows.map((row) =>
 					row.kind === 'tool' && row.id === event.id
 						? { ...row, result: event.result, hasResult: true, isError: event.is_error }
 						: row,
 				);
 				return;
 			case 'turn_complete':
-				this.busy = false;
+				bucket.busy = false;
 				return;
 			case 'aborted':
-				this.busy = false;
-				this.rows = [...this.rows, { kind: 'aborted', id: `aborted-${Date.now()}` }];
+				bucket.busy = false;
+				bucket.rows = [...bucket.rows, { kind: 'aborted', id: `aborted-${Date.now()}` }];
 				return;
 			case 'error':
-				this.busy = false;
-				this.rows = [
-					...this.rows,
+				bucket.busy = false;
+				bucket.rows = [
+					...bucket.rows,
 					{
 						kind: 'error',
 						id: `error-${Date.now()}`,
@@ -599,33 +837,187 @@ class CoderPanelState {
 				];
 				return;
 			case 'session_loaded':
-				// Reset the transcript and adopt the new session's
-				// metadata. Replay events arrive immediately after
-				// this one (fired by the backend on the same
-				// `coder:event` channel), so the rows fill in on
-				// the next handlers.
-				this.rows = [];
-				this.busy = false;
-				this.activeSession = {
+				// Reset the bucket's transcript and adopt the new
+				// session's metadata. Replay events arrive
+				// immediately after this one (fired by the backend
+				// on the same `coder:event` channel), so the rows
+				// fill in on the next handlers.
+				bucket.rows = [];
+				bucket.subagentSummaries = new Map();
+				bucket.subagentTranscripts = new Map();
+				bucket.viewSubagentId = null;
+				bucket.busy = false;
+				bucket.activeSession = {
 					id: event.id,
 					title: event.title,
 					created_at_ms: event.created_at_ms,
 					updated_at_ms: event.updated_at_ms,
 				};
-				this.view = 'session';
+				bucket.view = 'session';
 				return;
 			case 'session_title_updated':
-				if (this.activeSession?.id === event.id) {
-					this.activeSession = { ...this.activeSession, title: event.title };
+				if (bucket.activeSession?.id === event.id) {
+					bucket.activeSession = { ...bucket.activeSession, title: event.title };
 				}
-				if (this.sessions !== null) {
-					this.sessions = this.sessions.map((s) => (s.id === event.id ? { ...s, title: event.title } : s));
+				if (bucket.sessions !== null) {
+					bucket.sessions = bucket.sessions.map((s) => (s.id === event.id ? { ...s, title: event.title } : s));
 				}
 				return;
 			case 'session_list_changed':
-				void this.refreshSessions();
+				// Re-fetch the folder's session list. We can only
+				// re-fetch the **active** folder's list via the
+				// existing `coder_list_sessions` API (it uses the
+				// active folder server-side). For non-active
+				// folders, the bucket's `sessions` cache will go
+				// stale until the user switches back; cheap to
+				// live with — the next visit refreshes via
+				// `refreshSessions`.
+				if (folder === (this.activeFolderPath ?? NO_FOLDER_KEY)) {
+					void this.refreshSessions();
+				} else {
+					// Mark stale so the next visit force-refetches.
+					bucket.sessions = null;
+				}
 				return;
+			case 'folder_summary_ready':
+				// Handled at the envelope level — see
+				// `#dispatchEnvelope`. Should never reach this
+				// arm; keep the case for exhaustiveness.
+				return;
+			case 'subagent_spawned': {
+				const summary: SubagentSummary = {
+					id: event.subagent_id,
+					toolCallId: event.tool_call_id,
+					targetFolder: event.target_folder,
+					mode: event.mode,
+					status: 'running',
+					resultPreview: null,
+					tokensUsedEstimate: 0,
+					subSessionId: null,
+				};
+				const summaries = new Map(bucket.subagentSummaries);
+				summaries.set(event.tool_call_id, summary);
+				bucket.subagentSummaries = summaries;
+
+				const transcripts = new Map(bucket.subagentTranscripts);
+				transcripts.set(event.subagent_id, {
+					id: event.subagent_id,
+					toolCallId: event.tool_call_id,
+					mode: event.mode,
+					targetFolder: event.target_folder,
+					rows: [],
+				});
+				bucket.subagentTranscripts = transcripts;
+				return;
+			}
+			case 'subagent_event': {
+				const transcripts = new Map(bucket.subagentTranscripts);
+				const existing = transcripts.get(event.subagent_id);
+				if (!existing) {
+					return;
+				}
+				const nextRows = applyInnerEventToRows(existing.rows, event.inner);
+				transcripts.set(event.subagent_id, { ...existing, rows: nextRows });
+				bucket.subagentTranscripts = transcripts;
+				return;
+			}
+			case 'subagent_finished': {
+				const summaries = new Map(bucket.subagentSummaries);
+				const summary = findSummaryById(summaries, event.subagent_id);
+				if (!summary) {
+					return;
+				}
+				const transcript = bucket.subagentTranscripts.get(event.subagent_id);
+				const lastAssistant = transcript?.rows
+					.toReversed()
+					.find((row): row is Extract<CoderRow, { kind: 'assistant' }> => row.kind === 'assistant');
+				const preview = lastAssistant?.text.trim() ?? null;
+				summaries.set(summary.toolCallId, {
+					...summary,
+					status: event.was_error ? 'error' : 'done',
+					resultPreview: preview && preview.length > 0 ? preview : summary.resultPreview,
+					tokensUsedEstimate: event.tokens_used_estimate,
+					subSessionId: summary.subSessionId,
+				});
+				bucket.subagentSummaries = summaries;
+				return;
+			}
 		}
+	}
+
+	/** Switch the panel into the sub-agent pop-out view. The
+	 *  back-arrow in `'subagent'` mode returns to the parent's
+	 *  session via [`closeSubagentView`]. */
+	openSubagent(subagentId: string): void {
+		if (!this.subagentTranscripts.has(subagentId)) {
+			return;
+		}
+		this.viewSubagentId = subagentId;
+		this.view = 'subagent';
+	}
+
+	/** Return from a sub-agent pop-out to the parent's session
+	 *  transcript. Keeps the sub-agent's state in
+	 *  `subagentTranscripts` so re-opening the same card lands at
+	 *  the same place. */
+	closeSubagentView(): void {
+		this.viewSubagentId = null;
+		this.view = 'session';
+	}
+}
+
+/** Find a `SubagentSummary` in `summaries` whose `id` matches.
+ *  Used by `subagent_finished` (which carries `subagent_id`, not
+ *  the parent's `tool_call_id` we keyed by). */
+function findSummaryById(summaries: Map<string, SubagentSummary>, subagentId: string): SubagentSummary | null {
+	for (const summary of summaries.values()) {
+		if (summary.id === subagentId) {
+			return summary;
+		}
+	}
+	return null;
+}
+
+/** Reduce one inner sub-agent event onto a row list. Mirrors the
+ *  parent's `#applyEvent` row mutations for the assistant + tool
+ *  cases — the only event kinds a sub-agent ever wraps. Other
+ *  kinds (turn_complete, session_*, error, aborted) belong to the
+ *  parent's lifecycle and are handled at the outer level. */
+function applyInnerEventToRows(rows: CoderRow[], event: CoderEvent): CoderRow[] {
+	switch (event.kind) {
+		case 'assistant_message_start':
+			return [...rows, { kind: 'assistant', id: event.id, text: '', thinking: '', thinkingOpen: true }];
+		case 'assistant_message_delta':
+			return appendDelta(rows, event.id, event.delta, 'text');
+		case 'assistant_thinking_delta':
+			return appendDelta(rows, event.id, event.delta, 'thinking');
+		case 'assistant_message_end':
+			return rows.map((row) =>
+				row.kind === 'assistant' && row.id === event.id
+					? { ...row, text: event.text, thinking: event.thinking ?? row.thinking, thinkingOpen: false }
+					: row,
+			);
+		case 'tool_call':
+			return [
+				...rows,
+				{
+					kind: 'tool',
+					id: event.id,
+					name: event.name,
+					args: event.args,
+					result: undefined,
+					hasResult: false,
+					isError: false,
+				},
+			];
+		case 'tool_result':
+			return rows.map((row) =>
+				row.kind === 'tool' && row.id === event.id
+					? { ...row, result: event.result, hasResult: true, isError: event.is_error }
+					: row,
+			);
+		default:
+			return rows;
 	}
 }
 

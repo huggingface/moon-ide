@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import { confirm } from '@tauri-apps/plugin-dialog';
-	import { coder } from '../coder.svelte';
+	import { coder, type CoderRow } from '../coder.svelte';
 	import { slack } from '../slack.svelte';
 	import { workspace } from '../state.svelte';
 	import CoderConnectModal from './CoderConnectModal.svelte';
@@ -331,7 +331,7 @@
 				</ul>
 			{/if}
 		</div>
-	{:else}
+	{:else if coder.view === 'session'}
 		<!-- Sticky in-session header: a small back-to-list affordance,
 			 the session title (centre, prominent), and the "+ new"
 			 button. Both buttons inherit `.icon`'s muted styling so
@@ -361,102 +361,7 @@
 				</p>
 			{/if}
 			{#each coder.rows as row (row.id)}
-				{#if row.kind === 'user'}
-					{@const parsed = parseUserPrompt(row.text)}
-					<div class="row user">
-						<div class="row-label">you</div>
-						{#if parsed.prose.trim().length > 0}
-							<div class="bubble">{parsed.prose}</div>
-						{/if}
-						{#if parsed.attachments.length > 0}
-							<!-- The context block the user attached at send
-								 time, rendered as clickable chips instead
-								 of a verbatim XML wall in the bubble.
-								 Clicking opens the file at the captured
-								 starting line — the file may have changed
-								 since (the agent likely just edited it),
-								 so this is a "navigate to the spot I
-								 referenced" gesture, not "show me what I
-								 sent". -->
-							<div class="user-refs">
-								{#each parsed.attachments as ref, i (ref.path + ':' + ref.startLine + '-' + ref.endLine + ':' + i)}
-									<button
-										type="button"
-										class="user-ref"
-										title={`${ref.path}:${ref.startLine}-${ref.endLine}`}
-										onclick={() =>
-											onOpenAttachment({
-												path: ref.path,
-												startLine: ref.startLine,
-											})}
-									>
-										<FileIcon />
-										<span class="user-ref-label">
-											<span class="user-ref-name">{baseName(ref.path)}</span>
-											<span class="user-ref-range"
-												>{ref.startLine === ref.endLine
-													? `:${ref.startLine}`
-													: `:${ref.startLine}-${ref.endLine}`}</span
-											>
-										</span>
-									</button>
-								{/each}
-							</div>
-						{/if}
-					</div>
-				{:else if row.kind === 'assistant'}
-					<div class="row assistant">
-						<div class="row-label">coder</div>
-						{#if row.thinking.length > 0}
-							<!-- Reasoning trace. Open while streaming so the user
-								 sees thoughts land, collapsed once the message
-								 finishes (the `assistant_message_end` handler
-								 flips `thinkingOpen`). The component pins the
-								 inner scroll to the bottom only while pinned by
-								 the user, same gesture as a chat thread. -->
-							<CoderThinking
-								text={row.thinking}
-								open={row.thinkingOpen}
-								onOpenChange={(next) => (row.thinkingOpen = next)}
-								streaming={row.text.length === 0}
-							/>
-						{/if}
-						{#if row.text.trim().length > 0}
-							<!-- Trim before the visibility check so a
-								 model that ends with just whitespace
-								 (e.g. tool-only turn that emitted a
-								 trailing `\n`) doesn't render an
-								 empty grey rectangle below the
-								 thinking block. The actual text we
-								 hand to `CoderMarkdown` is untrimmed
-								 — preserving leading whitespace is
-								 the renderer's job. -->
-							<div class="bubble assistant-bubble">
-								<CoderMarkdown text={row.text} />
-							</div>
-						{/if}
-					</div>
-				{:else if row.kind === 'tool'}
-					<div class="row tool" class:err={row.isError}>
-						<div class="row-label">tool · {row.name}</div>
-						<details>
-							<summary>{!row.hasResult ? 'running…' : row.isError ? 'error' : 'ok'}</summary>
-							<div class="block-label">args</div>
-							<pre class="block">{fmtArgs(row.args)}</pre>
-							{#if row.hasResult}
-								<div class="block-label">result</div>
-								<pre class="block">{fmtArgs(row.result)}</pre>
-							{/if}
-						</details>
-					</div>
-				{:else if row.kind === 'aborted'}
-					<div class="row notice">aborted</div>
-				{:else if row.kind === 'error'}
-					<div class="row error" role="alert">
-						<div class="row-label">error</div>
-						<div class="bubble">{row.text}</div>
-					</div>
-				{/if}
+				{@render rowMarkup(row, true)}
 			{/each}
 		</div>
 		<div class="composer">
@@ -511,12 +416,204 @@
 				onkeydown={onComposerKey}
 			></textarea>
 		</div>
+	{:else if coder.view === 'subagent'}
+		<!-- Sub-agent pop-out: full transcript of one sub-agent, with
+			 a back-arrow returning to the parent's session. No
+			 composer (sub-agents take their task at spawn time and
+			 finish on their own; the user can't drive them
+			 mid-flight). The row renderer is the same one the
+			 parent uses, so streaming sub-agents update live in
+			 this view too. -->
+		{@const subId = coder.viewSubagentId}
+		{@const transcript = subId !== null ? (coder.subagentTranscripts.get(subId) ?? null) : null}
+		<header class="session-bar">
+			<button
+				type="button"
+				class="icon"
+				onclick={() => coder.closeSubagentView()}
+				title="Back to parent"
+				aria-label="Back to parent"
+			>
+				← Back
+			</button>
+			{#if transcript !== null}
+				<span class="session-bar-title" title={transcript.targetFolder}>
+					Sub-agent · {baseName(transcript.targetFolder)}
+				</span>
+				<span class="subagent-mode" class:research={transcript.mode === 'research'} title="Sub-agent mode">
+					{transcript.mode}
+				</span>
+			{:else}
+				<span class="session-bar-title">Sub-agent</span>
+				<span></span>
+			{/if}
+		</header>
+		<div class="transcript">
+			{#if transcript === null}
+				<p class="hint">Sub-agent transcript not available. Re-open the parent session to refresh.</p>
+			{:else if transcript.rows.length === 0}
+				<p class="hint">Sub-agent starting…</p>
+			{:else}
+				{#each transcript.rows as row (row.id)}
+					{@render rowMarkup(row, false)}
+				{/each}
+			{/if}
+		</div>
 	{/if}
 </div>
 
 {#if coder.deviceCode || coder.awaitingApproval}
 	<CoderConnectModal />
 {/if}
+
+<!-- Row renderer extracted as a snippet so the parent's session
+	 transcript and the sub-agent pop-out can share it without
+	 duplicating ~80 lines of conditional markup. `withSubagentCards`
+	 controls whether `spawn_subagent` tool rows render the
+	 inline collapsed card; sub-agents themselves can't spawn
+	 sub-sub-agents (depth-1 cap), so the flag is `false` in the
+	 sub-agent view. -->
+{#snippet rowMarkup(row: CoderRow, withSubagentCards: boolean)}
+	{#if row.kind === 'user'}
+		{@const parsed = parseUserPrompt(row.text)}
+		<div class="row user">
+			<div class="row-label">you</div>
+			{#if parsed.prose.trim().length > 0}
+				<div class="bubble">{parsed.prose}</div>
+			{/if}
+			{#if parsed.attachments.length > 0}
+				<!-- The context block the user attached at send
+								 time, rendered as clickable chips instead
+								 of a verbatim XML wall in the bubble.
+								 Clicking opens the file at the captured
+								 starting line — the file may have changed
+								 since (the agent likely just edited it),
+								 so this is a "navigate to the spot I
+								 referenced" gesture, not "show me what I
+								 sent". -->
+				<div class="user-refs">
+					{#each parsed.attachments as ref, i (ref.path + ':' + ref.startLine + '-' + ref.endLine + ':' + i)}
+						<button
+							type="button"
+							class="user-ref"
+							title={`${ref.path}:${ref.startLine}-${ref.endLine}`}
+							onclick={() =>
+								onOpenAttachment({
+									path: ref.path,
+									startLine: ref.startLine,
+								})}
+						>
+							<FileIcon />
+							<span class="user-ref-label">
+								<span class="user-ref-name">{baseName(ref.path)}</span>
+								<span class="user-ref-range"
+									>{ref.startLine === ref.endLine ? `:${ref.startLine}` : `:${ref.startLine}-${ref.endLine}`}</span
+								>
+							</span>
+						</button>
+					{/each}
+				</div>
+			{/if}
+		</div>
+	{:else if row.kind === 'assistant'}
+		<div class="row assistant">
+			<div class="row-label">coder</div>
+			{#if row.thinking.length > 0}
+				<!-- Reasoning trace. Open while streaming so the user
+								 sees thoughts land, collapsed once the message
+								 finishes (the `assistant_message_end` handler
+								 flips `thinkingOpen`). The component pins the
+								 inner scroll to the bottom only while pinned by
+								 the user, same gesture as a chat thread. -->
+				<CoderThinking
+					text={row.thinking}
+					open={row.thinkingOpen}
+					onOpenChange={(next) => (row.thinkingOpen = next)}
+					streaming={row.text.length === 0}
+				/>
+			{/if}
+			{#if row.text.trim().length > 0}
+				<!-- Trim before the visibility check so a
+								 model that ends with just whitespace
+								 (e.g. tool-only turn that emitted a
+								 trailing `\n`) doesn't render an
+								 empty grey rectangle below the
+								 thinking block. The actual text we
+								 hand to `CoderMarkdown` is untrimmed
+								 — preserving leading whitespace is
+								 the renderer's job. -->
+				<div class="bubble assistant-bubble">
+					<CoderMarkdown text={row.text} />
+				</div>
+			{/if}
+		</div>
+	{:else if row.kind === 'tool'}
+		{@const subagent = withSubagentCards ? (coder.subagentSummaries.get(row.id) ?? null) : null}
+		<div class="row tool" class:err={row.isError}>
+			<div class="row-label">tool · {row.name}</div>
+			<details>
+				<summary>{!row.hasResult ? 'running…' : row.isError ? 'error' : 'ok'}</summary>
+				<div class="block-label">args</div>
+				<pre class="block">{fmtArgs(row.args)}</pre>
+				{#if row.hasResult}
+					<div class="block-label">result</div>
+					<pre class="block">{fmtArgs(row.result)}</pre>
+				{/if}
+			</details>
+			{#if subagent !== null}
+				<!-- Collapsed sub-agent card. Renders inline under
+								 the parent's `spawn_subagent` tool row so
+								 the parent transcript stays scannable while
+								 a click pops out into the full sub-agent
+								 transcript view (`coder.view = 'subagent'`).
+								 The mode badge inverts colour scheme by
+								 mode so a research / coder mix-up is
+								 obvious at a glance. -->
+				<button
+					type="button"
+					class="subagent-card"
+					class:done={subagent.status === 'done'}
+					class:running={subagent.status === 'running'}
+					class:err={subagent.status === 'error'}
+					title={`Open sub-agent transcript (${subagent.targetFolder})`}
+					onclick={() => coder.openSubagent(subagent.id)}
+				>
+					<div class="subagent-card-header">
+						<span class="subagent-mode" class:research={subagent.mode === 'research'}>
+							{subagent.mode}
+						</span>
+						<span class="subagent-folder" title={subagent.targetFolder}>
+							{baseName(subagent.targetFolder)}
+						</span>
+						<span class="subagent-status">
+							{#if subagent.status === 'running'}
+								running…
+							{:else if subagent.status === 'error'}
+								error
+							{:else}
+								done
+							{/if}
+						</span>
+					</div>
+					{#if subagent.resultPreview && subagent.resultPreview.length > 0}
+						<div class="subagent-preview">{subagent.resultPreview}</div>
+					{/if}
+					<div class="subagent-footer">
+						<span class="subagent-tokens">~{subagent.tokensUsedEstimate} tok</span>
+						<span class="subagent-open">Open transcript →</span>
+					</div>
+				</button>
+			{/if}
+		</div>
+	{:else if row.kind === 'aborted'}
+		<div class="row notice">aborted</div>
+	{:else if row.kind === 'error'}
+		<div class="row error" role="alert">
+			<div class="row-label">error</div>
+			<div class="bubble">{row.text}</div>
+		</div>
+	{/if}
+{/snippet}
 
 <style>
 	.panel {
@@ -902,6 +999,103 @@
 		margin: 4px 0 0;
 		white-space: pre-wrap;
 		word-break: break-word;
+	}
+	/* Collapsed sub-agent card. Renders inline under the parent's
+	   `spawn_subagent` tool row. Reads as a clickable "pop out"
+	   affordance — click anywhere on the card body, and the panel
+	   swaps to the sub-agent's own transcript view. */
+	.subagent-card {
+		appearance: none;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+		margin-top: 6px;
+		padding: 8px 10px;
+		background: var(--m-bg-overlay);
+		border: 1px solid var(--m-border);
+		border-radius: 6px;
+		color: var(--m-fg);
+		text-align: left;
+		font: inherit;
+		font-size: 12px;
+		cursor: pointer;
+	}
+	.subagent-card:hover {
+		background: var(--m-bg-2);
+		border-color: var(--m-border-strong, var(--m-border));
+	}
+	.subagent-card.running {
+		border-style: dashed;
+	}
+	.subagent-card.err {
+		border-color: var(--m-danger);
+		background: color-mix(in srgb, var(--m-danger) 10%, transparent);
+	}
+	.subagent-card-header {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		font-size: 11px;
+		color: var(--m-fg-muted);
+	}
+	.subagent-folder {
+		flex: 1;
+		min-width: 0;
+		font-weight: 500;
+		font-family: var(--m-font-mono, ui-monospace, monospace);
+		color: var(--m-fg);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.subagent-status {
+		font-size: 10px;
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+	}
+	/* Mode pill: `coder` keeps the accent fill (full toolkit, can
+	   edit), `research` flips to a quieter neutral fill so the
+	   read-only constraint is visually distinct. Same shape as
+	   the SCM panel's changes badge for visual continuity. */
+	.subagent-mode {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		min-width: 0;
+		padding: 1px 6px;
+		border-radius: 999px;
+		background: var(--m-accent);
+		color: var(--m-bg);
+		font-size: 10px;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+		flex-shrink: 0;
+	}
+	.subagent-mode.research {
+		background: var(--m-bg-3, var(--m-bg-2));
+		color: var(--m-fg-muted);
+	}
+	.subagent-preview {
+		font-size: 12px;
+		line-height: 1.4;
+		color: var(--m-fg);
+		display: -webkit-box;
+		-webkit-line-clamp: 2;
+		line-clamp: 2;
+		-webkit-box-orient: vertical;
+		overflow: hidden;
+	}
+	.subagent-footer {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		font-size: 10px;
+		color: var(--m-fg-subtle);
+	}
+	.subagent-open {
+		font-weight: 500;
+		color: var(--m-fg-muted);
 	}
 	.composer {
 		flex-shrink: 0;

@@ -53,6 +53,17 @@ pub async fn coder_status(state: State<'_, AppState>) -> Result<CoderStatus, Moo
 	state.coder.status().await.map_err(MoonError::from)
 }
 
+/// Fetch the cached "Bound folders" description for `folder`
+/// (absolute path matching `WorkspaceFolder.path`). Returns
+/// `None` when the cache is cold or stale — the runner kicks off
+/// regeneration on its next turn, and a `folder_summary_ready`
+/// event will fire when it finishes. Used by the project bar
+/// tooltip and sub-agent picker preview.
+#[tauri::command]
+pub async fn coder_folder_summary(state: State<'_, AppState>, folder: String) -> Result<Option<String>, MoonError> {
+	Ok(state.coder.folder_summary(&folder).await)
+}
+
 /// Kick off the HF device flow. Returns the user/device code pair
 /// immediately. The frontend opens `verification_uri_complete` in
 /// the system browser then calls [`coder_poll_device_code`] to wait
@@ -85,11 +96,16 @@ pub async fn coder_send(state: State<'_, AppState>, text: String) -> Result<(), 
 	state.coder.send(text).await.map_err(MoonError::from)
 }
 
-/// Cancel the active turn, if any. Synchronous; the spawned future
-/// observes the cancellation token on its next `select!` and exits.
+/// Cancel the **active folder's** running turn, if any.
+/// Background turns running in other folders are left alone — the
+/// user has to switch to them and stop manually if they want
+/// (per the multi-session "agents keep running per project"
+/// contract). Async because resolving the active folder + its
+/// `FolderSession` map entry needs `await`.
 #[tauri::command]
-pub fn coder_abort(state: State<'_, AppState>) {
-	state.coder.abort();
+pub async fn coder_abort(state: State<'_, AppState>) -> Result<(), MoonError> {
+	state.coder.abort().await;
+	Ok(())
 }
 
 /// List persisted sessions for the active workspace folder. Empty
@@ -122,7 +138,10 @@ pub async fn coder_new_session(state: State<'_, AppState>) -> Result<SessionSumm
 #[tauri::command]
 pub async fn coder_open_session(state: State<'_, AppState>, id: String) -> Result<SessionSummary, MoonError> {
 	let summary = state.coder.open_session(id).await.map_err(MoonError::from)?;
-	persist_last_session(&state.config_dir, Some(summary.id.clone())).await;
+	let folder = active_folder_path(&state).await;
+	if let Some(folder) = folder {
+		persist_last_session(&state.config_dir, &folder, Some(summary.id.clone())).await;
+	}
 	Ok(summary)
 }
 
@@ -131,32 +150,54 @@ pub async fn coder_open_session(state: State<'_, AppState>, id: String) -> Resul
 #[tauri::command]
 pub async fn coder_delete_session(state: State<'_, AppState>, id: String) -> Result<(), MoonError> {
 	state.coder.delete_session(id.clone()).await.map_err(MoonError::from)?;
-	let mut current = app_state_store::load(&state.config_dir).await?;
-	if current.coder.last_session_id.as_deref() == Some(id.as_str()) {
-		current.coder.last_session_id = None;
-		app_state_store::save(&state.config_dir, &current).await?;
+	let folder = active_folder_path(&state).await;
+	if let Some(folder) = folder {
+		let mut current = app_state_store::load(&state.config_dir).await?;
+		if current.coder.last_session_by_folder.get(&folder).map(|v| v.as_str()) == Some(id.as_str()) {
+			current.coder.last_session_by_folder.remove(&folder);
+			app_state_store::save(&state.config_dir, &current).await?;
+		}
 	}
 	Ok(())
 }
 
-/// Persist the last-opened session id so a relaunch lands the
-/// user back in the right transcript. Best-effort: a write
-/// failure logs but doesn't fail the open call. `None` clears
-/// the pointer (e.g. the user just deleted the session).
-async fn persist_last_session(config_dir: &camino::Utf8Path, id: Option<String>) {
+/// Persist the last-opened session id for the given workspace
+/// folder so a relaunch lands the user back in the right
+/// transcript per project. Best-effort: a write failure logs but
+/// doesn't fail the open call. `None` clears the entry (e.g. the
+/// user just deleted the session).
+async fn persist_last_session(config_dir: &camino::Utf8Path, folder: &str, id: Option<String>) {
 	let current = match app_state_store::load(config_dir).await {
 		Ok(state) => state,
 		Err(err) => {
-			tracing::warn!(error = %err, "could not load app state to persist last_session_id");
+			tracing::warn!(error = %err, "could not load app state to persist last session id");
 			return;
 		}
 	};
-	if current.coder.last_session_id == id {
-		return;
-	}
 	let mut next = current;
-	next.coder.last_session_id = id;
-	if let Err(err) = app_state_store::save(config_dir, &next).await {
-		tracing::warn!(error = %err, "could not persist last_session_id");
+	let existing = next.coder.last_session_by_folder.get(folder).cloned();
+	match (existing, id) {
+		(Some(prev), Some(new)) if prev == new => return,
+		(None, None) => return,
+		(_, Some(new)) => {
+			next.coder.last_session_by_folder.insert(folder.to_string(), new);
+		}
+		(_, None) => {
+			next.coder.last_session_by_folder.remove(folder);
+		}
 	}
+	if let Err(err) = app_state_store::save(config_dir, &next).await {
+		tracing::warn!(error = %err, "could not persist last session id");
+	}
+}
+
+/// Active workspace folder's absolute path, or `None` when the
+/// workspace is empty / no folder is bound. Used by the
+/// per-folder persistence helpers.
+async fn active_folder_path(state: &AppState) -> Option<String> {
+	state
+		.workspaces
+		.active_folder()
+		.await
+		.map(|entry| entry.folder.path.clone())
 }

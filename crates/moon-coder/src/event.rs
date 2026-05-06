@@ -6,6 +6,23 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Outer envelope carrying a folder tag alongside the inner
+/// [`CoderEvent`]. Every event the runner emits goes through this
+/// shape on the wire so the multi-session frontend can route
+/// updates to the right per-folder UI bucket.
+///
+/// Folder is the absolute path of the **session's bound folder**
+/// (matches `WorkspaceFolder.path`), even for sub-agent events:
+/// sub-agents belong to whichever project originated them, so a
+/// `SubagentEvent` arrives tagged with the **parent's** folder
+/// regardless of which folder the sub-agent's tools operate on
+/// (`target_folder` lives inside `SubagentSpawned.target_folder`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoderEventEnvelope {
+	pub folder: String,
+	pub event: CoderEvent,
+}
+
 /// One push event the loop sends to the panel. Tagged enum so the
 /// UI can `switch (event.kind)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +126,48 @@ pub enum CoderEvent {
 	/// rather than us pushing the full list — keeps the wire
 	/// shape small at the cost of one extra round trip.
 	SessionListChanged,
+
+	/// A bound folder's cached summary just refreshed. The runner
+	/// uses this to refresh the parent's "Bound folders" section in
+	/// the system prompt on the next turn; the project bar can
+	/// also re-fetch via `coder_folder_summary` to update tooltips
+	/// without polling. Carries the absolute folder path (matches
+	/// `WorkspaceFolder.path`) so the frontend can route by exact
+	/// match without recomputing slugs.
+	FolderSummaryReady { folder: String, description: String },
+
+	/// A new sub-agent has been registered against a parent
+	/// `tool_call_id`. Frontend uses this to insert a collapsed
+	/// summary card under the spawn_subagent tool row. `mode` is
+	/// the wire string ("research" / "coder") so the UI badge
+	/// renders without re-deriving the enum.
+	SubagentSpawned {
+		tool_call_id: String,
+		subagent_id: String,
+		target_folder: String,
+		mode: String,
+	},
+
+	/// One inner event from a sub-agent's runner. The frontend
+	/// routes by `subagent_id` into the per-sub-agent transcript
+	/// store and renders `inner` with the same row components the
+	/// parent transcript uses. Boxed because `CoderEvent` is
+	/// recursive — `SubagentEvent.inner` is itself a `CoderEvent`.
+	SubagentEvent {
+		subagent_id: String,
+		inner: Box<CoderEvent>,
+	},
+
+	/// A sub-agent has finished (success or error). Frontend flips
+	/// the collapsed card's status pip and stops accepting deltas
+	/// for the matching `subagent_id`. `tokens_used_estimate` is
+	/// approximated from message bytes today; precise tracking
+	/// arrives when streaming `usage` is plumbed.
+	SubagentFinished {
+		subagent_id: String,
+		tokens_used_estimate: u32,
+		was_error: bool,
+	},
 }
 
 /// Snapshot of the agent's auth + session state. Returned from

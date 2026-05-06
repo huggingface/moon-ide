@@ -255,14 +255,15 @@ container-bound tools without the agent loop knowing.
 The schema is JSON-Schema in the request to the LLM; the
 implementations are typed Rust:
 
-| Tool         | Signature                                                                                               | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| ------------ | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `read_file`  | `(path, start_line?, end_line?) -> { content, start_line, end_line, total_lines, truncated, mtime_ms }` | `content` is line-numbered: every line is prefixed with `<line_no>\|<line>` (right-aligned, width sized to the largest visible number). The prefix is metadata, not part of the file. `start_line` / `end_line` are 1-based and inclusive; `end_line` is clamped to EOF and the response echoes the _effective_ range so the model can detect short reads. Refuses paths outside the active workspace folder.                                                                                    |
-| `write_file` | `(path, content) -> { path, bytes_written, mtime_ms }`                                                  | Creates parents only if they exist; agent does `bash mkdir -p` first when it needs to                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `edit_file`  | `(path, find, replace, occurrence?) -> { path, bytes_written, mtime_ms, occurrence, total_matches }`    | `find` is an exact substring (whitespace significant); empty `find` rejected; non-unique match without `occurrence` throws so the LLM retries with more context                                                                                                                                                                                                                                                                                                                                  |
-| `list_dir`   | `(path) -> DirEntry[]`                                                                                  | Honours the same gitignore-aware walk the file tree uses                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `grep`       | `(pattern, case_sensitive?, max_matches?) -> { pattern, matches, count, truncated }`                    | `matches` is one hit per line in `path:line: text` form (line is 1-based). The exact line numbers feed back into `read_file`'s `start_line` / `end_line` so the typical loop is `grep` → narrow `read_file` → `edit_file`. Backed by the existing `ignore`/ripgrep dep.                                                                                                                                                                                                                          |
-| `bash`       | `(cmd, timeout_ms?) -> { cmd, target, stdout, stderr, exit_code }`                                      | Routes to `docker exec -w <container_cwd> <name> sh -lc <cmd>` when the workspace shell container's lifecycle status is `Running`, else `sh -lc <cmd>` rooted at the active folder. The decision is made by `tools::resolve_bash_target`, which calls the same `moon_container::Workspace::status()` query `lsp.rs` already uses — so terminals, LSP, and the coder agree on the routing target. `target` field echoes `"host"` / `"container"` so the panel pip and the tool result can't drift |
+| Tool             | Signature                                                                                                                                         | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `read_file`      | `(path, start_line?, end_line?) -> { content, start_line, end_line, total_lines, truncated, mtime_ms }`                                           | `content` is line-numbered: every line is prefixed with `<line_no>\|<line>` (right-aligned, width sized to the largest visible number). The prefix is metadata, not part of the file. `start_line` / `end_line` are 1-based and inclusive; `end_line` is clamped to EOF and the response echoes the _effective_ range so the model can detect short reads. Refuses paths outside the active workspace folder.                                                                                                                                |
+| `write_file`     | `(path, content) -> { path, bytes_written, mtime_ms }`                                                                                            | Creates parents only if they exist; agent does `bash mkdir -p` first when it needs to                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `edit_file`      | `(path, find, replace, occurrence?) -> { path, bytes_written, mtime_ms, occurrence, total_matches }`                                              | `find` is an exact substring (whitespace significant); empty `find` rejected; non-unique match without `occurrence` throws so the LLM retries with more context                                                                                                                                                                                                                                                                                                                                                                              |
+| `list_dir`       | `(path) -> DirEntry[]`                                                                                                                            | Honours the same gitignore-aware walk the file tree uses                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `grep`           | `(pattern, case_sensitive?, max_matches?) -> { pattern, matches, count, truncated }`                                                              | `matches` is one hit per line in `path:line: text` form (line is 1-based). The exact line numbers feed back into `read_file`'s `start_line` / `end_line` so the typical loop is `grep` → narrow `read_file` → `edit_file`. Backed by the existing `ignore`/ripgrep dep.                                                                                                                                                                                                                                                                      |
+| `bash`           | `(cmd, timeout_ms?) -> { cmd, target, stdout, stderr, exit_code }`                                                                                | Routes to `docker exec -w <container_cwd> <name> sh -lc <cmd>` when the workspace shell container's lifecycle status is `Running`, else `sh -lc <cmd>` rooted at the active folder. The decision is made by `tools::resolve_bash_target`, which calls the same `moon_container::Workspace::status()` query `lsp.rs` already uses — so terminals, LSP, and the coder agree on the routing target. `target` field echoes `"host"` / `"container"` so the panel pip and the tool result can't drift                                             |
+| `spawn_subagent` | `(task, folder?, mode?, model?, system_prompt?) -> { result, sub_session_id, tokens_used_estimate, mode, iterations_used, byte_budget_exceeded }` | Spawns a parallel sub-agent against a bound workspace folder (defaults to the parent's active folder). `mode` is `"research"` (read-only intent) or `"coder"` (default; full toolkit). `model` is `"fast"` (default) or `"large"`. Multiple `spawn_subagent` calls in one assistant message run in parallel (cap: 4 via `Semaphore`). Sub-agents cannot spawn sub-sub-agents — depth=1 cap is enforced by the parent's tool list including `spawn_subagent` while the sub-agent's does not. Available **only** to the top-level parent turn. |
 
 Tools that arrive **as separate commits when proven needed**, not
 in the initial slice:
@@ -420,6 +421,20 @@ Skills are file conventions; the user drops `SKILL.md` into one of
 the supported directories.
 
 ## Sessions
+
+### Multi-session per project
+
+Every bound workspace folder has its own in-memory session, its own running-turn cancel handle, and its own sessions-list cache. Switching the active workspace folder doesn't touch other folders' sessions, so an agent running in folder X keeps streaming events while the user is browsing folder Y. When the user switches back to X, the panel re-renders against X's bucket — the transcript, the sub-agent cards, the composer draft and attachments are all where they were left.
+
+The backend keeps the per-folder runtime state in `CoderState.sessions_by_folder: HashMap<Utf8PathBuf, Arc<FolderSession>>`. Lazy creation: a `FolderSession` materialises the first time a command needs one for that folder. Currently we never garbage-collect entries on folder unbind — they sit in the map until process exit. Cheap (a `Mutex<Session>` and a `Mutex<TurnState>` per folder; nothing per-folder allocates more than that until tools actually run), and rebinding the same folder gets the same in-memory state back.
+
+Tools captured by a running turn close over the **session's bound folder**, not the live `WorkspaceRegistry::active_folder()`. That's how "agent in folder X stays bound to folder X" actually works at the tool layer: the spawned `run_turn` task carries an `Arc<FolderSession>` plus the folder string, and its `ToolContext` uses that folder for every dispatch. Switching active folder mid-turn cannot redirect tool calls.
+
+`abort` operates on the **active folder's** turn only. Stopping a background turn requires switching to that folder first. Sign-out is the one global exception — it cancels every running turn since the auth identity backing them just went away.
+
+Per-folder hydration on launch: `AppState.coder.last_session_by_folder: Map<folder, sessionId>` records the last-opened session per project; the panel restores the active folder's entry on first mount, and again whenever the user switches back to a folder it hasn't visited yet in this session.
+
+The wire format reflects all of this: `coder:event` payloads are wrapped in a `CoderEventEnvelope { folder, event }` so the frontend can route updates to the right per-folder UI bucket. Sub-agent events arrive tagged with the **parent's** folder (sub-agents belong to whichever project originated them), so a parent in folder X with a sub-agent operating against folder Y still shows the sub-agent's collapsed card under X's transcript.
 
 ### On disk
 
@@ -644,46 +659,72 @@ A failed upload is a `tracing::warn!` plus a small status-bar pip
   and therefore in the bucket. NDA workspaces should toggle sync
   off; the banner exists exactly for this case.
 
-## Sub-agents (planned, not in initial sub-phases)
+## Sub-agents
 
-A `spawn_subagent` tool exposed to the parent loop:
+The parent's loop exposes `spawn_subagent` (see the [tool surface](#tool-surface) above for the schema). One call dispatches one sub-agent; the parent's tool call awaits the sub-agent's report, then the model continues with that text in its context. Multiple `spawn_subagent` calls in a single assistant message dispatch concurrently, bounded by a 4-permit semaphore so a stampede on the inference router stays well-behaved.
 
 ```jsonschema
 spawn_subagent(
-  task: string,                    // human-readable description
-  system_prompt?: string,          // overrides the workspace default
-  model?: "fast" | "large" | string, // defaults to "fast"
-  allowed_tools?: string[]         // defaults to read-only
-) -> { result: string, tokens_used: number }
+  task: string,                    // self-contained description; sub-agent doesn't see the parent's transcript
+  folder?: string,                 // basename of a bound folder, default = parent's active folder
+  mode?: "research" | "coder",     // default = "coder"
+  model?: "fast" | "large",        // default = "fast"
+  system_prompt?: string           // overrides the mode-default prompt
+) -> {
+  result: string,                  // the only string the parent's model sees
+  sub_session_id: string,          // the UI's pop-out lookup key, persists across IDE restarts
+  tokens_used_estimate: number,    // approximated from message bytes (precise tracking lands when streaming `usage` is plumbed)
+  mode: "research" | "coder",      // echoes the mode the sub-agent actually ran under
+  iterations_used: number,         // tool-call roundtrips consumed
+  byte_budget_exceeded: boolean    // set when the cap kicked in and the result is a partial-findings stub
+}
 ```
 
-Implementation: the parent's tool dispatcher constructs a fresh
-`Loop` instance with its own `messages: []`, the requested model
-slug, and a tool subset (default: `read_file`, `list_dir`, `grep`).
-The sub-agent runs the full loop and returns a single text result;
-the parent only ever sees that string in its context. Token cost,
-turn count, and the sub-session JSONL are persisted alongside the
-parent (under `.moon/agent-sessions/<parent-id>.subs/<sub-id>.jsonl`)
-and shown collapsed in the parent's tool-call render.
+### Modes
 
-Use cases the team has surfaced:
+Two operational modes — the model picks per spawn, defaults to `coder`:
 
-- "Research where in the codebase X is used and summarize" — a
-  `grep` + `read_file` loop on the cheap model that returns one
-  paragraph instead of polluting the parent's context with 20
-  file reads.
-- "Apply this list of mechanical refactors" — a write-capable
-  sub-agent that edits files and reports back with a diff
-  summary. (Tools: `read_file`, `edit_file`, `apply_diff`, `bash`.)
+- **`research`** — read-only intent. Tools: `read_file`, `list_dir`, `grep`, `bash`. The shell stays available so sub-agents can run inspection commands (`git log`, `git diff --stat`, `cargo check`, `pytest --collect-only`, …) without us having to whitelist every read-only shell idiom as a separate tool. The "no mutation via `bash`" half of the constraint is **behavioural** and lives in the sub-agent's system prompt — `write_file` and `edit_file` are blocked at the [`ToolRegistry::dispatch`](../crates/moon-coder/src/tools.rs) boundary regardless of what the prompt says.
+- **`coder`** — full toolkit. Adds `write_file` and `edit_file`. Use for "do this scoped task and report back" workflows.
 
-Open questions for when this lands:
+Top-level parent sessions are always `coder` — there is no parent-side toggle. Mode is a sub-agent-level concept.
 
-- Per-sub-agent budget (max turns / max tokens).
-- Whether the parent can `abort` an in-flight sub-agent
-  separately from itself.
-- UI: collapsed-by-default render inside the parent's tool-call
-  block, expand to see the sub-session. Probably shares
-  rendering machinery with the regular tool-call view.
+### Folder targeting
+
+Sub-agents target one already-bound workspace folder. Defaults to the parent's active folder; explicit `folder` argument takes any other bound folder by basename (or by absolute path as a fallback). Targeting an unbound path errors with `Err(CoderError::ToolFailed)` so the parent's model can recover.
+
+The parent stays single-folder for **its own** tools — `read_file` & friends always operate against `cx.folder` from the parent's `ToolContext`. Cross-folder work happens only via sub-agents. The parent's awareness of bound folders comes from the [Bound folders](#bound-folders-system-prompt-section) section in its system prompt; the model can't intelligently delegate without knowing what each folder is.
+
+### Model tiers
+
+Two tiers, surfaced as a `model: "fast" | "large"` enum:
+
+- **`fast`** (default) → `DEFAULT_FAST_MODEL` from [`crates/moon-coder/src/defaults.rs`](../crates/moon-coder/src/defaults.rs). Right pick for almost all sub-agents — focused reconnaissance, scoped edits, narrow tasks.
+- **`large`** → `DEFAULT_LARGE_MODEL`. For sub-agent tasks that need the same reasoning depth as a top-level chat turn (multi-file refactors, synthesis across many sources, ambiguous specs).
+
+Arbitrary HF slugs are not accepted at this boundary on purpose — sub-agent dispatch picks a _tier_, not a specific model. The user picks providers globally; the per-call selection is just "fast" / "large".
+
+### Budget
+
+Each sub-agent is capped at 6 tool-call roundtrips and ~32 KB of cumulative message bytes (≈ 8 K tokens via the `bytes / 4` approximation). Both caps fail the sub-agent with a partial-result stub (`byte_budget_exceeded: true` for the byte cap; the iteration cap returns its own "stopped after N iterations" string). Numbers are deliberately conservative — bump when a real workload outgrows them.
+
+### Persistence
+
+Sub-agent transcripts persist as JSONL at `<XDG_DATA_HOME>/moon-ide/coder-sessions/<parent-folder-slug>/<sub-id>.jsonl`. The directory uses the **parent** folder's slug — sub-agents belong to whichever project originated them, not whichever folder they happened to operate against, so listing sessions for the parent folder surfaces every sub-agent that ran underneath it. The header carries `parent_session_id` + `parent_tool_call_id` + `subagent_mode` so the UI's "pop out" affordance can resolve a transcript across IDE restarts; `subagent_target_folder` is populated only when the sub-agent's tools operated against a different folder than its parent (otherwise omitted from the on-disk header).
+
+### UI
+
+The frontend renders sub-agents as collapsed cards inline under the parent's `spawn_subagent` tool row: target-folder basename, mode badge (`research` quiet-neutral, `coder` accent-tinted), status pip, two-line result preview, token-cost footer. Click pops out into a dedicated sub-agent view (`coder.view = 'subagent'`) with a back-arrow to the parent's session. The pop-out reuses the parent transcript's row markup — same components, just a different rows source.
+
+In-memory only for now: closing + reopening the parent session does not currently reload prior sub-agent transcripts from disk (the Tauri layer would need to expose a "load sub-agent JSONL by id" path the panel hasn't wired yet). The on-disk JSONL lives, so the data isn't lost — only the in-IDE pop-out access during the next launch.
+
+### Bound folders system-prompt section
+
+The parent's system prompt (rebuilt on every turn in [`runner::refresh_system_prompt`](../crates/moon-coder/src/runner.rs)) gains a "Bound folders" section listing every bound folder with a 2–3 sentence description. Descriptions are generated by the `fast` model from each folder's manifest files in canonical order (`AGENTS.md`, `README.md`, `Cargo.toml`, `package.json`, `pyproject.toml`), cached at `<XDG_DATA_HOME>/moon-ide/folder-summaries/<slug>.json` keyed on a 64-bit FNV-1a of the inputs, and invalidated when any of those inputs change. AGENTS.md leads the bundle because it's literally written for agents — when both AGENTS.md and a README exist, the agent guidance anchors the prompt before the user-facing prose. Casing is matched case-insensitively against the folder's top-level entries, so `Readme.md` / `AGENTS.MD` / `Agents.md` all resolve without a hardcoded variant list.
+
+Generation kicks off as a detached `tokio::spawn` from `runner::kick_off_summary_refresh` for any bound folder whose summary cache is missing or stale. The runner never blocks a turn waiting for one — if a summary isn't ready, the system-prompt builder emits `(summary still generating)` for that folder, and the next turn picks up whichever summaries finished in between. A `folder_summary_ready` event fires when one lands, so the project bar (follow-up plan) can refresh tooltips without polling.
+
+The parent's tools stay scoped to its active folder — bound-folder summaries are **context only**, not tool access. Cross-folder work happens via `spawn_subagent`.
 
 ## UI placement
 
@@ -809,8 +850,10 @@ no shared component. ADR 0003 ("no adapter layer") still applies.
   `SYSTEM.md`. Reconsider when somebody asks.
 - **Permission popups** — see "Permissions" above.
 - **MCP** — same posture as pi.
-- **Sub-agent UI / scheduling** — the schema and plan are above;
-  no implementation in the initial sub-phases.
+- **Per-sub-agent abort UI** — parent abort cascades to all live sub-agents via child `CancellationToken`s; individual cancel buttons are deferred until a real workload calls for them.
+- **Background detached sub-agents** (Cursor / Devin-style "agents that keep working across IDE restarts") — sub-agents are synchronous-blocking; the parent's tool call awaits their report.
+- **Depth ≥ 2 sub-sub-agents** — hardcoded depth=1 cap. The sub-agent's tool list omits `spawn_subagent`, so the model literally cannot describe a sub-sub-agent.
+- **Reload sub-agent transcripts from disk** — the JSONL persists, but the panel's "pop out" only resolves transcripts that were observed via the live event stream during the current IDE session.
 - **Skill packages / installable skills** — file conventions only.
 - **Custom providers** — schema lives in `AppState.coder.providers`
   but no UI / wiring in the initial sub-phases.

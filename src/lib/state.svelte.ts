@@ -733,6 +733,13 @@ class WorkspaceState {
 			this.#headInFlight.clear();
 		}
 		this.workspace = snapshot.folders.length === 0 ? null : snapshot;
+		// Tell the coder panel which folder is now active so its
+		// per-folder UI bucket flips. Per the multi-session design:
+		// turns running in the previous folder keep going in the
+		// background, just streaming events into their own bucket.
+		// The user sees the new folder's transcript / sessions list
+		// / draft / attachments restored intact when they return.
+		coder.setActiveFolder(snapshot.active_folder ?? null);
 		// Drop FolderStates whose folders aren't bound anymore. Two-pass
 		// (collect-then-delete) so we never mutate the map while
 		// iterating — the spec allows it, but oxlint flags the spread
@@ -1161,7 +1168,7 @@ class WorkspaceState {
 				slack: { active_bot: null, active_thread_ts: null },
 				bottom_panel: bottomPanel.serialise(),
 				right_panel: null,
-				coder: { last_session_id: null },
+				coder: { last_session_by_folder: {} },
 				next_edit: {
 					external_base_url: this.nextEditExternalBaseUrl.trim(),
 					llama_binary: this.nextEditLlamaBinary.trim(),

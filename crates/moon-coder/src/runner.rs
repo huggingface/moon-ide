@@ -22,24 +22,30 @@
 //! 6. Cap iterations at [`MAX_TURN_ITERATIONS`] so a misbehaving
 //!    model can't run forever.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use moon_core::WorkspaceRegistry;
 use serde_json::Value;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::{Authenticator, DeviceCode, HfIdentity};
 use crate::defaults::{DEFAULT_FAST_MODEL, DEFAULT_LARGE_MODEL, MAX_TURN_ITERATIONS, PHASE_6_0_SYSTEM_PROMPT};
 use crate::error::CoderError;
-use crate::event::{CoderEvent, CoderStatus};
+use crate::event::{CoderEvent, CoderEventEnvelope, CoderStatus};
+use crate::folder_summary::FolderSummaryService;
 use crate::inference::{AssistantResponse, ChatMessage, FunctionCall, InferenceClient, StreamEvent};
 use crate::sessions::{
 	self, current_time_ms, new_session_id, session_title_from_prompt, sessions_dir, LoadedSession, SessionHeader,
 	SessionRecord, SessionSummary, SESSION_SCHEMA_VERSION,
 };
-use crate::tools::ToolRegistry;
+use crate::subagent::{build_subagent_spec, run_subagent, spawn_subagent_tool_definition, SubagentReport};
+use crate::tools::{CoderMode, ToolContext, ToolRegistry};
+use moon_core::WorkspaceFolderEntry;
+use serde_json::json;
+use tokio::sync::Semaphore;
 
 /// Capacity for the broadcast channel the Tauri layer subscribes to.
 /// Each turn produces O(few hundred) events at most; oversizing
@@ -57,13 +63,26 @@ pub struct CoderHandle {
 /// Inner shared state. Each field is independently lockable / cloneable
 /// so the spawned turn future can take exactly the handles it needs
 /// without aliasing a single big lock.
+///
+/// **Multi-session model**: every bound workspace folder gets its
+/// own [`FolderSession`] (one in-memory `Session` + one
+/// `TurnState`), kept in `sessions_by_folder`. Switching the active
+/// workspace folder doesn't touch other folders' sessions, so an
+/// agent running in folder X keeps streaming events while the user
+/// is browsing folder Y. Events on the broadcast channel carry the
+/// folder string they belong to (see [`CoderEventEnvelope`]) so
+/// the frontend can route them into per-folder UI buckets.
 struct CoderState {
 	auth: Authenticator,
 	inference: InferenceClient,
 	tools: ToolRegistry,
-	events: broadcast::Sender<CoderEvent>,
-	turn: Arc<Mutex<TurnState>>,
-	session: Arc<Mutex<Session>>,
+	events: broadcast::Sender<CoderEventEnvelope>,
+	/// Per-folder session + turn state. Lazy-created on the first
+	/// command that targets a given folder; survives across
+	/// folder switches so background turns aren't interrupted.
+	/// Keyed by absolute path (the same string used in
+	/// `WorkspaceFolder.path`).
+	sessions_by_folder: Arc<RwLock<HashMap<Utf8PathBuf, Arc<FolderSession>>>>,
 	/// Held here in addition to inside `ToolRegistry` so `status()`
 	/// can read the active folder + container state for the panel-
 	/// header indicator without going through the tool dispatch path.
@@ -81,6 +100,30 @@ struct CoderState {
 	/// live inside the project tree any more — they're personal
 	/// scratch / history, not project artefacts.
 	coder_sessions_dir: Utf8PathBuf,
+	/// Per-machine cache for bound-folder descriptions used in the
+	/// "Bound folders" section of the parent's system prompt.
+	/// Owned via `Arc` so the background generation tasks (one per
+	/// in-flight folder) can share it cheaply.
+	folder_summaries: Arc<FolderSummaryService>,
+}
+
+/// Per-folder runtime: one in-memory `Session` plus one
+/// `TurnState`. Kept under separate mutexes so `abort` and `send`
+/// race on the same `TurnState` lock without holding the session
+/// while waiting for it (and inversely, the session can be
+/// updated mid-turn without contending with abort).
+struct FolderSession {
+	session: Mutex<Session>,
+	turn: Mutex<TurnState>,
+}
+
+impl FolderSession {
+	fn new() -> Self {
+		Self {
+			session: Mutex::new(Session::new_blank()),
+			turn: Mutex::new(TurnState::default()),
+		}
+	}
 }
 
 /// Per-turn cancellation token + "is anything running right now?"
@@ -90,6 +133,39 @@ struct CoderState {
 #[derive(Default)]
 struct TurnState {
 	cancel: Option<CancellationToken>,
+}
+
+/// Pre-tagged event sender. One `FolderEventSink` per running
+/// turn / sub-agent / auto-rename pass — captures the folder
+/// string once so emit sites don't have to thread it through
+/// every send call. Sub-agents share their parent's sink so
+/// their events arrive in the parent's folder bucket on the
+/// frontend (sub-agents belong to whichever project originated
+/// them).
+#[derive(Clone)]
+pub(crate) struct FolderEventSink {
+	sender: broadcast::Sender<CoderEventEnvelope>,
+	folder: String,
+}
+
+impl FolderEventSink {
+	pub(crate) fn new(sender: broadcast::Sender<CoderEventEnvelope>, folder: impl Into<String>) -> Self {
+		Self {
+			sender,
+			folder: folder.into(),
+		}
+	}
+
+	pub(crate) fn send(&self, event: CoderEvent) {
+		let _ = self.sender.send(CoderEventEnvelope {
+			folder: self.folder.clone(),
+			event,
+		});
+	}
+
+	pub(crate) fn folder(&self) -> &str {
+		&self.folder
+	}
 }
 
 /// In-memory session. Per AGENTS.md "no premature migrations" we
@@ -137,6 +213,10 @@ impl Session {
 				created_at_ms: now,
 				updated_at_ms: now,
 				model: DEFAULT_LARGE_MODEL.to_string(),
+				parent_session_id: None,
+				parent_tool_call_id: None,
+				subagent_mode: None,
+				subagent_target_folder: None,
 			},
 			session_dir: None,
 			messages: vec![ChatMessage::System {
@@ -161,34 +241,92 @@ impl Session {
 /// reach the inner type. Removing it later is a non-issue.
 pub type Coder = CoderHandle;
 
+impl CoderState {
+	/// Get the [`FolderSession`] for `folder_path`, creating it on
+	/// first call. Cheap-clone return so callers can hold an `Arc`
+	/// across `await` boundaries without contending with the map's
+	/// `RwLock`.
+	async fn folder_session_for(&self, folder_path: &Utf8Path) -> Arc<FolderSession> {
+		{
+			let by = self.sessions_by_folder.read().await;
+			if let Some(existing) = by.get(folder_path) {
+				return existing.clone();
+			}
+		}
+		// Two writers can race here — the second one to grab the
+		// write lock sees the first's insert and reuses it. Cheap
+		// new() means the wasted allocation on the loser doesn't
+		// matter, but the entry itself must be insertion-stable
+		// so callers always get the same `Arc` back.
+		let mut by = self.sessions_by_folder.write().await;
+		by.entry(folder_path.to_path_buf())
+			.or_insert_with(|| Arc::new(FolderSession::new()))
+			.clone()
+	}
+
+	/// Resolve to `(active folder's FolderSession, folder path)`
+	/// or error with `NoActiveFolder`. Used by every command that
+	/// the user triggers from the panel — `send`, `abort`,
+	/// `list_sessions`, `new_session`, etc. Background tasks
+	/// (`run_turn`, `run_subagent`, `spawn_auto_rename`) close
+	/// over an `Arc<FolderSession>` from when they were spawned
+	/// and never re-resolve through this helper, so a folder
+	/// switch mid-turn doesn't redirect them.
+	async fn active_folder_session(&self) -> Result<(Arc<FolderSession>, Utf8PathBuf), CoderError> {
+		let folder = self
+			.workspaces
+			.active_folder()
+			.await
+			.ok_or(CoderError::NoActiveFolder)?;
+		let folder_path = Utf8PathBuf::from(folder.folder.path.clone());
+		let session = self.folder_session_for(&folder_path).await;
+		Ok((session, folder_path))
+	}
+}
+
 impl CoderHandle {
 	pub fn new(
 		workspaces: Arc<WorkspaceRegistry>,
 		workspaces_dir: Utf8PathBuf,
 		coder_sessions_dir: Utf8PathBuf,
+		folder_summaries_dir: Utf8PathBuf,
 	) -> Result<Self, CoderError> {
 		let auth = Authenticator::new()?;
 		let inference = InferenceClient::new(auth.clone())?;
 		let tools = ToolRegistry::new(workspaces.clone(), workspaces_dir.clone());
 		let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+		let folder_summaries = Arc::new(FolderSummaryService::new(folder_summaries_dir));
 		Ok(Self {
 			state: Arc::new(CoderState {
 				auth,
 				inference,
 				tools,
 				events,
-				turn: Arc::new(Mutex::new(TurnState::default())),
-				session: Arc::new(Mutex::new(Session::new_blank())),
+				sessions_by_folder: Arc::new(RwLock::new(HashMap::new())),
 				workspaces,
 				workspaces_dir,
 				coder_sessions_dir,
+				folder_summaries,
 			}),
 		})
 	}
 
 	pub async fn status(&self) -> Result<CoderStatus, CoderError> {
 		let identity = self.state.auth.identity().await?;
-		let busy = self.state.turn.lock().await.cancel.is_some();
+		// `busy` reflects the **active folder's** turn only — the
+		// panel mirrors per-folder UI state, so other folders'
+		// running turns don't make this folder's composer disable
+		// (they update their own per-folder UI state when the user
+		// switches back).
+		let busy = match self.state.workspaces.active_folder().await {
+			Some(folder) => {
+				let path = Utf8PathBuf::from(folder.folder.path.clone());
+				let fs = self.state.folder_session_for(&path).await;
+				let busy_now = fs.turn.lock().await.cancel.is_some();
+				busy_now
+			}
+			None => false,
+		};
 		// `bash_target` mirrors what `tools::bash` would pick if it
 		// ran right now. Computed here so the panel header can show
 		// the indicator without waiting for the first `bash` call.
@@ -211,6 +349,22 @@ impl CoderHandle {
 		})
 	}
 
+	/// Returns the cached "Bound folders" description for `folder`
+	/// when one exists and is still in sync with the on-disk
+	/// manifests. `None` when the cache is cold or stale —
+	/// callers (the project bar tooltip, sub-agent target picker
+	/// preview) should treat that as "summary still generating"
+	/// and let the next turn refresh it.
+	pub async fn folder_summary(&self, folder: &str) -> Option<String> {
+		let path = camino::Utf8Path::new(folder);
+		self
+			.state
+			.folder_summaries
+			.cached(path)
+			.await
+			.map(|summary| summary.description)
+	}
+
 	pub async fn start_device_flow(&self) -> Result<DeviceCode, CoderError> {
 		self.state.auth.start_device_flow().await
 	}
@@ -220,20 +374,38 @@ impl CoderHandle {
 	}
 
 	pub async fn sign_out(&self) -> Result<(), CoderError> {
-		self.abort_inner().await;
+		// Sign-out aborts every in-flight turn across every
+		// folder, since the user is repudiating the auth identity
+		// the inference client is using. Then drop every cached
+		// per-folder session — a re-sign-in is conceptually a
+		// fresh conversation. On-disk sessions are untouched
+		// (they belong to the workspace, not the user identity).
+		self.abort_all().await;
 		self.state.auth.sign_out().await?;
-		// Reset the in-memory session — a re-sign-in is conceptually
-		// a fresh conversation. On-disk sessions are untouched (they
-		// belong to the workspace, not the user identity).
-		*self.state.session.lock().await = Session::new_blank();
+		self.state.sessions_by_folder.write().await.clear();
 		Ok(())
 	}
 
-	/// Snapshot of the active session. `None` when the session is
-	/// blank (no user message yet) — the panel uses this to render
-	/// the empty / "send your first message" state.
+	/// Cancel every running turn across every folder. Used by
+	/// sign-out (semantic "this auth identity is no longer
+	/// driving the agent") and by tests that need a clean slate.
+	async fn abort_all(&self) {
+		let by = self.state.sessions_by_folder.read().await;
+		for fs in by.values() {
+			let turn = fs.turn.lock().await;
+			if let Some(token) = turn.cancel.as_ref() {
+				token.cancel();
+			}
+		}
+	}
+
+	/// Snapshot of the **active folder's** session. `None` when
+	/// the session is blank (no user message yet) or no folder is
+	/// active — the panel uses this to render the empty /
+	/// "send your first message" state.
 	pub async fn active_session(&self) -> Option<SessionSummary> {
-		let session = self.state.session.lock().await;
+		let (fs, _) = self.state.active_folder_session().await.ok()?;
+		let session = fs.session.lock().await;
 		if session.header.title.is_empty() && session.persisted_records == 0 {
 			return None;
 		}
@@ -252,13 +424,22 @@ impl CoderHandle {
 		sessions::list_sessions(&dir).await
 	}
 
-	/// Discard the current in-memory session and start a blank
-	/// one. Doesn't touch disk — empty sessions never get a file
-	/// in the first place. Returns the new session's metadata so
-	/// the panel can reference it before the first send.
+	/// Discard the active folder's in-memory session and start a
+	/// blank one. Doesn't touch disk — empty sessions never get a
+	/// file in the first place. Returns the new session's metadata
+	/// so the panel can reference it before the first send. Other
+	/// folders' sessions are untouched.
 	pub async fn new_session(&self) -> Result<SessionSummary, CoderError> {
-		self.abort_inner().await;
-		let mut session = self.state.session.lock().await;
+		let (fs, _) = self.state.active_folder_session().await?;
+		// Abort the active folder's turn (if any) before swapping
+		// out its session. Other folders' running turns keep going.
+		{
+			let turn = fs.turn.lock().await;
+			if let Some(token) = turn.cancel.as_ref() {
+				token.cancel();
+			}
+		}
+		let mut session = fs.session.lock().await;
 		*session = Session::new_blank();
 		let summary = session.summary();
 		drop(session);
@@ -275,17 +456,19 @@ impl CoderHandle {
 	/// special "loaded" code path beyond the initial reset.
 	pub async fn open_session(&self, id: String) -> Result<SessionSummary, CoderError> {
 		sessions::validate_session_id(&id)?;
-		let folder = self
-			.state
-			.workspaces
-			.active_folder()
-			.await
-			.ok_or(CoderError::NoActiveFolder)?;
-		let folder_root = Utf8PathBuf::from(folder.folder.path.clone());
-		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_root);
+		let (fs, folder_path) = self.state.active_folder_session().await?;
+		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
 		let LoadedSession { header, records } = sessions::load(&dir, &id).await?;
 
-		self.abort_inner().await;
+		// Abort the active folder's turn before swapping its
+		// session out. Other folders' turns are untouched.
+		{
+			let turn = fs.turn.lock().await;
+			if let Some(token) = turn.cancel.as_ref() {
+				token.cancel();
+			}
+		}
+
 		let mut messages: Vec<ChatMessage> = vec![ChatMessage::System {
 			content: PHASE_6_0_SYSTEM_PROMPT.to_string(),
 		}];
@@ -330,20 +513,21 @@ impl CoderHandle {
 			persisted_records: records.len() as u32,
 			auto_rename_pending: false,
 		};
-		*self.state.session.lock().await = session;
+		*fs.session.lock().await = session;
 
 		// Tell the panel to clear + reload, then fan out the
 		// records as the same events a live turn would emit.
 		// `SessionLoaded` carries the metadata so the sticky
 		// header doesn't need a follow-up IPC round trip.
-		let _ = self.state.events.send(CoderEvent::SessionLoaded {
+		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string());
+		sink.send(CoderEvent::SessionLoaded {
 			id: summary.id.clone(),
 			title: summary.title.clone(),
 			created_at_ms: summary.created_at_ms,
 			updated_at_ms: summary.updated_at_ms,
 		});
 		for record in records {
-			emit_replay_events(&self.state.events, record);
+			emit_replay_events(&sink, record);
 		}
 		// Clear the busy state on the frontend. Replayed `UserMessage`
 		// events flip `coder.busy = true` (mirroring the live-turn
@@ -355,63 +539,54 @@ impl CoderHandle {
 		// cases: if the IDE was killed mid-turn we want busy=false
 		// anyway, since no real turn is running on the rehydrated
 		// session.
-		let _ = self.state.events.send(CoderEvent::TurnComplete);
+		sink.send(CoderEvent::TurnComplete);
 		Ok(summary)
 	}
 
 	/// Delete a persisted session under the active workspace
 	/// folder. Idempotent. If the deleted session is the one
-	/// currently mounted in memory, replace the in-memory session
-	/// with a blank one and emit `SessionLoaded` for it so the
-	/// panel resets.
+	/// currently mounted in memory for that folder, replace it
+	/// with a blank one. Other folders' sessions are untouched.
 	pub async fn delete_session(&self, id: String) -> Result<(), CoderError> {
 		sessions::validate_session_id(&id)?;
-		let folder = self
-			.state
-			.workspaces
-			.active_folder()
-			.await
-			.ok_or(CoderError::NoActiveFolder)?;
-		let folder_root = Utf8PathBuf::from(folder.folder.path.clone());
-		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_root);
+		let (fs, folder_path) = self.state.active_folder_session().await?;
+		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
 		sessions::delete(&dir, &id).await?;
 		{
-			let mut session = self.state.session.lock().await;
+			let mut session = fs.session.lock().await;
 			if session.header.id == id {
 				*session = Session::new_blank();
 			}
 		}
-		let _ = self.state.events.send(CoderEvent::SessionListChanged);
+		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string());
+		sink.send(CoderEvent::SessionListChanged);
 		Ok(())
 	}
 
 	pub async fn send(&self, text: String) -> Result<(), CoderError> {
-		// Reject double-sends. The frontend disables the composer
-		// while a turn runs; this is the backend belt-and-brace.
-		{
-			let turn = self.state.turn.lock().await;
-			if turn.cancel.is_some() {
-				return Err(CoderError::Internal("a turn is already running".into()));
-			}
-		}
 		// Bail early if there's no signed-in session — surface a
 		// clean error instead of letting the inference layer fail
 		// on the first request.
 		if !self.state.auth.has_valid_session().await {
 			return Err(CoderError::NotSignedIn);
 		}
-		let folder = self
-			.state
-			.workspaces
-			.active_folder()
-			.await
-			.ok_or(CoderError::NoActiveFolder)?;
-		let folder_root = Utf8PathBuf::from(folder.folder.path.clone());
-		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_root);
+		let (fs, folder_path) = self.state.active_folder_session().await?;
+		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
+
+		// Reject double-sends within this **folder**. Other folders
+		// can have their own turns running simultaneously — the
+		// per-folder turn lock means switching projects doesn't
+		// stall the agent in the one you left behind.
+		{
+			let turn = fs.turn.lock().await;
+			if turn.cancel.is_some() {
+				return Err(CoderError::Internal("a turn is already running for this folder".into()));
+			}
+		}
 
 		let cancel = CancellationToken::new();
 		{
-			let mut turn = self.state.turn.lock().await;
+			let mut turn = fs.turn.lock().await;
 			turn.cancel = Some(cancel.clone());
 		}
 
@@ -419,7 +594,7 @@ impl CoderHandle {
 		// title and locks the sessions dir; subsequent sends just
 		// append.
 		let (auto_rename_after, summary_to_announce) = {
-			let mut session = self.state.session.lock().await;
+			let mut session = fs.session.lock().await;
 			let needs_loaded_event = session.header.title.is_empty() && session.persisted_records == 0;
 			if session.session_dir.is_none() {
 				session.session_dir = Some(dir.clone());
@@ -437,18 +612,19 @@ impl CoderHandle {
 			};
 			(auto_rename, summary)
 		};
+		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string());
 		if let Some(summary) = summary_to_announce {
 			// Fresh session graduating to "first message landed".
 			// Tell the UI so the sticky header switches from
 			// "untitled" → the truncated prompt and the sessions
 			// list picks it up.
-			let _ = self.state.events.send(CoderEvent::SessionLoaded {
+			sink.send(CoderEvent::SessionLoaded {
 				id: summary.id.clone(),
 				title: summary.title.clone(),
 				created_at_ms: summary.created_at_ms,
 				updated_at_ms: summary.updated_at_ms,
 			});
-			let _ = self.state.events.send(CoderEvent::SessionListChanged);
+			sink.send(CoderEvent::SessionListChanged);
 		}
 
 		// Append the user message to in-memory chat history + the
@@ -456,7 +632,7 @@ impl CoderHandle {
 		// only loses the user's prompt from the saved transcript,
 		// the in-memory turn proceeds.
 		{
-			let mut session = self.state.session.lock().await;
+			let mut session = fs.session.lock().await;
 			session.messages.push(ChatMessage::User { content: text.clone() });
 			let header = session.header.clone();
 			let dir = session
@@ -467,35 +643,38 @@ impl CoderHandle {
 			if let Err(err) = sessions::append_record(&dir, &header, &SessionRecord::User { text: text.clone() }).await {
 				tracing::warn!(error = %err, "failed to persist user message");
 			} else {
-				let mut session = self.state.session.lock().await;
+				let mut session = fs.session.lock().await;
 				session.persisted_records = session.persisted_records.saturating_add(1);
 			}
 		}
 
 		let user_id = new_message_id();
-		let _ = self.state.events.send(CoderEvent::UserMessage {
+		sink.send(CoderEvent::UserMessage {
 			id: user_id,
 			text: text.clone(),
 		});
 
 		let state = self.state.clone();
+		let fs_for_turn = fs.clone();
 		let cancel_outer = cancel.clone();
+		let sink_for_turn = sink.clone();
+		let folder_for_turn = folder_path.clone();
 		tokio::spawn(async move {
-			let result = run_turn(&state, cancel_outer).await;
-			state.turn.lock().await.cancel = None;
+			let result = run_turn(&state, &fs_for_turn, &folder_for_turn, &sink_for_turn, cancel_outer).await;
+			fs_for_turn.turn.lock().await.cancel = None;
 			match result {
 				Ok(()) => {
-					let _ = state.events.send(CoderEvent::TurnComplete);
+					sink_for_turn.send(CoderEvent::TurnComplete);
 					if auto_rename_after {
-						spawn_auto_rename(state.clone());
+						spawn_auto_rename(state.clone(), fs_for_turn.clone(), sink_for_turn);
 					}
 				}
 				Err(CoderError::Aborted) => {
-					let _ = state.events.send(CoderEvent::Aborted);
+					sink_for_turn.send(CoderEvent::Aborted);
 				}
 				Err(err) => {
 					tracing::warn!(error = %err, "coder turn failed");
-					let _ = state.events.send(CoderEvent::Error {
+					sink_for_turn.send(CoderEvent::Error {
 						message: err.to_string(),
 					});
 				}
@@ -505,36 +684,72 @@ impl CoderHandle {
 		Ok(())
 	}
 
-	pub fn abort(&self) {
-		// Cheap synchronous variant for the Tauri command path —
-		// just trip the token; the spawned turn observes it on the
-		// next `select!` and exits.
-		if let Ok(turn) = self.state.turn.try_lock() {
-			if let Some(token) = turn.cancel.as_ref() {
-				token.cancel();
-			}
-		}
-	}
-
-	async fn abort_inner(&self) {
-		let turn = self.state.turn.lock().await;
+	/// Cancel the **active folder's** turn (if any). Background
+	/// turns running in other folders are left alone — switching
+	/// to one and hitting stop is a separate action. Just trips
+	/// the cancel token; the spawned turn observes it on its
+	/// next `select!` and exits.
+	pub async fn abort(&self) {
+		let Ok((fs, _)) = self.state.active_folder_session().await else {
+			return;
+		};
+		let turn = fs.turn.lock().await;
 		if let Some(token) = turn.cancel.as_ref() {
 			token.cancel();
 		}
 	}
 
-	pub fn subscribe(&self) -> broadcast::Receiver<CoderEvent> {
+	pub fn subscribe(&self) -> broadcast::Receiver<CoderEventEnvelope> {
 		self.state.events.subscribe()
 	}
 }
 
-async fn run_turn(state: &Arc<CoderState>, cancel: CancellationToken) -> Result<(), CoderError> {
-	let tool_defs = state.tools.definitions();
+async fn run_turn(
+	state: &Arc<CoderState>,
+	fs: &Arc<FolderSession>,
+	folder_path: &Utf8Path,
+	sink: &FolderEventSink,
+	cancel: CancellationToken,
+) -> Result<(), CoderError> {
+	// Parent's tool list = registry's regular tools plus the
+	// `spawn_subagent` definition. Sub-agents pick from the
+	// registry alone (no spawn_subagent), which is how the
+	// depth-1 cap is enforced — a sub-agent literally cannot
+	// describe a sub-sub-agent because the model never sees the
+	// tool.
+	let mut tool_defs = state.tools.definitions();
+	tool_defs.push(spawn_subagent_tool_definition());
+	// Pin the tool context to the **session's** bound folder
+	// (captured at spawn time), not the live `active_folder()`.
+	// This is what makes "agent keeps running in folder X while
+	// user browses folder Y" actually work: the spawned `run_turn`
+	// closes over its `folder_path`, so its tools always operate
+	// against folder X regardless of whatever the user has
+	// foregrounded in the IDE.
+	let folder_entry = state
+		.workspaces
+		.folder_for_path(folder_path.as_str())
+		.await
+		.ok_or(CoderError::NoActiveFolder)?;
+	let cx = ToolContext::new(folder_entry, CoderMode::Coder);
+	// Compose a fresh system prompt and overwrite the session's
+	// `messages[0]`: the base prompt plus a "Bound folders"
+	// section keyed off whatever summaries are currently cached.
+	// Sub-agent dispatch reads the same cache so the model's
+	// awareness of bound folders is consistent across parent +
+	// sub-agent prompts.
+	refresh_system_prompt(state, fs, folder_path).await;
+	// Schedule background regeneration for any bound folder whose
+	// summary cache is missing or stale. Detached tokio tasks; we
+	// don't block the turn waiting for them to land. The next
+	// turn will pick up whichever finished in the interim via the
+	// fresh `refresh_system_prompt` above.
+	kick_off_summary_refresh(state, sink).await;
 	for _iter in 0..MAX_TURN_ITERATIONS {
 		if cancel.is_cancelled() {
 			return Err(CoderError::Aborted);
 		}
-		let messages = state.session.lock().await.messages.clone();
+		let messages = fs.session.lock().await.messages.clone();
 
 		// One stable id per assistant message, shared between the
 		// `start`, every content / thinking `delta`, and the final
@@ -545,7 +760,7 @@ async fn run_turn(state: &Arc<CoderState>, cancel: CancellationToken) -> Result<
 		let assistant_id = new_message_id();
 		let content_started = std::sync::atomic::AtomicBool::new(false);
 		let thinking_emitted = std::sync::atomic::AtomicBool::new(false);
-		let events = state.events.clone();
+		let sink_for_cb = sink.clone();
 		let id_for_cb = assistant_id.clone();
 		let response = state
 			.inference
@@ -557,9 +772,9 @@ async fn run_turn(state: &Arc<CoderState>, cancel: CancellationToken) -> Result<
 				|event| match event {
 					StreamEvent::ContentDelta { delta } => {
 						if !content_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
-							let _ = events.send(CoderEvent::AssistantMessageStart { id: id_for_cb.clone() });
+							sink_for_cb.send(CoderEvent::AssistantMessageStart { id: id_for_cb.clone() });
 						}
-						let _ = events.send(CoderEvent::AssistantMessageDelta {
+						sink_for_cb.send(CoderEvent::AssistantMessageDelta {
 							id: id_for_cb.clone(),
 							delta: delta.to_string(),
 						});
@@ -573,10 +788,10 @@ async fn run_turn(state: &Arc<CoderState>, cancel: CancellationToken) -> Result<
 						// land, and content streams into the same row
 						// when it eventually arrives.
 						if !content_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
-							let _ = events.send(CoderEvent::AssistantMessageStart { id: id_for_cb.clone() });
+							sink_for_cb.send(CoderEvent::AssistantMessageStart { id: id_for_cb.clone() });
 						}
 						thinking_emitted.store(true, std::sync::atomic::Ordering::Relaxed);
-						let _ = events.send(CoderEvent::AssistantThinkingDelta {
+						sink_for_cb.send(CoderEvent::AssistantThinkingDelta {
 							id: id_for_cb.clone(),
 							delta: delta.to_string(),
 						});
@@ -591,8 +806,8 @@ async fn run_turn(state: &Arc<CoderState>, cancel: CancellationToken) -> Result<
 			)
 			.await?;
 
-		state.session.lock().await.messages.push(response_to_message(&response));
-		persist_assistant_record(state, &response).await;
+		fs.session.lock().await.messages.push(response_to_message(&response));
+		persist_assistant_record(fs, &response).await;
 
 		// Always emit `End` *if* we ever started a bubble; otherwise
 		// the frontend would be stuck with an empty placeholder.
@@ -612,7 +827,7 @@ async fn run_turn(state: &Arc<CoderState>, cancel: CancellationToken) -> Result<
 			} else {
 				None
 			};
-			let _ = state.events.send(CoderEvent::AssistantMessageEnd {
+			sink.send(CoderEvent::AssistantMessageEnd {
 				id: assistant_id,
 				text: response.content.clone().unwrap_or_default(),
 				thinking: canonical_thinking,
@@ -623,51 +838,9 @@ async fn run_turn(state: &Arc<CoderState>, cancel: CancellationToken) -> Result<
 			return Ok(());
 		}
 
-		for call in &response.tool_calls {
-			if cancel.is_cancelled() {
-				return Err(CoderError::Aborted);
-			}
-			let args = parse_tool_args(&call.function);
-			let _ = state.events.send(CoderEvent::ToolCall {
-				id: call.id.clone(),
-				name: call.function.name.clone(),
-				args: args.clone(),
-			});
-
-			let outcome = state.tools.dispatch(&call.function.name, &args, &cancel).await;
-			match outcome {
-				Ok(value) => {
-					let content = value.to_string();
-					let _ = state.events.send(CoderEvent::ToolResult {
-						id: call.id.clone(),
-						result: value,
-						is_error: false,
-					});
-					state.session.lock().await.messages.push(ChatMessage::Tool {
-						tool_call_id: call.id.clone(),
-						content: content.clone(),
-					});
-					persist_tool_record(state, &call.id, &content).await;
-				}
-				Err(CoderError::Aborted) => return Err(CoderError::Aborted),
-				Err(err) => {
-					let payload = serde_json::json!({ "error": err.to_string() });
-					let content = payload.to_string();
-					let _ = state.events.send(CoderEvent::ToolResult {
-						id: call.id.clone(),
-						result: payload,
-						is_error: true,
-					});
-					state.session.lock().await.messages.push(ChatMessage::Tool {
-						tool_call_id: call.id.clone(),
-						content: content.clone(),
-					});
-					persist_tool_record(state, &call.id, &content).await;
-				}
-			}
-		}
+		dispatch_tool_calls(state, fs, sink, &cx, &cancel, &response.tool_calls).await?;
 	}
-	let _ = state.events.send(CoderEvent::Error {
+	sink.send(CoderEvent::Error {
 		message: format!(
 			"agent loop exceeded {} iterations without finishing",
 			MAX_TURN_ITERATIONS
@@ -679,11 +852,335 @@ async fn run_turn(state: &Arc<CoderState>, cancel: CancellationToken) -> Result<
 	)))
 }
 
-/// Append an `Assistant` record to the active session's JSONL.
-/// Best-effort: a write failure logs but doesn't fail the turn.
-async fn persist_assistant_record(state: &Arc<CoderState>, response: &AssistantResponse) {
+/// Limit on concurrent sub-agents per parent batch. A
+/// `Semaphore`-bound; only meaningful when the model emits a
+/// homogeneous `spawn_subagent` batch larger than this. Excess
+/// sub-agents queue against the semaphore. Hardcoded for now per
+/// AGENTS.md "hardcode first, configure later" — bumps land when
+/// a real workload outgrows it.
+const SUBAGENT_PARALLELISM_CAP: usize = 4;
+
+/// Run every `tool_call` in `calls`, emitting the `ToolCall` /
+/// `ToolResult` event pair for each and pushing the result onto
+/// the session's messages. Branches:
+///
+/// - **Homogeneous `spawn_subagent` batch (N ≥ 2)**: spawn each
+///   sub-agent concurrently, bounded by [`SUBAGENT_PARALLELISM_CAP`].
+///   Tool-call events fire upfront so the UI inserts every
+///   collapsed card before any sub-agent finishes; results land
+///   in completion order but are pushed onto `messages` in the
+///   model's original tool-call order so context stays
+///   deterministic across replays.
+/// - **Anything else** (mixed batch, single call, or zero
+///   `spawn_subagent` calls): sequential dispatch. Sub-agent
+///   intercept still kicks in for individual `spawn_subagent`
+///   calls in mixed batches.
+async fn dispatch_tool_calls(
+	state: &Arc<CoderState>,
+	fs: &Arc<FolderSession>,
+	sink: &FolderEventSink,
+	cx: &ToolContext,
+	cancel: &CancellationToken,
+	calls: &[crate::inference::ToolCall],
+) -> Result<(), CoderError> {
+	let homogeneous_subagent = calls.len() >= 2 && calls.iter().all(|c| c.function.name == "spawn_subagent");
+	if homogeneous_subagent {
+		dispatch_subagent_batch(state, fs, sink, cx, cancel, calls).await
+	} else {
+		for call in calls {
+			if cancel.is_cancelled() {
+				return Err(CoderError::Aborted);
+			}
+			let args = parse_tool_args(&call.function);
+			sink.send(CoderEvent::ToolCall {
+				id: call.id.clone(),
+				name: call.function.name.clone(),
+				args: args.clone(),
+			});
+			let outcome = if call.function.name == "spawn_subagent" {
+				handle_spawn_subagent(state, fs, sink, cx, cancel, &call.id, &args).await
+			} else {
+				state.tools.dispatch(&call.function.name, &args, cx, cancel).await
+			};
+			finish_tool_call(fs, sink, &call.id, outcome).await?;
+		}
+		Ok(())
+	}
+}
+
+/// Run N parallel sub-agents under a `Semaphore`, then drain
+/// results in the order the model issued them so the conversation
+/// history stays deterministic. Cancellation cascades automatically
+/// via `cancel.child_token()` (the parent's token is the child's
+/// parent).
+async fn dispatch_subagent_batch(
+	state: &Arc<CoderState>,
+	fs: &Arc<FolderSession>,
+	sink: &FolderEventSink,
+	cx: &ToolContext,
+	cancel: &CancellationToken,
+	calls: &[crate::inference::ToolCall],
+) -> Result<(), CoderError> {
+	// Emit `ToolCall` events upfront so every collapsed card is
+	// present in the parent's transcript before any sub-agent
+	// starts streaming events of its own.
+	let parsed_args: Vec<Value> = calls.iter().map(|c| parse_tool_args(&c.function)).collect();
+	for (call, args) in calls.iter().zip(parsed_args.iter()) {
+		sink.send(CoderEvent::ToolCall {
+			id: call.id.clone(),
+			name: call.function.name.clone(),
+			args: args.clone(),
+		});
+	}
+
+	let sem = Arc::new(Semaphore::new(SUBAGENT_PARALLELISM_CAP));
+	let mut tasks = Vec::with_capacity(calls.len());
+	for (call, args) in calls.iter().cloned().zip(parsed_args.into_iter()) {
+		let state_for_task = state.clone();
+		let fs_for_task = fs.clone();
+		let sink_for_task = sink.clone();
+		let cx_for_task = cx.clone();
+		let cancel_for_task = cancel.clone();
+		let sem_for_task = sem.clone();
+		let call_id = call.id.clone();
+		let task = tokio::spawn(async move {
+			let _permit = sem_for_task.acquire().await.expect("semaphore not closed");
+			handle_spawn_subagent(
+				&state_for_task,
+				&fs_for_task,
+				&sink_for_task,
+				&cx_for_task,
+				&cancel_for_task,
+				&call_id,
+				&args,
+			)
+			.await
+		});
+		tasks.push((call, task));
+	}
+	for (call, task) in tasks {
+		let outcome = match task.await {
+			Ok(o) => o,
+			Err(err) => Err(CoderError::Internal(format!(
+				"sub-agent task join error for {}: {err}",
+				call.id
+			))),
+		};
+		finish_tool_call(fs, sink, &call.id, outcome).await?;
+	}
+	Ok(())
+}
+
+/// Build + run a `Subagent` from the JSON args. Validation
+/// errors surface back to the model as the tool's `is_error: true`
+/// result so a confused call ("folder X not bound", "unknown
+/// mode") is a recoverable signal, not a hard turn-failure.
+async fn handle_spawn_subagent(
+	state: &Arc<CoderState>,
+	fs: &Arc<FolderSession>,
+	sink: &FolderEventSink,
+	cx: &ToolContext,
+	cancel: &CancellationToken,
+	tool_call_id: &str,
+	args: &Value,
+) -> Result<Value, CoderError> {
+	let parent_session_id = fs.session.lock().await.header.id.clone();
+	// Parent's bound folder is the sink's folder — that's the
+	// session this dispatch belongs to. Sub-agent JSONL lands
+	// under that slug regardless of which folder the sub-agent's
+	// tools operate against (parent's project owns its sub-agents).
+	let parent_folder = Utf8PathBuf::from(sink.folder());
+	let bound = state.workspaces.folders().await;
+	let spec = build_subagent_spec(
+		parent_session_id,
+		tool_call_id.to_string(),
+		parent_folder,
+		args,
+		&cx.folder,
+		&bound,
+	)?;
+	let sub_cancel = cancel.child_token();
+	// Sub-agents share their parent's `FolderEventSink` — events
+	// arrive in the parent's folder bucket on the frontend, which
+	// is exactly the multi-session contract: sub-agents belong to
+	// whichever project originated them.
+	let report: SubagentReport = run_subagent(
+		&state.tools,
+		&state.inference,
+		sink,
+		&state.coder_sessions_dir,
+		spec,
+		sub_cancel,
+	)
+	.await?;
+	Ok(json!({
+		"result": report.result,
+		"sub_session_id": report.sub_session_id,
+		"tokens_used_estimate": report.tokens_used_estimate,
+		"mode": match report.mode { CoderMode::Research => "research", CoderMode::Coder => "coder" },
+		"iterations_used": report.iterations_used,
+		"byte_budget_exceeded": report.byte_budget_exceeded,
+	}))
+}
+
+/// Shared "tool finished, push result + emit events + persist"
+/// epilogue used by both the sequential and the parallel paths.
+async fn finish_tool_call(
+	fs: &Arc<FolderSession>,
+	sink: &FolderEventSink,
+	tool_call_id: &str,
+	outcome: Result<Value, CoderError>,
+) -> Result<(), CoderError> {
+	match outcome {
+		Ok(value) => {
+			let content = value.to_string();
+			sink.send(CoderEvent::ToolResult {
+				id: tool_call_id.to_string(),
+				result: value,
+				is_error: false,
+			});
+			fs.session.lock().await.messages.push(ChatMessage::Tool {
+				tool_call_id: tool_call_id.to_string(),
+				content: content.clone(),
+			});
+			persist_tool_record(fs, tool_call_id, &content).await;
+			Ok(())
+		}
+		Err(CoderError::Aborted) => Err(CoderError::Aborted),
+		Err(err) => {
+			let payload = json!({ "error": err.to_string() });
+			let content = payload.to_string();
+			sink.send(CoderEvent::ToolResult {
+				id: tool_call_id.to_string(),
+				result: payload,
+				is_error: true,
+			});
+			fs.session.lock().await.messages.push(ChatMessage::Tool {
+				tool_call_id: tool_call_id.to_string(),
+				content: content.clone(),
+			});
+			persist_tool_record(fs, tool_call_id, &content).await;
+			Ok(())
+		}
+	}
+}
+
+/// Recompose the session's system prompt (`messages[0]`) from the
+/// base prompt + a freshly-rendered "Bound folders" section.
+/// Called at the top of every turn so newly-cached folder
+/// summaries pick up without restarting the session.
+///
+/// The "active" marker in the rendered section tracks the
+/// **session's** bound folder (`folder_path`), not the live
+/// `WorkspaceRegistry::active_folder()`. With multi-session
+/// running, the session running in folder X always marks X as
+/// active in its own prompt regardless of which folder the user
+/// is currently browsing — that's what keeps the model's
+/// "your folder" reference stable across folder switches.
+async fn refresh_system_prompt(state: &Arc<CoderState>, fs: &Arc<FolderSession>, folder_path: &Utf8Path) {
+	let folders = state.workspaces.folders().await;
+	let prompt = compose_system_prompt(&folders, Some(folder_path.as_str()), &state.folder_summaries).await;
+	let mut session = fs.session.lock().await;
+	if let Some(ChatMessage::System { content }) = session.messages.first_mut() {
+		*content = prompt;
+	} else {
+		session.messages.insert(0, ChatMessage::System { content: prompt });
+	}
+}
+
+/// Schedule background regeneration for any bound folder whose
+/// summary cache is missing or stale. Detached tasks; the runner
+/// never waits on them. A summary that lands during a long turn
+/// surfaces in the *next* turn's system prompt — `refresh_system_prompt`
+/// runs on every iteration's top.
+///
+/// `FolderSummaryReady` events are tagged with the **target
+/// folder's** path on the envelope (not the session's). The
+/// frontend treats this kind of event as a global cache update
+/// regardless of which folder bucket it arrives in.
+async fn kick_off_summary_refresh(state: &Arc<CoderState>, _sink: &FolderEventSink) {
+	let folders = state.workspaces.folders().await;
+	for entry in folders {
+		let folder_root = Utf8PathBuf::from(&entry.folder.path);
+		if state.folder_summaries.cached(folder_root.as_path()).await.is_some() {
+			continue;
+		}
+		state.folder_summaries.spawn_regenerate(
+			folder_root,
+			state.inference.clone(),
+			state.events.clone(),
+			CancellationToken::new(),
+		);
+	}
+}
+
+/// Build the parent's system prompt: base text from
+/// [`PHASE_6_0_SYSTEM_PROMPT`] plus a "Bound folders" section iff
+/// any bound folder has a cached description. Folders without
+/// cached descriptions render as `(summary still generating)` so
+/// the model knows the folder *exists* but doesn't yet have
+/// metadata to reason about.
+async fn compose_system_prompt(
+	folders: &[Arc<WorkspaceFolderEntry>],
+	active_path: Option<&str>,
+	summaries: &Arc<FolderSummaryService>,
+) -> String {
+	if folders.is_empty() {
+		return PHASE_6_0_SYSTEM_PROMPT.to_string();
+	}
+	// Look up cached summaries up-front so the rendered section
+	// never half-blocks on disk reads inside a `for` loop.
+	let mut entries: Vec<(String, String, Option<String>, bool)> = Vec::with_capacity(folders.len());
+	let mut any_cached = false;
+	for folder in folders {
+		let folder_path = folder.folder.path.clone();
+		let folder_name = folder.folder.name.clone();
+		let cached = summaries.cached(Utf8Path::new(&folder_path)).await;
+		if cached.is_some() {
+			any_cached = true;
+		}
+		let is_active = active_path == Some(folder_path.as_str());
+		entries.push((folder_name, folder_path, cached.map(|s| s.description), is_active));
+	}
+	// Only emit the section when at least one folder has a real
+	// description. A 1-folder workspace whose summary hasn't
+	// landed yet doesn't benefit from a placeholder-only block —
+	// the model already knows it has one folder via the active
+	// context elsewhere.
+	if !any_cached {
+		return PHASE_6_0_SYSTEM_PROMPT.to_string();
+	}
+	let mut out = String::with_capacity(PHASE_6_0_SYSTEM_PROMPT.len() + 512);
+	out.push_str(PHASE_6_0_SYSTEM_PROMPT);
+	if !out.ends_with('\n') {
+		out.push('\n');
+	}
+	out.push('\n');
+	out.push_str("## Bound folders\n\n");
+	out.push_str("These workspace folders are bound and visible to sub-agents. Your own tools (`read_file`, `list_dir`, `grep`, `bash`, `write_file`, `edit_file`) operate against the **active** folder; spawn a sub-agent against a non-active folder when the task naturally lives there.\n\n");
+	for (name, _path, description, is_active) in &entries {
+		out.push_str("- **");
+		out.push_str(name);
+		out.push_str("**");
+		if *is_active {
+			out.push_str(" (active)");
+		}
+		out.push_str(" — ");
+		match description {
+			Some(text) => out.push_str(text.trim()),
+			None => out.push_str("(summary still generating)"),
+		}
+		out.push('\n');
+	}
+	out
+}
+
+/// Append an `Assistant` record to the JSONL of the given
+/// folder's session. Best-effort: a write failure logs but
+/// doesn't fail the turn.
+async fn persist_assistant_record(fs: &Arc<FolderSession>, response: &AssistantResponse) {
 	let (dir, header) = {
-		let session = state.session.lock().await;
+		let session = fs.session.lock().await;
 		let Some(dir) = session.session_dir.clone() else {
 			return;
 		};
@@ -698,13 +1195,13 @@ async fn persist_assistant_record(state: &Arc<CoderState>, response: &AssistantR
 		tracing::warn!(error = %err, "failed to persist assistant message");
 		return;
 	}
-	let mut session = state.session.lock().await;
+	let mut session = fs.session.lock().await;
 	session.persisted_records = session.persisted_records.saturating_add(1);
 }
 
-async fn persist_tool_record(state: &Arc<CoderState>, tool_call_id: &str, content: &str) {
+async fn persist_tool_record(fs: &Arc<FolderSession>, tool_call_id: &str, content: &str) {
 	let (dir, header) = {
-		let session = state.session.lock().await;
+		let session = fs.session.lock().await;
 		let Some(dir) = session.session_dir.clone() else {
 			return;
 		};
@@ -718,7 +1215,7 @@ async fn persist_tool_record(state: &Arc<CoderState>, tool_call_id: &str, conten
 		tracing::warn!(error = %err, "failed to persist tool result");
 		return;
 	}
-	let mut session = state.session.lock().await;
+	let mut session = fs.session.lock().await;
 	session.persisted_records = session.persisted_records.saturating_add(1);
 }
 
@@ -728,13 +1225,17 @@ async fn persist_tool_record(state: &Arc<CoderState>, tool_call_id: &str, conten
 /// `SessionTitleUpdated` event. Failures are logged at info level
 /// — the truncated-prompt title is a perfectly serviceable
 /// fallback.
-fn spawn_auto_rename(state: Arc<CoderState>) {
+///
+/// Tied to a specific `FolderSession` so the rename only applies
+/// to the session that just finished its first turn — other
+/// folders' sessions stay untouched.
+fn spawn_auto_rename(state: Arc<CoderState>, fs: Arc<FolderSession>, sink: FolderEventSink) {
 	tokio::spawn(async move {
 		// Snapshot the chat history without holding the session
 		// lock across the LLM call — turns / aborts must be able
 		// to grab it freely while we wait on the network.
 		let (dir, header_snapshot, transcript) = {
-			let mut session = state.session.lock().await;
+			let mut session = fs.session.lock().await;
 			session.auto_rename_pending = false;
 			let Some(dir) = session.session_dir.clone() else {
 				return;
@@ -772,7 +1273,7 @@ fn spawn_auto_rename(state: Arc<CoderState>) {
 		// Re-check: the user might have opened a different
 		// session while we were waiting on the model. Only apply
 		// when the active session is still the one we started.
-		let mut session = state.session.lock().await;
+		let mut session = fs.session.lock().await;
 		if session.header.id != header_snapshot.id {
 			return;
 		}
@@ -795,11 +1296,11 @@ fn spawn_auto_rename(state: Arc<CoderState>) {
 			tracing::warn!(error = %err, "auto-rename: failed to persist new title");
 			return;
 		}
-		let _ = state.events.send(CoderEvent::SessionTitleUpdated {
+		sink.send(CoderEvent::SessionTitleUpdated {
 			id: header_for_disk.id,
 			title: new_title,
 		});
-		let _ = state.events.send(CoderEvent::SessionListChanged);
+		sink.send(CoderEvent::SessionListChanged);
 	});
 }
 
@@ -867,10 +1368,10 @@ fn sanitise_auto_title(raw: &str) -> String {
 /// session record. Fires assistant content as one final
 /// (Start, End) pair — no per-token replay, since the user has
 /// already seen it stream and we don't have the original timing.
-fn emit_replay_events(events: &broadcast::Sender<CoderEvent>, record: SessionRecord) {
+fn emit_replay_events(sink: &FolderEventSink, record: SessionRecord) {
 	match record {
 		SessionRecord::User { text } => {
-			let _ = events.send(CoderEvent::UserMessage {
+			sink.send(CoderEvent::UserMessage {
 				id: new_message_id(),
 				text,
 			});
@@ -884,8 +1385,8 @@ fn emit_replay_events(events: &broadcast::Sender<CoderEvent>, record: SessionRec
 			let has_text = content.as_deref().map(|t| !t.is_empty()).unwrap_or(false);
 			let has_thinking = thinking.as_deref().map(|t| !t.is_empty()).unwrap_or(false);
 			if has_text || has_thinking {
-				let _ = events.send(CoderEvent::AssistantMessageStart { id: id.clone() });
-				let _ = events.send(CoderEvent::AssistantMessageEnd {
+				sink.send(CoderEvent::AssistantMessageStart { id: id.clone() });
+				sink.send(CoderEvent::AssistantMessageEnd {
 					id,
 					text: content.unwrap_or_default(),
 					thinking: thinking.filter(|t| !t.is_empty()),
@@ -893,7 +1394,7 @@ fn emit_replay_events(events: &broadcast::Sender<CoderEvent>, record: SessionRec
 			}
 			for call in tool_calls {
 				let args = parse_tool_args(&call.function);
-				let _ = events.send(CoderEvent::ToolCall {
+				sink.send(CoderEvent::ToolCall {
 					id: call.id.clone(),
 					name: call.function.name,
 					args,
@@ -915,7 +1416,7 @@ fn emit_replay_events(events: &broadcast::Sender<CoderEvent>, record: SessionRec
 			// purposes (the panel's sole use is the red-tinted
 			// styling on the `tool` row).
 			let is_error = matches!(&result, Value::Object(map) if map.contains_key("error") && map.len() == 1);
-			let _ = events.send(CoderEvent::ToolResult {
+			sink.send(CoderEvent::ToolResult {
 				id: tool_call_id,
 				result,
 				is_error,

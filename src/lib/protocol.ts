@@ -428,7 +428,13 @@ export type RightPanelKind = 'chat' | 'coder';
  * `moon_protocol::app_state::CoderAppState`.
  */
 export type CoderAppState = {
-	last_session_id: string | null;
+	/**
+	 * Last-opened session id per workspace folder. Restored when
+	 * the user revisits a folder; the active folder's entry
+	 * decides which session the panel mounts at launch. Mirrors
+	 * `moon_protocol::app_state::CoderAppState::last_session_by_folder`.
+	 */
+	last_session_by_folder: Record<string, string>;
 };
 
 /** Local llama.cpp autocomplete. Mirrors `moon_protocol::next_edit::NextEditAppState`. */
@@ -571,7 +577,7 @@ export const defaultAppState: AppState = {
 	slack: { active_bot: null, active_thread_ts: null },
 	bottom_panel: { visible: false, height: 240 },
 	right_panel: null,
-	coder: { last_session_id: null },
+	coder: { last_session_by_folder: {} },
 	next_edit: {
 		external_base_url: '',
 		llama_binary: '',
@@ -878,7 +884,35 @@ export type CoderEvent =
 	| { kind: 'error'; message: string }
 	| { kind: 'session_loaded'; id: string; title: string; created_at_ms: number; updated_at_ms: number }
 	| { kind: 'session_title_updated'; id: string; title: string }
-	| { kind: 'session_list_changed' };
+	| { kind: 'session_list_changed' }
+	| { kind: 'folder_summary_ready'; folder: string; description: string }
+	| { kind: 'subagent_spawned'; tool_call_id: string; subagent_id: string; target_folder: string; mode: SubagentMode }
+	| { kind: 'subagent_event'; subagent_id: string; inner: CoderEvent }
+	| { kind: 'subagent_finished'; subagent_id: string; tokens_used_estimate: number; was_error: boolean };
+
+/**
+ * Two operational modes a sub-agent can run under. Mirrors
+ * `moon_coder::tools::CoderMode::as_wire()`. `research` is read-only
+ * intent (`write_file`/`edit_file` refuse at the tool boundary; the
+ * "no mutation via bash" half is behavioural via the system prompt).
+ * `coder` is the full toolkit. Top-level parent sessions are always
+ * `coder` — there is no parent-side toggle.
+ */
+export type SubagentMode = 'research' | 'coder';
+
+/**
+ * Outer envelope carrying a folder tag alongside the inner event.
+ * Mirrors `moon_coder::CoderEventEnvelope`. The frontend's
+ * multi-session dispatcher routes events to per-folder UI buckets
+ * by `envelope.folder` (absolute path matching
+ * `WorkspaceFolder.path`). Sub-agent events arrive tagged with
+ * the **parent's** folder, since sub-agents belong to whichever
+ * project originated them.
+ */
+export type CoderEventEnvelope = {
+	folder: string;
+	event: CoderEvent;
+};
 
 /**
  * Lightweight summary of a persisted coder session — what the

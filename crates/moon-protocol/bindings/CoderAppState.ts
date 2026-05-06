@@ -9,16 +9,13 @@
  */
 export type CoderAppState = { 
 /**
- * Session id the user had open at last shutdown. Restored on
- * launch *if* the file still exists in the active workspace
- * folder; otherwise the panel falls back to the sessions list
- * view. Cleared when the user deletes the matching session
- * or when an `open_session` call lands a different id.
- *
- * Stored as a flat `Option<String>` rather than a per-folder
- * map because users rarely keep multiple folders mounted at
- * once and the simpler shape pays off in code; if the
- * workflow lands where it matters, switch to a map and
- * don't ship a migration shim.
+ * Last-opened session id **per workspace folder**. Restored on
+ * launch when the user revisits a folder: the active folder's
+ * entry decides which session the panel mounts. Per the
+ * multi-session design, every project gets its own slot so a
+ * re-open of folder X resumes X's last session even if the
+ * user has worked in folder Y in between. Cleared per-folder
+ * when the matching session gets deleted; an `open_session`
+ * call updates that folder's entry.
  */
-last_session_id: string | null, };
+last_session_by_folder: { [key in string]: string }, };

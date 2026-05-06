@@ -62,6 +62,12 @@ const SESSION_EXT: &str = "jsonl";
 /// JSONL header — first line of every session file. Must be the
 /// first record because the [`load_summary`] fast path stops after
 /// reading exactly one line.
+///
+/// Sub-agent sessions reuse this same struct with the optional
+/// `parent_*` / `subagent_mode` fields populated. Top-level
+/// (parent) sessions leave them `None`; the optional fields are
+/// elided from JSON via `skip_serializing_if`, so existing
+/// on-disk sessions stay byte-compatible.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionHeader {
 	pub schema: u32,
@@ -79,6 +85,28 @@ pub struct SessionHeader {
 	/// individual turns (Phase 6.4 will add per-session model
 	/// override that lives here).
 	pub model: String,
+	/// Parent session id, when this header describes a sub-agent
+	/// session. `None` for top-level (user-driven) sessions.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub parent_session_id: Option<String>,
+	/// `tool_call_id` of the parent's `spawn_subagent` call that
+	/// produced this sub-agent. Lets the UI's "pop out" affordance
+	/// resolve the sub-agent's transcript across IDE restarts.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub parent_tool_call_id: Option<String>,
+	/// Wire string ("research" / "coder") of the mode the
+	/// sub-agent ran under. `None` for top-level sessions; mirrors
+	/// `CoderMode::as_wire()` so the frontend reads it verbatim.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub subagent_mode: Option<String>,
+	/// Absolute path of the folder the sub-agent's tools operated
+	/// against. May differ from the parent's bound folder (which
+	/// owns the JSONL on disk) when the parent passed an explicit
+	/// `folder` argument to `spawn_subagent`. `None` for top-level
+	/// sessions and for sub-agent sessions that targeted the same
+	/// folder as their parent.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub subagent_target_folder: Option<String>,
 }
 
 /// One append-only record in the JSONL body. Tagged enum so each
@@ -549,6 +577,10 @@ mod tests {
 			created_at_ms: 1,
 			updated_at_ms: 1,
 			model: "test/model".into(),
+			parent_session_id: None,
+			parent_tool_call_id: None,
+			subagent_mode: None,
+			subagent_target_folder: None,
 		};
 		append_record(&dir, &header, &SessionRecord::User { text: "hi".into() })
 			.await
