@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { projectCompose, projectComposeStateLabel } from '../projectCompose.svelte';
 	import { workspace } from '../state.svelte';
+	import ContainerIcon from './icons/ContainerIcon.svelte';
 	import ProjectComposePopover from './ProjectComposePopover.svelte';
 
 	// Stacked folder bars — one row per folder bound into the workspace
@@ -8,13 +9,21 @@
 	// it active, hover for the `×` (remove) button, click the `+` to
 	// pick another folder.
 	//
-	// `.indicator` slot: when the folder has its own
-	// `docker-compose.yml`, a small dot reflects the per-folder
-	// compose project's status (running / failed / paused / etc.).
-	// Click opens a per-folder popover with start/stop/rebuild
-	// actions and a service list. Folders without a compose file
-	// get an empty (transparent) indicator so the row layout stays
-	// stable across folders.
+	// Each row exposes two passive readouts about the folder:
+	//
+	// - **Git change badges** (`+N ~N -N`) — added / modified /
+	//   deleted counts pulled from the per-folder
+	//   `gitChangeSummaries` map. Refreshed on workspace hydrate,
+	//   on every active-folder `refreshGitStatus` pass, and on
+	//   coder `tool_result` events so an agent in folder A
+	//   modifying folder B is visible from B's bar without B
+	//   becoming active.
+	// - **Container indicator** — when the folder ships a
+	//   `docker-compose.yml`, a small container glyph reflects the
+	//   project's compose state (running / failed / paused / …).
+	//   Click opens a per-folder popover with start/stop/rebuild.
+	//   Folders without compose get a placeholder so the row
+	//   layout doesn't shift across folders.
 	//
 	// The active row's chevron points down (`▾`) and the file tree
 	// renders directly underneath the bar in `Sidebar.svelte`. Inactive
@@ -27,6 +36,20 @@
 
 	const folders = $derived(workspace.workspace?.folders ?? []);
 	const activePath = $derived(workspace.activeFolderPath);
+
+	function summaryTitle(added: number, modified: number, deleted: number): string {
+		const parts: string[] = [];
+		if (added > 0) {
+			parts.push(`${added} added/untracked`);
+		}
+		if (modified > 0) {
+			parts.push(`${modified} modified`);
+		}
+		if (deleted > 0) {
+			parts.push(`${deleted} deleted`);
+		}
+		return parts.join(', ');
+	}
 </script>
 
 <ul class="bars" role="list">
@@ -37,6 +60,11 @@
 		{@const composeState = snap?.status.state ?? null}
 		{@const composeBusy = projectCompose.inFlightFor(folder.path) !== undefined}
 		{@const popoverOpen = projectCompose.isPanelOpen(folder.path)}
+		{@const summary = workspace.gitChangeSummaryFor(folder.path)}
+		{@const added = summary?.added ?? 0}
+		{@const modified = summary?.modified ?? 0}
+		{@const deleted = summary?.deleted ?? 0}
+		{@const hasChanges = added + modified + deleted > 0}
 		<li class="bar" class:active={isActive}>
 			<button
 				type="button"
@@ -49,6 +77,23 @@
 				<span class="chev" aria-hidden="true">{isActive ? '▾' : '▸'}</span>
 				<span class="name">{folder.name}</span>
 			</button>
+			{#if hasChanges}
+				<span
+					class="git-summary"
+					title="Working tree: {summaryTitle(added, modified, deleted)}"
+					aria-label="Git changes: {summaryTitle(added, modified, deleted)}"
+				>
+					{#if added > 0}
+						<span class="badge added">+{added}</span>
+					{/if}
+					{#if modified > 0}
+						<span class="badge modified">~{modified}</span>
+					{/if}
+					{#if deleted > 0}
+						<span class="badge deleted">-{deleted}</span>
+					{/if}
+				</span>
+			{/if}
 			{#if hasCompose}
 				<button
 					type="button"
@@ -64,7 +109,7 @@
 						projectCompose.togglePanel(folder.path);
 					}}
 				>
-					<span class="dot" aria-hidden="true"></span>
+					<ContainerIcon size={12} />
 				</button>
 			{:else}
 				<!-- Layout placeholder: keeps row width identical to
@@ -165,12 +210,38 @@
 		text-overflow: ellipsis;
 		white-space: nowrap;
 	}
+	.git-summary {
+		flex-shrink: 0;
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		padding: 0 6px;
+		font-size: 11px;
+		font-variant-numeric: tabular-nums;
+		line-height: 1;
+		pointer-events: auto;
+	}
+	.badge {
+		display: inline-block;
+	}
+	/* Mirror Pierre's tree-tinting palette so a folder bar
+	   showing `+3 ~1 -2` reads in the same colour vocabulary as
+	   the file rows inside it. */
+	.badge.added {
+		color: var(--m-success);
+	}
+	.badge.modified {
+		color: var(--m-warning, var(--m-fg-muted));
+	}
+	.badge.deleted {
+		color: var(--m-danger);
+	}
 	.indicator {
 		flex-shrink: 0;
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
-		width: 18px;
+		width: 22px;
 		height: 100%;
 		background: transparent;
 		border: none;
@@ -185,47 +256,40 @@
 	.indicator.open {
 		background: var(--m-bg-1);
 	}
-	.indicator .dot {
-		width: 8px;
-		height: 8px;
-		border-radius: 50%;
-		background: currentColor;
-		display: inline-block;
-		transition: background 80ms;
+	/* Per-state colouring for the container icon. Mirrors the
+	   state-text colours used by the workspace status pip +
+	   popover so the visual vocabulary stays consistent between
+	   the bottom bar and the folder bars. `absent` (compose file
+	   present but never brought up) is muted — neutral, "ready
+	   to start". */
+	.indicator.state-absent {
+		color: var(--m-fg-subtle);
 	}
-	/* Per-state colouring for the dot. Mirrors the state-text
-	   colours used by the workspace status pip + popover so the
-	   visual vocabulary stays consistent between the bottom bar
-	   and the folder bars. `absent` (compose file present but
-	   never brought up) is muted — neutral, "ready to start". */
-	.indicator.state-absent .dot {
-		background: var(--m-fg-subtle);
-	}
-	.indicator.state-creating .dot {
-		background: var(--m-warning, var(--m-fg-muted));
+	.indicator.state-creating {
+		color: var(--m-warning, var(--m-fg-muted));
 		animation: pulse 1.6s ease-in-out infinite;
 	}
-	.indicator.state-running .dot {
-		background: var(--m-success);
+	.indicator.state-running {
+		color: var(--m-success);
 	}
-	.indicator.state-paused .dot {
-		background: var(--m-warning, var(--m-fg-muted));
+	.indicator.state-paused {
+		color: var(--m-warning, var(--m-fg-muted));
 	}
-	.indicator.state-stopped .dot {
-		background: var(--m-fg-muted);
+	.indicator.state-stopped {
+		color: var(--m-fg-muted);
 	}
-	.indicator.state-failed .dot {
-		background: var(--m-danger);
+	.indicator.state-failed {
+		color: var(--m-danger);
 	}
 	/* `busy` = a per-folder lifecycle command (`up`, `pause`,
 	   `down`, …) is in flight. Override both the colour and the
-	   animation so the dot reads as "transitioning" rather than
+	   animation so the icon reads as "transitioning" rather than
 	   layering a pulse on top of whatever the previous state was
 	   — without this, a retry after a `failed` startup would
-	   show a blinking _red_ dot, which conflates "actively
+	   show a blinking _red_ glyph, which conflates "actively
 	   working on it" with "broken". */
-	.indicator.busy .dot {
-		background: var(--m-warning, var(--m-fg-muted));
+	.indicator.busy {
+		color: var(--m-warning, var(--m-fg-muted));
 		animation: pulse 1.2s ease-in-out infinite;
 	}
 	@keyframes pulse {

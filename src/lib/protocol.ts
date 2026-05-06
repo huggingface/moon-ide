@@ -120,6 +120,20 @@ export type GitStatusEntry = {
 };
 
 /**
+ * Aggregate change counts for a single bound folder, used to paint
+ * the per-folder badges on the project bar. Untracked files fold
+ * into `added` because the bar only needs a single "this folder
+ * has new files" signal — the SCM panel inside the active folder
+ * still distinguishes them. Mirrors
+ * `moon_protocol::git::GitChangeSummary`.
+ */
+export type GitChangeSummary = {
+	added: number;
+	modified: number;
+	deleted: number;
+};
+
+/**
  * Per-line blame for the inline current-line annotation and its
  * hover tooltip. Mirrors `moon_protocol::git::GitLineBlame`. The
  * `isUncommitted` flag is a convenience peel-off of the all-zero

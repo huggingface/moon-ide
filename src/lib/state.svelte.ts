@@ -14,6 +14,7 @@ import {
 	type EditorConfig,
 	type FolderSession,
 	type GitBranchInfo,
+	type GitChangeSummary,
 	type GitFileBlame,
 	type GitStatusEntry,
 	type LspDiagnostic,
@@ -779,6 +780,19 @@ class WorkspaceState {
 		// have no compose.yaml — the backend short-circuits to
 		// `Absent` without invoking docker.
 		void projectCompose.refreshAll(snapshot.folders.map((f) => f.path));
+		// Same warm-up for the per-folder git change badges. Each
+		// non-active folder's `git status` runs once here so the
+		// project bar paints with real counts on first frame.
+		// Subsequent refreshes ride on `refreshGitStatus` so an
+		// agent edit in folder A also re-counts folder B.
+		const gone = new Set(this.gitChangeSummaries.keys());
+		for (const folder of snapshot.folders) {
+			gone.delete(folder.path);
+		}
+		for (const path of gone) {
+			this.gitChangeSummaries.delete(path);
+		}
+		void this.refreshAllGitChangeSummaries();
 	}
 
 	tabsFor(side: SplitSide): string[] {
@@ -906,6 +920,11 @@ class WorkspaceState {
 		// later `lsp_*` call (triggered by opening a TS file) has
 		// a listener in place before the broker starts emitting.
 		void this.bindLspListeners();
+		// Coder event stream: drives the per-folder project-bar
+		// badge refresh after a tool result lands, so cross-folder
+		// agent edits show up without fs-watcher coverage of every
+		// bound folder.
+		void this.bindCoderRefresh();
 
 		const ws = this.workspace;
 		const session = state.last_session;
@@ -1246,6 +1265,29 @@ class WorkspaceState {
 	gitStatusEntries = $state<readonly GitStatusEntry[]>([]);
 
 	/**
+	 * Per-folder aggregate change counts driving the project-bar
+	 * badges. Keyed by absolute folder path. Refreshed on workspace
+	 * hydration, on add/remove, and on every active-folder
+	 * `refreshGitStatus` pass — that last one is the load-bearing
+	 * trigger for the "agent in folder A modified folder B" case:
+	 * the watcher fires on A's tree, the active refresh fans out,
+	 * and B's badge updates without B ever becoming active.
+	 *
+	 * Folders that aren't repos / have no changes resolve to a
+	 * zeroed `GitChangeSummary`; missing entries (folder freshly
+	 * added, refresh in flight) render as no badges either.
+	 */
+	gitChangeSummaries = new SvelteMap<string, GitChangeSummary>();
+
+	/**
+	 * In-flight guard so a watcher burst (the agent saving 30 files
+	 * back-to-back) doesn't stack 30 `git status` subprocesses per
+	 * folder. The first call wins; subsequent ones short-circuit
+	 * until the in-flight one resolves and clears the flag.
+	 */
+	#summaryInFlight = new Set<string>();
+
+	/**
 	 * Active folder's branch + HEAD info. The SCM panel reads
 	 * `name` for its header; `headShortSha` is the fallback the
 	 * panel shows when the repo is in detached-HEAD state. Both
@@ -1329,6 +1371,50 @@ class WorkspaceState {
 				prUrl: null,
 			};
 		}
+	}
+
+	/**
+	 * Reactive lookup for the project bar. `undefined` until the
+	 * folder's first refresh resolves; consumers render no badges
+	 * in that case.
+	 */
+	gitChangeSummaryFor(folderPath: string): GitChangeSummary | undefined {
+		return this.gitChangeSummaries.get(folderPath);
+	}
+
+	/**
+	 * Pull the change summary for a single folder. Coalesces with
+	 * any in-flight refresh for the same folder. Failures cache as
+	 * a zeroed summary — the most common reason is "git unavailable
+	 * / not a repo / folder vanished", and rendering "no badges"
+	 * is the right answer for all of them.
+	 */
+	async refreshGitChangeSummary(folderPath: string): Promise<void> {
+		if (this.#summaryInFlight.has(folderPath)) {
+			return;
+		}
+		this.#summaryInFlight.add(folderPath);
+		try {
+			const summary = await ipc.fs.gitChangeSummary(folderPath);
+			this.gitChangeSummaries.set(folderPath, summary);
+		} catch {
+			this.gitChangeSummaries.set(folderPath, { added: 0, modified: 0, deleted: 0 });
+		} finally {
+			this.#summaryInFlight.delete(folderPath);
+		}
+	}
+
+	/**
+	 * Fan out a summary refresh to every bound folder. Cheap when
+	 * folders are small; the per-folder in-flight guard collapses
+	 * bursts. Used after workspace hydration and on every active-
+	 * folder `refreshGitStatus` pass so cross-folder edits (an
+	 * agent in folder A modifying folder B) reach the project bar
+	 * without B becoming active.
+	 */
+	async refreshAllGitChangeSummaries(): Promise<void> {
+		const folders = this.workspace?.folders ?? [];
+		await Promise.all(folders.map((f) => this.refreshGitChangeSummary(f.path)));
 	}
 
 	/**
@@ -1478,6 +1564,14 @@ class WorkspaceState {
 				void this.reloadOpenFileFromDisk(file.path);
 			}
 		}
+		// Fan out to every bound folder's project-bar badge. The
+		// active folder's status was just (re)classified above; for
+		// inactive folders we issue a separate `git status` so an
+		// agent in folder A modifying folder B reaches B's badge
+		// even though B isn't being watched. Cheap: per-folder
+		// `git status` is sub-100ms on real repos and the
+		// in-flight guard collapses bursts.
+		void this.refreshAllGitChangeSummaries();
 	}
 
 	/**
@@ -1646,6 +1740,53 @@ class WorkspaceState {
 			// Event bus unavailable (tests / non-Tauri). The
 			// editor will show no diagnostics and the status
 			// pill will stay hidden — acceptable degradation.
+		}
+	}
+
+	#coderRefreshWired = false;
+	#coderRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+	/**
+	 * Subscribe to the coder event channel for project-bar refresh.
+	 * The fs-watcher only sees the **active** folder, so an agent
+	 * running in folder A that edits folder B (sub-agent on B,
+	 * `bash` writing into B's tree, …) wouldn't otherwise trigger
+	 * a status refresh — B's badge would lag until the user
+	 * activated it. Listening on `coder:event` and refreshing all
+	 * summaries on any `tool_result` / `turn_complete` /
+	 * `subagent_finished` covers the cross-folder case.
+	 *
+	 * Debounced (200ms) so a turn that fires 30 `edit_file`s
+	 * back-to-back collapses into one fan-out instead of 30. The
+	 * per-folder in-flight guard inside `refreshGitChangeSummary`
+	 * is a second backstop.
+	 */
+	async bindCoderRefresh(): Promise<void> {
+		if (this.#coderRefreshWired) {
+			return;
+		}
+		this.#coderRefreshWired = true;
+		const schedule = () => {
+			if (this.#coderRefreshTimer !== null) {
+				clearTimeout(this.#coderRefreshTimer);
+			}
+			this.#coderRefreshTimer = setTimeout(() => {
+				this.#coderRefreshTimer = null;
+				void this.refreshAllGitChangeSummaries();
+			}, 200);
+		};
+		try {
+			await listen<{ folder: string; event: { kind: string } }>('coder:event', ({ payload }) => {
+				const kind = payload.event.kind;
+				if (kind === 'tool_result' || kind === 'turn_complete' || kind === 'subagent_finished') {
+					schedule();
+				}
+			});
+		} catch {
+			// Event bus unavailable (tests / non-Tauri). Active-
+			// folder fs-watcher fan-out still covers the in-folder
+			// case; only the cross-folder agent edit goes unseen
+			// until the next focus / palette refresh.
 		}
 	}
 

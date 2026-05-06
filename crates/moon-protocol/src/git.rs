@@ -57,6 +57,22 @@ pub struct GitStatusEntry {
 	pub status: GitFileStatus,
 }
 
+/// Aggregate change counts for a single bound folder. Drives the
+/// per-folder badges on the project bar so a user can see at a
+/// glance which folders an agent (or anything else) just modified
+/// — even folders that aren't currently active. `Untracked` files
+/// fold into `added` because the project bar's signal-to-noise is
+/// "this folder has a new file in it"; the SCM panel inside the
+/// active folder still distinguishes the two.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct GitChangeSummary {
+	pub added: u32,
+	pub modified: u32,
+	pub deleted: u32,
+}
+
 /// Per-line blame: who last touched this line, when, and with what
 /// commit. The inline current-line annotation uses `author_short` +
 /// a frontend-computed relative date + `summary`; the hover tooltip

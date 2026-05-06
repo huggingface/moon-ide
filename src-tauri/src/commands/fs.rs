@@ -1,7 +1,9 @@
 use camino::Utf8PathBuf;
 use moon_core::{read_host_file, write_host_file};
 use moon_protocol::fs::{DirEntry, ReadFileResult, StatResult, WriteFileResult};
-use moon_protocol::git::{GitBranchInfo, GitCommitResult, GitFileBlame, GitStatusEntry};
+use moon_protocol::git::{
+	GitBranchInfo, GitChangeSummary, GitCommitResult, GitFileBlame, GitFileStatus, GitStatusEntry,
+};
 use moon_protocol::MoonError;
 use tauri::State;
 
@@ -149,6 +151,43 @@ pub async fn fs_git_status_entries(
 ) -> Result<Vec<GitStatusEntry>, MoonError> {
 	let entry = state.workspaces.require_active_folder().await?;
 	entry.host.git_status_entries(&paths).await
+}
+
+/// Aggregate added / modified / deleted counts for a single bound
+/// folder — feeds the per-folder badges on the project bar so the
+/// user can see at a glance which folders have working-tree
+/// changes. Distinct from `fs_git_status_entries` because (a) the
+/// project bar only needs counts, not the full path list, and (b)
+/// it must work for **any** bound folder, not just the active one.
+/// Folder lookup goes through the `WorkspaceRegistry`; an empty
+/// `paths` slice keeps the walker-fallback path silent for non-repo
+/// folders (zero counts), which is the right "this folder has
+/// nothing to flag" answer.
+#[tauri::command]
+pub async fn fs_git_change_summary(
+	state: State<'_, AppState>,
+	folder_path: String,
+) -> Result<GitChangeSummary, MoonError> {
+	let entry = state
+		.workspaces
+		.folder_for_path(&folder_path)
+		.await
+		.ok_or_else(|| MoonError::invalid(format!("unknown folder: {folder_path}")))?;
+	let entries = entry.host.git_status_entries(&[]).await?;
+	let mut summary = GitChangeSummary::default();
+	for e in entries {
+		match e.status {
+			// `Untracked` files fold into `added`: from the project
+			// bar's POV "there's a new file in this folder" is one
+			// signal — the SCM panel inside the active folder still
+			// keeps the two distinct.
+			GitFileStatus::Added | GitFileStatus::Untracked => summary.added += 1,
+			GitFileStatus::Modified => summary.modified += 1,
+			GitFileStatus::Deleted => summary.deleted += 1,
+			GitFileStatus::Ignored => {}
+		}
+	}
+	Ok(summary)
 }
 
 /// Discard working-tree + index changes for `paths` by restoring

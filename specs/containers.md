@@ -112,9 +112,18 @@ brings up just the workspace shell.
 
 When a bound folder has a root-level `docker-compose.yml` (or
 `compose.yaml`), the folder bar in the sidebar grows a small
-status indicator. Click opens a popover with Start / Stop /
-Recreate / Down and a service list — same vocabulary as the
-workspace shell's pip, scoped to that one folder's project.
+**container glyph** tinted by the project's compose state
+(running / failed / paused / stopped / absent). Click opens a
+popover with Start / Stop / Recreate / Down and a service list
+— same vocabulary as the workspace shell's pip, scoped to that
+one folder's project.
+
+Folder bars also carry compact `+N ~N -N` git badges next to
+the folder name (added/untracked, modified, deleted counts for
+the working tree). They refresh on every active-folder status
+pass and on coder `tool_result` events, so an agent in folder
+A modifying folder B is visible from B's bar without B
+becoming active.
 
 Under the hood the IDE just shells out:
 
@@ -149,7 +158,7 @@ After binding moon-landing into a moon-ide workspace:
   with one bind mount (`/home/me/code/moon-landing →
 /workspace/moon-landing`). "Set up" brings up just the
   `dev` container — fast, doesn't touch any project image.
-- The folder bar shows a muted indicator (compose file
+- The folder bar shows a muted container glyph (compose file
   detected, services not running). The user clicks it and
   hits "Start services"; the IDE runs
   `docker compose -f /home/me/code/moon-landing/docker-compose.yml
@@ -157,8 +166,8 @@ After binding moon-landing into a moon-ide workspace:
   logged into `registry.internal.huggingface.tech` on their
   host's daemon picks up the private images transparently.
 - If gitaly fails the volume permission check, the folder bar
-  flips its dot to red and the popover lists `gitaly · exited
-(1)`. The workspace shell stays up — the user can still
+  flips its container glyph to red and the popover lists
+  `gitaly · exited (1)`. The workspace shell stays up — the user can still
   open a terminal — and "Recreate" / "Down" sit on the
   popover.
 - The user's app continues to run wherever it ran before —
@@ -1010,7 +1019,7 @@ the same whether one or many folders are bound.
   mount list changed; the workspace shell project doesn't
   touch the new folder's services. Pre-opt-in (no
   `compose.yaml` yet) is a no-op: the file is materialised
-  on first "Set up". The folder bar's compose indicator
+  on first "Set up". The folder bar's container glyph
   warms up shortly after by polling
   `project_compose_status` for the new folder.
 - **Remove a folder** (per-bar `×`, with confirm): the
