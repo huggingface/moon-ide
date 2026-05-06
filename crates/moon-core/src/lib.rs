@@ -19,7 +19,7 @@ pub mod pre_save;
 pub mod search;
 pub mod workspace;
 
-pub use host::{LocalHost, WorkspaceHost};
+pub use host::{read_host_file, write_host_file, LocalHost, WorkspaceHost};
 pub use workspace::{WorkspaceFolderEntry, WorkspaceRegistry, DEFAULT_WORKSPACE_ID};
 
 pub use moon_protocol as protocol;

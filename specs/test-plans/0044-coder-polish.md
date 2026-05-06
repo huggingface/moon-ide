@@ -119,10 +119,10 @@ and just stop`). The model emits thinking + tool calls and
 a markdown code block` (the file is tab-indented per ADR
     0004).
 
-                                                                        Expected: the rendered fenced code block shows 2-column
-                                                                        tabs, not 8. Compare to the same content in Cursor / VS
-                                                                        Code's Markdown preview at default settings — the
-                                                                        moon-ide rendering is tighter.
+                                                                                Expected: the rendered fenced code block shows 2-column
+                                                                                tabs, not 8. Compare to the same content in Cursor / VS
+                                                                                Code's Markdown preview at default settings — the
+                                                                                moon-ide rendering is tighter.
 
 12. Same check in the Slack panel: paste a tab-indented snippet
     inside triple-backticks via Slack proper, then look at it

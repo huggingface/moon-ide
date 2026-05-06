@@ -42,6 +42,8 @@ pub fn run() {
 			commands::fs::fs_collect_paths,
 			commands::fs::fs_read_file,
 			commands::fs::fs_write_file,
+			commands::fs::fs_read_file_host,
+			commands::fs::fs_write_file_host,
 			commands::fs::fs_create_file,
 			commands::fs::fs_create_dir,
 			commands::fs::fs_rename,

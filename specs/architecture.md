@@ -47,6 +47,10 @@ For local containers, the host filesystem is the source of truth — moon-core r
 
 This is what makes local-container support cheap (Phase 2). It is also what will make remote SSH / Codespaces-style modes cheap when we add them. Violating it is the single biggest architectural risk.
 
+### Host-direct fs (one explicit exception)
+
+`fs_read_file_host` / `fs_write_file_host` (free functions in `moon_core::host`) read and write the **host** filesystem with no `WorkspaceHost` in the loop. They exist for one user-visible affordance — `Ctrl+O` "Open File…" — when the picked path lives outside every bound folder. Phase 2's `ContainerHost` would refuse such a path (it's outside the bind mount) and a remote `WorkspaceHost` couldn't see it at all. Buffers loaded this way carry `OpenFile.isExternal` and skip LSP / editorconfig / git / session persistence; they aren't part of any project. Every other fs call still goes through the active host.
+
 ## `WorkspaceHost` (Phase 2)
 
 ```rust

@@ -115,6 +115,26 @@
 				workspace.newUntitledTab();
 				return;
 			}
+			if (!event.shiftKey && key === 'o') {
+				// Open File…: native picker, then route through
+				// `openHostFile`. Files inside the active folder
+				// fall through to the regular `openFile` flow;
+				// files outside it (or, in the Phase 2 container
+				// world, outside the bind mount) are read via
+				// `fs.readFileHost` and tracked with `isExternal`.
+				// Same toast-on-no-folder shape as Ctrl+N because
+				// the open-files list is per-folder.
+				event.preventDefault();
+				if (!workspace.workspace) {
+					workspace.flash('Open a folder before opening a file.');
+					return;
+				}
+				const selected = await open({ directory: false, multiple: false });
+				if (typeof selected === 'string') {
+					await workspace.openHostFile(selected);
+				}
+				return;
+			}
 			if (event.shiftKey && key === 'p') {
 				event.preventDefault();
 				palette.show('commands');

@@ -55,6 +55,12 @@ export const ipc = {
 		collectPaths: (maxDepth: number) => invoke<string[]>('fs_collect_paths', { maxDepth }),
 		readFile: (path: string) => invoke<ReadFileResult>('fs_read_file', { path }),
 		writeFile: (path: string, text: string) => invoke<WriteFileResult>('fs_write_file', { path, text }),
+		// Host-direct read/write for files outside every bound folder. Bypasses
+		// the active `WorkspaceHost` so an external path stays readable when the
+		// active folder runs in a container (the in-container host can't see
+		// paths outside the bind mount). See `Workspace::openHostFile`.
+		readFileHost: (path: string) => invoke<ReadFileResult>('fs_read_file_host', { path }),
+		writeFileHost: (path: string, text: string) => invoke<WriteFileResult>('fs_write_file_host', { path, text }),
 		createFile: (path: string) => invoke<void>('fs_create_file', { path }),
 		createDir: (path: string) => invoke<void>('fs_create_dir', { path }),
 		rename: (from: string, to: string) => invoke<void>('fs_rename', { from, to }),

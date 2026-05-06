@@ -78,6 +78,28 @@ export const builtInCommands: Command[] = [
 		run: () => void workspace.loadPaths(),
 	},
 	{
+		id: 'editor.openFile',
+		title: 'Open File…',
+		shortcut: 'Ctrl+O',
+		// Mirrors the `Ctrl+O` keybinding in App.svelte. The native
+		// dialog runs on the host machine even when the active
+		// folder lives in a container, and `openHostFile` routes
+		// the picked path through `fs.readFileHost` when it falls
+		// outside every bound folder — so the user can pop open
+		// any host file (a sibling repo, ~/.bashrc, …) without
+		// adding the folder to the workspace.
+		run: async () => {
+			if (!workspace.workspace) {
+				workspace.flash('Open a folder before opening a file.');
+				return;
+			}
+			const selected = await open({ directory: false, multiple: false });
+			if (typeof selected === 'string') {
+				await workspace.openHostFile(selected);
+			}
+		},
+	},
+	{
 		id: 'editor.newFile',
 		title: 'New File',
 		shortcut: 'Ctrl+N',

@@ -123,6 +123,15 @@ export type OpenFile = {
 	// the session so a deleted row the user left open pops back up
 	// in diff mode after a restart.
 	isDeleted: boolean;
+	// True for buffers opened from outside every bound folder via
+	// `openHostFile` (Ctrl+O on a path the active folder doesn't
+	// contain). The bytes live wherever the host filesystem says,
+	// so reads / writes route through the host-direct IPC pair
+	// (`fs.readFileHost` / `fs.writeFileHost`) and the buffer skips
+	// LSP, editorconfig, git, and session persistence — all of
+	// those assume the file lives inside the active folder's host.
+	// Path is the absolute host path; tabs render the basename.
+	isExternal: boolean;
 };
 
 /**
@@ -1133,8 +1142,22 @@ class WorkspaceState {
 			// from both tab lists and from the active fields before we
 			// serialise. The user-facing trade-off — `Ctrl+N`, type, quit
 			// without saving = work is gone — matches every other editor.
-			const realPaths = (paths: string[]) => paths.filter((p) => !isUntitledPath(p));
-			const realActive = (path: string | null) => (path !== null && !isUntitledPath(path) ? path : null);
+			// External buffers (Ctrl+O on a file outside every bound
+			// folder) get the same treatment — the persisted session is
+			// per-folder, and a file from the host's $HOME has no
+			// natural folder to belong to. Re-typing Ctrl+O after a
+			// restart is the contract.
+			const externalSet = new Set<string>();
+			for (const fs of this.folderStates.values()) {
+				for (const f of fs.openFiles) {
+					if (f.isExternal) {
+						externalSet.add(f.path);
+					}
+				}
+			}
+			const isPersistable = (p: string) => !isUntitledPath(p) && !externalSet.has(p);
+			const realPaths = (paths: string[]) => paths.filter(isPersistable);
+			const realActive = (path: string | null) => (path !== null && isPersistable(path) ? path : null);
 			const folderSessions: FolderSession[] = [];
 			if (ws) {
 				for (const folder of ws.folders) {
@@ -1438,6 +1461,13 @@ class WorkspaceState {
 		// conservative loop over every open buffer.
 		for (const file of this.openFiles) {
 			if (file.kind !== 'text' || file.isDeleted) {
+				continue;
+			}
+			// External buffers don't belong to the active folder's
+			// repo or its watcher — neither HEAD refresh nor on-disk
+			// reload would route through the right host. They
+			// re-read on the next user action (or stay as-is).
+			if (file.isExternal) {
 				continue;
 			}
 			if (changedSubset !== null && !changedSubset.has(file.path)) {
@@ -1860,6 +1890,7 @@ class WorkspaceState {
 			loadedMtimeMs: null,
 			isDirty: false,
 			isDeleted: false,
+			isExternal: false,
 		};
 		this.openFiles = [...this.openFiles, file];
 		const tabs = this.tabsFor(side);
@@ -1899,6 +1930,75 @@ class WorkspaceState {
 		}
 		this.setActive(path, side, options);
 		void this.ensureEditorConfig(path);
+	}
+
+	/**
+	 * Open a file selected from the native "Open File…" dialog. The
+	 * dialog hands us an absolute host path; we route it one of two
+	 * ways:
+	 *
+	 *   - Inside the active folder → fall through to `openFile` on the
+	 *     folder-relative path so the buffer gets the full editor
+	 *     treatment (LSP, editorconfig, git status / blame / HEAD,
+	 *     session persistence).
+	 *   - Outside every bound folder → load via `fs.readFileHost`,
+	 *     which bypasses every `WorkspaceHost` and reads straight
+	 *     from the host filesystem. The buffer enters `openFiles` with
+	 *     `isExternal: true`, which disables LSP / editorconfig / git
+	 *     wiring and skips session persistence. Saves route through
+	 *     `fs.writeFileHost` against the same absolute path. Crucially,
+	 *     this stays correct in the Phase 2 container world: the
+	 *     in-container host can't see paths outside the bind mount,
+	 *     so anything not under the active folder must use the host
+	 *     pair.
+	 *
+	 * Requires an active folder (the open-files list is per-folder).
+	 */
+	async openHostFile(absolutePath: string, side: SplitSide = this.focusedSide) {
+		const folder = this.activeFolder;
+		if (!folder) {
+			this.flash('Open a folder before opening a file.');
+			return;
+		}
+		const root = folder.path.replace(/\/+$/, '');
+		const relative = relativeToRoot(absolutePath, root);
+		if (relative !== null) {
+			await this.openFile(relative, side);
+			return;
+		}
+		const existing = this.openFiles.find((f) => f.path === absolutePath);
+		if (!existing) {
+			let result;
+			try {
+				result = await ipc.fs.readFileHost(absolutePath);
+			} catch (err) {
+				this.flash(`Failed to open ${absolutePath}: ${formatError(err)}`);
+				return;
+			}
+			if (result.is_binary) {
+				this.flash(`Cannot open binary file: ${absolutePath}`);
+				return;
+			}
+			const file: OpenFile = {
+				path: absolutePath,
+				name: basename(absolutePath),
+				kind: 'text',
+				isUntitled: false,
+				text: result.text,
+				previewUrl: '',
+				loadedFingerprint: fingerprint(result.text),
+				loadedMtimeMs: result.mtime_ms,
+				isDirty: false,
+				isDeleted: false,
+				isExternal: true,
+			};
+			this.openFiles = [...this.openFiles, file];
+		}
+		const tabs = this.tabsFor(side);
+		if (!tabs.includes(absolutePath)) {
+			this.setTabsFor(side, [...tabs, absolutePath]);
+		}
+		this.setActive(absolutePath, side);
 	}
 
 	editorConfigFor(path: string): EditorConfig {
@@ -1974,6 +2074,14 @@ class WorkspaceState {
 		if (isUntitledPath(path)) {
 			return;
 		}
+		// External buffers live outside every bound folder; the active
+		// folder's `.editorconfig` cascade is the wrong tree to walk.
+		// Defaults are fine here — the team rarely edits unrelated
+		// host files long enough for indent settings to matter.
+		const file = this.openFiles.find((f) => f.path === path);
+		if (file?.isExternal) {
+			return;
+		}
 		if (this.editorConfigs.has(path)) {
 			return;
 		}
@@ -2032,6 +2140,7 @@ class WorkspaceState {
 			loadedMtimeMs: result.mtime_ms,
 			isDirty: false,
 			isDeleted: false,
+			isExternal: false,
 		};
 	}
 
@@ -2048,6 +2157,7 @@ class WorkspaceState {
 			loadedMtimeMs: null,
 			isDirty: false,
 			isDeleted: false,
+			isExternal: false,
 		};
 	}
 
@@ -2080,6 +2190,7 @@ class WorkspaceState {
 			loadedMtimeMs: null,
 			isDirty: false,
 			isDeleted: true,
+			isExternal: false,
 		};
 	}
 
@@ -2561,6 +2672,12 @@ class WorkspaceState {
 		// break the "re-click an already-open file" flow (the existing
 		// entry would short-circuit the load).
 		if (!this.leftTabs.includes(path) && !this.rightTabs.includes(path)) {
+			// External buffers were never opened with the LSP / git
+			// machinery, so capture the flag before the filter and
+			// skip the matching teardown. Calling `lspClose` here
+			// would issue a `didClose` for a `didOpen` the broker
+			// never saw.
+			const wasExternal = this.openFiles.find((f) => f.path === path)?.isExternal === true;
 			this.openFiles = this.openFiles.filter((f) => f.path !== path);
 			if (this.previewModes.has(path)) {
 				const next = new Map(this.previewModes);
@@ -2572,15 +2689,17 @@ class WorkspaceState {
 				next.delete(path);
 				this.diffModes = next;
 			}
-			// Tell the LSP broker *and* drop any cached diagnostics
-			// so a later reopen of the same path starts clean rather
-			// than flashing stale squigglies.
-			this.lspClose(path);
-			// Drop blame cache + any pending refresh timer. If the
-			// user reopens the file later a fresh blame fetch runs;
-			// no point keeping the old one warm.
-			this.clearBlameFor(path);
-			this.clearHeadFor(path);
+			if (!wasExternal) {
+				// Tell the LSP broker *and* drop any cached diagnostics
+				// so a later reopen of the same path starts clean rather
+				// than flashing stale squigglies.
+				this.lspClose(path);
+				// Drop blame cache + any pending refresh timer. If the
+				// user reopens the file later a fresh blame fetch runs;
+				// no point keeping the old one warm.
+				this.clearBlameFor(path);
+				this.clearHeadFor(path);
+			}
 		}
 
 		if (fallback !== null) {
@@ -2710,7 +2829,11 @@ class WorkspaceState {
 		// guard in `refreshBlame` keeps this cheap — once the cache
 		// has an entry or a fetch is pending, this call is a no-op.
 		const file = this.openFiles.find((f) => f.path === path);
-		const isLiveTextBuffer = file && file.kind === 'text' && !file.isDeleted;
+		// External buffers live outside every bound folder, so the
+		// active folder's git layer has nothing to say about them
+		// (no HEAD, no blame). Skip both seeds — they'd just round-
+		// trip to the host for a guaranteed-empty answer.
+		const isLiveTextBuffer = file && file.kind === 'text' && !file.isDeleted && !file.isExternal;
 		if (isLiveTextBuffer && !this.blameByPath.has(path)) {
 			this.refreshBlame(path);
 		}
@@ -3128,10 +3251,12 @@ class WorkspaceState {
 	}
 
 	updateText(path: string, text: string) {
+		let isExternal = false;
 		this.openFiles = this.openFiles.map((f) => {
 			if (f.path !== path) {
 				return f;
 			}
+			isExternal = f.isExternal;
 			// Length mismatch is a fast path: different sizes can never compare
 			// equal, so we skip hashing entirely while the user is typing.
 			const dirty =
@@ -3142,7 +3267,11 @@ class WorkspaceState {
 		// backend does the serialisation with the LSP server, so a
 		// dropped update (e.g. closeFile racing) can never leave us
 		// in a state that disagrees with the server's last version.
-		this.lspScheduleUpdate(path, text);
+		// External buffers never had a `didOpen` (no folder-rooted LSP
+		// to send it to), so skip didChange too.
+		if (!isExternal) {
+			this.lspScheduleUpdate(path, text);
+		}
 	}
 
 	closeActive() {
@@ -3177,6 +3306,27 @@ class WorkspaceState {
 		// state, the LSP didChange is a no-op, the fingerprint stays
 		// stable).
 		try {
+			// External buffers route through the host-direct write so
+			// the bytes land on the host filesystem regardless of
+			// whether the active folder is currently containerised.
+			// They also skip the editorconfig + lint-staged save
+			// pipeline (no workspace root to anchor the cascade
+			// against) and the post-save blame / head refresh
+			// (external paths aren't in the active folder's repo).
+			if (file.isExternal) {
+				const result = await ipc.fs.writeFileHost(file.path, file.text);
+				this.openFiles = this.openFiles.map((f) =>
+					f.path === file.path
+						? {
+								...f,
+								isDirty: false,
+								loadedFingerprint: fingerprint(f.text),
+								loadedMtimeMs: result.mtime_ms,
+							}
+						: f,
+				);
+				return;
+			}
 			const result = await ipc.fs.writeFile(file.path, file.text);
 			// The pre-save pipeline (line endings, trim trailing ws, final
 			// newline) runs server-side, so the bytes on disk may not equal

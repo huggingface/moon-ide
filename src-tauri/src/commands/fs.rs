@@ -1,4 +1,5 @@
 use camino::Utf8PathBuf;
+use moon_core::{read_host_file, write_host_file};
 use moon_protocol::fs::{DirEntry, ReadFileResult, StatResult, WriteFileResult};
 use moon_protocol::git::{GitBranchInfo, GitCommitResult, GitFileBlame, GitStatusEntry};
 use moon_protocol::MoonError;
@@ -52,6 +53,27 @@ pub async fn fs_write_file(
 	// ws, final newline) plus the lint-staged formatter. See
 	// specs/editorconfig.md and specs/decisions/0012-format-on-save.md.
 	entry.host.save_file(&path, &text).await
+}
+
+/// Read an arbitrary host path, bypassing every `WorkspaceHost`. Used by
+/// the "Open File…" affordance for files that live outside any bound folder.
+/// In the Phase 2 container world, this still reads from the host
+/// filesystem — the in-container host can't see paths outside the bind
+/// mount, so routing those through `WorkspaceHost::read_file` would be
+/// wrong by construction. No active-folder check; absolute paths only.
+#[tauri::command]
+pub async fn fs_read_file_host(path: String) -> Result<ReadFileResult, MoonError> {
+	let path = Utf8PathBuf::from(path);
+	read_host_file(&path).await
+}
+
+/// Companion to [`fs_read_file_host`] — saves an external buffer back to
+/// the host path it came from. Skips the editorconfig / lint-staged save
+/// pipeline because external files don't belong to any workspace root.
+#[tauri::command]
+pub async fn fs_write_file_host(path: String, text: String) -> Result<WriteFileResult, MoonError> {
+	let path = Utf8PathBuf::from(path);
+	write_host_file(&path, &text).await
 }
 
 /// Create an empty file at `path`. Errors if the path already

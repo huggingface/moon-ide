@@ -1795,6 +1795,54 @@ fn looks_binary(bytes: &[u8]) -> bool {
 	head.contains(&0)
 }
 
+/// Read a file directly from the host filesystem, bypassing every
+/// `WorkspaceHost` (and therefore every workspace-root check). Used by the
+/// "Open File…" affordance to load files that live outside any bound folder
+/// — and, in the Phase 2 container world, to reach files outside the bind
+/// mount that the in-container host can't see at all. Same `ReadFileResult`
+/// shape as [`WorkspaceHost::read_file`] (binary detection + mtime), so the
+/// frontend handles the two paths interchangeably. The caller is responsible
+/// for whatever boundary makes sense at the UI layer.
+pub async fn read_host_file(path: &Utf8Path) -> MoonResult<ReadFileResult> {
+	let bytes = tokio::fs::read(path.as_std_path()).await.map_err(MoonError::from)?;
+	let metadata = tokio::fs::metadata(path.as_std_path()).await.map_err(MoonError::from)?;
+	let mtime_ms = metadata.modified().ok().and_then(system_time_to_ms);
+
+	if looks_binary(&bytes) {
+		return Ok(ReadFileResult {
+			text: String::new(),
+			mtime_ms,
+			is_binary: true,
+		});
+	}
+
+	let text = String::from_utf8(bytes).map_err(|e| MoonError::IoError(e.to_string()))?;
+	Ok(ReadFileResult {
+		text,
+		mtime_ms,
+		is_binary: false,
+	})
+}
+
+/// Write `text` straight to the host path. Counterpart to
+/// [`read_host_file`] — bypasses the editorconfig + lint-staged save pipeline
+/// because external files don't belong to any workspace root and there's no
+/// `.editorconfig` cascade or lint-staged config to consult. Equivalent of
+/// `tokio::fs::write` plus the `WriteFileResult` shape the frontend already
+/// understands.
+pub async fn write_host_file(path: &Utf8Path, text: &str) -> MoonResult<WriteFileResult> {
+	let bytes = text.as_bytes();
+	tokio::fs::write(path.as_std_path(), bytes)
+		.await
+		.map_err(MoonError::from)?;
+	let metadata = tokio::fs::metadata(path.as_std_path()).await.map_err(MoonError::from)?;
+	let mtime_ms = metadata.modified().ok().and_then(system_time_to_ms);
+	Ok(WriteFileResult {
+		mtime_ms,
+		bytes_written: bytes.len() as u64,
+	})
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
