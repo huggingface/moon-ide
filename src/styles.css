@@ -77,6 +77,12 @@
 	--trees-selected-focused-border-color-override: var(--m-accent);
 	--trees-border-color-override: var(--m-border);
 	--trees-focus-ring-color-override: var(--m-accent);
+	/* Tighten the tree's outer left/right inset. Pierre's default
+	   is 16px, which leaves a wide empty gutter to the left of
+	   every row in our narrow sidebar; 6px keeps the focus ring
+	   from clipping against the sidebar edge while reclaiming
+	   ~20px of horizontal space for filenames. */
+	--trees-padding-inline-override: 6px;
 
 	--m-font-ui: -apple-system, 'Inter', system-ui, 'Segoe UI', Roboto, sans-serif;
 	--m-font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;

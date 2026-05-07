@@ -81,6 +81,7 @@ export const ipc = {
 		gitPush: () => invoke<void>('fs_git_push'),
 		gitPublishBranch: () => invoke<void>('fs_git_publish_branch'),
 		gitPull: () => invoke<void>('fs_git_pull'),
+		gitMergeDefaultBranch: (remoteRef: string) => invoke<void>('fs_git_merge_default_branch', { remoteRef }),
 		gitFetch: () => invoke<void>('fs_git_fetch'),
 		gitHeadCommitMessage: () => invoke<string>('fs_git_head_commit_message'),
 	},

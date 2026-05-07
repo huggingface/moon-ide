@@ -147,11 +147,19 @@ nothing else uses it" is the kind of dead config the bootstrap rule
    (no config in the workspace, or a config that doesn't list the
    file's extension).
 
-Today's table is one row:
+Today's table:
 
-| extension | command                 |
-| --------- | ----------------------- |
-| `.rs`     | `rustfmt --edition <e>` |
+| extension      | command (base)            | cwd                  |
+| -------------- | ------------------------- | -------------------- |
+| `.rs`          | `rustfmt --edition <e>`   | file's parent dir    |
+| `.py` / `.pyi` | `[.venv/bin/]ruff format` | nearest project root |
+
+The resolver also returns the `cwd` the subprocess should run in,
+not just the command — necessary because Python's project-local
+toolchain (`.venv/bin/ruff`) only resolves when the subprocess is
+spawned with the project root as its working directory. The Rust
+path keeps the existing "file's parent" cwd; the Python path pins
+to the project root.
 
 `rustfmt` walks up from each input file looking for `rustfmt.toml` /
 `.rustfmt.toml`. The edition we have to discover ourselves: bare
@@ -181,6 +189,61 @@ The subprocess runs with the file's parent directory as `cwd`,
 matching what a shell invocation from that directory would resolve.
 When `rustfmt` isn't installed the existing "tool not found" warning
 fires and the file keeps its editorconfig-normalised bytes.
+
+#### Python: ruff with venv preference
+
+The Python path walks parents from the file looking for the first
+directory containing `pyproject.toml`, `setup.py`, or `setup.cfg`
+— the canonical Python project markers. That directory becomes
+both the project root and the subprocess `cwd`, so:
+
+- `ruff` finds the project's `[tool.ruff]` config (it walks up
+  from cwd, same as it does in a shell).
+- A relative `.venv/bin/ruff` bin token resolves correctly from
+  cwd. When `<root>/.venv/bin/ruff` exists on the host filesystem
+  we prefer it over a bare `ruff` PATH lookup. Projects pin
+  specific ruff versions in their venv (`uv pip install ruff` /
+  `pip install ruff==X`); honouring that pin matches what the
+  team would get running `ruff format` from a terminal in the
+  same directory.
+- The same string works on host **and** container with no
+  bin-token translation. The bind mount makes
+  `<host>/.venv/bin/ruff` and `/workspace/<basename>/.venv/bin/ruff`
+  the same inode, so the host-side `is_file()` probe is correct
+  for either target. `docker exec -w <translated_cwd> …
+.venv/bin/ruff format <translated_abs_path>` then resolves the
+  bin against the in-container cwd just like `Command::new("…")
+.current_dir(…)` does on the host.
+
+When no project marker is found anywhere up the tree (a loose
+`.py` script in a notes directory, a snippet inside a README's
+adjacent dir) the resolver falls back to the file's parent dir as
+cwd and bare `ruff format`. ruff's defaults still produce a
+useful format; the only thing missing is project-specific config.
+
+`black` and `autopep8` aren't in the table. The hardcode-first
+rule lets the team add them when a project that uses them lands
+on the format-on-save path; until then, ruff is the default
+because every Python project the team works on (`huggingface_hub`,
+internal tooling) ships a ruff-shaped pipeline. As elsewhere,
+lint-staged still wins whenever a `.lintstagedrc.json` matches
+the file, so a black-using project that ships
+`{ "*.py": "black" }` overrides the default the same way it does
+for everything else.
+
+#### Why a struct, not just a string
+
+`default_format_command` returns a `DefaultFormatCommand { command,
+cwd }` rather than a bare command string. Splitting `cwd` out of
+the resolver's contract is what makes the relative-bin-token trick
+work for Python without leaking any container-awareness into the
+format module — every other case (Rust today, hypothetical Go /
+JS / etc. tomorrow) just sets `cwd` to the file's parent and
+keeps the existing semantics. The host runner forwards the cwd
+verbatim; the container runner translates it through the bind
+mount the same way it always did.
+
+#### Adding a row
 
 Per AGENTS.md "hardcode first, configure later" we add a row when a
 project the team uses needs one. The table is **not** an allow-list:

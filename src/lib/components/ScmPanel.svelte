@@ -40,6 +40,7 @@
 	import { ipc } from '../ipc';
 	import { formatError } from '../protocol';
 	import BranchIcon from './icons/BranchIcon.svelte';
+	import MergeIcon from './icons/MergeIcon.svelte';
 	import PullRequestIcon from './icons/PullRequestIcon.svelte';
 	import RefreshIcon from './icons/RefreshIcon.svelte';
 	import RevertIcon from './icons/RevertIcon.svelte';
@@ -61,7 +62,26 @@
 
 	let message = $state('');
 	let amend = $state(false);
-	let busy = $state(false);
+	// Split into two flags so the commit-row spinner only fires
+	// during commit / commit-on-new-branch, not during sync /
+	// publish (which used to flash a spinner on the disabled
+	// commit button — implying "your commit is in progress" when
+	// it's actually a pull/push). The broader `busy` derived flag
+	// keeps gating "disable everything else while one git op
+	// runs" with no per-call-site changes. `revertAll` doesn't
+	// need its own flag — it's a one-shot, doesn't fan out into
+	// spinners.
+	let committing = $state(false);
+	let syncing = $state(false);
+	// `git merge origin/main` ("Update from main") gets its own
+	// busy flag so its button can spin independently while not
+	// firing the commit-row spinner. Folded into the broader
+	// `busy` gate so commit / sync stay disabled while a merge
+	// is in flight (and vice versa) — running two write-side
+	// git ops in parallel is a recipe for "what just happened
+	// to my working tree".
+	let merging = $state(false);
+	let busy = $derived(committing || syncing || merging);
 	let textarea: HTMLTextAreaElement | undefined = $state();
 
 	// Tracks the bytes we wrote into `message` from
@@ -165,6 +185,32 @@
 	// both, matching Cursor's / VSCode's "Sync Changes" pattern.
 	const canSync = $derived(!needsPublish && (branch.ahead > 0 || branch.behind > 0));
 
+	// Local short name of the repo's default branch, derived from
+	// the remote-tracking ref (`origin/main` → `main`). Used in
+	// the "Update from <name>" button label and confirm-flash so
+	// the user sees the local-style name they recognise rather
+	// than the disambiguated remote-tracking string.
+	const defaultBranchShortName = $derived.by(() => {
+		const ref = branch.defaultBranchRemoteRef;
+		if (ref === null) {
+			return null;
+		}
+		const slash = ref.indexOf('/');
+		if (slash < 0) {
+			return ref;
+		}
+		return ref.slice(slash + 1);
+	});
+
+	// "Update from main" affordance. Only shown when the remote
+	// default branch has commits we don't, AND we're not on it
+	// ourselves (the regular `Sync Changes` button covers the
+	// "I'm on main and origin/main moved" case via `behind`).
+	// Auto-fetch keeps `defaultBranchBehind` current; we don't
+	// fetch here, the merge runs against whatever the local
+	// remote-tracking ref points at right now.
+	const canMergeDefault = $derived(!busy && branch.defaultBranchRemoteRef !== null && branch.defaultBranchBehind > 0);
+
 	// Tooltip detail for the sync button. Plain-text fallback for
 	// the (Push / Pull / Sync) labels that we used to bake into
 	// the button text.
@@ -187,7 +233,7 @@
 		if (!canCommit) {
 			return;
 		}
-		busy = true;
+		committing = true;
 		try {
 			const ok = await workspace.commitChanges(message, amend);
 			if (ok) {
@@ -198,7 +244,7 @@
 				autoSize();
 			}
 		} finally {
-			busy = false;
+			committing = false;
 			textarea?.focus();
 		}
 	}
@@ -207,7 +253,7 @@
 		if (!canCommitNewBranch) {
 			return;
 		}
-		busy = true;
+		committing = true;
 		try {
 			const ok = await workspace.commitChangesOnNewBranch(newBranchName, message);
 			if (ok) {
@@ -220,7 +266,7 @@
 				autoSize();
 			}
 		} finally {
-			busy = false;
+			committing = false;
 			textarea?.focus();
 		}
 	}
@@ -456,11 +502,32 @@
 		if (busy) {
 			return;
 		}
-		busy = true;
+		syncing = true;
 		try {
 			await workspace.publishBranch();
 		} finally {
-			busy = false;
+			syncing = false;
+		}
+	}
+
+	async function mergeDefault() {
+		if (busy) {
+			return;
+		}
+		const ref = branch.defaultBranchRemoteRef;
+		if (ref === null) {
+			return;
+		}
+		merging = true;
+		try {
+			await workspace.mergeDefaultBranch(ref);
+			// Same await-the-refresh-before-clearing-busy pattern
+			// `sync()` uses, for the same reason: stop the button
+			// from briefly un-disabling between "merge returned"
+			// and "behind hit zero" before it unmounts.
+			await workspace.refreshGitBranch();
+		} finally {
+			merging = false;
 		}
 	}
 
@@ -473,7 +540,7 @@
 		if (initialAhead === 0 && initialBehind === 0) {
 			return;
 		}
-		busy = true;
+		syncing = true;
 		try {
 			if (initialBehind > 0) {
 				const ok = await workspace.pullChanges();
@@ -484,8 +551,18 @@
 			if (initialAhead > 0) {
 				await workspace.pushChanges();
 			}
+			// Wait for the branch counters to refresh before
+			// flipping `syncing` off, so the button doesn't
+			// briefly un-disable between "pull/push returned"
+			// and "ahead/behind hit zero" — without this the
+			// button visibly flickers from disabled-spinning
+			// → enabled → unmounted as the post-sync git
+			// state catches up. `refreshGitBranch` is a
+			// single `git symbolic-ref` + `git rev-list
+			// --count`, so the extra await is cheap.
+			await workspace.refreshGitBranch();
 		} finally {
-			busy = false;
+			syncing = false;
 		}
 	}
 
@@ -505,11 +582,15 @@
 		if (paths.length === 0) {
 			return;
 		}
-		busy = true;
+		// Reuse `committing` here — revert is a working-tree
+		// mutation in the same family as commit, and we want the
+		// same "everything is disabled while I rewrite the tree"
+		// gate. Borrowing the flag avoids a third per-row state.
+		committing = true;
 		try {
 			await workspace.discardPaths(paths);
 		} finally {
-			busy = false;
+			committing = false;
 		}
 	}
 
@@ -687,7 +768,13 @@
 	     exclusive, enforced by `setAmend` / `setNewBranch`. -->
 	<div class="commit-row" class:busy>
 		<button type="button" class="commit-btn" title={commitButtonLabel} disabled={!canSubmit} onclick={onCommitClick}>
-			{#if busy}
+			{#if committing}
+				<!-- Spinner only fires on actual commit (or revert,
+				     which borrows the same flag). Sync / publish
+				     leave the commit button quiet — they have their
+				     own spinning refresh icon below; doubling up
+				     read as "your commit is also in progress" when
+				     it isn't. -->
 				<span class="spinner spinner-on-accent" aria-hidden="true"></span>
 			{/if}
 			<span class="commit-btn-label">{commitButtonLabel}</span>
@@ -747,6 +834,47 @@
 			{#if !busy && branch.ahead > 0}
 				<span class="sync-btn-count">
 					{branch.ahead}<span class="sync-btn-arrow" aria-hidden="true">↑</span>
+				</span>
+			{/if}
+		</button>
+	{/if}
+	{#if canMergeDefault && defaultBranchShortName !== null}
+		<!-- "Update from main" — separate button from sync because
+		     the underlying op is `git merge origin/main` against the
+		     *current* branch, not a pull of the current branch's
+		     own upstream. We render it secondary (outlined, accent
+		     text) so the primary sync action keeps the loud accent
+		     fill when both buttons are visible at once (branch
+		     ahead/behind upstream *and* main has new commits). -->
+		<button
+			type="button"
+			class="merge-default-btn"
+			title={merging
+				? `Merging ${branch.defaultBranchRemoteRef ?? defaultBranchShortName} into current branch…`
+				: `Merge ${branch.defaultBranchRemoteRef ?? defaultBranchShortName} into current branch (${branch.defaultBranchBehind} commit${branch.defaultBranchBehind === 1 ? '' : 's'})`}
+			disabled={busy}
+			onclick={mergeDefault}
+		>
+			<span class="merge-default-icon" aria-hidden="true">
+				{#if merging}
+					<!-- Replace the merge glyph with a spinner while
+					     in flight rather than rotating the glyph
+					     itself: a spinning merge icon reads as
+					     "branching" half the time around the
+					     rotation, which is the opposite of the
+					     gesture. Spinner is the unambiguous "this
+					     is busy" signal. -->
+					<span class="spinner"></span>
+				{:else}
+					<MergeIcon size={12} />
+				{/if}
+			</span>
+			<span class="merge-default-label"
+				>{merging ? `Merging ${defaultBranchShortName}…` : `Update from ${defaultBranchShortName}`}</span
+			>
+			{#if !merging}
+				<span class="merge-default-count">
+					{branch.defaultBranchBehind}<span class="merge-default-arrow" aria-hidden="true">↓</span>
 				</span>
 			{/if}
 		</button>
@@ -1235,6 +1363,80 @@
 		outline-offset: 2px;
 	}
 	.sync-btn:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+	/* "Update from main" — secondary affordance, rendered outlined
+	   rather than filled so when it stacks under a primary sync
+	   button (branch ahead/behind upstream *and* main has new
+	   commits) the eye reads the sync as the main CTA and merge
+	   as the "also worth knowing" follow-up. When sync isn't
+	   showing this button is alone in the slot and reads as the
+	   primary call to action by default. Same shape + size as
+	   `.sync-btn` so toggling between the two doesn't shift the
+	   panel layout. */
+	.merge-default-btn {
+		appearance: none;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 6px;
+		width: 100%;
+		min-height: 26px;
+		margin-top: 2px;
+		padding: 4px 10px;
+		border: 1px solid var(--m-accent);
+		border-radius: 4px;
+		background: transparent;
+		color: var(--m-accent);
+		font: inherit;
+		font-size: 12px;
+		font-weight: 600;
+		line-height: 1.2;
+		cursor: pointer;
+		font-variant-numeric: tabular-nums;
+	}
+	.merge-default-icon {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		flex-shrink: 0;
+		/* Horizontal flip — the Lucide `git-merge` glyph defaults
+		   to "target spine on the left, source branch arcing in
+		   from upper-right". For *this* specific button the
+		   gesture is "merge main → current branch", and the
+		   user reads the affordance left-to-right as `main → me`,
+		   so we want main (the source) on the left and the
+		   current-branch tip on the right. Mirroring with
+		   `scaleX(-1)` is the cheapest way to get it without
+		   shipping a second icon component, and it doesn't apply
+		   while the spinner is showing because the spinner is
+		   rotation-symmetric. */
+		transform: scaleX(-1);
+	}
+	.merge-default-label {
+		flex-shrink: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.merge-default-count {
+		display: inline-flex;
+		align-items: baseline;
+		gap: 1px;
+	}
+	.merge-default-arrow {
+		font-weight: 700;
+		opacity: 0.9;
+	}
+	.merge-default-btn:hover:not(:disabled) {
+		background: color-mix(in srgb, var(--m-accent) 12%, transparent);
+	}
+	.merge-default-btn:focus-visible {
+		outline: 2px solid var(--m-accent);
+		outline-offset: 2px;
+	}
+	.merge-default-btn:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
 	}

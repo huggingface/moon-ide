@@ -160,6 +160,23 @@ pub struct GitBranchInfo {
 	/// `has_upstream`); the backend just produces the URL when
 	/// it has the inputs.
 	pub pr_url: Option<String>,
+	/// Remote-tracking ref for the repo's default branch — e.g.
+	/// `"origin/main"`. Resolved from `refs/remotes/origin/HEAD`
+	/// when present, else falls back to `origin/main` →
+	/// `origin/master`. `None` when no `origin` remote exists,
+	/// the symbolic ref isn't set, and neither fallback is
+	/// available; the SCM panel hides its "Update from <main>"
+	/// affordance in that case.
+	pub default_branch_remote_ref: Option<String>,
+	/// Number of commits the default branch's remote-tracking
+	/// ref has that the current branch's HEAD doesn't — what a
+	/// `git merge <default_branch_remote_ref>` would land. `0`
+	/// when no default can be resolved, when HEAD is already up
+	/// to date, when we're already on the default branch (the
+	/// regular `Sync Changes` button covers that case), or when
+	/// the count couldn't be determined. The SCM panel shows the
+	/// "Update from main" button iff this is `> 0`.
+	pub default_branch_behind: u32,
 }
 
 /// Outcome of a successful `git_commit`. The SCM panel renders

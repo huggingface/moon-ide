@@ -37,7 +37,7 @@
 //! [specs/decisions/0012-format-on-save.md](../../../specs/decisions/0012-format-on-save.md)
 //! (the original stdin/stdout design that this supersedes).
 
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use std::collections::HashSet;
 use std::env;
 use std::ffi::OsString;
@@ -227,19 +227,41 @@ fn build_command(
 	}
 }
 
-/// Language-default formatter command for `abs_path`, used as a
-/// fallback when lint-staged either has no config in the workspace
-/// or has a config but no matching rule for this file. Looked up by
-/// file extension (case-insensitive); returns the full command with
-/// the caller appending the absolute file path on top.
+/// Language-default formatter resolution result. The `command` is
+/// the lint-staged-shaped string the caller hands to
+/// [`run_formatter`] (which appends the absolute file path as the
+/// last positional). `cwd` is the directory the subprocess should
+/// run in; we expose it so a language with project-local tooling
+/// (e.g. Python's `.venv/bin/ruff`) can pin the cwd to the project
+/// root, and a `command` whose first token is a path *relative* to
+/// that cwd resolves correctly on both host and container without
+/// any bin-token translation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultFormatCommand {
+	/// Whitespace-separated command. The caller appends the
+	/// absolute path of the file being saved as the final
+	/// positional argument.
+	pub command: String,
+	/// Working directory the subprocess runs in. For host-mode
+	/// this is forwarded to `Command::current_dir`; for
+	/// container-mode it's translated through the bind mount and
+	/// passed as `docker exec -w <translated_cwd>`.
+	pub cwd: Utf8PathBuf,
+}
+
+/// Language-default formatter for `abs_path`, used as a fallback
+/// when lint-staged either has no config in the workspace or has
+/// a config but no matching rule for this file. Looked up by file
+/// extension (case-insensitive).
 ///
 /// Today's table:
 ///
-/// | extension | command (base)            |
-/// |-----------|---------------------------|
-/// | `.rs`     | `rustfmt --edition <e>`   |
+/// | extension     | command (base)              | cwd                  |
+/// |---------------|-----------------------------|----------------------|
+/// | `.rs`         | `rustfmt --edition <e>`     | file's parent dir    |
+/// | `.py` / `.pyi`| `[.venv/bin/]ruff format`   | nearest project root |
 ///
-/// The Rust path walks parents from `abs_path` looking for the
+/// The **Rust path** walks parents from `abs_path` looking for the
 /// nearest `Cargo.toml` with a `[package].edition` field. Bare
 /// `rustfmt <file>` defaults to edition 2015 — which rejects
 /// `async fn`, `let-else`, every modern Rust feature — because
@@ -247,23 +269,80 @@ fn build_command(
 /// invoked through `cargo fmt`. We do that detection ourselves
 /// so format-on-save is per-file (no whole-package reformat) and
 /// still picks up the project's actual edition. Falls back to
-/// `2024` when no `Cargo.toml` is found, which matches modern
-/// project defaults; if that's wrong rustfmt's own error
-/// surfaces in the format-on-save log.
+/// `2024` when no `Cargo.toml` is found.
+///
+/// The **Python path** walks parents looking for a project root
+/// marker (`pyproject.toml`, `setup.py`, or `setup.cfg`) and pins
+/// `cwd` to that directory so `ruff` finds the project's
+/// `[tool.ruff]` config and so a relative `.venv/bin/ruff`
+/// resolves. When `<root>/.venv/bin/ruff` exists on the host
+/// filesystem (the bind mount makes that the same inode as
+/// `/workspace/<basename>/.venv/bin/ruff` inside the container,
+/// so this works for both host and container targets) we prefer
+/// it over the bare `ruff` lookup — projects pin a specific ruff
+/// version in their venv and we want to honour it. No venv → bare
+/// `ruff format` lookup against `PATH`. No project root → fall
+/// back to the file's parent directory and bare `ruff`. The
+/// `.pyi` stub extension routes the same way; `ruff format`
+/// handles both.
 ///
 /// Per AGENTS.md "hardcode first, configure later" we add a row
 /// when a project the team uses needs one. lint-staged still wins
 /// whenever it matches, so adding a row never overrides an
 /// explicit team config.
-pub fn default_format_command(abs_path: &Utf8Path) -> Option<String> {
+pub fn default_format_command(abs_path: &Utf8Path) -> Option<DefaultFormatCommand> {
 	let ext = abs_path.extension()?.to_ascii_lowercase();
+	let parent = abs_path.parent()?;
 	match ext.as_str() {
 		"rs" => {
 			let edition = nearest_cargo_edition(abs_path).unwrap_or_else(|| "2024".to_owned());
-			Some(format!("rustfmt --edition {edition}"))
+			Some(DefaultFormatCommand {
+				command: format!("rustfmt --edition {edition}"),
+				cwd: parent.to_path_buf(),
+			})
+		}
+		"py" | "pyi" => {
+			let project_root = nearest_python_project_root(abs_path);
+			let cwd = project_root.clone().unwrap_or_else(|| parent.to_path_buf());
+			// `<root>/.venv/bin/ruff` on the host filesystem is
+			// the same inode as `/workspace/<basename>/.venv/bin/ruff`
+			// inside the container thanks to the bind mount, so
+			// this `is_file` probe is correct for both targets
+			// without us having to translate the path back and
+			// forth.
+			let bin = match &project_root {
+				Some(root) if root.join(".venv").join("bin").join("ruff").is_file() => ".venv/bin/ruff".to_owned(),
+				_ => "ruff".to_owned(),
+			};
+			Some(DefaultFormatCommand {
+				command: format!("{bin} format"),
+				cwd,
+			})
 		}
 		_ => None,
 	}
+}
+
+/// Walk parents from `start_file` looking for the nearest
+/// directory that anchors a Python project. We accept (in order)
+/// `pyproject.toml`, `setup.py`, `setup.cfg` — the three markers
+/// every Python packaging tool consults. Returns the first
+/// directory containing any of them, or `None` if we walk all the
+/// way to the root without finding one (a loose `.py` script with
+/// no project around it).
+fn nearest_python_project_root(start_file: &Utf8Path) -> Option<Utf8PathBuf> {
+	const MARKERS: &[&str] = &["pyproject.toml", "setup.py", "setup.cfg"];
+
+	let mut current = start_file.parent();
+	while let Some(dir) = current {
+		for marker in MARKERS {
+			if dir.join(marker).is_file() {
+				return Some(dir.to_path_buf());
+			}
+		}
+		current = dir.parent();
+	}
+	None
 }
 
 /// Walk parents from `start_file` looking for the nearest
@@ -389,11 +468,12 @@ mod tests {
 
 	#[test]
 	fn default_format_command_unknown_extensions_return_none() {
-		// No Cargo.toml lookup happens for non-`.rs` paths, so an
-		// arbitrary path string is fine.
-		assert_eq!(default_format_command(Utf8Path::new("/abs/README")), None);
-		assert_eq!(default_format_command(Utf8Path::new("/abs/a.txt")), None);
-		assert_eq!(default_format_command(Utf8Path::new("/abs/a.ts")), None);
+		// No Cargo.toml / pyproject.toml lookup happens for
+		// non-supported paths, so an arbitrary path string is
+		// fine.
+		assert!(default_format_command(Utf8Path::new("/abs/README")).is_none());
+		assert!(default_format_command(Utf8Path::new("/abs/a.txt")).is_none());
+		assert!(default_format_command(Utf8Path::new("/abs/a.ts")).is_none());
 	}
 
 	#[test]
@@ -413,8 +493,11 @@ mod tests {
 		let file = src.join("main.rs");
 		std::fs::write(file.as_std_path(), "fn main() {}").unwrap();
 
-		let cmd = default_format_command(&file).expect("rust fallback");
-		assert_eq!(cmd, "rustfmt --edition 2024");
+		let resolved = default_format_command(&file).expect("rust fallback");
+		assert_eq!(resolved.command, "rustfmt --edition 2024");
+		// Rust path keeps the file's parent dir as cwd —
+		// rustfmt walks for `rustfmt.toml` itself.
+		assert_eq!(resolved.cwd, src);
 	}
 
 	#[test]
@@ -424,8 +507,9 @@ mod tests {
 		let file = root.join("loose.rs");
 		std::fs::write(file.as_std_path(), "fn main() {}").unwrap();
 
-		let cmd = default_format_command(&file).expect("rust fallback");
-		assert_eq!(cmd, "rustfmt --edition 2024");
+		let resolved = default_format_command(&file).expect("rust fallback");
+		assert_eq!(resolved.command, "rustfmt --edition 2024");
+		assert_eq!(resolved.cwd, root);
 	}
 
 	#[test]
@@ -452,8 +536,112 @@ mod tests {
 		let file = src.join("lib.rs");
 		std::fs::write(file.as_std_path(), "").unwrap();
 
-		let cmd = default_format_command(&file).expect("rust fallback");
-		assert_eq!(cmd, "rustfmt --edition 2021");
+		let resolved = default_format_command(&file).expect("rust fallback");
+		assert_eq!(resolved.command, "rustfmt --edition 2021");
+	}
+
+	/// Python: `pyproject.toml` at the project root + a
+	/// `.venv/bin/ruff` shim. The fallback should pin `cwd` to
+	/// the project root and prefer the venv's ruff over a bare
+	/// `ruff` PATH lookup. The `is_file()` probe runs against
+	/// the host filesystem, which is also what the container
+	/// sees (same inode, bind mount), so the resolver is
+	/// target-agnostic.
+	#[cfg(unix)]
+	#[test]
+	fn default_format_command_python_prefers_venv_ruff() {
+		use std::os::unix::fs::PermissionsExt;
+		let tmp = TempDir::new().unwrap();
+		let root = Utf8PathBuf::from_path_buf(tmp.path().canonicalize().unwrap()).unwrap();
+		std::fs::write(root.join("pyproject.toml").as_std_path(), "[project]\nname = \"x\"\n").unwrap();
+		let venv_bin = root.join(".venv").join("bin");
+		std::fs::create_dir_all(venv_bin.as_std_path()).unwrap();
+		// Real file — the resolver checks `is_file`, not
+		// executability. We mark it +x anyway for parity with
+		// what an actual venv ships.
+		let ruff = venv_bin.join("ruff");
+		std::fs::write(ruff.as_std_path(), "#!/bin/sh\nexit 0\n").unwrap();
+		std::fs::set_permissions(ruff.as_std_path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+		let src = root.join("src");
+		std::fs::create_dir_all(src.as_std_path()).unwrap();
+		let file = src.join("main.py");
+		std::fs::write(file.as_std_path(), "print('x')\n").unwrap();
+
+		let resolved = default_format_command(&file).expect("python fallback");
+		assert_eq!(resolved.command, ".venv/bin/ruff format");
+		// cwd at the project root — `.venv/bin/ruff` resolves
+		// relative to it both on host and inside the container
+		// (`docker exec -w /workspace/foo … .venv/bin/ruff`).
+		assert_eq!(resolved.cwd, root);
+	}
+
+	#[test]
+	fn default_format_command_python_falls_back_to_bare_ruff_without_venv() {
+		// Project root with `pyproject.toml` but no `.venv`. The
+		// resolver still pins `cwd` to the project root (so ruff
+		// picks up `[tool.ruff]`) but the bin token falls through
+		// to a bare `ruff` PATH lookup.
+		let tmp = TempDir::new().unwrap();
+		let root = Utf8PathBuf::from_path_buf(tmp.path().canonicalize().unwrap()).unwrap();
+		std::fs::write(root.join("pyproject.toml").as_std_path(), "[project]\nname = \"x\"\n").unwrap();
+		let file = root.join("a.py");
+		std::fs::write(file.as_std_path(), "x = 1\n").unwrap();
+
+		let resolved = default_format_command(&file).expect("python fallback");
+		assert_eq!(resolved.command, "ruff format");
+		assert_eq!(resolved.cwd, root);
+	}
+
+	#[test]
+	fn default_format_command_python_loose_file_uses_parent_dir() {
+		// No project marker anywhere up the tree — the resolver
+		// can't anchor on a project root, so it falls back to
+		// the file's parent directory. ruff still works (its
+		// own defaults are fine) but won't find a project
+		// `[tool.ruff]` config.
+		let tmp = TempDir::new().unwrap();
+		let root = Utf8PathBuf::from_path_buf(tmp.path().canonicalize().unwrap()).unwrap();
+		let file = root.join("scratch.py");
+		std::fs::write(file.as_std_path(), "x = 1\n").unwrap();
+
+		let resolved = default_format_command(&file).expect("python fallback");
+		assert_eq!(resolved.command, "ruff format");
+		assert_eq!(resolved.cwd, root);
+	}
+
+	#[test]
+	fn default_format_command_python_setup_py_anchors_project_root() {
+		// Older project layout: `setup.py` at the root, no
+		// `pyproject.toml`. Resolver should still anchor cwd
+		// there.
+		let tmp = TempDir::new().unwrap();
+		let root = Utf8PathBuf::from_path_buf(tmp.path().canonicalize().unwrap()).unwrap();
+		std::fs::write(
+			root.join("setup.py").as_std_path(),
+			"from setuptools import setup\nsetup()\n",
+		)
+		.unwrap();
+		let pkg = root.join("mypkg");
+		std::fs::create_dir_all(pkg.as_std_path()).unwrap();
+		let file = pkg.join("__init__.py");
+		std::fs::write(file.as_std_path(), "").unwrap();
+
+		let resolved = default_format_command(&file).expect("python fallback");
+		assert_eq!(resolved.command, "ruff format");
+		assert_eq!(resolved.cwd, root);
+	}
+
+	#[test]
+	fn default_format_command_python_pyi_stubs_route_through_ruff() {
+		let tmp = TempDir::new().unwrap();
+		let root = Utf8PathBuf::from_path_buf(tmp.path().canonicalize().unwrap()).unwrap();
+		std::fs::write(root.join("pyproject.toml").as_std_path(), "[project]\nname = \"x\"\n").unwrap();
+		let file = root.join("api.pyi");
+		std::fs::write(file.as_std_path(), "def f(x: int) -> int: ...\n").unwrap();
+
+		let resolved = default_format_command(&file).expect("python fallback for .pyi");
+		assert_eq!(resolved.command, "ruff format");
 	}
 
 	#[test]

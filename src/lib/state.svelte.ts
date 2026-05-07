@@ -1423,6 +1423,8 @@ class WorkspaceState {
 		ahead: 0,
 		behind: 0,
 		prUrl: null,
+		defaultBranchRemoteRef: null,
+		defaultBranchBehind: 0,
 	});
 
 	/**
@@ -1477,7 +1479,20 @@ class WorkspaceState {
 		return n;
 	}
 
-	private async refreshGitBranch() {
+	/**
+	 * Pull the active folder's branch name, upstream config, and
+	 * ahead/behind counters from the backend. Public so the SCM
+	 * panel can await it after `sync()` / `publish()` to keep the
+	 * sync button disabled until the counters drop to zero —
+	 * without this the button briefly un-disables before
+	 * unmounting because the inner pull/push call returns before
+	 * the next branch refresh tick lands.
+	 *
+	 * Failures collapse to a "no branch info" state; we'd rather
+	 * the SCM panel render a neutral header than surface a flash
+	 * for a transient git probe failure.
+	 */
+	async refreshGitBranch() {
 		try {
 			this.gitBranch = await ipc.fs.gitBranch();
 		} catch {
@@ -1488,6 +1503,8 @@ class WorkspaceState {
 				ahead: 0,
 				behind: 0,
 				prUrl: null,
+				defaultBranchRemoteRef: null,
+				defaultBranchBehind: 0,
 			};
 		}
 	}
@@ -1651,6 +1668,29 @@ class WorkspaceState {
 			return true;
 		} catch (err) {
 			this.flash(`Pull failed: ${formatError(err)}`);
+			return false;
+		}
+	}
+
+	/**
+	 * `git merge --no-edit <remoteRef>` for the active folder.
+	 * Backed by whatever `gitBranch.defaultBranchRemoteRef` was at
+	 * call time (the SCM panel passes it in so we don't risk
+	 * merging a stale default that drifted between the click and
+	 * the IPC). Conflicts and dirty-tree refusals propagate via
+	 * flash with git's stderr verbatim. On success we refresh the
+	 * full active folder so newly-merged files light up the tree
+	 * the same way `pullChanges` does.
+	 */
+	async mergeDefaultBranch(remoteRef: string) {
+		try {
+			await ipc.fs.gitMergeDefaultBranch(remoteRef);
+			const shortName = remoteRef.split('/').slice(1).join('/') || remoteRef;
+			this.flash(`Merged ${shortName} into current branch.`);
+			void this.refreshActiveFolder();
+			return true;
+		} catch (err) {
+			this.flash(`Merge failed: ${formatError(err)}`);
 			return false;
 		}
 	}

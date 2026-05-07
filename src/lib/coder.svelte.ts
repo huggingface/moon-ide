@@ -40,11 +40,28 @@ const CODER_EVENT_CHANNEL = 'coder:event';
  *  Assistant rows track an optional `thinking` trace alongside
  *  `text`. `thinkingOpen` controls the disclosure state: open while
  *  the message is still streaming so the user can watch reasoning
- *  land, auto-collapsed on `assistant_message_end`. */
+ *  land, auto-collapsed on `assistant_message_end`.
+ *
+ *  Tool rows carry `startedAt` (epoch ms, set on `tool_call`) and
+ *  `durationMs` (set on `tool_result`). The panel uses the first to
+ *  drive a live ticking elapsed counter while the tool runs and the
+ *  second to display the precise elapsed time once the call settles
+ *  — useful for spotting slow tools (multi-second `bash` tail,
+ *  multi-megabyte `read_file`) at a glance. */
 export type CoderRow =
 	| { kind: 'user'; id: string; text: string }
 	| { kind: 'assistant'; id: string; text: string; thinking: string; thinkingOpen: boolean }
-	| { kind: 'tool'; id: string; name: string; args: unknown; result: unknown; hasResult: boolean; isError: boolean }
+	| {
+			kind: 'tool';
+			id: string;
+			name: string;
+			args: unknown;
+			result: unknown;
+			hasResult: boolean;
+			isError: boolean;
+			startedAt: number;
+			durationMs: number | null;
+	  }
 	| { kind: 'error'; id: string; text: string }
 	| { kind: 'aborted'; id: string };
 
@@ -872,13 +889,21 @@ class CoderPanelState {
 						result: undefined,
 						hasResult: false,
 						isError: false,
+						startedAt: Date.now(),
+						durationMs: null,
 					},
 				];
 				return;
 			case 'tool_result':
 				bucket.rows = bucket.rows.map((row) =>
 					row.kind === 'tool' && row.id === event.id
-						? { ...row, result: event.result, hasResult: true, isError: event.is_error }
+						? {
+								...row,
+								result: event.result,
+								hasResult: true,
+								isError: event.is_error,
+								durationMs: Date.now() - row.startedAt,
+							}
 						: row,
 				);
 				return;
@@ -1107,12 +1132,20 @@ function applyInnerEventToRows(rows: CoderRow[], event: CoderEvent): CoderRow[] 
 					result: undefined,
 					hasResult: false,
 					isError: false,
+					startedAt: Date.now(),
+					durationMs: null,
 				},
 			];
 		case 'tool_result':
 			return rows.map((row) =>
 				row.kind === 'tool' && row.id === event.id
-					? { ...row, result: event.result, hasResult: true, isError: event.is_error }
+					? {
+							...row,
+							result: event.result,
+							hasResult: true,
+							isError: event.is_error,
+							durationMs: Date.now() - row.startedAt,
+						}
 					: row,
 			);
 		default:

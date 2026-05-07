@@ -115,6 +115,61 @@
 		}
 	}
 
+	// Live tick fed into running tool rows so their elapsed-time
+	// readout (`running… (Xs)`) advances. One shared interval per
+	// panel — every tool row reads the same `nowTick` and computes
+	// its own elapsed locally. We pause the interval when no tool
+	// is running so an idle panel doesn't burn a wakeup per
+	// second, and restart it the moment a fresh `tool_call`
+	// arrives. 250ms keeps the readout feeling live without
+	// turning into a stopwatch ("0.0 / 0.2 / 0.5 / 0.7…");
+	// formatting clamps to one decimal so 4.2s reads cleanly even
+	// when the underlying tick lands at 4.247s.
+	let nowTick = $state(Date.now());
+	const hasRunningTool = $derived(coder.rows.some((row) => row.kind === 'tool' && !row.hasResult));
+	$effect(() => {
+		if (!hasRunningTool) {
+			return;
+		}
+		nowTick = Date.now();
+		const handle = window.setInterval(() => {
+			nowTick = Date.now();
+		}, 250);
+		return () => window.clearInterval(handle);
+	});
+
+	/** Format an elapsed duration in milliseconds for the tool row
+	 *  summary line. Two display regimes:
+	 *
+	 *  - **Live (still running)**: sub-second values render as
+	 *    "Xms" so a flash-fast `read_file` reads honestly; once
+	 *    we cross 1s we switch to whole-second resolution
+	 *    (`floor`) so the counter ticks "1s → 2s → 3s" rather
+	 *    than chasing the 250ms sample boundary ("0.8 → 1.2 →
+	 *    1.5"). Beyond a minute we go to "Mm SSs".
+	 *  - **Final (`hasResult`)**: same shape, except sub-minute
+	 *    values keep one decimal so "1.2s" / "12ms" — captures
+	 *    the precise duration the user wants for spotting slow
+	 *    tools after the fact.
+	 */
+	function fmtElapsed(ms: number, live: boolean): string {
+		if (ms < 0) {
+			return '0ms';
+		}
+		if (ms < 1000) {
+			return `${Math.round(ms)}ms`;
+		}
+		if (ms < 60_000) {
+			if (live) {
+				return `${Math.floor(ms / 1000)}s`;
+			}
+			return `${(ms / 1000).toFixed(1)}s`;
+		}
+		const min = Math.floor(ms / 60_000);
+		const sec = Math.floor((ms % 60_000) / 1000);
+		return `${min}m ${sec.toString().padStart(2, '0')}s`;
+	}
+
 	async function onNewSession(): Promise<void> {
 		await coder.newSession();
 		// Land focus in the composer so a fresh session is one
@@ -610,43 +665,64 @@
 			{/if}
 		</div>
 	{:else if row.kind === 'assistant'}
-		<div class="row assistant">
-			<div class="row-label">coder</div>
-			{#if row.thinking.length > 0}
-				<!-- Reasoning trace. Open while streaming so the user
-								 sees thoughts land, collapsed once the message
-								 finishes (the `assistant_message_end` handler
-								 flips `thinkingOpen`). The component pins the
-								 inner scroll to the bottom only while pinned by
-								 the user, same gesture as a chat thread. -->
-				<CoderThinking
-					text={row.thinking}
-					open={row.thinkingOpen}
-					onOpenChange={(next) => (row.thinkingOpen = next)}
-					streaming={row.text.length === 0}
-				/>
-			{/if}
-			{#if row.text.trim().length > 0}
-				<!-- Trim before the visibility check so a
-								 model that ends with just whitespace
-								 (e.g. tool-only turn that emitted a
-								 trailing `\n`) doesn't render an
-								 empty grey rectangle below the
-								 thinking block. The actual text we
-								 hand to `CoderMarkdown` is untrimmed
-								 — preserving leading whitespace is
-								 the renderer's job. -->
-				<div class="bubble assistant-bubble">
-					<CoderMarkdown text={row.text} />
-				</div>
-			{/if}
-		</div>
+		<!-- Skip the whole row when an assistant turn produced
+		     neither thinking nor text. Tool-only turns (the model
+		     emits a tool call and nothing else) used to render an
+		     orphan "coder" label above the tool row, which read as
+		     duplicate noise. See the `kind === 'tool'` branch
+		     below for the affordance the user actually cares
+		     about in that case. -->
+		{@const hasThinking = row.thinking.length > 0}
+		{@const hasText = row.text.trim().length > 0}
+		{#if hasThinking || hasText}
+			<div class="row assistant">
+				<div class="row-label">coder</div>
+				{#if hasThinking}
+					<!-- Reasoning trace. Open while streaming so the user
+									 sees thoughts land, collapsed once the message
+									 finishes (the `assistant_message_end` handler
+									 flips `thinkingOpen`). The component pins the
+									 inner scroll to the bottom only while pinned by
+									 the user, same gesture as a chat thread. -->
+					<CoderThinking
+						text={row.thinking}
+						open={row.thinkingOpen}
+						onOpenChange={(next) => (row.thinkingOpen = next)}
+						streaming={!hasText}
+					/>
+				{/if}
+				{#if hasText}
+					<!-- Trim before the visibility check so a
+									 model that ends with just whitespace
+									 (e.g. tool-only turn that emitted a
+									 trailing `\n`) doesn't render an
+									 empty grey rectangle below the
+									 thinking block. The actual text we
+									 hand to `CoderMarkdown` is untrimmed
+									 — preserving leading whitespace is
+									 the renderer's job. -->
+					<div class="bubble assistant-bubble">
+						<CoderMarkdown text={row.text} />
+					</div>
+				{/if}
+			</div>
+		{/if}
 	{:else if row.kind === 'tool'}
 		{@const subagent = withSubagentCards ? (coder.subagentSummaries.get(row.id) ?? null) : null}
+		{@const elapsedMs = row.hasResult ? (row.durationMs ?? 0) : Math.max(0, nowTick - row.startedAt)}
 		<div class="row tool" class:err={row.isError}>
 			<div class="row-label">tool · {row.name}</div>
 			<details>
-				<summary>{!row.hasResult ? 'running…' : row.isError ? 'error' : 'ok'}</summary>
+				<summary>
+					<span class="tool-status">{!row.hasResult ? 'running…' : row.isError ? 'error' : 'ok'}</span>
+					<!-- Live elapsed counter while running, precise
+									 final duration once the tool settles. Reads
+									 the panel-level `nowTick` so every running
+									 tool row advances on the same 250ms beat
+									 instead of each one fighting for its own
+									 interval. -->
+					<span class="tool-elapsed" class:running={!row.hasResult}>{fmtElapsed(elapsedMs, !row.hasResult)}</span>
+				</summary>
 				<div class="block-label">args</div>
 				<pre class="block">{fmtArgs(row.args)}</pre>
 				{#if row.hasResult}
@@ -1103,6 +1179,26 @@
 	.row.tool summary {
 		cursor: pointer;
 		color: var(--m-fg-muted);
+		display: flex;
+		align-items: baseline;
+		gap: 6px;
+	}
+	.row.tool .tool-status {
+		flex: 0 0 auto;
+	}
+	/* Tabular numerics on the elapsed counter so the trailing
+	   digits don't shift the layout while a running tool ticks
+	   from 1.2s → 1.3s. `running` flips to a tinted muted colour
+	   so a finished call's duration reads as a settled fact, not
+	   an active timer. */
+	.row.tool .tool-elapsed {
+		flex: 0 0 auto;
+		color: var(--m-fg-subtle);
+		font-size: 11px;
+		font-variant-numeric: tabular-nums;
+	}
+	.row.tool .tool-elapsed.running {
+		color: var(--m-accent);
 	}
 	.row.tool .block-label {
 		margin-top: 6px;

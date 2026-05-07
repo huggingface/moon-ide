@@ -264,6 +264,19 @@ pub trait WorkspaceHost: Send + Sync {
 	/// and missing-upstream messages all stay readable.
 	async fn git_pull(&self) -> MoonResult<()>;
 
+	/// `git merge --no-edit <remote_ref>` — fast-forward when
+	/// possible, otherwise create a merge commit with git's
+	/// default subject. The SCM panel calls this when the user
+	/// clicks "Update from main"; `<remote_ref>` is the same
+	/// `default_branch_remote_ref` (e.g. `"origin/main"`) the
+	/// branch info exposes, so the backend doesn't have to
+	/// re-resolve the default. We rely on the periodic auto-fetch
+	/// to keep the remote-tracking ref current; this op never
+	/// fetches itself, matching the "merge means merge" contract
+	/// the button label sets up. Errors (conflicts, dirty tree,
+	/// unknown ref) propagate git's stderr verbatim.
+	async fn git_merge_default_branch(&self, remote_ref: &str) -> MoonResult<()>;
+
 	/// Subject + body of the current `HEAD` commit (`git log -1
 	/// --pretty=%B`). Used by the SCM panel to prefill the commit
 	/// composer when "amend" is toggled on with an empty message
@@ -441,17 +454,21 @@ impl LocalHost {
 	}
 
 	/// Layer 2 of `run_formatter_chain`: language-default formatter
-	/// keyed by file extension. Runs the subprocess with the file's
-	/// parent directory as `cwd` so any tool that walks up looking
-	/// for its config (rustfmt → `rustfmt.toml` / `Cargo.toml`) starts
-	/// from the same place it would when invoked from a shell in that
-	/// directory.
+	/// keyed by file extension. The resolver in
+	/// [`format::default_format_command`] decides both the command
+	/// to run and the `cwd` to run it in, so a language with
+	/// project-local tooling (Python's `.venv/bin/ruff`) can pin
+	/// the cwd to the project root while a language with no such
+	/// requirement (Rust → `rustfmt`) falls through to the file's
+	/// parent directory. Anchoring `cwd` like this lets a relative
+	/// bin token resolve correctly on both host and container
+	/// (`docker exec -w <translated_cwd> … .venv/bin/ruff`) without
+	/// us having to translate the bin token itself.
 	async fn run_default_formatter_for(&self, abs: &Utf8Path, target: &ShellTarget) -> bool {
-		let Some(default_cmd) = format::default_format_command(abs) else {
+		let Some(default) = format::default_format_command(abs) else {
 			return false;
 		};
-		let cwd = abs.parent().unwrap_or(&self.root).to_path_buf();
-		let _ = format::run_formatter(&self.root, &cwd, abs, &default_cmd, target).await;
+		let _ = format::run_formatter(&self.root, &default.cwd, abs, &default.command, target).await;
 		true
 	}
 
@@ -1114,6 +1131,20 @@ impl WorkspaceHost for LocalHost {
 			.map_err(|e| MoonError::Internal(format!("git_pull join error: {e}")))?
 	}
 
+	async fn git_merge_default_branch(&self, remote_ref: &str) -> MoonResult<()> {
+		let root = self.root.clone();
+		let remote_ref = remote_ref.to_owned();
+		tokio::task::spawn_blocking(move || {
+			run_git_simple(
+				&root,
+				&["merge", "--no-edit", &remote_ref],
+				&format!("git merge {remote_ref}"),
+			)
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_merge_default_branch join error: {e}")))?
+	}
+
 	async fn git_fetch(&self) -> MoonResult<()> {
 		run_git_fetch_quiet(&self.root).await
 	}
@@ -1220,6 +1251,29 @@ fn run_git_branch(root: &Utf8Path) -> GitBranchInfo {
 		_ => None,
 	};
 
+	let default_branch_remote_ref = resolve_default_remote_ref(root);
+	// Hide the "Update from main" affordance when we're already
+	// on the default branch — the regular `Sync Changes` button
+	// covers that case (its `behind` is the same `origin/main →
+	// HEAD` count). Comparing the local short name against the
+	// stripped remote-tracking ref is enough: `origin/main` →
+	// `main`, which equals the local branch name when checked
+	// out from `origin/main`.
+	let default_branch_behind = match (&default_branch_remote_ref, &name) {
+		(Some(remote_ref), Some(local_name)) => {
+			let local_default = remote_ref
+				.split_once('/')
+				.map(|(_, b)| b)
+				.unwrap_or(remote_ref.as_str());
+			if local_default == local_name.as_str() {
+				0
+			} else {
+				count_behind(root, remote_ref)
+			}
+		}
+		_ => 0,
+	};
+
 	GitBranchInfo {
 		name,
 		head_short_sha,
@@ -1227,7 +1281,76 @@ fn run_git_branch(root: &Utf8Path) -> GitBranchInfo {
 		ahead,
 		behind,
 		pr_url,
+		default_branch_remote_ref,
+		default_branch_behind,
 	}
+}
+
+/// Best-effort resolution of the repo's default branch on `origin`.
+/// Three sources, tried in order:
+///
+/// 1. `git symbolic-ref --short refs/remotes/origin/HEAD` — set by
+///    `git clone` and refreshable with `git remote set-head origin
+///    --auto`. The right answer when it's there.
+/// 2. `git rev-parse --verify --quiet origin/main` — modern default
+///    that the symbolic ref usually points at.
+/// 3. `git rev-parse --verify --quiet origin/master` — older default,
+///    still common on long-lived repos.
+///
+/// Returns the short remote-tracking name (`"origin/main"` /
+/// `"origin/master"`) so the SCM panel can both display the local
+/// short name as a label and pass the full ref to `git merge`.
+/// `None` when no `origin` remote exists, the symbolic ref isn't
+/// set, and neither fallback ref resolves — the SCM panel hides
+/// its "Update from <main>" button in that case.
+fn resolve_default_remote_ref(root: &Utf8Path) -> Option<String> {
+	use std::process::Command;
+
+	let symbolic = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["symbolic-ref", "--short", "--quiet", "refs/remotes/origin/HEAD"])
+		.output()
+		.ok()
+		.filter(|o| o.status.success())
+		.and_then(|o| String::from_utf8(o.stdout).ok())
+		.map(|s| s.trim().to_owned())
+		.filter(|s| !s.is_empty());
+	if symbolic.is_some() {
+		return symbolic;
+	}
+	for candidate in ["origin/main", "origin/master"] {
+		let exists = Command::new("git")
+			.arg("-C")
+			.arg(root.as_std_path())
+			.args(["rev-parse", "--verify", "--quiet", candidate])
+			.output()
+			.ok()
+			.is_some_and(|o| o.status.success());
+		if exists {
+			return Some(candidate.to_owned());
+		}
+	}
+	None
+}
+
+/// `git rev-list --count HEAD..<remote_ref>` — number of commits
+/// `<remote_ref>` has that `HEAD` doesn't. Same shape the upstream
+/// `behind` counter uses; reports `0` on any failure (no HEAD,
+/// missing ref, git unavailable).
+fn count_behind(root: &Utf8Path, remote_ref: &str) -> u32 {
+	use std::process::Command;
+
+	Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["rev-list", "--count", &format!("HEAD..{remote_ref}")])
+		.output()
+		.ok()
+		.filter(|o| o.status.success())
+		.and_then(|o| String::from_utf8(o.stdout).ok())
+		.and_then(|s| s.trim().parse::<u32>().ok())
+		.unwrap_or(0)
 }
 
 /// Percent-encode a git branch name for use as a single path
@@ -3278,6 +3401,168 @@ mod tests {
 			elapsed < std::time::Duration::from_secs(10),
 			"git_fetch took {elapsed:?} — should fail fast, not approach the 30s timeout"
 		);
+	}
+
+	/// `git_branch` exposes `default_branch_remote_ref` +
+	/// `default_branch_behind` so the SCM panel can render an
+	/// "Update from main" affordance. Validate the happy path:
+	/// a feature branch sitting on the same commit as `main`, then
+	/// a third commit pushed to `origin/main` from a sibling clone.
+	/// After fetch we expect `default_branch_remote_ref ==
+	/// "origin/main"` and `default_branch_behind == 1`.
+	#[tokio::test]
+	async fn git_branch_reports_default_branch_behind_after_remote_advances() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping default-branch-behind test");
+			return;
+		};
+
+		let root = TempDir::new().unwrap();
+		let remote = root.path().join("remote.git");
+		let pusher = root.path().join("pusher");
+		let local = root.path().join("local");
+
+		run_git(&git, root.path(), &["init", "--bare", "-q", "-b", "main", "remote.git"]);
+		std::fs::create_dir_all(&pusher).unwrap();
+		run_git(&git, &pusher, &["init", "-q", "-b", "main"]);
+		run_git(&git, &pusher, &["config", "user.email", "p@example.com"]);
+		run_git(&git, &pusher, &["config", "user.name", "Pusher"]);
+		run_git(&git, &pusher, &["remote", "add", "origin", remote.to_str().unwrap()]);
+		std::fs::write(pusher.join("README.md"), "v1\n").unwrap();
+		run_git(&git, &pusher, &["add", "."]);
+		run_git(&git, &pusher, &["commit", "-q", "-m", "initial"]);
+		run_git(&git, &pusher, &["push", "-q", "-u", "origin", "main"]);
+
+		run_git(&git, root.path(), &["clone", "-q", remote.to_str().unwrap(), "local"]);
+		run_git(&git, &local, &["config", "user.email", "l@example.com"]);
+		run_git(&git, &local, &["config", "user.name", "Local"]);
+		run_git(&git, &local, &["checkout", "-q", "-b", "feature"]);
+
+		std::fs::write(pusher.join("README.md"), "v2\n").unwrap();
+		run_git(&git, &pusher, &["commit", "-q", "-am", "second"]);
+		run_git(&git, &pusher, &["push", "-q", "origin", "main"]);
+
+		let local_root = Utf8PathBuf::from_path_buf(local.canonicalize().unwrap()).unwrap();
+		LocalHost::new(local_root.clone()).git_fetch().await.unwrap();
+
+		let branch = LocalHost::new(local_root).git_branch().await.unwrap();
+		assert_eq!(
+			branch.default_branch_remote_ref.as_deref(),
+			Some("origin/main"),
+			"expected origin/main as the resolved default ref, got {branch:?}"
+		);
+		assert_eq!(
+			branch.default_branch_behind, 1,
+			"expected default_branch_behind=1 after fetch, got {branch:?}"
+		);
+		assert_eq!(branch.name.as_deref(), Some("feature"));
+	}
+
+	/// On the default branch itself the "Update from main" button
+	/// must hide — `behind` (the upstream-tracking count) already
+	/// surfaces the same commits via the regular Sync Changes
+	/// button. We assert `default_branch_behind == 0` even though
+	/// `origin/main` is a commit ahead, since reading `branch.name
+	/// == "main"` strips the affordance.
+	#[tokio::test]
+	async fn git_branch_default_branch_behind_is_zero_when_on_default_branch() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping on-default test");
+			return;
+		};
+
+		let root = TempDir::new().unwrap();
+		let remote = root.path().join("remote.git");
+		let pusher = root.path().join("pusher");
+		let local = root.path().join("local");
+
+		run_git(&git, root.path(), &["init", "--bare", "-q", "-b", "main", "remote.git"]);
+		std::fs::create_dir_all(&pusher).unwrap();
+		run_git(&git, &pusher, &["init", "-q", "-b", "main"]);
+		run_git(&git, &pusher, &["config", "user.email", "p@example.com"]);
+		run_git(&git, &pusher, &["config", "user.name", "Pusher"]);
+		run_git(&git, &pusher, &["remote", "add", "origin", remote.to_str().unwrap()]);
+		std::fs::write(pusher.join("README.md"), "v1\n").unwrap();
+		run_git(&git, &pusher, &["add", "."]);
+		run_git(&git, &pusher, &["commit", "-q", "-m", "initial"]);
+		run_git(&git, &pusher, &["push", "-q", "-u", "origin", "main"]);
+
+		run_git(&git, root.path(), &["clone", "-q", remote.to_str().unwrap(), "local"]);
+		run_git(&git, &local, &["config", "user.email", "l@example.com"]);
+		run_git(&git, &local, &["config", "user.name", "Local"]);
+
+		std::fs::write(pusher.join("README.md"), "v2\n").unwrap();
+		run_git(&git, &pusher, &["commit", "-q", "-am", "second"]);
+		run_git(&git, &pusher, &["push", "-q", "origin", "main"]);
+
+		let local_root = Utf8PathBuf::from_path_buf(local.canonicalize().unwrap()).unwrap();
+		LocalHost::new(local_root.clone()).git_fetch().await.unwrap();
+
+		let branch = LocalHost::new(local_root).git_branch().await.unwrap();
+		assert_eq!(branch.name.as_deref(), Some("main"));
+		assert_eq!(
+			branch.default_branch_behind, 0,
+			"on the default branch, Sync Changes covers the new commits — Update-from-main should hide"
+		);
+		assert_eq!(
+			branch.behind, 1,
+			"Sync Changes should still surface the upstream commit"
+		);
+	}
+
+	/// `git_merge_default_branch` lands the remote default branch's
+	/// commits on the current feature branch via a fast-forward (or
+	/// merge commit when histories diverge). Happy path: branch
+	/// off, push a commit on `origin/main`, fetch, run merge,
+	/// confirm `default_branch_behind` drops to 0.
+	#[tokio::test]
+	async fn git_merge_default_branch_fast_forwards_local_branch() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping merge-default test");
+			return;
+		};
+
+		let root = TempDir::new().unwrap();
+		let remote = root.path().join("remote.git");
+		let pusher = root.path().join("pusher");
+		let local = root.path().join("local");
+
+		run_git(&git, root.path(), &["init", "--bare", "-q", "-b", "main", "remote.git"]);
+		std::fs::create_dir_all(&pusher).unwrap();
+		run_git(&git, &pusher, &["init", "-q", "-b", "main"]);
+		run_git(&git, &pusher, &["config", "user.email", "p@example.com"]);
+		run_git(&git, &pusher, &["config", "user.name", "Pusher"]);
+		run_git(&git, &pusher, &["remote", "add", "origin", remote.to_str().unwrap()]);
+		std::fs::write(pusher.join("README.md"), "v1\n").unwrap();
+		run_git(&git, &pusher, &["add", "."]);
+		run_git(&git, &pusher, &["commit", "-q", "-m", "initial"]);
+		run_git(&git, &pusher, &["push", "-q", "-u", "origin", "main"]);
+
+		run_git(&git, root.path(), &["clone", "-q", remote.to_str().unwrap(), "local"]);
+		run_git(&git, &local, &["config", "user.email", "l@example.com"]);
+		run_git(&git, &local, &["config", "user.name", "Local"]);
+		run_git(&git, &local, &["checkout", "-q", "-b", "feature"]);
+
+		std::fs::write(pusher.join("README.md"), "v2\n").unwrap();
+		run_git(&git, &pusher, &["commit", "-q", "-am", "second"]);
+		run_git(&git, &pusher, &["push", "-q", "origin", "main"]);
+
+		let local_root = Utf8PathBuf::from_path_buf(local.canonicalize().unwrap()).unwrap();
+		LocalHost::new(local_root.clone()).git_fetch().await.unwrap();
+		let pre = LocalHost::new(local_root.clone()).git_branch().await.unwrap();
+		assert_eq!(pre.default_branch_behind, 1);
+
+		LocalHost::new(local_root.clone())
+			.git_merge_default_branch("origin/main")
+			.await
+			.unwrap();
+
+		let post = LocalHost::new(local_root).git_branch().await.unwrap();
+		assert_eq!(
+			post.default_branch_behind, 0,
+			"expected default_branch_behind to drop to 0 after merge, got {post:?}"
+		);
+		assert_eq!(post.name.as_deref(), Some("feature"));
 	}
 
 	#[cfg(unix)]

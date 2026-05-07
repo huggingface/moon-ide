@@ -295,6 +295,19 @@ pub async fn fs_git_pull(state: State<'_, AppState>) -> Result<(), MoonError> {
 	entry.host.git_pull().await
 }
 
+/// `git merge --no-edit <remote_ref>` for the active folder. The
+/// SCM panel calls this when the user clicks "Update from main";
+/// `remote_ref` is whatever the latest `GitBranchInfo` exposed in
+/// `default_branch_remote_ref` (typically `"origin/main"`). Errors
+/// (conflicts, dirty tree, missing ref) propagate git's stderr
+/// verbatim so the flash matches what the user would see in a
+/// terminal.
+#[tauri::command]
+pub async fn fs_git_merge_default_branch(state: State<'_, AppState>, remote_ref: String) -> Result<(), MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.git_merge_default_branch(&remote_ref).await
+}
+
 /// `git fetch --quiet --no-tags` against the configured upstream
 /// remote. Drives the periodic auto-fetch loop in the frontend so
 /// the "Sync Changes" button surfaces when commits land upstream

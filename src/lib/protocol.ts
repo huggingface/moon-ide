@@ -191,6 +191,26 @@ export type GitBranchInfo = {
 	 * `hasUpstream`).
 	 */
 	prUrl: string | null;
+	/**
+	 * Remote-tracking ref for the repo's default branch, e.g.
+	 * `"origin/main"`. Resolved from `refs/remotes/origin/HEAD`
+	 * with fallbacks to `origin/main` then `origin/master`.
+	 * `null` when no default can be resolved. The SCM panel
+	 * passes this verbatim to `git_merge_default_branch` and
+	 * derives the displayed short name (`"main"`) from it.
+	 */
+	defaultBranchRemoteRef: string | null;
+	/**
+	 * Number of commits the default branch's remote-tracking ref
+	 * has that the current branch's HEAD doesn't — what
+	 * `git merge <defaultBranchRemoteRef>` would land. `0` when
+	 * the current branch is already up to date with the default,
+	 * when we're already on the default branch (the regular
+	 * sync button covers that case), or when no default could
+	 * be resolved. The SCM panel shows the "Update from main"
+	 * affordance iff this is `> 0`.
+	 */
+	defaultBranchBehind: number;
 };
 
 /**

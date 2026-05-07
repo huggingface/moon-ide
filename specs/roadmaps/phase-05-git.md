@@ -162,7 +162,8 @@ view and suppress the inline gutter.
 [0037](../test-plans/0037-revert-icon-and-utf8-save.md),
 [0052](../test-plans/0052-folder-bar-status.md),
 [0062](../test-plans/0062-commit-to-new-branch.md),
-[0064](../test-plans/0064-git-auto-fetch.md). Status: shipped
+[0064](../test-plans/0064-git-auto-fetch.md),
+[0065](../test-plans/0065-scm-update-from-main.md). Status: shipped
 (piecewise; the panel grew across several plans).
 
 The right-side-of-the-folder-bar SCM panel:
@@ -211,6 +212,18 @@ HEAD --no-color` patch capped at ~16 KB (new
   roundtrip is in flight; same treatment for `Publishing…` on
   `Publish Branch`. Same accent-colored spinner appears next to
   the commit button label while busy.
+- **Update from main.** Secondary outlined button below `Sync
+Changes` that surfaces when the repo's default branch
+  (`origin/HEAD` → `origin/main` → `origin/master`) has commits
+  the current branch's HEAD doesn't, and we're not on the default
+  branch ourselves. Drives `git merge --no-edit <remote_ref>` via
+  `WorkspaceHost::git_merge_default_branch` /
+  `fs_git_merge_default_branch`. The remote ref + behind count
+  ride on the existing `git_branch` IPC as
+  `defaultBranchRemoteRef` / `defaultBranchBehind` so no extra
+  round-trip is needed. Conflicts / dirty-tree refusals propagate
+  git's stderr verbatim via flash; an in-app abort affordance is
+  a later concern (Phase 5's full conflict UI).
 
 ### 5.4 — Search ignores `.git/`
 

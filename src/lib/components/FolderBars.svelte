@@ -3,6 +3,7 @@
 	import { projectCompose, projectComposeStateLabel } from '../projectCompose.svelte';
 	import { workspace } from '../state.svelte';
 	import ContainerIcon from './icons/ContainerIcon.svelte';
+	import SparklesIcon from './icons/SparklesIcon.svelte';
 	import ProjectComposePopover from './ProjectComposePopover.svelte';
 
 	// Stacked folder bars — one row per folder bound into the workspace
@@ -12,13 +13,15 @@
 	//
 	// Each row exposes three passive readouts about the folder:
 	//
-	// - **Agent-running pip** — a pulsing accent dot rendered
-	//   between the chevron and the folder name when the coder
-	//   has a turn in flight against that folder. Lets the user
-	//   notice a background turn (sub-agent, just-launched parent
-	//   in a non-active folder, …) without having to switch
-	//   active folder. Reads through `coder.busyForFolder` so the
-	//   pip tracks the bucket's `busy` `$state` reactively.
+	// - **Agent-running glyph** — a pulsing AI sparkle rendered
+	//   right after the folder name when the coder has a turn in
+	//   flight against that folder. Lets the user notice a
+	//   background turn (sub-agent, just-launched parent in a
+	//   non-active folder, …) without having to switch active
+	//   folder. Sits in the same per-row column as the git badges
+	//   so it doesn't push the name around. Reads through
+	//   `coder.busyForFolder` so the glyph tracks the bucket's
+	//   `busy` `$state` reactively.
 	// - **Git change badges** (`+N ~N -N`) — added / modified /
 	//   deleted counts pulled from the per-folder
 	//   `gitChangeSummaries` map. Refreshed on workspace hydrate,
@@ -84,10 +87,12 @@
 				onclick={() => void workspace.setActiveFolder(folder.path)}
 			>
 				<span class="chev" aria-hidden="true">{isActive ? '▾' : '▸'}</span>
-				{#if agentRunning}
-					<span class="agent-pip" aria-label="Agent running" title="Agent running"></span>
-				{/if}
 				<span class="name">{folder.name}</span>
+				{#if agentRunning}
+					<span class="agent-glyph" aria-label="Agent running" title="Agent running">
+						<SparklesIcon size={12} />
+					</span>
+				{/if}
 			</button>
 			{#if hasChanges}
 				<span
@@ -215,40 +220,47 @@
 		font-size: 10px;
 		text-align: center;
 	}
-	/* Agent-running pip — a small pulsing accent dot between the
-	   chevron and the folder name. Only renders while a turn is
-	   in flight for this folder, so the bar doesn't carry an
-	   always-empty placeholder when nothing's running. The
-	   `flex-shrink: 0` keeps it from being squeezed on narrow
-	   sidebars; `box-shadow` with the accent at low alpha gives
-	   a subtle halo that reads as "live" without screaming. */
-	.agent-pip {
+	/* Agent-running glyph — a pulsing AI sparkle that sits right
+	   after the folder name. Only renders while a turn is in
+	   flight for this folder, so the bar doesn't carry an
+	   always-empty placeholder when nothing's running. Same
+	   sparkles glyph the SCM panel uses for AI suggestions, so the
+	   "magic-is-happening" vocabulary stays consistent across the
+	   IDE. The accent colour + opacity pulse reads as "live"
+	   without the harsher scale/halo of the previous dot. */
+	.agent-glyph {
 		flex-shrink: 0;
-		display: inline-block;
-		width: 7px;
-		height: 7px;
-		border-radius: 50%;
-		background: var(--m-accent);
-		box-shadow: 0 0 0 2px color-mix(in srgb, var(--m-accent) 28%, transparent);
-		animation: agent-pip-pulse 1.4s ease-in-out infinite;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		color: var(--m-accent);
+		animation: agent-glyph-pulse 1.4s ease-in-out infinite;
 	}
-	@keyframes agent-pip-pulse {
+	@keyframes agent-glyph-pulse {
 		0%,
 		100% {
 			opacity: 1;
-			transform: scale(1);
 		}
 		50% {
-			opacity: 0.55;
-			transform: scale(0.8);
+			opacity: 0.45;
 		}
 	}
 	.name {
-		flex: 1;
+		flex: 0 1 auto;
 		min-width: 0;
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+	}
+	/* Inside the bar-button, after the name + optional agent glyph,
+	   a flexible spacer eats remaining space so the next sibling
+	   (currently nothing — git-summary lives outside the button)
+	   doesn't get pulled in. Keeping this as a separate rule on
+	   the button itself rather than a stray <div> so the markup
+	   stays scannable. */
+	.bar-button::after {
+		content: '';
+		flex: 1;
 	}
 	.git-summary {
 		flex-shrink: 0;
