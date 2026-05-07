@@ -1586,6 +1586,12 @@ class WorkspaceState {
 			const result = await ipc.fs.gitCommit(trimmed, amend);
 			const verb = amend ? 'Amended' : 'Committed';
 			this.flash(`${verb} ${result.shortSha}: ${result.summary}`);
+			// "Stage everything then commit" clears the working tree,
+			// so the SCM filter has nothing left to show — flip it
+			// off so the file tree snaps back to the regular full
+			// view instead of stranding the user on an empty
+			// changes-only pane with the filter pill still lit.
+			this.scmFilterOn = false;
 			await this.refreshGitBranch();
 			void this.refreshActiveFolder();
 			return true;
@@ -1618,6 +1624,11 @@ class WorkspaceState {
 		try {
 			const result = await ipc.fs.gitCommitOnNewBranch(trimmedBranch, trimmedMessage);
 			this.flash(`Committed ${result.shortSha} on ${trimmedBranch}: ${result.summary}`);
+			// Same reasoning as `commitChanges`: post-commit working
+			// tree is empty, so the SCM filter has nothing to filter
+			// to — flip it off rather than stranding the user on an
+			// empty changes-only pane.
+			this.scmFilterOn = false;
 			await this.refreshGitBranch();
 			void this.refreshActiveFolder();
 			return true;
