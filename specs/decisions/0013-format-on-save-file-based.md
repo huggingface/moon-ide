@@ -102,17 +102,50 @@ broker, coder bash, format-on-save) into the same trait. The current
 duplication is intentional: each layer grew the routing inline at a
 different time, and consolidating them is its own change.
 
-#### What stays on the host
+#### Project-local binary discovery in the container (added 2026-05-07)
 
-The in-container `PATH` is the container image's responsibility (today:
-`moon-base`'s rustup install, system bins). We deliberately don't
-forward the host's `node_modules/.bin/` chain via `--env PATH=…`:
-docker's `--env` _replaces_ the in-container `PATH` rather than
-prepending, which would lose the system bins the user's lint-staged
-commands depend on. Project-local `node_modules/.bin/` discovery on
-the container side is a deferred enhancement — flag it via container-
-image PATH, or wrap the spawn in `sh -lc` when a real project needs
-it. The host-side walk still happens for `ShellTarget::Host`.
+Initial container support deferred `node_modules/.bin/` discovery: the
+container image was responsible for `PATH`, and `--env PATH=…` was off
+the table because docker's `--env` _replaces_ the in-container `PATH`
+(it would have lost the rustup / fnm / bun / system bins moon-base
+sets up). The first project the team actually saved to in container
+mode — `~/code/moon-landing/server`, lint-staged's
+`prettier -w --ignore-path ../.prettierignore` — surfaced the gap:
+`prettier` lives in the workspace's `node_modules/.bin/`, not on the
+container's `PATH`, so the spawn failed with `NotFound` and no
+formatter ran. Format-on-save worked on the host (the npm-run-path
+chain prepend is on `Command::env`) and silently no-op'd in container.
+
+The fix wraps the docker exec in a `sh -c` that prepends the project's
+in-container `node_modules/.bin/` chain (host paths translated through
+the bind mount) to the container's existing `$PATH`, then `exec "$@"`s
+the original argv. Concretely:
+
+```
+docker exec -w <container_cwd> <name>
+  sh -c 'PATH="<chain>:$PATH" exec "$@"'
+  sh <bin> <user_args>... <abs_in_container>
+```
+
+The shell expands `$PATH` at exec time inside the container, so we
+keep whatever moon-base configured (rustup, fnm's default Node, bun,
+uv, system bins) without having to know the layout. `sh` is the
+conventional `$0` placeholder; the formatter inherits the original
+argv via `"$@"` with no extra quoting. Same `npm-run-path` walk the
+host arm uses (`config_dir` → `workspace_root`), just translated into
+container space.
+
+This does **not** activate the project's pinned Node version (e.g.
+moon-landing's `.nvmrc` 24.14.1). `node` itself resolves to whatever
+moon-base set as the fnm default (the container LTS), because fnm's
+`--use-on-cd` hook only fires for interactive shells and `docker
+exec` is non-interactive. For the format pipeline that's fine — the
+formatter binaries (`prettier`, `oxfmt`, `eslint`, `ruff`) work on any
+modern-enough Node, and the team isn't running native-module-bound
+tooling at save time. If the team starts saving against a project
+that needs the pinned Node at format time, add an `eval "$(fnm env)"
+&& fnm use --install-if-missing --silent-if-unchanged` prelude to the
+wrapper — same shape, two extra lines.
 
 #### What this does NOT solve
 

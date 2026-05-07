@@ -21,16 +21,18 @@
 //!
 //! When the active folder runs inside a workspace shell container
 //! (`ShellTarget::Container`), the spawn is wrapped as
-//! `docker exec -w <container_cwd> <name> <bin> <args> <abs_in_container>`
-//! — same shape the LSP and the agent's `bash` tool use. Paths are
-//! translated through the bind mount (`/workspace/<basename>/...`) so
-//! the in-container process sees the file under the same path
-//! `cargo fmt` / `prettier` / `eslint` would see when invoked from a
-//! terminal in the container. The host `PATH` walk is skipped in
-//! container mode; the container's own `PATH` plus the bind-mounted
-//! `node_modules/.bin/` directories are added via `--env PATH=…` so
-//! the same project-local-binary discovery rule applies on either
-//! side.
+//! `docker exec -w <container_cwd> <name> sh -c '<wrap>' sh <bin> <args> <abs_in_container>`
+//! where `<wrap>` is `PATH="<container-side node_modules/.bin chain>:$PATH" exec "$@"`.
+//! Paths are translated through the bind mount (`/workspace/<basename>/...`)
+//! so the in-container process sees the file under the same path
+//! `cargo fmt` / `prettier` / `eslint` would see from a terminal in
+//! the container. The `sh -c` wrapper prepends the project's
+//! `node_modules/.bin/` chain (in container space) to the
+//! container's existing `$PATH` — same `npm-run-path` semantics the
+//! host arm uses, evaluated inside the container so we don't have
+//! to know the image's PATH layout. `exec "$@"` then replaces the
+//! shell with the actual binary so the formatter inherits the
+//! original argv intact.
 //!
 //! See [specs/decisions/0013-format-on-save-file-based.md](../../../specs/decisions/0013-format-on-save-file-based.md)
 //! (the current design) and
@@ -185,24 +187,30 @@ fn build_command(
 		ShellTarget::Container { container_name, .. } => {
 			let translated_config = target.translate_path(config_dir)?;
 			let translated_abs = target.translate_path(abs_file_path)?;
+			let container_chain = build_container_node_modules_chain(config_dir, workspace_root, target);
 
 			// `docker exec` (no `-it`): captured stdout/stderr,
 			// no TTY. Same shape `moon-coder`'s `bash` tool and
 			// the LSP `DockerExec` spawner use.
 			//
-			// We deliberately don't override the *in-container*
-			// `PATH`. Docker's `--env PATH=…` *replaces* the
-			// container's PATH, which would lose system bins
-			// (`/usr/local/bin`, rustup's `~/.cargo/bin`, …).
-			// The container image (moon-base) is responsible
-			// for setting PATH so the user's lint-staged
-			// commands resolve. Project-local
-			// `node_modules/.bin/` discovery on the container
-			// side is a future enhancement — flag it via
-			// container image PATH or a `sh -lc` wrapper if a
-			// real project needs it.
+			// The `sh -c` wrapper prepends the project's in-
+			// container `node_modules/.bin/` chain to the
+			// container's existing `$PATH`. We can't use docker's
+			// `--env PATH=…` for this because that *replaces*
+			// the container's PATH (losing system bins, rustup's
+			// `~/.cargo/bin`, fnm's default-Node link, …); the
+			// shell wrapper expands `$PATH` at exec time inside
+			// the container so we keep whatever moon-base
+			// configured.
 			//
-			// We *do* prepend the host-side
+			// Argv passing: `sh -c "PATH=...:$PATH exec \"\$@\""
+			// sh <bin> <user_args>... <abs>` — the shell receives
+			// `bin` / args via `"$@"` and `exec`s them, so the
+			// formatter inherits the original argv with no extra
+			// quoting layer to escape. `sh` is the conventional
+			// `$0` placeholder.
+			//
+			// We *also* prepend the host-side
 			// `node_modules/.bin/` chain to the **docker
 			// subprocess's** PATH (host-side lookup of `docker`
 			// itself). In production this is a no-op — docker
@@ -216,6 +224,10 @@ fn build_command(
 				.arg("-w")
 				.arg(translated_config.as_str())
 				.arg(container_name)
+				.arg("sh")
+				.arg("-c")
+				.arg(format!(r#"PATH="{container_chain}:$PATH" exec "$@""#))
+				.arg("sh")
 				.arg(bin_token);
 			for arg in user_args {
 				cmd.arg(arg);
@@ -403,6 +415,35 @@ fn parse_package_edition(path: &std::path::Path) -> Option<String> {
 		return Some(value.to_owned());
 	}
 	None
+}
+
+/// In-container `node_modules/.bin/` chain for the format-on-save
+/// `sh -c` wrapper. Walks the same `start` → `root` path
+/// [`build_path_env`] walks, but emits **container-side** absolute
+/// paths (translated through the bind mount) joined by `:`. The
+/// caller interpolates the result into `PATH="<chain>:$PATH"` so
+/// the shell expands `$PATH` against the container's live env at
+/// exec time.
+///
+/// `start` and `root` are host paths and must already be inside the
+/// bind mount — the caller validates that by translating
+/// `config_dir` / `abs_file_path` up front. Any directory that
+/// fails to translate is skipped defensively (returns no entry for
+/// that level rather than aborting).
+fn build_container_node_modules_chain(start: &Utf8Path, root: &Utf8Path, target: &ShellTarget) -> String {
+	let mut entries: Vec<String> = Vec::new();
+	let mut current: Option<&Utf8Path> = Some(start);
+	while let Some(dir) = current {
+		if let Some(translated) = target.translate_path(dir) {
+			let bin = translated.join("node_modules").join(".bin");
+			entries.push(bin.to_string());
+		}
+		if dir == root {
+			break;
+		}
+		current = dir.parent();
+	}
+	entries.join(":")
 }
 
 /// Build a `PATH` value with every `node_modules/.bin/` directory from
@@ -759,9 +800,10 @@ mod tests {
 
 	/// Container target: building the command for a `Container`
 	/// shell target produces a `docker exec -w <container_cwd>
-	/// <name> <bin> <args> <abs_in_container>` argv. Validates
-	/// the host-to-container path translation and the no-`-it`
-	/// shape (we want captured output, not a TTY).
+	/// <name> sh -c '<wrap>' sh <bin> <args> <abs_in_container>`
+	/// argv. Validates the host-to-container path translation, the
+	/// `sh -c` PATH-prepend wrapper, and the no-`-it` shape (we want
+	/// captured output, not a TTY).
 	#[test]
 	fn build_command_container_translates_paths_and_uses_docker_exec() {
 		let target = ShellTarget::Container {
@@ -784,6 +826,10 @@ mod tests {
 				"-w",
 				"/workspace/workloads/app/sdk",
 				"moon-ws-default-dev-1",
+				"sh",
+				"-c",
+				r#"PATH="/workspace/workloads/app/sdk/node_modules/.bin:/workspace/workloads/app/node_modules/.bin:/workspace/workloads/node_modules/.bin:$PATH" exec "$@""#,
+				"sh",
 				"rustfmt",
 				"/workspace/workloads/app/sdk/src/main.rs",
 			]
@@ -793,6 +839,48 @@ mod tests {
 			!args.iter().any(|a| a == "-t" || a == "-it"),
 			"docker exec for format-on-save must not allocate a TTY"
 		);
+	}
+
+	#[test]
+	fn build_container_node_modules_chain_walks_config_dir_to_root() {
+		let target = ShellTarget::Container {
+			container_name: "moon-ws-default-dev-1".into(),
+			host_root: Utf8PathBuf::from("/home/dev/code/moon-landing"),
+			server_root: Utf8PathBuf::from("/workspace/moon-landing"),
+		};
+		// The motivating case: a moon-landing/server save, where
+		// the lint-staged config sits at the workspace root and
+		// the saved file lives under `server/`. The chain is
+		// translated into container space so `prettier` resolves
+		// against `/workspace/moon-landing/node_modules/.bin/`
+		// inside the dev container.
+		let chain = build_container_node_modules_chain(
+			Utf8Path::new("/home/dev/code/moon-landing/server"),
+			Utf8Path::new("/home/dev/code/moon-landing"),
+			&target,
+		);
+		assert_eq!(
+			chain,
+			"/workspace/moon-landing/server/node_modules/.bin:/workspace/moon-landing/node_modules/.bin",
+		);
+	}
+
+	#[test]
+	fn build_container_node_modules_chain_collapses_when_start_equals_root() {
+		let target = ShellTarget::Container {
+			container_name: "moon-ws-default-dev-1".into(),
+			host_root: Utf8PathBuf::from("/home/dev/code/moon-landing"),
+			server_root: Utf8PathBuf::from("/workspace/moon-landing"),
+		};
+		let chain = build_container_node_modules_chain(
+			Utf8Path::new("/home/dev/code/moon-landing"),
+			Utf8Path::new("/home/dev/code/moon-landing"),
+			&target,
+		);
+		// Single entry: the workspace root itself. Regression
+		// guard for the trailing-separator quirk
+		// `translate_path` already handles for this case.
+		assert_eq!(chain, "/workspace/moon-landing/node_modules/.bin");
 	}
 
 	#[test]
