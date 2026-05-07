@@ -2,6 +2,7 @@
 
 mod commands;
 mod fs_watcher;
+mod shell_resolver;
 mod shutdown;
 mod slack_poller;
 mod state;
@@ -196,6 +197,22 @@ pub fn run() {
 			// would dispatch tools against an empty registry and
 			// every `read_file` would fail with `NoActiveFolder`.
 			let workspaces = Arc::new(WorkspaceRegistry::new());
+
+			// Plug a [`ShellResolver`] into the registry so every
+			// folder's `LocalHost` can route format-on-save (and
+			// any future host-issued subprocess) through the
+			// workspace shell container when it's running. Same
+			// routing decision the LSP and the agent's `bash` tool
+			// make — deduplicating the three resolvers is a
+			// follow-up, but the wire shape is identical. Held as
+			// a `Weak` so dropping the registry doesn't keep the
+			// resolver — and therefore the registry — alive.
+			let shell_resolver = std::sync::Arc::new(shell_resolver::WorkspaceShellResolver::new(
+				Arc::downgrade(&workspaces),
+				workspaces_dir.clone(),
+			));
+			workspaces.set_shell_resolver(moon_core::ShellResolverHandle::new(shell_resolver));
+
 			let coder = CoderHandle::new(
 				workspaces.clone(),
 				workspaces_dir.clone(),

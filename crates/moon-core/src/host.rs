@@ -16,6 +16,7 @@ use crate::editorconfig::EditorConfigService;
 use crate::format;
 use crate::lint_staged::{LintStagedRules, LintStagedService};
 use crate::pre_save;
+use crate::shell::{ShellResolverHandle, ShellTarget};
 
 #[async_trait]
 pub trait WorkspaceHost: Send + Sync {
@@ -309,6 +310,12 @@ pub struct LocalHost {
 	root: Utf8PathBuf,
 	editorconfig: EditorConfigService,
 	lint_staged: LintStagedService,
+	/// Where to spawn host-issued subprocesses (today: format-on-save).
+	/// `None` → always run on the host's userland; injected by the
+	/// Tauri layer so format-on-save uses the workspace shell
+	/// container when it's `Running`. See `crate::shell` and
+	/// ADR 0002.
+	shell_resolver: Option<ShellResolverHandle>,
 }
 
 impl LocalHost {
@@ -317,27 +324,61 @@ impl LocalHost {
 			editorconfig: EditorConfigService::new(root.clone()),
 			lint_staged: LintStagedService::new(root.clone()),
 			root,
+			shell_resolver: None,
 		}
+	}
+
+	/// Plug in a [`ShellResolverHandle`] so format-on-save (and any
+	/// future host-issued subprocess) can route to the workspace
+	/// shell container when it's running. With no resolver every
+	/// subprocess stays on the host — the existing behaviour.
+	pub fn with_shell_resolver(mut self, resolver: ShellResolverHandle) -> Self {
+		self.shell_resolver = Some(resolver);
+		self
 	}
 
 	pub fn root(&self) -> &Utf8Path {
 		&self.root
 	}
 
-	/// Run the lint-staged formatter for `rel` against the file
-	/// already on disk. The command is spawned with the absolute file
-	/// path appended as a positional argument and is expected to mutate
-	/// the file in place — same shape `bun run lint-staged` uses on
-	/// commit. Every miss path is logged inside
-	/// [`crate::format::run_formatter`].
+	/// Resolve the target shell for subprocesses spawned against
+	/// this host. Defaults to [`ShellTarget::Host`] when no resolver
+	/// is plugged in.
+	async fn shell_target(&self) -> ShellTarget {
+		match &self.shell_resolver {
+			Some(handle) => handle.resolve(&self.root).await,
+			None => ShellTarget::Host,
+		}
+	}
+
+	/// Run a formatter for `rel` against the file already on disk.
+	/// Two-layer dispatch:
 	///
-	/// **TODO (chain truncation)**: when the matched rule has more than
-	/// one command, only the **last** one runs. moon-landing's
-	/// `*.{js,mjs,ts,svelte}` chain pairs `node scripts/lint.ts --fix`
-	/// with `prettier -w` and the node step is too slow to run on every
-	/// save. Once that script is sped up this flips to "run the whole
-	/// chain". A `tracing::warn!` once per process per truncated chain
-	/// length keeps the deviation visible.
+	/// 1. **lint-staged** is the team's per-repo source of truth and
+	///    wins whenever it has a matching rule. The command is spawned
+	///    with the absolute file path appended as a positional argument
+	///    and is expected to mutate the file in place — same shape
+	///    `bun run lint-staged` uses on commit.
+	/// 2. **Language defaults** (see [`format::default_format_command`])
+	///    fire only when (1) didn't apply, so projects that don't ship a
+	///    `.lintstagedrc.json` (`workloads` is pure Rust + Cargo, no JS
+	///    tooling) still get format-on-save for the languages we have
+	///    a default for. lint-staged still takes precedence whenever
+	///    it matches, so adding a default never overrides an explicit
+	///    team config.
+	///
+	/// Every miss path is logged inside [`crate::format::run_formatter`].
+	///
+	/// **TODO (chain truncation)**: when the matched lint-staged rule
+	/// has more than one command, only the **last** one runs.
+	/// moon-landing's `*.{js,mjs,ts,svelte}` chain pairs
+	/// `node scripts/lint.ts --fix` with `prettier -w` and the node
+	/// step is too slow to run on every save. Once that script is
+	/// sped up this flips to "run the whole chain". A
+	/// `tracing::warn!` once per process per truncated chain length
+	/// keeps the deviation visible. The language-default layer never
+	/// has a chain (one command per extension) so the caveat doesn't
+	/// apply to it.
 	///
 	/// When the flip happens, the chain runs **all** commands and
 	/// **does not** abort on the first non-zero exit / timeout (unlike
@@ -351,25 +392,37 @@ impl LocalHost {
 	/// should re-read). `false` means "nothing happened, the caller
 	/// can keep the pre-chain bytes".
 	async fn run_formatter_chain(&self, rel: &Utf8Path) -> bool {
+		// `absolute_path` is the only way to get the host-side absolute
+		// path for a workspace-relative input. The host-to-container
+		// translation for the `Container` shell target rebases this
+		// through the bind mount so the in-container process sees the
+		// same file under `/workspace/<basename>/...`.
+		let Ok(abs_str) = self.absolute_path(rel).await else {
+			return false;
+		};
+		let abs = Utf8PathBuf::from(abs_str);
+		let target = self.shell_target().await;
+
+		if self.run_lint_staged_chain_for(rel, &abs, &target).await {
+			return true;
+		}
+		self.run_default_formatter_for(&abs, &target).await
+	}
+
+	/// Layer 1 of `run_formatter_chain`: matched lint-staged rule.
+	/// Returns `true` when a command ran.
+	async fn run_lint_staged_chain_for(&self, rel: &Utf8Path, abs: &Utf8Path, target: &ShellTarget) -> bool {
 		let Ok(rules) = self.lint_staged.for_path(rel).await else {
 			return false;
 		};
 		if rules.is_empty() {
 			return false;
 		}
-		// `absolute_path` is the only way to get the host-side absolute
-		// path for a workspace-relative input. On `RemoteHost` (Phase 2)
-		// this would be the in-container path — exactly what the
-		// in-container formatter wants as its file argument.
-		let Ok(abs_str) = self.absolute_path(rel).await else {
-			return false;
-		};
-		let abs = Utf8PathBuf::from(abs_str);
 		let Some(commands) = rules.match_commands(abs.as_std_path()) else {
 			return false;
 		};
-		// Until the chain-truncation TODO above is lifted, only the
-		// last command runs. `last()` matches the team's current
+		// Until the chain-truncation TODO on `run_formatter_chain` lifts,
+		// only the last command runs. `last()` matches the team's current
 		// configs (the formatter is the last entry; the linter is
 		// before it), so dropping the prefix is the smallest change
 		// that gets format-on-save working again on `moon-landing/server`.
@@ -383,11 +436,22 @@ impl LocalHost {
 		// hit (the rule came from a real file on disk); the workspace
 		// root is just a defensive fallback the type system asks for.
 		let cwd = rules.config_dir().unwrap_or(&self.root).to_path_buf();
-		let _ = format::run_formatter(&self.root, &cwd, &abs, cmd).await;
-		// Whether the subprocess succeeded or not, the on-disk bytes
-		// may have moved; force the caller to re-stat / re-read. (On
-		// failure the file might have been partially mutated before the
-		// non-zero exit.)
+		let _ = format::run_formatter(&self.root, &cwd, abs, cmd, target).await;
+		true
+	}
+
+	/// Layer 2 of `run_formatter_chain`: language-default formatter
+	/// keyed by file extension. Runs the subprocess with the file's
+	/// parent directory as `cwd` so any tool that walks up looking
+	/// for its config (rustfmt → `rustfmt.toml` / `Cargo.toml`) starts
+	/// from the same place it would when invoked from a shell in that
+	/// directory.
+	async fn run_default_formatter_for(&self, abs: &Utf8Path, target: &ShellTarget) -> bool {
+		let Some(default_cmd) = format::default_format_command(abs) else {
+			return false;
+		};
+		let cwd = abs.parent().unwrap_or(&self.root).to_path_buf();
+		let _ = format::run_formatter(&self.root, &cwd, abs, &default_cmd, target).await;
 		true
 	}
 
@@ -3320,5 +3384,159 @@ mod tests {
 		h.save_file(Utf8Path::new("a.txt"), "hello   \nworld\t").await.unwrap();
 		let on_disk = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
 		assert_eq!(on_disk, "hello\nworld\n");
+	}
+
+	/// No matching lint-staged rule but the file extension has a
+	/// language-default formatter entry → the fallback runs. Validates
+	/// that `~/code/workloads`-style projects (pure Rust, no
+	/// `.lintstagedrc.json`) get format-on-save without needing a
+	/// per-repo lint-staged config.
+	///
+	/// `rustfmt` itself can't be assumed in CI, so we drop a fake one
+	/// in `node_modules/.bin/` — `build_path_env` prepends that
+	/// directory to the formatter subprocess's `PATH`, so spawning
+	/// `rustfmt` resolves to this script before any system install.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn save_file_falls_back_to_default_formatter_when_extension_has_one() {
+		let dir = TempDir::new().unwrap();
+		let h = host(&dir);
+
+		let bin = dir.path().join("node_modules").join(".bin");
+		std::fs::create_dir_all(&bin).unwrap();
+		// The fallback now emits `rustfmt --edition <e> <path>`,
+		// so the file path is the last positional. POSIX `for`
+		// loop walks all args and the trailing `:` keeps the
+		// last one in `$f`.
+		write_executable_script(
+			&bin.join("rustfmt"),
+			"#!/bin/sh\nfor f in \"$@\"; do :; done\ntr '[:lower:]' '[:upper:]' < \"$f\" > \"$f.tmp\" && mv \"$f.tmp\" \"$f\"\n",
+		);
+
+		let result = h.save_file(Utf8Path::new("a.rs"), "hello\n").await.unwrap();
+		let on_disk = std::fs::read_to_string(dir.path().join("a.rs")).unwrap();
+		assert_eq!(on_disk.trim_end(), "HELLO");
+		assert_eq!(result.bytes_written, on_disk.len() as u64);
+	}
+
+	/// Container routing: when a `ShellResolver` returns
+	/// `ShellTarget::Container`, format-on-save spawns
+	/// `docker exec -w <translated_cwd> <name> <bin> <translated_abs>`
+	/// instead of running the binary on the host. We can't ask CI
+	/// for a real container, so we point the resolver at a fake
+	/// `docker` script (dropped on the formatter subprocess's
+	/// `PATH` via `node_modules/.bin/` prepend) that records its
+	/// argv to a sidecar and exits 0 without mutating the file.
+	/// This validates path translation + invocation shape
+	/// end-to-end without bringing docker into the test bus.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn save_file_routes_format_through_docker_exec_in_container_target() {
+		use crate::shell::{ShellResolver, ShellResolverHandle, ShellTarget};
+
+		let dir = TempDir::new().unwrap();
+		let root = Utf8PathBuf::from_path_buf(dir.path().canonicalize().unwrap()).unwrap();
+
+		let argv_log = root.join("docker.argv");
+		let bin = dir.path().join("node_modules").join(".bin");
+		std::fs::create_dir_all(&bin).unwrap();
+		write_executable_script(
+			&bin.join("docker"),
+			&format!("#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > {argv_log}\n"),
+		);
+
+		// Stub resolver: always container, with the bind mount
+		// rooted at this temp dir → /workspace/<basename>.
+		struct StubResolver {
+			host_root: Utf8PathBuf,
+			server_root: Utf8PathBuf,
+		}
+		#[async_trait::async_trait]
+		impl ShellResolver for StubResolver {
+			async fn resolve(&self, _host_root: &Utf8Path) -> ShellTarget {
+				ShellTarget::Container {
+					container_name: "moon-ws-test-dev-1".into(),
+					host_root: self.host_root.clone(),
+					server_root: self.server_root.clone(),
+				}
+			}
+		}
+		let basename = root.file_name().unwrap_or("workspace").to_string();
+		let resolver = ShellResolverHandle::new(std::sync::Arc::new(StubResolver {
+			host_root: root.clone(),
+			server_root: Utf8PathBuf::from(format!("/workspace/{basename}")),
+		}));
+
+		// Drop a Cargo.toml so the rustfmt fallback emits the
+		// detected `--edition` flag — same wire shape the user
+		// will see in `~/code/workloads`.
+		std::fs::write(
+			dir.path().join("Cargo.toml"),
+			"[package]\nname = \"x\"\nedition = \"2024\"\n",
+		)
+		.unwrap();
+
+		let host = LocalHost::new(root.clone()).with_shell_resolver(resolver);
+		host.save_file(Utf8Path::new("a.rs"), "hello\n").await.unwrap();
+
+		// Argv verifies the wire shape: `exec -w <translated_cwd>
+		// <name> rustfmt --edition 2024 <translated_abs>`. No
+		// `-it` (captured I/O).
+		let argv = std::fs::read_to_string(argv_log.as_std_path()).unwrap();
+		let lines: Vec<&str> = argv.lines().collect();
+		assert_eq!(
+			lines,
+			vec![
+				"exec",
+				"-w",
+				format!("/workspace/{basename}").as_str(),
+				"moon-ws-test-dev-1",
+				"rustfmt",
+				"--edition",
+				"2024",
+				format!("/workspace/{basename}/a.rs").as_str(),
+			]
+		);
+	}
+
+	/// Lint-staged still wins over the language-default fallback. With
+	/// a `.lintstagedrc.json` that maps `*.rs` to a marker script and
+	/// a fake `rustfmt` on PATH, only the marker should run — proving
+	/// that adding a default-formatter row never overrides an explicit
+	/// team config.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn save_file_lint_staged_wins_over_default_formatter() {
+		let dir = TempDir::new().unwrap();
+		let h = host(&dir);
+
+		write_executable_script(
+			&dir.path().join("marker.sh"),
+			"#!/bin/sh\nprintf 'lint-staged-ran' > \"$1\"\n",
+		);
+		std::fs::write(dir.path().join(".lintstagedrc.json"), r#"{ "*.rs": "./marker.sh" }"#).unwrap();
+
+		// Fake rustfmt that would clobber the file with a different
+		// marker — must NOT run because lint-staged matched first.
+		// `--edition <e>` lands in `$1..$2`, so reach for the
+		// last positional with the same `for` trick the
+		// fallback test uses.
+		let bin = dir.path().join("node_modules").join(".bin");
+		std::fs::create_dir_all(&bin).unwrap();
+		write_executable_script(
+			&bin.join("rustfmt"),
+			"#!/bin/sh\nfor f in \"$@\"; do :; done\nprintf 'rustfmt-ran' > \"$f\"\n",
+		);
+
+		h.save_file(Utf8Path::new("a.rs"), "hello\n").await.unwrap();
+		let on_disk = std::fs::read_to_string(dir.path().join("a.rs")).unwrap();
+		assert!(
+			on_disk.contains("lint-staged-ran"),
+			"lint-staged should have won; got: {on_disk:?}"
+		);
+		assert!(
+			!on_disk.contains("rustfmt-ran"),
+			"rustfmt fallback should not have fired; got: {on_disk:?}"
+		);
 	}
 }

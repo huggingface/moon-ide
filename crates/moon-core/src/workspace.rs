@@ -11,10 +11,11 @@
 use camino::Utf8PathBuf;
 use moon_protocol::workspace::{HostKind, Workspace as WorkspaceRecord, WorkspaceFolder, WorkspaceId};
 use moon_protocol::{MoonError, MoonResult};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 
 use crate::host::{LocalHost, WorkspaceHost};
+use crate::shell::ShellResolverHandle;
 
 /// Fixed ID of the singleton workspace until Phase 7 introduces named
 /// workspaces. Surfaced as a constant so downstream code (container
@@ -40,6 +41,16 @@ impl std::fmt::Debug for WorkspaceFolderEntry {
 #[derive(Default)]
 pub struct WorkspaceRegistry {
 	inner: RwLock<RegistryInner>,
+	/// Optional resolver used to give each new folder's
+	/// [`LocalHost`] the right shell target for format-on-save.
+	/// `OnceLock` (not a constructor argument) breaks the
+	/// chicken-and-egg between `Arc<WorkspaceRegistry>` and
+	/// resolvers that themselves want a `Weak<WorkspaceRegistry>`
+	/// to read the current bound-folder set. The Tauri layer sets
+	/// this exactly once at startup, before adding any folders;
+	/// `add_folder` reads it on each call so subsequent folders
+	/// inherit the same routing.
+	shell_resolver: OnceLock<ShellResolverHandle>,
 }
 
 #[derive(Default)]
@@ -51,6 +62,15 @@ struct RegistryInner {
 impl WorkspaceRegistry {
 	pub fn new() -> Self {
 		Self::default()
+	}
+
+	/// Install the [`ShellResolverHandle`] every subsequently-added
+	/// folder's [`LocalHost`] picks up. First call wins; later
+	/// calls are silently ignored — wiring belongs in the startup
+	/// path, not in handlers. The handle is cloned per folder so
+	/// every host shares the same resolver instance.
+	pub fn set_shell_resolver(&self, handle: ShellResolverHandle) {
+		let _ = self.shell_resolver.set(handle);
 	}
 
 	/// Add `path` as a folder in the workspace and make it active.
@@ -83,9 +103,13 @@ impl WorkspaceRegistry {
 			name,
 			host: HostKind::Local,
 		};
+		let mut local = LocalHost::new(canonical);
+		if let Some(resolver) = self.shell_resolver.get() {
+			local = local.with_shell_resolver(resolver.clone());
+		}
 		let entry = Arc::new(WorkspaceFolderEntry {
 			folder,
-			host: Arc::new(LocalHost::new(canonical)),
+			host: Arc::new(local),
 		});
 		inner.folders.push(entry.clone());
 		inner.active_folder_path = Some(canonical_str);

@@ -54,6 +54,140 @@ the absolute file path as the last positional argument, let the tool
 mutate the file in place. Drop the `KnownTool` allow-list, drop the
 mode-flag stripping, drop the stdin/stdout plumbing.
 
+### Container routing (added 2026-05-07)
+
+Format-on-save shells out to a binary that's expected to mutate the
+file in place. moon-ide runs on the host even when the active folder
+is bind-mounted into the workspace shell container — so a host-side
+spawn happens in the _wrong userland_: stable rustfmt instead of the
+container's nightly, system-wide `prettier` instead of the project's
+pinned one, the host's edition resolution instead of `Cargo.toml`'s.
+This is exactly the situation [ADR 0002 — workspace host](0002-workspace-host.md)
+exists to avoid; the LSP layer
+([ADR 0007 / `specs/lsp.md` § container-backed LSP](../lsp.md))
+and the agent's `bash` tool ([phase-06-coder.md](../roadmaps/phase-06-coder.md))
+already route through the container the same way.
+
+[`moon_core::shell::ShellTarget`](../../crates/moon-core/src/shell.rs)
+unifies the spawn boundary:
+
+- `ShellTarget::Host` → `Command::new(bin)` with the existing
+  `node_modules/.bin/`-walking `PATH` prefix.
+- `ShellTarget::Container { container_name, host_root, server_root }`
+  → `docker exec -w <container_cwd> <name> <bin> <args> <abs_in_container>`.
+  Paths translate through the bind mount (`/workspace/<basename>/...`)
+  the same way [`TerminalTarget::container_cwd_for_folder`](../../crates/moon-terminal/src/target.rs)
+  resolves them for terminals; if the file isn't under the mount the
+  formatter silently no-ops with a `tracing::warn!`. No `-it`: format-
+  on-save wants captured output, not a TTY (same shape the agent's
+  `bash` tool uses, and the inverse of LSP's `-i` only — LSP needs
+  stdin open for JSON-RPC).
+
+A [`ShellResolver`](../../crates/moon-core/src/shell.rs) trait sits in
+`moon-core` so the format pipeline doesn't depend on `moon-container`
+or docker. `WorkspaceRegistry` carries an `OnceLock<ShellResolverHandle>`
+that gets installed once at startup; every `LocalHost::new` built
+afterwards picks it up. The Tauri-side implementation lives in
+[`src-tauri/src/shell_resolver.rs`](../../src-tauri/src/shell_resolver.rs)
+and mirrors `commands::lsp::resolve_target` /
+`moon_coder::tools::resolve_bash_target` line-for-line: build a
+`ContainerWorkspace` from the current bound-folder set, query its
+lifecycle status, return `Container` only when the project is
+`Running`. Any failure (no compose project, daemon unreachable, parse
+error) collapses to `Host` — format-on-save is best-effort and a
+container hiccup must never make it worse than the host-only baseline.
+
+A future cleanup can collapse the three `resolve_*_target` copies (LSP
+broker, coder bash, format-on-save) into the same trait. The current
+duplication is intentional: each layer grew the routing inline at a
+different time, and consolidating them is its own change.
+
+#### What stays on the host
+
+The in-container `PATH` is the container image's responsibility (today:
+`moon-base`'s rustup install, system bins). We deliberately don't
+forward the host's `node_modules/.bin/` chain via `--env PATH=…`:
+docker's `--env` _replaces_ the in-container `PATH` rather than
+prepending, which would lose the system bins the user's lint-staged
+commands depend on. Project-local `node_modules/.bin/` discovery on
+the container side is a deferred enhancement — flag it via container-
+image PATH, or wrap the spawn in `sh -lc` when a real project needs
+it. The host-side walk still happens for `ShellTarget::Host`.
+
+#### What this does NOT solve
+
+- **Format-on-save running in `moon-remote`.** The remote sidecar grows
+  its own `WorkspaceHost` impl in Phase 2; the same `ShellTarget` /
+  `ShellResolver` machinery applies there, with a different resolver
+  picking the in-sidecar shell. No change required to the format
+  pipeline itself.
+- **A truly different toolchain per bound folder.** If two folders
+  bind into the same workspace shell with conflicting toolchains, the
+  one moon-base ships wins. That's a workspace-shell concern, not a
+  format-on-save one.
+
+### Language-default fallback (added 2026-05-07)
+
+lint-staged is the team's per-repo source of truth for _which_ tool runs
+on save. Most of the team's projects ship a `.lintstagedrc.json` (or a
+`package.json#lint-staged`) and that's the whole story. A few don't:
+`~/code/workloads` is pure Rust + Cargo, has no JS toolchain, and the
+team has no reason to add lint-staged just to wire format-on-save.
+Telling each Rust-only repo "drop a `.lintstagedrc.json` even though
+nothing else uses it" is the kind of dead config the bootstrap rule
+([ADR 0005](0005-bootstrap.md)) tells us to avoid.
+
+`LocalHost::run_formatter_chain` therefore has two layers:
+
+1. **lint-staged** wins whenever it has a matching rule for the file.
+   Identical behaviour to "before" — the team's `.lintstagedrc.json`
+   stays the source of truth wherever it exists.
+2. **Language-default formatter**, looked up by file extension in
+   [`format::default_format_command`], fires only when (1) didn't apply
+   (no config in the workspace, or a config that doesn't list the
+   file's extension).
+
+Today's table is one row:
+
+| extension | command                 |
+| --------- | ----------------------- |
+| `.rs`     | `rustfmt --edition <e>` |
+
+`rustfmt` walks up from each input file looking for `rustfmt.toml` /
+`.rustfmt.toml`. The edition we have to discover ourselves: bare
+`rustfmt <file>` defaults to **edition 2015** because rustfmt only
+reads `Cargo.toml` for the edition when invoked through `cargo fmt`.
+Edition 2015 rejects `async fn`, `let-else`, every modern Rust
+feature — so without `--edition` the fallback fails on every
+realistic crate.
+
+The Rust path therefore walks parents from the file looking for the
+nearest `Cargo.toml` whose `[package]` table declares an `edition`
+(workspace-only manifests are skipped because rustfmt operates per
+crate). Detected edition is forwarded as `--edition <value>`. When
+no `Cargo.toml` matches we default to `2024` — modern projects pick
+up the right edition, older crates with `edition = "2018"` declared
+explicitly still work, and the only loser is a hypothetical edition-
+2015-only crate without a `[package].edition` line, which would fall
+through to today's defaults anyway.
+
+`cargo fmt` was the obvious alternative — it handles edition lookup
+itself — but it formats the _whole package_ per call, so saving one
+file would reformat every other dirty file in the same crate.
+Per-file formatting matters because the editor's "the file you
+saved looks different from what you saved" UX hinges on it.
+
+The subprocess runs with the file's parent directory as `cwd`,
+matching what a shell invocation from that directory would resolve.
+When `rustfmt` isn't installed the existing "tool not found" warning
+fires and the file keeps its editorconfig-normalised bytes.
+
+Per AGENTS.md "hardcode first, configure later" we add a row when a
+project the team uses needs one. The table is **not** an allow-list:
+adding a row never overrides an explicit lint-staged config (lint-staged
+matches first). Removing a row stops the fallback for that extension
+without affecting any team config.
+
 ### Chain-truncation caveat (current state, 2026-05-07)
 
 The intended end state is "run every command in the matched chain in
@@ -97,10 +231,15 @@ flowchart LR
     save_file[host.save_file] --> editorconfig[editorconfig pre-save]
     editorconfig --> write[host.write_file]
     write --> chain{lint-staged rule?}
-    chain -- yes --> cmd1[command 1: bin args... abs_path]
-    cmd1 --> cmd2[command 2: ...]
-    cmd2 --> stat[re-stat for response]
-    chain -- no --> done[return]
+    chain -- yes --> resolve[resolve ShellTarget]
+    chain -- no --> default{default for ext?}
+    default -- yes --> resolve
+    default -- no --> done[return]
+    resolve --> spawn{Host or Container?}
+    spawn -- Host --> hostcmd[bin args... abs_host_path]
+    spawn -- Container --> dockercmd[docker exec -w cwd name bin args... abs_in_container]
+    hostcmd --> stat[re-stat for response]
+    dockercmd --> stat
     stat --> done
 ```
 
