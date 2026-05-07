@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { coder } from '../coder.svelte';
 	import { projectCompose, projectComposeStateLabel } from '../projectCompose.svelte';
 	import { workspace } from '../state.svelte';
 	import ContainerIcon from './icons/ContainerIcon.svelte';
@@ -9,8 +10,15 @@
 	// it active, hover for the `×` (remove) button, click the `+` to
 	// pick another folder.
 	//
-	// Each row exposes two passive readouts about the folder:
+	// Each row exposes three passive readouts about the folder:
 	//
+	// - **Agent-running pip** — a pulsing accent dot rendered
+	//   between the chevron and the folder name when the coder
+	//   has a turn in flight against that folder. Lets the user
+	//   notice a background turn (sub-agent, just-launched parent
+	//   in a non-active folder, …) without having to switch
+	//   active folder. Reads through `coder.busyForFolder` so the
+	//   pip tracks the bucket's `busy` `$state` reactively.
 	// - **Git change badges** (`+N ~N -N`) — added / modified /
 	//   deleted counts pulled from the per-folder
 	//   `gitChangeSummaries` map. Refreshed on workspace hydrate,
@@ -65,16 +73,20 @@
 		{@const modified = summary?.modified ?? 0}
 		{@const deleted = summary?.deleted ?? 0}
 		{@const hasChanges = added + modified + deleted > 0}
+		{@const agentRunning = coder.busyForFolder(folder.path)}
 		<li class="bar" class:active={isActive}>
 			<button
 				type="button"
 				class="bar-button"
-				title={folder.path}
+				title={agentRunning ? `${folder.path}\n(agent running)` : folder.path}
 				aria-current={isActive ? 'true' : undefined}
 				aria-expanded={isActive}
 				onclick={() => void workspace.setActiveFolder(folder.path)}
 			>
 				<span class="chev" aria-hidden="true">{isActive ? '▾' : '▸'}</span>
+				{#if agentRunning}
+					<span class="agent-pip" aria-label="Agent running" title="Agent running"></span>
+				{/if}
 				<span class="name">{folder.name}</span>
 			</button>
 			{#if hasChanges}
@@ -202,6 +214,34 @@
 		color: var(--m-fg-muted);
 		font-size: 10px;
 		text-align: center;
+	}
+	/* Agent-running pip — a small pulsing accent dot between the
+	   chevron and the folder name. Only renders while a turn is
+	   in flight for this folder, so the bar doesn't carry an
+	   always-empty placeholder when nothing's running. The
+	   `flex-shrink: 0` keeps it from being squeezed on narrow
+	   sidebars; `box-shadow` with the accent at low alpha gives
+	   a subtle halo that reads as "live" without screaming. */
+	.agent-pip {
+		flex-shrink: 0;
+		display: inline-block;
+		width: 7px;
+		height: 7px;
+		border-radius: 50%;
+		background: var(--m-accent);
+		box-shadow: 0 0 0 2px color-mix(in srgb, var(--m-accent) 28%, transparent);
+		animation: agent-pip-pulse 1.4s ease-in-out infinite;
+	}
+	@keyframes agent-pip-pulse {
+		0%,
+		100% {
+			opacity: 1;
+			transform: scale(1);
+		}
+		50% {
+			opacity: 0.55;
+			transform: scale(0.8);
+		}
 	}
 	.name {
 		flex: 1;

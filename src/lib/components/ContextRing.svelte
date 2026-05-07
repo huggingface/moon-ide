@@ -38,11 +38,28 @@
 	});
 
 	// SVG ring geometry: the stroke width is a fraction of the
-	// radius so the ring looks correct at every size.
+	// radius so the ring looks correct at every size. We pin
+	// `pathLength = 100` on the fill circle so the dasharray
+	// math is in plain percent — a `dash` of `42` means "fill 42%
+	// of the ring" regardless of `radius`. Without this the
+	// dasharray was in user units (≈ 47 at size 18); a 1 %
+	// ratio came out as a 0.47-unit dash that the round-cap
+	// geometry effectively erased.
 	const stroke = $derived(Math.max(2, Math.round(size * 0.18)));
 	const radius = $derived((size - stroke) / 2);
-	const circumference = $derived(2 * Math.PI * radius);
-	const dash = $derived(circumference * ratio);
+	// Clamp the visible arc to at least 6 % of the ring whenever
+	// any prompt tokens have been billed — a fresh session at
+	// 1-3 % of context window was rendering as a sub-pixel arc
+	// that disappeared into the track. Above the clamp the arc
+	// is exact; below it we show a "something is filling" nub
+	// and the tooltip carries the precise percentage.
+	const dash = $derived.by(() => {
+		if (!usage || ratio <= 0) {
+			return 0;
+		}
+		const minVisible = 6;
+		return Math.max(minVisible, ratio * 100);
+	});
 
 	function formatKilo(n: number): string {
 		if (n < 1000) {
@@ -112,7 +129,8 @@
 				stroke="currentColor"
 				stroke-width={stroke}
 				stroke-linecap="round"
-				stroke-dasharray="{dash} {circumference}"
+				pathLength="100"
+				stroke-dasharray="{dash} {100 - dash}"
 				transform="rotate(-90 {size / 2} {size / 2})"
 				class="fill"
 			/>
@@ -131,17 +149,22 @@
 	.track {
 		opacity: 0.18;
 	}
+	/* Tone palette uses repo theme tokens (`--m-*`) so the ring
+	   tracks the active light/dark theme. Each token has a
+	   reasonable hex fallback for the no-theme-loaded case (e.g.
+	   the splash) — those values were what the old `--text-muted`
+	   alias was implicitly resolving to via the fallback. */
 	.tone-idle {
-		color: var(--text-muted, #888);
+		color: var(--m-fg-muted, #9aa3b9);
 	}
 	.tone-muted {
-		color: var(--text-muted, #888);
+		color: var(--m-fg-muted, #9aa3b9);
 	}
 	.tone-warning {
-		color: var(--warning, #d4a017);
+		color: var(--m-warning, #d4a017);
 	}
 	.tone-danger {
-		color: var(--danger, #c62828);
+		color: var(--m-danger, #c62828);
 	}
 	.pulse {
 		animation: ring-pulse 1.6s ease-in-out infinite;

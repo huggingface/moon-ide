@@ -1423,19 +1423,55 @@ async fn kick_off_summary_refresh(state: &Arc<CoderState>, _sink: &FolderEventSi
 	}
 }
 
-/// Build the parent's system prompt: base text from
-/// [`PHASE_6_0_SYSTEM_PROMPT`] plus a "Bound folders" section iff
-/// any bound folder has a cached description. Folders without
-/// cached descriptions render as `(summary still generating)` so
-/// the model knows the folder *exists* but doesn't yet have
-/// metadata to reason about.
+/// Build the parent's system prompt. Sections are concatenated in
+/// this order:
+///
+/// 1. Base text from [`PHASE_6_0_SYSTEM_PROMPT`].
+/// 2. **Project rules** — verbatim contents of `AGENTS.md` (or
+///    `CLAUDE.md` as a fallback) from the *active* folder root.
+///    Projects that came from the Claude / Anthropic ecosystem
+///    name their agent-rules file `CLAUDE.md`; we treat that as
+///    equivalent. Both are matched case-insensitively, capped at
+///    [`AGENT_RULES_MAX_BYTES`], and truncated with a sentinel so
+///    the model knows the file was clipped.
+/// 3. **Bound folders** section, listing every bound folder with
+///    its 2–3 sentence cached description. Skipped entirely when
+///    no folder has a cached description yet — folders without
+///    caches render as `(summary still generating)` once the
+///    section is emitted.
+///
+/// All sections are byte-stable across turns when their inputs
+/// haven't changed (project rules byte-stable until the user
+/// edits the file; folder summaries byte-stable until the user
+/// edits a manifest), so the inference router's prefix cache
+/// keeps hitting on the system-prompt prefix.
 async fn compose_system_prompt(
 	folders: &[Arc<WorkspaceFolderEntry>],
 	active_path: Option<&str>,
 	summaries: &Arc<FolderSummaryService>,
 ) -> String {
+	let mut out = String::with_capacity(PHASE_6_0_SYSTEM_PROMPT.len() + 1024);
+	out.push_str(PHASE_6_0_SYSTEM_PROMPT);
+	if !out.ends_with('\n') {
+		out.push('\n');
+	}
+
+	if let Some(active) = active_path {
+		if let Some(rules) = read_agent_rules(Utf8Path::new(active)).await {
+			out.push('\n');
+			out.push_str("## Project rules\n\n");
+			out.push_str(
+				"Verbatim contents of `AGENTS.md` (or `CLAUDE.md` as a fallback) from the active folder. Treat these as authoritative project conventions — they override anything in the base prompt above when the two disagree.\n\n",
+			);
+			out.push_str(&rules);
+			if !out.ends_with('\n') {
+				out.push('\n');
+			}
+		}
+	}
+
 	if folders.is_empty() {
-		return PHASE_6_0_SYSTEM_PROMPT.to_string();
+		return out;
 	}
 	// Look up cached summaries up-front so the rendered section
 	// never half-blocks on disk reads inside a `for` loop.
@@ -1457,12 +1493,7 @@ async fn compose_system_prompt(
 	// the model already knows it has one folder via the active
 	// context elsewhere.
 	if !any_cached {
-		return PHASE_6_0_SYSTEM_PROMPT.to_string();
-	}
-	let mut out = String::with_capacity(PHASE_6_0_SYSTEM_PROMPT.len() + 512);
-	out.push_str(PHASE_6_0_SYSTEM_PROMPT);
-	if !out.ends_with('\n') {
-		out.push('\n');
+		return out;
 	}
 	out.push('\n');
 	out.push_str("## Bound folders\n\n");
@@ -1486,6 +1517,80 @@ async fn compose_system_prompt(
 		out.push('\n');
 	}
 	out
+}
+
+/// Filenames we accept as "the active folder's project rules", in
+/// preference order. AGENTS.md is the convention this repo uses
+/// (and the one the broader agent ecosystem has been converging
+/// on); CLAUDE.md is the Anthropic / Claude Code convention. We
+/// take whichever exists, AGENTS.md winning when both are
+/// present so a project that ships both has one canonical source.
+///
+/// Casing matches `folder_summary::CANONICAL_MANIFEST_NAMES` —
+/// case-insensitive against the on-disk listing — so `agents.md`
+/// / `CLAUDE.MD` / `Claude.md` all resolve.
+const AGENT_RULES_NAMES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
+
+/// Cap on the agent-rules section. Larger files get truncated
+/// with a `... (truncated)` sentinel so the model can still draw
+/// signal from the prefix. 20 KB lines up with the most-favoured
+/// agent-rules size we've seen in practice (low-thousand-word
+/// AGENTS.md files) without bloating the system prompt for repos
+/// that ship a sprawling 100 KB file.
+const AGENT_RULES_MAX_BYTES: usize = 20_000;
+
+/// Read `AGENTS.md` (or `CLAUDE.md` as a fallback) from
+/// `folder_root`. Case-insensitive against the top-level listing.
+/// Returns `None` when neither file exists, the read fails, or the
+/// file is empty after trimming.
+///
+/// Walking up parent dirs (a la `.editorconfig` / `git`) is
+/// deliberately deferred — most users keep their agent rules at
+/// the project root, and the spec note in [`specs/coder.md`] §
+/// "What the LLM sees as system prompt" calls for parent walk in
+/// 6.6. Today's behaviour is "active folder root only" until
+/// somebody actually has a multi-level AGENTS.md hierarchy that
+/// matters.
+async fn read_agent_rules(folder_root: &Utf8Path) -> Option<String> {
+	let mut by_lower: HashMap<String, std::path::PathBuf> = HashMap::new();
+	if let Ok(mut iter) = tokio::fs::read_dir(folder_root.as_std_path()).await {
+		while let Ok(Some(entry)) = iter.next_entry().await {
+			let file_name = entry.file_name();
+			let Some(name_str) = file_name.to_str() else {
+				continue;
+			};
+			by_lower.insert(name_str.to_lowercase(), entry.path());
+		}
+	}
+	for canonical in AGENT_RULES_NAMES {
+		let Some(path) = by_lower.get(&canonical.to_lowercase()) else {
+			continue;
+		};
+		let bytes = tokio::fs::read(path).await.ok()?;
+		if bytes.is_empty() {
+			continue;
+		}
+		let truncated = bytes.len() > AGENT_RULES_MAX_BYTES;
+		let slice = if truncated {
+			&bytes[..AGENT_RULES_MAX_BYTES]
+		} else {
+			&bytes[..]
+		};
+		// Lossy is fine — agent-rules files are human-edited Markdown;
+		// any bad bytes are an authoring bug and the model can cope.
+		let mut text = String::from_utf8_lossy(slice).into_owned();
+		if text.trim().is_empty() {
+			continue;
+		}
+		if truncated {
+			if !text.ends_with('\n') {
+				text.push('\n');
+			}
+			text.push_str("\n... (truncated)\n");
+		}
+		return Some(text);
+	}
+	None
 }
 
 /// Append an `Assistant` record to the JSONL of the given
@@ -2142,6 +2247,81 @@ mod tests {
 		let p2 = build_branch_name_prompt("Add tail param", " src/foo.py | 4 ++--\n 1 file changed");
 		assert!(p2.contains("Add tail param"));
 		assert!(p2.contains("src/foo.py"));
+	}
+
+	#[tokio::test]
+	async fn read_agent_rules_returns_none_for_empty_folder() {
+		let dir = tempfile::TempDir::new().unwrap();
+		let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+		assert!(read_agent_rules(&root).await.is_none());
+	}
+
+	#[tokio::test]
+	async fn read_agent_rules_returns_agents_md_when_present() {
+		let dir = tempfile::TempDir::new().unwrap();
+		std::fs::write(dir.path().join("AGENTS.md"), "# Agent rules\n- be concise\n").unwrap();
+		let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+		let rules = read_agent_rules(&root).await.expect("AGENTS.md should be picked up");
+		assert!(rules.contains("# Agent rules"));
+		assert!(rules.contains("be concise"));
+	}
+
+	#[tokio::test]
+	async fn read_agent_rules_falls_back_to_claude_md_when_agents_md_missing() {
+		let dir = tempfile::TempDir::new().unwrap();
+		std::fs::write(
+			dir.path().join("CLAUDE.md"),
+			"# Project conventions\nUse 4-space tabs.\n",
+		)
+		.unwrap();
+		let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+		let rules = read_agent_rules(&root)
+			.await
+			.expect("CLAUDE.md should be picked up as fallback");
+		assert!(rules.contains("Project conventions"));
+	}
+
+	#[tokio::test]
+	async fn read_agent_rules_prefers_agents_md_when_both_present() {
+		let dir = tempfile::TempDir::new().unwrap();
+		std::fs::write(dir.path().join("AGENTS.md"), "from-agents\n").unwrap();
+		std::fs::write(dir.path().join("CLAUDE.md"), "from-claude\n").unwrap();
+		let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+		let rules = read_agent_rules(&root).await.unwrap();
+		assert!(rules.contains("from-agents"));
+		assert!(!rules.contains("from-claude"));
+	}
+
+	#[tokio::test]
+	async fn read_agent_rules_matches_case_insensitively() {
+		let dir = tempfile::TempDir::new().unwrap();
+		std::fs::write(dir.path().join("Claude.md"), "# rules\n").unwrap();
+		let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+		assert!(read_agent_rules(&root).await.is_some());
+	}
+
+	#[tokio::test]
+	async fn read_agent_rules_truncates_oversized_files_with_sentinel() {
+		let dir = tempfile::TempDir::new().unwrap();
+		// Build something larger than the cap. ASCII-only so byte
+		// length and char length match for the assertion below.
+		let body = "x".repeat(AGENT_RULES_MAX_BYTES + 1_000);
+		std::fs::write(dir.path().join("AGENTS.md"), &body).unwrap();
+		let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+		let rules = read_agent_rules(&root).await.unwrap();
+		assert!(rules.contains("... (truncated)"));
+		assert!(rules.len() < body.len());
+	}
+
+	#[tokio::test]
+	async fn read_agent_rules_skips_empty_files() {
+		let dir = tempfile::TempDir::new().unwrap();
+		std::fs::write(dir.path().join("AGENTS.md"), "").unwrap();
+		std::fs::write(dir.path().join("CLAUDE.md"), "# fallback\n").unwrap();
+		let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+		// Empty AGENTS.md falls through to CLAUDE.md.
+		let rules = read_agent_rules(&root).await.unwrap();
+		assert!(rules.contains("fallback"));
 	}
 
 	#[test]

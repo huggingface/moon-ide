@@ -278,6 +278,18 @@ class CoderPanelState {
 		return false;
 	}
 
+	/** "Is the agent currently running a turn for this folder?"
+	 *  Used by the project-bar to surface a pulsing pip when a
+	 *  background turn is mid-flight in a folder the user isn't
+	 *  currently viewing. Goes through `bucketFor` (not a raw
+	 *  `byFolder.get`) so the read sets up reactivity on the
+	 *  bucket's `busy` `$state`; the consequent lazy-create of
+	 *  an empty bucket per bound folder is cheap (a handful of
+	 *  null fields). */
+	busyForFolder(folder: string): boolean {
+		return this.bucketFor(folder).busy;
+	}
+
 	// Per-folder field forwards. Components keep reading
 	// `coder.rows`, `coder.busy`, etc. unchanged — the indirection
 	// through `current` keeps them on the right bucket while the

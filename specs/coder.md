@@ -394,9 +394,17 @@ Concatenated, in this order, with `\n\n` between sections:
 1. Hardcoded base prompt (workspace-aware): "You are moon-coder,
    the coding agent built into moon-ide. The user is working on
    …; here are the tools you have …".
-2. **`AGENTS.md`** from the active workspace root, walked up
-   parent dirs (a la `.editorconfig` / `git`). Same convention
-   the rest of the agent ecosystem uses.
+2. **`AGENTS.md`** from the active workspace root, with
+   **`CLAUDE.md`** as a fallback for projects that came from the
+   Claude / Anthropic ecosystem. Both are matched case-insensitively
+   against the folder's top-level entries; AGENTS.md wins when
+   both are present so a project that ships both has one
+   canonical source. Verbatim contents up to a 20 KB cap, then a
+   `... (truncated)` sentinel so the model knows it didn't see
+   the tail. Walked-up parent dirs (a la `.editorconfig` / `git`)
+   is on the 6.6 work list — today the read is "active folder
+   root only" since that's where every team we've seen actually
+   keeps these files.
 3. `<workspace>/.moon/SYSTEM.md` if present (project-specific
    override — used to extend, not replace, the base prompt).
 4. **Skills** discovered from these directories under the active
