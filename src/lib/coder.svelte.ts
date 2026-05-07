@@ -144,6 +144,19 @@ export type ComposerAttachment = {
 class FolderViewState {
 	rows = $state<CoderRow[]>([]);
 	busy = $state(false);
+	/** "An agent in this folder finished a turn while the user
+	 *  wasn't looking, and they haven't visited the folder
+	 *  since." Drives the static amber sparkle on the folder bar
+	 *  for non-active projects with completed work, so a user
+	 *  juggling background agents notices "that one's done"
+	 *  without needing the panel open. Set on
+	 *  `turn_complete` / `aborted` / `error` only for buckets
+	 *  whose folder is not currently active (an active-folder
+	 *  completion is something the user is already looking at).
+	 *  Cleared in [`setActiveFolder`] when the user switches to
+	 *  the folder. Process-local; no need to persist across
+	 *  restarts. */
+	attentionPending = $state(false);
 	activeSession = $state<CoderSessionSummary | null>(null);
 	view = $state<CoderView>('session');
 	viewSubagentId = $state<string | null>(null);
@@ -305,6 +318,15 @@ class CoderPanelState {
 	 *  null fields). */
 	busyForFolder(folder: string): boolean {
 		return this.bucketFor(folder).busy;
+	}
+
+	/** "Has an agent in this folder finished a turn that the user
+	 *  hasn't seen yet?" Same per-folder shape as [`busyForFolder`].
+	 *  The folder bar reads through this so a switch back to the
+	 *  folder (which clears the flag in [`setActiveFolder`]) re-
+	 *  renders the bar without the badge. */
+	attentionPendingForFolder(folder: string): boolean {
+		return this.bucketFor(folder).attentionPending;
 	}
 
 	// Per-folder field forwards. Components keep reading
@@ -644,6 +666,18 @@ class CoderPanelState {
 	 *  into its own bucket in the background. */
 	setActiveFolder(path: string | null): void {
 		this.activeFolderPath = path;
+		// Clear any "agent finished, not seen yet" badge on the
+		// folder we're switching to — the user is now looking
+		// (or about to look). We only consult an existing bucket
+		// rather than `bucketFor` so we don't lazy-create empty
+		// buckets on every folder switch; a folder with no bucket
+		// has no flag to clear by definition.
+		if (path !== null) {
+			const bucket = this.byFolder.get(path);
+			if (bucket !== undefined && bucket.attentionPending) {
+				bucket.attentionPending = false;
+			}
+		}
 	}
 
 	async wireRuntime(): Promise<void> {
@@ -825,6 +859,29 @@ class CoderPanelState {
 	 *    backend's tagging contract), so a sub-agent's
 	 *    transcript builds up in the same bucket as the parent
 	 *    that spawned it. */
+	/** Flip a bucket's `attentionPending` flag to `true` iff this
+	 *  is a *background* completion — i.e. a turn that ended
+	 *  while the user was looking at a different folder (or no
+	 *  folder at all). An active-folder turn-end doesn't need
+	 *  the badge: the user is already on the panel, the result
+	 *  is already on screen, and lighting up an "agent finished"
+	 *  cue would just be visual noise.
+	 *
+	 *  The `NO_FOLDER_KEY` guard suppresses the badge for the
+	 *  pre-bind sentinel bucket: a turn that completed before
+	 *  any folder was active can't be associated with a folder
+	 *  bar to render on, so the flag would be dead state. */
+	#flagAttentionIfBackground(bucket: FolderViewState, folder: string): void {
+		if (folder === NO_FOLDER_KEY) {
+			return;
+		}
+		const active = this.activeFolderPath ?? NO_FOLDER_KEY;
+		if (folder === active) {
+			return;
+		}
+		bucket.attentionPending = true;
+	}
+
 	#dispatchEnvelope(envelope: CoderEventEnvelope): void {
 		if (envelope.event.kind === 'folder_summary_ready') {
 			const next = new Map(this.folderDescriptions);
@@ -909,10 +966,12 @@ class CoderPanelState {
 				return;
 			case 'turn_complete':
 				bucket.busy = false;
+				this.#flagAttentionIfBackground(bucket, folder);
 				return;
 			case 'aborted':
 				bucket.busy = false;
 				bucket.rows = [...bucket.rows, { kind: 'aborted', id: `aborted-${Date.now()}` }];
+				this.#flagAttentionIfBackground(bucket, folder);
 				return;
 			case 'error':
 				bucket.busy = false;
@@ -924,6 +983,7 @@ class CoderPanelState {
 						text: event.message,
 					},
 				];
+				this.#flagAttentionIfBackground(bucket, folder);
 				return;
 			case 'session_loaded':
 				// Reset the bucket's transcript and adopt the new

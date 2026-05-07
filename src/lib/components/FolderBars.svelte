@@ -13,15 +13,21 @@
 	//
 	// Each row exposes three passive readouts about the folder:
 	//
-	// - **Agent-running glyph** — a pulsing AI sparkle rendered
-	//   right after the folder name when the coder has a turn in
-	//   flight against that folder. Lets the user notice a
-	//   background turn (sub-agent, just-launched parent in a
-	//   non-active folder, …) without having to switch active
-	//   folder. Sits in the same per-row column as the git badges
-	//   so it doesn't push the name around. Reads through
-	//   `coder.busyForFolder` so the glyph tracks the bucket's
-	//   `busy` `$state` reactively.
+	// - **Agent-state glyph** — an AI sparkle rendered right
+	//   after the folder name. Two states:
+	//     - **Running**: pulsing accent-coloured sparkle while a
+	//       turn is in flight for the folder (drives attention
+	//       through motion).
+	//     - **Finished, not seen**: static amber sparkle after
+	//       a turn ends in a *non-active* folder, persisting
+	//       until the user clicks that folder bar to switch
+	//       active. Lets a user juggling background agents see
+	//       "this one's done, look at it" without missing the
+	//       completion. Cleared in `coder.setActiveFolder`.
+	//   Sits in the same per-row column as the git badges so it
+	//   doesn't push the name around. Reads through
+	//   `coder.busyForFolder` and `coder.attentionPendingForFolder`
+	//   so the glyph tracks the bucket's reactive `$state`.
 	// - **Git change badges** (`+N ~N -N`) — added / modified /
 	//   deleted counts pulled from the per-folder
 	//   `gitChangeSummaries` map. Refreshed on workspace hydrate,
@@ -77,11 +83,17 @@
 		{@const deleted = summary?.deleted ?? 0}
 		{@const hasChanges = added + modified + deleted > 0}
 		{@const agentRunning = coder.busyForFolder(folder.path)}
+		{@const agentDone = !agentRunning && coder.attentionPendingForFolder(folder.path)}
+		{@const barTitle = agentRunning
+			? `${folder.path}\n(agent running)`
+			: agentDone
+				? `${folder.path}\n(agent finished — click to view)`
+				: folder.path}
 		<li class="bar" class:active={isActive}>
 			<button
 				type="button"
 				class="bar-button"
-				title={agentRunning ? `${folder.path}\n(agent running)` : folder.path}
+				title={barTitle}
 				aria-current={isActive ? 'true' : undefined}
 				aria-expanded={isActive}
 				onclick={() => void workspace.setActiveFolder(folder.path)}
@@ -89,7 +101,15 @@
 				<span class="chev" aria-hidden="true">{isActive ? '▾' : '▸'}</span>
 				<span class="name">{folder.name}</span>
 				{#if agentRunning}
-					<span class="agent-glyph" aria-label="Agent running" title="Agent running">
+					<span class="agent-glyph running" aria-label="Agent running" title="Agent running">
+						<SparklesIcon size={12} />
+					</span>
+				{:else if agentDone}
+					<span
+						class="agent-glyph done"
+						aria-label="Agent finished — switch to this folder to view"
+						title="Agent finished — click to view"
+					>
 						<SparklesIcon size={12} />
 					</span>
 				{/if}
@@ -220,21 +240,32 @@
 		font-size: 10px;
 		text-align: center;
 	}
-	/* Agent-running glyph — a pulsing AI sparkle that sits right
-	   after the folder name. Only renders while a turn is in
-	   flight for this folder, so the bar doesn't carry an
-	   always-empty placeholder when nothing's running. Same
-	   sparkles glyph the SCM panel uses for AI suggestions, so the
-	   "magic-is-happening" vocabulary stays consistent across the
-	   IDE. The accent colour + opacity pulse reads as "live"
-	   without the harsher scale/halo of the previous dot. */
+	/* Agent-state glyph — an AI sparkle right after the folder
+	   name. Same SparklesIcon the SCM panel uses for AI
+	   suggestions so the "magic-is-happening" vocabulary stays
+	   consistent across the IDE. Two variants:
+
+	   - `.running` — a turn is currently in flight for this
+	     folder. Accent colour + opacity pulse reads as "live"
+	     and earns the attention.
+	   - `.done` — a turn finished in this folder while the user
+	     was looking elsewhere, and the user hasn't visited the
+	     folder since. Amber colour, *no animation*: the work is
+	     done, so a pulse would over-claim attention; a static
+	     hue is enough to say "this one's waiting on you" at a
+	     glance. Clears as soon as the folder becomes active. */
 	.agent-glyph {
 		flex-shrink: 0;
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
+	}
+	.agent-glyph.running {
 		color: var(--m-accent);
 		animation: agent-glyph-pulse 1.4s ease-in-out infinite;
+	}
+	.agent-glyph.done {
+		color: var(--m-warning, var(--m-fg-muted));
 	}
 	@keyframes agent-glyph-pulse {
 		0%,
