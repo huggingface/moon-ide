@@ -1,32 +1,33 @@
 # Test plans
 
-Written test plans for non-trivial commits. Drafted **before** the commit, refined while the human is testing, and committed alongside the code change. Numbered like ADRs (`NNNN-short-slug.md`); numbers never reused.
+Written test plans for **major features and phase deliverables**. Drafted **before** the commit, refined while the human is testing, and committed alongside the code change. Numbered like ADRs (`NNNN-short-slug.md`); numbers never reused.
+
+Most commits don't get a test plan. That's the default. The rest of this file is the narrow set of cases where one is still worth writing.
 
 ## Why we keep them
 
 - They survive the conversation that produced them. Once a chat is gone, the why-and-how-to-test goes with it. A file in the repo doesn't.
 - They give a future agent something to reference when fixing a regression in the same area: "this is what was supposed to keep working".
 - They make `git blame` a useful starting point — find the file, find the commit, find the test plan.
-- They force us to write down the steps we'd otherwise rattle off in a chat reply, so the human reviewer doesn't have to reconstruct them.
 
 ## When to write one
 
 **Yes**:
 
 - Phase deliverables (one per phase, at minimum).
-- Any commit that adds, changes, or removes an IPC method, a Tauri command, or a `WorkspaceHost` trait method.
-- New UI surfaces (new component a user will interact with, new keybinding, new menu).
-- Bug fixes that cross more than one layer (UI ↔ core ↔ host).
-- Anything that introduces a new dependency or tool.
+- Major features that introduce a new top-level surface area or architectural layer (e.g. the coder, the container host, a new bound subsystem).
 
-**No**:
+**No** — skip the test plan, write a clear commit body instead:
 
+- Routine bug fixes, including cross-layer ones. The commit message + `git log -p` is enough.
+- New keybindings, menu items, or tweaks to an existing UI surface.
+- Single-file refactors and small protocol additions.
+- New dependencies, formatter / linter knobs, build-tool tweaks.
 - Pure formatting / lint-only changes.
-- Single-file refactors with no behavioral change.
 - Comment / doc-only changes.
 - Rename-only changes.
 
-When in doubt: write one. They are cheap.
+When in doubt: **skip**. The plans we already have are the historical record; new ones are cheap but not free, and most of what they used to capture is better answered by a clear commit body and the diff itself.
 
 ## Format
 

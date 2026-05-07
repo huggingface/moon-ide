@@ -14,7 +14,7 @@ This file is read by AI coding agents (Cursor, Claude Code, opencode, etc.) when
 - If a spec is wrong or incomplete and you fix the underlying code, **update the spec in the same change**.
 - New non-trivial decisions get a new ADR in `specs/decisions/NNNN-short-title.md`. Don't rewrite old ADRs; supersede them with a new one.
 - Keep specs short, opinionated, and current. They are not aspirational marketing.
-- Non-trivial commits get a **test plan** in `specs/test-plans/NNNN-short-slug.md` written before the commit (or while the human is testing). See [specs/test-plans/README.md](specs/test-plans/README.md) for what counts as non-trivial and the required headers.
+- **Major features and phase deliverables** get a test plan in `specs/test-plans/NNNN-short-slug.md`, written before the commit (or while the human is testing). Routine bug fixes, small UI tweaks, new keybindings, single-file refactors, and incremental polish **skip the test plan** — `git log -p` plus a clear commit body covers what changed. When in doubt, **skip**. See [specs/test-plans/README.md](specs/test-plans/README.md) for what still earns a plan and the required headers.
 
 ## House rules
 
@@ -83,4 +83,4 @@ These are enforced by reviewers and CI; breaking them is a real bug:
 - Commits should be atomic and tell a story; no "wip" or "fix" alone.
 - A change that touches both Rust and TS for the same feature lands in one commit.
 - Reference the spec/ADR you're implementing in the commit body when relevant.
-- Non-trivial commits also reference their test plan: `Test plan: specs/test-plans/NNNN-...md` in the commit body. The test plan file is part of the same commit.
+- When a commit ships with a test plan (major features / phase deliverables), reference it in the commit body: `Test plan: specs/test-plans/NNNN-...md`. The test plan file is part of the same commit. Most commits won't have one, and that's fine.

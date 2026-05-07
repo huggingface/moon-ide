@@ -13,7 +13,7 @@ Living design docs for moon-ide. Read these before changing the system. Update t
 - [roadmap.md](roadmap.md) — phased plan and current status (one paragraph per phase)
 - [roadmaps/](roadmaps/) — per-phase work breakdowns when a phase grows past one paragraph
 - [decisions/](decisions/) — ADRs (numbered architecture decision records)
-- [test-plans/](test-plans/) — written test plans for non-trivial commits
+- [test-plans/](test-plans/) — written test plans for major features and phase deliverables (most commits don't get one)
 
 Phase files in `roadmaps/` are about **work** (verbs, milestones, acceptance bullets); area specs in `specs/<area>.md` are about the **system** (nouns, contracts, invariants). If a paragraph could plausibly fit in either, it belongs in the spec.
 

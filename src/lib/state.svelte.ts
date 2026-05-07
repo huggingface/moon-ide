@@ -804,8 +804,20 @@ class WorkspaceState {
 			}
 		}
 		// Hydrate the active folder's tree if it's a fresh state.
+		// On a swap to a previously-loaded folder the cached paths
+		// still match disk, but `gitStatusEntries` and `gitBranch`
+		// are workspace-level state still pointing at the prior
+		// folder's SCM data — re-classify against the cached paths
+		// so the SCM panel header (branch / ahead / behind) and the
+		// change-count badge snap to the new folder. Without this,
+		// re-visiting a folder shows the prior folder's branch and
+		// changes until the next watcher fire, the next 3-minute
+		// auto-fetch tick, or until something else nudges
+		// `refreshGitStatus`.
 		if (this.activeFolderState && this.activeFolderState.paths.length === 0) {
 			await this.loadPaths();
+		} else if (previousActive !== null && previousActive !== snapshot.active_folder) {
+			void this.refreshGitStatus(this.paths, null);
 		}
 		// Warm the per-folder compose snapshot for every bound
 		// folder so the bars paint with real data on first frame
