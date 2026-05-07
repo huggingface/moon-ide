@@ -100,6 +100,40 @@ pub struct SshAgentForward {
 	pub host_socket: Utf8PathBuf,
 }
 
+/// The host's `git config --global user.{name,email}`, projected
+/// into the dev container as `GIT_AUTHOR_*` / `GIT_COMMITTER_*`
+/// environment variables.
+///
+/// Why env vars and not a mounted `~/.gitconfig`:
+///
+/// 1. **Surgical surface.** We only export the bits we know we
+///    want (the identity). A mounted host gitconfig would also
+///    drag in credential helpers, signing settings, and per-tool
+///    aliases — most of which point at host-only binaries that
+///    don't exist in the container and surface as confusing
+///    `git config --get` errors.
+/// 2. **Layered safely.** Env vars take precedence over
+///    `~/.gitconfig` inside the container, so the dev's own
+///    in-container gitconfig (if they ever set one) keeps
+///    working. The environment is the override, not a
+///    replacement.
+/// 3. **Easy to reason about.** A glance at the generated
+///    `compose.yaml` shows exactly which identity the container
+///    will commit as.
+///
+/// Resolved at the lifecycle layer — see
+/// [`crate::lifecycle::detect_host_git_identity`]. `None` (no
+/// global identity configured) skips the four env vars entirely;
+/// the container's git is then in the same "Please tell me who
+/// you are" state it'd have on a fresh checkout, which is the
+/// correct fallback (we'd rather refuse to commit than commit as
+/// the wrong person).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostGitIdentity {
+	pub name: String,
+	pub email: String,
+}
+
 /// How the generator should populate the `dev` service.
 #[derive(Debug, Clone)]
 pub struct ComposeRenderOptions<'a> {
@@ -120,6 +154,34 @@ pub struct ComposeRenderOptions<'a> {
 	/// and environment block entirely (no `SSH_AUTH_SOCK` set
 	/// inside the container, no agent socket mounted).
 	pub ssh_agent: Option<&'a SshAgentForward>,
+	/// Optional git identity carried over from the host. `None`
+	/// leaves the container's git unconfigured, so the first
+	/// commit prompts "Please tell me who you are" — a deliberate
+	/// "refuse rather than commit as the wrong person" fallback.
+	pub git_identity: Option<&'a HostGitIdentity>,
+}
+
+/// Wrap `value` in double quotes, escaping `\` and `"` so an
+/// arbitrary user string (a name with quotes, an email with a
+/// `@`, anything containing `:` / `#` / leading whitespace) is
+/// always YAML-safe. Cheaper than pulling in a YAML escaper for
+/// the few env values we ever emit; matches the YAML 1.2 quoted
+/// scalar rules we actually need.
+fn quote_yaml_double(value: &str) -> String {
+	let mut out = String::with_capacity(value.len() + 2);
+	out.push('"');
+	for ch in value.chars() {
+		match ch {
+			'\\' => out.push_str("\\\\"),
+			'"' => out.push_str("\\\""),
+			'\n' => out.push_str("\\n"),
+			'\t' => out.push_str("\\t"),
+			'\r' => out.push_str("\\r"),
+			c => out.push(c),
+		}
+	}
+	out.push('"');
+	out
 }
 
 /// Result of [`generate_compose`].
@@ -179,9 +241,25 @@ pub fn generate_compose(options: ComposeRenderOptions<'_>) -> ComposeRender {
 			);
 		}
 	}
+	// Collect every env entry first so we can emit one
+	// `environment:` block (or none). Order is stable for diff-
+	// friendliness: SSH agent first (existing behaviour), then the
+	// four git identity vars in canonical author/committer order.
+	let mut env: Vec<(&str, String)> = Vec::new();
 	if options.ssh_agent.is_some() {
+		env.push(("SSH_AUTH_SOCK", SSH_AGENT_CONTAINER_PATH.to_owned()));
+	}
+	if let Some(id) = options.git_identity {
+		env.push(("GIT_AUTHOR_NAME", id.name.clone()));
+		env.push(("GIT_AUTHOR_EMAIL", id.email.clone()));
+		env.push(("GIT_COMMITTER_NAME", id.name.clone()));
+		env.push(("GIT_COMMITTER_EMAIL", id.email.clone()));
+	}
+	if !env.is_empty() {
 		let _ = writeln!(yaml, "    environment:");
-		let _ = writeln!(yaml, "      SSH_AUTH_SOCK: {SSH_AGENT_CONTAINER_PATH}");
+		for (key, value) in env {
+			let _ = writeln!(yaml, "      {key}: {}", quote_yaml_double(&value));
+		}
 	}
 	// `sleep infinity` is the conventional "keep this container
 	// alive so we can `docker exec` into it" command. Phase 2.1
@@ -224,6 +302,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[],
 			ssh_agent: None,
+			git_identity: None,
 		});
 
 		assert!(render.yaml.contains("name: moon-ws-default"));
@@ -231,8 +310,11 @@ mod tests {
 		// Workspace compose no longer pulls in project services —
 		// they're managed per-folder now.
 		assert!(!render.yaml.contains("include:"));
-		// No agent forward → no environment block on the dev service.
+		// No agent forward and no git identity → no environment
+		// block on the dev service at all.
+		assert!(!render.yaml.contains("    environment:"));
 		assert!(!render.yaml.contains("SSH_AUTH_SOCK"));
+		assert!(!render.yaml.contains("GIT_AUTHOR"));
 	}
 
 	#[test]
@@ -247,6 +329,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &mounts,
 			ssh_agent: None,
+			git_identity: None,
 		});
 
 		assert!(render
@@ -265,6 +348,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &mounts,
 			ssh_agent: None,
+			git_identity: None,
 		};
 		let a = generate_compose(opts.clone());
 		let b = generate_compose(opts);
@@ -280,6 +364,7 @@ mod tests {
 			dev_image: "huggingface/moon-base:0.1",
 			bound_mounts: &[mount("/x", "x")],
 			ssh_agent: None,
+			git_identity: None,
 		});
 		assert!(render.yaml.contains("image: huggingface/moon-base:0.1"));
 	}
@@ -292,6 +377,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[],
 			ssh_agent: None,
+			git_identity: None,
 		});
 		assert!(render.yaml.contains("name: moon-ws-scratch"));
 	}
@@ -307,12 +393,15 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
 			ssh_agent: Some(&agent),
+			git_identity: None,
 		});
 
 		assert!(render
 			.yaml
 			.contains("- /tmp/ssh-XXXX/agent.42:/run/host-services/ssh-auth.sock"));
-		assert!(render.yaml.contains("SSH_AUTH_SOCK: /run/host-services/ssh-auth.sock"));
+		assert!(render
+			.yaml
+			.contains("SSH_AUTH_SOCK: \"/run/host-services/ssh-auth.sock\""));
 		// The bound-folder mount still lands above the agent mount.
 		assert!(render.yaml.contains("- /home/me/code/moon-ide:/workspace/moon-ide"));
 	}
@@ -331,12 +420,94 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[],
 			ssh_agent: Some(&agent),
+			git_identity: None,
 		});
 
 		assert!(!render.yaml.contains("    volumes:\n      []"));
 		assert!(render
 			.yaml
 			.contains("- /run/user/1000/keyring/ssh:/run/host-services/ssh-auth.sock"));
-		assert!(render.yaml.contains("SSH_AUTH_SOCK: /run/host-services/ssh-auth.sock"));
+		assert!(render
+			.yaml
+			.contains("SSH_AUTH_SOCK: \"/run/host-services/ssh-auth.sock\""));
+	}
+
+	#[test]
+	fn git_identity_emits_author_and_committer_env_vars() {
+		let project = project();
+		let identity = HostGitIdentity {
+			name: "Eli Smith".into(),
+			email: "eli@example.com".into(),
+		};
+		let render = generate_compose(ComposeRenderOptions {
+			project: &project,
+			dev_image: "moon-base:dev",
+			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
+			ssh_agent: None,
+			git_identity: Some(&identity),
+		});
+
+		assert!(
+			render.yaml.contains("    environment:"),
+			"expected environment block, got:\n{}",
+			render.yaml
+		);
+		assert!(render.yaml.contains("GIT_AUTHOR_NAME: \"Eli Smith\""));
+		assert!(render.yaml.contains("GIT_AUTHOR_EMAIL: \"eli@example.com\""));
+		assert!(render.yaml.contains("GIT_COMMITTER_NAME: \"Eli Smith\""));
+		assert!(render.yaml.contains("GIT_COMMITTER_EMAIL: \"eli@example.com\""));
+	}
+
+	#[test]
+	fn git_identity_and_ssh_agent_share_environment_block() {
+		let project = project();
+		let agent = SshAgentForward {
+			host_socket: Utf8PathBuf::from("/run/user/1000/keyring/ssh"),
+		};
+		let identity = HostGitIdentity {
+			name: "Eli".into(),
+			email: "eli@example.com".into(),
+		};
+		let render = generate_compose(ComposeRenderOptions {
+			project: &project,
+			dev_image: "moon-base:dev",
+			bound_mounts: &[],
+			ssh_agent: Some(&agent),
+			git_identity: Some(&identity),
+		});
+
+		// One environment block, both keys inside it. Stable order
+		// (SSH first, then identity in author/committer order).
+		let block_start = render.yaml.find("    environment:\n").expect("env block");
+		let body = &render.yaml[block_start..];
+		assert!(body.starts_with("    environment:\n      SSH_AUTH_SOCK: "));
+		assert!(body.contains("GIT_AUTHOR_NAME: \"Eli\""));
+		// Only one `environment:` block exists (regression against
+		// future code re-emitting it for the second feature).
+		assert_eq!(render.yaml.matches("    environment:\n").count(), 1);
+	}
+
+	#[test]
+	fn git_identity_escapes_quote_and_backslash_in_name() {
+		let project = project();
+		let identity = HostGitIdentity {
+			name: "Eli \"the\\test\" Smith".into(),
+			email: "eli@example.com".into(),
+		};
+		let render = generate_compose(ComposeRenderOptions {
+			project: &project,
+			dev_image: "moon-base:dev",
+			bound_mounts: &[],
+			ssh_agent: None,
+			git_identity: Some(&identity),
+		});
+		// Double-quoted scalar with `"` → `\"` and `\` → `\\`.
+		assert!(
+			render
+				.yaml
+				.contains("GIT_AUTHOR_NAME: \"Eli \\\"the\\\\test\\\" Smith\""),
+			"got:\n{}",
+			render.yaml
+		);
 	}
 }

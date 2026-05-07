@@ -70,7 +70,9 @@ use moon_protocol::MoonError;
 use thiserror::Error;
 use tokio::process::Command;
 
-use crate::compose::{generate_compose, BoundMount, ComposeRender, ComposeRenderOptions, SshAgentForward};
+use crate::compose::{
+	generate_compose, BoundMount, ComposeRender, ComposeRenderOptions, HostGitIdentity, SshAgentForward,
+};
 use crate::project::{project_name_for_id, ProjectName, ProjectNameError};
 
 /// The image reference written into a freshly generated
@@ -219,11 +221,13 @@ impl Workspace {
 	pub fn render_compose(&self, dev_image: &str) -> ComposeRender {
 		let mounts = self.bound_mounts();
 		let agent = detect_ssh_agent_forward();
+		let identity = detect_host_git_identity();
 		generate_compose(ComposeRenderOptions {
 			project: &self.project,
 			dev_image,
 			bound_mounts: &mounts,
 			ssh_agent: agent.as_ref(),
+			git_identity: identity.as_ref(),
 		})
 	}
 
@@ -482,6 +486,48 @@ pub(crate) fn detect_ssh_agent_forward() -> Option<SshAgentForward> {
 		return None;
 	}
 	Some(SshAgentForward { host_socket: path })
+}
+
+/// Read the host's `git config --global user.{name,email}` so we
+/// can project them into the dev container as `GIT_AUTHOR_*` /
+/// `GIT_COMMITTER_*`. Returns `None` when **either** field is
+/// missing — a half-configured identity (name without email, or
+/// vice versa) is exactly the case where git refuses to commit
+/// anyway, so promoting it into the container would just defer
+/// the same error to commit time.
+///
+/// `--global` (not `--get`) is deliberate: we want the user-level
+/// identity, not whatever per-repo override the IDE happens to be
+/// running inside. The container has no notion of "current repo"
+/// at startup, and per-repo overrides will still be respected
+/// when the user `cd`s into a folder with one (env vars take
+/// precedence over `~/.gitconfig`, but per-repo `.git/config`
+/// takes precedence over env vars).
+///
+/// Resolved fresh per `render_compose` call (cheap shell-out;
+/// runs maybe twice per workspace lifetime). If the user updates
+/// their host gitconfig after the container is up, regenerating
+/// the workspace compose file picks up the new identity — the
+/// IDE's "Rebuild container" affordance is the user-facing path.
+pub(crate) fn detect_host_git_identity() -> Option<HostGitIdentity> {
+	let name = read_git_global_config("user.name")?;
+	let email = read_git_global_config("user.email")?;
+	Some(HostGitIdentity { name, email })
+}
+
+fn read_git_global_config(key: &str) -> Option<String> {
+	let output = std::process::Command::new("git")
+		.args(["config", "--global", "--get", key])
+		.output()
+		.ok()?;
+	if !output.status.success() {
+		return None;
+	}
+	let value = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+	if value.is_empty() {
+		return None;
+	}
+	Some(value)
 }
 
 fn render_bound_folders_json(folders: &[Utf8PathBuf]) -> String {

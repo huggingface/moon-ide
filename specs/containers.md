@@ -821,6 +821,74 @@ What this **doesn't** do (deferred until somebody asks):
   `x-moon` key (or top-level setting) can come back when a
   second concrete need appears.
 
+## Git author identity from the host
+
+Without help, a fresh dev container has no git identity at all —
+the first `git commit` (or any tool that calls `git commit`,
+including coder agents) hits `*** Please tell me who you are`.
+Worse, in practice an LLM agent running in the container
+"helpfully" papers over this by running `git config user.email
+…` with whatever placeholder it invented (we've seen `Developer
+/ dev@huggingface.co`), and now commits go out with the wrong
+author until somebody notices.
+
+moon-ide closes that gap by **carrying the host's
+`git config --global user.{name,email}` into the container as
+environment variables** on the `dev` service:
+
+```yaml
+services:
+  dev:
+    environment:
+      GIT_AUTHOR_NAME: 'Eli Smith'
+      GIT_AUTHOR_EMAIL: 'eli@example.com'
+      GIT_COMMITTER_NAME: 'Eli Smith'
+      GIT_COMMITTER_EMAIL: 'eli@example.com'
+```
+
+`compose.yaml` shares **one** `environment:` block across the
+SSH agent forward (above) and the git identity — they sit on
+the same dev service.
+
+Why env vars and not a mounted `~/.gitconfig`:
+
+1. **Surgical surface.** Only the bits we actually want
+   (the identity). A mounted host gitconfig also drags in
+   credential helpers, signing settings, and per-tool aliases —
+   most of which point at host-only binaries that don't exist
+   in the container and surface as confusing
+   `git config --get` errors.
+2. **Layered safely.** Env vars take precedence over
+   `~/.gitconfig` inside the container, but per-repo
+   `.git/config` overrides still win — so a project that
+   intentionally pins a different identity (a bot account for
+   automated commits, etc.) keeps working.
+3. **Easy to reason about.** A glance at the generated
+   `compose.yaml` shows exactly which identity the container
+   will commit as; no "what's actually in
+   `/home/dev/.gitconfig` right now?" detective work.
+
+Resolution: `git config --global --get user.name` and
+`user.email`, run on the host at `compose.yaml` render time
+(once per workspace setup, again on `Rebuild`). Both have to
+return non-empty values; if **either** is missing we skip all
+four env vars and let the container's git refuse to commit on
+its own — that's the right "fail loudly rather than commit as
+the wrong person" fallback.
+
+Updates to the host's gitconfig propagate via the same
+`Rebuild container` affordance the SSH agent forward uses; we
+don't try to hot-swap container env vars at runtime.
+
+What this **doesn't** do (deferred):
+
+- Forward arbitrary gitconfig (signing keys, `pull.rebase`,
+  `core.editor`, …). The team uses defaults; nobody's asked
+  for more.
+- Forward `gh auth status` / `~/.config/gh/` so `gh` works
+  in-container without re-login. Plausible follow-up; not
+  blocking commit attribution.
+
 ## `WorkspaceHost::ContainerHost`
 
 The trait already exists from Phase 0:

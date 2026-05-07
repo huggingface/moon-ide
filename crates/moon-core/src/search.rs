@@ -9,6 +9,7 @@ use camino::Utf8Path;
 use grep_matcher::Matcher;
 use grep_regex::RegexMatcher;
 use grep_searcher::{sinks::UTF8, Searcher};
+use ignore::overrides::{Override, OverrideBuilder};
 use ignore::WalkBuilder;
 use moon_protocol::search::{
 	ContentSearchHit, ContentSearchOptions, ContentSearchResult, FileSearchOptions, FileSearchResult,
@@ -17,6 +18,23 @@ use moon_protocol::{MoonError, MoonResult};
 
 /// Minimum score below which file-name candidates are dropped from the result list.
 const FILE_SEARCH_MIN_SCORE: i64 = 0;
+
+/// Build the per-walk override set: skip `.git/` explicitly so the
+/// search results don't drown in pack files / object blobs / log
+/// chatter. ripgrep gets this for free because its default
+/// `hidden(true)` filters every dotdir; we set `hidden(false)` to
+/// surface dotfiles like `.editorconfig`, so we have to add `.git`
+/// back as an explicit exclusion.
+///
+/// `.gitignore` (`node_modules/`, `target/`, `dist/`, …) and
+/// `.git/info/exclude` are still respected via
+/// `WalkBuilder::git_ignore(true)` / `git_exclude(true)` — this
+/// override only patches the one case those features can't cover.
+fn build_overrides(root: &Utf8Path) -> Override {
+	let mut builder = OverrideBuilder::new(root.as_std_path());
+	let _ = builder.add("!.git/");
+	builder.build().unwrap_or_else(|_| Override::empty())
+}
 
 pub fn search_files(root: &Utf8Path, opts: &FileSearchOptions) -> MoonResult<Vec<FileSearchResult>> {
 	let query = opts.query.trim().to_lowercase();
@@ -32,6 +50,7 @@ pub fn search_files(root: &Utf8Path, opts: &FileSearchOptions) -> MoonResult<Vec
 		.git_ignore(true)
 		.git_exclude(true)
 		.ignore(true)
+		.overrides(build_overrides(root))
 		.build();
 
 	for entry in walker.flatten() {
@@ -138,6 +157,7 @@ pub fn search_content(root: &Utf8Path, opts: &ContentSearchOptions) -> MoonResul
 		.git_ignore(true)
 		.git_exclude(true)
 		.ignore(true)
+		.overrides(build_overrides(root))
 		.build();
 
 	'outer: for entry in walker.flatten() {
@@ -241,6 +261,104 @@ mod tests {
 		let r = search_content(&root(&dir), &opts).unwrap();
 		assert_eq!(r.hits.len(), 2);
 		assert!(!r.truncated);
+	}
+
+	#[test]
+	fn file_search_skips_dot_git_directory() {
+		// `.git/` is not gitignored (it's *the* git store), and we
+		// run with `hidden(false)` so dotfiles like `.editorconfig`
+		// surface — the explicit override is the only thing keeping
+		// search out of pack files / log blobs / refs.
+		let dir = TempDir::new().unwrap();
+		std::fs::create_dir_all(dir.path().join(".git/logs")).unwrap();
+		std::fs::write(dir.path().join(".git/logs/HEAD"), "fakelog\n").unwrap();
+		std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+		std::fs::write(dir.path().join("README.md"), "# real file\n").unwrap();
+
+		let opts = FileSearchOptions {
+			query: "head".into(),
+			limit: 50,
+		};
+		let hits = search_files(&root(&dir), &opts).unwrap();
+		assert!(
+			hits.iter().all(|h| !h.path.starts_with(".git/")),
+			"file search leaked into .git/: {hits:?}"
+		);
+	}
+
+	#[test]
+	fn content_search_skips_dot_git_directory() {
+		let dir = TempDir::new().unwrap();
+		std::fs::create_dir_all(dir.path().join(".git/logs")).unwrap();
+		std::fs::write(dir.path().join(".git/logs/HEAD"), "needle-in-git\n").unwrap();
+		std::fs::write(dir.path().join("README.md"), "needle-in-readme\n").unwrap();
+
+		let opts = ContentSearchOptions {
+			query: "needle".into(),
+			case_sensitive: false,
+			regex: false,
+			max_matches: 100,
+		};
+		let r = search_content(&root(&dir), &opts).unwrap();
+		assert!(
+			r.hits.iter().all(|h| !h.path.starts_with(".git/")),
+			"content search leaked into .git/: {:?}",
+			r.hits
+		);
+		// The readme hit should still come through — we only want
+		// `.git/` filtered, not all dotfiles.
+		assert!(
+			r.hits.iter().any(|h| h.path == "README.md"),
+			"readme hit got dropped along with the git filter: {:?}",
+			r.hits
+		);
+	}
+
+	#[test]
+	fn content_search_respects_gitignore() {
+		// `.gitignore` exclusions (`node_modules/`, `target/`, …)
+		// are wired via `WalkBuilder::git_ignore(true)`. Regression
+		// against a future change accidentally flipping it off — a
+		// `node_modules/`-laden workspace would otherwise drown the
+		// results in dependency code. The `ignore` crate only
+		// honours `.gitignore` when there's a real `.git/` at or
+		// above the search root, so we `git init` (no commits
+		// needed — just the metadata directory).
+		let dir = TempDir::new().unwrap();
+		std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+		std::fs::write(dir.path().join(".gitignore"), "node_modules/\ntarget/\n").unwrap();
+		std::fs::create_dir_all(dir.path().join("node_modules/lodash")).unwrap();
+		std::fs::write(
+			dir.path().join("node_modules/lodash/index.js"),
+			"function unique() {}\n",
+		)
+		.unwrap();
+		std::fs::create_dir_all(dir.path().join("target/debug")).unwrap();
+		std::fs::write(dir.path().join("target/debug/note.txt"), "unique build artefact\n").unwrap();
+		std::fs::write(dir.path().join("src.txt"), "unique value\n").unwrap();
+
+		let opts = ContentSearchOptions {
+			query: "unique".into(),
+			case_sensitive: false,
+			regex: false,
+			max_matches: 100,
+		};
+		let r = search_content(&root(&dir), &opts).unwrap();
+		assert!(
+			r.hits.iter().all(|h| !h.path.starts_with("node_modules/")),
+			"content search leaked into node_modules/: {:?}",
+			r.hits
+		);
+		assert!(
+			r.hits.iter().all(|h| !h.path.starts_with("target/")),
+			"content search leaked into target/: {:?}",
+			r.hits
+		);
+		assert!(
+			r.hits.iter().any(|h| h.path == "src.txt"),
+			"unignored hit got dropped along with the gitignore filter: {:?}",
+			r.hits
+		);
 	}
 
 	#[test]

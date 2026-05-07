@@ -82,6 +82,7 @@ export const ipc = {
 		gitPublishBranch: () => invoke<void>('fs_git_publish_branch'),
 		gitPull: () => invoke<void>('fs_git_pull'),
 		gitFetch: () => invoke<void>('fs_git_fetch'),
+		gitHeadCommitMessage: () => invoke<string>('fs_git_head_commit_message'),
 	},
 	search: {
 		files: (options: FileSearchOptions) => invoke<FileSearchResult[]>('search_files', { options }),
@@ -177,6 +178,7 @@ export const ipc = {
 		signOut: () => invoke<void>('coder_sign_out'),
 		send: (text: string) => invoke<void>('coder_send', { text }),
 		suggestBranchName: (message: string) => invoke<string>('coder_suggest_branch_name', { message }),
+		suggestCommitMessage: (message: string) => invoke<string>('coder_suggest_commit_message', { message }),
 		abort: () => invoke<void>('coder_abort'),
 		listSessions: () => invoke<CoderSessionSummary[]>('coder_list_sessions'),
 		activeSession: () => invoke<CoderSessionSummary | null>('coder_active_session'),

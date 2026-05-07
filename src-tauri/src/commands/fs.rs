@@ -307,3 +307,15 @@ pub async fn fs_git_fetch(state: State<'_, AppState>) -> Result<(), MoonError> {
 	let entry = state.workspaces.require_active_folder().await?;
 	entry.host.git_fetch().await
 }
+
+/// `git log -1 --pretty=%B` — subject + body of the current `HEAD`
+/// commit. Used by the SCM panel to prefill the commit message
+/// when the user toggles "amend" on with an empty draft. Empty
+/// string when there's nothing to read (no commits yet, not a
+/// repo, git unavailable); the panel renders that as "amend with
+/// no prefill" rather than a flash toast.
+#[tauri::command]
+pub async fn fs_git_head_commit_message(state: State<'_, AppState>) -> Result<String, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.git_head_commit_message().await
+}

@@ -38,4 +38,8 @@ manual.
 
 - [phase-01.5-editor-polish.md](phase-01.5-editor-polish.md)
 - [phase-02-containers.md](phase-02-containers.md)
+- [phase-02.5-multi-folder.md](phase-02.5-multi-folder.md)
+- [phase-03-terminal.md](phase-03-terminal.md)
+- [phase-05-git.md](phase-05-git.md)
+- [phase-06-coder.md](phase-06-coder.md)
 - [phase-11-slack-chat.md](phase-11-slack-chat.md)

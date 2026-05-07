@@ -263,6 +263,26 @@ pub trait WorkspaceHost: Send + Sync {
 	/// and missing-upstream messages all stay readable.
 	async fn git_pull(&self) -> MoonResult<()>;
 
+	/// Subject + body of the current `HEAD` commit (`git log -1
+	/// --pretty=%B`). Used by the SCM panel to prefill the commit
+	/// composer when "amend" is toggled on with an empty message
+	/// — the user almost always wants to start from the existing
+	/// message and edit, not re-type it. Returns an empty string
+	/// when the repo has no commits yet, isn't a repo at all, or
+	/// git is unavailable; callers treat the empty case as "nothing
+	/// to prefill" without branching on `Result`.
+	async fn git_head_commit_message(&self) -> MoonResult<String>;
+
+	/// Working-tree diff against `HEAD` (`git diff HEAD --no-color`),
+	/// capped at ~16 KB so a sprawling refactor doesn't blow up the
+	/// LLM prompt that consumes this. Used by the SCM panel's "AI
+	/// commit message" sparkle button. The cap is byte-based and
+	/// truncates at the next newline boundary so half-rendered hunk
+	/// headers don't confuse the model. Returns an empty string when
+	/// there's nothing to diff (clean tree, not a repo, git
+	/// unavailable).
+	async fn git_diff_patch(&self) -> MoonResult<String>;
+
 	/// `git fetch --quiet --no-tags` against the current branch's
 	/// upstream remote (defaults to `origin`). Used by the periodic
 	/// auto-fetch loop in the SCM panel so the "Sync Changes" button
@@ -1033,6 +1053,20 @@ impl WorkspaceHost for LocalHost {
 	async fn git_fetch(&self) -> MoonResult<()> {
 		run_git_fetch_quiet(&self.root).await
 	}
+
+	async fn git_head_commit_message(&self) -> MoonResult<String> {
+		let root = self.root.clone();
+		tokio::task::spawn_blocking(move || Ok(run_git_head_commit_message(&root)))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_head_commit_message join error: {e}")))?
+	}
+
+	async fn git_diff_patch(&self) -> MoonResult<String> {
+		let root = self.root.clone();
+		tokio::task::spawn_blocking(move || Ok(run_git_diff_patch(&root)))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_diff_patch join error: {e}")))?
+	}
 }
 
 /// `git symbolic-ref --short HEAD` for the branch name,
@@ -1440,6 +1474,68 @@ fn run_git_simple(root: &Utf8Path, args: &[&str], label: &str) -> MoonResult<()>
 		return Err(MoonError::IoError(format!("{label}: {combined}")));
 	}
 	Ok(())
+}
+
+/// `git log -1 --pretty=%B` for the current `HEAD`. Returns the
+/// raw subject + body verbatim (with whatever trailing newlines git
+/// emits stripped); empty string on any failure (no repo, no
+/// commits yet, git unavailable). Synchronous; runs on the
+/// blocking pool via `git_head_commit_message`.
+fn run_git_head_commit_message(root: &Utf8Path) -> String {
+	use std::process::Command;
+
+	let output = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["log", "-1", "--pretty=%B"])
+		.output();
+	let Ok(output) = output else {
+		return String::new();
+	};
+	if !output.status.success() {
+		return String::new();
+	}
+	String::from_utf8(output.stdout)
+		.unwrap_or_default()
+		.trim_end_matches('\n')
+		.to_string()
+}
+
+/// `git diff HEAD --no-color`, byte-capped at ~16 KB. The cap
+/// truncates at the next newline boundary so we don't hand a
+/// half-formed hunk header to the LLM. Empty string on failure.
+fn run_git_diff_patch(root: &Utf8Path) -> String {
+	use std::process::Command;
+
+	const MAX_BYTES: usize = 16_000;
+
+	let output = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["diff", "HEAD", "--no-color"])
+		.output();
+	let Ok(output) = output else {
+		return String::new();
+	};
+	if !output.status.success() {
+		return String::new();
+	}
+	let raw = String::from_utf8_lossy(&output.stdout);
+	if raw.len() <= MAX_BYTES {
+		return raw.into_owned();
+	}
+	// Cut just past the last newline at or before MAX_BYTES so the
+	// trailing chunk handed to the LLM is structurally complete (no
+	// half-line hunk headers that read as garbage). `+ 1` includes
+	// the newline itself, so the prefix ends in `\n` and the
+	// sentinel sits cleanly on its own line. Falls back to a hard
+	// byte cut if there's no newline at all in the prefix (a
+	// pathologically long single line) — the model will still see
+	// the sentinel and infer truncation.
+	let cut = raw[..MAX_BYTES].rfind('\n').map(|i| i + 1).unwrap_or(MAX_BYTES);
+	let mut out = raw[..cut].to_owned();
+	out.push_str("... (diff truncated)\n");
+	out
 }
 
 /// `git fetch --quiet --no-tags` with prompts disabled and a 30s
@@ -2908,6 +3004,86 @@ mod tests {
 		let summary = host(&dir).git_diff_summary().await.unwrap();
 		assert!(summary.contains("a.txt"), "got {summary:?}");
 		assert!(summary.contains("file changed"), "got {summary:?}");
+	}
+
+	#[tokio::test]
+	async fn git_head_commit_message_returns_subject_and_body() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping head_commit_message test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(
+			&git,
+			dir.path(),
+			&[
+				"commit",
+				"-q",
+				"-m",
+				"Add bucket sync",
+				"-m",
+				"Body line one.\nBody line two.",
+			],
+		);
+		let msg = host(&dir).git_head_commit_message().await.unwrap();
+		assert!(msg.starts_with("Add bucket sync"), "got {msg:?}");
+		assert!(msg.contains("Body line one."), "got {msg:?}");
+		// Subject + body separator survives; trailing newline does not.
+		assert!(!msg.ends_with('\n'), "got {msg:?}");
+	}
+
+	#[tokio::test]
+	async fn git_head_commit_message_empty_when_no_commits() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping no-commits head_commit_message test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		// Fresh repo, no commits yet — `git log -1` exits non-zero;
+		// host returns empty string, callers treat as "nothing to
+		// prefill".
+		assert_eq!(host(&dir).git_head_commit_message().await.unwrap(), "");
+	}
+
+	#[tokio::test]
+	async fn git_diff_patch_returns_patch_and_truncates_above_cap() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping diff_patch test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "initial"]);
+
+		std::fs::write(dir.path().join("a.txt"), "alpha changed\n").unwrap();
+		let patch = host(&dir).git_diff_patch().await.unwrap();
+		assert!(patch.contains("diff --git"), "got {patch:?}");
+		assert!(patch.contains("alpha changed"), "got {patch:?}");
+		assert!(
+			!patch.contains("(diff truncated)"),
+			"small diff was unexpectedly truncated: {patch:?}"
+		);
+
+		// Now blow past the 16 KB cap with a long file change.
+		let huge: String = (0..3000).map(|i| format!("line {i}\n")).collect();
+		std::fs::write(dir.path().join("a.txt"), huge).unwrap();
+		let patch = host(&dir).git_diff_patch().await.unwrap();
+		assert!(patch.len() <= 17_000, "patch={} should be capped near 16k", patch.len());
+		assert!(patch.contains("(diff truncated)"), "missing truncation sentinel");
+		// Truncation cuts at a newline; we'd see a hanging partial
+		// line otherwise (everything before the sentinel ends in `\n`).
+		let body = patch.trim_end_matches("... (diff truncated)\n");
+		assert!(body.ends_with('\n'), "truncation should land on a newline boundary");
 	}
 
 	fn which_git() -> Option<std::path::PathBuf> {

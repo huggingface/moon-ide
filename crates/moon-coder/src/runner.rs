@@ -409,6 +409,44 @@ impl CoderHandle {
 		Ok(cleaned)
 	}
 
+	/// Suggest a commit message from the working-tree diff. Same
+	/// shape as [`Self::suggest_branch_name`] — fast model,
+	/// tightly-scoped system prompt, output run through
+	/// [`sanitise_commit_message`] so we strip stray markdown / code
+	/// fences / quote wrappers the model occasionally tacks on.
+	///
+	/// `diff_patch` is the actual `git diff HEAD` output (capped
+	/// upstream at ~16 KB by [`crate::host::run_git_diff_patch`]) —
+	/// the model needs the patch content, not just the stat, to
+	/// write a subject line that's specific rather than generic.
+	/// `existing_message` is whatever the user has already typed in
+	/// the composer, included as soft context: "if the user already
+	/// has a direction, refine it; otherwise infer freshly".
+	///
+	/// Errors when the model call fails or the response sanitises
+	/// down to the empty string.
+	pub async fn suggest_commit_message(&self, existing_message: &str, diff_patch: &str) -> Result<String, CoderError> {
+		let prompt = build_commit_message_prompt(existing_message, diff_patch);
+		let messages = vec![
+			ChatMessage::System {
+				content: COMMIT_MESSAGE_SYSTEM_PROMPT.to_string(),
+			},
+			ChatMessage::User { content: prompt },
+		];
+		let cancel = CancellationToken::new();
+		let response = self
+			.state
+			.inference
+			.chat_completion(DEFAULT_FAST_MODEL, &messages, &[], &cancel)
+			.await?;
+		let raw = response.content.unwrap_or_default();
+		let cleaned = sanitise_commit_message(&raw);
+		if cleaned.is_empty() {
+			return Err(CoderError::Internal("commit message suggestion was empty".into()));
+		}
+		Ok(cleaned)
+	}
+
 	pub async fn start_device_flow(&self) -> Result<DeviceCode, CoderError> {
 		self.state.auth.start_device_flow().await
 	}
@@ -1591,6 +1629,13 @@ const AUTO_RENAME_SYSTEM_PROMPT: &str = "You are a title generator. Given a shor
 /// kebab-cased identifier, not a sentence.
 const BRANCH_NAME_SYSTEM_PROMPT: &str = "You suggest git branch names. Given a draft commit message and/or a `git diff --stat` summary, return ONE short branch name in kebab-case (2 to 5 words, lowercase, hyphen-separated, no slashes, no quotes, no leading prefix like `feature/` or `fix/`). Output the name only, no explanation.";
 
+/// One-shot system prompt for commit-message suggestion. Asks
+/// for a single subject line (no body, no markdown, no quotes)
+/// because that's what fits the textarea and is what the team's
+/// commit history actually uses; the user can flesh out a body
+/// manually after the prefill if they want one.
+const COMMIT_MESSAGE_SYSTEM_PROMPT: &str = "You suggest git commit messages. Given a working-tree diff (and optionally a draft message the user has started typing), return ONE concise subject line (5 to 10 words, imperative mood, no period, no quotes, no markdown, no `feat:` / `fix:` prefix unless the project's existing history obviously uses them). Output the subject only, no body, no explanation.";
+
 /// Build the user-side prompt for the branch-name pass. We always
 /// send both fields with explicit headings so a blank one is
 /// obviously a non-signal rather than a missing argument the
@@ -1612,6 +1657,77 @@ fn build_branch_name_prompt(commit_message: &str, diff_summary: &str) -> String 
 		out.push_str(diff);
 	}
 	out
+}
+
+/// User-side prompt for the commit-message pass. We always ship
+/// both fields with explicit headings so a blank one is obviously
+/// "no signal here, infer from the other" rather than a missing
+/// argument the model needs to guess at.
+fn build_commit_message_prompt(existing_message: &str, diff_patch: &str) -> String {
+	let message = existing_message.trim();
+	let diff = diff_patch.trim();
+	let mut out = String::new();
+	out.push_str("Draft commit message (may be empty):\n");
+	if message.is_empty() {
+		out.push_str("(none)");
+	} else {
+		out.push_str(message);
+	}
+	out.push_str("\n\nWorking-tree diff (`git diff HEAD`):\n");
+	if diff.is_empty() {
+		out.push_str("(none)");
+	} else {
+		out.push_str(diff);
+	}
+	out
+}
+
+/// Trim a model-emitted commit subject down to a single clean
+/// line. The fast model usually behaves but sometimes wraps in
+/// backticks / quotes, prefixes with "Subject:" / "Commit:", or
+/// appends a body separated by a blank line — keep the first
+/// non-empty line, strip wrapper punctuation, drop common labels,
+/// drop a trailing period (commit subjects don't end with one),
+/// and cap length so a runaway response can't blow out the
+/// composer.
+pub(crate) fn sanitise_commit_message(raw: &str) -> String {
+	const MAX_CHARS: usize = 100;
+
+	let trimmed = raw.trim();
+	let first_line = trimmed.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+	let mut s = first_line.trim().to_string();
+
+	for prefix in ["subject:", "commit message:", "commit:", "message:", "title:"] {
+		if let Some(rest) = strip_prefix_ignore_ascii_case(&s, prefix) {
+			s = rest.trim().to_string();
+		}
+	}
+
+	s = s.trim_matches(|c: char| c == '"' || c == '\'' || c == '`').to_string();
+	while s.ends_with('.') || s.ends_with(' ') {
+		s.pop();
+	}
+
+	if s.chars().count() <= MAX_CHARS {
+		return s;
+	}
+	let mut clipped: String = s.chars().take(MAX_CHARS).collect();
+	while clipped.ends_with(' ') || clipped.ends_with('.') {
+		clipped.pop();
+	}
+	clipped
+}
+
+fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+	if s.len() < prefix.len() {
+		return None;
+	}
+	let head = &s[..prefix.len()];
+	if head.eq_ignore_ascii_case(prefix) {
+		Some(&s[prefix.len()..])
+	} else {
+		None
+	}
 }
 
 /// Coerce a model-emitted branch suggestion into something git
@@ -1947,6 +2063,59 @@ mod tests {
 	#[test]
 	fn sanitise_branch_collapses_runs_and_drops_unsafe_chars() {
 		assert_eq!(sanitise_branch_name("--fix:: bucket   sync!@#"), "fix-bucket-sync");
+	}
+
+	#[test]
+	fn sanitise_commit_strips_wrappers_and_labels() {
+		assert_eq!(
+			sanitise_commit_message("\"Add tail param to upload helper\""),
+			"Add tail param to upload helper"
+		);
+		assert_eq!(
+			sanitise_commit_message("Subject: refactor cache layer"),
+			"refactor cache layer"
+		);
+		assert_eq!(
+			sanitise_commit_message("`Tighten retry budget for uploads`"),
+			"Tighten retry budget for uploads"
+		);
+		assert_eq!(
+			sanitise_commit_message("Fix offline auto-fetch flake."),
+			"Fix offline auto-fetch flake"
+		);
+	}
+
+	#[test]
+	fn sanitise_commit_takes_first_non_empty_line() {
+		let raw = "\n  \nAdd amend prefill to SCM panel\n\nDetails go here.\n";
+		assert_eq!(sanitise_commit_message(raw), "Add amend prefill to SCM panel");
+	}
+
+	#[test]
+	fn sanitise_commit_clamps_runaway_subject() {
+		let raw = "this commit message is way too long and the model decided to write a paragraph as if it were a subject line and we should clamp it down before it blows up the composer";
+		let out = sanitise_commit_message(raw);
+		assert!(out.chars().count() <= 100);
+		assert!(!out.ends_with(' '));
+		assert!(!out.ends_with('.'));
+	}
+
+	#[test]
+	fn sanitise_commit_returns_empty_for_blank_input() {
+		assert_eq!(sanitise_commit_message(""), "");
+		assert_eq!(sanitise_commit_message("   "), "");
+		assert_eq!(sanitise_commit_message("\n\n"), "");
+	}
+
+	#[test]
+	fn build_commit_message_prompt_marks_blank_fields() {
+		let p = build_commit_message_prompt("", "");
+		assert!(p.contains("Draft commit message (may be empty):\n(none)"));
+		assert!(p.contains("Working-tree diff (`git diff HEAD`):\n(none)"));
+
+		let p2 = build_commit_message_prompt("WIP commit", "diff --git a/foo b/foo\n+ bar\n");
+		assert!(p2.contains("Draft commit message (may be empty):\nWIP commit"));
+		assert!(p2.contains("diff --git a/foo b/foo"));
 	}
 
 	#[test]

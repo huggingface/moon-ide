@@ -113,6 +113,23 @@ pub async fn coder_suggest_branch_name(state: State<'_, AppState>, message: Stri
 		.map_err(MoonError::from)
 }
 
+/// Suggest a one-line commit subject from the active folder's
+/// `git diff HEAD` patch (capped to ~16 KB upstream) and whatever
+/// the user has already typed in the composer. Used by the SCM
+/// panel's sparkle button inset on the commit textarea. Errors
+/// surface verbatim through the panel as a flash toast — the user
+/// can still type the message manually.
+#[tauri::command]
+pub async fn coder_suggest_commit_message(state: State<'_, AppState>, message: String) -> Result<String, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	let diff = entry.host.git_diff_patch().await.unwrap_or_default();
+	state
+		.coder
+		.suggest_commit_message(&message, &diff)
+		.await
+		.map_err(MoonError::from)
+}
+
 /// Cancel the **active folder's** running turn, if any.
 /// Background turns running in other folders are left alone — the
 /// user has to switch to them and stop manually if they want
