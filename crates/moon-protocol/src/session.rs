@@ -8,7 +8,7 @@
 //! compile time. Per AGENTS.md "no premature migrations": we change
 //! this freely until the roadmap is done.
 
-use crate::git::PrListScope;
+use crate::git::{CompareBaseline, PrListScope};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -55,6 +55,12 @@ pub struct FolderSession {
 	/// [`PrListScope::All`] for fresh sessions and for sessions
 	/// written by older builds (`#[serde(default)]`).
 	pub pr_scope: PrListScope,
+	/// SCM compare baseline for this folder. `Default` makes the
+	/// file tree, change gutter, and diff view show "what this
+	/// branch / PR changes versus main"; `Head` is the regular
+	/// "what's modified since the last commit". Persisted per
+	/// folder for the same reason as `pr_scope`.
+	pub compare_baseline: CompareBaseline,
 }
 
 /// Dummy `Default` so `#[serde(default)]` on the struct can fill
@@ -73,6 +79,7 @@ impl Default for FolderSession {
 			has_split: false,
 			focused_side: SplitSide::Left,
 			pr_scope: PrListScope::default(),
+			compare_baseline: CompareBaseline::default(),
 		}
 	}
 }

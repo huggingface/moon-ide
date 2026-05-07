@@ -138,9 +138,38 @@ diff view is intentionally a viewer + light-edit surface. The HEAD
 side picks up external `git commit` / `checkout` via the existing
 `headByPath` cache.
 
-Scope is deliberately minimal — `HEAD` vs working tree only, no
-staging / no branch compare / no per-hunk accept — matching what
-the team actively needs right now.
+Scope expanded once: a per-folder **compare baseline**
+(`'head'` / `'default'`, persisted in
+`FolderSession.compare_baseline`) swaps the diff view's "before"
+side and the file tree / change-gutter / SCM-filter status source
+between two views of "what's different right now":
+
+- `'head'` (default) — working tree vs `HEAD`, the regular
+  per-commit gutter & status view.
+- `'default'` — working tree vs the merge-base with the repo's
+  default branch (`origin/main` / `origin/master` from the
+  existing `defaultBranchRemoteRef` resolver). The file tree
+  paints `(M)` / `(A)` / `(D)` against main, the SCM "filter to
+  changes only" pill stacks on top to focus the tree on
+  changed-vs-main paths, and the diff view's "before" side is
+  the merge-base blob — exactly the view the user sees when
+  reviewing their own PR. Untracked files are absent from
+  `git diff <merge-base>` so they don't appear in this mode (the
+  user hasn't committed them yet — they're "not part of the
+  branch").
+
+The `'default'` mode silently degrades to `'head'` semantics
+(but the toggle stays sticky) when the host can't compute the
+diff — no resolvable default branch, HEAD detached, on the
+default branch itself, or no merge-base. Backed by
+`WorkspaceHost::git_default_branch_diff` (returns
+`Option<BranchDiffStatus { merge_base, default_branch_ref,
+entries }>`) and a generalised `git_ref_content(rev, path)` —
+`git_head_content` is now a thin wrapper that passes
+`"HEAD"`. The merge-base SHA is cached on
+`FolderState.defaultBranchMergeBase` so each open buffer's
+"before"-side fetch is a single `git show <sha>:<path>`. No
+per-hunk accept yet — same scope discipline as before.
 
 **Git-change gutter** in the regular editor (test plan
 [0033](../test-plans/0033-git-change-gutter.md)). A dedicated
@@ -170,8 +199,13 @@ The right-side-of-the-folder-bar SCM panel:
 
 - Branch label (or short HEAD SHA in the detached-HEAD case),
   open-PR button when the upstream is a recognised host and the
-  branch isn't `main` / `master`, revert-all icon, change-count
-  pill that doubles as the "filter to changes only" toggle.
+  branch isn't `main` / `master`, revert-all icon, an off-by-
+  default `vs <default-branch>` pill (flips the per-folder
+  compare baseline — see §5.2), and the change-count pill that
+  doubles as the "filter to changes only" toggle. The `vs main`
+  pill suppresses itself on the default branch and when no
+  default branch resolves; it stacks orthogonally with the
+  changes-only filter.
 - **Periodic auto-fetch.** `WorkspaceHost::git_fetch` shells out
   to `git fetch --quiet --no-tags` with prompts disabled
   (`GIT_TERMINAL_PROMPT=0`, blanked `GIT_ASKPASS` /

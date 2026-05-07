@@ -106,7 +106,14 @@
 		} else if (file.isDeleted) {
 			head = file.text;
 		} else {
-			const fetched = await ipc.fs.gitHeadContent(path);
+			// Baseline-aware fetch: `'default'` reads the file at
+			// the cached merge-base SHA; everything else falls
+			// through to the regular HEAD blob.
+			const mergeBase = workspace.defaultBranchMergeBase;
+			const fetched =
+				workspace.compareBaseline === 'default' && mergeBase !== null
+					? await ipc.fs.gitRefContent(mergeBase, path)
+					: await ipc.fs.gitHeadContent(path);
 			if (token !== buildToken) {
 				return;
 			}

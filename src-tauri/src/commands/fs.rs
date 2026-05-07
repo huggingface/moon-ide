@@ -2,8 +2,8 @@ use camino::Utf8PathBuf;
 use moon_core::{read_host_file, write_host_file};
 use moon_protocol::fs::{DirEntry, ReadFileResult, StatResult, WriteFileResult};
 use moon_protocol::git::{
-	BranchList, BranchSwitchTarget, GitBranchInfo, GitChangeSummary, GitCommitResult, GitFileBlame, GitFileStatus,
-	GitStatusEntry, PrListScope,
+	BranchDiffStatus, BranchList, BranchSwitchTarget, GitBranchInfo, GitChangeSummary, GitCommitResult, GitFileBlame,
+	GitFileStatus, GitStatusEntry, PrListScope,
 };
 use moon_protocol::MoonError;
 use tauri::State;
@@ -224,6 +224,36 @@ pub async fn fs_git_head_content(state: State<'_, AppState>, path: String) -> Re
 	let entry = state.workspaces.require_active_folder().await?;
 	let path = Utf8PathBuf::from(path);
 	entry.host.git_head_content(&path).await
+}
+
+/// `git show <rev>:<path>` for the SCM panel's `Default` compare
+/// baseline. `rev` is either `HEAD` or a 40-char hex SHA (the
+/// merge-base the frontend cached); the host validates and
+/// rejects anything else. `Ok(None)` on absent path / binary blob
+/// / no repo follows the same convention as `fs_git_head_content`.
+#[tauri::command]
+pub async fn fs_git_ref_content(
+	state: State<'_, AppState>,
+	rev: String,
+	path: String,
+) -> Result<Option<String>, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	let path = Utf8PathBuf::from(path);
+	entry.host.git_ref_content(&rev, &path).await
+}
+
+/// Resolve the merge-base with the repo's default branch and
+/// return the file-level diff (committed + uncommitted) against
+/// it. Powers the `Default` compare baseline: file tree
+/// decoration, change gutter, SCM filter view, and the diff
+/// view's "before" side all read from the returned
+/// `BranchDiffStatus`. `Ok(None)` for non-repo / on-default-branch
+/// / detached-HEAD / no-merge-base — the SCM panel silently
+/// keeps the toggle inert in those states.
+#[tauri::command]
+pub async fn fs_git_default_branch_diff(state: State<'_, AppState>) -> Result<Option<BranchDiffStatus>, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.git_default_branch_diff().await
 }
 
 /// Branch + HEAD info for the active folder's SCM panel header.

@@ -12,6 +12,7 @@ import type {
 	FileSearchOptions,
 	FileSearchResult,
 	BranchList,
+	BranchDiffStatus,
 	PrListScope,
 	BranchSwitchTarget,
 	GitBranchInfo,
@@ -77,6 +78,8 @@ export const ipc = {
 		gitRestorePaths: (paths: string[]) => invoke<void>('fs_git_restore_paths', { paths }),
 		gitBlame: (path: string) => invoke<GitFileBlame | null>('fs_git_blame', { path }),
 		gitHeadContent: (path: string) => invoke<string | null>('fs_git_head_content', { path }),
+		gitRefContent: (rev: string, path: string) => invoke<string | null>('fs_git_ref_content', { rev, path }),
+		gitDefaultBranchDiff: () => invoke<BranchDiffStatus | null>('fs_git_default_branch_diff'),
 		gitBranch: () => invoke<GitBranchInfo>('fs_git_branch'),
 		gitCommit: (message: string, amend: boolean) => invoke<GitCommitResult>('fs_git_commit', { message, amend }),
 		gitCommitOnNewBranch: (branch: string, message: string) =>

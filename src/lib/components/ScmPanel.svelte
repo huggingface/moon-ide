@@ -47,6 +47,32 @@
 	import SparklesIcon from './icons/SparklesIcon.svelte';
 
 	const branch = $derived(workspace.gitBranch);
+
+	// Short label for the SCM compare-baseline pill — e.g.
+	// `'main'` / `'master'`. Resolved from
+	// `FolderState.defaultBranchName` when the `'default'`
+	// baseline is active and applicable, else falls back to
+	// `branch.defaultBranchRemoteRef` so the pill can suggest
+	// "vs main" before the user ever flips the toggle (lets the
+	// affordance signal what it'd compare against). `null` means
+	// "no default branch resolvable" — the pill suppresses
+	// itself entirely in that case.
+	const compareLabel = $derived.by(() => {
+		const ref = workspace.defaultBranchName ?? branch.defaultBranchRemoteRef;
+		if (ref === null) {
+			return null;
+		}
+		const slash = ref.indexOf('/');
+		return slash === -1 ? ref : ref.slice(slash + 1);
+	});
+
+	// On the default branch itself the toggle is meaningless
+	// (merge-base = HEAD, diff is empty). Suppress the pill
+	// rather than rendering an inert "vs main" you can't click
+	// usefully.
+	const compareToggleApplicable = $derived(
+		compareLabel !== null && branch.name !== null && branch.name !== compareLabel,
+	);
 	const branchLabel = $derived.by(() => {
 		if (branch.name !== null) {
 			return branch.name;
@@ -685,6 +711,22 @@
 						<PullRequestIcon />
 					</button>
 				{/if}
+				{#if compareToggleApplicable}
+					{@const isDefault = workspace.compareBaseline === 'default'}
+					<button
+						type="button"
+						class="compare-pill"
+						class:active={isDefault}
+						title={isDefault
+							? `Comparing working tree against ${compareLabel} (click to compare against last commit instead)`
+							: `Click to show every file changed since branching off ${compareLabel}`}
+						aria-label={isDefault ? `Stop comparing against ${compareLabel}` : `Compare against ${compareLabel}`}
+						aria-pressed={isDefault}
+						onclick={() => workspace.setCompareBaseline(isDefault ? 'head' : 'default')}
+					>
+						vs {compareLabel}
+					</button>
+				{/if}
 				{#if changeCount > 0 || workspace.scmFilterOn}
 					<button
 						type="button"
@@ -1321,6 +1363,39 @@
 	.changes-badge.active {
 		background: transparent;
 		color: var(--m-accent);
+	}
+	/* Compare-against-default-branch pill, sitting next to the
+	   change-count badge in the SCM header. Inactive state is a
+	   muted outlined pill ("vs main" — click to compare); active
+	   state mirrors the changes-badge's accent vocabulary. */
+	.compare-pill {
+		appearance: none;
+		display: inline-flex;
+		align-items: center;
+		height: 20px;
+		padding: 0 8px;
+		border: 1px solid var(--m-border);
+		border-radius: 999px;
+		background: transparent;
+		color: var(--m-fg-subtle);
+		font-size: 10px;
+		font-family: var(--m-font-mono);
+		text-transform: lowercase;
+		letter-spacing: 0.04em;
+		cursor: pointer;
+		white-space: nowrap;
+	}
+	.compare-pill:hover {
+		color: var(--m-fg);
+		border-color: var(--m-border-strong);
+	}
+	.compare-pill.active {
+		background: var(--m-accent);
+		border-color: var(--m-accent);
+		color: var(--m-bg);
+	}
+	.compare-pill.active:hover {
+		filter: brightness(0.95);
 	}
 	/* Full-width sync button beneath the composer — the unified
 	   alternative to separate push/pull icons. Hidden when the

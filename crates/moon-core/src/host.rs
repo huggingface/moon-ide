@@ -9,8 +9,8 @@ use camino::{Utf8Path, Utf8PathBuf};
 use moon_protocol::editorconfig::EditorConfig;
 use moon_protocol::fs::{DirEntry, EntryKind, ReadFileResult, StatResult, WriteFileResult};
 use moon_protocol::git::{
-	BranchList, BranchListEntry, BranchSwitchTarget, GitBranchInfo, GitCommitResult, GitFileBlame, GitFileStatus,
-	GitLineBlame, GitStatusEntry, PrListScope, PrListStatus,
+	BranchDiffStatus, BranchList, BranchListEntry, BranchSwitchTarget, GitBranchInfo, GitCommitResult, GitFileBlame,
+	GitFileStatus, GitLineBlame, GitStatusEntry, PrListScope, PrListStatus,
 };
 use moon_protocol::{MoonError, MoonResult};
 use std::time::SystemTime;
@@ -179,6 +179,37 @@ pub trait WorkspaceHost: Send + Sync {
 	/// text. Real errors (join failures, unreadable UTF-8 from a file
 	/// we thought was text) still bubble up.
 	async fn git_head_content(&self, path: &Utf8Path) -> MoonResult<Option<String>>;
+
+	/// `git show <rev>:<path>` — same shape as
+	/// [`git_head_content`] but for an arbitrary rev. The
+	/// `Default` compare baseline reads the working tree's
+	/// merge-base blob through this method; the diff view picks
+	/// the rev based on the active folder's
+	/// [`moon_protocol::git::CompareBaseline`].
+	///
+	/// `rev` is validated to be either the literal `"HEAD"` or a
+	/// 40-character hex SHA: those are the only two shapes the
+	/// frontend ever passes, and constraining rejects an
+	/// adversarial caller from feeding `git show` a flag-shaped
+	/// rev string. Same `Ok(None)` collapse rules as
+	/// `git_head_content` (path missing at rev, binary blob, no
+	/// repo, git absent).
+	async fn git_ref_content(&self, rev: &str, path: &Utf8Path) -> MoonResult<Option<String>>;
+
+	/// File-level diff between the working tree (committed +
+	/// uncommitted) and the merge-base with the repo's default
+	/// branch. The SCM panel's `Default` compare baseline reads
+	/// this; the file tree's per-row decoration, the change
+	/// gutter, and the diff view all swap their data source to
+	/// the returned [`BranchDiffStatus`].
+	///
+	/// `Ok(None)` covers the "this comparison isn't applicable"
+	/// states the UI silently downgrades to `Head` mode for: not
+	/// a git repo, no `default_branch_remote_ref` resolvable,
+	/// HEAD is detached, HEAD already points at the default
+	/// branch's commit, or no merge-base exists. Real errors
+	/// (join / spawn failures) still bubble up.
+	async fn git_default_branch_diff(&self) -> MoonResult<Option<BranchDiffStatus>>;
 
 	/// Lightweight branch / HEAD info for the SCM panel header.
 	/// Returns the all-`None` default when the active folder isn't
@@ -1070,6 +1101,15 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_head_content(&self, path: &Utf8Path) -> MoonResult<Option<String>> {
+		self.git_ref_content("HEAD", path).await
+	}
+
+	async fn git_ref_content(&self, rev: &str, path: &Utf8Path) -> MoonResult<Option<String>> {
+		if !is_safe_rev(rev) {
+			return Err(MoonError::invalid(format!(
+				"git_ref_content rejects rev: {rev:?} (expected \"HEAD\" or 40-char hex SHA)"
+			)));
+		}
 		// Same containment envelope as `git_blame`: reject absolute,
 		// reject `..` escapes, reject rooted paths. The diff view
 		// never legitimately asks for anything outside the active
@@ -1080,7 +1120,7 @@ impl WorkspaceHost for LocalHost {
 		let rel = Utf8PathBuf::from(path.as_str().trim_end_matches('/'));
 		if rel.is_absolute() {
 			return Err(MoonError::invalid(format!(
-				"git_head_content rejects absolute path: {rel}"
+				"git_ref_content rejects absolute path: {rel}"
 			)));
 		}
 		let mut depth = 0i32;
@@ -1090,7 +1130,7 @@ impl WorkspaceHost for LocalHost {
 					depth -= 1;
 					if depth < 0 {
 						return Err(MoonError::invalid(format!(
-							"git_head_content rejects path escape: {rel}"
+							"git_ref_content rejects path escape: {rel}"
 						)));
 					}
 				}
@@ -1098,15 +1138,23 @@ impl WorkspaceHost for LocalHost {
 				camino::Utf8Component::CurDir => {}
 				camino::Utf8Component::Prefix(_) | camino::Utf8Component::RootDir => {
 					return Err(MoonError::invalid(format!(
-						"git_head_content rejects rooted path: {rel}"
+						"git_ref_content rejects rooted path: {rel}"
 					)));
 				}
 			}
 		}
 		let root = self.root.clone();
-		tokio::task::spawn_blocking(move || run_git_head_content(&root, &rel))
+		let rev = rev.to_owned();
+		tokio::task::spawn_blocking(move || run_git_ref_content(&root, &rev, &rel))
 			.await
-			.map_err(|e| MoonError::Internal(format!("git_head_content join error: {e}")))?
+			.map_err(|e| MoonError::Internal(format!("git_ref_content join error: {e}")))?
+	}
+
+	async fn git_default_branch_diff(&self) -> MoonResult<Option<BranchDiffStatus>> {
+		let root = self.root.clone();
+		tokio::task::spawn_blocking(move || Ok(run_git_default_branch_diff(&root)))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_default_branch_diff join error: {e}")))?
 	}
 
 	async fn git_branch(&self) -> MoonResult<GitBranchInfo> {
@@ -2385,18 +2433,36 @@ fn run_git_blame(root: &Utf8Path, path: &Utf8PathBuf) -> MoonResult<Option<GitFi
 	Ok(Some(blame))
 }
 
-/// `git show HEAD:<path>`. Returns `Ok(None)` for the "no diff to
+/// Validate a rev string that's about to be passed to `git
+/// show <rev>:<path>`. We accept exactly two shapes — the
+/// literal `"HEAD"` (compare baseline = `Head`) and a 40-char
+/// hex SHA (compare baseline = `Default`, where the frontend
+/// passes the merge-base it cached). Refusing anything else
+/// keeps the surface narrow: the frontend never legitimately
+/// hands us a flag-shaped or path-shaped rev, so any other
+/// input is either a bug or an attempt to confuse the underlying
+/// git invocation.
+fn is_safe_rev(rev: &str) -> bool {
+	if rev == "HEAD" {
+		return true;
+	}
+	rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// `git show <rev>:<path>`. Returns `Ok(None)` for the "no diff to
 /// show" states the UI treats silently: not a repo, path isn't in
-/// `HEAD` (freshly added / untracked), or `git` itself is missing.
-/// Binary contents at `HEAD` collapse to `None` too — the diff view
-/// only renders text. UTF-8 decode failures on something we *thought*
-/// was text are the one real error path and bubble up.
+/// the rev's tree (freshly added / untracked), or `git` itself is
+/// missing. Binary contents at the rev collapse to `None` too —
+/// the diff view only renders text. UTF-8 decode failures on
+/// something we *thought* was text are the one real error path
+/// and bubble up.
 ///
-/// Invoked from the blocking pool.
-fn run_git_head_content(root: &Utf8Path, path: &Utf8PathBuf) -> MoonResult<Option<String>> {
+/// Invoked from the blocking pool. `rev` has already been
+/// validated by [`is_safe_rev`].
+fn run_git_ref_content(root: &Utf8Path, rev: &str, path: &Utf8PathBuf) -> MoonResult<Option<String>> {
 	use std::process::Command;
 
-	// `HEAD:<path>` uses forward slashes regardless of host OS —
+	// `<rev>:<path>` uses forward slashes regardless of host OS —
 	// git's pathspec grammar isn't the platform's. The path is
 	// already workspace-relative + UTF-8 so the conversion is
 	// lossless; Windows paths with backslashes would confuse git
@@ -2405,7 +2471,7 @@ fn run_git_head_content(root: &Utf8Path, path: &Utf8PathBuf) -> MoonResult<Optio
 	// blob by path. `--` isn't used here: `git show` treats args
 	// after `--` as pathspecs rather than as rev-parse inputs, and
 	// the blob would come back empty.
-	let spec = format!("HEAD:{}", path.as_str().replace('\\', "/"));
+	let spec = format!("{}:{}", rev, path.as_str().replace('\\', "/"));
 	let output = Command::new("git")
 		.arg("-C")
 		.arg(root.as_std_path())
@@ -2418,7 +2484,7 @@ fn run_git_head_content(root: &Utf8Path, path: &Utf8PathBuf) -> MoonResult<Optio
 	if !output.status.success() {
 		// Two common shapes collapse to `None` here:
 		// - "fatal: not a git repository" → outside a repo.
-		// - "fatal: path 'foo' exists on disk, but not in 'HEAD'"
+		// - "fatal: path 'foo' exists on disk, but not in '<rev>'"
 		//   → untracked / newly-added. The diff for those is
 		//   "everything is new", which the frontend renders by
 		//   passing an empty "before" side itself; we don't need
@@ -2426,9 +2492,10 @@ fn run_git_head_content(root: &Utf8Path, path: &Utf8PathBuf) -> MoonResult<Optio
 		let stderr = String::from_utf8_lossy(&output.stderr);
 		tracing::debug!(
 			path = %path,
+			rev = %rev,
 			code = output.status.code().unwrap_or(-1),
 			stderr = %stderr.trim(),
-			"git show HEAD:<path> exited non-zero"
+			"git show <rev>:<path> exited non-zero"
 		);
 		return Ok(None);
 	}
@@ -2437,7 +2504,137 @@ fn run_git_head_content(root: &Utf8Path, path: &Utf8PathBuf) -> MoonResult<Optio
 	}
 	String::from_utf8(output.stdout)
 		.map(Some)
-		.map_err(|e| MoonError::IoError(format!("git show HEAD:<path> produced non-UTF-8 text: {e}")))
+		.map_err(|e| MoonError::IoError(format!("git show <rev>:<path> produced non-UTF-8 text: {e}")))
+}
+
+/// Resolve the merge-base with the default branch and emit the
+/// file-level diff between the working tree (committed +
+/// uncommitted) and that base. Returns `None` for the cases the
+/// SCM panel silently downgrades to `Head` for — see the trait
+/// method's doc for the full list.
+///
+/// Invoked from the blocking pool.
+fn run_git_default_branch_diff(root: &Utf8Path) -> Option<BranchDiffStatus> {
+	use std::process::Command;
+
+	// Resolve the default-branch remote ref the same way the
+	// existing `git_branch` does, so the toggle's enabled-state
+	// in the SCM panel matches the data we'd actually return.
+	let default_ref = resolve_default_remote_ref(root)?;
+
+	// Bail early when HEAD is detached — there's no meaningful
+	// "branch" to compare and the merge-base call would just
+	// hand us HEAD itself.
+	let head_branch = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+		.output()
+		.ok()?;
+	if !head_branch.status.success() {
+		return None;
+	}
+	let head_name = String::from_utf8_lossy(&head_branch.stdout).trim().to_owned();
+	if head_name.is_empty() {
+		return None;
+	}
+	// On the default branch itself (e.g. `main`) the merge-base is
+	// HEAD and the diff is empty — and the toggle would be
+	// confusing rather than useful. Suppress.
+	if default_ref.split_once('/').map(|(_, b)| b) == Some(head_name.as_str()) {
+		return None;
+	}
+
+	let merge_base = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["merge-base", "HEAD", &default_ref])
+		.output()
+		.ok()?;
+	if !merge_base.status.success() {
+		return None;
+	}
+	let merge_base = String::from_utf8_lossy(&merge_base.stdout).trim().to_owned();
+	if merge_base.is_empty() {
+		return None;
+	}
+
+	// `git diff --name-status -z --no-renames <merge-base>`
+	// compares the working tree (committed + uncommitted) against
+	// `merge-base`. Untracked files are absent from `git diff`
+	// against a tree-ish — that matches the user's "modified /
+	// added / deleted vs main" mental model so we don't need to
+	// merge in porcelain output here.
+	//
+	// `--no-renames` keeps the parser flat: a rename comes through
+	// as `D <old>\0A <new>` instead of the two-path `R<NN>` record,
+	// the same discipline the regular porcelain pipeline uses.
+	let diff = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["diff", "--name-status", "-z", "--no-renames", &merge_base])
+		.output()
+		.ok()?;
+	if !diff.status.success() {
+		tracing::debug!(
+			%merge_base,
+			code = diff.status.code().unwrap_or(-1),
+			stderr = %String::from_utf8_lossy(&diff.stderr).trim(),
+			"git diff --name-status against merge-base failed"
+		);
+		return None;
+	}
+	let entries = parse_diff_name_status_z(&diff.stdout);
+	Some(BranchDiffStatus {
+		merge_base,
+		default_branch_ref: default_ref,
+		entries,
+	})
+}
+
+/// `git diff --name-status -z` records are
+/// `<status>\0<path>\0`-shaped (the `-z` flag swaps the regular
+/// `<status>\t<path>\n` for NUL-separated fields *and* records).
+/// Map the single status byte to the existing `GitFileStatus`
+/// vocabulary; unknown bytes are dropped silently — we'd rather
+/// skip a row than paint an arbitrary status.
+fn parse_diff_name_status_z(buf: &[u8]) -> Vec<GitStatusEntry> {
+	let mut out = Vec::new();
+	let mut cursor = 0;
+	while cursor < buf.len() {
+		// Status field — one byte under `--no-renames`. With
+		// renames enabled this would be `R<NN>` / `C<NN>` which
+		// our caller doesn't ask for, but the loop is still safe:
+		// it'd just hit the `_ => continue` arm and move on.
+		let Some(status_end) = buf[cursor..].iter().position(|&b| b == 0) else {
+			break;
+		};
+		if status_end == 0 {
+			// Empty status field — malformed, bail.
+			break;
+		}
+		let status_byte = buf[cursor];
+		cursor += status_end + 1;
+		let Some(path_end) = buf[cursor..].iter().position(|&b| b == 0) else {
+			break;
+		};
+		let raw_path = &buf[cursor..cursor + path_end];
+		cursor += path_end + 1;
+		let Ok(path) = std::str::from_utf8(raw_path) else {
+			continue;
+		};
+		let status = match status_byte {
+			b'A' => GitFileStatus::Added,
+			b'D' => GitFileStatus::Deleted,
+			b'M' | b'T' => GitFileStatus::Modified,
+			_ => continue,
+		};
+		out.push(GitStatusEntry {
+			path: path.to_owned(),
+			status,
+		});
+	}
+	out
 }
 
 /// Resolve the primary remote's web URL, normalised for link-
@@ -4178,6 +4375,142 @@ mod tests {
 		// path in `Participating` to sort by — the well-formed
 		// row should be a real unix-second value.
 		assert!(rows[0].1.is_some());
+	}
+
+	#[test]
+	fn is_safe_rev_accepts_head_and_40_char_hex() {
+		assert!(is_safe_rev("HEAD"));
+		// Lowercase hex (the shape `git rev-parse` emits).
+		assert!(is_safe_rev("0123456789abcdef0123456789abcdef01234567"));
+		// Uppercase hex — `--` etc. on the path are still safe;
+		// callers stick to lowercase but we accept both.
+		assert!(is_safe_rev("0123456789ABCDEF0123456789ABCDEF01234567"));
+		// Wrong length, non-hex, flag-shaped, branch name.
+		assert!(!is_safe_rev(""));
+		assert!(!is_safe_rev("head"));
+		assert!(!is_safe_rev("main"));
+		assert!(!is_safe_rev("origin/main"));
+		assert!(!is_safe_rev("--upload-pack=evil"));
+		assert!(!is_safe_rev("0123456789abcdef")); // too short
+		assert!(!is_safe_rev("0123456789abcdef0123456789abcdef0123456g")); // non-hex
+	}
+
+	#[test]
+	fn parse_diff_name_status_z_maps_status_bytes_and_skips_unknowns() {
+		// `git diff --name-status -z --no-renames` shape: each
+		// field (status, path) is NUL-terminated, so a record is
+		// `<status>\0<path>\0`. Mix in an unknown byte (`X`) to
+		// confirm the parser drops it instead of poisoning the
+		// row.
+		let raw: &[u8] = b"M\0src/lib.rs\0A\0src/new.rs\0D\0src/gone.rs\0T\0src/typechange.rs\0X\0noise\0";
+		let entries = parse_diff_name_status_z(raw);
+		assert_eq!(entries.len(), 4);
+		assert_eq!(entries[0].path, "src/lib.rs");
+		assert!(matches!(entries[0].status, GitFileStatus::Modified));
+		assert_eq!(entries[1].path, "src/new.rs");
+		assert!(matches!(entries[1].status, GitFileStatus::Added));
+		assert_eq!(entries[2].path, "src/gone.rs");
+		assert!(matches!(entries[2].status, GitFileStatus::Deleted));
+		// Typechange folds into Modified — same surface as the
+		// porcelain pipeline.
+		assert_eq!(entries[3].path, "src/typechange.rs");
+		assert!(matches!(entries[3].status, GitFileStatus::Modified));
+	}
+
+	#[test]
+	fn parse_diff_name_status_z_handles_empty_and_malformed_input() {
+		assert!(parse_diff_name_status_z(b"").is_empty());
+		// Missing terminating NUL on the path — drop the trailing
+		// partial record.
+		assert!(parse_diff_name_status_z(b"M\0src/lib.rs").is_empty());
+	}
+
+	#[tokio::test]
+	async fn git_default_branch_diff_returns_committed_and_uncommitted_changes() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping default-branch diff test");
+			return;
+		};
+		// Two repos: a bare "remote" that we treat as `origin`,
+		// and a clone we run the diff inside.
+		let root = TempDir::new().unwrap();
+		let remote = root.path().join("remote.git");
+		let clone = root.path().join("local");
+		run_git(&git, root.path(), &["init", "--bare", "-q", "-b", "main", "remote.git"]);
+		// Seed `main` on the remote with one commit.
+		let seeder = root.path().join("seeder");
+		std::fs::create_dir_all(&seeder).unwrap();
+		run_git(&git, &seeder, &["init", "-q", "-b", "main"]);
+		run_git(&git, &seeder, &["config", "user.email", "s@example.com"]);
+		run_git(&git, &seeder, &["config", "user.name", "Seeder"]);
+		run_git(&git, &seeder, &["remote", "add", "origin", remote.to_str().unwrap()]);
+		std::fs::write(seeder.join("a.rs"), "fn a() {}\n").unwrap();
+		std::fs::write(seeder.join("b.rs"), "fn b() {}\n").unwrap();
+		run_git(&git, &seeder, &["add", "."]);
+		run_git(&git, &seeder, &["commit", "-q", "-m", "main: initial"]);
+		run_git(&git, &seeder, &["push", "-q", "-u", "origin", "main"]);
+		// Clone the remote; that's where the test runs.
+		run_git(&git, root.path(), &["clone", "-q", remote.to_str().unwrap(), "local"]);
+		run_git(&git, &clone, &["config", "user.email", "l@example.com"]);
+		run_git(&git, &clone, &["config", "user.name", "Local"]);
+		// On a feature branch:
+		// - commit an addition (`new.rs`)
+		// - commit a deletion (`b.rs`)
+		// Then leave one uncommitted modification (`a.rs`) in
+		// the working tree. All three should appear in the diff.
+		run_git(&git, &clone, &["checkout", "-q", "-b", "feat/branch-diff"]);
+		std::fs::write(clone.join("new.rs"), "fn new() {}\n").unwrap();
+		run_git(&git, &clone, &["add", "."]);
+		run_git(&git, &clone, &["commit", "-q", "-m", "add new.rs"]);
+		std::fs::remove_file(clone.join("b.rs")).unwrap();
+		run_git(&git, &clone, &["add", "-A"]);
+		run_git(&git, &clone, &["commit", "-q", "-m", "rm b.rs"]);
+		std::fs::write(clone.join("a.rs"), "fn a() { todo!() }\n").unwrap();
+
+		let utf8 = Utf8PathBuf::from_path_buf(clone.canonicalize().unwrap()).unwrap();
+		let result = LocalHost::new(utf8).git_default_branch_diff().await.unwrap();
+		let Some(diff) = result else {
+			panic!("expected Some(BranchDiffStatus); got None");
+		};
+		assert_eq!(diff.default_branch_ref, "origin/main");
+		assert_eq!(diff.merge_base.len(), 40, "merge_base must be a 40-char SHA");
+		// Map by path so order doesn't matter.
+		let by_path: std::collections::HashMap<&str, GitFileStatus> =
+			diff.entries.iter().map(|e| (e.path.as_str(), e.status)).collect();
+		assert_eq!(by_path.get("new.rs"), Some(&GitFileStatus::Added));
+		assert_eq!(by_path.get("b.rs"), Some(&GitFileStatus::Deleted));
+		assert_eq!(by_path.get("a.rs"), Some(&GitFileStatus::Modified));
+		assert_eq!(by_path.len(), 3, "no untracked / unrelated rows expected: {by_path:?}");
+	}
+
+	#[tokio::test]
+	async fn git_default_branch_diff_returns_none_when_on_default_branch() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping default-branch on-main test");
+			return;
+		};
+		let root = TempDir::new().unwrap();
+		let remote = root.path().join("remote.git");
+		let clone = root.path().join("local");
+		run_git(&git, root.path(), &["init", "--bare", "-q", "-b", "main", "remote.git"]);
+		let seeder = root.path().join("seeder");
+		std::fs::create_dir_all(&seeder).unwrap();
+		run_git(&git, &seeder, &["init", "-q", "-b", "main"]);
+		run_git(&git, &seeder, &["config", "user.email", "s@example.com"]);
+		run_git(&git, &seeder, &["config", "user.name", "Seeder"]);
+		run_git(&git, &seeder, &["remote", "add", "origin", remote.to_str().unwrap()]);
+		std::fs::write(seeder.join("a"), "1").unwrap();
+		run_git(&git, &seeder, &["add", "."]);
+		run_git(&git, &seeder, &["commit", "-q", "-m", "first"]);
+		run_git(&git, &seeder, &["push", "-q", "-u", "origin", "main"]);
+		run_git(&git, root.path(), &["clone", "-q", remote.to_str().unwrap(), "local"]);
+
+		let utf8 = Utf8PathBuf::from_path_buf(clone.canonicalize().unwrap()).unwrap();
+		// Active branch is `main` (the default). The toggle would
+		// be confusing here, so the host returns `None` and the
+		// frontend silently keeps `Head` mode.
+		let result = LocalHost::new(utf8).git_default_branch_diff().await.unwrap();
+		assert!(result.is_none(), "expected None when HEAD is on the default branch");
 	}
 
 	#[test]

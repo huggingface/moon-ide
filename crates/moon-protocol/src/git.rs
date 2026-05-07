@@ -350,6 +350,64 @@ pub enum BranchSwitchTarget {
 	Pr { number: u32 },
 }
 
+/// Which baseline the SCM machinery (status entries, change
+/// gutter, diff view) compares the working tree against. `Head`
+/// is the regular `git status` against `HEAD`. `Default`
+/// substitutes the merge-base with the default branch
+/// (`origin/main` / `origin/master`), so the file tree, gutter,
+/// and diff view all surface "what does this branch / PR change
+/// relative to main" instead of "what's modified since my last
+/// commit".
+///
+/// Persisted per folder in [`crate::session::FolderSession`]:
+/// flipping a busy monorepo into `Default` shouldn't drag a
+/// sleepy side-project's SCM panel along with it. `Default`
+/// silently degrades to `Head` when there's no resolvable
+/// default branch, no merge-base, or HEAD is sitting on the
+/// default branch itself — in those states the toggle still
+/// renders but the underlying view is identical to `Head`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum CompareBaseline {
+	/// Working tree vs `HEAD` — the default `git status` view.
+	#[default]
+	Head,
+	/// Working tree vs `merge-base(HEAD, default-branch)` — the
+	/// "everything this branch changes from main" view.
+	Default,
+}
+
+/// Result of `git_default_branch_diff`. `None` (the outer
+/// `Option`) means "default-branch comparison isn't applicable
+/// here": no repo, no resolvable default branch, HEAD is
+/// detached, HEAD points at the default branch itself, or no
+/// merge-base exists. The frontend treats those cases as "stay
+/// in Head mode regardless of the toggle".
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchDiffStatus {
+	/// SHA of `merge-base(HEAD, default-branch)`. Stable while
+	/// HEAD and the default branch's tip don't move; the diff
+	/// view + change gutter reads file content at this rev when
+	/// the baseline is `Default`.
+	pub merge_base: String,
+	/// Human-readable name of the default branch we resolved
+	/// against — e.g. `"origin/main"`. Surfaced in the SCM panel
+	/// header so the toggle's label can read `vs main` /
+	/// `vs master` correctly.
+	pub default_branch_ref: String,
+	/// File-level changes from `merge_base` to the working tree
+	/// (committed + uncommitted, no rename detection — same
+	/// `--no-renames` discipline as the regular porcelain
+	/// pipeline so renames split into `Deleted(old) +
+	/// Added(new)`). Untracked files aren't in `git diff` against
+	/// a tree-ish, so they don't appear here — matches the user
+	/// mental model of "modified / added / deleted vs main".
+	pub entries: Vec<GitStatusEntry>,
+}
+
 /// Outcome of a successful `git_commit`. The SCM panel renders
 /// `short_sha` + `summary` in the post-commit toast so the user
 /// can verify the commit landed without opening a terminal.

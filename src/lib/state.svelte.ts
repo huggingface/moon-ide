@@ -13,6 +13,7 @@ import {
 	type AppState,
 	type BranchList,
 	type PrListScope,
+	type CompareBaseline,
 	type BranchSwitchTarget,
 	type EditorConfig,
 	type FolderSession,
@@ -195,6 +196,31 @@ class FolderState {
 	// stay in `participating` mode while a side-project keeps the
 	// default `all`. Defaults to `all`.
 	prScope = $state<PrListScope>('all');
+
+	// SCM compare baseline for this folder. `'head'` is the
+	// regular `git status` against HEAD; `'default'` swaps in the
+	// merge-base with the repo's default branch so the file
+	// tree, gutter, and diff view all show "what's different
+	// from main". Persisted in `FolderSession.compare_baseline`.
+	compareBaseline = $state<CompareBaseline>('head');
+
+	// Cached merge-base SHA when `compareBaseline === 'default'`
+	// and the diff actually applies (resolved default branch,
+	// HEAD off the default branch, merge-base exists). `null`
+	// signals "applicable" (host returned `None`) — the
+	// frontend keeps `compareBaseline === 'default'` so the
+	// toggle stays sticky, but every consumer falls back to
+	// `'head'` semantics. Re-derived on every
+	// `refreshGitStatus` pass.
+	defaultBranchMergeBase = $state<string | null>(null);
+
+	// Human-readable name of the default branch we last
+	// resolved against (e.g. `'origin/main'`). Powers the SCM
+	// panel header's `vs main` / `vs master` label so the
+	// toggle reads correctly on `master`-defaulted repos.
+	// `null` mirrors `defaultBranchMergeBase`'s
+	// "not-applicable" semantics.
+	defaultBranchName = $state<string | null>(null);
 
 	constructor(public readonly folderPath: string) {}
 }
@@ -1075,6 +1101,7 @@ class WorkspaceState {
 					// `#[serde(default)]` for older sessions that
 					// don't carry the field; trust whatever lands.
 					fs.prScope = folderSession.pr_scope ?? 'all';
+					fs.compareBaseline = folderSession.compare_baseline ?? 'head';
 				} finally {
 					if (previousActive !== null && previousActive !== folder.path) {
 						try {
@@ -1337,6 +1364,7 @@ class WorkspaceState {
 						has_split: fs.hasSplit,
 						focused_side: fs.focusedSide,
 						pr_scope: fs.prScope,
+						compare_baseline: fs.compareBaseline,
 					});
 				}
 			}
@@ -1798,6 +1826,72 @@ class WorkspaceState {
 		void this.refreshBranchList();
 	}
 
+	/**
+	 * Active folder's SCM compare baseline, surfaced as a derived
+	 * alias so the SCM panel can read/write `workspace.compareBaseline`
+	 * without reaching into `FolderState`. Falls back to `'head'`
+	 * when no folder is bound.
+	 */
+	get compareBaseline(): CompareBaseline {
+		const active = this.workspace?.active_folder ?? null;
+		const fs = active === null ? null : this.folderStates.get(active);
+		return fs?.compareBaseline ?? 'head';
+	}
+
+	/**
+	 * SHA of the merge-base with the default branch, when the
+	 * `'default'` baseline applies. `null` outside the active
+	 * folder, when the host returned `None` (no default branch /
+	 * detached / on default branch / no merge-base), or when the
+	 * baseline is `'head'`.
+	 */
+	get defaultBranchMergeBase(): string | null {
+		const active = this.workspace?.active_folder ?? null;
+		const fs = active === null ? null : this.folderStates.get(active);
+		return fs?.defaultBranchMergeBase ?? null;
+	}
+
+	/**
+	 * Short label for the default branch the SCM toggle compares
+	 * against — e.g. `'origin/main'`. `null` when no default branch
+	 * could be resolved; the SCM panel renders the toggle in
+	 * disabled state in that case.
+	 */
+	get defaultBranchName(): string | null {
+		const active = this.workspace?.active_folder ?? null;
+		const fs = active === null ? null : this.folderStates.get(active);
+		return fs?.defaultBranchName ?? null;
+	}
+
+	/**
+	 * Flip the active folder's SCM compare baseline. Same
+	 * persistence + debounce contract as `setPrScope`. Triggers
+	 * a status refresh so the file tree, gutter, and diff view
+	 * pick up the new source on the next paint.
+	 *
+	 * Setting `'default'` is sticky even when the host can't
+	 * resolve a default branch (e.g. fresh repo before the first
+	 * push): the toggle stays in `'default'` so flipping back
+	 * later doesn't require remembering. Every consumer reads
+	 * `defaultBranchMergeBase`; `null` there means
+	 * "fall back to HEAD-blob semantics for this paint".
+	 */
+	setCompareBaseline(baseline: CompareBaseline) {
+		const active = this.workspace?.active_folder ?? null;
+		const fs = active === null ? null : this.folderStates.get(active);
+		if (!fs || fs.compareBaseline === baseline) {
+			return;
+		}
+		fs.compareBaseline = baseline;
+		// Drop cached blobs for the old baseline — same path
+		// might map to a different `git show <rev>:<path>`
+		// result under the new baseline. Re-fetched lazily on
+		// the next `refreshHead` for each open buffer.
+		this.headByPath = new Map();
+		this.persistAppState();
+		void this.refreshGitStatus(this.paths, null);
+	}
+
 	async refreshBranchList() {
 		this.branchSwitcher.loading = true;
 		try {
@@ -1854,15 +1948,60 @@ class WorkspaceState {
 		// refresh on every status pass is how branch changes
 		// propagate back to the UI.)
 		void this.refreshGitBranch();
-		try {
-			this.gitStatusEntries = await ipc.fs.gitStatusEntries([...paths]);
-		} catch {
-			// Non-fatal — we'd rather leave the tree untinted than
-			// noise up the toast for a git probe failure. If git is
-			// absent the command still succeeds (returns []), so
-			// throwing here is a legitimate filesystem error worth
-			// ignoring for tree cosmetics.
-			this.gitStatusEntries = [];
+		// `'default'` baseline routes through `git diff
+		// --name-status` against the merge-base; the entries
+		// already carry the right modified/added/deleted labels
+		// for the file tree. When the host can't compute that
+		// diff (no default branch, on default branch, detached
+		// HEAD, no merge-base) we fall back to the regular
+		// `git status` path so the tree still paints something
+		// sensible — the toggle stays sticky for free.
+		const fs =
+			this.workspace?.active_folder !== null && this.workspace !== null
+				? (this.folderStates.get(this.workspace.active_folder ?? '') ?? null)
+				: null;
+		const useDefaultBaseline = fs?.compareBaseline === 'default';
+		let usedDefaultBaseline = false;
+		if (useDefaultBaseline) {
+			try {
+				const diff = await ipc.fs.gitDefaultBranchDiff();
+				if (diff !== null) {
+					this.gitStatusEntries = diff.entries;
+					if (fs !== null) {
+						fs.defaultBranchMergeBase = diff.mergeBase;
+						fs.defaultBranchName = diff.defaultBranchRef;
+					}
+					usedDefaultBaseline = true;
+				} else if (fs !== null) {
+					fs.defaultBranchMergeBase = null;
+					fs.defaultBranchName = null;
+				}
+			} catch {
+				// Same fallback discipline as `gitStatusEntries`
+				// below — silently degrade rather than toasting
+				// a tree-cosmetics error. The branch-vs-main
+				// view appears empty until the next refresh.
+				if (fs !== null) {
+					fs.defaultBranchMergeBase = null;
+					fs.defaultBranchName = null;
+				}
+			}
+		} else if (fs !== null) {
+			fs.defaultBranchMergeBase = null;
+			fs.defaultBranchName = null;
+		}
+		if (!usedDefaultBaseline) {
+			try {
+				this.gitStatusEntries = await ipc.fs.gitStatusEntries([...paths]);
+			} catch {
+				// Non-fatal — we'd rather leave the tree untinted
+				// than noise up the toast for a git probe
+				// failure. If git is absent the command still
+				// succeeds (returns []), so throwing here is a
+				// legitimate filesystem error worth ignoring for
+				// tree cosmetics.
+				this.gitStatusEntries = [];
+			}
 		}
 		// `HEAD` moves whenever a git status refresh is warranted
 		// (commit, checkout, pull, reset). Re-fetch the content
@@ -2402,8 +2541,18 @@ class WorkspaceState {
 			return;
 		}
 		this.#headInFlight.add(path);
-		void ipc.fs
-			.gitHeadContent(path)
+		// In `'default'` baseline mode we read the file's content
+		// at the merge-base instead of HEAD. The merge-base SHA
+		// is cached on `FolderState.defaultBranchMergeBase` and
+		// refreshed on every `refreshGitStatus` pass, so the
+		// gutter / diff view automatically catch up when HEAD or
+		// the default branch's tip moves.
+		const mergeBase = this.defaultBranchMergeBase;
+		const fetch =
+			this.compareBaseline === 'default' && mergeBase !== null
+				? ipc.fs.gitRefContent(mergeBase, path)
+				: ipc.fs.gitHeadContent(path);
+		void fetch
 			.then((head) => {
 				// Stale-response guard, same reasoning as `refreshBlame`:
 				// the active folder can have swapped during the await,
@@ -2759,7 +2908,17 @@ class WorkspaceState {
 	 * message to surface.
 	 */
 	private async loadDeletedFile(path: string): Promise<OpenFile | null> {
-		const headText = await ipc.fs.gitHeadContent(path);
+		// Same baseline-aware fetch as `refreshHead`: in
+		// `'default'` mode the "before" side is the merge-base's
+		// blob; otherwise it's HEAD's. A path that's gone from
+		// disk + missing at the active baseline collapses to
+		// `null` and the caller falls back to its disk-read
+		// error message.
+		const mergeBase = this.defaultBranchMergeBase;
+		const headText =
+			this.compareBaseline === 'default' && mergeBase !== null
+				? await ipc.fs.gitRefContent(mergeBase, path)
+				: await ipc.fs.gitHeadContent(path);
 		if (headText === null) {
 			return null;
 		}

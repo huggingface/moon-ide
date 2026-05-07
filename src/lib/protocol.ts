@@ -289,6 +289,30 @@ export type PrListScope = 'all' | 'participating';
  */
 export type BranchSwitchTarget = { kind: 'local'; name: string } | { kind: 'pr'; number: number };
 
+/**
+ * Which baseline the SCM machinery (status entries, change gutter,
+ * diff view) compares the working tree against. `head` is the
+ * regular `git status` against `HEAD`; `default` substitutes the
+ * merge-base with the repo's default branch (`origin/main` /
+ * `origin/master`), so the file tree, gutter, and diff view all
+ * surface "what does this branch / PR change relative to main".
+ * Persisted per folder in `FolderSession.compare_baseline`.
+ * Mirrors `moon_protocol::git::CompareBaseline`.
+ */
+export type CompareBaseline = 'head' | 'default';
+
+/**
+ * Result of `git_default_branch_diff`. The frontend caches the
+ * `mergeBase` SHA so the diff view + change gutter can pull file
+ * content at that rev via `gitRefContent`. Mirrors
+ * `moon_protocol::git::BranchDiffStatus`.
+ */
+export type BranchDiffStatus = {
+	mergeBase: string;
+	defaultBranchRef: string;
+	entries: GitStatusEntry[];
+};
+
 export type GitFileBlame = {
 	path: string;
 	/**
@@ -487,6 +511,8 @@ export type FolderSession = {
 	focused_side: SplitSide;
 	/** Branch-switcher PR-section filter — see `PrListScope`. */
 	pr_scope: PrListScope;
+	/** SCM compare baseline — see `CompareBaseline`. */
+	compare_baseline: CompareBaseline;
 };
 
 /**
