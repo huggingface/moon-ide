@@ -62,6 +62,7 @@ pub fn run() {
 			commands::fs::fs_git_push,
 			commands::fs::fs_git_publish_branch,
 			commands::fs::fs_git_pull,
+			commands::fs::fs_git_fetch,
 			commands::search::search_files,
 			commands::search::search_content,
 			commands::app_state::app_state_load,

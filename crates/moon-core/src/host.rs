@@ -51,13 +51,14 @@ pub trait WorkspaceHost: Send + Sync {
 
 	/// Write `text` after running it through the save pipeline:
 	/// `.editorconfig` line-ending / trim-ws / final-newline normalization,
-	/// then the lint-staged formatter (oxfmt / prettier / rustfmt) for
-	/// files that have one configured. Every editor save and every agent
+	/// then every command in the file's lint-staged chain (run in order,
+	/// against the file already on disk — same shape `bun run
+	/// lint-staged` uses on commit). Every editor save and every agent
 	/// write funnels through this, so the on-disk shape matches what
-	/// `bun run lint-staged` would produce regardless of who issued the
-	/// write. Failures inside the formatter step never abort the save —
-	/// callers are guaranteed to land at least the editorconfig-normalised
-	/// bytes. See [specs/decisions/0012-format-on-save.md](../../../specs/decisions/0012-format-on-save.md).
+	/// lint-staged would produce regardless of who issued the write.
+	/// Failures inside the formatter step never abort the save — callers
+	/// are guaranteed to land at least the editorconfig-normalised bytes.
+	/// See [specs/decisions/0012-format-on-save.md](../../../specs/decisions/0012-format-on-save.md).
 	async fn save_file(&self, path: &Utf8Path, text: &str) -> MoonResult<WriteFileResult>;
 
 	async fn stat(&self, path: &Utf8Path) -> MoonResult<StatResult>;
@@ -261,6 +262,27 @@ pub trait WorkspaceHost: Send + Sync {
 	/// conflict markers in the working tree, dirty-tree refusals,
 	/// and missing-upstream messages all stay readable.
 	async fn git_pull(&self) -> MoonResult<()>;
+
+	/// `git fetch --quiet --no-tags` against the current branch's
+	/// upstream remote (defaults to `origin`). Used by the periodic
+	/// auto-fetch loop in the SCM panel so the "Sync Changes" button
+	/// surfaces when commits land upstream — `git_branch`'s
+	/// ahead/behind read is local-ref-only, so without a fetch the
+	/// `behind` counter never moves on its own.
+	///
+	/// Best-effort. We pin `GIT_TERMINAL_PROMPT=0` and zero out
+	/// `GIT_ASKPASS` / `SSH_ASKPASS` so a remote needing
+	/// credentials fails fast instead of hanging on a TTY prompt
+	/// that the desktop process can't even render. Capped at 30s
+	/// to bound a hung fetch (DNS stall, dropped TCP) — we'd rather
+	/// retry on the next tick than starve the work pool.
+	///
+	/// Errors propagate git's stderr verbatim. Common ones the UI
+	/// is expected to swallow (offline / no remote / no upstream /
+	/// auth refused) are still returned so callers can choose to
+	/// surface them in dev mode; the auto-fetch loop downgrades
+	/// them to `tracing::debug!`.
+	async fn git_fetch(&self) -> MoonResult<()>;
 }
 
 pub struct LocalHost {
@@ -282,28 +304,71 @@ impl LocalHost {
 		&self.root
 	}
 
-	/// Run the lint-staged formatter for `rel` against `text`, if one is
-	/// configured. Returns `None` (caller falls back to the editorconfig-
-	/// normalised text) when there's no rule for the file or when the
-	/// formatter itself misses — every miss path is logged inside
+	/// Run the lint-staged formatter for `rel` against the file
+	/// already on disk. The command is spawned with the absolute file
+	/// path appended as a positional argument and is expected to mutate
+	/// the file in place — same shape `bun run lint-staged` uses on
+	/// commit. Every miss path is logged inside
 	/// [`crate::format::run_formatter`].
-	async fn maybe_run_formatter(&self, rel: &Utf8Path, text: &str) -> Option<String> {
-		let rules = self.lint_staged.for_path(rel).await.ok()?;
+	///
+	/// **TODO (chain truncation)**: when the matched rule has more than
+	/// one command, only the **last** one runs. moon-landing's
+	/// `*.{js,mjs,ts,svelte}` chain pairs `node scripts/lint.ts --fix`
+	/// with `prettier -w` and the node step is too slow to run on every
+	/// save. Once that script is sped up this flips to "run the whole
+	/// chain". A `tracing::warn!` once per process per truncated chain
+	/// length keeps the deviation visible.
+	///
+	/// When the flip happens, the chain runs **all** commands and
+	/// **does not** abort on the first non-zero exit / timeout (unlike
+	/// `bun run lint-staged` on commit). format-on-save is best-effort:
+	/// if `eslint --fix` times out we still want `prettier -w` to run.
+	/// Each failure logs its own warning; the next command in the
+	/// chain spawns regardless. See ADR 0013 § Chain-truncation caveat.
+	///
+	/// Returns `true` when a command ran (whether successfully or not —
+	/// either way the on-disk bytes may have changed and the caller
+	/// should re-read). `false` means "nothing happened, the caller
+	/// can keep the pre-chain bytes".
+	async fn run_formatter_chain(&self, rel: &Utf8Path) -> bool {
+		let Ok(rules) = self.lint_staged.for_path(rel).await else {
+			return false;
+		};
 		if rules.is_empty() {
-			return None;
+			return false;
 		}
 		// `absolute_path` is the only way to get the host-side absolute
 		// path for a workspace-relative input. On `RemoteHost` (Phase 2)
 		// this would be the in-container path — exactly what the
-		// in-container formatter wants on its `--stdin-filepath`.
-		let abs_str = self.absolute_path(rel).await.ok()?;
+		// in-container formatter wants as its file argument.
+		let Ok(abs_str) = self.absolute_path(rel).await else {
+			return false;
+		};
 		let abs = Utf8PathBuf::from(abs_str);
-		let cmd = rules.match_command(abs.as_std_path())?.to_owned();
-		// `config_dir` is `Some` whenever `match_command` returned a hit
-		// (the rule came from a real file on disk); the workspace root
-		// is just a defensive fallback the type system asks for.
+		let Some(commands) = rules.match_commands(abs.as_std_path()) else {
+			return false;
+		};
+		// Until the chain-truncation TODO above is lifted, only the
+		// last command runs. `last()` matches the team's current
+		// configs (the formatter is the last entry; the linter is
+		// before it), so dropping the prefix is the smallest change
+		// that gets format-on-save working again on `moon-landing/server`.
+		let Some(cmd) = commands.last() else {
+			return false;
+		};
+		if commands.len() > 1 {
+			warn_chain_truncated_once(commands.len());
+		}
+		// `config_dir` is `Some` whenever `match_commands` returned a
+		// hit (the rule came from a real file on disk); the workspace
+		// root is just a defensive fallback the type system asks for.
 		let cwd = rules.config_dir().unwrap_or(&self.root).to_path_buf();
-		format::run_formatter(&self.root, &cwd, &abs, &cmd, text).await
+		let _ = format::run_formatter(&self.root, &cwd, &abs, cmd).await;
+		// Whether the subprocess succeeded or not, the on-disk bytes
+		// may have moved; force the caller to re-stat / re-read. (On
+		// failure the file might have been partially mutated before the
+		// non-zero exit.)
+		true
 	}
 
 	/// Resolve a workspace-relative or absolute path against the workspace root.
@@ -693,22 +758,42 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn save_file(&self, path: &Utf8Path, text: &str) -> MoonResult<WriteFileResult> {
-		// Formatter wins: oxfmt / prettier / rustfmt all canonicalise
-		// line endings, trim trailing whitespace, and ensure a final
-		// newline themselves. Running the editorconfig pipeline first
-		// is wasted work (and risks fighting a formatter that has a
-		// different opinion on, say, line-ending style — formatters
-		// are the canonical source of truth for files they own). The
-		// editorconfig pipeline only kicks in as the fallback when no
-		// formatter ran: no lint-staged rule for this file, the rule
-		// pointed at an unsupported tool, or the formatter subprocess
-		// failed. See specs/decisions/0012-format-on-save.md.
-		if let Some(formatted) = self.maybe_run_formatter(path, text).await {
-			return self.write_file(path, &formatted).await;
-		}
+		// Two-stage save (per ADR 0012):
+		//
+		// 1. Editorconfig normalisation in-memory, then write the bytes
+		//    to disk so the formatter has something coherent to read.
+		// 2. Run the lint-staged chain (if any) against that file, in
+		//    the same shape `bun run lint-staged` uses on commit: each
+		//    command spawns with the absolute file path appended and is
+		//    expected to mutate the file in place. Re-stat afterwards
+		//    to pick up the post-format mtime / size for the response.
+		//
+		// Failures in stage 2 never abort the save — the editorconfig
+		// pass already landed on disk, so the worst case is the bytes
+		// are normalised but unformatted.
 		let ec = self.editorconfig.for_path(path).await?;
 		let normalized = pre_save::apply_pipeline(text, &ec);
-		self.write_file(path, &normalized).await
+		let initial = self.write_file(path, &normalized).await?;
+
+		if !self.run_formatter_chain(path).await {
+			return Ok(initial);
+		}
+
+		// Re-stat: the chain mutated the file, so the bytes-on-disk
+		// length and mtime have moved. Cheap (single `stat`), only
+		// runs when we actually formatted.
+		let abs_str = self.absolute_path(path).await?;
+		let abs = Utf8PathBuf::from(abs_str);
+		match tokio::fs::metadata(abs.as_std_path()).await {
+			Ok(metadata) => Ok(WriteFileResult {
+				mtime_ms: metadata.modified().ok().and_then(system_time_to_ms),
+				bytes_written: metadata.len(),
+			}),
+			Err(err) => {
+				tracing::warn!(path = %abs, %err, "format-on-save: post-format stat failed");
+				Ok(initial)
+			}
+		}
 	}
 
 	async fn git_status_entries(&self, paths: &[String]) -> MoonResult<Vec<GitStatusEntry>> {
@@ -943,6 +1028,10 @@ impl WorkspaceHost for LocalHost {
 		tokio::task::spawn_blocking(move || run_git_simple(&root, &["pull"], "git pull"))
 			.await
 			.map_err(|e| MoonError::Internal(format!("git_pull join error: {e}")))?
+	}
+
+	async fn git_fetch(&self) -> MoonResult<()> {
+		run_git_fetch_quiet(&self.root).await
 	}
 }
 
@@ -1350,6 +1439,76 @@ fn run_git_simple(root: &Utf8Path, args: &[&str], label: &str) -> MoonResult<()>
 		};
 		return Err(MoonError::IoError(format!("{label}: {combined}")));
 	}
+	Ok(())
+}
+
+/// `git fetch --quiet --no-tags` with prompts disabled and a 30s
+/// timeout. Used by the periodic auto-fetch loop so the upstream
+/// tracking ref (`refs/remotes/origin/<branch>`) refreshes without
+/// the user clicking anything; `git_branch`'s ahead/behind read
+/// then surfaces the new "Sync Changes" affordance.
+///
+/// Async on purpose: `tokio::process::Command` + `tokio::time::timeout`
+/// gives us the deadline for free; the existing `run_git_simple`
+/// (sync, on the blocking pool) has no timeout and would let a
+/// hung fetch park a worker indefinitely.
+async fn run_git_fetch_quiet(root: &Utf8Path) -> MoonResult<()> {
+	use std::process::Stdio;
+	use tokio::process::Command;
+	use tokio::time::{timeout, Duration};
+
+	const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+	let mut cmd = Command::new("git");
+	cmd.arg("-C")
+		.arg(root.as_std_path())
+		.args(["fetch", "--quiet", "--no-tags"])
+		// Without these env knobs a remote that needs auth (HTTPS
+		// without a credential helper, or SSH without an agent)
+		// hangs waiting on stdin we can't even render. Fail fast so
+		// the auto-fetch loop logs and moves on.
+		.env("GIT_TERMINAL_PROMPT", "0")
+		.env("GIT_ASKPASS", "")
+		.env("SSH_ASKPASS", "")
+		// `LC_ALL=C` matches the convention used elsewhere
+		// (`run_git_commit`) so the few stderr matches we do later
+		// don't drift on localised installs.
+		.env("LC_ALL", "C")
+		.stdin(Stdio::null())
+		.stdout(Stdio::null())
+		.stderr(Stdio::piped());
+
+	let child = cmd
+		.spawn()
+		.map_err(|e| MoonError::IoError(format!("git fetch failed to launch: {e}")))?;
+
+	let output = match timeout(FETCH_TIMEOUT, child.wait_with_output()).await {
+		Ok(Ok(o)) => o,
+		Ok(Err(e)) => return Err(MoonError::IoError(format!("git fetch: {e}"))),
+		Err(_) => {
+			return Err(MoonError::IoError(format!(
+				"git fetch: timed out after {}s",
+				FETCH_TIMEOUT.as_secs()
+			)));
+		}
+	};
+
+	if !output.status.success() {
+		let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+		let detail = if stderr.is_empty() {
+			format!("exit {}", output.status.code().unwrap_or(-1))
+		} else {
+			stderr
+		};
+		// `tracing::debug!` (not `warn!`) because the auto-fetch loop
+		// hits this on every offline / no-upstream / auth-refused
+		// run; promoting them to warn would spam dev terminals.
+		// `RUST_LOG=moon_core=debug` is the supported channel for
+		// triaging "why isn't Sync Changes appearing?".
+		tracing::debug!(root = %root, detail = %detail, "git_fetch failed");
+		return Err(MoonError::IoError(format!("git fetch: {detail}")));
+	}
+
 	Ok(())
 }
 
@@ -2025,6 +2184,25 @@ pub async fn read_host_file(path: &Utf8Path) -> MoonResult<ReadFileResult> {
 		mtime_ms,
 		is_binary: false,
 	})
+}
+
+/// One-shot warning when a lint-staged chain is truncated to its last
+/// command. See `LocalHost::run_formatter_chain` for the rationale and
+/// the TODO that flips this back to "run the whole chain". Deduped on
+/// chain length so a config that adds a third command later in life
+/// still surfaces a fresh warning.
+fn warn_chain_truncated_once(chain_len: usize) {
+	use std::collections::HashSet;
+	use std::sync::{Mutex, OnceLock};
+	static SEEN: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+	let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+	let mut guard = seen.lock().expect("chain-truncated warn cache poisoned");
+	if guard.insert(chain_len) {
+		tracing::warn!(
+			chain_len,
+			"format-on-save: lint-staged chain truncated to last command (temporary; see TODO in LocalHost::run_formatter_chain)"
+		);
+	}
 }
 
 /// Write `text` straight to the host path. Counterpart to
@@ -2753,5 +2931,218 @@ mod tests {
 			"git {args:?} failed: {}",
 			String::from_utf8_lossy(&out.stderr)
 		);
+	}
+
+	#[tokio::test]
+	async fn git_fetch_advances_remote_tracking_ref() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping git_fetch test");
+			return;
+		};
+
+		// Three repos: a bare `remote.git` to push against, `local`
+		// is the workspace under test (we run `git_fetch` here), and
+		// `pusher` is an unrelated clone used to land a new commit
+		// on `remote.git` *behind* `local`'s back. After fetch,
+		// `local`'s `refs/remotes/origin/main` should point at
+		// `pusher`'s last commit.
+		let root = TempDir::new().unwrap();
+		let remote = root.path().join("remote.git");
+		let pusher = root.path().join("pusher");
+		let local = root.path().join("local");
+
+		// Bare repo doesn't have any branches yet — `pusher` (a
+		// fresh non-clone) creates `main` and pushes it so subsequent
+		// `clone` commands have a default branch to land on.
+		run_git(&git, root.path(), &["init", "--bare", "-q", "-b", "main", "remote.git"]);
+		std::fs::create_dir_all(&pusher).unwrap();
+		run_git(&git, &pusher, &["init", "-q", "-b", "main"]);
+		run_git(&git, &pusher, &["config", "user.email", "p@example.com"]);
+		run_git(&git, &pusher, &["config", "user.name", "Pusher"]);
+		run_git(&git, &pusher, &["remote", "add", "origin", remote.to_str().unwrap()]);
+		std::fs::write(pusher.join("README.md"), "v1\n").unwrap();
+		run_git(&git, &pusher, &["add", "."]);
+		run_git(&git, &pusher, &["commit", "-q", "-m", "initial"]);
+		run_git(&git, &pusher, &["push", "-q", "-u", "origin", "main"]);
+
+		run_git(&git, root.path(), &["clone", "-q", remote.to_str().unwrap(), "local"]);
+		run_git(&git, &local, &["config", "user.email", "l@example.com"]);
+		run_git(&git, &local, &["config", "user.name", "Local"]);
+
+		// Land a new commit upstream that `local` knows nothing about.
+		std::fs::write(pusher.join("README.md"), "v2\n").unwrap();
+		run_git(&git, &pusher, &["commit", "-q", "-am", "second"]);
+		run_git(&git, &pusher, &["push", "-q", "origin", "main"]);
+
+		// Pre-fetch: `local`'s `origin/main` is still on the first commit.
+		let pre = std::process::Command::new(&git)
+			.arg("-C")
+			.arg(&local)
+			.args(["rev-parse", "refs/remotes/origin/main"])
+			.output()
+			.unwrap();
+		let pre_sha = String::from_utf8_lossy(&pre.stdout).trim().to_string();
+
+		// Run the function under test.
+		let local_root = Utf8PathBuf::from_path_buf(local.canonicalize().unwrap()).unwrap();
+		LocalHost::new(local_root).git_fetch().await.unwrap();
+
+		// Post-fetch: `origin/main` advanced to the second commit.
+		let post = std::process::Command::new(&git)
+			.arg("-C")
+			.arg(&local)
+			.args(["rev-parse", "refs/remotes/origin/main"])
+			.output()
+			.unwrap();
+		let post_sha = String::from_utf8_lossy(&post.stdout).trim().to_string();
+		assert_ne!(pre_sha, post_sha, "refs/remotes/origin/main did not advance");
+
+		// And `git_branch` now reports `behind = 1` against the
+		// upstream — exactly the signal the SCM panel reads to
+		// surface "Sync Changes".
+		let branch = LocalHost::new(Utf8PathBuf::from_path_buf(local.canonicalize().unwrap()).unwrap())
+			.git_branch()
+			.await
+			.unwrap();
+		assert_eq!(branch.behind, 1, "expected behind=1 after fetch, got {branch:?}");
+	}
+
+	#[tokio::test]
+	async fn git_fetch_fails_fast_on_unreachable_remote() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping git_fetch unreachable test");
+			return;
+		};
+
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		// `file://` URL pointing at a path that doesn't exist —
+		// git fails synchronously with "does not appear to be a git
+		// repository", no network involved, no auth prompt risk.
+		// Validates the error-propagation path without exercising
+		// the 30s timeout (which would slow the test down for no
+		// reason).
+		run_git(
+			&git,
+			dir.path(),
+			&["remote", "add", "origin", "file:///definitely/not/a/repo"],
+		);
+
+		let started = std::time::Instant::now();
+		let err = host(&dir).git_fetch().await.unwrap_err();
+		let elapsed = started.elapsed();
+		assert!(matches!(err, MoonError::IoError(_)), "expected IoError, got {err:?}");
+		assert!(
+			elapsed < std::time::Duration::from_secs(10),
+			"git_fetch took {elapsed:?} — should fail fast, not approach the 30s timeout"
+		);
+	}
+
+	#[cfg(unix)]
+	fn write_executable_script(path: &std::path::Path, body: &str) {
+		use std::os::unix::fs::PermissionsExt;
+		std::fs::write(path, body).unwrap();
+		std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+	}
+
+	/// Whole save pipeline against an arbitrary lint-staged command —
+	/// validates that `save_file` runs commands lint-staged-style (file
+	/// path appended, command mutates file in place) for tools that
+	/// were never in the old `KnownTool` allow-list.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn save_file_runs_arbitrary_lint_staged_command() {
+		let dir = TempDir::new().unwrap();
+		let h = host(&dir);
+
+		write_executable_script(
+			&dir.path().join("uppercase.sh"),
+			"#!/bin/sh\ntr '[:lower:]' '[:upper:]' < \"$1\" > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"\n",
+		);
+		std::fs::write(
+			dir.path().join(".lintstagedrc.json"),
+			r#"{ "*.txt": "./uppercase.sh" }"#,
+		)
+		.unwrap();
+
+		let result = h.save_file(Utf8Path::new("a.txt"), "hello world").await.unwrap();
+		let on_disk = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
+		assert_eq!(on_disk.trim_end(), "HELLO WORLD");
+		assert_eq!(result.bytes_written, on_disk.len() as u64);
+	}
+
+	/// Until the chain-truncation TODO in `run_formatter_chain` lifts,
+	/// only the **last** command in a chain runs. Earlier commands are
+	/// dropped on the floor — verified here by giving the first command
+	/// a script that would clobber the file with a marker, and the
+	/// last command a script that produces a different recognisable
+	/// shape. Update this test to assert "both ran in order" once the
+	/// TODO flips.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn save_file_runs_only_last_command_in_chain() {
+		let dir = TempDir::new().unwrap();
+		let h = host(&dir);
+
+		write_executable_script(&dir.path().join("first.sh"), "#!/bin/sh\nprintf 'first-ran' > \"$1\"\n");
+		write_executable_script(
+			&dir.path().join("upper.sh"),
+			"#!/bin/sh\ntr '[:lower:]' '[:upper:]' < \"$1\" > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"\n",
+		);
+		std::fs::write(
+			dir.path().join(".lintstagedrc.json"),
+			r#"{ "*.txt": ["./first.sh", "./upper.sh"] }"#,
+		)
+		.unwrap();
+
+		h.save_file(Utf8Path::new("a.txt"), "hello world").await.unwrap();
+		let on_disk = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
+		// `upper.sh` ran on the editorconfig-normalised text, not on
+		// `first.sh`'s marker. If `first.sh` had run, the file would
+		// contain `first-ran` (or `FIRST-RAN` if it then went through
+		// `upper.sh`).
+		assert!(
+			on_disk.contains("HELLO WORLD"),
+			"expected upper.sh output, got: {on_disk:?}"
+		);
+		assert!(
+			!on_disk.to_lowercase().contains("first-ran"),
+			"first.sh should have been skipped, got: {on_disk:?}"
+		);
+	}
+
+	/// Failure of the (only-run) last command is non-fatal: the
+	/// editorconfig-normalised bytes stay on disk and save still
+	/// returns success.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn save_file_keeps_normalised_text_when_last_command_fails() {
+		let dir = TempDir::new().unwrap();
+		let h = host(&dir);
+
+		write_executable_script(&dir.path().join("fail.sh"), "#!/bin/sh\nexit 1\n");
+		std::fs::write(dir.path().join(".lintstagedrc.json"), r#"{ "*.txt": "./fail.sh" }"#).unwrap();
+
+		h.save_file(Utf8Path::new("a.txt"), "input  ").await.unwrap();
+		let on_disk = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
+		// editorconfig stripped the trailing whitespace and added the
+		// final newline; the failing formatter didn't get to mutate
+		// further.
+		assert_eq!(on_disk, "input\n");
+	}
+
+	/// No matching lint-staged rule → editorconfig pipeline still runs
+	/// (final newline ensured, trailing whitespace stripped).
+	#[tokio::test]
+	async fn save_file_falls_back_to_editorconfig_when_no_rule() {
+		let dir = TempDir::new().unwrap();
+		let h = host(&dir);
+
+		// No `.lintstagedrc.json`, so `match_commands` returns None.
+		h.save_file(Utf8Path::new("a.txt"), "hello   \nworld\t").await.unwrap();
+		let on_disk = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
+		assert_eq!(on_disk, "hello\nworld\n");
 	}
 }

@@ -672,6 +672,11 @@ class WorkspaceState {
 			const ws = await ipc.workspace.setActiveFolder(path);
 			await this.adoptWorkspaceSnapshot(ws);
 			this.persistAppState();
+			// Kick an auto-fetch on the new folder so the Sync Changes
+			// button surfaces promptly instead of waiting for the next
+			// 3-minute periodic tick. Throttled internally — rapid
+			// folder-switching doesn't spam fetches.
+			void this.runGitAutoFetch('folder-switch');
 		} catch (err) {
 			this.flash(`Could not switch folder: ${formatError(err)}`);
 		}
@@ -930,6 +935,7 @@ class WorkspaceState {
 		// one — no per-tab subscription dance.
 		void composeLogs.wireRuntime();
 		this.wireNextEditProbe();
+		this.wireGitAutoFetch();
 		void this.refreshNextEditServerStatusThenMaybeAutostart();
 		// Terminal output rides on its own event channel —
 		// see `terminal.svelte.ts`. Wired once at startup so
@@ -1168,6 +1174,91 @@ class WorkspaceState {
 		window.setInterval(() => {
 			void this.refreshNextEditProbe();
 		}, 8000);
+	}
+
+	private gitAutoFetchWired = false;
+	private gitAutoFetchInFlight = false;
+	private gitAutoFetchLastAt = 0;
+
+	/**
+	 * Periodic `git fetch` against the active folder so the SCM
+	 * panel's "Sync Changes" button surfaces when commits land
+	 * upstream — `git_branch`'s ahead/behind read is local-ref-only
+	 * and otherwise stays stale until the user manually pulls /
+	 * pushes / runs `git fetch` from a terminal. Triggers:
+	 *
+	 * - **Once** ~5s after wire so the IDE has settled.
+	 * - **Every 3 minutes** thereafter (matches VSCode / Cursor's
+	 *   `git.autofetchPeriod` default — hardcoded; flip to a
+	 *   setting when someone asks).
+	 * - **On window focus**, throttled so an alt-tab flurry doesn't
+	 *   spam fetches.
+	 *
+	 * Best-effort: failures (offline, auth refused, 30s timeout
+	 * inside `git_fetch`) are silently swallowed — the user never
+	 * asked us to fetch, so a flash toast would be noise. The
+	 * backend's `tracing::debug!("git_fetch failed", ...)` in
+	 * `run_git_fetch_quiet` is the supported triage channel
+	 * (`RUST_LOG=moon_core=debug`). Skips when the document is
+	 * hidden, when no folder is active, and when a fetch is
+	 * already in flight.
+	 */
+	private wireGitAutoFetch() {
+		if (this.gitAutoFetchWired || typeof window === 'undefined') {
+			return;
+		}
+		this.gitAutoFetchWired = true;
+		window.setTimeout(() => void this.runGitAutoFetch('initial'), 5_000);
+		window.setInterval(
+			() => {
+				void this.runGitAutoFetch('interval');
+			},
+			3 * 60 * 1000,
+		);
+		window.addEventListener('focus', () => {
+			void this.runGitAutoFetch('focus');
+		});
+	}
+
+	private async runGitAutoFetch(reason: 'initial' | 'interval' | 'focus' | 'folder-switch'): Promise<void> {
+		if (this.gitAutoFetchInFlight) {
+			return;
+		}
+		if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+			return;
+		}
+		if (!this.activeFolder) {
+			return;
+		}
+		const now = Date.now();
+		// 30s minimum between fetches except for the periodic timer.
+		// Focus / folder-switch triggers are bursty by nature; the
+		// 3-minute periodic tick is the floor for "we definitely
+		// want a fresh fetch even if nothing else nudged us".
+		if (reason !== 'interval' && now - this.gitAutoFetchLastAt < 30_000) {
+			return;
+		}
+		this.gitAutoFetchLastAt = now;
+		this.gitAutoFetchInFlight = true;
+		try {
+			await ipc.fs.gitFetch();
+			// Fetch only moves remote-tracking refs; local working
+			// tree, index, HEAD all unchanged. Just refresh the
+			// branch readout so `behind` reflects the new upstream
+			// and the Sync Changes button surfaces. A full
+			// `refreshGitStatus` would be wasted work.
+			await this.refreshGitBranch();
+		} catch {
+			// Auto-fetch failures (offline, no upstream, auth refused,
+			// 30s timeout) are silently swallowed — the user never
+			// asked us to fetch, so a flash toast / dev-console log
+			// would be noise. The user-visible signal is "Sync
+			// Changes" not appearing; the supported channel for
+			// triaging is `RUST_LOG=moon_core=debug` plus the dev
+			// tools' Network tab on the Tauri IPC.
+		} finally {
+			this.gitAutoFetchInFlight = false;
+		}
 	}
 
 	private persistAppState() {

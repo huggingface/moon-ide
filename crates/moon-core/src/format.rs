@@ -1,124 +1,122 @@
 //! The `RunFormatter` rung of the pre-save pipeline.
 //!
-//! Translates a lint-staged command (e.g. `prettier --write`) into the
-//! tool's stdin/stdout invocation, runs it with a 5s timeout, and
-//! returns the formatted text. Saves must always succeed, so any
-//! failure here (binary missing, non-zero exit, timeout, non-utf-8
-//! stdout) collapses to `None` with a `tracing::warn!`; the caller
-//! falls back to the editorconfig-normalised text.
+//! Runs a lint-staged command against the on-disk file, in the same
+//! shape `bun run lint-staged` itself does on commit: spawn the binary
+//! the user wrote in their config, append the absolute file path as a
+//! positional argument, let the tool mutate the file in place. No
+//! per-tool allow-list, no flag rewriting, no stdin plumbing.
 //!
-//! See [specs/decisions/0012-format-on-save.md](../../../specs/decisions/0012-format-on-save.md).
+//! The team's `node_modules/.bin/` chain (from `cwd` up to the
+//! workspace root) is prepended to `PATH` so locally-installed tools
+//! resolve before system ones — same convention `npm-run-path` /
+//! lint-staged itself use.
+//!
+//! Saves must always succeed, so any failure here (binary missing,
+//! non-zero exit, timeout, spawn error) collapses to `Ok(false)` with a
+//! `tracing::warn!` and the caller keeps going / accepts whatever the
+//! file looked like before this command ran. Chain commands abort on
+//! the first failure, mirroring lint-staged's semantics.
+//!
+//! See [specs/decisions/0013-format-on-save-file-based.md](../../../specs/decisions/0013-format-on-save-file-based.md)
+//! (the current design) and
+//! [specs/decisions/0012-format-on-save.md](../../../specs/decisions/0012-format-on-save.md)
+//! (the original stdin/stdout design that this supersedes).
 
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::Utf8Path;
 use std::collections::HashSet;
+use std::env;
+use std::ffi::OsString;
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
 const FORMAT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Run the lint-staged `command` for `abs_file_path` against `text` and
-/// return the formatted output. `workspace_root` bounds the upward
-/// `node_modules/.bin` walk so we don't escape the workspace looking
-/// for tools. `config_dir` is the directory that hosts the
-/// `.lintstagedrc.json` / `package.json#lint-staged` whose `command`
-/// we're running — we use it as the subprocess cwd (so relative
-/// arguments like `--ignore-path ../.prettierignore` resolve from the
-/// same place lint-staged would resolve them) and as the starting
-/// point for the `node_modules/.bin` walk (matches lint-staged's own
-/// per-package binary discovery in pnpm-style monorepos where each
-/// workspace package carries its own `node_modules/.bin`).
+/// Run the lint-staged `command` for `abs_file_path`. The subprocess
+/// runs with `config_dir` as its `cwd` (so relative arguments like
+/// `--ignore-path ../.prettierignore` resolve from the same place
+/// lint-staged itself would resolve them) and `PATH` prefixed with
+/// every `node_modules/.bin/` directory walking from `config_dir` up to
+/// `workspace_root` (matches lint-staged's per-package binary discovery
+/// in pnpm-style monorepos).
+///
+/// Returns `Ok(true)` when the subprocess exited 0; `Ok(false)` for any
+/// failure that's been logged. Errors are collapsed to `Ok(false)` —
+/// format-on-save is best-effort by design.
 pub async fn run_formatter(
 	workspace_root: &Utf8Path,
 	config_dir: &Utf8Path,
 	abs_file_path: &Utf8Path,
 	command: &str,
-	text: &str,
-) -> Option<String> {
+) -> bool {
 	let parts = parse_command(command);
-	let (bin_token, user_args) = parts.split_first()?;
+	let Some((bin_token, user_args)) = parts.split_first() else {
+		return false;
+	};
 	let bin_name = bin_basename(bin_token);
 
-	let Some(tool) = KnownTool::from_bin_name(bin_name) else {
-		warn_once("unsupported", bin_name, || {
-			tracing::warn!(tool = bin_name, "format-on-save: unsupported tool; skipping")
-		});
-		return None;
+	let mut argv: Vec<&str> = user_args.iter().map(String::as_str).collect();
+	let abs_str = abs_file_path.as_str();
+	argv.push(abs_str);
+
+	let path_var = build_path_env(config_dir, workspace_root);
+
+	let mut cmd = Command::new(bin_token);
+	cmd
+		.args(&argv)
+		.current_dir(config_dir.as_str())
+		.env("PATH", &path_var)
+		.stdin(Stdio::null())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped());
+
+	let child = match cmd.spawn() {
+		Ok(c) => c,
+		Err(err) => {
+			if err.kind() == std::io::ErrorKind::NotFound {
+				warn_once("missing", bin_name, || {
+					tracing::warn!(
+						tool = bin_name,
+						"format-on-save: tool not found in node_modules/.bin or $PATH; skipping"
+					)
+				});
+			} else {
+				tracing::warn!(tool = bin_name, %err, "format-on-save: spawn failed");
+			}
+			return false;
+		}
 	};
 
-	let resolved_bin = resolve_binary(tool, config_dir, workspace_root)?;
-	let argv = tool.build_argv(user_args, abs_file_path);
-
-	spawn_and_capture(&resolved_bin, &argv, config_dir, text).await
-}
-
-#[derive(Debug, Clone, Copy)]
-enum KnownTool {
-	Oxfmt,
-	Prettier,
-	Rustfmt,
-}
-
-impl KnownTool {
-	fn from_bin_name(name: &str) -> Option<Self> {
-		match name {
-			"oxfmt" => Some(Self::Oxfmt),
-			"prettier" => Some(Self::Prettier),
-			"rustfmt" => Some(Self::Rustfmt),
-			_ => None,
+	let output = match timeout(FORMAT_TIMEOUT, child.wait_with_output()).await {
+		Ok(Ok(o)) => o,
+		Ok(Err(err)) => {
+			tracing::warn!(tool = bin_name, %err, "format-on-save: subprocess failed");
+			return false;
 		}
-	}
-
-	fn binary_name(self) -> &'static str {
-		match self {
-			Self::Oxfmt => "oxfmt",
-			Self::Prettier => "prettier",
-			Self::Rustfmt => "rustfmt",
+		Err(_) => {
+			tracing::warn!(
+				tool = bin_name,
+				timeout_ms = FORMAT_TIMEOUT.as_millis() as u64,
+				"format-on-save: tool timed out"
+			);
+			return false;
 		}
+	};
+
+	if !output.status.success() {
+		let stderr = String::from_utf8_lossy(&output.stderr);
+		tracing::warn!(
+			tool = bin_name,
+			status = ?output.status,
+			stderr = %stderr.trim(),
+			"format-on-save: tool exited with error"
+		);
+		return false;
 	}
 
-	/// Look in `node_modules/.bin/` first for tools the team installs
-	/// via npm. `rustfmt` ships with rustup; PATH-only.
-	fn prefers_node_modules(self) -> bool {
-		matches!(self, Self::Oxfmt | Self::Prettier)
-	}
-
-	/// Translate the lint-staged user args into the tool's stdin-mode
-	/// argv. Mode flags that force file-mutation (`--write`, `--check`,
-	/// `--list-different`) are stripped — we only run in stdin mode.
-	fn build_argv(self, user_args: &[String], abs_path: &Utf8Path) -> Vec<String> {
-		let filtered: Vec<String> = user_args.iter().filter(|a| !is_mode_flag(a)).cloned().collect();
-		match self {
-			Self::Oxfmt => {
-				let mut argv = filtered;
-				argv.push(format!("--stdin-filepath={abs_path}"));
-				argv
-			}
-			Self::Prettier => {
-				let mut argv = filtered;
-				argv.push("--stdin-filepath".to_owned());
-				argv.push(abs_path.to_string());
-				argv
-			}
-			Self::Rustfmt => {
-				let mut argv = vec!["--emit".to_owned(), "stdout".to_owned()];
-				argv.extend(filtered);
-				argv
-			}
-		}
-	}
-}
-
-fn is_mode_flag(arg: &str) -> bool {
-	// `--write` / `-w` and friends force file-mutation mode; combined
-	// with `--stdin-filepath` prettier rejects the invocation outright,
-	// so we strip the short forms too. oxfmt accepts the long forms but
-	// not the shorts; rustfmt has neither — both safe to strip
-	// universally.
-	matches!(arg, "--write" | "-w" | "--check" | "-c" | "--list-different" | "-l")
+	true
 }
 
 /// Whitespace split. Lint-staged commands are simple — no shell pipes,
@@ -137,111 +135,35 @@ fn bin_basename(s: &str) -> &str {
 	}
 }
 
-fn resolve_binary(tool: KnownTool, start_dir: &Utf8Path, root: &Utf8Path) -> Option<Utf8PathBuf> {
-	let name = tool.binary_name();
-	if tool.prefers_node_modules() {
-		if let Some(p) = find_node_modules_bin(name, start_dir, root) {
-			return Some(p);
-		}
-	}
-	match which::which(name) {
-		Ok(p) => match Utf8PathBuf::from_path_buf(p) {
-			Ok(p) => Some(p),
-			Err(p) => {
-				tracing::warn!(path = ?p, tool = name, "format-on-save: tool path is not utf-8; skipping");
-				None
-			}
-		},
-		Err(_) => {
-			warn_once("missing", name, || {
-				tracing::warn!(
-					tool = name,
-					"format-on-save: tool not found in node_modules/.bin or $PATH; skipping"
-				)
-			});
-			None
-		}
-	}
-}
-
-fn find_node_modules_bin(name: &str, start: &Utf8Path, root: &Utf8Path) -> Option<Utf8PathBuf> {
+/// Build a `PATH` value with every `node_modules/.bin/` directory from
+/// `start` up to `root` (inclusive) prepended to the inherited `PATH`.
+/// Mirrors `npm-run-path`: a project-installed `prettier` resolves
+/// before any system one, but `node` / `bun` / `rustfmt` (which aren't
+/// in `node_modules/.bin/`) fall through to the system path.
+fn build_path_env(start: &Utf8Path, root: &Utf8Path) -> OsString {
+	let separator = if cfg!(windows) { ';' } else { ':' };
+	let mut prefix = String::new();
 	let mut current: Option<&Utf8Path> = Some(start);
 	while let Some(dir) = current {
-		let candidate = dir.join("node_modules").join(".bin").join(name);
-		if candidate.exists() {
-			return Some(candidate);
+		let bin = dir.join("node_modules").join(".bin");
+		if !prefix.is_empty() {
+			prefix.push(separator);
 		}
+		prefix.push_str(bin.as_str());
 		if dir == root {
 			break;
 		}
 		current = dir.parent();
 	}
-	None
-}
 
-async fn spawn_and_capture(bin: &Utf8Path, argv: &[String], cwd: &Utf8Path, text: &str) -> Option<String> {
-	let mut cmd = Command::new(bin.as_str());
-	cmd
-		.args(argv)
-		.current_dir(cwd.as_str())
-		.stdin(Stdio::piped())
-		.stdout(Stdio::piped())
-		.stderr(Stdio::piped());
-
-	let mut child = match cmd.spawn() {
-		Ok(c) => c,
-		Err(err) => {
-			tracing::warn!(bin = %bin, %err, "format-on-save: spawn failed");
-			return None;
+	let mut out = OsString::from(prefix);
+	if let Some(existing) = env::var_os("PATH") {
+		if !out.is_empty() {
+			out.push(separator.to_string());
 		}
-	};
-
-	// Write stdin in a separate task and read stdout via
-	// `wait_with_output` so a tool that streams its output (and would
-	// block on a full 64 KiB pipe buffer if stdin and stdout were on the
-	// same task) can't deadlock with us.
-	let stdin = child.stdin.take();
-	let bytes = text.as_bytes().to_vec();
-	let writer = tokio::spawn(async move {
-		if let Some(mut stdin) = stdin {
-			if let Err(err) = stdin.write_all(&bytes).await {
-				tracing::warn!(%err, "format-on-save: stdin write failed");
-			}
-			let _ = stdin.shutdown().await;
-		}
-	});
-
-	let output = match timeout(FORMAT_TIMEOUT, child.wait_with_output()).await {
-		Ok(Ok(o)) => o,
-		Ok(Err(err)) => {
-			tracing::warn!(%err, "format-on-save: subprocess failed");
-			let _ = writer.await;
-			return None;
-		}
-		Err(_) => {
-			tracing::warn!(
-				timeout_ms = FORMAT_TIMEOUT.as_millis() as u64,
-				"format-on-save: tool timed out"
-			);
-			let _ = writer.await;
-			return None;
-		}
-	};
-	let _ = writer.await;
-
-	if !output.status.success() {
-		let stderr = String::from_utf8_lossy(&output.stderr);
-		tracing::warn!(status = ?output.status, stderr = %stderr.trim(), "format-on-save: tool exited with error");
-		return None;
+		out.push(existing);
 	}
-
-	match String::from_utf8(output.stdout) {
-		Ok(s) => Some(s),
-		Err(err) => {
-			tracing::warn!(%err, "format-on-save: tool stdout was not utf-8");
-			None
-		}
-	}
+	out
 }
 
 fn warn_once(kind: &'static str, key: &str, emit: impl FnOnce()) {
@@ -257,6 +179,8 @@ fn warn_once(kind: &'static str, key: &str, emit: impl FnOnce()) {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use camino::Utf8PathBuf;
+	use tempfile::TempDir;
 
 	#[test]
 	fn parse_command_splits_on_whitespace() {
@@ -281,80 +205,80 @@ mod tests {
 	}
 
 	#[test]
-	fn build_argv_oxfmt_appends_stdin_filepath() {
-		let argv = KnownTool::Oxfmt.build_argv(&[], Utf8Path::new("/abs/foo.ts"));
-		assert_eq!(argv, vec!["--stdin-filepath=/abs/foo.ts".to_owned()]);
+	fn build_path_env_walks_from_start_to_root() {
+		let tmp = TempDir::new().unwrap();
+		let root = Utf8PathBuf::from_path_buf(tmp.path().canonicalize().unwrap()).unwrap();
+		let nested = root.join("a").join("b");
+		std::fs::create_dir_all(nested.as_std_path()).unwrap();
+
+		let path = build_path_env(&nested, &root);
+		let s = path.to_string_lossy();
+		let parts: Vec<&str> = s.split(if cfg!(windows) { ';' } else { ':' }).collect();
+		// Closest first, then walking up to root.
+		assert_eq!(parts[0], nested.join("node_modules/.bin").as_str());
+		assert_eq!(parts[1], root.join("a/node_modules/.bin").as_str());
+		assert_eq!(parts[2], root.join("node_modules/.bin").as_str());
+		// Inherited PATH is appended after the prefix; its presence /
+		// content is environment-dependent so just sanity-check that
+		// at least one extra entry came through when the host has a
+		// PATH (basically always in CI / dev shells).
+		if env::var_os("PATH").is_some() {
+			assert!(parts.len() > 3, "expected inherited PATH to be appended: {s}");
+		}
 	}
 
-	#[test]
-	fn build_argv_prettier_strips_write_flag() {
-		let user = vec!["--write".to_owned(), "--plugin=foo".to_owned()];
-		let argv = KnownTool::Prettier.build_argv(&user, Utf8Path::new("/abs/App.svelte"));
-		assert_eq!(
-			argv,
-			vec![
-				"--plugin=foo".to_owned(),
-				"--stdin-filepath".to_owned(),
-				"/abs/App.svelte".to_owned(),
-			]
-		);
+	/// Smoke test the whole spawn path: drop a tiny shell script in the
+	/// temp dir that mutates the file argument it receives, run it
+	/// through `run_formatter`, and assert the file changed. Validates
+	/// the contract that matters — "appends the abs path as the last
+	/// positional arg" — without bundling prettier / oxfmt into CI.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn run_formatter_spawns_and_passes_path() {
+		use std::os::unix::fs::PermissionsExt;
+		let tmp = TempDir::new().unwrap();
+		let root = Utf8PathBuf::from_path_buf(tmp.path().canonicalize().unwrap()).unwrap();
+
+		let script = root.join("fmt.sh");
+		std::fs::write(
+			script.as_std_path(),
+			"#!/bin/sh\nprintf 'formatted:%s\\n' \"$1\" > \"$1\"\n",
+		)
+		.unwrap();
+		std::fs::set_permissions(script.as_std_path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+		let file = root.join("input.txt");
+		std::fs::write(file.as_std_path(), "before").unwrap();
+
+		let ok = run_formatter(&root, &root, &file, "./fmt.sh").await;
+		assert!(ok);
+
+		let after = std::fs::read_to_string(file.as_std_path()).unwrap();
+		assert!(after.starts_with("formatted:"), "got: {after:?}");
+		assert!(after.contains(file.as_str()), "got: {after:?}");
 	}
 
-	#[test]
-	fn build_argv_rustfmt_prepends_emit_stdout() {
-		let user = vec!["--edition".to_owned(), "2021".to_owned()];
-		let argv = KnownTool::Rustfmt.build_argv(&user, Utf8Path::new("/abs/lib.rs"));
-		assert_eq!(
-			argv,
-			vec![
-				"--emit".to_owned(),
-				"stdout".to_owned(),
-				"--edition".to_owned(),
-				"2021".to_owned(),
-			]
-		);
+	#[tokio::test]
+	async fn run_formatter_missing_tool_returns_false() {
+		let tmp = TempDir::new().unwrap();
+		let root = Utf8PathBuf::from_path_buf(tmp.path().canonicalize().unwrap()).unwrap();
+		let file = root.join("a.txt");
+		std::fs::write(file.as_std_path(), "x").unwrap();
+
+		let ok = run_formatter(&root, &root, &file, "definitely-not-a-real-binary-xyzzy").await;
+		assert!(!ok);
 	}
 
-	#[test]
-	fn build_argv_strips_check_and_list_different() {
-		let user = vec!["--check".to_owned(), "--list-different".to_owned()];
-		let argv = KnownTool::Prettier.build_argv(&user, Utf8Path::new("/x/y.ts"));
-		assert_eq!(argv, vec!["--stdin-filepath".to_owned(), "/x/y.ts".to_owned()]);
-	}
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn run_formatter_non_zero_exit_returns_false() {
+		let tmp = TempDir::new().unwrap();
+		let root = Utf8PathBuf::from_path_buf(tmp.path().canonicalize().unwrap()).unwrap();
+		let file = root.join("a.txt");
+		std::fs::write(file.as_std_path(), "x").unwrap();
 
-	#[test]
-	fn build_argv_strips_short_mode_flags() {
-		// Regression: `prettier -w --ignore-path ../.prettierignore` is
-		// the lint-staged command used by moon-landing's `server/`
-		// package; without short-flag stripping we'd ship `-w` to
-		// prettier alongside `--stdin-filepath`, which prettier
-		// rejects with a non-zero exit and we'd silently fall back to
-		// the un-formatted text.
-		let user = vec![
-			"-w".to_owned(),
-			"--ignore-path".to_owned(),
-			"../.prettierignore".to_owned(),
-		];
-		let argv = KnownTool::Prettier.build_argv(&user, Utf8Path::new("/abs/server/ambient.d.ts"));
-		assert_eq!(
-			argv,
-			vec![
-				"--ignore-path".to_owned(),
-				"../.prettierignore".to_owned(),
-				"--stdin-filepath".to_owned(),
-				"/abs/server/ambient.d.ts".to_owned(),
-			]
-		);
-	}
-
-	#[test]
-	fn known_tool_from_name() {
-		assert!(matches!(KnownTool::from_bin_name("oxfmt"), Some(KnownTool::Oxfmt)));
-		assert!(matches!(
-			KnownTool::from_bin_name("prettier"),
-			Some(KnownTool::Prettier)
-		));
-		assert!(matches!(KnownTool::from_bin_name("rustfmt"), Some(KnownTool::Rustfmt)));
-		assert!(KnownTool::from_bin_name("eslint").is_none());
+		// `false` always exits 1 — file path arg is ignored.
+		let ok = run_formatter(&root, &root, &file, "false").await;
+		assert!(!ok);
 	}
 }

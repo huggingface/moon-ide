@@ -46,14 +46,14 @@ trait BeforeSaveTransform {
 }
 ```
 
-The save pipeline is, in priority order:
+The save pipeline runs in two stages:
 
-1. `RunFormatter` — pulled forward from Phase 8 as a bootstrap concern. See [ADR 0012 — Format on save via lint-staged](decisions/0012-format-on-save.md). Driven by the project's `.lintstagedrc.json` (or `package.json#lint-staged`); supersedes the speculative direction in [ADR 0006](decisions/0006-no-settings-file.md) where the knob would have been a moon-specific `.editorconfig` extension. **Wins outright when it ran successfully**: oxfmt / prettier / rustfmt all canonicalise line endings, trailing whitespace, and the final newline themselves, so the formatter's output goes straight to disk and the editorconfig steps below are skipped.
-2. `EnsureLineEndings` — `end_of_line`. Fallback for files without a formatter.
-3. `TrimTrailingWhitespace` — `trim_trailing_whitespace`. Fallback for files without a formatter.
-4. `EnsureFinalNewline` — `insert_final_newline`. Fallback for files without a formatter.
+1. **In-memory editorconfig normalization** — `EnsureLineEndings` (`end_of_line`), `TrimTrailingWhitespace` (`trim_trailing_whitespace`), `EnsureFinalNewline` (`insert_final_newline`). Always runs. The normalised bytes are written to disk via `write_file`.
+2. **Lint-staged formatter chain** — every command in the file's lint-staged rule, run in order against the on-disk file (each command spawns with the absolute file path appended and is expected to mutate the file in place; abort the chain on the first non-zero exit). Pulled forward from Phase 8 as a bootstrap concern. See [ADR 0013 — Format on save: file-based lint-staged invocation](decisions/0013-format-on-save-file-based.md), which supersedes the stdin/stdout design in [ADR 0012](decisions/0012-format-on-save.md). Driven by the project's `.lintstagedrc.json` (or `package.json#lint-staged`). When a chain ran the file gets re-stat'd so the response carries the post-format mtime / size; the editor re-reads to pick up the bytes a formatter mutated.
 
-The full save seam is the `WorkspaceHost::save_file` trait method, not `WorkspaceHost::write_file`. `save_file` runs the priority order above and then delegates to `write_file` for the raw bytes. Every editor save (`fs_write_file`) and every coder/agent edit funnels through `save_file`; raw `write_file` stays available for tests and any future caller that wants exactly the bytes it hands in.
+The editorconfig pass is essentially redundant for files a formatter owns (oxfmt / prettier / rustfmt all canonicalise line endings + trim + final newline themselves) but the cost is one in-memory string transform per save — cheap, idempotent, and it gives files without a lint-staged rule the same baseline.
+
+The full save seam is the `WorkspaceHost::save_file` trait method, not `WorkspaceHost::write_file`. `save_file` orchestrates both stages above. Every editor save (`fs_write_file`) and every coder/agent edit funnels through `save_file`; raw `write_file` stays available for tests and any future caller that wants exactly the bytes it hands in.
 
 ### Editor (CodeMirror) integration
 

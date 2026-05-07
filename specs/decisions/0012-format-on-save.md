@@ -1,7 +1,7 @@
 # ADR 0012 — Format on save via lint-staged
 
 Date: 2026-05-05
-Status: accepted
+Status: accepted; the **stdin/stdout invocation**, **first-match reduction**, and **`KnownTool` allow-list** sections are superseded by [ADR 0013 — Format on save: file-based lint-staged invocation](0013-format-on-save-file-based.md). The rest stands: `.lintstagedrc.json` is still the source of truth, JSON-only, the `RunFormatter` step is still the seam, failures still never abort the save.
 
 ## Context
 

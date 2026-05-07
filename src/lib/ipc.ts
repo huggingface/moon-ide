@@ -81,6 +81,7 @@ export const ipc = {
 		gitPush: () => invoke<void>('fs_git_push'),
 		gitPublishBranch: () => invoke<void>('fs_git_publish_branch'),
 		gitPull: () => invoke<void>('fs_git_pull'),
+		gitFetch: () => invoke<void>('fs_git_fetch'),
 	},
 	search: {
 		files: (options: FileSearchOptions) => invoke<FileSearchResult[]>('search_files', { options }),

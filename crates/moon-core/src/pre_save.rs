@@ -3,15 +3,21 @@
 //! Runs server-side just before bytes hit disk. Each transform is a
 //! pure function on `(text, ec)`: idempotent, no I/O, no panic. The
 //! default pipeline (line endings → trim trailing whitespace → final
-//! newline) is what every save in moon-ide goes through. The
-//! `RunFormatter` step that lint-staged drives lives in `crate::format`
-//! and is composed at the call site in `LocalHost::save_file` rather
-//! than being threaded through this module — the formatter is
-//! best-effort and async, while these transforms are mandatory and
-//! sync.
+//! newline) is what every save in moon-ide goes through.
 //!
-//! See [specs/editorconfig.md](../../../specs/editorconfig.md) and
-//! [specs/decisions/0012-format-on-save.md](../../../specs/decisions/0012-format-on-save.md).
+//! The lint-staged formatter chain (`crate::format::run_formatter`)
+//! runs *after* this pipeline lands the editorconfig-normalised bytes
+//! on disk: each command in the chain is spawned with the absolute
+//! file path appended and is expected to mutate the file in place.
+//! The two stages are composed at the call site in
+//! `LocalHost::save_file`. Editorconfig transforms are mandatory and
+//! sync; the formatter chain is best-effort and async.
+//!
+//! See [specs/editorconfig.md](../../../specs/editorconfig.md),
+//! [specs/decisions/0013-format-on-save-file-based.md](../../../specs/decisions/0013-format-on-save-file-based.md)
+//! (current), and
+//! [specs/decisions/0012-format-on-save.md](../../../specs/decisions/0012-format-on-save.md)
+//! (superseded stdin/stdout design).
 
 use moon_protocol::editorconfig::{EditorConfig, EndOfLine};
 

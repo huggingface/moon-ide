@@ -13,7 +13,11 @@
 //! ships with Phase 5's git integration. External edits pick up on the
 //! next moon-ide restart.
 //!
-//! See [specs/decisions/0012-format-on-save.md](../../../specs/decisions/0012-format-on-save.md).
+//! See [specs/decisions/0012-format-on-save.md](../../../specs/decisions/0012-format-on-save.md)
+//! (the original design) and
+//! [specs/decisions/0013-format-on-save-file-based.md](../../../specs/decisions/0013-format-on-save-file-based.md)
+//! (the current file-based-invocation design — every command in the
+//! matched chain runs in order against the on-disk file).
 
 use camino::{Utf8Path, Utf8PathBuf};
 use globset::{Glob, GlobMatcher};
@@ -38,8 +42,6 @@ pub struct LintStagedRules {
 }
 
 struct LintStagedRule {
-	/// The original pattern, kept for diagnostics.
-	pattern: String,
 	matcher: GlobMatcher,
 	/// micromatch's `matchBase` switches on whether the pattern contains
 	/// a path separator. lint-staged inherits that behaviour, so `*.ts`
@@ -50,10 +52,12 @@ struct LintStagedRule {
 }
 
 impl LintStagedRules {
-	/// First command of the first matching rule for `abs_path`. Returns
-	/// `None` when nothing matches; callers treat that as "no formatter
-	/// configured for this file" rather than an error.
-	pub fn match_command(&self, abs_path: &Path) -> Option<&str> {
+	/// Whole command chain for the first matching rule for `abs_path`.
+	/// Returns `None` when nothing matches; callers treat that as "no
+	/// formatter configured for this file" rather than an error. The
+	/// caller runs the chain in order and aborts on the first failure
+	/// — same semantics lint-staged itself applies on commit.
+	pub fn match_commands(&self, abs_path: &Path) -> Option<&[String]> {
 		let rel = self
 			.config_dir
 			.as_ref()
@@ -73,17 +77,7 @@ impl LintStagedRules {
 			if !hit {
 				continue;
 			}
-			if rule.commands.len() > 1 {
-				// lint-staged supports chains (`["eslint --fix", "prettier
-				// --write"]`); for our one-input-one-output text pipeline
-				// only the first command runs. Documented in ADR 0012.
-				tracing::warn!(
-					pattern = %rule.pattern,
-					count = rule.commands.len(),
-					"format-on-save: only the first command in a lint-staged chain runs",
-				);
-			}
-			return rule.commands.first().map(String::as_str);
+			return Some(rule.commands.as_slice());
 		}
 		None
 	}
@@ -248,7 +242,6 @@ fn parse_value(value: &Value, config_dir: &Utf8Path) -> Result<LintStagedRules, 
 		rules.push(LintStagedRule {
 			has_separator: pattern.contains('/'),
 			matcher: glob.compile_matcher(),
-			pattern: pattern.clone(),
 			commands,
 		});
 	}
@@ -280,6 +273,10 @@ mod tests {
 		dir.path().canonicalize().unwrap().join(rel)
 	}
 
+	fn cmds(slice: Option<&[String]>) -> Option<Vec<&str>> {
+		slice.map(|s| s.iter().map(String::as_str).collect())
+	}
+
 	#[tokio::test]
 	async fn empty_when_no_config() {
 		let dir = TempDir::new().unwrap();
@@ -287,7 +284,7 @@ mod tests {
 		let svc = service(&dir);
 		let rules = svc.for_path(Utf8Path::new("src/lib.rs")).await.unwrap();
 		assert!(rules.is_empty());
-		assert!(rules.match_command(&abs(&dir, "src/lib.rs")).is_none());
+		assert!(rules.match_commands(&abs(&dir, "src/lib.rs")).is_none());
 	}
 
 	#[tokio::test]
@@ -308,16 +305,19 @@ mod tests {
 		let svc = service(&dir);
 
 		let ts = svc.for_path(Utf8Path::new("src/deep/foo.ts")).await.unwrap();
-		assert_eq!(ts.match_command(&abs(&dir, "src/deep/foo.ts")), Some("oxfmt"));
+		assert_eq!(
+			cmds(ts.match_commands(&abs(&dir, "src/deep/foo.ts"))),
+			Some(vec!["oxfmt"])
+		);
 
 		let svelte = svc.for_path(Utf8Path::new("src/App.svelte")).await.unwrap();
 		assert_eq!(
-			svelte.match_command(&abs(&dir, "src/App.svelte")),
-			Some("prettier --write"),
+			cmds(svelte.match_commands(&abs(&dir, "src/App.svelte"))),
+			Some(vec!["prettier --write"]),
 		);
 
 		let toml = svc.for_path(Utf8Path::new("Cargo.toml")).await.unwrap();
-		assert!(toml.match_command(&abs(&dir, "Cargo.toml")).is_none());
+		assert!(toml.match_commands(&abs(&dir, "Cargo.toml")).is_none());
 	}
 
 	#[tokio::test]
@@ -336,7 +336,7 @@ mod tests {
 		write(&dir, "a.ts", "");
 		let svc = service(&dir);
 		let rules = svc.for_path(Utf8Path::new("a.ts")).await.unwrap();
-		assert_eq!(rules.match_command(&abs(&dir, "a.ts")), Some("oxfmt"));
+		assert_eq!(cmds(rules.match_commands(&abs(&dir, "a.ts"))), Some(vec!["oxfmt"]));
 	}
 
 	#[tokio::test]
@@ -351,7 +351,7 @@ mod tests {
 		write(&dir, "a.ts", "");
 		let svc = service(&dir);
 		let rules = svc.for_path(Utf8Path::new("a.ts")).await.unwrap();
-		assert_eq!(rules.match_command(&abs(&dir, "a.ts")), Some("from-rc"));
+		assert_eq!(cmds(rules.match_commands(&abs(&dir, "a.ts"))), Some(vec!["from-rc"]));
 	}
 
 	#[tokio::test]
@@ -366,10 +366,13 @@ mod tests {
 		// For nested/*.ts the inner wins by virtue of being closest, even
 		// though it doesn't list `*.ts` — there's no merge across levels.
 		let ts_rules = svc.for_path(Utf8Path::new("nested/a.ts")).await.unwrap();
-		assert!(ts_rules.match_command(&abs(&dir, "nested/a.ts")).is_none());
+		assert!(ts_rules.match_commands(&abs(&dir, "nested/a.ts")).is_none());
 
 		let js_rules = svc.for_path(Utf8Path::new("nested/b.js")).await.unwrap();
-		assert_eq!(js_rules.match_command(&abs(&dir, "nested/b.js")), Some("inner"));
+		assert_eq!(
+			cmds(js_rules.match_commands(&abs(&dir, "nested/b.js"))),
+			Some(vec!["inner"])
+		);
 	}
 
 	#[tokio::test]
@@ -381,20 +384,31 @@ mod tests {
 		let svc = service(&dir);
 
 		let src = svc.for_path(Utf8Path::new("src/a.ts")).await.unwrap();
-		assert_eq!(src.match_command(&abs(&dir, "src/a.ts")), Some("oxfmt"));
+		assert_eq!(cmds(src.match_commands(&abs(&dir, "src/a.ts"))), Some(vec!["oxfmt"]));
 
 		let other = svc.for_path(Utf8Path::new("other/b.ts")).await.unwrap();
-		assert!(other.match_command(&abs(&dir, "other/b.ts")).is_none());
+		assert!(other.match_commands(&abs(&dir, "other/b.ts")).is_none());
 	}
 
 	#[tokio::test]
-	async fn array_command_first_wins() {
+	async fn array_command_returns_full_chain() {
+		// Regression: previously the loader collapsed chains to the
+		// first command and warned. The save-pipeline now runs every
+		// command in order (matching what `bun run lint-staged` does
+		// on commit), so the loader must surface the whole chain.
 		let dir = TempDir::new().unwrap();
-		write(&dir, ".lintstagedrc.json", r#"{ "*.ts": ["oxfmt", "echo done"] }"#);
+		write(
+			&dir,
+			".lintstagedrc.json",
+			r#"{ "*.ts": ["node scripts/lint.ts --fix", "prettier -w"] }"#,
+		);
 		write(&dir, "a.ts", "");
 		let svc = service(&dir);
 		let rules = svc.for_path(Utf8Path::new("a.ts")).await.unwrap();
-		assert_eq!(rules.match_command(&abs(&dir, "a.ts")), Some("oxfmt"));
+		assert_eq!(
+			cmds(rules.match_commands(&abs(&dir, "a.ts"))),
+			Some(vec!["node scripts/lint.ts --fix", "prettier -w"]),
+		);
 	}
 
 	#[tokio::test]
@@ -404,15 +418,15 @@ mod tests {
 		write(&dir, "a.ts", "");
 		let svc = service(&dir);
 		let one = svc.for_path(Utf8Path::new("a.ts")).await.unwrap();
-		assert_eq!(one.match_command(&abs(&dir, "a.ts")), Some("first"));
+		assert_eq!(cmds(one.match_commands(&abs(&dir, "a.ts"))), Some(vec!["first"]));
 
 		write(&dir, ".lintstagedrc.json", r#"{ "*.ts": "second" }"#);
 		let cached = svc.for_path(Utf8Path::new("a.ts")).await.unwrap();
-		assert_eq!(cached.match_command(&abs(&dir, "a.ts")), Some("first"));
+		assert_eq!(cmds(cached.match_commands(&abs(&dir, "a.ts"))), Some(vec!["first"]));
 
 		svc.clear().await;
 		let fresh = svc.for_path(Utf8Path::new("a.ts")).await.unwrap();
-		assert_eq!(fresh.match_command(&abs(&dir, "a.ts")), Some("second"));
+		assert_eq!(cmds(fresh.match_commands(&abs(&dir, "a.ts"))), Some(vec!["second"]));
 	}
 
 	#[tokio::test]

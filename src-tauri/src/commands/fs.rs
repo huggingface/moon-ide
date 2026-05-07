@@ -294,3 +294,16 @@ pub async fn fs_git_pull(state: State<'_, AppState>) -> Result<(), MoonError> {
 	let entry = state.workspaces.require_active_folder().await?;
 	entry.host.git_pull().await
 }
+
+/// `git fetch --quiet --no-tags` against the configured upstream
+/// remote. Drives the periodic auto-fetch loop in the frontend so
+/// the "Sync Changes" button surfaces when commits land upstream
+/// without the user clicking anything. Best-effort: failures
+/// (offline, no upstream, auth refused, 30s timeout) propagate
+/// git's stderr but the frontend logs them at debug level rather
+/// than flashing a toast — auto-fetch must not be noisy.
+#[tauri::command]
+pub async fn fs_git_fetch(state: State<'_, AppState>) -> Result<(), MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.git_fetch().await
+}
