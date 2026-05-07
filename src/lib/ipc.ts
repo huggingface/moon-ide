@@ -76,6 +76,8 @@ export const ipc = {
 		gitHeadContent: (path: string) => invoke<string | null>('fs_git_head_content', { path }),
 		gitBranch: () => invoke<GitBranchInfo>('fs_git_branch'),
 		gitCommit: (message: string, amend: boolean) => invoke<GitCommitResult>('fs_git_commit', { message, amend }),
+		gitCommitOnNewBranch: (branch: string, message: string) =>
+			invoke<GitCommitResult>('fs_git_commit_on_new_branch', { branch, message }),
 		gitPush: () => invoke<void>('fs_git_push'),
 		gitPublishBranch: () => invoke<void>('fs_git_publish_branch'),
 		gitPull: () => invoke<void>('fs_git_pull'),
@@ -173,6 +175,7 @@ export const ipc = {
 		pollDeviceCode: (code: DeviceCode) => invoke<HfIdentity>('coder_poll_device_code', { code }),
 		signOut: () => invoke<void>('coder_sign_out'),
 		send: (text: string) => invoke<void>('coder_send', { text }),
+		suggestBranchName: (message: string) => invoke<string>('coder_suggest_branch_name', { message }),
 		abort: () => invoke<void>('coder_abort'),
 		listSessions: () => invoke<CoderSessionSummary[]>('coder_list_sessions'),
 		activeSession: () => invoke<CoderSessionSummary | null>('coder_active_session'),

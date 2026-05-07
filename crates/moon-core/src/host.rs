@@ -205,6 +205,41 @@ pub trait WorkspaceHost: Send + Sync {
 	/// staging UI is a later phase.
 	async fn git_commit(&self, message: &str, amend: bool) -> MoonResult<GitCommitResult>;
 
+	/// Create a fresh branch from the current `HEAD`, switch to it,
+	/// then stage everything and commit with `message`. The caller
+	/// is responsible for picking a sensible name; the host
+	/// validates with `git check-ref-format --branch <name>` before
+	/// touching anything so a malformed name fails fast without
+	/// leaving the repo half-mutated.
+	///
+	/// Errors when:
+	///   - The active folder isn't a git repo.
+	///   - `branch` is empty or fails `check-ref-format`.
+	///   - A branch with that name already exists locally — we don't
+	///     guess between "switch to it and commit" and "rename it";
+	///     the user gets git's own "already exists" message and can
+	///     pick a different name.
+	///   - The commit step fails (empty `message`, nothing to commit,
+	///     missing identity) — same diagnostics as
+	///     [`Self::git_commit`].
+	///
+	/// On any failure after the branch was created we attempt to
+	/// switch back to the original branch and delete the freshly-
+	/// created one so the user's HEAD position is what they expect;
+	/// best-effort, errors are logged but not surfaced (the original
+	/// commit failure is the actionable one).
+	async fn git_commit_on_new_branch(&self, branch: &str, message: &str) -> MoonResult<GitCommitResult>;
+
+	/// Lightweight diff summary of the working tree against `HEAD`,
+	/// suitable for feeding to a small LLM that's suggesting a
+	/// branch / commit name. Output is `git diff HEAD --stat -M -C`
+	/// trimmed to a manageable size — file paths plus per-file
+	/// `+/-` counts plus the totals line. Returns an empty string
+	/// when there's nothing to summarise (clean tree, not a repo,
+	/// `git` not installed) — the caller decides what to do with
+	/// the void.
+	async fn git_diff_summary(&self) -> MoonResult<String>;
+
 	/// `git push` with no arguments — uses the configured upstream
 	/// for the current branch. Errors propagate git's own stderr
 	/// verbatim so messages like "the current branch X has no
@@ -855,6 +890,22 @@ impl WorkspaceHost for LocalHost {
 			.map_err(|e| MoonError::Internal(format!("git_branch join error: {e}")))?
 	}
 
+	async fn git_commit_on_new_branch(&self, branch: &str, message: &str) -> MoonResult<GitCommitResult> {
+		let root = self.root.clone();
+		let branch = branch.to_owned();
+		let message = message.to_owned();
+		tokio::task::spawn_blocking(move || run_git_commit_on_new_branch(&root, &branch, &message))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_commit_on_new_branch join error: {e}")))?
+	}
+
+	async fn git_diff_summary(&self) -> MoonResult<String> {
+		let root = self.root.clone();
+		tokio::task::spawn_blocking(move || Ok(run_git_diff_summary(&root)))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_diff_summary join error: {e}")))?
+	}
+
 	async fn git_commit(&self, message: &str, amend: bool) -> MoonResult<GitCommitResult> {
 		let trimmed = message.trim();
 		if trimmed.is_empty() && !amend {
@@ -1051,7 +1102,18 @@ fn run_git_commit(root: &Utf8Path, message: &str, amend: bool) -> MoonResult<Git
 	}
 
 	let mut commit = Command::new("git");
-	commit.arg("-C").arg(root.as_std_path()).arg("commit");
+	commit
+		.arg("-C")
+		.arg(root.as_std_path())
+		// Force the C locale so the "nothing to commit" detection
+		// below works regardless of the user's system language —
+		// otherwise git localises stdout (e.g. French outputs
+		// "rien à valider") and we miss the friendly-error path.
+		// Stderr passed verbatim to the flash toast also stays in
+		// English, which we'd want anyway given the rest of the UI
+		// is English.
+		.env("LC_ALL", "C")
+		.arg("commit");
 	if amend {
 		commit.arg("--amend");
 		if message.is_empty() {
@@ -1121,6 +1183,147 @@ fn run_git_commit(root: &Utf8Path, message: &str, amend: bool) -> MoonResult<Git
 	};
 
 	Ok(GitCommitResult { short_sha, summary })
+}
+
+/// Validate `branch` with `git check-ref-format --branch`, create
+/// it from current `HEAD` (`git switch -c <branch>`), then route
+/// to [`run_git_commit`]. On any failure after the branch has
+/// been created we attempt a rollback (`git switch -` plus
+/// `git branch -D <branch>`) so the user's `HEAD` is back where
+/// it started — best-effort, the original error is what the
+/// caller surfaces.
+fn run_git_commit_on_new_branch(root: &Utf8Path, branch: &str, message: &str) -> MoonResult<GitCommitResult> {
+	use std::process::Command;
+
+	if branch.is_empty() {
+		return Err(MoonError::invalid("branch name is empty"));
+	}
+	let check = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["check-ref-format", "--branch", branch])
+		.output()
+		.map_err(|e| MoonError::IoError(format!("git check-ref-format failed to launch: {e}")))?;
+	if !check.status.success() {
+		let stderr = String::from_utf8_lossy(&check.stderr).trim().to_string();
+		let detail = if stderr.is_empty() {
+			format!("{branch:?} is not a valid git branch name")
+		} else {
+			format!("{branch:?}: {stderr}")
+		};
+		return Err(MoonError::invalid(detail));
+	}
+
+	// Snapshot the previous branch so a failed commit can roll
+	// back to it. Detached HEAD returns a non-zero exit; we treat
+	// that as "no name to roll back to" and fall back to switching
+	// by SHA.
+	let previous_ref = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+		.output()
+		.ok()
+		.filter(|o| o.status.success())
+		.and_then(|o| String::from_utf8(o.stdout).ok())
+		.map(|s| s.trim().to_owned())
+		.filter(|s| !s.is_empty());
+	let previous_sha = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["rev-parse", "HEAD"])
+		.output()
+		.ok()
+		.filter(|o| o.status.success())
+		.and_then(|o| String::from_utf8(o.stdout).ok())
+		.map(|s| s.trim().to_owned())
+		.filter(|s| !s.is_empty());
+
+	let switch = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["switch", "-c", branch])
+		.output()
+		.map_err(|e| MoonError::IoError(format!("git switch -c failed to launch: {e}")))?;
+	if !switch.status.success() {
+		let stderr = String::from_utf8_lossy(&switch.stderr).trim().to_string();
+		let stdout = String::from_utf8_lossy(&switch.stdout).trim().to_string();
+		let combined = if stderr.is_empty() { stdout } else { stderr };
+		return Err(MoonError::IoError(format!(
+			"git switch -c exited {}: {combined}",
+			switch.status.code().unwrap_or(-1)
+		)));
+	}
+
+	let commit_result = run_git_commit(root, message, false);
+	match commit_result {
+		Ok(result) => Ok(result),
+		Err(err) => {
+			// Roll back: switch back to the previous ref, then
+			// delete the freshly-created branch. Both are best-
+			// effort — if either fails we log and return the
+			// original commit error, since that's the one the
+			// user has to act on.
+			let rollback_target = previous_ref.as_deref().or(previous_sha.as_deref());
+			if let Some(target) = rollback_target {
+				let switch_back = Command::new("git")
+					.arg("-C")
+					.arg(root.as_std_path())
+					.args(["switch", target])
+					.output();
+				if let Err(e) = switch_back {
+					tracing::warn!(target = %target, error = %e, "rollback: git switch failed to launch");
+				} else if let Ok(out) = Command::new("git")
+					.arg("-C")
+					.arg(root.as_std_path())
+					.args(["branch", "-D", branch])
+					.output()
+				{
+					if !out.status.success() {
+						let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+						tracing::warn!(branch = %branch, stderr = %msg, "rollback: failed to delete fresh branch");
+					}
+				}
+			}
+			Err(err)
+		}
+	}
+}
+
+/// `git diff HEAD --stat -M -C --no-color`. Empty string on any
+/// failure (no repo, no commits yet, git unavailable) so callers
+/// can treat the absence as "nothing to summarise" without
+/// branching on `Result`.
+fn run_git_diff_summary(root: &Utf8Path) -> String {
+	use std::process::Command;
+
+	const MAX_BYTES: usize = 4_000;
+
+	let output = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["diff", "HEAD", "--stat=200,80", "-M", "-C", "--no-color"])
+		.output();
+	let Ok(output) = output else {
+		return String::new();
+	};
+	if !output.status.success() {
+		return String::new();
+	}
+	let text = String::from_utf8_lossy(&output.stdout);
+	if text.len() <= MAX_BYTES {
+		return text.into_owned();
+	}
+	// Trim to char boundary so we don't slice through a multi-byte
+	// path. The summary is informational; cropping the tail is
+	// fine.
+	let mut idx = MAX_BYTES;
+	while idx > 0 && !text.is_char_boundary(idx) {
+		idx -= 1;
+	}
+	let mut clipped = text[..idx].to_owned();
+	clipped.push_str("\n[truncated]");
+	clipped
 }
 
 /// Run `git <args>` from `root` and surface stderr verbatim on
@@ -2400,6 +2603,133 @@ mod tests {
 			.await
 			.unwrap_err();
 		assert!(matches!(err, MoonError::InvalidArgument(_)), "got {err:?}");
+	}
+
+	#[tokio::test]
+	async fn git_commit_on_new_branch_creates_branch_and_commits() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping new-branch commit test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		std::fs::write(dir.path().join("README.md"), "hi\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "initial"]);
+
+		std::fs::write(dir.path().join("CHANGES.md"), "wip\n").unwrap();
+		let result = host(&dir)
+			.git_commit_on_new_branch("feature/wip", "Add CHANGES.md")
+			.await
+			.unwrap();
+		assert!(!result.short_sha.is_empty());
+		assert_eq!(result.summary, "Add CHANGES.md");
+
+		let head_branch = std::process::Command::new(&git)
+			.arg("-C")
+			.arg(dir.path())
+			.args(["symbolic-ref", "--short", "HEAD"])
+			.output()
+			.unwrap();
+		assert!(head_branch.status.success());
+		assert_eq!(String::from_utf8_lossy(&head_branch.stdout).trim(), "feature/wip");
+	}
+
+	#[tokio::test]
+	async fn git_commit_on_new_branch_rejects_invalid_name() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping invalid-branch test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		std::fs::write(dir.path().join("README.md"), "hi\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "initial"]);
+
+		// Spaces are illegal in git ref names; we should fail before
+		// touching the index.
+		let err = host(&dir)
+			.git_commit_on_new_branch("not a branch", "msg")
+			.await
+			.unwrap_err();
+		assert!(matches!(err, MoonError::InvalidArgument(_)), "got {err:?}");
+
+		// HEAD should still be on `main`, not on a half-created branch.
+		let head_branch = std::process::Command::new(&git)
+			.arg("-C")
+			.arg(dir.path())
+			.args(["symbolic-ref", "--short", "HEAD"])
+			.output()
+			.unwrap();
+		assert_eq!(String::from_utf8_lossy(&head_branch.stdout).trim(), "main");
+	}
+
+	#[tokio::test]
+	async fn git_commit_on_new_branch_rolls_back_on_empty_index() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping rollback test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		std::fs::write(dir.path().join("README.md"), "hi\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "initial"]);
+
+		// Working tree is clean; the commit step should fail with
+		// "nothing to commit" and the host should roll the fresh
+		// branch back so HEAD lands on `main` again.
+		let err = host(&dir)
+			.git_commit_on_new_branch("feature/nope", "msg")
+			.await
+			.unwrap_err();
+		let detail = format!("{err:?}");
+		assert!(detail.contains("nothing to commit"), "got {detail}");
+
+		let head_branch = std::process::Command::new(&git)
+			.arg("-C")
+			.arg(dir.path())
+			.args(["symbolic-ref", "--short", "HEAD"])
+			.output()
+			.unwrap();
+		assert_eq!(String::from_utf8_lossy(&head_branch.stdout).trim(), "main");
+
+		// And the branch we tried to create should be gone.
+		let branch_list = std::process::Command::new(&git)
+			.arg("-C")
+			.arg(dir.path())
+			.args(["branch", "--list", "feature/nope"])
+			.output()
+			.unwrap();
+		assert!(String::from_utf8_lossy(&branch_list.stdout).trim().is_empty());
+	}
+
+	#[tokio::test]
+	async fn git_diff_summary_lists_changed_files() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping diff-summary test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+		std::fs::write(dir.path().join("b.txt"), "beta\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "initial"]);
+		std::fs::write(dir.path().join("a.txt"), "alpha changed\n").unwrap();
+
+		let summary = host(&dir).git_diff_summary().await.unwrap();
+		assert!(summary.contains("a.txt"), "got {summary:?}");
+		assert!(summary.contains("file changed"), "got {summary:?}");
 	}
 
 	fn which_git() -> Option<std::path::PathBuf> {

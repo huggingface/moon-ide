@@ -250,6 +250,22 @@ pub async fn fs_git_commit(
 	entry.host.git_commit(&message, amend).await
 }
 
+/// Create a fresh branch from `HEAD`, switch to it, and commit
+/// the staged + working-tree changes. The SCM panel calls this
+/// from its "Commit to new branch…" inline form. Branch name
+/// validation runs server-side via `git check-ref-format`; on
+/// commit failure the host rolls back the branch creation so
+/// `HEAD` is back where it started.
+#[tauri::command]
+pub async fn fs_git_commit_on_new_branch(
+	state: State<'_, AppState>,
+	branch: String,
+	message: String,
+) -> Result<GitCommitResult, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.git_commit_on_new_branch(&branch, &message).await
+}
+
 /// Push the active folder's current branch to its configured
 /// upstream. Returns `Ok(())` on success; failures (no upstream,
 /// non-fast-forward, auth) propagate git's stderr.

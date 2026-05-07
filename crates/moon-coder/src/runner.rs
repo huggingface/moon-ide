@@ -374,6 +374,41 @@ impl CoderHandle {
 			.map(|summary| summary.description)
 	}
 
+	/// Ask the fast model to propose a kebab-cased branch name from
+	/// `commit_message` and `diff_summary`. Either may be empty
+	/// (the caller is free to send only one); we just nudge the
+	/// model harder when both are blank by saying "no diff
+	/// available" so it doesn't hallucinate a plausible-but-wrong
+	/// name. Output is post-processed through
+	/// [`sanitise_branch_name`] so the model can't slip a slash,
+	/// space, or stray quote past us.
+	///
+	/// Errors when the model call fails or the response sanitises
+	/// down to the empty string. `NoActiveFolder` is returned by
+	/// the caller if there's no folder bound; this method itself
+	/// doesn't touch the workspace.
+	pub async fn suggest_branch_name(&self, commit_message: &str, diff_summary: &str) -> Result<String, CoderError> {
+		let prompt = build_branch_name_prompt(commit_message, diff_summary);
+		let messages = vec![
+			ChatMessage::System {
+				content: BRANCH_NAME_SYSTEM_PROMPT.to_string(),
+			},
+			ChatMessage::User { content: prompt },
+		];
+		let cancel = CancellationToken::new();
+		let response = self
+			.state
+			.inference
+			.chat_completion(DEFAULT_FAST_MODEL, &messages, &[], &cancel)
+			.await?;
+		let raw = response.content.unwrap_or_default();
+		let cleaned = sanitise_branch_name(&raw);
+		if cleaned.is_empty() {
+			return Err(CoderError::Internal("branch name suggestion was empty".into()));
+		}
+		Ok(cleaned)
+	}
+
 	pub async fn start_device_flow(&self) -> Result<DeviceCode, CoderError> {
 		self.state.auth.start_device_flow().await
 	}
@@ -1551,6 +1586,86 @@ fn spawn_auto_rename(state: Arc<CoderState>, fs: Arc<FolderSession>, sink: Folde
 /// purpose — we want a flat string, not a paragraph of preamble.
 const AUTO_RENAME_SYSTEM_PROMPT: &str = "You are a title generator. Given a short transcript of one turn between a user and a coding assistant, return a 4 to 6 word title for the conversation. Output the title only, with no quotes, no period, no markdown, and no preamble.";
 
+/// One-shot system prompt for branch-name suggestion. Same
+/// minimal-preamble shape as the title generator: we want a
+/// kebab-cased identifier, not a sentence.
+const BRANCH_NAME_SYSTEM_PROMPT: &str = "You suggest git branch names. Given a draft commit message and/or a `git diff --stat` summary, return ONE short branch name in kebab-case (2 to 5 words, lowercase, hyphen-separated, no slashes, no quotes, no leading prefix like `feature/` or `fix/`). Output the name only, no explanation.";
+
+/// Build the user-side prompt for the branch-name pass. We always
+/// send both fields with explicit headings so a blank one is
+/// obviously a non-signal rather than a missing argument the
+/// model needs to fill in.
+fn build_branch_name_prompt(commit_message: &str, diff_summary: &str) -> String {
+	let message = commit_message.trim();
+	let diff = diff_summary.trim();
+	let mut out = String::new();
+	out.push_str("Commit message:\n");
+	if message.is_empty() {
+		out.push_str("(none)");
+	} else {
+		out.push_str(message);
+	}
+	out.push_str("\n\nDiff summary (`git diff HEAD --stat`):\n");
+	if diff.is_empty() {
+		out.push_str("(none)");
+	} else {
+		out.push_str(diff);
+	}
+	out
+}
+
+/// Coerce a model-emitted branch suggestion into something git
+/// will accept. The fast model is usually well-behaved, but it
+/// occasionally tacks on quotes, a `feature/` prefix, or a
+/// trailing period — strip those, lowercase, replace internal
+/// whitespace + underscore with `-`, drop any character outside
+/// `[a-z0-9.-]`, collapse runs of `-`, trim leading/trailing
+/// `-`, and cap length. The remaining string passes
+/// `git check-ref-format --branch` for everything we've seen
+/// from the model so far.
+pub(crate) fn sanitise_branch_name(raw: &str) -> String {
+	const MAX_CHARS: usize = 60;
+	let trimmed = raw.trim();
+	let trimmed = trimmed.trim_matches(|c: char| c == '"' || c == '\'' || c == '`' || c == '*' || c == '.');
+	// Take the first line — the model occasionally appends a
+	// follow-up sentence we don't want.
+	let first_line = trimmed.lines().next().unwrap_or("");
+	let lower = first_line.to_lowercase();
+	let mut out = String::with_capacity(lower.len());
+	let mut last_dash = false;
+	for ch in lower.chars() {
+		let mapped = if ch.is_ascii_alphanumeric() || ch == '.' {
+			Some(ch)
+		} else if ch == '-' || ch == '_' || ch == ' ' || ch == '/' || ch == '\t' {
+			Some('-')
+		} else {
+			None
+		};
+		match mapped {
+			Some('-') => {
+				if !last_dash && !out.is_empty() {
+					out.push('-');
+					last_dash = true;
+				}
+			}
+			Some(c) => {
+				out.push(c);
+				last_dash = false;
+			}
+			None => {}
+		}
+	}
+	let trimmed = out.trim_matches('-').trim_matches('.').to_owned();
+	if trimmed.chars().count() <= MAX_CHARS {
+		return trimmed;
+	}
+	let mut clipped: String = trimmed.chars().take(MAX_CHARS).collect();
+	while clipped.ends_with('-') || clipped.ends_with('.') {
+		clipped.pop();
+	}
+	clipped
+}
+
 /// Cheap projection of `messages` for the rename pass: collapse
 /// everything to plain "user: …" / "assistant: …" lines, capped
 /// to a few thousand chars so we don't pass an entire turn's
@@ -1807,6 +1922,57 @@ mod tests {
 		let long = "word ".repeat(50);
 		let out = sanitise_auto_title(&long);
 		assert!(out.ends_with('…'));
+	}
+
+	#[test]
+	fn sanitise_branch_lowercases_and_kebabs() {
+		assert_eq!(sanitise_branch_name("Add Tail Param"), "add-tail-param");
+		assert_eq!(sanitise_branch_name("fix_login_bug"), "fix-login-bug");
+		assert_eq!(sanitise_branch_name("UPDATE/Docs"), "update-docs");
+	}
+
+	#[test]
+	fn sanitise_branch_strips_quotes_and_prefix_punctuation() {
+		assert_eq!(sanitise_branch_name("`add-bucket-sync`"), "add-bucket-sync");
+		assert_eq!(sanitise_branch_name("\"Refactor cache\""), "refactor-cache");
+		assert_eq!(sanitise_branch_name("...weird..."), "weird");
+	}
+
+	#[test]
+	fn sanitise_branch_takes_first_line_only() {
+		let raw = "add-bucket-sync\n(I went with this because it's short)";
+		assert_eq!(sanitise_branch_name(raw), "add-bucket-sync");
+	}
+
+	#[test]
+	fn sanitise_branch_collapses_runs_and_drops_unsafe_chars() {
+		assert_eq!(sanitise_branch_name("--fix:: bucket   sync!@#"), "fix-bucket-sync");
+	}
+
+	#[test]
+	fn sanitise_branch_clamps_length_and_trims_trailing_dash() {
+		let raw = "really-long-branch-name-that-exceeds-the-cap-on-length-because-the-model-was-too-verbose-today";
+		let out = sanitise_branch_name(raw);
+		assert!(out.chars().count() <= 60);
+		assert!(!out.ends_with('-'));
+	}
+
+	#[test]
+	fn sanitise_branch_returns_empty_for_garbage() {
+		assert_eq!(sanitise_branch_name(""), "");
+		assert_eq!(sanitise_branch_name("???"), "");
+		assert_eq!(sanitise_branch_name("   "), "");
+	}
+
+	#[test]
+	fn build_branch_name_prompt_marks_blank_fields() {
+		let p = build_branch_name_prompt("", "");
+		assert!(p.contains("Commit message:\n(none)"));
+		assert!(p.contains("Diff summary"));
+		assert!(p.contains("(none)"));
+		let p2 = build_branch_name_prompt("Add tail param", " src/foo.py | 4 ++--\n 1 file changed");
+		assert!(p2.contains("Add tail param"));
+		assert!(p2.contains("src/foo.py"));
 	}
 
 	#[test]

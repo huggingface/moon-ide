@@ -96,6 +96,23 @@ pub async fn coder_send(state: State<'_, AppState>, text: String) -> Result<(), 
 	state.coder.send(text).await.map_err(MoonError::from)
 }
 
+/// Suggest a kebab-cased branch name based on the user's draft
+/// commit message and the active folder's `git diff HEAD --stat`
+/// summary. Used by the SCM panel's "Commit to new branch…" form
+/// to populate the branch input. Falls back to an error string
+/// the panel surfaces verbatim when the model is unreachable —
+/// the user can still type a name manually.
+#[tauri::command]
+pub async fn coder_suggest_branch_name(state: State<'_, AppState>, message: String) -> Result<String, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	let diff = entry.host.git_diff_summary().await.unwrap_or_default();
+	state
+		.coder
+		.suggest_branch_name(&message, &diff)
+		.await
+		.map_err(MoonError::from)
+}
+
 /// Cancel the **active folder's** running turn, if any.
 /// Background turns running in other folders are left alone — the
 /// user has to switch to them and stop manually if they want

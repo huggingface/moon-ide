@@ -1476,6 +1476,38 @@ class WorkspaceState {
 	}
 
 	/**
+	 * Create a fresh branch from `HEAD`, switch to it, then commit
+	 * the working-tree + staged changes with `message`. Used by
+	 * the SCM panel's "Commit to new branch…" inline form. Branch
+	 * validation, conflict checks, and rollback-on-failure all
+	 * live server-side in `git_commit_on_new_branch`; we just
+	 * surface success / failure via the same flash + refresh
+	 * pattern as `commitChanges`.
+	 */
+	async commitChangesOnNewBranch(branch: string, message: string) {
+		const trimmedBranch = branch.trim();
+		const trimmedMessage = message.trim();
+		if (trimmedBranch.length === 0) {
+			this.flash('Branch name is empty.');
+			return false;
+		}
+		if (trimmedMessage.length === 0) {
+			this.flash('Commit message is empty.');
+			return false;
+		}
+		try {
+			const result = await ipc.fs.gitCommitOnNewBranch(trimmedBranch, trimmedMessage);
+			this.flash(`Committed ${result.shortSha} on ${trimmedBranch}: ${result.summary}`);
+			await this.refreshGitBranch();
+			void this.refreshActiveFolder();
+			return true;
+		} catch (err) {
+			this.flash(`Commit failed: ${formatError(err)}`);
+			return false;
+		}
+	}
+
+	/**
 	 * `git push` for the active folder's current branch. Errors
 	 * (no upstream, auth, non-fast-forward) surface as a flash
 	 * with git's own stderr — the user gets the actionable hint

@@ -24,9 +24,14 @@
 	import { tick } from 'svelte';
 	import { openUrl } from '@tauri-apps/plugin-opener';
 	import { workspace } from '../state.svelte';
+	import { coder } from '../coder.svelte';
+	import { ipc } from '../ipc';
+	import { formatError } from '../protocol';
+	import BranchIcon from './icons/BranchIcon.svelte';
 	import PullRequestIcon from './icons/PullRequestIcon.svelte';
 	import RefreshIcon from './icons/RefreshIcon.svelte';
 	import RevertIcon from './icons/RevertIcon.svelte';
+	import SparklesIcon from './icons/SparklesIcon.svelte';
 
 	const branch = $derived(workspace.gitBranch);
 	const branchLabel = $derived.by(() => {
@@ -47,12 +52,28 @@
 	let busy = $state(false);
 	let textarea: HTMLTextAreaElement | undefined = $state();
 
+	// "Commit to new branch" inline form. `newBranchOpen` toggles
+	// the second composer row visible; `newBranchName` mirrors its
+	// input. Closing the form clears the name so a re-open
+	// doesn't carry stale text. `suggestingBranch` gates the
+	// sparkle button while the fast-model call is in flight.
+	let newBranchOpen = $state(false);
+	let newBranchName = $state('');
+	let suggestingBranch = $state(false);
+	let newBranchInput: HTMLInputElement | undefined = $state();
+
 	const changeCount = $derived(workspace.scmChangeCount);
 
 	// Amend-with-empty-message is valid (preserve previous
 	// subject); fresh commits still need a message. Push and pull
 	// buttons just need "not currently busy".
 	const canCommit = $derived(!busy && (amend || message.trim().length > 0));
+
+	// "Commit to new branch" requires both a non-empty message and
+	// a non-empty branch name; amend doesn't apply (you can't
+	// amend HEAD into a new branch with the same gesture). The
+	// "branch toggle" pill is also disabled while busy.
+	const canCommitNewBranch = $derived(!busy && message.trim().length > 0 && newBranchName.trim().length > 0);
 
 	// "Publish branch" lives in the same slot as the sync button
 	// and takes priority: when a real branch is checked out but
@@ -133,6 +154,70 @@
 			}
 		} finally {
 			busy = false;
+			textarea?.focus();
+		}
+	}
+
+	async function commitOnNewBranch() {
+		if (!canCommitNewBranch) {
+			return;
+		}
+		busy = true;
+		try {
+			const ok = await workspace.commitChangesOnNewBranch(newBranchName, message);
+			if (ok) {
+				message = '';
+				newBranchName = '';
+				newBranchOpen = false;
+				amend = false;
+				await tick();
+				autoSize();
+			}
+		} finally {
+			busy = false;
+			textarea?.focus();
+		}
+	}
+
+	function toggleNewBranchForm() {
+		newBranchOpen = !newBranchOpen;
+		if (newBranchOpen) {
+			// Amending into a new branch isn't a coherent gesture —
+			// drop the toggle so the user gets a clear "fresh
+			// commit on a fresh branch" experience.
+			amend = false;
+			void tick().then(() => newBranchInput?.focus());
+			return;
+		}
+		newBranchName = '';
+	}
+
+	async function suggestBranchName() {
+		if (suggestingBranch) {
+			return;
+		}
+		suggestingBranch = true;
+		try {
+			const name = await ipc.coder.suggestBranchName(message);
+			newBranchName = name;
+			void tick().then(() => newBranchInput?.focus());
+		} catch (err) {
+			workspace.flash(`Could not suggest a branch name: ${formatError(err)}`);
+		} finally {
+			suggestingBranch = false;
+		}
+	}
+
+	function onNewBranchKey(event: KeyboardEvent) {
+		if (event.key === 'Enter' && !event.isComposing) {
+			event.preventDefault();
+			void commitOnNewBranch();
+			return;
+		}
+		if (event.key === 'Escape') {
+			event.preventDefault();
+			newBranchOpen = false;
+			newBranchName = '';
 			textarea?.focus();
 		}
 	}
@@ -321,19 +406,79 @@
 			onkeydown={onKeydown}
 			oninput={autoSize}
 		></textarea>
-		<button
-			type="button"
-			class="amend-inset"
-			class:active={amend}
-			title={amend ? 'Amend HEAD on next commit (click to disable)' : 'Toggle amend mode'}
-			aria-label={amend ? 'Amend mode on' : 'Toggle amend mode'}
-			aria-pressed={amend}
-			disabled={busy}
-			onclick={() => (amend = !amend)}
-		>
-			<span aria-hidden="true">✎</span>
-		</button>
+		<div class="composer-insets">
+			<button
+				type="button"
+				class="composer-inset"
+				class:active={newBranchOpen}
+				title={newBranchOpen
+					? 'Cancel commit-to-new-branch'
+					: 'Commit to a new branch (creates a fresh branch from HEAD)'}
+				aria-label={newBranchOpen ? 'Cancel commit-to-new-branch' : 'Commit to a new branch'}
+				aria-pressed={newBranchOpen}
+				disabled={busy}
+				onclick={toggleNewBranchForm}
+			>
+				<BranchIcon size={12} />
+			</button>
+			<button
+				type="button"
+				class="composer-inset"
+				class:active={amend}
+				title={amend ? 'Amend HEAD on next commit (click to disable)' : 'Toggle amend mode'}
+				aria-label={amend ? 'Amend mode on' : 'Toggle amend mode'}
+				aria-pressed={amend}
+				disabled={busy || newBranchOpen}
+				onclick={() => (amend = !amend)}
+			>
+				<span aria-hidden="true">✎</span>
+			</button>
+		</div>
 	</div>
+	{#if newBranchOpen}
+		<div class="new-branch-row">
+			<input
+				bind:this={newBranchInput}
+				bind:value={newBranchName}
+				class="new-branch-input"
+				type="text"
+				spellcheck="false"
+				autocomplete="off"
+				autocapitalize="off"
+				placeholder="new-branch-name"
+				aria-label="New branch name"
+				disabled={busy}
+				onkeydown={onNewBranchKey}
+			/>
+			{#if coder.signedIn}
+				<button
+					type="button"
+					class="new-branch-suggest"
+					title="Suggest a branch name from the diff and message"
+					aria-label="Suggest a branch name"
+					disabled={busy || suggestingBranch}
+					onclick={suggestBranchName}
+				>
+					{#if suggestingBranch}
+						<span class="spinner" aria-hidden="true"></span>
+					{:else}
+						<SparklesIcon size={12} />
+					{/if}
+				</button>
+			{/if}
+			<button
+				type="button"
+				class="new-branch-confirm"
+				title={canCommitNewBranch
+					? `Create ${newBranchName.trim()} and commit`
+					: 'Enter a branch name and a commit message'}
+				disabled={!canCommitNewBranch}
+				onclick={commitOnNewBranch}
+			>
+				Commit
+			</button>
+		</div>
+	{/if}
 	{#if needsPublish}
 		<button
 			type="button"
@@ -467,7 +612,9 @@
 		box-sizing: border-box;
 		min-height: 24px;
 		max-height: 240px;
-		padding: 4px 28px 4px 6px;
+		/* Right padding clears the two inset buttons (`composer-insets`):
+		   2 × 20px buttons + 2px gap + 4px outer margin + a hair of slack. */
+		padding: 4px 50px 4px 6px;
 		border: 1px solid var(--m-border);
 		border-radius: 4px;
 		background: var(--m-bg-1);
@@ -494,15 +641,19 @@
 	.input:disabled {
 		opacity: 0.6;
 	}
-	/* Inset amend toggle: a small square button sitting in the
-	   bottom-right of the composer. Off → muted ghost. On → accent
-	   ring matching the rest of the panel's "this control is
-	   driving" vocabulary. */
-	.amend-inset {
-		appearance: none;
+	/* Inset toggle row in the bottom-right of the composer. Holds
+	   the new-branch toggle and the amend toggle side-by-side; the
+	   textarea reserves enough right-padding to clear both. */
+	.composer-insets {
 		position: absolute;
 		right: 4px;
 		bottom: 4px;
+		display: inline-flex;
+		align-items: center;
+		gap: 2px;
+	}
+	.composer-inset {
+		appearance: none;
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
@@ -518,22 +669,129 @@
 		line-height: 1;
 		cursor: pointer;
 	}
-	.amend-inset:hover:not(:disabled) {
+	.composer-inset:hover:not(:disabled) {
 		background: var(--m-bg-2);
 		color: var(--m-fg);
 	}
-	.amend-inset:focus-visible {
+	.composer-inset:focus-visible {
 		outline: 1px solid var(--m-accent);
 		outline-offset: -1px;
 	}
-	.amend-inset.active {
+	.composer-inset.active {
 		background: var(--m-bg-overlay);
 		border-color: var(--m-accent);
 		color: var(--m-fg);
 	}
-	.amend-inset:disabled {
+	.composer-inset:disabled {
 		opacity: 0.4;
 		cursor: not-allowed;
+	}
+	/* Inline "new branch" row that appears under the composer when
+	   the user clicks the branch toggle. Sparkle (suggest) button
+	   only renders when the coder is signed in — without HF auth
+	   we couldn't call the inference router anyway. */
+	.new-branch-row {
+		display: flex;
+		align-items: stretch;
+		gap: 4px;
+	}
+	.new-branch-input {
+		appearance: none;
+		flex: 1;
+		min-width: 0;
+		box-sizing: border-box;
+		height: 26px;
+		padding: 0 6px;
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		background: var(--m-bg-1);
+		color: var(--m-fg);
+		font: inherit;
+		font-family: var(--m-font-mono, monospace);
+		font-size: 12px;
+		line-height: 1;
+	}
+	.new-branch-input::placeholder {
+		color: var(--m-fg-subtle);
+	}
+	.new-branch-input:focus-visible {
+		outline: 1px solid var(--m-accent);
+		outline-offset: 0;
+		border-color: transparent;
+	}
+	.new-branch-input:disabled {
+		opacity: 0.6;
+	}
+	.new-branch-suggest {
+		appearance: none;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 26px;
+		height: 26px;
+		padding: 0;
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		background: var(--m-bg-1);
+		color: var(--m-fg-muted);
+		cursor: pointer;
+		flex-shrink: 0;
+	}
+	.new-branch-suggest:hover:not(:disabled) {
+		background: var(--m-bg-2);
+		color: var(--m-fg);
+	}
+	.new-branch-suggest:focus-visible {
+		outline: 1px solid var(--m-accent);
+		outline-offset: -1px;
+	}
+	.new-branch-suggest:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+	.new-branch-confirm {
+		appearance: none;
+		flex-shrink: 0;
+		height: 26px;
+		padding: 0 10px;
+		border: 1px solid var(--m-accent);
+		border-radius: 4px;
+		background: var(--m-accent);
+		color: var(--m-bg);
+		font: inherit;
+		font-size: 12px;
+		font-weight: 600;
+		line-height: 1;
+		cursor: pointer;
+	}
+	.new-branch-confirm:hover:not(:disabled) {
+		filter: brightness(1.1);
+	}
+	.new-branch-confirm:focus-visible {
+		outline: 2px solid var(--m-accent);
+		outline-offset: 2px;
+	}
+	.new-branch-confirm:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+	/* Tiny inline spinner used by the suggest button while the
+	   fast-model call is in flight. Same size + color treatment as
+	   the SparklesIcon it replaces so the swap doesn't shift the
+	   button height. */
+	.spinner {
+		display: inline-block;
+		width: 12px;
+		height: 12px;
+		border: 1.5px solid currentColor;
+		border-top-color: transparent;
+		border-radius: 50%;
+		animation: scm-spin 0.8s linear infinite;
+	}
+	@keyframes scm-spin {
+		to {
+			transform: rotate(360deg);
+		}
 	}
 	/* Pill badge in the header next to the branch name. Always
 	   carries the change count; visible iff the user has changes

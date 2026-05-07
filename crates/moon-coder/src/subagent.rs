@@ -24,10 +24,13 @@
 //!   small model for the auto-rename title generator. The latter
 //!   still uses [`DEFAULT_FAST_MODEL`] internally; sub-agents do
 //!   not.
-//! - Iteration cap: [`SUBAGENT_MAX_ITERATIONS`] tool-roundtrips per
-//!   sub-agent — generous because auto-compaction handles the
-//!   "context too big" failure mode that the older byte cap was
-//!   approximating.
+//! - Iteration cap: same [`MAX_TURN_ITERATIONS`] as the parent.
+//!   Sub-agents used to run a tighter cap (50) on the assumption
+//!   they were scoped tasks, but in practice that just made them
+//!   bail mid-refactor when delegated a meaty chunk of work; auto-
+//!   compaction handles the "context too big" failure mode the
+//!   older byte cap was approximating, so there's no reason to
+//!   throttle a sub-agent harder than its parent.
 //! - Token-aware compaction kicks in at the same threshold as the
 //!   parent loop ([`crate::compaction::COMPACT_THRESHOLD`]); the
 //!   summary becomes a synthetic `system` message that replaces
@@ -44,7 +47,7 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::compaction;
-use crate::defaults::DEFAULT_LARGE_MODEL;
+use crate::defaults::{DEFAULT_LARGE_MODEL, MAX_TURN_ITERATIONS};
 use crate::error::CoderError;
 use crate::event::CoderEvent;
 use crate::inference::{
@@ -56,15 +59,6 @@ use crate::sessions::{
 	SESSION_SCHEMA_VERSION,
 };
 use crate::tools::{CoderMode, ToolContext, ToolRegistry};
-
-/// Hard cap on tool-call roundtrips per sub-agent. Lower than the
-/// parent's [`MAX_TURN_ITERATIONS`](crate::defaults::MAX_TURN_ITERATIONS)
-/// because sub-agents are scoped tasks (find a thing, fix one bug,
-/// summarize a folder), but high enough that a real multi-step
-/// inspection or refactor doesn't bail mid-flight. Auto-compaction
-/// handles the "context too big" half so we don't need a separate
-/// byte cap to backstop runaway growth.
-pub const SUBAGENT_MAX_ITERATIONS: usize = 50;
 
 /// Generated as `sub-<19-char-id>`. Different prefix from session
 /// ids (`sess-...`) so a tail of the events can tell them apart at
@@ -273,7 +267,7 @@ async fn run_subagent_inner(
 	let tool_defs = tools.definitions();
 	let cx = ToolContext::new(spec.folder.clone(), spec.mode);
 
-	for iter in 0..SUBAGENT_MAX_ITERATIONS {
+	for iter in 0..MAX_TURN_ITERATIONS {
 		if cancel.is_cancelled() {
 			return Err(CoderError::Aborted);
 		}
@@ -439,16 +433,16 @@ async fn run_subagent_inner(
 	let wrap_up = subagent_wrap_up(inference, sink, spec, &session_dir, &header, &mut messages, &cancel).await;
 	let result = match wrap_up {
 		Ok(text) if !text.trim().is_empty() => {
-			format!("[Sub-agent reached the {SUBAGENT_MAX_ITERATIONS}-iteration cap; final wrap-up follows.]\n\n{text}")
+			format!("[Sub-agent reached the {MAX_TURN_ITERATIONS}-iteration cap; final wrap-up follows.]\n\n{text}")
 		}
-		_ => format!("Sub-agent stopped after {SUBAGENT_MAX_ITERATIONS} iterations without producing a final answer.",),
+		_ => format!("Sub-agent stopped after {MAX_TURN_ITERATIONS} iterations without producing a final answer.",),
 	};
 	Ok(SubagentReport {
 		result,
 		tokens_used_estimate: tokens_used_for_report(&messages, last_usage),
 		sub_session_id: id.clone(),
 		mode: spec.mode,
-		iterations_used: SUBAGENT_MAX_ITERATIONS as u32,
+		iterations_used: MAX_TURN_ITERATIONS as u32,
 	})
 }
 
@@ -476,11 +470,11 @@ async fn subagent_wrap_up(
 	let id = spec.id.as_str();
 	tracing::info!(
 		subagent_id = %id,
-		iterations = SUBAGENT_MAX_ITERATIONS,
+		iterations = MAX_TURN_ITERATIONS,
 		"sub-agent iteration cap reached; running final tools-disabled wrap-up",
 	);
 	let sentinel = format!(
-		"[Tool-call budget exhausted: you've used all {SUBAGENT_MAX_ITERATIONS} tool-call iterations available for this sub-agent. \
+		"[Tool-call budget exhausted: you've used all {MAX_TURN_ITERATIONS} tool-call iterations available for this sub-agent. \
 Do not call any more tools. Write a final response now using only what you've already gathered: summarise findings, what's still unfinished, and any uncertainty.]"
 	);
 	messages.push(ChatMessage::User {
