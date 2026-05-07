@@ -53,10 +53,17 @@ const READ_FILE_MAX_BYTES: usize = 200_000;
 const BASH_OUTPUT_MAX_BYTES: usize = 64_000;
 
 /// Two flavours every dispatched tool runs under. The parent's
-/// top-level turn always uses [`CoderMode::Coder`]; sub-agents
+/// top-level turn always uses [`CoderMode::Agent`]; sub-agents
 /// pick per spawn (Phase C of the multi-project plan). Surfaced
 /// to tools via [`ToolContext`] so write-side tools can self-gate
 /// without each one re-deriving the rule.
+///
+/// The variant name `Agent` (and its wire string `"agent"`) is
+/// deliberate: an earlier iteration called this `Coder`, but the
+/// model would consistently treat a `mode: "coder"` sub-agent as
+/// less capable than itself and hesitate to delegate non-trivial
+/// work. `agent` reads as "another instance of you" in the model's
+/// vocabulary and lifted that hesitation in dogfooding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoderMode {
 	/// Read-only intent. `read_file` / `list_dir` / `grep` / `bash`
@@ -67,23 +74,23 @@ pub enum CoderMode {
 	/// system prompt instead.
 	Research,
 	/// Full toolkit. Today's parent-turn behaviour.
-	Coder,
+	Agent,
 }
 
 impl CoderMode {
 	pub fn allows_writes(self) -> bool {
-		matches!(self, Self::Coder)
+		matches!(self, Self::Agent)
 	}
 
 	/// Wire string used by event payloads (`SubagentSpawned.mode`,
 	/// the `mode` field on the `spawn_subagent` tool result, etc.).
-	/// Stable identifiers — `"research"` / `"coder"` — that the
+	/// Stable identifiers — `"research"` / `"agent"` — that the
 	/// frontend reads verbatim, so don't rename without also
 	/// updating `src/lib/protocol.ts`.
 	pub fn as_wire(self) -> &'static str {
 		match self {
 			Self::Research => "research",
-			Self::Coder => "coder",
+			Self::Agent => "agent",
 		}
 	}
 }
@@ -141,83 +148,95 @@ impl ToolRegistry {
 	}
 
 	/// Resolve a path argument against the synthetic `/workspace/`
-	/// surface the system prompt advertises and reject anything that
-	/// clearly belongs to a different bound folder. Three outcomes:
+	/// surface the system prompt advertises and route to the right
+	/// bound folder. Returns the `(target_folder, relative_path)` pair
+	/// the caller should dispatch against.
 	///
-	/// - **Active-folder absolute** (`/workspace/<active>/...`):
-	///   strip the prefix and return the remainder as a relative
-	///   path. The model can use either form — `src/foo.rs` or
-	///   `/workspace/<active>/src/foo.rs` — and they resolve the
-	///   same way.
-	/// - **Cross-folder absolute** (`/workspace/<other>/...`):
-	///   error with a sub-agent suggestion. The model sees the
-	///   guidance baked into the message and learns to spawn one
-	///   instead of guessing at sibling paths.
-	/// - **Cross-folder relative** (`<other>` or `<other>/...` where
-	///   `<other>` is a bound-folder basename ≠ active): same
-	///   error. We don't try to disambiguate a same-named directory
-	///   inside the active folder — if the model legitimately wants
-	///   that, prefixing with `./<other>` opts out of the check.
+	/// Three cases:
 	///
-	/// Anything else (`/abs/host/path`, `..` escapes, normal
-	/// relative paths) is left alone for `WorkspaceHost::resolve`
-	/// to validate. The cross-folder gate is purely a sub-agent
-	/// nudge layered on top of the existing host-level safety net.
+	/// - **Synthetic `/workspace/<name>/...`**: routes to the folder
+	///   whose basename matches `<name>` (active or otherwise). The
+	///   path returned is whatever's left after stripping the
+	///   `/workspace/<name>/` prefix; an empty tail becomes `"."`.
+	///   Errors with a clear "no folder bound as `<name>`" message
+	///   when the basename doesn't match anything bound.
+	/// - **Bare relative path starting with another bound folder's
+	///   basename** (`<other>/foo.rs`): also routes cross-folder.
+	///   The model often types this form when the system prompt
+	///   has shown it the synthetic `/workspace/<other>` path.
+	///   Disambiguation: a leading `./` opts out and forces the
+	///   path to resolve inside the [`ToolContext`]'s folder, so a
+	///   legitimate same-named subdirectory still works.
+	/// - **Anything else** (relative paths, absolute non-synthetic):
+	///   resolved against `cx.folder` and left for
+	///   [`WorkspaceHost::resolve`] to validate the way it
+	///   always has.
+	///
+	/// Sub-agents call this with `cx.folder` set to their own
+	/// assigned folder. They typically only see one bound folder
+	/// in their tool context (the one they were spawned against),
+	/// but the routing logic is identical — it just collapses to
+	/// the no-op case when the basename matches `cx.folder`.
 	async fn resolve_workspace_path(
 		&self,
 		raw: &str,
 		cx: &ToolContext,
 		tool: &'static str,
-	) -> Result<String, CoderError> {
+	) -> Result<(Arc<WorkspaceFolderEntry>, String), CoderError> {
 		let folders = self.workspaces.folders().await;
 		let active_name = cx.folder.folder.name.as_str();
-		let active_path = cx.folder.folder.path.as_str();
 		let path = Utf8Path::new(raw);
 
+		// Synthetic `/workspace/<name>/...` path. Same routing rule
+		// regardless of whether `<name>` matches the active folder
+		// or a sibling — we always look up the folder, and the
+		// returned `target` ends up equal to `cx.folder` when the
+		// basenames match.
 		if path.is_absolute() {
 			if let Ok(rest) = path.strip_prefix("/workspace") {
 				let mut comps = rest.components();
 				if let Some(camino::Utf8Component::Normal(first)) = comps.next() {
-					if first == active_name {
-						let tail = rest.strip_prefix(first).unwrap_or(Utf8Path::new(""));
-						let s = tail.as_str();
-						return Ok(if s.is_empty() { ".".to_string() } else { s.to_string() });
-					}
-					if let Some(other) = folders
+					let target = folders
 						.iter()
-						.find(|f| f.folder.name == first && f.folder.path != active_path)
-					{
-						return Err(cross_folder_error(tool, raw, &other.folder.name));
-					}
+						.find(|f| f.folder.name == first)
+						.cloned()
+						.ok_or_else(|| unbound_folder_error(tool, raw, first, &folders))?;
+					let tail = rest.strip_prefix(first).unwrap_or(Utf8Path::new(""));
+					let s = tail.as_str();
+					let resolved = if s.is_empty() { ".".to_string() } else { s.to_string() };
+					return Ok((target, resolved));
 				}
 			}
-			return Ok(raw.to_string());
+			// Absolute paths that aren't `/workspace/<name>/...` go
+			// through the active folder; the host's `resolve` will
+			// reject anything outside its root.
+			return Ok((cx.folder.clone(), raw.to_string()));
 		}
 
 		let mut comps = path.components();
 		match comps.next() {
 			// Leading `./` is the explicit "I mean a path *inside*
-			// the active folder, even if the first segment looks
-			// like a sibling's basename" opt-out the error message
-			// advertises. Pass through untouched.
-			Some(camino::Utf8Component::CurDir) => return Ok(raw.to_string()),
+			// `cx.folder`, even if the first segment looks like a
+			// sibling's basename" opt-out. Pass through untouched.
+			Some(camino::Utf8Component::CurDir) => Ok((cx.folder.clone(), raw.to_string())),
 			Some(camino::Utf8Component::Normal(name)) => {
-				if name != active_name
-					&& folders
-						.iter()
-						.any(|f| f.folder.name == name && f.folder.path != active_path)
-				{
-					let other = folders
-						.iter()
-						.find(|f| f.folder.name == name && f.folder.path != active_path)
-						.expect("just found above");
-					return Err(cross_folder_error(tool, raw, &other.folder.name));
+				if name != active_name {
+					if let Some(other) = folders.iter().find(|f| f.folder.name == name).cloned() {
+						// `<other-name>/<rest>` — strip the basename
+						// and route to that folder. Bare `<other-name>`
+						// (no tail) becomes `.`.
+						let tail_str = path
+							.strip_prefix(name)
+							.map(|t| t.as_str().to_string())
+							.unwrap_or_default();
+						let resolved = if tail_str.is_empty() { ".".to_string() } else { tail_str };
+						return Ok((other, resolved));
+					}
 				}
+				Ok((cx.folder.clone(), raw.to_string()))
 			}
-			_ => {}
+			_ => Ok((cx.folder.clone(), raw.to_string())),
 		}
-
-		Ok(raw.to_string())
 	}
 
 	/// Tool definitions to advertise to the model on every chat call.
@@ -225,13 +244,13 @@ impl ToolRegistry {
 		vec![
 			ToolDefinition::function(
 				"read_file",
-				"Read the contents of a file inside the **active** workspace folder. Returns the file's text, with each line prefixed by `<line_number>|<line>`. Treat the prefix as metadata — it is not part of the file. Optional `start_line` / `end_line` (1-based, inclusive) read just a slice; both omitted means read the whole file (capped at 200 kB). Refuses paths outside the active folder; to read files in a *different* bound folder, call `spawn_subagent` with `folder: \"<other-name>\"` instead of trying to reach across.",
+				"Read the contents of a file in any currently-bound workspace folder. Returns the file's text, with each line prefixed by `<line_number>|<line>`. Treat the prefix as metadata — it is not part of the file. Optional `start_line` / `end_line` (1-based, inclusive) read just a slice; both omitted means read the whole file (capped at 200 kB).",
 				json!({
 					"type": "object",
 					"properties": {
 						"path": {
 							"type": "string",
-							"description": "Path inside the active workspace folder. Use a folder-relative path (`src/foo.rs`) or the synthetic absolute `/workspace/<active-name>/src/foo.rs`; both resolve the same way."
+							"description": "Either a path inside the active workspace folder (`src/foo.rs`), or a synthetic `/workspace/<name>/src/foo.rs` to address any other currently-bound folder. Both forms work the same way; the latter is how you reach files outside the active folder."
 						},
 						"start_line": {
 							"type": "integer",
@@ -247,13 +266,13 @@ impl ToolRegistry {
 			),
 			ToolDefinition::function(
 				"list_dir",
-				"List the immediate contents of a directory inside the **active** workspace folder. Returns one entry per line in `kind  name` form. Refuses paths outside the active folder; spawn a sub-agent for sibling folders.",
+				"List the immediate contents of a directory in any currently-bound workspace folder. Returns one entry per line in `kind  name` form.",
 				json!({
 					"type": "object",
 					"properties": {
 						"path": {
 							"type": "string",
-							"description": "Path inside the active workspace folder. `.` for the active folder root; relative `src/` or absolute `/workspace/<active-name>/src/` both work.",
+							"description": "`.` for the active folder root; a relative path (`src/`) for an active-folder subtree; or `/workspace/<name>/...` to list inside any other currently-bound folder.",
 							"default": "."
 						}
 					}
@@ -301,13 +320,13 @@ impl ToolRegistry {
 			),
 			ToolDefinition::function(
 				"write_file",
-				"Overwrite a file with new content (or create it if missing) inside the **active** workspace folder. Use for new files or whole-file rewrites; prefer `edit_file` for surgical changes inside a large file. The file's parent directory must already exist. Throws on paths outside the active folder; to write into a sibling bound folder, spawn a `coder`-mode sub-agent against it.",
+				"Overwrite a file with new content (or create it if missing) in any currently-bound workspace folder. Use for new files or whole-file rewrites; prefer `edit_file` for surgical changes inside a large file. The file's parent directory must already exist.",
 				json!({
 					"type": "object",
 					"properties": {
 						"path": {
 							"type": "string",
-							"description": "Path inside the active workspace folder. Created if it does not exist. Relative or `/workspace/<active-name>/...`."
+							"description": "Path in the target folder. Either active-folder-relative (`src/foo.rs`) or synthetic `/workspace/<name>/...` to write into any other currently-bound folder. Created if it does not exist."
 						},
 						"content": {
 							"type": "string",
@@ -319,13 +338,13 @@ impl ToolRegistry {
 			),
 			ToolDefinition::function(
 				"edit_file",
-				"Replace an exact substring inside a file in the **active** workspace folder. `find` must match the file *exactly* (including whitespace and line endings) and must be unique unless `occurrence` is given. To insert text, set `find` to the line you want to insert before/after and include it in `replace`. To delete, set `replace` to an empty string. Failure throws — when it does, retry with more surrounding context in `find` so the match becomes unique. Sibling bound folders are off-limits; spawn a `coder`-mode sub-agent if you need to edit one.",
+				"Replace an exact substring inside a file in any currently-bound workspace folder. `find` must match the file *exactly* (including whitespace and line endings) and must be unique unless `occurrence` is given. To insert text, set `find` to the line you want to insert before/after and include it in `replace`. To delete, set `replace` to an empty string. Failure throws — when it does, retry with more surrounding context in `find` so the match becomes unique.",
 				json!({
 					"type": "object",
 					"properties": {
 						"path": {
 							"type": "string",
-							"description": "Path inside the active workspace folder. The file must already exist. Relative or `/workspace/<active-name>/...`."
+							"description": "Path in the target folder. Either active-folder-relative or synthetic `/workspace/<name>/...` to edit a file in any other currently-bound folder. The file must already exist."
 						},
 						"find": {
 							"type": "string",
@@ -401,8 +420,7 @@ impl ToolRegistry {
 		if matches!(parsed.start_line, Some(0)) || matches!(parsed.end_line, Some(0)) {
 			return Err(CoderError::invalid_args("read_file", "line numbers are 1-based"));
 		}
-		let resolved_path = self.resolve_workspace_path(&parsed.path, cx, "read_file").await?;
-		let folder = &cx.folder;
+		let (folder, resolved_path) = self.resolve_workspace_path(&parsed.path, cx, "read_file").await?;
 		let result = folder.host.read_file(Utf8Path::new(&resolved_path)).await?;
 		if result.is_binary {
 			return Err(CoderError::tool_failed("read_file", "binary file"));
@@ -440,8 +458,7 @@ impl ToolRegistry {
 		}
 		let parsed: ListDirArgs =
 			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("list_dir", err.to_string()))?;
-		let resolved_path = self.resolve_workspace_path(&parsed.path, cx, "list_dir").await?;
-		let folder = &cx.folder;
+		let (folder, resolved_path) = self.resolve_workspace_path(&parsed.path, cx, "list_dir").await?;
 		let entries = folder.host.read_dir(Utf8Path::new(&resolved_path)).await?;
 		let mut out = String::new();
 		for e in &entries {
@@ -508,8 +525,7 @@ impl ToolRegistry {
 		}
 		let parsed: WriteFileArgs =
 			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("write_file", err.to_string()))?;
-		let resolved_path = self.resolve_workspace_path(&parsed.path, cx, "write_file").await?;
-		let folder = &cx.folder;
+		let (folder, resolved_path) = self.resolve_workspace_path(&parsed.path, cx, "write_file").await?;
 		let result = folder
 			.host
 			.save_file(Utf8Path::new(&resolved_path), &parsed.content)
@@ -535,8 +551,7 @@ impl ToolRegistry {
 		if parsed.find.is_empty() {
 			return Err(CoderError::invalid_args("edit_file", "`find` must not be empty"));
 		}
-		let resolved_path = self.resolve_workspace_path(&parsed.path, cx, "edit_file").await?;
-		let folder = &cx.folder;
+		let (folder, resolved_path) = self.resolve_workspace_path(&parsed.path, cx, "edit_file").await?;
 		let path = Utf8Path::new(&resolved_path);
 		let original = folder.host.read_file(path).await?;
 		if original.is_binary {
@@ -747,22 +762,32 @@ pub(crate) const BASH_TARGET_CONTAINER: &str = "container";
 /// are LLM-sized (file contents + a few hundred bytes of `find`),
 /// not large-corpus. Same algorithm `pi-mono` uses for the same
 /// reason.
-/// Build the "you tried to reach a sibling bound folder; spawn a
-/// sub-agent instead" error returned by [`ToolRegistry::resolve_workspace_path`].
-/// The wording is deliberately prescriptive — the message is what the model
-/// reads back as the tool's `is_error: true` content, and the next turn
-/// usually does what the sentence in front of its eyes says.
-fn cross_folder_error(tool: &'static str, raw_path: &str, other_name: &str) -> CoderError {
+/// Build the "no bound folder named `<name>`" error returned by
+/// [`ToolRegistry::resolve_workspace_path`] when a `/workspace/<name>/...`
+/// path doesn't match any currently-bound folder. The error lists what
+/// *is* bound so the model can self-correct without another guess turn.
+fn unbound_folder_error(
+	tool: &'static str,
+	raw_path: &str,
+	requested: &str,
+	folders: &[Arc<WorkspaceFolderEntry>],
+) -> CoderError {
+	let bound = folders
+		.iter()
+		.map(|f| format!("`{}`", f.folder.name))
+		.collect::<Vec<_>>()
+		.join(", ");
+	let bound_clause = if bound.is_empty() {
+		"no folders are currently bound".to_string()
+	} else {
+		format!("currently bound: {bound}")
+	};
 	CoderError::tool_failed(
 		tool,
 		format!(
-			"`{raw_path}` lives in the bound folder `{other_name}`, which is *not* the active folder. \
-This tool only operates inside the active folder. \
-To inspect or edit `{other_name}`, call `spawn_subagent` with `folder: \"{other_name}\"` instead — \
-that gives the sub-agent its own tool context rooted at that folder, and you get a single summarised \
-result back without polluting your own context with its tool output. \
-If you actually meant a directory of the same name *inside* the active folder, prefix the path with `./` \
-(e.g. `./{other_name}/...`)."
+			"`{raw_path}` references the workspace `{requested}`, but no folder is bound under that name \
+({bound_clause}). Use one of the bound folder basenames in the `/workspace/<name>/...` form, or use a \
+plain relative path to address the active folder."
 		),
 	)
 }
@@ -1075,7 +1100,7 @@ mod tests {
 
 		async fn make_cx(registry: &Arc<WorkspaceRegistry>, idx: usize) -> ToolContext {
 			let folders = registry.folders().await;
-			ToolContext::new(folders[idx].clone(), CoderMode::Coder)
+			ToolContext::new(folders[idx].clone(), CoderMode::Agent)
 		}
 
 		#[tokio::test]
@@ -1084,11 +1109,12 @@ mod tests {
 			let one_path = camino::Utf8PathBuf::from_path_buf(one.path().to_path_buf()).unwrap();
 			let (registry, tools) = build_registry(&[one_path.as_path()]).await;
 			let cx = make_cx(&registry, 0).await;
-			let out = tools
+			let (folder, out) = tools
 				.resolve_workspace_path("src/lib.rs", &cx, "read_file")
 				.await
 				.expect("relative path should pass through");
 			assert_eq!(out, "src/lib.rs");
+			assert!(Arc::ptr_eq(&folder, &cx.folder));
 		}
 
 		#[tokio::test]
@@ -1099,11 +1125,12 @@ mod tests {
 			let cx = make_cx(&registry, 0).await;
 			let active_name = registry.folders().await[0].folder.name.clone();
 			let raw = format!("/workspace/{active_name}/src/foo.rs");
-			let out = tools
+			let (folder, out) = tools
 				.resolve_workspace_path(&raw, &cx, "read_file")
 				.await
 				.expect("synthetic active-folder path should resolve");
 			assert_eq!(out, "src/foo.rs");
+			assert!(Arc::ptr_eq(&folder, &cx.folder));
 		}
 
 		#[tokio::test]
@@ -1114,71 +1141,81 @@ mod tests {
 			let cx = make_cx(&registry, 0).await;
 			let active_name = registry.folders().await[0].folder.name.clone();
 			let raw = format!("/workspace/{active_name}");
-			let out = tools
+			let (folder, out) = tools
 				.resolve_workspace_path(&raw, &cx, "list_dir")
 				.await
 				.expect("synthetic root should resolve");
 			assert_eq!(out, ".");
+			assert!(Arc::ptr_eq(&folder, &cx.folder));
 		}
 
 		#[tokio::test]
-		async fn synthetic_sibling_path_errors_with_subagent_hint() {
+		async fn synthetic_sibling_path_routes_to_other_folder() {
 			let one = TempDir::new().unwrap();
 			let two = TempDir::new().unwrap();
 			let one_path = camino::Utf8PathBuf::from_path_buf(one.path().to_path_buf()).unwrap();
 			let two_path = camino::Utf8PathBuf::from_path_buf(two.path().to_path_buf()).unwrap();
 			let (registry, tools) = build_registry(&[one_path.as_path(), two_path.as_path()]).await;
 			let cx = make_cx(&registry, 0).await;
-			let other_name = registry.folders().await[1].folder.name.clone();
+			let folders = registry.folders().await;
+			let other = folders[1].clone();
+			let other_name = other.folder.name.clone();
 			let raw = format!("/workspace/{other_name}/src/foo.rs");
-			let err = tools.resolve_workspace_path(&raw, &cx, "read_file").await.unwrap_err();
-			match err {
-				CoderError::ToolFailed { tool, message } => {
-					assert_eq!(tool, "read_file");
-					assert!(message.contains("spawn_subagent"), "message: {message}");
-					assert!(message.contains(&other_name), "message: {message}");
-				}
-				other => panic!("expected ToolFailed, got {other:?}"),
-			}
+			let (target, out) = tools
+				.resolve_workspace_path(&raw, &cx, "read_file")
+				.await
+				.expect("synthetic sibling path should now route to the sibling folder");
+			assert_eq!(out, "src/foo.rs");
+			assert!(Arc::ptr_eq(&target, &other), "expected route to sibling folder");
 		}
 
 		#[tokio::test]
-		async fn relative_sibling_basename_errors_with_subagent_hint() {
+		async fn relative_sibling_basename_routes_to_other_folder() {
 			let one = TempDir::new().unwrap();
 			let two = TempDir::new().unwrap();
 			let one_path = camino::Utf8PathBuf::from_path_buf(one.path().to_path_buf()).unwrap();
 			let two_path = camino::Utf8PathBuf::from_path_buf(two.path().to_path_buf()).unwrap();
 			let (registry, tools) = build_registry(&[one_path.as_path(), two_path.as_path()]).await;
 			let cx = make_cx(&registry, 0).await;
-			let other_name = registry.folders().await[1].folder.name.clone();
-			// The user's reported failure mode: agent wrote `read_file({path: "huggingface_hub/foo.py"})`.
+			let folders = registry.folders().await;
+			let other = folders[1].clone();
+			let other_name = other.folder.name.clone();
+			// The lower-friction form: agent writes `<sibling-name>/foo.rs`
+			// (without the `/workspace/` prefix). Same routing.
 			let raw = format!("{other_name}/foo.rs");
-			let err = tools.resolve_workspace_path(&raw, &cx, "list_dir").await.unwrap_err();
-			assert!(matches!(err, CoderError::ToolFailed { .. }), "got {err:?}");
+			let (target, out) = tools
+				.resolve_workspace_path(&raw, &cx, "list_dir")
+				.await
+				.expect("relative sibling path should route");
+			assert_eq!(out, "foo.rs");
+			assert!(Arc::ptr_eq(&target, &other));
 		}
 
 		#[tokio::test]
-		async fn relative_sibling_basename_alone_errors() {
-			// Bare basename, no slash — also reported by the user.
+		async fn relative_sibling_basename_alone_routes_to_root() {
 			let one = TempDir::new().unwrap();
 			let two = TempDir::new().unwrap();
 			let one_path = camino::Utf8PathBuf::from_path_buf(one.path().to_path_buf()).unwrap();
 			let two_path = camino::Utf8PathBuf::from_path_buf(two.path().to_path_buf()).unwrap();
 			let (registry, tools) = build_registry(&[one_path.as_path(), two_path.as_path()]).await;
 			let cx = make_cx(&registry, 0).await;
-			let other_name = registry.folders().await[1].folder.name.clone();
-			let err = tools
+			let folders = registry.folders().await;
+			let other = folders[1].clone();
+			let other_name = other.folder.name.clone();
+			let (target, out) = tools
 				.resolve_workspace_path(&other_name, &cx, "list_dir")
 				.await
-				.unwrap_err();
-			assert!(matches!(err, CoderError::ToolFailed { .. }), "got {err:?}");
+				.expect("bare sibling basename should list its root");
+			assert_eq!(out, ".");
+			assert!(Arc::ptr_eq(&target, &other));
 		}
 
 		#[tokio::test]
 		async fn explicit_dot_slash_disambiguates_same_named_subdir() {
 			// A directory inside the active folder happens to share a
 			// sibling's basename. Prefixing with `./` opts out of the
-			// cross-folder check so the path passes through unchanged.
+			// cross-folder routing so the path passes through against
+			// the active folder.
 			let one = TempDir::new().unwrap();
 			let two = TempDir::new().unwrap();
 			let one_path = camino::Utf8PathBuf::from_path_buf(one.path().to_path_buf()).unwrap();
@@ -1187,11 +1224,34 @@ mod tests {
 			let cx = make_cx(&registry, 0).await;
 			let other_name = registry.folders().await[1].folder.name.clone();
 			let raw = format!("./{other_name}/foo.rs");
-			let out = tools
+			let (folder, out) = tools
 				.resolve_workspace_path(&raw, &cx, "read_file")
 				.await
-				.expect("./<sibling-name> should pass through");
+				.expect("./<sibling-name> should pass through against the active folder");
 			assert_eq!(out, raw);
+			assert!(Arc::ptr_eq(&folder, &cx.folder));
+		}
+
+		#[tokio::test]
+		async fn synthetic_unbound_name_errors_with_bound_list() {
+			let one = TempDir::new().unwrap();
+			let one_path = camino::Utf8PathBuf::from_path_buf(one.path().to_path_buf()).unwrap();
+			let (registry, tools) = build_registry(&[one_path.as_path()]).await;
+			let cx = make_cx(&registry, 0).await;
+			let active_name = registry.folders().await[0].folder.name.clone();
+			let raw = "/workspace/no-such-folder/src/foo.rs";
+			let err = tools.resolve_workspace_path(raw, &cx, "read_file").await.unwrap_err();
+			match err {
+				CoderError::ToolFailed { tool, message } => {
+					assert_eq!(tool, "read_file");
+					assert!(message.contains("no-such-folder"), "message: {message}");
+					assert!(
+						message.contains(&active_name),
+						"message should list bound folders: {message}"
+					);
+				}
+				other => panic!("expected ToolFailed, got {other:?}"),
+			}
 		}
 
 		#[tokio::test]
@@ -1203,11 +1263,12 @@ mod tests {
 			let one_path = camino::Utf8PathBuf::from_path_buf(one.path().to_path_buf()).unwrap();
 			let (registry, tools) = build_registry(&[one_path.as_path()]).await;
 			let cx = make_cx(&registry, 0).await;
-			let out = tools
+			let (folder, out) = tools
 				.resolve_workspace_path("/etc/passwd", &cx, "read_file")
 				.await
 				.expect("unrelated absolute paths should pass through");
 			assert_eq!(out, "/etc/passwd");
+			assert!(Arc::ptr_eq(&folder, &cx.folder));
 		}
 	}
 }

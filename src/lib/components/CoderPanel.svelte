@@ -661,7 +661,7 @@
 								 a click pops out into the full sub-agent
 								 transcript view (`coder.view = 'subagent'`).
 								 The mode badge inverts colour scheme by
-								 mode so a research / coder mix-up is
+								 mode so a research / agent mix-up is
 								 obvious at a glance. -->
 				<button
 					type="button"
@@ -1178,7 +1178,7 @@
 		text-transform: uppercase;
 		letter-spacing: 0.06em;
 	}
-	/* Mode pill: `coder` keeps the accent fill (full toolkit, can
+	/* Mode pill: `agent` keeps the accent fill (full toolkit, can
 	   edit), `research` flips to a quieter neutral fill so the
 	   read-only constraint is visually distinct. Same shape as
 	   the SCM panel's changes badge for visual continuity. */

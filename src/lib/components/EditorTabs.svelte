@@ -1,6 +1,9 @@
 <script lang="ts">
+	import { mount as mountComponent, unmount } from 'svelte';
 	import { workspace, type MarkdownView, type OpenFile, type SplitSide } from '../state.svelte';
 	import { isMarkdownPath } from '../util/markdown';
+	import ContextMenu from './ContextMenu.svelte';
+	import type { ContextMenuItem } from './contextMenu';
 	import RevertIcon from './icons/RevertIcon.svelte';
 
 	type Props = { side: SplitSide };
@@ -224,6 +227,152 @@
 		dropBeforePath = null;
 		dropAtEnd = false;
 	}
+
+	// Right-click on a tab opens a small action menu. We re-use
+	// `ContextMenu.svelte` (the same component the file tree mounts
+	// for its row menus) by spawning a portaled host on `document.body`
+	// and tearing it down on close. Going through `mount` instead of
+	// rendering the menu inside the strip keeps it from getting clipped
+	// by the tab strip's `overflow: hidden` and lets the popover
+	// position itself against the viewport.
+	let activeTabMenu: ReturnType<typeof mountComponent> | null = null;
+	let activeTabMenuHost: HTMLElement | null = null;
+
+	$effect(() => {
+		return () => {
+			disposeTabMenu();
+		};
+	});
+
+	function disposeTabMenu() {
+		if (activeTabMenu) {
+			void unmount(activeTabMenu);
+			activeTabMenu = null;
+		}
+		if (activeTabMenuHost) {
+			activeTabMenuHost.remove();
+			activeTabMenuHost = null;
+		}
+	}
+
+	function absolutePathFor(file: OpenFile): string | null {
+		if (file.isUntitled) {
+			return null;
+		}
+		if (file.isExternal) {
+			return file.path;
+		}
+		const root = workspace.activeFolderPath;
+		if (root === null) {
+			return null;
+		}
+		return `${root.replace(/\/+$/, '')}/${file.path}`;
+	}
+
+	async function copyToClipboard(text: string, label: string) {
+		try {
+			await navigator.clipboard.writeText(text);
+			workspace.flash(`Copied ${label}`);
+		} catch {
+			workspace.flash(`Could not copy ${label}`);
+		}
+	}
+
+	function buildTabMenuItems(file: OpenFile): ContextMenuItem[] {
+		const items: ContextMenuItem[] = [];
+		const absolute = absolutePathFor(file);
+		const copyPathItem: ContextMenuItem = {
+			id: 'copy-path',
+			label: 'Copy path',
+			disabled: absolute === null,
+			onSelect: () => {
+				if (absolute !== null) {
+					void copyToClipboard(absolute, 'path');
+				}
+			},
+		};
+		if (absolute !== null) {
+			copyPathItem.title = absolute;
+		}
+		items.push(copyPathItem);
+		// "Relative path" only makes sense for in-folder files. For
+		// external buffers `file.path` already *is* the absolute host
+		// path, so the relative entry would be a duplicate of "Copy
+		// path"; for untitled buffers there's no path at all.
+		if (!file.isExternal && !file.isUntitled) {
+			items.push({
+				id: 'copy-relative-path',
+				label: 'Copy relative path',
+				title: file.path,
+				onSelect: () => {
+					void copyToClipboard(file.path, 'relative path');
+				},
+			});
+		}
+
+		const paneTabs = workspace.tabsFor(side);
+		const hasOthers = paneTabs.some((p) => p !== file.path);
+		items.push({
+			id: 'close',
+			label: 'Close',
+			onSelect: () => {
+				void workspace.closeFile(file.path, side);
+			},
+		});
+		items.push({
+			id: 'close-others',
+			label: 'Close others',
+			disabled: !hasOthers,
+			onSelect: () => {
+				const others = workspace.tabsFor(side).filter((p) => p !== file.path);
+				for (const p of others) {
+					void workspace.closeFile(p, side);
+				}
+			},
+		});
+		items.push({
+			id: 'close-all',
+			label: 'Close all',
+			disabled: paneTabs.length === 0,
+			onSelect: () => {
+				const all = workspace.tabsFor(side).slice();
+				for (const p of all) {
+					void workspace.closeFile(p, side);
+				}
+			},
+		});
+		return items;
+	}
+
+	function openTabMenu(event: MouseEvent, file: OpenFile) {
+		event.preventDefault();
+		event.stopPropagation();
+		disposeTabMenu();
+
+		const items = buildTabMenuItems(file);
+		const host = document.createElement('div');
+		host.setAttribute('data-tab-context-menu-root', 'true');
+		host.style.position = 'fixed';
+		host.style.top = '0';
+		host.style.left = '0';
+		host.style.width = '0';
+		host.style.height = '0';
+		host.style.zIndex = '9999';
+		document.body.appendChild(host);
+
+		const anchorRect = { left: event.clientX, top: event.clientY, width: 0, height: 0 };
+		activeTabMenu = mountComponent(ContextMenu, {
+			target: host,
+			props: {
+				items,
+				anchorRect,
+				onClose: () => {
+					disposeTabMenu();
+				},
+			},
+		});
+		activeTabMenuHost = host;
+	}
 </script>
 
 <!--
@@ -260,6 +409,7 @@
 				draggable="true"
 				onclick={() => workspace.setActive(file.path, side)}
 				onkeydown={(e) => onTabKey(e, file.path)}
+				oncontextmenu={(e) => openTabMenu(e, file)}
 				ondragstart={(e) => onTabDragStart(e, file.path)}
 				ondragover={(e) => onTabDragOver(e, file.path)}
 				ondragend={onDragEnd}

@@ -15,10 +15,15 @@
 //!   and `edit_file` at the dispatch boundary (see
 //!   [`ToolRegistry::dispatch`]); the "no mutation via `bash`" half
 //!   is behavioural and lives in the system prompt.
-//! - Model tier is `Fast` (default) or `Large`. The strings
-//!   `"fast"` / `"large"` translate to
-//!   [`DEFAULT_FAST_MODEL`] / [`DEFAULT_LARGE_MODEL`]. Arbitrary HF
-//!   slugs are not accepted at this boundary on purpose.
+//! - Sub-agents inherit the parent's everyday driver model
+//!   ([`DEFAULT_LARGE_MODEL`]). There used to be a `fast`/`large`
+//!   selector; we dropped it because (1) it implied sub-agents
+//!   were second-class workers, which made the parent reluctant to
+//!   delegate non-trivial tasks; and (2) it was unused complexity
+//!   — the team uses one model for actual work and a separate
+//!   small model for the auto-rename title generator. The latter
+//!   still uses [`DEFAULT_FAST_MODEL`] internally; sub-agents do
+//!   not.
 //! - Iteration cap: [`SUBAGENT_MAX_ITERATIONS`] tool-roundtrips per
 //!   sub-agent — generous because auto-compaction handles the
 //!   "context too big" failure mode that the older byte cap was
@@ -39,7 +44,7 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::compaction;
-use crate::defaults::{DEFAULT_FAST_MODEL, DEFAULT_LARGE_MODEL};
+use crate::defaults::DEFAULT_LARGE_MODEL;
 use crate::error::CoderError;
 use crate::event::CoderEvent;
 use crate::inference::{
@@ -47,7 +52,8 @@ use crate::inference::{
 };
 use crate::runner::FolderEventSink;
 use crate::sessions::{
-	self, current_time_ms, new_session_id, sessions_dir, SessionHeader, SessionRecord, SESSION_SCHEMA_VERSION,
+	self, current_time_ms, new_session_id, sessions_dir, subagent_session_dir, SessionHeader, SessionRecord,
+	SESSION_SCHEMA_VERSION,
 };
 use crate::tools::{CoderMode, ToolContext, ToolRegistry};
 
@@ -84,47 +90,12 @@ pub struct Subagent {
 	pub parent_folder: Utf8PathBuf,
 	pub task: String,
 	pub system_prompt_override: Option<String>,
-	pub model_tier: ModelTier,
 	pub mode: CoderMode,
 	/// Folder the sub-agent's tools operate against. May differ
 	/// from `parent_folder` when the model passed an explicit
 	/// `folder` argument to `spawn_subagent`. Surfaced as
 	/// `target_folder` in events / persistence metadata.
 	pub folder: Arc<WorkspaceFolderEntry>,
-}
-
-/// Two-tier model selector exposed via `spawn_subagent`'s `model`
-/// argument. Translated to the moon-coder default constants before
-/// the inference call so arbitrary HF slugs can't leak in via this
-/// boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelTier {
-	Fast,
-	Large,
-}
-
-impl ModelTier {
-	pub fn slug(self) -> &'static str {
-		match self {
-			Self::Fast => DEFAULT_FAST_MODEL,
-			Self::Large => DEFAULT_LARGE_MODEL,
-		}
-	}
-
-	pub fn parse(raw: &str) -> Option<Self> {
-		match raw {
-			"fast" => Some(Self::Fast),
-			"large" => Some(Self::Large),
-			_ => None,
-		}
-	}
-
-	pub fn as_wire(self) -> &'static str {
-		match self {
-			Self::Fast => "fast",
-			Self::Large => "large",
-		}
-	}
 }
 
 /// What the sub-agent runner returns to the parent's tool
@@ -148,16 +119,18 @@ pub struct SubagentReport {
 pub fn spawn_subagent_tool_definition() -> ToolDefinition {
 	ToolDefinition::function(
 		"spawn_subagent",
-		"Spawn a sub-agent against a workspace folder and get back a single summarised string. Three reasons to reach for this: \
-**(1) cross-folder access** — your own tools only see the active folder, so any work in a sibling bound folder must go through a sub-agent (`folder: \"<other-name>\"`); \
-**(2) parallelism** — multiple `spawn_subagent` calls in one assistant message run concurrently (capped at 4), so independent investigations or edits across folders finish in one round-trip; \
-**(3) context preservation** — a `research` sub-agent that reads 30 files and reports one paragraph spends its tokens, not yours, and your transcript stays clean for the synthesis turn. \
+		"Delegate a self-contained task to a sub-agent and get back a single summarised string. Sub-agents run in their own context with their own LLM round-trips — you spend tokens on the task description and the final summary, not on every intermediate read or edit. \
 \
-Mode: use `mode: \"research\"` (recommended for inspection tasks) for read-only investigation — the sub-agent gets `read_file`, `list_dir`, `grep`, and `bash` for inspection commands (`git log`, `git diff`, `cargo check`, `pytest --collect-only`, …) but is instructed not to mutate anything. Use `mode: \"coder\"` (default) when the sub-agent should make edits — same toolkit plus `write_file` and `edit_file`. \
+Reach for this when one of these applies: \
+**(1) context preservation** — when the inputs are large but the answer is small (`grep`-then-read sweeps, \"is feature X already implemented?\", \"find every callsite of Y\", \"summarise this folder\"), spawning a sub-agent keeps the noisy tool output out of your own transcript. Your synthesis turn stays focused on the question, not the rummaging. \
+**(2) parallelism** — multiple `spawn_subagent` calls in one assistant message run concurrently (capped at 4), so an N-way investigation finishes in one round-trip instead of N. Use this when sub-tasks are independent. \
+**(3) scoped delegation** — when you want a fresh agent to take ownership of a self-contained piece of work (\"port this client to the new endpoints\", \"investigate why these tests fail\") without your own session's prior context biasing the approach. \
 \
-Model tier: `\"fast\"` (default) is the cheap / quick model and is the right pick for almost all sub-agents — focused reconnaissance, scoped edits, narrow tasks. Use `\"large\"` only when the sub-agent's task needs the same reasoning depth you'd want for a top-level chat turn (multi-file refactors, synthesis across many sources, ambiguous specs). \
+For mechanically related cross-folder work (you know exactly what to change in folder B because of work you just did in folder A), you do **not** need a sub-agent — your own tools accept `/workspace/<other-name>/...` paths and operate against any bound folder directly. Sub-agents are for *delegation*, not for *access*. \
 \
-The sub-agent has no access to your conversation history; describe the task self-containedly. Sub-agents cannot spawn further sub-agents.",
+Mode: `\"research\"` (recommended for investigations) gets `read_file`, `list_dir`, `grep`, and `bash` for inspection commands (`git log`, `git diff`, `cargo check`, `pytest --collect-only`, …) but is instructed not to mutate anything. `\"agent\"` (default) is the full toolkit — same capabilities as you have, including edits. \
+\
+The sub-agent has no access to your conversation history — describe the task self-containedly. Sub-agents cannot spawn further sub-agents.",
 		json!({
 			"type": "object",
 			"properties": {
@@ -167,17 +140,12 @@ The sub-agent has no access to your conversation history; describe the task self
 				},
 				"folder": {
 					"type": "string",
-					"description": "Basename of a currently-bound workspace folder to target (matches the `<name>` in `/workspace/<name>` from the Bound folders section). Omit (or set to the active folder's basename) to target the parent's active folder — useful for context-isolation even within the same folder. Targeting an unbound folder errors."
+					"description": "Basename of a currently-bound workspace folder to scope the sub-agent against (matches the `<name>` in `/workspace/<name>` from the Bound folders section). Omit (or set to the active folder's basename) to target the parent's active folder — useful for context-isolation even within the same folder. Targeting an unbound folder errors."
 				},
 				"mode": {
 					"type": "string",
-					"enum": ["research", "coder"],
-					"description": "`research` is read-only intent; `coder` (default) is the full toolkit and may edit files."
-				},
-				"model": {
-					"type": "string",
-					"enum": ["fast", "large"],
-					"description": "Model tier. `fast` (default) for routine work; `large` for heavy reasoning. Arbitrary slugs not accepted."
+					"enum": ["research", "agent"],
+					"description": "`research` is read-only intent (read_file, list_dir, grep, bash for inspection); `agent` (default) is the full toolkit and may edit files. The sub-agent in `agent` mode has the same capabilities you do."
 				},
 				"system_prompt": {
 					"type": "string",
@@ -194,7 +162,7 @@ The sub-agent has no access to your conversation history; describe the task self
 /// every event wrapped in [`CoderEvent::SubagentEvent`] so the UI
 /// can route updates to the right collapsed card / pop-out pane.
 /// Persists a JSONL transcript at
-/// `<coder_sessions_dir>/<parent-folder-slug>/<sub-id>.jsonl`,
+/// `<coder_sessions_dir>/<parent-folder-slug>/<parent-session-id>/<sub-id>.jsonl`,
 /// with a header carrying the parent's session id + tool_call_id
 /// so a "pop out" lookup survives IDE restarts.
 pub(crate) async fn run_subagent(
@@ -254,14 +222,17 @@ async fn run_subagent_inner(
 	let mut last_usage: Option<TokenUsage> = None;
 
 	// JSONL transcript lives under the **parent** folder's slug,
-	// not the target folder's. Sub-agents belong to whichever
-	// project originated them — listing sessions for the parent
-	// folder surfaces every sub-agent that ran underneath it,
-	// even when the sub-agent operated against a different
-	// folder. The header carries `target_folder` as metadata so
-	// the UI can still show which folder the sub-agent was
-	// scoped to.
-	let session_dir = sessions_dir(coder_sessions_dir, spec.parent_folder.as_path());
+	// nested inside a per-parent-session subdirectory:
+	// `<sessions_dir>/<parent_session_id>/<sub-id>.jsonl`. Sub-agents
+	// belong to whichever project originated them, and grouping by
+	// parent session means listing the sessions dir flat returns
+	// only top-level sessions (the picker stays clean) while
+	// `<parent_id>/` keeps every sub-agent that ran during that
+	// conversation in one obvious spot. The header carries
+	// `target_folder` as metadata so the UI can still show which
+	// folder the sub-agent was scoped to.
+	let parent_dir = sessions_dir(coder_sessions_dir, spec.parent_folder.as_path());
+	let session_dir = subagent_session_dir(&parent_dir, &spec.parent_session_id);
 	let now = current_time_ms();
 	// `subagent_target_folder` is `Some(...)` only when the
 	// sub-agent operated against a folder different from the
@@ -276,7 +247,7 @@ async fn run_subagent_inner(
 		title: subagent_session_title(&spec.task),
 		created_at_ms: now,
 		updated_at_ms: now,
-		model: spec.model_tier.slug().to_string(),
+		model: DEFAULT_LARGE_MODEL.to_string(),
 		parent_session_id: Some(spec.parent_session_id.clone()),
 		parent_tool_call_id: Some(spec.parent_tool_call_id.clone()),
 		subagent_mode: Some(spec.mode.as_wire().to_string()),
@@ -315,7 +286,7 @@ async fn run_subagent_inner(
 			inference,
 			sink,
 			Some(&id),
-			spec.model_tier.slug(),
+			DEFAULT_LARGE_MODEL,
 			last_usage.as_ref(),
 			&mut messages,
 			&cancel,
@@ -329,7 +300,7 @@ async fn run_subagent_inner(
 		let started = std::sync::atomic::AtomicBool::new(false);
 		let response = inference
 			.chat_completion_stream(
-				spec.model_tier.slug(),
+				DEFAULT_LARGE_MODEL,
 				&messages,
 				&tool_defs,
 				&cancel,
@@ -385,7 +356,7 @@ async fn run_subagent_inner(
 		// Wrap the parent runner's helper so the sub-agent's ring
 		// updates land on the same wire as parent updates. The
 		// envelope is `SubagentEvent { inner: TokenUsage … }`.
-		emit_subagent_token_usage(sink, &id, spec.model_tier.slug(), &messages, &response);
+		emit_subagent_token_usage(sink, &id, DEFAULT_LARGE_MODEL, &messages, &response);
 		messages.push(response_to_message(&response));
 		persist_subagent(
 			&session_dir,
@@ -523,7 +494,7 @@ Do not call any more tools. Write a final response now using only what you've al
 	let sink_for_cb = sink.clone();
 	let started = std::sync::atomic::AtomicBool::new(false);
 	let response = inference
-		.chat_completion_stream(spec.model_tier.slug(), messages, &[], cancel, |event| match event {
+		.chat_completion_stream(DEFAULT_LARGE_MODEL, messages, &[], cancel, |event| match event {
 			StreamEvent::ContentDelta { delta } => {
 				if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
 					sink_for_cb.send(wrap_inner(
@@ -702,16 +673,16 @@ fn parse_tool_args(function: &FunctionCall) -> Value {
 
 const RESEARCH_SYSTEM_PROMPT: &str = r#"You are a research sub-agent inside moon-ide. You have been spawned by a parent agent to gather information from a workspace folder and report back. Your job is investigation, not editing.
 
-Tools available: `read_file`, `list_dir`, `grep`, and `bash`. They all operate against the single folder assigned to you (shown below) — you cannot reach the parent's other bound folders, and you cannot spawn further sub-agents. Address files relative to your folder (`src/foo.rs`) or with the synthetic `/workspace/<your-folder-name>/...` form; both work.
+Tools available: `read_file`, `list_dir`, `grep`, and `bash`. You are scoped to a single folder (shown below); `grep` and `bash` run against it, and relative paths resolve inside it. You cannot spawn further sub-agents.
 
 The shell is for read-only inspection only — `git log`, `git diff --stat`, `cargo check`, `pytest --collect-only`, `ls -la`, `cat`, `wc`, and similar. Do **not** run commands that mutate the filesystem, network state, or remote services. No `git commit`, `git push`, `cargo build` (it writes to `target/`), `mv`, `rm`, `npm install`, `pip install`, redirection-to-file (`> path`, `>> path`), or anything that would change persistent state.
 
 Return your findings as a single coherent text result when you finish. The parent will see only that string; do not address them as "you" or assume shared context.
 "#;
 
-const CODER_SYSTEM_PROMPT: &str = r#"You are a coder sub-agent inside moon-ide. You have been spawned by a parent agent to perform a focused task in a workspace folder. You may read and edit files freely.
+const AGENT_SYSTEM_PROMPT: &str = r#"You are an agent sub-agent inside moon-ide. You have been spawned by a parent agent to perform a focused task in a workspace folder. Your capabilities are the same as the parent's — you can read, search, run commands, and edit files freely.
 
-Tools available: `read_file`, `list_dir`, `grep`, `bash`, `write_file`, `edit_file`. They all operate against the single folder assigned to you (shown below) — you cannot reach the parent's other bound folders, and you cannot spawn further sub-agents. Address files relative to your folder (`src/foo.rs`) or with the synthetic `/workspace/<your-folder-name>/...` form; both work.
+Tools available: `read_file`, `list_dir`, `grep`, `bash`, `write_file`, `edit_file`. You are scoped to a single folder (shown below); `grep` and `bash` run against it, and relative paths resolve inside it. You cannot spawn further sub-agents.
 
 Read before you edit — don't invent file paths. Use `edit_file` for surgical changes inside large files; reach for `write_file` for new files and whole-file rewrites.
 
@@ -721,7 +692,7 @@ Return a single coherent text result when you finish. The parent will see only t
 fn build_subagent_system_prompt(mode: CoderMode, folder: &Arc<WorkspaceFolderEntry>, task: &str) -> String {
 	let base = match mode {
 		CoderMode::Research => RESEARCH_SYSTEM_PROMPT,
-		CoderMode::Coder => CODER_SYSTEM_PROMPT,
+		CoderMode::Agent => AGENT_SYSTEM_PROMPT,
 	};
 	let header = format!(
 		"## Task\n\n{task}\n\n## Working folder\n\n- **{name}** at `{path}`\n",
@@ -770,24 +741,14 @@ pub fn build_subagent_spec(
 	};
 
 	let mode = match args.get("mode").and_then(Value::as_str) {
-		None | Some("coder") => CoderMode::Coder,
+		None | Some("agent") => CoderMode::Agent,
 		Some("research") => CoderMode::Research,
 		Some(other) => {
 			return Err(CoderError::invalid_args(
 				"spawn_subagent",
-				format!("unknown mode `{other}` — expected `research` or `coder`"),
+				format!("unknown mode `{other}` — expected `research` or `agent`"),
 			));
 		}
-	};
-
-	let model_tier = match args.get("model").and_then(Value::as_str) {
-		None | Some("") => ModelTier::Fast,
-		Some(raw) => ModelTier::parse(raw).ok_or_else(|| {
-			CoderError::invalid_args(
-				"spawn_subagent",
-				format!("unknown model `{raw}` — expected `fast` or `large`"),
-			)
-		})?,
 	};
 
 	let system_prompt_override = args
@@ -804,7 +765,6 @@ pub fn build_subagent_spec(
 		parent_folder,
 		task,
 		system_prompt_override,
-		model_tier,
 		mode,
 		folder,
 	})
@@ -839,14 +799,6 @@ mod tests {
 		registry.folders().await
 	}
 
-	#[test]
-	fn model_tier_parses_known_strings_only() {
-		assert_eq!(ModelTier::parse("fast"), Some(ModelTier::Fast));
-		assert_eq!(ModelTier::parse("large"), Some(ModelTier::Large));
-		assert!(ModelTier::parse("").is_none());
-		assert!(ModelTier::parse("Qwen/whatever").is_none());
-	}
-
 	fn parent_folder_for(folders: &[Arc<WorkspaceFolderEntry>], idx: usize) -> Utf8PathBuf {
 		Utf8PathBuf::from(folders[idx].folder.path.clone())
 	}
@@ -868,8 +820,7 @@ mod tests {
 			&folders,
 		)
 		.unwrap();
-		assert_eq!(spec.mode, CoderMode::Coder);
-		assert_eq!(spec.model_tier, ModelTier::Fast);
+		assert_eq!(spec.mode, CoderMode::Agent);
 		assert_eq!(spec.task, "do the thing");
 		assert!(Arc::ptr_eq(&spec.folder, &active));
 		assert_eq!(spec.parent_folder, parent_folder);

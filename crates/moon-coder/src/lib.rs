@@ -35,5 +35,5 @@ pub use folder_summary::{FolderSummary, FolderSummaryService};
 pub use inference::InferenceClient;
 pub use runner::{Coder, CoderHandle};
 pub use sessions::SessionSummary;
-pub use subagent::{ModelTier, Subagent, SubagentReport};
+pub use subagent::{Subagent, SubagentReport};
 pub use tools::{CoderMode, ToolContext, ToolRegistry};

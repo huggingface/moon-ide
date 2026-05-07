@@ -94,7 +94,7 @@ pub struct SessionHeader {
 	/// resolve the sub-agent's transcript across IDE restarts.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub parent_tool_call_id: Option<String>,
-	/// Wire string ("research" / "coder") of the mode the
+	/// Wire string ("research" / "agent") of the mode the
 	/// sub-agent ran under. `None` for top-level sessions; mirrors
 	/// `CoderMode::as_wire()` so the frontend reads it verbatim.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -168,6 +168,21 @@ pub struct LoadedSession {
 /// folder path the session is bound to.
 pub fn sessions_dir(coder_sessions_root: &Utf8Path, folder_root: &Utf8Path) -> Utf8PathBuf {
 	coder_sessions_root.join(project_slug(folder_root))
+}
+
+/// Per-parent-session directory for sub-agent transcripts. Every
+/// sub-agent spawned under `<sessions_dir>/<parent_session_id>.jsonl`
+/// persists its own JSONL into
+/// `<sessions_dir>/<parent_session_id>/<sub-id>.jsonl`.
+///
+/// Created lazily when the first sub-agent for that parent writes
+/// its header (`persist_subagent` calls `create_dir_all`). The
+/// subdir is empty for sessions that never spawned anything, and
+/// absent for sessions where no spawn ever fired — so a flat
+/// listing of `<sessions_dir>/` plus the `*.jsonl` extension
+/// filter naturally excludes sub-agents from the session picker.
+pub fn subagent_session_dir(sessions_dir: &Utf8Path, parent_session_id: &str) -> Utf8PathBuf {
+	sessions_dir.join(parent_session_id)
 }
 
 /// Deterministic short slug for a workspace folder: the basename
@@ -287,11 +302,20 @@ fn strip_trailing_context_block(prompt: &str) -> &str {
 	&prompt[..open_idx]
 }
 
-/// List every session in `dir`. Returns summaries sorted by
-/// `updated_at_ms` descending — the most-recently-touched session
-/// is the most-likely-wanted one when the panel mounts. Missing
-/// directory yields an empty list, not an error: a fresh workspace
-/// just has no sessions yet.
+/// List every **top-level** session in `dir`. Returns summaries
+/// sorted by `updated_at_ms` descending — the most-recently-touched
+/// session is the most-likely-wanted one when the panel mounts.
+/// Missing directory yields an empty list, not an error: a fresh
+/// workspace just has no sessions yet.
+///
+/// Sub-agent transcripts live in per-parent subdirectories
+/// (`<dir>/<parent-session-id>/<sub-id>.jsonl`), so a flat read of
+/// `dir` filtered to `*.jsonl` files naturally excludes them. The
+/// subdirectories themselves don't have the `.jsonl` extension and
+/// fall through the filter without a special prefix check. To
+/// reach a sub-agent's transcript, use the pop-out card on the
+/// parent's session or [`Runner::session_jsonl_path`] (which
+/// scans the parent subdirs for a matching `sub-*` id).
 pub async fn list_sessions(dir: &Utf8Path) -> Result<Vec<SessionSummary>, CoderError> {
 	if !tokio::fs::try_exists(dir.as_std_path()).await.unwrap_or(false) {
 		return Ok(Vec::new());
@@ -438,20 +462,64 @@ pub async fn append_record(dir: &Utf8Path, header: &SessionHeader, record: &Sess
 	Ok(())
 }
 
-/// Delete a session file. Idempotent — a missing file is not an
-/// error so the UI's "delete then refresh" flow is well-defined
-/// even when two windows race.
+/// Delete a session file plus its sub-agent subdirectory (if any).
+/// Idempotent — a missing file or subdir is not an error so the
+/// UI's "delete then refresh" flow is well-defined even when two
+/// windows race. The subdir cleanup is best-effort: a partial
+/// failure logs at warn but doesn't block the JSONL deletion.
 pub async fn delete(dir: &Utf8Path, id: &str) -> Result<(), CoderError> {
 	let path = session_path(dir, id);
 	match tokio::fs::remove_file(path.as_std_path()).await {
-		Ok(()) => Ok(()),
-		Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-		Err(err) => Err(CoderError::from(err)),
+		Ok(()) => {}
+		Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+		Err(err) => return Err(CoderError::from(err)),
 	}
+	let subagents = subagent_session_dir(dir, id);
+	match tokio::fs::remove_dir_all(subagents.as_std_path()).await {
+		Ok(()) => {}
+		Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+		Err(err) => {
+			tracing::warn!(
+				error = %err,
+				path = %subagents,
+				"could not remove sub-agent subdirectory; leaving on disk",
+			);
+		}
+	}
+	Ok(())
 }
 
 pub fn session_path(dir: &Utf8Path, id: &str) -> Utf8PathBuf {
 	dir.join(format!("{id}.{SESSION_EXT}"))
+}
+
+/// Find a sub-agent's JSONL by id, scanning the per-parent
+/// subdirectories under `dir`. Returns `None` if `dir` doesn't
+/// exist, no subdirectory contains a matching file, or `id`
+/// doesn't have the `sub-` prefix (in which case the caller
+/// should use [`session_path`] directly). Used by the
+/// "open trace" affordance — the IPC takes a single id and
+/// doesn't know the parent ahead of time. Cheap because the
+/// scan is bounded by the number of parent sessions in the
+/// project (a few dozen at most), and each subdir is checked
+/// with a single `try_exists`.
+pub async fn find_subagent_session(dir: &Utf8Path, id: &str) -> Option<Utf8PathBuf> {
+	if !id.starts_with("sub-") {
+		return None;
+	}
+	let mut read_dir = tokio::fs::read_dir(dir.as_std_path()).await.ok()?;
+	while let Some(entry) = read_dir.next_entry().await.ok().flatten() {
+		let path = entry.path();
+		if !path.is_dir() {
+			continue;
+		}
+		let utf8 = Utf8PathBuf::from_path_buf(path).ok()?;
+		let candidate = session_path(&utf8, id);
+		if tokio::fs::try_exists(candidate.as_std_path()).await.unwrap_or(false) {
+			return Some(candidate);
+		}
+	}
+	None
 }
 
 pub fn current_time_ms() -> i64 {
@@ -619,6 +687,115 @@ mod tests {
 		let summary = load_summary(&summary_path).await.unwrap();
 		assert_eq!(summary.title, "renamed by auto-pass");
 		assert_eq!(summary.id, "sess-test");
+	}
+
+	#[tokio::test]
+	async fn list_sessions_skips_subagent_jsonl() {
+		// Sub-agent transcripts live under per-parent subdirectories
+		// (`<dir>/<parent-id>/<sub-id>.jsonl`). Listing the flat
+		// directory should return only top-level sessions; the
+		// subdirectory itself doesn't have the `.jsonl` extension
+		// and falls through the filter.
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+
+		let parent_header = SessionHeader {
+			schema: SESSION_SCHEMA_VERSION,
+			id: "sess-parent".into(),
+			title: "parent".into(),
+			created_at_ms: 1,
+			updated_at_ms: 1,
+			model: "test/model".into(),
+			parent_session_id: None,
+			parent_tool_call_id: None,
+			subagent_mode: None,
+			subagent_target_folder: None,
+		};
+		append_record(&dir, &parent_header, &SessionRecord::User { text: "hi".into() })
+			.await
+			.unwrap();
+
+		let sub_dir = subagent_session_dir(&dir, "sess-parent");
+		let sub_header = SessionHeader {
+			schema: SESSION_SCHEMA_VERSION,
+			id: "sub-child".into(),
+			title: "spawned by parent".into(),
+			created_at_ms: 2,
+			updated_at_ms: 2,
+			model: "test/model".into(),
+			parent_session_id: Some("sess-parent".into()),
+			parent_tool_call_id: Some("call-1".into()),
+			subagent_mode: Some("agent".into()),
+			subagent_target_folder: None,
+		};
+		append_record(
+			&sub_dir,
+			&sub_header,
+			&SessionRecord::User {
+				text: "do thing".into(),
+			},
+		)
+		.await
+		.unwrap();
+
+		let listed = list_sessions(&dir).await.unwrap();
+		assert_eq!(listed.len(), 1, "list should hide sub-agent transcripts");
+		assert_eq!(listed[0].id, "sess-parent");
+
+		// `find_subagent_session` resolves the sub-agent's path
+		// for the IPC's "open trace" affordance — the IPC takes
+		// a single id so the runner has to scan parent subdirs.
+		let found = find_subagent_session(&dir, "sub-child").await;
+		assert_eq!(found, Some(session_path(&sub_dir, "sub-child")));
+		// Top-level ids return None — the caller should use the
+		// flat `session_path` for those.
+		let not_found = find_subagent_session(&dir, "sess-parent").await;
+		assert_eq!(not_found, None);
+	}
+
+	#[tokio::test]
+	async fn delete_session_removes_subagent_subdir() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+
+		let parent_header = SessionHeader {
+			schema: SESSION_SCHEMA_VERSION,
+			id: "sess-parent".into(),
+			title: "parent".into(),
+			created_at_ms: 1,
+			updated_at_ms: 1,
+			model: "test/model".into(),
+			parent_session_id: None,
+			parent_tool_call_id: None,
+			subagent_mode: None,
+			subagent_target_folder: None,
+		};
+		append_record(&dir, &parent_header, &SessionRecord::User { text: "hi".into() })
+			.await
+			.unwrap();
+		let sub_dir = subagent_session_dir(&dir, "sess-parent");
+		let sub_header = SessionHeader {
+			schema: SESSION_SCHEMA_VERSION,
+			id: "sub-child".into(),
+			title: "x".into(),
+			created_at_ms: 2,
+			updated_at_ms: 2,
+			model: "test/model".into(),
+			parent_session_id: Some("sess-parent".into()),
+			parent_tool_call_id: Some("call-1".into()),
+			subagent_mode: Some("agent".into()),
+			subagent_target_folder: None,
+		};
+		append_record(&sub_dir, &sub_header, &SessionRecord::User { text: "x".into() })
+			.await
+			.unwrap();
+
+		delete(&dir, "sess-parent").await.unwrap();
+
+		assert!(!tokio::fs::try_exists(session_path(&dir, "sess-parent").as_std_path())
+			.await
+			.unwrap());
+		assert!(!tokio::fs::try_exists(sub_dir.as_std_path()).await.unwrap());
 	}
 
 	#[test]

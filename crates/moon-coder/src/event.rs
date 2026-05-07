@@ -139,7 +139,7 @@ pub enum CoderEvent {
 	/// A new sub-agent has been registered against a parent
 	/// `tool_call_id`. Frontend uses this to insert a collapsed
 	/// summary card under the spawn_subagent tool row. `mode` is
-	/// the wire string ("research" / "coder") so the UI badge
+	/// the wire string ("research" / "agent") so the UI badge
 	/// renders without re-deriving the enum.
 	SubagentSpawned {
 		tool_call_id: String,

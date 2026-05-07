@@ -929,10 +929,11 @@ export type TokenUsageSource = 'provider' | 'estimate';
  * `moon_coder::tools::CoderMode::as_wire()`. `research` is read-only
  * intent (`write_file`/`edit_file` refuse at the tool boundary; the
  * "no mutation via bash" half is behavioural via the system prompt).
- * `coder` is the full toolkit. Top-level parent sessions are always
- * `coder` — there is no parent-side toggle.
+ * `agent` is the full toolkit — same capabilities as the parent.
+ * Top-level parent sessions are always `agent` — there is no parent-
+ * side toggle.
  */
-export type SubagentMode = 'research' | 'coder';
+export type SubagentMode = 'research' | 'agent';
 
 /**
  * Outer envelope carrying a folder tag alongside the inner event.

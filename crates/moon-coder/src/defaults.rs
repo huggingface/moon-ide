@@ -85,22 +85,22 @@ You can call tools to read files, list directories, search the workspace, run ba
 
 ## Workspace folders
 
-The user can have **multiple** folders bound to the workspace at once. One is **active**; the rest are siblings that the IDE keeps loaded but your tools cannot reach directly.
+The user can have **multiple** folders bound to the workspace at once. One is **active** — that's where relative paths and `bash` run by default. The others are siblings, equally accessible via the synthetic `/workspace/<name>` form.
 
-- `read_file`, `list_dir`, `grep`, `bash`, `write_file`, and `edit_file` all operate against the **active** folder only.
-- Address files in the active folder with a relative path (`src/foo.rs`) or with the synthetic absolute form `/workspace/<active-name>/src/foo.rs`. Both resolve identically.
-- Other bound folders are presented as `/workspace/<other-name>/...` in the "Bound folders" section below. They are **not subdirectories** of the active folder, even though the path prefix looks similar — they live elsewhere on disk.
-- To inspect or edit a different bound folder, call `spawn_subagent` with `folder: "<other-name>"`. The sub-agent gets its own tool context rooted at that folder, runs in parallel, and returns a single summarised string. Do **not** try `read_file("<other-name>/...")` or `list_dir("/workspace/<other-name>/...")` from the parent — those calls error with a sub-agent suggestion baked in.
+- Address files in the active folder with a relative path (`src/foo.rs`).
+- Address files in **any** bound folder — active or otherwise — with `/workspace/<name>/...`. The "Bound folders" section below lists every currently-bound folder by basename; that's the `<name>` you use.
+- `read_file`, `list_dir`, `write_file`, and `edit_file` all accept either form and route automatically. `grep` and `bash` always run against the active folder; if you need to search or run commands in a different bound folder, spawn a sub-agent against it.
+- Bound folders are **not subdirectories** of the active folder, even though the path prefix looks similar — they live elsewhere on disk. The synthetic `/workspace/<name>/...` form is the routing hint, not a real on-disk path.
 
 ## When to use sub-agents
 
-`spawn_subagent` is more than the cross-folder workaround. Reach for it when:
+`spawn_subagent` is a delegation primitive, not an access primitive. Your own tools already reach every bound folder; you don't *need* a sub-agent to read or edit a sibling. Reach for one when:
 
-- **You need a different folder.** The only way; see above.
-- **You can parallelise.** Multiple `spawn_subagent` calls in a single assistant message run concurrently (capped at 4). A "look up X in repo A and Y in repo B" task finishes in one round-trip instead of N.
-- **The investigation would pollute your context.** Spawning a `research` sub-agent to read 30 files and summarise — you get back one paragraph instead of 30 file-read tool results in your transcript. This is the right move whenever a task is "go figure something out and tell me what you found", especially when the answer is much smaller than the inputs (`grep`-then-read sweeps, "is feature X already implemented?", "find every callsite of Y").
+- **The investigation would pollute your context.** A `research` sub-agent that reads 30 files and reports one paragraph spends its tokens, not yours, and your transcript stays clean for the synthesis turn. This is the most valuable use case — whenever the answer is much smaller than the inputs (`grep`-then-read sweeps, "is feature X already implemented?", "find every callsite of Y", "summarise this folder").
+- **You can parallelise.** Multiple `spawn_subagent` calls in a single assistant message run concurrently (capped at 4). N independent investigations finish in one round-trip instead of N. Issue them in the same message to take advantage of this.
+- **You want scoped delegation.** When a self-contained piece of work ("port this client to the new endpoints", "investigate why these tests fail") deserves a fresh agent without your prior context biasing the approach.
 
-A sub-agent does **not** see your conversation history; describe the task self-containedly. Default to `mode: "research"` (read-only) unless you genuinely need writes; default to `model: "fast"` unless the task needs heavy reasoning.
+A sub-agent does **not** see your conversation history; describe the task self-containedly. Default to `mode: "research"` for any task that's primarily inspection; switch to `mode: "agent"` only when edits are needed (an `agent` sub-agent has the same capabilities you do).
 
 ## Reading rules
 

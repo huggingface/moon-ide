@@ -190,6 +190,23 @@ class FolderState {
 	constructor(public readonly folderPath: string) {}
 }
 
+/**
+ * Shape of a single `coder:event` Tauri event for the project-bar
+ * refresh listener. Mirrors the parts of `CoderEvent` we actually
+ * inspect — the rest stays unknown so the type is honest about
+ * what we don't introspect.
+ */
+type CoderRefreshEvent = {
+	kind: string;
+	name?: string;
+	args?: Record<string, unknown> | null;
+	inner?: { kind?: string };
+};
+type CoderRefreshEnvelope = {
+	folder: string;
+	event: CoderRefreshEvent;
+};
+
 class WorkspaceState {
 	workspace = $state<Workspace | null>(null);
 
@@ -1756,39 +1773,89 @@ class WorkspaceState {
 
 	#coderRefreshWired = false;
 	#coderRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+	/**
+	 * Folder paths that the parent agent's `tool_call` events have
+	 * touched within the current debounce window. Drained on flush.
+	 * Populated only when we can confidently resolve the target
+	 * folder from `args.path`; ambiguous calls fall through to
+	 * the all-folders fan-out by setting `#coderRefreshFanOut`.
+	 */
+	#coderRefreshPending: Set<string> = new Set();
+	/**
+	 * Sticky bit. Set when a sub-agent fires a `tool_call` (we
+	 * don't have its bound folder in the event wrapper, so we
+	 * can't be surgical), or when a parent `tool_call` couldn't
+	 * be classified. Cleared on flush. When set, the next flush
+	 * refreshes every bound folder.
+	 */
+	#coderRefreshFanOut = false;
 
 	/**
 	 * Subscribe to the coder event channel for project-bar refresh.
 	 * The fs-watcher only sees the **active** folder, so an agent
-	 * running in folder A that edits folder B (sub-agent on B,
-	 * `bash` writing into B's tree, …) wouldn't otherwise trigger
-	 * a status refresh — B's badge would lag until the user
-	 * activated it. Listening on `coder:event` and refreshing all
-	 * summaries on any `tool_result` / `turn_complete` /
-	 * `subagent_finished` covers the cross-folder case.
+	 * running in folder A that edits folder B (cross-folder path
+	 * via `/workspace/<other>/...`, sub-agent on B, `bash` writing
+	 * into B's tree, …) wouldn't otherwise trigger a status
+	 * refresh — B's badge would lag until the user activated it.
 	 *
-	 * Debounced (200ms) so a turn that fires 30 `edit_file`s
-	 * back-to-back collapses into one fan-out instead of 30. The
-	 * per-folder in-flight guard inside `refreshGitChangeSummary`
-	 * is a second backstop.
+	 * Surgical refresh strategy: every parent `tool_call` for a
+	 * file-touching tool has its `args.path` parsed and resolved
+	 * to a bound folder via the same `/workspace/<name>` rule
+	 * the backend uses; that folder's path joins
+	 * `#coderRefreshPending`. On `tool_result`, `turn_complete`,
+	 * or `subagent_finished` we schedule a 200 ms debounced flush.
+	 * Anything we can't confidently scope (sub-agent activity,
+	 * `bash` writes, parse failures) flips a fan-out bit so the
+	 * flush refreshes every bound folder — correctness over
+	 * cleverness.
 	 */
 	async bindCoderRefresh(): Promise<void> {
 		if (this.#coderRefreshWired) {
 			return;
 		}
 		this.#coderRefreshWired = true;
+		const flush = () => {
+			this.#coderRefreshTimer = null;
+			const pending = this.#coderRefreshPending;
+			const fanOut = this.#coderRefreshFanOut;
+			this.#coderRefreshPending = new Set();
+			this.#coderRefreshFanOut = false;
+			if (fanOut || pending.size === 0) {
+				void this.refreshAllGitChangeSummaries();
+				return;
+			}
+			for (const path of pending) {
+				void this.refreshGitChangeSummary(path);
+			}
+		};
 		const schedule = () => {
 			if (this.#coderRefreshTimer !== null) {
 				clearTimeout(this.#coderRefreshTimer);
 			}
-			this.#coderRefreshTimer = setTimeout(() => {
-				this.#coderRefreshTimer = null;
-				void this.refreshAllGitChangeSummaries();
-			}, 200);
+			this.#coderRefreshTimer = setTimeout(flush, 200);
 		};
 		try {
-			await listen<{ folder: string; event: { kind: string } }>('coder:event', ({ payload }) => {
+			await listen<CoderRefreshEnvelope>('coder:event', ({ payload }) => {
 				const kind = payload.event.kind;
+				if (kind === 'tool_call') {
+					const target = this.resolveCoderEventTargetFolder(payload);
+					if (target) {
+						this.#coderRefreshPending.add(target);
+					} else {
+						this.#coderRefreshFanOut = true;
+					}
+					return;
+				}
+				if (kind === 'subagent_event') {
+					// Sub-agent events don't carry the sub-agent's bound
+					// folder in the wrapper, so any tool activity from a
+					// sub-agent flips the fan-out bit. Cheap insurance.
+					const inner = payload.event.inner;
+					if (inner && inner.kind === 'tool_call') {
+						this.#coderRefreshFanOut = true;
+					}
+					return;
+				}
 				if (kind === 'tool_result' || kind === 'turn_complete' || kind === 'subagent_finished') {
 					schedule();
 				}
@@ -1799,6 +1866,50 @@ class WorkspaceState {
 			// case; only the cross-folder agent edit goes unseen
 			// until the next focus / palette refresh.
 		}
+	}
+
+	/**
+	 * Mirrors the backend's `resolve_workspace_path` so we can tell
+	 * which bound folder a `tool_call` actually touches. Returns
+	 * `null` when the tool isn't path-shaped (`bash`, `grep`,
+	 * unknown), or when the path argument is missing — those flip
+	 * the fan-out bit. `read_file` / `list_dir` / `write_file` /
+	 * `edit_file` with a `path` argument always resolve to *some*
+	 * bound folder, falling back to the originating session's
+	 * folder for unrouted relative paths.
+	 */
+	private resolveCoderEventTargetFolder(payload: CoderRefreshEnvelope): string | null {
+		const ev = payload.event;
+		if (ev.kind !== 'tool_call') {
+			return null;
+		}
+		const tool = ev.name;
+		if (tool !== 'read_file' && tool !== 'list_dir' && tool !== 'write_file' && tool !== 'edit_file') {
+			return null;
+		}
+		const args = ev.args;
+		const raw = args && typeof args === 'object' && 'path' in args && typeof args.path === 'string' ? args.path : null;
+		if (!raw) {
+			return null;
+		}
+		const folders = this.workspace?.folders ?? [];
+		const synthetic = /^\/workspace\/([^/]+)/.exec(raw);
+		if (synthetic) {
+			const match = folders.find((f) => f.name === synthetic[1]);
+			return match ? match.path : null;
+		}
+		if (raw.startsWith('./')) {
+			return payload.folder;
+		}
+		const firstSegment = raw.split('/', 1)[0] ?? raw;
+		const activeName = folders.find((f) => f.path === payload.folder)?.name;
+		if (firstSegment !== activeName) {
+			const sibling = folders.find((f) => f.name === firstSegment);
+			if (sibling) {
+				return sibling.path;
+			}
+		}
+		return payload.folder;
 	}
 
 	/**

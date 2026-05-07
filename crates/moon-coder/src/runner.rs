@@ -456,14 +456,21 @@ impl CoderHandle {
 		};
 		let folder_root = Utf8PathBuf::from(folder.folder.path.clone());
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_root);
-		let path = sessions::session_path(&dir, &id);
-		if !tokio::fs::try_exists(path.as_std_path())
+		let direct = sessions::session_path(&dir, &id);
+		if tokio::fs::try_exists(direct.as_std_path())
 			.await
 			.map_err(|err| CoderError::Internal(format!("could not stat session jsonl: {err}")))?
 		{
-			return Err(CoderError::Internal(format!("session jsonl not found: {path}")));
+			return Ok(direct);
 		}
-		Ok(path)
+		// Fallback for sub-agent ids: scan per-parent subdirectories
+		// (`<dir>/<parent-id>/<sub-id>.jsonl`). The IPC takes a
+		// single id and doesn't carry the parent, so we do the
+		// lookup here. No-op for top-level ids.
+		if let Some(found) = sessions::find_subagent_session(&dir, &id).await {
+			return Ok(found);
+		}
+		Err(CoderError::Internal(format!("session jsonl not found: {direct}")))
 	}
 
 	/// Discard the active folder's in-memory session and start a
@@ -788,7 +795,7 @@ async fn run_turn(
 		.folder_for_path(folder_path.as_str())
 		.await
 		.ok_or(CoderError::NoActiveFolder)?;
-	let cx = ToolContext::new(folder_entry, CoderMode::Coder);
+	let cx = ToolContext::new(folder_entry, CoderMode::Agent);
 	// Compose a fresh system prompt and overwrite the session's
 	// `messages[0]`: the base prompt plus a "Bound folders"
 	// section keyed off whatever summaries are currently cached.
@@ -1247,7 +1254,7 @@ async fn handle_spawn_subagent(
 		"result": report.result,
 		"sub_session_id": report.sub_session_id,
 		"tokens_used_estimate": report.tokens_used_estimate,
-		"mode": match report.mode { CoderMode::Research => "research", CoderMode::Coder => "coder" },
+		"mode": report.mode.as_wire(),
 		"iterations_used": report.iterations_used,
 	}))
 }
