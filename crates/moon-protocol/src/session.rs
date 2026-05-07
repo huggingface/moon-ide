@@ -8,6 +8,7 @@
 //! compile time. Per AGENTS.md "no premature migrations": we change
 //! this freely until the roadmap is done.
 
+use crate::git::PrListScope;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -26,6 +27,7 @@ pub enum SplitSide {
 /// entry but the wire shape stays the same.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
+#[serde(default)]
 pub struct FolderSession {
 	/// Absolute path of the folder on the host. Used to re-bind the
 	/// folder on next launch and to invalidate stale entries when the
@@ -46,6 +48,33 @@ pub struct FolderSession {
 	pub active_right: Option<String>,
 	pub has_split: bool,
 	pub focused_side: SplitSide,
+	/// Branch-switcher PR-section filter for this folder. Persisted
+	/// per folder so flipping to "Participating" on a busy
+	/// monorepo doesn't drag a sleepy side-project's palette into
+	/// participating-only mode too. Defaults to
+	/// [`PrListScope::All`] for fresh sessions and for sessions
+	/// written by older builds (`#[serde(default)]`).
+	pub pr_scope: PrListScope,
+}
+
+/// Dummy `Default` so `#[serde(default)]` on the struct can fill
+/// in a fresh `FolderSession` if the on-disk JSON is missing
+/// fields. Per AGENTS.md "no premature migrations": on disk we
+/// rely on field-level defaults and tolerate missing fields,
+/// rather than write migration code.
+impl Default for FolderSession {
+	fn default() -> Self {
+		Self {
+			folder_path: String::new(),
+			open_files_left: Vec::new(),
+			open_files_right: Vec::new(),
+			active_left: None,
+			active_right: None,
+			has_split: false,
+			focused_side: SplitSide::Left,
+			pr_scope: PrListScope::default(),
+		}
+	}
 }
 
 /// Persisted UI session for the singleton workspace. Holds one

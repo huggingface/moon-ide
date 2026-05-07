@@ -179,6 +179,177 @@ pub struct GitBranchInfo {
 	pub default_branch_behind: u32,
 }
 
+/// One row in the branch-switcher palette. Two kinds today: a
+/// local branch (or remote-tracking ref already fetched) and a
+/// GitHub PR sourced from `gh pr list`. The discriminant drives
+/// the switch verb on the backend — `git switch <name>` for
+/// `Local`, `gh pr checkout <number>` for `Pr` (so cross-fork PRs
+/// get the fork-fetching dance for free).
+///
+/// Frontend renders both in a single list with a section header
+/// per kind; type-to-filter spans both. See
+/// `src/lib/components/BranchSwitcher.svelte`.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum BranchListEntry {
+	/// A branch the local repo already knows about — cheap
+	/// `git switch` target. Sourced from `git for-each-ref
+	/// refs/heads`, sorted by committer date (newest first) at
+	/// the backend so the UI renders the order verbatim.
+	Local {
+		/// Short branch name (`feat/foo`, `main`).
+		name: String,
+		/// First line of the tip commit (`%(subject)`). Empty
+		/// string when the ref points at an empty tree (rare —
+		/// freshly created branch with `--orphan` and no
+		/// commit yet).
+		last_commit_subject: String,
+		/// Human-readable "3 hours ago" / "yesterday" style
+		/// timestamp, computed by git itself
+		/// (`%(committerdate:relative)`). The frontend renders
+		/// it verbatim — no locale translation, matches what
+		/// `git branch -v` would print.
+		committer_date_relative: String,
+		/// Marker for the row that's currently checked out so
+		/// the UI can render it as inert (no point switching to
+		/// the branch you're already on).
+		is_current: bool,
+	},
+	/// A GitHub pull request, as reported by `gh pr list`.
+	Pr {
+		/// PR number (the `#42` segment). 32-bit fits every
+		/// realistic GitHub repo's PR count.
+		number: u32,
+		/// PR title verbatim. Rendered with mono accent on the
+		/// number, then a separator, then the title.
+		title: String,
+		/// GitHub login of the PR's author (no `@` prefix). The
+		/// frontend prepends `@` itself so the wire format
+		/// stays clean.
+		author: String,
+		/// Source branch (`headRefName`) the PR is open from.
+		/// Used by `gh pr checkout` implicitly; we surface it
+		/// in the UI for users who recognise the branch name
+		/// faster than the title.
+		head_ref: String,
+		/// True iff the PR is currently a draft. The frontend
+		/// renders a small `draft` badge inline; type-to-filter
+		/// still matches drafts (no filter knob today, hardcode
+		/// first per AGENTS.md).
+		is_draft: bool,
+		/// Human-readable last-update timestamp from gh's
+		/// JSON. We compute the relative form on the backend so
+		/// every row has the same format regardless of locale.
+		updated_at_relative: String,
+	},
+}
+
+/// Why the PR section of [`BranchList`] is empty. Surfaced in the
+/// palette as the section's empty-state row so the user knows
+/// whether to install gh, run `gh auth login`, or accept that
+/// their remote isn't on GitHub.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum PrListStatus {
+	/// PRs were fetched successfully (the section is populated
+	/// or genuinely has no open PRs).
+	#[default]
+	Ok,
+	/// `gh` isn't installed (or isn't on the resolved `PATH`).
+	/// Frontend renders `"Install gh to see PR list"` plus a
+	/// link to `https://cli.github.com/`.
+	GhMissing,
+	/// `gh` is installed but `gh auth status` reports no usable
+	/// auth (signed out, expired token). Frontend offers a
+	/// "Run `gh auth login`" hint that opens an integrated
+	/// terminal pinned to the active folder.
+	GhNotAuthed,
+	/// The active folder's `origin` (or `upstream`) isn't a
+	/// GitHub remote, so PRs aren't applicable. Frontend
+	/// suppresses the section entirely (no "empty" row, no
+	/// "missing" row — just no PR section).
+	NotGithub,
+	/// `gh pr list` ran but exited non-zero (network error, API
+	/// rate limit, scope refused, …). Frontend surfaces the
+	/// detail verbatim so the user gets the actionable hint.
+	Failed { detail: String },
+}
+
+/// Result of `branch_list`. Three slots so the frontend can paint
+/// local rows immediately even if the gh probe is slow / failing
+/// — local always returns from `git for-each-ref` in single-digit
+/// milliseconds, gh can stall on a network round-trip.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchList {
+	/// Recent local branches, newest committer-date first,
+	/// capped at a small number (today's slice ships 20 — bumps
+	/// when a real project hits the cap).
+	pub local: Vec<BranchListEntry>,
+	/// Open GitHub PRs against the active folder's repo. Empty
+	/// when [`pr_status`](Self::pr_status) is anything other
+	/// than `Ok`; capped at 30. Sub-filters (`@me`, "review
+	/// requested") are deferred — type-to-filter handles the
+	/// volume the team currently sees.
+	pub prs: Vec<BranchListEntry>,
+	/// Why `prs` is empty, if it is. `Ok` means "the section is
+	/// populated with whatever gh returned, including the empty
+	/// case of no open PRs" — the frontend distinguishes
+	/// "section unavailable" from "section truthfully empty".
+	pub pr_status: PrListStatus,
+}
+
+/// Scope filter for `branch_list`'s PR section. `All` mirrors
+/// `gh pr list --state open` (every open PR in the repo);
+/// `Participating` uses GitHub's search qualifiers to keep only
+/// PRs the user is involved in — a focused list for repos with
+/// dozens of in-flight changes.
+///
+/// "Participating" runs two `gh pr list --search` queries in
+/// parallel and merges them by PR number:
+///
+/// - `state:open involves:@me` — author, assignee, mentioned, or
+///   commenter (everything GitHub's notification "Participating"
+///   filter covers).
+/// - `state:open review-requested:@me` — review explicitly
+///   requested from the user. Not covered by `involves:`.
+///
+/// The default (`All`) matches the previous slice's behaviour so
+/// flipping the toggle in the palette is the gesture, not the
+/// other way around.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum PrListScope {
+	/// Every open PR in the active folder's repo.
+	#[default]
+	All,
+	/// PRs the user is involved in — author / assignee /
+	/// mentioned / commenter / review requested.
+	Participating,
+}
+
+/// Argument for `branch_switch`. `Local` runs `git switch
+/// <name>`; `Pr` runs `gh pr checkout <number>` so cross-fork
+/// PRs work without manual remote / fetch fiddling.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum BranchSwitchTarget {
+	/// Switch to a local branch by name. Errors propagate git's
+	/// stderr verbatim ("Your local changes to the following
+	/// files would be overwritten by checkout") so the user gets
+	/// the actionable hint.
+	Local { name: String },
+	/// Check out a GitHub PR by number via `gh pr checkout`.
+	/// gh's stderr propagates the same way — auth missing,
+	/// network failure, dirty tree, etc.
+	Pr { number: u32 },
+}
+
 /// Outcome of a successful `git_commit`. The SCM panel renders
 /// `short_sha` + `summary` in the post-commit toast so the user
 /// can verify the commit landed without opening a terminal.

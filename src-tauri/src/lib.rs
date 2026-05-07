@@ -66,6 +66,8 @@ pub fn run() {
 			commands::fs::fs_git_merge_default_branch,
 			commands::fs::fs_git_fetch,
 			commands::fs::fs_git_head_commit_message,
+			commands::fs::fs_branch_list,
+			commands::fs::fs_branch_switch,
 			commands::search::search_files,
 			commands::search::search_content,
 			commands::app_state::app_state_load,

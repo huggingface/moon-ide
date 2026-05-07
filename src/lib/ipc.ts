@@ -11,6 +11,9 @@ import type {
 	EditorConfig,
 	FileSearchOptions,
 	FileSearchResult,
+	BranchList,
+	PrListScope,
+	BranchSwitchTarget,
 	GitBranchInfo,
 	GitChangeSummary,
 	GitCommitResult,
@@ -84,6 +87,8 @@ export const ipc = {
 		gitMergeDefaultBranch: (remoteRef: string) => invoke<void>('fs_git_merge_default_branch', { remoteRef }),
 		gitFetch: () => invoke<void>('fs_git_fetch'),
 		gitHeadCommitMessage: () => invoke<string>('fs_git_head_commit_message'),
+		branchList: (prScope: PrListScope) => invoke<BranchList>('fs_branch_list', { prScope }),
+		branchSwitch: (target: BranchSwitchTarget) => invoke<void>('fs_branch_switch', { target }),
 	},
 	search: {
 		files: (options: FileSearchOptions) => invoke<FileSearchResult[]>('search_files', { options }),

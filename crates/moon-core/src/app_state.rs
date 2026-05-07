@@ -71,6 +71,7 @@ mod tests {
 				active_right: None,
 				has_split: false,
 				focused_side: SplitSide::Left,
+				..Default::default()
 			}],
 			active_folder_path: Some("/tmp/example".into()),
 		}

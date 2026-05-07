@@ -71,7 +71,7 @@ use thiserror::Error;
 use tokio::process::Command;
 
 use crate::compose::{
-	generate_compose, BoundMount, ComposeRender, ComposeRenderOptions, HostGitIdentity, SshAgentForward,
+	generate_compose, BoundMount, ComposeRender, ComposeRenderOptions, GhConfigMount, HostGitIdentity, SshAgentForward,
 };
 use crate::project::{project_name_for_id, ProjectName, ProjectNameError};
 
@@ -222,12 +222,14 @@ impl Workspace {
 		let mounts = self.bound_mounts();
 		let agent = detect_ssh_agent_forward();
 		let identity = detect_host_git_identity();
+		let gh_config = detect_host_gh_config();
 		generate_compose(ComposeRenderOptions {
 			project: &self.project,
 			dev_image,
 			bound_mounts: &mounts,
 			ssh_agent: agent.as_ref(),
 			git_identity: identity.as_ref(),
+			gh_config: gh_config.as_ref(),
 		})
 	}
 
@@ -513,6 +515,48 @@ pub(crate) fn detect_host_git_identity() -> Option<HostGitIdentity> {
 	let name = read_git_global_config("user.name")?;
 	let email = read_git_global_config("user.email")?;
 	Some(HostGitIdentity { name, email })
+}
+
+/// Resolve the host's `gh` config directory and bind-mount it
+/// into the dev container so an in-container `gh` shares the
+/// host's auth state. Returns `None` when:
+///
+/// - `$GH_CONFIG_DIR` isn't set and the platform default
+///   (`$XDG_CONFIG_HOME/gh` or `~/.config/gh`) doesn't exist —
+///   the user has never run `gh auth login` on the host.
+///   Mounting a non-existent path would have Docker auto-create
+///   it as an empty directory and shadow any later host login
+///   until the container is recreated.
+/// - The home directory itself can't be resolved (no `$HOME`,
+///   no `$USERPROFILE`) — extremely rare, but we'd rather skip
+///   than guess.
+///
+/// Re-evaluated every time we render or write `compose.yaml`,
+/// matching `detect_ssh_agent_forward`'s "rebuild container to
+/// pick it up" cadence.
+pub(crate) fn detect_host_gh_config() -> Option<GhConfigMount> {
+	let raw = std::env::var("GH_CONFIG_DIR").ok().filter(|s| !s.is_empty());
+	let path = if let Some(raw) = raw {
+		Utf8PathBuf::from(raw)
+	} else {
+		let xdg = std::env::var("XDG_CONFIG_HOME").ok().filter(|s| !s.is_empty());
+		let base = match xdg {
+			Some(s) => Utf8PathBuf::from(s),
+			None => {
+				let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok()?;
+				Utf8PathBuf::from(home).join(".config")
+			}
+		};
+		base.join("gh")
+	};
+	if !path.is_dir() {
+		tracing::debug!(
+			%path,
+			"gh config dir not found; skipping gh auth pass-through into the container",
+		);
+		return None;
+	}
+	Some(GhConfigMount { host_path: path })
 }
 
 fn read_git_global_config(key: &str) -> Option<String> {

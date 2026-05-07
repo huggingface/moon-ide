@@ -224,6 +224,39 @@ Changes` that surfaces when the repo's default branch
   round-trip is needed. Conflicts / dirty-tree refusals propagate
   git's stderr verbatim via flash; an in-app abort affordance is
   a later concern (Phase 5's full conflict UI).
+- **Branch switcher.** Cmd+Shift+B (and a click on the branch
+  label) opens a Cmd+P-style palette listing recent local
+  branches plus open GitHub PRs in a single filterable list.
+  Local rows come from `git for-each-ref refs/heads
+--sort=-committerdate` (cap 20); PR rows come from `gh pr list`
+  (cap 30) on the host (no container routing today — the
+  LocalHost binds the active folder's `.git` the container would
+  see anyway). Backend lives in `WorkspaceHost::branch_list` /
+  `branch_switch`; the `BranchSwitchTarget` discriminator picks
+  `git switch <name>` vs `gh pr checkout <number>` so cross-fork
+  PRs work without manual remote / fetch fiddling. The PR
+  section's emptiness carries a `PrListStatus` so the empty-state
+  row is the right hint: _Install gh_ / _gh is signed out_ /
+  _gh pr list failed: …_ — the `notGithub` case suppresses the
+  section entirely rather than rendering "no PRs". The free-text
+  filter spans branch name, commit subject, PR number, title,
+  author, and head ref so type-to-filter is the primary
+  navigation gesture.
+
+  PR rows are filtered by a per-folder `pr_scope` (persisted in
+  `FolderSession.pr_scope`, surfaced as an `All PRs` /
+  `Participating` toggle in the palette's hint bar). `All` mirrors
+  the unfiltered `gh pr list --state open`. `Participating` runs
+  two `gh pr list --search` calls in parallel —
+  `state:open involves:@me` (author / assignee / mentioned /
+  commenter) and `state:open review-requested:@me` — and merges
+  by PR number, sorted by raw `updatedAt` so the merged list
+  reads chronologically. Persistence is per folder so a busy
+  monorepo can stay in `Participating` without dragging a
+  side-project's palette into the same filter.
+
+  Container `gh` shares the host's auth via the `~/.config/gh`
+  read-only bind mount (see `specs/containers.md`).
 
 ### 5.4 — Search ignores `.git/`
 

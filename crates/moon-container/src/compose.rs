@@ -100,6 +100,42 @@ pub struct SshAgentForward {
 	pub host_socket: Utf8PathBuf,
 }
 
+/// In-container path the host's `gh` config is mounted at. We
+/// pin it to the `dev` user's `~/.config/gh` so the in-container
+/// `gh` finds the host's auth without needing
+/// `GH_CONFIG_DIR=/whatever` on every invocation. `dev`'s home is
+/// `/home/dev` per the moon-base Dockerfile.
+pub const GH_CONFIG_CONTAINER_PATH: &str = "/home/dev/.config/gh";
+
+/// Bind-mount of the host's `gh` config directory (typically
+/// `~/.config/gh`) into the dev container, read-only. Surfaces
+/// the host's existing `gh auth login` session as the container's
+/// auth state — opening a container terminal and running
+/// `gh pr list` Just Works without re-authing.
+///
+/// Read-only on purpose:
+///
+/// 1. **One source of truth.** The host owns the auth; the
+///    container reads it. A container `gh auth login` would
+///    silently update the host's config (because the bind mount
+///    is shared), which is surprising and hard to undo.
+/// 2. **No accidental mutation.** Tools that lazily write the
+///    config (e.g. `gh config set`) fail loudly inside the
+///    container instead of mutating host state.
+/// 3. **Mirrors SSH agent forwarding.** The agent socket is
+///    similarly host-owned; gh config follows the same pattern.
+///
+/// If the host config doesn't exist yet (`~/.config/gh` is
+/// absent because the user has never run `gh auth login`), the
+/// lifecycle layer skips the mount entirely — Docker would
+/// otherwise auto-create the source as a directory and shadow
+/// any later host login until the container is recreated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GhConfigMount {
+	/// Absolute host-side path to the gh config directory.
+	pub host_path: Utf8PathBuf,
+}
+
 /// The host's `git config --global user.{name,email}`, projected
 /// into the dev container as `GIT_AUTHOR_*` / `GIT_COMMITTER_*`
 /// environment variables.
@@ -159,6 +195,10 @@ pub struct ComposeRenderOptions<'a> {
 	/// commit prompts "Please tell me who you are" — a deliberate
 	/// "refuse rather than commit as the wrong person" fallback.
 	pub git_identity: Option<&'a HostGitIdentity>,
+	/// Optional host `gh` config bind mount. `None` skips the
+	/// volume entirely (no auth pass-through; `gh` inside the
+	/// container is in its default unauthenticated state).
+	pub gh_config: Option<&'a GhConfigMount>,
 }
 
 /// Wrap `value` in double quotes, escaping `\` and `"` so an
@@ -215,10 +255,10 @@ pub fn generate_compose(options: ComposeRenderOptions<'_>) -> ComposeRender {
 	let _ = writeln!(yaml, "    init: true");
 	let _ = writeln!(yaml, "    working_dir: /workspace");
 	let _ = writeln!(yaml, "    volumes:");
-	if options.bound_mounts.is_empty() && options.ssh_agent.is_none() {
+	if options.bound_mounts.is_empty() && options.ssh_agent.is_none() && options.gh_config.is_none() {
 		// Empty list is valid YAML and compose accepts it; this
 		// keeps the structure consistent for the no-folder /
-		// no-ssh-agent edge case.
+		// no-ssh-agent / no-gh-config edge case.
 		let _ = writeln!(yaml, "      []");
 	} else {
 		for mount in options.bound_mounts {
@@ -238,6 +278,16 @@ pub fn generate_compose(options: ComposeRenderOptions<'_>) -> ComposeRender {
 				"      - {host}:{container}",
 				host = agent.host_socket.as_str(),
 				container = SSH_AGENT_CONTAINER_PATH,
+			);
+		}
+		if let Some(gh) = options.gh_config {
+			// Read-only by design — the container reads the
+			// host's auth, never writes back.
+			let _ = writeln!(
+				yaml,
+				"      - {host}:{container}:ro",
+				host = gh.host_path.as_str(),
+				container = GH_CONFIG_CONTAINER_PATH,
 			);
 		}
 	}
@@ -303,6 +353,7 @@ mod tests {
 			bound_mounts: &[],
 			ssh_agent: None,
 			git_identity: None,
+			gh_config: None,
 		});
 
 		assert!(render.yaml.contains("name: moon-ws-default"));
@@ -330,6 +381,7 @@ mod tests {
 			bound_mounts: &mounts,
 			ssh_agent: None,
 			git_identity: None,
+			gh_config: None,
 		});
 
 		assert!(render
@@ -349,6 +401,7 @@ mod tests {
 			bound_mounts: &mounts,
 			ssh_agent: None,
 			git_identity: None,
+			gh_config: None,
 		};
 		let a = generate_compose(opts.clone());
 		let b = generate_compose(opts);
@@ -365,6 +418,7 @@ mod tests {
 			bound_mounts: &[mount("/x", "x")],
 			ssh_agent: None,
 			git_identity: None,
+			gh_config: None,
 		});
 		assert!(render.yaml.contains("image: huggingface/moon-base:0.1"));
 	}
@@ -378,6 +432,7 @@ mod tests {
 			bound_mounts: &[],
 			ssh_agent: None,
 			git_identity: None,
+			gh_config: None,
 		});
 		assert!(render.yaml.contains("name: moon-ws-scratch"));
 	}
@@ -394,6 +449,7 @@ mod tests {
 			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
 			ssh_agent: Some(&agent),
 			git_identity: None,
+			gh_config: None,
 		});
 
 		assert!(render
@@ -421,6 +477,7 @@ mod tests {
 			bound_mounts: &[],
 			ssh_agent: Some(&agent),
 			git_identity: None,
+			gh_config: None,
 		});
 
 		assert!(!render.yaml.contains("    volumes:\n      []"));
@@ -445,6 +502,7 @@ mod tests {
 			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
 			ssh_agent: None,
 			git_identity: Some(&identity),
+			gh_config: None,
 		});
 
 		assert!(
@@ -474,6 +532,7 @@ mod tests {
 			bound_mounts: &[],
 			ssh_agent: Some(&agent),
 			git_identity: Some(&identity),
+			gh_config: None,
 		});
 
 		// One environment block, both keys inside it. Stable order
@@ -485,6 +544,51 @@ mod tests {
 		// Only one `environment:` block exists (regression against
 		// future code re-emitting it for the second feature).
 		assert_eq!(render.yaml.matches("    environment:\n").count(), 1);
+	}
+
+	#[test]
+	fn gh_config_mount_renders_read_only_volume() {
+		let project = project();
+		let gh = GhConfigMount {
+			host_path: Utf8PathBuf::from("/home/me/.config/gh"),
+		};
+		let render = generate_compose(ComposeRenderOptions {
+			project: &project,
+			dev_image: "moon-base:dev",
+			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
+			ssh_agent: None,
+			git_identity: None,
+			gh_config: Some(&gh),
+		});
+
+		assert!(
+			render.yaml.contains("- /home/me/.config/gh:/home/dev/.config/gh:ro"),
+			"got:\n{}",
+			render.yaml
+		);
+	}
+
+	#[test]
+	fn gh_config_mount_renders_with_no_bound_folders_or_agent() {
+		let project = project();
+		let gh = GhConfigMount {
+			host_path: Utf8PathBuf::from("/home/me/.config/gh"),
+		};
+		let render = generate_compose(ComposeRenderOptions {
+			project: &project,
+			dev_image: "moon-base:dev",
+			bound_mounts: &[],
+			ssh_agent: None,
+			git_identity: None,
+			gh_config: Some(&gh),
+		});
+
+		assert!(!render.yaml.contains("    volumes:\n      []"));
+		assert!(
+			render.yaml.contains("- /home/me/.config/gh:/home/dev/.config/gh:ro"),
+			"got:\n{}",
+			render.yaml
+		);
 	}
 
 	#[test]
@@ -500,6 +604,7 @@ mod tests {
 			bound_mounts: &[],
 			ssh_agent: None,
 			git_identity: Some(&identity),
+			gh_config: None,
 		});
 		// Double-quoted scalar with `"` → `\"` and `\` → `\\`.
 		assert!(

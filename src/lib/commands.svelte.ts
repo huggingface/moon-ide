@@ -146,6 +146,13 @@ export const builtInCommands: Command[] = [
 		run: () => palette.show('search'),
 	},
 	{
+		id: 'git.switchBranch',
+		title: 'Switch Branch…',
+		shortcut: 'Ctrl+Shift+B',
+		visible: () => workspace.workspace !== null,
+		run: () => workspace.openBranchSwitcher(),
+	},
+	{
 		id: 'editor.toggleLineWrap',
 		title: 'Toggle Line Wrap',
 		shortcut: 'Alt+Z',

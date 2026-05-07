@@ -6,6 +6,7 @@
 	import StatusBar from './lib/components/StatusBar.svelte';
 	import Splash from './lib/components/Splash.svelte';
 	import Welcome from './lib/components/Welcome.svelte';
+	import BranchSwitcher from './lib/components/BranchSwitcher.svelte';
 	import CommandPalette from './lib/components/CommandPalette.svelte';
 	import ChatPanel from './lib/components/ChatPanel.svelte';
 	import CoderPanel from './lib/components/CoderPanel.svelte';
@@ -162,6 +163,21 @@
 			if (event.shiftKey && key === 'f') {
 				event.preventDefault();
 				palette.show('search');
+				return;
+			}
+			if (event.shiftKey && key === 'b') {
+				// Branch switcher: recent local branches + open
+				// GitHub PRs in one palette. Requires a workspace
+				// — the `git for-each-ref` runs against the active
+				// folder. Press-with-no-folder flashes a hint
+				// instead of opening an empty palette so the user
+				// gets the explanation, not silence.
+				event.preventDefault();
+				if (!workspace.workspace) {
+					workspace.flash('Open a folder before switching branches.');
+					return;
+				}
+				workspace.openBranchSwitcher();
 				return;
 			}
 			if (event.shiftKey && key === 'd') {
@@ -435,6 +451,7 @@
 	</div>
 	<StatusBar />
 	<CommandPalette />
+	<BranchSwitcher />
 	{#if workspace.toast}
 		<div class="toast" role="status">{workspace.toast}</div>
 	{/if}

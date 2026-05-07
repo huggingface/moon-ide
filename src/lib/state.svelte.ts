@@ -11,6 +11,9 @@ import {
 	defaultEditorConfig,
 	formatError,
 	type AppState,
+	type BranchList,
+	type PrListScope,
+	type BranchSwitchTarget,
 	type EditorConfig,
 	type FolderSession,
 	type GitBranchInfo,
@@ -186,6 +189,12 @@ class FolderState {
 	// folder's untitled sequence starts at 1 — independent of how
 	// many untitled buffers any other folder has produced.
 	untitledCounter = $state(0);
+
+	// Branch-switcher PR-section filter for this folder. Persisted
+	// per folder (`FolderSession.pr_scope`) so a busy monorepo can
+	// stay in `participating` mode while a side-project keeps the
+	// default `all`. Defaults to `all`.
+	prScope = $state<PrListScope>('all');
 
 	constructor(public readonly folderPath: string) {}
 }
@@ -1062,6 +1071,10 @@ class WorkspaceState {
 								? (fs.rightTabs[0] ?? null)
 								: null;
 					fs.focusedSide = folderSession.focused_side === 'right' && fs.hasSplit ? 'right' : 'left';
+					// `pr_scope` defaulted server-side via
+					// `#[serde(default)]` for older sessions that
+					// don't carry the field; trust whatever lands.
+					fs.prScope = folderSession.pr_scope ?? 'all';
 				} finally {
 					if (previousActive !== null && previousActive !== folder.path) {
 						try {
@@ -1323,6 +1336,7 @@ class WorkspaceState {
 						active_right: fs.hasSplit ? realActive(fs.rightActive) : null,
 						has_split: fs.hasSplit,
 						focused_side: fs.focusedSide,
+						pr_scope: fs.prScope,
 					});
 				}
 			}
@@ -1715,6 +1729,118 @@ class WorkspaceState {
 		} catch (err) {
 			this.flash(`Merge failed: ${formatError(err)}`);
 			return false;
+		}
+	}
+
+	/**
+	 * Branch-switcher palette state. `open` flips on via
+	 * `openBranchSwitcher()` (Cmd+Shift+B / click on the branch
+	 * label) and off via `closeBranchSwitcher()`. The list is
+	 * fetched lazily on open so we don't pay the
+	 * `git for-each-ref` + `gh pr list` round-trip until the user
+	 * actually asks. `loading` is true during the fetch; rows
+	 * paint as soon as `list` is set.
+	 *
+	 * `list` defaults to a "no rows yet, treat the PR section as
+	 * unavailable" stub so the UI can render an empty state on
+	 * first paint without dealing with `null`.
+	 */
+	branchSwitcher = $state<{
+		open: boolean;
+		loading: boolean;
+		switching: boolean;
+		list: BranchList;
+	}>({
+		open: false,
+		loading: false,
+		switching: false,
+		list: { local: [], prs: [], prStatus: { kind: 'ok' } },
+	});
+
+	/**
+	 * PR-section filter for the *active* folder, surfaced as a
+	 * derived alias so the palette can read/write
+	 * `workspace.prScope` without reaching into `FolderState`.
+	 * Falls back to `'all'` when no folder is bound — the
+	 * palette never opens in that state, but the typing keeps
+	 * the toggle's `disabled` branch trivial.
+	 */
+	get prScope(): PrListScope {
+		const active = this.workspace?.active_folder ?? null;
+		const fs = active === null ? null : this.folderStates.get(active);
+		return fs?.prScope ?? 'all';
+	}
+
+	openBranchSwitcher() {
+		if (this.branchSwitcher.open) {
+			return;
+		}
+		this.branchSwitcher.open = true;
+		void this.refreshBranchList();
+	}
+
+	closeBranchSwitcher() {
+		this.branchSwitcher.open = false;
+		this.branchSwitcher.switching = false;
+	}
+
+	setPrScope(scope: PrListScope) {
+		const active = this.workspace?.active_folder ?? null;
+		const fs = active === null ? null : this.folderStates.get(active);
+		if (!fs || fs.prScope === scope) {
+			return;
+		}
+		fs.prScope = scope;
+		// Persist the new pref alongside other folder state. The
+		// schedule is debounced inside `persistAppState`, so
+		// flipping the toggle once is one disk write.
+		this.persistAppState();
+		void this.refreshBranchList();
+	}
+
+	async refreshBranchList() {
+		this.branchSwitcher.loading = true;
+		try {
+			this.branchSwitcher.list = await ipc.fs.branchList(this.prScope);
+		} catch (err) {
+			this.flash(`Branch list failed: ${formatError(err)}`);
+			this.branchSwitcher.list = {
+				local: [],
+				prs: [],
+				prStatus: { kind: 'failed', detail: formatError(err) },
+			};
+		} finally {
+			this.branchSwitcher.loading = false;
+		}
+	}
+
+	/**
+	 * Switch the active folder to `target`. Closes the palette
+	 * on success and refreshes the active folder so the file
+	 * tree, branch label, and SCM panel pick up the new HEAD.
+	 * Failures (dirty tree, missing branch, gh auth required)
+	 * propagate as a flash with git / gh's stderr verbatim and
+	 * leave the palette open so the user can pick a different
+	 * row.
+	 */
+	async switchToBranch(target: BranchSwitchTarget): Promise<boolean> {
+		if (this.branchSwitcher.switching) {
+			return false;
+		}
+		this.branchSwitcher.switching = true;
+		try {
+			await ipc.fs.branchSwitch(target);
+			const label = target.kind === 'local' ? target.name : `PR #${target.number}`;
+			this.flash(`Switched to ${label}.`);
+			this.closeBranchSwitcher();
+			await this.refreshGitBranch();
+			void this.refreshActiveFolder();
+			return true;
+		} catch (err) {
+			this.flash(`Switch failed: ${formatError(err)}`);
+			return false;
+		} finally {
+			this.branchSwitcher.switching = false;
 		}
 	}
 

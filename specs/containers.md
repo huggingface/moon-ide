@@ -885,9 +885,37 @@ What this **doesn't** do (deferred):
 - Forward arbitrary gitconfig (signing keys, `pull.rebase`,
   `core.editor`, …). The team uses defaults; nobody's asked
   for more.
-- Forward `gh auth status` / `~/.config/gh/` so `gh` works
-  in-container without re-login. Plausible follow-up; not
-  blocking commit attribution.
+
+## `gh` config forwarding
+
+The host's `gh` config directory bind-mounts into the dev
+container **read-only** at `/home/dev/.config/gh`, so an
+in-container `gh` shares the host's `gh auth login` session
+without a second sign-in. Sourced from
+`$GH_CONFIG_DIR` → `$XDG_CONFIG_HOME/gh` → `~/.config/gh`,
+and skipped entirely if none of those resolves to an existing
+directory (otherwise Docker would auto-create the source as
+empty and shadow any later host login until the container is
+recreated).
+
+```yaml
+services:
+  dev:
+    volumes:
+      - /home/me/.config/gh:/home/dev/.config/gh:ro
+```
+
+Read-only on purpose: the host owns the auth, the container
+reads it. A container-side `gh auth login` would silently
+update the host's config (the bind mount is shared) which is
+surprising and hard to undo; tools that lazily write the
+config (`gh config set`) fail loudly inside the container
+instead of mutating host state.
+
+The IDE itself runs `gh pr list` / `gh pr checkout` against
+the **host's** `gh` for the branch-switcher palette (the
+LocalHost path doesn't go through the container) — the bind
+mount exists so that a container terminal feels the same.
 
 ## `WorkspaceHost::ContainerHost`
 

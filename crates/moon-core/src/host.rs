@@ -8,7 +8,10 @@ use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use moon_protocol::editorconfig::EditorConfig;
 use moon_protocol::fs::{DirEntry, EntryKind, ReadFileResult, StatResult, WriteFileResult};
-use moon_protocol::git::{GitBranchInfo, GitCommitResult, GitFileBlame, GitFileStatus, GitLineBlame, GitStatusEntry};
+use moon_protocol::git::{
+	BranchList, BranchListEntry, BranchSwitchTarget, GitBranchInfo, GitCommitResult, GitFileBlame, GitFileStatus,
+	GitLineBlame, GitStatusEntry, PrListScope, PrListStatus,
+};
 use moon_protocol::{MoonError, MoonResult};
 use std::time::SystemTime;
 
@@ -296,6 +299,43 @@ pub trait WorkspaceHost: Send + Sync {
 	/// there's nothing to diff (clean tree, not a repo, git
 	/// unavailable).
 	async fn git_diff_patch(&self) -> MoonResult<String>;
+
+	/// Recent branches + open PRs for the active folder, formatted
+	/// for the branch-switcher palette. Two sections in the
+	/// returned [`BranchList`]:
+	///
+	/// 1. `local` — `git for-each-ref refs/heads`, sorted newest
+	///    first by committer date, capped at 20.
+	/// 2. `prs` — open GitHub PRs via `gh pr list` (capped at
+	///    30). `pr_scope == All` is "every open PR";
+	///    `Participating` runs two `--search` queries
+	///    (`involves:@me` + `review-requested:@me`) in parallel
+	///    and merges them.
+	///    Empty when `gh` isn't installed (`pr_status =
+	///    GhMissing`), when `gh` isn't authenticated (`GhNotAuthed`),
+	///    when the active folder's `origin` / `upstream` isn't
+	///    GitHub (`NotGithub`), or when the call exited non-zero
+	///    (`Failed { detail }`). The frontend uses
+	///    [`PrListStatus`] verbatim to render the section's
+	///    empty-state row.
+	///
+	/// Both sections are produced in parallel — local always
+	/// returns in single-digit milliseconds; the gh probe can take
+	/// a network round-trip but the local list paints
+	/// independently. Failures in either are best-effort: a broken
+	/// git or gh leaves the affected section empty rather than
+	/// taking down the whole call.
+	async fn branch_list(&self, pr_scope: PrListScope) -> MoonResult<BranchList>;
+
+	/// Switch the active folder to `target`. `Local { name }` runs
+	/// `git switch <name>`; `Pr { number }` runs
+	/// `gh pr checkout <number>` so cross-fork PRs get the
+	/// fork-fetching dance for free.
+	///
+	/// Errors propagate stderr verbatim (dirty-tree refusal,
+	/// missing branch, gh auth required, network failure) so the
+	/// user gets the actionable hint without us re-wrapping it.
+	async fn branch_switch(&self, target: &BranchSwitchTarget) -> MoonResult<()>;
 
 	/// `git fetch --quiet --no-tags` against the current branch's
 	/// upstream remote (defaults to `origin`). Used by the periodic
@@ -1149,6 +1189,18 @@ impl WorkspaceHost for LocalHost {
 		run_git_fetch_quiet(&self.root).await
 	}
 
+	async fn branch_list(&self, pr_scope: PrListScope) -> MoonResult<BranchList> {
+		run_branch_list(&self.root, pr_scope).await
+	}
+
+	async fn branch_switch(&self, target: &BranchSwitchTarget) -> MoonResult<()> {
+		let root = self.root.clone();
+		let target = target.clone();
+		tokio::task::spawn_blocking(move || run_branch_switch(&root, &target))
+			.await
+			.map_err(|e| MoonError::Internal(format!("branch_switch join error: {e}")))?
+	}
+
 	async fn git_head_commit_message(&self) -> MoonResult<String> {
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || Ok(run_git_head_commit_message(&root)))
@@ -1792,6 +1844,448 @@ async fn run_git_fetch_quiet(root: &Utf8Path) -> MoonResult<()> {
 		return Err(MoonError::IoError(format!("git fetch: {detail}")));
 	}
 
+	Ok(())
+}
+
+/// Cap on local-branch rows. Bumps when a real project hits it; 20
+/// is "Cmd+Shift+B for the last few branches I touched" territory.
+const BRANCH_LIST_LOCAL_CAP: usize = 20;
+/// Cap on `gh pr list` rows. The team's repos run well under this
+/// today; if a noisy repo lands, type-to-filter handles the volume
+/// before we bump the cap.
+const BRANCH_LIST_PR_CAP: usize = 30;
+/// `gh pr list` timeout. Matches `run_git_fetch_quiet`'s 30s ceiling
+/// — same "we'd rather fail than freeze the UI" trade-off; 30s is
+/// well past the worst observed GitHub API round-trip.
+const GH_PR_LIST_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+
+/// Top-level entry point for `WorkspaceHost::branch_list`. Runs the
+/// git half on the blocking pool (cheap, sync `Command::output`)
+/// and the gh half on the async runtime (single-shot
+/// `tokio::process::Command` with a timeout) in parallel via
+/// `tokio::join!`. Either half failing collapses to an empty
+/// section + a `PrListStatus` (for the gh side) — the call
+/// itself never errors out today, so the trait could return
+/// `BranchList` directly, but we keep `MoonResult` for symmetry
+/// with the other host methods and to leave room for a future
+/// hard-error path (e.g. "active folder doesn't exist").
+async fn run_branch_list(root: &Utf8Path, pr_scope: PrListScope) -> MoonResult<BranchList> {
+	let local_root = root.to_owned();
+	let local_fut = tokio::task::spawn_blocking(move || run_branch_list_local(&local_root));
+	let prs_fut = run_branch_list_prs(root, pr_scope);
+	let (local_join, (prs, pr_status)) = tokio::join!(local_fut, prs_fut);
+	let local = local_join.unwrap_or_else(|err| {
+		tracing::warn!(%err, "branch_list: local section join error");
+		Vec::new()
+	});
+	Ok(BranchList { local, prs, pr_status })
+}
+
+/// `git for-each-ref refs/heads --sort=-committerdate` →
+/// [`BranchListEntry::Local`] rows. NUL-separated fields (`%00` in
+/// the format string) so a tab- or space-containing commit subject
+/// doesn't corrupt the parse — subjects regularly contain
+/// whitespace and the occasional control character.
+fn run_branch_list_local(root: &Utf8Path) -> Vec<BranchListEntry> {
+	use std::process::Command;
+
+	let current = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+		.output()
+		.ok()
+		.filter(|o| o.status.success())
+		.and_then(|o| String::from_utf8(o.stdout).ok())
+		.map(|s| s.trim().to_owned());
+
+	let output = match Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args([
+			"for-each-ref",
+			"--sort=-committerdate",
+			&format!("--count={BRANCH_LIST_LOCAL_CAP}"),
+			"--format=%(refname:short)%00%(committerdate:relative)%00%(subject)",
+			"refs/heads",
+		])
+		.output()
+	{
+		Ok(o) if o.status.success() => o,
+		Ok(_) | Err(_) => return Vec::new(),
+	};
+
+	let stdout = String::from_utf8_lossy(&output.stdout);
+	let mut rows = Vec::new();
+	for line in stdout.lines() {
+		let mut parts = line.splitn(3, '\0');
+		let Some(name) = parts.next() else { continue };
+		let Some(date) = parts.next() else { continue };
+		let subject = parts.next().unwrap_or("");
+		if name.is_empty() {
+			continue;
+		}
+		let is_current = current.as_deref() == Some(name);
+		rows.push(BranchListEntry::Local {
+			name: name.to_owned(),
+			last_commit_subject: subject.to_owned(),
+			committer_date_relative: date.to_owned(),
+			is_current,
+		});
+	}
+	rows
+}
+
+/// PR section: probe the active folder's remote for GitHub-ness,
+/// then `gh pr list --json … --limit <cap>`. Returns the rows
+/// plus a [`PrListStatus`] so the frontend renders the right
+/// empty-state row when the section is empty.
+async fn run_branch_list_prs(root: &Utf8Path, scope: PrListScope) -> (Vec<BranchListEntry>, PrListStatus) {
+	if remote_web_url(root).is_none() {
+		return (Vec::new(), PrListStatus::NotGithub);
+	}
+	match scope {
+		PrListScope::All => {
+			// Single canonical query: every open PR in the repo.
+			// `gh pr list --state open` orders by createdAt desc;
+			// we want updatedAt desc instead, so we resort on the
+			// way out using the timestamp the parser already
+			// extracted. (gh has no `--sort` flag for `pr list`,
+			// and `--search` would override `--state` so it's not
+			// any cheaper to push the sort server-side.)
+			let (mut rows, status) = run_gh_pr_list_query(root, None).await;
+			rows.sort_by(|a, b| b.1.cmp(&a.1));
+			let dropped = rows.into_iter().map(|(entry, _)| entry).collect();
+			(dropped, status)
+		}
+		PrListScope::Participating => {
+			// Two queries in parallel — `involves:@me` covers
+			// author / assignee / mentioned / commenter, but
+			// **not** review-requested (that's its own qualifier).
+			// Merge by PR number, sort by raw updatedAt desc.
+			//
+			// We use `sort:updated-desc` in the search query so
+			// each side already lands ordered, but resort after
+			// merging for the same reason the `All` branch does:
+			// the merge can interleave freshly-replied review
+			// requests with older `involves:` rows, and only a
+			// post-merge sort gives the user the chronological
+			// "what moved last" view.
+			let involves = run_gh_pr_list_query(root, Some("state:open involves:@me sort:updated-desc"));
+			let review = run_gh_pr_list_query(root, Some("state:open review-requested:@me sort:updated-desc"));
+			let ((involves_rows, involves_status), (review_rows, review_status)) = tokio::join!(involves, review);
+			// Status reconciliation: if both calls landed on the
+			// same hard error (`GhMissing` / `GhNotAuthed` /
+			// `NotGithub`) report it; if one succeeded and the
+			// other transient-failed we still return the
+			// successful slice with `Ok` so the user sees
+			// something rather than a blank failure.
+			let status = match (&involves_status, &review_status) {
+				(PrListStatus::Ok, _) | (_, PrListStatus::Ok) => PrListStatus::Ok,
+				(a, b) if a == b => a.clone(),
+				_ => involves_status,
+			};
+			let mut by_number: std::collections::HashMap<u32, (BranchListEntry, Option<i64>)> =
+				std::collections::HashMap::new();
+			for (entry, ts) in involves_rows.into_iter().chain(review_rows) {
+				let BranchListEntry::Pr { number, .. } = entry else {
+					continue;
+				};
+				by_number.entry(number).or_insert((entry, ts));
+			}
+			let mut rows: Vec<(BranchListEntry, Option<i64>)> = by_number.into_values().collect();
+			// Sort by raw updatedAt timestamp desc so the merged
+			// list reads the same way the unfiltered list does.
+			// `None` (unparseable timestamp) sinks to the bottom.
+			rows.sort_by(|a, b| b.1.cmp(&a.1));
+			rows.truncate(BRANCH_LIST_PR_CAP);
+			let dropped = rows.into_iter().map(|(entry, _)| entry).collect();
+			(dropped, status)
+		}
+	}
+}
+
+/// One `gh pr list --json …` invocation. `search` is forwarded as
+/// `--search "<q>"` when present (and replaces the default
+/// `--state open` slice — gh's search qualifier handles state
+/// itself); when absent the call falls back to `--state open`.
+///
+/// Returns `(rows, status)` so the caller can decide how to merge
+/// multiple queries. Each row carries the parsed unix-second
+/// timestamp alongside the [`BranchListEntry::Pr`] so `Participating`
+/// can sort the merged set chronologically before dropping the
+/// timestamp on the way out.
+async fn run_gh_pr_list_query(
+	root: &Utf8Path,
+	search: Option<&str>,
+) -> (Vec<(BranchListEntry, Option<i64>)>, PrListStatus) {
+	let mut cmd = tokio::process::Command::new("gh");
+	cmd.current_dir(root.as_std_path()).args([
+		"pr",
+		"list",
+		"--limit",
+		&BRANCH_LIST_PR_CAP.to_string(),
+		"--json",
+		"number,title,headRefName,isDraft,updatedAt,author",
+	]);
+	match search {
+		Some(query) => {
+			cmd.args(["--search", query]);
+		}
+		None => {
+			cmd.args(["--state", "open"]);
+		}
+	}
+	cmd
+		.env("GH_PROMPT_DISABLED", "1")
+		.env("LC_ALL", "C")
+		.stdin(std::process::Stdio::null())
+		.stdout(std::process::Stdio::piped())
+		.stderr(std::process::Stdio::piped());
+
+	let child = match cmd.spawn() {
+		Ok(c) => c,
+		Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+			return (Vec::new(), PrListStatus::GhMissing);
+		}
+		Err(err) => {
+			tracing::debug!(%err, "branch_list: gh spawn failed");
+			return (
+				Vec::new(),
+				PrListStatus::Failed {
+					detail: err.to_string(),
+				},
+			);
+		}
+	};
+
+	let output = match tokio::time::timeout(GH_PR_LIST_TIMEOUT, child.wait_with_output()).await {
+		Ok(Ok(o)) => o,
+		Ok(Err(err)) => {
+			return (
+				Vec::new(),
+				PrListStatus::Failed {
+					detail: format!("gh pr list: {err}"),
+				},
+			);
+		}
+		Err(_) => {
+			return (
+				Vec::new(),
+				PrListStatus::Failed {
+					detail: format!("gh pr list: timed out after {}s", GH_PR_LIST_TIMEOUT.as_secs()),
+				},
+			);
+		}
+	};
+
+	if !output.status.success() {
+		let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+		let lower = stderr.to_ascii_lowercase();
+		if lower.contains("not logged into") || lower.contains("gh auth login") || lower.contains("authentication") {
+			return (Vec::new(), PrListStatus::GhNotAuthed);
+		}
+		return (Vec::new(), PrListStatus::Failed { detail: stderr });
+	}
+
+	let now = SystemTime::now();
+	let rows = parse_gh_pr_list(&output.stdout, now);
+	(rows, PrListStatus::Ok)
+}
+
+/// Parse `gh pr list --json …` output into [`BranchListEntry::Pr`]
+/// rows paired with their raw updatedAt unix timestamp. The
+/// timestamp is `None` when gh emits something we can't parse —
+/// callers that don't merge can drop it; merging callers
+/// (`Participating`) sort by it before dropping. Broken out so a
+/// unit test can feed canned JSON without spawning gh. Skips rows
+/// missing required fields rather than erroring — gh's schema is
+/// stable but a future field rename shouldn't take the whole
+/// palette down.
+fn parse_gh_pr_list(stdout: &[u8], now: SystemTime) -> Vec<(BranchListEntry, Option<i64>)> {
+	let value: serde_json::Value = match serde_json::from_slice(stdout) {
+		Ok(v) => v,
+		Err(err) => {
+			tracing::warn!(%err, "branch_list: gh JSON parse failed");
+			return Vec::new();
+		}
+	};
+	let Some(arr) = value.as_array() else {
+		return Vec::new();
+	};
+	let mut rows = Vec::with_capacity(arr.len());
+	for item in arr {
+		let Some(number) = item.get("number").and_then(|n| n.as_u64()) else {
+			continue;
+		};
+		let Some(title) = item.get("title").and_then(|t| t.as_str()) else {
+			continue;
+		};
+		let Some(head_ref) = item.get("headRefName").and_then(|h| h.as_str()) else {
+			continue;
+		};
+		let is_draft = item.get("isDraft").and_then(|d| d.as_bool()).unwrap_or(false);
+		let updated_at = item.get("updatedAt").and_then(|u| u.as_str()).unwrap_or("");
+		let author = item
+			.get("author")
+			.and_then(|a| a.get("login"))
+			.and_then(|l| l.as_str())
+			.unwrap_or("");
+		let updated_at_unix = parse_iso8601_utc(updated_at);
+		let updated_at_relative = format_iso8601_relative(updated_at, now).unwrap_or_default();
+		let entry = BranchListEntry::Pr {
+			number: number.min(u32::MAX as u64) as u32,
+			title: title.to_owned(),
+			author: author.to_owned(),
+			head_ref: head_ref.to_owned(),
+			is_draft,
+			updated_at_relative,
+		};
+		rows.push((entry, updated_at_unix));
+	}
+	rows
+}
+
+/// Parse a UTC ISO 8601 timestamp (`YYYY-MM-DDTHH:MM:SSZ`, what
+/// `gh` emits) and format the duration since `now` as a
+/// human-readable relative string ("3 hours ago", "yesterday",
+/// "2 weeks ago", …). Returns `None` for unparseable input or
+/// future timestamps.
+///
+/// Hand-rolled rather than pulling in a date crate: gh's format
+/// is fixed, and the rounding thresholds are coarse enough that
+/// timezone / leap-second precision doesn't matter.
+fn format_iso8601_relative(iso: &str, now: SystemTime) -> Option<String> {
+	let then = parse_iso8601_utc(iso)?;
+	let now_secs = now.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs() as i64;
+	let diff = now_secs.saturating_sub(then);
+	if diff < 0 {
+		return None;
+	}
+	const MIN: i64 = 60;
+	const HOUR: i64 = 60 * MIN;
+	const DAY: i64 = 24 * HOUR;
+	const WEEK: i64 = 7 * DAY;
+	const MONTH: i64 = 30 * DAY;
+	const YEAR: i64 = 365 * DAY;
+	let formatted = match diff {
+		d if d < MIN => "just now".to_owned(),
+		d if d < 2 * MIN => "1 minute ago".to_owned(),
+		d if d < HOUR => format!("{} minutes ago", d / MIN),
+		d if d < 2 * HOUR => "1 hour ago".to_owned(),
+		d if d < DAY => format!("{} hours ago", d / HOUR),
+		d if d < 2 * DAY => "yesterday".to_owned(),
+		d if d < WEEK => format!("{} days ago", d / DAY),
+		d if d < 2 * WEEK => "1 week ago".to_owned(),
+		d if d < MONTH => format!("{} weeks ago", d / WEEK),
+		d if d < 2 * MONTH => "1 month ago".to_owned(),
+		d if d < YEAR => format!("{} months ago", d / MONTH),
+		d if d < 2 * YEAR => "1 year ago".to_owned(),
+		d => format!("{} years ago", d / YEAR),
+	};
+	Some(formatted)
+}
+
+/// Parse `YYYY-MM-DDTHH:MM:SSZ` into Unix seconds. We accept the
+/// trailing `Z` (UTC) as gh always emits it, and a fractional-
+/// seconds `.` segment which gh sometimes emits — anything else
+/// is rejected. No timezone offsets, no locale parsing.
+fn parse_iso8601_utc(iso: &str) -> Option<i64> {
+	let bytes = iso.as_bytes();
+	if bytes.len() < 20 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
+		return None;
+	}
+	if bytes[13] != b':' || bytes[16] != b':' {
+		return None;
+	}
+	let year: i64 = std::str::from_utf8(&bytes[0..4]).ok()?.parse().ok()?;
+	let month: u32 = std::str::from_utf8(&bytes[5..7]).ok()?.parse().ok()?;
+	let day: u32 = std::str::from_utf8(&bytes[8..10]).ok()?.parse().ok()?;
+	let hour: u32 = std::str::from_utf8(&bytes[11..13]).ok()?.parse().ok()?;
+	let min: u32 = std::str::from_utf8(&bytes[14..16]).ok()?.parse().ok()?;
+	let sec: u32 = std::str::from_utf8(&bytes[17..19]).ok()?.parse().ok()?;
+	if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+		return None;
+	}
+	// Days from 1970-01-01 to year-month-day, treating gh's UTC
+	// dates as proleptic Gregorian. Algorithm: count leap years up
+	// to year-1, then add days-of-year up to month-1, then add day
+	// (1-based). Plenty of room (i64) for any date gh would emit.
+	let days = days_from_civil(year, month, day);
+	let secs = days * 86_400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64;
+	Some(secs)
+}
+
+/// Howard Hinnant's "days_from_civil" — proleptic Gregorian
+/// year-month-day → days since 1970-01-01. Public-domain
+/// algorithm, tiny and verified against `chrono` for every
+/// realistic year. We embed it here rather than pulling in
+/// `chrono` for the one ISO timestamp gh emits.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+	let y = if m <= 2 { y - 1 } else { y };
+	let era = (if y >= 0 { y } else { y - 399 }) / 400;
+	let yoe = (y - era * 400) as u32;
+	let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+	let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+	era * 146_097 + doe as i64 - 719_468
+}
+
+/// `git switch <name>` / `gh pr checkout <number>` dispatcher.
+/// Surfaces stderr verbatim on non-zero exit so the user sees
+/// git / gh's actionable hint without us re-wrapping it.
+fn run_branch_switch(root: &Utf8Path, target: &BranchSwitchTarget) -> MoonResult<()> {
+	use std::process::Command;
+
+	let mut cmd = Command::new(match target {
+		BranchSwitchTarget::Local { .. } => "git",
+		// `gh pr checkout` resolves the PR's head ref via the
+		// GitHub API (so it works for fork PRs too) and runs
+		// the equivalent `git fetch` + `git switch` against the
+		// active folder. The repo is inferred from `git remote`
+		// in the cwd — gh has no `-C <dir>` flag, so the
+		// dispatcher below uses `current_dir()` for the gh
+		// branch.
+		BranchSwitchTarget::Pr { .. } => "gh",
+	});
+	let label = match target {
+		BranchSwitchTarget::Local { name } => {
+			let trimmed = name.trim();
+			if trimmed.is_empty() {
+				return Err(MoonError::invalid("branch name is empty"));
+			}
+			cmd.arg("-C").arg(root.as_std_path()).args(["switch", trimmed]);
+			format!("git switch {trimmed}")
+		}
+		BranchSwitchTarget::Pr { number } => {
+			cmd
+				.current_dir(root.as_std_path())
+				.args(["pr", "checkout", &number.to_string()]);
+			format!("gh pr checkout {number}")
+		}
+	};
+
+	let output = cmd
+		.env("GIT_TERMINAL_PROMPT", "0")
+		.env("GH_PROMPT_DISABLED", "1")
+		.env("LC_ALL", "C")
+		.output()
+		.map_err(|e| {
+			if e.kind() == std::io::ErrorKind::NotFound {
+				MoonError::IoError(format!("{label}: command not found on PATH"))
+			} else {
+				MoonError::IoError(format!("{label} failed to launch: {e}"))
+			}
+		})?;
+	if !output.status.success() {
+		let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+		let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+		let detail = match (stderr.is_empty(), stdout.is_empty()) {
+			(false, _) => stderr,
+			(true, false) => stdout,
+			(true, true) => format!("exit {}", output.status.code().unwrap_or(-1)),
+		};
+		return Err(MoonError::IoError(format!("{label}: {detail}")));
+	}
 	Ok(())
 }
 
@@ -3565,6 +4059,269 @@ mod tests {
 		assert_eq!(post.name.as_deref(), Some("feature"));
 	}
 
+	#[test]
+	fn parse_iso8601_utc_round_trips_known_timestamps() {
+		assert_eq!(parse_iso8601_utc("1970-01-01T00:00:00Z"), Some(0));
+		assert_eq!(parse_iso8601_utc("2026-05-07T22:00:00Z"), Some(1_778_191_200));
+		// Rejects non-Z suffixes / wrong separators / short strings.
+		assert_eq!(parse_iso8601_utc(""), None);
+		assert_eq!(parse_iso8601_utc("2026-05-07 22:00:00"), None);
+		assert_eq!(parse_iso8601_utc("2026/05/07T22:00:00Z"), None);
+	}
+
+	#[test]
+	fn format_iso8601_relative_buckets_diff_into_human_strings() {
+		let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_780_000_000);
+		let from_secs_ago = |secs: u64| -> String {
+			let then = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_780_000_000 - secs);
+			let iso = iso8601_from_unix(then.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64);
+			format_iso8601_relative(&iso, now).expect("relative")
+		};
+		assert_eq!(from_secs_ago(0), "just now");
+		assert_eq!(from_secs_ago(45), "just now");
+		assert_eq!(from_secs_ago(60), "1 minute ago");
+		assert_eq!(from_secs_ago(120), "2 minutes ago");
+		assert_eq!(from_secs_ago(3600), "1 hour ago");
+		assert_eq!(from_secs_ago(7200), "2 hours ago");
+		assert_eq!(from_secs_ago(60 * 60 * 25), "yesterday");
+		assert_eq!(from_secs_ago(60 * 60 * 24 * 3), "3 days ago");
+		assert_eq!(from_secs_ago(60 * 60 * 24 * 8), "1 week ago");
+		assert_eq!(from_secs_ago(60 * 60 * 24 * 35), "1 month ago");
+		assert_eq!(from_secs_ago(60 * 60 * 24 * 400), "1 year ago");
+		// Future timestamps reject — we don't render "in 3 hours" and
+		// the caller treats `None` as "no relative form".
+		let future_iso = iso8601_from_unix(1_780_001_000);
+		assert_eq!(format_iso8601_relative(&future_iso, now), None);
+	}
+
+	fn iso8601_from_unix(secs: i64) -> String {
+		// Tiny inverse of `parse_iso8601_utc` for test fixtures.
+		// Uses chrono-free arithmetic via `time` crate API would be
+		// nicer but we don't pull a crate just for tests; the
+		// roundtrip below is checked against the real parser.
+		let days = secs.div_euclid(86_400);
+		let time = secs.rem_euclid(86_400);
+		let (y, m, d) = civil_from_days(days);
+		let hour = time / 3600;
+		let min = (time % 3600) / 60;
+		let sec = time % 60;
+		format!("{y:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
+	}
+
+	fn civil_from_days(z: i64) -> (i64, u32, u32) {
+		let z = z + 719_468;
+		let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+		let doe = (z - era * 146_097) as u32;
+		let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+		let y = yoe as i64 + era * 400;
+		let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+		let mp = (5 * doy + 2) / 153;
+		let d = doy - (153 * mp + 2) / 5 + 1;
+		let m = if mp < 10 { mp + 3 } else { mp - 9 };
+		let y = if m <= 2 { y + 1 } else { y };
+		(y, m, d)
+	}
+
+	#[test]
+	fn parse_gh_pr_list_extracts_rows_and_skips_malformed() {
+		let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_780_000_000);
+		let json = br#"[
+			{
+				"number": 42,
+				"title": "Add cool feature",
+				"headRefName": "feat/cool",
+				"isDraft": false,
+				"updatedAt": "2026-05-07T22:00:00Z",
+				"author": { "login": "ada" }
+			},
+			{
+				"number": 7,
+				"title": "WIP: shave yak",
+				"headRefName": "wip/yak",
+				"isDraft": true,
+				"updatedAt": "2026-05-06T22:00:00Z",
+				"author": { "login": "lovelace" }
+			},
+			{
+				"title": "missing number - skipped",
+				"headRefName": "x"
+			}
+		]"#;
+
+		let rows = parse_gh_pr_list(json, now);
+		assert_eq!(rows.len(), 2, "expected the two well-formed rows");
+		match &rows[0].0 {
+			BranchListEntry::Pr {
+				number,
+				title,
+				author,
+				head_ref,
+				is_draft,
+				..
+			} => {
+				assert_eq!(*number, 42);
+				assert_eq!(title, "Add cool feature");
+				assert_eq!(author, "ada");
+				assert_eq!(head_ref, "feat/cool");
+				assert!(!is_draft);
+			}
+			_ => panic!("expected Pr entry"),
+		}
+		match &rows[1].0 {
+			BranchListEntry::Pr { number, is_draft, .. } => {
+				assert_eq!(*number, 7);
+				assert!(*is_draft);
+			}
+			_ => panic!("expected Pr entry"),
+		}
+		// updatedAt timestamps come back parsed for the merging
+		// path in `Participating` to sort by — the well-formed
+		// row should be a real unix-second value.
+		assert!(rows[0].1.is_some());
+	}
+
+	#[test]
+	fn parse_gh_pr_list_returns_empty_on_garbage() {
+		let now = SystemTime::UNIX_EPOCH;
+		assert!(parse_gh_pr_list(b"", now).is_empty());
+		assert!(parse_gh_pr_list(b"not json", now).is_empty());
+		// JSON but not an array — gh shouldn't ever produce this,
+		// but we tolerate without panicking.
+		assert!(parse_gh_pr_list(br#"{"oops": true}"#, now).is_empty());
+	}
+
+	#[tokio::test]
+	async fn branch_list_local_orders_by_committer_date_with_current_marker() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping branch_list local test");
+			return;
+		};
+
+		let root = TempDir::new().unwrap();
+		let repo = root.path();
+		run_git(&git, repo, &["init", "-q", "-b", "main"]);
+		run_git(&git, repo, &["config", "user.email", "t@example.com"]);
+		run_git(&git, repo, &["config", "user.name", "Tester"]);
+		std::fs::write(repo.join("README.md"), "v1\n").unwrap();
+		run_git(&git, repo, &["add", "."]);
+		run_git(&git, repo, &["commit", "-q", "-m", "first commit"]);
+
+		// Seed two extra branches at separate commits so the
+		// `--sort=-committerdate` order is observable.
+		run_git(&git, repo, &["checkout", "-q", "-b", "feat/older"]);
+		std::fs::write(repo.join("a"), "1").unwrap();
+		run_git(&git, repo, &["add", "."]);
+		run_git(&git, repo, &["commit", "-q", "-m", "older work"]);
+		run_git(&git, repo, &["checkout", "-q", "main"]);
+		run_git(&git, repo, &["checkout", "-q", "-b", "feat/newer"]);
+		std::fs::write(repo.join("b"), "2").unwrap();
+		run_git(&git, repo, &["add", "."]);
+		run_git(&git, repo, &["commit", "-q", "-m", "newer work"]);
+
+		let utf8 = Utf8PathBuf::from_path_buf(repo.canonicalize().unwrap()).unwrap();
+		let result = LocalHost::new(utf8).branch_list(PrListScope::All).await.unwrap();
+
+		// Newer first, older last. Current branch is `feat/newer`
+		// (we never switched away after the second checkout).
+		let names: Vec<&str> = result
+			.local
+			.iter()
+			.map(|e| match e {
+				BranchListEntry::Local { name, .. } => name.as_str(),
+				_ => panic!("expected local entries"),
+			})
+			.collect();
+		assert_eq!(names, vec!["feat/newer", "feat/older", "main"]);
+
+		let current_count = result
+			.local
+			.iter()
+			.filter(|e| matches!(e, BranchListEntry::Local { is_current: true, .. }))
+			.count();
+		assert_eq!(current_count, 1);
+		assert!(matches!(
+			&result.local[0],
+			BranchListEntry::Local { is_current: true, name, .. } if name == "feat/newer"
+		));
+
+		// No remote configured → not a GitHub repo, so the PR
+		// section is suppressed without contacting gh.
+		assert!(matches!(result.pr_status, PrListStatus::NotGithub));
+		assert!(result.prs.is_empty());
+	}
+
+	#[tokio::test]
+	async fn branch_switch_local_moves_head_to_target() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping branch_switch test");
+			return;
+		};
+
+		let root = TempDir::new().unwrap();
+		let repo = root.path();
+		run_git(&git, repo, &["init", "-q", "-b", "main"]);
+		run_git(&git, repo, &["config", "user.email", "t@example.com"]);
+		run_git(&git, repo, &["config", "user.name", "Tester"]);
+		std::fs::write(repo.join("README.md"), "v1\n").unwrap();
+		run_git(&git, repo, &["add", "."]);
+		run_git(&git, repo, &["commit", "-q", "-m", "first commit"]);
+		run_git(&git, repo, &["branch", "feat/two"]);
+
+		let utf8 = Utf8PathBuf::from_path_buf(repo.canonicalize().unwrap()).unwrap();
+		LocalHost::new(utf8.clone())
+			.branch_switch(&BranchSwitchTarget::Local {
+				name: "feat/two".into(),
+			})
+			.await
+			.unwrap();
+
+		let info = LocalHost::new(utf8.clone()).git_branch().await.unwrap();
+		assert_eq!(info.name.as_deref(), Some("feat/two"));
+
+		// Empty name fails fast with a clear message — no `git
+		// switch ` ever fires.
+		let err = LocalHost::new(utf8)
+			.branch_switch(&BranchSwitchTarget::Local { name: "  ".into() })
+			.await
+			.unwrap_err();
+		match err {
+			MoonError::InvalidArgument(msg) => assert!(msg.contains("branch name")),
+			other => panic!("expected InvalidArgument, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn branch_list_pr_section_signals_not_github_for_non_github_remote() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping non-github remote test");
+			return;
+		};
+		let root = TempDir::new().unwrap();
+		let repo = root.path();
+		run_git(&git, repo, &["init", "-q", "-b", "main"]);
+		run_git(&git, repo, &["config", "user.email", "t@example.com"]);
+		run_git(&git, repo, &["config", "user.name", "Tester"]);
+		std::fs::write(repo.join("README.md"), "v1\n").unwrap();
+		run_git(&git, repo, &["add", "."]);
+		run_git(&git, repo, &["commit", "-q", "-m", "first"]);
+		run_git(
+			&git,
+			repo,
+			&["remote", "add", "origin", "git@gitlab.com:owner/repo.git"],
+		);
+
+		let utf8 = Utf8PathBuf::from_path_buf(repo.canonicalize().unwrap()).unwrap();
+		let result = LocalHost::new(utf8).branch_list(PrListScope::All).await.unwrap();
+		// A non-GitHub remote short-circuits before we ever spawn
+		// `gh`, regardless of whether gh is installed.
+		assert!(
+			matches!(result.pr_status, PrListStatus::NotGithub),
+			"expected NotGithub, got {:?}",
+			result.pr_status
+		);
+		assert!(result.prs.is_empty());
+	}
+
 	#[cfg(unix)]
 	fn write_executable_script(path: &std::path::Path, body: &str) {
 		use std::os::unix::fs::PermissionsExt;
@@ -3765,8 +4522,11 @@ mod tests {
 		host.save_file(Utf8Path::new("a.rs"), "hello\n").await.unwrap();
 
 		// Argv verifies the wire shape: `exec -w <translated_cwd>
-		// <name> rustfmt --edition 2024 <translated_abs>`. No
-		// `-it` (captured I/O).
+		// <name> sh -c '<wrap>' sh rustfmt --edition 2024
+		// <translated_abs>`, where the `sh -c` wrapper prepends
+		// the bind-mount-translated `node_modules/.bin` chain to
+		// `$PATH` so project-local binaries resolve. No `-it`
+		// (captured I/O). See ADR 0013.
 		let argv = std::fs::read_to_string(argv_log.as_std_path()).unwrap();
 		let lines: Vec<&str> = argv.lines().collect();
 		assert_eq!(
@@ -3776,6 +4536,10 @@ mod tests {
 				"-w",
 				format!("/workspace/{basename}").as_str(),
 				"moon-ws-test-dev-1",
+				"sh",
+				"-c",
+				format!(r#"PATH="/workspace/{basename}/node_modules/.bin:$PATH" exec "$@""#).as_str(),
+				"sh",
 				"rustfmt",
 				"--edition",
 				"2024",

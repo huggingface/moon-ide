@@ -223,6 +223,72 @@ export type GitCommitResult = {
 	summary: string;
 };
 
+/**
+ * One row in the branch-switcher palette. Discriminated union over
+ * `kind`: `local` runs `git switch <name>`, `pr` runs
+ * `gh pr checkout <number>` so cross-fork PRs work without manual
+ * remote / fetch fiddling. Mirrors `moon_protocol::git::BranchListEntry`.
+ */
+export type BranchListEntry =
+	| {
+			kind: 'local';
+			name: string;
+			lastCommitSubject: string;
+			committerDateRelative: string;
+			isCurrent: boolean;
+	  }
+	| {
+			kind: 'pr';
+			number: number;
+			title: string;
+			author: string;
+			headRef: string;
+			isDraft: boolean;
+			updatedAtRelative: string;
+	  };
+
+/**
+ * Why the PR section of `BranchList.prs` is empty. The frontend
+ * uses this to render the right empty-state row (or suppress the
+ * section entirely for `notGithub`). Mirrors
+ * `moon_protocol::git::PrListStatus`.
+ */
+export type PrListStatus =
+	| { kind: 'ok' }
+	| { kind: 'gh_missing' }
+	| { kind: 'gh_not_authed' }
+	| { kind: 'not_github' }
+	| { kind: 'failed'; detail: string };
+
+/**
+ * Result of `branch_list`. Local rows always populate; the PR
+ * section's emptiness is annotated by `prStatus`. Mirrors
+ * `moon_protocol::git::BranchList`.
+ */
+export type BranchList = {
+	local: BranchListEntry[];
+	prs: BranchListEntry[];
+	prStatus: PrListStatus;
+};
+
+/**
+ * Scope filter for `branchList`'s PR section. `all` mirrors `gh
+ * pr list --state open` (every open PR in the repo);
+ * `participating` runs two `gh pr list --search` queries in
+ * parallel — `involves:@me` and `review-requested:@me` — and
+ * merges them, mirroring GitHub's notification "Participating"
+ * filter plus review-requested. Persisted per folder in
+ * `FolderSession.pr_scope`. Mirrors
+ * `moon_protocol::git::PrListScope`.
+ */
+export type PrListScope = 'all' | 'participating';
+
+/**
+ * Argument for `branch_switch`. Mirrors
+ * `moon_protocol::git::BranchSwitchTarget`.
+ */
+export type BranchSwitchTarget = { kind: 'local'; name: string } | { kind: 'pr'; number: number };
+
 export type GitFileBlame = {
 	path: string;
 	/**
@@ -419,6 +485,8 @@ export type FolderSession = {
 	active_right: string | null;
 	has_split: boolean;
 	focused_side: SplitSide;
+	/** Branch-switcher PR-section filter — see `PrListScope`. */
+	pr_scope: PrListScope;
 };
 
 /**

@@ -2,7 +2,8 @@ use camino::Utf8PathBuf;
 use moon_core::{read_host_file, write_host_file};
 use moon_protocol::fs::{DirEntry, ReadFileResult, StatResult, WriteFileResult};
 use moon_protocol::git::{
-	GitBranchInfo, GitChangeSummary, GitCommitResult, GitFileBlame, GitFileStatus, GitStatusEntry,
+	BranchList, BranchSwitchTarget, GitBranchInfo, GitChangeSummary, GitCommitResult, GitFileBlame, GitFileStatus,
+	GitStatusEntry, PrListScope,
 };
 use moon_protocol::MoonError;
 use tauri::State;
@@ -306,6 +307,29 @@ pub async fn fs_git_pull(state: State<'_, AppState>) -> Result<(), MoonError> {
 pub async fn fs_git_merge_default_branch(state: State<'_, AppState>, remote_ref: String) -> Result<(), MoonError> {
 	let entry = state.workspaces.require_active_folder().await?;
 	entry.host.git_merge_default_branch(&remote_ref).await
+}
+
+/// Recent local branches + open GitHub PRs for the branch-switcher
+/// palette. Local branches always populate (single-digit ms `git
+/// for-each-ref`); the PR section depends on `gh` being installed,
+/// signed in, and the active folder's remote being on GitHub —
+/// each "no" surfaces as a [`PrListStatus`](moon_protocol::git::PrListStatus)
+/// the frontend renders as the section's empty-state row.
+#[tauri::command]
+pub async fn fs_branch_list(state: State<'_, AppState>, pr_scope: PrListScope) -> Result<BranchList, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.branch_list(pr_scope).await
+}
+
+/// `git switch <name>` (Local) or `gh pr checkout <number>` (Pr).
+/// Errors propagate git / gh stderr verbatim — dirty-tree refusal,
+/// missing branch, gh auth required, network failure — so the
+/// frontend's flash carries the actionable hint without us
+/// re-wrapping it.
+#[tauri::command]
+pub async fn fs_branch_switch(state: State<'_, AppState>, target: BranchSwitchTarget) -> Result<(), MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.branch_switch(&target).await
 }
 
 /// `git fetch --quiet --no-tags` against the configured upstream

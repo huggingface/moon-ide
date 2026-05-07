@@ -650,10 +650,17 @@
 <section class="scm" aria-label="Source control">
 	{#if branchLabel !== null}
 		<div class="header">
-			<div class="branch" title={branch.name === null ? 'Detached HEAD' : `Branch: ${branch.name}`}>
+			<button
+				type="button"
+				class="branch"
+				title={branch.name === null
+					? 'Detached HEAD — click to switch'
+					: `Branch: ${branch.name} — click to switch (Ctrl+Shift+B)`}
+				onclick={() => workspace.openBranchSwitcher()}
+			>
 				<span class="branch-icon" aria-hidden="true">⎇</span>
 				<span class="branch-name">{branchLabel}</span>
-			</div>
+			</button>
 			<div class="actions">
 				{#if changeCount > 0}
 					<button
@@ -904,6 +911,23 @@
 		display: flex;
 		align-items: center;
 		gap: 6px;
+		background: transparent;
+		border: 1px solid transparent;
+		border-radius: 4px;
+		padding: 1px 4px;
+		margin: -1px -4px;
+		color: inherit;
+		font: inherit;
+		cursor: pointer;
+		text-align: left;
+	}
+	.branch:hover {
+		background: var(--m-bg-2);
+		border-color: var(--m-border);
+	}
+	.branch:focus-visible {
+		outline: 2px solid var(--m-accent);
+		outline-offset: 1px;
 	}
 	.branch-icon {
 		flex-shrink: 0;
