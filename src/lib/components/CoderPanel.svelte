@@ -57,14 +57,47 @@
 		void coder.refreshStatus();
 	});
 
-	// Auto-scroll the transcript when new rows land. Bound to
-	// `coder.rows.length` so we don't fire on every text-delta once
-	// streaming arrives in 6.1.
+	// Auto-scroll the transcript when new rows land — but only
+	// when the user is *already* parked at (or close to) the
+	// bottom. If they scrolled up to look at an earlier message
+	// or tool result, we leave their viewport alone instead of
+	// yanking them back down on every fresh tool call. Coming
+	// back to the bottom (manually scrolling there) re-arms the
+	// auto-follow on the next row.
+	//
+	// Both `stickyBottom` and `lastRowCount` are plain `let`s,
+	// not `$state`: nothing else reacts to them, and the effect
+	// below should re-run only when *rows* change, not every
+	// time the user drags the scrollbar.
+	let stickyBottom = true;
+	let lastRowCount = 0;
+	const STICKY_BOTTOM_THRESHOLD_PX = 24;
+
+	function onTranscriptScroll(): void {
+		if (!scrollEl) {
+			return;
+		}
+		const distance = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
+		stickyBottom = distance <= STICKY_BOTTOM_THRESHOLD_PX;
+	}
+
 	$effect(() => {
-		const _trigger = coder.rows.length;
-		void _trigger;
+		const count = coder.rows.length;
+		if (count < lastRowCount) {
+			// Conversation reset: folder switch, sub-agent → main
+			// pop, or session swap shrinks the row list. Re-arm
+			// sticky-bottom so the next streamed message in the
+			// new context still auto-follows. Without this the
+			// flag stays "false" from a previous-session
+			// scroll-up and the new conversation never anchors.
+			stickyBottom = true;
+		}
+		lastRowCount = count;
+		if (!stickyBottom) {
+			return;
+		}
 		void tick().then(() => {
-			if (scrollEl) {
+			if (scrollEl && stickyBottom) {
 				scrollEl.scrollTop = scrollEl.scrollHeight;
 			}
 		});
@@ -540,7 +573,7 @@
 				<PlusIcon />
 			</button>
 		</header>
-		<div class="transcript" bind:this={scrollEl}>
+		<div class="transcript" bind:this={scrollEl} onscroll={onTranscriptScroll}>
 			{#if coder.rows.length === 0}
 				<p class="hint">
 					Send a prompt to start. The agent can read files, list directories, search, and run shell commands.
