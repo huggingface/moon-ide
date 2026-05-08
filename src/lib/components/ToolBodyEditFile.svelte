@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { fmtJson, openToolPath } from './toolBodyHelpers';
+	import { fmtJson, openToolPath, parseToolError } from './toolBodyHelpers';
 
 	interface Props {
 		args: unknown;
@@ -54,7 +54,14 @@
 
 	const argsP = $derived(parseArgs(args));
 	const resultP = $derived(hasResult ? parseResult(result) : null);
-	const parseable = $derived(argsP !== null || resultP !== null);
+	// Tool-error envelope from the coder runner: `{ "error": "<msg>" }`
+	// with `is_error: true`. We surface the message inline above the
+	// diff (when `find` / `replace` are still parseable) so the user
+	// sees both the attempted edit and why it failed (`find` matched
+	// 3 times, file is binary, occurrence out of range, …) without
+	// expanding the generic JSON fallback.
+	const errorMsg = $derived(hasResult ? parseToolError(result) : null);
+	const parseable = $derived(argsP !== null || resultP !== null || errorMsg !== null);
 	const path = $derived(resultP?.path ?? argsP?.path ?? null);
 	const findText = $derived(argsP !== null ? stripTrailingNl(argsP.find) : '');
 	const replaceText = $derived(argsP !== null ? stripTrailingNl(argsP.replace) : '');
@@ -84,7 +91,15 @@
 {:else}
 	<div class="ef-block">
 		<header class="ef-header">
-			<span class="ef-verb">{resultP !== null ? 'edited' : 'editing'}</span>
+			<span class="ef-verb" class:err={errorMsg !== null}>
+				{#if errorMsg !== null}
+					failed
+				{:else if resultP !== null}
+					edited
+				{:else}
+					editing
+				{/if}
+			</span>
 			{#if path !== null}
 				<button type="button" class="ef-path tool-link" title={`Open ${path}`} onclick={() => void openToolPath(path)}>
 					{path}
@@ -94,6 +109,17 @@
 				<span class="ef-meta">{occurrenceLabel}</span>
 			{/if}
 		</header>
+		{#if errorMsg !== null}
+			<!-- Inline error block. The runner emits the same string
+				 verbatim back to the model (so the model can recover
+				 / retry); rendering it here means the user sees the
+				 same signal the model just did, which keeps mental
+				 model parity. The diff below still shows what was
+				 attempted — useful when the failure is a multi-match
+				 ("find matched 4 times in …") and the user wants to
+				 see exactly which `find` was ambiguous. -->
+			<div class="ef-error" role="alert">{errorMsg}</div>
+		{/if}
 		{#if argsP !== null}
 			<!-- Unified-diff view: a `-` block for the searched
 				 string and a `+` block for the replacement. We
@@ -138,6 +164,20 @@
 		letter-spacing: 0.06em;
 		font-size: 10px;
 		color: var(--m-fg-subtle);
+	}
+	.ef-verb.err {
+		color: var(--m-danger);
+	}
+	.ef-error {
+		font-family: var(--m-font-mono, ui-monospace, monospace);
+		font-size: 11px;
+		line-height: 1.4;
+		padding: 6px 8px;
+		border-radius: 4px;
+		background: color-mix(in srgb, var(--m-danger) 14%, transparent);
+		color: var(--m-danger);
+		white-space: pre-wrap;
+		word-break: break-word;
 	}
 	.ef-path {
 		flex: 1 1 auto;

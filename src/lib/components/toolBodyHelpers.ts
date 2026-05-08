@@ -107,6 +107,35 @@ export function extractInnerHtml(html: string): string {
 	return html.slice(tagEnd + 1, codeEnd);
 }
 
+/** Detect the coder runner's tool-error envelope and return the
+ *  message string. The runner emits exactly
+ *  `{ "error": "<message>" }` (with `is_error: true`) for any
+ *  `CoderError::ToolFailed` / `InvalidToolArgs` an individual tool
+ *  raises — see `crates/moon-coder/src/runner.rs:finish_tool_call`.
+ *
+ *  Returns `null` when `result` doesn't match the envelope shape so
+ *  callers can fall through to their normal success rendering.
+ *  Tool-body components use this to surface "find matched 3 times,
+ *  pass occurrence" / "find not found in foo.rs" / "binary file"
+ *  cleanly inline rather than collapsing into the generic JSON
+ *  fallback. */
+export function parseToolError(result: unknown): string | null {
+	if (typeof result !== 'object' || result === null) {
+		return null;
+	}
+	// Same shape-narrowing pattern the per-tool `parseArgs` /
+	// `parseResult` helpers use: cast to a partial type with only
+	// the field we care about so the assertion stays a strict
+	// subset of `object` (the type the runtime check already
+	// narrowed to).
+	const o = result as { error?: unknown };
+	if (typeof o.error !== 'string') {
+		return null;
+	}
+	const msg = o.error.trim();
+	return msg.length > 0 ? msg : null;
+}
+
 /** Map a workspace-relative path to a fence id understood by
  *  `highlightCode`. Mirrors the canonical / alias lists in
  *  `src/lib/editor/highlightCode.ts`; returns `null` for any
