@@ -39,6 +39,7 @@
 	import { coder } from '../coder.svelte';
 	import { ipc } from '../ipc';
 	import { formatError } from '../protocol';
+	import { textInputUndo } from '../actions/textInputUndo';
 	import BranchIcon from './icons/BranchIcon.svelte';
 	import MergeIcon from './icons/MergeIcon.svelte';
 	import PullRequestIcon from './icons/PullRequestIcon.svelte';
@@ -751,6 +752,7 @@
 		<textarea
 			bind:this={textarea}
 			bind:value={message}
+			use:textInputUndo
 			class="input"
 			class:input-with-ai={coder.signedIn}
 			rows="1"
@@ -782,6 +784,7 @@
 			<input
 				bind:this={newBranchInput}
 				bind:value={newBranchName}
+				use:textInputUndo
 				class="new-branch-input"
 				type="text"
 				spellcheck="false"

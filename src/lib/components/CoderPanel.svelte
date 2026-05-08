@@ -18,6 +18,7 @@
 	import CodeIcon from './icons/CodeIcon.svelte';
 	import { ipc } from '../ipc';
 	import { formatError } from '../protocol';
+	import { textInputUndo } from '../actions/textInputUndo';
 
 	let scrollEl: HTMLDivElement | undefined = $state();
 	let composer: HTMLTextAreaElement | undefined = $state();
@@ -86,6 +87,8 @@
 	async function onComposerKey(event: KeyboardEvent) {
 		// Enter sends; Shift+Enter inserts a newline. Esc aborts the
 		// active turn (matches the panel header's stop button).
+		// Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y are wired by the
+		// `use:textInputUndo` action on the textarea below.
 		if (event.key === 'Escape' && coder.busy) {
 			event.preventDefault();
 			await coder.abort();
@@ -96,6 +99,31 @@
 			await coder.send();
 		}
 	}
+
+	function onComposerInput(event: Event): void {
+		const ta = event.currentTarget as HTMLTextAreaElement;
+		coder.draft = ta.value;
+	}
+
+	// State → DOM sync for *external* draft writes only: a folder
+	// switch (the bucket getter returns a different bucket's
+	// draft), an attachment chip removal (`removeAttachment`
+	// regex-replaces tokens out of the draft), or a post-send
+	// clear. During plain typing the `oninput` handler above
+	// keeps `coder.draft` and `composer.value` in lockstep, so
+	// this effect's `value !== composer.value` check fails and
+	// it does nothing — which is exactly what preserves the
+	// textarea's native Ctrl+Z buffer. Going the other way (using
+	// `bind:value`) made Svelte's binding effect periodically
+	// reassign `composer.value`, and any JS write to a textarea's
+	// `value` clears its native undo history; that's the bug
+	// this whole approach side-steps.
+	$effect(() => {
+		const value = coder.draft;
+		if (composer && composer.value !== value) {
+			composer.value = value;
+		}
+	});
 
 	async function onSignOut() {
 		const ok = await confirm('Sign out of Hugging Face?', { title: 'Sign out', kind: 'warning' });
@@ -514,7 +542,7 @@
 			{/if}
 			<textarea
 				bind:this={composer}
-				bind:value={coder.draft}
+				use:textInputUndo
 				placeholder={coder.busy
 					? 'Press Esc to stop the turn…'
 					: coder.attachments.length > 0
@@ -523,6 +551,7 @@
 				rows="3"
 				disabled={coder.busy}
 				onkeydown={onComposerKey}
+				oninput={onComposerInput}
 			></textarea>
 		</div>
 	{:else if coder.view === 'subagent'}

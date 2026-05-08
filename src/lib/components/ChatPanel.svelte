@@ -8,6 +8,7 @@
 	import { formatSlackRelative, formatSlackTime } from '../util/slackTime';
 	import { collectMentionedUserIds, parseSlackMrkdwn, slackPlainText } from '../util/slackMrkdwn';
 	import { resolveReactionName } from '../util/slackEmoji';
+	import { textInputUndo } from '../actions/textInputUndo';
 	import ChatConnectModal from './ChatConnectModal.svelte';
 	import SlackMessageBody from './SlackMessageBody.svelte';
 	import RefreshIcon from './icons/RefreshIcon.svelte';
@@ -637,6 +638,7 @@
 					<textarea
 						bind:this={composer}
 						bind:value={draft}
+						use:textInputUndo
 						placeholder={composerPlaceholder}
 						disabled={composerDisabled}
 						onkeydown={onComposerKeydown}

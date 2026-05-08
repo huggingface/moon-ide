@@ -518,7 +518,9 @@ class CoderPanelState {
 			// Fallback: append at end of draft — better than dropping
 			// the token on the floor. This only fires before the
 			// panel mounts; in practice the focus tick mounts the
-			// composer before we reach here anyway.
+			// composer before we reach here anyway. No DOM means no
+			// undo to participate in either, so the direct draft
+			// write is fine.
 			const sep = this.draft.length > 0 && !/\s$/.test(this.draft) ? ' ' : '';
 			this.draft = `${this.draft}${sep}${token} `;
 			return;
@@ -530,16 +532,26 @@ class CoderPanelState {
 		const needsLeading = before.length > 0 && !/\s$/.test(before);
 		const needsTrailing = after.length === 0 || !/^\s/.test(after);
 		const insertion = `${needsLeading ? ' ' : ''}${token}${needsTrailing ? ' ' : ''}`;
-		this.draft = `${before}${insertion}${after}`;
-		// Restore caret to just after the trailing space — the user
-		// can keep typing without backing into the token. Defer to
-		// a microtask so Svelte has flushed the bound `value` into
-		// the DOM before we move the selection.
-		const caret = before.length + insertion.length;
-		queueMicrotask(() => {
-			ta.selectionStart = caret;
-			ta.selectionEnd = caret;
-		});
+		// `execCommand('insertText')` is technically deprecated
+		// but every webview we ship into (Chromium, WebKitGTK
+		// via Tauri, WebView2) still implements it for textarea
+		// inserts, and unlike a direct `value =` write it
+		// *participates in the textarea's native undo stack* —
+		// Ctrl+Z then pulls the token back out the same way it
+		// reverses regular typing. The fallback below covers the
+		// theoretical "execCommand returned false" path with a
+		// direct draft write; native undo is lost there but the
+		// token still lands.
+		ta.focus();
+		const ok = document.execCommand('insertText', false, insertion);
+		if (!ok) {
+			this.draft = `${before}${insertion}${after}`;
+			const caret = before.length + insertion.length;
+			queueMicrotask(() => {
+				ta.selectionStart = caret;
+				ta.selectionEnd = caret;
+			});
+		}
 	}
 
 	/** Refresh the persisted sessions list. Best-effort: a
