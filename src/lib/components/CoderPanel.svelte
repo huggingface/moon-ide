@@ -143,6 +143,53 @@
 		}
 	}
 
+	/** Pull the typed shape of the `bash` tool's arguments — see
+	 *  `crates/moon-coder/src/tools.rs`'s `BashArgs`. Returns
+	 *  `null` when the args don't look like bash args, which lets
+	 *  the renderer fall back to the JSON path. */
+	function parseBashArgs(args: unknown): { cmd: string; timeoutMs: number | null } | null {
+		if (typeof args !== 'object' || args === null) {
+			return null;
+		}
+		const a = args as { cmd?: unknown; timeout_ms?: unknown };
+		if (typeof a.cmd !== 'string') {
+			return null;
+		}
+		const t = typeof a.timeout_ms === 'number' ? a.timeout_ms : null;
+		return { cmd: a.cmd, timeoutMs: t };
+	}
+
+	/** Pull the typed shape of the `bash` tool's success result —
+	 *  see `crates/moon-coder/src/tools.rs`'s `bash` `json!` block.
+	 *  Returns `null` when the result was structured by an error
+	 *  path (a string error, an unrelated object) so the renderer
+	 *  drops to the JSON fallback for those edge cases. */
+	function parseBashResult(result: unknown): {
+		cmd: string | null;
+		stdout: string;
+		stderr: string;
+		exitCode: number | null;
+		target: string | null;
+	} | null {
+		if (typeof result !== 'object' || result === null) {
+			return null;
+		}
+		const r = result as Record<string, unknown>;
+		// Heuristic: the bash result always carries either
+		// `stdout`, `stderr`, or `exit_code`. Anything missing
+		// all three isn't bash-shaped — treat as JSON.
+		if (typeof r.stdout !== 'string' && typeof r.stderr !== 'string' && typeof r.exit_code !== 'number') {
+			return null;
+		}
+		return {
+			cmd: typeof r.cmd === 'string' ? r.cmd : null,
+			stdout: typeof r.stdout === 'string' ? r.stdout : '',
+			stderr: typeof r.stderr === 'string' ? r.stderr : '',
+			exitCode: typeof r.exit_code === 'number' ? r.exit_code : null,
+			target: typeof r.target === 'string' ? r.target : null,
+		};
+	}
+
 	// Live tick fed into running tool rows so their elapsed-time
 	// readout (`running… (Xs)`) advances. One shared interval per
 	// panel — every tool row reads the same `nowTick` and computes
@@ -740,23 +787,75 @@
 		{@const subagent = withSubagentCards ? (coder.subagentSummaries.get(row.id) ?? null) : null}
 		{@const elapsedMs = row.hasResult ? (row.durationMs ?? 0) : Math.max(0, nowTick - row.startedAt)}
 		<div class="row tool" class:err={row.isError}>
-			<div class="row-label">tool · {row.name}</div>
+			<!-- One-line collapsed shape: status dot, tool name,
+				 status word, elapsed counter — chevron on the right
+				 from the native `<details>`. The standalone
+				 `tool · {name}` label that used to sit above the
+				 details was carrying duplicate information; folding
+				 the name into the summary trades two short lines
+				 plus the inter-line gap for one. The args / result
+				 blocks render unchanged when the row is expanded. -->
 			<details>
 				<summary>
+					<span class="tool-dot" class:running={!row.hasResult} class:err={row.isError} aria-hidden="true"></span>
+					<span class="tool-name">{row.name}</span>
 					<span class="tool-status">{!row.hasResult ? 'running…' : row.isError ? 'error' : 'ok'}</span>
 					<!-- Live elapsed counter while running, precise
-									 final duration once the tool settles. Reads
-									 the panel-level `nowTick` so every running
-									 tool row advances on the same 250ms beat
-									 instead of each one fighting for its own
-									 interval. -->
+						 final duration once the tool settles. Reads
+						 the panel-level `nowTick` so every running
+						 tool row advances on the same 250ms beat
+						 instead of each one fighting for its own
+						 interval. -->
 					<span class="tool-elapsed" class:running={!row.hasResult}>{fmtElapsed(elapsedMs, !row.hasResult)}</span>
 				</summary>
-				<div class="block-label">args</div>
-				<pre class="block">{fmtArgs(row.args)}</pre>
-				{#if row.hasResult}
-					<div class="block-label">result</div>
-					<pre class="block">{fmtArgs(row.result)}</pre>
+				{#if row.name === 'bash'}
+					{@const bArgs = parseBashArgs(row.args)}
+					{@const bResult = row.hasResult ? parseBashResult(row.result) : null}
+					{@const bashCmd = bResult?.cmd ?? bArgs?.cmd ?? ''}
+					<!-- Terminal-style view: a `$ <cmd>` line, then
+						 stdout / stderr blocks, then an `exit N` tag.
+						 Reads like the user just ran the command in a
+						 shell — much closer to the agent's mental
+						 model than a JSON dump of the same fields.
+						 Falls through to the JSON path below when the
+						 args/result don't match the expected shape
+						 (legacy traces, tool errors that returned a
+						 plain string, etc.). -->
+					{#if bArgs !== null || bResult !== null}
+						<div class="bash-block">
+							<div class="bash-cmd">
+								<span class="bash-prompt" aria-hidden="true">$</span>
+								<span class="bash-cmd-text">{bashCmd}</span>
+							</div>
+							{#if bResult !== null}
+								{#if bResult.stdout.length > 0}
+									<pre class="bash-stream bash-stdout">{bResult.stdout}</pre>
+								{/if}
+								{#if bResult.stderr.length > 0}
+									<pre class="bash-stream bash-stderr">{bResult.stderr}</pre>
+								{/if}
+								<div class="bash-exit" class:err={bResult.exitCode !== 0 && bResult.exitCode !== null}>
+									exit {bResult.exitCode ?? '?'}{#if bResult.target}
+										<span class="bash-target"> · {bResult.target}</span>
+									{/if}
+								</div>
+							{/if}
+						</div>
+					{:else}
+						<div class="block-label">args</div>
+						<pre class="block">{fmtArgs(row.args)}</pre>
+						{#if row.hasResult}
+							<div class="block-label">result</div>
+							<pre class="block">{fmtArgs(row.result)}</pre>
+						{/if}
+					{/if}
+				{:else}
+					<div class="block-label">args</div>
+					<pre class="block">{fmtArgs(row.args)}</pre>
+					{#if row.hasResult}
+						<div class="block-label">result</div>
+						<pre class="block">{fmtArgs(row.result)}</pre>
+					{/if}
 				{/if}
 			</details>
 			{#if subagent !== null}
@@ -1200,6 +1299,9 @@
 		font-size: 12px;
 		background: var(--m-bg-overlay);
 		border-radius: 6px;
+		padding: 4px 8px;
+	}
+	.row.tool details[open] {
 		padding: 6px 8px;
 	}
 	.row.tool.err details {
@@ -1209,8 +1311,34 @@
 		cursor: pointer;
 		color: var(--m-fg-muted);
 		display: flex;
-		align-items: baseline;
+		align-items: center;
 		gap: 6px;
+		min-height: 18px;
+		line-height: 1.2;
+	}
+	/* Status dot: a 7px circle that flips colour with the tool's
+	   state — accent while the call is in flight, danger on
+	   error, otherwise a calm subtle fill. Reads as the row's
+	   primary identity at a glance, so the eye can scan a
+	   stack of tool rows by colour without parsing the words. */
+	.row.tool .tool-dot {
+		flex: 0 0 auto;
+		width: 7px;
+		height: 7px;
+		border-radius: 50%;
+		background: var(--m-fg-subtle);
+	}
+	.row.tool .tool-dot.running {
+		background: var(--m-accent);
+	}
+	.row.tool .tool-dot.err,
+	.row.tool.err .tool-dot {
+		background: var(--m-danger);
+	}
+	.row.tool .tool-name {
+		flex: 0 0 auto;
+		color: var(--m-fg);
+		font-weight: 500;
 	}
 	.row.tool .tool-status {
 		flex: 0 0 auto;
@@ -1249,6 +1377,73 @@
 		margin: 4px 0 0;
 		white-space: pre-wrap;
 		word-break: break-word;
+	}
+	/* Terminal-style body for an expanded `bash` tool row. The
+	   command is rendered as a `$ <cmd>` line, then stdout /
+	   stderr / exit-code blocks beneath. Reads like the agent's
+	   own shell session rather than a JSON object with `cmd` /
+	   `stdout` / `stderr` keys, which is what you'd want to
+	   debug a multi-step bash plan. */
+	.row.tool .bash-block {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+		margin-top: 4px;
+		font-family: var(--m-font-mono, ui-monospace, monospace);
+		font-size: 11px;
+		line-height: 1.4;
+	}
+	.row.tool .bash-cmd {
+		display: flex;
+		gap: 6px;
+		background: var(--m-bg);
+		border-radius: 4px;
+		padding: 6px 8px;
+		white-space: pre-wrap;
+		word-break: break-word;
+	}
+	.row.tool .bash-prompt {
+		flex: 0 0 auto;
+		color: var(--m-accent);
+		user-select: none;
+	}
+	.row.tool .bash-cmd-text {
+		flex: 1 1 auto;
+		color: var(--m-fg);
+	}
+	.row.tool .bash-stream {
+		background: var(--m-bg);
+		color: var(--m-fg);
+		border-radius: 4px;
+		padding: 6px 8px;
+		max-height: 240px;
+		overflow: auto;
+		margin: 0;
+		white-space: pre-wrap;
+		word-break: break-word;
+	}
+	/* stderr stays on the same dark background as stdout so a
+	   command that interleaves the two streams reads as one
+	   pane; the danger tint on the text itself is enough to
+	   call out the "this is the error stream" without making
+	   benign stderr output (cargo build progress, ssh banners)
+	   look like a fatal failure. */
+	.row.tool .bash-stderr {
+		color: var(--m-danger);
+	}
+	.row.tool .bash-exit {
+		font-size: 10px;
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+		color: var(--m-fg-subtle);
+	}
+	.row.tool .bash-exit.err {
+		color: var(--m-danger);
+	}
+	.row.tool .bash-target {
+		color: var(--m-fg-subtle);
+		text-transform: none;
+		letter-spacing: 0;
 	}
 	/* Collapsed sub-agent card. Renders inline under the parent's
 	   `spawn_subagent` tool row. Reads as a clickable "pop out"
