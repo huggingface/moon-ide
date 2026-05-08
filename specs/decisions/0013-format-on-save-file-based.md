@@ -186,6 +186,7 @@ Today's table:
 | -------------- | ------------------------- | -------------------- |
 | `.rs`          | `rustfmt --edition <e>`   | file's parent dir    |
 | `.py` / `.pyi` | `[.venv/bin/]ruff format` | nearest project root |
+| `.go`          | `gofmt -w`                | file's parent dir    |
 
 The resolver also returns the `cwd` the subprocess should run in,
 not just the command — necessary because Python's project-local
@@ -253,6 +254,23 @@ When no project marker is found anywhere up the tree (a loose
 adjacent dir) the resolver falls back to the file's parent dir as
 cwd and bare `ruff format`. ruff's defaults still produce a
 useful format; the only thing missing is project-specific config.
+
+#### Go: gofmt
+
+The Go path is the simplest of the three: `gofmt -w <file>`
+reformats in place. `gofmt` ships with the Go toolchain itself
+(no extra install), is opinionated by design (no project
+`.gofmt.toml` or equivalent to read), and runs per-file — same
+shape as rustfmt. We pin `cwd` to the file's parent directory;
+`gofmt` has no notion of a project root.
+
+`goimports` would have been the obvious richer alternative — it
+formats _and_ organises imports — but it requires a separate
+install (`go install golang.org/x/tools/cmd/goimports@latest`)
+that we don't want to assume yet. Per the hardcode-first rule,
+gofmt covers the common case; teams that ship `goimports`-ed
+code via lint-staged keep their existing pipeline (lint-staged
+always wins).
 
 `black` and `autopep8` aren't in the table. The hardcode-first
 rule lets the team add them when a project that uses them lands

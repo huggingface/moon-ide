@@ -272,6 +272,7 @@ pub struct DefaultFormatCommand {
 /// |---------------|-----------------------------|----------------------|
 /// | `.rs`         | `rustfmt --edition <e>`     | file's parent dir    |
 /// | `.py` / `.pyi`| `[.venv/bin/]ruff format`   | nearest project root |
+/// | `.go`         | `gofmt -w`                  | file's parent dir    |
 ///
 /// The **Rust path** walks parents from `abs_path` looking for the
 /// nearest `Cargo.toml` with a `[package].edition` field. Bare
@@ -298,6 +299,16 @@ pub struct DefaultFormatCommand {
 /// `.pyi` stub extension routes the same way; `ruff format`
 /// handles both.
 ///
+/// The **Go path** is the simplest of the three: `gofmt -w <file>`
+/// reformats in place. `gofmt` ships with the Go toolchain itself
+/// (no extra install), is opinionated by design (no project
+/// `.gofmt.toml` to read), and runs per-file — same shape as
+/// rustfmt. We pin `cwd` to the file's parent directory; `gofmt`
+/// has no notion of project root and the canonical tool that
+/// _does_ (`goimports`) requires a separate install we don't
+/// want to assume yet. If a team ships `goimports`-ed code via
+/// lint-staged, that always wins (lint-staged runs first).
+///
 /// Per AGENTS.md "hardcode first, configure later" we add a row
 /// when a project the team uses needs one. lint-staged still wins
 /// whenever it matches, so adding a row never overrides an
@@ -313,6 +324,10 @@ pub fn default_format_command(abs_path: &Utf8Path) -> Option<DefaultFormatComman
 				cwd: parent.to_path_buf(),
 			})
 		}
+		"go" => Some(DefaultFormatCommand {
+			command: "gofmt -w".to_owned(),
+			cwd: parent.to_path_buf(),
+		}),
 		"py" | "pyi" => {
 			let project_root = nearest_python_project_root(abs_path);
 			let cwd = project_root.clone().unwrap_or_else(|| parent.to_path_buf());
@@ -671,6 +686,22 @@ mod tests {
 		let resolved = default_format_command(&file).expect("python fallback");
 		assert_eq!(resolved.command, "ruff format");
 		assert_eq!(resolved.cwd, root);
+	}
+
+	#[test]
+	fn default_format_command_go_uses_gofmt_in_parent_dir() {
+		// Go has no project-root anchoring (gofmt is per-file
+		// and config-free); cwd is just the file's parent.
+		let tmp = TempDir::new().unwrap();
+		let root = Utf8PathBuf::from_path_buf(tmp.path().canonicalize().unwrap()).unwrap();
+		let pkg = root.join("internal").join("server");
+		std::fs::create_dir_all(pkg.as_std_path()).unwrap();
+		let file = pkg.join("server.go");
+		std::fs::write(file.as_std_path(), "package server\n").unwrap();
+
+		let resolved = default_format_command(&file).expect("go fallback");
+		assert_eq!(resolved.command, "gofmt -w");
+		assert_eq!(resolved.cwd, pkg);
 	}
 
 	#[test]

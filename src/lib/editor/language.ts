@@ -145,6 +145,18 @@ export async function languageFor(filename: string, firstLine?: string): Promise
 			const { rust } = await import('@codemirror/lang-rust');
 			return [rust()];
 		}
+		case 'go': {
+			// `@codemirror/lang-go` is the official upstream — it
+			// ships a Lezer grammar tracked against the latest Go
+			// spec (generics, type params, range-over-func), so we
+			// match the editor highlighter for `.go` to whatever
+			// Go's own spec says is current. No extra arg needed:
+			// the package's default export wires up indentation +
+			// auto-close-brackets the same way the Rust / Python
+			// extensions do.
+			const { go } = await import('@codemirror/lang-go');
+			return [go()];
+		}
 		case 'py':
 		case 'pyi': {
 			const { python } = await import('@codemirror/lang-python');

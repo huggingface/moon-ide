@@ -1,6 +1,6 @@
 # LSP
 
-Status: partial — TypeScript, Rust, and Python all have diagnostics + hover + completion + goto-definition + nav history wired via the stage-1/stage-2 slices of Phase 4. All three additionally route **inside the workspace container** when one is up and the binary is reachable there (see [Container-backed LSP](#container-backed-lsp)); the broker falls back to host LSP per-language when it isn't. Every other language (Svelte, CSS, HTML, JSON) is architecturally in scope and not yet wired.
+Status: partial — TypeScript, Rust, Python, and Go all have diagnostics + hover + completion + goto-definition + nav history wired via the stage-1/stage-2 slices of Phase 4. All four additionally route **inside the workspace container** when one is up and the binary is reachable there (see [Container-backed LSP](#container-backed-lsp)); the broker falls back to host LSP per-language when it isn't. Every other language (Svelte, CSS, HTML, JSON) is architecturally in scope and not yet wired.
 
 ## The non-negotiable invariant
 
@@ -96,6 +96,18 @@ This drops `rust-analyzer` at `$CARGO_HOME/bin/rust-analyzer` (typically `~/.car
 
 No startup args: `rust-analyzer` defaults to stdio + LSP when invoked with no flags, which is exactly what we want. It auto-detects workspace layout from `initialize.workspaceFolders`, so the generic init we already send suffices. Advanced configuration (`checkOnSave`, `cargo.features`, proc-macro toggles, etc.) is left at defaults for now — we'll add `workspace/didChangeConfiguration` plumbing when a real need surfaces.
 
+### Go server: `gopls`
+
+Same posture as `rust-analyzer` — the official LSP from the Go team (`golang.org/x/tools/gopls`) and the only one anyone ships in practice. Go has no per-project install convention; the binary always lands in the user-wide GOPATH after:
+
+```
+go install golang.org/x/tools/gopls@latest
+```
+
+This drops `gopls` at `$GOPATH/bin/gopls` (with `$GOPATH` defaulting to `$HOME/go` per the Go toolchain since Go 1.8). Discovery prefers `$GOBIN/gopls` (the explicit override the Go toolchain itself honours over `$GOPATH/bin`), then `$GOPATH/bin/gopls`, then `$PATH` — so distro packages (`golang-go`), Homebrew, and hand-compiled installs all resolve without extra work.
+
+No startup args: `gopls` defaults to stdio + LSP when invoked with no flags. It reads `go.mod` / `go.work` itself and auto-detects the workspace layout from `initialize.workspaceFolders`. Advanced configuration (build flags, analyzer toggles, etc.) is left at defaults for now.
+
 ### TypeScript server: `tsgo`, not `typescript-language-server`
 
 We target Microsoft's native TS 7 port (`@typescript/native-preview`, binary name `tsgo`) rather than the community `typescript-language-server` wrapper. Rationale:
@@ -114,12 +126,13 @@ Discovery is per-language via `LspBinarySpec::discovery`:
 - **`DiscoveryStrategy::NodeModules`** (TS / JS): walks up from the broker's root looking for `<ancestor>/node_modules/.bin/<bin_name>` at every level, then falls back to `which::which(bin_name)`. Matches Node's own resolution algorithm — pnpm-hoisted monorepos (single top-level `node_modules`) work identically to classic per-package layouts. The first match wins: a project-pinned copy always beats a global install, letting a monorepo freeze a specific LSP version without affecting other projects on the same machine.
 - **`DiscoveryStrategy::CargoHome`** (Rust): checks `$CARGO_HOME/bin/<bin_name>` (fallback `$HOME/.cargo/bin/<bin_name>`, or `$USERPROFILE/.cargo/bin/` on Windows), then `$PATH`. Covers `rustup component add rust-analyzer` — the default install location isn't always on a GUI-launched process's inherited `PATH`, especially on macOS and some Linux desktop environments.
 - **`DiscoveryStrategy::PythonVenv`** (Python): walks up from the broker's root looking for `<ancestor>/.venv/bin/<bin_name>` (Unix) / `<ancestor>/.venv/Scripts/<bin_name>.exe` (Windows), then `$PATH`. Mirrors the `NodeModules` shape for the Python ecosystem: `.venv/` is `uv`'s default virtualenv layout and where `uv pip install` / `uv add --dev` land. The PATH fallback catches users who installed via `uv tool install` (lands in `~/.local/bin`).
+- **`DiscoveryStrategy::GoBin`** (Go): checks `$GOBIN/<bin_name>` first (the Go toolchain's explicit override), then `$GOPATH/bin/<bin_name>` (with `$GOPATH` defaulting to `$HOME/go` per the toolchain default since Go 1.8), then `$PATH`. Same posture as `CargoHome`: `go install` always writes user-wide, so a per-user pin is the canonical install path; the PATH fallback covers distro / Homebrew / hand-compiled installs.
 
 On Windows we adjust the filename per strategy: `<bin>.cmd` for the Node case (npm's `.bin` wrapper), `<bin>.exe` for Cargo (native executables), `<bin>.exe` for Python (matches CPython's venv layout).
 
 If nothing is found on disk, the broker caches a `NotAvailable` slot per language and emits `lsp:status { status: 'notavailable' }`. The status bar paints a quiet pill whose tooltip is the spec's `install_hint` field (e.g. `bun add -D @typescript/native-preview` or `rustup component add rust-analyzer`) — copy-pasteable into a terminal.
 
-Container-backed workspaces (ADR 0008) skip host discovery entirely for languages whose server the container already ships — see [Container-backed LSP](#container-backed-lsp). Rust is the first (and currently only) such language: `moon-base` pre-installs `rust-analyzer` via `rustup component add`, and the broker pipes stdio through `docker exec` when the container is `Running`. Falling back to the host is automatic when the container is down, not configured, or doesn't have the server.
+Container-backed workspaces (ADR 0008) skip host discovery entirely for languages whose server the container already ships — see [Container-backed LSP](#container-backed-lsp). `moon-base` pre-installs `rust-analyzer` (via `rustup component add`) and `gopls` (via `go install`), and the broker pipes stdio through `docker exec` when the container is `Running`. Falling back to the host is automatic when the container is down, not configured, or doesn't have the server.
 
 ### Container-backed LSP
 
@@ -139,7 +152,7 @@ The per-server fallback covers two separate cases without a user setting:
 1. **Custom image dropped the server** (e.g. `moon-base` rebuilt from a fork that removed `rust-analyzer`) — container probe fails → broker retries on host, with a `tracing::info!` breadcrumb.
 2. **Binary isn't reachable inside the container at all** — most commonly `tsgo`, whose real binary sits in `node_modules/.bin/tsgo` and is a Linux-specific shim installed by `bun install`. When the host `node_modules` sits **inside** the bind mount (the normal case for moon-ide itself), container-side LSP works; when it's hoisted to a parent of the active folder (some pnpm monorepos), the path is outside the mount and the broker falls back to host for that language.
 
-In-container binary-path resolution lives in `moon_core::lsp::server::container_binary_path`. It walks host ancestors for `NodeModules`- and `PythonVenv`-strategy specs and translates matches through the `HostMount` translator; for `CargoHome`-strategy specs it hands back the basename because `moon-base` installs `rust-analyzer` on the container's `$PATH` via rustup.
+In-container binary-path resolution lives in `moon_core::lsp::server::container_binary_path`. It walks host ancestors for `NodeModules`- and `PythonVenv`-strategy specs and translates matches through the `HostMount` translator; for `CargoHome`- and `GoBin`-strategy specs it hands back the basename because `moon-base` installs the corresponding server (`rust-analyzer`, `gopls`) on the container's `$PATH`.
 
 **Pieces.**
 
@@ -151,7 +164,7 @@ In-container binary-path resolution lives in `moon_core::lsp::server::container_
 
 **Teardown on container transitions.** Every mutating container command (`container_setup`, `container_stop`, `container_pause`, `container_resume`, `container_rebuild`, `container_teardown`, `container_apply_bound_folders`) calls `reset_lsp_broker` after the compose action completes. That drops the current broker; the next `lsp_open` rebuilds against whatever state the container is in now. Cheaper and more deterministic than trying to mutate the broker in place.
 
-**Image responsibility.** `moon-base` pre-installs language servers that benefit from a global pin: today that's `rust-analyzer` via `rustup component add` (Rust has no per-project install convention). TypeScript (`tsgo`) and Python (`ty`) are intentionally **not** pre-installed — both have first-class per-project install paths (`bun add -D @typescript/native-preview`, `uv add --dev ty`), and the per-project copy is what should win. The container surfaces an unavailable-pill until the user installs the server; matches the host UX. See [`containers.md`](containers.md#the-moon-base-image) for the current tool inventory.
+**Image responsibility.** `moon-base` pre-installs language servers that benefit from a global pin: today that's `rust-analyzer` via `rustup component add` (Rust has no per-project install convention) and `gopls` via `go install` (same logic — Go has no per-project install convention either). TypeScript (`tsgo`) and Python (`ty`) are intentionally **not** pre-installed — both have first-class per-project install paths (`bun add -D @typescript/native-preview`, `uv add --dev ty`), and the per-project copy is what should win. The container surfaces an unavailable-pill until the user installs the server; matches the host UX. See [`containers.md`](containers.md#the-moon-base-image) for the current tool inventory.
 
 **Known non-goals for this slice.**
 

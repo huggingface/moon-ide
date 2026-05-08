@@ -197,6 +197,50 @@ RUN uv python install 3.12 \
  && uv tool install --python 3.12 huggingface_hub \
  && hf --version
 
+# Go toolchain — installed from the upstream tarball into the
+# `dev` user's home (no root needed at run time). Debian's
+# `golang-go` package is usually a release behind upstream and
+# Go's toolchain ships gopls / module tooling that depend on a
+# recent compiler, so we follow the pattern rustup / fnm / uv
+# already set in this image: pin a specific version and install
+# user-mode.
+#
+# `gopls` (the official Go LSP from `golang.org/x/tools/gopls`)
+# is installed via `go install` for the same reason `rust-analyzer`
+# is pre-installed via `rustup component add` — Go has no
+# per-project install convention, so the per-user pin is the
+# convention. The LSP broker's `DockerExec` route resolves
+# `gopls` against the container's `$PATH` (which includes
+# `$GOPATH/bin`), matching the `CargoHome`-style basename
+# resolution `rust-analyzer` uses. See specs/lsp.md.
+ARG GO_VERSION=1.26.3
+
+# `TARGETARCH` is auto-populated by BuildKit for every platform in
+# the multi-arch matrix (`amd64` / `arm64` for the moon-base
+# manifest) and matches Go's tarball naming exactly — no case
+# ladder needed. If a future arch lands in the matrix that Go
+# doesn't publish for, the curl 404 fails the build with a clear
+# error rather than silently shipping a broken image.
+ARG TARGETARCH
+ENV GOROOT=/home/${USERNAME}/.local/go \
+    GOPATH=/home/${USERNAME}/go \
+    PATH=/home/${USERNAME}/.local/go/bin:/home/${USERNAME}/go/bin:${PATH}
+
+# `--retry`: dl.google.com (where go.dev/dl redirects) occasionally
+# 503s or refuses connections during the image build window. A
+# hard fail there is a long debug for what's almost always a
+# transient blip; let curl back off and try again instead.
+RUN mkdir -p "${HOME}/.local" \
+ && curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused \
+      "https://go.dev/dl/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz" \
+      -o /tmp/go.tar.gz \
+ && tar -C "${HOME}/.local" -xzf /tmp/go.tar.gz \
+ && rm /tmp/go.tar.gz \
+ && go version
+
+RUN go install golang.org/x/tools/gopls@latest \
+ && gopls version
+
 WORKDIR /workspace
 
 # moon-ide attaches with `docker exec` for everything (terminals, LSPs,

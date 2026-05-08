@@ -88,25 +88,32 @@ impl LspSpawner {
 	}
 
 	/// Check whether `bin` exists and starts cleanly in the
-	/// target location. We invoke `<bin> --version` and treat a
-	/// zero exit code as "available".
+	/// target location. We invoke `<bin> <probe_args…>` and
+	/// treat a zero exit code as "available".
 	///
-	/// Why `--version` and not a plain `which`: for
-	/// `DockerExec` the binary is inside the container and
-	/// `which` on the host tells us nothing. For `Local` a
-	/// matching filesystem entry isn't quite enough either —
-	/// the server might be installed but e.g. the toolchain
-	/// component behind a rustup proxy shim isn't, in which
-	/// case `--version` fails fast and we correctly route to
-	/// `NotAvailable` instead of spawning and then reporting
-	/// "Crashed".
+	/// Why a probe and not a plain `which`: for `DockerExec`
+	/// the binary is inside the container and `which` on the
+	/// host tells us nothing. For `Local` a matching filesystem
+	/// entry isn't quite enough either — the server might be
+	/// installed but e.g. the toolchain component behind a
+	/// rustup proxy shim isn't, in which case the probe fails
+	/// fast and we correctly route to `NotAvailable` instead of
+	/// spawning and then reporting "Crashed".
+	///
+	/// `probe_args` is per-spec because LSP servers don't all
+	/// agree on the syntax. `--version` is the dominant
+	/// convention (rust-analyzer, tsgo, ty); `gopls` uses
+	/// Cobra-style subcommand syntax (`gopls version`) and
+	/// treats long flags as unknown CLI options. The
+	/// `LspBinarySpec` carries the right argv so this layer
+	/// stays generic.
 	///
 	/// stdout / stderr are dropped — we only care about the
 	/// exit status. Any spawn failure (docker not installed,
 	/// container missing, binary missing) also returns `false`.
-	pub async fn probe(&self, bin: &str) -> bool {
+	pub async fn probe(&self, bin: &str, probe_args: &[&str]) -> bool {
 		let bin_path = Path::new(bin);
-		let mut cmd = self.build_command(bin_path, &["--version"]);
+		let mut cmd = self.build_command(bin_path, probe_args);
 		cmd.stdin(Stdio::null());
 		cmd.stdout(Stdio::null());
 		cmd.stderr(Stdio::null());
@@ -187,7 +194,7 @@ mod tests {
 	#[tokio::test]
 	async fn probe_returns_true_on_zero_exit() {
 		let spawner = LspSpawner::Local;
-		assert!(spawner.probe("/bin/echo").await);
+		assert!(spawner.probe("/bin/echo", &["--version"]).await);
 	}
 
 	/// `Local::probe` returns false when the binary doesn't
@@ -196,16 +203,31 @@ mod tests {
 	#[tokio::test]
 	async fn probe_returns_false_on_missing_bin() {
 		let spawner = LspSpawner::Local;
-		assert!(!spawner.probe("/definitely/not/a/binary/xyzzy").await);
+		assert!(!spawner.probe("/definitely/not/a/binary/xyzzy", &["--version"]).await);
 	}
 
 	/// `false(1)` is POSIX-standard and exits non-zero; use it
-	/// as a shape-check for "binary runs but `--version` fails"
+	/// as a shape-check for "binary runs but the probe fails"
 	/// without depending on a container being available.
 	#[cfg(unix)]
 	#[tokio::test]
 	async fn probe_returns_false_on_non_zero_exit() {
 		let spawner = LspSpawner::Local;
-		assert!(!spawner.probe("/bin/false").await);
+		assert!(!spawner.probe("/bin/false", &["--version"]).await);
+	}
+
+	/// Probe argv flows through verbatim — regression guard for
+	/// the gopls case where `["version"]` (subcommand) succeeds
+	/// but `["--version"]` (long flag) exits non-zero. We assert
+	/// only the positive shape: a probe with no args invoked on
+	/// `/bin/true` exits zero, while `/bin/false` always exits
+	/// one regardless of args, so a single argv slot is enough.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn probe_uses_supplied_argv() {
+		let spawner = LspSpawner::Local;
+		// `/bin/true` ignores all args and exits zero.
+		assert!(spawner.probe("/bin/true", &["version"]).await);
+		assert!(spawner.probe("/bin/true", &[]).await);
 	}
 }

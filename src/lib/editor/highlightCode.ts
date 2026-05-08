@@ -52,6 +52,7 @@ const LOADERS: Record<string, () => Promise<Parser>> = {
 	html: async () => (await import('@codemirror/lang-html')).htmlLanguage.parser,
 	markdown: async () => (await import('@codemirror/lang-markdown')).markdownLanguage.parser,
 	rust: async () => (await import('@codemirror/lang-rust')).rustLanguage.parser,
+	go: async () => (await import('@codemirror/lang-go')).goLanguage.parser,
 	python: async () => (await import('@codemirror/lang-python')).pythonLanguage.parser,
 	toml: async () => {
 		const { toml } = await import('@codemirror/legacy-modes/mode/toml');

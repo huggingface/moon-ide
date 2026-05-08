@@ -151,6 +151,7 @@ export function fenceLangFromPath(path: string | null): string | null {
 		svelte: 'svelte',
 		md: 'markdown',
 		rs: 'rust',
+		go: 'go',
 		py: 'python',
 		pyi: 'python',
 		sh: 'shell',

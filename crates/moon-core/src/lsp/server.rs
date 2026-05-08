@@ -57,6 +57,14 @@ pub struct LspBinarySpec {
 	pub language_id: &'static str,
 	pub bin_name: &'static str,
 	pub args: &'static [&'static str],
+	/// Argv used by the broker's availability probe (`<bin>
+	/// <probe_args…>` — exit zero means "available"). Almost
+	/// every LSP accepts `--version`; the odd exception is
+	/// `gopls`, which uses subcommand syntax (`gopls version`)
+	/// and treats the long flag as an unknown CLI option. Per-
+	/// spec override keeps the probe generic without forcing
+	/// every server to follow the same convention.
+	pub probe_args: &'static [&'static str],
 	pub install_hint: &'static str,
 	pub discovery: DiscoveryStrategy,
 }
@@ -91,6 +99,13 @@ pub enum DiscoveryStrategy {
 	/// did `uv tool install ty` instead and have `~/.local/bin`
 	/// on PATH.
 	PythonVenv,
+	/// Check `$GOBIN/<bin>`, then `$GOPATH/bin/<bin>` (with
+	/// `$GOPATH` defaulting to `$HOME/go`), then `$PATH`. Covers
+	/// the canonical `go install golang.org/x/tools/gopls@latest`
+	/// install path — Go has no per-project install convention
+	/// (binaries always land in the user-wide GOPATH), so the
+	/// shape mirrors `CargoHome` rather than `NodeModules`.
+	GoBin,
 }
 
 /// TypeScript / JavaScript server.
@@ -113,6 +128,7 @@ pub const TS_SERVER: LspBinarySpec = LspBinarySpec {
 	language_id: "typescript",
 	bin_name: "tsgo",
 	args: &["--lsp", "--stdio"],
+	probe_args: &["--version"],
 	install_hint: "bun add -D @typescript/native-preview",
 	discovery: DiscoveryStrategy::NodeModules,
 };
@@ -134,6 +150,7 @@ pub const RUST_SERVER: LspBinarySpec = LspBinarySpec {
 	language_id: "rust",
 	bin_name: "rust-analyzer",
 	args: &[],
+	probe_args: &["--version"],
 	install_hint: "rustup component add rust-analyzer",
 	discovery: DiscoveryStrategy::CargoHome,
 };
@@ -158,8 +175,36 @@ pub const PYTHON_SERVER: LspBinarySpec = LspBinarySpec {
 	language_id: "python",
 	bin_name: "ty",
 	args: &["server"],
+	probe_args: &["--version"],
 	install_hint: "uv add --dev ty (or uv tool install ty)",
 	discovery: DiscoveryStrategy::PythonVenv,
+};
+
+/// Go server — `gopls`, the official LSP from the Go team
+/// (`golang.org/x/tools/gopls`). Same posture as `rust-analyzer`:
+/// no per-project install convention, the binary always lives in
+/// the user-wide GOPATH after `go install`. Discovery prefers
+/// `$GOBIN/gopls`, then `$GOPATH/bin/gopls` (with `$GOPATH`
+/// defaulting to `$HOME/go` per the Go toolchain's own default),
+/// then `$PATH`.
+///
+/// No startup args: `gopls` defaults to stdio + LSP when invoked
+/// with no flags. It auto-detects the workspace layout from
+/// `initialize.workspaceFolders` and reads `go.mod` / `go.work`
+/// itself.
+///
+/// `probe_args` is `["version"]`, not `["--version"]`: gopls is
+/// the one server in our roster that uses Cobra-style subcommand
+/// syntax instead of long flags, and treats `--version` as an
+/// unknown flag (exit 2). The probe would otherwise cache
+/// `NotAvailable` even when the binary is happily installed.
+pub const GO_SERVER: LspBinarySpec = LspBinarySpec {
+	language_id: "go",
+	bin_name: "gopls",
+	args: &[],
+	probe_args: &["version"],
+	install_hint: "go install golang.org/x/tools/gopls@latest",
+	discovery: DiscoveryStrategy::GoBin,
 };
 
 pub struct LspServer {
@@ -846,6 +891,33 @@ pub fn discover_binary(bin_name: &str, strategy: DiscoveryStrategy, start: &Path
 				Err(_) => None,
 			}
 		}
+		DiscoveryStrategy::GoBin => {
+			// 1. `$GOBIN/<bin>` — explicit override the Go
+			//    toolchain itself honours over `$GOPATH/bin`.
+			// 2. `$GOPATH/bin/<bin>` — what `go install` writes
+			//    to when `$GOBIN` isn't set. `$GOPATH` itself
+			//    defaults to `$HOME/go` per the Go docs (no
+			//    longer required to be set since Go 1.8).
+			// 3. `$PATH` — distro packages (`golang-go`),
+			//    Homebrew, or hand-compiled installs.
+			if let Some(candidate) = go_bin_candidate(bin_name) {
+				if candidate.exists() {
+					tracing::debug!(
+						bin = bin_name,
+						path = %candidate.display(),
+						"lsp: resolved via go bin"
+					);
+					return Some(candidate);
+				}
+			}
+			match which::which(bin_name) {
+				Ok(path) => {
+					tracing::debug!(bin = bin_name, path = %path.display(), "lsp: resolved via PATH");
+					Some(path)
+				}
+				Err(_) => None,
+			}
+		}
 	}
 }
 
@@ -937,6 +1009,7 @@ pub fn container_binary_path(spec: &LspBinarySpec, translator: &PathTranslator) 
 			None
 		}
 		DiscoveryStrategy::CargoHome => Some(PathBuf::from(spec.bin_name)),
+		DiscoveryStrategy::GoBin => Some(PathBuf::from(spec.bin_name)),
 		DiscoveryStrategy::PythonVenv => {
 			// Container is always Linux — same `bin/<name>` layout
 			// every Unix venv uses.
@@ -1014,6 +1087,28 @@ fn is_rustup_shim(path: &Path) -> bool {
 	}
 }
 
+/// Resolve `$GOBIN/<bin_name>`, falling back to
+/// `$GOPATH/bin/<bin_name>`, with `$GOPATH` defaulting to
+/// `$HOME/go` (the toolchain default since Go 1.8). Returns
+/// `None` only when we can't build any candidate at all (no
+/// `$GOBIN`, no `$GOPATH`, no `$HOME` / `$USERPROFILE`) — caller
+/// still has the `$PATH` escape hatch after this.
+fn go_bin_candidate(bin_name: &str) -> Option<PathBuf> {
+	let filename = if cfg!(windows) {
+		format!("{bin_name}.exe")
+	} else {
+		bin_name.to_owned()
+	};
+	if let Some(gobin) = std::env::var_os("GOBIN") {
+		return Some(PathBuf::from(gobin).join(&filename));
+	}
+	let gopath = std::env::var_os("GOPATH")
+		.map(PathBuf::from)
+		.or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join("go")))
+		.or_else(|| std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join("go")))?;
+	Some(gopath.join("bin").join(filename))
+}
+
 /// Resolve `$CARGO_HOME/bin/<bin_name>` with the `$HOME/.cargo/bin/`
 /// fallback that rustup uses when `$CARGO_HOME` isn't set. Returns
 /// `None` only when we can't build any candidate at all (no
@@ -1061,6 +1156,11 @@ mod tests {
 	/// `CARGO_HOME`-mutating tests below race and one sporadically
 	/// sees the other's value.
 	static CARGO_HOME_LOCK: Mutex<()> = Mutex::new(());
+
+	/// Same rationale as `CARGO_HOME_LOCK`: serialise the tests
+	/// that touch `$GOBIN` / `$GOPATH` so they don't race each
+	/// other or any other env-mutating test in the module.
+	static GO_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 	#[cfg(unix)]
 	fn make_executable(path: &Path) {
@@ -1430,6 +1530,97 @@ mod tests {
 		};
 		let resolved = container_binary_path(&PYTHON_SERVER, &translator).expect("resolves when .venv is in the mount");
 		assert_eq!(resolved, Path::new("/workspace/moon-py/.venv/bin/ty"));
+	}
+
+	/// `GoBin`-strategy specs return the basename: `moon-base`
+	/// installs `gopls` on the container's `$PATH` via
+	/// `go install`, so `docker exec` can resolve it without
+	/// an absolute path. Mirrors the CargoHome shape.
+	#[test]
+	fn container_binary_path_go_bin_returns_basename() {
+		let translator = PathTranslator::HostMount {
+			host_root: Utf8PathBuf::from("/home/dev/code/gitaly"),
+			server_root: Utf8PathBuf::from("/workspace/gitaly"),
+		};
+		let resolved = container_binary_path(&GO_SERVER, &translator).expect("gopls always returns Some for GoBin");
+		assert_eq!(resolved, Path::new("gopls"));
+	}
+
+	/// `$GOBIN` points at an explicit override directory; the
+	/// candidate must live there even when `$GOPATH` is set
+	/// elsewhere. The Go toolchain itself prefers `$GOBIN` over
+	/// `$GOPATH/bin` and discovery should match.
+	#[test]
+	fn discover_uses_gobin_when_set() {
+		let _guard = GO_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+		let tmp = tempfile::tempdir().unwrap();
+		let bin_dir = tmp.path().join("explicit-gobin");
+		fs::create_dir_all(&bin_dir).unwrap();
+		let bin_name = if cfg!(windows) { "fake-gopls.exe" } else { "fake-gopls" };
+		let bin_path = bin_dir.join(bin_name);
+		fs::write(&bin_path, b"#!/bin/sh\n").unwrap();
+		make_executable(&bin_path);
+
+		let prev_gobin = std::env::var_os("GOBIN");
+		let prev_gopath = std::env::var_os("GOPATH");
+		// SAFETY: see CARGO_HOME-mutation rationale on
+		// `discover_uses_cargo_home_when_set`. Single-threaded
+		// env mutation, restored on exit, GO_ENV_LOCK serialises
+		// every other test in this module that touches the same
+		// vars.
+		unsafe {
+			std::env::set_var("GOBIN", &bin_dir);
+			std::env::remove_var("GOPATH");
+		}
+		let found = discover_binary("fake-gopls", DiscoveryStrategy::GoBin, tmp.path());
+		// SAFETY: see above.
+		unsafe {
+			match prev_gobin {
+				Some(v) => std::env::set_var("GOBIN", v),
+				None => std::env::remove_var("GOBIN"),
+			}
+			match prev_gopath {
+				Some(v) => std::env::set_var("GOPATH", v),
+				None => std::env::remove_var("GOPATH"),
+			}
+		}
+		assert_eq!(found.as_deref(), Some(bin_path.as_path()));
+	}
+
+	/// Without `$GOBIN`, discovery falls through to
+	/// `$GOPATH/bin/<bin>`. Regression guard for the dual-env
+	/// resolution shape.
+	#[test]
+	fn discover_uses_gopath_bin_when_gobin_unset() {
+		let _guard = GO_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+		let tmp = tempfile::tempdir().unwrap();
+		let bin_dir = tmp.path().join("bin");
+		fs::create_dir_all(&bin_dir).unwrap();
+		let bin_name = if cfg!(windows) { "fake-gopls.exe" } else { "fake-gopls" };
+		let bin_path = bin_dir.join(bin_name);
+		fs::write(&bin_path, b"#!/bin/sh\n").unwrap();
+		make_executable(&bin_path);
+
+		let prev_gobin = std::env::var_os("GOBIN");
+		let prev_gopath = std::env::var_os("GOPATH");
+		// SAFETY: see above.
+		unsafe {
+			std::env::remove_var("GOBIN");
+			std::env::set_var("GOPATH", tmp.path());
+		}
+		let found = discover_binary("fake-gopls", DiscoveryStrategy::GoBin, tmp.path());
+		// SAFETY: see above.
+		unsafe {
+			match prev_gobin {
+				Some(v) => std::env::set_var("GOBIN", v),
+				None => std::env::remove_var("GOBIN"),
+			}
+			match prev_gopath {
+				Some(v) => std::env::set_var("GOPATH", v),
+				None => std::env::remove_var("GOPATH"),
+			}
+		}
+		assert_eq!(found.as_deref(), Some(bin_path.as_path()));
 	}
 
 	/// A venv at a parent of the active folder isn't visible from

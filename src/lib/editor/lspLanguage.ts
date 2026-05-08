@@ -21,6 +21,7 @@ const BY_EXTENSION: Record<string, string> = {
 	cjs: 'javascript',
 	jsx: 'javascriptreact',
 	rs: 'rust',
+	go: 'go',
 	py: 'python',
 	// `.pyi` is a type-stub file — same language id as a real
 	// `.py`, ty consumes both. (We don't surface a separate

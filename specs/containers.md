@@ -248,22 +248,27 @@ What `moon-base` ships:
   toolchain, `fnm` + Node LTS + Corepack (so `.nvmrc` /
   `.node-version` auto-switch with auto-install on `cd`, and
   `pnpm` / `yarn` resolve from each project's `packageManager`
-  field), `uv` (Astral's Python toolchain manager), the `hf`
-  CLI installed via `uv tool` so its dep tree stays isolated,
-  and `gh` from GitHub's official apt repo. Comfort tooling:
-  `git`, `ripgrep`, `fzf`, `bat`, `jq`. None of these lock a
-  language version on the team — projects opt in via their own
-  `.nvmrc` / `rust-toolchain.toml` / `pyproject.toml`, and
-  `rustup toolchain install nightly` or `uv python install 3.10`
-  on top of `moon-base` covers the rest.
+  field), `uv` (Astral's Python toolchain manager), Go (pinned
+  via `GO_VERSION`, installed user-mode under
+  `~/.local/go`), the `hf` CLI installed via `uv tool` so its
+  dep tree stays isolated, and `gh` from GitHub's official apt
+  repo. Comfort tooling: `git`, `ripgrep`, `fzf`, `bat`, `jq`.
+  None of these lock a language version on the team — projects
+  opt in via their own `.nvmrc` / `rust-toolchain.toml` /
+  `pyproject.toml` / `go.mod`, and `rustup toolchain install
+nightly` or `uv python install 3.10` on top of `moon-base`
+  covers the rest.
 - **Language servers**: `rust-analyzer` (via
-  `rustup component add`). The moon-ide LSP broker probes for
-  this on first `.rs` open and runs the server inside the
-  container via `docker exec` when present, so a developer
-  who hasn't installed `rust-analyzer` on their host still
-  gets Rust diagnostics, hover, and goto-def. Python / JS
-  language servers follow the same pattern when they're
-  wired in — see [LSP](lsp.md#container-backed-lsp).
+  `rustup component add`) and `gopls` (via
+  `go install golang.org/x/tools/gopls@latest`). The moon-ide
+  LSP broker probes for these on first `.rs` / `.go` open and
+  runs the server inside the container via `docker exec` when
+  present, so a developer who hasn't installed the toolchain
+  on their host still gets diagnostics, hover, and goto-def.
+  Python / JS language servers follow the same pattern via
+  per-project install (`uv add --dev ty`,
+  `bun add -D @typescript/native-preview`) — see
+  [LSP](lsp.md#container-backed-lsp).
 - **WebKitGTK dev libraries** so a fresh moon-ide checkout is
   buildable inside its own container (the bootstrap concern
   from [ADR 0005](decisions/0005-bootstrap.md)).

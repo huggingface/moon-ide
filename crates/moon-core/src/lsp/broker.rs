@@ -29,8 +29,8 @@ use tokio::sync::{broadcast, Mutex};
 
 use super::client::LspClientError;
 use super::server::{
-	container_binary_path, discover_binary, LspBinarySpec, LspServer, LspServerEvent, PathTranslator, PYTHON_SERVER,
-	RUST_SERVER, TS_SERVER,
+	container_binary_path, discover_binary, LspBinarySpec, LspServer, LspServerEvent, PathTranslator, GO_SERVER,
+	PYTHON_SERVER, RUST_SERVER, TS_SERVER,
 };
 use super::spawn::LspSpawner;
 
@@ -157,6 +157,7 @@ impl LspBroker {
 			"typescript" | "typescriptreact" | "javascript" | "javascriptreact" => Some(&TS_SERVER),
 			"rust" => Some(&RUST_SERVER),
 			"python" => Some(&PYTHON_SERVER),
+			"go" => Some(&GO_SERVER),
 			_ => None,
 		}
 	}
@@ -314,21 +315,23 @@ impl LspBroker {
 			},
 		};
 
-		// `--version` probe keeps us honest: resolving a path
-		// doesn't prove the file is executable on the target
-		// (Linux-only binary in a node_modules installed from a
-		// macOS host, or a rustup shim for a component that
-		// isn't actually installed). The probe uses the same
-		// build-command pipeline the real spawn will, so if it
-		// clears we know framing + stdio wiring work.
+		// `<bin> <probe_args…>` keeps us honest: resolving a
+		// path doesn't prove the file is executable on the
+		// target (Linux-only binary in a node_modules installed
+		// from a macOS host, or a rustup shim for a component
+		// that isn't actually installed). The probe uses the
+		// same build-command pipeline the real spawn will, so
+		// if it clears we know framing + stdio wiring work.
+		// Argv is per-spec — most servers accept `--version`,
+		// gopls is the odd one out with subcommand syntax.
 		let bin_str = bin_path.to_string_lossy();
-		if !route.spawner.probe(&bin_str).await {
+		if !route.spawner.probe(&bin_str, spec.probe_args).await {
 			tracing::info!(
 				bin = spec.bin_name,
 				lang = spec.language_id,
 				path = %bin_str,
-				"lsp: probe `{} --version` failed on this route",
-				bin_str,
+				probe_args = ?spec.probe_args,
+				"lsp: probe failed on this route"
 			);
 			return SpawnOutcome::Unavailable;
 		}
