@@ -563,3 +563,31 @@ button:focus-visible {
 .cm-git-overview-deleted {
 	background: var(--m-danger);
 }
+
+/* Inline link-like button used by the coder tool body components
+   (grep hits, read_file / write_file / edit_file path headers,
+   list_dir file entries) to make file references clickable. We
+   use a real `<button>` rather than `<a>` because navigation
+   goes through the workspace store (tabs, splits, pending jumps)
+   not URL routing. The class strips the native chrome and the
+   button reads as an underlined accent string in monospace
+   context — same affordance as a hyperlink, no extra surprise. */
+.tool-link {
+	appearance: none;
+	background: transparent;
+	border: 0;
+	padding: 0;
+	font: inherit;
+	color: var(--m-accent, var(--m-fg));
+	text-align: left;
+	cursor: pointer;
+}
+.tool-link:hover,
+.tool-link:focus-visible {
+	text-decoration: underline;
+}
+.tool-link:focus-visible {
+	outline: 1px solid var(--m-accent, var(--m-fg));
+	outline-offset: 1px;
+	border-radius: 2px;
+}

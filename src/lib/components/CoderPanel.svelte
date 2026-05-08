@@ -7,6 +7,11 @@
 	import CoderConnectModal from './CoderConnectModal.svelte';
 	import CoderMarkdown from './CoderMarkdown.svelte';
 	import CoderThinking from './CoderThinking.svelte';
+	import ToolBodyEditFile from './ToolBodyEditFile.svelte';
+	import ToolBodyGrep from './ToolBodyGrep.svelte';
+	import ToolBodyListDir from './ToolBodyListDir.svelte';
+	import ToolBodyReadFile from './ToolBodyReadFile.svelte';
+	import ToolBodyWriteFile from './ToolBodyWriteFile.svelte';
 	import TerminalTargetIcon from './TerminalTargetIcon.svelte';
 	import ContextRing from './ContextRing.svelte';
 	import ChatBubbleIcon from './icons/ChatBubbleIcon.svelte';
@@ -849,6 +854,45 @@
 							<pre class="block">{fmtArgs(row.result)}</pre>
 						{/if}
 					{/if}
+				{:else if row.name === 'read_file'}
+					<!-- File-viewer view: path header, line numbers
+						 in a sticky column, syntax-highlighted code
+						 in a scroll column. Same `@lezer/highlight`
+						 pipeline that paints fenced blocks in the
+						 markdown renderer, so a `.ts` snippet here
+						 shares colours with the live editor. The
+						 component falls back to the JSON view on
+						 unrecognised payload shapes itself. -->
+					<ToolBodyReadFile args={row.args} result={row.result} hasResult={row.hasResult} />
+				{:else if row.name === 'write_file'}
+					<!-- File-write view: header `wrote <path> · N kB`,
+						 then the content rendered the same way as
+						 `read_file` (line numbers + highlighting).
+						 Lets the user see exactly what landed on
+						 disk without an extra `read_file` round-trip. -->
+					<ToolBodyWriteFile args={row.args} result={row.result} hasResult={row.hasResult} />
+				{:else if row.name === 'edit_file'}
+					<!-- Edit view: unified-diff style with a tinted
+						 red `find` block and a tinted green `replace`
+						 block. No syntax highlighting on the diff
+						 sides — partial-grammar colouring of a
+						 mid-expression edit is more often wrong than
+						 right; the diff colours carry the signal. -->
+					<ToolBodyEditFile args={row.args} result={row.result} hasResult={row.hasResult} />
+				{:else if row.name === 'grep'}
+					<!-- Grep view: pattern in a chip, count + truncation
+						 flag in the meta line, then a scrollable hit
+						 list with `path:line  text` columns. Reads
+						 like `rg -n` output, which is also what the
+						 model sees in its own context. -->
+					<ToolBodyGrep args={row.args} result={row.result} hasResult={row.hasResult} />
+				{:else if row.name === 'list_dir'}
+					<!-- Listing view: kind glyph + name per row, with
+						 directories accented and getting a trailing
+						 `/`. A scrollable column so a large
+						 `node_modules`-style listing doesn't push the
+						 transcript page-tall. -->
+					<ToolBodyListDir args={row.args} result={row.result} hasResult={row.hasResult} />
 				{:else}
 					<div class="block-label">args</div>
 					<pre class="block">{fmtArgs(row.args)}</pre>
