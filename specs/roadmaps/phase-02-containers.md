@@ -10,12 +10,13 @@ defer to specific milestones.
 
 ### 2.0 — Container plumbing
 
-**Acceptance**: opening a workspace that has no `.moon/`
-folder shows a "Run this project in a container? [Set up | Not
-now]" prompt in a new "Container" status-bar pip. "Set up"
-writes a default `<workspace>/.moon/compose.yaml` (with an
-`include:` block for any sibling `docker-compose.yml` files
-moon-ide spotted), pulls `moon-base`, and brings up the whole
+**Acceptance**: opening a workspace that hasn't been
+containerised yet shows a "Run this project in a container?
+[Set up | Not now]" prompt in a new "Container" status-bar
+pip. "Set up" writes a default workspace `compose.yaml` to
+moon-ide's per-workspace state directory (with an `include:`
+block for any sibling `docker-compose.yml` files moon-ide
+spotted), pulls `moon-base`, and brings up the whole
 compose project — the workspace's `dev` service _and_ the
 included project services as siblings on the host's daemon.
 Subsequent opens unpause the project; closing the window
@@ -35,10 +36,11 @@ What ships:
 - Compose discovery + generation logic ✅
   (`crates/moon-container/src/{discovery,compose,project}.rs`):
   scans the workspace root and one level deep for
-  `docker-compose.yml` / `compose.yaml`, writes
-  `<workspace>/.moon/compose.yaml` with the discovered files
-  in `include:` plus a `dev` service. Generation runs once on
-  first opt-in; the file is user-owned thereafter.
+  `docker-compose.yml` / `compose.yaml`, writes a workspace
+  `compose.yaml` into moon-ide's per-workspace state directory
+  with the discovered files in `include:` plus a `dev` service.
+  Generation runs once on first opt-in; the file is user-owned
+  thereafter.
 - `moon-base` Dockerfile (✅ in tree) + GitHub Actions workflow
   (✅ [`.github/workflows/moon-base.yml`](../../.github/workflows/moon-base.yml))
   publishing a multi-arch manifest
@@ -245,7 +247,7 @@ with their re-visit triggers; the short list:
 ## 2.0.5 — workspace ≠ folder (shipped)
 
 The original 2.0 wiring keyed compose state off the active
-folder: state at `<workspace>/.moon/compose.yaml`, project
+folder: state next to that folder's source tree, project
 name hashed from the folder path, container recreated on every
 folder switch. That conflation is incoherent the moment a
 single moon-ide window holds multiple folders, so once

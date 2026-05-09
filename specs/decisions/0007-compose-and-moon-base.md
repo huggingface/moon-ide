@@ -48,16 +48,22 @@ Three things made the default unattractive for moon-ide:
 
 Two parts, intentionally bundled.
 
-### 1. `<workspace>/.moon/compose.yaml` is the native format
+### 1. `compose.yaml` is the native format
 
 Standard Docker Compose syntax. moon-ide reads it on every
 workspace open, parses just enough to find the service it
 attaches to (`x-moon.shell-service` extension key), and
-otherwise lets compose own its semantics.
+otherwise lets compose own its semantics. The file lives
+in moon-ide's per-workspace state directory; see the
+[state-dir amendment below](#amendment-2026-04-29--state-dir-and-multi-folder-mounts)
+for the path and rationale.
 
 Generated once on first opt-in with sane defaults
-(see [`containers.md`](../containers.md#workspace-config-composeyaml));
-user-owned thereafter — moon-ide never writes back.
+(see [`containers.md`](../containers.md#workspace-config-composeyaml)).
+The "user-owned thereafter — moon-ide never writes back"
+contract from the original wording was relaxed by the same
+amendment, which made the file a derived artefact of the
+bound-folder set.
 
 Reading existing `.devcontainer/devcontainer.json` files (for
 interop with repos shared with non-moon-ide users) is a
@@ -193,7 +199,8 @@ Reversible, with cost.
 ## Amendment (2026-04-29) — state dir and multi-folder mounts
 
 The original wording put `compose.yaml` inside the workspace
-itself (`<workspace>/.moon/compose.yaml`), and described the
+itself (next to the user's source tree, in a
+moon-ide-managed subdirectory), and described the
 "workspace" as if it were one folder. Phase 2.5's multi-folder
 UX makes that conflation incoherent: a workspace is now a list
 of folders, the active one swaps without compose-project

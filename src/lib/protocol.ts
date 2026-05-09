@@ -550,10 +550,9 @@ export type RightPanelKind = 'chat' | 'coder';
 
 /**
  * Coder-specific slice of [`AppState`]. Only frontend-side
- * affordance pointers — actual session content lives under each
- * workspace folder at
- * `<folder>/.moon/agent-sessions/<id>.jsonl`. Mirrors
- * `moon_protocol::app_state::CoderAppState`.
+ * affordance pointers — actual session content lives under
+ * `<XDG_DATA_HOME>/moon-ide/coder-sessions/<project-slug>/<id>.jsonl`.
+ * Mirrors `moon_protocol::app_state::CoderAppState`.
  */
 export type CoderAppState = {
 	/**

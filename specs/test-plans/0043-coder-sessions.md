@@ -3,12 +3,19 @@
 - **Date**: 2026-05-05
 - **Phase**: 6.3 — Sessions on disk
 
+> Superseded by [test plan 0044](0044-coder-polish.md), which
+> moved sessions out of the project tree into
+> `<XDG_DATA_HOME>/moon-ide/coder-sessions/<project-slug>/`.
+> The paths in this plan describe the location that shipped at
+> 6.3 time and was replaced soon after; rerunning this plan
+> verbatim against current builds will not find files there.
+
 ## What shipped
 
 - Per-workspace sessions persisted as JSONL under
-  `<workspace>/.moon/agent-sessions/<id>.jsonl`. Header line
-  carries `schema, id, title, created_at_ms, updated_at_ms,
-model`; body lines are tagged `SessionRecord`s
+  the project's source tree (`agent-sessions/<id>.jsonl`).
+  Header line carries `schema, id, title, created_at_ms,
+updated_at_ms, model`; body lines are tagged `SessionRecord`s
   (`user`, `assistant`, `tool`, `title_update`).
 - Lazy persistence — empty sessions never write a file, the
   header lands on the first record append.
@@ -32,25 +39,25 @@ model`; body lines are tagged `SessionRecord`s
 
 Prerequisites: `bun install`, `bun run dev`, signed in to
 Hugging Face (per test plan 0039), an active workspace folder
-with `.moon/` writable.
+that the IDE can persist sessions for.
 
 ### Lazy persistence + first turn
 
 1. Open the coder panel, hit the `+` icon to start a fresh
    session. Expected: empty transcript with the placeholder
-   "Send a prompt to start." line. No file under
-   `<workspace>/.moon/agent-sessions/` yet — confirm with
-   `ls -la <workspace>/.moon/agent-sessions/ 2>/dev/null`.
+   "Send a prompt to start." line. No JSONL file for the
+   session in the sessions directory yet (see superseded note
+   above for the path this plan originally targeted).
 
 2. Send `summarise the structure of crates/moon-coder in 3
 sentences`.
 
    Expected:
    - The transcript fills in via streaming as before.
-   - A new file appears at
-     `<workspace>/.moon/agent-sessions/sess-<...>.jsonl`. First
-     line is the header with `title` set to the truncated
-     prompt; each event in the turn lands as one body line.
+   - A new file appears in the sessions directory named
+     `sess-<...>.jsonl`. First line is the header with `title`
+     set to the truncated prompt; each event in the turn lands
+     as one body line.
    - In the panel's sticky session-bar, the title shows the
      truncated prompt.
 

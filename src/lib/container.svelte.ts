@@ -160,7 +160,7 @@ class ContainerPanelState {
 	}
 
 	/**
-	 * Fetch the would-be `.moon/compose.yaml` and cache it for the
+	 * Fetch the would-be workspace `compose.yaml` and cache it for the
 	 * preview panel. Cheap, no daemon round-trip — purely a render of
 	 * the discovery + generator output.
 	 */

@@ -174,7 +174,7 @@ What ships:
 ### 6.3 — Sessions on disk + auto-rename — **done** (todo_write deferred)
 
 **Acceptance**: every prompt/turn is persisted to JSONL under
-`<workspace>/.moon/agent-sessions/`. The panel surfaces a
+`<XDG_DATA_HOME>/moon-ide/coder-sessions/<project-slug>/`. The panel surfaces a
 sessions list (with a sticky `+` button) and an in-session
 header (with `← Sessions | title | +`). Clicking a session opens
 it; hover-revealed trash icon + confirm dialog deletes.
@@ -280,16 +280,15 @@ What ships:
 
 **Acceptance**: the agent's system prompt includes (a) the
 hardcoded base, (b) `AGENTS.md` walked from the active workspace
-folder, (c) `<workspace>/.moon/SYSTEM.md` if present, (d) a list
-of discovered `SKILL.md` files with their frontmatter
-descriptions. The agent can `read_file` a skill body when it
-decides to use one. The panel surfaces context-window usage as a
-ring around the new-session button so the user sees compaction
-coming before it lands.
+folder, (c) a list of discovered `SKILL.md` files with their
+frontmatter descriptions. The agent can `read_file` a skill body
+when it decides to use one. The panel surfaces context-window
+usage as a ring around the new-session button so the user sees
+compaction coming before it lands.
 
 What ships:
 
-- Skill discovery walks `skills/`, `.moon/skills/`,
+- Skill discovery walks `skills/`,
   `.claude/skills/`, `.cursor/skills/`, `.cursor/skills-*/`,
   `.agents/skills/` (recursively, one level deep) for
   `SKILL.md` files under the active workspace folder and its

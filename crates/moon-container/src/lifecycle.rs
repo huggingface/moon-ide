@@ -21,9 +21,8 @@
 //! State directory layout
 //! ----------------------
 //!
-//! Pre-2.5 the file lived at `<workspace>/.moon/compose.yaml`.
-//! Post-2.5 it's at `<state_dir>/compose.yaml` where `state_dir`
-//! is `~/.local/share/moon-ide/workspaces/<id>/` — outside any
+//! `<state_dir>/compose.yaml` where `state_dir` is
+//! `~/.local/share/moon-ide/workspaces/<id>/` — outside any
 //! repo, decoupled from any specific folder. Sibling
 //! `bound-folders.json` records the bound-folder set the
 //! `compose.yaml` was generated from; the lifecycle layer treats

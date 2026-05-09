@@ -69,7 +69,7 @@ contribute-repos` scopes (deliberately weaker than `manage-repos`
   knowing or caring. IDE-native tools (`goto_definition`,
   `find_references`, `git_status`, `git_diff`) follow as separate
   commits when proven needed.
-- **Sessions**: append-only JSONL in `<workspace>/.moon/agent-sessions/`,
+- **Sessions**: append-only JSONL under `<XDG_DATA_HOME>/moon-ide/coder-sessions/`,
   mirrored to a per-user private HF bucket (`<user>/moon-ide-sessions`,
   one folder per workspace) via `hf-xet` + the `repo_type="bucket"`
   Hub APIs. Sync is on-by-default with a per-workspace opt-out toggle
@@ -138,10 +138,10 @@ team's IDE". We deliberately skip:
   somebody surfaces a concrete request.
 
 The one extensibility surface we _do_ keep is **`SKILL.md` discovery**
-(reading `AGENTS.md` and any `.moon/skills/` / `.cursor/skills*/` /
-`.agents/skills/` files into the system prompt), because that's a
-file convention, not code, and the moon-ide repo itself already
-participates in it.
+(reading `AGENTS.md` and any `skills/` / `.claude/skills/` /
+`.cursor/skills*/` / `.agents/skills/` files into the system
+prompt), because that's a file convention, not code, and the
+moon-ide repo itself already participates in it.
 
 ## Consequences
 

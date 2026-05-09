@@ -405,14 +405,11 @@ Concatenated, in this order, with `\n\n` between sections:
    is on the 6.6 work list — today the read is "active folder
    root only" since that's where every team we've seen actually
    keeps these files.
-3. `<workspace>/.moon/SYSTEM.md` if present (project-specific
-   override — used to extend, not replace, the base prompt).
-4. **Skills** discovered from these directories under the active
+3. **Skills** discovered from these directories under the active
    workspace folder (or any parent — same walk-up convention as
    `AGENTS.md`):
    - `skills/<name>/SKILL.md` — the project-local convention used
      by `agentskills.io` and the `pi`/`claude` agent ecosystem.
-   - `.moon/skills/<name>/SKILL.md`
    - `.claude/skills/<name>/SKILL.md`
    - `.cursor/skills/<name>/SKILL.md` and `.cursor/skills-*/<name>/SKILL.md`
    - `.agents/skills/<name>/SKILL.md`
@@ -472,12 +469,12 @@ releases apply retroactively. The header carries metadata
 `model`); a `title_update` record overrides the header's title on
 load (auto-rename uses this — see below).
 
-Sessions explicitly **don't** live inside the project tree
-(`<workspace>/.moon/...`). They're personal scratch / history
-rather than project artefacts: putting them under VCS would
-either litter `git status` or force a `.gitignore` entry every
-team adds blind, and tying them to the on-disk path rather than
-the user's account would make them follow a `git mv` of the repo
+Sessions explicitly **don't** live inside the project tree.
+They're personal scratch / history rather than project
+artefacts: putting them under VCS would either litter
+`git status` or force a `.gitignore` entry every team adds
+blind, and tying them to the on-disk path rather than the
+user's account would make them follow a `git mv` of the repo
 in confusing ways. The shared `moon-ide/` data dir under
 `XDG_DATA_HOME` (next to compose state) is the right home.
 
@@ -972,8 +969,8 @@ no shared component. ADR 0003 ("no adapter layer") still applies.
 ## Out of scope (explicitly)
 
 - **Pluggable agent binaries** (ACP) — superseded by ADR 0010.
-- **Plan mode** — the team can write plans into `AGENTS.md` /
-  `SYSTEM.md`. Reconsider when somebody asks.
+- **Plan mode** — the team can write plans into `AGENTS.md`.
+  Reconsider when somebody asks.
 - **Permission popups** — see "Permissions" above.
 - **MCP** — same posture as pi.
 - **Per-sub-agent abort UI** — parent abort cascades to all live sub-agents via child `CancellationToken`s; individual cancel buttons are deferred until a real workload calls for them.

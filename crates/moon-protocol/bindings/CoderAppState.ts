@@ -4,8 +4,10 @@
  * Coder-specific slice of [`AppState`].
  *
  * Only frontend-side affordance pointers — the actual session
- * content lives under each workspace folder at
- * `<folder>/.moon/agent-sessions/<id>.jsonl`, not here.
+ * content lives under
+ * `<XDG_DATA_HOME>/moon-ide/coder-sessions/<project-slug>/<id>.jsonl`,
+ * not here. See [`crate::session`] / `crates/moon-coder/src/sessions.rs`
+ * for the on-disk format.
  */
 export type CoderAppState = { 
 /**

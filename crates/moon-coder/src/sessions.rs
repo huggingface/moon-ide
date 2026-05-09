@@ -9,16 +9,16 @@
 //!
 //! ## Why a global data dir, not the project tree
 //!
-//! Storing sessions inside the project (`<workspace>/.moon/...`)
-//! puts them under version control by default and on the user's
-//! laptop rather than tied to their account. Both wrong:
-//! sessions are personal scratch / history, not project artefacts.
-//! The new layout sits next to compose state under
-//! `<XDG_DATA_HOME>/moon-ide/`, with a `<project-slug>/`
-//! subdirectory derived deterministically from the absolute
-//! folder path so the same project always maps to the same
-//! directory across launches and across teammates' machines maps
-//! to *different* directories (their absolute paths differ).
+//! Storing sessions inside the project tree puts them under
+//! version control by default and on the user's laptop rather
+//! than tied to their account. Both wrong: sessions are personal
+//! scratch / history, not project artefacts. The layout sits
+//! next to compose state under `<XDG_DATA_HOME>/moon-ide/`, with
+//! a `<project-slug>/` subdirectory derived deterministically
+//! from the absolute folder path so the same project always
+//! maps to the same directory across launches and across
+//! teammates' machines maps to *different* directories (their
+//! absolute paths differ).
 //!
 //! ## Project slug
 //!
@@ -237,7 +237,7 @@ fn fnv1a32_hex(s: &str) -> String {
 
 /// Generate a fresh session id. Prefixed with the local-date so
 /// sorting by id roughly matches sorting by creation time, which
-/// helps when staring at a `ls` of `.moon/agent-sessions/`.
+/// helps when staring at a `ls` of the sessions directory.
 pub fn new_session_id() -> String {
 	let ts = current_time_ms();
 	let random: u32 = rand_suffix();

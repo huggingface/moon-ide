@@ -74,11 +74,11 @@ pub fn context_window_for(model_slug: &str) -> u32 {
 	128_000
 }
 
-/// Phase-6.2 system prompt. A real version that pulls in `AGENTS.md`,
-/// `<workspace>/.moon/SYSTEM.md`, and discovered `SKILL.md` files
-/// lands in 6.6 — see `specs/coder.md` § "What the LLM sees as
-/// system prompt". This stub establishes the shape and gives the
-/// model a usable identity for the early test loops.
+/// Phase-6.2 system prompt. A real version that pulls in `AGENTS.md`
+/// and discovered `SKILL.md` files lands in 6.6 — see
+/// `specs/coder.md` § "What the LLM sees as system prompt". This
+/// stub establishes the shape and gives the model a usable
+/// identity for the early test loops.
 pub const PHASE_6_0_SYSTEM_PROMPT: &str = r#"You are moon-coder, the AI coding assistant inside the moon-ide editor.
 
 You can call tools to read files, list directories, search the workspace, run bash commands, and edit files. Use them whenever you need to inspect or change the codebase — never guess at file contents. Keep tool calls focused: prefer one targeted `grep` over scanning every file.

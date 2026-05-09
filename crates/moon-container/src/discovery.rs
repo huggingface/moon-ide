@@ -48,8 +48,6 @@
 //! What we skip
 //! ------------
 //!
-//! - The generated `.moon/` directory (we'd self-reference,
-//!   producing an include cycle).
 //! - Hidden directories (`.git`, `.cache`, `.cargo`, …) — by
 //!   leading-dot convention.
 //! - Conventional build artefact directories (`node_modules`,
@@ -173,14 +171,6 @@ fn scan_dir(dir: &Utf8Path, workspace_root: &Utf8Path, by_dir: &mut BTreeMap<Utf
 		let Some(rel) = relative_to(workspace_root, &candidate) else {
 			continue;
 		};
-		// `.moon/compose.yaml` is moon-ide's own output; including
-		// it would cycle. The check is on the raw relative path
-		// rather than the dir name so a user who happens to have
-		// a top-level dir literally named `.moon` still gets the
-		// cycle-protection.
-		if rel.starts_with(".moon") {
-			continue;
-		}
 		// Per directory, keep the highest-precedence file (lowest
 		// numeric value); ignore the rest.
 		let entry = by_dir.entry(dir.to_path_buf()).or_insert_with(|| FoundFile {
@@ -199,7 +189,6 @@ fn scan_dir(dir: &Utf8Path, workspace_root: &Utf8Path, by_dir: &mut BTreeMap<Utf
 /// `node_modules`, `target`, etc. — directories where finding a
 /// compose file would be a false positive.
 const SKIP_DIR_NAMES: &[&str] = &[
-	".moon",
 	"node_modules",
 	"target",
 	"dist",
@@ -329,20 +318,6 @@ mod tests {
 		let root = root(&tmp);
 		touch(&root.join("a/b/docker-compose.yml"));
 		assert!(discover_compose_files(&root).files.is_empty());
-	}
-
-	#[test]
-	fn skips_self_generated_moon_compose() {
-		let tmp = tempdir().unwrap();
-		let root = root(&tmp);
-		touch(&root.join(".moon/compose.yaml"));
-		// Plus a real one elsewhere, to confirm we filter rather
-		// than empty-result-on-any-self-match.
-		touch(&root.join("svc/docker-compose.yml"));
-
-		let result = discover_compose_files(&root);
-		assert_eq!(result.files.len(), 1);
-		assert_eq!(result.files[0].relative_path, "svc/docker-compose.yml");
 	}
 
 	#[test]

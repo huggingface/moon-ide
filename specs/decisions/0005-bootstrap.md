@@ -40,8 +40,8 @@ These also drive Phase 4 (LSP) and Phase 8 (lint/format) priority.
 ### Container image for Moon IDE itself
 
 Moon IDE is itself a workspace; per
-[`containers.md`](../containers.md) it ships a
-`<workspace>/.moon/compose.yaml` (added in Phase 2) referencing the
+[`containers.md`](../containers.md) opening it generates a
+workspace `compose.yaml` (added in Phase 2) referencing the
 moon-published `moon-base` image, which carries:
 
 - A modern Linux base (Debian stable) with `libwebkit2gtk-4.1-dev`,

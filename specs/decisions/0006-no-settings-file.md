@@ -5,7 +5,7 @@ Status: accepted
 
 ## Context
 
-Phase 1 shipped a `<workspace>/.moon/settings.json` with three sections:
+Phase 1 shipped a per-project `settings.json` (committed to the repo) with three sections:
 
 - `editor`: `tab_size`, `insert_spaces`, `format_on_save`, `render_tabs`.
 - `keymap`: a `Record<string, string>` of command → shortcut.
@@ -66,8 +66,13 @@ When the final roadmap phase lands and we declare a stable user-facing
 surface, the question "is this per-project or per-user?" gets a clear
 answer:
 
-- per-project → `.editorconfig` (or a future moon-specific `.moon/`
-  file if a real concrete need shows up that editorconfig can't model).
+- per-project → `.editorconfig`. moon-ide deliberately does not
+  layer its own per-project config on top: format-on-save reads
+  the project's existing tooling (`lint-staged`, `package.json`
+  scripts, `editorconfig`), language services come from the
+  project's own toolchain. Adding a `moon`-specific per-project
+  file would create a parallel source of truth where there's
+  already an established one.
 - per-user → `AppState`.
 
 ## Consequences

@@ -55,7 +55,7 @@ If moon-ide's own source tree contains a file of some format, supporting that fo
 
 ### No premature migrations
 
-Until the roadmap's last phase ships, there is no "user installed base" worth keeping compatible with. Schemas (settings files, persisted app state, the JSON-RPC protocol, the `.moon/` directory layout) can be renamed, restructured, or deleted freely. **Don't write migration code, aliases, or backward-compat shims** for these — the cost is dead code that hides the real schema. Acceptable failure modes when a schema changes:
+Until the roadmap's last phase ships, there is no "user installed base" worth keeping compatible with. Schemas (persisted app state, the JSON-RPC protocol, the per-workspace state directory, the coder session JSONL header) can be renamed, restructured, or deleted freely. **Don't write migration code, aliases, or backward-compat shims** for these — the cost is dead code that hides the real schema. Acceptable failure modes when a schema changes:
 
 - The dev (whoever's running moon-ide on their machine) loses their last session / open tabs / persisted app state once. They reopen the folder; life goes on.
 - A best-effort `tracing::warn!` on a parse failure is fine; falling back to defaults is fine; crashing on startup is **not**.

@@ -21,7 +21,8 @@ container needs. There are three candidate models:
    project compose runs nested. We landed this in
    `8b5a2f7` / `026d410` and walked it back in this ADR.
 2. **Sibling services on the host's daemon, via compose
-   `include:`.** moon-ide generates `<workspace>/.moon/compose.yaml`,
+   `include:`.** moon-ide generates a workspace-level
+   `compose.yaml` (in moon-ide's per-workspace state directory),
    which `include:`s the project's own `docker-compose.yml`
    and adds a `dev` service alongside. Everything runs on the
    user's host daemon as one compose project.
@@ -51,7 +52,7 @@ Concretely:
 
 - `moon-base` does not embed dockerd, fuse-overlayfs,
   iptables, or a docker CLI.
-- The generated `<workspace>/.moon/compose.yaml` does **not**
+- The generated workspace `compose.yaml` does **not**
   set `privileged: true` on the `dev` service.
 - When moon-ide spots a sibling `docker-compose.yml` (at the
   workspace root or in any first-level repo) it adds an
