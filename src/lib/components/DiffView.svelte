@@ -6,7 +6,7 @@
 	import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
 	import { bracketMatching, indentOnInput, indentUnit } from '@codemirror/language';
 	import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from '@codemirror/autocomplete';
-	import { MergeView, goToNextChunk, goToPreviousChunk } from '@codemirror/merge';
+	import { MergeView, diff as rawDiff, goToNextChunk, goToPreviousChunk } from '@codemirror/merge';
 	import { ipc } from '../ipc';
 	import { workspace, type OpenFile, type SplitSide } from '../state.svelte';
 	import { highlightTabs } from '../editor/highlightTabs';
@@ -303,6 +303,33 @@
 			// file with one edit at line 2500 still lands the
 			// user at the change.
 			revertControls: 'a-to-b',
+			diffConfig: {
+				// `MergeView` defaults to `presentableDiff`, which
+				// runs a final `mergeAdjacent(changes, 3)` step that
+				// fuses any two changes separated by fewer than 3
+				// unchanged characters. In dense code (think
+				// `}, { foo: bar` or `request.status = 200; now`)
+				// that fuses small real edits together with their
+				// surrounding punctuation, and the visual changed-
+				// text highlight then spans many unchanged lines
+				// between the first and last actual change — even
+				// though the change-bar gutter (which uses our own
+				// `gitChangesExtension` diff path) shows the right
+				// per-line picture next to it.
+				//
+				// The raw `diff` only merges truly-adjacent changes
+				// (`mergeAdjacent(_, 1)`), so the highlight tracks
+				// what actually differs character-by-character. We
+				// lose `presentableDiff`'s word-boundary alignment
+				// (a `foo` → `fooz` rename highlights `o` → `oz`
+				// rather than the whole word), which is a
+				// readability regression but a small one — the
+				// surrounding monospace + the per-line gutter still
+				// make the change obvious. If the unaligned edges
+				// become a problem we can re-introduce the word-
+				// alignment loop without the 3-char merge step.
+				override: rawDiff,
+			},
 		});
 
 		const chunks = merge.chunks;
