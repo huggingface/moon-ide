@@ -307,23 +307,34 @@
 				// `MergeView` defaults to `presentableDiff`, which
 				// runs a final `mergeAdjacent(changes, 3)` step that
 				// fuses any two changes separated by fewer than 3
-				// unchanged characters. In dense code (think
-				// `}, { foo: bar` or `request.status = 200; now`)
-				// that fuses small real edits together with their
-				// surrounding punctuation, and the visual changed-
-				// text highlight then spans many unchanged lines
-				// between the first and last actual change — even
-				// though the change-bar gutter (which uses our own
-				// `gitChangesExtension` diff path) shows the right
-				// per-line picture next to it.
+				// unchanged *characters* (not lines — the threshold
+				// is character distance in both A and B).
 				//
-				// The raw `diff` only merges truly-adjacent changes
-				// (`mergeAdjacent(_, 1)`), so the highlight tracks
-				// what actually differs character-by-character. We
-				// lose `presentableDiff`'s word-boundary alignment
-				// (a `foo` → `fooz` rename highlights `o` → `oz`
-				// rather than the whole word), which is a
-				// readability regression but a small one — the
+				// On its own that sounds harmless, but a single
+				// `Change` object can already span many lines: when
+				// you insert a multi-line block, the newlines live
+				// inside `fromB..toB` of one `Change`. In a refactor
+				// like `{ $set: {status, rejectionReason} }` →
+				// a multi-line aggregation pipeline, the diff finds
+				// short common substrings (`"status"`, `", "`) inside
+				// the new text and emits the inserts on either side
+				// as separate `Change`s only 1–2 chars apart. The
+				// 3-char merge then fuses those, and because each
+				// half was already multi-line, the merged `Change`
+				// — and so the saturated `cm-changedText` — covers
+				// several lines of mostly-new content with a few
+				// matched substrings inlined. Visually that reads
+				// as "the highlight jumped across unchanged text".
+				//
+				// The raw `diff` only does the gap-1 merge that
+				// `normalize` runs anyway, so each highlighted span
+				// is one contiguous insertion or replacement and any
+				// matched substring (e.g. `"status"`) drops out of
+				// the saturated highlight. The cost is losing the
+				// word-boundary alignment `presentableDiff` does
+				// before the merge step (a `foo` → `fooz` rename
+				// highlights `o` → `oz` rather than the whole word),
+				// which is a small readability regression — the
 				// surrounding monospace + the per-line gutter still
 				// make the change obvious. If the unaligned edges
 				// become a problem we can re-introduce the word-
