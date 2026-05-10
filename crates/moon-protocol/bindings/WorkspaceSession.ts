@@ -2,9 +2,12 @@
 import type { FolderSession } from "./FolderSession";
 
 /**
- * Persisted UI session for the singleton workspace. Holds one
+ * Persisted UI session for one workspace. Holds one
  * [`FolderSession`] per bound folder, plus a pointer to which folder
- * was active at last save.
+ * was active at last save. Lives at
+ * `<workspaces_dir>/<id>/session.json` from Phase 7.5 onward —
+ * previously it was `AppState.last_session` in the global
+ * `state.json`, and the IDE wipes that legacy slot on first run.
  */
 export type WorkspaceSession = { 
 /**

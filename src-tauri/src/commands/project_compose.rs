@@ -24,40 +24,32 @@ use crate::state::AppState;
 /// Payload: [`ProjectComposeStateChange`].
 pub const PROJECT_COMPOSE_STATE_EVENT: &str = "project_compose:state";
 
-/// Resolve a [`ProjectCompose`] for the given folder under the
-/// active workspace.
+/// Resolve a [`ProjectCompose`] for the given folder under this
+/// process's workspace.
 ///
-/// Returns the workspace ID (for the event payload) alongside the
-/// resolved handle. `Ok(None)` for the second return slot means
-/// "the folder is bound but has no compose file at its root";
-/// callers handle that case by reporting an `Absent` snapshot
-/// rather than erroring — that's how the UI tells "no compose"
-/// from "compose down".
-async fn project_handle(
-	state: &AppState,
-	folder_path: &Utf8Path,
-) -> Result<(String, Option<ProjectCompose>), MoonError> {
+/// `Ok(None)` for the second return slot means "the folder is
+/// bound but has no compose file at its root"; callers handle
+/// that case by reporting an `Absent` snapshot rather than
+/// erroring — that's how the UI tells "no compose" from
+/// "compose down".
+async fn project_handle(state: &AppState, folder_path: &Utf8Path) -> Result<Option<ProjectCompose>, MoonError> {
 	let snapshot = state.workspaces.snapshot().await;
-	let workspace_id = snapshot.id.clone();
 	let bound = snapshot.folders.iter().any(|f| Utf8Path::new(&f.path) == folder_path);
 	if !bound {
 		return Err(MoonError::NotFound(format!("folder {folder_path}")));
 	}
-	let pc = ProjectCompose::for_folder(&workspace_id, folder_path)?;
-	Ok((workspace_id, pc))
+	let pc = ProjectCompose::for_folder(&snapshot.id, folder_path)?;
+	Ok(pc)
 }
 
 /// Project handle in the "must exist" form. Used by mutating
 /// commands — calling `up` on a folder that hasn't got a compose
 /// file is a programming error in the UI, not a runtime
 /// condition we want to silently swallow.
-async fn require_project_handle(
-	state: &AppState,
-	folder_path: &Utf8Path,
-) -> Result<(String, ProjectCompose), MoonError> {
-	let (workspace_id, pc) = project_handle(state, folder_path).await?;
-	let pc = pc.ok_or_else(|| MoonError::NotFound(format!("no compose file in {folder_path}")))?;
-	Ok((workspace_id, pc))
+async fn require_project_handle(state: &AppState, folder_path: &Utf8Path) -> Result<ProjectCompose, MoonError> {
+	project_handle(state, folder_path)
+		.await?
+		.ok_or_else(|| MoonError::NotFound(format!("no compose file in {folder_path}")))
 }
 
 fn make_status(folder_path: &Utf8Path, pc: Option<&ProjectCompose>, status: ContainerStatus) -> ProjectComposeStatus {
@@ -86,14 +78,12 @@ fn make_status(folder_path: &Utf8Path, pc: Option<&ProjectCompose>, status: Cont
 /// (the command result is the authoritative success signal).
 async fn snapshot_and_emit(
 	app: &AppHandle,
-	workspace_id: String,
 	folder_path: &Utf8Path,
 	pc: &ProjectCompose,
 ) -> Result<ProjectComposeStatus, MoonError> {
 	let status = pc.status().await?;
 	let project = make_status(folder_path, Some(pc), status);
 	let payload = ProjectComposeStateChange {
-		workspace_id,
 		folder_path: folder_path.to_string(),
 		project: project.clone(),
 	};
@@ -115,7 +105,7 @@ pub async fn project_compose_status(
 	folder_path: String,
 ) -> Result<ProjectComposeStatus, MoonError> {
 	let folder_path = Utf8PathBuf::from(folder_path);
-	let (_, pc) = project_handle(&state, &folder_path).await?;
+	let pc = project_handle(&state, &folder_path).await?;
 	let status = match &pc {
 		Some(pc) => pc.status().await?,
 		None => ContainerStatus {
@@ -133,9 +123,9 @@ pub async fn project_compose_up(
 	folder_path: String,
 ) -> Result<ProjectComposeStatus, MoonError> {
 	let folder_path = Utf8PathBuf::from(folder_path);
-	let (workspace_id, pc) = require_project_handle(&state, &folder_path).await?;
+	let pc = require_project_handle(&state, &folder_path).await?;
 	pc.up().await?;
-	snapshot_and_emit(&app, workspace_id, &folder_path, &pc).await
+	snapshot_and_emit(&app, &folder_path, &pc).await
 }
 
 #[tauri::command]
@@ -145,9 +135,9 @@ pub async fn project_compose_pause(
 	folder_path: String,
 ) -> Result<ProjectComposeStatus, MoonError> {
 	let folder_path = Utf8PathBuf::from(folder_path);
-	let (workspace_id, pc) = require_project_handle(&state, &folder_path).await?;
+	let pc = require_project_handle(&state, &folder_path).await?;
 	pc.pause().await?;
-	snapshot_and_emit(&app, workspace_id, &folder_path, &pc).await
+	snapshot_and_emit(&app, &folder_path, &pc).await
 }
 
 #[tauri::command]
@@ -157,9 +147,9 @@ pub async fn project_compose_resume(
 	folder_path: String,
 ) -> Result<ProjectComposeStatus, MoonError> {
 	let folder_path = Utf8PathBuf::from(folder_path);
-	let (workspace_id, pc) = require_project_handle(&state, &folder_path).await?;
+	let pc = require_project_handle(&state, &folder_path).await?;
 	pc.resume().await?;
-	snapshot_and_emit(&app, workspace_id, &folder_path, &pc).await
+	snapshot_and_emit(&app, &folder_path, &pc).await
 }
 
 #[tauri::command]
@@ -169,9 +159,9 @@ pub async fn project_compose_rebuild(
 	folder_path: String,
 ) -> Result<ProjectComposeStatus, MoonError> {
 	let folder_path = Utf8PathBuf::from(folder_path);
-	let (workspace_id, pc) = require_project_handle(&state, &folder_path).await?;
+	let pc = require_project_handle(&state, &folder_path).await?;
 	pc.rebuild().await?;
-	snapshot_and_emit(&app, workspace_id, &folder_path, &pc).await
+	snapshot_and_emit(&app, &folder_path, &pc).await
 }
 
 /// `docker compose stop` — SIGTERM every service in the project
@@ -185,9 +175,9 @@ pub async fn project_compose_stop(
 	folder_path: String,
 ) -> Result<ProjectComposeStatus, MoonError> {
 	let folder_path = Utf8PathBuf::from(folder_path);
-	let (workspace_id, pc) = require_project_handle(&state, &folder_path).await?;
+	let pc = require_project_handle(&state, &folder_path).await?;
 	pc.stop().await?;
-	snapshot_and_emit(&app, workspace_id, &folder_path, &pc).await
+	snapshot_and_emit(&app, &folder_path, &pc).await
 }
 
 #[tauri::command]
@@ -197,9 +187,9 @@ pub async fn project_compose_down(
 	folder_path: String,
 ) -> Result<ProjectComposeStatus, MoonError> {
 	let folder_path = Utf8PathBuf::from(folder_path);
-	let (workspace_id, pc) = require_project_handle(&state, &folder_path).await?;
+	let pc = require_project_handle(&state, &folder_path).await?;
 	pc.down().await?;
-	snapshot_and_emit(&app, workspace_id, &folder_path, &pc).await
+	snapshot_and_emit(&app, &folder_path, &pc).await
 }
 
 /// `docker compose start <service>` — bring a single created /
@@ -212,9 +202,9 @@ pub async fn project_compose_service_start(
 	service: String,
 ) -> Result<ProjectComposeStatus, MoonError> {
 	let folder_path = Utf8PathBuf::from(folder_path);
-	let (workspace_id, pc) = require_project_handle(&state, &folder_path).await?;
+	let pc = require_project_handle(&state, &folder_path).await?;
 	pc.start_service(&service).await?;
-	snapshot_and_emit(&app, workspace_id, &folder_path, &pc).await
+	snapshot_and_emit(&app, &folder_path, &pc).await
 }
 
 /// `docker compose stop <service>` — SIGTERM a single service's
@@ -227,9 +217,9 @@ pub async fn project_compose_service_stop(
 	service: String,
 ) -> Result<ProjectComposeStatus, MoonError> {
 	let folder_path = Utf8PathBuf::from(folder_path);
-	let (workspace_id, pc) = require_project_handle(&state, &folder_path).await?;
+	let pc = require_project_handle(&state, &folder_path).await?;
 	pc.stop_service(&service).await?;
-	snapshot_and_emit(&app, workspace_id, &folder_path, &pc).await
+	snapshot_and_emit(&app, &folder_path, &pc).await
 }
 
 /// `docker compose restart <service>` — stop + start a single
@@ -243,7 +233,7 @@ pub async fn project_compose_service_restart(
 	service: String,
 ) -> Result<ProjectComposeStatus, MoonError> {
 	let folder_path = Utf8PathBuf::from(folder_path);
-	let (workspace_id, pc) = require_project_handle(&state, &folder_path).await?;
+	let pc = require_project_handle(&state, &folder_path).await?;
 	pc.restart_service(&service).await?;
-	snapshot_and_emit(&app, workspace_id, &folder_path, &pc).await
+	snapshot_and_emit(&app, &folder_path, &pc).await
 }

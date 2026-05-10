@@ -215,13 +215,14 @@ What moves:
 - **State dir**. `compose.yaml` lives at
   `<dirs::data_local_dir>/moon-ide/workspaces/<id>/compose.yaml`
   — outside any specific repo, decoupled from any specific
-  folder. `<id>` is the constant `"default"` until multi-
-  workspace UI ships (Phase 7); the layout is forward-compatible
-  with named workspaces under sibling subdirectories. A
-  sibling `bound-folders.json` records the list of folder paths
-  the file was generated from, so the generator stays
-  deterministic and the workspace's bound set survives an IDE
-  crash without consulting `app_state.json`.
+  folder. `<id>` is the constant `"default"` until Phase 7.2
+  introduces user-named workspaces (slug ids like `huggingface`
+  / `gitaly`, picked at creation time); the layout is
+  forward-compatible with those — they just become sibling
+  subdirectories. A sibling `bound-folders.json` records the
+  list of folder paths the file was generated from, so the
+  generator stays deterministic and the workspace's bound set
+  survives an IDE crash without consulting `app_state.json`.
 - **Project name**. `moon-ws-<id>` (so `moon-ws-default`),
   derived from the workspace id, not a hash of any path. The
   compose project survives folder switches and folder add /

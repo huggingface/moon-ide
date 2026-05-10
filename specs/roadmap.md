@@ -71,7 +71,7 @@ System architecture: [containers.md](containers.md). Sub-phase work breakdown: [
 
 The "command centre" foundation: a workspace becomes a list of folders rather than _being_ a folder. Pulled forward from Phase 7 because the Phase 2 container redesign — workspace state lives outside any repo, compose project survives across folder switches — is incoherent without it. See [`roadmaps/phase-02.5-multi-folder.md`](roadmaps/phase-02.5-multi-folder.md) for the work breakdown and [`containers.md` § Multi-folder workspace](containers.md#multi-folder-workspace-the-command-centre-ux) for the container redesign that lights up on top.
 
-**Acceptance**: opening a folder adds it to the workspace as a new folder bar in the sidebar instead of replacing the active workspace; clicking a bar makes it active and swaps the file tree + tabs to that folder's persisted state; an inline `+ Add folder` row picks a new folder; an `×` per bar removes it (with confirm) including its session entry; per-folder tab/active state survives restart. One workspace (`"default"`) with N folders — multi-workspace UI stays a Phase 7 concern.
+**Acceptance**: opening a folder adds it to the workspace as a new folder bar in the sidebar instead of replacing the active workspace; clicking a bar makes it active and swaps the file tree + tabs to that folder's persisted state; an inline `+ Add folder` row picks a new folder; an `×` per bar removes it (with confirm) including its session entry; per-folder tab/active state survives restart. One workspace (`"default"`) with N folders — multi-workspace UI stays a Phase 7 concern (see [`roadmaps/phase-07-multi-workspace.md`](roadmaps/phase-07-multi-workspace.md)).
 
 What deliberately doesn't ship in 2.5: showing more than one folder's tree at once, cross-folder search, drag-to-reorder bars, folder rename. (Compose indicators on the folder bars shipped right after, with Phase 2.0.6 — see the [`phase-02-containers.md` § 2.0.6 — workspace shell vs project services](roadmaps/phase-02-containers.md#206--workspace-shell-vs-project-services-shipped) section.)
 
@@ -114,9 +114,13 @@ Architectural spec: [`coder.md`](coder.md). Sub-phase work breakdown: [`roadmaps
 
 ## Phase 7 — Multi-repo coordination
 
-Phase 2.5 already shipped the multi-folder workspace shape. What Phase 7 adds on top: cross-folder search via per-folder `tantivy` indices with a parallel query layer, a `workspace_list` / `workspace_grep` tool surface for the coder so it can target `@folder-name`, and named multi-workspace UI (today's singleton `"default"` becomes one of many, with `Open Workspace…` / `Switch Workspace…` affordances).
+Two sibling concerns ride this phase number; they ship independently.
 
-App state grows with this phase: today's single workspace (folders + active) becomes a list of named workspaces with the most recent set of folders per workspace. The `AppState` struct in `moon-core` is the natural place for this.
+**Multi-workspace UI**: today's singleton workspace becomes one of many, **one OS process per workspace** (see [ADR 0014](decisions/0014-process-per-workspace.md)), with `Open Workspace…` / `Switch Workspace…` affordances. Workspace ids are user-set slugs (`huggingface` / `gitaly` / …) so `docker ps`, the per-workspace state dir, and the `--workspace <slug>` CLI line in process listings all stay readable. Sub-phase work breakdown: [`roadmaps/phase-07-multi-workspace.md`](roadmaps/phase-07-multi-workspace.md). The plan there is staged so each step is reviewable on its own — registry id refactor, catalog plumbing, per-workspace session.json + create/delete IPC, process-per-workspace + focus-socket pivot, picker UX, restore-most-recent.
+
+**Cross-folder search**: per-folder `tantivy` indices with a parallel query layer, a `workspace_list` / `workspace_grep` tool surface for the coder so it can target `@folder-name`. Independent of the multi-workspace work and gets its own roadmap doc when it grows past one paragraph.
+
+App state grows with both: per-workspace state moves into `<XDG_DATA_HOME>/moon-ide/workspaces/<id>/session.json`; the `AppState` struct in `moon-core` keeps only per-machine concerns (theme, AI creds, Slack token pointer, the list of known workspaces).
 
 ## Phase 8 — Lint / format
 

@@ -1,7 +1,7 @@
 {
 	"$schema": "../gen/schemas/desktop-schema.json",
 	"identifier": "default",
-	"description": "Default capabilities for the moon-ide desktop window.",
+	"description": "Default capabilities for the moon-ide window. Process-per-workspace makes each process own a single window labelled `main`; sibling workspaces run in sibling processes.",
 	"windows": ["main"],
 	"permissions": [
 		"core:default",

@@ -110,18 +110,19 @@ pub async fn slack_list_dm_bots(state: State<'_, AppState>) -> Result<Vec<SlackB
 /// state.
 #[tauri::command]
 pub async fn slack_select_bot(state: State<'_, AppState>, profile: SlackBotProfile) -> Result<(), MoonError> {
-	let mut current = app_state_store::load(&state.config_dir).await?;
-	let bot_changed = current
-		.slack
-		.active_bot
-		.as_ref()
-		.is_none_or(|bot| bot.user_id != profile.user_id);
 	let dm_channel_id = profile.dm_channel_id.clone();
-	current.slack.active_bot = Some(profile);
-	if bot_changed {
-		current.slack.active_thread_ts = None;
-	}
-	app_state_store::save(&state.config_dir, &current).await?;
+	app_state_store::mutate(&state.config_dir, move |s| {
+		let bot_changed = s
+			.slack
+			.active_bot
+			.as_ref()
+			.is_none_or(|bot| bot.user_id != profile.user_id);
+		s.slack.active_bot = Some(profile);
+		if bot_changed {
+			s.slack.active_thread_ts = None;
+		}
+	})
+	.await?;
 	// Feed the poller too. `set_active_channel` clears any pending
 	// thread anyway, matching the persisted-state invariant above.
 	state.slack.poller.set_active_channel(Some(dm_channel_id));
@@ -236,29 +237,20 @@ pub async fn slack_get_user(state: State<'_, AppState>, user_id: String) -> Resu
 /// clears the pick (e.g. they hit "back to sessions"). Idempotent.
 #[tauri::command]
 pub async fn slack_set_active_thread(state: State<'_, AppState>, thread_ts: Option<String>) -> Result<(), MoonError> {
-	let mut current = app_state_store::load(&state.config_dir).await?;
 	state.slack.poller.set_active_thread_ts(thread_ts.clone());
-	if current.slack.active_thread_ts == thread_ts {
-		return Ok(());
-	}
-	current.slack.active_thread_ts = thread_ts;
-	app_state_store::save(&state.config_dir, &current).await
+	app_state_store::mutate(&state.config_dir, move |s| {
+		s.slack.active_thread_ts = thread_ts;
+	})
+	.await
 }
 
 async fn clear_active_bot_on_disk(state: &AppState) {
-	match app_state_store::load(&state.config_dir).await {
-		Ok(mut current) => {
-			if current.slack.active_bot.is_none() && current.slack.active_thread_ts.is_none() {
-				return;
-			}
-			current.slack.active_bot = None;
-			current.slack.active_thread_ts = None;
-			if let Err(err) = app_state_store::save(&state.config_dir, &current).await {
-				tracing::warn!(error = %err, "failed to clear persisted slack bot");
-			}
-		}
-		Err(err) => {
-			tracing::warn!(error = %err, "failed to load app state while clearing slack bot");
-		}
+	let result = app_state_store::mutate(&state.config_dir, |s| {
+		s.slack.active_bot = None;
+		s.slack.active_thread_ts = None;
+	})
+	.await;
+	if let Err(err) = result {
+		tracing::warn!(error = %err, "failed to clear persisted slack bot");
 	}
 }

@@ -397,13 +397,11 @@ fn cadence(elapsed: Duration) -> Option<Duration> {
 }
 
 async fn clear_bot_on_disk(config_dir: &Utf8PathBuf) -> Result<(), moon_protocol::MoonError> {
-	let mut current = app_state_store::load(config_dir).await?;
-	if current.slack.active_bot.is_none() && current.slack.active_thread_ts.is_none() {
-		return Ok(());
-	}
-	current.slack.active_bot = None;
-	current.slack.active_thread_ts = None;
-	app_state_store::save(config_dir, &current).await
+	app_state_store::mutate(config_dir, |s| {
+		s.slack.active_bot = None;
+		s.slack.active_thread_ts = None;
+	})
+	.await
 }
 
 #[cfg(test)]

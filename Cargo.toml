@@ -13,7 +13,13 @@ members = [
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.85"
+# Bumped from 1.85 to 1.89 for stable `std::fs::File::lock()` —
+# moon-core's app_state.json mutator relies on cross-process
+# `flock(2)` to serialize writes between sibling `moon-ide`
+# processes (Phase 7 process-per-workspace). The previous third-
+# party-crate route (fs4 / fs2) duplicates a stdlib feature for
+# zero benefit.
+rust-version = "1.89"
 license = "Apache-2.0"
 publish = false
 

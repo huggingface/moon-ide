@@ -93,15 +93,12 @@ pub struct ContainerStatus {
 
 /// Payload of the `container:state` Tauri event, broadcast after
 /// every lifecycle command (and, eventually, from the docker
-/// events watcher 2.2 will add).
-///
-/// `workspace_id` is included so the frontend can route the
-/// event to the right workspace once multi-window arrives — for
-/// 2.0 it always matches the active workspace.
+/// events watcher 2.2 will add). Phase 7 made each window one
+/// process bound to one workspace, so the event implicitly
+/// scopes to that process — no `workspace_id` field needed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct ContainerStateChange {
-	pub workspace_id: String,
 	pub status: ContainerStatus,
 }
 
@@ -141,7 +138,6 @@ pub struct ProjectComposeStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct ProjectComposeStateChange {
-	pub workspace_id: String,
 	pub folder_path: String,
 	pub project: ProjectComposeStatus,
 }

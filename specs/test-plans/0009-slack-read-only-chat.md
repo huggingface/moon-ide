@@ -111,7 +111,7 @@ Slack — sending will land in the IDE in 11.3." That's also a pass.
 5. **Verify on disk**:
 
    ```bash
-   cat ~/.config/dev.moon-ide.desktop/state.json | jq .slack
+   cat ~/.config/moon-ide/state.json | jq .slack
    ```
 
    Expected to look like:

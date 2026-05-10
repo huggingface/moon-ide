@@ -92,9 +92,7 @@ pub async fn compose_logs_close(state: State<'_, AppState>, stream_id: String) -
 }
 
 /// Tauri command resolver mirror of `project_compose::require_project_handle`,
-/// duplicated locally to keep this module self-contained — the log
-/// commands don't need the workspace ID the project_compose layer
-/// passes around for `state` events.
+/// duplicated locally to keep this module self-contained.
 async fn require_project_handle(state: &AppState, folder_path: &Utf8Path) -> Result<ProjectCompose, MoonError> {
 	let snapshot = state.workspaces.snapshot().await;
 	let bound = snapshot.folders.iter().any(|f| Utf8Path::new(&f.path) == folder_path);

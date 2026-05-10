@@ -30,10 +30,8 @@ pub async fn ui_set_right_panel(state: State<'_, AppState>, kind: Option<RightPa
 		.slack
 		.poller
 		.set_panel_visible(matches!(kind, Some(RightPanelKind::Chat)));
-	let mut current = app_state_store::load(&state.config_dir).await?;
-	if current.right_panel == kind {
-		return Ok(());
-	}
-	current.right_panel = kind;
-	app_state_store::save(&state.config_dir, &current).await
+	app_state_store::mutate(&state.config_dir, move |s| {
+		s.right_panel = kind;
+	})
+	.await
 }

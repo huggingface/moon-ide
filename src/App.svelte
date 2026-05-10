@@ -19,6 +19,15 @@
 	import { palette, reloadWindow } from './lib/commands.svelte';
 	import { cycleFocus } from './lib/focus';
 	import { ipc } from './lib/ipc';
+	import { formatError } from './lib/protocol';
+	import { resolveAppInfo } from './lib/workspace-id';
+	import { workspacePicker } from './lib/workspacePicker.svelte';
+	import { workspaceCreate } from './lib/workspaceCreate.svelte';
+	import WorkspacePicker from './lib/components/WorkspacePicker.svelte';
+	import WorkspaceCreate from './lib/components/WorkspaceCreate.svelte';
+	import PrebootLanding from './lib/components/PrebootLanding.svelte';
+
+	let prebootMode = $state(false);
 
 	let sidebarWidth = $state(280);
 	// The right-side slot is shared between chat and coder
@@ -50,6 +59,27 @@
 		const tag = target.tagName;
 		return tag === 'INPUT' || tag === 'TEXTAREA';
 	}
+
+	// Title bar = `<workspace-name> — <focused-folder>:<branch>`.
+	// Re-synced on every change to any of the three inputs.
+	// `setTitle` is per-window so each open workspace's window
+	// stays labelled correctly without coordination.
+	$effect(() => {
+		const name = workspace.workspaceName;
+		if (name === null) {
+			return;
+		}
+		const folder = workspace.activeFolder?.name ?? null;
+		const branch = workspace.gitBranch.name;
+		let title = name;
+		if (folder !== null) {
+			title = `${name} — ${folder}`;
+			if (branch !== null) {
+				title = `${title}:${branch}`;
+			}
+		}
+		void ipc.window.setTitle(title);
+	});
 
 	onMount(() => {
 		void hydrate();
@@ -218,6 +248,47 @@
 				await reloadWindow();
 				return;
 			}
+			// Phase 7.8 — multi-workspace shortcuts.
+			//
+			// Ctrl+Shift+N: open the "New workspace" modal in
+			// this window. Submitting creates the workspace and
+			// spawns a window for it; the calling window stays
+			// where it was so the user keeps their context if
+			// they bail.
+			if (event.shiftKey && key === 'n') {
+				event.preventDefault();
+				workspaceCreate.open();
+				return;
+			}
+			// Ctrl+Shift+O: workspace picker palette. Selecting
+			// an entry focuses an existing window for that
+			// workspace or spawns a fresh one.
+			if (event.shiftKey && key === 'o') {
+				event.preventDefault();
+				void workspacePicker.open();
+				return;
+			}
+			// Ctrl+Shift+A: add a folder to this window's workspace.
+			// Same picker as the welcome screen's and folder bar's
+			// `Add folder` button.
+			if (event.shiftKey && key === 'a') {
+				event.preventDefault();
+				void pickFolder();
+				return;
+			}
+			// Ctrl+Shift+W: close the calling window. The
+			// last-window guard lives on the backend (refuses
+			// to close it); the toast feedback path here keeps
+			// that explicit for the user.
+			if (event.shiftKey && key === 'w') {
+				event.preventDefault();
+				try {
+					await ipc.window.close();
+				} catch (err) {
+					workspace.flash(formatError(err));
+				}
+				return;
+			}
 			if (!event.shiftKey && key === 'l') {
 				// Echoes Cursor's `Ctrl+L = open coder chat` muscle
 				// memory:
@@ -289,6 +360,22 @@
 	});
 
 	async function hydrate() {
+		// Resolve the process's mode + workspace before any
+		// other IPC fires. The answer never changes for the
+		// process's lifetime; subsequent `currentWorkspaceId()`
+		// reads return the cached value.
+		const info = await resolveAppInfo();
+		if (info.mode === 'preboot') {
+			// Empty-catalog first launch. Render the
+			// "Name your workspace" landing instead of the
+			// regular IDE chrome; submitting spawns a real
+			// `--workspace <slug>` child and exits this
+			// process.
+			prebootMode = true;
+			workspace.hydrated = true;
+			return;
+		}
+		workspace.workspaceName = info.workspaceName ?? info.workspaceId;
 		// The backend has already replayed the persisted folder list and
 		// active-folder pointer at launch (see src-tauri/src/lib.rs),
 		// so the first call to `workspace_active` returns the full,
@@ -382,9 +469,14 @@
 {#if !workspace.hydrated}
 	<!-- Holds the viewport until we know whether there's a workspace
 	     and which theme to paint in. Otherwise the Welcome screen
-	     flashes "Open folder" under dark themes on every launch of a
-	     project that was already open. -->
+	     flashes its `Add folder` card under dark themes on every
+	     launch of a project that was already open. -->
 	<Splash />
+{:else if prebootMode}
+	<!-- First launch with an empty catalog. The user names a
+	     workspace; we spawn a real `--workspace <slug>` child
+	     and exit this preboot process. -->
+	<PrebootLanding />
 {:else}
 	<div class="app">
 		<aside class="sidebar" style:width="{sidebarWidth}px">
@@ -452,6 +544,8 @@
 	<StatusBar />
 	<CommandPalette />
 	<BranchSwitcher />
+	<WorkspacePicker />
+	<WorkspaceCreate />
 	{#if workspace.toast}
 		<div class="toast" role="status">{workspace.toast}</div>
 	{/if}

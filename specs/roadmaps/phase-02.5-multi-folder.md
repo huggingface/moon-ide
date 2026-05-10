@@ -43,7 +43,7 @@ per-folder settings file.
 
 ```rust
 pub struct Workspace {
-    pub id: WorkspaceId,                  // "default" until multi-workspace ships
+    pub id: WorkspaceId,                  // "default" until 7.2 introduces slug ids
     pub folders: Vec<WorkspaceFolder>,    // insertion order, displayed in bar order
     pub active_folder: Option<String>,    // absolute path, must match a folder.path
 }
@@ -184,7 +184,10 @@ Restore order on launch:
 - Compose indicators on folder bars. Reserved slot only;
   populated by the Phase 2 container redesign.
 - Multiple workspaces. One workspace (`"default"`) with N
-  folders.
+  folders. User-named multi-workspace lands in Phase 7.5
+  (per-workspace `session.json`) and Phase 7.6
+  (`workspace_create` / `_delete` IPC); windowed UX in Phase
+  7.7+.
 
 ## Suggested commit chain
 

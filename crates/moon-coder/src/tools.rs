@@ -1089,7 +1089,7 @@ mod tests {
 		use tempfile::TempDir;
 
 		async fn build_registry(paths: &[&camino::Utf8Path]) -> (Arc<WorkspaceRegistry>, ToolRegistry) {
-			let registry = Arc::new(WorkspaceRegistry::new());
+			let registry = Arc::new(WorkspaceRegistry::new("test-workspace".into()));
 			for p in paths {
 				registry.add_folder(p.to_path_buf()).await.unwrap();
 			}

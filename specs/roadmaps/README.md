@@ -42,4 +42,5 @@ manual.
 - [phase-03-terminal.md](phase-03-terminal.md)
 - [phase-05-git.md](phase-05-git.md)
 - [phase-06-coder.md](phase-06-coder.md)
+- [phase-07-multi-workspace.md](phase-07-multi-workspace.md)
 - [phase-11-slack-chat.md](phase-11-slack-chat.md)

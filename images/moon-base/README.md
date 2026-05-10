@@ -18,6 +18,22 @@ Decisions:
 [ADR 0007 — compose + moon-base](../../specs/decisions/0007-compose-and-moon-base.md),
 [ADR 0008 — host-shared daemon](../../specs/decisions/0008-host-shared-daemon.md).
 
+## Build locally
+
+```bash
+docker build -t moon-base:dev images/moon-base/
+```
+
+(Run from the repo root.)
+
+First-build size lands around 3.3 GB (WebKitGTK + GTK 3 dev
+libs are ~1.4 GB on their own; rustup with the stable
+toolchain pulls another ~1 GB; uv-managed Python 3.12 + the
+hf CLI's dep tree adds ~250 MB; Node LTS + corepack adds ~250 MB;
+gh + comfort tooling adds ~50 MB). We'll look at slimming if it
+gets unwieldy, but a multi-GB workspace base image is normal for
+the "polyglot toolchain" tradeoff we picked in ADR 0007.
+
 ## Status
 
 - **In tree** — iterating on the recipe.
@@ -126,52 +142,6 @@ recipe stabilises. The mechanic will be a git tag like
 out of scope until Phase 2.0 ships end-to-end.
 
 Tracker: [`specs/roadmaps/phase-02-containers.md`](../../specs/roadmaps/phase-02-containers.md).
-
-## Build locally
-
-```bash
-docker build -t moon-base:dev images/moon-base/
-```
-
-(Run from the repo root.)
-
-Verify everything landed:
-
-```bash
-docker run --rm moon-base:dev bash -c '
-  rustc --version && cargo --version && bun --version
-  node --version && npm --version && corepack --version
-  fnm --version
-  uv --version && hf --version
-  gh --version | head -1
-  rg --version | head -1
-  fzf --version
-  bat --version
-  jq --version
-  pkg-config --modversion webkit2gtk-4.1
-'
-```
-
-Verify `.nvmrc` auto-install + auto-switch end-to-end against
-a checkout that pins a non-default Node:
-
-```bash
-docker run --rm -v "$(pwd):/workspace:ro" moon-base:dev bash -ic '
-  cd /workspace
-  cat .nvmrc 2>/dev/null && node --version
-'
-```
-
-(The `-i` is required so `.bashrc` gets sourced; the cd alias
-is what triggers the fnm install + use.)
-
-First-build size lands around 3.3 GB (WebKitGTK + GTK 3 dev
-libs are ~1.4 GB on their own; rustup with the stable
-toolchain pulls another ~1 GB; uv-managed Python 3.12 + the
-hf CLI's dep tree adds ~250 MB; Node LTS + corepack adds ~250 MB;
-gh + comfort tooling adds ~50 MB). We'll look at slimming if it
-gets unwieldy, but a multi-GB workspace base image is normal for
-the "polyglot toolchain" tradeoff we picked in ADR 0007.
 
 ## Versioning
 

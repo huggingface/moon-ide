@@ -141,7 +141,7 @@ Prerequisites: `bun install`, host deps installed per `README.md`,
     `bun run dev`). One-time hygiene: delete the WebKitGTK
     cache for moon-ide so any stale entries from before this
     change are flushed —
-    `rm -rf ~/.local/share/dev.moon-ide.desktop/WebKitCache`.
+    `rm -rf ~/.local/share/moon-ide/WebKitCache`.
 26. Restart `bun run dev`. Expected: the terminal logs no
     `[vite-plugin-svelte:load] failed to load virtual css
 module` warnings during startup, and none on subsequent

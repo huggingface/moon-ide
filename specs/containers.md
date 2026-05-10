@@ -1079,11 +1079,12 @@ and is locked in by [ADR 0007](decisions/0007-compose-and-moon-base.md#amendment
 └── bound-folders.json    # the absolute path list compose.yaml was generated from
 ```
 
-`<id>` is the literal string `"default"` until multi-workspace
-UX exists. The layout is forward-compatible with named
-workspaces — they just become other entries under
-`workspaces/`, with a small `workspaces/index.json` mapping
-ids to display names when Phase 7 lands.
+`<id>` is the literal string `"default"` until Phase 7.2
+introduces user-named workspaces (slug ids like `huggingface`,
+`gitaly`, …). The layout is forward-compatible with that —
+named workspaces just become other entries under `workspaces/`,
+with workspace metadata (display name, last-active timestamp)
+tracked in `AppState`.
 
 #### One compose project per workspace, not per folder
 

@@ -33,7 +33,7 @@ Prerequisites: `bun install`, then `bun run dev`.
 4. **Fresh install uses `tauri.conf.json` defaults.**
    1. Delete the plugin's persistence file (location varies by
       platform; on Linux it's under
-      `~/.local/share/dev.moon-ide.desktop/`). Keep `state.json`.
+      `~/.local/share/moon-ide/`). Keep `state.json`.
    2. Launch. Expected: default 1280x800 window per
       `src-tauri/tauri.conf.json`, not maximized.
 

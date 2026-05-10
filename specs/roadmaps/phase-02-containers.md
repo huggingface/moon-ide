@@ -262,7 +262,7 @@ the short version:
 - Workspace state lives at
   `<dirs::data_local_dir>/moon-ide/workspaces/<id>/`
   (`compose.yaml` + `bound-folders.json`), with `<id>` =
-  `"default"` until multi-workspace ships.
+  `"default"` until Phase 7.2 introduces user-named slug ids.
 - Compose project name is `moon-ws-<id>`, decoupled from any
   folder path. The project survives folder switches and
   folder add / remove; only the contents of `compose.yaml`

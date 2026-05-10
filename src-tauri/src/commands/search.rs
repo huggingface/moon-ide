@@ -7,8 +7,8 @@ use tauri::State;
 use crate::state::AppState;
 
 // Search scopes to the active folder for now. Cross-folder search
-// lands in Phase 7 (per-folder tantivy indices, parallel query) once
-// the multi-folder shape from 2.5 has miles on it.
+// lands later (per-folder tantivy indices, parallel query) once
+// the multi-folder shape has miles on it.
 
 #[tauri::command]
 pub async fn search_files(

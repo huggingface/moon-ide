@@ -64,7 +64,7 @@ export const palette = new PaletteState();
 export const builtInCommands: Command[] = [
 	{
 		id: 'workspace.openFolder',
-		title: 'Open Folder…',
+		title: 'Add Folder…',
 		run: async () => {
 			const selected = await open({ directory: true, multiple: false });
 			if (typeof selected === 'string') {

@@ -8,23 +8,33 @@
 //! per-machine and lives here. Per AGENTS.md "no premature migrations":
 //! we change this struct freely until the roadmap is done — there are no
 //! aliases or fallbacks.
+//!
+//! Per-workspace UI state (folders, tabs, splits, focused folder, SCM
+//! filters) does **not** live here — it lives in
+//! `<workspaces_dir>/<id>/session.json`, owned by
+//! [`moon_core::session`]. Splitting the two means a multi-workspace
+//! launch doesn't fight over a single session slot.
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::next_edit::NextEditAppState;
-use crate::session::WorkspaceSession;
 use crate::slack::SlackBotProfile;
 use crate::theme::ThemeMode;
+use crate::workspace::WorkspaceMeta;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
 #[ts(export)]
 #[serde(default, deny_unknown_fields)]
 pub struct AppState {
-	/// What was on screen at the last successful save: workspace, tabs,
-	/// active pane. Restored verbatim on next launch when the workspace
-	/// folder still exists.
-	pub last_session: Option<WorkspaceSession>,
+	/// Catalog of every workspace the user has on this machine
+	/// (Phase 7.2). Empty until the user names their first
+	/// workspace in preboot mode. Mutated through the
+	/// `workspace_create` / `workspace_delete` /
+	/// `workspace_rename` IPC; the launcher reads it to pick
+	/// the most-recently-active slug to spawn (Phase 7.9).
+	#[serde(default)]
+	pub workspaces: Vec<WorkspaceMeta>,
 	/// Active UI theme. Per-machine; survives workspace switches.
 	pub theme: ThemeMode,
 	/// Per-machine, non-secret Slack panel state. The `xoxp-` token

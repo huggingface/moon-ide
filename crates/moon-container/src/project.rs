@@ -14,15 +14,14 @@
 //! For per-folder project services (each bound folder's own
 //! `docker-compose.yml`), the project name is
 //! `moon-ws-<id>-<folder-slug>` — same prefix so a single
-//! `docker compose ls --filter name=moon-ws-default-` enumerates
+//! `docker compose ls --filter name=moon-ws-<id>-` enumerates
 //! everything the workspace owns. See [`project_name_for_folder`]
 //! for the slug rules.
 //!
-//! For now the IDE only ever uses the literal workspace ID
-//! `default`; multi-workspace support (Phase 7) will introduce
-//! more, at which point the validation here is the gate that
-//! makes sure those IDs survive a `docker compose -p ...`
-//! interpolation without quoting.
+//! Phase 7 + ADR 0014: each `moon-ide --workspace <slug>` process
+//! drives one workspace ID through this layer. Validation here is
+//! the gate that makes sure the slug survives a
+//! `docker compose -p ...` interpolation without quoting.
 
 use std::fmt;
 

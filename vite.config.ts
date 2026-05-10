@@ -19,7 +19,7 @@ export default defineConfig(async ({ command }) => ({
 			// CSS extraction, and the race is dev-server-only.
 			emitCss: command !== 'serve',
 		}),
-		// WebKitGTK persists ~/.local/share/dev.moon-ide.desktop/WebKitCache
+		// WebKitGTK persists ~/.local/share/moon-ide/WebKitCache
 		// across launches and revalidates lazily. After config changes that
 		// alter what modules a Svelte component imports (e.g. flipping
 		// `emitCss`), stale cached JS resurrects requests for modules that

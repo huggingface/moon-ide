@@ -1,12 +1,21 @@
-//! Workspace registry: tracks the singleton workspace and the
-//! folders bound into it.
+//! Workspace registry: tracks the running process's workspace
+//! and the folders bound into it.
 //!
-//! Phase 2.5 makes "workspace" and "folder" different things. The
-//! singleton workspace ID is fixed to `"default"`; named multi-
-//! workspace UI lands in Phase 7. Each folder owns its own
-//! [`WorkspaceHost`] (today always [`LocalHost`]) — fs and search
-//! commands route through the active folder's host, never the
-//! workspace's, because hosts are per-folder by construction.
+//! Phase 7 (process-per-workspace): each moon-ide process owns
+//! exactly one workspace, identified by the slug passed via
+//! `--workspace <slug>` at startup (or chosen interactively in
+//! the preboot landing UI). Multiple workspaces map to multiple
+//! OS processes — there's no in-process registry map. This
+//! collapses every "what's the active workspace right now"
+//! question to "the one this process owns", which is exactly
+//! the constraint that lets the coder, the LSP broker, the fs
+//! watcher, and the format-on-save shell resolver be plain
+//! per-process singletons.
+//!
+//! Each folder owns its own [`WorkspaceHost`] (today always
+//! [`LocalHost`]) — fs and search commands route through the
+//! active folder's host, never the workspace's, because hosts
+//! are per-folder by construction.
 
 use camino::Utf8PathBuf;
 use moon_protocol::workspace::{HostKind, Workspace as WorkspaceRecord, WorkspaceFolder, WorkspaceId};
@@ -16,11 +25,6 @@ use tokio::sync::RwLock;
 
 use crate::host::{LocalHost, WorkspaceHost};
 use crate::shell::ShellResolverHandle;
-
-/// Fixed ID of the singleton workspace until Phase 7 introduces named
-/// workspaces. Surfaced as a constant so downstream code (container
-/// project naming, future state-dir layout) doesn't re-derive it.
-pub const DEFAULT_WORKSPACE_ID: &str = "default";
 
 /// One bound folder plus the host that drives reads/writes for paths
 /// inside it. Held behind an `Arc` so command handlers can hang on to
@@ -38,8 +42,14 @@ impl std::fmt::Debug for WorkspaceFolderEntry {
 	}
 }
 
-#[derive(Default)]
 pub struct WorkspaceRegistry {
+	/// Stable workspace id. The Tauri layer threads it through
+	/// to the compose project name (`moon-ws-<id>`), the
+	/// per-workspace state dir (`<workspaces_dir>/<id>/`), and
+	/// the per-workspace single-instance lock socket. Owned
+	/// here (not in `RegistryInner`) because it never changes
+	/// for the lifetime of the process — no lock needed.
+	id: WorkspaceId,
 	inner: RwLock<RegistryInner>,
 	/// Optional resolver used to give each new folder's
 	/// [`LocalHost`] the right shell target for format-on-save.
@@ -60,8 +70,12 @@ struct RegistryInner {
 }
 
 impl WorkspaceRegistry {
-	pub fn new() -> Self {
-		Self::default()
+	pub fn new(id: WorkspaceId) -> Self {
+		Self {
+			id,
+			inner: RwLock::default(),
+			shell_resolver: OnceLock::new(),
+		}
 	}
 
 	/// Install the [`ShellResolverHandle`] every subsequently-added
@@ -151,7 +165,7 @@ impl WorkspaceRegistry {
 	pub async fn snapshot(&self) -> WorkspaceRecord {
 		let inner = self.inner.read().await;
 		WorkspaceRecord {
-			id: DEFAULT_WORKSPACE_ID.to_string(),
+			id: self.id.clone(),
 			folders: inner.folders.iter().map(|e| e.folder.clone()).collect(),
 			active_folder: inner.active_folder_path.clone(),
 		}
@@ -187,7 +201,7 @@ impl WorkspaceRegistry {
 	}
 
 	pub async fn workspace_id(&self) -> WorkspaceId {
-		DEFAULT_WORKSPACE_ID.to_string()
+		self.id.clone()
 	}
 }
 
@@ -196,12 +210,16 @@ mod tests {
 	use super::*;
 	use tempfile::TempDir;
 
+	fn test_registry() -> WorkspaceRegistry {
+		WorkspaceRegistry::new("test-workspace".into())
+	}
+
 	#[tokio::test]
 	async fn add_folder_sets_active() {
 		let dir = TempDir::new().unwrap();
 		let path = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
 
-		let registry = WorkspaceRegistry::new();
+		let registry = test_registry();
 		let entry = registry.add_folder(path.clone()).await.unwrap();
 
 		assert_eq!(entry.folder.host, HostKind::Local);
@@ -217,7 +235,7 @@ mod tests {
 		std::fs::write(&file, "x").unwrap();
 		let path = Utf8PathBuf::from_path_buf(file).unwrap();
 
-		let registry = WorkspaceRegistry::new();
+		let registry = test_registry();
 		let err = registry.add_folder(path).await.unwrap_err();
 		assert!(matches!(err, MoonError::InvalidArgument(_)));
 	}
@@ -227,7 +245,7 @@ mod tests {
 		let dir = TempDir::new().unwrap();
 		let path = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
 
-		let registry = WorkspaceRegistry::new();
+		let registry = test_registry();
 		let first = registry.add_folder(path.clone()).await.unwrap();
 		let second = registry.add_folder(path.clone()).await.unwrap();
 
@@ -246,7 +264,7 @@ mod tests {
 		let one_path = Utf8PathBuf::from_path_buf(one.path().to_path_buf()).unwrap();
 		let two_path = Utf8PathBuf::from_path_buf(two.path().to_path_buf()).unwrap();
 
-		let registry = WorkspaceRegistry::new();
+		let registry = test_registry();
 		let entry_one = registry.add_folder(one_path.clone()).await.unwrap();
 		let entry_two = registry.add_folder(two_path.clone()).await.unwrap();
 		assert_eq!(
@@ -254,14 +272,12 @@ mod tests {
 			Some(entry_two.folder.path.as_str())
 		);
 
-		// Removing the active folder hands active to the previous one.
 		registry.remove_folder(&entry_two.folder.path).await.unwrap();
 		assert_eq!(
 			registry.snapshot().await.active_folder.as_deref(),
 			Some(entry_one.folder.path.as_str())
 		);
 
-		// Removing the last folder leaves the workspace empty.
 		registry.remove_folder(&entry_one.folder.path).await.unwrap();
 		let snap = registry.snapshot().await;
 		assert!(snap.folders.is_empty());
@@ -270,8 +286,16 @@ mod tests {
 
 	#[tokio::test]
 	async fn set_active_folder_rejects_unknown_path() {
-		let registry = WorkspaceRegistry::new();
+		let registry = test_registry();
 		let err = registry.set_active_folder("/nope").await.unwrap_err();
 		assert!(matches!(err, MoonError::NotFound(_)));
+	}
+
+	#[tokio::test]
+	async fn snapshot_carries_constructed_id() {
+		let registry = WorkspaceRegistry::new("abc-123".into());
+		let snap = registry.snapshot().await;
+		assert_eq!(snap.id, "abc-123");
+		assert_eq!(registry.workspace_id().await, "abc-123");
 	}
 }

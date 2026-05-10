@@ -43,14 +43,61 @@ export type WorkspaceFolder = {
 };
 
 /**
- * The full workspace shape — a singleton `"default"` workspace
- * holding zero or more folders, with at most one currently active.
- * Mirrors `moon_protocol::workspace::Workspace`.
+ * Workspace identifier — a slug like `"huggingface"` /
+ * `"gitaly"`. Process-per-workspace: each `moon-ide` process
+ * owns one workspace named at startup via `--workspace <id>`;
+ * the slug is used for the per-workspace state directory
+ * (`<workspaces_dir>/<id>/`), the compose project name
+ * (`moon-ws-<id>`), and the per-workspace single-instance
+ * lock socket. Mirrors `moon_protocol::workspace::WorkspaceId`.
+ */
+export type WorkspaceId = string;
+
+/**
+ * Process mode reported by the backend's `app_info` IPC.
+ * `workspace` means a real workspace was mounted at startup
+ * (CLI arg or auto-restored from the catalog); `preboot`
+ * means the catalog was empty and the user hasn't named a
+ * workspace yet. Mirrors `moon_protocol::app_info::AppInfoMode`.
+ */
+export type AppInfoMode = 'workspace' | 'preboot';
+
+/**
+ * Bootstrap information the frontend reads exactly once on
+ * hydrate. The values never change for a process's lifetime.
+ * Mirrors `moon_protocol::app_info::AppInfo`.
+ */
+export type AppInfo = {
+	mode: AppInfoMode;
+	workspaceId: WorkspaceId | null;
+	workspaceName: string | null;
+};
+
+/**
+ * The full workspace shape — the running process's single
+ * workspace, holding zero or more folders with at most one
+ * currently active. Mirrors `moon_protocol::workspace::Workspace`.
  */
 export type Workspace = {
 	id: string;
 	folders: WorkspaceFolder[];
 	active_folder: string | null;
+};
+
+/**
+ * Catalog entry for a workspace the user has on this machine.
+ * Mirrors `moon_protocol::workspace::WorkspaceMeta`. Lives in
+ * `AppState.workspaces`; distinct from the live `Workspace`
+ * snapshot above (which carries folders + active for one
+ * workspace).
+ */
+export type WorkspaceMeta = {
+	/** Slug id; passes `[a-z0-9_-]` so `moon-ws-<id>` is valid. */
+	id: string;
+	/** Display name (free text). */
+	name: string;
+	/** Unix epoch seconds; bumped on every launch. */
+	last_active_at: number;
 };
 
 export type FileSearchOptions = {
@@ -516,11 +563,12 @@ export type FolderSession = {
 };
 
 /**
- * Persisted UI session for the singleton workspace. Frontend-owned
- * shape; the backend is pure storage. Mirrors
+ * Persisted UI session for one workspace. Frontend-owned shape; the
+ * backend is pure storage. Mirrors
  * `moon_protocol::session::WorkspaceSession`. Holds one
  * [`FolderSession`] per bound folder, plus a pointer to which folder
- * was active at last save.
+ * was active at last save. Lives at `<workspaces_dir>/<id>/session.json`
+ * from Phase 7.5 onward — previously it was `AppState.last_session`.
  */
 export type WorkspaceSession = {
 	folders: FolderSession[];
@@ -620,7 +668,12 @@ export type NextEditCompleteResult = {
  * everything moon-ide stores about a user goes here.
  */
 export type AppState = {
-	last_session: WorkspaceSession | null;
+	/** Phase 7.2 catalog: every workspace the user has on this
+	 * machine. Empty until the user names their first one in
+	 * preboot mode. The frontend doesn't mutate this through
+	 * `app_state_save` — dedicated IPC owns it
+	 * (`workspace_create` / `workspace_delete` / `workspace_rename`). */
+	workspaces: WorkspaceMeta[];
 	theme: ThemeMode;
 	slack: SlackAppState;
 	bottom_panel: BottomPanelAppState;
@@ -663,11 +716,11 @@ export type LogStreamClosed = {
  * - `container`: the workspace container (`moon-ws-<id>-dev-1`).
  *   `cwd` is a path inside the container — the frontend
  *   computes `/workspace/<basename>` for the active folder
- *   before dispatching the open call.
+ *   before dispatching the open call. Process-per-workspace
+ *   makes the workspace id implicit on the backend (it's the
+ *   process's own).
  */
-export type TerminalTarget =
-	| { kind: 'host'; cwd: string | null }
-	| { kind: 'container'; workspace_id: string; cwd: string };
+export type TerminalTarget = { kind: 'host'; cwd: string | null } | { kind: 'container'; cwd: string };
 
 /** Open-call payload. Mirrors
  * `moon_protocol::terminal::TerminalOpenRequest`. */
@@ -699,7 +752,7 @@ export const DEFAULT_NEXT_EDIT_BASE_URL = `http://127.0.0.1:${DEFAULT_NEXT_EDIT_
 export const DEFAULT_NEXT_EDIT_HF_REPO = 'sweepai/sweep-next-edit-1.5B';
 
 export const defaultAppState: AppState = {
-	last_session: null,
+	workspaces: [],
 	theme: 'system',
 	slack: { active_bot: null, active_thread_ts: null },
 	bottom_panel: { visible: false, height: 240 },
@@ -916,13 +969,13 @@ export type ContainerStatus = {
 };
 
 /**
- * Payload of the `container:state` Tauri event. Includes
- * `workspace_id` so once multi-window arrives the right pip
- * updates; in 2.0 it always matches the active workspace.
- * Mirrors `moon_protocol::container::ContainerStateChange`.
+ * Payload of the `container:state` Tauri event. Process-per-
+ * workspace: each window is its own process, so the event
+ * implicitly scopes to the current process's workspace. No
+ * `workspace_id` field. Mirrors
+ * `moon_protocol::container::ContainerStateChange`.
  */
 export type ContainerStateChange = {
-	workspace_id: string;
 	status: ContainerStatus;
 };
 
@@ -948,7 +1001,6 @@ export type ProjectComposeStatus = {
  * Mirrors `moon_protocol::container::ProjectComposeStateChange`.
  */
 export type ProjectComposeStateChange = {
-	workspace_id: string;
 	folder_path: string;
 	project: ProjectComposeStatus;
 };
@@ -1092,12 +1144,42 @@ export function isMoonError(err: unknown): err is MoonError {
 	);
 }
 
+/**
+ * Render any error value as a single human-readable string.
+ *
+ * - `MoonError` (the JSON shape every Tauri command returns
+ *   when it fails) is rendered as just its `message` — the
+ *   `code` discriminant is internal taxonomy, not something
+ *   the user needs to read. Callers that genuinely care
+ *   about `code` should `isMoonError` and switch on it
+ *   themselves.
+ * - `Error` instances render as their `message`.
+ * - Strings pass through unchanged.
+ * - Anything else (plain objects with a `message`, etc.)
+ *   gets a best-effort coercion before falling back to
+ *   `String(err)`. The `[object Object]` failure mode is
+ *   the explicit thing this function exists to prevent.
+ */
 export function formatError(err: unknown): string {
 	if (isMoonError(err)) {
-		return `${err.code}: ${err.message}`;
+		return err.message;
 	}
 	if (err instanceof Error) {
 		return err.message;
+	}
+	if (typeof err === 'string') {
+		return err;
+	}
+	if (typeof err === 'object' && err !== null) {
+		const maybe = err as { message?: unknown };
+		if (typeof maybe.message === 'string') {
+			return maybe.message;
+		}
+		try {
+			return JSON.stringify(err);
+		} catch {
+			return 'unknown error';
+		}
 	}
 	return String(err);
 }

@@ -46,6 +46,12 @@
 	// renders directly underneath the bar in `Sidebar.svelte`. Inactive
 	// rows show `▸` and are header-only.
 
+	// Shortcut hint shown in the `+ Add folder` button's tooltip.
+	// Same `⌘` vs `Ctrl` heuristic as the Welcome screen.
+	const isMac =
+		typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent);
+	const addFolderTitle = isMac ? 'Add folder (⌘+Shift+A)' : 'Add folder (Ctrl+Shift+A)';
+
 	type Props = {
 		onPickFolder: () => void | Promise<void>;
 	};
@@ -180,11 +186,11 @@
 			type="button"
 			class="add-button"
 			data-folder-add-button
-			title="Add folder…"
+			title={addFolderTitle}
 			onclick={() => void onPickFolder()}
 		>
 			<span class="plus" aria-hidden="true">+</span>
-			<span class="add-label">{folders.length === 0 ? 'Open folder' : 'Add folder'}</span>
+			<span class="add-label">Add folder</span>
 		</button>
 	</li>
 </ul>

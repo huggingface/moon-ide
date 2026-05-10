@@ -5,15 +5,18 @@ import type { NextEditAppState } from "./NextEditAppState";
 import type { RightPanelKind } from "./RightPanelKind";
 import type { SlackAppState } from "./SlackAppState";
 import type { ThemeMode } from "./ThemeMode";
-import type { WorkspaceSession } from "./WorkspaceSession";
+import type { WorkspaceMeta } from "./WorkspaceMeta";
 
 export type AppState = { 
 /**
- * What was on screen at the last successful save: workspace, tabs,
- * active pane. Restored verbatim on next launch when the workspace
- * folder still exists.
+ * Catalog of every workspace the user has on this machine
+ * (Phase 7.2). Empty until the user names their first
+ * workspace in preboot mode. Mutated through the
+ * `workspace_create` / `workspace_delete` /
+ * `workspace_rename` IPC; the launcher reads it to pick
+ * the most-recently-active slug to spawn (Phase 7.9).
  */
-last_session: WorkspaceSession | null, 
+workspaces: Array<WorkspaceMeta>, 
 /**
  * Active UI theme. Per-machine; survives workspace switches.
  */

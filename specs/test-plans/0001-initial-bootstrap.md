@@ -118,9 +118,9 @@ bun run dev
 3. The matching tree row is highlighted as the active file (you should not have to scroll-and-click in the tree to confirm which file is which).
 4. With multiple tabs open, click each one in turn. The tree-row highlight follows the active tab.
 5. Close all tabs. Tree selection clears. Click any file in the tree → it opens (selection-change event fires correctly).
-6. Move one of the open files away externally between launches (e.g. `mv ~/code/example/foo.txt /tmp/`). Relaunch. The other tabs restore; the missing one is silently dropped; no error toast. Stop the app and inspect `<app_config_dir>/dev.moon-ide.desktop/state.json` — `open_files` no longer contains the dropped path.
+6. Move one of the open files away externally between launches (e.g. `mv ~/code/example/foo.txt /tmp/`). Relaunch. The other tabs restore; the missing one is silently dropped; no error toast. Stop the app and inspect `<app_config_dir>/moon-ide/state.json` — `open_files` no longer contains the dropped path.
 7. Move the entire workspace folder away. Relaunch. Welcome screen appears (no crash, no toast). Stderr shows a `failed to restore last workspace` warning. Move it back, relaunch — full session (folder + tabs + active) restores.
-8. On a fresh OS user (or after deleting `<app_config_dir>/dev.moon-ide.desktop/state.json`), launch — welcome screen appears, no error.
+8. On a fresh OS user (or after deleting `<app_config_dir>/moon-ide/state.json`), launch — welcome screen appears, no error.
 9. With a state file from a previous schema (e.g. one that still has the old `last_workspace_path` field, or anything else `serde` rejects), launch — stderr shows `app state parse failed; ignoring`, app starts on the welcome screen, no crash. (This is the "no premature migrations" path.)
 
 ## What must keep working

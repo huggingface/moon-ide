@@ -3,6 +3,7 @@
 //!
 //! See [specs/protocol.md](../../specs/protocol.md).
 
+pub mod app_info;
 pub mod app_state;
 pub mod container;
 pub mod editorconfig;

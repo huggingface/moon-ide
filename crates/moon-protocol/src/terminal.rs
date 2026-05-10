@@ -22,6 +22,12 @@ use ts_rs::TS;
 /// in-container path under `/workspace/<basename>` for the
 /// active folder, picked by the frontend at open time so the
 /// backend doesn't have to know about workspace layout.
+///
+/// Process-per-workspace: there's no `workspace_id` field on
+/// `Container` because each process is pinned to one
+/// workspace. The Tauri command derives the
+/// `moon-ws-<id>-dev-1` container name from
+/// `state.workspace_id()`.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -30,10 +36,6 @@ pub enum TerminalTarget {
 		cwd: Option<String>,
 	},
 	Container {
-		/// Workspace id (`default` until multi-workspace
-		/// ships). The Tauri command derives the actual
-		/// `moon-ws-<id>-dev-1` container name from this.
-		workspace_id: String,
 		/// In-container working directory. Required.
 		cwd: String,
 	},

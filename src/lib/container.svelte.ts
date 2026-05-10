@@ -75,8 +75,9 @@ class ContainerPanelState {
 		} catch {
 			// Event-bus bind failed. The pip still works — every
 			// command response carries the new status, so we just
-			// won't see updates from other windows. No actionable
-			// surface to flash for.
+			// miss out on updates from background events (docker
+			// daemon state changes etc). No actionable surface to
+			// flash for.
 		}
 	}
 

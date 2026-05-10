@@ -7,4 +7,4 @@ import type { ProjectComposeStatus } from "./ProjectComposeStatus";
  * on `folder_path` so the UI can update one folder bar without
  * re-querying the others.
  */
-export type ProjectComposeStateChange = { workspace_id: string, folder_path: string, project: ProjectComposeStatus, };
+export type ProjectComposeStateChange = { folder_path: string, project: ProjectComposeStatus, };

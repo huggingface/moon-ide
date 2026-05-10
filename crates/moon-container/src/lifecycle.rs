@@ -145,7 +145,8 @@ impl From<LifecycleError> for MoonError {
 /// Inputs the caller resolves before constructing a [`Workspace`].
 #[derive(Debug, Clone)]
 pub struct WorkspaceConfig {
-	/// Stable, validated workspace identifier (`default` for now).
+	/// Stable, validated workspace identifier — the slug from
+	/// the running process's `--workspace <slug>` CLI arg.
 	/// Becomes the suffix on the compose project name and the
 	/// directory name under `<workspaces_dir>/`.
 	pub workspace_id: String,

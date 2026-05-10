@@ -197,11 +197,13 @@ pub async fn coder_delete_session(state: State<'_, AppState>, id: String) -> Res
 	state.coder.delete_session(id.clone()).await.map_err(MoonError::from)?;
 	let folder = active_folder_path(&state).await;
 	if let Some(folder) = folder {
-		let mut current = app_state_store::load(&state.config_dir).await?;
-		if current.coder.last_session_by_folder.get(&folder).map(|v| v.as_str()) == Some(id.as_str()) {
-			current.coder.last_session_by_folder.remove(&folder);
-			app_state_store::save(&state.config_dir, &current).await?;
-		}
+		let id_owned = id.clone();
+		app_state_store::mutate(&state.config_dir, move |s| {
+			if s.coder.last_session_by_folder.get(&folder).map(|v| v.as_str()) == Some(id_owned.as_str()) {
+				s.coder.last_session_by_folder.remove(&folder);
+			}
+		})
+		.await?;
 	}
 	Ok(())
 }
@@ -212,26 +214,22 @@ pub async fn coder_delete_session(state: State<'_, AppState>, id: String) -> Res
 /// doesn't fail the open call. `None` clears the entry (e.g. the
 /// user just deleted the session).
 async fn persist_last_session(config_dir: &camino::Utf8Path, folder: &str, id: Option<String>) {
-	let current = match app_state_store::load(config_dir).await {
-		Ok(state) => state,
-		Err(err) => {
-			tracing::warn!(error = %err, "could not load app state to persist last session id");
-			return;
+	let folder_owned = folder.to_string();
+	let result = app_state_store::mutate(config_dir, move |s| {
+		let existing = s.coder.last_session_by_folder.get(&folder_owned).cloned();
+		match (existing, id) {
+			(Some(prev), Some(new)) if prev == new => {}
+			(None, None) => {}
+			(_, Some(new)) => {
+				s.coder.last_session_by_folder.insert(folder_owned, new);
+			}
+			(_, None) => {
+				s.coder.last_session_by_folder.remove(&folder_owned);
+			}
 		}
-	};
-	let mut next = current;
-	let existing = next.coder.last_session_by_folder.get(folder).cloned();
-	match (existing, id) {
-		(Some(prev), Some(new)) if prev == new => return,
-		(None, None) => return,
-		(_, Some(new)) => {
-			next.coder.last_session_by_folder.insert(folder.to_string(), new);
-		}
-		(_, None) => {
-			next.coder.last_session_by_folder.remove(folder);
-		}
-	}
-	if let Err(err) = app_state_store::save(config_dir, &next).await {
+	})
+	.await;
+	if let Err(err) = result {
 		tracing::warn!(error = %err, "could not persist last session id");
 	}
 }

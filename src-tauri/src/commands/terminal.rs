@@ -43,7 +43,7 @@ pub async fn terminal_open(
 	state: State<'_, AppState>,
 	request: TerminalOpenRequest,
 ) -> Result<String, MoonError> {
-	let target = into_internal_target(request.target)?;
+	let target = into_internal_target(request.target, &state)?;
 
 	let stream_id = Uuid::new_v4().to_string();
 	let (cmd_tx, cmd_rx) = mpsc::channel::<TerminalCommand>(COMMAND_CHANNEL_DEPTH);
@@ -108,20 +108,18 @@ pub async fn terminal_close(state: State<'_, AppState>, stream_id: String) -> Re
 	Ok(())
 }
 
-fn into_internal_target(t: ProtocolTarget) -> Result<TerminalTarget, MoonError> {
+fn into_internal_target(t: ProtocolTarget, state: &AppState) -> Result<TerminalTarget, MoonError> {
 	match t {
 		ProtocolTarget::Host { cwd } => Ok(TerminalTarget::Host {
 			cwd: cwd.map(Utf8PathBuf::from),
 			shell: None,
 		}),
-		ProtocolTarget::Container { workspace_id, cwd } => {
-			if workspace_id.is_empty() {
-				return Err(MoonError::invalid(
-					"terminal_open: empty workspace_id for container target",
-				));
-			}
+		ProtocolTarget::Container { cwd } => {
+			let id = state
+				.workspace_id()
+				.ok_or_else(|| MoonError::invalid("terminal_open: container target requires a bound workspace"))?;
 			Ok(TerminalTarget::Container {
-				container_name: container_name_for_workspace(&workspace_id),
+				container_name: container_name_for_workspace(id),
 				cwd: Utf8PathBuf::from(cwd),
 				shell: None,
 			})

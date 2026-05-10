@@ -13,64 +13,76 @@ use crate::fs_watcher::FsWatcherHandle;
 use crate::slack_poller::PollerHandle;
 
 pub struct AppState {
-	/// Shared with the coder loop (via [`CoderHandle`]) so tool
-	/// dispatch sees the same active folder every other command
-	/// does. Held as an `Arc` so the coder can hang on to its own
-	/// clone without a separate registry pass-through.
+	/// The single workspace this process owns. Phase 7's
+	/// process-per-workspace model: each `moon-ide` process is
+	/// pinned to one workspace at startup (CLI arg
+	/// `--workspace <slug>`), so the registry is a singleton —
+	/// no map, no per-call resolution. Cross-workspace
+	/// operations (`workspace_create`, the picker, focus
+	/// existing) go cross-process via the per-workspace lock
+	/// socket; see [`crate::commands::window`] +
+	/// [`crate::focus_socket`].
+	///
+	/// In preboot mode (no `--workspace` arg, empty catalog)
+	/// the registry id is the sentinel
+	/// [`PREBOOT_WORKSPACE_ID`] and the registry never gains
+	/// folders; the frontend renders the "Name your workspace"
+	/// landing instead of the regular IDE chrome.
 	pub workspaces: Arc<WorkspaceRegistry>,
-	/// Where global, machine-local app state lives (last opened folder, etc.).
-	/// Set once at startup from Tauri's `app_config_dir`.
+	/// Where global, machine-local app state lives (theme,
+	/// catalog, slack creds). Set once at startup from Tauri's
+	/// `app_config_dir`.
 	pub config_dir: Utf8PathBuf,
 	/// Root of moon-ide's per-workspace state directories — one
 	/// subdirectory per workspace id holds that workspace's
-	/// `compose.yaml` and `bound-folders.json`. Resolved once at
-	/// startup as `<dirs::data_local_dir>/moon-ide/workspaces/`.
-	/// Decoupled from the workspace folder set so the compose
-	/// project survives folder switches (see ADR 0007 amendment).
+	/// `compose.yaml` / `bound-folders.json` / `session.json` /
+	/// `instance.sock`. Resolved once at startup as
+	/// `<dirs::data_local_dir>/moon-ide/workspaces/`.
 	pub workspaces_dir: Utf8PathBuf,
 	/// Slack chat panel state. The token itself lives in the OS keyring;
 	/// this is the in-memory client cache (populated at startup if the
 	/// keyring has a token, otherwise lazily on first `slack_set_token`).
 	pub slack: SlackState,
-	/// Registry of active `docker compose logs -f` streams, keyed
-	/// by the stream ID returned to the frontend. Each entry holds
-	/// the `AbortHandle` of the supervisor task that owns the
-	/// child process — aborting it drops the child, which is
-	/// spawned with `kill_on_drop(true)` so the SIGKILL goes out
-	/// immediately. See [`crate::commands::compose_logs`].
+	/// Registry of active `docker compose logs -f` streams.
 	pub log_streams: Arc<Mutex<HashMap<String, AbortHandle>>>,
-	/// Registry of active terminal sessions, keyed by stream id.
-	/// Each entry holds the supervisor's [`AbortHandle`] alongside
-	/// a tokio mpsc sender that ferries `terminal_write` bytes
-	/// from the command thread into the supervisor — see
-	/// [`crate::commands::terminal`]. Aborting the supervisor
-	/// drops the `PtySession` which kills the child process
-	/// (host shell or `docker exec`) immediately.
+	/// Registry of active terminal sessions.
 	pub terminal_streams: Arc<Mutex<HashMap<String, TerminalStreamHandle>>>,
-	/// Filesystem watcher actor. Re-pointed to the active folder
-	/// whenever `workspace_open_local` /
-	/// `workspace_set_active_folder` / `workspace_remove_folder`
-	/// runs; emits `fs:changed` on debounced file activity so the
-	/// tree + git status can refresh without waiting for window
-	/// focus or a palette command. See [`crate::fs_watcher`].
+	/// Filesystem watcher actor.
 	pub fs_watcher: FsWatcherHandle,
-	/// LSP broker plus its event-pump task. Lazily created the
-	/// first time the frontend calls an `lsp_*` command so we
-	/// don't pay the TS server startup cost for folders that
-	/// happen to contain no TypeScript. Torn down when the
-	/// workspace closes (via `lsp_shutdown` in the shutdown
-	/// hook) or when the active folder switches (see
-	/// [`crate::commands::lsp`]).
+	/// LSP broker plus its event-pump task.
 	pub lsp: Arc<Mutex<Option<LspHandle>>>,
-	/// In-process AI coding agent (Phase 6). Cheap-to-clone handle;
-	/// every `coder_*` command goes through it. Constructed once at
-	/// startup against the same `WorkspaceRegistry` everything else
-	/// uses, so the agent's tool dispatch lands on the active folder
-	/// without a separate registry hop. See `specs/coder.md`.
+	/// In-process AI coding agent (Phase 6).
 	pub coder: CoderHandle,
 	/// Optional `llama-server` child for local autocomplete (HF `--hf-repo`).
 	pub next_edit_server: Arc<NextEditServerSupervisor>,
+	/// Process mode + identity. The frontend's first hydrate
+	/// reads this via [`crate::commands::app_info::app_info`]
+	/// to decide whether to render the preboot landing or the
+	/// regular IDE shell.
+	pub mode: AppMode,
 }
+
+/// What this process is doing. Picked once at startup based on
+/// CLI args + catalog state; never mutates afterwards.
+#[derive(Debug, Clone)]
+pub enum AppMode {
+	/// `moon-ide --workspace <slug>` mode. The registry is
+	/// bound to `slug`, every IPC operates on it. The user
+	/// closes this window with Ctrl+Shift+W → process exits.
+	Workspace { id: String },
+	/// `moon-ide` with no args, catalog empty. The frontend
+	/// shows the workspace-naming landing UI; on submit it
+	/// calls `workspace_create` then `window_open(slug)` which
+	/// spawns a real `--workspace <slug>` child and exits this
+	/// preboot.
+	Preboot,
+}
+
+/// Sentinel id used by the preboot registry. Starts with `_`
+/// so [`moon_protocol::workspace::validate_workspace_id`]
+/// rejects it as user input — there's no path by which a real
+/// workspace can collide.
+pub const PREBOOT_WORKSPACE_ID: &str = "__preboot__";
 
 /// Owning handle the terminal commands keep per stream. The
 /// `tx` channel is read by the supervisor task; sending fails
@@ -97,6 +109,7 @@ impl AppState {
 		fs_watcher: FsWatcherHandle,
 		workspaces: Arc<WorkspaceRegistry>,
 		coder: CoderHandle,
+		mode: AppMode,
 	) -> Self {
 		Self {
 			workspaces,
@@ -109,16 +122,27 @@ impl AppState {
 			lsp: Arc::new(Mutex::new(None)),
 			coder,
 			next_edit_server: Arc::new(NextEditServerSupervisor::default()),
+			mode,
 		}
 	}
 
 	/// Path of the per-workspace state directory for the given
-	/// id (e.g. `<workspaces_dir>/default/`). The directory itself
-	/// is created lazily on first compose write — the existence
-	/// check belongs in `moon-container`'s lifecycle layer, not
-	/// here.
+	/// id (e.g. `<workspaces_dir>/huggingface/`). The directory
+	/// itself is created lazily on first compose write — the
+	/// existence check belongs in `moon-container`'s lifecycle
+	/// layer, not here.
 	pub fn workspace_state_dir(&self, workspace_id: &str) -> Utf8PathBuf {
 		self.workspaces_dir.join(workspace_id)
+	}
+
+	/// Workspace id this process owns, or `None` in preboot
+	/// mode. Cheap inline copy; called from every command that
+	/// needs to derive a workspace-scoped path.
+	pub fn workspace_id(&self) -> Option<&str> {
+		match &self.mode {
+			AppMode::Workspace { id } => Some(id.as_str()),
+			AppMode::Preboot => None,
+		}
 	}
 }
 

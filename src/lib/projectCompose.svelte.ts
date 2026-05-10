@@ -102,7 +102,7 @@ class ProjectComposeStateStore {
 		} catch {
 			// Event-bus bind failed. Per-folder mutations still
 			// hand back fresh snapshots in their command result;
-			// we just won't see updates from other windows.
+			// we just miss out on background event updates.
 		}
 	}
 

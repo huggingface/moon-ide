@@ -35,15 +35,13 @@ export function canOpenContainerTerminal(): boolean {
  * always invoke this from a click handler — disabling the
  * trigger is a UX nicety, not a safety requirement. */
 export function openContainerTerminal(): void {
-	const id = workspace.workspace?.id;
-	if (!id || container.state !== 'running') {
+	if (container.state !== 'running') {
 		return;
 	}
 	const folder = workspace.activeFolder;
 	const cwd = folder ? containerCwdFor(folder.path) : '/workspace';
 	const target: TerminalTarget = {
 		kind: 'container',
-		workspace_id: id,
 		cwd,
 	};
 	void terminalStore.open(target, DEFAULT_COLS, DEFAULT_ROWS);

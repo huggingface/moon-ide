@@ -1,10 +1,11 @@
 <script lang="ts">
 	// Shown during the brief window between mount and the first
 	// resolved-workspace paint. Prevents the Welcome screen from
-	// flashing "Open folder" when there _is_ a persisted folder —
-	// `App.svelte` hides this once `workspace.hydrated` flips. Styled
-	// only with themed CSS vars so it inherits the saved theme as soon
-	// as `restoreAppState` applies it (usually one frame later).
+	// flashing its `Add folder` card when there _is_ a persisted
+	// folder — `App.svelte` hides this once `workspace.hydrated`
+	// flips. Styled only with themed CSS vars so it inherits the
+	// saved theme as soon as `restoreAppState` applies it (usually
+	// one frame later).
 </script>
 
 <div class="splash" aria-hidden="true">

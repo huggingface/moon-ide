@@ -786,7 +786,7 @@ mod tests {
 	}
 
 	async fn registry_with_folders(paths: &[&Utf8Path]) -> Vec<Arc<WorkspaceFolderEntry>> {
-		let registry = WorkspaceRegistry::new();
+		let registry = WorkspaceRegistry::new("test-workspace".into());
 		for path in paths {
 			registry.add_folder(path.to_path_buf()).await.unwrap();
 		}

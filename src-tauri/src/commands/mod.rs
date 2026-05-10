@@ -1,3 +1,4 @@
+pub mod app_info;
 pub mod app_state;
 pub mod coder;
 pub mod compose_logs;
@@ -8,8 +9,10 @@ pub mod lsp;
 pub mod next_edit;
 pub mod project_compose;
 pub mod search;
+pub mod session;
 pub mod slack;
 pub mod system;
 pub mod terminal;
 pub mod ui;
+pub mod window;
 pub mod workspace;

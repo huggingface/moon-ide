@@ -97,7 +97,7 @@ the raw `<@U…>` and `<https://…|label>` tokens were unreadable.
 ### Disconnect resets the cache
 
 - After disconnect → reconnect, the user cache is empty. Mentions
-  re-fetch on the next render. (Verify by clearing `~/.config/dev.moon-ide.desktop/state.json`'s
+  re-fetch on the next render. (Verify by clearing `~/.config/moon-ide/state.json`'s
   active bot pick or by toggling the connect modal disconnect path.)
 
 ### Block Kit precedence

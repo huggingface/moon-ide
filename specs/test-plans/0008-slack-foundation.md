@@ -53,7 +53,7 @@
   session blob, or in any frontend state save. Inspect the AppState
   file after connecting:
   ```bash
-  cat ~/.config/dev.moon-ide.desktop/state.json | jq
+  cat ~/.config/moon-ide/state.json | jq
   ```
   Confirm there's no `xoxp-` substring anywhere. The `slack.active_bot`
   field should hold IDs + display metadata only (after picking). Inspect
@@ -129,7 +129,7 @@ account slack-user-token` if you've already connected before).
 7. The status-bar chat pip turns green.
 8. Confirm persistence:
    ```bash
-   cat ~/.config/dev.moon-ide.desktop/state.json | jq .slack
+   cat ~/.config/moon-ide/state.json | jq .slack
    ```
    should print the picked bot's `user_id`, `dm_channel_id`,
    `username`, `real_name`, `display_name`, `image_url`. No `xoxp-`
@@ -179,7 +179,7 @@ null`. Pick a different bot; persistence updates accordingly.
    D-Bus interface is what keyring talks to and is already present).
 5. Confirm `state.json`:
    ```bash
-   cat ~/.config/dev.moon-ide.desktop/state.json | jq '.slack, .right_panel'
+   cat ~/.config/moon-ide/state.json | jq '.slack, .right_panel'
    ```
    should show the same `active_bot` you picked (and no `xoxp-`
    substring anywhere in the file), plus `right_panel: "chat"` —
@@ -202,7 +202,7 @@ null`. Pick a different bot; persistence updates accordingly.
    should print nothing (and exit non-zero). Confirm the persisted
    bot pick is gone:
    ```bash
-   cat ~/.config/dev.moon-ide.desktop/state.json | jq .slack
+   cat ~/.config/moon-ide/state.json | jq .slack
    ```
    should print `{"active_bot": null}`.
 

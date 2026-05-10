@@ -38,7 +38,7 @@ Prerequisites: `bun install`, `bun run dev`, fresh `state.json`.
 
 1. **First-run defaults**
 
-   Quit the app, delete `~/.config/dev.moon-ide.desktop/state.json`
+   Quit the app, delete `~/.config/moon-ide/state.json`
    (or the platform-equivalent), relaunch.
 
    Expected: neither right-side panel renders. The chat / coder
@@ -50,7 +50,7 @@ Prerequisites: `bun install`, `bun run dev`, fresh `state.json`.
 
    Expected:
    - Chat panel appears on the right.
-   - `cat ~/.config/dev.moon-ide.desktop/state.json | jq .right_panel`
+   - `cat ~/.config/moon-ide/state.json | jq .right_panel`
      prints `"chat"`.
 
 3. **Swap to coder via header icon**

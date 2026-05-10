@@ -1,5 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
+
 import type {
+	AppInfo,
 	AppState,
 	CoderSessionSummary,
 	CoderStatus,
@@ -38,6 +40,8 @@ import type {
 	SystemTheme,
 	TerminalOpenRequest,
 	Workspace,
+	WorkspaceMeta,
+	WorkspaceSession,
 	WriteFileResult,
 	NextEditCompleteParams,
 	NextEditCompleteResult,
@@ -46,14 +50,47 @@ import type {
 	NextEditServerStartParams,
 } from './protocol';
 
-// Single auditable surface for all Tauri commands. Components MUST go through this.
+// Single auditable surface for all Tauri commands. Components MUST go
+// through this. Process-per-workspace (Phase 7) made every workspace
+// scoped command implicit on the process's own workspace, so no
+// `workspaceId` is threaded through the wire — `invoke` everywhere.
 export const ipc = {
+	// `app_info` is the very first IPC the frontend issues on
+	// hydrate to learn whether this process is in workspace mode
+	// or in preboot (no `--workspace` arg, empty catalog).
+	appInfo: () => invoke<AppInfo>('app_info'),
 	workspace: {
 		openLocal: (path: string) => invoke<Workspace>('workspace_open_local', { path }),
 		removeFolder: (path: string) => invoke<Workspace>('workspace_remove_folder', { path }),
 		setActiveFolder: (path: string) => invoke<Workspace>('workspace_set_active_folder', { path }),
 		active: () => invoke<Workspace | null>('workspace_active'),
 		list: () => invoke<Workspace[]>('workspace_list'),
+	},
+	// Catalog of every workspace on the machine + create / delete /
+	// rename. Cross-process operations: writes to `state.json` are
+	// visible to sibling processes the next time they re-read the
+	// catalog (the picker re-reads on every open).
+	workspaces: {
+		catalog: () => invoke<WorkspaceMeta[]>('workspace_catalog'),
+		// Idempotent create-or-switch: returns the existing
+		// catalog entry if the slug is already taken, otherwise
+		// appends a new one. Pass an empty `slug` to auto-derive
+		// it from `name`. Pair with `window.open` for the
+		// "Ctrl+Shift+N" flow — together they create a new
+		// workspace or focus an existing one transparently.
+		create: (slug: string, name: string) => invoke<WorkspaceMeta>('workspace_create', { slug, name }),
+		delete: (slug: string) => invoke<void>('workspace_delete', { slug }),
+		rename: (slug: string, name: string) => invoke<WorkspaceMeta>('workspace_rename', { slug, name }),
+	},
+	// Window management. Process-per-workspace: `open` either
+	// focuses the sibling process that already owns `slug` or
+	// spawns a fresh `moon-ide --workspace <slug>` child;
+	// `close` exits this process; `setTitle` rewrites the
+	// calling window's OS title.
+	window: {
+		open: (slug: string) => invoke<void>('window_open', { workspaceId: slug }),
+		close: () => invoke<void>('window_close'),
+		setTitle: (title: string) => invoke<void>('window_set_title', { title }),
 	},
 	fs: {
 		readDir: (path: string) => invoke<DirEntry[]>('fs_read_dir', { path }),
@@ -100,6 +137,15 @@ export const ipc = {
 	appState: {
 		load: () => invoke<AppState>('app_state_load'),
 		save: (appState: AppState) => invoke<void>('app_state_save', { appState }),
+	},
+	session: {
+		// Per-workspace UI session blob (folders bound, tabs,
+		// splits, focused folder, SCM filters). Lives at
+		// `<workspaces_dir>/<id>/session.json`. Process-per-
+		// workspace makes the workspace id implicit — the
+		// backend reads it from `state.workspace_id()`.
+		load: () => invoke<WorkspaceSession>('session_load'),
+		save: (session: WorkspaceSession) => invoke<void>('session_save', { session }),
 	},
 	system: {
 		theme: () => invoke<SystemTheme>('system_theme'),

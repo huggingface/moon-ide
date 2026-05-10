@@ -479,6 +479,15 @@ class WorkspaceState {
 	activeFolderPath: string | null = $derived(this.workspace?.active_folder ?? null);
 
 	/**
+	 * Display name of the workspace this window belongs to —
+	 * e.g. `"Hugging Face"` for a workspace whose slug is
+	 * `huggingface`. Looked up from the catalog once on hydrate
+	 * and cached; the title bar reads from here. `null` until
+	 * the catalog fetch resolves.
+	 */
+	workspaceName: string | null = $state(null);
+
+	/**
 	 * Active folder record. Components reach for `.path`, `.name`,
 	 * `.host` here instead of the workspace-level fields the
 	 * single-folder shape used to expose.
@@ -664,8 +673,8 @@ class WorkspaceState {
 	 * Idempotent on duplicate path — the backend silently flips the
 	 * existing entry to active, and we re-load its tree if it had
 	 * never been populated. Per Phase 2.5 this is the single
-	 * "open folder" code path: the welcome screen, the sidebar's
-	 * `+ Add folder` row, the command palette's "Open Folder…", and
+	 * `Add folder` code path: the welcome screen, the sidebar's
+	 * `+ Add folder` row, the command palette's `Add Folder…`, and
 	 * the `EditorPane` empty-state button all funnel through here.
 	 */
 	async openLocal(path: string) {
@@ -888,22 +897,28 @@ class WorkspaceState {
 	}
 
 	/**
-	 * Read the persisted AppState (theme + last session) and apply both.
-	 * Theme is applied unconditionally. The session is only applied if it
-	 * matches the currently-open workspace; tabs pointing at files that
-	 * no longer exist are silently dropped and the cleaned-up state gets
-	 * re-saved. Called once on startup from `App.svelte`.
+	 * Read the persisted AppState (theme + per-machine slices) plus the
+	 * active workspace's session blob (folders, tabs, splits) and apply
+	 * both. Theme is applied unconditionally. The session is only applied
+	 * if it matches the currently-open workspace; tabs pointing at files
+	 * that no longer exist are silently dropped and the cleaned-up state
+	 * gets re-saved. Called once on startup from `App.svelte`.
 	 */
 	async restoreAppState() {
 		// Probe the OS theme (XDG portal / native API) and read the
-		// persisted `state.json` in parallel — they're independent
-		// and both block the first meaningful paint. `bindSystemPreference`
-		// is awaited so `applyTheme` below reads a trustworthy
-		// `systemPrefersDark`: on Linux WebKitGTK the synchronous
-		// `matchMedia` answer seeded during class construction is
-		// unreliable, and only the portal probe knows for sure.
+		// persisted `state.json` + per-workspace `session.json` in
+		// parallel — they're independent and all block the first
+		// meaningful paint. `bindSystemPreference` is awaited so
+		// `applyTheme` below reads a trustworthy `systemPrefersDark`:
+		// on Linux WebKitGTK the synchronous `matchMedia` answer
+		// seeded during class construction is unreliable, and only
+		// the portal probe knows for sure.
 		const appStatePromise = ipc.appState.load().then(
 			(state) => ({ ok: true, state }) as const,
+			(err) => ({ ok: false, err }) as const,
+		);
+		const sessionPromise = ipc.session.load().then(
+			(session) => ({ ok: true, session }) as const,
 			(err) => ({ ok: false, err }) as const,
 		);
 		await this.bindSystemPreference();
@@ -915,6 +930,15 @@ class WorkspaceState {
 			return;
 		}
 		const state = appStateResult.state;
+		const sessionResult = await sessionPromise;
+		// A failed session load is not fatal — the user just lands
+		// without their last tabs. The persist tick on first
+		// interaction will heal the on-disk file. Soft-warn so it's
+		// visible in dev without spooking the user.
+		const session = sessionResult.ok ? sessionResult.session : null;
+		if (!sessionResult.ok) {
+			this.flash(`Could not restore session: ${formatError(sessionResult.err)}`);
+		}
 
 		this.theme = state.theme;
 		this.nextEditExternalBaseUrl = (state.next_edit.external_base_url ?? '').trim();
@@ -1008,8 +1032,7 @@ class WorkspaceState {
 		void this.bindCoderRefresh();
 
 		const ws = this.workspace;
-		const session = state.last_session;
-		if (!ws || !session) {
+		if (!ws || !session || session.folders.length === 0) {
 			// Even without a session to replay we still want to give
 			// the bottom-panel auto-spawn a shot — the panel's
 			// visibility is in `state` (just hydrated above) and is
@@ -1368,17 +1391,20 @@ class WorkspaceState {
 					});
 				}
 			}
-			const session: WorkspaceSession | null = ws
-				? { folders: folderSessions, active_folder_path: ws.active_folder }
-				: null;
-			// `slack`, `right_panel`, and `coder` are written through
-			// their own Tauri commands (`slack_*`, `ui_set_right_panel`,
-			// `coder_*`); the backend's `app_state_save` ignores
+			const session: WorkspaceSession = {
+				folders: folderSessions,
+				active_folder_path: ws?.active_folder ?? null,
+			};
+			// `workspaces`, `slack`, `right_panel`, and `coder` are
+			// written through their own paths (Phase 7.2 bootstrap
+			// + Phase 7.6 IPC for the workspace catalog; `slack_*`,
+			// `ui_set_right_panel`, `coder_*` Tauri commands for
+			// the rest). The backend's `app_state_save` ignores
 			// whatever we send for those fields and preserves the
-			// on-disk value. The placeholders satisfy the shared type
-			// only.
+			// on-disk value. The placeholders satisfy the shared
+			// type only.
 			const payload: AppState = {
-				last_session: session,
+				workspaces: [],
 				theme: this.theme,
 				slack: { active_bot: null, active_thread_ts: null },
 				bottom_panel: bottomPanel.serialise(),
@@ -1393,13 +1419,18 @@ class WorkspaceState {
 					server_autostart: this.nextEditServerAutostart,
 				},
 			};
-			// AppState writes are best-effort. A toast on every failure
-			// would be too noisy (this fires on every navigation); a
-			// global frontend logger doesn't exist yet (and isn't worth
-			// adding for one callsite). If saves systematically fail the
-			// next launch's restore will simply have no data — that's
-			// loud enough.
+			// AppState + session writes are best-effort. A toast on
+			// every failure would be too noisy (this fires on every
+			// navigation); a global frontend logger doesn't exist
+			// yet (and isn't worth adding for one callsite). If
+			// saves systematically fail the next launch's restore
+			// will simply have no data — that's loud enough. The
+			// two writes are issued in parallel rather than chained
+			// so a slow save on one path doesn't gate the other.
 			void ipc.appState.save(payload).catch(() => {});
+			if (ws) {
+				void ipc.session.save(session).catch(() => {});
+			}
 		});
 	}
 

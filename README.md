@@ -19,8 +19,6 @@ A team-specialized IDE built from scratch by assembling best-in-class components
 - Svelte 5 + TypeScript + Vite frontend
 - CodeMirror 6 editor
 - `@pierre/trees` (vanilla mode) for the file tree
-- Rust workspace: `moon-core` (shared), `moon-protocol` (JSON-RPC schema), `moon-slack` (Slack chat panel client), `moon-coder` (in-process AI coding agent — Phase 6), `moon-remote` (future remote-host runtime for SSH / Codespaces — not used by the local-container path)
-- `gix` for git, `tantivy` for indexed search, `hf-xet` for the coder's session bucket sync
 
 See [specs/architecture.md](specs/architecture.md) for the high-level design and [specs/](specs/) for everything else.
 
@@ -30,12 +28,7 @@ See [specs/architecture.md](specs/architecture.md) for the high-level design and
 .
 ├── src/                    Svelte 5 UI source
 ├── src-tauri/              Tauri shell (Rust main, capabilities, config)
-├── crates/
-│   ├── moon-core/          Workspace ops, LSP mux, git, indexer
-│   ├── moon-protocol/      JSON-RPC schema shared by both ends
-│   ├── moon-slack/         Slack Web API client for the chat panel
-│   ├── moon-coder/         In-process AI coding agent (Phase 6)
-│   └── moon-remote/        Binary for the future remote-host story (SSH / Codespaces)
+├── crates/                 Modules
 ├── specs/                  Living design docs
 ├── AGENTS.md               Instructions for AI coding agents working in this repo
 ├── Cargo.toml              Cargo workspace root
@@ -69,19 +62,19 @@ sudo apt install -y libwebkit2gtk-4.1-dev libsoup-3.0-dev libgtk-3-dev \
 
 WebKitGTK provides the webview the Tauri app loads at runtime, so this set is required at both build and launch time.
 
-## Run
+## Run (dev)
 
 ```bash
 bun install
 bun run dev
 ```
 
-`bun run dev` boots the Tauri shell (Rust backend + the Vite-served Svelte UI as one window). On the first run, expect a noticeable Cargo build before the window appears.
+## Run (prod)
 
-`bun run fmt` / `lint` / `check` / `test` cover both the JS/TS and Rust sides; `:js` / `:rust` variants exist if you only want one. Code style and tooling rationale lives in [ADR 0004](specs/decisions/0004-code-style.md); a pre-commit hook auto-formats staged files.
-
-## Status
-
-Phases 0 (skeleton) and 1 (editor + navigation) are implemented. Phase 2 (containerised dev shells) is next — see [specs/roadmap.md](specs/roadmap.md) and [specs/containers.md](specs/containers.md).
+```bash
+bun install
+bun run tauri build --no-bundle
+./target/release/moon-dekstop
+```
 
 > **Phased delivery rule** — each phase ends with a hand-back to a human reviewer. AI agents do not start the next phase on their own. See [AGENTS.md](AGENTS.md#phased-delivery).

@@ -2,8 +2,10 @@
 import type { WorkspaceFolder } from "./WorkspaceFolder";
 
 /**
- * The full workspace shape: a singleton `"default"` workspace
- * holding zero or more folders, with at most one currently active.
+ * The running process's single workspace, holding zero or
+ * more folders, with at most one currently active. Each
+ * `moon-ide --workspace <slug>` process owns exactly one
+ * `Workspace` for its lifetime (ADR 0014).
  */
 export type Workspace = { id: string, 
 /**
