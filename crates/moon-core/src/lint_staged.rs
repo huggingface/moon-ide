@@ -39,6 +39,12 @@ pub struct LintStagedRules {
 	/// applies via `path.join(cwd, pattern)`.
 	config_dir: Option<Utf8PathBuf>,
 	rules: Arc<Vec<LintStagedRule>>,
+	/// Diagnostics produced while parsing the config (likely-broken
+	/// patterns, unsupported value shapes, …). Surfaced in the
+	/// format-on-save log panel when this config is matched against
+	/// a file; carries no fatal weight (the matching rules still
+	/// load and run).
+	parse_warnings: Arc<Vec<String>>,
 }
 
 struct LintStagedRule {
@@ -93,6 +99,14 @@ impl LintStagedRules {
 	/// etc.) resolve from the same directory lint-staged itself uses.
 	pub fn config_dir(&self) -> Option<&Utf8Path> {
 		self.config_dir.as_deref()
+	}
+
+	/// Diagnostics collected while parsing this config (likely-broken
+	/// glob patterns, etc.). Surfaced once per process per pattern
+	/// through the format-on-save log panel — see
+	/// `LocalHost::run_lint_staged_chain_for`.
+	pub fn parse_warnings(&self) -> &[String] {
+		&self.parse_warnings
 	}
 }
 
@@ -223,6 +237,7 @@ fn parse_value(value: &Value, config_dir: &Utf8Path) -> Result<LintStagedRules, 
 		.as_object()
 		.ok_or_else(|| "lint-staged config must be an object".to_owned())?;
 	let mut rules = Vec::with_capacity(map.len());
+	let mut warnings = Vec::new();
 	for (pattern, cmds) in map {
 		let commands: Vec<String> = match cmds {
 			Value::String(s) => vec![s.clone()],
@@ -236,9 +251,27 @@ fn parse_value(value: &Value, config_dir: &Utf8Path) -> Result<LintStagedRules, 
 			Ok(g) => g,
 			Err(err) => {
 				tracing::warn!(pattern = %pattern, %err, "format-on-save: invalid glob; skipping");
+				warnings.push(format!("invalid glob `{pattern}`: {err}; rule skipped"));
 				continue;
 			}
 		};
+		// Heuristic: a comma outside `{…}` is essentially never
+		// what the user meant. Patterns like `*.ts,*.vue` are a
+		// common copy-paste mistake (matches a literal filename
+		// with a comma in it; never matches `app.ts` or `app.vue`).
+		// `*.{ts,vue}` is the brace-expanded form that works.
+		// Files with literal commas in their names are vanishingly
+		// rare in practice and would be caught here as false
+		// positives — acceptable trade.
+		if looks_like_unbraced_comma_glob(pattern) {
+			tracing::warn!(
+				pattern = %pattern,
+				"format-on-save: pattern contains comma outside of brace expansion — did you mean `*.{{ext1,ext2}}`?"
+			);
+			warnings.push(format!(
+				"pattern `{pattern}` has a comma outside `{{…}}` — this is a literal filename character in glob syntax, not a separator. Did you mean `*.{{ext1,ext2}}`? (Today this rule matches only files whose actual filename contains a comma.)"
+			));
+		}
 		rules.push(LintStagedRule {
 			has_separator: pattern.contains('/'),
 			matcher: glob.compile_matcher(),
@@ -248,7 +281,31 @@ fn parse_value(value: &Value, config_dir: &Utf8Path) -> Result<LintStagedRules, 
 	Ok(LintStagedRules {
 		config_dir: Some(config_dir.to_path_buf()),
 		rules: Arc::new(rules),
+		parse_warnings: Arc::new(warnings),
 	})
+}
+
+/// True when `pattern` contains a `,` that isn't inside a `{…}` brace
+/// group. micromatch / globset treat such commas as literal filename
+/// characters, so `*.ts,*.vue` only matches a file literally named
+/// `…,…` — vanishingly rare on disk and nearly always a misremembered
+/// brace expansion. Returns `false` for the legitimate `*.{ts,vue}`
+/// form and for patterns with no comma at all.
+fn looks_like_unbraced_comma_glob(pattern: &str) -> bool {
+	let mut depth = 0i32;
+	for ch in pattern.chars() {
+		match ch {
+			'{' => depth += 1,
+			'}' => {
+				if depth > 0 {
+					depth -= 1;
+				}
+			}
+			',' if depth == 0 => return true,
+			_ => {}
+		}
+	}
+	false
 }
 
 #[cfg(test)]
@@ -275,6 +332,24 @@ mod tests {
 
 	fn cmds(slice: Option<&[String]>) -> Option<Vec<&str>> {
 		slice.map(|s| s.iter().map(String::as_str).collect())
+	}
+
+	#[test]
+	fn comma_outside_braces_is_flagged_as_likely_mistake() {
+		// Common copy-paste mistakes that don't do what the user
+		// thinks they do.
+		assert!(looks_like_unbraced_comma_glob("*.ts,*.vue"));
+		assert!(looks_like_unbraced_comma_glob("src/**/*.ts,src/**/*.tsx"));
+		// Legitimate brace expansion is fine.
+		assert!(!looks_like_unbraced_comma_glob("*.{ts,vue}"));
+		assert!(!looks_like_unbraced_comma_glob("*.{js,mjs,ts,svelte}"));
+		assert!(!looks_like_unbraced_comma_glob("src/**/*.{ts,tsx}"));
+		// Mixed: a comma inside the braces and one outside is
+		// still suspicious.
+		assert!(looks_like_unbraced_comma_glob("*.{ts,tsx},*.vue"));
+		// No commas → never flagged.
+		assert!(!looks_like_unbraced_comma_glob("*.ts"));
+		assert!(!looks_like_unbraced_comma_glob("src/**/*.ts"));
 	}
 
 	#[tokio::test]

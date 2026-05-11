@@ -556,6 +556,15 @@ impl LocalHost {
 				return false;
 			}
 		};
+		// Surface parse-time warnings (likely-broken globs etc.) on
+		// the format-on-save panel. Deduped process-wide on the
+		// warning string itself so a misconfigured pattern logs
+		// once, not on every save until the user fixes it.
+		for w in rules.parse_warnings() {
+			if warn_lint_staged_config_once(w) {
+				self.format_log(crate::logs::LogLevel::Warn, || format!("lint-staged config: {w}"));
+			}
+		}
 		if rules.is_empty() {
 			self.format_log(crate::logs::LogLevel::Info, || {
 				"lint-staged: no `.lintstagedrc.*` / `package.json#lint-staged` between this file and the workspace root".into()
@@ -3282,6 +3291,20 @@ fn warn_chain_truncated_once(chain_len: usize) {
 			"format-on-save: lint-staged chain truncated to last command (temporary; see TODO in LocalHost::run_formatter_chain)"
 		);
 	}
+}
+
+/// Process-wide dedup for lint-staged parse-time warnings: returns
+/// `true` the first time a given warning string is seen, `false`
+/// afterwards. Lets the caller emit each distinct warning exactly
+/// once on the format-on-save panel even though the rules object
+/// is re-matched on every save.
+fn warn_lint_staged_config_once(warning: &str) -> bool {
+	use std::collections::HashSet;
+	use std::sync::{Mutex, OnceLock};
+	static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+	let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+	let mut guard = seen.lock().expect("lint-staged config warn cache poisoned");
+	guard.insert(warning.to_owned())
 }
 
 /// Write `text` straight to the host path. Counterpart to
