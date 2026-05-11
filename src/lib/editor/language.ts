@@ -136,6 +136,18 @@ export async function languageFor(filename: string, firstLine?: string): Promise
 			const { html } = await import('@codemirror/lang-html');
 			return [html()];
 		}
+		case 'vue': {
+			// `@codemirror/lang-vue` is the official upstream Vue SFC
+			// grammar (Marijn's, same author as core CodeMirror). It
+			// composes on top of `lang-html` for the template region
+			// and `lang-javascript` for `<script>` blocks, which is
+			// what you'd hand-roll anyway. Pulled in for the team's
+			// Vue projects; no LSP wiring yet (Volar is the obvious
+			// next step but isn't on the roadmap until there's a real
+			// ask for it).
+			const { vue } = await import('@codemirror/lang-vue');
+			return [vue()];
+		}
 		case 'md':
 		case 'markdown': {
 			const { markdown } = await import('@codemirror/lang-markdown');
