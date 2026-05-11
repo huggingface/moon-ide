@@ -96,6 +96,19 @@ function offsetFor(doc: EditorView['state']['doc'], line: number, character: num
 }
 
 /**
+ * LSP position → CM document offset against `view`'s current doc.
+ * Clamps `line` past EOF to the doc length and `character` past
+ * line end to that line's end, so a goto-def that points into a
+ * since-shrunken buffer lands at the closest valid position instead
+ * of crashing CM with an out-of-bounds dispatch. Exported because
+ * both the editor and the diff view consume `pendingJumps` and
+ * need the same conversion.
+ */
+export function offsetForLspPosition(view: EditorView, position: { line: number; character: number }): number {
+	return offsetFor(view.state.doc, position.line, position.character);
+}
+
+/**
  * A `ViewPlugin`-shaped extension that keeps the editor's lint state
  * in sync with `workspace.diagnostics[path]`. Subscribes via an
  * `$effect`-equivalent: the returned updater is invoked from

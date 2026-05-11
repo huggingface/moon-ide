@@ -19,6 +19,7 @@
 		lspCompletionSource,
 		lspDiagnosticsExtension,
 		lspHoverExtension,
+		offsetForLspPosition,
 	} from '../editor/lsp';
 	import { lspGotoDefinitionExtension } from '../editor/lspGotoDefinition';
 	import type { EditorConfig } from '../protocol';
@@ -385,6 +386,59 @@
 		}
 		m.b.dispatch({
 			changes: { from: 0, to: m.b.state.doc.length, insert: text },
+		});
+	});
+
+	// Pending jumps targeted at this buffer's path land here exactly
+	// like in the regular Editor view, so Ctrl-click goto-definition
+	// from *inside* the diff view (or from any other surface that
+	// targets a buffer we happen to have open in diff mode) moves
+	// the right pane's caret to the LSP-returned line + character
+	// instead of leaving it wherever the click happened. Without
+	// this consumer the jump was queued but never applied — the
+	// caret stayed at the clicked symbol and the user saw "nothing
+	// happened" / "wrong line". Mirrors the consumer in
+	// `Editor.svelte`; deleted buffers skip it because their right
+	// pane is empty and read-only.
+	//
+	// Ordering matters: read `pendingJumps` (and the other reactive
+	// inputs) *before* the `merge` check. `merge` is a plain `let`
+	// assigned inside the async `buildMerge`, so it's not reactive
+	// — if we early-returned on `!m` first, the effect would
+	// subscribe to nothing and never re-run when a jump arrives.
+	// The other `$effect`s above use the same trick; they happen to
+	// also have an obvious reactive lead (theme, headByPath, …).
+	$effect(() => {
+		const folder = workspace.activeFolderPath;
+		if (folder === null || file.isDeleted) {
+			return;
+		}
+		const key = `${folder}::${file.path}`;
+		const pending = workspace.pendingJumps.get(key);
+		if (!pending) {
+			return;
+		}
+		const m = merge;
+		if (!m) {
+			return;
+		}
+		// Microtask defers the dispatch past any in-flight CM
+		// state-rebuild (matches the timing rationale in
+		// `Editor.svelte`'s consumer). Capturing `buildToken` /
+		// rechecking `merge` would be defensive against a swap
+		// mid-microtask, but the consumer is cheap enough that an
+		// orphan dispatch into a torn-down view is just a no-op.
+		queueMicrotask(() => {
+			if (!merge) {
+				return;
+			}
+			const offset = offsetForLspPosition(merge.b, pending);
+			merge.b.dispatch({
+				selection: EditorSelection.cursor(offset),
+				effects: EditorView.scrollIntoView(offset, { y: 'center' }),
+			});
+			merge.b.focus();
+			workspace.consumePendingJump(folder, file.path);
 		});
 	});
 

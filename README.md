@@ -62,18 +62,11 @@ sudo apt install -y libwebkit2gtk-4.1-dev libsoup-3.0-dev libgtk-3-dev \
 
 WebKitGTK provides the webview the Tauri app loads at runtime, so this set is required at both build and launch time.
 
-## Run (dev)
+## Run
 
 ```bash
 bun install
-bun run dev
-```
-
-## Run (prod)
-
-```bash
-bun install
-bun run tauri build --no-bundle
+bun run build:bin
 ./target/release/moon-dekstop
 ```
 

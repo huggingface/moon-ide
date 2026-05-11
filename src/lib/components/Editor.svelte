@@ -20,6 +20,7 @@
 		lspCompletionSource,
 		lspDiagnosticsExtension,
 		lspHoverExtension,
+		offsetForLspPosition,
 	} from '../editor/lsp';
 	import { applyAutocompleteFromEditorView } from '../editor/autocompleteApply';
 	import { frontendLog } from '../logs.svelte';
@@ -290,11 +291,7 @@
 			return;
 		}
 		queueMicrotask(() => {
-			const offset = offsetFromLspPosition(v, pending);
-			if (offset === null) {
-				workspace.consumePendingJump(folder, file.path);
-				return;
-			}
+			const offset = offsetForLspPosition(v, pending);
 			v.dispatch({
 				selection: EditorSelection.cursor(offset),
 				effects: EditorView.scrollIntoView(offset, { y: 'center' }),
@@ -524,21 +521,6 @@
 			endLine: effectiveToLineNumber,
 			text,
 		});
-	}
-
-	// LSP position → CM offset, clamped so a range that pointed
-	// past a shorter file (rare, but can happen if the file shrank
-	// between the LSP response and this dispatch) doesn't crash.
-	function offsetFromLspPosition(v: EditorView, position: LspPosition): number | null {
-		const doc = v.state.doc;
-		if (position.line < 0) {
-			return 0;
-		}
-		if (position.line >= doc.lines) {
-			return doc.length;
-		}
-		const lineInfo = doc.line(position.line + 1);
-		return lineInfo.from + Math.min(position.character, lineInfo.length);
 	}
 
 	// CM offset → LSP position. Line numbers are 0-indexed in LSP /
