@@ -36,6 +36,7 @@ import {
 import { lspLanguageFor } from './editor/lspLanguage';
 import { bottomPanel } from './bottomPanel.svelte';
 import { composeLogs } from './composeLogs.svelte';
+import { diagLogs } from './logs.svelte';
 import { terminal } from './terminal.svelte';
 import { coder } from './coder.svelte';
 import { container } from './container.svelte';
@@ -1005,6 +1006,11 @@ class WorkspaceState {
 		// panel's log tabs receive lines as soon as the user opens
 		// one — no per-tab subscription dance.
 		void composeLogs.wireRuntime();
+		// Diagnostic logs panel: subscribe to the backend's
+		// `logs:entry` event so emits from the LSP broker and any
+		// other future producer show up in the bottom-panel
+		// picker without the user having to open the panel first.
+		void diagLogs.start();
 		this.wireNextEditProbe();
 		this.wireGitAutoFetch();
 		void this.refreshNextEditServerStatusThenMaybeAutostart();
@@ -2242,9 +2248,22 @@ class WorkspaceState {
 				this.diagnostics = next;
 			});
 			await listen<LspStatusEvent>('lsp:status', ({ payload }) => {
+				const prev = this.lspStatuses.get(payload.languageId)?.status ?? null;
 				const next = new Map(this.lspStatuses);
 				next.set(payload.languageId, payload);
 				this.lspStatuses = next;
+				// If we just transitioned into `crashed` and the
+				// active file is governed by this language id,
+				// re-`open` it. The broker evicts the dead slot
+				// on the next request; sending a fresh `open` now
+				// primes the re-spawned server with the buffer's
+				// current text so the user's *next* Ctrl+Space
+				// resolves against a server that knows the doc.
+				// Without this they'd have to switch tabs and
+				// back, or edit a character, to re-attach.
+				if (payload.status === 'crashed' && prev !== 'crashed') {
+					this.#reopenActiveForLanguage(payload.languageId);
+				}
 			});
 		} catch {
 			// Event bus unavailable (tests / non-Tauri). The
@@ -2417,6 +2436,29 @@ class WorkspaceState {
 		// "failures" here are the expected graceful degradation
 		// (NotAvailable reported with an Ok(())).
 		void ipc.lsp.open(path, languageId, text).catch(() => {});
+	}
+
+	/**
+	 * Re-`open` the active editor buffer if its language id matches
+	 * `languageId`. Called from the `lsp:status` listener when a
+	 * server crashes, so the broker's auto-respawn (lazy on the
+	 * next request) lands with the live buffer text instead of an
+	 * empty doc set. Idempotent: if the active file isn't
+	 * governed by this language the call is a no-op.
+	 */
+	#reopenActiveForLanguage(languageId: string): void {
+		const file = this.activeFile;
+		if (file === null) {
+			return;
+		}
+		if (file.path.startsWith('untitled:')) {
+			return;
+		}
+		const fileLang = lspLanguageFor(file.path);
+		if (fileLang !== languageId) {
+			return;
+		}
+		this.lspOpen(file.path, file.text);
 	}
 
 	/**

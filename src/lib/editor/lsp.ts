@@ -25,9 +25,16 @@ import { setDiagnostics, type Diagnostic as CmDiagnostic, lintGutter } from '@co
 import { Facet, type Extension } from '@codemirror/state';
 import { EditorView, hoverTooltip, type Tooltip } from '@codemirror/view';
 import { ipc } from '../ipc';
+import { frontendLog } from '../logs.svelte';
 import { openExternalMarkdownLink, renderMarkdown } from '../markdown';
-import type { LspDiagnostic, LspSeverity } from '../protocol';
+import { formatError, type LspDiagnostic, type LspSeverity } from '../protocol';
 import { lspLanguageFor } from './lspLanguage';
+
+/** Diagnostic-logs source for everything autocomplete-related.
+ * The user explicitly asked to see Ctrl+Space breadcrumbs here so
+ * "did the keybinding fire?" vs. "did the LSP answer empty?" is
+ * one click away. */
+const COMPLETION_LOG_SOURCE = 'editor.completion';
 
 // Facet so every adapter (diagnostics, hover, completion) reads the
 // *same* path for the editor view. The Editor component `.of()`s it
@@ -236,10 +243,20 @@ export const lspCompletionSource: CompletionSource = async (
 ): Promise<CompletionResult | null> => {
 	const path = context.state.facet(filePathFacet);
 	if (!path) {
+		frontendLog(
+			COMPLETION_LOG_SOURCE,
+			'debug',
+			`invoked (explicit=${context.explicit}) — no file path bound, skipping`,
+		);
 		return null;
 	}
 	const languageId = lspLanguageFor(path);
 	if (!languageId) {
+		frontendLog(
+			COMPLETION_LOG_SOURCE,
+			'debug',
+			`invoked (explicit=${context.explicit}, path=${path}) — no LSP language id for this extension, skipping`,
+		);
 		return null;
 	}
 	const line = context.state.doc.lineAt(context.pos);
@@ -247,13 +264,28 @@ export const lspCompletionSource: CompletionSource = async (
 		line: line.number - 1,
 		character: context.pos - line.from,
 	};
+	frontendLog(
+		COMPLETION_LOG_SOURCE,
+		'info',
+		`invoked (explicit=${context.explicit}, path=${path}, lang=${languageId}, line=${position.line}, char=${position.character}) → calling lsp_completion`,
+	);
 	let list;
 	try {
 		list = await ipc.lsp.completion(path, languageId, position);
-	} catch {
+	} catch (err) {
+		frontendLog(COMPLETION_LOG_SOURCE, 'error', `lsp_completion threw: ${formatError(err)}`);
 		return null;
 	}
+	frontendLog(
+		COMPLETION_LOG_SOURCE,
+		'info',
+		`lsp_completion returned ${list.items.length} item${list.items.length === 1 ? '' : 's'} (isIncomplete=${list.isIncomplete})`,
+	);
 	if (list.items.length === 0) {
+		// Returning `null` here lets CM dismiss the popover; the
+		// log line above is the only signal the user gets that
+		// "Ctrl+Space did fire, the server just had nothing to
+		// offer at this position".
 		return null;
 	}
 	// `from` is the start of the word under the caret; CM uses it

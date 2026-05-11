@@ -7,6 +7,7 @@
 		"dev": "tauri dev",
 		"dev:vite": "vite",
 		"build": "tauri build",
+		"build:bin": "tauri build --no-bundle",
 		"build:vite": "vite build",
 		"preview": "vite preview",
 		"tauri": "tauri",

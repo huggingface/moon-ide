@@ -231,7 +231,7 @@ async fn ensure_broker(state: &AppState, app: &AppHandle) -> Result<std::sync::A
 		}
 	};
 
-	let broker = LspBroker::new_with_spawner(root.clone(), spawner, translator);
+	let broker = LspBroker::new_with_spawner(root.clone(), spawner, translator, state.logs.clone());
 	let mut rx = broker.subscribe();
 	let app_clone = app.clone();
 	let pump = tokio::spawn(async move {

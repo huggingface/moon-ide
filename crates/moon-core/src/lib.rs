@@ -12,6 +12,7 @@ pub mod editorconfig;
 pub mod format;
 pub mod host;
 pub mod lint_staged;
+pub mod logs;
 pub mod lsp;
 pub mod next_edit;
 pub mod next_edit_server;
@@ -22,6 +23,7 @@ pub mod shell;
 pub mod workspace;
 
 pub use host::{read_host_file, write_host_file, LocalHost, WorkspaceHost};
+pub use logs::LogSink;
 pub use shell::{AlwaysHostResolver, ShellResolver, ShellResolverHandle, ShellTarget};
 pub use workspace::{WorkspaceFolderEntry, WorkspaceRegistry};
 

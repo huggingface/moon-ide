@@ -5,6 +5,8 @@
 	import { workspace } from '../state.svelte';
 	import { terminalExitSuffix } from '../terminal.svelte';
 	import LogTab from './LogTab.svelte';
+	import LogsLauncher from './LogsLauncher.svelte';
+	import LogsPanel from './LogsPanel.svelte';
 	import TerminalTab from './TerminalTab.svelte';
 	import TerminalLauncher from './TerminalLauncher.svelte';
 	import TerminalTargetIcon from './TerminalTargetIcon.svelte';
@@ -130,6 +132,7 @@
 			{/each}
 		</ol>
 		<div class="strip-actions">
+			<LogsLauncher anchor="above" title="Open diagnostic logs" />
 			<TerminalLauncher anchor="above" variant="full" title="Open a new terminal" />
 			<button
 				type="button"
@@ -170,6 +173,8 @@
 						<LogTab {tab} />
 					{:else if tab.kind === 'terminal'}
 						<TerminalTab {tab} />
+					{:else if tab.kind === 'diag'}
+						<LogsPanel {tab} />
 					{/if}
 				</div>
 			{/each}

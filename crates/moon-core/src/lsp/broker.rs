@@ -33,6 +33,7 @@ use super::server::{
 	PYTHON_SERVER, RUST_SERVER, TS_SERVER,
 };
 use super::spawn::LspSpawner;
+use crate::logs::LogSink;
 
 pub struct LspBroker {
 	root: Utf8PathBuf,
@@ -53,6 +54,13 @@ pub struct LspBroker {
 	fallback: Option<SpawnerPair>,
 	servers: Mutex<HashMap<String, ServerSlot>>,
 	events: broadcast::Sender<LspServerEvent>,
+	/// Diagnostic log sink. Receives the same status transitions
+	/// the `events` channel does, plus routing decisions
+	/// (primary-vs-fallback, discovery hits/misses) the UI can
+	/// pull up in the bottom-panel logs view. Every broker gets a
+	/// sink — tests construct a standalone one and ignore it.
+	/// See [`crate::logs`].
+	log_sink: Arc<LogSink>,
 }
 
 /// One "how to spawn" target: the spawner plus the translator
@@ -92,14 +100,15 @@ pub type LspEventRx = broadcast::Receiver<LspServerEvent>;
 
 impl LspBroker {
 	/// Host-only broker. Equivalent to
-	/// `new_with_spawner(root, LspSpawner::Local, Identity{ root })`;
+	/// `new_with_spawner(root, LspSpawner::Local, Identity{ root }, LogSink::new())`;
 	/// kept as a thin helper so existing call sites and tests that
-	/// don't care about container routing stay readable.
+	/// don't care about container routing or log routing stay
+	/// readable. Tests get a fresh standalone sink they can drop.
 	pub fn new(root: Utf8PathBuf) -> Arc<Self> {
 		let translator = PathTranslator::Identity {
 			host_root: root.clone(),
 		};
-		Self::new_with_spawner(root, LspSpawner::Local, translator)
+		Self::new_with_spawner(root, LspSpawner::Local, translator, LogSink::new())
 	}
 
 	/// Full form. The Tauri layer uses this to plug in
@@ -108,13 +117,25 @@ impl LspBroker {
 	/// LSP. See `specs/lsp.md#container-backed-lsp` for the
 	/// routing table.
 	///
+	/// `log_sink` collects routing decisions and status changes for
+	/// the bottom-panel logs view (see [`crate::logs`]). It's
+	/// non-optional on purpose — every production broker has a
+	/// sink, and making it `Option` would mean a needless branch
+	/// at every emit site. Tests pass a fresh [`LogSink::new()`]
+	/// and ignore the broadcast end.
+	///
 	/// When `spawner` is `DockerExec`, the broker auto-populates a
 	/// host fallback from the translator's host root so any server
 	/// whose binary can't be resolved inside the container (hoisted
 	/// node_modules, custom image) still runs on the host. No
 	/// fallback is kept when `spawner` is already `Local` — there
 	/// is nowhere lower to drop to.
-	pub fn new_with_spawner(root: Utf8PathBuf, spawner: LspSpawner, translator: PathTranslator) -> Arc<Self> {
+	pub fn new_with_spawner(
+		root: Utf8PathBuf,
+		spawner: LspSpawner,
+		translator: PathTranslator,
+		log_sink: Arc<LogSink>,
+	) -> Arc<Self> {
 		let fallback = match &spawner {
 			LspSpawner::DockerExec { .. } => {
 				let host_root = translator.host_root().clone();
@@ -137,7 +158,17 @@ impl LspBroker {
 			fallback,
 			servers: Mutex::new(HashMap::new()),
 			events,
+			log_sink,
 		})
+	}
+
+	/// Source key used by the broker for its own log emissions.
+	/// Per-language so the picker's grouping (`lsp.typescript`,
+	/// `lsp.rust`, …) matches what the user sees in the status
+	/// bar pill — easier to mental-model than a single shared
+	/// `lsp` bucket.
+	fn log_source_for(language_id: &str) -> String {
+		format!("lsp.{language_id}")
 	}
 
 	pub fn subscribe(&self) -> LspEventRx {
@@ -178,13 +209,29 @@ impl LspBroker {
 	/// cached in the `servers` map so a missing server doesn't
 	/// re-probe on every subsequent open.
 	async fn ensure_server(&self, spec: &LspBinarySpec) -> Result<Option<Arc<LspServer>>, LspClientError> {
+		let log_source = Self::log_source_for(spec.language_id);
 		{
-			let servers = self.servers.lock().await;
+			let mut servers = self.servers.lock().await;
 			if let Some(slot) = servers.get(spec.language_id) {
-				return Ok(match slot {
-					ServerSlot::Ready(s) => Some(s.clone()),
-					ServerSlot::NotAvailable => None,
-				});
+				match slot {
+					ServerSlot::Ready(s) if s.is_alive() => return Ok(Some(s.clone())),
+					ServerSlot::Ready(_) => {
+						// Cached server died (the LspServer's
+						// death-watcher already logged + flipped
+						// the status pill). Evict so the spawn
+						// path below mints a fresh one. The doc
+						// state from the old server is lost; the
+						// frontend's `lsp:status` Crashed
+						// listener re-opens the active file, so
+						// the next request after this one
+						// resolves against a primed server.
+						servers.remove(spec.language_id);
+						self
+							.log_sink
+							.info(&log_source, "re-spawning after detected death of previous server");
+					}
+					ServerSlot::NotAvailable => return Ok(None),
+				}
 			}
 		}
 
@@ -196,6 +243,9 @@ impl LspBroker {
 			status: mp::LspServerStatus::Starting,
 			detail: Some(spec.bin_name.to_owned()),
 		}));
+		self
+			.log_sink
+			.info(&log_source, format!("starting server (bin = {})", spec.bin_name));
 
 		match self.try_spawn_on(spec, &self.primary).await {
 			SpawnOutcome::Ready(server) => {
@@ -204,6 +254,7 @@ impl LspBroker {
 					.lock()
 					.await
 					.insert(spec.language_id.to_owned(), ServerSlot::Ready(server.clone()));
+				self.log_sink.info(&log_source, "server ready on primary route");
 				return Ok(Some(server));
 			}
 			SpawnOutcome::Err(e) => {
@@ -217,17 +268,24 @@ impl LspBroker {
 					.lock()
 					.await
 					.insert(spec.language_id.to_owned(), ServerSlot::NotAvailable);
+				let detail = e.to_string();
 				let _ = self.events.send(LspServerEvent::StatusChanged(mp::LspStatusEvent {
 					language_id: spec.language_id.to_owned(),
 					status: mp::LspServerStatus::Crashed,
-					detail: Some(e.to_string()),
+					detail: Some(detail.clone()),
 				}));
+				self
+					.log_sink
+					.error(&log_source, format!("spawn failed on primary route: {detail}"));
 				return Err(e);
 			}
 			SpawnOutcome::Unavailable => {
 				// Binary wasn't found or `--version` probe
 				// exited non-zero. Fall through to the host
 				// fallback if one is configured.
+				self
+					.log_sink
+					.warn(&log_source, "binary not found on primary route (container)");
 			}
 		}
 
@@ -237,6 +295,7 @@ impl LspBroker {
 				lang = spec.language_id,
 				"lsp: primary (container) unavailable, retrying on host fallback"
 			);
+			self.log_sink.info(&log_source, "retrying on host fallback route");
 			match self.try_spawn_on(spec, fallback).await {
 				SpawnOutcome::Ready(server) => {
 					self
@@ -244,6 +303,7 @@ impl LspBroker {
 						.lock()
 						.await
 						.insert(spec.language_id.to_owned(), ServerSlot::Ready(server.clone()));
+					self.log_sink.info(&log_source, "server ready on host fallback route");
 					return Ok(Some(server));
 				}
 				SpawnOutcome::Err(e) => {
@@ -252,16 +312,23 @@ impl LspBroker {
 						.lock()
 						.await
 						.insert(spec.language_id.to_owned(), ServerSlot::NotAvailable);
+					let detail = e.to_string();
 					let _ = self.events.send(LspServerEvent::StatusChanged(mp::LspStatusEvent {
 						language_id: spec.language_id.to_owned(),
 						status: mp::LspServerStatus::Crashed,
-						detail: Some(e.to_string()),
+						detail: Some(detail.clone()),
 					}));
+					self
+						.log_sink
+						.error(&log_source, format!("spawn failed on host fallback: {detail}"));
 					return Err(e);
 				}
 				SpawnOutcome::Unavailable => {
 					// Host fallback also missing the binary.
 					// Fall through to the NotAvailable pill.
+					self
+						.log_sink
+						.warn(&log_source, "binary not found on host fallback either");
 				}
 			}
 		}
@@ -279,6 +346,10 @@ impl LspBroker {
 			// without leaving the IDE.
 			detail: Some(spec.install_hint.to_owned()),
 		}));
+		self.log_sink.warn(
+			&log_source,
+			format!("not available; install hint: {}", spec.install_hint),
+		);
 		Ok(None)
 	}
 
@@ -290,25 +361,50 @@ impl LspBroker {
 	/// `Err` is a real spawn / init failure that should bubble
 	/// all the way out.
 	async fn try_spawn_on(&self, spec: &LspBinarySpec, route: &SpawnerPair) -> SpawnOutcome {
+		let log_source = Self::log_source_for(spec.language_id);
 		let bin_path: PathBuf = match &route.spawner {
 			LspSpawner::Local => match discover_binary(spec.bin_name, spec.discovery, self.root.as_std_path()) {
-				Some(p) => p,
+				Some(p) => {
+					self
+						.log_sink
+						.debug(&log_source, format!("host discovery → {}", p.display()));
+					p
+				}
 				None => {
 					tracing::info!(
 						bin = spec.bin_name,
 						lang = spec.language_id,
 						"lsp: host binary discovery found nothing"
 					);
+					self.log_sink.debug(
+						&log_source,
+						format!(
+							"host discovery: no `{}` found on PATH or ecosystem paths",
+							spec.bin_name
+						),
+					);
 					return SpawnOutcome::Unavailable;
 				}
 			},
 			LspSpawner::DockerExec { .. } => match container_binary_path(spec, &route.translator) {
-				Some(p) => p,
+				Some(p) => {
+					self
+						.log_sink
+						.debug(&log_source, format!("container discovery → {}", p.display()));
+					p
+				}
 				None => {
 					tracing::info!(
 						bin = spec.bin_name,
 						lang = spec.language_id,
 						"lsp: container binary path unresolved (likely node_modules above mount or missing)"
+					);
+					self.log_sink.debug(
+						&log_source,
+						format!(
+							"container discovery: no `{}` found below the bind mount (hoisted node_modules?)",
+							spec.bin_name
+						),
 					);
 					return SpawnOutcome::Unavailable;
 				}
@@ -333,6 +429,9 @@ impl LspBroker {
 				probe_args = ?spec.probe_args,
 				"lsp: probe failed on this route"
 			);
+			self
+				.log_sink
+				.warn(&log_source, format!("probe `{} {:?}` failed", bin_str, spec.probe_args));
 			return SpawnOutcome::Unavailable;
 		}
 
@@ -342,6 +441,7 @@ impl LspBroker {
 			&route.spawner,
 			route.translator.clone(),
 			self.events.clone(),
+			self.log_sink.clone(),
 		)
 		.await
 		{

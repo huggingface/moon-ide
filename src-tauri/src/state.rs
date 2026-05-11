@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use camino::Utf8PathBuf;
 use moon_coder::CoderHandle;
-use moon_core::{NextEditServerSupervisor, WorkspaceRegistry};
+use moon_core::{LogSink, NextEditServerSupervisor, WorkspaceRegistry};
 use moon_slack::{SlackClient, TokenStore};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::AbortHandle;
@@ -60,6 +60,11 @@ pub struct AppState {
 	/// to decide whether to render the preboot landing or the
 	/// regular IDE shell.
 	pub mode: AppMode,
+	/// Diagnostic log sink. Wired into the LSP broker (and,
+	/// later, format-on-save / fs-watcher / git) so user-
+	/// facing breadcrumbs are available in the bottom-panel
+	/// logs view instead of only in launcher stderr.
+	pub logs: Arc<LogSink>,
 }
 
 /// What this process is doing. Picked once at startup based on
@@ -102,6 +107,11 @@ pub enum TerminalCommand {
 }
 
 impl AppState {
+	// Eight fields by design: this is the process's whole world
+	// (workspace registry, paths, every long-lived actor handle).
+	// A builder or grouping struct would just shuffle the same
+	// arity around without paying for itself.
+	#[allow(clippy::too_many_arguments)]
 	pub fn new(
 		config_dir: Utf8PathBuf,
 		workspaces_dir: Utf8PathBuf,
@@ -110,6 +120,7 @@ impl AppState {
 		workspaces: Arc<WorkspaceRegistry>,
 		coder: CoderHandle,
 		mode: AppMode,
+		logs: Arc<LogSink>,
 	) -> Self {
 		Self {
 			workspaces,
@@ -123,6 +134,7 @@ impl AppState {
 			coder,
 			next_edit_server: Arc::new(NextEditServerSupervisor::default()),
 			mode,
+			logs,
 		}
 	}
 

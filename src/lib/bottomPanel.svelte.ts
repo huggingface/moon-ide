@@ -64,7 +64,7 @@ export const DEFAULT_BOTTOM_PANEL_HEIGHT = 240;
  * lean shells — kind-specific content (log line buffers, future
  * terminal session handles) lives in a sibling store keyed on
  * `id` so adding new kinds doesn't bloat this type. */
-export type BottomPanelTab = PlaceholderTab | LogTab | TerminalTab;
+export type BottomPanelTab = PlaceholderTab | LogTab | TerminalTab | DiagTab;
 
 export type PlaceholderTab = {
 	id: string;
@@ -91,6 +91,20 @@ export type TerminalTab = {
 	title: string;
 	kind: 'terminal';
 	target: TerminalTarget;
+};
+
+/** Diagnostic-logs tab. One tab = one [`source`] from the unified
+ * `diagLogs` store (`logs.svelte.ts`). Multiple tabs on the same
+ * source are deduped at open time so a second click on the same
+ * picker entry just focuses the existing tab.
+ *
+ * Per-source buffers live in `diagLogs`, not the tab itself —
+ * matches the `LogTab` ↔ `composeLogs` split. */
+export type DiagTab = {
+	id: string;
+	title: string;
+	kind: 'diag';
+	source: string;
 };
 
 class BottomPanelStore {
@@ -197,6 +211,14 @@ class BottomPanelStore {
 	findLogTab(folderPath: string, service: string): LogTab | null {
 		const tab = this.#tabs.find((t) => t.kind === 'log' && t.folderPath === folderPath && t.service === service);
 		return tab && tab.kind === 'log' ? tab : null;
+	}
+
+	/** Find an existing diagnostic-logs tab for `source`. Same
+	 * dedup posture as [`findLogTab`] — the bottom-panel picker
+	 * uses it to focus rather than open a duplicate. */
+	findDiagTab(source: string): DiagTab | null {
+		const tab = this.#tabs.find((t) => t.kind === 'diag' && t.source === source);
+		return tab && tab.kind === 'diag' ? tab : null;
 	}
 
 	closeTab(id: string): void {

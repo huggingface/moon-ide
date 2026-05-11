@@ -300,6 +300,19 @@ impl PathTranslator {
 			PathTranslator::HostMount { host_root, .. } => host_root,
 		}
 	}
+
+	/// `true` when the server lives in a different process namespace
+	/// from us (devcontainer, future SSH host, …). Callers must NOT
+	/// forward our host PID to a server that can't observe it — see
+	/// `initialize.processId` in the LSP spec: many servers (tsgo
+	/// included) poll that PID with `kill -0` as a parent-died
+	/// watchdog. In a separate PID namespace that poll always fails,
+	/// so the server exits within seconds and the broker re-spawns
+	/// it in a tight loop. Opting out of the watchdog by sending
+	/// `null` is the spec-blessed escape hatch for this case.
+	pub fn is_remote(&self) -> bool {
+		matches!(self, PathTranslator::HostMount { .. })
+	}
 }
 
 struct DocState {
@@ -328,6 +341,7 @@ impl LspServer {
 		spawner: &LspSpawner,
 		translator: PathTranslator,
 		events: broadcast::Sender<LspServerEvent>,
+		log_sink: Arc<crate::logs::LogSink>,
 	) -> Result<Option<Arc<Self>>, LspClientError> {
 		let mut child = spawner
 			.build_command(bin_path, spec.args)
@@ -351,13 +365,21 @@ impl LspServer {
 			.take()
 			.ok_or_else(|| LspClientError::Io("child stderr not piped".into()))?;
 
-		// Pipe stderr to tracing so a crash-loop is visible in
-		// `RUST_LOG=moon=debug` without spamming info logs.
+		// Mirror stderr to both `tracing` (debug under
+		// `RUST_LOG=moon=debug`) and the bottom-panel logs view
+		// (always visible to the user). Server stderr is where
+		// crash messages, ill-formed config warnings, and ty-
+		// missing-stub gripes live — having those one click away
+		// turns an opaque "LSP went quiet" into a clear "the
+		// server says X".
 		let lang = spec.language_id.to_owned();
+		let log_source = format!("lsp.{lang}");
+		let stderr_sink = log_sink.clone();
 		tokio::spawn(async move {
 			let mut reader = BufReader::new(stderr).lines();
 			while let Ok(Some(line)) = reader.next_line().await {
 				tracing::debug!(lang = %lang, "lsp stderr: {line}");
+				stderr_sink.debug(&log_source, format!("stderr: {line}"));
 			}
 		});
 
@@ -420,7 +442,41 @@ impl LspServer {
 			}))
 			.ok();
 
+		// Death-watcher: the moment the client's I/O loops exit
+		// (child crashed, stdout EOF, write failed), surface it as
+		// a `Crashed` status transition and a log entry. Without
+		// this, the death sits invisible until the next request
+		// returns the opaque "lsp client shut down" RPC error.
+		// The broker's `ensure_server` separately evicts the slot
+		// via `is_alive()`, so the very next call re-spawns.
+		let death_signal = server.client.death_signal();
+		let events_for_death = events.clone();
+		let log_for_death = log_sink.clone();
+		let lang_for_death = spec.language_id.to_owned();
+		let bin_for_death = bin_path.display().to_string();
+		tokio::spawn(async move {
+			death_signal.wait().await;
+			let _ = events_for_death.send(LspServerEvent::StatusChanged(mp::LspStatusEvent {
+				language_id: lang_for_death.clone(),
+				status: mp::LspServerStatus::Crashed,
+				detail: Some("server stdio closed unexpectedly".to_owned()),
+			}));
+			log_for_death.error(
+				&format!("lsp.{lang_for_death}"),
+				format!(
+					"server died ({bin_for_death}); slot evicted, next request will re-spawn. Inspect lines above for stderr from the dying child."
+				),
+			);
+		});
+
 		Ok(Some(server))
+	}
+
+	/// `true` while the underlying I/O loops are still pumping.
+	/// The broker calls this when fishing a cached server out of
+	/// its slot map — a `false` answer means evict-and-re-spawn.
+	pub fn is_alive(&self) -> bool {
+		self.client.is_alive()
 	}
 
 	async fn initialize(&self) -> Result<(), LspClientError> {
@@ -490,9 +546,23 @@ impl LspServer {
 		let server_root = self.translator.server_root();
 		let root_uri = path_to_file_uri(server_root.as_std_path());
 
+		// Forward our PID only if the server is in the same PID
+		// namespace (host route). For container / remote routes we
+		// send `null`: the spec lets us opt out of the parent-died
+		// watchdog, and forwarding a PID the server can't see is
+		// actively harmful — tsgo's watchdog poll `kill -0` fails
+		// immediately, the server exits ~5s into its lifetime, and
+		// the broker re-spawns in a tight loop ("Parent process N
+		// has exited, shutting down" / "context canceled" in stderr).
+		let process_id = if self.translator.is_remote() {
+			None
+		} else {
+			Some(std::process::id())
+		};
+
 		#[allow(deprecated)]
 		let params = lt::InitializeParams {
-			process_id: Some(std::process::id()),
+			process_id,
 			root_path: None,
 			root_uri: Some(root_uri.clone()),
 			initialization_options: None,

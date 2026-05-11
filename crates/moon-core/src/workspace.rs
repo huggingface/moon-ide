@@ -61,6 +61,12 @@ pub struct WorkspaceRegistry {
 	/// `add_folder` reads it on each call so subsequent folders
 	/// inherit the same routing.
 	shell_resolver: OnceLock<ShellResolverHandle>,
+	/// Diagnostic log sink, shared across every folder's
+	/// [`LocalHost`] so format-on-save (and other host-side
+	/// pipelines we wire next) emit to the same bottom-panel
+	/// view. Same lifecycle as `shell_resolver`: set once at
+	/// startup, picked up by every subsequent `add_folder`.
+	log_sink: OnceLock<Arc<crate::logs::LogSink>>,
 }
 
 #[derive(Default)]
@@ -75,6 +81,7 @@ impl WorkspaceRegistry {
 			id,
 			inner: RwLock::default(),
 			shell_resolver: OnceLock::new(),
+			log_sink: OnceLock::new(),
 		}
 	}
 
@@ -85,6 +92,14 @@ impl WorkspaceRegistry {
 	/// every host shares the same resolver instance.
 	pub fn set_shell_resolver(&self, handle: ShellResolverHandle) {
 		let _ = self.shell_resolver.set(handle);
+	}
+
+	/// Install the workspace's shared [`LogSink`]. Same first-
+	/// call-wins semantics as `set_shell_resolver`; every folder
+	/// added after this point inherits the sink, format-on-save
+	/// included.
+	pub fn set_log_sink(&self, sink: Arc<crate::logs::LogSink>) {
+		let _ = self.log_sink.set(sink);
 	}
 
 	/// Add `path` as a folder in the workspace and make it active.
@@ -120,6 +135,9 @@ impl WorkspaceRegistry {
 		let mut local = LocalHost::new(canonical);
 		if let Some(resolver) = self.shell_resolver.get() {
 			local = local.with_shell_resolver(resolver.clone());
+		}
+		if let Some(sink) = self.log_sink.get() {
+			local = local.with_log_sink(sink.clone());
 		}
 		let entry = Arc::new(WorkspaceFolderEntry {
 			folder,

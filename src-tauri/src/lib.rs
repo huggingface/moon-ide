@@ -168,6 +168,10 @@ pub fn run() {
 			commands::lsp::lsp_hover,
 			commands::lsp::lsp_completion,
 			commands::lsp::lsp_definition,
+			commands::logs::logs_snapshot,
+			commands::logs::logs_sources,
+			commands::logs::logs_clear,
+			commands::logs::logs_emit,
 			commands::next_edit::next_edit_probe,
 			commands::next_edit::next_edit_complete,
 			commands::next_edit::next_edit_server_start,
@@ -307,6 +311,16 @@ pub fn run() {
 			.map_err(|err| format!("could not init moon-coder: {err}"))?;
 			commands::coder::spawn_event_pump(app.handle().clone(), coder.clone());
 
+			let logs = moon_core::LogSink::new();
+			commands::logs::spawn_event_pump(app.handle().clone(), logs.clone());
+			// Share the sink with every folder's `LocalHost` so
+			// format-on-save (and any future host-side pipeline
+			// we wire in) lands in the bottom-panel logs view
+			// under source `"format-on-save"`. Same shape as the
+			// shell-resolver wiring above; both have to land
+			// before the first folder gets added.
+			workspace_registry.set_log_sink(logs.clone());
+
 			let state = AppState::new(
 				config_dir.clone(),
 				workspaces_dir.clone(),
@@ -315,6 +329,7 @@ pub fn run() {
 				workspace_registry,
 				coder,
 				mode.clone(),
+				logs,
 			);
 
 			// Live OS colour-scheme tracking (Linux only — on macOS

@@ -13,6 +13,7 @@ use moon_protocol::git::{
 	GitFileStatus, GitLineBlame, GitStatusEntry, PrListScope, PrListStatus,
 };
 use moon_protocol::{MoonError, MoonResult};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::editorconfig::EditorConfigService;
@@ -400,6 +401,11 @@ pub struct LocalHost {
 	/// container when it's `Running`. See `crate::shell` and
 	/// ADR 0002.
 	shell_resolver: Option<ShellResolverHandle>,
+	/// Diagnostic log sink. `None` in tests / pure-library use; the
+	/// Tauri layer plugs in `AppState::logs` at startup so
+	/// format-on-save decisions land in the bottom-panel logs view
+	/// under source `"format-on-save"`. See test plan 0069.
+	log_sink: Option<Arc<crate::logs::LogSink>>,
 }
 
 impl LocalHost {
@@ -409,6 +415,7 @@ impl LocalHost {
 			lint_staged: LintStagedService::new(root.clone()),
 			root,
 			shell_resolver: None,
+			log_sink: None,
 		}
 	}
 
@@ -419,6 +426,28 @@ impl LocalHost {
 	pub fn with_shell_resolver(mut self, resolver: ShellResolverHandle) -> Self {
 		self.shell_resolver = Some(resolver);
 		self
+	}
+
+	/// Plug in the workspace's shared [`LogSink`] so format-on-save
+	/// emits user-visible breadcrumbs (decision points, command
+	/// runs, exit codes) under source `"format-on-save"`. Tests
+	/// and non-Tauri callers can leave it unset; emits become a
+	/// no-op.
+	pub fn with_log_sink(mut self, sink: Arc<crate::logs::LogSink>) -> Self {
+		self.log_sink = Some(sink);
+		self
+	}
+
+	/// Convenience: emit one info-level entry on source
+	/// `format-on-save`. No-op when no sink is installed (tests
+	/// and library use). The string is built lazily by the
+	/// closure so callers pay nothing for a missing sink.
+	fn format_log<F>(&self, level: crate::logs::LogLevel, msg: F)
+	where
+		F: FnOnce() -> String,
+	{
+		let Some(sink) = &self.log_sink else { return };
+		sink.emit("format-on-save", level, msg());
 	}
 
 	pub fn root(&self) -> &Utf8Path {
@@ -481,28 +510,66 @@ impl LocalHost {
 		// translation for the `Container` shell target rebases this
 		// through the bind mount so the in-container process sees the
 		// same file under `/workspace/<basename>/...`.
-		let Ok(abs_str) = self.absolute_path(rel).await else {
-			return false;
+		let abs_str = match self.absolute_path(rel).await {
+			Ok(s) => s,
+			Err(err) => {
+				self.format_log(crate::logs::LogLevel::Warn, || {
+					format!("could not resolve absolute path for {rel}: {err}; nothing ran")
+				});
+				return false;
+			}
 		};
 		let abs = Utf8PathBuf::from(abs_str);
 		let target = self.shell_target().await;
+		let target_label = match &target {
+			ShellTarget::Host => "host".to_owned(),
+			ShellTarget::Container { container_name, .. } => format!("container {container_name}"),
+		};
+		self.format_log(crate::logs::LogLevel::Info, || {
+			format!("save: {rel} (formatter dispatch target = {target_label})")
+		});
 
 		if self.run_lint_staged_chain_for(rel, &abs, &target).await {
 			return true;
 		}
-		self.run_default_formatter_for(&abs, &target).await
+		if self.run_default_formatter_for(&abs, &target).await {
+			return true;
+		}
+		self.format_log(crate::logs::LogLevel::Info, || {
+			let ext = abs.extension().unwrap_or("");
+			format!(
+				"no formatter configured for {rel} (no lint-staged match, no language default for .{ext}); bytes left as-is"
+			)
+		});
+		false
 	}
 
 	/// Layer 1 of `run_formatter_chain`: matched lint-staged rule.
 	/// Returns `true` when a command ran.
 	async fn run_lint_staged_chain_for(&self, rel: &Utf8Path, abs: &Utf8Path, target: &ShellTarget) -> bool {
-		let Ok(rules) = self.lint_staged.for_path(rel).await else {
-			return false;
+		let rules = match self.lint_staged.for_path(rel).await {
+			Ok(r) => r,
+			Err(err) => {
+				self.format_log(crate::logs::LogLevel::Warn, || {
+					format!("lint-staged: failed to load config: {err}")
+				});
+				return false;
+			}
 		};
 		if rules.is_empty() {
+			self.format_log(crate::logs::LogLevel::Info, || {
+				"lint-staged: no `.lintstagedrc.*` / `package.json#lint-staged` between this file and the workspace root".into()
+			});
 			return false;
 		}
 		let Some(commands) = rules.match_commands(abs.as_std_path()) else {
+			self.format_log(crate::logs::LogLevel::Info, || {
+				let config = rules
+					.config_dir()
+					.map(|d| d.as_str().to_owned())
+					.unwrap_or_else(|| self.root.as_str().to_owned());
+				format!("lint-staged: config found at {config} but no glob matched {abs}")
+			});
 			return false;
 		};
 		// Until the chain-truncation TODO on `run_formatter_chain` lifts,
@@ -510,17 +577,37 @@ impl LocalHost {
 		// configs (the formatter is the last entry; the linter is
 		// before it), so dropping the prefix is the smallest change
 		// that gets format-on-save working again on `moon-landing/server`.
+		let total = commands.len();
 		let Some(cmd) = commands.last() else {
 			return false;
 		};
-		if commands.len() > 1 {
-			warn_chain_truncated_once(commands.len());
+		if total > 1 {
+			warn_chain_truncated_once(total);
 		}
 		// `config_dir` is `Some` whenever `match_commands` returned a
 		// hit (the rule came from a real file on disk); the workspace
 		// root is just a defensive fallback the type system asks for.
 		let cwd = rules.config_dir().unwrap_or(&self.root).to_path_buf();
-		let _ = format::run_formatter(&self.root, &cwd, abs, cmd, target).await;
+		self.format_log(crate::logs::LogLevel::Info, || {
+			let trunc_note = if total > 1 {
+				format!(" (chain has {total} commands; only the last runs — see TODO in run_formatter_chain)")
+			} else {
+				String::new()
+			};
+			format!("lint-staged: running `{cmd}` in {cwd}{trunc_note}")
+		});
+		let started = std::time::Instant::now();
+		let ok = format::run_formatter(&self.root, &cwd, abs, cmd, target).await;
+		let elapsed_ms = started.elapsed().as_millis();
+		let outcome_level = if ok {
+			crate::logs::LogLevel::Info
+		} else {
+			crate::logs::LogLevel::Warn
+		};
+		self.format_log(outcome_level, || {
+			let verb = if ok { "succeeded" } else { "failed (see warnings above)" };
+			format!("lint-staged: `{cmd}` {verb} in {elapsed_ms}ms")
+		});
 		true
 	}
 
@@ -537,9 +624,27 @@ impl LocalHost {
 	/// us having to translate the bin token itself.
 	async fn run_default_formatter_for(&self, abs: &Utf8Path, target: &ShellTarget) -> bool {
 		let Some(default) = format::default_format_command(abs) else {
+			self.format_log(crate::logs::LogLevel::Info, || {
+				let ext = abs.extension().unwrap_or("");
+				format!("default formatter: no built-in rule for .{ext}")
+			});
 			return false;
 		};
-		let _ = format::run_formatter(&self.root, &default.cwd, abs, &default.command, target).await;
+		self.format_log(crate::logs::LogLevel::Info, || {
+			format!("default formatter: running `{}` in {}", default.command, default.cwd)
+		});
+		let started = std::time::Instant::now();
+		let ok = format::run_formatter(&self.root, &default.cwd, abs, &default.command, target).await;
+		let elapsed_ms = started.elapsed().as_millis();
+		let outcome_level = if ok {
+			crate::logs::LogLevel::Info
+		} else {
+			crate::logs::LogLevel::Warn
+		};
+		self.format_log(outcome_level, || {
+			let verb = if ok { "succeeded" } else { "failed (see warnings above)" };
+			format!("default formatter: `{}` {verb} in {elapsed_ms}ms", default.command)
+		});
 		true
 	}
 

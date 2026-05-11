@@ -10,6 +10,7 @@ pub mod editorconfig;
 pub mod error;
 pub mod fs;
 pub mod git;
+pub mod logs;
 pub mod lsp;
 pub mod next_edit;
 pub mod search;

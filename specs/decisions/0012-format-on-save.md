@@ -175,6 +175,18 @@ doesn't spam the log on every keystroke save. The remaining failures
 warn every time — they're rare enough and useful enough to see each
 occurrence.
 
+In addition to `tracing` (which only the developer running moon-ide
+under a terminal sees), every decision point in
+`LocalHost::run_formatter_chain` and the two layer helpers also
+emits to the shared [`LogSink`](../../crates/moon-core/src/logs.rs)
+under source `"format-on-save"`. The user opens the bottom-panel
+Logs picker (next to the Terminal launcher) and gets a per-save
+trace: dispatch target (host vs. container), whether lint-staged
+matched, the command and `cwd` that ran, exit outcome and duration,
+or the fallback "no formatter configured for .ext; bytes left
+as-is" line when neither layer fires. The wiring lives in
+[test plan 0069](../test-plans/0069-diag-logs-panel.md).
+
 ## Consequences
 
 - ADR 0006's third Consequences bullet (`format_on_save` re-appears

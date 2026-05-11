@@ -5,6 +5,7 @@ pub mod compose_logs;
 pub mod container;
 pub mod editorconfig;
 pub mod fs;
+pub mod logs;
 pub mod lsp;
 pub mod next_edit;
 pub mod project_compose;

@@ -369,6 +369,29 @@ mod tests {
 	}
 
 	#[test]
+	fn dev_service_always_has_init_true() {
+		// `init: true` injects `docker-init` (tini) as the
+		// container's PID 1. We rely on it to reap any process
+		// that orphans inside the container — most commonly a
+		// child of an LSP server (e.g. tsgo's helper procs) that
+		// outlives its `docker exec` session. Without it, `sleep
+		// infinity` would be PID 1 and it does not reap SIGCHLD,
+		// so zombies would accumulate over a long-running session.
+		// This test exists so the line can't be dropped in a
+		// future compose refactor without somebody noticing.
+		let project = project();
+		let render = generate_compose(ComposeRenderOptions {
+			project: &project,
+			dev_image: "moon-base:dev",
+			bound_mounts: &[],
+			ssh_agent: None,
+			git_identity: None,
+			gh_config: None,
+		});
+		assert!(render.yaml.contains("    init: true"));
+	}
+
+	#[test]
 	fn bound_folders_render_as_volume_mounts_under_slash_workspace() {
 		let project = project();
 		let mounts = [

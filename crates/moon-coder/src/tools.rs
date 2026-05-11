@@ -1400,8 +1400,7 @@ mod tests {
 
 	#[test]
 	fn locate_edit_indent_fallback_prepends_missing_tabs() {
-		// Reproduces the Capfi session failure: file has 3-tab
-		// indent on the `error: {` line, model wrote `find` with
+		// file has 3-tab indent on the `error: {` line, model wrote `find` with
 		// 2 tabs. The fuzzy match should still locate the block
 		// and the spliced `replace` should pick up the extra tab
 		// so the file's indentation is preserved without relying

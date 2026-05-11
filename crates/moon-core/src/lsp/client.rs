@@ -22,14 +22,14 @@
 //! [`framing`]: super::framing
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify};
 use tokio::task::JoinHandle;
 
 use super::framing;
@@ -103,6 +103,41 @@ pub struct LspClient {
 	// and the tasks exit when their channels close.
 	_reader: JoinHandle<()>,
 	_writer: JoinHandle<()>,
+	/// Liveness flag. Flipped to `false` by either I/O loop when
+	/// it exits (child died, stdout EOF, write failure, requested
+	/// shutdown). Callers query via [`is_alive`] before sending —
+	/// the broker uses this to evict dead slots and re-spawn on
+	/// the next request instead of forever returning the stale
+	/// "lsp client shut down" RPC error.
+	alive: Arc<AtomicBool>,
+	/// Fired exactly when [`alive`] flips to `false`. Lets the
+	/// LSP server actor await client death without polling, so a
+	/// crash can fan out (log entry + status pill) the moment it
+	/// happens rather than at the next request.
+	death_notify: Arc<Notify>,
+}
+
+/// Awaitable handle to a client's death. Returned by
+/// [`LspClient::death_signal`]; the future resolves when the
+/// client transitions to not-alive (either I/O loop exited or
+/// `shutdown` was called).
+pub struct DeathSignal {
+	alive: Arc<AtomicBool>,
+	notify: Arc<Notify>,
+}
+
+impl DeathSignal {
+	pub async fn wait(self) {
+		// Re-check after every notify in case of spurious
+		// wakeups; the `notify_waiters` from the I/O loops is
+		// always paired with a `store(false)` ahead of it.
+		loop {
+			if !self.alive.load(Ordering::Acquire) {
+				return;
+			}
+			self.notify.notified().await;
+		}
+	}
 }
 
 impl LspClient {
@@ -124,9 +159,18 @@ impl LspClient {
 		// probably looping.
 		let (tx, rx) = mpsc::channel::<Outbound>(256);
 		let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+		let alive = Arc::new(AtomicBool::new(true));
+		let death_notify = Arc::new(Notify::new());
 
-		let writer_task = tokio::spawn(writer_loop(stdin, rx));
-		let reader_task = tokio::spawn(reader_loop(stdout, pending.clone(), tx.clone(), notifications));
+		let writer_task = tokio::spawn(writer_loop(stdin, rx, alive.clone(), death_notify.clone()));
+		let reader_task = tokio::spawn(reader_loop(
+			stdout,
+			pending.clone(),
+			tx.clone(),
+			notifications,
+			alive.clone(),
+			death_notify.clone(),
+		));
 
 		Self {
 			next_id: AtomicI64::new(1),
@@ -134,6 +178,25 @@ impl LspClient {
 			pending,
 			_reader: reader_task,
 			_writer: writer_task,
+			alive,
+			death_notify,
+		}
+	}
+
+	/// `true` while both I/O loops are still pumping. Flips to
+	/// `false` the moment either exits (child crash, stdout EOF,
+	/// stdin pipe broken, explicit `shutdown`).
+	pub fn is_alive(&self) -> bool {
+		self.alive.load(Ordering::Acquire)
+	}
+
+	/// Future that resolves when the client transitions to not
+	/// alive. The broker spawns a watcher off this to log + flip
+	/// the status pill the instant the server dies — no polling.
+	pub fn death_signal(&self) -> DeathSignal {
+		DeathSignal {
+			alive: self.alive.clone(),
+			notify: self.death_notify.clone(),
 		}
 	}
 
@@ -194,7 +257,16 @@ impl LspClient {
 	}
 }
 
-async fn writer_loop<W: AsyncWrite + Unpin + Send + 'static>(mut stdin: W, mut rx: mpsc::Receiver<Outbound>) {
+async fn writer_loop<W: AsyncWrite + Unpin + Send + 'static>(
+	mut stdin: W,
+	mut rx: mpsc::Receiver<Outbound>,
+	alive: Arc<AtomicBool>,
+	death_notify: Arc<Notify>,
+) {
+	let _drop_guard = LivenessGuard {
+		alive: alive.clone(),
+		notify: death_notify.clone(),
+	};
 	while let Some(out) = rx.recv().await {
 		let payload = match out {
 			Outbound::Request { id, method, params, .. } => {
@@ -238,12 +310,34 @@ async fn writer_loop<W: AsyncWrite + Unpin + Send + 'static>(mut stdin: W, mut r
 	}
 }
 
+/// Drop guard that flips the liveness flag and fans out the death
+/// notification when either I/O loop exits. Using a guard (instead
+/// of an explicit set-at-end-of-function call) means a panic or
+/// early-return in the loop body still signals correctly.
+struct LivenessGuard {
+	alive: Arc<AtomicBool>,
+	notify: Arc<Notify>,
+}
+
+impl Drop for LivenessGuard {
+	fn drop(&mut self) {
+		self.alive.store(false, Ordering::Release);
+		self.notify.notify_waiters();
+	}
+}
+
 async fn reader_loop<R: AsyncRead + Unpin + Send + 'static>(
 	stdout: R,
 	pending: PendingMap,
 	tx: mpsc::Sender<Outbound>,
 	notifications: broadcast::Sender<ServerNotification>,
+	alive: Arc<AtomicBool>,
+	death_notify: Arc<Notify>,
 ) {
+	let _drop_guard = LivenessGuard {
+		alive: alive.clone(),
+		notify: death_notify.clone(),
+	};
 	let mut reader = BufReader::new(stdout);
 	loop {
 		let bytes = match framing::read_message(&mut reader).await {

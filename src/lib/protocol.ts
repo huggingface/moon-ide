@@ -503,6 +503,29 @@ export type LspStatusEvent = {
 	detail: string | null;
 };
 
+/**
+ * Severity of a diagnostic log entry. Mirrors `moon_protocol::logs::LogLevel`.
+ * Maps to `tracing` levels minus `TRACE`.
+ */
+export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+
+/**
+ * One line of diagnostic log output, surfaced in the bottom-panel
+ * logs view. The `source` field is a free-form bucket key
+ * (`lsp.typescript`, `format-on-save`, `editor.completion`, …) that
+ * the picker groups by. `seq` is a process-wide monotonic counter
+ * so the frontend can merge the snapshot from `logs_snapshot` with
+ * the live stream from `logs:entry` without duplicating entries.
+ * Mirrors `moon_protocol::logs::LogEntry`.
+ */
+export type LogEntry = {
+	source: string;
+	level: LogLevel;
+	message: string;
+	tsMs: number;
+	seq: number;
+};
+
 export type SplitSide = 'left' | 'right';
 
 export type IndentStyle = 'tab' | 'space';

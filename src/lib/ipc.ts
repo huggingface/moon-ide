@@ -23,6 +23,8 @@ import type {
 	GitFileBlame,
 	GitStatusEntry,
 	HfIdentity,
+	LogEntry,
+	LogLevel,
 	LspCompletionList,
 	LspHover,
 	LspLocation,
@@ -196,6 +198,12 @@ export const ipc = {
 			invoke<NextEditServerSnapshot>('next_edit_server_start', { params }),
 		serverStop: () => invoke<NextEditServerSnapshot>('next_edit_server_stop'),
 		serverStatus: () => invoke<NextEditServerSnapshot>('next_edit_server_status'),
+	},
+	logs: {
+		snapshot: (source: string) => invoke<LogEntry[]>('logs_snapshot', { source }),
+		sources: () => invoke<string[]>('logs_sources'),
+		clear: (source: string) => invoke<void>('logs_clear', { source }),
+		emit: (source: string, level: LogLevel, message: string) => invoke<void>('logs_emit', { source, level, message }),
 	},
 	lsp: {
 		open: (path: string, languageId: string, text: string) => invoke<void>('lsp_open', { path, languageId, text }),

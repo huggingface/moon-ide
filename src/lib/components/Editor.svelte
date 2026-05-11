@@ -7,7 +7,13 @@
 	import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 	import { searchKeymap, highlightSelectionMatches } from '@codemirror/search';
 	import { bracketMatching, indentOnInput, indentUnit } from '@codemirror/language';
-	import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from '@codemirror/autocomplete';
+	import {
+		autocompletion,
+		closeBrackets,
+		closeBracketsKeymap,
+		completionKeymap,
+		startCompletion,
+	} from '@codemirror/autocomplete';
 	import {
 		applyDiagnostics,
 		filePathFacet,
@@ -16,6 +22,7 @@
 		lspHoverExtension,
 	} from '../editor/lsp';
 	import { applyAutocompleteFromEditorView } from '../editor/autocompleteApply';
+	import { frontendLog } from '../logs.svelte';
 	import { lspGotoDefinitionExtension } from '../editor/lspGotoDefinition';
 	import { blameExtension, blameFacet } from '../editor/blame';
 	import { gitChangesExtension, headTextFacet } from '../editor/gitChanges';
@@ -67,7 +74,24 @@
 	let lastHandledAutocompleteEditorTick = 0;
 
 	function runAutocompleteFromShortcut(editorView: EditorView): boolean {
+		frontendLog('editor.completion', 'debug', 'Ctrl+T pressed → applying next-edit autocomplete');
 		void applyAutocompleteFromEditorView(editorView);
+		return true;
+	}
+
+	// High-priority Ctrl+Space binding that logs the key event in
+	// addition to triggering completion. The user reported "Ctrl+Space
+	// worked once but not after"; logging at this seam lets them tell
+	// whether CodeMirror is even seeing the keystroke (IBus / IME
+	// hijack vs. CM-internal issue) from inside the IDE. We claim
+	// the keystroke (`return true`) and re-invoke `startCompletion`
+	// ourselves rather than fall through, because chained handlers in
+	// CM's keymap only run when the previous one returns `false` —
+	// returning `false` here would make the log run twice if anything
+	// downstream also bound `Ctrl-Space`.
+	function logCtrlSpace(editorView: EditorView): boolean {
+		frontendLog('editor.completion', 'info', 'Ctrl+Space pressed → invoking startCompletion');
+		startCompletion(editorView);
 		return true;
 	}
 
@@ -363,14 +387,34 @@
 			headCompartment.of(headTextFacet.of(workspace.headByPath.get(file.path) ?? null)),
 			// Ctrl+Space → LSP only. Local autocomplete (Ctrl+T / palette) patches
 			// the buffer directly — it is not a CodeMirror completion source.
+			//
+			// `defaultKeymap: false` is load-bearing: with the default
+			// on, `autocompletion()` installs the upstream
+			// `completionKeymap` at `Prec.highest` internally (see
+			// `completionKeymapExt` in @codemirror/autocomplete), which
+			// would shadow our `Prec.high` `logCtrlSpace` tap — the user
+			// would press Ctrl+Space, completion would fire, but our
+			// "Ctrl+Space pressed" breadcrumb would never log. We spread
+			// `completionKeymap` ourselves below at default precedence
+			// so navigation / accept / escape still work; our high-
+			// precedence override replaces only the Ctrl-Space slot.
 			autocompletion({
 				activateOnTyping: false,
 				override: [lspCompletionSource],
+				defaultKeymap: false,
 			}),
 			Prec.high(
 				keymap.of([
 					{ key: 'Ctrl-t', run: runAutocompleteFromShortcut },
 					{ mac: 'Ctrl-t', run: runAutocompleteFromShortcut },
+					// Tap on Ctrl+Space so the user can see it land
+					// in CodeMirror via the diag-logs panel.
+					// `logCtrlSpace` itself invokes `startCompletion`
+					// and returns true; we own the slot at `Prec.high`
+					// so this runs ahead of `completionKeymap`'s
+					// default Ctrl-Space binding (same key, lower
+					// precedence) without double-firing completion.
+					{ key: 'Ctrl-Space', run: logCtrlSpace },
 				]),
 			),
 			keymap.of([
