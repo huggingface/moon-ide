@@ -4,17 +4,44 @@
 //! files, `cargo build` touching `target/`) into one notification
 //! per window.
 //!
-//! Scope stays deliberately narrow for Phase 5's first fs-watch
-//! slice: one recursive watcher at a time, `.git/` filtered out to
-//! skip the spray of internal refs-writes a single `git commit`
-//! produces. Gitignore-aware filtering, per-folder watches, and an
-//! event payload carrying the changed paths are later-phase work —
-//! the frontend today only needs a "re-fetch everything" nudge.
+//! ## Why we walk the tree ourselves
 //!
-//! Actor model: one tokio task owns the `notify::RecommendedWatcher`
-//! and drains its callback. Another side of the same task receives
-//! `SetRoot` commands from the Tauri command handlers. That keeps
-//! the notify watcher entirely off the shared-state path — only the
+//! notify's `RecursiveMode::Recursive` would be the obvious
+//! one-liner, but its internal walker follows symlinks. In a pnpm
+//! monorepo that explodes: `packages/foo/node_modules/@scope/bar`
+//! is a directory symlink back into `packages/bar/`, so notify
+//! registers an inotify watch on the symlinked path *first*
+//! (alphabetical order of the tree walk), and from then on every
+//! event for files under `packages/bar/` is reported with the
+//! `node_modules/@scope/bar/...` prefix. The frontend's
+//! per-buffer reload keys on the real workspace-relative path
+//! (`packages/bar/src/foo.ts`) and the predicate misses, so an
+//! external `git checkout` modifying `packages/bar/src/foo.ts`
+//! never reloaded the open buffer.
+//!
+//! Manual walk with `ignore::WalkBuilder` and `follow_links(false)`
+//! pins the watches to canonical paths — and gitignore-aware so we
+//! don't waste inotify watches (and the user's
+//! `fs.inotify.max_user_watches` budget) on `node_modules` /
+//! `target/` / build output that the user's `.gitignore` already
+//! says to ignore. `.git/` is excluded by `ignore` unconditionally
+//! and re-added as one non-recursive watch so we still see
+//! `.git/HEAD` rewrites for branch-switch detection.
+//!
+//! Cost of the manual approach: ~one inotify watch per source
+//! directory + a few hundred ms of walk on workspace open. Both
+//! are well within budget for the repos this team uses, and
+//! orders of magnitude smaller than the unfiltered cost. New
+//! directories created at runtime get a fresh watch via the
+//! `Create(Folder)` event path so `mkdir foo/ && touch foo/bar.ts`
+//! starts surfacing events on `foo/bar.ts` immediately.
+//!
+//! ## Actor model
+//!
+//! One tokio task owns the `notify::RecommendedWatcher` and drains
+//! its callback. Another side of the same task receives `SetRoot`
+//! commands from the Tauri command handlers. That keeps the
+//! notify watcher entirely off the shared-state path — only the
 //! `mpsc::Sender` escapes the actor, so swapping backends (Linux
 //! inotify, macOS FSEvents, Windows ReadDirectoryChangesW) doesn't
 //! leak past this file.
@@ -24,7 +51,8 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::Duration;
 
-use notify::event::ModifyKind;
+use ignore::WalkBuilder;
+use notify::event::{CreateKind, ModifyKind};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -137,7 +165,7 @@ async fn run(app: AppHandle, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
 		}
 	};
 
-	let mut current_root: Option<PathBuf> = None;
+	let mut current: Option<WatchedRoot> = None;
 	// Workspace-relative paths accumulated since the last emit. We
 	// dedup with a `HashSet` because notify routinely fires several
 	// events for the same path inside one debounce window (open,
@@ -171,7 +199,12 @@ async fn run(app: AppHandle, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
 			cmd = cmd_rx.recv() => {
 				match cmd {
 					Some(Command::SetRoot(new)) => {
-						apply_set_root(&mut watcher, &mut current_root, new);
+						if let Some(old) = current.take() {
+							old.detach(&mut watcher);
+						}
+						if let Some(path) = new {
+							current = Some(WatchedRoot::attach(&mut watcher, path));
+						}
 						// Stale paths from the previous root mean
 						// nothing to the new one's frontend.
 						pending_paths.clear();
@@ -188,17 +221,32 @@ async fn run(app: AppHandle, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
 			}
 
 			Some(res) = event_rx.recv() => {
+				// `Create(Folder)` for a path inside our root means
+				// the user (or a tool) just made a new directory.
+				// Walk it and add non-recursive watches so files
+				// dropped inside immediately surface. Without this
+				// step the manual-walk-non-recursive approach would
+				// be blind to anything created after startup.
+				if let Some(root) = current.as_mut() {
+					if let Ok(event) = &res {
+						if matches!(event.kind, EventKind::Create(CreateKind::Folder)) {
+							for path in &event.paths {
+								root.add_subtree(&mut watcher, path);
+							}
+						}
+					}
+				}
 				let prev_count = pending_paths.len();
 				collect_event_paths(
 					&res,
-					current_root.as_deref(),
+					current.as_ref().map(WatchedRoot::root),
 					&mut pending_paths,
 					&mut pending_topology,
 				);
 				if pending_paths.len() == prev_count {
 					// Event was filtered (`.git/`, access bump,
-					// out-of-root) — nothing to emit, nothing to
-					// schedule.
+					// `node_modules/`, out-of-root) — nothing to
+					// emit, nothing to schedule.
 					continue;
 				}
 				let now = Instant::now();
@@ -265,23 +313,37 @@ async fn poll_optional_sleep(slot: &mut Option<Pin<Box<Sleep>>>) {
 	}
 }
 
-fn apply_set_root(watcher: &mut RecommendedWatcher, current: &mut Option<PathBuf>, new: Option<PathBuf>) {
-	if current.as_ref() == new.as_ref() {
-		return;
+/// Tracks the set of directories we've registered non-recursive
+/// watches against. Owned by the actor; never shared. We keep the
+/// path set so a subsequent `SetRoot` can cleanly unwatch every
+/// previous registration — notify's `RecommendedWatcher::unwatch`
+/// takes a path, not a watch descriptor, so we have to remember
+/// every path we passed to `watch`.
+struct WatchedRoot {
+	root: PathBuf,
+	watched_dirs: HashSet<PathBuf>,
+}
+
+impl WatchedRoot {
+	fn root(&self) -> &Path {
+		&self.root
 	}
-	if let Some(old) = current.take() {
-		if let Err(e) = watcher.unwatch(&old) {
-			// Unwatch failing is common when the folder was
-			// unmounted or deleted out from under us. Log at
-			// debug because the `watch` below is what the user
-			// cares about.
-			tracing::debug!(error = %e, path = %old.display(), "unwatch failed");
-		}
-	}
-	if let Some(path) = new.clone() {
-		match watcher.watch(&path, RecursiveMode::Recursive) {
+
+	/// Walk the workspace tree (gitignore-aware, `follow_links(false)`,
+	/// excluding `node_modules` and `.git`) and register a
+	/// non-recursive inotify watch per directory. `.git/` is
+	/// re-watched non-recursively *as one entry* so we still see
+	/// the `.git/HEAD` rewrite that external `git switch` /
+	/// `git checkout` use to flip branches.
+	fn attach(watcher: &mut RecommendedWatcher, root: PathBuf) -> Self {
+		let mut watched_dirs: HashSet<PathBuf> = HashSet::new();
+		// Watch the workspace root itself first so events for
+		// top-level entries (Create / Remove / Rename at the
+		// workspace root) aren't lost while the recursive walk is
+		// still in progress.
+		match watcher.watch(&root, RecursiveMode::NonRecursive) {
 			Ok(()) => {
-				tracing::debug!(path = %path.display(), "fs watcher attached");
+				watched_dirs.insert(root.clone());
 			}
 			Err(e) => {
 				// inotify's per-user watch limit is a realistic
@@ -292,13 +354,163 @@ fn apply_set_root(watcher: &mut RecommendedWatcher, current: &mut Option<PathBuf
 				// this bites them.
 				tracing::warn!(
 					error = %e,
-					path = %path.display(),
+					path = %root.display(),
 					"failed to attach fs watcher; live refresh will be unavailable for this folder"
 				);
+				return WatchedRoot { root, watched_dirs };
+			}
+		}
+		// `.git/` would otherwise be invisible to the walker —
+		// `ignore` skips it unconditionally — but we need
+		// `.git/HEAD` writes to detect external branch switches.
+		// Watching `.git/` non-recursively gives us the entries
+		// directly inside (HEAD, index, ORIG_HEAD, MERGE_HEAD)
+		// without the per-commit storm of `.git/refs/` /
+		// `.git/objects/` writes that motivated the original
+		// `.git/` filter.
+		let dotgit = root.join(".git");
+		if dotgit.is_dir() {
+			match watcher.watch(&dotgit, RecursiveMode::NonRecursive) {
+				Ok(()) => {
+					watched_dirs.insert(dotgit);
+				}
+				Err(e) => {
+					tracing::debug!(error = %e, "failed to watch .git/ for branch-switch detection");
+				}
+			}
+		}
+		let walker = WalkBuilder::new(&root)
+			.follow_links(false)
+			.hidden(false)
+			.git_ignore(true)
+			.git_global(true)
+			.git_exclude(true)
+			.ignore(true)
+			.require_git(false)
+			.filter_entry(|entry| !is_excluded_dir_entry(entry))
+			.build();
+		let mut walked_dirs: usize = 0;
+		let mut watch_failures: usize = 0;
+		for entry in walker {
+			let Ok(entry) = entry else {
+				continue;
+			};
+			let Some(ft) = entry.file_type() else {
+				continue;
+			};
+			if !ft.is_dir() {
+				continue;
+			}
+			let path = entry.path();
+			if path == root {
+				continue;
+			}
+			walked_dirs += 1;
+			match watcher.watch(path, RecursiveMode::NonRecursive) {
+				Ok(()) => {
+					watched_dirs.insert(path.to_path_buf());
+				}
+				Err(e) => {
+					watch_failures += 1;
+					tracing::debug!(error = %e, path = %path.display(), "failed to watch dir");
+				}
+			}
+		}
+		tracing::debug!(
+			path = %root.display(),
+			dirs_walked = walked_dirs,
+			watches_held = watched_dirs.len(),
+			watch_failures,
+			"fs watcher attached",
+		);
+		WatchedRoot { root, watched_dirs }
+	}
+
+	fn detach(self, watcher: &mut RecommendedWatcher) {
+		for path in &self.watched_dirs {
+			if let Err(e) = watcher.unwatch(path) {
+				// Unwatch failing is common when the folder was
+				// unmounted or deleted out from under us. Log at
+				// debug because the next `attach` is what the
+				// user cares about.
+				tracing::debug!(error = %e, path = %path.display(), "unwatch failed");
 			}
 		}
 	}
-	*current = new;
+
+	/// Add watches for a directory subtree that didn't exist when
+	/// we last walked the workspace. Called on `Create(Folder)`
+	/// events so `mkdir foo/` followed by `touch foo/bar.ts`
+	/// surfaces the file write without waiting for a re-attach.
+	fn add_subtree(&mut self, watcher: &mut RecommendedWatcher, path: &Path) {
+		if !path.starts_with(&self.root) {
+			return;
+		}
+		if self.watched_dirs.contains(path) {
+			return;
+		}
+		if path_has_excluded_component(path) {
+			return;
+		}
+		let walker = WalkBuilder::new(path)
+			.follow_links(false)
+			.hidden(false)
+			.git_ignore(true)
+			.git_global(true)
+			.git_exclude(true)
+			.ignore(true)
+			.require_git(false)
+			.filter_entry(|entry| !is_excluded_dir_entry(entry))
+			.build();
+		for entry in walker {
+			let Ok(entry) = entry else {
+				continue;
+			};
+			let Some(ft) = entry.file_type() else {
+				continue;
+			};
+			if !ft.is_dir() {
+				continue;
+			}
+			let p = entry.path();
+			if self.watched_dirs.contains(p) {
+				continue;
+			}
+			match watcher.watch(p, RecursiveMode::NonRecursive) {
+				Ok(()) => {
+					self.watched_dirs.insert(p.to_path_buf());
+				}
+				Err(e) => {
+					tracing::debug!(error = %e, path = %p.display(), "failed to add late watch");
+				}
+			}
+		}
+	}
+}
+
+/// `ignore`'s filter for the recursive walk. We never descend
+/// into `node_modules` (pnpm symlinks aside, npm-style physical
+/// `node_modules` would explode the inotify watch count on a
+/// large repo) or `.git/` (which we re-watch non-recursively as
+/// a single entry for `.git/HEAD` detection). Other build-output
+/// dirs (`target/`, `dist/`, `.next/`) are handled by the
+/// gitignore axis since the user's `.gitignore` almost always
+/// covers them — staying out of speculative-hardcode territory.
+fn is_excluded_dir_entry(entry: &ignore::DirEntry) -> bool {
+	let Some(name) = entry.file_name().to_str() else {
+		return false;
+	};
+	name == "node_modules" || name == ".git"
+}
+
+/// Same logic as [`is_excluded_dir_entry`] but operating on a
+/// raw path. Used for the `Create(Folder)` follow-up so we don't
+/// re-walk into a freshly-created `node_modules`.
+fn path_has_excluded_component(path: &Path) -> bool {
+	path.components().any(|c| {
+		let s = c.as_os_str();
+		s == "node_modules" || s == ".git"
+	})
 }
 
 /// Sift one notify event into `pending`. Drops `.git/` churn
@@ -340,6 +552,16 @@ fn collect_event_paths(
 	let mut took_a_path = false;
 	for raw in &event.paths {
 		if is_in_dotgit(raw) && !is_dotgit_head(raw) {
+			continue;
+		}
+		// Belt-and-braces. The walker excludes `node_modules` so
+		// inotify shouldn't fire events for paths under it in the
+		// first place — but a manually-added watch from a future
+		// code path, or a symlink we missed, would otherwise leak
+		// `node_modules/...` paths to the frontend's per-buffer
+		// reload loop and cause `subset.has(open_file.path)`
+		// mismatches.
+		if path_has_excluded_component(raw) {
 			continue;
 		}
 		let Ok(rel) = raw.strip_prefix(root) else {

@@ -36,7 +36,7 @@ import {
 import { lspLanguageFor } from './editor/lspLanguage';
 import { bottomPanel } from './bottomPanel.svelte';
 import { composeLogs } from './composeLogs.svelte';
-import { diagLogs } from './logs.svelte';
+import { diagLogs, frontendLog } from './logs.svelte';
 import { terminal } from './terminal.svelte';
 import { coder } from './coder.svelte';
 import { container } from './container.svelte';
@@ -2073,10 +2073,26 @@ class WorkspaceState {
 				continue;
 			}
 			if (changedSubset !== null && !changedSubset.has(file.path)) {
+				frontendLog(
+					'fs-watcher',
+					'debug',
+					`reload skipped: open file '${file.path}' not in subset of ${changedSubset.size} path(s)`,
+				);
 				continue;
 			}
 			this.refreshHead(file.path);
-			if (!file.isDirty) {
+			if (file.isDirty) {
+				frontendLog(
+					'fs-watcher',
+					'info',
+					`reload skipped: '${file.path}' is dirty (unsaved edits — would clobber); HEAD refresh only`,
+				);
+			} else {
+				frontendLog(
+					'fs-watcher',
+					'info',
+					`reloading '${file.path}' from disk (matched fs:changed${changedSubset === null ? ' [null subset → full sweep]' : ''})`,
+				);
 				void this.reloadOpenFileFromDisk(file.path);
 			}
 		}
@@ -2104,30 +2120,87 @@ class WorkspaceState {
 	 * step is an fs-watcher (roadmap Phase 5) rather than hand-
 	 * written diffing here.
 	 *
-	 * Collapses with an in-flight walk — firing two focus events
-	 * back-to-back (alt-tab flurry) doesn't stack two concurrent
-	 * recursions.
+	 * Coalesces with an in-flight walk: alt-tab flurry doesn't
+	 * stack two concurrent recursions. **But** the coalescing
+	 * accumulates the changed subset across calls — silently
+	 * dropping a second event's subset is the bug that made
+	 * "switch branch in terminal" not refresh open files when the
+	 * checkout's topology event kicked off a long walk and the
+	 * working-tree writes for the open file landed in a second
+	 * `fs:changed` burst that arrived mid-walk. After the
+	 * in-flight refresh finishes we drain the pending subset into
+	 * one follow-up `refreshActiveFolder` call so every observed
+	 * path eventually flows through the per-buffer reload loop.
 	 */
+	#pendingRefreshSubset: Set<string> | null = null;
+	#pendingRefreshNullSubset = false;
+	#pendingRefreshTopology = false;
+
 	async refreshActiveFolder(changedSubset: ReadonlySet<string> | null = null, topologyChanged = true): Promise<void> {
 		if (!this.activeFolder) {
 			return;
 		}
 		if (this.loadingPaths) {
+			this.#mergePendingRefresh(changedSubset, topologyChanged);
+			frontendLog(
+				'fs-watcher',
+				'debug',
+				`refresh deferred (in-flight walk); subset=${changedSubset === null ? 'null' : changedSubset.size}, topology=${topologyChanged}`,
+			);
 			return;
 		}
-		if (topologyChanged) {
-			await this.loadPaths(changedSubset);
+		try {
+			if (topologyChanged) {
+				await this.loadPaths(changedSubset);
+			} else {
+				// Modify-only batch: every changed entry already
+				// exists in the tree's `paths` snapshot, so the
+				// recursive `collect_paths` walk is wasted work.
+				// Refresh git status (cheap aggregate IPC) and run
+				// the per-buffer loop against the existing path
+				// list. The narrowed loop visits only open files in
+				// `changedSubset`, so the user's own Ctrl+S becomes
+				// one `git status` call and one re-read instead of a
+				// tree walk plus N×(git show + read).
+				await this.refreshGitStatus(this.paths, changedSubset);
+			}
+		} finally {
+			await this.#drainPendingRefresh();
+		}
+	}
+
+	#mergePendingRefresh(changedSubset: ReadonlySet<string> | null, topologyChanged: boolean): void {
+		this.#pendingRefreshTopology = this.#pendingRefreshTopology || topologyChanged;
+		if (changedSubset === null) {
+			// "Don't know what moved" wins: a `null` subset means
+			// the next refresh has to sweep every open buffer, so
+			// hold onto that hint and discard the narrower one.
+			this.#pendingRefreshNullSubset = true;
+			this.#pendingRefreshSubset = null;
 			return;
 		}
-		// Modify-only batch: every changed entry already exists in
-		// the tree's `paths` snapshot, so the recursive
-		// `collect_paths` walk is wasted work. Refresh git status
-		// (cheap aggregate IPC) and run the per-buffer loop against
-		// the existing path list. The narrowed loop visits only
-		// open files in `changedSubset`, so the user's own Ctrl+S
-		// becomes one `git status` call and one re-read instead of
-		// a tree walk plus N×(git show + read).
-		await this.refreshGitStatus(this.paths, changedSubset);
+		if (this.#pendingRefreshNullSubset) {
+			return;
+		}
+		if (this.#pendingRefreshSubset === null) {
+			this.#pendingRefreshSubset = new Set(changedSubset);
+			return;
+		}
+		for (const p of changedSubset) {
+			this.#pendingRefreshSubset.add(p);
+		}
+	}
+
+	async #drainPendingRefresh(): Promise<void> {
+		if (!this.#pendingRefreshNullSubset && this.#pendingRefreshSubset === null) {
+			return;
+		}
+		const subset = this.#pendingRefreshNullSubset ? null : this.#pendingRefreshSubset;
+		const topology = this.#pendingRefreshTopology;
+		this.#pendingRefreshSubset = null;
+		this.#pendingRefreshNullSubset = false;
+		this.#pendingRefreshTopology = false;
+		await this.refreshActiveFolder(subset, topology);
 	}
 
 	/** Set to true after `bindFolderChangeRefresh` installs the
@@ -2198,6 +2271,19 @@ class WorkspaceState {
 		try {
 			await listen<{ paths: string[]; topologyChanged: boolean }>('fs:changed', ({ payload }) => {
 				const subset = payload.paths.length > 0 ? new Set(payload.paths) : null;
+				// Sample up to 5 paths so a `git checkout` burst
+				// doesn't dump dozens of lines per emit; the user
+				// can compare these against `file.path` in the
+				// per-buffer log lines below to diagnose path
+				// mismatches (workspace-relative vs absolute,
+				// cross-folder, etc.).
+				const sample = payload.paths.slice(0, 5).join(', ');
+				const more = payload.paths.length > 5 ? ` … (+${payload.paths.length - 5} more)` : '';
+				frontendLog(
+					'fs-watcher',
+					'info',
+					`fs:changed paths=${payload.paths.length} topology=${payload.topologyChanged}${payload.paths.length === 0 ? '' : ` [${sample}${more}]`}`,
+				);
 				void this.refreshActiveFolder(subset, payload.topologyChanged);
 			});
 		} catch {
