@@ -308,7 +308,7 @@ impl ToolRegistry {
 					"properties": {
 						"cmd": {
 							"type": "string",
-							"description": "Shell command, executed via `sh -lc <cmd>`."
+							"description": "Shell command, executed via `bash -lc <cmd>`."
 						},
 						"timeout_ms": {
 							"type": "integer",
@@ -644,11 +644,24 @@ impl ToolRegistry {
 	/// panel header / `CoderStatus.bash_target` advertises:
 	///
 	/// - **Container** (workspace shell container is `Running`):
-	///   `docker exec -w <container_cwd> <name> sh -lc <cmd>`.
+	///   `docker exec -w <container_cwd> <name> bash -lc <cmd>`.
 	///   Reuses `moon_terminal::container_name_for_workspace` +
 	///   `TerminalTarget::container_cwd_for_folder` so the framing
 	///   matches terminals and LSP exactly.
-	/// - **Host** (otherwise): `sh -lc <cmd>` rooted at the folder.
+	/// - **Host** (otherwise): `bash -lc <cmd>` rooted at the folder.
+	///
+	/// **Why `bash -lc` and not `sh -lc`.** On most modern Linuxes
+	/// `/bin/sh` is `dash`, which as a login shell reads only
+	/// `~/.profile`. Most dev toolchains (rustup, fnm, mise,
+	/// pyenv, …) put their PATH-extending env line in `~/.bashrc`
+	/// — sometimes additionally in `~/.profile`, often not.
+	/// Result: `sh -lc 'cargo …'` returns "cargo: not found" even
+	/// though the user's interactive terminal has cargo on PATH.
+	/// `bash -lc` reads `~/.bash_profile` (which on almost every
+	/// dev box sources `~/.bashrc`), so the tool's PATH matches
+	/// the terminal's. Trade-off: requires `bash` to exist in the
+	/// container — true for every dev image we care about, since
+	/// terminals (`moon-terminal::target`) already assume it.
 	async fn build_bash_command(
 		&self,
 		folder: &WorkspaceFolderEntry,
@@ -672,12 +685,12 @@ impl ToolRegistry {
 				.arg("-w")
 				.arg(container_cwd.as_str())
 				.arg(&container_name)
-				.arg("sh")
+				.arg("bash")
 				.arg("-lc")
 				.arg(cmd);
 			return Ok((command, BASH_TARGET_CONTAINER));
 		}
-		let mut command = tokio::process::Command::new("sh");
+		let mut command = tokio::process::Command::new("bash");
 		command.arg("-lc").arg(cmd).current_dir(folder.folder.path.as_str());
 		Ok((command, BASH_TARGET_HOST))
 	}
