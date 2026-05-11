@@ -338,7 +338,7 @@ impl ToolRegistry {
 			),
 			ToolDefinition::function(
 				"edit_file",
-				"Replace an exact substring inside a file in any currently-bound workspace folder. `find` must match the file *exactly* (including whitespace and line endings) and must be unique unless `occurrence` is given. To insert text, set `find` to the line you want to insert before/after and include it in `replace`. To delete, set `replace` to an empty string. Failure throws — when it does, retry with more surrounding context in `find` so the match becomes unique.",
+				"Replace an exact substring inside a file in any currently-bound workspace folder. `find` must match the file (whitespace tolerant) and must be unique unless `occurrence` is given. To insert text, set `find` to the line you want to insert before/after and include it in `replace`. To delete, set `replace` to an empty string. Failure throws — when it does, retry with more surrounding context in `find` so the match becomes unique.",
 				json!({
 					"type": "object",
 					"properties": {
@@ -348,7 +348,7 @@ impl ToolRegistry {
 						},
 						"find": {
 							"type": "string",
-							"description": "Exact substring to locate. No regex; whitespace is significant."
+							"description": "Exact substring to locate. No regex; whitespace tolerant."
 						},
 						"replace": {
 							"type": "string",
@@ -558,49 +558,28 @@ impl ToolRegistry {
 			return Err(CoderError::tool_failed("edit_file", "binary file"));
 		}
 
-		let matches: Vec<usize> = byte_offsets_of(&original.text, &parsed.find);
-		let target_idx = match (matches.len(), parsed.occurrence) {
-			(0, _) => {
-				return Err(CoderError::tool_failed(
-					"edit_file",
-					format!("`find` not found in {}", parsed.path),
-				));
-			}
-			(1, None | Some(1)) => matches[0],
-			(_, None) => {
-				return Err(CoderError::tool_failed(
-					"edit_file",
-					format!(
-						"`find` matched {} times in {}; pass `occurrence` (1-based) or include more surrounding context",
-						matches.len(),
-						parsed.path
-					),
-				));
-			}
-			(n, Some(idx)) if idx == 0 || idx > n => {
-				return Err(CoderError::tool_failed(
-					"edit_file",
-					format!("occurrence {idx} out of range — `find` matched {n} times"),
-				));
-			}
-			// `idx >= 1` and `idx <= n` here, so the subtraction can't
-			// underflow. `matches[idx - 1]` is always in bounds.
-			(_, Some(idx)) => matches[idx - 1],
-		};
+		let plan = locate_edit(
+			&original.text,
+			&parsed.find,
+			&parsed.replace,
+			parsed.occurrence,
+			&parsed.path,
+		)?;
 
-		let mut new_text = String::with_capacity(original.text.len() - parsed.find.len() + parsed.replace.len());
-		new_text.push_str(&original.text[..target_idx]);
-		new_text.push_str(&parsed.replace);
-		new_text.push_str(&original.text[target_idx + parsed.find.len()..]);
+		let mut new_text = String::with_capacity(original.text.len() - (plan.end - plan.start) + plan.replace_text.len());
+		new_text.push_str(&original.text[..plan.start]);
+		new_text.push_str(&plan.replace_text);
+		new_text.push_str(&original.text[plan.end..]);
 
 		let result = folder.host.save_file(path, &new_text).await?;
 		Ok(json!({
 			"path": parsed.path,
-			"replaced_at_byte": target_idx,
+			"replaced_at_byte": plan.start,
 			"bytes_written": new_text.len(),
 			"mtime_ms": result.mtime_ms,
-			"occurrence": parsed.occurrence.unwrap_or(1),
-			"total_matches": matches.len(),
+			"occurrence": plan.occurrence,
+			"total_matches": plan.total_matches,
+			"match_mode": plan.mode,
 		}))
 	}
 
@@ -806,6 +785,453 @@ fn byte_offsets_of(haystack: &str, needle: &str) -> Vec<usize> {
 	hits
 }
 
+/// The match `edit_file` ultimately commits to. Carries the byte
+/// range to splice out, the replacement text (already re-indented if
+/// the fuzzy path adjusted it), and metadata for the JSON result.
+#[cfg_attr(test, derive(Debug))]
+struct EditPlan {
+	start: usize,
+	end: usize,
+	replace_text: String,
+	total_matches: usize,
+	occurrence: usize,
+	/// Which matcher succeeded. Surfaced verbatim in the tool result
+	/// so the model — and any human reading the session log — can see
+	/// when a fallback kicked in. The strings are part of the tool
+	/// protocol: `"exact"`, `"fuzzy_indent"`, `"fuzzy_unescape"`.
+	mode: &'static str,
+}
+
+/// Locate `find` in `text` using a layered match. Returns the byte
+/// range to splice plus the replacement bytes to write back.
+///
+/// 1. **Exact** — `str::find` against the file verbatim. Same
+///    behaviour `edit_file` has always had; covers every case where
+///    the model gets `find` byte-perfect on the first try.
+/// 2. **Unescape fallback** — if `find` contains the literal 2-char
+///    sequences `\\n` / `\\t` (the model's escape-leakage failure
+///    mode — see `specs/test-plans/0068-edit-file-fuzzy-fallback.md`)
+///    and the unescaped form matches exactly while the original
+///    doesn't, treat that as the intended pattern. `replace` is
+///    unescaped in the same way so the splice is consistent.
+/// 3. **Indent-tolerant fallback** — strip per-line leading whitespace
+///    from both `find` and the file's lines, look for a line-aligned
+///    match. On success, splice the *original* file lines' byte range
+///    and re-indent `replace` so its first non-blank line lines up
+///    with the file's match indent. This catches the "model is off
+///    by one tab depth" failure mode without weakening exact-match
+///    semantics — only kicks in when the strict match misses.
+///
+/// The fuzzy paths assume format-on-save will catch any residual
+/// indentation skew in `replace`. Without a formatter the edit may
+/// land with the model's exact (possibly mis-indented) replacement
+/// bytes shifted by the indent delta; that's the deliberate trade
+/// — fewer "find not found" loops at the cost of a one-off re-indent
+/// the formatter will normalise anyway.
+fn locate_edit(
+	text: &str,
+	find: &str,
+	replace: &str,
+	occurrence: Option<usize>,
+	path_for_error: &str,
+) -> Result<EditPlan, CoderError> {
+	// Stage 1: exact match. Hot path; returns immediately on success.
+	let exact = byte_offsets_of(text, find);
+	if !exact.is_empty() {
+		let (idx, picked) = select_match(&exact, occurrence, path_for_error, find.len(), text)?;
+		return Ok(EditPlan {
+			start: idx,
+			end: idx + find.len(),
+			replace_text: replace.to_owned(),
+			total_matches: exact.len(),
+			occurrence: picked,
+			mode: "exact",
+		});
+	}
+
+	// Stage 2: escape-leakage. Only kicks in when `find` actually
+	// contains a literal `\n` / `\t` pair — otherwise the unescape is
+	// a no-op and we'd just retry the same query.
+	if has_literal_escape(find) {
+		let unescaped_find = unescape_literals(find);
+		let m = byte_offsets_of(text, &unescaped_find);
+		if !m.is_empty() {
+			let unescaped_replace = unescape_literals(replace);
+			let (idx, picked) = select_match(&m, occurrence, path_for_error, unescaped_find.len(), text)?;
+			return Ok(EditPlan {
+				start: idx,
+				end: idx + unescaped_find.len(),
+				replace_text: unescaped_replace,
+				total_matches: m.len(),
+				occurrence: picked,
+				mode: "fuzzy_unescape",
+			});
+		}
+	}
+
+	// Stage 3: per-line indent-tolerant. Only well-defined when
+	// `find` is line-aligned (every line is on its own); a mid-line
+	// `find` falls through to the no-match error below.
+	let fuzzy = find_indent_tolerant(text, find);
+	if !fuzzy.is_empty() {
+		let (chosen, picked) = select_fuzzy(&fuzzy, occurrence, path_for_error, text)?;
+		let replace_text = reindent_replacement(replace, &chosen.find_indent, &chosen.file_indent);
+		return Ok(EditPlan {
+			start: chosen.start,
+			end: chosen.end,
+			replace_text,
+			total_matches: fuzzy.len(),
+			occurrence: picked,
+			mode: "fuzzy_indent",
+		});
+	}
+
+	Err(CoderError::tool_failed(
+		"edit_file",
+		format!(
+			"`find` not found in {path_for_error}. The file's bytes did not match `find` exactly, and no \
+indent-tolerant match was found either. Re-run `read_file` to see the current state of the file and pass \
+`find` with the same indentation (tabs vs. spaces, count) and line endings the file actually uses."
+		),
+	))
+}
+
+/// Resolve the index of the match to commit to, given the full list
+/// of byte offsets and the caller's optional `occurrence` selector.
+/// Returns `(byte_offset, 1-based-occurrence)`.
+///
+/// `find_len` and `text` aren't used by the picker today but are
+/// kept in the signature for symmetry with `select_fuzzy` (which
+/// needs `text` to format line numbers in the multi-match error).
+fn select_match(
+	matches: &[usize],
+	occurrence: Option<usize>,
+	path: &str,
+	_find_len: usize,
+	text: &str,
+) -> Result<(usize, usize), CoderError> {
+	match (matches.len(), occurrence) {
+		(0, _) => unreachable!("select_match called with empty matches"),
+		(1, None | Some(1)) => Ok((matches[0], 1)),
+		(n, None) => {
+			let lines: Vec<u32> = matches.iter().map(|&off| line_number_at_byte(text, off)).collect();
+			let lines_csv = lines.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+			Err(CoderError::tool_failed(
+				"edit_file",
+				format!(
+					"`find` matched {n} times in {path} (at lines {lines_csv}); pass `occurrence` \
+(1-based) or include more surrounding context"
+				),
+			))
+		}
+		(n, Some(idx)) if idx == 0 || idx > n => Err(CoderError::tool_failed(
+			"edit_file",
+			format!("occurrence {idx} out of range — `find` matched {n} times"),
+		)),
+		// `idx >= 1` and `idx <= n` here, so the subtraction can't
+		// underflow. `matches[idx - 1]` is always in bounds.
+		(_, Some(idx)) => Ok((matches[idx - 1], idx)),
+	}
+}
+
+fn select_fuzzy<'a>(
+	matches: &'a [FuzzyMatch],
+	occurrence: Option<usize>,
+	path: &str,
+	text: &str,
+) -> Result<(&'a FuzzyMatch, usize), CoderError> {
+	match (matches.len(), occurrence) {
+		(0, _) => unreachable!("select_fuzzy called with empty matches"),
+		(1, None | Some(1)) => Ok((&matches[0], 1)),
+		(n, None) => {
+			let lines: Vec<u32> = matches.iter().map(|m| line_number_at_byte(text, m.start)).collect();
+			let lines_csv = lines.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+			Err(CoderError::tool_failed(
+				"edit_file",
+				format!(
+					"`find` indent-tolerant match was ambiguous in {path} ({n} hits at lines \
+{lines_csv}); pass `occurrence` (1-based) or include more surrounding context"
+				),
+			))
+		}
+		(n, Some(idx)) if idx == 0 || idx > n => Err(CoderError::tool_failed(
+			"edit_file",
+			format!("occurrence {idx} out of range — `find` matched {n} times"),
+		)),
+		(_, Some(idx)) => Ok((&matches[idx - 1], idx)),
+	}
+}
+
+fn line_number_at_byte(text: &str, offset: usize) -> u32 {
+	// 1-based line count: bytes preceding `offset` plus one for the
+	// line we're sitting on. `bytecount`-free implementation; the
+	// inputs here are LLM-call-sized (file ≤ ~200 KB) so the scan
+	// cost is irrelevant.
+	let upto = offset.min(text.len());
+	(text[..upto].bytes().filter(|&b| b == b'\n').count() + 1) as u32
+}
+
+/// True when `find` contains a literal two-character `\n` or `\t`
+/// sequence (backslash + letter) that an LLM might have meant as the
+/// control character. Cheap pre-check so the unescape stage only
+/// runs when there's actually something to unescape.
+fn has_literal_escape(find: &str) -> bool {
+	let bytes = find.as_bytes();
+	let mut i = 0;
+	while i + 1 < bytes.len() {
+		if bytes[i] == b'\\' && (bytes[i + 1] == b'n' || bytes[i + 1] == b't') {
+			return true;
+		}
+		i += 1;
+	}
+	false
+}
+
+/// Translate literal `\n` / `\t` 2-char sequences into the
+/// corresponding control characters. We intentionally do **not**
+/// touch `\\` — the model rarely means to embed a literal
+/// backslash in `find` (real backslashes don't survive its own
+/// thought-to-JSON pipeline as `\\\\`), and translating it would
+/// confuse the rare case of someone editing a regex / printf
+/// string.
+fn unescape_literals(s: &str) -> String {
+	let mut out = String::with_capacity(s.len());
+	let mut bytes = s.bytes().peekable();
+	while let Some(b) = bytes.next() {
+		if b == b'\\' {
+			match bytes.peek() {
+				Some(b'n') => {
+					bytes.next();
+					out.push('\n');
+					continue;
+				}
+				Some(b't') => {
+					bytes.next();
+					out.push('\t');
+					continue;
+				}
+				_ => {}
+			}
+		}
+		out.push(b as char);
+	}
+	out
+}
+
+/// A single indent-tolerant hit. `start..end` is the byte range in
+/// the original file that the splice will replace; `file_indent` is
+/// the leading whitespace on the file's first matched line, and
+/// `find_indent` is the corresponding leading whitespace on `find`'s
+/// first non-blank line. Both indents are used to re-indent the
+/// caller's `replace` text.
+struct FuzzyMatch {
+	start: usize,
+	end: usize,
+	file_indent: String,
+	find_indent: String,
+}
+
+/// Per-line indent-tolerant match. Splits `find` into lines, strips
+/// the common leading whitespace from each non-blank line, then walks
+/// the file looking for a window whose lines match after the same
+/// per-line strip. The window is aligned to file line boundaries on
+/// both ends so the resulting splice is itself line-aligned (which
+/// keeps the re-indent of `replace` well-defined).
+///
+/// Single-line `find` is the easy case — match the trimmed line, take
+/// the file's leading whitespace as `file_indent`, take `find`'s
+/// leading whitespace as `find_indent`. Multi-line: same idea,
+/// per-line, with the constraint that every non-blank line of `find`
+/// matches the corresponding file line after its own leading
+/// whitespace is stripped. Blank lines in `find` match any blank
+/// (or whitespace-only) line in the file.
+fn find_indent_tolerant(text: &str, find: &str) -> Vec<FuzzyMatch> {
+	let find_lines: Vec<&str> = find.split('\n').collect();
+	if find_lines.is_empty() {
+		return Vec::new();
+	}
+	// Drop a trailing empty element from a `find` that ends with `\n`
+	// so the per-line walk doesn't try to match a phantom empty line
+	// past the end of the window. If `find` was just `\n` (one blank
+	// line) we still leave one element so the count stays meaningful.
+	let find_lines = if find_lines.len() > 1 && find_lines.last() == Some(&"") {
+		&find_lines[..find_lines.len() - 1]
+	} else {
+		&find_lines[..]
+	};
+	if find_lines.is_empty() {
+		return Vec::new();
+	}
+
+	// `find`'s indent is the leading whitespace of its first
+	// non-blank line. Falling back to "" when every line is blank
+	// (degenerate `find`, but we shouldn't crash on it).
+	let find_indent = find_lines
+		.iter()
+		.find(|l| !l.trim().is_empty())
+		.map(|l| leading_whitespace(l).to_owned())
+		.unwrap_or_default();
+
+	// Pre-compute file line spans (start byte, end-without-newline
+	// byte) so the inner loop can splice without re-scanning.
+	let file_lines = collect_line_spans(text);
+	if file_lines.len() < find_lines.len() {
+		return Vec::new();
+	}
+
+	let mut hits = Vec::new();
+	let limit = file_lines.len() - find_lines.len() + 1;
+	for start_idx in 0..limit {
+		let Some(file_indent) = file_indent_at(text, &file_lines[start_idx], find_lines[0]) else {
+			continue;
+		};
+		let mut ok = true;
+		for (offset, find_line) in find_lines.iter().enumerate() {
+			let file_line = &text[file_lines[start_idx + offset].0..file_lines[start_idx + offset].1];
+			if !lines_match_after_dedent(file_line, find_line) {
+				ok = false;
+				break;
+			}
+		}
+		if !ok {
+			continue;
+		}
+		let span_start = file_lines[start_idx].0;
+		let span_end = file_lines[start_idx + find_lines.len() - 1].1;
+		hits.push(FuzzyMatch {
+			start: span_start,
+			end: span_end,
+			file_indent,
+			find_indent: find_indent.clone(),
+		});
+	}
+	hits
+}
+
+/// Indent of the file's first matched line, *or* `None` when the
+/// model's first `find` line is blank (in which case we don't have a
+/// meaningful anchor; the next iteration will try the line below).
+/// Also bails when the file line is shorter than the model's
+/// expected post-dedent content — a cheap pre-filter before the full
+/// `lines_match_after_dedent` runs.
+fn file_indent_at(text: &str, span: &(usize, usize), first_find_line: &str) -> Option<String> {
+	let file_line = &text[span.0..span.1];
+	let trimmed_find = first_find_line.trim_start_matches([' ', '\t']);
+	if trimmed_find.is_empty() {
+		return None;
+	}
+	let trimmed_file = file_line.trim_start_matches([' ', '\t']);
+	if trimmed_file.is_empty() {
+		return None;
+	}
+	if !trimmed_file.starts_with(trimmed_find) && trimmed_file != trimmed_find.trim_end() {
+		return None;
+	}
+	Some(leading_whitespace(file_line).to_owned())
+}
+
+fn lines_match_after_dedent(file_line: &str, find_line: &str) -> bool {
+	let f = file_line.trim_start_matches([' ', '\t']).trim_end_matches([' ', '\t']);
+	let n = find_line.trim_start_matches([' ', '\t']).trim_end_matches([' ', '\t']);
+	if n.is_empty() {
+		// Blank `find` line matches any blank or whitespace-only
+		// file line. (Both halves are empty after the trim_*.)
+		return f.is_empty();
+	}
+	f == n
+}
+
+fn leading_whitespace(line: &str) -> &str {
+	let end = line.bytes().position(|b| b != b' ' && b != b'\t').unwrap_or(line.len());
+	&line[..end]
+}
+
+/// `(start, end_without_newline)` byte offsets for every line in
+/// `text`, including a trailing empty line when the file ends with
+/// `\n` (so the count matches `text.lines().count() + 1` for
+/// newline-terminated files). The "end without newline" form is what
+/// the per-line splice wants: the trailing `\n` lives outside the
+/// matched span so the file's existing line structure is preserved.
+fn collect_line_spans(text: &str) -> Vec<(usize, usize)> {
+	let mut spans = Vec::new();
+	let bytes = text.as_bytes();
+	let mut line_start = 0;
+	for (i, &b) in bytes.iter().enumerate() {
+		if b == b'\n' {
+			spans.push((line_start, i));
+			line_start = i + 1;
+		}
+	}
+	if line_start < bytes.len() {
+		spans.push((line_start, bytes.len()));
+	}
+	spans
+}
+
+/// Apply the file-vs-find indent delta to `replace` so the spliced
+/// bytes line up with the file's indentation at the match point.
+///
+/// - `file_indent` longer than `find_indent` and starts with it →
+///   the model under-indented; prepend the extra prefix to every
+///   non-blank line of `replace`.
+/// - `find_indent` longer than `file_indent` and starts with it →
+///   the model over-indented; strip the extra prefix from every
+///   non-blank line of `replace` that has it. Lines without that
+///   prefix are left as-is (defensive — the model can stay
+///   internally consistent if it deepens nesting inside `replace`).
+/// - Indents differ in *shape* (tab vs. spaces, mixed): leave
+///   `replace` alone. Better to let format-on-save sort it than to
+///   silently mutate the model's text on a guess.
+fn reindent_replacement(replace: &str, find_indent: &str, file_indent: &str) -> String {
+	if find_indent == file_indent {
+		return replace.to_owned();
+	}
+	if let Some(extra) = file_indent.strip_prefix(find_indent) {
+		return prepend_per_nonblank_line(replace, extra);
+	}
+	if let Some(extra) = find_indent.strip_prefix(file_indent) {
+		return strip_per_nonblank_line(replace, extra);
+	}
+	replace.to_owned()
+}
+
+fn prepend_per_nonblank_line(text: &str, prefix: &str) -> String {
+	if prefix.is_empty() {
+		return text.to_owned();
+	}
+	let mut out = String::with_capacity(text.len() + prefix.len() * 4);
+	for (i, line) in text.split_inclusive('\n').enumerate() {
+		// First line always gets the prefix when non-blank — the
+		// caller's invariant is that `replace`'s first content line
+		// corresponds to the file's matched first line.
+		let trimmed = line.trim_end_matches('\n');
+		if trimmed.is_empty() {
+			out.push_str(line);
+			continue;
+		}
+		let _ = i; // suppress unused warning; kept for future per-line policy hooks.
+		out.push_str(prefix);
+		out.push_str(line);
+	}
+	out
+}
+
+fn strip_per_nonblank_line(text: &str, prefix: &str) -> String {
+	if prefix.is_empty() {
+		return text.to_owned();
+	}
+	let mut out = String::with_capacity(text.len());
+	for line in text.split_inclusive('\n') {
+		let trimmed = line.trim_end_matches('\n');
+		if trimmed.is_empty() || !trimmed.starts_with(prefix) {
+			out.push_str(line);
+			continue;
+		}
+		out.push_str(&line[prefix.len()..]);
+	}
+	out
+}
+
 fn clamp_to_char_boundary(s: &str, max: usize) -> usize {
 	if s.len() <= max {
 		return s.len();
@@ -951,8 +1377,129 @@ fn clamp_to_char_boundary_bytes(bytes: &[u8], max: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-	use super::{byte_offsets_of, format_grep_hits, format_numbered_lines, truncate_grep_line, GREP_MAX_LINE_CHARS};
+	use super::{
+		byte_offsets_of, format_grep_hits, format_numbered_lines, locate_edit, truncate_grep_line, GREP_MAX_LINE_CHARS,
+	};
 	use moon_protocol::search::ContentSearchHit;
+
+	#[test]
+	fn locate_edit_exact_match_returns_byte_range_and_replacement() {
+		// Hot path: model's `find` byte-matches the file. Splice
+		// covers exactly `find.len()` bytes; `replace_text` is
+		// returned verbatim so existing tests / callers keep their
+		// invariants.
+		let text = "alpha\nbeta\ngamma\n";
+		let plan = locate_edit(text, "beta", "BETA", None, "test.txt").expect("exact match");
+		assert_eq!(plan.start, 6);
+		assert_eq!(plan.end, 10);
+		assert_eq!(plan.replace_text, "BETA");
+		assert_eq!(plan.mode, "exact");
+		assert_eq!(plan.total_matches, 1);
+		assert_eq!(plan.occurrence, 1);
+	}
+
+	#[test]
+	fn locate_edit_indent_fallback_prepends_missing_tabs() {
+		// Reproduces the Capfi session failure: file has 3-tab
+		// indent on the `error: {` line, model wrote `find` with
+		// 2 tabs. The fuzzy match should still locate the block
+		// and the spliced `replace` should pick up the extra tab
+		// so the file's indentation is preserved without relying
+		// on the formatter.
+		let file = "fn main() {\n\t\t\terror: {\n\t\t\t\tname: x,\n\t\t\t},\n}\n";
+		let find = "\t\terror: {\n\t\t\tname: x,\n\t\t},";
+		let replace = "\t\terror: {\n\t\t\tname: x,\n\t\t\tstatus: 500,\n\t\t},";
+		let plan = locate_edit(file, find, replace, None, "test.rs").expect("fuzzy indent match");
+		assert_eq!(plan.mode, "fuzzy_indent");
+		// Splice covers the file's actual matched lines (3-tab
+		// indent), not the model's would-be `find` bytes.
+		assert_eq!(
+			&file[plan.start..plan.end],
+			"\t\t\terror: {\n\t\t\t\tname: x,\n\t\t\t},"
+		);
+		// Replacement is shifted by the missing tab on every
+		// non-blank line.
+		assert_eq!(
+			plan.replace_text,
+			"\t\t\terror: {\n\t\t\t\tname: x,\n\t\t\t\tstatus: 500,\n\t\t\t},"
+		);
+	}
+
+	#[test]
+	fn locate_edit_indent_fallback_strips_extra_tabs() {
+		// Mirror case: model over-indented its `find` relative to
+		// the file. We strip the excess from `replace` so the
+		// splice still slots in cleanly.
+		let file = "error: {\n\tname: x,\n},\n";
+		let find = "\t\terror: {\n\t\t\tname: x,\n\t\t},";
+		let replace = "\t\terror: {\n\t\t\tname: x,\n\t\t\tstatus: 500,\n\t\t},";
+		let plan = locate_edit(file, find, replace, None, "test.rs").expect("fuzzy indent strip match");
+		assert_eq!(plan.mode, "fuzzy_indent");
+		assert_eq!(&file[plan.start..plan.end], "error: {\n\tname: x,\n},");
+		assert_eq!(plan.replace_text, "error: {\n\tname: x,\n\tstatus: 500,\n},");
+	}
+
+	#[test]
+	fn locate_edit_unescape_fallback_translates_literal_tn() {
+		// Escape-leakage failure mode: the model's `find` carries
+		// the literal two-char `\n` / `\t` sequences instead of
+		// the control bytes. The unescape stage retries with the
+		// translated form and quietly succeeds.
+		let file = "a\n\tb\n";
+		let find = r"a\n\tb";
+		let replace = r"x\n\ty";
+		let plan = locate_edit(file, find, replace, None, "test.txt").expect("unescape match");
+		assert_eq!(plan.mode, "fuzzy_unescape");
+		assert_eq!(&file[plan.start..plan.end], "a\n\tb");
+		assert_eq!(plan.replace_text, "x\n\ty");
+	}
+
+	#[test]
+	fn locate_edit_multi_match_error_lists_line_numbers() {
+		// Model gave a `find` that legitimately matches twice;
+		// without `occurrence` we now name the lines so the model
+		// can pick the right one with more context.
+		let file = "foo\nbar\nfoo\nbaz\n";
+		let err = locate_edit(file, "foo", "X", None, "dup.txt").unwrap_err();
+		let msg = err.to_string();
+		assert!(msg.contains("lines 1, 3"), "error should list line numbers, got: {msg}");
+	}
+
+	#[test]
+	fn locate_edit_occurrence_picks_nth_exact_match() {
+		// Sanity: the `occurrence` selector still works on the
+		// exact path after the refactor.
+		let file = "foo\nfoo\nfoo\n";
+		let plan = locate_edit(file, "foo", "X", Some(2), "dup.txt").expect("occurrence=2");
+		assert_eq!(plan.occurrence, 2);
+		assert_eq!(plan.start, 4);
+		assert_eq!(plan.end, 7);
+	}
+
+	#[test]
+	fn locate_edit_no_match_returns_actionable_error() {
+		// Final fallback: nothing matched. Error mentions the
+		// path and tells the model what to do next (re-read,
+		// check whitespace) rather than a bare "not found".
+		let err = locate_edit("hello world\n", "missing", "x", None, "src/foo.rs").unwrap_err();
+		let msg = err.to_string();
+		assert!(msg.contains("src/foo.rs"));
+		assert!(msg.contains("indent-tolerant"));
+	}
+
+	#[test]
+	fn locate_edit_indent_fallback_ambiguous_lists_lines() {
+		// Two indent-tolerant hits, no `occurrence` → error
+		// names both line numbers so the model can disambiguate
+		// without another round of guessing.
+		let file = "\tfoo\n\t\tfoo\n";
+		let err = locate_edit(file, "foo", "X", None, "dup.txt").unwrap_err();
+		let msg = err.to_string();
+		// Exact match would find both `foo`s anyway → this is
+		// the exact-match ambiguity error, not the indent-fuzzy
+		// one. The line numbers should still be listed.
+		assert!(msg.contains("lines 1, 2"), "error should list line numbers, got: {msg}");
+	}
 
 	#[test]
 	fn byte_offsets_of_finds_non_overlapping_hits() {

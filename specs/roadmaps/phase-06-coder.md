@@ -117,9 +117,14 @@ them up via the existing fs-watch path).
 
 What ships:
 
-- `write_file` and `edit_file` tools. `edit_file` uses exact
-  string match; failure throws so the LLM can retry with bigger
-  context. Multi-match disambiguation via a 1-based `occurrence`
+- `write_file` and `edit_file` tools. `edit_file` tries exact
+  byte match first, then falls back to (a) unescaping literal
+  `\n` / `\t` in `find` and retrying exact and (b) a line-aligned
+  indent-tolerant match that re-indents `replace` to fit the
+  file. `match_mode` in the result reports which path took.
+  Failure throws — the error lists matching line numbers when
+  more than one fuzzy hit exists. Multi-match disambiguation via
+  a 1-based `occurrence`
   arg — passing it without a prior failure is fine, but the
   prompt steers the model toward "add more context" first.
   Open-buffer collision: if the target is a dirty open tab, the
