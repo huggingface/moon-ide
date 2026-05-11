@@ -32,6 +32,30 @@
 	const errorCount = $derived(activeFileDiagnostics.filter((d) => d.severity === 'error').length);
 	const warnCount = $derived(activeFileDiagnostics.filter((d) => d.severity === 'warning').length);
 
+	// Character count of the current editor selection, surfaced as
+	// a tiny chip so the user can size up a buffer against an LLM
+	// context budget (Ctrl+A on AGENTS.md → "12,345 selected"). We
+	// use `text.length` — JS's UTF-16 code-unit count — on purpose:
+	// for ASCII-dominated source / markdown it equals the visible
+	// character count exactly, and even for emoji-heavy buffers it
+	// stays a useful order-of-magnitude proxy without paying the
+	// cost of an `Array.from(text)` walk on a multi-MB select-all.
+	// The snapshot is sticky across tab switches (see
+	// `state.svelte.ts` activeSelection docs — the "Add to Coder"
+	// flow wants it), so we gate the chip on the snapshot's path
+	// matching the active file. Otherwise switching to a fresh
+	// buffer would still show the previous file's selection size.
+	const selectionChars = $derived.by(() => {
+		const sel = workspace.activeSelection;
+		if (sel === null || workspace.activeFile === null) {
+			return 0;
+		}
+		if (sel.path !== workspace.activeFile.path) {
+			return 0;
+		}
+		return sel.text.length;
+	});
+
 	// Per-language LSP availability pill. We show it only when the
 	// active file maps to a language we have a server wired up for
 	// (so a Markdown buffer doesn't flash a "typescript not
@@ -292,6 +316,16 @@
 				{workspace.activeFile.name}{workspace.activeFile.isDirty ? ' •' : ''}
 			</span>
 		{/if}
+		<!-- Selection size chip. Hidden when there's no selection
+			 so the status bar stays quiet during regular editing.
+			 Tooltip spells out the unit; the chip itself stays
+			 compact ("12,345 sel") to leave room for the other
+			 status pills. -->
+		{#if selectionChars > 0}
+			<span class="item sel" title="{selectionChars.toLocaleString()} characters selected">
+				{selectionChars.toLocaleString()} sel
+			</span>
+		{/if}
 		<!-- Diagnostic pill. Only renders when there's something to
 			 say — zero-error / zero-warning buffers stay quiet. -->
 		{#if errorCount > 0 || warnCount > 0}
@@ -532,6 +566,11 @@
 	.path {
 		max-width: 60ch;
 		color: var(--m-fg-subtle);
+	}
+	.sel {
+		color: var(--m-fg-muted);
+		font-variant-numeric: tabular-nums;
+		cursor: help;
 	}
 	.chat {
 		font: inherit;
