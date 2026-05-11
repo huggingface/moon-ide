@@ -23,9 +23,19 @@ use crate::slack::SlackBotProfile;
 use crate::theme::ThemeMode;
 use crate::workspace::WorkspaceMeta;
 
+// On-disk persisted state — explicitly **not** `deny_unknown_fields`.
+// When we delete a field in a later version, the next launch's
+// deserializer should silently drop the obsolete key instead of
+// rejecting the whole file (which throws away every other piece of
+// persisted state in the process: open folders, panel sizes, last
+// session, etc.). The pre-stable-schema rule in AGENTS.md (delete
+// fields freely; don't write migrations) only works if the reader is
+// permissive about *extra* fields. Wire protocols like
+// `crate::workspace::WorkspaceMeta` still use `deny_unknown_fields`
+// because there a typo in either party's struct is a real bug.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
 #[ts(export)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct AppState {
 	/// Catalog of every workspace the user has on this machine
 	/// (Phase 7.2). Empty until the user names their first
@@ -77,9 +87,11 @@ pub enum RightPanelKind {
 /// without re-running the bot picker. Panel visibility lives at the
 /// top level on [`AppState::right_panel`] — chat and coder share
 /// one slot.
+// See the note on [`AppState`] re: `deny_unknown_fields` and on-disk
+// state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
 #[ts(export)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct SlackAppState {
 	/// Bot the user picked from the DM list. `None` means "show the
 	/// picker on next chat-panel render". Cleared by an explicit "Pick
@@ -102,9 +114,13 @@ pub struct SlackAppState {
 /// `<XDG_DATA_HOME>/moon-ide/coder-sessions/<project-slug>/<id>.jsonl`,
 /// not here. See [`crate::session`] / `crates/moon-coder/src/sessions.rs`
 /// for the on-disk format.
+// See the note on [`AppState`] re: `deny_unknown_fields` and on-disk
+// state. The `default_provider` field that lived here in an earlier
+// build is exactly the case this is meant to handle — old state.json
+// files in the wild still carry it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
 #[ts(export)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct CoderAppState {
 	/// Last-opened session id **per workspace folder**. Restored on
 	/// launch when the user revisits a folder: the active folder's
@@ -116,6 +132,27 @@ pub struct CoderAppState {
 	/// call updates that folder's entry.
 	#[serde(default)]
 	pub last_session_by_folder: std::collections::HashMap<String, String>,
+	/// Slug of the "standard" model driving the main agent loop +
+	/// every sub-agent. Empty means "use the hardcoded default"
+	/// (`DEFAULT_STANDARD_MODEL` in `crates/moon-coder/src/defaults.rs`).
+	/// Format mirrors what the HF Inference Providers router accepts
+	/// in the request body — bare `Qwen/Qwen3.5-397B-A17B`, or
+	/// suffixed with `:scaleway` / `:fastest` / etc.
+	#[serde(default)]
+	pub standard_model: String,
+	/// Slug of the "cheap" model used for auto-rename, branch-name
+	/// suggester, commit-message suggester, compaction summary, and
+	/// folder-summary onboarding. Same format as `standard_model`.
+	/// Empty = `DEFAULT_CHEAP_MODEL`.
+	#[serde(default)]
+	pub cheap_model: String,
+	/// Organisation slug to send as the `X-HF-Bill-To` header on every
+	/// inference call. Empty = bill the user's personal account.
+	/// The user must be a paying member of the org and the org must
+	/// have inference credits, otherwise the router rejects the
+	/// request — we surface the router's error verbatim.
+	#[serde(default)]
+	pub bill_to: String,
 }
 
 /// Bottom-panel slice of [`AppState`].
@@ -125,9 +162,11 @@ pub struct CoderAppState {
 /// processes that don't survive a launch, and re-spawning them blindly
 /// on startup would surprise the user. Visibility + height are pure
 /// chrome and safe to restore.
+// See the note on [`AppState`] re: `deny_unknown_fields` and on-disk
+// state.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct BottomPanelAppState {
 	/// Whether the bottom panel was open at last shutdown. Defaults to
 	/// `false` — first-run users shouldn't have an empty panel
@@ -149,5 +188,34 @@ impl Default for BottomPanelAppState {
 			// a typical 1080p screen, without crowding the editor.
 			height: 240,
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// Pre-stable schema rule: deleting a field from `*AppState`
+	// shouldn't reject the whole state file on the next launch. The
+	// failure mode this prevents in practice is "user updates moon-ide,
+	// loses every workspace / panel / session state because one stale
+	// key was still in `state.json`". The structs explicitly opt **out**
+	// of `deny_unknown_fields`; this test pins that decision.
+	#[test]
+	fn app_state_tolerates_obsolete_fields() {
+		// Mix a real current key (`workspaces` is empty but valid)
+		// with an obsolete one we know used to exist, plus a
+		// completely made-up key for paranoia.
+		let json = r#"{
+			"workspaces": [],
+			"obsolete_top_level_field": 42,
+			"coder": {
+				"standard_model": "Qwen/Qwen3.5-397B-A17B:scaleway",
+				"default_provider": "scaleway",
+				"some_future_field": "anything"
+			}
+		}"#;
+		let parsed: AppState = serde_json::from_str(json).expect("parses despite obsolete keys");
+		assert_eq!(parsed.coder.standard_model, "Qwen/Qwen3.5-397B-A17B:scaleway");
 	}
 }

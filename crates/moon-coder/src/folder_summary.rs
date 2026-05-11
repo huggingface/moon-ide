@@ -33,7 +33,6 @@ use tokio::fs;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::defaults::DEFAULT_FAST_MODEL;
 use crate::event::{CoderEvent, CoderEventEnvelope};
 use crate::inference::{ChatMessage, InferenceClient};
 use crate::sessions::{current_time_ms, project_slug};
@@ -152,6 +151,7 @@ impl FolderSummaryService {
 		self: &Arc<Self>,
 		folder_root: Utf8PathBuf,
 		inference: InferenceClient,
+		cheap_model: String,
 		events: broadcast::Sender<CoderEventEnvelope>,
 		cancel: CancellationToken,
 	) {
@@ -164,7 +164,7 @@ impl FolderSummaryService {
 					return;
 				}
 			}
-			let outcome = generate_and_cache(&this.cache_root, &folder_root, &inference, &cancel).await;
+			let outcome = generate_and_cache(&this.cache_root, &folder_root, &inference, &cheap_model, &cancel).await;
 			match outcome {
 				Ok(summary) => {
 					tracing::debug!(slug, "folder summary refreshed");
@@ -199,6 +199,7 @@ async fn generate_and_cache(
 	cache_root: &Utf8Path,
 	folder_root: &Utf8Path,
 	inference: &InferenceClient,
+	cheap_model: &str,
 	cancel: &CancellationToken,
 ) -> Result<FolderSummary, String> {
 	let (input_text, sig) = read_inputs(folder_root).await;
@@ -229,7 +230,7 @@ async fn generate_and_cache(
 		ChatMessage::User { content: user_prompt },
 	];
 	let response = inference
-		.chat_completion(DEFAULT_FAST_MODEL, &messages, &[], cancel)
+		.chat_completion(cheap_model, &messages, &[], cancel)
 		.await
 		.map_err(|err| err.to_string())?;
 	let raw = response.content.unwrap_or_default();

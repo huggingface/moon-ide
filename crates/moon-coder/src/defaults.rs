@@ -21,17 +21,33 @@ pub const HF_OAUTH_CLIENT_ID: &str = "7977dff4-917a-4cf9-a726-dd45e25faa5f";
 ///   enough for create-repo + push, which is all bucket sync
 ///   needs. Bucket sync itself lands in 6.7; we ask for the scope
 ///   at sign-in so the user only sees the consent screen once.
-pub const HF_OAUTH_SCOPES: &str = "inference-api contribute-repos";
+/// - `read-billing` — required for `canPay` to be populated on
+///   each `orgs[]` entry in `/oauth/userinfo`. Without this scope
+///   HF omits the field across the board (or sends `false`) so the
+///   picker has no way to tell a payment-capable org from one that
+///   isn't. Cheap to ask for — consent shows it as
+///   "Read billing info"; we don't actually move money, the scope
+///   only lets us *see* whether the user can.
+///
+/// Users with a token issued before a scope addition need to sign
+/// out + back in to upgrade. Existing tokens keep working for the
+/// scopes they originally granted; the picker just renders
+/// "not authorized" / "can_pay unknown" until the upgrade happens.
+pub const HF_OAUTH_SCOPES: &str = "inference-api contribute-repos read-billing";
 
-/// Default "large" model — the everyday driver. Carried verbatim
-/// from the user's brief (see ADR 0010). Phase 6.0 hardwires this;
-/// 6.4 makes it configurable.
-pub const DEFAULT_LARGE_MODEL: &str = "Qwen/Qwen3.5-397B-A17B:scaleway";
+/// Default "standard" model — the everyday driver. Carried verbatim
+/// from the user's brief (see ADR 0010). Seed value the runner uses
+/// when [`crate::models::CoderModels::standard`] is empty (i.e. the
+/// user hasn't picked one in the settings popover). User-facing
+/// label is "standard" because the picker exposes the choice as
+/// "Standard model" vs "Cheap model" — `large` would imply a tier
+/// system we don't actually have.
+pub const DEFAULT_STANDARD_MODEL: &str = "Qwen/Qwen3.5-397B-A17B:scaleway";
 
-/// Default "fast" model — used for sub-agents and lightweight tasks.
-/// Not wired to the loop in 6.0 (sub-agents are deferred); kept here
-/// so 6.4 only needs to plumb the existing constant through.
-pub const DEFAULT_FAST_MODEL: &str = "Qwen/Qwen3-Coder-30B-A3B-Instruct:scaleway";
+/// Default "cheap" model — used for auto-rename session titles,
+/// branch-name suggester, compaction summaries, folder summaries.
+/// Same fallback semantics as [`DEFAULT_STANDARD_MODEL`].
+pub const DEFAULT_CHEAP_MODEL: &str = "Qwen/Qwen3-Coder-30B-A3B-Instruct:scaleway";
 
 /// HF Hub base URL — the host serves OAuth endpoints, the API, and
 /// the bucket REST endpoints from the same origin.
@@ -50,17 +66,26 @@ pub const HF_ROUTER_BASE: &str = "https://router.huggingface.co/v1";
 pub const MAX_TURN_ITERATIONS: usize = 200;
 
 /// Per-model context-window size in tokens. Drives the in-panel
-/// usage ring and the auto-compaction threshold. Hardcoded today
-/// per AGENTS.md "hardcode first, configure later" — the team
-/// uses two models and they're both 256k. Returns the conservative
-/// default when an unknown slug shows up so a future model swap
-/// degrades to "the ring works but undersells the window" rather
-/// than a panic.
+/// usage ring and the auto-compaction threshold.
+///
+/// **Fallback only.** Authoritative source is the router's
+/// `/v1/models` response — `providers[].context_length` — distilled
+/// into [`crate::models::CoderModels::context_windows`] by
+/// [`crate::runner::CoderHandle::list_models`] every time the
+/// picker is opened. The runner's
+/// [`crate::models::CoderModels::context_window`] consults that map
+/// first and only falls through here when the catalog hasn't been
+/// fetched yet (the user sent their first turn before opening the
+/// picker) or the model id genuinely isn't in the router catalog.
+///
+/// Entries are prefix-matched so `Qwen/Qwen3.5-397B-A17B:scaleway`
+/// resolves the same as the bare slug. Keep this list to the
+/// team's default picks (the ones in
+/// [`DEFAULT_STANDARD_MODEL`] / [`DEFAULT_CHEAP_MODEL`]); anything
+/// else will reach this table only on the cold first turn and
+/// only ever once per process — the picker fetch makes it
+/// authoritative from then on.
 pub fn context_window_for(model_slug: &str) -> u32 {
-	// Slug lookup uses prefix matching because the router pins a
-	// `:scaleway` (or other-provider) suffix onto the canonical HF
-	// model id. The context window is a property of the underlying
-	// model, not the provider route.
 	const TABLE: &[(&str, u32)] = &[
 		("Qwen/Qwen3.5-397B-A17B", 256_000),
 		("Qwen/Qwen3-Coder-30B-A3B-Instruct", 256_000),
@@ -70,7 +95,10 @@ pub fn context_window_for(model_slug: &str) -> u32 {
 			return *window;
 		}
 	}
-	tracing::warn!(model = model_slug, "no context_window entry; defaulting to 128k");
+	tracing::warn!(
+		model = model_slug,
+		"no context_window entry and router catalog not yet fetched; defaulting to 128k"
+	);
 	128_000
 }
 

@@ -85,9 +85,9 @@ struct TokenBundle {
 	token_type: String,
 }
 
-/// What `/oauth/userinfo` returns, trimmed to what we render. HF
-/// includes a lot more (orgs, plan, …) but the panel only ever
-/// needs name + avatar.
+/// What `/oauth/userinfo` returns, trimmed to what we render +
+/// the `orgs` array we now consume to feed the model picker's
+/// "Bill to" dropdown.
 ///
 /// Note `username` (`preferred_username`) and `name` are
 /// **separate** OIDC claims and HF returns both — `username` is
@@ -96,16 +96,108 @@ struct TokenBundle {
 /// `preferred_username`, which made serde collapse them and report
 /// "duplicate field `preferred_username`". Don't be tempted to
 /// re-add the alias.
+///
+/// `orgs` is read straight from the OAuth userinfo response —
+/// previously we hit `/api/whoami-v2` for the same data, but
+/// userinfo already carries it and we already have an OAuth token
+/// to authenticate with, so it's one less endpoint + scope to
+/// reason about. The set of orgs is determined by what the user
+/// consented to share at OAuth time; an org the user is a member of
+/// but didn't expose to moon-ide simply won't show up in the
+/// picker. If the userinfo response omits `orgs` entirely the field
+/// defaults to an empty list — the "Personal account" option always
+/// works regardless.
+// Renames are `deserialize`-only on every field below: HF emits
+// `preferred_username` / `picture` / `canPay` / `roleInOrg` /
+// `isEnterprise` on the wire, but we forward the parsed struct
+// straight to the frontend via Tauri's IPC and the TS side expects
+// the Rust field names. A bidirectional `rename = "…"` makes the
+// Tauri serializer write `preferred_username` etc. back out, which
+// the TS reads as `undefined` — every renamed field arrives empty
+// and the picker silently breaks (empty parens after the org name,
+// "Bill to" sending the display name instead of the slug).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HfIdentity {
-	#[serde(rename = "preferred_username")]
+	#[serde(rename(deserialize = "preferred_username"))]
 	pub username: String,
 	#[serde(default)]
 	pub name: Option<String>,
-	#[serde(default, rename = "picture")]
+	#[serde(default, rename(deserialize = "picture"))]
 	pub avatar_url: Option<String>,
 	#[serde(default)]
 	pub email: Option<String>,
+	/// Orgs the user belongs to, as reported by `/oauth/userinfo`.
+	/// Sorted server-side; we preserve that order. Each entry is
+	/// safe to send to the router as `X-HF-Bill-To: <name>`
+	/// provided the org has `can_pay: true` (the picker greys out
+	/// orgs that can't pay and explains why on hover).
+	#[serde(default)]
+	pub orgs: Vec<HfOrg>,
+}
+
+/// One entry of [`HfIdentity::orgs`]. Field names mirror HF's
+/// userinfo payload (camelCase on the wire); we rename to
+/// `snake_case` for the Rust + TS surface. Unknown fields are
+/// dropped silently — we only consume what the picker needs.
+///
+/// **Slug vs. display name**: HF returns `preferred_username` as
+/// the URL slug (`huggingface`) and `name` as the display string
+/// (`"Hugging Face"`). The router's `X-HF-Bill-To` header expects
+/// the slug, so the picker sends `slug` while showing `name` in
+/// the dropdown row. Old userinfo payloads (or denied-scope cases)
+/// might omit `preferred_username`; we fall back to `name` in
+/// that case to keep the dropdown functional even though billing
+/// will likely fail — the router error reaches the panel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HfOrg {
+	/// Display name as HF shows it everywhere
+	/// (`"Hugging Face"`). Surfaced in the picker dropdown row.
+	pub name: String,
+	/// URL slug (`huggingface`) — what `X-HF-Bill-To` actually
+	/// wants. `None` when the userinfo payload omitted it (older
+	/// HF builds or a scope-denied response that only carried
+	/// `name`); the picker falls back to `name` in that case so
+	/// billing at least attempts a string the user typed by hand
+	/// would too.
+	#[serde(default, rename(deserialize = "preferred_username"))]
+	pub slug: Option<String>,
+	/// Display avatar for the org. `None` falls back to the
+	/// auto-generated identicon HF renders elsewhere.
+	#[serde(default, rename(deserialize = "picture"))]
+	pub avatar_url: Option<String>,
+	/// Authoritative flag: `true` iff the user can bill inference
+	/// calls to this org.
+	///
+	/// Populated by HF whenever the `read-billing` OAuth scope was
+	/// granted *and* the user authorized this specific org at consent
+	/// time. A `false` value is a real "cannot pay" signal (no
+	/// credits, role doesn't permit billing, etc.) — the picker
+	/// disables the corresponding `<option>` so the user can't pick
+	/// it. Without `read-billing` the field is absent server-side and
+	/// we deserialize to `false`; same effect, which is fine because
+	/// we never reach this code path for orgs that aren't in the
+	/// authorized set anyway (those get filtered out earlier — see
+	/// [`role_in_org`](Self::role_in_org)).
+	#[serde(default, rename(deserialize = "canPay"))]
+	pub can_pay: bool,
+	/// User's role inside the org, e.g. `"admin"` / `"contributor"`.
+	///
+	/// **Per-org consent signal.** HF only emits `roleInOrg` (and the
+	/// other org-scoped fields like `canPay`) for orgs the user
+	/// explicitly authorized moon-ide for at the OAuth consent
+	/// screen. A `None` value means the user is a member of that org
+	/// but didn't tick its checkbox at consent time, and the entry
+	/// carries no usable signal. The picker filters those rows out
+	/// of the bill-to dropdown — if a user expects an org and doesn't
+	/// see it, they sign out + back in and re-tick at the consent
+	/// screen.
+	#[serde(default, rename(deserialize = "roleInOrg"))]
+	pub role_in_org: Option<String>,
+	/// True for enterprise orgs. Drives a small badge in the
+	/// picker so users running on a personal + work account can
+	/// tell them apart at a glance.
+	#[serde(default, rename(deserialize = "isEnterprise"))]
+	pub is_enterprise: bool,
 }
 
 /// Owns the keyring entry for the HF OAuth tokens. Stateless — held
@@ -408,7 +500,36 @@ impl Authenticator {
 		if !status.is_success() {
 			return Err(CoderError::http(endpoint, status.as_u16(), body));
 		}
-		decode_body(&endpoint, &body)
+
+		// Debug-only verbatim body. Contains the user's HF-registered
+		// email + email_verified + per-org payload, so it's gated
+		// behind `RUST_LOG=moon_coder::auth=debug` — not on by default.
+		// Useful when an org's `slug` arrives as `null` to confirm
+		// whether HF actually omitted `preferred_username` or we
+		// renamed the field on our side.
+		tracing::debug!(body = %body, "/oauth/userinfo raw response");
+
+		let identity: HfIdentity = decode_body(&endpoint, &body)?;
+
+		// Info-level summary of what we deserialised. Just the fields
+		// the picker reads — username, the orgs each as
+		// `name (slug)` or `name (<no slug>)` so a missing
+		// `preferred_username` per-entry is loud in the log.
+		let org_summary: Vec<String> = identity
+			.orgs
+			.iter()
+			.map(|o| match &o.slug {
+				Some(slug) => format!("{} ({slug})", o.name),
+				None => format!("{} (<no slug>)", o.name),
+			})
+			.collect();
+		tracing::info!(
+			username = %identity.username,
+			orgs_count = identity.orgs.len(),
+			orgs = ?org_summary,
+			"parsed /oauth/userinfo"
+		);
+		Ok(identity)
 	}
 }
 
@@ -503,4 +624,65 @@ fn is_expired(bundle: &TokenBundle) -> bool {
 
 fn is_near_expiry(bundle: &TokenBundle) -> bool {
 	unix_now().saturating_add(REFRESH_LEAD_TIME_SECS) >= bundle.expires_at_unix
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// Round-trip pins the bidirectional-rename trap: HF's wire shape
+	// uses `preferred_username`/`picture`/`canPay`/`roleInOrg`/
+	// `isEnterprise`, the TS side reads our Rust field names, and a
+	// bare `rename = "…"` would emit the wire names on the outbound
+	// serialize path — leaving every renamed field `undefined` on the
+	// frontend. Renames must be `rename(deserialize = "…")`.
+	#[test]
+	fn hf_org_serializes_with_rust_field_names() {
+		let wire = r#"{
+			"name": "Hugging Face",
+			"preferred_username": "huggingface",
+			"picture": "https://example.test/avatar.png",
+			"canPay": true,
+			"roleInOrg": "admin",
+			"isEnterprise": false
+		}"#;
+		let org: HfOrg = serde_json::from_str(wire).expect("parses wire shape");
+		assert_eq!(org.slug.as_deref(), Some("huggingface"));
+		assert_eq!(org.avatar_url.as_deref(), Some("https://example.test/avatar.png"));
+		assert!(org.can_pay);
+		assert_eq!(org.role_in_org.as_deref(), Some("admin"));
+		assert!(!org.is_enterprise);
+
+		let out = serde_json::to_value(&org).expect("serialises");
+		// Outbound path uses Rust field names so the frontend (which
+		// expects `slug`, `avatar_url`, `can_pay`, `role_in_org`,
+		// `is_enterprise`) sees populated fields.
+		assert_eq!(out["slug"], "huggingface");
+		assert_eq!(out["avatar_url"], "https://example.test/avatar.png");
+		assert_eq!(out["can_pay"], true);
+		assert_eq!(out["role_in_org"], "admin");
+		assert_eq!(out["is_enterprise"], false);
+		// Wire names must not leak through on the outbound side.
+		assert!(out.get("preferred_username").is_none(), "wire name leaked");
+		assert!(out.get("canPay").is_none(), "wire name leaked");
+	}
+
+	#[test]
+	fn hf_identity_serializes_with_rust_field_names() {
+		let wire = r#"{
+			"sub": "abc",
+			"preferred_username": "coyotte508",
+			"name": "Eliott Coyac",
+			"picture": "https://example.test/me.png"
+		}"#;
+		let id: HfIdentity = serde_json::from_str(wire).expect("parses wire shape");
+		assert_eq!(id.username, "coyotte508");
+		assert_eq!(id.avatar_url.as_deref(), Some("https://example.test/me.png"));
+
+		let out = serde_json::to_value(&id).expect("serialises");
+		assert_eq!(out["username"], "coyotte508");
+		assert_eq!(out["avatar_url"], "https://example.test/me.png");
+		assert!(out.get("preferred_username").is_none());
+		assert!(out.get("picture").is_none());
+	}
 }

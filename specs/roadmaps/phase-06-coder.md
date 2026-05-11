@@ -217,8 +217,8 @@ What shipped:
   rows, and an `Intl.RelativeTimeFormat` time format on the
   list rows.
 - Auto-rename pass: spawned after the first turn completes,
-  uses `DEFAULT_FAST_MODEL` with a tight system prompt asking
-  for a 4-6 word title. Result is sanitised (trim quotes,
+  uses the cheap model (see 6.4) with a tight system prompt
+  asking for a 4-6 word title. Result is sanitised (trim quotes,
   ellipsis-truncate, collapse whitespace) before it lands in
   the header. Failures keep the truncated-prompt fallback.
 
@@ -238,17 +238,39 @@ rolled into 6.4):
 
 ### 6.4 — Model picker
 
-**Acceptance**: the panel header has a model dropdown with the
-hardcoded "large" / "fast" defaults plus any free-form HF slug
-typed by the user. Picks persist per session in the JSONL header.
+**Acceptance**: a cog icon in the coder panel header opens a
+popover with two model fields (Standard, Cheap), a default-provider
+hint, a Bill-to dropdown, and a click-to-fill catalog sourced from
+`https://router.huggingface.co/v1/models`. Picks persist
+panel-globally per signed-in user, in `AppState.coder`.
 
 What ships:
 
-- Model picker in `CoderPanel.svelte` header, sourced from
-  `defaults.rs` plus the active session's override.
-- `coder_set_model` Tauri command.
-- The session JSONL header gets a `model` field (and stays
-  schema-compatible with the 6.3 header — additive).
+- `crates/moon-coder/src/models.rs` — `CoderModels` snapshot held
+  behind `Arc<RwLock>` and shared with `InferenceClient` for
+  `X-HF-Bill-To`. Runner / sub-agent / compaction / folder-summary
+  re-read at the top of each call site so flips apply to the next
+  round-trip.
+- `AppState.coder.{standard_model, cheap_model, default_provider,
+bill_to}` (all default-empty; runner substitutes the hardcoded
+  defaults from `crates/moon-coder/src/defaults.rs`).
+- New Tauri commands: `coder_get_model_settings`,
+  `coder_set_model_settings`, `coder_list_models`. The catalog
+  call is forwarded straight to the router; bindings live in
+  `moon-protocol::coder_models` (`RouterModel`, `RouterProvider`,
+  `RouterPricing`, `CoderModelSettings`).
+- `HfIdentity.orgs` populated from `/oauth/userinfo` so the
+  "Bill to" dropdown has something to show without a separate
+  `/api/whoami-v2` round trip.
+- `CoderModelSettingsModal.svelte` — popover behind the cog with
+  the four fields, catalog list, search, and tier-toggle (the
+  catalog list is unfiltered for the cheap tier and filtered to
+  `supports_tools_anywhere` for the standard tier).
+- Rename across the codebase: `DEFAULT_LARGE_MODEL` /
+  `DEFAULT_FAST_MODEL` → `DEFAULT_STANDARD_MODEL` /
+  `DEFAULT_CHEAP_MODEL` (and matching field names everywhere).
+  No migration; pre-6.4 sessions still parse because the JSONL
+  `model` field is purely informational metadata.
 
 ### 6.5 — Steering, follow-up, ask_user
 

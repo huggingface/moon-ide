@@ -45,9 +45,9 @@
 
 use tokio_util::sync::CancellationToken;
 
-use crate::defaults::{context_window_for, DEFAULT_FAST_MODEL};
 use crate::event::CoderEvent;
 use crate::inference::{ChatMessage, InferenceClient, TokenUsage};
+use crate::models::CoderModels;
 use crate::runner::{estimate_prompt_tokens, FolderEventSink};
 
 /// Fraction of the model's context window that triggers a
@@ -111,7 +111,7 @@ pub(crate) async fn compact_if_needed(
 	inference: &InferenceClient,
 	sink: &FolderEventSink,
 	subagent_id_for_wrap: Option<&str>,
-	model_slug: &str,
+	models: &CoderModels,
 	last_usage: Option<&TokenUsage>,
 	messages: &mut Vec<ChatMessage>,
 	cancel: &CancellationToken,
@@ -119,7 +119,11 @@ pub(crate) async fn compact_if_needed(
 	let Some(usage) = last_usage else {
 		return false;
 	};
-	let context = context_window_for(model_slug);
+	// Context-window cap is a property of the *driver* model — the
+	// one whose history we're trying to fit. The cheap model only
+	// has to chew through `messages[1..cutoff]` for the summary;
+	// its own window doesn't gate the decision.
+	let context = models.context_window(models.standard());
 	if context == 0 {
 		return false;
 	}
@@ -164,7 +168,7 @@ pub(crate) async fn compact_if_needed(
 		},
 	];
 	let response = match inference
-		.chat_completion(DEFAULT_FAST_MODEL, &summary_call, &[], cancel)
+		.chat_completion(models.cheap(), &summary_call, &[], cancel)
 		.await
 	{
 		Ok(r) => r,

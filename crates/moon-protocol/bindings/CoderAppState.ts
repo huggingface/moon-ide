@@ -20,4 +20,28 @@ export type CoderAppState = {
  * when the matching session gets deleted; an `open_session`
  * call updates that folder's entry.
  */
-last_session_by_folder: { [key in string]: string }, };
+last_session_by_folder: { [key in string]: string }, 
+/**
+ * Slug of the "standard" model driving the main agent loop +
+ * every sub-agent. Empty means "use the hardcoded default"
+ * (`DEFAULT_STANDARD_MODEL` in `crates/moon-coder/src/defaults.rs`).
+ * Format mirrors what the HF Inference Providers router accepts
+ * in the request body — bare `Qwen/Qwen3.5-397B-A17B`, or
+ * suffixed with `:scaleway` / `:fastest` / etc.
+ */
+standard_model: string, 
+/**
+ * Slug of the "cheap" model used for auto-rename, branch-name
+ * suggester, commit-message suggester, compaction summary, and
+ * folder-summary onboarding. Same format as `standard_model`.
+ * Empty = `DEFAULT_CHEAP_MODEL`.
+ */
+cheap_model: string, 
+/**
+ * Organisation slug to send as the `X-HF-Bill-To` header on every
+ * inference call. Empty = bill the user's personal account.
+ * The user must be a paying member of the org and the org must
+ * have inference credits, otherwise the router rejects the
+ * request — we surface the router's error verbatim.
+ */
+bill_to: string, };

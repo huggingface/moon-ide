@@ -234,7 +234,7 @@ The right-side-of-the-folder-bar SCM panel:
 - **AI commit message** sparkle inset top-right of the textarea.
   `coder_suggest_commit_message` feeds the fast model
   (`DEFAULT_FAST_MODEL`) with the user's draft + a `git diff
-HEAD --no-color` patch capped at ~16 KB (new
+HEAD --no-color` patch capped at ~64 KB (new
   `WorkspaceHost::git_diff_patch`); response cleaned via
   `sanitise_commit_message` (single line, drop labels / quotes /
   trailing period, clamp to 100 chars).

@@ -14,11 +14,29 @@
 use std::sync::Arc;
 
 use futures_util::StreamExt as _;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::auth::Authenticator;
 use crate::defaults::HF_ROUTER_BASE;
 use crate::error::CoderError;
+use crate::models::SharedCoderModels;
+
+/// Some providers (DeepInfra at least) serialize "this chunk has no
+/// tool calls" as `tool_calls: null` instead of just omitting the
+/// field. Serde's `#[serde(default)]` covers *missing*, not
+/// *explicit-null*, so we need a custom deserializer that maps both
+/// to `T::default()`. Used on every `Vec` field that's part of an
+/// inference response — adding it costs nothing and we'd rather
+/// not have streams die mid-token because a provider was generous
+/// with `null`s.
+fn null_or_missing_as_default<'de, T, D>(deserializer: D) -> Result<T, D::Error>
+where
+	T: Default + Deserialize<'de>,
+	D: Deserializer<'de>,
+{
+	let opt = Option::<T>::deserialize(deserializer)?;
+	Ok(opt.unwrap_or_default())
+}
 
 /// One message in the conversation, in the OpenAI chat-completions
 /// shape. We keep the wire shape verbatim so the router doesn't need
@@ -35,7 +53,11 @@ pub enum ChatMessage {
 	Assistant {
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		content: Option<String>,
-		#[serde(default, skip_serializing_if = "Vec::is_empty")]
+		#[serde(
+			default,
+			deserialize_with = "null_or_missing_as_default",
+			skip_serializing_if = "Vec::is_empty"
+		)]
 		tool_calls: Vec<ToolCall>,
 	},
 	Tool {
@@ -170,7 +192,7 @@ pub struct AssistantResponse {
 	pub content: Option<String>,
 	#[serde(default, alias = "reasoning_content", alias = "reasoning")]
 	pub thinking: Option<String>,
-	#[serde(default)]
+	#[serde(default, deserialize_with = "null_or_missing_as_default")]
 	pub tool_calls: Vec<ToolCall>,
 	/// Provider-reported usage for the round-trip that produced
 	/// this response. `None` when the provider didn't emit a
@@ -189,7 +211,7 @@ pub struct AssistantResponse {
 /// handles both).
 #[derive(Debug, Clone, Deserialize)]
 struct StreamChunk {
-	#[serde(default)]
+	#[serde(default, deserialize_with = "null_or_missing_as_default")]
 	choices: Vec<StreamChoice>,
 	/// Final-chunk usage report. Only present on the very last
 	/// chunk of a stream when `stream_options.include_usage` was
@@ -239,7 +261,7 @@ struct StreamDelta {
 	reasoning_content: Option<String>,
 	#[serde(default)]
 	reasoning: Option<String>,
-	#[serde(default)]
+	#[serde(default, deserialize_with = "null_or_missing_as_default")]
 	tool_calls: Vec<ToolCallDelta>,
 }
 
@@ -269,16 +291,20 @@ struct FunctionCallDelta {
 }
 
 /// Inference HTTP client. Cheap to clone; the underlying
-/// `reqwest::Client` does its own connection pooling.
+/// `reqwest::Client` does its own connection pooling. Holds a
+/// reference to the [`SharedCoderModels`] handle so every request
+/// reads the current `bill_to` setting without the runner having to
+/// thread it through each call site.
 #[derive(Clone)]
 pub struct InferenceClient {
 	http: reqwest::Client,
 	auth: Authenticator,
 	base_url: String,
+	models: SharedCoderModels,
 }
 
 impl InferenceClient {
-	pub fn new(auth: Authenticator) -> Result<Self, CoderError> {
+	pub fn new(auth: Authenticator, models: SharedCoderModels) -> Result<Self, CoderError> {
 		let http = reqwest::Client::builder()
 			.user_agent(concat!("moon-ide/", env!("CARGO_PKG_VERSION")))
 			.build()
@@ -287,12 +313,112 @@ impl InferenceClient {
 			http,
 			auth,
 			base_url: HF_ROUTER_BASE.to_string(),
+			models,
 		})
 	}
 
 	pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
 		self.base_url = base_url.into();
 		self
+	}
+
+	/// Snapshot of the `X-HF-Bill-To` value to send on the next
+	/// request. Read fresh per request so a settings flip mid-turn
+	/// applies to the very next round-trip.
+	async fn current_bill_to(&self) -> Option<String> {
+		self.models.read().await.bill_to().map(str::to_owned)
+	}
+
+	/// GET `/v1/models` → list of [`RouterModel`]s the picker
+	/// renders. Auth uses the user's OAuth token; the router gates
+	/// model visibility on the token's scopes + the user's plan,
+	/// so the list a free user sees is a subset of what a Pro user
+	/// sees. We don't try to second-guess that — we just forward.
+	///
+	/// Bill-to header is **not** sent for the catalog call. The
+	/// router returns the same catalog regardless and we want a
+	/// failed `coder_set_models { bill_to = "org" }` to still let
+	/// the picker reload after the user fixes the org name.
+	pub async fn list_models(&self) -> Result<Vec<moon_protocol::coder_models::RouterModel>, CoderError> {
+		use moon_protocol::coder_models::{RouterModel, RouterPricing, RouterProvider};
+		let token = self.auth.current_access_token().await?;
+		let endpoint = format!("{}/models", self.base_url);
+		let response = self
+			.http
+			.get(&endpoint)
+			.bearer_auth(&token)
+			.send()
+			.await
+			.map_err(CoderError::from)?;
+		let status = response.status();
+		let body = response.text().await.map_err(CoderError::from)?;
+		if !status.is_success() {
+			return Err(CoderError::http(endpoint, status.as_u16(), body));
+		}
+
+		// Mirror the wire shape just for the decode step — we
+		// translate to the trimmed protocol shape immediately so
+		// the rest of the codebase doesn't see the verbose
+		// `architecture`/`is_model_author` cruft.
+		#[derive(Deserialize)]
+		struct ListBody {
+			data: Vec<RawModel>,
+		}
+		#[derive(Deserialize)]
+		struct RawModel {
+			id: String,
+			#[serde(default)]
+			owned_by: String,
+			#[serde(default)]
+			providers: Vec<RawProvider>,
+		}
+		#[derive(Deserialize)]
+		struct RawProvider {
+			provider: String,
+			#[serde(default)]
+			context_length: Option<u32>,
+			#[serde(default)]
+			supports_tools: bool,
+			#[serde(default)]
+			pricing: Option<RawPricing>,
+			#[serde(default)]
+			first_token_latency_ms: Option<f64>,
+			#[serde(default)]
+			throughput: Option<f64>,
+		}
+		#[derive(Deserialize)]
+		struct RawPricing {
+			input: f64,
+			output: f64,
+		}
+
+		let raw: ListBody = crate::auth::decode_body(&endpoint, &body)?;
+		let mut out = Vec::with_capacity(raw.data.len());
+		for m in raw.data {
+			let providers: Vec<RouterProvider> = m
+				.providers
+				.into_iter()
+				.map(|p| RouterProvider {
+					provider: p.provider,
+					context_length: p.context_length,
+					supports_tools: p.supports_tools,
+					pricing: p.pricing.map(|p| RouterPricing {
+						input: p.input,
+						output: p.output,
+					}),
+					first_token_latency_ms: p.first_token_latency_ms,
+					throughput: p.throughput,
+				})
+				.collect();
+			let supports_tools_anywhere = providers.iter().any(|p| p.supports_tools);
+			out.push(RouterModel {
+				id: m.id,
+				owned_by: m.owned_by,
+				supports_tools_anywhere,
+				providers,
+			});
+		}
+		Ok(out)
 	}
 
 	/// One non-streaming chat-completions round trip.
@@ -427,7 +553,12 @@ impl InferenceClient {
 		body: &ChatCompletionRequest<'_>,
 		cancel: &tokio_util::sync::CancellationToken,
 	) -> Result<reqwest::Response, CoderError> {
-		let send = self.http.post(endpoint).bearer_auth(access_token).json(body).send();
+		let bill_to = self.current_bill_to().await;
+		let mut builder = self.http.post(endpoint).bearer_auth(access_token).json(body);
+		if let Some(org) = bill_to {
+			builder = builder.header(BILL_TO_HEADER, org);
+		}
+		let send = builder.send();
 		tokio::select! {
 			biased;
 			_ = cancel.cancelled() => Err(CoderError::Aborted),
@@ -443,16 +574,22 @@ impl InferenceClient {
 		cancel: &tokio_util::sync::CancellationToken,
 	) -> Result<reqwest::Response, CoderError> {
 		// Same shape as `send_once`; a separate method exists only to
-		// mirror it — no header difference today, but if the router
-		// ever wants `Accept: text/event-stream` set explicitly this
-		// is the spot.
-		let send = self
+		// mirror it — no header difference today *except* the
+		// explicit `accept: text/event-stream` to nudge providers
+		// that default to JSON, plus the `X-HF-Bill-To` re-read for
+		// the streaming path too (`bill_to` flips mid-turn just
+		// changes whose pocket the next call comes out of).
+		let bill_to = self.current_bill_to().await;
+		let mut builder = self
 			.http
 			.post(endpoint)
 			.bearer_auth(access_token)
 			.header("accept", "text/event-stream")
-			.json(body)
-			.send();
+			.json(body);
+		if let Some(org) = bill_to {
+			builder = builder.header(BILL_TO_HEADER, org);
+		}
+		let send = builder.send();
 		tokio::select! {
 			biased;
 			_ = cancel.cancelled() => Err(CoderError::Aborted),
@@ -460,6 +597,11 @@ impl InferenceClient {
 		}
 	}
 }
+
+/// Lowercase per the HF docs example (`x-hf-bill-to`). Reqwest is
+/// case-insensitive on the way out but we keep the docs' casing for
+/// grep-ability against moon-landing's `Middlewares.ts`.
+const BILL_TO_HEADER: &str = "x-hf-bill-to";
 
 /// One parsed delta, handed to the streaming caller's callback as
 /// bytes arrive. Borrowed strings keep the hot path allocation-free
@@ -765,6 +907,36 @@ mod tests {
 		assert!(resp.tool_calls.is_empty());
 		assert!(resp.content.is_none());
 		assert!(resp.thinking.is_none());
+	}
+
+	#[test]
+	fn stream_chunk_parses_explicit_nulls_for_array_fields() {
+		// DeepInfra (and likely others) serialize "no value" as an
+		// explicit `null` rather than omitting the field. Without
+		// the `null_or_missing_as_default` deserializer this chunk
+		// rejects with "invalid type: null, expected a sequence"
+		// and the stream dies mid-token. Pin the behaviour.
+		let raw = r#"{
+			"choices": [{
+				"delta": {
+					"role": "assistant",
+					"content": "",
+					"reasoning_content": null,
+					"tool_calls": null
+				},
+				"finish_reason": null
+			}]
+		}"#;
+		let chunk: StreamChunk = serde_json::from_str(raw).expect("parses with explicit nulls");
+		assert_eq!(chunk.choices.len(), 1);
+		assert!(chunk.choices[0].delta.tool_calls.is_empty());
+
+		// A `choices: null` chunk (some providers emit one as the
+		// final usage-only frame) also has to round-trip.
+		let usage_chunk = r#"{"choices": null, "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}}"#;
+		let chunk: StreamChunk = serde_json::from_str(usage_chunk).expect("parses choices: null");
+		assert!(chunk.choices.is_empty());
+		assert!(chunk.usage.is_some());
 	}
 
 	#[test]

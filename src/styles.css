@@ -1,5 +1,14 @@
 /* Theme tokens. Override in light mode by toggling the `.light` class on :root. */
 :root {
+	/* Tells the user agent which palette to use for *native* widgets
+	   (the `<select>` dropdown menu, scrollbars, form-control chrome,
+	   the focus-ring color). Without it WebKitGTK renders form
+	   controls with the OS-default light skin even when our CSS
+	   paints everything dark around them — the symptom is a glaring
+	   white `<select>` field in dark mode. Flipped in `:root.light`
+	   below. */
+	color-scheme: dark;
+
 	/* Surfaces */
 	--m-bg: #0d1017;
 	--m-bg-1: #11151f;
@@ -89,6 +98,7 @@
 }
 
 :root.light {
+	color-scheme: light;
 	--m-bg: #fafbfd;
 	--m-bg-1: #f1f3f8;
 	--m-bg-2: #e9edf5;

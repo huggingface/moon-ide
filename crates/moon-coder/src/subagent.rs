@@ -16,14 +16,16 @@
 //!   [`ToolRegistry::dispatch`]); the "no mutation via `bash`" half
 //!   is behavioural and lives in the system prompt.
 //! - Sub-agents inherit the parent's everyday driver model
-//!   ([`DEFAULT_LARGE_MODEL`]). There used to be a `fast`/`large`
-//!   selector; we dropped it because (1) it implied sub-agents
-//!   were second-class workers, which made the parent reluctant to
-//!   delegate non-trivial tasks; and (2) it was unused complexity
-//!   — the team uses one model for actual work and a separate
-//!   small model for the auto-rename title generator. The latter
-//!   still uses [`DEFAULT_FAST_MODEL`] internally; sub-agents do
-//!   not.
+//!   ([`crate::models::CoderModels::standard`]). There used to be
+//!   a `fast`/`large` selector; we dropped it because (1) it
+//!   implied sub-agents were second-class workers, which made the
+//!   parent reluctant to delegate non-trivial tasks; and (2) it
+//!   was unused complexity — the team uses one model for actual
+//!   work and a separate cheap model for the auto-rename title
+//!   generator + compaction summaries. The cheap model
+//!   ([`crate::models::CoderModels::cheap`]) is still used
+//!   internally by sub-agents for compaction; it's not selectable
+//!   per-call.
 //! - Iteration cap: same [`MAX_TURN_ITERATIONS`] as the parent.
 //!   Sub-agents used to run a tighter cap (50) on the assumption
 //!   they were scoped tasks, but in practice that just made them
@@ -47,12 +49,13 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::compaction;
-use crate::defaults::{DEFAULT_LARGE_MODEL, MAX_TURN_ITERATIONS};
+use crate::defaults::MAX_TURN_ITERATIONS;
 use crate::error::CoderError;
 use crate::event::CoderEvent;
 use crate::inference::{
 	AssistantResponse, ChatMessage, FunctionCall, InferenceClient, StreamEvent, TokenUsage, ToolDefinition,
 };
+use crate::models::CoderModels;
 use crate::runner::FolderEventSink;
 use crate::sessions::{
 	self, current_time_ms, new_session_id, sessions_dir, subagent_session_dir, SessionHeader, SessionRecord,
@@ -164,6 +167,7 @@ pub(crate) async fn run_subagent(
 	inference: &InferenceClient,
 	sink: &FolderEventSink,
 	coder_sessions_dir: &Utf8Path,
+	models: &CoderModels,
 	spec: Subagent,
 	cancel: CancellationToken,
 ) -> Result<SubagentReport, CoderError> {
@@ -176,7 +180,7 @@ pub(crate) async fn run_subagent(
 		mode: mode.as_wire().to_string(),
 	});
 
-	let outcome = run_subagent_inner(tools, inference, sink, coder_sessions_dir, &spec, cancel).await;
+	let outcome = run_subagent_inner(tools, inference, sink, coder_sessions_dir, models, &spec, cancel).await;
 
 	let was_error = outcome.is_err();
 	sink.send(CoderEvent::SubagentFinished {
@@ -192,9 +196,11 @@ async fn run_subagent_inner(
 	inference: &InferenceClient,
 	sink: &FolderEventSink,
 	coder_sessions_dir: &Utf8Path,
+	models: &CoderModels,
 	spec: &Subagent,
 	cancel: CancellationToken,
 ) -> Result<SubagentReport, CoderError> {
+	let standard_model = models.standard().to_owned();
 	let id = spec.id.clone();
 	let system_prompt = spec
 		.system_prompt_override
@@ -241,7 +247,11 @@ async fn run_subagent_inner(
 		title: subagent_session_title(&spec.task),
 		created_at_ms: now,
 		updated_at_ms: now,
-		model: DEFAULT_LARGE_MODEL.to_string(),
+		// Informational seed; the actual model used per round-trip
+		// comes from the parent's `CoderModels` snapshot at
+		// `run_subagent` time. See note in
+		// [`crate::runner::Session::new_blank`].
+		model: standard_model.clone(),
 		parent_session_id: Some(spec.parent_session_id.clone()),
 		parent_tool_call_id: Some(spec.parent_tool_call_id.clone()),
 		subagent_mode: Some(spec.mode.as_wire().to_string()),
@@ -280,7 +290,7 @@ async fn run_subagent_inner(
 			inference,
 			sink,
 			Some(&id),
-			DEFAULT_LARGE_MODEL,
+			models,
 			last_usage.as_ref(),
 			&mut messages,
 			&cancel,
@@ -293,45 +303,39 @@ async fn run_subagent_inner(
 		let sink_for_cb = sink.clone();
 		let started = std::sync::atomic::AtomicBool::new(false);
 		let response = inference
-			.chat_completion_stream(
-				DEFAULT_LARGE_MODEL,
-				&messages,
-				&tool_defs,
-				&cancel,
-				|event| match event {
-					StreamEvent::ContentDelta { delta } => {
-						if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
-							sink_for_cb.send(wrap_inner(
-								&id_for_subagent,
-								CoderEvent::AssistantMessageStart { id: id_for_cb.clone() },
-							));
-						}
+			.chat_completion_stream(&standard_model, &messages, &tool_defs, &cancel, |event| match event {
+				StreamEvent::ContentDelta { delta } => {
+					if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
 						sink_for_cb.send(wrap_inner(
 							&id_for_subagent,
-							CoderEvent::AssistantMessageDelta {
-								id: id_for_cb.clone(),
-								delta: delta.to_string(),
-							},
+							CoderEvent::AssistantMessageStart { id: id_for_cb.clone() },
 						));
 					}
-					StreamEvent::ThinkingDelta { delta } => {
-						if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
-							sink_for_cb.send(wrap_inner(
-								&id_for_subagent,
-								CoderEvent::AssistantMessageStart { id: id_for_cb.clone() },
-							));
-						}
+					sink_for_cb.send(wrap_inner(
+						&id_for_subagent,
+						CoderEvent::AssistantMessageDelta {
+							id: id_for_cb.clone(),
+							delta: delta.to_string(),
+						},
+					));
+				}
+				StreamEvent::ThinkingDelta { delta } => {
+					if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
 						sink_for_cb.send(wrap_inner(
 							&id_for_subagent,
-							CoderEvent::AssistantThinkingDelta {
-								id: id_for_cb.clone(),
-								delta: delta.to_string(),
-							},
+							CoderEvent::AssistantMessageStart { id: id_for_cb.clone() },
 						));
 					}
-					StreamEvent::ToolCallDelta { .. } => {}
-				},
-			)
+					sink_for_cb.send(wrap_inner(
+						&id_for_subagent,
+						CoderEvent::AssistantThinkingDelta {
+							id: id_for_cb.clone(),
+							delta: delta.to_string(),
+						},
+					));
+				}
+				StreamEvent::ToolCallDelta { .. } => {}
+			})
 			.await?;
 		if started.into_inner() {
 			sink.send(wrap_inner(
@@ -350,7 +354,7 @@ async fn run_subagent_inner(
 		// Wrap the parent runner's helper so the sub-agent's ring
 		// updates land on the same wire as parent updates. The
 		// envelope is `SubagentEvent { inner: TokenUsage … }`.
-		emit_subagent_token_usage(sink, &id, DEFAULT_LARGE_MODEL, &messages, &response);
+		emit_subagent_token_usage(sink, &id, models, &standard_model, &messages, &response);
 		messages.push(response_to_message(&response));
 		persist_subagent(
 			&session_dir,
@@ -430,7 +434,17 @@ async fn run_subagent_inner(
 	// after N iterations" stub. The wrap-up reply becomes the
 	// sub-agent's `result` string (with a leading note so the
 	// parent's model knows the budget was exhausted).
-	let wrap_up = subagent_wrap_up(inference, sink, spec, &session_dir, &header, &mut messages, &cancel).await;
+	let wrap_up = subagent_wrap_up(
+		inference,
+		sink,
+		spec,
+		&session_dir,
+		&header,
+		&standard_model,
+		&mut messages,
+		&cancel,
+	)
+	.await;
 	let result = match wrap_up {
 		Ok(text) if !text.trim().is_empty() => {
 			format!("[Sub-agent reached the {MAX_TURN_ITERATIONS}-iteration cap; final wrap-up follows.]\n\n{text}")
@@ -458,12 +472,21 @@ async fn run_subagent_inner(
 /// Returns the text of the wrap-up answer for the caller to wire
 /// into [`SubagentReport::result`]. Errors / empty responses fall
 /// back to the historical canned message in the caller.
+// Eight args is a hair over clippy's seven-arg cap, but every one
+// of them is genuinely needed by the wrap-up flow — `header` for
+// persistence (sub-agents write their wrap-up reply into the same
+// JSONL as the rest of the run), `session_dir` likewise,
+// `standard_model` for the LLM call. Bundling any of these into
+// an aux struct just for the arg-count gate would obscure the
+// call site for no real signal.
+#[allow(clippy::too_many_arguments)]
 async fn subagent_wrap_up(
 	inference: &InferenceClient,
 	sink: &FolderEventSink,
 	spec: &Subagent,
 	session_dir: &Utf8Path,
 	header: &SessionHeader,
+	standard_model: &str,
 	messages: &mut Vec<ChatMessage>,
 	cancel: &CancellationToken,
 ) -> Result<String, CoderError> {
@@ -488,7 +511,7 @@ Do not call any more tools. Write a final response now using only what you've al
 	let sink_for_cb = sink.clone();
 	let started = std::sync::atomic::AtomicBool::new(false);
 	let response = inference
-		.chat_completion_stream(DEFAULT_LARGE_MODEL, messages, &[], cancel, |event| match event {
+		.chat_completion_stream(standard_model, messages, &[], cancel, |event| match event {
 			StreamEvent::ContentDelta { delta } => {
 				if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
 					sink_for_cb.send(wrap_inner(
@@ -558,11 +581,12 @@ Do not call any more tools. Write a final response now using only what you've al
 fn emit_subagent_token_usage(
 	sink: &FolderEventSink,
 	subagent_id: &str,
+	models: &crate::models::CoderModels,
 	model_slug: &str,
 	messages: &[ChatMessage],
 	response: &AssistantResponse,
 ) {
-	let context_window = crate::defaults::context_window_for(model_slug);
+	let context_window = models.context_window(model_slug);
 	let (prompt_tokens, completion_tokens, total_tokens, source) = match response.usage {
 		Some(u) => (
 			u.prompt_tokens,

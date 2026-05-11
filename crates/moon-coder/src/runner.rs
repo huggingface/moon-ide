@@ -32,13 +32,12 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::{Authenticator, DeviceCode, HfIdentity};
-use crate::defaults::{
-	context_window_for, DEFAULT_FAST_MODEL, DEFAULT_LARGE_MODEL, MAX_TURN_ITERATIONS, PHASE_6_0_SYSTEM_PROMPT,
-};
+use crate::defaults::{MAX_TURN_ITERATIONS, PHASE_6_0_SYSTEM_PROMPT};
 use crate::error::CoderError;
 use crate::event::{CoderEvent, CoderEventEnvelope, CoderStatus, TokenUsageSource};
 use crate::folder_summary::FolderSummaryService;
 use crate::inference::{AssistantResponse, ChatMessage, FunctionCall, InferenceClient, StreamEvent, TokenUsage};
+use crate::models::{self, CoderModels, SharedCoderModels};
 use crate::sessions::{
 	self, current_time_ms, new_session_id, session_title_from_prompt, sessions_dir, LoadedSession, SessionHeader,
 	SessionRecord, SessionSummary, SESSION_SCHEMA_VERSION,
@@ -107,6 +106,12 @@ struct CoderState {
 	/// Owned via `Arc` so the background generation tasks (one per
 	/// in-flight folder) can share it cheaply.
 	folder_summaries: Arc<FolderSummaryService>,
+	/// User's current model picks + `bill_to` org. Shared with
+	/// [`InferenceClient`] so a settings flip reaches both the model
+	/// selection (runner reads at turn-start) and the
+	/// `X-HF-Bill-To` header (client reads per request) without
+	/// re-wiring anything.
+	models: SharedCoderModels,
 }
 
 /// Per-folder runtime: one in-memory `Session` plus one
@@ -220,7 +225,13 @@ impl Session {
 				title: String::new(),
 				created_at_ms: now,
 				updated_at_ms: now,
-				model: DEFAULT_LARGE_MODEL.to_string(),
+				// Seed value only; the actual model used for any
+				// given round-trip is read fresh from
+				// [`CoderState::models`] by the runner. This field
+				// in the JSONL header is purely informational and
+				// reflects what was *possible* at session-creation
+				// time, not what every later turn ran against.
+				model: crate::defaults::DEFAULT_STANDARD_MODEL.to_string(),
 				parent_session_id: None,
 				parent_tool_call_id: None,
 				subagent_mode: None,
@@ -299,9 +310,11 @@ impl CoderHandle {
 		workspaces_dir: Utf8PathBuf,
 		coder_sessions_dir: Utf8PathBuf,
 		folder_summaries_dir: Utf8PathBuf,
+		initial_models: CoderModels,
 	) -> Result<Self, CoderError> {
 		let auth = Authenticator::new()?;
-		let inference = InferenceClient::new(auth.clone())?;
+		let models = models::shared(initial_models);
+		let inference = InferenceClient::new(auth.clone(), models.clone())?;
 		let tools = ToolRegistry::new(workspaces.clone(), workspaces_dir.clone());
 		let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 		let folder_summaries = Arc::new(FolderSummaryService::new(folder_summaries_dir));
@@ -316,8 +329,46 @@ impl CoderHandle {
 				workspaces_dir,
 				coder_sessions_dir,
 				folder_summaries,
+				models,
 			}),
 		})
+	}
+
+	/// Hot-swap the user-facing model picks. Only `standard`,
+	/// `cheap`, and `bill_to` are written; the router-derived
+	/// `context_windows` cache is preserved across the swap so a
+	/// fresh save from the picker doesn't blow the catalog away
+	/// (the picker fetches the catalog in a separate command).
+	///
+	/// The runner snapshots [`CoderModels`] at the top of each turn
+	/// / sub-agent / cheap-helper call so the *next* round-trip
+	/// picks up the change; in-flight requests are untouched.
+	/// `bill_to` reaches every subsequent request via the shared
+	/// handle held inside [`InferenceClient`].
+	pub async fn set_user_picks(&self, standard: String, cheap: String, bill_to: Option<String>) {
+		let mut m = self.state.models.write().await;
+		m.standard = standard;
+		m.cheap = cheap;
+		m.bill_to = bill_to;
+	}
+
+	/// Current `CoderModels` snapshot. The Tauri layer reads this
+	/// on `coder_status` so the panel can render the active picks
+	/// without keeping a parallel cache.
+	pub async fn current_models(&self) -> CoderModels {
+		self.state.models.read().await.clone()
+	}
+
+	/// Catalog forwarded from the router's `/v1/models`. Side effect:
+	/// refreshes [`CoderModels::context_windows`] so subsequent
+	/// turns can size the usage ring / compaction threshold against
+	/// authoritative numbers instead of the static fallback table.
+	/// Errors when the user isn't signed in or the router rejects.
+	pub async fn list_models(&self) -> Result<Vec<moon_protocol::coder_models::RouterModel>, CoderError> {
+		let catalog = self.state.inference.list_models().await?;
+		let windows = models::context_windows_from_catalog(&catalog);
+		self.state.models.write().await.context_windows = Arc::new(windows);
+		Ok(catalog)
 	}
 
 	pub async fn status(&self) -> Result<CoderStatus, CoderError> {
@@ -395,11 +446,12 @@ impl CoderHandle {
 			},
 			ChatMessage::User { content: prompt },
 		];
+		let cheap_model = self.state.models.read().await.cheap().to_owned();
 		let cancel = CancellationToken::new();
 		let response = self
 			.state
 			.inference
-			.chat_completion(DEFAULT_FAST_MODEL, &messages, &[], &cancel)
+			.chat_completion(&cheap_model, &messages, &[], &cancel)
 			.await?;
 		let raw = response.content.unwrap_or_default();
 		let cleaned = sanitise_branch_name(&raw);
@@ -416,7 +468,7 @@ impl CoderHandle {
 	/// fences / quote wrappers the model occasionally tacks on.
 	///
 	/// `diff_patch` is the actual `git diff HEAD` output (capped
-	/// upstream at ~16 KB by [`crate::host::run_git_diff_patch`]) —
+	/// upstream at ~64 KB by [`crate::host::run_git_diff_patch`]) —
 	/// the model needs the patch content, not just the stat, to
 	/// write a subject line that's specific rather than generic.
 	/// `existing_message` is whatever the user has already typed in
@@ -433,11 +485,12 @@ impl CoderHandle {
 			},
 			ChatMessage::User { content: prompt },
 		];
+		let cheap_model = self.state.models.read().await.cheap().to_owned();
 		let cancel = CancellationToken::new();
 		let response = self
 			.state
 			.inference
-			.chat_completion(DEFAULT_FAST_MODEL, &messages, &[], &cancel)
+			.chat_completion(&cheap_model, &messages, &[], &cancel)
 			.await?;
 		let raw = response.content.unwrap_or_default();
 		let cleaned = sanitise_commit_message(&raw);
@@ -848,6 +901,15 @@ async fn run_turn(
 	sink: &FolderEventSink,
 	cancel: CancellationToken,
 ) -> Result<(), CoderError> {
+	// Snapshot the user's current model picks once at turn-start.
+	// A settings flip mid-turn doesn't retroactively change which
+	// model the in-flight requests are talking to; the *next* turn
+	// (or sub-agent, or auto-rename) will see the new pick. `bill_to`
+	// is read fresh per request via the shared handle inside
+	// `InferenceClient` instead.
+	let models = state.models.read().await.clone();
+	let standard_model = models.standard().to_owned();
+
 	// Parent's tool list = registry's regular tools plus the
 	// `spawn_subagent` definition. Sub-agents pick from the
 	// registry alone (no spawn_subagent), which is how the
@@ -898,7 +960,7 @@ async fn run_turn(
 			&state.inference,
 			sink,
 			None,
-			DEFAULT_LARGE_MODEL,
+			&models,
 			last_usage.as_ref(),
 			&mut messages,
 			&cancel,
@@ -925,46 +987,40 @@ async fn run_turn(
 		let id_for_cb = assistant_id.clone();
 		let response = state
 			.inference
-			.chat_completion_stream(
-				DEFAULT_LARGE_MODEL,
-				&messages,
-				&tool_defs,
-				&cancel,
-				|event| match event {
-					StreamEvent::ContentDelta { delta } => {
-						if !content_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
-							sink_for_cb.send(CoderEvent::AssistantMessageStart { id: id_for_cb.clone() });
-						}
-						sink_for_cb.send(CoderEvent::AssistantMessageDelta {
-							id: id_for_cb.clone(),
-							delta: delta.to_string(),
-						});
+			.chat_completion_stream(&standard_model, &messages, &tool_defs, &cancel, |event| match event {
+				StreamEvent::ContentDelta { delta } => {
+					if !content_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+						sink_for_cb.send(CoderEvent::AssistantMessageStart { id: id_for_cb.clone() });
 					}
-					StreamEvent::ThinkingDelta { delta } => {
-						// Thinking arrives before content on every
-						// reasoning-model provider we know of. Fire
-						// `AssistantMessageStart` on the first thinking
-						// delta too — that way the panel inserts the
-						// row early, the user sees the thinking block
-						// land, and content streams into the same row
-						// when it eventually arrives.
-						if !content_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
-							sink_for_cb.send(CoderEvent::AssistantMessageStart { id: id_for_cb.clone() });
-						}
-						thinking_emitted.store(true, std::sync::atomic::Ordering::Relaxed);
-						sink_for_cb.send(CoderEvent::AssistantThinkingDelta {
-							id: id_for_cb.clone(),
-							delta: delta.to_string(),
-						});
+					sink_for_cb.send(CoderEvent::AssistantMessageDelta {
+						id: id_for_cb.clone(),
+						delta: delta.to_string(),
+					});
+				}
+				StreamEvent::ThinkingDelta { delta } => {
+					// Thinking arrives before content on every
+					// reasoning-model provider we know of. Fire
+					// `AssistantMessageStart` on the first thinking
+					// delta too — that way the panel inserts the
+					// row early, the user sees the thinking block
+					// land, and content streams into the same row
+					// when it eventually arrives.
+					if !content_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+						sink_for_cb.send(CoderEvent::AssistantMessageStart { id: id_for_cb.clone() });
 					}
-					// Tool-call deltas are intentionally not surfaced.
-					// The runner buffers them inside the inference
-					// client and dispatches once the whole call is
-					// assembled — partial JSON arguments aren't
-					// useful to render.
-					StreamEvent::ToolCallDelta { .. } => {}
-				},
-			)
+					thinking_emitted.store(true, std::sync::atomic::Ordering::Relaxed);
+					sink_for_cb.send(CoderEvent::AssistantThinkingDelta {
+						id: id_for_cb.clone(),
+						delta: delta.to_string(),
+					});
+				}
+				// Tool-call deltas are intentionally not surfaced.
+				// The runner buffers them inside the inference
+				// client and dispatches once the whole call is
+				// assembled — partial JSON arguments aren't
+				// useful to render.
+				StreamEvent::ToolCallDelta { .. } => {}
+			})
 			.await?;
 
 		{
@@ -992,7 +1048,7 @@ async fn run_turn(
 		// numbers are exact; falls back to a bytes/4 estimate when
 		// the provider didn't emit a streaming usage chunk so the
 		// ring still moves on every turn.
-		emit_token_usage(sink, DEFAULT_LARGE_MODEL, &messages, &response);
+		emit_token_usage(sink, &models, &standard_model, &messages, &response);
 
 		// Always emit `End` *if* we ever started a bubble; otherwise
 		// the frontend would be stuck with an empty placeholder.
@@ -1060,6 +1116,8 @@ async fn wrap_up_final_answer(
 		tools_at_cap = tool_defs.len(),
 		"iteration cap reached; asking the model for a final tools-disabled wrap-up",
 	);
+	let models = state.models.read().await.clone();
+	let standard_model = models.standard().to_owned();
 
 	let sentinel_id = new_message_id();
 	let sentinel_text = format!(
@@ -1113,7 +1171,7 @@ done, what's still unfinished, and any uncertainty. If the user needs to take a 
 	let thinking_emitted = std::sync::atomic::AtomicBool::new(false);
 	let response = state
 		.inference
-		.chat_completion_stream(DEFAULT_LARGE_MODEL, &messages, &[], cancel, |event| match event {
+		.chat_completion_stream(&standard_model, &messages, &[], cancel, |event| match event {
 			StreamEvent::ContentDelta { delta } => {
 				if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
 					sink_for_cb.send(CoderEvent::AssistantMessageStart { id: id_for_cb.clone() });
@@ -1157,7 +1215,7 @@ done, what's still unfinished, and any uncertainty. If the user needs to take a 
 
 	fs.session.lock().await.messages.push(response_to_message(&response));
 	persist_assistant_record(fs, &response).await;
-	emit_token_usage(sink, DEFAULT_LARGE_MODEL, &messages, &response);
+	emit_token_usage(sink, &models, &standard_model, &messages, &response);
 
 	Ok(())
 }
@@ -1314,11 +1372,13 @@ async fn handle_spawn_subagent(
 	// arrive in the parent's folder bucket on the frontend, which
 	// is exactly the multi-session contract: sub-agents belong to
 	// whichever project originated them.
+	let models_snapshot = state.models.read().await.clone();
 	let report: SubagentReport = run_subagent(
 		&state.tools,
 		&state.inference,
 		sink,
 		&state.coder_sessions_dir,
+		&models_snapshot,
 		spec,
 		sub_cancel,
 	)
@@ -1409,6 +1469,7 @@ async fn refresh_system_prompt(state: &Arc<CoderState>, fs: &Arc<FolderSession>,
 /// regardless of which folder bucket it arrives in.
 async fn kick_off_summary_refresh(state: &Arc<CoderState>, _sink: &FolderEventSink) {
 	let folders = state.workspaces.folders().await;
+	let cheap_model = state.models.read().await.cheap().to_owned();
 	for entry in folders {
 		let folder_root = Utf8PathBuf::from(&entry.folder.path);
 		if state.folder_summaries.cached(folder_root.as_path()).await.is_some() {
@@ -1417,6 +1478,7 @@ async fn kick_off_summary_refresh(state: &Arc<CoderState>, _sink: &FolderEventSi
 		state.folder_summaries.spawn_regenerate(
 			folder_root,
 			state.inference.clone(),
+			cheap_model.clone(),
 			state.events.clone(),
 			CancellationToken::new(),
 		);
@@ -1665,22 +1727,23 @@ fn spawn_auto_rename(state: Arc<CoderState>, fs: Arc<FolderSession>, sink: Folde
 		if transcript.is_empty() {
 			return;
 		}
-		tracing::debug!(session = %header_snapshot.id, "auto-rename: requesting title from fast model");
+		tracing::debug!(session = %header_snapshot.id, "auto-rename: requesting title from cheap model");
 		let messages = vec![
 			ChatMessage::System {
 				content: AUTO_RENAME_SYSTEM_PROMPT.to_string(),
 			},
 			ChatMessage::User { content: transcript },
 		];
+		let cheap_model = state.models.read().await.cheap().to_owned();
 		let cancel = CancellationToken::new();
 		let response = match state
 			.inference
-			.chat_completion(DEFAULT_FAST_MODEL, &messages, &[], &cancel)
+			.chat_completion(&cheap_model, &messages, &[], &cancel)
 			.await
 		{
 			Ok(resp) => resp,
 			Err(err) => {
-				tracing::info!(error = %err, "auto-rename: fast-model call failed; keeping fallback title");
+				tracing::info!(error = %err, "auto-rename: cheap-model call failed; keeping fallback title");
 				return;
 			}
 		};
@@ -2030,11 +2093,12 @@ fn response_to_message(response: &AssistantResponse) -> ChatMessage {
 /// these bytes mirrors what the provider would have reported.
 pub(crate) fn emit_token_usage(
 	sink: &FolderEventSink,
+	models: &CoderModels,
 	model_slug: &str,
 	messages: &[ChatMessage],
 	response: &AssistantResponse,
 ) {
-	let context_window = context_window_for(model_slug);
+	let context_window = models.context_window(model_slug);
 	let (prompt_tokens, completion_tokens, total_tokens, source) = match response.usage {
 		Some(u) => (
 			u.prompt_tokens,

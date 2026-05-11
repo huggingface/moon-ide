@@ -192,19 +192,86 @@ router does.
 
 Hardcoded in `crates/moon-coder/src/defaults.rs`:
 
-- **`large`** → `Qwen/Qwen3.5-397B-A17B:scaleway` — the day-to-day
-  default for chat / refactor / multi-step tasks.
-- **`fast`** → `Qwen/Qwen3-Coder-30B-A3B-Instruct:scaleway` — the cheap default,
-  used as the sub-agent default once that lands.
+- **`standard`** → `Qwen/Qwen3.5-397B-A17B:scaleway` — the
+  day-to-day default for chat / refactor / multi-step tasks. The
+  agent loop and every sub-agent run against this model.
+- **`cheap`** → `Qwen/Qwen3-Coder-30B-A3B-Instruct:scaleway` —
+  used for everything that doesn't need tool calls: auto-rename
+  session titles, branch-name suggester, commit-message suggester,
+  compaction summaries, folder-summary onboarding.
 
-The "large" / "fast" abstraction lives at the moon-coder level so
-sub-agents and future "rerun this turn on a cheaper model"
-affordances aren't tied to a specific HF slug. Swapping a default
-is a one-line constant change.
+These are _defaults_. The user picks freely from the catalog at
+runtime — see [Model picker](#model-picker). Internally we never
+read the constants except as fallbacks when the user's pick is the
+empty string.
 
-Per-session model override is stored in the session JSONL header.
-Per-workspace defaults arrive only when somebody asks; until then,
-new sessions start at the global defaults.
+Per-session model override is stored in the session JSONL header
+purely as informational metadata; the runner reads the active pick
+from `CoderModels` (panel-global, user-scoped), not from the
+session header.
+
+### Model picker
+
+User-facing surface: a cog icon in the coder panel header opens a
+popover with four fields:
+
+- **Standard model** and **Cheap model** — wire model ids (e.g.
+  `Qwen/Qwen3.5-397B-A17B:scaleway`) sent verbatim to the router.
+  Empty string falls back to the hardcoded default. The popover's
+  catalog list lets the user click-to-fill against the live
+  `https://router.huggingface.co/v1/models` response. The Standard
+  list is pre-filtered to models with at least one tool-capable
+  provider; the Cheap list is unfiltered.
+- **Default provider** — UI hint only, used to auto-suffix the
+  picked model with `:provider`. Accepts real provider slugs
+  (`scaleway`, `novita`, `together`, `fireworks-ai`, …) and the
+  router-side synthetic policies (`fastest`, `cheapest`,
+  `preferred`). The picker only applies the suffix when the
+  catalog row actually has that provider route, so users don't
+  accidentally pin a model to a provider that doesn't serve it.
+- **Bill to** — sent as `X-HF-Bill-To` on every inference request.
+  Dropdown sourced from `identity.orgs` (which itself comes from
+  `/oauth/userinfo` — same call we already make at sign-in time,
+  no extra scope / endpoint involved). "Personal account" is the
+  always-present default.
+
+The picks live in `AppState.coder.{standard_model, cheap_model,
+default_provider, bill_to}` and are hot-swapped into the runner's
+`CoderModels` snapshot on save. Mid-turn changes apply to the next
+round-trip; in-flight requests are not aborted.
+
+Internal architecture:
+
+```text
+                    ┌─────────────────────────────────────┐
+                    │  CoderHandle::set_models(...)        │
+                    │  (called from coder_set_model_       │
+                    │  settings Tauri cmd)                 │
+                    └────────────────┬─────────────────────┘
+                                     │
+                                     ▼
+                ┌────────────────────────────────────────┐
+                │  Arc<RwLock<CoderModels>>               │
+                │   { standard, cheap, bill_to }         │
+                └────┬───────────────────────────────────┘
+                     │                  │
+              read at every             │
+              chat-completions          │
+              site (turn-start          │
+              snapshot)                 │
+                     │                  ▼
+                     │     ┌────────────────────────────────┐
+                     │     │  InferenceClient                │
+                     │     │   reads bill_to                 │
+                     │     │   per-request → X-HF-Bill-To    │
+                     │     └────────────────────────────────┘
+                     ▼
+            runner / subagent / compaction / folder_summary
+```
+
+`default_provider` lives only in `AppState`; the runner doesn't
+read it because the suffix has already been baked into the saved
+model ids by the time the picker writes back.
 
 #### Why HF as primary
 
@@ -715,7 +782,7 @@ The frontend's `ContextRing` component lives in the panel header — a small cir
 When a [`TokenUsage`](../crates/moon-coder/src/event.rs) event reports `prompt_tokens / context_window ≥ 0.80`, the next iteration of the loop runs an auto-compaction pass before sending. The pass:
 
 1. Walks the in-memory message history backwards, counts the most recent **6 user turns**, and uses the oldest of those as the **cut point**.
-2. Calls the **fast model** with a fixed system prompt that asks it to summarise the prefix (`messages[1..cut]`) — covering user intent, decisions, files touched, current state, and what to do next. Output is plain markdown; the call is non-streaming and has no tools.
+2. Calls the **cheap model** (see [Model picker](#model-picker)) with a fixed system prompt that asks it to summarise the prefix (`messages[1..cut]`) — covering user intent, decisions, files touched, current state, and what to do next. Output is plain markdown; the call is non-streaming and has no tools.
 3. Replaces the prefix with a single synthetic [`ChatMessage::System`](../crates/moon-coder/src/inference.rs) carrying the summary (with a header that distinguishes it from `messages[0]`, the composed system prompt). The leading system prompt is **not** reinjected — `runner::refresh_system_prompt` runs at the top of every turn anyway and recomposes it from `AGENTS.md` + bound-folder summaries + folder-summary cache, so the compaction summary at `messages[1]` rides under whatever the next turn's fresh system prompt produces.
 
 ```text
@@ -773,7 +840,7 @@ spawn_subagent(
 }
 ```
 
-There used to be a `model: "fast" | "large"` selector on this tool. We dropped it — the model picker had two effects neither of which justified the surface area: (a) it implied sub-agents were second-class workers, which biased the parent toward refusing to delegate non-trivial tasks; (b) it duplicated a tier choice the team doesn't actually exercise. Sub-agents now inherit [`DEFAULT_LARGE_MODEL`](../crates/moon-coder/src/defaults.rs) — the same everyday-driver model the parent uses. The fast model still exists for one internal use case (the auto-rename title generator), but it's no longer reachable from any tool surface.
+There used to be a `model: "fast" | "large"` selector on this tool. We dropped it — the model picker had two effects neither of which justified the surface area: (a) it implied sub-agents were second-class workers, which biased the parent toward refusing to delegate non-trivial tasks; (b) it duplicated a tier choice the team doesn't actually exercise. Sub-agents now inherit the parent's **standard** model (see [Model picker](#model-picker)). The cheap model is still used internally (auto-rename title generator, branch-name suggester, commit-message suggester, compaction summaries, folder summaries) but is not reachable from any tool surface or sub-agent argument.
 
 ### Modes
 

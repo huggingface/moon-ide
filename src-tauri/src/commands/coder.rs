@@ -7,6 +7,7 @@
 
 use moon_coder::{CoderHandle, CoderStatus, DeviceCode, HfIdentity, SessionSummary};
 use moon_core::app_state as app_state_store;
+use moon_protocol::coder_models::{CoderModelSettings, RouterModel};
 use moon_protocol::MoonError;
 use tauri::{AppHandle, Emitter, State};
 
@@ -114,7 +115,7 @@ pub async fn coder_suggest_branch_name(state: State<'_, AppState>, message: Stri
 }
 
 /// Suggest a one-line commit subject from the active folder's
-/// `git diff HEAD` patch (capped to ~16 KB upstream) and whatever
+/// `git diff HEAD` patch (capped to ~64 KB upstream) and whatever
 /// the user has already typed in the composer. Used by the SCM
 /// panel's sparkle button inset on the commit textarea. Errors
 /// surface verbatim through the panel as a flash toast — the user
@@ -243,4 +244,56 @@ async fn active_folder_path(state: &AppState) -> Option<String> {
 		.active_folder()
 		.await
 		.map(|entry| entry.folder.path.clone())
+}
+
+/// Snapshot of the user's current model picks. The popover reads
+/// this on open so it doesn't fall out of sync if a different
+/// surface (or a future hotkey) wrote to AppState.
+#[tauri::command]
+pub async fn coder_get_model_settings(state: State<'_, AppState>) -> Result<CoderModelSettings, MoonError> {
+	let models = state.coder.current_models().await;
+	Ok(CoderModelSettings {
+		standard_model: models.standard,
+		cheap_model: models.cheap,
+		bill_to: models.bill_to.unwrap_or_default(),
+	})
+}
+
+/// Persist + apply the new picker settings. Writes through
+/// AppState (so a relaunch sees the same picks) and pokes the
+/// coder so the very next round-trip uses the new model + bill_to.
+/// Slugs are already in their final `model:provider` form because
+/// the picker concatenates on click; the runner doesn't do any
+/// post-processing.
+#[tauri::command]
+pub async fn coder_set_model_settings(
+	state: State<'_, AppState>,
+	settings: CoderModelSettings,
+) -> Result<(), MoonError> {
+	let bill_to = if settings.bill_to.is_empty() {
+		None
+	} else {
+		Some(settings.bill_to.clone())
+	};
+	state
+		.coder
+		.set_user_picks(settings.standard_model.clone(), settings.cheap_model.clone(), bill_to)
+		.await;
+
+	app_state_store::mutate(&state.config_dir, move |s| {
+		s.coder.standard_model = settings.standard_model;
+		s.coder.cheap_model = settings.cheap_model;
+		s.coder.bill_to = settings.bill_to;
+	})
+	.await?;
+	Ok(())
+}
+
+/// Fetch the router's `/v1/models` catalog. One round trip per
+/// call — the frontend caches the result for the lifetime of the
+/// popover so the user can flip filters without re-hitting the
+/// network.
+#[tauri::command]
+pub async fn coder_list_models(state: State<'_, AppState>) -> Result<Vec<RouterModel>, MoonError> {
+	state.coder.list_models().await.map_err(MoonError::from)
 }

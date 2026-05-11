@@ -206,6 +206,9 @@ pub fn run() {
 			commands::coder::coder_open_session,
 			commands::coder::coder_delete_session,
 			commands::coder::coder_session_jsonl_path,
+			commands::coder::coder_get_model_settings,
+			commands::coder::coder_set_model_settings,
+			commands::coder::coder_list_models,
 			commands::ui::ui_set_right_panel,
 		])
 		.setup(move |app| {
@@ -302,11 +305,29 @@ pub fn run() {
 			));
 			workspace_registry.set_shell_resolver(moon_core::ShellResolverHandle::new(shell_resolver));
 
+			// Seed the coder with the user's persisted model picks
+			// + `bill_to`. Empty strings on the protocol side
+			// resolve to the hardcoded defaults inside
+			// `CoderModels::standard()` / `cheap()` / `bill_to()`;
+			// frontend stores wire-format slugs (with optional
+			// `:provider` suffix) so the runner doesn't have to
+			// concatenate suffixes at request time.
+			let initial_coder_models = moon_coder::CoderModels {
+				standard: loaded_state.coder.standard_model.clone(),
+				cheap: loaded_state.coder.cheap_model.clone(),
+				bill_to: if loaded_state.coder.bill_to.is_empty() {
+					None
+				} else {
+					Some(loaded_state.coder.bill_to.clone())
+				},
+				..moon_coder::CoderModels::default()
+			};
 			let coder = CoderHandle::new(
 				workspace_registry.clone(),
 				workspaces_dir.clone(),
 				coder_sessions_dir,
 				folder_summaries_dir,
+				initial_coder_models,
 			)
 			.map_err(|err| format!("could not init moon-coder: {err}"))?;
 			commands::coder::spawn_event_pump(app.handle().clone(), coder.clone());

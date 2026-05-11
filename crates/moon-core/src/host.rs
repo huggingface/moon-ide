@@ -323,7 +323,7 @@ pub trait WorkspaceHost: Send + Sync {
 	async fn git_head_commit_message(&self) -> MoonResult<String>;
 
 	/// Working-tree diff against `HEAD` (`git diff HEAD --no-color`),
-	/// capped at ~16 KB so a sprawling refactor doesn't blow up the
+	/// capped at ~64 KB so a sprawling refactor doesn't blow up the
 	/// LLM prompt that consumes this. Used by the SCM panel's "AI
 	/// commit message" sparkle button. The cap is byte-based and
 	/// truncates at the next newline boundary so half-rendered hunk
@@ -1821,7 +1821,7 @@ fn run_git_commit_on_new_branch(root: &Utf8Path, branch: &str, message: &str) ->
 fn run_git_diff_summary(root: &Utf8Path) -> String {
 	use std::process::Command;
 
-	const MAX_BYTES: usize = 4_000;
+	const MAX_BYTES: usize = 16_000;
 
 	let output = Command::new("git")
 		.arg("-C")
@@ -1902,13 +1902,13 @@ fn run_git_head_commit_message(root: &Utf8Path) -> String {
 		.to_string()
 }
 
-/// `git diff HEAD --no-color`, byte-capped at ~16 KB. The cap
+/// `git diff HEAD --no-color`, byte-capped at ~64 KB. The cap
 /// truncates at the next newline boundary so we don't hand a
 /// half-formed hunk header to the LLM. Empty string on failure.
 fn run_git_diff_patch(root: &Utf8Path) -> String {
 	use std::process::Command;
 
-	const MAX_BYTES: usize = 16_000;
+	const MAX_BYTES: usize = 64_000;
 
 	let output = Command::new("git")
 		.arg("-C")
@@ -4080,11 +4080,11 @@ mod tests {
 			"small diff was unexpectedly truncated: {patch:?}"
 		);
 
-		// Now blow past the 16 KB cap with a long file change.
-		let huge: String = (0..3000).map(|i| format!("line {i}\n")).collect();
+		// Now blow past the 64 KB cap with a long file change.
+		let huge: String = (0..8000).map(|i| format!("line {i}\n")).collect();
 		std::fs::write(dir.path().join("a.txt"), huge).unwrap();
 		let patch = host(&dir).git_diff_patch().await.unwrap();
-		assert!(patch.len() <= 17_000, "patch={} should be capped near 16k", patch.len());
+		assert!(patch.len() <= 65_000, "patch={} should be capped near 64k", patch.len());
 		assert!(patch.contains("(diff truncated)"), "missing truncation sentinel");
 		// Truncation cuts at a newline; we'd see a hanging partial
 		// line otherwise (everything before the sentinel ends in `\n`).

@@ -6,6 +6,7 @@
 	import { workspace } from '../state.svelte';
 	import CoderConnectModal from './CoderConnectModal.svelte';
 	import CoderMarkdown from './CoderMarkdown.svelte';
+	import CoderModelSettingsModal from './CoderModelSettingsModal.svelte';
 	import CoderThinking from './CoderThinking.svelte';
 	import ToolBodyEditFile from './ToolBodyEditFile.svelte';
 	import ToolBodyGrep from './ToolBodyGrep.svelte';
@@ -15,6 +16,7 @@
 	import TerminalTargetIcon from './TerminalTargetIcon.svelte';
 	import ContextRing from './ContextRing.svelte';
 	import ChatBubbleIcon from './icons/ChatBubbleIcon.svelte';
+	import SettingsIcon from './icons/SettingsIcon.svelte';
 	import SignOutIcon from './icons/SignOutIcon.svelte';
 	import PlusIcon from './icons/PlusIcon.svelte';
 	import ListIcon from './icons/ListIcon.svelte';
@@ -27,6 +29,12 @@
 
 	let scrollEl: HTMLDivElement | undefined = $state();
 	let composer: HTMLTextAreaElement | undefined = $state();
+
+	// Whether the model-picker popover is currently mounted. Local
+	// to the header because no other surface opens it; keeping it
+	// off the global store also means closing the popover doesn't
+	// emit a Svelte re-render of every panel consumer.
+	let modelSettingsOpen = $state(false);
 
 	onMount(() => {
 		void coder.refreshStatus();
@@ -472,6 +480,15 @@
 				<ChatBubbleIcon />
 			</button>
 			{#if coder.signedIn}
+				<button
+					type="button"
+					class="icon"
+					title="Model settings"
+					aria-label="Model settings"
+					onclick={() => (modelSettingsOpen = true)}
+				>
+					<SettingsIcon />
+				</button>
 				<button type="button" class="icon" title="Sign out" aria-label="Sign out" onclick={onSignOut}>
 					<SignOutIcon />
 				</button>
@@ -698,6 +715,10 @@
 
 {#if coder.deviceCode || coder.awaitingApproval}
 	<CoderConnectModal />
+{/if}
+
+{#if modelSettingsOpen}
+	<CoderModelSettingsModal onClose={() => (modelSettingsOpen = false)} />
 {/if}
 
 <!-- Row renderer extracted as a snippet so the parent's session

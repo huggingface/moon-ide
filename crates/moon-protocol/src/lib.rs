@@ -5,6 +5,7 @@
 
 pub mod app_info;
 pub mod app_state;
+pub mod coder_models;
 pub mod container;
 pub mod editorconfig;
 pub mod error;

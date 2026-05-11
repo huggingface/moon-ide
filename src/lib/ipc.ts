@@ -3,8 +3,10 @@ import { invoke } from '@tauri-apps/api/core';
 import type {
 	AppInfo,
 	AppState,
+	CoderModelSettings,
 	CoderSessionSummary,
 	CoderStatus,
+	RouterModel,
 	ContainerStatus,
 	ContentSearchOptions,
 	ContentSearchResult,
@@ -249,6 +251,9 @@ export const ipc = {
 		openSession: (id: string) => invoke<CoderSessionSummary>('coder_open_session', { id }),
 		deleteSession: (id: string) => invoke<void>('coder_delete_session', { id }),
 		sessionJsonlPath: (id: string) => invoke<string>('coder_session_jsonl_path', { id }),
+		getModelSettings: () => invoke<CoderModelSettings>('coder_get_model_settings'),
+		setModelSettings: (settings: CoderModelSettings) => invoke<void>('coder_set_model_settings', { settings }),
+		listModels: () => invoke<RouterModel[]>('coder_list_models'),
 	},
 	ui: {
 		setRightPanel: (kind: RightPanelKind | null) => invoke<void>('ui_set_right_panel', { kind }),

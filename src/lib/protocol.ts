@@ -1031,12 +1031,66 @@ export type ProjectComposeStateChange = {
 /**
  * Hugging Face user identity returned by `coder_status` and the
  * device-flow completion. Mirrors `moon_coder::auth::HfIdentity`.
+ *
+ * `orgs` populates the model picker's "Bill to" dropdown. Every
+ * entry stays selectable — `can_pay` is a hint, not a gate, because
+ * users who declined the optional `orgs` OAuth scope at consent
+ * time get back orgs with no `can_pay` / `role_in_org` at all
+ * (those fields default to `false` / `null` in that case, which
+ * doesn't actually mean "can't bill", just "we don't know"). The
+ * router is the source of truth — a rejected bill surfaces
+ * verbatim, and the user picks something else. An empty array
+ * (or missing field on older payloads) just means "personal
+ * account only".
  */
 export type HfIdentity = {
 	username: string;
 	name: string | null;
 	avatar_url: string | null;
 	email: string | null;
+	orgs: HfOrg[];
+};
+
+/**
+ * One entry of {@link HfIdentity.orgs}. Mirrors
+ * `moon_coder::auth::HfOrg`; field names match the Rust struct,
+ * not the camelCase shape HF returns on the wire (serde renames at
+ * the seam).
+ */
+export type HfOrg = {
+	/**
+	 * Display string ("Hugging Face"). Shown in the picker row;
+	 * **not** what `X-HF-Bill-To` accepts — use {@link slug} for
+	 * the wire value.
+	 */
+	name: string;
+	/**
+	 * URL slug ("huggingface"). Sent as `X-HF-Bill-To`. Always
+	 * present in current HF userinfo responses since
+	 * `preferred_username` ships under the basic `openid profile`
+	 * scope; the `null` fallback is defensive paranoia, not a
+	 * real path.
+	 */
+	slug: string | null;
+	avatar_url: string | null;
+	/**
+	 * Authoritative: `true` iff the user can bill inference calls
+	 * to this org. Picker disables the matching `<option>` when
+	 * this is `false`. Requires the `read-billing` OAuth scope to
+	 * be populated; orgs the user didn't authorize at all are
+	 * filtered out by {@link role_in_org} before this matters.
+	 */
+	can_pay: boolean;
+	/**
+	 * Role string (`"admin"`, `"contributor"`, …) when the user
+	 * authorized moon-ide for this specific org at the OAuth
+	 * consent screen. `null` means the user is a member but
+	 * didn't tick its checkbox — those entries carry no usable
+	 * signal and the picker filters them out of the bill-to
+	 * dropdown entirely.
+	 */
+	role_in_org: string | null;
+	is_enterprise: boolean;
 };
 
 /**
@@ -1147,6 +1201,65 @@ export type CoderSessionSummary = {
 	title: string;
 	created_at_ms: number;
 	updated_at_ms: number;
+};
+
+/**
+ * Read/write payload for the model-picker popover. Mirrors
+ * `moon_protocol::coder_models::CoderModelSettings`.
+ *
+ * `standard_model` / `cheap_model` are the wire model ids the
+ * router accepts on `chat/completions`, in their final
+ * `model:provider` form (`Qwen/Qwen3.5-397B-A17B:scaleway`) —
+ * the picker concatenates on click so the runner never has to.
+ * Empty strings mean "use the hardcoded default" — the runner
+ * substitutes `DEFAULT_STANDARD_MODEL` / `DEFAULT_CHEAP_MODEL` at
+ * request time.
+ *
+ * `bill_to` is the HF org slug for `X-HF-Bill-To`. Empty = bill
+ * the user's personal account.
+ */
+export type CoderModelSettings = {
+	standard_model: string;
+	cheap_model: string;
+	bill_to: string;
+};
+
+/**
+ * One row of the router catalog the picker renders. Mirrors
+ * `moon_protocol::coder_models::RouterModel`. The router returns
+ * the list sorted "most popular first" and we preserve that order
+ * verbatim — the picker only deviates when the user types into the
+ * search box.
+ */
+export type RouterModel = {
+	id: string;
+	owned_by: string;
+	supports_tools_anywhere: boolean;
+	providers: RouterProvider[];
+};
+
+export type RouterProvider = {
+	provider: string;
+	context_length: number | null;
+	supports_tools: boolean;
+	pricing: RouterPricing | null;
+	/**
+	 * Mean time-to-first-token in milliseconds, from the router's
+	 * internal probes. `null` for providers the router doesn't have
+	 * measurements for (typically `featherless-ai` entries on a
+	 * model's first day, or very low-traffic routes).
+	 */
+	first_token_latency_ms: number | null;
+	/**
+	 * Mean output throughput in tokens-per-second from the same
+	 * probes. Same `null` semantics as `first_token_latency_ms`.
+	 */
+	throughput: number | null;
+};
+
+export type RouterPricing = {
+	input: number;
+	output: number;
 };
 
 export type MoonError =

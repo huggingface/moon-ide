@@ -22,10 +22,12 @@ import {
 	formatError,
 	type CoderEvent,
 	type CoderEventEnvelope,
+	type CoderModelSettings,
 	type CoderSessionSummary,
 	type CoderStatus,
 	type DeviceCode,
 	type HfIdentity,
+	type RouterModel,
 	type SubagentMode,
 } from './protocol';
 import { rightPanel } from './rightPanel.svelte';
@@ -244,6 +246,75 @@ class CoderPanelState {
 
 	/** Latest sign-in error (device-flow expired, denied, network). */
 	signInError = $state<string | null>(null);
+
+	/** Snapshot of the user's current model picks, mirrored from
+	 *  `coder_get_model_settings`. `null` until the popover (or any
+	 *  other consumer) calls `loadModelSettings()` for the first
+	 *  time. Writes go through `saveModelSettings()` which both
+	 *  persists and re-reads, so we never have to optimistically
+	 *  update this from the UI. */
+	modelSettings = $state<CoderModelSettings | null>(null);
+
+	/** Router `/v1/models` catalog. Populated by
+	 *  `loadModels()` on popover-open. `null` until the first fetch;
+	 *  callers can use the loading flag to decide whether to show a
+	 *  spinner. Lives at the panel level (not popover-local) so a
+	 *  reopen inside the same session reuses the cached list
+	 *  without re-hitting the network. */
+	routerModels = $state<RouterModel[] | null>(null);
+
+	/** UI flag while `coder_list_models` is in flight. */
+	modelsLoading = $state(false);
+
+	/** Last error from `coder_list_models` / `coder_set_model_settings`,
+	 *  surfaced inline in the popover so the user can see what the
+	 *  router said. Cleared on the next successful call. */
+	modelsError = $state<string | null>(null);
+
+	/** Fetch the current settings into [`modelSettings`]. Safe to
+	 *  call repeatedly; idempotent at the steady state. Errors land
+	 *  in [`modelsError`] and the previous snapshot stays in place
+	 *  so a stale popover still has something to render. */
+	async loadModelSettings(): Promise<void> {
+		try {
+			this.modelSettings = await ipc.coder.getModelSettings();
+		} catch (err) {
+			this.modelsError = formatError(err);
+		}
+	}
+
+	/** Persist + apply the new settings and refresh the snapshot.
+	 *  Throws so the popover can keep the form open on failure;
+	 *  caller decides what to render in that state. */
+	async saveModelSettings(next: CoderModelSettings): Promise<void> {
+		try {
+			await ipc.coder.setModelSettings(next);
+			this.modelSettings = next;
+			this.modelsError = null;
+		} catch (err) {
+			this.modelsError = formatError(err);
+			throw err;
+		}
+	}
+
+	/** Fetch the router catalog. One round trip per call. The result
+	 *  is cached in [`routerModels`]; consumers should check that
+	 *  first and only call this when it's `null` (or when forcing a
+	 *  refresh on an explicit user gesture). */
+	async loadModels(): Promise<void> {
+		if (this.modelsLoading) {
+			return;
+		}
+		this.modelsLoading = true;
+		try {
+			this.routerModels = await ipc.coder.listModels();
+			this.modelsError = null;
+		} catch (err) {
+			this.modelsError = formatError(err);
+		} finally {
+			this.modelsLoading = false;
+		}
+	}
 
 	/** Cached "Bound folders" descriptions populated by
 	 *  `folder_summary_ready` events. Folder absolute path →
