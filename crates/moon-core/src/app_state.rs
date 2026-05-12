@@ -203,6 +203,7 @@ mod tests {
 						id: format!("a-{i}"),
 						name: format!("a-{i}"),
 						last_active_at: i,
+						color: None,
 					});
 				})
 				.await
@@ -217,6 +218,7 @@ mod tests {
 						id: format!("b-{i}"),
 						name: format!("b-{i}"),
 						last_active_at: i,
+						color: None,
 					});
 				})
 				.await

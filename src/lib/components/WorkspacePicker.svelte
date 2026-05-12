@@ -1,6 +1,16 @@
 <script lang="ts">
-	import { workspacePicker } from '../workspacePicker.svelte';
+	import { defaultWorkspaceColor, workspacePicker } from '../workspacePicker.svelte';
 	import { currentWorkspaceId } from '../workspace-id';
+	import type { WorkspaceMeta } from '../protocol';
+
+	function colorFor(meta: WorkspaceMeta): string {
+		return meta.color ?? defaultWorkspaceColor(meta.id);
+	}
+
+	function onColorInput(meta: WorkspaceMeta, event: Event) {
+		const value = (event.currentTarget as HTMLInputElement).value;
+		void workspacePicker.setColor(meta, value);
+	}
 
 	function onBackdropKeydown(event: KeyboardEvent) {
 		if (event.key === 'Escape') {
@@ -90,7 +100,17 @@
 				{#each workspacePicker.filtered as meta, i (meta.id)}
 					{@const isCurrent = meta.id === currentWorkspaceId()}
 					{@const isSelected = i === workspacePicker.selectedIndex}
+					{@const badgeColor = colorFor(meta)}
 					<div class="row" class:selected={isSelected} role="option" aria-selected={isSelected} tabindex="-1">
+						<label class="swatch" style="--m-swatch: {badgeColor}" title="Change colour for {meta.name}">
+							<span class="swatch-dot" aria-hidden="true"></span>
+							<input
+								type="color"
+								value={badgeColor}
+								onchange={(e) => onColorInput(meta, e)}
+								aria-label="Workspace colour"
+							/>
+						</label>
 						<button
 							type="button"
 							class="row-main"
@@ -109,6 +129,19 @@
 								<span>{formatRelative(meta.last_active_at)}</span>
 							</div>
 						</button>
+						{#if meta.color !== null && meta.color !== undefined}
+							<button
+								type="button"
+								class="reset-color"
+								title="Reset to default colour"
+								onclick={(e) => {
+									e.stopPropagation();
+									void workspacePicker.setColor(meta, '');
+								}}
+							>
+								Reset
+							</button>
+						{/if}
 						{#if !isCurrent}
 							<button
 								type="button"
@@ -247,6 +280,59 @@
 		background: var(--m-bg-2);
 		color: var(--m-fg-danger, #ff6b6b);
 		border-color: var(--m-fg-danger, #ff6b6b);
+	}
+	/* Colour swatch on each row. The visible bit is the rounded
+	 * `.swatch-dot` painted with the workspace's badge colour;
+	 * the `<input type="color">` sits on top with `opacity: 0`
+	 * so clicking the dot opens the native picker without us
+	 * having to render our own. `--m-swatch` is set per-row from
+	 * the template so the dot tracks the swatch live. */
+	.swatch {
+		position: relative;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 22px;
+		height: 22px;
+		margin-left: 10px;
+		flex: 0 0 auto;
+		cursor: pointer;
+	}
+	.swatch-dot {
+		display: block;
+		width: 14px;
+		height: 14px;
+		border-radius: 4px;
+		background: var(--m-swatch);
+		border: 1px solid color-mix(in srgb, var(--m-fg) 24%, transparent);
+		transition: transform 80ms ease;
+	}
+	.swatch:hover .swatch-dot {
+		transform: scale(1.12);
+	}
+	.swatch input[type='color'] {
+		position: absolute;
+		inset: 0;
+		opacity: 0;
+		cursor: pointer;
+		padding: 0;
+		border: 0;
+		background: transparent;
+	}
+	.reset-color {
+		background: transparent;
+		border: 1px solid var(--m-border);
+		color: var(--m-fg-muted);
+		font-size: 11px;
+		padding: 4px 8px;
+		border-radius: 4px;
+		font-family: inherit;
+		cursor: pointer;
+	}
+	.reset-color:hover {
+		background: var(--m-bg-2);
+		color: var(--m-fg);
+		border-color: var(--m-border-strong);
 	}
 	.empty {
 		margin: 0;

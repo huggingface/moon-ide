@@ -85,6 +85,13 @@ export const ipc = {
 		create: (slug: string, name: string) => invoke<WorkspaceMeta>('workspace_create', { slug, name }),
 		delete: (slug: string) => invoke<void>('workspace_delete', { slug }),
 		rename: (slug: string, name: string) => invoke<WorkspaceMeta>('workspace_rename', { slug, name }),
+		// Update the badge colour for `slug`. Pass `''` (empty
+		// string) to clear back to the deterministic hash-derived
+		// colour. When `slug` matches the running process's own
+		// workspace, the window icon repaints immediately —
+		// sibling processes pick up the change on their next
+		// launch.
+		setColor: (slug: string, color: string) => invoke<WorkspaceMeta>('workspace_set_color', { slug, color }),
 	},
 	// Window management. Process-per-workspace: `open` either
 	// focuses the sibling process that already owns `slug` or

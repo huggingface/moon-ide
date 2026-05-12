@@ -98,6 +98,11 @@ export type WorkspaceMeta = {
 	name: string;
 	/** Unix epoch seconds; bumped on every launch. */
 	last_active_at: number;
+	/** User-chosen badge colour as `#rrggbb`. `null` / absent
+	 * means "use the deterministic hash-derived hue" — the
+	 * default every new workspace starts with. Drives the
+	 * per-window icon Tauri sets at startup. */
+	color?: string | null;
 };
 
 export type FileSearchOptions = {

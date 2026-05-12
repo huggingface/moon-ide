@@ -5,7 +5,7 @@ use moon_protocol::workspace::{
 	slugify_workspace_name, validate_workspace_id, Workspace as WorkspaceRecord, WorkspaceMeta,
 };
 use moon_protocol::MoonError;
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::focus_socket;
 use crate::state::AppState;
@@ -182,6 +182,7 @@ pub async fn workspace_create(
 			id: slug_owned,
 			name: name_owned,
 			last_active_at: now,
+			color: None,
 		};
 		s.workspaces.push(meta.clone());
 		meta
@@ -239,6 +240,53 @@ pub async fn workspace_delete(state: State<'_, AppState>, slug: String) -> Resul
 	})
 	.await?;
 	Ok(())
+}
+
+/// Update the badge colour for a workspace. `color` is either a
+/// `#rrggbb` (or `#rgb`) hex string or an empty string to clear
+/// back to the deterministic hash-derived colour. When the
+/// edited workspace is the one this process owns, the running
+/// window's icon repaints immediately — sibling processes
+/// repaint on next launch.
+///
+/// Validation is intentionally light: an unparseable colour is
+/// stored as-is and the icon code falls back to the hash hue.
+/// That way a partial typo round-trip from the picker doesn't
+/// fail loudly; the user just sees the default colour and
+/// re-edits.
+#[tauri::command]
+pub async fn workspace_set_color(
+	app: tauri::AppHandle,
+	state: State<'_, AppState>,
+	slug: String,
+	color: String,
+) -> Result<WorkspaceMeta, MoonError> {
+	validate_workspace_id(&slug)?;
+	let trimmed = color.trim();
+	let next_color: Option<String> = if trimmed.is_empty() {
+		None
+	} else {
+		Some(trimmed.to_string())
+	};
+	let slug_owned = slug.clone();
+	let color_for_mutate = next_color.clone();
+	let meta = core_app_state::mutate(&state.config_dir, move |s| {
+		let meta = s
+			.workspaces
+			.iter_mut()
+			.find(|m| m.id == slug_owned)
+			.ok_or_else(|| MoonError::NotFound(format!("workspace `{slug_owned}`")))?;
+		meta.color = color_for_mutate;
+		Ok::<WorkspaceMeta, MoonError>(meta.clone())
+	})
+	.await??;
+
+	if Some(slug.as_str()) == state.workspace_id() {
+		if let Some(window) = app.get_webview_window("main") {
+			crate::window_icon::apply_workspace_icon(&window, &slug, next_color.as_deref());
+		}
+	}
+	Ok(meta)
 }
 
 /// Update the human-readable name of a workspace. The id (and

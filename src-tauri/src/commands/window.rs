@@ -127,6 +127,7 @@ pub async fn bump_last_active(state: &AppState, workspace_id: &str) {
 			id: id.clone(),
 			name: id,
 			last_active_at: now,
+			color: None,
 		});
 	})
 	.await;

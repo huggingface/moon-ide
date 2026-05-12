@@ -66,6 +66,15 @@ pub struct WorkspaceMeta {
 	/// "recent" sort. Bumped on `workspace_create`, `window_open`,
 	/// and every `session_save` tick.
 	pub last_active_at: i64,
+	/// User-chosen badge colour as `#rrggbb`, applied to this
+	/// workspace's per-window icon (alt-tab differentiation). `None`
+	/// means "use the deterministic hash-derived hue" — i.e. the
+	/// default colour every new workspace starts with. `#[serde(default)]`
+	/// keeps state.json forward-compatible: pre-colour catalogs
+	/// load cleanly and lazily promote to `None` on the next save.
+	#[serde(default)]
+	#[ts(optional)]
+	pub color: Option<String>,
 }
 
 /// The running process's single workspace, holding zero or

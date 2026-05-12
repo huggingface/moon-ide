@@ -22,6 +22,7 @@ mod shutdown;
 mod slack_poller;
 mod state;
 mod system_theme_watcher;
+mod window_icon;
 
 use std::sync::{Arc, Mutex};
 
@@ -132,6 +133,7 @@ pub fn run() {
 			commands::workspace::workspace_create,
 			commands::workspace::workspace_delete,
 			commands::workspace::workspace_rename,
+			commands::workspace::workspace_set_color,
 			commands::window::window_open,
 			commands::window::window_close,
 			commands::window::window_set_title,
@@ -276,6 +278,26 @@ pub fn run() {
 					}
 				}
 			};
+
+			// Per-window icon derived from the workspace id and
+			// optional user override colour pulled from the
+			// catalog, so an alt-tab stack of multiple `moon-ide`s
+			// shows a distinct coloured badge per workspace. X11
+			// honours the per-window `_NET_WM_ICON` Tauri sets
+			// here; on Wayland most compositors look icons up by
+			// `app_id` and ignore per-window pixmaps, so the call
+			// is best-effort there. Preboot mode also gets an
+			// icon (keyed on the sentinel id, no override) — same
+			// code path, no branching needed. Failures are logged
+			// and dropped inside `apply_workspace_icon`.
+			if let Some(window) = app.get_webview_window("main") {
+				let override_color = loaded_state
+					.workspaces
+					.iter()
+					.find(|m| m.id == workspace_id)
+					.and_then(|m| m.color.clone());
+				window_icon::apply_workspace_icon(&window, &workspace_id, override_color.as_deref());
+			}
 
 			// Build the shared client cell first, spawn the Slack
 			// poller against it, then hand the same Arc to AppState
