@@ -40,7 +40,12 @@ import { diagLogs, frontendLog } from './logs.svelte';
 import { terminal } from './terminal.svelte';
 import { coder } from './coder.svelte';
 import { container } from './container.svelte';
-import { canOpenContainerTerminal, openContainerTerminal, openHostTerminal } from './openTerminal';
+import {
+	canOpenContainerTerminal,
+	ensureActiveFolderTerminal,
+	openContainerTerminal,
+	openHostTerminal,
+} from './openTerminal';
 import { projectCompose } from './projectCompose.svelte';
 import { rightPanel } from './rightPanel.svelte';
 import { slack } from './slack.svelte';
@@ -757,6 +762,14 @@ class WorkspaceState {
 			// 3-minute periodic tick. Throttled internally — rapid
 			// folder-switching doesn't spam fetches.
 			void this.runGitAutoFetch('folder-switch');
+			// If the bottom panel is open with a terminal, make sure
+			// the user has a shell rooted in the new folder ready to
+			// go — focus an existing matching terminal, or spawn one
+			// in the workspace's preferred mode (container if up,
+			// host otherwise). Hydration paths bypass this method
+			// (they call `ipc.workspace.setActiveFolder` directly),
+			// so this only fires on real user-driven switches.
+			ensureActiveFolderTerminal();
 		} catch (err) {
 			this.flash(`Could not switch folder: ${formatError(err)}`);
 		}

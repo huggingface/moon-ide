@@ -5,6 +5,7 @@
 //
 // Architecture: ADR 0009.
 
+import { bottomPanel, type TerminalTab } from './bottomPanel.svelte';
 import { container } from './container.svelte';
 import { workspace } from './state.svelte';
 import { terminal as terminalStore } from './terminal.svelte';
@@ -57,4 +58,65 @@ export function containerCwdFor(absolutePath: string): string {
 		return '/workspace';
 	}
 	return `/workspace/${basename}`;
+}
+
+/** Called after a project (active folder) switch: if the bottom
+ * panel is visible and already hosts at least one terminal, make
+ * sure the user lands on a terminal rooted in the **new** folder.
+ *
+ * Strategy:
+ * 1. Look for a live (non-exited) terminal whose cwd matches the
+ *    new folder — either host (`target.cwd === folderPath`) or
+ *    container (`target.cwd === containerCwdFor(folderPath)`).
+ *    First match wins; we don't care whether it's host or
+ *    container, the user's existing setup trumps our default
+ *    preference.
+ * 2. If none, spawn a fresh one in the preferred mode: container
+ *    when the workspace container is up, host otherwise.
+ *
+ * No-op when the panel is hidden or hosts no terminals at all —
+ * we don't surprise users who collapsed the strip or only have
+ * log / diag tabs open. Initial workspace hydration also calls
+ * `setActiveFolder` indirectly, but the entry point that wires
+ * this in skips that path (see `WorkspaceState.setActiveFolder`). */
+export function ensureActiveFolderTerminal(): void {
+	if (!bottomPanel.visible) {
+		return;
+	}
+	const tabs = bottomPanel.tabs;
+	const hasAnyTerminal = tabs.some((t) => t.kind === 'terminal');
+	if (!hasAnyTerminal) {
+		return;
+	}
+	const folder = workspace.activeFolder;
+	if (!folder) {
+		return;
+	}
+	const folderPath = folder.path;
+	const containerCwd = containerCwdFor(folderPath);
+	const existing = tabs.find((t): t is TerminalTab => {
+		if (t.kind !== 'terminal') {
+			return false;
+		}
+		const expectedCwd = t.target.kind === 'host' ? folderPath : containerCwd;
+		if (t.target.cwd !== expectedCwd) {
+			return false;
+		}
+		// Skip exited terminals — re-using a dead PTY isn't a
+		// thing; the user wants a live shell on the new folder.
+		const session = terminalStore.sessionFor(t.id);
+		if (session?.closed) {
+			return false;
+		}
+		return true;
+	});
+	if (existing) {
+		bottomPanel.setActive(existing.id);
+		return;
+	}
+	if (canOpenContainerTerminal()) {
+		openContainerTerminal();
+		return;
+	}
+	openHostTerminal();
 }
