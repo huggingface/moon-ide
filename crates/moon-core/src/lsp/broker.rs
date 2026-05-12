@@ -556,4 +556,33 @@ impl LspBroker {
 			}
 		}
 	}
+
+	/// Tear down the server slot for `language_id`. Same end state
+	/// as the crash-recovery path: the broker forgets the slot and
+	/// the next request for this language lazily re-spawns. Emits
+	/// `Stopped` so the status pill flips while the next spawn is
+	/// in flight. No-op when no server slot exists for the
+	/// language — restarting an LSP that never ran is a sensible
+	/// idempotent (e.g. the user clicked "Restart" on a freshly
+	/// opened diag-logs tab whose server hadn't actually spun up
+	/// yet). Anything in `Failed` / `Pending` is dropped without
+	/// a shutdown call.
+	pub async fn shutdown_language(&self, language_id: &str) {
+		let mut servers = self.servers.lock().await;
+		let Some(slot) = servers.remove(language_id) else {
+			return;
+		};
+		let log_source = Self::log_source_for(language_id);
+		self
+			.log_sink
+			.info(&log_source, "restart requested; tearing down server slot");
+		if let ServerSlot::Ready(server) = slot {
+			server.shutdown().await;
+		}
+		let _ = self.events.send(LspServerEvent::StatusChanged(mp::LspStatusEvent {
+			language_id: language_id.to_string(),
+			status: mp::LspServerStatus::Stopped,
+			detail: None,
+		}));
+	}
 }

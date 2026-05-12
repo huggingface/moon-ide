@@ -2,7 +2,15 @@
 	import { tick } from 'svelte';
 	import { bottomPanel, type DiagTab } from '../bottomPanel.svelte';
 	import { diagLogs, MAX_ENTRIES_PER_SOURCE } from '../logs.svelte';
+	import { workspace } from '../state.svelte';
 	import type { LogLevel } from '../protocol';
+
+	/** Diagnostic-logs sources for live LSP brokers are tagged
+	 * `lsp.<language_id>` (matches the convention in
+	 * `moon_core::lsp::broker::log_source_for`). The "Restart"
+	 * button only makes sense for those tabs; we hide it on
+	 * `format-on-save`, `editor.completion`, etc. */
+	const LSP_SOURCE_PREFIX = 'lsp.';
 
 	// Body component for a `kind: 'diag'` bottom-panel tab. Renders
 	// one diagnostic source from the unified `diagLogs` store —
@@ -20,6 +28,10 @@
 	let { tab }: Props = $props();
 
 	const entries = $derived(diagLogs.entriesFor(tab.source));
+	const lspLanguageId = $derived(
+		tab.source.startsWith(LSP_SOURCE_PREFIX) ? tab.source.slice(LSP_SOURCE_PREFIX.length) : null,
+	);
+	let restartInFlight = $state(false);
 
 	let bodyEl: HTMLDivElement | null = null;
 	let userScrolledAway = $state(false);
@@ -55,6 +67,18 @@
 
 	async function clear() {
 		await diagLogs.clear(tab.source);
+	}
+
+	async function restart() {
+		if (lspLanguageId === null || restartInFlight) {
+			return;
+		}
+		restartInFlight = true;
+		try {
+			await workspace.restartLsp(lspLanguageId);
+		} finally {
+			restartInFlight = false;
+		}
 	}
 
 	function toggleFollow() {
@@ -96,6 +120,17 @@
 		>
 			{follow ? '⏸ Pause' : '▶ Follow'}
 		</button>
+		{#if lspLanguageId !== null}
+			<button
+				type="button"
+				class="tb-btn"
+				onclick={restart}
+				disabled={restartInFlight}
+				title="Tear down the {lspLanguageId} language server and let the next request re-spawn it"
+			>
+				{restartInFlight ? 'Restarting…' : 'Restart'}
+			</button>
+		{/if}
 		<button type="button" class="tb-btn" onclick={clear} title="Clear buffer">Clear</button>
 		<button type="button" class="tb-btn" onclick={close} title="Close tab">Close</button>
 	</div>
@@ -160,6 +195,12 @@
 		background: var(--m-bg-overlay);
 		border-color: var(--m-border);
 		color: var(--m-fg);
+	}
+	.tb-btn:disabled {
+		opacity: 0.5;
+		cursor: default;
+		background: transparent;
+		border-color: transparent;
 	}
 	.body {
 		flex: 1;

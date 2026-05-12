@@ -2643,6 +2643,49 @@ class WorkspaceState {
 	}
 
 	/**
+	 * Manually restart the LSP server for `languageId`. The backend
+	 * drops the broker's server slot (next `lsp_*` request lazily
+	 * re-spawns) and emits a `stopped` status; here we follow up
+	 * by re-issuing `didOpen` for every currently-open buffer that
+	 * maps to the same language id, so the user gets fresh
+	 * diagnostics without having to flip tabs. Failures are
+	 * surfaced via `flash` — the UX is "click the button, see a
+	 * pill flip back to running within a couple seconds".
+	 *
+	 * The diagnostic cache for affected paths is **kept** rather
+	 * than cleared; the new server publishes a full replacement
+	 * list on its first analysis pass, so overwriting them at
+	 * that moment is correct. Clearing now would leave a brief
+	 * empty-state flash that the user would read as "the restart
+	 * lost my errors".
+	 */
+	async restartLsp(languageId: string): Promise<void> {
+		try {
+			await ipc.lsp.restart(languageId);
+		} catch (err) {
+			this.flash(`Could not restart ${languageId} LSP: ${formatError(err)}`);
+			return;
+		}
+		// Re-prime the new server with every open buffer that's
+		// governed by this language id. The broker is rooted at
+		// the active folder, so cross-folder buffers will silently
+		// be NotAvailable — that's fine, they were also
+		// NotAvailable before the restart for the same reason.
+		for (const file of this.openFiles) {
+			if (file.kind !== 'text' || file.isDeleted) {
+				continue;
+			}
+			if (file.path.startsWith('untitled:')) {
+				continue;
+			}
+			if (lspLanguageFor(file.path) !== languageId) {
+				continue;
+			}
+			this.lspOpen(file.path, file.text);
+		}
+	}
+
+	/**
 	 * Close notification + drop the cached diagnostics for `path`.
 	 * The buffer has no more observers in moon-ide, so showing its
 	 * stale problem count on next reopen would be wrong.

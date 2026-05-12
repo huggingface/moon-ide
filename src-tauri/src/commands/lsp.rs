@@ -116,6 +116,26 @@ pub async fn lsp_completion(
 		.map_err(|e| MoonError::internal(e.to_string()))
 }
 
+/// Tear down the server slot for `language_id` so the next
+/// `lsp_*` request lazily re-spawns it. Used by the "Restart"
+/// button in the diag-logs panel and by anyone who's just
+/// upgraded a global toolchain (`bun add typescript-go` etc.)
+/// and wants the IDE to pick up the new binary without bouncing
+/// the whole window. No-op when no broker exists yet — calling
+/// restart before any LSP has spun up is a fine idempotent.
+#[tauri::command]
+pub async fn lsp_restart(state: State<'_, AppState>, language_id: String) -> Result<(), MoonError> {
+	let broker = {
+		let guard = state.lsp.lock().await;
+		match guard.as_ref() {
+			Some(b) => b.broker.clone(),
+			None => return Ok(()),
+		}
+	};
+	broker.shutdown_language(&language_id).await;
+	Ok(())
+}
+
 /// Resolve `textDocument/definition` for the symbol at `position`.
 /// Returns `Ok(None)` when the server doesn't know (e.g. the cursor
 /// is on whitespace, a keyword with no jump, or a literal). The UI

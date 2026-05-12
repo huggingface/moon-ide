@@ -224,6 +224,13 @@ export const ipc = {
 			invoke<LspCompletionList>('lsp_completion', { path, languageId, position }),
 		definition: (path: string, languageId: string, position: LspPosition) =>
 			invoke<LspLocation | null>('lsp_definition', { path, languageId, position }),
+		// Tear down the server slot for `languageId`. The next
+		// `open` / `update` / `hover` / `completion` lazily
+		// re-spawns it; the diag-logs panel exposes a "Restart"
+		// button per `lsp.*` source. No-op when no broker exists
+		// yet — calling restart before any LSP has spun up is
+		// fine.
+		restart: (languageId: string) => invoke<void>('lsp_restart', { languageId }),
 	},
 	slack: {
 		setToken: (token: string) => invoke<SlackIdentity>('slack_set_token', { token }),

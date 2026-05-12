@@ -170,6 +170,7 @@ pub fn run() {
 			commands::lsp::lsp_hover,
 			commands::lsp::lsp_completion,
 			commands::lsp::lsp_definition,
+			commands::lsp::lsp_restart,
 			commands::logs::logs_snapshot,
 			commands::logs::logs_sources,
 			commands::logs::logs_clear,
