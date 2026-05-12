@@ -670,6 +670,41 @@ class WorkspaceState {
 	}
 
 	/**
+	 * Per-buffer view-state cache for tab switches. Keyed by
+	 * `${folder}::${path}` like `navStack`. Holds the caret
+	 * offset, the selection's anchor offset (so a range
+	 * survives, not just a cursor), and the scroller's
+	 * `scrollTop`. `Editor.svelte` snapshots into here right
+	 * before tearing down its `EditorView` state for a tab
+	 * swap, and reads back when re-mounting the same path. The
+	 * cache entry survives any number of switches; it's
+	 * dropped only when the buffer falls out of every pane
+	 * (see `closeFile`'s GC block).
+	 *
+	 * Deliberately **not** reactive — cursor moves don't need
+	 * to wake up the reactive graph, and the snapshot/restore
+	 * cycle is driven by lifecycle hooks, not reads from
+	 * Svelte components.
+	 */
+	private viewStateByKey = new Map<string, { caretOffset: number; anchorOffset: number; scrollTop: number }>();
+
+	snapshotViewState(
+		folder: string,
+		path: string,
+		snapshot: { caretOffset: number; anchorOffset: number; scrollTop: number },
+	): void {
+		this.viewStateByKey.set(navKey(folder, path), snapshot);
+	}
+
+	getViewState(folder: string, path: string): { caretOffset: number; anchorOffset: number; scrollTop: number } | null {
+		return this.viewStateByKey.get(navKey(folder, path)) ?? null;
+	}
+
+	private dropViewState(folder: string, path: string): void {
+		this.viewStateByKey.delete(navKey(folder, path));
+	}
+
+	/**
 	 * Add `path` as a folder in the workspace and make it active.
 	 * Idempotent on duplicate path — the backend silently flips the
 	 * existing entry to active, and we re-load its tree if it had
@@ -3601,6 +3636,14 @@ class WorkspaceState {
 				// no point keeping the old one warm.
 				this.clearBlameFor(path);
 				this.clearHeadFor(path);
+			}
+			// Drop the per-buffer view-state snapshot. A reopen of
+			// the same path should land at the start of the file
+			// (matches every other IDE) rather than at wherever the
+			// caret was the last time the buffer existed.
+			const folder = this.activeFolderPath;
+			if (folder !== null) {
+				this.dropViewState(folder, path);
 			}
 		}
 

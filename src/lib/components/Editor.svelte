@@ -139,6 +139,22 @@
 			// snapshot — Ctrl+L should never attach a selection
 			// from a tab the user just left.
 			workspace.setActiveSelection(null);
+			// Capture the outgoing tab's caret + scroll so coming
+			// back to it lands the user where they left off rather
+			// than at the top of the file. `setState` below replaces
+			// the view's state wholesale, which is why this has to
+			// happen *before* the swap. `renamed` falls through
+			// because that path doesn't `setState` — the doc is
+			// patched in place and the live selection survives on
+			// its own.
+			const folder = workspace.activeFolderPath;
+			if (!renamed && currentPath !== null && folder !== null) {
+				workspace.snapshotViewState(folder, currentPath, {
+					caretOffset: v.state.selection.main.head,
+					anchorOffset: v.state.selection.main.anchor,
+					scrollTop: v.scrollDOM.scrollTop,
+				});
+			}
 			currentPath = file.path;
 			void workspace.ensureEditorConfig(file.path);
 			void applyLanguage(file.path, file.text);
@@ -153,6 +169,32 @@
 				extensions: baseExtensions(),
 			});
 			v.setState(next);
+			// Restore the incoming tab's snapshot, if any. A fresh
+			// open (no prior snapshot) leaves the cursor at offset
+			// 0, matching what `EditorState.create` already gives
+			// us — no-op for first-time views. The scroll restore
+			// is microtask-deferred so CodeMirror has flushed its
+			// post-`setState` measurement pass and `scrollDOM`'s
+			// `scrollHeight` reflects the new doc; setting
+			// `scrollTop` before that lands at 0 silently. A
+			// downstream pending-jump (Ctrl/Cmd-click goto-def
+			// arrived at this path) still wins because its effect
+			// queues *another* dispatch in a later microtask that
+			// overwrites the restore — deliberate ordering, see
+			// the pending-jump effect's comment for the same
+			// reasoning.
+			const snapshot = folder !== null ? workspace.getViewState(folder, file.path) : null;
+			if (snapshot !== null) {
+				const docLen = v.state.doc.length;
+				const head = Math.min(snapshot.caretOffset, docLen);
+				const anchor = Math.min(snapshot.anchorOffset, docLen);
+				v.dispatch({
+					selection: head === anchor ? EditorSelection.cursor(head) : EditorSelection.range(anchor, head),
+				});
+				queueMicrotask(() => {
+					v.scrollDOM.scrollTop = snapshot.scrollTop;
+				});
+			}
 			return;
 		}
 		// Same path, but the in-memory text may differ if state was mutated externally.
