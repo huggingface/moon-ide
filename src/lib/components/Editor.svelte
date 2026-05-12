@@ -7,13 +7,7 @@
 	import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 	import { searchKeymap, highlightSelectionMatches } from '@codemirror/search';
 	import { bracketMatching, indentOnInput, indentUnit } from '@codemirror/language';
-	import {
-		autocompletion,
-		closeBrackets,
-		closeBracketsKeymap,
-		completionKeymap,
-		startCompletion,
-	} from '@codemirror/autocomplete';
+	import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from '@codemirror/autocomplete';
 	import {
 		applyDiagnostics,
 		filePathFacet,
@@ -80,20 +74,20 @@
 		return true;
 	}
 
-	// High-priority Ctrl+Space binding that logs the key event in
-	// addition to triggering completion. The user reported "Ctrl+Space
-	// worked once but not after"; logging at this seam lets them tell
-	// whether CodeMirror is even seeing the keystroke (IBus / IME
-	// hijack vs. CM-internal issue) from inside the IDE. We claim
-	// the keystroke (`return true`) and re-invoke `startCompletion`
-	// ourselves rather than fall through, because chained handlers in
-	// CM's keymap only run when the previous one returns `false` —
-	// returning `false` here would make the log run twice if anything
-	// downstream also bound `Ctrl-Space`.
-	function logCtrlSpace(editorView: EditorView): boolean {
-		frontendLog('editor.completion', 'info', 'Ctrl+Space pressed → invoking startCompletion');
-		startCompletion(editorView);
-		return true;
+	// Ctrl+Space breadcrumb for the diag-logs panel. We tap the
+	// key at `Prec.high`, log, and return `false` so the keystroke
+	// falls through to `completionKeymap`'s canonical Ctrl-Space
+	// binding (which calls `startCompletion`). We deliberately
+	// don't claim the key here: that duplicates the side effect
+	// for no reason, and — more subtly — would route the keystroke
+	// through a different code path than every other completion
+	// trigger, which made it hard to reason about which keymap
+	// owned what. Returning `false` also keeps the binding
+	// composable: any future second listener at higher precedence
+	// can intercept Ctrl-Space without us having to coordinate.
+	function logCtrlSpace(): boolean {
+		frontendLog('editor.completion', 'info', 'Ctrl+Space pressed');
+		return false;
 	}
 
 	onMount(() => {
@@ -434,9 +428,9 @@
 			// would shadow our `Prec.high` `logCtrlSpace` tap — the user
 			// would press Ctrl+Space, completion would fire, but our
 			// "Ctrl+Space pressed" breadcrumb would never log. We spread
-			// `completionKeymap` ourselves below at default precedence
-			// so navigation / accept / escape still work; our high-
-			// precedence override replaces only the Ctrl-Space slot.
+			// `completionKeymap` ourselves below; the tap runs first
+			// and falls through, so the canonical completion handlers
+			// still own popup navigation / accept / escape.
 			autocompletion({
 				activateOnTyping: false,
 				override: [lspCompletionSource],
@@ -448,14 +442,27 @@
 					{ mac: 'Ctrl-t', run: runAutocompleteFromShortcut },
 					// Tap on Ctrl+Space so the user can see it land
 					// in CodeMirror via the diag-logs panel.
-					// `logCtrlSpace` itself invokes `startCompletion`
-					// and returns true; we own the slot at `Prec.high`
-					// so this runs ahead of `completionKeymap`'s
-					// default Ctrl-Space binding (same key, lower
-					// precedence) without double-firing completion.
+					// `logCtrlSpace` returns `false` so the keystroke
+					// continues to the `completionKeymap` block below
+					// (same `Prec.high`, registered after us, so
+					// within-precedence ordering hands Ctrl-Space to
+					// it next) and `startCompletion` fires there.
 					{ key: 'Ctrl-Space', run: logCtrlSpace },
 				]),
 			),
+			// `completionKeymap` lives at `Prec.high` so its
+			// `ArrowDown` / `ArrowUp` / `Enter` / `Escape`
+			// handlers beat the corresponding bindings in
+			// `defaultKeymap` (which would otherwise move the
+			// caret instead of the popup selection). Each handler
+			// returns `false` when the popup is closed, so the
+			// default-precedence bindings still own those keys for
+			// regular editing — they only "win" while the popup is
+			// up. Mirrors the upstream `autocompletion()` install
+			// (which would put this at `Prec.highest`) but kept at
+			// `Prec.high` so any future `Prec.highest` override can
+			// still intercept.
+			Prec.high(keymap.of([...completionKeymap])),
 			keymap.of([
 				// Alt+Left / Alt+Right (= file-history back / forward)
 				// are handled at the window level in `App.svelte`,
@@ -470,7 +477,6 @@
 				...defaultKeymap,
 				...historyKeymap,
 				...searchKeymap,
-				...completionKeymap,
 				indentWithTab,
 			]),
 			themeCompartment.of(moonEditorTheme(workspace.effectiveTheme)),
