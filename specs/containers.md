@@ -819,16 +819,73 @@ that the manual rebuild step isn't a UX wart.
 
 What this **doesn't** do (deferred until somebody asks):
 
-- Forward the user's `~/.ssh/config` (Host aliases,
-  `IdentityFile` paths, `ProxyCommand`s). Anyone whose git
-  remotes use a custom Host alias has to either rewrite the
-  remote URL or mount their `~/.ssh/config` themselves via a
-  team Dockerfile-on-top.
 - Forward GPG agents for signed commits. Same story — easy to
   layer on per-team if it shows up.
 - Toggle the forward off via UI. Hardcoded on by default; an
   `x-moon` key (or top-level setting) can come back when a
   second concrete need appears.
+
+## SSH config forwarding
+
+Agent forwarding alone isn't enough when the user's git remotes
+or interactive `ssh` invocations rely on **`Host` aliases**
+defined in `~/.ssh/config` (e.g. `ssh europe`, where `europe`
+expands to a specific `HostName` / `User` / `ProxyJump` combo).
+On the host that command resolves; inside the dev container,
+with no config to consult, OpenSSH falls back to treating
+`europe` as a literal DNS name and hangs.
+
+moon-ide closes that gap by bind-mounting the host's
+`~/.ssh/config` into the container, read-only, at the dev
+user's `~/.ssh/config`:
+
+```yaml
+services:
+  dev:
+    volumes:
+      - /home/me/.ssh/config:/home/dev/.ssh/config:ro
+```
+
+**Only the config file**, not the rest of `~/.ssh/`. Private
+keys deliberately stay on the host — the agent forward
+(`SSH_AUTH_SOCK`, above) is the intended auth path, so an
+exfiltratable copy of the keys inside the container would
+defeat its whole purpose.
+
+Resolution: `$HOME/.ssh/config` on the IDE process's
+environment. Skipped (with a `tracing::debug!`) when the file
+doesn't exist — otherwise Docker would auto-create the source
+as an empty directory and shadow any later host config until
+the container is recreated. Re-evaluated on every
+`compose.yaml` write, same cadence as the agent forward.
+
+What follows from "config but no keys, no `~/.ssh/` dir":
+
+- **`IdentityFile`** lines referencing host-side key paths
+  (`~/.ssh/id_*`, `~/.ssh/keys/foo`) won't resolve inside the
+  container. OpenSSH silently skips missing identity files
+  and falls back to the agent, which is what we want anyway.
+- **`ProxyCommand`** lines that exec host-only binaries
+  (`cloudflared access ssh`, `aws ssm start-session`, …)
+  won't work inside the container — the binary isn't there.
+  Cross-boundary tooling limitation, not specific to this
+  mount.
+- **`Include`** directives pointing at non-mounted paths are
+  silently ignored by OpenSSH; the main config still applies.
+- **`ControlMaster` / `ControlPath`** writes go to the bind-
+  mounted `.ssh` parent dir, which Docker creates as root-
+  owned 0755. The user can't write a control socket there.
+  Connection multiplexing inside the container is therefore
+  off; not a regression for non-multiplexed flows.
+
+What this **doesn't** do (deferred until somebody asks):
+
+- Forward `~/.ssh/known_hosts`. The base image already
+  pre-seeds keys for `github.com` and `gitlab.com`; custom
+  hosts prompt on first connect in an interactive
+  `docker exec` and fail under non-interactive mode (workaround:
+  `-o StrictHostKeyChecking=accept-new`). Easy follow-up if it
+  bites someone.
 
 ## Git author identity from the host
 

@@ -71,6 +71,7 @@ use tokio::process::Command;
 
 use crate::compose::{
 	generate_compose, BoundMount, ComposeRender, ComposeRenderOptions, GhConfigMount, HostGitIdentity, SshAgentForward,
+	SshConfigMount,
 };
 use crate::project::{project_name_for_id, ProjectName, ProjectNameError};
 
@@ -221,6 +222,7 @@ impl Workspace {
 	pub fn render_compose(&self, dev_image: &str) -> ComposeRender {
 		let mounts = self.bound_mounts();
 		let agent = detect_ssh_agent_forward();
+		let ssh_config = detect_host_ssh_config();
 		let identity = detect_host_git_identity();
 		let gh_config = detect_host_gh_config();
 		generate_compose(ComposeRenderOptions {
@@ -228,6 +230,7 @@ impl Workspace {
 			dev_image,
 			bound_mounts: &mounts,
 			ssh_agent: agent.as_ref(),
+			ssh_config: ssh_config.as_ref(),
 			git_identity: identity.as_ref(),
 			gh_config: gh_config.as_ref(),
 		})
@@ -515,6 +518,42 @@ pub(crate) fn detect_host_git_identity() -> Option<HostGitIdentity> {
 	let name = read_git_global_config("user.name")?;
 	let email = read_git_global_config("user.email")?;
 	Some(HostGitIdentity { name, email })
+}
+
+/// Resolve the host's `~/.ssh/config` and bind-mount it into the
+/// dev container so an in-container `ssh` knows the user's
+/// `Host` aliases, `ProxyJump` chains, and per-host options.
+/// Without this, a command like `ssh europe` inside a container
+/// terminal — perfectly fine on the host — falls through to DNS
+/// resolution of the literal alias and hangs.
+///
+/// Resolves to `$HOME/.ssh/config` (or `$USERPROFILE/.ssh/config`
+/// on Windows-ish hosts, included for symmetry with
+/// [`detect_host_gh_config`]). Returns `None` when the file isn't
+/// there — mounting a non-existent path would have Docker
+/// auto-create the source as an empty directory and shadow any
+/// later host config until the container is recreated.
+///
+/// Private key material is deliberately **not** mounted. The
+/// agent forward ([`detect_ssh_agent_forward`]) is the intended
+/// auth path; `IdentityFile` directives in the config silently
+/// fall through to the agent when the referenced key path
+/// doesn't resolve inside the container.
+///
+/// Re-evaluated every time we render or write `compose.yaml`,
+/// matching the other host-bridge detectors' "rebuild container
+/// to pick it up" cadence.
+pub(crate) fn detect_host_ssh_config() -> Option<SshConfigMount> {
+	let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok()?;
+	let path = Utf8PathBuf::from(home).join(".ssh").join("config");
+	if !path.is_file() {
+		tracing::debug!(
+			%path,
+			"ssh config not found; skipping ssh config pass-through into the container",
+		);
+		return None;
+	}
+	Some(SshConfigMount { host_path: path })
 }
 
 /// Resolve the host's `gh` config directory and bind-mount it

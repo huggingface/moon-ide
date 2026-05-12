@@ -164,11 +164,6 @@ failed`. `BatchMode=yes` rejects interactive prompts, so
   relaunch under an agent-bearing shell (or set
   `SSH_AUTH_SOCK` and trigger a rebuild). The IDE doesn't
   watch for agent-socket appearance.
-- **`~/.ssh/config` is not forwarded.** Anyone whose git
-  remotes rely on a custom `Host` alias or an `IdentityFile`
-  pointing at a non-default key needs to either rewrite the
-  remote URL or layer their own `~/.ssh/config` mount in a
-  team Dockerfile.
 - **GPG agent (signed commits) is not forwarded.** Easy to
   layer on per-team Dockerfile if it shows up.
 - **Pre-seeded known_hosts can drift.** If GitHub or GitLab

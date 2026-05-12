@@ -100,6 +100,51 @@ pub struct SshAgentForward {
 	pub host_socket: Utf8PathBuf,
 }
 
+/// In-container path the host's `~/.ssh/config` is bind-mounted
+/// at. We pin it to the `dev` user's `~/.ssh/config` so the
+/// in-container `ssh` reads it without `SSH_CONFIG=/whatever` on
+/// every invocation. `dev`'s home is `/home/dev` per the
+/// moon-base Dockerfile.
+pub const SSH_CONFIG_CONTAINER_PATH: &str = "/home/dev/.ssh/config";
+
+/// Bind-mount of the host's `~/.ssh/config` into the dev
+/// container, read-only. Surfaces the user's Host aliases,
+/// `ProxyJump` chains, and per-host options inside the workspace
+/// shell — without it, `ssh europe` (or any other custom Host
+/// alias) inside a container terminal tries to DNS-resolve the
+/// literal alias and hangs, even though the same command works
+/// on the host.
+///
+/// Read-only on purpose: the host owns the config; the container
+/// reads it. A container-side rewrite would surprisingly mutate
+/// the host's config via the shared bind mount.
+///
+/// Caveats (documented in `specs/containers.md` § SSH config
+/// forwarding):
+///
+/// - **`IdentityFile`** entries that reference host-side key
+///   paths (`~/.ssh/id_*`) won't resolve inside the container
+///   because keys are deliberately not mounted. SSH falls through
+///   to the agent (`SSH_AUTH_SOCK`), which is the intended path
+///   anyway.
+/// - **`ProxyCommand`** entries that exec host-only binaries
+///   (`cloudflared`, `aws ssm`, …) won't work — that's a known
+///   limitation of cross-boundary tooling, not specific to this
+///   mount.
+/// - **`Include`** directives pointing at non-mounted paths are
+///   silently skipped by OpenSSH; main config still applies.
+///
+/// If `~/.ssh/config` doesn't exist on the host, the lifecycle
+/// layer skips the mount entirely — Docker would otherwise
+/// auto-create the source as an empty directory and shadow any
+/// later host config until the container is recreated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshConfigMount {
+	/// Absolute host-side path to the user's ssh config file
+	/// (typically `~/.ssh/config`).
+	pub host_path: Utf8PathBuf,
+}
+
 /// In-container path the host's `gh` config is mounted at. We
 /// pin it to the `dev` user's `~/.config/gh` so the in-container
 /// `gh` finds the host's auth without needing
@@ -190,6 +235,10 @@ pub struct ComposeRenderOptions<'a> {
 	/// and environment block entirely (no `SSH_AUTH_SOCK` set
 	/// inside the container, no agent socket mounted).
 	pub ssh_agent: Option<&'a SshAgentForward>,
+	/// Optional `~/.ssh/config` bind mount. `None` skips the
+	/// volume entirely — Host aliases and per-host options are
+	/// then unknown inside the container.
+	pub ssh_config: Option<&'a SshConfigMount>,
 	/// Optional git identity carried over from the host. `None`
 	/// leaves the container's git unconfigured, so the first
 	/// commit prompts "Please tell me who you are" — a deliberate
@@ -255,10 +304,11 @@ pub fn generate_compose(options: ComposeRenderOptions<'_>) -> ComposeRender {
 	let _ = writeln!(yaml, "    init: true");
 	let _ = writeln!(yaml, "    working_dir: /workspace");
 	let _ = writeln!(yaml, "    volumes:");
-	if options.bound_mounts.is_empty() && options.ssh_agent.is_none() && options.gh_config.is_none() {
+	let has_extra_mount = options.ssh_agent.is_some() || options.ssh_config.is_some() || options.gh_config.is_some();
+	if options.bound_mounts.is_empty() && !has_extra_mount {
 		// Empty list is valid YAML and compose accepts it; this
 		// keeps the structure consistent for the no-folder /
-		// no-ssh-agent / no-gh-config edge case.
+		// no-ssh-agent / no-ssh-config / no-gh-config edge case.
 		let _ = writeln!(yaml, "      []");
 	} else {
 		for mount in options.bound_mounts {
@@ -278,6 +328,19 @@ pub fn generate_compose(options: ComposeRenderOptions<'_>) -> ComposeRender {
 				"      - {host}:{container}",
 				host = agent.host_socket.as_str(),
 				container = SSH_AGENT_CONTAINER_PATH,
+			);
+		}
+		if let Some(cfg) = options.ssh_config {
+			// Read-only by design — the host owns the config,
+			// the container reads Host aliases & per-host
+			// options from it. Private key material stays out
+			// (only the file itself, not the whole `.ssh` dir,
+			// is mounted).
+			let _ = writeln!(
+				yaml,
+				"      - {host}:{container}:ro",
+				host = cfg.host_path.as_str(),
+				container = SSH_CONFIG_CONTAINER_PATH,
 			);
 		}
 		if let Some(gh) = options.gh_config {
@@ -352,6 +415,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[],
 			ssh_agent: None,
+			ssh_config: None,
 			git_identity: None,
 			gh_config: None,
 		});
@@ -385,6 +449,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[],
 			ssh_agent: None,
+			ssh_config: None,
 			git_identity: None,
 			gh_config: None,
 		});
@@ -403,6 +468,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &mounts,
 			ssh_agent: None,
+			ssh_config: None,
 			git_identity: None,
 			gh_config: None,
 		});
@@ -423,6 +489,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &mounts,
 			ssh_agent: None,
+			ssh_config: None,
 			git_identity: None,
 			gh_config: None,
 		};
@@ -440,6 +507,7 @@ mod tests {
 			dev_image: "huggingface/moon-base:0.1",
 			bound_mounts: &[mount("/x", "x")],
 			ssh_agent: None,
+			ssh_config: None,
 			git_identity: None,
 			gh_config: None,
 		});
@@ -454,6 +522,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[],
 			ssh_agent: None,
+			ssh_config: None,
 			git_identity: None,
 			gh_config: None,
 		});
@@ -471,6 +540,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
 			ssh_agent: Some(&agent),
+			ssh_config: None,
 			git_identity: None,
 			gh_config: None,
 		});
@@ -499,6 +569,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[],
 			ssh_agent: Some(&agent),
+			ssh_config: None,
 			git_identity: None,
 			gh_config: None,
 		});
@@ -524,6 +595,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
 			ssh_agent: None,
+			ssh_config: None,
 			git_identity: Some(&identity),
 			gh_config: None,
 		});
@@ -554,6 +626,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[],
 			ssh_agent: Some(&agent),
+			ssh_config: None,
 			git_identity: Some(&identity),
 			gh_config: None,
 		});
@@ -570,6 +643,91 @@ mod tests {
 	}
 
 	#[test]
+	fn ssh_config_mount_renders_read_only_volume() {
+		let project = project();
+		let cfg = SshConfigMount {
+			host_path: Utf8PathBuf::from("/home/me/.ssh/config"),
+		};
+		let render = generate_compose(ComposeRenderOptions {
+			project: &project,
+			dev_image: "moon-base:dev",
+			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
+			ssh_agent: None,
+			ssh_config: Some(&cfg),
+			git_identity: None,
+			gh_config: None,
+		});
+
+		assert!(
+			render.yaml.contains("- /home/me/.ssh/config:/home/dev/.ssh/config:ro"),
+			"got:\n{}",
+			render.yaml,
+		);
+		// No environment block: ssh config is a pure file mount,
+		// no env var carries with it (unlike SSH_AUTH_SOCK).
+		assert!(!render.yaml.contains("    environment:"));
+	}
+
+	#[test]
+	fn ssh_config_mount_renders_with_no_bound_folders_or_agent() {
+		// Pre-opt-in shape: no folders bound yet but the host's
+		// ssh config is still available — the renderer must not
+		// regress to `volumes: []` and drop the config mount.
+		let project = project();
+		let cfg = SshConfigMount {
+			host_path: Utf8PathBuf::from("/home/me/.ssh/config"),
+		};
+		let render = generate_compose(ComposeRenderOptions {
+			project: &project,
+			dev_image: "moon-base:dev",
+			bound_mounts: &[],
+			ssh_agent: None,
+			ssh_config: Some(&cfg),
+			git_identity: None,
+			gh_config: None,
+		});
+
+		assert!(!render.yaml.contains("    volumes:\n      []"));
+		assert!(
+			render.yaml.contains("- /home/me/.ssh/config:/home/dev/.ssh/config:ro"),
+			"got:\n{}",
+			render.yaml,
+		);
+	}
+
+	#[test]
+	fn ssh_config_and_agent_coexist_in_volumes_block() {
+		// Both forwards on at once — the common case for users
+		// with Host aliases in their `~/.ssh/config`. Agent
+		// handles auth; config handles alias resolution.
+		let project = project();
+		let agent = SshAgentForward {
+			host_socket: Utf8PathBuf::from("/run/user/1000/keyring/ssh"),
+		};
+		let cfg = SshConfigMount {
+			host_path: Utf8PathBuf::from("/home/me/.ssh/config"),
+		};
+		let render = generate_compose(ComposeRenderOptions {
+			project: &project,
+			dev_image: "moon-base:dev",
+			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
+			ssh_agent: Some(&agent),
+			ssh_config: Some(&cfg),
+			git_identity: None,
+			gh_config: None,
+		});
+
+		assert!(render
+			.yaml
+			.contains("- /run/user/1000/keyring/ssh:/run/host-services/ssh-auth.sock"));
+		assert!(render.yaml.contains("- /home/me/.ssh/config:/home/dev/.ssh/config:ro"));
+		// Agent still drives SSH_AUTH_SOCK; config carries no env.
+		assert!(render
+			.yaml
+			.contains("SSH_AUTH_SOCK: \"/run/host-services/ssh-auth.sock\""));
+	}
+
+	#[test]
 	fn gh_config_mount_renders_read_only_volume() {
 		let project = project();
 		let gh = GhConfigMount {
@@ -580,6 +738,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
 			ssh_agent: None,
+			ssh_config: None,
 			git_identity: None,
 			gh_config: Some(&gh),
 		});
@@ -602,6 +761,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[],
 			ssh_agent: None,
+			ssh_config: None,
 			git_identity: None,
 			gh_config: Some(&gh),
 		});
@@ -626,6 +786,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[],
 			ssh_agent: None,
+			ssh_config: None,
 			git_identity: Some(&identity),
 			gh_config: None,
 		});

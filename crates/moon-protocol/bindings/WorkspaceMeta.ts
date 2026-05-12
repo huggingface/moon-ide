@@ -33,4 +33,13 @@ name: string,
  * "recent" sort. Bumped on `workspace_create`, `window_open`,
  * and every `session_save` tick.
  */
-last_active_at: bigint, };
+last_active_at: bigint, 
+/**
+ * User-chosen badge colour as `#rrggbb`, applied to this
+ * workspace's per-window icon (alt-tab differentiation). `None`
+ * means "use the deterministic hash-derived hue" — i.e. the
+ * default colour every new workspace starts with. `#[serde(default)]`
+ * keeps state.json forward-compatible: pre-colour catalogs
+ * load cleanly and lazily promote to `None` on the next save.
+ */
+color?: string, };
