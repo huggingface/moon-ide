@@ -29,6 +29,13 @@ const DOCKERFILE_VARIANT_RE = /(?:^Dockerfile\.|\.Dockerfile$)/;
 // grammar, and that's not worth shipping today).
 const IGNORE_FILENAME_RE = /^\.[\w-]*ignore$/;
 
+// `.env`, `.env.local`, `.env.production`, `.env.example`, etc. —
+// dotenv-flavoured files. Bare `env` (no leading dot) is intentionally
+// not matched; it's a Unix command, not a config convention. The
+// per-line tokenizer below handles `KEY=VALUE`, `# comment`,
+// `export `, and `${VAR}` interpolation inside double-quoted values.
+const ENV_FILENAME_RE = /^\.env(?:\..+)?$/;
+
 // Lazy ignore-file mode. CodeMirror's `StreamLanguage` is a thin
 // per-line tokenizer; for ignore files we only need one rule: a `#`
 // at start-of-line opens a comment that runs to end-of-line. `!` at
@@ -43,6 +50,111 @@ const ignoreLanguage = StreamLanguage.define({
 		}
 		stream.skipToEnd();
 		return null;
+	},
+	languageData: {
+		commentTokens: { line: '#' },
+	},
+});
+
+// Dotenv mode. Per-line, with a tiny bit of state to remember
+// whether we've crossed the `=` on the current line — everything
+// after the `=` is the value, everything before is the (optional)
+// `export ` keyword and the key. State resets at start-of-line so
+// continuations across lines aren't supported (dotenv conventions
+// vary on this; almost nobody uses them, and supporting them
+// would require deciding which dialect to follow).
+//
+// Token mapping mirrors the Lezer tag dictionary the editor theme
+// is wired against, so the colours come out matching the rest of
+// the IDE:
+//   - `comment`        → `#` lines and trailing `# …` after a value
+//   - `keyword`        → `export ` prefix
+//   - `propertyName`   → the key on the left of `=`
+//   - `operator`       → the `=` itself
+//   - `string`         → unquoted, single-quoted, double-quoted value
+//   - `variableName`   → `${VAR}` interpolation inside double-quoted
+//                        (single-quoted values are taken literally,
+//                        same as POSIX shell semantics)
+const envLanguage = StreamLanguage.define<{ inValue: boolean }>({
+	name: 'dotenv',
+	startState() {
+		return { inValue: false };
+	},
+	token(stream, state) {
+		if (stream.sol()) {
+			state.inValue = false;
+			if (stream.eatSpace()) {
+				return null;
+			}
+			if (stream.peek() === '#') {
+				stream.skipToEnd();
+				return 'comment';
+			}
+			if (stream.match(/^export\b/)) {
+				return 'keyword';
+			}
+			if (stream.match(/^[A-Za-z_][A-Za-z0-9_]*/)) {
+				return 'propertyName';
+			}
+		}
+		if (!state.inValue) {
+			if (stream.eatSpace()) {
+				return null;
+			}
+			if (stream.eat('=')) {
+				state.inValue = true;
+				return 'operator';
+			}
+			// Stray content before `=` (e.g. `KEY .` typo). Walk on
+			// rather than busy-loop the tokenizer.
+			stream.next();
+			return null;
+		}
+		// Past the `=` — value region until EOL.
+		if (stream.peek() === '#') {
+			stream.skipToEnd();
+			return 'comment';
+		}
+		if (stream.eat('"')) {
+			while (!stream.eol()) {
+				const ch = stream.next();
+				if (ch === '\\') {
+					stream.next();
+					continue;
+				}
+				if (ch === '$' && stream.peek() === '{') {
+					// Back up so the `${…}` interpolation gets its
+					// own token on the next dispatch.
+					stream.backUp(1);
+					return 'string';
+				}
+				if (ch === '"') {
+					return 'string';
+				}
+			}
+			return 'string';
+		}
+		if (stream.eat("'")) {
+			while (!stream.eol()) {
+				if (stream.next() === "'") {
+					return 'string';
+				}
+			}
+			return 'string';
+		}
+		if (stream.match(/^\$\{[^}]*\}/)) {
+			return 'variableName';
+		}
+		if (stream.match(/^\$[A-Za-z_][A-Za-z0-9_]*/)) {
+			return 'variableName';
+		}
+		if (stream.eatSpace()) {
+			return null;
+		}
+		// Unquoted value run: read until whitespace, `#`, or `$`
+		// (interpolation starts), then yield the chunk as a string.
+		stream.eatWhile((c: string) => c !== ' ' && c !== '\t' && c !== '#' && c !== '$' && c !== '"' && c !== "'");
+		return 'string';
 	},
 	languageData: {
 		commentTokens: { line: '#' },
@@ -72,6 +184,9 @@ export async function languageFor(filename: string, firstLine?: string): Promise
 	const baseName = filename.split('/').pop() ?? filename;
 	if (IGNORE_FILENAME_RE.test(baseName)) {
 		return [ignoreLanguage];
+	}
+	if (ENV_FILENAME_RE.test(baseName)) {
+		return [envLanguage];
 	}
 	let ext = FILENAME_LANGUAGES[baseName] ?? baseName.split('.').pop()?.toLowerCase() ?? '';
 	if (DOCKERFILE_VARIANT_RE.test(baseName)) {
