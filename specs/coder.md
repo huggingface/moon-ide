@@ -640,14 +640,16 @@ to Coder` pill in its top-right corner while the snapshot
 #### Wire shape (matches Cursor)
 
 The user prose stays intact, with `@`-tokens inline at the
-positions the user picked. The captured snippet contents land
-in a trailing `<context>` block:
+positions the user picked. The captured snippet contents and
+the implicit "active file" hint both land in a trailing
+`<context>` block:
 
 ```
 explain the difference between @src/lib/foo.ts:48-50 and
 @src/lib/foo.ts:63-67
 
 <context>
+<active_file path="src/lib/foo.ts" />
 <code_selection path="src/lib/foo.ts" lines="48-50">
 [lines 48-50 verbatim]
 </code_selection>
@@ -666,8 +668,30 @@ sufficient delimiter — no need to fence the body — so a
 snippet that contains its own triple-backticks rides through
 unmangled.
 
+`<active_file path="…" />` is self-closing — no body, no
+selection range, just the workspace-relative path of whichever
+file the user has focused in the editor at send time. Ships on
+every turn the user has a routable file open (skipped for
+untitled buffers, external host-direct buffers, and
+working-tree-deleted buffers — none of them are addressable by
+the agent's tools). The model uses it as a "current focus"
+hint: questions like "explain this" or "add a test for the
+function I'm looking at" route correctly without the user
+needing to `Ctrl+L`. Contents are deliberately _not_ shipped
+implicitly — that stays `Ctrl+L`'s job; the model can
+`read_file` on its own when it actually wants the bytes. The
+hint lives in the user message (per-turn) rather than the
+system prompt because tab switches would otherwise bust the
+inference router's prefix cache. The `parseUserPrompt`
+renderer in `CoderPanel.svelte` ignores the element (no chip
+rendered) — the user already knows what they have open, and
+the raw value is still visible in the on-disk session JSONL
+for anyone debugging.
+
 Empty draft + non-empty attachments is a valid send (the
-context block ships on its own); empty + empty is a no-op.
+context block ships on its own); empty + empty is a no-op even
+when an active file is focused — the implicit hint never
+auto-fires a turn on its own.
 
 The text snapshot lives with the chip — a follow-up edit to
 the file does not change what the agent sees. That matches

@@ -889,16 +889,19 @@ class CoderPanelState {
 		await this.refreshStatus();
 	}
 
-	async send(): Promise<void> {
+	async send(activeFilePath: string | null = null): Promise<void> {
 		const text = this.draft.trim();
 		const attachments = this.attachments;
 		// Allow sending when *either* there's text or there are
 		// attached selections — "explain this" with an attachment
-		// but no question is a perfectly reasonable starter.
+		// but no question is a perfectly reasonable starter. The
+		// active-file hint is implicit: present-or-absent on every
+		// turn, doesn't count as "the user wanted to send" on its
+		// own (it would auto-fire on Enter in an empty composer).
 		if ((text.length === 0 && attachments.length === 0) || this.busy) {
 			return;
 		}
-		const payload = renderPromptWithAttachments(text, attachments);
+		const payload = renderPromptWithAttachments(text, attachments, activeFilePath);
 		this.draft = '';
 		this.clearAttachments();
 		// Optimistic flip — the `user_message` event lands within
@@ -1307,19 +1310,47 @@ function applyInnerEventToRows(rows: CoderRow[], event: CoderEvent): CoderRow[] 
  *
  *  Empty draft + non-empty attachments is a valid send — we ship
  *  just the context block so "explain this" with one selection
- *  works. */
-function renderPromptWithAttachments(text: string, attachments: ComposerAttachment[]): string {
-	if (attachments.length === 0) {
-		return text;
+ *  works.
+ *
+ *  `activeFilePath` is the path of whichever file the user has
+ *  focused in the editor at send time, or `null` when nothing
+ *  routable is open (terminal-only focus, untitled buffer,
+ *  external host-direct buffer, file the user deleted). The hint
+ *  ships every turn the user has something open — it's cheap
+ *  (~30 tokens), survives compaction (older turns reduce to a
+ *  summary; the model still needs "what's open *now*" from this
+ *  turn), and gives the model enough to call `read_file` on its
+ *  own for follow-ups like "explain this" or "add a test for the
+ *  function I'm looking at" without the user needing `Ctrl+L` for
+ *  context-free questions. We deliberately do **not** ship the
+ *  file's contents implicitly — that's still `Ctrl+L`'s job.
+ *  Per-turn (in the user message), not in the system prompt, so
+ *  tab switches don't bust the router's prefix cache. */
+function renderPromptWithAttachments(
+	text: string,
+	attachments: ComposerAttachment[],
+	activeFilePath: string | null,
+): string {
+	const blocks: string[] = [];
+	if (activeFilePath !== null) {
+		// Self-closing — the element is metadata, not content.
+		// The renderer's `parseUserPrompt` only chip-strips
+		// `<code_selection>` elements, so `<active_file>` rides
+		// through invisibly in the UI while still reaching the
+		// model.
+		blocks.push(`<active_file path="${escapeXmlAttr(activeFilePath)}" />`);
 	}
-	const blocks = attachments.map((att) => {
+	for (const att of attachments) {
 		const range = att.startLine === att.endLine ? `${att.startLine}` : `${att.startLine}-${att.endLine}`;
 		// Wrap the captured text verbatim. We don't fence the body
 		// since the surrounding `<code_selection>` element is
 		// already an unambiguous delimiter — no risk of
 		// triple-backticks in the snippet "closing" our wrapper.
-		return `<code_selection path="${escapeXmlAttr(att.path)}" lines="${range}">\n${att.text}\n</code_selection>`;
-	});
+		blocks.push(`<code_selection path="${escapeXmlAttr(att.path)}" lines="${range}">\n${att.text}\n</code_selection>`);
+	}
+	if (blocks.length === 0) {
+		return text;
+	}
 	const context = `<context>\n${blocks.join('\n')}\n</context>`;
 	return text.length > 0 ? `${text}\n\n${context}` : context;
 }
