@@ -29,6 +29,10 @@
 
 	let host: HTMLDivElement;
 	let merge: MergeView | undefined;
+	// Cleanup for the horizontal-scroll sync wired up at the tail
+	// of `buildMerge`. Cleared on teardown so we don't leak DOM
+	// listeners across diff-view remounts.
+	let detachHScrollSync: (() => void) | null = null;
 
 	// Compartments are per-side: each `EditorView` inside the
 	// MergeView owns its own EditorState and can't share a Compartment
@@ -71,6 +75,8 @@
 			// resolves into a no-op instead of attaching to a
 			// destroyed host node.
 			buildToken++;
+			detachHScrollSync?.();
+			detachHScrollSync = null;
 			merge?.destroy();
 			merge = undefined;
 			// Drop any selection snapshot the right pane published
@@ -287,6 +293,12 @@
 			...(file.isDeleted ? [EditorState.readOnly.of(true), EditorView.editable.of(false)] : []),
 		];
 
+		// Tear down any previous sync before rebuilding — `buildMerge`
+		// is only called once per mount today, but keep this defensive
+		// in case the build path grows a rebuild branch later.
+		detachHScrollSync?.();
+		detachHScrollSync = null;
+
 		merge = new MergeView({
 			a: { doc: head, extensions: sharedLeft },
 			b: { doc: rightText, extensions: rightExtensions },
@@ -343,6 +355,8 @@
 				override: rawDiff,
 			},
 		});
+
+		detachHScrollSync = wireHorizontalScrollSync(merge.a.scrollDOM, merge.b.scrollDOM);
 
 		const chunks = merge.chunks;
 		if (chunks.length > 0 && !file.isDeleted) {
@@ -538,6 +552,53 @@
 	function editorConfigExtensions(ec: EditorConfig): Extension {
 		const unit = ec.indent_style === 'tab' ? '\t' : ' '.repeat(Math.max(1, ec.indent_size));
 		return [EditorState.tabSize.of(Math.max(1, ec.tab_width)), indentUnit.of(unit)];
+	}
+
+	/**
+	 * Keep the two side `.cm-scroller` elements horizontally
+	 * aligned. `@codemirror/merge` already syncs vertical scroll
+	 * (the outer `.cm-mergeView` drives both editors' Y axis) but
+	 * each side's scroller owns its own X axis — so a long line
+	 * on the left can scroll right while the right side stays
+	 * pinned, which makes line-by-line comparison painful.
+	 *
+	 * We mirror `scrollLeft` either way: a scroll on `a` writes to
+	 * `b` and vice-versa. The `syncing` flag breaks the loop —
+	 * `scroll` events from a programmatic `scrollLeft` write are
+	 * dispatched on the next animation frame, so a microtask
+	 * would clear the guard too early and the echo would write
+	 * back. `requestAnimationFrame` outlasts that echo. The
+	 * clamp case — source scrolled past target's `scrollWidth` —
+	 * also relies on this: after the clamp, the echo on the
+	 * narrower side would otherwise yank the wider side back to
+	 * the clamped value.
+	 *
+	 * Returns a cleanup that removes both listeners. Caller (the
+	 * `onMount` teardown above) drops it on diff-view unmount.
+	 */
+	function wireHorizontalScrollSync(a: HTMLElement, b: HTMLElement): () => void {
+		let syncing = false;
+		const mirror = (from: HTMLElement, to: HTMLElement) => {
+			if (syncing) {
+				return;
+			}
+			if (to.scrollLeft === from.scrollLeft) {
+				return;
+			}
+			syncing = true;
+			to.scrollLeft = from.scrollLeft;
+			requestAnimationFrame(() => {
+				syncing = false;
+			});
+		};
+		const onA = () => mirror(a, b);
+		const onB = () => mirror(b, a);
+		a.addEventListener('scroll', onA, { passive: true });
+		b.addEventListener('scroll', onB, { passive: true });
+		return () => {
+			a.removeEventListener('scroll', onA);
+			b.removeEventListener('scroll', onB);
+		};
 	}
 
 	/**
