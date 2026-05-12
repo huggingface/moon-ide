@@ -574,6 +574,53 @@ button:focus-visible {
 	background: var(--m-danger);
 }
 
+/* LSP-diagnostic overview ruler. Shares the same 10px column as
+   the git overview but paints in a parallel lane to its left so
+   the two surfaces don't visually collide: git markers hug the
+   scrollbar (right: 1px), diagnostic markers sit just inside
+   (right: 6px). Same z, pointer-events, click-to-jump shape as
+   the git overview. Hover bumps width to 5px for an easier click
+   target without claiming layout. */
+.cm-lsp-overview {
+	position: absolute;
+	top: 0;
+	right: 0;
+	bottom: 0;
+	width: 10px;
+	z-index: 5;
+	pointer-events: none;
+}
+.cm-lsp-overview-marker {
+	position: absolute;
+	right: 6px;
+	width: 3px;
+	/* Same minimum height as the git markers — single-line
+	   diagnostics in a multi-thousand-line file still surface. */
+	height: 3px;
+	margin-top: -1px;
+	border-radius: 1px;
+	pointer-events: auto;
+	cursor: pointer;
+	opacity: 0.85;
+}
+.cm-lsp-overview-marker:hover {
+	opacity: 1;
+	width: 5px;
+	right: 5px;
+}
+.cm-lsp-overview-error {
+	background: var(--m-danger);
+}
+.cm-lsp-overview-warning {
+	background: var(--m-warning);
+}
+.cm-lsp-overview-info {
+	background: var(--m-accent);
+}
+.cm-lsp-overview-hint {
+	background: var(--m-fg-muted);
+}
+
 /* Inline link-like button used by the coder tool body components
    (grep hits, read_file / write_file / edit_file path headers,
    list_dir file entries) to make file references clickable. We

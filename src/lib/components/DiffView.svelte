@@ -22,13 +22,41 @@
 		offsetForLspPosition,
 	} from '../editor/lsp';
 	import { lspGotoDefinitionExtension } from '../editor/lspGotoDefinition';
+	import { lspOverviewExtension } from '../editor/lspOverview';
+	import { frontendLog } from '../logs.svelte';
 	import type { EditorConfig } from '../protocol';
+
+	// Mirror of `Editor.svelte`'s `logCtrlSpace`. Taps Ctrl+Space at
+	// `Prec.high`, logs the breadcrumb into the `editor.completion`
+	// diag-logs source, and returns `false` so the keystroke falls
+	// through to `completionKeymap`'s canonical Ctrl-Space binding
+	// (which calls `startCompletion`). Lives in DiffView so the
+	// log fires regardless of which surface the user is in —
+	// debugging "did Ctrl+Space land?" shouldn't require knowing
+	// whether the buffer is in source or diff mode.
+	function logCtrlSpace(): boolean {
+		frontendLog('editor.completion', 'info', 'Ctrl+Space pressed');
+		return false;
+	}
 
 	type Props = { file: OpenFile; side: SplitSide };
 	let { file, side }: Props = $props();
 
 	let host: HTMLDivElement;
-	let merge: MergeView | undefined;
+	// `merge` is reactive so the `$effect`s below re-fire once
+	// `buildMerge` (async — language load + head fetch) finally
+	// assigns it. Without `$state`, the diagnostics / pending-jump
+	// effects would run once at mount with `merge` undefined,
+	// return early, and never re-run unless their *other*
+	// dependencies (`workspace.diagnostics`, `pendingJumps`)
+	// changed afterwards. Flipping into diff mode with already-
+	// published diagnostics would then leave the right pane
+	// blank — no squigglies, no overview-ruler markers — until
+	// the next edit nudged the map. `$state` on this single
+	// `let` is enough; the MergeView instance itself isn't
+	// proxied (class instances pass through `$state` as-is in
+	// Svelte 5), so method calls and internal state stay intact.
+	let merge: MergeView | undefined = $state(undefined);
 	// Cleanup for the horizontal-scroll sync wired up at the tail
 	// of `buildMerge`. Cleared on teardown so we don't leak DOM
 	// listeners across diff-view remounts.
@@ -192,16 +220,52 @@
 			: [
 					filePathFacet.of(path),
 					...lspDiagnosticsExtension(),
+					// LSP overview ruler — same lane as the regular
+					// editor, mounted into `.diff-host` via
+					// `overviewMountFacet` (set below in
+					// `gitChangeExtensions`).
+					lspOverviewExtension,
 					lspHoverExtension(),
 					lspGotoDefinitionExtension({
 						jumpTo: (target, position, folder) => workspace.jumpTo(target, position, side, folder),
 						resolveExternalUri: (uri) => workspace.resolveExternalUri(uri),
 						flash: (msg) => workspace.flash(msg),
 					}),
+					// `defaultKeymap: false` here mirrors `Editor.svelte`:
+					// with the default on, `autocompletion()` installs
+					// the upstream `completionKeymap` at `Prec.highest`
+					// internally, which would shadow our `Prec.high`
+					// Ctrl+Space breadcrumb tap below. We install
+					// `completionKeymap` ourselves at `Prec.high` so the
+					// tap fires first and falls through to the canonical
+					// completion handlers.
 					autocompletion({
 						activateOnTyping: false,
 						override: [lspCompletionSource],
+						defaultKeymap: false,
 					}),
+					Prec.high(
+						keymap.of([
+							// Returns `false` so the keystroke
+							// continues to the `completionKeymap`
+							// block below (same `Prec.high`,
+							// registered after us, so
+							// within-precedence ordering hands
+							// Ctrl-Space to it next) and
+							// `startCompletion` fires there.
+							{ key: 'Ctrl-Space', run: logCtrlSpace },
+						]),
+					),
+					// `completionKeymap` at `Prec.high` so its
+					// `ArrowDown` / `ArrowUp` / `Enter` / `Escape`
+					// handlers beat the corresponding bindings in
+					// `defaultKeymap` while the popup is open (each
+					// handler returns `false` when the popup is
+					// closed, so the default-precedence bindings still
+					// own those keys for regular editing). Without
+					// this lift, the same regression as `Editor.svelte`
+					// hit before — popup nav lost to caret motion.
+					Prec.high(keymap.of([...completionKeymap])),
 				];
 
 		// Per-line change gutter + clickable overview-ruler. Same
@@ -250,11 +314,14 @@
 				// Alt+Left / Alt+Right ride the global handler in
 				// `App.svelte` so they swallow consistently across
 				// view kinds (no fallback to CM word-motion).
+				// `completionKeymap` lives above at `Prec.high` —
+				// don't re-spread it here, that would duplicate
+				// handlers at default precedence where they'd lose
+				// to `defaultKeymap` for the popup-open keys.
 				...closeBracketsKeymap,
 				...defaultKeymap,
 				...historyKeymap,
 				...searchKeymap,
-				...completionKeymap,
 				indentWithTab,
 				// F7 / Shift-F7 mirror the CodeMirror reference
 				// merge example. Quick way to hop between hunks

@@ -19,6 +19,7 @@
 	import { applyAutocompleteFromEditorView } from '../editor/autocompleteApply';
 	import { frontendLog } from '../logs.svelte';
 	import { lspGotoDefinitionExtension } from '../editor/lspGotoDefinition';
+	import { lspOverviewExtension } from '../editor/lspOverview';
 	import { blameExtension, blameFacet } from '../editor/blame';
 	import { gitChangesExtension, headTextFacet } from '../editor/gitChanges';
 	import { workspace, type OpenFile, type SplitSide } from '../state.svelte';
@@ -392,6 +393,13 @@
 			// markers; `setDiagnostics` gets dispatched by the
 			// reactive `$effect` below.
 			...lspDiagnosticsExtension(),
+			// LSP overview ruler: thin lane on the right edge of
+			// the viewport that plots every diagnostic at its
+			// scaled vertical position, so errors further down a
+			// long file are discoverable without scrolling. Same
+			// shape as the git-changes overview, just in a
+			// neighbouring CSS lane.
+			lspOverviewExtension,
 			lspHoverExtension(),
 			lspGotoDefinitionExtension({
 				jumpTo: (path, position, folder) => workspace.jumpTo(path, position, side, folder),

@@ -2618,6 +2618,31 @@ class WorkspaceState {
 	}
 
 	/**
+	 * Force-send a `textDocument/didChange` for `path` with `text`
+	 * right now, cancelling any pending debounced update. Used by
+	 * the save path: the format-on-save pipeline can rewrite the
+	 * bytes between what the LSP server last saw (via
+	 * `lspScheduleUpdate`) and what the editor now shows, so we
+	 * have to re-sync the server before its diagnostics are
+	 * meaningful against the new buffer. Skipping the debounce
+	 * matters because the pending timer's closure captured the
+	 * *pre-format* text — letting it fire after a save would
+	 * overwrite the server's view back to stale bytes.
+	 */
+	lspNotifyAfterSave(path: string, text: string) {
+		const languageId = lspLanguageFor(path);
+		if (!languageId || path.startsWith('untitled:')) {
+			return;
+		}
+		const existing = this.#lspUpdateTimers.get(path);
+		if (existing !== undefined) {
+			clearTimeout(existing);
+			this.#lspUpdateTimers.delete(path);
+		}
+		void ipc.lsp.update(path, languageId, text).catch(() => {});
+	}
+
+	/**
 	 * Close notification + drop the cached diagnostics for `path`.
 	 * The buffer has no more observers in moon-ide, so showing its
 	 * stale problem count on next reopen would be wrong.
@@ -4293,17 +4318,29 @@ class WorkspaceState {
 			// "save then save again" would still mark dirty if the pipeline
 			// changed anything.
 			const fresh = await ipc.fs.readFile(file.path);
+			const freshText = fresh.is_binary ? file.text : fresh.text;
 			this.openFiles = this.openFiles.map((f) =>
 				f.path === file.path
 					? {
 							...f,
-							text: fresh.is_binary ? f.text : fresh.text,
+							text: freshText,
 							isDirty: false,
-							loadedFingerprint: fingerprint(fresh.is_binary ? f.text : fresh.text),
+							loadedFingerprint: fingerprint(freshText),
 							loadedMtimeMs: result.mtime_ms,
 						}
 					: f,
 			);
+			// Re-sync the LSP server to the post-format bytes. The
+			// debounced `lspScheduleUpdate` from the last keystroke
+			// (if any) carries the *pre-format* text in its closure,
+			// so without this the server would either stay on the
+			// stale text or — worse — have its view dragged back to
+			// the pre-format bytes when the pending timer fires
+			// *after* the save. Either case leaves the squigglies
+			// stuck on positions that no longer match what the
+			// editor displays. Binary files don't get an
+			// `lspLanguageFor` mapping so this is a no-op for them.
+			this.lspNotifyAfterSave(file.path, freshText);
 			// Saving a `.editorconfig` invalidated the host-side cache;
 			// refresh frontend copies so the active editor immediately
 			// honours the new indent/tab rules.
