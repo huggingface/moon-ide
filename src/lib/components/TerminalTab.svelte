@@ -3,6 +3,7 @@
 	import { Terminal, type ITheme } from '@xterm/xterm';
 	import { FitAddon } from '@xterm/addon-fit';
 	import { WebLinksAddon } from '@xterm/addon-web-links';
+	import { openUrl } from '@tauri-apps/plugin-opener';
 	import '@xterm/xterm/css/xterm.css';
 
 	import type { TerminalTab } from '../bottomPanel.svelte';
@@ -58,7 +59,19 @@
 		});
 		fitAddon = new FitAddon();
 		term.loadAddon(fitAddon);
-		term.loadAddon(new WebLinksAddon());
+		// xterm's default click handler is `window.open(uri,
+		// '_blank')`, which is a no-op inside Tauri's webview —
+		// the link gets detected and hover-underlined, but the
+		// click does nothing. Route through the `opener` plugin
+		// (same path the rest of the IDE uses for external URLs)
+		// so clicking `http://localhost:4508` in a container
+		// terminal actually launches the host's default browser.
+		term.loadAddon(
+			new WebLinksAddon((event, uri) => {
+				event.preventDefault();
+				void openUrl(uri);
+			}),
+		);
 
 		term.open(hostEl);
 		// Defer the initial fit: in some startup paths the panel
