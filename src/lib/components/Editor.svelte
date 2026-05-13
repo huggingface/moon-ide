@@ -389,6 +389,19 @@
 			indentOnInput(),
 			history(),
 			highlightSelectionMatches(),
+			// Deleted-file tabs (working-tree copy gone, `file.text`
+			// holds the HEAD blob captured at open time) land in the
+			// regular Editor when the user clicked their row in the
+			// SCM changes tree — see `FileTree.activateRowFromTree`
+			// and `EditorPane.showDiff`. The user wants a readable
+			// "what was in this file?" view, not a side-by-side
+			// against an empty pane, but a stray keystroke followed
+			// by Ctrl+S would silently un-delete the file with the
+			// HEAD bytes (saveActive doesn't gate on `isDeleted`).
+			// Locking the view read-only is the cheapest way to
+			// keep the gesture safe — the explicit "View Diff"
+			// affordance is still one Ctrl+Shift+D away.
+			...(file.isDeleted ? [EditorState.readOnly.of(true), EditorView.editable.of(false)] : []),
 			// LSP diagnostics: the gutter extension paints severity
 			// markers; `setDiagnostics` gets dispatched by the
 			// reactive `$effect` below.

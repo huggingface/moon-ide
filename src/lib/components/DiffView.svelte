@@ -183,23 +183,23 @@
 		// priority — only a "plain" Escape with no panel / popup
 		// open trickles down to us. Bound on both sides so the
 		// gesture works regardless of which pane currently has
-		// keyboard focus. Skipped entirely for deleted buffers
-		// because there's no editor mode to flip *to*.
-		const escapeBinding = file.isDeleted
-			? []
-			: [
-					Prec.low(
-						keymap.of([
-							{
-								key: 'Escape',
-								run: () => {
-									workspace.setDiffMode(file.path, false);
-									return true;
-								},
-							},
-						]),
-					),
-				];
+		// keyboard focus. Deleted buffers get the binding too —
+		// the EditorPane no longer force-routes them here, so
+		// "explicitly opened diff (right-click View diff) → Esc"
+		// is a real flip to the read-only Editor view of HEAD.
+		const escapeBinding = [
+			Prec.low(
+				keymap.of([
+					{
+						key: 'Escape',
+						run: () => {
+							workspace.setDiffMode(file.path, false);
+							return true;
+						},
+					},
+				]),
+			),
+		];
 
 		const sharedLeft: Extension[] = [
 			lineNumbers(),

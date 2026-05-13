@@ -1343,9 +1343,17 @@
 	 *    Source view, even if the path was previously toggled to
 	 *    Diff via the changes-view click, the gutter, or the tab
 	 *    toolbar). Then preview-open without stealing focus.
-	 *  - `'changes'` mode: set the diff-mode flag for this path
-	 *    (the SCM panel already filters to "what changed", and
-	 *    diff is the natural follow-up). Then preview-open.
+	 *  - `'changes'` mode: set the diff-mode flag *only* for files
+	 *    with `modified` status — those are the rows where a
+	 *    side-by-side comparison has something to show. Added /
+	 *    untracked / deleted files don't have two sides to
+	 *    compare (added: no HEAD blob; deleted: no working tree;
+	 *    untracked: same as added), so the diff view collapses
+	 *    into a single-coloured wall of plus / minus prefixes
+	 *    that wastes a pane. For those, clear the flag like the
+	 *    `'all'` branch does and let the regular Editor /
+	 *    deleted-file read-only view render instead. Same
+	 *    `EditorTabs.canDiff` rule, applied at click time.
 	 *
 	 * Both `setDiffMode` and `openFile` are idempotent for "no
 	 * actual change" inputs, so this is safe to call from both
@@ -1360,7 +1368,9 @@
 		if (!item || item.isDirectory()) {
 			return;
 		}
-		workspace.setDiffMode(path, mode === 'changes');
+		const status = workspace.gitStatusEntries.find((e) => e.path === path)?.status;
+		const wantsDiff = mode === 'changes' && status === 'modified';
+		workspace.setDiffMode(path, wantsDiff);
 		void workspace.openFile(path, undefined, { focus: false });
 	}
 

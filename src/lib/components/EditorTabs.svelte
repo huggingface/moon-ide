@@ -43,11 +43,17 @@
 	const diffMode: boolean = $derived(activePath !== null && workspace.diffModeFor(activePath));
 	const activeIsDeleted = $derived(activeFile?.kind === 'text' && activeFile.isDeleted);
 	// "Diff" button is meaningful only when there's something to
-	// diff: a tracked file with working-tree differences (`modified`
-	// or `deleted`). Untracked / added / clean / ignored / image
-	// buffers don't surface it. Deleted buffers are *always* in
-	// diff mode (no editor view exists), so the toggle would just
-	// be a noisy "Source" button that does nothing — hide it too.
+	// diff: a tracked file with working-tree differences
+	// (`modified`). Untracked / added / clean / ignored / image
+	// buffers don't surface it — no `HEAD` side worth rendering.
+	// Deleted buffers don't surface it either: their normal view
+	// is a read-only `Editor` of the HEAD blob (see
+	// `Editor.baseExtensions` and `EditorPane.showDiff`), and
+	// the explicit "View diff" right-click in the file tree is
+	// the path to the side-by-side for the rare "show me HEAD
+	// vs empty" use case — putting the same flip in the tab
+	// toolbar would just be a noisy "Source" button most of the
+	// time.
 	const canDiff = $derived.by(() => {
 		if (activeFile === null || activeFile.kind !== 'text') {
 			return false;

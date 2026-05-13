@@ -20,16 +20,21 @@
 		return workspace.openFiles.find((f) => f.path === activePath) ?? null;
 	});
 	// Diff-view wins over markdown-preview. A buffer hits the diff
-	// pane when it's either:
-	//   - in diff mode (the user toggled it via tab button / palette
-	//     / Ctrl-Shift-D / gutter click — `workspace.diffModes`), or
-	//   - a deleted-file tab (nothing to edit; the HEAD blob shown
-	//     as an against-empty diff is the only sensible view).
+	// pane only when the user has explicitly asked for it — via the
+	// tab toggle, the command palette, `Ctrl-Shift-D`, the gutter
+	// click, or (for `modified` files) a click in the SCM
+	// changes-only tree. Deleted-file tabs used to be force-routed
+	// here on the rationale that "there's no working tree to edit",
+	// but a single read-only Editor showing the HEAD content is
+	// what users actually want for "what was in this file before it
+	// was deleted?" — a side-by-side against an empty pane just
+	// halves the reading space. `Editor.svelte` flips itself
+	// read-only when `file.isDeleted`, so the normal view is safe.
 	const showDiff = $derived.by(() => {
 		if (activeFile === null || activeFile.kind !== 'text') {
 			return false;
 		}
-		return activeFile.isDeleted || workspace.diffModeFor(activeFile.path);
+		return workspace.diffModeFor(activeFile.path);
 	});
 	const showMarkdownPreview = $derived(
 		activeFile !== null &&

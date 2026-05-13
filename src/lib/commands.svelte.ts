@@ -329,9 +329,7 @@ export const builtInCommands: Command[] = [
 	{
 		id: 'git.toggleDiffView',
 		// Title flips with the current mode so the palette entry is
-		// self-describing. Deleted files always render in diff view,
-		// so the command isn't shown for them — there's no toggle
-		// to flip.
+		// self-describing.
 		title: () => {
 			const path = workspace.activePath;
 			return path !== null && workspace.diffModeFor(path) ? 'Git: Hide Diff View' : 'Git: View Diff';
@@ -340,8 +338,12 @@ export const builtInCommands: Command[] = [
 		// Visible when the active file is a **modified** working-
 		// tree change (the only case where there's a meaningful HEAD
 		// vs working tree diff to flip into). Untracked / added /
-		// ignored files have no `HEAD` side. Deleted files are
-		// always in diff view — no toggle needed.
+		// ignored files have no `HEAD` side. Deleted files now
+		// render as a read-only `Editor` of the HEAD blob by
+		// default — the explicit "View diff" right-click in the
+		// file tree is the path to the side-by-side for the rare
+		// "show me HEAD vs empty" case, so the palette command
+		// stays hidden here to keep it focused on the common flow.
 		visible: () => {
 			const path = workspace.activePath;
 			if (path === null) {
