@@ -14,6 +14,32 @@ import type { TerminalTarget } from './protocol';
 const DEFAULT_COLS = 80;
 const DEFAULT_ROWS = 24;
 
+/** Folder path → the bottom-panel terminal id that was active
+ *  the last time the user worked in that folder.
+ *
+ *  Populated by [`rememberActiveTerminalFor`] at folder-switch
+ *  time and consulted by [`ensureActiveFolderTerminal`] before
+ *  it falls back to cwd-matching / spawning. The point is to
+ *  preserve "I had terminal #3 selected in project A when I
+ *  switched away" so the same terminal lights up when the user
+ *  returns to A — not just any terminal whose cwd happens to
+ *  match.
+ *
+ *  Module-local on purpose: the policy lives next to
+ *  `ensureActiveFolderTerminal`, and the only callers are the
+ *  workspace state machine. Not persisted across launches —
+ *  PTYs don't survive a restart and the bottom panel
+ *  deliberately doesn't replay tabs (see `BottomPanelStore`
+ *  comment), so a remembered id would point at nothing on
+ *  next boot.
+ *
+ *  Stale entries (pointing at a since-closed terminal, or at a
+ *  folder that's been unbound) are pruned lazily on read by
+ *  `ensureActiveFolderTerminal`; folder removal calls
+ *  [`forgetTerminalMemoryFor`] eagerly so the map doesn't grow
+ *  without bound across a long session of bind / unbind cycles. */
+const lastTerminalByFolder = new Map<string, string>();
+
 /** Open a host terminal rooted at the active folder
  * (or `$HOME` when no folder is selected). */
 export function openHostTerminal(): void {
@@ -60,19 +86,27 @@ export function containerCwdFor(absolutePath: string): string {
 	return `/workspace/${basename}`;
 }
 
-/** Called after a project (active folder) switch: if the bottom
- * panel is visible and already hosts at least one terminal, make
- * sure the user lands on a terminal rooted in the **new** folder.
+/** Called after a project (active folder) switch *or* an
+ * `openLocal(newFolder)`: if the bottom panel is visible and
+ * already hosts at least one terminal, make sure the user lands
+ * on a terminal rooted in the (now-)active folder.
  *
- * Strategy:
- * 1. Look for a live (non-exited) terminal whose cwd matches the
- *    new folder — either host (`target.cwd === folderPath`) or
- *    container (`target.cwd === containerCwdFor(folderPath)`).
- *    First match wins; we don't care whether it's host or
- *    container, the user's existing setup trumps our default
- *    preference.
- * 2. If none, spawn a fresh one in the preferred mode: container
- *    when the workspace container is up, host otherwise.
+ * Strategy, in order:
+ * 1. **Per-folder memory.** If the user had a terminal selected
+ *    the last time this folder was active and it's still alive,
+ *    re-focus it. Lets you bounce between projects without losing
+ *    "I was in pane #3 over here". Populated by
+ *    [`rememberActiveTerminalFor`] from the workspace state machine
+ *    on the way out of a folder.
+ * 2. **cwd match.** Otherwise, look for any live (non-exited)
+ *    terminal whose cwd matches the active folder — host
+ *    (`target.cwd === folderPath`) or container
+ *    (`target.cwd === containerCwdFor(folderPath)`). First match
+ *    wins; we don't care which mode, the user's existing setup
+ *    trumps our default preference.
+ * 3. **Spawn.** None of the above — open a fresh one in the
+ *    preferred mode: container when the workspace container is
+ *    up, host otherwise.
  *
  * No-op when the panel is hidden or hosts no terminals at all —
  * we don't surprise users who collapsed the strip or only have
@@ -93,6 +127,21 @@ export function ensureActiveFolderTerminal(): void {
 		return;
 	}
 	const folderPath = folder.path;
+	pruneClosedMemoryEntries();
+	const remembered = lastTerminalByFolder.get(folderPath);
+	if (remembered !== undefined) {
+		const tab = tabs.find((t) => t.id === remembered);
+		if (tab && tab.kind === 'terminal') {
+			const session = terminalStore.sessionFor(remembered);
+			if (!session?.closed) {
+				bottomPanel.setActive(remembered);
+				return;
+			}
+		}
+		// Remembered terminal is dead / gone — drop it so the
+		// next lookup falls through cleanly.
+		lastTerminalByFolder.delete(folderPath);
+	}
 	const containerCwd = containerCwdFor(folderPath);
 	const existing = tabs.find((t): t is TerminalTab => {
 		if (t.kind !== 'terminal') {
@@ -119,4 +168,64 @@ export function ensureActiveFolderTerminal(): void {
 		return;
 	}
 	openHostTerminal();
+}
+
+/** Snapshot the bottom panel's currently-active terminal as the
+ *  remembered pick for `folderPath`. Called by the workspace
+ *  state machine right before it flips to a new active folder,
+ *  so the next time the user returns to `folderPath` the same
+ *  terminal lights up.
+ *
+ *  No-op when:
+ *  - `folderPath` is `null` (no folder was active before the
+ *    switch — e.g. the very first folder being bound),
+ *  - the active bottom-panel tab is something else (a log /
+ *    diag tab the user clicked while in this folder); we
+ *    deliberately leave any prior remembered terminal entry
+ *    untouched in that case, on the assumption that the user
+ *    still wants "their terminal" back when they return to
+ *    this folder.
+ *
+ *  Note we don't record on every `bottomPanel.setActive` call:
+ *  doing so would require this module to observe panel state
+ *  and pull in a `$state` subscription. Snapshotting at
+ *  folder-switch time covers the only case where the value is
+ *  actually read (the same folder being re-entered later). */
+export function rememberActiveTerminalFor(folderPath: string | null): void {
+	if (folderPath === null) {
+		return;
+	}
+	const id = bottomPanel.activeId;
+	if (id === null) {
+		return;
+	}
+	const tab = bottomPanel.tabs.find((t) => t.id === id);
+	if (!tab || tab.kind !== 'terminal') {
+		return;
+	}
+	lastTerminalByFolder.set(folderPath, id);
+}
+
+/** Drop the remembered-terminal entry for `folderPath`. Called
+ *  by `WorkspaceState.removeFolder` so unbinding a folder
+ *  doesn't leave a dangling id behind to be lazily pruned
+ *  later. */
+export function forgetTerminalMemoryFor(folderPath: string): void {
+	lastTerminalByFolder.delete(folderPath);
+}
+
+/** Lazy pruning: drop entries whose terminal id no longer
+ *  exists in the panel (closed by the user, supervisor lost
+ *  it, …). Called from `ensureActiveFolderTerminal` so a typical
+ *  read pays at most one O(tabs + entries) sweep. */
+function pruneClosedMemoryEntries(): void {
+	if (lastTerminalByFolder.size === 0) {
+		return;
+	}
+	const alive = new Set(bottomPanel.tabs.filter((t) => t.kind === 'terminal').map((t) => t.id));
+	for (const [folder, id] of lastTerminalByFolder) {
+		if (!alive.has(id)) {
+			lastTerminalByFolder.delete(folder);
+		}
+	}
 }

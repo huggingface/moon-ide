@@ -43,8 +43,10 @@ import { container } from './container.svelte';
 import {
 	canOpenContainerTerminal,
 	ensureActiveFolderTerminal,
+	forgetTerminalMemoryFor,
 	openContainerTerminal,
 	openHostTerminal,
+	rememberActiveTerminalFor,
 } from './openTerminal';
 import { projectCompose } from './projectCompose.svelte';
 import { rightPanel } from './rightPanel.svelte';
@@ -720,6 +722,7 @@ class WorkspaceState {
 	 */
 	async openLocal(path: string) {
 		const beforeCount = this.workspace?.folders.length ?? 0;
+		const previousFolderPath = this.activeFolderPath;
 		try {
 			const ws = await ipc.workspace.openLocal(path);
 			await this.adoptWorkspaceSnapshot(ws);
@@ -739,6 +742,16 @@ class WorkspaceState {
 			// case (no compose.yaml yet) as a free pass, so this is
 			// cheap pre-opt-in.
 			void container.syncBoundFolders();
+			// Mirror the folder-switch terminal routing so adding a
+			// new folder behaves like switching to it: remember the
+			// outgoing folder's selected terminal, then ensure a
+			// shell is ready in the new folder. The new folder has
+			// no prior memory and no cwd match, so this resolves to
+			// "spawn a fresh terminal" — but only when the bottom
+			// panel already hosts a terminal, matching the gate
+			// `ensureActiveFolderTerminal` already enforces.
+			rememberActiveTerminalFor(previousFolderPath);
+			ensureActiveFolderTerminal();
 		} catch (err) {
 			this.flash(`Failed to open: ${formatError(err)}`);
 		}
@@ -753,6 +766,12 @@ class WorkspaceState {
 		if (this.activeFolderPath === path) {
 			return;
 		}
+		// Snapshot the currently-active bottom-panel terminal (if
+		// any) as the remembered pick for the folder we're leaving,
+		// so a later return to that folder restores the same pane
+		// rather than just the first cwd-match. No-op when the user
+		// is on a non-terminal tab or when there's no prior folder.
+		const previousFolderPath = this.activeFolderPath;
 		try {
 			const ws = await ipc.workspace.setActiveFolder(path);
 			await this.adoptWorkspaceSnapshot(ws);
@@ -764,11 +783,13 @@ class WorkspaceState {
 			void this.runGitAutoFetch('folder-switch');
 			// If the bottom panel is open with a terminal, make sure
 			// the user has a shell rooted in the new folder ready to
-			// go — focus an existing matching terminal, or spawn one
-			// in the workspace's preferred mode (container if up,
-			// host otherwise). Hydration paths bypass this method
-			// (they call `ipc.workspace.setActiveFolder` directly),
-			// so this only fires on real user-driven switches.
+			// go — first the per-folder remembered terminal, then a
+			// cwd match, finally a fresh spawn in the workspace's
+			// preferred mode (container if up, host otherwise).
+			// Hydration paths bypass this method (they call
+			// `ipc.workspace.setActiveFolder` directly), so this
+			// only fires on real user-driven switches.
+			rememberActiveTerminalFor(previousFolderPath);
 			ensureActiveFolderTerminal();
 		} catch (err) {
 			this.flash(`Could not switch folder: ${formatError(err)}`);
@@ -813,6 +834,11 @@ class WorkspaceState {
 			// They still show up in `docker compose ls` and can be
 			// torn down by re-binding the folder if needed.
 			projectCompose.forget(path);
+			// Drop any remembered "this folder's preferred terminal"
+			// id eagerly so the lazy-prune sweep in
+			// `ensureActiveFolderTerminal` doesn't have to find it
+			// later. Cheap idempotent delete.
+			forgetTerminalMemoryFor(path);
 			await this.adoptWorkspaceSnapshot(ws);
 			this.persistAppState();
 			// Bound-folder set shrunk: re-emit `compose.yaml` so the
