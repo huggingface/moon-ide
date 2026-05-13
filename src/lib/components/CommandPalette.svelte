@@ -232,7 +232,7 @@
 				     The placeholder mentions both shapes so users
 				     don't have to discover the glob support from
 				     trial and error. -->
-				<div class="row sub-row">
+				<div class="row">
 					<span class="prefix sub-prefix" aria-hidden="true">in</span>
 					<input
 						type="text"
@@ -410,13 +410,13 @@
 	.search-toggle.active:hover {
 		filter: brightness(1.1);
 	}
-	/* Path-include row sits flush under the query row, sharing the
-	   same border-bottom rhythm. `prefix` is repurposed as a "in"
-	   label so the row reads as "search [query] in [path]" without
-	   a second visible field label. */
-	.sub-row {
-		border-top: 1px solid var(--m-border);
-	}
+	/* Path-include row sits flush under the query row. `.row`'s own
+	   `border-bottom` already provides the visual separator
+	   between the two rows, so the sub-row inherits the rest of
+	   the `.row` rhythm without overriding anything. `sub-prefix`
+	   re-uses the prefix slot as a short "in" label so the row
+	   reads as "search [query] in [path]" without needing a
+	   second visible field label. */
 	.sub-prefix {
 		font-family: var(--m-font-mono);
 		font-size: 11px;
