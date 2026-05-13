@@ -51,6 +51,15 @@
 
 	let modelSearch = $state('');
 	let editingTier = $state<'standard' | 'cheap'>('standard');
+
+	// Web-search section state. The Tavily key itself is held
+	// only in the keyring; here we just track whether one is set
+	// (loaded asynchronously on mount) and a draft string the user
+	// is typing in. The draft is discarded the moment the modal
+	// closes — keys never round-trip back through `coder_get_*`.
+	let webKeyDraft = $state('');
+	let webKeySaving = $state(false);
+	let webKeyError = $state<string | null>(null);
 	// Which model row is currently expanded — `null` for "all
 	// collapsed". Single-expansion is on purpose: showing two
 	// open provider tables at once is busy and the picker already
@@ -68,7 +77,39 @@
 		if (coder.routerModels === null) {
 			void coder.loadModels();
 		}
+		void coder.loadWebSearchConfigured();
 	});
+
+	async function onSaveWebKey(): Promise<void> {
+		const trimmed = webKeyDraft.trim();
+		if (trimmed.length === 0) {
+			webKeyError = 'Paste a Tavily API key first.';
+			return;
+		}
+		webKeySaving = true;
+		webKeyError = null;
+		try {
+			await coder.saveWebSearchKey(trimmed);
+			webKeyDraft = '';
+		} catch (err) {
+			webKeyError = err instanceof Error ? err.message : String(err);
+		} finally {
+			webKeySaving = false;
+		}
+	}
+
+	async function onClearWebKey(): Promise<void> {
+		webKeySaving = true;
+		webKeyError = null;
+		try {
+			await coder.clearWebSearchKey();
+			webKeyDraft = '';
+		} catch (err) {
+			webKeyError = err instanceof Error ? err.message : String(err);
+		} finally {
+			webKeySaving = false;
+		}
+	}
 
 	function modelMatches(model: RouterModel, needle: string, tier: 'standard' | 'cheap'): boolean {
 		if (tier === 'standard' && !model.supports_tools_anywhere) {
@@ -422,6 +463,53 @@
 					the OAuth consent screen.
 				</span>
 			</label>
+
+			<!-- Web-search subsection. Separate-but-inline rather than
+				 a second modal because the team has one knob to set
+				 here (a Tavily API key) and the discoverability win
+				 from grouping it with the rest of the agent settings
+				 outweighs the small layout overhead. The key itself
+				 never round-trips back from the keyring; the UI just
+				 knows whether one is set. -->
+			<div class="web-key field">
+				<span class="label-row">
+					<span class="label-name">Web search (Tavily)</span>
+					{#if coder.webSearchConfigured === true}
+						<span class="key-status configured" title="Key stored in OS keyring">key configured</span>
+					{:else if coder.webSearchConfigured === false}
+						<span class="key-status missing">no key</span>
+					{/if}
+				</span>
+				<div class="web-key-row">
+					<input
+						type="password"
+						bind:value={webKeyDraft}
+						placeholder={coder.webSearchConfigured ? 'Paste a new key to replace' : 'tvly-...'}
+						spellcheck="false"
+						autocomplete="off"
+						disabled={webKeySaving}
+					/>
+					<button
+						type="button"
+						class="primary"
+						onclick={onSaveWebKey}
+						disabled={webKeySaving || webKeyDraft.trim().length === 0}
+					>
+						{coder.webSearchConfigured ? 'Replace' : 'Save'}
+					</button>
+					{#if coder.webSearchConfigured === true}
+						<button type="button" class="secondary" onclick={onClearWebKey} disabled={webKeySaving}>Clear</button>
+					{/if}
+				</div>
+				<span class="hint">
+					Enables the <code>web_search</code> tool — Tavily for the SERP, Jina Reader for the page fetch (no second key
+					needed). Get a free key at <code>tavily.com</code>; stored in your OS keyring, never read back into this
+					dialog. Leave blank to disable web search entirely (the model won't see the tool).
+				</span>
+				{#if webKeyError !== null}
+					<span class="error">{webKeyError}</span>
+				{/if}
+			</div>
 		</section>
 
 		<section class="catalog">
@@ -881,5 +969,34 @@
 		margin: 0;
 		font-size: 11px;
 		color: var(--m-error, #d34c4c);
+	}
+	.web-key-row {
+		display: flex;
+		gap: 6px;
+		align-items: stretch;
+	}
+	.web-key-row input {
+		flex: 1 1 auto;
+		min-width: 0;
+	}
+	.web-key-row button {
+		flex: 0 0 auto;
+		padding: 0 12px;
+		font-size: 11px;
+	}
+	.key-status {
+		font-size: 10px;
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+		padding: 1px 6px;
+		border-radius: 3px;
+		border: 1px solid var(--m-border);
+	}
+	.key-status.configured {
+		color: var(--m-success, #38a169);
+		border-color: var(--m-success, #38a169);
+	}
+	.key-status.missing {
+		color: var(--m-fg-muted);
 	}
 </style>

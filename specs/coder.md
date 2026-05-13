@@ -331,6 +331,8 @@ implementations are typed Rust:
 | `grep`           | `(pattern, case_sensitive?, max_matches?) -> { pattern, matches, count, truncated }`                                | `matches` is one hit per line in `path:line: text` form (line is 1-based). Lines longer than 500 chars are capped with a `… [line truncated, N chars total]` marker so a single hit on an inlined base64 image / minified bundle can't blow the context window — the path + line are intact, so `read_file` with `start_line` / `end_line` is the recovery path. The exact line numbers feed back into `read_file`'s `start_line` / `end_line` so the typical loop is `grep` → narrow `read_file` → `edit_file`. Backed by the existing `ignore`/ripgrep dep.                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `bash`           | `(cmd, timeout_ms?) -> { cmd, target, stdout, stderr, exit_code }`                                                  | Routes to `docker exec -w <container_cwd> <name> bash -lc <cmd>` when the workspace shell container's lifecycle status is `Running`, else `bash -lc <cmd>` rooted at the active folder. The decision is made by `tools::resolve_bash_target`, which calls the same `moon_container::Workspace::status()` query `lsp.rs` already uses — so terminals, LSP, and the coder agree on the routing target. `target` field echoes `"host"` / `"container"` so the panel pip and the tool result can't drift. `bash -lc` (not `sh -lc`) because `/bin/sh` is `dash` on most distros: as a login shell `dash` reads only `~/.profile`, but most dev toolchains (rustup, fnm, mise, pyenv) put their PATH-extending env line in `~/.bashrc`. `bash -lc` reads `~/.bash_profile` (which on almost every dev box sources `~/.bashrc`), matching the user's interactive terminal so a command that works in the terminal works in the tool. Trade-off: requires `bash` in the container — already assumed by `moon-terminal`. |
 | `spawn_subagent` | `(task, folder?, mode?, system_prompt?) -> { result, sub_session_id, tokens_used_estimate, mode, iterations_used }` | Delegates a self-contained task to a sub-agent and gets back a single summarised string. `folder` defaults to the parent's active folder. `mode` is `"research"` (read-only intent) or `"agent"` (default; full toolkit, same capabilities as the parent). The sub-agent inherits the parent's everyday driver model — there is no per-call model selector. Multiple `spawn_subagent` calls in one assistant message run in parallel (cap: 4 via `Semaphore`). Sub-agents cannot spawn sub-sub-agents — depth=1 cap is enforced by the parent's tool list including `spawn_subagent` while the sub-agent's does not. Available **only** to the top-level parent turn.                                                                                                                                                                                                                                                                                                                                            |
+| `web_search`     | `(query, max_results?) -> { query, results, count }`                                                                | Open-web search via Tavily. `results` is a list of `{ title, url, snippet, published_date? }` entries sorted by Tavily's relevance ranking. `max_results` defaults to 8 and is capped at 20. Only advertised to the model when a Tavily API key is configured (model-settings popover → Web search); without a key the tool is hidden from the definitions list so the model never sees an unusable tool. See [§ Web search](#web-search).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `web_fetch`      | `(url) -> { url, markdown, truncated, bytes }`                                                                      | Fetch a single page and return Jina Reader's markdown extraction. `http`/`https` only; other schemes rejected at the boundary. Body capped at 200 kB — past that, `truncated: true` and the tail is dropped. Always available (Jina's free tier needs no key). Sub-agents in both modes can call it — fetching docs is read-only, no mutation risk. See [§ Web search](#web-search).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 
 Tools that arrive **as separate commits when proven needed**, not
 in the initial slice:
@@ -430,6 +432,72 @@ the missing input — "rename it across the codebase or just
 locally?", "delete the old file or keep it for compat?". The
 prompt explicitly discourages "should I proceed?"-style polling
 because that turns the agent into a confirmation maze.
+
+### Web search
+
+Two tools, both pure outbound HTTP from the IDE process — no
+`WorkspaceHost` involvement (there's no workspace to touch).
+
+**`web_search(query, max_results?)`** routes through Tavily's
+SERP API and returns `{ title, url, snippet, published_date? }`
+entries. We picked Tavily over Brave / Serper / Exa because (a)
+its JSON shape is clean and stable, (b) the free tier covers 1k
+searches / month per user — enough for an interactive editor
+agent — and (c) it's the option that consistently shows up in
+LLM-agent benchmarks, so future models will already know how to
+use it well. Per-user key, stored in the OS keyring at
+`service=moon-ide, account=coder-web-search:tavily`. The tool is
+**only advertised to the model when a key is configured** — no
+point telling the agent about a tool that's guaranteed to error.
+
+**`web_fetch(url)`** routes through
+[Jina Reader](https://jina.ai/reader) (`https://r.jina.ai/<url>`)
+and returns clean markdown extracted from the page. No key
+needed for the free tier (60 RPM, ample for the agent's actual
+fetch rate). Picked over an in-process HTML→markdown extractor
+because (a) it's literally one `reqwest::get` and zero deps, and
+(b) extraction quality is consistently good across SPAs / doc
+sites / blogs that an embedded `readability` port would handle
+badly. `http`/`https` only; other schemes rejected at the entry
+point. Body capped at 200 kB to keep a huge page from monopolising
+the agent's context window — past that, `truncated: true` and
+the model knows to fetch a more specific sub-page rather than
+re-fetch the same URL.
+
+**Why two tools, not one.** The agent decides for itself whether
+the snippets in the SERP answered the question or whether a full
+read is worth the tokens; we don't preemptively expand every
+result. This is closer to how a human Googles than to a "search
+and synthesise" black box, and the auto-compaction machine already
+handles the "context too big after a few `web_fetch`es" failure
+mode for free. We deliberately do **not** insert a cheap-model
+summarisation step between Jina and the agent — that introduces
+non-determinism (the summariser drops nuance) and extra latency
+for a problem we don't actually have.
+
+**Mode gating.** Neither tool is mode-gated. A Research sub-agent
+reading the open web is exactly the kind of read-only inspection
+the mode exists for. The mutating-tool gate (`write_file` /
+`edit_file`) still applies — `web_search` and `web_fetch` are
+strictly read-only against the world, just like `read_file` is
+strictly read-only against the workspace.
+
+**Failure shape.** Errors map to `CoderError::ToolFailed` and
+flow back to the model as `is_error: true` results. Tavily's
+verbatim error body (`{"detail": "Invalid API key"}`,
+`{"detail": "quota exceeded"}`) is preserved in the surfaced
+message so the user sees what to fix when they look at the
+tool-call card in the transcript.
+
+**UI.** The Tavily key is set / cleared in the model-settings
+popover ("Web search" section). The key itself never round-trips
+back from the keyring; the popover just knows whether one is
+configured. Tool results render through dedicated tool-body
+components (`ToolBodyWebSearch`, `ToolBodyWebFetch`): the SERP
+shows one card per hit with clickable title → system browser
+via `tauri-plugin-opener`; the fetch result renders the page's
+markdown through the same `CoderMarkdown` pipeline an assistant
+reply uses, with a clickable URL header.
 
 ### Error model
 

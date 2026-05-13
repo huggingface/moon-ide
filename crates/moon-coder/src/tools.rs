@@ -33,6 +33,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::CoderError;
 use crate::inference::ToolDefinition;
+use crate::web::WebClient;
 
 /// Hard cap on `bash` runtime — keeps a runaway tool call from
 /// burning the LLM's budget waiting for a hung process. Matches the
@@ -115,22 +116,32 @@ impl ToolContext {
 
 /// Tools are dispatched by name. The registry holds the JSON-schema
 /// descriptors handed to the LLM, the workspace registry the runtime
-/// needs to resolve container state for `bash`, and the workspaces
+/// needs to resolve container state for `bash`, the workspaces
 /// state-dir parent so `bash` can ask `moon-container` whether the
-/// workspace shell container is running. The per-call folder + mode
-/// arrive via [`ToolContext`] on each [`dispatch`](Self::dispatch).
+/// workspace shell container is running, and the shared [`WebClient`]
+/// the web search / fetch tools dispatch through. The per-call folder
+/// + mode arrive via [`ToolContext`] on each [`dispatch`](Self::dispatch).
 #[derive(Clone)]
 pub struct ToolRegistry {
 	workspaces: Arc<WorkspaceRegistry>,
 	workspaces_dir: Utf8PathBuf,
+	web: WebClient,
 }
 
 impl ToolRegistry {
-	pub fn new(workspaces: Arc<WorkspaceRegistry>, workspaces_dir: Utf8PathBuf) -> Self {
+	pub fn new(workspaces: Arc<WorkspaceRegistry>, workspaces_dir: Utf8PathBuf, web: WebClient) -> Self {
 		Self {
 			workspaces,
 			workspaces_dir,
+			web,
 		}
+	}
+
+	/// Shared [`WebClient`]. Exposed so the Tauri command layer can
+	/// expose the keyring-backed Tavily key surface (status / set /
+	/// clear) without needing its own keyring entry.
+	pub fn web(&self) -> &WebClient {
+		&self.web
 	}
 
 	/// Build a [`ToolContext`] from the workspace's current active
@@ -240,8 +251,13 @@ impl ToolRegistry {
 	}
 
 	/// Tool definitions to advertise to the model on every chat call.
+	///
+	/// `web_search` is gated on a configured Tavily API key: with no
+	/// key the model never sees the definition, so it can't be tempted
+	/// to call a tool that's guaranteed to error. `web_fetch` is
+	/// always advertised — Jina Reader's free tier needs no key.
 	pub fn definitions(&self) -> Vec<ToolDefinition> {
-		vec![
+		let mut defs = vec![
 			ToolDefinition::function(
 				"read_file",
 				"Read the contents of a file in any currently-bound workspace folder. Returns the file's text, with each line prefixed by `<line_number>|<line>`. Treat the prefix as metadata — it is not part of the file. Optional `start_line` / `end_line` (1-based, inclusive) read just a slice; both omitted means read the whole file (capped at 200 kB).",
@@ -362,7 +378,42 @@ impl ToolRegistry {
 					"required": ["path", "find", "replace"]
 				}),
 			),
-		]
+			ToolDefinition::function(
+				"web_fetch",
+				"Fetch a single web page and return its main content as clean Markdown. Backed by Jina Reader — strips boilerplate, preserves headings / links / code blocks. Use this to read documentation, blog posts, RFCs, release notes, or any URL surfaced by `web_search`. Only `http`/`https` URLs are accepted. Long pages are truncated at ~200 kB; if `truncated` is true, fetch a more specific sub-page rather than re-fetching the same URL.",
+				json!({
+					"type": "object",
+					"properties": {
+						"url": {
+							"type": "string",
+							"description": "Absolute http or https URL to fetch."
+						}
+					},
+					"required": ["url"]
+				}),
+			),
+		];
+		if self.web.has_tavily_key() {
+			defs.push(ToolDefinition::function(
+				"web_search",
+				"Search the open web. Returns a small list of `{ title, url, snippet }` entries (plus `published_date` when known) sorted by Tavily's relevance ranking. Use this when you need information that might be missing or outdated in your training data — recent releases, API docs you don't already know, error messages quoted online, news, package changelogs. After picking a promising URL, call `web_fetch` on it for the full page. Don't use `web_search` for facts you're confident about, and don't use it for anything inside the workspace — that's what `grep` / `read_file` / `bash` are for.",
+				json!({
+					"type": "object",
+					"properties": {
+						"query": {
+							"type": "string",
+							"description": "Free-form search query, same way you'd type into a search engine. Be specific — include version numbers, language names, error message fragments."
+						},
+						"max_results": {
+							"type": "integer",
+							"description": "Maximum number of results to return. Defaults to 8; capped at 20."
+						}
+					},
+					"required": ["query"]
+				}),
+			));
+		}
+		defs
 	}
 
 	pub async fn dispatch(
@@ -394,6 +445,11 @@ impl ToolRegistry {
 				}
 				self.edit_file(args, cx).await
 			}
+			// Web tools are intentionally *not* mode-gated: a
+			// Research sub-agent reading the open web is exactly
+			// the kind of read-only inspection the mode exists for.
+			"web_search" => self.web_search(args, cancel).await,
+			"web_fetch" => self.web_fetch(args, cancel).await,
 			other => Err(CoderError::UnknownTool(other.to_string())),
 		}
 	}
@@ -580,6 +636,41 @@ impl ToolRegistry {
 			"occurrence": plan.occurrence,
 			"total_matches": plan.total_matches,
 			"match_mode": plan.mode,
+		}))
+	}
+
+	async fn web_search(&self, args: &Value, cancel: &CancellationToken) -> Result<Value, CoderError> {
+		#[derive(Deserialize)]
+		struct WebSearchArgs {
+			query: String,
+			#[serde(default)]
+			max_results: Option<u32>,
+		}
+		let parsed: WebSearchArgs =
+			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("web_search", err.to_string()))?;
+		let max_results = parsed.max_results.unwrap_or_else(WebClient::default_search_max_results);
+		let results = self.web.search(&parsed.query, max_results, cancel).await?;
+		let count = results.len();
+		Ok(json!({
+			"query": parsed.query,
+			"results": results,
+			"count": count,
+		}))
+	}
+
+	async fn web_fetch(&self, args: &Value, cancel: &CancellationToken) -> Result<Value, CoderError> {
+		#[derive(Deserialize)]
+		struct WebFetchArgs {
+			url: String,
+		}
+		let parsed: WebFetchArgs =
+			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("web_fetch", err.to_string()))?;
+		let fetched = self.web.fetch(&parsed.url, cancel).await?;
+		Ok(json!({
+			"url": fetched.url,
+			"markdown": fetched.markdown,
+			"truncated": fetched.truncated,
+			"bytes": fetched.markdown.len(),
 		}))
 	}
 
@@ -1653,7 +1744,8 @@ mod tests {
 				registry.add_folder(p.to_path_buf()).await.unwrap();
 			}
 			let workspaces_dir = Utf8PathBuf::from(paths[0].parent().unwrap_or(camino::Utf8Path::new("/tmp")));
-			let tool_registry = ToolRegistry::new(registry.clone(), workspaces_dir);
+			let web = crate::web::WebClient::new().expect("web client builds in tests");
+			let tool_registry = ToolRegistry::new(registry.clone(), workspaces_dir, web);
 			(registry, tool_registry)
 		}
 

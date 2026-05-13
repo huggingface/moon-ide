@@ -12,6 +12,8 @@
 	import ToolBodyGrep from './ToolBodyGrep.svelte';
 	import ToolBodyListDir from './ToolBodyListDir.svelte';
 	import ToolBodyReadFile from './ToolBodyReadFile.svelte';
+	import ToolBodyWebFetch from './ToolBodyWebFetch.svelte';
+	import ToolBodyWebSearch from './ToolBodyWebSearch.svelte';
 	import ToolBodyWriteFile from './ToolBodyWriteFile.svelte';
 	import TerminalTargetIcon from './TerminalTargetIcon.svelte';
 	import ContextRing from './ContextRing.svelte';
@@ -966,6 +968,21 @@
 						 `node_modules`-style listing doesn't push the
 						 transcript page-tall. -->
 					<ToolBodyListDir args={row.args} result={row.result} hasResult={row.hasResult} />
+				{:else if row.name === 'web_search'}
+					<!-- SERP view: query in a chip, result count in the
+						 meta line, then one card per hit with title,
+						 URL, and snippet. Clicking the title opens
+						 the URL in the host's default browser via
+						 `tauri-plugin-opener`. -->
+					<ToolBodyWebSearch args={row.args} result={row.result} hasResult={row.hasResult} />
+				{:else if row.name === 'web_fetch'}
+					<!-- Page-content view: URL header (clickable to
+						 open in browser) + Jina-extracted markdown
+						 rendered through the same pipeline an
+						 assistant message uses. Truncation flag in
+						 the header when the body was lopped at the
+						 200 kB cap. -->
+					<ToolBodyWebFetch args={row.args} result={row.result} hasResult={row.hasResult} />
 				{:else}
 					<div class="block-label">args</div>
 					<pre class="block">{fmtArgs(row.args)}</pre>

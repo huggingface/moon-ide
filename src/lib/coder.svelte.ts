@@ -316,6 +316,51 @@ class CoderPanelState {
 		}
 	}
 
+	/** True iff a Tavily API key is stored in the keyring. Tracked
+	 *  so the model-settings popover can render the right state
+	 *  (set / configured / clearing) without a keyring round-trip
+	 *  every keystroke. `null` until the popover (or another
+	 *  consumer) calls [`loadWebSearchConfigured`] for the first
+	 *  time — distinguishes "we don't know yet" from "we know:
+	 *  not configured". */
+	webSearchConfigured = $state<boolean | null>(null);
+
+	/** Refresh [`webSearchConfigured`] from the runner. Safe to
+	 *  call repeatedly. */
+	async loadWebSearchConfigured(): Promise<void> {
+		try {
+			this.webSearchConfigured = await ipc.coder.webSearchConfigured();
+		} catch (err) {
+			this.modelsError = formatError(err);
+		}
+	}
+
+	/** Persist a new Tavily API key. Throws on validation failure
+	 *  (empty key) so the popover can keep the form open + show the
+	 *  message inline. */
+	async saveWebSearchKey(key: string): Promise<void> {
+		try {
+			await ipc.coder.setWebSearchKey(key);
+			this.webSearchConfigured = true;
+			this.modelsError = null;
+		} catch (err) {
+			this.modelsError = formatError(err);
+			throw err;
+		}
+	}
+
+	/** Drop the Tavily key. Idempotent. */
+	async clearWebSearchKey(): Promise<void> {
+		try {
+			await ipc.coder.clearWebSearchKey();
+			this.webSearchConfigured = false;
+			this.modelsError = null;
+		} catch (err) {
+			this.modelsError = formatError(err);
+			throw err;
+		}
+	}
+
 	/** Cached "Bound folders" descriptions populated by
 	 *  `folder_summary_ready` events. Folder absolute path →
 	 *  description text. Used by the project-bar tooltip

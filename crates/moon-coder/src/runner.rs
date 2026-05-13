@@ -315,7 +315,8 @@ impl CoderHandle {
 		let auth = Authenticator::new()?;
 		let models = models::shared(initial_models);
 		let inference = InferenceClient::new(auth.clone(), models.clone())?;
-		let tools = ToolRegistry::new(workspaces.clone(), workspaces_dir.clone());
+		let web = crate::web::WebClient::new()?;
+		let tools = ToolRegistry::new(workspaces.clone(), workspaces_dir.clone(), web);
 		let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 		let folder_summaries = Arc::new(FolderSummaryService::new(folder_summaries_dir));
 		Ok(Self {
@@ -332,6 +333,31 @@ impl CoderHandle {
 				models,
 			}),
 		})
+	}
+
+	/// True iff a Tavily API key is currently stored in the
+	/// keyring. The panel reads this on the model-settings popover
+	/// to flip the web-search section between "set a key" and
+	/// "key configured · clear / replace" states. Cheap sync read
+	/// of the in-memory cache — no keyring round-trip.
+	pub fn web_search_configured(&self) -> bool {
+		self.state.tools.web().has_tavily_key()
+	}
+
+	/// Persist a new Tavily API key in the OS keyring. Empty /
+	/// whitespace-only values are rejected at the [`crate::web::WebClient`]
+	/// boundary. After this returns Ok, [`web_search_configured`]
+	/// flips to `true` and the next turn advertises `web_search` in
+	/// the tool list.
+	pub fn set_web_search_key(&self, key: &str) -> Result<(), CoderError> {
+		self.state.tools.web().set_tavily_key(key)
+	}
+
+	/// Drop the keyring entry. Idempotent. After this returns Ok,
+	/// `web_search` disappears from the tool list on the next
+	/// turn.
+	pub fn clear_web_search_key(&self) -> Result<(), CoderError> {
+		self.state.tools.web().clear_tavily_key()
 	}
 
 	/// Hot-swap the user-facing model picks. Only `standard`,

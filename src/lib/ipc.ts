@@ -268,6 +268,9 @@ export const ipc = {
 		getModelSettings: () => invoke<CoderModelSettings>('coder_get_model_settings'),
 		setModelSettings: (settings: CoderModelSettings) => invoke<void>('coder_set_model_settings', { settings }),
 		listModels: () => invoke<RouterModel[]>('coder_list_models'),
+		webSearchConfigured: () => invoke<boolean>('coder_web_search_configured'),
+		setWebSearchKey: (key: string) => invoke<void>('coder_set_web_search_key', { key }),
+		clearWebSearchKey: () => invoke<void>('coder_clear_web_search_key'),
 	},
 	ui: {
 		setRightPanel: (kind: RightPanelKind | null) => invoke<void>('ui_set_right_panel', { kind }),

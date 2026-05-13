@@ -297,3 +297,26 @@ pub async fn coder_set_model_settings(
 pub async fn coder_list_models(state: State<'_, AppState>) -> Result<Vec<RouterModel>, MoonError> {
 	state.coder.list_models().await.map_err(MoonError::from)
 }
+
+/// `true` iff a Tavily API key is stored in the OS keyring. The
+/// model-settings popover reads this on mount so it can render the
+/// "set a key" / "key configured" state correctly. Cheap sync read
+/// of the in-memory cache — no keyring round-trip.
+#[tauri::command]
+pub async fn coder_web_search_configured(state: State<'_, AppState>) -> Result<bool, MoonError> {
+	Ok(state.coder.web_search_configured())
+}
+
+/// Persist a new Tavily API key. Trimmed at the runner; empty
+/// values are rejected. After this returns Ok, the next agent
+/// turn will see `web_search` in its tool list.
+#[tauri::command]
+pub async fn coder_set_web_search_key(state: State<'_, AppState>, key: String) -> Result<(), MoonError> {
+	state.coder.set_web_search_key(&key).map_err(MoonError::from)
+}
+
+/// Drop the Tavily key from the keyring. Idempotent.
+#[tauri::command]
+pub async fn coder_clear_web_search_key(state: State<'_, AppState>) -> Result<(), MoonError> {
+	state.coder.clear_web_search_key().map_err(MoonError::from)
+}

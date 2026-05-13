@@ -212,6 +212,9 @@ pub fn run() {
 			commands::coder::coder_get_model_settings,
 			commands::coder::coder_set_model_settings,
 			commands::coder::coder_list_models,
+			commands::coder::coder_web_search_configured,
+			commands::coder::coder_set_web_search_key,
+			commands::coder::coder_clear_web_search_key,
 			commands::ui::ui_set_right_panel,
 		])
 		.setup(move |app| {

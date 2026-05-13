@@ -27,6 +27,7 @@ pub mod runner;
 pub mod sessions;
 pub mod subagent;
 pub mod tools;
+pub mod web;
 
 pub use auth::{Authenticator, DeviceCode, HfIdentity, HfOrg, TokenStore};
 pub use defaults::{DEFAULT_CHEAP_MODEL, DEFAULT_STANDARD_MODEL, HF_OAUTH_CLIENT_ID, HF_OAUTH_SCOPES};
@@ -39,3 +40,4 @@ pub use runner::{Coder, CoderHandle};
 pub use sessions::SessionSummary;
 pub use subagent::{Subagent, SubagentReport};
 pub use tools::{CoderMode, ToolContext, ToolRegistry};
+pub use web::{WebClient, WebFetchResult, WebSearchResult};
