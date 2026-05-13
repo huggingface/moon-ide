@@ -14,12 +14,20 @@
 		if (typeof a !== 'object' || a === null) {
 			return null;
 		}
-		const o = a as { path?: unknown; find?: unknown; replace?: unknown; occurrence?: unknown };
-		if (typeof o.path !== 'string' || typeof o.find !== 'string' || typeof o.replace !== 'string') {
+		const o = a as {
+			path?: unknown;
+			file_path?: unknown;
+			file?: unknown;
+			find?: unknown;
+			replace?: unknown;
+			occurrence?: unknown;
+		};
+		const pathRaw = o.path ?? o.file_path ?? o.file;
+		if (typeof pathRaw !== 'string' || typeof o.find !== 'string' || typeof o.replace !== 'string') {
 			return null;
 		}
 		return {
-			path: o.path,
+			path: pathRaw,
 			find: o.find,
 			replace: o.replace,
 			occurrence: typeof o.occurrence === 'number' ? o.occurrence : null,

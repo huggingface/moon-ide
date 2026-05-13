@@ -457,6 +457,7 @@ impl ToolRegistry {
 	async fn read_file(&self, args: &Value, cx: &ToolContext) -> Result<Value, CoderError> {
 		#[derive(Deserialize)]
 		struct ReadFileArgs {
+			#[serde(alias = "file_path", alias = "file")]
 			path: String,
 			#[serde(default)]
 			start_line: Option<u32>,
@@ -596,6 +597,7 @@ impl ToolRegistry {
 	async fn edit_file(&self, args: &Value, cx: &ToolContext) -> Result<Value, CoderError> {
 		#[derive(Deserialize)]
 		struct EditFileArgs {
+			#[serde(alias = "file_path", alias = "file")]
 			path: String,
 			find: String,
 			replace: String,

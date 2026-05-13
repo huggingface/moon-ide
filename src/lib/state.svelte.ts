@@ -2535,7 +2535,8 @@ class WorkspaceState {
 	 * `null` when the tool isn't path-shaped (`bash`, `grep`,
 	 * unknown), or when the path argument is missing — those flip
 	 * the fan-out bit. `read_file` / `list_dir` / `write_file` /
-	 * `edit_file` with a `path` argument always resolve to *some*
+	 * `edit_file` with a path-shaped argument (`path`, or compat-only
+	 * `file_path` / `file` on `read_file` / `edit_file`) always resolve to *some*
 	 * bound folder, falling back to the originating session's
 	 * folder for unrouted relative paths.
 	 */
@@ -2549,7 +2550,16 @@ class WorkspaceState {
 			return null;
 		}
 		const args = ev.args;
-		const raw = args && typeof args === 'object' && 'path' in args && typeof args.path === 'string' ? args.path : null;
+		let raw: string | null = null;
+		if (args && typeof args === 'object') {
+			const o = args;
+			if (tool === 'read_file' || tool === 'edit_file') {
+				const p = o.path ?? o.file_path ?? o.file;
+				raw = typeof p === 'string' ? p : null;
+			} else {
+				raw = typeof o.path === 'string' ? o.path : null;
+			}
+		}
 		if (!raw) {
 			return null;
 		}

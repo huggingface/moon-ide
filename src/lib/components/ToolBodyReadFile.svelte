@@ -22,12 +22,13 @@
 		if (typeof a !== 'object' || a === null) {
 			return null;
 		}
-		const o = a as { path?: unknown; start_line?: unknown; end_line?: unknown };
-		if (typeof o.path !== 'string') {
+		const o = a as { path?: unknown; file_path?: unknown; file?: unknown; start_line?: unknown; end_line?: unknown };
+		const pathRaw = o.path ?? o.file_path ?? o.file;
+		if (typeof pathRaw !== 'string') {
 			return null;
 		}
 		return {
-			path: o.path,
+			path: pathRaw,
 			startLine: typeof o.start_line === 'number' ? o.start_line : null,
 			endLine: typeof o.end_line === 'number' ? o.end_line : null,
 		};

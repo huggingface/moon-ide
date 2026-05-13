@@ -1,17 +1,17 @@
 <script lang="ts">
-	// Two-button popover that opens a new terminal — host or
-	// container. Reused from the bottom-panel strip and the
-	// status bar (anywhere a "+ Terminal" entry point makes
-	// sense). Picks sensible defaults from current workspace
+	// Host/container terminal launcher. When the workspace
+	// container is running, trigger opens a two-item menu;
+	// when not, trigger opens a host terminal directly.
+	// Reused from the bottom-panel strip and the status bar.
+	// Picks sensible defaults from current workspace
 	// state:
 	//
 	//   * Host terminal cwd = active folder's host path; `null`
 	//     (= `$HOME`) when no folder is bound.
 	//   * Container terminal cwd = `/workspace/<basename>` for
-	//     the active folder, `/workspace` as a fallback. The
-	//     container button is disabled when the workspace
-	//     container isn't running, with a tooltip that points
-	//     at the status bar's pip.
+	//     the active folder, `/workspace` as a fallback. If the
+	//     container stops while the menu is open, "In container"
+	//     becomes disabled.
 	//
 	// Architecture: ADR 0009.
 
@@ -42,6 +42,10 @@
 	const activeFolder = $derived(workspace.activeFolder);
 
 	function toggle() {
+		if (!containerRunning) {
+			openHostTerminal();
+			return;
+		}
 		open = !open;
 	}
 

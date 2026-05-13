@@ -61,6 +61,12 @@
 	// of `buildMerge`. Cleared on teardown so we don't leak DOM
 	// listeners across diff-view remounts.
 	let detachHScrollSync: (() => void) | null = null;
+	// Cleanup for the per-side sticky synthetic horizontal
+	// scrollbars. Same lifecycle as the sync above — created in
+	// `buildMerge` after the MergeView mounts, torn down on
+	// teardown / rebuild.
+	let detachStickyHbarA: (() => void) | null = null;
+	let detachStickyHbarB: (() => void) | null = null;
 
 	// Compartments are per-side: each `EditorView` inside the
 	// MergeView owns its own EditorState and can't share a Compartment
@@ -105,6 +111,10 @@
 			buildToken++;
 			detachHScrollSync?.();
 			detachHScrollSync = null;
+			detachStickyHbarA?.();
+			detachStickyHbarA = null;
+			detachStickyHbarB?.();
+			detachStickyHbarB = null;
 			merge?.destroy();
 			merge = undefined;
 			// Drop any selection snapshot the right pane published
@@ -365,6 +375,10 @@
 		// in case the build path grows a rebuild branch later.
 		detachHScrollSync?.();
 		detachHScrollSync = null;
+		detachStickyHbarA?.();
+		detachStickyHbarA = null;
+		detachStickyHbarB?.();
+		detachStickyHbarB = null;
 
 		merge = new MergeView({
 			a: { doc: head, extensions: sharedLeft },
@@ -424,6 +438,8 @@
 		});
 
 		detachHScrollSync = wireHorizontalScrollSync(merge.a.scrollDOM, merge.b.scrollDOM);
+		detachStickyHbarA = attachStickyHScrollbar(merge.a.scrollDOM, merge.a.dom);
+		detachStickyHbarB = attachStickyHScrollbar(merge.b.scrollDOM, merge.b.dom);
 
 		const chunks = merge.chunks;
 		if (chunks.length > 0 && !file.isDeleted) {
@@ -669,6 +685,104 @@
 	}
 
 	/**
+	 * Per-side sticky synthetic horizontal scrollbar.
+	 *
+	 * `@codemirror/merge` lays the inner `.cm-scroller`s out at
+	 * natural (doc) height so the outer `.cm-mergeView` can drive
+	 * a single aligned vertical scroll across both sides. A side
+	 * effect: each `.cm-scroller`'s native horizontal scrollbar
+	 * lives at the bottom edge of that doc-tall element, which
+	 * is far below the viewport for any non-trivial file. The
+	 * user only sees the bar after scrolling all the way to the
+	 * doc bottom, and CodeMirror's `.cm-panels-bottom` (Ctrl+F
+	 * search panel) had the same problem until we relaxed
+	 * `.cm-mergeViewEditor`'s overflow in CSS.
+	 *
+	 * The search panel already carries `position: sticky;
+	 * bottom: 0` from CodeMirror's base theme, so relaxing
+	 * overflow alone fixes it. The native horizontal scrollbar
+	 * isn't a CSS element we can relocate, so we hide it
+	 * (`scrollbar-width: none`) and render a synthetic bar
+	 * sticky-bottom inside each column. The bar's inner spacer
+	 * matches `scrollWidth`; bidirectional `scrollLeft` mirroring
+	 * keeps the synthetic and the underlying scroller in lockstep.
+	 *
+	 * `--diff-hbar-h` is set on the column so the sibling search
+	 * panel can sit just above the bar (see `.cm-panels-bottom`
+	 * rule in the style block) — when no horizontal overflow
+	 * exists we collapse the bar to zero so the panel sits flush
+	 * with the mergeView's bottom edge.
+	 */
+	function attachStickyHScrollbar(scroller: HTMLElement, editorDom: HTMLElement): () => void {
+		const column = editorDom.parentElement;
+		if (column === null) {
+			return () => {};
+		}
+		const bar = document.createElement('div');
+		bar.className = 'diff-hscrollbar-sticky';
+		const fill = document.createElement('div');
+		fill.className = 'diff-hscrollbar-fill';
+		bar.appendChild(fill);
+		column.appendChild(bar);
+
+		let syncing = false;
+		const updateGeometry = () => {
+			const sw = scroller.scrollWidth;
+			const cw = scroller.clientWidth;
+			fill.style.width = `${sw}px`;
+			const hasOverflow = sw > cw + 1;
+			bar.style.display = hasOverflow ? 'block' : 'none';
+			// Reserve vertical space above the bar for the
+			// (already-sticky) Ctrl+F panel so they don't overlap.
+			column.style.setProperty('--diff-hbar-h', hasOverflow ? '14px' : '0px');
+		};
+		const onBarScroll = () => {
+			if (syncing) {
+				return;
+			}
+			if (bar.scrollLeft === scroller.scrollLeft) {
+				return;
+			}
+			syncing = true;
+			scroller.scrollLeft = bar.scrollLeft;
+			requestAnimationFrame(() => {
+				syncing = false;
+			});
+		};
+		const onScrollerScroll = () => {
+			if (syncing) {
+				return;
+			}
+			if (scroller.scrollLeft === bar.scrollLeft) {
+				return;
+			}
+			syncing = true;
+			bar.scrollLeft = scroller.scrollLeft;
+			requestAnimationFrame(() => {
+				syncing = false;
+			});
+		};
+		bar.addEventListener('scroll', onBarScroll, { passive: true });
+		scroller.addEventListener('scroll', onScrollerScroll, { passive: true });
+
+		const content = scroller.querySelector('.cm-content');
+		const ro = new ResizeObserver(updateGeometry);
+		ro.observe(scroller);
+		if (content !== null) {
+			ro.observe(content);
+		}
+		updateGeometry();
+
+		return () => {
+			bar.removeEventListener('scroll', onBarScroll);
+			scroller.removeEventListener('scroll', onScrollerScroll);
+			ro.disconnect();
+			bar.remove();
+			column.style.removeProperty('--diff-hbar-h');
+		};
+	}
+
+	/**
 	 * Mirror of `Editor.svelte`'s `publishSelection` for the diff
 	 * view's right-hand (working-tree) editor. Same line-trimming
 	 * heuristic — when the user's drag ends at a line's `from`,
@@ -737,8 +851,63 @@
 	.diff-host :global(.cm-editor.cm-focused) {
 		outline: none;
 	}
+	/* The merge package ships `.cm-mergeViewEditor { overflow: hidden }`,
+	 * which makes each column its own scroll container (even though
+	 * nothing actually scrolls there — overflow:hidden still
+	 * registers as one). That hijacks `position: sticky` for
+	 * descendants: CodeMirror's `.cm-panels.cm-panels-bottom` (the
+	 * Ctrl+F search panel) and our synthetic horizontal scrollbar
+	 * both want to stick to `.cm-mergeView`'s viewport, but they
+	 * end up attaching to this hidden box and sit at the column's
+	 * natural bottom (= bottom of the doc-tall editor). Relaxing
+	 * the overflow lets the sticky chain walk past the column up
+	 * to `.cm-mergeView`'s overflow-y:auto, which is the actual
+	 * scroll container. Horizontal clipping is still done by the
+	 * inner `.cm-scroller` (overflow-x: auto), so we don't get any
+	 * visual leak from removing the column's clip. */
 	.diff-host :global(.cm-mergeViewEditor) {
 		min-width: 0;
+		overflow: visible;
+	}
+	/* CodeMirror sets `position: sticky; bottom: 0` on `.cm-panels`
+	 * via inline style (see `panels.syncDOM` in @codemirror/view).
+	 * Override the inline `0` to make room for our sticky synthetic
+	 * horizontal scrollbar below so they don't stack at the same
+	 * viewport row. `--diff-hbar-h` is set by `attachStickyHScrollbar`
+	 * — 14px while a horizontal scrollbar is needed, 0 otherwise.
+	 * `!important` is required to beat the inline style. */
+	.diff-host :global(.cm-panels.cm-panels-bottom) {
+		bottom: var(--diff-hbar-h, 0px) !important;
+	}
+	/* Hide the native horizontal scrollbar — the synthetic
+	 * sticky bar below replaces it at viewport bottom. Mouse-
+	 * wheel / touch horizontal scrolling still works on the
+	 * scroller; only the chrome moves. */
+	.diff-host :global(.cm-scroller) {
+		scrollbar-width: none;
+	}
+	.diff-host :global(.cm-scroller::-webkit-scrollbar) {
+		display: none;
+	}
+	/* Sticky synthetic horizontal scrollbar. Lives inside
+	 * `.cm-mergeViewEditor` (sibling of `.cm-editor`); because
+	 * the column is now overflow:visible (above), sticky here
+	 * attaches to `.cm-mergeView` and pins to its viewport
+	 * bottom while the user scrolls. The inner `.diff-hscrollbar-fill`
+	 * is sized to match the underlying `.cm-scroller`'s
+	 * `scrollWidth` so the synthetic bar's thumb tracks the
+	 * actual content. */
+	.diff-host :global(.diff-hscrollbar-sticky) {
+		position: sticky;
+		bottom: 0;
+		height: 14px;
+		overflow-x: auto;
+		overflow-y: hidden;
+		z-index: 4;
+		background: var(--m-bg);
+	}
+	.diff-host :global(.diff-hscrollbar-fill) {
+		height: 1px;
 	}
 	/* Character-level change marker: the library default is a 2px
 	 * bottom-edge gradient, which (a) reads as a loud underline on
