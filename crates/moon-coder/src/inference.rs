@@ -697,9 +697,17 @@ where
 	Ok(finalize_response(content_buf, thinking_buf, tool_call_bufs, usage))
 }
 
-/// Working state for one in-progress tool call. The model emits the
-/// `id` + `name` once and then streams `arguments` as a JSON-encoded
-/// string in arbitrary slices; we glue them back together here.
+/// Working state for one in-progress tool call. Only `arguments` is
+/// genuinely delta-streamed (the provider chunks the JSON-encoded
+/// argument string into arbitrary slices); `id`, `kind`, and `name`
+/// are *set-once* identifiers. The OpenAI-compatible chat-completions
+/// SSE schema doesn't strictly require these to appear on the first
+/// chunk only, and providers routed through HF Inference vary in
+/// practice — some send `id` once, others re-emit the full value on
+/// every chunk for idempotence. Concatenating those re-sends would
+/// bloat the call `id` to hundreds of KB and re-feed the bloated id
+/// on every subsequent prompt, so the accumulator overwrites rather
+/// than appends.
 #[derive(Debug, Default)]
 struct ToolCallBuffer {
 	id: String,
@@ -732,14 +740,20 @@ fn accumulate_chunk(
 		}
 		let slot = &mut tool_calls[tc.index];
 		if let Some(id) = tc.id.as_deref() {
-			slot.id.push_str(id);
+			if !id.is_empty() {
+				id.clone_into(&mut slot.id);
+			}
 		}
 		if let Some(kind) = tc.kind.as_deref() {
-			slot.kind = kind.to_string();
+			if !kind.is_empty() {
+				kind.clone_into(&mut slot.kind);
+			}
 		}
 		if let Some(func) = tc.function.as_ref() {
 			if let Some(name) = func.name.as_deref() {
-				slot.name.push_str(name);
+				if !name.is_empty() {
+					name.clone_into(&mut slot.name);
+				}
 			}
 			if let Some(args) = func.arguments.as_deref() {
 				slot.arguments.push_str(args);
@@ -960,6 +974,50 @@ mod tests {
 		assert_eq!(resp.tool_calls[0].id, "call_x");
 		assert_eq!(resp.tool_calls[0].function.name, "read_file");
 		assert_eq!(resp.tool_calls[0].function.arguments, r#"{"path":"foo.rs"}"#);
+	}
+
+	#[test]
+	fn accumulate_chunk_set_once_for_id_and_name_when_provider_re_emits() {
+		// Some providers routed through HF Inference re-send the
+		// full `id` (and sometimes `name`) on every delta chunk for
+		// idempotence, not just the first. A naive `push_str`
+		// accumulator concatenates them and ships >100 KB tool-call
+		// ids back to the model on the next iteration — confirmed
+		// in the field on real sessions. Pin the set-once
+		// behaviour: id, type, and name overwrite; only arguments
+		// accumulate.
+		let id_chunk = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"write_file","arguments":""}}]}}]}"#;
+		let arg_chunk_with_id = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"write_file","arguments":"a"}}]}}]}"#;
+		let mut content = String::new();
+		let mut thinking = String::new();
+		let mut tcs = Vec::new();
+		// One initial chunk plus a thousand follow-up chunks each
+		// re-emitting the full id/name alongside one byte of args.
+		let chunk: StreamChunk = serde_json::from_str(id_chunk).unwrap();
+		accumulate_chunk(&chunk, &mut content, &mut thinking, &mut tcs);
+		for _ in 0..1000 {
+			let chunk: StreamChunk = serde_json::from_str(arg_chunk_with_id).unwrap();
+			accumulate_chunk(&chunk, &mut content, &mut thinking, &mut tcs);
+		}
+		let resp = finalize_response(content, thinking, tcs, None);
+		assert_eq!(resp.tool_calls.len(), 1);
+		assert_eq!(
+			resp.tool_calls[0].id, "call_x",
+			"id must not concatenate across re-emits"
+		);
+		assert_eq!(
+			resp.tool_calls[0].function.name, "write_file",
+			"name must not concatenate across re-emits"
+		);
+		assert_eq!(
+			resp.tool_calls[0].kind, "function",
+			"type must not concatenate across re-emits"
+		);
+		assert_eq!(
+			resp.tool_calls[0].function.arguments.len(),
+			1000,
+			"arguments is the only field that should accumulate"
+		);
 	}
 
 	#[test]
