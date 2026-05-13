@@ -159,13 +159,13 @@ What ships:
   container's runtime state and is always `Local` today. The
   signal we want is "did the user click Set up / Resume?", which
   is `ContainerStatus.state == Running`.
-- Container path: `docker exec -w <container_cwd> <name> bash -lc <cmd>`,
+- Container path: `docker exec -w <container_cwd> <name> bash -c <cmd>`,
   using `moon_terminal::container_name_for_workspace` and
   `TerminalTarget::container_cwd_for_folder` so terminals, LSP,
   and the coder all agree on the framing. No `-it` (we want
-  captured I/O, not a TTY). `bash` (not `sh`) so the tool's PATH
-  matches the user's interactive terminal — see `coder.md` for
-  the trap that motivated the switch.
+  captured I/O, not a TTY). Container uses non-login `bash -c` so
+  moon-base `ENV PATH` survives Debian `/etc/profile` — see
+  `coder.md`. Host path stays `bash -lc`.
 - `CoderStatus.bash_target: "host" | "container" | null` mirrors
   the bash tool result's `target` field. The frontend listens to
   the `container:state` Tauri event and re-probes status on

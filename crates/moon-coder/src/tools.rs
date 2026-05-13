@@ -324,7 +324,7 @@ impl ToolRegistry {
 					"properties": {
 						"cmd": {
 							"type": "string",
-							"description": "Shell command, executed via `bash -lc <cmd>`."
+							"description": "Shell command. Host: `bash -lc <cmd>`. Workspace shell container: `docker exec … bash -c <cmd>` so moon-base `ENV PATH` (fnm, cargo, bun, …) is preserved."
 						},
 						"timeout_ms": {
 							"type": "integer",
@@ -737,24 +737,31 @@ impl ToolRegistry {
 	/// panel header / `CoderStatus.bash_target` advertises:
 	///
 	/// - **Container** (workspace shell container is `Running`):
-	///   `docker exec -w <container_cwd> <name> bash -lc <cmd>`.
+	///   `docker exec -w <container_cwd> <name> bash -c <cmd>`.
 	///   Reuses `moon_terminal::container_name_for_workspace` +
 	///   `TerminalTarget::container_cwd_for_folder` so the framing
 	///   matches terminals and LSP exactly.
+	///
+	///   **`bash -c` here (not `-lc`).** moon-base sets toolchain
+	///   PATH segments via Dockerfile `ENV`. A login shell reads
+	///   Debian `/etc/profile`, which resets `PATH` before project
+	///   hooks run; non-interactive shells skip `~/.bashrc`, so fnm's
+	///   eval never restores Node — yet `docker exec … bash` (PTY
+	///   terminals) is interactive and does load `~/.bashrc`. Using a
+	///   non-login shell inherits the container env verbatim and
+	///   matches what `node`, `cargo`, etc. expect from the image.
 	/// - **Host** (otherwise): `bash -lc <cmd>` rooted at the folder.
 	///
-	/// **Why `bash -lc` and not `sh -lc`.** On most modern Linuxes
-	/// `/bin/sh` is `dash`, which as a login shell reads only
-	/// `~/.profile`. Most dev toolchains (rustup, fnm, mise,
-	/// pyenv, …) put their PATH-extending env line in `~/.bashrc`
-	/// — sometimes additionally in `~/.profile`, often not.
-	/// Result: `sh -lc 'cargo …'` returns "cargo: not found" even
-	/// though the user's interactive terminal has cargo on PATH.
-	/// `bash -lc` reads `~/.bash_profile` (which on almost every
-	/// dev box sources `~/.bashrc`), so the tool's PATH matches
-	/// the terminal's. Trade-off: requires `bash` to exist in the
-	/// container — true for every dev image we care about, since
-	/// terminals (`moon-terminal::target`) already assume it.
+	/// **Why host uses `bash -lc` and not `sh -lc`.** On most modern
+	/// Linuxes `/bin/sh` is `dash`, which as a login shell reads only
+	/// `~/.profile`. Most host toolchains (rustup, mise, pyenv, …)
+	/// extend PATH from `~/.bashrc` — sometimes additionally in
+	/// `~/.profile`, often not. Result: `sh -lc 'cargo …'` returns
+	/// "cargo: not found" even though the user's interactive terminal
+	/// has cargo on PATH. `bash -lc` reads `~/.bash_profile` (which on
+	/// almost every dev box sources `~/.bashrc`). Trade-off: requires
+	/// `bash` in the container — true for moon-base, since terminals
+	/// (`moon-terminal::target`) already assume it.
 	async fn build_bash_command(
 		&self,
 		folder: &WorkspaceFolderEntry,
@@ -779,7 +786,7 @@ impl ToolRegistry {
 				.arg(container_cwd.as_str())
 				.arg(&container_name)
 				.arg("bash")
-				.arg("-lc")
+				.arg("-c")
 				.arg(cmd);
 			return Ok((command, BASH_TARGET_CONTAINER));
 		}

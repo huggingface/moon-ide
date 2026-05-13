@@ -20,12 +20,13 @@ mtime_ms }`. Path-traversal outside the workspace folder is
   supported in this phase" line is gone.
 - 6.2 sub-phase split in [`phase-06-coder.md`](../roadmaps/phase-06-coder.md):
   mutating tools and container-aware bash both land here.
-- `bash` tool now routes through `docker exec -w <container_cwd>
-<name> sh -lc <cmd>` whenever the workspace shell container is
+- `bash` tool routes through `docker exec -w <container_cwd>
+<name> bash -c <cmd>` whenever the workspace shell container is
   `Running` (queried via `moon_container::Workspace::status()` —
   the same call `lsp.rs::resolve_target` makes, so terminals,
-  LSP, and the coder share one source of truth). Result carries
-  a `target` field (`"host"` / `"container"`).
+  LSP, and the coder share one source of truth); host stays
+  `bash -lc <cmd>`. Result carries a `target` field (`"host"` /
+  `"container"`).
 - Panel header has a monitor / container glyph next to the
   username (reuses `TerminalTargetIcon`). Surfaces from
   `CoderStatus.bash_target`; re-probes on `container:state`
