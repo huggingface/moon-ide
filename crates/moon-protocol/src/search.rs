@@ -28,6 +28,23 @@ pub struct ContentSearchOptions {
 	pub case_sensitive: bool,
 	#[serde(default)]
 	pub regex: bool,
+	/// When true, the query only matches at word boundaries. Stacks with
+	/// `regex`: in regex mode we wrap the pattern with `\b…\b`; in plain
+	/// mode we escape first, then wrap. Mirrors VS Code's `Aa | \b | .*`
+	/// toggle trio in the search input.
+	#[serde(default)]
+	pub whole_word: bool,
+	/// Restrict the walk to paths matching this filter (relative to the
+	/// workspace root, gitignore-style globs). `None` / empty means
+	/// "search everything". A bare path like `src/lib` is normalised to
+	/// `src/lib/**` so users don't have to remember glob syntax for the
+	/// common "scope to a subdirectory" case; anything containing a
+	/// glob metacharacter (`*`, `?`, `[`, `]`, `!`) is passed through
+	/// to the `ignore` crate's `OverrideBuilder` verbatim, so users
+	/// who do know globs can write `**/*.svelte` or `!**/snapshots/**`
+	/// and have it Just Work.
+	#[serde(default)]
+	pub include_glob: Option<String>,
 	/// Cap to keep the UI responsive. The first `max_matches` matches are
 	/// returned and the rest is reported back via `truncated = true`.
 	#[serde(default = "default_max_matches")]

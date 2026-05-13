@@ -41,6 +41,20 @@ class PaletteState {
 	contentTruncated = $state(false);
 	loading = $state(false);
 
+	// Per-session search toggles, mirroring VS Code's `Aa | \b | .*`
+	// trio plus a path-scope input. They live on the palette state
+	// (not on `WorkspaceState`) so the user's choices survive
+	// closing-and-reopening the palette during one IDE session but
+	// don't bleed into other windows. No persistence across IDE
+	// launches yet — wait for someone to ask.
+	searchCaseSensitive = $state(false);
+	searchWholeWord = $state(false);
+	searchRegex = $state(false);
+	/** Gitignore-style glob restricting the walk. Empty string =
+	 *  "no scope filter". Bare paths like `src/lib` are normalised
+	 *  to `src/lib/**` server-side. */
+	searchInclude = $state('');
+
 	show(mode: PaletteMode, initialQuery = '') {
 		this.mode = mode;
 		this.query = initialQuery;
@@ -56,6 +70,22 @@ class PaletteState {
 
 	setQuery(q: string) {
 		this.query = q;
+	}
+
+	setSearchInclude(value: string) {
+		this.searchInclude = value;
+	}
+
+	toggleSearchCaseSensitive() {
+		this.searchCaseSensitive = !this.searchCaseSensitive;
+	}
+
+	toggleSearchWholeWord() {
+		this.searchWholeWord = !this.searchWholeWord;
+	}
+
+	toggleSearchRegex() {
+		this.searchRegex = !this.searchRegex;
 	}
 }
 
@@ -442,7 +472,15 @@ export async function runContentSearch(query: string) {
 	}
 	palette.loading = true;
 	try {
-		const result = await ipc.search.content({ query, max_matches: 200 });
+		const include = palette.searchInclude.trim();
+		const result = await ipc.search.content({
+			query,
+			case_sensitive: palette.searchCaseSensitive,
+			whole_word: palette.searchWholeWord,
+			regex: palette.searchRegex,
+			include_glob: include.length === 0 ? null : include,
+			max_matches: 200,
+		});
 		palette.contentResults = result.hits;
 		palette.contentTruncated = result.truncated;
 	} catch (err) {

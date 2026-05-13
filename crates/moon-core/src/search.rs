@@ -30,10 +30,48 @@ const FILE_SEARCH_MIN_SCORE: i64 = 0;
 /// `.git/info/exclude` are still respected via
 /// `WalkBuilder::git_ignore(true)` / `git_exclude(true)` — this
 /// override only patches the one case those features can't cover.
-fn build_overrides(root: &Utf8Path) -> Override {
+///
+/// `include_glob`, when provided, layers an *inclusion* override on
+/// top: anything not matching the user's glob is filtered out at
+/// walk time (the `ignore` crate short-circuits whole subtrees, so
+/// the speedup is real on `target/`-laden repos). Invalid globs are
+/// dropped with a `tracing::warn!` and the search runs unfiltered —
+/// breaking the search UI on a typo is worse than silently widening
+/// the scope.
+fn build_overrides(root: &Utf8Path, include_glob: Option<&str>) -> Override {
 	let mut builder = OverrideBuilder::new(root.as_std_path());
 	let _ = builder.add("!.git/");
+	if let Some(raw) = include_glob {
+		let trimmed = raw.trim();
+		if !trimmed.is_empty() {
+			let normalised = normalise_include_glob(trimmed);
+			if let Err(err) = builder.add(&normalised) {
+				tracing::warn!(
+					%err,
+					original = trimmed,
+					normalised = %normalised,
+					"invalid include_glob; running search without an include filter"
+				);
+			}
+		}
+	}
 	builder.build().unwrap_or_else(|_| Override::empty())
+}
+
+/// Convert the user's "scope to a path" input into a gitignore-style
+/// pattern the `ignore` crate accepts. Patterns containing a glob
+/// metacharacter (`*`, `?`, `[`, `]`) or a `!` negation are passed
+/// through verbatim — the user already knows what they're doing. A
+/// bare path (`src/lib`, `crates/moon-coder/`) is expanded to
+/// `<path>/**` so it actually matches files *under* that directory
+/// rather than only a sibling literally named that string.
+fn normalise_include_glob(raw: &str) -> String {
+	let has_glob = raw.bytes().any(|b| matches!(b, b'*' | b'?' | b'[' | b']' | b'!'));
+	if has_glob {
+		return raw.to_string();
+	}
+	let trimmed = raw.trim_end_matches('/');
+	format!("{trimmed}/**")
 }
 
 pub fn search_files(root: &Utf8Path, opts: &FileSearchOptions) -> MoonResult<Vec<FileSearchResult>> {
@@ -50,7 +88,7 @@ pub fn search_files(root: &Utf8Path, opts: &FileSearchOptions) -> MoonResult<Vec
 		.git_ignore(true)
 		.git_exclude(true)
 		.ignore(true)
-		.overrides(build_overrides(root))
+		.overrides(build_overrides(root, None))
 		.build();
 
 	for entry in walker.flatten() {
@@ -134,16 +172,27 @@ pub fn search_content(root: &Utf8Path, opts: &ContentSearchOptions) -> MoonResul
 		});
 	}
 
-	let pattern = if opts.regex {
+	let raw_pattern = if opts.regex {
 		query.to_string()
 	} else {
 		regex_syntax::escape(query)
 	};
+	// `\b` word boundaries wrap the *final* pattern, after the user's
+	// regex / escape has been applied. That way `whole_word=true` stays
+	// composable: in plain mode it word-bounds the literal; in regex
+	// mode it word-bounds the user's pattern (`\bfoo|bar\b` is the
+	// caller's call to make if they want grouping, but `(?:...)`
+	// isn't worth automating from the toggle).
+	let bounded_pattern = if opts.whole_word {
+		format!(r"\b(?:{raw_pattern})\b")
+	} else {
+		raw_pattern
+	};
 
 	let matcher = if opts.case_sensitive {
-		RegexMatcher::new(&pattern)
+		RegexMatcher::new(&bounded_pattern)
 	} else {
-		RegexMatcher::new(&format!("(?i){pattern}"))
+		RegexMatcher::new(&format!("(?i){bounded_pattern}"))
 	}
 	.map_err(|e| MoonError::invalid(format!("invalid regex: {e}")))?;
 
@@ -157,7 +206,7 @@ pub fn search_content(root: &Utf8Path, opts: &ContentSearchOptions) -> MoonResul
 		.git_ignore(true)
 		.git_exclude(true)
 		.ignore(true)
-		.overrides(build_overrides(root))
+		.overrides(build_overrides(root, opts.include_glob.as_deref()))
 		.build();
 
 	'outer: for entry in walker.flatten() {
@@ -254,9 +303,8 @@ mod tests {
 
 		let opts = ContentSearchOptions {
 			query: "hello".into(),
-			case_sensitive: false,
-			regex: false,
 			max_matches: 100,
+			..Default::default()
 		};
 		let r = search_content(&root(&dir), &opts).unwrap();
 		assert_eq!(r.hits.len(), 2);
@@ -295,9 +343,8 @@ mod tests {
 
 		let opts = ContentSearchOptions {
 			query: "needle".into(),
-			case_sensitive: false,
-			regex: false,
 			max_matches: 100,
+			..Default::default()
 		};
 		let r = search_content(&root(&dir), &opts).unwrap();
 		assert!(
@@ -339,9 +386,8 @@ mod tests {
 
 		let opts = ContentSearchOptions {
 			query: "unique".into(),
-			case_sensitive: false,
-			regex: false,
 			max_matches: 100,
+			..Default::default()
 		};
 		let r = search_content(&root(&dir), &opts).unwrap();
 		assert!(
@@ -362,6 +408,134 @@ mod tests {
 	}
 
 	#[test]
+	fn content_search_whole_word_filters_substring_hits() {
+		// `whole_word: true` should match `print` standalone but not
+		// `println` / `imprinted`. Both case-sensitive and case-
+		// insensitive paths must respect the boundary.
+		let dir = TempDir::new().unwrap();
+		std::fs::write(
+			dir.path().join("a.txt"),
+			"print here\nprintln also here\nimprinted again\n",
+		)
+		.unwrap();
+
+		let opts = ContentSearchOptions {
+			query: "print".into(),
+			whole_word: true,
+			..Default::default()
+		};
+		let r = search_content(&root(&dir), &opts).unwrap();
+		assert_eq!(
+			r.hits.len(),
+			1,
+			"whole-word should drop println / imprinted: {:?}",
+			r.hits
+		);
+		assert_eq!(r.hits[0].line, 1);
+	}
+
+	#[test]
+	fn content_search_whole_word_composes_with_regex_pattern() {
+		// In regex mode the user's pattern gets wrapped in `\b(?:..)\b`,
+		// so `foo|bar` with whole-word matches `foo` and `bar` as
+		// words but not `foobar`.
+		let dir = TempDir::new().unwrap();
+		std::fs::write(dir.path().join("a.txt"), "foo bar\nfoobar\n").unwrap();
+
+		let opts = ContentSearchOptions {
+			query: "foo|bar".into(),
+			regex: true,
+			whole_word: true,
+			..Default::default()
+		};
+		let r = search_content(&root(&dir), &opts).unwrap();
+		// Line 1 has two whole-word matches (`foo` then `bar`); line 2
+		// has zero. We collect at most one hit per line in the current
+		// sink shape, so the assertion is "line 1 only".
+		assert!(
+			r.hits.iter().all(|h| h.line == 1),
+			"whole-word regex leaked into foobar: {:?}",
+			r.hits
+		);
+		assert!(
+			!r.hits.is_empty(),
+			"whole-word regex dropped the real matches: {:?}",
+			r.hits
+		);
+	}
+
+	#[test]
+	fn content_search_include_glob_scopes_to_subdirectory() {
+		// Bare path scoping is the common case users actually reach
+		// for: "search only inside crates/moon-core/". We normalise it
+		// to `<path>/**` so a hit in a sibling directory drops out.
+		let dir = TempDir::new().unwrap();
+		std::fs::create_dir_all(dir.path().join("crates/moon-core")).unwrap();
+		std::fs::create_dir_all(dir.path().join("crates/moon-protocol")).unwrap();
+		std::fs::write(dir.path().join("crates/moon-core/foo.rs"), "needle here\n").unwrap();
+		std::fs::write(dir.path().join("crates/moon-protocol/bar.rs"), "needle there\n").unwrap();
+		std::fs::write(dir.path().join("README.md"), "needle outside\n").unwrap();
+
+		let opts = ContentSearchOptions {
+			query: "needle".into(),
+			include_glob: Some("crates/moon-core".into()),
+			..Default::default()
+		};
+		let r = search_content(&root(&dir), &opts).unwrap();
+		assert!(
+			r.hits.iter().all(|h| h.path.starts_with("crates/moon-core/")),
+			"include_glob leaked into siblings: {:?}",
+			r.hits
+		);
+		assert!(
+			!r.hits.is_empty(),
+			"include_glob dropped every legitimate hit: {:?}",
+			r.hits
+		);
+	}
+
+	#[test]
+	fn content_search_include_glob_passes_explicit_globs_through() {
+		// `**/*.svelte` (or any pattern with a glob metacharacter)
+		// goes to the override builder verbatim — the user knows
+		// what they want.
+		let dir = TempDir::new().unwrap();
+		std::fs::create_dir_all(dir.path().join("src")).unwrap();
+		std::fs::write(dir.path().join("src/Foo.svelte"), "needle in svelte\n").unwrap();
+		std::fs::write(dir.path().join("src/foo.ts"), "needle in ts\n").unwrap();
+
+		let opts = ContentSearchOptions {
+			query: "needle".into(),
+			include_glob: Some("**/*.svelte".into()),
+			..Default::default()
+		};
+		let r = search_content(&root(&dir), &opts).unwrap();
+		assert!(
+			r.hits.iter().all(|h| h.path.ends_with(".svelte")),
+			"include_glob `**/*.svelte` should only match .svelte: {:?}",
+			r.hits
+		);
+		assert_eq!(r.hits.len(), 1);
+	}
+
+	#[test]
+	fn content_search_invalid_include_glob_falls_back_to_unfiltered() {
+		// Rather than failing the search outright, a bad glob (e.g.
+		// an unterminated bracket expression) should warn and run the
+		// search without an include filter. Breaking the search UI
+		// on a typo is the worse failure mode.
+		let dir = TempDir::new().unwrap();
+		std::fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
+		let opts = ContentSearchOptions {
+			query: "needle".into(),
+			include_glob: Some("[".into()),
+			..Default::default()
+		};
+		let r = search_content(&root(&dir), &opts).unwrap();
+		assert_eq!(r.hits.len(), 1);
+	}
+
+	#[test]
 	fn content_search_visits_files_past_old_default_cap() {
 		// Regression: a previous default `max_files = 1000` silently
 		// bailed out of the walk before reaching anything past the
@@ -376,9 +550,8 @@ mod tests {
 
 		let opts = ContentSearchOptions {
 			query: "ReadRepoContent".into(),
-			case_sensitive: false,
-			regex: false,
 			max_matches: 500,
+			..Default::default()
 		};
 		let r = search_content(&root(&dir), &opts).unwrap();
 		assert_eq!(r.hits.len(), 1);

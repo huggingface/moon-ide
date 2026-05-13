@@ -561,6 +561,7 @@ impl ToolRegistry {
 			case_sensitive: parsed.case_sensitive,
 			regex: true,
 			max_matches: parsed.max_matches.unwrap_or(200) as usize,
+			..Default::default()
 		};
 		let result = tokio::task::spawn_blocking(move || moon_core::search::search_content(&root, &options))
 			.await

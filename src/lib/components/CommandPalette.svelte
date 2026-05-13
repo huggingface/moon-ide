@@ -24,12 +24,26 @@
 	});
 
 	// Search modes hit the backend; debounce so we don't spam Rust.
+	// Flipping any of the search-mode toggles (case, whole-word,
+	// regex, include filter) refires the search against the current
+	// query — same debounce window as a keystroke, so a rapid
+	// "type word, then click `Aa`" sequence collapses to one round-
+	// trip rather than two.
 	$effect(() => {
 		if (!palette.open) {
 			return;
 		}
 		const q = palette.query;
 		const mode = palette.mode;
+		// Read these here so Svelte tracks them as dependencies of
+		// this effect; the actual values are picked up off
+		// `palette.*` inside `runContentSearch` when the timer
+		// fires. The `void` discards keep oxlint happy without
+		// adding a noisy intermediate.
+		void palette.searchCaseSensitive;
+		void palette.searchWholeWord;
+		void palette.searchRegex;
+		void palette.searchInclude;
 		if (mode === 'commands') {
 			return;
 		}
@@ -167,10 +181,68 @@
 					oninput={(e) => palette.setQuery(e.currentTarget.value)}
 					onkeydown={onKey}
 				/>
+				{#if palette.mode === 'search'}
+					<!-- VS Code-style toggle trio sitting at the end of the
+					     search input. Each button is press-and-stay
+					     (aria-pressed); flipping any of them refires the
+					     search through the effect above. The buttons live
+					     on the same row as the input — they're small
+					     enough not to crowd the query, and they read as
+					     "options for *this* search" rather than as a
+					     separate toolbar. -->
+					<div class="search-toggles" aria-label="Search options">
+						<button
+							type="button"
+							class="search-toggle"
+							class:active={palette.searchCaseSensitive}
+							title="Match case (Aa)"
+							aria-label="Match case"
+							aria-pressed={palette.searchCaseSensitive}
+							onclick={() => palette.toggleSearchCaseSensitive()}>Aa</button
+						>
+						<button
+							type="button"
+							class="search-toggle"
+							class:active={palette.searchWholeWord}
+							title="Match whole word"
+							aria-label="Match whole word"
+							aria-pressed={palette.searchWholeWord}
+							onclick={() => palette.toggleSearchWholeWord()}>ab|</button
+						>
+						<button
+							type="button"
+							class="search-toggle"
+							class:active={palette.searchRegex}
+							title="Use regular expression"
+							aria-label="Use regular expression"
+							aria-pressed={palette.searchRegex}
+							onclick={() => palette.toggleSearchRegex()}>.*</button
+						>
+					</div>
+				{/if}
 				{#if palette.loading}
 					<span class="loading">…</span>
 				{/if}
 			</div>
+			{#if palette.mode === 'search'}
+				<!-- Second-row include filter: empty means "search
+				     everywhere", a bare path scopes to that subtree
+				     (server-side normalises `src/lib` → `src/lib/**`),
+				     and globs like `**/*.svelte` pass through verbatim.
+				     The placeholder mentions both shapes so users
+				     don't have to discover the glob support from
+				     trial and error. -->
+				<div class="row sub-row">
+					<span class="prefix sub-prefix" aria-hidden="true">in</span>
+					<input
+						type="text"
+						placeholder="Path or glob (e.g. src/lib or **/*.svelte) — leave blank for entire workspace"
+						value={palette.searchInclude}
+						oninput={(e) => palette.setSearchInclude(e.currentTarget.value)}
+						onkeydown={onKey}
+					/>
+				</div>
+			{/if}
 			<ul class="results" role="listbox">
 				{#if palette.mode === 'commands'}
 					{#each commandList as cmd, i (cmd.id)}
@@ -291,6 +363,65 @@
 	}
 	.loading {
 		color: var(--m-fg-subtle);
+	}
+	/* Compact toggle trio at the trailing edge of the search input.
+	   Each button is a single-line glyph (`Aa`, `ab|`, `.*`) so the
+	   row stays uncluttered; pressed state mirrors the SCM panel's
+	   "active pill" vocabulary — accent fill with the panel bg as
+	   the contrasting text — so the cluster reads consistently
+	   alongside the rest of the chrome. */
+	.search-toggles {
+		display: flex;
+		align-items: center;
+		gap: 2px;
+		flex-shrink: 0;
+	}
+	.search-toggle {
+		appearance: none;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		min-width: 24px;
+		height: 22px;
+		padding: 0 4px;
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		background: transparent;
+		color: var(--m-fg-muted);
+		font: inherit;
+		font-family: var(--m-font-mono, monospace);
+		font-size: 11px;
+		line-height: 1;
+		cursor: pointer;
+	}
+	.search-toggle:hover {
+		background: var(--m-bg-3);
+		color: var(--m-fg);
+	}
+	.search-toggle:focus-visible {
+		outline: 1px solid var(--m-accent);
+		outline-offset: -1px;
+	}
+	.search-toggle.active {
+		background: var(--m-accent);
+		border-color: var(--m-accent);
+		color: var(--m-bg);
+	}
+	.search-toggle.active:hover {
+		filter: brightness(1.1);
+	}
+	/* Path-include row sits flush under the query row, sharing the
+	   same border-bottom rhythm. `prefix` is repurposed as a "in"
+	   label so the row reads as "search [query] in [path]" without
+	   a second visible field label. */
+	.sub-row {
+		border-top: 1px solid var(--m-border);
+	}
+	.sub-prefix {
+		font-family: var(--m-font-mono);
+		font-size: 11px;
+		text-transform: lowercase;
+		opacity: 0.7;
 	}
 	.results {
 		list-style: none;

@@ -119,6 +119,13 @@ export type ContentSearchOptions = {
 	query: string;
 	case_sensitive?: boolean;
 	regex?: boolean;
+	/** Only match at word boundaries. Stacks with `regex`. */
+	whole_word?: boolean;
+	/** Restrict the walk to paths matching this gitignore-style glob.
+	 *  Empty / undefined means "search everything". A bare path (`src/lib`)
+	 *  is normalised to `src/lib/**` server-side, so users don't need to
+	 *  know glob syntax for the common "scope to subdirectory" case. */
+	include_glob?: string | null;
 	max_matches?: number;
 };
 
