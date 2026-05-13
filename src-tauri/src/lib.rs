@@ -212,6 +212,13 @@ pub fn run() {
 			commands::coder::coder_get_model_settings,
 			commands::coder::coder_set_model_settings,
 			commands::coder::coder_list_models,
+			commands::coder::coder_list_provider_models,
+			commands::coder::coder_new_provider_id,
+			commands::coder::coder_probe_provider,
+			commands::coder::coder_save_provider,
+			commands::coder::coder_delete_provider,
+			commands::coder::coder_set_provider_api_key,
+			commands::coder::coder_clear_provider_api_key,
 			commands::coder::coder_web_search_configured,
 			commands::coder::coder_set_web_search_key,
 			commands::coder::coder_clear_web_search_key,
@@ -332,12 +339,15 @@ pub fn run() {
 			workspace_registry.set_shell_resolver(moon_core::ShellResolverHandle::new(shell_resolver));
 
 			// Seed the coder with the user's persisted model picks
-			// + `bill_to`. Empty strings on the protocol side
-			// resolve to the hardcoded defaults inside
-			// `CoderModels::standard()` / `cheap()` / `bill_to()`;
-			// frontend stores wire-format slugs (with optional
-			// `:provider` suffix) so the runner doesn't have to
-			// concatenate suffixes at request time.
+			// + `bill_to` + user-added providers. Empty slugs on
+			// the protocol side resolve to the hardcoded defaults
+			// inside `CoderModels::standard()` / `cheap()` /
+			// `bill_to()`; frontend stores wire-format slugs (with
+			// optional `:provider` suffix) so the runner doesn't
+			// have to concatenate suffixes at request time. The
+			// `has_api_key` flag on each provider is overwritten
+			// inside `CoderHandle::new` from the keyring — we don't
+			// trust whatever was on disk.
 			let initial_coder_models = moon_coder::CoderModels {
 				standard: loaded_state.coder.standard_model.clone(),
 				cheap: loaded_state.coder.cheap_model.clone(),
@@ -346,6 +356,8 @@ pub fn run() {
 				} else {
 					Some(loaded_state.coder.bill_to.clone())
 				},
+				providers: loaded_state.coder.providers.clone(),
+				active_provider: loaded_state.coder.active_provider.clone(),
 				..moon_coder::CoderModels::default()
 			};
 			let coder = CoderHandle::new(

@@ -1,9 +1,20 @@
-//! HF Inference Providers HTTP client.
+//! Inference HTTP client.
 //!
-//! OpenAI-compatible API surface against
-//! `https://router.huggingface.co/v1`. Authentication uses the OAuth
-//! access token from [`crate::auth::Authenticator`]; the client wraps
-//! its own `reqwest::Client` and refreshes-on-401 automatically.
+//! OpenAI-compatible API surface. Two routing modes:
+//!
+//! - **Hugging Face** (default): `https://router.huggingface.co/v1`,
+//!   OAuth access token from [`crate::auth::Authenticator`] with
+//!   refresh-on-401, and `X-HF-Bill-To` on every request.
+//! - **Custom OpenAI-compatible** (OpenRouter, local vLLM / Ollama /
+//!   llama.cpp, …): user-supplied `base_url`, optional
+//!   `Bearer <api_key>` drawn from
+//!   [`crate::providers::ProviderKeyring`], no bill-to. No
+//!   automatic refresh — a 401 from a user provider means the key
+//!   is wrong / revoked and the user has to fix it in the picker.
+//!
+//! The route is resolved off [`SharedCoderModels::resolve_route`]
+//! once per request, so a settings flip mid-turn applies on the
+//! very next call.
 //!
 //! Both the non-streaming `chat_completion` and the streaming
 //! `chat_completion_stream` paths exist. The runner uses the
@@ -19,7 +30,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::auth::Authenticator;
 use crate::defaults::HF_ROUTER_BASE;
 use crate::error::CoderError;
-use crate::models::SharedCoderModels;
+use crate::models::{ResolvedProvider, SharedCoderModels};
+use crate::providers::ProviderKeyring;
 
 /// Some providers (DeepInfra at least) serialize "this chunk has no
 /// tool calls" as `tool_calls: null` instead of just omitting the
@@ -291,20 +303,49 @@ struct FunctionCallDelta {
 }
 
 /// Inference HTTP client. Cheap to clone; the underlying
-/// `reqwest::Client` does its own connection pooling. Holds a
-/// reference to the [`SharedCoderModels`] handle so every request
-/// reads the current `bill_to` setting without the runner having to
-/// thread it through each call site.
+/// `reqwest::Client` does its own connection pooling. Holds
+/// references to:
+///
+/// - [`Authenticator`] for HF OAuth tokens (refresh-on-401),
+/// - [`SharedCoderModels`] for the active route + `bill_to`,
+/// - [`ProviderKeyring`] for per-provider API keys.
+///
+/// Every request reads the active route fresh off [`SharedCoderModels`]
+/// so a settings flip mid-turn applies to the very next round-trip.
 #[derive(Clone)]
 pub struct InferenceClient {
 	http: reqwest::Client,
 	auth: Authenticator,
-	base_url: String,
+	/// HF default override, only consulted when the resolved route
+	/// is [`ResolvedProvider::HuggingFace`]. Tests inject a mock
+	/// router here via [`Self::with_hf_base_url`]; the production
+	/// code leaves it at [`HF_ROUTER_BASE`].
+	hf_base_url: String,
 	models: SharedCoderModels,
+	provider_keys: ProviderKeyring,
+}
+
+/// Resolved request routing for one round-trip.
+///
+/// Built by [`InferenceClient::resolve_route_for_request`] off
+/// [`SharedCoderModels::resolve_route`] + a keyring lookup. Carries
+/// `is_huggingface` so the 401-refresh path stays a one-shot for HF
+/// and a hard failure for user providers (where there's no refresh
+/// token, just a key the user has to fix in the picker).
+#[derive(Debug, Clone)]
+struct ResolvedRoute {
+	base_url: String,
+	auth_token: Option<String>,
+	bill_to: Option<String>,
+	is_huggingface: bool,
 }
 
 impl InferenceClient {
-	pub fn new(auth: Authenticator, models: SharedCoderModels) -> Result<Self, CoderError> {
+	pub fn new(
+		auth: Authenticator,
+		models: SharedCoderModels,
+		provider_keys: ProviderKeyring,
+	) -> Result<Self, CoderError> {
 		let http = reqwest::Client::builder()
 			.user_agent(concat!("moon-ide/", env!("CARGO_PKG_VERSION")))
 			.build()
@@ -312,37 +353,81 @@ impl InferenceClient {
 		Ok(Self {
 			http,
 			auth,
-			base_url: HF_ROUTER_BASE.to_string(),
+			hf_base_url: HF_ROUTER_BASE.to_string(),
 			models,
+			provider_keys,
 		})
 	}
 
-	pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-		self.base_url = base_url.into();
+	/// Override the HF router base URL. Test-only — production
+	/// uses [`HF_ROUTER_BASE`]. Has no effect on user providers
+	/// (they bring their own `base_url`).
+	pub fn with_hf_base_url(mut self, base_url: impl Into<String>) -> Self {
+		self.hf_base_url = base_url.into();
 		self
 	}
 
-	/// Snapshot of the `X-HF-Bill-To` value to send on the next
-	/// request. Read fresh per request so a settings flip mid-turn
-	/// applies to the very next round-trip.
-	async fn current_bill_to(&self) -> Option<String> {
-		self.models.read().await.bill_to().map(str::to_owned)
+	/// Resolve the request route fresh off the shared models +
+	/// keyring. Called at the top of every request so a settings
+	/// flip mid-turn applies to the next call without rewiring.
+	///
+	/// HF path: fetch (or refresh) the OAuth access token; HF
+	/// returns `NotSignedIn` cleanly when the user hasn't done
+	/// the device flow.
+	///
+	/// Custom path: snapshot the keyring entry (None = no auth
+	/// header, the local-llama.cpp case). Returns an error only
+	/// when the resolved entry is missing a `base_url` — a
+	/// defensive check; the picker rejects empty URLs at save
+	/// time, this guards against a hand-edited `state.json`.
+	async fn resolve_route_for_request(&self) -> Result<ResolvedRoute, CoderError> {
+		let snapshot = self.models.read().await.clone();
+		match snapshot.resolve_route() {
+			ResolvedProvider::HuggingFace => {
+				let access = self.auth.current_access_token().await?;
+				Ok(ResolvedRoute {
+					base_url: self.hf_base_url.clone(),
+					auth_token: Some(access),
+					bill_to: snapshot.bill_to().map(str::to_owned),
+					is_huggingface: true,
+				})
+			}
+			ResolvedProvider::Custom { id, base_url } => {
+				if base_url.trim().is_empty() {
+					return Err(CoderError::Internal(format!(
+						"active provider {id} has empty base_url; fix it in the model-settings popover"
+					)));
+				}
+				let trimmed = base_url.trim_end_matches('/').to_owned();
+				let auth_token = self.provider_keys.get(&id);
+				Ok(ResolvedRoute {
+					base_url: trimmed,
+					auth_token,
+					bill_to: None,
+					is_huggingface: false,
+				})
+			}
+		}
 	}
 
-	/// GET `/v1/models` → list of [`RouterModel`]s the picker
-	/// renders. Auth uses the user's OAuth token; the router gates
-	/// model visibility on the token's scopes + the user's plan,
-	/// so the list a free user sees is a subset of what a Pro user
-	/// sees. We don't try to second-guess that — we just forward.
+	/// GET `/v1/models` against the HF router → rich
+	/// [`RouterModel`] catalog with per-route pricing / throughput.
+	/// Only valid when the active provider is HF; the runner gates
+	/// the call before forwarding from the Tauri command.
+	///
+	/// Auth uses the user's OAuth token; the router gates model
+	/// visibility on the token's scopes + the user's plan, so the
+	/// list a free user sees is a subset of what a Pro user sees.
+	/// We don't try to second-guess that — we just forward.
 	///
 	/// Bill-to header is **not** sent for the catalog call. The
 	/// router returns the same catalog regardless and we want a
 	/// failed `coder_set_models { bill_to = "org" }` to still let
 	/// the picker reload after the user fixes the org name.
-	pub async fn list_models(&self) -> Result<Vec<moon_protocol::coder_models::RouterModel>, CoderError> {
+	pub async fn list_hf_models(&self) -> Result<Vec<moon_protocol::coder_models::RouterModel>, CoderError> {
 		use moon_protocol::coder_models::{RouterModel, RouterPricing, RouterProvider};
 		let token = self.auth.current_access_token().await?;
-		let endpoint = format!("{}/models", self.base_url);
+		let endpoint = format!("{}/models", self.hf_base_url);
 		let response = self
 			.http
 			.get(&endpoint)
@@ -421,12 +506,59 @@ impl InferenceClient {
 		Ok(out)
 	}
 
+	/// `GET <base_url>/models` against a user-added provider.
+	///
+	/// All OpenAI-compat servers ship `{ data: [{ id, owned_by? }] }`
+	/// at minimum. Many ship more: OpenRouter adds
+	/// `name` / `context_length` / `pricing` / `description`;
+	/// LiteLLM exposes pricing for routes it has rates for; vLLM
+	/// emits `max_model_len` (treated as context length). We
+	/// parse all of those tolerantly — fields the server
+	/// doesn't emit deserialize as `None` and the picker just
+	/// doesn't render them.
+	///
+	/// Pricing comes back from OpenRouter as strings of
+	/// dollars-per-token (`"0.000003"`); we multiply by
+	/// `1_000_000` so the protocol type carries a uniform
+	/// "$/M tokens" number regardless of source. LiteLLM emits
+	/// per-million numbers directly under
+	/// `input_cost_per_million_tokens` and we forward those
+	/// untouched.
+	///
+	/// Errors propagate verbatim — a 404 from a minimal server
+	/// that skips `/v1/models` lands back at the picker; the user
+	/// can still type a model slug directly into the field.
+	pub async fn list_provider_models(
+		&self,
+		base_url: &str,
+		api_key: Option<&str>,
+	) -> Result<Vec<moon_protocol::coder_models::ProviderModelSummary>, CoderError> {
+		let trimmed = base_url.trim_end_matches('/');
+		let endpoint = format!("{trimmed}/models");
+		let mut req = self.http.get(&endpoint);
+		if let Some(key) = api_key {
+			req = req.bearer_auth(key);
+		}
+		let response = req.send().await.map_err(CoderError::from)?;
+		let status = response.status();
+		let body = response.text().await.map_err(CoderError::from)?;
+		if !status.is_success() {
+			return Err(CoderError::http(endpoint, status.as_u16(), body));
+		}
+
+		let raw: provider_catalog::ListBody = crate::auth::decode_body(&endpoint, &body)?;
+		Ok(raw.data.into_iter().map(provider_catalog::flatten).collect())
+	}
+
 	/// One non-streaming chat-completions round trip.
 	///
-	/// Auto-refresh on 401: the first response that comes back as
-	/// `Unauthorized` triggers a refresh-then-retry; the second 401
-	/// surfaces as `NotSignedIn` to force the panel back into the
-	/// device-flow modal.
+	/// HF: auto-refresh on 401 — the first response that comes
+	/// back as `Unauthorized` triggers a refresh-then-retry; the
+	/// second 401 surfaces as `NotSignedIn` to force the panel
+	/// back into the device-flow modal.
+	///
+	/// Custom providers: 401 is surfaced verbatim. There's no
+	/// refresh token; the user has to fix the key in the picker.
 	pub async fn chat_completion(
 		&self,
 		model: &str,
@@ -434,7 +566,8 @@ impl InferenceClient {
 		tools: &[ToolDefinition],
 		cancel: &tokio_util::sync::CancellationToken,
 	) -> Result<AssistantResponse, CoderError> {
-		let endpoint = format!("{}/chat/completions", self.base_url);
+		let mut route = self.resolve_route_for_request().await?;
+		let endpoint = format!("{}/chat/completions", route.base_url);
 		let body = ChatCompletionRequest {
 			model,
 			messages,
@@ -444,13 +577,13 @@ impl InferenceClient {
 			stream_options: None,
 		};
 
-		let access = self.auth.current_access_token().await?;
-		let mut response = self.send_once(&endpoint, &access, &body, cancel).await?;
+		let mut response = self.send_once(&endpoint, &route, &body, cancel).await?;
 
-		if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-			tracing::info!("inference returned 401; refreshing token and retrying once");
+		if response.status() == reqwest::StatusCode::UNAUTHORIZED && route.is_huggingface {
+			tracing::info!("HF inference returned 401; refreshing token and retrying once");
 			let refreshed = self.auth.refresh_now().await?;
-			response = self.send_once(&endpoint, &refreshed, &body, cancel).await?;
+			route.auth_token = Some(refreshed);
+			response = self.send_once(&endpoint, &route, &body, cancel).await?;
 		}
 
 		let status = response.status();
@@ -502,7 +635,8 @@ impl InferenceClient {
 	where
 		F: FnMut(StreamEvent<'_>),
 	{
-		let endpoint = format!("{}/chat/completions", self.base_url);
+		let mut route = self.resolve_route_for_request().await?;
+		let endpoint = format!("{}/chat/completions", route.base_url);
 		let body = ChatCompletionRequest {
 			model,
 			messages,
@@ -518,13 +652,13 @@ impl InferenceClient {
 			stream_options: Some(StreamOptions { include_usage: true }),
 		};
 
-		let access = self.auth.current_access_token().await?;
-		let mut response = self.send_once_stream(&endpoint, &access, &body, cancel).await?;
+		let mut response = self.send_once_stream(&endpoint, &route, &body, cancel).await?;
 
-		if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-			tracing::info!("inference returned 401; refreshing token and retrying once");
+		if response.status() == reqwest::StatusCode::UNAUTHORIZED && route.is_huggingface {
+			tracing::info!("HF inference returned 401; refreshing token and retrying once");
 			let refreshed = self.auth.refresh_now().await?;
-			response = self.send_once_stream(&endpoint, &refreshed, &body, cancel).await?;
+			route.auth_token = Some(refreshed);
+			response = self.send_once_stream(&endpoint, &route, &body, cancel).await?;
 		}
 
 		let status = response.status();
@@ -549,13 +683,15 @@ impl InferenceClient {
 	async fn send_once(
 		&self,
 		endpoint: &str,
-		access_token: &str,
+		route: &ResolvedRoute,
 		body: &ChatCompletionRequest<'_>,
 		cancel: &tokio_util::sync::CancellationToken,
 	) -> Result<reqwest::Response, CoderError> {
-		let bill_to = self.current_bill_to().await;
-		let mut builder = self.http.post(endpoint).bearer_auth(access_token).json(body);
-		if let Some(org) = bill_to {
+		let mut builder = self.http.post(endpoint).json(body);
+		if let Some(token) = route.auth_token.as_deref() {
+			builder = builder.bearer_auth(token);
+		}
+		if let Some(org) = route.bill_to.as_deref() {
 			builder = builder.header(BILL_TO_HEADER, org);
 		}
 		let send = builder.send();
@@ -569,24 +705,23 @@ impl InferenceClient {
 	async fn send_once_stream(
 		&self,
 		endpoint: &str,
-		access_token: &str,
+		route: &ResolvedRoute,
 		body: &ChatCompletionRequest<'_>,
 		cancel: &tokio_util::sync::CancellationToken,
 	) -> Result<reqwest::Response, CoderError> {
 		// Same shape as `send_once`; a separate method exists only to
 		// mirror it — no header difference today *except* the
 		// explicit `accept: text/event-stream` to nudge providers
-		// that default to JSON, plus the `X-HF-Bill-To` re-read for
-		// the streaming path too (`bill_to` flips mid-turn just
-		// changes whose pocket the next call comes out of).
-		let bill_to = self.current_bill_to().await;
+		// that default to JSON.
 		let mut builder = self
 			.http
 			.post(endpoint)
-			.bearer_auth(access_token)
 			.header("accept", "text/event-stream")
 			.json(body);
-		if let Some(org) = bill_to {
+		if let Some(token) = route.auth_token.as_deref() {
+			builder = builder.bearer_auth(token);
+		}
+		if let Some(org) = route.bill_to.as_deref() {
 			builder = builder.header(BILL_TO_HEADER, org);
 		}
 		let send = builder.send();
@@ -890,6 +1025,225 @@ fn truncate_for_log(s: &str) -> String {
 /// through `Arc<...>` without dragging the auth handle along
 /// separately.
 pub type SharedInference = Arc<InferenceClient>;
+
+/// Tolerant parser for OpenAI-compat `/v1/models` responses.
+///
+/// Three classes of server we want to read:
+///
+/// - **Minimal** (Ollama, llama.cpp): just `{ id, owned_by? }`.
+/// - **OpenRouter**: adds `name`, `context_length`, pricing as
+///   strings of `$/token`, and a `description`. Pricing lives
+///   under `pricing.prompt` / `pricing.completion` for the
+///   prompt-/completion-side respectively.
+/// - **LiteLLM** when run as a router: pricing under
+///   `input_cost_per_token` / `output_cost_per_token` (numbers,
+///   per token), context length sometimes nested under
+///   `litellm_provider` config blocks. We pick what we can; the
+///   rest stays `None`.
+/// - **vLLM**: exposes `max_model_len` instead of
+///   `context_length`. We accept either as the source for the
+///   context window.
+///
+/// Anything we can't parse stays `None`; the picker degrades to
+/// the minimal view. Pricing is normalised to **$/million
+/// tokens** at this boundary so the protocol type and UI never
+/// have to second-guess units.
+mod provider_catalog {
+	use serde::Deserialize;
+
+	use moon_protocol::coder_models::ProviderModelSummary;
+
+	#[derive(Deserialize)]
+	pub(super) struct ListBody {
+		#[serde(default)]
+		pub(super) data: Vec<RawModel>,
+	}
+
+	#[derive(Deserialize)]
+	pub(super) struct RawModel {
+		id: String,
+		#[serde(default)]
+		owned_by: Option<String>,
+		/// OpenRouter ships this as the long human name; OpenAI's
+		/// own catalog doesn't include it.
+		#[serde(default)]
+		name: Option<String>,
+		#[serde(default)]
+		description: Option<String>,
+		/// OpenRouter: integer context window. We also accept
+		/// `max_model_len` (vLLM) as a synonym; both populate
+		/// this field at deserialize time via the catch-all
+		/// inside `flatten`.
+		#[serde(default)]
+		context_length: Option<u32>,
+		#[serde(default)]
+		max_model_len: Option<u32>,
+		/// OpenRouter shape: `{ prompt: "0.000003", completion: "0.000015" }`,
+		/// strings of dollars per token. Other fields
+		/// (`image`, `request`, …) ignored on purpose.
+		#[serde(default)]
+		pricing: Option<OpenRouterPricing>,
+		/// LiteLLM shape: per-token floats at the top level.
+		#[serde(default)]
+		input_cost_per_token: Option<f64>,
+		#[serde(default)]
+		output_cost_per_token: Option<f64>,
+		/// Some LiteLLM deployments pre-multiply for the user.
+		/// Trust those verbatim.
+		#[serde(default)]
+		input_cost_per_million_tokens: Option<f64>,
+		#[serde(default)]
+		output_cost_per_million_tokens: Option<f64>,
+	}
+
+	#[derive(Deserialize)]
+	struct OpenRouterPricing {
+		/// Prompt-side price. OpenRouter sends a string; we
+		/// also accept numbers in case the server normalises.
+		#[serde(default)]
+		prompt: Option<StringOrFloat>,
+		#[serde(default)]
+		completion: Option<StringOrFloat>,
+	}
+
+	#[derive(Deserialize)]
+	#[serde(untagged)]
+	enum StringOrFloat {
+		Float(f64),
+		String(String),
+	}
+
+	impl StringOrFloat {
+		fn as_f64(&self) -> Option<f64> {
+			match self {
+				Self::Float(v) => Some(*v),
+				Self::String(s) => s.trim().parse::<f64>().ok(),
+			}
+		}
+	}
+
+	/// Truncate a description to a sane cap so a server that
+	/// returns a full README per model doesn't blow up the picker
+	/// UI. Chosen by eyeball — most OpenRouter descriptions are
+	/// ≤ 200 chars, the few that aren't get clipped without
+	/// fanfare.
+	const DESCRIPTION_CAP: usize = 240;
+
+	pub(super) fn flatten(raw: RawModel) -> ProviderModelSummary {
+		let context_length = raw.context_length.or(raw.max_model_len);
+		let pricing_in_per_million = raw
+			.input_cost_per_million_tokens
+			.or_else(|| raw.input_cost_per_token.map(|v| v * 1_000_000.0))
+			.or_else(|| {
+				raw
+					.pricing
+					.as_ref()
+					.and_then(|p| p.prompt.as_ref())
+					.and_then(|v| v.as_f64())
+					.map(|v| v * 1_000_000.0)
+			});
+		let pricing_out_per_million = raw
+			.output_cost_per_million_tokens
+			.or_else(|| raw.output_cost_per_token.map(|v| v * 1_000_000.0))
+			.or_else(|| {
+				raw
+					.pricing
+					.as_ref()
+					.and_then(|p| p.completion.as_ref())
+					.and_then(|v| v.as_f64())
+					.map(|v| v * 1_000_000.0)
+			});
+		let description = raw.description.map(|s| {
+			let trimmed = s.trim();
+			if trimmed.chars().count() <= DESCRIPTION_CAP {
+				trimmed.to_owned()
+			} else {
+				// Clip on a char boundary; never panic.
+				let mut out = String::with_capacity(DESCRIPTION_CAP + 1);
+				for (i, c) in trimmed.chars().enumerate() {
+					if i >= DESCRIPTION_CAP {
+						break;
+					}
+					out.push(c);
+				}
+				out.push('…');
+				out
+			}
+		});
+		ProviderModelSummary {
+			id: raw.id,
+			owned_by: raw.owned_by,
+			name: raw.name.filter(|s| !s.is_empty()),
+			context_length,
+			pricing_in_per_million,
+			pricing_out_per_million,
+			description: description.filter(|s| !s.is_empty()),
+		}
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use super::*;
+
+		#[test]
+		fn parses_openrouter_shape() {
+			let raw = r#"{
+				"data": [{
+					"id": "anthropic/claude-3.5-sonnet",
+					"name": "Anthropic: Claude 3.5 Sonnet",
+					"context_length": 200000,
+					"pricing": {"prompt": "0.000003", "completion": "0.000015"},
+					"description": "Anthropic's flagship..."
+				}]
+			}"#;
+			let parsed: ListBody = serde_json::from_str(raw).unwrap();
+			let row = flatten(parsed.data.into_iter().next().unwrap());
+			assert_eq!(row.id, "anthropic/claude-3.5-sonnet");
+			assert_eq!(row.name.as_deref(), Some("Anthropic: Claude 3.5 Sonnet"));
+			assert_eq!(row.context_length, Some(200_000));
+			assert!((row.pricing_in_per_million.unwrap() - 3.0).abs() < 1e-9);
+			assert!((row.pricing_out_per_million.unwrap() - 15.0).abs() < 1e-9);
+		}
+
+		#[test]
+		fn parses_minimal_ollama_shape() {
+			let raw = r#"{
+				"data": [{"id": "llama3.2", "owned_by": "library"}]
+			}"#;
+			let parsed: ListBody = serde_json::from_str(raw).unwrap();
+			let row = flatten(parsed.data.into_iter().next().unwrap());
+			assert_eq!(row.id, "llama3.2");
+			assert_eq!(row.owned_by.as_deref(), Some("library"));
+			assert!(row.pricing_in_per_million.is_none());
+			assert!(row.context_length.is_none());
+		}
+
+		#[test]
+		fn vllm_max_model_len_maps_to_context_length() {
+			let raw = r#"{
+				"data": [{"id": "qwen2.5-72b", "max_model_len": 32768}]
+			}"#;
+			let parsed: ListBody = serde_json::from_str(raw).unwrap();
+			let row = flatten(parsed.data.into_iter().next().unwrap());
+			assert_eq!(row.context_length, Some(32_768));
+		}
+
+		#[test]
+		fn litellm_per_token_pricing_normalises_to_per_million() {
+			let raw = r#"{
+				"data": [{
+					"id": "gpt-4o-mini",
+					"input_cost_per_token": 0.00000015,
+					"output_cost_per_token": 0.0000006
+				}]
+			}"#;
+			let parsed: ListBody = serde_json::from_str(raw).unwrap();
+			let row = flatten(parsed.data.into_iter().next().unwrap());
+			assert!((row.pricing_in_per_million.unwrap() - 0.15).abs() < 1e-9);
+			assert!((row.pricing_out_per_million.unwrap() - 0.60).abs() < 1e-9);
+		}
+	}
+}
 
 #[cfg(test)]
 mod tests {

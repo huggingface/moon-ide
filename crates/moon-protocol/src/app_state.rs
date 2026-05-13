@@ -18,6 +18,7 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::coder_models::CoderProviderConfig;
 use crate::next_edit::NextEditAppState;
 use crate::slack::SlackBotProfile;
 use crate::theme::ThemeMode;
@@ -153,6 +154,32 @@ pub struct CoderAppState {
 	/// request — we surface the router's error verbatim.
 	#[serde(default)]
 	pub bill_to: String,
+	/// User-added OpenAI-compatible providers (OpenRouter, locally
+	/// hosted vLLM / Ollama / llama.cpp, …). The HF route is
+	/// always implicitly available and is **not** in this list —
+	/// it's the default when [`active_provider`] is `None`.
+	///
+	/// Each entry carries its own `standard_model` / `cheap_model`
+	/// because slugs aren't portable between hosts (an OpenRouter
+	/// `anthropic/claude-3.5-sonnet` doesn't resolve on HF and vice
+	/// versa). Switching the active provider swaps the picks the
+	/// runner uses with it.
+	///
+	/// API keys do **not** live here. They're stored in the OS
+	/// keyring under `service=moon-ide`, `account=coder-provider:<id>`
+	/// — moving them out of `state.json` keeps secrets off disk in a
+	/// file the user might commit by accident.
+	///
+	/// [`active_provider`]: Self::active_provider
+	#[serde(default)]
+	pub providers: Vec<CoderProviderConfig>,
+	/// Id of the currently active provider — `None` for the
+	/// implicit HF route. When `Some(id)`, must match one of
+	/// [`providers`](Self::providers)`.id`; the runner falls back
+	/// to HF on a mismatch (e.g. the entry was deleted out of
+	/// band) and a `tracing::warn!` notes the orphan.
+	#[serde(default)]
+	pub active_provider: Option<String>,
 }
 
 /// Bottom-panel slice of [`AppState`].
@@ -217,5 +244,33 @@ mod tests {
 		}"#;
 		let parsed: AppState = serde_json::from_str(json).expect("parses despite obsolete keys");
 		assert_eq!(parsed.coder.standard_model, "Qwen/Qwen3.5-397B-A17B:scaleway");
+		assert!(parsed.coder.providers.is_empty());
+		assert!(parsed.coder.active_provider.is_none());
+	}
+
+	#[test]
+	fn app_state_round_trips_user_providers() {
+		let parsed: AppState = serde_json::from_str(
+			r#"{
+				"coder": {
+					"providers": [
+						{
+							"id": "or-1",
+							"label": "OpenRouter",
+							"base_url": "https://openrouter.ai/api/v1",
+							"standard_model": "anthropic/claude-3.5-sonnet",
+							"cheap_model": "openai/gpt-4o-mini"
+						}
+					],
+					"active_provider": "or-1"
+				}
+			}"#,
+		)
+		.expect("parses provider entry");
+		assert_eq!(parsed.coder.providers.len(), 1);
+		assert_eq!(parsed.coder.providers[0].id, "or-1");
+		assert_eq!(parsed.coder.providers[0].base_url, "https://openrouter.ai/api/v1");
+		assert!(!parsed.coder.providers[0].has_api_key); // never persisted on disk
+		assert_eq!(parsed.coder.active_provider.as_deref(), Some("or-1"));
 	}
 }

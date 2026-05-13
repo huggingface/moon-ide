@@ -647,6 +647,21 @@ export type CoderAppState = {
 	last_session_by_folder: Record<string, string>;
 };
 
+/**
+ * One user-added OpenAI-compatible provider. Mirrors
+ * `moon_protocol::coder_models::CoderProviderConfig`. API keys
+ * live in the OS keyring (account=`coder-provider:<id>`), not
+ * here — only the `has_api_key` flag is surfaced.
+ */
+export type CoderProviderConfig = {
+	id: string;
+	label: string;
+	base_url: string;
+	standard_model: string;
+	cheap_model: string;
+	has_api_key: boolean;
+};
+
 /** Local llama.cpp autocomplete. Mirrors `moon_protocol::next_edit::NextEditAppState`. */
 export type NextEditAppState = {
 	/** When non-empty, probes/completion use this URL; otherwise `http://{server_host}:{server_port}`. */
@@ -1228,12 +1243,49 @@ export type CoderSessionSummary = {
  * request time.
  *
  * `bill_to` is the HF org slug for `X-HF-Bill-To`. Empty = bill
- * the user's personal account.
+ * the user's personal account. Only applies when `active_provider`
+ * is `null` (HF route); when a user provider is active, the
+ * runner suppresses the header.
+ *
+ * `active_provider` is `null` for the implicit HF default or
+ * `id` of one of the entries in `providers`.
  */
 export type CoderModelSettings = {
 	standard_model: string;
 	cheap_model: string;
 	bill_to: string;
+	active_provider: string | null;
+	providers: CoderProviderConfig[];
+};
+
+/** Result of `coder_probe_provider`. Mirrors
+ *  `moon_protocol::coder_models::ProviderProbeResult`. */
+export type ProviderProbeResult = {
+	model_count: number;
+	sample_model_ids: string[];
+};
+
+/**
+ * Catalog entry for a user-added provider. Mirrors
+ * `moon_protocol::coder_models::ProviderModelSummary`.
+ *
+ * Everything but `id` is optional and server-dependent — the
+ * OpenAI-compat spec only promises `id`/`owned_by`. OpenRouter
+ * ships the richer fields (name, context, pricing, description)
+ * and the picker lights them up automatically. Pricing is
+ * normalised at the backend to **$/million tokens** regardless
+ * of wire shape, so the UI never has to know whether the source
+ * was OpenRouter's per-token strings or LiteLLM's per-million
+ * floats.
+ */
+export type ProviderModelSummary = {
+	id: string;
+	owned_by: string | null;
+	name?: string | null;
+	context_length?: number | null;
+	pricing_in_per_million?: number | null;
+	pricing_out_per_million?: number | null;
+	description?: string | null;
 };
 
 /**

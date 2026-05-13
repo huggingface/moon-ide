@@ -284,28 +284,54 @@ model ids by the time the picker writes back.
   array on `AppState.coder.providers[]`. The HF flow stays
   canonical.
 
-### Later: custom OpenAI-compatible endpoints (OpenRouter, local)
+### Custom OpenAI-compatible endpoints (OpenRouter, local)
 
-`AppState.coder.providers` becomes a `Vec<ProviderConfig>` with:
+`AppState.coder.providers` is a `Vec<CoderProviderConfig>`:
 
 ```rust
-struct ProviderConfig {
-    id: String,                  // "openrouter", "ollama-local", …
-    label: String,               // shown in the model picker
-    base_url: String,            // OpenAI-compat /v1 root
-    auth: ProviderAuth,          // ApiKey { keyring_account } | None
-    model_prefix: Option<String>,// optional UI hint
+struct CoderProviderConfig {
+    id: String,           // opaque "prov-<unix-ms>-<rand>"
+    label: String,        // user-typed, shown in the picker
+    base_url: String,     // OpenAI-compat /v1 root
+    standard_model: String,
+    cheap_model: String,
+    has_api_key: bool,    // server-set off the keyring
 }
 ```
 
-API keys live in the keyring under
-`service=moon-ide`, `account=coder-provider:<id>`. Adding a
-provider is a small modal that takes `(label, base_url, api_key?)`,
-verifies via a `GET /v1/models` (or a 1-token completion if `models`
-isn't supported) before saving.
+The HF route stays implicit and always available — it has no entry
+in this list and is selected via `active_provider: None`. Switching
+to a user provider sets `active_provider = Some(id)` and the runner
+reads the picks off that entry instead of the HF fields. The
+[`X-HF-Bill-To`](#bill-to-org-vs-personal) header is suppressed off
+the wire when a user provider is active.
 
-This is **not** in the initial sub-phases. It lands when someone on
-the team wants OpenRouter, a local vLLM, or Anthropic-direct.
+API keys live in the keyring under `service=moon-ide`,
+`account=coder-provider:<id>`. The Tauri commands shipping this:
+
+- `coder_new_provider_id` — allocates the opaque id (keyring slot is
+  addressable before the config lands in `AppState`).
+- `coder_probe_provider` — `GET <base_url>/models` first, fallback
+  to a 1-token `chat/completions` ping on 404. Lets the picker
+  verify before saving without committing a half-broken config.
+- `coder_save_provider` / `coder_delete_provider` — atomic
+  per-provider commits straight into `AppState`.
+- `coder_set_provider_api_key` / `coder_clear_provider_api_key` —
+  keyring-only; secrets never round-trip through the model-settings
+  read.
+- `coder_list_provider_models { id }` — flat
+  `[{ id, owned_by? }]` for the picker; differs from `coder_list_models`
+  which returns the rich HF catalog with per-route pricing.
+
+The picker hides the "Bill to" field when a user provider is
+active, renders a flat catalog (since pricing / throughput aren't
+uniform across OpenAI-compat servers), and treats `localhost` /
+`*.local` base URLs as keyless-by-default (Ollama / llama.cpp run
+keyless conventionally).
+
+The 401-refresh behaviour stays HF-only: a user provider that
+returns 401 surfaces the error to the user — there's no refresh
+token, just an API key the user has to fix in the picker.
 
 ### Later: Anthropic OAuth (Claude Pro / Max)
 

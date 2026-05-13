@@ -37,20 +37,46 @@
 	// `slug ?? name` as the wire value, `name` as the display label.
 
 	import { coder } from '../coder.svelte';
-	import type { CoderModelSettings, RouterModel, RouterProvider } from '../protocol';
+	import type { CoderModelSettings, CoderProviderConfig, RouterModel, RouterProvider } from '../protocol';
 	import { onMount } from 'svelte';
 
 	type Props = { onClose: () => void };
 	let { onClose }: Props = $props();
 
+	// Picker state. `standardModel` / `cheapModel` / `billTo` are
+	// the picks for whichever provider is currently active in the
+	// local edit state — when the user flips `activeProviderId`,
+	// we commit the textbox values back to the previous provider's
+	// record (or the HF slot) and load the new provider's picks
+	// into the textboxes. Save flow rolls all of that into a
+	// single `CoderModelSettings` write.
 	let standardModel = $state('');
 	let cheapModel = $state('');
 	let billTo = $state('');
+	let activeProviderId = $state<string | null>(null);
+	let providers = $state<CoderProviderConfig[]>([]);
 	let saving = $state(false);
 	let saveError = $state<string | null>(null);
 
 	let modelSearch = $state('');
 	let editingTier = $state<'standard' | 'cheap'>('standard');
+
+	// Add / edit provider sub-form state. `null` = closed; a
+	// non-null value means the inline form is open. `id` is
+	// pre-allocated from `coder.newProviderId()` for new entries
+	// so the keyring slot is addressable from the moment the
+	// user types a key.
+	type ProviderDraft = {
+		id: string;
+		label: string;
+		base_url: string;
+		api_key: string; // local-only; never read back from the keyring
+		is_new: boolean;
+	};
+	let providerDraft = $state<ProviderDraft | null>(null);
+	let probing = $state(false);
+	let probeMessage = $state<string | null>(null);
+	let probeError = $state<string | null>(null);
 
 	// Web-search section state. The Tavily key itself is held
 	// only in the keyring; here we just track whether one is set
@@ -67,17 +93,260 @@
 	// estate.
 	let expandedModelId = $state<string | null>(null);
 
+	// Mirror of the runner-side `is_local_base_url` heuristic so
+	// the picker can decide whether to show the "no key" badge
+	// without bothering the user about a localhost server they
+	// intentionally run keyless.
+	function isLocalUrl(url: string): boolean {
+		const afterScheme = url.includes('://') ? url.slice(url.indexOf('://') + 3) : url;
+		const hostEnd = afterScheme.search(/[/:?#]/);
+		const host = hostEnd === -1 ? afterScheme : afterScheme.slice(0, hostEnd);
+		return host === 'localhost' || host === '127.0.0.1' || host === '::1' || host.endsWith('.local');
+	}
+
+	function cloneProviders(list: CoderProviderConfig[]): CoderProviderConfig[] {
+		// In-place spread inside `.map` is flagged by `oxlint`'s
+		// `no-map-spread` rule. `Object.assign` produces the same
+		// shallow clone without the per-iteration heap allocation
+		// the rule cares about.
+		const out: CoderProviderConfig[] = [];
+		for (const item of list) {
+			out.push(Object.assign({}, item));
+		}
+		return out;
+	}
+
+	function loadFromSettings(settings: CoderModelSettings): void {
+		providers = cloneProviders(settings.providers);
+		activeProviderId = settings.active_provider;
+		if (activeProviderId === null) {
+			standardModel = settings.standard_model;
+			cheapModel = settings.cheap_model;
+			billTo = settings.bill_to;
+		} else {
+			const entry = providers.find((p) => p.id === activeProviderId);
+			if (entry) {
+				standardModel = entry.standard_model;
+				cheapModel = entry.cheap_model;
+			}
+			billTo = settings.bill_to;
+		}
+	}
+
 	onMount(async () => {
 		await coder.loadModelSettings();
 		if (coder.modelSettings) {
-			standardModel = coder.modelSettings.standard_model;
-			cheapModel = coder.modelSettings.cheap_model;
-			billTo = coder.modelSettings.bill_to;
-		}
-		if (coder.routerModels === null) {
+			loadFromSettings(coder.modelSettings);
+			if (activeProviderId !== null) {
+				if (coder.providerModels[activeProviderId] === undefined) {
+					void coder.loadProviderModels(activeProviderId);
+				}
+			} else if (coder.routerModels === null) {
+				void coder.loadModels();
+			}
+		} else if (coder.routerModels === null) {
 			void coder.loadModels();
 		}
 		void coder.loadWebSearchConfigured();
+	});
+
+	// Commit the textbox values back to whichever provider's slot
+	// is active right now, then flip `activeProviderId` and load
+	// the destination's picks. Keeps the modal's "save once at the
+	// end" semantics: no IPC happens until the user clicks Save.
+	function switchActiveProvider(nextId: string | null): void {
+		if (nextId === activeProviderId) {
+			return;
+		}
+		// Snapshot current textboxes into the outgoing slot.
+		if (activeProviderId === null) {
+			// HF: textboxes map straight onto the local HF picks.
+		} else {
+			providers = providers.map((p) =>
+				p.id === activeProviderId ? { ...p, standard_model: standardModel, cheap_model: cheapModel } : p,
+			);
+		}
+		activeProviderId = nextId;
+		if (nextId === null) {
+			// HF: restore the HF picks the user typed earlier (or
+			// from settings on initial load).
+			const settings = coder.modelSettings;
+			standardModel = settings?.standard_model ?? '';
+			cheapModel = settings?.cheap_model ?? '';
+			if (coder.routerModels === null) {
+				void coder.loadModels();
+			}
+		} else {
+			const entry = providers.find((p) => p.id === nextId);
+			standardModel = entry?.standard_model ?? '';
+			cheapModel = entry?.cheap_model ?? '';
+			if (coder.providerModels[nextId] === undefined) {
+				void coder.loadProviderModels(nextId);
+			}
+		}
+		expandedModelId = null;
+	}
+
+	function openAddProvider(): void {
+		void (async () => {
+			const id = await coder.newProviderId();
+			providerDraft = {
+				id,
+				label: '',
+				base_url: '',
+				api_key: '',
+				is_new: true,
+			};
+			probeMessage = null;
+			probeError = null;
+		})();
+	}
+
+	function openEditProvider(id: string): void {
+		const entry = providers.find((p) => p.id === id);
+		if (!entry) {
+			return;
+		}
+		providerDraft = {
+			id: entry.id,
+			label: entry.label,
+			base_url: entry.base_url,
+			api_key: '',
+			is_new: false,
+		};
+		probeMessage = null;
+		probeError = null;
+	}
+
+	function closeProviderDraft(): void {
+		providerDraft = null;
+		probeMessage = null;
+		probeError = null;
+		probing = false;
+	}
+
+	async function onProbeDraft(): Promise<void> {
+		if (providerDraft === null) {
+			return;
+		}
+		const baseUrl = providerDraft.base_url.trim();
+		if (baseUrl.length === 0) {
+			probeError = 'Enter a base URL first.';
+			return;
+		}
+		probing = true;
+		probeError = null;
+		probeMessage = null;
+		try {
+			const result = await coder.probeProvider(baseUrl, providerDraft.api_key.trim());
+			if (result.model_count > 0) {
+				const sample = result.sample_model_ids.slice(0, 3).join(', ');
+				probeMessage = `OK — ${result.model_count} model${result.model_count === 1 ? '' : 's'} reachable${sample ? ` (e.g. ${sample}).` : '.'}`;
+			} else {
+				probeMessage =
+					'OK — endpoint reachable, but it does not expose `/v1/models`. You can still type a model id directly.';
+			}
+		} catch (err) {
+			probeError = err instanceof Error ? err.message : String(err);
+		} finally {
+			probing = false;
+		}
+	}
+
+	async function onSaveDraft(): Promise<void> {
+		if (providerDraft === null) {
+			return;
+		}
+		const draft = providerDraft;
+		const label = draft.label.trim();
+		const baseUrl = draft.base_url.trim();
+		if (label.length === 0 || baseUrl.length === 0) {
+			probeError = 'Label and base URL are required.';
+			return;
+		}
+		const cleanedKey = draft.api_key.trim();
+		try {
+			// Persist the key first so the runner's `has_api_key`
+			// flips to true at the moment the config lands.
+			if (cleanedKey.length > 0) {
+				await coder.setProviderApiKey(draft.id, cleanedKey);
+			}
+			const existing = providers.find((p) => p.id === draft.id);
+			const next: CoderProviderConfig = {
+				id: draft.id,
+				label,
+				base_url: baseUrl,
+				standard_model: existing?.standard_model ?? '',
+				cheap_model: existing?.cheap_model ?? '',
+				has_api_key: cleanedKey.length > 0 || (existing?.has_api_key ?? false),
+			};
+			await coder.saveProvider(next);
+			// Re-sync local working copy from the refreshed
+			// settings so the segmented control + `has_api_key`
+			// flags are right.
+			if (coder.modelSettings) {
+				providers = cloneProviders(coder.modelSettings.providers);
+			}
+			coder.forgetProviderModels(draft.id);
+			closeProviderDraft();
+		} catch (err) {
+			probeError = err instanceof Error ? err.message : String(err);
+		}
+	}
+
+	async function onClearDraftKey(): Promise<void> {
+		if (providerDraft === null) {
+			return;
+		}
+		try {
+			await coder.clearProviderApiKey(providerDraft.id);
+			if (coder.modelSettings) {
+				providers = cloneProviders(coder.modelSettings.providers);
+			}
+			providerDraft = { ...providerDraft, api_key: '' };
+			probeMessage = 'API key cleared.';
+		} catch (err) {
+			probeError = err instanceof Error ? err.message : String(err);
+		}
+	}
+
+	async function onDeleteDraft(): Promise<void> {
+		if (providerDraft === null || providerDraft.is_new) {
+			return;
+		}
+		const id = providerDraft.id;
+		try {
+			await coder.deleteProvider(id);
+			if (coder.modelSettings) {
+				providers = cloneProviders(coder.modelSettings.providers);
+			}
+			if (activeProviderId === id) {
+				switchActiveProvider(null);
+			}
+			closeProviderDraft();
+		} catch (err) {
+			probeError = err instanceof Error ? err.message : String(err);
+		}
+	}
+
+	const activeProvider = $derived(
+		activeProviderId === null ? null : (providers.find((p) => p.id === activeProviderId) ?? null),
+	);
+	const isHfActive = $derived(activeProviderId === null);
+	// `/v1/models` rows for the active user provider, when any.
+	// `null` = still loading; `[]` = no catalog (server doesn't
+	// expose `/v1/models`, or we got an error and cached an empty
+	// array so the spinner stops).
+	const providerCatalog = $derived(activeProviderId === null ? null : (coder.providerModels[activeProviderId] ?? null));
+	const filteredProviderCatalog = $derived.by(() => {
+		const rows = providerCatalog ?? [];
+		const needle = modelSearch.trim().toLowerCase();
+		if (needle.length === 0) {
+			return rows;
+		}
+		return rows.filter(
+			(r) => r.id.toLowerCase().includes(needle) || (r.owned_by?.toLowerCase().includes(needle) ?? false),
+		);
 	});
 
 	async function onSaveWebKey(): Promise<void> {
@@ -341,10 +610,27 @@
 	async function onSave(): Promise<void> {
 		saving = true;
 		saveError = null;
+		// Commit the textbox values back to whichever slot is
+		// currently active before snapshotting the picker state.
+		const standard = standardModel.trim();
+		const cheap = cheapModel.trim();
+		let hfStandard = coder.modelSettings?.standard_model ?? '';
+		let hfCheap = coder.modelSettings?.cheap_model ?? '';
+		let providersToSave = cloneProviders(providers);
+		if (activeProviderId === null) {
+			hfStandard = standard;
+			hfCheap = cheap;
+		} else {
+			providersToSave = providersToSave.map((p) =>
+				p.id === activeProviderId ? { ...p, standard_model: standard, cheap_model: cheap } : p,
+			);
+		}
 		const next: CoderModelSettings = {
-			standard_model: standardModel.trim(),
-			cheap_model: cheapModel.trim(),
+			standard_model: hfStandard,
+			cheap_model: hfCheap,
 			bill_to: billTo.trim(),
+			active_provider: activeProviderId,
+			providers: providersToSave,
 		};
 		try {
 			await coder.saveModelSettings(next);
@@ -389,226 +675,423 @@
 			<button type="button" class="close" aria-label="Close" onclick={onCancel}>×</button>
 		</header>
 
-		<section class="fields">
-			<label class="field">
-				<span class="label-row">
-					<span class="label-name">Standard model</span>
-					<button
-						type="button"
-						class="tier-tab"
-						class:active={editingTier === 'standard'}
-						onclick={() => (editingTier = 'standard')}>edit</button
-					>
-				</span>
-				<input
-					type="text"
-					bind:value={standardModel}
-					placeholder="Qwen/Qwen3.5-397B-A17B:scaleway"
-					spellcheck="false"
-					autocomplete="off"
-				/>
-				<span class="hint">
-					Drives the main agent loop and every sub-agent. Empty = built-in default.
-					{#if standardDetails !== null}
-						<span class="stats">· {standardDetails}</span>
+		<!-- Provider switcher. HF is always implicit + first;
+			 user-added providers sit alongside, and the `+ Add`
+			 button opens the inline editor below. Switching here
+			 commits the textbox picks to the outgoing slot and
+			 loads the destination's picks — no IPC until Save. -->
+		<section class="provider-switcher" aria-label="Active provider">
+			<button
+				type="button"
+				class="provider-tab"
+				class:active={activeProviderId === null}
+				onclick={() => switchActiveProvider(null)}
+			>
+				Hugging Face
+			</button>
+			{#each providers as p (p.id)}
+				<button
+					type="button"
+					class="provider-tab"
+					class:active={activeProviderId === p.id}
+					onclick={() => switchActiveProvider(p.id)}
+					title={p.base_url}
+				>
+					{p.label}
+					{#if !p.has_api_key && !isLocalUrl(p.base_url)}
+						<span class="provider-tab-flag" title="No API key configured">no key</span>
 					{/if}
-				</span>
-			</label>
+				</button>
+			{/each}
+			<button type="button" class="provider-tab add" onclick={openAddProvider}>+ Add provider</button>
+			{#if activeProvider !== null}
+				<button type="button" class="provider-edit" onclick={() => openEditProvider(activeProvider.id)}>Edit</button>
+			{/if}
+		</section>
 
-			<label class="field">
-				<span class="label-row">
-					<span class="label-name">Cheap model</span>
-					<button
-						type="button"
-						class="tier-tab"
-						class:active={editingTier === 'cheap'}
-						onclick={() => (editingTier = 'cheap')}>edit</button
-					>
-				</span>
-				<input
-					type="text"
-					bind:value={cheapModel}
-					placeholder="Qwen/Qwen3-Coder-30B-A3B-Instruct:scaleway"
-					spellcheck="false"
-					autocomplete="off"
-				/>
-				<span class="hint">
-					Used for commit messages, branch names, compaction summaries, folder summaries.
-					{#if cheapDetails !== null}
-						<span class="stats">· {cheapDetails}</span>
-					{/if}
-				</span>
-			</label>
-
-			<label class="field">
-				<span class="label-row">
-					<span class="label-name">Bill to</span>
-				</span>
-				<select class="bill-to" bind:value={billTo}>
-					<option value="">Personal account</option>
-					{#each orgs as org (org.slug ?? org.name)}
-						<option value={org.slug ?? org.name} disabled={!org.can_pay}>
-							{org.name}
-							{#if org.slug !== null && org.slug !== org.name}
-								({org.slug})
+		{#if providerDraft !== null}
+			<section class="provider-draft" aria-label="Provider details">
+				<div class="draft-grid">
+					<label class="field">
+						<span class="label-row"><span class="label-name">Label</span></span>
+						<input
+							type="text"
+							bind:value={providerDraft.label}
+							placeholder="OpenRouter"
+							spellcheck="false"
+							autocomplete="off"
+						/>
+					</label>
+					<label class="field">
+						<span class="label-row"><span class="label-name">Base URL</span></span>
+						<input
+							type="text"
+							bind:value={providerDraft.base_url}
+							placeholder="https://openrouter.ai/api/v1"
+							spellcheck="false"
+							autocomplete="off"
+						/>
+					</label>
+					<label class="field draft-key">
+						<span class="label-row">
+							<span class="label-name">API key</span>
+							{#if !providerDraft.is_new}
+								{@const existing = providers.find((p) => p.id === providerDraft?.id)}
+								{#if existing?.has_api_key}
+									<span class="key-status configured">key configured</span>
+								{:else}
+									<span class="key-status missing">no key</span>
+								{/if}
 							{/if}
-							{#if org.is_enterprise}— enterprise{/if}
-							{#if !org.can_pay}— can't pay{/if}
-						</option>
-					{/each}
-				</select>
-				<span class="hint">
-					Sent as <code>X-HF-Bill-To</code>. Personal = your own HF account. Orgs you've authorized moon-ide for show up
-					here; ones that can't pay are disabled. If an org you expect is missing, sign out and back in and tick it at
-					the OAuth consent screen.
-				</span>
-			</label>
+						</span>
+						<input
+							type="password"
+							bind:value={providerDraft.api_key}
+							placeholder={providerDraft.is_new ? 'sk-or-...' : 'Paste a new key to replace'}
+							spellcheck="false"
+							autocomplete="off"
+						/>
+						<span class="hint">
+							Stored in your OS keyring, never read back into this dialog. Leave blank for keyless local servers (<code
+								>localhost</code
+							>, <code>*.local</code>).
+						</span>
+					</label>
+				</div>
+				<div class="draft-actions">
+					<button type="button" class="secondary" onclick={onProbeDraft} disabled={probing}>
+						{probing ? 'Probing…' : 'Verify'}
+					</button>
+					{#if !providerDraft.is_new}
+						<button type="button" class="secondary" onclick={onClearDraftKey}>Clear key</button>
+						<button type="button" class="danger" onclick={onDeleteDraft}>Delete provider</button>
+					{/if}
+					<span class="flex-spacer"></span>
+					<button type="button" class="secondary" onclick={closeProviderDraft}>Close</button>
+					<button type="button" class="primary" onclick={onSaveDraft}>
+						{providerDraft.is_new ? 'Save provider' : 'Save changes'}
+					</button>
+				</div>
+				{#if probeError !== null}
+					<p class="error">{probeError}</p>
+				{:else if probeMessage !== null}
+					<p class="probe-ok">{probeMessage}</p>
+				{/if}
+			</section>
+		{/if}
 
-			<!-- Web-search subsection. Separate-but-inline rather than
+		{#if providerDraft === null}
+			<section class="fields">
+				<label class="field">
+					<span class="label-row">
+						<span class="label-name">Standard model</span>
+						<button
+							type="button"
+							class="tier-tab"
+							class:active={editingTier === 'standard'}
+							onclick={() => (editingTier = 'standard')}>edit</button
+						>
+					</span>
+					<input
+						type="text"
+						bind:value={standardModel}
+						placeholder="Qwen/Qwen3.5-397B-A17B:scaleway"
+						spellcheck="false"
+						autocomplete="off"
+					/>
+					<span class="hint">
+						Drives the main agent loop and every sub-agent. Empty = built-in default.
+						{#if standardDetails !== null}
+							<span class="stats">· {standardDetails}</span>
+						{/if}
+					</span>
+				</label>
+
+				<label class="field">
+					<span class="label-row">
+						<span class="label-name">Cheap model</span>
+						<button
+							type="button"
+							class="tier-tab"
+							class:active={editingTier === 'cheap'}
+							onclick={() => (editingTier = 'cheap')}>edit</button
+						>
+					</span>
+					<input
+						type="text"
+						bind:value={cheapModel}
+						placeholder="Qwen/Qwen3-Coder-30B-A3B-Instruct:scaleway"
+						spellcheck="false"
+						autocomplete="off"
+					/>
+					<span class="hint">
+						Used for commit messages, branch names, compaction summaries, folder summaries.
+						{#if cheapDetails !== null}
+							<span class="stats">· {cheapDetails}</span>
+						{/if}
+					</span>
+				</label>
+
+				{#if isHfActive}
+					<label class="field">
+						<span class="label-row">
+							<span class="label-name">Bill to</span>
+						</span>
+						<select class="bill-to" bind:value={billTo}>
+							<option value="">Personal account</option>
+							{#each orgs as org (org.slug ?? org.name)}
+								<option value={org.slug ?? org.name} disabled={!org.can_pay}>
+									{org.name}
+									{#if org.slug !== null && org.slug !== org.name}
+										({org.slug})
+									{/if}
+									{#if org.is_enterprise}— enterprise{/if}
+									{#if !org.can_pay}— can't pay{/if}
+								</option>
+							{/each}
+						</select>
+						<span class="hint">
+							Sent as <code>X-HF-Bill-To</code>. Personal = your own HF account. Orgs you've authorized moon-ide for
+							show up here; ones that can't pay are disabled. If an org you expect is missing, sign out and back in and
+							tick it at the OAuth consent screen.
+						</span>
+					</label>
+				{/if}
+
+				<!-- Web-search subsection. Separate-but-inline rather than
 				 a second modal because the team has one knob to set
 				 here (a Tavily API key) and the discoverability win
 				 from grouping it with the rest of the agent settings
 				 outweighs the small layout overhead. The key itself
 				 never round-trips back from the keyring; the UI just
 				 knows whether one is set. -->
-			<div class="web-key field">
-				<span class="label-row">
-					<span class="label-name">Web search (Tavily)</span>
-					{#if coder.webSearchConfigured === true}
-						<span class="key-status configured" title="Key stored in OS keyring">key configured</span>
-					{:else if coder.webSearchConfigured === false}
-						<span class="key-status missing">no key</span>
-					{/if}
-				</span>
-				<div class="web-key-row">
-					<input
-						type="password"
-						bind:value={webKeyDraft}
-						placeholder={coder.webSearchConfigured ? 'Paste a new key to replace' : 'tvly-...'}
-						spellcheck="false"
-						autocomplete="off"
-						disabled={webKeySaving}
-					/>
-					<button
-						type="button"
-						class="primary"
-						onclick={onSaveWebKey}
-						disabled={webKeySaving || webKeyDraft.trim().length === 0}
-					>
-						{coder.webSearchConfigured ? 'Replace' : 'Save'}
-					</button>
-					{#if coder.webSearchConfigured === true}
-						<button type="button" class="secondary" onclick={onClearWebKey} disabled={webKeySaving}>Clear</button>
+				<div class="web-key field">
+					<span class="label-row">
+						<span class="label-name">Web search (Tavily)</span>
+						{#if coder.webSearchConfigured === true}
+							<span class="key-status configured" title="Key stored in OS keyring">key configured</span>
+						{:else if coder.webSearchConfigured === false}
+							<span class="key-status missing">no key</span>
+						{/if}
+					</span>
+					<div class="web-key-row">
+						<input
+							type="password"
+							bind:value={webKeyDraft}
+							placeholder={coder.webSearchConfigured ? 'Paste a new key to replace' : 'tvly-...'}
+							spellcheck="false"
+							autocomplete="off"
+							disabled={webKeySaving}
+						/>
+						<button
+							type="button"
+							class="primary"
+							onclick={onSaveWebKey}
+							disabled={webKeySaving || webKeyDraft.trim().length === 0}
+						>
+							{coder.webSearchConfigured ? 'Replace' : 'Save'}
+						</button>
+						{#if coder.webSearchConfigured === true}
+							<button type="button" class="secondary" onclick={onClearWebKey} disabled={webKeySaving}>Clear</button>
+						{/if}
+					</div>
+					<span class="hint">
+						Enables the <code>web_search</code> tool — Tavily for the SERP, Jina Reader for the page fetch (no second
+						key needed). Get a free key at <code>tavily.com</code>; stored in your OS keyring, never read back into this
+						dialog. Leave blank to disable web search entirely (the model won't see the tool).
+					</span>
+					{#if webKeyError !== null}
+						<span class="error">{webKeyError}</span>
 					{/if}
 				</div>
-				<span class="hint">
-					Enables the <code>web_search</code> tool — Tavily for the SERP, Jina Reader for the page fetch (no second key
-					needed). Get a free key at <code>tavily.com</code>; stored in your OS keyring, never read back into this
-					dialog. Leave blank to disable web search entirely (the model won't see the tool).
-				</span>
-				{#if webKeyError !== null}
-					<span class="error">{webKeyError}</span>
-				{/if}
-			</div>
-		</section>
+			</section>
 
-		<section class="catalog">
-			<header class="catalog-header">
-				<span class="catalog-title">
-					Catalog ({editingTier} model)
-				</span>
-				<input
-					type="search"
-					bind:value={modelSearch}
-					placeholder="Filter by name, owner, or provider…"
-					spellcheck="false"
-					autocomplete="off"
-				/>
-			</header>
-			{#if coder.modelsLoading && coder.routerModels === null}
-				<p class="catalog-hint">Loading models from <code>router.huggingface.co</code>…</p>
-			{:else if coder.routerModels === null && coder.modelsError !== null}
-				<p class="error">{coder.modelsError}</p>
-				<button type="button" class="secondary" onclick={() => coder.loadModels()}>Retry</button>
-			{:else if filteredModels.length === 0}
-				<p class="catalog-hint">No models match this filter.</p>
-			{:else}
-				<ul class="catalog-list">
-					{#each filteredModels as model (model.id)}
-						{@const expanded = expandedModelId === model.id}
-						{@const summary = summaryFor(model)}
-						<li class="model-li" class:expanded>
-							<button type="button" class="model-row" aria-expanded={expanded} onclick={() => toggleExpanded(model.id)}>
-								<span class="chevron" aria-hidden="true">{expanded ? '▾' : '▸'}</span>
-								<span class="model-id">{model.id}</span>
-								{#if !model.supports_tools_anywhere}
-									<span class="no-tools" title="No provider exposes tool calls — won't work as the standard model">
-										no tools
+			<section class="catalog">
+				<header class="catalog-header">
+					<span class="catalog-title">
+						Catalog ({editingTier} model)
+					</span>
+					<input
+						type="search"
+						bind:value={modelSearch}
+						placeholder={isHfActive ? 'Filter by name, owner, or provider…' : 'Filter by model id or owner…'}
+						spellcheck="false"
+						autocomplete="off"
+					/>
+					{#if !isHfActive && activeProviderId !== null}
+						{@const id = activeProviderId}
+						<button
+							type="button"
+							class="catalog-refresh"
+							title="Re-fetch /v1/models from this provider"
+							onclick={() => {
+								coder.forgetProviderModels(id);
+								void coder.loadProviderModels(id);
+							}}
+						>
+							Refresh
+						</button>
+					{/if}
+				</header>
+				{#if !isHfActive}
+					<!-- User-added provider: render the flat /v1/models
+					 list. The picker writes the slug verbatim into
+					 the textbox above; there's no `:provider`
+					 suffix because non-HF routes don't multiplex. -->
+					{#if coder.modelsLoading && providerCatalog === null}
+						<p class="catalog-hint">Loading models from this provider…</p>
+					{:else if providerCatalog === null}
+						<p class="catalog-hint">Open the provider's catalog…</p>
+						<button
+							type="button"
+							class="secondary"
+							onclick={() => activeProviderId !== null && coder.loadProviderModels(activeProviderId)}
+						>
+							Load catalog
+						</button>
+					{:else if providerCatalog.length === 0 && coder.modelsError !== null}
+						<p class="error">{coder.modelsError}</p>
+						<p class="catalog-hint">
+							You can still type a model id directly into the {editingTier} model field above.
+						</p>
+					{:else if filteredProviderCatalog.length === 0}
+						<p class="catalog-hint">No models match this filter.</p>
+					{:else}
+						<ul class="flat-catalog">
+							{#each filteredProviderCatalog as row (row.id)}
+								{@const picked = (editingTier === 'standard' ? standardModel : cheapModel) === row.id}
+								<li>
+									<button
+										type="button"
+										class="flat-row"
+										class:picked
+										onclick={() => {
+											if (editingTier === 'standard') {
+												standardModel = row.id;
+											} else {
+												cheapModel = row.id;
+											}
+										}}
+									>
+										<div class="flat-row-main">
+											<span class="flat-id">{row.id}</span>
+											{#if row.name && row.name !== row.id}
+												<span class="flat-name">{row.name}</span>
+											{/if}
+											{#if picked}
+												<span class="flat-picked">Picked</span>
+											{/if}
+										</div>
+										<div class="flat-row-meta">
+											{#if row.context_length}
+												<span>{formatContext(row.context_length)} ctx</span>
+											{/if}
+											{#if row.pricing_in_per_million !== null && row.pricing_in_per_million !== undefined}
+												<span>
+													${parseFloat(row.pricing_in_per_million.toFixed(3))}/${parseFloat(
+														(row.pricing_out_per_million ?? row.pricing_in_per_million).toFixed(3),
+													)} per M
+												</span>
+											{/if}
+											{#if row.owned_by}
+												<span class="flat-owner">{row.owned_by}</span>
+											{/if}
+										</div>
+									</button>
+								</li>
+							{/each}
+						</ul>
+					{/if}
+				{:else if coder.modelsLoading && coder.routerModels === null}
+					<p class="catalog-hint">Loading models from <code>router.huggingface.co</code>…</p>
+				{:else if coder.routerModels === null && coder.modelsError !== null}
+					<p class="error">{coder.modelsError}</p>
+					<button type="button" class="secondary" onclick={() => coder.loadModels()}>Retry</button>
+				{:else if filteredModels.length === 0}
+					<p class="catalog-hint">No models match this filter.</p>
+				{:else}
+					<ul class="catalog-list">
+						{#each filteredModels as model (model.id)}
+							{@const expanded = expandedModelId === model.id}
+							{@const summary = summaryFor(model)}
+							<li class="model-li" class:expanded>
+								<button
+									type="button"
+									class="model-row"
+									aria-expanded={expanded}
+									onclick={() => toggleExpanded(model.id)}
+								>
+									<span class="chevron" aria-hidden="true">{expanded ? '▾' : '▸'}</span>
+									<span class="model-id">{model.id}</span>
+									{#if !model.supports_tools_anywhere}
+										<span class="no-tools" title="No provider exposes tool calls — won't work as the standard model">
+											no tools
+										</span>
+									{/if}
+									<span class="model-summary">
+										{#if summary.context}<span>{summary.context}</span>{/if}
+										<span>{model.providers.length} provider{model.providers.length === 1 ? '' : 's'}</span>
+										{#if summary.priceIn}<span>{summary.priceIn}</span>{/if}
+										{#if summary.priceOut}<span>{summary.priceOut}</span>{/if}
+										{#if summary.throughput}<span class="perf">{summary.throughput}</span>{/if}
 									</span>
-								{/if}
-								<span class="model-summary">
-									{#if summary.context}<span>{summary.context}</span>{/if}
-									<span>{model.providers.length} provider{model.providers.length === 1 ? '' : 's'}</span>
-									{#if summary.priceIn}<span>{summary.priceIn}</span>{/if}
-									{#if summary.priceOut}<span>{summary.priceOut}</span>{/if}
-									{#if summary.throughput}<span class="perf">{summary.throughput}</span>{/if}
-								</span>
-							</button>
-							{#if expanded}
-								<div class="provider-table-wrap">
-									<table class="provider-table">
-										<thead>
-											<tr>
-												<th scope="col">Provider</th>
-												<th scope="col">Context</th>
-												<th scope="col">$ in / out per M</th>
-												<th scope="col">Throughput</th>
-												<th scope="col">TTFT</th>
-												<th scope="col" class="pick-col"></th>
-											</tr>
-										</thead>
-										<tbody>
-											{#each model.providers as provider (provider.provider)}
-												{@const picked = isPickedFor(model, provider)}
-												{@const disabled = editingTier === 'standard' && !provider.supports_tools}
-												<tr class="provider-row" class:picked class:disabled>
-													<td class="provider-name">
-														{provider.provider}
-														{#if !provider.supports_tools}
-															<span class="cell-flag" title="No tool calls on this route">no tools</span>
-														{/if}
-													</td>
-													<td>{formatContext(provider.context_length)}</td>
-													<td>{formatPriceCell(provider.pricing)}</td>
-													<td>{formatThroughput(provider.throughput)}</td>
-													<td>{formatLatency(provider.first_token_latency_ms)}</td>
-													<td class="pick-col">
-														<button
-															type="button"
-															class="pick"
-															class:picked
-															onclick={() => pickProvider(model, provider)}
-															{disabled}
-															title={disabled
-																? 'Standard tier requires tool-capable providers'
-																: picked
-																	? `Currently picked for ${editingTier} tier`
-																	: `Pick for ${editingTier} tier`}
-														>
-															{picked ? 'Picked' : 'Pick'}
-														</button>
-													</td>
+								</button>
+								{#if expanded}
+									<div class="provider-table-wrap">
+										<table class="provider-table">
+											<thead>
+												<tr>
+													<th scope="col">Provider</th>
+													<th scope="col">Context</th>
+													<th scope="col">$ in / out per M</th>
+													<th scope="col">Throughput</th>
+													<th scope="col">TTFT</th>
+													<th scope="col" class="pick-col"></th>
 												</tr>
-											{/each}
-										</tbody>
-									</table>
-								</div>
-							{/if}
-						</li>
-					{/each}
-				</ul>
-			{/if}
-		</section>
+											</thead>
+											<tbody>
+												{#each model.providers as provider (provider.provider)}
+													{@const picked = isPickedFor(model, provider)}
+													{@const disabled = editingTier === 'standard' && !provider.supports_tools}
+													<tr class="provider-row" class:picked class:disabled>
+														<td class="provider-name">
+															{provider.provider}
+															{#if !provider.supports_tools}
+																<span class="cell-flag" title="No tool calls on this route">no tools</span>
+															{/if}
+														</td>
+														<td>{formatContext(provider.context_length)}</td>
+														<td>{formatPriceCell(provider.pricing)}</td>
+														<td>{formatThroughput(provider.throughput)}</td>
+														<td>{formatLatency(provider.first_token_latency_ms)}</td>
+														<td class="pick-col">
+															<button
+																type="button"
+																class="pick"
+																class:picked
+																onclick={() => pickProvider(model, provider)}
+																{disabled}
+																title={disabled
+																	? 'Standard tier requires tool-capable providers'
+																	: picked
+																		? `Currently picked for ${editingTier} tier`
+																		: `Pick for ${editingTier} tier`}
+															>
+																{picked ? 'Picked' : 'Pick'}
+															</button>
+														</td>
+													</tr>
+												{/each}
+											</tbody>
+										</table>
+									</div>
+								{/if}
+							</li>
+						{/each}
+					</ul>
+				{/if}
+			</section>
+		{/if}
 
 		<footer>
 			{#if saveError}
@@ -998,5 +1481,175 @@
 	}
 	.key-status.missing {
 		color: var(--m-fg-muted);
+	}
+	.provider-switcher {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 6px;
+		padding-bottom: 10px;
+		border-bottom: 1px solid var(--m-border);
+	}
+	.provider-tab {
+		background: transparent;
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		color: var(--m-fg);
+		font-size: 12px;
+		padding: 4px 10px;
+		cursor: pointer;
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+	}
+	.provider-tab.active {
+		background: var(--m-accent);
+		border-color: var(--m-accent);
+		color: var(--m-on-accent, #fff);
+	}
+	.provider-tab.add {
+		border-style: dashed;
+		color: var(--m-fg-muted);
+	}
+	.provider-tab-flag {
+		font-size: 9px;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		padding: 1px 5px;
+		border-radius: 3px;
+		border: 1px solid currentColor;
+		color: var(--m-fg-muted);
+	}
+	.provider-tab.active .provider-tab-flag {
+		color: var(--m-on-accent, #fff);
+	}
+	.provider-edit {
+		background: transparent;
+		border: 1px solid var(--m-border);
+		color: var(--m-fg-muted);
+		border-radius: 4px;
+		font-size: 11px;
+		padding: 3px 8px;
+		cursor: pointer;
+		margin-left: auto;
+	}
+	.provider-draft {
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+		padding: 12px;
+		background: var(--m-bg-overlay);
+		border: 1px solid var(--m-border);
+		border-radius: 6px;
+	}
+	.draft-grid {
+		display: grid;
+		grid-template-columns: minmax(160px, 1fr) minmax(220px, 2fr);
+		gap: 10px 14px;
+	}
+	.draft-key {
+		grid-column: 1 / -1;
+	}
+	.draft-actions {
+		display: flex;
+		gap: 8px;
+		align-items: center;
+		flex-wrap: wrap;
+	}
+	.flex-spacer {
+		flex: 1 1 auto;
+	}
+	.danger {
+		background: transparent;
+		border: 1px solid var(--m-error, #d34c4c);
+		color: var(--m-error, #d34c4c);
+		border-radius: 4px;
+		padding: 6px 14px;
+		font-size: 12px;
+		cursor: pointer;
+	}
+	.probe-ok {
+		margin: 0;
+		font-size: 11px;
+		color: var(--m-success, #38a169);
+	}
+	.flat-catalog {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		max-height: 320px;
+		overflow-y: auto;
+	}
+	.flat-row {
+		display: flex;
+		flex-direction: column;
+		align-items: stretch;
+		gap: 2px;
+		width: 100%;
+		text-align: left;
+		background: transparent;
+		border: 1px solid transparent;
+		border-radius: 4px;
+		color: var(--m-fg);
+		padding: 6px 10px;
+		font-size: 12px;
+		font-family: var(--m-font-mono, ui-monospace, monospace);
+		cursor: pointer;
+	}
+	.flat-row:hover {
+		background: var(--m-bg-overlay);
+	}
+	.flat-row.picked {
+		border-color: var(--m-accent);
+		background: color-mix(in srgb, var(--m-accent) 12%, transparent);
+	}
+	.flat-row-main {
+		display: flex;
+		align-items: baseline;
+		gap: 10px;
+	}
+	.flat-row-meta {
+		display: flex;
+		align-items: baseline;
+		gap: 10px;
+		font-family: var(--m-font, system-ui, sans-serif);
+		font-size: 10px;
+		color: var(--m-fg-muted);
+	}
+	.flat-row-meta:empty {
+		display: none;
+	}
+	.flat-id {
+		flex: 0 0 auto;
+	}
+	.flat-name {
+		flex: 1 1 auto;
+		font-family: var(--m-font, system-ui, sans-serif);
+		font-size: 11px;
+		color: var(--m-fg-muted);
+	}
+	.flat-owner {
+		font-size: 10px;
+		color: var(--m-fg-muted);
+		font-family: var(--m-font, system-ui, sans-serif);
+	}
+	.flat-picked {
+		font-size: 10px;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		color: var(--m-accent);
+		font-family: var(--m-font, system-ui, sans-serif);
+	}
+	.catalog-refresh {
+		background: transparent;
+		border: 1px solid var(--m-border);
+		color: var(--m-fg-muted);
+		border-radius: 4px;
+		font-size: 11px;
+		padding: 3px 8px;
+		cursor: pointer;
 	}
 </style>

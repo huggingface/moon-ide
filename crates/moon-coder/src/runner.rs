@@ -37,7 +37,8 @@ use crate::error::CoderError;
 use crate::event::{CoderEvent, CoderEventEnvelope, CoderStatus, TokenUsageSource};
 use crate::folder_summary::FolderSummaryService;
 use crate::inference::{AssistantResponse, ChatMessage, FunctionCall, InferenceClient, StreamEvent, TokenUsage};
-use crate::models::{self, CoderModels, SharedCoderModels};
+use crate::models::{self, CoderModels, ResolvedProvider, SharedCoderModels};
+use crate::providers::{self, ProviderKeyring};
 use crate::sessions::{
 	self, current_time_ms, new_session_id, session_title_from_prompt, sessions_dir, LoadedSession, SessionHeader,
 	SessionRecord, SessionSummary, SESSION_SCHEMA_VERSION,
@@ -106,12 +107,18 @@ struct CoderState {
 	/// Owned via `Arc` so the background generation tasks (one per
 	/// in-flight folder) can share it cheaply.
 	folder_summaries: Arc<FolderSummaryService>,
-	/// User's current model picks + `bill_to` org. Shared with
-	/// [`InferenceClient`] so a settings flip reaches both the model
-	/// selection (runner reads at turn-start) and the
-	/// `X-HF-Bill-To` header (client reads per request) without
-	/// re-wiring anything.
+	/// User's current model picks + `bill_to` org + user-added
+	/// providers. Shared with [`InferenceClient`] so a settings
+	/// flip reaches both the model selection (runner reads at
+	/// turn-start) and the per-request route resolution (client
+	/// reads on every send) without re-wiring anything.
 	models: SharedCoderModels,
+	/// Per-provider API keys, mirrored from the OS keyring.
+	/// Shared with [`InferenceClient`] so a `coder_set_provider_api_key`
+	/// flip applies to the very next request. Held here too so
+	/// the auth commands can read / mutate it without going
+	/// through the inference client.
+	provider_keys: ProviderKeyring,
 }
 
 /// Per-folder runtime: one in-memory `Session` plus one
@@ -313,8 +320,24 @@ impl CoderHandle {
 		initial_models: CoderModels,
 	) -> Result<Self, CoderError> {
 		let auth = Authenticator::new()?;
+		// Warm the per-provider keyring from the persisted
+		// providers list before the inference client starts
+		// resolving routes — otherwise the first request after a
+		// relaunch would see "no key" for a provider the user
+		// already set up.
+		let provider_keys = ProviderKeyring::new();
+		let provider_ids: Vec<String> = initial_models.providers.iter().map(|p| p.id.clone()).collect();
+		provider_keys.warm(provider_ids);
+		// Reflect `has_api_key` on the persisted entries so
+		// `current_models()` exposes the right state to the picker
+		// on first read — the keyring is the source of truth, not
+		// `state.json`.
+		let mut initial_models = initial_models;
+		for provider in &mut initial_models.providers {
+			provider.has_api_key = provider_keys.has_key(&provider.id);
+		}
 		let models = models::shared(initial_models);
-		let inference = InferenceClient::new(auth.clone(), models.clone())?;
+		let inference = InferenceClient::new(auth.clone(), models.clone(), provider_keys.clone())?;
 		let web = crate::web::WebClient::new()?;
 		let tools = ToolRegistry::new(workspaces.clone(), workspaces_dir.clone(), web);
 		let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
@@ -331,6 +354,7 @@ impl CoderHandle {
 				coder_sessions_dir,
 				folder_summaries,
 				models,
+				provider_keys,
 			}),
 		})
 	}
@@ -360,22 +384,119 @@ impl CoderHandle {
 		self.state.tools.web().clear_tavily_key()
 	}
 
-	/// Hot-swap the user-facing model picks. Only `standard`,
-	/// `cheap`, and `bill_to` are written; the router-derived
+	/// Hot-swap the user-facing model picks for HF.
+	/// `standard` / `cheap` / `bill_to` apply only when the active
+	/// route is HF; user providers carry their own picks in
+	/// `providers[].standard_model` etc. The router-derived
 	/// `context_windows` cache is preserved across the swap so a
 	/// fresh save from the picker doesn't blow the catalog away
 	/// (the picker fetches the catalog in a separate command).
 	///
-	/// The runner snapshots [`CoderModels`] at the top of each turn
-	/// / sub-agent / cheap-helper call so the *next* round-trip
-	/// picks up the change; in-flight requests are untouched.
-	/// `bill_to` reaches every subsequent request via the shared
-	/// handle held inside [`InferenceClient`].
+	/// The runner snapshots [`CoderModels`] at the top of each
+	/// turn / sub-agent / cheap-helper call so the *next*
+	/// round-trip picks up the change; in-flight requests are
+	/// untouched. `bill_to` reaches every subsequent request via
+	/// the shared handle held inside [`InferenceClient`].
 	pub async fn set_user_picks(&self, standard: String, cheap: String, bill_to: Option<String>) {
 		let mut m = self.state.models.write().await;
 		m.standard = standard;
 		m.cheap = cheap;
 		m.bill_to = bill_to;
+	}
+
+	/// Replace the user-added providers list + the active
+	/// selection in one go. The caller (Tauri command) has
+	/// already persisted the same shape to `state.json`; this
+	/// just flips the runtime view.
+	///
+	/// `providers[].has_api_key` flags are re-computed off the
+	/// keyring rather than trusted from the caller — the keyring
+	/// is the source of truth, and a frontend trying to spoof the
+	/// flag shouldn't be able to make the inference client
+	/// believe an empty slot has a key.
+	pub async fn set_providers(
+		&self,
+		mut providers: Vec<moon_protocol::coder_models::CoderProviderConfig>,
+		active: Option<String>,
+	) {
+		for p in &mut providers {
+			p.has_api_key = self.state.provider_keys.has_key(&p.id);
+		}
+		let mut m = self.state.models.write().await;
+		m.providers = providers;
+		m.active_provider = active;
+	}
+
+	/// Generate a fresh opaque provider id. The Tauri command
+	/// uses this to allocate the keyring entry name (under
+	/// `service=moon-ide, account=coder-provider:<id>`) before
+	/// persisting the config — keeps id generation in one place.
+	pub fn new_provider_id(&self) -> String {
+		providers::new_provider_id()
+	}
+
+	/// Persist a new API key for a provider id. Empty values are
+	/// rejected at the keyring boundary. After this returns Ok,
+	/// the very next request resolving to this provider picks up
+	/// the new key without rewiring.
+	pub fn set_provider_api_key(&self, id: &str, key: &str) -> Result<(), CoderError> {
+		let result = self.state.provider_keys.set(id, key);
+		// Reflect the flag onto the cached models snapshot so the
+		// next `current_models()` read by the picker sees the
+		// correct state — no need to wait for a `set_providers`
+		// round-trip.
+		if result.is_ok() {
+			let provider_keys = self.state.provider_keys.clone();
+			let models = self.state.models.clone();
+			let id = id.to_owned();
+			tokio::spawn(async move {
+				let mut m = models.write().await;
+				for p in &mut m.providers {
+					if p.id == id {
+						p.has_api_key = provider_keys.has_key(&id);
+					}
+				}
+			});
+		}
+		result
+	}
+
+	/// Drop the API key for a provider id. Idempotent — fine to
+	/// call on a provider that never had a key (the local-vLLM
+	/// case where the user is just removing a stale entry).
+	pub fn clear_provider_api_key(&self, id: &str) -> Result<(), CoderError> {
+		let result = self.state.provider_keys.clear(id);
+		if result.is_ok() {
+			let models = self.state.models.clone();
+			let id = id.to_owned();
+			tokio::spawn(async move {
+				let mut m = models.write().await;
+				for p in &mut m.providers {
+					if p.id == id {
+						p.has_api_key = false;
+					}
+				}
+			});
+		}
+		result
+	}
+
+	/// Probe a `(base_url, api_key)` combination before the
+	/// picker commits. See [`providers::probe_provider`] for the
+	/// fallback order. Builds a fresh `reqwest::Client` for the
+	/// probe rather than reusing the inference client's so a
+	/// hung probe can't share connection-pool state with live
+	/// traffic.
+	pub async fn probe_provider(
+		&self,
+		base_url: &str,
+		api_key: Option<&str>,
+	) -> Result<moon_protocol::coder_models::ProviderProbeResult, CoderError> {
+		let http = reqwest::Client::builder()
+			.user_agent(concat!("moon-ide/", env!("CARGO_PKG_VERSION")))
+			.build()
+			.map_err(CoderError::from)?;
+		providers::probe_provider(&http, base_url, api_key).await
 	}
 
 	/// Current `CoderModels` snapshot. The Tauri layer reads this
@@ -385,20 +506,83 @@ impl CoderHandle {
 		self.state.models.read().await.clone()
 	}
 
-	/// Catalog forwarded from the router's `/v1/models`. Side effect:
-	/// refreshes [`CoderModels::context_windows`] so subsequent
-	/// turns can size the usage ring / compaction threshold against
-	/// authoritative numbers instead of the static fallback table.
-	/// Errors when the user isn't signed in or the router rejects.
+	/// Catalog the picker renders.
+	///
+	/// - HF active: forward the rich `/v1/models` shape from the
+	///   router (preserves provider/route/pricing detail).
+	/// - User provider active: returns an `Err(NoActiveFolder)`-
+	///   shaped error (`Internal(...)`) so the Tauri command can
+	///   route the picker to `coder_list_provider_models`
+	///   instead. We keep one entrypoint per shape so the
+	///   frontend never has to disambiguate the union type.
+	///
+	/// Side effect: when HF is active, refreshes
+	/// [`CoderModels::context_windows`] so subsequent turns can
+	/// size the usage ring / compaction threshold against
+	/// authoritative numbers instead of the static fallback
+	/// table.
 	pub async fn list_models(&self) -> Result<Vec<moon_protocol::coder_models::RouterModel>, CoderError> {
-		let catalog = self.state.inference.list_models().await?;
-		let windows = models::context_windows_from_catalog(&catalog);
-		self.state.models.write().await.context_windows = Arc::new(windows);
-		Ok(catalog)
+		let route = self.state.models.read().await.resolve_route();
+		match route {
+			ResolvedProvider::HuggingFace => {
+				let catalog = self.state.inference.list_hf_models().await?;
+				let windows = models::context_windows_from_catalog(&catalog);
+				self.state.models.write().await.context_windows = Arc::new(windows);
+				Ok(catalog)
+			}
+			ResolvedProvider::Custom { .. } => Err(CoderError::Internal(
+				"active provider is not Hugging Face; call coder_list_provider_models instead".into(),
+			)),
+		}
+	}
+
+	/// Flat catalog for a user-added provider. `id` matches one
+	/// of `CoderModels::providers[].id`; the runner looks up the
+	/// `base_url` and the (optional) API key, then calls
+	/// `/v1/models` against the endpoint. Errors propagate
+	/// verbatim — a 404 means the server doesn't expose the
+	/// catalog endpoint and the user can still type a model slug
+	/// directly into the picker field.
+	pub async fn list_provider_models(
+		&self,
+		provider_id: &str,
+	) -> Result<Vec<moon_protocol::coder_models::ProviderModelSummary>, CoderError> {
+		let snapshot = self.state.models.read().await;
+		let entry = snapshot
+			.providers
+			.iter()
+			.find(|p| p.id == provider_id)
+			.ok_or_else(|| CoderError::Internal(format!("unknown provider id: {provider_id}")))?;
+		let base_url = entry.base_url.clone();
+		drop(snapshot);
+		let api_key = self.state.provider_keys.get(provider_id);
+		self
+			.state
+			.inference
+			.list_provider_models(&base_url, api_key.as_deref())
+			.await
 	}
 
 	pub async fn status(&self) -> Result<CoderStatus, CoderError> {
 		let identity = self.state.auth.identity().await?;
+		// `signed_in` is route-aware: HF needs OAuth; a user
+		// provider just needs a configured key (or a localhost
+		// `base_url` where running keyless is conventional). The
+		// `identity` field stays HF-only — it's the `HfIdentity`
+		// payload the picker renders for the "Bill to" dropdown
+		// and the user avatar in the header; off-HF the panel
+		// hides that surface.
+		let route = self.state.models.read().await.resolve_route();
+		let signed_in = match &route {
+			ResolvedProvider::HuggingFace => identity.is_some(),
+			ResolvedProvider::Custom { id, base_url } => {
+				if self.state.provider_keys.has_key(id) {
+					true
+				} else {
+					is_local_base_url(base_url)
+				}
+			}
+		};
 		// `busy` reflects the **active folder's** turn only — the
 		// panel mirrors per-folder UI state, so other folders'
 		// running turns don't make this folder's composer disable
@@ -428,7 +612,7 @@ impl CoderHandle {
 			None
 		};
 		Ok(CoderStatus {
-			signed_in: identity.is_some(),
+			signed_in,
 			identity,
 			busy,
 			bash_target,
@@ -766,11 +950,24 @@ impl CoderHandle {
 	}
 
 	pub async fn send(&self, text: String) -> Result<(), CoderError> {
-		// Bail early if there's no signed-in session — surface a
-		// clean error instead of letting the inference layer fail
-		// on the first request.
-		if !self.state.auth.has_valid_session().await {
-			return Err(CoderError::NotSignedIn);
+		// Bail early if the active route can't authenticate —
+		// surface a clean error instead of letting the inference
+		// layer fail on the first request. HF needs OAuth; user
+		// providers need a configured key (or a localhost
+		// `base_url`, where keyless is conventional for Ollama /
+		// llama.cpp).
+		let route = self.state.models.read().await.resolve_route();
+		match &route {
+			ResolvedProvider::HuggingFace => {
+				if !self.state.auth.has_valid_session().await {
+					return Err(CoderError::NotSignedIn);
+				}
+			}
+			ResolvedProvider::Custom { id, base_url } => {
+				if !self.state.provider_keys.has_key(id) && !is_local_base_url(base_url) {
+					return Err(CoderError::NotSignedIn);
+				}
+			}
 		}
 		let (fs, folder_path) = self.state.active_folder_session().await?;
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
@@ -2172,6 +2369,26 @@ pub(crate) fn estimate_prompt_tokens(messages: &[ChatMessage]) -> u32 {
 	(bytes / 4) as u32
 }
 
+/// `true` iff `base_url`'s host is loopback or `.local`. Used to
+/// decide whether a user provider without an API key should still
+/// count as "signed in" — local llama.cpp / Ollama / vLLM
+/// instances are routinely run without auth, and forcing the user
+/// to "configure a key" before the panel would let them send a
+/// message would be the wrong UX. Non-local hosts (OpenRouter,
+/// anything reachable from the network) still require a key.
+///
+/// The check is conservative: we extract the host between the
+/// scheme and the first path / port separator and only accept
+/// `localhost`, `127.0.0.1`, `::1`, or a `.local` mDNS suffix.
+/// Anything else — including `0.0.0.0` (which a misconfigured
+/// server might bind to) — gets treated as remote.
+fn is_local_base_url(base_url: &str) -> bool {
+	let after_scheme = base_url.split_once("://").map(|(_, rest)| rest).unwrap_or(base_url);
+	let host_end = after_scheme.find(['/', ':', '?', '#']).unwrap_or(after_scheme.len());
+	let host = &after_scheme[..host_end];
+	matches!(host, "localhost" | "127.0.0.1" | "::1") || host.ends_with(".local")
+}
+
 fn estimate_completion_tokens(response: &AssistantResponse) -> u32 {
 	let mut bytes: usize = 0;
 	bytes += response.content.as_deref().map(str::len).unwrap_or(0);
@@ -2326,6 +2543,20 @@ mod tests {
 		assert_eq!(sanitise_branch_name(""), "");
 		assert_eq!(sanitise_branch_name("???"), "");
 		assert_eq!(sanitise_branch_name("   "), "");
+	}
+
+	#[test]
+	fn local_base_url_detection_covers_common_shapes() {
+		assert!(is_local_base_url("http://localhost:8080/v1"));
+		assert!(is_local_base_url("http://127.0.0.1:11434"));
+		assert!(is_local_base_url("http://myhost.local/v1"));
+		assert!(is_local_base_url("localhost:8080/v1"));
+		assert!(!is_local_base_url("https://openrouter.ai/api/v1"));
+		assert!(!is_local_base_url("https://api.anthropic.com/v1"));
+		// `0.0.0.0` is a wildcard bind, not actually a reachable
+		// loopback — and a server bound there is reachable from
+		// the network, so we still want a key.
+		assert!(!is_local_base_url("http://0.0.0.0:8080/v1"));
 	}
 
 	#[test]

@@ -7,8 +7,11 @@
 
 use moon_coder::{CoderHandle, CoderStatus, DeviceCode, HfIdentity, SessionSummary};
 use moon_core::app_state as app_state_store;
-use moon_protocol::coder_models::{CoderModelSettings, RouterModel};
+use moon_protocol::coder_models::{
+	CoderModelSettings, CoderProviderConfig, ProviderModelSummary, ProviderProbeResult, RouterModel,
+};
 use moon_protocol::MoonError;
+use serde::Deserialize;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::state::AppState;
@@ -248,7 +251,11 @@ async fn active_folder_path(state: &AppState) -> Option<String> {
 
 /// Snapshot of the user's current model picks. The popover reads
 /// this on open so it doesn't fall out of sync if a different
-/// surface (or a future hotkey) wrote to AppState.
+/// surface (or a future hotkey) wrote to AppState. Returns the
+/// full picker state in one shot: HF picks, the active provider
+/// id, and the user-added providers list (each carrying its own
+/// `has_api_key` flag, which is sourced from the keyring rather
+/// than echoed from disk).
 #[tauri::command]
 pub async fn coder_get_model_settings(state: State<'_, AppState>) -> Result<CoderModelSettings, MoonError> {
 	let models = state.coder.current_models().await;
@@ -256,15 +263,22 @@ pub async fn coder_get_model_settings(state: State<'_, AppState>) -> Result<Code
 		standard_model: models.standard,
 		cheap_model: models.cheap,
 		bill_to: models.bill_to.unwrap_or_default(),
+		active_provider: models.active_provider,
+		providers: models.providers,
 	})
 }
 
 /// Persist + apply the new picker settings. Writes through
 /// AppState (so a relaunch sees the same picks) and pokes the
-/// coder so the very next round-trip uses the new model + bill_to.
-/// Slugs are already in their final `model:provider` form because
-/// the picker concatenates on click; the runner doesn't do any
-/// post-processing.
+/// coder so the very next round-trip uses the new model +
+/// bill_to + provider list. Slugs are already in their final
+/// `model:provider` form because the picker concatenates on
+/// click; the runner doesn't do any post-processing.
+///
+/// API keys do **not** travel through this command. The picker
+/// uses `coder_set_provider_api_key` / `coder_clear_provider_api_key`
+/// (per-id, keyring-backed) so secrets never round-trip through
+/// AppState or the IPC layer's logging.
 #[tauri::command]
 pub async fn coder_set_model_settings(
 	state: State<'_, AppState>,
@@ -275,27 +289,187 @@ pub async fn coder_set_model_settings(
 	} else {
 		Some(settings.bill_to.clone())
 	};
+	let providers_for_runner = settings.providers.clone();
+	let active_for_runner = settings.active_provider.clone();
 	state
 		.coder
 		.set_user_picks(settings.standard_model.clone(), settings.cheap_model.clone(), bill_to)
 		.await;
+	state.coder.set_providers(providers_for_runner, active_for_runner).await;
 
 	app_state_store::mutate(&state.config_dir, move |s| {
 		s.coder.standard_model = settings.standard_model;
 		s.coder.cheap_model = settings.cheap_model;
 		s.coder.bill_to = settings.bill_to;
+		s.coder.active_provider = settings.active_provider;
+		// Strip `has_api_key` before persisting — it's keyring-derived,
+		// not state, and surviving it on disk would let a hand-edited
+		// `state.json` claim a key is configured when the keyring is
+		// empty.
+		s.coder.providers = settings
+			.providers
+			.into_iter()
+			.map(|mut p| {
+				p.has_api_key = false;
+				p
+			})
+			.collect();
 	})
 	.await?;
 	Ok(())
 }
 
-/// Fetch the router's `/v1/models` catalog. One round trip per
-/// call — the frontend caches the result for the lifetime of the
-/// popover so the user can flip filters without re-hitting the
-/// network.
+/// Fetch the router's `/v1/models` catalog. **HF-only** — when a
+/// user provider is active, the command errors and the picker is
+/// expected to call `coder_list_provider_models` instead. One
+/// round trip per call; the frontend caches the result for the
+/// lifetime of the popover so flipping filters doesn't re-hit
+/// the network.
 #[tauri::command]
 pub async fn coder_list_models(state: State<'_, AppState>) -> Result<Vec<RouterModel>, MoonError> {
 	state.coder.list_models().await.map_err(MoonError::from)
+}
+
+/// Allocate a fresh opaque provider id. The picker's `Add provider`
+/// modal calls this before any keyring / config write so the
+/// keyring slot is addressable from the moment the user types a
+/// key, even if they cancel out of the modal before saving.
+/// Idempotent in the sense that a leaked id without any matching
+/// state is harmless — nothing reads the keyring slot until the
+/// provider config lands in `AppState`.
+#[tauri::command]
+pub async fn coder_new_provider_id(state: State<'_, AppState>) -> Result<String, MoonError> {
+	Ok(state.coder.new_provider_id())
+}
+
+/// Probe a `(base_url, api_key)` pair before the picker commits.
+/// Surfaces the upstream HTTP failure verbatim on error so the
+/// user can see "401 Unauthorized" / "couldn't reach host" / etc.
+/// `api_key` empty = probe without an `Authorization` header
+/// (local llama.cpp / Ollama).
+#[derive(Debug, Deserialize)]
+pub struct ProbeProviderArgs {
+	pub base_url: String,
+	#[serde(default)]
+	pub api_key: String,
+}
+
+#[tauri::command]
+pub async fn coder_probe_provider(
+	state: State<'_, AppState>,
+	args: ProbeProviderArgs,
+) -> Result<ProviderProbeResult, MoonError> {
+	let key = if args.api_key.is_empty() {
+		None
+	} else {
+		Some(args.api_key.as_str())
+	};
+	state
+		.coder
+		.probe_provider(&args.base_url, key)
+		.await
+		.map_err(MoonError::from)
+}
+
+/// Persist a per-provider API key in the OS keyring. Empty values
+/// are rejected — same trap the Tavily key avoids: a silently-empty
+/// entry would set `has_api_key: true` while every downstream
+/// call 401s. After this returns Ok, the next request resolving
+/// to this provider picks up the new key without rewiring.
+#[derive(Debug, Deserialize)]
+pub struct SetProviderApiKeyArgs {
+	pub id: String,
+	pub key: String,
+}
+
+#[tauri::command]
+pub async fn coder_set_provider_api_key(
+	state: State<'_, AppState>,
+	args: SetProviderApiKeyArgs,
+) -> Result<(), MoonError> {
+	state
+		.coder
+		.set_provider_api_key(&args.id, &args.key)
+		.map_err(MoonError::from)
+}
+
+/// Drop the keyring entry for a provider. Idempotent — fine to
+/// call on a provider that never had a key (the local-vLLM case
+/// where the user is just removing a stale entry).
+#[tauri::command]
+pub async fn coder_clear_provider_api_key(state: State<'_, AppState>, id: String) -> Result<(), MoonError> {
+	state.coder.clear_provider_api_key(&id).map_err(MoonError::from)
+}
+
+/// Flat `/v1/models` catalog for a user-added provider. The
+/// picker uses this instead of `coder_list_models` when a user
+/// provider is active. Returns the OpenAI-compat `{id, owned_by}`
+/// rows; the picker renders them as a flat searchable list
+/// (no pricing / throughput — those aren't uniform across
+/// OpenAI-compat servers).
+///
+/// Errors on network / 4xx / 5xx propagate verbatim. A 404 means
+/// the server doesn't expose the catalog endpoint; the picker
+/// shows "Catalog unavailable" and the user can still type a
+/// model slug directly into the field.
+#[tauri::command]
+pub async fn coder_list_provider_models(
+	state: State<'_, AppState>,
+	id: String,
+) -> Result<Vec<ProviderModelSummary>, MoonError> {
+	state.coder.list_provider_models(&id).await.map_err(MoonError::from)
+}
+
+/// Side-channel persist of a brand-new provider entry. Used by
+/// the `Add provider` modal so the new provider lands in
+/// `AppState` and the runtime view *before* the user has had a
+/// chance to flip it to active. The picker can call
+/// `coder_set_model_settings` later with the full state, but
+/// this commit-per-action shape keeps the "I clicked Save in
+/// the Add modal, but cancelled the outer modal" path from
+/// losing the provider.
+///
+/// The keyring entry, if any, was already written via
+/// `coder_set_provider_api_key` against `config.id` before this
+/// call — we don't take the key as a parameter here.
+#[tauri::command]
+pub async fn coder_save_provider(state: State<'_, AppState>, config: CoderProviderConfig) -> Result<(), MoonError> {
+	let (providers, active) = app_state_store::mutate(&state.config_dir, move |s| {
+		let mut cfg = config.clone();
+		// `has_api_key` is keyring-derived; never trust the caller.
+		cfg.has_api_key = false;
+		if let Some(existing) = s.coder.providers.iter_mut().find(|p| p.id == cfg.id) {
+			*existing = cfg;
+		} else {
+			s.coder.providers.push(cfg);
+		}
+		(s.coder.providers.clone(), s.coder.active_provider.clone())
+	})
+	.await?;
+	state.coder.set_providers(providers, active).await;
+	Ok(())
+}
+
+/// Drop a provider entry from `AppState` and its keyring slot.
+/// If the deleted provider was active, the runner falls back to
+/// HF (the only always-available route). Idempotent: deleting an
+/// unknown id is a no-op.
+#[tauri::command]
+pub async fn coder_delete_provider(state: State<'_, AppState>, id: String) -> Result<(), MoonError> {
+	// Drop the keyring entry first; even if the AppState write
+	// fails, we don't want the credential to outlive the config.
+	let _ = state.coder.clear_provider_api_key(&id);
+	let id_for_state = id.clone();
+	let (providers, active) = app_state_store::mutate(&state.config_dir, move |s| {
+		s.coder.providers.retain(|p| p.id != id_for_state);
+		if s.coder.active_provider.as_deref() == Some(id_for_state.as_str()) {
+			s.coder.active_provider = None;
+		}
+		(s.coder.providers.clone(), s.coder.active_provider.clone())
+	})
+	.await?;
+	state.coder.set_providers(providers, active).await;
+	Ok(())
 }
 
 /// `true` iff a Tavily API key is stored in the OS keyring. The

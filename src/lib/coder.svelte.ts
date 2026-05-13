@@ -23,10 +23,13 @@ import {
 	type CoderEvent,
 	type CoderEventEnvelope,
 	type CoderModelSettings,
+	type CoderProviderConfig,
 	type CoderSessionSummary,
 	type CoderStatus,
 	type DeviceCode,
 	type HfIdentity,
+	type ProviderModelSummary,
+	type ProviderProbeResult,
 	type RouterModel,
 	type SubagentMode,
 } from './protocol';
@@ -300,7 +303,8 @@ class CoderPanelState {
 	/** Fetch the router catalog. One round trip per call. The result
 	 *  is cached in [`routerModels`]; consumers should check that
 	 *  first and only call this when it's `null` (or when forcing a
-	 *  refresh on an explicit user gesture). */
+	 *  refresh on an explicit user gesture). HF-only — call
+	 *  [`loadProviderModels`] when a user provider is active. */
 	async loadModels(): Promise<void> {
 		if (this.modelsLoading) {
 			return;
@@ -314,6 +318,116 @@ class CoderPanelState {
 		} finally {
 			this.modelsLoading = false;
 		}
+	}
+
+	/** Flat `/v1/models` catalog for a user-added provider.
+	 *  Cached per-id in [`providerModels`] so flipping back to
+	 *  the same provider doesn't re-hit the network. The
+	 *  picker calls this every time the active provider
+	 *  changes; an explicit `Refresh` action flushes the cache. */
+	providerModels = $state<Record<string, ProviderModelSummary[] | null>>({});
+
+	async loadProviderModels(id: string): Promise<void> {
+		if (this.modelsLoading) {
+			return;
+		}
+		this.modelsLoading = true;
+		try {
+			const rows = await ipc.coder.listProviderModels(id);
+			this.providerModels = { ...this.providerModels, [id]: rows };
+			this.modelsError = null;
+		} catch (err) {
+			// Cache `[]` so the picker stops spinning + renders the
+			// "type a model id directly" hint. The error itself
+			// stays in `modelsError` for the inline message.
+			this.providerModels = { ...this.providerModels, [id]: [] };
+			this.modelsError = formatError(err);
+		} finally {
+			this.modelsLoading = false;
+		}
+	}
+
+	/** Forget the cached `/v1/models` rows for `id`. Used by the
+	 *  Edit-provider flow after a `base_url` change so the
+	 *  picker re-fetches against the new URL. */
+	forgetProviderModels(id: string): void {
+		const next = { ...this.providerModels };
+		delete next[id];
+		this.providerModels = next;
+	}
+
+	/** Probe a `(base_url, api_key)` pair from the Add/Edit
+	 *  provider modal. Throws the formatted error so the modal
+	 *  keeps the form open on failure. */
+	async probeProvider(baseUrl: string, apiKey: string): Promise<ProviderProbeResult> {
+		try {
+			return await ipc.coder.probeProvider(baseUrl, apiKey);
+		} catch (err) {
+			throw new Error(formatError(err), { cause: err });
+		}
+	}
+
+	/** Add or update a provider entry. The picker calls
+	 *  `setProviderApiKey` separately for the API key (it's
+	 *  keyring-bound and never round-trips through this shape).
+	 *  Refreshes [`modelSettings`] from the runner so the new
+	 *  shape lands without a manual round-trip. */
+	async saveProvider(config: CoderProviderConfig): Promise<void> {
+		try {
+			await ipc.coder.saveProvider(config);
+			await this.loadModelSettings();
+			this.modelsError = null;
+		} catch (err) {
+			this.modelsError = formatError(err);
+			throw err;
+		}
+	}
+
+	/** Delete a provider entry + its keyring slot. */
+	async deleteProvider(id: string): Promise<void> {
+		try {
+			await ipc.coder.deleteProvider(id);
+			this.forgetProviderModels(id);
+			await this.loadModelSettings();
+			this.modelsError = null;
+		} catch (err) {
+			this.modelsError = formatError(err);
+			throw err;
+		}
+	}
+
+	/** Persist a per-provider API key. Empty values rejected by
+	 *  the runner. Refreshes [`modelSettings`] so `has_api_key`
+	 *  flips on the picker without manual coordination. */
+	async setProviderApiKey(id: string, key: string): Promise<void> {
+		try {
+			await ipc.coder.setProviderApiKey(id, key);
+			await this.loadModelSettings();
+			this.modelsError = null;
+		} catch (err) {
+			this.modelsError = formatError(err);
+			throw err;
+		}
+	}
+
+	/** Drop a per-provider key. Idempotent. */
+	async clearProviderApiKey(id: string): Promise<void> {
+		try {
+			await ipc.coder.clearProviderApiKey(id);
+			await this.loadModelSettings();
+			this.modelsError = null;
+		} catch (err) {
+			this.modelsError = formatError(err);
+			throw err;
+		}
+	}
+
+	/** Allocate a fresh opaque provider id from the runner. The
+	 *  Add-provider modal uses this so the keyring slot for the
+	 *  API key is addressable before the provider config lands
+	 *  in `AppState`. */
+	async newProviderId(): Promise<string> {
+		return await ipc.coder.newProviderId();
 	}
 
 	/** True iff a Tavily API key is stored in the keyring. Tracked
