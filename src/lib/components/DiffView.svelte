@@ -4,7 +4,7 @@
 	import { EditorView, highlightActiveLine, highlightActiveLineGutter, keymap, lineNumbers } from '@codemirror/view';
 	import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 	import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
-	import { bracketMatching, indentOnInput, indentUnit } from '@codemirror/language';
+	import { bracketMatching, foldGutter, indentOnInput, indentUnit } from '@codemirror/language';
 	import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from '@codemirror/autocomplete';
 	import { MergeView, diff as rawDiff, goToNextChunk, goToPreviousChunk } from '@codemirror/merge';
 	import { ipc } from '../ipc';
@@ -203,6 +203,17 @@
 
 		const sharedLeft: Extension[] = [
 			lineNumbers(),
+			// Code folding mirrors the regular editor — both sides
+			// of the diff fold independently. `MergeView` already
+			// reacts to per-side `heightChanged` (via its update
+			// listener calling `updateSpacers`) and re-emits block
+			// spacers on whichever side is shorter at the start of
+			// each unchanged region, so folding a function on one
+			// side just rebalances the alignment. We skip the CM
+			// `foldKeymap` for the same AltGr-layout reason as
+			// the regular editor — see the comment on `foldGutter`
+			// in `Editor.svelte` for the full rationale.
+			foldGutter(),
 			EditorState.readOnly.of(true),
 			EditorView.editable.of(false),
 			highlightSelectionMatches(),
@@ -316,6 +327,12 @@
 
 		const rightExtensions: Extension[] = [
 			lineNumbers(),
+			// See comment on the left pane's `foldGutter()` —
+			// MergeView's spacer-based alignment absorbs per-side
+			// fold height changes, so it's safe to enable folding
+			// on the right too. No `foldKeymap` either (same
+			// AZERTY-layout reason as the regular editor).
+			foldGutter(),
 			highlightActiveLine(),
 			highlightActiveLineGutter(),
 			bracketMatching(),

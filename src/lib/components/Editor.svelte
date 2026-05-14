@@ -6,7 +6,7 @@
 	import { highlightTabs } from '../editor/highlightTabs';
 	import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 	import { searchKeymap, highlightSelectionMatches } from '@codemirror/search';
-	import { bracketMatching, indentOnInput, indentUnit } from '@codemirror/language';
+	import { bracketMatching, foldGutter, indentOnInput, indentUnit } from '@codemirror/language';
 	import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from '@codemirror/autocomplete';
 	import {
 		applyDiagnostics,
@@ -382,6 +382,34 @@
 		const ec = workspace.editorConfigFor(file.path);
 		return [
 			lineNumbers(),
+			// Code folding. The gutter sits immediately right of the
+			// line numbers so the markers stay visually anchored to
+			// the line they fold; pulls in `codeFolding()` as a
+			// dependency, so we don't add it separately. Languages
+			// that ship a Lezer grammar (TS/JS, JSON, Rust, Go,
+			// Python, HTML/Svelte, Vue, CSS, Markdown) declare fold
+			// ranges via `languageData.foldNodeProp` and get folding
+			// for free; legacy `StreamLanguage` modes (TOML, YAML,
+			// shell, dockerfile, properties, ignore, dotenv, JSONL)
+			// have no fold info and render an empty marker column —
+			// same behaviour as VS Code for those grammars.
+			//
+			// We deliberately do **not** install CM's `foldKeymap`.
+			// Its `Ctrl-Alt-[` / `Ctrl-Alt-]` (foldAll / unfoldAll)
+			// shadow the AltGr-`[` / AltGr-`]` glyphs on French
+			// AZERTY and other AltGr layouts: Linux browsers report
+			// AltGr as `ctrlKey + altKey`, and CM's `runHandlers`
+			// matches `event.key === '['` against `Ctrl-Alt-[`
+			// before any layout heuristic kicks in (the
+			// `browser.windows` guard inside CM only suppresses
+			// the keyCode-fallback path, not the keyName match),
+			// so typing a `[` literal would silently fold the
+			// whole file. The `Ctrl-Shift-[` / `]` pair is
+			// unreachable on AZERTY anyway. Click the gutter to
+			// fold; if a keyboard binding is wanted later, wire
+			// one whose key is layout-stable (an F-key, or a
+			// `Ctrl+K` leader sequence à la VS Code).
+			foldGutter(),
 			highlightActiveLine(),
 			highlightActiveLineGutter(),
 			bracketMatching(),

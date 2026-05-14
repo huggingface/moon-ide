@@ -36,6 +36,38 @@ function moonTheme(dark: boolean): Extension {
 				backgroundColor: 'transparent',
 				color: 'var(--m-fg)',
 			},
+			// Code-folding markers (▾ open, ▸ closed) live in their
+			// own gutter immediately right of the line numbers. CM6
+			// renders them as plain text glyphs; we just need them
+			// to pick up the editor palette instead of the upstream
+			// muted-grey default. `cursor: pointer` is the usual
+			// affordance — the user is going to want to click them.
+			'.cm-foldGutter .cm-gutterElement': {
+				color: 'var(--m-fg-subtle)',
+				cursor: 'pointer',
+				padding: '0 2px',
+			},
+			'.cm-foldGutter .cm-gutterElement:hover': {
+				color: 'var(--m-fg)',
+			},
+			// Placeholder shown inline where a folded range used to
+			// be (CM's default is the literal string `…`). Pad it
+			// out, give it a soft chip background, and let a click
+			// re-expand the range — same shape as VS Code's
+			// inline fold indicator.
+			'.cm-foldPlaceholder': {
+				backgroundColor: 'var(--m-bg-overlay)',
+				color: 'var(--m-fg-muted)',
+				border: '1px solid var(--m-border)',
+				borderRadius: '3px',
+				padding: '0 4px',
+				margin: '0 2px',
+				cursor: 'pointer',
+			},
+			'.cm-foldPlaceholder:hover': {
+				color: 'var(--m-fg)',
+				borderColor: 'var(--m-border-strong)',
+			},
 			'.cm-activeLine': {
 				backgroundColor: 'var(--m-editor-line-active)',
 			},
