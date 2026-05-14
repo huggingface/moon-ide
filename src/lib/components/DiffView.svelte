@@ -239,6 +239,12 @@
 					lspGotoDefinitionExtension({
 						jumpTo: (target, position, folder) => workspace.jumpTo(target, position, side, folder),
 						resolveExternalUri: (uri) => workspace.resolveExternalUri(uri),
+						recordSourcePosition: (target, position) => {
+							const folder = workspace.activeFolderPath;
+							if (folder !== null) {
+								workspace.pushClickNavigation(folder, target, position);
+							}
+						},
 						flash: (msg) => workspace.flash(msg),
 					}),
 					// `defaultKeymap: false` here mirrors `Editor.svelte`:

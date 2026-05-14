@@ -77,8 +77,38 @@ export type GotoDefinitionDeps = {
 	 * bound folder — the caller surfaces a toast instead.
 	 */
 	resolveExternalUri: (externalUri: string) => { folder: string; path: string } | null;
+	/**
+	 * Bookmark the source-file click position on the nav stack
+	 * before the jump fires. Called when the modifier-click lands
+	 * more than [`NAV_BOOKMARK_LINE_THRESHOLD`] lines from the
+	 * current caret — otherwise the existing tip (placed by an
+	 * earlier real click or by `pushFileSwitchEntry`) is already
+	 * close enough that an extra bookmark is noise. The plugin
+	 * pushes through this callback instead of touching workspace
+	 * state directly so the module stays UI-pure.
+	 */
+	recordSourcePosition: (path: string, position: LspPosition) => void;
 	flash: (message: string) => void;
 };
+
+/**
+ * Lines of distance between the current caret and a modifier-click
+ * before we consider the click "far away" enough to warrant its
+ * own nav-history bookmark.
+ *
+ * On Linux/Windows, CodeMirror's mousedown handler does **not**
+ * move the primary cursor on a Ctrl+Click (the modifier is
+ * reserved for multi-cursor / rectangular select). That means the
+ * editor's selection-update listener never sees the click and
+ * never records it via `pushClickNavigation`. Without an explicit
+ * bookmark, Alt+Left after a jump lands at the previous tip —
+ * often `(line 0, char 0)` when the file was just opened from
+ * the tree. The threshold below skips the redundant bookmark
+ * when the click is within a couple of lines of the caret
+ * (typical "I'm reading this region anyway" case) and records
+ * it when the user has scanned somewhere new.
+ */
+const NAV_BOOKMARK_LINE_THRESHOLD = 3;
 
 /**
  * Build the goto-definition extension. The returned bundle is:
@@ -242,6 +272,17 @@ export function lspGotoDefinitionExtension(deps: GotoDefinitionDeps): Extension 
 				const position = positionFor(this.view, pos);
 				event.preventDefault();
 				event.stopPropagation();
+				// Bookmark the click position on the nav stack before
+				// the jump fires, so Alt+Left lands at the
+				// jump-from spot instead of the file's previous tip
+				// (which is (0, 0) when the user only just opened
+				// the file from the tree). See
+				// `NAV_BOOKMARK_LINE_THRESHOLD` for the
+				// "close enough to skip" rule.
+				const caret = positionFor(this.view, this.view.state.selection.main.head);
+				if (Math.abs(caret.line - position.line) >= NAV_BOOKMARK_LINE_THRESHOLD) {
+					deps.recordSourcePosition(path, position);
+				}
 				void this.jump(path, languageId, position);
 			}
 

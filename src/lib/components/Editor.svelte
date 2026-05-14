@@ -417,6 +417,12 @@
 			lspGotoDefinitionExtension({
 				jumpTo: (path, position, folder) => workspace.jumpTo(path, position, side, folder),
 				resolveExternalUri: (uri) => workspace.resolveExternalUri(uri),
+				recordSourcePosition: (path, position) => {
+					const folder = workspace.activeFolderPath;
+					if (folder !== null) {
+						workspace.pushClickNavigation(folder, path, position);
+					}
+				},
 				flash: (msg) => workspace.flash(msg),
 			}),
 			lspPathCompartment.of(filePathFacet.of(file.path)),
