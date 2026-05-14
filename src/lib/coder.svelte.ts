@@ -988,12 +988,31 @@ class CoderPanelState {
 			const id = appState.coder.last_session_by_folder[folderKey];
 			if (id) {
 				try {
-					await this.openSession(id);
+					// Call the IPC directly rather than going
+					// through `this.openSession(id)`. The latter
+					// has its own try/catch that surfaces failures
+					// as an inline error row — correct for an
+					// explicit user click, but wrong for silent
+					// hydration: the row would mount with the
+					// error already in `rows` and the user would
+					// have to back out manually to recover. Direct
+					// IPC lets the error bubble to the catch below
+					// so we fall through to the sessions list
+					// instead. The state-reset that `openSession`
+					// does before its IPC call is a no-op here
+					// because the bucket is freshly initialised at
+					// hydration time.
+					const summary = await ipc.coder.openSession(id);
+					this.activeSession = summary;
+					this.view = 'session';
 					return;
 				} catch {
-					// Stale pointer — the session was deleted, or
-					// we just switched to a folder that doesn't
-					// have it. Drop into the list view.
+					// Stale pointer — the session no longer exists
+					// on disk (manual rm, dev-cleanup of
+					// `~/.local/share/moon-ide/`, etc.). Fall
+					// through to the list view; the pointer will
+					// be overwritten the next time the user opens
+					// or sends in a session.
 				}
 			}
 		} catch {

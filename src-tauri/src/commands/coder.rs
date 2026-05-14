@@ -95,9 +95,37 @@ pub async fn coder_sign_out(state: State<'_, AppState>) -> Result<(), MoonError>
 /// resolves once the turn has been spawned, then events stream over
 /// the `coder:event` channel. Errors here mean the turn never
 /// started (no auth, already-running turn, etc.).
+///
+/// Pins `last_session_by_folder[active]` to the active session after
+/// a successful send. Two reasons:
+///
+/// 1. `new_session` doesn't persist a pointer — empty sessions
+///    aren't on disk yet, so there's no id worth remembering until
+///    the first record lands. Without this nudge, "create new
+///    session → send → quit" leaves the pointer on whichever
+///    previous session the user had open, and the next launch
+///    hydrates the wrong transcript.
+/// 2. If the previous pointer was stale (session deleted out-of-
+///    band), `persist_last_session` here overwrites it. Combined
+///    with the silent fall-through in `coder.svelte.ts`'
+///    `#hydrateSession`, that turns the "host error: Aucun
+///    fichier ou dossier de ce nom" stuck-error-row failure mode
+///    into a self-healing one — the first send after a relaunch
+///    refreshes the pointer for next time.
+///
+/// `persist_last_session` is a cheap no-op when the pointer
+/// already matches, so we don't bother gating it on "is the
+/// pointer stale".
 #[tauri::command]
 pub async fn coder_send(state: State<'_, AppState>, text: String) -> Result<(), MoonError> {
-	state.coder.send(text).await.map_err(MoonError::from)
+	state.coder.send(text).await.map_err(MoonError::from)?;
+	let folder = active_folder_path(&state).await;
+	if let Some(folder) = folder {
+		if let Some(summary) = state.coder.active_session().await {
+			persist_last_session(&state.config_dir, &folder, Some(summary.id)).await;
+		}
+	}
+	Ok(())
 }
 
 /// Suggest a kebab-cased branch name based on the user's draft
