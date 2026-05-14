@@ -1,3 +1,44 @@
+/* Bundled Fantasque Sans Mono — a programming font with built-in
+   coding ligatures (==, !=, =>, ->, …), distributed under the SIL
+   Open Font License 1.1 (see `assets/fonts/fantasque-sans-mono/
+   LICENSE.txt`). Bundling lets the IDE render the same way on every
+   machine instead of falling back to whatever monospace font the
+   host happens to ship. We only carry the four `.woff2` weights —
+   modern WebKit (which Tauri uses) reads woff2 natively, so the
+   .woff / .ttf / .svg fallbacks the upstream `*-decl.css` snippets
+   include aren't needed. `font-display: swap` is irrelevant for
+   files this small served off-disk by Tauri, but it costs nothing
+   and protects against the (rare) case where a slow first paint
+   would otherwise FOIT. */
+@font-face {
+	font-family: 'Fantasque Sans Mono';
+	src: url('./assets/fonts/fantasque-sans-mono/FantasqueSansMono-Regular.woff2') format('woff2');
+	font-weight: 400;
+	font-style: normal;
+	font-display: swap;
+}
+@font-face {
+	font-family: 'Fantasque Sans Mono';
+	src: url('./assets/fonts/fantasque-sans-mono/FantasqueSansMono-Italic.woff2') format('woff2');
+	font-weight: 400;
+	font-style: italic;
+	font-display: swap;
+}
+@font-face {
+	font-family: 'Fantasque Sans Mono';
+	src: url('./assets/fonts/fantasque-sans-mono/FantasqueSansMono-Bold.woff2') format('woff2');
+	font-weight: 700;
+	font-style: normal;
+	font-display: swap;
+}
+@font-face {
+	font-family: 'Fantasque Sans Mono';
+	src: url('./assets/fonts/fantasque-sans-mono/FantasqueSansMono-BoldItalic.woff2') format('woff2');
+	font-weight: 700;
+	font-style: italic;
+	font-display: swap;
+}
+
 /* Theme tokens. Override in light mode by toggling the `.light` class on :root. */
 :root {
 	/* Tells the user agent which palette to use for *native* widgets
@@ -94,7 +135,25 @@
 	--trees-padding-inline-override: 6px;
 
 	--m-font-ui: -apple-system, 'Inter', system-ui, 'Segoe UI', Roboto, sans-serif;
-	--m-font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+	/* Fantasque Sans Mono is bundled (see the `@font-face` block at
+	   the top of this file), so the first family in the stack is
+	   guaranteed to load. The remaining fallbacks stay as a safety
+	   net for any future host without webfont support. */
+	--m-font-mono:
+		'Fantasque Sans Mono', 'JetBrains Mono', 'Fira Code', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+
+	/* Activate the contextual-alternates OpenType feature globally
+	   so Fantasque Sans Mono's coding ligatures (`==`, `!=`, `=>`,
+	   `->`, `<=`, `>=`, `<-`, `|>`, `<>`, `::`, …) actually render
+	   on every surface that pulls `var(--m-font-mono)`. Without
+	   `calt` enabled, the glyphs sit on separate ems and read as
+	   the individual characters. `font-feature-settings` inherits,
+	   so setting it on `:root` cascades through every descendant
+	   that doesn't override it — Inter and the system-ui fallbacks
+	   define no `calt` substitutions so it's a no-op for the UI
+	   font, which lets us avoid touching every component CSS.
+	   `liga` is on by default in browsers, so we don't list it. */
+	font-feature-settings: 'calt' 1;
 }
 
 :root.light {

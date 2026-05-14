@@ -19,7 +19,7 @@ function moonTheme(dark: boolean): Extension {
 				color: 'var(--m-fg)',
 				backgroundColor: 'var(--m-editor-bg)',
 				height: '100%',
-				fontSize: '13px',
+				fontSize: '15px',
 				fontFamily: 'var(--m-font-mono)',
 			},
 			'.cm-content': {

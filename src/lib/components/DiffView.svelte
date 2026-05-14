@@ -21,6 +21,7 @@
 		lspHoverExtension,
 		offsetForLspPosition,
 	} from '../editor/lsp';
+	import { diffPureChangeExtension } from '../editor/diffPureChange';
 	import { lspGotoDefinitionExtension } from '../editor/lspGotoDefinition';
 	import { lspOverviewExtension } from '../editor/lspOverview';
 	import { frontendLog } from '../logs.svelte';
@@ -203,6 +204,11 @@
 
 		const sharedLeft: Extension[] = [
 			lineNumbers(),
+			// See `diffPureChange.ts` — tags whole-chunk pure-delete
+			// lines on A so the inner per-character red highlight
+			// is stripped (the gutter and line tint already say
+			// "this entire line is gone").
+			diffPureChangeExtension,
 			// Code folding mirrors the regular editor — both sides
 			// of the diff fold independently. `MergeView` already
 			// reacts to per-side `heightChanged` (via its update
@@ -327,6 +333,11 @@
 
 		const rightExtensions: Extension[] = [
 			lineNumbers(),
+			// Same pure-add/delete tagging as the left pane — here it
+			// strips the inner green highlight on whole-chunk
+			// additions, since the line gutter + background already
+			// communicate the change.
+			diffPureChangeExtension,
 			// See comment on the left pane's `foldGutter()` —
 			// MergeView's spacer-based alignment absorbs per-side
 			// fold height changes, so it's safe to enable folding
@@ -951,5 +962,21 @@
 	}
 	.diff-host :global(.cm-merge-b .cm-deletedText) {
 		background: color-mix(in srgb, var(--m-danger) 22%, transparent) !important;
+	}
+	/* Pure-added / pure-deleted lines: the line-level change is
+	 * already conveyed by the gutter bar (`.cm-changedLineGutter`
+	 * — green on B for additions, red on A for deletions) and the
+	 * subtle line-background tint. Layering the per-character
+	 * highlight (`.cm-changedText`) on top doubles up the same hue
+	 * across the entire line and reads as saturated noise without
+	 * adding information. The line decoration `.cm-moon-pure-change`
+	 * is added by `diffPureChange.ts` on whole-chunk pure-add/
+	 * pure-delete ranges (queried from `getChunks(state)` on each
+	 * pane), so this rule only strips the highlight where it's
+	 * redundant — modified lines keep their per-character markers
+	 * since the substring-vs-surrounding-text distinction is
+	 * useful there. */
+	.diff-host :global(.cm-moon-pure-change .cm-changedText) {
+		background: transparent !important;
 	}
 </style>
