@@ -45,6 +45,7 @@
 	import PullRequestIcon from './icons/PullRequestIcon.svelte';
 	import RefreshIcon from './icons/RefreshIcon.svelte';
 	import RevertIcon from './icons/RevertIcon.svelte';
+	import ReviewIcon from './icons/ReviewIcon.svelte';
 	import SparklesIcon from './icons/SparklesIcon.svelte';
 
 	const branch = $derived(workspace.gitBranch);
@@ -714,6 +715,17 @@
 				{/if}
 				{#if compareToggleApplicable}
 					{@const isDefault = workspace.compareBaseline === 'default'}
+					{#if isDefault && changeCount > 0}
+						<button
+							type="button"
+							class="icon-btn"
+							title={`Open aggregated diff against ${compareLabel}`}
+							aria-label={`Open aggregated diff against ${compareLabel}`}
+							onclick={() => workspace.openReviewTab()}
+						>
+							<ReviewIcon />
+						</button>
+					{/if}
 					<button
 						type="button"
 						class="compare-pill"

@@ -54,6 +54,7 @@ import { slack } from './slack.svelte';
 import { fingerprint, fingerprintEquals, type ContentFingerprint } from './util/hash';
 import { fileKindFor, type FileKind } from './util/fileKind';
 import { isMarkdownPath } from './util/markdown';
+import { isReviewPath, REVIEW_PATH } from './util/reviewPath';
 
 export type MarkdownView = 'source' | 'preview';
 
@@ -425,6 +426,15 @@ class WorkspaceState {
 	// declarative.
 	sidebarFocusTick = $state(0);
 	statusFocusTick = $state(0);
+
+	// "Scroll-to-section" signal for the Review changes pseudo-tab.
+	// When the review tab is active in some pane and the user clicks
+	// a file row in the SCM changes tree, we bump this with the
+	// clicked path; `ReviewView` watches it and scrolls its matching
+	// section into view. `tick` makes repeated clicks on the same
+	// row re-trigger the effect — without it Svelte would dedupe the
+	// reactive update and the second click would feel broken.
+	reviewScrollRequest = $state<{ path: string; tick: number } | null>(null);
 
 	// Linear navigation history, browser-style but position-aware (each
 	// entry pins a caret inside a file rather than just a path).
@@ -809,7 +819,7 @@ class WorkspaceState {
 				if (file.kind !== 'text' || file.isDeleted) {
 					continue;
 				}
-				if (file.path.startsWith('untitled:')) {
+				if (isSyntheticBufferPath(file.path)) {
 					continue;
 				}
 				this.lspOpen(file.path, file.text);
@@ -1498,7 +1508,7 @@ class WorkspaceState {
 					}
 				}
 			}
-			const isPersistable = (p: string) => !isUntitledPath(p) && !externalSet.has(p);
+			const isPersistable = (p: string) => !isSyntheticBufferPath(p) && !externalSet.has(p);
 			const realPaths = (paths: string[]) => paths.filter(isPersistable);
 			const realActive = (path: string | null) => (path !== null && isPersistable(path) ? path : null);
 			const folderSessions: FolderSession[] = [];
@@ -2713,7 +2723,7 @@ class WorkspaceState {
 	 */
 	lspOpen(path: string, text: string) {
 		const languageId = lspLanguageFor(path);
-		if (!languageId || path.startsWith('untitled:')) {
+		if (!languageId || isSyntheticBufferPath(path)) {
 			return;
 		}
 		// Swallow failures: if the server crashes mid-session or
@@ -2738,7 +2748,7 @@ class WorkspaceState {
 		if (file === null) {
 			return;
 		}
-		if (file.path.startsWith('untitled:')) {
+		if (isSyntheticBufferPath(file.path)) {
 			return;
 		}
 		const fileLang = lspLanguageFor(file.path);
@@ -2756,7 +2766,7 @@ class WorkspaceState {
 	 */
 	lspScheduleUpdate(path: string, text: string) {
 		const languageId = lspLanguageFor(path);
-		if (!languageId || path.startsWith('untitled:')) {
+		if (!languageId || isSyntheticBufferPath(path)) {
 			return;
 		}
 		const existing = this.#lspUpdateTimers.get(path);
@@ -2784,7 +2794,7 @@ class WorkspaceState {
 	 */
 	lspNotifyAfterSave(path: string, text: string) {
 		const languageId = lspLanguageFor(path);
-		if (!languageId || path.startsWith('untitled:')) {
+		if (!languageId || isSyntheticBufferPath(path)) {
 			return;
 		}
 		const existing = this.#lspUpdateTimers.get(path);
@@ -2828,7 +2838,7 @@ class WorkspaceState {
 			if (file.kind !== 'text' || file.isDeleted) {
 				continue;
 			}
-			if (file.path.startsWith('untitled:')) {
+			if (isSyntheticBufferPath(file.path)) {
 				continue;
 			}
 			if (lspLanguageFor(file.path) !== languageId) {
@@ -2855,7 +2865,7 @@ class WorkspaceState {
 			next.delete(path);
 			this.diagnostics = next;
 		}
-		if (!languageId || path.startsWith('untitled:')) {
+		if (!languageId || isSyntheticBufferPath(path)) {
 			return;
 		}
 		void ipc.lsp.close(path, languageId).catch(() => {});
@@ -2874,7 +2884,7 @@ class WorkspaceState {
 	 * path anyway.
 	 */
 	refreshBlame(path: string) {
-		if (path.startsWith('untitled:')) {
+		if (isSyntheticBufferPath(path)) {
 			return;
 		}
 		if (this.#blameInFlight.has(path)) {
@@ -2921,7 +2931,7 @@ class WorkspaceState {
 	 * enough.
 	 */
 	scheduleBlameRefresh(path: string) {
-		if (path.startsWith('untitled:')) {
+		if (isSyntheticBufferPath(path)) {
 			return;
 		}
 		const existing = this.#blameTimers.get(path);
@@ -2962,7 +2972,7 @@ class WorkspaceState {
 	 * focus, and the extension treats `null` as "no gutter" anyway.
 	 */
 	refreshHead(path: string) {
-		if (path.startsWith('untitled:')) {
+		if (isSyntheticBufferPath(path)) {
 			return;
 		}
 		if (this.#headInFlight.has(path)) {
@@ -3050,7 +3060,58 @@ class WorkspaceState {
 		this.setActive(path, side);
 	}
 
+	/**
+	 * Open (or focus, if already open) the "Review changes" pseudo-
+	 * tab for the active folder. The tab renders a stack of read-
+	 * only diff sections against the default-branch merge-base —
+	 * the entry point is the SCM panel's `vs main` row when the
+	 * compare baseline is `'default'` and there are changes.
+	 *
+	 * Synthetic `OpenFile` carries empty bytes; everything routes
+	 * off `workspace.gitStatusEntries` and
+	 * `workspace.defaultBranchMergeBase` inside `ReviewView`. The
+	 * path uses the `review://` prefix so persistence, LSP, blame,
+	 * and HEAD fetch all skip it (see `isSyntheticBufferPath`).
+	 */
+	openReviewTab(side: SplitSide = this.focusedSide) {
+		const path = REVIEW_PATH;
+		const existing = this.openFiles.find((f) => f.path === path);
+		if (!existing) {
+			const file: OpenFile = {
+				path,
+				name: 'Review changes',
+				kind: 'text',
+				isUntitled: false,
+				text: '',
+				previewUrl: '',
+				loadedFingerprint: fingerprint(''),
+				loadedMtimeMs: null,
+				isDirty: false,
+				isDeleted: false,
+				isExternal: false,
+			};
+			this.openFiles = [...this.openFiles, file];
+		}
+		const tabs = this.tabsFor(side);
+		if (!tabs.includes(path)) {
+			this.setTabsFor(side, [...tabs, path]);
+		}
+		this.setActive(path, side);
+	}
+
 	async openFile(path: string, side: SplitSide = this.focusedSide, options: { focus?: boolean } = {}) {
+		// Nav-history (Alt+Left / forward) replays through `openFile`,
+		// and the review pseudo-tab can sit in history just like a
+		// real path. If the tab was closed in the meantime, the
+		// synthetic OpenFile is gone from `openFiles` and the
+		// fileKindFor / loadTextFile fall-through below would try to
+		// IPC-load `review://default-branch` and fail. Re-route
+		// review paths through `openReviewTab`, which rebuilds the
+		// stub buffer on demand.
+		if (isReviewPath(path)) {
+			this.openReviewTab(side);
+			return;
+		}
 		const existing = this.openFiles.find((f) => f.path === path);
 		if (!existing) {
 			const kind = fileKindFor(path);
@@ -3232,7 +3293,7 @@ class WorkspaceState {
 		// the buffer to a real location. Until then the editor falls back
 		// to `defaultEditorConfig`, same as it does during the first paint
 		// of any tab before its IPC roundtrip resolves.
-		if (isUntitledPath(path)) {
+		if (isSyntheticBufferPath(path)) {
 			return;
 		}
 		// External buffers live outside every bound folder; the active
@@ -4356,6 +4417,23 @@ class WorkspaceState {
 		this.statusFocusTick += 1;
 	}
 
+	/** True iff some open pane currently shows the Review pseudo-tab.
+	 *  Drives the SCM filter tree's click semantics — when this is
+	 *  `true`, a row click scrolls the review view rather than
+	 *  opening a new editor tab. */
+	get isReviewTabVisible(): boolean {
+		return this.leftActive === REVIEW_PATH || (this.hasSplit && this.rightActive === REVIEW_PATH);
+	}
+
+	/** Ask the open `ReviewView` to scroll its `path` section into
+	 *  view. Bumps `tick` even on repeat-same-path clicks so the
+	 *  reactivity round-trips. No-op if no review tab is currently
+	 *  open — the caller decides whether to also open one. */
+	requestReviewScroll(path: string) {
+		const tick = (this.reviewScrollRequest?.tick ?? 0) + 1;
+		this.reviewScrollRequest = { path, tick };
+	}
+
 	focusSide(side: SplitSide) {
 		if (this.focusedSide === side) {
 			return;
@@ -5028,6 +5106,17 @@ function relativeToRoot(absolute: string, root: string): string | null {
 
 export function isUntitledPath(path: string): boolean {
 	return path.startsWith('untitled:');
+}
+
+/** True for any synthetic path that doesn't back onto a real
+ *  on-disk file under a bound folder — `untitled:N` unsaved
+ *  buffers and the `review://` pseudo-tab. Used by every gate
+ *  that would otherwise route to the host's filesystem (LSP,
+ *  blame, HEAD fetch, persistence, format-on-save, …) so we
+ *  don't fire IPCs that are guaranteed to fail or, worse,
+ *  silently match the wrong file. */
+export function isSyntheticBufferPath(path: string): boolean {
+	return isUntitledPath(path) || isReviewPath(path);
 }
 
 /**

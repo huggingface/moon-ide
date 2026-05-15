@@ -4,10 +4,12 @@
 	import DiffView from './DiffView.svelte';
 	import ImageView from './ImageView.svelte';
 	import MarkdownView from './MarkdownView.svelte';
+	import ReviewView from './ReviewView.svelte';
 	import Welcome from './Welcome.svelte';
 	import { open } from '@tauri-apps/plugin-dialog';
 	import { workspace, type SplitSide } from '../state.svelte';
 	import { isMarkdownPath } from '../util/markdown';
+	import { isReviewPath } from '../util/reviewPath';
 
 	type Props = { side: SplitSide };
 	let { side }: Props = $props();
@@ -30,8 +32,12 @@
 	// was deleted?" — a side-by-side against an empty pane just
 	// halves the reading space. `Editor.svelte` flips itself
 	// read-only when `file.isDeleted`, so the normal view is safe.
+	const showReview = $derived(activeFile !== null && isReviewPath(activeFile.path));
 	const showDiff = $derived.by(() => {
 		if (activeFile === null || activeFile.kind !== 'text') {
+			return false;
+		}
+		if (showReview) {
 			return false;
 		}
 		return workspace.diffModeFor(activeFile.path);
@@ -41,7 +47,8 @@
 			activeFile.kind === 'text' &&
 			isMarkdownPath(activeFile.path) &&
 			workspace.previewModeFor(activeFile.path) === 'preview' &&
-			!showDiff,
+			!showDiff &&
+			!showReview,
 	);
 	// Show the "Add to Coder" hint only when this pane is showing
 	// the file the workspace's `activeSelection` points at, and
@@ -60,7 +67,7 @@
 		if (activeFile === null || activeFile.kind !== 'text') {
 			return false;
 		}
-		if (showMarkdownPreview) {
+		if (showMarkdownPreview || showReview) {
 			return false;
 		}
 		return selection.path === activeFile.path;
@@ -90,19 +97,24 @@
 	<EditorTabs {side} />
 	<div class="body">
 		{#if activeFile?.kind === 'image'}
-			<!-- Image / Diff / Markdown views build CodeMirror /
-			     image state in `onMount` and don't watch `file.path`
-			     internally — `Editor` is the only view that handles
-			     path swaps in-place. Key the others on the path so a
-			     tab change behind the same view kind (e.g. clicking
-			     another modified file while the current one is in
-			     diff mode) tears down the old instance and rebuilds.
-			     Without the key the right-side merge editor's
-			     update-listener still carries the original path in
-			     its closure and ends up writing the new file's text
-			     into the old file's buffer. -->
+			<!-- Image / Diff / Markdown / Review views build
+			     CodeMirror / image state in `onMount` and don't
+			     watch `file.path` internally — `Editor` is the
+			     only view that handles path swaps in-place. Key
+			     the others on the path so a tab change behind the
+			     same view kind (e.g. clicking another modified
+			     file while the current one is in diff mode) tears
+			     down the old instance and rebuilds. Without the
+			     key the right-side merge editor's update-listener
+			     still carries the original path in its closure and
+			     ends up writing the new file's text into the old
+			     file's buffer. -->
 			{#key activeFile.path}
 				<ImageView file={activeFile} />
+			{/key}
+		{:else if activeFile && showReview}
+			{#key activeFile.path}
+				<ReviewView />
 			{/key}
 		{:else if activeFile && showDiff}
 			{#key activeFile.path}

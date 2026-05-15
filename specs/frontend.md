@@ -94,7 +94,7 @@ Anything not in that list is intentionally off. Notably **no** rectangular selec
 Different jobs, different tools:
 
 - **Working-tree diff** (modified-file `View diff`, deleted files): `@codemirror/merge`'s `MergeView` — two CodeMirror editors side by side, sharing the regular editor's language / theme / editorconfig stack. Left side (`HEAD`) is read-only, right side (working tree) is editable so the user can fix things up directly inside the diff. `Ctrl+S` writes the right-hand buffer back through the normal `saveActive` path.
-- **Read-only diffs** (commit detail, SCM review panel, PR hover): same `@codemirror/merge` engine, configured with both sides read-only. Avoids carrying two diff renderers around.
+- **Read-only diffs** (commit detail, SCM review panel, PR hover, **Review changes** pseudo-tab): same `@codemirror/merge` engine, configured with both sides read-only. Avoids carrying two diff renderers around. The Review pseudo-tab (`review://default-branch`, see Phase 5 §5.4) stacks one `MergeView` per changed file inside a single scrollable container; each section lazy-mounts on `IntersectionObserver` hit so opening a 100-file branch stays snappy.
 - **Editable merge conflicts**: `@codemirror/merge`. Its `MergeView` is a real CM editor with a diff gutter, so the same keybindings, theme, selection, and undo stack apply — a conflict-resolution buffer is just a CM buffer with extra chrome. Not yet wired; lands alongside the SCM "resolve conflicts" flow.
 - **Main editor buffer**: CodeMirror 6, as above.
 

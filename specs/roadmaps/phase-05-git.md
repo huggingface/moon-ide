@@ -206,6 +206,13 @@ The right-side-of-the-folder-bar SCM panel:
   pill suppresses itself on the default branch and when no
   default branch resolves; it stacks orthogonally with the
   changes-only filter.
+- **Review changes** entry point. When the baseline is
+  `'default'` and there's at least one entry, a "stacked diff"
+  icon button appears just before the `vs main` pill. Click
+  opens (or focuses) the **Review changes** pseudo-tab — a
+  scrollable stack of per-file diff sections against the
+  merge-base, the same view a reviewer would see on a PR. See
+  §5.4 for the tab itself.
 - **Periodic auto-fetch.** `WorkspaceHost::git_fetch` shells out
   to `git fetch --quiet --no-tags` with prompts disabled
   (`GIT_TERMINAL_PROMPT=0`, blanked `GIT_ASKPASS` /
@@ -292,7 +299,110 @@ Changes` that surfaces when the repo's default branch
   Container `gh` shares the host's auth via the `~/.config/gh`
   read-only bind mount (see `specs/containers.md`).
 
-### 5.4 — Search ignores `.git/`
+### 5.4 — Review changes (aggregated diff)
+
+**Status**: shipped (no test plan).
+
+`Diff view` (§5.2) opens one file's changes at a time. When the
+user wants to look at _the whole branch_ (their own PR, before
+opening it on GitHub), per-file flipping is too slow — and the
+existing changes-tree gives a list but not a "scroll through every
+diff" surface. The Review changes pseudo-tab is that surface.
+
+**Entry point.** The SCM panel header paints a stacked-diff icon
+button immediately to the left of the `vs <default>` pill,
+visible only when
+
+- the per-folder compare baseline is `'default'` (so we have a
+  merge-base SHA and `gitStatusEntries` already reflects
+  branch-vs-base), and
+- there's at least one changed entry.
+
+Click opens or focuses the review tab in the current pane.
+
+**The tab itself.** A synthetic `OpenFile` keyed on
+`review://default-branch` (`isReviewPath()` in
+`src/lib/util/reviewPath.ts`). The path uses a non-filesystem
+scheme so every gate that would otherwise route to the host
+(LSP open / update / close, blame, HEAD fetch, editorconfig,
+persistence, format-on-save) skips it via the unified
+`isSyntheticBufferPath` helper. The synthetic buffer carries
+empty bytes; all data flows in through reactive reads of
+`workspace.gitStatusEntries` and
+`workspace.defaultBranchMergeBase` inside `ReviewView.svelte`.
+
+`EditorPane.svelte` recognises the prefix and mounts
+`ReviewView` instead of `Editor` / `DiffView`. The view renders
+a scrollable stack of `ReviewSection`s, one per non-ignored
+entry — each a read-only `MergeView` with left = merge-base
+blob (`ipc.fs.gitRefContent(mergeBase, path)`) and right = the
+open buffer text (so unsaved edits show up in the review) or a
+fresh `readFile` if the buffer isn't loaded.
+
+**Unchanged regions collapse.** Each section runs `MergeView`
+with `collapseUnchanged: { margin: 3, minSize: 5 }` so long
+runs of identical lines fold behind a clickable `… N unchanged
+lines` placeholder. Opposite trade-off from `DiffView`
+(single-file mode, where the change-bar gutter and overview
+ruler already locate the diff and the placeholder gets in the
+way of `Ctrl+F` / scroll): in the aggregated view a 30-file
+branch with a 2000-line file changed in 20 places would
+otherwise force the reader to scroll past acres of unchanged
+code between sections. `margin: 3` matches `git diff -U3`;
+`minSize: 5` keeps small gaps between adjacent hunks expanded
+so they read continuously.
+
+A single tab per folder; clicking the SCM button while the
+review is already open just focuses it. Closing the tab GCs the
+synthetic buffer through the same `closeFile` path real buffers
+use.
+
+**Performance: lazy-mount.** The first two sections build their
+`MergeView` eagerly so the user sees content immediately.
+Everything else mounts on first viewport hit via
+`IntersectionObserver` with a `rootMargin: 50%` pre-build window,
+and _stays mounted_ once built — scroll position and fold state
+survive a scroll-away. On a 100-file PR that's the difference
+between "review tab is the new welcome screen" and "review tab
+opens snappily".
+
+**TOC: SCM tree doubles as navigation.** When the review tab is
+visible in some pane (`workspace.isReviewTabVisible`),
+`FileTree.svelte`'s `activateRowFromTree` reroutes click events
+in `mode === 'changes'`: instead of opening that file as a new
+editor tab, it calls `workspace.requestReviewScroll(path)` which
+bumps a `{ path, tick }` signal on `WorkspaceState`. `ReviewView`
+watches the signal and `scrollIntoView`s the matching section.
+The `tick` field makes repeat-same-path clicks re-trigger the
+effect — same pattern as `focusTick`. Plain (`mode === 'all'`)
+tree clicks keep their open-as-editor behaviour.
+
+**Keyboard nav inside the view.** `n` / `p` (terminal-pager style)
+and `Alt-ArrowDown` / `Alt-ArrowUp` jump between adjacent file
+sections. The listener sits on the scroll container; events that
+originate inside a CodeMirror editor are ignored (so `n` keystrokes
+in CM's search panel keep their normal meaning). The container
+auto-focuses on mount so the bindings work without a click.
+
+**What the review tab is not.** Read-only by design: editing
+happens by opening the file in a normal editor tab (header has
+an "open" affordance — clicking the path opens the file). No
+per-hunk staging, no inline comments, no LSP wiring on the
+diff editors. We skip those because
+
+- editing diffs in-place is what `DiffView` is for (single file,
+  editable right side); the review tab is the bird's-eye view,
+- LSP `didOpen` per file would explode broker traffic on large
+  PRs for zero new signal — the regular Editor view on each
+  file already provides full LSP when needed, and
+- the per-file `MergeView` is heavy enough that doubling it up
+  with completion / hover popovers would push the lazy-mount
+  budget into perceptible jank.
+
+If those become real itches we revisit with hard numbers, not
+speculation.
+
+### 5.5 — Search ignores `.git/`
 
 **Status**: shipped (no test plan).
 

@@ -1368,6 +1368,19 @@
 		if (!item || item.isDirectory()) {
 			return;
 		}
+		// Review-changes pseudo-tab is open and we're in the
+		// changes-only tree: route the click to a "scroll my
+		// section into view" signal on `WorkspaceState` instead
+		// of opening a new editor tab. The review view is the
+		// aggregated diff for *this exact file list*, so the
+		// click "selects" the file inside the open review rather
+		// than spawning a per-file diff next to it. Plain tree
+		// (`mode === 'all'`) keeps its open-as-editor-tab
+		// behaviour — review never appears there.
+		if (mode === 'changes' && workspace.isReviewTabVisible) {
+			workspace.requestReviewScroll(path);
+			return;
+		}
 		const status = workspace.gitStatusEntries.find((e) => e.path === path)?.status;
 		const wantsDiff = mode === 'changes' && status === 'modified';
 		workspace.setDiffMode(path, wantsDiff);
