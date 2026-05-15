@@ -682,7 +682,24 @@ class CoderPanelState {
 
 	/** Tauri-listener cleanup; one entry per `wireRuntime` call. */
 	#unlisten: UnlistenFn[] = [];
-	#runtimeWired = false;
+	#listenersWired = false;
+	/** Flipped to `true` by `markWorkspaceReady()` once the
+	 *  `restoreAppState` folder-restore loop has finished mutating
+	 *  the **backend's** active folder. Per-folder hydration
+	 *  (`refreshStatus` + `#hydrateSession`) is gated on this so it
+	 *  doesn't fire while the loop is racing the backend's
+	 *  active-folder pointer through every persisted folder — that
+	 *  race is what previously made the panel show another folder's
+	 *  sessions on cold start (the panel's `coder.activeFolderPath`
+	 *  was correct, but `coder_list_sessions` reads from the
+	 *  backend's mutable active-folder pointer). */
+	#workspaceReady = false;
+	/** Folders we've already kicked off hydration for. Per-folder
+	 *  so a switch between unvisited folders fetches fresh state;
+	 *  switches back to a folder we already hydrated reuse the
+	 *  bucket as it stands (per the multi-session "agents keep
+	 *  running per project" contract). */
+	#hydratedFolders = new Set<string>();
 
 	get signedIn(): boolean {
 		return this.status?.signed_in ?? false;
@@ -940,14 +957,33 @@ class CoderPanelState {
 			if (bucket !== undefined && bucket.attentionPending) {
 				bucket.attentionPending = false;
 			}
+			// Kick off first-time hydration for this folder. Gated
+			// on `#workspaceReady` so the cold-start call from
+			// `adoptWorkspaceSnapshot` doesn't race the folder-
+			// restore loop (which is mid-flight at that point);
+			// `markWorkspaceReady` flushes the active folder once
+			// the loop is done.
+			void this.#hydrateFolder(path);
 		}
 	}
 
+	/** Bind the Tauri push-event listeners that drive the panel.
+	 *  Idempotent — runs once per process; subsequent calls
+	 *  early-return so HMR-driven re-mounts don't double-bind.
+	 *
+	 *  Deliberately separate from per-folder hydration
+	 *  ([`hydrateActiveFolder`]). Listeners need to be live before
+	 *  the first `coder:event` arrives (otherwise an in-flight turn
+	 *  resumed across an HMR reload silently drops events) so this
+	 *  fires early in `restoreAppState`. Hydration, in contrast,
+	 *  reads through the backend's active-folder pointer and must
+	 *  wait until the workspace folder-restore loop has stopped
+	 *  mutating that pointer. */
 	async wireRuntime(): Promise<void> {
-		if (this.#runtimeWired) {
+		if (this.#listenersWired) {
 			return;
 		}
-		this.#runtimeWired = true;
+		this.#listenersWired = true;
 		try {
 			const unlisten = await listen<CoderEventEnvelope>(CODER_EVENT_CHANNEL, (event) => {
 				this.#dispatchEnvelope(event.payload);
@@ -976,6 +1012,45 @@ class CoderPanelState {
 			// the pip just won't auto-update; the next status probe
 			// (folder switch, manual reload) reconciles.
 		}
+	}
+
+	/** Tell the panel that the backend's active folder is now
+	 *  stable and per-folder hydration is safe to fire. Called by
+	 *  `state.svelte.ts` after the `restoreAppState` folder-restore
+	 *  loop has finished switching the backend's active-folder
+	 *  pointer through every persisted folder. Idempotent.
+	 *
+	 *  Triggers an immediate hydrate for whichever folder is
+	 *  currently active, and flushes any folder-switch hydrations
+	 *  the user kicked off before the workspace was ready (those
+	 *  are no-ops in `setActiveFolder` until the flag flips). */
+	markWorkspaceReady(): void {
+		if (this.#workspaceReady) {
+			return;
+		}
+		this.#workspaceReady = true;
+		if (this.activeFolderPath !== null) {
+			void this.#hydrateFolder(this.activeFolderPath);
+		}
+	}
+
+	/** Idempotent per-folder hydration. Once the workspace folder
+	 *  loop has settled, calling this for the active folder runs
+	 *  the initial `refreshStatus` + `#hydrateSession` pair that
+	 *  used to live at the tail of [`wireRuntime`]. Safe to invoke
+	 *  from both startup and folder-switch paths — repeat calls
+	 *  for an already-hydrated folder return immediately, so
+	 *  switching back to a folder doesn't re-fetch its sessions
+	 *  list (per the multi-session "switching folders doesn't
+	 *  re-hydrate" contract). */
+	async #hydrateFolder(path: string): Promise<void> {
+		if (!this.#workspaceReady) {
+			return;
+		}
+		if (this.#hydratedFolders.has(path)) {
+			return;
+		}
+		this.#hydratedFolders.add(path);
 		await this.refreshStatus();
 		await this.#hydrateSession();
 	}

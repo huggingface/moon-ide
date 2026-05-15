@@ -1130,6 +1130,11 @@ class WorkspaceState {
 			// independent from the per-folder tab session restored
 			// below.
 			void this.spawnInitialBottomPanelTerminal(containerRefresh, terminalRuntime);
+			// No folder loop to fight with — let the coder panel
+			// hydrate the active folder immediately. Idempotent;
+			// the `setActiveFolder` call earlier in the bootstrap
+			// already queued a no-op hydrate that this flushes.
+			coder.markWorkspaceReady();
 			return;
 		}
 
@@ -1242,6 +1247,13 @@ class WorkspaceState {
 		} finally {
 			this.suppressPersist = false;
 		}
+		// Backend's active-folder pointer is now finalised. Let the
+		// coder panel hydrate (sessions list + active session) for
+		// the active folder; before this point a hydrate would have
+		// raced the loop above and pulled the wrong folder's data
+		// (e.g. surfaced moon-landing's session list while the
+		// active folder was already moon-ide).
+		coder.markWorkspaceReady();
 		// Re-save so dropped files don't haunt the next launch, and
 		// request editor focus once the active tab is in place.
 		this.persistAppState();
