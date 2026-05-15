@@ -5,11 +5,16 @@
 //!
 //! - **Reader task**: pulls framed messages, decodes them, and
 //!   dispatches. Responses land in the matching `oneshot` from the
-//!   pending map. Server → client notifications go to the
-//!   `notifications` broadcast channel the broker subscribes to.
-//!   Server → client *requests* get a `null` response so the server
-//!   doesn't block — we don't implement any client-side capabilities
-//!   yet (see `crate::lsp::server` for why that's OK).
+//!   pending map. Server → client notifications and server → client
+//!   *requests* both go to the `notifications` broadcast channel
+//!   that the broker subscribes to — the server-module pump
+//!   pattern-matches on `method` to decide whether to act.
+//!   Requests additionally get an auto-`null` response sent back so
+//!   the server doesn't block on the round-trip; that's a
+//!   spec-acceptable success reply for every server → client request
+//!   we currently react to (`client/registerCapability`,
+//!   `workspace/diagnostic/refresh`, `workspace/configuration` —
+//!   the last is `null = no config, use defaults`).
 //!
 //! - **Writer task**: serialises outbound requests/notifications and
 //!   writes them framed. Bounded channel, so backpressure pushes back
@@ -372,19 +377,31 @@ async fn reader_loop<R: AsyncRead + Unpin + Send + 'static>(
 		let has_method = value.get("method").is_some();
 
 		if has_method && has_id {
-			// Server → client request. Stage 1: acknowledge with
-			// `null`. That's enough for `workspace/configuration`
-			// (server treats null as "no config, use defaults"),
-			// `window/workDoneProgress/create` (server fires
-			// progress but we ignore it), and
-			// `client/registerCapability` (we already exposed
-			// what we support in `initialize`).
+			// Server → client request. We acknowledge with `null`
+			// (spec-acceptable success for every request we react
+			// to: `workspace/configuration` treats null as "no
+			// config, use defaults"; `window/workDoneProgress/create`
+			// fires progress we ignore; `client/registerCapability`
+			// has `void` result so null is fine; same for
+			// `workspace/diagnostic/refresh`) **and** forward the
+			// (method, params) to the same broadcast channel that
+			// carries notifications, so the server-module pump can
+			// pattern-match on method and act on the ones we care
+			// about (record fs-watcher glob registrations, kick off
+			// a workspace-wide diagnostic refresh, …). Side-effects
+			// happen client-side after the null reply went out, but
+			// since none of the requests we react to take long
+			// enough for the ordering to matter — and the spec
+			// explicitly allows "respond now, finish work later" —
+			// this keeps the writer loop free of higher-level
+			// concerns.
 			let id = value.get("id").cloned().unwrap_or(Value::Null);
 			let method = value
 				.get("method")
 				.and_then(Value::as_str)
 				.unwrap_or("<unknown>")
 				.to_owned();
+			let params = value.get("params").cloned().unwrap_or(Value::Null);
 			tracing::trace!(method = %method, "lsp: server->client request, responding null");
 			if tx
 				.send(Outbound::Response {
@@ -396,6 +413,10 @@ async fn reader_loop<R: AsyncRead + Unpin + Send + 'static>(
 			{
 				return;
 			}
+			let _ = notifications.send(ServerNotification {
+				method: method.clone(),
+				params,
+			});
 			continue;
 		}
 		if has_method {

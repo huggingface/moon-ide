@@ -31,6 +31,7 @@ use std::sync::Arc;
 use camino::Utf8PathBuf;
 use lsp_types as lt;
 use moon_protocol::lsp as mp;
+use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::{broadcast, Mutex};
@@ -222,11 +223,86 @@ pub struct LspServer {
 	// increasing versions per didChange to detect out-of-order
 	// updates; we start at 1 on open and tick each change.
 	docs: Mutex<HashMap<String, DocState>>,
+	/// Glob patterns the server registered for
+	/// `workspace/didChangeWatchedFiles` notifications, keyed on
+	/// the registration id so an `unregisterCapability` can drop
+	/// just that entry. Populated lazily by the notification pump
+	/// when the server fires `client/registerCapability`; empty
+	/// for servers that don't ask for fs-event notifications
+	/// (which makes [`notify_files_changed`] a no-op for them —
+	/// safe and free).
+	watched_patterns: Mutex<HashMap<String, Vec<WatchedPattern>>>,
 	/// Fan-out sink the server uses to publish its own events
 	/// (diagnostics, status changes). Cloned from the broker's
 	/// channel so the pull-diagnostics task can shove `LspDiagnostics`
 	/// events directly through the same surface as the push pump.
 	events: broadcast::Sender<LspServerEvent>,
+}
+
+/// One compiled glob the server cares about, plus the
+/// LSP-flavoured event-type bitmask. Default kind per spec is
+/// 7 (Create | Change | Delete) when the server omits it.
+struct WatchedPattern {
+	matcher: globset::GlobMatcher,
+	kind: lt::WatchKind,
+}
+
+/// Compile every glob from a `workspace/didChangeWatchedFiles`
+/// registration into the in-memory matcher list. Free function
+/// (rather than a method) so the parsing logic can be unit-
+/// tested without spinning up a real LSP server child process.
+///
+/// `Relative` glob patterns are flattened to their `pattern`
+/// string and matched against workspace-relative paths. The
+/// spec scopes them to a `WorkspaceFolder`, but moon-ide opens
+/// one folder per broker so the relative form would point at
+/// the same root either way. Servers that ship only string
+/// patterns (the common case for tsgo / rust-analyzer / gopls)
+/// hit the simpler arm.
+///
+/// Returns `None` when the registration carries no usable
+/// patterns — empty `watchers` list, all globs failed to
+/// compile (logged at warn), or `register_options` was missing.
+/// The caller treats that the same as "we never saw the
+/// registration", which is the right behaviour: the spec's
+/// auto-`null` reply already told the server we accepted, but
+/// not knowing how to compile any of its patterns means we
+/// silently won't fire watched-files notifications, identical
+/// to the pre-B+C state. No correctness regression.
+fn parse_watched_files_registration(reg: lt::Registration) -> Option<(String, Vec<WatchedPattern>)> {
+	let opts_value = reg.register_options?;
+	let opts: lt::DidChangeWatchedFilesRegistrationOptions = match serde_json::from_value(opts_value) {
+		Ok(o) => o,
+		Err(e) => {
+			tracing::warn!(error = %e, "lsp: bad watched-files registration options");
+			return None;
+		}
+	};
+	let mut compiled: Vec<WatchedPattern> = Vec::new();
+	for watcher in opts.watchers {
+		let pattern_str = match watcher.glob_pattern {
+			lt::GlobPattern::String(s) => s,
+			lt::GlobPattern::Relative(rel) => rel.pattern,
+		};
+		let glob = match globset::GlobBuilder::new(&pattern_str).literal_separator(false).build() {
+			Ok(g) => g,
+			Err(e) => {
+				tracing::warn!(error = %e, pattern = %pattern_str, "lsp: failed to compile registered glob");
+				continue;
+			}
+		};
+		let kind = watcher
+			.kind
+			.unwrap_or_else(|| lt::WatchKind::Create | lt::WatchKind::Change | lt::WatchKind::Delete);
+		compiled.push(WatchedPattern {
+			matcher: glob.compile_matcher(),
+			kind,
+		});
+	}
+	if compiled.is_empty() {
+		return None;
+	}
+	Some((reg.id, compiled))
 }
 
 /// Bridge between host-relative workspace paths and the
@@ -392,6 +468,7 @@ impl LspServer {
 			child: Mutex::new(Some(child)),
 			translator,
 			docs: Mutex::new(HashMap::new()),
+			watched_patterns: Mutex::new(HashMap::new()),
 			events: events.clone(),
 		});
 
@@ -411,25 +488,54 @@ impl LspServer {
 		// driven by `update` after every `didOpen` / `didChange`.
 		tokio::spawn(async move {
 			while let Ok(notif) = notif_rx.recv().await {
-				if notif.method.as_str() != "textDocument/publishDiagnostics" {
-					continue;
-				}
-				let params: lt::PublishDiagnosticsParams = match serde_json::from_value(notif.params) {
-					Ok(p) => p,
-					Err(e) => {
-						tracing::warn!(error = %e, "lsp: bad publishDiagnostics payload");
-						continue;
+				match notif.method.as_str() {
+					"textDocument/publishDiagnostics" => {
+						let params: lt::PublishDiagnosticsParams = match serde_json::from_value(notif.params) {
+							Ok(p) => p,
+							Err(e) => {
+								tracing::warn!(error = %e, "lsp: bad publishDiagnostics payload");
+								continue;
+							}
+						};
+						let Some(path) = server_ref.uri_to_relative(&params.uri) else {
+							continue;
+						};
+						let diagnostics = params.diagnostics.into_iter().map(translate::diagnostic).collect();
+						let _ = events_sink.send(LspServerEvent::Diagnostics(mp::LspDiagnosticsEvent {
+							path,
+							diagnostics,
+						}));
 					}
-				};
-				let path = match server_ref.uri_to_relative(&params.uri) {
-					Some(p) => p,
-					None => continue,
-				};
-				let diagnostics = params.diagnostics.into_iter().map(translate::diagnostic).collect();
-				let _ = events_sink.send(LspServerEvent::Diagnostics(mp::LspDiagnosticsEvent {
-					path,
-					diagnostics,
-				}));
+					"client/registerCapability" => {
+						// Server tells us which capabilities it
+						// wants to drive dynamically. We act on
+						// `workspace/didChangeWatchedFiles`
+						// (record the glob patterns); other
+						// methods get logged + dropped, since
+						// the spec lets us answer the request
+						// with a `null` "applied" reply (the
+						// client.rs reader did that already)
+						// without actually wiring anything up.
+						server_ref.handle_register_capability(notif.params).await;
+					}
+					"client/unregisterCapability" => {
+						server_ref.handle_unregister_capability(notif.params).await;
+					}
+					"workspace/diagnostic/refresh" => {
+						// Server-driven re-pull request. Fires
+						// after the server invalidates its
+						// per-file diagnostic cache (typically
+						// in response to a
+						// `workspace/didChangeWatchedFiles`
+						// notification we sent it). Re-pull
+						// every doc this server has open;
+						// `client.rs` already replied null on
+						// the wire so the server isn't blocked
+						// while we do this.
+						server_ref.refresh_open_diagnostics().await;
+					}
+					_ => {}
+				}
 			}
 		});
 
@@ -485,6 +591,32 @@ impl LspServer {
 		// references later just means flipping a flag here and
 		// shipping the command that uses it.
 		let caps = lt::ClientCapabilities {
+			workspace: Some(lt::WorkspaceClientCapabilities {
+				// We support `workspace/didChangeWatchedFiles`
+				// (forwarded from the host fs-watcher) but only
+				// via dynamic registration — the LSP spec
+				// doesn't define a static-watch surface, so the
+				// flag below is the only way for the server to
+				// learn about file changes. Servers that
+				// register watch globs get notified when matching
+				// files change on disk; servers that don't
+				// register fall back to the per-buffer
+				// `didOpen`/`didChange` path same as before.
+				did_change_watched_files: Some(lt::DidChangeWatchedFilesClientCapabilities {
+					dynamic_registration: Some(true),
+					relative_pattern_support: Some(false),
+				}),
+				// Server-driven diagnostic refresh: the server
+				// can ask us to re-pull diagnostics for every
+				// open document (e.g. after a watched-files
+				// notification invalidated its caches). Wired
+				// to `LspServer::refresh_open_diagnostics` in
+				// the notification pump.
+				diagnostic: Some(lt::DiagnosticWorkspaceClientCapabilities {
+					refresh_support: Some(true),
+				}),
+				..Default::default()
+			}),
 			text_document: Some(lt::TextDocumentClientCapabilities {
 				synchronization: Some(lt::TextDocumentSyncClientCapabilities {
 					dynamic_registration: Some(false),
@@ -736,6 +868,154 @@ impl LspServer {
 			}],
 		};
 		self.client.notify("textDocument/didChange", params).await
+	}
+
+	/// Process one `client/registerCapability` request from the
+	/// server. Today the only registration we act on is
+	/// `workspace/didChangeWatchedFiles`; everything else is
+	/// already covered by the static capability set we sent in
+	/// `initialize`, so we log and drop. Per the LSP spec, the
+	/// `null` reply [`client.rs`] already wrote on the wire is a
+	/// "registration applied" success — even if our action below
+	/// fails to compile a glob, the server proceeds as if it had.
+	///
+	/// The default `kind` for a watcher is 7 (Create | Change |
+	/// Delete) per spec, applied when the server omits the field.
+	async fn handle_register_capability(self: &Arc<Self>, params: Value) {
+		let parsed: lt::RegistrationParams = match serde_json::from_value(params) {
+			Ok(p) => p,
+			Err(e) => {
+				tracing::warn!(error = %e, "lsp: bad registerCapability payload");
+				return;
+			}
+		};
+		for reg in parsed.registrations {
+			if reg.method != "workspace/didChangeWatchedFiles" {
+				tracing::debug!(method = %reg.method, "lsp: ignoring dynamic registration");
+				continue;
+			}
+			match parse_watched_files_registration(reg) {
+				Some((id, patterns)) => {
+					let count = patterns.len();
+					self.watched_patterns.lock().await.insert(id.clone(), patterns);
+					tracing::debug!(lang = %self.language_id, registration_id = %id, watchers = count, "lsp: recorded watched-files registration");
+				}
+				None => {
+					tracing::debug!(lang = %self.language_id, "lsp: skipping watched-files registration with no usable patterns");
+				}
+			}
+		}
+	}
+
+	/// Drop registrations that the server no longer wants. Same
+	/// shape as [`handle_register_capability`] but in reverse. We
+	/// only forget the entry — the next `registerCapability` with
+	/// the same id will replace it. Failures here are silently
+	/// dropped: an unregister of an unknown id is a no-op anyway.
+	async fn handle_unregister_capability(self: &Arc<Self>, params: Value) {
+		let parsed: lt::UnregistrationParams = match serde_json::from_value(params) {
+			Ok(p) => p,
+			Err(e) => {
+				tracing::warn!(error = %e, "lsp: bad unregisterCapability payload");
+				return;
+			}
+		};
+		let mut guard = self.watched_patterns.lock().await;
+		for unreg in parsed.unregisterations {
+			if unreg.method != "workspace/didChangeWatchedFiles" {
+				continue;
+			}
+			guard.remove(&unreg.id);
+		}
+	}
+
+	/// Forward an fs-watcher batch to the server as one
+	/// `workspace/didChangeWatchedFiles` notification, after
+	/// filtering paths through the globs the server registered
+	/// for that event. No-op when this server hasn't registered
+	/// any watchers (rust-analyzer post-init, servers that don't
+	/// implement the capability at all) or when none of the
+	/// changed paths match — the round-trip cost is one map walk
+	/// against the registered globs.
+	///
+	/// `kind` is hardcoded to `Changed` for now: the host
+	/// fs-watcher emits a flat `paths` list without per-path
+	/// create/modify/delete classification, and `Changed` is what
+	/// every wired server actually keys off (rust-analyzer
+	/// invalidates caches, tsgo / tsserver re-index). If a
+	/// fidelity issue surfaces, the watcher payload extension is
+	/// the right fix; defaulting here avoids over-engineering
+	/// before there's a real bug.
+	pub async fn notify_files_changed(&self, paths: &[String]) -> Result<(), LspClientError> {
+		if paths.is_empty() {
+			return Ok(());
+		}
+		let patterns = self.watched_patterns.lock().await;
+		if patterns.is_empty() {
+			return Ok(());
+		}
+		let kind = lt::FileChangeType::CHANGED;
+		let mut events: Vec<lt::FileEvent> = Vec::new();
+		for path in paths {
+			let mut matched = false;
+			for group in patterns.values() {
+				for pattern in group {
+					if !pattern.kind.contains(lt::WatchKind::Change) {
+						continue;
+					}
+					if pattern.matcher.is_match(path) {
+						matched = true;
+						break;
+					}
+				}
+				if matched {
+					break;
+				}
+			}
+			if !matched {
+				continue;
+			}
+			events.push(lt::FileEvent {
+				uri: self.relative_to_uri(path),
+				typ: kind,
+			});
+		}
+		drop(patterns);
+		if events.is_empty() {
+			return Ok(());
+		}
+		let count = events.len();
+		let params = lt::DidChangeWatchedFilesParams { changes: events };
+		self.client.notify("workspace/didChangeWatchedFiles", params).await?;
+		tracing::trace!(lang = %self.language_id, count, "lsp: forwarded watched-files batch");
+		Ok(())
+	}
+
+	/// Re-pull diagnostics for every document currently open on
+	/// this server. Used to refresh stale diagnostics after an
+	/// out-of-band file change (a `git checkout` rewriting source
+	/// files, an external editor save, …) — none of which fires
+	/// `didChange` for already-open buffers, so without this nudge
+	/// the panel keeps painting the diagnostics it computed
+	/// against the previous version of the file.
+	///
+	/// Best-effort: each pull runs in a detached task via the
+	/// existing `spawn_pull_diagnostics` plumbing, so the caller
+	/// returns immediately and individual server failures don't
+	/// block a workspace-wide refresh. Servers that don't
+	/// implement pull diagnostics (push-only, e.g. rust-analyzer)
+	/// already noop the pull at debug-log level inside
+	/// `pull_diagnostics`, so this method is cheap to call across
+	/// every running server regardless of which ones actually
+	/// answer.
+	pub async fn refresh_open_diagnostics(self: &Arc<Self>) {
+		let paths: Vec<String> = {
+			let docs = self.docs.lock().await;
+			docs.keys().cloned().collect()
+		};
+		for path in paths {
+			self.spawn_pull_diagnostics(&path);
+		}
 	}
 
 	pub async fn close(&self, rel_path: &str) -> Result<(), LspClientError> {
@@ -1717,5 +1997,108 @@ mod tests {
 			container_binary_path(&PYTHON_SERVER, &translator).is_none(),
 			"hoisted .venv sits above the bind mount — container can't reach it"
 		);
+	}
+
+	/// `parse_watched_files_registration` round-trips a typical
+	/// tsserver-shaped registration (string globs, default kind)
+	/// into a usable matcher list.
+	#[test]
+	fn watched_files_registration_compiles_string_globs() {
+		let reg = lt::Registration {
+			id: "ts-files".to_owned(),
+			method: "workspace/didChangeWatchedFiles".to_owned(),
+			register_options: Some(serde_json::json!({
+				"watchers": [
+					{ "globPattern": "**/*.ts" },
+					{ "globPattern": "**/tsconfig*.json", "kind": 2 }
+				]
+			})),
+		};
+		let (id, patterns) = parse_watched_files_registration(reg).expect("registration parses");
+		assert_eq!(id, "ts-files");
+		assert_eq!(patterns.len(), 2);
+		assert!(patterns[0].matcher.is_match("src/main.ts"));
+		assert!(patterns[0].matcher.is_match("nested/foo/bar.ts"));
+		assert!(!patterns[0].matcher.is_match("src/main.rs"));
+		// Default kind defaults to 7 (all three) when omitted.
+		assert!(
+			patterns[0].kind.contains(lt::WatchKind::Change),
+			"default kind must include Change so notify_files_changed actually fires"
+		);
+		// Explicit kind=2 is preserved.
+		assert_eq!(patterns[1].kind.bits(), 2);
+		assert!(patterns[1].matcher.is_match("tsconfig.json"));
+		assert!(patterns[1].matcher.is_match("packages/api/tsconfig.build.json"));
+	}
+
+	/// Empty `watchers` list → `None` so the caller treats it
+	/// as "no registration to record". Same end-state as a
+	/// server that never sent the registration at all.
+	#[test]
+	fn watched_files_registration_empty_returns_none() {
+		let reg = lt::Registration {
+			id: "noop".to_owned(),
+			method: "workspace/didChangeWatchedFiles".to_owned(),
+			register_options: Some(serde_json::json!({ "watchers": [] })),
+		};
+		assert!(parse_watched_files_registration(reg).is_none());
+	}
+
+	/// Missing `register_options` entirely → `None`. Servers
+	/// shouldn't send this for `didChangeWatchedFiles`, but the
+	/// LSP type allows it as `Option<Value>` and we don't crash
+	/// the pump on a malformed payload.
+	#[test]
+	fn watched_files_registration_missing_options_returns_none() {
+		let reg = lt::Registration {
+			id: "broken".to_owned(),
+			method: "workspace/didChangeWatchedFiles".to_owned(),
+			register_options: None,
+		};
+		assert!(parse_watched_files_registration(reg).is_none());
+	}
+
+	/// A bad glob pattern is logged + skipped; the rest of the
+	/// list still compiles. Reflects real-world server bugs
+	/// where one pattern is malformed but the others are fine.
+	#[test]
+	fn watched_files_registration_skips_bad_globs() {
+		let reg = lt::Registration {
+			id: "mixed".to_owned(),
+			method: "workspace/didChangeWatchedFiles".to_owned(),
+			register_options: Some(serde_json::json!({
+				"watchers": [
+					{ "globPattern": "**/*.rs" },
+					{ "globPattern": "[" }
+				]
+			})),
+		};
+		let (_, patterns) = parse_watched_files_registration(reg).expect("at least one valid pattern");
+		assert_eq!(patterns.len(), 1, "the bad glob is dropped, the good one survives");
+		assert!(patterns[0].matcher.is_match("crates/foo/src/lib.rs"));
+	}
+
+	/// `Relative` glob patterns flatten to their inner pattern
+	/// string. The spec scopes them to a `WorkspaceFolder`; we
+	/// open one folder per broker so the distinction collapses.
+	#[test]
+	fn watched_files_registration_handles_relative_pattern() {
+		let reg = lt::Registration {
+			id: "relative".to_owned(),
+			method: "workspace/didChangeWatchedFiles".to_owned(),
+			register_options: Some(serde_json::json!({
+				"watchers": [
+					{
+						"globPattern": {
+							"baseUri": "file:///workspace",
+							"pattern": "**/*.go"
+						}
+					}
+				]
+			})),
+		};
+		let (_, patterns) = parse_watched_files_registration(reg).expect("relative pattern parses");
+		assert!(patterns[0].matcher.is_match("cmd/main.go"));
+		assert!(!patterns[0].matcher.is_match("README.md"));
 	}
 }

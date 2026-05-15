@@ -116,6 +116,81 @@ pub async fn lsp_completion(
 		.map_err(|e| MoonError::internal(e.to_string()))
 }
 
+/// Forward an fs-watcher batch to every running language
+/// server. Each server filters the paths through the globs it
+/// registered via `client/registerCapability` and sends one
+/// `workspace/didChangeWatchedFiles` notification with the
+/// matching subset; servers that didn't register watchers
+/// silently no-op. The window-focus path uses
+/// [`lsp_refresh_open_diagnostics`] instead, since focus events
+/// don't carry a path list.
+///
+/// Well-behaved servers respond to a watched-files batch by
+/// invalidating per-file caches and (because we advertise
+/// `workspace.diagnostics.refreshSupport`) firing a
+/// `workspace/diagnostic/refresh` request back at us, which the
+/// notification pump turns into a per-server
+/// `refresh_open_diagnostics` call. End result: the panel's
+/// diagnostics catch up to the on-disk truth without the user
+/// having to retype.
+///
+/// No-op when no broker exists yet (the user hasn't opened any
+/// LSP language file in this session): forwarding fs events to
+/// zero servers is a fine idempotent.
+#[tauri::command]
+pub async fn lsp_notify_files_changed(state: State<'_, AppState>, paths: Vec<String>) -> Result<(), MoonError> {
+	let broker = {
+		let guard = state.lsp.lock().await;
+		match guard.as_ref() {
+			Some(b) => b.broker.clone(),
+			None => return Ok(()),
+		}
+	};
+	broker.notify_files_changed(&paths).await;
+	Ok(())
+}
+
+/// Trigger a diagnostic re-pull for every document currently
+/// open on every running language server. Called by the
+/// frontend on window-focus events (typical "I `git checkout`ed
+/// in a terminal and alt-tabbed back" flow) — this covers the
+/// cold-start case the fs-watcher structurally can't, since the
+/// watcher only fires for events that landed *during* its
+/// lifetime, and a checkout that happened before launch leaves
+/// no trace.
+///
+/// `language_ids` scopes the refresh; empty array means "every
+/// running server".
+///
+/// Off-disk changes that happen *while the IDE is running* are
+/// handled via [`lsp_notify_files_changed`] + the server's own
+/// `workspace/diagnostic/refresh` request (see the spec section
+/// "Stale-diagnostics refresh on off-disk changes" in
+/// `specs/lsp.md`). This command is the focus-driven safety net
+/// for everything that path can't catch.
+///
+/// No-op when no broker exists yet.
+#[tauri::command]
+pub async fn lsp_refresh_open_diagnostics(
+	state: State<'_, AppState>,
+	language_ids: Vec<String>,
+) -> Result<(), MoonError> {
+	let broker = {
+		let guard = state.lsp.lock().await;
+		match guard.as_ref() {
+			Some(b) => b.broker.clone(),
+			None => return Ok(()),
+		}
+	};
+	let filter = if language_ids.is_empty() {
+		None
+	} else {
+		Some(language_ids.as_slice())
+	};
+	broker.refresh_open_diagnostics(filter).await;
+	Ok(())
+}
+
 /// Tear down the server slot for `language_id` so the next
 /// `lsp_*` request lazily re-spawns it. Used by the "Restart"
 /// button in the diag-logs panel and by anyone who's just

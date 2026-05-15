@@ -539,6 +539,95 @@ impl LspBroker {
 		server.completion(path, position).await
 	}
 
+	/// Forward a host fs-watcher batch to every running server,
+	/// scoped per-server through the globs that server registered
+	/// for `workspace/didChangeWatchedFiles`. Servers that didn't
+	/// register watchers (rust-analyzer post-init, push-only
+	/// servers that ignore the capability, …) silently no-op
+	/// inside `LspServer::notify_files_changed`, so the broad
+	/// fan-out is cheap.
+	///
+	/// This is the canonical LSP signal for off-disk file changes
+	/// (a `git checkout`, an external editor save, a coder tool
+	/// rewriting an unopened file). On reception, well-behaved
+	/// servers invalidate their per-file caches and — if we
+	/// advertised `workspace.diagnostics.refreshSupport` (we do)
+	/// — request a workspace-wide diagnostic refresh, which loops
+	/// back through the notification pump into
+	/// `refresh_open_diagnostics` for that server.
+	///
+	/// Errors are logged at warn level rather than propagated:
+	/// notify is fire-and-forget by design, and a single server
+	/// failing to receive the batch shouldn't block the others.
+	pub async fn notify_files_changed(&self, paths: &[String]) {
+		let servers: Vec<Arc<LspServer>> = {
+			let guard = self.servers.lock().await;
+			guard
+				.iter()
+				.filter_map(|(_, slot)| {
+					let ServerSlot::Ready(server) = slot else {
+						return None;
+					};
+					if !server.is_alive() {
+						return None;
+					}
+					Some(server.clone())
+				})
+				.collect()
+		};
+		for server in servers {
+			if let Err(err) = server.notify_files_changed(paths).await {
+				tracing::warn!(error = %err, "lsp: notify_files_changed failed");
+			}
+		}
+	}
+
+	/// Re-pull diagnostics for every open document on every
+	/// running server. The IDE calls this when an out-of-band file
+	/// change lands (fs-watcher detected a `git checkout` /
+	/// external editor save / coder-tool-driven rewrite of an
+	/// unopened file) or when the window regains focus, so stale
+	/// diagnostics computed against a previous filesystem state
+	/// repaint without the user having to retype.
+	///
+	/// `language_filter` lets the caller scope the fan-out to only
+	/// the servers whose language matches at least one path in the
+	/// triggering event — a `.toml` change shouldn't poke
+	/// `tsserver`. Pass `None` to refresh every running server
+	/// (the focus-event path).
+	///
+	/// Slots in `Pending`, `NotAvailable`, or `Failed` are skipped
+	/// silently: a server that hasn't even started can't have
+	/// stale diagnostics yet, and one we know we can't spawn isn't
+	/// going to start now. Push-only servers (rust-analyzer) noop
+	/// the pull internally at debug-log level, so the broad
+	/// fan-out stays cheap.
+	pub async fn refresh_open_diagnostics(&self, language_filter: Option<&[String]>) {
+		let servers: Vec<Arc<LspServer>> = {
+			let guard = self.servers.lock().await;
+			guard
+				.iter()
+				.filter_map(|(lang, slot)| {
+					let ServerSlot::Ready(server) = slot else {
+						return None;
+					};
+					if let Some(filter) = language_filter {
+						if !filter.iter().any(|l| l == lang) {
+							return None;
+						}
+					}
+					if !server.is_alive() {
+						return None;
+					}
+					Some(server.clone())
+				})
+				.collect()
+		};
+		for server in servers {
+			server.refresh_open_diagnostics().await;
+		}
+	}
+
 	/// Shut every spawned server down and drop them. Called on
 	/// workspace close. Best-effort — any hung server will SIGKILL
 	/// on its `Child` drop regardless.

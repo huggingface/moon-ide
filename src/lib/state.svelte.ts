@@ -396,6 +396,17 @@ class WorkspaceState {
 	 * server isn't chasing each keystroke.
 	 */
 	#lspUpdateTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+	/**
+	 * Debounce timer for the focus-driven LSP diagnostic refresh
+	 * (`ipc.lsp.refreshOpenDiagnostics([])`). Window-focus can fire
+	 * twice in quick succession (alt-tab → click into the IDE → focus
+	 * event for each), so the 250ms timer collapses them. In-IDE
+	 * off-disk changes go through `ipc.lsp.notifyFilesChanged`
+	 * instead — the LSP server itself decides when to ask us for a
+	 * refresh, so we don't need a client-side scheduler for that
+	 * path.
+	 */
+	#lspRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
 	// Monotonic counter the active editor view watches to refocus itself.
 	// Bumped whenever the user "navigates" to a file (tab click, tree click,
@@ -2359,6 +2370,28 @@ class WorkspaceState {
 					`fs:changed paths=${payload.paths.length} topology=${payload.topologyChanged}${payload.paths.length === 0 ? '' : ` [${sample}${more}]`}`,
 				);
 				void this.refreshActiveFolder(subset, payload.topologyChanged);
+				// Forward the fs-watcher batch to every running
+				// LSP server as `workspace/didChangeWatchedFiles`.
+				// Each server filters the paths through the globs
+				// it registered at startup, so a `.toml`-only
+				// burst lands on no server at all and a TS file
+				// change only reaches the TypeScript server.
+				// Well-behaved servers respond by invalidating
+				// caches and asking us (via the
+				// `workspace/diagnostic/refresh` request handled
+				// by the broker's notification pump) to re-pull
+				// diagnostics for every open buffer — that's how
+				// the panel catches up to a `git checkout`
+				// without the user having to retype. Servers
+				// that don't register watchers (rust-analyzer
+				// post-init, push-only servers) silently no-op
+				// inside the per-server filter, so the broad
+				// fan-out is cheap.
+				if (payload.paths.length > 0) {
+					void ipc.lsp.notifyFilesChanged(payload.paths).catch((err) => {
+						frontendLog('lsp.refresh', 'warn', `notifyFilesChanged failed: ${formatError(err)}`);
+					});
+				}
 			});
 		} catch {
 			// Event bus unavailable (tests / non-Tauri). Focus
@@ -2374,6 +2407,16 @@ class WorkspaceState {
 				// know what moved. Fall back to the conservative
 				// full sweep (null subset + topologyChanged=true).
 				void this.refreshActiveFolder();
+				// Cold-start safety net: an alt-tab back from a
+				// terminal where the user just `git checkout`ed
+				// before moon-ide was even running should clear
+				// out stale LSP diagnostics. The fs-watcher
+				// can't help here — it only fires for events
+				// during its lifetime — so we re-pull every
+				// open buffer on every running server. Cheap;
+				// the broker debounces and push-only servers
+				// noop the pull.
+				this.scheduleLspDiagnosticsRefresh();
 			});
 		} catch {
 			// No Tauri window. Palette command is the last
@@ -2430,6 +2473,41 @@ class WorkspaceState {
 			// editor will show no diagnostics and the status
 			// pill will stay hidden — acceptable degradation.
 		}
+	}
+
+	/**
+	 * Schedule a workspace-wide LSP diagnostic re-pull on every
+	 * running server, debounced 250ms. Used by the window-focus
+	 * path to cover the cold-start case the in-IDE fs-watcher
+	 * structurally can't — a `git checkout` that happened while
+	 * moon-ide was closed leaves no fs event behind.
+	 *
+	 * 250ms: long enough that a rapid alt-tab pair collapses into
+	 * one refresh, short enough that the user doesn't visibly wait
+	 * between coming back to the window and the panel updating.
+	 *
+	 * In-IDE off-disk changes flow through
+	 * `ipc.lsp.notifyFilesChanged` (in `bindFolderChangeRefresh`'s
+	 * `fs:changed` branch) instead. The server decides when to ask
+	 * for a refresh based on the watched-files notification, so
+	 * the client-side scheduler isn't needed there.
+	 */
+	scheduleLspDiagnosticsRefresh(): void {
+		if (this.#lspRefreshTimer !== null) {
+			return;
+		}
+		this.#lspRefreshTimer = setTimeout(() => {
+			this.#lspRefreshTimer = null;
+			void ipc.lsp.refreshOpenDiagnostics([]).catch((err) => {
+				// Best-effort — the user gets stale diagnostics
+				// for one debounce window if the broker is mid-
+				// rebuild, no worse than before this nudge
+				// existed. Log so a real plumbing miswire shows
+				// up in the diag-logs panel rather than being
+				// silently swallowed.
+				frontendLog('lsp.refresh', 'warn', `refreshOpenDiagnostics failed: ${formatError(err)}`);
+			});
+		}, 250);
 	}
 
 	#coderRefreshWired = false;

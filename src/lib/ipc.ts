@@ -234,6 +234,29 @@ export const ipc = {
 		// yet — calling restart before any LSP has spun up is
 		// fine.
 		restart: (languageId: string) => invoke<void>('lsp_restart', { languageId }),
+		// Re-pull diagnostics for every document on every running
+		// language server (optionally scoped to a subset of
+		// languages). The frontend uses this on window-focus
+		// events to cover the cold-start case the fs-watcher
+		// structurally can't — a `git checkout` that happened
+		// while the IDE was closed leaves no fs event to react
+		// to. In-IDE off-disk changes flow through
+		// `notifyFilesChanged` instead, so the server can
+		// invalidate the right caches and trigger a refresh on
+		// its own. Pass `[]` to refresh every running server.
+		refreshOpenDiagnostics: (languageIds: readonly string[]) =>
+			invoke<void>('lsp_refresh_open_diagnostics', { languageIds }),
+		// Forward an fs-watcher batch to every running language
+		// server as one `workspace/didChangeWatchedFiles`
+		// notification per server, scoped through the globs that
+		// server registered via `client/registerCapability`. The
+		// canonical LSP plumbing for off-disk file changes —
+		// well-behaved servers invalidate caches and fire a
+		// `workspace/diagnostic/refresh` request back, which the
+		// backend turns into a per-server diagnostic re-pull. No-op
+		// when no broker has spun up yet, or when no server has
+		// registered a watcher matching any of the paths.
+		notifyFilesChanged: (paths: readonly string[]) => invoke<void>('lsp_notify_files_changed', { paths }),
 	},
 	slack: {
 		setToken: (token: string) => invoke<SlackIdentity>('slack_set_token', { token }),
