@@ -917,6 +917,48 @@
 		if (removed.length === 0 && added.length === 0) {
 			return;
 		}
+		// `'changes'` mode: the path list never contains directory
+		// entries (only the changed file paths). Pierre's
+		// `removePath` doesn't auto-prune empty parents — its
+		// `promoteEmptyAncestorsToExplicit` flips the now-empty
+		// directory node to "explicit" so it stays visible. In
+		// `'all'` mode that's correct (empty dirs exist on disk
+		// and should render), but here a committed-or-reverted
+		// file leaves its parent directory dangling in the tree
+		// with no children. Walk the ancestors of every removed
+		// path; any ancestor that no longer has a descendant in
+		// `next` gets queued for removal too, deepest-first so
+		// nested empty chains unravel cleanly. `'all'` mode keeps
+		// receiving directory paths from the filesystem walk and
+		// doesn't need this pass.
+		if (mode === 'changes' && removed.length > 0) {
+			const needed = new Set<string>();
+			for (const path of next) {
+				appendAncestors(path, needed);
+			}
+			// `'changes'` mode never feeds Pierre directory entries
+			// directly (only file paths from `gitStatusEntries`),
+			// so `prev` won't list the dirs we need to clean up —
+			// but Pierre auto-created those dir nodes on `addPath`
+			// when each file landed, so they're guaranteed to be
+			// present at removal time. No extra `prev.has` guard
+			// needed; the depth-descending sort below ensures the
+			// file leaf comes out before its parent dir.
+			const orphanDirs = new Set<string>();
+			for (const path of removed) {
+				const ancestors: string[] = [];
+				appendAncestorList(path, ancestors);
+				for (const ancestor of ancestors) {
+					if (needed.has(ancestor)) {
+						break;
+					}
+					orphanDirs.add(ancestor);
+				}
+			}
+			for (const dir of orphanDirs) {
+				removed.push(dir);
+			}
+		}
 		removed.sort((a, b) => depthOf(b) - depthOf(a));
 		added.sort((a, b) => depthOf(a) - depthOf(b));
 		const ops: FileTreeBatchOperation[] = [];
@@ -932,6 +974,37 @@
 			// eslint-disable-next-line no-console
 			console.warn('moon-ide: incremental tree update failed; falling back to full reset', err);
 			local.resetPaths(merged);
+		}
+	}
+
+	/** Add every ancestor directory of `path` (each ending in `/`)
+	 *  to `out`. `foo/bar/baz.txt` → `foo/bar/`, `foo/`. Top-level
+	 *  files contribute nothing. */
+	function appendAncestors(path: string, out: Set<string>): void {
+		let idx = path.length;
+		while (idx > 0) {
+			const slash = path.lastIndexOf('/', idx - 1);
+			if (slash < 0) {
+				return;
+			}
+			const ancestor = path.slice(0, slash + 1);
+			if (out.has(ancestor)) {
+				return;
+			}
+			out.add(ancestor);
+			idx = slash;
+		}
+	}
+
+	function appendAncestorList(path: string, out: string[]): void {
+		let idx = path.length;
+		while (idx > 0) {
+			const slash = path.lastIndexOf('/', idx - 1);
+			if (slash < 0) {
+				return;
+			}
+			out.push(path.slice(0, slash + 1));
+			idx = slash;
 		}
 	}
 
