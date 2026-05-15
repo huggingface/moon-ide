@@ -272,6 +272,69 @@
 		};
 	}
 
+	/** Single-line hint shown next to the tool name in the
+	 *  collapsed `<summary>` line — gives the user enough context
+	 *  to recognise a tool call without expanding it. The shape is
+	 *  the most identifying argument for each tool: path for the
+	 *  file ones, the command for `bash`, the pattern / query for
+	 *  search, the URL for `web_fetch`. Returns `null` for tool
+	 *  names we don't have a hint shape for, and for malformed
+	 *  args (the chip just won't render — the JSON-fallback body
+	 *  carries the raw payload when expanded). The arg-key fallback
+	 *  list (`path` / `file_path` / `file`) mirrors the per-tool
+	 *  parsers in `ToolBody*.svelte` so a model that uses any of
+	 *  the spellings still gets a chip.
+	 *
+	 *  We collapse the hint to the first line of the value so a
+	 *  multi-line bash heredoc doesn't blow up the row height; the
+	 *  full payload remains visible in the expanded body. */
+	function toolHint(name: string, args: unknown): string | null {
+		if (typeof args !== 'object' || args === null) {
+			return null;
+		}
+		const o = args as Record<string, unknown>;
+		const pickPath = (): string | null => {
+			const candidate = o.path ?? o.file_path ?? o.file;
+			return typeof candidate === 'string' && candidate.length > 0 ? candidate : null;
+		};
+		switch (name) {
+			case 'bash': {
+				return typeof o.cmd === 'string' ? firstLine(o.cmd) : null;
+			}
+			case 'read_file':
+			case 'write_file':
+			case 'edit_file':
+			case 'list_dir': {
+				return pickPath();
+			}
+			case 'grep': {
+				return typeof o.pattern === 'string' ? firstLine(o.pattern) : null;
+			}
+			case 'web_search': {
+				return typeof o.query === 'string' ? firstLine(o.query) : null;
+			}
+			case 'web_fetch': {
+				return typeof o.url === 'string' ? o.url : null;
+			}
+			default:
+				return null;
+		}
+	}
+
+	function firstLine(s: string): string | null {
+		const trimmed = s.replace(/^\s+/, '');
+		if (trimmed.length === 0) {
+			return null;
+		}
+		const nl = trimmed.indexOf('\n');
+		if (nl === -1) {
+			return trimmed;
+		}
+		// Trailing `…` so the user knows the value spans more than
+		// one line; the expanded body shows the full text.
+		return `${trimmed.slice(0, nl).trimEnd()} …`;
+	}
+
 	// Live tick fed into running tool rows so their elapsed-time
 	// readout (`running… (Xs)`) advances. One shared interval per
 	// panel — every tool row reads the same `nowTick` and computes
@@ -881,6 +944,7 @@
 	{:else if row.kind === 'tool'}
 		{@const subagent = withSubagentCards ? (coder.subagentSummaries.get(row.id) ?? null) : null}
 		{@const elapsedMs = row.hasResult ? (row.durationMs ?? 0) : Math.max(0, nowTick - row.startedAt)}
+		{@const hint = toolHint(row.name, row.args)}
 		<div class="row tool" class:err={row.isError}>
 			<!-- One-line collapsed shape: status dot, tool name,
 				 status word, elapsed counter — chevron on the right
@@ -894,6 +958,16 @@
 				<summary>
 					<span class="tool-dot" class:running={!row.hasResult} class:err={row.isError} aria-hidden="true"></span>
 					<span class="tool-name">{row.name}</span>
+					{#if hint !== null}
+						<!-- Identifying argument shown inline so the user
+							 can recognise the call without expanding the
+							 row: path for file tools, command for bash,
+							 pattern / query / URL for the rest. Flexes to
+							 fill the remaining width and ellipses on
+							 overflow; the expanded body still has the
+							 full payload. -->
+						<span class="tool-hint" title={hint}>{hint}</span>
+					{/if}
 					<span class="tool-status">{!row.hasResult ? 'running…' : row.isError ? 'error' : 'ok'}</span>
 					<!-- Live elapsed counter while running, precise
 						 final duration once the tool settles. Reads
@@ -1488,6 +1562,23 @@
 		flex: 0 0 auto;
 		color: var(--m-fg);
 		font-weight: 500;
+	}
+	/* Identifying-argument chip between the tool name and the
+	   status word. Takes the remaining width and ellipses on
+	   overflow so a long path / command doesn't push the elapsed
+	   counter off-row. Monospace because the values are paths,
+	   shell commands, regex patterns — code-shaped text — and a
+	   muted colour to keep the tool name as the primary lock-on
+	   point in the row. */
+	.row.tool .tool-hint {
+		flex: 1 1 auto;
+		min-width: 0;
+		overflow: hidden;
+		white-space: nowrap;
+		text-overflow: ellipsis;
+		font-family: var(--m-font-mono, ui-monospace, monospace);
+		font-size: 11px;
+		color: var(--m-fg-muted);
 	}
 	.row.tool .tool-status {
 		flex: 0 0 auto;
