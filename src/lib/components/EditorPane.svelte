@@ -81,6 +81,20 @@
 		await workspace.openLocal(selected);
 	}
 
+	// Post-flush marker for folder-swap profiling: fires after this
+	// pane has reconciled. The keyed Image/Diff/Markdown/Review
+	// blocks tear down and rebuild on path change; the regular
+	// Editor swaps state in place. Either way the mark lets us
+	// align EditorPane reconciliation against the rest of the
+	// cascade in a devtools timeline.
+	$effect(() => {
+		void activePath;
+		void showReview;
+		void showDiff;
+		void showMarkdownPreview;
+		performance.mark(`moon:editorPane.${side}.update`);
+	});
+
 	function focus() {
 		workspace.focusSide(side);
 	}

@@ -811,10 +811,48 @@ class WorkspaceState {
 		// rather than just the first cwd-match. No-op when the user
 		// is on a non-terminal tab or when there's no prior folder.
 		const previousFolderPath = this.activeFolderPath;
+		// Profiling: a marker the user can wrap a DevTools >
+		// Performance > Record around to scope the flame chart to a
+		// single folder-switch gesture. The `performance.measure`
+		// pairs below show up as named bars under the "User Timing"
+		// track. Paired with the post-rAF entries in
+		// `loadPaths` / FileTree.svelte we get a full timeline:
+		// click → IPC → sync adopt → reactive cascade → tree
+		// rebuild → git status refresh. See test plan 0076 for the
+		// reading guide.
+		performance.mark('moon:setActiveFolder.start');
+		const tStart = performance.now();
 		try {
 			const ws = await ipc.workspace.setActiveFolder(path);
+			const tIpc = performance.now();
+			performance.measure('moon:setActiveFolder.ipc', 'moon:setActiveFolder.start');
+			performance.mark('moon:setActiveFolder.adopt.start');
 			await this.adoptWorkspaceSnapshot(ws);
+			const tAdopt = performance.now();
+			performance.measure('moon:setActiveFolder.adopt', 'moon:setActiveFolder.adopt.start');
 			this.persistAppState();
+			// Schedule a follow-up timing capture once the browser
+			// has had a chance to paint the new folder bar /
+			// breadcrumb. rAF fires after the next style + layout +
+			// paint commit, so this approximates "time from click
+			// to first frame the user can see the new chrome". If
+			// this is large despite a small `ipc + adopt`, the
+			// stall is in Svelte's reactive cascade or in a
+			// downstream effect (FileTree resetPaths, EditorPane
+			// re-mount, SCM panel rebuild).
+			requestAnimationFrame(() => {
+				const tFirstFrame = performance.now();
+				performance.mark('moon:setActiveFolder.firstFrame');
+				performance.measure('moon:setActiveFolder.toFirstFrame', 'moon:setActiveFolder.start');
+				// eslint-disable-next-line no-console
+				console.info(
+					`moon-ide: setActiveFolder(${path}) ` +
+						`ipc=${(tIpc - tStart).toFixed(1)}ms ` +
+						`adopt=${(tAdopt - tIpc).toFixed(1)}ms ` +
+						`reactive+paint=${(tFirstFrame - tAdopt).toFixed(1)}ms ` +
+						`toFirstFrame=${(tFirstFrame - tStart).toFixed(1)}ms`,
+				);
+			});
 			// Re-prime the LSP for the new folder's open buffers.
 			// The backend's `ensure_broker` rebuilds lazily on the
 			// next `lsp_*` IPC (it sees the active-folder change
@@ -944,6 +982,13 @@ class WorkspaceState {
 	 * state.
 	 */
 	async adoptWorkspaceSnapshot(snapshot: Workspace) {
+		// Profiling: granular timings for the sync portion of the
+		// hydration. `setActiveFolder`'s `adopt` line reports the
+		// total of these plus whatever Svelte effects fire at the
+		// `await adoptWorkspaceSnapshot()` microtask boundary. See
+		// test plan 0076.
+		const tAdopt0 = performance.now();
+		performance.mark('moon:adopt.start');
 		// A folder swap invalidates the per-path blame cache: the
 		// same relative path can mean different files in folders A
 		// and B (both `src/lib.rs` in a multi-folder workspace), and
@@ -960,7 +1005,9 @@ class WorkspaceState {
 			this.headByPath = new Map();
 			this.#headInFlight.clear();
 		}
+		const tAdoptBlame = performance.now();
 		this.workspace = snapshot.folders.length === 0 ? null : snapshot;
+		const tAdoptAssign = performance.now();
 		// Tell the coder panel which folder is now active so its
 		// per-folder UI bucket flips. Per the multi-session design:
 		// turns running in the previous folder keep going in the
@@ -968,6 +1015,7 @@ class WorkspaceState {
 		// The user sees the new folder's transcript / sessions list
 		// / draft / attachments restored intact when they return.
 		coder.setActiveFolder(snapshot.active_folder ?? null);
+		const tAdoptCoder = performance.now();
 		// Drop FolderStates whose folders aren't bound anymore. Two-pass
 		// (collect-then-delete) so we never mutate the map while
 		// iterating — the spec allows it, but oxlint flags the spread
@@ -988,6 +1036,7 @@ class WorkspaceState {
 				this.folderStates.set(folder.path, new FolderState(folder.path));
 			}
 		}
+		const tAdoptFolderStates = performance.now();
 		// Hydrate the active folder's tree if it's a fresh state.
 		// On a swap to a previously-loaded folder the cached paths
 		// still match disk, but `gitStatusEntries` and `gitBranch`
@@ -999,8 +1048,17 @@ class WorkspaceState {
 		// changes until the next watcher fire, the next 3-minute
 		// auto-fetch tick, or until something else nudges
 		// `refreshGitStatus`.
+		//
+		// `loadPaths()` is **fire-and-forget** here: awaiting it
+		// would gate every caller of `adoptWorkspaceSnapshot` on a
+		// full recursive backend walk, which on a many-thousand-file
+		// project pins the IPC for hundreds of ms before the UI
+		// can paint the new folder bar / breadcrumb / empty tree.
+		// The frontend's `loadingPaths` flag covers the in-flight
+		// window; the tree paints with the spinner first, then
+		// reconciles when paths arrive.
 		if (this.activeFolderState && this.activeFolderState.paths.length === 0) {
-			await this.loadPaths();
+			void this.loadPaths();
 		} else if (previousActive !== null && previousActive !== snapshot.active_folder) {
 			void this.refreshGitStatus(this.paths, null);
 		}
@@ -1023,6 +1081,19 @@ class WorkspaceState {
 			this.gitChangeSummaries.delete(path);
 		}
 		void this.refreshAllGitChangeSummaries();
+		const tAdoptEnd = performance.now();
+		performance.mark('moon:adopt.end');
+		performance.measure('moon:adopt', 'moon:adopt.start', 'moon:adopt.end');
+		// eslint-disable-next-line no-console
+		console.info(
+			`moon-ide: adopt(${snapshot.active_folder ?? '<none>'}) ` +
+				`blame=${(tAdoptBlame - tAdopt0).toFixed(1)}ms ` +
+				`assignWs=${(tAdoptAssign - tAdoptBlame).toFixed(1)}ms ` +
+				`coder=${(tAdoptCoder - tAdoptAssign).toFixed(1)}ms ` +
+				`folderStates=${(tAdoptFolderStates - tAdoptCoder).toFixed(1)}ms ` +
+				`tail=${(tAdoptEnd - tAdoptFolderStates).toFixed(1)}ms ` +
+				`total=${(tAdoptEnd - tAdopt0).toFixed(1)}ms`,
+		);
 	}
 
 	tabsFor(side: SplitSide): string[] {
@@ -1597,6 +1668,14 @@ class WorkspaceState {
 			return;
 		}
 		this.loadingPaths = true;
+		// Profiling: see `setActiveFolder` above for the wider
+		// timeline. The `walk` measure is the recursive backend
+		// walk + IPC; `assign` is the synchronous reactive
+		// assignment plus whatever effects Svelte flushes
+		// synchronously in response (FileTree's path-set effect
+		// runs here, calling `tree.resetPaths(merged)`).
+		performance.mark('moon:loadPaths.start');
+		const tStart = performance.now();
 		try {
 			// One IPC call, full recursive walk backend-side. The
 			// previous implementation fired one `readDir` per
@@ -1604,12 +1683,24 @@ class WorkspaceState {
 			// dominated refresh latency (the walk itself is a
 			// sub-hundred-ms `read_dir` storm).
 			const collected = await ipc.fs.collectPaths(MAX_TREE_DEPTH);
+			const tWalk = performance.now();
+			performance.measure('moon:loadPaths.walk', 'moon:loadPaths.start');
+			performance.mark('moon:loadPaths.assign.start');
 			this.paths = collected;
+			const tAssign = performance.now();
+			performance.measure('moon:loadPaths.assign', 'moon:loadPaths.assign.start');
 			// Classify git status in the background — the tree can
 			// paint before we know the answer. Pierre reconciles
 			// `setGitStatus` updates in place, so late-arriving
 			// entries fade / tint the affected rows without a reflow.
 			void this.refreshGitStatus(collected, changedSubset);
+			// eslint-disable-next-line no-console
+			console.info(
+				`moon-ide: loadPaths(${this.activeFolderPath}) ` +
+					`walk=${(tWalk - tStart).toFixed(1)}ms ` +
+					`assign=${(tAssign - tWalk).toFixed(1)}ms ` +
+					`count=${collected.length}`,
+			);
 		} catch (err) {
 			this.flash(`Failed to read folder: ${formatError(err)}`);
 		} finally {

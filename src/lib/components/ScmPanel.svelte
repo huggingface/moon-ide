@@ -673,6 +673,16 @@
 		void message;
 		autoSize();
 	});
+
+	// Post-flush marker for folder-swap profiling: fires after the
+	// SCM panel has reconciled. See the matching mark in CoderPanel
+	// for the wider strategy.
+	$effect(() => {
+		void workspace.activeFolderPath;
+		void workspace.gitStatusEntries;
+		void workspace.scmFilterOn;
+		performance.mark('moon:scmPanel.update');
+	});
 </script>
 
 <section class="scm" aria-label="Source control">

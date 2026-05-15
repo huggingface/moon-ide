@@ -93,6 +93,7 @@ pub fn run() {
 			commands::workspace::workspace_list,
 			commands::fs::fs_read_dir,
 			commands::fs::fs_collect_paths,
+			commands::fs::fs_collect_paths_under,
 			commands::fs::fs_read_file,
 			commands::fs::fs_write_file,
 			commands::fs::fs_read_file_host,

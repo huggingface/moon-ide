@@ -12,13 +12,15 @@
 		type ContextMenuItem as PierreContextMenuItem,
 		type ContextMenuOpenContext as PierreContextMenuOpenContext,
 		type FileTreeBatchOperation,
+		type FileTreeDirectoryHandle,
 		type FileTreeMutationEvent,
 		type FileTreeRenameEvent,
 	} from '@pierre/trees';
 	import ContextMenu from './ContextMenu.svelte';
 	import type { ContextMenuItem } from './contextMenu';
 	import { workspace } from '../state.svelte';
-	import type { GitFileStatus, GitStatusEntry } from '../protocol';
+	import { ipc } from '../ipc';
+	import { formatError, type GitFileStatus, type GitStatusEntry } from '../protocol';
 
 	type Props = {
 		/**
@@ -824,6 +826,38 @@
 	// changes.
 	const deletedSignature = $derived(deletedPathsSignature(workspace.gitStatusEntries));
 	let lastTreePaths: ReadonlySet<string> | null = null;
+	// Tracks the active folder seen by the last path-set effect run.
+	// Switching folders bounces this and forces the wholesale
+	// `resetPaths` branch — see the comment above the `resetPaths`
+	// call below for the cost model.
+	let lastEffectFolderPath: string | null = null;
+
+	// Lazy-load bookkeeping for gitignored directories
+	// (`node_modules/`, `target/`, …). The backend's
+	// `fs_collect_paths` collapses them to a single trailing-slash
+	// entry. We surface them in the tree but only walk into them
+	// on demand: when the user expands one, we fetch its direct
+	// children and add them via `tree.batch`. Children that are
+	// themselves directories get added to `lazyDirs` so a deeper
+	// expansion fires another fetch.
+	//
+	//  - `lazyDirs`: paths Pierre knows about but whose descendants
+	//    haven't been walked yet. Click-or-keypress on one of these
+	//    triggers a load.
+	//  - `lazyLoading`: in-flight set to debounce repeated
+	//    expansion events while a fetch is mid-IPC.
+	//  - `lazyLoaded`: every path we've appended via the lazy
+	//    flow. Re-unioned into `merged` so the next
+	//    `gitStatusEntries`-driven path-set effect doesn't
+	//    `applyPathsDiff` them away (the backend walk still
+	//    excludes them).
+	let lazyDirs = new Set<string>();
+	let lazyLoading = new Set<string>();
+	let lazyLoaded = new Set<string>();
+	// Active folder seen by the last `seedLazyDirs` run. Mirrors
+	// `lastEffectFolderPath` but lives on the lazy-load side so the
+	// re-seed doesn't depend on effect execution order.
+	let lazySeedFolderPath: string | null = null;
 
 	$effect(() => {
 		// Both modes ultimately re-derive paths from workspace
@@ -847,18 +881,133 @@
 			void deletedSignature;
 			const entries = untrack(() => workspace.gitStatusEntries);
 			merged = mergedPathsWithDeletions(paths, entries);
+			// Re-seed `lazyDirs` whenever the active folder swap or
+			// a fresh git-status refresh tells us the set of
+			// collapsed-ignored directories. Same-folder refreshes
+			// keep `lazyLoaded` so previously-expanded subtrees
+			// stay populated. Only runs in 'all' mode — changes
+			// mode never walks into ignored dirs by design.
+			seedLazyDirs(workspace.activeFolderPath, entries);
+			if (lazyLoaded.size > 0) {
+				merged = mergeLazyLoaded(merged);
+			}
 		}
 		if (!tree) {
 			return;
 		}
+		// Skip Pierre work when this tree mode isn't visible. Both
+		// `'all'` and `'changes'` trees stay mounted at all times
+		// (CSS-toggled via the `.hidden` class on their wrapper),
+		// so without this gate a folder switch pays the full
+		// `resetPaths` / `applyPathsDiff` cost *twice* — once for
+		// the visible tree the user sees, once for the hidden tree
+		// they won't look at until they toggle the SCM filter. The
+		// hidden tree's preact reconciliation still re-renders 30+
+		// virtualised rows in its shadow DOM, triggers style
+		// invalidation up to the host, and shows up downstream as
+		// a multi-hundred-ms `recalculate-styles` event.
+		//
+		// To keep the catch-up cheap when the mode becomes visible
+		// later, we bounce `lastTreePaths` to `null`. The next run
+		// hits the `wholesaleFill`-equivalent path and does a one-
+		// shot `resetPaths(merged)`. The user toggling SCM filter
+		// is a deliberate gesture, not a hot path, so the
+		// transition cost is fine to land there instead of
+		// spreading it across every folder switch.
+		if (!isVisibleMode()) {
+			lastTreePaths = null;
+			return;
+		}
+		// Switching to a different active folder invalidates the
+		// incremental diff: the new folder's path-set is wholly
+		// disjoint from the old one's, and a remove-everything
+		// followed by an add-everything `batch` over Pierre's
+		// child index burns enough time on tens-of-thousands-of-
+		// files repos to be the dominant frame stall when the user
+		// hits the folder bar. `resetPaths` rebuilds the path
+		// store in one shot and skips the per-op event emission
+		// `batch` runs; we also pay the cost once instead of twice
+		// (the intermediate "previous folder cleared, new folder
+		// not yet loaded" state used to trigger a wasted full
+		// remove batch on its own). `workspace.activeFolderPath`
+		// is reactive — Svelte re-runs us when it flips.
+		const currentFolder = workspace.activeFolderPath;
+		const folderSwitched = currentFolder !== lastEffectFolderPath;
+		if (folderSwitched) {
+			lastEffectFolderPath = currentFolder;
+			lastTreePaths = null;
+		}
 		const nextSet = new Set(merged);
+		// Force the wholesale-rebuild path whenever the previous
+		// snapshot was empty and the next one isn't. `applyPathsDiff`
+		// is a per-op `tree.batch([{type:'add', path}, …])` storm,
+		// which on a single mid-sized repo (~80k paths) measured at
+		// 6.8 s of main-thread time — Pierre eats every `add`
+		// through its child-index bookkeeping and emits an event per
+		// op. `resetPaths(merged)` on the same data lands closer to
+		// 1 s because it builds the path store in one shot. The
+		// initial `loadPaths` after a fresh mount and the post-
+		// folder-switch fill both hit this case (the effect's first
+		// run sees `prev=∅, next=loaded paths`), so this is the
+		// dominant cost outside of folder switches and worth the
+		// special-case.
+		const wholesaleFill = !folderSwitched && lastTreePaths !== null && lastTreePaths.size === 0 && nextSet.size > 0;
 
-		if (lastTreePaths === null) {
+		// Coalesce echo runs. The path-set effect's deps include
+		// `workspace.paths`, `workspace.gitStatusEntries` (via
+		// `deletedSignature`), `workspace.scmFilterPaths`, and
+		// `workspace.activeFolderPath`. On a folder switch each of
+		// these flips in its own microtask cycle, so the effect
+		// re-runs 2–3 times per tree mode before the cascade
+		// settles. Most of those runs produce an identical
+		// `merged` because the relevant slice didn't actually
+		// change — but Pierre's `resetPaths` / `applyPathsDiff`
+		// don't know that, do the full rebuild, and the resulting
+		// shadow-DOM churn shows up as 200+ ms style recalcs
+		// downstream. A cheap structural-equality skip here cuts
+		// the duplicated `fileTree.update` runs (observed: 4 per
+		// folder switch → 2) and the cascading style recalcs they
+		// drag in. The `lastTreePaths` cursor stays as-is so the
+		// next *real* change still takes the right branch.
+		if (!folderSwitched && !wholesaleFill && lastTreePaths !== null && pathSetsEqual(lastTreePaths, nextSet)) {
+			// Selection may have shifted under us even when the
+			// path set didn't change (Save As writes activePath
+			// then later flips paths) — replay it before
+			// returning, same as the non-skip branch below does.
+			const target = untrack(() => workspace.activePath);
+			applySelection(tree, target, { afterReset: true });
+			return;
+		}
+
+		// Profiling: paired with `setActiveFolder` / `loadPaths`
+		// timings in `state.svelte.ts`, see test plan 0076. We
+		// only emit a log line on a folder switch / wholesale fill
+		// or a sizable update so steady-state edits don't spam the
+		// console. The `User Timing` measure is always emitted —
+		// it's free in the absence of a Performance recording.
+		const treeStart = performance.now();
+		performance.mark('moon:fileTree.update.start');
+
+		let strategy: 'resetPaths' | 'applyPathsDiff';
+		if (lastTreePaths === null || wholesaleFill) {
 			tree.resetPaths(merged);
+			strategy = 'resetPaths';
 		} else {
 			applyPathsDiff(tree, lastTreePaths, nextSet, merged);
+			strategy = 'applyPathsDiff';
 		}
 		lastTreePaths = nextSet;
+
+		const treeDur = performance.now() - treeStart;
+		performance.mark('moon:fileTree.update.end');
+		performance.measure('moon:fileTree.update', 'moon:fileTree.update.start', 'moon:fileTree.update.end');
+		if (folderSwitched || wholesaleFill || treeDur > 50) {
+			// eslint-disable-next-line no-console
+			console.info(
+				`moon-ide: fileTree.update mode=${mode} folder=${currentFolder ?? '<none>'} ` +
+					`paths=${merged.length} ${strategy}=${treeDur.toFixed(1)}ms`,
+			);
+		}
 
 		// Replay the active path so Save As (which mutates
 		// `activePath` *before* the new file lands in `paths`, with
@@ -869,6 +1018,28 @@
 		applySelection(tree, target, { afterReset: true });
 	});
 
+	/**
+	 * Structural set equality. Pierre's path lists are typically
+	 * 100s–1000s of strings and most echo runs are bit-for-bit
+	 * identical, so a size + every-member check is enough. We
+	 * never need a deep-order comparison because Pierre's path
+	 * store is order-agnostic at the input boundary.
+	 */
+	function pathSetsEqual(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+		if (a === b) {
+			return true;
+		}
+		if (a.size !== b.size) {
+			return false;
+		}
+		for (const value of a) {
+			if (!b.has(value)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
 	function currentPaths(): readonly string[] {
 		if (mode === 'changes') {
 			return untrack(() => workspace.scmFilterPaths);
@@ -877,6 +1048,160 @@
 			untrack(() => workspace.paths),
 			untrack(() => workspace.gitStatusEntries),
 		);
+	}
+
+	/**
+	 * Refresh `lazyDirs` from the current gitignored-directory
+	 * list. A folder switch resets every lazy-load bucket because
+	 * the new folder has its own ignore set; same-folder refreshes
+	 * preserve `lazyLoaded` so already-expanded `node_modules/foo/`
+	 * stays visible across watcher kicks.
+	 */
+	function seedLazyDirs(folder: string | null, entries: readonly GitStatusEntry[]): void {
+		if (folder !== lazySeedFolderPath) {
+			lazySeedFolderPath = folder;
+			lazyLoaded = new Set();
+		}
+		const next = new Set<string>();
+		for (const entry of entries) {
+			if (entry.status === 'ignored' && entry.path.endsWith('/') && !lazyLoaded.has(entry.path)) {
+				next.add(entry.path);
+			}
+		}
+		lazyDirs = next;
+	}
+
+	/**
+	 * Union `merged` with `lazyLoaded` while preserving the input
+	 * order — Pierre tolerates either order, but a stable merge
+	 * makes the `applyPathsDiff` add list smaller on the next tick.
+	 */
+	function mergeLazyLoaded(merged: readonly string[]): readonly string[] {
+		const out = new Set(merged);
+		for (const path of lazyLoaded) {
+			out.add(path);
+		}
+		return [...out];
+	}
+
+	/**
+	 * Fetch one level of children for an expanded gitignored
+	 * directory and batch-add them to Pierre. The user expanded
+	 * `path` (a `node_modules/`-style entry); we hand back its
+	 * direct children so the tree can paint them. Sub-directories
+	 * become themselves lazy entries — drilling deeper re-issues
+	 * this command at the next level. Errors flash and leave the
+	 * directory marked as still-lazy so a retry-click works.
+	 */
+	async function loadLazyDir(path: string): Promise<void> {
+		if (!path.endsWith('/')) {
+			return;
+		}
+		if (lazyLoading.has(path)) {
+			return;
+		}
+		const local = tree;
+		if (!local) {
+			return;
+		}
+		lazyLoading.add(path);
+		try {
+			// `max_depth=0` means "direct children only" — the
+			// walker pushes the entries of `path` but never
+			// recurses into sub-directories. Drilling deeper
+			// fires another lazy-load against the deeper rel.
+			const children = await ipc.fs.collectPathsUnder(path, 0);
+			if (children.length === 0) {
+				lazyDirs.delete(path);
+				lazyLoaded.add(path);
+				return;
+			}
+			const addPaths: string[] = [];
+			for (const child of children) {
+				if (child === path) {
+					continue;
+				}
+				if (lazyLoaded.has(child)) {
+					continue;
+				}
+				addPaths.push(child);
+				lazyLoaded.add(child);
+				if (child.endsWith('/')) {
+					lazyDirs.add(child);
+				}
+			}
+			lazyDirs.delete(path);
+			lazyLoaded.add(path);
+			if (addPaths.length > 0) {
+				const ops: FileTreeBatchOperation[] = addPaths.map((p) => ({ type: 'add', path: p }));
+				try {
+					local.batch(ops);
+					// Mirror the new paths into `lastTreePaths`
+					// so the next `applyPathsDiff` run (driven
+					// by a git-status refresh or path-set
+					// effect re-fire) sees them as already
+					// present rather than trying to re-add and
+					// crashing Pierre's path store. The set is
+					// recreated rather than mutated so any
+					// future reactive dependency on identity
+					// (currently none, but cheap insurance)
+					// still triggers.
+					if (lastTreePaths !== null) {
+						const next = new Set(lastTreePaths);
+						for (const p of addPaths) {
+							next.add(p);
+						}
+						lastTreePaths = next;
+					}
+				} catch {
+					// Pierre rejected the batch (path-store
+					// invariant violation); roll the lazy-load
+					// state back so a subsequent click can retry
+					// rather than silently leaving the user with
+					// an empty expanded folder.
+					for (const p of addPaths) {
+						lazyLoaded.delete(p);
+						if (p.endsWith('/')) {
+							lazyDirs.add(p);
+						}
+					}
+					lazyDirs.add(path);
+					lazyLoaded.delete(path);
+				}
+			}
+		} catch (err) {
+			workspace.flash(`Could not load ${path}: ${formatError(err)}`);
+		} finally {
+			lazyLoading.delete(path);
+		}
+	}
+
+	/**
+	 * Probe whether `path` is a still-unloaded ignored directory
+	 * and, if so, kick the one-level walk. Called from the click /
+	 * keyboard handlers after Pierre has had a chance to flip the
+	 * row's expansion state.
+	 */
+	function maybeLoadLazyAt(path: string): void {
+		if (mode !== 'all') {
+			return;
+		}
+		if (!lazyDirs.has(path)) {
+			return;
+		}
+		const item = tree?.getItem(path);
+		if (!item || !item.isDirectory()) {
+			return;
+		}
+		// Pierre's discriminated union narrows via `isDirectory()`'s
+		// literal-`true` return type, but svelte-check's type
+		// inference doesn't pick it up here — cast through after
+		// the early-return guard.
+		const dir = item as FileTreeDirectoryHandle;
+		if (!dir.isExpanded()) {
+			return;
+		}
+		void loadLazyDir(path);
 	}
 
 	/**
@@ -1349,6 +1674,17 @@
 			activateFocusedRow();
 			return;
 		}
+		// Pierre handles ArrowRight (expand) and ArrowLeft / Space
+		// (toggle) on its row before this wrapper-level handler
+		// fires, so by the time we read `isExpanded()` the new
+		// state is in place. Probe lazy load on every keystroke
+		// that could have flipped expansion.
+		if (event.key === 'ArrowRight' || event.key === 'ArrowLeft' || event.key === ' ') {
+			const focused = tree?.getFocusedPath();
+			if (focused) {
+				queueMicrotask(() => maybeLoadLazyAt(focused));
+			}
+		}
 		if (event.key === 'Delete' || event.key === 'Backspace') {
 			if (isTextInputFocused()) {
 				return;
@@ -1485,6 +1821,12 @@
 			return;
 		}
 		activateRowFromTree(path);
+		// Pierre's row-level click handler already toggled
+		// expansion synchronously by the time the event bubbled
+		// here, so `isExpanded()` reflects post-click state. If
+		// the row is one of our gitignored-and-not-yet-walked
+		// dirs and just opened, fetch its direct children.
+		maybeLoadLazyAt(path);
 	}
 
 	function isVisibleMode(): boolean {

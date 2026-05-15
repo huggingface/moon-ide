@@ -83,6 +83,40 @@ function applyLinkRules(parser: MarkdownIt): void {
 }
 
 /**
+ * Module-level memo of rendered markdown. Folder-switch profiling
+ * (see test-plan 0076) traced a ~270 ms style recalc per swap back
+ * to the cascade of `{@html html}` updates that fire when many
+ * `CoderMarkdown` instances mount at once: each one schedules an
+ * `rAF`, the rAFs all fire in the same frame, every async render
+ * resolves around the same time, and the DOM ends up with N
+ * subtrees swapped in close succession. Memoising the rendered
+ * HTML lets `CoderMarkdown` skip the rAF + async dance entirely
+ * on a cache hit (folder swap back to an already-visited session,
+ * reopening a session, re-mounting the panel) and apply the cached
+ * HTML synchronously during the same Svelte flush as the row mount.
+ *
+ * Key is `linkify`-tagged so the two parser modes (file content
+ * vs. chat transcript) don't collide. Eviction is FIFO at
+ * `MARKDOWN_CACHE_MAX` entries; raw markdown source rarely exceeds
+ * a few kilobytes, so the steady-state memory cap is small (a few
+ * MB worst case) and the cache resets on page reload.
+ */
+const markdownCache = new Map<string, string>();
+const MARKDOWN_CACHE_MAX = 500;
+
+function markdownCacheKey(source: string, linkify: boolean): string {
+	return (linkify ? 'L\x00' : '_\x00') + source;
+}
+
+/**
+ * Sync lookup against the render cache. Returns `undefined` for a
+ * miss — caller falls back to `renderMarkdown` (async).
+ */
+export function getCachedMarkdown(source: string, options: { linkify?: boolean } = {}): string | undefined {
+	return markdownCache.get(markdownCacheKey(source, options.linkify ?? false));
+}
+
+/**
  * Render a Markdown string to sanitised HTML. Async because the
  * syntax-highlighter pre-loads the CodeMirror grammar for every
  * fenced-code language before the synchronous render — dynamic
@@ -99,12 +133,22 @@ function applyLinkRules(parser: MarkdownIt): void {
  * where raw URLs in prose are the norm. Default is off so any
  * existing caller keeps the old behaviour without thinking about
  * the flag.
+ *
+ * The rendered HTML is stored in `markdownCache`; subsequent calls
+ * for the same `(source, linkify)` short-circuit on the synchronous
+ * `getCachedMarkdown` path used by `CoderMarkdown.svelte`.
  */
 export async function renderMarkdown(source: string, options: { linkify?: boolean } = {}): Promise<string> {
+	const linkify = options.linkify ?? false;
+	const key = markdownCacheKey(source, linkify);
+	const cached = markdownCache.get(key);
+	if (cached !== undefined) {
+		return cached;
+	}
 	await loadHighlighters(extractFenceLanguages(source));
-	const parser = options.linkify ? mdLinkified : md;
+	const parser = linkify ? mdLinkified : md;
 	const html = parser.render(source);
-	return DOMPurify.sanitize(html, {
+	const sanitised = DOMPurify.sanitize(html, {
 		// Block any URI scheme that isn't on the known-safe list.
 		// DOMPurify defaults already cover the common cases; this is
 		// belt-and-suspenders. `data:image/*` stays allowed (used by
@@ -114,6 +158,14 @@ export async function renderMarkdown(source: string, options: { linkify?: boolea
 		// `innerHTML` so a string is what we want.
 		RETURN_TRUSTED_TYPE: false,
 	});
+	markdownCache.set(key, sanitised);
+	if (markdownCache.size > MARKDOWN_CACHE_MAX) {
+		const oldest = markdownCache.keys().next().value;
+		if (oldest !== undefined) {
+			markdownCache.delete(oldest);
+		}
+	}
+	return sanitised;
 }
 
 /**

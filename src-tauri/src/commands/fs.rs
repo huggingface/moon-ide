@@ -30,10 +30,45 @@ pub async fn fs_read_dir(state: State<'_, AppState>, path: String) -> Result<Vec
 /// call, dominated refresh latency on anything bigger than a toy
 /// repo. This command does the same walk backend-side and returns
 /// the full path list in a single roundtrip.
+/// Lazy-load a single subtree on demand. The file tree calls this
+/// when the user expands a directory that `fs_collect_paths` left
+/// collapsed because git ignored it (`node_modules/`, `target/`,
+/// …). One level at a time keeps the IPC small and the path-store
+/// batch cheap — drilling deeper into the subtree re-issues this
+/// command with the deeper rel.
+#[tauri::command]
+pub async fn fs_collect_paths_under(
+	state: State<'_, AppState>,
+	rel: String,
+	max_depth: u32,
+) -> Result<Vec<String>, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	let path = Utf8PathBuf::from(rel);
+	entry.host.collect_paths_under(&path, max_depth).await
+}
+
 #[tauri::command]
 pub async fn fs_collect_paths(state: State<'_, AppState>, max_depth: u32) -> Result<Vec<String>, MoonError> {
+	// Profiling: paired with the frontend `console.info` from
+	// `loadPaths`. The wall time here is the recursive
+	// `std::fs::read_dir` storm on the blocking pool; the
+	// `require_active_folder` lookup is a single mutex read. See
+	// test plan 0076.
+	let t0 = std::time::Instant::now();
 	let entry = state.workspaces.require_active_folder().await?;
-	entry.host.collect_paths(max_depth).await
+	let t1 = std::time::Instant::now();
+	let paths = entry.host.collect_paths(max_depth).await?;
+	let t2 = std::time::Instant::now();
+	tracing::info!(
+		target: "moon_profile",
+		"fs_collect_paths folder={} require={}ms walk={}ms total={}ms count={}",
+		entry.folder.path,
+		(t1 - t0).as_millis(),
+		(t2 - t1).as_millis(),
+		(t2 - t0).as_millis(),
+		paths.len(),
+	);
+	Ok(paths)
 }
 
 #[tauri::command]

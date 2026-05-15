@@ -123,6 +123,20 @@ pub trait WorkspaceHost: Send + Sync {
 	/// work; everything else was IPC framing.
 	async fn collect_paths(&self, max_depth: u32) -> MoonResult<Vec<String>>;
 
+	/// Walk a single subtree on demand, ignoring the gitignore-
+	/// collapse filter that `collect_paths` applies. Returns paths
+	/// relative to the workspace root (same shape as
+	/// `collect_paths` output). Used by the file tree's lazy-load
+	/// flow: when the user expands a directory that was collapsed
+	/// because git ignored it (`node_modules/`, `target/`, …),
+	/// this fetches its direct children so they slot into Pierre's
+	/// path store without a full re-walk.
+	///
+	/// `max_depth` counts levels below `rel` (1 = direct children
+	/// only). The walker still hides `.git/` and emits directories
+	/// with a trailing slash. Errors if `rel` escapes the root.
+	async fn collect_paths_under(&self, rel: &Utf8Path, max_depth: u32) -> MoonResult<Vec<String>>;
+
 	/// Per-path git status for the file tree — added, modified,
 	/// deleted, untracked, and ignored. Deleted entries are included
 	/// even when the frontend hasn't enumerated them on disk; the
@@ -1095,6 +1109,39 @@ impl WorkspaceHost for LocalHost {
 			.map_err(|e| MoonError::Internal(format!("git_status_entries join error: {e}")))?
 	}
 
+	async fn collect_paths_under(&self, rel: &Utf8Path, max_depth: u32) -> MoonResult<Vec<String>> {
+		// Lazy-load entry point for ignored directories. Compared
+		// to `collect_paths` we skip the `collapsed_ignored_dirs`
+		// probe — the caller already knows this subtree is
+		// gitignored and explicitly wants its contents — and we
+		// root the walk at `rel` so a single click only pays for
+		// the directory the user just expanded. An empty `rel`
+		// would re-walk the whole workspace without the ignore
+		// filter and is rejected: the caller must always name a
+		// specific subdirectory.
+		let raw = rel.as_str();
+		if raw.is_empty() {
+			return Err(MoonError::InvalidArgument(
+				"collect_paths_under requires a non-empty subdirectory".into(),
+			));
+		}
+		// `resolve` confirms the path exists and stays inside the
+		// workspace root; we discard its absolute form and walk
+		// with the caller-provided relative segment so the emitted
+		// paths stay root-relative (Pierre stores them that way).
+		let _ = self.resolve(rel)?;
+		let rel_owned = raw.trim_end_matches('/').to_string();
+		let root = self.root.clone();
+		tokio::task::spawn_blocking(move || {
+			let mut out = Vec::new();
+			let empty = std::collections::BTreeSet::new();
+			walk_paths(&root, &rel_owned, &mut out, 0, max_depth, &empty);
+			Ok(out)
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("collect_paths_under join error: {e}")))?
+	}
+
 	async fn collect_paths(&self, max_depth: u32) -> MoonResult<Vec<String>> {
 		// Pure `std::fs` walk on the blocking pool. Tried using
 		// `tokio::fs::read_dir` recursively here — it kept the
@@ -1102,10 +1149,27 @@ impl WorkspaceHost for LocalHost {
 		// slower than the sync version, presumably because the
 		// actual read_dir syscall is already non-blocking-ish on
 		// modern kernels.
+		//
+		// Before walking we run a quick `git status` to learn
+		// which directories git would collapse to a single ignored
+		// row (the typical suspects are `node_modules/`, `target/`,
+		// `build/`, `dist/`, `.next/`, etc.). The walk then emits
+		// each such directory as a single collapsed entry and skips
+		// recursing into it — without this, a single moon-ide-sized
+		// repo handed Pierre ~127k paths, the bulk of which were
+		// `node_modules/**/*` Pierre would dutifully add to its
+		// path store and the user never wants to expand. The skip
+		// is purely "don't enumerate descendants"; the dir itself
+		// stays in the tree so the user can still see it and click
+		// it (which today does nothing more than reveal the
+		// collapsed badge — lazy descendant fetch is a follow-up).
+		// Non-repo folders return an empty skip set and the walk
+		// behaves exactly as before.
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
+			let skip = collapsed_ignored_dirs(&root);
 			let mut out = Vec::new();
-			walk_paths(&root, "", &mut out, 0, max_depth);
+			walk_paths(&root, "", &mut out, 0, max_depth, &skip);
 			Ok(out)
 		})
 		.await
@@ -2981,7 +3045,14 @@ struct CommitMeta {
 /// Errors are swallowed per-entry rather than bubbled up: a single
 /// unreadable symlink or permission-denied directory shouldn't blow
 /// up a whole refresh. The entries we _can_ read still make the cut.
-fn walk_paths(root: &Utf8Path, rel: &str, out: &mut Vec<String>, depth: u32, max_depth: u32) {
+fn walk_paths(
+	root: &Utf8Path,
+	rel: &str,
+	out: &mut Vec<String>,
+	depth: u32,
+	max_depth: u32,
+	skip_dirs: &std::collections::BTreeSet<String>,
+) {
 	let dir_path = if rel.is_empty() {
 		root.as_std_path().to_path_buf()
 	} else {
@@ -3002,21 +3073,101 @@ fn walk_paths(root: &Utf8Path, rel: &str, out: &mut Vec<String>, depth: u32, max
 			format!("{rel}/{name}")
 		};
 		if file_type.is_dir() {
-			// `.git/` hides on purpose — see `read_dir`'s matching
-			// skip. Once Phase 5's git layer fully lands this may
-			// move to a gitignore-aware filter, but right now the
-			// tree would drown in refs/ churn if we surfaced it.
+			// `.git/` hides on purpose; ignored-directory pruning
+			// goes through the explicit skip set instead of
+			// hard-coded names so a project that chooses to track
+			// `node_modules/` (rare but legal) keeps its contents
+			// visible.
 			if name == ".git" {
 				continue;
 			}
-			out.push(format!("{child_rel}/"));
+			let dir_path_rel = format!("{child_rel}/");
+			if skip_dirs.contains(&dir_path_rel) {
+				// Emit the directory itself so the user still
+				// sees it in the tree (and the git overlay can
+				// tint it with the ignored colour), but don't
+				// enumerate its descendants. For a repo whose
+				// gitignore covers `node_modules/`, this saves
+				// the path store from carrying tens of thousands
+				// of entries the user has no way to reach.
+				out.push(dir_path_rel);
+				continue;
+			}
+			out.push(dir_path_rel);
 			if depth < max_depth {
-				walk_paths(root, &child_rel, out, depth + 1, max_depth);
+				walk_paths(root, &child_rel, out, depth + 1, max_depth, skip_dirs);
 			}
 		} else if file_type.is_file() || file_type.is_symlink() {
 			out.push(child_rel);
 		}
 	}
+}
+
+/// Set of repo-relative directory paths (each ending in `/`) that
+/// `git status --ignored=matching` collapses to a single ignored
+/// row. The walker treats these as "don't recurse" so Pierre
+/// never sees their descendants. Returns an empty set for non-repo
+/// folders, git failures, or repos with no ignored directories.
+///
+/// `--porcelain=v1 -z --ignored=matching`. We **don't** pass
+/// `--untracked-files=no` — git refuses
+/// `--ignored=matching --untracked-files=no` with `Combinaison non
+/// supportée…` because untracked enumeration is the mechanism that
+/// surfaces ignored entries in the first place. The default
+/// (`--untracked-files=normal`) keeps untracked directories
+/// collapsed to `dir/` records, which we filter out below.
+fn collapsed_ignored_dirs(root: &Utf8Path) -> std::collections::BTreeSet<String> {
+	use std::process::Command;
+
+	let mut out = std::collections::BTreeSet::new();
+	let Ok(output) = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["status", "--porcelain=v1", "-z", "--ignored=matching"])
+		.output()
+	else {
+		return out;
+	};
+	if !output.status.success() {
+		return out;
+	}
+	let mut cursor = 0;
+	let buf = &output.stdout;
+	while cursor < buf.len() {
+		if buf.len() - cursor < 3 {
+			break;
+		}
+		let x = buf[cursor];
+		let y = buf[cursor + 1];
+		cursor += 3;
+		let path_start = cursor;
+		while cursor < buf.len() && buf[cursor] != 0 {
+			cursor += 1;
+		}
+		let raw = &buf[path_start..cursor];
+		if cursor < buf.len() {
+			cursor += 1;
+		}
+		// Only `!!` records (both X and Y are `!`) describe
+		// ignored entries. Anything else (`R` renames double-
+		// records for example) is irrelevant here.
+		if x != b'!' || y != b'!' {
+			continue;
+		}
+		let Ok(path) = std::str::from_utf8(raw) else {
+			continue;
+		};
+		// `--ignored=matching` collapses an ignored directory to
+		// `name/` (trailing slash). An ignored *file* comes
+		// through without a trailing slash; we ignore those —
+		// the walker would visit it anyway and pierre's git
+		// overlay tints it from `git_status_entries`.
+		if !path.ends_with('/') {
+			continue;
+		}
+		out.insert(path.replace('\\', "/"));
+	}
+	out
 }
 
 /// Per-path git status for every interesting entry in the tree —
@@ -3440,6 +3591,124 @@ mod tests {
 		assert!(set.contains("src/nested/deep.rs"), "got {set:?}");
 		// `.git/` and everything inside it stays off the tree.
 		assert!(!set.iter().any(|p| p.starts_with(".git")), "got {set:?}");
+	}
+
+	#[tokio::test]
+	async fn collect_paths_skips_into_git_ignored_dirs() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping gitignore-aware collect_paths test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		// A `node_modules/`-style nuisance directory plus a real
+		// source directory. After `git init` + the `.gitignore`,
+		// `git status --ignored=matching` reports `node_modules/`
+		// as a single collapsed `!!` record; `collect_paths` should
+		// emit that one entry and skip its descendants entirely.
+		std::fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
+		std::fs::create_dir_all(dir.path().join("node_modules").join("deep").join("nested")).unwrap();
+		std::fs::write(
+			dir
+				.path()
+				.join("node_modules")
+				.join("deep")
+				.join("nested")
+				.join("file.js"),
+			"",
+		)
+		.unwrap();
+		std::fs::write(dir.path().join("node_modules").join("top.js"), "").unwrap();
+		std::fs::create_dir_all(dir.path().join("src")).unwrap();
+		std::fs::write(dir.path().join("src").join("lib.rs"), "").unwrap();
+		std::fs::write(dir.path().join("README.md"), "").unwrap();
+
+		run_git(&git, dir.path(), &["init", "-q"]);
+		run_git(&git, dir.path(), &["config", "user.email", "test@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "test"]);
+		run_git(&git, dir.path(), &["add", ".gitignore", "src", "README.md"]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "init"]);
+
+		let paths = host(&dir).collect_paths(6).await.unwrap();
+		let set: std::collections::HashSet<_> = paths.into_iter().collect();
+		assert!(set.contains("README.md"), "got {set:?}");
+		assert!(set.contains("src/"), "got {set:?}");
+		assert!(set.contains("src/lib.rs"), "got {set:?}");
+		// The collapsed `node_modules/` row stays so the user can
+		// see it in the tree and the git overlay can tint it.
+		assert!(set.contains("node_modules/"), "got {set:?}");
+		// Every descendant of `node_modules/` is skipped.
+		assert!(
+			!set
+				.iter()
+				.any(|p| p.starts_with("node_modules/") && p != "node_modules/"),
+			"node_modules/ contents leaked into the path list, got {set:?}",
+		);
+	}
+
+	#[tokio::test]
+	async fn collect_paths_does_not_skip_in_non_git_folder() {
+		// Same shape as the gitignore-aware test, but no `git init`
+		// so `git status` errors and the skip set is empty. The
+		// walk must enumerate everything — non-repo folders don't
+		// have an authoritative ignore source we can consult, so
+		// the safe default is "show all paths and let the user
+		// decide".
+		let dir = TempDir::new().unwrap();
+		std::fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
+		std::fs::create_dir_all(dir.path().join("node_modules").join("deep")).unwrap();
+		std::fs::write(dir.path().join("node_modules").join("deep").join("file.js"), "").unwrap();
+
+		let paths = host(&dir).collect_paths(6).await.unwrap();
+		let set: std::collections::HashSet<_> = paths.into_iter().collect();
+		assert!(set.contains("node_modules/"), "got {set:?}");
+		assert!(set.contains("node_modules/deep/"), "got {set:?}");
+		assert!(set.contains("node_modules/deep/file.js"), "got {set:?}");
+	}
+
+	#[tokio::test]
+	async fn collect_paths_under_walks_one_subtree() {
+		// Lazy-load entry point: ignores the gitignore-collapse
+		// filter (the caller already decided this subtree is
+		// worth fetching) and only walks below the named
+		// directory. `max_depth=0` matches the file tree's
+		// "one level at a time" lazy load — direct children
+		// only, no descent into sub-directories.
+		let dir = TempDir::new().unwrap();
+		std::fs::create_dir_all(dir.path().join("node_modules").join("foo").join("bar")).unwrap();
+		std::fs::write(dir.path().join("node_modules").join("top.js"), "").unwrap();
+		std::fs::write(dir.path().join("node_modules").join("foo").join("a.js"), "").unwrap();
+		std::fs::write(dir.path().join("node_modules").join("foo").join("bar").join("b.js"), "").unwrap();
+		std::fs::write(dir.path().join("README.md"), "").unwrap();
+
+		let paths = host(&dir)
+			.collect_paths_under(Utf8Path::new("node_modules/"), 0)
+			.await
+			.unwrap();
+		let set: std::collections::HashSet<_> = paths.into_iter().collect();
+		assert!(set.contains("node_modules/foo/"), "got {set:?}");
+		assert!(set.contains("node_modules/top.js"), "got {set:?}");
+		// `max_depth=0` pushes direct children but never
+		// recurses, so `foo/a.js` and `bar/` (let alone deeper)
+		// stay out of the result.
+		assert!(!set.contains("node_modules/foo/a.js"), "got {set:?}");
+		assert!(!set.contains("node_modules/foo/bar/"), "got {set:?}");
+		assert!(!set.contains("node_modules/foo/bar/b.js"), "got {set:?}");
+		// Sibling subtrees outside `rel` aren't touched.
+		assert!(!set.contains("README.md"), "got {set:?}");
+	}
+
+	#[tokio::test]
+	async fn collect_paths_under_rejects_empty_rel() {
+		let dir = TempDir::new().unwrap();
+		let err = host(&dir).collect_paths_under(Utf8Path::new(""), 1).await;
+		assert!(matches!(err, Err(MoonError::InvalidArgument(_))));
+	}
+
+	#[tokio::test]
+	async fn collect_paths_under_rejects_escaping_rel() {
+		let dir = TempDir::new().unwrap();
+		let err = host(&dir).collect_paths_under(Utf8Path::new("../escape"), 1).await;
+		assert!(err.is_err());
 	}
 
 	#[tokio::test]

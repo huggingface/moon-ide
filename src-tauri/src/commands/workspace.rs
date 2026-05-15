@@ -24,7 +24,7 @@ pub async fn workspace_open_local(state: State<'_, AppState>, path: String) -> R
 	state.workspaces.add_folder(path).await?;
 	let snap = state.workspaces.snapshot().await;
 	repoint_fs_watcher(&state, &snap);
-	reset_lsp_if_root_changed(&state, &snap).await;
+	detach_lsp_teardown_if_root_changed(&state, &snap).await;
 	Ok(snap)
 }
 
@@ -36,7 +36,7 @@ pub async fn workspace_remove_folder(state: State<'_, AppState>, path: String) -
 	state.workspaces.remove_folder(&path).await?;
 	let snap = state.workspaces.snapshot().await;
 	repoint_fs_watcher(&state, &snap);
-	reset_lsp_if_root_changed(&state, &snap).await;
+	detach_lsp_teardown_if_root_changed(&state, &snap).await;
 	Ok(snap)
 }
 
@@ -48,10 +48,28 @@ pub async fn workspace_set_active_folder(
 	state: State<'_, AppState>,
 	path: String,
 ) -> Result<WorkspaceRecord, MoonError> {
+	// Profiling: paired with the frontend `console.info` from
+	// `setActiveFolder`. Any phase that creeps past single-digit ms
+	// here is the IPC roundtrip's bottleneck. See test plan 0076.
+	let t0 = std::time::Instant::now();
 	state.workspaces.set_active_folder(&path).await?;
+	let t1 = std::time::Instant::now();
 	let snap = state.workspaces.snapshot().await;
+	let t2 = std::time::Instant::now();
 	repoint_fs_watcher(&state, &snap);
-	reset_lsp_if_root_changed(&state, &snap).await;
+	let t3 = std::time::Instant::now();
+	detach_lsp_teardown_if_root_changed(&state, &snap).await;
+	let t4 = std::time::Instant::now();
+	tracing::info!(
+		target: "moon_profile",
+		"workspace_set_active_folder path={} set={}ms snapshot={}ms watcher={}ms lsp_detach={}ms total={}ms",
+		path,
+		(t1 - t0).as_millis(),
+		(t2 - t1).as_millis(),
+		(t3 - t2).as_millis(),
+		(t4 - t3).as_millis(),
+		(t4 - t0).as_millis(),
+	);
 	Ok(snap)
 }
 
@@ -71,24 +89,35 @@ fn repoint_fs_watcher(state: &AppState, snap: &WorkspaceRecord) {
 /// the new root; the frontend re-issues `didOpen` for all open
 /// buffers when it sees the workspace change (see
 /// `state.svelte.ts` → `applyWorkspaceSnapshot`).
-async fn reset_lsp_if_root_changed(state: &AppState, snap: &WorkspaceRecord) {
-	let Some(active) = snap.active_folder.as_ref() else {
-		let handle = { state.lsp.lock().await.take() };
-		if let Some(old) = handle {
+///
+/// The actual `shutdown_all` runs on a detached task — every LSP
+/// server gets up to 4 s of timeouts (2 s shutdown request plus 2 s
+/// child wait), iterated **sequentially**, so on a folder running
+/// TS, rust-analyzer, and tailwind together the synchronous
+/// version stalled the IPC roundtrip for 6–12 s. The user can't
+/// switch folders while LSPs are dying, even though nothing on the
+/// frontend's critical path actually depends on the old brokers
+/// finishing teardown: the next `lsp_*` command lazily builds a
+/// fresh broker against the new root regardless. Snipping the
+/// handle out of the mutex synchronously and letting the spawned
+/// task own the rest of the teardown gives the IPC ~sub-millisecond
+/// latency here.
+async fn detach_lsp_teardown_if_root_changed(state: &AppState, snap: &WorkspaceRecord) {
+	let old_handle = match snap.active_folder.as_ref() {
+		None => state.lsp.lock().await.take(),
+		Some(active) => {
+			let new_root = Utf8PathBuf::from(active);
+			let mut guard = state.lsp.lock().await;
+			match guard.as_ref() {
+				Some(existing) if existing.root == new_root => None,
+				_ => guard.take(),
+			}
+		}
+	};
+	if let Some(old) = old_handle {
+		tokio::spawn(async move {
 			old.broker.shutdown_all().await;
-		}
-		return;
-	};
-	let new_root = Utf8PathBuf::from(active);
-	let handle = {
-		let mut guard = state.lsp.lock().await;
-		match guard.as_ref() {
-			Some(existing) if existing.root == new_root => None,
-			_ => guard.take(),
-		}
-	};
-	if let Some(old) = handle {
-		old.broker.shutdown_all().await;
+		});
 	}
 }
 

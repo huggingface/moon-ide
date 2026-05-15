@@ -181,13 +181,28 @@
 			// is an undo that skips an external mutation rather
 			// than corrupting the buffer.
 			const snapshot = folder !== null ? workspace.getViewState(folder, file.path) : null;
+			const tBuildStart = performance.now();
 			const next = snapshot?.historyJson
 				? buildStateWithHistory(file.text, snapshot.historyJson)
 				: EditorState.create({
 						doc: file.text,
 						extensions: baseExtensions(),
 					});
+			const tBuildEnd = performance.now();
+			performance.mark('moon:editor.setState.start');
 			v.setState(next);
+			const tSetStateEnd = performance.now();
+			performance.mark('moon:editor.setState.end');
+			performance.measure('moon:editor.setState', 'moon:editor.setState.start', 'moon:editor.setState.end');
+			const buildDur = tBuildEnd - tBuildStart;
+			const setDur = tSetStateEnd - tBuildEnd;
+			if (buildDur + setDur > 30) {
+				// eslint-disable-next-line no-console
+				console.info(
+					`moon-ide: editor.setState path=${file.path} bytes=${file.text.length} ` +
+						`build=${buildDur.toFixed(1)}ms setState=${setDur.toFixed(1)}ms`,
+				);
+			}
 			// Restore the incoming tab's caret + scroll. A fresh
 			// open (no prior snapshot) leaves the cursor at offset
 			// 0, matching what `EditorState.create` already gives

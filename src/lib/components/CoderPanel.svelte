@@ -67,6 +67,21 @@
 		void coder.refreshStatus();
 	});
 
+	// Post-flush marker for folder-swap profiling: fires after Svelte
+	// has reconciled the panel for any of the listed dependencies.
+	// Pair the timestamp with `moon:setActiveFolder.start` in a
+	// devtools timeline to localize where the panel's reconciliation
+	// lands in the cascade — when one of the giant style recalcs
+	// fires shortly after this mark, the transcript / sessions render
+	// is the trigger.
+	$effect(() => {
+		void coder.activeFolderPath;
+		void coder.rows;
+		void coder.view;
+		void coder.sessions;
+		performance.mark('moon:coderPanel.update');
+	});
+
 	// Auto-scroll the transcript when new rows land — but only
 	// when the user is *already* parked at (or close to) the
 	// bottom. If they scrolled up to look at an earlier message
