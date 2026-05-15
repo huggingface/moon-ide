@@ -250,12 +250,24 @@ The right-side-of-the-folder-bar SCM panel:
   `coder_suggest_commit_message` feeds the fast model
   (`DEFAULT_FAST_MODEL`) with the user's draft + a `git diff
 HEAD --no-color` patch capped at ~64 KB (new
-  `WorkspaceHost::git_diff_patch`); response cleaned via
-  `sanitise_commit_message` (single line, drop labels / quotes /
-  trailing period, clamp to 100 chars).
+  `WorkspaceHost::git_diff_patch`). The patch also includes
+  synthesised `new file mode 100644` entries for every untracked,
+  non-ignored file, because the commit path runs `git add -A`
+  before `git commit` — so the model sees the same surface that
+  will actually land in the commit. Binary untracked files surface
+  as the standard `Binary files /dev/null and b/<path> differ`
+  marker instead of dumping raw bytes into the prompt. Response
+  cleaned via `sanitise_commit_message` (single line, drop labels /
+  quotes / trailing period, clamp to 100 chars).
 - **AI branch name** sparkle on the branch-name input (same
   surface as the commit-message sparkle, paired with the
-  branch-name field).
+  branch-name field). Backed by `WorkspaceHost::git_diff_summary`,
+  which produces `git diff HEAD --stat` plus synthesised stat
+  lines for untracked, non-ignored files (binaries surface as the
+  standard `Bin` marker), with a single reconciled totals line
+  covering both — same rationale as the commit-message path: the
+  branch name should reflect everything that's about to land in
+  the commit, not just the tracked subset.
 - **Sync spinner.** The Sync Changes button rotates its refresh
   icon and flips the label to `Syncing…` while a pull / push
   roundtrip is in flight; same treatment for `Publishing…` on

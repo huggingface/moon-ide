@@ -1878,14 +1878,36 @@ fn run_git_commit_on_new_branch(root: &Utf8Path, branch: &str, message: &str) ->
 	}
 }
 
-/// `git diff HEAD --stat -M -C --no-color`. Empty string on any
-/// failure (no repo, no commits yet, git unavailable) so callers
-/// can treat the absence as "nothing to summarise" without
-/// branching on `Result`.
+/// Diff summary the SCM panel feeds to the AI branch-name
+/// suggester: `git diff HEAD --stat -M -C --no-color` plus
+/// synthesised stat lines for untracked, non-ignored files. The
+/// reconciled totals line covers tracked + untracked together so
+/// the small model sees a single coherent header rather than two
+/// disjoint chunks.
+///
+/// Same rationale as [`run_git_diff_patch`]: the SCM panel's
+/// commit path runs `git add -A` first, so untracked files are
+/// part of the eventual commit and naming the branch off
+/// tracked-only changes would be misleading. Empty string on full
+/// failure (no repo, git unavailable) so callers can keep
+/// treating the absence as "nothing to summarise". Char-boundary
+/// safe truncation kicks in at ~16 KB.
 fn run_git_diff_summary(root: &Utf8Path) -> String {
-	use std::process::Command;
-
 	const MAX_BYTES: usize = 16_000;
+
+	let tracked = run_git_diff_summary_tracked(root);
+	let untracked = collect_untracked_summary_entries(root);
+	let combined = merge_diff_summary(&tracked, &untracked);
+	cap_summary_at_char_boundary(combined, MAX_BYTES)
+}
+
+/// `git diff HEAD --stat=200,80 -M -C --no-color`. Returns the
+/// raw stdout on success; empty string on any failure (fresh repo
+/// without `HEAD`, git unavailable, etc.). Empty here is fine —
+/// the untracked pass downstream still produces a useful summary
+/// for the "first commit" case.
+fn run_git_diff_summary_tracked(root: &Utf8Path) -> String {
+	use std::process::Command;
 
 	let output = Command::new("git")
 		.arg("-C")
@@ -1898,14 +1920,216 @@ fn run_git_diff_summary(root: &Utf8Path) -> String {
 	if !output.status.success() {
 		return String::new();
 	}
-	let text = String::from_utf8_lossy(&output.stdout);
-	if text.len() <= MAX_BYTES {
-		return text.into_owned();
+	String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Per-untracked-file summary entry: enough to render a stat line
+/// and feed the totals reconciliation. `lines` is `None` for
+/// binary files so the merge step can render git's `Bin` marker
+/// without having to re-detect.
+struct UntrackedSummary {
+	path: String,
+	lines: Option<usize>,
+}
+
+/// Walk untracked, non-ignored files and synthesise a summary
+/// entry per file. Skips files we can't read (race with
+/// concurrent edits, permission errors); dropped files are silent
+/// because the summary is best-effort context for an LLM, not a
+/// load-bearing signal.
+fn collect_untracked_summary_entries(root: &Utf8Path) -> Vec<UntrackedSummary> {
+	use std::process::Command;
+
+	const BINARY_PROBE: usize = 8_000;
+
+	let listing = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["ls-files", "--others", "--exclude-standard", "-z"])
+		.output();
+	let Ok(listing) = listing else {
+		return Vec::new();
+	};
+	if !listing.status.success() {
+		return Vec::new();
 	}
-	// Trim to char boundary so we don't slice through a multi-byte
-	// path. The summary is informational; cropping the tail is
-	// fine.
-	let mut idx = MAX_BYTES;
+	let mut entries = Vec::new();
+	for entry in listing.stdout.split(|&b| b == 0) {
+		if entry.is_empty() {
+			continue;
+		}
+		let Ok(rel_path) = std::str::from_utf8(entry) else {
+			continue;
+		};
+		let abs = root.join(rel_path);
+		let Ok(bytes) = std::fs::read(abs.as_std_path()) else {
+			continue;
+		};
+		let probe = &bytes[..bytes.len().min(BINARY_PROBE)];
+		let lines = if probe.contains(&0) {
+			None
+		} else {
+			// Match `git diff --stat`: a final trailing newline
+			// closes the previous line rather than starting a new
+			// empty one.
+			let count = bytes.iter().filter(|b| **b == b'\n').count();
+			let extra = if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+				1
+			} else {
+				0
+			};
+			Some(count + extra)
+		};
+		entries.push(UntrackedSummary {
+			path: rel_path.to_owned(),
+			lines,
+		});
+	}
+	entries
+}
+
+/// Splice `untracked` entries into the tracked stat output and
+/// rewrite the trailing `N files changed, ...` totals line so it
+/// covers both. When tracked is empty (fresh repo, no commits
+/// yet, etc.) and there's nothing untracked either, returns an
+/// empty string so callers keep the "nothing to summarise"
+/// short-circuit. Pure on string inputs; tested directly.
+fn merge_diff_summary(tracked: &str, untracked: &[UntrackedSummary]) -> String {
+	if tracked.is_empty() && untracked.is_empty() {
+		return String::new();
+	}
+	let (entries_block, prior_totals) = split_diff_summary(tracked);
+	let mut out = entries_block.to_string();
+	if !out.is_empty() && !out.ends_with('\n') {
+		out.push('\n');
+	}
+	for entry in untracked {
+		out.push_str(&format_untracked_stat_line(entry));
+		out.push('\n');
+	}
+	let totals = reconcile_totals_line(prior_totals, untracked);
+	if !totals.is_empty() {
+		out.push_str(&totals);
+		out.push('\n');
+	}
+	out
+}
+
+/// Split the raw `git diff --stat` output into the per-file
+/// entries (everything except the trailing summary line) and the
+/// summary line itself. Returns `("", "")` for an empty input.
+/// The split is line-based: the totals line is always last and
+/// always begins with ` N files changed,` / ` N file changed,`.
+fn split_diff_summary(tracked: &str) -> (&str, &str) {
+	if tracked.is_empty() {
+		return ("", "");
+	}
+	let trimmed = tracked.trim_end_matches('\n');
+	let Some(last_newline) = trimmed.rfind('\n') else {
+		// Single-line input: either pure totals or pure entry.
+		// Treat the totals shape as totals; otherwise fall through
+		// as a single entry with no totals line.
+		if looks_like_summary_totals(trimmed) {
+			return ("", trimmed);
+		}
+		return (trimmed, "");
+	};
+	let last_line = &trimmed[last_newline + 1..];
+	if looks_like_summary_totals(last_line) {
+		return (&trimmed[..last_newline], last_line);
+	}
+	(trimmed, "")
+}
+
+fn looks_like_summary_totals(line: &str) -> bool {
+	let stripped = line.trim_start();
+	stripped.starts_with(|c: char| c.is_ascii_digit())
+		&& (stripped.contains("file changed") || stripped.contains("files changed"))
+}
+
+/// Render a single untracked-file stat line that mirrors `git
+/// diff --stat`'s shape. We don't reproduce git's auto-scaled bar
+/// width (it'd need cross-file knowledge for a tiny visual win the
+/// LLM doesn't care about); a fixed-cap bar of `+` characters is
+/// good enough.
+fn format_untracked_stat_line(entry: &UntrackedSummary) -> String {
+	const MAX_BAR: usize = 50;
+
+	match entry.lines {
+		None => format!(" {} | Bin 0 -> ? bytes", entry.path),
+		Some(lines) => {
+			let bar_width = lines.min(MAX_BAR);
+			let bar = "+".repeat(bar_width);
+			format!(" {} | {lines} {bar}", entry.path)
+		}
+	}
+}
+
+/// Build a single totals line covering both the existing
+/// `prior_totals` (if any) and the untracked entries we're
+/// appending. The line shape matches what git itself emits so the
+/// model sees one continuous summary; we recompute counts rather
+/// than appending a second totals line because that would read as
+/// stale / contradictory.
+fn reconcile_totals_line(prior_totals: &str, untracked: &[UntrackedSummary]) -> String {
+	let (mut files, mut insertions, deletions) = parse_totals_line(prior_totals);
+	for entry in untracked {
+		files += 1;
+		insertions += entry.lines.unwrap_or(0);
+	}
+	if files == 0 {
+		return String::new();
+	}
+	let file_word = if files == 1 { "file" } else { "files" };
+	let mut out = format!(" {files} {file_word} changed");
+	if insertions > 0 {
+		let word = if insertions == 1 { "insertion" } else { "insertions" };
+		out.push_str(&format!(", {insertions} {word}(+)"));
+	}
+	if deletions > 0 {
+		let word = if deletions == 1 { "deletion" } else { "deletions" };
+		out.push_str(&format!(", {deletions} {word}(-)"));
+	}
+	out
+}
+
+/// Pull the (files, insertions, deletions) tuple out of git's
+/// own totals line. Returns zeroed counts when the line is empty
+/// or doesn't parse — we tolerate parse failures because the
+/// caller's recompute pass still produces something usable
+/// (untracked-only totals).
+fn parse_totals_line(line: &str) -> (usize, usize, usize) {
+	let mut files = 0usize;
+	let mut insertions = 0usize;
+	let mut deletions = 0usize;
+	for chunk in line.split(',') {
+		let trimmed = chunk.trim();
+		let Some((num_str, _)) = trimmed.split_once(' ') else {
+			continue;
+		};
+		let Ok(num) = num_str.parse::<usize>() else {
+			continue;
+		};
+		if trimmed.contains("file") {
+			files = num;
+		} else if trimmed.contains("insertion") {
+			insertions = num;
+		} else if trimmed.contains("deletion") {
+			deletions = num;
+		}
+	}
+	(files, insertions, deletions)
+}
+
+/// Cap `text` at `cap` bytes, trimming back to the previous char
+/// boundary so we don't slice through a multi-byte path, and
+/// append a `[truncated]` marker when truncation actually
+/// happened.
+fn cap_summary_at_char_boundary(text: String, cap: usize) -> String {
+	if text.len() <= cap {
+		return text;
+	}
+	let mut idx = cap;
 	while idx > 0 && !text.is_char_boundary(idx) {
 		idx -= 1;
 	}
@@ -1966,13 +2190,43 @@ fn run_git_head_commit_message(root: &Utf8Path) -> String {
 		.to_string()
 }
 
-/// `git diff HEAD --no-color`, byte-capped at ~64 KB. The cap
-/// truncates at the next newline boundary so we don't hand a
-/// half-formed hunk header to the LLM. Empty string on failure.
+/// Working-tree patch the SCM panel feeds to the AI commit-message
+/// suggester: `git diff HEAD --no-color` plus a synthesised
+/// "new file" entry per untracked, non-ignored file. Byte-capped
+/// at ~64 KB; the cap truncates at the next newline boundary so we
+/// don't hand a half-formed hunk header to the LLM.
+///
+/// Untracked files are appended because the SCM panel's commit
+/// path runs `git add -A` before `git commit`, so brand-new files
+/// **are** committed. `git diff HEAD` alone misses them, which
+/// would leave the model writing a commit message that ignores
+/// the new files entirely. The synthesised entry mirrors what
+/// `git diff` would emit for the same file once it's been added,
+/// so the model sees a homogeneous patch.
+///
+/// Empty string when there's nothing to surface (clean tree, not
+/// a repo, git unavailable). Errors on the underlying commands
+/// are swallowed — this is a best-effort hint, not a load-bearing
+/// signal.
 fn run_git_diff_patch(root: &Utf8Path) -> String {
-	use std::process::Command;
-
 	const MAX_BYTES: usize = 64_000;
+
+	let mut combined = run_git_diff_head(root);
+	if combined.len() < MAX_BYTES {
+		append_untracked_synthesised_patches(root, &mut combined, MAX_BYTES);
+	}
+	cap_patch_at_newline(combined, MAX_BYTES)
+}
+
+/// `git diff HEAD --no-color`. Returns whatever git emitted on
+/// success; empty string on any failure (no repo, no commits yet,
+/// git unavailable). A repo with no `HEAD` commit is the common
+/// "fail" case; in that scenario the untracked-files pass
+/// downstream still produces a useful patch, so callers can rely
+/// on the combined output being non-empty whenever there's
+/// anything at all to commit.
+fn run_git_diff_head(root: &Utf8Path) -> String {
+	use std::process::Command;
 
 	let output = Command::new("git")
 		.arg("-C")
@@ -1985,20 +2239,119 @@ fn run_git_diff_patch(root: &Utf8Path) -> String {
 	if !output.status.success() {
 		return String::new();
 	}
-	let raw = String::from_utf8_lossy(&output.stdout);
-	if raw.len() <= MAX_BYTES {
-		return raw.into_owned();
+	String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Walk every untracked, non-ignored file under `root` and append
+/// a synthesised "new file" diff entry to `combined`. Stops as
+/// soon as `combined` reaches `cap` so the caller's truncation
+/// pass has bytes to work with.
+///
+/// Binary files (heuristic: any null byte in the first 8 KB)
+/// surface as the same `Binary files /dev/null and b/<path>
+/// differ` line real `git diff` emits, so the model sees the file
+/// is part of the commit without us shovelling raw bytes into the
+/// prompt.
+fn append_untracked_synthesised_patches(root: &Utf8Path, combined: &mut String, cap: usize) {
+	use std::process::Command;
+
+	// `-z` so paths with spaces / quotes survive a single `\0` split
+	// without git applying its quote-escape pass. `--exclude-standard`
+	// drops `.gitignore`-matched paths so we don't slurp in the
+	// dev's `node_modules/`.
+	let listing = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["ls-files", "--others", "--exclude-standard", "-z"])
+		.output();
+	let Ok(listing) = listing else {
+		return;
+	};
+	if !listing.status.success() {
+		return;
 	}
-	// Cut just past the last newline at or before MAX_BYTES so the
-	// trailing chunk handed to the LLM is structurally complete (no
-	// half-line hunk headers that read as garbage). `+ 1` includes
-	// the newline itself, so the prefix ends in `\n` and the
-	// sentinel sits cleanly on its own line. Falls back to a hard
-	// byte cut if there's no newline at all in the prefix (a
-	// pathologically long single line) — the model will still see
-	// the sentinel and infer truncation.
-	let cut = raw[..MAX_BYTES].rfind('\n').map(|i| i + 1).unwrap_or(MAX_BYTES);
-	let mut out = raw[..cut].to_owned();
+	for entry in listing.stdout.split(|&b| b == 0) {
+		if entry.is_empty() {
+			continue;
+		}
+		if combined.len() >= cap {
+			return;
+		}
+		let Ok(rel_path) = std::str::from_utf8(entry) else {
+			continue;
+		};
+		let abs = root.join(rel_path);
+		let Ok(bytes) = std::fs::read(abs.as_std_path()) else {
+			continue;
+		};
+		combined.push_str(&synthesise_new_file_patch(rel_path, &bytes));
+	}
+}
+
+/// Build a `git diff`-shaped "new file" entry for `bytes` so the
+/// LLM sees an untracked file the same way it sees a tracked
+/// modification. The hash field is a placeholder zero — the
+/// receiving prompt only reads the structural envelope and the
+/// content lines, not the SHA.
+fn synthesise_new_file_patch(rel_path: &str, bytes: &[u8]) -> String {
+	const BINARY_PROBE: usize = 8_000;
+
+	let probe = &bytes[..bytes.len().min(BINARY_PROBE)];
+	let header = format!("diff --git a/{rel_path} b/{rel_path}\nnew file mode 100644\nindex 0000000..0000000\n");
+	if probe.contains(&0) {
+		return format!("{header}Binary files /dev/null and b/{rel_path} differ\n");
+	}
+	let Ok(text) = std::str::from_utf8(bytes) else {
+		return format!("{header}Binary files /dev/null and b/{rel_path} differ\n");
+	};
+	if text.is_empty() {
+		// Empty file: still emit the header so the path is
+		// surfaced to the model. No hunk body — git itself emits
+		// no `@@` header for zero-length new files either.
+		return format!("{header}--- /dev/null\n+++ b/{rel_path}\n");
+	}
+	let trailing_newline = text.ends_with('\n');
+	let body_lines: Vec<&str> = if trailing_newline {
+		text.strip_suffix('\n').unwrap_or(text).split('\n').collect()
+	} else {
+		text.split('\n').collect()
+	};
+	let line_count = body_lines.len();
+	let mut out = String::with_capacity(header.len() + bytes.len() + 64);
+	out.push_str(&header);
+	out.push_str(&format!(
+		"--- /dev/null\n+++ b/{rel_path}\n@@ -0,0 +1,{line_count} @@\n"
+	));
+	for line in &body_lines {
+		out.push('+');
+		out.push_str(line);
+		out.push('\n');
+	}
+	if !trailing_newline {
+		// Mirror real git so the model can tell the file has no
+		// final newline (matters for some lints / tools).
+		out.push_str("\\ No newline at end of file\n");
+	}
+	out
+}
+
+/// Trim `combined` so the result is at most `cap` bytes and ends
+/// at a newline boundary, with a trailing `... (diff truncated)`
+/// marker when truncation actually happened. Pure function;
+/// extracted so the assembly path above can keep its append logic
+/// flat.
+fn cap_patch_at_newline(combined: String, cap: usize) -> String {
+	if combined.len() <= cap {
+		return combined;
+	}
+	// Cut just past the last newline at or before `cap` so the
+	// trailing chunk handed to the LLM is structurally complete
+	// (no half-line hunk headers). `+ 1` includes the newline
+	// itself, so the prefix ends in `\n` and the sentinel sits on
+	// its own line. Hard byte cut as a last resort if the prefix
+	// has no newline at all (pathologically long single line).
+	let cut = combined[..cap].rfind('\n').map(|i| i + 1).unwrap_or(cap);
+	let mut out = combined[..cut].to_owned();
 	out.push_str("... (diff truncated)\n");
 	out
 }
@@ -4282,6 +4635,132 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn git_diff_summary_includes_untracked_files() {
+		// Same rationale as the patch path: `git add -A` will pick
+		// up untracked files at commit time, so the summary the
+		// branch-name suggester sees has to include them too.
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping diff-summary untracked test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		std::fs::write(dir.path().join("seed.txt"), "seed\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "initial"]);
+
+		// Tracked modification + a brand-new file + an ignored file.
+		std::fs::write(dir.path().join("seed.txt"), "seed changed\n").unwrap();
+		std::fs::write(
+			dir.path().join("brand_new.rs"),
+			"fn one() {}\nfn two() {}\nfn three() {}\n",
+		)
+		.unwrap();
+		std::fs::write(dir.path().join(".gitignore"), "ignored.log\n").unwrap();
+		std::fs::write(dir.path().join("ignored.log"), "noise\n").unwrap();
+
+		let summary = host(&dir).git_diff_summary().await.unwrap();
+		assert!(summary.contains("seed.txt"), "tracked entry missing: {summary:?}");
+		assert!(summary.contains("brand_new.rs"), "untracked entry missing: {summary:?}");
+		// Three lines + bar marker for the new file.
+		assert!(summary.contains("brand_new.rs | 3"), "line count missing: {summary:?}");
+		// The .gitignore file itself is untracked → does surface.
+		assert!(summary.contains(".gitignore"), "gitignore should surface: {summary:?}");
+		// But the file matched by .gitignore must not.
+		assert!(!summary.contains("ignored.log"), "ignored file leaked: {summary:?}");
+
+		// Single reconciled totals line covering tracked + untracked.
+		let totals_count = summary
+			.lines()
+			.filter(|l| l.contains("files changed") || l.contains("file changed"))
+			.count();
+		assert_eq!(totals_count, 1, "expected exactly one totals line, got {summary:?}");
+		// 1 tracked + 2 untracked (brand_new.rs, .gitignore) = 3 files.
+		assert!(summary.contains("3 files changed"), "totals miscounted: {summary:?}");
+	}
+
+	#[tokio::test]
+	async fn git_diff_summary_marks_untracked_binary() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping diff-summary binary test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		std::fs::write(dir.path().join("seed.txt"), "seed\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "initial"]);
+
+		let mut bytes = vec![0u8; 16];
+		bytes[3] = 0;
+		bytes.extend_from_slice(b"payload");
+		std::fs::write(dir.path().join("blob.bin"), &bytes).unwrap();
+
+		let summary = host(&dir).git_diff_summary().await.unwrap();
+		assert!(summary.contains("blob.bin | Bin"), "binary marker missing: {summary:?}");
+	}
+
+	#[test]
+	fn merge_diff_summary_handles_empty_tracked() {
+		// Fresh repo with no commits: tracked summary is empty
+		// because `git diff HEAD` has no HEAD to diff against. We
+		// still want a coherent summary built purely from untracked
+		// files so the "first commit ever" branch-name suggestion
+		// has something to chew on.
+		let untracked = vec![
+			UntrackedSummary {
+				path: "src/lib.rs".to_string(),
+				lines: Some(42),
+			},
+			UntrackedSummary {
+				path: "README.md".to_string(),
+				lines: Some(1),
+			},
+		];
+		let merged = merge_diff_summary("", &untracked);
+		assert!(merged.contains("src/lib.rs | 42"), "got {merged:?}");
+		assert!(merged.contains("README.md | 1"), "got {merged:?}");
+		assert!(merged.contains("2 files changed"), "got {merged:?}");
+		assert!(merged.contains("43 insertions(+)"), "got {merged:?}");
+	}
+
+	#[test]
+	fn merge_diff_summary_reconciles_totals() {
+		// Mock tracked stat: 1 file, 5 insertions, 2 deletions.
+		// Adding one untracked text file with 10 lines should yield
+		// 2 files / 15 insertions / 2 deletions.
+		let tracked = " a.txt | 7 +++++--\n 1 file changed, 5 insertions(+), 2 deletions(-)\n";
+		let untracked = vec![UntrackedSummary {
+			path: "b.txt".to_string(),
+			lines: Some(10),
+		}];
+		let merged = merge_diff_summary(tracked, &untracked);
+		assert!(merged.contains("a.txt | 7"), "tracked entry dropped: {merged:?}");
+		assert!(merged.contains("b.txt | 10"), "untracked entry missing: {merged:?}");
+		// Old totals line is gone, replaced with the reconciled one.
+		assert_eq!(
+			merged.matches("file changed").count() + merged.matches("files changed").count(),
+			1
+		);
+		assert!(merged.contains("2 files changed"), "got {merged:?}");
+		assert!(merged.contains("15 insertions(+)"), "got {merged:?}");
+		assert!(merged.contains("2 deletions(-)"), "got {merged:?}");
+	}
+
+	#[test]
+	fn merge_diff_summary_handles_empty_input() {
+		// Clean tree, no untracked files: short-circuit to empty
+		// string so callers can keep their "nothing to summarise"
+		// path.
+		let merged = merge_diff_summary("", &[]);
+		assert!(merged.is_empty(), "got {merged:?}");
+	}
+
+	#[tokio::test]
 	async fn git_head_commit_message_returns_subject_and_body() {
 		let Some(git) = which_git() else {
 			eprintln!("git not on PATH — skipping head_commit_message test");
@@ -4359,6 +4838,92 @@ mod tests {
 		// line otherwise (everything before the sentinel ends in `\n`).
 		let body = patch.trim_end_matches("... (diff truncated)\n");
 		assert!(body.ends_with('\n'), "truncation should land on a newline boundary");
+	}
+
+	#[tokio::test]
+	async fn git_diff_patch_includes_untracked_files() {
+		// `commit` runs `git add -A` first, so untracked files are
+		// part of the commit. The patch surface for the AI commit
+		// suggester therefore has to include them too — otherwise
+		// the model writes a message that ignores brand-new files.
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping diff_patch untracked test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "initial"]);
+
+		// Tracked modification + a brand-new file + an ignored
+		// file (which must NOT show up).
+		std::fs::write(dir.path().join("a.txt"), "alpha changed\n").unwrap();
+		std::fs::write(dir.path().join("new.txt"), "fresh line one\nfresh line two\n").unwrap();
+		std::fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
+		std::fs::write(dir.path().join("ignored.txt"), "should not appear\n").unwrap();
+
+		let patch = host(&dir).git_diff_patch().await.unwrap();
+		// Tracked modification still surfaces.
+		assert!(patch.contains("alpha changed"), "tracked diff missing: {patch:?}");
+		// Untracked file shows up as a "new file mode" entry, just
+		// like git would emit once it's been added.
+		assert!(
+			patch.contains("diff --git a/new.txt b/new.txt"),
+			"untracked header missing: {patch:?}"
+		);
+		assert!(
+			patch.contains("new file mode 100644"),
+			"new file marker missing: {patch:?}"
+		);
+		assert!(patch.contains("--- /dev/null"), "/dev/null marker missing: {patch:?}");
+		assert!(patch.contains("+fresh line one"), "first line missing: {patch:?}");
+		assert!(patch.contains("+fresh line two"), "second line missing: {patch:?}");
+		// Ignored file doesn't leak in. (The string "ignored.txt"
+		// itself does appear — the new `.gitignore` is untracked
+		// and therefore part of the commit, so its contents are in
+		// the patch. We check for the ignored file's body and
+		// header instead.)
+		assert!(!patch.contains("should not appear"), "ignored file leaked: {patch:?}");
+		assert!(
+			!patch.contains("b/ignored.txt"),
+			"ignored file's diff header leaked: {patch:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn git_diff_patch_marks_untracked_binary_files() {
+		// Untracked binaries surface as the same `Binary files ...
+		// differ` line real `git diff` emits, so the model knows
+		// the file is part of the commit without us shovelling raw
+		// bytes into the prompt.
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping diff_patch binary test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		std::fs::write(dir.path().join("seed.txt"), "seed\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "initial"]);
+
+		// Null byte in the first 8 KB → binary heuristic trips.
+		let mut bytes = vec![0u8; 16];
+		bytes[3] = 0;
+		bytes.extend_from_slice(b"some payload");
+		std::fs::write(dir.path().join("blob.bin"), &bytes).unwrap();
+
+		let patch = host(&dir).git_diff_patch().await.unwrap();
+		assert!(
+			patch.contains("Binary files /dev/null and b/blob.bin differ"),
+			"binary marker missing: {patch:?}"
+		);
+		// And the raw payload doesn't end up in the prompt.
+		assert!(!patch.contains("some payload"), "binary contents leaked: {patch:?}");
 	}
 
 	fn which_git() -> Option<std::path::PathBuf> {
