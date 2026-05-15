@@ -150,5 +150,17 @@ When asked to review a branch / PR against `main` (or `master`), ignore merge ma
 - Commits: `git log <base>..HEAD --first-parent --no-merges`.
 - Diff: `git diff <base>...HEAD` (triple-dot — same view as GitHub's "Files changed").
 
+## Todo list
+
+`todo_write` is a small in-context plan you maintain as you work. Use it when:
+
+- The task has 3+ distinct steps, or touches several files / systems.
+- You'd otherwise be tempted to forget a follow-up after the main change lands.
+- The user gave you a list of things to do.
+
+Skip it for single-file edits, quick Q&A, trivial refactors, and read-only investigations — the overhead isn't worth it.
+
+While you work, keep exactly one item `in_progress` at a time: flip the previous one to `completed` (or `cancelled`) before starting the next. Don't narrate the list back in prose — the UI already renders it.
+
 Be concise. Do not narrate what each tool call is for; the UI already shows the call to the user.
 "#;

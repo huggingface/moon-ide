@@ -220,6 +220,12 @@ async fn run_subagent_inner(
 	// compaction trigger and as the eventual `tokens_used_estimate`
 	// the parent sees back.
 	let mut last_usage: Option<TokenUsage> = None;
+	// Sub-agent-local todo list. Sub-agents see `todo_write`
+	// advertised on the same footing the parent does and maintain
+	// their own scratchpad; it never bubbles up to the parent's
+	// pill (the parent has its own list) but the per-call result
+	// renders inside the sub-agent's transcript card.
+	let mut todos: Vec<crate::TodoItem> = Vec::new();
 
 	// JSONL transcript lives under the **parent** folder's slug,
 	// nested inside a per-parent-session subdirectory:
@@ -397,7 +403,15 @@ async fn run_subagent_inner(
 					args: args.clone(),
 				},
 			));
-			let outcome = tools.dispatch(&call.function.name, &args, &cx, &cancel).await;
+			let outcome = if call.function.name == "todo_write" {
+				// Same short-circuit shape as the parent runner —
+				// `todo_write` mutates per-session state
+				// (`todos`), so it can't go through the stateless
+				// registry dispatch.
+				handle_subagent_todo_write(&mut todos, &args, &session_dir, &header).await
+			} else {
+				tools.dispatch(&call.function.name, &args, &cx, &cancel).await
+			};
 			let (content, is_error) = match outcome {
 				Ok(value) => (value.to_string(), false),
 				Err(CoderError::Aborted) => return Err(CoderError::Aborted),
@@ -694,6 +708,47 @@ fn response_to_message(response: &AssistantResponse) -> ChatMessage {
 
 fn parse_tool_args(function: &FunctionCall) -> Value {
 	serde_json::from_str(&function.arguments).unwrap_or(Value::Null)
+}
+
+/// Sub-agent counterpart to [`crate::runner::handle_todo_write`].
+/// Same wire shape, same validation, same persistence record —
+/// the only difference is the storage cell: this one mutates the
+/// sub-agent's local `todos` vec (passed by `&mut`) and writes
+/// into the sub-agent's per-parent JSONL via [`persist_subagent`].
+/// Sub-agents see `todo_write` advertised the same way the parent
+/// does (per the spec), so each sub-agent gets its own scratchpad
+/// without bleeding into the parent's plan.
+async fn handle_subagent_todo_write(
+	todos: &mut Vec<crate::TodoItem>,
+	args: &Value,
+	session_dir: &Utf8Path,
+	header: &SessionHeader,
+) -> Result<Value, CoderError> {
+	#[derive(serde::Deserialize)]
+	struct TodoWriteArgs {
+		todos: Vec<crate::TodoItem>,
+		#[serde(default)]
+		merge: bool,
+	}
+	let parsed: TodoWriteArgs =
+		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("todo_write", err.to_string()))?;
+	for item in &parsed.todos {
+		if item.id.trim().is_empty() {
+			return Err(CoderError::invalid_args(
+				"todo_write",
+				"todo item `id` must be a non-empty string",
+			));
+		}
+	}
+	let merged = crate::merge_todos(todos, parsed.todos, parsed.merge);
+	*todos = merged.clone();
+	persist_subagent(
+		session_dir,
+		header,
+		&SessionRecord::TodosUpdate { todos: merged.clone() },
+	)
+	.await;
+	Ok(json!({ "todos": merged }))
 }
 
 const RESEARCH_SYSTEM_PROMPT: &str = r#"You are a research sub-agent inside moon-ide. You have been spawned by a parent agent to gather information from a workspace folder and report back. Your job is investigation, not editing.

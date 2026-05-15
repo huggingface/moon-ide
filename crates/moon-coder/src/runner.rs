@@ -218,6 +218,13 @@ struct Session {
 	/// compact before sending. `None` until the very first
 	/// response lands.
 	last_usage: Option<TokenUsage>,
+	/// In-memory todo list maintained by the agent's `todo_write`
+	/// tool. Survives compaction (the messages prefix gets
+	/// folded; the plan does not) and is reset only when the user
+	/// starts a new session. Persisted via
+	/// [`SessionRecord::TodosUpdate`] — replay seeds this from
+	/// the **last** record on disk.
+	todos: Vec<crate::TodoItem>,
 }
 
 impl Session {
@@ -251,6 +258,7 @@ impl Session {
 			persisted_records: 0,
 			auto_rename_pending: false,
 			last_usage: None,
+			todos: Vec::new(),
 		}
 	}
 
@@ -1018,6 +1026,11 @@ impl CoderHandle {
 		// one such record; sessions written before this variant
 		// shipped fall through to the bytes/4 estimate below.
 		let mut last_usage: Option<TokenUsage> = None;
+		// Last `TodosUpdate` record. Same replay-last-wins shape
+		// as `last_usage`: we don't care about intermediate todo
+		// states, only what the agent's plan looked like at the
+		// moment the session was last persisted.
+		let mut last_todos: Vec<crate::TodoItem> = Vec::new();
 		// Reconstruct the chat history from the persisted records.
 		// Tool messages need to know their `tool_call_id`, which
 		// the persisted Assistant record carries verbatim — we
@@ -1058,6 +1071,9 @@ impl CoderHandle {
 						cache_read_input_tokens: *cache_read_input_tokens,
 						cache_creation_input_tokens: *cache_creation_input_tokens,
 					});
+				}
+				SessionRecord::TodosUpdate { todos } => {
+					last_todos = todos.clone();
 				}
 			}
 		}
@@ -1112,6 +1128,7 @@ impl CoderHandle {
 			// would silently skip the compaction-before-send
 			// guard on the very next prompt.
 			last_usage,
+			todos: last_todos,
 		};
 		*fs.session.lock().await = session;
 
@@ -1734,6 +1751,14 @@ async fn dispatch_tool_calls(
 			});
 			let outcome = if call.function.name == "spawn_subagent" {
 				handle_spawn_subagent(state, fs, sink, cx, cancel, &call.id, &args).await
+			} else if call.function.name == "todo_write" {
+				// `todo_write` mutates per-session state owned by
+				// the runner (`Session.todos`), so it doesn't fit
+				// the stateless-tool shape `ToolRegistry::dispatch`
+				// expects. Short-circuit here, alongside
+				// `spawn_subagent`, before falling through to the
+				// generic registry dispatch.
+				handle_todo_write(fs, &args).await
 			} else {
 				state.tools.dispatch(&call.function.name, &args, cx, cancel).await
 			};
@@ -1857,6 +1882,64 @@ async fn handle_spawn_subagent(
 		"mode": report.mode.as_wire(),
 		"iterations_used": report.iterations_used,
 	}))
+}
+
+/// Apply a `todo_write` payload to the current session's todo
+/// list, persist a snapshot, and return the canonical post-merge
+/// list as the tool's result.
+///
+/// Lives on the runner side rather than in [`crate::tools`]
+/// because the list is per-session state — see
+/// [`crate::Session::todos`] — and the registry's
+/// [`ToolRegistry::dispatch`] surface is intentionally stateless.
+/// The short-circuit in [`dispatch_tool_calls`] routes here for
+/// `name == "todo_write"`.
+///
+/// Validation is light: empty `id`s are rejected (they'd collapse
+/// distinct items into one merge target), the rest is left to
+/// [`crate::merge_todos`]. The model gets a structured
+/// `CoderError::invalid_args` response when validation fails, so a
+/// confused call surfaces as `is_error: true` in the next round
+/// rather than corrupting the list silently.
+///
+/// Persistence failure is logged at warn but does **not** fail
+/// the tool call: the in-memory list is the source of truth for
+/// the running turn, and a JSONL write hiccup shouldn't make the
+/// model retry a successful state mutation. This mirrors how
+/// other persistence sites in the runner treat disk failures.
+async fn handle_todo_write(fs: &Arc<FolderSession>, args: &Value) -> Result<Value, CoderError> {
+	#[derive(serde::Deserialize)]
+	struct TodoWriteArgs {
+		todos: Vec<crate::TodoItem>,
+		#[serde(default)]
+		merge: bool,
+	}
+	let parsed: TodoWriteArgs =
+		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("todo_write", err.to_string()))?;
+	for item in &parsed.todos {
+		if item.id.trim().is_empty() {
+			return Err(CoderError::invalid_args(
+				"todo_write",
+				"todo item `id` must be a non-empty string",
+			));
+		}
+	}
+
+	let mut session = fs.session.lock().await;
+	let merged = crate::merge_todos(&session.todos, parsed.todos, parsed.merge);
+	session.todos = merged.clone();
+	let header = session.header.clone();
+	let dir_opt = session.session_dir.clone();
+	drop(session);
+
+	if let Some(dir) = dir_opt {
+		if let Err(err) =
+			sessions::append_record(&dir, &header, &SessionRecord::TodosUpdate { todos: merged.clone() }).await
+		{
+			tracing::warn!("failed to persist todos update: {err}");
+		}
+	}
+	Ok(json!({ "todos": merged }))
 }
 
 /// Shared "tool finished, push result + emit events + persist"
@@ -2580,6 +2663,15 @@ fn emit_replay_events(sink: &FolderEventSink, record: SessionRecord) {
 			// `Usage`, and emits a single `TokenUsage` event for
 			// it after the replay loop — replaying every record
 			// would just animate the ring through old states.
+		}
+		SessionRecord::TodosUpdate { .. } => {
+			// Same rationale as `Usage`: the panel only needs
+			// the last list. Each `todo_write` call replays via
+			// the surrounding `Assistant` (tool_call) +
+			// subsequent `Tool` (tool_result) pair, and the
+			// frontend mirrors `tool_result.todos` into its
+			// `coder.todos` bucket — no need for a synthetic
+			// `TodosUpdate` event during replay.
 		}
 	}
 }

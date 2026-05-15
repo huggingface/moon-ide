@@ -392,6 +392,44 @@ impl ToolRegistry {
 					"required": ["url"]
 				}),
 			),
+			ToolDefinition::function(
+				"todo_write",
+				"Maintain a small in-context todo list for the current task. Returns the canonical full list after the call. `merge: false` (default) replaces the list wholesale — pass `todos: []` to clear. `merge: true` matches incoming items by `id` and updates in place; unknown ids are appended; items you don't mention are left untouched. Each item must carry all three fields (`id`, `content`, `status`) regardless of the merge flag.",
+				json!({
+					"type": "object",
+					"properties": {
+						"todos": {
+							"type": "array",
+							"description": "Each entry must carry all three fields, even with `merge: true` — there is no field-level partial update.",
+							"items": {
+								"type": "object",
+								"properties": {
+									"id": {
+										"type": "string",
+										"description": "Stable identifier you assign and reuse across calls. Match an existing item with `merge: true` to update it."
+									},
+									"content": {
+										"type": "string",
+										"description": "Short imperative description (\"Add foo\", \"Wire up bar\")."
+									},
+									"status": {
+										"type": "string",
+										"enum": ["pending", "in_progress", "completed", "cancelled"],
+										"description": "Lifecycle state. Mark exactly one item `in_progress` while working on it; flip to `completed` or `cancelled` when done."
+									}
+								},
+								"required": ["id", "content", "status"]
+							}
+						},
+						"merge": {
+							"type": "boolean",
+							"description": "When true, items are matched by `id` and merged into the current list (unknown ids appended; unmentioned ids left alone). When false, the incoming list replaces the current one wholesale. Default false.",
+							"default": false
+						}
+					},
+					"required": ["todos"]
+				}),
+			),
 		];
 		if self.web.has_tavily_key() {
 			defs.push(ToolDefinition::function(

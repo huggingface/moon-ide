@@ -146,6 +146,62 @@ export type ComposerAttachment = {
  *  multi-session decision: composer draft and attachments live
  *  here too, so each project's typed-but-unsent prose survives a
  *  folder hop. */
+/**
+ * One entry in the agent's session-scoped todo list. Mirrors
+ * `moon_coder::TodoItem`. The pill in the panel header and the
+ * `ToolBodyTodoWrite.svelte` row body both render off these.
+ */
+export type TodoItem = {
+	id: string;
+	content: string;
+	status: 'pending' | 'in_progress' | 'completed' | 'cancelled';
+};
+
+/** Set keyed by `string` (not `TodoItem['status']`) so calling
+ *  `.has(unknown)` after a `typeof === 'string'` guard doesn't
+ *  need an unsafe narrowing cast. */
+const TODO_STATUSES: ReadonlySet<string> = new Set(['pending', 'in_progress', 'completed', 'cancelled']);
+
+function isTodoStatus(value: unknown): value is TodoItem['status'] {
+	return typeof value === 'string' && TODO_STATUSES.has(value);
+}
+
+/**
+ * Pull the canonical todo list out of a `todo_write` tool result
+ * payload. Returns `null` when the shape doesn't match (older
+ * traces, error payloads, future shape drift) so the caller can
+ * leave the bucket's list untouched.
+ */
+function extractTodos(result: unknown): TodoItem[] | null {
+	if (typeof result !== 'object' || result === null) {
+		return null;
+	}
+	const raw = (result as { todos?: unknown }).todos;
+	if (!Array.isArray(raw)) {
+		return null;
+	}
+	// `Array.isArray` widens `raw` to `any[]` in TS's flow
+	// analysis; re-assert to `unknown[]` so the per-item cast
+	// below narrows from `unknown` (oxlint allows that) rather
+	// than from `any` (oxlint flags as unsafe).
+	const items: unknown[] = raw;
+	const out: TodoItem[] = [];
+	for (const item of items) {
+		if (typeof item !== 'object' || item === null) {
+			return null;
+		}
+		const o = item as { id?: unknown; content?: unknown; status?: unknown };
+		if (typeof o.id !== 'string' || typeof o.content !== 'string') {
+			return null;
+		}
+		if (!isTodoStatus(o.status)) {
+			return null;
+		}
+		out.push({ id: o.id, content: o.content, status: o.status });
+	}
+	return out;
+}
+
 class FolderViewState {
 	rows = $state<CoderRow[]>([]);
 	busy = $state(false);
@@ -180,6 +236,13 @@ class FolderViewState {
 	 *  lands so the UI can render the disclosure with the summary
 	 *  body until the next compaction overwrites it. */
 	compaction = $state<CompactionState | null>(null);
+	/** Canonical post-merge todo list maintained by the agent's
+	 *  `todo_write` tool. Mirrored from `tool_result.todos` so the
+	 *  pill / popover in the panel header stay in lock-step with
+	 *  the model's view. Empty until the agent calls the tool;
+	 *  also re-seeded on session replay because `tool_result`
+	 *  events are re-emitted as part of the replay stream. */
+	todos = $state<TodoItem[]>([]);
 }
 
 /**
@@ -662,6 +725,14 @@ class CoderPanelState {
 		return this.current.compaction;
 	}
 
+	/** Per-folder todo list. The header pill reads it directly via
+	 *  `coder.todos`; the popover renders the same list with status
+	 *  glyphs. Empty array when the agent hasn't called
+	 *  `todo_write` in the current session. */
+	get todos(): TodoItem[] {
+		return this.current.todos;
+	}
+
 	/** Counter the panel `$effect`s on to refocus the composer
 	 *  after we mutate it programmatically (e.g. attaching a
 	 *  selection from the editor via Ctrl+L). Increment to
@@ -843,6 +914,10 @@ class CoderPanelState {
 		this.subagentTranscripts = new Map();
 		this.viewSubagentId = null;
 		this.busy = false;
+		// Wipe todos before replay; the session's last
+		// `tool_result` for `todo_write` (if any) will repopulate
+		// the bucket as the replay stream lands.
+		this.current.todos = [];
 		try {
 			const summary = await ipc.coder.openSession(id);
 			this.activeSession = summary;
@@ -879,6 +954,9 @@ class CoderPanelState {
 			// repopulates the ring from zero.
 			this.current.tokenUsage = null;
 			this.current.compaction = null;
+			// Same rationale for the todo list — a new session
+			// starts with no plan.
+			this.current.todos = [];
 		} catch (err) {
 			this.rows = [{ kind: 'error', id: `local-${Date.now()}`, text: formatError(err) }];
 		}
@@ -902,6 +980,7 @@ class CoderPanelState {
 				// doesn't outlive its data.
 				this.current.tokenUsage = null;
 				this.current.compaction = null;
+				this.current.todos = [];
 			}
 		} catch (err) {
 			// eslint-disable-next-line no-console
@@ -1172,6 +1251,7 @@ class CoderPanelState {
 		this.subagentTranscripts = new Map();
 		this.viewSubagentId = null;
 		this.busy = false;
+		this.current.todos = [];
 		await this.refreshStatus();
 	}
 
@@ -1335,6 +1415,26 @@ class CoderPanelState {
 							}
 						: row,
 				);
+				// Mirror the canonical post-merge list from a
+				// successful `todo_write` into the bucket so the
+				// header pill / popover stay in lock-step with the
+				// model. Errored calls are skipped — the list
+				// hasn't actually changed in that case (the runner
+				// short-circuits before mutating
+				// `Session.todos`). The match keys off the parent
+				// row's tool name; we don't have the name on the
+				// `tool_result` event itself. Replay re-emits the
+				// same `tool_call` + `tool_result` pair so this
+				// path also seeds the bucket on session reopen.
+				if (!event.is_error) {
+					const parent = bucket.rows.find((row) => row.kind === 'tool' && row.id === event.id);
+					if (parent && parent.kind === 'tool' && parent.name === 'todo_write') {
+						const next = extractTodos(event.result);
+						if (next !== null) {
+							bucket.todos = next;
+						}
+					}
+				}
 				return;
 			case 'turn_complete':
 				bucket.busy = false;
@@ -1368,6 +1468,10 @@ class CoderPanelState {
 				bucket.subagentTranscripts = new Map();
 				bucket.viewSubagentId = null;
 				bucket.busy = false;
+				// Wipe the todo list before replay; the session's
+				// last `tool_result` for `todo_write` (if any)
+				// repopulates this in the per-record replay stream.
+				bucket.todos = [];
 				bucket.activeSession = {
 					id: event.id,
 					title: event.title,

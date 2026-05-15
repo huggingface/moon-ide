@@ -27,6 +27,7 @@ pub mod providers;
 pub mod runner;
 pub mod sessions;
 pub mod subagent;
+pub mod todo;
 pub mod tools;
 pub mod web;
 
@@ -41,5 +42,6 @@ pub use providers::{new_provider_id, probe_provider, ProviderKeyring};
 pub use runner::{Coder, CoderHandle};
 pub use sessions::SessionSummary;
 pub use subagent::{Subagent, SubagentReport};
+pub use todo::{merge_todos, TodoItem, TodoStatus};
 pub use tools::{CoderMode, ToolContext, ToolRegistry};
 pub use web::{WebClient, WebFetchResult, WebSearchResult};

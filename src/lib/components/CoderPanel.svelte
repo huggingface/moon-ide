@@ -12,11 +12,13 @@
 	import ToolBodyGrep from './ToolBodyGrep.svelte';
 	import ToolBodyListDir from './ToolBodyListDir.svelte';
 	import ToolBodyReadFile from './ToolBodyReadFile.svelte';
+	import ToolBodyTodoWrite from './ToolBodyTodoWrite.svelte';
 	import ToolBodyWebFetch from './ToolBodyWebFetch.svelte';
 	import ToolBodyWebSearch from './ToolBodyWebSearch.svelte';
 	import ToolBodyWriteFile from './ToolBodyWriteFile.svelte';
 	import TerminalTargetIcon from './TerminalTargetIcon.svelte';
 	import ContextRing from './ContextRing.svelte';
+	import CoderTodoPill from './CoderTodoPill.svelte';
 	import ChatBubbleIcon from './icons/ChatBubbleIcon.svelte';
 	import SettingsIcon from './icons/SettingsIcon.svelte';
 	import SignOutIcon from './icons/SignOutIcon.svelte';
@@ -316,9 +318,44 @@
 			case 'web_fetch': {
 				return typeof o.url === 'string' ? o.url : null;
 			}
+			case 'todo_write': {
+				return todoWriteHint(o);
+			}
 			default:
 				return null;
 		}
+	}
+
+	/** Hint preview for `todo_write` row summaries. Reads the
+	 *  args (the model's proposed list at call time): if any item
+	 *  is `in_progress`, show its content prefixed with `→` so
+	 *  the user sees what the agent is committing to right now;
+	 *  otherwise fall back to a `M / N done` count summary. The
+	 *  header pill is the always-visible at-rest indicator; this
+	 *  one's per-row context. Returns `null` when args don't
+	 *  parse so the chip just doesn't render. */
+	function todoWriteHint(o: Record<string, unknown>): string | null {
+		const todos = o.todos;
+		if (!Array.isArray(todos) || todos.length === 0) {
+			return null;
+		}
+		let inProgress: string | null = null;
+		let done = 0;
+		for (const item of todos) {
+			if (typeof item !== 'object' || item === null) {
+				continue;
+			}
+			const t = item as { content?: unknown; status?: unknown };
+			if (t.status === 'in_progress' && typeof t.content === 'string' && inProgress === null) {
+				inProgress = t.content;
+			} else if (t.status === 'completed' || t.status === 'cancelled') {
+				done += 1;
+			}
+		}
+		if (inProgress !== null) {
+			return `→ ${firstLine(inProgress) ?? inProgress}`;
+		}
+		return `${done} / ${todos.length} done`;
 	}
 
 	function firstLine(s: string): string | null {
@@ -558,6 +595,13 @@
 			{/if}
 		</div>
 		<div class="actions">
+			<!-- At-a-glance pill for the agent's todo list: dominant
+				 status glyph + `done / total` count. Hidden when the
+				 list is empty; click expands a popover with the full
+				 list. Sits to the left of the context ring so the
+				 reading order is "what's the agent doing right now?"
+				 then "how much room is left in the window?". -->
+			<CoderTodoPill />
 			<!-- Rolling context-window indicator: arc fills as the
 				 next round-trip's prompt grows, ticks into warning /
 				 danger before auto-compaction kicks in, and pulses
@@ -1072,6 +1116,14 @@
 						 the header when the body was lopped at the
 						 200 kB cap. -->
 					<ToolBodyWebFetch args={row.args} result={row.result} hasResult={row.hasResult} />
+				{:else if row.name === 'todo_write'}
+					<!-- Plan view: status glyph per item, in-
+						 progress accented, completed / cancelled
+						 struck through. The header pill renders the
+						 same bucket of todos; this row shows the
+						 history of plan mutations as the agent
+						 works. -->
+					<ToolBodyTodoWrite args={row.args} result={row.result} hasResult={row.hasResult} />
 				{:else}
 					<div class="block-label">args</div>
 					<pre class="block">{fmtArgs(row.args)}</pre>

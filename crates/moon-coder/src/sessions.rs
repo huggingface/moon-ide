@@ -165,6 +165,25 @@ pub enum SessionRecord {
 		#[serde(default, skip_serializing_if = "u32_is_zero")]
 		cache_creation_input_tokens: u32,
 	},
+	/// Snapshot of the session's todo list after one `todo_write`
+	/// call. Append-only: each call writes one record carrying the
+	/// **full** post-merge list (the same list the model sees as
+	/// the tool result, so on-disk and in-context never drift).
+	///
+	/// On replay the last `TodosUpdate` wins; intermediate ones
+	/// are read but discarded. The list is small (a few items at
+	/// most), and replay throws them away anyway, so the on-disk
+	/// cost is negligible compared to the simplicity of "tool
+	/// result == record body".
+	///
+	/// The record is **not** wired into the post-replay event
+	/// stream as a synthetic event: the panel reconstructs its
+	/// `coder.todos` bucket from the same `tool_result` payloads
+	/// it sees during replay (the runner re-emits them as
+	/// [`crate::CoderEvent::ToolResult`]), so we don't need a
+	/// dedicated `TodosLoaded` event for the empty-list case
+	/// either — an unset bucket renders the same "no list" pill.
+	TodosUpdate { todos: Vec<crate::TodoItem> },
 }
 
 fn u32_is_zero(n: &u32) -> bool {

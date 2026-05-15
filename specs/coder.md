@@ -412,23 +412,62 @@ pi-mono convention so prompts can be carried over verbatim:
 
 Backend semantics:
 
-- The list is **session-scoped**. The loop keeps it in the
-  session's state object (alongside `messages`) and snapshots it
-  as part of the session JSONL header (Phase 6.3). Reset when
-  the user starts a new session; never persisted across users
-  (it's per-session, not per-workspace).
+- The list is **session-scoped**. The loop keeps it on
+  `Session.todos` alongside `messages` / `last_usage`. Each
+  `todo_write` call appends one `SessionRecord::TodosUpdate`
+  carrying the **full** post-merge list to the session JSONL;
+  replay walks the records and seeds the in-memory list from
+  the **last** `TodosUpdate` (intermediate ones are read but
+  discarded). Reset when the user starts a new session; not
+  persisted across users (it's per-session, not per-workspace).
+- The list **survives compaction**. Compaction folds the older
+  prefix of `messages` into a synthetic system summary; the plan
+  is orthogonal to that and stays untouched.
 - The tool result is the _current full list_ after the update so
-  the model always sees its own bookkeeping.
+  the model always sees its own bookkeeping. The frontend mirrors
+  the same payload into a per-folder `coder.todos` bucket.
+- Lifecycle (the spec doesn't model "complete the list" or "clear
+  the list" as separate operations — both happen via state
+  transitions of the same `todo_write` call):
+  - **Complete an item** → `merge: true` with that item's id and
+    `status: "completed"` (or `"cancelled"`). It stays in the
+    list with the new status; the row UI strikes it through.
+  - **Restart with a fresh plan** → `merge: false` with a new
+    `todos` array. Wholesale replacement.
+  - **Discard everything** → `merge: false` with `todos: []`.
+  - **New session** → empty list.
+- `merge: true` requires all three fields (`id`, `content`,
+  `status`) on each item. Unknown ids are appended; existing ids
+  are updated in place; items not mentioned are left untouched.
+  No field-level partial updates — keeps the schema simple, and
+  the model has the full list in context anyway.
 - Only one item should be `in_progress` at a time. The tool does
   **not** enforce this — the prompt does, the same way Cursor's
   prompt does. Enforcing it would make benign races (the model
   flips two items in one call) into errors for no benefit.
+- The tool is available in **agent** and **research** sub-agents
+  too. Sub-agents maintain their own scratchpads (separate from
+  the parent's plan); each sub-agent's list lives on its own
+  `Session.todos` and persists into its own per-parent JSONL.
 
 Frontend rendering:
 
-- A sticky list near the top of the panel transcript shows the
-  current todos with their status glyphs. Re-renders on every
-  `tool_result` for `todo_write`.
+- A compact pill in the panel header (next to the context ring)
+  shows the dominant status glyph and a `done / total` count.
+  Hidden when the list is empty. Clicking the pill expands a
+  popover with the full list — status glyphs, in-progress accent,
+  strikethrough on completed / cancelled. Closes on outside click
+  or Escape.
+- Each `todo_write` call renders a per-row body in the transcript
+  via `ToolBodyTodoWrite.svelte`, so scrolling back through the
+  session shows how the plan evolved.
+- The collapsed tool-row hint chip prefers `→ <in-progress
+content>` when there's an item in flight, falling back to
+  `M / N done` at rest.
+- Sub-agent transcripts render the same per-row body for the
+  sub-agent's own `todo_write` calls; the **header pill** is
+  parent-only — sub-agent plans don't bubble into the parent's
+  pill, since they're separate scopes.
 - The agent owns the list. The user can't tick items by hand —
   this is the agent's scratchpad, not a shared task tracker.
   Editing-by-user is a separate question that we'd answer by

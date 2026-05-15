@@ -178,7 +178,7 @@ What ships:
   would just add bookkeeping. The trait method earns its keep
   when `RemoteHost` lands and there's a second implementor.
 
-### 6.3 — Sessions on disk + auto-rename — **done** (todo_write deferred)
+### 6.3 — Sessions on disk + auto-rename — **done**
 
 **Acceptance**: every prompt/turn is persisted to JSONL under
 `<XDG_DATA_HOME>/moon-ide/coder-sessions/<project-slug>/`. The panel surfaces a
@@ -224,12 +224,21 @@ What shipped:
   ellipsis-truncate, collapse whitespace) before it lands in
   the header. Failures keep the truncated-prompt fallback.
 
-Deferred to a follow-up commit (still in the 6.3 spirit, not
-rolled into 6.4):
+Shipped after 6.3:
 
-- `todo_write` tool. The schema and UX are already in
-  [`coder.md`](../coder.md#todo-list-tool); the implementation
-  is independent of the persistence work and ships next.
+- `todo_write` tool. Implementation matches
+  [`coder.md`](../coder.md#todo-list-tool): per-session list on
+  `Session.todos`, runner short-circuit in `dispatch_tool_calls`,
+  one `SessionRecord::TodosUpdate` snapshot per call, replay-
+  last-wins, available in agent + research sub-agents (each
+  scratchpad is local to its session). Frontend: header pill +
+  popover next to the context ring, `ToolBodyTodoWrite.svelte`
+  per-call body, and an in-progress-aware hint chip on the
+  collapsed tool-row summary. Test plan:
+  [`specs/test-plans/0077-todo-write-tool.md`](../test-plans/0077-todo-write-tool.md).
+
+Still deferred from 6.3 (not rolled into 6.4):
+
 - Per-folder `last_session_id`. Today the slot is flat — if
   the user switches workspace folder, the relaunch points at
   a session id that probably doesn't exist in the new folder
