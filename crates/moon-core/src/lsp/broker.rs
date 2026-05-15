@@ -29,8 +29,8 @@ use tokio::sync::{broadcast, Mutex};
 
 use super::client::LspClientError;
 use super::server::{
-	container_binary_path, discover_binary, LspBinarySpec, LspServer, LspServerEvent, PathTranslator, GO_SERVER,
-	PYTHON_SERVER, RUST_SERVER, TS_SERVER,
+	container_binary_path, discover_binary, resolve_install_hint, LspBinarySpec, LspServer, LspServerEvent,
+	PathTranslator, GO_SERVER, PYTHON_SERVER, RUST_SERVER, TS_SERVER,
 };
 use super::spawn::LspSpawner;
 use crate::logs::LogSink;
@@ -338,18 +338,22 @@ impl LspBroker {
 			.lock()
 			.await
 			.insert(spec.language_id.to_owned(), ServerSlot::NotAvailable);
+		// Resolve once: the helper picks `pnpm -wD add` / `npm i -D` /
+		// `bun add -D` based on the lockfile at the workspace root
+		// (TypeScript only — every other server has a single
+		// canonical install path).
+		let install_hint = resolve_install_hint(spec, &self.root);
 		let _ = self.events.send(LspServerEvent::StatusChanged(mp::LspStatusEvent {
 			language_id: spec.language_id.to_owned(),
 			status: mp::LspServerStatus::NotAvailable,
 			// Surface the install command directly in the pill
 			// tooltip so the user has copy-pasteable next steps
 			// without leaving the IDE.
-			detail: Some(spec.install_hint.to_owned()),
+			detail: Some(install_hint.clone()),
 		}));
-		self.log_sink.warn(
-			&log_source,
-			format!("not available; install hint: {}", spec.install_hint),
-		);
+		self
+			.log_sink
+			.warn(&log_source, format!("not available; install hint: {install_hint}"));
 		Ok(None)
 	}
 

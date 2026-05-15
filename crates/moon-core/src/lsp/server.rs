@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use lsp_types as lt;
 use moon_protocol::lsp as mp;
 use serde_json::Value;
@@ -133,6 +133,36 @@ pub const TS_SERVER: LspBinarySpec = LspBinarySpec {
 	install_hint: "bun add -D @typescript/native-preview",
 	discovery: DiscoveryStrategy::NodeModules,
 };
+
+/// Resolve the install hint to surface for `spec` in the context of
+/// the workspace `root`. Most specs return their static
+/// `install_hint` verbatim — there's only one canonical install path
+/// for `rust-analyzer`, `gopls`, `ty`. The TS server is the
+/// exception: a developer using pnpm or npm shouldn't be told to run
+/// `bun add` — that would either fail (no `bun.lock`, package
+/// manager mismatch) or quietly create a parallel `bun.lock`
+/// alongside the existing lockfile, both bad. Picking the command
+/// from the root lockfile keeps the pill tooltip copy-pasteable for
+/// whichever package manager the project actually uses.
+///
+/// Detection is strictly file-presence at the workspace root:
+/// `pnpm-lock.yaml` → `pnpm -wD add` (the `-w` flag points pnpm at
+/// the workspace root, which is the typical shape for monorepos
+/// using pnpm); `package-lock.json` → `npm i -D`; otherwise (`bun.lock`
+/// or no recognised lockfile) → the static `bun add -D` hint, which
+/// matches moon-ide itself and is a reasonable default for a fresh
+/// repo.
+pub fn resolve_install_hint(spec: &LspBinarySpec, root: &Utf8Path) -> String {
+	if spec.language_id == "typescript" {
+		if root.join("pnpm-lock.yaml").exists() {
+			return "pnpm -wD add @typescript/native-preview".to_string();
+		}
+		if root.join("package-lock.json").exists() {
+			return "npm i -D @typescript/native-preview".to_string();
+		}
+	}
+	spec.install_hint.to_string()
+}
 
 /// Rust server — `rust-analyzer`, the ecosystem-standard LSP.
 ///
@@ -2168,5 +2198,87 @@ mod tests {
 		let (_, patterns) = parse_watched_files_registration(reg).expect("relative pattern parses");
 		assert!(patterns[0].matcher.is_match("cmd/main.go"));
 		assert!(!patterns[0].matcher.is_match("README.md"));
+	}
+
+	/// `pnpm-lock.yaml` at the workspace root flips the TS install
+	/// hint to the pnpm form so the pill tooltip is copy-pasteable
+	/// in pnpm-managed monorepos.
+	#[test]
+	fn install_hint_picks_pnpm_for_pnpm_lock() {
+		let tmp = tempfile::tempdir().unwrap();
+		let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: 6\n").unwrap();
+		assert_eq!(
+			resolve_install_hint(&TS_SERVER, &root),
+			"pnpm -wD add @typescript/native-preview"
+		);
+	}
+
+	/// `package-lock.json` at the workspace root flips the TS hint
+	/// to `npm i -D`. A repo without a lockfile (or with `bun.lock`)
+	/// keeps the static `bun add -D` default.
+	#[test]
+	fn install_hint_picks_npm_for_npm_lock() {
+		let tmp = tempfile::tempdir().unwrap();
+		let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		fs::write(root.join("package-lock.json"), "{}").unwrap();
+		assert_eq!(
+			resolve_install_hint(&TS_SERVER, &root),
+			"npm i -D @typescript/native-preview"
+		);
+	}
+
+	/// `pnpm-lock.yaml` wins over `package-lock.json` when both are
+	/// present (which happens during a manager migration). Pinning
+	/// the priority avoids the hint flickering between forms based
+	/// on directory iteration order.
+	#[test]
+	fn install_hint_prefers_pnpm_over_npm() {
+		let tmp = tempfile::tempdir().unwrap();
+		let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: 6\n").unwrap();
+		fs::write(root.join("package-lock.json"), "{}").unwrap();
+		assert_eq!(
+			resolve_install_hint(&TS_SERVER, &root),
+			"pnpm -wD add @typescript/native-preview"
+		);
+	}
+
+	/// No lockfile (or only `bun.lock`) keeps the static default —
+	/// matches moon-ide itself and is the safe fallback.
+	#[test]
+	fn install_hint_defaults_to_bun() {
+		let tmp = tempfile::tempdir().unwrap();
+		let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		assert_eq!(
+			resolve_install_hint(&TS_SERVER, &root),
+			"bun add -D @typescript/native-preview"
+		);
+		fs::write(root.join("bun.lock"), "").unwrap();
+		assert_eq!(
+			resolve_install_hint(&TS_SERVER, &root),
+			"bun add -D @typescript/native-preview"
+		);
+	}
+
+	/// Non-TypeScript specs are unaffected — they all have one
+	/// canonical install path each.
+	#[test]
+	fn install_hint_passthrough_for_other_languages() {
+		let tmp = tempfile::tempdir().unwrap();
+		let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: 6\n").unwrap();
+		assert_eq!(
+			resolve_install_hint(&RUST_SERVER, &root),
+			"rustup component add rust-analyzer"
+		);
+		assert_eq!(
+			resolve_install_hint(&GO_SERVER, &root),
+			"go install golang.org/x/tools/gopls@latest"
+		);
+		assert_eq!(
+			resolve_install_hint(&PYTHON_SERVER, &root),
+			"uv add --dev ty (or uv tool install ty)"
+		);
 	}
 }

@@ -130,7 +130,7 @@ Discovery is per-language via `LspBinarySpec::discovery`:
 
 On Windows we adjust the filename per strategy: `<bin>.cmd` for the Node case (npm's `.bin` wrapper), `<bin>.exe` for Cargo (native executables), `<bin>.exe` for Python (matches CPython's venv layout).
 
-If nothing is found on disk, the broker caches a `NotAvailable` slot per language and emits `lsp:status { status: 'notavailable' }`. The status bar paints a quiet pill whose tooltip is the spec's `install_hint` field (e.g. `bun add -D @typescript/native-preview` or `rustup component add rust-analyzer`) — copy-pasteable into a terminal.
+If nothing is found on disk, the broker caches a `NotAvailable` slot per language and emits `lsp:status { status: 'notavailable' }`. The status bar paints a quiet pill whose tooltip is the spec's `install_hint` field (e.g. `bun add -D @typescript/native-preview` or `rustup component add rust-analyzer`) — copy-pasteable into a terminal. The TypeScript hint is adapted to the workspace root's package-manager lockfile (`pnpm-lock.yaml` → `pnpm -wD add @typescript/native-preview`, `package-lock.json` → `npm i -D @typescript/native-preview`, otherwise `bun add -D ...`); the other languages have one canonical install path each so they keep their static hint.
 
 Container-backed workspaces (ADR 0008) skip host discovery entirely for languages whose server the container already ships — see [Container-backed LSP](#container-backed-lsp). `moon-base` pre-installs `rust-analyzer` (via `rustup component add`) and `gopls` (via `go install`), and the broker pipes stdio through `docker exec` when the container is `Running`. Falling back to the host is automatic when the container is down, not configured, or doesn't have the server.
 
