@@ -872,6 +872,13 @@ class CoderPanelState {
 			this.activeSession = null;
 			this.view = 'session';
 			this.busy = false;
+			// Clear the per-folder token-usage / compaction state so
+			// the context ring at the panel header doesn't carry
+			// the previous session's prompt-tokens count into a
+			// fresh blank session. The next `token_usage` event
+			// repopulates the ring from zero.
+			this.current.tokenUsage = null;
+			this.current.compaction = null;
 		} catch (err) {
 			this.rows = [{ kind: 'error', id: `local-${Date.now()}`, text: formatError(err) }];
 		}
@@ -890,6 +897,11 @@ class CoderPanelState {
 				this.subagentSummaries = new Map();
 				this.subagentTranscripts = new Map();
 				this.viewSubagentId = null;
+				// Same teardown as `newSession`: drop the deleted
+				// session's token / compaction snapshot so the ring
+				// doesn't outlive its data.
+				this.current.tokenUsage = null;
+				this.current.compaction = null;
 			}
 		} catch (err) {
 			// eslint-disable-next-line no-console
