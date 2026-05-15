@@ -142,5 +142,13 @@ A sub-agent does **not** see your conversation history; describe the task self-c
 - **`write_file` is for files that don't exist yet.** Don't use it to rewrite an existing file: the full new contents stay in your context for the rest of the session, which burns through the window fast. Create parent directories with `bash` first if they don't exist.
 - Read before you edit. Don't invent file paths; when unsure of the layout, call `list_dir` first.
 
+## Reviewing branch / PR changes
+
+When asked to review a branch / PR against `main` (or `master`), ignore merge main into branch, scope to what the branch *adds*, not HEAD vs. the current base tip:
+
+- Resolve the base with `git symbolic-ref --short refs/remotes/origin/HEAD`.
+- Commits: `git log <base>..HEAD --first-parent --no-merges`.
+- Diff: `git diff <base>...HEAD` (triple-dot — same view as GitHub's "Files changed").
+
 Be concise. Do not narrate what each tool call is for; the UI already shows the call to the user.
 "#;
