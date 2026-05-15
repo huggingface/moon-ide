@@ -201,6 +201,27 @@ export type TokenUsageState = {
 	 *  bytes/4 approximation. The ring tints identically; the
 	 *  tooltip prefixes a `≈` for `'estimate'`. */
 	source: 'provider' | 'estimate';
+	/** Anthropic prompt-caching breakdown of `prompt`, surfaced by
+	 *  OpenRouter when the request carried `cache_control: ephemeral`
+	 *  markers (currently set automatically when the active provider
+	 *  is OpenRouter and the model id is `anthropic/...`; see
+	 *  `cache_breakpoint_indexes` in `crates/moon-coder/src/inference.rs`).
+	 *
+	 *  - `cacheReadTokens`: how many of `prompt` were served from
+	 *    the 5-min ephemeral cache at the 90 % discount. The bigger
+	 *    this number, the more the call saved off the base input
+	 *    price.
+	 *  - `cacheCreationTokens`: how many of `prompt` were written
+	 *    to cache on this call at the 25 % surcharge. Pays back on
+	 *    the very next call within 5 min, as long as the prefix
+	 *    stays stable.
+	 *
+	 *  Both are `0` for non-Anthropic providers / requests with no
+	 *  cache markers. They are a subset of `prompt`, not a delta:
+	 *  `prompt` is the full input count regardless of how it was
+	 *  billed. */
+	cacheReadTokens: number;
+	cacheCreationTokens: number;
 };
 
 /**
@@ -1362,6 +1383,8 @@ class CoderPanelState {
 					total: event.total_tokens,
 					contextWindow: event.context_window,
 					source: event.source,
+					cacheReadTokens: event.cache_read_tokens,
+					cacheCreationTokens: event.cache_creation_tokens,
 				};
 				return;
 			case 'compaction_started':

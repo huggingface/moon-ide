@@ -187,12 +187,28 @@ pub enum CoderEvent {
 	/// once it crosses ~80% of `context_window`, the runner
 	/// schedules a compaction pass before the next user prompt
 	/// goes out.
+	///
+	/// `cache_read_tokens` / `cache_creation_tokens` are the
+	/// Anthropic prompt-caching breakdown (only emitted by
+	/// OpenRouter routes that use `cache_control: ephemeral`
+	/// markers; `0` everywhere else). Subset of `prompt_tokens`,
+	/// not in addition — `cache_read_tokens` is "of the prompt,
+	/// X tokens hit the 90 %-off cache"; `cache_creation_tokens`
+	/// is "of the prompt, Y tokens got written to the cache at
+	/// a 25 % surcharge". The panel's usage ring uses them
+	/// purely for the tooltip; the compaction trigger still
+	/// keys off `prompt_tokens` because that's what eats
+	/// context-window space regardless of how it's billed.
 	TokenUsage {
 		prompt_tokens: u32,
 		completion_tokens: u32,
 		total_tokens: u32,
 		context_window: u32,
 		source: TokenUsageSource,
+		#[serde(default)]
+		cache_read_tokens: u32,
+		#[serde(default)]
+		cache_creation_tokens: u32,
 	},
 
 	/// Auto-compaction is starting. Fires before the fast-model

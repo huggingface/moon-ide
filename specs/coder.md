@@ -333,6 +333,27 @@ The 401-refresh behaviour stays HF-only: a user provider that
 returns 401 surfaces the error to the user — there's no refresh
 token, just an API key the user has to fix in the picker.
 
+#### Prompt caching (Anthropic via OpenRouter)
+
+Anthropic prompt caching is opt-in (unlike DeepSeek / Gemini Flash / GPT‑4o, which auto-cache on prefix match), so by default zero caching happens on a Claude model regardless of how repetitive the request is. The IDE enables it automatically when:
+
+1. The active provider's `base_url` contains `openrouter.ai`, **and**
+2. The model id starts with `anthropic/`.
+
+Together this means OpenRouter is the only path that produces cached requests today; a hypothetical custom provider pointed at `api.anthropic.com` would also need a translation layer for the native `/v1/messages` shape and is out of scope.
+
+Mechanism: instead of sending each message as `{role, content: "string"}`, the inference layer flips selected messages onto the blocks-array shape `{role, content: [{type: "text", text: "...", cache_control: {type: "ephemeral"}}]}` for those messages only. Other messages keep the string form, so the wire shape stays byte-for-byte identical to the no-caching path for every other provider. Non-Anthropic providers see no `cache_control` at all because `cache_breakpoint_indexes` returns an empty list and `build_wire_messages` then degenerates to the original `String` content.
+
+Breakpoint placement (`cache_breakpoint_indexes` in `crates/moon-coder/src/inference.rs`) uses two of Anthropic's four allowed markers per request:
+
+1. **End of system prompt** (always message index 0 in our agent loop). The biggest static piece in every request — base prompt, hardcoded editing rules, the bound-folders block, the folder-summary preamble — adds up to ~6–8 K tokens of identical content across every turn. One marker, one cache write on the very first call, every subsequent call within the 5-min TTL reads the whole system off cache at the 90 % discount.
+
+2. **End of the last non-assistant message in the list** (the most recent user prompt or tool result). Anthropic caches the entire prefix up to and including the marker; the next round-trip's prefix is exactly "this prefix plus the new assistant turn plus any new tool results", so its longest-matching-prefix lookup at start-of-call comes back as a hit covering everything stable. Assistant turns get skipped because our wire layer keeps them on string-content form — assistant content is `None` when the model emitted tool calls only, and there's no text block we could attach `cache_control` to in that case. Walking back one step lands on a tool or user message that always has non-empty string content.
+
+The 5-minute ephemeral TTL is plenty for an interactive agent loop (turns land seconds apart); the 1-hour TTL costs 5× more per cache write and buys nothing for an active session. Anthropic silently ignores cache breakpoints on spans below the 1024-token minimum, so short conversations pay no cache-write surcharge and get no hits — no special-case in our code.
+
+The usage breakdown comes back on the streaming `usage` chunk alongside `prompt_tokens`. We extend `TokenUsage` with `cache_read_input_tokens` and `cache_creation_input_tokens` (default `0` for every provider that doesn't emit them — DeepSeek's own `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` shape uses different field names, so its caching shows up as zero here for now; revisit when we ship a DeepSeek-specific path) and forward them through `CoderEvent::TokenUsage` as `cache_read_tokens` / `cache_creation_tokens`. The panel's `ContextRing` tooltip surfaces them in a `cache: 3.5k read (87 %, -90 %) · 480 written (+25 %)` line whenever either side is non-zero; the line is suppressed entirely when both are zero so non-caching paths don't see clutter. The compaction trigger still keys off `prompt_tokens` because what eats context-window space is the full input regardless of how it was billed.
+
 ### Later: Anthropic OAuth (Claude Pro / Max)
 
 A second OAuth flow, parallel to HF's, persisted in its own keyring

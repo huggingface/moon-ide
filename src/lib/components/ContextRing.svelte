@@ -87,6 +87,21 @@
 		if (usage.source === 'estimate') {
 			lines.push('Provider did not emit usage; figures are bytes/4 estimates.');
 		}
+		// Prompt-caching line. Only render when either side is
+		// non-zero so non-Anthropic providers (and Anthropic
+		// requests before the first cache write lands) don't get
+		// a "0 cached" line cluttering the tooltip.
+		if (usage.cacheReadTokens > 0 || usage.cacheCreationTokens > 0) {
+			const parts: string[] = [];
+			if (usage.cacheReadTokens > 0) {
+				const sharePct = usage.prompt > 0 ? Math.round((usage.cacheReadTokens / usage.prompt) * 100) : 0;
+				parts.push(`${formatKilo(usage.cacheReadTokens)} read (${sharePct}%, -90%)`);
+			}
+			if (usage.cacheCreationTokens > 0) {
+				parts.push(`${formatKilo(usage.cacheCreationTokens)} written (+25%)`);
+			}
+			lines.push(`cache: ${parts.join(' · ')}`);
+		}
 		if (compaction?.phase === 'running') {
 			lines.push(`Compacting older turns into a summary…`);
 		} else if (compaction?.phase === 'done') {

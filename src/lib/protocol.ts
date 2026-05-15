@@ -1179,6 +1179,19 @@ export type CoderEvent =
 			total_tokens: number;
 			context_window: number;
 			source: TokenUsageSource;
+			/**
+			 * Anthropic prompt-caching breakdown of `prompt_tokens`,
+			 * surfaced by OpenRouter when the request used
+			 * `cache_control: ephemeral` markers. `cache_read_tokens`
+			 * is the slice billed at the 90 %-off cache-read rate;
+			 * `cache_creation_tokens` is the slice billed at the
+			 * 25 %-surcharge cache-write rate (pays back on the
+			 * next call within the 5-min TTL). Both `0` for
+			 * non-Anthropic providers and for Anthropic requests
+			 * with no cache breakpoints.
+			 */
+			cache_read_tokens: number;
+			cache_creation_tokens: number;
 	  }
 	| { kind: 'compaction_started'; messages_compacted: number }
 	| { kind: 'compaction_complete'; summary: string; prompt_tokens_after: number };

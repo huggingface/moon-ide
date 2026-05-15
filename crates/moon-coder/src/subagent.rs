@@ -587,34 +587,39 @@ fn emit_subagent_token_usage(
 	response: &AssistantResponse,
 ) {
 	let context_window = models.context_window(model_slug);
-	let (prompt_tokens, completion_tokens, total_tokens, source) = match response.usage {
-		Some(u) => (
-			u.prompt_tokens,
-			u.completion_tokens,
-			u.total_tokens,
-			crate::event::TokenUsageSource::Provider,
-		),
-		None => {
-			let prompt = crate::runner::estimate_prompt_tokens(messages);
-			// Mirror the parent's bytes/4 for completion side; the
-			// inference module's helper isn't reachable here and
-			// duplicating four lines is cleaner than threading it.
-			let completion = (response.content.as_deref().map(str::len).unwrap_or(0)
-				+ response.thinking.as_deref().map(str::len).unwrap_or(0)
-				+ response
-					.tool_calls
-					.iter()
-					.map(|c| c.function.name.len() + c.function.arguments.len())
-					.sum::<usize>()) as u32
-				/ 4;
-			(
-				prompt,
-				completion,
-				prompt + completion,
-				crate::event::TokenUsageSource::Estimate,
-			)
-		}
-	};
+	let (prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_creation_tokens, source) =
+		match response.usage {
+			Some(u) => (
+				u.prompt_tokens,
+				u.completion_tokens,
+				u.total_tokens,
+				u.cache_read_input_tokens,
+				u.cache_creation_input_tokens,
+				crate::event::TokenUsageSource::Provider,
+			),
+			None => {
+				let prompt = crate::runner::estimate_prompt_tokens(messages);
+				// Mirror the parent's bytes/4 for completion side; the
+				// inference module's helper isn't reachable here and
+				// duplicating four lines is cleaner than threading it.
+				let completion = (response.content.as_deref().map(str::len).unwrap_or(0)
+					+ response.thinking.as_deref().map(str::len).unwrap_or(0)
+					+ response
+						.tool_calls
+						.iter()
+						.map(|c| c.function.name.len() + c.function.arguments.len())
+						.sum::<usize>()) as u32
+					/ 4;
+				(
+					prompt,
+					completion,
+					prompt + completion,
+					0,
+					0,
+					crate::event::TokenUsageSource::Estimate,
+				)
+			}
+		};
 	sink.send(wrap_inner(
 		subagent_id,
 		CoderEvent::TokenUsage {
@@ -623,6 +628,8 @@ fn emit_subagent_token_usage(
 			total_tokens,
 			context_window,
 			source,
+			cache_read_tokens,
+			cache_creation_tokens,
 		},
 	));
 }

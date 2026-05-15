@@ -100,6 +100,120 @@ pub struct FunctionCall {
 	pub arguments: String,
 }
 
+/// Wire-format message: the JSON shape we actually serialise and
+/// send to the provider. Differs from [`ChatMessage`] only in
+/// that `content` can be a blocks array — that's how Anthropic
+/// prompt-caching markers ride on an OpenAI-compatible request
+/// body (via OpenRouter routing to `anthropic/*`). Non-caching
+/// providers see byte-for-byte the same wire shape they did
+/// before because [`WireContent::String`] serialises untagged.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "role", rename_all = "lowercase")]
+enum WireMessage<'a> {
+	System {
+		content: WireContent<'a>,
+	},
+	User {
+		content: WireContent<'a>,
+	},
+	Assistant {
+		#[serde(skip_serializing_if = "Option::is_none")]
+		content: Option<&'a str>,
+		#[serde(skip_serializing_if = "<[ToolCall]>::is_empty")]
+		tool_calls: &'a [ToolCall],
+	},
+	Tool {
+		tool_call_id: &'a str,
+		content: WireContent<'a>,
+	},
+}
+
+/// A message's `content` field on the wire. `String` is the
+/// common path (everything we used to send); `Blocks` kicks in
+/// when we want to attach `cache_control` to a text block.
+/// Untagged so Serde picks the variant by JSON shape.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+enum WireContent<'a> {
+	String(&'a str),
+	Blocks(Vec<WireTextBlock<'a>>),
+}
+
+/// One text block inside a content-as-array message. `kind` is
+/// always `"text"` for our use; we'd add `image_url` etc. here
+/// if we ever wanted to send images.
+#[derive(Debug, Clone, Serialize)]
+struct WireTextBlock<'a> {
+	#[serde(rename = "type")]
+	kind: &'static str,
+	text: &'a str,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	cache_control: Option<CacheControl>,
+}
+
+/// Anthropic prompt-caching marker. `ephemeral` is the only
+/// `type` OpenRouter/Anthropic accept today; we leave `ttl` off
+/// so it defaults to 5 minutes (which is plenty — the next turn
+/// in an active conversation always lands well inside that
+/// window, and the 1h TTL costs 5x more on the cache-write side
+/// without buying us anything for an interactive agent loop).
+#[derive(Debug, Clone, Copy, Serialize)]
+struct CacheControl {
+	#[serde(rename = "type")]
+	kind: &'static str,
+}
+
+impl CacheControl {
+	const EPHEMERAL: Self = Self { kind: "ephemeral" };
+}
+
+/// Build the wire message list from a slice of [`ChatMessage`]s,
+/// optionally attaching `cache_control: ephemeral` to the
+/// indexes listed in `cached_indexes`. Pass an empty slice to
+/// keep the original string-content shape — that's what every
+/// non-Anthropic round-trip does, so we keep the cheap path
+/// cheap.
+fn build_wire_messages<'a>(messages: &'a [ChatMessage], cached_indexes: &[usize]) -> Vec<WireMessage<'a>> {
+	let mut out = Vec::with_capacity(messages.len());
+	for (idx, msg) in messages.iter().enumerate() {
+		let cache_here = cached_indexes.contains(&idx);
+		let wire = match msg {
+			ChatMessage::System { content } => WireMessage::System {
+				content: wire_content(content, cache_here),
+			},
+			ChatMessage::User { content } => WireMessage::User {
+				content: wire_content(content, cache_here),
+			},
+			ChatMessage::Assistant { content, tool_calls } => WireMessage::Assistant {
+				// `cache_breakpoint_indexes` never targets an
+				// assistant turn (it skips backwards to the
+				// previous tool / user message), so `cache_here`
+				// is `false` for every assistant message and we
+				// keep the simple string-content shape.
+				content: content.as_deref(),
+				tool_calls,
+			},
+			ChatMessage::Tool { tool_call_id, content } => WireMessage::Tool {
+				tool_call_id,
+				content: wire_content(content, cache_here),
+			},
+		};
+		out.push(wire);
+	}
+	out
+}
+
+fn wire_content(content: &str, cache_here: bool) -> WireContent<'_> {
+	if !cache_here {
+		return WireContent::String(content);
+	}
+	WireContent::Blocks(vec![WireTextBlock {
+		kind: "text",
+		text: content,
+		cache_control: Some(CacheControl::EPHEMERAL),
+	}])
+}
+
 /// Tool definition handed to the model in the request. Mirrors
 /// OpenAI's `{ "type": "function", "function": { ... } }` shape.
 #[derive(Debug, Clone, Serialize)]
@@ -132,7 +246,7 @@ impl ToolDefinition {
 #[derive(Debug, Clone, Serialize)]
 struct ChatCompletionRequest<'a> {
 	model: &'a str,
-	messages: &'a [ChatMessage],
+	messages: Vec<WireMessage<'a>>,
 	#[serde(skip_serializing_if = "<[ToolDefinition]>::is_empty")]
 	tools: &'a [ToolDefinition],
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -168,6 +282,18 @@ pub struct ChatCompletionResponse {
 /// much of the model's context window the next round-trip will
 /// have to fit the system prompt + history into. `completion_tokens`
 /// is just the model's output for this single response.
+///
+/// `cache_read_input_tokens` / `cache_creation_input_tokens` are
+/// Anthropic's prompt-caching split, exposed verbatim by
+/// OpenRouter when the request used `cache_control: ephemeral`
+/// markers. They're a *breakdown* of `prompt_tokens`, not in
+/// addition to it — i.e. `prompt_tokens` is the full input,
+/// `cache_read_input_tokens` says "X of those were served from
+/// cache at the 90 % discount" and `cache_creation_input_tokens`
+/// says "Y of those were written to cache at a 25 % surcharge".
+/// Default `0` for every non-Anthropic provider (they don't emit
+/// the fields) and for Anthropic requests that didn't hit any
+/// cache yet.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
 pub struct TokenUsage {
 	#[serde(default)]
@@ -176,6 +302,10 @@ pub struct TokenUsage {
 	pub completion_tokens: u32,
 	#[serde(default)]
 	pub total_tokens: u32,
+	#[serde(default)]
+	pub cache_read_input_tokens: u32,
+	#[serde(default)]
+	pub cache_creation_input_tokens: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -338,6 +468,87 @@ struct ResolvedRoute {
 	auth_token: Option<String>,
 	bill_to: Option<String>,
 	is_huggingface: bool,
+}
+
+/// Decide which message indexes should carry an Anthropic
+/// `cache_control: ephemeral` marker for this request. Returns
+/// an empty list when the route/model don't support prompt
+/// caching (every non-OpenRouter route, plus OpenRouter routes
+/// to non-Anthropic models) — that's the path that preserves
+/// the original string-content wire shape.
+///
+/// ## Strategy
+///
+/// Two breakpoints, well under Anthropic's 4-per-request cap:
+///
+/// 1. **System prompt** (index 0). The biggest static piece in
+///    every request — about 6–8 K tokens of base prompt + folder
+///    summary + bound-folders block. Marking it once means every
+///    subsequent call within the 5-min TTL reads the entire
+///    system prompt off cache at a 90 % discount instead of
+///    paying full input price.
+///
+/// 2. **Last non-assistant message in the list** (the most
+///    recent user prompt or tool result). The cache is written
+///    for the entire prefix up to and including this marker;
+///    the *next* round-trip's prefix is exactly "this prefix
+///    plus the new assistant turn plus any new tool results",
+///    so the longest-matching-prefix lookup at the start of
+///    that next call comes back as a hit. Assistant turns get
+///    skipped because our [`WireMessage::Assistant`] keeps
+///    string-content (assistant content is often empty when the
+///    model emitted tool calls only — there's no text block to
+///    attach `cache_control` to), and walking back to the
+///    previous tool / user message lands on something that
+///    always has non-empty string content we *can* mark.
+///
+/// Anthropic silently ignores cache breakpoints on spans below
+/// the 1024-token minimum, so a very short conversation pays no
+/// cache-write surcharge and gets no hits — no special-case
+/// needed here.
+fn cache_breakpoint_indexes(messages: &[ChatMessage], route: &ResolvedRoute, model: &str) -> Vec<usize> {
+	if !supports_anthropic_caching(route, model) {
+		return Vec::new();
+	}
+	if messages.is_empty() {
+		return Vec::new();
+	}
+	let mut indexes = vec![0_usize];
+	let last = messages.len() - 1;
+	if last == 0 {
+		return indexes;
+	}
+	let mut anchor = last;
+	while anchor > 0 && matches!(messages[anchor], ChatMessage::Assistant { .. }) {
+		anchor -= 1;
+	}
+	if anchor > 0 {
+		indexes.push(anchor);
+	}
+	indexes
+}
+
+/// True when the resolved route is OpenRouter (`openrouter.ai`
+/// in the base URL) and the model id looks like an Anthropic
+/// model (`anthropic/...` — the slug OpenRouter exposes for
+/// every Claude variant). OpenRouter is currently the only
+/// path through which we hit Anthropic models: the HF router
+/// doesn't proxy them, and a "custom" provider pointing
+/// directly at `api.anthropic.com` would need a heavier
+/// translation layer (the native `/v1/messages` shape diverges
+/// from `/v1/chat/completions` in too many places to fake).
+fn supports_anthropic_caching(route: &ResolvedRoute, model: &str) -> bool {
+	if route.is_huggingface {
+		return false;
+	}
+	if !route.base_url.contains("openrouter.ai") {
+		return false;
+	}
+	is_anthropic_model(model)
+}
+
+fn is_anthropic_model(model: &str) -> bool {
+	model.starts_with("anthropic/")
 }
 
 impl InferenceClient {
@@ -568,9 +779,10 @@ impl InferenceClient {
 	) -> Result<AssistantResponse, CoderError> {
 		let mut route = self.resolve_route_for_request().await?;
 		let endpoint = format!("{}/chat/completions", route.base_url);
+		let cache_indexes = cache_breakpoint_indexes(messages, &route, model);
 		let body = ChatCompletionRequest {
 			model,
-			messages,
+			messages: build_wire_messages(messages, &cache_indexes),
 			tools,
 			tool_choice: if tools.is_empty() { None } else { Some("auto") },
 			stream: false,
@@ -637,9 +849,10 @@ impl InferenceClient {
 	{
 		let mut route = self.resolve_route_for_request().await?;
 		let endpoint = format!("{}/chat/completions", route.base_url);
+		let cache_indexes = cache_breakpoint_indexes(messages, &route, model);
 		let body = ChatCompletionRequest {
 			model,
-			messages,
+			messages: build_wire_messages(messages, &cache_indexes),
 			tools,
 			tool_choice: if tools.is_empty() { None } else { Some("auto") },
 			stream: true,
@@ -1406,6 +1619,176 @@ mod tests {
 		let resp: AssistantResponse = serde_json::from_str(raw).unwrap();
 		assert_eq!(resp.content.as_deref(), Some("hi"));
 		assert_eq!(resp.thinking.as_deref(), Some("thought trail"));
+	}
+
+	#[test]
+	fn cache_breakpoints_empty_for_non_openrouter_route() {
+		// HF route → no caching, regardless of model id.
+		let route = ResolvedRoute {
+			base_url: "https://router.huggingface.co/v1".into(),
+			auth_token: None,
+			bill_to: None,
+			is_huggingface: true,
+		};
+		let messages = vec![
+			ChatMessage::System { content: "sys".into() },
+			ChatMessage::User { content: "hi".into() },
+		];
+		assert!(cache_breakpoint_indexes(&messages, &route, "anthropic/claude-sonnet-4.5").is_empty());
+
+		// Custom non-OpenRouter route → no caching either, even
+		// if the slug happens to start with `anthropic/`.
+		let route = ResolvedRoute {
+			base_url: "https://api.anthropic.com/v1".into(),
+			auth_token: None,
+			bill_to: None,
+			is_huggingface: false,
+		};
+		assert!(cache_breakpoint_indexes(&messages, &route, "anthropic/claude-sonnet-4.5").is_empty());
+
+		// OpenRouter with a non-Anthropic slug → no caching.
+		let route = ResolvedRoute {
+			base_url: "https://openrouter.ai/api/v1".into(),
+			auth_token: None,
+			bill_to: None,
+			is_huggingface: false,
+		};
+		assert!(cache_breakpoint_indexes(&messages, &route, "openai/gpt-4o").is_empty());
+	}
+
+	#[test]
+	fn cache_breakpoints_marks_system_and_last_non_assistant() {
+		let route = ResolvedRoute {
+			base_url: "https://openrouter.ai/api/v1".into(),
+			auth_token: None,
+			bill_to: None,
+			is_huggingface: false,
+		};
+		let model = "anthropic/claude-sonnet-4.5";
+
+		// Just a system prompt: only index 0 marked.
+		let messages = vec![ChatMessage::System { content: "sys".into() }];
+		assert_eq!(cache_breakpoint_indexes(&messages, &route, model), vec![0]);
+
+		// System + user: both marked.
+		let messages = vec![
+			ChatMessage::System { content: "sys".into() },
+			ChatMessage::User { content: "hi".into() },
+		];
+		assert_eq!(cache_breakpoint_indexes(&messages, &route, model), vec![0, 1]);
+
+		// System + user + assistant (with tool calls, empty content):
+		// last is assistant → walk back to user at index 1.
+		let messages = vec![
+			ChatMessage::System { content: "sys".into() },
+			ChatMessage::User { content: "hi".into() },
+			ChatMessage::Assistant {
+				content: None,
+				tool_calls: vec![ToolCall {
+					id: "call_1".into(),
+					kind: "function".into(),
+					function: FunctionCall {
+						name: "ls".into(),
+						arguments: "{}".into(),
+					},
+				}],
+			},
+		];
+		assert_eq!(cache_breakpoint_indexes(&messages, &route, model), vec![0, 1]);
+
+		// System + user + assistant + tool: anchor on the tool
+		// (index 3), the most up-to-date stable prefix for next call.
+		let messages = vec![
+			ChatMessage::System { content: "sys".into() },
+			ChatMessage::User { content: "hi".into() },
+			ChatMessage::Assistant {
+				content: None,
+				tool_calls: vec![ToolCall {
+					id: "call_1".into(),
+					kind: "function".into(),
+					function: FunctionCall {
+						name: "ls".into(),
+						arguments: "{}".into(),
+					},
+				}],
+			},
+			ChatMessage::Tool {
+				tool_call_id: "call_1".into(),
+				content: "/etc /var".into(),
+			},
+		];
+		assert_eq!(cache_breakpoint_indexes(&messages, &route, model), vec![0, 3]);
+	}
+
+	#[test]
+	fn wire_messages_no_cache_serialises_as_string_content() {
+		// The cheap-path is the load-bearing case: every non-Anthropic
+		// request has to come out byte-for-byte the same as the
+		// pre-caching wire shape, otherwise we'd break every provider
+		// that doesn't expect blocks-form content.
+		let messages = vec![
+			ChatMessage::System { content: "sys".into() },
+			ChatMessage::User { content: "hi".into() },
+			ChatMessage::Tool {
+				tool_call_id: "call_1".into(),
+				content: "ok".into(),
+			},
+		];
+		let wire = build_wire_messages(&messages, &[]);
+		let json = serde_json::to_string(&wire).unwrap();
+		assert!(json.contains(r#"{"role":"system","content":"sys"}"#));
+		assert!(json.contains(r#"{"role":"user","content":"hi"}"#));
+		assert!(json.contains(r#"{"role":"tool","tool_call_id":"call_1","content":"ok"}"#));
+		// Crucial regression guard: no `cache_control` and no
+		// blocks-array shape leaked when caching is off.
+		assert!(!json.contains("cache_control"));
+		assert!(!json.contains(r#""type":"text""#));
+	}
+
+	#[test]
+	fn wire_messages_with_cache_emits_blocks_only_on_marked_indexes() {
+		let messages = vec![
+			ChatMessage::System { content: "sys".into() },
+			ChatMessage::User { content: "hi".into() },
+			ChatMessage::Tool {
+				tool_call_id: "call_1".into(),
+				content: "ok".into(),
+			},
+		];
+		// Mark system + tool (typical 2-breakpoint placement for
+		// an in-flight turn). User in between stays string-form.
+		let wire = build_wire_messages(&messages, &[0, 2]);
+		let json = serde_json::to_string(&wire).unwrap();
+		assert!(json
+			.contains(r#"{"role":"system","content":[{"type":"text","text":"sys","cache_control":{"type":"ephemeral"}}]}"#));
+		// User remains string content (not in `cached_indexes`).
+		assert!(json.contains(r#"{"role":"user","content":"hi"}"#));
+		// Tool gets the blocks shape with cache_control on the
+		// single text block; tool_call_id is preserved.
+		assert!(json.contains(
+			r#"{"role":"tool","tool_call_id":"call_1","content":[{"type":"text","text":"ok","cache_control":{"type":"ephemeral"}}]}"#
+		));
+	}
+
+	#[test]
+	fn token_usage_accepts_anthropic_cache_fields() {
+		// OpenRouter streams these alongside the usual prompt /
+		// completion / total when the request had cache_control
+		// markers. We have to parse them or the breakdown goes
+		// silently to zero in the tooltip.
+		let raw = r#"{"prompt_tokens":4000,"completion_tokens":200,"total_tokens":4200,"cache_read_input_tokens":3500,"cache_creation_input_tokens":480}"#;
+		let usage: TokenUsage = serde_json::from_str(raw).unwrap();
+		assert_eq!(usage.prompt_tokens, 4000);
+		assert_eq!(usage.cache_read_input_tokens, 3500);
+		assert_eq!(usage.cache_creation_input_tokens, 480);
+
+		// Providers that don't emit the fields parse as zero;
+		// the runner emits 0 to the panel, which the tooltip
+		// then suppresses entirely.
+		let raw = r#"{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}"#;
+		let usage: TokenUsage = serde_json::from_str(raw).unwrap();
+		assert_eq!(usage.cache_read_input_tokens, 0);
+		assert_eq!(usage.cache_creation_input_tokens, 0);
 	}
 
 	#[test]

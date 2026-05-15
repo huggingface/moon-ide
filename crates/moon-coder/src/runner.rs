@@ -1261,6 +1261,8 @@ async fn run_turn(
 					prompt_tokens: prompt,
 					completion_tokens: completion,
 					total_tokens: prompt + completion,
+					cache_read_input_tokens: 0,
+					cache_creation_input_tokens: 0,
 				}
 			}));
 		}
@@ -2322,25 +2324,37 @@ pub(crate) fn emit_token_usage(
 	response: &AssistantResponse,
 ) {
 	let context_window = models.context_window(model_slug);
-	let (prompt_tokens, completion_tokens, total_tokens, source) = match response.usage {
-		Some(u) => (
-			u.prompt_tokens,
-			u.completion_tokens,
-			u.total_tokens,
-			TokenUsageSource::Provider,
-		),
-		None => {
-			let prompt = estimate_prompt_tokens(messages);
-			let completion = estimate_completion_tokens(response);
-			(prompt, completion, prompt + completion, TokenUsageSource::Estimate)
-		}
-	};
+	let (prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_creation_tokens, source) =
+		match response.usage {
+			Some(u) => (
+				u.prompt_tokens,
+				u.completion_tokens,
+				u.total_tokens,
+				u.cache_read_input_tokens,
+				u.cache_creation_input_tokens,
+				TokenUsageSource::Provider,
+			),
+			None => {
+				let prompt = estimate_prompt_tokens(messages);
+				let completion = estimate_completion_tokens(response);
+				(
+					prompt,
+					completion,
+					prompt + completion,
+					0,
+					0,
+					TokenUsageSource::Estimate,
+				)
+			}
+		};
 	sink.send(CoderEvent::TokenUsage {
 		prompt_tokens,
 		completion_tokens,
 		total_tokens,
 		context_window,
 		source,
+		cache_read_tokens,
+		cache_creation_tokens,
 	});
 }
 
