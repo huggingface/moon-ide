@@ -137,6 +137,38 @@ pub enum SessionRecord {
 	/// the auto-renamed title sticks across launches without a
 	/// rewrite-the-header-in-place dance.
 	TitleUpdate { title: String },
+	/// Provider-supplied token usage from the round-trip that
+	/// just landed. Appended after every parent-loop call whose
+	/// response carried a `usage` chunk; absent for round-trips
+	/// where the provider didn't emit usage (we don't bother
+	/// persisting bytes/4 estimates — they're recomputable from
+	/// the message history). On reopen, the last `Usage` record
+	/// drives the post-replay `TokenUsage` event so the panel's
+	/// context-usage ring shows provider-exact figures from the
+	/// moment the session re-mounts, instead of a bytes/4
+	/// estimate that often lands 20–30 % off. Cache fields only
+	/// emitted when non-zero (Anthropic via OpenRouter).
+	///
+	/// Sub-agents share the same JSONL machinery and persist their
+	/// own Usage records into their per-parent subdir, but the
+	/// "open session" path doesn't load sub-agent files (the
+	/// reload is top-level only) so those records are inert until
+	/// somebody adds a sub-agent restore path. Persisting them
+	/// today still costs nothing and pays off the moment that path
+	/// lands.
+	Usage {
+		prompt_tokens: u32,
+		completion_tokens: u32,
+		total_tokens: u32,
+		#[serde(default, skip_serializing_if = "u32_is_zero")]
+		cache_read_input_tokens: u32,
+		#[serde(default, skip_serializing_if = "u32_is_zero")]
+		cache_creation_input_tokens: u32,
+	},
+}
+
+fn u32_is_zero(n: &u32) -> bool {
+	*n == 0
 }
 
 /// Lightweight summary used by the panel's session list. Avoids
@@ -796,6 +828,99 @@ mod tests {
 			.await
 			.unwrap());
 		assert!(!tokio::fs::try_exists(sub_dir.as_std_path()).await.unwrap());
+	}
+
+	#[tokio::test]
+	async fn usage_record_round_trips_with_optional_cache_fields() {
+		// `Usage` records drive the post-replay context-usage
+		// ring on `open_session`. Two shapes worth pinning:
+		//
+		// 1. A "no caching" usage (most providers): cache fields
+		//    skip-serialise so the JSONL line stays slim.
+		// 2. An Anthropic-via-OpenRouter usage: cache fields
+		//    present and round-trip back exactly.
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let header = SessionHeader {
+			schema: SESSION_SCHEMA_VERSION,
+			id: "sess-usage".into(),
+			title: "usage round trip".into(),
+			created_at_ms: 1,
+			updated_at_ms: 1,
+			model: "anthropic/claude-sonnet-4.5".into(),
+			parent_session_id: None,
+			parent_tool_call_id: None,
+			subagent_mode: None,
+			subagent_target_folder: None,
+		};
+
+		// Plain non-caching usage line: cache fields are zero,
+		// so they should be absent from the on-disk JSON.
+		let plain = SessionRecord::Usage {
+			prompt_tokens: 1234,
+			completion_tokens: 56,
+			total_tokens: 1290,
+			cache_read_input_tokens: 0,
+			cache_creation_input_tokens: 0,
+		};
+		append_record(&dir, &header, &plain).await.unwrap();
+		let raw = tokio::fs::read_to_string(session_path(&dir, "sess-usage").as_std_path())
+			.await
+			.unwrap();
+		// Header line + one usage line. The usage line should
+		// not carry the cache_* keys (skip-if-zero).
+		let usage_line = raw.lines().nth(1).expect("usage line present");
+		assert!(usage_line.contains(r#""kind":"usage""#));
+		assert!(usage_line.contains(r#""prompt_tokens":1234"#));
+		assert!(!usage_line.contains("cache_read_input_tokens"));
+		assert!(!usage_line.contains("cache_creation_input_tokens"));
+
+		// Now an Anthropic-via-OpenRouter usage where caching
+		// kicked in. Both cache fields round-trip on disk.
+		let with_cache = SessionRecord::Usage {
+			prompt_tokens: 9000,
+			completion_tokens: 200,
+			total_tokens: 9200,
+			cache_read_input_tokens: 7500,
+			cache_creation_input_tokens: 600,
+		};
+		append_record(&dir, &header, &with_cache).await.unwrap();
+		let loaded = load(&dir, "sess-usage").await.unwrap();
+		assert_eq!(loaded.records.len(), 2);
+		match &loaded.records[1] {
+			SessionRecord::Usage {
+				prompt_tokens,
+				completion_tokens,
+				total_tokens,
+				cache_read_input_tokens,
+				cache_creation_input_tokens,
+			} => {
+				assert_eq!(*prompt_tokens, 9000);
+				assert_eq!(*completion_tokens, 200);
+				assert_eq!(*total_tokens, 9200);
+				assert_eq!(*cache_read_input_tokens, 7500);
+				assert_eq!(*cache_creation_input_tokens, 600);
+			}
+			other => panic!("expected Usage, got {other:?}"),
+		}
+
+		// And the no-caching record we wrote first should
+		// still parse back with default-zero cache fields,
+		// proving the missing-on-disk → 0-in-memory fallback
+		// works on reload.
+		match &loaded.records[0] {
+			SessionRecord::Usage {
+				prompt_tokens,
+				cache_read_input_tokens,
+				cache_creation_input_tokens,
+				..
+			} => {
+				assert_eq!(*prompt_tokens, 1234);
+				assert_eq!(*cache_read_input_tokens, 0);
+				assert_eq!(*cache_creation_input_tokens, 0);
+			}
+			other => panic!("expected Usage, got {other:?}"),
+		}
 	}
 
 	#[test]

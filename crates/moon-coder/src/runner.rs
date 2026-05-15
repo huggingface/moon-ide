@@ -857,6 +857,12 @@ impl CoderHandle {
 		let mut messages: Vec<ChatMessage> = vec![ChatMessage::System {
 			content: PHASE_6_0_SYSTEM_PROMPT.to_string(),
 		}];
+		// Last `Usage` record we saw while walking the JSONL.
+		// Drives the post-replay context-usage ring with
+		// provider-exact figures when the session has at least
+		// one such record; sessions written before this variant
+		// shipped fall through to the bytes/4 estimate below.
+		let mut last_usage: Option<TokenUsage> = None;
 		// Reconstruct the chat history from the persisted records.
 		// Tool messages need to know their `tool_call_id`, which
 		// the persisted Assistant record carries verbatim — we
@@ -883,6 +889,21 @@ impl CoderHandle {
 					});
 				}
 				SessionRecord::TitleUpdate { .. } => {}
+				SessionRecord::Usage {
+					prompt_tokens,
+					completion_tokens,
+					total_tokens,
+					cache_read_input_tokens,
+					cache_creation_input_tokens,
+				} => {
+					last_usage = Some(TokenUsage {
+						prompt_tokens: *prompt_tokens,
+						completion_tokens: *completion_tokens,
+						total_tokens: *total_tokens,
+						cache_read_input_tokens: *cache_read_input_tokens,
+						cache_creation_input_tokens: *cache_creation_input_tokens,
+					});
+				}
 			}
 		}
 		let summary = SessionSummary {
@@ -891,13 +912,51 @@ impl CoderHandle {
 			created_at_ms: header.created_at_ms,
 			updated_at_ms: header.updated_at_ms,
 		};
+		// Snapshot what the panel needs for the restore-time
+		// usage hint *before* the move into `Session`. We prefer
+		// the last persisted `Usage` record (provider-exact for
+		// the round-trip that wrote it) over a bytes/4 estimate
+		// of the rebuilt history; the estimate is the fallback
+		// for sessions written before the `Usage` variant shipped
+		// or for round-trips where the provider didn't emit a
+		// usage chunk. Either way the panel's context-usage ring
+		// fills in the moment the transcript appears, instead of
+		// staying empty until the user sends their first new
+		// prompt. The next live call overwrites whatever we send
+		// here.
+		let restore_models = self.state.models.read().await.clone();
+		let restore_standard = restore_models.standard().to_owned();
+		let restore_context_window = restore_models.context_window(&restore_standard);
+		let (restore_prompt, restore_completion, restore_total, restore_cache_read, restore_cache_creation, restore_source) =
+			match last_usage {
+				Some(u) => (
+					u.prompt_tokens,
+					u.completion_tokens,
+					u.total_tokens,
+					u.cache_read_input_tokens,
+					u.cache_creation_input_tokens,
+					TokenUsageSource::Provider,
+				),
+				None => {
+					let estimate = estimate_prompt_tokens(&messages);
+					(estimate, 0, estimate, 0, 0, TokenUsageSource::Estimate)
+				}
+			};
 		let session = Session {
 			header,
 			session_dir: Some(dir),
 			messages,
 			persisted_records: records.len() as u32,
 			auto_rename_pending: false,
-			last_usage: None,
+			// Seed the in-memory `last_usage` with whatever we
+			// recovered from disk. Without this the auto-
+			// compaction trigger wouldn't have a number to
+			// compare against until the first post-restore
+			// round-trip lands — and a session that was already
+			// near the compaction threshold when it got persisted
+			// would silently skip the compaction-before-send
+			// guard on the very next prompt.
+			last_usage,
 		};
 		*fs.session.lock().await = session;
 
@@ -915,6 +974,26 @@ impl CoderHandle {
 		for record in records {
 			emit_replay_events(&sink, record);
 		}
+		// Restore-time context-usage hint. `Provider` source when
+		// we recovered a persisted `Usage` record (the ring renders
+		// without the `≈` tooltip prefix), `Estimate` when we
+		// fell back to bytes/4. Cache fields are non-zero only on
+		// the persisted-Usage path; on the estimate path we don't
+		// have any cache info to report, so the tooltip suppresses
+		// the `cache:` line. The completion field tracks whatever
+		// the persisted record carried (0 on the estimate path)
+		// even though no turn is in flight here — the ring keys
+		// off `prompt_tokens` regardless, so it's just the
+		// tooltip's "completion · total" line that benefits.
+		sink.send(CoderEvent::TokenUsage {
+			prompt_tokens: restore_prompt,
+			completion_tokens: restore_completion,
+			total_tokens: restore_total,
+			context_window: restore_context_window,
+			source: restore_source,
+			cache_read_tokens: restore_cache_read,
+			cache_creation_tokens: restore_cache_creation,
+		});
 		// Clear the busy state on the frontend. Replayed `UserMessage`
 		// events flip `coder.busy = true` (mirroring the live-turn
 		// flow), but no `TurnComplete` is recorded in the session
@@ -1267,6 +1346,14 @@ async fn run_turn(
 			}));
 		}
 		persist_assistant_record(fs, &response).await;
+		// Persist provider usage too, so a session reopened later
+		// — by the same IDE process or a fresh launch — restores
+		// the panel's context-usage ring with provider-exact
+		// figures from the moment the transcript appears, instead
+		// of the bytes/4 estimate that's `≈20–30 %` off in
+		// practice. No-op when the provider didn't emit usage;
+		// the open path falls back to the estimate in that case.
+		persist_usage_record(fs, &response).await;
 
 		// Per-iteration token usage report. Drives the in-panel
 		// usage ring + the auto-compaction trigger. Provider-supplied
@@ -1904,6 +1991,42 @@ async fn persist_assistant_record(fs: &Arc<FolderSession>, response: &AssistantR
 	session.persisted_records = session.persisted_records.saturating_add(1);
 }
 
+/// Append a [`SessionRecord::Usage`] when the round-trip that
+/// just finished carried provider-supplied figures. We skip the
+/// bytes/4 estimate path on purpose — those numbers are
+/// recomputable from the persisted messages, so persisting them
+/// would just bloat the JSONL with redundant approximations.
+/// Best-effort: a write failure logs but doesn't fail the turn,
+/// same posture as the assistant / tool persisters above.
+///
+/// `persisted_records` deliberately *isn't* incremented here.
+/// That counter feeds the auto-rename "is this session worth
+/// renaming yet?" check, which keys off real conversational
+/// records (user / assistant / tool); a metadata sidecar like
+/// `Usage` shouldn't move it.
+async fn persist_usage_record(fs: &Arc<FolderSession>, response: &AssistantResponse) {
+	let Some(usage) = response.usage else {
+		return;
+	};
+	let (dir, header) = {
+		let session = fs.session.lock().await;
+		let Some(dir) = session.session_dir.clone() else {
+			return;
+		};
+		(dir, session.header.clone())
+	};
+	let record = SessionRecord::Usage {
+		prompt_tokens: usage.prompt_tokens,
+		completion_tokens: usage.completion_tokens,
+		total_tokens: usage.total_tokens,
+		cache_read_input_tokens: usage.cache_read_input_tokens,
+		cache_creation_input_tokens: usage.cache_creation_input_tokens,
+	};
+	if let Err(err) = sessions::append_record(&dir, &header, &record).await {
+		tracing::warn!(error = %err, "failed to persist usage record");
+	}
+}
+
 async fn persist_tool_record(fs: &Arc<FolderSession>, tool_call_id: &str, content: &str) {
 	let (dir, header) = {
 		let session = fs.session.lock().await;
@@ -2293,6 +2416,15 @@ fn emit_replay_events(sink: &FolderEventSink, record: SessionRecord) {
 			// Title is already reflected in the header we sent
 			// with `SessionLoaded`; no follow-up needed at the
 			// per-record level.
+		}
+		SessionRecord::Usage { .. } => {
+			// Per-round-trip usage figures are metadata: the
+			// panel cares about the *latest* number for its
+			// context-usage ring, not the historical sequence.
+			// `open_session` walks the records, picks the last
+			// `Usage`, and emits a single `TokenUsage` event for
+			// it after the replay loop — replaying every record
+			// would just animate the ring through old states.
 		}
 	}
 }

@@ -640,7 +640,9 @@ The first line is a header; every subsequent line is one
 {"kind":"user","text":"do the thing"}
 {"kind":"assistant","content":"sure…","thinking":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{...}"}}]}
 {"kind":"tool","tool_call_id":"call_1","content":"…"}
+{"kind":"usage","prompt_tokens":1234,"completion_tokens":56,"total_tokens":1290}
 {"kind":"assistant","content":"done"}
+{"kind":"usage","prompt_tokens":1340,"completion_tokens":18,"total_tokens":1358}
 {"kind":"title_update","title":"add bucket sync upload task"}
 ```
 
@@ -650,6 +652,8 @@ releases apply retroactively. The header carries metadata
 (`schema`, `id`, `title`, `created_at_ms`, `updated_at_ms`,
 `model`); a `title_update` record overrides the header's title on
 load (auto-rename uses this — see below).
+
+Provider-supplied token usage gets persisted as a `usage` record after every parent-loop round-trip whose response carried a `usage` chunk. The fields mirror [`TokenUsage`](../crates/moon-coder/src/inference.rs) (`prompt_tokens`, `completion_tokens`, `total_tokens`, plus `cache_read_input_tokens` / `cache_creation_input_tokens` when caching kicked in — those last two skip-serialise when zero, which is most providers). On reopen, the runner walks every record, remembers the **last** `Usage`, and uses it as the seed for both the in-memory `last_usage` (so the auto-compaction trigger has a real number to compare against on the very next prompt) and the synthetic restore-time `TokenUsage` event the panel turns into the context-usage ring. Sessions written before this variant shipped, or sessions whose final round-trip didn't yield a `usage` chunk, fall back to a bytes/4 estimate of the rebuilt history — same number the panel used to render at restore time before persistence landed. Sub-agent JSONLs follow the same shape; `open_session` only reloads top-level transcripts today, so persisted sub-agent usage is forensic value plus future-proofing for whenever sub-agent restore lands. Bytes/4 estimates aren't persisted: they're recomputable from the messages, so storing them would just bloat the file with redundant approximations.
 
 Sessions explicitly **don't** live inside the project tree.
 They're personal scratch / history rather than project
