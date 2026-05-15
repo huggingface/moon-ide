@@ -787,6 +787,33 @@ class WorkspaceState {
 			const ws = await ipc.workspace.setActiveFolder(path);
 			await this.adoptWorkspaceSnapshot(ws);
 			this.persistAppState();
+			// Re-prime the LSP for the new folder's open buffers.
+			// The backend's `ensure_broker` rebuilds lazily on the
+			// next `lsp_*` IPC (it sees the active-folder change
+			// and tears down the old broker), but the freshly-built
+			// broker starts with an empty docs map — no `didOpen`
+			// has been fired for any of the new folder's tabs. In a
+			// container-routed setup that often surfaces as TS
+			// "Cannot find name 'assert'" / missing-`@types/node`
+			// noise on the first interaction: typing fires
+			// `lsp_update`, which reaches a server that doesn't
+			// know the file (silently dropped), and surrounding
+			// hover / completion / definition probes either get
+			// nothing back or fall through to project-wide
+			// analysis with stale assumptions. Mirrors what
+			// `restartLsp` already does after a manual restart and
+			// what `restoreAppState` does for the active folder at
+			// startup — folder switches were the missing entry
+			// point.
+			for (const file of this.openFiles) {
+				if (file.kind !== 'text' || file.isDeleted) {
+					continue;
+				}
+				if (file.path.startsWith('untitled:')) {
+					continue;
+				}
+				this.lspOpen(file.path, file.text);
+			}
 			// Kick an auto-fetch on the new folder so the Sync Changes
 			// button surfaces promptly instead of waiting for the next
 			// 3-minute periodic tick. Throttled internally — rapid
