@@ -347,12 +347,16 @@ pub async fn coder_set_model_settings(
 	Ok(())
 }
 
-/// Fetch the router's `/v1/models` catalog. **HF-only** — when a
-/// user provider is active, the command errors and the picker is
-/// expected to call `coder_list_provider_models` instead. One
-/// round trip per call; the frontend caches the result for the
-/// lifetime of the popover so flipping filters doesn't re-hit
-/// the network.
+/// Fetch the HF router's `/v1/models` catalog for the picker's
+/// HF tab. Not gated on the persisted active route — the picker
+/// lets the user flip between the HF tab and user-provider tabs
+/// while editing, and a 500 on every HF tab visit while
+/// OpenRouter is currently active would be wrong. User-provider
+/// catalogs use `coder_list_provider_models`; the two
+/// entrypoints exist because the wire shapes differ. One round
+/// trip per call; the frontend caches the result for the
+/// lifetime of the popover so flipping tabs doesn't re-hit the
+/// network.
 #[tauri::command]
 pub async fn coder_list_models(state: State<'_, AppState>) -> Result<Vec<RouterModel>, MoonError> {
 	state.coder.list_models().await.map_err(MoonError::from)

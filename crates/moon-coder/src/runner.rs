@@ -398,10 +398,17 @@ impl CoderHandle {
 	/// untouched. `bill_to` reaches every subsequent request via
 	/// the shared handle held inside [`InferenceClient`].
 	pub async fn set_user_picks(&self, standard: String, cheap: String, bill_to: Option<String>) {
-		let mut m = self.state.models.write().await;
-		m.standard = standard;
-		m.cheap = cheap;
-		m.bill_to = bill_to;
+		{
+			let mut m = self.state.models.write().await;
+			m.standard = standard;
+			m.cheap = cheap;
+			m.bill_to = bill_to;
+		}
+		// Push the new context-window denominator to any folder
+		// whose ring is sitting on the previous model's
+		// number — without this the ring wouldn't repaint until
+		// the user sent another turn.
+		self.refresh_token_usage_windows().await;
 	}
 
 	/// Replace the user-added providers list + the active
@@ -414,6 +421,16 @@ impl CoderHandle {
 	/// is the source of truth, and a frontend trying to spoof the
 	/// flag shouldn't be able to make the inference client
 	/// believe an empty slot has a key.
+	///
+	/// Side effect: when the active provider id changes, kicks
+	/// off a best-effort background catalog fetch so
+	/// [`CoderModels::context_windows`] sees the new route's
+	/// slugs before the next turn lands. Without this the user
+	/// could flip from HF to OpenRouter, send a message
+	/// immediately, and watch the ring fall back to the
+	/// static 128k for the entire first turn (until they
+	/// happen to open the picker, which would refresh the
+	/// cache as a side-effect).
 	pub async fn set_providers(
 		&self,
 		mut providers: Vec<moon_protocol::coder_models::CoderProviderConfig>,
@@ -422,9 +439,22 @@ impl CoderHandle {
 		for p in &mut providers {
 			p.has_api_key = self.state.provider_keys.has_key(&p.id);
 		}
-		let mut m = self.state.models.write().await;
-		m.providers = providers;
-		m.active_provider = active;
+		let active_changed = {
+			let mut m = self.state.models.write().await;
+			let prev_active = m.active_provider.clone();
+			m.providers = providers;
+			m.active_provider = active.clone();
+			prev_active != active
+		};
+		// Repaint any folder ring with the new active route's
+		// context window — even if the prime below ends up
+		// fetching a fresher number, the immediate effect is
+		// that the user's previous-model ring stops misleading
+		// them. The prime + its own refresh will land later.
+		self.refresh_token_usage_windows().await;
+		if active_changed {
+			self.spawn_prime_context_windows();
+		}
 	}
 
 	/// Generate a fresh opaque provider id. The Tauri command
@@ -506,34 +536,145 @@ impl CoderHandle {
 		self.state.models.read().await.clone()
 	}
 
-	/// Catalog the picker renders.
+	/// Best-effort warm of [`CoderModels::context_windows`] for
+	/// the currently-active route. Called at startup and on every
+	/// active-provider change so the very first turn after a
+	/// relaunch / route flip already has authoritative numbers
+	/// instead of the static 128k fallback.
 	///
-	/// - HF active: forward the rich `/v1/models` shape from the
-	///   router (preserves provider/route/pricing detail).
-	/// - User provider active: returns an `Err(NoActiveFolder)`-
-	///   shaped error (`Internal(...)`) so the Tauri command can
-	///   route the picker to `coder_list_provider_models`
-	///   instead. We keep one entrypoint per shape so the
-	///   frontend never has to disambiguate the union type.
+	/// Failures (network, 401, 404 on a server that doesn't
+	/// expose `/v1/models`) are logged at `debug` and swallowed —
+	/// the fallback table still gives the runner a usable
+	/// number, and the next turn's response will carry exact
+	/// usage from the provider regardless.
 	///
-	/// Side effect: when HF is active, refreshes
-	/// [`CoderModels::context_windows`] so subsequent turns can
-	/// size the usage ring / compaction threshold against
-	/// authoritative numbers instead of the static fallback
-	/// table.
-	pub async fn list_models(&self) -> Result<Vec<moon_protocol::coder_models::RouterModel>, CoderError> {
+	/// Variant for callers that already hold a Tokio runtime
+	/// handle (`set_providers` inside an async command). The
+	/// Tauri setup hook is **not** one of them — it runs on the
+	/// outer thread before `tauri::async_runtime` has been
+	/// installed; the desktop layer uses
+	/// `tauri::async_runtime::spawn(coder.prime_context_windows())`
+	/// to launch the same work on the right reactor.
+	pub fn spawn_prime_context_windows(&self) {
+		let handle = self.clone();
+		tokio::spawn(async move {
+			handle.prime_context_windows().await;
+		});
+	}
+
+	pub async fn prime_context_windows(&self) {
 		let route = self.state.models.read().await.resolve_route();
 		match route {
-			ResolvedProvider::HuggingFace => {
-				let catalog = self.state.inference.list_hf_models().await?;
-				let windows = models::context_windows_from_catalog(&catalog);
-				self.state.models.write().await.context_windows = Arc::new(windows);
-				Ok(catalog)
+			ResolvedProvider::HuggingFace => match self.state.inference.list_hf_models().await {
+				Ok(catalog) => {
+					let windows = models::context_windows_from_catalog(&catalog);
+					{
+						let mut m = self.state.models.write().await;
+						m.context_windows = models::merge_context_windows(&m.context_windows, windows);
+					}
+					self.refresh_token_usage_windows().await;
+				}
+				Err(err) => {
+					tracing::debug!(?err, "context-window prime: HF catalog fetch failed; using fallback");
+				}
+			},
+			ResolvedProvider::Custom { id, .. } => {
+				match self.list_provider_models(&id).await {
+					Ok(_) => {
+						// `list_provider_models` already merged the fresh
+						// windows; just push the updated `context_window`
+						// out to any folder session whose ring is sitting
+						// on stale numbers from before the prime landed.
+						self.refresh_token_usage_windows().await;
+					}
+					Err(err) => {
+						tracing::debug!(
+							provider_id = %id,
+							?err,
+							"context-window prime: provider catalog fetch failed; using fallback"
+						);
+					}
+				}
 			}
-			ResolvedProvider::Custom { .. } => Err(CoderError::Internal(
-				"active provider is not Hugging Face; call coder_list_provider_models instead".into(),
-			)),
 		}
+	}
+
+	/// Re-emit a [`CoderEvent::TokenUsage`] for every folder
+	/// session that already has a `last_usage`, using the
+	/// **current** active model's context window. The token
+	/// counts (prompt / completion / total / cache) are
+	/// preserved — only the `context_window` denominator changes.
+	///
+	/// Called after every catalog refresh and after model-picks
+	/// changes so:
+	///
+	/// - The ring repaints to the right capacity the moment the
+	///   user flips models or the picker fetch lands; they don't
+	///   have to send another turn just to see the correct
+	///   denominator.
+	/// - Sessions restored before the cache was warm (cold first
+	///   launch, prime still in flight) get their ring corrected
+	///   when the prime finishes, instead of stranding them on
+	///   the static 128k fallback until the next turn.
+	///
+	/// No-op for folder sessions without a `last_usage` — those
+	/// haven't had a turn yet, so the ring on the panel is empty
+	/// and there's nothing to update. Best-effort: a session
+	/// dropping its lock between the snapshot read and the emit
+	/// is fine, the next turn refreshes anyway.
+	async fn refresh_token_usage_windows(&self) {
+		let models = self.state.models.read().await.clone();
+		let active_model = models.standard().to_owned();
+		let context_window = models.context_window(&active_model);
+		let folders: Vec<(Utf8PathBuf, Arc<FolderSession>)> = {
+			let by = self.state.sessions_by_folder.read().await;
+			by.iter().map(|(p, fs)| (p.clone(), fs.clone())).collect()
+		};
+		for (folder_path, fs) in folders {
+			let usage = match fs.session.lock().await.last_usage {
+				Some(u) => u,
+				None => continue,
+			};
+			let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string());
+			sink.send(CoderEvent::TokenUsage {
+				prompt_tokens: usage.prompt_tokens,
+				completion_tokens: usage.completion_tokens,
+				total_tokens: usage.total_tokens,
+				context_window,
+				source: TokenUsageSource::Provider,
+				cache_read_tokens: usage.cache_read_input_tokens,
+				cache_creation_tokens: usage.cache_creation_input_tokens,
+			});
+		}
+	}
+
+	/// HF router `/v1/models` catalog. Returns the rich shape
+	/// (per-provider routes + pricing + throughput) the picker's
+	/// HF tab renders.
+	///
+	/// **Not gated on the active route.** The picker shows both
+	/// the HF tab and the user-provider tabs side by side and
+	/// the user is allowed to flip between them while editing
+	/// the modal — gating here would 500 the HF tab any time
+	/// OpenRouter / a local vLLM was the persisted active route,
+	/// even though the request itself is just "give me the HF
+	/// catalog". User-provider catalogs go through
+	/// [`Self::list_provider_models`] (id-keyed); the two
+	/// entrypoints exist because the wire shapes differ, not
+	/// because the active route picks one.
+	///
+	/// Side effect: refreshes [`CoderModels::context_windows`]
+	/// with the HF entries (merge, not replace) so subsequent
+	/// turns size the usage ring / compaction threshold against
+	/// authoritative numbers instead of the static fallback
+	/// table — useful even when HF isn't currently active, since
+	/// the user might flip back.
+	pub async fn list_models(&self) -> Result<Vec<moon_protocol::coder_models::RouterModel>, CoderError> {
+		let catalog = self.state.inference.list_hf_models().await?;
+		let windows = models::context_windows_from_catalog(&catalog);
+		let mut m = self.state.models.write().await;
+		m.context_windows = models::merge_context_windows(&m.context_windows, windows);
+		Ok(catalog)
 	}
 
 	/// Flat catalog for a user-added provider. `id` matches one
@@ -543,6 +684,14 @@ impl CoderHandle {
 	/// verbatim — a 404 means the server doesn't expose the
 	/// catalog endpoint and the user can still type a model slug
 	/// directly into the picker field.
+	///
+	/// Side effect: merges the catalog's per-model
+	/// `context_length` into [`CoderModels::context_windows`] so
+	/// the very next turn's usage ring + auto-compaction trigger
+	/// see the authoritative window for whichever slug the user
+	/// just picked. Without this every OpenRouter / LiteLLM /
+	/// vLLM model would land in the static-fallback `128k`
+	/// branch — wrong for 200k Claude, wrong for 1M GPT-4.1, etc.
 	pub async fn list_provider_models(
 		&self,
 		provider_id: &str,
@@ -556,11 +705,17 @@ impl CoderHandle {
 		let base_url = entry.base_url.clone();
 		drop(snapshot);
 		let api_key = self.state.provider_keys.get(provider_id);
-		self
+		let catalog = self
 			.state
 			.inference
 			.list_provider_models(&base_url, api_key.as_deref())
-			.await
+			.await?;
+		let windows = models::context_windows_from_provider_catalog(&catalog);
+		if !windows.is_empty() {
+			let mut m = self.state.models.write().await;
+			m.context_windows = models::merge_context_windows(&m.context_windows, windows);
+		}
+		Ok(catalog)
 	}
 
 	pub async fn status(&self) -> Result<CoderStatus, CoderError> {

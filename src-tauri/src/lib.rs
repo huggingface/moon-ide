@@ -371,6 +371,19 @@ pub fn run() {
 			)
 			.map_err(|err| format!("could not init moon-coder: {err}"))?;
 			commands::coder::spawn_event_pump(app.handle().clone(), coder.clone());
+			// Best-effort prime of the per-model context-window cache for
+			// the active route, so the first turn after relaunch sizes
+			// the usage ring + auto-compaction trigger off authoritative
+			// numbers instead of the static 128k fallback. Background
+			// task on Tauri's runtime — `tokio::spawn` doesn't work here
+			// because the setup hook isn't on a Tokio reactor yet; the
+			// runner's own `spawn_prime_context_windows` is reserved for
+			// callers that already are. Failures are logged and swallowed
+			// inside `prime_context_windows`.
+			let coder_for_prime = coder.clone();
+			tauri::async_runtime::spawn(async move {
+				coder_for_prime.prime_context_windows().await;
+			});
 
 			let logs = moon_core::LogSink::new();
 			commands::logs::spawn_event_pump(app.handle().clone(), logs.clone());

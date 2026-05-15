@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use moon_protocol::coder_models::{CoderProviderConfig, RouterModel};
+use moon_protocol::coder_models::{CoderProviderConfig, ProviderModelSummary, RouterModel};
 use tokio::sync::RwLock;
 
 use crate::defaults::{context_window_for, DEFAULT_CHEAP_MODEL, DEFAULT_STANDARD_MODEL};
@@ -71,11 +71,21 @@ pub struct CoderModels {
 	/// in [`providers`](Self::providers) — handles the "user
 	/// deleted the entry out of band" race.
 	pub active_provider: Option<String>,
-	/// Model-id → context-length cache distilled from the router's
-	/// `/v1/models` response. Populated as a side-effect of
-	/// [`crate::runner::CoderHandle::list_models`] (which the picker
-	/// hits on open), read by [`Self::context_window`] on every
-	/// LLM round-trip to size the usage ring and arm auto-compaction.
+	/// Model-id → context-length cache distilled from every
+	/// `/v1/models` catalog the picker has fetched in this
+	/// process. Populated as a side-effect of
+	/// [`crate::runner::CoderHandle::list_models`] (HF) and
+	/// [`crate::runner::CoderHandle::list_provider_models`] (user
+	/// providers), and primed in the background by
+	/// [`crate::runner::CoderHandle::prime_context_windows`] on
+	/// startup / active-provider change so the very first turn
+	/// after a relaunch already has authoritative numbers.
+	/// Read by [`Self::context_window`] on every LLM round-trip
+	/// to size the usage ring and arm auto-compaction.
+	///
+	/// Catalogs from different routes are **merged** rather than
+	/// replaced — a fetch from OpenRouter mustn't blow away the
+	/// HF entries the user might still flip back to.
 	///
 	/// Value is the **max** over `providers[].context_length` for
 	/// the model — most providers serve the same window, but a few
@@ -253,6 +263,37 @@ pub fn context_windows_from_catalog(catalog: &[RouterModel]) -> HashMap<String, 
 	out
 }
 
+/// Same as [`context_windows_from_catalog`] but for a flat user-
+/// provider catalog (OpenRouter, LiteLLM, raw vLLM, …). The
+/// runner side merges this into [`CoderModels::context_windows`]
+/// alongside the HF entries — that way flipping the active
+/// provider in the picker doesn't blow the cache away.
+pub fn context_windows_from_provider_catalog(catalog: &[ProviderModelSummary]) -> HashMap<String, u32> {
+	let mut out = HashMap::new();
+	for m in catalog {
+		if let Some(w) = m.context_length {
+			out.insert(m.id.clone(), w);
+		}
+	}
+	out
+}
+
+/// Merge `incoming` slug→window pairs into `base`, returning a
+/// fresh `Arc<HashMap>`. New keys win on collision; pre-existing
+/// keys not present in `incoming` are preserved. Used by every
+/// catalog-fetch site so a route flip in the picker doesn't
+/// erase the previous route's windows.
+pub fn merge_context_windows(base: &HashMap<String, u32>, incoming: HashMap<String, u32>) -> Arc<HashMap<String, u32>> {
+	if base.is_empty() {
+		return Arc::new(incoming);
+	}
+	let mut merged = base.clone();
+	for (k, v) in incoming {
+		merged.insert(k, v);
+	}
+	Arc::new(merged)
+}
+
 /// Process-wide shared handle. Constructed once at coder startup,
 /// updated by the Tauri layer's `coder_set_models` command, read by
 /// the runner at every chat-completions call site (snapshot-clone,
@@ -261,4 +302,61 @@ pub type SharedCoderModels = Arc<RwLock<CoderModels>>;
 
 pub fn shared(models: CoderModels) -> SharedCoderModels {
 	Arc::new(RwLock::new(models))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use moon_protocol::coder_models::ProviderModelSummary;
+
+	fn provider_summary(id: &str, ctx: Option<u32>) -> ProviderModelSummary {
+		ProviderModelSummary {
+			id: id.to_owned(),
+			owned_by: None,
+			name: None,
+			context_length: ctx,
+			pricing_in_per_million: None,
+			pricing_out_per_million: None,
+			description: None,
+		}
+	}
+
+	#[test]
+	fn provider_catalog_skips_models_without_context_length() {
+		let catalog = vec![
+			provider_summary("anthropic/claude-opus-4", Some(1_000_000)),
+			provider_summary("openai/gpt-4o-mini", None),
+		];
+		let map = context_windows_from_provider_catalog(&catalog);
+		assert_eq!(map.get("anthropic/claude-opus-4"), Some(&1_000_000));
+		assert!(!map.contains_key("openai/gpt-4o-mini"));
+	}
+
+	#[test]
+	fn merge_preserves_old_entries_and_overwrites_collisions() {
+		let mut base = HashMap::new();
+		base.insert("Qwen/Qwen3.5-397B-A17B".to_owned(), 256_000u32);
+		base.insert("anthropic/claude-opus-4".to_owned(), 200_000u32);
+		let mut incoming = HashMap::new();
+		incoming.insert("anthropic/claude-opus-4".to_owned(), 1_000_000u32);
+		incoming.insert("openai/gpt-4.1".to_owned(), 1_000_000u32);
+
+		let merged = merge_context_windows(&base, incoming);
+
+		assert_eq!(merged.get("Qwen/Qwen3.5-397B-A17B"), Some(&256_000));
+		assert_eq!(merged.get("anthropic/claude-opus-4"), Some(&1_000_000));
+		assert_eq!(merged.get("openai/gpt-4.1"), Some(&1_000_000));
+	}
+
+	#[test]
+	fn context_window_lookup_consults_cache_then_strips_provider_suffix_then_static_table() {
+		let mut models = CoderModels::default();
+		let mut cache = HashMap::new();
+		cache.insert("anthropic/claude-opus-4".to_owned(), 1_000_000u32);
+		models.context_windows = Arc::new(cache);
+
+		assert_eq!(models.context_window("anthropic/claude-opus-4"), 1_000_000);
+		assert_eq!(models.context_window("anthropic/claude-opus-4:fastest"), 1_000_000);
+		assert_eq!(models.context_window("Qwen/Qwen3.5-397B-A17B"), 256_000);
+	}
 }
