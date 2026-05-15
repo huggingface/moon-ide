@@ -666,6 +666,23 @@ impl LspServer {
 					dynamic_registration: Some(false),
 					related_document_support: Some(false),
 				}),
+				// `textDocument/rename`. `prepare_support: true`
+				// tells servers we'll call
+				// `textDocument/prepareRename` first so they can
+				// gate the rename surface on a real identifier
+				// (vs. the frontend's `wordAt` falling back to
+				// renaming punctuation tokens). Servers without
+				// rename support (clangd's `--background-index=0`,
+				// some bespoke language servers) silently ignore
+				// the flag and return `null` for both requests —
+				// the frontend treats that as "not renameable",
+				// no toast.
+				rename: Some(lt::RenameClientCapabilities {
+					dynamic_registration: Some(false),
+					prepare_support: Some(true),
+					prepare_support_default_behavior: None,
+					honors_change_annotations: Some(false),
+				}),
 				..Default::default()
 			}),
 			..Default::default()
@@ -1069,6 +1086,57 @@ impl LspServer {
 		// containerised project would be mis-classified as
 		// "external" and surface as a toast.
 		Ok(resp.and_then(|r| translate::definition_response(r, self.translator.server_root().as_std_path())))
+	}
+
+	/// Send `textDocument/prepareRename`. Returns `None` when the
+	/// server says the cursor isn't on a renameable symbol — the
+	/// UI treats that as a quiet "no rename here", no toast.
+	/// `fallback_word` is the identifier the frontend identified
+	/// under the cursor; we hand it back as the input placeholder
+	/// when the server returned a bare range (the common shape).
+	pub async fn prepare_rename(
+		&self,
+		rel_path: &str,
+		position: mp::LspPosition,
+		fallback_word: &str,
+	) -> Result<Option<mp::LspPrepareRename>, LspClientError> {
+		let uri = self.relative_to_uri(rel_path);
+		let params = lt::TextDocumentPositionParams {
+			text_document: lt::TextDocumentIdentifier { uri },
+			position: translate::to_lsp_position(position),
+		};
+		let resp: Option<lt::PrepareRenameResponse> = self.client.request("textDocument/prepareRename", params).await?;
+		Ok(resp.and_then(|r| translate::prepare_rename_response(r, fallback_word)))
+	}
+
+	/// Send `textDocument/rename`. Returns an empty
+	/// [`mp::LspWorkspaceEdit`] when the server has nothing to
+	/// change (cursor wasn't on a real symbol, server doesn't
+	/// support rename) — the frontend treats zero edits the same
+	/// as a `None` from `prepare_rename`.
+	pub async fn rename(
+		&self,
+		rel_path: &str,
+		position: mp::LspPosition,
+		new_name: &str,
+	) -> Result<mp::LspWorkspaceEdit, LspClientError> {
+		let uri = self.relative_to_uri(rel_path);
+		let params = lt::RenameParams {
+			text_document_position: lt::TextDocumentPositionParams {
+				text_document: lt::TextDocumentIdentifier { uri },
+				position: translate::to_lsp_position(position),
+			},
+			new_name: new_name.to_owned(),
+			work_done_progress_params: lt::WorkDoneProgressParams::default(),
+		};
+		let resp: Option<lt::WorkspaceEdit> = self.client.request("textDocument/rename", params).await?;
+		// Same `server_root` reasoning as `definition`: container
+		// servers emit URIs under their mount root, so we strip
+		// against the translator's server view, not the host root.
+		Ok(match resp {
+			Some(edit) => translate::workspace_edit(edit, self.translator.server_root().as_std_path()),
+			None => mp::LspWorkspaceEdit::default(),
+		})
 	}
 
 	pub async fn completion(

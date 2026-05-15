@@ -20,6 +20,7 @@
 	import { frontendLog } from '../logs.svelte';
 	import { lspGotoDefinitionExtension } from '../editor/lspGotoDefinition';
 	import { lspOverviewExtension } from '../editor/lspOverview';
+	import { lspRenameExtension } from '../editor/lspRename';
 	import { blameExtension, blameFacet } from '../editor/blame';
 	import { gitChangesExtension, headTextFacet } from '../editor/gitChanges';
 	import { workspace, type OpenFile, type SplitSide } from '../state.svelte';
@@ -453,6 +454,9 @@
 				},
 				flash: (msg) => workspace.flash(msg),
 			}),
+			// F2 LSP rename. The extension owns its own keymap +
+			// docked panel; the editor just plugs it in.
+			lspRenameExtension(),
 			lspPathCompartment.of(filePathFacet.of(file.path)),
 			// Git blame annotation for the caret's current line.
 			// The compartment reconfigures to feed new blame data

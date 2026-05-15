@@ -520,6 +520,39 @@ impl LspBroker {
 		server.definition(path, position).await
 	}
 
+	pub async fn prepare_rename(
+		&self,
+		path: &str,
+		language_id: &str,
+		position: mp::LspPosition,
+		fallback_word: &str,
+	) -> Result<Option<mp::LspPrepareRename>, LspClientError> {
+		let Some(spec) = Self::spec_for(language_id) else {
+			return Ok(None);
+		};
+		let Some(server) = self.ensure_server(spec).await? else {
+			return Ok(None);
+		};
+		server.prepare_rename(path, position, fallback_word).await
+	}
+
+	pub async fn rename(
+		&self,
+		path: &str,
+		language_id: &str,
+		position: mp::LspPosition,
+		new_name: &str,
+	) -> Result<mp::LspWorkspaceEdit, LspClientError> {
+		let empty = mp::LspWorkspaceEdit::default();
+		let Some(spec) = Self::spec_for(language_id) else {
+			return Ok(empty);
+		};
+		let Some(server) = self.ensure_server(spec).await? else {
+			return Ok(empty);
+		};
+		server.rename(path, position, new_name).await
+	}
+
 	pub async fn completion(
 		&self,
 		path: &str,

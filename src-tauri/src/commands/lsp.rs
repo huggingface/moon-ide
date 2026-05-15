@@ -20,7 +20,7 @@ use moon_container::{Workspace as ContainerWorkspace, WorkspaceConfig};
 use moon_core::lsp::server::PathTranslator;
 use moon_core::lsp::{LspBroker, LspServerEvent, LspSpawner};
 use moon_protocol::container::ContainerState;
-use moon_protocol::lsp::{LspCompletionList, LspHover, LspLocation, LspPosition};
+use moon_protocol::lsp::{LspCompletionList, LspHover, LspLocation, LspPosition, LspPrepareRename, LspWorkspaceEdit};
 use moon_protocol::MoonError;
 use moon_terminal::{container_name_for_workspace, TerminalTarget};
 use tauri::{AppHandle, Emitter, State};
@@ -226,6 +226,50 @@ pub async fn lsp_definition(
 	let broker = ensure_broker(&state, &app).await?;
 	broker
 		.definition(&path, &language_id, position)
+		.await
+		.map_err(|e| MoonError::internal(e.to_string()))
+}
+
+/// `textDocument/prepareRename` — server-side rename gate. `Ok(None)`
+/// = "cursor not on a renameable symbol"; the F2 flow surfaces a
+/// quiet flash instead of an error. `fallback_word` is the
+/// frontend's `wordAt(cursor)` reading; used as the input's
+/// placeholder when the server returned a bare range with no
+/// placeholder (the common shape — see
+/// `translate::prepare_rename_response`).
+#[tauri::command]
+pub async fn lsp_prepare_rename(
+	state: State<'_, AppState>,
+	app: AppHandle,
+	path: String,
+	language_id: String,
+	position: LspPosition,
+	fallback_word: String,
+) -> Result<Option<LspPrepareRename>, MoonError> {
+	let broker = ensure_broker(&state, &app).await?;
+	broker
+		.prepare_rename(&path, &language_id, position, &fallback_word)
+		.await
+		.map_err(|e| MoonError::internal(e.to_string()))
+}
+
+/// `textDocument/rename` — server-side identifier rewrite plan.
+/// Returns an empty [`LspWorkspaceEdit`] when the server has
+/// nothing to change (cursor wasn't on a real symbol, server
+/// doesn't implement rename); the F2 flow treats that the same
+/// as a `None` from `lsp_prepare_rename`.
+#[tauri::command]
+pub async fn lsp_rename(
+	state: State<'_, AppState>,
+	app: AppHandle,
+	path: String,
+	language_id: String,
+	position: LspPosition,
+	new_name: String,
+) -> Result<LspWorkspaceEdit, MoonError> {
+	let broker = ensure_broker(&state, &app).await?;
+	broker
+		.rename(&path, &language_id, position, &new_name)
 		.await
 		.map_err(|e| MoonError::internal(e.to_string()))
 }

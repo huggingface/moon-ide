@@ -205,6 +205,68 @@ pub enum LspServerStatus {
 	Stopped,
 }
 
+/// One edit inside a single document. Range is the existing text
+/// to replace; `new_text` is what to put in its place. Empty
+/// `new_text` is a deletion. LSP guarantees edits inside a single
+/// document's edit list never overlap, so a frontend applier can
+/// sort by start position and run them right-to-left without
+/// shifting offsets.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct LspTextEdit {
+	pub range: LspRange,
+	pub new_text: String,
+}
+
+/// All edits the server wants applied to a single document. `path`
+/// is the same workspace-relative form the rest of the LSP surface
+/// uses; edits that target files outside the active folder are
+/// dropped at the translation boundary (we don't support cross-
+/// workspace rename today).
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct LspDocumentEdit {
+	pub path: String,
+	pub edits: Vec<LspTextEdit>,
+}
+
+/// Result of a `textDocument/rename` — the server's plan for
+/// every file that needs to change. The frontend applies open-
+/// buffer edits in memory (marking the file dirty) and writes
+/// closed-file edits to disk through the workspace host, then
+/// fires `workspace/didChangeWatchedFiles` so the server can
+/// resync.
+///
+/// `document_edits` is the only field — we deliberately skip the
+/// `create / rename / delete` resource operations that LSP's
+/// `WorkspaceEdit` can also carry. A pure-identifier rename
+/// doesn't need them, and supporting file-system mutations
+/// triggered by an LSP without a confirmation surface is a
+/// trap.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct LspWorkspaceEdit {
+	pub document_edits: Vec<LspDocumentEdit>,
+}
+
+/// Result of `textDocument/prepareRename`. `Some(...)` means the
+/// server has confirmed the cursor sits on a renameable symbol
+/// and hands back the existing identifier's range (so the
+/// frontend can position its inline input) plus a placeholder
+/// (typically the existing name; some servers strip a `$`
+/// sigil or similar). `None` means "no rename here" — the
+/// frontend flashes a quiet message.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct LspPrepareRename {
+	pub range: LspRange,
+	pub placeholder: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 #[serde(rename_all = "camelCase")]

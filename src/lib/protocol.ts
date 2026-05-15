@@ -455,6 +455,47 @@ export type LspLocation = {
 };
 
 /**
+ * One edit inside a single document. Mirrors
+ * `moon_protocol::lsp::LspTextEdit`. Edits inside one
+ * `LspDocumentEdit` never overlap, so a frontend applier can sort
+ * by start position and run them right-to-left.
+ */
+export type LspTextEdit = {
+	range: LspRange;
+	newText: string;
+};
+
+/**
+ * All edits the server wants applied to one document. `path` is
+ * workspace-relative. Mirrors `moon_protocol::lsp::LspDocumentEdit`.
+ */
+export type LspDocumentEdit = {
+	path: string;
+	edits: LspTextEdit[];
+};
+
+/**
+ * Result of a `textDocument/rename`. The frontend applies edits
+ * to open buffers in memory (marking them dirty) and writes
+ * closed-file edits to disk through the workspace host, then
+ * fires `workspace/didChangeWatchedFiles` so the server can
+ * resync. Mirrors `moon_protocol::lsp::LspWorkspaceEdit`.
+ */
+export type LspWorkspaceEdit = {
+	documentEdits: LspDocumentEdit[];
+};
+
+/**
+ * Result of `textDocument/prepareRename` — `null` from the IPC
+ * means "cursor not on a renameable symbol". Mirrors
+ * `moon_protocol::lsp::LspPrepareRename`.
+ */
+export type LspPrepareRename = {
+	range: LspRange;
+	placeholder: string;
+};
+
+/**
  * Kind of a completion item. Mirrors LSP's list 1:1; the frontend
  * uses it for iconography. Extending this set requires adding to
  * `moon_protocol::lsp::LspCompletionKind` and the `translate` match.

@@ -223,6 +223,105 @@ fn resolve_uri(uri: &lt::Uri, root: &Path) -> (String, String) {
 	}
 }
 
+/// Translate a `textDocument/prepareRename` response. Returns
+/// `None` for the "not renameable" / "default behaviour" cases —
+/// the UI treats both identically (no rename surface).
+///
+/// `fallback_word` is the word under the cursor as the frontend
+/// would compute it; used as the placeholder when the server
+/// returned a bare range with no placeholder (the common shape:
+/// servers say "yes, rename this span" without echoing the
+/// existing identifier).
+pub fn prepare_rename_response(resp: lt::PrepareRenameResponse, fallback_word: &str) -> Option<mp::LspPrepareRename> {
+	match resp {
+		lt::PrepareRenameResponse::Range(r) => Some(mp::LspPrepareRename {
+			range: range(r),
+			placeholder: fallback_word.to_owned(),
+		}),
+		lt::PrepareRenameResponse::RangeWithPlaceholder { range: r, placeholder } => Some(mp::LspPrepareRename {
+			range: range(r),
+			placeholder,
+		}),
+		// `DefaultBehavior { default_behavior: true }` means
+		// "use the client's own word-at-position logic". We
+		// have that on the frontend (CM's `wordAt`) — but
+		// surfacing that as "no prepare data" lets the caller
+		// fall back to the trigger position without us having
+		// to invent a synthetic range here.
+		lt::PrepareRenameResponse::DefaultBehavior { default_behavior } if default_behavior => Some(mp::LspPrepareRename {
+			range: mp::LspRange {
+				start: mp::LspPosition { line: 0, character: 0 },
+				end: mp::LspPosition { line: 0, character: 0 },
+			},
+			placeholder: fallback_word.to_owned(),
+		}),
+		lt::PrepareRenameResponse::DefaultBehavior { .. } => None,
+	}
+}
+
+/// Flatten an LSP `WorkspaceEdit` into the protocol shape the
+/// frontend applies. Drops any entries whose target URI isn't a
+/// `file://` URI under `root` — the UI can't (yet) reach files
+/// outside the active folder, and surfacing partial cross-folder
+/// edits would silently lose user intent. Cross-folder rename
+/// support lands when we grow the multi-bound-folder edit path.
+///
+/// Both wire shapes are flattened: the legacy `changes` map and
+/// the newer `document_changes` array (we ignore `RenameFile` /
+/// `CreateFile` / `DeleteFile` resource ops — see the
+/// `LspWorkspaceEdit` docs).
+pub fn workspace_edit(edit: lt::WorkspaceEdit, root: &Path) -> mp::LspWorkspaceEdit {
+	let mut document_edits: Vec<mp::LspDocumentEdit> = Vec::new();
+	if let Some(changes) = edit.changes {
+		for (uri, edits) in changes {
+			let (path, _ext) = resolve_uri(&uri, root);
+			if path.is_empty() {
+				continue;
+			}
+			document_edits.push(mp::LspDocumentEdit {
+				path,
+				edits: edits.into_iter().map(text_edit).collect(),
+			});
+		}
+	}
+	if let Some(doc_changes) = edit.document_changes {
+		match doc_changes {
+			lt::DocumentChanges::Edits(edits) => {
+				for doc in edits {
+					let (path, _ext) = resolve_uri(&doc.text_document.uri, root);
+					if path.is_empty() {
+						continue;
+					}
+					let edits: Vec<mp::LspTextEdit> = doc
+						.edits
+						.into_iter()
+						.map(|e| match e {
+							lt::OneOf::Left(te) => text_edit(te),
+							lt::OneOf::Right(ann) => text_edit(ann.text_edit),
+						})
+						.collect();
+					document_edits.push(mp::LspDocumentEdit { path, edits });
+				}
+			}
+			lt::DocumentChanges::Operations(_) => {
+				// File-creation / -rename / -deletion ops fall
+				// outside the safe surface for an LSP rename —
+				// see `LspWorkspaceEdit`. Servers asking for
+				// them get the identifier edits applied; the
+				// resource ops are silently dropped.
+			}
+		}
+	}
+	mp::LspWorkspaceEdit { document_edits }
+}
+
+fn text_edit(e: lt::TextEdit) -> mp::LspTextEdit {
+	mp::LspTextEdit {
+		range: range(e.range),
+		new_text: e.new_text,
+	}
+}
+
 pub fn completion_response(resp: lt::CompletionResponse) -> mp::LspCompletionList {
 	match resp {
 		lt::CompletionResponse::Array(items) => mp::LspCompletionList {

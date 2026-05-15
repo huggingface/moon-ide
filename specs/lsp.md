@@ -1,10 +1,10 @@
 # LSP
 
-Status: partial — TypeScript, Rust, Python, and Go all have diagnostics + hover + completion + goto-definition + nav history wired via the stage-1/stage-2 slices of Phase 4. All four additionally route **inside the workspace container** when one is up and the binary is reachable there (see [Container-backed LSP](#container-backed-lsp)); the broker falls back to host LSP per-language when it isn't. Every other language (Svelte, CSS, HTML, JSON) is architecturally in scope and not yet wired.
+Status: partial — TypeScript, Rust, Python, and Go all have diagnostics + hover + completion + goto-definition + F2 rename + nav history wired via the stage-1/stage-2 slices of Phase 4. All four additionally route **inside the workspace container** when one is up and the binary is reachable there (see [Container-backed LSP](#container-backed-lsp)); the broker falls back to host LSP per-language when it isn't. Every other language (Svelte, CSS, HTML, JSON) is architecturally in scope and not yet wired.
 
 ## The non-negotiable invariant
 
-LSP lives in `moon-core`. Nothing in the UI speaks LSP JSON-RPC directly. The frontend sees **moon-shaped** types (`LspDiagnostic`, `LspHover`, `LspCompletionList`, `LspLocation`, `LspStatusEvent` — see `crates/moon-protocol/src/lsp.rs`) and Tauri commands (`lsp_open` / `lsp_update` / `lsp_close` / `lsp_hover` / `lsp_completion` / `lsp_definition`) that forward to the broker.
+LSP lives in `moon-core`. Nothing in the UI speaks LSP JSON-RPC directly. The frontend sees **moon-shaped** types (`LspDiagnostic`, `LspHover`, `LspCompletionList`, `LspLocation`, `LspPrepareRename`, `LspWorkspaceEdit`, `LspStatusEvent` — see `crates/moon-protocol/src/lsp.rs`) and Tauri commands (`lsp_open` / `lsp_update` / `lsp_close` / `lsp_hover` / `lsp_completion` / `lsp_definition` / `lsp_prepare_rename` / `lsp_rename`) that forward to the broker.
 
 This mirrors the Phase 5 git layer's discipline: one translation wall between upstream protocol types and the UI, one place to fix things when either side moves.
 
@@ -215,6 +215,17 @@ The "hold modifier, mouse over identifier, see underline, click to jump" UX (fro
 
 Server-side capability advertisement is `definition: { linkSupport: true }`; we take `LocationLink`'s `targetSelectionRange` (the identifier) over `targetRange` (the whole body) so the caret lands on the name, not inside a function body.
 
+### F2 rename
+
+The "park caret on an identifier, hit F2, type new name, every reference rewrites" UX is wired through `src/lib/editor/lspRename.ts` (CM extension) and the matching `prepare_rename` / `rename` server methods in `crates/moon-core/src/lsp/server.rs`.
+
+- **Trigger.** F2 keymap entry reads `wordAt(caret)`, falls back to the bare text under the cursor, and fires `textDocument/prepareRename`. Servers that decline (cursor on punctuation, keyword, string body) get a quiet flash; we don't open the panel.
+- **Panel.** A docked CM `showPanel` row at the top of the editor with a prefilled input + Rename / Cancel buttons. Enter fires `textDocument/rename`; Escape (or the Cancel button) dismisses. Any edit to the underlying buffer behind the panel also dismisses — the user typing in the document is the signal they've moved on.
+- **Applier.** `LspWorkspaceEdit.documentEdits` is split into open buffers (routed through `workspace.updateText` so the file goes dirty and the CM `$effect` syncs the in-memory text into the view) and closed files (read → apply → write through the active folder's `WorkspaceHost`, then `lsp_notify_files_changed` so every server can invalidate caches and re-publish diagnostics). Open buffers' `didChange` carries their updates directly, so we don't double-notify them.
+- **No auto-save.** Edited open buffers stay dirty; the user reviews them in the tab strip / SCM panel and commits with Ctrl+S. Matches VS Code's behaviour and gives a clear "review then save" path. Closed files write through the workspace host's `save_file`, which runs the normal format-on-save pipeline — same bytes the user would land on if they manually opened and saved.
+- **Wire shape.** Server capability advertisement is `rename: { prepareSupport: true, ..., honorsChangeAnnotations: false }`. The runner-side translator drops `WorkspaceEdit.documentChanges` resource ops (`CreateFile` / `RenameFile` / `DeleteFile`) — a pure-identifier rename never asks for them, and applying file-system mutations without a confirmation surface is a trap.
+- **Out of scope today.** Cross-folder rename (touching files in sibling bound folders). The LSP is rooted at the active folder, so its rename plan is folder-scoped by construction; the translator drops any URI outside that root with no surface — surfaces when we grow the multi-bound-folder LSP path.
+
 ### Navigation history (Alt+Left / Alt+Right)
 
 Position-aware, browser-style history lives on `WorkspaceState`. Each entry carries enough to re-establish both the active buffer and the caret inside it — VS Code-style — and the entries are folder-tagged so a multi-folder workspace can walk back through files in folder B while folder A is active.
@@ -262,11 +273,12 @@ Two Tauri events, both keyed by language-agnostic payloads so the UI doesn't nee
   - `lspHoverExtension()` — CM `hoverTooltip` delegating to `ipc.lsp.hover`. Rendered inside `.cm-lsp-hover` which the editor chrome theme styles.
   - `lspCompletionSource` — CM `CompletionSource` registered as an `override` on the editor's `autocompletion` extension. Never auto-opens; Ctrl-Space or a panel re-query triggers it.
 - **`src/lib/editor/lspGotoDefinition.ts`** — Ctrl/Cmd-hover link preview + Ctrl/Cmd-click jump. Takes a `{ jumpTo, flash }` callback bag so it doesn't import `state.svelte.ts`. `Editor.svelte` wires the real workspace methods through.
+- **`src/lib/editor/lspRename.ts`** — F2 rename. Owns its own state field, keymap, panel, and applier; talks to `workspace` directly for the open-buffer / `flash` surface (the panel is editor-local, so callback-bagging would be over-engineered here).
 - **`src/lib/editor/lspLanguage.ts`** — path → LSP language-id mapping. Also the feature-flag: returning `null` means "no LSP here", so adding Rust is literally one entry plus a wire-in on the backend.
 
 ## Non-goals of stage 1
 
-- ~~Go-to-definition~~ — shipped in stage 2 (this section). Find-references, rename, code actions — stage 4+.
+- ~~Go-to-definition~~ — shipped in stage 2 (this section). ~~Rename~~ — shipped (see [F2 rename](#f2-rename)). Find-references, code actions — stage 4+.
 - Workspace symbols. Requires a separate UI surface (palette split).
 - Signature help, selection range, semantic tokens — nice, not needed.
 - Snippets in completion — `snippet_support: false` in client capabilities. Turning it on requires a snippet-renderer extension on the frontend.

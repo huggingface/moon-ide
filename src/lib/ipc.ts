@@ -34,6 +34,8 @@ import type {
 	LspHover,
 	LspLocation,
 	LspPosition,
+	LspPrepareRename,
+	LspWorkspaceEdit,
 	ProjectComposeStatus,
 	ReadFileResult,
 	RightPanelKind,
@@ -227,6 +229,10 @@ export const ipc = {
 			invoke<LspCompletionList>('lsp_completion', { path, languageId, position }),
 		definition: (path: string, languageId: string, position: LspPosition) =>
 			invoke<LspLocation | null>('lsp_definition', { path, languageId, position }),
+		prepareRename: (path: string, languageId: string, position: LspPosition, fallbackWord: string) =>
+			invoke<LspPrepareRename | null>('lsp_prepare_rename', { path, languageId, position, fallbackWord }),
+		rename: (path: string, languageId: string, position: LspPosition, newName: string) =>
+			invoke<LspWorkspaceEdit>('lsp_rename', { path, languageId, position, newName }),
 		// Tear down the server slot for `languageId`. The next
 		// `open` / `update` / `hover` / `completion` lazily
 		// re-spawns it; the diag-logs panel exposes a "Restart"

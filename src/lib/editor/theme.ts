@@ -125,6 +125,53 @@ function moonTheme(dark: boolean): Extension {
 				textUnderlineOffset: '2px',
 				cursor: 'pointer',
 			},
+			// F2 rename panel — docked at the top of the editor.
+			// Shares the panel chrome (border, bg, padding) with
+			// the search panel below, then adds row layout for
+			// the label / input / buttons trio.
+			'.cm-lsp-rename': {
+				display: 'flex',
+				alignItems: 'center',
+				gap: '8px',
+				padding: '6px 8px',
+				fontSize: '12px',
+			},
+			'.cm-lsp-rename-label': {
+				color: 'var(--m-fg-muted)',
+				whiteSpace: 'nowrap',
+			},
+			'.cm-lsp-rename-input': {
+				flex: '1 1 auto',
+				minWidth: '120px',
+				maxWidth: '320px',
+				backgroundColor: 'var(--m-bg-2)',
+				color: 'var(--m-fg)',
+				border: '1px solid var(--m-border)',
+				borderRadius: '3px',
+				padding: '2px 6px',
+				fontFamily: 'var(--m-font-mono)',
+			},
+			'.cm-lsp-rename-input:focus': {
+				outline: '1px solid var(--m-accent)',
+				outlineOffset: '0',
+				borderColor: 'var(--m-accent)',
+			},
+			'.cm-lsp-rename-apply, .cm-lsp-rename-cancel': {
+				backgroundColor: 'transparent',
+				color: 'var(--m-fg)',
+				border: '1px solid var(--m-border)',
+				borderRadius: '3px',
+				padding: '2px 8px',
+				cursor: 'pointer',
+			},
+			'.cm-lsp-rename-apply:hover, .cm-lsp-rename-cancel:hover': {
+				backgroundColor: 'var(--m-bg-overlay)',
+				borderColor: 'var(--m-border-strong)',
+			},
+			'.cm-lsp-rename-apply:disabled, .cm-lsp-rename-cancel:disabled': {
+				opacity: '0.5',
+				cursor: 'default',
+			},
 			// Search panel (Ctrl+F) and goto-line panel. CM6 ships its
 			// own light-grey defaults that look out of place in either
 			// theme; we override them with our palette tokens. Inputs
