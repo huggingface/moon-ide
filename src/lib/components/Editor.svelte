@@ -4,7 +4,7 @@
 	import { EditorState, Compartment, EditorSelection, Prec, Transaction } from '@codemirror/state';
 	import { EditorView, highlightActiveLine, highlightActiveLineGutter, keymap, lineNumbers } from '@codemirror/view';
 	import { highlightTabs } from '../editor/highlightTabs';
-	import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
+	import { defaultKeymap, history, historyField, historyKeymap, indentWithTab } from '@codemirror/commands';
 	import { searchKeymap, highlightSelectionMatches } from '@codemirror/search';
 	import { bracketMatching, foldGutter, indentOnInput, indentUnit } from '@codemirror/language';
 	import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from '@codemirror/autocomplete';
@@ -135,20 +135,29 @@
 			// snapshot — Ctrl+L should never attach a selection
 			// from a tab the user just left.
 			workspace.setActiveSelection(null);
-			// Capture the outgoing tab's caret + scroll so coming
-			// back to it lands the user where they left off rather
-			// than at the top of the file. `setState` below replaces
-			// the view's state wholesale, which is why this has to
+			// Capture the outgoing tab's caret + scroll + undo
+			// history so coming back to it lands the user where
+			// they left off *and* Ctrl+Z still walks through the
+			// pre-switch edits. `setState` below replaces the
+			// view's state wholesale, which is why this has to
 			// happen *before* the swap. `renamed` falls through
 			// because that path doesn't `setState` — the doc is
-			// patched in place and the live selection survives on
-			// its own.
+			// patched in place and the live selection + history
+			// survive on their own.
 			const folder = workspace.activeFolderPath;
 			if (!renamed && currentPath !== null && folder !== null) {
+				// `toJSON({ history })` returns `{ doc, selection,
+				// history }`. We pass it whole into the snapshot —
+				// the restore path only consumes the `history`
+				// slot (the doc is re-sourced from `file.text`,
+				// the cursor / scroll restore lives in the
+				// dedicated fields below) but the JSON shape is
+				// what CM's `fromJSON` reader expects.
 				workspace.snapshotViewState(folder, currentPath, {
 					caretOffset: v.state.selection.main.head,
 					anchorOffset: v.state.selection.main.anchor,
 					scrollTop: v.scrollDOM.scrollTop,
+					historyJson: v.state.toJSON({ history: historyField }),
 				});
 			}
 			currentPath = file.path;
@@ -160,12 +169,26 @@
 				syncDocText(v, file.text);
 				return;
 			}
-			const next = EditorState.create({
-				doc: file.text,
-				extensions: baseExtensions(),
-			});
+			// Build the fresh state. When a snapshot with a
+			// preserved history exists we route through
+			// `fromJSON` so CM's undo stack reattaches; otherwise
+			// `EditorState.create` is fine. We always override
+			// `doc` with the workspace's authoritative text in
+			// case it changed externally (F2 rename, format-on-
+			// save in a sibling tab, coder writes) — the history
+			// deltas may then refer to offsets that no longer
+			// exist, but CM clamps internally and the worst case
+			// is an undo that skips an external mutation rather
+			// than corrupting the buffer.
+			const snapshot = folder !== null ? workspace.getViewState(folder, file.path) : null;
+			const next = snapshot?.historyJson
+				? buildStateWithHistory(file.text, snapshot.historyJson)
+				: EditorState.create({
+						doc: file.text,
+						extensions: baseExtensions(),
+					});
 			v.setState(next);
-			// Restore the incoming tab's snapshot, if any. A fresh
+			// Restore the incoming tab's caret + scroll. A fresh
 			// open (no prior snapshot) leaves the cursor at offset
 			// 0, matching what `EditorState.create` already gives
 			// us — no-op for first-time views. The scroll restore
@@ -179,7 +202,6 @@
 			// overwrites the restore — deliberate ordering, see
 			// the pending-jump effect's comment for the same
 			// reasoning.
-			const snapshot = folder !== null ? workspace.getViewState(folder, file.path) : null;
 			if (snapshot !== null) {
 				const docLen = v.state.doc.length;
 				const head = Math.min(snapshot.caretOffset, docLen);
@@ -654,6 +676,33 @@
 	// content and keeps each extension's incremental work
 	// proportional to what actually changed. The `diff` package is
 	// already a dependency (used by the git-change gutter).
+	// Re-attach a serialized CM history to a fresh state seeded
+	// with `text`. We route through `EditorState.fromJSON` rather
+	// than reaching into `historyField.spec` (not part of CM's
+	// public surface) — the JSON shape `{ doc, selection,
+	// history }` is what CM's reader expects. We override `doc`
+	// with the workspace's current text in case it changed
+	// externally while the tab wasn't visible; the offsets in
+	// the cursor / scroll restore branch below run their own
+	// clamping, and we collapse the selection to the doc start
+	// here so `fromJSON` can't reject an out-of-range range
+	// (the live selection restore lands a few lines later
+	// anyway and overwrites this).
+	function buildStateWithHistory(text: string, historyJson: unknown): EditorState {
+		const json = { ...(historyJson as object), doc: text, selection: { ranges: [{ anchor: 0, head: 0 }], main: 0 } };
+		try {
+			return EditorState.fromJSON(json, { extensions: baseExtensions() }, { history: historyField });
+		} catch {
+			// `fromJSON` rejects malformed history blobs (e.g. a
+			// schema change in `@codemirror/commands`) — silently
+			// fall back to a history-less state rather than
+			// trapping the user with a broken tab. The lost
+			// undo stack is recoverable by retyping; a thrown
+			// error here is not.
+			return EditorState.create({ doc: text, extensions: baseExtensions() });
+		}
+	}
+
 	function syncDocText(v: EditorView, next: string): void {
 		const current = v.state.doc.toString();
 		if (current === next) {

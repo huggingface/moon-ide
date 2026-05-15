@@ -701,30 +701,48 @@ class WorkspaceState {
 	 * Per-buffer view-state cache for tab switches. Keyed by
 	 * `${folder}::${path}` like `navStack`. Holds the caret
 	 * offset, the selection's anchor offset (so a range
-	 * survives, not just a cursor), and the scroller's
-	 * `scrollTop`. `Editor.svelte` snapshots into here right
-	 * before tearing down its `EditorView` state for a tab
+	 * survives, not just a cursor), the scroller's `scrollTop`,
+	 * and the serialized CodeMirror history (so Ctrl+Z still
+	 * walks back through edits made *before* the user clicked
+	 * away to another tab). `Editor.svelte` snapshots into here
+	 * right before tearing down its `EditorView` state for a tab
 	 * swap, and reads back when re-mounting the same path. The
 	 * cache entry survives any number of switches; it's
 	 * dropped only when the buffer falls out of every pane
 	 * (see `closeFile`'s GC block).
+	 *
+	 * `historyJson` is the output of
+	 * `EditorState.toJSON({ history: historyField })` (the
+	 * `history` slot only — doc / selection are restored
+	 * separately because the workspace's `file.text` is the
+	 * authoritative doc and a stray external edit can shift
+	 * the in-buffer offsets without invalidating the history's
+	 * delta chain). The shape is `unknown` because CM doesn't
+	 * publish the schema — we only ever hand it back to
+	 * `EditorState.fromJSON`.
 	 *
 	 * Deliberately **not** reactive — cursor moves don't need
 	 * to wake up the reactive graph, and the snapshot/restore
 	 * cycle is driven by lifecycle hooks, not reads from
 	 * Svelte components.
 	 */
-	private viewStateByKey = new Map<string, { caretOffset: number; anchorOffset: number; scrollTop: number }>();
+	private viewStateByKey = new Map<
+		string,
+		{ caretOffset: number; anchorOffset: number; scrollTop: number; historyJson?: unknown }
+	>();
 
 	snapshotViewState(
 		folder: string,
 		path: string,
-		snapshot: { caretOffset: number; anchorOffset: number; scrollTop: number },
+		snapshot: { caretOffset: number; anchorOffset: number; scrollTop: number; historyJson?: unknown },
 	): void {
 		this.viewStateByKey.set(navKey(folder, path), snapshot);
 	}
 
-	getViewState(folder: string, path: string): { caretOffset: number; anchorOffset: number; scrollTop: number } | null {
+	getViewState(
+		folder: string,
+		path: string,
+	): { caretOffset: number; anchorOffset: number; scrollTop: number; historyJson?: unknown } | null {
 		return this.viewStateByKey.get(navKey(folder, path)) ?? null;
 	}
 

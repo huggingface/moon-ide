@@ -72,6 +72,7 @@ State per editor:
 - doc + selection + scroll
 - dirty flag
 - file mtime at load (to detect external changes later)
+- per-tab view-state snapshot (caret + anchor + `scrollTop` + serialized CM history) cached on `WorkspaceState.viewStateByKey`, captured right before a tab swap and replayed on return. Includes the undo history (`EditorState.toJSON({ history: historyField })`) so `Ctrl+Z` after `Alt+Left`-ing back to an unsaved buffer still walks through edits made before the user clicked away. Dropped when the buffer falls out of every pane (`closeFile`'s GC block), so a fresh open from the tree starts with an empty undo stack.
 
 Saves go through `ipc.fs.writeFile`. The editor only tracks dirty state; persistence is owned by the workspace state module.
 
