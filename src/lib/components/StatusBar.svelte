@@ -57,23 +57,41 @@
 		return sel.text.length;
 	});
 
-	// Per-language LSP availability pill. We show it only when the
-	// active file maps to a language we have a server wired up for
-	// (so a Markdown buffer doesn't flash a "typescript not
-	// available" message) AND the server's state is notable —
-	// `running` is the happy path; we skip the pill there. Statuses
-	// we surface:
+	// Per-language LSP pill. Visible whenever the active file maps
+	// to a language we have a server wired up for (so a Markdown
+	// buffer doesn't render "typescript: ..." against a server that
+	// has nothing to do with the open file). We show the pill in
+	// every state — including the steady-state `running` — so the
+	// user always has a one-click handle into that server's logs;
+	// the colour and label tell the steady-state apart from the
+	// noisy ones at a glance.
+	//
+	// `activeLspStatus` may be momentarily `null` between "the user
+	// just opened the first file of this language" and "the broker
+	// emitted its first `lsp:status` event": LSP servers spawn
+	// lazily on the first `lsp_open` IPC, so the in-memory
+	// `lspStatuses` map is empty until then. We render a placeholder
+	// pill in that window — same visual treatment as `starting` —
+	// so the affordance doesn't flicker in for a frame and out
+	// again.
+	//
+	// Statuses we surface:
+	//   - `running` — happy path, subdued colour, just shows the
+	//     language id; clicking opens the logs (rare; mostly for
+	//     debugging) with no hint suffix in the tooltip
+	//   - `starting` — ~3-5s spinner while the server boots
 	//   - `notavailable` — nudge the user to install the binary
-	//   - `starting` — ~3-5s spinner while tsserver boots
 	//   - `crashed` — last run died; next file open will retry
 	//   - `stopped` — shutdown fired (during workspace close)
 	const activeLanguage = $derived(workspace.activeFile ? lspLanguageFor(workspace.activeFile.path) : null);
 	const activeLspStatus = $derived(activeLanguage ? (workspace.lspStatuses.get(activeLanguage) ?? null) : null);
-	const showLspStatus = $derived(activeLspStatus !== null && activeLspStatus.status !== 'running');
+	const showLspStatus = $derived(activeLanguage !== null);
+	const lspDisplayLanguageId = $derived(activeLspStatus?.languageId ?? activeLanguage ?? '');
+	const lspStatusKind = $derived(activeLspStatus?.status ?? 'pending');
 	const lspStatusLabel = $derived.by(() => {
 		const s = activeLspStatus;
 		if (!s) {
-			return '';
+			return lspDisplayLanguageId ? `${lspDisplayLanguageId}: starting…` : '';
 		}
 		switch (s.status) {
 			case 'notavailable':
@@ -91,19 +109,21 @@
 	const lspStatusTitle = $derived.by(() => {
 		const s = activeLspStatus;
 		if (!s) {
-			return '';
+			return lspDisplayLanguageId ? `${lspDisplayLanguageId} language server: starting — click to open logs` : '';
 		}
+		// "Click to open logs" hint on every state now that the
+		// pill is always clickable — the tooltip is the only
+		// place the affordance is discoverable from.
 		if (s.status === 'notavailable') {
-			return s.detail ?? `Install a language server for ${s.languageId}`;
+			const base = s.detail ?? `Install a language server for ${s.languageId}`;
+			return `${base} — click to open logs`;
 		}
-		// On a crash, append a "click to open logs" hint so the
-		// affordance is discoverable without the user having to
-		// hunt for the Logs launcher button.
 		if (s.status === 'crashed') {
 			const base = s.detail ?? `${s.languageId} language server crashed`;
 			return `${base} — click to open logs`;
 		}
-		return s.detail ?? lspStatusLabel;
+		const base = s.detail ?? lspStatusLabel;
+		return `${base} — click to open logs`;
 	});
 
 	/**
@@ -111,9 +131,10 @@
 	 * Mirrors the `pick(source)` flow in [`LogsLauncher`] —
 	 * matched diag tabs share `source: 'lsp.<languageId>'` with
 	 * the broker convention in `moon_core::lsp::broker::log_source_for`.
-	 * Used by the status-bar crashed-pill click handler so a user
-	 * who sees "rust: crashed" lands directly on the failing
-	 * server's stderr without having to open the picker.
+	 * Used by the status-bar pill click handler so a user who
+	 * sees any state — running, starting, crashed, … — lands
+	 * directly on that server's stderr without having to open
+	 * the picker.
 	 */
 	function openLspLogPanel(languageId: string): void {
 		const source = `lsp.${languageId}`;
@@ -380,32 +401,22 @@
 				{/if}
 			</span>
 		{/if}
-		<!-- LSP availability pill. Only visible when the active file
-			 has a wired-up language server AND that server isn't in
-			 the happy `running` state. Kept plain text (no icon) so
-			 it doesn't compete visually with the diagnostic pill. -->
-		{#if showLspStatus && activeLspStatus}
-			{#if activeLspStatus.status === 'crashed'}
-				<!-- Crashed servers get a real button so the user can
-					 jump straight to the LSP log panel for the failing
-					 language. Other non-running statuses (`starting`,
-					 `notavailable`, `stopped`) stay as a passive `<span>`:
-					 `starting` is transient, `notavailable` has no logs
-					 to show, and `stopped` only fires during workspace
-					 close — none of them earns the click affordance. -->
-				<button
-					type="button"
-					class="lsp-status status-crashed clickable"
-					title={lspStatusTitle}
-					onclick={() => openLspLogPanel(activeLspStatus!.languageId)}
-				>
-					{lspStatusLabel}
-				</button>
-			{:else}
-				<span class="lsp-status status-{activeLspStatus.status}" title={lspStatusTitle}>
-					{lspStatusLabel}
-				</span>
-			{/if}
+		<!-- LSP pill. Visible whenever the active file has a wired-
+			 up language server, regardless of the server's state —
+			 the colour distinguishes the noisy states from the
+			 happy path, and clicking always opens the LSP log
+			 panel for that language. Kept plain text (no icon) so
+			 it doesn't compete visually with the diagnostic pill
+			 to its left. -->
+		{#if showLspStatus && lspDisplayLanguageId !== ''}
+			<button
+				type="button"
+				class="lsp-status status-{lspStatusKind} clickable"
+				title={lspStatusTitle}
+				onclick={() => openLspLogPanel(lspDisplayLanguageId)}
+			>
+				{lspStatusLabel}
+			</button>
 		{/if}
 		<!-- Container status pip. Hidden until we have a status snapshot
 			 (no flash of "absent" while we're still resolving the
@@ -951,13 +962,15 @@
 	.diag-dot.warn {
 		background: var(--m-warning);
 	}
-	/* LSP availability pill. Subdued colour by default (not an
-	   error state), amber during the transient `starting` window
-	   so the user knows something's happening, red for crashed.
-	   `.clickable` is applied on the crashed variant where the
-	   pill becomes a `<button>` (jumps to the LSP log panel) —
-	   the selectors below reset the default `<button>` chrome so
-	   the span and button paths render pixel-identically. */
+	/* LSP pill. Always rendered as a `<button>` now; the selectors
+	   below reset the default browser chrome and apply per-state
+	   colour. Subdued for the steady-state `running` and
+	   `notavailable` (informational, not actionable from the pill
+	   itself), amber during the transient `starting` window and the
+	   pre-event `pending` placeholder so the user knows something's
+	   happening, red for crashed. `.clickable` is kept as an
+	   explicit affordance class for parity with other status-bar
+	   buttons; today every render has it set. */
 	.lsp-status {
 		font: inherit;
 		font-size: 11px;
@@ -970,21 +983,19 @@
 		height: 18px;
 		display: inline-flex;
 		align-items: center;
-		cursor: help;
+		cursor: pointer;
 	}
+	.lsp-status.status-pending,
 	.lsp-status.status-starting {
 		color: var(--m-warning);
 	}
 	.lsp-status.status-crashed {
 		color: var(--m-danger);
 	}
-	.lsp-status.clickable {
-		cursor: pointer;
-	}
-	.lsp-status.clickable:hover {
+	.lsp-status:hover {
 		border-color: var(--m-border-strong);
 	}
-	.lsp-status.clickable:focus-visible {
+	.lsp-status:focus-visible {
 		outline: 1px solid var(--m-accent);
 		outline-offset: 1px;
 	}
