@@ -8,6 +8,7 @@
 	import TerminalLauncher from './TerminalLauncher.svelte';
 	import ThemePicker from './ThemePicker.svelte';
 	import { lspLanguageFor } from '../editor/lspLanguage';
+	import { bottomPanel } from '../bottomPanel.svelte';
 
 	let themePicker: ThemePicker | undefined = $state();
 	let containerWrap: HTMLDivElement | undefined = $state();
@@ -95,8 +96,40 @@
 		if (s.status === 'notavailable') {
 			return s.detail ?? `Install a language server for ${s.languageId}`;
 		}
+		// On a crash, append a "click to open logs" hint so the
+		// affordance is discoverable without the user having to
+		// hunt for the Logs launcher button.
+		if (s.status === 'crashed') {
+			const base = s.detail ?? `${s.languageId} language server crashed`;
+			return `${base} — click to open logs`;
+		}
 		return s.detail ?? lspStatusLabel;
 	});
+
+	/**
+	 * Open (or focus) the diagnostic-logs tab for `languageId`.
+	 * Mirrors the `pick(source)` flow in [`LogsLauncher`] —
+	 * matched diag tabs share `source: 'lsp.<languageId>'` with
+	 * the broker convention in `moon_core::lsp::broker::log_source_for`.
+	 * Used by the status-bar crashed-pill click handler so a user
+	 * who sees "rust: crashed" lands directly on the failing
+	 * server's stderr without having to open the picker.
+	 */
+	function openLspLogPanel(languageId: string): void {
+		const source = `lsp.${languageId}`;
+		const existing = bottomPanel.findDiagTab(source);
+		if (existing) {
+			bottomPanel.setActive(existing.id);
+		} else {
+			bottomPanel.addTab({
+				id: `diag:${source}`,
+				title: source,
+				kind: 'diag',
+				source,
+			});
+		}
+		bottomPanel.show();
+	}
 
 	// Optimistic state during the two long-running ops (setup,
 	// rebuild) so the pip transitions immediately rather than
@@ -352,9 +385,27 @@
 			 the happy `running` state. Kept plain text (no icon) so
 			 it doesn't compete visually with the diagnostic pill. -->
 		{#if showLspStatus && activeLspStatus}
-			<span class="lsp-status status-{activeLspStatus.status}" title={lspStatusTitle}>
-				{lspStatusLabel}
-			</span>
+			{#if activeLspStatus.status === 'crashed'}
+				<!-- Crashed servers get a real button so the user can
+					 jump straight to the LSP log panel for the failing
+					 language. Other non-running statuses (`starting`,
+					 `notavailable`, `stopped`) stay as a passive `<span>`:
+					 `starting` is transient, `notavailable` has no logs
+					 to show, and `stopped` only fires during workspace
+					 close — none of them earns the click affordance. -->
+				<button
+					type="button"
+					class="lsp-status status-crashed clickable"
+					title={lspStatusTitle}
+					onclick={() => openLspLogPanel(activeLspStatus!.languageId)}
+				>
+					{lspStatusLabel}
+				</button>
+			{:else}
+				<span class="lsp-status status-{activeLspStatus.status}" title={lspStatusTitle}>
+					{lspStatusLabel}
+				</span>
+			{/if}
 		{/if}
 		<!-- Container status pip. Hidden until we have a status snapshot
 			 (no flash of "absent" while we're still resolving the
@@ -902,11 +953,17 @@
 	}
 	/* LSP availability pill. Subdued colour by default (not an
 	   error state), amber during the transient `starting` window
-	   so the user knows something's happening, red for crashed. */
+	   so the user knows something's happening, red for crashed.
+	   `.clickable` is applied on the crashed variant where the
+	   pill becomes a `<button>` (jumps to the LSP log panel) —
+	   the selectors below reset the default `<button>` chrome so
+	   the span and button paths render pixel-identically. */
 	.lsp-status {
+		font: inherit;
 		font-size: 11px;
 		color: var(--m-fg-muted);
 		background: var(--m-bg-overlay);
+		border: 1px solid transparent;
 		border-radius: 4px;
 		padding: 0 6px;
 		line-height: 18px;
@@ -920,5 +977,15 @@
 	}
 	.lsp-status.status-crashed {
 		color: var(--m-danger);
+	}
+	.lsp-status.clickable {
+		cursor: pointer;
+	}
+	.lsp-status.clickable:hover {
+		border-color: var(--m-border-strong);
+	}
+	.lsp-status.clickable:focus-visible {
+		outline: 1px solid var(--m-accent);
+		outline-offset: 1px;
 	}
 </style>

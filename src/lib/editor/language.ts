@@ -312,6 +312,30 @@ export async function languageFor(filename: string, firstLine?: string): Promise
 			const { dockerFile } = await import('@codemirror/legacy-modes/mode/dockerfile');
 			return [StreamLanguage.define(dockerFile)];
 		}
+		case 'tf':
+		case 'tfvars':
+		case 'hcl': {
+			// HashiCorp Configuration Language — covers Terraform
+			// (`.tf`, `.tfvars`) and standalone HCL configs
+			// (`.hcl`, e.g. Packer, Consul, Nomad). The package
+			// ships a Lezer grammar ported from `tree-sitter-hcl`,
+			// which is the canonical HCL2 grammar HashiCorp's own
+			// tooling references — so heredoc / template
+			// interpolation / object expressions all parse
+			// correctly. Same shape as the other `lang-*`
+			// extensions: indentation, brace matching, and the
+			// `languageData.foldNodeProp` that hooks our
+			// `foldGutter` lands automatically.
+			//
+			// `.tfstate` is **not** wired up: it's machine-written
+			// JSON and the `json` arm above already covers it
+			// (the `.json` extension takes precedence anyway, so
+			// the question is only what to do for files renamed
+			// `*.tfstate`). Terraform never edits state files by
+			// hand and the grammar would be wrong.
+			const { hcl } = await import('codemirror-lang-hcl');
+			return [hcl()];
+		}
 		default:
 			return [];
 	}

@@ -74,6 +74,7 @@ const LOADERS: Record<string, () => Promise<Parser>> = {
 		const { dockerFile } = await import('@codemirror/legacy-modes/mode/dockerfile');
 		return StreamLanguage.define(dockerFile).parser;
 	},
+	hcl: async () => (await import('codemirror-lang-hcl')).hclLanguage.parser,
 };
 
 /**
@@ -102,6 +103,9 @@ const ALIASES: Record<string, keyof typeof LOADERS> = {
 	bash: 'shell',
 	zsh: 'shell',
 	yml: 'yaml',
+	tf: 'hcl',
+	tfvars: 'hcl',
+	terraform: 'hcl',
 };
 
 /**
