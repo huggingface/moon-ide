@@ -11,6 +11,7 @@
 	import { languageFor } from '../editor/language';
 	import { moonEditorTheme } from '../editor/theme';
 	import { diffPureChangeExtension } from '../editor/diffPureChange';
+	import { diffGutterTintExtension } from '../editor/diffGutterTint';
 	import type { GitFileStatus } from '../protocol';
 
 	type Props = {
@@ -147,6 +148,7 @@
 
 		const sideA: Extension[] = [
 			lineNumbers(),
+			diffGutterTintExtension('a'),
 			foldGutter(),
 			diffPureChangeExtension,
 			highlightSelectionMatches(),
@@ -159,6 +161,7 @@
 		];
 		const sideB: Extension[] = [
 			lineNumbers(),
+			diffGutterTintExtension('b'),
 			foldGutter(),
 			diffPureChangeExtension,
 			highlightActiveLine(),
@@ -178,7 +181,11 @@
 			a: { doc: base, extensions: sideA },
 			b: { doc: working, extensions: sideB },
 			parent: host,
-			gutter: true,
+			// Built-in change-bar gutter replaced by line-number
+			// cell tinting via `diffGutterTintExtension` — see
+			// `DiffView.svelte` for the same call site and
+			// rationale.
+			gutter: false,
 			highlightChanges: true,
 			// No revert controls — the review tab is read-only;
 			// the user can't apply A→B or vice versa from here.
@@ -533,11 +540,13 @@
 	 * already conveyed by the gutter bar plus the line tint, so
 	 * layering the per-character marker on top doubles up the
 	 * same hue across the entire line. `diffPureChange.ts`
-	 * adds the `.cm-moon-pure-change` line decoration on
-	 * whole-chunk pure adds (on B) and pure deletes (on A);
-	 * this rule strips the redundant highlight only there.
-	 * Modified lines keep their per-character markers so the
-	 * substring-vs-surrounding-text distinction stays visible. */
+	 * adds the `.cm-moon-pure-change` line decoration on any
+	 * line whose content is wholly inside `Change` spans —
+	 * whole-chunk pure adds / deletes plus all-new / all-removed
+	 * lines living inside an otherwise-modified chunk. Lines
+	 * with surviving common substrings keep their per-character
+	 * markers so the substring-vs-surrounding-text distinction
+	 * stays visible. */
 	.review-section :global(.cm-moon-pure-change .cm-changedText) {
 		background: transparent !important;
 	}

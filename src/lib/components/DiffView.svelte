@@ -22,6 +22,7 @@
 		offsetForLspPosition,
 	} from '../editor/lsp';
 	import { diffPureChangeExtension } from '../editor/diffPureChange';
+	import { diffGutterTintExtension } from '../editor/diffGutterTint';
 	import { lspGotoDefinitionExtension } from '../editor/lspGotoDefinition';
 	import { lspOverviewExtension } from '../editor/lspOverview';
 	import { frontendLog } from '../logs.svelte';
@@ -204,6 +205,11 @@
 
 		const sharedLeft: Extension[] = [
 			lineNumbers(),
+			// Tint the line-number cell red on deleted / modified
+			// lines so the chrome stays narrow (no dedicated
+			// change-bar gutter — see `diffGutterTintExtension`
+			// and the `gutter: false` pass to `MergeView` below).
+			diffGutterTintExtension('a'),
 			// See `diffPureChange.ts` — tags whole-chunk pure-delete
 			// lines on A so the inner per-character red highlight
 			// is stripped (the gutter and line tint already say
@@ -333,6 +339,12 @@
 
 		const rightExtensions: Extension[] = [
 			lineNumbers(),
+			// Tint the line-number cell green on added / modified
+			// lines (mirrors the left pane's red on deleted /
+			// modified). See `diffGutterTintExtension` and the
+			// `gutter: false` pass to `MergeView` below for the
+			// replacement of the package's built-in 3px gutter bar.
+			diffGutterTintExtension('b'),
 			// Same pure-add/delete tagging as the left pane — here it
 			// strips the inner green highlight on whole-chunk
 			// additions, since the line gutter + background already
@@ -418,7 +430,13 @@
 			a: { doc: head, extensions: sharedLeft },
 			b: { doc: rightText, extensions: rightExtensions },
 			parent: host,
-			gutter: true,
+			// The package's built-in `cm-changeGutter` (a 3px
+			// coloured bar) is replaced by tinting the line-number
+			// cell directly via `diffGutterTintExtension`. Keeping
+			// the dedicated bar on top of the cell tint doubles
+			// the same hue across two adjacent columns and reads
+			// as visual noise without adding information.
+			gutter: false,
 			highlightChanges: true,
 			// Show the full file. Earlier we collapsed unchanged
 			// regions behind a `… N unchanged lines` placeholder,
@@ -970,12 +988,14 @@
 	 * highlight (`.cm-changedText`) on top doubles up the same hue
 	 * across the entire line and reads as saturated noise without
 	 * adding information. The line decoration `.cm-moon-pure-change`
-	 * is added by `diffPureChange.ts` on whole-chunk pure-add/
-	 * pure-delete ranges (queried from `getChunks(state)` on each
-	 * pane), so this rule only strips the highlight where it's
-	 * redundant — modified lines keep their per-character markers
-	 * since the substring-vs-surrounding-text distinction is
-	 * useful there. */
+	 * is added by `diffPureChange.ts` on any line whose entire
+	 * content is part of a `Change` span — covering whole-chunk
+	 * pure adds/deletes *and* the all-new / all-removed lines
+	 * sitting inside an otherwise-modified chunk (e.g. a block of
+	 * inserted comment lines between two unchanged anchors). Lines
+	 * with surviving common substrings keep their per-character
+	 * markers since the substring-vs-surrounding-text distinction
+	 * is useful there. */
 	.diff-host :global(.cm-moon-pure-change .cm-changedText) {
 		background: transparent !important;
 	}

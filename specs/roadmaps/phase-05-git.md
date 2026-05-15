@@ -171,19 +171,27 @@ entries }>`) and a generalised `git_ref_content(rev, path)` —
 "before"-side fetch is a single `git show <sha>:<path>`. No
 per-hunk accept yet — same scope discipline as before.
 
-**Git-change gutter** in the regular editor (test plan
-[0033](../test-plans/0033-git-change-gutter.md)). A dedicated
-CodeMirror gutter diffs the live buffer against the cached `HEAD`
-blob (`jsdiff::diffLines`) and paints a thin green bar for added
-lines, a thin blue bar for modified lines, and a red wedge at the
-top / bottom of the line bordering a pure deletion. Recomputes on
-every transaction so the markers stay in sync as the user types;
-the `HEAD` cache itself re-fetches whenever `refreshGitStatus`
-runs (covering external commits / checkouts). A matching overview
-ruler overlays the right-edge scrollbar with scaled-down,
-clickable change markers so the user can jump to any diff region
-in the file at a glance. Deleted buffers keep rendering in diff
-view and suppress the inline gutter.
+**Git-change indicator** in the regular editor (test plan
+[0033](../test-plans/0033-git-change-gutter.md), later switched
+to line-number cell tinting). Diffs the live buffer against the
+cached `HEAD` blob (`jsdiff::diffLines`) and paints the
+line-number gutter cell with a tinted background — green for
+additions, blue for modifications, red top/bottom border on the
+adjacent line for pure deletions. The earlier dedicated wedge
+gutter is gone (one less column to track); we reuse the
+line-number column the eye already lands on, GitHub-style. Same
+classes (`cm-gitline-added` / `cm-gitline-modified` /
+`cm-gitline-deleted-above` / `cm-gitline-deleted-below`) cover
+the diff view and the aggregated review pseudo-tab via
+`diffGutterTintExtension` so all three surfaces share one
+visual vocabulary. Recomputes on every transaction so the
+indicator stays in sync as the user types; the `HEAD` cache
+itself re-fetches whenever `refreshGitStatus` runs (covering
+external commits / checkouts). A matching overview ruler
+overlays the right-edge scrollbar with scaled-down, clickable
+change markers so the user can jump to any diff region in the
+file at a glance. Deleted buffers keep rendering in diff view
+and suppress the inline indicator.
 
 ### 5.3 — SCM panel
 

@@ -485,19 +485,16 @@
 			// as `workspace.blameByPath` updates.
 			blameExtension(),
 			blameCompartment.of(blameFacet.of(workspace.blameByPath.get(file.path) ?? null)),
-			// Git-change wedges in a dedicated gutter, paired with the
-			// HEAD facet populated from `workspace.headByPath`. A
-			// click on any per-line marker flips the buffer into diff
-			// mode so the user can see the full chunk in context —
-			// matches "open diff" via the tab toggle / Ctrl-Shift-D /
-			// palette, just keyed off a more direct affordance.
-			gitChangesExtension({
-				onGutterClick: () => {
-					if (currentPath !== null) {
-						workspace.setDiffMode(currentPath, true);
-					}
-				},
-			}),
+			// Per-line git-change indicator: paints the line-number
+			// gutter cell background green / blue (added / modified)
+			// and adds a thin red top/bottom border on the adjacent
+			// line for pure deletions. Replaces the older dedicated
+			// wedge gutter — same data source (`workspace.headByPath`
+			// via `headTextFacet`), just rendered against the
+			// existing line-number column so the chrome stays
+			// narrower. To open diff mode: tab toggle, Ctrl+Shift+D,
+			// or the SCM panel's diff column.
+			gitChangesExtension(),
 			headCompartment.of(headTextFacet.of(workspace.headByPath.get(file.path) ?? null)),
 			// Ctrl+Space → LSP only. Local autocomplete (Ctrl+T / palette) patches
 			// the buffer directly — it is not a CodeMirror completion source.

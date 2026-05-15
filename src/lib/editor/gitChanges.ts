@@ -1,20 +1,33 @@
-// Per-line git-change markers in the editor gutter.
+// Per-line git-change indicators on the editor's line-number gutter.
 //
 // Pulls the file's `HEAD` content via the workspace cache (populated
 // by `WorkspaceState.refreshHead` when a buffer is opened) and, on
 // every transaction, line-diffs it against the current doc. The
-// resulting per-line classification is surfaced as coloured bars in
-// a dedicated gutter:
+// resulting per-line classification is surfaced as a *line-number
+// background tint* — GitHub-style — rather than a dedicated
+// change-bar gutter:
 //
 //   - green `added`      — line exists in the working tree but not
 //                          in `HEAD` and isn't adjacent to a removal
 //   - blue  `modified`   — added block that directly replaces a
 //                          removed block; the typical "I changed
 //                          this line" case
-//   - red   `deletedAbove` / `deletedBelow` — tiny wedges at the
-//                          boundary where a pure deletion occurred,
-//                          so a removed line is still discoverable
-//                          without opening the diff view
+//   - red   `deletedAbove` / `deletedBelow` — thin border on the top
+//                          or bottom edge of the adjacent line's
+//                          line-number cell, so a pure deletion is
+//                          still visible without opening the diff
+//                          view
+//
+// Why line-number tint instead of a dedicated wedge gutter:
+//
+//   - One fewer column means less horizontal noise on file types
+//     (.md, .json, configs) where the change-bar would still be on
+//     a single-line edit.
+//   - The line-number cell is a stable target the eye already lands
+//     on, so a tint is enough to surface a change without growing
+//     the chrome.
+//   - The same marker shape works for the diff view (`diffGutterTint`)
+//     so both surfaces share visual vocabulary.
 //
 // Design notes:
 //
@@ -34,8 +47,15 @@
 //     belong in the SCM panel (Phase 5, later slice); the gutter
 //     is an at-a-glance indicator, not an editing surface.
 
-import { EditorSelection, Facet, StateField, type Extension, type Transaction } from '@codemirror/state';
-import { EditorView, gutter, GutterMarker, ViewPlugin, type PluginValue, type ViewUpdate } from '@codemirror/view';
+import { EditorSelection, Facet, RangeSet, StateField, type Extension, type Transaction } from '@codemirror/state';
+import {
+	EditorView,
+	gutterLineClass,
+	GutterMarker,
+	ViewPlugin,
+	type PluginValue,
+	type ViewUpdate,
+} from '@codemirror/view';
 import { diffLines } from 'diff';
 
 /**
@@ -159,7 +179,16 @@ export function computeLineChanges(head: string, current: string): GitLineChange
 	return { added, modified, deletedAbove, deletedBelow };
 }
 
-class GutterLineMarker extends GutterMarker {
+/**
+ * Bare-elementClass marker for the `gutterLineClass` facet. The
+ * class string lands on every gutter row for the marked line; CSS
+ * (`editor/theme.ts`) scopes the actual styling to the line-number
+ * gutter via `.cm-gutter.cm-lineNumbers .cm-gutterElement.cm-gitline-…`.
+ * `toDOM` is intentionally omitted — `gutterLineClass` markers
+ * that define one would render in every gutter, which we don't
+ * want.
+ */
+class GitLineClassMarker extends GutterMarker {
 	override readonly elementClass: string;
 
 	constructor(className: string) {
@@ -168,25 +197,25 @@ class GutterLineMarker extends GutterMarker {
 	}
 
 	override eq(other: GutterMarker): boolean {
-		return other instanceof GutterLineMarker && other.elementClass === this.elementClass;
+		return other instanceof GitLineClassMarker && other.elementClass === this.elementClass;
 	}
 }
 
-const ADDED_MARKER = new GutterLineMarker('cm-git-change cm-git-change-added');
-const MODIFIED_MARKER = new GutterLineMarker('cm-git-change cm-git-change-modified');
-const DELETED_ABOVE_MARKER = new GutterLineMarker('cm-git-change cm-git-change-deleted-above');
-const DELETED_BELOW_MARKER = new GutterLineMarker('cm-git-change cm-git-change-deleted-below');
-const ADDED_AND_DELETED_BELOW_MARKER = new GutterLineMarker(
-	'cm-git-change cm-git-change-added cm-git-change-deleted-below',
-);
-const MODIFIED_AND_DELETED_BELOW_MARKER = new GutterLineMarker(
-	'cm-git-change cm-git-change-modified cm-git-change-deleted-below',
-);
-// A single "empty but sized" marker stands in on rows that have no
-// change. The gutter extension reserves width per the widest marker
-// it's asked to render — without this spacer the gutter would
-// collapse to 0px and reflow every time the first change appears.
-const SPACER_MARKER = new GutterLineMarker('cm-git-change cm-git-change-spacer');
+/// Cache markers by class-string so identical sets of classes
+/// reuse the same `GutterMarker` instance — RangeSet uses `eq` to
+/// dedupe redraws, and a fresh instance every recompute would
+/// thrash CM's gutter diff.
+const MARKER_CACHE = new Map<string, GitLineClassMarker>();
+function gitLineMarker(classes: readonly string[]): GitLineClassMarker {
+	const key = classes.join(' ');
+	let m = MARKER_CACHE.get(key);
+	if (m) {
+		return m;
+	}
+	m = new GitLineClassMarker(key);
+	MARKER_CACHE.set(key, m);
+	return m;
+}
 
 const gitChangesField = StateField.define<GitLineChanges>({
 	create(state) {
@@ -210,34 +239,57 @@ const gitChangesField = StateField.define<GitLineChanges>({
 	},
 });
 
-function markerFor(changes: GitLineChanges, lineNo: number): GutterMarker | null {
-	const isAdded = changes.added.has(lineNo);
-	const isModified = changes.modified.has(lineNo);
-	const isDeletedAbove = changes.deletedAbove.has(lineNo);
-	const isDeletedBelow = changes.deletedBelow.has(lineNo);
-	// `deletedAbove` folds into the main status colour by virtue of
-	// CSS — the `::before` wedge paints on the top edge regardless of
-	// the row's main colour. Handling the common cases first keeps
-	// the fall-through simple.
-	if (isAdded && isDeletedBelow) {
-		return ADDED_AND_DELETED_BELOW_MARKER;
+/**
+ * Build the gutter-class RangeSet for the current change set.
+ * One marker per affected line, classes joined when the same line
+ * carries multiple flags (e.g. an added line that also has a
+ * deletion below it). Lines without a change get no marker, which
+ * means the line-number cell stays at its default background.
+ */
+function buildGutterClassSet(
+	changes: GitLineChanges,
+	state: { doc: EditorView['state']['doc'] },
+): RangeSet<GutterMarker> {
+	const byLine = new Map<number, string[]>();
+	const push = (lineNo: number, cls: string) => {
+		const cur = byLine.get(lineNo);
+		if (cur) {
+			cur.push(cls);
+		} else {
+			byLine.set(lineNo, [cls]);
+		}
+	};
+	for (const lineNo of changes.added) {
+		push(lineNo, 'cm-gitline cm-gitline-added');
 	}
-	if (isModified && isDeletedBelow) {
-		return MODIFIED_AND_DELETED_BELOW_MARKER;
+	for (const lineNo of changes.modified) {
+		push(lineNo, 'cm-gitline cm-gitline-modified');
 	}
-	if (isAdded) {
-		return ADDED_MARKER;
+	for (const lineNo of changes.deletedAbove) {
+		push(lineNo, 'cm-gitline-deleted-above');
 	}
-	if (isModified) {
-		return MODIFIED_MARKER;
+	for (const lineNo of changes.deletedBelow) {
+		push(lineNo, 'cm-gitline-deleted-below');
 	}
-	if (isDeletedAbove) {
-		return DELETED_ABOVE_MARKER;
+	if (byLine.size === 0) {
+		return RangeSet.empty;
 	}
-	if (isDeletedBelow) {
-		return DELETED_BELOW_MARKER;
+	const doc = state.doc;
+	const docLines = doc.lines;
+	const ranges = [];
+	for (const [lineNo, classes] of byLine) {
+		// Defend against a stale range from a transaction that
+		// hasn't been reclassified yet (shouldn't happen with the
+		// `Facet.compute` keyed on the field, but cheap insurance).
+		if (lineNo < 1 || lineNo > docLines) {
+			continue;
+		}
+		const line = doc.line(lineNo);
+		ranges.push(gitLineMarker(classes).range(line.from));
 	}
-	return null;
+	// `RangeSet.of(.., true)` sorts for us, so the input order from
+	// the per-set iteration above doesn't have to be ascending.
+	return RangeSet.of(ranges, true);
 }
 
 /**
@@ -359,60 +411,25 @@ class GitOverviewPlugin implements PluginValue {
 const gitOverviewPlugin = ViewPlugin.fromClass(GitOverviewPlugin);
 
 /**
- * Optional config injected by `Editor.svelte`:
+ * Wire up:
  *
- * - `onGutterClick`: invoked when the user clicks a per-line marker
- *   in the change gutter (added / modified / deletion wedge). The
- *   editor passes a closure that toggles diff mode for the buffer,
- *   so the gutter doubles as an "open diff" affordance for the line
- *   you cared about. Clicks on rows without a marker are ignored.
+ *   - the per-line change classification (`gitChangesField`)
+ *   - the gutter-line-class facet that paints the line-number cell
+ *     background per change kind (replaces the old wedge gutter —
+ *     see the module docstring)
+ *   - the right-edge overview ruler (unchanged)
+ *
+ * The previous `onGutterClick` "click the wedge to open diff mode"
+ * affordance is gone with the wedge — the user already has
+ * `Ctrl+Shift+D`, the per-tab toggle, and the SCM panel's diff
+ * column for the same intent, and a click on the line-number cell
+ * would collide with line-selection gestures other editors lean on.
+ * Add it back via a synthetic transparent gutter if it's missed.
  */
-export type GitChangesConfig = {
-	onGutterClick?: () => void;
-};
-
-export function gitChangesExtension(config: GitChangesConfig = {}): Extension {
-	const onGutterClick = config.onGutterClick;
-	const handlers = onGutterClick
-		? {
-				click: (view: EditorView, line: { from: number }) => {
-					const changes = view.state.field(gitChangesField, false);
-					if (!changes) {
-						return false;
-					}
-					const lineNo = view.state.doc.lineAt(line.from).number;
-					// Only react on rows that actually have a change
-					// marker — clicks on the spacer (clean rows)
-					// should fall through to CodeMirror's default
-					// gutter handling.
-					if (markerFor(changes, lineNo) === null) {
-						return false;
-					}
-					onGutterClick();
-					return true;
-				},
-			}
-		: {};
+export function gitChangesExtension(): Extension {
 	return [
 		gitChangesField,
-		gutter({
-			class: 'cm-git-changes-gutter',
-			lineMarker(view, line) {
-				const changes = view.state.field(gitChangesField, false);
-				if (!changes) {
-					return null;
-				}
-				const lineNo = view.state.doc.lineAt(line.from).number;
-				return markerFor(changes, lineNo);
-			},
-			lineMarkerChange(update) {
-				return update.startState.field(gitChangesField, false) !== update.state.field(gitChangesField, false);
-			},
-			// Keep a constant-width gutter so the first appearance of
-			// a change doesn't nudge the editor content sideways.
-			initialSpacer: () => SPACER_MARKER,
-			domEventHandlers: handlers,
-		}),
+		gutterLineClass.compute([gitChangesField], (state) => buildGutterClassSet(state.field(gitChangesField), state)),
 		gitOverviewPlugin,
 	];
 }
