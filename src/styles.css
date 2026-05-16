@@ -362,14 +362,38 @@ button:focus-visible {
 }
 .markdown-body table {
 	border-collapse: collapse;
-	width: 100%;
 	font-size: 0.95em;
+	/* `display: block` + `width: max-content` lets the browser
+	 * scroll the table horizontally when it would otherwise
+	 * overflow the container (chat bubble, hover popover) while
+	 * preserving column alignment via the anonymous CSS-table
+	 * wrapper the engine generates around the rows. The previous
+	 * `width: 100%` made the table stretch and combined badly
+	 * with `table-layout: auto` under a tight container — short
+	 * headers got crushed even though long columns had slack. */
+	display: block;
+	width: max-content;
+	max-width: 100%;
+	overflow-x: auto;
 }
 .markdown-body th,
 .markdown-body td {
 	border: 1px solid var(--m-border);
 	padding: 6px 10px;
 	text-align: left;
+	/* Opt out of any ancestor `word-break: break-word` (the coder
+	 * panel's chat bubble sets it). Per spec, `break-word`
+	 * behaves like `overflow-wrap: anywhere` for min-content
+	 * sizing, which lets the browser collapse a column's
+	 * min-content width down to a single character — short
+	 * headers like "New Cap" then split as "Ne / w" even when
+	 * there's room to widen the column. Resetting to normal
+	 * sizing keeps `table-layout: auto` honest; long
+	 * unbreakable strings still wrap thanks to `overflow-wrap:
+	 * break-word`, but only when the line would otherwise
+	 * overflow, not as part of column-width math. */
+	word-break: normal;
+	overflow-wrap: break-word;
 }
 .markdown-body th {
 	background: var(--m-bg-1);
