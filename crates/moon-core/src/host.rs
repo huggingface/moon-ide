@@ -420,6 +420,16 @@ pub struct LocalHost {
 	/// format-on-save decisions land in the bottom-panel logs view
 	/// under source `"format-on-save"`. See test plan 0069.
 	log_sink: Option<Arc<crate::logs::LogSink>>,
+	/// Serialises every git invocation against this folder. The
+	/// auto-fetch loop, status polling, blame, ref reads, etc. all
+	/// briefly take `.git/index.lock`; without coordination they
+	/// race against user-initiated commits whose hooks (lint-staged,
+	/// pre-commit) do their own stash dance. The race surfaces as
+	/// data loss when a hook's `git stash apply` is interrupted
+	/// mid-write. Holding this mutex around every git subprocess
+	/// closes the window. FIFO so background ops can't starve the
+	/// user. See [ADR 0015](../../specs/decisions/0015-git-serialisation.md).
+	git_mutex: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl LocalHost {
@@ -430,7 +440,21 @@ impl LocalHost {
 			root,
 			shell_resolver: None,
 			log_sink: None,
+			git_mutex: Arc::new(tokio::sync::Mutex::new(())),
 		}
+	}
+
+	/// Acquire the per-folder git mutex as an owned guard. The
+	/// `OwnedMutexGuard` is `Send + 'static`, so the caller can
+	/// move it into a `tokio::task::spawn_blocking` closure and
+	/// keep the lock held across the full subprocess lifetime —
+	/// which is the point: git's index lock isn't process-aware,
+	/// so two of *our own* git commands racing is enough to break
+	/// a hook mid-`git stash apply`. See [ADR 0015].
+	///
+	/// [ADR 0015]: ../../specs/decisions/0015-git-serialisation.md
+	async fn git_lock(&self) -> tokio::sync::OwnedMutexGuard<()> {
+		self.git_mutex.clone().lock_owned().await
 	}
 
 	/// Plug in a [`ShellResolverHandle`] so format-on-save (and any
@@ -1102,11 +1126,15 @@ impl WorkspaceHost for LocalHost {
 		// path is dominated by git itself anyway; the walker is
 		// single-threaded but fast enough for IDE-sized trees (tens
 		// of thousands of files) without `build_parallel`'s wiring.
+		let guard = self.git_lock().await;
 		let root = self.root.clone();
 		let paths = paths.to_vec();
-		tokio::task::spawn_blocking(move || classify_git_status(&root, &paths))
-			.await
-			.map_err(|e| MoonError::Internal(format!("git_status_entries join error: {e}")))?
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			classify_git_status(&root, &paths)
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_status_entries join error: {e}")))?
 	}
 
 	async fn collect_paths_under(&self, rel: &Utf8Path, max_depth: u32) -> MoonResult<Vec<String>> {
@@ -1164,9 +1192,15 @@ impl WorkspaceHost for LocalHost {
 		// it (which today does nothing more than reveal the
 		// collapsed badge — lazy descendant fetch is a follow-up).
 		// Non-repo folders return an empty skip set and the walk
-		// behaves exactly as before.
+		// behaves exactly as before. The `collapsed_ignored_dirs`
+		// probe spawns `git status`, so we hold the per-folder git
+		// mutex for the seed step (and only the seed step — the
+		// walk itself is pure fs I/O and doesn't compete for git's
+		// index.lock).
+		let guard = self.git_lock().await;
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
 			let skip = collapsed_ignored_dirs(&root);
 			let mut out = Vec::new();
 			walk_paths(&root, "", &mut out, 0, max_depth, &skip);
@@ -1231,10 +1265,14 @@ impl WorkspaceHost for LocalHost {
 		if rels.is_empty() {
 			return Ok(());
 		}
+		let guard = self.git_lock().await;
 		let root = self.root.clone();
-		tokio::task::spawn_blocking(move || run_git_restore(&root, &rels))
-			.await
-			.map_err(|e| MoonError::Internal(format!("git_restore_paths join error: {e}")))??;
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			run_git_restore(&root, &rels)
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_restore_paths join error: {e}")))??;
 		// Restored files may have been open in the editor; the
 		// editorconfig cache doesn't key on content, so no entry is
 		// stale, but staying symmetric with trash/delete keeps future
@@ -1272,10 +1310,14 @@ impl WorkspaceHost for LocalHost {
 				}
 			}
 		}
+		let guard = self.git_lock().await;
 		let root = self.root.clone();
-		tokio::task::spawn_blocking(move || run_git_blame(&root, &rel))
-			.await
-			.map_err(|e| MoonError::Internal(format!("git_blame join error: {e}")))?
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			run_git_blame(&root, &rel)
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_blame join error: {e}")))?
 	}
 
 	async fn git_head_content(&self, path: &Utf8Path) -> MoonResult<Option<String>> {
@@ -1321,41 +1363,61 @@ impl WorkspaceHost for LocalHost {
 				}
 			}
 		}
+		let guard = self.git_lock().await;
 		let root = self.root.clone();
 		let rev = rev.to_owned();
-		tokio::task::spawn_blocking(move || run_git_ref_content(&root, &rev, &rel))
-			.await
-			.map_err(|e| MoonError::Internal(format!("git_ref_content join error: {e}")))?
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			run_git_ref_content(&root, &rev, &rel)
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_ref_content join error: {e}")))?
 	}
 
 	async fn git_default_branch_diff(&self) -> MoonResult<Option<BranchDiffStatus>> {
+		let guard = self.git_lock().await;
 		let root = self.root.clone();
-		tokio::task::spawn_blocking(move || Ok(run_git_default_branch_diff(&root)))
-			.await
-			.map_err(|e| MoonError::Internal(format!("git_default_branch_diff join error: {e}")))?
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			Ok(run_git_default_branch_diff(&root))
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_default_branch_diff join error: {e}")))?
 	}
 
 	async fn git_branch(&self) -> MoonResult<GitBranchInfo> {
+		let guard = self.git_lock().await;
 		let root = self.root.clone();
-		tokio::task::spawn_blocking(move || Ok(run_git_branch(&root)))
-			.await
-			.map_err(|e| MoonError::Internal(format!("git_branch join error: {e}")))?
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			Ok(run_git_branch(&root))
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_branch join error: {e}")))?
 	}
 
 	async fn git_commit_on_new_branch(&self, branch: &str, message: &str) -> MoonResult<GitCommitResult> {
+		let guard = self.git_lock().await;
 		let root = self.root.clone();
 		let branch = branch.to_owned();
 		let message = message.to_owned();
-		tokio::task::spawn_blocking(move || run_git_commit_on_new_branch(&root, &branch, &message))
-			.await
-			.map_err(|e| MoonError::Internal(format!("git_commit_on_new_branch join error: {e}")))?
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			run_git_commit_on_new_branch(&root, &branch, &message)
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_commit_on_new_branch join error: {e}")))?
 	}
 
 	async fn git_diff_summary(&self) -> MoonResult<String> {
+		let guard = self.git_lock().await;
 		let root = self.root.clone();
-		tokio::task::spawn_blocking(move || Ok(run_git_diff_summary(&root)))
-			.await
-			.map_err(|e| MoonError::Internal(format!("git_diff_summary join error: {e}")))?
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			Ok(run_git_diff_summary(&root))
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_diff_summary join error: {e}")))?
 	}
 
 	async fn git_commit(&self, message: &str, amend: bool) -> MoonResult<GitCommitResult> {
@@ -1363,23 +1425,33 @@ impl WorkspaceHost for LocalHost {
 		if trimmed.is_empty() && !amend {
 			return Err(MoonError::invalid("commit message is empty"));
 		}
+		let guard = self.git_lock().await;
 		let root = self.root.clone();
 		let owned = trimmed.to_owned();
-		tokio::task::spawn_blocking(move || run_git_commit(&root, &owned, amend))
-			.await
-			.map_err(|e| MoonError::Internal(format!("git_commit join error: {e}")))?
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			run_git_commit(&root, &owned, amend)
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_commit join error: {e}")))?
 	}
 
 	async fn git_push(&self) -> MoonResult<()> {
+		let guard = self.git_lock().await;
 		let root = self.root.clone();
-		tokio::task::spawn_blocking(move || run_git_simple(&root, &["push"], "git push"))
-			.await
-			.map_err(|e| MoonError::Internal(format!("git_push join error: {e}")))?
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			run_git_simple(&root, &["push"], "git push")
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_push join error: {e}")))?
 	}
 
 	async fn git_publish_branch(&self) -> MoonResult<()> {
+		let guard = self.git_lock().await;
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
 			run_git_simple(
 				&root,
 				&["push", "--set-upstream", "origin", "HEAD"],
@@ -1391,16 +1463,22 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_pull(&self) -> MoonResult<()> {
+		let guard = self.git_lock().await;
 		let root = self.root.clone();
-		tokio::task::spawn_blocking(move || run_git_simple(&root, &["pull"], "git pull"))
-			.await
-			.map_err(|e| MoonError::Internal(format!("git_pull join error: {e}")))?
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			run_git_simple(&root, &["pull"], "git pull")
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_pull join error: {e}")))?
 	}
 
 	async fn git_merge_default_branch(&self, remote_ref: &str) -> MoonResult<()> {
+		let guard = self.git_lock().await;
 		let root = self.root.clone();
 		let remote_ref = remote_ref.to_owned();
 		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
 			run_git_simple(
 				&root,
 				&["merge", "--no-edit", &remote_ref],
@@ -1412,33 +1490,55 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_fetch(&self) -> MoonResult<()> {
+		// `run_git_fetch_quiet` is async (uses tokio's
+		// `Command` for the timeout), so the guard just needs to
+		// outlive the await.
+		let _guard = self.git_lock().await;
 		run_git_fetch_quiet(&self.root).await
 	}
 
 	async fn branch_list(&self, pr_scope: PrListScope) -> MoonResult<BranchList> {
+		// `run_branch_list` shells out to `git for-each-ref` and
+		// `gh pr list`; both can compete with concurrent index
+		// writes. `gh` is the slow bit (network), so the worst
+		// case is a commit waiting a few seconds for an in-flight
+		// PR list — acceptable.
+		let _guard = self.git_lock().await;
 		run_branch_list(&self.root, pr_scope).await
 	}
 
 	async fn branch_switch(&self, target: &BranchSwitchTarget) -> MoonResult<()> {
+		let guard = self.git_lock().await;
 		let root = self.root.clone();
 		let target = target.clone();
-		tokio::task::spawn_blocking(move || run_branch_switch(&root, &target))
-			.await
-			.map_err(|e| MoonError::Internal(format!("branch_switch join error: {e}")))?
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			run_branch_switch(&root, &target)
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("branch_switch join error: {e}")))?
 	}
 
 	async fn git_head_commit_message(&self) -> MoonResult<String> {
+		let guard = self.git_lock().await;
 		let root = self.root.clone();
-		tokio::task::spawn_blocking(move || Ok(run_git_head_commit_message(&root)))
-			.await
-			.map_err(|e| MoonError::Internal(format!("git_head_commit_message join error: {e}")))?
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			Ok(run_git_head_commit_message(&root))
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_head_commit_message join error: {e}")))?
 	}
 
 	async fn git_diff_patch(&self) -> MoonResult<String> {
+		let guard = self.git_lock().await;
 		let root = self.root.clone();
-		tokio::task::spawn_blocking(move || Ok(run_git_diff_patch(&root)))
-			.await
-			.map_err(|e| MoonError::Internal(format!("git_diff_patch join error: {e}")))?
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			Ok(run_git_diff_patch(&root))
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_diff_patch join error: {e}")))?
 	}
 }
 
@@ -1672,6 +1772,25 @@ fn encode_branch_segment(branch: &str) -> String {
 /// friendlier message. Amend with no staged changes and no
 /// message change is a no-op git refuses with the same preamble;
 /// the rewrite covers it too.
+///
+/// **Safety snapshot.** After `git add -A` lands every change in
+/// the index, we take a `git stash create` snapshot of that
+/// index. If `git commit` fails for any reason between then and
+/// success — most importantly, a misbehaving pre-commit hook
+/// (lint-staged, pre-commit) that crashes mid-stash-apply and
+/// leaves the working tree in pieces — we restore via
+/// [`try_restore_commit_safety_snapshot`] so the user never
+/// loses files. The per-folder git mutex (ADR 0015) makes the
+/// corruption window essentially zero from our side, but the
+/// snapshot is cheap and gives us a last-resort if the hook
+/// itself races against a sibling process or has a bug of its
+/// own. On success the snapshot becomes an unreferenced commit
+/// object that git GC will drop in the usual 30/90 day window.
+///
+/// We snapshot **after** `git add -A` rather than before because
+/// `git stash create -u` silently drops untracked files on
+/// git ≤ 2.43 — but staging-as-Added pulls them into the index
+/// where a vanilla `git stash create` captures them.
 fn run_git_commit(root: &Utf8Path, message: &str, amend: bool) -> MoonResult<GitCommitResult> {
 	use std::process::Command;
 
@@ -1682,12 +1801,17 @@ fn run_git_commit(root: &Utf8Path, message: &str, amend: bool) -> MoonResult<Git
 		.output()
 		.map_err(|e| MoonError::IoError(format!("git add failed to launch: {e}")))?;
 	if !stage.status.success() {
+		// `git add` failed before we touched anything reversible,
+		// so there's nothing to restore — let the error propagate
+		// straight through.
 		let stderr = String::from_utf8_lossy(&stage.stderr).trim().to_string();
 		return Err(MoonError::IoError(format!(
 			"git add exited {}: {stderr}",
 			stage.status.code().unwrap_or(-1)
 		)));
 	}
+
+	let safety = take_commit_safety_snapshot(root);
 
 	let mut commit = Command::new("git");
 	commit
@@ -1718,6 +1842,9 @@ fn run_git_commit(root: &Utf8Path, message: &str, amend: bool) -> MoonResult<Git
 	if !commit.status.success() {
 		let stdout = String::from_utf8_lossy(&commit.stdout).to_string();
 		let stderr = String::from_utf8_lossy(&commit.stderr).trim().to_string();
+		if let Some(snap) = &safety {
+			try_restore_commit_safety_snapshot(root, snap);
+		}
 		// `git commit` prints "nothing to commit, working tree clean"
 		// (or one of several variants) on stdout when the index has
 		// no staged changes after our `add -A` pass — typically
@@ -1771,6 +1898,144 @@ fn run_git_commit(root: &Utf8Path, message: &str, amend: bool) -> MoonResult<Git
 	};
 
 	Ok(GitCommitResult { short_sha, summary })
+}
+
+/// Snapshot the current index as a free-floating stash commit
+/// and return its SHA. Called **after** `git add -A` so the
+/// index already has every working-tree change — including
+/// previously-untracked files, which `git stash create -u`
+/// silently drops on git ≤ 2.43. Returns `None` on a clean tree
+/// (nothing to snapshot) or any git failure.
+///
+/// The created object is **not** in the stash list — it's a
+/// dangling commit. Callers either reference it explicitly via
+/// [`try_restore_commit_safety_snapshot`] or let it be GC'd.
+/// Cost is sub-millisecond on a typical repo.
+fn take_commit_safety_snapshot(root: &Utf8Path) -> Option<String> {
+	use std::process::Command;
+
+	let output = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["stash", "create"])
+		.output()
+		.ok()?;
+	if !output.status.success() {
+		return None;
+	}
+	let sha = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+	if sha.is_empty() {
+		return None;
+	}
+	Some(sha)
+}
+
+/// Best-effort restore from a snapshot taken by
+/// [`take_commit_safety_snapshot`]. Sequence:
+///
+/// 1. `git read-tree --reset <snap>` rewrites the index to match
+///    the snapshot's tree (which is everything we had staged
+///    just before `git commit` ran the hooks).
+/// 2. `git checkout-index -a -f` writes every index entry back
+///    to the working tree, restoring files a misbehaving hook
+///    deleted and overwriting any half-applied modifications.
+///
+/// The "untracked" / "tracked" distinction collapses here
+/// because step 1 happens after `git add -A` snapshotted both
+/// into the index. **Side effect:** any files a successful
+/// hook auto-fixed (`eslint --fix`, `prettier --write`, etc.)
+/// in the working tree get wiped on restore — but the restore
+/// only runs when the commit also failed, in which case the
+/// auto-fix would have been discarded by lint-staged's own
+/// "revert to original state" path anyway. Net: same end-state
+/// the user expects from a failed commit, plus the data-loss
+/// guarantee.
+///
+/// Falls back to `git stash store`-ing the snapshot under a
+/// labelled message if any of those commands fail. The labelled
+/// stash surfaces in `git stash list` so the recovery path is
+/// discoverable without reading our logs.
+///
+/// Errors are never propagated — restoration is opportunistic
+/// and the caller is already returning a commit failure. The
+/// `tracing` lines are the supported triage channel.
+fn try_restore_commit_safety_snapshot(root: &Utf8Path, sha: &str) {
+	use std::process::Command;
+
+	let read_tree = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["read-tree", "--reset", sha])
+		.output();
+	let read_tree_ok = matches!(&read_tree, Ok(o) if o.status.success());
+	if !read_tree_ok {
+		log_safety_snapshot_failure(sha, "read-tree", &read_tree);
+		store_safety_snapshot_for_manual_recovery(root, sha);
+		return;
+	}
+
+	let checkout = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["checkout-index", "-a", "-f"])
+		.output();
+	let checkout_ok = matches!(&checkout, Ok(o) if o.status.success());
+	if !checkout_ok {
+		log_safety_snapshot_failure(sha, "checkout-index", &checkout);
+		store_safety_snapshot_for_manual_recovery(root, sha);
+		return;
+	}
+
+	tracing::info!(
+		snapshot = %sha,
+		"moon-ide: commit failed; restored index + working tree from safety snapshot",
+	);
+}
+
+fn log_safety_snapshot_failure(sha: &str, step: &str, result: &std::io::Result<std::process::Output>) {
+	match result {
+		Ok(o) => {
+			let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+			tracing::warn!(
+				snapshot = %sha,
+				step,
+				%stderr,
+				"moon-ide: safety snapshot restore step failed",
+			);
+		}
+		Err(e) => {
+			tracing::warn!(
+				snapshot = %sha,
+				step,
+				error = %e,
+				"moon-ide: safety snapshot restore step failed to launch",
+			);
+		}
+	}
+}
+
+fn store_safety_snapshot_for_manual_recovery(root: &Utf8Path, sha: &str) {
+	use std::process::Command;
+
+	let store = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args([
+			"stash",
+			"store",
+			"--quiet",
+			"-m",
+			"moon-ide commit safety snapshot — recover with `git stash pop`",
+			sha,
+		])
+		.output();
+	if let Err(e) = store {
+		tracing::warn!(
+			snapshot = %sha,
+			error = %e,
+			"moon-ide: safety snapshot store failed to launch — snapshot survives only as a dangling commit",
+		);
+	}
 }
 
 /// Validate `branch` with `git check-ref-format --branch`, create
@@ -4611,6 +4876,199 @@ mod tests {
 			.output()
 			.unwrap();
 		assert!(String::from_utf8_lossy(&branch_list.stdout).trim().is_empty());
+	}
+
+	#[tokio::test]
+	async fn safety_snapshot_restores_after_destructive_pre_commit_hook() {
+		// Pre-commit frameworks (lint-staged, pre-commit) do their
+		// own stash dance during `git commit`. When that dance is
+		// interrupted mid-`git stash apply`, the working tree
+		// loses files. Our safety snapshot (taken right before
+		// `git add -A`) is the last-resort restore that brings
+		// them back. This test simulates that exact corruption: a
+		// hook that deletes the working tree and then exits
+		// non-zero, mimicking a crashed lint-staged.
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping safety-snapshot test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		std::fs::write(dir.path().join("seed.txt"), "seed\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "initial"]);
+
+		// Tracked modification, plus an untracked new file.
+		std::fs::write(dir.path().join("seed.txt"), "modified content\n").unwrap();
+		std::fs::write(dir.path().join("brand_new.rs"), "fn main() {}\n// new file\n").unwrap();
+
+		// Destructive pre-commit hook: blow away the staged paths
+		// and exit non-zero. This is the worst-case shape of a
+		// hook crash mid-flight.
+		let hooks_dir = dir.path().join(".git/hooks");
+		std::fs::create_dir_all(&hooks_dir).unwrap();
+		let hook_path = hooks_dir.join("pre-commit");
+		std::fs::write(&hook_path, "#!/bin/sh\nrm -f seed.txt brand_new.rs\nexit 1\n").unwrap();
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			let mut perms = std::fs::metadata(&hook_path).unwrap().permissions();
+			perms.set_mode(0o755);
+			std::fs::set_permissions(&hook_path, perms).unwrap();
+		}
+
+		let result = host(&dir).git_commit("test commit", false).await;
+		assert!(result.is_err(), "commit should have failed: {result:?}");
+
+		// Files survive thanks to the safety snapshot. Without the
+		// snapshot the hook's `rm -f` leaves the working tree
+		// empty (only `seed.txt` would come back via git's own
+		// implicit reset, and `brand_new.rs` would be permanently
+		// gone — it was untracked).
+		assert!(
+			dir.path().join("seed.txt").exists(),
+			"tracked file lost after hook crash"
+		);
+		assert!(
+			dir.path().join("brand_new.rs").exists(),
+			"untracked file lost after hook crash"
+		);
+		let seed = std::fs::read_to_string(dir.path().join("seed.txt")).unwrap();
+		assert_eq!(seed, "modified content\n", "tracked file content lost");
+		let brand_new = std::fs::read_to_string(dir.path().join("brand_new.rs")).unwrap();
+		assert_eq!(brand_new, "fn main() {}\n// new file\n", "untracked file content lost");
+	}
+
+	#[tokio::test]
+	async fn safety_snapshot_restores_after_destructive_hook_on_new_branch() {
+		// Same setup, but exercising `git_commit_on_new_branch`
+		// since that's the path the user actually hit. The flow
+		// composes (`git_commit_on_new_branch` calls into
+		// `run_git_commit` which holds the snapshot), so the
+		// expectation is identical: files survive on disk after
+		// the hook crash.
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping safety-snapshot new-branch test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		std::fs::write(dir.path().join("seed.txt"), "seed\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "initial"]);
+
+		std::fs::write(dir.path().join("seed.txt"), "branch-mode change\n").unwrap();
+		std::fs::write(dir.path().join("new_on_branch.rs"), "// new\n").unwrap();
+
+		let hooks_dir = dir.path().join(".git/hooks");
+		std::fs::create_dir_all(&hooks_dir).unwrap();
+		let hook_path = hooks_dir.join("pre-commit");
+		std::fs::write(&hook_path, "#!/bin/sh\nrm -f seed.txt new_on_branch.rs\nexit 1\n").unwrap();
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			let mut perms = std::fs::metadata(&hook_path).unwrap().permissions();
+			perms.set_mode(0o755);
+			std::fs::set_permissions(&hook_path, perms).unwrap();
+		}
+
+		let result = host(&dir).git_commit_on_new_branch("feature/safety", "msg").await;
+		assert!(result.is_err(), "commit should have failed: {result:?}");
+
+		assert!(dir.path().join("seed.txt").exists());
+		assert!(dir.path().join("new_on_branch.rs").exists());
+		assert_eq!(
+			std::fs::read_to_string(dir.path().join("seed.txt")).unwrap(),
+			"branch-mode change\n"
+		);
+
+		// Branch rollback still happened — HEAD is back on `main`.
+		let head_branch = std::process::Command::new(&git)
+			.arg("-C")
+			.arg(dir.path())
+			.args(["symbolic-ref", "--short", "HEAD"])
+			.output()
+			.unwrap();
+		assert_eq!(String::from_utf8_lossy(&head_branch.stdout).trim(), "main");
+	}
+
+	#[tokio::test]
+	async fn concurrent_commits_serialise_via_git_mutex() {
+		// Two commits firing concurrently against the same host.
+		// The pre-commit hook sleeps for 200ms, so without the
+		// per-folder mutex the two `git add` / `git commit`
+		// invocations would overlap and at least one would fail
+		// with `Unable to create '.git/index.lock': File exists`.
+		// With the mutex the second commit waits for the first
+		// to finish entirely; both succeed.
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping concurrent-commits test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		std::fs::write(dir.path().join("seed.txt"), "seed\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "initial"]);
+
+		// Slow but harmless hook.
+		let hooks_dir = dir.path().join(".git/hooks");
+		std::fs::create_dir_all(&hooks_dir).unwrap();
+		let hook_path = hooks_dir.join("pre-commit");
+		std::fs::write(&hook_path, "#!/bin/sh\nsleep 0.2\nexit 0\n").unwrap();
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			let mut perms = std::fs::metadata(&hook_path).unwrap().permissions();
+			perms.set_mode(0o755);
+			std::fs::set_permissions(&hook_path, perms).unwrap();
+		}
+
+		let host = std::sync::Arc::new(host(&dir));
+
+		std::fs::write(dir.path().join("a.txt"), "first\n").unwrap();
+		let host1 = host.clone();
+		let h1 = tokio::spawn(async move { host1.git_commit("first commit", false).await });
+
+		// Brief jitter so both tasks are in flight; without the
+		// mutex this is the window where their `.git/index.lock`
+		// usage overlaps. With the mutex, h2 just waits.
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+		std::fs::write(dir.path().join("b.txt"), "second\n").unwrap();
+		let host2 = host.clone();
+		let h2 = tokio::spawn(async move { host2.git_commit("second commit", false).await });
+
+		let r1 = h1.await.unwrap();
+		let r2 = h2.await.unwrap();
+		assert!(r1.is_ok(), "first commit failed: {r1:?}");
+		assert!(r2.is_ok(), "second commit failed: {r2:?}");
+
+		// Both commits land in the log on top of the initial one.
+		let log = std::process::Command::new(&git)
+			.arg("-C")
+			.arg(dir.path())
+			.args(["log", "--oneline"])
+			.output()
+			.unwrap();
+		let lines: Vec<_> = String::from_utf8_lossy(&log.stdout)
+			.lines()
+			.filter(|l| !l.is_empty())
+			.map(str::to_owned)
+			.collect();
+		assert_eq!(lines.len(), 3, "expected initial + 2 commits, got: {lines:?}");
+
+		// `.git/index.lock` is not lingering.
+		assert!(
+			!dir.path().join(".git/index.lock").exists(),
+			"index.lock leaked across commits"
+		);
 	}
 
 	#[tokio::test]
