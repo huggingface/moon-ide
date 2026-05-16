@@ -202,7 +202,10 @@
 	/* Popover anchored under the pill. `right: 0` so a long list
 	   grows leftward instead of clipping off the panel on narrow
 	   widths. Width caps + max-height keep a chatty agent's plan
-	   from eating the whole header. */
+	   from eating the whole header. Uses `--m-bg-2` (the same
+	   solid surface the status-bar popovers use) — the previous
+	   `--m-bg-elevated` fallback to `--m-bg-overlay` rendered
+	   ~3 % alpha and let coder-row text bleed through. */
 	.popover {
 		position: absolute;
 		top: calc(100% + 6px);
@@ -212,10 +215,10 @@
 		max-width: min(360px, 90vw);
 		max-height: 360px;
 		overflow: auto;
-		background: var(--m-bg-elevated, var(--m-bg-overlay));
-		border: 1px solid var(--m-border, transparent);
+		background: var(--m-bg-2);
+		border: 1px solid var(--m-border-strong, var(--m-border, transparent));
 		border-radius: 6px;
-		box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
+		box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
 		padding: 6px 0;
 	}
 	.list {
