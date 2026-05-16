@@ -85,14 +85,23 @@ Three control surfaces:
 - **Abort** (`Esc`): cancels the in-flight HTTP / SSE / tool-call.
   The session keeps the partial assistant message and any completed
   tool calls; the loop stops cleanly.
-- **Steer** (Enter while `streaming` / `tools`): queue a user message
-  to be delivered after the current turn settles (i.e. all tool
-  calls from this assistant message complete). One queued message
-  at a time by default; the queue is visible above the composer.
-- **Follow-up** (Alt+Enter while idle-but-just-finished): queue a
-  user message to be delivered after the agent finishes _all_ work —
-  i.e. when there are no more tool calls and no steering messages
-  to inject.
+- **Steer** (Enter while `streaming` / `tools`): the composer stays
+  editable mid-turn. Pressing Enter fires `coder_send` like a
+  regular message; the runner sees a turn already in flight,
+  appends the text to `Session.pending_steers`, and emits a
+  `user_message` event so the bubble lands in the transcript
+  immediately. The running `run_turn` drains the queue at its next
+  iteration top — after the current iteration's tool results have
+  settled, before the next LLM call — so the model sees the steer
+  on its next round-trip. Persistence happens at drain time, never
+  at queue time, because the OpenAI / Anthropic chat shape forbids
+  a user message between an `assistant.tool_calls` and its tool
+  result rows; persisting then would corrupt session reload.
+  Aborts (`Esc`) drop undrained steers — pressing Esc throws away
+  in-flight intent, including queued context.
+- **Follow-up** (Alt+Enter while idle-but-just-finished): future —
+  not implemented. For now, sending while idle just starts a fresh
+  turn the moment the user hits Enter.
 
 These match pi's defaults. They also match the Slack panel's
 keymap (Enter sends, Shift+Enter newline) so a user moving between

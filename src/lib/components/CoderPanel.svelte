@@ -789,12 +789,11 @@
 				bind:this={composer}
 				use:textInputUndo
 				placeholder={coder.busy
-					? 'Press Esc to stop the turn…'
+					? 'Steer the running turn (Enter to send, Esc to stop)…'
 					: coder.attachments.length > 0
 						? 'Ask about the attached selection…'
 						: 'Ask the coder…'}
 				rows="3"
-				disabled={coder.busy}
 				onkeydown={onComposerKey}
 				oninput={onComposerInput}
 			></textarea>

@@ -1264,16 +1264,20 @@ class CoderPanelState {
 		// active-file hint is implicit: present-or-absent on every
 		// turn, doesn't count as "the user wanted to send" on its
 		// own (it would auto-fire on Enter in an empty composer).
-		if ((text.length === 0 && attachments.length === 0) || this.busy) {
+		// Sending while busy is a *steer*: the backend queues it
+		// and drains into the running turn at its next iteration
+		// boundary so the model can incorporate the new context
+		// without the user having to abort and restart.
+		if (text.length === 0 && attachments.length === 0) {
 			return;
 		}
 		const payload = renderPromptWithAttachments(text, attachments, activeFilePath);
 		this.draft = '';
 		this.clearAttachments();
 		// Optimistic flip — the `user_message` event lands within
-		// milliseconds and reconciles, but the composer needs to
-		// disable immediately or the user can fire a second turn
-		// before the round-trip completes.
+		// milliseconds and reconciles. For an initial send this is
+		// what stops a double-fire while the IPC is in flight; for
+		// a steer (already busy) it's a no-op.
 		this.busy = true;
 		try {
 			await ipc.coder.send(payload);

@@ -225,6 +225,21 @@ struct Session {
 	/// [`SessionRecord::TodosUpdate`] — replay seeds this from
 	/// the **last** record on disk.
 	todos: Vec<crate::TodoItem>,
+	/// User messages typed into the composer while a turn is
+	/// already running. The runner drains them into `messages`
+	/// (and persists each as a `SessionRecord::User`) at the top
+	/// of every `run_turn` iteration — i.e. after the previous
+	/// iteration's tool results have settled, before the next LLM
+	/// call. That ordering matters: the OpenAI / Anthropic chat
+	/// shape forbids a user message between an `assistant` with
+	/// `tool_calls` and its `tool` result rows, so persisting at
+	/// queue time would corrupt the on-disk transcript and break
+	/// session reload. In-memory only; an aborted turn drops
+	/// undrained steers (the `UserMessage` event already fired,
+	/// so the bubble lingers for the rest of the session but is
+	/// gone on next reload — acceptable trade-off, the user
+	/// pressed Esc to throw away in-flight intent).
+	pending_steers: Vec<String>,
 }
 
 impl Session {
@@ -259,6 +274,7 @@ impl Session {
 			auto_rename_pending: false,
 			last_usage: None,
 			todos: Vec::new(),
+			pending_steers: Vec::new(),
 		}
 	}
 
@@ -1129,6 +1145,7 @@ impl CoderHandle {
 			// guard on the very next prompt.
 			last_usage,
 			todos: last_todos,
+			pending_steers: Vec::new(),
 		};
 		*fs.session.lock().await = session;
 
@@ -1223,14 +1240,29 @@ impl CoderHandle {
 		let (fs, folder_path) = self.state.active_folder_session().await?;
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
 
-		// Reject double-sends within this **folder**. Other folders
-		// can have their own turns running simultaneously — the
-		// per-folder turn lock means switching projects doesn't
-		// stall the agent in the one you left behind.
+		// A second `send` while a turn is already in flight is a
+		// **steer**: queue the new user message and let the
+		// running `run_turn` drain it at its next iteration top.
+		// The composer stays open during a turn so the user can
+		// nudge the model mid-flight ("also do X", "actually
+		// scratch that, just summarise"). Other folders can have
+		// their own turns running simultaneously — the per-folder
+		// turn lock means switching projects doesn't stall the
+		// agent in the one you left behind.
 		{
 			let turn = fs.turn.lock().await;
 			if turn.cancel.is_some() {
-				return Err(CoderError::Internal("a turn is already running for this folder".into()));
+				drop(turn);
+				let mut session = fs.session.lock().await;
+				session.pending_steers.push(text.clone());
+				session.header.updated_at_ms = current_time_ms();
+				drop(session);
+				let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string());
+				sink.send(CoderEvent::UserMessage {
+					id: new_message_id(),
+					text,
+				});
+				return Ok(());
 			}
 		}
 
@@ -1422,6 +1454,18 @@ async fn run_turn(
 		if cancel.is_cancelled() {
 			return Err(CoderError::Aborted);
 		}
+
+		// Drain any user steers queued via `send()` while this
+		// turn was running. Each one becomes a real
+		// `ChatMessage::User` in the prompt and a
+		// `SessionRecord::User` on disk. We persist here (not at
+		// queue time) because the chat shape forbids a user
+		// message between an `assistant` with `tool_calls` and
+		// its `tool` rows; queuing during `dispatch_tool_calls`
+		// and persisting then would interleave them and break
+		// session reload. Compaction below sees the steers in
+		// `messages` and folds them like any other history.
+		drain_pending_steers(fs).await;
 
 		// Token-aware compaction before each round-trip. Reads the
 		// session's last-seen usage; if it crossed the threshold,
@@ -2203,6 +2247,43 @@ async fn read_agent_rules(folder_root: &Utf8Path) -> Option<String> {
 		return Some(text);
 	}
 	None
+}
+
+/// Drain `pending_steers` into `session.messages` and persist
+/// each as a [`SessionRecord::User`]. Called at the top of every
+/// `run_turn` iteration so steers reach the model on the next
+/// LLM round-trip. The session lock is held while we lift the
+/// queue and append, then dropped before the (slow) JSONL write
+/// so a steer arriving mid-write doesn't block on us; an aborted
+/// turn that never gets to drain leaves the queue intact for
+/// garbage collection when the session itself is replaced
+/// (`load_session`, `clear_session`).
+async fn drain_pending_steers(fs: &Arc<FolderSession>) {
+	let (steers, dir, header) = {
+		let mut session = fs.session.lock().await;
+		if session.pending_steers.is_empty() {
+			return;
+		}
+		let drained: Vec<String> = std::mem::take(&mut session.pending_steers);
+		for text in &drained {
+			session.messages.push(ChatMessage::User { content: text.clone() });
+		}
+		session.header.updated_at_ms = current_time_ms();
+		let dir = session.session_dir.clone();
+		let header = session.header.clone();
+		(drained, dir, header)
+	};
+	let Some(dir) = dir else {
+		return;
+	};
+	for text in steers {
+		if let Err(err) = sessions::append_record(&dir, &header, &SessionRecord::User { text }).await {
+			tracing::warn!(error = %err, "failed to persist steered user message");
+			continue;
+		}
+		let mut session = fs.session.lock().await;
+		session.persisted_records = session.persisted_records.saturating_add(1);
+	}
 }
 
 /// Append an `Assistant` record to the JSONL of the given
@@ -3061,5 +3142,108 @@ mod tests {
 		assert!(!summary.contains("tool body"));
 		assert!(summary.contains("user: do thing"));
 		assert!(summary.contains("assistant: done"));
+	}
+
+	fn header_for(id: &str) -> SessionHeader {
+		SessionHeader {
+			schema: SESSION_SCHEMA_VERSION,
+			id: id.into(),
+			title: "steer test".into(),
+			created_at_ms: 1,
+			updated_at_ms: 1,
+			model: "test/model".into(),
+			parent_session_id: None,
+			parent_tool_call_id: None,
+			subagent_mode: None,
+			subagent_target_folder: None,
+		}
+	}
+
+	#[tokio::test]
+	async fn drain_pending_steers_appends_in_order_and_persists() {
+		// Drain has to land queued steers as `ChatMessage::User`
+		// at the end of `messages` (so the chat shape stays valid
+		// — system → user → … → assistant.tool_calls → tool*) and
+		// must persist each as a `SessionRecord::User` in queue
+		// order. This test holds both at once: queue two steers
+		// behind an existing tool result, drain, check messages
+		// + JSONL line up.
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let header = header_for("sess-steer");
+		let mut session = Session::new_blank();
+		session.header = header.clone();
+		session.session_dir = Some(dir.clone());
+		session.messages = vec![
+			ChatMessage::System { content: "sys".into() },
+			ChatMessage::User {
+				content: "do thing".into(),
+			},
+			ChatMessage::Assistant {
+				content: None,
+				tool_calls: Vec::new(),
+			},
+			ChatMessage::Tool {
+				tool_call_id: "tc-1".into(),
+				content: "{}".into(),
+			},
+		];
+		session.pending_steers = vec!["also do X".into(), "and then Y".into()];
+		let fs = Arc::new(FolderSession {
+			session: Mutex::new(session),
+			turn: Mutex::new(TurnState::default()),
+		});
+
+		drain_pending_steers(&fs).await;
+
+		let session = fs.session.lock().await;
+		assert!(session.pending_steers.is_empty());
+		match session.messages.last() {
+			Some(ChatMessage::User { content }) => assert_eq!(content, "and then Y"),
+			other => panic!("last message should be the second steer, got {other:?}"),
+		}
+		match &session.messages[session.messages.len() - 2] {
+			ChatMessage::User { content } => assert_eq!(content, "also do X"),
+			other => panic!("second-to-last should be the first steer, got {other:?}"),
+		}
+		assert_eq!(session.persisted_records, 2);
+		drop(session);
+
+		let jsonl = tokio::fs::read_to_string(sessions::session_path(&dir, "sess-steer").as_std_path())
+			.await
+			.unwrap();
+		assert!(jsonl.contains(r#""text":"also do X""#), "{jsonl}");
+		assert!(jsonl.contains(r#""text":"and then Y""#), "{jsonl}");
+		// Ordering on disk matches queue order, not timestamp
+		// (which is identical for both records anyway).
+		let first = jsonl.find("also do X").unwrap();
+		let second = jsonl.find("and then Y").unwrap();
+		assert!(first < second, "steers persisted out of order: {jsonl}");
+	}
+
+	#[tokio::test]
+	async fn drain_pending_steers_is_a_noop_when_queue_is_empty() {
+		// Iteration top fires `drain_pending_steers` unconditionally;
+		// the empty-queue path must not touch `messages`,
+		// `persisted_records`, or `updated_at_ms`. Without this
+		// guard every iteration would needlessly bump the
+		// session header.
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let mut session = Session::new_blank();
+		session.session_dir = Some(dir);
+		let original_len = session.messages.len();
+		let original_updated = session.header.updated_at_ms;
+		let fs = Arc::new(FolderSession {
+			session: Mutex::new(session),
+			turn: Mutex::new(TurnState::default()),
+		});
+
+		drain_pending_steers(&fs).await;
+
+		let session = fs.session.lock().await;
+		assert_eq!(session.messages.len(), original_len);
+		assert_eq!(session.header.updated_at_ms, original_updated);
+		assert_eq!(session.persisted_records, 0);
 	}
 }
