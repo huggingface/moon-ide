@@ -125,6 +125,35 @@
 	// allow it and noop in `moveFile` when the move is a no-op.
 	let dropAtEnd = $state(false);
 
+	// Strip element so we can scroll the active tab into view when
+	// the user opens / focuses a file from elsewhere (file tree,
+	// command palette, "go to definition", etc). Without this, a
+	// long-running session where the user has 30 tabs open ends up
+	// switching to a file whose tab is two screens off and the
+	// horizontal scroll position never catches up.
+	let tabsEl: HTMLDivElement | undefined = $state(undefined);
+	$effect(() => {
+		// Track both deps explicitly so the effect re-runs on
+		// activate-different-tab and on reorder (drag, close).
+		activePath;
+		tabPaths;
+		if (!tabsEl || activePath === null) {
+			return;
+		}
+		// Defer one frame so the just-mounted tab is in the DOM
+		// when we look it up — `$effect` runs after the current
+		// flush, but the tab node for a freshly-opened file is
+		// only attached during that same flush, and on cold open
+		// (first render) `querySelector` would otherwise miss it.
+		const handle = requestAnimationFrame(() => {
+			const el = tabsEl?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]');
+			if (el) {
+				el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+			}
+		});
+		return () => cancelAnimationFrame(handle);
+	});
+
 	function close(event: Event, path: string) {
 		event.stopPropagation();
 		void workspace.closeFile(path, side);
@@ -391,6 +420,7 @@
 -->
 <div class="strip">
 	<div
+		bind:this={tabsEl}
 		class="tabs"
 		class:drop-end={dropAtEnd}
 		role="tablist"
