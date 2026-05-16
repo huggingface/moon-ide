@@ -16,7 +16,7 @@
 	import { coder } from './lib/coder.svelte';
 	import { bottomPanel } from './lib/bottomPanel.svelte';
 	import { canOpenContainerTerminal, openContainerTerminal, openHostTerminal } from './lib/openTerminal';
-	import { palette, reloadWindow } from './lib/commands.svelte';
+	import { palette, reloadWindow, searchQueryFromSelection } from './lib/commands.svelte';
 	import { cycleFocus } from './lib/focus';
 	import { ipc } from './lib/ipc';
 	import { formatError } from './lib/protocol';
@@ -192,7 +192,11 @@
 			}
 			if (event.shiftKey && key === 'f') {
 				event.preventDefault();
-				palette.show('search');
+				// Pre-fill with the editor selection, mirroring
+				// VS Code / Cursor. The palette input auto-selects
+				// on focus so the user can immediately retype to
+				// replace, or just hit Enter to run the search.
+				palette.show('search', searchQueryFromSelection());
 				return;
 			}
 			if (event.shiftKey && key === 'b') {

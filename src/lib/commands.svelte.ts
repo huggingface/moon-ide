@@ -29,6 +29,35 @@ export function commandTitle(cmd: Command): string {
 	return typeof cmd.title === 'function' ? cmd.title() : cmd.title;
 }
 
+/**
+ * Pre-fill string for the "Search in Files…" palette. Mirrors
+ * VS Code / Cursor: opening the workspace search with a non-empty
+ * editor selection drops the selected text into the search box so
+ * the user can hit Enter immediately. Multi-line selections
+ * collapse to their first non-empty line — a multi-line ripgrep
+ * pattern is rarely what the user meant, and the palette input is
+ * single-line anyway. Returns `''` when there's nothing usable
+ * (no selection, blank-only selection, or a payload long enough
+ * that pre-filling would dominate the input field).
+ */
+export function searchQueryFromSelection(): string {
+	const sel = workspace.activeSelection;
+	if (sel === null) {
+		return '';
+	}
+	for (const line of sel.text.split(/\r?\n/)) {
+		const trimmed = line.trim();
+		if (trimmed.length === 0) {
+			continue;
+		}
+		if (trimmed.length > 200) {
+			return '';
+		}
+		return trimmed;
+	}
+	return '';
+}
+
 export type PaletteMode = 'commands' | 'files' | 'search';
 
 class PaletteState {
@@ -173,7 +202,7 @@ export const builtInCommands: Command[] = [
 		id: 'palette.searchInFiles',
 		title: 'Search in Files…',
 		shortcut: 'Ctrl+Shift+F',
-		run: () => palette.show('search'),
+		run: () => palette.show('search', searchQueryFromSelection()),
 	},
 	{
 		id: 'git.switchBranch',
