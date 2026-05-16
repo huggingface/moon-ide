@@ -248,15 +248,22 @@
 			}
 		}
 		if (blobs.length === 0) {
-			// WebKitGTK exposes nothing in `ClipboardEvent` for many
-			// image clipboards (screenshot tools, image apps); the
-			// event arrives empty even though the OS clipboard
-			// holds a picture. Fall through to the Tauri-side
-			// `readImage` API, which goes through the OS clipboard
-			// directly (arboard) instead of the web layer. We always
-			// preventDefault here — the textarea would otherwise
-			// just receive nothing, but staying explicit means a
-			// rebound textarea event handler can't sneak in.
+			// The WebKitGTK image-clipboard workaround. WebKit
+			// hands us a totally empty `ClipboardEvent` for many
+			// image clipboards (screenshot tools, image apps),
+			// even though the OS clipboard holds a picture; we
+			// fall through to the Tauri-side `readImage` API
+			// (arboard) for that case. Crucially we only do this
+			// when the event itself is empty — if it carries
+			// `text/plain` (or anything else) we let the textarea
+			// handle it normally. Previously we always
+			// `preventDefault`ed here, which silently ate every
+			// text paste because the OS clipboard image read
+			// returned null and the original text never landed.
+			const eventEmpty = items.length === 0 && data.files.length === 0 && data.types.length === 0;
+			if (!eventEmpty) {
+				return;
+			}
 			event.preventDefault();
 			const blob = await tryReadClipboardImage();
 			if (blob === null) {
