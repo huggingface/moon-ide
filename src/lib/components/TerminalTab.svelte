@@ -74,6 +74,46 @@
 		);
 
 		term.open(hostEl);
+		// Linux convention for copy / paste in a terminal is
+		// Ctrl+Shift+C / Ctrl+Shift+V — Ctrl+C is reserved for
+		// SIGINT. xterm.js doesn't ship that mapping by default,
+		// so we intercept the keydown before it reaches the
+		// terminal's input pipeline. `attachCustomKeyEventHandler`
+		// returning `false` swallows the event entirely (no PTY
+		// write, no scroll, no bell). `e.code` is layout-
+		// independent — important on a French keyboard, where
+		// `e.key` for the C key shifts to a different glyph.
+		term.attachCustomKeyEventHandler((event) => {
+			if (event.type !== 'keydown' || !event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey) {
+				return true;
+			}
+			if (event.code === 'KeyC') {
+				const text = term?.getSelection() ?? '';
+				if (text.length > 0) {
+					void navigator.clipboard.writeText(text).catch(() => {
+						// Swallow — failing silently is better than a
+						// modal; the user can retry, or fall back to
+						// the menu copy via right-click selection.
+					});
+				}
+				return false;
+			}
+			if (event.code === 'KeyV') {
+				void navigator.clipboard
+					.readText()
+					.then((text) => {
+						if (text.length === 0) {
+							return;
+						}
+						void terminalStore.writeInput(tab.id, encoder.encode(text));
+					})
+					.catch(() => {
+						// As above — silent failure beats a modal.
+					});
+				return false;
+			}
+			return true;
+		});
 		// Defer the initial fit: in some startup paths the panel
 		// is still settling layout when `onMount` fires, so a
 		// direct `fit()` here can compute a 1-row grid and stick
