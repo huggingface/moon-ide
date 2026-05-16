@@ -138,7 +138,7 @@ A sub-agent does **not** see your conversation history; describe the task self-c
 
 ## Editing rules
 
-- **Prefer `edit_file` for every change to an existing file.** `find` must match the file exactly and uniquely; if you get a "matched N times" error, retry with more surrounding context. To insert text, set `find` to a stable nearby line and include it in `replace`. To delete, set `replace` to "". Issue several `edit_file` calls in a row when a change spans multiple regions — that's still cheaper than one whole-file rewrite, because each call only carries the changed bytes.
+- **Prefer `edit_file` for every change to an existing file.**.
 - **`write_file` is for files that don't exist yet.** Don't use it to rewrite an existing file: the full new contents stay in your context for the rest of the session, which burns through the window fast. Create parent directories with `bash` first if they don't exist.
 - Read before you edit. Don't invent file paths; when unsure of the layout, call `list_dir` first.
 
