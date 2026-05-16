@@ -91,17 +91,30 @@ user; write in third-person past tense (\"the user asked\", \"the assistant edit
 that aren't in the prefix. Do not include the entire transcript verbatim. Aim for somewhere between 4,000 and \
 16,000 tokens of output — long enough to be useful, short enough not to dominate the next round-trip's window.";
 
+/// Outcome of one [`compact_if_needed`] call. The summary +
+/// `messages_compacted` are what the caller persists into the
+/// session JSONL as a [`crate::sessions::SessionRecord::Compaction`]
+/// so reopening the session reaches the same compacted in-memory
+/// shape instead of re-inflating the full pre-compaction
+/// transcript.
+pub(crate) struct CompactionApplied {
+	pub summary: String,
+	pub messages_compacted: u32,
+}
+
 /// Inspect the last reported token usage; if the next prompt is
 /// likely to cross [`COMPACT_THRESHOLD`] of the context window,
 /// run a fast-model summary call and replace the older prefix of
 /// `messages` with a synthetic [`ChatMessage::System`] holding
 /// that summary.
 ///
-/// Returns `true` when compaction actually ran (and `messages`
-/// was mutated). Returns `false` when the threshold wasn't met,
-/// when there isn't enough history to compact, or when the fast
-/// model call itself failed (logged at warn — the agent keeps
-/// going and will try again on the next turn).
+/// Returns `Some` when compaction actually ran (and `messages`
+/// was mutated) — the caller is responsible for persisting the
+/// returned summary as a `SessionRecord::Compaction` so replay
+/// reaches the same shape. Returns `None` when the threshold
+/// wasn't met, when there isn't enough history to compact, or
+/// when the fast model call itself failed (logged at warn — the
+/// agent keeps going and will try again on the next turn).
 ///
 /// `subagent_id_for_wrap` distinguishes parent vs sub-agent
 /// callers. When `Some(id)`, every emitted [`CoderEvent`] is
@@ -115,21 +128,19 @@ pub(crate) async fn compact_if_needed(
 	last_usage: Option<&TokenUsage>,
 	messages: &mut Vec<ChatMessage>,
 	cancel: &CancellationToken,
-) -> bool {
-	let Some(usage) = last_usage else {
-		return false;
-	};
+) -> Option<CompactionApplied> {
+	let usage = last_usage?;
 	// Context-window cap is a property of the *driver* model — the
 	// one whose history we're trying to fit. The cheap model only
 	// has to chew through `messages[1..cutoff]` for the summary;
 	// its own window doesn't gate the decision.
 	let context = models.context_window(models.standard());
 	if context == 0 {
-		return false;
+		return None;
 	}
 	let ratio = usage.prompt_tokens as f32 / context as f32;
 	if ratio < COMPACT_THRESHOLD {
-		return false;
+		return None;
 	}
 
 	let Some(cutoff) = find_cutoff_index(messages) else {
@@ -144,12 +155,12 @@ pub(crate) async fn compact_if_needed(
 			context_window = context,
 			"compaction threshold crossed but no compactable prefix; passing through"
 		);
-		return false;
+		return None;
 	};
 
 	let older = &messages[1..cutoff];
 	if older.is_empty() {
-		return false;
+		return None;
 	}
 	let messages_compacted = older.len() as u32;
 
@@ -184,7 +195,7 @@ pub(crate) async fn compact_if_needed(
 					prompt_tokens_after: usage.prompt_tokens,
 				},
 			);
-			return false;
+			return None;
 		}
 	};
 	let summary = response.content.clone().unwrap_or_default();
@@ -198,16 +209,10 @@ pub(crate) async fn compact_if_needed(
 				prompt_tokens_after: usage.prompt_tokens,
 			},
 		);
-		return false;
+		return None;
 	}
 
-	messages.drain(1..cutoff);
-	messages.insert(
-		1,
-		ChatMessage::System {
-			content: format!("{COMPACTION_HEADER}{summary}"),
-		},
-	);
+	apply_summary_to_messages(messages, cutoff, &summary);
 
 	let prompt_tokens_after = estimate_prompt_tokens(messages);
 	tracing::info!(
@@ -220,11 +225,30 @@ pub(crate) async fn compact_if_needed(
 		sink,
 		subagent_id_for_wrap,
 		CoderEvent::CompactionComplete {
-			summary,
+			summary: summary.clone(),
 			prompt_tokens_after,
 		},
 	);
-	true
+	Some(CompactionApplied {
+		summary,
+		messages_compacted,
+	})
+}
+
+/// Replace `messages[1..cutoff]` with one synthetic system
+/// message holding the compaction summary. Shared between live
+/// compaction and replay so both paths produce the byte-identical
+/// in-memory `messages` shape — without that, "what the model
+/// sees after a compaction" would diverge between a live run and
+/// the same session reopened from disk.
+pub(crate) fn apply_summary_to_messages(messages: &mut Vec<ChatMessage>, cutoff: usize, summary: &str) {
+	messages.drain(1..cutoff);
+	messages.insert(
+		1,
+		ChatMessage::System {
+			content: format!("{COMPACTION_HEADER}{summary}"),
+		},
+	);
 }
 
 /// Return the index of the K-th most recent user message
@@ -404,5 +428,72 @@ mod tests {
 		// messages later in the slice are fine because their
 		// parent assistant rides with them.
 		assert!(matches!(msgs[cutoff], ChatMessage::User { .. }));
+	}
+
+	#[test]
+	fn replay_cutoff_at_len_drops_everything_since_system_prompt() {
+		// Replay-time shape: rebuild messages from JSONL records
+		// up through the Compaction record, then call
+		// `apply_summary_to_messages` with `cutoff = messages.len()`.
+		// Result must be exactly `[system_prompt, summary]` —
+		// reopening a compacted session shouldn't carry the
+		// pre-compaction transcript along.
+		let mut msgs = vec![system("S"), user("u0"), assistant("a0"), user("u1"), assistant("a1")];
+		let cutoff = msgs.len();
+		apply_summary_to_messages(&mut msgs, cutoff, "earlier turns: did stuff");
+		assert_eq!(msgs.len(), 2);
+		match &msgs[0] {
+			ChatMessage::System { content } => assert_eq!(content, "S"),
+			other => panic!("expected original system prompt at index 0, got {other:?}"),
+		}
+		match &msgs[1] {
+			ChatMessage::System { content } => {
+				assert!(
+					content.contains("earlier turns: did stuff"),
+					"summary system message should contain the supplied summary, got: {content}"
+				);
+			}
+			other => panic!("expected summary system message at index 1, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn live_apply_then_replay_apply_yield_same_shape() {
+		// Two paths reach the same in-memory `messages`:
+		//   1. live: drain `[1..cutoff]`, insert summary,
+		//      append the post-cutoff tail (already there).
+		//   2. replay: rebuild every record into messages,
+		//      then drain `[1..len]` on the Compaction record,
+		//      then keep appending newer records.
+		// Both must produce byte-identical output for the same
+		// summary; otherwise the prompt diverges between a live
+		// session and the same session reopened.
+		let live = {
+			let mut m = vec![
+				system("S"),
+				user("u0"),
+				assistant("a0"),
+				user("u1"),
+				assistant("a1"),
+				user("u2"),
+				assistant("a2"),
+			];
+			apply_summary_to_messages(&mut m, 5, "summary text");
+			m
+		};
+		let replay = {
+			let mut m = vec![system("S"), user("u0"), assistant("a0"), user("u1"), assistant("a1")];
+			let cutoff = m.len();
+			apply_summary_to_messages(&mut m, cutoff, "summary text");
+			m.push(user("u2"));
+			m.push(assistant("a2"));
+			m
+		};
+		assert_eq!(live.len(), replay.len());
+		for (i, (a, b)) in live.iter().zip(replay.iter()).enumerate() {
+			let left = serde_json::to_string(a).unwrap();
+			let right = serde_json::to_string(b).unwrap();
+			assert_eq!(left, right, "mismatch at index {i}: live={left} replay={right}");
+		}
 	}
 }

@@ -1025,7 +1025,7 @@ after:
   user (most recent)
 ```
 
-The on-disk JSONL transcript is **not** rewritten. The full history stays on disk so pop-out / debug / audit see everything; only the in-memory prompt the next round-trip sends gets compacted. As a consequence the on-disk file can be longer than what the agent currently has in front of it; that's intentional.
+The on-disk JSONL transcript is **not** rewritten — the full history stays on disk so pop-out / debug / audit see everything; only the in-memory prompt the next round-trip sends gets compacted. As a consequence the on-disk file can be longer than what the agent currently has in front of it; that's intentional. To keep replay reaching the same compacted shape, the runner also appends a [`SessionRecord::Compaction { summary, messages_compacted }`](../crates/moon-coder/src/sessions.rs) record at the point the live drain happened. On reload, replay rebuilds messages linearly until it hits the `Compaction` record, drops everything since `messages[0]` (the composed system prompt), inserts the synthetic summary system message, and keeps replaying newer records on top. Without this record, reopening a long compacted session would re-inflate the entire pre-compaction transcript and the next turn would instantly trip the provider's context-length cap.
 
 Two events fire around the pass:
 

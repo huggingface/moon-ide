@@ -1107,6 +1107,19 @@ impl CoderHandle {
 				SessionRecord::TodosUpdate { todos } => {
 					last_todos = todos.clone();
 				}
+				SessionRecord::Compaction { summary, .. } => {
+					// Replay-time compaction: drop everything we
+					// rebuilt since the system prompt and replace
+					// it with the synthetic summary, exactly the
+					// way the live runtime did when the record was
+					// first written. Without this, reopening a
+					// session that was compacted mid-run would
+					// re-inflate the full pre-compaction
+					// transcript and the next turn would instantly
+					// trip the provider's context-length cap.
+					let cutoff = messages.len();
+					crate::compaction::apply_summary_to_messages(&mut messages, cutoff, summary);
+				}
 			}
 		}
 		let summary = SessionSummary {
@@ -1498,11 +1511,14 @@ async fn run_turn(
 		// Token-aware compaction before each round-trip. Reads the
 		// session's last-seen usage; if it crossed the threshold,
 		// runs a fast-model summary and rewrites `messages` in
-		// place. The on-disk JSONL transcript is left untouched —
-		// only the in-memory prompt shrinks.
+		// place. We also persist a `Compaction` record into the
+		// JSONL so reloading the session reaches the same shape —
+		// otherwise replay re-inflates the full pre-compaction
+		// transcript and the next turn instantly trips the
+		// provider's context-length cap.
 		let last_usage = fs.session.lock().await.last_usage;
 		let mut messages = fs.session.lock().await.messages.clone();
-		let did_compact = crate::compaction::compact_if_needed(
+		let compaction = crate::compaction::compact_if_needed(
 			&state.inference,
 			sink,
 			None,
@@ -1512,12 +1528,27 @@ async fn run_turn(
 			&cancel,
 		)
 		.await;
-		if did_compact {
-			let mut session = fs.session.lock().await;
-			session.messages = messages.clone();
-			// Reset the trigger so we don't re-compact next iteration
-			// before the next response's usage lands.
-			session.last_usage = None;
+		if let Some(applied) = compaction {
+			let (header, dir) = {
+				let mut session = fs.session.lock().await;
+				session.messages = messages.clone();
+				// Reset the trigger so we don't re-compact next
+				// iteration before the next response's usage lands.
+				session.last_usage = None;
+				(session.header.clone(), session.session_dir.clone())
+			};
+			if let Some(dir) = dir {
+				let record = SessionRecord::Compaction {
+					summary: applied.summary,
+					messages_compacted: applied.messages_compacted,
+				};
+				if let Err(err) = sessions::append_record(&dir, &header, &record).await {
+					tracing::warn!(error = %err, "failed to persist compaction record; reload will re-inflate the prefix");
+				} else {
+					let mut session = fs.session.lock().await;
+					session.persisted_records = session.persisted_records.saturating_add(1);
+				}
+			}
 		}
 
 		// One stable id per assistant message, shared between the
@@ -2789,6 +2820,17 @@ fn emit_replay_events(sink: &FolderEventSink, record: SessionRecord) {
 			// frontend mirrors `tool_result.todos` into its
 			// `coder.todos` bucket — no need for a synthetic
 			// `TodosUpdate` event during replay.
+		}
+		SessionRecord::Compaction { .. } => {
+			// Compaction shapes the in-memory `messages` slice
+			// at replay time (see [`load_session`]); the panel
+			// has no per-record event to render — the compaction
+			// disclosure is keyed on the live
+			// `compaction_started` / `compaction_complete` event
+			// pair, and we deliberately don't re-fire those on
+			// reload (the user already saw the disclosure when
+			// the live compaction ran; reopening shouldn't pop
+			// it back open).
 		}
 	}
 }

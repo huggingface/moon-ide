@@ -23,6 +23,7 @@ moon-slack = { workspace = true }
 moon-terminal = { workspace = true }
 
 tauri = { version = "2.10", features = ["protocol-asset"] }
+tauri-plugin-clipboard-manager = "2.3"
 tauri-plugin-dialog = "2.4"
 tauri-plugin-fs = "2.4"
 tauri-plugin-opener = "2"

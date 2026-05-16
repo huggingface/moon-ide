@@ -1,7 +1,9 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import { confirm } from '@tauri-apps/plugin-dialog';
+	import { readImage } from '@tauri-apps/plugin-clipboard-manager';
 	import { coder, type CoderRow } from '../coder.svelte';
+	import { frontendLog } from '../logs.svelte';
 	import { slack } from '../slack.svelte';
 	import { workspace } from '../state.svelte';
 	import CoderConnectModal from './CoderConnectModal.svelte';
@@ -199,26 +201,86 @@
 	 *  text representation, common when copying from screenshot
 	 *  apps) attach the image *and* let the text portion paste,
 	 *  so the user can keep typing around the image they just
-	 *  dropped in. */
+	 *  dropped in.
+	 *
+	 *  Looking in three places, in order, because WebKitGTK's
+	 *  clipboard layer is inconsistent about which one a
+	 *  screenshot-tool paste lands in:
+	 *  1. `clipboardData.items` with `kind === 'file'` — the
+	 *     standard path Chromium / Safari macOS use.
+	 *  2. `clipboardData.files` — WebKit on some Linux distros
+	 *     populates this list while leaving `items[*].kind` set
+	 *     to `'string'`.
+	 *  3. `clipboardData.items` with any MIME starting `image/` —
+	 *     fallback for the same WebKit edge case where `kind` is
+	 *     `'string'` but `type` is `image/png` and `getAsFile()`
+	 *     still works. */
 	async function onComposerPaste(event: ClipboardEvent): Promise<void> {
 		const data = event.clipboardData;
 		if (data === null) {
+			frontendLog('moon-ide', 'info', 'composer paste: clipboardData is null');
 			return;
 		}
 		const items = Array.from(data.items);
-		const imageItems = items.filter((it) => it.kind === 'file' && it.type.startsWith('image/'));
-		if (imageItems.length === 0) {
+		const itemDescr = items.map((it) => `${it.kind}/${it.type || '<no-type>'}`).join(', ');
+		const fileDescr = Array.from(data.files)
+			.map((f) => `${f.type || '<no-type>'}/${f.size}B`)
+			.join(', ');
+		frontendLog(
+			'moon-ide',
+			'info',
+			`composer paste: items=[${itemDescr}] files=[${fileDescr}] types=[${data.types.join(', ')}]`,
+		);
+		const blobs: File[] = [];
+		for (const it of items) {
+			if (it.type.startsWith('image/')) {
+				const f = it.getAsFile();
+				if (f !== null) {
+					blobs.push(f);
+				}
+			}
+		}
+		if (blobs.length === 0) {
+			for (const f of Array.from(data.files)) {
+				if (f.type.startsWith('image/')) {
+					blobs.push(f);
+				}
+			}
+		}
+		if (blobs.length === 0) {
+			// WebKitGTK exposes nothing in `ClipboardEvent` for many
+			// image clipboards (screenshot tools, image apps); the
+			// event arrives empty even though the OS clipboard
+			// holds a picture. Fall through to the Tauri-side
+			// `readImage` API, which goes through the OS clipboard
+			// directly (arboard) instead of the web layer. We always
+			// preventDefault here — the textarea would otherwise
+			// just receive nothing, but staying explicit means a
+			// rebound textarea event handler can't sneak in.
+			event.preventDefault();
+			const blob = await tryReadClipboardImage();
+			if (blob === null) {
+				frontendLog('moon-ide', 'info', 'composer paste: no image found in clipboard (web or tauri)');
+				return;
+			}
+			const result = await coder.addImageAttachment(blob, 'pasted.png');
+			if (!result.ok) {
+				coder.rows = [
+					...coder.rows,
+					{
+						kind: 'error',
+						id: `local-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+						text: `Couldn't attach image: ${result.reason}`,
+					},
+				];
+			}
 			return;
 		}
 		const hasText = items.some((it) => it.kind === 'string' && it.type === 'text/plain');
 		if (!hasText) {
 			event.preventDefault();
 		}
-		for (const item of imageItems) {
-			const blob = item.getAsFile();
-			if (blob === null) {
-				continue;
-			}
+		for (const blob of blobs) {
 			const result = await coder.addImageAttachment(blob, blob.name);
 			if (!result.ok) {
 				coder.rows = [
@@ -231,6 +293,43 @@
 				];
 			}
 		}
+	}
+
+	/** Tauri-side clipboard read that bypasses WebKitGTK. Returns
+	 *  a `Blob` when the OS clipboard actually holds an image,
+	 *  `null` otherwise (clipboard empty / text-only / read
+	 *  failed). The plugin gives us raw RGBA bytes; we re-encode
+	 *  to PNG via OffscreenCanvas because providers want a real
+	 *  image MIME on the wire, not raw pixels. */
+	async function tryReadClipboardImage(): Promise<Blob | null> {
+		const image = await readImage().catch((err: unknown) => {
+			// "no image in clipboard" is the common, expected
+			// failure mode and not worth a louder log; we
+			// already log "no image found in clipboard" above.
+			frontendLog('moon-ide', 'info', `composer paste: tauri readImage failed: ${String(err)}`);
+			return null;
+		});
+		if (image === null) {
+			return null;
+		}
+		const size = await image.size();
+		const rgba = await image.rgba();
+		if (size.width === 0 || size.height === 0 || rgba.length === 0) {
+			return null;
+		}
+		frontendLog(
+			'moon-ide',
+			'info',
+			`composer paste: tauri readImage ${size.width}x${size.height} (${rgba.length}B rgba)`,
+		);
+		const canvas = new OffscreenCanvas(size.width, size.height);
+		const ctx = canvas.getContext('2d');
+		if (ctx === null) {
+			return null;
+		}
+		const data = new ImageData(new Uint8ClampedArray(rgba), size.width, size.height);
+		ctx.putImageData(data, 0, 0);
+		return await canvas.convertToBlob({ type: 'image/png' });
 	}
 
 	// State → DOM sync for *external* draft writes only: a folder

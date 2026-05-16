@@ -291,7 +291,11 @@ async fn run_subagent_inner(
 		// is bumping into the model's context window, fold the
 		// older messages into a synthetic system summary before
 		// the next request goes out. No-op early in the run.
-		compaction::compact_if_needed(
+		// Persist a `Compaction` record into the sub-agent's
+		// JSONL alongside the parent path, so a future "reopen
+		// sub-agent transcript" feature replays into the same
+		// compacted shape instead of re-inflating the prefix.
+		let compaction_outcome = compaction::compact_if_needed(
 			inference,
 			sink,
 			Some(&id),
@@ -301,6 +305,18 @@ async fn run_subagent_inner(
 			&cancel,
 		)
 		.await;
+		if let Some(applied) = compaction_outcome {
+			last_usage = None;
+			persist_subagent(
+				&session_dir,
+				&header,
+				&SessionRecord::Compaction {
+					summary: applied.summary,
+					messages_compacted: applied.messages_compacted,
+				},
+			)
+			.await;
+		}
 
 		let assistant_id = format!("{id}::msg-{iter}");
 		let id_for_cb = assistant_id.clone();

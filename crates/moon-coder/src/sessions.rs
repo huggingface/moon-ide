@@ -173,6 +173,20 @@ pub enum SessionRecord {
 		#[serde(default, skip_serializing_if = "u32_is_zero")]
 		cache_creation_input_tokens: u32,
 	},
+	/// One auto-compaction pass landed. The runtime drains the
+	/// older message prefix and replaces it with a synthetic
+	/// system message holding `summary`; this record is the
+	/// on-disk twin so replay reaches the same in-memory shape.
+	/// Without it, reopening a long session re-inflates the full
+	/// pre-compaction transcript and the next turn instantly
+	/// trips the provider's context-length cap.
+	///
+	/// `messages_compacted` mirrors the value the runtime emits
+	/// in [`crate::CoderEvent::CompactionStarted`], kept here
+	/// for symmetry / debugging — replay doesn't actually need
+	/// it (the truncation logic is purely "drop everything since
+	/// the system prompt and inject the summary").
+	Compaction { summary: String, messages_compacted: u32 },
 	/// Snapshot of the session's todo list after one `todo_write`
 	/// call. Append-only: each call writes one record carrying the
 	/// **full** post-merge list (the same list the model sees as
@@ -842,6 +856,52 @@ mod tests {
 			!user_line.contains("\"images\""),
 			"user line still serialised images field: {user_line}"
 		);
+	}
+
+	#[tokio::test]
+	async fn compaction_record_round_trips_via_jsonl() {
+		// Auto-compaction writes a `Compaction` record so that
+		// reopening the session reaches the same compacted
+		// in-memory shape instead of re-inflating the full
+		// pre-compaction transcript. Round-trip the record to
+		// guard the serde shape — losing it silently would push
+		// the next turn over the provider's context-length cap.
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let header = SessionHeader {
+			schema: SESSION_SCHEMA_VERSION,
+			id: "sess-compact".into(),
+			title: "compaction round trip".into(),
+			created_at_ms: 1,
+			updated_at_ms: 1,
+			model: "test/model".into(),
+			parent_session_id: None,
+			parent_tool_call_id: None,
+			subagent_mode: None,
+			subagent_target_folder: None,
+		};
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::Compaction {
+				summary: "earlier turns: refactored foo into bar".into(),
+				messages_compacted: 42,
+			},
+		)
+		.await
+		.unwrap();
+		let loaded = load(&dir, "sess-compact").await.unwrap();
+		assert_eq!(loaded.records.len(), 1);
+		match &loaded.records[0] {
+			SessionRecord::Compaction {
+				summary,
+				messages_compacted,
+			} => {
+				assert_eq!(summary, "earlier turns: refactored foo into bar");
+				assert_eq!(*messages_compacted, 42);
+			}
+			other => panic!("expected compaction record, got {other:?}"),
+		}
 	}
 
 	#[tokio::test]
