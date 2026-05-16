@@ -868,6 +868,38 @@ Cursor's behaviour and is the safer interpretation: the user
 asked about the code as it stood when they attached it, not as
 it stands at send time.
 
+### Image attachments
+
+The user can paste images (e.g. screenshots from the system
+clipboard) directly into the composer textarea. Mechanics:
+
+- Paste handler on the composer reads `ClipboardEvent.clipboardData.items`,
+  pulls out anything with `kind === 'file' && type.startsWith('image/')`,
+  and routes each blob through `coder.addImageAttachment(blob)`.
+  Mixed payloads (image + text representation, common when
+  copying from screenshot apps) attach the image and let the
+  text portion paste.
+- Each image becomes an `ImageComposerAttachment` chip in the
+  same chip strip as selection chips, with a thumbnail in place
+  of the file icon. The × removes it; sending clears the strip.
+  Cap: 4 MB per image (decoded), 10 images per send — the user
+  gets a friendly inline error if they try to exceed either.
+- On send, image attachments are split out of the chip list and
+  shipped to `coder_send` as a separate `images` argument
+  alongside the text+context payload. The Rust side carries them
+  on the `ChatMessage::User` variant and emits OpenAI-compatible
+  `{"type": "image_url", "image_url": {"url": "data:..."}}` blocks
+  on the wire (OpenRouter normalises this into Anthropic's
+  `image` block on the way through).
+- Persisted in JSONL via `SessionRecord::User { text, images }`
+  with `skip_serializing_if = "Vec::is_empty"`, so existing
+  no-image transcripts keep their old line shape and replay on
+  any build.
+- Replayed on session reopen as a `CoderEvent::UserMessage` that
+  carries the images through to the user's bubble, which renders
+  them as clickable thumbnails (click → open full-size in a new
+  tab via the data URL).
+
 ### Compaction
 
 Long sessions exceed the model's context window. moon-coder ships

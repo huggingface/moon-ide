@@ -227,7 +227,7 @@ async fn generate_and_cache(
 		ChatMessage::System {
 			content: SUMMARY_SYSTEM_PROMPT.to_string(),
 		},
-		ChatMessage::User { content: user_prompt },
+		ChatMessage::user(user_prompt),
 	];
 	let response = inference
 		.chat_completion(cheap_model, &messages, &[], cancel)

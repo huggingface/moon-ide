@@ -163,9 +163,7 @@ pub(crate) async fn compact_if_needed(
 		ChatMessage::System {
 			content: SUMMARY_SYSTEM_PROMPT.to_string(),
 		},
-		ChatMessage::User {
-			content: render_prefix_for_summary(older),
-		},
+		ChatMessage::user(render_prefix_for_summary(older)),
 	];
 	let response = match inference
 		.chat_completion(models.cheap(), &summary_call, &[], cancel)
@@ -278,9 +276,18 @@ Each block is one message; roles are explicit. The first message is the start of
 				out.push_str(content);
 				out.push_str("\n\n");
 			}
-			ChatMessage::User { content } => {
+			ChatMessage::User { content, images } => {
 				out.push_str("### user\n");
 				out.push_str(content);
+				if !images.is_empty() {
+					// Note image presence so the summary doesn't
+					// claim the user "didn't show me anything"
+					// when there were screenshots in the prefix.
+					// We can't usefully describe the pixels here
+					// (the cheap summary model never saw them),
+					// so a count is the honest minimum.
+					out.push_str(&format!("\n[{} attached image(s)]", images.len()));
+				}
 				out.push_str("\n\n");
 			}
 			ChatMessage::Assistant { content, tool_calls } => {
@@ -323,7 +330,7 @@ mod tests {
 	use crate::inference::{ChatMessage, FunctionCall, ToolCall};
 
 	fn user(t: &str) -> ChatMessage {
-		ChatMessage::User { content: t.into() }
+		ChatMessage::user(t)
 	}
 	fn assistant(t: &str) -> ChatMessage {
 		ChatMessage::Assistant {
@@ -375,7 +382,7 @@ mod tests {
 		// and the cutoff index points at u4.
 		let cutoff = find_cutoff_index(&msgs).expect("cutoff");
 		match &msgs[cutoff] {
-			ChatMessage::User { content } => assert_eq!(content, "u4"),
+			ChatMessage::User { content, .. } => assert_eq!(content, "u4"),
 			other => panic!("cutoff did not land on a user message: {other:?}"),
 		}
 	}

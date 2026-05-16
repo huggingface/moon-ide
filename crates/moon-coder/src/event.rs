@@ -30,8 +30,16 @@ pub struct CoderEventEnvelope {
 pub enum CoderEvent {
 	/// The user's prompt is in the session and a turn just started.
 	/// Carries the message verbatim so the UI can render it without
-	/// echoing what it just sent.
-	UserMessage { id: String, text: String },
+	/// echoing what it just sent. `images` is the data-URL form of
+	/// any pictures pasted into the composer; empty for the vast
+	/// majority of turns and elided from the wire shape in that
+	/// case to keep the common-path payload small.
+	UserMessage {
+		id: String,
+		text: String,
+		#[serde(default, skip_serializing_if = "Vec::is_empty")]
+		images: Vec<crate::inference::ImageAttachment>,
+	},
 
 	/// A new assistant message bubble has started in the current
 	/// turn — fires before the first `AssistantMessageDelta` for a

@@ -1187,6 +1187,20 @@ export type DeviceCode = {
 	device_code: string;
 };
 
+/**
+ * One image the user pasted into the composer, shipped over IPC to
+ * `coder_send` (and persisted into the session JSONL on the way).
+ * Mirrors `moon_coder::ImageAttachment`. `data_url` is the canonical
+ * `data:<mime>;base64,<payload>` form — what providers want on the
+ * wire and what we hand straight back to the model on session
+ * replay. `mime` is duplicated so neither side has to re-parse the
+ * data URL prefix when emitting wire messages.
+ */
+export type ImageAttachmentPayload = {
+	data_url: string;
+	mime: string;
+};
+
 /** Snapshot returned by `coder_status`. Mirrors `moon_coder::CoderStatus`. */
 export type CoderStatus = {
 	signed_in: boolean;
@@ -1207,7 +1221,7 @@ export type CoderStatus = {
  * because 6.0 doesn't persist the session.
  */
 export type CoderEvent =
-	| { kind: 'user_message'; id: string; text: string }
+	| { kind: 'user_message'; id: string; text: string; images?: ImageAttachmentPayload[] }
 	| { kind: 'assistant_message_start'; id: string }
 	| { kind: 'assistant_message_delta'; id: string; delta: string }
 	| { kind: 'assistant_thinking_delta'; id: string; delta: string }

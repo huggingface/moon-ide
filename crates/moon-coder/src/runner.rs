@@ -36,7 +36,9 @@ use crate::defaults::{MAX_TURN_ITERATIONS, PHASE_6_0_SYSTEM_PROMPT};
 use crate::error::CoderError;
 use crate::event::{CoderEvent, CoderEventEnvelope, CoderStatus, TokenUsageSource};
 use crate::folder_summary::FolderSummaryService;
-use crate::inference::{AssistantResponse, ChatMessage, FunctionCall, InferenceClient, StreamEvent, TokenUsage};
+use crate::inference::{
+	AssistantResponse, ChatMessage, FunctionCall, ImageAttachment, InferenceClient, StreamEvent, TokenUsage,
+};
 use crate::models::{self, CoderModels, ResolvedProvider, SharedCoderModels};
 use crate::providers::{self, ProviderKeyring};
 use crate::sessions::{
@@ -239,7 +241,18 @@ struct Session {
 	/// so the bubble lingers for the rest of the session but is
 	/// gone on next reload — acceptable trade-off, the user
 	/// pressed Esc to throw away in-flight intent).
-	pending_steers: Vec<String>,
+	pending_steers: Vec<PendingSteer>,
+}
+
+/// One queued steer waiting to be drained into `session.messages`
+/// at the top of the next `run_turn` iteration. Carries the user
+/// text plus any images they pasted into the composer while the
+/// turn was already running, so the model sees the same shape it
+/// would have seen for a regular send.
+#[derive(Debug, Clone)]
+struct PendingSteer {
+	text: String,
+	images: Vec<ImageAttachment>,
 }
 
 impl Session {
@@ -833,7 +846,7 @@ impl CoderHandle {
 			ChatMessage::System {
 				content: BRANCH_NAME_SYSTEM_PROMPT.to_string(),
 			},
-			ChatMessage::User { content: prompt },
+			ChatMessage::user(prompt),
 		];
 		let cheap_model = self.state.models.read().await.cheap().to_owned();
 		let cancel = CancellationToken::new();
@@ -872,7 +885,7 @@ impl CoderHandle {
 			ChatMessage::System {
 				content: COMMIT_MESSAGE_SYSTEM_PROMPT.to_string(),
 			},
-			ChatMessage::User { content: prompt },
+			ChatMessage::user(prompt),
 		];
 		let cheap_model = self.state.models.read().await.cheap().to_owned();
 		let cancel = CancellationToken::new();
@@ -1053,8 +1066,11 @@ impl CoderHandle {
 		// echo it onto the rebuilt `ChatMessage::Tool`.
 		for record in &records {
 			match record {
-				SessionRecord::User { text } => {
-					messages.push(ChatMessage::User { content: text.clone() });
+				SessionRecord::User { text, images } => {
+					messages.push(ChatMessage::User {
+						content: text.clone(),
+						images: images.clone(),
+					});
 				}
 				SessionRecord::Assistant {
 					content,
@@ -1217,7 +1233,7 @@ impl CoderHandle {
 		Ok(())
 	}
 
-	pub async fn send(&self, text: String) -> Result<(), CoderError> {
+	pub async fn send(&self, text: String, images: Vec<ImageAttachment>) -> Result<(), CoderError> {
 		// Bail early if the active route can't authenticate —
 		// surface a clean error instead of letting the inference
 		// layer fail on the first request. HF needs OAuth; user
@@ -1254,13 +1270,17 @@ impl CoderHandle {
 			if turn.cancel.is_some() {
 				drop(turn);
 				let mut session = fs.session.lock().await;
-				session.pending_steers.push(text.clone());
+				session.pending_steers.push(PendingSteer {
+					text: text.clone(),
+					images: images.clone(),
+				});
 				session.header.updated_at_ms = current_time_ms();
 				drop(session);
 				let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string());
 				sink.send(CoderEvent::UserMessage {
 					id: new_message_id(),
 					text,
+					images,
 				});
 				return Ok(());
 			}
@@ -1323,14 +1343,21 @@ impl CoderHandle {
 		// the in-memory turn proceeds.
 		{
 			let mut session = fs.session.lock().await;
-			session.messages.push(ChatMessage::User { content: text.clone() });
+			session.messages.push(ChatMessage::User {
+				content: text.clone(),
+				images: images.clone(),
+			});
 			let header = session.header.clone();
 			let dir = session
 				.session_dir
 				.clone()
 				.expect("session_dir set above before this point");
 			drop(session);
-			if let Err(err) = sessions::append_record(&dir, &header, &SessionRecord::User { text: text.clone() }).await {
+			let record = SessionRecord::User {
+				text: text.clone(),
+				images: images.clone(),
+			};
+			if let Err(err) = sessions::append_record(&dir, &header, &record).await {
 				tracing::warn!(error = %err, "failed to persist user message");
 			} else {
 				let mut session = fs.session.lock().await;
@@ -1342,6 +1369,7 @@ impl CoderHandle {
 		sink.send(CoderEvent::UserMessage {
 			id: user_id,
 			text: text.clone(),
+			images: images.clone(),
 		});
 
 		let state = self.state.clone();
@@ -1655,9 +1683,7 @@ done, what's still unfinished, and any uncertainty. If the user needs to take a 
 	);
 	{
 		let mut session = fs.session.lock().await;
-		session.messages.push(ChatMessage::User {
-			content: sentinel_text.clone(),
-		});
+		session.messages.push(ChatMessage::user(sentinel_text.clone()));
 	}
 	{
 		// Best-effort persist of the sentinel into the JSONL — same
@@ -1675,6 +1701,7 @@ done, what's still unfinished, and any uncertainty. If the user needs to take a 
 				&header,
 				&SessionRecord::User {
 					text: sentinel_text.clone(),
+					images: Vec::new(),
 				},
 			)
 			.await
@@ -1689,6 +1716,7 @@ done, what's still unfinished, and any uncertainty. If the user needs to take a 
 	sink.send(CoderEvent::UserMessage {
 		id: sentinel_id,
 		text: sentinel_text,
+		images: Vec::new(),
 	});
 
 	let messages = fs.session.lock().await.messages.clone();
@@ -2264,9 +2292,12 @@ async fn drain_pending_steers(fs: &Arc<FolderSession>) {
 		if session.pending_steers.is_empty() {
 			return;
 		}
-		let drained: Vec<String> = std::mem::take(&mut session.pending_steers);
-		for text in &drained {
-			session.messages.push(ChatMessage::User { content: text.clone() });
+		let drained: Vec<PendingSteer> = std::mem::take(&mut session.pending_steers);
+		for steer in &drained {
+			session.messages.push(ChatMessage::User {
+				content: steer.text.clone(),
+				images: steer.images.clone(),
+			});
 		}
 		session.header.updated_at_ms = current_time_ms();
 		let dir = session.session_dir.clone();
@@ -2276,8 +2307,12 @@ async fn drain_pending_steers(fs: &Arc<FolderSession>) {
 	let Some(dir) = dir else {
 		return;
 	};
-	for text in steers {
-		if let Err(err) = sessions::append_record(&dir, &header, &SessionRecord::User { text }).await {
+	for steer in steers {
+		let record = SessionRecord::User {
+			text: steer.text,
+			images: steer.images,
+		};
+		if let Err(err) = sessions::append_record(&dir, &header, &record).await {
 			tracing::warn!(error = %err, "failed to persist steered user message");
 			continue;
 		}
@@ -2399,7 +2434,7 @@ fn spawn_auto_rename(state: Arc<CoderState>, fs: Arc<FolderSession>, sink: Folde
 			ChatMessage::System {
 				content: AUTO_RENAME_SYSTEM_PROMPT.to_string(),
 			},
-			ChatMessage::User { content: transcript },
+			ChatMessage::user(transcript),
 		];
 		let cheap_model = state.models.read().await.cheap().to_owned();
 		let cancel = CancellationToken::new();
@@ -2627,7 +2662,7 @@ fn summarise_transcript(messages: &[ChatMessage]) -> String {
 	for msg in messages {
 		match msg {
 			ChatMessage::System { .. } => continue,
-			ChatMessage::User { content } => {
+			ChatMessage::User { content, .. } => {
 				out.push_str("user: ");
 				out.push_str(content);
 				out.push('\n');
@@ -2679,10 +2714,11 @@ fn sanitise_auto_title(raw: &str) -> String {
 /// already seen it stream and we don't have the original timing.
 fn emit_replay_events(sink: &FolderEventSink, record: SessionRecord) {
 	match record {
-		SessionRecord::User { text } => {
+		SessionRecord::User { text, images } => {
 			sink.send(CoderEvent::UserMessage {
 				id: new_message_id(),
 				text,
+				images,
 			});
 		}
 		SessionRecord::Assistant {
@@ -2821,12 +2857,24 @@ pub(crate) fn emit_token_usage(
 /// Rough byte-count of every chat message — covers system / user /
 /// assistant / tool. Includes `tool_calls` argument strings since
 /// those land in the prompt verbatim and can be substantial when
-/// the model emits long structured arguments.
+/// the model emits long structured arguments. Image attachments
+/// add their data-URL length to the count: the bytes/4 estimate
+/// is still a coarse approximation for vision tokens (providers
+/// typically charge per tile or a fixed amount per image rather
+/// than by base64 length), but counting *something* keeps a
+/// freshly pasted screenshot from looking free until the
+/// provider's first usage chunk lands.
 pub(crate) fn estimate_prompt_tokens(messages: &[ChatMessage]) -> u32 {
 	let mut bytes: usize = 0;
 	for msg in messages {
 		match msg {
-			ChatMessage::System { content } | ChatMessage::User { content } => bytes += content.len(),
+			ChatMessage::System { content } => bytes += content.len(),
+			ChatMessage::User { content, images } => {
+				bytes += content.len();
+				for img in images {
+					bytes += img.data_url.len();
+				}
+			}
 			ChatMessage::Assistant { content, tool_calls } => {
 				bytes += content.as_deref().map(str::len).unwrap_or(0);
 				for call in tool_calls {
@@ -3125,9 +3173,7 @@ mod tests {
 			ChatMessage::System {
 				content: "system prompt body".into(),
 			},
-			ChatMessage::User {
-				content: "do thing".into(),
-			},
+			ChatMessage::user("do thing"),
 			ChatMessage::Tool {
 				tool_call_id: "x".into(),
 				content: "tool body".into(),
@@ -3176,9 +3222,7 @@ mod tests {
 		session.session_dir = Some(dir.clone());
 		session.messages = vec![
 			ChatMessage::System { content: "sys".into() },
-			ChatMessage::User {
-				content: "do thing".into(),
-			},
+			ChatMessage::user("do thing"),
 			ChatMessage::Assistant {
 				content: None,
 				tool_calls: Vec::new(),
@@ -3188,7 +3232,16 @@ mod tests {
 				content: "{}".into(),
 			},
 		];
-		session.pending_steers = vec!["also do X".into(), "and then Y".into()];
+		session.pending_steers = vec![
+			PendingSteer {
+				text: "also do X".into(),
+				images: Vec::new(),
+			},
+			PendingSteer {
+				text: "and then Y".into(),
+				images: Vec::new(),
+			},
+		];
 		let fs = Arc::new(FolderSession {
 			session: Mutex::new(session),
 			turn: Mutex::new(TurnState::default()),
@@ -3199,11 +3252,11 @@ mod tests {
 		let session = fs.session.lock().await;
 		assert!(session.pending_steers.is_empty());
 		match session.messages.last() {
-			Some(ChatMessage::User { content }) => assert_eq!(content, "and then Y"),
+			Some(ChatMessage::User { content, .. }) => assert_eq!(content, "and then Y"),
 			other => panic!("last message should be the second steer, got {other:?}"),
 		}
 		match &session.messages[session.messages.len() - 2] {
-			ChatMessage::User { content } => assert_eq!(content, "also do X"),
+			ChatMessage::User { content, .. } => assert_eq!(content, "also do X"),
 			other => panic!("second-to-last should be the first steer, got {other:?}"),
 		}
 		assert_eq!(session.persisted_records, 2);

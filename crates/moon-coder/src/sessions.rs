@@ -115,8 +115,16 @@ pub struct SessionHeader {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionRecord {
-	/// One user prompt landed.
-	User { text: String },
+	/// One user prompt landed. `images` is the data-URL form of
+	/// any pictures pasted into the composer with the prompt;
+	/// empty for the vast majority of turns and elided from the
+	/// JSONL line in that case so a no-image transcript stays
+	/// trivially diffable.
+	User {
+		text: String,
+		#[serde(default, skip_serializing_if = "Vec::is_empty")]
+		images: Vec<crate::inference::ImageAttachment>,
+	},
 	/// One assistant turn completed. Carries the canonical full
 	/// content + reasoning trace + any tool calls the model
 	/// emitted. Both `content` and `thinking` are `None` when the
@@ -701,9 +709,16 @@ mod tests {
 			subagent_mode: None,
 			subagent_target_folder: None,
 		};
-		append_record(&dir, &header, &SessionRecord::User { text: "hi".into() })
-			.await
-			.unwrap();
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::User {
+				text: "hi".into(),
+				images: Vec::new(),
+			},
+		)
+		.await
+		.unwrap();
 		append_record(
 			&dir,
 			&header,
@@ -741,6 +756,95 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn user_record_round_trips_with_attached_images() {
+		// Regression guard for image attachments: a User record
+		// with `images` must round-trip through JSONL → load
+		// without losing the data URLs, otherwise pasted
+		// screenshots would silently disappear on session
+		// reload.
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let header = SessionHeader {
+			schema: SESSION_SCHEMA_VERSION,
+			id: "sess-img".into(),
+			title: "img round trip".into(),
+			created_at_ms: 1,
+			updated_at_ms: 1,
+			model: "test/model".into(),
+			parent_session_id: None,
+			parent_tool_call_id: None,
+			subagent_mode: None,
+			subagent_target_folder: None,
+		};
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::User {
+				text: "look at this".into(),
+				images: vec![crate::inference::ImageAttachment {
+					data_url: "data:image/png;base64,AAAA".into(),
+					mime: "image/png".into(),
+				}],
+			},
+		)
+		.await
+		.unwrap();
+		let loaded = load(&dir, "sess-img").await.unwrap();
+		assert_eq!(loaded.records.len(), 1);
+		match &loaded.records[0] {
+			SessionRecord::User { text, images } => {
+				assert_eq!(text, "look at this");
+				assert_eq!(images.len(), 1);
+				assert_eq!(images[0].data_url, "data:image/png;base64,AAAA");
+				assert_eq!(images[0].mime, "image/png");
+			}
+			other => panic!("expected user record, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn user_record_without_images_omits_images_field() {
+		// `skip_serializing_if = "Vec::is_empty"` on `images`
+		// must keep no-image User records out of the JSONL.
+		// Otherwise every user line gets a stray `"images":[]`,
+		// which adds nothing and makes a `git log -p` of a
+		// session transcript unreadable.
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let header = SessionHeader {
+			schema: SESSION_SCHEMA_VERSION,
+			id: "sess-noimg".into(),
+			title: "no img".into(),
+			created_at_ms: 1,
+			updated_at_ms: 1,
+			model: "test/model".into(),
+			parent_session_id: None,
+			parent_tool_call_id: None,
+			subagent_mode: None,
+			subagent_target_folder: None,
+		};
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::User {
+				text: "hi".into(),
+				images: Vec::new(),
+			},
+		)
+		.await
+		.unwrap();
+		let body = tokio::fs::read_to_string(session_path(&dir, "sess-noimg").as_std_path())
+			.await
+			.unwrap();
+		// First line is the header, second is the user record.
+		let user_line = body.lines().nth(1).unwrap();
+		assert!(
+			!user_line.contains("\"images\""),
+			"user line still serialised images field: {user_line}"
+		);
+	}
+
+	#[tokio::test]
 	async fn list_sessions_skips_subagent_jsonl() {
 		// Sub-agent transcripts live under per-parent subdirectories
 		// (`<dir>/<parent-id>/<sub-id>.jsonl`). Listing the flat
@@ -762,9 +866,16 @@ mod tests {
 			subagent_mode: None,
 			subagent_target_folder: None,
 		};
-		append_record(&dir, &parent_header, &SessionRecord::User { text: "hi".into() })
-			.await
-			.unwrap();
+		append_record(
+			&dir,
+			&parent_header,
+			&SessionRecord::User {
+				text: "hi".into(),
+				images: Vec::new(),
+			},
+		)
+		.await
+		.unwrap();
 
 		let sub_dir = subagent_session_dir(&dir, "sess-parent");
 		let sub_header = SessionHeader {
@@ -784,6 +895,7 @@ mod tests {
 			&sub_header,
 			&SessionRecord::User {
 				text: "do thing".into(),
+				images: Vec::new(),
 			},
 		)
 		.await
@@ -821,9 +933,16 @@ mod tests {
 			subagent_mode: None,
 			subagent_target_folder: None,
 		};
-		append_record(&dir, &parent_header, &SessionRecord::User { text: "hi".into() })
-			.await
-			.unwrap();
+		append_record(
+			&dir,
+			&parent_header,
+			&SessionRecord::User {
+				text: "hi".into(),
+				images: Vec::new(),
+			},
+		)
+		.await
+		.unwrap();
 		let sub_dir = subagent_session_dir(&dir, "sess-parent");
 		let sub_header = SessionHeader {
 			schema: SESSION_SCHEMA_VERSION,
@@ -837,9 +956,16 @@ mod tests {
 			subagent_mode: Some("agent".into()),
 			subagent_target_folder: None,
 		};
-		append_record(&sub_dir, &sub_header, &SessionRecord::User { text: "x".into() })
-			.await
-			.unwrap();
+		append_record(
+			&sub_dir,
+			&sub_header,
+			&SessionRecord::User {
+				text: "x".into(),
+				images: Vec::new(),
+			},
+		)
+		.await
+		.unwrap();
 
 		delete(&dir, "sess-parent").await.unwrap();
 

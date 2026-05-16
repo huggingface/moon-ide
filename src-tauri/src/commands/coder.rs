@@ -5,7 +5,7 @@
 //! `coder:event` Tauri channel. See
 //! `specs/test-plans/0039-coder-skeleton.md`.
 
-use moon_coder::{CoderHandle, CoderStatus, DeviceCode, HfIdentity, SessionSummary};
+use moon_coder::{CoderHandle, CoderStatus, DeviceCode, HfIdentity, ImageAttachment, SessionSummary};
 use moon_core::app_state as app_state_store;
 use moon_protocol::coder_models::{
 	CoderModelSettings, CoderProviderConfig, ProviderModelSummary, ProviderProbeResult, RouterModel,
@@ -117,8 +117,12 @@ pub async fn coder_sign_out(state: State<'_, AppState>) -> Result<(), MoonError>
 /// already matches, so we don't bother gating it on "is the
 /// pointer stale".
 #[tauri::command]
-pub async fn coder_send(state: State<'_, AppState>, text: String) -> Result<(), MoonError> {
-	state.coder.send(text).await.map_err(MoonError::from)?;
+pub async fn coder_send(
+	state: State<'_, AppState>,
+	text: String,
+	images: Vec<ImageAttachment>,
+) -> Result<(), MoonError> {
+	state.coder.send(text, images).await.map_err(MoonError::from)?;
 	let folder = active_folder_path(&state).await;
 	if let Some(folder) = folder {
 		if let Some(summary) = state.coder.active_session().await {

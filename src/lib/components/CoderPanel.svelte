@@ -189,6 +189,50 @@
 		coder.draft = ta.value;
 	}
 
+	/** Intercept clipboard pastes so we can pull image blobs into
+	 *  the chip strip instead of letting them fall through to the
+	 *  textarea (which would either drop them or, on some
+	 *  browsers, paste a stringified `[object File]` placeholder).
+	 *  Plain-text pastes pass through untouched — we only call
+	 *  `preventDefault` when we actually consumed at least one
+	 *  image from the payload. Mixed payloads (an image plus a
+	 *  text representation, common when copying from screenshot
+	 *  apps) attach the image *and* let the text portion paste,
+	 *  so the user can keep typing around the image they just
+	 *  dropped in. */
+	async function onComposerPaste(event: ClipboardEvent): Promise<void> {
+		const data = event.clipboardData;
+		if (data === null) {
+			return;
+		}
+		const items = Array.from(data.items);
+		const imageItems = items.filter((it) => it.kind === 'file' && it.type.startsWith('image/'));
+		if (imageItems.length === 0) {
+			return;
+		}
+		const hasText = items.some((it) => it.kind === 'string' && it.type === 'text/plain');
+		if (!hasText) {
+			event.preventDefault();
+		}
+		for (const item of imageItems) {
+			const blob = item.getAsFile();
+			if (blob === null) {
+				continue;
+			}
+			const result = await coder.addImageAttachment(blob, blob.name);
+			if (!result.ok) {
+				coder.rows = [
+					...coder.rows,
+					{
+						kind: 'error',
+						id: `local-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+						text: `Couldn't attach image: ${result.reason}`,
+					},
+				];
+			}
+		}
+	}
+
 	// State → DOM sync for *external* draft writes only: a folder
 	// switch (the bucket getter returns a different bucket's
 	// draft), an attachment chip removal (`removeAttachment`
@@ -748,30 +792,38 @@
 		</div>
 		<div class="composer">
 			{#if coder.attachments.length > 0}
-				<!-- Attached selections / files. Click the body to
-					 open the file at the captured range; click the
-					 × to remove the chip. The text snapshot the
-					 chip carries gets prepended to the prompt as a
-					 fenced code block on send. -->
+				<!-- Attached selections / images. Selection chips
+					 click through to the file at the captured
+					 range; image chips show the thumbnail. Both
+					 strip with the × button. -->
 				<div class="attachments" role="list">
 					{#each coder.attachments as attachment (attachment.id)}
 						<div class="attachment" role="listitem">
-							<button
-								type="button"
-								class="attachment-open"
-								title={`${attachment.path}:${attachment.startLine}-${attachment.endLine}`}
-								onclick={() => onOpenAttachment(attachment)}
-							>
-								<FileIcon />
-								<span class="attachment-label">
-									<span class="attachment-name">{baseName(attachment.path)}</span>
-									<span class="attachment-range">
-										{attachment.startLine === attachment.endLine
-											? `:${attachment.startLine}`
-											: `:${attachment.startLine}-${attachment.endLine}`}
+							{#if attachment.kind === 'selection'}
+								<button
+									type="button"
+									class="attachment-open"
+									title={`${attachment.path}:${attachment.startLine}-${attachment.endLine}`}
+									onclick={() => onOpenAttachment(attachment)}
+								>
+									<FileIcon />
+									<span class="attachment-label">
+										<span class="attachment-name">{baseName(attachment.path)}</span>
+										<span class="attachment-range">
+											{attachment.startLine === attachment.endLine
+												? `:${attachment.startLine}`
+												: `:${attachment.startLine}-${attachment.endLine}`}
+										</span>
+									</span>
+								</button>
+							{:else}
+								<span class="attachment-open attachment-image" title={attachment.name}>
+									<img src={attachment.dataUrl} alt={attachment.name} class="attachment-thumb" />
+									<span class="attachment-label">
+										<span class="attachment-name">{attachment.name}</span>
 									</span>
 								</span>
-							</button>
+							{/if}
 							<button
 								type="button"
 								class="attachment-remove"
@@ -792,10 +844,11 @@
 					? 'Steer the running turn (Enter to send, Esc to stop)…'
 					: coder.attachments.length > 0
 						? 'Ask about the attached selection…'
-						: 'Ask the coder…'}
+						: 'Ask the coder… (paste images to attach)'}
 				rows="3"
 				onkeydown={onComposerKey}
 				oninput={onComposerInput}
+				onpaste={onComposerPaste}
 			></textarea>
 		</div>
 	{:else if coder.view === 'subagent'}
@@ -906,6 +959,20 @@
 			<div class="row-label">you</div>
 			{#if parsed.prose.trim().length > 0}
 				<div class="bubble">{parsed.prose}</div>
+			{/if}
+			{#if row.images.length > 0}
+				<!-- Pasted images, rendered as thumbnails so the
+								 user can recognise what they attached two
+								 turns ago. Clicking opens the data URL in a
+								 new tab — Tauri's webview lets the user
+								 zoom there for free. -->
+				<div class="user-images">
+					{#each row.images as img, i (img.data_url + ':' + i)}
+						<a class="user-image" href={img.data_url} target="_blank" rel="noopener" title="Open image full-size">
+							<img src={img.data_url} alt={`pasted image ${i + 1}`} />
+						</a>
+					{/each}
+				</div>
 			{/if}
 			{#if parsed.attachments.length > 0}
 				<!-- The context block the user attached at send
@@ -1902,6 +1969,37 @@
 	.attachment-remove:hover {
 		color: var(--m-fg);
 		background: color-mix(in srgb, var(--m-danger) 14%, transparent);
+	}
+	.attachment-image {
+		cursor: default;
+	}
+	.attachment-thumb {
+		display: block;
+		width: 28px;
+		height: 28px;
+		object-fit: cover;
+		border-radius: 3px;
+		flex-shrink: 0;
+	}
+	.user-images {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 6px;
+		margin-top: 4px;
+	}
+	.user-image {
+		display: inline-block;
+		max-width: 320px;
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		overflow: hidden;
+		text-decoration: none;
+	}
+	.user-image img {
+		display: block;
+		max-width: 100%;
+		max-height: 240px;
+		height: auto;
 	}
 	textarea {
 		width: 100%;

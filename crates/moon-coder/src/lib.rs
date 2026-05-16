@@ -36,7 +36,7 @@ pub use defaults::{DEFAULT_CHEAP_MODEL, DEFAULT_STANDARD_MODEL, HF_OAUTH_CLIENT_
 pub use error::CoderError;
 pub use event::{CoderEvent, CoderEventEnvelope, CoderStatus};
 pub use folder_summary::{FolderSummary, FolderSummaryService};
-pub use inference::InferenceClient;
+pub use inference::{ImageAttachment, InferenceClient};
 pub use models::CoderModels;
 pub use providers::{new_provider_id, probe_provider, ProviderKeyring};
 pub use runner::{Coder, CoderHandle};

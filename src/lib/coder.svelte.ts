@@ -28,6 +28,7 @@ import {
 	type CoderStatus,
 	type DeviceCode,
 	type HfIdentity,
+	type ImageAttachmentPayload,
 	type ProviderModelSummary,
 	type ProviderProbeResult,
 	type RouterModel,
@@ -54,7 +55,7 @@ const CODER_EVENT_CHANNEL = 'coder:event';
  *  — useful for spotting slow tools (multi-second `bash` tail,
  *  multi-megabyte `read_file`) at a glance. */
 export type CoderRow =
-	| { kind: 'user'; id: string; text: string }
+	| { kind: 'user'; id: string; text: string; images: ImageAttachmentPayload[] }
 	| { kind: 'assistant'; id: string; text: string; thinking: string; thinkingOpen: boolean }
 	| {
 			kind: 'tool';
@@ -112,12 +113,11 @@ export type SubagentTranscript = {
 	rows: CoderRow[];
 };
 
-/** One piece of editor context the user has attached to the
- *  composer via the Ctrl+L "add to chat" gesture (mirrors
- *  Cursor's `@file:line-line` chips). The text is captured at
- *  attach time so a follow-up edit to the file doesn't change
- *  what the agent sees — the user pinned a snapshot, not a
- *  reference.
+/** One editor selection the user attached to the composer via
+ *  the Ctrl+L "add to chat" gesture (mirrors Cursor's
+ *  `@file:line-line` chips). The text is captured at attach time
+ *  so a follow-up edit to the file doesn't change what the agent
+ *  sees — the user pinned a snapshot, not a reference.
  *
  *  Each attachment has a stable `token` (`@path:start-end`) that
  *  also lives inline in the composer textarea — same shape
@@ -125,7 +125,8 @@ export type SubagentTranscript = {
  *  the order of attachments in the trailing `<context>` block,
  *  and the panel's `×` button strips matching tokens out of the
  *  draft so the chip and the inline reference always agree. */
-export type ComposerAttachment = {
+export type SelectionAttachment = {
+	kind: 'selection';
 	id: string;
 	token: string;
 	path: string;
@@ -133,6 +134,30 @@ export type ComposerAttachment = {
 	endLine: number;
 	text: string;
 };
+
+/** One image the user pasted (or otherwise dropped) into the
+ *  composer. Stored as a `data:<mime>;base64,...` URL — the same
+ *  shape providers want on the wire — so the send path doesn't
+ *  have to re-encode at the last second. `name` is purely
+ *  cosmetic (chip label / accessibility), `sizeBytes` drives the
+ *  pre-send size cap so a 10 MB screenshot doesn't quietly blow
+ *  the provider's request limit. */
+export type ImageComposerAttachment = {
+	kind: 'image';
+	id: string;
+	dataUrl: string;
+	mime: string;
+	name: string;
+	sizeBytes: number;
+};
+
+/** Anything the chip strip can hold. The two shapes share the
+ *  panel's render path (one chip per attachment) but differ in
+ *  what the user clicks them for: selections jump to the file at
+ *  the captured range; images preview the picture. Send-time
+ *  splits them — selections render into the trailing
+ *  `<context>` block, images ride on the IPC alongside `text`. */
+export type ComposerAttachment = SelectionAttachment | ImageComposerAttachment;
 
 /** Per-bound-folder UI state. One instance per folder we've ever
  *  routed an event for; lazily created via
@@ -807,12 +832,17 @@ class CoderPanelState {
 		this.view = 'session';
 		const token = formatAttachmentToken(snapshot.path, snapshot.startLine, snapshot.endLine);
 		const dup = this.attachments.find(
-			(a) => a.path === snapshot.path && a.startLine === snapshot.startLine && a.endLine === snapshot.endLine,
+			(a) =>
+				a.kind === 'selection' &&
+				a.path === snapshot.path &&
+				a.startLine === snapshot.startLine &&
+				a.endLine === snapshot.endLine,
 		);
 		if (!dup) {
 			this.attachments = [
 				...this.attachments,
 				{
+					kind: 'selection',
 					id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
 					token,
 					path: snapshot.path,
@@ -826,12 +856,67 @@ class CoderPanelState {
 		this.composerFocusTick = this.composerFocusTick + 1;
 	}
 
+	/** Cap on a single pasted image. 4 MB is conservative across
+	 *  providers — OpenAI tolerates 20 MB base64, Anthropic 5 MB,
+	 *  HF Inference is squishier. We measure the decoded blob size
+	 *  (not the base64 string), so the on-wire payload after
+	 *  encoding lands a bit higher (~5.3 MB max) but still inside
+	 *  every host's hard limit. Bigger images get a friendly
+	 *  refusal instead of a silent provider 4xx. */
+	static readonly IMAGE_MAX_BYTES = 4 * 1000 * 1000;
+	/** Cap on simultaneous image attachments per send. Plenty for
+	 *  any realistic "look at these screenshots" turn while still
+	 *  bounding context-window blowups from accidental ten-paste
+	 *  flurries. */
+	static readonly MAX_IMAGE_ATTACHMENTS = 10;
+
+	/** Add an image (typically from a clipboard paste) to the
+	 *  composer's chip strip. Rejects oversized blobs and silently
+	 *  ignores additions past [`MAX_IMAGE_ATTACHMENTS`] so the
+	 *  user gets a stable cap rather than an unbounded queue. The
+	 *  caller already has the bytes (paste handlers, drop
+	 *  handlers); this method does the data-URL conversion in
+	 *  one place. */
+	async addImageAttachment(blob: Blob, name?: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+		if (blob.size === 0) {
+			return { ok: false, reason: 'empty image' };
+		}
+		if (blob.size > CoderPanelState.IMAGE_MAX_BYTES) {
+			const limitMb = Math.round(CoderPanelState.IMAGE_MAX_BYTES / 1_000_000);
+			return { ok: false, reason: `image is ${formatBytes(blob.size)}; cap is ${limitMb} MB` };
+		}
+		const imageCount = this.attachments.filter((a) => a.kind === 'image').length;
+		if (imageCount >= CoderPanelState.MAX_IMAGE_ATTACHMENTS) {
+			return { ok: false, reason: `at most ${CoderPanelState.MAX_IMAGE_ATTACHMENTS} images per message` };
+		}
+		const mime = blob.type !== '' ? blob.type : 'image/png';
+		const dataUrl = await blobToDataUrl(blob);
+		rightPanel.set('coder');
+		this.view = 'session';
+		this.attachments = [
+			...this.attachments,
+			{
+				kind: 'image',
+				id: `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+				dataUrl,
+				mime,
+				name: name ?? `Image ${imageCount + 1}`,
+				sizeBytes: blob.size,
+			},
+		];
+		this.composerFocusTick = this.composerFocusTick + 1;
+		return { ok: true };
+	}
+
 	removeAttachment(id: string): void {
 		const att = this.attachments.find((a) => a.id === id);
 		if (!att) {
 			return;
 		}
 		this.attachments = this.attachments.filter((a) => a.id !== id);
+		if (att.kind !== 'selection') {
+			return;
+		}
 		// Strip every occurrence of the inline token (with at most
 		// one trailing whitespace char) out of the draft. The user's
 		// own typing might have nudged spacing around the token —
@@ -1258,9 +1343,9 @@ class CoderPanelState {
 	async send(activeFilePath: string | null = null): Promise<void> {
 		const text = this.draft.trim();
 		const attachments = this.attachments;
-		// Allow sending when *either* there's text or there are
-		// attached selections — "explain this" with an attachment
-		// but no question is a perfectly reasonable starter. The
+		// Allow sending when *any* of text, selections, or images
+		// is present — "explain this" with an attachment but no
+		// question is a perfectly reasonable starter. The
 		// active-file hint is implicit: present-or-absent on every
 		// turn, doesn't count as "the user wanted to send" on its
 		// own (it would auto-fire on Enter in an empty composer).
@@ -1271,7 +1356,20 @@ class CoderPanelState {
 		if (text.length === 0 && attachments.length === 0) {
 			return;
 		}
-		const payload = renderPromptWithAttachments(text, attachments, activeFilePath);
+		const selectionAttachments: SelectionAttachment[] = [];
+		const imageAttachments: ImageComposerAttachment[] = [];
+		for (const att of attachments) {
+			if (att.kind === 'selection') {
+				selectionAttachments.push(att);
+			} else {
+				imageAttachments.push(att);
+			}
+		}
+		const payload = renderPromptWithAttachments(text, selectionAttachments, activeFilePath);
+		const images: ImageAttachmentPayload[] = imageAttachments.map((img) => ({
+			data_url: img.dataUrl,
+			mime: img.mime,
+		}));
 		this.draft = '';
 		this.clearAttachments();
 		// Optimistic flip — the `user_message` event lands within
@@ -1280,7 +1378,7 @@ class CoderPanelState {
 		// a steer (already busy) it's a no-op.
 		this.busy = true;
 		try {
-			await ipc.coder.send(payload);
+			await ipc.coder.send(payload, images);
 		} catch (err) {
 			this.busy = false;
 			this.rows = [
@@ -1357,7 +1455,7 @@ class CoderPanelState {
 	#applyEventToBucket(bucket: FolderViewState, folder: string, event: CoderEvent): void {
 		switch (event.kind) {
 			case 'user_message':
-				bucket.rows = [...bucket.rows, { kind: 'user', id: event.id, text: event.text }];
+				bucket.rows = [...bucket.rows, { kind: 'user', id: event.id, text: event.text, images: event.images ?? [] }];
 				bucket.busy = true;
 				return;
 			case 'assistant_message_start':
@@ -1724,7 +1822,7 @@ function applyInnerEventToRows(rows: CoderRow[], event: CoderEvent): CoderRow[] 
  *  tab switches don't bust the router's prefix cache. */
 function renderPromptWithAttachments(
 	text: string,
-	attachments: ComposerAttachment[],
+	attachments: SelectionAttachment[],
 	activeFilePath: string | null,
 ): string {
 	const blocks: string[] = [];
@@ -1755,6 +1853,42 @@ const REGEX_META_PATTERN = /[\\^$.*+?()[\]{}|]/g;
 
 function escapeRegExp(s: string): string {
 	return s.replace(REGEX_META_PATTERN, '\\$&');
+}
+
+/** Read a blob as a `data:<mime>;base64,...` URL. Used for paste
+ *  / drop image attachments — `FileReader.readAsDataURL` is the
+ *  one-shot path that handles every browser-supported image MIME
+ *  without us having to base64-encode bytes ourselves. */
+function blobToDataUrl(blob: Blob): Promise<string> {
+	return new Promise((resolve, reject) => {
+		const reader = new FileReader();
+		reader.addEventListener(
+			'load',
+			() => {
+				const result = reader.result;
+				if (typeof result !== 'string') {
+					reject(new Error('FileReader returned non-string result for a blob'));
+					return;
+				}
+				resolve(result);
+			},
+			{ once: true },
+		);
+		reader.addEventListener('error', () => reject(reader.error ?? new Error('FileReader failed')), { once: true });
+		reader.readAsDataURL(blob);
+	});
+}
+
+/** Pretty-print a byte count for the "image too large" error
+ *  message. We use 1000-multiples per house style. */
+function formatBytes(n: number): string {
+	if (n < 1000) {
+		return `${n} B`;
+	}
+	if (n < 1_000_000) {
+		return `${(n / 1000).toFixed(1)} kB`;
+	}
+	return `${(n / 1_000_000).toFixed(1)} MB`;
 }
 
 function escapeXmlAttr(s: string): string {

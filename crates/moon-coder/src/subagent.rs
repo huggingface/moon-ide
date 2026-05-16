@@ -210,9 +210,7 @@ async fn run_subagent_inner(
 		ChatMessage::System {
 			content: system_prompt.clone(),
 		},
-		ChatMessage::User {
-			content: spec.task.clone(),
-		},
+		ChatMessage::user(spec.task.clone()),
 	];
 	// Most-recent provider-supplied usage. Populated whenever an
 	// LLM call returns a `usage` block; `None` when every round
@@ -272,6 +270,7 @@ async fn run_subagent_inner(
 		&header,
 		&SessionRecord::User {
 			text: spec.task.clone(),
+			images: Vec::new(),
 		},
 	)
 	.await;
@@ -514,10 +513,16 @@ async fn subagent_wrap_up(
 		"[Tool-call budget exhausted: you've used all {MAX_TURN_ITERATIONS} tool-call iterations available for this sub-agent. \
 Do not call any more tools. Write a final response now using only what you've already gathered: summarise findings, what's still unfinished, and any uncertainty.]"
 	);
-	messages.push(ChatMessage::User {
-		content: sentinel.clone(),
-	});
-	persist_subagent(session_dir, header, &SessionRecord::User { text: sentinel.clone() }).await;
+	messages.push(ChatMessage::user(sentinel.clone()));
+	persist_subagent(
+		session_dir,
+		header,
+		&SessionRecord::User {
+			text: sentinel.clone(),
+			images: Vec::new(),
+		},
+	)
+	.await;
 
 	let assistant_id = format!("{id}::wrap-up");
 	let id_for_cb = assistant_id.clone();

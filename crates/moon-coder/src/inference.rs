@@ -50,6 +50,22 @@ where
 	Ok(opt.unwrap_or_default())
 }
 
+/// One image the user attached to a prompt (typically by pasting a
+/// screenshot into the composer). `data_url` is the canonical
+/// representation — `data:<mime>;base64,<payload>` — and is what
+/// gets shipped to the model verbatim inside an `image_url` content
+/// block. `mime` is cached separately so we don't have to re-parse
+/// the prefix every time we serialise. We never store the raw
+/// bytes: the data-URL form is what providers want on the wire and
+/// what the JSONL transcript replays back into context, so going
+/// through bytes would be an extra encode/decode round-trip with no
+/// upside.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageAttachment {
+	pub data_url: String,
+	pub mime: String,
+}
+
 /// One message in the conversation, in the OpenAI chat-completions
 /// shape. We keep the wire shape verbatim so the router doesn't need
 /// adapter code.
@@ -61,6 +77,15 @@ pub enum ChatMessage {
 	},
 	User {
 		content: String,
+		/// Images the user attached to this prompt. Empty for the
+		/// vast majority of messages; non-empty only when the user
+		/// pasted (or otherwise dropped) an image into the composer.
+		/// On the wire we hoist these into the content-as-blocks
+		/// shape (`{"type":"image_url", ...}`), so a User with no
+		/// images keeps emitting the cheap string-content payload
+		/// that every router has prefix-cached.
+		#[serde(default, skip_serializing_if = "Vec::is_empty")]
+		images: Vec<ImageAttachment>,
 	},
 	Assistant {
 		#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -76,6 +101,19 @@ pub enum ChatMessage {
 		tool_call_id: String,
 		content: String,
 	},
+}
+
+impl ChatMessage {
+	/// Convenience constructor for a text-only user message — the
+	/// shape every caller wants when there's no pasted image.
+	/// Lets us keep the struct-with-images variant explicit at the
+	/// one site (the composer) that actually attaches images.
+	pub fn user(content: impl Into<String>) -> Self {
+		Self::User {
+			content: content.into(),
+			images: Vec::new(),
+		}
+	}
 }
 
 /// One tool call the model emitted. The `function.arguments` field
@@ -129,26 +167,40 @@ enum WireMessage<'a> {
 }
 
 /// A message's `content` field on the wire. `String` is the
-/// common path (everything we used to send); `Blocks` kicks in
-/// when we want to attach `cache_control` to a text block.
-/// Untagged so Serde picks the variant by JSON shape.
+/// common path (everything we used to send for text-only
+/// messages with no caching); `Blocks` kicks in when we want to
+/// attach `cache_control` to a text block, when the user pasted
+/// images into the prompt, or both. Untagged so Serde picks the
+/// variant by JSON shape.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 enum WireContent<'a> {
 	String(&'a str),
-	Blocks(Vec<WireTextBlock<'a>>),
+	Blocks(Vec<WireBlock<'a>>),
 }
 
-/// One text block inside a content-as-array message. `kind` is
-/// always `"text"` for our use; we'd add `image_url` etc. here
-/// if we ever wanted to send images.
+/// One block inside a content-as-array message. `text` blocks
+/// carry prose (and optionally an Anthropic `cache_control`
+/// marker); `image_url` blocks carry user-attached images as
+/// data URLs. Both shapes are OpenAI vision-API compatible —
+/// OpenRouter normalises `image_url` into Anthropic's `image`
+/// block on the way through.
 #[derive(Debug, Clone, Serialize)]
-struct WireTextBlock<'a> {
-	#[serde(rename = "type")]
-	kind: &'static str,
-	text: &'a str,
-	#[serde(skip_serializing_if = "Option::is_none")]
-	cache_control: Option<CacheControl>,
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WireBlock<'a> {
+	Text {
+		text: &'a str,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		cache_control: Option<CacheControl>,
+	},
+	ImageUrl {
+		image_url: WireImageUrl<'a>,
+	},
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WireImageUrl<'a> {
+	url: &'a str,
 }
 
 /// Anthropic prompt-caching marker. `ephemeral` is the only
@@ -179,10 +231,10 @@ fn build_wire_messages<'a>(messages: &'a [ChatMessage], cached_indexes: &[usize]
 		let cache_here = cached_indexes.contains(&idx);
 		let wire = match msg {
 			ChatMessage::System { content } => WireMessage::System {
-				content: wire_content(content, cache_here),
+				content: wire_text_content(content, cache_here),
 			},
-			ChatMessage::User { content } => WireMessage::User {
-				content: wire_content(content, cache_here),
+			ChatMessage::User { content, images } => WireMessage::User {
+				content: wire_user_content(content, images, cache_here),
 			},
 			ChatMessage::Assistant { content, tool_calls } => WireMessage::Assistant {
 				// `cache_breakpoint_indexes` never targets an
@@ -195,7 +247,7 @@ fn build_wire_messages<'a>(messages: &'a [ChatMessage], cached_indexes: &[usize]
 			},
 			ChatMessage::Tool { tool_call_id, content } => WireMessage::Tool {
 				tool_call_id,
-				content: wire_content(content, cache_here),
+				content: wire_text_content(content, cache_here),
 			},
 		};
 		out.push(wire);
@@ -203,15 +255,36 @@ fn build_wire_messages<'a>(messages: &'a [ChatMessage], cached_indexes: &[usize]
 	out
 }
 
-fn wire_content(content: &str, cache_here: bool) -> WireContent<'_> {
+fn wire_text_content(content: &str, cache_here: bool) -> WireContent<'_> {
 	if !cache_here {
 		return WireContent::String(content);
 	}
-	WireContent::Blocks(vec![WireTextBlock {
-		kind: "text",
+	WireContent::Blocks(vec![WireBlock::Text {
 		text: content,
 		cache_control: Some(CacheControl::EPHEMERAL),
 	}])
+}
+
+/// Build the wire content for a User message, hoisting into the
+/// blocks shape whenever there's an image attached or a cache
+/// marker to apply. The text block always lands first; images
+/// follow in attachment order. `cache_control` rides on the text
+/// block so the cache write captures the prose half of the turn.
+fn wire_user_content<'a>(content: &'a str, images: &'a [ImageAttachment], cache_here: bool) -> WireContent<'a> {
+	if images.is_empty() {
+		return wire_text_content(content, cache_here);
+	}
+	let mut blocks: Vec<WireBlock<'a>> = Vec::with_capacity(images.len() + 1);
+	blocks.push(WireBlock::Text {
+		text: content,
+		cache_control: cache_here.then_some(CacheControl::EPHEMERAL),
+	});
+	for img in images {
+		blocks.push(WireBlock::ImageUrl {
+			image_url: WireImageUrl { url: &img.data_url },
+		});
+	}
+	WireContent::Blocks(blocks)
 }
 
 /// Tool definition handed to the model in the request. Mirrors
@@ -1630,10 +1703,7 @@ mod tests {
 			bill_to: None,
 			is_huggingface: true,
 		};
-		let messages = vec![
-			ChatMessage::System { content: "sys".into() },
-			ChatMessage::User { content: "hi".into() },
-		];
+		let messages = vec![ChatMessage::System { content: "sys".into() }, ChatMessage::user("hi")];
 		assert!(cache_breakpoint_indexes(&messages, &route, "anthropic/claude-sonnet-4.5").is_empty());
 
 		// Custom non-OpenRouter route → no caching either, even
@@ -1671,17 +1741,14 @@ mod tests {
 		assert_eq!(cache_breakpoint_indexes(&messages, &route, model), vec![0]);
 
 		// System + user: both marked.
-		let messages = vec![
-			ChatMessage::System { content: "sys".into() },
-			ChatMessage::User { content: "hi".into() },
-		];
+		let messages = vec![ChatMessage::System { content: "sys".into() }, ChatMessage::user("hi")];
 		assert_eq!(cache_breakpoint_indexes(&messages, &route, model), vec![0, 1]);
 
 		// System + user + assistant (with tool calls, empty content):
 		// last is assistant → walk back to user at index 1.
 		let messages = vec![
 			ChatMessage::System { content: "sys".into() },
-			ChatMessage::User { content: "hi".into() },
+			ChatMessage::user("hi"),
 			ChatMessage::Assistant {
 				content: None,
 				tool_calls: vec![ToolCall {
@@ -1700,7 +1767,7 @@ mod tests {
 		// (index 3), the most up-to-date stable prefix for next call.
 		let messages = vec![
 			ChatMessage::System { content: "sys".into() },
-			ChatMessage::User { content: "hi".into() },
+			ChatMessage::user("hi"),
 			ChatMessage::Assistant {
 				content: None,
 				tool_calls: vec![ToolCall {
@@ -1728,7 +1795,7 @@ mod tests {
 		// that doesn't expect blocks-form content.
 		let messages = vec![
 			ChatMessage::System { content: "sys".into() },
-			ChatMessage::User { content: "hi".into() },
+			ChatMessage::user("hi"),
 			ChatMessage::Tool {
 				tool_call_id: "call_1".into(),
 				content: "ok".into(),
@@ -1749,7 +1816,7 @@ mod tests {
 	fn wire_messages_with_cache_emits_blocks_only_on_marked_indexes() {
 		let messages = vec![
 			ChatMessage::System { content: "sys".into() },
-			ChatMessage::User { content: "hi".into() },
+			ChatMessage::user("hi"),
 			ChatMessage::Tool {
 				tool_call_id: "call_1".into(),
 				content: "ok".into(),
@@ -1768,6 +1835,56 @@ mod tests {
 		assert!(json.contains(
 			r#"{"role":"tool","tool_call_id":"call_1","content":[{"type":"text","text":"ok","cache_control":{"type":"ephemeral"}}]}"#
 		));
+	}
+
+	#[test]
+	fn wire_user_with_images_emits_blocks_with_image_url() {
+		let messages = vec![
+			ChatMessage::System { content: "sys".into() },
+			ChatMessage::User {
+				content: "what's in this".into(),
+				images: vec![ImageAttachment {
+					data_url: "data:image/png;base64,AAAA".into(),
+					mime: "image/png".into(),
+				}],
+			},
+		];
+		let wire = build_wire_messages(&messages, &[]);
+		let json = serde_json::to_string(&wire).unwrap();
+		assert!(json.contains(r#"{"role":"system","content":"sys"}"#));
+		assert!(json.contains(
+			r#""role":"user","content":[{"type":"text","text":"what's in this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]"#
+		));
+	}
+
+	#[test]
+	fn wire_user_with_images_and_cache_marks_text_block_only() {
+		let messages = vec![ChatMessage::User {
+			content: "hi".into(),
+			images: vec![ImageAttachment {
+				data_url: "data:image/jpeg;base64,BBBB".into(),
+				mime: "image/jpeg".into(),
+			}],
+		}];
+		let wire = build_wire_messages(&messages, &[0]);
+		let json = serde_json::to_string(&wire).unwrap();
+		assert!(json.contains(r#""type":"text","text":"hi","cache_control":{"type":"ephemeral"}"#));
+		assert!(json.contains(r#""type":"image_url","image_url":{"url":"data:image/jpeg;base64,BBBB"}"#));
+	}
+
+	#[test]
+	fn wire_user_no_images_no_cache_keeps_string_content() {
+		// Regression guard: adding the images field must not
+		// change the cheap path's wire shape — every router with
+		// a prefix cache keyed on the literal request bytes
+		// would otherwise miss on the next turn.
+		let messages = vec![ChatMessage::User {
+			content: "hi".into(),
+			images: Vec::new(),
+		}];
+		let wire = build_wire_messages(&messages, &[]);
+		let json = serde_json::to_string(&wire).unwrap();
+		assert_eq!(json, r#"[{"role":"user","content":"hi"}]"#);
 	}
 
 	#[test]
