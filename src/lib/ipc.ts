@@ -20,6 +20,7 @@ import type {
 	FileSearchResult,
 	BranchList,
 	BranchDiffStatus,
+	CollectPathsResult,
 	PrListScope,
 	BranchSwitchTarget,
 	GitBranchInfo,
@@ -110,8 +111,9 @@ export const ipc = {
 	},
 	fs: {
 		readDir: (path: string) => invoke<DirEntry[]>('fs_read_dir', { path }),
-		collectPaths: (maxDepth: number) => invoke<string[]>('fs_collect_paths', { maxDepth }),
-		collectPathsUnder: (rel: string, maxDepth: number) => invoke<string[]>('fs_collect_paths_under', { rel, maxDepth }),
+		collectPaths: (maxDepth: number) => invoke<CollectPathsResult>('fs_collect_paths', { maxDepth }),
+		collectPathsUnder: (rel: string, maxDepth: number) =>
+			invoke<CollectPathsResult>('fs_collect_paths_under', { rel, maxDepth }),
 		readFile: (path: string) => invoke<ReadFileResult>('fs_read_file', { path }),
 		writeFile: (path: string, text: string) => invoke<WriteFileResult>('fs_write_file', { path, text }),
 		// Host-direct read/write for files outside every bound folder. Bypasses

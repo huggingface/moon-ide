@@ -30,6 +30,17 @@ export type StatResult = {
 	mtime_ms: number | null;
 };
 
+/**
+ * Mirror of `moon_protocol::fs::CollectPathsResult` — the
+ * file-tree path enumeration plus the directories whose recursion
+ * the depth cap stopped short of so the frontend can lazy-load
+ * them on expansion.
+ */
+export type CollectPathsResult = {
+	paths: string[];
+	depth_capped: string[];
+};
+
 export type HostKind = 'local' | 'devcontainer';
 
 /**

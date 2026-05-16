@@ -161,6 +161,14 @@ export type OpenFile = {
 class FolderState {
 	paths = $state<string[]>([]);
 
+	// Directories the backend stopped recursion at because we hit
+	// `MAX_TREE_DEPTH`. The file tree treats these like ignored
+	// directories: the row is shown, but its children are fetched
+	// on expansion via `collect_paths_under` instead of being
+	// enumerated up-front. Empty for shallow projects where the
+	// depth cap never kicked in.
+	depthCappedPaths = $state<string[]>([]);
+
 	// Loaded text/image buffers, keyed by folder-relative path. A
 	// buffer is shared across panes — typing in pane A updates the same
 	// `OpenFile` that pane B is rendering, so the dirty marker and text
@@ -555,6 +563,15 @@ class WorkspaceState {
 	set paths(value: string[]) {
 		if (this.activeFolderState) {
 			this.activeFolderState.paths = value;
+		}
+	}
+
+	get depthCappedPaths(): string[] {
+		return this.activeFolderState?.depthCappedPaths ?? [];
+	}
+	set depthCappedPaths(value: string[]) {
+		if (this.activeFolderState) {
+			this.activeFolderState.depthCappedPaths = value;
 		}
 	}
 
@@ -1686,20 +1703,22 @@ class WorkspaceState {
 			const tWalk = performance.now();
 			performance.measure('moon:loadPaths.walk', 'moon:loadPaths.start');
 			performance.mark('moon:loadPaths.assign.start');
-			this.paths = collected;
+			this.paths = collected.paths;
+			this.depthCappedPaths = collected.depth_capped;
 			const tAssign = performance.now();
 			performance.measure('moon:loadPaths.assign', 'moon:loadPaths.assign.start');
 			// Classify git status in the background — the tree can
 			// paint before we know the answer. Pierre reconciles
 			// `setGitStatus` updates in place, so late-arriving
 			// entries fade / tint the affected rows without a reflow.
-			void this.refreshGitStatus(collected, changedSubset);
+			void this.refreshGitStatus(collected.paths, changedSubset);
 			// eslint-disable-next-line no-console
 			console.info(
 				`moon-ide: loadPaths(${this.activeFolderPath}) ` +
 					`walk=${(tWalk - tStart).toFixed(1)}ms ` +
 					`assign=${(tAssign - tWalk).toFixed(1)}ms ` +
-					`count=${collected.length}`,
+					`count=${collected.paths.length} ` +
+					`depthCapped=${collected.depth_capped.length}`,
 			);
 		} catch (err) {
 			this.flash(`Failed to read folder: ${formatError(err)}`);
@@ -5179,13 +5198,19 @@ function resolveSystemTheme(theme: SystemTheme): boolean {
 }
 
 /**
- * How deep `fs_collect_paths` recurses. Cap exists so very deep
- * trees can't stall the UI on first load or on refresh. Entries
- * beyond the cap are listed at their level but their children
- * aren't enumerated — Phase 1 will add lazy expansion to remove
- * this cap, at which point the constant goes away.
+ * How deep `fs_collect_paths` recurses. The walk is `read_dir`-
+ * bound and gitignore-collapsed (`node_modules/` etc. only emit
+ * a single row), so 16 levels comfortably covers every realistic
+ * project — SvelteKit's deepest `[param]/` route stacks fit, and
+ * monorepos with `packages/<scope>/<name>/src/**` don't get cut
+ * short. Anything that *does* hit the cap surfaces in
+ * `CollectPathsResult.depth_capped`; FileTree marks those rows as
+ * lazy and fetches their children on expansion via
+ * `collect_paths_under`. Bumping the cap rather than removing it
+ * is defence-in-depth against pathologically deep gitignore-
+ * leaking trees we haven't seen in the wild yet.
  */
-const MAX_TREE_DEPTH = 6;
+const MAX_TREE_DEPTH = 16;
 
 function basename(path: string): string {
 	const i = path.lastIndexOf('/');

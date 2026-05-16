@@ -883,11 +883,13 @@
 			merged = mergedPathsWithDeletions(paths, entries);
 			// Re-seed `lazyDirs` whenever the active folder swap or
 			// a fresh git-status refresh tells us the set of
-			// collapsed-ignored directories. Same-folder refreshes
+			// collapsed-ignored directories, or the depth-capped
+			// frontier the walk left for us. Same-folder refreshes
 			// keep `lazyLoaded` so previously-expanded subtrees
 			// stay populated. Only runs in 'all' mode — changes
 			// mode never walks into ignored dirs by design.
-			seedLazyDirs(workspace.activeFolderPath, entries);
+			const depthCapped = workspace.depthCappedPaths;
+			seedLazyDirs(workspace.activeFolderPath, entries, depthCapped);
 			if (lazyLoaded.size > 0) {
 				merged = mergeLazyLoaded(merged);
 			}
@@ -1051,13 +1053,24 @@
 	}
 
 	/**
-	 * Refresh `lazyDirs` from the current gitignored-directory
-	 * list. A folder switch resets every lazy-load bucket because
-	 * the new folder has its own ignore set; same-folder refreshes
-	 * preserve `lazyLoaded` so already-expanded `node_modules/foo/`
-	 * stays visible across watcher kicks.
+	 * Refresh `lazyDirs` from the two sources of "directory
+	 * present in the tree but not yet enumerated":
+	 *
+	 * - gitignored directories the backend collapsed
+	 *   (`node_modules/`, `target/`, …)
+	 * - directories the recursive walk stopped at because they
+	 *   sit beyond `MAX_TREE_DEPTH`
+	 *
+	 * A folder switch resets every lazy-load bucket because the
+	 * new folder has its own ignore + depth-cap set; same-folder
+	 * refreshes preserve `lazyLoaded` so already-expanded subtrees
+	 * stay visible across watcher kicks.
 	 */
-	function seedLazyDirs(folder: string | null, entries: readonly GitStatusEntry[]): void {
+	function seedLazyDirs(
+		folder: string | null,
+		entries: readonly GitStatusEntry[],
+		depthCapped: readonly string[],
+	): void {
 		if (folder !== lazySeedFolderPath) {
 			lazySeedFolderPath = folder;
 			lazyLoaded = new Set();
@@ -1066,6 +1079,11 @@
 		for (const entry of entries) {
 			if (entry.status === 'ignored' && entry.path.endsWith('/') && !lazyLoaded.has(entry.path)) {
 				next.add(entry.path);
+			}
+		}
+		for (const path of depthCapped) {
+			if (path.endsWith('/') && !lazyLoaded.has(path)) {
+				next.add(path);
 			}
 		}
 		lazyDirs = next;
@@ -1110,7 +1128,13 @@
 			// walker pushes the entries of `path` but never
 			// recurses into sub-directories. Drilling deeper
 			// fires another lazy-load against the deeper rel.
-			const children = await ipc.fs.collectPathsUnder(path, 0);
+			// `depth_capped` reflects the same walk: any direct
+			// child that itself has hidden descendants comes back
+			// in that list and gets added to `lazyDirs` so the
+			// next click drills further.
+			const result = await ipc.fs.collectPathsUnder(path, 0);
+			const children = result.paths;
+			const cappedChildren = new Set(result.depth_capped);
 			if (children.length === 0) {
 				lazyDirs.delete(path);
 				lazyLoaded.add(path);
@@ -1126,7 +1150,15 @@
 				}
 				addPaths.push(child);
 				lazyLoaded.add(child);
-				if (child.endsWith('/')) {
+				// `max_depth=0` means we only learn whether a
+				// child *itself* has hidden descendants via the
+				// `depth_capped` list. Anything not in that set
+				// is fully enumerated as far as the walker can
+				// see — it's either a leaf or its contents are
+				// already in `children`. Marking only the capped
+				// ones as lazy avoids pointless IPC roundtrips
+				// when the user expands an empty directory.
+				if (child.endsWith('/') && cappedChildren.has(child)) {
 					lazyDirs.add(child);
 				}
 			}

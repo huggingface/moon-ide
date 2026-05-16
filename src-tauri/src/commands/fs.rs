@@ -1,6 +1,6 @@
 use camino::Utf8PathBuf;
 use moon_core::{read_host_file, write_host_file};
-use moon_protocol::fs::{DirEntry, ReadFileResult, StatResult, WriteFileResult};
+use moon_protocol::fs::{CollectPathsResult, DirEntry, ReadFileResult, StatResult, WriteFileResult};
 use moon_protocol::git::{
 	BranchDiffStatus, BranchList, BranchSwitchTarget, GitBranchInfo, GitChangeSummary, GitCommitResult, GitFileBlame,
 	GitFileStatus, GitStatusEntry, PrListScope,
@@ -41,14 +41,14 @@ pub async fn fs_collect_paths_under(
 	state: State<'_, AppState>,
 	rel: String,
 	max_depth: u32,
-) -> Result<Vec<String>, MoonError> {
+) -> Result<CollectPathsResult, MoonError> {
 	let entry = state.workspaces.require_active_folder().await?;
 	let path = Utf8PathBuf::from(rel);
 	entry.host.collect_paths_under(&path, max_depth).await
 }
 
 #[tauri::command]
-pub async fn fs_collect_paths(state: State<'_, AppState>, max_depth: u32) -> Result<Vec<String>, MoonError> {
+pub async fn fs_collect_paths(state: State<'_, AppState>, max_depth: u32) -> Result<CollectPathsResult, MoonError> {
 	// Profiling: paired with the frontend `console.info` from
 	// `loadPaths`. The wall time here is the recursive
 	// `std::fs::read_dir` storm on the blocking pool; the
@@ -57,18 +57,19 @@ pub async fn fs_collect_paths(state: State<'_, AppState>, max_depth: u32) -> Res
 	let t0 = std::time::Instant::now();
 	let entry = state.workspaces.require_active_folder().await?;
 	let t1 = std::time::Instant::now();
-	let paths = entry.host.collect_paths(max_depth).await?;
+	let result = entry.host.collect_paths(max_depth).await?;
 	let t2 = std::time::Instant::now();
 	tracing::info!(
 		target: "moon_profile",
-		"fs_collect_paths folder={} require={}ms walk={}ms total={}ms count={}",
+		"fs_collect_paths folder={} require={}ms walk={}ms total={}ms paths={} depth_capped={}",
 		entry.folder.path,
 		(t1 - t0).as_millis(),
 		(t2 - t1).as_millis(),
 		(t2 - t0).as_millis(),
-		paths.len(),
+		result.paths.len(),
+		result.depth_capped.len(),
 	);
-	Ok(paths)
+	Ok(result)
 }
 
 #[tauri::command]

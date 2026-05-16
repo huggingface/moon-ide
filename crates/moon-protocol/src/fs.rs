@@ -69,3 +69,17 @@ pub struct FsEvent {
 	pub kind: FsEventKind,
 	pub path: String,
 }
+
+/// Output of [`collect_paths`](crate) and `collect_paths_under`:
+/// the enumerated path set plus the directories whose recursion
+/// the depth cap stopped short of. The frontend treats
+/// `depth_capped` like the gitignored-collapsed set, marking each
+/// entry as lazy so a later expansion fetches its children on
+/// demand. Empty `depth_capped` means the walk reached every leaf
+/// without hitting the cap.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CollectPathsResult {
+	pub paths: Vec<String>,
+	pub depth_capped: Vec<String>,
+}

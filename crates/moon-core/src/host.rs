@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use moon_protocol::editorconfig::EditorConfig;
-use moon_protocol::fs::{DirEntry, EntryKind, ReadFileResult, StatResult, WriteFileResult};
+use moon_protocol::fs::{CollectPathsResult, DirEntry, EntryKind, ReadFileResult, StatResult, WriteFileResult};
 use moon_protocol::git::{
 	BranchDiffStatus, BranchList, BranchListEntry, BranchSwitchTarget, GitBranchInfo, GitCommitResult, GitFileBlame,
 	GitFileStatus, GitLineBlame, GitStatusEntry, PrListScope, PrListStatus,
@@ -113,7 +113,9 @@ pub trait WorkspaceHost: Send + Sync {
 	/// (directories carry a trailing `/`, files don't, `.git/` is
 	/// skipped). `max_depth` bounds how deep we recurse so very
 	/// nested trees can't stall the UI on first load; entries at
-	/// the cap are included but their children aren't.
+	/// the cap are included but their children aren't — those
+	/// directories surface in [`CollectPathsResult::depth_capped`]
+	/// so the frontend can lazy-load them on expansion.
 	///
 	/// Exists separately from `read_dir` because the tree's walker
 	/// would otherwise fire one IPC roundtrip per directory —
@@ -121,21 +123,25 @@ pub trait WorkspaceHost: Send + Sync {
 	/// handful of folders. One call collapses hundreds of
 	/// roundtrips into a single backend walk, which is the actual
 	/// work; everything else was IPC framing.
-	async fn collect_paths(&self, max_depth: u32) -> MoonResult<Vec<String>>;
+	async fn collect_paths(&self, max_depth: u32) -> MoonResult<CollectPathsResult>;
 
 	/// Walk a single subtree on demand, ignoring the gitignore-
 	/// collapse filter that `collect_paths` applies. Returns paths
 	/// relative to the workspace root (same shape as
 	/// `collect_paths` output). Used by the file tree's lazy-load
 	/// flow: when the user expands a directory that was collapsed
-	/// because git ignored it (`node_modules/`, `target/`, …),
-	/// this fetches its direct children so they slot into Pierre's
+	/// because git ignored it (`node_modules/`, `target/`, …) or
+	/// because the depth cap stopped its enumeration short, this
+	/// fetches its direct children so they slot into Pierre's
 	/// path store without a full re-walk.
 	///
 	/// `max_depth` counts levels below `rel` (1 = direct children
 	/// only). The walker still hides `.git/` and emits directories
 	/// with a trailing slash. Errors if `rel` escapes the root.
-	async fn collect_paths_under(&self, rel: &Utf8Path, max_depth: u32) -> MoonResult<Vec<String>>;
+	/// `depth_capped` in the response is populated when a child
+	/// directory itself hit the cap — drilling deeper re-issues
+	/// the call against that path.
+	async fn collect_paths_under(&self, rel: &Utf8Path, max_depth: u32) -> MoonResult<CollectPathsResult>;
 
 	/// Per-path git status for the file tree — added, modified,
 	/// deleted, untracked, and ignored. Deleted entries are included
@@ -1137,7 +1143,7 @@ impl WorkspaceHost for LocalHost {
 		.map_err(|e| MoonError::Internal(format!("git_status_entries join error: {e}")))?
 	}
 
-	async fn collect_paths_under(&self, rel: &Utf8Path, max_depth: u32) -> MoonResult<Vec<String>> {
+	async fn collect_paths_under(&self, rel: &Utf8Path, max_depth: u32) -> MoonResult<CollectPathsResult> {
 		// Lazy-load entry point for ignored directories. Compared
 		// to `collect_paths` we skip the `collapsed_ignored_dirs`
 		// probe — the caller already knows this subtree is
@@ -1161,16 +1167,17 @@ impl WorkspaceHost for LocalHost {
 		let rel_owned = raw.trim_end_matches('/').to_string();
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
-			let mut out = Vec::new();
+			let mut paths = Vec::new();
+			let mut depth_capped = Vec::new();
 			let empty = std::collections::BTreeSet::new();
-			walk_paths(&root, &rel_owned, &mut out, 0, max_depth, &empty);
-			Ok(out)
+			walk_paths(&root, &rel_owned, &mut paths, &mut depth_capped, 0, max_depth, &empty);
+			Ok(CollectPathsResult { paths, depth_capped })
 		})
 		.await
 		.map_err(|e| MoonError::Internal(format!("collect_paths_under join error: {e}")))?
 	}
 
-	async fn collect_paths(&self, max_depth: u32) -> MoonResult<Vec<String>> {
+	async fn collect_paths(&self, max_depth: u32) -> MoonResult<CollectPathsResult> {
 		// Pure `std::fs` walk on the blocking pool. Tried using
 		// `tokio::fs::read_dir` recursively here — it kept the
 		// reactor busy with tiny awaits per entry and wound up
@@ -1202,9 +1209,10 @@ impl WorkspaceHost for LocalHost {
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
 			let skip = collapsed_ignored_dirs(&root);
-			let mut out = Vec::new();
-			walk_paths(&root, "", &mut out, 0, max_depth, &skip);
-			Ok(out)
+			let mut paths = Vec::new();
+			let mut depth_capped = Vec::new();
+			walk_paths(&root, "", &mut paths, &mut depth_capped, 0, max_depth, &skip);
+			Ok(CollectPathsResult { paths, depth_capped })
 		})
 		.await
 		.map_err(|e| MoonError::Internal(format!("collect_paths join error: {e}")))?
@@ -3667,6 +3675,7 @@ fn walk_paths(
 	root: &Utf8Path,
 	rel: &str,
 	out: &mut Vec<String>,
+	depth_capped: &mut Vec<String>,
 	depth: u32,
 	max_depth: u32,
 	skip_dirs: &std::collections::BTreeSet<String>,
@@ -3711,14 +3720,44 @@ fn walk_paths(
 				out.push(dir_path_rel);
 				continue;
 			}
-			out.push(dir_path_rel);
+			out.push(dir_path_rel.clone());
 			if depth < max_depth {
-				walk_paths(root, &child_rel, out, depth + 1, max_depth, skip_dirs);
+				walk_paths(root, &child_rel, out, depth_capped, depth + 1, max_depth, skip_dirs);
+			} else if dir_has_any_entry(&dir_path.join(&name)) {
+				// Hit the depth cap with a directory that has
+				// children we won't enumerate. Surface it as a
+				// lazy frontier so the file tree can fetch its
+				// contents on expansion. Empty leaf directories
+				// are NOT marked — they don't need lazy loading.
+				depth_capped.push(dir_path_rel);
 			}
 		} else if file_type.is_file() || file_type.is_symlink() {
 			out.push(child_rel);
 		}
 	}
+}
+
+/// Cheap "does this directory contain anything visible to the
+/// walker?" probe. Used by [`walk_paths`] at the depth cap so we
+/// only mark a directory as lazy when there's actually something
+/// for the lazy load to fetch — empty leaves stay non-lazy and
+/// don't trigger an IPC roundtrip on expansion.
+///
+/// Skips `.git/` for the same reason the walker does. Returns
+/// `false` on `read_dir` errors so we don't mark unreadable
+/// directories as lazy (the lazy load would fail again anyway).
+fn dir_has_any_entry(path: &std::path::Path) -> bool {
+	let Ok(iter) = std::fs::read_dir(path) else {
+		return false;
+	};
+	for entry in iter.flatten() {
+		let name = entry.file_name();
+		if name == ".git" {
+			continue;
+		}
+		return true;
+	}
+	false
 }
 
 /// Set of repo-relative directory paths (each ending in `/`) that
@@ -4200,8 +4239,8 @@ mod tests {
 		std::fs::write(dir.path().join("src").join("lib.rs"), "").unwrap();
 		std::fs::write(dir.path().join("src").join("nested").join("deep.rs"), "").unwrap();
 
-		let paths = host(&dir).collect_paths(6).await.unwrap();
-		let set: std::collections::HashSet<_> = paths.into_iter().collect();
+		let result = host(&dir).collect_paths(6).await.unwrap();
+		let set: std::collections::HashSet<_> = result.paths.into_iter().collect();
 		assert!(set.contains("README.md"), "got {set:?}");
 		assert!(set.contains("src/"), "got {set:?}");
 		assert!(set.contains("src/lib.rs"), "got {set:?}");
@@ -4209,6 +4248,7 @@ mod tests {
 		assert!(set.contains("src/nested/deep.rs"), "got {set:?}");
 		// `.git/` and everything inside it stays off the tree.
 		assert!(!set.iter().any(|p| p.starts_with(".git")), "got {set:?}");
+		assert!(result.depth_capped.is_empty(), "got {:?}", result.depth_capped);
 	}
 
 	#[tokio::test]
@@ -4246,8 +4286,8 @@ mod tests {
 		run_git(&git, dir.path(), &["add", ".gitignore", "src", "README.md"]);
 		run_git(&git, dir.path(), &["commit", "-q", "-m", "init"]);
 
-		let paths = host(&dir).collect_paths(6).await.unwrap();
-		let set: std::collections::HashSet<_> = paths.into_iter().collect();
+		let result = host(&dir).collect_paths(6).await.unwrap();
+		let set: std::collections::HashSet<_> = result.paths.into_iter().collect();
 		assert!(set.contains("README.md"), "got {set:?}");
 		assert!(set.contains("src/"), "got {set:?}");
 		assert!(set.contains("src/lib.rs"), "got {set:?}");
@@ -4276,8 +4316,8 @@ mod tests {
 		std::fs::create_dir_all(dir.path().join("node_modules").join("deep")).unwrap();
 		std::fs::write(dir.path().join("node_modules").join("deep").join("file.js"), "").unwrap();
 
-		let paths = host(&dir).collect_paths(6).await.unwrap();
-		let set: std::collections::HashSet<_> = paths.into_iter().collect();
+		let result = host(&dir).collect_paths(6).await.unwrap();
+		let set: std::collections::HashSet<_> = result.paths.into_iter().collect();
 		assert!(set.contains("node_modules/"), "got {set:?}");
 		assert!(set.contains("node_modules/deep/"), "got {set:?}");
 		assert!(set.contains("node_modules/deep/file.js"), "got {set:?}");
@@ -4298,11 +4338,11 @@ mod tests {
 		std::fs::write(dir.path().join("node_modules").join("foo").join("bar").join("b.js"), "").unwrap();
 		std::fs::write(dir.path().join("README.md"), "").unwrap();
 
-		let paths = host(&dir)
+		let result = host(&dir)
 			.collect_paths_under(Utf8Path::new("node_modules/"), 0)
 			.await
 			.unwrap();
-		let set: std::collections::HashSet<_> = paths.into_iter().collect();
+		let set: std::collections::HashSet<_> = result.paths.into_iter().collect();
 		assert!(set.contains("node_modules/foo/"), "got {set:?}");
 		assert!(set.contains("node_modules/top.js"), "got {set:?}");
 		// `max_depth=0` pushes direct children but never
@@ -4313,6 +4353,11 @@ mod tests {
 		assert!(!set.contains("node_modules/foo/bar/b.js"), "got {set:?}");
 		// Sibling subtrees outside `rel` aren't touched.
 		assert!(!set.contains("README.md"), "got {set:?}");
+		// `node_modules/foo/` stops short of its own children at
+		// the cap, so it surfaces as a lazy frontier for the next
+		// expansion.
+		let capped: std::collections::HashSet<_> = result.depth_capped.into_iter().collect();
+		assert!(capped.contains("node_modules/foo/"), "got {capped:?}");
 	}
 
 	#[tokio::test]
@@ -4336,12 +4381,33 @@ mod tests {
 		std::fs::write(dir.path().join("a").join("b").join("c").join("deep.txt"), "").unwrap();
 
 		// depth=0 → only the immediate children are enumerated;
-		// `a/` is listed but `a/b/` isn't recursed.
-		let paths = host(&dir).collect_paths(0).await.unwrap();
-		let set: std::collections::HashSet<_> = paths.into_iter().collect();
+		// `a/` is listed but `a/b/` isn't recursed. `a/` carries
+		// hidden descendants so it surfaces as a depth-capped
+		// lazy frontier.
+		let result = host(&dir).collect_paths(0).await.unwrap();
+		let set: std::collections::HashSet<_> = result.paths.into_iter().collect();
 		assert!(set.contains("a/"), "got {set:?}");
 		assert!(!set.contains("a/b/"), "got {set:?}");
 		assert!(!set.contains("a/b/c/deep.txt"), "got {set:?}");
+		let capped: std::collections::HashSet<_> = result.depth_capped.into_iter().collect();
+		assert!(capped.contains("a/"), "got {capped:?}");
+	}
+
+	#[tokio::test]
+	async fn collect_paths_skips_lazy_marker_for_empty_dir() {
+		// Empty leaf directories at the depth cap are NOT marked
+		// as lazy: there's nothing to fetch on expansion, so the
+		// frontend should just show them empty rather than fire a
+		// pointless IPC roundtrip.
+		let dir = TempDir::new().unwrap();
+		std::fs::create_dir_all(dir.path().join("empty_leaf")).unwrap();
+		std::fs::create_dir_all(dir.path().join("populated").join("child")).unwrap();
+		std::fs::write(dir.path().join("populated").join("child").join("file.txt"), "").unwrap();
+
+		let result = host(&dir).collect_paths(0).await.unwrap();
+		let capped: std::collections::HashSet<_> = result.depth_capped.into_iter().collect();
+		assert!(!capped.contains("empty_leaf/"), "got {capped:?}");
+		assert!(capped.contains("populated/"), "got {capped:?}");
 	}
 
 	#[tokio::test]
