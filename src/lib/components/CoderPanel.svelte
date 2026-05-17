@@ -641,6 +641,31 @@
 		return idx >= 0 ? trimmed.slice(idx + 1) : trimmed;
 	}
 
+	// Copy an assistant message's raw markdown source to the
+	// clipboard. Flips the button label to "Copied" / "Failed" for
+	// ~1.2s so the user gets visible feedback inside a webview where
+	// "did the clipboard actually take?" is otherwise invisible.
+	// Failure surfaces as `Failed` rather than a flash because the
+	// button itself is the affordance the user just clicked.
+	async function onCopyAssistantMarkdown(event: MouseEvent, text: string): Promise<void> {
+		event.stopPropagation();
+		const button = event.currentTarget;
+		if (!(button instanceof HTMLButtonElement)) {
+			return;
+		}
+		let ok = false;
+		try {
+			await navigator.clipboard.writeText(text);
+			ok = true;
+		} catch {
+			ok = false;
+		}
+		button.textContent = ok ? 'Copied' : 'Failed';
+		window.setTimeout(() => {
+			button.textContent = 'Copy markdown';
+		}, 1200);
+	}
+
 	async function onOpenAttachment(attachment: { path: string; startLine: number }): Promise<void> {
 		// Open the file and jump to the first line of the captured
 		// range. We don't try to restore the original column / end
@@ -1176,6 +1201,25 @@
 									 the renderer's job. -->
 					<div class="bubble assistant-bubble">
 						<CoderMarkdown text={row.text} />
+						<!-- Hover-revealed "Copy markdown" button. Sits
+									 in the top-right corner of the bubble;
+									 grabs the raw markdown source (`row.text`)
+									 rather than the rendered HTML so the user
+									 ends up with something they can paste back
+									 into a markdown surface. The fenced-code
+									 "Copy" buttons (rendered by `markdown.ts`)
+									 are still active inside the bubble for
+									 per-snippet copies. -->
+						<button
+							type="button"
+							class="copy-md"
+							aria-label="Copy markdown"
+							onclick={(event) => {
+								void onCopyAssistantMarkdown(event, row.text);
+							}}
+						>
+							Copy markdown
+						</button>
 					</div>
 				{/if}
 			</div>
@@ -1729,7 +1773,42 @@
 	   visible blank lines on top of the markdown's already-correct
 	   paragraph spacing. */
 	.assistant-bubble {
+		position: relative;
 		white-space: normal;
+	}
+	/* Hover-revealed "Copy markdown" button anchored to the bubble's
+	   top-right corner. Stays out of the visual flow until the user
+	   actually hovers the bubble; positioned above the markdown
+	   article so it doesn't displace text. The fenced-code "Copy"
+	   buttons (`.md-copy-code` in `styles.css`) live inside each
+	   `<pre>` block separately, so the two affordances coexist
+	   without overlap when a code block sits at the very top of a
+	   reply. */
+	.assistant-bubble .copy-md {
+		position: absolute;
+		top: 6px;
+		right: 6px;
+		padding: 2px 8px;
+		font: inherit;
+		font-size: 11px;
+		color: var(--m-fg-muted);
+		background: var(--m-bg-overlay);
+		border: 1px solid var(--m-border);
+		border-radius: 3px;
+		cursor: pointer;
+		opacity: 0;
+		transition:
+			opacity 120ms ease,
+			color 120ms ease,
+			border-color 120ms ease;
+	}
+	.assistant-bubble:hover .copy-md,
+	.assistant-bubble .copy-md:focus-visible {
+		opacity: 1;
+	}
+	.assistant-bubble .copy-md:hover {
+		color: var(--m-fg);
+		border-color: color-mix(in srgb, var(--m-accent) 40%, var(--m-border));
 	}
 	.row.user .bubble {
 		background: color-mix(in srgb, var(--m-accent) 18%, transparent);

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { getCachedMarkdown, openExternalMarkdownLink, renderMarkdown } from '../markdown';
+	import { getCachedMarkdown, handleMarkdownCopyClick, openExternalMarkdownLink, renderMarkdown } from '../markdown';
 	import { workspace } from '../state.svelte';
 	import { visibleOnce } from '../actions/visibleOnce';
 
@@ -119,6 +119,9 @@
 	function onArticleClick(event: MouseEvent) {
 		const target = event.target;
 		if (!(target instanceof HTMLElement)) {
+			return;
+		}
+		if (handleMarkdownCopyClick(event)) {
 			return;
 		}
 		const anchor = target.closest('a');

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { openExternalMarkdownLink, renderMarkdown, resolveMarkdownLink } from '../markdown';
+	import { handleMarkdownCopyClick, openExternalMarkdownLink, renderMarkdown, resolveMarkdownLink } from '../markdown';
 	import { isUntitledPath, workspace, type OpenFile } from '../state.svelte';
 
 	type Props = { file: OpenFile };
@@ -40,6 +40,9 @@
 	function onArticleClick(event: MouseEvent) {
 		const target = event.target;
 		if (!(target instanceof HTMLElement)) {
+			return;
+		}
+		if (handleMarkdownCopyClick(event)) {
 			return;
 		}
 		const anchor = target.closest('a');

@@ -51,7 +51,25 @@ function buildMarkdownIt(linkify: boolean): MarkdownIt {
 		highlight: (code, lang) => highlightCode(code, lang),
 	});
 	applyLinkRules(md);
+	applyFenceCopyRule(md);
 	return md;
+}
+
+// Wrap every fenced code block so a hover-revealed "Copy" button
+// can sit in the top-right corner. The click is delegated to the
+// hosting `<article>` (see `handleMarkdownCopyClick`) which finds
+// the sibling `<pre>` and writes its `textContent` to the
+// clipboard. We don't touch indented-code blocks (`code_block`
+// token) — those are a markdown rarity nowadays and the model
+// always emits fences anyway, so the maintenance cost of styling
+// two copy-button shapes isn't worth it.
+function applyFenceCopyRule(parser: MarkdownIt): void {
+	const defaultFenceRender =
+		parser.renderer.rules.fence ?? ((tokens, idx, options, _env, self) => self.renderToken(tokens, idx, options));
+	parser.renderer.rules.fence = (tokens, idx, options, env, self) => {
+		const fence = defaultFenceRender(tokens, idx, options, env, self);
+		return `<div class="md-code-block">${fence}<button class="md-copy-code" type="button" aria-label="Copy code">Copy</button></div>`;
+	};
 }
 
 const md = buildMarkdownIt(false);
@@ -157,6 +175,11 @@ export async function renderMarkdown(source: string, options: { linkify?: boolea
 		// Always return a string, never a DOM node. We assign to
 		// `innerHTML` so a string is what we want.
 		RETURN_TRUSTED_TYPE: false,
+		// `<button>` is on DOMPurify's default allow-list but the
+		// `type` attribute isn't always — passing it explicitly so
+		// our fenced-code "Copy" buttons are non-submitting buttons
+		// regardless of the surrounding form context.
+		ADD_ATTR: ['type'],
 	});
 	markdownCache.set(key, sanitised);
 	if (markdownCache.size > MARKDOWN_CACHE_MAX) {
@@ -166,6 +189,62 @@ export async function renderMarkdown(source: string, options: { linkify?: boolea
 		}
 	}
 	return sanitised;
+}
+
+/**
+ * Click delegate for the "Copy" buttons rendered inside fenced
+ * code blocks. Returns `true` if the click was handled (so the
+ * caller can `event.preventDefault()` and stop further routing),
+ * `false` otherwise — the caller falls through to its anchor /
+ * link logic in that case.
+ *
+ * The button text flips to "Copied" for a beat after a successful
+ * write so the user gets visual feedback in a webview where
+ * "did the clipboard actually take?" is otherwise invisible.
+ * Failure mode (clipboard API unavailable, permission denied,
+ * etc.): the text flips to "Failed"; we don't surface a toast
+ * because the button itself is the affordance.
+ */
+export function handleMarkdownCopyClick(event: MouseEvent): boolean {
+	const target = event.target;
+	if (!(target instanceof HTMLElement)) {
+		return false;
+	}
+	const button = target.closest('.md-copy-code');
+	if (!(button instanceof HTMLButtonElement)) {
+		return false;
+	}
+	event.preventDefault();
+	const wrap = button.parentElement;
+	const pre = wrap?.querySelector('pre');
+	const code = pre?.textContent ?? '';
+	if (code === '') {
+		return true;
+	}
+	void copyTextWithFeedback(button, code, 'Copy', 'Copied', 'Failed');
+	return true;
+}
+
+async function copyTextWithFeedback(
+	button: HTMLButtonElement,
+	text: string,
+	idleLabel: string,
+	successLabel: string,
+	failureLabel: string,
+): Promise<void> {
+	let ok = false;
+	try {
+		await navigator.clipboard.writeText(text);
+		ok = true;
+	} catch {
+		ok = false;
+	}
+	button.textContent = ok ? successLabel : failureLabel;
+	// Reset after ~1.2s. Long enough to register, short enough that
+	// rapid re-clicks see the live state again.
+	window.setTimeout(() => {
+		button.textContent = idleLabel;
+	}, 1200);
 }
 
 /**

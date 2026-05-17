@@ -342,6 +342,47 @@ button:focus-visible {
 	padding: 0;
 	font-size: inherit;
 }
+/* Fenced code blocks are wrapped by `applyFenceCopyRule` in
+   `markdown.ts` so a hover-revealed "Copy" button can sit in the
+   top-right corner. The wrapper is `position: relative` so the
+   button is anchored to the block edge regardless of the block's
+   own padding; the button is `position: absolute` so wide blocks
+   that scroll horizontally don't shove the button off-screen. The
+   `<pre>` keeps its own margin (`0.8em 0` above) — the wrapper
+   inherits no extra spacing of its own so the rendered layout
+   matches the previous bare-`<pre>` shape exactly. */
+.markdown-body .md-code-block {
+	position: relative;
+}
+.markdown-body .md-code-block > pre {
+	margin: 0.8em 0;
+}
+.markdown-body .md-copy-code {
+	position: absolute;
+	top: 6px;
+	right: 6px;
+	padding: 2px 8px;
+	font: inherit;
+	font-size: 11px;
+	color: var(--m-fg-muted);
+	background: var(--m-bg-overlay);
+	border: 1px solid var(--m-border);
+	border-radius: 3px;
+	cursor: pointer;
+	opacity: 0;
+	transition:
+		opacity 120ms ease,
+		color 120ms ease,
+		border-color 120ms ease;
+}
+.markdown-body .md-code-block:hover .md-copy-code,
+.markdown-body .md-copy-code:focus-visible {
+	opacity: 1;
+}
+.markdown-body .md-copy-code:hover {
+	color: var(--m-fg);
+	border-color: color-mix(in srgb, var(--m-accent) 40%, var(--m-border));
+}
 .markdown-body a {
 	color: var(--m-accent);
 	text-decoration: none;
