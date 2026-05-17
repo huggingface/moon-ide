@@ -44,6 +44,9 @@ import type {
 	LspRange,
 	LspWorkspaceEdit,
 	ProjectComposeStatus,
+	ForwardedPort,
+	ForwardedPortStatus,
+	PortsApplyResult,
 	ReadFileResult,
 	RightPanelKind,
 	SlackBotProfile,
@@ -203,6 +206,12 @@ export const ipc = {
 			invoke<ProjectComposeStatus>('project_compose_service_stop', { folderPath, service }),
 		serviceRestart: (folderPath: string, service: string) =>
 			invoke<ProjectComposeStatus>('project_compose_service_restart', { folderPath, service }),
+	},
+	ports: {
+		list: () => invoke<ForwardedPort[]>('ports_list'),
+		set: (forwards: ForwardedPort[]) => invoke<PortsApplyResult>('ports_set', { forwards }),
+		status: () => invoke<ForwardedPortStatus[]>('ports_status'),
+		reapply: () => invoke<PortsApplyResult>('ports_reapply'),
 	},
 	composeLogs: {
 		open: (folderPath: string, service: string) => invoke<string>('compose_logs_open', { folderPath, service }),

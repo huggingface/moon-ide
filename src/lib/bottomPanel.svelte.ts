@@ -64,7 +64,7 @@ export const DEFAULT_BOTTOM_PANEL_HEIGHT = 240;
  * lean shells — kind-specific content (log line buffers, future
  * terminal session handles) lives in a sibling store keyed on
  * `id` so adding new kinds doesn't bloat this type. */
-export type BottomPanelTab = PlaceholderTab | LogTab | TerminalTab | DiagTab;
+export type BottomPanelTab = PlaceholderTab | LogTab | TerminalTab | DiagTab | PortsTab;
 
 export type PlaceholderTab = {
 	id: string;
@@ -105,6 +105,15 @@ export type DiagTab = {
 	title: string;
 	kind: 'diag';
 	source: string;
+};
+
+/** Workspace port-forwarding picker. Singleton per workspace —
+ *  the panel reads from the global `ports` store, so a second
+ *  open just focuses the existing tab via [`findPortsTab`]. */
+export type PortsTab = {
+	id: string;
+	title: string;
+	kind: 'ports';
 };
 
 class BottomPanelStore {
@@ -219,6 +228,15 @@ class BottomPanelStore {
 	findDiagTab(source: string): DiagTab | null {
 		const tab = this.#tabs.find((t) => t.kind === 'diag' && t.source === source);
 		return tab && tab.kind === 'diag' ? tab : null;
+	}
+
+	/** Find the (singleton) Ports tab if it's already open. The
+	 *  panel itself is keyed on the global `ports` store, so the
+	 *  identity is "this workspace's ports tab" — no inputs to
+	 *  match on. */
+	findPortsTab(): PortsTab | null {
+		const tab = this.#tabs.find((t) => t.kind === 'ports');
+		return tab && tab.kind === 'ports' ? tab : null;
 	}
 
 	closeTab(id: string): void {

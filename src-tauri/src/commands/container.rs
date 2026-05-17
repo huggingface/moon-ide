@@ -15,11 +15,16 @@
 //! lockstep without polling.
 
 use camino::Utf8PathBuf;
-use moon_container::{Workspace as ContainerWorkspace, WorkspaceConfig, DEFAULT_DEV_IMAGE};
-use moon_protocol::container::{ContainerStateChange, ContainerStatus};
+use moon_container::{
+	apply_forwards, list_forward_status, project_name_for_id, Workspace as ContainerWorkspace, WorkspaceConfig,
+	DEFAULT_DEV_IMAGE,
+};
+use moon_core::session as core_session;
+use moon_protocol::container::{ContainerState, ContainerStateChange, ContainerStatus};
 use moon_protocol::MoonError;
 use tauri::{AppHandle, Emitter, State};
 
+use crate::commands::ports::PORTS_STATE_EVENT;
 use crate::state::AppState;
 
 /// Emitted after every successful lifecycle command. Payload:
@@ -61,6 +66,54 @@ async fn reset_lsp_broker(state: &AppState) {
 	}
 }
 
+/// Re-apply the persisted port-forward set after a workspace
+/// lifecycle event that may have torn the proxy sidecar down
+/// (setup post-teardown, rebuild, apply_bound_folders triggering
+/// a dev recreate). Best-effort: failures are logged at `warn`
+/// and don't fail the underlying lifecycle command — the user
+/// can retry from the Ports panel. Skipped when the workspace
+/// shell isn't running yet (we don't want to spin up a sidecar
+/// pointing at a stopped dev).
+async fn reapply_persisted_forwards(app: &AppHandle, state: &AppState, status: &ContainerStatus) {
+	if !matches!(status.state, ContainerState::Running) {
+		return;
+	}
+	let Some(id) = state.workspace_id() else {
+		return;
+	};
+	let session = match core_session::load(&state.workspaces_dir, id).await {
+		Ok(s) => s,
+		Err(err) => {
+			tracing::warn!(error = %err, "could not load session for forward reapply");
+			return;
+		}
+	};
+	if session.forwarded_ports.is_empty() {
+		return;
+	}
+	let project = match project_name_for_id(id) {
+		Ok(p) => p,
+		Err(err) => {
+			tracing::warn!(error = %err, "could not resolve project name for forward reapply");
+			return;
+		}
+	};
+	if let Err(err) = apply_forwards(&project, &session.forwarded_ports).await {
+		tracing::warn!(error = %err, "forward reapply after lifecycle event failed");
+		return;
+	}
+	let payload = match list_forward_status(&project, &session.forwarded_ports).await {
+		Ok(s) => s,
+		Err(err) => {
+			tracing::warn!(error = %err, "could not compute forward status after reapply");
+			return;
+		}
+	};
+	if let Err(err) = app.emit(PORTS_STATE_EVENT, &payload) {
+		tracing::warn!(error = %err, "failed to emit ports:state after reapply");
+	}
+}
+
 /// Pure query — does not emit. The UI polls this on focus and
 /// after long-running operations the user might have invoked
 /// outside the IDE.
@@ -77,7 +130,9 @@ pub async fn container_setup(app: AppHandle, state: State<'_, AppState>) -> Resu
 	let container = workspace_handle(&state).await?;
 	container.setup(DEFAULT_DEV_IMAGE).await?;
 	reset_lsp_broker(&state).await;
-	snapshot_and_emit(&app, &container).await
+	let status = snapshot_and_emit(&app, &container).await?;
+	reapply_persisted_forwards(&app, &state, &status).await;
+	Ok(status)
 }
 
 #[tauri::command]
@@ -101,7 +156,9 @@ pub async fn container_rebuild(app: AppHandle, state: State<'_, AppState>) -> Re
 	let container = workspace_handle(&state).await?;
 	container.rebuild(DEFAULT_DEV_IMAGE).await?;
 	reset_lsp_broker(&state).await;
-	snapshot_and_emit(&app, &container).await
+	let status = snapshot_and_emit(&app, &container).await?;
+	reapply_persisted_forwards(&app, &state, &status).await;
+	Ok(status)
 }
 
 #[tauri::command]
@@ -134,7 +191,9 @@ pub async fn container_apply_bound_folders(
 	let container = workspace_handle(&state).await?;
 	container.apply_bound_folders(DEFAULT_DEV_IMAGE).await?;
 	reset_lsp_broker(&state).await;
-	snapshot_and_emit(&app, &container).await
+	let status = snapshot_and_emit(&app, &container).await?;
+	reapply_persisted_forwards(&app, &state, &status).await;
+	Ok(status)
 }
 
 /// Render what `compose.yaml` *would* contain without writing it.

@@ -765,31 +765,111 @@ The container sees one tree.
 
 The container runs on its own bridge network — the whole point
 of doing this is _not_ polluting the host's `localhost`. Ports
-the user wants to reach from the host are declared explicitly
-in `compose.yaml`'s `ports:` map.
+the user wants to reach from the host are forwarded by an
+**IDE-managed proxy sidecar**, not by listing them in
+`compose.yaml`'s `ports:` map.
 
-Three rules:
+### Why a sidecar (not `ports:` on `dev`)
 
-1. **Nothing auto-forwards.** A service inside the container
-   listening on `:3000` is not reachable from the host unless
-   `compose.yaml` says so.
-2. **Declared forwards bind on `127.0.0.1` by default.** The
-   user opts in to `0.0.0.0` per-port if they want to reach
-   the dev server from another device.
-3. **Conflict detection.** If the host port is busy when the
-   container starts, surface the error in the panel — don't
-   silently rebind.
+Compose treats `ports:` as part of the dev service's spec —
+adding or removing a forward forces a recreate of the dev
+container, which drops every terminal session, every in-progress
+LSP, every agent process. The whole point of "exposing a port"
+is that the user is iterating on something running inside the
+container; recreating the container kills that thing on every
+edit. The sidecar is a separate container with its own
+lifecycle, so port edits never touch `dev`.
 
-The IDE surfaces the live forward map in a small "Ports"
-section of the status bar / sidebar (Phase 2.2):
+### Mechanism
+
+For each workspace, moon-ide runs at most one proxy container:
+
+- Name: `moon-ws-<id>-ports-1`.
+- Image: `alpine/socat:1.8.0.3` (~5 MB; pinned tag).
+- Network: `moon-ws-<id>_default` — the workspace shell's
+  default network, so the proxy can resolve `dev` by name.
+- Publishes `127.0.0.1:<host_port>` for each declared forward;
+  fans `socat tcp-listen:<container_port>,fork,reuseaddr
+tcp:moon-ws-<id>-dev-1:<container_port>` listeners off a
+  single `sh -c '… & wait'` invocation.
+
+Adding or removing a forward = stop the sidecar, run a new one
+with the new port set. The dev container, terminals, and any
+in-flight `bun dev` are untouched.
+
+### Storage and lifecycle
+
+Forwards are persisted per-workspace in `session.json` as
+[`ForwardedPort`](../crates/moon-protocol/src/ports.rs)
+entries (`container_port`, `host_port`, `label`). The host
+port defaults to the container port on the picker; the user
+re-types it on cross-workspace conflicts (workspace A:
+`3000 -> 3000`, workspace B: `3001 -> 3000`).
+
+Lifecycle integration:
+
+- `Workspace::teardown` stops the sidecar **before**
+  `compose down` — Docker refuses to remove a network with
+  active endpoints, and the sidecar attaches to the
+  workspace's default network. (Same hazard as the
+  cross-project attach in [`network.rs`](../crates/moon-container/src/network.rs).)
+- `Workspace::stop` leaves the sidecar running. It'll
+  proxy-fail to a stopped dev (socat returns "connection
+  refused" per accept), which is the right user-visible
+  behaviour: the user sees that their forward is up but
+  their server isn't.
+- `container_setup` / `container_rebuild` /
+  `container_apply_bound_folders` re-apply the persisted
+  forward set after the lifecycle command lands, so a fresh
+  workspace shell comes up with its forwards already wired.
+
+### Conflict handling
+
+`ports_set` runs a pre-flight `TcpListener::bind("127.0.0.1:N")`
+per requested host port. Conflicts are returned on
+[`PortsApplyResult.conflicts`](../crates/moon-protocol/src/ports.rs)
+and _omitted_ from the sidecar — non-conflicting entries still
+come up. The user's full requested set is persisted regardless,
+so retrying after they stop whatever else was on `:N` brings
+the missing forward in without re-typing.
+
+### Loopback only
+
+Forwards bind `127.0.0.1` exclusively. A `0.0.0.0` toggle
+(reach the workspace's dev server from another device on the
+LAN) is deferred until somebody concretely asks for it — see
+AGENTS.md's "hardcode first, configure later".
+
+### What's not in scope
+
+- **Auto-detection.** No `ss -ltn` poll inside the dev
+  container — the user types the forward. Adding it later is
+  straightforward and mostly an opt-in default-off feature.
+- **devcontainer.json `forwardPorts` interop.** Phase 2.3.
+- **Surfacing the project compose's `ports:`.** A read-only
+  viewer for forwards published by per-folder
+  `docker-compose.yml` files can land alongside the proxy
+  picker; for now those forwards still work, they're just not
+  in the same panel.
+- **Presigned-URL rewriting** for s3/minio dev stacks. Out of
+  scope; the user works around it with hostnames in their app
+  config.
+
+### UI surface
+
+The forward map lives in the bottom panel's "Ports" tab and a
+status-bar entry next to the container pip:
 
 ```
-● 3000 → http://localhost:3000   (bun dev)
-● 5173 → http://localhost:5173   (vite)
+● 3000 → http://localhost:3000   (vite)
+● 8080 → http://localhost:8080   (api)
 ✕ 5432 → host port busy          [retry]
 ```
 
-Clicking opens the URL in the host's default browser.
+Status dots: green = live, amber = proxy down (workspace shell
+not running), red = host port busy. Clicking the host port
+opens `http://localhost:<host_port>` in the host's default
+browser.
 
 ## SSH agent forwarding
 

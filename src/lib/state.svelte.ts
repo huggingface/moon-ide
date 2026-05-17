@@ -48,6 +48,7 @@ import {
 	openHostTerminal,
 	rememberActiveTerminalFor,
 } from './openTerminal';
+import { ports } from './ports.svelte';
 import { projectCompose } from './projectCompose.svelte';
 import { rightPanel } from './rightPanel.svelte';
 import { slack } from './slack.svelte';
@@ -1235,6 +1236,13 @@ class WorkspaceState {
 		// than racing with the in-flight call.
 		void container.wireRuntime();
 		const containerRefresh = container.refresh();
+		// Workspace port forwards: same wire-and-refresh dance.
+		// `ports.refresh` is cheap (one `docker inspect` for the
+		// proxy + N `bind()` probes); calling it on every workspace
+		// change keeps the panel's status dots fresh without
+		// requiring it to be open.
+		void ports.wireRuntime();
+		void ports.refresh();
 		// Per-folder compose snapshots use a parallel event
 		// subscription keyed on `folder_path`. The folder bars'
 		// indicators read from `projectCompose.snapshotFor(path)`,

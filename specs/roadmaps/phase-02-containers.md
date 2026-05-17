@@ -143,28 +143,37 @@ Test plan: `0015-container-routed-exec.md` (TBD).
 
 ### 2.2 — Port forwarding UX
 
-**Acceptance**: a "Ports" surface (sidebar or status-bar
-section — pick at implementation) lists every active forward
-declared in `compose.yaml` with state (✓/✕ on host port
-availability), URL, and the originating in-container port.
-Clicking a row opens the URL in the host's default browser.
-Conflicts (host port busy) surface with a Retry button instead
-of silent failure.
+**Status**: shipped 2026-05-17. The original "lists every
+forward declared in compose.yaml" framing flipped during
+implementation — declaring the forward in `compose.yaml`
+forces a recreate of the dev container on every edit, which
+kills terminals + LSPs + agents. The picker drives a separate
+`alpine/socat` proxy sidecar (`moon-ws-<id>-ports-1`) instead;
+adding/removing a port edits only the sidecar, not `dev`.
 
-What ships:
+What shipped:
 
-- A docker events watcher that updates the forward map on
-  start/stop.
-- A small "Ports" UI region.
-- Host-port conflict detection on container start.
+- A bottom-panel "Ports" tab + a status-bar entry next to the
+  container pip.
+- An IDE-managed proxy sidecar per workspace, restarted on
+  every forward set mutation.
+- Pre-flight `bind()` host-port conflict probe; conflicts
+  reported per-port without failing the whole apply.
+- Persistence in `WorkspaceSession.forwarded_ports`. Auto
+  re-apply on `container_setup` / `container_rebuild` /
+  `container_apply_bound_folders` so a fresh shell comes up
+  with its forwards already wired.
 
-What doesn't ship in 2.2:
+Out of scope (deferred):
 
-- On-demand forwarding ("forward this port now without editing
-  compose"). Defer until somebody actually wants it; the
-  workflow today is "edit compose, rebuild" which is fine.
+- Auto-detection (`ss -ltn` poll inside dev). Hooks land if
+  there's demand.
+- `0.0.0.0` toggle. Loopback-only is hardcoded.
+- Surfacing the project compose's already-published ports in
+  the same panel.
+- Devcontainer.json `forwardPorts` interop — Phase 2.3.
 
-Test plan: `0016-container-ports.md` (TBD).
+Test plan: [`0082-workspace-port-forwarding.md`](../test-plans/0082-workspace-port-forwarding.md).
 
 ### 2.3 — Devcontainer.json interop
 

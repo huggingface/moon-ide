@@ -1493,6 +1493,33 @@ export type RouterPricing = {
 	output: number;
 };
 
+/**
+ * One declared host-to-dev port forward. Mirrors
+ * `moon_protocol::ports::ForwardedPort`. `host_port` defaults
+ * to `container_port` on the picker; the user retypes it on
+ * cross-workspace conflicts.
+ */
+export type ForwardedPort = {
+	container_port: number;
+	host_port: number;
+	label: string;
+};
+
+/** Mirrors `moon_protocol::ports::ForwardedPortHealth`. */
+export type ForwardedPortHealth = 'live' | 'host_port_busy' | 'proxy_down';
+
+/** Mirrors `moon_protocol::ports::ForwardedPortStatus`. */
+export type ForwardedPortStatus = {
+	forward: ForwardedPort;
+	health: ForwardedPortHealth;
+};
+
+/** Mirrors `moon_protocol::ports::PortsApplyResult`. */
+export type PortsApplyResult = {
+	applied: ForwardedPort[];
+	conflicts: ForwardedPort[];
+};
+
 export type MoonError =
 	| { code: 'NotFound'; message: string }
 	| { code: 'IoError'; message: string }

@@ -90,6 +90,7 @@ mod tests {
 			}],
 			active_folder_path: Some("/tmp/example".into()),
 			coder_provider_lock: None,
+			forwarded_ports: Vec::new(),
 		}
 	}
 

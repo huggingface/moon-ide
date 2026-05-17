@@ -10,6 +10,7 @@
 
 use crate::coder_models::CoderProviderLock;
 use crate::git::{CompareBaseline, PrListScope};
+use crate::ports::ForwardedPort;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -118,4 +119,19 @@ pub struct WorkspaceSession {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	#[ts(optional, type = "CoderProviderLock | null")]
 	pub coder_provider_lock: Option<CoderProviderLock>,
+	/// User-declared host-to-dev port forwards. Each entry is
+	/// served by the workspace's proxy sidecar
+	/// (`moon-ws-<id>-ports-1`); the sidecar is recreated
+	/// whenever this list changes — the dev container itself
+	/// stays untouched, so terminals + any in-flight
+	/// `bun dev` survive port edits.
+	///
+	/// Empty list = no sidecar running. Persisted in
+	/// `session.json` so the user's per-workspace mappings
+	/// (workspace A: `3000 -> 3000`; workspace B:
+	/// `3001 -> 3000`) survive restarts and don't fight over
+	/// the host's port space across workspaces. See
+	/// [`crate::ports`] for the wire shape.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub forwarded_ports: Vec<ForwardedPort>,
 }

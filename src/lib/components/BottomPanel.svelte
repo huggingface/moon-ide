@@ -7,6 +7,7 @@
 	import LogTab from './LogTab.svelte';
 	import LogsLauncher from './LogsLauncher.svelte';
 	import LogsPanel from './LogsPanel.svelte';
+	import PortsPanel from './PortsPanel.svelte';
 	import TerminalTab from './TerminalTab.svelte';
 	import TerminalLauncher from './TerminalLauncher.svelte';
 	import TerminalTargetIcon from './TerminalTargetIcon.svelte';
@@ -175,6 +176,8 @@
 						<TerminalTab {tab} />
 					{:else if tab.kind === 'diag'}
 						<LogsPanel {tab} />
+					{:else if tab.kind === 'ports'}
+						<PortsPanel />
 					{/if}
 				</div>
 			{/each}

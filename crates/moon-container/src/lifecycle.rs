@@ -74,6 +74,7 @@ use crate::compose::{
 	SshConfigMount,
 };
 use crate::network::{connect_container_to_network, dev_container_name, project_default_network};
+use crate::port_forward::stop_forwards;
 use crate::project::{project_name_for_id, ProjectName, ProjectNameError};
 use crate::project_compose::ProjectCompose;
 
@@ -399,8 +400,15 @@ impl Workspace {
 	///
 	/// `down` removes the dev container, which also drops any
 	/// project-network attachments it carried — no explicit
-	/// detach is needed.
+	/// detach is needed. The proxy sidecar from
+	/// [`crate::port_forward`] *is* attached to the workspace's
+	/// default network, though, and Docker refuses to remove a
+	/// network with active endpoints — so stop the sidecar first
+	/// (best-effort: a missing sidecar is success).
 	pub async fn teardown(&self) -> Result<(), LifecycleError> {
+		if let Err(err) = stop_forwards(&self.project).await {
+			tracing::warn!(%err, project = %self.project, "best-effort stop of port-forward sidecar before teardown failed");
+		}
 		self.docker_compose(["down"]).await?;
 		Ok(())
 	}

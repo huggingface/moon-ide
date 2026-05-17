@@ -9,6 +9,7 @@
 	import ThemePicker from './ThemePicker.svelte';
 	import { lspLanguageFor } from '../editor/lspLanguage';
 	import { bottomPanel } from '../bottomPanel.svelte';
+	import { ports } from '../ports.svelte';
 
 	let themePicker: ThemePicker | undefined = $state();
 	let containerWrap: HTMLDivElement | undefined = $state();
@@ -21,6 +22,31 @@
 	let autocompletePortDraft = $state(String(workspace.nextEditServerPort));
 
 	const SWEEP_NEXT_EDIT_BLOG = 'https://blog.sweep.dev/posts/oss-next-edit';
+
+	const portsCount = $derived(ports.status.length);
+	const portsAllLive = $derived(portsCount > 0 && ports.status.every((s) => s.health === 'live'));
+	const portsBadgeTitle = $derived(
+		portsCount === 0
+			? 'No port forwards declared'
+			: portsAllLive
+				? `${portsCount} forward${portsCount === 1 ? '' : 's'} live`
+				: `${portsCount} forward${portsCount === 1 ? '' : 's'} declared`,
+	);
+
+	function togglePortsPanel(): void {
+		const existing = bottomPanel.findPortsTab();
+		if (existing) {
+			if (bottomPanel.activeId === existing.id && bottomPanel.visible) {
+				bottomPanel.hide();
+				return;
+			}
+			bottomPanel.setActive(existing.id);
+			bottomPanel.show();
+			return;
+		}
+		bottomPanel.addTab({ id: 'ports', title: 'Ports', kind: 'ports' });
+		bottomPanel.show();
+	}
 
 	// Error / warning counts for the current file. Info and hint
 	// diagnostics are intentionally omitted from the pill: tsserver
@@ -554,6 +580,10 @@
 					<ContainerPanel />
 				{/if}
 			</div>
+			<button type="button" class="container" title={portsBadgeTitle} onclick={togglePortsPanel}>
+				<span class="pip" class:on={portsAllLive}></span>
+				ports{portsCount > 0 ? ` (${portsCount})` : ''}
+			</button>
 		{/if}
 		<!-- Terminal launcher. Same popover the bottom-panel
 			 strip uses; placed here so the user can spawn a

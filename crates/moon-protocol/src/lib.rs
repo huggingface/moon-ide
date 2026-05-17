@@ -14,6 +14,7 @@ pub mod git;
 pub mod logs;
 pub mod lsp;
 pub mod next_edit;
+pub mod ports;
 pub mod search;
 pub mod session;
 pub mod slack;
