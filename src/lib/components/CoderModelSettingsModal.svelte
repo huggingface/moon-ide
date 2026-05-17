@@ -136,6 +136,12 @@
 	let webKeyDraft = $state('');
 	let webKeySaving = $state(false);
 	let webKeyError = $state<string | null>(null);
+	// When a key is already configured, the section shows as a
+	// compact one-liner; the input only mounts when the user
+	// clicks `Replace`. Avoids the password-shaped input
+	// competing with the catalog-search input visually — users
+	// were clicking the wrong one when filtering models.
+	let webKeyEditing = $state(false);
 	// Which model row is currently expanded — `null` for "all
 	// collapsed". Single-expansion is on purpose: showing two
 	// open provider tables at once is busy and the picker already
@@ -209,6 +215,12 @@
 	// the destination's picks. Keeps the modal's "save once at the
 	// end" semantics: no IPC happens until the user clicks Save.
 	function switchActiveProvider(nextId: string | null): void {
+		// Always exit any open draft (add or edit) when a tab is
+		// clicked, even if it's the currently-active one. Without
+		// this, clicking `+ Add OpenRouter` and then clicking the
+		// previously-active tab leaves the user stuck on the draft
+		// form with no way out except Cancel.
+		closeProviderDraft();
 		if (nextId === activeProviderId) {
 			return;
 		}
@@ -399,6 +411,11 @@
 		activeProviderId === null ? null : (providers.find((p) => p.id === activeProviderId) ?? null),
 	);
 	const isHfActive = $derived(activeProviderId === null);
+	// While drafting a brand-new provider, no existing tab is
+	// "the active one" — the modal's primary content is the
+	// draft form. Editing an existing provider still highlights
+	// its tab (you're configuring that same provider).
+	const draftingNew = $derived(providerDraft !== null && providerDraft.is_new);
 	// `/v1/models` rows for the active user provider, when any.
 	// `null` = still loading; `[]` = no catalog (server doesn't
 	// expose `/v1/models`, or we got an error and cached an empty
@@ -821,7 +838,7 @@
 			<button
 				type="button"
 				class="provider-tab"
-				class:active={activeProviderId === null}
+				class:active={activeProviderId === null && !draftingNew}
 				onclick={() => switchActiveProvider(null)}
 			>
 				Hugging Face
@@ -830,7 +847,7 @@
 				<button
 					type="button"
 					class="provider-tab"
-					class:active={activeProviderId === p.id}
+					class:active={activeProviderId === p.id && !draftingNew}
 					onclick={() => switchActiveProvider(p.id)}
 					title={p.base_url}
 				>
@@ -952,15 +969,12 @@
 
 		{#if providerDraft === null}
 			<section class="fields">
-				<label class="field">
+				<label class="field" class:tier-active={editingTier === 'standard'}>
 					<span class="label-row">
 						<span class="label-name">Standard model</span>
-						<button
-							type="button"
-							class="tier-tab"
-							class:active={editingTier === 'standard'}
-							onclick={() => (editingTier = 'standard')}>edit</button
-						>
+						{#if editingTier === 'standard'}
+							<span class="tier-flag" title="Catalog clicks below will populate this field">catalog target</span>
+						{/if}
 					</span>
 					<input
 						type="text"
@@ -968,6 +982,7 @@
 						placeholder="Qwen/Qwen3.5-397B-A17B:scaleway"
 						spellcheck="false"
 						autocomplete="off"
+						onfocusin={() => (editingTier = 'standard')}
 					/>
 					<span class="hint">
 						Drives the main agent loop and every sub-agent. Empty = built-in default.
@@ -987,6 +1002,7 @@
 							autocomplete="off"
 							disabled={standardModel.trim().length === 0}
 							oninput={(e) => writeCapFor(standardModel, (e.target as HTMLInputElement).value)}
+							onfocusin={() => (editingTier = 'standard')}
 						/>
 						<span class="cap-unit">tokens</span>
 						{#if standardCapInput.length > 0}
@@ -995,15 +1011,12 @@
 					</span>
 				</label>
 
-				<label class="field">
+				<label class="field" class:tier-active={editingTier === 'cheap'}>
 					<span class="label-row">
 						<span class="label-name">Cheap model</span>
-						<button
-							type="button"
-							class="tier-tab"
-							class:active={editingTier === 'cheap'}
-							onclick={() => (editingTier = 'cheap')}>edit</button
-						>
+						{#if editingTier === 'cheap'}
+							<span class="tier-flag" title="Catalog clicks below will populate this field">catalog target</span>
+						{/if}
 					</span>
 					<input
 						type="text"
@@ -1011,6 +1024,7 @@
 						placeholder="Qwen/Qwen3-Coder-30B-A3B-Instruct:scaleway"
 						spellcheck="false"
 						autocomplete="off"
+						onfocusin={() => (editingTier = 'cheap')}
 					/>
 					<span class="hint">
 						Used for commit messages, branch names, compaction summaries, folder summaries.
@@ -1030,6 +1044,7 @@
 							autocomplete="off"
 							disabled={cheapModel.trim().length === 0}
 							oninput={(e) => writeCapFor(cheapModel, (e.target as HTMLInputElement).value)}
+							onfocusin={() => (editingTier = 'cheap')}
 						/>
 						<span class="cap-unit">tokens</span>
 						{#if cheapCapInput.length > 0}
@@ -1063,53 +1078,6 @@
 						</span>
 					</label>
 				{/if}
-
-				<!-- Web-search subsection. Separate-but-inline rather than
-				 a second modal because the team has one knob to set
-				 here (a Tavily API key) and the discoverability win
-				 from grouping it with the rest of the agent settings
-				 outweighs the small layout overhead. The key itself
-				 never round-trips back from the keyring; the UI just
-				 knows whether one is set. -->
-				<div class="web-key field">
-					<span class="label-row">
-						<span class="label-name">Web search (Tavily)</span>
-						{#if coder.webSearchConfigured === true}
-							<span class="key-status configured" title="Key stored in OS keyring">key configured</span>
-						{:else if coder.webSearchConfigured === false}
-							<span class="key-status missing">no key</span>
-						{/if}
-					</span>
-					<div class="web-key-row">
-						<input
-							type="password"
-							bind:value={webKeyDraft}
-							placeholder={coder.webSearchConfigured ? 'Paste a new key to replace' : 'tvly-...'}
-							spellcheck="false"
-							autocomplete="off"
-							disabled={webKeySaving}
-						/>
-						<button
-							type="button"
-							class="primary"
-							onclick={onSaveWebKey}
-							disabled={webKeySaving || webKeyDraft.trim().length === 0}
-						>
-							{coder.webSearchConfigured ? 'Replace' : 'Save'}
-						</button>
-						{#if coder.webSearchConfigured === true}
-							<button type="button" class="secondary" onclick={onClearWebKey} disabled={webKeySaving}>Clear</button>
-						{/if}
-					</div>
-					<span class="hint">
-						Enables the <code>web_search</code> tool — Tavily for the SERP, Jina Reader for the page fetch (no second
-						key needed). Get a free key at <code>tavily.com</code>; stored in your OS keyring, never read back into this
-						dialog. Leave blank to disable web search entirely (the model won't see the tool).
-					</span>
-					{#if webKeyError !== null}
-						<span class="error">{webKeyError}</span>
-					{/if}
-				</div>
 			</section>
 
 			<section class="catalog">
@@ -1297,6 +1265,90 @@
 					</ul>
 				{/if}
 			</section>
+
+			<!-- Web-search subsection. Below the catalog because
+				 it's a one-time key-paste step, not a daily knob —
+				 putting it between the model fields and the catalog
+				 made users click the password input by mistake when
+				 reaching for the catalog filter. Compact-when-
+				 configured: just a status pill + Replace / Clear
+				 buttons; the input only mounts on Replace. The key
+				 itself never round-trips back from the keyring;
+				 the UI just knows whether one is set. -->
+			<section class="web-key" aria-label="Web search">
+				{#if coder.webSearchConfigured === true && !webKeyEditing}
+					<div class="web-key-summary">
+						<span class="label-name">Web search (Tavily)</span>
+						<span class="key-status configured" title="Key stored in OS keyring">key configured</span>
+						<span class="flex-spacer"></span>
+						<button
+							type="button"
+							class="secondary"
+							onclick={() => {
+								webKeyEditing = true;
+								webKeyError = null;
+							}}
+						>
+							Replace
+						</button>
+						<button type="button" class="secondary" onclick={onClearWebKey} disabled={webKeySaving}>Clear</button>
+					</div>
+				{:else}
+					<div class="label-row">
+						<span class="label-name">Web search (Tavily)</span>
+						{#if coder.webSearchConfigured === true}
+							<span class="key-status configured" title="Key stored in OS keyring">key configured</span>
+						{:else if coder.webSearchConfigured === false}
+							<span class="key-status missing">no key</span>
+						{/if}
+					</div>
+					<div class="web-key-row">
+						<input
+							type="password"
+							bind:value={webKeyDraft}
+							placeholder={coder.webSearchConfigured ? 'Paste a new key to replace' : 'tvly-...'}
+							spellcheck="false"
+							autocomplete="off"
+							disabled={webKeySaving}
+						/>
+						<button
+							type="button"
+							class="primary"
+							onclick={async () => {
+								await onSaveWebKey();
+								if (webKeyError === null) {
+									webKeyEditing = false;
+								}
+							}}
+							disabled={webKeySaving || webKeyDraft.trim().length === 0}
+						>
+							{coder.webSearchConfigured ? 'Replace' : 'Save'}
+						</button>
+						{#if coder.webSearchConfigured === true}
+							<button
+								type="button"
+								class="secondary"
+								onclick={() => {
+									webKeyEditing = false;
+									webKeyDraft = '';
+									webKeyError = null;
+								}}
+								disabled={webKeySaving}
+							>
+								Cancel
+							</button>
+						{/if}
+					</div>
+					<span class="hint">
+						Enables the <code>web_search</code> tool — Tavily for the SERP, Jina Reader for the page fetch (no second
+						key needed). Get a free key at <code>tavily.com</code>; stored in your OS keyring, never read back into this
+						dialog. Leave blank to disable web search entirely (the model won't see the tool).
+					</span>
+					{#if webKeyError !== null}
+						<span class="error">{webKeyError}</span>
+					{/if}
+				{/if}
+			</section>
 		{/if}
 
 		<footer>
@@ -1386,21 +1438,18 @@
 		font-weight: 600;
 		color: var(--m-fg);
 	}
-	.tier-tab {
-		background: transparent;
-		border: 1px solid var(--m-border);
+	.tier-flag {
+		background: var(--m-accent);
+		border: 1px solid var(--m-accent);
 		border-radius: 4px;
-		color: var(--m-fg-muted);
+		color: var(--m-on-accent, #fff);
 		font-size: 10px;
 		text-transform: uppercase;
 		letter-spacing: 0.5px;
 		padding: 2px 6px;
-		cursor: pointer;
 	}
-	.tier-tab.active {
-		background: var(--m-accent);
+	.tier-active > input[type='text'] {
 		border-color: var(--m-accent);
-		color: var(--m-on-accent, #fff);
 	}
 	.field input,
 	.field select {
@@ -1710,6 +1759,30 @@
 		margin: 0;
 		font-size: 11px;
 		color: var(--m-error, #d34c4c);
+	}
+	.web-key {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+		padding-top: 10px;
+		border-top: 1px solid var(--m-border);
+	}
+	.web-key-summary {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+	.web-key-summary .label-name {
+		font-size: 12px;
+		font-weight: 600;
+	}
+	.web-key-summary .secondary {
+		flex: 0 0 auto;
+		padding: 2px 10px;
+		font-size: 11px;
+	}
+	.flex-spacer {
+		flex: 1 1 auto;
 	}
 	.web-key-row {
 		display: flex;
