@@ -247,6 +247,53 @@ fn u32_is_zero(n: &u32) -> bool {
 	*n == 0
 }
 
+/// JSON content used as the synthetic `Tool` result when replay
+/// detects an interrupted tool call. Kept small + parseable so
+/// the panel renders a clean error row and the model — if the
+/// user resumes the session — sees an unambiguous "this tool
+/// didn't run" signal it can react to instead of a hung promise.
+///
+/// Both `open_session` (top-level transcript) and
+/// `replay_subagent_spawned` (sub-agent transcripts) rely on
+/// this string; the panel detects "looks like an error" via the
+/// `{"error": "…"}`-only-key shape (see `emit_replay_events`).
+pub const INTERRUPTED_TOOL_RESULT_JSON: &str = r#"{"error":"Interrupted before tool completed."}"#;
+
+/// Walk `records` and return the tool-call ids that an Assistant
+/// record emitted but no later `Tool` record acknowledged.
+///
+/// In the wild, this happens when the user stops the coder mid-
+/// tool (Ctrl+C, panel close, IDE quit) — the Assistant record
+/// hits disk before the tool dispatcher returns, but the
+/// matching `Tool` record never gets appended. Without recovery,
+/// the panel re-renders the row as "running" forever and the
+/// model rejects the next turn (most providers strict-validate
+/// "every assistant tool_call has a matching tool message").
+///
+/// Returned in iteration order so callers can preserve "tool
+/// results follow their assistant message" when threading the
+/// orphans back into a rebuilt `messages` slice. Cheap: O(N) one
+/// pass with a small `HashSet`.
+pub fn orphan_tool_call_ids(records: &[SessionRecord]) -> Vec<String> {
+	let mut completed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+	for record in records {
+		if let SessionRecord::Tool { tool_call_id, .. } = record {
+			completed.insert(tool_call_id.as_str());
+		}
+	}
+	let mut orphans: Vec<String> = Vec::new();
+	for record in records {
+		if let SessionRecord::Assistant { tool_calls, .. } = record {
+			for call in tool_calls {
+				if !completed.contains(call.id.as_str()) {
+					orphans.push(call.id.clone());
+				}
+			}
+		}
+	}
+	orphans
+}
+
 /// Lightweight summary used by the panel's session list. Avoids
 /// loading every record off disk when the user just wants to pick
 /// a session.
@@ -1173,5 +1220,111 @@ mod tests {
 		// slugs (the FNV suffix disambiguates).
 		assert_eq!(a.file_name(), b.file_name());
 		assert_ne!(project_slug(&a), project_slug(&b));
+	}
+
+	fn make_tool_call(id: &str, name: &str) -> ToolCall {
+		ToolCall {
+			id: id.into(),
+			kind: "function".into(),
+			function: crate::inference::FunctionCall {
+				name: name.into(),
+				arguments: "{}".into(),
+			},
+		}
+	}
+
+	#[test]
+	fn orphan_tool_call_ids_returns_empty_when_every_call_has_a_result() {
+		let records = vec![
+			SessionRecord::User {
+				text: "hi".into(),
+				images: Vec::new(),
+			},
+			SessionRecord::Assistant {
+				content: None,
+				thinking: None,
+				tool_calls: vec![make_tool_call("call-a", "bash")],
+			},
+			SessionRecord::Tool {
+				tool_call_id: "call-a".into(),
+				content: r#"{"stdout":"ok"}"#.into(),
+			},
+		];
+		assert!(orphan_tool_call_ids(&records).is_empty());
+	}
+
+	#[test]
+	fn orphan_tool_call_ids_finds_interrupted_tail() {
+		// Common shape: user prompted, model emitted two
+		// tool_calls in one Assistant message, the dispatcher
+		// got through the first one and the user pressed Stop
+		// before the second returned.
+		let records = vec![
+			SessionRecord::User {
+				text: "go".into(),
+				images: Vec::new(),
+			},
+			SessionRecord::Assistant {
+				content: None,
+				thinking: None,
+				tool_calls: vec![make_tool_call("call-a", "bash"), make_tool_call("call-b", "bash")],
+			},
+			SessionRecord::Tool {
+				tool_call_id: "call-a".into(),
+				content: r#"{"stdout":"a"}"#.into(),
+			},
+		];
+		assert_eq!(orphan_tool_call_ids(&records), vec!["call-b".to_string()]);
+	}
+
+	#[test]
+	fn orphan_tool_call_ids_handles_multiple_assistant_turns() {
+		// Two complete turns followed by a third orphan turn.
+		// The completed turns shouldn't show up as orphans even
+		// though their tool_calls came earlier in the stream.
+		let records = vec![
+			SessionRecord::Assistant {
+				content: None,
+				thinking: None,
+				tool_calls: vec![make_tool_call("call-a", "bash")],
+			},
+			SessionRecord::Tool {
+				tool_call_id: "call-a".into(),
+				content: "{}".into(),
+			},
+			SessionRecord::Assistant {
+				content: None,
+				thinking: None,
+				tool_calls: vec![make_tool_call("call-b", "read_file")],
+			},
+			SessionRecord::Tool {
+				tool_call_id: "call-b".into(),
+				content: "{}".into(),
+			},
+			SessionRecord::Assistant {
+				content: None,
+				thinking: None,
+				tool_calls: vec![make_tool_call("call-c", "bash")],
+			},
+		];
+		assert_eq!(orphan_tool_call_ids(&records), vec!["call-c".to_string()]);
+	}
+
+	#[test]
+	fn orphan_tool_call_ids_ignores_text_only_assistant_turns() {
+		// Plain "ask the model a question, get an answer back"
+		// — no tool_calls anywhere. Must return empty.
+		let records = vec![
+			SessionRecord::User {
+				text: "what time is it".into(),
+				images: Vec::new(),
+			},
+			SessionRecord::Assistant {
+				content: Some("I don't know".into()),
+				thinking: None,
+				tool_calls: Vec::new(),
+			},
+		];
+		assert!(orphan_tool_call_ids(&records).is_empty());
 	}
 }

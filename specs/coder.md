@@ -801,6 +801,15 @@ the `+` button doesn't litter the directory with empty sessions.
 
 A crash loses at most the in-flight event.
 
+### Interrupted tool calls (orphan recovery)
+
+If the user stops the coder mid-tool (Esc, panel close, IDE quit) the assistant's `tool_calls` already hit disk but the matching `tool` record never did — the dispatcher was cancelled before it could emit one. Without recovery, reopening that session would render a forever-"running" tool row and the next turn would crash inside the provider (every chat-completions API rejects an `assistant.tool_calls` without its matching `tool` results). On reload, [`open_session`](../crates/moon-coder/src/runner.rs) walks the records once, scopes any `tool_call` id with no later `tool` record as orphan, and:
+
+- Synthesises a `ChatMessage::Tool` with content `{"error":"Interrupted before tool completed."}` for each orphan, appended to the in-memory `messages` slice so the next turn has a valid history.
+- Emits a synthetic `CoderEvent::ToolResult { is_error: true, ... }` per orphan after the replay loop so the panel flips its row from running → errored.
+
+The recovery is not persisted back to the JSONL — it's idempotent per-load (same orphans → same synthetic results), and avoiding the file mutation keeps "load is read-only" intact. The same logic runs on sub-agent transcripts ([`replay_subagent_spawned`](../crates/moon-coder/src/runner.rs)).
+
 ### Auto-rename
 
 After the first turn of a fresh session **finishes** — successfully, aborted, or errored — the runner fires a one-shot fast-model call asking for a 4-6 word title against whatever made it into the transcript so far. That title:

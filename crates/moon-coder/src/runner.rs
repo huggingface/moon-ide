@@ -1156,6 +1156,21 @@ impl CoderHandle {
 				}
 			}
 		}
+		// Orphan tool calls = Assistant tool_calls that never got
+		// a matching `Tool` record (user stopped mid-tool, IDE
+		// crashed before the dispatcher returned, …). Inject a
+		// synthetic `Tool` message for each so the rebuilt
+		// `messages` slice satisfies the provider's "every
+		// tool_call has a tool result" invariant on the next
+		// turn. The panel-side recovery (synthesising
+		// `ToolResult` events) lives in the replay loop below.
+		let orphan_tool_call_ids = sessions::orphan_tool_call_ids(&records);
+		for orphan_id in &orphan_tool_call_ids {
+			messages.push(ChatMessage::Tool {
+				tool_call_id: orphan_id.clone(),
+				content: sessions::INTERRUPTED_TOOL_RESULT_JSON.to_string(),
+			});
+		}
 		let summary = SessionSummary {
 			id: header.id.clone(),
 			title: header.title.clone(),
@@ -1261,6 +1276,20 @@ impl CoderHandle {
 				}
 				other => emit_replay_events(&sink, other),
 			}
+		}
+		// Surface every orphan tool call as an errored
+		// `ToolResult` event so the panel flips its row from
+		// "running" to "error". The synthetic JSON content
+		// matches the `{"error": "…"}`-only-key shape that
+		// `emit_replay_events` (and the live runtime) treat as
+		// `is_error: true`, so the rendering is identical to a
+		// genuinely-failed tool.
+		for orphan_id in orphan_tool_call_ids {
+			sink.send(CoderEvent::ToolResult {
+				id: orphan_id,
+				result: serde_json::json!({ "error": "Interrupted before tool completed." }),
+				is_error: true,
+			});
 		}
 		// Restore-time context-usage hint. `Provider` source when
 		// we recovered a persisted `Usage` record (the ring renders
@@ -3101,6 +3130,7 @@ async fn replay_subagent_spawned(
 			return;
 		}
 	};
+	let orphan_tool_call_ids = sessions::orphan_tool_call_ids(&loaded.records);
 	for record in loaded.records {
 		// Wrap each replayed event into a `SubagentEvent` so the
 		// frontend routes by `subagent_id` into the per-sub-agent
@@ -3116,6 +3146,21 @@ async fn replay_subagent_spawned(
 				inner: Box::new(inner),
 			});
 		}
+	}
+	// Same orphan-recovery as the top-level path: a sub-agent
+	// killed mid-tool leaves its last `tool_call` without a
+	// `tool_result`, which the panel renders as a forever-
+	// running row. Synthesise the matching error result so the
+	// popped-out transcript settles into a clean done state.
+	for orphan_id in orphan_tool_call_ids {
+		sink.send(CoderEvent::SubagentEvent {
+			subagent_id: subagent_id.clone(),
+			inner: Box::new(CoderEvent::ToolResult {
+				id: orphan_id,
+				result: serde_json::json!({ "error": "Interrupted before tool completed." }),
+				is_error: true,
+			}),
+		});
 	}
 }
 
