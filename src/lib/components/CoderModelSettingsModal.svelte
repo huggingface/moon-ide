@@ -37,7 +37,15 @@
 	// `slug ?? name` as the wire value, `name` as the display label.
 
 	import { coder } from '../coder.svelte';
-	import type { CoderModelSettings, CoderProviderConfig, ProviderKind, RouterModel, RouterProvider } from '../protocol';
+	import { workspace } from '../state.svelte';
+	import type {
+		CoderModelSettings,
+		CoderProviderConfig,
+		CoderProviderLock,
+		ProviderKind,
+		RouterModel,
+		RouterProvider,
+	} from '../protocol';
 	import { onMount } from 'svelte';
 
 	// Built-in provider presets surfaced in the `+ Add provider`
@@ -95,6 +103,20 @@
 	let providers = $state<CoderProviderConfig[]>([]);
 	let saving = $state(false);
 	let saveError = $state<string | null>(null);
+
+	// Per-workspace provider lock. `true` pins this workspace to
+	// whichever provider is currently active; the runner ignores
+	// the global `active_provider` for this workspace and a
+	// switch in another workspace doesn't bleed in. The
+	// always-tracked target is `activeProviderId` — saving
+	// translates that into the wire-shape `CoderProviderLock`
+	// (`{kind: 'hf'}` or `{kind: 'user', id}`) when locked.
+	//
+	// We track only the boolean here; `activeProviderId` is the
+	// already-existing source of truth for "which provider is
+	// active in the modal right now". Locking takes a snapshot of
+	// `activeProviderId` at save time.
+	let providerLocked = $state(false);
 
 	// Per-slug context-window cap, in tokens. Mirrors the
 	// settings shape's `context_window_overrides` map but indexed
@@ -191,6 +213,7 @@
 		// whole map; mutating in place wouldn't notify
 		// `slugCapInput`.
 		slugCaps = { ...settings.context_window_overrides };
+		providerLocked = settings.provider_lock !== null && settings.provider_lock !== undefined;
 	}
 
 	onMount(async () => {
@@ -411,6 +434,10 @@
 		activeProviderId === null ? null : (providers.find((p) => p.id === activeProviderId) ?? null),
 	);
 	const isHfActive = $derived(activeProviderId === null);
+	// Human-readable name for the currently-active provider —
+	// used by the lock-row label so the user can confirm at a
+	// glance which provider they're about to pin.
+	const activeProviderLabel = $derived(activeProvider !== null ? activeProvider.label : 'Hugging Face');
 	// While drafting a brand-new provider, no existing tab is
 	// "the active one" — the modal's primary content is the
 	// draft form. Editing an existing provider still highlights
@@ -773,6 +800,16 @@
 				p.id === activeProviderId ? { ...p, standard_model: standard, cheap_model: cheap } : p,
 			);
 		}
+		// Resolve the lock state into the wire-shape tagged enum.
+		// `null` (no lock) means: writes flow to the global
+		// default. `{kind:'hf'}` / `{kind:'user',id}` pin this
+		// workspace to whichever provider the modal currently
+		// shows active.
+		const providerLock: CoderProviderLock | null = providerLocked
+			? activeProviderId === null
+				? { kind: 'hf' }
+				: { kind: 'user', id: activeProviderId }
+			: null;
 		const next: CoderModelSettings = {
 			standard_model: hfStandard,
 			cheap_model: hfCheap,
@@ -785,6 +822,7 @@
 			context_window_overrides: Object.fromEntries(
 				Object.entries(slugCaps).filter(([, v]) => Number.isFinite(v) && v > 0),
 			),
+			provider_lock: providerLock,
 		};
 		try {
 			await coder.saveModelSettings(next);
@@ -874,6 +912,30 @@
 			{#if activeProvider !== null}
 				<button type="button" class="provider-edit" onclick={() => openEditProvider(activeProvider.id)}>Edit</button>
 			{/if}
+		</section>
+
+		<!-- Per-workspace provider lock. When ON, the workspace
+			 sticks with whatever's currently active in the modal,
+			 even if another workspace's modal flips the global
+			 default. The toggle is per-workspace state — it lives
+			 in `session.json`, not the global `state.json`. -->
+		<section class="provider-lock-row" aria-label="Provider lock">
+			<label class="provider-lock-toggle">
+				<input type="checkbox" bind:checked={providerLocked} disabled={workspace.workspaceName === null} />
+				<span class="provider-lock-label">
+					Lock provider to this workspace
+					{#if workspace.workspaceName !== null}
+						<span class="provider-lock-workspace">({workspace.workspaceName})</span>
+					{/if}
+				</span>
+			</label>
+			<span class="provider-lock-hint">
+				{#if providerLocked}
+					Locked to <strong>{activeProviderLabel}</strong>. Other workspaces can switch freely; this one stays put.
+				{:else}
+					Off — this workspace follows the global active provider.
+				{/if}
+			</span>
 		</section>
 
 		{#if providerDraft !== null}
@@ -1883,6 +1945,43 @@
 		padding: 3px 8px;
 		cursor: pointer;
 		margin-left: auto;
+	}
+	.provider-lock-row {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: 12px;
+		padding: 8px 0 4px;
+		border-bottom: 1px solid var(--m-border);
+	}
+	.provider-lock-toggle {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		font-size: 12px;
+		color: var(--m-fg);
+		cursor: pointer;
+		user-select: none;
+	}
+	.provider-lock-toggle input[type='checkbox'] {
+		margin: 0;
+	}
+	.provider-lock-label {
+		display: inline-flex;
+		align-items: baseline;
+		gap: 4px;
+	}
+	.provider-lock-workspace {
+		color: var(--m-fg-muted);
+		font-size: 11px;
+	}
+	.provider-lock-hint {
+		font-size: 11px;
+		color: var(--m-fg-muted);
+	}
+	.provider-lock-hint strong {
+		color: var(--m-fg);
+		font-weight: 500;
 	}
 	.provider-draft {
 		display: flex;

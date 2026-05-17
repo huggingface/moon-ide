@@ -1408,7 +1408,22 @@ export type CoderModelSettings = {
 	 *  (usage ring, auto-compaction). Use case: capping a 1M-window
 	 *  model at 250k where quality degrades past that point. */
 	context_window_overrides: Record<string, number>;
+	/** Per-workspace lock on the active provider. `null` (or
+	 *  missing) means "no lock — follow the global default and
+	 *  let modal saves write the global". Non-null pins the
+	 *  workspace to the chosen provider; the modal's save flow
+	 *  then writes the lock into `session.json` and leaves the
+	 *  global default untouched, so toggling provider in another
+	 *  workspace doesn't drag this one along. */
+	provider_lock?: CoderProviderLock | null;
 };
+
+/** Per-workspace lock on the coder's active provider. Mirrors
+ *  `moon_protocol::coder_models::CoderProviderLock` — a tagged
+ *  union so the "locked to HF" state is distinguishable from
+ *  "no lock" (both would collapse to `null` in an
+ *  `Option<Option<string>>` shape). */
+export type CoderProviderLock = { kind: 'hf' } | { kind: 'user'; id: string };
 
 /** Result of `coder_probe_provider`. Mirrors
  *  `moon_protocol::coder_models::ProviderProbeResult`. */

@@ -7,8 +7,9 @@
 
 use moon_coder::{CoderHandle, CoderStatus, DeviceCode, HfIdentity, ImageAttachment, SessionSummary};
 use moon_core::app_state as app_state_store;
+use moon_core::session as core_session;
 use moon_protocol::coder_models::{
-	CoderModelSettings, CoderProviderConfig, ProviderModelSummary, ProviderProbeResult, RouterModel,
+	CoderModelSettings, CoderProviderConfig, CoderProviderLock, ProviderModelSummary, ProviderProbeResult, RouterModel,
 };
 use moon_protocol::MoonError;
 use serde::Deserialize;
@@ -285,12 +286,22 @@ async fn active_folder_path(state: &AppState) -> Option<String> {
 /// this on open so it doesn't fall out of sync if a different
 /// surface (or a future hotkey) wrote to AppState. Returns the
 /// full picker state in one shot: HF picks, the active provider
-/// id, and the user-added providers list (each carrying its own
+/// id, the user-added providers list (each carrying its own
 /// `has_api_key` flag, which is sourced from the keyring rather
-/// than echoed from disk).
+/// than echoed from disk), and the per-workspace provider lock.
+///
+/// The `active_provider` field on the response is the
+/// **effective** active provider (lock if pinned, else global
+/// default) — i.e. what the runner is actually using. The
+/// `provider_lock` field tells the picker whether the value
+/// came from a workspace lock or the global. They never disagree
+/// at the value level when the lock is set; the lock is just the
+/// "where did this come from?" annotation the picker needs to
+/// route writes correctly.
 #[tauri::command]
 pub async fn coder_get_model_settings(state: State<'_, AppState>) -> Result<CoderModelSettings, MoonError> {
 	let models = state.coder.current_models().await;
+	let provider_lock = workspace_provider_lock(&state).await;
 	Ok(CoderModelSettings {
 		standard_model: models.standard,
 		cheap_model: models.cheap,
@@ -302,7 +313,44 @@ pub async fn coder_get_model_settings(state: State<'_, AppState>) -> Result<Code
 		// `coder_set_model_settings`; sharing the `Arc` would
 		// risk a write through a stale clone.
 		context_window_overrides: (*models.context_window_overrides).clone(),
+		provider_lock,
 	})
+}
+
+/// Read the per-workspace provider lock from `session.json` for
+/// the workspace this process owns. `None` for processes that
+/// haven't bound a workspace (preboot mode), and `None` on any
+/// I/O / parse failure (logged inside `core_session::load`). A
+/// missing file is normal — first launch never wrote one.
+async fn workspace_provider_lock(state: &AppState) -> Option<CoderProviderLock> {
+	let id = state.workspace_id()?;
+	match core_session::load(&state.workspaces_dir, id).await {
+		Ok(session) => session.coder_provider_lock,
+		Err(err) => {
+			tracing::warn!(error = %err, "could not load session for provider-lock read");
+			None
+		}
+	}
+}
+
+/// Apply `lock` to this workspace's `session.json`. `Some(_)`
+/// replaces the existing lock; `None` clears it. No-ops in
+/// preboot mode (no workspace bound to the process). Updates the
+/// lock field in place; every other field on the session is
+/// preserved by load-then-save round-trip so we don't clobber
+/// folders / tabs / SCM filters that the frontend's
+/// `session_save` flow keeps current.
+async fn write_workspace_provider_lock(state: &AppState, lock: Option<CoderProviderLock>) -> Result<(), MoonError> {
+	let Some(id) = state.workspace_id() else {
+		return Ok(());
+	};
+	let id = id.to_owned();
+	let mut session = core_session::load(&state.workspaces_dir, &id).await?;
+	if session.coder_provider_lock == lock {
+		return Ok(());
+	}
+	session.coder_provider_lock = lock;
+	core_session::save(&state.workspaces_dir, &id, &session).await
 }
 
 /// Persist + apply the new picker settings. Writes through
@@ -316,6 +364,16 @@ pub async fn coder_get_model_settings(state: State<'_, AppState>) -> Result<Code
 /// uses `coder_set_provider_api_key` / `coder_clear_provider_api_key`
 /// (per-id, keyring-backed) so secrets never round-trip through
 /// AppState or the IPC layer's logging.
+///
+/// **Provider lock semantics**: when `settings.provider_lock` is
+/// `Some(_)`, the workspace is pinned to the picked active
+/// provider. The lock is persisted into `session.json` and the
+/// runner is updated, but the global
+/// [`crate::commands::app_state`] active provider is left
+/// untouched — sibling workspaces keep their own behaviour. When
+/// the lock is `None`, the previous behaviour applies: the
+/// picked active provider becomes the new global default and any
+/// prior lock on this workspace is cleared.
 #[tauri::command]
 pub async fn coder_set_model_settings(
 	state: State<'_, AppState>,
@@ -329,18 +387,42 @@ pub async fn coder_set_model_settings(
 	let providers_for_runner = settings.providers.clone();
 	let active_for_runner = settings.active_provider.clone();
 	let overrides_for_runner = settings.context_window_overrides.clone();
+	let provider_lock = settings.provider_lock.clone();
 	state
 		.coder
 		.set_user_picks(settings.standard_model.clone(), settings.cheap_model.clone(), bill_to)
 		.await;
+	// Runner always gets the effective active provider (lock if
+	// pinned, else the global). The picker pre-resolved this onto
+	// `settings.active_provider`, so we forward verbatim.
 	state.coder.set_providers(providers_for_runner, active_for_runner).await;
 	state.coder.set_context_window_overrides(overrides_for_runner).await;
 
+	// Persist the per-workspace lock first. If this fails we
+	// haven't yet touched the global `state.json`, so the user
+	// retries against an unchanged baseline. (Reverse order
+	// would mean a transient session-write failure silently
+	// promoted a workspace pin to the global default.)
+	write_workspace_provider_lock(&state, provider_lock.clone()).await?;
+
+	let lock_active_provider = match &provider_lock {
+		Some(CoderProviderLock::Hf) => Some(None),
+		Some(CoderProviderLock::User { id }) => Some(Some(id.clone())),
+		None => None,
+	};
 	app_state_store::mutate(&state.config_dir, move |s| {
 		s.coder.standard_model = settings.standard_model;
 		s.coder.cheap_model = settings.cheap_model;
 		s.coder.bill_to = settings.bill_to;
-		s.coder.active_provider = settings.active_provider;
+		// Only the unlocked path writes back to the global
+		// active provider — locked saves keep the global frozen
+		// so other workspaces aren't dragged along. The runner
+		// already got the locked value through `set_providers`
+		// above; persistence here is purely about the next
+		// boot's global default for unlocked workspaces.
+		if lock_active_provider.is_none() {
+			s.coder.active_provider = settings.active_provider;
+		}
 		// Strip `has_api_key` before persisting — it's keyring-derived,
 		// not state, and surviving it on disk would let a hand-edited
 		// `state.json` claim a key is configured when the keyring is
@@ -494,7 +576,7 @@ pub async fn coder_list_provider_models(
 /// call — we don't take the key as a parameter here.
 #[tauri::command]
 pub async fn coder_save_provider(state: State<'_, AppState>, config: CoderProviderConfig) -> Result<(), MoonError> {
-	let (providers, active) = app_state_store::mutate(&state.config_dir, move |s| {
+	let (providers, global_active) = app_state_store::mutate(&state.config_dir, move |s| {
 		let mut cfg = config.clone();
 		// `has_api_key` is keyring-derived; never trust the caller.
 		cfg.has_api_key = false;
@@ -506,7 +588,16 @@ pub async fn coder_save_provider(state: State<'_, AppState>, config: CoderProvid
 		(s.coder.providers.clone(), s.coder.active_provider.clone())
 	})
 	.await?;
-	state.coder.set_providers(providers, active).await;
+	// A pinned workspace's effective provider isn't the global
+	// `active`; if we forwarded the global verbatim, adding a new
+	// provider in a locked workspace would silently flip the
+	// runner off the lock. Resolve the lock first.
+	let effective_active = match workspace_provider_lock(&state).await {
+		Some(CoderProviderLock::Hf) => None,
+		Some(CoderProviderLock::User { id }) => Some(id),
+		None => global_active,
+	};
+	state.coder.set_providers(providers, effective_active).await;
 	Ok(())
 }
 
@@ -514,13 +605,20 @@ pub async fn coder_save_provider(state: State<'_, AppState>, config: CoderProvid
 /// If the deleted provider was active, the runner falls back to
 /// HF (the only always-available route). Idempotent: deleting an
 /// unknown id is a no-op.
+///
+/// If this workspace's `coder_provider_lock` pinned the deleted
+/// provider, clear it so the next read resolves the global default
+/// without leaving a `tracing::warn!` per turn for the orphaned
+/// lock. Sibling workspaces that pinned the same id (other OS
+/// processes) get the warn-and-fallback path on their next boot —
+/// we don't reach across processes to clean their `session.json`.
 #[tauri::command]
 pub async fn coder_delete_provider(state: State<'_, AppState>, id: String) -> Result<(), MoonError> {
 	// Drop the keyring entry first; even if the AppState write
 	// fails, we don't want the credential to outlive the config.
 	let _ = state.coder.clear_provider_api_key(&id);
 	let id_for_state = id.clone();
-	let (providers, active) = app_state_store::mutate(&state.config_dir, move |s| {
+	let (providers, global_active) = app_state_store::mutate(&state.config_dir, move |s| {
 		s.coder.providers.retain(|p| p.id != id_for_state);
 		if s.coder.active_provider.as_deref() == Some(id_for_state.as_str()) {
 			s.coder.active_provider = None;
@@ -528,7 +626,27 @@ pub async fn coder_delete_provider(state: State<'_, AppState>, id: String) -> Re
 		(s.coder.providers.clone(), s.coder.active_provider.clone())
 	})
 	.await?;
-	state.coder.set_providers(providers, active).await;
+	let workspace_lock = workspace_provider_lock(&state).await;
+	let lock_pointed_at_deleted =
+		matches!(&workspace_lock, Some(CoderProviderLock::User { id: locked }) if locked == &id);
+	if lock_pointed_at_deleted {
+		write_workspace_provider_lock(&state, None).await?;
+	}
+	// Recompute the effective active provider: the lock — if it
+	// survived the deletion — still wins over the global default.
+	// Without this, deleting an unrelated provider (Y) while
+	// pinned to X would silently flip the runner from X to the
+	// global active, which could be HF or anything else.
+	let effective_active = if lock_pointed_at_deleted {
+		global_active
+	} else {
+		match workspace_lock {
+			Some(CoderProviderLock::Hf) => None,
+			Some(CoderProviderLock::User { id }) => Some(id),
+			None => global_active,
+		}
+	};
+	state.coder.set_providers(providers, effective_active).await;
 	Ok(())
 }
 

@@ -317,6 +317,47 @@ reads the picks off that entry instead of the HF fields. The
 [`X-HF-Bill-To`](#bill-to-org-vs-personal) header is suppressed off
 the wire when a user provider is active.
 
+### Per-workspace provider lock
+
+`active_provider` lives in the global `state.json`, so a flip in
+one workspace's modal would naturally bleed into every other
+workspace on the next launch. That's the right default — most users
+have a single preferred provider — but some repos (e.g. one that
+relies on Anthropic's prompt-cache for quality, while others happily
+flip between HF and OpenRouter) want to opt out.
+
+The opt-out is a per-workspace pin stored on
+[`WorkspaceSession::coder_provider_lock`](../crates/moon-protocol/src/session.rs)
+in the workspace's `session.json`. Two-variant tagged enum:
+
+```rust
+enum CoderProviderLock {
+    Hf,                    // pinned to the implicit HF route
+    User { id: String },   // pinned to a user-added provider
+}
+```
+
+Resolution rule: the runner's effective active provider is
+`session.coder_provider_lock.unwrap_or(state.coder.active_provider)`.
+The picker's `coder_get_model_settings` returns the **effective**
+value on `active_provider` plus the lock annotation, so the modal
+shows what's actually running with a "Locked to X" label when the
+pin is set.
+
+Writes from the picker:
+
+- **Lock on**: persist the picked provider into
+  `session.coder_provider_lock`. Don't touch `state.coder.active_provider`.
+  Sibling workspaces are unaffected.
+- **Lock off**: persist the picked provider into
+  `state.coder.active_provider` (the previous behaviour). Clear the
+  workspace's lock so the global default takes over.
+
+A stale pin (the locked user-provider id no longer exists in
+`state.coder.providers`) falls back to HF the same way a stale
+global `active_provider` does, with a `tracing::warn!` noting the
+orphan.
+
 `kind` is the wire-shape discriminator:
 
 - `custom` — free-form OpenAI-compatible endpoint. Default for

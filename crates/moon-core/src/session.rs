@@ -89,6 +89,7 @@ mod tests {
 				..Default::default()
 			}],
 			active_folder_path: Some("/tmp/example".into()),
+			coder_provider_lock: None,
 		}
 	}
 

@@ -8,6 +8,7 @@
 //! compile time. Per AGENTS.md "no premature migrations": we change
 //! this freely until the roadmap is done.
 
+use crate::coder_models::CoderProviderLock;
 use crate::git::{CompareBaseline, PrListScope};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -100,4 +101,21 @@ pub struct WorkspaceSession {
 	/// Absolute path of the active folder, if any. Must match one of
 	/// `folders[].folder_path` when set.
 	pub active_folder_path: Option<String>,
+	/// Per-workspace lock on the coder's active provider. When set,
+	/// the runner ignores
+	/// [`crate::app_state::CoderAppState::active_provider`] for
+	/// this workspace and uses the locked value — so toggling the
+	/// global default from another workspace's modal doesn't bleed
+	/// into a workspace the user pinned. `None` (the default) means
+	/// "follow the global active_provider, just like before".
+	///
+	/// This is per-workspace because a single user often runs
+	/// different repos against different providers (e.g. one repo
+	/// always against Anthropic for cache-friendliness, another
+	/// happily flipping between HF and OpenRouter). Storing the
+	/// lock here rather than in `AppState` keeps the global default
+	/// genuinely global while letting individual workspaces opt out.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[ts(optional, type = "CoderProviderLock | null")]
+	pub coder_provider_lock: Option<CoderProviderLock>,
 }

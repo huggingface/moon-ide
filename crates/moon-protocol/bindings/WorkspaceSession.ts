@@ -19,4 +19,21 @@ folders: Array<FolderSession>,
  * Absolute path of the active folder, if any. Must match one of
  * `folders[].folder_path` when set.
  */
-active_folder_path: string | null, };
+active_folder_path: string | null, 
+/**
+ * Per-workspace lock on the coder's active provider. When set,
+ * the runner ignores
+ * [`crate::app_state::CoderAppState::active_provider`] for
+ * this workspace and uses the locked value — so toggling the
+ * global default from another workspace's modal doesn't bleed
+ * into a workspace the user pinned. `None` (the default) means
+ * "follow the global active_provider, just like before".
+ *
+ * This is per-workspace because a single user often runs
+ * different repos against different providers (e.g. one repo
+ * always against Anthropic for cache-friendliness, another
+ * happily flipping between HF and OpenRouter). Storing the
+ * lock here rather than in `AppState` keeps the global default
+ * genuinely global while letting individual workspaces opt out.
+ */
+coder_provider_lock?: CoderProviderLock | null, };

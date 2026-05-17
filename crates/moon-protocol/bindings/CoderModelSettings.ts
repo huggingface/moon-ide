@@ -38,4 +38,19 @@ export type CoderModelSettings = { standard_model: string, cheap_model: string, 
  * site so the usage ring + auto-compaction respect the cap
  * the same way they respect the actual window.
  */
-context_window_overrides: { [key in string]: number }, };
+context_window_overrides: { [key in string]: number }, 
+/**
+ * Per-workspace lock on the active provider. `None` means
+ * "no lock; this workspace follows the global
+ * `active_provider`". `Some(_)` means "this workspace is
+ * pinned, ignore global writes from sibling workspaces".
+ *
+ * Round-trips through the picker: read returns the
+ * workspace's current lock; write applies the new lock
+ * (replacing or clearing). When the lock is `Some(_)`, the
+ * `active_provider` field on this struct is interpreted as
+ * "what the workspace's lock should be set to" — the global
+ * default isn't touched. When the lock is `None`, writes
+ * fall through to the global default like before.
+ */
+provider_lock?: CoderProviderLock | null, };

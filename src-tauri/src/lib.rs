@@ -346,6 +346,38 @@ pub fn run() {
 			));
 			workspace_registry.set_shell_resolver(moon_core::ShellResolverHandle::new(shell_resolver));
 
+			// Resolve the effective active provider for this
+			// workspace: a per-workspace lock (in `session.json`)
+			// always wins over the global default
+			// (`state.json`'s `coder.active_provider`). Loading
+			// the session here is cheap (one small JSON file) and
+			// done before `CoderHandle::new` so the runner sees
+			// the locked provider on the very first turn instead
+			// of resolving against the global and then flipping
+			// later.
+			//
+			// `restore_session` further down reads the same file
+			// again for tabs / folders / SCM filters; we don't
+			// pass the session through because the two callers
+			// want different slices and a missing-file fallback
+			// is harmless either way.
+			let initial_provider_lock = if matches!(mode, AppMode::Workspace { .. }) {
+				match tauri::async_runtime::block_on(moon_core::session::load(&workspaces_dir, &workspace_id)) {
+					Ok(session) => session.coder_provider_lock,
+					Err(err) => {
+						tracing::warn!(error = %err, "could not load session for provider-lock resolution");
+						None
+					}
+				}
+			} else {
+				None
+			};
+			let effective_active_provider = match &initial_provider_lock {
+				Some(moon_protocol::coder_models::CoderProviderLock::Hf) => None,
+				Some(moon_protocol::coder_models::CoderProviderLock::User { id }) => Some(id.clone()),
+				None => loaded_state.coder.active_provider.clone(),
+			};
+
 			// Seed the coder with the user's persisted model picks
 			// + `bill_to` + user-added providers. Empty slugs on
 			// the protocol side resolve to the hardcoded defaults
@@ -365,7 +397,7 @@ pub fn run() {
 					Some(loaded_state.coder.bill_to.clone())
 				},
 				providers: loaded_state.coder.providers.clone(),
-				active_provider: loaded_state.coder.active_provider.clone(),
+				active_provider: effective_active_provider,
 				context_window_overrides: std::sync::Arc::new(loaded_state.coder.context_window_overrides.clone()),
 				..moon_coder::CoderModels::default()
 			};

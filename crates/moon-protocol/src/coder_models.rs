@@ -106,6 +106,38 @@ pub struct RouterPricing {
 // `RouterPricing` is `PartialEq` not `Eq` because `f64` isn't `Eq`
 // (NaN); that's fine, the picker never hashes it.
 
+/// Per-workspace lock on the active provider.
+///
+/// When set on a [`crate::session::WorkspaceSession`], the
+/// runner uses this as the effective active provider regardless
+/// of what [`crate::app_state::CoderAppState::active_provider`]
+/// says — and a write to the global default (from another
+/// workspace's modal) doesn't affect this workspace. Use case:
+/// "this repo wants Anthropic for everything; I might toggle the
+/// other repos' default between HF and OpenRouter, but this one
+/// stays put".
+///
+/// Why a tagged enum and not `Option<Option<String>>`: the
+/// "locked to HF" state needs to be distinguishable from the
+/// "no lock" state, but `Option<Option<String>>` collapses to
+/// `null` for both at the JSON boundary. The two-variant enum
+/// keeps the wire shape unambiguous.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CoderProviderLock {
+	/// Locked to the implicit HF route. Mirrors the
+	/// "`active_provider == None`" arm in the global default.
+	Hf,
+	/// Locked to a specific user-added provider by id. Must
+	/// match one of the entries in
+	/// [`crate::app_state::CoderAppState::providers`]; the
+	/// runner falls back to HF on a stale lock (e.g. the
+	/// provider was deleted out of band) and a `tracing::warn!`
+	/// notes the orphan.
+	User { id: String },
+}
+
 /// Read/write payload for `coder_get_model_settings` /
 /// `coder_set_model_settings`.
 ///
@@ -151,6 +183,21 @@ pub struct CoderModelSettings {
 	/// the same way they respect the actual window.
 	#[serde(default)]
 	pub context_window_overrides: std::collections::HashMap<String, u32>,
+	/// Per-workspace lock on the active provider. `None` means
+	/// "no lock; this workspace follows the global
+	/// `active_provider`". `Some(_)` means "this workspace is
+	/// pinned, ignore global writes from sibling workspaces".
+	///
+	/// Round-trips through the picker: read returns the
+	/// workspace's current lock; write applies the new lock
+	/// (replacing or clearing). When the lock is `Some(_)`, the
+	/// `active_provider` field on this struct is interpreted as
+	/// "what the workspace's lock should be set to" — the global
+	/// default isn't touched. When the lock is `None`, writes
+	/// fall through to the global default like before.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[ts(optional, type = "CoderProviderLock | null")]
+	pub provider_lock: Option<CoderProviderLock>,
 }
 
 /// Wire-protocol shape of one user-added provider. Three flavours:
