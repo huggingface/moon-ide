@@ -316,11 +316,15 @@ What changes:
   Start / Pause / Resume / Rebuild / Stop and a service
   list, mirroring the workspace shell's status pip but
   scoped to that one project.
-- Networking: the dev shell and per-folder services run on
-  separate compose networks by default. Cross-talk via
-  `host.docker.internal:<port>` if the user's compose
-  exposes host ports; an explicit external network is the
-  escape hatch. Phase 2.2 will formalise routing.
+- Networking: the dev shell and per-folder services start
+  on separate compose networks, but moon-ide attaches the
+  dev container to each running project's `<project>_default`
+  network on `up` (and detaches on `down`) so service-name
+  DNS works from a workspace terminal — `mongosh
+mongodb://mongo:27017` Just Works. See
+  `specs/containers.md` § Networking for limitations
+  (segmented networks, cross-project name collisions, cold-
+  start ordering).
 - Discovery scope: per-folder lifecycle uses **only** the
   folder's root compose file. Sub-directory composes that
   the previous `include:`-based discovery would have picked

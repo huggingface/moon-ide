@@ -39,14 +39,24 @@
 //! paths inside the user's compose still resolve from the file's
 //! directory — exactly what the user wired up.
 //!
+//! Cross-project networking
+//! ------------------------
+//!
+//! `dev` and a folder's services start as separate compose
+//! projects on separate networks, but [`Self::up`] /
+//! [`Self::rebuild`] / [`Self::start_service`] /
+//! [`Self::restart_service`] follow up with a `docker network
+//! connect <project>_default <dev-container>` so the workspace
+//! shell can reach project services by compose service name —
+//! `mongosh mongodb://mongo:27017`, `psql -h db -U postgres`,
+//! `curl http://api:3000/health`. [`Self::down`] disconnects
+//! before tearing the network down. See [`crate::network`] for
+//! the helper, idempotency rules, and the limitation around
+//! projects that override the default network.
+//!
 //! What's not covered yet
 //! ----------------------
 //!
-//! - Cross-project networking. `dev` and a folder's services run
-//!   on separate compose networks; the user reaches them via
-//!   `host.docker.internal:<port>` if they expose host ports, or
-//!   wires up an external network manually. Phase 2.2 will
-//!   formalise the routing.
 //! - Folder-local *override* files (`compose.override.yaml`,
 //!   etc.). The handle uses whichever single file
 //!   [`crate::discovery::discover_root_compose`] picked.
@@ -58,7 +68,10 @@ use moon_protocol::container::{ContainerState, ContainerStatus};
 
 use crate::discovery::{discover_root_compose, DiscoveredCompose};
 use crate::lifecycle::{aggregate_state, parse_ps_output, run_docker_compose, LifecycleError};
-use crate::project::{folder_slug, project_name_for_folder, ProjectName};
+use crate::network::{
+	connect_container_to_network, dev_container_name, disconnect_container_from_network, project_default_network,
+};
+use crate::project::{folder_slug, project_name_for_folder, project_name_for_id, ProjectName};
 
 /// Handle for a single bound folder's compose project.
 ///
@@ -66,12 +79,18 @@ use crate::project::{folder_slug, project_name_for_folder, ProjectName};
 /// `discover_root_compose` does). One handle per folder, rebuilt
 /// on every Tauri command — there's no long-lived state to
 /// preserve, the project name is derived deterministically.
+///
+/// The `workspace_project` carried on the handle is the parent
+/// workspace shell's project name (`moon-ws-<id>`); we need it to
+/// resolve the dev container we attach to this project's network
+/// for service-name DNS to work — see [`crate::network`].
 #[derive(Debug, Clone)]
 pub struct ProjectCompose {
 	folder_root: Utf8PathBuf,
 	compose_file: Utf8PathBuf,
 	relative_path: Utf8PathBuf,
 	project: ProjectName,
+	workspace_project: ProjectName,
 }
 
 impl ProjectCompose {
@@ -99,11 +118,13 @@ impl ProjectCompose {
 	) -> Result<Self, LifecycleError> {
 		let basename = folder_root.file_name().unwrap_or("folder");
 		let project = project_name_for_folder(workspace_id, basename)?;
+		let workspace_project = project_name_for_id(workspace_id)?;
 		Ok(Self {
 			folder_root: folder_root.to_path_buf(),
 			compose_file: found.absolute_path,
 			relative_path: found.relative_path,
 			project,
+			workspace_project,
 		})
 	}
 
@@ -142,8 +163,15 @@ impl ProjectCompose {
 	///
 	/// Used by the folder-bar "Start services" affordance. The
 	/// IDE never auto-invokes this; it's always a user click.
+	///
+	/// On success, attaches the workspace's `dev` container to
+	/// this project's default network (best effort) so a
+	/// container terminal can reach the project's services by
+	/// compose service name (`mongosh mongodb://mongo:27017`,
+	/// `psql -h db`). See [`crate::network`].
 	pub async fn up(&self) -> Result<(), LifecycleError> {
 		self.docker_compose(["up", "-d", "--wait"]).await?;
+		self.attach_workspace_dev().await;
 		Ok(())
 	}
 
@@ -158,10 +186,16 @@ impl ProjectCompose {
 	}
 
 	/// Hammer: `up -d --force-recreate --pull always --wait`.
+	///
+	/// Re-attaches the workspace dev container after the recreate
+	/// — `--force-recreate` tears down the project network too, so
+	/// any pre-existing attachment is gone by the time we get
+	/// here.
 	pub async fn rebuild(&self) -> Result<(), LifecycleError> {
 		self
 			.docker_compose(["up", "-d", "--force-recreate", "--pull", "always", "--wait"])
 			.await?;
+		self.attach_workspace_dev().await;
 		Ok(())
 	}
 
@@ -171,6 +205,13 @@ impl ProjectCompose {
 	/// `up` resumes from the same containers without rebuilding
 	/// or re-pulling images. This is the right "I'm done for
 	/// now, I'll come back to this project soon" knob.
+	///
+	/// We deliberately leave the dev container's attachment to
+	/// the project network in place: the network survives `stop`,
+	/// and a follow-up [`Self::up`] / [`Self::start_service`]
+	/// re-uses the same network, so the attachment is still valid.
+	/// Detaching here would force an extra `connect` round-trip on
+	/// every start/stop cycle for no benefit.
 	pub async fn stop(&self) -> Result<(), LifecycleError> {
 		self.docker_compose(["stop"]).await?;
 		Ok(())
@@ -181,7 +222,15 @@ impl ProjectCompose {
 	/// host bind mounts) are *preserved*: this isn't a data
 	/// nuke, just a daemon-side teardown of the runtime
 	/// resources. The user's compose file stays put on disk.
+	///
+	/// Detaches the workspace dev container from the project
+	/// network *before* `down` runs — Docker refuses to remove
+	/// a network with active endpoints, and our dev container
+	/// is exactly that. Detach failures are tolerated (network
+	/// might already be gone from a partially-failed prior down)
+	/// so the cleanup remains best-effort.
 	pub async fn down(&self) -> Result<(), LifecycleError> {
+		self.detach_workspace_dev().await;
 		self.docker_compose(["down"]).await?;
 		Ok(())
 	}
@@ -194,8 +243,14 @@ impl ProjectCompose {
 	/// the service has never been brought up (no container record
 	/// on the daemon yet) the daemon will error; that's the
 	/// caller's signal to use the project-level `up` instead.
+	///
+	/// Re-attaches the workspace dev container after the start —
+	/// the project network survives across `stop`/`start`, but a
+	/// fresh workspace shell created since the last `up` won't
+	/// be on it yet. Idempotent on the already-attached path.
 	pub async fn start_service(&self, service: &str) -> Result<(), LifecycleError> {
 		self.docker_compose(["start", service]).await?;
+		self.attach_workspace_dev().await;
 		Ok(())
 	}
 
@@ -214,7 +269,56 @@ impl ProjectCompose {
 	/// "recreate from a fresh image" workflow.
 	pub async fn restart_service(&self, service: &str) -> Result<(), LifecycleError> {
 		self.docker_compose(["restart", service]).await?;
+		self.attach_workspace_dev().await;
 		Ok(())
+	}
+
+	/// Best-effort attach of the workspace `dev` container to
+	/// this project's default network.
+	///
+	/// Failures are logged at `warn` and swallowed: the user's
+	/// project services are up, which is the success the caller
+	/// was after; the cross-project DNS perk is a quality-of-life
+	/// add. Common failure paths include:
+	///
+	/// - The workspace shell isn't up yet (cold-start order: user
+	///   started a project before opting into the workspace
+	///   shell). The next `Workspace::setup` reconciles by
+	///   re-attaching across all running projects.
+	/// - The user's project compose declares an explicit
+	///   top-level `networks:` block that doesn't include
+	///   `default`, so `<project>_default` doesn't exist. The
+	///   user picked that segmentation deliberately; we surface
+	///   the limitation in `specs/containers.md`.
+	async fn attach_workspace_dev(&self) {
+		let network = project_default_network(&self.project);
+		let dev = dev_container_name(&self.workspace_project);
+		if let Err(err) = connect_container_to_network(&network, &dev).await {
+			tracing::warn!(
+				%err,
+				project = %self.project,
+				network,
+				dev,
+				"failed to attach workspace dev container to project network",
+			);
+		}
+	}
+
+	/// Best-effort detach. Mirror of `attach_workspace_dev` —
+	/// errors are logged and swallowed so a `down` doesn't
+	/// fail because the network already disappeared.
+	async fn detach_workspace_dev(&self) {
+		let network = project_default_network(&self.project);
+		let dev = dev_container_name(&self.workspace_project);
+		if let Err(err) = disconnect_container_from_network(&network, &dev).await {
+			tracing::warn!(
+				%err,
+				project = %self.project,
+				network,
+				dev,
+				"failed to detach workspace dev container from project network",
+			);
+		}
 	}
 
 	async fn docker_compose<I, S>(&self, args: I) -> Result<crate::lifecycle::DockerOutput, LifecycleError>

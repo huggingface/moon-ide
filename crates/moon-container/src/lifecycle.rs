@@ -73,7 +73,9 @@ use crate::compose::{
 	generate_compose, BoundMount, ComposeRender, ComposeRenderOptions, GhConfigMount, HostGitIdentity, SshAgentForward,
 	SshConfigMount,
 };
+use crate::network::{connect_container_to_network, dev_container_name, project_default_network};
 use crate::project::{project_name_for_id, ProjectName, ProjectNameError};
+use crate::project_compose::ProjectCompose;
 
 /// The image reference written into a freshly generated
 /// `compose.yaml` if the caller doesn't override it.
@@ -107,6 +109,13 @@ pub enum LifecycleError {
 	#[error("docker compose failed (exit {code}): {stderr}")]
 	ComposeFailed { code: i32, stderr: String },
 
+	#[error("docker {subcommand} failed (exit {code}): {stderr}")]
+	DockerCommandFailed {
+		subcommand: String,
+		code: i32,
+		stderr: String,
+	},
+
 	#[error("could not parse `docker compose ps` output: {0}")]
 	ParseError(String),
 
@@ -136,6 +145,11 @@ impl From<LifecycleError> for MoonError {
 			LifecycleError::ComposeFailed { code, stderr } => {
 				MoonError::internal(format!("docker compose failed (exit {code}): {stderr}"))
 			}
+			LifecycleError::DockerCommandFailed {
+				subcommand,
+				code,
+				stderr,
+			} => MoonError::internal(format!("docker {subcommand} failed (exit {code}): {stderr}")),
 			LifecycleError::ParseError(msg) => MoonError::internal(format!("could not parse docker compose output: {msg}")),
 			LifecycleError::InvalidWorkspaceId(err) => MoonError::invalid(err.to_string()),
 			LifecycleError::Io(err) => MoonError::from(err),
@@ -164,6 +178,7 @@ pub struct WorkspaceConfig {
 /// (no I/O).
 #[derive(Debug, Clone)]
 pub struct Workspace {
+	workspace_id: String,
 	state_dir: Utf8PathBuf,
 	bound_folders: Vec<Utf8PathBuf>,
 	project: ProjectName,
@@ -178,6 +193,7 @@ impl Workspace {
 		let compose_path = config.state_dir.join(COMPOSE_FILE);
 		let bound_folders_path = config.state_dir.join(BOUND_FOLDERS_FILE);
 		Ok(Self {
+			workspace_id: config.workspace_id,
 			state_dir: config.state_dir,
 			bound_folders: config.bound_folders,
 			project,
@@ -289,9 +305,16 @@ impl Workspace {
 	/// state from the current bound-folder set, then `docker
 	/// compose up -d --wait` so we don't return until everything
 	/// is healthy (or has failed).
+	///
+	/// After the dev container is up, reconciles network
+	/// attachments to every bound folder whose project services
+	/// are already running — covers the case where the user
+	/// started a project's services first (cold-start) and only
+	/// then opted into the workspace shell.
 	pub async fn setup(&self, dev_image: &str) -> Result<(), LifecycleError> {
 		self.write_state(dev_image).await?;
 		self.docker_compose(["up", "-d", "--wait"]).await?;
+		self.reattach_running_projects().await;
 		Ok(())
 	}
 
@@ -313,7 +336,11 @@ impl Workspace {
 		}
 		let status = self.status().await?;
 		if matches!(status.state, ContainerState::Running) {
+			// `up -d --wait` recreates the dev container when its
+			// mount set changes — that drops every prior project-
+			// network attachment, same as `rebuild`. Reattach.
 			self.docker_compose(["up", "-d", "--wait"]).await?;
+			self.reattach_running_projects().await;
 		}
 		Ok(())
 	}
@@ -337,6 +364,10 @@ impl Workspace {
 	/// changed, when an included compose changed in a way `up`
 	/// didn't pick up, or when the user just wants to start
 	/// over.
+	///
+	/// Force-recreate replaces the dev container, so any prior
+	/// project-network attachments are lost; we reconcile them
+	/// after the recreate.
 	pub async fn rebuild(&self, dev_image: &str) -> Result<(), LifecycleError> {
 		// Make sure the file on disk reflects the current
 		// bound-folder set before forcing a recreate — otherwise
@@ -346,6 +377,7 @@ impl Workspace {
 		self
 			.docker_compose(["up", "-d", "--force-recreate", "--pull", "always", "--wait"])
 			.await?;
+		self.reattach_running_projects().await;
 		Ok(())
 	}
 
@@ -364,9 +396,67 @@ impl Workspace {
 	/// `docker compose down` — stop and remove containers,
 	/// networks, and the project entry. The compose file itself
 	/// stays on disk; the next `setup` resurrects from there.
+	///
+	/// `down` removes the dev container, which also drops any
+	/// project-network attachments it carried — no explicit
+	/// detach is needed.
 	pub async fn teardown(&self) -> Result<(), LifecycleError> {
 		self.docker_compose(["down"]).await?;
 		Ok(())
+	}
+
+	/// Walk the bound-folder set and, for each folder whose
+	/// project compose is currently running, re-attach this
+	/// workspace's dev container to that project's default
+	/// network. Best-effort throughout: a folder without a
+	/// compose file, a project that's down, an attach failure
+	/// — all logged at `debug` / `warn` and skipped. The dev
+	/// container being up is a hard prerequisite (the caller
+	/// drives that).
+	///
+	/// Two situations rely on this:
+	///
+	/// 1. Cold-start where the user brings up project services
+	///    *before* opting into the workspace shell. The
+	///    project's `up` couldn't attach the dev container
+	///    (didn't exist yet); the workspace's `setup` reconciles.
+	/// 2. Workspace `rebuild` recreates the dev container, which
+	///    drops every prior attachment. Reconcile here is the
+	///    only way to re-establish them without touching every
+	///    project's lifecycle.
+	async fn reattach_running_projects(&self) {
+		let dev = dev_container_name(&self.project);
+		for folder in &self.bound_folders {
+			let pc = match ProjectCompose::for_folder(&self.workspace_id, folder) {
+				Ok(Some(pc)) => pc,
+				Ok(None) => continue,
+				Err(err) => {
+					tracing::debug!(%err, %folder, "skipping reattach: invalid project handle");
+					continue;
+				}
+			};
+			let status = match pc.status().await {
+				Ok(s) => s,
+				Err(err) => {
+					tracing::debug!(%err, %folder, "skipping reattach: status query failed");
+					continue;
+				}
+			};
+			if !matches!(status.state, ContainerState::Running) {
+				continue;
+			}
+			let network = project_default_network(pc.project());
+			if let Err(err) = connect_container_to_network(&network, &dev).await {
+				tracing::warn!(
+					%err,
+					%folder,
+					project = %pc.project(),
+					network,
+					dev,
+					"failed to reattach dev container to project network",
+				);
+			}
+		}
 	}
 
 	async fn docker_compose<I, S>(&self, args: I) -> Result<DockerOutput, LifecycleError>

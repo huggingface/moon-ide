@@ -340,10 +340,12 @@ and described in
   `project_compose:state` events keyed on the same field
   so each folder bar updates independently.
 - Networking: workspace shell and per-folder services run
-  on separate compose networks. Cross-talk via host ports
-  (`host.docker.internal:<port>`) for now; explicit
-  external networks for users who need service-name
-  resolution. Phase 2.2 formalises.
+  on separate compose networks, but the dev container is
+  attached to each running project's `<project>_default`
+  network on `up` so service-name DNS works from a
+  workspace terminal. See `specs/containers.md` §
+  Networking. Phase 2.2 formalises any further routing UX
+  (port pickers, multi-network topologies).
 
 What deliberately doesn't ship in 2.0.6:
 

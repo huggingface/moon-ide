@@ -181,25 +181,59 @@ it never writes back.
 
 ### Networking
 
-Workspace shell and per-folder project services run on
-**separate compose networks** by default — they can't reach
-each other by service name out of the box. Cross-talk
-options:
+Workspace shell and per-folder project services start as
+**separate compose projects on separate networks**, but the
+workspace shell's `dev` container is automatically attached
+to each running project's default network so service-name
+DNS works from a workspace terminal:
 
-- **Host ports**: if moon-landing's compose declares
-  `ports: - "27017:27017"`, the workspace shell reaches mongo
-  via `host.docker.internal:27017` (we configure
-  `extra_hosts: ["host.docker.internal:host-gateway"]` on
-  `dev`).
-- **External network**: declare a top-level network in both
-  the workspace's compose (manually for now) and the
-  project's compose with `external: true` — both projects
-  attach and service names resolve.
+```bash
+# from a terminal in the workspace shell:
+mongosh mongodb://mongo:27017     # works
+psql -h db -U postgres            # works
+curl http://api:3000/health       # works
+```
 
-Phase 2.2 formalises the routing UX. For now the simple
-"isolated by default, host ports for cross-talk" model is
-explicit and matches how the user already runs `docker
-compose up` per-repo today.
+The mechanism is a `docker network connect <project>_default
+<dev-container>` issued after every project `up` / `rebuild`
+/ `start_service` / `restart_service`, and a matching
+`disconnect` before `down`. The workspace shell `setup` /
+`rebuild` / `apply_bound_folders` reconciles by re-attaching
+across every running project — covers cold-start (project up
+before workspace shell) and dev-container recreate (which
+drops every prior attachment).
+
+Limitations:
+
+- We attach to the project's **default** network only
+  (`<project>_default`). A project that declares an explicit
+  top-level `networks:` block segmenting services into
+  separate tiers (frontend / backend / db) only gets the
+  default tier reachable by name from the dev container —
+  the user picked that segmentation deliberately. They can
+  still reach segmented services by host port if their
+  compose forwards them.
+- Cold-start ordering: if the user brings a project up while
+  the workspace shell is down, the project's `up` quietly
+  skips the attach (no dev container yet); the next workspace
+  `setup` reconciles. Logged at `warn` so a debugger can see
+  it; not surfaced as an error in the UI.
+- Cross-project service-name **collisions** across two bound
+  folders: if `repo-a` and `repo-b` both expose a service
+  named `mongo`, only the first one connected wins
+  resolution from the dev container. Compose still keeps the
+  two projects isolated from each other; the collision is
+  only at the cross-project DNS layer the dev container
+  sees. Rename one or use the host-ports fallback.
+
+Host ports still work as a fallback for projects with
+services explicitly exposed to the host
+(`ports: - "27017:27017"`): on Linux the dev container can
+reach them via the docker bridge gateway IP, on Docker
+Desktop via `host.docker.internal`. The cross-network
+attach is the recommended path because it doesn't require
+the user to publish ports they wouldn't otherwise need
+exposed.
 
 ### Why not nested
 

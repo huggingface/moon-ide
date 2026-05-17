@@ -21,6 +21,7 @@
 pub mod compose;
 pub mod discovery;
 pub mod lifecycle;
+pub mod network;
 pub mod project;
 pub mod project_compose;
 
@@ -32,5 +33,8 @@ pub use discovery::{
 	DiscoveredCompose,
 };
 pub use lifecycle::{LifecycleError, Workspace, WorkspaceConfig, BOUND_FOLDERS_FILE, COMPOSE_FILE, DEFAULT_DEV_IMAGE};
+pub use network::{
+	connect_container_to_network, dev_container_name, disconnect_container_from_network, project_default_network,
+};
 pub use project::{folder_slug, project_name_for_folder, project_name_for_id, ProjectName, ProjectNameError};
 pub use project_compose::{slug_for_folder_basename, ProjectCompose, ProjectComposeSnapshot};
