@@ -15,6 +15,7 @@
 	import { rightPanel } from './lib/rightPanel.svelte';
 	import { coder } from './lib/coder.svelte';
 	import { bottomPanel } from './lib/bottomPanel.svelte';
+	import { terminal } from './lib/terminal.svelte';
 	import { canOpenContainerTerminal, openContainerTerminal, openHostTerminal } from './lib/openTerminal';
 	import { palette, reloadWindow, searchQueryFromSelection } from './lib/commands.svelte';
 	import { cycleFocus } from './lib/focus';
@@ -58,6 +59,22 @@
 		}
 		const tag = target.tagName;
 		return tag === 'INPUT' || tag === 'TEXTAREA';
+	}
+
+	// True when DOM focus currently sits inside an xterm.js
+	// surface (the helper textarea xterm uses for input, the
+	// `.xterm-screen` content layer, the `.term-host` wrapper).
+	// Used by the Ctrl+L handler to prefer the terminal's
+	// selection over a stale editor selection when the user is
+	// actively reading scrollback. `:focus-within` would do this
+	// declaratively but the JS path keeps the keymap predicate
+	// alongside its fallback chain.
+	function isFocusInsideTerminal(): boolean {
+		const active = document.activeElement;
+		if (!(active instanceof HTMLElement)) {
+			return false;
+		}
+		return active.closest('.term-host, .xterm') !== null;
 	}
 
 	// Title bar = `<workspace-name> — <focused-folder>:<branch>`.
@@ -296,21 +313,43 @@
 			if (!event.shiftKey && key === 'l') {
 				// Echoes Cursor's `Ctrl+L = open coder chat` muscle
 				// memory:
-				//   - if the editor has a non-empty selection, attach
-				//     it to the coder composer as a chip and open the
-				//     coder panel;
+				//   - if the *focused* surface is a terminal pane
+				//     and its selection is non-empty, attach the
+				//     highlighted scrollback as a `<terminal_output>`
+				//     chip — focus beats a stale editor selection
+				//     left over from the user's previous task;
+				//   - else if the editor has a non-empty selection,
+				//     attach it to the coder composer as a chip;
+				//   - else if any terminal pane has a non-empty
+				//     selection, fall back to that;
 				//   - otherwise just toggle coder visibility.
 				// Slack still has its status-bar pip + the
 				// speech-bubble swap icon in the coder header + the
 				// `chat.togglePanel` palette entry, so giving up its
 				// own Ctrl+L doesn't hide it from anybody.
 				event.preventDefault();
-				const selection = workspace.activeSelection;
-				if (selection !== null) {
-					coder.addAttachmentFromSelection(selection);
-				} else {
-					coder.togglePanel();
+				const editorSelection = workspace.activeSelection;
+				const terminalSelection = terminal.activeSelection;
+				const inTerminal = isFocusInsideTerminal();
+				if (inTerminal && terminalSelection !== null) {
+					coder.addAttachmentFromTerminal({
+						text: terminalSelection.text,
+						label: terminalSelection.label,
+					});
+					return;
 				}
+				if (editorSelection !== null) {
+					coder.addAttachmentFromSelection(editorSelection);
+					return;
+				}
+				if (terminalSelection !== null) {
+					coder.addAttachmentFromTerminal({
+						text: terminalSelection.text,
+						label: terminalSelection.label,
+					});
+					return;
+				}
+				coder.togglePanel();
 				return;
 			}
 			if (!event.shiftKey && key === 'j') {

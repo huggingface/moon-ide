@@ -58,6 +58,19 @@ export type TerminalSession = {
 
 type OutputWriter = (bytes: Uint8Array) => void;
 
+/** Snapshot of the most recent non-empty selection across every
+ *  open terminal pane. Updated by `TerminalTab` via xterm's
+ *  `onSelectionChange` and read by App.svelte's Ctrl+L handler
+ *  to attach the highlighted scrollback to the coder composer.
+ *  Mirrors the editor's `activeSelection` shape: the *last
+ *  meaningful selection wins*, since the user typically has at
+ *  most one terminal in their attention at a time. */
+export type TerminalSelectionSnapshot = {
+	streamId: string;
+	text: string;
+	label: string;
+};
+
 class TerminalStore {
 	#sessions = new SvelteMap<string, TerminalSession>();
 	#writers = new Map<string, OutputWriter>();
@@ -67,6 +80,14 @@ class TerminalStore {
 	#pending = new Map<string, Uint8Array[]>();
 	#unlisten: UnlistenFn[] = [];
 	#runtimeWired = false;
+
+	/** Most recent non-empty selection across all open terminal
+	 * panes. `null` when every pane has its selection cleared.
+	 * Reactive: the editor's "Add to Coder" hint pill in
+	 * `EditorPane.svelte` shouldn't read this (it's for editor
+	 * selections only); App.svelte's Ctrl+L handler reads it as
+	 * a fallback when the editor has nothing selected. */
+	activeSelection = $state<TerminalSelectionSnapshot | null>(null);
 
 	async wireRuntime(): Promise<void> {
 		if (this.#runtimeWired) {
@@ -149,6 +170,9 @@ class TerminalStore {
 		this.#sessions.delete(streamId);
 		this.#writers.delete(streamId);
 		this.#pending.delete(streamId);
+		if (this.activeSelection?.streamId === streamId) {
+			this.activeSelection = null;
+		}
 		bottomPanel.closeTab(streamId);
 	}
 
@@ -167,6 +191,21 @@ class TerminalStore {
 
 	clearWriter(streamId: string): void {
 		this.#writers.delete(streamId);
+	}
+
+	/** Update the cross-pane "last non-empty selection" snapshot.
+	 * Empty strings clear the snapshot only when the *clearing*
+	 * pane was the one whose selection we last cached — otherwise
+	 * a user dragging across pane B would race with pane A's
+	 * "selection cleared" event and we'd lose B's selection. */
+	setSelection(streamId: string, text: string, label: string): void {
+		if (text.length === 0) {
+			if (this.activeSelection?.streamId === streamId) {
+				this.activeSelection = null;
+			}
+			return;
+		}
+		this.activeSelection = { streamId, text, label };
 	}
 
 	async writeInput(streamId: string, bytes: Uint8Array): Promise<void> {

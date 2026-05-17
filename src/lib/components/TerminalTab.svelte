@@ -88,28 +88,36 @@
 		// fans out: a host shell that prints container paths or
 		// vice versa still gets links.
 		fileLinkProvider = term.registerLinkProvider(buildFileLinkProvider());
-		// Linux convention for copy / paste in a terminal is
-		// Ctrl+Shift+C / Ctrl+Shift+V — Ctrl+C is reserved for
-		// SIGINT. xterm.js doesn't ship that mapping by default,
-		// so we intercept the keydown before it reaches the
-		// terminal's input pipeline. `attachCustomKeyEventHandler`
-		// returning `false` swallows the event entirely (no PTY
-		// write, no scroll, no bell). `e.code` is layout-
-		// independent — important on a French keyboard, where
-		// `e.key` for the C key shifts to a different glyph.
+		// Windows-Terminal-style copy/paste mapping. xterm.js
+		// ships neither by default, so we intercept the keydown
+		// before it reaches the terminal's input pipeline.
+		// `attachCustomKeyEventHandler` returning `false` swallows
+		// the event entirely (no PTY write, no scroll, no bell).
+		// `event.code` is layout-independent — important on a
+		// French keyboard where `event.key` for the C key shifts
+		// to a different glyph.
+		//
+		// `Ctrl+C` is overloaded: a non-empty selection copies
+		// (and clears the selection so a follow-up `Ctrl+C` lands
+		// as SIGINT), an empty selection falls through to xterm's
+		// default and sends SIGINT. `Ctrl+V` always pastes.
+		// We deliberately don't reserve the `Ctrl+Shift+*`
+		// variants — the user already has unambiguous primaries.
 		term.attachCustomKeyEventHandler((event) => {
-			if (event.type !== 'keydown' || !event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey) {
+			if (event.type !== 'keydown' || !event.ctrlKey || event.shiftKey || event.altKey || event.metaKey) {
 				return true;
 			}
 			if (event.code === 'KeyC') {
 				const text = term?.getSelection() ?? '';
-				if (text.length > 0) {
-					void navigator.clipboard.writeText(text).catch(() => {
-						// Swallow — failing silently is better than a
-						// modal; the user can retry, or fall back to
-						// the menu copy via right-click selection.
-					});
+				if (text.length === 0) {
+					return true;
 				}
+				void navigator.clipboard.writeText(text).catch(() => {
+					// Swallow — failing silently is better than a
+					// modal; the user can retry, or fall back to
+					// the menu copy via right-click selection.
+				});
+				term?.clearSelection();
 				return false;
 			}
 			if (event.code === 'KeyV') {
@@ -151,6 +159,18 @@
 		// (e.g. arrow keys → CSI sequences); we just transport.
 		term.onData((data) => {
 			void terminalStore.writeInput(tab.id, encoder.encode(data));
+		});
+
+		// Mirror xterm's selection state into the terminal store
+		// so App.svelte's Ctrl+L handler can attach the highlighted
+		// scrollback to the coder composer when the editor has
+		// nothing selected. xterm doesn't pass the text on the
+		// event, so we read it via `getSelection()` each fire —
+		// the operation is O(rows) on the live selection range,
+		// fine even for kilobyte drag-selects.
+		term.onSelectionChange(() => {
+			const text = term?.getSelection() ?? '';
+			terminalStore.setSelection(tab.id, text, tab.title);
 		});
 
 		// Resize: refit on container resize. The fit addon reads

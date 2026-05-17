@@ -971,11 +971,24 @@
 										</span>
 									</span>
 								</button>
-							{:else}
+							{:else if attachment.kind === 'image'}
 								<span class="attachment-open attachment-image" title={attachment.name}>
 									<img src={attachment.dataUrl} alt={attachment.name} class="attachment-thumb" />
 									<span class="attachment-label">
 										<span class="attachment-name">{attachment.name}</span>
+									</span>
+								</span>
+							{:else}
+								<span
+									class="attachment-open attachment-terminal"
+									title={`Terminal output (${attachment.lineCount} ${attachment.lineCount === 1 ? 'line' : 'lines'} from ${attachment.label})`}
+								>
+									<span class="attachment-terminal-glyph" aria-hidden="true">⌘</span>
+									<span class="attachment-label">
+										<span class="attachment-name">{attachment.label || 'terminal'}</span>
+										<span class="attachment-range">
+											:{attachment.lineCount}{attachment.lineCount === 1 ? ' line' : ' lines'}
+										</span>
 									</span>
 								</span>
 							{/if}
@@ -2241,6 +2254,14 @@
 		height: 28px;
 		object-fit: cover;
 		border-radius: 3px;
+		flex-shrink: 0;
+	}
+	.attachment-terminal {
+		cursor: default;
+	}
+	.attachment-terminal-glyph {
+		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+		color: var(--m-fg-muted);
 		flex-shrink: 0;
 	}
 	.user-images {

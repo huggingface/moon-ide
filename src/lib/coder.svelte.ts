@@ -152,13 +152,33 @@ export type ImageComposerAttachment = {
 	sizeBytes: number;
 };
 
-/** Anything the chip strip can hold. The two shapes share the
+/** A snapshot of text the user selected in a terminal pane and
+ *  attached via Ctrl+L. Unlike `SelectionAttachment` there's no
+ *  stable address (no path, no line numbers within a file) — the
+ *  scrollback isn't a navigable artefact — so the chip is purely
+ *  informational and we don't insert an inline `@`-token at the
+ *  caret. `label` is the source terminal's tab title (typically
+ *  the cwd basename) for chip readability when several terminals
+ *  are open. `lineCount` is captured at attach time for the chip
+ *  label so the user can see how much they grabbed without
+ *  expanding the chip. */
+export type TerminalAttachment = {
+	kind: 'terminal';
+	id: string;
+	text: string;
+	label: string;
+	lineCount: number;
+};
+
+/** Anything the chip strip can hold. The three shapes share the
  *  panel's render path (one chip per attachment) but differ in
  *  what the user clicks them for: selections jump to the file at
- *  the captured range; images preview the picture. Send-time
- *  splits them — selections render into the trailing
- *  `<context>` block, images ride on the IPC alongside `text`. */
-export type ComposerAttachment = SelectionAttachment | ImageComposerAttachment;
+ *  the captured range; images preview the picture; terminal
+ *  attachments are read-only context blobs (the scrollback isn't
+ *  navigable). Send-time splits them — selection / terminal
+ *  render into the trailing `<context>` block, images ride on
+ *  the IPC alongside `text`. */
+export type ComposerAttachment = SelectionAttachment | ImageComposerAttachment | TerminalAttachment;
 
 /** Per-bound-folder UI state. One instance per folder we've ever
  *  routed an event for; lazily created via
@@ -857,6 +877,38 @@ class CoderPanelState {
 		this.composerFocusTick = this.composerFocusTick + 1;
 	}
 
+	/** Open the panel + attach a terminal scrollback selection to
+	 *  the composer. Bound to Ctrl+L when a terminal pane has the
+	 *  active text selection. Dedupes on identical (text, label)
+	 *  pairs so a stray double-tap doesn't pile two chips for the
+	 *  exact same blob. We don't insert an inline token: the
+	 *  scrollback has no stable address worth referencing in
+	 *  prose, and a verbose `@terminal:<random-id>` token would
+	 *  just be noise. */
+	addAttachmentFromTerminal(snapshot: { text: string; label: string }): void {
+		const text = snapshot.text;
+		if (text.length === 0) {
+			return;
+		}
+		rightPanel.set('coder');
+		this.view = 'session';
+		const dup = this.attachments.find((a) => a.kind === 'terminal' && a.text === text && a.label === snapshot.label);
+		if (!dup) {
+			const lineCount = countLines(text);
+			this.attachments = [
+				...this.attachments,
+				{
+					kind: 'terminal',
+					id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+					text,
+					label: snapshot.label,
+					lineCount,
+				},
+			];
+		}
+		this.composerFocusTick = this.composerFocusTick + 1;
+	}
+
 	/** "Fix in coder" entry-point from the editor's lint tooltip.
 	 *  Opens the panel, attaches a snapshot of the diagnostic's
 	 *  range (so the model sees the same code the squiggle covers),
@@ -1415,14 +1467,17 @@ class CoderPanelState {
 		}
 		const selectionAttachments: SelectionAttachment[] = [];
 		const imageAttachments: ImageComposerAttachment[] = [];
+		const terminalAttachments: TerminalAttachment[] = [];
 		for (const att of attachments) {
 			if (att.kind === 'selection') {
 				selectionAttachments.push(att);
-			} else {
+			} else if (att.kind === 'image') {
 				imageAttachments.push(att);
+			} else {
+				terminalAttachments.push(att);
 			}
 		}
-		const payload = renderPromptWithAttachments(text, selectionAttachments, activeFilePath);
+		const payload = renderPromptWithAttachments(text, selectionAttachments, terminalAttachments, activeFilePath);
 		const images: ImageAttachmentPayload[] = imageAttachments.map((img) => ({
 			data_url: img.dataUrl,
 			mime: img.mime,
@@ -1880,6 +1935,7 @@ function applyInnerEventToRows(rows: CoderRow[], event: CoderEvent): CoderRow[] 
 function renderPromptWithAttachments(
 	text: string,
 	attachments: SelectionAttachment[],
+	terminalAttachments: TerminalAttachment[],
 	activeFilePath: string | null,
 ): string {
 	const blocks: string[] = [];
@@ -1898,6 +1954,14 @@ function renderPromptWithAttachments(
 		// already an unambiguous delimiter — no risk of
 		// triple-backticks in the snippet "closing" our wrapper.
 		blocks.push(`<code_selection path="${escapeXmlAttr(att.path)}" lines="${range}">\n${att.text}\n</code_selection>`);
+	}
+	for (const att of terminalAttachments) {
+		// Same envelope strategy: the `<terminal_output>` tag is
+		// the delimiter, no fenced body. `label` lands as an
+		// attribute so a model that's reading the context block
+		// can tell which terminal the snippet came from when the
+		// user attached output from several.
+		blocks.push(`<terminal_output label="${escapeXmlAttr(att.label)}">\n${att.text}\n</terminal_output>`);
 	}
 	if (blocks.length === 0) {
 		return text;
@@ -1960,6 +2024,25 @@ function formatAttachmentToken(path: string, startLine: number, endLine: number)
 		return `@${path}:${startLine}`;
 	}
 	return `@${path}:${startLine}-${endLine}`;
+}
+
+/** Count newline-separated lines in a text blob, treating an
+ *  empty trailing newline as part of the last line (so "a\nb\n"
+ *  is 2 lines, not 3). Used for terminal-attachment chip labels
+ *  — the user wants "5 lines", not "6 lines because the shell
+ *  echoes a final \n". */
+function countLines(text: string): number {
+	if (text.length === 0) {
+		return 0;
+	}
+	const trimmed = text.endsWith('\n') ? text.slice(0, -1) : text;
+	let count = 1;
+	for (const ch of trimmed) {
+		if (ch === '\n') {
+			count += 1;
+		}
+	}
+	return count;
 }
 
 /** Append `delta` to the assistant row identified by `id`. The
