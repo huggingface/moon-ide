@@ -49,6 +49,20 @@ moon-ws-<id>-dev-1 bash` with cwd = `/workspace/<basename>`
 - Keyboard: standard xterm.js keybindings, `Ctrl+C` /
   `Ctrl+D` go to the shell as expected. Copy/paste
   uses `Ctrl+Shift+C` / `Ctrl+Shift+V` (xterm default).
+- File-link navigation: stack-trace-shaped paths in the
+  output (`file:///abs/path:line:col`, bare absolute
+  `/abs/path:line:col`, container `/workspace/<basename>/...`)
+  underline on hover and open in the editor on
+  Ctrl/Cmd-click — same modifier as the editor's
+  goto-definition. Container paths reverse-map through the
+  bound-folder list by basename, mirroring the forward
+  `containerCwdFor` rule the terminal opens with. Bare
+  clicks stay inert so drag-selection across a path keeps
+  working. Relative paths are out of scope (no shell
+  integration to follow `cd`); the path either has to be
+  absolute or carry the `/workspace/...` prefix. See
+  [`src/lib/terminalLinks.ts`](../../src/lib/terminalLinks.ts)
+  for the matcher.
 
 What ships:
 

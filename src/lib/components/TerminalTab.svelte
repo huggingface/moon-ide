@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onDestroy, onMount, untrack } from 'svelte';
-	import { Terminal, type ITheme } from '@xterm/xterm';
+	import { Terminal, type IDisposable, type ILink, type ILinkProvider, type ITheme } from '@xterm/xterm';
 	import { FitAddon } from '@xterm/addon-fit';
 	import { WebLinksAddon } from '@xterm/addon-web-links';
 	import { openUrl } from '@tauri-apps/plugin-opener';
@@ -9,6 +9,7 @@
 	import type { TerminalTab } from '../bottomPanel.svelte';
 	import { terminal as terminalStore } from '../terminal.svelte';
 	import { workspace } from '../state.svelte';
+	import { parseFileLinks, resolveTerminalLink } from '../terminalLinks';
 
 	// Body component for a `kind: 'terminal'` bottom-panel tab.
 	// Mounts an xterm.js Terminal wired to the store's IO bus:
@@ -36,6 +37,7 @@
 	let term: Terminal | null = null;
 	let fitAddon: FitAddon | null = null;
 	let resizeObserver: ResizeObserver | null = null;
+	let fileLinkProvider: IDisposable | null = null;
 
 	onMount(() => {
 		if (!hostEl) {
@@ -74,6 +76,18 @@
 		);
 
 		term.open(hostEl);
+		// File-link provider — recognise `file:///abs/path:line:col`
+		// URIs and bare absolute paths in the row text and
+		// underline them on hover. Activation is gated on
+		// Ctrl/Cmd-click (matching the editor's goto-definition
+		// gesture) so plain clicks and drag-selection across a
+		// stack-trace path keep working. Container `/workspace/...`
+		// paths are reverse-mapped to the bound folder via
+		// basename match — same convention `containerCwdFor`
+		// uses when opening a container terminal. Resolution
+		// fans out: a host shell that prints container paths or
+		// vice versa still gets links.
+		fileLinkProvider = term.registerLinkProvider(buildFileLinkProvider());
 		// Linux convention for copy / paste in a terminal is
 		// Ctrl+Shift+C / Ctrl+Shift+V — Ctrl+C is reserved for
 		// SIGINT. xterm.js doesn't ship that mapping by default,
@@ -168,10 +182,87 @@
 		resizeObserver?.disconnect();
 		resizeObserver = null;
 		terminalStore.clearWriter(tab.id);
+		fileLinkProvider?.dispose();
+		fileLinkProvider = null;
 		term?.dispose();
 		term = null;
 		fitAddon = null;
 	});
+
+	/**
+	 * One xterm `ILinkProvider` per Terminal instance. xterm
+	 * calls `provideLinks(y, cb)` each time the cursor enters
+	 * a new row; we read the row's text, scan it for path
+	 * matches, and hand back ranges with hover/leave (so the
+	 * underline shows up) plus an `activate` callback gated on
+	 * Ctrl/Cmd-click.
+	 *
+	 * Wrapped lines are ignored — most stack-trace paths fit
+	 * in one row, and stitching wrap continuations is
+	 * surprisingly involved (xterm exposes `isWrapped` per
+	 * line but we'd have to walk forward/backward, re-derive
+	 * column ranges across the join, and avoid double-counting
+	 * matches that overlap the wrap point). If a path ever
+	 * actually wraps in real usage we revisit then.
+	 */
+	function buildFileLinkProvider(): ILinkProvider {
+		return {
+			provideLinks(y: number, callback: (links: ILink[] | undefined) => void): void {
+				const t = term;
+				if (t === null) {
+					callback(undefined);
+					return;
+				}
+				const buffer = t.buffer.active;
+				const line = buffer.getLine(y - 1);
+				if (line === undefined) {
+					callback(undefined);
+					return;
+				}
+				// `trimRight: true` strips trailing whitespace cells
+				// so the regex doesn't have to deal with them.
+				const text = line.translateToString(true);
+				const matches = parseFileLinks(text);
+				if (matches.length === 0) {
+					callback(undefined);
+					return;
+				}
+				const links: ILink[] = matches.map((m) => ({
+					// xterm's `IBufferRange` is 1-based and
+					// inclusive on both ends; the JS string
+					// indices are 0-based half-open, so `+1` on
+					// start and use `end` directly for the
+					// inclusive end column.
+					range: {
+						start: { x: m.start + 1, y },
+						end: { x: m.end, y },
+					},
+					text: text.slice(m.start, m.end),
+					activate: (event) => {
+						// Gate on Ctrl (Linux/Win) or Cmd (mac).
+						// Bare clicks fall through silently so the
+						// user can drag-select across a path
+						// without launching a navigation.
+						if (!event.ctrlKey && !event.metaKey) {
+							return;
+						}
+						event.preventDefault();
+						const resolved = resolveTerminalLink(m, workspace.workspace);
+						if (resolved === null) {
+							return;
+						}
+						void workspace.jumpTo(
+							resolved.path,
+							{ line: resolved.line, character: resolved.character },
+							workspace.focusedSide,
+							resolved.folder,
+						);
+					},
+				}));
+				callback(links);
+			},
+		};
+	}
 
 	function refit() {
 		if (!fitAddon || !term) {
