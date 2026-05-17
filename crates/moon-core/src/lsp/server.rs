@@ -871,10 +871,19 @@ impl LspServer {
 			.load(std::sync::atomic::Ordering::Relaxed)
 	}
 
-	/// Send `textDocument/didOpen`. Idempotent: a second open for
-	/// the same path is routed as a change — editors that reopen
-	/// a closed tab expect the server to pick up where they left
-	/// off, not crash on a duplicate open.
+	/// Send `textDocument/didOpen` (first time) or
+	/// `textDocument/didChange` (subsequent calls) for `rel_path`,
+	/// then schedule a diagnostic pull. The two paths are merged on
+	/// purpose: a respawned server starts with an empty `docs` map,
+	/// and the very next thing the broker forwards may be either a
+	/// fresh `lsp_open` (tab switch / file load) or a debounced
+	/// `lsp_update` from in-flight typing — keeping them on the
+	/// same entry point means the new server picks up the buffer no
+	/// matter which one wins the race. The frontend's
+	/// [`super::broker::LspBroker::update`] forwards through here
+	/// for exactly that reason; treating an `update` as a "didOpen
+	/// if needed" is what unsticks the linter co-tenant after a
+	/// crash or manual restart.
 	pub async fn open(self: &Arc<Self>, rel_path: &str, text: String, language_id: &str) -> Result<(), LspClientError> {
 		let mut docs = self.docs.lock().await;
 		let uri = self.relative_to_uri(rel_path);
@@ -898,25 +907,6 @@ impl LspServer {
 		docs.insert(rel_path.to_owned(), DocState { version });
 		drop(docs);
 		self.client.notify("textDocument/didOpen", params).await?;
-		self.spawn_pull_diagnostics(rel_path);
-		Ok(())
-	}
-
-	pub async fn update(self: &Arc<Self>, rel_path: &str, text: String) -> Result<(), LspClientError> {
-		let mut docs = self.docs.lock().await;
-		let state = match docs.get_mut(rel_path) {
-			Some(s) => s,
-			None => {
-				// Frontend is ahead of us (change before open?). Drop silently;
-				// the next open call will catch us up.
-				return Ok(());
-			}
-		};
-		state.version += 1;
-		let version = state.version;
-		let uri = self.relative_to_uri(rel_path);
-		drop(docs);
-		self.apply_change(&uri, version, text).await?;
 		self.spawn_pull_diagnostics(rel_path);
 		Ok(())
 	}

@@ -521,15 +521,29 @@ impl LspBroker {
 		Ok(())
 	}
 
+	/// Forward a buffer's latest text to every server that covers
+	/// `language_id`. Routed through [`LspServer::open`] (not
+	/// `update`) so a respawned server — fresh slot, empty `docs`
+	/// map — auto-attaches the buffer on the next keystroke instead
+	/// of silently dropping the change. Concretely: oxlint died (or
+	/// was restarted via the diag-logs panel), `ensure_server`
+	/// minted a clean slot, and the frontend's `lspScheduleUpdate`
+	/// debounce is the first thing that reaches the new process. We
+	/// want that to be `didOpen` if the new process has never seen
+	/// the file, and `didChange` if it has — `LspServer::open`
+	/// already keys on its own `docs` to pick the right one. Without
+	/// this, the linter pill flips green again but its diagnostics
+	/// would freeze on the pre-crash snapshot until the user
+	/// switched tabs and back.
 	pub async fn update(&self, path: &str, text: String, language_id: &str) -> Result<(), LspClientError> {
 		if let Some(spec) = Self::spec_for(language_id) {
 			if let Some(server) = self.ensure_server(spec).await? {
-				server.update(path, text.clone()).await?;
+				server.open(path, text.clone(), language_id).await?;
 			}
 		}
 		if let Some(spec) = Self::lint_spec_for(language_id) {
 			if let Some(server) = self.ensure_server(spec).await? {
-				server.update(path, text).await?;
+				server.open(path, text, language_id).await?;
 			}
 		}
 		Ok(())

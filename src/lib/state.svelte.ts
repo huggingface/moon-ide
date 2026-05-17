@@ -33,7 +33,7 @@ import {
 	type WorkspaceFolder,
 	type WorkspaceSession,
 } from './protocol';
-import { lspLanguageFor } from './editor/lspLanguage';
+import { lspLanguageFor, lspSlotCoversFile } from './editor/lspLanguage';
 import { bottomPanel } from './bottomPanel.svelte';
 import { composeLogs } from './composeLogs.svelte';
 import { diagLogs, frontendLog } from './logs.svelte';
@@ -2897,12 +2897,18 @@ class WorkspaceState {
 	}
 
 	/**
-	 * Re-`open` the active editor buffer if its language id matches
-	 * `languageId`. Called from the `lsp:status` listener when a
-	 * server crashes, so the broker's auto-respawn (lazy on the
-	 * next request) lands with the live buffer text instead of an
-	 * empty doc set. Idempotent: if the active file isn't
-	 * governed by this language the call is a no-op.
+	 * Re-`open` the active editor buffer if it's governed by the
+	 * broker slot identified by `languageId` (the slot key —
+	 * `"typescript"`, `"rust"`, `"oxlint"`, …). Called from the
+	 * `lsp:status` listener when a server crashes, so the broker's
+	 * auto-respawn (lazy on the next request) lands with the live
+	 * buffer text instead of an empty doc set.
+	 *
+	 * Membership goes through [`lspSlotCoversFile`] rather than a
+	 * strict `lspLanguageFor(path) === languageId` test so the
+	 * linter co-tenant works correctly: a crashed `oxlint` slot
+	 * needs to reopen `.ts` / `.tsx` / `.js` / `.jsx` files, none
+	 * of which produce a file-language id of `"oxlint"`.
 	 */
 	#reopenActiveForLanguage(languageId: string): void {
 		const file = this.activeFile;
@@ -2913,7 +2919,7 @@ class WorkspaceState {
 			return;
 		}
 		const fileLang = lspLanguageFor(file.path);
-		if (fileLang !== languageId) {
+		if (fileLang === null || !lspSlotCoversFile(languageId, fileLang)) {
 			return;
 		}
 		this.lspOpen(file.path, file.text);
@@ -2990,11 +2996,17 @@ class WorkspaceState {
 			this.flash(`Could not restart ${languageId} LSP: ${formatError(err)}`);
 			return;
 		}
-		// Re-prime the new server with every open buffer that's
-		// governed by this language id. The broker is rooted at
-		// the active folder, so cross-folder buffers will silently
-		// be NotAvailable — that's fine, they were also
-		// NotAvailable before the restart for the same reason.
+		// Re-prime the new server with every open buffer it
+		// governs. The broker is rooted at the active folder, so
+		// cross-folder buffers will silently be NotAvailable —
+		// that's fine, they were also NotAvailable before the
+		// restart for the same reason. Membership is the slot's
+		// covered set ([`lspSlotCoversFile`]), not a file-language
+		// equality: a `restartLsp("oxlint")` has to reopen `.ts` /
+		// `.tsx` / `.js` / `.jsx` buffers, whose own language ids
+		// are `"typescript"` etc. — strict equality would silently
+		// reopen zero files and the linter would come up empty
+		// until the user typed in each tab again.
 		for (const file of this.openFiles) {
 			if (file.kind !== 'text' || file.isDeleted) {
 				continue;
@@ -3002,7 +3014,8 @@ class WorkspaceState {
 			if (isSyntheticBufferPath(file.path)) {
 				continue;
 			}
-			if (lspLanguageFor(file.path) !== languageId) {
+			const fileLang = lspLanguageFor(file.path);
+			if (fileLang === null || !lspSlotCoversFile(languageId, fileLang)) {
 				continue;
 			}
 			this.lspOpen(file.path, file.text);
