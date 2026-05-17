@@ -100,6 +100,36 @@ RUN install -m 0755 -d /etc/apt/keyrings \
  && apt-get install -y --no-install-recommends gh \
  && rm -rf /var/lib/apt/lists/*
 
+# mongosh (the MongoDB shell) from MongoDB's official apt repo.
+# We pull only the `mongodb-mongosh` package — not the full
+# `mongodb-org` server stack — because the workspace container
+# doesn't host MongoDB itself; project services live as
+# host-daemon siblings via compose `include:` (ADR 0008). The
+# shell's the part the dev needs in their interactive container
+# terminal, the same way `gh` is here without `git` itself
+# needing to be a separate concern.
+#
+# Pinned to the 8.0 channel, MongoDB's current server major as
+# of this image revision; mongosh 2.x in that channel speaks
+# every server protocol from 4.4 onwards so projects on older
+# Mongo (Mongoku connects to whatever cluster the user points
+# it at) still work.
+# `signed-by` accepts ASCII-armored keys directly since apt 1.4
+# (Bookworm has 2.6.x), so we skip the usual `gpg --dearmor`
+# round-trip and the gnupg dependency it would pull in. The
+# `.asc` file goes straight into `/etc/apt/keyrings/` and apt
+# verifies the repo signature against it.
+RUN install -m 0755 -d /etc/apt/keyrings \
+ && curl -fsSL https://pgp.mongodb.com/server-8.0.asc \
+      -o /etc/apt/keyrings/mongodb-server-8.0.asc \
+ && chmod a+r /etc/apt/keyrings/mongodb-server-8.0.asc \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/mongodb-server-8.0.asc] https://repo.mongodb.org/apt/debian bookworm/mongodb-org/8.0 main" \
+      > /etc/apt/sources.list.d/mongodb-org-8.0.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends mongodb-mongosh \
+ && rm -rf /var/lib/apt/lists/* \
+ && mongosh --version
+
 # Non-root user. UID 1000 lines up with the conventional "first user"
 # on Linux contributors' hosts; on Docker Desktop for macOS the
 # host->container user mapping fronts whatever the Mac contributor's
