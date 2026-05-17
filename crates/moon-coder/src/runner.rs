@@ -557,13 +557,14 @@ impl CoderHandle {
 	pub async fn probe_provider(
 		&self,
 		base_url: &str,
+		kind: moon_protocol::coder_models::ProviderKind,
 		api_key: Option<&str>,
 	) -> Result<moon_protocol::coder_models::ProviderProbeResult, CoderError> {
 		let http = reqwest::Client::builder()
 			.user_agent(concat!("moon-ide/", env!("CARGO_PKG_VERSION")))
 			.build()
 			.map_err(CoderError::from)?;
-		providers::probe_provider(&http, base_url, api_key).await
+		providers::probe_provider(&http, base_url, kind, api_key).await
 	}
 
 	/// Current `CoderModels` snapshot. The Tauri layer reads this
@@ -615,7 +616,9 @@ impl CoderHandle {
 					tracing::debug!(?err, "context-window prime: HF catalog fetch failed; using fallback");
 				}
 			},
-			ResolvedProvider::Custom { id, .. } => {
+			ResolvedProvider::Custom { id, .. }
+			| ResolvedProvider::OpenRouter { id, .. }
+			| ResolvedProvider::Anthropic { id, .. } => {
 				match self.list_provider_models(&id).await {
 					Ok(_) => {
 						// `list_provider_models` already merged the fresh
@@ -740,12 +743,13 @@ impl CoderHandle {
 			.find(|p| p.id == provider_id)
 			.ok_or_else(|| CoderError::Internal(format!("unknown provider id: {provider_id}")))?;
 		let base_url = entry.base_url.clone();
+		let kind = entry.kind;
 		drop(snapshot);
 		let api_key = self.state.provider_keys.get(provider_id);
 		let catalog = self
 			.state
 			.inference
-			.list_provider_models(&base_url, api_key.as_deref())
+			.list_provider_models(&base_url, api_key.as_deref(), kind)
 			.await?;
 		let windows = models::context_windows_from_provider_catalog(&catalog);
 		if !windows.is_empty() {
@@ -767,7 +771,9 @@ impl CoderHandle {
 		let route = self.state.models.read().await.resolve_route();
 		let signed_in = match &route {
 			ResolvedProvider::HuggingFace => identity.is_some(),
-			ResolvedProvider::Custom { id, base_url } => {
+			ResolvedProvider::Custom { id, base_url }
+			| ResolvedProvider::OpenRouter { id, base_url }
+			| ResolvedProvider::Anthropic { id, base_url } => {
 				if self.state.provider_keys.has_key(id) {
 					true
 				} else {
@@ -1260,7 +1266,9 @@ impl CoderHandle {
 					return Err(CoderError::NotSignedIn);
 				}
 			}
-			ResolvedProvider::Custom { id, base_url } => {
+			ResolvedProvider::Custom { id, base_url }
+			| ResolvedProvider::OpenRouter { id, base_url }
+			| ResolvedProvider::Anthropic { id, base_url } => {
 				if !self.state.provider_keys.has_key(id) && !is_local_base_url(base_url) {
 					return Err(CoderError::NotSignedIn);
 				}

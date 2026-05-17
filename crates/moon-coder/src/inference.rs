@@ -531,16 +531,31 @@ pub struct InferenceClient {
 /// Resolved request routing for one round-trip.
 ///
 /// Built by [`InferenceClient::resolve_route_for_request`] off
-/// [`SharedCoderModels::resolve_route`] + a keyring lookup. Carries
-/// `is_huggingface` so the 401-refresh path stays a one-shot for HF
-/// and a hard failure for user providers (where there's no refresh
-/// token, just a key the user has to fix in the picker).
+/// [`SharedCoderModels::resolve_route`] + a keyring lookup. The
+/// `kind` discriminator drives both the wire shape (OpenAI-compat
+/// vs Anthropic native) and the auth-failure recovery story (HF
+/// gets one transparent token refresh; everything else surfaces
+/// 401 verbatim so the user fixes the key in the picker).
 #[derive(Debug, Clone)]
-struct ResolvedRoute {
-	base_url: String,
-	auth_token: Option<String>,
-	bill_to: Option<String>,
-	is_huggingface: bool,
+pub(crate) struct ResolvedRoute {
+	pub(crate) base_url: String,
+	pub(crate) auth_token: Option<String>,
+	pub(crate) bill_to: Option<String>,
+	pub(crate) kind: RouteKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouteKind {
+	HuggingFace,
+	Custom,
+	OpenRouter,
+	Anthropic,
+}
+
+impl ResolvedRoute {
+	pub(crate) fn is_huggingface(&self) -> bool {
+		matches!(self.kind, RouteKind::HuggingFace)
+	}
 }
 
 /// Decide which message indexes should carry an Anthropic
@@ -611,10 +626,7 @@ fn cache_breakpoint_indexes(messages: &[ChatMessage], route: &ResolvedRoute, mod
 /// translation layer (the native `/v1/messages` shape diverges
 /// from `/v1/chat/completions` in too many places to fake).
 fn supports_anthropic_caching(route: &ResolvedRoute, model: &str) -> bool {
-	if route.is_huggingface {
-		return false;
-	}
-	if !route.base_url.contains("openrouter.ai") {
+	if !matches!(route.kind, RouteKind::OpenRouter) {
 		return false;
 	}
 	is_anthropic_model(model)
@@ -666,32 +678,35 @@ impl InferenceClient {
 	/// time, this guards against a hand-edited `state.json`.
 	async fn resolve_route_for_request(&self) -> Result<ResolvedRoute, CoderError> {
 		let snapshot = self.models.read().await.clone();
-		match snapshot.resolve_route() {
-			ResolvedProvider::HuggingFace => {
-				let access = self.auth.current_access_token().await?;
-				Ok(ResolvedRoute {
-					base_url: self.hf_base_url.clone(),
-					auth_token: Some(access),
-					bill_to: snapshot.bill_to().map(str::to_owned),
-					is_huggingface: true,
-				})
-			}
-			ResolvedProvider::Custom { id, base_url } => {
-				if base_url.trim().is_empty() {
-					return Err(CoderError::Internal(format!(
-						"active provider {id} has empty base_url; fix it in the model-settings popover"
-					)));
-				}
-				let trimmed = base_url.trim_end_matches('/').to_owned();
-				let auth_token = self.provider_keys.get(&id);
-				Ok(ResolvedRoute {
-					base_url: trimmed,
-					auth_token,
-					bill_to: None,
-					is_huggingface: false,
-				})
-			}
+		let resolved = snapshot.resolve_route();
+		if matches!(resolved, ResolvedProvider::HuggingFace) {
+			let access = self.auth.current_access_token().await?;
+			return Ok(ResolvedRoute {
+				base_url: self.hf_base_url.clone(),
+				auth_token: Some(access),
+				bill_to: snapshot.bill_to().map(str::to_owned),
+				kind: RouteKind::HuggingFace,
+			});
 		}
+		let (kind, id, base_url) = match resolved {
+			ResolvedProvider::HuggingFace => unreachable!(),
+			ResolvedProvider::Custom { id, base_url } => (RouteKind::Custom, id, base_url),
+			ResolvedProvider::OpenRouter { id, base_url } => (RouteKind::OpenRouter, id, base_url),
+			ResolvedProvider::Anthropic { id, base_url } => (RouteKind::Anthropic, id, base_url),
+		};
+		if base_url.trim().is_empty() {
+			return Err(CoderError::Internal(format!(
+				"active provider {id} has empty base_url; fix it in the model-settings popover"
+			)));
+		}
+		let trimmed = base_url.trim_end_matches('/').to_owned();
+		let auth_token = self.provider_keys.get(&id);
+		Ok(ResolvedRoute {
+			base_url: trimmed,
+			auth_token,
+			bill_to: None,
+			kind,
+		})
 	}
 
 	/// GET `/v1/models` against the HF router → rich
@@ -816,7 +831,12 @@ impl InferenceClient {
 		&self,
 		base_url: &str,
 		api_key: Option<&str>,
+		kind: moon_protocol::coder_models::ProviderKind,
 	) -> Result<Vec<moon_protocol::coder_models::ProviderModelSummary>, CoderError> {
+		use moon_protocol::coder_models::ProviderKind;
+		if matches!(kind, ProviderKind::Anthropic) {
+			return crate::anthropic::list_models(&self.http, base_url, api_key).await;
+		}
 		let trimmed = base_url.trim_end_matches('/');
 		let endpoint = format!("{trimmed}/models");
 		let mut req = self.http.get(&endpoint);
@@ -850,7 +870,11 @@ impl InferenceClient {
 		tools: &[ToolDefinition],
 		cancel: &tokio_util::sync::CancellationToken,
 	) -> Result<AssistantResponse, CoderError> {
-		let mut route = self.resolve_route_for_request().await?;
+		let route = self.resolve_route_for_request().await?;
+		if route.kind == RouteKind::Anthropic {
+			return crate::anthropic::chat_completion(&self.http, &route, model, messages, tools, cancel).await;
+		}
+		let mut route = route;
 		let endpoint = format!("{}/chat/completions", route.base_url);
 		let cache_indexes = cache_breakpoint_indexes(messages, &route, model);
 		let body = ChatCompletionRequest {
@@ -864,7 +888,7 @@ impl InferenceClient {
 
 		let mut response = self.send_once(&endpoint, &route, &body, cancel).await?;
 
-		if response.status() == reqwest::StatusCode::UNAUTHORIZED && route.is_huggingface {
+		if response.status() == reqwest::StatusCode::UNAUTHORIZED && route.is_huggingface() {
 			tracing::info!("HF inference returned 401; refreshing token and retrying once");
 			let refreshed = self.auth.refresh_now().await?;
 			route.auth_token = Some(refreshed);
@@ -920,7 +944,12 @@ impl InferenceClient {
 	where
 		F: FnMut(StreamEvent<'_>),
 	{
-		let mut route = self.resolve_route_for_request().await?;
+		let route = self.resolve_route_for_request().await?;
+		if route.kind == RouteKind::Anthropic {
+			return crate::anthropic::chat_completion_stream(&self.http, &route, model, messages, tools, cancel, on_event)
+				.await;
+		}
+		let mut route = route;
 		let endpoint = format!("{}/chat/completions", route.base_url);
 		let cache_indexes = cache_breakpoint_indexes(messages, &route, model);
 		let body = ChatCompletionRequest {
@@ -940,7 +969,7 @@ impl InferenceClient {
 
 		let mut response = self.send_once_stream(&endpoint, &route, &body, cancel).await?;
 
-		if response.status() == reqwest::StatusCode::UNAUTHORIZED && route.is_huggingface {
+		if response.status() == reqwest::StatusCode::UNAUTHORIZED && route.is_huggingface() {
 			tracing::info!("HF inference returned 401; refreshing token and retrying once");
 			let refreshed = self.auth.refresh_now().await?;
 			route.auth_token = Some(refreshed);
@@ -1241,20 +1270,20 @@ fn finalize_response(
 }
 
 #[derive(Debug)]
-struct EventBoundary {
+pub(crate) struct EventBoundary {
 	/// Offset (exclusive) of the last byte of the event body — i.e.
 	/// the position of the trailing `\n` that immediately precedes
 	/// the blank-line separator.
-	body_end: usize,
+	pub(crate) body_end: usize,
 	/// Offset (exclusive) of the byte *after* the blank-line
 	/// separator. Drain `0..boundary_end` to consume the event.
-	boundary_end: usize,
+	pub(crate) boundary_end: usize,
 }
 
 /// Find the next `\n\n` (or `\r\n\r\n`) boundary in the buffer.
 /// Returns `None` when the buffer doesn't yet contain a complete
 /// event — the caller pulls more bytes and tries again.
-fn find_event_boundary(buf: &[u8]) -> Option<EventBoundary> {
+pub(crate) fn find_event_boundary(buf: &[u8]) -> Option<EventBoundary> {
 	if let Some(idx) = find_subsequence(buf, b"\r\n\r\n") {
 		return Some(EventBoundary {
 			body_end: idx,
@@ -1278,7 +1307,7 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// with `:` are comments (provider keep-alives); blank lines never
 /// reach this function because `find_event_boundary` already
 /// trimmed at the boundary.
-fn extract_data_lines(event: &str) -> Vec<&str> {
+pub(crate) fn extract_data_lines(event: &str) -> Vec<&str> {
 	let mut out = Vec::new();
 	for line in event.split('\n') {
 		let line = line.strip_suffix('\r').unwrap_or(line);
@@ -1295,7 +1324,7 @@ fn extract_data_lines(event: &str) -> Vec<&str> {
 	out
 }
 
-fn truncate_for_log(s: &str) -> String {
+pub(crate) fn truncate_for_log(s: &str) -> String {
 	const LIMIT: usize = 256;
 	if s.len() <= LIMIT {
 		return s.to_string();
@@ -1701,18 +1730,21 @@ mod tests {
 			base_url: "https://router.huggingface.co/v1".into(),
 			auth_token: None,
 			bill_to: None,
-			is_huggingface: true,
+			kind: RouteKind::HuggingFace,
 		};
 		let messages = vec![ChatMessage::System { content: "sys".into() }, ChatMessage::user("hi")];
 		assert!(cache_breakpoint_indexes(&messages, &route, "anthropic/claude-sonnet-4.5").is_empty());
 
-		// Custom non-OpenRouter route → no caching either, even
-		// if the slug happens to start with `anthropic/`.
+		// Custom (non-OpenRouter, non-Anthropic) route → no caching
+		// either, even if the slug happens to start with
+		// `anthropic/`. The Anthropic-native variant takes a
+		// completely separate code path; it doesn't run through
+		// `cache_breakpoint_indexes` at all.
 		let route = ResolvedRoute {
-			base_url: "https://api.anthropic.com/v1".into(),
+			base_url: "https://example.com/v1".into(),
 			auth_token: None,
 			bill_to: None,
-			is_huggingface: false,
+			kind: RouteKind::Custom,
 		};
 		assert!(cache_breakpoint_indexes(&messages, &route, "anthropic/claude-sonnet-4.5").is_empty());
 
@@ -1721,7 +1753,7 @@ mod tests {
 			base_url: "https://openrouter.ai/api/v1".into(),
 			auth_token: None,
 			bill_to: None,
-			is_huggingface: false,
+			kind: RouteKind::OpenRouter,
 		};
 		assert!(cache_breakpoint_indexes(&messages, &route, "openai/gpt-4o").is_empty());
 	}
@@ -1732,7 +1764,7 @@ mod tests {
 			base_url: "https://openrouter.ai/api/v1".into(),
 			auth_token: None,
 			bill_to: None,
-			is_huggingface: false,
+			kind: RouteKind::OpenRouter,
 		};
 		let model = "anthropic/claude-sonnet-4.5";
 

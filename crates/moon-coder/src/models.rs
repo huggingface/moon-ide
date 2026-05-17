@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use moon_protocol::coder_models::{CoderProviderConfig, ProviderModelSummary, RouterModel};
+use moon_protocol::coder_models::{CoderProviderConfig, ProviderKind, ProviderModelSummary, RouterModel};
 use tokio::sync::RwLock;
 
 use crate::defaults::{context_window_for, DEFAULT_CHEAP_MODEL, DEFAULT_STANDARD_MODEL};
@@ -111,6 +111,13 @@ impl Default for CoderModels {
 
 /// Resolved request routing for one round-trip. Computed off
 /// [`CoderModels`] on the inference side.
+///
+/// `Custom` and `OpenRouter` share a wire path (OpenAI-compat
+/// `/chat/completions`); they're separate variants so the runner
+/// can attach the right `cache_control` markers without sniffing
+/// the base URL. `Anthropic` is a different beast — see
+/// [`crate::anthropic`] for the translator the inference client
+/// branches into when this variant is active.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedProvider {
 	/// Implicit HF route. The inference client uses
@@ -118,12 +125,44 @@ pub enum ResolvedProvider {
 	/// `Authenticator`'s OAuth bearer (with refresh on 401), and
 	/// sends `X-HF-Bill-To` when set.
 	HuggingFace,
-	/// User-added OpenAI-compatible endpoint. The client uses
+	/// Free-form OpenAI-compatible endpoint. The client uses
 	/// `base_url` verbatim, sends `Authorization: Bearer
 	/// <api_key>` when the keyring has an entry, and omits the
 	/// bill-to header. The `id` is the keyring lookup key the
 	/// inference client uses to fetch the api key per request.
 	Custom { id: String, base_url: String },
+	/// OpenRouter built-in. Wire path is identical to
+	/// [`Self::Custom`]; the variant exists so prompt-cache
+	/// markers fire on `anthropic/*` slugs without consulting
+	/// the base URL.
+	OpenRouter { id: String, base_url: String },
+	/// Anthropic native (`/v1/messages`). Auth via `x-api-key`,
+	/// system prompt as a top-level field, native `cache_control`
+	/// blocks, separate streaming SSE event grammar.
+	Anthropic { id: String, base_url: String },
+}
+
+impl ResolvedProvider {
+	/// Keyring lookup id for this route, or `None` for the
+	/// implicit HF route (which has no keyring entry — the
+	/// `Authenticator` owns the bearer there).
+	pub fn provider_id(&self) -> Option<&str> {
+		match self {
+			Self::HuggingFace => None,
+			Self::Custom { id, .. } | Self::OpenRouter { id, .. } | Self::Anthropic { id, .. } => Some(id.as_str()),
+		}
+	}
+
+	/// Endpoint root for this route, or `None` for HF (the
+	/// inference client hardcodes `HF_ROUTER_BASE` there).
+	pub fn base_url(&self) -> Option<&str> {
+		match self {
+			Self::HuggingFace => None,
+			Self::Custom { base_url, .. } | Self::OpenRouter { base_url, .. } | Self::Anthropic { base_url, .. } => {
+				Some(base_url.as_str())
+			}
+		}
+	}
 }
 
 impl CoderModels {
@@ -148,11 +187,22 @@ impl CoderModels {
 		}
 	}
 
-	/// Active cheap slug. Same fallback rules as
-	/// [`standard`](Self::standard).
+	/// Active cheap slug.
+	///
+	/// On a user provider with no `cheap_model` set, fall back to
+	/// the same provider's `standard_model`. The previous fallback
+	/// (the HF `DEFAULT_CHEAP_MODEL` slug) was wrong for any
+	/// non-HF route — non-HF hosts simply don't carry that slug —
+	/// so a session running on OpenRouter / Anthropic with the
+	/// cheap field left blank would 404 on the first auto-rename.
+	/// Falling through to standard keeps the cheap call sites
+	/// (auto-rename, branch-name suggester, compaction summary)
+	/// working without forcing the user to pick two slugs in the
+	/// modal.
 	pub fn cheap(&self) -> &str {
 		match self.active_provider_entry() {
 			Some(p) if !p.cheap_model.is_empty() => p.cheap_model.as_str(),
+			Some(p) if !p.standard_model.is_empty() => p.standard_model.as_str(),
 			Some(_) => DEFAULT_CHEAP_MODEL,
 			None => {
 				if self.cheap.is_empty() {
@@ -185,9 +235,19 @@ impl CoderModels {
 	/// points at a deleted entry.
 	pub fn resolve_route(&self) -> ResolvedProvider {
 		match self.active_provider_entry() {
-			Some(entry) => ResolvedProvider::Custom {
-				id: entry.id.clone(),
-				base_url: entry.base_url.clone(),
+			Some(entry) => match entry.kind {
+				ProviderKind::Anthropic => ResolvedProvider::Anthropic {
+					id: entry.id.clone(),
+					base_url: entry.base_url.clone(),
+				},
+				ProviderKind::OpenRouter => ResolvedProvider::OpenRouter {
+					id: entry.id.clone(),
+					base_url: entry.base_url.clone(),
+				},
+				ProviderKind::Custom => ResolvedProvider::Custom {
+					id: entry.id.clone(),
+					base_url: entry.base_url.clone(),
+				},
 			},
 			None => ResolvedProvider::HuggingFace,
 		}

@@ -725,9 +725,25 @@ export type CoderAppState = {
  * live in the OS keyring (account=`coder-provider:<id>`), not
  * here — only the `has_api_key` flag is surfaced.
  */
+/**
+ * Built-in provider flavour. Mirrors
+ * `moon_protocol::coder_models::ProviderKind`. The wire path for
+ * `custom` and `open_router` is identical (OpenAI-compat
+ * `/chat/completions`); `anthropic` triggers the native
+ * `/v1/messages` translator on the backend with different auth
+ * headers, content blocks, and SSE event grammar.
+ */
+export type ProviderKind = 'custom' | 'open_router' | 'anthropic';
+
 export type CoderProviderConfig = {
 	id: string;
 	label: string;
+	/**
+	 * Built-in flavour, or `custom` for free-form entries.
+	 * Defaults to `custom` on the backend so entries persisted
+	 * before this field existed deserialize cleanly.
+	 */
+	kind: ProviderKind;
 	base_url: string;
 	standard_model: string;
 	cheap_model: string;

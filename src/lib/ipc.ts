@@ -7,6 +7,7 @@ import type {
 	CoderProviderConfig,
 	CoderSessionSummary,
 	CoderStatus,
+	ProviderKind,
 	ProviderModelSummary,
 	ProviderProbeResult,
 	RouterModel,
@@ -317,8 +318,10 @@ export const ipc = {
 		listModels: () => invoke<RouterModel[]>('coder_list_models'),
 		listProviderModels: (id: string) => invoke<ProviderModelSummary[]>('coder_list_provider_models', { id }),
 		newProviderId: () => invoke<string>('coder_new_provider_id'),
-		probeProvider: (baseUrl: string, apiKey: string) =>
-			invoke<ProviderProbeResult>('coder_probe_provider', { args: { base_url: baseUrl, api_key: apiKey } }),
+		probeProvider: (baseUrl: string, apiKey: string, kind: ProviderKind = 'custom') =>
+			invoke<ProviderProbeResult>('coder_probe_provider', {
+				args: { base_url: baseUrl, api_key: apiKey, kind },
+			}),
 		saveProvider: (config: CoderProviderConfig) => invoke<void>('coder_save_provider', { config }),
 		deleteProvider: (id: string) => invoke<void>('coder_delete_provider', { id }),
 		setProviderApiKey: (id: string, key: string) => invoke<void>('coder_set_provider_api_key', { args: { id, key } }),

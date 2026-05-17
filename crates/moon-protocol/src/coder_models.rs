@@ -138,7 +138,42 @@ pub struct CoderModelSettings {
 	pub providers: Vec<CoderProviderConfig>,
 }
 
-/// One user-added OpenAI-compatible provider — OpenRouter, a local
+/// Wire-protocol shape of one user-added provider. Three flavours:
+///
+/// - [`Self::Custom`] — any OpenAI-compatible endpoint the user
+///   typed in by hand (local llama.cpp / vLLM / Ollama, LiteLLM,
+///   Together, Groq, …). The runner hits `<base_url>/chat/completions`
+///   verbatim and passes the API key as `Authorization: Bearer …`
+///   when one is configured.
+/// - [`Self::OpenRouter`] — same wire shape as `Custom` (OpenAI-
+///   compatible), but the picker recognises it as a built-in so the
+///   `Add provider` modal can pre-fill the URL and link straight to
+///   the API-key dashboard. The runner doesn't behave differently —
+///   the only diff today is that prompt-cache markers fire for
+///   `anthropic/*` slugs without sniffing the base URL.
+/// - [`Self::Anthropic`] — **not** OpenAI-compatible. The runner
+///   takes a separate code path that talks `/v1/messages` directly
+///   (auth via `x-api-key`, system prompt as a top-level field, tool
+///   shape via `tool_use` / `tool_result` blocks, native `cache_control`
+///   on prompt-cache markers, separate streaming SSE event grammar).
+///   Picker pre-fills the URL and locks the field.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+	/// Free-form OpenAI-compat endpoint (default for back-compat
+	/// with entries persisted before this enum existed).
+	#[default]
+	Custom,
+	/// OpenRouter built-in. Wire path is OpenAI-compat; the marker
+	/// only changes picker UX today.
+	OpenRouter,
+	/// Anthropic native built-in. Triggers the `/v1/messages` code
+	/// path in [`moon_coder::inference`].
+	Anthropic,
+}
+
+/// One user-added provider — OpenRouter, Anthropic, a local
 /// llama.cpp / vLLM / Ollama, a hosted Anthropic-via-proxy, …
 /// Persisted into [`crate::app_state::CoderAppState::providers`];
 /// the API key lives in the OS keyring under
@@ -156,18 +191,31 @@ pub struct CoderModelSettings {
 pub struct CoderProviderConfig {
 	pub id: String,
 	pub label: String,
-	/// OpenAI-compat `/v1` root, e.g.
-	/// `https://openrouter.ai/api/v1` or
-	/// `http://localhost:8080/v1`. Stored verbatim; the runner
-	/// builds request URLs by appending `/chat/completions` etc.
+	/// Built-in flavour, or [`ProviderKind::Custom`] for free-form
+	/// entries. Defaults to `Custom` on missing so entries
+	/// persisted before this field existed deserialize cleanly.
+	#[serde(default)]
+	pub kind: ProviderKind,
+	/// Endpoint root. For `Custom` and `OpenRouter` this is the
+	/// OpenAI-compat `/v1` root the runner appends
+	/// `/chat/completions` to (e.g. `https://openrouter.ai/api/v1`,
+	/// `http://localhost:8080/v1`). For `Anthropic` this is the
+	/// API host *without* `/v1` (e.g. `https://api.anthropic.com`)
+	/// — the Messages API translator builds the full URL.
 	pub base_url: String,
-	/// Per-provider standard model slug. Same wire shape as the
-	/// HF `standard_model` — empty string falls back to the
-	/// hardcoded default at request time.
+	/// Per-provider standard model slug. Picker-required for
+	/// [`ProviderKind::OpenRouter`] and [`ProviderKind::Anthropic`]
+	/// (the Save button is disabled until one is picked from the
+	/// catalog); free-form entries can stay empty if the user
+	/// wants to hand-edit later, in which case the runner errors
+	/// at first call.
 	#[serde(default)]
 	pub standard_model: String,
 	/// Per-provider cheap model slug. Same semantics as
-	/// [`standard_model`](Self::standard_model).
+	/// [`standard_model`](Self::standard_model). Empty falls back
+	/// to the standard slug for the same provider — the previous
+	/// behaviour (fall back to the HF cheap default) leaked an
+	/// HF-only slug onto every non-HF route.
 	#[serde(default)]
 	pub cheap_model: String,
 	/// `true` iff the keyring currently holds an entry for this

@@ -388,6 +388,14 @@ pub struct ProbeProviderArgs {
 	pub base_url: String,
 	#[serde(default)]
 	pub api_key: String,
+	/// Wire-shape hint for the probe. Anthropic uses
+	/// `x-api-key` + `anthropic-version` headers and a different
+	/// catalog endpoint; everything else (OpenRouter, custom
+	/// OpenAI-compat) probes via `Authorization: Bearer …` against
+	/// `/v1/models`. Defaults to `Custom` when missing so older
+	/// frontends keep working.
+	#[serde(default)]
+	pub kind: moon_protocol::coder_models::ProviderKind,
 }
 
 #[tauri::command]
@@ -402,7 +410,7 @@ pub async fn coder_probe_provider(
 	};
 	state
 		.coder
-		.probe_provider(&args.base_url, key)
+		.probe_provider(&args.base_url, args.kind, key)
 		.await
 		.map_err(MoonError::from)
 }

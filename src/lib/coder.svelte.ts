@@ -29,6 +29,7 @@ import {
 	type DeviceCode,
 	type HfIdentity,
 	type ImageAttachmentPayload,
+	type ProviderKind,
 	type ProviderModelSummary,
 	type ProviderProbeResult,
 	type RouterModel,
@@ -468,9 +469,9 @@ class CoderPanelState {
 	/** Probe a `(base_url, api_key)` pair from the Add/Edit
 	 *  provider modal. Throws the formatted error so the modal
 	 *  keeps the form open on failure. */
-	async probeProvider(baseUrl: string, apiKey: string): Promise<ProviderProbeResult> {
+	async probeProvider(baseUrl: string, apiKey: string, kind: ProviderKind = 'custom'): Promise<ProviderProbeResult> {
 		try {
-			return await ipc.coder.probeProvider(baseUrl, apiKey);
+			return await ipc.coder.probeProvider(baseUrl, apiKey, kind);
 		} catch (err) {
 			throw new Error(formatError(err), { cause: err });
 		}

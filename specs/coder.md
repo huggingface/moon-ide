@@ -301,7 +301,9 @@ model ids by the time the picker writes back.
 struct CoderProviderConfig {
     id: String,           // opaque "prov-<unix-ms>-<rand>"
     label: String,        // user-typed, shown in the picker
-    base_url: String,     // OpenAI-compat /v1 root
+    kind: ProviderKind,   // custom | open_router | anthropic
+    base_url: String,     // OpenAI-compat /v1 root for custom/open_router;
+                          // API host (e.g. https://api.anthropic.com) for anthropic
     standard_model: String,
     cheap_model: String,
     has_api_key: bool,    // server-set off the keyring
@@ -315,22 +317,62 @@ reads the picks off that entry instead of the HF fields. The
 [`X-HF-Bill-To`](#bill-to-org-vs-personal) header is suppressed off
 the wire when a user provider is active.
 
+`kind` is the wire-shape discriminator:
+
+- `custom` — free-form OpenAI-compatible endpoint. Default for
+  back-compat with entries persisted before the field existed; what
+  every locally-hosted server (vLLM, Ollama, llama.cpp, LiteLLM,
+  …) lands under.
+- `open_router` — a built-in preset for OpenRouter. Identical wire
+  path to `custom`, but the picker recognises it for the URL
+  preset and the API-key dashboard link, and the prompt-cache
+  marker code fires on `anthropic/*` slugs without sniffing the
+  base URL.
+- `anthropic` — Anthropic native (`/v1/messages`). The runner
+  takes a separate code path through
+  [`crates/moon-coder/src/anthropic.rs`](../crates/moon-coder/src/anthropic.rs):
+  auth via `x-api-key` + `anthropic-version`, system prompt as a
+  top-level field, tool calls as `tool_use` / `tool_result`
+  content blocks, images as base64 `image` blocks, native
+  `cache_control: {type: "ephemeral"}` markers, and a different
+  streaming SSE event grammar
+  (`message_start` / `content_block_*` / `message_delta` /
+  `message_stop`). The translator merges adjacent
+  `tool` / `user` messages into a single user-role Anthropic
+  message because the API rejects two consecutive same-role turns.
+
+For the built-in presets the picker locks `base_url`
+(`https://openrouter.ai/api/v1` for OpenRouter,
+`https://api.anthropic.com` for Anthropic) and disables the outer
+**Save** button until a `standard_model` is picked from the
+catalog — the runner has no per-preset hardcoded default and a
+blank slug would 404 on the first turn. `cheap_model` stays
+optional and falls back to `standard_model` for the same provider
+when blank (the previous fallback to the HF cheap default leaked
+an HF-only slug onto every non-HF route).
+
 API keys live in the keyring under `service=moon-ide`,
 `account=coder-provider:<id>`. The Tauri commands shipping this:
 
 - `coder_new_provider_id` — allocates the opaque id (keyring slot is
   addressable before the config lands in `AppState`).
-- `coder_probe_provider` — `GET <base_url>/models` first, fallback
-  to a 1-token `chat/completions` ping on 404. Lets the picker
-  verify before saving without committing a half-broken config.
+- `coder_probe_provider { base_url, api_key, kind }` —
+  `GET <base_url>/models` for OpenAI-compat kinds (fallback to a
+  1-token `chat/completions` ping on 404), or `GET /v1/models`
+  with the Anthropic auth headers for `kind=anthropic`. Lets the
+  picker verify before saving without committing a half-broken
+  config.
 - `coder_save_provider` / `coder_delete_provider` — atomic
   per-provider commits straight into `AppState`.
 - `coder_set_provider_api_key` / `coder_clear_provider_api_key` —
   keyring-only; secrets never round-trip through the model-settings
   read.
-- `coder_list_provider_models { id }` — flat
-  `[{ id, owned_by? }]` for the picker; differs from `coder_list_models`
-  which returns the rich HF catalog with per-route pricing.
+- `coder_list_provider_models { id }` — flat catalog for the
+  picker; the runner picks the right wire shape based on the
+  provider's `kind` (OpenAI-compat `/v1/models` for
+  `custom`/`open_router`, Anthropic native for `anthropic`).
+  Differs from `coder_list_models`, which returns the rich HF
+  catalog with per-route pricing.
 
 The picker hides the "Bill to" field when a user provider is
 active, renders a flat catalog (since pricing / throughput aren't
@@ -342,16 +384,14 @@ The 401-refresh behaviour stays HF-only: a user provider that
 returns 401 surfaces the error to the user — there's no refresh
 token, just an API key the user has to fix in the picker.
 
-#### Prompt caching (Anthropic via OpenRouter)
+#### Prompt caching (Anthropic, native or via OpenRouter)
 
-Anthropic prompt caching is opt-in (unlike DeepSeek / Gemini Flash / GPT‑4o, which auto-cache on prefix match), so by default zero caching happens on a Claude model regardless of how repetitive the request is. The IDE enables it automatically when:
+Anthropic prompt caching is opt-in (unlike DeepSeek / Gemini Flash / GPT‑4o, which auto-cache on prefix match), so by default zero caching happens on a Claude model regardless of how repetitive the request is. The IDE enables it automatically on every Anthropic-bound request, regardless of how it's routed:
 
-1. The active provider's `base_url` contains `openrouter.ai`, **and**
-2. The model id starts with `anthropic/`.
+- **`kind=anthropic`** (native `/v1/messages`): the translator marks the last block of the system prompt and the last block of the most recent user-role message with `cache_control: {type: "ephemeral"}` directly on the Anthropic-native content blocks.
+- **`kind=open_router`** (OpenAI-compat through OpenRouter to an `anthropic/*` slug): the inference layer flips selected messages onto the blocks-array shape `{role, content: [{type: "text", text: "...", cache_control: {type: "ephemeral"}}]}` for those messages only — OpenRouter normalises the `cache_control` marker into Anthropic's native shape on the way through. Other messages keep the string form, so the wire shape stays byte-for-byte identical to the no-caching path for every other provider.
 
-Together this means OpenRouter is the only path that produces cached requests today; a hypothetical custom provider pointed at `api.anthropic.com` would also need a translation layer for the native `/v1/messages` shape and is out of scope.
-
-Mechanism: instead of sending each message as `{role, content: "string"}`, the inference layer flips selected messages onto the blocks-array shape `{role, content: [{type: "text", text: "...", cache_control: {type: "ephemeral"}}]}` for those messages only. Other messages keep the string form, so the wire shape stays byte-for-byte identical to the no-caching path for every other provider. Non-Anthropic providers see no `cache_control` at all because `cache_breakpoint_indexes` returns an empty list and `build_wire_messages` then degenerates to the original `String` content.
+Non-Anthropic providers see no `cache_control` at all because `cache_breakpoint_indexes` returns an empty list and `build_wire_messages` then degenerates to the original `String` content. The same is true for `kind=custom` providers regardless of slug — the marker only fires when the route's `kind` says caching is meaningful.
 
 Breakpoint placement (`cache_breakpoint_indexes` in `crates/moon-coder/src/inference.rs`) uses two of Anthropic's four allowed markers per request:
 

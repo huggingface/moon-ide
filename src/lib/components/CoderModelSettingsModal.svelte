@@ -37,8 +37,46 @@
 	// `slug ?? name` as the wire value, `name` as the display label.
 
 	import { coder } from '../coder.svelte';
-	import type { CoderModelSettings, CoderProviderConfig, RouterModel, RouterProvider } from '../protocol';
+	import type { CoderModelSettings, CoderProviderConfig, ProviderKind, RouterModel, RouterProvider } from '../protocol';
 	import { onMount } from 'svelte';
+
+	// Built-in provider presets surfaced in the `+ Add provider`
+	// row. Each preset locks the base URL, threads its `kind`
+	// through the probe / save commands so the backend hits the
+	// right wire shape, and links to the upstream key dashboard.
+	// The list lives next to the modal because it's pure UI
+	// chrome — the runner-side code is keyed off
+	// `CoderProviderConfig.kind`, not these labels.
+	type BuiltinPreset = {
+		kind: ProviderKind;
+		label: string;
+		base_url: string;
+		api_key_placeholder: string;
+		api_key_dashboard_url: string;
+		api_key_dashboard_label: string;
+	};
+	const BUILTIN_PRESETS: readonly BuiltinPreset[] = [
+		{
+			kind: 'open_router',
+			label: 'OpenRouter',
+			base_url: 'https://openrouter.ai/api/v1',
+			api_key_placeholder: 'sk-or-...',
+			api_key_dashboard_url: 'https://openrouter.ai/settings/keys',
+			api_key_dashboard_label: 'openrouter.ai/settings/keys',
+		},
+		{
+			kind: 'anthropic',
+			label: 'Anthropic',
+			base_url: 'https://api.anthropic.com',
+			api_key_placeholder: 'sk-ant-...',
+			api_key_dashboard_url: 'https://console.anthropic.com/settings/keys',
+			api_key_dashboard_label: 'console.anthropic.com/settings/keys',
+		},
+	];
+
+	function presetForKind(kind: ProviderKind): BuiltinPreset | null {
+		return BUILTIN_PRESETS.find((p) => p.kind === kind) ?? null;
+	}
 
 	type Props = { onClose: () => void };
 	let { onClose }: Props = $props();
@@ -69,6 +107,7 @@
 	type ProviderDraft = {
 		id: string;
 		label: string;
+		kind: ProviderKind;
 		base_url: string;
 		api_key: string; // local-only; never read back from the keyring
 		is_new: boolean;
@@ -187,13 +226,15 @@
 		expandedModelId = null;
 	}
 
-	function openAddProvider(): void {
+	function openAddProvider(kind: ProviderKind): void {
 		void (async () => {
 			const id = await coder.newProviderId();
+			const preset = presetForKind(kind);
 			providerDraft = {
 				id,
-				label: '',
-				base_url: '',
+				label: preset?.label ?? '',
+				kind,
+				base_url: preset?.base_url ?? '',
 				api_key: '',
 				is_new: true,
 			};
@@ -210,6 +251,7 @@
 		providerDraft = {
 			id: entry.id,
 			label: entry.label,
+			kind: entry.kind,
 			base_url: entry.base_url,
 			api_key: '',
 			is_new: false,
@@ -238,7 +280,7 @@
 		probeError = null;
 		probeMessage = null;
 		try {
-			const result = await coder.probeProvider(baseUrl, providerDraft.api_key.trim());
+			const result = await coder.probeProvider(baseUrl, providerDraft.api_key.trim(), providerDraft.kind);
 			if (result.model_count > 0) {
 				const sample = result.sample_model_ids.slice(0, 3).join(', ');
 				probeMessage = `OK — ${result.model_count} model${result.model_count === 1 ? '' : 's'} reachable${sample ? ` (e.g. ${sample}).` : '.'}`;
@@ -275,6 +317,7 @@
 			const next: CoderProviderConfig = {
 				id: draft.id,
 				label,
+				kind: draft.kind,
 				base_url: baseUrl,
 				standard_model: existing?.standard_model ?? '',
 				cheap_model: existing?.cheap_model ?? '',
@@ -288,6 +331,14 @@
 				providers = cloneProviders(coder.modelSettings.providers);
 			}
 			coder.forgetProviderModels(draft.id);
+			// Switch the active provider to the new entry so the
+			// catalog tab below loads its `/v1/models` automatically
+			// — for built-in presets the user still has to pick a
+			// standard model from there before the outer Save
+			// button enables.
+			if (draft.is_new) {
+				switchActiveProvider(draft.id);
+			}
 			closeProviderDraft();
 		} catch (err) {
 			probeError = err instanceof Error ? err.message : String(err);
@@ -607,6 +658,19 @@
 	// below) is always available regardless of org consent.
 	const orgs = $derived((coder.status?.identity?.orgs ?? []).filter((o) => o.role_in_org !== null));
 
+	// Built-in providers (OpenRouter, Anthropic) require an
+	// explicit standard-model pick from the catalog before Save
+	// can fire — there's no sensible hardcoded default per
+	// preset, and an empty slug would 404 on the first turn. The
+	// HF route and free-form Custom providers stay loose: HF has
+	// a backend-side default; Custom is intentionally hand-edit
+	// territory.
+	const requiresStandardPick = $derived(
+		activeProvider !== null && (activeProvider.kind === 'open_router' || activeProvider.kind === 'anthropic'),
+	);
+	const standardModelSelected = $derived(standardModel.trim().length > 0);
+	const saveBlockedBecauseNoStandard = $derived(requiresStandardPick && !standardModelSelected);
+
 	async function onSave(): Promise<void> {
 		saving = true;
 		saveError = null;
@@ -703,13 +767,27 @@
 					{/if}
 				</button>
 			{/each}
-			<button type="button" class="provider-tab add" onclick={openAddProvider}>+ Add provider</button>
+			<span class="provider-add-row">
+				<span class="provider-add-label">+ Add</span>
+				{#each BUILTIN_PRESETS as preset (preset.kind)}
+					<button
+						type="button"
+						class="provider-tab add"
+						onclick={() => openAddProvider(preset.kind)}
+						title={preset.base_url}
+					>
+						{preset.label}
+					</button>
+				{/each}
+				<button type="button" class="provider-tab add" onclick={() => openAddProvider('custom')}>Custom…</button>
+			</span>
 			{#if activeProvider !== null}
 				<button type="button" class="provider-edit" onclick={() => openEditProvider(activeProvider.id)}>Edit</button>
 			{/if}
 		</section>
 
 		{#if providerDraft !== null}
+			{@const preset = presetForKind(providerDraft.kind)}
 			<section class="provider-draft" aria-label="Provider details">
 				<div class="draft-grid">
 					<label class="field">
@@ -717,20 +795,32 @@
 						<input
 							type="text"
 							bind:value={providerDraft.label}
-							placeholder="OpenRouter"
+							placeholder={preset?.label ?? 'My provider'}
 							spellcheck="false"
 							autocomplete="off"
 						/>
 					</label>
 					<label class="field">
-						<span class="label-row"><span class="label-name">Base URL</span></span>
+						<span class="label-row">
+							<span class="label-name">Base URL</span>
+							{#if preset !== null}
+								<span class="key-status configured">{preset.label} preset</span>
+							{/if}
+						</span>
 						<input
 							type="text"
 							bind:value={providerDraft.base_url}
-							placeholder="https://openrouter.ai/api/v1"
+							placeholder={preset?.base_url ?? 'https://example.com/v1'}
 							spellcheck="false"
 							autocomplete="off"
+							readonly={preset !== null}
 						/>
+						{#if preset !== null}
+							<span class="hint">
+								Built-in preset — URL is locked to the upstream API root. Pick <em>Custom…</em> instead if you need a different
+								endpoint.
+							</span>
+						{/if}
 					</label>
 					<label class="field draft-key">
 						<span class="label-row">
@@ -747,11 +837,18 @@
 						<input
 							type="password"
 							bind:value={providerDraft.api_key}
-							placeholder={providerDraft.is_new ? 'sk-or-...' : 'Paste a new key to replace'}
+							placeholder={providerDraft.is_new
+								? (preset?.api_key_placeholder ?? 'sk-...')
+								: 'Paste a new key to replace'}
 							spellcheck="false"
 							autocomplete="off"
 						/>
 						<span class="hint">
+							{#if preset !== null}
+								Get a key at <a href={preset.api_key_dashboard_url} target="_blank" rel="noreferrer noopener">
+									{preset.api_key_dashboard_label}
+								</a>.
+							{/if}
 							Stored in your OS keyring, never read back into this dialog. Leave blank for keyless local servers (<code
 								>localhost</code
 							>, <code>*.local</code>).
@@ -1097,9 +1194,15 @@
 			{#if saveError}
 				<p class="error">{saveError}</p>
 			{/if}
+			{#if saveBlockedBecauseNoStandard}
+				<p class="hint footer-hint">
+					Pick a standard model from the catalog below to enable Save. Cheap model is optional — it falls back to the
+					standard slug when blank.
+				</p>
+			{/if}
 			<div class="footer-actions">
 				<button type="button" class="secondary" onclick={onCancel} disabled={saving}>Cancel</button>
-				<button type="button" class="primary" onclick={onSave} disabled={saving}>
+				<button type="button" class="primary" onclick={onSave} disabled={saving || saveBlockedBecauseNoStandard}>
 					{saving ? 'Saving…' : 'Save'}
 				</button>
 			</div>
@@ -1510,6 +1613,26 @@
 	.provider-tab.add {
 		border-style: dashed;
 		color: var(--m-fg-muted);
+	}
+	.provider-add-row {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		padding-left: 4px;
+		border-left: 1px solid var(--m-border, transparent);
+		margin-left: 4px;
+	}
+	.provider-add-label {
+		font-size: 10px;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		color: var(--m-fg-muted);
+		padding-right: 2px;
+	}
+	.footer-hint {
+		font-size: 11px;
+		color: var(--m-fg-muted);
+		margin: 0;
 	}
 	.provider-tab-flag {
 		font-size: 9px;

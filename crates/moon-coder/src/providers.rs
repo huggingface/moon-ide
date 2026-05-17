@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use moon_protocol::coder_models::ProviderProbeResult;
+use moon_protocol::coder_models::{ProviderKind, ProviderProbeResult};
 use serde::Deserialize;
 
 use crate::error::CoderError;
@@ -222,9 +222,15 @@ pub fn new_provider_id() -> String {
 ///
 /// `api_key` empty = no `Authorization` header sent. The probe
 /// fails fast on 401 / 403 so a key typo is loud at save time.
+///
+/// `kind` selects the probe path: [`ProviderKind::Anthropic`]
+/// hits Anthropic's native `/v1/models` with the
+/// `x-api-key` + `anthropic-version` headers, everything else
+/// uses the OpenAI-compat shape (`Authorization: Bearer …`).
 pub async fn probe_provider(
 	http: &reqwest::Client,
 	base_url: &str,
+	kind: ProviderKind,
 	api_key: Option<&str>,
 ) -> Result<ProviderProbeResult, CoderError> {
 	let trimmed = base_url.trim_end_matches('/');
@@ -233,6 +239,10 @@ pub async fn probe_provider(
 			"coder_probe_provider",
 			"base_url must not be empty",
 		));
+	}
+
+	if matches!(kind, ProviderKind::Anthropic) {
+		return crate::anthropic::probe(http, trimmed, api_key).await;
 	}
 
 	match probe_models(http, trimmed, api_key).await {

@@ -15,6 +15,7 @@
 //! - [`specs/decisions/0010-coder-rewrite-not-acp.md`](../../../specs/decisions/0010-coder-rewrite-not-acp.md)
 //! - [`specs/roadmaps/phase-06-coder.md`](../../../specs/roadmaps/phase-06-coder.md)
 
+pub mod anthropic;
 pub mod auth;
 pub mod compaction;
 pub mod defaults;

@@ -424,7 +424,7 @@ function applyAdditionalEdits(view: EditorView, edits: readonly LspTextEdit[]): 
 			const to = offsetFor(doc, e.range.end.line, e.range.end.character);
 			return { from, to, insert: e.newText };
 		})
-		.sort((a, b) => a.from - b.from);
+		.toSorted((a, b) => a.from - b.from);
 	if (changes.length === 0) {
 		return;
 	}
