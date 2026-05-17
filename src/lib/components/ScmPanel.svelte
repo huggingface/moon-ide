@@ -723,19 +723,21 @@
 						<PullRequestIcon />
 					</button>
 				{/if}
+				{#if changeCount > 0}
+					{@const isDefault = workspace.compareBaseline === 'default'}
+					{@const reviewBaselineLabel = isDefault && compareLabel !== null ? compareLabel : 'HEAD'}
+					<button
+						type="button"
+						class="icon-btn"
+						title={`Open aggregated diff against ${reviewBaselineLabel}`}
+						aria-label={`Open aggregated diff against ${reviewBaselineLabel}`}
+						onclick={() => workspace.openReviewTab()}
+					>
+						<ReviewIcon />
+					</button>
+				{/if}
 				{#if compareToggleApplicable}
 					{@const isDefault = workspace.compareBaseline === 'default'}
-					{#if isDefault && changeCount > 0}
-						<button
-							type="button"
-							class="icon-btn"
-							title={`Open aggregated diff against ${compareLabel}`}
-							aria-label={`Open aggregated diff against ${compareLabel}`}
-							onclick={() => workspace.openReviewTab()}
-						>
-							<ReviewIcon />
-						</button>
-					{/if}
 					<button
 						type="button"
 						class="compare-pill"

@@ -17,6 +17,12 @@
 	type Props = {
 		path: string;
 		status: GitFileStatus;
+		// Merge-base SHA when reviewing against the default branch;
+		// `null` when the active baseline is `head`, in which case
+		// `loadBase` reads `git show HEAD:<path>` via
+		// `gitHeadContent` instead. The section is keyed off this
+		// value in the parent so a baseline flip remounts and
+		// rebuilds against the right "before" content.
 		mergeBase: string | null;
 		// Eager: build the MergeView immediately at mount. Lazy: wait
 		// for the first IntersectionObserver hit. The parent passes
@@ -259,15 +265,18 @@
 
 	async function loadBase(): Promise<string> {
 		// `added` rows have no merge-base blob; an untracked file by
-		// definition isn't in git yet either. Skip the fetch.
+		// definition isn't in git yet either. Skip the fetch — left
+		// side renders empty so the diff reads as a pure addition.
 		if (status === 'added' || status === 'untracked') {
 			return '';
 		}
-		if (mergeBase === null) {
-			return '';
-		}
 		try {
-			const content = await ipc.fs.gitRefContent(mergeBase, path);
+			// `mergeBase === null` is the "vs HEAD" baseline (the
+			// review tab opened against the working tree without
+			// flipping to default-branch mode). Read the file at
+			// HEAD instead of at the merge-base SHA.
+			const content =
+				mergeBase !== null ? await ipc.fs.gitRefContent(mergeBase, path) : await ipc.fs.gitHeadContent(path);
 			return content ?? '';
 		} catch {
 			return '';

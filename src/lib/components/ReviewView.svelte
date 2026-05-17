@@ -20,13 +20,29 @@
 
 	// Filter ignored rows out — same vocabulary as `scmFilterPaths`.
 	// In `compareBaseline === 'default'` the backend already excludes
-	// ignored entries; this filter survives the future case where the
-	// review tab is opened against a different baseline.
+	// ignored entries; in `'head'` mode `git status` does include
+	// them under the `!! ` porcelain marker and the filter
+	// suppresses them here.
 	const entries: readonly GitStatusEntry[] = $derived.by(() => {
 		return workspace.gitStatusEntries.filter((e) => e.status !== 'ignored');
 	});
-	const mergeBase: string | null = $derived(workspace.defaultBranchMergeBase);
-	const branchName: string | null = $derived(workspace.defaultBranchName);
+	// `mergeBase` is non-null only when the SCM panel is set to
+	// the default-branch baseline. In HEAD mode the section
+	// fetches the previous content via `gitHeadContent` instead;
+	// `null` here is the explicit signal for "use HEAD".
+	const mergeBase: string | null = $derived(
+		workspace.compareBaseline === 'default' ? workspace.defaultBranchMergeBase : null,
+	);
+	// Banner label: "vs <branch>" in default-branch mode (matches
+	// the GitHub-style PR review framing); "vs HEAD" in
+	// working-tree mode (the equivalent of opening every changed
+	// file's individual diff at once).
+	const baselineLabel: string = $derived.by(() => {
+		if (workspace.compareBaseline === 'default') {
+			return shortRef(workspace.defaultBranchName);
+		}
+		return 'HEAD';
+	});
 
 	function registerSection(path: string, el: HTMLElement | null) {
 		if (el === null) {
@@ -153,16 +169,21 @@
 >
 	<div class="banner">
 		<span class="title">Review changes</span>
-		{#if branchName !== null}
-			<span class="vs">vs {shortRef(branchName)}</span>
+		{#if baselineLabel.length > 0}
+			<span class="vs">vs {baselineLabel}</span>
 		{/if}
 		<span class="counts">{entries.length} file{entries.length === 1 ? '' : 's'}</span>
 	</div>
 	{#if entries.length === 0}
-		<div class="empty">No changes against {shortRef(branchName) || 'the default branch'}.</div>
+		<div class="empty">No changes against {baselineLabel.length > 0 ? baselineLabel : 'the baseline'}.</div>
 	{:else}
 		<div class="stack">
-			{#each entries as entry, i (entry.path)}
+			<!-- Baseline is part of the key so toggling the SCM
+				 panel's `vs <default>` pill remounts the sections
+				 with a fresh `mergeBase` prop. Without it the
+				 sections would keep rendering against the prior
+				 baseline (build runs once on mount). -->
+			{#each entries as entry, i (`${entry.path}|${mergeBase ?? 'HEAD'}`)}
 				<ReviewSection path={entry.path} status={entry.status} {mergeBase} eager={i < 2} {registerSection} />
 			{/each}
 		</div>

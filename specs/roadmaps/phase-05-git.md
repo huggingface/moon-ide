@@ -214,13 +214,14 @@ The right-side-of-the-folder-bar SCM panel:
   pill suppresses itself on the default branch and when no
   default branch resolves; it stacks orthogonally with the
   changes-only filter.
-- **Review changes** entry point. When the baseline is
-  `'default'` and there's at least one entry, a "stacked diff"
-  icon button appears just before the `vs main` pill. Click
-  opens (or focuses) the **Review changes** pseudo-tab — a
-  scrollable stack of per-file diff sections against the
-  merge-base, the same view a reviewer would see on a PR. See
-  §5.4 for the tab itself.
+- **Review changes** entry point. Whenever there's at least one
+  entry, a "stacked diff" icon button appears in the SCM panel
+  header (just before the `vs main` pill in default-branch mode,
+  on its own when the pill is hidden). Click opens (or focuses)
+  the **Review changes** pseudo-tab — a scrollable stack of
+  per-file diff sections against the active baseline (merge-base
+  in `'default'` mode, `HEAD` in `'head'` mode). See §5.4 for the
+  tab itself.
 - **Periodic auto-fetch.** `WorkspaceHost::git_fetch` shells out
   to `git fetch --quiet --no-tags` with prompts disabled
   (`GIT_TERMINAL_PROMPT=0`, blanked `GIT_ASKPASS` /
@@ -330,13 +331,15 @@ existing changes-tree gives a list but not a "scroll through every
 diff" surface. The Review changes pseudo-tab is that surface.
 
 **Entry point.** The SCM panel header paints a stacked-diff icon
-button immediately to the left of the `vs <default>` pill,
-visible only when
-
-- the per-folder compare baseline is `'default'` (so we have a
-  merge-base SHA and `gitStatusEntries` already reflects
-  branch-vs-base), and
-- there's at least one changed entry.
+button immediately to the left of the `vs <default>` pill, visible
+whenever there's at least one changed entry — regardless of the
+active compare baseline. The icon's tooltip names the active
+baseline so a click is never ambiguous: `Open aggregated diff
+against main` in default-branch mode, `Open aggregated diff
+against HEAD` in working-tree mode. Even users sitting on the
+default branch (where the `vs <default>` pill is hidden because
+the comparison is degenerate) can still review their staged /
+unstaged work.
 
 Click opens or focuses the review tab in the current pane.
 
@@ -348,16 +351,29 @@ scheme so every gate that would otherwise route to the host
 persistence, format-on-save) skips it via the unified
 `isSyntheticBufferPath` helper. The synthetic buffer carries
 empty bytes; all data flows in through reactive reads of
-`workspace.gitStatusEntries` and
+`workspace.gitStatusEntries`, `workspace.compareBaseline`, and
 `workspace.defaultBranchMergeBase` inside `ReviewView.svelte`.
 
 `EditorPane.svelte` recognises the prefix and mounts
 `ReviewView` instead of `Editor` / `DiffView`. The view renders
 a scrollable stack of `ReviewSection`s, one per non-ignored
-entry — each a read-only `MergeView` with left = merge-base
-blob (`ipc.fs.gitRefContent(mergeBase, path)`) and right = the
-open buffer text (so unsaved edits show up in the review) or a
-fresh `readFile` if the buffer isn't loaded.
+entry. Each is a read-only `MergeView` with the open buffer
+text (so unsaved edits show up in the review) or a fresh
+`readFile` on the right; the left side comes from one of two
+sources depending on the active baseline:
+
+- **Default-branch mode** (`compareBaseline === 'default'` and
+  the merge-base SHA resolved): `ipc.fs.gitRefContent(mergeBase,
+path)` — same view a reviewer would see on a PR.
+- **Working-tree mode** (`compareBaseline === 'head'` or no
+  merge-base): `ipc.fs.gitHeadContent(path)` — the equivalent
+  of opening every changed file's individual `DiffView` at
+  once.
+
+`mergeBase` is woven into the section's `(path | mergeBase)`
+key so toggling the SCM panel's `vs <default>` pill while the
+review tab is open remounts every section against the right
+"before" content instead of leaving stale builds on screen.
 
 **Unchanged regions collapse.** Each section runs `MergeView`
 with `collapseUnchanged: { margin: 3, minSize: 5 }` so long
