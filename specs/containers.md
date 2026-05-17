@@ -169,7 +169,12 @@ After binding moon-landing into a moon-ide workspace:
   flips its container glyph to red and the popover lists
   `gitaly · exited (1)`. The workspace shell stays up — the user can still
   open a terminal — and "Recreate" / "Down" sit on the
-  popover.
+  popover. The status freshens via two pollers (see
+  `crates/moon-ide/src/lib/projectCompose.svelte.ts`): a coarse
+  15 s background poll across every bound folder so closed-popover
+  bars catch silent crashes, and a tight 2 s poll on the folder
+  whose popover is open so the in-flight `up -d --wait` view
+  doesn't freeze on the pre-mutation snapshot.
 - The user's app continues to run wherever it ran before —
   on the host (reaching services through published host
   ports, exactly as today) or, once Phase 2.1 routes
@@ -839,6 +844,36 @@ Forwards bind `127.0.0.1` exclusively. A `0.0.0.0` toggle
 (reach the workspace's dev server from another device on the
 LAN) is deferred until somebody concretely asks for it — see
 AGENTS.md's "hardcode first, configure later".
+
+### Server inside the container must listen on `0.0.0.0`
+
+The proxy sidecar is a **separate** container on the workspace
+default network. Its socat connects to the dev container by its
+compose service name (`dev:<port>`), which the daemon's embedded
+DNS resolves to dev's bridge IP — _not_ its loopback. A server
+bound to `127.0.0.1:<port>` inside the dev container is only
+listening on dev's loopback interface, so the sidecar can't
+reach it.
+
+Practical consequence: dev servers need their "all interfaces"
+flag.
+
+- `vite --host` (or `host: true` in `vite.config.ts`)
+- `bun --host=0.0.0.0` / `bun dev` with `Bun.serve({ hostname: "0.0.0.0", ... })`
+- `next dev -H 0.0.0.0`
+- `python -m http.server --bind 0.0.0.0`
+
+Database / cache images (`mongo`, `postgres`, `redis`) ship with
+their listeners on `0.0.0.0` already; that's why the side-
+container path through `mongodb://mongo:27017` worked without
+the `--host` ceremony.
+
+A future iteration could side-step this by chaining a second
+sidecar in `--network container:dev` mode that bridges dev's
+loopback onto its bridge IP, but it's two containers per
+workspace and the `--host` workaround is one-line in every
+mainstream framework. Hardcode the loopback-only contract,
+configure later.
 
 ### What's not in scope
 

@@ -62,6 +62,21 @@ export type ProjectComposeInFlight =
  */
 const PANEL_POLL_INTERVAL_MS = 2000;
 
+/**
+ * Coarse background poll for every bound folder's compose
+ * snapshot. The popover's 2 s poll only fires while it's open;
+ * a service that crashes silently (mongo OOMs, a healthcheck
+ * flips unhealthy) would otherwise leave the folder bar's
+ * indicator green until the user happens to re-open the popover.
+ * 15 s is the sweet spot — fresh enough that a crashed service
+ * shows red within a third of a minute, infrequent enough to be
+ * a nothingburger on the daemon (one `docker compose ps` per
+ * bound folder per cycle, and the Rust side caches the
+ * compose-file probe in-process so absent-compose folders cost
+ * a single `stat`).
+ */
+const BACKGROUND_POLL_INTERVAL_MS = 15_000;
+
 class ProjectComposeStateStore {
 	/** Per-folder snapshot cache. Key is the folder's absolute path. */
 	#snapshots = new SvelteMap<string, ProjectComposeStatus>();
@@ -80,6 +95,13 @@ class ProjectComposeStateStore {
 	 * open so service-level state updates without waiting for the
 	 * mutation to resolve. */
 	#pollers = new Map<string, ReturnType<typeof setInterval>>();
+
+	/** Coarse background poller — refreshes every snapshot we've
+	 * ever seen so closed-popover folder bars don't sit on stale
+	 * `running`/`green` indicators after a service crashes. Set
+	 * once the workspace mounts; cleared on workspace teardown via
+	 * `forgetAll`. */
+	#backgroundPoller: ReturnType<typeof setInterval> | null = null;
 
 	#unlisten: UnlistenFn[] = [];
 	#runtimeWired = false;
@@ -104,6 +126,24 @@ class ProjectComposeStateStore {
 			// hand back fresh snapshots in their command result;
 			// we just miss out on background event updates.
 		}
+		this.#startBackgroundPolling();
+	}
+
+	#startBackgroundPolling(): void {
+		if (this.#backgroundPoller !== null) {
+			return;
+		}
+		this.#backgroundPoller = setInterval(() => {
+			void this.#refreshAllKnownFolders();
+		}, BACKGROUND_POLL_INTERVAL_MS);
+	}
+
+	async #refreshAllKnownFolders(): Promise<void> {
+		const folders = Array.from(this.#snapshots.keys());
+		if (folders.length === 0) {
+			return;
+		}
+		await Promise.all(folders.map((p) => this.refresh(p)));
 	}
 
 	/** Reactive lookup. `undefined` until the folder's first poll. */

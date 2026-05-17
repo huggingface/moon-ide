@@ -156,6 +156,12 @@
 			Bind <code>127.0.0.1:&lt;host&gt;</code> on this machine to <code>&lt;container&gt;</code> inside the workspace
 			dev container. Edits never recreate <code>dev</code> — only the proxy sidecar.
 		</p>
+		<p class="hint">
+			Your server inside the container must listen on
+			<code>0.0.0.0</code> (e.g. <code>vite --host</code>, <code>bun --host=0.0.0.0</code>,
+			<code>next dev -H 0.0.0.0</code>). A bare <code>localhost</code>-only listener can't be reached from the proxy
+			sidecar.
+		</p>
 	</header>
 	{#if drafts.length === 0}
 		<p class="empty">No forwards declared. Add one below.</p>
