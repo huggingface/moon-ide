@@ -22,4 +22,20 @@ import type { CoderProviderConfig } from "./CoderProviderConfig";
  *
  * [`providers`]: Self::providers
  */
-export type CoderModelSettings = { standard_model: string, cheap_model: string, bill_to: string, active_provider?: string | null, providers: Array<CoderProviderConfig>, };
+export type CoderModelSettings = { standard_model: string, cheap_model: string, bill_to: string, active_provider?: string | null, providers: Array<CoderProviderConfig>, 
+/**
+ * Per-slug context-window caps in tokens. See
+ * [`crate::app_state::CoderAppState::context_window_overrides`]
+ * for the wire-shape rationale; this field round-trips the
+ * same map through the picker so the user can edit the cap
+ * next to the model field.
+ *
+ * Slug is the full wire id used at the call site (with any
+ * `:provider` suffix for HF, bare id for user providers).
+ * `None` / missing entry = use the model's catalog window
+ * directly. The runner clamps to `min(catalog, cap)` at
+ * every [`moon_coder::CoderModels::context_window`] call
+ * site so the usage ring + auto-compaction respect the cap
+ * the same way they respect the actual window.
+ */
+context_window_overrides: { [key in string]: number }, };

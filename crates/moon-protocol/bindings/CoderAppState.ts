@@ -73,4 +73,27 @@ providers: Array<CoderProviderConfig>,
  * to HF on a mismatch (e.g. the entry was deleted out of
  * band) and a `tracing::warn!` notes the orphan.
  */
-active_provider: string | null, };
+active_provider: string | null, 
+/**
+ * Per-slug context-window caps in tokens. Slug =
+ * [`CoderModels::context_window`]'s lookup key — the full
+ * wire model id including any `:provider` suffix
+ * (`Qwen/Qwen3.5-397B-A17B:scaleway`) for HF or the bare
+ * id (`anthropic/claude-opus-4`) for user providers. When
+ * the map carries an entry for the slug the runner returns
+ * `min(catalog_window, cap)` instead of the raw catalog
+ * number.
+ *
+ * Use case: a model that technically advertises a 1M-token
+ * window but performs measurably worse past ~250k. Capping
+ * here arms compaction earlier and keeps the usage ring
+ * honest without forcing the user to remember to switch
+ * models.
+ *
+ * Empty map = no caps. Caps for slugs no longer in the
+ * active picks are kept on disk so flipping back picks the
+ * cap up again — there's no GC because the storage cost is
+ * trivial and dropping live entries on a model swap would
+ * be more surprising than helpful.
+ */
+context_window_overrides: { [key in string]: number }, };

@@ -365,6 +365,7 @@ pub fn run() {
 				},
 				providers: loaded_state.coder.providers.clone(),
 				active_provider: loaded_state.coder.active_provider.clone(),
+				context_window_overrides: std::sync::Arc::new(loaded_state.coder.context_window_overrides.clone()),
 				..moon_coder::CoderModels::default()
 			};
 			let coder = CoderHandle::new(

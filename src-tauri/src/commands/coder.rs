@@ -297,6 +297,11 @@ pub async fn coder_get_model_settings(state: State<'_, AppState>) -> Result<Code
 		bill_to: models.bill_to.unwrap_or_default(),
 		active_provider: models.active_provider,
 		providers: models.providers,
+		// Clone out of the `Arc<HashMap>`: the picker mutates
+		// the map locally and round-trips it back in
+		// `coder_set_model_settings`; sharing the `Arc` would
+		// risk a write through a stale clone.
+		context_window_overrides: (*models.context_window_overrides).clone(),
 	})
 }
 
@@ -323,11 +328,13 @@ pub async fn coder_set_model_settings(
 	};
 	let providers_for_runner = settings.providers.clone();
 	let active_for_runner = settings.active_provider.clone();
+	let overrides_for_runner = settings.context_window_overrides.clone();
 	state
 		.coder
 		.set_user_picks(settings.standard_model.clone(), settings.cheap_model.clone(), bill_to)
 		.await;
 	state.coder.set_providers(providers_for_runner, active_for_runner).await;
+	state.coder.set_context_window_overrides(overrides_for_runner).await;
 
 	app_state_store::mutate(&state.config_dir, move |s| {
 		s.coder.standard_model = settings.standard_model;
@@ -345,6 +352,15 @@ pub async fn coder_set_model_settings(
 				p.has_api_key = false;
 				p
 			})
+			.collect();
+		// Drop `0`-valued entries on persist: they're already
+		// treated as "no cap" at the runtime boundary, but
+		// keeping them on disk would litter `state.json` with
+		// inert rows after every `Clear` gesture.
+		s.coder.context_window_overrides = settings
+			.context_window_overrides
+			.into_iter()
+			.filter(|(_, v)| *v > 0)
 			.collect();
 	})
 	.await?;

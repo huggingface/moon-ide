@@ -1371,6 +1371,14 @@ export type CoderModelSettings = {
 	bill_to: string;
 	active_provider: string | null;
 	providers: CoderProviderConfig[];
+	/** Per-slug context-window cap in tokens. Slug = full wire id
+	 *  (with any `:provider` suffix for HF, bare id for user
+	 *  providers). Missing entry / value `0` = use the model's
+	 *  catalog window directly; the runner clamps with
+	 *  `min(catalog, cap)` everywhere `context_window` is read
+	 *  (usage ring, auto-compaction). Use case: capping a 1M-window
+	 *  model at 250k where quality degrades past that point. */
+	context_window_overrides: Record<string, number>;
 };
 
 /** Result of `coder_probe_provider`. Mirrors

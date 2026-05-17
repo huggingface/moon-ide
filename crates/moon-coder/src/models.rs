@@ -94,6 +94,13 @@ pub struct CoderModels {
 	/// the whole [`CoderModels`] for snapshot reads a pointer copy
 	/// regardless of catalog size (~1k entries).
 	pub context_windows: Arc<HashMap<String, u32>>,
+	/// User-set per-slug context-window caps. Mirrors
+	/// [`moon_protocol::app_state::CoderAppState::context_window_overrides`]
+	/// at runtime. [`Self::context_window`] applies the cap with
+	/// `min(catalog, override)` so the usage ring and the
+	/// auto-compaction threshold both respect "this model is
+	/// better at 250k even though it advertises 1M".
+	pub context_window_overrides: Arc<HashMap<String, u32>>,
 }
 
 impl Default for CoderModels {
@@ -105,6 +112,7 @@ impl Default for CoderModels {
 			providers: Vec::new(),
 			active_provider: None,
 			context_windows: Arc::new(HashMap::new()),
+			context_window_overrides: Arc::new(HashMap::new()),
 		}
 	}
 }
@@ -284,7 +292,26 @@ impl CoderModels {
 	/// model. The cache fills in as soon as the picker has been
 	/// opened once (HF-only — user providers don't populate the
 	/// catalog).
+	///
+	/// User-set caps from
+	/// [`Self::context_window_overrides`] clamp the result with
+	/// `min(catalog, override)`. Lookup tries the full slug then
+	/// the suffix-stripped base — same precedence as the catalog
+	/// lookup, so a cap entered against `Qwen/...:scaleway`
+	/// applies to that slug only while a cap on the bare id
+	/// applies to every `:provider` flavour. Caps strictly
+	/// below `1` collapse to no cap (defensive against the
+	/// frontend persisting a `0` from a cleared input).
 	pub fn context_window(&self, slug: &str) -> u32 {
+		let actual = self.catalog_context_window(slug);
+		let cap = self.cap_for(slug).filter(|c| *c > 0);
+		match cap {
+			Some(c) => actual.min(c),
+			None => actual,
+		}
+	}
+
+	fn catalog_context_window(&self, slug: &str) -> u32 {
 		if let Some(&w) = self.context_windows.get(slug) {
 			return w;
 		}
@@ -295,6 +322,23 @@ impl CoderModels {
 			}
 		}
 		context_window_for(slug)
+	}
+
+	/// User-set context-window cap for `slug`, or `None` when
+	/// none is set. Same lookup discipline as the catalog: full
+	/// slug first, then `:provider` suffix stripped, so
+	/// model-wide caps apply to every routed flavour.
+	pub fn cap_for(&self, slug: &str) -> Option<u32> {
+		if let Some(&c) = self.context_window_overrides.get(slug) {
+			return Some(c);
+		}
+		let base = strip_provider_suffix(slug);
+		if base != slug {
+			if let Some(&c) = self.context_window_overrides.get(base) {
+				return Some(c);
+			}
+		}
+		None
 	}
 }
 
@@ -418,5 +462,72 @@ mod tests {
 		assert_eq!(models.context_window("anthropic/claude-opus-4"), 1_000_000);
 		assert_eq!(models.context_window("anthropic/claude-opus-4:fastest"), 1_000_000);
 		assert_eq!(models.context_window("Qwen/Qwen3.5-397B-A17B"), 256_000);
+	}
+
+	#[test]
+	fn user_cap_clamps_catalog_window_and_falls_back_when_no_cap() {
+		let mut models = CoderModels::default();
+		let mut cache = HashMap::new();
+		cache.insert("anthropic/claude-opus-4".to_owned(), 1_000_000u32);
+		models.context_windows = Arc::new(cache);
+		let mut caps = HashMap::new();
+		caps.insert("anthropic/claude-opus-4".to_owned(), 250_000u32);
+		models.context_window_overrides = Arc::new(caps);
+
+		assert_eq!(models.context_window("anthropic/claude-opus-4"), 250_000);
+		// Provider-suffixed slug: bare-id cap applies through the
+		// suffix-strip fallback.
+		assert_eq!(models.context_window("anthropic/claude-opus-4:fastest"), 250_000);
+		// Different model: no cap, no clamp.
+		assert_eq!(models.context_window("Qwen/Qwen3.5-397B-A17B"), 256_000);
+	}
+
+	#[test]
+	fn user_cap_above_catalog_does_not_inflate_window() {
+		let mut models = CoderModels::default();
+		let mut cache = HashMap::new();
+		cache.insert("openai/gpt-4o-mini".to_owned(), 128_000u32);
+		models.context_windows = Arc::new(cache);
+		let mut caps = HashMap::new();
+		caps.insert("openai/gpt-4o-mini".to_owned(), 1_000_000u32);
+		models.context_window_overrides = Arc::new(caps);
+
+		// `min(128k, 1M)` — capping above catalog is a no-op,
+		// not a window inflation.
+		assert_eq!(models.context_window("openai/gpt-4o-mini"), 128_000);
+	}
+
+	#[test]
+	fn cap_of_zero_is_treated_as_no_cap() {
+		// Defensive against the frontend persisting a cleared
+		// input as `0` instead of removing the entry: a literal
+		// 0-token cap would lock the runner out of every call.
+		let mut models = CoderModels::default();
+		let mut cache = HashMap::new();
+		cache.insert("anthropic/claude-opus-4".to_owned(), 1_000_000u32);
+		models.context_windows = Arc::new(cache);
+		let mut caps = HashMap::new();
+		caps.insert("anthropic/claude-opus-4".to_owned(), 0u32);
+		models.context_window_overrides = Arc::new(caps);
+
+		assert_eq!(models.context_window("anthropic/claude-opus-4"), 1_000_000);
+	}
+
+	#[test]
+	fn provider_specific_cap_does_not_apply_to_other_routes() {
+		// Cap pinned with the `:provider` suffix should clamp
+		// only the matching wire slug; the bare id stays
+		// uncapped.
+		let mut models = CoderModels::default();
+		let mut cache = HashMap::new();
+		cache.insert("anthropic/claude-opus-4".to_owned(), 1_000_000u32);
+		models.context_windows = Arc::new(cache);
+		let mut caps = HashMap::new();
+		caps.insert("anthropic/claude-opus-4:scaleway".to_owned(), 200_000u32);
+		models.context_window_overrides = Arc::new(caps);
+
+		assert_eq!(models.context_window("anthropic/claude-opus-4:scaleway"), 200_000);
+		assert_eq!(models.context_window("anthropic/claude-opus-4"), 1_000_000);
+		assert_eq!(models.context_window("anthropic/claude-opus-4:fastest"), 1_000_000);
 	}
 }

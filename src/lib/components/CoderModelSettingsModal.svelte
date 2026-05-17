@@ -96,6 +96,17 @@
 	let saving = $state(false);
 	let saveError = $state<string | null>(null);
 
+	// Per-slug context-window cap, in tokens. Mirrors the
+	// settings shape's `context_window_overrides` map but indexed
+	// by full wire slug — the user types into the cap input next
+	// to whichever tier they're editing, and we write into
+	// `slugCaps[slug]` keyed off `currentTierSlug()`. Values get
+	// rounded to integers on save; the per-slug input format lets
+	// the user type `250000` or `250_000` (we strip non-digits) so
+	// the modal doesn't have to pick a unit. Empty / cleared input
+	// removes the entry.
+	let slugCaps = $state<Record<string, number>>({});
+
 	let modelSearch = $state('');
 	let editingTier = $state<'standard' | 'cheap'>('standard');
 
@@ -170,6 +181,10 @@
 			}
 			billTo = settings.bill_to;
 		}
+		// Rebuild from a fresh object so reactivity tracks the
+		// whole map; mutating in place wouldn't notify
+		// `slugCapInput`.
+		slugCaps = { ...settings.context_window_overrides };
 	}
 
 	onMount(async () => {
@@ -649,6 +664,58 @@
 	const standardDetails = $derived(slugDetails(standardModel));
 	const cheapDetails = $derived(slugDetails(cheapModel));
 
+	// Editor binding for the cap input next to the standard /
+	// cheap model fields. `''` means "no cap"; non-empty values
+	// are persisted as positive integers in `slugCaps`. The
+	// derived getter reads from `slugCaps[slug]`; the setter
+	// writes back, removing the entry on clear so the saved
+	// `context_window_overrides` map stays minimal. Keying off
+	// the live slug means switching the standard model's slug
+	// flips the cap input to whatever's stored against the new
+	// slug — caps survive a model swap.
+	function readCapFor(slug: string): string {
+		const trimmed = slug.trim();
+		if (trimmed.length === 0) {
+			return '';
+		}
+		const v = slugCaps[trimmed];
+		return v === undefined || v === 0 ? '' : String(v);
+	}
+	function writeCapFor(slug: string, raw: string): void {
+		const trimmed = slug.trim();
+		if (trimmed.length === 0) {
+			return;
+		}
+		const digits = raw.replace(/\D+/g, '');
+		const next = { ...slugCaps };
+		if (digits.length === 0) {
+			delete next[trimmed];
+		} else {
+			const n = Number(digits);
+			if (Number.isFinite(n) && n > 0) {
+				next[trimmed] = n;
+			} else {
+				delete next[trimmed];
+			}
+		}
+		slugCaps = next;
+	}
+	const standardCapInput = $derived(readCapFor(standardModel));
+	const cheapCapInput = $derived(readCapFor(cheapModel));
+
+	// Pretty `250k` / `1M` for the cap hint. Uses the same
+	// formatter the catalog rows do so a `250000` cap reads as
+	// `250k` next to the model's catalog window of `1M`.
+	function shortTokens(n: number): string {
+		if (n >= 1_000_000) {
+			return `${(n / 1_000_000).toFixed(n % 1_000_000 === 0 ? 0 : 1)}M`;
+		}
+		if (n >= 1_000) {
+			return `${Math.round(n / 1_000)}k`;
+		}
+		return `${n}`;
+	}
+
 	// Orgs we surface in the bill-to dropdown: only the ones the user
 	// explicitly authorized moon-ide for at the OAuth consent screen.
 	// HF flags those by emitting a `roleInOrg` value; an org the user
@@ -695,6 +762,12 @@
 			bill_to: billTo.trim(),
 			active_provider: activeProviderId,
 			providers: providersToSave,
+			// Drop empty/zero caps before sending — keeps the
+			// persisted map minimal and matches the runner-side
+			// "treat 0 as no cap" defensive behaviour.
+			context_window_overrides: Object.fromEntries(
+				Object.entries(slugCaps).filter(([, v]) => Number.isFinite(v) && v > 0),
+			),
 		};
 		try {
 			await coder.saveModelSettings(next);
@@ -902,6 +975,24 @@
 							<span class="stats">· {standardDetails}</span>
 						{/if}
 					</span>
+					<span class="cap-row">
+						<span class="cap-label">Cap context to</span>
+						<input
+							type="text"
+							class="cap-input"
+							inputmode="numeric"
+							value={standardCapInput}
+							placeholder="leave blank for model max"
+							spellcheck="false"
+							autocomplete="off"
+							disabled={standardModel.trim().length === 0}
+							oninput={(e) => writeCapFor(standardModel, (e.target as HTMLInputElement).value)}
+						/>
+						<span class="cap-unit">tokens</span>
+						{#if standardCapInput.length > 0}
+							<span class="cap-hint">≈ {shortTokens(Number(standardCapInput))}</span>
+						{/if}
+					</span>
 				</label>
 
 				<label class="field">
@@ -925,6 +1016,24 @@
 						Used for commit messages, branch names, compaction summaries, folder summaries.
 						{#if cheapDetails !== null}
 							<span class="stats">· {cheapDetails}</span>
+						{/if}
+					</span>
+					<span class="cap-row">
+						<span class="cap-label">Cap context to</span>
+						<input
+							type="text"
+							class="cap-input"
+							inputmode="numeric"
+							value={cheapCapInput}
+							placeholder="leave blank for model max"
+							spellcheck="false"
+							autocomplete="off"
+							disabled={cheapModel.trim().length === 0}
+							oninput={(e) => writeCapFor(cheapModel, (e.target as HTMLInputElement).value)}
+						/>
+						<span class="cap-unit">tokens</span>
+						{#if cheapCapInput.length > 0}
+							<span class="cap-hint">≈ {shortTokens(Number(cheapCapInput))}</span>
 						{/if}
 					</span>
 				</label>
@@ -1340,6 +1449,52 @@
 		color: var(--m-fg);
 		font-family: var(--m-font-mono, ui-monospace, monospace);
 		font-size: 10.5px;
+	}
+	/* Per-tier context-window cap input. Sits below the slug
+	   field on the same `.field` flex column; keeps the visual
+	   weight low (small font, muted label) so it reads as a
+	   knob rather than another required field. The numeric
+	   input shares the slug field's monospace + bg-overlay so
+	   the two stack visually without a heavier divider. */
+	.cap-row {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		flex-wrap: wrap;
+		font-size: 11px;
+		color: var(--m-fg-muted);
+	}
+	.cap-label {
+		font-size: 11px;
+		color: var(--m-fg-muted);
+	}
+	.cap-input {
+		flex: 0 0 140px;
+		min-width: 0;
+		background: var(--m-bg-overlay);
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		color: var(--m-fg);
+		font-family: var(--m-font-mono, ui-monospace, monospace);
+		font-size: 11.5px;
+		padding: 3px 6px;
+	}
+	.cap-input:focus {
+		outline: none;
+		border-color: var(--m-accent);
+	}
+	.cap-input:disabled {
+		opacity: 0.55;
+		cursor: not-allowed;
+	}
+	.cap-unit {
+		font-size: 11px;
+		color: var(--m-fg-muted);
+	}
+	.cap-hint {
+		font-family: var(--m-font-mono, ui-monospace, monospace);
+		font-size: 11px;
+		color: var(--m-fg);
 	}
 
 	.catalog {

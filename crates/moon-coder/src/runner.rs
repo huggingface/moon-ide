@@ -448,6 +448,25 @@ impl CoderHandle {
 		self.refresh_token_usage_windows().await;
 	}
 
+	/// Replace the per-slug context-window caps. Called from the
+	/// picker `Save` flow alongside [`Self::set_user_picks`] /
+	/// [`Self::set_providers`]; the caller (the Tauri command)
+	/// has already persisted the same map to `state.json`. Each
+	/// `0` value is treated as "no cap" by
+	/// [`CoderModels::context_window`] so a frontend that fails
+	/// to remove a cleared input doesn't lock the runner out.
+	///
+	/// Refreshes the per-folder usage rings so a cap edit
+	/// repaints them immediately — the next turn isn't required
+	/// to see the new denominator.
+	pub async fn set_context_window_overrides(&self, overrides: std::collections::HashMap<String, u32>) {
+		{
+			let mut m = self.state.models.write().await;
+			m.context_window_overrides = std::sync::Arc::new(overrides);
+		}
+		self.refresh_token_usage_windows().await;
+	}
+
 	/// Replace the user-added providers list + the active
 	/// selection in one go. The caller (Tauri command) has
 	/// already persisted the same shape to `state.json`; this
