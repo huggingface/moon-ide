@@ -20,7 +20,9 @@ use moon_container::{Workspace as ContainerWorkspace, WorkspaceConfig};
 use moon_core::lsp::server::PathTranslator;
 use moon_core::lsp::{LspBroker, LspServerEvent, LspSpawner};
 use moon_protocol::container::ContainerState;
-use moon_protocol::lsp::{LspCompletionList, LspHover, LspLocation, LspPosition, LspPrepareRename, LspWorkspaceEdit};
+use moon_protocol::lsp::{
+	LspCompletionItem, LspCompletionList, LspHover, LspLocation, LspPosition, LspPrepareRename, LspWorkspaceEdit,
+};
 use moon_protocol::MoonError;
 use moon_terminal::{container_name_for_workspace, TerminalTarget};
 use tauri::{AppHandle, Emitter, State};
@@ -97,6 +99,20 @@ pub async fn lsp_hover(
 	let broker = ensure_broker(&state, &app).await?;
 	broker
 		.hover(&path, &language_id, position)
+		.await
+		.map_err(|e| MoonError::internal(e.to_string()))
+}
+
+#[tauri::command]
+pub async fn lsp_completion_resolve(
+	state: State<'_, AppState>,
+	app: AppHandle,
+	language_id: String,
+	resolve_token: String,
+) -> Result<LspCompletionItem, MoonError> {
+	let broker = ensure_broker(&state, &app).await?;
+	broker
+		.completion_resolve(&language_id, &resolve_token)
 		.await
 		.map_err(|e| MoonError::internal(e.to_string()))
 }

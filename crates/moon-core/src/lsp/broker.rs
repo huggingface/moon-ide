@@ -576,6 +576,45 @@ impl LspBroker {
 		server.completion(path, position).await
 	}
 
+	/// Resolve one completion item against the matching language
+	/// server. The frontend ships back the opaque token we issued
+	/// in [`Self::completion`]; we hand it to the right
+	/// [`LspServer`] which round-trips through
+	/// `completionItem/resolve` to fetch lazy-resolved fields
+	/// (auto-import edits, full documentation, etc.).
+	///
+	/// Returns the empty completion item when the language has no
+	/// server registered or its server isn't running — the
+	/// frontend treats that as "fall back to whatever
+	/// `additionalTextEdits` we already had", which is the right
+	/// behaviour both for unsupported languages and for the
+	/// lifecycle window between server crash and broker restart.
+	pub async fn completion_resolve(
+		&self,
+		language_id: &str,
+		resolve_token: &str,
+	) -> Result<mp::LspCompletionItem, LspClientError> {
+		let empty = mp::LspCompletionItem {
+			label: String::new(),
+			kind: None,
+			detail: None,
+			documentation: None,
+			insert_text: None,
+			sort_text: None,
+			filter_text: None,
+			text_edit: None,
+			additional_text_edits: Vec::new(),
+			resolve_token: None,
+		};
+		let Some(spec) = Self::spec_for(language_id) else {
+			return Ok(empty);
+		};
+		let Some(server) = self.ensure_server(spec).await? else {
+			return Ok(empty);
+		};
+		server.completion_resolve(resolve_token).await
+	}
+
 	/// Forward a host fs-watcher batch to every running server,
 	/// scoped per-server through the globs that server registered
 	/// for `workspace/didChangeWatchedFiles`. Servers that didn't

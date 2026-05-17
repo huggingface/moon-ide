@@ -24,10 +24,17 @@ import type { Completion, CompletionContext, CompletionResult, CompletionSource 
 import { setDiagnostics, type Diagnostic as CmDiagnostic, lintGutter } from '@codemirror/lint';
 import { Facet, type Extension } from '@codemirror/state';
 import { EditorView, hoverTooltip, type Tooltip } from '@codemirror/view';
+import type { Text } from '@codemirror/state';
 import { ipc } from '../ipc';
 import { frontendLog } from '../logs.svelte';
 import { openExternalMarkdownLink, renderMarkdown } from '../markdown';
-import { formatError, type LspDiagnostic, type LspSeverity } from '../protocol';
+import {
+	formatError,
+	type LspCompletionItem,
+	type LspDiagnostic,
+	type LspSeverity,
+	type LspTextEdit,
+} from '../protocol';
 import { lspLanguageFor } from './lspLanguage';
 
 /** Diagnostic-logs source for everything autocomplete-related.
@@ -318,7 +325,9 @@ export const lspCompletionSource: CompletionSource = async (
 		options: list.items.map((item) => {
 			const option: Completion = {
 				label: item.label,
-				apply: item.insertText ?? item.label,
+				apply: (view, _completion, applyFrom, applyTo) => {
+					applyLspCompletion(view, item, languageId, applyFrom, applyTo);
+				},
 			};
 			if (item.kind !== null) {
 				option.type = item.kind;
@@ -337,6 +346,114 @@ export const lspCompletionSource: CompletionSource = async (
 		validFor: /^[\w$]*$/,
 	};
 };
+
+/**
+ * Commit one LSP completion item: dispatch the primary text
+ * insertion immediately, then chase the auto-import block via
+ * `completionItem/resolve` if the server lazy-resolves it.
+ *
+ * Two-transaction shape rather than one because resolve has
+ * latency (`tsgo` is ~30ms cold, `rust-analyzer` can be 100ms+
+ * for a fresh symbol). Forcing the user to wait on resolve
+ * before the typed token even appears would make accepts feel
+ * laggy. The trade-off is two undo units instead of one — but
+ * the import line landing a beat after the identifier is the
+ * standard LSP-client UX (VS Code, Helix, Zed all do it this
+ * way) and the alternative (everyone waits for the import
+ * round-trip) is worse.
+ */
+function applyLspCompletion(
+	view: EditorView,
+	item: LspCompletionItem,
+	languageId: string,
+	applyFrom: number,
+	applyTo: number,
+): void {
+	const primary = primaryEditFor(item, view.state.doc, applyFrom, applyTo);
+	view.dispatch({
+		changes: { from: primary.from, to: primary.to, insert: primary.insert },
+		selection: { anchor: primary.from + primary.insert.length },
+	});
+	if (item.resolveToken !== null) {
+		// Resolve replaces additionalTextEdits — never merge what
+		// we already have with what comes back, just trust the
+		// resolved item. A non-empty initial list paired with a
+		// resolve token is rare (most servers ship one or the
+		// other); when it happens, deferring keeps us aligned
+		// with VS Code semantics so a server that "fills in"
+		// resolves consistently.
+		void resolveAndApplyAdditional(view, item.resolveToken, languageId, item.label);
+		return;
+	}
+	if (item.additionalTextEdits.length > 0) {
+		applyAdditionalEdits(view, item.additionalTextEdits);
+	}
+}
+
+/** Where the primary insertion lands. Honours an explicit
+ *  `textEdit` range if the server gave one (e.g. completing
+ *  `foo.bar` from inside `foo` — the server replaces the whole
+ *  dotted span, not just the prefix-matched suffix); otherwise
+ *  falls back to "replace the matchBefore-detected word with
+ *  `insertText` / `label`". */
+function primaryEditFor(
+	item: LspCompletionItem,
+	doc: Text,
+	fallbackFrom: number,
+	fallbackTo: number,
+): { from: number; to: number; insert: string } {
+	if (item.textEdit !== null) {
+		const start = offsetFor(doc, item.textEdit.range.start.line, item.textEdit.range.start.character);
+		const end = offsetFor(doc, item.textEdit.range.end.line, item.textEdit.range.end.character);
+		return { from: start, to: end, insert: item.textEdit.newText };
+	}
+	return { from: fallbackFrom, to: fallbackTo, insert: item.insertText ?? item.label };
+}
+
+/** Apply a list of LSP text edits as one CM transaction. LSP
+ *  guarantees edits inside a single document don't overlap, so we
+ *  just sort by `from` ascending — CM accepts a sorted array of
+ *  changes as a single transaction and updates any in-flight
+ *  selection (the caret the primary edit just placed) for the
+ *  inserted import line at line 0. */
+function applyAdditionalEdits(view: EditorView, edits: readonly LspTextEdit[]): void {
+	const doc = view.state.doc;
+	const changes = edits
+		.map((e) => {
+			const from = offsetFor(doc, e.range.start.line, e.range.start.character);
+			const to = offsetFor(doc, e.range.end.line, e.range.end.character);
+			return { from, to, insert: e.newText };
+		})
+		.sort((a, b) => a.from - b.from);
+	if (changes.length === 0) {
+		return;
+	}
+	view.dispatch({ changes });
+}
+
+async function resolveAndApplyAdditional(
+	view: EditorView,
+	token: string,
+	languageId: string,
+	label: string,
+): Promise<void> {
+	let resolved: LspCompletionItem;
+	try {
+		resolved = await ipc.lsp.completionResolve(languageId, token);
+	} catch (err) {
+		frontendLog(COMPLETION_LOG_SOURCE, 'error', `completionItem/resolve threw for "${label}": ${formatError(err)}`);
+		return;
+	}
+	if (resolved.additionalTextEdits.length === 0) {
+		return;
+	}
+	frontendLog(
+		COMPLETION_LOG_SOURCE,
+		'info',
+		`completionItem/resolve for "${label}" applied ${resolved.additionalTextEdits.length} additional edit${resolved.additionalTextEdits.length === 1 ? '' : 's'}`,
+	);
+	applyAdditionalEdits(view, resolved.additionalTextEdits);
+}
 
 /**
  * Convert an LSP `sortText` into a CM `boost`. LSP sort keys are

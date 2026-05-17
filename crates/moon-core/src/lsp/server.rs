@@ -262,6 +262,19 @@ pub struct LspServer {
 	/// (which makes [`notify_files_changed`] a no-op for them —
 	/// safe and free).
 	watched_patterns: Mutex<HashMap<String, Vec<WatchedPattern>>>,
+	/// Snapshot of `result.capabilities.completion_provider.resolve_provider`
+	/// from the server's `initialize` response. Tells us whether
+	/// `completionItem/resolve` is meaningful for this server —
+	/// the LSP auto-import pipeline (`tsgo`, `rust-analyzer`,
+	/// `pyright`) lazy-resolves `additionalTextEdits` and gates
+	/// the import line on this flag. When `false`, the broker
+	/// short-circuits resolve and returns whatever the initial
+	/// `textDocument/completion` projection already carried
+	/// instead of round-tripping a no-op call. `AtomicBool` so
+	/// reads from the request handlers don't take the docs lock;
+	/// stored once at `initialize` time, never written again
+	/// during the server's lifetime.
+	completion_resolve_provider: std::sync::atomic::AtomicBool,
 	/// Fan-out sink the server uses to publish its own events
 	/// (diagnostics, status changes). Cloned from the broker's
 	/// channel so the pull-diagnostics task can shove `LspDiagnostics`
@@ -499,6 +512,7 @@ impl LspServer {
 			translator,
 			docs: Mutex::new(HashMap::new()),
 			watched_patterns: Mutex::new(HashMap::new()),
+			completion_resolve_provider: std::sync::atomic::AtomicBool::new(false),
 			events: events.clone(),
 		});
 
@@ -679,6 +693,26 @@ impl LspServer {
 						snippet_support: Some(false),
 						documentation_format: Some(vec![lt::MarkupKind::Markdown, lt::MarkupKind::PlainText]),
 						insert_replace_support: Some(false),
+						// Tell servers we'll call
+						// `completionItem/resolve` to hydrate the
+						// listed properties on commit. The big one
+						// is `additionalTextEdits` — the LSP
+						// auto-import pipeline lives there
+						// (`tsgo`, `rust-analyzer`, `pyright` all
+						// gate the import line on resolve to keep
+						// the initial completion list cheap).
+						// `documentation` and `detail` are common
+						// to lazy-resolve too; declaring them
+						// keeps initial results small without
+						// losing the side-panel body once the
+						// user picks a candidate.
+						resolve_support: Some(lt::CompletionItemCapabilityResolveSupport {
+							properties: vec![
+								"additionalTextEdits".to_string(),
+								"documentation".to_string(),
+								"detail".to_string(),
+							],
+						}),
 						..Default::default()
 					}),
 					completion_item_kind: None,
@@ -759,9 +793,36 @@ impl LspServer {
 			work_done_progress_params: lt::WorkDoneProgressParams::default(),
 		};
 
-		let _: lt::InitializeResult = self.client.request("initialize", params).await?;
+		let result: lt::InitializeResult = self.client.request("initialize", params).await?;
+		// Stash the server's `completionProvider.resolveProvider`
+		// flag so the broker knows whether a
+		// `completionItem/resolve` round-trip is going to give us
+		// anything new. `tsgo` / `rust-analyzer` / `pyright`
+		// advertise `true` and use the resolve hook to ship the
+		// auto-import line; servers that don't (some bespoke
+		// language servers, older clangd) advertise `false` and
+		// the broker short-circuits resolve.
+		let resolve_provider = result
+			.capabilities
+			.completion_provider
+			.as_ref()
+			.and_then(|cp| cp.resolve_provider)
+			.unwrap_or(false);
+		self
+			.completion_resolve_provider
+			.store(resolve_provider, std::sync::atomic::Ordering::Relaxed);
 		self.client.notify("initialized", lt::InitializedParams {}).await?;
 		Ok(())
+	}
+
+	/// Whether this server told us at `initialize` time that
+	/// `completionItem/resolve` is supported. Used by the broker
+	/// to decide whether the resolve token an `LspCompletionItem`
+	/// carries is worth shipping to the frontend at all.
+	pub fn supports_completion_resolve(&self) -> bool {
+		self
+			.completion_resolve_provider
+			.load(std::sync::atomic::Ordering::Relaxed)
 	}
 
 	/// Send `textDocument/didOpen`. Idempotent: a second open for
@@ -1188,13 +1249,40 @@ impl LspServer {
 			}),
 		};
 		let resp: Option<lt::CompletionResponse> = self.client.request("textDocument/completion", params).await?;
-		match resp {
-			Some(r) => Ok(translate::completion_response(r)),
-			None => Ok(mp::LspCompletionList {
+		let supports_resolve = self.supports_completion_resolve();
+		Ok(match resp {
+			Some(r) => translate::completion_response_with_resolve(r, supports_resolve),
+			None => mp::LspCompletionList {
 				is_incomplete: false,
 				items: vec![],
-			}),
+			},
+		})
+	}
+
+	/// Hand a previously-emitted `LspCompletionItem` back to the
+	/// server via `completionItem/resolve` to fetch the lazy-
+	/// resolved fields — primarily the auto-import block in
+	/// `additionalTextEdits`. The frontend ships back the opaque
+	/// `resolve_token` we issued in [`Self::completion`]; we
+	/// JSON-decode it into the original `lt::CompletionItem`,
+	/// round-trip through the server, and re-project. When the
+	/// server didn't advertise `resolveProvider`, this is a no-op
+	/// — we just decode the token and return its projection so
+	/// the frontend doesn't need a second branch.
+	pub async fn completion_resolve(&self, resolve_token: &str) -> Result<mp::LspCompletionItem, LspClientError> {
+		let original: lt::CompletionItem =
+			serde_json::from_str(resolve_token).map_err(|e| LspClientError::Decode(format!("resolve token: {e}")))?;
+		if !self.supports_completion_resolve() {
+			// Decoding the token alone doesn't add `additionalTextEdits`
+			// the server didn't already send, so the round-trip
+			// would be a no-op; skip the IPC and re-project.
+			// `include_resolve_token: false` so the frontend can
+			// stop chasing resolve on the same item — we already
+			// know there's nothing more to fetch.
+			return Ok(translate::completion_item_with_resolve(original, false));
 		}
+		let resolved: lt::CompletionItem = self.client.request("completionItem/resolve", original).await?;
+		Ok(translate::completion_item_with_resolve(resolved, false))
 	}
 
 	pub fn language_id(&self) -> &str {

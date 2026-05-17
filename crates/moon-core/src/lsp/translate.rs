@@ -141,13 +141,42 @@ pub fn completion_kind(k: lt::CompletionItemKind) -> mp::LspCompletionKind {
 }
 
 pub fn completion_item(item: lt::CompletionItem) -> mp::LspCompletionItem {
-	let documentation = item.documentation.map(|d| match d {
+	completion_item_with_resolve(item, true)
+}
+
+/// Same projection as [`completion_item`] but lets the caller
+/// suppress the resolve token. Used by
+/// [`crate::lsp::server::LspServer::completion_resolve`]: the
+/// resolved item is final, so handing the frontend a token that
+/// would re-trigger another `completionItem/resolve` round-trip
+/// would just spin.
+pub fn completion_item_with_resolve(item: lt::CompletionItem, include_resolve_token: bool) -> mp::LspCompletionItem {
+	let documentation = item.documentation.clone().map(|d| match d {
 		lt::Documentation::String(s) => s,
 		lt::Documentation::MarkupContent(m) => match m.kind {
 			lt::MarkupKind::Markdown => m.value,
 			lt::MarkupKind::PlainText => format!("```\n{}\n```", m.value),
 		},
 	});
+	let text_edit = item.text_edit.as_ref().and_then(completion_primary_edit);
+	let additional_text_edits: Vec<mp::LspTextEdit> = item
+		.additional_text_edits
+		.clone()
+		.unwrap_or_default()
+		.into_iter()
+		.map(text_edit_owned)
+		.collect();
+	// Round-trip the entire `lt::CompletionItem` as JSON so the
+	// resolve call can hand it back to the server verbatim. LSP
+	// servers are picky about getting back exactly the item they
+	// sent — projecting through our shape and reconstructing
+	// would lose `data`, server-internal fields, etc., and
+	// `tsserver` flatly errors when its `data` blob is missing.
+	let resolve_token = if include_resolve_token {
+		serde_json::to_string(&item).ok()
+	} else {
+		None
+	};
 	mp::LspCompletionItem {
 		label: item.label,
 		kind: item.kind.map(completion_kind),
@@ -156,6 +185,39 @@ pub fn completion_item(item: lt::CompletionItem) -> mp::LspCompletionItem {
 		insert_text: item.insert_text,
 		sort_text: item.sort_text,
 		filter_text: item.filter_text,
+		text_edit,
+		additional_text_edits,
+		resolve_token,
+	}
+}
+
+/// Project the `text_edit` field of an `lt::CompletionItem` down
+/// to one of our `LspTextEdit`s. LSP gives the server a choice
+/// between a plain `TextEdit` and an `InsertReplaceEdit` (where
+/// the server wants different ranges for "insert mode" — type
+/// continues — and "replace mode" — the matched word gets
+/// rewritten). We declared `insert_replace_support: false` in
+/// our client capabilities, so well-behaved servers send a plain
+/// `TextEdit`; we still cope with the replace shape and pick the
+/// **replace** range — that's what the user means when they
+/// commit a completion that "rewrites" the in-flight token.
+fn completion_primary_edit(edit: &lt::CompletionTextEdit) -> Option<mp::LspTextEdit> {
+	match edit {
+		lt::CompletionTextEdit::Edit(te) => Some(mp::LspTextEdit {
+			range: range(te.range),
+			new_text: te.new_text.clone(),
+		}),
+		lt::CompletionTextEdit::InsertAndReplace(ir) => Some(mp::LspTextEdit {
+			range: range(ir.replace),
+			new_text: ir.new_text.clone(),
+		}),
+	}
+}
+
+fn text_edit_owned(e: lt::TextEdit) -> mp::LspTextEdit {
+	mp::LspTextEdit {
+		range: range(e.range),
+		new_text: e.new_text,
 	}
 }
 
@@ -323,14 +385,32 @@ fn text_edit(e: lt::TextEdit) -> mp::LspTextEdit {
 }
 
 pub fn completion_response(resp: lt::CompletionResponse) -> mp::LspCompletionList {
+	completion_response_with_resolve(resp, true)
+}
+
+/// Same as [`completion_response`] but lets the broker pass the
+/// server's `resolveProvider` flag through. We only emit a
+/// `resolve_token` when the server actually supports
+/// `completionItem/resolve`; otherwise the frontend would chase
+/// a round-trip whose response is identical to what we already
+/// projected. Saves a render-blocking IPC on every accept for
+/// servers without resolve.
+pub fn completion_response_with_resolve(resp: lt::CompletionResponse, supports_resolve: bool) -> mp::LspCompletionList {
 	match resp {
 		lt::CompletionResponse::Array(items) => mp::LspCompletionList {
 			is_incomplete: false,
-			items: items.into_iter().map(completion_item).collect(),
+			items: items
+				.into_iter()
+				.map(|i| completion_item_with_resolve(i, supports_resolve))
+				.collect(),
 		},
 		lt::CompletionResponse::List(list) => mp::LspCompletionList {
 			is_incomplete: list.is_incomplete,
-			items: list.items.into_iter().map(completion_item).collect(),
+			items: list
+				.items
+				.into_iter()
+				.map(|i| completion_item_with_resolve(i, supports_resolve))
+				.collect(),
 		},
 	}
 }
@@ -410,5 +490,109 @@ mod tests {
 			range: None,
 		};
 		assert_eq!(hover(h).unwrap().contents, "```\nx: number\n```");
+	}
+
+	#[test]
+	fn completion_item_emits_resolve_token_when_supported() {
+		// `tsgo` / `rust-analyzer` ship empty `additional_text_edits`
+		// in the initial completion response and gate the auto-import
+		// line on `completionItem/resolve`. Our projection has to
+		// emit a `resolve_token` (the full original item, JSON-
+		// encoded) so the frontend can chase the resolve and round-
+		// trip the exact item back to the server.
+		let item = lt::CompletionItem {
+			label: "useState".into(),
+			kind: Some(lt::CompletionItemKind::FUNCTION),
+			detail: Some("(initialState: S | (() => S)) => [S, Dispatch<SetStateAction<S>>]".into()),
+			data: Some(serde_json::json!({ "exportName": "useState", "moduleSpecifier": "react" })),
+			..Default::default()
+		};
+		let projected = completion_item_with_resolve(item, true);
+		assert_eq!(projected.label, "useState");
+		assert!(projected.additional_text_edits.is_empty());
+		let token = projected
+			.resolve_token
+			.expect("resolve token must be present when supported");
+		// Token round-trips back to a valid `lt::CompletionItem` —
+		// the resolver hands this verbatim to the server.
+		let restored: lt::CompletionItem = serde_json::from_str(&token).expect("token decodes to CompletionItem");
+		assert_eq!(restored.label, "useState");
+		assert_eq!(
+			restored.data,
+			Some(serde_json::json!({ "exportName": "useState", "moduleSpecifier": "react" }))
+		);
+	}
+
+	#[test]
+	fn completion_item_omits_resolve_token_when_unsupported() {
+		// Servers that don't advertise `resolveProvider` get a
+		// short-circuited surface — calling resolve on the item
+		// would be a no-op, so we strip the token so the frontend
+		// doesn't bother. Without this the frontend would chase a
+		// pointless IPC for every accept on (e.g.) clangd builds
+		// without `--background-index`.
+		let item = lt::CompletionItem {
+			label: "Foo".into(),
+			..Default::default()
+		};
+		let projected = completion_item_with_resolve(item, false);
+		assert!(projected.resolve_token.is_none());
+	}
+
+	#[test]
+	fn completion_item_passes_through_additional_text_edits() {
+		// The "rare" path: a server that pre-resolves the import
+		// line (rust-analyzer with `imports.preferPrelude` does
+		// this for some prelude items). The translator should pass
+		// the edits through verbatim so the frontend can apply
+		// them without an extra resolve round-trip.
+		let item = lt::CompletionItem {
+			label: "HashMap".into(),
+			additional_text_edits: Some(vec![lt::TextEdit {
+				range: lt::Range {
+					start: lt::Position { line: 0, character: 0 },
+					end: lt::Position { line: 0, character: 0 },
+				},
+				new_text: "use std::collections::HashMap;\n".into(),
+			}]),
+			..Default::default()
+		};
+		let projected = completion_item_with_resolve(item, true);
+		assert_eq!(projected.additional_text_edits.len(), 1);
+		assert_eq!(
+			projected.additional_text_edits[0].new_text,
+			"use std::collections::HashMap;\n"
+		);
+	}
+
+	#[test]
+	fn completion_item_picks_replace_range_for_insert_replace_edit() {
+		// We declared `insert_replace_support: false`, so well-
+		// behaved servers send a plain `TextEdit`. A few (older
+		// `tsserver` builds, some experimental servers) ignore
+		// the capability and ship the dual-range shape anyway —
+		// we honour the **replace** range, which matches what the
+		// user means when they accept a completion that "rewrites"
+		// the in-flight token.
+		let item = lt::CompletionItem {
+			label: "foo".into(),
+			text_edit: Some(lt::CompletionTextEdit::InsertAndReplace(lt::InsertReplaceEdit {
+				new_text: "fooBar".into(),
+				insert: lt::Range {
+					start: lt::Position { line: 0, character: 3 },
+					end: lt::Position { line: 0, character: 3 },
+				},
+				replace: lt::Range {
+					start: lt::Position { line: 0, character: 0 },
+					end: lt::Position { line: 0, character: 6 },
+				},
+			})),
+			..Default::default()
+		};
+		let projected = completion_item_with_resolve(item, false);
+		let edit = projected.text_edit.expect("primary text edit projected");
+		assert_eq!(edit.range.start.character, 0);
+		assert_eq!(edit.range.end.character, 6);
+		assert_eq!(edit.new_text, "fooBar");
 	}
 }

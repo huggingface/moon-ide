@@ -175,6 +175,33 @@ pub struct LspCompletionItem {
 	/// Filter key if the server wants a different match surface than
 	/// `label`. Same rationale as `sort_text`.
 	pub filter_text: Option<String>,
+	/// Primary text edit the server wants applied at acceptance,
+	/// when it cares about an exact range (e.g. completing
+	/// `foo.bar` from inside `foo` — the server replaces the whole
+	/// dotted span, not just the prefix-matched suffix). When
+	/// `None`, the frontend falls back to "replace the
+	/// matchBefore-detected word with `insert_text` / `label`".
+	/// `LspRange` is UTF-16, zero-based — same encoding the
+	/// hover/diagnostics surface uses.
+	pub text_edit: Option<LspTextEdit>,
+	/// Edits the server wants applied **alongside** the primary
+	/// edit, typically auto-import lines: e.g. picking `useState`
+	/// from a React module ships an `import { useState } from
+	/// 'react';` line at the top of the file. Often empty in the
+	/// initial `textDocument/completion` response and only
+	/// populated after the client calls
+	/// `completionItem/resolve` — see [`Self::resolve_token`].
+	pub additional_text_edits: Vec<LspTextEdit>,
+	/// Opaque token the frontend ships back to
+	/// `lsp_completion_resolve` to fetch lazy-resolved fields
+	/// (notably `additional_text_edits` for auto-imports). Built
+	/// by JSON-encoding the original `lsp_types::CompletionItem`,
+	/// so the resolver can replay the exact server payload — the
+	/// LSP spec says clients must round-trip the original item
+	/// verbatim. `None` when the server didn't advertise resolve
+	/// support at init time, in which case whatever we already
+	/// have in [`Self::additional_text_edits`] is final.
+	pub resolve_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

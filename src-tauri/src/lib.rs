@@ -171,6 +171,7 @@ pub fn run() {
 			commands::lsp::lsp_close,
 			commands::lsp::lsp_hover,
 			commands::lsp::lsp_completion,
+			commands::lsp::lsp_completion_resolve,
 			commands::lsp::lsp_definition,
 			commands::lsp::lsp_prepare_rename,
 			commands::lsp::lsp_rename,

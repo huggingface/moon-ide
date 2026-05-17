@@ -546,6 +546,26 @@ export type LspCompletionItem = {
 	insertText: string | null;
 	sortText: string | null;
 	filterText: string | null;
+	/**
+	 * Primary text edit, when the server picked an exact range to
+	 * replace (e.g. completing `foo.bar` from inside `foo`). Falls
+	 * back to "replace the matched word with `insertText`/`label`"
+	 * when null.
+	 */
+	textEdit: LspTextEdit | null;
+	/**
+	 * Edits applied alongside the primary insertion — auto-import
+	 * lines, mostly. Typically empty in the initial response and
+	 * populated by `completionItem/resolve` (see `resolveToken`).
+	 */
+	additionalTextEdits: LspTextEdit[];
+	/**
+	 * Opaque blob the frontend ships back to `lsp_completion_resolve`
+	 * to lazy-fetch `additionalTextEdits`. Null when the server
+	 * doesn't advertise resolve support — what's in
+	 * `additionalTextEdits` is then already final.
+	 */
+	resolveToken: string | null;
 };
 
 export type LspCompletionList = {

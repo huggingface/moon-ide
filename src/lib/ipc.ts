@@ -32,6 +32,7 @@ import type {
 	ImageAttachmentPayload,
 	LogEntry,
 	LogLevel,
+	LspCompletionItem,
 	LspCompletionList,
 	LspHover,
 	LspLocation,
@@ -231,6 +232,16 @@ export const ipc = {
 			invoke<LspHover | null>('lsp_hover', { path, languageId, position }),
 		completion: (path: string, languageId: string, position: LspPosition) =>
 			invoke<LspCompletionList>('lsp_completion', { path, languageId, position }),
+		// Lazy-resolve a completion item (the auto-import block lives
+		// here for `tsgo` / `rust-analyzer` / `pyright`). The
+		// `resolveToken` is the opaque string the matching item
+		// carried; we hand it back unchanged. Returns the resolved
+		// item with `additionalTextEdits` filled in. When the
+		// matching server didn't advertise resolveSupport, the
+		// backend short-circuits to a no-op and gives us back the
+		// item we'd already have — same shape, no IPC fan-out.
+		completionResolve: (languageId: string, resolveToken: string) =>
+			invoke<LspCompletionItem>('lsp_completion_resolve', { languageId, resolveToken }),
 		definition: (path: string, languageId: string, position: LspPosition) =>
 			invoke<LspLocation | null>('lsp_definition', { path, languageId, position }),
 		prepareRename: (path: string, languageId: string, position: LspPosition, fallbackWord: string) =>
