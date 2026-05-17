@@ -39,6 +39,7 @@ import { workspace } from '../state.svelte';
 import type { LspPosition, LspTextEdit, LspWorkspaceEdit } from '../protocol';
 import { filePathFacet } from './lsp';
 import { lspLanguageFor } from './lspLanguage';
+import { applyWorkspaceEdit } from './lspWorkspaceEdit';
 
 /**
  * State payload while the rename input is open. `null` means
@@ -193,60 +194,13 @@ async function runRename(state: RenameState, newName: string, view: EditorView):
 		view.focus();
 		return;
 	}
-	let openCount = 0;
-	let closedCount = 0;
-	const closedPaths: string[] = [];
-	for (const doc of edit.documentEdits) {
-		// Empty `path` means the URI was outside the active
-		// folder — translation already dropped it from the list,
-		// but defend in depth so a future protocol change can't
-		// silently corrupt random files.
-		if (doc.path.length === 0 || doc.edits.length === 0) {
-			continue;
-		}
-		const openFile = workspace.openFiles.find((f) => f.path === doc.path);
-		if (openFile) {
-			const nextText = applyEditsToText(openFile.text, doc.edits);
-			if (nextText !== openFile.text) {
-				workspace.updateText(doc.path, nextText);
-			}
-			openCount++;
-			continue;
-		}
-		try {
-			const read = await ipc.fs.readFile(doc.path);
-			const nextText = applyEditsToText(read.text, doc.edits);
-			if (nextText !== read.text) {
-				await ipc.fs.writeFile(doc.path, nextText);
-			}
-			closedPaths.push(doc.path);
-			closedCount++;
-		} catch (err) {
-			workspace.flash(`Rename: failed to update ${doc.path}: ${formatErr(err)}`);
-			// Best-effort: continue with the rest. Partial
-			// rename is better than no rename, and the SCM
-			// panel will show the user exactly which files
-			// landed.
-		}
+	const result = await applyWorkspaceEdit(edit);
+	for (const failure of result.failures) {
+		workspace.flash(`Rename: failed to update ${failure.path}: ${failure.error}`);
 	}
-	if (closedPaths.length > 0) {
-		// Tell every running server that these files changed on
-		// disk so it can invalidate caches and re-publish
-		// diagnostics. Open buffers already routed through
-		// `updateText` → `didChange`, so they're up-to-date on
-		// the server's view; no need to double-notify.
-		try {
-			await ipc.lsp.notifyFilesChanged(closedPaths);
-		} catch {
-			// Best-effort: a server that disconnected between
-			// the rename and the notify isn't a user-facing
-			// failure — diagnostics will refresh on the next
-			// open / window-focus / didChange anyway.
-		}
-	}
-	const total = openCount + closedCount;
+	const total = result.openCount + result.closedCount;
 	const fileWord = total === 1 ? 'file' : 'files';
-	const dirtyHint = openCount > 0 ? ' (unsaved — Ctrl+S to commit)' : '';
+	const dirtyHint = result.openCount > 0 ? ' (unsaved — Ctrl+S to commit)' : '';
 	workspace.flash(`Renamed '${state.placeholder}' → '${newName}' in ${total} ${fileWord}${dirtyHint}`);
 	view.dispatch({ effects: closeRenameEffect.of(null) });
 	view.focus();

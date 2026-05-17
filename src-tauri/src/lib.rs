@@ -175,6 +175,7 @@ pub fn run() {
 			commands::lsp::lsp_definition,
 			commands::lsp::lsp_prepare_rename,
 			commands::lsp::lsp_rename,
+			commands::lsp::lsp_code_action,
 			commands::lsp::lsp_restart,
 			commands::lsp::lsp_refresh_open_diagnostics,
 			commands::lsp::lsp_notify_files_changed,

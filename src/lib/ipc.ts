@@ -33,12 +33,15 @@ import type {
 	ImageAttachmentPayload,
 	LogEntry,
 	LogLevel,
+	LspCodeAction,
 	LspCompletionItem,
 	LspCompletionList,
+	LspDiagnostic,
 	LspHover,
 	LspLocation,
 	LspPosition,
 	LspPrepareRename,
+	LspRange,
 	LspWorkspaceEdit,
 	ProjectComposeStatus,
 	ReadFileResult,
@@ -249,6 +252,19 @@ export const ipc = {
 			invoke<LspPrepareRename | null>('lsp_prepare_rename', { path, languageId, position, fallbackWord }),
 		rename: (path: string, languageId: string, position: LspPosition, newName: string) =>
 			invoke<LspWorkspaceEdit>('lsp_rename', { path, languageId, position, newName }),
+		// Quick-fix (`textDocument/codeAction`, `quickfix`-only) for
+		// one diagnostic the cursor is parked on. `producer` is the
+		// slot key the frontend received with the original
+		// `lsp:diagnostics` event (`"typescript"` for tsgo,
+		// `"oxlint"` for the linter co-tenant) — the broker uses it
+		// to route the request to the server that warned about this
+		// range, not the other JS/TS co-tenant. Returns an empty
+		// list when nothing is wired or running; the lint tooltip
+		// falls back to the always-on "Fix in coder" entry the
+		// frontend layers on top of every diagnostic regardless of
+		// what the server returned.
+		codeAction: (path: string, producer: string, range: LspRange, diagnostic: LspDiagnostic) =>
+			invoke<LspCodeAction[]>('lsp_code_action', { path, producer, range, diagnostic }),
 		// Tear down the server slot for `languageId`. The next
 		// `open` / `update` / `hover` / `completion` lazily
 		// re-spawns it; the diag-logs panel exposes a "Restart"

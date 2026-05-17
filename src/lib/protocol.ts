@@ -513,6 +513,29 @@ export type LspPrepareRename = {
 };
 
 /**
+ * One quick-fix the lint tooltip can offer for a diagnostic.
+ *
+ * Pure-`Command` actions (no edit) and actions whose edit
+ * survived translation as empty are dropped on the backend, so
+ * every entry the frontend sees has a non-empty `edit` it can
+ * apply. Mirrors `moon_protocol::lsp::LspCodeAction`.
+ *
+ * `producer` is stamped by the broker (the slot key — `typescript`
+ * / `oxlint` / `rust`) so the UI can label each action with which
+ * co-tenant suggested it. `kind` is LSP's `CodeActionKind` string
+ * when the server set one (`quickfix`, `refactor.rewrite`,
+ * `source.fixAll.oxc`, …); we don't filter on it today but the
+ * data is wired so a future "Show all code actions" surface can.
+ */
+export type LspCodeAction = {
+	title: string;
+	kind: string | null;
+	edit: LspWorkspaceEdit;
+	isPreferred: boolean;
+	producer: string;
+};
+
+/**
  * Kind of a completion item. Mirrors LSP's list 1:1; the frontend
  * uses it for iconography. Extending this set requires adding to
  * `moon_protocol::lsp::LspCompletionKind` and the `translate` match.

@@ -29,8 +29,9 @@ use tokio::sync::{broadcast, Mutex};
 
 use super::client::LspClientError;
 use super::server::{
-	container_binary_path, discover_binary, resolve_install_hint, LspBinarySpec, LspServer, LspServerEvent,
-	PathTranslator, GO_SERVER, OXLINT_LANGUAGES, OXLINT_LINTER, PYTHON_SERVER, RUST_SERVER, TS_SERVER,
+	container_binary_path, discover_binary, discover_oxlint_workspace_folders, resolve_install_hint, LspBinarySpec,
+	LspServer, LspServerEvent, PathTranslator, GO_SERVER, OXLINT_LANGUAGES, OXLINT_LINTER, PYTHON_SERVER, RUST_SERVER,
+	TS_SERVER,
 };
 use super::spawn::LspSpawner;
 use crate::logs::LogSink;
@@ -483,11 +484,27 @@ impl LspBroker {
 			return SpawnOutcome::Unavailable;
 		}
 
+		// Workspace folders the server should anchor on. Language
+		// servers all index the whole tree from `rootUri`
+		// regardless, so the single-entry list is right for them
+		// (and stays cheap). The linter co-tenant gets a richer
+		// list because oxlint's config discovery is per-folder,
+		// not per-file: a `.oxlintrc.json` at `apps/api/` only
+		// applies to files under `apps/api/` if `apps/api/` is in
+		// the `workspaceFolders` array. See
+		// [`discover_oxlint_workspace_folders`] for the scan.
+		let workspace_folders: Vec<String> = if spec.language_id == OXLINT_LINTER.language_id {
+			discover_oxlint_workspace_folders(self.root.as_std_path())
+		} else {
+			vec![String::new()]
+		};
+
 		match LspServer::spawn(
 			spec,
 			&bin_path,
 			&route.spawner,
 			route.translator.clone(),
+			workspace_folders,
 			self.events.clone(),
 			self.log_sink.clone(),
 		)
@@ -640,6 +657,51 @@ impl LspBroker {
 			return Ok(empty);
 		};
 		server.rename(path, position, new_name).await
+	}
+
+	/// Resolve the [`LspBinarySpec`] for a `producer` slot key.
+	/// `producer` is the value the frontend round-trips with each
+	/// diagnostic — `"typescript"` for `tsgo`, `"rust"` for
+	/// rust-analyzer, `"oxlint"` for the linter co-tenant. Single
+	/// entry-point so a future protocol-level slot doesn't have to
+	/// be added in two places (here and `slot_map_for`); the spec
+	/// list is small enough that the linear match is cheap.
+	fn spec_for_producer(producer: &str) -> Option<&'static LspBinarySpec> {
+		if producer == OXLINT_LINTER.language_id {
+			return Some(&OXLINT_LINTER);
+		}
+		Self::spec_for(producer)
+	}
+
+	/// Ask the server that emitted `diagnostic` (identified by
+	/// `producer`, the slot key the frontend received with each
+	/// `lsp:diagnostics` event) for quickfixes covering it.
+	/// Routing per-producer rather than fanning out to every
+	/// server keeps the request narrow: oxlint and tsgo each only
+	/// know about their own diagnostics, and a co-tenant being
+	/// asked about a range it never warned on tends to either
+	/// return nothing or — worse — return unrelated source-action
+	/// noise.
+	///
+	/// Returns the empty list when the producer's slot has no
+	/// running server (no spec, server not booted yet, recent
+	/// crash). The frontend treats that the same as "no quickfixes
+	/// available" and the lint tooltip falls back to the always-on
+	/// "Fix in coder" entry.
+	pub async fn code_action(
+		&self,
+		path: &str,
+		producer: &str,
+		range: mp::LspRange,
+		diagnostic: mp::LspDiagnostic,
+	) -> Result<Vec<mp::LspCodeAction>, LspClientError> {
+		let Some(spec) = Self::spec_for_producer(producer) else {
+			return Ok(Vec::new());
+		};
+		let Some(server) = self.ensure_server(spec).await? else {
+			return Ok(Vec::new());
+		};
+		server.code_action(path, &range, &diagnostic, producer).await
 	}
 
 	pub async fn completion(

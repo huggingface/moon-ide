@@ -307,6 +307,39 @@ pub struct LspPrepareRename {
 	pub placeholder: String,
 }
 
+/// One `textDocument/codeAction` result, projected to the subset
+/// the frontend renders inside the CodeMirror lint tooltip.
+///
+/// Actions with no `edit` (pure `Command` shapes — e.g. `tsgo`'s
+/// "Organize imports" or oxlint's `oxc.fixAll` workspace command)
+/// are dropped on the broker side: we don't currently execute LSP
+/// commands, and rendering an action whose click does nothing
+/// would be worse than not surfacing it. The frontend can layer
+/// its own non-edit actions on top (the "Fix in coder" entry that
+/// composes a coder prompt is one example).
+///
+/// `kind` mirrors LSP's `CodeActionKind` string when present —
+/// `quickfix` / `refactor.rewrite` / `source.fixAll.oxc` / …
+/// The frontend keys on the leading segment to colour-code or
+/// re-order; today it's purely cosmetic but the data is on the
+/// wire so future surfaces don't need a protocol bump.
+///
+/// `producer` carries the server's slot key (`"typescript"`,
+/// `"oxlint"`, …) so a tooltip with quick-fixes from two
+/// co-tenants can label each one and the user can tell whose
+/// suggestion they're accepting. Stamped by the broker at
+/// fan-out time, not by the server itself.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct LspCodeAction {
+	pub title: String,
+	pub kind: Option<String>,
+	pub edit: LspWorkspaceEdit,
+	pub is_preferred: bool,
+	pub producer: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 #[serde(rename_all = "camelCase")]

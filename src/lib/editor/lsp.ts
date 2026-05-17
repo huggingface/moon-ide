@@ -21,21 +21,25 @@
 // resolves it to a `file://` URI against the workspace root.
 
 import type { Completion, CompletionContext, CompletionResult, CompletionSource } from '@codemirror/autocomplete';
-import { setDiagnostics, type Diagnostic as CmDiagnostic, lintGutter } from '@codemirror/lint';
+import { setDiagnostics, type Action as CmAction, type Diagnostic as CmDiagnostic, lintGutter } from '@codemirror/lint';
 import { Facet, type Extension } from '@codemirror/state';
 import { EditorView, hoverTooltip, type Tooltip } from '@codemirror/view';
 import type { Text } from '@codemirror/state';
+import { coder } from '../coder.svelte';
 import { ipc } from '../ipc';
 import { frontendLog } from '../logs.svelte';
 import { openExternalMarkdownLink, renderMarkdown } from '../markdown';
 import {
 	formatError,
+	type LspCodeAction,
 	type LspCompletionItem,
 	type LspDiagnostic,
 	type LspSeverity,
 	type LspTextEdit,
 } from '../protocol';
+import { workspace } from '../state.svelte';
 import { lspLanguageFor } from './lspLanguage';
+import { applyWorkspaceEdit } from './lspWorkspaceEdit';
 
 /** Diagnostic-logs source for everything autocomplete-related.
  * The user explicitly asked to see Ctrl+Space breadcrumbs here so
@@ -60,6 +64,52 @@ const SEVERITY_MAP: SeverityMap = {
 	hint: 'hint',
 };
 
+type ProducerDiagnostic = {
+	d: LspDiagnostic;
+	producer: string;
+};
+
+/** Per-(path, diagnostic) cached `LspCodeAction[]`. The lint
+ * tooltip needs `Diagnostic.actions` populated synchronously when
+ * it opens, but the LSP fetch is async; we prime this map on each
+ * `applyDiagnostics` call (one IPC per diagnostic, in parallel)
+ * and re-dispatch with full actions once it lands. The cache
+ * survives across re-dispatches so a fresh
+ * `applyDiagnostics(view, samePath)` after, say, a status-pill
+ * refresh doesn't repaint with empty action lists for one frame.
+ *
+ * Keys are derived from the diagnostic itself rather than its
+ * memory identity — diagnostics are full-replaced on every server
+ * publish, so the same logical "while(1) is constant" entry is a
+ * fresh object on every keystroke, but its `(producer, range,
+ * code)` triple stays stable until the user actually edits the
+ * line. That triple is what we key on.
+ *
+ * Module-level (not per-view) so the diff-view editor and the
+ * main editor share the cache when looking at the same file.
+ */
+const codeActionCache = new Map<string, Map<string, LspCodeAction[]>>();
+
+/** Generation counter that lets late prefetches drop their result
+ * when a newer `applyDiagnostics` has already fired. Each call
+ * bumps it; the in-flight prefetch reads it once at start and
+ * discards everything if it doesn't match at completion. Avoids
+ * the "switched files mid-fetch, old file's actions painted on
+ * new file's diagnostics" race. */
+let activeFetchGen = 0;
+
+function diagnosticKey(d: LspDiagnostic, producer: string): string {
+	const code = d.code ?? '';
+	// First line of the message disambiguates two diagnostics
+	// that share a range + code (rare, but oxlint can emit
+	// e.g. two `typescript-eslint(no-unused-vars)` for two
+	// adjacent identifiers on the same line). 80 chars is plenty
+	// — anything past that is rule-chatter the tooltip already
+	// truncates.
+	const msg = d.message.split('\n')[0]?.slice(0, 80) ?? '';
+	return `${producer}|${d.range.start.line}:${d.range.start.character}|${code}|${msg}`;
+}
+
 /**
  * Translate an LSP diagnostic list into CM's `Diagnostic[]`. The only
  * non-trivial step is the range: LSP uses line/column (0-based UTF-16
@@ -68,9 +118,14 @@ const SEVERITY_MAP: SeverityMap = {
  * rather than dropped, so a stale diagnostic from before a paste
  * still paints on a best-effort position.
  */
-function toCmDiagnostics(view: EditorView, diagnostics: readonly LspDiagnostic[]): CmDiagnostic[] {
+function toCmDiagnostics(
+	view: EditorView,
+	diagnostics: readonly ProducerDiagnostic[],
+	path: string | null,
+): CmDiagnostic[] {
 	const doc = view.state.doc;
-	return diagnostics.map((d) => {
+	const cache = path === null ? null : codeActionCache.get(path);
+	return diagnostics.map(({ d, producer }) => {
 		const from = offsetFor(doc, d.range.start.line, d.range.start.character);
 		const to = Math.max(from, offsetFor(doc, d.range.end.line, d.range.end.character));
 		const tags: string[] = [];
@@ -81,13 +136,78 @@ function toCmDiagnostics(view: EditorView, diagnostics: readonly LspDiagnostic[]
 			tags.push(d.code);
 		}
 		const suffix = tags.length > 0 ? ` [${tags.join(' ')}]` : '';
+		const cachedActions = cache === null ? undefined : cache?.get(diagnosticKey(d, producer));
 		return {
 			from,
 			to: from === to ? to + 1 : to,
 			severity: SEVERITY_MAP[d.severity],
 			message: d.message + suffix,
+			actions: buildActions(d, producer, path, cachedActions ?? []),
 		};
 	});
+}
+
+/** Build the action list shown in the lint tooltip for one
+ * diagnostic. LSP-provided quickfixes (cached or just-fetched)
+ * come first — autofix, "disable rule on this line", "disable
+ * rule for this file" — and our always-on "Fix in coder" entry
+ * caps the list so the user has an out even when the linter has
+ * no programmatic fix to offer. */
+function buildActions(
+	d: LspDiagnostic,
+	producer: string,
+	path: string | null,
+	cached: readonly LspCodeAction[],
+): readonly CmAction[] {
+	const actions: CmAction[] = [];
+	for (const ca of cached) {
+		actions.push({
+			name: ca.title,
+			apply: () => {
+				void runQuickFix(ca);
+			},
+		});
+	}
+	if (path !== null) {
+		actions.push({
+			name: 'Fix in coder',
+			apply: (view, from, to) => {
+				const text = view.state.doc.sliceString(from, to);
+				coder.fixDiagnosticInCoder({
+					path,
+					startLine: d.range.start.line + 1,
+					endLine: d.range.end.line + 1,
+					text,
+					code: d.code,
+					source: d.source,
+					message: d.message,
+				});
+			},
+		});
+	}
+	return actions;
+}
+
+async function runQuickFix(ca: LspCodeAction): Promise<void> {
+	try {
+		const result = await applyWorkspaceEdit(ca.edit);
+		for (const f of result.failures) {
+			workspace.flash(`Quick fix: failed to update ${f.path}: ${f.error}`);
+		}
+		const total = result.openCount + result.closedCount;
+		if (total === 0 && result.failures.length === 0) {
+			// Server returned an edit that targeted only files
+			// we couldn't reach (URIs outside the workspace
+			// root, dropped by the translation layer). Surface
+			// quietly rather than silently no-oping; the user
+			// just clicked something and deserves a hint that
+			// it didn't take.
+			workspace.flash(`Quick fix: nothing to apply for "${ca.title}"`);
+		}
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		workspace.flash(`Quick fix failed: ${msg}`);
+	}
 }
 
 function offsetFor(doc: EditorView['state']['doc'], line: number, character: number): number {
@@ -133,11 +253,91 @@ export function lspDiagnosticsExtension(): Extension[] {
 }
 
 /**
- * Apply the latest diagnostics for `path` to `view`. Called from
- * Editor.svelte's `$effect(() => workspace.diagnostics)` block.
+ * Apply the latest diagnostics for the editor's current path to
+ * `view`. Called from `Editor.svelte` and `DiffView.svelte` from a
+ * reactive `$effect(() => workspace.diagnosticsByProducer)` block;
+ * `perProducer` is the per-file slice of that map (so each
+ * diagnostic carries its origin server's slot key, which the
+ * lint tooltip needs to ask the right server for quickfixes).
+ *
+ * Two-phase apply for the action list: the synchronous dispatch
+ * uses whatever quick-fixes are already cached (typically empty
+ * on first apply), then a background prefetch fans out one
+ * `lsp_code_action` IPC per diagnostic and re-dispatches with the
+ * fetched actions populated. A generation counter guards against
+ * stale prefetches landing after a newer apply (e.g. user
+ * switched files mid-fetch). The `Fix in coder` action is always
+ * present client-side regardless — that's the user's escape
+ * hatch when the linter has no programmatic fix to offer.
  */
-export function applyDiagnostics(view: EditorView, diagnostics: readonly LspDiagnostic[]): void {
-	const cm = toCmDiagnostics(view, diagnostics);
+export function applyDiagnostics(
+	view: EditorView,
+	perProducer: ReadonlyMap<string, readonly LspDiagnostic[]> | null,
+): void {
+	const path = view.state.facet(filePathFacet);
+	const flat: ProducerDiagnostic[] = [];
+	if (perProducer !== null) {
+		for (const [producer, list] of perProducer) {
+			for (const d of list) {
+				flat.push({ d, producer });
+			}
+		}
+	}
+	const cm = toCmDiagnostics(view, flat, path);
+	view.dispatch(setDiagnostics(view.state, cm));
+	if (path !== null && flat.length > 0) {
+		activeFetchGen += 1;
+		const myGen = activeFetchGen;
+		void prefetchCodeActions(view, flat, path, myGen);
+	}
+}
+
+async function prefetchCodeActions(
+	view: EditorView,
+	flat: readonly ProducerDiagnostic[],
+	path: string,
+	gen: number,
+): Promise<void> {
+	const cache = codeActionCache.get(path) ?? new Map<string, LspCodeAction[]>();
+	let changed = false;
+	const tasks = flat.map(async ({ d, producer }) => {
+		const key = diagnosticKey(d, producer);
+		if (cache.has(key)) {
+			return;
+		}
+		try {
+			const actions = await ipc.lsp.codeAction(path, producer, d.range, d);
+			if (gen !== activeFetchGen) {
+				return;
+			}
+			cache.set(key, actions);
+			changed = true;
+		} catch (err) {
+			// Cache the empty list so we don't retry on every
+			// re-render. A fresh server publish (next edit) will
+			// produce new keys naturally; transient failures
+			// during a server restart land here and the user just
+			// sees the always-on `Fix in coder` action until then.
+			frontendLog('editor.diagnostics', 'warn', `code-action prefetch failed: ${formatError(err)}`);
+			cache.set(key, []);
+		}
+	});
+	await Promise.all(tasks);
+	if (gen !== activeFetchGen) {
+		return;
+	}
+	codeActionCache.set(path, cache);
+	if (!changed) {
+		return;
+	}
+	if (view.state.facet(filePathFacet) !== path) {
+		// User swapped files between prefetch start and
+		// completion — the editor's diagnostics state now belongs
+		// to a different path. Drop without dispatch; the new
+		// path's `applyDiagnostics` already fired on the swap.
+		return;
+	}
+	const cm = toCmDiagnostics(view, flat, path);
 	view.dispatch(setDiagnostics(view.state, cm));
 }
 

@@ -305,8 +305,8 @@
 		if (!v) {
 			return;
 		}
-		const list = workspace.diagnostics.get(file.path) ?? [];
-		applyDiagnostics(v, list);
+		const perProducer = workspace.diagnosticsByProducer.get(file.path) ?? null;
+		applyDiagnostics(v, perProducer);
 	});
 
 	// Blame data. Reconfiguring the facet is what makes the

@@ -21,7 +21,8 @@ use moon_core::lsp::server::PathTranslator;
 use moon_core::lsp::{LspBroker, LspServerEvent, LspSpawner};
 use moon_protocol::container::ContainerState;
 use moon_protocol::lsp::{
-	LspCompletionItem, LspCompletionList, LspHover, LspLocation, LspPosition, LspPrepareRename, LspWorkspaceEdit,
+	LspCodeAction, LspCompletionItem, LspCompletionList, LspDiagnostic, LspHover, LspLocation, LspPosition,
+	LspPrepareRename, LspRange, LspWorkspaceEdit,
 };
 use moon_protocol::MoonError;
 use moon_terminal::{container_name_for_workspace, TerminalTarget};
@@ -286,6 +287,30 @@ pub async fn lsp_rename(
 	let broker = ensure_broker(&state, &app).await?;
 	broker
 		.rename(&path, &language_id, position, &new_name)
+		.await
+		.map_err(|e| MoonError::internal(e.to_string()))
+}
+
+/// `textDocument/codeAction` for one diagnostic the user has
+/// parked the cursor on. `producer` is the slot key that emitted
+/// it (`"typescript"`, `"oxlint"`, …) — the same string the
+/// frontend received with the original `lsp:diagnostics` event,
+/// round-tripped so the broker can route the request to exactly
+/// that server. Returns the empty list when nothing is wired up
+/// for the producer or the server isn't running; the lint
+/// tooltip falls back to the always-on "Fix in coder" entry.
+#[tauri::command]
+pub async fn lsp_code_action(
+	state: State<'_, AppState>,
+	app: AppHandle,
+	path: String,
+	producer: String,
+	range: LspRange,
+	diagnostic: LspDiagnostic,
+) -> Result<Vec<LspCodeAction>, MoonError> {
+	let broker = ensure_broker(&state, &app).await?;
+	broker
+		.code_action(&path, &producer, range, diagnostic)
 		.await
 		.map_err(|e| MoonError::internal(e.to_string()))
 }

@@ -857,6 +857,62 @@ class CoderPanelState {
 		this.composerFocusTick = this.composerFocusTick + 1;
 	}
 
+	/** "Fix in coder" entry-point from the editor's lint tooltip.
+	 *  Opens the panel, attaches a snapshot of the diagnostic's
+	 *  range (so the model sees the same code the squiggle covers),
+	 *  and seeds the composer draft with a one-line ask that
+	 *  mentions the rule + first line of the linter's message.
+	 *
+	 *  The prompt is intentionally short — long pre-canned text
+	 *  trains the user to delete it before sending, which is worse
+	 *  than a tight starter line they can edit. The diagnostic's
+	 *  full message and surrounding source are already attached as
+	 *  the selection snippet, so the model isn't reading the
+	 *  squiggle blind. */
+	fixDiagnosticInCoder(args: {
+		path: string;
+		startLine: number;
+		endLine: number;
+		text: string;
+		code: string | null;
+		source: string | null;
+		message: string;
+	}): void {
+		rightPanel.set('coder');
+		this.view = 'session';
+		const token = formatAttachmentToken(args.path, args.startLine, args.endLine);
+		const dup = this.attachments.find(
+			(a) =>
+				a.kind === 'selection' && a.path === args.path && a.startLine === args.startLine && a.endLine === args.endLine,
+		);
+		if (!dup) {
+			this.attachments = [
+				...this.attachments,
+				{
+					kind: 'selection',
+					id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+					token,
+					path: args.path,
+					startLine: args.startLine,
+					endLine: args.endLine,
+					text: args.text,
+				},
+			];
+		}
+		// Tag is whichever of source / code we know — `oxlint`
+		// emits both (`source: "oxc"`, `code: "no-base-to-string"`),
+		// `tsgo` emits just `code` (the TS error number). The
+		// space between them is conditional so we never show a
+		// stray leading separator when only one is set.
+		const tagParts = [args.source, args.code].filter((s): s is string => typeof s === 'string' && s.length > 0);
+		const tag = tagParts.length > 0 ? ` [${tagParts.join(' ')}]` : '';
+		const firstLine = args.message.split('\n')[0]?.trim() ?? '';
+		const ask = firstLine.length > 0 ? `Fix${tag}: ${firstLine}` : `Fix this${tag}`;
+		const newDraft = `${ask} ${token}`;
+		this.draft = this.draft.length === 0 ? newDraft : `${newDraft}\n\n${this.draft}`;
+		this.composerFocusTick = this.composerFocusTick + 1;
+	}
+
 	/** Cap on a single pasted image. 4 MB is conservative across
 	 *  providers — OpenAI tolerates 20 MB base64, Anthropic 5 MB,
 	 *  HF Inference is squishier. We measure the decoded blob size

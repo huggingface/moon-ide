@@ -33,6 +33,7 @@ This file is read by AI coding agents (Cursor, Claude Code, opencode, etc.) when
 - Format: `bun run fmt` (oxfmt + prettier-svelte) and `cargo fmt --all`.
 - Lint: `bun run lint` (oxlint, type-aware) and `cargo clippy --all-targets -- -D warnings`.
 - Type-check: `bun run check` (`tsgo --noEmit` + `svelte-check`).
+- Test: `bun run test` (`vitest run` for JS/Svelte + `cargo test --workspace`). **Do not use `bun test`** — Bun's built-in runner doesn't compile Svelte's `$state` runes and trips on `*.svelte.ts` modules. Use the script.
 - Full details and rationale: [ADR 0004 — code style](specs/decisions/0004-code-style.md).
 - The IDE has to be able to develop itself. See [ADR 0005 — bootstrap](specs/decisions/0005-bootstrap.md).
 

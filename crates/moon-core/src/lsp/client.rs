@@ -402,15 +402,37 @@ async fn reader_loop<R: AsyncRead + Unpin + Send + 'static>(
 				.unwrap_or("<unknown>")
 				.to_owned();
 			let params = value.get("params").cloned().unwrap_or(Value::Null);
-			tracing::trace!(method = %method, "lsp: server->client request, responding null");
-			if tx
-				.send(Outbound::Response {
-					id,
-					result: Value::Null,
-				})
-				.await
-				.is_err()
-			{
+			// `workspace/configuration` is the one server→client
+			// request where `null` is the wrong answer for at
+			// least one of the servers we run: oxlint takes the
+			// per-folder config items out of `result` directly,
+			// and a `null` reply makes it bail with a parse
+			// error in its logs and silently fall back to a
+			// **partial** options set (built-in defaults plus
+			// whatever the on-disk `.oxlintrc.json` contributes
+			// for `rules`, but **without** the `options.*` keys
+			// like `typeAware` because those are LSP-side, not
+			// disk-side). Reply with `[{}, {}, …]` — one empty
+			// object per requested item — which oxlint reads as
+			// "no per-folder LSP overrides, server, please use
+			// the on-disk `.oxlintrc.json` as your single source
+			// of truth". Every other server we run today
+			// (rust-analyzer, gopls, ty, tsgo) either doesn't
+			// send this request or accepts the same shape
+			// without complaint, so the special-case stays
+			// scoped to the one method that needed it.
+			let result = if method == "workspace/configuration" {
+				let n = params
+					.get("items")
+					.and_then(Value::as_array)
+					.map(|a| a.len())
+					.unwrap_or(0);
+				Value::Array(vec![Value::Object(serde_json::Map::new()); n])
+			} else {
+				Value::Null
+			};
+			tracing::trace!(method = %method, "lsp: server->client request, responding");
+			if tx.send(Outbound::Response { id, result }).await.is_err() {
 				return;
 			}
 			let _ = notifications.send(ServerNotification {

@@ -44,6 +44,43 @@ pub fn to_lsp_position(p: mp::LspPosition) -> lt::Position {
 	}
 }
 
+pub fn to_lsp_range(r: &mp::LspRange) -> lt::Range {
+	lt::Range {
+		start: to_lsp_position(r.start),
+		end: to_lsp_position(r.end),
+	}
+}
+
+/// Reconstruct an `lsp_types::Diagnostic` from the protocol shape
+/// the frontend round-trips (range + severity + message + source +
+/// code). Used as the `context.diagnostics` payload of a
+/// `textDocument/codeAction` request — servers (oxlint in
+/// particular) match incoming diagnostics back to their internal
+/// representation by `(range, code)`, so getting those two fields
+/// right is the only thing that matters for the request to find
+/// the right fixes. `related_information`, `tags`, and `data`
+/// aren't round-tripped through our protocol so they're left
+/// `None`; servers that need them for code-action matching are
+/// not represented in our wired set today.
+pub fn to_lsp_diagnostic(d: &mp::LspDiagnostic) -> lt::Diagnostic {
+	lt::Diagnostic {
+		range: to_lsp_range(&d.range),
+		severity: Some(match d.severity {
+			mp::LspSeverity::Error => lt::DiagnosticSeverity::ERROR,
+			mp::LspSeverity::Warning => lt::DiagnosticSeverity::WARNING,
+			mp::LspSeverity::Info => lt::DiagnosticSeverity::INFORMATION,
+			mp::LspSeverity::Hint => lt::DiagnosticSeverity::HINT,
+		}),
+		code: d.code.as_ref().map(|c| lt::NumberOrString::String(c.clone())),
+		code_description: None,
+		source: d.source.clone(),
+		message: d.message.clone(),
+		related_information: None,
+		tags: None,
+		data: None,
+	}
+}
+
 fn severity(s: Option<lt::DiagnosticSeverity>) -> mp::LspSeverity {
 	// Default to Error when the server doesn't specify: playing
 	// safe is louder than silent, and most servers always set this
@@ -384,6 +421,45 @@ fn text_edit(e: lt::TextEdit) -> mp::LspTextEdit {
 	}
 }
 
+/// Project a `textDocument/codeAction` response into the
+/// frontend-shaped `LspCodeAction` list. Pure-`Command` actions
+/// (no `edit`) are dropped — see [`mp::LspCodeAction`] for why.
+/// `producer` is stamped here so the frontend can label each
+/// action with which co-tenant suggested it (oxlint vs tsgo)
+/// without the server having to carry that string itself.
+pub fn code_actions(resp: lt::CodeActionResponse, producer: &str, root: &Path) -> Vec<mp::LspCodeAction> {
+	let mut out = Vec::with_capacity(resp.len());
+	for entry in resp {
+		let action = match entry {
+			lt::CodeActionOrCommand::CodeAction(a) => a,
+			// `Command` shape: server hands us a workspace command
+			// to invoke instead of edits. We don't run commands
+			// (no `workspace/executeCommand` plumbing), so silently
+			// drop these. The "Disable rule" / autofix actions we
+			// actually want from oxlint all come through as
+			// `CodeAction` with edits.
+			lt::CodeActionOrCommand::Command(_) => continue,
+		};
+		let Some(edit) = action.edit else {
+			// No-edit code actions are typically command-only
+			// (`oxc.fixAll`); drop for the same reason as above.
+			continue;
+		};
+		let workspace = workspace_edit(edit, root);
+		if workspace.document_edits.is_empty() {
+			continue;
+		}
+		out.push(mp::LspCodeAction {
+			title: action.title,
+			kind: action.kind.map(|k| k.as_str().to_owned()),
+			edit: workspace,
+			is_preferred: action.is_preferred.unwrap_or(false),
+			producer: producer.to_owned(),
+		});
+	}
+	out
+}
+
 pub fn completion_response(resp: lt::CompletionResponse) -> mp::LspCompletionList {
 	completion_response_with_resolve(resp, true)
 }
@@ -563,6 +639,140 @@ mod tests {
 			projected.additional_text_edits[0].new_text,
 			"use std::collections::HashMap;\n"
 		);
+	}
+
+	#[test]
+	fn to_lsp_diagnostic_round_trips_code_and_severity() {
+		// `textDocument/codeAction` requires the `context.diagnostics`
+		// entries to match what the server originally emitted by
+		// `(range, code)`; lose either and oxlint silently returns
+		// no quickfixes. This test pins both fields.
+		let d = mp::LspDiagnostic {
+			range: mp::LspRange {
+				start: mp::LspPosition { line: 5, character: 3 },
+				end: mp::LspPosition { line: 5, character: 9 },
+			},
+			severity: mp::LspSeverity::Warning,
+			message: "constant condition".into(),
+			source: Some("oxc".into()),
+			code: Some("eslint(no-constant-condition)".into()),
+		};
+		let lsp = to_lsp_diagnostic(&d);
+		assert_eq!(lsp.severity, Some(lt::DiagnosticSeverity::WARNING));
+		assert_eq!(lsp.message, "constant condition");
+		assert_eq!(lsp.source.as_deref(), Some("oxc"));
+		match lsp.code {
+			Some(lt::NumberOrString::String(s)) => assert_eq!(s, "eslint(no-constant-condition)"),
+			other => panic!("expected string code, got {other:?}"),
+		}
+		assert_eq!(lsp.range.start.line, 5);
+		assert_eq!(lsp.range.end.character, 9);
+	}
+
+	#[test]
+	fn code_actions_drops_command_only_entries() {
+		// LSP's `Command` shape (no `edit`) is what oxlint ships for
+		// its workspace-wide `oxc.fixAll` action and what tsgo ships
+		// for "Organize imports". We don't run `workspace/executeCommand`
+		// so rendering them as clickable-but-no-op tooltip entries is
+		// worse than leaving them out.
+		let resp = vec![lt::CodeActionOrCommand::Command(lt::Command {
+			title: "Fix everything".into(),
+			command: "oxc.fixAll".into(),
+			arguments: None,
+		})];
+		let projected = code_actions(resp, "oxlint", std::path::Path::new("/tmp/root"));
+		assert!(projected.is_empty(), "command-only entries dropped");
+	}
+
+	// `lt::Uri` uses interior mutability for ID interning so a
+	// `HashMap<Uri, _>` trips `clippy::mutable_key_type`. Building
+	// a `WorkspaceEdit::changes` map is the *only* way to feed
+	// `code_actions` a translation-eligible edit; the lint doesn't
+	// represent a real bug here (we never mutate the URIs after
+	// insertion). Local allow so the surrounding production code
+	// keeps the lint enabled.
+	#[allow(clippy::mutable_key_type)]
+	#[test]
+	fn code_actions_keeps_quickfix_with_workspace_edit() {
+		use std::str::FromStr;
+		let tmp = tempfile::tempdir().unwrap();
+		let file = tmp.path().join("src").join("a.ts");
+		std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+		std::fs::write(&file, b"").unwrap();
+		let uri_str = format!("file://{}", file.display());
+		let mut changes = std::collections::HashMap::new();
+		changes.insert(
+			lt::Uri::from_str(&uri_str).unwrap(),
+			vec![lt::TextEdit {
+				range: lt::Range {
+					start: lt::Position { line: 5, character: 0 },
+					end: lt::Position { line: 5, character: 0 },
+				},
+				new_text: "// oxlint-disable-next-line no-constant-condition\n".into(),
+			}],
+		);
+		let resp = vec![lt::CodeActionOrCommand::CodeAction(lt::CodeAction {
+			title: "Disable no-constant-condition for this line".into(),
+			kind: Some(lt::CodeActionKind::QUICKFIX),
+			diagnostics: None,
+			edit: Some(lt::WorkspaceEdit {
+				changes: Some(changes),
+				..Default::default()
+			}),
+			command: None,
+			is_preferred: Some(false),
+			disabled: None,
+			data: None,
+		})];
+		let projected = code_actions(resp, "oxlint", tmp.path());
+		assert_eq!(projected.len(), 1);
+		assert_eq!(projected[0].title, "Disable no-constant-condition for this line");
+		assert_eq!(projected[0].kind.as_deref(), Some("quickfix"));
+		assert_eq!(projected[0].producer, "oxlint");
+		assert_eq!(projected[0].edit.document_edits.len(), 1);
+		assert_eq!(projected[0].edit.document_edits[0].path, "src/a.ts");
+		assert_eq!(projected[0].edit.document_edits[0].edits.len(), 1);
+		assert!(projected[0].edit.document_edits[0].edits[0]
+			.new_text
+			.contains("oxlint-disable-next-line"));
+	}
+
+	#[allow(clippy::mutable_key_type)] // see note on `code_actions_keeps_quickfix_with_workspace_edit`.
+	#[test]
+	fn code_actions_drops_quickfix_with_only_external_edits() {
+		// A quickfix whose edits all target paths outside the
+		// workspace root is unreachable for the frontend (the
+		// open-buffer / fs-write paths only operate on workspace-
+		// relative paths). Keeping it in the list would render a
+		// clickable-but-silent tooltip entry — worse than dropping.
+		use std::str::FromStr;
+		let tmp = tempfile::tempdir().unwrap();
+		let outside = tmp.path().parent().unwrap().join("elsewhere.ts");
+		let uri_str = format!("file://{}", outside.display());
+		let mut changes = std::collections::HashMap::new();
+		changes.insert(
+			lt::Uri::from_str(&uri_str).unwrap(),
+			vec![lt::TextEdit {
+				range: lt::Range::default(),
+				new_text: "x".into(),
+			}],
+		);
+		let resp = vec![lt::CodeActionOrCommand::CodeAction(lt::CodeAction {
+			title: "Edit external file".into(),
+			kind: Some(lt::CodeActionKind::QUICKFIX),
+			diagnostics: None,
+			edit: Some(lt::WorkspaceEdit {
+				changes: Some(changes),
+				..Default::default()
+			}),
+			command: None,
+			is_preferred: None,
+			disabled: None,
+			data: None,
+		})];
+		let projected = code_actions(resp, "oxlint", tmp.path());
+		assert!(projected.is_empty(), "external-only edits dropped");
 	}
 
 	#[test]

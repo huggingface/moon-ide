@@ -85,6 +85,42 @@ function moonTheme(dark: boolean): Extension {
 				borderColor: 'var(--m-border-strong)',
 				color: 'var(--m-fg)',
 			},
+			// Lint tooltip body: the diagnostic message + its
+			// quick-fix action buttons. CM's defaults set a 4px
+			// padding and a system-font sans-serif; we widen the
+			// padding a touch so the per-diagnostic separator
+			// reads as a row, and enforce our editor font on the
+			// message so a stray monospaced identifier in the
+			// linter's prose doesn't whiplash to system-sans.
+			'.cm-tooltip-lint': {
+				maxWidth: '60ch',
+				padding: '0',
+			},
+			'.cm-diagnostic': {
+				padding: '6px 8px',
+				fontSize: '12px',
+				lineHeight: '1.45',
+			},
+			// Quick-fix buttons (LSP code actions + our "Fix in
+			// coder" entry). CM's default is a barely-visible
+			// borderless button; pin it to our accent surface so
+			// the user can tell it's interactive at a glance.
+			'.cm-diagnosticAction': {
+				backgroundColor: 'var(--m-bg-3)',
+				color: 'var(--m-fg)',
+				border: '1px solid var(--m-border)',
+				borderRadius: '4px',
+				padding: '2px 8px',
+				marginLeft: '0',
+				marginRight: '6px',
+				marginTop: '6px',
+				fontSize: '11px',
+				cursor: 'pointer',
+			},
+			'.cm-diagnosticAction:hover': {
+				backgroundColor: 'var(--m-bg-hover)',
+				borderColor: 'var(--m-border-strong)',
+			},
 			'.cm-tooltip.cm-tooltip-autocomplete > ul > li[aria-selected]': {
 				backgroundColor: 'var(--m-accent)',
 				color: 'var(--m-bg)',

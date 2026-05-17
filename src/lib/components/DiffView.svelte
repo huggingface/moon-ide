@@ -653,8 +653,8 @@
 		if (!m || file.isDeleted) {
 			return;
 		}
-		const list = workspace.diagnostics.get(file.path) ?? [];
-		applyDiagnostics(m.b, list);
+		const perProducer = workspace.diagnosticsByProducer.get(file.path) ?? null;
+		applyDiagnostics(m.b, perProducer);
 	});
 
 	$effect(() => {

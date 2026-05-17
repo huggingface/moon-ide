@@ -283,6 +283,77 @@ pub const OXLINT_LINTER: LspBinarySpec = LspBinarySpec {
 /// given `lsp_open` / `lsp_update` call. Mirrors `tsgo`'s set.
 pub const OXLINT_LANGUAGES: &[&str] = &["typescript", "typescriptreact", "javascript", "javascriptreact"];
 
+/// Maximum walk depth when scanning for nested `.oxlintrc.json`
+/// files. `apps/<pkg>/`, `packages/<pkg>/`, `services/<pkg>/foo/`
+/// — five is enough to cover every monorepo layout we care about
+/// while keeping the scan cost on a fresh `.gitignore` walk well
+/// under a second. `WalkBuilder` already prunes `node_modules/`,
+/// `.git/`, and ignored directories so the depth budget isn't
+/// spent on vendored files.
+const OXLINT_CONFIG_SCAN_DEPTH: usize = 5;
+
+/// Discover host-relative directories that contain a
+/// `.oxlintrc.json`, anchored at `host_root`. The empty string
+/// (`""`) is always present and stands for the root itself; nested
+/// hits are returned as forward-slash paths relative to the root,
+/// sorted for deterministic output. The result is what the broker
+/// hands to [`LspServer::spawn`] as `workspace_folders` so oxlint
+/// anchors its per-folder config discovery on each containing
+/// package — a `.oxlintrc.json` in `apps/api/` is invisible to the
+/// LSP unless `apps/api` is advertised as its own workspace folder.
+///
+/// `.gitignore`-aware via `ignore::WalkBuilder`, so a
+/// `node_modules/oxlint/` dropping a sample `.oxlintrc.json`
+/// doesn't get advertised. Bounded by [`OXLINT_CONFIG_SCAN_DEPTH`]
+/// for the same reason the binary discovery is bounded — the
+/// walk needs to be cheap enough to run on every broker spawn.
+pub fn discover_oxlint_workspace_folders(host_root: &Path) -> Vec<String> {
+	use ignore::WalkBuilder;
+	let mut out: Vec<String> = vec![String::new()];
+	let walker = WalkBuilder::new(host_root)
+		.hidden(false)
+		.git_ignore(true)
+		.git_exclude(true)
+		.ignore(true)
+		.max_depth(Some(OXLINT_CONFIG_SCAN_DEPTH))
+		.build();
+	for entry in walker.flatten() {
+		if entry.depth() == 0 {
+			continue;
+		}
+		let path = entry.path();
+		if !path.is_file() {
+			continue;
+		}
+		if path.file_name().and_then(|s| s.to_str()) != Some(".oxlintrc.json") {
+			continue;
+		}
+		let Some(parent) = path.parent() else {
+			continue;
+		};
+		if parent == host_root {
+			// Root config — already covered by the empty entry.
+			continue;
+		}
+		let Ok(rel) = parent.strip_prefix(host_root) else {
+			continue;
+		};
+		let Some(rel_str) = rel.to_str() else {
+			continue;
+		};
+		// Forward slashes on the wire for cross-platform parity
+		// with the rest of the LSP path plumbing (which already
+		// normalises this way in `PathTranslator::relativise`).
+		let normalised = rel_str.replace('\\', "/");
+		if !normalised.is_empty() {
+			out.push(normalised);
+		}
+	}
+	out.sort();
+	out.dedup();
+	out
+}
+
 pub struct LspServer {
 	language_id: String,
 	client: LspClient,
@@ -294,6 +365,20 @@ pub struct LspServer {
 	/// `root` field; all URI construction + parsing routes through
 	/// here so the wire format matches what the server expects.
 	translator: PathTranslator,
+	/// Workspace folders this server was spawned with — host-side
+	/// **relative** to `translator.host_root()`, with `""` for the
+	/// root itself. Sent in `initialize` (translated through
+	/// [`PathTranslator::absolutise`] so container-routed servers
+	/// see `/workspace/<basename>/<rel>` URIs). Multi-root matters
+	/// for linter co-tenants: oxlint anchors its config discovery
+	/// per workspace folder, not per file, so a monorepo with a
+	/// `.oxlintrc.json` in each package has to advertise each
+	/// containing directory as its own folder or the per-package
+	/// rule overrides silently never take effect. Single-entry
+	/// (just the root) for language servers — they don't gain
+	/// anything from a wider list and tsgo / rust-analyzer index
+	/// the whole tree from rootUri regardless.
+	workspace_folders: Vec<String>,
 	// Per-document version counter. LSP requires monotonically
 	// increasing versions per didChange to detect out-of-order
 	// updates; we start at 1 on open and tick each change.
@@ -504,6 +589,7 @@ impl LspServer {
 		bin_path: &Path,
 		spawner: &LspSpawner,
 		translator: PathTranslator,
+		workspace_folders: Vec<String>,
 		events: broadcast::Sender<LspServerEvent>,
 		log_sink: Arc<crate::logs::LogSink>,
 	) -> Result<Option<Arc<Self>>, LspClientError> {
@@ -555,6 +641,7 @@ impl LspServer {
 			client,
 			child: Mutex::new(Some(child)),
 			translator,
+			workspace_folders,
 			docs: Mutex::new(HashMap::new()),
 			watched_patterns: Mutex::new(HashMap::new()),
 			completion_resolve_provider: std::sync::atomic::AtomicBool::new(false),
@@ -705,6 +792,20 @@ impl LspServer {
 				diagnostic: Some(lt::DiagnosticWorkspaceClientCapabilities {
 					refresh_support: Some(true),
 				}),
+				// `workspace/configuration`: we declare support so
+				// servers that run in pull-config mode (oxlint, in
+				// particular, which asks per workspace folder for
+				// its `oxc_language_server` settings) get a real
+				// reply instead of the request silently failing.
+				// `client.rs` answers with an array of empty
+				// objects — one per requested item — which oxlint
+				// reads as "no per-folder overrides, server, use
+				// the on-disk `.oxlintrc.json` you'd have used
+				// anyway". Combined with `workspaceFolders` per
+				// `.oxlintrc.json`-bearing directory, this is what
+				// makes the editor's diagnostics line up with the
+				// project's `oxlint --fix` script in monorepos.
+				configuration: Some(true),
 				..Default::default()
 			}),
 			text_document: Some(lt::TextDocumentClientCapabilities {
@@ -805,6 +906,38 @@ impl LspServer {
 		let server_root = self.translator.server_root();
 		let root_uri = path_to_file_uri(server_root.as_std_path());
 
+		// Build one `WorkspaceFolder` per host-relative entry in
+		// `self.workspace_folders`. Empty / `"."` entries map to
+		// the workspace root itself; anything else translates
+		// through `absolutise` so container-routed servers see the
+		// `/workspace/<basename>/<rel>` form. Folder name is the
+		// basename — what shows up in the server's logs and
+		// status output. Falls back to the root if the field is
+		// somehow empty so we never send `Some(vec![])`, which
+		// some servers treat as "no folders, work file-by-file".
+		let mut folders: Vec<lt::WorkspaceFolder> = self
+			.workspace_folders
+			.iter()
+			.map(|rel| {
+				let abs = if rel.is_empty() || rel == "." {
+					server_root.clone()
+				} else {
+					self.translator.absolutise(rel)
+				};
+				let name = abs.file_name().unwrap_or("workspace").to_owned();
+				lt::WorkspaceFolder {
+					uri: path_to_file_uri(abs.as_std_path()),
+					name,
+				}
+			})
+			.collect();
+		if folders.is_empty() {
+			folders.push(lt::WorkspaceFolder {
+				uri: root_uri.clone(),
+				name: server_root.file_name().unwrap_or("workspace").to_owned(),
+			});
+		}
+
 		// Forward our PID only if the server is in the same PID
 		// namespace (host route). For container / remote routes we
 		// send `null`: the spec lets us opt out of the parent-died
@@ -827,10 +960,7 @@ impl LspServer {
 			initialization_options: None,
 			capabilities: caps,
 			trace: None,
-			workspace_folders: Some(vec![lt::WorkspaceFolder {
-				uri: root_uri,
-				name: server_root.file_name().unwrap_or("workspace").to_owned(),
-			}]),
+			workspace_folders: Some(folders),
 			client_info: Some(lt::ClientInfo {
 				name: "moon-ide".into(),
 				version: Some(env!("CARGO_PKG_VERSION").into()),
@@ -1265,6 +1395,50 @@ impl LspServer {
 			Some(edit) => translate::workspace_edit(edit, self.translator.server_root().as_std_path()),
 			None => mp::LspWorkspaceEdit::default(),
 		})
+	}
+
+	/// Send `textDocument/codeAction` for one diagnostic the user
+	/// is parked on. We pass exactly that diagnostic in the request
+	/// `context`, with `only` narrowed to `quickfix` so servers that
+	/// also return refactor / source actions stay out of the lint
+	/// tooltip — those belong on a different surface (a future
+	/// `Show all code actions` keybinding) and would crowd out the
+	/// fix-this-thing options the user actually came for.
+	///
+	/// Edits in the response are translated through
+	/// [`translate::workspace_edit`] against the translator's
+	/// server-side root, so a containerised oxlint that sees
+	/// `/workspace/<basename>/...` URIs comes back with paths
+	/// relative to the host workspace root — exactly the shape the
+	/// frontend's open-buffer / fs-write appliers already accept.
+	pub async fn code_action(
+		&self,
+		rel_path: &str,
+		range: &mp::LspRange,
+		diagnostic: &mp::LspDiagnostic,
+		producer: &str,
+	) -> Result<Vec<mp::LspCodeAction>, LspClientError> {
+		let uri = self.relative_to_uri(rel_path);
+		let params = lt::CodeActionParams {
+			text_document: lt::TextDocumentIdentifier { uri },
+			range: translate::to_lsp_range(range),
+			context: lt::CodeActionContext {
+				diagnostics: vec![translate::to_lsp_diagnostic(diagnostic)],
+				only: Some(vec![lt::CodeActionKind::QUICKFIX]),
+				trigger_kind: Some(lt::CodeActionTriggerKind::INVOKED),
+			},
+			work_done_progress_params: lt::WorkDoneProgressParams::default(),
+			partial_result_params: lt::PartialResultParams::default(),
+		};
+		let resp: Option<lt::CodeActionResponse> = self.client.request("textDocument/codeAction", params).await?;
+		let Some(resp) = resp else {
+			return Ok(Vec::new());
+		};
+		Ok(translate::code_actions(
+			resp,
+			producer,
+			self.translator.server_root().as_std_path(),
+		))
 	}
 
 	pub async fn completion(
@@ -2611,5 +2785,77 @@ mod tests {
 		}
 		assert!(!OXLINT_LANGUAGES.contains(&"rust"));
 		assert!(!OXLINT_LANGUAGES.contains(&"python"));
+	}
+
+	/// The empty-tree case: no nested `.oxlintrc.json`, just the
+	/// root entry. Needed because the broker hands the result
+	/// straight to `LspServer::spawn` and an empty list there
+	/// would surface as "no workspace folders at all" — some
+	/// servers treat that as "work file-by-file, ignore configs".
+	#[test]
+	fn discover_oxlint_workspace_folders_returns_root_when_no_configs() {
+		let tmp = tempfile::tempdir().unwrap();
+		let root = tmp.path();
+		let folders = discover_oxlint_workspace_folders(root);
+		assert_eq!(folders, vec![String::new()]);
+	}
+
+	/// Real monorepo shape: `.oxlintrc.json` at root + nested
+	/// packages. We expect the root entry (`""`) plus each
+	/// nested directory, sorted, no duplicates. A root-level
+	/// `.oxlintrc.json` should NOT add a separate entry — it's
+	/// already covered by the empty string.
+	#[test]
+	fn discover_oxlint_workspace_folders_walks_nested_packages() {
+		let tmp = tempfile::tempdir().unwrap();
+		let root = tmp.path();
+		fs::write(root.join(".oxlintrc.json"), "{}").unwrap();
+		fs::create_dir_all(root.join("apps/api")).unwrap();
+		fs::write(root.join("apps/api/.oxlintrc.json"), "{}").unwrap();
+		fs::create_dir_all(root.join("apps/game-server")).unwrap();
+		fs::write(root.join("apps/game-server/.oxlintrc.json"), "{}").unwrap();
+		fs::create_dir_all(root.join("packages/utils")).unwrap();
+		fs::write(root.join("packages/utils/.oxlintrc.json"), "{}").unwrap();
+
+		let mut folders = discover_oxlint_workspace_folders(root);
+		folders.sort();
+		assert_eq!(
+			folders,
+			vec![
+				"".to_owned(),
+				"apps/api".to_owned(),
+				"apps/game-server".to_owned(),
+				"packages/utils".to_owned(),
+			]
+		);
+	}
+
+	/// `node_modules/` is `.gitignore`'d by default in any real
+	/// project (and our `WalkBuilder` honours it). Confirm a
+	/// vendored `.oxlintrc.json` from a dependency doesn't show
+	/// up as its own workspace folder — that would point oxlint
+	/// at someone else's config and misreport diagnostics.
+	/// `node_modules/` is ignored in any real project (`.gitignore`
+	/// inside a git repo, or a top-level `.ignore` file the walker
+	/// also honours). We use `.ignore` here because tempdirs aren't
+	/// git repos and `WalkBuilder::git_ignore` only kicks in when
+	/// it can find a `.git/` ancestor — `.ignore` works
+	/// unconditionally and is the convention `ripgrep` and friends
+	/// document for ignored-but-not-VCS-ignored layouts. The real
+	/// codebase always has `.gitignore`, so the assertion still
+	/// proves the intended behaviour: a vendored `.oxlintrc.json`
+	/// from a dependency must not show up as its own workspace
+	/// folder, otherwise oxlint would lint half the project with
+	/// somebody else's config.
+	#[test]
+	fn discover_oxlint_workspace_folders_skips_node_modules() {
+		let tmp = tempfile::tempdir().unwrap();
+		let root = tmp.path();
+		fs::write(root.join(".ignore"), "node_modules\n").unwrap();
+		fs::create_dir_all(root.join("node_modules/oxlint")).unwrap();
+		fs::write(root.join("node_modules/oxlint/.oxlintrc.json"), "{}").unwrap();
+
+		let folders = discover_oxlint_workspace_folders(root);
+		assert_eq!(folders, vec![String::new()]);
 	}
 }
