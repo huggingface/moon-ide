@@ -1392,6 +1392,10 @@ pub fn discover_binary(bin_name: &str, strategy: DiscoveryStrategy, start: &Path
 			} else {
 				bin_name.to_owned()
 			};
+			// Tier 1: hoisted layout — walk ancestors of `start`
+			// looking for `node_modules/.bin/<bin>`. Hits the
+			// common case (single-package projects, npm / pnpm /
+			// bun monorepos with a hoisted root `node_modules`).
 			for ancestor in start.ancestors() {
 				let candidate = ancestor.join("node_modules").join(".bin").join(&filename);
 				if candidate.exists() {
@@ -1402,6 +1406,25 @@ pub fn discover_binary(bin_name: &str, strategy: DiscoveryStrategy, start: &Path
 					);
 					return Some(candidate);
 				}
+			}
+			// Tier 2: per-workspace layout — pnpm / yarn workspaces
+			// with `nodeLinker: node-modules` install each
+			// package's deps into its own `node_modules/.bin/`.
+			// `start` is the IDE workspace root (e.g.
+			// `~/repo/`), but the closest `node_modules/.bin/`
+			// might live at `apps/api/node_modules/.bin/`. Walk a
+			// bounded subtree of `start` looking for those nested
+			// locations. Capped depth keeps a `node_modules`-free
+			// monorepo from costing a full filesystem walk on
+			// every spawn — typical hits are 2-3 levels deep
+			// (`apps/<pkg>/`, `packages/<pkg>/`).
+			if let Some(found) = scan_for_node_modules_bin(start, &filename, NODE_MODULES_SCAN_DEPTH) {
+				tracing::debug!(
+					bin = bin_name,
+					path = %found.display(),
+					"lsp: resolved via nested workspace node_modules"
+				);
+				return Some(found);
 			}
 			match which::which(bin_name) {
 				Ok(path) => {
@@ -1504,6 +1527,85 @@ pub fn discover_binary(bin_name: &str, strategy: DiscoveryStrategy, start: &Path
 	}
 }
 
+/// How deep we'll scan a workspace root for nested
+/// `node_modules/.bin/<bin>` entries before giving up. Picked to
+/// cover the common monorepo shapes (`apps/<pkg>/`,
+/// `packages/<pkg>/`, `services/<pkg>/`) with a tiny buffer for
+/// odd ones (`apps/<area>/<pkg>/`). Past this depth the cost of
+/// a fresh discovery on every LSP spawn outweighs the benefit:
+/// the user can hoist their dep, install it globally, or move
+/// their workspace root to the package that owns the binary.
+const NODE_MODULES_SCAN_DEPTH: u32 = 4;
+
+/// Bounded depth-first scan of `root` looking for
+/// `*/node_modules/.bin/<filename>`. Used as a fallback for
+/// monorepos where the `node_modules` lives below the workspace
+/// root (per-workspace install layout) rather than at or above
+/// it (hoisted layout).
+///
+/// Skips `.git/` and any `node_modules/` directory we're not
+/// directly probing — recursing into a `node_modules/` would
+/// turn one missing binary into a `find / -name foo` storm. We
+/// also don't traverse symlinks, same reason.
+///
+/// Returns the first match found in directory-iteration order.
+/// In practice every match is the right one — a monorepo doesn't
+/// install two oxlints at different versions across packages and
+/// expect us to "pick the right one" without a separate signal.
+fn scan_for_node_modules_bin(root: &Path, filename: &str, max_depth: u32) -> Option<PathBuf> {
+	scan_for_node_modules_bin_inner(root, filename, max_depth, 0)
+}
+
+fn scan_for_node_modules_bin_inner(dir: &Path, filename: &str, max_depth: u32, depth: u32) -> Option<PathBuf> {
+	// At every level the *current* dir gets a probe — covers the
+	// case where `dir` itself has a `node_modules/.bin/<filename>`
+	// the ancestor walk in `discover_binary` already missed
+	// (shouldn't happen given `start.ancestors()` covers `start`
+	// itself, but it's free and keeps the recursion shape uniform).
+	let candidate = dir.join("node_modules").join(".bin").join(filename);
+	if candidate.exists() {
+		return Some(candidate);
+	}
+	if depth >= max_depth {
+		return None;
+	}
+	let iter = std::fs::read_dir(dir).ok()?;
+	for entry in iter.flatten() {
+		let Ok(file_type) = entry.file_type() else {
+			continue;
+		};
+		// `is_dir()` follows symlinks, which we don't want for
+		// the recursive descent — `is_symlink()` short-circuits
+		// the symlink case and `is_dir()` on the metadata
+		// without traversal isn't directly available, so test
+		// `is_symlink()` first.
+		if file_type.is_symlink() || !file_type.is_dir() {
+			continue;
+		}
+		let name = entry.file_name();
+		// `node_modules/` itself is the leaf we *probe* for at
+		// this level (above), not something we descend into:
+		// recursing inside a `node_modules` is what the cost
+		// guardrails are protecting against.
+		if name == "node_modules" || name == ".git" {
+			continue;
+		}
+		// Hidden directories (`.next/`, `.cache/`, …) likewise
+		// shouldn't host a real package, and walking them is
+		// pure overhead.
+		if let Some(s) = name.to_str() {
+			if s.starts_with('.') {
+				continue;
+			}
+		}
+		let child = entry.path();
+		if let Some(found) = scan_for_node_modules_bin_inner(&child, filename, max_depth, depth + 1) {
+			return Some(found);
+		}
+	}
+	None
+}
+
 /// Per-platform `(subdir, filename)` inside `.venv/` that hosts an
 /// installed CLI. Unix venvs use `bin/<name>` (no extension), Windows
 /// venvs use `Scripts/<name>.exe`. Tracks Python's own venv module
@@ -1556,6 +1658,7 @@ pub fn container_binary_path(spec: &LspBinarySpec, translator: &PathTranslator) 
 			// Container is always Linux (moon-base is debian) —
 			// no `.cmd` suffix dance the host path needs.
 			let filename = spec.bin_name;
+			// Tier 1: ancestor walk for the hoisted-root layout.
 			for ancestor in host_root.ancestors() {
 				let candidate = ancestor.join("node_modules").join(".bin").join(filename);
 				if !candidate.exists() {
@@ -1583,6 +1686,22 @@ pub fn container_binary_path(spec: &LspBinarySpec, translator: &PathTranslator) 
 					"lsp: resolved via container-side node_modules"
 				);
 				return Some(path);
+			}
+			// Tier 2: nested-workspace layout (per-package
+			// `node_modules`). Same bounded scan the host path
+			// uses; matches always sit inside `host_root` here
+			// because we only descend from the bind-mount root,
+			// so the relativise step always succeeds.
+			if let Some(host_match) = scan_for_node_modules_bin(host_root, filename, NODE_MODULES_SCAN_DEPTH) {
+				if let Ok(rel) = host_match.strip_prefix(host_root) {
+					let path = server_root.join(rel);
+					tracing::debug!(
+						bin = spec.bin_name,
+						path = %path.display(),
+						"lsp: resolved via container-side nested workspace node_modules"
+					);
+					return Some(path);
+				}
 			}
 			tracing::debug!(
 				bin = spec.bin_name,
@@ -1791,6 +1910,62 @@ mod tests {
 
 		let found = discover_binary("my-lsp", DiscoveryStrategy::NodeModules, &nested);
 		assert_eq!(found.as_deref(), Some(bin_path.as_path()));
+	}
+
+	/// pnpm / yarn workspace layout: each package installs into its
+	/// own `node_modules/.bin/`, with no hoisted root copy. The
+	/// ancestor walk (the hoisted-layout fast path) misses those, so
+	/// discovery falls through to the bounded downward scan. Mimics
+	/// `~/repo/apps/api/node_modules/.bin/oxlint` while the IDE's
+	/// workspace root is `~/repo/`.
+	#[test]
+	fn discover_finds_binary_in_nested_workspace_node_modules() {
+		let tmp = tempfile::tempdir().unwrap();
+		let nested_bin_dir = tmp.path().join("apps").join("api").join("node_modules").join(".bin");
+		fs::create_dir_all(&nested_bin_dir).unwrap();
+		let bin_name = if cfg!(windows) { "my-lsp.cmd" } else { "my-lsp" };
+		let bin_path = nested_bin_dir.join(bin_name);
+		fs::write(&bin_path, b"#!/bin/sh\n").unwrap();
+		make_executable(&bin_path);
+
+		let found = discover_binary("my-lsp", DiscoveryStrategy::NodeModules, tmp.path());
+		assert_eq!(
+			found.as_deref(),
+			Some(bin_path.as_path()),
+			"per-workspace node_modules under the workspace root must be discoverable"
+		);
+	}
+
+	/// Don't recurse into `node_modules/` when looking for a binary.
+	/// A package that ships its own `node_modules/.bin/<name>`
+	/// (vendored dep) shouldn't shadow the project's chosen one — and
+	/// the cost of walking every nested `node_modules` would explode.
+	#[test]
+	fn discover_does_not_recurse_into_node_modules_for_nested_search() {
+		let tmp = tempfile::tempdir().unwrap();
+		// Bury a fake `my-lsp` deep inside a vendored package's own
+		// `node_modules`. The scan must not find this — it's not the
+		// project's chosen binary, and walking into nested
+		// `node_modules` would be a perf disaster on real repos.
+		let buried = tmp
+			.path()
+			.join("apps")
+			.join("api")
+			.join("node_modules")
+			.join("some-pkg")
+			.join("node_modules")
+			.join(".bin");
+		fs::create_dir_all(&buried).unwrap();
+		let bin_name = if cfg!(windows) { "my-lsp.cmd" } else { "my-lsp" };
+		let bin_path = buried.join(bin_name);
+		fs::write(&bin_path, b"#!/bin/sh\n").unwrap();
+		make_executable(&bin_path);
+
+		let found = discover_binary("my-lsp", DiscoveryStrategy::NodeModules, tmp.path());
+		assert!(
+			found.is_none(),
+			"nested-search must skip `node_modules/` itself; got {found:?}"
+		);
 	}
 
 	/// A project-local copy beats whatever happens to be on PATH.

@@ -825,6 +825,7 @@
 	// effect only fires when the actual set of paths to render
 	// changes.
 	const deletedSignature = $derived(deletedPathsSignature(workspace.gitStatusEntries));
+	const ignoredSignature = $derived(ignoredPathsSignature(workspace.gitStatusEntries));
 	let lastTreePaths: ReadonlySet<string> | null = null;
 	// Tracks the active folder seen by the last path-set effect run.
 	// Switching folders bounces this and forces the wholesale
@@ -874,11 +875,20 @@
 			merged = workspace.scmFilterPaths;
 		} else {
 			const paths = workspace.paths;
-			// Track the signature so a deletion appearing/disappearing
-			// re-runs this effect. We immediately untrack to re-read
-			// `gitStatusEntries` for the merge — the signature already
-			// captured "what changed".
+			// Track signatures so an ignored or deleted entry
+			// appearing / disappearing re-runs this effect. Add /
+			// modify / untracked status flips produce the same
+			// signature for both, so the noisy git-status refresh
+			// stream doesn't re-fire the path-set work just to
+			// flip a `Modified` flag — only structural changes
+			// the tree cares about (deletions add ghost rows,
+			// ignored dirs become lazy frontiers) do. We then
+			// `untrack` the read of `gitStatusEntries` itself: the
+			// signatures already captured "what changed", so
+			// re-tracking the array would double-fire on every
+			// refresh.
 			void deletedSignature;
+			void ignoredSignature;
 			const entries = untrack(() => workspace.gitStatusEntries);
 			merged = mergedPathsWithDeletions(paths, entries);
 			// Re-seed `lazyDirs` whenever the active folder swap or
@@ -1391,6 +1401,26 @@
 		}
 		deleted.sort();
 		return deleted.join('\0');
+	}
+
+	// Mirror of `deletedPathsSignature` for the `Ignored` subset.
+	// Drives the lazy-seed re-run when a background `refreshGitStatus`
+	// lands ignored entries the initial pass didn't have. Without
+	// this, the path-set effect would only re-run on path / deletion
+	// changes, and `seedLazyDirs` would stay anchored to whatever
+	// (likely empty) set of ignored entries existed at first paint —
+	// `node_modules/` would never get the lazy badge so the click
+	// would no-op. See `seedLazyDirs` and `loadLazyDir` for the load
+	// path that depends on this.
+	function ignoredPathsSignature(entries: readonly GitStatusEntry[]): string {
+		const ignored: string[] = [];
+		for (const entry of entries) {
+			if (entry.status === 'ignored') {
+				ignored.push(entry.path);
+			}
+		}
+		ignored.sort();
+		return ignored.join('\0');
 	}
 
 	// Mirror the active file in the tree's selection so the row stays
