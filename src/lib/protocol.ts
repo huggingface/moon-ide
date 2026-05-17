@@ -440,6 +440,12 @@ export type LspDiagnostic = {
  */
 export type LspDiagnosticsEvent = {
 	path: string;
+	/** Slot key of the server that produced this report —
+	 * `"typescript"`, `"rust"`, `"oxlint"`, … Lets the frontend
+	 * key diagnostics by `(path, producer)` so two servers
+	 * (the language server + a co-tenant linter) don't clobber
+	 * each other when they both publish for the same file. */
+	producer: string;
 	diagnostics: LspDiagnostic[];
 };
 

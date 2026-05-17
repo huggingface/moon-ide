@@ -30,7 +30,7 @@ use tokio::sync::{broadcast, Mutex};
 use super::client::LspClientError;
 use super::server::{
 	container_binary_path, discover_binary, resolve_install_hint, LspBinarySpec, LspServer, LspServerEvent,
-	PathTranslator, GO_SERVER, PYTHON_SERVER, RUST_SERVER, TS_SERVER,
+	PathTranslator, GO_SERVER, OXLINT_LANGUAGES, OXLINT_LINTER, PYTHON_SERVER, RUST_SERVER, TS_SERVER,
 };
 use super::spawn::LspSpawner;
 use crate::logs::LogSink;
@@ -53,6 +53,24 @@ pub struct LspBroker {
 	/// is already the host; we don't stack another fallback.
 	fallback: Option<SpawnerPair>,
 	servers: Mutex<HashMap<String, ServerSlot>>,
+	/// Linter co-tenants — keyed by the linter's slot name
+	/// (`"oxlint"`), populated lazily on the first `lsp_open` for
+	/// a file whose language id appears in
+	/// [`super::server::OXLINT_LANGUAGES`]. Each linter speaks
+	/// LSP just like the language servers in `servers` and pushes
+	/// its diagnostics through the same broadcast channel — they
+	/// arrive on the frontend as `producer: "oxlint"` and the UI
+	/// merges them with the language server's reports for the
+	/// same path.
+	///
+	/// Lives in a separate map (rather than next to the
+	/// language servers) because the lookup is by **linter
+	/// name**, not file language id, and routing fans out two
+	/// servers per file. Hover / completion / definition / rename
+	/// only consult `servers`; only diagnostics-producing ops
+	/// (`open` / `update` / `close` / `notify_files_changed` /
+	/// `refresh_open_diagnostics`) fan out here.
+	lint_servers: Mutex<HashMap<String, ServerSlot>>,
 	events: broadcast::Sender<LspServerEvent>,
 	/// Diagnostic log sink. Receives the same status transitions
 	/// the `events` channel does, plus routing decisions
@@ -157,6 +175,7 @@ impl LspBroker {
 			primary: SpawnerPair { spawner, translator },
 			fallback,
 			servers: Mutex::new(HashMap::new()),
+			lint_servers: Mutex::new(HashMap::new()),
 			events,
 			log_sink,
 		})
@@ -193,6 +212,34 @@ impl LspBroker {
 		}
 	}
 
+	/// Optional linter co-tenant for `language_id`. Returns the
+	/// linter's spec when one applies — today only oxlint for
+	/// JS/TS — and `None` when there's no linter wired for that
+	/// language. Linters publish their own diagnostics alongside
+	/// the language server's; they don't replace it.
+	fn lint_spec_for(language_id: &str) -> Option<&'static LspBinarySpec> {
+		if OXLINT_LANGUAGES.contains(&language_id) {
+			Some(&OXLINT_LINTER)
+		} else {
+			None
+		}
+	}
+
+	/// The map of [`ServerSlot`]s a given spec lives in. Language
+	/// servers (TS / Rust / Python / Go) live in `servers`;
+	/// linter co-tenants (oxlint) live in `lint_servers`. Two
+	/// maps so a single language id can have **both** a language
+	/// server and a linter slot keyed by their respective
+	/// `spec.language_id` ("typescript" vs "oxlint") without
+	/// collision.
+	fn slot_map_for(&self, spec: &LspBinarySpec) -> &Mutex<HashMap<String, ServerSlot>> {
+		if spec.language_id == OXLINT_LINTER.language_id {
+			&self.lint_servers
+		} else {
+			&self.servers
+		}
+	}
+
 	/// Ensure a server for `spec` is running and return a cloned
 	/// handle. Spawns on first call. On spawn failure (binary
 	/// missing, bad args, child exits immediately) caches a
@@ -206,12 +253,13 @@ impl LspBroker {
 	/// if one is configured — concretely, a container-backed
 	/// broker falls back to host LSP for servers whose binary
 	/// isn't in the container. The per-language outcome is
-	/// cached in the `servers` map so a missing server doesn't
-	/// re-probe on every subsequent open.
+	/// cached in the matching slot map so a missing server
+	/// doesn't re-probe on every subsequent open.
 	async fn ensure_server(&self, spec: &LspBinarySpec) -> Result<Option<Arc<LspServer>>, LspClientError> {
 		let log_source = Self::log_source_for(spec.language_id);
+		let slot_map = self.slot_map_for(spec);
 		{
-			let mut servers = self.servers.lock().await;
+			let mut servers = slot_map.lock().await;
 			if let Some(slot) = servers.get(spec.language_id) {
 				match slot {
 					ServerSlot::Ready(s) if s.is_alive() => return Ok(Some(s.clone())),
@@ -249,8 +297,7 @@ impl LspBroker {
 
 		match self.try_spawn_on(spec, &self.primary).await {
 			SpawnOutcome::Ready(server) => {
-				self
-					.servers
+				slot_map
 					.lock()
 					.await
 					.insert(spec.language_id.to_owned(), ServerSlot::Ready(server.clone()));
@@ -263,8 +310,7 @@ impl LspBroker {
 				// for this language. Falling back to host on an
 				// init-level crash would mask bugs in the server
 				// or the image; surface it instead.
-				self
-					.servers
+				slot_map
 					.lock()
 					.await
 					.insert(spec.language_id.to_owned(), ServerSlot::NotAvailable);
@@ -298,8 +344,7 @@ impl LspBroker {
 			self.log_sink.info(&log_source, "retrying on host fallback route");
 			match self.try_spawn_on(spec, fallback).await {
 				SpawnOutcome::Ready(server) => {
-					self
-						.servers
+					slot_map
 						.lock()
 						.await
 						.insert(spec.language_id.to_owned(), ServerSlot::Ready(server.clone()));
@@ -307,8 +352,7 @@ impl LspBroker {
 					return Ok(Some(server));
 				}
 				SpawnOutcome::Err(e) => {
-					self
-						.servers
+					slot_map
 						.lock()
 						.await
 						.insert(spec.language_id.to_owned(), ServerSlot::NotAvailable);
@@ -333,15 +377,15 @@ impl LspBroker {
 			}
 		}
 
-		self
-			.servers
+		slot_map
 			.lock()
 			.await
 			.insert(spec.language_id.to_owned(), ServerSlot::NotAvailable);
 		// Resolve once: the helper picks `pnpm -wD add` / `npm i -D` /
 		// `bun add -D` based on the lockfile at the workspace root
-		// (TypeScript only — every other server has a single
-		// canonical install path).
+		// for the package-manager-aware specs (TypeScript, oxlint).
+		// Other servers have a single canonical install path and
+		// fall through to the static `install_hint`.
 		let install_hint = resolve_install_hint(spec, &self.root);
 		let _ = self.events.send(LspServerEvent::StatusChanged(mp::LspStatusEvent {
 			language_id: spec.language_id.to_owned(),
@@ -459,39 +503,66 @@ impl LspBroker {
 	}
 
 	pub async fn open(&self, path: &str, text: String, language_id: &str) -> Result<(), LspClientError> {
-		let Some(spec) = Self::spec_for(language_id) else {
-			return Ok(());
-		};
-		let Some(server) = self.ensure_server(spec).await? else {
-			return Ok(());
-		};
-		server.open(path, text, language_id).await
+		// Fan out to the language server (if any) AND the linter
+		// co-tenant (if any). Either being missing is fine; only
+		// truly hard errors propagate. Errors are independent: a
+		// failed linter open shouldn't stop the language server's
+		// open from going through.
+		if let Some(spec) = Self::spec_for(language_id) {
+			if let Some(server) = self.ensure_server(spec).await? {
+				server.open(path, text.clone(), language_id).await?;
+			}
+		}
+		if let Some(spec) = Self::lint_spec_for(language_id) {
+			if let Some(server) = self.ensure_server(spec).await? {
+				server.open(path, text, language_id).await?;
+			}
+		}
+		Ok(())
 	}
 
 	pub async fn update(&self, path: &str, text: String, language_id: &str) -> Result<(), LspClientError> {
-		let Some(spec) = Self::spec_for(language_id) else {
-			return Ok(());
-		};
-		let Some(server) = self.ensure_server(spec).await? else {
-			return Ok(());
-		};
-		server.update(path, text).await
+		if let Some(spec) = Self::spec_for(language_id) {
+			if let Some(server) = self.ensure_server(spec).await? {
+				server.update(path, text.clone()).await?;
+			}
+		}
+		if let Some(spec) = Self::lint_spec_for(language_id) {
+			if let Some(server) = self.ensure_server(spec).await? {
+				server.update(path, text).await?;
+			}
+		}
+		Ok(())
 	}
 
 	pub async fn close(&self, path: &str, language_id: &str) -> Result<(), LspClientError> {
-		let Some(spec) = Self::spec_for(language_id) else {
-			return Ok(());
-		};
-		// Don't spawn just to close; if the server isn't up there's
-		// nothing to do.
-		let server = {
-			let servers = self.servers.lock().await;
-			match servers.get(spec.language_id) {
-				Some(ServerSlot::Ready(s)) => s.clone(),
-				_ => return Ok(()),
+		// Don't spawn either server just to close; if neither is up
+		// there's nothing to do.
+		if let Some(spec) = Self::spec_for(language_id) {
+			let server = {
+				let servers = self.servers.lock().await;
+				match servers.get(spec.language_id) {
+					Some(ServerSlot::Ready(s)) => Some(s.clone()),
+					_ => None,
+				}
+			};
+			if let Some(s) = server {
+				s.close(path).await?;
 			}
-		};
-		server.close(path).await
+		}
+		if let Some(spec) = Self::lint_spec_for(language_id) {
+			let server = {
+				let lint_servers = self.lint_servers.lock().await;
+				match lint_servers.get(spec.language_id) {
+					Some(ServerSlot::Ready(s)) => Some(s.clone()),
+					_ => None,
+				}
+			};
+			if let Some(s) = server {
+				s.close(path).await?;
+			}
+		}
+		Ok(())
 	}
 
 	pub async fn hover(
@@ -636,21 +707,8 @@ impl LspBroker {
 	/// notify is fire-and-forget by design, and a single server
 	/// failing to receive the batch shouldn't block the others.
 	pub async fn notify_files_changed(&self, paths: &[String]) {
-		let servers: Vec<Arc<LspServer>> = {
-			let guard = self.servers.lock().await;
-			guard
-				.iter()
-				.filter_map(|(_, slot)| {
-					let ServerSlot::Ready(server) = slot else {
-						return None;
-					};
-					if !server.is_alive() {
-						return None;
-					}
-					Some(server.clone())
-				})
-				.collect()
-		};
+		let mut servers: Vec<Arc<LspServer>> = collect_alive(&self.servers).await;
+		servers.extend(collect_alive(&self.lint_servers).await);
 		for server in servers {
 			if let Err(err) = server.notify_files_changed(paths).await {
 				tracing::warn!(error = %err, "lsp: notify_files_changed failed");
@@ -679,7 +737,10 @@ impl LspBroker {
 	/// the pull internally at debug-log level, so the broad
 	/// fan-out stays cheap.
 	pub async fn refresh_open_diagnostics(&self, language_filter: Option<&[String]>) {
-		let servers: Vec<Arc<LspServer>> = {
+		// Language servers: filter by their slot key (which equals
+		// the file's language id for tsgo / rust-analyzer / ty /
+		// gopls).
+		let mut servers: Vec<Arc<LspServer>> = {
 			let guard = self.servers.lock().await;
 			guard
 				.iter()
@@ -699,6 +760,36 @@ impl LspBroker {
 				})
 				.collect()
 		};
+		// Linter co-tenants: filter by *file* language id, since
+		// the linter's slot key ("oxlint") is the producer name,
+		// not a file language. Treat the linter as relevant when
+		// the filter contains any language it covers.
+		let lint_servers: Vec<Arc<LspServer>> = {
+			let guard = self.lint_servers.lock().await;
+			guard
+				.iter()
+				.filter_map(|(lint_name, slot)| {
+					let ServerSlot::Ready(server) = slot else {
+						return None;
+					};
+					if let Some(filter) = language_filter {
+						let covers = if lint_name == OXLINT_LINTER.language_id {
+							filter.iter().any(|l| OXLINT_LANGUAGES.contains(&l.as_str()))
+						} else {
+							false
+						};
+						if !covers {
+							return None;
+						}
+					}
+					if !server.is_alive() {
+						return None;
+					}
+					Some(server.clone())
+				})
+				.collect()
+		};
+		servers.extend(lint_servers);
 		for server in servers {
 			server.refresh_open_diagnostics().await;
 		}
@@ -708,9 +799,15 @@ impl LspBroker {
 	/// workspace close. Best-effort — any hung server will SIGKILL
 	/// on its `Child` drop regardless.
 	pub async fn shutdown_all(&self) {
-		let mut servers = self.servers.lock().await;
-		let slots: Vec<_> = servers.drain().collect();
-		for (lang, slot) in slots {
+		let mut all: Vec<(String, ServerSlot)> = {
+			let mut servers = self.servers.lock().await;
+			servers.drain().collect()
+		};
+		{
+			let mut lint_servers = self.lint_servers.lock().await;
+			all.extend(lint_servers.drain());
+		}
+		for (lang, slot) in all {
 			if let ServerSlot::Ready(server) = slot {
 				server.shutdown().await;
 				let _ = self.events.send(LspServerEvent::StatusChanged(mp::LspStatusEvent {
@@ -733,8 +830,24 @@ impl LspBroker {
 	/// yet). Anything in `Failed` / `Pending` is dropped without
 	/// a shutdown call.
 	pub async fn shutdown_language(&self, language_id: &str) {
-		let mut servers = self.servers.lock().await;
-		let Some(slot) = servers.remove(language_id) else {
+		// Language id here is also the slot key, so it works for
+		// both maps. A "shutdown_language('typescript')" only kills
+		// `tsgo`, leaving `oxlint` alone — and vice versa for
+		// "shutdown_language('oxlint')". The Restart pill in the
+		// status bar is per-pill, so the per-slot semantics match
+		// what the user clicked on.
+		let slot = {
+			let mut servers = self.servers.lock().await;
+			servers.remove(language_id)
+		};
+		let slot = match slot {
+			Some(s) => Some(s),
+			None => {
+				let mut lint_servers = self.lint_servers.lock().await;
+				lint_servers.remove(language_id)
+			}
+		};
+		let Some(slot) = slot else {
 			return;
 		};
 		let log_source = Self::log_source_for(language_id);
@@ -750,4 +863,26 @@ impl LspBroker {
 			detail: None,
 		}));
 	}
+}
+
+/// Snapshot of every alive [`LspServer`] in a slot map. Returned as
+/// owned `Arc`s so the caller can drop the lock before doing I/O on
+/// any of them — the broker's broadcast operations (notify-files-
+/// changed, refresh-diagnostics) call into the servers, which take
+/// their own locks; holding the slot map while doing that risks
+/// deadlock with `ensure_server` paths.
+async fn collect_alive(map: &Mutex<HashMap<String, ServerSlot>>) -> Vec<Arc<LspServer>> {
+	let guard = map.lock().await;
+	guard
+		.iter()
+		.filter_map(|(_, slot)| {
+			let ServerSlot::Ready(server) = slot else {
+				return None;
+			};
+			if !server.is_alive() {
+				return None;
+			}
+			Some(server.clone())
+		})
+		.collect()
 }

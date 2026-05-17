@@ -60,14 +60,27 @@ pub struct LspDiagnostic {
 }
 
 /// Pushed on the `lsp:diagnostics` Tauri event whenever a server
-/// emits `textDocument/publishDiagnostics`. `path` is the same
-/// workspace-relative form the frontend opens files with; the
-/// backend translates between that and `file://` URIs internally.
+/// emits `textDocument/publishDiagnostics` (or returns a
+/// `Full` `DocumentDiagnosticReport` to a pull request).
+///
+/// `path` is the same workspace-relative form the frontend opens
+/// files with; the backend translates between that and `file://`
+/// URIs internally.
+///
+/// `producer` identifies which server's report this is — typically
+/// the server's slot key in the broker (`"typescript"`, `"rust"`,
+/// `"oxlint"`, …). Two servers can have an opinion on the same
+/// file at the same time (e.g. `tsgo` runs alongside `oxlint --lsp`
+/// on a `.ts` file), and each one publishes full-replacement reports
+/// for its own surface. The frontend keys diagnostics by
+/// `(path, producer)` so a fresh oxlint report never clobbers
+/// `tsgo`'s, and vice versa.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct LspDiagnosticsEvent {
 	pub path: String,
+	pub producer: String,
 	pub diagnostics: Vec<LspDiagnostic>,
 }
 

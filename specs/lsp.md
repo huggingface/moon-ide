@@ -259,16 +259,17 @@ tsserver issues `workspace/configuration`, `window/workDoneProgress/create`, and
 
 Two Tauri events, both keyed by language-agnostic payloads so the UI doesn't need a per-language dispatch:
 
-- **`lsp:diagnostics`** — `LspDiagnosticsEvent { path, diagnostics: [] }`. Full replacement. Either a `textDocument/publishDiagnostics` notification from a push-mode server _or_ a `Full` `DocumentDiagnosticReport` returned by a pull-mode server (see "Diagnostics: push and pull" above) becomes one of these — the frontend can't tell the modes apart and shouldn't have to.
+- **`lsp:diagnostics`** — `LspDiagnosticsEvent { path, producer, diagnostics: [] }`. Full replacement **per producer**. Either a `textDocument/publishDiagnostics` notification from a push-mode server _or_ a `Full` `DocumentDiagnosticReport` returned by a pull-mode server (see "Diagnostics: push and pull" above) becomes one of these — the frontend can't tell the modes apart and shouldn't have to. `producer` carries the server's slot key (`"typescript"`, `"rust"`, `"oxlint"`, …) so two servers reporting on the same file don't clobber each other — the frontend keys diagnostics by `(path, producer)` and the editor's lint gutter consumes the flat union. See [Linter co-tenants](#linter-co-tenants).
 - **`lsp:status`** — `LspStatusEvent { languageId, status, detail? }`. Emitted on every server-state transition (spawn attempt, initialise success, crash, shutdown). The UI caches the latest per language id and only renders the pill when the status is anything other than `running`. **Crash detection is push, not pull**: each `LspClient` carries an `AtomicBool` liveness flag flipped by either I/O loop on exit, plus a `Notify` that fans out the transition. `LspServer::spawn` parks a watcher task that emits `status: 'crashed'` the instant the flag flips, and the broker's `ensure_server` evicts dead slots via `is_alive()` so the next request re-spawns. The frontend re-`open`s the active buffer on a fresh `crashed` so the new server lands with the live text in its doc set.
 - **`logs:entry`** (cross-cutting) — `LogEntry { source, level, message, tsMs, seq }`. Not LSP-specific; the broker emits into the workspace's shared `LogSink` (`crates/moon-core/src/logs.rs`) using `lsp.<language_id>` as the source key. Routing decisions (primary→fallback), discovery hits/misses, status transitions, and child stderr all flow through here so the user can open the bottom-panel logs view and see why a server didn't come up. See [test plan 0069](test-plans/0069-diag-logs-panel.md).
 
 ## Frontend architecture
 
 - **`src/lib/state.svelte.ts`** is the single source of LSP state on the frontend:
-  - `diagnostics: Map<path, LspDiagnostic[]>` — populated by the `lsp:diagnostics` listener.
+  - `diagnosticsByProducer: Map<path, Map<producer, LspDiagnostic[]>>` — full state, written by the `lsp:diagnostics` listener (`producer` slice replaced on each event).
+  - `diagnostics: Map<path, LspDiagnostic[]>` — flat union the editor reads; recomputed from `diagnosticsByProducer` on every event so consumers (`Editor.svelte`, `DiffView.svelte`, `StatusBar.svelte`) stay producer-agnostic.
   - `lspStatuses: Map<language_id, LspStatusEvent>` — populated by the `lsp:status` listener.
-  - `lspOpen(path, text)` / `lspScheduleUpdate(path, text)` (150ms debounce) / `lspClose(path)` wrap the three lifecycle calls and no-op on file types without a server.
+  - `lspOpen(path, text)` / `lspScheduleUpdate(path, text)` (150ms debounce) / `lspClose(path)` wrap the three lifecycle calls and no-op on file types without a server. The broker fans out each call to the language server **and** any [linter co-tenant](#linter-co-tenants) registered for the file's language id.
 - **`src/lib/editor/lsp.ts`** is the CodeMirror adapter surface:
   - `filePathFacet` — current buffer path, read by every adapter.
   - `lspDiagnosticsExtension()` — just `lintGutter()`; the actual diagnostics come in via `applyDiagnostics(view, list)` which `Editor.svelte` calls from a reactive `$effect`.
@@ -277,6 +278,19 @@ Two Tauri events, both keyed by language-agnostic payloads so the UI doesn't nee
 - **`src/lib/editor/lspGotoDefinition.ts`** — Ctrl/Cmd-hover link preview + Ctrl/Cmd-click jump. Takes a `{ jumpTo, flash }` callback bag so it doesn't import `state.svelte.ts`. `Editor.svelte` wires the real workspace methods through.
 - **`src/lib/editor/lspRename.ts`** — F2 rename. Owns its own state field, keymap, panel, and applier; talks to `workspace` directly for the open-buffer / `flash` surface (the panel is editor-local, so callback-bagging would be over-engineered here).
 - **`src/lib/editor/lspLanguage.ts`** — path → LSP language-id mapping. Also the feature-flag: returning `null` means "no LSP here", so adding Rust is literally one entry plus a wire-in on the backend.
+
+### Linter co-tenants
+
+Some linters speak LSP. Today that's `oxlint --lsp` (added upstream in oxc 1.47, [PR #19292](https://github.com/oxc-project/oxc/pull/19292) and friends); we route it through the **same broker** as the language servers, but in a parallel `lint_servers` slot map so it can run **alongside** the language server on the same file. A `.ts` open spawns both `tsgo` (in `servers["typescript"]`) and `oxlint` (in `lint_servers["oxlint"]`); both publish `textDocument/publishDiagnostics`, both stamps land on the editor's lint gutter, each scoped to its own `producer`.
+
+The split is deliberate:
+
+- **Routing key differs from file language id.** `tsgo`'s slot key is `"typescript"`; the file's `textDocument.languageId` is also `"typescript"`. For oxlint, the slot key is `"oxlint"` (the binary, also the producer name on diagnostics + the status pill) while the file's `textDocument.languageId` stays `"typescript"` — that's what oxlint needs in order to pick the right parser. Two maps, keyed by their own slot, sidesteps the language-id collision cleanly without needing a `(language_id, role)` tuple key.
+- **Capability surface is narrower.** Linters only do diagnostics. Hover, completion, definition, rename, prepare-rename: not advertised, not asked for, not consulted. Only the diagnostics-producing surface (`open` / `update` / `close` / `notify_files_changed` / `refresh_open_diagnostics` / `shutdown_*`) fans out to both maps; everything else continues to look at `servers` only.
+- **Producer stamp keeps clobbers honest.** `LspDiagnosticsEvent` carries `producer: String` — every emit site stamps it with `self.language_id` (the slot key). The frontend stores `diagnosticsByProducer: Map<path, Map<producer, LspDiagnostic[]>>` and recomputes the flat union for the editor on each event, so a fresh oxlint report only replaces oxlint's slice — `tsgo`'s last truth stays put until `tsgo` itself republishes, and vice versa.
+- **Lifecycle is independent.** Status events for oxlint carry `language_id: "oxlint"` (matching its slot key), so the status bar paints a separate pill. Crash, restart, NotAvailable: all per-slot. The user can have `tsgo` running fine and `oxlint` not-installed; the install hint is `bun add -D oxlint` (lockfile-aware → `pnpm -wD add oxlint` / `npm i -D oxlint`, mirroring the TS server's adaptation).
+
+`OXLINT_LANGUAGES` (in `crates/moon-core/src/lsp/server.rs`) is the wire-up: the four JS/TS file language ids on which the broker spawns oxlint as a co-tenant. Adding more linters in the future is the same template — a new `LspBinarySpec`, a new `<linter>_LANGUAGES` set, a new branch in `Broker::lint_spec_for`. We don't need a generic "registry" abstraction yet; one linter ships, more get added when the team asks.
 
 ## Non-goals of stage 1
 

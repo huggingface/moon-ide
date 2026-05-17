@@ -344,14 +344,26 @@ class WorkspaceState {
 	// per folder so the cross-folder cache stays consistent.
 	editorConfigs = $state<Map<string, EditorConfig>>(new Map());
 
-	// LSP diagnostics per path. Full-replacement semantics: each
-	// `lsp:diagnostics` event overwrites the entry for its path with
-	// the server's new truth, matching how language servers model
-	// `publishDiagnostics`. An empty array means "server has run on
-	// this file, clean slate" — distinct from "not present" which
-	// means "server hasn't reported yet". The editor binds its lint
-	// gutter to this; the status bar reads the active path's entry.
+	// LSP diagnostics per path, flat union across all producers.
+	// Full-replacement semantics applies *per producer*, not per
+	// path — `lsp:diagnostics` events stamp `producer` (the server's
+	// slot key, e.g. `"typescript"` or `"oxlint"`) so two co-tenant
+	// servers reporting on the same file each refresh their own
+	// slice without clobbering the other. The flat union is what the
+	// editor's lint gutter and the status bar read; the per-producer
+	// split lives in [`diagnosticsByProducer`] so we can refresh one
+	// slice cleanly when a single server publishes.
 	diagnostics = $state<Map<string, LspDiagnostic[]>>(new Map());
+
+	// Backing per-producer state for [`diagnostics`]. Keyed first
+	// by file path, then by `producer` from the `lsp:diagnostics`
+	// event. Outer Map is a fresh object on update so Svelte
+	// reactivity reaches into derived consumers; the inner Map is
+	// rebuilt on each producer-update too. Held alongside
+	// `diagnostics` (rather than computed lazily) because every
+	// editor frame would otherwise reduce-then-flatten on the hot
+	// path.
+	diagnosticsByProducer = $state<Map<string, Map<string, LspDiagnostic[]>>>(new Map());
 
 	// Per-file git blame, indexed by line. The inline current-line
 	// annotation and its hover tooltip read from here. Populated on
@@ -2623,9 +2635,30 @@ class WorkspaceState {
 		this.#lspListenersWired = true;
 		try {
 			await listen<LspDiagnosticsEvent>('lsp:diagnostics', ({ payload }) => {
-				const next = new Map(this.diagnostics);
-				next.set(payload.path, payload.diagnostics);
-				this.diagnostics = next;
+				// Update the per-producer slice for this path,
+				// then recompute the flat union the editor reads.
+				// Empty `diagnostics` from a producer is a real
+				// clean-slate signal for that producer (server
+				// finished a pass and the file has no problems
+				// from its perspective) — we keep the producer
+				// entry so the union explicitly reflects "ts ok,
+				// oxlint still thinking" rather than reverting to
+				// "ts hasn't reported yet".
+				const nextByProducer = new Map(this.diagnosticsByProducer);
+				const perPath = new Map(nextByProducer.get(payload.path) ?? new Map<string, LspDiagnostic[]>());
+				perPath.set(payload.producer, payload.diagnostics);
+				nextByProducer.set(payload.path, perPath);
+				this.diagnosticsByProducer = nextByProducer;
+
+				const flat: LspDiagnostic[] = [];
+				for (const list of perPath.values()) {
+					for (const d of list) {
+						flat.push(d);
+					}
+				}
+				const nextDiagnostics = new Map(this.diagnostics);
+				nextDiagnostics.set(payload.path, flat);
+				this.diagnostics = nextDiagnostics;
 			});
 			await listen<LspStatusEvent>('lsp:status', ({ payload }) => {
 				const prev = this.lspStatuses.get(payload.languageId)?.status ?? null;
@@ -2992,6 +3025,11 @@ class WorkspaceState {
 			const next = new Map(this.diagnostics);
 			next.delete(path);
 			this.diagnostics = next;
+		}
+		if (this.diagnosticsByProducer.has(path)) {
+			const nextByProducer = new Map(this.diagnosticsByProducer);
+			nextByProducer.delete(path);
+			this.diagnosticsByProducer = nextByProducer;
 		}
 		if (!languageId || isSyntheticBufferPath(path)) {
 			return;

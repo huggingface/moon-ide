@@ -161,6 +161,14 @@ pub fn resolve_install_hint(spec: &LspBinarySpec, root: &Utf8Path) -> String {
 			return "npm i -D @typescript/native-preview".to_string();
 		}
 	}
+	if spec.language_id == "oxlint" {
+		if root.join("pnpm-lock.yaml").exists() {
+			return "pnpm -wD add oxlint".to_string();
+		}
+		if root.join("package-lock.json").exists() {
+			return "npm i -D oxlint".to_string();
+		}
+	}
 	spec.install_hint.to_string()
 }
 
@@ -237,6 +245,43 @@ pub const GO_SERVER: LspBinarySpec = LspBinarySpec {
 	install_hint: "go install golang.org/x/tools/gopls@latest",
 	discovery: DiscoveryStrategy::GoBin,
 };
+
+/// JS/TS linter — `oxlint`, run as a language server via its
+/// built-in `--lsp` flag.
+///
+/// **Co-tenant with the language server.** This is *not* a
+/// replacement for `tsgo` — it runs alongside on the same files,
+/// publishing its own `publishDiagnostics` reports stamped with
+/// `producer: "oxlint"`. The frontend keys diagnostics by
+/// `(path, producer)` so type errors from `tsgo` and lint
+/// warnings from `oxlint` coexist on the same line.
+///
+/// `oxlint --lsp` was wired up in oxc 1.47 (see oxc-project/oxc
+/// PRs #19292, #20321) and speaks standard LSP framing over
+/// stdio. Discovery prefers the project-local `node_modules/.bin/oxlint`
+/// — same `NodeModules` walk we use for `tsgo` — so a project
+/// pinning a specific oxlint version isn't shadowed by a global
+/// install.
+///
+/// `language_id: "oxlint"` is the broker slot key (the producer
+/// stamp on diagnostics, the status-bar pill name). The
+/// per-document `textDocument.languageId` carried in `didOpen`
+/// is still the file's real language (`"typescript"`,
+/// `"javascriptreact"`, …) — that's what oxlint needs to know
+/// which parser to use.
+pub const OXLINT_LINTER: LspBinarySpec = LspBinarySpec {
+	language_id: "oxlint",
+	bin_name: "oxlint",
+	args: &["--lsp"],
+	probe_args: &["--version"],
+	install_hint: "bun add -D oxlint",
+	discovery: DiscoveryStrategy::NodeModules,
+};
+
+/// File language ids that the linter co-tenant covers. Used by
+/// the broker to decide whether to spawn / route to oxlint for a
+/// given `lsp_open` / `lsp_update` call. Mirrors `tsgo`'s set.
+pub const OXLINT_LANGUAGES: &[&str] = &["typescript", "typescriptreact", "javascript", "javascriptreact"];
 
 pub struct LspServer {
 	language_id: String,
@@ -547,6 +592,7 @@ impl LspServer {
 						let diagnostics = params.diagnostics.into_iter().map(translate::diagnostic).collect();
 						let _ = events_sink.send(LspServerEvent::Diagnostics(mp::LspDiagnosticsEvent {
 							path,
+							producer: server_ref.language_id.clone(),
 							diagnostics,
 						}));
 					}
@@ -953,6 +999,7 @@ impl LspServer {
 		let diagnostics = items.into_iter().map(translate::diagnostic).collect();
 		let _ = self.events.send(LspServerEvent::Diagnostics(mp::LspDiagnosticsEvent {
 			path: rel_path.to_owned(),
+			producer: self.language_id.clone(),
 			diagnostics,
 		}));
 		Ok(())
@@ -2368,5 +2415,36 @@ mod tests {
 			resolve_install_hint(&PYTHON_SERVER, &root),
 			"uv add --dev ty (or uv tool install ty)"
 		);
+	}
+
+	/// Oxlint's install hint follows the same lockfile-driven
+	/// shape as the TS server: pnpm / npm-aware where the user's
+	/// project pins a manager, otherwise the static `bun add -D`
+	/// default.
+	#[test]
+	fn install_hint_for_oxlint_follows_lockfile() {
+		let tmp = tempfile::tempdir().unwrap();
+		let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		assert_eq!(resolve_install_hint(&OXLINT_LINTER, &root), "bun add -D oxlint");
+
+		fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: 6\n").unwrap();
+		assert_eq!(resolve_install_hint(&OXLINT_LINTER, &root), "pnpm -wD add oxlint");
+
+		fs::remove_file(root.join("pnpm-lock.yaml")).unwrap();
+		fs::write(root.join("package-lock.json"), "{}").unwrap();
+		assert_eq!(resolve_install_hint(&OXLINT_LINTER, &root), "npm i -D oxlint");
+	}
+
+	/// `OXLINT_LANGUAGES` covers exactly the file language ids
+	/// `tsgo` covers — they're co-tenants on every JS/TS file, so
+	/// the sets must agree. Drift here means oxlint silently
+	/// skips some files that otherwise have a TS server running.
+	#[test]
+	fn oxlint_covers_same_languages_as_ts_server() {
+		for lang in ["typescript", "typescriptreact", "javascript", "javascriptreact"] {
+			assert!(OXLINT_LANGUAGES.contains(&lang), "oxlint should cover {lang}");
+		}
+		assert!(!OXLINT_LANGUAGES.contains(&"rust"));
+		assert!(!OXLINT_LANGUAGES.contains(&"python"));
 	}
 }
