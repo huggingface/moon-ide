@@ -80,12 +80,12 @@ export type CoderRow =
 export type CoderView = 'list' | 'session' | 'subagent';
 
 /** Status of one sub-agent currently visible in the parent's
- *  transcript. Drives the collapsed card under each `spawn_subagent`
+ *  transcript. Drives the collapsed card under each `task`
  *  tool row: `running` while events stream in, `done` /
  *  `error` / `aborted` once `subagent_finished` lands. */
 export type SubagentStatus = 'running' | 'done' | 'error';
 
-/** Summary card displayed inline under a `spawn_subagent` tool
+/** Summary card displayed inline under a `task` tool
  *  call in the parent's transcript. Keyed by `toolCallId` so the
  *  card lookup matches the tool row's stable id. */
 export type SubagentSummary = {

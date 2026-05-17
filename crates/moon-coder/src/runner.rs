@@ -42,10 +42,10 @@ use crate::inference::{
 use crate::models::{self, CoderModels, ResolvedProvider, SharedCoderModels};
 use crate::providers::{self, ProviderKeyring};
 use crate::sessions::{
-	self, current_time_ms, new_session_id, session_title_from_prompt, sessions_dir, LoadedSession, SessionHeader,
-	SessionRecord, SessionSummary, SESSION_SCHEMA_VERSION,
+	self, current_time_ms, new_session_id, session_title_from_prompt, sessions_dir, subagent_session_dir, LoadedSession,
+	SessionHeader, SessionRecord, SessionSummary, SESSION_SCHEMA_VERSION,
 };
-use crate::subagent::{build_subagent_spec, run_subagent, spawn_subagent_tool_definition, SubagentReport};
+use crate::subagent::{build_subagent_spec, run_subagent, task_tool_definition};
 use crate::tools::{CoderMode, ToolContext, ToolRegistry};
 use moon_core::WorkspaceFolderEntry;
 use serde_json::json;
@@ -1145,6 +1145,15 @@ impl CoderHandle {
 					let cutoff = messages.len();
 					crate::compaction::apply_summary_to_messages(&mut messages, cutoff, summary);
 				}
+				SessionRecord::SubagentSpawned { .. } | SessionRecord::SubagentFinished { .. } => {
+					// Sub-agent records are UI-only: they rebuild
+					// the parent's collapsed cards on reload but
+					// don't shape the parent's `messages` slice.
+					// The sub-agent's text result is already stored
+					// as a `Tool` record's content in the
+					// surrounding tool_call / tool_result pair, so
+					// the parent's history is unaffected.
+				}
 			}
 		}
 		let summary = SessionSummary {
@@ -1185,7 +1194,7 @@ impl CoderHandle {
 			};
 		let session = Session {
 			header,
-			session_dir: Some(dir),
+			session_dir: Some(dir.clone()),
 			messages,
 			persisted_records: records.len() as u32,
 			auto_rename_pending: false,
@@ -1214,8 +1223,44 @@ impl CoderHandle {
 			created_at_ms: summary.created_at_ms,
 			updated_at_ms: summary.updated_at_ms,
 		});
+		// Sub-agent records replay through a dedicated async path
+		// that pulls in each sub-agent's own JSONL so the popped-
+		// out transcript matches what the user originally saw,
+		// not just a synthetic preview. The other variants stay
+		// on the sync [`emit_replay_events`] path.
 		for record in records {
-			emit_replay_events(&sink, record);
+			match record {
+				SessionRecord::SubagentSpawned {
+					ref tool_call_id,
+					ref subagent_id,
+					ref target_folder,
+					ref mode,
+				} => {
+					replay_subagent_spawned(
+						&sink,
+						&dir,
+						&summary.id,
+						tool_call_id.clone(),
+						subagent_id.clone(),
+						target_folder.clone(),
+						mode.clone(),
+					)
+					.await;
+				}
+				SessionRecord::SubagentFinished {
+					subagent_id,
+					tokens_used_estimate,
+					was_error,
+					result_preview: _,
+				} => {
+					sink.send(CoderEvent::SubagentFinished {
+						subagent_id,
+						tokens_used_estimate,
+						was_error,
+					});
+				}
+				other => emit_replay_events(&sink, other),
+			}
 		}
 		// Restore-time context-usage hint. `Provider` source when
 		// we recovered a persisted `Usage` record (the ring renders
@@ -1485,13 +1530,13 @@ async fn run_turn(
 	let standard_model = models.standard().to_owned();
 
 	// Parent's tool list = registry's regular tools plus the
-	// `spawn_subagent` definition. Sub-agents pick from the
-	// registry alone (no spawn_subagent), which is how the
+	// `task` definition (delegation primitive). Sub-agents pick
+	// from the registry alone (no `task`), which is how the
 	// depth-1 cap is enforced — a sub-agent literally cannot
 	// describe a sub-sub-agent because the model never sees the
 	// tool.
 	let mut tool_defs = state.tools.definitions();
-	tool_defs.push(spawn_subagent_tool_definition());
+	tool_defs.push(task_tool_definition());
 	// Pin the tool context to the **session's** bound folder
 	// (captured at spawn time), not the live `active_folder()`.
 	// This is what makes "agent keeps running in folder X while
@@ -1589,6 +1634,37 @@ async fn run_turn(
 		let thinking_emitted = std::sync::atomic::AtomicBool::new(false);
 		let sink_for_cb = sink.clone();
 		let id_for_cb = assistant_id.clone();
+
+		// Real-time token-usage estimates. We send a prompt-only
+		// estimate the moment the round-trip starts so the
+		// context-usage ring jumps as soon as the user hits send
+		// (or a tool result lands), instead of waiting for the
+		// provider's final usage chunk. While the assistant
+		// streams we update the completion side at most every
+		// `STREAM_USAGE_THROTTLE` so the panel reflects "the
+		// model is producing a lot of text" without firing an
+		// event per delta. The post-call `emit_token_usage` below
+		// overrides everything with provider-exact numbers when
+		// the chunk arrives.
+		const STREAM_USAGE_THROTTLE: std::time::Duration = std::time::Duration::from_millis(500);
+		let prompt_estimate = estimate_prompt_tokens(&messages);
+		let context_window = models.context_window(&standard_model);
+		sink.send(CoderEvent::TokenUsage {
+			prompt_tokens: prompt_estimate,
+			completion_tokens: 0,
+			total_tokens: prompt_estimate,
+			context_window,
+			source: TokenUsageSource::Estimate,
+			cache_read_tokens: 0,
+			cache_creation_tokens: 0,
+		});
+		// `Mutex` rather than `Cell` because the future the
+		// closure participates in is required to be `Send` —
+		// `tokio::spawn` requires a `Send` future, and `Cell` is
+		// not `Sync`. The closure runs sequentially from a single
+		// task so there's no real contention.
+		let stream_usage_state = std::sync::Mutex::new((0u32, std::time::Instant::now()));
+
 		let response = state
 			.inference
 			.chat_completion_stream(&standard_model, &messages, &tool_defs, &cancel, |event| match event {
@@ -1600,6 +1676,14 @@ async fn run_turn(
 						id: id_for_cb.clone(),
 						delta: delta.to_string(),
 					});
+					maybe_emit_stream_usage(
+						&sink_for_cb,
+						&stream_usage_state,
+						STREAM_USAGE_THROTTLE,
+						delta.len(),
+						prompt_estimate,
+						context_window,
+					);
 				}
 				StreamEvent::ThinkingDelta { delta } => {
 					// Thinking arrives before content on every
@@ -1617,6 +1701,14 @@ async fn run_turn(
 						id: id_for_cb.clone(),
 						delta: delta.to_string(),
 					});
+					maybe_emit_stream_usage(
+						&sink_for_cb,
+						&stream_usage_state,
+						STREAM_USAGE_THROTTLE,
+						delta.len(),
+						prompt_estimate,
+						context_window,
+					);
 				}
 				// Tool-call deltas are intentionally not surfaced.
 				// The runner buffers them inside the inference
@@ -1836,27 +1928,26 @@ done, what's still unfinished, and any uncertainty. If the user needs to take a 
 
 /// Limit on concurrent sub-agents per parent batch. A
 /// `Semaphore`-bound; only meaningful when the model emits a
-/// homogeneous `spawn_subagent` batch larger than this. Excess
-/// sub-agents queue against the semaphore. Hardcoded for now per
-/// AGENTS.md "hardcode first, configure later" — bumps land when
-/// a real workload outgrows it.
+/// homogeneous `task` batch larger than this. Excess sub-agents
+/// queue against the semaphore. Hardcoded for now per AGENTS.md
+/// "hardcode first, configure later" — bumps land when a real
+/// workload outgrows it.
 const SUBAGENT_PARALLELISM_CAP: usize = 4;
 
 /// Run every `tool_call` in `calls`, emitting the `ToolCall` /
 /// `ToolResult` event pair for each and pushing the result onto
 /// the session's messages. Branches:
 ///
-/// - **Homogeneous `spawn_subagent` batch (N ≥ 2)**: spawn each
-///   sub-agent concurrently, bounded by [`SUBAGENT_PARALLELISM_CAP`].
+/// - **Homogeneous `task` batch (N ≥ 2)**: spawn each sub-agent
+///   concurrently, bounded by [`SUBAGENT_PARALLELISM_CAP`].
 ///   Tool-call events fire upfront so the UI inserts every
 ///   collapsed card before any sub-agent finishes; results land
 ///   in completion order but are pushed onto `messages` in the
 ///   model's original tool-call order so context stays
 ///   deterministic across replays.
-/// - **Anything else** (mixed batch, single call, or zero
-///   `spawn_subagent` calls): sequential dispatch. Sub-agent
-///   intercept still kicks in for individual `spawn_subagent`
-///   calls in mixed batches.
+/// - **Anything else** (mixed batch, single call, or zero `task`
+///   calls): sequential dispatch. Sub-agent intercept still kicks
+///   in for individual `task` calls in mixed batches.
 async fn dispatch_tool_calls(
 	state: &Arc<CoderState>,
 	fs: &Arc<FolderSession>,
@@ -1865,7 +1956,7 @@ async fn dispatch_tool_calls(
 	cancel: &CancellationToken,
 	calls: &[crate::inference::ToolCall],
 ) -> Result<(), CoderError> {
-	let homogeneous_subagent = calls.len() >= 2 && calls.iter().all(|c| c.function.name == "spawn_subagent");
+	let homogeneous_subagent = calls.len() >= 2 && calls.iter().all(|c| c.function.name == "task");
 	if homogeneous_subagent {
 		dispatch_subagent_batch(state, fs, sink, cx, cancel, calls).await
 	} else {
@@ -1879,14 +1970,14 @@ async fn dispatch_tool_calls(
 				name: call.function.name.clone(),
 				args: args.clone(),
 			});
-			let outcome = if call.function.name == "spawn_subagent" {
-				handle_spawn_subagent(state, fs, sink, cx, cancel, &call.id, &args).await
+			let outcome = if call.function.name == "task" {
+				handle_task(state, fs, sink, cx, cancel, &call.id, &args).await
 			} else if call.function.name == "todo_write" {
 				// `todo_write` mutates per-session state owned by
 				// the runner (`Session.todos`), so it doesn't fit
 				// the stateless-tool shape `ToolRegistry::dispatch`
 				// expects. Short-circuit here, alongside
-				// `spawn_subagent`, before falling through to the
+				// `task`, before falling through to the
 				// generic registry dispatch.
 				handle_todo_write(fs, &args).await
 			} else {
@@ -1935,7 +2026,7 @@ async fn dispatch_subagent_batch(
 		let call_id = call.id.clone();
 		let task = tokio::spawn(async move {
 			let _permit = sem_for_task.acquire().await.expect("semaphore not closed");
-			handle_spawn_subagent(
+			handle_task(
 				&state_for_task,
 				&fs_for_task,
 				&sink_for_task,
@@ -1965,7 +2056,7 @@ async fn dispatch_subagent_batch(
 /// errors surface back to the model as the tool's `is_error: true`
 /// result so a confused call ("folder X not bound", "unknown
 /// mode") is a recoverable signal, not a hard turn-failure.
-async fn handle_spawn_subagent(
+async fn handle_task(
 	state: &Arc<CoderState>,
 	fs: &Arc<FolderSession>,
 	sink: &FolderEventSink,
@@ -1989,13 +2080,30 @@ async fn handle_spawn_subagent(
 		&cx.folder,
 		&bound,
 	)?;
+	// Persist the spawn into the **parent**'s JSONL right away
+	// (before the sub-agent runs) so a crash / kill mid-sub-agent
+	// still leaves a record the parent can replay. The on-disk
+	// record mirrors `CoderEvent::SubagentSpawned` byte-for-byte
+	// so replay needs no shape conversion. Best-effort: a write
+	// failure logs at warn but doesn't fail the spawn.
+	persist_parent_record(
+		fs,
+		SessionRecord::SubagentSpawned {
+			tool_call_id: tool_call_id.to_string(),
+			subagent_id: spec.id.clone(),
+			target_folder: spec.folder.folder.path.clone(),
+			mode: spec.mode.as_wire().to_string(),
+		},
+	)
+	.await;
+	let subagent_id_for_record = spec.id.clone();
 	let sub_cancel = cancel.child_token();
 	// Sub-agents share their parent's `FolderEventSink` — events
 	// arrive in the parent's folder bucket on the frontend, which
 	// is exactly the multi-session contract: sub-agents belong to
 	// whichever project originated them.
 	let models_snapshot = state.models.read().await.clone();
-	let report: SubagentReport = run_subagent(
+	let outcome = run_subagent(
 		&state.tools,
 		&state.inference,
 		sink,
@@ -2004,7 +2112,30 @@ async fn handle_spawn_subagent(
 		spec,
 		sub_cancel,
 	)
-	.await?;
+	.await;
+	// Persist the finish (success or error) into the parent's
+	// JSONL. We piggy-back on the live `CoderEvent::SubagentFinished`
+	// shape and add a `result_preview` so a reloaded parent can
+	// render the collapsed card without lazy-loading the
+	// sub-agent's own JSONL. For errors we record `was_error: true`
+	// and a `None` preview — the parent's tool_result row already
+	// surfaces the error JSON, no need to duplicate it.
+	let finished_record = match &outcome {
+		Ok(report) => SessionRecord::SubagentFinished {
+			subagent_id: subagent_id_for_record.clone(),
+			tokens_used_estimate: report.tokens_used_estimate,
+			was_error: false,
+			result_preview: result_preview_from(&report.result),
+		},
+		Err(_) => SessionRecord::SubagentFinished {
+			subagent_id: subagent_id_for_record,
+			tokens_used_estimate: 0,
+			was_error: true,
+			result_preview: None,
+		},
+	};
+	persist_parent_record(fs, finished_record).await;
+	let report = outcome?;
 	Ok(json!({
 		"result": report.result,
 		"sub_session_id": report.sub_session_id,
@@ -2012,6 +2143,43 @@ async fn handle_spawn_subagent(
 		"mode": report.mode.as_wire(),
 		"iterations_used": report.iterations_used,
 	}))
+}
+
+/// First non-empty trimmed line of `result`, capped at 512 chars,
+/// for the [`SessionRecord::SubagentFinished::result_preview`] field.
+/// We keep the full string instead of the panel's two-line cap so a
+/// future "expanded preview" surface doesn't need a re-derivation
+/// pass; `None` for empty results.
+fn result_preview_from(result: &str) -> Option<String> {
+	let trimmed = result.trim();
+	if trimmed.is_empty() {
+		return None;
+	}
+	if trimmed.len() <= 512 {
+		return Some(trimmed.to_string());
+	}
+	Some(trimmed.chars().take(512).collect())
+}
+
+/// Append a record to the parent's session JSONL. Looks up the
+/// session's `session_dir` + header under the lock; logs at warn
+/// and proceeds on persistence errors (consistent with how the
+/// rest of the runner treats best-effort writes).
+async fn persist_parent_record(fs: &Arc<FolderSession>, record: SessionRecord) {
+	let (session_dir, header) = {
+		let session = fs.session.lock().await;
+		(session.session_dir.clone(), session.header.clone())
+	};
+	let Some(dir) = session_dir else {
+		// Empty / never-persisted parent session — skip rather
+		// than seeding the file from the middle of a sub-agent
+		// run; the very next user prompt path persists the
+		// header + this record's siblings.
+		return;
+	};
+	if let Err(err) = sessions::append_record(&dir, &header, &record).await {
+		tracing::warn!(?err, "failed to persist subagent record on parent session");
+	}
 }
 
 /// Apply a `todo_write` payload to the current session's todo
@@ -2128,13 +2296,29 @@ async fn finish_tool_call(
 /// "your folder" reference stable across folder switches.
 async fn refresh_system_prompt(state: &Arc<CoderState>, fs: &Arc<FolderSession>, folder_path: &Utf8Path) {
 	let folders = state.workspaces.folders().await;
-	let prompt = compose_system_prompt(&folders, Some(folder_path.as_str()), &state.folder_summaries).await;
+	let container_mode = workspace_in_container_mode(&state.tools).await;
+	let prompt = compose_system_prompt(
+		&folders,
+		Some(folder_path.as_str()),
+		&state.folder_summaries,
+		container_mode,
+	)
+	.await;
 	let mut session = fs.session.lock().await;
 	if let Some(ChatMessage::System { content }) = session.messages.first_mut() {
 		*content = prompt;
 	} else {
 		session.messages.insert(0, ChatMessage::System { content: prompt });
 	}
+}
+
+/// Probe whether the workspace's shell container is currently
+/// running. Reuses the same `resolve_bash_target` plumbing the
+/// `bash` tool dispatches against, so the system prompt's
+/// "Bound folders" rendering can't drift from how `bash` actually
+/// routes commands.
+async fn workspace_in_container_mode(tools: &ToolRegistry) -> bool {
+	tools.bash_target_is_container().await
 }
 
 /// Schedule background regeneration for any bound folder whose
@@ -2191,6 +2375,7 @@ async fn compose_system_prompt(
 	folders: &[Arc<WorkspaceFolderEntry>],
 	active_path: Option<&str>,
 	summaries: &Arc<FolderSummaryService>,
+	container_mode: bool,
 ) -> String {
 	let mut out = String::with_capacity(PHASE_6_0_SYSTEM_PROMPT.len() + 1024);
 	out.push_str(PHASE_6_0_SYSTEM_PROMPT);
@@ -2239,17 +2424,28 @@ async fn compose_system_prompt(
 	}
 	out.push('\n');
 	out.push_str("## Bound folders\n\n");
-	out.push_str(
-		"All folders currently bound to this workspace, listed with the synthetic `/workspace/<name>` paths your tools recognise. Your tools resolve paths against the **active** folder only; for any other folder, use `spawn_subagent` with `folder: \"<name>\"`.\n\n",
-	);
-	for (name, _path, description, is_active) in &entries {
-		out.push_str("- `/workspace/");
-		out.push_str(name);
+	if container_mode {
+		out.push_str(
+			"All folders currently bound to this workspace, listed with the `/workspace/<name>` paths the workspace shell container mounts them at. Your file-routing tools (`read_file`, `list_dir`, `write_file`, `edit_file`) accept these absolute paths to address any bound folder; `grep` and `bash` always run against the **active** folder, so for searches or commands in a non-active folder, use `task` with `folder: \"<name>\"`.\n\n",
+		);
+	} else {
+		out.push_str(
+			"All folders currently bound to this workspace, listed with their absolute host paths. Your file-routing tools (`read_file`, `list_dir`, `write_file`, `edit_file`) accept these absolute paths to address any bound folder; `grep` and `bash` always run against the **active** folder, so for searches or commands in a non-active folder, use `task` with `folder: \"<name>\"`.\n\n",
+		);
+	}
+	for (name, path, description, is_active) in &entries {
+		out.push_str("- `");
+		if container_mode {
+			out.push_str("/workspace/");
+			out.push_str(name);
+		} else {
+			out.push_str(path);
+		}
 		out.push('`');
 		if *is_active {
 			out.push_str(" **(active — your tools operate here)**");
 		} else {
-			out.push_str(" — sibling, reach via `spawn_subagent`");
+			out.push_str(" — sibling, reach via `task`");
 		}
 		out.push_str(" · ");
 		match description {
@@ -2848,6 +3044,14 @@ fn emit_replay_events(sink: &FolderEventSink, record: SessionRecord) {
 			// `coder.todos` bucket — no need for a synthetic
 			// `TodosUpdate` event during replay.
 		}
+		SessionRecord::SubagentSpawned { .. } | SessionRecord::SubagentFinished { .. } => {
+			// Sub-agent records are replayed by `open_session` in
+			// a dedicated async pass that also pulls in the
+			// sub-agent's own JSONL — see [`replay_subagent`]. We
+			// can't do that here because [`emit_replay_events`]
+			// is sync; this arm exists to keep the match
+			// exhaustive.
+		}
 		SessionRecord::Compaction { .. } => {
 			// Compaction shapes the in-memory `messages` slice
 			// at replay time (see [`load_session`]); the panel
@@ -2859,6 +3063,121 @@ fn emit_replay_events(sink: &FolderEventSink, record: SessionRecord) {
 			// the live compaction ran; reopening shouldn't pop
 			// it back open).
 		}
+	}
+}
+
+/// Replay one persisted [`SessionRecord::SubagentSpawned`] record:
+/// emit the `SubagentSpawned` event so the parent's panel rebuilds
+/// the collapsed card, then read the sub-agent's own JSONL (if it
+/// exists) and re-emit each of its records as `SubagentEvent`s so
+/// the popped-out transcript matches what the user originally saw.
+///
+/// Sub-agent JSONLs sit at
+/// `<parent_sessions_dir>/<parent_session_id>/<subagent_id>.jsonl`
+/// — we don't recompute the path; we just probe it and skip
+/// gracefully if it's missing (manual deletion, partial write,
+/// older session that pre-dated subagent persistence).
+async fn replay_subagent_spawned(
+	sink: &FolderEventSink,
+	parent_sessions_dir: &Utf8Path,
+	parent_session_id: &str,
+	tool_call_id: String,
+	subagent_id: String,
+	target_folder: String,
+	mode: String,
+) {
+	sink.send(CoderEvent::SubagentSpawned {
+		tool_call_id,
+		subagent_id: subagent_id.clone(),
+		target_folder,
+		mode,
+	});
+
+	let sub_dir = subagent_session_dir(parent_sessions_dir, parent_session_id);
+	let loaded = match sessions::load(&sub_dir, &subagent_id).await {
+		Ok(loaded) => loaded,
+		Err(err) => {
+			tracing::warn!(?err, %subagent_id, "skipping sub-agent transcript replay (load failed)");
+			return;
+		}
+	};
+	for record in loaded.records {
+		// Wrap each replayed event into a `SubagentEvent` so the
+		// frontend routes by `subagent_id` into the per-sub-agent
+		// transcript bucket. Skip records that have no
+		// transcript-shape (Usage, TodosUpdate, Compaction,
+		// nested Subagent*) — those only matter for live
+		// runtime / context reconstruction, not for the popped-
+		// out transcript.
+		let inners = subagent_replay_inners(record);
+		for inner in inners {
+			sink.send(CoderEvent::SubagentEvent {
+				subagent_id: subagent_id.clone(),
+				inner: Box::new(inner),
+			});
+		}
+	}
+}
+
+/// Translate one sub-agent persisted record into the
+/// `CoderEvent`s the parent's panel feeds through
+/// `applyInnerEventToRows`. Returns an empty Vec for records that
+/// don't shape the transcript (Usage / TodosUpdate / Compaction /
+/// nested SubagentSpawned/Finished) — they'd be ignored by the
+/// frontend reducer anyway, but skipping them here keeps the IPC
+/// chatter down on a long-running sub-agent.
+fn subagent_replay_inners(record: SessionRecord) -> Vec<CoderEvent> {
+	match record {
+		SessionRecord::User { text, images } => vec![CoderEvent::UserMessage {
+			id: new_message_id(),
+			text,
+			images,
+		}],
+		SessionRecord::Assistant {
+			content,
+			thinking,
+			tool_calls,
+		} => {
+			let mut out = Vec::new();
+			let id = new_message_id();
+			let has_text = content.as_deref().map(|t| !t.is_empty()).unwrap_or(false);
+			let has_thinking = thinking.as_deref().map(|t| !t.is_empty()).unwrap_or(false);
+			if has_text || has_thinking {
+				out.push(CoderEvent::AssistantMessageStart { id: id.clone() });
+				out.push(CoderEvent::AssistantMessageEnd {
+					id,
+					text: content.unwrap_or_default(),
+					thinking: thinking.filter(|t| !t.is_empty()),
+				});
+			}
+			for call in tool_calls {
+				let args = parse_tool_args(&call.function);
+				out.push(CoderEvent::ToolCall {
+					id: call.id.clone(),
+					name: call.function.name,
+					args,
+				});
+			}
+			out
+		}
+		SessionRecord::Tool { tool_call_id, content } => {
+			let result = match serde_json::from_str::<Value>(&content) {
+				Ok(value) => value,
+				Err(_) => Value::String(content),
+			};
+			let is_error = matches!(&result, Value::Object(map) if map.contains_key("error") && map.len() == 1);
+			vec![CoderEvent::ToolResult {
+				id: tool_call_id,
+				result,
+				is_error,
+			}]
+		}
+		SessionRecord::TitleUpdate { .. }
+		| SessionRecord::Usage { .. }
+		| SessionRecord::TodosUpdate { .. }
+		| SessionRecord::Compaction { .. }
+		| SessionRecord::SubagentSpawned { .. }
+		| SessionRecord::SubagentFinished { .. } => Vec::new(),
 	}
 }
 
@@ -2920,6 +3239,50 @@ pub(crate) fn emit_token_usage(
 		source,
 		cache_read_tokens,
 		cache_creation_tokens,
+	});
+}
+
+/// Throttled mid-stream token-usage emission. Counts up
+/// `delta_len` bytes into `state`'s byte counter, then emits a
+/// fresh [`CoderEvent::TokenUsage`] (Estimate-tagged) only when
+/// at least `throttle` has elapsed since the previous emission.
+/// Cheap enough to call on every content / thinking delta — the
+/// throttle keeps the event rate to ~2 Hz no matter how fast
+/// the provider streams.
+fn maybe_emit_stream_usage(
+	sink: &FolderEventSink,
+	state: &std::sync::Mutex<(u32, std::time::Instant)>,
+	throttle: std::time::Duration,
+	delta_len: usize,
+	prompt_estimate: u32,
+	context_window: u32,
+) {
+	let len = u32::try_from(delta_len).unwrap_or(u32::MAX);
+	let now = std::time::Instant::now();
+	let completion_bytes = {
+		let Ok(mut guard) = state.lock() else {
+			return;
+		};
+		guard.0 = guard.0.saturating_add(len);
+		if now.duration_since(guard.1) < throttle {
+			return;
+		}
+		guard.1 = now;
+		guard.0
+	};
+	// Same bytes/4 ratio used for prompt estimates so the ring
+	// stays consistent across the pre-call estimate, mid-stream
+	// updates, and the post-call provider-exact numbers.
+	let completion_estimate = completion_bytes / 4;
+	let total = prompt_estimate.saturating_add(completion_estimate);
+	sink.send(CoderEvent::TokenUsage {
+		prompt_tokens: prompt_estimate,
+		completion_tokens: completion_estimate,
+		total_tokens: total,
+		context_window,
+		source: TokenUsageSource::Estimate,
+		cache_read_tokens: 0,
+		cache_creation_tokens: 0,
 	});
 }
 

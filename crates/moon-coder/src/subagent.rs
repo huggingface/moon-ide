@@ -5,9 +5,16 @@
 //! history, its own [`ToolContext`] (folder + mode), and its own
 //! cancellation token derived from the parent's so an abort
 //! cascades. Sub-agents return a single text result that the parent
-//! sees as the `spawn_subagent` tool's return value; the rest of
-//! the sub-agent's transcript is kept addressable via its
+//! sees as the `task` tool's return value; the rest of the
+//! sub-agent's transcript is kept addressable via its
 //! `sub_session_id` for the UI's pop-out view (Phase E).
+//!
+//! The wire-level tool name on the parent is `task` (matches the
+//! convention from every other agent product the team has used and
+//! the model picked up on it without prompting). Internally we keep
+//! the `subagent` naming for types and the module — that's what
+//! actually gets spawned, and it disambiguates from the `Session`
+//! type that backs both parents and sub-agents.
 //!
 //! Today's contract:
 //!
@@ -38,8 +45,8 @@
 //!   summary becomes a synthetic `system` message that replaces
 //!   the older prefix.
 //! - Depth cap: hardcoded to 1. The sub-agent's own tool list does
-//!   not include `spawn_subagent`, so a sub-agent literally cannot
-//!   spawn a sub-sub-agent.
+//!   not include `task`, so a sub-agent literally cannot spawn a
+//!   sub-sub-agent.
 
 use std::sync::Arc;
 
@@ -72,7 +79,7 @@ fn new_subagent_id() -> String {
 }
 
 /// Caller-provided plan for one sub-agent run. Built by the
-/// parent's `spawn_subagent` tool dispatch from validated args.
+/// parent's `task` tool dispatch from validated args.
 #[derive(Debug, Clone)]
 pub struct Subagent {
 	pub id: String,
@@ -90,8 +97,8 @@ pub struct Subagent {
 	pub mode: CoderMode,
 	/// Folder the sub-agent's tools operate against. May differ
 	/// from `parent_folder` when the model passed an explicit
-	/// `folder` argument to `spawn_subagent`. Surfaced as
-	/// `target_folder` in events / persistence metadata.
+	/// `folder` argument to `task`. Surfaced as `target_folder`
+	/// in events / persistence metadata.
 	pub folder: Arc<WorkspaceFolderEntry>,
 }
 
@@ -108,22 +115,28 @@ pub struct SubagentReport {
 	pub iterations_used: u32,
 }
 
-/// JSON tool definition for `spawn_subagent`. Lives outside the
-/// `ToolRegistry` so sub-agents (which use the registry's
-/// `definitions()`) don't see the spawn tool — that's how depth
-/// is enforced. The parent's `run_turn` appends this to the tool
-/// list it advertises.
-pub fn spawn_subagent_tool_definition() -> ToolDefinition {
+/// JSON tool definition for the `task` tool (delegation primitive
+/// — what kicks off a sub-agent). Lives outside the `ToolRegistry`
+/// so sub-agents (which use the registry's `definitions()`) don't
+/// see it — that's how depth is enforced. The parent's `run_turn`
+/// appends this to the tool list it advertises.
+///
+/// Wire name is `task` (matching the convention every other agent
+/// product the team has used). The Rust types and module are still
+/// named `Subagent` / `subagent.rs` because internally that's what
+/// the call spawns; only the model-facing tool name reflects the
+/// user-facing concept.
+pub fn task_tool_definition() -> ToolDefinition {
 	ToolDefinition::function(
-		"spawn_subagent",
+		"task",
 		"Delegate a self-contained task to a sub-agent and get back a single summarised string. Sub-agents run in their own context with their own LLM round-trips — you spend tokens on the task description and the final summary, not on every intermediate read or edit. \
 \
 Reach for this when one of these applies: \
 **(1) context preservation** — when the inputs are large but the answer is small (`grep`-then-read sweeps, \"is feature X already implemented?\", \"find every callsite of Y\", \"summarise this folder\"), spawning a sub-agent keeps the noisy tool output out of your own transcript. Your synthesis turn stays focused on the question, not the rummaging. \
-**(2) parallelism** — multiple `spawn_subagent` calls in one assistant message run concurrently (capped at 4), so an N-way investigation finishes in one round-trip instead of N. Use this when sub-tasks are independent. \
+**(2) parallelism** — multiple `task` calls in one assistant message run concurrently (capped at 4), so an N-way investigation finishes in one round-trip instead of N. Use this when sub-tasks are independent. \
 **(3) scoped delegation** — when you want a fresh agent to take ownership of a self-contained piece of work (\"port this client to the new endpoints\", \"investigate why these tests fail\") without your own session's prior context biasing the approach. \
 \
-For mechanically related cross-folder work (you know exactly what to change in folder B because of work you just did in folder A), you do **not** need a sub-agent — your own tools accept `/workspace/<other-name>/...` paths and operate against any bound folder directly. Sub-agents are for *delegation*, not for *access*. \
+For mechanically related cross-folder work (you know exactly what to change in folder B because of work you just did in folder A), you do **not** need a sub-agent — your own tools accept any currently-bound folder's path directly (the Bound folders section above lists them). Sub-agents are for *delegation*, not for *access*. \
 \
 Mode: `\"research\"` (recommended for investigations) gets `read_file`, `list_dir`, `grep`, and `bash` for inspection commands (`git log`, `git diff`, `cargo check`, `pytest --collect-only`, …) but is instructed not to mutate anything. `\"agent\"` (default) is the full toolkit — same capabilities as you have, including edits. \
 \
@@ -137,7 +150,7 @@ The sub-agent has no access to your conversation history — describe the task s
 				},
 				"folder": {
 					"type": "string",
-					"description": "Basename of a currently-bound workspace folder to scope the sub-agent against (matches the `<name>` in `/workspace/<name>` from the Bound folders section). Omit (or set to the active folder's basename) to target the parent's active folder — useful for context-isolation even within the same folder. Targeting an unbound folder errors."
+					"description": "Basename of a currently-bound workspace folder to scope the sub-agent against (matches one of the names listed in the Bound folders section). Omit (or set to the active folder's basename) to target the parent's active folder — useful for context-isolation even within the same folder. Targeting an unbound folder errors."
 				},
 				"mode": {
 					"type": "string",
@@ -241,8 +254,8 @@ async fn run_subagent_inner(
 	// `subagent_target_folder` is `Some(...)` only when the
 	// sub-agent operated against a folder different from the
 	// parent's (i.e. an explicit `folder` argument was passed to
-	// `spawn_subagent`). When the sub-agent targets the same
-	// folder as its parent, `None` keeps the on-disk header tidy.
+	// `task`). When the sub-agent targets the same folder as its
+	// parent, `None` keeps the on-disk header tidy.
 	let target_folder_path = spec.folder.folder.path.clone();
 	let target_differs = Utf8Path::new(target_folder_path.as_str()) != spec.parent_folder.as_path();
 	let header = SessionHeader {
@@ -275,10 +288,10 @@ async fn run_subagent_inner(
 	)
 	.await;
 
-	// The sub-agent's tool list deliberately omits `spawn_subagent`.
-	// That's how the depth=1 cap is enforced: a sub-agent literally
-	// cannot describe a sub-sub-agent because the model never sees
-	// the tool.
+	// The sub-agent's tool list deliberately omits `task`. That's
+	// how the depth=1 cap is enforced: a sub-agent literally cannot
+	// describe a sub-sub-agent because the model never sees the
+	// tool.
 	let tool_defs = tools.definitions();
 	let cx = ToolContext::new(spec.folder.clone(), spec.mode);
 
@@ -829,16 +842,16 @@ pub fn build_subagent_spec(
 	let task = args
 		.get("task")
 		.and_then(Value::as_str)
-		.ok_or_else(|| CoderError::invalid_args("spawn_subagent", "missing required string field `task`"))?
+		.ok_or_else(|| CoderError::invalid_args("task", "missing required string field `task`"))?
 		.to_string();
 	if task.trim().is_empty() {
-		return Err(CoderError::invalid_args("spawn_subagent", "`task` must not be empty"));
+		return Err(CoderError::invalid_args("task", "`task` must not be empty"));
 	}
 
 	let folder = match args.get("folder").and_then(Value::as_str) {
 		None | Some("") => parent_active_folder.clone(),
 		Some(name) => find_bound_folder(bound_folders, name)
-			.ok_or_else(|| CoderError::tool_failed("spawn_subagent", format!("folder `{name}` is not bound")))?,
+			.ok_or_else(|| CoderError::tool_failed("task", format!("folder `{name}` is not bound")))?,
 	};
 
 	let mode = match args.get("mode").and_then(Value::as_str) {
@@ -846,7 +859,7 @@ pub fn build_subagent_spec(
 		Some("research") => CoderMode::Research,
 		Some(other) => {
 			return Err(CoderError::invalid_args(
-				"spawn_subagent",
+				"task",
 				format!("unknown mode `{other}` — expected `research` or `agent`"),
 			));
 		}

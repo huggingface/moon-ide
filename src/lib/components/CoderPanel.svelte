@@ -471,6 +471,13 @@
 			case 'todo_write': {
 				return todoWriteHint(o);
 			}
+			case 'task': {
+				const folder = typeof o.folder === 'string' && o.folder.length > 0 ? o.folder : null;
+				const mode = typeof o.mode === 'string' && o.mode.length > 0 ? o.mode : 'agent';
+				const taskText = typeof o.task === 'string' ? firstLine(o.task) : null;
+				const head = folder !== null ? `${folder} · ${mode}` : mode;
+				return taskText !== null ? `${head} — ${taskText}` : head;
+			}
 			default:
 				return null;
 		}
@@ -821,10 +828,27 @@
 			{:else}
 				<ul class="session-list">
 					{#each coder.sessions as session (session.id)}
-						<li class="session-row" class:active={coder.activeSession?.id === session.id}>
-							<button type="button" class="session-pick" onclick={() => onPickSession(session.id)} title="Open session">
-								<div class="session-title">{session.title || '(untitled)'}</div>
-								<div class="session-meta">{formatRelative(session.updated_at_ms)}</div>
+						{@const isRunning = coder.busy && coder.activeSession?.id === session.id}
+						<li class="session-row" class:active={coder.activeSession?.id === session.id} class:running={isRunning}>
+							<button
+								type="button"
+								class="session-pick"
+								onclick={() => onPickSession(session.id)}
+								title={isRunning ? 'Session is running — click to follow' : 'Open session'}
+							>
+								<div class="session-title">
+									{#if isRunning}
+										<span class="running-dot" aria-hidden="true"></span>
+									{/if}
+									<span class="session-title-text">{session.title || '(untitled)'}</span>
+								</div>
+								<div class="session-meta">
+									{#if isRunning}
+										<span class="running-label">running…</span>
+										<span class="session-meta-sep">·</span>
+									{/if}
+									{formatRelative(session.updated_at_ms)}
+								</div>
 							</button>
 							<button
 								type="button"
@@ -1025,10 +1049,9 @@
 <!-- Row renderer extracted as a snippet so the parent's session
 	 transcript and the sub-agent pop-out can share it without
 	 duplicating ~80 lines of conditional markup. `withSubagentCards`
-	 controls whether `spawn_subagent` tool rows render the
-	 inline collapsed card; sub-agents themselves can't spawn
-	 sub-sub-agents (depth-1 cap), so the flag is `false` in the
-	 sub-agent view. -->
+	 controls whether `task` tool rows render the inline collapsed
+	 card; sub-agents themselves can't spawn sub-sub-agents (depth-1
+	 cap), so the flag is `false` in the sub-agent view. -->
 {#snippet compactionMarkup(state: import('../coder.svelte').CompactionState)}
 	<!-- Compaction disclosure: a single full-width row at the
 		 bottom of the transcript so it doesn't push past the
@@ -1307,7 +1330,7 @@
 			</details>
 			{#if subagent !== null}
 				<!-- Collapsed sub-agent card. Renders inline under
-								 the parent's `spawn_subagent` tool row so
+								 the parent's `task` tool row so
 								 the parent transcript stays scannable while
 								 a click pops out into the full sub-agent
 								 transcript view (`coder.view = 'subagent'`).
@@ -1558,15 +1581,63 @@
 		gap: 2px;
 	}
 	.session-title {
+		display: flex;
+		align-items: center;
+		gap: 6px;
 		font-size: 12px;
 		color: var(--m-fg);
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
 	}
+	.session-title-text {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		min-width: 0;
+	}
 	.session-meta {
+		display: flex;
+		align-items: center;
+		gap: 4px;
 		font-size: 11px;
 		color: var(--m-fg-subtle);
+	}
+	.session-row.running .running-label {
+		color: var(--m-accent);
+		font-weight: 500;
+	}
+	.session-row .session-meta-sep {
+		color: var(--m-fg-subtle);
+	}
+	/* Running pip — small accent dot that pulses while the bucket
+	   reports `busy`. The session list is the only surface where a
+	   user actively scans for "is anything still working?", and a
+	   pulsing dot beats a static badge for that question. */
+	.running-dot {
+		flex-shrink: 0;
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		background: var(--m-accent);
+		box-shadow: 0 0 0 0 color-mix(in srgb, var(--m-accent) 60%, transparent);
+		animation: session-running-pulse 1.4s ease-in-out infinite;
+	}
+	@keyframes session-running-pulse {
+		0% {
+			box-shadow: 0 0 0 0 color-mix(in srgb, var(--m-accent) 60%, transparent);
+		}
+		70% {
+			box-shadow: 0 0 0 6px color-mix(in srgb, var(--m-accent) 0%, transparent);
+		}
+		100% {
+			box-shadow: 0 0 0 0 color-mix(in srgb, var(--m-accent) 0%, transparent);
+		}
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.running-dot {
+			animation: none;
+		}
 	}
 	.session-row-action {
 		opacity: 0;
@@ -1910,7 +1981,7 @@
 		letter-spacing: 0;
 	}
 	/* Collapsed sub-agent card. Renders inline under the parent's
-	   `spawn_subagent` tool row. Reads as a clickable "pop out"
+	   `task` tool row. Reads as a clickable "pop out"
 	   affordance — click anywhere on the card body, and the panel
 	   swaps to the sub-agent's own transcript view. */
 	.subagent-card {

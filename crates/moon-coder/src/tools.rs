@@ -84,7 +84,7 @@ impl CoderMode {
 	}
 
 	/// Wire string used by event payloads (`SubagentSpawned.mode`,
-	/// the `mode` field on the `spawn_subagent` tool result, etc.).
+	/// the `mode` field on the `task` tool result, etc.).
 	/// Stable identifiers — `"research"` / `"agent"` — that the
 	/// frontend reads verbatim, so don't rename without also
 	/// updating `src/lib/protocol.ts`.
@@ -144,6 +144,17 @@ impl ToolRegistry {
 		&self.web
 	}
 
+	/// `true` when the workspace shell container is currently
+	/// `Running` and the `bash` tool would route there. Reused by
+	/// the system-prompt builder to decide whether to advertise
+	/// folders by their host absolute paths (host mode) or under
+	/// the synthetic `/workspace/<name>` mount the container
+	/// actually exposes (container mode). Falls back to host on
+	/// any docker-side failure, matching the bash tool's posture.
+	pub async fn bash_target_is_container(&self) -> bool {
+		resolve_bash_target(&self.workspaces, &self.workspaces_dir).await == BASH_TARGET_CONTAINER
+	}
+
 	/// Build a [`ToolContext`] from the workspace's current active
 	/// folder. Callers that already know the folder (sub-agent
 	/// runner) construct `ToolContext::new` directly; this helper
@@ -158,36 +169,44 @@ impl ToolRegistry {
 		Ok(ToolContext::new(folder, mode))
 	}
 
-	/// Resolve a path argument against the synthetic `/workspace/`
-	/// surface the system prompt advertises and route to the right
-	/// bound folder. Returns the `(target_folder, relative_path)` pair
-	/// the caller should dispatch against.
+	/// Resolve a path argument and route to the right bound folder.
+	/// Returns the `(target_folder, relative_path)` pair the caller
+	/// should dispatch against.
 	///
-	/// Three cases:
+	/// Cases, in order:
 	///
-	/// - **Synthetic `/workspace/<name>/...`**: routes to the folder
-	///   whose basename matches `<name>` (active or otherwise). The
-	///   path returned is whatever's left after stripping the
-	///   `/workspace/<name>/` prefix; an empty tail becomes `"."`.
-	///   Errors with a clear "no folder bound as `<name>`" message
-	///   when the basename doesn't match anything bound.
+	/// - **Absolute path under a bound folder's root**: routes to
+	///   that folder. The returned `relative_path` is the portion
+	///   inside the folder's root (or `"."` when the path is the
+	///   folder root itself). This is the everyday host-mode form:
+	///   the system prompt's "Bound folders" section advertises
+	///   each folder by its absolute host path, and the model
+	///   joins file-relative paths onto it.
+	/// - **Synthetic `/workspace/<name>/...`**: container-mode
+	///   form. Routes to the folder whose basename matches
+	///   `<name>`. Errors with a clear "no folder bound as `<name>`"
+	///   message when the basename doesn't match anything bound.
+	///   Kept available in host mode too — a model that's seen
+	///   both forms across sessions doesn't fight us about it —
+	///   but the system prompt only advertises this form when the
+	///   workspace shell container is actually running.
 	/// - **Bare relative path starting with another bound folder's
 	///   basename** (`<other>/foo.rs`): also routes cross-folder.
-	///   The model often types this form when the system prompt
-	///   has shown it the synthetic `/workspace/<other>` path.
 	///   Disambiguation: a leading `./` opts out and forces the
 	///   path to resolve inside the [`ToolContext`]'s folder, so a
 	///   legitimate same-named subdirectory still works.
-	/// - **Anything else** (relative paths, absolute non-synthetic):
-	///   resolved against `cx.folder` and left for
-	///   [`WorkspaceHost::resolve`] to validate the way it
-	///   always has.
+	/// - **Anything else** (relative paths, absolute paths outside
+	///   every bound folder's root): resolved against `cx.folder`
+	///   and left for [`WorkspaceHost::resolve`] to validate the
+	///   way it always has — an absolute path outside every bound
+	///   folder fails with a clear "escapes workspace root" error,
+	///   which is the behaviour we want for paths like `/etc/passwd`.
 	///
 	/// Sub-agents call this with `cx.folder` set to their own
 	/// assigned folder. They typically only see one bound folder
 	/// in their tool context (the one they were spawned against),
 	/// but the routing logic is identical — it just collapses to
-	/// the no-op case when the basename matches `cx.folder`.
+	/// the no-op case when the path is already inside `cx.folder`.
 	async fn resolve_workspace_path(
 		&self,
 		raw: &str,
@@ -198,12 +217,19 @@ impl ToolRegistry {
 		let active_name = cx.folder.folder.name.as_str();
 		let path = Utf8Path::new(raw);
 
-		// Synthetic `/workspace/<name>/...` path. Same routing rule
-		// regardless of whether `<name>` matches the active folder
-		// or a sibling — we always look up the folder, and the
-		// returned `target` ends up equal to `cx.folder` when the
-		// basenames match.
 		if path.is_absolute() {
+			// Absolute path that lands under a bound folder's
+			// root: route to that folder. The "longest matching
+			// root" pick handles the (rare) case where one bound
+			// folder is a strict ancestor of another — the inner
+			// one wins, matching how the file tree groups them.
+			if let Some((target, relative)) = match_bound_folder_root(&folders, path) {
+				return Ok((target, relative));
+			}
+			// Synthetic `/workspace/<name>/...`: the container-mode
+			// surface from the system prompt. Looked up by basename
+			// against the bound folders just like the absolute-root
+			// case above.
 			if let Ok(rest) = path.strip_prefix("/workspace") {
 				let mut comps = rest.components();
 				if let Some(camino::Utf8Component::Normal(first)) = comps.next() {
@@ -218,9 +244,9 @@ impl ToolRegistry {
 					return Ok((target, resolved));
 				}
 			}
-			// Absolute paths that aren't `/workspace/<name>/...` go
-			// through the active folder; the host's `resolve` will
-			// reject anything outside its root.
+			// Absolute paths that don't match either pattern fall
+			// through to the active folder; the host's `resolve`
+			// rejects anything outside its root.
 			return Ok((cx.folder.clone(), raw.to_string()));
 		}
 
@@ -264,11 +290,11 @@ impl ToolRegistry {
 				json!({
 					"type": "object",
 					"properties": {
-						"path": {
-							"type": "string",
-							"description": "Either a path inside the active workspace folder (`src/foo.rs`), or a synthetic `/workspace/<name>/src/foo.rs` to address any other currently-bound folder. Both forms work the same way; the latter is how you reach files outside the active folder."
-						},
-						"start_line": {
+					"path": {
+						"type": "string",
+						"description": "Either a path inside the active workspace folder (`src/foo.rs`), or an absolute path that lands inside any currently-bound folder. The system prompt's \"Bound folders\" section advertises each folder by the absolute path your tools accept for it (a host path on host mode, the synthetic `/workspace/<name>` mount when the workspace shell container is running)."
+					},
+					"start_line": {
 							"type": "integer",
 							"description": "First line to include, 1-based and inclusive. Omit to start at line 1."
 						},
@@ -286,11 +312,11 @@ impl ToolRegistry {
 				json!({
 					"type": "object",
 					"properties": {
-						"path": {
-							"type": "string",
-							"description": "`.` for the active folder root; a relative path (`src/`) for an active-folder subtree; or `/workspace/<name>/...` to list inside any other currently-bound folder.",
-							"default": "."
-						}
+					"path": {
+						"type": "string",
+						"description": "`.` for the active folder root; a relative path (`src/`) for an active-folder subtree; or an absolute path inside any currently-bound folder (the form is shown in the \"Bound folders\" section of the system prompt).",
+						"default": "."
+					}
 					}
 				}),
 			),
@@ -340,11 +366,11 @@ impl ToolRegistry {
 				json!({
 					"type": "object",
 					"properties": {
-						"path": {
-							"type": "string",
-							"description": "Path in the target folder. Either active-folder-relative (`src/foo.rs`) or synthetic `/workspace/<name>/...` to write into any other currently-bound folder. Created if it does not exist."
-						},
-						"content": {
+					"path": {
+						"type": "string",
+						"description": "Path in the target folder. Either active-folder-relative (`src/foo.rs`) or an absolute path inside any currently-bound folder (see the system prompt's \"Bound folders\" section for the right shape). Created if it does not exist."
+					},
+					"content": {
 							"type": "string",
 							"description": "Full file contents. Whatever you pass becomes the file verbatim — include the trailing newline if you want one."
 						}
@@ -358,9 +384,9 @@ impl ToolRegistry {
 				json!({
 					"type": "object",
 					"properties": {
-						"path": {
-							"type": "string",
-							"description": "Path in the target folder. Either active-folder-relative or synthetic `/workspace/<name>/...` to edit a file in any other currently-bound folder. The file must already exist."
+					"path": {
+						"type": "string",
+						"description": "Path in the target folder. Either active-folder-relative or an absolute path inside any currently-bound folder (see the system prompt's \"Bound folders\" section for the right shape). The file must already exist."
 						},
 						"find": {
 							"type": "string",
@@ -893,6 +919,42 @@ pub(crate) const BASH_TARGET_CONTAINER: &str = "container";
 /// are LLM-sized (file contents + a few hundred bytes of `find`),
 /// not large-corpus. Same algorithm `pi-mono` uses for the same
 /// reason.
+/// Pick the bound folder whose root is an ancestor of `path` (or
+/// equal to it) and return `(folder, relative_path_inside)`. When
+/// multiple roots match — only possible if a bound folder is a
+/// strict ancestor of another, which the file tree allows — the
+/// **longest** match wins so the inner folder's relative addressing
+/// stays correct. Returns `None` for absolute paths that aren't
+/// under any bound root.
+///
+/// `path` must be absolute; callers branch on `is_absolute()` first.
+/// We compare on the component-prefix (not raw-string-prefix) so a
+/// folder root `/foo/bar` doesn't match an unrelated path
+/// `/foo/barbaz/...`.
+fn match_bound_folder_root(
+	folders: &[Arc<WorkspaceFolderEntry>],
+	path: &Utf8Path,
+) -> Option<(Arc<WorkspaceFolderEntry>, String)> {
+	let mut best: Option<(Arc<WorkspaceFolderEntry>, String, usize)> = None;
+	for entry in folders {
+		let root = Utf8Path::new(entry.folder.path.as_str());
+		let Ok(tail) = path.strip_prefix(root) else {
+			continue;
+		};
+		let depth = root.as_str().len();
+		let relative = if tail.as_str().is_empty() {
+			".".to_string()
+		} else {
+			tail.as_str().to_string()
+		};
+		match &best {
+			Some((_, _, prev_depth)) if *prev_depth >= depth => {}
+			_ => best = Some((entry.clone(), relative, depth)),
+		}
+	}
+	best.map(|(f, r, _)| (f, r))
+}
+
 /// Build the "no bound folder named `<name>`" error returned by
 /// [`ToolRegistry::resolve_workspace_path`] when a `/workspace/<name>/...`
 /// path doesn't match any currently-bound folder. The error lists what
@@ -916,9 +978,9 @@ fn unbound_folder_error(
 	CoderError::tool_failed(
 		tool,
 		format!(
-			"`{raw_path}` references the workspace `{requested}`, but no folder is bound under that name \
-({bound_clause}). Use one of the bound folder basenames in the `/workspace/<name>/...` form, or use a \
-plain relative path to address the active folder."
+			"`{raw_path}` references a workspace `{requested}`, but no folder is bound under that name \
+({bound_clause}). Use the absolute path the system prompt's \"Bound folders\" section advertises for the \
+target folder, or a plain relative path to address the active folder."
 		),
 	)
 }
@@ -1968,6 +2030,79 @@ mod tests {
 				.expect("unrelated absolute paths should pass through");
 			assert_eq!(out, "/etc/passwd");
 			assert!(Arc::ptr_eq(&folder, &cx.folder));
+		}
+
+		#[tokio::test]
+		async fn absolute_host_path_inside_active_folder_strips_to_relative() {
+			// Host-mode form: the system prompt advertises bound
+			// folders by their host abs path; the model joins file
+			// paths onto it. The resolver must route to the matching
+			// folder and emit the inside-folder relative path.
+			let one = TempDir::new().unwrap();
+			let one_path = camino::Utf8PathBuf::from_path_buf(one.path().to_path_buf()).unwrap();
+			let (registry, tools) = build_registry(&[one_path.as_path()]).await;
+			let cx = make_cx(&registry, 0).await;
+			let raw = format!("{}/src/foo.rs", one_path.as_str());
+			let (folder, out) = tools
+				.resolve_workspace_path(&raw, &cx, "read_file")
+				.await
+				.expect("abs path under active folder should resolve");
+			assert_eq!(out, "src/foo.rs");
+			assert!(Arc::ptr_eq(&folder, &cx.folder));
+		}
+
+		#[tokio::test]
+		async fn absolute_host_path_at_folder_root_resolves_to_dot() {
+			let one = TempDir::new().unwrap();
+			let one_path = camino::Utf8PathBuf::from_path_buf(one.path().to_path_buf()).unwrap();
+			let (registry, tools) = build_registry(&[one_path.as_path()]).await;
+			let cx = make_cx(&registry, 0).await;
+			let (folder, out) = tools
+				.resolve_workspace_path(one_path.as_str(), &cx, "list_dir")
+				.await
+				.expect("abs path equal to folder root should resolve to '.'");
+			assert_eq!(out, ".");
+			assert!(Arc::ptr_eq(&folder, &cx.folder));
+		}
+
+		#[tokio::test]
+		async fn absolute_host_path_inside_sibling_routes_cross_folder() {
+			let one = TempDir::new().unwrap();
+			let two = TempDir::new().unwrap();
+			let one_path = camino::Utf8PathBuf::from_path_buf(one.path().to_path_buf()).unwrap();
+			let two_path = camino::Utf8PathBuf::from_path_buf(two.path().to_path_buf()).unwrap();
+			let (registry, tools) = build_registry(&[one_path.as_path(), two_path.as_path()]).await;
+			let cx = make_cx(&registry, 0).await;
+			let folders = registry.folders().await;
+			let other = folders[1].clone();
+			let raw = format!("{}/src/foo.rs", two_path.as_str());
+			let (target, out) = tools
+				.resolve_workspace_path(&raw, &cx, "read_file")
+				.await
+				.expect("abs path under sibling should route cross-folder");
+			assert_eq!(out, "src/foo.rs");
+			assert!(Arc::ptr_eq(&target, &other));
+		}
+
+		#[tokio::test]
+		async fn absolute_host_path_under_nested_bound_folder_picks_inner() {
+			// `/foo/bar/sub` should route to `/foo/bar/sub` when both
+			// `/foo/bar` and `/foo/bar/sub` are bound — the longer
+			// match wins, matching how the file tree groups files.
+			let outer = TempDir::new().unwrap();
+			let outer_path = camino::Utf8PathBuf::from_path_buf(outer.path().to_path_buf()).unwrap();
+			let inner_dir = outer_path.join("nested");
+			std::fs::create_dir(inner_dir.as_std_path()).unwrap();
+			let (registry, tools) = build_registry(&[outer_path.as_path(), inner_dir.as_path()]).await;
+			let cx = make_cx(&registry, 0).await;
+			let inner_entry = registry.folders().await[1].clone();
+			let raw = format!("{}/file.rs", inner_dir.as_str());
+			let (target, out) = tools
+				.resolve_workspace_path(&raw, &cx, "read_file")
+				.await
+				.expect("nested bound folder path should resolve to the inner folder");
+			assert_eq!(out, "file.rs");
+			assert!(Arc::ptr_eq(&target, &inner_entry));
 		}
 	}
 }

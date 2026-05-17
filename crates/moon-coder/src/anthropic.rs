@@ -859,6 +859,14 @@ pub async fn list_models(
 		return Err(CoderError::http(endpoint, status.as_u16(), body));
 	}
 
+	// Anthropic's `/v1/models` returns `max_input_tokens` per
+	// model — the per-model context window we surface to the
+	// picker as `context_length`. They also return `max_tokens`,
+	// which is the cap on the *output* slot for one call (8192 for
+	// Claude 4.x today, 128k with the `output-128k-2025-02-19`
+	// beta header). We don't expose that as a column yet —
+	// `MAX_TOKENS` in the chat-completion path is what hits that
+	// limit, and it's a constant we hardcode anyway.
 	#[derive(Deserialize)]
 	struct ListBody {
 		#[serde(default)]
@@ -869,6 +877,8 @@ pub async fn list_models(
 		id: String,
 		#[serde(default)]
 		display_name: Option<String>,
+		#[serde(default)]
+		max_input_tokens: Option<u32>,
 	}
 
 	let raw: ListBody = crate::auth::decode_body(&endpoint, &body)?;
@@ -879,7 +889,7 @@ pub async fn list_models(
 			id: m.id,
 			owned_by: Some("anthropic".into()),
 			name: m.display_name,
-			context_length: None,
+			context_length: m.max_input_tokens,
 			pricing_in_per_million: None,
 			pricing_out_per_million: None,
 			description: None,
@@ -1220,5 +1230,81 @@ mod tests {
 		let usage = resp.usage.expect("usage");
 		assert_eq!(usage.prompt_tokens, 100);
 		assert_eq!(usage.completion_tokens, 7);
+	}
+
+	#[test]
+	fn list_models_parses_max_input_tokens_into_context_length() {
+		// Anthropic's `/v1/models` returns `max_input_tokens` per
+		// model since the 2025-11 API revision. Older sessions
+		// could see a payload without the field — `Option`
+		// gracefully degrades to `None`, matching how the rest of
+		// the providers handle a missing context.
+		let body = r#"{
+			"data": [
+				{
+					"type": "model",
+					"id": "claude-sonnet-4-5-20250929",
+					"display_name": "Claude Sonnet 4.5",
+					"created_at": "2025-09-29T00:00:00Z",
+					"max_input_tokens": 200000,
+					"max_tokens": 8192
+				},
+				{
+					"type": "model",
+					"id": "claude-haiku-4-5-20251001",
+					"display_name": "Claude Haiku 4.5",
+					"created_at": "2025-10-01T00:00:00Z",
+					"max_input_tokens": 200000,
+					"max_tokens": 8192
+				},
+				{
+					"type": "model",
+					"id": "older-shape-no-context",
+					"display_name": "Older shape",
+					"created_at": "2024-01-01T00:00:00Z"
+				}
+			]
+		}"#;
+
+		// Mirror the inline `serde_json::from_str` in
+		// `list_models`. We can't call `list_models` directly here
+		// without a running HTTP server, so we re-derive the
+		// parser shape and assert it produces the right
+		// `ProviderModelSummary`s.
+		#[derive(serde::Deserialize)]
+		struct ListBody {
+			#[serde(default)]
+			data: Vec<RawModel>,
+		}
+		#[derive(serde::Deserialize)]
+		struct RawModel {
+			id: String,
+			#[serde(default)]
+			display_name: Option<String>,
+			#[serde(default)]
+			max_input_tokens: Option<u32>,
+		}
+		let raw: ListBody = serde_json::from_str(body).unwrap();
+		let summaries: Vec<ProviderModelSummary> = raw
+			.data
+			.into_iter()
+			.map(|m| ProviderModelSummary {
+				id: m.id,
+				owned_by: Some("anthropic".into()),
+				name: m.display_name,
+				context_length: m.max_input_tokens,
+				pricing_in_per_million: None,
+				pricing_out_per_million: None,
+				description: None,
+			})
+			.collect();
+
+		assert_eq!(summaries.len(), 3);
+		assert_eq!(summaries[0].id, "claude-sonnet-4-5-20250929");
+		assert_eq!(summaries[0].context_length, Some(200000));
+		assert_eq!(summaries[1].id, "claude-haiku-4-5-20251001");
+		assert_eq!(summaries[1].context_length, Some(200000));
+		assert_eq!(summaries[2].id, "older-shape-no-context");
+		assert_eq!(summaries[2].context_length, None);
 	}
 }

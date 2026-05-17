@@ -89,9 +89,9 @@ pub struct SessionHeader {
 	/// session. `None` for top-level (user-driven) sessions.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub parent_session_id: Option<String>,
-	/// `tool_call_id` of the parent's `spawn_subagent` call that
-	/// produced this sub-agent. Lets the UI's "pop out" affordance
-	/// resolve the sub-agent's transcript across IDE restarts.
+	/// `tool_call_id` of the parent's `task` call that produced
+	/// this sub-agent. Lets the UI's "pop out" affordance resolve
+	/// the sub-agent's transcript across IDE restarts.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub parent_tool_call_id: Option<String>,
 	/// Wire string ("research" / "agent") of the mode the
@@ -102,9 +102,9 @@ pub struct SessionHeader {
 	/// Absolute path of the folder the sub-agent's tools operated
 	/// against. May differ from the parent's bound folder (which
 	/// owns the JSONL on disk) when the parent passed an explicit
-	/// `folder` argument to `spawn_subagent`. `None` for top-level
-	/// sessions and for sub-agent sessions that targeted the same
-	/// folder as their parent.
+	/// `folder` argument to `task`. `None` for top-level sessions
+	/// and for sub-agent sessions that targeted the same folder as
+	/// their parent.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub subagent_target_folder: Option<String>,
 }
@@ -206,6 +206,41 @@ pub enum SessionRecord {
 	/// dedicated `TodosLoaded` event for the empty-list case
 	/// either — an unset bucket renders the same "no list" pill.
 	TodosUpdate { todos: Vec<crate::TodoItem> },
+	/// One sub-agent was spawned by this session. Mirrors
+	/// [`crate::CoderEvent::SubagentSpawned`] one-to-one so replay
+	/// can re-emit the same event without re-deriving anything.
+	///
+	/// Without this record, reopening a session that had spawned
+	/// sub-agents leaves the parent transcript with bare `task`
+	/// tool rows and no inline summary card — the user can't get
+	/// to the sub-agent's transcript at all because the panel
+	/// keys the pop-out off `subagentSummaries`, which only ever
+	/// got populated from the live event stream.
+	SubagentSpawned {
+		tool_call_id: String,
+		subagent_id: String,
+		target_folder: String,
+		mode: String,
+	},
+	/// One sub-agent finished (success or error). Mirrors
+	/// [`crate::CoderEvent::SubagentFinished`] plus a
+	/// `result_preview` field so the collapsed card on the
+	/// reloaded parent transcript can show the sub-agent's final
+	/// answer without us also having to lazy-load the sub-agent's
+	/// own JSONL just to read its last assistant message.
+	SubagentFinished {
+		subagent_id: String,
+		tokens_used_estimate: u32,
+		was_error: bool,
+		/// First non-empty trimmed assistant message from the
+		/// sub-agent's transcript. `Some(...)` for clean exits;
+		/// `None` for errors / abort with no produced text. Two-
+		/// line cap is enforced by the panel CSS — we persist the
+		/// full preview string here so a future "show full
+		/// preview" UI doesn't need a re-derivation pass.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		result_preview: Option<String>,
+	},
 }
 
 fn u32_is_zero(n: &u32) -> bool {

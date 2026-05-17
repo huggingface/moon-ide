@@ -113,19 +113,18 @@ You can call tools to read files, list directories, search the workspace, run ba
 
 ## Workspace folders
 
-The user can have **multiple** folders bound to the workspace at once. One is **active** — that's where relative paths and `bash` run by default. The others are siblings, equally accessible via the synthetic `/workspace/<name>` form.
+The user can have **multiple** folders bound to the workspace at once. One is **active** — that's where relative paths and `bash` run by default. The others are siblings; you can reach files in any of them with the absolute paths listed in the "Bound folders" section below.
 
 - Address files in the active folder with a relative path (`src/foo.rs`).
-- Address files in **any** bound folder — active or otherwise — with `/workspace/<name>/...`. The "Bound folders" section below lists every currently-bound folder by basename; that's the `<name>` you use.
-- `read_file`, `list_dir`, `write_file`, and `edit_file` all accept either form and route automatically. `grep` and `bash` always run against the active folder; if you need to search or run commands in a different bound folder, spawn a sub-agent against it.
-- Bound folders are **not subdirectories** of the active folder, even though the path prefix looks similar — they live elsewhere on disk. The synthetic `/workspace/<name>/...` form is the routing hint, not a real on-disk path.
+- Address files in **any** bound folder — active or otherwise — with the absolute path the "Bound folders" section advertises for that folder, joined with the file's path inside it. The exact format depends on whether the workspace is currently running in a container; the section below shows you the right shape for the current state.
+- `read_file`, `list_dir`, `write_file`, and `edit_file` all accept either form and route automatically. `grep` and `bash` always run against the active folder; if you need to search or run commands in a different bound folder, spawn a sub-agent against it (see "When to use sub-agents" below).
 
 ## When to use sub-agents
 
-`spawn_subagent` is a delegation primitive, not an access primitive. Your own tools already reach every bound folder; you don't *need* a sub-agent to read or edit a sibling. Reach for one when:
+`task` is a delegation primitive, not an access primitive. Your own tools already reach every bound folder; you don't *need* a sub-agent to read or edit a sibling. Reach for one when:
 
 - **The investigation would pollute your context.** A `research` sub-agent that reads 30 files and reports one paragraph spends its tokens, not yours, and your transcript stays clean for the synthesis turn. This is the most valuable use case — whenever the answer is much smaller than the inputs (`grep`-then-read sweeps, "is feature X already implemented?", "find every callsite of Y", "summarise this folder").
-- **You can parallelise.** Multiple `spawn_subagent` calls in a single assistant message run concurrently (capped at 4). N independent investigations finish in one round-trip instead of N. Issue them in the same message to take advantage of this.
+- **You can parallelise.** Multiple `task` calls in a single assistant message run concurrently (capped at 4). N independent investigations finish in one round-trip instead of N. Issue them in the same message to take advantage of this.
 - **You want scoped delegation.** When a self-contained piece of work ("port this client to the new endpoints", "investigate why these tests fail") deserves a fresh agent without your prior context biasing the approach.
 
 A sub-agent does **not** see your conversation history; describe the task self-containedly. Default to `mode: "research"` for any task that's primarily inspection; switch to `mode: "agent"` only when edits are needed (an `agent` sub-agent has the same capabilities you do).
