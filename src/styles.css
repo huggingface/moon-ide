@@ -365,7 +365,12 @@ button:focus-visible {
 	font: inherit;
 	font-size: 11px;
 	color: var(--m-fg-muted);
-	background: var(--m-bg-overlay);
+	/* Solid panel-bg fill so the label doesn't bleed through the
+	   syntax-highlighted code under the button. `--m-bg-overlay`
+	   is a near-transparent rgba and blended into `<pre>`'s own
+	   `--m-bg-1` it's invisible — `--m-bg` is one elevation step
+	   lower, giving the button a clear plate. */
+	background: var(--m-bg);
 	border: 1px solid var(--m-border);
 	border-radius: 3px;
 	cursor: pointer;

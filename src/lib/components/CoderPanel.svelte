@@ -1792,7 +1792,13 @@
 		font: inherit;
 		font-size: 11px;
 		color: var(--m-fg-muted);
-		background: var(--m-bg-overlay);
+		/* Solid panel-elevation fill so the label doesn't bleed
+		   through the markdown text under the button. The bubble
+		   itself is `--m-bg-overlay` (a near-transparent rgba),
+		   so reusing it here would render the button see-through;
+		   `--m-bg-1` is the next elevation step and gives the
+		   button a clear plate against the bubble. */
+		background: var(--m-bg-1);
 		border: 1px solid var(--m-border);
 		border-radius: 3px;
 		cursor: pointer;
