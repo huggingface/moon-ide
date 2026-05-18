@@ -98,9 +98,16 @@
 		// to a different glyph.
 		//
 		// `Ctrl+C` is overloaded: a non-empty selection copies
-		// (and clears the selection so a follow-up `Ctrl+C` lands
-		// as SIGINT), an empty selection falls through to xterm's
-		// default and sends SIGINT. `Ctrl+V` always pastes.
+		// (and keeps the selection visible so the user can
+		// re-verify what landed in the clipboard, drag to extend
+		// it, or fire another copy); an empty selection falls
+		// through to xterm's default and sends SIGINT. `Ctrl+V`
+		// always pastes. `Ctrl+L` is swallowed here when text is
+		// selected so the window-level handler in App.svelte
+		// (which forwards the selection to the coder composer)
+		// is the only thing that runs — without this, the shell
+		// would still see `^L` and clear its screen, dropping
+		// the selected scrollback on the floor.
 		// We deliberately don't reserve the `Ctrl+Shift+*`
 		// variants — the user already has unambiguous primaries.
 		term.attachCustomKeyEventHandler((event) => {
@@ -112,12 +119,16 @@
 				if (text.length === 0) {
 					return true;
 				}
-				void navigator.clipboard.writeText(text).catch(() => {
-					// Swallow — failing silently is better than a
-					// modal; the user can retry, or fall back to
-					// the menu copy via right-click selection.
-				});
-				term?.clearSelection();
+				void navigator.clipboard
+					.writeText(text)
+					.then(() => {
+						workspace.flash('Copied');
+					})
+					.catch(() => {
+						// Swallow — failing silently is better than a
+						// modal; the user can retry, or fall back to
+						// the menu copy via right-click selection.
+					});
 				return false;
 			}
 			if (event.code === 'KeyV') {
@@ -132,6 +143,9 @@
 					.catch(() => {
 						// As above — silent failure beats a modal.
 					});
+				return false;
+			}
+			if (event.code === 'KeyL' && (term?.getSelection() ?? '').length > 0) {
 				return false;
 			}
 			return true;
