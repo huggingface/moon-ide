@@ -53,4 +53,14 @@ coder_provider_lock?: CoderProviderLock | null,
  * the host's port space across workspaces. See
  * [`crate::ports`] for the wire shape.
  */
-forwarded_ports?: Array<ForwardedPort>, };
+forwarded_ports?: Array<ForwardedPort>, 
+/**
+ * HF Hub bucket bound to this workspace, if any. When set,
+ * the runner pushes session JSONLs to the bucket on
+ * `TurnEnded` (autosync) or on the user's explicit "Upload"
+ * click (manual). See [`crate::coder_hub`] for the
+ * destination shape (`<namespace>/<name>` on the Hub) and
+ * the per-session `uploaded` cache. `None` (the default)
+ * means "no Hub binding; sessions stay local".
+ */
+coder_hub_bucket?: CoderHubBucket | null, };

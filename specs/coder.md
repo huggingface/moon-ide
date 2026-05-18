@@ -116,10 +116,10 @@ client ID **`7977dff4-917a-4cf9-a726-dd45e25faa5f`**. No client
 secret. Scopes asked upfront, just like
 [Phase 11's Slack flow](slack-chat.md#required-scopes-user-token):
 
-| Scope              | Used by     | What it gets us                                                                                                                                                                                                                                                |
-| ------------------ | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `inference-api`    | LLM calls   | Call HF Inference Providers' router endpoint                                                                                                                                                                                                                   |
-| `contribute-repos` | Bucket sync | Create + write to the `<user>/moon-ide-sessions` private bucket. Strictly weaker than `manage-repos` (which would also grant repo deletion and settings edits); `contribute-repos` is the minimum that lets us `create-repo` + `push`, which is all sync needs |
+| Scope              | Used by     | What it gets us                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ------------------ | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `inference-api`    | LLM calls   | Call HF Inference Providers' router endpoint                                                                                                                                                                                                                                                                                                                                                                              |
+| `contribute-repos` | Bucket sync | Create + write to the per-workspace trace bucket. Strictly weaker than `manage-repos` (which would also grant repo deletion and settings edits); `contribute-repos` is the minimum that lets us `create-repo` + `push`, which is all sync needs. The scope also fences us to buckets we own: it is **the** server-side access check, so a malicious moon-ide build can't reach a user's other buckets with the same token |
 
 The `read-billing` and `email` scopes are deliberately **not**
 asked for: we don't need to read the user's email and we don't
@@ -1014,55 +1014,121 @@ Buckets are HF Hub's S3-like object storage backed by Xet — see
 [the official guide](https://huggingface.co/docs/huggingface_hub/guides/buckets)
 and [the Buckets API PR](https://github.com/huggingface/huggingface_hub/pull/3673).
 They're a different `repo_type="bucket"` from models / datasets /
-spaces. moon-coder uses one bucket per user to keep the team's
-session history in one place.
+spaces. moon-coder uses **one bucket per workspace**, owned by either
+the user or one of their orgs, so coder traces render in HF's
+[pi-mono trace viewer](https://huggingface.co/docs/hub/en/storage-bucket-trace-viewer).
 
-### Bucket layout
+### Connect flow
 
-- **One per-user private bucket**, name `moon-ide-sessions`. Created
-  on first sign-in with the API equivalent of
-  `create_bucket("moon-ide-sessions", private=true, exist_ok=true)`.
-- Key prefix per workspace: `<workspace-slug>/<session-id>.jsonl`
-  where `<workspace-slug>` is a stable short hash of the
-  workspace's canonical absolute path (e.g.
-  `<sha256(path)[:16]>`). Renaming a folder doesn't fork its
-  history; moving a checkout to another machine still lines up.
-- A small `<workspace-slug>/manifest.json` lists the workspace's
-  human-readable name, last-seen path, and session-id → first-line
-  preview. Useful for a future "browse remote sessions" UI.
+A workspace starts unbound. The model-settings popover shows a
+"Connect to Hugging Face" button that opens
+[`HfBucketConnectModal.svelte`](../src/lib/components/HfBucketConnectModal.svelte):
 
-### Sync cadence
+- **Owner** — dropdown of the user's namespace plus every org from
+  the cached OAuth identity. The user explicitly picks one.
+- **Name** — defaults to `<workspace-basename>-traces`, validated
+  against the Hub's repo-name rule (alphanumeric + `.-_`, max 96
+  chars). Inline preview shows `<owner>/<name>`.
+- **Visibility** — Private (default) / Public. Stored at create
+  time for display; the Hub is authoritative.
+- **Create bucket** — calls `coder_hub_create_bucket`, which POSTs
+  `/api/buckets/<owner>/<name>`, writes a README via Xet (see
+  below), and persists the resulting [`CoderHubBucket`] onto
+  `WorkspaceSession.coder_hub_bucket`. `409 Conflict` is mapped to
+  success: the bucket already exists, we adopt it. (The fence is
+  that `contribute-repos` will fail later with `403` if we don't
+  own it — moon-ide doesn't need to disambiguate up front.)
 
-A debounced background task per session:
+After create, `autosync` defaults to **false**. The model-settings
+section shows a checkbox the user can flip on — connecting the
+bucket alone doesn't trigger any pushes.
 
-- Local writes are append-only, so the sync task knows the new
-  byte offset. Every **N seconds of quiescence** (default 5 s)
-  after the last local write, the task uploads the **whole file**
-  again — Xet dedup makes this nearly free, since the unchanged
-  prefix re-uploads as a hash-only reference.
-- Force-flushes on session close (panel hidden / app exit).
-- The task uses `hf-xet`'s `XetSession` for the byte transfer and
-  the Hub REST API (`/api/buckets/...` endpoints) for create /
-  list / delete operations. We don't shell out to the Python
-  `huggingface_hub` CLI.
+### On-Hub layout
 
-### Privacy / opt-out
+```text
+<owner>/<name>
+├── README.md           ← generated once at create time
+└── sessions/
+	├── sess-1779.....-abc.jsonl
+	├── sess-1780.....-def.jsonl
+	└── sub-1779....-x.jsonl     ← sub-agent sessions, same flat space
+```
 
-Default: **on for every workspace once signed in**. The first time
-a fresh workspace's session uploads, the panel shows a one-time
-banner:
+The README is a short markdown stub:
 
-> Syncing this workspace's coder sessions to your private HF bucket
-> `moon-ide-sessions/<workspace-name>`.
+```markdown
+# moon-ide traces — <workspace-basename>
 
-The banner has an inline toggle next to that text — flipping it off
-sets `AppState.coder.sync_disabled_workspaces[]` for the workspace
-and dismisses the banner. The same toggle is reachable from the
-panel header after the banner is gone, so the off-switch is always
-one click away.
+This bucket stores coder session traces from moon-ide for the
+workspace `<workspace-basename>`.
 
-A failed upload is a `tracing::warn!` plus a small status-bar pip
-("coder sync delayed"). Local JSONL stays the source of truth.
+Sessions land under `sessions/` as one JSONL per session, in
+pi-mono trace shape. Hugging Face renders each file inline through
+the Hub's pi trace viewer.
+
+Generated by moon-ide on YYYY-MM-DD.
+```
+
+No frontmatter — the trace viewer keys off blob path + `.jsonl`
+extension.
+
+### Sync paths
+
+Two entry points, one common implementation:
+
+- **Manual** — every session row has a cloud-up icon; clicking it
+  pushes that session immediately. Always available, regardless
+  of `autosync`. Used for one-shot sharing of a finished trace
+  and for the first-ever upload after connect.
+- **Autosync** — the runner's `TurnComplete` handler calls
+  [`HubSync::enqueue_session_sync`] with a 2 s debounce per
+  `(workspace_id, session_id)`. A chatty turn whose closing
+  records straddle two `TurnComplete` boundaries collapses into a
+  single upload. The enqueue is fire-and-forget; the turn task
+  never blocks on it.
+
+Both paths land at [`HubSync::upload_session`], which:
+
+1. Reads the local JSONL bytes.
+2. Skips entirely if `WorkspaceSession.coder_hub_bucket.uploaded[id].bytes`
+   matches the on-disk length — the file hasn't grown since the
+   last successful push.
+3. `GET /api/buckets/<owner>/<name>/xet-write-token` for a
+   short-lived CAS upload token + the Xet endpoint URL.
+4. Pushes the bytes through `hf-xet`'s
+   [`XetUploadCommit`](https://docs.rs/hf-xet/latest/xet/xet_session/struct.XetUploadCommit.html),
+   harvests the Merkle hash off the per-file `XetFileInfo`.
+5. `POST /api/buckets/<owner>/<name>/batch` an NDJSON `addFile`
+   line binding the hash at `sessions/<id>.jsonl` with the JSONL
+   content type.
+6. Updates `uploaded[id]` to the new `(bytes, at_ms)` and
+   persists.
+
+Emits a `HubSyncStarted` event before step 3 and a
+`HubSyncFinished` event after step 6 (success) or after any
+intermediate error. The frontend's session-list row decoration
+flips between idle / syncing / synced / failed off that pair.
+
+### Failure mode
+
+A failed upload is a `tracing::warn!` plus the `HubSyncFinished`
+event's `ok: false` arm — the session row's cloud icon flips red
+with the error text in its tooltip. Local JSONL stays the source
+of truth; the next autosync (or a manual click) retries from
+scratch. We don't surface a status-bar pip — the per-row icon is
+sufficient and won't drag the workspace's status bar into the
+"red" state for a Hub blip.
+
+### Disconnect
+
+The same model-settings section has a Disconnect button. It clears
+`WorkspaceSession.coder_hub_bucket` (in particular the `uploaded`
+cache) but doesn't touch the bucket on the Hub itself — bucket
+deletion is a web-UI action the user takes when they actually
+want to drop the data. Disconnecting then re-connecting to the
+**same** bucket starts the `uploaded` cache fresh; the first
+post-reconnect sync round-trips every session even though Xet
+dedup makes the actual bytes nearly free.
 
 ### What never leaves the host
 
@@ -1070,8 +1136,10 @@ A failed upload is a `tracing::warn!` plus a small status-bar pip
 - Provider API keys for any custom provider (keyring only).
 - File contents that the agent _reads_ during a session **do**
   end up in the JSONL (they're part of the tool result message),
-  and therefore in the bucket. NDA workspaces should toggle sync
-  off; the banner exists exactly for this case.
+  and therefore in the bucket once a sync lands. NDA workspaces
+  should leave autosync off (the connect modal defaults to that)
+  and never click the per-row Upload button on a sensitive
+  session.
 
 ## Token accounting and auto-compaction
 

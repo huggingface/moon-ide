@@ -1369,7 +1369,9 @@ export type CoderEvent =
 			cache_creation_tokens: number;
 	  }
 	| { kind: 'compaction_started'; messages_compacted: number }
-	| { kind: 'compaction_complete'; summary: string; prompt_tokens_after: number };
+	| { kind: 'compaction_complete'; summary: string; prompt_tokens_after: number }
+	| { kind: 'hub_sync_started'; session_id: string }
+	| { kind: 'hub_sync_finished'; session_id: string; ok: boolean; error?: string };
 
 /**
  * Where the numbers in a `token_usage` event came from. `provider`
@@ -1563,6 +1565,38 @@ export type PortsApplyResult = {
 	applied: ForwardedPort[];
 	conflicts: ForwardedPort[];
 };
+
+/** One HF Hub bucket bound to a workspace. Mirrors
+ *  `moon_protocol::coder_hub::CoderHubBucket`. The runner pushes
+ *  session JSONLs to `<namespace>/<name>` on the Hub; `autosync`
+ *  flips the per-`TurnEnded` push on and off. `uploaded` is the
+ *  local "what we last sent" cache so unchanged JSONLs skip the
+ *  round-trip. */
+export type CoderHubBucket = {
+	namespace: string;
+	name: string;
+	private: boolean;
+	autosync: boolean;
+	uploaded: Record<string, UploadedMarker>;
+};
+
+/** Per-session push bookkeeping. Mirrors
+ *  `moon_protocol::coder_hub::UploadedMarker`. */
+export type UploadedMarker = {
+	bytes: number;
+	at_ms: number;
+};
+
+/** One option in the connect modal's namespace dropdown.
+ *  Mirrors `moon_protocol::coder_hub::HubNamespace`. */
+export type HubNamespace = { kind: 'user'; name: string } | { kind: 'org'; name: string };
+
+/** Live status reported by the runner while a session JSONL is
+ *  being pushed to the Hub. Drives the cloud-icon state on the
+ *  session-list rows. Per-folder via `CoderEventEnvelope`. */
+export type HubSyncProgress =
+	| { kind: 'started'; session_id: string }
+	| { kind: 'finished'; session_id: string; ok: boolean; error?: string };
 
 export type MoonError =
 	| { code: 'NotFound'; message: string }

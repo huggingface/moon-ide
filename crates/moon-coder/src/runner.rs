@@ -121,6 +121,12 @@ struct CoderState {
 	/// the auth commands can read / mutate it without going
 	/// through the inference client.
 	provider_keys: ProviderKeyring,
+	/// HF Hub bucket sync. Holds the debounce queue + the HTTP
+	/// client used for `/api/buckets/*` round-trips. Drives both
+	/// the per-turn autosync (runner hook in [`Coder::send`]
+	/// continuations) and the panel's manual / "Sync all"
+	/// buttons (Tauri commands in `src-tauri/src/commands/coder.rs`).
+	pub(crate) hub_sync: crate::hub_sync::HubSync,
 }
 
 /// Per-folder runtime: one in-memory `Session` plus one
@@ -393,6 +399,12 @@ impl CoderHandle {
 		let tools = ToolRegistry::new(workspaces.clone(), workspaces_dir.clone(), web);
 		let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 		let folder_summaries = Arc::new(FolderSummaryService::new(folder_summaries_dir));
+		let hub_sync = crate::hub_sync::HubSync::new(
+			auth.clone(),
+			events.clone(),
+			workspaces_dir.clone(),
+			coder_sessions_dir.clone(),
+		)?;
 		Ok(Self {
 			state: Arc::new(CoderState {
 				auth,
@@ -406,8 +418,38 @@ impl CoderHandle {
 				folder_summaries,
 				models,
 				provider_keys,
+				hub_sync,
 			}),
 		})
+	}
+
+	/// Access to the workspace's HF Hub bucket sync state. Used
+	/// by the Tauri layer (`coder_hub_*` commands) to drive the
+	/// connect / autosync / manual-upload affordances. Cheap
+	/// clone — every field on [`crate::hub_sync::HubSync`] is
+	/// already `Arc`-wrapped where it needs to be.
+	pub fn hub_sync(&self) -> crate::hub_sync::HubSync {
+		self.state.hub_sync.clone()
+	}
+
+	/// Workspace id this handle was wired against. Used by the
+	/// hub sync commands to load + persist `WorkspaceSession`
+	/// without re-deriving the id from a folder path.
+	pub async fn workspace_id(&self) -> String {
+		self.state.workspaces.workspace_id().await
+	}
+
+	/// Absolute path of the active workspace folder, if any.
+	/// Convenience used by the hub sync Tauri commands so the
+	/// `src-tauri` layer doesn't need a direct dep on
+	/// [`moon_core::WorkspaceRegistry`].
+	pub async fn active_folder(&self) -> Option<String> {
+		self
+			.state
+			.workspaces
+			.active_folder()
+			.await
+			.map(|entry| entry.folder.path.clone())
 	}
 
 	/// True iff a Tavily API key is currently stored in the
@@ -1530,7 +1572,10 @@ impl CoderHandle {
 			let result = run_turn(&state, &fs_for_turn, &folder_for_turn, &sink_for_turn, cancel_outer).await;
 			fs_for_turn.turn.lock().await.cancel = None;
 			match &result {
-				Ok(()) => sink_for_turn.send(CoderEvent::TurnComplete),
+				Ok(()) => {
+					sink_for_turn.send(CoderEvent::TurnComplete);
+					maybe_autosync_to_hub(&state, &fs_for_turn, &folder_for_turn).await;
+				}
 				Err(CoderError::Aborted) => sink_for_turn.send(CoderEvent::Aborted),
 				Err(err) => {
 					tracing::warn!(error = %err, "coder turn failed");
@@ -1620,6 +1665,43 @@ pub struct UnqueuedSteer {
 fn pop_pending_steer(session: &mut Session, id: &str) -> Option<PendingSteer> {
 	let idx = session.pending_steers.iter().position(|s| s.id == id)?;
 	Some(session.pending_steers.remove(idx))
+}
+
+/// After a successful turn, check the workspace's
+/// [`coder_hub_bucket`] binding and, if `autosync` is on, enqueue
+/// a debounced upload of the active session's JSONL. Fire-and-
+/// forget — the turn task never blocks on the upload. Silently
+/// no-ops when there's no binding, when autosync is off, or when
+/// the workspace's `session.json` fails to load (we log the
+/// failure but don't surface it; the next turn retries).
+async fn maybe_autosync_to_hub(state: &Arc<CoderState>, fs: &Arc<FolderSession>, folder_path: &Utf8Path) {
+	let workspace_id = state.workspaces.workspace_id().await;
+	let workspace_session = match moon_core::session::load(&state.workspaces_dir, &workspace_id).await {
+		Ok(s) => s,
+		Err(err) => {
+			tracing::warn!(error = %err, "hub autosync: could not read session.json");
+			return;
+		}
+	};
+	let Some(bucket) = workspace_session.coder_hub_bucket else {
+		return;
+	};
+	if !bucket.autosync {
+		return;
+	}
+	let session_id = {
+		let session = fs.session.lock().await;
+		// An empty session has nothing to push — guard against
+		// the (rare but possible) race where the turn task
+		// finished but no records were ever persisted.
+		if session.persisted_records == 0 {
+			return;
+		}
+		session.header.id.clone()
+	};
+	state
+		.hub_sync
+		.enqueue_session_sync(workspace_id, folder_path.to_path_buf(), session_id);
 }
 
 async fn run_turn(

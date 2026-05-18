@@ -254,6 +254,27 @@ pub enum CoderEvent {
 	/// flips the row from "compacting…" to a collapsible
 	/// disclosure showing the summary.
 	CompactionComplete { summary: String, prompt_tokens_after: u32 },
+
+	/// A push to the workspace's HF Hub bucket has started for
+	/// `session_id`. The frontend flips the matching session
+	/// row's cloud icon into the "syncing" state (spinning
+	/// ring); a matching [`HubSyncFinished`] event flips it back
+	/// to idle (`ok: true`) or failed (`ok: false`). Per-folder
+	/// via [`CoderEventEnvelope`] — the row decoration lives in
+	/// the session list, which itself is per-folder.
+	HubSyncStarted { session_id: String },
+
+	/// The push that started with the matching
+	/// [`HubSyncStarted`] is done. `ok` is `false` on any
+	/// failure (token refresh failed, Xet rejected, batch 4xx,
+	/// disk I/O); `error` carries the displayable reason for
+	/// the tooltip when `ok` is `false`.
+	HubSyncFinished {
+		session_id: String,
+		ok: bool,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		error: Option<String>,
+	},
 }
 
 /// Where the token numbers in [`CoderEvent::TokenUsage`] came from.

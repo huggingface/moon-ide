@@ -22,12 +22,14 @@ import {
 	formatError,
 	type CoderEvent,
 	type CoderEventEnvelope,
+	type CoderHubBucket,
 	type CoderModelSettings,
 	type CoderProviderConfig,
 	type CoderSessionSummary,
 	type CoderStatus,
 	type DeviceCode,
 	type HfIdentity,
+	type HubNamespace,
 	type ImageAttachmentPayload,
 	type ProviderKind,
 	type ProviderModelSummary,
@@ -361,6 +363,17 @@ export type CompactionState =
 	| { phase: 'running'; messagesCompacted: number }
 	| { phase: 'done'; messagesCompacted: number; summary: string; promptTokensAfter: number };
 
+/** Per-session sync state for the row decoration in the session
+ *  list. Held in `CoderPanelState.hubSyncState`, keyed by
+ *  session id. Driven by the streamed `HubSyncStarted` /
+ *  `HubSyncFinished` events — the row icon flips based on this
+ *  state, not the IPC return value (which only signals "request
+ *  accepted"). */
+export type HubSyncRowState =
+	| { phase: 'syncing' }
+	| { phase: 'synced'; atMs: number }
+	| { phase: 'failed'; error: string };
+
 /** Sentinel folder key used when no workspace folder is active.
  *  Pre-binding the agent panel still lets the user start typing
  *  into the composer; the draft stays under this key until a
@@ -419,6 +432,19 @@ class CoderPanelState {
 	 *  router said. Cleared on the next successful call. */
 	modelsError = $state<string | null>(null);
 
+	/** HF Hub bucket bound to the current workspace, if any.
+	 *  Populated by [`loadHubBinding`] on panel mount and after a
+	 *  successful create/disconnect. `null` means "no binding";
+	 *  the picker renders the "Connect" affordance in that case. */
+	hubBucket = $state<CoderHubBucket | null>(null);
+
+	/** Per-session sync state, keyed by session id. Lives on the
+	 *  panel state so the row decoration can flip between
+	 *  "syncing…" / "synced" / "failed" without dragging the full
+	 *  binding through props. Populated by `HubSyncStarted` /
+	 *  `HubSyncFinished` envelopes. */
+	hubSyncState = $state<Record<string, HubSyncRowState>>({});
+
 	/** Fetch the current settings into [`modelSettings`]. Safe to
 	 *  call repeatedly; idempotent at the steady state. Errors land
 	 *  in [`modelsError`] and the previous snapshot stays in place
@@ -443,6 +469,73 @@ class CoderPanelState {
 			this.modelsError = formatError(err);
 			throw err;
 		}
+	}
+
+	/** Fetch the current workspace's HF Hub binding into
+	 *  [`hubBucket`]. Safe to call repeatedly; idempotent. Errors
+	 *  drop silently — the picker just keeps the "Connect"
+	 *  affordance visible until the next reload. The picker
+	 *  surfaces real-time failures via the modal / row tooltips
+	 *  rather than a panel-level toast, so we don't push the
+	 *  read failure anywhere globally either. */
+	async loadHubBinding(): Promise<void> {
+		try {
+			this.hubBucket = await ipc.coder.hubGetBinding();
+		} catch {
+			// Ignored — see fn docstring.
+		}
+	}
+
+	/** List the HF namespaces the user can create a bucket under
+	 *  (their login + every org they belong to). Used by the
+	 *  connect modal's dropdown. Throws so the modal can surface
+	 *  network / not-signed-in failures inline. */
+	async listHubNamespaces(): Promise<HubNamespace[]> {
+		return await ipc.coder.hubListNamespaces();
+	}
+
+	/** Provision a bucket on the Hub and bind it to the active
+	 *  workspace. Updates [`hubBucket`] on success. The modal
+	 *  reads the return value to render the post-create banner;
+	 *  it's also stored on [`hubBucket`] so re-opening the
+	 *  picker sees the connected state. */
+	async createHubBucket(namespace: string, name: string, isPrivate: boolean): Promise<CoderHubBucket> {
+		const bucket = await ipc.coder.hubCreateBucket(namespace, name, isPrivate);
+		this.hubBucket = bucket;
+		return bucket;
+	}
+
+	/** Flip autosync on or off. Optimistic update; reloads the
+	 *  binding on failure to recover from a stale flag. */
+	async setHubAutosync(enabled: boolean): Promise<void> {
+		const previous = this.hubBucket;
+		if (this.hubBucket) {
+			this.hubBucket = { ...this.hubBucket, autosync: enabled };
+		}
+		try {
+			await ipc.coder.hubSetAutosync(enabled);
+		} catch (err) {
+			this.hubBucket = previous;
+			throw err;
+		}
+	}
+
+	/** Drop the workspace's binding. Does not touch the bucket on
+	 *  the Hub itself — that's a web-UI action. */
+	async disconnectHubBucket(): Promise<void> {
+		await ipc.coder.hubDisconnect();
+		this.hubBucket = null;
+		this.hubSyncState = {};
+	}
+
+	/** Push one session JSONL to the Hub right now. Used by the
+	 *  per-row upload icon and the header "Sync all" button.
+	 *  Returns the same promise the IPC resolves so callers can
+	 *  await for chained UI updates (the row state itself flips
+	 *  via the streamed `HubSyncStarted` / `HubSyncFinished`
+	 *  events, not from this resolution). */
+	async uploadSessionToHub(sessionId: string): Promise<void> {
+		await ipc.coder.hubUploadSession(sessionId);
 	}
 
 	/** Fetch the router catalog. One round trip per call. The result
@@ -1992,6 +2085,24 @@ class CoderPanelState {
 						...bucket.tokenUsage,
 						prompt: event.prompt_tokens_after,
 					};
+				}
+				return;
+			}
+			case 'hub_sync_started':
+				this.hubSyncState = {
+					...this.hubSyncState,
+					[event.session_id]: { phase: 'syncing' },
+				};
+				return;
+			case 'hub_sync_finished': {
+				this.hubSyncState = {
+					...this.hubSyncState,
+					[event.session_id]: event.ok
+						? { phase: 'synced', atMs: Date.now() }
+						: { phase: 'failed', error: event.error ?? 'Upload failed' },
+				};
+				if (event.ok) {
+					this.loadHubBinding().catch(() => {});
 				}
 				return;
 			}

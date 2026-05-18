@@ -38,6 +38,7 @@
 
 	import { coder } from '../coder.svelte';
 	import { workspace } from '../state.svelte';
+	import HfBucketConnectModal from './HfBucketConnectModal.svelte';
 	import type {
 		CoderModelSettings,
 		CoderProviderConfig,
@@ -88,6 +89,8 @@
 
 	type Props = { onClose: () => void };
 	let { onClose }: Props = $props();
+
+	let hubConnectOpen = $state(false);
 
 	// Picker state. `standardModel` / `cheapModel` / `billTo` are
 	// the picks for whichever provider is currently active in the
@@ -217,6 +220,7 @@
 	}
 
 	onMount(async () => {
+		void coder.loadHubBinding();
 		await coder.loadModelSettings();
 		if (coder.modelSettings) {
 			loadFromSettings(coder.modelSettings);
@@ -1411,6 +1415,71 @@
 					{/if}
 				{/if}
 			</section>
+
+			<!-- HF Hub trace sync. One bucket per workspace; the
+				 runner pushes session JSONLs to <namespace>/<name>
+				 so the Hub can render them in its pi-mono trace
+				 viewer. `autosync` defaults to off after connect
+				 to keep the first push deliberate; the manual
+				 row-level "Upload" affordance is always available.
+				 The disconnect button only drops the workspace's
+				 binding — the bucket itself stays on the Hub. -->
+			<section class="hub-sync" aria-label="Hugging Face trace sync">
+				<div class="label-row">
+					<span class="label-name">Hugging Face trace sync</span>
+				</div>
+				{#if coder.hubBucket}
+					{@const bucket = coder.hubBucket}
+					<div class="hub-summary">
+						<span class="hub-target">
+							<a
+								href="https://huggingface.co/buckets/{bucket.namespace}/{bucket.name}"
+								target="_blank"
+								rel="noreferrer"
+							>
+								{bucket.namespace}/{bucket.name}
+							</a>
+						</span>
+						<span class="key-status configured">connected</span>
+					</div>
+					<label class="autosync-row">
+						<input
+							type="checkbox"
+							checked={bucket.autosync}
+							onchange={(e) => coder.setHubAutosync((e.target as HTMLInputElement).checked)}
+						/>
+						<span>Autosync after every turn</span>
+					</label>
+					<span class="hint">
+						Sessions land under <code>sessions/</code> as pi-mono JSONLs the Hub can render inline. Manual
+						<code>Upload</code> is always available on each session row.
+					</span>
+					<div class="hub-actions">
+						<button
+							type="button"
+							class="secondary"
+							onclick={async () => {
+								try {
+									await coder.disconnectHubBucket();
+								} catch (err) {
+									saveError = err instanceof Error ? err.message : String(err);
+								}
+							}}
+						>
+							Disconnect
+						</button>
+					</div>
+				{:else}
+					<span class="hint">
+						Provision a workspace-scoped HF bucket so coder sessions render in the Hub's pi-mono trace viewer.
+					</span>
+					<div class="hub-actions">
+						<button type="button" class="primary" onclick={() => (hubConnectOpen = true)}>
+							Connect to Hugging Face
+						</button>
+					</div>
+				{/if}
+			</section>
 		{/if}
 
 		<footer>
@@ -1432,6 +1501,10 @@
 		</footer>
 	</div>
 </div>
+
+{#if hubConnectOpen}
+	<HfBucketConnectModal onClose={() => (hubConnectOpen = false)} />
+{/if}
 
 <style>
 	.overlay {
@@ -1859,6 +1932,64 @@
 		flex: 0 0 auto;
 		padding: 0 12px;
 		font-size: 11px;
+	}
+	.hub-sync {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		padding-top: 10px;
+		border-top: 1px solid var(--m-border);
+	}
+	.hub-sync .label-name {
+		font-size: 12px;
+		font-weight: 600;
+	}
+	.hub-summary {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		font-size: 12px;
+	}
+	.hub-target a {
+		color: var(--m-fg);
+		text-decoration: underline;
+		font-family: var(--m-font-mono, ui-monospace, monospace);
+	}
+	.autosync-row {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		font-size: 12px;
+		color: var(--m-fg);
+	}
+	.hub-actions {
+		display: flex;
+		gap: 6px;
+		margin-top: 2px;
+	}
+	.hub-actions .primary,
+	.hub-actions .secondary {
+		font: inherit;
+		border-radius: 4px;
+		padding: 6px 12px;
+		font-size: 12px;
+		cursor: pointer;
+	}
+	.hub-actions .primary {
+		background: var(--m-accent);
+		color: #fff;
+		border: 0;
+	}
+	.hub-actions .secondary {
+		background: var(--m-bg-overlay);
+		color: var(--m-fg);
+		border: 1px solid var(--m-border);
+	}
+	.hub-actions .primary:hover {
+		filter: brightness(1.1);
+	}
+	.hub-actions .secondary:hover {
+		border-color: var(--m-fg-muted);
 	}
 	.key-status {
 		font-size: 10px;

@@ -22,6 +22,7 @@ pub mod defaults;
 pub mod error;
 pub mod event;
 pub mod folder_summary;
+pub mod hub_sync;
 pub mod inference;
 pub mod models;
 pub mod providers;

@@ -3,10 +3,12 @@ import { invoke } from '@tauri-apps/api/core';
 import type {
 	AppInfo,
 	AppState,
+	CoderHubBucket,
 	CoderModelSettings,
 	CoderProviderConfig,
 	CoderSessionSummary,
 	CoderStatus,
+	HubNamespace,
 	ProviderKind,
 	ProviderModelSummary,
 	ProviderProbeResult,
@@ -360,6 +362,13 @@ export const ipc = {
 		webSearchConfigured: () => invoke<boolean>('coder_web_search_configured'),
 		setWebSearchKey: (key: string) => invoke<void>('coder_set_web_search_key', { key }),
 		clearWebSearchKey: () => invoke<void>('coder_clear_web_search_key'),
+		hubListNamespaces: () => invoke<HubNamespace[]>('coder_hub_list_namespaces'),
+		hubGetBinding: () => invoke<CoderHubBucket | null>('coder_hub_get_binding'),
+		hubCreateBucket: (namespace: string, name: string, isPrivate: boolean) =>
+			invoke<CoderHubBucket>('coder_hub_create_bucket', { namespace, name, private: isPrivate }),
+		hubSetAutosync: (enabled: boolean) => invoke<void>('coder_hub_set_autosync', { enabled }),
+		hubDisconnect: () => invoke<void>('coder_hub_disconnect'),
+		hubUploadSession: (sessionId: string) => invoke<void>('coder_hub_upload_session', { sessionId }),
 	},
 	ui: {
 		setRightPanel: (kind: RightPanelKind | null) => invoke<void>('ui_set_right_panel', { kind }),

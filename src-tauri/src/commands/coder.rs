@@ -5,9 +5,11 @@
 //! `coder:event` Tauri channel. See
 //! `specs/test-plans/0039-coder-skeleton.md`.
 
+use camino::Utf8PathBuf;
 use moon_coder::{CoderHandle, CoderStatus, DeviceCode, HfIdentity, ImageAttachment, SessionSummary, UnqueuedSteer};
 use moon_core::app_state as app_state_store;
 use moon_core::session as core_session;
+use moon_protocol::coder_hub::{CoderHubBucket, HubNamespace};
 use moon_protocol::coder_models::{
 	CoderModelSettings, CoderProviderConfig, CoderProviderLock, ProviderModelSummary, ProviderProbeResult, RouterModel,
 };
@@ -669,6 +671,125 @@ pub async fn coder_delete_provider(state: State<'_, AppState>, id: String) -> Re
 #[tauri::command]
 pub async fn coder_web_search_configured(state: State<'_, AppState>) -> Result<bool, MoonError> {
 	Ok(state.coder.web_search_configured())
+}
+
+// ---------- HF Hub bucket sync commands ----------
+
+/// Namespaces the user can create a bucket under: their own
+/// login plus every org they belong to. Populates the connect
+/// modal's dropdown. Driven off the cached OAuth identity, so
+/// the modal opens instantly.
+#[tauri::command]
+pub async fn coder_hub_list_namespaces(state: State<'_, AppState>) -> Result<Vec<HubNamespace>, MoonError> {
+	state.coder.hub_sync().list_namespaces().await.map_err(MoonError::from)
+}
+
+/// Read the current workspace's Hub binding (if any). Cheap
+/// `session.json` read; the picker uses this on mount to render
+/// the "Connected to …" / "Connect" affordance.
+#[tauri::command]
+pub async fn coder_hub_get_binding(state: State<'_, AppState>) -> Result<Option<CoderHubBucket>, MoonError> {
+	let Some(id) = state.workspace_id() else {
+		return Ok(None);
+	};
+	let session = core_session::load(&state.workspaces_dir, id).await?;
+	Ok(session.coder_hub_bucket)
+}
+
+/// Provision a new bucket on the Hub, write the README, and bind
+/// it to the active workspace. `autosync` defaults to `false`;
+/// the modal nudges the user to flip it on but never auto-flips.
+#[tauri::command]
+pub async fn coder_hub_create_bucket(
+	state: State<'_, AppState>,
+	namespace: String,
+	name: String,
+	private: bool,
+) -> Result<CoderHubBucket, MoonError> {
+	let Some(id) = state.workspace_id() else {
+		return Err(MoonError::invalid("no workspace bound to this process"));
+	};
+	let id = id.to_owned();
+	let workspace_basename = workspace_basename(&state).await.unwrap_or_else(|| name.clone());
+	let bucket = state
+		.coder
+		.hub_sync()
+		.create_bucket(&namespace, &name, private, &workspace_basename)
+		.await?;
+	let mut session = core_session::load(&state.workspaces_dir, &id).await?;
+	session.coder_hub_bucket = Some(bucket.clone());
+	core_session::save(&state.workspaces_dir, &id, &session).await?;
+	Ok(bucket)
+}
+
+/// Flip autosync on or off for the active workspace's binding.
+/// No-op (returns `Ok`) when there's no binding — the modal
+/// shouldn't surface the toggle in that case, but guarding here
+/// keeps the IPC contract uniform across UI states.
+#[tauri::command]
+pub async fn coder_hub_set_autosync(state: State<'_, AppState>, enabled: bool) -> Result<(), MoonError> {
+	let Some(id) = state.workspace_id() else {
+		return Ok(());
+	};
+	let id = id.to_owned();
+	let mut session = core_session::load(&state.workspaces_dir, &id).await?;
+	let Some(bucket) = session.coder_hub_bucket.as_mut() else {
+		return Ok(());
+	};
+	if bucket.autosync == enabled {
+		return Ok(());
+	}
+	bucket.autosync = enabled;
+	core_session::save(&state.workspaces_dir, &id, &session).await
+}
+
+/// Drop the workspace's Hub binding (does not delete the bucket
+/// on the Hub — that's a separate web-UI action). Clears the
+/// in-flight upload cache too.
+#[tauri::command]
+pub async fn coder_hub_disconnect(state: State<'_, AppState>) -> Result<(), MoonError> {
+	let Some(id) = state.workspace_id() else {
+		return Ok(());
+	};
+	let id = id.to_owned();
+	let mut session = core_session::load(&state.workspaces_dir, &id).await?;
+	if session.coder_hub_bucket.is_none() {
+		return Ok(());
+	}
+	session.coder_hub_bucket = None;
+	core_session::save(&state.workspaces_dir, &id, &session).await
+}
+
+/// Push one session JSONL to the bound bucket. Used by the row
+/// "Upload" affordance and the header "Sync all" button. Always
+/// available, regardless of `autosync`. Emits
+/// `coder:event` envelopes (`HubSyncStarted` / `HubSyncFinished`)
+/// for live UI state.
+#[tauri::command]
+pub async fn coder_hub_upload_session(state: State<'_, AppState>, session_id: String) -> Result<(), MoonError> {
+	let Some(id) = state.workspace_id() else {
+		return Err(MoonError::invalid("no workspace bound to this process"));
+	};
+	let id = id.to_owned();
+	let Some(folder) = state.coder.active_folder().await else {
+		return Err(MoonError::invalid("no active workspace folder"));
+	};
+	let folder_path = Utf8PathBuf::from(folder);
+	state
+		.coder
+		.hub_sync()
+		.upload_session(&id, &folder_path, &session_id)
+		.await
+		.map_err(MoonError::from)
+}
+
+/// Helper: best-effort basename of the workspace's active folder.
+/// Used to seed the README and the default bucket name preview.
+/// `None` when there's no active folder.
+async fn workspace_basename(state: &AppState) -> Option<String> {
+	let folder = state.coder.active_folder().await?;
+	let path = Utf8PathBuf::from(folder);
+	path.file_name().map(|s| s.to_string())
 }
 
 /// Persist a new Tavily API key. Trimmed at the runner; empty

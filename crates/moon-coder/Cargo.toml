@@ -34,6 +34,12 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+# Hugging Face Xet client. Used by `hub_sync.rs` to upload coder
+# session JSONLs into a workspace-scoped bucket so the Hub can
+# render them in its pi-mono trace viewer. The crate publishes as
+# `hf-xet` on crates.io but exposes its root namespace as `xet`,
+# hence the `use xet::xet_session` imports.
+hf-xet = "1.5"
 
 [dev-dependencies]
 tempfile = "3"

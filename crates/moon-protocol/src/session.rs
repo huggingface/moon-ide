@@ -8,6 +8,7 @@
 //! compile time. Per AGENTS.md "no premature migrations": we change
 //! this freely until the roadmap is done.
 
+use crate::coder_hub::CoderHubBucket;
 use crate::coder_models::CoderProviderLock;
 use crate::git::{CompareBaseline, PrListScope};
 use crate::ports::ForwardedPort;
@@ -134,4 +135,14 @@ pub struct WorkspaceSession {
 	/// [`crate::ports`] for the wire shape.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub forwarded_ports: Vec<ForwardedPort>,
+	/// HF Hub bucket bound to this workspace, if any. When set,
+	/// the runner pushes session JSONLs to the bucket on
+	/// `TurnEnded` (autosync) or on the user's explicit "Upload"
+	/// click (manual). See [`crate::coder_hub`] for the
+	/// destination shape (`<namespace>/<name>` on the Hub) and
+	/// the per-session `uploaded` cache. `None` (the default)
+	/// means "no Hub binding; sessions stay local".
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[ts(optional, type = "CoderHubBucket | null")]
+	pub coder_hub_bucket: Option<CoderHubBucket>,
 }

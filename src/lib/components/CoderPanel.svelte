@@ -25,6 +25,7 @@
 	import SettingsIcon from './icons/SettingsIcon.svelte';
 	import SignOutIcon from './icons/SignOutIcon.svelte';
 	import PlusIcon from './icons/PlusIcon.svelte';
+	import CloudUploadIcon from './icons/CloudUploadIcon.svelte';
 	import ListIcon from './icons/ListIcon.svelte';
 	import FileIcon from './icons/FileIcon.svelte';
 	import TrashIcon from './icons/TrashIcon.svelte';
@@ -44,7 +45,45 @@
 
 	onMount(() => {
 		void coder.refreshStatus();
+		void coder.loadHubBinding();
 	});
+
+	function hubRowState(sessionId: string): 'idle' | 'syncing' | 'synced' | 'failed' {
+		const s = coder.hubSyncState[sessionId];
+		if (!s) {
+			return coder.hubBucket?.uploaded[sessionId] ? 'synced' : 'idle';
+		}
+		return s.phase;
+	}
+
+	function hubRowTitle(sessionId: string): string {
+		const bucket = coder.hubBucket;
+		if (!bucket) {
+			return 'Upload to Hugging Face';
+		}
+		const target = `${bucket.namespace}/${bucket.name}`;
+		const live = coder.hubSyncState[sessionId];
+		if (live?.phase === 'syncing') {
+			return `Uploading to ${target}…`;
+		}
+		if (live?.phase === 'failed') {
+			return `Upload failed: ${live.error}`;
+		}
+		const marker = bucket.uploaded[sessionId];
+		if (marker || live?.phase === 'synced') {
+			return `Synced to ${target}`;
+		}
+		return `Upload to ${target}`;
+	}
+
+	async function onUploadSession(event: MouseEvent, sessionId: string): Promise<void> {
+		event.stopPropagation();
+		try {
+			await coder.uploadSessionToHub(sessionId);
+		} catch (err) {
+			workspace.flash(`Hub upload failed: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	}
 
 	// Keep the store's `composerEl` reference in sync with the
 	// live textarea node — the store needs it so Ctrl+L can
@@ -903,6 +942,22 @@
 							>
 								<CodeIcon />
 							</button>
+							{#if coder.hubBucket}
+								{@const phase = hubRowState(session.id)}
+								<button
+									type="button"
+									class="icon session-row-action hub-action"
+									class:syncing={phase === 'syncing'}
+									class:synced={phase === 'synced'}
+									class:failed={phase === 'failed'}
+									title={hubRowTitle(session.id)}
+									aria-label={hubRowTitle(session.id)}
+									onclick={(event) => onUploadSession(event, session.id)}
+									disabled={phase === 'syncing'}
+								>
+									<CloudUploadIcon />
+								</button>
+							{/if}
 							<button
 								type="button"
 								class="icon session-row-action"
@@ -1727,6 +1782,38 @@
 	.session-row:hover .session-row-action,
 	.session-row:focus-within .session-row-action {
 		opacity: 1;
+	}
+	.hub-action.synced {
+		opacity: 0.55;
+		color: var(--m-fg-muted);
+	}
+	.hub-action.synced:hover,
+	.session-row:hover .hub-action.synced,
+	.session-row:focus-within .hub-action.synced {
+		opacity: 1;
+	}
+	.hub-action.syncing {
+		opacity: 1;
+		color: var(--m-accent);
+		animation: hub-action-pulse 1.2s ease-in-out infinite;
+	}
+	.hub-action.failed {
+		opacity: 1;
+		color: var(--m-danger);
+	}
+	@keyframes hub-action-pulse {
+		0%,
+		100% {
+			filter: brightness(1);
+		}
+		50% {
+			filter: brightness(1.4);
+		}
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.hub-action.syncing {
+			animation: none;
+		}
 	}
 	.empty {
 		flex: 1;

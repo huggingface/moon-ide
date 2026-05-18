@@ -236,6 +236,12 @@ pub fn run() {
 			commands::coder::coder_web_search_configured,
 			commands::coder::coder_set_web_search_key,
 			commands::coder::coder_clear_web_search_key,
+			commands::coder::coder_hub_list_namespaces,
+			commands::coder::coder_hub_get_binding,
+			commands::coder::coder_hub_create_bucket,
+			commands::coder::coder_hub_set_autosync,
+			commands::coder::coder_hub_disconnect,
+			commands::coder::coder_hub_upload_session,
 			commands::ui::ui_set_right_panel,
 		])
 		.setup(move |app| {
