@@ -26,7 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use moon_protocol::coder_models::{ProviderKind, ProviderProbeResult};
 use serde::Deserialize;
 
-use crate::error::CoderError;
+use crate::error::{request_id_of, CoderError};
 
 const KEYRING_SERVICE: &str = "moon-ide";
 const KEYRING_ACCOUNT_PREFIX: &str = "coder-provider:";
@@ -264,9 +264,10 @@ async fn probe_models(
 	}
 	let response = req.send().await.map_err(CoderError::from)?;
 	let status = response.status();
+	let request_id = request_id_of(&response);
 	let body = response.text().await.map_err(CoderError::from)?;
 	if !status.is_success() {
-		return Err(CoderError::http(endpoint, status.as_u16(), body));
+		return Err(CoderError::http(endpoint, status.as_u16(), body, request_id));
 	}
 
 	#[derive(Deserialize)]
@@ -313,8 +314,9 @@ async fn probe_chat_ping(
 	let response = req.send().await.map_err(CoderError::from)?;
 	let status = response.status();
 	if status.as_u16() == 401 || status.as_u16() == 403 {
+		let request_id = request_id_of(&response);
 		let text = response.text().await.unwrap_or_default();
-		return Err(CoderError::http(endpoint, status.as_u16(), text));
+		return Err(CoderError::http(endpoint, status.as_u16(), text, request_id));
 	}
 	Ok(ProviderProbeResult {
 		model_count: 0,

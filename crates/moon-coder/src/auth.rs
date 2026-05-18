@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::defaults::{HF_HUB_BASE, HF_OAUTH_CLIENT_ID, HF_OAUTH_SCOPES};
-use crate::error::CoderError;
+use crate::error::{request_id_of, CoderError};
 
 const KEYRING_SERVICE: &str = "moon-ide";
 const KEYRING_ACCOUNT: &str = "hf-oauth";
@@ -316,9 +316,10 @@ impl Authenticator {
 			.map_err(CoderError::from)?;
 
 		let status = response.status();
+		let request_id = request_id_of(&response);
 		let body = response.text().await.map_err(CoderError::from)?;
 		if !status.is_success() {
-			return Err(CoderError::http(endpoint, status.as_u16(), body));
+			return Err(CoderError::http(endpoint, status.as_u16(), body, request_id));
 		}
 
 		// HF docs: the body is JSON shaped per RFC 8628 with the optional
@@ -384,6 +385,7 @@ impl Authenticator {
 				.map_err(CoderError::from)?;
 
 			let status = response.status();
+			let request_id = request_id_of(&response);
 			let body = response.text().await.map_err(CoderError::from)?;
 
 			if status.is_success() {
@@ -405,7 +407,7 @@ impl Authenticator {
 				}
 				Some("expired_token") => return Err(CoderError::DeviceFlowExpired),
 				Some("access_denied") => return Err(CoderError::DeviceFlowDenied),
-				_ => return Err(CoderError::http(endpoint, status.as_u16(), body)),
+				_ => return Err(CoderError::http(endpoint, status.as_u16(), body, request_id)),
 			}
 		}
 	}
@@ -455,6 +457,7 @@ impl Authenticator {
 			.await
 			.map_err(CoderError::from)?;
 		let status = response.status();
+		let request_id = request_id_of(&response);
 		let body = response.text().await.map_err(CoderError::from)?;
 		if !status.is_success() {
 			// Refresh token has been revoked or expired. Drop the bundle
@@ -463,7 +466,7 @@ impl Authenticator {
 			tracing::warn!(status = %status, "hf-oauth refresh failed; clearing stored token");
 			self.store.clear().ok();
 			*cached = None;
-			return Err(CoderError::http(endpoint, status.as_u16(), body));
+			return Err(CoderError::http(endpoint, status.as_u16(), body, request_id));
 		}
 
 		let new_bundle = parse_token_response(&body, &endpoint)?;
@@ -496,9 +499,10 @@ impl Authenticator {
 			.await
 			.map_err(CoderError::from)?;
 		let status = response.status();
+		let request_id = request_id_of(&response);
 		let body = response.text().await.map_err(CoderError::from)?;
 		if !status.is_success() {
-			return Err(CoderError::http(endpoint, status.as_u16(), body));
+			return Err(CoderError::http(endpoint, status.as_u16(), body, request_id));
 		}
 
 		// Debug-only verbatim body. Contains the user's HF-registered

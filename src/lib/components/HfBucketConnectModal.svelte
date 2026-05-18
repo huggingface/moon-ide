@@ -43,11 +43,25 @@
 		}
 	});
 
+	// Default to the workspace name, not the active folder's
+	// basename: a single binding lives on `WorkspaceSession`, so
+	// every folder in this workspace pushes into the same bucket.
+	// Slugify the workspace label so it satisfies HF's repo-name
+	// rule (alphanumerics + `.-_`) — "Hugging Face" becomes
+	// `hugging-face`. Falls back to a generic stub for preboot
+	// or a workspace whose name slugifies to the empty string.
 	function defaultBucketName(): string {
-		const folder = workspace.activeFolderPath ?? '';
-		const parts = folder.split('/');
-		const basename = parts.findLast((p) => p.length > 0) ?? 'moon';
-		return `${basename}-traces`;
+		const slug = slugifyForRepoName(workspace.workspaceName ?? '');
+		const base = slug.length > 0 ? slug : 'moon-ide';
+		return `${base}-traces`;
+	}
+
+	function slugifyForRepoName(s: string): string {
+		return s
+			.toLowerCase()
+			.replace(/[^a-z0-9._-]+/g, '-')
+			.replace(/-{2,}/g, '-')
+			.replace(/^[-._]+|[-._]+$/g, '');
 	}
 
 	function labelFor(ns: HubNamespace): string {
@@ -106,8 +120,9 @@
 		</header>
 
 		<p class="lede">
-			Provision a workspace-scoped HF Hub bucket. Sessions land under <code>sessions/</code> as pi-mono JSONLs the Hub can
-			render in its trace viewer.
+			Provision one HF Hub bucket for the
+			<strong>{workspace.workspaceName ?? 'current'}</strong> workspace. Every folder bound to this workspace pushes its coder
+			sessions here as pi-mono JSONLs the Hub can render in its trace viewer.
 		</p>
 
 		{#if loadingNamespaces}

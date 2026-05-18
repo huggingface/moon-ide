@@ -9,6 +9,7 @@
 	import CoderConnectModal from './CoderConnectModal.svelte';
 	import CoderMarkdown from './CoderMarkdown.svelte';
 	import CoderModelSettingsModal from './CoderModelSettingsModal.svelte';
+	import HfBucketSettingsModal from './HfBucketSettingsModal.svelte';
 	import CoderThinking from './CoderThinking.svelte';
 	import ToolBodyEditFile from './ToolBodyEditFile.svelte';
 	import ToolBodyGrep from './ToolBodyGrep.svelte';
@@ -26,6 +27,7 @@
 	import SignOutIcon from './icons/SignOutIcon.svelte';
 	import PlusIcon from './icons/PlusIcon.svelte';
 	import CloudUploadIcon from './icons/CloudUploadIcon.svelte';
+	import CloudSyncIcon from './icons/CloudSyncIcon.svelte';
 	import ListIcon from './icons/ListIcon.svelte';
 	import FileIcon from './icons/FileIcon.svelte';
 	import TrashIcon from './icons/TrashIcon.svelte';
@@ -42,6 +44,7 @@
 	// off the global store also means closing the popover doesn't
 	// emit a Svelte re-render of every panel consumer.
 	let modelSettingsOpen = $state(false);
+	let hubSettingsOpen = $state(false);
 
 	onMount(() => {
 		void coder.refreshStatus();
@@ -866,6 +869,18 @@
 				<button
 					type="button"
 					class="icon"
+					class:active={coder.hubBucket !== null}
+					title={coder.hubBucket
+						? `HF trace sync: ${coder.hubBucket.namespace}/${coder.hubBucket.name}`
+						: 'Connect HF trace sync'}
+					aria-label="Hugging Face trace sync"
+					onclick={() => (hubSettingsOpen = true)}
+				>
+					<CloudSyncIcon />
+				</button>
+				<button
+					type="button"
+					class="icon"
 					title="Model settings"
 					aria-label="Model settings"
 					onclick={() => (modelSettingsOpen = true)}
@@ -1156,6 +1171,10 @@
 
 {#if modelSettingsOpen}
 	<CoderModelSettingsModal onClose={() => (modelSettingsOpen = false)} />
+{/if}
+
+{#if hubSettingsOpen}
+	<HfBucketSettingsModal onClose={() => (hubSettingsOpen = false)} />
 {/if}
 
 <!-- Row renderer extracted as a snippet so the parent's session
@@ -1617,6 +1636,13 @@
 	}
 	.icon:hover {
 		color: var(--m-fg);
+	}
+	.icon.active {
+		color: var(--m-accent);
+	}
+	.icon.active:hover {
+		color: var(--m-accent);
+		filter: brightness(1.15);
 	}
 	/* Sticky in-session header with "← Sessions" + title + "+
 	   new". Mirrors the chat panel's `.thread-header` shape so

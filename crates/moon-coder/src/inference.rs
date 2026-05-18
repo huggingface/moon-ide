@@ -29,7 +29,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::auth::Authenticator;
 use crate::defaults::HF_ROUTER_BASE;
-use crate::error::CoderError;
+use crate::error::{request_id_of, CoderError};
 use crate::models::{ResolvedProvider, SharedCoderModels};
 use crate::providers::ProviderKeyring;
 
@@ -735,9 +735,10 @@ impl InferenceClient {
 			.await
 			.map_err(CoderError::from)?;
 		let status = response.status();
+		let request_id = request_id_of(&response);
 		let body = response.text().await.map_err(CoderError::from)?;
 		if !status.is_success() {
-			return Err(CoderError::http(endpoint, status.as_u16(), body));
+			return Err(CoderError::http(endpoint, status.as_u16(), body, request_id));
 		}
 
 		// Mirror the wire shape just for the decode step — we
@@ -845,9 +846,10 @@ impl InferenceClient {
 		}
 		let response = req.send().await.map_err(CoderError::from)?;
 		let status = response.status();
+		let request_id = request_id_of(&response);
 		let body = response.text().await.map_err(CoderError::from)?;
 		if !status.is_success() {
-			return Err(CoderError::http(endpoint, status.as_u16(), body));
+			return Err(CoderError::http(endpoint, status.as_u16(), body, request_id));
 		}
 
 		let raw: provider_catalog::ListBody = crate::auth::decode_body(&endpoint, &body)?;
@@ -896,6 +898,7 @@ impl InferenceClient {
 		}
 
 		let status = response.status();
+		let request_id = request_id_of(&response);
 		let recv = response.text();
 		let text = tokio::select! {
 			biased;
@@ -903,7 +906,7 @@ impl InferenceClient {
 			out = recv => out.map_err(CoderError::from)?,
 		};
 		if !status.is_success() {
-			return Err(CoderError::http(endpoint, status.as_u16(), text));
+			return Err(CoderError::http(endpoint, status.as_u16(), text, request_id));
 		}
 
 		let parsed: ChatCompletionResponse = crate::auth::decode_body(&endpoint, &text)?;
@@ -978,6 +981,7 @@ impl InferenceClient {
 
 		let status = response.status();
 		if !status.is_success() {
+			let request_id = request_id_of(&response);
 			// Drain the body for the error message; failures aren't
 			// SSE-shaped, they're a plain JSON error body.
 			let recv = response.text();
@@ -986,7 +990,7 @@ impl InferenceClient {
 				_ = cancel.cancelled() => return Err(CoderError::Aborted),
 				out = recv => out.map_err(CoderError::from)?,
 			};
-			return Err(CoderError::http(endpoint, status.as_u16(), text));
+			return Err(CoderError::http(endpoint, status.as_u16(), text, request_id));
 		}
 
 		consume_sse_stream(response, cancel, |chunk| {

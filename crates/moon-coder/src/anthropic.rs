@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
-use crate::error::CoderError;
+use crate::error::{request_id_of, CoderError};
 use crate::inference::{
 	extract_data_lines, find_event_boundary, truncate_for_log, AssistantResponse, ChatMessage, FunctionCall,
 	ResolvedRoute, StreamEvent, TokenUsage, ToolCall, ToolDefinition,
@@ -378,6 +378,7 @@ pub(crate) async fn chat_completion(
 	};
 
 	let status = response.status();
+	let request_id = request_id_of(&response);
 	let recv = response.text();
 	let text = tokio::select! {
 		biased;
@@ -385,7 +386,7 @@ pub(crate) async fn chat_completion(
 		out = recv => out.map_err(CoderError::from)?,
 	};
 	if !status.is_success() {
-		return Err(CoderError::http(endpoint, status.as_u16(), text));
+		return Err(CoderError::http(endpoint, status.as_u16(), text, request_id));
 	}
 
 	let parsed: NonStreamResponse = crate::auth::decode_body(&endpoint, &text)?;
@@ -442,13 +443,14 @@ where
 
 	let status = response.status();
 	if !status.is_success() {
+		let request_id = request_id_of(&response);
 		let recv = response.text();
 		let text = tokio::select! {
 			biased;
 			_ = cancel.cancelled() => return Err(CoderError::Aborted),
 			out = recv => out.map_err(CoderError::from)?,
 		};
-		return Err(CoderError::http(endpoint, status.as_u16(), text));
+		return Err(CoderError::http(endpoint, status.as_u16(), text, request_id));
 	}
 
 	consume_stream(response, cancel, &mut on_event).await
@@ -590,6 +592,7 @@ impl StreamState {
 					"anthropic stream",
 					0,
 					format!("{}: {}", error.kind, error.message),
+					None,
 				));
 			}
 			StreamEventBody::Ping | StreamEventBody::Other => {}
@@ -854,9 +857,10 @@ pub async fn list_models(
 	}
 	let response = req.send().await.map_err(CoderError::from)?;
 	let status = response.status();
+	let request_id = request_id_of(&response);
 	let body = response.text().await.map_err(CoderError::from)?;
 	if !status.is_success() {
-		return Err(CoderError::http(endpoint, status.as_u16(), body));
+		return Err(CoderError::http(endpoint, status.as_u16(), body, request_id));
 	}
 
 	// Anthropic's `/v1/models` returns `max_input_tokens` per
@@ -922,9 +926,10 @@ pub async fn probe(
 	}
 	let response = req.send().await.map_err(CoderError::from)?;
 	let status = response.status();
+	let request_id = request_id_of(&response);
 	let body = response.text().await.map_err(CoderError::from)?;
 	if !status.is_success() {
-		return Err(CoderError::http(endpoint, status.as_u16(), body));
+		return Err(CoderError::http(endpoint, status.as_u16(), body, request_id));
 	}
 	#[derive(Deserialize)]
 	struct ListBody {
