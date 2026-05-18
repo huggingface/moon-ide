@@ -10,9 +10,20 @@
 	// floating panel anchored under the pill. Closes on outside
 	// click or Escape.
 	import { coder, type TodoItem } from '../coder.svelte';
+	import { tick } from 'svelte';
 
 	let open = $state(false);
 	let wrap: HTMLDivElement | undefined = $state(undefined);
+	let pill: HTMLButtonElement | undefined = $state(undefined);
+	let popover: HTMLDivElement | undefined = $state(undefined);
+	// Viewport coords pushed onto the popover when `open` flips, and
+	// kept in sync with the pill across scroll / resize. Driving the
+	// position imperatively (rather than `position: absolute` inside
+	// the panel) is what keeps the menu from being clipped by the
+	// coder panel's clip context — see the popover style block for
+	// the full reasoning.
+	let popoverTop = $state(0);
+	let popoverRight = $state(0);
 
 	const todos = $derived<TodoItem[]>(coder.todos);
 	const hasTodos = $derived(todos.length > 0);
@@ -60,13 +71,18 @@
 
 	// Outside-click and Escape close the popover. `wrap` includes
 	// the trigger button itself so clicking the pill toggles
-	// rather than re-opens.
+	// rather than re-opens. The popover lives in document.body via
+	// `position: fixed` (see style block) so an outside-click check
+	// has to ask both the wrap *and* the popover whether they
+	// contain the target — otherwise clicking inside the popover
+	// would dismiss it.
 	$effect(() => {
 		if (!open) {
 			return;
 		}
 		const onPointerDown = (event: PointerEvent) => {
-			if (wrap && wrap.contains(event.target as Node)) {
+			const target = event.target as Node;
+			if (wrap?.contains(target) || popover?.contains(target)) {
 				return;
 			}
 			open = false;
@@ -76,12 +92,45 @@
 				open = false;
 			}
 		};
+		const onLayoutChange = () => repositionPopover();
 		window.addEventListener('pointerdown', onPointerDown);
 		window.addEventListener('keydown', onKey);
+		// Re-anchor on anything that can shift the pill: window
+		// resize, ancestor scroll (capture: true catches scrolls
+		// inside the coder transcript scroller), and a `resize`
+		// trigger fires for panel splits / drag handles.
+		window.addEventListener('resize', onLayoutChange);
+		window.addEventListener('scroll', onLayoutChange, true);
 		return () => {
 			window.removeEventListener('pointerdown', onPointerDown);
 			window.removeEventListener('keydown', onKey);
+			window.removeEventListener('resize', onLayoutChange);
+			window.removeEventListener('scroll', onLayoutChange, true);
 		};
+	});
+
+	// Compute the popover's viewport coordinates from the pill's
+	// bounding rect. We anchor with `top` + `right` so a wide list
+	// grows leftward, and clamp `right` so the popover never tucks
+	// under the viewport edge when the panel is narrow + flush
+	// against the right side of the window.
+	function repositionPopover(): void {
+		if (!pill) {
+			return;
+		}
+		const rect = pill.getBoundingClientRect();
+		const margin = 8;
+		popoverTop = rect.bottom + 6;
+		popoverRight = Math.max(margin, window.innerWidth - rect.right);
+	}
+
+	// `tick()` so the popover element is in the DOM before we
+	// measure it; the position is set on the first paint.
+	$effect(() => {
+		if (!open) {
+			return;
+		}
+		void tick().then(() => repositionPopover());
 	});
 
 	function tooltipFor(): string {
@@ -100,6 +149,7 @@
 {#if hasTodos}
 	<div class="todo-wrap" bind:this={wrap}>
 		<button
+			bind:this={pill}
 			type="button"
 			class="pill"
 			class:in_progress={dominant === 'in_progress'}
@@ -121,7 +171,13 @@
 			<span class="count">{counts.completed + counts.cancelled}/{todos.length}</span>
 		</button>
 		{#if open}
-			<div class="popover" role="dialog" aria-label="Todo list">
+			<div
+				bind:this={popover}
+				class="popover"
+				role="dialog"
+				aria-label="Todo list"
+				style="top: {popoverTop}px; right: {popoverRight}px;"
+			>
 				<ul class="list">
 					{#each todos as todo (todo.id)}
 						<li
@@ -199,20 +255,24 @@
 	.count {
 		font-family: var(--m-font-mono, ui-monospace, monospace);
 	}
-	/* Popover anchored under the pill. `right: 0` so a long list
-	   grows leftward instead of clipping off the panel on narrow
-	   widths. Width caps + max-height keep a chatty agent's plan
-	   from eating the whole header. Uses `--m-bg-2` (the same
-	   solid surface the status-bar popovers use) — the previous
-	   `--m-bg-elevated` fallback to `--m-bg-overlay` rendered
-	   ~3 % alpha and let coder-row text bleed through. */
+	/* Popover anchored under the pill via viewport coordinates
+	   (`position: fixed` + `top`/`right` computed in the script
+	   from `pill.getBoundingClientRect()`). The previous
+	   `position: absolute` lived inside the coder panel's clip
+	   context: a list long enough to overflow the panel got
+	   clipped against the panel's left edge, leaving the popover
+	   visually truncated behind the editor pane. `fixed` lifts
+	   the popover into the viewport's stacking context so it can
+	   freely grow leftward without any ancestor `overflow` /
+	   `transform` / `contain` cutting it off. A high z-index keeps
+	   it above the editor's chrome (gutter, scrollbar, autocomplete
+	   popups), and the script-side reposition listener keeps it
+	   glued to the pill across resize / scroll. */
 	.popover {
-		position: absolute;
-		top: calc(100% + 6px);
-		right: 0;
-		z-index: 20;
+		position: fixed;
+		z-index: 1000;
 		min-width: 240px;
-		max-width: min(360px, 90vw);
+		max-width: min(360px, calc(100vw - 16px));
 		max-height: 360px;
 		overflow: auto;
 		background: var(--m-bg-2);

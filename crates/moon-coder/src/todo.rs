@@ -25,10 +25,18 @@ use serde::{Deserialize, Serialize};
 /// beyond using it as a map key, so any non-empty `String` is
 /// valid; empty strings are rejected at the tool boundary because
 /// they'd collapse multiple distinct items into one merge target.
+///
+/// `status` defaults to `Pending` when the model omits it. The
+/// schema still lists it under `properties` (so the model knows
+/// the field exists) and the system prompt still encourages
+/// explicit status; the default exists solely to swallow the
+/// recurrent "model forgets `status` on a freshly-added item"
+/// case instead of bouncing it as `CoderError::invalid_args`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TodoItem {
 	pub id: String,
 	pub content: String,
+	#[serde(default)]
 	pub status: TodoStatus,
 }
 
@@ -37,9 +45,14 @@ pub struct TodoItem {
 /// retire an item without faking a `completed`. The wire form is
 /// snake_case (`in_progress`) so prompts written for Cursor /
 /// pi-mono carry over verbatim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Default` is `Pending` — the natural state of a freshly-added
+/// item — so [`TodoItem`]'s `#[serde(default)]` on `status` falls
+/// back to it when the model omits the field.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TodoStatus {
+	#[default]
 	Pending,
 	InProgress,
 	Completed,
@@ -200,5 +213,31 @@ mod tests {
 			serde_json::from_str::<TodoStatus>("\"in_progress\"").unwrap(),
 			TodoStatus::InProgress
 		);
+	}
+
+	/// Models occasionally omit `status` when adding a fresh item
+	/// (intent is always "pending — I just added it"). The field
+	/// is now `#[serde(default)]` so the parse succeeds with the
+	/// natural default rather than bouncing the call back as an
+	/// `invalid_args` error the model has to retry past.
+	#[test]
+	fn item_defaults_status_to_pending_when_missing() {
+		let json = r#"{"id":"a","content":"new task"}"#;
+		let parsed: TodoItem = serde_json::from_str(json).unwrap();
+		assert_eq!(
+			parsed,
+			TodoItem {
+				id: "a".into(),
+				content: "new task".into(),
+				status: TodoStatus::Pending,
+			}
+		);
+	}
+
+	#[test]
+	fn item_keeps_explicit_status_when_present() {
+		let json = r#"{"id":"a","content":"working","status":"in_progress"}"#;
+		let parsed: TodoItem = serde_json::from_str(json).unwrap();
+		assert_eq!(parsed.status, TodoStatus::InProgress);
 	}
 }

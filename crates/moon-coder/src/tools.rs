@@ -420,13 +420,13 @@ impl ToolRegistry {
 			),
 			ToolDefinition::function(
 				"todo_write",
-				"Maintain a small in-context todo list for the current task. Returns the canonical full list after the call. `merge: false` (default) replaces the list wholesale — pass `todos: []` to clear. `merge: true` matches incoming items by `id` and updates in place; unknown ids are appended; items you don't mention are left untouched. Each item must carry all three fields (`id`, `content`, `status`) regardless of the merge flag.",
+				"Maintain a small in-context todo list for the current task. Returns the canonical full list after the call. `merge: false` (default) replaces the list wholesale — pass `todos: []` to clear. `merge: true` matches incoming items by `id` and updates in place; unknown ids are appended; items you don't mention are left untouched. Each item must carry `id` and `content`; `status` defaults to `pending` if omitted.",
 				json!({
 					"type": "object",
 					"properties": {
 						"todos": {
 							"type": "array",
-							"description": "Each entry must carry all three fields, even with `merge: true` — there is no field-level partial update.",
+							"description": "`id` and `content` are required on every entry; `status` defaults to `pending`.",
 							"items": {
 								"type": "object",
 								"properties": {
@@ -441,10 +441,11 @@ impl ToolRegistry {
 									"status": {
 										"type": "string",
 										"enum": ["pending", "in_progress", "completed", "cancelled"],
-										"description": "Lifecycle state. Mark exactly one item `in_progress` while working on it; flip to `completed` or `cancelled` when done."
+										"description": "Lifecycle state. Mark exactly one item `in_progress` while working on it; flip to `completed` or `cancelled` when done. Defaults to `pending` if omitted.",
+										"default": "pending"
 									}
 								},
-								"required": ["id", "content", "status"]
+								"required": ["id", "content"]
 							}
 						},
 						"merge": {
