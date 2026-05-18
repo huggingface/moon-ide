@@ -763,26 +763,26 @@ deterministically from the workspace folder's absolute path —
 two folders that share a basename get distinct slugs, and the
 same folder always maps to the same slug across launches.
 
-The first line is a header; every subsequent line is one
-[`SessionRecord`](../crates/moon-coder/src/sessions.rs):
+The first line is a header; every subsequent line is one record in **[pi-mono](https://github.com/badlogic/pi-mono)'s session-log wire shape**, so the file uploads to a Hugging Face dataset and renders directly through the pi harness in [moon-landing](../moon-landing/server/lib/datasets/trace/harnesses/pi.ts) with no extra adapter. The in-memory enum is still [`SessionRecord`](../crates/moon-coder/src/sessions.rs); conversion happens at the serialise / deserialise boundary in `sessions.rs` (see `record_to_pi_wire` / `pi_wire_to_records`).
 
 ```jsonl
-{"schema":1,"id":"sess-1746440000123-9e3779b1","title":"implement bucket sync","created_at_ms":1746440000123,"updated_at_ms":1746440045871,"model":"Qwen/Qwen3.5-397B-A17B:scaleway"}
-{"kind":"user","text":"do the thing"}
-{"kind":"assistant","content":"sure…","thinking":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{...}"}}]}
-{"kind":"tool","tool_call_id":"call_1","content":"…"}
-{"kind":"usage","prompt_tokens":1234,"completion_tokens":56,"total_tokens":1290}
-{"kind":"assistant","content":"done"}
-{"kind":"usage","prompt_tokens":1340,"completion_tokens":18,"total_tokens":1358}
-{"kind":"title_update","title":"add bucket sync upload task"}
+{"type":"session","version":2,"id":"sess-...","timestamp":"2026-05-18T12:14:33.421Z","cwd":"/workspace/moon-ide","title":"implement bucket sync","created_at_ms":1746440000123,"updated_at_ms":1746440045871,"model":"Qwen/Qwen3.5-397B-A17B:scaleway"}
+{"type":"message","message":{"role":"user","content":"do the thing"}}
+{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"sure…"},{"type":"toolCall","id":"call_1","name":"read_file","arguments":{"path":"…"}}],"provider":"Qwen","model":"Qwen3.5-397B-A17B:scaleway","usage":{"input":1234,"output":56,"totalTokens":1290}}}
+{"type":"message","message":{"role":"toolResult","toolCallId":"call_1","content":[{"type":"text","text":"…"}],"isError":false}}
+{"type":"compaction","summary":"earlier turns: …","details":{"messages_compacted":42}}
+{"type":"message","message":{"role":"custom","customType":"moon_title_update","display":false,"details":{"title":"add bucket sync upload task"}}}
 ```
 
-The system prompt isn't persisted: re-opening a session re-adds
-the current default at load time, so prompt updates between
-releases apply retroactively. The header carries metadata
-(`schema`, `id`, `title`, `created_at_ms`, `updated_at_ms`,
-`model`); a `title_update` record overrides the header's title on
-load (auto-rename uses this — see below).
+Per-record mapping:
+
+- **`User`**, **`Assistant`**, **`Tool`**, **`Compaction`** map natively to pi's `user` / `assistant` / `toolResult` messages and `compaction` row.
+- **`Usage`** folds onto the **prior** assistant line's `usage` block on write (pi-mono attaches token usage to the message that produced it, not a separate record). The append path reads the last line, parses it, mutates the assistant message in place, and rewrites the line — cheap because session files are small. In-memory `SessionRecord::Usage` survives the round-trip: on load, the embedded `usage` block is re-emitted as a stand-alone `Usage` record so the runner's context-usage / replay paths stay byte-identical.
+- **Moon-specific records** (`TitleUpdate`, `TodosUpdate`, `SubagentSpawned`, `SubagentFinished`) ride in pi `custom` rows with `display:false`, a recognisable `customType` (`moon_title_update`, `moon_todos_update`, `moon_subagent_spawned`, `moon_subagent_finished`), and the original record's fields under `details`. The pi viewer silently skips them (no `content` to render); reload uses `customType` to rehydrate the right `SessionRecord` variant.
+- **Image attachments** strip the `data:<mime>;base64,` prefix off `data_url` on write (pi's `ImageContent` keeps raw base64 in `data` and the mime type in `mimeType`); reload re-prefixes so the in-memory `data_url` stays exactly what the composer produced.
+- **Tool error detection** sets pi's `isError:true` when the tool result content is either `INTERRUPTED_TOOL_RESULT_JSON` or any single-key `{"error":"..."}` object, matching the panel's own "paint this row red" heuristic.
+
+The header carries pi-required keys (`type`, `version`, `id`, `cwd`, `timestamp` — `cwd` is the absolute path of the bound workspace folder, bound on first persistence by `Coder::send`) alongside our extras (`title`, `created_at_ms`, `updated_at_ms`, `model`, optional sub-agent fields). Pi's zod schemas don't `.strict()` unknown keys, so co-existing extras are safe. The system prompt isn't persisted: re-opening a session re-adds the current default at load time, so prompt updates between releases apply retroactively. A `moon_title_update` custom row overrides the header's title on load (auto-rename uses this — see below).
 
 Provider-supplied token usage gets persisted as a `usage` record after every parent-loop round-trip whose response carried a `usage` chunk. The fields mirror [`TokenUsage`](../crates/moon-coder/src/inference.rs) (`prompt_tokens`, `completion_tokens`, `total_tokens`, plus `cache_read_input_tokens` / `cache_creation_input_tokens` when caching kicked in — those last two skip-serialise when zero, which is most providers). On reopen, the runner walks every record, remembers the **last** `Usage`, and uses it as the seed for both the in-memory `last_usage` (so the auto-compaction trigger has a real number to compare against on the very next prompt) and the synthetic restore-time `TokenUsage` event the panel turns into the context-usage ring. Sessions written before this variant shipped, or sessions whose final round-trip didn't yield a `usage` chunk, fall back to a bytes/4 estimate of the rebuilt history — same number the panel used to render at restore time before persistence landed. Sub-agent JSONLs follow the same shape; `open_session` only reloads top-level transcripts today, so persisted sub-agent usage is forensic value plus future-proofing for whenever sub-agent restore lands. Bytes/4 estimates aren't persisted: they're recomputable from the messages, so storing them would just bloat the file with redundant approximations.
 

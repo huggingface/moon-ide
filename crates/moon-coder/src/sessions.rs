@@ -54,7 +54,18 @@ use crate::inference::ToolCall;
 /// premature migrations" we don't ship migration code; sessions
 /// from older schemas are surfaced as parse errors at load time
 /// (the panel falls back to the empty state and logs a warning).
-pub const SESSION_SCHEMA_VERSION: u32 = 1;
+///
+/// `2` introduces the pi-mono compatible wire shape (single
+/// `{type:"session", id, cwd, ...}` header + `{type:"message",
+/// message:{role:...}}` envelopes per record). Moon IDE's
+/// session JSONLs upload directly to a Hugging Face dataset and
+/// render through the pi harness in moon-landing without any
+/// extra adapter; Moon-specific records (title updates, todo
+/// snapshots, sub-agent metadata, standalone usage) ride in pi
+/// `custom` rows with no `content`, which the trace viewer
+/// silently skips. See [`record_to_pi_wire`] / [`pi_wire_to_record`]
+/// for the boundary.
+pub const SESSION_SCHEMA_VERSION: u32 = 2;
 
 /// File extension on every session file.
 const SESSION_EXT: &str = "jsonl";
@@ -63,15 +74,33 @@ const SESSION_EXT: &str = "jsonl";
 /// first record because the [`load_summary`] fast path stops after
 /// reading exactly one line.
 ///
+/// On disk the header is rendered into the pi-mono wire shape:
+/// `{"type":"session","version":2,"id":...,"timestamp":...,
+/// "cwd":...,...}`. We keep the in-memory struct using the
+/// existing field names (so call sites and tests don't churn);
+/// the manual `Serialize` / `Deserialize` impls translate at the
+/// boundary. `type` and `version` are pi-required keys; `cwd` is
+/// what the pi harness in moon-landing keys off when sniffing the
+/// header line in [detect.ts] (the trace viewer rejects sessions
+/// without a string `cwd`). The rest are Moon-IDE-specific and
+/// happily co-exist on the same row since pi's zod schemas don't
+/// `.strict()` unknown keys.
+///
 /// Sub-agent sessions reuse this same struct with the optional
 /// `parent_*` / `subagent_mode` fields populated. Top-level
 /// (parent) sessions leave them `None`; the optional fields are
-/// elided from JSON via `skip_serializing_if`, so existing
-/// on-disk sessions stay byte-compatible.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// elided from JSON when absent so a sub-agent-free transcript
+/// stays clean.
+#[derive(Debug, Clone)]
 pub struct SessionHeader {
 	pub schema: u32,
 	pub id: String,
+	/// Absolute path of the workspace folder this session is
+	/// bound to. Populated at first-persistence time (the runner
+	/// sets it when `Coder::send` writes the first record). Pi's
+	/// detector requires this to be a non-empty string; we
+	/// satisfy that by binding before any append.
+	pub cwd: String,
 	/// Human-readable title. Auto-derived from the first user
 	/// prompt at create time (`session_title_from_prompt`), then
 	/// optionally overwritten by the auto-rename pass after the
@@ -87,17 +116,14 @@ pub struct SessionHeader {
 	pub model: String,
 	/// Parent session id, when this header describes a sub-agent
 	/// session. `None` for top-level (user-driven) sessions.
-	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub parent_session_id: Option<String>,
 	/// `tool_call_id` of the parent's `task` call that produced
 	/// this sub-agent. Lets the UI's "pop out" affordance resolve
 	/// the sub-agent's transcript across IDE restarts.
-	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub parent_tool_call_id: Option<String>,
 	/// Wire string ("research" / "agent") of the mode the
 	/// sub-agent ran under. `None` for top-level sessions; mirrors
 	/// `CoderMode::as_wire()` so the frontend reads it verbatim.
-	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub subagent_mode: Option<String>,
 	/// Absolute path of the folder the sub-agent's tools operated
 	/// against. May differ from the parent's bound folder (which
@@ -105,8 +131,704 @@ pub struct SessionHeader {
 	/// `folder` argument to `task`. `None` for top-level sessions
 	/// and for sub-agent sessions that targeted the same folder as
 	/// their parent.
-	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub subagent_target_folder: Option<String>,
+}
+
+const PI_SESSION_TYPE: &str = "session";
+const PI_MESSAGE_TYPE: &str = "message";
+const PI_COMPACTION_TYPE: &str = "compaction";
+
+const CUSTOM_TYPE_TITLE_UPDATE: &str = "moon_title_update";
+const CUSTOM_TYPE_TODOS_UPDATE: &str = "moon_todos_update";
+const CUSTOM_TYPE_SUBAGENT_SPAWNED: &str = "moon_subagent_spawned";
+const CUSTOM_TYPE_SUBAGENT_FINISHED: &str = "moon_subagent_finished";
+const CUSTOM_TYPE_USAGE: &str = "moon_usage";
+
+impl Serialize for SessionHeader {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		use serde::ser::SerializeMap;
+		let mut map = serializer.serialize_map(None)?;
+		map.serialize_entry("type", PI_SESSION_TYPE)?;
+		map.serialize_entry("version", &self.schema)?;
+		map.serialize_entry("id", &self.id)?;
+		map.serialize_entry("timestamp", &iso8601_utc_ms(self.created_at_ms))?;
+		map.serialize_entry("cwd", &self.cwd)?;
+		map.serialize_entry("title", &self.title)?;
+		map.serialize_entry("created_at_ms", &self.created_at_ms)?;
+		map.serialize_entry("updated_at_ms", &self.updated_at_ms)?;
+		map.serialize_entry("model", &self.model)?;
+		if let Some(v) = &self.parent_session_id {
+			map.serialize_entry("parent_session_id", v)?;
+		}
+		if let Some(v) = &self.parent_tool_call_id {
+			map.serialize_entry("parent_tool_call_id", v)?;
+		}
+		if let Some(v) = &self.subagent_mode {
+			map.serialize_entry("subagent_mode", v)?;
+		}
+		if let Some(v) = &self.subagent_target_folder {
+			map.serialize_entry("subagent_target_folder", v)?;
+		}
+		map.end()
+	}
+}
+
+impl<'de> Deserialize<'de> for SessionHeader {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		#[derive(Deserialize)]
+		struct Raw {
+			#[serde(rename = "type", default)]
+			_kind: Option<String>,
+			#[serde(default)]
+			version: Option<u32>,
+			#[serde(default)]
+			schema: Option<u32>,
+			id: String,
+			#[serde(default)]
+			cwd: Option<String>,
+			#[serde(default)]
+			title: String,
+			#[serde(default)]
+			created_at_ms: i64,
+			#[serde(default)]
+			updated_at_ms: i64,
+			#[serde(default)]
+			model: String,
+			#[serde(default)]
+			parent_session_id: Option<String>,
+			#[serde(default)]
+			parent_tool_call_id: Option<String>,
+			#[serde(default)]
+			subagent_mode: Option<String>,
+			#[serde(default)]
+			subagent_target_folder: Option<String>,
+		}
+		let raw = Raw::deserialize(deserializer)?;
+		Ok(SessionHeader {
+			schema: raw.version.or(raw.schema).unwrap_or(SESSION_SCHEMA_VERSION),
+			id: raw.id,
+			cwd: raw.cwd.unwrap_or_default(),
+			title: raw.title,
+			created_at_ms: raw.created_at_ms,
+			updated_at_ms: raw.updated_at_ms,
+			model: raw.model,
+			parent_session_id: raw.parent_session_id,
+			parent_tool_call_id: raw.parent_tool_call_id,
+			subagent_mode: raw.subagent_mode,
+			subagent_target_folder: raw.subagent_target_folder,
+		})
+	}
+}
+
+/// Format milliseconds-since-Unix-epoch as `YYYY-MM-DDTHH:MM:SS.sssZ`
+/// (RFC 3339 / pi-friendly). Pure-stdlib (no `chrono` / `time`)
+/// because moon-coder already pulls in enough crates; the algorithm
+/// is Howard Hinnant's civil-from-days routine adapted to i64.
+pub(crate) fn iso8601_utc_ms(ms: i64) -> String {
+	let secs = ms.div_euclid(1000);
+	let sub_ms = ms.rem_euclid(1000) as u32;
+	let days = secs.div_euclid(86_400);
+	let secs_of_day = secs.rem_euclid(86_400);
+	let hour = (secs_of_day / 3600) as u32;
+	let minute = ((secs_of_day % 3600) / 60) as u32;
+	let second = (secs_of_day % 60) as u32;
+
+	let z = days + 719_468;
+	let era = z.div_euclid(146_097);
+	let doe = (z - era * 146_097) as u32;
+	let yoe = (doe.saturating_sub(doe / 1460) + doe / 36_524 - doe / 146_096) / 365;
+	let y = i64::from(yoe) + era * 400;
+	let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+	let mp = (5 * doy + 2) / 153;
+	let d = doy - (153 * mp + 2) / 5 + 1;
+	let m = if mp < 10 { mp + 3 } else { mp - 9 };
+	let year = if m <= 2 { y + 1 } else { y };
+
+	format!("{year:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}.{sub_ms:03}Z")
+}
+
+/// Convert one [`SessionRecord`] to its pi-mono wire shape — the
+/// JSON object we actually write to disk. The returned value is a
+/// **single** JSONL row: either a pi `message` envelope, a
+/// top-level `compaction` row, or a `custom` envelope wrapping a
+/// Moon-specific record.
+///
+/// `Usage` records are folded onto the most recently appended
+/// `assistant` line by [`try_fold_usage_into_last_assistant`] in
+/// `append_record`; this function is only reached for a `Usage`
+/// when there's no prior assistant on disk (a rare edge case —
+/// e.g. a sub-agent that streams a `Usage` before its first
+/// `Assistant` lands), in which case we emit a `moon_usage` custom
+/// row so the data still round-trips on reload.
+pub(crate) fn record_to_pi_wire(record: &SessionRecord, header: &SessionHeader) -> serde_json::Value {
+	match record {
+		SessionRecord::User { text, images } => pi_message_envelope(pi_user_message(text, images)),
+		SessionRecord::Assistant {
+			content,
+			thinking,
+			tool_calls,
+		} => pi_message_envelope(pi_assistant_message(
+			content.as_deref(),
+			thinking.as_deref(),
+			tool_calls,
+			header,
+			None,
+		)),
+		SessionRecord::Tool { tool_call_id, content } => pi_message_envelope(pi_tool_result_message(tool_call_id, content)),
+		SessionRecord::Compaction {
+			summary,
+			messages_compacted,
+		} => pi_compaction_row(summary, *messages_compacted),
+		SessionRecord::TitleUpdate { title } => pi_message_envelope(pi_custom_message(
+			CUSTOM_TYPE_TITLE_UPDATE,
+			serde_json::json!({ "title": title }),
+		)),
+		SessionRecord::TodosUpdate { todos } => pi_message_envelope(pi_custom_message(
+			CUSTOM_TYPE_TODOS_UPDATE,
+			serde_json::json!({ "todos": todos }),
+		)),
+		SessionRecord::SubagentSpawned {
+			tool_call_id,
+			subagent_id,
+			target_folder,
+			mode,
+		} => pi_message_envelope(pi_custom_message(
+			CUSTOM_TYPE_SUBAGENT_SPAWNED,
+			serde_json::json!({
+				"tool_call_id": tool_call_id,
+				"subagent_id": subagent_id,
+				"target_folder": target_folder,
+				"mode": mode,
+			}),
+		)),
+		SessionRecord::SubagentFinished {
+			subagent_id,
+			tokens_used_estimate,
+			was_error,
+			result_preview,
+		} => pi_message_envelope(pi_custom_message(
+			CUSTOM_TYPE_SUBAGENT_FINISHED,
+			serde_json::json!({
+				"subagent_id": subagent_id,
+				"tokens_used_estimate": tokens_used_estimate,
+				"was_error": was_error,
+				"result_preview": result_preview,
+			}),
+		)),
+		SessionRecord::Usage {
+			prompt_tokens,
+			completion_tokens,
+			total_tokens,
+			cache_read_input_tokens,
+			cache_creation_input_tokens,
+		} => pi_message_envelope(pi_custom_message(
+			CUSTOM_TYPE_USAGE,
+			pi_usage_details(
+				*prompt_tokens,
+				*completion_tokens,
+				*total_tokens,
+				*cache_read_input_tokens,
+				*cache_creation_input_tokens,
+			),
+		)),
+	}
+}
+
+fn pi_message_envelope(inner: serde_json::Value) -> serde_json::Value {
+	serde_json::json!({
+		"type": PI_MESSAGE_TYPE,
+		"message": inner,
+	})
+}
+
+fn pi_user_message(text: &str, images: &[crate::inference::ImageAttachment]) -> serde_json::Value {
+	if images.is_empty() {
+		return serde_json::json!({
+			"role": "user",
+			"content": text,
+		});
+	}
+	let mut content: Vec<serde_json::Value> = Vec::with_capacity(images.len() + 1);
+	if !text.is_empty() {
+		content.push(serde_json::json!({ "type": "text", "text": text }));
+	}
+	for image in images {
+		let (data, mime) = strip_data_url_prefix(&image.data_url, &image.mime);
+		content.push(serde_json::json!({
+			"type": "image",
+			"data": data,
+			"mimeType": mime,
+		}));
+	}
+	serde_json::json!({
+		"role": "user",
+		"content": content,
+	})
+}
+
+/// Strip a leading `data:<mime>;base64,` prefix off `data_url`.
+/// Pi's `ImageContent` keeps the raw base64 in `data` and the
+/// mime type in `mimeType`; the trace viewer reconstructs the
+/// full data URL via [`getBase64ImageDataUrl`]. We preserve the
+/// in-memory `data_url` exactly on round-trip by re-prefixing
+/// during reload (see [`pi_wire_to_record`]).
+fn strip_data_url_prefix<'a>(data_url: &'a str, mime: &'a str) -> (&'a str, &'a str) {
+	if let Some(rest) = data_url.strip_prefix("data:") {
+		if let Some(comma_idx) = rest.find(',') {
+			let header_part = &rest[..comma_idx];
+			let body = &rest[comma_idx + 1..];
+			let header_mime = header_part.split(';').next().unwrap_or(mime);
+			let mime_to_keep = if header_mime.is_empty() { mime } else { header_mime };
+			return (body, mime_to_keep);
+		}
+	}
+	(data_url, mime)
+}
+
+fn pi_assistant_message(
+	content: Option<&str>,
+	thinking: Option<&str>,
+	tool_calls: &[ToolCall],
+	header: &SessionHeader,
+	usage: Option<&SessionRecord>,
+) -> serde_json::Value {
+	let mut blocks: Vec<serde_json::Value> = Vec::new();
+	if let Some(thinking) = thinking {
+		if !thinking.is_empty() {
+			blocks.push(serde_json::json!({
+				"type": "thinking",
+				"thinking": thinking,
+			}));
+		}
+	}
+	if let Some(text) = content {
+		if !text.is_empty() {
+			blocks.push(serde_json::json!({
+				"type": "text",
+				"text": text,
+			}));
+		}
+	}
+	for call in tool_calls {
+		blocks.push(pi_tool_call_block(call));
+	}
+	let (provider, model) = split_provider_model(&header.model);
+	let mut message = serde_json::Map::new();
+	message.insert("role".into(), serde_json::Value::String("assistant".into()));
+	message.insert("content".into(), serde_json::Value::Array(blocks));
+	if let Some(p) = provider {
+		message.insert("provider".into(), serde_json::Value::String(p.to_string()));
+	}
+	if !model.is_empty() {
+		message.insert("model".into(), serde_json::Value::String(model.to_string()));
+	}
+	if let Some(SessionRecord::Usage {
+		prompt_tokens,
+		completion_tokens,
+		total_tokens,
+		cache_read_input_tokens,
+		cache_creation_input_tokens,
+	}) = usage
+	{
+		message.insert(
+			"usage".into(),
+			pi_usage_block(
+				*prompt_tokens,
+				*completion_tokens,
+				*total_tokens,
+				*cache_read_input_tokens,
+				*cache_creation_input_tokens,
+			),
+		);
+	}
+	serde_json::Value::Object(message)
+}
+
+/// Render one tool call as a pi `toolCall` content block. The
+/// model's `arguments` field is a JSON-string on the wire (because
+/// the OpenAI chat-completions schema serialises it that way);
+/// pi-mono expects a parsed `arguments` object, so we parse here
+/// and fall back to a single-key `{ "_raw": <string> }` on parse
+/// failure (rare — a malformed `arguments` would already have
+/// broken the dispatch loop anyway, but we'd rather round-trip
+/// faithfully than panic).
+fn pi_tool_call_block(call: &ToolCall) -> serde_json::Value {
+	let args = match serde_json::from_str::<serde_json::Value>(&call.function.arguments) {
+		Ok(v) => v,
+		Err(_) => serde_json::json!({ "_raw": call.function.arguments }),
+	};
+	serde_json::json!({
+		"type": "toolCall",
+		"id": call.id,
+		"name": call.function.name,
+		"arguments": args,
+	})
+}
+
+/// Split a `"provider/model"`-shaped header model string into its
+/// `(Some("provider"), "model")` parts. Models without a slash
+/// (custom / local) return `(None, full_string)`. Mirrors pi's
+/// own provider rendering: `${provider}/${model}` in the trace
+/// viewer's model label.
+fn split_provider_model(model: &str) -> (Option<&str>, &str) {
+	if let Some((provider, rest)) = model.split_once('/') {
+		(Some(provider), rest)
+	} else {
+		(None, model)
+	}
+}
+
+fn pi_tool_result_message(tool_call_id: &str, content: &str) -> serde_json::Value {
+	let is_error = looks_like_tool_error(content);
+	serde_json::json!({
+		"role": "toolResult",
+		"toolCallId": tool_call_id,
+		"content": [{ "type": "text", "text": content }],
+		"isError": is_error,
+	})
+}
+
+/// Heuristic: did this tool result represent an error condition?
+/// Currently true for our own interrupted-tool sentinel and for
+/// any JSON object whose only key is `"error"` (the shape the
+/// `bash` / `edit_file` tools use when they hard-fail). Mirrors
+/// what the panel does to decide whether to paint the tool row
+/// red, so the pi viewer's red badge matches our own.
+fn looks_like_tool_error(content: &str) -> bool {
+	if content == INTERRUPTED_TOOL_RESULT_JSON {
+		return true;
+	}
+	let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(content) else {
+		return false;
+	};
+	map.len() == 1 && map.contains_key("error")
+}
+
+fn pi_compaction_row(summary: &str, messages_compacted: u32) -> serde_json::Value {
+	serde_json::json!({
+		"type": PI_COMPACTION_TYPE,
+		"summary": summary,
+		"details": { "messages_compacted": messages_compacted },
+	})
+}
+
+fn pi_custom_message(custom_type: &str, details: serde_json::Value) -> serde_json::Value {
+	serde_json::json!({
+		"role": "custom",
+		"customType": custom_type,
+		"display": false,
+		"details": details,
+	})
+}
+
+/// Usage as it rides folded onto an assistant message: keys
+/// match the pi schema (`input` / `output` / `cacheRead` /
+/// `cacheWrite` / `totalTokens`). Cache fields are omitted when
+/// zero so non-caching providers still produce slim assistant
+/// lines.
+fn pi_usage_block(
+	prompt_tokens: u32,
+	completion_tokens: u32,
+	total_tokens: u32,
+	cache_read_input_tokens: u32,
+	cache_creation_input_tokens: u32,
+) -> serde_json::Value {
+	let mut map = serde_json::Map::new();
+	map.insert("input".into(), serde_json::json!(prompt_tokens));
+	map.insert("output".into(), serde_json::json!(completion_tokens));
+	map.insert("totalTokens".into(), serde_json::json!(total_tokens));
+	if cache_read_input_tokens > 0 {
+		map.insert("cacheRead".into(), serde_json::json!(cache_read_input_tokens));
+	}
+	if cache_creation_input_tokens > 0 {
+		map.insert("cacheWrite".into(), serde_json::json!(cache_creation_input_tokens));
+	}
+	serde_json::Value::Object(map)
+}
+
+/// Usage as it rides on a stand-alone `custom` row (no prior
+/// assistant to fold onto). Same numbers, identical key names so
+/// `pi_wire_to_record` reads both shapes through one code path.
+fn pi_usage_details(
+	prompt_tokens: u32,
+	completion_tokens: u32,
+	total_tokens: u32,
+	cache_read_input_tokens: u32,
+	cache_creation_input_tokens: u32,
+) -> serde_json::Value {
+	pi_usage_block(
+		prompt_tokens,
+		completion_tokens,
+		total_tokens,
+		cache_read_input_tokens,
+		cache_creation_input_tokens,
+	)
+}
+
+/// Parse one pi-wire JSONL row back into `SessionRecord`s. A
+/// single row maps to:
+///
+/// - `0` records: the pi header line, unknown row types, or pi
+///   message roles we don't understand (e.g. `branchSummary`).
+///   Returned as an empty `Vec` so the caller can `extend` past
+///   the row without special-casing `None`.
+/// - `1` record: the common case — `user`, `toolResult`,
+///   `compaction`, and most `custom` rows.
+/// - `2` records: an `assistant` row carrying a folded `usage`
+///   block, which we re-split into the [`SessionRecord::Assistant`]
+///   that wrote it plus the [`SessionRecord::Usage`] that rode
+///   along. Restoring the split keeps every downstream consumer
+///   (replay, context-usage ring) wired the same way it was in
+///   schema 1, where Usage was always a stand-alone record.
+pub(crate) fn pi_wire_to_records(value: &serde_json::Value) -> Vec<SessionRecord> {
+	let Some(row_type) = value.get("type").and_then(|v| v.as_str()) else {
+		return Vec::new();
+	};
+	if row_type == PI_COMPACTION_TYPE {
+		let summary = value
+			.get("summary")
+			.and_then(|v| v.as_str())
+			.unwrap_or_default()
+			.to_string();
+		let messages_compacted = value
+			.get("details")
+			.and_then(|d| d.get("messages_compacted"))
+			.and_then(|v| v.as_u64())
+			.unwrap_or(0) as u32;
+		return vec![SessionRecord::Compaction {
+			summary,
+			messages_compacted,
+		}];
+	}
+	if row_type != PI_MESSAGE_TYPE {
+		return Vec::new();
+	}
+	let Some(msg) = value.get("message") else {
+		return Vec::new();
+	};
+	let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+	match role {
+		"user" => parse_pi_user(msg).map(|r| vec![r]).unwrap_or_default(),
+		"assistant" => parse_pi_assistant(msg),
+		"toolResult" => parse_pi_tool_result(msg).map(|r| vec![r]).unwrap_or_default(),
+		"custom" => parse_pi_custom(msg).map(|r| vec![r]).unwrap_or_default(),
+		_ => Vec::new(),
+	}
+}
+
+fn parse_pi_user(msg: &serde_json::Value) -> Option<SessionRecord> {
+	let content = msg.get("content")?;
+	if let Some(text) = content.as_str() {
+		return Some(SessionRecord::User {
+			text: text.to_string(),
+			images: Vec::new(),
+		});
+	}
+	let blocks = content.as_array()?;
+	let mut texts: Vec<String> = Vec::new();
+	let mut images: Vec<crate::inference::ImageAttachment> = Vec::new();
+	for block in blocks {
+		let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+		match block_type {
+			"text" => {
+				if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+					texts.push(t.to_string());
+				}
+			}
+			"image" => {
+				let data = block.get("data").and_then(|v| v.as_str()).unwrap_or("");
+				let mime = block
+					.get("mimeType")
+					.and_then(|v| v.as_str())
+					.unwrap_or("image/png")
+					.to_string();
+				images.push(crate::inference::ImageAttachment {
+					data_url: format!("data:{mime};base64,{data}"),
+					mime,
+				});
+			}
+			_ => {}
+		}
+	}
+	Some(SessionRecord::User {
+		text: texts.join("\n"),
+		images,
+	})
+}
+
+fn parse_pi_assistant(msg: &serde_json::Value) -> Vec<SessionRecord> {
+	let Some(blocks) = msg.get("content").and_then(|v| v.as_array()) else {
+		return Vec::new();
+	};
+	let mut texts: Vec<String> = Vec::new();
+	let mut thinkings: Vec<String> = Vec::new();
+	let mut tool_calls: Vec<ToolCall> = Vec::new();
+	for block in blocks {
+		let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+		match block_type {
+			"text" => {
+				if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+					texts.push(t.to_string());
+				}
+			}
+			"thinking" => {
+				if let Some(t) = block.get("thinking").and_then(|v| v.as_str()) {
+					thinkings.push(t.to_string());
+				}
+			}
+			"toolCall" => {
+				let id = block.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+				let name = block
+					.get("name")
+					.and_then(|v| v.as_str())
+					.unwrap_or_default()
+					.to_string();
+				let args_value = block
+					.get("arguments")
+					.cloned()
+					.unwrap_or(serde_json::Value::Object(Default::default()));
+				let arguments = if let Some(raw) = args_value.get("_raw").and_then(|v| v.as_str()) {
+					raw.to_string()
+				} else {
+					serde_json::to_string(&args_value).unwrap_or_else(|_| "{}".into())
+				};
+				tool_calls.push(ToolCall {
+					id,
+					kind: "function".into(),
+					function: crate::inference::FunctionCall { name, arguments },
+				});
+			}
+			_ => {}
+		}
+	}
+	let content = if texts.is_empty() { None } else { Some(texts.join("\n")) };
+	let thinking = if thinkings.is_empty() {
+		None
+	} else {
+		Some(thinkings.join("\n"))
+	};
+	let mut out: Vec<SessionRecord> = Vec::with_capacity(2);
+	out.push(SessionRecord::Assistant {
+		content,
+		thinking,
+		tool_calls,
+	});
+	if let Some(usage) = msg.get("usage").and_then(parse_pi_usage_block) {
+		out.push(usage);
+	}
+	out
+}
+
+fn parse_pi_tool_result(msg: &serde_json::Value) -> Option<SessionRecord> {
+	let tool_call_id = msg.get("toolCallId").and_then(|v| v.as_str())?.to_string();
+	let content = msg.get("content").and_then(|v| v.as_array());
+	let body = match content {
+		Some(blocks) => {
+			let mut text_parts: Vec<String> = Vec::new();
+			for block in blocks {
+				if block.get("type").and_then(|v| v.as_str()) == Some("text") {
+					if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+						text_parts.push(t.to_string());
+					}
+				}
+			}
+			text_parts.join("\n")
+		}
+		None => String::new(),
+	};
+	Some(SessionRecord::Tool {
+		tool_call_id,
+		content: body,
+	})
+}
+
+fn parse_pi_custom(msg: &serde_json::Value) -> Option<SessionRecord> {
+	let custom_type = msg.get("customType").and_then(|v| v.as_str())?;
+	let details = msg.get("details").cloned().unwrap_or(serde_json::Value::Null);
+	match custom_type {
+		CUSTOM_TYPE_TITLE_UPDATE => {
+			let title = details
+				.get("title")
+				.and_then(|v| v.as_str())
+				.unwrap_or_default()
+				.to_string();
+			Some(SessionRecord::TitleUpdate { title })
+		}
+		CUSTOM_TYPE_TODOS_UPDATE => {
+			let todos: Vec<crate::TodoItem> = serde_json::from_value(
+				details
+					.get("todos")
+					.cloned()
+					.unwrap_or(serde_json::Value::Array(Vec::new())),
+			)
+			.unwrap_or_default();
+			Some(SessionRecord::TodosUpdate { todos })
+		}
+		CUSTOM_TYPE_SUBAGENT_SPAWNED => Some(SessionRecord::SubagentSpawned {
+			tool_call_id: details
+				.get("tool_call_id")
+				.and_then(|v| v.as_str())
+				.unwrap_or_default()
+				.to_string(),
+			subagent_id: details
+				.get("subagent_id")
+				.and_then(|v| v.as_str())
+				.unwrap_or_default()
+				.to_string(),
+			target_folder: details
+				.get("target_folder")
+				.and_then(|v| v.as_str())
+				.unwrap_or_default()
+				.to_string(),
+			mode: details
+				.get("mode")
+				.and_then(|v| v.as_str())
+				.unwrap_or_default()
+				.to_string(),
+		}),
+		CUSTOM_TYPE_SUBAGENT_FINISHED => Some(SessionRecord::SubagentFinished {
+			subagent_id: details
+				.get("subagent_id")
+				.and_then(|v| v.as_str())
+				.unwrap_or_default()
+				.to_string(),
+			tokens_used_estimate: details
+				.get("tokens_used_estimate")
+				.and_then(|v| v.as_u64())
+				.unwrap_or(0) as u32,
+			was_error: details.get("was_error").and_then(|v| v.as_bool()).unwrap_or(false),
+			result_preview: details
+				.get("result_preview")
+				.and_then(|v| v.as_str())
+				.map(str::to_string),
+		}),
+		CUSTOM_TYPE_USAGE => parse_pi_usage_block(&details),
+		_ => None,
+	}
+}
+
+fn parse_pi_usage_block(value: &serde_json::Value) -> Option<SessionRecord> {
+	let prompt_tokens = value.get("input").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+	let completion_tokens = value.get("output").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+	let total_tokens = value
+		.get("totalTokens")
+		.and_then(|v| v.as_u64())
+		.unwrap_or_else(|| u64::from(prompt_tokens + completion_tokens)) as u32;
+	let cache_read_input_tokens = value.get("cacheRead").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+	let cache_creation_input_tokens = value.get("cacheWrite").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+	Some(SessionRecord::Usage {
+		prompt_tokens,
+		completion_tokens,
+		total_tokens,
+		cache_read_input_tokens,
+		cache_creation_input_tokens,
+	})
 }
 
 /// One append-only record in the JSONL body. Tagged enum so each
@@ -535,11 +1257,13 @@ pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError>
 		if trimmed.is_empty() {
 			continue;
 		}
-		let Ok(record) = serde_json::from_str::<SessionRecord>(trimmed) else {
+		let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
 			continue;
 		};
-		if let SessionRecord::TitleUpdate { title } = record {
-			header.title = title;
+		for record in pi_wire_to_records(&value) {
+			if let SessionRecord::TitleUpdate { title } = record {
+				header.title = title;
+			}
 		}
 	}
 	Ok(SessionSummary {
@@ -573,12 +1297,14 @@ pub async fn load(dir: &Utf8Path, id: &str) -> Result<LoadedSession, CoderError>
 		if trimmed.is_empty() {
 			continue;
 		}
-		match serde_json::from_str::<SessionRecord>(trimmed) {
-			Ok(rec) => {
-				if let SessionRecord::TitleUpdate { title } = &rec {
-					header.title = title.clone();
+		match serde_json::from_str::<serde_json::Value>(trimmed) {
+			Ok(value) => {
+				for rec in pi_wire_to_records(&value) {
+					if let SessionRecord::TitleUpdate { title } = &rec {
+						header.title = title.clone();
+					}
+					records.push(rec);
 				}
-				records.push(rec);
 			}
 			Err(err) => {
 				tracing::warn!(error = %err, path = %path, "skipping unreadable session record");
@@ -591,6 +1317,14 @@ pub async fn load(dir: &Utf8Path, id: &str) -> Result<LoadedSession, CoderError>
 /// Append one record to a session's JSONL file. Creates the file
 /// (and the parent directory) on the first call so callers don't
 /// need to special-case "first write".
+///
+/// `Usage` records get special-cased: if the previous appended
+/// line on disk is an `assistant` pi-message, we rewrite that
+/// line in place to fold the usage block onto it (matching
+/// pi-mono's on-disk shape). If no prior assistant exists (rare
+/// — only seen when a sub-agent emits Usage before its first
+/// Assistant), we fall back to a stand-alone `moon_usage` custom
+/// row so the data still round-trips on reload.
 pub async fn append_record(dir: &Utf8Path, header: &SessionHeader, record: &SessionRecord) -> Result<(), CoderError> {
 	let path = session_path(dir, &header.id);
 	if let Some(parent) = path.parent() {
@@ -599,6 +1333,14 @@ pub async fn append_record(dir: &Utf8Path, header: &SessionHeader, record: &Sess
 			.map_err(CoderError::from)?;
 	}
 	let exists = tokio::fs::try_exists(path.as_std_path()).await.unwrap_or(false);
+
+	if exists
+		&& matches!(record, SessionRecord::Usage { .. })
+		&& try_fold_usage_into_last_assistant(&path, record).await?
+	{
+		return Ok(());
+	}
+
 	let mut file = OpenOptions::new()
 		.create(true)
 		.append(true)
@@ -610,11 +1352,101 @@ pub async fn append_record(dir: &Utf8Path, header: &SessionHeader, record: &Sess
 		file.write_all(header_line.as_bytes()).await.map_err(CoderError::from)?;
 		file.write_all(b"\n").await.map_err(CoderError::from)?;
 	}
-	let body_line = serde_json::to_string(record).map_err(CoderError::from)?;
+	let wire = record_to_pi_wire(record, header);
+	let body_line = serde_json::to_string(&wire).map_err(CoderError::from)?;
 	file.write_all(body_line.as_bytes()).await.map_err(CoderError::from)?;
 	file.write_all(b"\n").await.map_err(CoderError::from)?;
 	file.flush().await.map_err(CoderError::from)?;
 	Ok(())
+}
+
+/// Try to fold a `Usage` record into the last appended assistant
+/// line on disk. Returns `Ok(true)` when the fold landed and the
+/// caller should skip writing a stand-alone row; `Ok(false)`
+/// when the last line wasn't an assistant message (no fold
+/// possible — caller falls back to the regular append path).
+///
+/// Reads the file fully (session JSONLs are small, a few KB to
+/// a few hundred KB), finds the last line, parses it, mutates
+/// the embedded assistant message to add `usage`, then truncates
+/// the file back to the line start and rewrites just that line.
+/// The truncate-and-rewrite avoids the in-place line-length
+/// problem that would otherwise require shifting bytes around.
+async fn try_fold_usage_into_last_assistant(path: &Utf8Path, usage: &SessionRecord) -> Result<bool, CoderError> {
+	let SessionRecord::Usage {
+		prompt_tokens,
+		completion_tokens,
+		total_tokens,
+		cache_read_input_tokens,
+		cache_creation_input_tokens,
+	} = usage
+	else {
+		return Ok(false);
+	};
+
+	let content = tokio::fs::read_to_string(path.as_std_path())
+		.await
+		.map_err(CoderError::from)?;
+	let bytes = content.as_bytes();
+	if bytes.is_empty() {
+		return Ok(false);
+	}
+	let trailing_newline = bytes.ends_with(b"\n");
+	let end = if trailing_newline { bytes.len() - 1 } else { bytes.len() };
+	if end == 0 {
+		return Ok(false);
+	}
+	let start = bytes[..end]
+		.iter()
+		.rposition(|&b| b == b'\n')
+		.map(|p| p + 1)
+		.unwrap_or(0);
+	let last_line = &content[start..end];
+
+	let mut parsed: serde_json::Value = match serde_json::from_str(last_line) {
+		Ok(v) => v,
+		Err(_) => return Ok(false),
+	};
+	if parsed.get("type").and_then(|v| v.as_str()) != Some(PI_MESSAGE_TYPE) {
+		return Ok(false);
+	}
+	let Some(message) = parsed.get_mut("message").and_then(|v| v.as_object_mut()) else {
+		return Ok(false);
+	};
+	if message.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+		return Ok(false);
+	}
+	if message.contains_key("usage") {
+		return Ok(false);
+	}
+
+	message.insert(
+		"usage".into(),
+		pi_usage_block(
+			*prompt_tokens,
+			*completion_tokens,
+			*total_tokens,
+			*cache_read_input_tokens,
+			*cache_creation_input_tokens,
+		),
+	);
+
+	let new_line = serde_json::to_string(&parsed).map_err(CoderError::from)?;
+	let mut file = OpenOptions::new()
+		.write(true)
+		.open(path.as_std_path())
+		.await
+		.map_err(CoderError::from)?;
+	use tokio::io::AsyncSeekExt;
+	file.set_len(start as u64).await.map_err(CoderError::from)?;
+	file
+		.seek(std::io::SeekFrom::Start(start as u64))
+		.await
+		.map_err(CoderError::from)?;
+	file.write_all(new_line.as_bytes()).await.map_err(CoderError::from)?;
+	file.write_all(b"\n").await.map_err(CoderError::from)?;
+	file.flush().await.map_err(CoderError::from)?;
+	Ok(true)
 }
 
 /// Delete a session file plus its sub-agent subdirectory (if any).
@@ -786,25 +1618,30 @@ mod tests {
 		assert!(validate_session_id("sess-12345-abcdef").is_ok());
 	}
 
-	#[tokio::test]
-	async fn write_then_read_round_trip() {
-		// Round-trip a session through the JSONL writer + reader
-		// to make sure the schema survives serde defaults and
-		// `skip_serializing_if` settings.
-		let tmp = tempfile::tempdir().unwrap();
-		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
-		let header = SessionHeader {
+	fn make_test_header(id: &str) -> SessionHeader {
+		SessionHeader {
 			schema: SESSION_SCHEMA_VERSION,
-			id: "sess-test".into(),
-			title: "round trip".into(),
-			created_at_ms: 1,
-			updated_at_ms: 1,
-			model: "test/model".into(),
+			id: id.into(),
+			cwd: "/tmp/test".into(),
+			title: format!("{id} title"),
+			created_at_ms: 1_700_000_000_000,
+			updated_at_ms: 1_700_000_000_000,
+			model: "test-provider/test-model".into(),
 			parent_session_id: None,
 			parent_tool_call_id: None,
 			subagent_mode: None,
 			subagent_target_folder: None,
-		};
+		}
+	}
+
+	#[tokio::test]
+	async fn write_then_read_round_trip() {
+		// Round-trip a session through the JSONL writer + reader
+		// to make sure the pi wire shape survives serialise +
+		// deserialise.
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let header = make_test_header("sess-test");
 		append_record(
 			&dir,
 			&header,
@@ -852,26 +1689,86 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn user_record_round_trips_with_attached_images() {
-		// Regression guard for image attachments: a User record
-		// with `images` must round-trip through JSONL → load
-		// without losing the data URLs, otherwise pasted
-		// screenshots would silently disappear on session
-		// reload.
+	async fn header_emits_type_session_with_cwd() {
+		// pi-mono's `detect.ts` keys off `type === "session" &&
+		// typeof id === "string" && typeof cwd === "string"`.
+		// The header line we write must satisfy all three or the
+		// Hub trace viewer won't recognise the file at all.
 		let tmp = tempfile::tempdir().unwrap();
 		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
-		let header = SessionHeader {
-			schema: SESSION_SCHEMA_VERSION,
-			id: "sess-img".into(),
-			title: "img round trip".into(),
-			created_at_ms: 1,
-			updated_at_ms: 1,
-			model: "test/model".into(),
-			parent_session_id: None,
-			parent_tool_call_id: None,
-			subagent_mode: None,
-			subagent_target_folder: None,
-		};
+		let mut header = make_test_header("sess-pi-header");
+		header.cwd = "/workspace/moon-ide".into();
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::User {
+				text: "hi".into(),
+				images: Vec::new(),
+			},
+		)
+		.await
+		.unwrap();
+		let body = tokio::fs::read_to_string(session_path(&dir, "sess-pi-header").as_std_path())
+			.await
+			.unwrap();
+		let header_line = body.lines().next().expect("header line");
+		let parsed: serde_json::Value = serde_json::from_str(header_line).unwrap();
+		assert_eq!(parsed["type"], "session");
+		assert_eq!(parsed["id"], "sess-pi-header");
+		assert_eq!(parsed["cwd"], "/workspace/moon-ide");
+		assert_eq!(parsed["version"], SESSION_SCHEMA_VERSION);
+		assert!(parsed["timestamp"].is_string());
+
+		let loaded = load(&dir, "sess-pi-header").await.unwrap();
+		assert_eq!(loaded.header.cwd, "/workspace/moon-ide");
+		assert_eq!(loaded.header.schema, SESSION_SCHEMA_VERSION);
+	}
+
+	#[tokio::test]
+	async fn user_record_round_trips_through_pi_wire() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let header = make_test_header("sess-user");
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::User {
+				text: "hello".into(),
+				images: Vec::new(),
+			},
+		)
+		.await
+		.unwrap();
+		let body = tokio::fs::read_to_string(session_path(&dir, "sess-user").as_std_path())
+			.await
+			.unwrap();
+		let user_line = body.lines().nth(1).expect("user line present");
+		let parsed: serde_json::Value = serde_json::from_str(user_line).unwrap();
+		assert_eq!(parsed["type"], "message");
+		assert_eq!(parsed["message"]["role"], "user");
+		assert_eq!(parsed["message"]["content"], "hello");
+
+		let loaded = load(&dir, "sess-user").await.unwrap();
+		match &loaded.records[0] {
+			SessionRecord::User { text, images } => {
+				assert_eq!(text, "hello");
+				assert!(images.is_empty());
+			}
+			other => panic!("expected user record, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn image_attachments_strip_data_url_prefix() {
+		// Pi's `ImageContent` stores raw base64 in `data` and
+		// the mime type in `mimeType`. We must strip our
+		// `data:<mime>;base64,` prefix on write so the viewer
+		// can call `getBase64ImageDataUrl(data, mimeType)`; on
+		// read we re-prefix so the in-memory `data_url` stays
+		// exactly what the composer produced.
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let header = make_test_header("sess-img");
 		append_record(
 			&dir,
 			&header,
@@ -885,8 +1782,20 @@ mod tests {
 		)
 		.await
 		.unwrap();
+		let body = tokio::fs::read_to_string(session_path(&dir, "sess-img").as_std_path())
+			.await
+			.unwrap();
+		let user_line = body.lines().nth(1).expect("user line present");
+		let parsed: serde_json::Value = serde_json::from_str(user_line).unwrap();
+		let content = parsed["message"]["content"].as_array().expect("array");
+		assert_eq!(content.len(), 2);
+		assert_eq!(content[0]["type"], "text");
+		assert_eq!(content[0]["text"], "look at this");
+		assert_eq!(content[1]["type"], "image");
+		assert_eq!(content[1]["data"], "AAAA");
+		assert_eq!(content[1]["mimeType"], "image/png");
+
 		let loaded = load(&dir, "sess-img").await.unwrap();
-		assert_eq!(loaded.records.len(), 1);
 		match &loaded.records[0] {
 			SessionRecord::User { text, images } => {
 				assert_eq!(text, "look at this");
@@ -899,69 +1808,283 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn user_record_without_images_omits_images_field() {
-		// `skip_serializing_if = "Vec::is_empty"` on `images`
-		// must keep no-image User records out of the JSONL.
-		// Otherwise every user line gets a stray `"images":[]`,
-		// which adds nothing and makes a `git log -p` of a
-		// session transcript unreadable.
+	async fn assistant_with_thinking_text_and_tool_calls_emits_pi_blocks_in_order() {
+		// The pi viewer renders blocks in the order they appear
+		// in the message's `content` array. We emit thinking →
+		// text → toolCall* so the reasoning panel surfaces
+		// before the answer, and tool calls follow the answer
+		// (matching the pi-mono coding-agent's own ordering).
 		let tmp = tempfile::tempdir().unwrap();
 		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
-		let header = SessionHeader {
-			schema: SESSION_SCHEMA_VERSION,
-			id: "sess-noimg".into(),
-			title: "no img".into(),
-			created_at_ms: 1,
-			updated_at_ms: 1,
-			model: "test/model".into(),
-			parent_session_id: None,
-			parent_tool_call_id: None,
-			subagent_mode: None,
-			subagent_target_folder: None,
-		};
+		let header = make_test_header("sess-assistant");
 		append_record(
 			&dir,
 			&header,
-			&SessionRecord::User {
-				text: "hi".into(),
-				images: Vec::new(),
+			&SessionRecord::Assistant {
+				content: Some("here's a plan".into()),
+				thinking: Some("let me think".into()),
+				tool_calls: vec![ToolCall {
+					id: "call-1".into(),
+					kind: "function".into(),
+					function: crate::inference::FunctionCall {
+						name: "bash".into(),
+						arguments: r#"{"command":"ls"}"#.into(),
+					},
+				}],
 			},
 		)
 		.await
 		.unwrap();
-		let body = tokio::fs::read_to_string(session_path(&dir, "sess-noimg").as_std_path())
+
+		let body = tokio::fs::read_to_string(session_path(&dir, "sess-assistant").as_std_path())
 			.await
 			.unwrap();
-		// First line is the header, second is the user record.
-		let user_line = body.lines().nth(1).unwrap();
-		assert!(
-			!user_line.contains("\"images\""),
-			"user line still serialised images field: {user_line}"
-		);
+		let assistant_line = body.lines().nth(1).expect("assistant line present");
+		let parsed: serde_json::Value = serde_json::from_str(assistant_line).unwrap();
+		assert_eq!(parsed["type"], "message");
+		assert_eq!(parsed["message"]["role"], "assistant");
+		let blocks = parsed["message"]["content"].as_array().expect("blocks");
+		assert_eq!(blocks.len(), 3);
+		assert_eq!(blocks[0]["type"], "thinking");
+		assert_eq!(blocks[0]["thinking"], "let me think");
+		assert_eq!(blocks[1]["type"], "text");
+		assert_eq!(blocks[1]["text"], "here's a plan");
+		assert_eq!(blocks[2]["type"], "toolCall");
+		assert_eq!(blocks[2]["id"], "call-1");
+		assert_eq!(blocks[2]["name"], "bash");
+		assert_eq!(blocks[2]["arguments"]["command"], "ls");
+		// provider / model derived from `header.model`.
+		assert_eq!(parsed["message"]["provider"], "test-provider");
+		assert_eq!(parsed["message"]["model"], "test-model");
+
+		let loaded = load(&dir, "sess-assistant").await.unwrap();
+		match &loaded.records[0] {
+			SessionRecord::Assistant {
+				content,
+				thinking,
+				tool_calls,
+			} => {
+				assert_eq!(content.as_deref(), Some("here's a plan"));
+				assert_eq!(thinking.as_deref(), Some("let me think"));
+				assert_eq!(tool_calls.len(), 1);
+				assert_eq!(tool_calls[0].id, "call-1");
+				assert_eq!(tool_calls[0].function.name, "bash");
+				// Args round-trip as a compact JSON object string.
+				let reparsed: serde_json::Value = serde_json::from_str(&tool_calls[0].function.arguments).unwrap();
+				assert_eq!(reparsed["command"], "ls");
+			}
+			other => panic!("expected assistant record, got {other:?}"),
+		}
 	}
 
 	#[tokio::test]
-	async fn compaction_record_round_trips_via_jsonl() {
-		// Auto-compaction writes a `Compaction` record so that
-		// reopening the session reaches the same compacted
-		// in-memory shape instead of re-inflating the full
-		// pre-compaction transcript. Round-trip the record to
-		// guard the serde shape — losing it silently would push
-		// the next turn over the provider's context-length cap.
+	async fn usage_folds_onto_prior_assistant_line() {
+		// pi-mono carries the round-trip's `Usage` on the
+		// `usage` field of its assistant message, not as a
+		// stand-alone row. Our append path must fold a Usage
+		// record onto the prior assistant line on disk; the
+		// in-memory shape stays "Assistant followed by Usage"
+		// so every existing consumer (replay, context-usage
+		// ring) keeps working.
 		let tmp = tempfile::tempdir().unwrap();
 		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
-		let header = SessionHeader {
-			schema: SESSION_SCHEMA_VERSION,
-			id: "sess-compact".into(),
-			title: "compaction round trip".into(),
-			created_at_ms: 1,
-			updated_at_ms: 1,
-			model: "test/model".into(),
-			parent_session_id: None,
-			parent_tool_call_id: None,
-			subagent_mode: None,
-			subagent_target_folder: None,
-		};
+		let header = make_test_header("sess-usage-fold");
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::Assistant {
+				content: Some("done".into()),
+				thinking: None,
+				tool_calls: Vec::new(),
+			},
+		)
+		.await
+		.unwrap();
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::Usage {
+				prompt_tokens: 100,
+				completion_tokens: 20,
+				total_tokens: 120,
+				cache_read_input_tokens: 80,
+				cache_creation_input_tokens: 10,
+			},
+		)
+		.await
+		.unwrap();
+
+		let body = tokio::fs::read_to_string(session_path(&dir, "sess-usage-fold").as_std_path())
+			.await
+			.unwrap();
+		let lines: Vec<&str> = body.lines().collect();
+		// Header + assistant — no stand-alone usage row.
+		assert_eq!(lines.len(), 2, "usage should fold, not append a new line: {body}");
+		let assistant_line = lines[1];
+		let parsed: serde_json::Value = serde_json::from_str(assistant_line).unwrap();
+		let usage = &parsed["message"]["usage"];
+		assert_eq!(usage["input"], 100);
+		assert_eq!(usage["output"], 20);
+		assert_eq!(usage["totalTokens"], 120);
+		assert_eq!(usage["cacheRead"], 80);
+		assert_eq!(usage["cacheWrite"], 10);
+
+		let loaded = load(&dir, "sess-usage-fold").await.unwrap();
+		// In-memory: Assistant + Usage, same shape as schema 1.
+		assert_eq!(loaded.records.len(), 2);
+		assert!(matches!(loaded.records[0], SessionRecord::Assistant { .. }));
+		match &loaded.records[1] {
+			SessionRecord::Usage {
+				prompt_tokens,
+				completion_tokens,
+				total_tokens,
+				cache_read_input_tokens,
+				cache_creation_input_tokens,
+			} => {
+				assert_eq!(*prompt_tokens, 100);
+				assert_eq!(*completion_tokens, 20);
+				assert_eq!(*total_tokens, 120);
+				assert_eq!(*cache_read_input_tokens, 80);
+				assert_eq!(*cache_creation_input_tokens, 10);
+			}
+			other => panic!("expected Usage, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn usage_without_caching_omits_cache_keys_on_disk() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let header = make_test_header("sess-usage-plain");
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::Assistant {
+				content: Some("ok".into()),
+				thinking: None,
+				tool_calls: Vec::new(),
+			},
+		)
+		.await
+		.unwrap();
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::Usage {
+				prompt_tokens: 1234,
+				completion_tokens: 56,
+				total_tokens: 1290,
+				cache_read_input_tokens: 0,
+				cache_creation_input_tokens: 0,
+			},
+		)
+		.await
+		.unwrap();
+		let body = tokio::fs::read_to_string(session_path(&dir, "sess-usage-plain").as_std_path())
+			.await
+			.unwrap();
+		let assistant_line = body.lines().nth(1).expect("assistant line present");
+		assert!(assistant_line.contains(r#""input":1234"#));
+		assert!(!assistant_line.contains("cacheRead"));
+		assert!(!assistant_line.contains("cacheWrite"));
+
+		let loaded = load(&dir, "sess-usage-plain").await.unwrap();
+		match &loaded.records[1] {
+			SessionRecord::Usage {
+				cache_read_input_tokens,
+				cache_creation_input_tokens,
+				..
+			} => {
+				assert_eq!(*cache_read_input_tokens, 0);
+				assert_eq!(*cache_creation_input_tokens, 0);
+			}
+			other => panic!("expected Usage, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn title_update_round_trips_via_custom() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let header = make_test_header("sess-title");
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::TitleUpdate {
+				title: "renamed".into(),
+			},
+		)
+		.await
+		.unwrap();
+		let body = tokio::fs::read_to_string(session_path(&dir, "sess-title").as_std_path())
+			.await
+			.unwrap();
+		let title_line = body.lines().nth(1).expect("title line");
+		let parsed: serde_json::Value = serde_json::from_str(title_line).unwrap();
+		assert_eq!(parsed["type"], "message");
+		assert_eq!(parsed["message"]["role"], "custom");
+		assert_eq!(parsed["message"]["customType"], CUSTOM_TYPE_TITLE_UPDATE);
+		assert_eq!(parsed["message"]["display"], false);
+		assert_eq!(parsed["message"]["details"]["title"], "renamed");
+
+		let loaded = load(&dir, "sess-title").await.unwrap();
+		match &loaded.records[0] {
+			SessionRecord::TitleUpdate { title } => assert_eq!(title, "renamed"),
+			other => panic!("expected TitleUpdate, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn todos_update_round_trips_via_custom() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let header = make_test_header("sess-todos");
+		let todos = vec![
+			crate::TodoItem {
+				id: "t1".into(),
+				content: "first".into(),
+				status: crate::TodoStatus::Completed,
+			},
+			crate::TodoItem {
+				id: "t2".into(),
+				content: "second".into(),
+				status: crate::TodoStatus::Pending,
+			},
+		];
+		append_record(&dir, &header, &SessionRecord::TodosUpdate { todos: todos.clone() })
+			.await
+			.unwrap();
+		let body = tokio::fs::read_to_string(session_path(&dir, "sess-todos").as_std_path())
+			.await
+			.unwrap();
+		let line = body.lines().nth(1).expect("todos line");
+		let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
+		assert_eq!(parsed["message"]["customType"], CUSTOM_TYPE_TODOS_UPDATE);
+		assert_eq!(parsed["message"]["display"], false);
+		let written_todos = parsed["message"]["details"]["todos"].as_array().expect("todos");
+		assert_eq!(written_todos.len(), 2);
+
+		let loaded = load(&dir, "sess-todos").await.unwrap();
+		match &loaded.records[0] {
+			SessionRecord::TodosUpdate { todos: out } => {
+				assert_eq!(out.len(), 2);
+				assert_eq!(out[0].id, "t1");
+				assert_eq!(out[0].status, crate::TodoStatus::Completed);
+				assert_eq!(out[1].status, crate::TodoStatus::Pending);
+			}
+			other => panic!("expected TodosUpdate, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn compaction_emits_top_level_pi_compaction_row() {
+		// Compaction rides as its own top-level pi row (not a
+		// message envelope), matching pi-mono's session log
+		// shape so the trace viewer renders the compaction
+		// banner without us having to wrap it in a custom row.
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let header = make_test_header("sess-compaction");
 		append_record(
 			&dir,
 			&header,
@@ -972,8 +2095,16 @@ mod tests {
 		)
 		.await
 		.unwrap();
-		let loaded = load(&dir, "sess-compact").await.unwrap();
-		assert_eq!(loaded.records.len(), 1);
+		let body = tokio::fs::read_to_string(session_path(&dir, "sess-compaction").as_std_path())
+			.await
+			.unwrap();
+		let comp_line = body.lines().nth(1).expect("compaction line");
+		let parsed: serde_json::Value = serde_json::from_str(comp_line).unwrap();
+		assert_eq!(parsed["type"], "compaction");
+		assert_eq!(parsed["summary"], "earlier turns: refactored foo into bar");
+		assert_eq!(parsed["details"]["messages_compacted"], 42);
+
+		let loaded = load(&dir, "sess-compaction").await.unwrap();
 		match &loaded.records[0] {
 			SessionRecord::Compaction {
 				summary,
@@ -982,7 +2113,122 @@ mod tests {
 				assert_eq!(summary, "earlier turns: refactored foo into bar");
 				assert_eq!(*messages_compacted, 42);
 			}
-			other => panic!("expected compaction record, got {other:?}"),
+			other => panic!("expected Compaction, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn tool_result_emits_pi_tool_result_envelope() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let header = make_test_header("sess-tool");
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::Tool {
+				tool_call_id: "call-1".into(),
+				content: r#"{"stdout":"ok"}"#.into(),
+			},
+		)
+		.await
+		.unwrap();
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::Tool {
+				tool_call_id: "call-2".into(),
+				content: INTERRUPTED_TOOL_RESULT_JSON.into(),
+			},
+		)
+		.await
+		.unwrap();
+		let body = tokio::fs::read_to_string(session_path(&dir, "sess-tool").as_std_path())
+			.await
+			.unwrap();
+		let lines: Vec<&str> = body.lines().collect();
+		let ok_line: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+		assert_eq!(ok_line["message"]["role"], "toolResult");
+		assert_eq!(ok_line["message"]["toolCallId"], "call-1");
+		assert_eq!(ok_line["message"]["isError"], false);
+		assert_eq!(ok_line["message"]["content"][0]["text"], r#"{"stdout":"ok"}"#);
+
+		let err_line: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+		assert_eq!(err_line["message"]["isError"], true);
+
+		let loaded = load(&dir, "sess-tool").await.unwrap();
+		match &loaded.records[0] {
+			SessionRecord::Tool { tool_call_id, content } => {
+				assert_eq!(tool_call_id, "call-1");
+				assert_eq!(content, r#"{"stdout":"ok"}"#);
+			}
+			other => panic!("expected Tool, got {other:?}"),
+		}
+		match &loaded.records[1] {
+			SessionRecord::Tool { content, .. } => {
+				assert_eq!(content, INTERRUPTED_TOOL_RESULT_JSON);
+			}
+			other => panic!("expected Tool, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn subagent_records_round_trip_via_custom() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let header = make_test_header("sess-sub");
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::SubagentSpawned {
+				tool_call_id: "call-1".into(),
+				subagent_id: "sub-x".into(),
+				target_folder: "/workspace/api".into(),
+				mode: "agent".into(),
+			},
+		)
+		.await
+		.unwrap();
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::SubagentFinished {
+				subagent_id: "sub-x".into(),
+				tokens_used_estimate: 1234,
+				was_error: false,
+				result_preview: Some("did it".into()),
+			},
+		)
+		.await
+		.unwrap();
+		let loaded = load(&dir, "sess-sub").await.unwrap();
+		assert_eq!(loaded.records.len(), 2);
+		match &loaded.records[0] {
+			SessionRecord::SubagentSpawned {
+				tool_call_id,
+				subagent_id,
+				target_folder,
+				mode,
+			} => {
+				assert_eq!(tool_call_id, "call-1");
+				assert_eq!(subagent_id, "sub-x");
+				assert_eq!(target_folder, "/workspace/api");
+				assert_eq!(mode, "agent");
+			}
+			other => panic!("expected SubagentSpawned, got {other:?}"),
+		}
+		match &loaded.records[1] {
+			SessionRecord::SubagentFinished {
+				subagent_id,
+				tokens_used_estimate,
+				was_error,
+				result_preview,
+			} => {
+				assert_eq!(subagent_id, "sub-x");
+				assert_eq!(*tokens_used_estimate, 1234);
+				assert!(!*was_error);
+				assert_eq!(result_preview.as_deref(), Some("did it"));
+			}
+			other => panic!("expected SubagentFinished, got {other:?}"),
 		}
 	}
 
@@ -996,18 +2242,7 @@ mod tests {
 		let tmp = tempfile::tempdir().unwrap();
 		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
 
-		let parent_header = SessionHeader {
-			schema: SESSION_SCHEMA_VERSION,
-			id: "sess-parent".into(),
-			title: "parent".into(),
-			created_at_ms: 1,
-			updated_at_ms: 1,
-			model: "test/model".into(),
-			parent_session_id: None,
-			parent_tool_call_id: None,
-			subagent_mode: None,
-			subagent_target_folder: None,
-		};
+		let parent_header = make_test_header("sess-parent");
 		append_record(
 			&dir,
 			&parent_header,
@@ -1020,18 +2255,10 @@ mod tests {
 		.unwrap();
 
 		let sub_dir = subagent_session_dir(&dir, "sess-parent");
-		let sub_header = SessionHeader {
-			schema: SESSION_SCHEMA_VERSION,
-			id: "sub-child".into(),
-			title: "spawned by parent".into(),
-			created_at_ms: 2,
-			updated_at_ms: 2,
-			model: "test/model".into(),
-			parent_session_id: Some("sess-parent".into()),
-			parent_tool_call_id: Some("call-1".into()),
-			subagent_mode: Some("agent".into()),
-			subagent_target_folder: None,
-		};
+		let mut sub_header = make_test_header("sub-child");
+		sub_header.parent_session_id = Some("sess-parent".into());
+		sub_header.parent_tool_call_id = Some("call-1".into());
+		sub_header.subagent_mode = Some("agent".into());
 		append_record(
 			&sub_dir,
 			&sub_header,
@@ -1047,13 +2274,8 @@ mod tests {
 		assert_eq!(listed.len(), 1, "list should hide sub-agent transcripts");
 		assert_eq!(listed[0].id, "sess-parent");
 
-		// `find_subagent_session` resolves the sub-agent's path
-		// for the IPC's "open trace" affordance — the IPC takes
-		// a single id so the runner has to scan parent subdirs.
 		let found = find_subagent_session(&dir, "sub-child").await;
 		assert_eq!(found, Some(session_path(&sub_dir, "sub-child")));
-		// Top-level ids return None — the caller should use the
-		// flat `session_path` for those.
 		let not_found = find_subagent_session(&dir, "sess-parent").await;
 		assert_eq!(not_found, None);
 	}
@@ -1063,18 +2285,7 @@ mod tests {
 		let tmp = tempfile::tempdir().unwrap();
 		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
 
-		let parent_header = SessionHeader {
-			schema: SESSION_SCHEMA_VERSION,
-			id: "sess-parent".into(),
-			title: "parent".into(),
-			created_at_ms: 1,
-			updated_at_ms: 1,
-			model: "test/model".into(),
-			parent_session_id: None,
-			parent_tool_call_id: None,
-			subagent_mode: None,
-			subagent_target_folder: None,
-		};
+		let parent_header = make_test_header("sess-parent");
 		append_record(
 			&dir,
 			&parent_header,
@@ -1086,18 +2297,10 @@ mod tests {
 		.await
 		.unwrap();
 		let sub_dir = subagent_session_dir(&dir, "sess-parent");
-		let sub_header = SessionHeader {
-			schema: SESSION_SCHEMA_VERSION,
-			id: "sub-child".into(),
-			title: "x".into(),
-			created_at_ms: 2,
-			updated_at_ms: 2,
-			model: "test/model".into(),
-			parent_session_id: Some("sess-parent".into()),
-			parent_tool_call_id: Some("call-1".into()),
-			subagent_mode: Some("agent".into()),
-			subagent_target_folder: None,
-		};
+		let mut sub_header = make_test_header("sub-child");
+		sub_header.parent_session_id = Some("sess-parent".into());
+		sub_header.parent_tool_call_id = Some("call-1".into());
+		sub_header.subagent_mode = Some("agent".into());
 		append_record(
 			&sub_dir,
 			&sub_header,
@@ -1117,97 +2320,46 @@ mod tests {
 		assert!(!tokio::fs::try_exists(sub_dir.as_std_path()).await.unwrap());
 	}
 
-	#[tokio::test]
-	async fn usage_record_round_trips_with_optional_cache_fields() {
-		// `Usage` records drive the post-replay context-usage
-		// ring on `open_session`. Two shapes worth pinning:
-		//
-		// 1. A "no caching" usage (most providers): cache fields
-		//    skip-serialise so the JSONL line stays slim.
-		// 2. An Anthropic-via-OpenRouter usage: cache fields
-		//    present and round-trip back exactly.
-		let tmp = tempfile::tempdir().unwrap();
-		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
-		let header = SessionHeader {
-			schema: SESSION_SCHEMA_VERSION,
-			id: "sess-usage".into(),
-			title: "usage round trip".into(),
-			created_at_ms: 1,
-			updated_at_ms: 1,
-			model: "anthropic/claude-sonnet-4.5".into(),
-			parent_session_id: None,
-			parent_tool_call_id: None,
-			subagent_mode: None,
-			subagent_target_folder: None,
-		};
+	#[test]
+	fn iso8601_utc_ms_formats_epoch_zero() {
+		assert_eq!(iso8601_utc_ms(0), "1970-01-01T00:00:00.000Z");
+	}
 
-		// Plain non-caching usage line: cache fields are zero,
-		// so they should be absent from the on-disk JSON.
-		let plain = SessionRecord::Usage {
-			prompt_tokens: 1234,
-			completion_tokens: 56,
-			total_tokens: 1290,
-			cache_read_input_tokens: 0,
-			cache_creation_input_tokens: 0,
-		};
-		append_record(&dir, &header, &plain).await.unwrap();
-		let raw = tokio::fs::read_to_string(session_path(&dir, "sess-usage").as_std_path())
-			.await
-			.unwrap();
-		// Header line + one usage line. The usage line should
-		// not carry the cache_* keys (skip-if-zero).
-		let usage_line = raw.lines().nth(1).expect("usage line present");
-		assert!(usage_line.contains(r#""kind":"usage""#));
-		assert!(usage_line.contains(r#""prompt_tokens":1234"#));
-		assert!(!usage_line.contains("cache_read_input_tokens"));
-		assert!(!usage_line.contains("cache_creation_input_tokens"));
+	#[test]
+	fn iso8601_utc_ms_formats_known_timestamp() {
+		// 2024-01-15T12:34:56.789Z (validated against an
+		// independent computation).
+		let ms = 1_705_322_096_789;
+		assert_eq!(iso8601_utc_ms(ms), "2024-01-15T12:34:56.789Z");
+	}
 
-		// Now an Anthropic-via-OpenRouter usage where caching
-		// kicked in. Both cache fields round-trip on disk.
-		let with_cache = SessionRecord::Usage {
-			prompt_tokens: 9000,
-			completion_tokens: 200,
-			total_tokens: 9200,
-			cache_read_input_tokens: 7500,
-			cache_creation_input_tokens: 600,
-		};
-		append_record(&dir, &header, &with_cache).await.unwrap();
-		let loaded = load(&dir, "sess-usage").await.unwrap();
-		assert_eq!(loaded.records.len(), 2);
-		match &loaded.records[1] {
-			SessionRecord::Usage {
-				prompt_tokens,
-				completion_tokens,
-				total_tokens,
-				cache_read_input_tokens,
-				cache_creation_input_tokens,
-			} => {
-				assert_eq!(*prompt_tokens, 9000);
-				assert_eq!(*completion_tokens, 200);
-				assert_eq!(*total_tokens, 9200);
-				assert_eq!(*cache_read_input_tokens, 7500);
-				assert_eq!(*cache_creation_input_tokens, 600);
-			}
-			other => panic!("expected Usage, got {other:?}"),
-		}
+	#[test]
+	fn split_provider_model_handles_slashed_and_plain() {
+		assert_eq!(
+			split_provider_model("anthropic/claude-sonnet-4.5"),
+			(Some("anthropic"), "claude-sonnet-4.5")
+		);
+		assert_eq!(split_provider_model("local-model"), (None, "local-model"));
+	}
 
-		// And the no-caching record we wrote first should
-		// still parse back with default-zero cache fields,
-		// proving the missing-on-disk → 0-in-memory fallback
-		// works on reload.
-		match &loaded.records[0] {
-			SessionRecord::Usage {
-				prompt_tokens,
-				cache_read_input_tokens,
-				cache_creation_input_tokens,
-				..
-			} => {
-				assert_eq!(*prompt_tokens, 1234);
-				assert_eq!(*cache_read_input_tokens, 0);
-				assert_eq!(*cache_creation_input_tokens, 0);
-			}
-			other => panic!("expected Usage, got {other:?}"),
-		}
+	#[test]
+	fn strip_data_url_prefix_recovers_raw_base64() {
+		let (data, mime) = strip_data_url_prefix("data:image/png;base64,AAAA", "image/png");
+		assert_eq!(data, "AAAA");
+		assert_eq!(mime, "image/png");
+		// No prefix → passthrough.
+		let (data, mime) = strip_data_url_prefix("AAAA", "image/png");
+		assert_eq!(data, "AAAA");
+		assert_eq!(mime, "image/png");
+	}
+
+	#[test]
+	fn looks_like_tool_error_detects_error_shapes() {
+		assert!(looks_like_tool_error(INTERRUPTED_TOOL_RESULT_JSON));
+		assert!(looks_like_tool_error(r#"{"error":"boom"}"#));
+		assert!(!looks_like_tool_error(r#"{"stdout":"ok"}"#));
+		assert!(!looks_like_tool_error("plain text"));
+		assert!(!looks_like_tool_error(r#"{"error":"boom","stderr":""}"#));
 	}
 
 	#[test]

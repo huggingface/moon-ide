@@ -261,6 +261,12 @@ async fn run_subagent_inner(
 	let header = SessionHeader {
 		schema: SESSION_SCHEMA_VERSION,
 		id: id.clone(),
+		// Sub-agents operate against their target folder; that's
+		// the `cwd` the pi viewer should show for this trace.
+		// Sub-agents that fall back to the parent's folder still
+		// get a real path here (we use `target_folder_path`
+		// regardless of `target_differs`).
+		cwd: target_folder_path.clone(),
 		title: subagent_session_title(&spec.task),
 		created_at_ms: now,
 		updated_at_ms: now,

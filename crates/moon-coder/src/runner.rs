@@ -272,6 +272,12 @@ impl Session {
 			header: SessionHeader {
 				schema: SESSION_SCHEMA_VERSION,
 				id: new_session_id(),
+				// Bound at first-persistence time by `Coder::send`
+				// once we know which workspace folder the session
+				// is attached to. Left blank here so the freshly-
+				// created shell doesn't accidentally claim a path
+				// it never wrote to.
+				cwd: String::new(),
 				title: String::new(),
 				created_at_ms: now,
 				updated_at_ms: now,
@@ -1431,6 +1437,17 @@ impl CoderHandle {
 			let needs_loaded_event = session.header.title.is_empty() && session.persisted_records == 0;
 			if session.session_dir.is_none() {
 				session.session_dir = Some(dir.clone());
+			}
+			// First-persistence binds `cwd` to the workspace folder
+			// root so the JSONL header carries a non-empty path —
+			// pi-mono's detector ([detect.ts]) drops sessions whose
+			// `cwd` isn't a string, and an empty string would still
+			// pass that check but rendered as `(no folder)` in the
+			// trace viewer. Idempotent: a sub-agent header already
+			// carries `cwd` set in `subagent.rs::build_subagent_spec`
+			// and we don't clobber it.
+			if session.header.cwd.is_empty() {
+				session.header.cwd = folder_path.to_string();
 			}
 			if session.header.title.is_empty() {
 				session.header.title = session_title_from_prompt(&text);
@@ -3744,6 +3761,7 @@ mod tests {
 		SessionHeader {
 			schema: SESSION_SCHEMA_VERSION,
 			id: id.into(),
+			cwd: "/tmp/steer-test".into(),
 			title: "steer test".into(),
 			created_at_ms: 1,
 			updated_at_ms: 1,
@@ -3830,8 +3848,10 @@ mod tests {
 		let jsonl = tokio::fs::read_to_string(sessions::session_path(&dir, "sess-steer").as_std_path())
 			.await
 			.unwrap();
-		assert!(jsonl.contains(r#""text":"also do X""#), "{jsonl}");
-		assert!(jsonl.contains(r#""text":"and then Y""#), "{jsonl}");
+		// pi-mono envelopes carry plain-text user prompts in
+		// `message.content` as a string, not under `text`.
+		assert!(jsonl.contains(r#""content":"also do X""#), "{jsonl}");
+		assert!(jsonl.contains(r#""content":"and then Y""#), "{jsonl}");
 		// Ordering on disk matches queue order, not timestamp
 		// (which is identical for both records anyway).
 		let first = jsonl.find("also do X").unwrap();
