@@ -12,9 +12,11 @@ use grep_searcher::{sinks::UTF8, Searcher};
 use ignore::overrides::{Override, OverrideBuilder};
 use ignore::WalkBuilder;
 use moon_protocol::search::{
-	ContentSearchHit, ContentSearchOptions, ContentSearchResult, FileSearchOptions, FileSearchResult,
+	ContentReplaceError, ContentReplaceOptions, ContentReplaceResult, ContentSearchHit, ContentSearchOptions,
+	ContentSearchResult, FileSearchOptions, FileSearchResult,
 };
 use moon_protocol::{MoonError, MoonResult};
+use regex::Regex;
 
 /// Minimum score below which file-name candidates are dropped from the result list.
 const FILE_SEARCH_MIN_SCORE: i64 = 0;
@@ -267,6 +269,177 @@ fn find_first_match(matcher: &RegexMatcher, line: &[u8]) -> Option<(u32, u32)> {
 		.ok()
 		.flatten()
 		.map(|m: grep_matcher::Match| (m.start() as u32, m.end() as u32))
+}
+
+/// Mass-replace across every file the search walker would visit.
+/// Plain-text mode escapes both the pattern *and* the replacement
+/// so `$` / `\` / backrefs in the replacement string are literal;
+/// regex mode lets `Regex::replace_all` expand `$1` / `${name}` /
+/// `$$` per its standard rules. Each file is read, replaced, and
+/// — only if the bytes actually change — written back atomically
+/// via `std::fs::write` (which is a single `O_TRUNC` + `write`,
+/// good enough for the IDE's "I just did a refactor" use case;
+/// fancier crash-safety isn't worth the complexity yet).
+///
+/// We deliberately do **not** consult open editor buffers here:
+/// the surface area at the FS layer is small and predictable, and
+/// the existing file-watcher pipeline will pick the new bytes up.
+/// Callers that care about unsaved buffers (the search panel) gate
+/// the action UI-side.
+pub fn replace_content(root: &Utf8Path, opts: &ContentReplaceOptions) -> MoonResult<ContentReplaceResult> {
+	let query = opts.query.trim();
+	if query.is_empty() {
+		return Ok(ContentReplaceResult {
+			files_changed: 0,
+			replacements: 0,
+			errors: Vec::new(),
+		});
+	}
+
+	let (pattern, replacement) = build_replace_pattern(query, &opts.replacement, opts.regex, opts.whole_word);
+
+	let regex = build_replace_regex(&pattern, opts.case_sensitive)?;
+	// `grep-regex`'s matcher is the path we already use for the
+	// preview search — keeping it in the walk loop means "skip
+	// files that don't contain a match" stays a single, cheap
+	// scan over the bytes (no per-line UTF-8 conversion). Only
+	// the files that actually need a rewrite enter the read /
+	// edit / write path below.
+	let prefilter = if opts.case_sensitive {
+		RegexMatcher::new(&pattern)
+	} else {
+		RegexMatcher::new(&format!("(?i){pattern}"))
+	}
+	.map_err(|e| MoonError::invalid(format!("invalid regex: {e}")))?;
+
+	let mut files_changed = 0u32;
+	let mut total_replacements = 0u32;
+	let mut errors: Vec<ContentReplaceError> = Vec::new();
+
+	let walker = WalkBuilder::new(root.as_std_path())
+		.hidden(false)
+		.git_ignore(true)
+		.git_exclude(true)
+		.ignore(true)
+		.overrides(build_overrides(root, opts.include_glob.as_deref()))
+		.build();
+
+	for entry in walker.flatten() {
+		let path = entry.path();
+		if !path.is_file() {
+			continue;
+		}
+
+		let rel = match path.strip_prefix(root.as_std_path()) {
+			Ok(p) => p,
+			Err(_) => continue,
+		};
+		let rel_str = match rel.to_str() {
+			Some(s) => s.to_string(),
+			None => continue,
+		};
+
+		if !file_contains_match(&prefilter, path) {
+			continue;
+		}
+
+		let original = match std::fs::read_to_string(path) {
+			Ok(s) => s,
+			Err(err) => {
+				// Non-UTF-8 / unreadable files. The prefilter
+				// flagged a byte match, but we can't safely
+				// rewrite without a UTF-8 view, so skip with an
+				// entry the UI can surface.
+				errors.push(ContentReplaceError {
+					path: rel_str,
+					message: format!("read failed: {err}"),
+				});
+				continue;
+			}
+		};
+
+		let (replaced_text, n) = regex_replace_all_counted(&regex, &original, &replacement);
+		if n == 0 || replaced_text == original {
+			continue;
+		}
+
+		if let Err(err) = std::fs::write(path, replaced_text.as_bytes()) {
+			errors.push(ContentReplaceError {
+				path: rel_str,
+				message: format!("write failed: {err}"),
+			});
+			continue;
+		}
+
+		files_changed = files_changed.saturating_add(1);
+		total_replacements = total_replacements.saturating_add(n as u32);
+	}
+
+	Ok(ContentReplaceResult {
+		files_changed,
+		replacements: total_replacements,
+		errors,
+	})
+}
+
+/// Returns `(pattern, replacement)` ready to feed to
+/// [`Regex::replace_all`]. In plain-text mode the pattern is
+/// regex-escaped (so the query is treated literally) and the
+/// replacement is run through [`regex::Regex::replace_all`]'s
+/// "no expansion" escape (`$` → `$$`, `\` is already literal in
+/// the replacement language) so the user's typed text doesn't
+/// accidentally trigger backref expansion when they were just
+/// trying to type a `$` sign.
+fn build_replace_pattern(query: &str, replacement: &str, regex: bool, whole_word: bool) -> (String, String) {
+	let raw = if regex {
+		query.to_string()
+	} else {
+		regex_syntax::escape(query)
+	};
+	let pattern = if whole_word { format!(r"\b(?:{raw})\b") } else { raw };
+	let replacement = if regex {
+		replacement.to_string()
+	} else {
+		replacement.replace('$', "$$")
+	};
+	(pattern, replacement)
+}
+
+fn build_replace_regex(pattern: &str, case_sensitive: bool) -> MoonResult<Regex> {
+	let body = if case_sensitive {
+		pattern.to_string()
+	} else {
+		format!("(?i){pattern}")
+	};
+	Regex::new(&body).map_err(|e| MoonError::invalid(format!("invalid regex: {e}")))
+}
+
+fn file_contains_match(matcher: &RegexMatcher, path: &std::path::Path) -> bool {
+	// Reuse the grep-searcher pipeline used by `search_content` so
+	// the "is there a hit?" decision is byte-identical to what the
+	// preview UI just showed. `found` flips on the first match and
+	// the sink returns `false` to short-circuit the rest of the
+	// file — for big files with an early match this is much
+	// cheaper than reading the whole thing twice.
+	let mut found = false;
+	let sink = UTF8(|_line, _line_text| {
+		found = true;
+		Ok(false)
+	});
+	let mut searcher = Searcher::new();
+	let _ = searcher.search_path(matcher, path, sink);
+	found
+}
+
+/// `Regex::replace_all` doesn't expose a count of substitutions
+/// without a second pass. We do the second pass cheaply via
+/// `find_iter` and lean on `replace_all` for the actual rewrite —
+/// both are linear in the input length, and we only do them for
+/// files the prefilter has already confirmed contain ≥1 match.
+fn regex_replace_all_counted(re: &Regex, hay: &str, replacement: &str) -> (String, usize) {
+	let count = re.find_iter(hay).count();
+	let rewritten = re.replace_all(hay, replacement).into_owned();
+	(rewritten, count)
 }
 
 #[cfg(test)]
@@ -533,6 +706,184 @@ mod tests {
 		};
 		let r = search_content(&root(&dir), &opts).unwrap();
 		assert_eq!(r.hits.len(), 1);
+	}
+
+	#[test]
+	fn replace_content_rewrites_matching_files_in_place() {
+		let dir = TempDir::new().unwrap();
+		std::fs::write(dir.path().join("a.txt"), "foo bar foo\nbaz\n").unwrap();
+		std::fs::write(dir.path().join("b.txt"), "no match here\n").unwrap();
+
+		let opts = ContentReplaceOptions {
+			query: "foo".into(),
+			replacement: "qux".into(),
+			..Default::default()
+		};
+		let r = replace_content(&root(&dir), &opts).unwrap();
+		assert_eq!(r.files_changed, 1);
+		assert_eq!(r.replacements, 2);
+		assert!(r.errors.is_empty());
+		assert_eq!(
+			std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+			"qux bar qux\nbaz\n"
+		);
+		assert_eq!(
+			std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+			"no match here\n"
+		);
+	}
+
+	#[test]
+	fn replace_content_skips_no_op_writes() {
+		// If the replacement equals the matched text, we should not
+		// touch the file at all — `files_changed` stays at 0 so the
+		// UI doesn't claim work happened when the bytes on disk
+		// would be identical.
+		let dir = TempDir::new().unwrap();
+		std::fs::write(dir.path().join("a.txt"), "alpha beta\n").unwrap();
+		let mtime_before = std::fs::metadata(dir.path().join("a.txt")).unwrap().modified().unwrap();
+		std::thread::sleep(std::time::Duration::from_millis(10));
+
+		let opts = ContentReplaceOptions {
+			query: "alpha".into(),
+			replacement: "alpha".into(),
+			..Default::default()
+		};
+		let r = replace_content(&root(&dir), &opts).unwrap();
+		assert_eq!(r.files_changed, 0);
+		assert_eq!(r.replacements, 0);
+		let mtime_after = std::fs::metadata(dir.path().join("a.txt")).unwrap().modified().unwrap();
+		assert_eq!(mtime_before, mtime_after, "no-op replace must not touch mtime");
+	}
+
+	#[test]
+	fn replace_content_plain_text_treats_dollar_sign_literally() {
+		// In plain-text mode the user types `$1` to mean the
+		// literal string `$1` — not a regex backreference. The
+		// pre-escape (`$` → `$$`) in `build_replace_pattern` is
+		// what makes this work; the test guards the contract from
+		// future regressions.
+		let dir = TempDir::new().unwrap();
+		std::fs::write(dir.path().join("a.txt"), "before\n").unwrap();
+
+		let opts = ContentReplaceOptions {
+			query: "before".into(),
+			replacement: "$1 after".into(),
+			..Default::default()
+		};
+		let r = replace_content(&root(&dir), &opts).unwrap();
+		assert_eq!(r.files_changed, 1);
+		assert_eq!(r.replacements, 1);
+		assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "$1 after\n");
+	}
+
+	#[test]
+	fn replace_content_regex_mode_expands_backreferences() {
+		let dir = TempDir::new().unwrap();
+		std::fs::write(dir.path().join("a.txt"), "hello world\n").unwrap();
+
+		let opts = ContentReplaceOptions {
+			query: r"(\w+) (\w+)".into(),
+			replacement: "$2 $1".into(),
+			regex: true,
+			..Default::default()
+		};
+		let r = replace_content(&root(&dir), &opts).unwrap();
+		assert_eq!(r.files_changed, 1);
+		assert_eq!(r.replacements, 1);
+		assert_eq!(
+			std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+			"world hello\n"
+		);
+	}
+
+	#[test]
+	fn replace_content_respects_whole_word_toggle() {
+		let dir = TempDir::new().unwrap();
+		std::fs::write(dir.path().join("a.txt"), "print here\nprintln also\nimprinted\n").unwrap();
+
+		let opts = ContentReplaceOptions {
+			query: "print".into(),
+			replacement: "log".into(),
+			whole_word: true,
+			..Default::default()
+		};
+		let r = replace_content(&root(&dir), &opts).unwrap();
+		assert_eq!(r.files_changed, 1);
+		assert_eq!(r.replacements, 1);
+		assert_eq!(
+			std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+			"log here\nprintln also\nimprinted\n"
+		);
+	}
+
+	#[test]
+	fn replace_content_respects_include_glob_scope() {
+		let dir = TempDir::new().unwrap();
+		std::fs::create_dir_all(dir.path().join("src")).unwrap();
+		std::fs::create_dir_all(dir.path().join("vendor")).unwrap();
+		std::fs::write(dir.path().join("src/a.txt"), "todo\n").unwrap();
+		std::fs::write(dir.path().join("vendor/b.txt"), "todo\n").unwrap();
+
+		let opts = ContentReplaceOptions {
+			query: "todo".into(),
+			replacement: "done".into(),
+			include_glob: Some("src".into()),
+			..Default::default()
+		};
+		let r = replace_content(&root(&dir), &opts).unwrap();
+		assert_eq!(r.files_changed, 1);
+		assert_eq!(std::fs::read_to_string(dir.path().join("src/a.txt")).unwrap(), "done\n");
+		assert_eq!(
+			std::fs::read_to_string(dir.path().join("vendor/b.txt")).unwrap(),
+			"todo\n"
+		);
+	}
+
+	#[test]
+	fn replace_content_skips_dot_git_directory() {
+		// `.git/` is excluded for the same reason `search_content`
+		// skips it: we never want a refactor to rewrite pack files
+		// or refs. Mirror of `content_search_skips_dot_git_directory`.
+		let dir = TempDir::new().unwrap();
+		std::fs::create_dir_all(dir.path().join(".git/logs")).unwrap();
+		std::fs::write(dir.path().join(".git/logs/HEAD"), "needle\n").unwrap();
+		std::fs::write(dir.path().join("README.md"), "needle\n").unwrap();
+
+		let opts = ContentReplaceOptions {
+			query: "needle".into(),
+			replacement: "haystack".into(),
+			..Default::default()
+		};
+		let r = replace_content(&root(&dir), &opts).unwrap();
+		assert_eq!(r.files_changed, 1);
+		assert_eq!(
+			std::fs::read_to_string(dir.path().join(".git/logs/HEAD")).unwrap(),
+			"needle\n"
+		);
+		assert_eq!(
+			std::fs::read_to_string(dir.path().join("README.md")).unwrap(),
+			"haystack\n"
+		);
+	}
+
+	#[test]
+	fn replace_content_empty_query_is_a_no_op() {
+		// `query.trim().is_empty()` short-circuits the walker — no
+		// reads, no writes, no errors. The "what if I leave the
+		// search box blank?" panic case.
+		let dir = TempDir::new().unwrap();
+		std::fs::write(dir.path().join("a.txt"), "anything\n").unwrap();
+		let opts = ContentReplaceOptions {
+			query: "   ".into(),
+			replacement: "x".into(),
+			..Default::default()
+		};
+		let r = replace_content(&root(&dir), &opts).unwrap();
+		assert_eq!(r.files_changed, 0);
+		assert_eq!(r.replacements, 0);
+		assert!(r.errors.is_empty());
+		assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "anything\n");
 	}
 
 	#[test]

@@ -1,6 +1,9 @@
 use camino::Utf8Path;
 use moon_core::search;
-use moon_protocol::search::{ContentSearchOptions, ContentSearchResult, FileSearchOptions, FileSearchResult};
+use moon_protocol::search::{
+	ContentReplaceOptions, ContentReplaceResult, ContentSearchOptions, ContentSearchResult, FileSearchOptions,
+	FileSearchResult,
+};
 use moon_protocol::MoonError;
 use tauri::State;
 
@@ -32,4 +35,16 @@ pub async fn search_content(
 	tokio::task::spawn_blocking(move || search::search_content(Utf8Path::new(&root), &options))
 		.await
 		.map_err(|e| MoonError::Internal(format!("search task crashed: {e}")))?
+}
+
+#[tauri::command]
+pub async fn search_replace_content(
+	state: State<'_, AppState>,
+	options: ContentReplaceOptions,
+) -> Result<ContentReplaceResult, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	let root = entry.folder.path.clone();
+	tokio::task::spawn_blocking(move || search::replace_content(Utf8Path::new(&root), &options))
+		.await
+		.map_err(|e| MoonError::Internal(format!("replace task crashed: {e}")))?
 }

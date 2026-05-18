@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { applyEditsToText } from './lspRename';
+import { applyEditsToText } from './lspApplyEdits';
 import type { LspTextEdit } from '../protocol';
 
 function edit(startLine: number, startChar: number, endLine: number, endChar: number, newText: string): LspTextEdit {

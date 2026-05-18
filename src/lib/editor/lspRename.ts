@@ -36,10 +36,13 @@ import { Prec, StateEffect, StateField } from '@codemirror/state';
 import { EditorView, keymap, showPanel, type Panel } from '@codemirror/view';
 import { ipc } from '../ipc';
 import { workspace } from '../state.svelte';
-import type { LspPosition, LspTextEdit, LspWorkspaceEdit } from '../protocol';
+import type { LspPosition, LspWorkspaceEdit } from '../protocol';
 import { filePathFacet } from './lsp';
 import { lspLanguageFor } from './lspLanguage';
 import { applyWorkspaceEdit } from './lspWorkspaceEdit';
+import { applyEditsToText } from './lspApplyEdits';
+
+export { applyEditsToText };
 
 /**
  * State payload while the rename input is open. `null` means
@@ -211,54 +214,6 @@ function formatErr(err: unknown): string {
 		return err.message;
 	}
 	return String(err);
-}
-
-/**
- * Apply a server's `LspTextEdit[]` to `original`. Edits inside
- * one document never overlap per the LSP spec, so we sort
- * descending by start position and slice in-place — earlier
- * offsets aren't affected by later replacements.
- */
-export function applyEditsToText(original: string, edits: readonly LspTextEdit[]): string {
-	const lineStarts = lineStartsOf(original);
-	const sorted = edits.toSorted((a, b) => {
-		if (a.range.start.line !== b.range.start.line) {
-			return b.range.start.line - a.range.start.line;
-		}
-		return b.range.start.character - a.range.start.character;
-	});
-	let text = original;
-	for (const edit of sorted) {
-		const from = offsetForPosition(original.length, lineStarts, edit.range.start);
-		const to = offsetForPosition(original.length, lineStarts, edit.range.end);
-		text = text.slice(0, from) + edit.newText + text.slice(to);
-	}
-	return text;
-}
-
-function lineStartsOf(text: string): number[] {
-	const starts: number[] = [0];
-	for (let i = 0; i < text.length; i++) {
-		// Codepoint 10 (`\n`) is the only line terminator LSP
-		// positions are spec'd against. Servers normalise
-		// `\r\n` to `\n` when computing positions; we mirror
-		// that by ignoring `\r`.
-		if (text.charCodeAt(i) === 10) {
-			starts.push(i + 1);
-		}
-	}
-	return starts;
-}
-
-function offsetForPosition(textLength: number, lineStarts: readonly number[], pos: LspPosition): number {
-	if (pos.line < 0) {
-		return 0;
-	}
-	const start = lineStarts[pos.line];
-	if (start === undefined) {
-		return textLength;
-	}
-	return start + pos.character;
 }
 
 /**

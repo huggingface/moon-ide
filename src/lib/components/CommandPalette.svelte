@@ -5,11 +5,13 @@
 		filterCommands,
 		runFileSearch,
 		runContentSearch,
+		runContentReplace,
 		type Command,
 	} from '../commands.svelte';
 	import { workspace } from '../state.svelte';
 
 	let inputEl: HTMLInputElement | undefined = $state();
+	let replaceInputEl: HTMLInputElement | undefined = $state();
 	let selected = $state(0);
 	let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -17,7 +19,20 @@
 	const commandList: Command[] = $derived.by(() => (palette.mode === 'commands' ? filterCommands(palette.query) : []));
 
 	$effect(() => {
-		if (palette.open && inputEl) {
+		if (!palette.open) {
+			return;
+		}
+		// `Replace in Files…` (Ctrl+Shift+H) flips `replaceOpen`
+		// *before* `show()` runs, so by the time this effect fires
+		// the input row is mounted — focus the replace box when
+		// the query is already pre-filled from a selection, else
+		// keep focus on the query so the user can type a needle.
+		if (palette.mode === 'search' && palette.replaceOpen && palette.query.length > 0 && replaceInputEl) {
+			replaceInputEl.focus();
+			replaceInputEl.select();
+			return;
+		}
+		if (inputEl) {
 			inputEl.focus();
 			inputEl.select();
 		}
@@ -150,6 +165,35 @@
 		}
 	}
 
+	// Enter inside the replace input triggers the replace, not the
+	// result-list activation — the user is mid-refactor and almost
+	// never wants to jump to the first preview hit at that point.
+	// Escape still closes the palette; arrows still walk the result
+	// list so the preview can be reviewed without leaving the
+	// replace field.
+	function onReplaceKey(event: KeyboardEvent) {
+		if (event.key === 'Escape') {
+			event.preventDefault();
+			palette.hide();
+			return;
+		}
+		if (event.key === 'ArrowDown') {
+			event.preventDefault();
+			selected = Math.min(selected + 1, Math.max(0, totalRows - 1));
+			return;
+		}
+		if (event.key === 'ArrowUp') {
+			event.preventDefault();
+			selected = Math.max(selected - 1, 0);
+			return;
+		}
+		if (event.key === 'Enter') {
+			event.preventDefault();
+			void runContentReplace();
+			return;
+		}
+	}
+
 	function onBackdrop(event: MouseEvent) {
 		if (event.target === event.currentTarget) {
 			palette.hide();
@@ -189,8 +233,18 @@
 					     on the same row as the input — they're small
 					     enough not to crowd the query, and they read as
 					     "options for *this* search" rather than as a
-					     separate toolbar. -->
+					     separate toolbar. The leading "replace" toggle
+					     opens / closes the replacement input row. -->
 					<div class="search-toggles" aria-label="Search options">
+						<button
+							type="button"
+							class="search-toggle"
+							class:active={palette.replaceOpen}
+							title={palette.replaceOpen ? 'Hide replace row' : 'Show replace row (Ctrl+Shift+H)'}
+							aria-label="Toggle replace row"
+							aria-pressed={palette.replaceOpen}
+							onclick={() => palette.toggleReplaceOpen()}>↻</button
+						>
 						<button
 							type="button"
 							class="search-toggle"
@@ -241,6 +295,36 @@
 						oninput={(e) => palette.setSearchInclude(e.currentTarget.value)}
 						onkeydown={onKey}
 					/>
+				</div>
+			{/if}
+			{#if palette.mode === 'search' && palette.replaceOpen}
+				<!-- Mass-replace row. Hidden by default so the common
+				     "find references" path stays a two-row layout;
+				     opens via the leading toggle in the search-options
+				     trio or via `Ctrl+Shift+H`. The `Replace All`
+				     button is the only commit path — Enter inside the
+				     replace input is a synonym for clicking it, so
+				     users with hands on the keyboard never need to
+				     reach for the mouse. -->
+				<div class="row">
+					<span class="prefix sub-prefix" aria-hidden="true">↻</span>
+					<input
+						bind:this={replaceInputEl}
+						type="text"
+						placeholder="Replace with…"
+						value={palette.replaceText}
+						oninput={(e) => palette.setReplaceText(e.currentTarget.value)}
+						onkeydown={onReplaceKey}
+					/>
+					<button
+						type="button"
+						class="replace-all"
+						disabled={palette.replaceRunning || palette.query.trim().length === 0}
+						title="Replace every match across the workspace"
+						onclick={() => void runContentReplace()}
+					>
+						{palette.replaceRunning ? 'Replacing…' : 'Replace All'}
+					</button>
 				</div>
 			{/if}
 			<ul class="results" role="listbox">
@@ -409,6 +493,41 @@
 	}
 	.search-toggle.active:hover {
 		filter: brightness(1.1);
+	}
+	/* Mass-replace commit button. Lives at the trailing edge of the
+	   replace row mirroring the toggle trio in the search row, so
+	   the two rows scan as "field, then the actions that operate on
+	   that field". Disabled state cancels the accent fill so a
+	   running replace doesn't read as "ready to fire again". */
+	.replace-all {
+		appearance: none;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		height: 22px;
+		padding: 0 10px;
+		border: 1px solid var(--m-accent);
+		border-radius: 4px;
+		background: var(--m-accent);
+		color: var(--m-bg);
+		font: inherit;
+		font-size: 11px;
+		line-height: 1;
+		cursor: pointer;
+		flex-shrink: 0;
+	}
+	.replace-all:hover:not(:disabled) {
+		filter: brightness(1.1);
+	}
+	.replace-all:focus-visible {
+		outline: 1px solid var(--m-accent);
+		outline-offset: 2px;
+	}
+	.replace-all:disabled {
+		background: transparent;
+		color: var(--m-fg-subtle);
+		border-color: var(--m-border);
+		cursor: default;
 	}
 	/* Path-include row sits flush under the query row. `.row`'s own
 	   `border-bottom` already provides the visual separator

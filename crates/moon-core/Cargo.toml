@@ -27,6 +27,7 @@ uuid = { version = "1.18", features = ["v4", "serde"] }
 grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
+regex = "1.12"
 regex-syntax = "0.8"
 lsp-types = { workspace = true }
 which = { workspace = true }

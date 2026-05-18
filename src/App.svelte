@@ -213,6 +213,25 @@
 				// VS Code / Cursor. The palette input auto-selects
 				// on focus so the user can immediately retype to
 				// replace, or just hit Enter to run the search.
+				// Force the replace row closed so the muscle-memory
+				// "open search" shortcut never lands on the wider
+				// refactor layout if a previous Ctrl+Shift+H left
+				// it open.
+				palette.setReplaceOpen(false);
+				palette.show('search', searchQueryFromSelection());
+				return;
+			}
+			if (event.shiftKey && key === 'h') {
+				// Mass replace across files. Same selection-prefill
+				// as Ctrl+Shift+F; the only difference is the
+				// replace row opens automatically and focuses the
+				// replacement input when the query is already
+				// populated (see CommandPalette.svelte's focus
+				// effect). Matches VS Code / IntelliJ's bindings so
+				// users coming from those tools don't have to
+				// re-learn it.
+				event.preventDefault();
+				palette.setReplaceOpen(true);
 				palette.show('search', searchQueryFromSelection());
 				return;
 			}

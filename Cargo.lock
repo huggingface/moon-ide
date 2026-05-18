@@ -2770,6 +2770,7 @@ dependencies = [
  "lsp-types",
  "moon-protocol",
  "notify",
+ "regex",
  "regex-syntax",
  "reqwest 0.12.28",
  "serde",

@@ -154,6 +154,26 @@ export type ContentSearchResult = {
 	truncated: boolean;
 };
 
+export type ContentReplaceOptions = {
+	query: string;
+	replacement: string;
+	case_sensitive?: boolean;
+	regex?: boolean;
+	whole_word?: boolean;
+	include_glob?: string | null;
+};
+
+export type ContentReplaceResult = {
+	files_changed: number;
+	replacements: number;
+	errors: ContentReplaceError[];
+};
+
+export type ContentReplaceError = {
+	path: string;
+	message: string;
+};
+
 /**
  * What the user picked in the theme switcher. `'system'` means
  * "follow the OS" and gets resolved to dark/light at render time

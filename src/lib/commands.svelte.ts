@@ -83,6 +83,18 @@ class PaletteState {
 	 *  "no scope filter". Bare paths like `src/lib` are normalised
 	 *  to `src/lib/**` server-side. */
 	searchInclude = $state('');
+	/** Mass-replace input. Empty string + `replaceOpen=false` keep
+	 *  the palette in plain search mode; flipping `replaceOpen` shows
+	 *  a second row + a "Replace All" button. We don't auto-show on
+	 *  Ctrl+Shift+F so the common "find references" use case still
+	 *  opens to the simplest layout — users opt in to refactor mode
+	 *  with the toggle button (or `Ctrl+H`). */
+	replaceOpen = $state(false);
+	replaceText = $state('');
+	/** Running a replace can block the UI for a couple of seconds on
+	 *  a large repo. The flag pumps a spinner + disables the button
+	 *  so users don't double-fire the same refactor. */
+	replaceRunning = $state(false);
 
 	show(mode: PaletteMode, initialQuery = '') {
 		this.mode = mode;
@@ -115,6 +127,18 @@ class PaletteState {
 
 	toggleSearchRegex() {
 		this.searchRegex = !this.searchRegex;
+	}
+
+	setReplaceText(value: string) {
+		this.replaceText = value;
+	}
+
+	setReplaceOpen(value: boolean) {
+		this.replaceOpen = value;
+	}
+
+	toggleReplaceOpen() {
+		this.replaceOpen = !this.replaceOpen;
 	}
 }
 
@@ -202,7 +226,27 @@ export const builtInCommands: Command[] = [
 		id: 'palette.searchInFiles',
 		title: 'Search in Files…',
 		shortcut: 'Ctrl+Shift+F',
-		run: () => palette.show('search', searchQueryFromSelection()),
+		run: () => {
+			// Plain "find in files" — close the replace row if a
+			// previous refactor session left it open, so the user
+			// who pressed Ctrl+Shift+F lands in the simplest layout.
+			palette.setReplaceOpen(false);
+			palette.show('search', searchQueryFromSelection());
+		},
+	},
+	{
+		id: 'palette.replaceInFiles',
+		title: 'Replace in Files…',
+		// VS Code / IntelliJ both put mass-replace on Ctrl+Shift+H,
+		// and the team is migrating from those tools — keep the
+		// muscle memory. Identical to "Search in Files" but opens
+		// with the replace row visible and the replace input
+		// focused.
+		shortcut: 'Ctrl+Shift+H',
+		run: () => {
+			palette.setReplaceOpen(true);
+			palette.show('search', searchQueryFromSelection());
+		},
 	},
 	{
 		id: 'git.switchBranch',
@@ -517,5 +561,100 @@ export async function runContentSearch(query: string) {
 		palette.contentResults = [];
 	} finally {
 		palette.loading = false;
+	}
+}
+
+/**
+ * Walk the active folder and apply `palette.replaceText` to every
+ * match of `palette.query` (with the same case / whole-word / regex
+ * / include-glob toggles as the preview). Two gates run before the
+ * write loop kicks off:
+ *
+ *   1. Confirm with the user. The match count is whatever the
+ *      preview last showed; we tell the user it's a lower bound
+ *      (the search list is capped at 200, the replace is not) so a
+ *      "Replace 200 matches" prompt doesn't lull them into thinking
+ *      that's an upper bound.
+ *   2. Flag any open buffer that's dirty *and* matches the include
+ *      filter — replacing on disk while the user has unsaved edits
+ *      means the next save would silently revert the refactor, the
+ *      single worst failure mode for this feature. We surface it as
+ *      a separate confirm so the user can save first if they want.
+ *
+ * On success the file watcher pipeline reloads open buffers; we
+ * just close the palette and flash a summary.
+ */
+export async function runContentReplace() {
+	if (!workspace.workspace) {
+		return;
+	}
+	const query = palette.query.trim();
+	if (query.length === 0) {
+		workspace.flash('Enter something to search for before replacing.');
+		return;
+	}
+	if (palette.replaceText === palette.query) {
+		workspace.flash('Replacement is identical to the query — nothing to do.');
+		return;
+	}
+
+	const include = palette.searchInclude.trim();
+	const previewCount = palette.contentResults.length;
+	const lowerBoundNote = palette.contentTruncated ? ' (or more — preview was capped)' : '';
+	const previewSuffix =
+		previewCount > 0 ? ` Preview matched ${previewCount} line${previewCount === 1 ? '' : 's'}${lowerBoundNote}.` : '';
+	const includeNote = include.length === 0 ? '' : `\nScope: ${include}`;
+	const ok = await confirm(
+		`Replace every "${palette.query}" with "${palette.replaceText}" across the workspace?${previewSuffix}${includeNote}`,
+		{ title: 'Replace in Files', okLabel: 'Replace All', cancelLabel: 'Cancel', kind: 'warning' },
+	);
+	if (!ok) {
+		return;
+	}
+
+	const dirtyHits = workspace.openFiles.filter(
+		(f) => f.isDirty && palette.contentResults.some((h) => h.path === f.path),
+	);
+	if (dirtyHits.length > 0) {
+		const list = dirtyHits
+			.map((f) => f.path)
+			.slice(0, 5)
+			.join(', ');
+		const extra = dirtyHits.length > 5 ? `, +${dirtyHits.length - 5} more` : '';
+		const proceed = await confirm(
+			`${dirtyHits.length} open file${dirtyHits.length === 1 ? ' has' : 's have'} unsaved changes (${list}${extra}). Replacing on disk now will discard them on the next reload. Continue?`,
+			{ title: 'Unsaved changes', okLabel: 'Replace anyway', cancelLabel: 'Cancel', kind: 'warning' },
+		);
+		if (!proceed) {
+			return;
+		}
+	}
+
+	palette.replaceRunning = true;
+	try {
+		const result = await ipc.search.replaceContent({
+			query: palette.query,
+			replacement: palette.replaceText,
+			case_sensitive: palette.searchCaseSensitive,
+			whole_word: palette.searchWholeWord,
+			regex: palette.searchRegex,
+			include_glob: include.length === 0 ? null : include,
+		});
+		const filePlural = result.files_changed === 1 ? 'file' : 'files';
+		const matchPlural = result.replacements === 1 ? 'replacement' : 'replacements';
+		const summary = `${result.replacements} ${matchPlural} across ${result.files_changed} ${filePlural}.`;
+		const firstErr = result.errors[0];
+		if (firstErr) {
+			workspace.flash(
+				`Replace done: ${summary} ${result.errors.length} error${result.errors.length === 1 ? '' : 's'} (${firstErr.path}: ${firstErr.message}).`,
+			);
+		} else {
+			workspace.flash(`Replace done: ${summary}`);
+		}
+		palette.hide();
+	} catch (err) {
+		workspace.flash(`Replace failed: ${formatError(err)}`);
+	} finally {
+		palette.replaceRunning = false;
 	}
 }

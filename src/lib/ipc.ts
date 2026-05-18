@@ -12,6 +12,8 @@ import type {
 	ProviderProbeResult,
 	RouterModel,
 	ContainerStatus,
+	ContentReplaceOptions,
+	ContentReplaceResult,
 	ContentSearchOptions,
 	ContentSearchResult,
 	DeviceCode,
@@ -161,6 +163,8 @@ export const ipc = {
 	search: {
 		files: (options: FileSearchOptions) => invoke<FileSearchResult[]>('search_files', { options }),
 		content: (options: ContentSearchOptions) => invoke<ContentSearchResult>('search_content', { options }),
+		replaceContent: (options: ContentReplaceOptions) =>
+			invoke<ContentReplaceResult>('search_replace_content', { options }),
 	},
 	appState: {
 		load: () => invoke<AppState>('app_state_load'),

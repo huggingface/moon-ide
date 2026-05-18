@@ -126,6 +126,7 @@ pub fn run() {
 			commands::fs::fs_branch_switch,
 			commands::search::search_files,
 			commands::search::search_content,
+			commands::search::search_replace_content,
 			commands::app_info::app_info,
 			commands::app_state::app_state_load,
 			commands::app_state::app_state_save,
