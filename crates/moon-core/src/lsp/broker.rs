@@ -72,6 +72,29 @@ pub struct LspBroker {
 	/// (`open` / `update` / `close` / `notify_files_changed` /
 	/// `refresh_open_diagnostics`) fan out here.
 	lint_servers: Mutex<HashMap<String, ServerSlot>>,
+	/// Per-language serialization for `ensure_server`. Without
+	/// this, concurrent callers (the startup tab-restore burst,
+	/// several files opening in the same paint frame, the
+	/// language server + linter co-tenant ensured by `open` for
+	/// the same buffer) can all observe an empty slot for the
+	/// same language id, race into `try_spawn_on`, and each
+	/// spawn a separate LSP child. Only the last to finish wins
+	/// the slot; the rest are orphaned but kept alive by their
+	/// own `Arc<LspServer>` handle until dropped, holding their
+	/// resident set (tsgo runs ~500 MB per project) and a stack
+	/// of file descriptors. A few unlucky races at startup are
+	/// enough to exhaust the host's fd budget — at which point
+	/// every subsequent spawn fails with `EMFILE`, the user sees
+	/// the IDE wedge under runaway CPU + memory, and recovery
+	/// requires killing the process.
+	///
+	/// We allocate one [`Mutex`] per language id on first sight
+	/// and hold it across the slot inspection + `try_spawn_on`
+	/// call. Different languages remain independent (TS won't
+	/// block Rust, oxlint won't block TS); the language server
+	/// and its linter co-tenant for the same buffer serialize
+	/// only against themselves.
+	spawn_locks: Mutex<HashMap<&'static str, Arc<Mutex<()>>>>,
 	events: broadcast::Sender<LspServerEvent>,
 	/// Diagnostic log sink. Receives the same status transitions
 	/// the `events` channel does, plus routing decisions
@@ -177,6 +200,7 @@ impl LspBroker {
 			fallback,
 			servers: Mutex::new(HashMap::new()),
 			lint_servers: Mutex::new(HashMap::new()),
+			spawn_locks: Mutex::new(HashMap::new()),
 			events,
 			log_sink,
 		})
@@ -258,6 +282,22 @@ impl LspBroker {
 	/// doesn't re-probe on every subsequent open.
 	async fn ensure_server(&self, spec: &LspBinarySpec) -> Result<Option<Arc<LspServer>>, LspClientError> {
 		let log_source = Self::log_source_for(spec.language_id);
+		// Serialize ensure_server calls **per language id**.
+		// Concurrent callers for the same language pile up here;
+		// the first one through inspects the slot, spawns if
+		// needed, and the rest then see a populated slot on the
+		// other side of the lock. Different languages have
+		// independent locks, so TS and Rust still spawn in
+		// parallel. See `spawn_locks`' field doc for the why.
+		let spawn_lock = {
+			let mut locks = self.spawn_locks.lock().await;
+			locks
+				.entry(spec.language_id)
+				.or_insert_with(|| Arc::new(Mutex::new(())))
+				.clone()
+		};
+		let _spawn_guard = spawn_lock.lock().await;
+
 		let slot_map = self.slot_map_for(spec);
 		{
 			let mut servers = slot_map.lock().await;

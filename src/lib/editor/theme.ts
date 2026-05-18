@@ -96,24 +96,42 @@ function moonTheme(dark: boolean): Extension {
 				maxWidth: '60ch',
 				padding: '0',
 			},
+			// CM ships the diagnostic as a flat `<li>` with the
+			// message span and the action buttons as siblings, so
+			// the buttons flow inline after the prose. Treat the
+			// `<li>` as a flex-wrap row and force the text + source
+			// rows to take 100% width — the action buttons end up
+			// in their own row below the message, wrapping
+			// naturally when there are more than fit on one line.
 			'.cm-diagnostic': {
+				display: 'flex',
+				flexWrap: 'wrap',
+				alignItems: 'center',
+				gap: '6px',
 				padding: '6px 8px',
 				fontSize: '12px',
 				lineHeight: '1.45',
 			},
+			'.cm-diagnosticText': {
+				flexBasis: '100%',
+			},
+			'.cm-diagnosticSource': {
+				flexBasis: '100%',
+			},
 			// Quick-fix buttons (LSP code actions + our "Fix in
 			// coder" entry). CM's default is a barely-visible
 			// borderless button; pin it to our accent surface so
-			// the user can tell it's interactive at a glance.
+			// the user can tell it's interactive at a glance. We
+			// lean on the parent `.cm-diagnostic`'s `gap` for
+			// spacing instead of margins so the row stays tidy
+			// even when buttons wrap.
 			'.cm-diagnosticAction': {
 				backgroundColor: 'var(--m-bg-3)',
 				color: 'var(--m-fg)',
 				border: '1px solid var(--m-border)',
 				borderRadius: '4px',
 				padding: '2px 8px',
-				marginLeft: '0',
-				marginRight: '6px',
-				marginTop: '6px',
+				margin: '0',
 				fontSize: '11px',
 				cursor: 'pointer',
 			},

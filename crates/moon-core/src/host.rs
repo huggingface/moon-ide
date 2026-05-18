@@ -526,23 +526,15 @@ impl LocalHost {
 	///
 	/// Every miss path is logged inside [`crate::format::run_formatter`].
 	///
-	/// **TODO (chain truncation)**: when the matched lint-staged rule
-	/// has more than one command, only the **last** one runs.
-	/// moon-landing's `*.{js,mjs,ts,svelte}` chain pairs
-	/// `node scripts/lint.ts --fix` with `prettier -w` and the node
-	/// step is too slow to run on every save. Once that script is
-	/// sped up this flips to "run the whole chain". A
-	/// `tracing::warn!` once per process per truncated chain length
-	/// keeps the deviation visible. The language-default layer never
-	/// has a chain (one command per extension) so the caveat doesn't
-	/// apply to it.
-	///
-	/// When the flip happens, the chain runs **all** commands and
-	/// **does not** abort on the first non-zero exit / timeout (unlike
-	/// `bun run lint-staged` on commit). format-on-save is best-effort:
-	/// if `eslint --fix` times out we still want `prettier -w` to run.
-	/// Each failure logs its own warning; the next command in the
-	/// chain spawns regardless. See ADR 0013 § Chain-truncation caveat.
+	/// **Chain semantics**: when the matched lint-staged rule has more
+	/// than one command, **every** command in the chain runs in order.
+	/// Unlike `bun run lint-staged` on commit, format-on-save **does
+	/// not** abort on the first non-zero exit / timeout / spawn error
+	/// — each command's failure logs its own warning and the next one
+	/// spawns regardless. The rationale: format-on-save is best-effort
+	/// by design, and a flaky linter must not stop the trailing
+	/// `prettier -w` from reaching the file the user just saved.
+	/// See ADR 0013 § Chain semantics.
 	///
 	/// Returns `true` when a command ran (whether successfully or not —
 	/// either way the on-disk bytes may have changed and the caller
@@ -625,42 +617,41 @@ impl LocalHost {
 			});
 			return false;
 		};
-		// Until the chain-truncation TODO on `run_formatter_chain` lifts,
-		// only the last command runs. `last()` matches the team's current
-		// configs (the formatter is the last entry; the linter is
-		// before it), so dropping the prefix is the smallest change
-		// that gets format-on-save working again on `moon-landing/server`.
 		let total = commands.len();
-		let Some(cmd) = commands.last() else {
+		if total == 0 {
 			return false;
-		};
-		if total > 1 {
-			warn_chain_truncated_once(total);
 		}
 		// `config_dir` is `Some` whenever `match_commands` returned a
 		// hit (the rule came from a real file on disk); the workspace
 		// root is just a defensive fallback the type system asks for.
 		let cwd = rules.config_dir().unwrap_or(&self.root).to_path_buf();
-		self.format_log(crate::logs::LogLevel::Info, || {
-			let trunc_note = if total > 1 {
-				format!(" (chain has {total} commands; only the last runs — see TODO in run_formatter_chain)")
+		// Run every command in the chain in order. Failures don't
+		// abort: format-on-save is best-effort, and a flaky linter
+		// must not stop the trailing `prettier -w` (or equivalent)
+		// from reaching the file the user just saved. See
+		// ADR 0013 § Chain semantics.
+		for (idx, cmd) in commands.iter().enumerate() {
+			self.format_log(crate::logs::LogLevel::Info, || {
+				let step = if total > 1 {
+					format!(" (step {}/{total})", idx + 1)
+				} else {
+					String::new()
+				};
+				format!("lint-staged: running `{cmd}` in {cwd}{step}")
+			});
+			let started = std::time::Instant::now();
+			let ok = format::run_formatter(&self.root, &cwd, abs, cmd, target).await;
+			let elapsed_ms = started.elapsed().as_millis();
+			let outcome_level = if ok {
+				crate::logs::LogLevel::Info
 			} else {
-				String::new()
+				crate::logs::LogLevel::Warn
 			};
-			format!("lint-staged: running `{cmd}` in {cwd}{trunc_note}")
-		});
-		let started = std::time::Instant::now();
-		let ok = format::run_formatter(&self.root, &cwd, abs, cmd, target).await;
-		let elapsed_ms = started.elapsed().as_millis();
-		let outcome_level = if ok {
-			crate::logs::LogLevel::Info
-		} else {
-			crate::logs::LogLevel::Warn
-		};
-		self.format_log(outcome_level, || {
-			let verb = if ok { "succeeded" } else { "failed (see warnings above)" };
-			format!("lint-staged: `{cmd}` {verb} in {elapsed_ms}ms")
-		});
+			self.format_log(outcome_level, || {
+				let verb = if ok { "succeeded" } else { "failed (see warnings above)" };
+				format!("lint-staged: `{cmd}` {verb} in {elapsed_ms}ms")
+			});
+		}
 		true
 	}
 
@@ -4082,25 +4073,6 @@ pub async fn read_host_file(path: &Utf8Path) -> MoonResult<ReadFileResult> {
 	})
 }
 
-/// One-shot warning when a lint-staged chain is truncated to its last
-/// command. See `LocalHost::run_formatter_chain` for the rationale and
-/// the TODO that flips this back to "run the whole chain". Deduped on
-/// chain length so a config that adds a third command later in life
-/// still surfaces a fresh warning.
-fn warn_chain_truncated_once(chain_len: usize) {
-	use std::collections::HashSet;
-	use std::sync::{Mutex, OnceLock};
-	static SEEN: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
-	let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
-	let mut guard = seen.lock().expect("chain-truncated warn cache poisoned");
-	if guard.insert(chain_len) {
-		tracing::warn!(
-			chain_len,
-			"format-on-save: lint-staged chain truncated to last command (temporary; see TODO in LocalHost::run_formatter_chain)"
-		);
-	}
-}
-
 /// Process-wide dedup for lint-staged parse-time warnings: returns
 /// `true` the first time a given warning string is seen, `false`
 /// afterwards. Lets the caller emit each distinct warning exactly
@@ -6174,20 +6146,21 @@ mod tests {
 		assert_eq!(result.bytes_written, on_disk.len() as u64);
 	}
 
-	/// Until the chain-truncation TODO in `run_formatter_chain` lifts,
-	/// only the **last** command in a chain runs. Earlier commands are
-	/// dropped on the floor — verified here by giving the first command
-	/// a script that would clobber the file with a marker, and the
-	/// last command a script that produces a different recognisable
-	/// shape. Update this test to assert "both ran in order" once the
-	/// TODO flips.
+	/// Every command in a chain runs in order, each seeing the previous
+	/// one's on-disk output. Verified by chaining a "prepend marker"
+	/// script and an "uppercase" script — only the combined output
+	/// (marker + uppercase'd input, all in upper case) is possible if
+	/// both ran in sequence.
 	#[cfg(unix)]
 	#[tokio::test]
-	async fn save_file_runs_only_last_command_in_chain() {
+	async fn save_file_runs_every_command_in_chain_in_order() {
 		let dir = TempDir::new().unwrap();
 		let h = host(&dir);
 
-		write_executable_script(&dir.path().join("first.sh"), "#!/bin/sh\nprintf 'first-ran' > \"$1\"\n");
+		write_executable_script(
+			&dir.path().join("first.sh"),
+			"#!/bin/sh\nprintf 'prefix:' > \"$1.tmp\" && cat \"$1\" >> \"$1.tmp\" && mv \"$1.tmp\" \"$1\"\n",
+		);
 		write_executable_script(
 			&dir.path().join("upper.sh"),
 			"#!/bin/sh\ntr '[:lower:]' '[:upper:]' < \"$1\" > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"\n",
@@ -6200,26 +6173,54 @@ mod tests {
 
 		h.save_file(Utf8Path::new("a.txt"), "hello world").await.unwrap();
 		let on_disk = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
-		// `upper.sh` ran on the editorconfig-normalised text, not on
-		// `first.sh`'s marker. If `first.sh` had run, the file would
-		// contain `first-ran` (or `FIRST-RAN` if it then went through
-		// `upper.sh`).
+		// `first.sh` prepended `prefix:`, then `upper.sh` ran on the
+		// combined output and upper-cased everything. The presence of
+		// `PREFIX:` proves the first command ran; `HELLO WORLD` proves
+		// the second ran after it on the prefixed bytes.
 		assert!(
-			on_disk.contains("HELLO WORLD"),
-			"expected upper.sh output, got: {on_disk:?}"
-		);
-		assert!(
-			!on_disk.to_lowercase().contains("first-ran"),
-			"first.sh should have been skipped, got: {on_disk:?}"
+			on_disk.contains("PREFIX:HELLO WORLD"),
+			"expected both scripts to run in order, got: {on_disk:?}"
 		);
 	}
 
-	/// Failure of the (only-run) last command is non-fatal: the
+	/// A failing command mid-chain doesn't abort the rest: the trailing
+	/// formatter still runs on whatever bytes are on disk. Verified by
+	/// chaining a failing script (which leaves the file untouched) and
+	/// an "uppercase" formatter; the file should land upper-cased even
+	/// though the first step exited non-zero.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn save_file_chain_continues_past_failing_command() {
+		let dir = TempDir::new().unwrap();
+		let h = host(&dir);
+
+		write_executable_script(&dir.path().join("fail.sh"), "#!/bin/sh\nexit 1\n");
+		write_executable_script(
+			&dir.path().join("upper.sh"),
+			"#!/bin/sh\ntr '[:lower:]' '[:upper:]' < \"$1\" > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"\n",
+		);
+		std::fs::write(
+			dir.path().join(".lintstagedrc.json"),
+			r#"{ "*.txt": ["./fail.sh", "./upper.sh"] }"#,
+		)
+		.unwrap();
+
+		h.save_file(Utf8Path::new("a.txt"), "hello world").await.unwrap();
+		let on_disk = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
+		// `upper.sh` ran after `fail.sh` exited 1, so the bytes are
+		// the editorconfig-normalised input upper-cased.
+		assert!(
+			on_disk.contains("HELLO WORLD"),
+			"expected upper.sh to run after fail.sh, got: {on_disk:?}"
+		);
+	}
+
+	/// Failure of a single (non-chained) command is non-fatal: the
 	/// editorconfig-normalised bytes stay on disk and save still
 	/// returns success.
 	#[cfg(unix)]
 	#[tokio::test]
-	async fn save_file_keeps_normalised_text_when_last_command_fails() {
+	async fn save_file_keeps_normalised_text_when_command_fails() {
 		let dir = TempDir::new().unwrap();
 		let h = host(&dir);
 

@@ -302,41 +302,40 @@ adding a row never overrides an explicit lint-staged config (lint-staged
 matches first). Removing a row stops the fallback for that extension
 without affecting any team config.
 
-### Chain-truncation caveat (current state, 2026-05-07)
+### Chain semantics (current state, 2026-05-18)
 
-The intended end state is "run every command in the matched chain in
-order". The current implementation in `LocalHost::run_formatter_chain`
-ships a deliberately-narrowed version: **only the last command in the
-chain runs** when the chain has more than one entry. That keeps
-moon-landing's `*.{js,mjs,ts,svelte}` chain
-(`node scripts/lint.ts --fix`, then `prettier -w`) usable on every
-save: `prettier -w` runs, the slow `node` script doesn't. A
-`tracing::warn!` deduped per chain length fires once per process so
-the deviation is visible in logs.
+`LocalHost::run_lint_staged_chain_for` runs **every** command in the
+matched chain in order. Each command sees the previous one's output via
+the on-disk bytes — same shape `bun run lint-staged` itself uses on
+commit. moon-landing's `*.{js,mjs,ts,svelte}` chain
+(`node scripts/lint.ts --fix`, then `prettier -w`) now runs both steps
+on save, the way the team's commit pipeline already does.
 
-Flipping back to "run the whole chain" is a small change in
-`run_formatter_chain` plus a test rename — tracked by the explicit
-TODO in that function. The trigger is moon-landing's lint script
-becoming fast enough to live in a save-time pipeline.
+The earlier shipping behaviour ("only the last command runs", with a
+deduped truncation warning) is gone. It was a deliberately-narrow
+workaround for `moon-landing/server`'s slow `node scripts/lint.ts`
+step at format-on-save time; once the team's chains became fast enough
+to live in the save pipeline, keeping the workaround was strictly
+worse — chains with `eslint --fix` paired with `prettier -w` only ran
+the formatter and silently dropped the linter step.
 
-Single-command rules (the team's `.lintstagedrc.json` for the moon-ide
-repo itself, every other format-only entry) are unaffected: chain
-length 1 means nothing to truncate.
+Chains diverge from `bun run lint-staged`'s commit-time behaviour in
+one specific way: **save-time chains do not abort on the first non-zero
+exit / timeout / spawn error.** Every command in the chain runs
+regardless of earlier failures. The rationale is that format-on-save is
+best-effort by design — if `eslint --fix` times out, we still want
+`prettier -w` to run on the file the user is saving. The same
+disposition we already apply to a single failing command (log, keep
+the editorconfig-normalised bytes) extends naturally to chains: each
+command's failure logs its own `tracing::warn!`; subsequent commands
+keep going. lint-staged's commit-time abort-on-failure makes sense for
+"block the commit until the team fixes it"; save-time has no commit to
+block, so the cost of stopping mid-chain is "the team's formatter
+doesn't run because something else failed first", which is worse than
+"two warnings instead of one in the dev log".
 
-When the flip happens it diverges from `bun run lint-staged`'s
-commit-time behaviour in one specific way: **chains do not abort on the
-first non-zero exit / timeout / spawn error.** Every command in the
-chain runs regardless of earlier failures. The rationale is that
-format-on-save is best-effort by design — if `eslint --fix` times out,
-we still want `prettier -w` to run on the file the user is saving. The
-same disposition we already apply to a single failing command (log,
-keep the editorconfig-normalised bytes) extends naturally to chains:
-each command's failure logs its own `tracing::warn!`; subsequent
-commands keep going. lint-staged's commit-time abort-on-failure makes
-sense for "block the commit until the team fixes it"; save-time has no
-commit to block, so the cost of stopping mid-chain is "the team's
-formatter doesn't run because something else failed first", which is
-worse than "two warnings instead of one in the dev log".
+Single-command rules (chain length 1) are unaffected — the loop just
+runs once.
 
 ### New flow
 
@@ -394,18 +393,19 @@ lint-staged itself use. Effects:
 
 Format-on-save is best-effort by design (`save_file` must always land
 the bytes). Any of these collapses to a `tracing::warn!` and the chain
-either aborts (for `failed` commands inside the chain) or skips
-(when nothing matched):
+**continues** to the next command (see § Chain semantics above for the
+rationale); when nothing matched the chain is skipped entirely:
 
 - **Binary not found.** `Command::spawn` returns `ErrorKind::NotFound`.
   Logged once per tool name (deduped per process) as
   `format-on-save: tool not found in node_modules/.bin or $PATH; skipping`.
+  Next command in the chain still spawns.
 - **Non-zero exit.** Logged with the tool name, exit status, and a
-  trimmed `stderr`. Chain aborts; subsequent commands don't run.
+  trimmed `stderr`. Next command in the chain still spawns.
 - **Spawn error other than NotFound.** Logged with the underlying
-  `io::Error`. Chain aborts.
-- **5-second timeout.** Hardcoded; logged with the tool name. Chain
-  aborts.
+  `io::Error`. Next command in the chain still spawns.
+- **5-second timeout.** Hardcoded; logged with the tool name. Next
+  command in the chain still spawns.
 
 The editorconfig pre-save pass already wrote bytes to disk before any
 of this fired, so the worst-case file state is "editorconfig-normalised
@@ -420,13 +420,13 @@ both of which are recoverable on the next save.
 - `resolve_binary` + `find_node_modules_bin` (replaced by PATH-prepend).
 - `LintStagedRules::match_command` (singular, returned the first command
   of the first match) — replaced by `match_commands` (plural, returns
-  the whole chain). The host caller is responsible for chain-handling
-  policy (today: "run only the last", per the caveat above).
+  the whole chain). The host caller runs every command in order, never
+  aborting on failure (see § Chain semantics).
 - The `format-on-save: only the first command in a lint-staged chain
-runs` warning (which fired on the team's `moon-landing/server` config).
-  Replaced by a deduped
-  `format-on-save: lint-staged chain truncated to last command` warning
-  while the truncation caveat is in force.
+runs` warning (which fired on the team's `moon-landing/server` config),
+  along with the later `format-on-save: lint-staged chain truncated to
+last command` warning that briefly replaced it. The chain runs in full
+  now; both are unreachable.
 - The `format-on-save: unsupported tool; skipping` warning (now an
   unreachable case — every command is "supported" because there's no
   allow-list).
