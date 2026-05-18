@@ -40,6 +40,7 @@
 	import { ipc } from '../ipc';
 	import { formatError } from '../protocol';
 	import { textInputUndo } from '../actions/textInputUndo';
+	import { isReviewPath } from '../util/reviewPath';
 	import BranchIcon from './icons/BranchIcon.svelte';
 	import MergeIcon from './icons/MergeIcon.svelte';
 	import PullRequestIcon from './icons/PullRequestIcon.svelte';
@@ -729,12 +730,19 @@
 				{#if changeCount > 0}
 					{@const isDefault = workspace.compareBaseline === 'default'}
 					{@const reviewBaselineLabel = isDefault && compareLabel !== null ? compareLabel : 'HEAD'}
+					{@const reviewActive = workspace.activePath !== null && isReviewPath(workspace.activePath)}
 					<button
 						type="button"
 						class="icon-btn"
-						title={`Open aggregated diff against ${reviewBaselineLabel}`}
-						aria-label={`Open aggregated diff against ${reviewBaselineLabel}`}
-						onclick={() => workspace.openReviewTab()}
+						class:active={reviewActive}
+						title={reviewActive
+							? 'Close review (jump to file under cursor)'
+							: `Open aggregated diff against ${reviewBaselineLabel}`}
+						aria-label={reviewActive
+							? 'Close review (jump to file under cursor)'
+							: `Open aggregated diff against ${reviewBaselineLabel}`}
+						aria-pressed={reviewActive}
+						onclick={() => void workspace.toggleReviewTab()}
 					>
 						<ReviewIcon />
 					</button>
@@ -1054,6 +1062,19 @@
 	.icon-btn:disabled {
 		opacity: 0.4;
 		cursor: not-allowed;
+	}
+	/* Pressed/toggled icon: the review button is the only caller
+	   today, but the rule is generic so the next toggleable icon
+	   in this panel inherits it for free. Match the accent fill
+	   we use on `.compare-pill.active` so the two stay visually
+	   consistent. */
+	.icon-btn.active {
+		background: color-mix(in srgb, var(--m-accent) 18%, transparent);
+		color: var(--m-accent);
+	}
+	.icon-btn.active:hover:not(:disabled) {
+		background: color-mix(in srgb, var(--m-accent) 26%, transparent);
+		color: var(--m-accent);
 	}
 	/* Destructive icon — revert / discard / delete. Hover reveals
 	   the danger color so the user gets a "this is destructive"

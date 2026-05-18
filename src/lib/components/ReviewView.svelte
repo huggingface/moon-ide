@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onDestroy, onMount } from 'svelte';
 	import { workspace } from '../state.svelte';
 	import ReviewSection from './ReviewSection.svelte';
 	import type { GitStatusEntry } from '../protocol';
@@ -13,9 +13,25 @@
 
 	// Pull focus to the scroll container on mount so the keyboard
 	// shortcuts (`n` / `p` / Alt-Arrow) start working without the
-	// user having to click into the page first.
+	// user having to click into the page first. Seed the workspace
+	// "currently visible" pointer too: the review button's toggle
+	// behaviour needs *something* to jump to even before the user
+	// has scrolled, and the first entry is a sensible default.
 	onMount(() => {
 		scroller?.focus({ preventScroll: true });
+		updateVisibleFile();
+	});
+
+	// The pointer is only meaningful while the review pane is
+	// mounted. Clearing on destroy means closing the tab through
+	// any other route (tab-strip close, pane teardown on folder
+	// switch, …) leaves the workspace state honest.
+	onDestroy(() => {
+		workspace.reviewVisibleFile = null;
+		if (scrollFrame !== 0) {
+			cancelAnimationFrame(scrollFrame);
+			scrollFrame = 0;
+		}
 	});
 
 	// Filter ignored rows out — same vocabulary as `scmFilterPaths`.
@@ -79,6 +95,45 @@
 		}
 		scrollTo(req.path);
 	});
+
+	// Re-evaluate the visible-file pointer when the entry list
+	// changes — git refresh, baseline toggle, etc. — so the
+	// review-icon's "back to file" jump never points at a row
+	// the user can no longer see. Funnel through `onScroll` so
+	// the rAF gate coalesces with any actual scrolling that
+	// might happen in the same frame.
+	$effect(() => {
+		void entries;
+		onScroll();
+	});
+
+	// rAF-coalesced scroll → visible-section tracker. Scroll fires
+	// at every frame; without the rAF gate we'd churn the workspace
+	// reactive state pointlessly. The handler also runs once on
+	// mount so the pointer is set before the user touches the
+	// scroller.
+	let scrollFrame = 0;
+	function updateVisibleFile() {
+		const list = entries;
+		if (list.length === 0) {
+			workspace.reviewVisibleFile = null;
+			return;
+		}
+		const idx = findNearestIndex();
+		const entry = list[idx];
+		if (entry !== undefined) {
+			workspace.reviewVisibleFile = entry.path;
+		}
+	}
+	function onScroll() {
+		if (scrollFrame !== 0) {
+			return;
+		}
+		scrollFrame = requestAnimationFrame(() => {
+			scrollFrame = 0;
+			updateVisibleFile();
+		});
+	}
 
 	// Keyboard nav between file sections. `n` / `p` mirror the
 	// terminal-pager convention; Alt-Down / Alt-Up are the GUI
@@ -166,6 +221,7 @@
 	role="region"
 	aria-label="Review changes"
 	onkeydown={onKeyDown}
+	onscroll={onScroll}
 >
 	<div class="banner">
 		<span class="title">Review changes</span>

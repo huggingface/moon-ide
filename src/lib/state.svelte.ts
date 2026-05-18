@@ -466,6 +466,14 @@ class WorkspaceState {
 	// reactive update and the second click would feel broken.
 	reviewScrollRequest = $state<{ path: string; tick: number } | null>(null);
 
+	// Whichever per-file diff section is currently centred in the
+	// Review changes pseudo-tab. `ReviewView` keeps this updated
+	// as the user scrolls; `toggleReviewTab` reads it on close to
+	// jump the user straight to that file's regular editor tab.
+	// `null` when no review tab is currently open or the review
+	// stack is empty.
+	reviewVisibleFile = $state<string | null>(null);
+
 	// Linear navigation history, browser-style but position-aware (each
 	// entry pins a caret inside a file rather than just a path).
 	//
@@ -3311,6 +3319,44 @@ class WorkspaceState {
 			this.setTabsFor(side, [...tabs, path]);
 		}
 		this.setActive(path, side);
+	}
+
+	/**
+	 * Toggle the Review changes pseudo-tab on the focused side.
+	 *
+	 * - Off → on: same as [`openReviewTab`].
+	 * - On  → off: jump to the file the user is currently looking
+	 *   at in the review stack (see [`reviewVisibleFile`]) — switch
+	 *   to its existing tab if one is open, or open a new one — then
+	 *   close the review tab. With no tracked visible file (empty
+	 *   review, no scroll yet) we fall back to a plain close, which
+	 *   leaves `closeFile`'s usual neighbour-pick to decide focus.
+	 *
+	 * The SCM panel's review button calls this on click; the same
+	 * button also flips its visual "pressed" state off the boolean
+	 * `isReviewPath(activePath)` reactively, so going to another
+	 * tab the regular way (clicking it in the tab strip) untoggles
+	 * the button without going through this method at all.
+	 */
+	async toggleReviewTab(side: SplitSide = this.focusedSide) {
+		const activeOnSide = side === 'left' ? this.leftActive : this.rightActive;
+		const reviewActive = activeOnSide !== null && isReviewPath(activeOnSide);
+		if (!reviewActive) {
+			this.openReviewTab(side);
+			return;
+		}
+		const target = this.reviewVisibleFile;
+		this.reviewVisibleFile = null;
+		if (target !== null && !isReviewPath(target)) {
+			const tabs = this.tabsFor(side);
+			if (tabs.includes(target)) {
+				this.setActive(target, side);
+				await this.closeFile(REVIEW_PATH, side);
+				return;
+			}
+			await this.openFile(target, side);
+		}
+		await this.closeFile(REVIEW_PATH, side);
 	}
 
 	async openFile(path: string, side: SplitSide = this.focusedSide, options: { focus?: boolean } = {}) {
