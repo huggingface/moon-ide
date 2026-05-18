@@ -76,6 +76,17 @@ fn normalise_include_glob(raw: &str) -> String {
 	format!("{trimmed}/**")
 }
 
+/// Upper bound on the number of file entries we'll score during a
+/// quick-open walk. The two-pass walker that surfaces gitignored
+/// top-level files (so `.env`, `.envrc`, … are reachable) can
+/// otherwise drag a chunky monorepo if a teammate has, say, a
+/// `.cache/` they forgot to ignore. The cap is on *visits*, not on
+/// matches — the top-K-by-score filter further down keeps the
+/// returned list short. 20k is comfortably above any real
+/// workspace we've seen, well below the point where the walk
+/// itself slows the palette down.
+const FILE_SEARCH_MAX_VISITS: usize = 20_000;
+
 pub fn search_files(root: &Utf8Path, opts: &FileSearchOptions) -> MoonResult<Vec<FileSearchResult>> {
 	let query = opts.query.trim().to_lowercase();
 	if query.is_empty() {
@@ -84,8 +95,18 @@ pub fn search_files(root: &Utf8Path, opts: &FileSearchOptions) -> MoonResult<Vec
 
 	let limit = opts.limit.clamp(1, 500);
 	let mut hits: Vec<FileSearchResult> = Vec::new();
+	let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-	let walker = WalkBuilder::new(root.as_std_path())
+	// Pass 1 — gitignore-respecting walk. Tracks every directory
+	// the walker enters; that set becomes the allow-list for the
+	// second pass below, so a gitignored *file* like `.env` at
+	// the root reaches the user, but a gitignored *folder* like
+	// `node_modules/` (and everything underneath it) does not.
+	//
+	// The walker happens to yield every tracked file along the
+	// way, so we collect those into the result list directly
+	// rather than re-walking them in pass 2.
+	let respectful = WalkBuilder::new(root.as_std_path())
 		.hidden(false)
 		.git_ignore(true)
 		.git_exclude(true)
@@ -93,33 +114,111 @@ pub fn search_files(root: &Utf8Path, opts: &FileSearchOptions) -> MoonResult<Vec
 		.overrides(build_overrides(root, None))
 		.build();
 
-	for entry in walker.flatten() {
+	let mut walked_dirs: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+	walked_dirs.insert(root.as_std_path().to_path_buf());
+
+	let mut visits = 0usize;
+	for entry in respectful.flatten() {
+		visits = visits.saturating_add(1);
+		if visits > FILE_SEARCH_MAX_VISITS {
+			break;
+		}
 		let path = entry.path();
+		if path.is_dir() {
+			walked_dirs.insert(path.to_path_buf());
+			continue;
+		}
 		if !path.is_file() {
 			continue;
 		}
-		let rel = match path.strip_prefix(root.as_std_path()) {
-			Ok(p) => p,
-			Err(_) => continue,
-		};
-		let rel_str = match rel.to_str() {
-			Some(s) => s,
-			None => continue,
-		};
-		let score = score_file(rel_str, &query);
-		if score <= FILE_SEARCH_MIN_SCORE {
-			continue;
-		}
-		hits.push(FileSearchResult {
-			path: rel_str.to_string(),
-			score,
-		});
+		score_and_collect(root, path, &query, &mut hits, &mut seen);
 	}
 
-	// Highest score first; ties broken by shorter path.
+	if visits <= FILE_SEARCH_MAX_VISITS {
+		// Pass 2 — same walker shape, but with `.gitignore` /
+		// `.ignore` switched **off** so files like `.env` /
+		// `coverage.xml` / `dist-types.d.ts` show up. The
+		// `filter_entry` predicate clamps the walk to directories
+		// pass 1 already entered, so we never descend into
+		// `node_modules/` (gitignored) even though its parent (the
+		// workspace root) was walked. Files directly under the
+		// root land in `walked_dirs` via the parent check, so a
+		// gitignored top-level file is reachable without dragging
+		// the gitignored tree it'd otherwise hide behind.
+		let walked_for_filter = walked_dirs.clone();
+		let inclusive = WalkBuilder::new(root.as_std_path())
+			.hidden(false)
+			.git_ignore(false)
+			.git_exclude(false)
+			.ignore(false)
+			.overrides(build_overrides(root, None))
+			.filter_entry(move |entry| {
+				let Some(ft) = entry.file_type() else {
+					return true;
+				};
+				if !ft.is_dir() {
+					return true;
+				}
+				walked_for_filter.contains(entry.path())
+			})
+			.build();
+
+		for entry in inclusive.flatten() {
+			visits = visits.saturating_add(1);
+			if visits > FILE_SEARCH_MAX_VISITS {
+				break;
+			}
+			let path = entry.path();
+			if !path.is_file() {
+				continue;
+			}
+			// Belt-and-braces — `filter_entry` already pruned
+			// gitignored subtrees, but check the parent against
+			// the allow-list too in case `filter_entry` ever lets
+			// a file through whose containing dir wasn't walked.
+			let Some(parent) = path.parent() else {
+				continue;
+			};
+			if !walked_dirs.contains(parent) {
+				continue;
+			}
+			score_and_collect(root, path, &query, &mut hits, &mut seen);
+		}
+	}
+
 	hits.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.path.len().cmp(&b.path.len())));
 	hits.truncate(limit);
 	Ok(hits)
+}
+
+/// Score a single file entry and push it onto `hits` if it scores
+/// above the cutoff. `seen` dedupes across the two-pass walk —
+/// pass 1 always yields tracked files first, so the pass-2 path
+/// never overwrites a higher score with an identical one.
+fn score_and_collect(
+	root: &Utf8Path,
+	path: &std::path::Path,
+	query: &str,
+	hits: &mut Vec<FileSearchResult>,
+	seen: &mut std::collections::HashSet<String>,
+) {
+	let Ok(rel) = path.strip_prefix(root.as_std_path()) else {
+		return;
+	};
+	let Some(rel_str) = rel.to_str() else {
+		return;
+	};
+	let score = score_file(rel_str, query);
+	if score <= FILE_SEARCH_MIN_SCORE {
+		return;
+	}
+	if !seen.insert(rel_str.to_string()) {
+		return;
+	}
+	hits.push(FileSearchResult {
+		path: rel_str.to_string(),
+		score,
+	});
 }
 
 /// A small fuzzy-ish scorer. Not as good as a real fuzzy matcher, but it
@@ -482,6 +581,84 @@ mod tests {
 		let r = search_content(&root(&dir), &opts).unwrap();
 		assert_eq!(r.hits.len(), 2);
 		assert!(!r.truncated);
+	}
+
+	#[test]
+	fn file_search_surfaces_gitignored_top_level_files() {
+		// `.env` (and friends) are routinely gitignored but the
+		// user still needs to reach them through Ctrl+P. The
+		// two-pass walker lets the file through while the rest of
+		// the gitignore stack (notably `node_modules/`) stays
+		// suppressed.
+		let dir = TempDir::new().unwrap();
+		std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+		std::fs::write(dir.path().join(".gitignore"), ".env\nnode_modules/\n").unwrap();
+		std::fs::write(dir.path().join(".env"), "SECRET=hunter2\n").unwrap();
+		std::fs::create_dir_all(dir.path().join("node_modules/lodash")).unwrap();
+		std::fs::write(dir.path().join("node_modules/lodash/.env"), "decoy\n").unwrap();
+		std::fs::write(dir.path().join("README.md"), "real\n").unwrap();
+
+		let opts = FileSearchOptions {
+			query: "env".into(),
+			limit: 50,
+		};
+		let hits = search_files(&root(&dir), &opts).unwrap();
+		assert!(
+			hits.iter().any(|h| h.path == ".env"),
+			"top-level .env should surface: {hits:?}"
+		);
+		assert!(
+			hits.iter().all(|h| !h.path.starts_with("node_modules/")),
+			"node_modules subtree must stay suppressed: {hits:?}"
+		);
+	}
+
+	#[test]
+	fn file_search_does_not_descend_into_gitignored_directories() {
+		// The two-pass walker still walks the *root* in pass 2,
+		// but the `filter_entry` predicate prunes the gitignored
+		// `target/` directory before its files reach the scorer.
+		// Without this, `cargo`-shaped repos would drown in
+		// `target/debug/...` entries.
+		let dir = TempDir::new().unwrap();
+		std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+		std::fs::write(dir.path().join(".gitignore"), "target/\n").unwrap();
+		std::fs::create_dir_all(dir.path().join("target/debug")).unwrap();
+		std::fs::write(dir.path().join("target/debug/needle.txt"), "ignored leaf\n").unwrap();
+		std::fs::write(dir.path().join("needle.txt"), "real\n").unwrap();
+
+		let opts = FileSearchOptions {
+			query: "needle".into(),
+			limit: 50,
+		};
+		let hits = search_files(&root(&dir), &opts).unwrap();
+		assert!(
+			hits.iter().all(|h| !h.path.starts_with("target/")),
+			"target subtree must stay suppressed: {hits:?}"
+		);
+		assert!(
+			hits.iter().any(|h| h.path == "needle.txt"),
+			"sibling tracked file must still surface: {hits:?}"
+		);
+	}
+
+	#[test]
+	fn file_search_deduplicates_across_two_passes() {
+		// A tracked file shows up in pass 1 and could theoretically
+		// surface again in pass 2; the `seen` set guarantees one
+		// entry per relative path. Regression against a future
+		// refactor accidentally collecting both passes naively.
+		let dir = TempDir::new().unwrap();
+		std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+		std::fs::write(dir.path().join(".gitignore"), "secret/\n").unwrap();
+		std::fs::write(dir.path().join("widget.ts"), "tracked\n").unwrap();
+
+		let opts = FileSearchOptions {
+			query: "widget".into(),
+			limit: 50,
+		};
+		let hits = search_files(&root(&dir), &opts).unwrap();
+		assert_eq!(hits.iter().filter(|h| h.path == "widget.ts").count(), 1);
 	}
 
 	#[test]

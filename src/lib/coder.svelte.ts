@@ -153,18 +153,20 @@ export type ImageComposerAttachment = {
 };
 
 /** A snapshot of text the user selected in a terminal pane and
- *  attached via Ctrl+L. Unlike `SelectionAttachment` there's no
- *  stable address (no path, no line numbers within a file) — the
- *  scrollback isn't a navigable artefact — so the chip is purely
- *  informational and we don't insert an inline `@`-token at the
- *  caret. `label` is the source terminal's tab title (typically
- *  the cwd basename) for chip readability when several terminals
- *  are open. `lineCount` is captured at attach time for the chip
- *  label so the user can see how much they grabbed without
- *  expanding the chip. */
+ *  attached via Ctrl+L. `label` is the source terminal's tab title
+ *  (typically the cwd basename) for chip readability when several
+ *  terminals are open. `lineCount` is captured at attach time for
+ *  the chip label so the user can see how much they grabbed
+ *  without expanding the chip. `token` is the inline reference we
+ *  splice into the draft (e.g. `@terminal:powergrid` —
+ *  disambiguated with a `#N` suffix when multiple captures share
+ *  the same label) so the model has an in-prose pointer to the
+ *  matching `<terminal_output>` element in the trailing
+ *  `<context>` block. */
 export type TerminalAttachment = {
 	kind: 'terminal';
 	id: string;
+	token: string;
 	text: string;
 	label: string;
 	lineCount: number;
@@ -881,10 +883,14 @@ class CoderPanelState {
 	 *  the composer. Bound to Ctrl+L when a terminal pane has the
 	 *  active text selection. Dedupes on identical (text, label)
 	 *  pairs so a stray double-tap doesn't pile two chips for the
-	 *  exact same blob. We don't insert an inline token: the
-	 *  scrollback has no stable address worth referencing in
-	 *  prose, and a verbose `@terminal:<random-id>` token would
-	 *  just be noise. */
+	 *  exact same blob, and splices an `@terminal:<label>` token at
+	 *  the caret so the model can refer back to the corresponding
+	 *  `<terminal_output>` element in `<context>` from inside the
+	 *  user's prose (mirrors the inline-token behaviour code
+	 *  selections get). When several captures share the same label
+	 *  we suffix `#2`, `#3`, … so the tokens stay distinct;
+	 *  reattaching the *exact* same scrollback reuses the original
+	 *  token so the draft already has the right pointer. */
 	addAttachmentFromTerminal(snapshot: { text: string; label: string }): void {
 		const text = snapshot.text;
 		if (text.length === 0) {
@@ -892,7 +898,10 @@ class CoderPanelState {
 		}
 		rightPanel.set('coder');
 		this.view = 'session';
-		const dup = this.attachments.find((a) => a.kind === 'terminal' && a.text === text && a.label === snapshot.label);
+		const dup = this.attachments.find(
+			(a): a is TerminalAttachment => a.kind === 'terminal' && a.text === text && a.label === snapshot.label,
+		);
+		const token = dup ? dup.token : this.#nextTerminalToken(snapshot.label);
 		if (!dup) {
 			const lineCount = countLines(text);
 			this.attachments = [
@@ -900,13 +909,42 @@ class CoderPanelState {
 				{
 					kind: 'terminal',
 					id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+					token,
 					text,
 					label: snapshot.label,
 					lineCount,
 				},
 			];
 		}
+		this.#insertTokenAtCaret(token);
 		this.composerFocusTick = this.composerFocusTick + 1;
+	}
+
+	/** Mint the next `@terminal:<label>` token that doesn't collide
+	 *  with an existing terminal chip. `label` gets the same
+	 *  whitespace-collapse + non-word-strip the chip already does,
+	 *  so the token stays single-word (a stray space in the prose
+	 *  would break the token-as-word convention shared with
+	 *  selection tokens). */
+	#nextTerminalToken(label: string): string {
+		const base = `@terminal:${sanitiseTokenLabel(label)}`;
+		const existing = new Set(
+			this.attachments.filter((a): a is TerminalAttachment => a.kind === 'terminal').map((a) => a.token),
+		);
+		if (!existing.has(base)) {
+			return base;
+		}
+		for (let n = 2; n < 1000; n++) {
+			const candidate = `${base}#${n}`;
+			if (!existing.has(candidate)) {
+				return candidate;
+			}
+		}
+		// 1000 simultaneous terminal chips means the user is doing
+		// something very different from "drop a few logs in the
+		// prompt", and any token we pick will work — pick a random
+		// one and move on.
+		return `${base}#${Date.now().toString(36)}`;
 	}
 
 	/** "Fix in coder" entry-point from the editor's lint tooltip.
@@ -1023,7 +1061,7 @@ class CoderPanelState {
 			return;
 		}
 		this.attachments = this.attachments.filter((a) => a.id !== id);
-		if (att.kind !== 'selection') {
+		if (att.kind === 'image') {
 			return;
 		}
 		// Strip every occurrence of the inline token (with at most
@@ -1031,7 +1069,9 @@ class CoderPanelState {
 		// own typing might have nudged spacing around the token —
 		// matching the token plus an optional `\s` keeps the most
 		// common case clean without trying to be clever about
-		// arbitrary punctuation.
+		// arbitrary punctuation. Applies equally to selection and
+		// terminal attachments — both now carry an inline token, so
+		// removing the chip removes its in-prose pointer.
 		const pattern = new RegExp(`${escapeRegExp(att.token)}\\s?`, 'g');
 		this.draft = this.draft.replace(pattern, '');
 	}
@@ -1957,11 +1997,16 @@ function renderPromptWithAttachments(
 	}
 	for (const att of terminalAttachments) {
 		// Same envelope strategy: the `<terminal_output>` tag is
-		// the delimiter, no fenced body. `label` lands as an
-		// attribute so a model that's reading the context block
-		// can tell which terminal the snippet came from when the
-		// user attached output from several.
-		blocks.push(`<terminal_output label="${escapeXmlAttr(att.label)}">\n${att.text}\n</terminal_output>`);
+		// the delimiter, no fenced body. `label` is the human
+		// terminal title (cwd basename in practice); `token`
+		// echoes the inline `@terminal:<label>` reference spliced
+		// into the draft so the model can correlate the in-prose
+		// pointer with the matching context element when the user
+		// attached output from several terminals (or several
+		// disjoint snippets from one).
+		blocks.push(
+			`<terminal_output token="${escapeXmlAttr(att.token)}" label="${escapeXmlAttr(att.label)}">\n${att.text}\n</terminal_output>`,
+		);
 	}
 	if (blocks.length === 0) {
 		return text;
@@ -2024,6 +2069,17 @@ function formatAttachmentToken(path: string, startLine: number, endLine: number)
 		return `@${path}:${startLine}`;
 	}
 	return `@${path}:${startLine}-${endLine}`;
+}
+
+/** Squeeze a terminal tab title into something safe to use as the
+ *  body of an `@terminal:<label>` token. Whitespace becomes `-`,
+ *  any non-word/dot/dash byte is dropped, and a blank result falls
+ *  back to `terminal` so the token always has a body the model
+ *  can read as a single word. */
+function sanitiseTokenLabel(label: string): string {
+	const collapsed = label.trim().replace(/\s+/g, '-');
+	const stripped = collapsed.replace(/[^\w.-]/g, '');
+	return stripped.length > 0 ? stripped : 'terminal';
 }
 
 /** Count newline-separated lines in a text blob, treating an
