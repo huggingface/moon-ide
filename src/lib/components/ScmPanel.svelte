@@ -88,7 +88,6 @@
 		return null;
 	});
 
-	let message = $state('');
 	let amend = $state(false);
 	// Split into two flags so the commit-row spinner only fires
 	// during commit / commit-on-new-branch, not during sync /
@@ -112,7 +111,7 @@
 	let busy = $derived(committing || syncing || merging);
 	let textarea: HTMLTextAreaElement | undefined = $state();
 
-	// Tracks the bytes we wrote into `message` from
+	// Tracks the bytes we wrote into `workspace.commitDraft` from
 	// `git_head_commit_message` when the amend toggle flipped on
 	// from an empty composer. If the user toggles amend off
 	// *without* editing the prefill, we clear the textarea so
@@ -140,13 +139,15 @@
 	// Amend-with-empty-message is valid (preserve previous
 	// subject); fresh commits still need a message. Push and pull
 	// buttons just need "not currently busy".
-	const canCommit = $derived(!busy && (amend || message.trim().length > 0));
+	const canCommit = $derived(!busy && (amend || workspace.commitDraft.trim().length > 0));
 
 	// "Commit to new branch" requires both a non-empty message and
 	// a non-empty branch name; amend doesn't apply (you can't
 	// amend HEAD into a new branch with the same gesture). The
 	// "branch toggle" pill is also disabled while busy.
-	const canCommitNewBranch = $derived(!busy && message.trim().length > 0 && newBranchName.trim().length > 0);
+	const canCommitNewBranch = $derived(
+		!busy && workspace.commitDraft.trim().length > 0 && newBranchName.trim().length > 0,
+	);
 
 	// Single gate for the unified commit button. In branch mode it
 	// requires the branch-name field too; otherwise it's the
@@ -263,9 +264,9 @@
 		}
 		committing = true;
 		try {
-			const ok = await workspace.commitChanges(message, amend);
+			const ok = await workspace.commitChanges(workspace.commitDraft, amend);
 			if (ok) {
-				message = '';
+				workspace.commitDraft = '';
 				amend = false;
 				amendPrefill = '';
 				await tick();
@@ -283,9 +284,9 @@
 		}
 		committing = true;
 		try {
-			const ok = await workspace.commitChangesOnNewBranch(newBranchName, message);
+			const ok = await workspace.commitChangesOnNewBranch(newBranchName, workspace.commitDraft);
 			if (ok) {
-				message = '';
+				workspace.commitDraft = '';
 				newBranchName = '';
 				newBranchOpen = false;
 				amend = false;
@@ -321,7 +322,7 @@
 				newBranchName = '';
 			}
 			amend = true;
-			if (message.trim().length > 0) {
+			if (workspace.commitDraft.trim().length > 0) {
 				return;
 			}
 			try {
@@ -329,7 +330,7 @@
 				if (head.length === 0) {
 					return;
 				}
-				message = head;
+				workspace.commitDraft = head;
 				amendPrefill = head;
 				await tick();
 				autoSize();
@@ -341,8 +342,8 @@
 			return;
 		}
 		amend = false;
-		if (amendPrefill.length > 0 && message === amendPrefill) {
-			message = '';
+		if (amendPrefill.length > 0 && workspace.commitDraft === amendPrefill) {
+			workspace.commitDraft = '';
 			amendPrefill = '';
 			await tick();
 			autoSize();
@@ -379,7 +380,7 @@
 			await tick();
 			newBranchInput?.focus();
 			if (coder.signedIn) {
-				if (message.trim().length === 0 && !suggestingMessage) {
+				if (workspace.commitDraft.trim().length === 0 && !suggestingMessage) {
 					void autoSuggestCommitMessage();
 				}
 				if (newBranchName.length === 0 && !suggestingBranch) {
@@ -405,7 +406,7 @@
 	async function autoSuggestBranchName() {
 		suggestingBranch = true;
 		try {
-			const name = await ipc.coder.suggestBranchName(message);
+			const name = await ipc.coder.suggestBranchName(workspace.commitDraft);
 			if (!newBranchOpen || newBranchName.length > 0) {
 				return;
 			}
@@ -433,14 +434,14 @@
 	async function autoSuggestCommitMessage() {
 		suggestingMessage = true;
 		try {
-			const next = await ipc.coder.suggestCommitMessage(message);
-			if (message.trim().length > 0) {
+			const next = await ipc.coder.suggestCommitMessage(workspace.commitDraft);
+			if (workspace.commitDraft.trim().length > 0) {
 				return;
 			}
 			if (next.trim().length === 0) {
 				return;
 			}
-			message = next;
+			workspace.commitDraft = next;
 			// User-driven content for amend-toggle-off purposes —
 			// clear the prefill marker so toggling amend off
 			// later doesn't try to wipe the suggestion thinking
@@ -462,11 +463,11 @@
 		}
 		suggestingMessage = true;
 		try {
-			const next = await ipc.coder.suggestCommitMessage(message);
+			const next = await ipc.coder.suggestCommitMessage(workspace.commitDraft);
 			if (next.trim().length === 0) {
 				return;
 			}
-			message = next;
+			workspace.commitDraft = next;
 			// User-driven content; clear the prefill marker so a
 			// later amend-toggle-off doesn't try to wipe the AI
 			// suggestion thinking it was the prefill we wrote.
@@ -495,7 +496,7 @@
 		}
 		suggestingBranch = true;
 		try {
-			const name = await ipc.coder.suggestBranchName(message);
+			const name = await ipc.coder.suggestBranchName(workspace.commitDraft);
 			newBranchName = name;
 			void tick().then(() => newBranchInput?.focus());
 		} catch (err) {
@@ -633,9 +634,9 @@
 			void commit();
 			return;
 		}
-		if (event.key === 'Escape' && message.length > 0) {
+		if (event.key === 'Escape' && workspace.commitDraft.length > 0) {
 			event.preventDefault();
-			message = '';
+			workspace.commitDraft = '';
 			void tick().then(autoSize);
 		}
 	}
@@ -668,9 +669,11 @@
 	}
 
 	// Re-run autosize whenever the message string changes (clearing
-	// the draft after a commit needs the textarea to shrink back).
+	// the draft after a commit needs the textarea to shrink back,
+	// and a folder switch may swap in a longer/shorter draft for
+	// the new folder).
 	$effect(() => {
-		void message;
+		void workspace.commitDraft;
 		autoSize();
 	});
 
@@ -775,7 +778,7 @@
 	<div class="composer">
 		<textarea
 			bind:this={textarea}
-			bind:value={message}
+			bind:value={() => workspace.commitDraft, (v) => (workspace.commitDraft = v)}
 			use:textInputUndo
 			class="input"
 			class:input-with-ai={coder.signedIn}

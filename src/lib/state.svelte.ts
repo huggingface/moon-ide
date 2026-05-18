@@ -240,6 +240,15 @@ class FolderState {
 	// "not-applicable" semantics.
 	defaultBranchName = $state<string | null>(null);
 
+	// Commit-message draft for this folder's SCM panel. Survives
+	// folder switches so the user can flip between projects
+	// mid-sentence without losing their commit message — same
+	// rationale as keeping editor tabs and SCM compare baseline
+	// per folder. In-memory only (not in `FolderSession` on
+	// disk); IDE restart clears the draft, which matches how
+	// editor scratch buffers behave today.
+	commitDraft = $state('');
+
 	constructor(public readonly folderPath: string) {}
 }
 
@@ -675,6 +684,24 @@ class WorkspaceState {
 	private set untitledCounter(value: number) {
 		if (this.activeFolderState) {
 			this.activeFolderState.untitledCounter = value;
+		}
+	}
+
+	/**
+	 * Active folder's commit-message draft. The SCM panel binds
+	 * its textarea to this so flipping between folders doesn't
+	 * lose half-typed commit messages — same per-folder
+	 * persistence model as editor tabs and PR filter. Returns
+	 * `''` when no folder is active; writes are silent no-ops in
+	 * that case (the SCM panel doesn't render without a folder
+	 * anyway).
+	 */
+	get commitDraft(): string {
+		return this.activeFolderState?.commitDraft ?? '';
+	}
+	set commitDraft(value: string) {
+		if (this.activeFolderState) {
+			this.activeFolderState.commitDraft = value;
 		}
 	}
 
