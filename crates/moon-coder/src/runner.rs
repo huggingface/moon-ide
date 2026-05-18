@@ -236,11 +236,14 @@ struct Session {
 	/// shape forbids a user message between an `assistant` with
 	/// `tool_calls` and its `tool` result rows, so persisting at
 	/// queue time would corrupt the on-disk transcript and break
-	/// session reload. In-memory only; an aborted turn drops
-	/// undrained steers (the `UserMessage` event already fired,
-	/// so the bubble lingers for the rest of the session but is
-	/// gone on next reload — acceptable trade-off, the user
-	/// pressed Esc to throw away in-flight intent).
+	/// session reload. Pop with [`Coder::unqueue_steer`] (`ArrowUp`
+	/// on an empty composer in the panel) to take a queued steer
+	/// back before drain. In-memory only; undrained steers don't
+	/// hit disk (they live here, not in the JSONL), so a reload
+	/// can't recover them — acceptable since the panel pairs
+	/// queue-time emission of a [`CoderEvent::UserMessage`] with a
+	/// matching [`CoderEvent::SteerDrained`] only when the steer
+	/// actually graduates into the chat.
 	pending_steers: Vec<PendingSteer>,
 }
 
@@ -248,9 +251,14 @@ struct Session {
 /// at the top of the next `run_turn` iteration. Carries the user
 /// text plus any images they pasted into the composer while the
 /// turn was already running, so the model sees the same shape it
-/// would have seen for a regular send.
+/// would have seen for a regular send. `id` matches the
+/// [`CoderEvent::UserMessage`] id the panel rendered when the
+/// steer was queued, so [`Coder::unqueue_steer`] can pop the
+/// exact entry the user pointed at and [`drain_pending_steers`]
+/// can emit a matching [`CoderEvent::SteerDrained`].
 #[derive(Debug, Clone)]
 struct PendingSteer {
+	id: String,
 	text: String,
 	images: Vec<ImageAttachment>,
 }
@@ -1383,8 +1391,16 @@ impl CoderHandle {
 			let turn = fs.turn.lock().await;
 			if turn.cancel.is_some() {
 				drop(turn);
+				// Mint the id up here so it's shared between the
+				// `PendingSteer` (the backend's queue handle) and
+				// the `UserMessage` event (the UI's queue handle).
+				// `coder_unqueue_steer` then pops by the same id
+				// the panel saw, and the matching `SteerDrained`
+				// can target the same row.
+				let steer_id = new_message_id();
 				let mut session = fs.session.lock().await;
 				session.pending_steers.push(PendingSteer {
+					id: steer_id.clone(),
 					text: text.clone(),
 					images: images.clone(),
 				});
@@ -1392,9 +1408,10 @@ impl CoderHandle {
 				drop(session);
 				let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string());
 				sink.send(CoderEvent::UserMessage {
-					id: new_message_id(),
+					id: steer_id,
 					text,
 					images,
+					queued: true,
 				});
 				return Ok(());
 			}
@@ -1484,6 +1501,7 @@ impl CoderHandle {
 			id: user_id,
 			text: text.clone(),
 			images: images.clone(),
+			queued: false,
 		});
 
 		let state = self.state.clone();
@@ -1537,9 +1555,54 @@ impl CoderHandle {
 		}
 	}
 
+	/// Pop a queued steer by id from the active folder's session.
+	///
+	/// Returns the steer's `(text, images)` so the panel can
+	/// restore the user's draft + image chips. `None` when no
+	/// matching pending steer exists — either it was already
+	/// drained into the chat at the top of the latest `run_turn`
+	/// iteration (too late, no undo), or no folder is active.
+	/// Emits a [`CoderEvent::SteerDrained`] for the popped id so
+	/// the row's "queued" styling flips even if the panel didn't
+	/// know about the pop ahead of time (e.g. a sibling window
+	/// triggered the unqueue).
+	pub async fn unqueue_steer(&self, id: &str) -> Option<UnqueuedSteer> {
+		let (fs, folder_path) = self.state.active_folder_session().await.ok()?;
+		let popped = {
+			let mut session = fs.session.lock().await;
+			pop_pending_steer(&mut session, id)?
+		};
+		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string());
+		sink.send(CoderEvent::SteerDrained { id: id.to_string() });
+		Some(UnqueuedSteer {
+			text: popped.text,
+			images: popped.images,
+		})
+	}
+
 	pub fn subscribe(&self) -> broadcast::Receiver<CoderEventEnvelope> {
 		self.state.events.subscribe()
 	}
+}
+
+/// Result of a successful [`Coder::unqueue_steer`] — the bytes the
+/// panel needs to repopulate the composer. Serialised over the
+/// Tauri command boundary in the obvious shape.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UnqueuedSteer {
+	pub text: String,
+	#[serde(default)]
+	pub images: Vec<ImageAttachment>,
+}
+
+/// Remove the first matching pending steer from `session` and
+/// return it. `None` when the id isn't in the queue — the steer
+/// has already been drained, or the panel sent us a stale id. Pure
+/// over `&mut Session` so the unit tests don't need a folder /
+/// runtime.
+fn pop_pending_steer(session: &mut Session, id: &str) -> Option<PendingSteer> {
+	let idx = session.pending_steers.iter().position(|s| s.id == id)?;
+	Some(session.pending_steers.remove(idx))
 }
 
 async fn run_turn(
@@ -1607,7 +1670,7 @@ async fn run_turn(
 		// and persisting then would interleave them and break
 		// session reload. Compaction below sees the steers in
 		// `messages` and folds them like any other history.
-		drain_pending_steers(fs).await;
+		drain_pending_steers(fs, sink).await;
 
 		// Token-aware compaction before each round-trip. Reads the
 		// session's last-seen usage; if it crossed the threshold,
@@ -1896,6 +1959,7 @@ done, what's still unfinished, and any uncertainty. If the user needs to take a 
 		id: sentinel_id,
 		text: sentinel_text,
 		images: Vec::new(),
+		queued: false,
 	});
 
 	let messages = fs.session.lock().await.messages.clone();
@@ -2569,7 +2633,7 @@ async fn read_agent_rules(folder_root: &Utf8Path) -> Option<String> {
 /// turn that never gets to drain leaves the queue intact for
 /// garbage collection when the session itself is replaced
 /// (`load_session`, `clear_session`).
-async fn drain_pending_steers(fs: &Arc<FolderSession>) {
+async fn drain_pending_steers(fs: &Arc<FolderSession>, sink: &FolderEventSink) {
 	let (steers, dir, header) = {
 		let mut session = fs.session.lock().await;
 		if session.pending_steers.is_empty() {
@@ -2587,6 +2651,13 @@ async fn drain_pending_steers(fs: &Arc<FolderSession>) {
 		let header = session.header.clone();
 		(drained, dir, header)
 	};
+	// Tell the panel the queued rows just graduated — chip-strip
+	// "unqueue" disappears, and the row's muted styling clears.
+	// We emit before persistence so the UI flip is immediate
+	// regardless of disk latency.
+	for steer in &steers {
+		sink.send(CoderEvent::SteerDrained { id: steer.id.clone() });
+	}
 	let Some(dir) = dir else {
 		return;
 	};
@@ -3002,6 +3073,7 @@ fn emit_replay_events(sink: &FolderEventSink, record: SessionRecord) {
 				id: new_message_id(),
 				text,
 				images,
+				queued: false,
 			});
 		}
 		SessionRecord::Assistant {
@@ -3177,6 +3249,7 @@ fn subagent_replay_inners(record: SessionRecord) -> Vec<CoderEvent> {
 			id: new_message_id(),
 			text,
 			images,
+			queued: false,
 		}],
 		SessionRecord::Assistant {
 			content,
@@ -3711,10 +3784,12 @@ mod tests {
 		];
 		session.pending_steers = vec![
 			PendingSteer {
+				id: "steer-1".into(),
 				text: "also do X".into(),
 				images: Vec::new(),
 			},
 			PendingSteer {
+				id: "steer-2".into(),
 				text: "and then Y".into(),
 				images: Vec::new(),
 			},
@@ -3724,7 +3799,9 @@ mod tests {
 			turn: Mutex::new(TurnState::default()),
 		});
 
-		drain_pending_steers(&fs).await;
+		let (tx, mut rx) = broadcast::channel::<CoderEventEnvelope>(16);
+		let sink = FolderEventSink::new(tx, "/test/folder".to_string());
+		drain_pending_steers(&fs, &sink).await;
 
 		let session = fs.session.lock().await;
 		assert!(session.pending_steers.is_empty());
@@ -3738,6 +3815,17 @@ mod tests {
 		}
 		assert_eq!(session.persisted_records, 2);
 		drop(session);
+
+		// Exactly one SteerDrained per drained steer, in queue
+		// order — the panel flips the matching rows out of
+		// "queued" styling in the order they were sent.
+		let mut drained_ids = Vec::new();
+		while let Ok(env) = rx.try_recv() {
+			if let CoderEvent::SteerDrained { id } = env.event {
+				drained_ids.push(id);
+			}
+		}
+		assert_eq!(drained_ids, vec!["steer-1".to_string(), "steer-2".to_string()]);
 
 		let jsonl = tokio::fs::read_to_string(sessions::session_path(&dir, "sess-steer").as_std_path())
 			.await
@@ -3769,11 +3857,62 @@ mod tests {
 			turn: Mutex::new(TurnState::default()),
 		});
 
-		drain_pending_steers(&fs).await;
+		let (tx, _rx) = broadcast::channel::<CoderEventEnvelope>(8);
+		let sink = FolderEventSink::new(tx, "/test/folder".to_string());
+		drain_pending_steers(&fs, &sink).await;
 
 		let session = fs.session.lock().await;
 		assert_eq!(session.messages.len(), original_len);
 		assert_eq!(session.header.updated_at_ms, original_updated);
 		assert_eq!(session.persisted_records, 0);
+	}
+
+	#[tokio::test]
+	async fn unqueue_pending_steer_pops_by_id_and_leaves_others() {
+		// Pop the middle id; the other two stay in their original
+		// order. Returning the popped text+images is how the panel
+		// restores the draft + image chips on Ctrl+Up un-queue.
+		let mut session = Session::new_blank();
+		session.pending_steers = vec![
+			PendingSteer {
+				id: "a".into(),
+				text: "first".into(),
+				images: Vec::new(),
+			},
+			PendingSteer {
+				id: "b".into(),
+				text: "middle".into(),
+				images: vec![ImageAttachment {
+					data_url: "data:image/png;base64,xxx".into(),
+					mime: "image/png".into(),
+				}],
+			},
+			PendingSteer {
+				id: "c".into(),
+				text: "last".into(),
+				images: Vec::new(),
+			},
+		];
+
+		let popped = pop_pending_steer(&mut session, "b");
+		let popped = popped.expect("pop should succeed for an in-queue id");
+		assert_eq!(popped.text, "middle");
+		assert_eq!(popped.images.len(), 1);
+		assert_eq!(
+			session.pending_steers.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+			vec!["a", "c"]
+		);
+	}
+
+	#[tokio::test]
+	async fn unqueue_pending_steer_returns_none_when_unknown() {
+		let mut session = Session::new_blank();
+		session.pending_steers = vec![PendingSteer {
+			id: "a".into(),
+			text: "first".into(),
+			images: Vec::new(),
+		}];
+		assert!(pop_pending_steer(&mut session, "missing").is_none());
+		assert_eq!(session.pending_steers.len(), 1);
 	}
 }

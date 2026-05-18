@@ -216,6 +216,7 @@ pub fn run() {
 			commands::coder::coder_suggest_branch_name,
 			commands::coder::coder_suggest_commit_message,
 			commands::coder::coder_abort,
+			commands::coder::coder_unqueue_steer,
 			commands::coder::coder_list_sessions,
 			commands::coder::coder_active_session,
 			commands::coder::coder_new_session,

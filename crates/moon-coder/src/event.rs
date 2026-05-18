@@ -34,12 +34,30 @@ pub enum CoderEvent {
 	/// any pictures pasted into the composer; empty for the vast
 	/// majority of turns and elided from the wire shape in that
 	/// case to keep the common-path payload small.
+	///
+	/// `queued: true` marks a steer that arrived while a turn was
+	/// already running and is now sitting in the pending-steers
+	/// queue, *not yet* in `session.messages`. The runner flips
+	/// the state by emitting a matching [`SteerDrained`] event the
+	/// moment the steer is moved into the chat at the top of the
+	/// next iteration. The UI uses the flag to render the row in
+	/// a muted "queued" style and to know whether
+	/// `coder_unqueue_steer` can still pop it back into the
+	/// composer.
 	UserMessage {
 		id: String,
 		text: String,
 		#[serde(default, skip_serializing_if = "Vec::is_empty")]
 		images: Vec<crate::inference::ImageAttachment>,
+		#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+		queued: bool,
 	},
+
+	/// A previously-queued steer has been drained into the chat
+	/// (or unqueued / aborted away — same effect from the UI's
+	/// point of view). Carries the original [`UserMessage::id`] so
+	/// the panel can flip the matching row out of "queued" mode.
+	SteerDrained { id: String },
 
 	/// A new assistant message bubble has started in the current
 	/// turn — fires before the first `AssistantMessageDelta` for a

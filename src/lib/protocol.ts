@@ -1286,6 +1286,16 @@ export type ImageAttachmentPayload = {
 	mime: string;
 };
 
+/** Return shape of `coder_unqueue_steer`. `null` from the IPC
+ *  means the matching pending steer was already drained — no
+ *  un-queue happened. A non-null value carries the original draft
+ *  text and pasted images so the panel can repopulate the
+ *  composer chip-by-chip. */
+export type UnqueuedSteer = {
+	text: string;
+	images?: ImageAttachmentPayload[];
+};
+
 /** Snapshot returned by `coder_status`. Mirrors `moon_coder::CoderStatus`. */
 export type CoderStatus = {
 	signed_in: boolean;
@@ -1306,7 +1316,21 @@ export type CoderStatus = {
  * because 6.0 doesn't persist the session.
  */
 export type CoderEvent =
-	| { kind: 'user_message'; id: string; text: string; images?: ImageAttachmentPayload[] }
+	| {
+			kind: 'user_message';
+			id: string;
+			text: string;
+			images?: ImageAttachmentPayload[];
+			/** `true` when this message is a steer the user sent
+			 *  while a turn was already running; it now sits in the
+			 *  runner's pending-steers queue and hasn't been drained
+			 *  into `messages` yet. The matching `steer_drained`
+			 *  event arrives the moment the runner moves it into
+			 *  the chat. Defaults to `false` (every non-steer
+			 *  message). */
+			queued?: boolean;
+	  }
+	| { kind: 'steer_drained'; id: string }
 	| { kind: 'assistant_message_start'; id: string }
 	| { kind: 'assistant_message_delta'; id: string; delta: string }
 	| { kind: 'assistant_thinking_delta'; id: string; delta: string }

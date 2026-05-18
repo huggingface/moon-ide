@@ -56,7 +56,20 @@ const CODER_EVENT_CHANNEL = 'coder:event';
  *  — useful for spotting slow tools (multi-second `bash` tail,
  *  multi-megabyte `read_file`) at a glance. */
 export type CoderRow =
-	| { kind: 'user'; id: string; text: string; images: ImageAttachmentPayload[] }
+	| {
+			kind: 'user';
+			id: string;
+			text: string;
+			images: ImageAttachmentPayload[];
+			/** `true` while the message is sitting in the runner's
+			 *  pending-steers queue (sent during an ongoing turn
+			 *  and not yet drained into the chat). The panel
+			 *  renders these rows in a muted "queued" style and
+			 *  the composer's `Ctrl+Up` un-queue gesture only
+			 *  targets queued rows. Flips to `false` on the
+			 *  matching `steer_drained` event. */
+			queued: boolean;
+	  }
 	| { kind: 'assistant'; id: string; text: string; thinking: string; thinkingOpen: boolean }
 	| {
 			kind: 'tool';
@@ -1553,6 +1566,112 @@ class CoderPanelState {
 		}
 	}
 
+	/** Pop the most recently queued steer from the active folder's
+	 *  transcript back into the composer.
+	 *
+	 *  Bound to `ArrowUp` on an empty composer in the panel — the
+	 *  user just typed a steer mid-turn, realised they want to
+	 *  edit it before it lands in the chat, and presses Up to
+	 *  pull it back. The empty-composer guard keeps the regular
+	 *  textarea Up-arrow behaviour intact for everything else.
+	 *  We:
+	 *
+	 *  1. Find the latest `queued: true` user row in the active
+	 *     bucket (queued rows are always tail-end of the
+	 *     transcript, since the runner emits `UserMessage` as
+	 *     soon as the steer is queued).
+	 *  2. Call `coder_unqueue_steer(id)`. The runner removes the
+	 *     matching `PendingSteer` and emits `steer_drained` so
+	 *     the row's queued style flips off in lockstep with the
+	 *     transcript edit below — handy for sibling windows.
+	 *  3. Restore the original text to the draft, push the
+	 *     original images back as composer chips, drop the row
+	 *     from the transcript, and focus the composer.
+	 *
+	 *  Returns `true` when something was actually unqueued.
+	 *  `false` when there's no queued steer to pop, the IPC
+	 *  reported the steer had already been drained (race against
+	 *  the runner's iteration-top drain), or the call failed —
+	 *  the caller (the `Ctrl+Up` handler) treats `false` as
+	 *  "let the default arrow-key behaviour happen". */
+	async unqueueLatestSteer(): Promise<boolean> {
+		const latestQueued = this.rows
+			.toReversed()
+			.find((row): row is Extract<CoderRow, { kind: 'user' }> => row.kind === 'user' && row.queued);
+		if (!latestQueued) {
+			return false;
+		}
+		let popped: { text: string; images?: ImageAttachmentPayload[] } | null;
+		try {
+			popped = await ipc.coder.unqueueSteer(latestQueued.id);
+		} catch (err) {
+			// Surface inside the transcript rather than as a host
+			// flash — the user is mid-conversation and the rest of
+			// the panel's errors already land here.
+			this.rows = [
+				...this.rows,
+				{
+					kind: 'error',
+					id: `local-${Date.now()}`,
+					text: `Failed to un-queue message: ${formatError(err)}`,
+				},
+			];
+			return false;
+		}
+		if (popped === null) {
+			// Backend says the steer was already drained — flip
+			// the local row's flag to match (the `steer_drained`
+			// event would have done this too, but it may not have
+			// arrived yet) and leave the draft alone.
+			this.rows = this.rows.map((row) =>
+				row.kind === 'user' && row.id === latestQueued.id ? { ...row, queued: false } : row,
+			);
+			return false;
+		}
+		this.rows = this.rows.filter((row) => !(row.kind === 'user' && row.id === latestQueued.id));
+		// Splice the original text into wherever the caret was —
+		// usually at offset 0 since the user pressed Up on an
+		// empty composer, but be tolerant of "they started typing
+		// while we were awaiting the IPC". A trailing space keeps
+		// the keep-typing flow natural when the draft already had
+		// suffix text.
+		const restoredText = popped.text;
+		const beforeDraft = this.draft;
+		this.draft = beforeDraft.length === 0 ? restoredText : `${restoredText} ${beforeDraft}`;
+		// Push the images back onto the chip strip. We lost the
+		// original `name` / `sizeBytes` (they weren't shipped to
+		// the backend) — reconstruct a reasonable display name and
+		// approximate the size from the base64 payload so the chip
+		// reads sensibly.
+		const images = popped.images ?? [];
+		const restoredImages: ImageComposerAttachment[] = images.map((img, idx) => ({
+			kind: 'image',
+			id: `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${idx}`,
+			dataUrl: img.data_url,
+			mime: img.mime,
+			name: `Image ${idx + 1}`,
+			sizeBytes: approximateBase64Size(img.data_url),
+		}));
+		if (restoredImages.length > 0) {
+			this.attachments = [...this.attachments, ...restoredImages];
+		}
+		this.composerFocusTick = this.composerFocusTick + 1;
+		return true;
+	}
+
+	/** `true` when the active bucket has at least one queued steer
+	 *  the user can un-queue with `ArrowUp` on an empty composer.
+	 *  Hot path — the panel reads this every key press, so we
+	 *  keep it a cheap scan. */
+	get hasQueuedSteer(): boolean {
+		for (const row of this.rows) {
+			if (row.kind === 'user' && row.queued) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	/** Top-level dispatch for an envelope arriving on
 	 *  `coder:event`. Splits handling between:
 	 *
@@ -1607,8 +1726,26 @@ class CoderPanelState {
 	#applyEventToBucket(bucket: FolderViewState, folder: string, event: CoderEvent): void {
 		switch (event.kind) {
 			case 'user_message':
-				bucket.rows = [...bucket.rows, { kind: 'user', id: event.id, text: event.text, images: event.images ?? [] }];
+				bucket.rows = [
+					...bucket.rows,
+					{
+						kind: 'user',
+						id: event.id,
+						text: event.text,
+						images: event.images ?? [],
+						queued: event.queued ?? false,
+					},
+				];
 				bucket.busy = true;
+				return;
+			case 'steer_drained':
+				// Runner moved (or `coder.unqueueSteer` popped) the
+				// queued message; flip the row out of "queued"
+				// styling. Idempotent — a duplicate event lands as
+				// a no-op (the row is already `queued: false`).
+				bucket.rows = bucket.rows.map((row) =>
+					row.kind === 'user' && row.id === event.id ? { ...row, queued: false } : row,
+				);
 				return;
 			case 'assistant_message_start':
 				// Insert the empty bubble so the user sees the row
@@ -2043,6 +2180,22 @@ function blobToDataUrl(blob: Blob): Promise<string> {
 		reader.addEventListener('error', () => reject(reader.error ?? new Error('FileReader failed')), { once: true });
 		reader.readAsDataURL(blob);
 	});
+}
+
+/** Estimate the raw byte size of a `data:<mime>;base64,...` URL
+ *  without decoding it. Base64 expands 3 source bytes to 4
+ *  characters and pads the tail with `=`, so the inverse is
+ *  `floor(base64_len * 3 / 4) - padding`. Used on the un-queue
+ *  path where the original `sizeBytes` was never sent to the
+ *  backend; close enough for the chip's "Image (97 kB)" hint. */
+function approximateBase64Size(dataUrl: string): number {
+	const commaIdx = dataUrl.indexOf(',');
+	if (commaIdx === -1) {
+		return 0;
+	}
+	const body = dataUrl.slice(commaIdx + 1);
+	const padding = body.endsWith('==') ? 2 : body.endsWith('=') ? 1 : 0;
+	return Math.max(0, Math.floor((body.length * 3) / 4) - padding);
 }
 
 /** Pretty-print a byte count for the "image too large" error

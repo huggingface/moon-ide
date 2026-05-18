@@ -154,11 +154,30 @@
 	async function onComposerKey(event: KeyboardEvent) {
 		// Enter sends; Shift+Enter inserts a newline. Esc aborts the
 		// active turn (matches the panel header's stop button).
-		// Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y are wired by the
-		// `use:textInputUndo` action on the textarea below.
+		// ArrowUp on an empty composer (no modifiers) pulls the
+		// most recent queued steer back into the draft so the user
+		// can edit it before it lands in the chat — only fires
+		// when there's actually something queued, so a plain
+		// empty composer still falls through to the textarea's
+		// default no-op. Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y are wired
+		// by the `use:textInputUndo` action on the textarea below.
 		if (event.key === 'Escape' && coder.busy) {
 			event.preventDefault();
 			await coder.abort();
+			return;
+		}
+		if (
+			event.key === 'ArrowUp' &&
+			!event.shiftKey &&
+			!event.ctrlKey &&
+			!event.altKey &&
+			!event.metaKey &&
+			composer !== undefined &&
+			composer.value.length === 0 &&
+			coder.hasQueuedSteer
+		) {
+			event.preventDefault();
+			await coder.unqueueLatestSteer();
 			return;
 		}
 		if (event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.metaKey) {
@@ -1122,8 +1141,13 @@
 {#snippet rowMarkup(row: CoderRow, withSubagentCards: boolean)}
 	{#if row.kind === 'user'}
 		{@const parsed = parseUserPrompt(row.text)}
-		<div class="row user">
-			<div class="row-label">you</div>
+		<div class="row user" class:queued={row.queued}>
+			<div class="row-label">
+				you{#if row.queued}<span
+						class="queued-tag"
+						title="Waiting for the current turn to finish. Press ↑ on an empty composer to pull it back.">queued</span
+					>{/if}
+			</div>
 			{#if parsed.prose.trim().length > 0}
 				<div class="bubble">{parsed.prose}</div>
 			{/if}
@@ -1831,6 +1855,32 @@
 	}
 	.row.user .bubble {
 		background: color-mix(in srgb, var(--m-accent) 18%, transparent);
+	}
+	/* Queued steer styling: dim the bubble + ref chips so the
+	   row reads as "waiting room" instead of "live message".
+	   Pairs with the `queued` tag on the row label that explains
+	   the state in words for the user who isn't sure what the
+	   muted colouring means. */
+	.row.user.queued .bubble,
+	.row.user.queued .user-ref,
+	.row.user.queued .user-image {
+		opacity: 0.55;
+	}
+	.row.user.queued .bubble {
+		background: color-mix(in srgb, var(--m-accent) 8%, transparent);
+		border: 1px dashed color-mix(in srgb, var(--m-accent) 40%, var(--m-border));
+		padding: 7px 9px;
+	}
+	.queued-tag {
+		margin-left: 6px;
+		padding: 1px 6px;
+		border-radius: 999px;
+		font-size: 9px;
+		letter-spacing: 0.04em;
+		background: color-mix(in srgb, var(--m-accent) 22%, transparent);
+		color: var(--m-fg-muted);
+		text-transform: none;
+		font-weight: 500;
 	}
 	/* Inline references attached to a user message. Sit just below
 	   the prose bubble and read as quiet "links" rather than

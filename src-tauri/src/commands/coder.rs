@@ -5,7 +5,7 @@
 //! `coder:event` Tauri channel. See
 //! `specs/test-plans/0039-coder-skeleton.md`.
 
-use moon_coder::{CoderHandle, CoderStatus, DeviceCode, HfIdentity, ImageAttachment, SessionSummary};
+use moon_coder::{CoderHandle, CoderStatus, DeviceCode, HfIdentity, ImageAttachment, SessionSummary, UnqueuedSteer};
 use moon_core::app_state as app_state_store;
 use moon_core::session as core_session;
 use moon_protocol::coder_models::{
@@ -177,6 +177,18 @@ pub async fn coder_suggest_commit_message(state: State<'_, AppState>, message: S
 pub async fn coder_abort(state: State<'_, AppState>) -> Result<(), MoonError> {
 	state.coder.abort().await;
 	Ok(())
+}
+
+/// Pop a previously-queued steer (a `send` issued while a turn
+/// was already running, sitting in `pending_steers`) by id and
+/// return its `text` + `images` so the panel can repopulate the
+/// composer. Returns `None` when the id no longer matches a
+/// queued steer — by the time the user pressed `Up`, the runner
+/// drained the queue at the top of the next iteration. Bound to
+/// `ArrowUp` on an empty composer in the panel.
+#[tauri::command]
+pub async fn coder_unqueue_steer(state: State<'_, AppState>, id: String) -> Result<Option<UnqueuedSteer>, MoonError> {
+	Ok(state.coder.unqueue_steer(&id).await)
 }
 
 /// List persisted sessions for the active workspace folder. Empty
