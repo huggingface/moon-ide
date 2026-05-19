@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import { confirm } from '@tauri-apps/plugin-dialog';
-	import { readImage } from '@tauri-apps/plugin-clipboard-manager';
+	import { readImage, writeText as clipboardWriteText } from '@tauri-apps/plugin-clipboard-manager';
 	import { openUrl } from '@tauri-apps/plugin-opener';
 	import { coder, type CoderRow } from '../coder.svelte';
 	import { frontendLog } from '../logs.svelte';
@@ -109,13 +109,24 @@
 			return;
 		}
 		if (event.altKey) {
+			// Prefer the Tauri clipboard plugin: `navigator.clipboard`
+			// is unreliable on WebKitGTK (silently no-ops when the
+			// triggering element isn't a focused input), and Alt-click
+			// fires on a button that doesn't take focus. Fall back to
+			// `navigator.clipboard` only if the plugin call throws,
+			// and surface a flash on hard failure rather than
+			// swallowing — matches the `Copy path` pattern in
+			// EditorTabs / FileTree.
 			try {
-				await navigator.clipboard.writeText(url);
+				await clipboardWriteText(url);
 				workspace.flash('Trace URL copied to clipboard.');
 			} catch {
-				// Clipboard failures are silent everywhere else in
-				// the IDE (same pattern as the terminal copy/paste
-				// path); the user can fall back to the plain click.
+				try {
+					await navigator.clipboard.writeText(url);
+					workspace.flash('Trace URL copied to clipboard.');
+				} catch {
+					workspace.flash('Could not copy trace URL.');
+				}
 			}
 			return;
 		}
