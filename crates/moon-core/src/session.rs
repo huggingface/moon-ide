@@ -92,6 +92,7 @@ mod tests {
 			coder_provider_lock: None,
 			forwarded_ports: Vec::new(),
 			coder_hub_bucket: None,
+			compose_auto_resume: Default::default(),
 		}
 	}
 

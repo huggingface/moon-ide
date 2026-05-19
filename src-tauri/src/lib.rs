@@ -475,11 +475,18 @@ pub fn run() {
 			// Auto-resume any compose project this workspace
 			// had running last time. Workspace-mode only —
 			// preboot has no compose project to resume.
+			//
+			// Order matters: the workspace shell first (so the
+			// dev container exists and is on the daemon by
+			// the time `auto_resume_project_composes` issues
+			// per-folder `compose up`s, which try to attach
+			// it to each project network).
 			if matches!(mode, AppMode::Workspace { .. }) {
 				let app_handle = app.handle().clone();
 				tauri::async_runtime::spawn(async move {
 					let state = app_handle.state::<AppState>();
 					shutdown::auto_resume_shell(&state).await;
+					shutdown::auto_resume_project_composes(&state).await;
 				});
 			}
 

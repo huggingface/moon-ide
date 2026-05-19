@@ -58,6 +58,7 @@ fn merge_frontend_session(existing: WorkspaceSession, frontend: WorkspaceSession
 		coder_provider_lock: existing.coder_provider_lock,
 		forwarded_ports: existing.forwarded_ports,
 		coder_hub_bucket: existing.coder_hub_bucket,
+		compose_auto_resume: existing.compose_auto_resume,
 	}
 }
 
@@ -99,6 +100,7 @@ mod tests {
 			coder_provider_lock: None,
 			forwarded_ports: Vec::new(),
 			coder_hub_bucket: None,
+			compose_auto_resume: Default::default(),
 		}
 	}
 
@@ -119,6 +121,11 @@ mod tests {
 				autosync: true,
 				uploaded: Default::default(),
 			}),
+			compose_auto_resume: {
+				let mut m = std::collections::BTreeMap::new();
+				m.insert("/home/me/work".to_string(), true);
+				m
+			},
 		}
 	}
 
@@ -137,6 +144,7 @@ mod tests {
 		assert_eq!(merged.coder_hub_bucket, existing.coder_hub_bucket);
 		assert_eq!(merged.coder_provider_lock, existing.coder_provider_lock);
 		assert_eq!(merged.forwarded_ports, existing.forwarded_ports);
+		assert_eq!(merged.compose_auto_resume, existing.compose_auto_resume);
 		assert_eq!(merged.active_folder_path.as_deref(), Some("/home/me/work"));
 		assert_eq!(merged.folders.len(), 1);
 		assert_eq!(merged.folders[0].folder_path, "/home/me/work");
@@ -180,9 +188,11 @@ mod tests {
 		});
 		payload.forwarded_ports = vec![];
 		payload.coder_provider_lock = None;
+		payload.compose_auto_resume = std::collections::BTreeMap::new();
 		let merged = merge_frontend_session(existing.clone(), payload);
 		assert_eq!(merged.coder_hub_bucket, existing.coder_hub_bucket);
 		assert_eq!(merged.forwarded_ports, existing.forwarded_ports);
 		assert_eq!(merged.coder_provider_lock, existing.coder_provider_lock);
+		assert_eq!(merged.compose_auto_resume, existing.compose_auto_resume);
 	}
 }

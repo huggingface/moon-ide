@@ -63,4 +63,23 @@ forwarded_ports?: Array<ForwardedPort>,
  * the per-session `uploaded` cache. `None` (the default)
  * means "no Hub binding; sessions stay local".
  */
-coder_hub_bucket?: CoderHubBucket | null, };
+coder_hub_bucket?: CoderHubBucket | null, 
+/**
+ * Per-folder "this folder's `docker-compose.yml` project was
+ * `Running` when the IDE quit last time" map, keyed by the
+ * folder's absolute path. `shutdown::stop_all` populates
+ * this immediately before issuing `docker compose stop` for
+ * each folder; on next launch,
+ * `shutdown::auto_resume_project_composes` reads it and
+ * brings the marked folders back up with `compose up -d`.
+ *
+ * Cleared (for a folder) by Stop / Down clicks in the UI so
+ * quitting from a deliberately-stopped state doesn't
+ * auto-resurrect the project. Backend-managed: the
+ * `session_save` merge in `commands::session` keeps the
+ * on-disk value through frontend persist ticks. A missing
+ * entry, or `false`, means "don't auto-start"; that's also
+ * what happens after a corrupt-session fallback, which is
+ * the right safe default.
+ */
+compose_auto_resume?: { [key in string]: boolean }, };

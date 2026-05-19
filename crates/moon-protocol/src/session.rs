@@ -8,6 +8,8 @@
 //! compile time. Per AGENTS.md "no premature migrations": we change
 //! this freely until the roadmap is done.
 
+use std::collections::BTreeMap;
+
 use crate::coder_hub::CoderHubBucket;
 use crate::coder_models::CoderProviderLock;
 use crate::git::{CompareBaseline, PrListScope};
@@ -145,4 +147,22 @@ pub struct WorkspaceSession {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	#[ts(optional, type = "CoderHubBucket | null")]
 	pub coder_hub_bucket: Option<CoderHubBucket>,
+	/// Per-folder "this folder's `docker-compose.yml` project was
+	/// `Running` when the IDE quit last time" map, keyed by the
+	/// folder's absolute path. `shutdown::stop_all` populates
+	/// this immediately before issuing `docker compose stop` for
+	/// each folder; on next launch,
+	/// `shutdown::auto_resume_project_composes` reads it and
+	/// brings the marked folders back up with `compose up -d`.
+	///
+	/// Cleared (for a folder) by Stop / Down clicks in the UI so
+	/// quitting from a deliberately-stopped state doesn't
+	/// auto-resurrect the project. Backend-managed: the
+	/// `session_save` merge in `commands::session` keeps the
+	/// on-disk value through frontend persist ticks. A missing
+	/// entry, or `false`, means "don't auto-start"; that's also
+	/// what happens after a corrupt-session fallback, which is
+	/// the right safe default.
+	#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+	pub compose_auto_resume: BTreeMap<String, bool>,
 }

@@ -168,6 +168,10 @@ pub async fn project_compose_rebuild(
 /// without removing the containers. The cheaper counterpart to
 /// `project_compose_down`: a follow-up `up` resumes from the
 /// same containers and skips the image pull / build steps.
+///
+/// Also clears this folder's `compose_auto_resume` flag in
+/// `session.json` so a clean IDE quit afterwards doesn't
+/// resurrect a project the user just deliberately stopped.
 #[tauri::command]
 pub async fn project_compose_stop(
 	app: AppHandle,
@@ -177,9 +181,16 @@ pub async fn project_compose_stop(
 	let folder_path = Utf8PathBuf::from(folder_path);
 	let pc = require_project_handle(&state, &folder_path).await?;
 	pc.stop().await?;
+	if let Some(id) = state.workspace_id() {
+		crate::shutdown::clear_compose_auto_resume(&state, id, folder_path.as_str()).await;
+	}
 	snapshot_and_emit(&app, &folder_path, &pc).await
 }
 
+/// `docker compose down` — stop containers, remove containers,
+/// networks, and the project entry. Also clears this folder's
+/// `compose_auto_resume` flag (same reason as
+/// [`project_compose_stop`]).
 #[tauri::command]
 pub async fn project_compose_down(
 	app: AppHandle,
@@ -189,6 +200,9 @@ pub async fn project_compose_down(
 	let folder_path = Utf8PathBuf::from(folder_path);
 	let pc = require_project_handle(&state, &folder_path).await?;
 	pc.down().await?;
+	if let Some(id) = state.workspace_id() {
+		crate::shutdown::clear_compose_auto_resume(&state, id, folder_path.as_str()).await;
+	}
 	snapshot_and_emit(&app, &folder_path, &pc).await
 }
 
