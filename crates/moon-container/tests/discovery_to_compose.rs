@@ -64,6 +64,7 @@ fn workspace_compose_is_dev_only_with_one_mount_per_folder() {
 		ssh_config: None,
 		git_identity: None,
 		gh_config: None,
+		gh_token: None,
 	});
 
 	let yaml = &render.yaml;

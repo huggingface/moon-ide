@@ -25,8 +25,8 @@ This file is read by AI coding agents (Cursor, Claude Code, opencode, etc.) when
 - **No emoji in code, docs, or commit messages** unless explicitly asked.
 - **No one-line `if` / `else` / `for` / `while` without braces** — always use a block. Enforced by `oxlint`'s `curly` rule for JS/TS; Rust gets the same treatment by reviewer taste.
 - **Tabs, not spaces** for indentation in every file we author. Editor display width is in `.editorconfig`. See [ADR 0004](specs/decisions/0004-code-style.md).
-- Match existing code style; don't reformat unrelated code.
-- **No pre-existing warnings.** If `cargo build`, `cargo clippy`, `vite build`, `tsgo`, `svelte-check`, `oxlint`, or any tool we run in CI prints a warning, treat it as a bug and fix it — even if it isn't your fault and even if it isn't what you were asked to do. The repo stays clean. The only exception is when the warning genuinely cannot be fixed without a wider refactor; in that case, suppress it locally with a comment explaining why.
+- Match existing code style. Don't do drive-by whole-file reformats just because you opened the file — that's review-noise and makes `git blame` worse.
+- **No pre-existing warnings or actionable suggestions.** If `cargo build`, `cargo clippy`, `vite build`, `tsgo`, `svelte-check`, `oxlint`, the Svelte MCP autofixer, or any other tool we use prints a warning or a concrete suggestion (e.g. "this `$effect` should be `$derived`", "this `bind:this` could be an attachment"), treat it as a bug and fix it — even on lines you didn't touch, even if it isn't your fault, and even if it isn't what you were asked to do. The repo stays clean. The only exception is when the fix genuinely needs a wider refactor than the current change can absorb; in that case, suppress it locally with a comment explaining why, or open a follow-up note in the relevant spec.
 
 ## Tooling
 

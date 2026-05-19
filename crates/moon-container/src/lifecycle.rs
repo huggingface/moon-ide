@@ -70,8 +70,8 @@ use thiserror::Error;
 use tokio::process::Command;
 
 use crate::compose::{
-	generate_compose, BoundMount, ComposeRender, ComposeRenderOptions, GhConfigMount, HostGitIdentity, SshAgentForward,
-	SshConfigMount,
+	generate_compose, BoundMount, ComposeRender, ComposeRenderOptions, GhConfigMount, HostGhToken, HostGitIdentity,
+	SshAgentForward, SshConfigMount,
 };
 use crate::network::{connect_container_to_network, dev_container_name, project_default_network};
 use crate::port_forward::stop_forwards;
@@ -242,6 +242,7 @@ impl Workspace {
 		let ssh_config = detect_host_ssh_config();
 		let identity = detect_host_git_identity();
 		let gh_config = detect_host_gh_config();
+		let gh_token = detect_host_gh_token();
 		generate_compose(ComposeRenderOptions {
 			project: &self.project,
 			dev_image,
@@ -250,6 +251,7 @@ impl Workspace {
 			ssh_config: ssh_config.as_ref(),
 			git_identity: identity.as_ref(),
 			gh_config: gh_config.as_ref(),
+			gh_token: gh_token.as_ref(),
 		})
 	}
 
@@ -656,7 +658,7 @@ pub(crate) fn detect_host_ssh_config() -> Option<SshConfigMount> {
 
 /// Resolve the host's `gh` config directory and bind-mount it
 /// into the dev container so an in-container `gh` shares the
-/// host's auth state. Returns `None` when:
+/// host's per-host preferences. Returns `None` when:
 ///
 /// - `$GH_CONFIG_DIR` isn't set and the platform default
 ///   (`$XDG_CONFIG_HOME/gh` or `~/.config/gh`) doesn't exist —
@@ -671,6 +673,13 @@ pub(crate) fn detect_host_ssh_config() -> Option<SshConfigMount> {
 /// Re-evaluated every time we render or write `compose.yaml`,
 /// matching `detect_ssh_agent_forward`'s "rebuild container to
 /// pick it up" cadence.
+///
+/// Note that this mount on its own does **not** authenticate
+/// the in-container `gh` when the host uses the system keyring
+/// (the modern default — `hosts.yml` carries no `oauth_token:`
+/// in that mode). [`detect_host_gh_token`] is the companion that
+/// forwards the active token as `GH_TOKEN` and covers both
+/// storage shapes.
 pub(crate) fn detect_host_gh_config() -> Option<GhConfigMount> {
 	let raw = std::env::var("GH_CONFIG_DIR").ok().filter(|s| !s.is_empty());
 	let path = if let Some(raw) = raw {
@@ -694,6 +703,43 @@ pub(crate) fn detect_host_gh_config() -> Option<GhConfigMount> {
 		return None;
 	}
 	Some(GhConfigMount { host_path: path })
+}
+
+/// Resolve the host's active `gh` OAuth token so we can pass it
+/// into the dev container as `GH_TOKEN`. `gh auth token` is the
+/// canonical extraction path — it reads from whichever storage
+/// the host happens to be using (keyring or `hosts.yml`),
+/// avoiding a fork in our own logic.
+///
+/// Returns `None` when:
+///
+/// - The `gh` binary isn't on the host's `$PATH`. The user may
+///   not have installed it, or may have logged in via a custom
+///   mechanism. Either way, no token, no env var.
+/// - `gh auth token` exits non-zero (the typical signal for
+///   "you're not logged in").
+/// - Stdout is empty or non-UTF-8.
+///
+/// Re-evaluated every time we render or write `compose.yaml`, so
+/// a host-side `gh auth refresh` or `gh auth login` is picked up
+/// by the next "Rebuild container". The token ends up in
+/// plaintext in the generated `compose.yaml` under the
+/// per-workspace state dir — that's a deliberate trade-off (see
+/// [`HostGhToken`] for the rationale).
+pub(crate) fn detect_host_gh_token() -> Option<HostGhToken> {
+	let output = std::process::Command::new("gh").args(["auth", "token"]).output().ok()?;
+	if !output.status.success() {
+		tracing::debug!(
+			status = ?output.status,
+			"gh auth token returned non-zero; skipping GH_TOKEN forward",
+		);
+		return None;
+	}
+	let value = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+	if value.is_empty() {
+		return None;
+	}
+	Some(HostGhToken { token: value })
 }
 
 fn read_git_global_config(key: &str) -> Option<String> {

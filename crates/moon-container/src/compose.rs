@@ -154,9 +154,9 @@ pub const GH_CONFIG_CONTAINER_PATH: &str = "/home/dev/.config/gh";
 
 /// Bind-mount of the host's `gh` config directory (typically
 /// `~/.config/gh`) into the dev container, read-only. Surfaces
-/// the host's existing `gh auth login` session as the container's
-/// auth state — opening a container terminal and running
-/// `gh pr list` Just Works without re-authing.
+/// the host's per-host preferences (default editor, default
+/// protocol, etc.) — and on hosts that store the OAuth token in
+/// `hosts.yml` directly, the auth state too.
 ///
 /// Read-only on purpose:
 ///
@@ -170,6 +170,15 @@ pub const GH_CONFIG_CONTAINER_PATH: &str = "/home/dev/.config/gh";
 /// 3. **Mirrors SSH agent forwarding.** The agent socket is
 ///    similarly host-owned; gh config follows the same pattern.
 ///
+/// On its own this mount is **not enough** for `gh` to
+/// authenticate when the host uses the system keyring (the
+/// modern default — macOS Keychain, GNOME Keyring, Wincred).
+/// In that case `hosts.yml` carries no `oauth_token:` field and
+/// the container has no keyring to fall back on, so an
+/// in-container `gh auth status` reports "token is invalid".
+/// [`HostGhToken`] forwards the active token as `GH_TOKEN` so
+/// `gh` works in both storage shapes.
+///
 /// If the host config doesn't exist yet (`~/.config/gh` is
 /// absent because the user has never run `gh auth login`), the
 /// lifecycle layer skips the mount entirely — Docker would
@@ -179,6 +188,43 @@ pub const GH_CONFIG_CONTAINER_PATH: &str = "/home/dev/.config/gh";
 pub struct GhConfigMount {
 	/// Absolute host-side path to the gh config directory.
 	pub host_path: Utf8PathBuf,
+}
+
+/// The host's active `gh` OAuth token, projected into the dev
+/// container as `GH_TOKEN`. Resolved via `gh auth token` at
+/// compose-render time, which works regardless of whether the
+/// host stored its credentials in the system keyring or in
+/// `~/.config/gh/hosts.yml` — `gh` reads from whichever path is
+/// configured and prints the token to stdout.
+///
+/// Why an env var and not just the config mount alone:
+///
+/// 1. **Keyring storage.** `gh` defaults to the OS keyring for
+///    new logins (macOS Keychain, GNOME Keyring, Wincred). The
+///    container has no access to the host's keyring, and
+///    `hosts.yml` in that mode carries no `oauth_token:` field —
+///    so the bind mount alone leaves the in-container `gh`
+///    unauthenticated.
+/// 2. **Precedence.** `GH_TOKEN` takes precedence over every
+///    other resolution path, so we get the same answer whichever
+///    way the host happens to be configured.
+/// 3. **No mutation risk.** The container's `gh` can't
+///    accidentally rotate or invalidate the host's token by
+///    writing to a forwarded `hosts.yml`.
+///
+/// Resolved fresh per `render_compose` call — the same cadence
+/// as [`HostGitIdentity`] — so a host `gh auth refresh` is
+/// picked up by the next "Rebuild container".
+///
+/// The token ends up in plaintext inside the generated
+/// `compose.yaml` (under `<state-dir>/`, owned by the user). The
+/// trade-off is deliberate: we'd rather match the host's auth
+/// state than ask the user to re-login per-workspace. The state
+/// dir lives in the user's own data directory and isn't checked
+/// into any repo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostGhToken {
+	pub token: String,
 }
 
 /// The host's `git config --global user.{name,email}`, projected
@@ -245,9 +291,13 @@ pub struct ComposeRenderOptions<'a> {
 	/// "refuse rather than commit as the wrong person" fallback.
 	pub git_identity: Option<&'a HostGitIdentity>,
 	/// Optional host `gh` config bind mount. `None` skips the
-	/// volume entirely (no auth pass-through; `gh` inside the
-	/// container is in its default unauthenticated state).
+	/// volume entirely (no host preferences pass-through).
 	pub gh_config: Option<&'a GhConfigMount>,
+	/// Optional host `gh` OAuth token, emitted as `GH_TOKEN` on
+	/// the dev service. `None` leaves the container's `gh`
+	/// dependent on whatever the bind-mounted config contains —
+	/// which is empty when the host uses the system keyring.
+	pub gh_token: Option<&'a HostGhToken>,
 }
 
 /// Wrap `value` in double quotes, escaping `\` and `"` so an
@@ -368,6 +418,9 @@ pub fn generate_compose(options: ComposeRenderOptions<'_>) -> ComposeRender {
 		env.push(("GIT_COMMITTER_NAME", id.name.clone()));
 		env.push(("GIT_COMMITTER_EMAIL", id.email.clone()));
 	}
+	if let Some(token) = options.gh_token {
+		env.push(("GH_TOKEN", token.token.clone()));
+	}
 	if !env.is_empty() {
 		let _ = writeln!(yaml, "    environment:");
 		for (key, value) in env {
@@ -418,6 +471,7 @@ mod tests {
 			ssh_config: None,
 			git_identity: None,
 			gh_config: None,
+			gh_token: None,
 		});
 
 		assert!(render.yaml.contains("name: moon-ws-default"));
@@ -452,6 +506,7 @@ mod tests {
 			ssh_config: None,
 			git_identity: None,
 			gh_config: None,
+			gh_token: None,
 		});
 		assert!(render.yaml.contains("    init: true"));
 	}
@@ -471,6 +526,7 @@ mod tests {
 			ssh_config: None,
 			git_identity: None,
 			gh_config: None,
+			gh_token: None,
 		});
 
 		assert!(render
@@ -492,6 +548,7 @@ mod tests {
 			ssh_config: None,
 			git_identity: None,
 			gh_config: None,
+			gh_token: None,
 		};
 		let a = generate_compose(opts.clone());
 		let b = generate_compose(opts);
@@ -510,6 +567,7 @@ mod tests {
 			ssh_config: None,
 			git_identity: None,
 			gh_config: None,
+			gh_token: None,
 		});
 		assert!(render.yaml.contains("image: huggingface/moon-base:0.1"));
 	}
@@ -525,6 +583,7 @@ mod tests {
 			ssh_config: None,
 			git_identity: None,
 			gh_config: None,
+			gh_token: None,
 		});
 		assert!(render.yaml.contains("name: moon-ws-scratch"));
 	}
@@ -543,6 +602,7 @@ mod tests {
 			ssh_config: None,
 			git_identity: None,
 			gh_config: None,
+			gh_token: None,
 		});
 
 		assert!(render
@@ -572,6 +632,7 @@ mod tests {
 			ssh_config: None,
 			git_identity: None,
 			gh_config: None,
+			gh_token: None,
 		});
 
 		assert!(!render.yaml.contains("    volumes:\n      []"));
@@ -598,6 +659,7 @@ mod tests {
 			ssh_config: None,
 			git_identity: Some(&identity),
 			gh_config: None,
+			gh_token: None,
 		});
 
 		assert!(
@@ -629,6 +691,7 @@ mod tests {
 			ssh_config: None,
 			git_identity: Some(&identity),
 			gh_config: None,
+			gh_token: None,
 		});
 
 		// One environment block, both keys inside it. Stable order
@@ -656,6 +719,7 @@ mod tests {
 			ssh_config: Some(&cfg),
 			git_identity: None,
 			gh_config: None,
+			gh_token: None,
 		});
 
 		assert!(
@@ -685,6 +749,7 @@ mod tests {
 			ssh_config: Some(&cfg),
 			git_identity: None,
 			gh_config: None,
+			gh_token: None,
 		});
 
 		assert!(!render.yaml.contains("    volumes:\n      []"));
@@ -715,6 +780,7 @@ mod tests {
 			ssh_config: Some(&cfg),
 			git_identity: None,
 			gh_config: None,
+			gh_token: None,
 		});
 
 		assert!(render
@@ -741,6 +807,7 @@ mod tests {
 			ssh_config: None,
 			git_identity: None,
 			gh_config: Some(&gh),
+			gh_token: None,
 		});
 
 		assert!(
@@ -764,11 +831,61 @@ mod tests {
 			ssh_config: None,
 			git_identity: None,
 			gh_config: Some(&gh),
+			gh_token: None,
 		});
 
 		assert!(!render.yaml.contains("    volumes:\n      []"));
 		assert!(
 			render.yaml.contains("- /home/me/.config/gh:/home/dev/.config/gh:ro"),
+			"got:\n{}",
+			render.yaml
+		);
+	}
+
+	#[test]
+	fn gh_token_renders_as_gh_token_env() {
+		let project = project();
+		let token = HostGhToken {
+			token: "gho_abc123".into(),
+		};
+		let render = generate_compose(ComposeRenderOptions {
+			project: &project,
+			dev_image: "moon-base:dev",
+			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
+			ssh_agent: None,
+			ssh_config: None,
+			git_identity: None,
+			gh_config: None,
+			gh_token: Some(&token),
+		});
+
+		assert!(render.yaml.contains("    environment:"), "got:\n{}", render.yaml);
+		assert!(
+			render.yaml.contains("GH_TOKEN: \"gho_abc123\""),
+			"got:\n{}",
+			render.yaml
+		);
+	}
+
+	#[test]
+	fn gh_token_quotes_value_safely() {
+		let project = project();
+		let token = HostGhToken {
+			token: "weird\"value\\with$specials".into(),
+		};
+		let render = generate_compose(ComposeRenderOptions {
+			project: &project,
+			dev_image: "moon-base:dev",
+			bound_mounts: &[],
+			ssh_agent: None,
+			ssh_config: None,
+			git_identity: None,
+			gh_config: None,
+			gh_token: Some(&token),
+		});
+
+		assert!(
+			render.yaml.contains("GH_TOKEN: \"weird\\\"value\\\\with$specials\""),
 			"got:\n{}",
 			render.yaml
 		);
@@ -789,6 +906,7 @@ mod tests {
 			ssh_config: None,
 			git_identity: Some(&identity),
 			gh_config: None,
+			gh_token: None,
 		});
 		// Double-quoted scalar with `"` → `\"` and `\` → `\\`.
 		assert!(

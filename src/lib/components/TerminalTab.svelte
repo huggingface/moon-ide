@@ -1,8 +1,8 @@
 <script lang="ts">
-	import { onDestroy, onMount, untrack } from 'svelte';
-	import { Terminal, type IDisposable, type ILink, type ILinkProvider, type ITheme } from '@xterm/xterm';
+	import { Terminal, type ILink, type ILinkProvider, type ITheme } from '@xterm/xterm';
 	import { FitAddon } from '@xterm/addon-fit';
 	import { WebLinksAddon } from '@xterm/addon-web-links';
+	import type { Attachment } from 'svelte/attachments';
 	import { openUrl } from '@tauri-apps/plugin-opener';
 	import '@xterm/xterm/css/xterm.css';
 
@@ -33,25 +33,29 @@
 	const session = $derived(terminalStore.sessionFor(tab.id));
 	const openError = $derived(session?.openError ?? null);
 
-	let hostEl: HTMLDivElement | null = $state(null);
+	const encoder = new TextEncoder();
+
+	// Live handle to the xterm instance for the click-to-focus
+	// outer wrapper. Set by the attachment on mount and cleared
+	// on unmount. Not `$state` — the click handler reads it
+	// imperatively; no view depends on it.
 	let term: Terminal | null = null;
-	let fitAddon: FitAddon | null = null;
-	let resizeObserver: ResizeObserver | null = null;
-	let fileLinkProvider: IDisposable | null = null;
 
-	onMount(() => {
-		if (!hostEl) {
-			return;
-		}
-
+	// Inline attachment that owns the entire xterm lifecycle:
+	// construction on mount, every event hookup, the
+	// ResizeObserver, and disposal on unmount. Everything xterm-
+	// related is locally scoped here so the component body
+	// stays light. Returns the cleanup callback the attachment
+	// contract expects.
+	const xtermAttachment: Attachment<HTMLDivElement> = (hostEl) => {
 		// `convertEol: false` — we never inject text ourselves;
 		// the host shell takes care of CR/LF semantics. Theme
 		// values are read from the same CSS tokens the editor
-		// uses so terminal and editor coexist visually; a
-		// separate `$effect` below re-applies them when the
-		// active theme flips. Once Phase 8 ships Pierre's
-		// themes, this gets sourced from one place.
-		term = new Terminal({
+		// uses so terminal and editor coexist visually; the
+		// nested `$effect` below re-applies them when the active
+		// theme flips. Once Phase 8 ships Pierre's themes, this
+		// gets sourced from one place.
+		const t = new Terminal({
 			fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace',
 			fontSize: 12,
 			cursorBlink: true,
@@ -59,8 +63,8 @@
 			convertEol: false,
 			theme: terminalThemeFromCss(),
 		});
-		fitAddon = new FitAddon();
-		term.loadAddon(fitAddon);
+		const fit = new FitAddon();
+		t.loadAddon(fit);
 		// xterm's default click handler is `window.open(uri,
 		// '_blank')`, which is a no-op inside Tauri's webview —
 		// the link gets detected and hover-underlined, but the
@@ -68,14 +72,27 @@
 		// (same path the rest of the IDE uses for external URLs)
 		// so clicking `http://localhost:4508` in a container
 		// terminal actually launches the host's default browser.
-		term.loadAddon(
+		t.loadAddon(
 			new WebLinksAddon((event, uri) => {
 				event.preventDefault();
 				void openUrl(uri);
 			}),
 		);
 
-		term.open(hostEl);
+		t.open(hostEl);
+
+		const refit = () => {
+			// Skip the fit when the host element is collapsed
+			// (display:none or zero size); the addon would
+			// compute 0×0 cols/rows and brick the PTY's view of
+			// the screen.
+			if (hostEl.clientWidth === 0 || hostEl.clientHeight === 0) {
+				return;
+			}
+			fit.fit();
+			void terminalStore.resize(tab.id, t.cols, t.rows);
+		};
+
 		// File-link provider — recognise `file:///abs/path:line:col`
 		// URIs and bare absolute paths in the row text and
 		// underline them on hover. Activation is gated on
@@ -87,47 +104,62 @@
 		// uses when opening a container terminal. Resolution
 		// fans out: a host shell that prints container paths or
 		// vice versa still gets links.
-		fileLinkProvider = term.registerLinkProvider(buildFileLinkProvider());
+		const fileLinkProvider = t.registerLinkProvider(buildFileLinkProvider(t));
+
 		// Windows-Terminal-style copy/paste mapping. xterm.js
 		// ships neither by default, so we intercept the keydown
 		// before it reaches the terminal's input pipeline.
-		// `attachCustomKeyEventHandler` returning `false` swallows
-		// the event entirely (no PTY write, no scroll, no bell).
-		// `event.code` is layout-independent — important on a
-		// French keyboard where `event.key` for the C key shifts
-		// to a different glyph.
+		// `attachCustomKeyEventHandler` returning `false`
+		// swallows the event entirely (no PTY write, no scroll,
+		// no bell). `event.code` is layout-independent —
+		// important on a French keyboard where `event.key` for
+		// the C key shifts to a different glyph.
 		//
 		// `Ctrl+C` is overloaded: a non-empty selection copies
 		// (and keeps the selection visible so the user can
 		// re-verify what landed in the clipboard, drag to extend
 		// it, or fire another copy); an empty selection falls
 		// through to xterm's default and sends SIGINT. `Ctrl+V`
-		// always pastes. `Ctrl+L` is swallowed here when text is
-		// selected so the window-level handler in App.svelte
-		// (which forwards the selection to the coder composer)
-		// is the only thing that runs — without this, the shell
-		// would still see `^L` and clear its screen, dropping
-		// the selected scrollback on the floor.
-		// We deliberately don't reserve the `Ctrl+Shift+*`
-		// variants — the user already has unambiguous primaries.
-		term.attachCustomKeyEventHandler((event) => {
-			if (event.type !== 'keydown' || !event.ctrlKey || event.shiftKey || event.altKey || event.metaKey) {
+		// always pastes.
+		//
+		// `Ctrl+Shift+C` / `Ctrl+Shift+V` mirror the bare
+		// variants — gnome-terminal / VS Code / IntelliJ muscle
+		// memory. `Ctrl+Shift+C` with text selected also flashes
+		// a hint that shift isn't required in moon-ide, so the
+		// user retrains naturally toward the single-modifier
+		// path. `Ctrl+Shift+C` with no selection is swallowed
+		// silently (no PTY write, no toast) — the user clearly
+		// wanted a copy and there's nothing to copy.
+		//
+		// `Ctrl+L` is swallowed here when text is selected so
+		// the window-level handler in App.svelte (which forwards
+		// the selection to the coder composer) is the only thing
+		// that runs — without this, the shell would still see
+		// `^L` and clear its screen, dropping the selected
+		// scrollback on the floor.
+		t.attachCustomKeyEventHandler((event) => {
+			if (event.type !== 'keydown' || !event.ctrlKey || event.altKey || event.metaKey) {
 				return true;
 			}
 			if (event.code === 'KeyC') {
-				const text = term?.getSelection() ?? '';
-				if (text.length === 0) {
-					return true;
+				const selected = t.getSelection();
+				if (selected.length === 0) {
+					// No selection: bare Ctrl+C falls through to
+					// xterm's SIGINT default; Ctrl+Shift+C has
+					// nothing to copy, swallow it.
+					return !event.shiftKey;
 				}
+				const message = event.shiftKey ? 'Copied (Shift not needed in moon-ide)' : 'Copied';
 				void navigator.clipboard
-					.writeText(text)
+					.writeText(selected)
 					.then(() => {
-						workspace.flash('Copied');
+						workspace.flash(message);
 					})
 					.catch(() => {
-						// Swallow — failing silently is better than a
-						// modal; the user can retry, or fall back to
-						// the menu copy via right-click selection.
+						// Swallow — failing silently is better
+						// than a modal; the user can retry, or
+						// fall back to the menu copy via right-
+						// click selection.
 					});
 				return false;
 			}
@@ -145,83 +177,93 @@
 					});
 				return false;
 			}
-			if (event.code === 'KeyL' && (term?.getSelection() ?? '').length > 0) {
+			if (event.shiftKey) {
+				return true;
+			}
+			if (event.code === 'KeyL' && t.getSelection().length > 0) {
 				return false;
 			}
 			return true;
 		});
+
 		// Defer the initial fit: in some startup paths the panel
-		// is still settling layout when `onMount` fires, so a
-		// direct `fit()` here can compute a 1-row grid and stick
-		// xterm with it. `refit` skips zero-size containers, and
-		// the ResizeObserver below picks up the first real size.
+		// is still settling layout when the attachment fires, so
+		// a direct `fit()` here can compute a 1-row grid and
+		// stick xterm with it. `refit` skips zero-size containers,
+		// and the ResizeObserver below picks up the first real
+		// size.
 		refit();
 
 		// Hook the store's IO bus. The writer pushes raw bytes
 		// from the supervisor straight into xterm — its ANSI
 		// parser handles colour, cursor, alt-screen, etc.
-		untrack(() => {
-			terminalStore.setWriter(tab.id, (bytes) => {
-				if (term) {
-					term.write(bytes);
-				}
-			});
+		terminalStore.setWriter(tab.id, (bytes) => {
+			t.write(bytes);
 		});
 
 		// Forward keystrokes (and pasted text) to the supervisor.
 		// `onData` already decodes xterm's input modes correctly
 		// (e.g. arrow keys → CSI sequences); we just transport.
-		term.onData((data) => {
+		t.onData((data) => {
 			void terminalStore.writeInput(tab.id, encoder.encode(data));
 		});
 
 		// Mirror xterm's selection state into the terminal store
-		// so App.svelte's Ctrl+L handler can attach the highlighted
-		// scrollback to the coder composer when the editor has
-		// nothing selected. xterm doesn't pass the text on the
-		// event, so we read it via `getSelection()` each fire —
-		// the operation is O(rows) on the live selection range,
-		// fine even for kilobyte drag-selects.
-		term.onSelectionChange(() => {
-			const text = term?.getSelection() ?? '';
-			terminalStore.setSelection(tab.id, text, tab.title);
+		// so App.svelte's Ctrl+L handler can attach the
+		// highlighted scrollback to the coder composer when the
+		// editor has nothing selected. xterm doesn't pass the
+		// text on the event, so we read it via `getSelection()`
+		// each fire — the operation is O(rows) on the live
+		// selection range, fine even for kilobyte drag-selects.
+		t.onSelectionChange(() => {
+			terminalStore.setSelection(tab.id, t.getSelection(), tab.title);
 		});
 
 		// Resize: refit on container resize. The fit addon reads
-		// the host element's bounding box, so this fires whenever
-		// the panel height changes or the user toggles between
-		// tabs (ResizeObserver picks up display:none flipping
-		// back to flex).
-		resizeObserver = new ResizeObserver(() => {
+		// the host element's bounding box, so this fires
+		// whenever the panel height changes or the user toggles
+		// between tabs (ResizeObserver picks up display:none
+		// flipping back to flex).
+		const resizeObserver = new ResizeObserver(() => {
 			refit();
 		});
 		resizeObserver.observe(hostEl);
-	});
 
-	// Re-theme on every dark/light flip. Xterm.js has no CSS-
-	// variable pathway for its colours; the palette is copied into
-	// the Terminal's option bag at construction and stays stale
-	// until we overwrite it. Reading `workspace.effectiveTheme`
-	// (not `workspace.theme`) so "System" also repaints when the
-	// OS preference changes mid-session.
-	$effect(() => {
-		workspace.effectiveTheme;
-		if (!term) {
-			return;
-		}
-		term.options.theme = terminalThemeFromCss();
-	});
+		// Re-theme on every dark/light flip. Xterm.js has no
+		// CSS-variable pathway for its colours; the palette is
+		// copied into the Terminal's option bag at construction
+		// and stays stale until we overwrite it. Reading
+		// `workspace.effectiveTheme` (not `workspace.theme`) so
+		// "System" also repaints when the OS preference changes
+		// mid-session. The first run on mount is redundant with
+		// the constructor's `theme: terminalThemeFromCss()`
+		// above, but writing it the same way every time keeps
+		// the dependency tracking honest.
+		//
+		// Not a `$derived` (the Svelte autofixer's reflex
+		// suggestion): the sink is `t.options.theme`, which is
+		// xterm-owned imperative state, not a Svelte
+		// `$state`/`$derived` value. A derived would still need
+		// an `$effect` to push the result into xterm, which
+		// would just split the dependency tracking across two
+		// surfaces without removing the side effect.
+		$effect(() => {
+			workspace.effectiveTheme;
+			t.options.theme = terminalThemeFromCss();
+		});
 
-	onDestroy(() => {
-		resizeObserver?.disconnect();
-		resizeObserver = null;
-		terminalStore.clearWriter(tab.id);
-		fileLinkProvider?.dispose();
-		fileLinkProvider = null;
-		term?.dispose();
-		term = null;
-		fitAddon = null;
-	});
+		term = t;
+
+		return () => {
+			resizeObserver.disconnect();
+			terminalStore.clearWriter(tab.id);
+			fileLinkProvider.dispose();
+			t.dispose();
+			if (term === t) {
+				term = null;
+			}
+		};
+	};
 
 	/**
 	 * One xterm `ILinkProvider` per Terminal instance. xterm
@@ -239,14 +281,9 @@
 	 * matches that overlap the wrap point). If a path ever
 	 * actually wraps in real usage we revisit then.
 	 */
-	function buildFileLinkProvider(): ILinkProvider {
+	function buildFileLinkProvider(t: Terminal): ILinkProvider {
 		return {
 			provideLinks(y: number, callback: (links: ILink[] | undefined) => void): void {
-				const t = term;
-				if (t === null) {
-					callback(undefined);
-					return;
-				}
 				const buffer = t.buffer.active;
 				const line = buffer.getLine(y - 1);
 				if (line === undefined) {
@@ -298,25 +335,9 @@
 		};
 	}
 
-	function refit() {
-		if (!fitAddon || !term) {
-			return;
-		}
-		// Skip the fit when the host element is collapsed
-		// (display:none or zero size); the addon would compute
-		// 0×0 cols/rows and brick the PTY's view of the screen.
-		if (!hostEl || hostEl.clientWidth === 0 || hostEl.clientHeight === 0) {
-			return;
-		}
-		fitAddon.fit();
-		void terminalStore.resize(tab.id, term.cols, term.rows);
-	}
-
 	function focusTerminal() {
 		term?.focus();
 	}
-
-	const encoder = new TextEncoder();
 
 	function terminalThemeFromCss(): ITheme {
 		// Read from the same CSS tokens the editor uses so
@@ -342,7 +363,7 @@
 			Failed to open terminal: {openError}
 		</div>
 	{:else}
-		<div class="term-host" bind:this={hostEl}></div>
+		<div class="term-host" {@attach xtermAttachment}></div>
 	{/if}
 </div>
 

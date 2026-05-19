@@ -1105,8 +1105,8 @@ What this **doesn't** do (deferred):
 
 The host's `gh` config directory bind-mounts into the dev
 container **read-only** at `/home/dev/.config/gh`, so an
-in-container `gh` shares the host's `gh auth login` session
-without a second sign-in. Sourced from
+in-container `gh` shares the host's per-host preferences
+(default editor, default protocol, etc.). Sourced from
 `$GH_CONFIG_DIR` → `$XDG_CONFIG_HOME/gh` → `~/.config/gh`,
 and skipped entirely if none of those resolves to an existing
 directory (otherwise Docker would auto-create the source as
@@ -1118,6 +1118,8 @@ services:
   dev:
     volumes:
       - /home/me/.config/gh:/home/dev/.config/gh:ro
+    environment:
+      GH_TOKEN: 'gho_…'
 ```
 
 Read-only on purpose: the host owns the auth, the container
@@ -1127,10 +1129,49 @@ surprising and hard to undo; tools that lazily write the
 config (`gh config set`) fail loudly inside the container
 instead of mutating host state.
 
+### Why a `GH_TOKEN` env var alongside the mount
+
+Mounting `~/.config/gh` alone isn't enough to authenticate
+the in-container `gh` when the host stores its credentials in
+the system keyring (macOS Keychain, GNOME Keyring, Wincred —
+the modern `gh auth login` default). In that mode `hosts.yml`
+carries no `oauth_token:` field, and the container has no
+keyring to fall back on, so `gh auth status` inside reports
+`The token in default is invalid.` Worse, `gh api …` against
+private endpoints quietly returns `HTTP 404` because the
+unauthenticated request can't see private repos.
+
+To close that gap moon-ide runs `gh auth token` on the host
+at compose-render time and emits the result as `GH_TOKEN` on
+the `dev` service's `environment:` block. `gh` always reads
+`GH_TOKEN` ahead of any stored credentials, so it works the
+same whichever way the host happens to be configured. The
+token resolves fresh on each render — so `Rebuild container`
+after a host-side `gh auth refresh` picks up the new
+credentials.
+
+The token ends up in plaintext in the generated
+`compose.yaml` under
+`<dirs::data_local_dir>/moon-ide/workspaces/<id>/`. The state
+dir is the user's own data directory, not checked into any
+repo, and the trade-off — versus asking the user to re-login
+per-workspace — favours just-works auth in the team-of-one-
+dev-machine setting moon-ide targets. If a teammate is
+concerned about the on-disk footprint they can `gh auth
+logout` and skip the token forward entirely; the bind mount
+keeps preferences working.
+
+If `gh auth token` exits non-zero (the user has never
+logged in, or the `gh` binary isn't on `$PATH`), the
+`GH_TOKEN` line is omitted and `gh` inside the container
+falls back to whatever the bind-mounted config carries —
+which is the right "match the host" behaviour.
+
 The IDE itself runs `gh pr list` / `gh pr checkout` against
 the **host's** `gh` for the branch-switcher palette (the
 LocalHost path doesn't go through the container) — the bind
-mount exists so that a container terminal feels the same.
+mount + env var exist so that a container terminal feels the
+same.
 
 ## `WorkspaceHost::ContainerHost`
 
