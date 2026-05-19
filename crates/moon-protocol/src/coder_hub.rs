@@ -99,3 +99,39 @@ impl HubNamespace {
 		}
 	}
 }
+
+/// Result of `coder_hub_upload_all_sessions` — the bulk "push
+/// every local session JSONL into the bound bucket" affordance
+/// the settings modal exposes.
+///
+/// The op groups every folder bound to the workspace under one
+/// `xet-write-token` fetch and one `/batch` POST (the Hub's NDJSON
+/// add-file endpoint accepts a stream of entries), so a workspace
+/// with N stale sessions does roughly **two** Hub-API round-trips
+/// plus N parallel Xet CAS uploads — instead of the 3·N round-
+/// trips the per-row "Upload" button would cost.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
+#[ts(export)]
+pub struct HubUploadAllSummary {
+	/// Sessions whose CAS upload + `addFile` landed cleanly.
+	/// Already-synced sessions (matching length in the workspace's
+	/// `uploaded` marker map) don't count here — they bypass the
+	/// upload entirely and are reported in [`skipped`] instead.
+	pub uploaded: u32,
+	/// Sessions skipped because the local JSONL hadn't grown since
+	/// the last successful push. The Hub already has the bytes
+	/// thanks to Xet dedup; we just avoid the round-trip.
+	pub skipped: u32,
+	/// Per-session failure details. Best-effort partial success:
+	/// every uploadable session is attempted independently, so
+	/// one failure doesn't poison the rest.
+	pub failed: Vec<HubUploadFailure>,
+}
+
+/// One session that errored out during `coder_hub_upload_all_sessions`.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct HubUploadFailure {
+	pub session_id: String,
+	pub error: String,
+}

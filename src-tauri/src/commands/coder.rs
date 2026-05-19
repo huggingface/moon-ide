@@ -9,7 +9,7 @@ use camino::Utf8PathBuf;
 use moon_coder::{CoderHandle, CoderStatus, DeviceCode, HfIdentity, ImageAttachment, SessionSummary, UnqueuedSteer};
 use moon_core::app_state as app_state_store;
 use moon_core::session as core_session;
-use moon_protocol::coder_hub::{CoderHubBucket, HubNamespace};
+use moon_protocol::coder_hub::{CoderHubBucket, HubNamespace, HubUploadAllSummary};
 use moon_protocol::coder_models::{
 	CoderModelSettings, CoderProviderConfig, CoderProviderLock, ProviderModelSummary, ProviderProbeResult, RouterModel,
 };
@@ -781,6 +781,22 @@ pub async fn coder_hub_upload_session(state: State<'_, AppState>, session_id: St
 		.upload_session(&id, &folder_path, &session_id)
 		.await
 		.map_err(MoonError::from)
+}
+
+/// Push every local top-level session JSONL across every folder
+/// bound to this workspace, batching one `xet-write-token` fetch
+/// and one `/batch` POST across the whole set. Skips sessions
+/// whose local JSONL is already at the length the `uploaded`
+/// marker recorded — Xet would dedup the bytes anyway, but we
+/// also save the round-trip. Emits per-session
+/// `HubSyncStarted` / `HubSyncFinished` so the panel's row
+/// decorations animate in lockstep.
+#[tauri::command]
+pub async fn coder_hub_upload_all_sessions(state: State<'_, AppState>) -> Result<HubUploadAllSummary, MoonError> {
+	if state.workspace_id().is_none() {
+		return Err(MoonError::invalid("no workspace bound to this process"));
+	}
+	state.coder.hub_upload_all_sessions().await.map_err(MoonError::from)
 }
 
 /// Helper: best-effort basename of the workspace's active folder.

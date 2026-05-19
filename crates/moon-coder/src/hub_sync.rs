@@ -29,8 +29,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use camino::{Utf8Path, Utf8PathBuf};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use moon_core::session as core_session;
-use moon_protocol::coder_hub::{CoderHubBucket, HubNamespace, UploadedMarker};
+use moon_protocol::coder_hub::{CoderHubBucket, HubNamespace, HubUploadAllSummary, HubUploadFailure, UploadedMarker};
 use serde::Deserialize;
 use tokio::sync::broadcast;
 use tokio::sync::Mutex;
@@ -73,6 +74,38 @@ pub struct HubSync {
 }
 
 type DebounceKey = (String, String);
+
+/// One row picked up by [`HubSync::collect_upload_candidates`] —
+/// a session that's stale on the Hub (or never been pushed) and
+/// needs a CAS upload + `addFile` entry. Owns the bytes so the
+/// async upload pool can move them into the Xet client without
+/// re-reading the file.
+struct UploadCandidate {
+	session_id: String,
+	folder_path: Utf8PathBuf,
+	bucket_path: String,
+	bytes: Vec<u8>,
+	len: u64,
+}
+
+/// Output of [`HubSync::collect_upload_candidates`]. The
+/// `skipped` counter folds into the final
+/// [`HubUploadAllSummary`]; the entries feed the parallel CAS
+/// pool.
+#[derive(Default)]
+struct UploadCandidates {
+	entries: Vec<UploadCandidate>,
+	skipped: u32,
+}
+
+/// One session that landed on CAS successfully and is now ready
+/// to be bound on the bucket via the shared `/batch` POST.
+struct UploadResult {
+	session_id: String,
+	bucket_path: String,
+	hash: String,
+	len: u64,
+}
 
 impl HubSync {
 	pub fn new(
@@ -265,6 +298,221 @@ impl HubSync {
 			core_session::save(&self.workspaces_dir, workspace_id, &workspace_session).await?;
 		}
 		Ok(())
+	}
+
+	/// Upload every top-level session JSONL across every folder
+	/// bound to the workspace, batching the Hub round-trips so the
+	/// total wire cost is **one** `xet-write-token` fetch + N
+	/// parallel Xet CAS uploads + **one** `/batch` POST, rather
+	/// than the 3·N round-trips a loop of [`Self::upload_session`]
+	/// would pay.
+	///
+	/// The skip logic is the same byte-length check
+	/// [`Self::upload_session_inner`] uses — sessions whose local
+	/// JSONL hasn't grown since the last successful push are
+	/// skipped entirely (counted under [`HubUploadAllSummary::skipped`]).
+	/// Sub-agent sessions are deliberately **not** uploaded by
+	/// this path: they live under per-parent subdirectories and
+	/// the panel's per-row "Upload" button only ever pushes the
+	/// top-level row's id; matching that mental model keeps "I
+	/// hit Upload all" predictable. A future expansion can fold
+	/// them in once the panel grows a sub-agent row affordance.
+	///
+	/// Best-effort partial success: a single session failing
+	/// doesn't poison the rest. We collect per-session errors in
+	/// [`HubUploadAllSummary::failed`] and still commit the
+	/// `uploaded` marker bump for every session that landed.
+	pub async fn upload_all_sessions(
+		&self,
+		workspace_id: &str,
+		folders: &[Utf8PathBuf],
+	) -> Result<HubUploadAllSummary, CoderError> {
+		let mut workspace_session = core_session::load(&self.workspaces_dir, workspace_id).await?;
+		let Some(bucket) = workspace_session.coder_hub_bucket.as_ref().cloned() else {
+			return Err(CoderError::Internal(
+				"no Hugging Face bucket connected for this workspace".into(),
+			));
+		};
+
+		let candidates = self.collect_upload_candidates(folders, &bucket).await;
+		let mut summary = HubUploadAllSummary {
+			skipped: candidates.skipped,
+			..Default::default()
+		};
+		if candidates.entries.is_empty() {
+			return Ok(summary);
+		}
+
+		// One token covers every CAS push in this batch. The token
+		// is short-lived but plenty long for a batch of dozens of
+		// sessions — the existing per-session path already trusts
+		// the same `exp` window.
+		let token = fetch_xet_write_token(&self.http, &self.auth, &bucket.namespace, &bucket.name).await?;
+		let token = Arc::new(token);
+
+		// Cap parallelism so a workspace with 200 sessions doesn't
+		// open 200 concurrent CAS sessions. 4 mirrors the bucket
+		// our test plan exercises and is well under the Hub's
+		// per-IP soft cap.
+		const MAX_PARALLEL: usize = 4;
+
+		let mut in_flight = FuturesUnordered::new();
+		let mut completed: Vec<UploadResult> = Vec::with_capacity(candidates.entries.len());
+		let mut iter = candidates.entries.into_iter();
+		let push_next = |fu: &mut FuturesUnordered<_>, iter: &mut std::vec::IntoIter<UploadCandidate>| {
+			while fu.len() < MAX_PARALLEL {
+				let Some(candidate) = iter.next() else {
+					break;
+				};
+				let token = token.clone();
+				let UploadCandidate {
+					session_id,
+					folder_path,
+					bucket_path,
+					bytes,
+					len,
+				} = candidate;
+				self.emit(
+					&folder_path,
+					CoderEvent::HubSyncStarted {
+						session_id: session_id.clone(),
+					},
+				);
+				let tracking = bucket_path.clone();
+				fu.push(async move {
+					let outcome = xet_upload_bytes(&token, &tracking, bytes).await;
+					(session_id, folder_path, bucket_path, len, outcome)
+				});
+			}
+		};
+		push_next(&mut in_flight, &mut iter);
+		while let Some((session_id, folder_path, bucket_path, len, outcome)) = in_flight.next().await {
+			match outcome {
+				Ok(hash) => {
+					self.emit(
+						&folder_path,
+						CoderEvent::HubSyncFinished {
+							session_id: session_id.clone(),
+							ok: true,
+							error: None,
+						},
+					);
+					completed.push(UploadResult {
+						session_id,
+						bucket_path,
+						hash,
+						len,
+					});
+				}
+				Err(err) => {
+					self.emit(
+						&folder_path,
+						CoderEvent::HubSyncFinished {
+							session_id: session_id.clone(),
+							ok: false,
+							error: Some(err.to_string()),
+						},
+					);
+					summary.failed.push(HubUploadFailure {
+						session_id,
+						error: err.to_string(),
+					});
+				}
+			}
+			push_next(&mut in_flight, &mut iter);
+		}
+
+		if completed.is_empty() {
+			return Ok(summary);
+		}
+
+		// One batch POST binds every hash we just pushed. The
+		// endpoint accepts a stream of `addFile` lines, so this
+		// is genuinely a single round-trip regardless of how many
+		// sessions are in the set.
+		let entries: Vec<BatchAddFile<'_>> = completed
+			.iter()
+			.map(|r| BatchAddFile {
+				path: r.bucket_path.as_str(),
+				xet_hash: r.hash.as_str(),
+				content_type: SESSION_CONTENT_TYPE,
+			})
+			.collect();
+		match post_add_files(&self.http, &self.auth, &bucket.namespace, &bucket.name, &entries).await {
+			Ok(()) => {
+				if let Some(bucket_mut) = workspace_session.coder_hub_bucket.as_mut() {
+					let at_ms = now_ms();
+					for result in &completed {
+						bucket_mut.uploaded.insert(
+							result.session_id.clone(),
+							UploadedMarker {
+								bytes: result.len,
+								at_ms,
+							},
+						);
+					}
+					core_session::save(&self.workspaces_dir, workspace_id, &workspace_session).await?;
+				}
+				summary.uploaded = completed.len() as u32;
+			}
+			Err(err) => {
+				let detail = err.to_string();
+				for result in completed {
+					summary.failed.push(HubUploadFailure {
+						session_id: result.session_id,
+						error: detail.clone(),
+					});
+				}
+			}
+		}
+		Ok(summary)
+	}
+
+	/// Walk every folder, list top-level sessions, read the JSONL
+	/// bytes, and decide which sessions need a CAS upload vs. can
+	/// be short-circuited at the `uploaded` marker. Read errors
+	/// short-circuit the candidate (logged + counted as a failure
+	/// later if we surface it).
+	async fn collect_upload_candidates(&self, folders: &[Utf8PathBuf], bucket: &CoderHubBucket) -> UploadCandidates {
+		let mut candidates = UploadCandidates::default();
+		for folder in folders {
+			let dir = sessions::sessions_dir(&self.coder_sessions_dir, folder);
+			let summaries = match sessions::list_sessions(&dir).await {
+				Ok(s) => s,
+				Err(err) => {
+					tracing::warn!(error = %err, folder = %folder, "hub upload-all: list_sessions failed");
+					continue;
+				}
+			};
+			for summary in summaries {
+				let path = sessions::session_path(&dir, &summary.id);
+				let bytes = match tokio::fs::read(path.as_std_path()).await {
+					Ok(b) => b,
+					Err(err) => {
+						tracing::warn!(error = %err, path = %path, "hub upload-all: read failed");
+						continue;
+					}
+				};
+				let len = bytes.len() as u64;
+				let already = bucket
+					.uploaded
+					.get(&summary.id)
+					.map(|marker| marker.bytes == len)
+					.unwrap_or(false);
+				if already {
+					candidates.skipped += 1;
+					continue;
+				}
+				candidates.entries.push(UploadCandidate {
+					session_id: summary.id.clone(),
+					folder_path: folder.clone(),
+					bucket_path: bucket_path_for_session(folder, &summary.id),
+					bytes,
+					len,
+				});
+			}
+		}
+		candidates
 	}
 
 	/// Find the JSONL path for `session_id`. Handles both
@@ -462,11 +710,22 @@ async fn xet_upload_bytes(token: &XetWriteToken, tracking_name: &str, bytes: Vec
 	Ok(meta.xet_info.hash().to_string())
 }
 
+/// One row destined for the `/batch` NDJSON body. Carries
+/// borrowed slices so we don't allocate string copies for the
+/// hashes / paths the caller already owns.
+struct BatchAddFile<'a> {
+	path: &'a str,
+	xet_hash: &'a str,
+	content_type: &'a str,
+}
+
 /// `POST /api/buckets/<ns>/<name>/batch` with a single-line
 /// NDJSON body binding `xet_hash` at `path_in_bucket`. The
 /// endpoint accepts a stream of `addFile` / `copyFile` /
-/// `deleteFile` lines; we only ever push one at a time because
-/// each file's CAS upload is independent.
+/// `deleteFile` lines; for the per-session "Upload" button we
+/// only ever push one at a time because each file's CAS upload
+/// is independent. The "Upload all" path uses
+/// [`post_add_files`] to fold many entries into one round-trip.
 async fn post_add_file(
 	http: &reqwest::Client,
 	auth: &Authenticator,
@@ -476,18 +735,44 @@ async fn post_add_file(
 	xet_hash: &str,
 	content_type: &str,
 ) -> Result<(), CoderError> {
+	let entry = BatchAddFile {
+		path: path_in_bucket,
+		xet_hash,
+		content_type,
+	};
+	post_add_files(http, auth, namespace, name, std::slice::from_ref(&entry)).await
+}
+
+/// Batch variant of [`post_add_file`]. Folds N `addFile` rows
+/// into one NDJSON POST so the bulk-upload path doesn't pay a
+/// round-trip per session.
+async fn post_add_files(
+	http: &reqwest::Client,
+	auth: &Authenticator,
+	namespace: &str,
+	name: &str,
+	entries: &[BatchAddFile<'_>],
+) -> Result<(), CoderError> {
+	if entries.is_empty() {
+		return Ok(());
+	}
 	let token = auth.current_access_token().await?;
 	let endpoint = format!("{HF_HUB_BASE}/api/buckets/{namespace}/{name}/batch");
-	let entry = serde_json::json!({
-		"type": "addFile",
-		"path": path_in_bucket,
-		"xetHash": xet_hash,
-		"mtime": now_ms(),
-		"contentType": content_type,
-	});
-	let mut body =
-		serde_json::to_string(&entry).map_err(|err| CoderError::Internal(format!("ndjson encode failed: {err}")))?;
-	body.push('\n');
+	let mtime = now_ms();
+	let mut body = String::new();
+	for entry in entries {
+		let json = serde_json::json!({
+			"type": "addFile",
+			"path": entry.path,
+			"xetHash": entry.xet_hash,
+			"mtime": mtime,
+			"contentType": entry.content_type,
+		});
+		let line =
+			serde_json::to_string(&json).map_err(|err| CoderError::Internal(format!("ndjson encode failed: {err}")))?;
+		body.push_str(&line);
+		body.push('\n');
+	}
 	let response = http
 		.post(&endpoint)
 		.bearer_auth(token)
@@ -504,9 +789,9 @@ async fn post_add_file(
 	}
 	// The batch endpoint always returns a `BATCH_RESPONSE`
 	// shape with per-entry failures even on 200. Surface the
-	// first entry's error if the single push didn't land — the
-	// Hub returns 200 OK with `success: false` rather than a
-	// 4xx in that case, so a raw status check isn't enough.
+	// first failed entry if any entry didn't land — the Hub
+	// returns 200 OK with `success: false` rather than a 4xx in
+	// that case, so a raw status check isn't enough.
 	let parsed: BatchResponse =
 		serde_json::from_str(&response_body).map_err(|err| CoderError::decode(endpoint.clone(), err.to_string()))?;
 	if !parsed.success {

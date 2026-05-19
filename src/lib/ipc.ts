@@ -9,6 +9,7 @@ import type {
 	CoderSessionSummary,
 	CoderStatus,
 	HubNamespace,
+	HubUploadAllSummary,
 	ProviderKind,
 	ProviderModelSummary,
 	ProviderProbeResult,
@@ -369,6 +370,7 @@ export const ipc = {
 		hubSetAutosync: (enabled: boolean) => invoke<void>('coder_hub_set_autosync', { enabled }),
 		hubDisconnect: () => invoke<void>('coder_hub_disconnect'),
 		hubUploadSession: (sessionId: string) => invoke<void>('coder_hub_upload_session', { sessionId }),
+		hubUploadAllSessions: () => invoke<HubUploadAllSummary>('coder_hub_upload_all_sessions'),
 	},
 	ui: {
 		setRightPanel: (kind: RightPanelKind | null) => invoke<void>('ui_set_right_panel', { kind }),

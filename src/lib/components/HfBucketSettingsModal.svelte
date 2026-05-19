@@ -12,7 +12,8 @@
 	//     Hub), the autosync checkbox, and a Disconnect button.
 
 	import { coder } from '../coder.svelte';
-	import { formatError } from '../protocol';
+	import { workspace } from '../state.svelte';
+	import { formatError, type HubUploadAllSummary } from '../protocol';
 	import { onMount } from 'svelte';
 	import HfBucketConnectModal from './HfBucketConnectModal.svelte';
 
@@ -21,6 +22,8 @@
 
 	let connectOpen = $state(false);
 	let actionError = $state<string | null>(null);
+	let uploadingAll = $state(false);
+	let lastUploadAll = $state<HubUploadAllSummary | null>(null);
 
 	onMount(() => {
 		void coder.loadHubBinding();
@@ -31,8 +34,42 @@
 		const checked = (e.target as HTMLInputElement).checked;
 		try {
 			await coder.setHubAutosync(checked);
+			workspace.flash(checked ? 'Autosync on — uploads after every turn.' : 'Autosync off.');
 		} catch (err) {
 			actionError = formatError(err);
+		}
+	}
+
+	async function onUploadAll() {
+		if (uploadingAll) {
+			return;
+		}
+		actionError = null;
+		uploadingAll = true;
+		try {
+			const summary = await coder.uploadAllSessionsToHub();
+			lastUploadAll = summary;
+			const total = summary.uploaded + summary.skipped + summary.failed.length;
+			if (total === 0) {
+				workspace.flash('No sessions to upload yet.');
+			} else if (summary.failed.length === 0) {
+				const parts = [`${summary.uploaded} uploaded`];
+				if (summary.skipped > 0) {
+					parts.push(`${summary.skipped} already up to date`);
+				}
+				workspace.flash(parts.join(', ') + '.');
+			} else {
+				workspace.flash(`Uploaded ${summary.uploaded}, ${summary.failed.length} failed — see modal for details.`);
+			}
+			// Refresh the binding so the per-session `uploaded`
+			// markers we just bumped surface in the session-list
+			// row decoration straight away (the panel only knows
+			// about them via `coder.hubBucket.uploaded`).
+			await coder.loadHubBinding();
+		} catch (err) {
+			actionError = formatError(err);
+		} finally {
+			uploadingAll = false;
 		}
 	}
 
@@ -98,6 +135,34 @@
 			<p class="hint">
 				Manual <code>Upload</code> is always available on each session row, regardless of the autosync toggle.
 			</p>
+
+			<div class="bulk">
+				<button type="button" class="secondary bulk-button" onclick={onUploadAll} disabled={uploadingAll}>
+					{uploadingAll ? 'Uploading sessions…' : 'Upload all sessions now'}
+				</button>
+				<p class="hint">
+					Pushes every local session JSONL from every folder bound to this workspace. One Hub round-trip batches the
+					whole set; sessions already up to date are skipped.
+				</p>
+				{#if lastUploadAll}
+					{@const total = lastUploadAll.uploaded + lastUploadAll.skipped + lastUploadAll.failed.length}
+					{#if total === 0}
+						<p class="hint result">No sessions on disk yet.</p>
+					{:else}
+						<p class="hint result">
+							Last run: <strong>{lastUploadAll.uploaded}</strong> uploaded, <strong>{lastUploadAll.skipped}</strong>
+							already up to date{#if lastUploadAll.failed.length > 0}, <strong>{lastUploadAll.failed.length}</strong> failed{/if}.
+						</p>
+						{#if lastUploadAll.failed.length > 0}
+							<ul class="failures">
+								{#each lastUploadAll.failed as failure (failure.session_id)}
+									<li><code>{failure.session_id}</code>: {failure.error}</li>
+								{/each}
+							</ul>
+						{/if}
+					{/if}
+				{/if}
+			</div>
 
 			{#if actionError}
 				<p class="error" role="alert">{actionError}</p>
@@ -214,6 +279,35 @@
 		font-size: 11px;
 		color: var(--m-fg-subtle);
 		margin: 0;
+	}
+	.bulk {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		padding: 10px 12px;
+	}
+	.bulk-button {
+		align-self: flex-start;
+	}
+	.bulk-button:disabled {
+		cursor: progress;
+		opacity: 0.7;
+	}
+	.result {
+		margin-top: 2px;
+	}
+	.failures {
+		margin: 4px 0 0;
+		padding-left: 18px;
+		font-size: 11px;
+		color: var(--m-danger);
+		max-height: 100px;
+		overflow-y: auto;
+	}
+	.failures li {
+		margin-bottom: 2px;
 	}
 	.error {
 		font-size: 12px;

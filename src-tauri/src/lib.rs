@@ -242,6 +242,7 @@ pub fn run() {
 			commands::coder::coder_hub_set_autosync,
 			commands::coder::coder_hub_disconnect,
 			commands::coder::coder_hub_upload_session,
+			commands::coder::coder_hub_upload_all_sessions,
 			commands::ui::ui_set_right_panel,
 		])
 		.setup(move |app| {

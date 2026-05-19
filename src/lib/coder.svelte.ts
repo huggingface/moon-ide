@@ -30,6 +30,7 @@ import {
 	type DeviceCode,
 	type HfIdentity,
 	type HubNamespace,
+	type HubUploadAllSummary,
 	type ImageAttachmentPayload,
 	type ProviderKind,
 	type ProviderModelSummary,
@@ -536,6 +537,23 @@ class CoderPanelState {
 	 *  events, not from this resolution). */
 	async uploadSessionToHub(sessionId: string): Promise<void> {
 		await ipc.coder.hubUploadSession(sessionId);
+	}
+
+	/** Push every local session JSONL across every folder bound
+	 *  to the workspace into the Hub bucket in one batched run.
+	 *  Backend folds the round-trips: one `xet-write-token`
+	 *  fetch, parallel CAS uploads, one `/batch` POST that binds
+	 *  every newly-uploaded hash. Skipped sessions are those
+	 *  whose local JSONL bytes still match the last successful
+	 *  push; `failed` carries per-session errors with best-effort
+	 *  partial success (the rest of the batch still lands).
+	 *
+	 *  Per-row decoration animates via the same
+	 *  `HubSyncStarted` / `HubSyncFinished` events the
+	 *  single-session upload uses, so the panel doesn't need a
+	 *  separate progress channel. */
+	async uploadAllSessionsToHub(): Promise<HubUploadAllSummary> {
+		return ipc.coder.hubUploadAllSessions();
 	}
 
 	/** Fetch the router catalog. One round trip per call. The result

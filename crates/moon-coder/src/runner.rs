@@ -452,6 +452,26 @@ impl CoderHandle {
 			.map(|entry| entry.folder.path.clone())
 	}
 
+	/// Bulk-upload every top-level session JSONL across every
+	/// folder bound to this workspace into the connected HF Hub
+	/// bucket. Delegates to [`crate::hub_sync::HubSync::upload_all_sessions`]
+	/// after fetching the folder list off the registry — keeps the
+	/// `src-tauri` command boilerplate-free and folds the Hub
+	/// round-trips so a workspace with N stale sessions doesn't
+	/// pay 3·N round-trips.
+	pub async fn hub_upload_all_sessions(&self) -> Result<moon_protocol::coder_hub::HubUploadAllSummary, CoderError> {
+		let workspace_id = self.state.workspaces.workspace_id().await;
+		let folders: Vec<Utf8PathBuf> = self
+			.state
+			.workspaces
+			.folders()
+			.await
+			.into_iter()
+			.map(|entry| Utf8PathBuf::from(&entry.folder.path))
+			.collect();
+		self.state.hub_sync.upload_all_sessions(&workspace_id, &folders).await
+	}
+
 	/// True iff a Tavily API key is currently stored in the
 	/// keyring. The panel reads this on the model-settings popover
 	/// to flip the web-search section between "set a key" and

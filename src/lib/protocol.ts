@@ -1591,6 +1591,24 @@ export type UploadedMarker = {
  *  Mirrors `moon_protocol::coder_hub::HubNamespace`. */
 export type HubNamespace = { kind: 'user'; name: string } | { kind: 'org'; name: string };
 
+/** Result of the bulk "Upload all sessions" affordance. Mirrors
+ *  `moon_protocol::coder_hub::HubUploadAllSummary`. `uploaded` +
+ *  `skipped` + `failed.length` is the total session count touched
+ *  by the run — `skipped` is "already at-length on the Hub" and
+ *  bypasses the round-trip entirely. */
+export type HubUploadAllSummary = {
+	uploaded: number;
+	skipped: number;
+	failed: HubUploadFailure[];
+};
+
+/** Per-session failure detail in [`HubUploadAllSummary`]. Mirrors
+ *  `moon_protocol::coder_hub::HubUploadFailure`. */
+export type HubUploadFailure = {
+	session_id: string;
+	error: string;
+};
+
 /** Live status reported by the runner while a session JSONL is
  *  being pushed to the Hub. Drives the cloud-icon state on the
  *  session-list rows. Per-folder via `CoderEventEnvelope`. */
