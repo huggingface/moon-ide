@@ -711,36 +711,45 @@
 	 * pinned, which makes line-by-line comparison painful.
 	 *
 	 * We mirror `scrollLeft` either way: a scroll on `a` writes to
-	 * `b` and vice-versa. The `syncing` flag breaks the loop —
-	 * `scroll` events from a programmatic `scrollLeft` write are
-	 * dispatched on the next animation frame, so a microtask
-	 * would clear the guard too early and the echo would write
-	 * back. `requestAnimationFrame` outlasts that echo. The
-	 * clamp case — source scrolled past target's `scrollWidth` —
-	 * also relies on this: after the clamp, the echo on the
-	 * narrower side would otherwise yank the wider side back to
-	 * the clamped value.
+	 * `b` and vice-versa. Naively guarding with a time-windowed
+	 * `syncing` flag (microtask / rAF) is racy when the two sides
+	 * have different `scrollWidth`s: the wider side scrolls past
+	 * the narrower side's max, the narrower side clamps, and the
+	 * deferred `scroll` echo on the narrower side then yanks the
+	 * wider side back to the clamped value. That's the "snaps
+	 * back sometimes" behaviour reported on long-line diffs.
+	 *
+	 * Instead we identify echoes by *value*: when we mirror
+	 * `from → to`, we record the value `to` will settle at (after
+	 * the browser clamps it to `to`'s max scroll) as `expected[to]`.
+	 * The next `scroll` event on `to` that matches `expected[to]`
+	 * is consumed as the echo and cleared; anything else is a
+	 * real user scroll and propagates. This is correct regardless
+	 * of frame timing.
 	 *
 	 * Returns a cleanup that removes both listeners. Caller (the
 	 * `onMount` teardown above) drops it on diff-view unmount.
 	 */
 	function wireHorizontalScrollSync(a: HTMLElement, b: HTMLElement): () => void {
-		let syncing = false;
-		const mirror = (from: HTMLElement, to: HTMLElement) => {
-			if (syncing) {
+		const expected = new WeakMap<HTMLElement, number>();
+		const handle = (from: HTMLElement, to: HTMLElement) => {
+			const pending = expected.get(from);
+			if (pending !== undefined && from.scrollLeft === pending) {
+				// Echo from our own programmatic write to `from`.
+				expected.delete(from);
 				return;
 			}
-			if (to.scrollLeft === from.scrollLeft) {
+			expected.delete(from);
+			const toMax = Math.max(0, to.scrollWidth - to.clientWidth);
+			const target = Math.min(from.scrollLeft, toMax);
+			if (to.scrollLeft === target) {
 				return;
 			}
-			syncing = true;
-			to.scrollLeft = from.scrollLeft;
-			requestAnimationFrame(() => {
-				syncing = false;
-			});
+			expected.set(to, target);
+			to.scrollLeft = target;
 		};
-		const onA = () => mirror(a, b);
-		const onB = () => mirror(b, a);
+		const onA = () => handle(a, b);
+		const onB = () => handle(b, a);
 		a.addEventListener('scroll', onA, { passive: true });
 		b.addEventListener('scroll', onB, { passive: true });
 		return () => {

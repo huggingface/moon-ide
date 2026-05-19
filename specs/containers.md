@@ -129,12 +129,19 @@ Under the hood the IDE just shells out:
 
 ```
 docker compose -f <folder>/docker-compose.yml \
+  -f <state-dir>/project-overrides/<folder-slug>.yaml \
   -p moon-ws-<id>-<folder-slug> \
   <up|pause|down|...>
 ```
 
-The folder slug is the lower-cased basename with non-alnum
-characters collapsed to `-`. Both projects share the
+The second `-f` is a moon-ide-generated **restart-policy
+override** that neutralises `restart: always` (or any other
+policy) in the user's compose so the IDE's `docker compose stop`
+on quit isn't fought by the daemon. The user's compose file on
+disk is never modified — see
+[ADR 0017](decisions/0017-project-compose-restart-override.md)
+for the rationale. The folder slug is the lower-cased basename
+with non-alnum characters collapsed to `-`. Both projects share the
 `moon-ws-<id>-` prefix, so a single
 `docker compose ls --filter name=moon-ws-default-`
 enumerates everything the workspace owns:
@@ -540,7 +547,12 @@ runs `docker compose stop` against:
 - every bound folder's compose project (`moon-ws-<id>-<slug>`)
   that has a discoverable `docker-compose.yml` at its root.
 
-Then it exits. The window is hidden first so the UI doesn't
+Then it exits. Per-folder compose projects get the
+restart-policy override applied at create time (see
+[ADR 0017](decisions/0017-project-compose-restart-override.md)),
+so `stop` is final — the daemon doesn't respawn services
+behind us even if the user's compose declared
+`restart: always`. The window is hidden first so the UI doesn't
 look frozen for the ~10s of SIGTERM grace period; the actual
 stops run in a background tokio task off the Tauri event
 loop, and the process calls `app.exit(0)` once they finish.

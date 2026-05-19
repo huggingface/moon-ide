@@ -72,6 +72,7 @@ pub async fn stop_all(state: &AppState) {
 
 	let snapshot = state.workspaces.snapshot().await;
 	let workspace_id = snapshot.id.clone();
+	let state_dir = state.workspace_state_dir(&workspace_id);
 	let bound: Vec<Utf8PathBuf> = snapshot.folders.iter().map(|f| Utf8PathBuf::from(&f.path)).collect();
 
 	// Capture which folders were `Running` *before* we stop
@@ -83,7 +84,7 @@ pub async fn stop_all(state: &AppState) {
 	let mut auto_resume: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
 
 	for folder in &bound {
-		match ProjectCompose::for_folder(&workspace_id, folder) {
+		match ProjectCompose::for_folder(&workspace_id, &state_dir, folder) {
 			Ok(Some(project)) => {
 				let was_running = match project.status().await {
 					Ok(status) => status.state == ContainerState::Running,
@@ -217,6 +218,7 @@ pub async fn auto_resume_shell(state: &AppState) {
 pub async fn auto_resume_project_composes(state: &AppState) {
 	let snapshot = state.workspaces.snapshot().await;
 	let workspace_id = snapshot.id.clone();
+	let state_dir = state.workspace_state_dir(&workspace_id);
 
 	let session = match moon_core::session::load(&state.workspaces_dir, &workspace_id).await {
 		Ok(s) => s,
@@ -240,7 +242,7 @@ pub async fn auto_resume_project_composes(state: &AppState) {
 			continue;
 		}
 		let folder_path = Utf8PathBuf::from(&folder.path);
-		let project = match ProjectCompose::for_folder(&workspace_id, &folder_path) {
+		let project = match ProjectCompose::for_folder(&workspace_id, &state_dir, &folder_path) {
 			Ok(Some(p)) => p,
 			Ok(None) => {
 				tracing::warn!(folder = %folder_path, "auto_resume_project_composes: marked but no compose file found; skipping");

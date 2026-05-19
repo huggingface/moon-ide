@@ -406,29 +406,37 @@
 	 * lines force one side into horizontal overflow, dragging
 	 * either side's bar (or wheel-scrolling horizontally) drags
 	 * the other in lockstep so the aligned chunks line up
-	 * visually. A `syncing` flag plus `requestAnimationFrame`
-	 * release breaks the echo loop (browser dispatches the
-	 * mirrored scroll event on the next frame, so a microtask
-	 * would clear the guard too early). Returns a cleanup that
-	 * the section's onMount teardown invokes on unmount.
+	 * visually.
+	 *
+	 * Echoes from our own programmatic writes are identified by
+	 * value (not by a time-windowed flag) so unequal `scrollWidth`s
+	 * — the wider side scrolling past the narrower's max — don't
+	 * race the rAF-release and snap the wider side back to the
+	 * clamped value. See `DiffView.svelte` for the long-form
+	 * rationale.
+	 *
+	 * Returns a cleanup that the section's onMount teardown
+	 * invokes on unmount.
 	 */
 	function wireHorizontalScrollSync(a: HTMLElement, b: HTMLElement): () => void {
-		let syncing = false;
-		const mirror = (from: HTMLElement, to: HTMLElement) => {
-			if (syncing) {
+		const expected = new WeakMap<HTMLElement, number>();
+		const handle = (from: HTMLElement, to: HTMLElement) => {
+			const pending = expected.get(from);
+			if (pending !== undefined && from.scrollLeft === pending) {
+				expected.delete(from);
 				return;
 			}
-			if (to.scrollLeft === from.scrollLeft) {
+			expected.delete(from);
+			const toMax = Math.max(0, to.scrollWidth - to.clientWidth);
+			const target = Math.min(from.scrollLeft, toMax);
+			if (to.scrollLeft === target) {
 				return;
 			}
-			syncing = true;
-			to.scrollLeft = from.scrollLeft;
-			requestAnimationFrame(() => {
-				syncing = false;
-			});
+			expected.set(to, target);
+			to.scrollLeft = target;
 		};
-		const onA = () => mirror(a, b);
-		const onB = () => mirror(b, a);
+		const onA = () => handle(a, b);
+		const onB = () => handle(b, a);
 		a.addEventListener('scroll', onA, { passive: true });
 		b.addEventListener('scroll', onB, { passive: true });
 		return () => {
