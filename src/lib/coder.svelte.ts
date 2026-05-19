@@ -343,19 +343,28 @@ class FolderState {
 	 *  a new session bucket is minted on first event. */
 	sessionsById = new SvelteMap<string, SessionViewState>();
 
-	/** Lazy-create and return the bucket for `visibleSessionId`.
-	 *  Returns a placeholder bucket when the id is `null` so
-	 *  consumers don't need to null-guard every read; the
-	 *  placeholder lives under the empty-string key, which can
-	 *  never collide with a real session id. */
+	/** Empty fallback returned by [`visibleSession`] when no real
+	 *  session is mounted yet (`visibleSessionId === null` or the
+	 *  bucket simply hasn't been materialised). Held as a stable
+	 *  instance per folder so reading session-scoped fields
+	 *  through the panel getters is side-effect free — mutating
+	 *  `sessionsById` from inside `visibleSession` would trip
+	 *  `state_unsafe_mutation` on every `$derived` / template
+	 *  read that walked through it. */
+	#emptySession = new SessionViewState();
+
+	/** Return the bucket for `visibleSessionId`, or a stable
+	 *  empty placeholder when no session is mounted / the id
+	 *  hasn't been materialised yet. Pure read — never mutates
+	 *  `sessionsById`. The event dispatcher populates real
+	 *  buckets through [`CoderPanelState.sessionStateFor`] when
+	 *  the first envelope for a session id arrives. */
 	visibleSession(): SessionViewState {
-		const id = this.visibleSessionId ?? '';
-		let entry = this.sessionsById.get(id);
-		if (!entry) {
-			entry = new SessionViewState();
-			this.sessionsById.set(id, entry);
+		const id = this.visibleSessionId;
+		if (id === null) {
+			return this.#emptySession;
 		}
-		return entry;
+		return this.sessionsById.get(id) ?? this.#emptySession;
 	}
 
 	/** "Is the session with `sessionId` currently running a
