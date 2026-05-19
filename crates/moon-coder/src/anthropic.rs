@@ -638,10 +638,31 @@ impl StreamState {
 /// including the cache split) and `message_delta` (final
 /// `output_tokens`). Combine the two snapshots so the runner sees
 /// one consistent [`TokenUsage`].
+///
+/// **Anthropic's `input_tokens` is *only the non-cached portion***
+/// of the prompt — `cache_read_input_tokens` and
+/// `cache_creation_input_tokens` are reported alongside it, *not*
+/// as a sub-breakdown. The total prompt size (what actually fills
+/// the model's context window) is the sum of all three. We
+/// surface that sum as `prompt_tokens` so the context-window ring
+/// and the compaction trigger see the real footprint — otherwise
+/// a heavily-cached long session would show `1 / 1M` and never
+/// auto-compact even at 90 % of the window. The OpenAI-compatible
+/// `prompt_tokens` follows the same convention (full input,
+/// regardless of how it was billed); this just keeps the two
+/// providers' semantics aligned.
 fn merge_usage(existing: Option<TokenUsage>, incoming: AnthropicUsage) -> TokenUsage {
 	let mut out = existing.unwrap_or_default();
+	// Recover the raw, non-cached `input_tokens` from a prior
+	// merge by subtracting the cache split we already rolled in.
+	// `message_delta` typically only carries `output_tokens`, so
+	// the cache fields stay stable and this round-trips cleanly.
+	let mut raw_input = out
+		.prompt_tokens
+		.saturating_sub(out.cache_read_input_tokens)
+		.saturating_sub(out.cache_creation_input_tokens);
 	if let Some(v) = incoming.input_tokens {
-		out.prompt_tokens = v;
+		raw_input = v;
 	}
 	if let Some(v) = incoming.output_tokens {
 		out.completion_tokens = v;
@@ -652,12 +673,12 @@ fn merge_usage(existing: Option<TokenUsage>, incoming: AnthropicUsage) -> TokenU
 	if let Some(v) = incoming.cache_creation_input_tokens {
 		out.cache_creation_input_tokens = v;
 	}
-	// Anthropic's "input" doesn't include the cache numbers as a
-	// separate line — they're a *breakdown* of the input total.
-	// Compute `total_tokens` defensively for the runner's
-	// consumers: prompt + completion. Same convention the OpenAI
-	// usage shape uses when the provider doesn't explicitly emit
-	// it.
+	// Roll the cache portions into `prompt_tokens` so it matches
+	// the full-input convention every other provider uses. See
+	// the doc comment above for why.
+	out.prompt_tokens = raw_input
+		.saturating_add(out.cache_read_input_tokens)
+		.saturating_add(out.cache_creation_input_tokens);
 	out.total_tokens = out.prompt_tokens.saturating_add(out.completion_tokens);
 	out
 }
@@ -828,6 +849,14 @@ impl NonStreamResponse {
 			if let Some(v) = u.cache_creation_input_tokens {
 				out.cache_creation_input_tokens = v;
 			}
+			// Anthropic's `input_tokens` is the non-cached portion
+			// only; roll the cache numbers in so `prompt_tokens`
+			// matches the full-input convention. See `merge_usage`
+			// for the long-form rationale.
+			out.prompt_tokens = out
+				.prompt_tokens
+				.saturating_add(out.cache_read_input_tokens)
+				.saturating_add(out.cache_creation_input_tokens);
 			out.total_tokens = out.prompt_tokens.saturating_add(out.completion_tokens);
 			out
 		});
@@ -1134,6 +1163,70 @@ mod tests {
 		assert_eq!(usage.prompt_tokens, 12);
 		assert_eq!(usage.completion_tokens, 5);
 		assert_eq!(usage.total_tokens, 17);
+	}
+
+	#[test]
+	fn non_stream_usage_rolls_cache_portions_into_prompt_tokens() {
+		// Anthropic's `input_tokens` reports only the non-cached
+		// portion of the prompt. On a long, heavily-cached session
+		// it collapses to a handful of tokens while the real prompt
+		// sits in `cache_read_input_tokens`. The runner treats
+		// `prompt_tokens` as the full input (compaction trigger,
+		// context-window ring denominator), so we roll the cache
+		// numbers in here.
+		let body = serde_json::json!({
+			"content": [{"type": "text", "text": "ok"}],
+			"usage": {
+				"input_tokens": 3,
+				"output_tokens": 5,
+				"cache_read_input_tokens": 180_000,
+				"cache_creation_input_tokens": 2_000
+			}
+		});
+		let parsed: NonStreamResponse = serde_json::from_value(body).unwrap();
+		let usage = parsed.into_assistant_response().usage.expect("usage");
+		assert_eq!(usage.prompt_tokens, 182_003);
+		assert_eq!(usage.cache_read_input_tokens, 180_000);
+		assert_eq!(usage.cache_creation_input_tokens, 2_000);
+		assert_eq!(usage.completion_tokens, 5);
+		assert_eq!(usage.total_tokens, 182_008);
+	}
+
+	#[test]
+	fn merge_usage_rolls_cache_portions_into_prompt_tokens() {
+		// Streaming path: `message_start` carries `input_tokens` +
+		// cache split; `message_delta` carries `output_tokens`.
+		// After merging both snapshots `prompt_tokens` must
+		// represent the full input, matching the OpenAI-compat
+		// convention.
+		let after_start = merge_usage(
+			None,
+			AnthropicUsage {
+				input_tokens: Some(3),
+				output_tokens: None,
+				cache_read_input_tokens: Some(180_000),
+				cache_creation_input_tokens: Some(2_000),
+			},
+		);
+		assert_eq!(after_start.prompt_tokens, 182_003);
+		assert_eq!(after_start.cache_read_input_tokens, 180_000);
+		assert_eq!(after_start.cache_creation_input_tokens, 2_000);
+
+		let after_delta = merge_usage(
+			Some(after_start),
+			AnthropicUsage {
+				input_tokens: None,
+				output_tokens: Some(42),
+				cache_read_input_tokens: None,
+				cache_creation_input_tokens: None,
+			},
+		);
+		// `message_delta` only adds output_tokens — re-merging
+		// must not double-count the cache portions into
+		// `prompt_tokens`.
+		assert_eq!(after_delta.prompt_tokens, 182_003);
+		assert_eq!(after_delta.completion_tokens, 42);
+		assert_eq!(after_delta.total_tokens, 182_045);
 	}
 
 	#[test]
