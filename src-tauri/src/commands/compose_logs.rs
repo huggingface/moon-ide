@@ -99,7 +99,8 @@ async fn require_project_handle(state: &AppState, folder_path: &Utf8Path) -> Res
 	if !bound {
 		return Err(MoonError::NotFound(format!("folder {folder_path}")));
 	}
-	let pc = ProjectCompose::for_folder(&snapshot.id, folder_path)?
+	let state_dir = state.workspace_state_dir(&snapshot.id);
+	let pc = ProjectCompose::for_folder(&snapshot.id, &state_dir, folder_path)?
 		.ok_or_else(|| MoonError::NotFound(format!("no compose file in {folder_path}")))?;
 	Ok(pc)
 }

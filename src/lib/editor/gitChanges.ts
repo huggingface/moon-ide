@@ -474,13 +474,37 @@ function jumpToLine(view: EditorView, lineNo: number): void {
 }
 
 /**
- * Step the caret to the next git-change line below the current
- * caret. Returns `true` when the `gitChangesField` is installed
- * (i.e. this editor has the gitChanges extension) regardless of
- * whether there's somewhere to jump to — the binding deliberately
- * shadows CodeMirror's default `Alt-ArrowDown` (`moveLineDown`)
- * even on a clean buffer; the team wants Alt+Down to mean
- * "next change", not "move line", everywhere.
+ * Collapse a sorted line array into contiguous `[start, end]`
+ * blocks. Two change lines are part of the same block when they're
+ * directly adjacent (`n + 1 === next`); a gap of even one unchanged
+ * line breaks the run. Used by the Alt-Up / Alt-Down nav so a
+ * five-line modified hunk counts as one stop, not five.
+ */
+function changeBlocks(lines: number[]): Array<{ start: number; end: number }> {
+	const blocks: Array<{ start: number; end: number }> = [];
+	for (const n of lines) {
+		const last = blocks.at(-1);
+		if (last && n === last.end + 1) {
+			last.end = n;
+		} else {
+			blocks.push({ start: n, end: n });
+		}
+	}
+	return blocks;
+}
+
+/**
+ * Step the caret to the start of the next git-change block below
+ * the current caret. A "block" is a run of contiguous change lines
+ * — adjacent added / modified / deletion-anchor rows fold into one
+ * stop, so a five-line hunk takes one keystroke to skip, not five.
+ *
+ * Returns `true` when the `gitChangesField` is installed (i.e. this
+ * editor has the gitChanges extension) regardless of whether
+ * there's somewhere to jump to — the binding deliberately shadows
+ * CodeMirror's default `Alt-ArrowDown` (`moveLineDown`) even on a
+ * clean buffer; the team wants Alt+Down to mean "next change", not
+ * "move line", everywhere.
  *
  * Returns `false` when the field isn't installed so the binding
  * falls through to whatever else is bound (host-level handlers,
@@ -492,38 +516,46 @@ export const goToNextChange: Command = (view) => {
 	if (!changes) {
 		return false;
 	}
-	const lines = changeLines(changes);
-	if (lines.length === 0) {
+	const blocks = changeBlocks(changeLines(changes));
+	if (blocks.length === 0) {
 		return true;
 	}
 	const caretLine = view.state.doc.lineAt(view.state.selection.main.head).number;
-	const next = lines.find((n) => n > caretLine);
+	// Strictly past the end of whatever block the caret is in (or
+	// past the caret line if it's not in a block) so holding the
+	// key walks one block at a time instead of nudging through
+	// every row of a long hunk.
+	const next = blocks.find((b) => b.start > caretLine);
 	if (next === undefined) {
 		return true;
 	}
-	jumpToLine(view, next);
+	jumpToLine(view, next.start);
 	return true;
 };
 
 /**
- * Step the caret to the previous git-change line above the
- * current caret. Mirror of `goToNextChange` — see that doc for
- * the return-value contract.
+ * Step the caret to the start of the previous git-change block
+ * above the current caret. Mirror of `goToNextChange` — see that
+ * doc for the block-collapsing rule and return-value contract.
  */
 export const goToPreviousChange: Command = (view) => {
 	const changes = view.state.field(gitChangesField, false);
 	if (!changes) {
 		return false;
 	}
-	const lines = changeLines(changes);
-	if (lines.length === 0) {
+	const blocks = changeBlocks(changeLines(changes));
+	if (blocks.length === 0) {
 		return true;
 	}
 	const caretLine = view.state.doc.lineAt(view.state.selection.main.head).number;
-	let prev: number | undefined;
-	for (const n of lines) {
-		if (n < caretLine) {
-			prev = n;
+	// Find the last block whose end is strictly above the caret.
+	// If the caret sits inside a block, that block's `end >=
+	// caretLine` so we skip it and land on the previous one —
+	// keeping the gesture symmetric with `goToNextChange`.
+	let prev: { start: number; end: number } | undefined;
+	for (const b of blocks) {
+		if (b.end < caretLine) {
+			prev = b;
 		} else {
 			break;
 		}
@@ -531,6 +563,6 @@ export const goToPreviousChange: Command = (view) => {
 	if (prev === undefined) {
 		return true;
 	}
-	jumpToLine(view, prev);
+	jumpToLine(view, prev.start);
 	return true;
 };

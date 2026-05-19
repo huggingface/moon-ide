@@ -437,7 +437,7 @@ impl Workspace {
 	async fn reattach_running_projects(&self) {
 		let dev = dev_container_name(&self.project);
 		for folder in &self.bound_folders {
-			let pc = match ProjectCompose::for_folder(&self.workspace_id, folder) {
+			let pc = match ProjectCompose::for_folder(&self.workspace_id, &self.state_dir, folder) {
 				Ok(Some(pc)) => pc,
 				Ok(None) => continue,
 				Err(err) => {
@@ -484,10 +484,9 @@ pub(crate) struct DockerOutput {
 
 /// Run `docker compose -f <compose> -p <project> <args...>`.
 ///
-/// Used by both the workspace shell ([`Workspace`]) and the
-/// per-folder project runner ([`crate::project_compose`]) — both
-/// pin `-f` and `-p` explicitly so the spawned process's CWD or
-/// any ambient `.env` never colours the result.
+/// Used by the workspace shell ([`Workspace`]). Per-folder
+/// project services go through [`run_docker_compose_with_overrides`]
+/// so they can layer the restart-policy override on top.
 pub(crate) async fn run_docker_compose<I, S>(
 	compose_path: &Utf8Path,
 	project: &ProjectName,
@@ -497,9 +496,39 @@ where
 	I: IntoIterator<Item = S>,
 	S: AsRef<OsStr>,
 {
+	run_docker_compose_with_overrides::<_, _, &Utf8Path>(compose_path, &[], project, args).await
+}
+
+/// Run `docker compose -f <compose> [-f <override>]... -p
+/// <project> <args...>`.
+///
+/// Used by both the workspace shell (via [`run_docker_compose`],
+/// no overrides) and the per-folder project runner (with the
+/// generated restart-policy override layered on top). Both pin
+/// `-f` and `-p` explicitly so the spawned process's CWD or any
+/// ambient `.env` never colours the result.
+///
+/// Compose merge semantics: later `-f` files override earlier
+/// ones key by key — exactly the behaviour the restart override
+/// needs (the override's `restart: "no"` wins, anything else in
+/// the base file stays).
+pub(crate) async fn run_docker_compose_with_overrides<I, S, P>(
+	compose_path: &Utf8Path,
+	override_paths: &[P],
+	project: &ProjectName,
+	args: I,
+) -> Result<DockerOutput, LifecycleError>
+where
+	I: IntoIterator<Item = S>,
+	S: AsRef<OsStr>,
+	P: AsRef<Utf8Path>,
+{
 	let mut cmd = Command::new("docker");
 	cmd.arg("compose");
 	cmd.arg("-f").arg(compose_path.as_std_path());
+	for over in override_paths {
+		cmd.arg("-f").arg(over.as_ref().as_std_path());
+	}
 	cmd.arg("-p").arg(project.as_str());
 	for arg in args {
 		cmd.arg(arg);

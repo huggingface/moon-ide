@@ -67,11 +67,12 @@ use camino::{Utf8Path, Utf8PathBuf};
 use moon_protocol::container::{ContainerState, ContainerStatus};
 
 use crate::discovery::{discover_root_compose, DiscoveredCompose};
-use crate::lifecycle::{aggregate_state, parse_ps_output, run_docker_compose, LifecycleError};
+use crate::lifecycle::{aggregate_state, parse_ps_output, run_docker_compose_with_overrides, LifecycleError};
 use crate::network::{
 	connect_container_to_network, dev_container_name, disconnect_container_from_network, project_default_network,
 };
 use crate::project::{folder_slug, project_name_for_folder, project_name_for_id, ProjectName};
+use crate::restart_override::ensure_restart_override;
 
 /// Handle for a single bound folder's compose project.
 ///
@@ -91,6 +92,15 @@ pub struct ProjectCompose {
 	relative_path: Utf8PathBuf,
 	project: ProjectName,
 	workspace_project: ProjectName,
+	/// Workspace state dir (`<workspaces_dir>/<id>/`). The
+	/// restart-policy override file we layer over the user's
+	/// compose lives at `<state_dir>/project-overrides/<slug>.yaml`
+	/// — see [`crate::restart_override`].
+	state_dir: Utf8PathBuf,
+	/// Folder-slug component of the compose project name. Cached
+	/// here so the override path resolver doesn't have to re-parse
+	/// the [`ProjectName`].
+	slug: String,
 }
 
 impl ProjectCompose {
@@ -104,27 +114,39 @@ impl ProjectCompose {
 	/// a malformed compose project name (defensive; the workspace
 	/// ID has already been validated by the workspace shell
 	/// constructor by the time we reach here).
-	pub fn for_folder(workspace_id: &str, folder_root: &Utf8Path) -> Result<Option<Self>, LifecycleError> {
+	///
+	/// `state_dir` is the workspace's state directory
+	/// (`<workspaces_dir>/<id>/`); the restart-policy override
+	/// file we layer over the user's compose lives under there.
+	pub fn for_folder(
+		workspace_id: &str,
+		state_dir: &Utf8Path,
+		folder_root: &Utf8Path,
+	) -> Result<Option<Self>, LifecycleError> {
 		let Some(found) = discover_root_compose(folder_root) else {
 			return Ok(None);
 		};
-		Self::with_compose_file(workspace_id, folder_root, found).map(Some)
+		Self::with_compose_file(workspace_id, state_dir, folder_root, found).map(Some)
 	}
 
 	fn with_compose_file(
 		workspace_id: &str,
+		state_dir: &Utf8Path,
 		folder_root: &Utf8Path,
 		found: DiscoveredCompose,
 	) -> Result<Self, LifecycleError> {
 		let basename = folder_root.file_name().unwrap_or("folder");
 		let project = project_name_for_folder(workspace_id, basename)?;
 		let workspace_project = project_name_for_id(workspace_id)?;
+		let slug = folder_slug(basename);
 		Ok(Self {
 			folder_root: folder_root.to_path_buf(),
 			compose_file: found.absolute_path,
 			relative_path: found.relative_path,
 			project,
 			workspace_project,
+			state_dir: state_dir.to_path_buf(),
+			slug,
 		})
 	}
 
@@ -321,12 +343,27 @@ impl ProjectCompose {
 		}
 	}
 
+	/// Run `docker compose -f <user-file> -f <restart-override> -p
+	/// <project> <args...>` against this folder.
+	///
+	/// The override file is (re)generated on every call so a user
+	/// who adds a new service to their compose doesn't have to
+	/// remember to nuke a stale cache. It's cheap — one
+	/// `docker compose config --services` round-trip plus a few
+	/// hundred bytes written to disk — and runs entirely against
+	/// the local daemon. If the override step fails (daemon down,
+	/// compose file broken), the error bubbles up before we touch
+	/// any containers: the user sees the *real* reason, not a
+	/// confusing later failure from `up`.
+	///
+	/// See [`crate::restart_override`] for the rationale.
 	async fn docker_compose<I, S>(&self, args: I) -> Result<crate::lifecycle::DockerOutput, LifecycleError>
 	where
 		I: IntoIterator<Item = S>,
 		S: AsRef<OsStr>,
 	{
-		run_docker_compose(&self.compose_file, &self.project, args).await
+		let override_file = ensure_restart_override(&self.state_dir, &self.slug, &self.compose_file).await?;
+		run_docker_compose_with_overrides(&self.compose_file, &[override_file], &self.project, args).await
 	}
 }
 
@@ -392,11 +429,17 @@ mod tests {
 		fs::write(path, b"# placeholder\n").unwrap();
 	}
 
+	fn state_dir() -> Utf8PathBuf {
+		Utf8PathBuf::from("/tmp/moon-ide-test-state")
+	}
+
 	#[test]
 	fn for_folder_returns_none_without_compose() {
 		let tmp = tempdir().unwrap();
 		let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
-		assert!(ProjectCompose::for_folder("default", &root).unwrap().is_none());
+		assert!(ProjectCompose::for_folder("default", &state_dir(), &root)
+			.unwrap()
+			.is_none());
 	}
 
 	#[test]
@@ -406,7 +449,9 @@ mod tests {
 		let root = parent.join("moon-landing");
 		touch(&root.join("docker-compose.yml"));
 
-		let pc = ProjectCompose::for_folder("default", &root).unwrap().unwrap();
+		let pc = ProjectCompose::for_folder("default", &state_dir(), &root)
+			.unwrap()
+			.unwrap();
 		assert_eq!(pc.project().as_str(), "moon-ws-default-moon-landing");
 		assert_eq!(pc.compose_file(), root.join("docker-compose.yml"));
 		assert_eq!(pc.relative_path(), Utf8Path::new("docker-compose.yml"));
@@ -419,7 +464,9 @@ mod tests {
 		let root = parent.join("My Stuff");
 		touch(&root.join("compose.yaml"));
 
-		let pc = ProjectCompose::for_folder("default", &root).unwrap().unwrap();
+		let pc = ProjectCompose::for_folder("default", &state_dir(), &root)
+			.unwrap()
+			.unwrap();
 		assert_eq!(pc.project().as_str(), "moon-ws-default-my-stuff");
 	}
 
@@ -429,7 +476,7 @@ mod tests {
 		let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
 		touch(&root.join("docker-compose.yml"));
 
-		let err = ProjectCompose::for_folder("Bad ID", &root).unwrap_err();
+		let err = ProjectCompose::for_folder("Bad ID", &state_dir(), &root).unwrap_err();
 		assert!(matches!(err, LifecycleError::InvalidWorkspaceId(_)));
 	}
 
