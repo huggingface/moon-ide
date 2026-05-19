@@ -78,7 +78,11 @@ class LspOverviewPlugin implements PluginValue {
 
 	update(update: ViewUpdate): void {
 		const diagnosticsChanged = update.transactions.some((tr) => tr.effects.some((e) => e.is(setDiagnosticsEffect)));
-		if (!diagnosticsChanged && !update.docChanged && !update.viewportChanged) {
+		// `geometryChanged` covers folds collapsing / expanding (and any
+		// other line-height shift) — without it, markers stay anchored to
+		// their flat doc-line ratio even after a fold moves the actual
+		// line off-position relative to the scrollbar thumb.
+		if (!diagnosticsChanged && !update.docChanged && !update.viewportChanged && !update.geometryChanged) {
 			return;
 		}
 		this.render();
@@ -92,13 +96,16 @@ class LspOverviewPlugin implements PluginValue {
 	private render(): void {
 		const marks = collectMarks(this.view);
 		const lines = this.view.state.doc.lines;
+		const contentHeight = this.view.contentHeight;
 		// Cheap signature so we can short-circuit DOM work when
 		// `update` was a false positive (e.g. an unrelated state
 		// effect fired without changing the diagnostic list).
 		// Sorting by line keeps the signature stable across map
-		// iteration order changes.
+		// iteration order changes. `contentHeight` is included so a
+		// fold collapsing / expanding (which doesn't touch the doc or
+		// the diagnostic list) still invalidates the cache.
 		marks.sort((a, b) => a.line - b.line || SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
-		const signature = `${lines}|${marks.map((m) => `${m.line}:${m.severity[0]}`).join(',')}`;
+		const signature = `${lines}|${contentHeight}|${marks.map((m) => `${m.line}:${m.severity[0]}`).join(',')}`;
 		if (signature === this.lastSignature) {
 			return;
 		}
@@ -106,7 +113,7 @@ class LspOverviewPlugin implements PluginValue {
 		while (this.overlay.firstChild) {
 			this.overlay.removeChild(this.overlay.firstChild);
 		}
-		if (lines <= 0 || marks.length === 0) {
+		if (lines <= 0 || marks.length === 0 || contentHeight <= 0) {
 			return;
 		}
 		const frag = document.createDocumentFragment();
@@ -117,7 +124,7 @@ class LspOverviewPlugin implements PluginValue {
 		for (const mark of marks) {
 			const el = document.createElement('div');
 			el.className = `cm-lsp-overview-marker ${SEVERITY_CLASS[mark.severity]}`;
-			el.style.top = `${((mark.line - 0.5) / lines) * 100}%`;
+			el.style.top = `${markerTopPercent(this.view, mark.line, contentHeight)}%`;
 			el.dataset.line = String(mark.line);
 			el.title = mark.severity;
 			frag.appendChild(el);
@@ -155,6 +162,25 @@ function collectMarks(view: EditorView): Mark[] {
 		marks.push({ line, severity });
 	});
 	return marks;
+}
+
+/**
+ * Vertical position of `lineNo`'s midline within the editor's
+ * scrollable extent, expressed as a percentage. Reads the line's
+ * block geometry from CodeMirror rather than dividing by the doc
+ * line count, so folded regions (which shorten the scrollable
+ * height without changing `doc.lines`) are accounted for and the
+ * marker lines up with the scrollbar thumb's position at that
+ * line. A marker on a line *inside* a fold lands on the collapsed
+ * block's row — multiple such markers stack, which is the right
+ * thing: it tells the user "there's something hidden in this fold"
+ * without us silently dropping the marker.
+ */
+function markerTopPercent(view: EditorView, lineNo: number, contentHeight: number): number {
+	const pos = view.state.doc.line(lineNo).from;
+	const block = view.lineBlockAt(pos);
+	const midY = block.top + block.height / 2;
+	return (midY / contentHeight) * 100;
 }
 
 /** ViewPlugin export for inclusion in the editor's extension list.

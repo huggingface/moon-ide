@@ -306,6 +306,25 @@ function buildGutterClassSet(
  * can handle its own click. That gives us a discoverable indicator
  * without commandeering the scrollbar or stealing layout width.
  */
+/**
+ * Vertical position of `lineNo`'s midline within the editor's
+ * scrollable extent, expressed as a percentage. Reads the line's
+ * block geometry from CodeMirror rather than dividing by the doc
+ * line count, so folded regions (which shorten the scrollable
+ * height without changing `doc.lines`) are accounted for and the
+ * marker lines up with the scrollbar thumb's position at that
+ * line. A marker on a line *inside* a fold lands on the collapsed
+ * block's row — multiple such markers stack, which is the right
+ * thing: it tells the user "there's a change hidden in this fold"
+ * without us silently dropping the marker.
+ */
+function markerTopPercent(view: EditorView, lineNo: number, contentHeight: number): number {
+	const pos = view.state.doc.line(lineNo).from;
+	const block = view.lineBlockAt(pos);
+	const midY = block.top + block.height / 2;
+	return (midY / contentHeight) * 100;
+}
+
 class GitOverviewPlugin implements PluginValue {
 	private readonly overlay: HTMLDivElement;
 	private readonly onClick: (event: MouseEvent) => void;
@@ -337,9 +356,14 @@ class GitOverviewPlugin implements PluginValue {
 		// value by reference when there was no docChange or facet
 		// change, so identity works as our "did anything move?"
 		// check — avoids thrashing the DOM on every keystroke.
+		//
+		// `geometryChanged` is the fold/unfold (and any line-height
+		// shift) trigger: without it, markers stay anchored to a
+		// flat doc-line ratio after a fold moves the actual line
+		// off-position relative to the scrollbar thumb.
 		const changes = update.state.field(gitChangesField, false) ?? null;
 		const lines = update.state.doc.lines;
-		if (changes === this.lastChanges && lines === this.lastLines) {
+		if (changes === this.lastChanges && lines === this.lastLines && !update.geometryChanged) {
 			return;
 		}
 		this.lastChanges = changes;
@@ -355,12 +379,13 @@ class GitOverviewPlugin implements PluginValue {
 	private render(): void {
 		const changes = this.view.state.field(gitChangesField, false) ?? null;
 		const lines = this.view.state.doc.lines;
+		const contentHeight = this.view.contentHeight;
 		// Cheaper than `innerHTML = ''` and avoids the HTML-parsing
 		// cost for each re-render, but functionally the same.
 		while (this.overlay.firstChild) {
 			this.overlay.removeChild(this.overlay.firstChild);
 		}
-		if (!changes || lines <= 0) {
+		if (!changes || lines <= 0 || contentHeight <= 0) {
 			return;
 		}
 		const frag = document.createDocumentFragment();
@@ -368,10 +393,14 @@ class GitOverviewPlugin implements PluginValue {
 			for (const lineNo of set) {
 				const el = document.createElement('div');
 				el.className = `cm-git-overview-marker ${cls}`;
-				// Centre the marker on its line within the file's
-				// vertical extent. `(lineNo - 0.5) / lines` gives
-				// the fractional midline of a 1-based line number.
-				el.style.top = `${((lineNo - 0.5) / lines) * 100}%`;
+				// Position by the line's actual y in the scrolled
+				// content rather than its doc-line index, so folds
+				// (which shorten the scrollable extent without
+				// changing `doc.lines`) don't drift markers off the
+				// scrollbar thumb. Markers on lines inside a fold
+				// land on the collapsed block — see
+				// `markerTopPercent` for the rationale.
+				el.style.top = `${markerTopPercent(this.view, lineNo, contentHeight)}%`;
 				el.dataset.line = String(lineNo);
 				frag.appendChild(el);
 			}
