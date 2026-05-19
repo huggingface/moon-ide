@@ -691,6 +691,8 @@ async fn fetch_xet_write_token(
 /// round-trip).
 async fn xet_upload_bytes(token: &XetWriteToken, tracking_name: &str, bytes: Vec<u8>) -> Result<String, CoderError> {
 	use xet::xet_session::{Sha256Policy, XetSessionBuilder};
+	// Bucket uploads commit via `/batch` with just `{path, xetHash}`;
+	// the Hub never asks for a sha256 oid, so skip the extra hash.
 
 	let session = XetSessionBuilder::new()
 		.build()
@@ -704,7 +706,7 @@ async fn xet_upload_bytes(token: &XetWriteToken, tracking_name: &str, bytes: Vec
 		.await
 		.map_err(|err| CoderError::Internal(format!("xet upload commit build failed: {err}")))?;
 	let handle = commit
-		.upload_bytes(bytes, Sha256Policy::Compute, Some(tracking_name.to_string()))
+		.upload_bytes(bytes, Sha256Policy::Skip, Some(tracking_name.to_string()))
 		.await
 		.map_err(|err| CoderError::Internal(format!("xet upload_bytes failed: {err}")))?;
 	let meta = handle
