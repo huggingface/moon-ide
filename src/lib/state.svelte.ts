@@ -474,6 +474,15 @@ class WorkspaceState {
 	// stack is empty.
 	reviewVisibleFile = $state<string | null>(null);
 
+	// Path of the review section whose CodeMirror editor currently
+	// holds focus. `ReviewSection` updates this on focus / blur of
+	// its right-side editor; cleared when focus leaves the review
+	// surface entirely. `saveActive` checks this when the active
+	// tab is a `review://` buffer so `Ctrl+S` lands on the file
+	// the user is editing, not on the synthetic review buffer
+	// itself.
+	reviewFocusPath = $state<string | null>(null);
+
 	// Linear navigation history, browser-style but position-aware (each
 	// entry pins a caret inside a file rather than just a path).
 	//
@@ -3359,6 +3368,94 @@ class WorkspaceState {
 		await this.closeFile(REVIEW_PATH, side);
 	}
 
+	/**
+	 * Lazily attach a backing `OpenFile` for a path that the user is
+	 * editing from inside a review section, without touching tab
+	 * strips or the active-side pointer. The review tab stays
+	 * focused; the underlying file just gains an in-memory buffer
+	 * so [`updateText`] has a target and the section's edits can
+	 * flow through the normal dirty-flag / fingerprint machinery.
+	 *
+	 * No-op when a buffer already exists. The file is loaded via
+	 * the same [`loadTextFile`] path `openFile` uses, so blame /
+	 * HEAD / editorconfig seeds and LSP `didOpen` fire exactly
+	 * once — the user later switching to the regular editor tab
+	 * for this file (via the section header's path click) is just
+	 * a focus change, not a second load.
+	 *
+	 * Returns `true` on success, `false` if the load failed
+	 * (caller decides whether to surface a toast or just keep
+	 * the section read-only).
+	 */
+	async ensureBackingBuffer(path: string): Promise<boolean> {
+		if (this.openFiles.some((f) => f.path === path)) {
+			return true;
+		}
+		try {
+			const next = await this.loadTextFile(path);
+			if (!next) {
+				return false;
+			}
+			this.openFiles = [...this.openFiles, next];
+			if (next.kind === 'text' && !next.isDeleted) {
+				this.lspOpen(next.path, next.text);
+			}
+		} catch (err) {
+			this.flash(`Failed to open ${path}: ${formatError(err)}`);
+			return false;
+		}
+		void this.ensureEditorConfig(path);
+		return true;
+	}
+
+	/**
+	 * Save a file that's being edited from inside a review section.
+	 * The review tab is the active one, so [`saveActive`] would
+	 * save the synthetic `review://` buffer instead — pointless
+	 * write of zero bytes. This routes the underlying file's
+	 * bytes through the same `fs.writeFile` + post-format re-read
+	 * + LSP / blame / editorconfig refresh dance, just keyed off
+	 * `path` instead of `activeFile`.
+	 *
+	 * No-op when the path has no backing buffer (defensive — the
+	 * section's `updateListener` ensures one exists on first
+	 * edit) or when the buffer is clean (nothing to write). Both
+	 * cases are fine to silently skip; the section header's
+	 * dirty pip already communicates the state to the user.
+	 */
+	async saveReviewSection(path: string): Promise<void> {
+		const file = this.openFiles.find((f) => f.path === path);
+		if (!file || file.kind !== 'text' || file.isUntitled || file.isExternal || file.isDeleted) {
+			return;
+		}
+		if (!file.isDirty) {
+			return;
+		}
+		try {
+			const result = await ipc.fs.writeFile(path, file.text);
+			const fresh = await ipc.fs.readFile(path);
+			const freshText = fresh.is_binary ? file.text : fresh.text;
+			this.openFiles = this.openFiles.map((f) =>
+				f.path === path
+					? {
+							...f,
+							text: freshText,
+							isDirty: false,
+							loadedFingerprint: fingerprint(freshText),
+							loadedMtimeMs: result.mtime_ms,
+						}
+					: f,
+			);
+			this.lspNotifyAfterSave(path, freshText);
+			if (file.name === '.editorconfig') {
+				await this.refreshEditorConfigs();
+			}
+			this.scheduleBlameRefresh(path);
+		} catch (err) {
+			this.flash(`Save failed: ${formatError(err)}`);
+		}
+	}
+
 	async openFile(path: string, side: SplitSide = this.focusedSide, options: { focus?: boolean } = {}) {
 		// Nav-history (Alt+Left / forward) replays through `openFile`,
 		// and the review pseudo-tab can sit in history just like a
@@ -4802,6 +4899,18 @@ class WorkspaceState {
 	async saveActive() {
 		const file = this.activeFile;
 		if (!file) {
+			return;
+		}
+		// Review tab is the active tab when the user pressed Ctrl+S
+		// from inside a review section's editor. The synthetic
+		// `review://` buffer has nothing useful to save (it's
+		// always-clean empty bytes); route the keystroke to the
+		// underlying file the focused section is editing. Falls
+		// through to the regular save-active path when no section
+		// has focus, which then no-ops on the clean synthetic
+		// buffer.
+		if (isReviewPath(file.path) && this.reviewFocusPath !== null) {
+			await this.saveReviewSection(this.reviewFocusPath);
 			return;
 		}
 		// Untitled buffers route through the save-as flow on every save

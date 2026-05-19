@@ -53,6 +53,7 @@ import {
 	gutterLineClass,
 	GutterMarker,
 	ViewPlugin,
+	type Command,
 	type PluginValue,
 	type ViewUpdate,
 } from '@codemirror/view';
@@ -433,3 +434,103 @@ export function gitChangesExtension(): Extension {
 		gitOverviewPlugin,
 	];
 }
+
+/**
+ * Sorted union of every line number that carries a git-change
+ * marker (added / modified / deletion above / deletion below).
+ * Used by the Alt-Up / Alt-Down navigation commands to step
+ * between marked lines without caring which bucket they're in —
+ * "next change" is the same gesture regardless of whether the
+ * line is an addition, a modification, or anchors a deletion.
+ */
+function changeLines(changes: GitLineChanges): number[] {
+	const all = new Set<number>();
+	for (const n of changes.added) {
+		all.add(n);
+	}
+	for (const n of changes.modified) {
+		all.add(n);
+	}
+	for (const n of changes.deletedAbove) {
+		all.add(n);
+	}
+	for (const n of changes.deletedBelow) {
+		all.add(n);
+	}
+	return [...all].toSorted((a, b) => a - b);
+}
+
+/**
+ * Jump the caret to `lineNo`, centring it in the viewport. Shared
+ * by the next / previous commands and the overview-ruler click
+ * handler — same dispatch shape both places.
+ */
+function jumpToLine(view: EditorView, lineNo: number): void {
+	const line = view.state.doc.line(lineNo);
+	view.dispatch({
+		selection: EditorSelection.cursor(line.from),
+		effects: EditorView.scrollIntoView(line.from, { y: 'center' }),
+	});
+}
+
+/**
+ * Step the caret to the next git-change line below the current
+ * caret. Returns `true` when the `gitChangesField` is installed
+ * (i.e. this editor has the gitChanges extension) regardless of
+ * whether there's somewhere to jump to — the binding deliberately
+ * shadows CodeMirror's default `Alt-ArrowDown` (`moveLineDown`)
+ * even on a clean buffer; the team wants Alt+Down to mean
+ * "next change", not "move line", everywhere.
+ *
+ * Returns `false` when the field isn't installed so the binding
+ * falls through to whatever else is bound (host-level handlers,
+ * other keymaps). That keeps the command harmless when reused on
+ * a surface that doesn't carry git-change data.
+ */
+export const goToNextChange: Command = (view) => {
+	const changes = view.state.field(gitChangesField, false);
+	if (!changes) {
+		return false;
+	}
+	const lines = changeLines(changes);
+	if (lines.length === 0) {
+		return true;
+	}
+	const caretLine = view.state.doc.lineAt(view.state.selection.main.head).number;
+	const next = lines.find((n) => n > caretLine);
+	if (next === undefined) {
+		return true;
+	}
+	jumpToLine(view, next);
+	return true;
+};
+
+/**
+ * Step the caret to the previous git-change line above the
+ * current caret. Mirror of `goToNextChange` — see that doc for
+ * the return-value contract.
+ */
+export const goToPreviousChange: Command = (view) => {
+	const changes = view.state.field(gitChangesField, false);
+	if (!changes) {
+		return false;
+	}
+	const lines = changeLines(changes);
+	if (lines.length === 0) {
+		return true;
+	}
+	const caretLine = view.state.doc.lineAt(view.state.selection.main.head).number;
+	let prev: number | undefined;
+	for (const n of lines) {
+		if (n < caretLine) {
+			prev = n;
+		} else {
+			break;
+		}
+	}
+	if (prev === undefined) {
+		return true;
+	}
+	jumpToLine(view, prev);
+	return true;
+};

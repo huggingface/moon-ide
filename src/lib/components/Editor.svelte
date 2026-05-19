@@ -22,7 +22,7 @@
 	import { lspOverviewExtension } from '../editor/lspOverview';
 	import { lspRenameExtension } from '../editor/lspRename';
 	import { blameExtension, blameFacet } from '../editor/blame';
-	import { gitChangesExtension, headTextFacet } from '../editor/gitChanges';
+	import { gitChangesExtension, goToNextChange, goToPreviousChange, headTextFacet } from '../editor/gitChanges';
 	import { workspace, type OpenFile, type SplitSide } from '../state.svelte';
 	import { languageFor } from '../editor/language';
 	import { moonEditorTheme } from '../editor/theme';
@@ -541,6 +541,14 @@
 					// within-precedence ordering hands Ctrl-Space to
 					// it next) and `startCompletion` fires there.
 					{ key: 'Ctrl-Space', run: logCtrlSpace },
+					// Alt-Up / Alt-Down → step between git-change
+					// lines (the green/blue/red markers on the
+					// line-number gutter). Shadows CM's default
+					// `moveLineUp` / `moveLineDown` from
+					// `defaultKeymap` below; the team uses these
+					// keys for change navigation, not line moves.
+					{ key: 'Alt-ArrowUp', run: goToPreviousChange },
+					{ key: 'Alt-ArrowDown', run: goToNextChange },
 				]),
 			),
 			// `completionKeymap` lives at `Prec.high` so its

@@ -28,6 +28,7 @@
 	// switch, …) leaves the workspace state honest.
 	onDestroy(() => {
 		workspace.reviewVisibleFile = null;
+		workspace.reviewFocusPath = null;
 		// Drop any selection a child section published while we were
 		// live. Sections clear their own when unmounted, but the
 		// CodeMirror teardown order between us and our children

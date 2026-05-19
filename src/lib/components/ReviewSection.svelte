@@ -1,9 +1,11 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { Compartment, EditorState, type Extension } from '@codemirror/state';
-	import { EditorView, highlightActiveLine, lineNumbers } from '@codemirror/view';
-	import { bracketMatching, foldGutter } from '@codemirror/language';
-	import { highlightSelectionMatches } from '@codemirror/search';
+	import { EditorView, highlightActiveLine, highlightActiveLineGutter, keymap, lineNumbers } from '@codemirror/view';
+	import { bracketMatching, foldGutter, indentOnInput, indentUnit } from '@codemirror/language';
+	import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
+	import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
+	import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
 	import { MergeView, diff as rawDiff } from '@codemirror/merge';
 	import { ipc } from '../ipc';
 	import { workspace } from '../state.svelte';
@@ -12,7 +14,7 @@
 	import { moonEditorTheme } from '../editor/theme';
 	import { diffPureChangeExtension } from '../editor/diffPureChange';
 	import { diffGutterTintExtension } from '../editor/diffGutterTint';
-	import type { GitFileStatus } from '../protocol';
+	import type { EditorConfig, GitFileStatus } from '../protocol';
 
 	type Props = {
 		path: string;
@@ -46,6 +48,12 @@
 	let mounted = $state(false);
 	let loading = $state(false);
 	let buildToken = 0;
+	// One-shot promise that resolves once the underlying file has
+	// been attached as an `OpenFile`. Lazily created on the first
+	// keystroke so an unedited section doesn't pay the load cost,
+	// shared across subsequent keystrokes so racing `readFile`
+	// calls can't reorder a stale `updateText` over a fresh one.
+	let backingReady: Promise<boolean> | null = null;
 	// Cleanup for the per-section horizontal scroll mirror set
 	// up at the tail of `build`. Stored at component scope so the
 	// `onMount` teardown (and the rebuild branch, if ever) can
@@ -54,15 +62,33 @@
 
 	// Theme + language compartments mirror DiffView's pattern so a
 	// theme toggle or language hot-swap reconfigures the live merge
-	// view instead of forcing a full rebuild. No editorconfig
-	// compartment: review sections are read-only, default indent
-	// settings don't matter visually.
+	// view instead of forcing a full rebuild. `ecB` is the right-
+	// side editorconfig compartment — only side B is editable, so
+	// indent / tab settings only matter for it.
 	const langA = new Compartment();
 	const langB = new Compartment();
 	const themeA = new Compartment();
 	const themeB = new Compartment();
 	const wrapA = new Compartment();
 	const wrapB = new Compartment();
+	const ecB = new Compartment();
+
+	// Deleted-on-disk rows have no working tree to edit; everything
+	// else (modified / added / untracked) is fair game for fixes
+	// straight from the review surface. `added` / `untracked` files
+	// have an empty left-pane base, so an edit on the right just
+	// reduces the diff against an empty before — which is the
+	// expected behaviour for "tidy up something I just wrote".
+	const editable = $derived(status !== 'deleted');
+
+	// Backing-buffer dirty flag for the section header pip. Sourced
+	// from `workspace.openFiles` so it tracks the same in-memory
+	// state Ctrl+S would write — saving from inside the section
+	// flips this back to clean on the next reactive tick.
+	const backingDirty = $derived.by(() => {
+		const open = workspace.openFiles.find((f) => f.path === path);
+		return open !== undefined && open.kind === 'text' && open.isDirty;
+	});
 
 	onMount(() => {
 		registerSection(path, sectionEl ?? null);
@@ -100,6 +126,7 @@
 					merge?.destroy();
 					merge = undefined;
 					clearOurSelection();
+					clearOurFocus();
 				};
 			}
 		}
@@ -111,6 +138,7 @@
 			merge?.destroy();
 			merge = undefined;
 			clearOurSelection();
+			clearOurFocus();
 		};
 	});
 
@@ -122,6 +150,16 @@
 		const current = workspace.activeSelection;
 		if (current !== null && current.path === path) {
 			workspace.setActiveSelection(null);
+		}
+	}
+
+	// Same pattern for the focus pointer: a section being torn down
+	// while focused (e.g. the user committed the file out of the
+	// changes list) shouldn't leave a stale path that the next
+	// Ctrl+S would route to a no-longer-editable buffer.
+	function clearOurFocus() {
+		if (workspace.reviewFocusPath === path) {
+			workspace.reviewFocusPath = null;
 		}
 	}
 
@@ -147,6 +185,23 @@
 		merge.b.dispatch({ effects: wrapB.reconfigure(ext) });
 	});
 
+	// Live editorconfig reconfigure on side B. The compartment is
+	// only populated when the section is editable (see `build`),
+	// so the dispatch is a no-op for `deleted` rows whose right
+	// pane stays read-only.
+	$effect(() => {
+		const ec = workspace.editorConfigFor(path);
+		if (!merge || !editable) {
+			return;
+		}
+		merge.b.dispatch({ effects: ecB.reconfigure(editorConfigExtensions(ec)) });
+	});
+
+	function editorConfigExtensions(ec: EditorConfig): Extension {
+		const unit = ec.indent_style === 'tab' ? '\t' : ' '.repeat(Math.max(1, ec.indent_size));
+		return [EditorState.tabSize.of(Math.max(1, ec.tab_width)), indentUnit.of(unit)];
+	}
+
 	async function build() {
 		if (mounted || loading || !host) {
 			return;
@@ -163,7 +218,11 @@
 			return;
 		}
 
-		const sharedReadOnly: Extension[] = [EditorState.readOnly.of(true), EditorView.editable.of(false)];
+		// Side A (base / HEAD blob) is always read-only — editing the
+		// "before" view would be meaningless. Side B (working tree)
+		// is editable for everything except `deleted` rows.
+		const readOnlyA: Extension[] = [EditorState.readOnly.of(true), EditorView.editable.of(false)];
+		const readOnlyB: Extension[] = editable ? [] : [EditorState.readOnly.of(true), EditorView.editable.of(false)];
 
 		const sideA: Extension[] = [
 			lineNumbers(),
@@ -176,8 +235,75 @@
 			themeA.of(moonEditorTheme(workspace.effectiveTheme)),
 			langA.of(lang),
 			wrapA.of(workspace.lineWrap ? EditorView.lineWrapping : []),
-			...sharedReadOnly,
+			...readOnlyA,
 		];
+
+		// Working-tree side picks up the regular editor's editing
+		// stack — history, bracket close, indent-on-input, the
+		// standard keymaps — so typing in a review section feels
+		// the same as typing in `Editor.svelte`. LSP affordances
+		// (hover, goto-def, diagnostics, completion) are deliberately
+		// out of scope: review sections render N files at once and
+		// pinging `didOpen` per section would explode broker
+		// traffic on a 50-file branch. The user clicks the section
+		// header's path to open the file as a regular tab when
+		// they want LSP.
+		const ec = workspace.editorConfigFor(path);
+		const editingExtensions: Extension[] = editable
+			? [
+					highlightActiveLineGutter(),
+					closeBrackets(),
+					indentOnInput(),
+					history(),
+					ecB.of(editorConfigExtensions(ec)),
+					keymap.of([
+						...closeBracketsKeymap,
+						...defaultKeymap,
+						...historyKeymap,
+						...searchKeymap,
+						indentWithTab,
+						// Ctrl+S inside a review section saves the
+						// underlying file, not the synthetic
+						// `review://` buffer that `saveActive` would
+						// hit via the global Ctrl+S handler. The
+						// binding lives on the section's CM editor
+						// so it only fires when focus is here;
+						// elsewhere the global handler still owns
+						// the keystroke.
+						{
+							key: 'Mod-s',
+							run: () => {
+								void workspace.saveReviewSection(path);
+								return true;
+							},
+						},
+					]),
+				]
+			: [];
+
+		// Focus tracker: publishes the section's path to the
+		// workspace on focus and clears it on blur. `saveActive`
+		// reads this when the active tab is the synthetic review
+		// buffer so global Ctrl+S lands on the file the user is
+		// editing, not on the empty `review://` placeholder.
+		// Symmetric clear-only-if-ours rule mirrors
+		// `clearOurSelection`: a quick focus hop from this
+		// section to a sibling fires the sibling's `focus`
+		// before our `blur`, so an unconditional clear in our
+		// blur handler would stomp the sibling's claim.
+		const focusListener = EditorView.domEventHandlers({
+			focus: () => {
+				workspace.reviewFocusPath = path;
+				return false;
+			},
+			blur: () => {
+				if (workspace.reviewFocusPath === path) {
+					workspace.reviewFocusPath = null;
+				}
+				return false;
+			},
+		});
+
 		const sideB: Extension[] = [
 			lineNumbers(),
 			diffGutterTintExtension('b'),
@@ -190,20 +316,42 @@
 			themeB.of(moonEditorTheme(workspace.effectiveTheme)),
 			langB.of(lang),
 			wrapB.of(workspace.lineWrap ? EditorView.lineWrapping : []),
-			// Selection-publish hook on the working-tree side so
-			// `Ctrl+L` can attach a highlighted span from the review
-			// view to the coder, the same way it does from a regular
-			// editor or the right pane of `DiffView`. We only wire
-			// the right side: the left is the base/HEAD snapshot,
-			// whose line numbers wouldn't match the file on disk and
-			// would mislead the model. Status `deleted` has an empty
-			// right side, so selection events never fire there.
+			focusListener,
+			...editingExtensions,
+			// Selection-publish + edit-publish hook on the working-
+			// tree side. Selection routes to `Ctrl+L` (same as the
+			// regular editor / DiffView's right pane); doc changes
+			// route through `workspace.updateText`, lazily attaching
+			// a backing `OpenFile` on first keystroke so the dirty
+			// flag, fingerprint, and `Ctrl+S` machinery all have a
+			// target. We only wire the right side: the left is the
+			// base/HEAD snapshot and stays read-only.
 			EditorView.updateListener.of((update) => {
 				if (update.selectionSet) {
 					publishReviewSelection(update.state);
 				}
+				if (update.docChanged && editable) {
+					const next = update.state.doc.toString();
+					// Lazily attach the underlying file as an
+					// `OpenFile` on the first keystroke so
+					// `workspace.updateText` (and the Ctrl+S save
+					// path) have a target. We chain every
+					// keystroke off the same `backingReady`
+					// promise so two rapid edits before the load
+					// resolves can't reorder a stale `updateText`
+					// over a fresh one (the chain serialises them).
+					if (backingReady === null) {
+						backingReady = workspace.ensureBackingBuffer(path);
+					}
+					backingReady = backingReady.then((ok) => {
+						if (ok) {
+							workspace.updateText(path, next);
+						}
+						return ok;
+					});
+				}
 			}),
-			...sharedReadOnly,
+			...readOnlyB,
 		];
 
 		detachHScrollSync?.();
@@ -437,6 +585,9 @@
 		<button type="button" class="path" title={`Open ${path}`} onclick={openInEditor}>
 			{#if dirName(path)}<span class="dir">{dirName(path)}/</span>{/if}<span class="name">{fileName(path)}</span>
 		</button>
+		{#if backingDirty}
+			<span class="dirty" title="Unsaved edits — Ctrl+S to save" aria-label="Unsaved edits">●</span>
+		{/if}
 	</header>
 	{#if !collapsed}
 		<div class="body" bind:this={host}></div>
@@ -543,6 +694,13 @@
 	}
 	.name {
 		color: var(--m-fg);
+	}
+	.dirty {
+		color: var(--m-accent, #4ec9b0);
+		font-size: 14px;
+		line-height: 1;
+		margin-left: 4px;
+		flex: 0 0 auto;
 	}
 	.body {
 		display: flex;

@@ -12,7 +12,13 @@
 	import { highlightTabs } from '../editor/highlightTabs';
 	import { languageFor } from '../editor/language';
 	import { moonEditorTheme } from '../editor/theme';
-	import { gitChangesExtension, headTextFacet, overviewMountFacet } from '../editor/gitChanges';
+	import {
+		gitChangesExtension,
+		goToNextChange,
+		goToPreviousChange,
+		headTextFacet,
+		overviewMountFacet,
+	} from '../editor/gitChanges';
 	import {
 		applyDiagnostics,
 		filePathFacet,
@@ -374,6 +380,13 @@
 				// don't re-spread it here, that would duplicate
 				// handlers at default precedence where they'd lose
 				// to `defaultKeymap` for the popup-open keys.
+				//
+				// Alt-Up / Alt-Down step between git-change lines
+				// (same as the regular editor); listed before
+				// `...defaultKeymap` so within-keymap ordering
+				// beats CM's `moveLineUp` / `moveLineDown`.
+				{ key: 'Alt-ArrowUp', run: goToPreviousChange },
+				{ key: 'Alt-ArrowDown', run: goToNextChange },
 				...closeBracketsKeymap,
 				...defaultKeymap,
 				...historyKeymap,

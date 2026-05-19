@@ -5432,10 +5432,22 @@ mod tests {
 	}
 
 	fn run_git(git: &std::path::Path, cwd: &std::path::Path, args: &[&str]) {
+		// Scrub the ambient identity. Devs (and CI containers) often
+		// have `GIT_AUTHOR_NAME` / `GIT_COMMITTER_NAME` exported in
+		// their shell — those override `git config user.name` and
+		// make the blame / log tests assert against the wrong name.
+		// Removing them here pins every test commit to the repo-local
+		// `user.name` / `user.email` the test sets up.
 		let out = std::process::Command::new(git)
 			.arg("-C")
 			.arg(cwd)
 			.args(args)
+			.env_remove("GIT_AUTHOR_NAME")
+			.env_remove("GIT_AUTHOR_EMAIL")
+			.env_remove("GIT_AUTHOR_DATE")
+			.env_remove("GIT_COMMITTER_NAME")
+			.env_remove("GIT_COMMITTER_EMAIL")
+			.env_remove("GIT_COMMITTER_DATE")
 			.output()
 			.expect("spawn git");
 		assert!(
