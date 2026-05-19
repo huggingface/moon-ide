@@ -210,14 +210,16 @@ export async function languageFor(filename: string, firstLine?: string): Promise
 		case 'cts':
 		case 'tsx': {
 			const { javascript } = await import('@codemirror/lang-javascript');
-			return [javascript({ typescript: true, jsx: ext === 'tsx' })];
+			const { jsdocExtension } = await import('./jsdoc');
+			return [javascript({ typescript: true, jsx: ext === 'tsx' }), jsdocExtension()];
 		}
 		case 'js':
 		case 'mjs':
 		case 'cjs':
 		case 'jsx': {
 			const { javascript } = await import('@codemirror/lang-javascript');
-			return [javascript({ jsx: ext === 'jsx' })];
+			const { jsdocExtension } = await import('./jsdoc');
+			return [javascript({ jsx: ext === 'jsx' }), jsdocExtension()];
 		}
 		case 'json':
 		case 'jsonc': {
