@@ -1215,7 +1215,7 @@ pub async fn list_sessions(dir: &Utf8Path) -> Result<Vec<SessionSummary>, CoderE
 			}
 		}
 	}
-	summaries.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+	summaries.sort_by_key(|s| std::cmp::Reverse(s.updated_at_ms));
 	Ok(summaries)
 }
 

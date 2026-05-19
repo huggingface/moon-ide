@@ -990,8 +990,8 @@ impl LspBroker {
 async fn collect_alive(map: &Mutex<HashMap<String, ServerSlot>>) -> Vec<Arc<LspServer>> {
 	let guard = map.lock().await;
 	guard
-		.iter()
-		.filter_map(|(_, slot)| {
+		.values()
+		.filter_map(|slot| {
 			let ServerSlot::Ready(server) = slot else {
 				return None;
 			};

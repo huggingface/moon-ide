@@ -1626,15 +1626,12 @@ class CoderPanelState {
 		await this.refreshStatus();
 	}
 
-	async send(activeFilePath: string | null = null): Promise<void> {
+	async send(): Promise<void> {
 		const text = this.draft.trim();
 		const attachments = this.attachments;
 		// Allow sending when *any* of text, selections, or images
 		// is present — "explain this" with an attachment but no
-		// question is a perfectly reasonable starter. The
-		// active-file hint is implicit: present-or-absent on every
-		// turn, doesn't count as "the user wanted to send" on its
-		// own (it would auto-fire on Enter in an empty composer).
+		// question is a perfectly reasonable starter.
 		// Sending while busy is a *steer*: the backend queues it
 		// and drains into the running turn at its next iteration
 		// boundary so the model can incorporate the new context
@@ -1654,7 +1651,7 @@ class CoderPanelState {
 				terminalAttachments.push(att);
 			}
 		}
-		const payload = renderPromptWithAttachments(text, selectionAttachments, terminalAttachments, activeFilePath);
+		const payload = renderPromptWithAttachments(text, selectionAttachments, terminalAttachments);
 		const images: ImageAttachmentPayload[] = imageAttachments.map((img) => ({
 			data_url: img.dataUrl,
 			mime: img.mime,
@@ -2235,37 +2232,13 @@ function applyInnerEventToRows(rows: CoderRow[], event: CoderEvent): CoderRow[] 
  *
  *  Empty draft + non-empty attachments is a valid send — we ship
  *  just the context block so "explain this" with one selection
- *  works.
- *
- *  `activeFilePath` is the path of whichever file the user has
- *  focused in the editor at send time, or `null` when nothing
- *  routable is open (terminal-only focus, untitled buffer,
- *  external host-direct buffer, file the user deleted). The hint
- *  ships every turn the user has something open — it's cheap
- *  (~30 tokens), survives compaction (older turns reduce to a
- *  summary; the model still needs "what's open *now*" from this
- *  turn), and gives the model enough to call `read_file` on its
- *  own for follow-ups like "explain this" or "add a test for the
- *  function I'm looking at" without the user needing `Ctrl+L` for
- *  context-free questions. We deliberately do **not** ship the
- *  file's contents implicitly — that's still `Ctrl+L`'s job.
- *  Per-turn (in the user message), not in the system prompt, so
- *  tab switches don't bust the router's prefix cache. */
+ *  works. */
 function renderPromptWithAttachments(
 	text: string,
 	attachments: SelectionAttachment[],
 	terminalAttachments: TerminalAttachment[],
-	activeFilePath: string | null,
 ): string {
 	const blocks: string[] = [];
-	if (activeFilePath !== null) {
-		// Self-closing — the element is metadata, not content.
-		// The renderer's `parseUserPrompt` only chip-strips
-		// `<code_selection>` elements, so `<active_file>` rides
-		// through invisibly in the UI while still reaching the
-		// model.
-		blocks.push(`<active_file path="${escapeXmlAttr(activeFilePath)}" />`);
-	}
 	for (const att of attachments) {
 		const range = att.startLine === att.endLine ? `${att.startLine}` : `${att.startLine}-${att.endLine}`;
 		// Wrap the captured text verbatim. We don't fence the body

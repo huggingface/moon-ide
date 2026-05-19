@@ -258,27 +258,8 @@
 		}
 		if (event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.metaKey) {
 			event.preventDefault();
-			await coder.send(routableActivePath());
+			await coder.send();
 		}
-	}
-
-	/** Path of the focused editor's active file, or `null` when
-	 *  nothing routable is open. We skip untitled buffers (no disk
-	 *  path the model can `read_file`), external host-direct
-	 *  buffers (absolute paths that don't fit the active folder's
-	 *  `/workspace/<name>` tool convention), and deleted-in-tree
-	 *  buffers (the user is staring at a HEAD-side diff for a
-	 *  working-tree-deleted file; `read_file` would fail). For
-	 *  everything else we hand the workspace-relative path to the
-	 *  send pipeline; `renderPromptWithAttachments` wraps it as a
-	 *  self-closing `<active_file path="…" />` inside the trailing
-	 *  `<context>` block on every turn the user has a file open. */
-	function routableActivePath(): string | null {
-		const af = workspace.activeFile;
-		if (af === null || af.isUntitled || af.isExternal || af.isDeleted) {
-			return null;
-		}
-		return af.path;
 	}
 
 	function onComposerInput(event: Event): void {

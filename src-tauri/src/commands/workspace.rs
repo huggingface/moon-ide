@@ -154,7 +154,7 @@ pub async fn workspace_list(state: State<'_, AppState>) -> Result<Vec<WorkspaceR
 #[tauri::command]
 pub async fn workspace_catalog(state: State<'_, AppState>) -> Result<Vec<WorkspaceMeta>, MoonError> {
 	let mut metas = core_app_state::load(&state.config_dir).await?.workspaces;
-	metas.sort_by(|a, b| b.last_active_at.cmp(&a.last_active_at));
+	metas.sort_by_key(|m| std::cmp::Reverse(m.last_active_at));
 	Ok(metas)
 }
 

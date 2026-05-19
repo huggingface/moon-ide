@@ -296,11 +296,7 @@ fn looks_like_unbraced_comma_glob(pattern: &str) -> bool {
 	for ch in pattern.chars() {
 		match ch {
 			'{' => depth += 1,
-			'}' => {
-				if depth > 0 {
-					depth -= 1;
-				}
-			}
+			'}' if depth > 0 => depth -= 1,
 			',' if depth == 0 => return true,
 			_ => {}
 		}

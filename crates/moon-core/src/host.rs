@@ -2797,7 +2797,7 @@ async fn run_branch_list_prs(root: &Utf8Path, scope: PrListScope) -> (Vec<Branch
 			// and `--search` would override `--state` so it's not
 			// any cheaper to push the sort server-side.)
 			let (mut rows, status) = run_gh_pr_list_query(root, None).await;
-			rows.sort_by(|a, b| b.1.cmp(&a.1));
+			rows.sort_by_key(|row| std::cmp::Reverse(row.1));
 			let dropped = rows.into_iter().map(|(entry, _)| entry).collect();
 			(dropped, status)
 		}
@@ -2840,7 +2840,7 @@ async fn run_branch_list_prs(root: &Utf8Path, scope: PrListScope) -> (Vec<Branch
 			// Sort by raw updatedAt timestamp desc so the merged
 			// list reads the same way the unfiltered list does.
 			// `None` (unparseable timestamp) sinks to the bottom.
-			rows.sort_by(|a, b| b.1.cmp(&a.1));
+			rows.sort_by_key(|row| std::cmp::Reverse(row.1));
 			rows.truncate(BRANCH_LIST_PR_CAP);
 			let dropped = rows.into_iter().map(|(entry, _)| entry).collect();
 			(dropped, status)

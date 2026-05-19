@@ -2228,7 +2228,7 @@ async fn dispatch_subagent_batch(
 
 	let sem = Arc::new(Semaphore::new(SUBAGENT_PARALLELISM_CAP));
 	let mut tasks = Vec::with_capacity(calls.len());
-	for (call, args) in calls.iter().cloned().zip(parsed_args.into_iter()) {
+	for (call, args) in calls.iter().cloned().zip(parsed_args) {
 		let state_for_task = state.clone();
 		let fs_for_task = fs.clone();
 		let sink_for_task = sink.clone();
@@ -3101,12 +3101,11 @@ pub(crate) fn sanitise_branch_name(raw: &str) -> String {
 			None
 		};
 		match mapped {
-			Some('-') => {
-				if !last_dash && !out.is_empty() {
-					out.push('-');
-					last_dash = true;
-				}
+			Some('-') if !last_dash && !out.is_empty() => {
+				out.push('-');
+				last_dash = true;
 			}
+			Some('-') => {}
 			Some(c) => {
 				out.push(c);
 				last_dash = false;
