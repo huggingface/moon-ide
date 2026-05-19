@@ -819,6 +819,14 @@ struct BatchFailure {
 	error: String,
 }
 
+/// Public sibling of [`bucket_path_for_session`]. Used by the
+/// Tauri layer to compute the Hub web-viewer URL for a session
+/// without re-implementing the per-folder slug logic in the
+/// frontend.
+pub fn bucket_path_for(folder_path: &Utf8Path, session_id: &str) -> String {
+	bucket_path_for_session(folder_path, session_id)
+}
+
 fn bucket_path_for_session(folder_path: &Utf8Path, session_id: &str) -> String {
 	// Mirror the on-disk layout: a workspace can hold many
 	// folders, so we group traces by folder slug rather than

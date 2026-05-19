@@ -556,6 +556,19 @@ class CoderPanelState {
 		return ipc.coder.hubUploadAllSessions();
 	}
 
+	/** Build the `https://huggingface.co/buckets/...` URL for
+	 *  the given session id under the **active** folder. Used by
+	 *  the per-row "Open trace on Hub" affordance to launch the
+	 *  pi-mono trace viewer in the host's default browser (plain
+	 *  click) or copy the URL to the clipboard (Alt-click). The
+	 *  caller should only surface the affordance when the
+	 *  session has an `uploaded[id]` marker; this method
+	 *  surfaces a typed error otherwise (no bucket, no active
+	 *  folder, etc.). */
+	async hubSessionUrl(sessionId: string): Promise<string> {
+		return ipc.coder.hubSessionUrl(sessionId);
+	}
+
 	/** Fetch the router catalog. One round trip per call. The result
 	 *  is cached in [`routerModels`]; consumers should check that
 	 *  first and only call this when it's `null` (or when forcing a

@@ -710,11 +710,13 @@ pub async fn coder_hub_create_bucket(
 		return Err(MoonError::invalid("no workspace bound to this process"));
 	};
 	let id = id.to_owned();
-	let workspace_basename = workspace_basename(&state).await.unwrap_or_else(|| name.clone());
+	let workspace_label = workspace_display_label(&state, &id)
+		.await
+		.unwrap_or_else(|| name.clone());
 	let bucket = state
 		.coder
 		.hub_sync()
-		.create_bucket(&namespace, &name, private, &workspace_basename)
+		.create_bucket(&namespace, &name, private, &workspace_label)
 		.await?;
 	let mut session = core_session::load(&state.workspaces_dir, &id).await?;
 	session.coder_hub_bucket = Some(bucket.clone());
@@ -799,10 +801,67 @@ pub async fn coder_hub_upload_all_sessions(state: State<'_, AppState>) -> Result
 	state.coder.hub_upload_all_sessions().await.map_err(MoonError::from)
 }
 
-/// Helper: best-effort basename of the workspace's active folder.
-/// Used to seed the README and the default bucket name preview.
-/// `None` when there's no active folder.
-async fn workspace_basename(state: &AppState) -> Option<String> {
+/// Build the Hub web-viewer URL for `session_id` under the
+/// active folder. Resolves to
+/// `https://huggingface.co/buckets/<ns>/<name>/tree/<folder-slug>/<id>.jsonl`
+/// — same `<folder-slug>/<id>.jsonl` layout the runner uses for
+/// the upload path, so this matches whatever's actually on the
+/// Hub.
+///
+/// Errors with a typed `Invalid` when the workspace has no bucket
+/// connected (the panel should not surface the affordance in that
+/// case; this is a defence-in-depth check) or when there's no
+/// active folder. Doesn't check whether the file actually exists
+/// on the Hub — the per-row affordance is gated on the local
+/// `uploaded` marker, which is enough.
+#[tauri::command]
+pub async fn coder_hub_session_url(state: State<'_, AppState>, session_id: String) -> Result<String, MoonError> {
+	let Some(id) = state.workspace_id() else {
+		return Err(MoonError::invalid("no workspace bound to this process"));
+	};
+	let id = id.to_owned();
+	let session = core_session::load(&state.workspaces_dir, &id).await?;
+	let Some(bucket) = session.coder_hub_bucket else {
+		return Err(MoonError::invalid(
+			"no Hugging Face bucket connected for this workspace",
+		));
+	};
+	let Some(folder) = state.coder.active_folder().await else {
+		return Err(MoonError::invalid("no active workspace folder"));
+	};
+	let folder_path = Utf8PathBuf::from(folder);
+	let path_in_bucket = moon_coder::hub_sync::bucket_path_for(&folder_path, &session_id);
+	Ok(format!(
+		"https://huggingface.co/buckets/{namespace}/{name}/tree/{path}",
+		namespace = bucket.namespace,
+		name = bucket.name,
+		path = path_in_bucket,
+	))
+}
+
+/// Helper: best-effort human label for the workspace, used to seed
+/// the HF Hub bucket README.
+///
+/// Preference order:
+///
+/// 1. The workspace's display `name` from the global catalog
+///    (`AppState.workspaces[id].name`) — what the user typed at
+///    workspace-create time and what's labelled on the picker.
+///    The right answer for a multi-folder workspace.
+/// 2. The active folder's basename — a fallback for pre-catalog
+///    bootstraps where the catalog hasn't been populated yet
+///    (early launch, dev path). Worse than (1) for multi-folder
+///    workspaces but better than an empty README header.
+/// 3. `None` — caller falls back to the bucket name itself.
+async fn workspace_display_label(state: &AppState, workspace_id: &str) -> Option<String> {
+	if let Ok(app_state) = moon_core::app_state::load(&state.config_dir).await {
+		if let Some(meta) = app_state.workspaces.iter().find(|m| m.id == workspace_id) {
+			let trimmed = meta.name.trim();
+			if !trimmed.is_empty() {
+				return Some(trimmed.to_string());
+			}
+		}
+	}
 	let folder = state.coder.active_folder().await?;
 	let path = Utf8PathBuf::from(folder);
 	path.file_name().map(|s| s.to_string())

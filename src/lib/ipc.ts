@@ -371,6 +371,7 @@ export const ipc = {
 		hubDisconnect: () => invoke<void>('coder_hub_disconnect'),
 		hubUploadSession: (sessionId: string) => invoke<void>('coder_hub_upload_session', { sessionId }),
 		hubUploadAllSessions: () => invoke<HubUploadAllSummary>('coder_hub_upload_all_sessions'),
+		hubSessionUrl: (sessionId: string) => invoke<string>('coder_hub_session_url', { sessionId }),
 	},
 	ui: {
 		setRightPanel: (kind: RightPanelKind | null) => invoke<void>('ui_set_right_panel', { kind }),

@@ -133,36 +133,22 @@
 			</label>
 
 			<p class="hint">
-				Manual <code>Upload</code> is always available on each session row, regardless of the autosync toggle.
+				Manual <code>Upload</code> is always available on each session row.
+				<button type="button" class="link" onclick={onUploadAll} disabled={uploadingAll}>
+					{uploadingAll ? 'Uploading…' : 'Upload all now'}
+				</button> pushes every session from every bound folder in one batch.
 			</p>
 
-			<div class="bulk">
-				<button type="button" class="secondary bulk-button" onclick={onUploadAll} disabled={uploadingAll}>
-					{uploadingAll ? 'Uploading sessions…' : 'Upload all sessions now'}
-				</button>
-				<p class="hint">
-					Pushes every local session JSONL from every folder bound to this workspace. One Hub round-trip batches the
-					whole set; sessions already up to date are skipped.
-				</p>
-				{#if lastUploadAll}
-					{@const total = lastUploadAll.uploaded + lastUploadAll.skipped + lastUploadAll.failed.length}
-					{#if total === 0}
-						<p class="hint result">No sessions on disk yet.</p>
-					{:else}
-						<p class="hint result">
-							Last run: <strong>{lastUploadAll.uploaded}</strong> uploaded, <strong>{lastUploadAll.skipped}</strong>
-							already up to date{#if lastUploadAll.failed.length > 0}, <strong>{lastUploadAll.failed.length}</strong> failed{/if}.
-						</p>
-						{#if lastUploadAll.failed.length > 0}
-							<ul class="failures">
-								{#each lastUploadAll.failed as failure (failure.session_id)}
-									<li><code>{failure.session_id}</code>: {failure.error}</li>
-								{/each}
-							</ul>
-						{/if}
-					{/if}
-				{/if}
-			</div>
+			{#if lastUploadAll && lastUploadAll.failed.length > 0}
+				<details class="failures-block" open>
+					<summary>{lastUploadAll.failed.length} failed to upload</summary>
+					<ul class="failures">
+						{#each lastUploadAll.failed as failure (failure.session_id)}
+							<li><code>{failure.session_id}</code>: {failure.error}</li>
+						{/each}
+					</ul>
+				</details>
+			{/if}
 
 			{#if actionError}
 				<p class="error" role="alert">{actionError}</p>
@@ -279,30 +265,38 @@
 		font-size: 11px;
 		color: var(--m-fg-subtle);
 		margin: 0;
+		line-height: 1.5;
 	}
-	.bulk {
-		display: flex;
-		flex-direction: column;
-		gap: 6px;
-		border: 1px solid var(--m-border);
-		border-radius: 4px;
-		padding: 10px 12px;
+	.link {
+		background: transparent;
+		border: 0;
+		padding: 0;
+		font: inherit;
+		color: var(--m-accent);
+		cursor: pointer;
+		text-decoration: underline;
 	}
-	.bulk-button {
-		align-self: flex-start;
+	.link:hover:not(:disabled) {
+		filter: brightness(1.15);
 	}
-	.bulk-button:disabled {
+	.link:disabled {
 		cursor: progress;
 		opacity: 0.7;
 	}
-	.result {
-		margin-top: 2px;
-	}
-	.failures {
-		margin: 4px 0 0;
-		padding-left: 18px;
+	.failures-block {
 		font-size: 11px;
 		color: var(--m-danger);
+		background: color-mix(in srgb, var(--m-danger) 10%, transparent);
+		border-radius: 4px;
+		padding: 6px 10px;
+	}
+	.failures-block summary {
+		cursor: pointer;
+		user-select: none;
+	}
+	.failures {
+		margin: 6px 0 0;
+		padding-left: 18px;
 		max-height: 100px;
 		overflow-y: auto;
 	}

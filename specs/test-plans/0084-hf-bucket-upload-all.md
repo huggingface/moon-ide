@@ -5,14 +5,27 @@
 
 ## What shipped
 
-- **`Upload all sessions now`** button in the bucket settings
-  modal. One click pushes every top-level session JSONL from
-  every folder bound to the workspace into the connected HF Hub
-  bucket; sessions already up to date are skipped at the byte-
-  length marker. Result strip in the modal reports
-  `<uploaded> uploaded, <skipped> already up to date,
-<failed> failed`, with per-session failure detail when
-  anything errored.
+- **`Upload all now`** link inline in the bucket settings
+  modal's hint paragraph. One click pushes every top-level
+  session JSONL from every folder bound to the workspace into
+  the connected HF Hub bucket; sessions already up to date are
+  skipped at the byte-length marker. The success summary
+  (`<uploaded> uploaded, <skipped> already up to date`) shows
+  as a bottom-screen flash; per-session failure detail folds
+  into an inline `<details>` region inside the modal so the
+  happy path leaves no chrome behind.
+- **"Open trace on Hub"** affordance — a small external-link
+  glyph that appears on each session row (and in the in-session
+  header) only when the session has actually been uploaded
+  (i.e. there's an `uploaded[id]` marker on the bucket
+  binding). Plain click opens the trace's
+  `https://huggingface.co/buckets/<ns>/<name>/tree/<slug>/<id>.jsonl`
+  URL in the host's default browser; `Alt`-click copies the URL
+  to the clipboard with a `Trace URL copied to clipboard.`
+  flash. The URL is computed server-side by
+  `coder_hub_session_url` so the folder-slug derivation lives
+  in one place (the runner's `bucket_path_for` helper, also
+  used by the upload path).
 - Backend folds the round-trips: one `xet-write-token` fetch
   - parallel Xet CAS uploads (capped at 4) + **one** `/batch`
     NDJSON POST that binds every newly-uploaded hash. A workspace
@@ -74,47 +87,76 @@ jq 'keys'`. Expected: the file contains `coder_hub_bucket`
 ### 3. Upload all — happy path
 
 1. With the bucket connected and ≥ 2 local sessions across
-   ≥ 2 folders, open the modal and click **Upload all
-   sessions now**. Expected: the button label becomes
-   `Uploading sessions…` and is disabled; the per-row cloud
-   icon on the sessions list (for any folder you're currently
-   looking at) flips through `idle → syncing → synced`.
-2. The button returns to its normal label; the result strip
-   reads `Last run: <uploaded> uploaded, <skipped> already up
-to date.` Bottom-of-screen flash mirrors the summary.
-3. In the Hub bucket page, every folder's `<slug>/` directory
-   exists and contains the expected JSONLs. Open one — the
-   pi-mono trace viewer renders it inline.
-4. Click **Upload all sessions now** again immediately.
-   Expected: the result strip flips to
-   `0 uploaded, N already up to date.` — the byte-length
-   skip shortcut kicked in for every session.
+   ≥ 2 folders, open the modal and click the **Upload all
+   now** link inside the hint paragraph. Expected: the link
+   text flips to `Uploading…` and is non-clickable; the
+   per-row cloud icon on the sessions list (for any folder
+   you're currently looking at) flips through
+   `idle → syncing → synced`.
+2. The link returns to its normal label; a bottom-of-screen
+   flash reads `<N> uploaded, <M> already up to date.` No
+   chrome accumulates inside the modal — the happy path
+   leaves no residue.
+3. In the Hub bucket page, every folder's `<slug>/`
+   directory exists and contains the expected JSONLs.
+   Open one — the pi-mono trace viewer renders it inline.
+4. Click **Upload all now** again immediately. Expected:
+   the flash reads `0 uploaded, <total> already up to
+date.` — the byte-length skip shortcut kicked in for
+   every session.
 
 ### 4. Upload all — no sessions yet
 
 1. From a clean workspace with zero session JSONLs on disk,
-   click **Upload all sessions now**. Expected: the result
-   strip reads `No sessions on disk yet.` and the bottom
-   flash is `No sessions to upload yet.`
+   click **Upload all now**. Expected: the bottom flash
+   reads `No sessions to upload yet.` The modal stays
+   chrome-free.
 
 ### 5. Upload all — partial failure
 
 1. Kill network mid-batch (`sudo ip link set <iface> down`
    while the upload is in flight) on a workspace with several
-   stale sessions. Expected: the run completes; the result
-   strip reads `Uploaded X, N failed`; the failure list shows
-   each failed `session_id` with the Hub error string. The
-   modal stays open and the panel doesn't crash.
-2. Restore the network and click **Upload all sessions now**
-   again. Expected: only the previously-failed sessions are
-   actually pushed (the successful ones are now `skipped`).
+   stale sessions. Expected: the bottom flash reads
+   `Uploaded X, N failed — see modal for details.`; an inline
+   `<details>` region appears in the modal listing each
+   failed `session_id` with the Hub error string. The modal
+   stays open and the panel doesn't crash.
+2. Restore the network and click **Upload all now** again.
+   Expected: only the previously-failed sessions are actually
+   pushed (the successful ones are now `skipped`); the
+   inline failures region either disappears or shrinks to
+   reflect the second run.
 
-### 6. Cross-folder batching
+### 6. Open trace on Hub
 
-1. With ≥ 2 folders bound, run **Upload all sessions now**
-   from a workspace where folder A has 2 sessions and folder
-   B has 3 sessions, all unsynced. Expected: the result
-   shows `5 uploaded`; the Hub bucket has two top-level
+1. With the bucket connected and at least one **uploaded**
+   session, open the sessions list. Expected: the row for the
+   uploaded session carries a small external-link glyph
+   between the upload cloud icon and the trash icon. Rows for
+   never-uploaded sessions don't show the glyph.
+2. Click the glyph. Expected: the host's default browser
+   opens at
+   `https://huggingface.co/buckets/<ns>/<name>/tree/<folder-slug>/<session-id>.jsonl`;
+   the trace renders in the pi-mono viewer.
+3. `Alt`-click (or `Option`-click on macOS) the glyph.
+   Expected: no browser opens; a flash reads
+   `Trace URL copied to clipboard.` Paste it elsewhere to
+   verify. The URL must match what step 2 navigated to.
+4. Open a session and look at its in-session header
+   (`← back · title · </> · Open trace on Hub · +`). The
+   Hub-open glyph appears here too, gated on the same
+   `uploaded[id]` marker, with the same click / Alt-click
+   gestures.
+5. Disconnect the bucket. Expected: every Hub-open glyph
+   disappears from the sessions list **and** the in-session
+   header along with the upload-cloud and synced indicators.
+
+### 7. Cross-folder batching
+
+1. With ≥ 2 folders bound, run **Upload all now** from a
+   workspace where folder A has 2 sessions and folder B has
+   3 sessions, all unsynced. Expected: the bottom flash
+   reads `5 uploaded.`; the Hub bucket has two top-level
    directories, one for each folder's slug, containing the
    right session ids.
 
@@ -144,6 +186,10 @@ follow-up.
   protects).
 - `forwarded_ports` survives folder switches for the same
   reason.
+- The `</>` per-row icon still opens the **local** JSONL in
+  the editor — it isn't overloaded with a Hub-redirect mode
+  when autosync is on. Local source-of-truth view stays
+  reachable independently of the Hub mirror.
 
 ## Known limitations
 

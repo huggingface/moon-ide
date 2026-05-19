@@ -2,6 +2,7 @@
 	import { onMount, tick } from 'svelte';
 	import { confirm } from '@tauri-apps/plugin-dialog';
 	import { readImage } from '@tauri-apps/plugin-clipboard-manager';
+	import { openUrl } from '@tauri-apps/plugin-opener';
 	import { coder, type CoderRow } from '../coder.svelte';
 	import { frontendLog } from '../logs.svelte';
 	import { slack } from '../slack.svelte';
@@ -28,6 +29,7 @@
 	import PlusIcon from './icons/PlusIcon.svelte';
 	import CloudUploadIcon from './icons/CloudUploadIcon.svelte';
 	import CloudSyncIcon from './icons/CloudSyncIcon.svelte';
+	import ExternalLinkIcon from './icons/ExternalLinkIcon.svelte';
 	import ListIcon from './icons/ListIcon.svelte';
 	import FileIcon from './icons/FileIcon.svelte';
 	import TrashIcon from './icons/TrashIcon.svelte';
@@ -86,6 +88,38 @@
 		} catch (err) {
 			workspace.flash(`Hub upload failed: ${err instanceof Error ? err.message : String(err)}`);
 		}
+	}
+
+	/**
+	 * Open the trace's Hub URL in the host's default browser
+	 * (plain click) or copy it to the clipboard (Alt-click).
+	 * Surfaced per-session only when the session has been
+	 * uploaded — i.e. there's an `uploaded[id]` marker on the
+	 * bucket binding. The button is hidden in any other state, so
+	 * a click should never land here without a valid URL, but we
+	 * still surface the typed error as a flash for safety.
+	 */
+	async function onOpenTraceOnHub(event: MouseEvent, sessionId: string): Promise<void> {
+		event.stopPropagation();
+		let url: string;
+		try {
+			url = await coder.hubSessionUrl(sessionId);
+		} catch (err) {
+			workspace.flash(`Could not resolve Hub URL: ${formatError(err)}`);
+			return;
+		}
+		if (event.altKey) {
+			try {
+				await navigator.clipboard.writeText(url);
+				workspace.flash('Trace URL copied to clipboard.');
+			} catch {
+				// Clipboard failures are silent everywhere else in
+				// the IDE (same pattern as the terminal copy/paste
+				// path); the user can fall back to the plain click.
+			}
+			return;
+		}
+		void openUrl(url);
 	}
 
 	// Keep the store's `composerEl` reference in sync with the
@@ -972,6 +1006,17 @@
 								>
 									<CloudUploadIcon />
 								</button>
+								{#if coder.hubBucket.uploaded[session.id]}
+									<button
+										type="button"
+										class="icon session-row-action"
+										title="Open trace on Hugging Face (Alt-click to copy URL)"
+										aria-label="Open trace on Hugging Face"
+										onclick={(event) => onOpenTraceOnHub(event, session.id)}
+									>
+										<ExternalLinkIcon />
+									</button>
+								{/if}
 							{/if}
 							<button
 								type="button"
@@ -1016,6 +1061,17 @@
 				>
 					<CodeIcon />
 				</button>
+				{#if coder.hubBucket?.uploaded[coder.activeSession.id]}
+					<button
+						type="button"
+						class="icon"
+						onclick={(event) => onOpenTraceOnHub(event, coder.activeSession!.id)}
+						title="Open trace on Hugging Face (Alt-click to copy URL)"
+						aria-label="Open trace on Hugging Face"
+					>
+						<ExternalLinkIcon />
+					</button>
+				{/if}
 			{/if}
 			<button type="button" class="icon" onclick={onNewSession} title="New session" aria-label="New session">
 				<PlusIcon />
