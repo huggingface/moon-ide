@@ -31,7 +31,7 @@ Four small, related coder changes that the human asked for in one batch (see [ag
 
 ### D. "Running" pip in the session list
 
-- The session list (`coder.view === 'list'`) now paints a small pulsing accent dot left of the title and a `running…` label in the meta row for whichever row matches `coder.activeSession?.id` while `coder.busy === true`. Goes through the existing per-folder bucket — only the active folder's session list shows pips, since `busy` is folder-scoped and the runner contract is one running turn per project.
+- The session list (`coder.view === 'list'`) now paints a small pulsing accent dot left of the title and a `running…` label in the meta row for any session row whose turn is currently running. **Superseded by [ADR 0016](../decisions/0016-coder-concurrent-sessions.md):** when this plan shipped, `busy` was folder-scoped and only the visible session could ever be running, so the pip only ever appeared on one row at a time. Post-ADR, `busy` is per-session and multiple rows in the same folder can show pips simultaneously — see [test plan 0085](0085-coder-concurrent-sessions.md).
 - `prefers-reduced-motion: reduce` disables the pulse keyframes; the dot stays solid in that case.
 
 ## How to test

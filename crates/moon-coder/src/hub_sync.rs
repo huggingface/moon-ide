@@ -576,8 +576,16 @@ impl HubSync {
 	}
 
 	fn emit(&self, folder_path: &Utf8Path, event: CoderEvent) {
+		// Hub-sync events are **folder-scoped**, not session-scoped:
+		// the sessions-list cloud icon they decorate sits in the
+		// folder-level sessions list, and the frontend's dispatcher
+		// routes the empty `session_id` to a folder-level handler.
+		// The session id of the JSONL being uploaded lives on the
+		// inner event payload (`HubSyncStarted.session_id` /
+		// `HubSyncFinished.session_id`), so no information is lost.
 		let _ = self.events.send(CoderEventEnvelope {
 			folder: folder_path.as_str().to_string(),
+			session_id: String::new(),
 			event,
 		});
 	}

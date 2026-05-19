@@ -1395,16 +1395,24 @@ export type TokenUsageSource = 'provider' | 'estimate';
 export type SubagentMode = 'research' | 'agent';
 
 /**
- * Outer envelope carrying a folder tag alongside the inner event.
- * Mirrors `moon_coder::CoderEventEnvelope`. The frontend's
- * multi-session dispatcher routes events to per-folder UI buckets
- * by `envelope.folder` (absolute path matching
- * `WorkspaceFolder.path`). Sub-agent events arrive tagged with
- * the **parent's** folder, since sub-agents belong to whichever
- * project originated them.
+ * Outer envelope carrying a `(folder, session_id)` tag alongside
+ * the inner event. Mirrors `moon_coder::CoderEventEnvelope`. The
+ * frontend's multi-session dispatcher routes events to per-
+ * `(folder, session_id)` UI buckets — multiple sessions can run
+ * concurrently in the same folder (see ADR 0016) so the folder
+ * alone isn't enough to disambiguate. Sub-agent events arrive
+ * tagged with the **parent's** folder + session id, since sub-
+ * agents belong to whichever session originated them.
+ *
+ * A handful of event variants are genuinely folder-scoped, not
+ * session-scoped (`folder_summary_ready`, `hub_sync_started`,
+ * `hub_sync_finished`); those arrive with `session_id === ''` and
+ * the dispatcher routes them to the folder-level handler rather
+ * than a specific session bucket.
  */
 export type CoderEventEnvelope = {
 	folder: string;
+	session_id: string;
 	event: CoderEvent;
 };
 

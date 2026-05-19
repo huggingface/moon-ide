@@ -941,8 +941,9 @@
 			{:else}
 				<ul class="session-list">
 					{#each coder.sessions as session (session.id)}
-						{@const isRunning = coder.busy && coder.activeSession?.id === session.id}
-						<li class="session-row" class:active={coder.activeSession?.id === session.id} class:running={isRunning}>
+						{@const isVisible = coder.currentSession.activeSession?.id === session.id}
+						{@const isRunning = coder.current.isSessionRunning(session.id)}
+						<li class="session-row" class:active={isVisible} class:running={isRunning}>
 							<button
 								type="button"
 								class="session-pick"

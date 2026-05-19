@@ -17,6 +17,7 @@
 //! See `specs/coder.md` and `specs/test-plans/0039-coder-skeleton.md`.
 
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { SvelteMap } from 'svelte/reactivity';
 import { ipc } from './ipc';
 import {
 	formatError,
@@ -198,18 +199,6 @@ export type TerminalAttachment = {
  *  the IPC alongside `text`. */
 export type ComposerAttachment = SelectionAttachment | ImageComposerAttachment | TerminalAttachment;
 
-/** Per-bound-folder UI state. One instance per folder we've ever
- *  routed an event for; lazily created via
- *  [`CoderPanelState.bucketFor`]. Held in `byFolder` map keyed by
- *  the folder's absolute path (matches `WorkspaceFolder.path`).
- *
- *  Per-folder so that a turn running in folder X keeps streaming
- *  rows / busy / sub-agent updates into X's bucket while the user
- *  is browsing folder Y — switching active folder swaps which
- *  bucket the panel reads from, no IPC, no state loss. Per the
- *  multi-session decision: composer draft and attachments live
- *  here too, so each project's typed-but-unsent prose survives a
- *  folder hop. */
 /**
  * One entry in the agent's session-scoped todo list. Mirrors
  * `moon_coder::TodoItem`. The pill in the panel header and the
@@ -266,47 +255,118 @@ function extractTodos(result: unknown): TodoItem[] | null {
 	return out;
 }
 
-class FolderViewState {
+/** Per-(folder, session_id) UI state. One bucket per runtime
+ *  session the panel has ever seen an event for in a given
+ *  folder. Lazily created via
+ *  [`CoderPanelState.sessionStateFor`] — an inbound event for a
+ *  background session id we haven't materialised yet mints a
+ *  fresh bucket on first arrival.
+ *
+ *  Per-session per ADR 0016: several sessions can run
+ *  concurrently in the same folder, each with its own
+ *  transcript, busy pip, context ring, todo list, and composer
+ *  draft. Switching the visible session inside a folder swaps
+ *  which bucket the panel reads from; the other sessions keep
+ *  streaming into their own buckets in the background. */
+class SessionViewState {
 	rows = $state<CoderRow[]>([]);
 	busy = $state(false);
+	activeSession = $state<CoderSessionSummary | null>(null);
+	viewSubagentId = $state<string | null>(null);
+	subagentSummaries = $state<Map<string, SubagentSummary>>(new Map());
+	subagentTranscripts = $state<Map<string, SubagentTranscript>>(new Map());
+	draft = $state('');
+	attachments = $state<ComposerAttachment[]>([]);
+	/** Latest token usage report from the parent loop for this
+	 *  session. `null` before the first turn; populated from
+	 *  `token_usage` events and used by [`ContextRing`] in the
+	 *  panel header. */
+	tokenUsage = $state<TokenUsageState | null>(null);
+	/** Auto-compaction status for this session. `null` when
+	 *  nothing is in flight; `{ phase: 'running', ... }` while the
+	 *  fast-model summary call is out; `{ phase: 'done', ... }`
+	 *  after `compaction_complete` lands so the UI can render the
+	 *  disclosure with the summary body until the next
+	 *  compaction overwrites it. */
+	compaction = $state<CompactionState | null>(null);
+	/** Canonical post-merge todo list maintained by the agent's
+	 *  `todo_write` tool for this session. Mirrored from
+	 *  `tool_result.todos` so the pill / popover in the panel
+	 *  header stay in lock-step with the model's view. Empty
+	 *  until the agent calls the tool; also re-seeded on session
+	 *  replay because `tool_result` events are re-emitted as part
+	 *  of the replay stream. */
+	todos = $state<TodoItem[]>([]);
+}
+
+/** Per-bound-folder UI state. One instance per folder we've ever
+ *  routed an event for; lazily created via
+ *  [`CoderPanelState.bucketFor`]. Held in `byFolder` map keyed by
+ *  the folder's absolute path (matches `WorkspaceFolder.path`).
+ *
+ *  Holds folder-scoped fields plus a map of per-session buckets.
+ *  Per ADR 0016, several sessions can run concurrently in one
+ *  folder; folder-level fields here are rolled up across them
+ *  (`attentionPending` is "any session in this folder finished
+ *  while the user was looking elsewhere"). Session-scoped fields
+ *  live on [`SessionViewState`] under `sessionsById`. */
+class FolderState {
+	/** On-disk sessions list (lazy-fetched). */
+	sessions = $state<CoderSessionSummary[] | null>(null);
+	/** Panel-level view selector for this folder. */
+	view = $state<CoderView>('session');
 	/** "An agent in this folder finished a turn while the user
 	 *  wasn't looking, and they haven't visited the folder
 	 *  since." Drives the static amber sparkle on the folder bar
 	 *  for non-active projects with completed work, so a user
 	 *  juggling background agents notices "that one's done"
 	 *  without needing the panel open. Set on
-	 *  `turn_complete` / `aborted` / `error` only for buckets
-	 *  whose folder is not currently active (an active-folder
+	 *  `turn_complete` / `aborted` / `error` only for folders
+	 *  that are not currently active (an active-folder
 	 *  completion is something the user is already looking at).
 	 *  Cleared in [`setActiveFolder`] when the user switches to
-	 *  the folder. Process-local; no need to persist across
-	 *  restarts. */
+	 *  the folder. Folder-scoped (not per-session) so the badge
+	 *  rolls up: any session finishing in a background folder
+	 *  lights the same sparkle. */
 	attentionPending = $state(false);
-	activeSession = $state<CoderSessionSummary | null>(null);
-	view = $state<CoderView>('session');
-	viewSubagentId = $state<string | null>(null);
-	subagentSummaries = $state<Map<string, SubagentSummary>>(new Map());
-	subagentTranscripts = $state<Map<string, SubagentTranscript>>(new Map());
-	sessions = $state<CoderSessionSummary[] | null>(null);
-	draft = $state('');
-	attachments = $state<ComposerAttachment[]>([]);
-	/** Latest token usage report from the parent loop. `null`
-	 *  before the first turn; populated from `token_usage` events
-	 *  and used by [`ContextRing`] in the panel header. */
-	tokenUsage = $state<TokenUsageState | null>(null);
-	/** Auto-compaction status. `null` when nothing is in flight;
-	 *  `{ phase: 'running', ... }` while the fast-model summary
-	 *  call is out; `{ phase: 'done', ... }` after `compaction_complete`
-	 *  lands so the UI can render the disclosure with the summary
-	 *  body until the next compaction overwrites it. */
-	compaction = $state<CompactionState | null>(null);
-	/** Canonical post-merge todo list maintained by the agent's
-	 *  `todo_write` tool. Mirrored from `tool_result.todos` so the
-	 *  pill / popover in the panel header stay in lock-step with
-	 *  the model's view. Empty until the agent calls the tool;
-	 *  also re-seeded on session replay because `tool_result`
-	 *  events are re-emitted as part of the replay stream. */
-	todos = $state<TodoItem[]>([]);
+	/** Session id the panel is currently mounted on for this
+	 *  folder; `null` when there is no visible session (cold
+	 *  start before hydration, or after deleting the visible
+	 *  session — the panel falls back to the sessions list).
+	 *  Mutated by `openSession` / `newSession` / `session_loaded`
+	 *  / `deleteSession` / hydration. */
+	visibleSessionId = $state<string | null>(null);
+	/** Per-session buckets keyed by runtime session id.
+	 *  `SvelteMap` so consumers iterating it (the sessions list
+	 *  re-checks every row's per-session `busy` for its running
+	 *  pip; `anyBusy` walks every folder's sessions) re-run when
+	 *  a new session bucket is minted on first event. */
+	sessionsById = new SvelteMap<string, SessionViewState>();
+
+	/** Lazy-create and return the bucket for `visibleSessionId`.
+	 *  Returns a placeholder bucket when the id is `null` so
+	 *  consumers don't need to null-guard every read; the
+	 *  placeholder lives under the empty-string key, which can
+	 *  never collide with a real session id. */
+	visibleSession(): SessionViewState {
+		const id = this.visibleSessionId ?? '';
+		let entry = this.sessionsById.get(id);
+		if (!entry) {
+			entry = new SessionViewState();
+			this.sessionsById.set(id, entry);
+		}
+		return entry;
+	}
+
+	/** "Is the session with `sessionId` currently running a
+	 *  turn?" Reads through the bucket's per-session `busy` so
+	 *  the sessions-list per-row pip flips for background turns,
+	 *  not just the visible one. Returns `false` when the
+	 *  session has no bucket yet (no events ever arrived for
+	 *  it). */
+	isSessionRunning(sessionId: string): boolean {
+		return this.sessionsById.get(sessionId)?.busy ?? false;
+	}
 }
 
 /**
@@ -758,10 +818,11 @@ class CoderPanelState {
 	 *  removed (cheap, and a folder rebound after removal gets
 	 *  the same bucket back, which is what the user expects).
 	 *  The map itself is **not** `$state` — only the inner
-	 *  `FolderViewState`'s `$state` fields drive component
+	 *  `FolderState`'s `$state` fields (and its
+	 *  `SvelteMap<string, SessionViewState>`) drive component
 	 *  re-renders, so we don't need to re-allocate the map on
 	 *  every bucket access. */
-	byFolder = new Map<string, FolderViewState>();
+	byFolder = new Map<string, FolderState>();
 
 	/** Absolute path of the currently active workspace folder, or
 	 *  `null` when none is bound. Updated externally via
@@ -777,8 +838,17 @@ class CoderPanelState {
 	 *  Reading any per-folder field through this getter sets up
 	 *  a reactivity dependency on `activeFolderPath`, so a folder
 	 *  switch re-renders the panel against the new bucket. */
-	get current(): FolderViewState {
+	get current(): FolderState {
 		return this.bucketFor(this.activeFolderPath ?? NO_FOLDER_KEY);
+	}
+
+	/** Convenience: the visible session bucket inside `current`.
+	 *  Lazy-creates a placeholder when `visibleSessionId === null`
+	 *  so consumers can always read session-scoped fields without
+	 *  null-guards. Re-resolves when the active folder switches
+	 *  *or* the visible session id flips. */
+	get currentSession(): SessionViewState {
+		return this.current.visibleSession();
 	}
 
 	/** Look up (and lazily create) the bucket for a specific folder.
@@ -786,37 +856,61 @@ class CoderPanelState {
 	 *  the right folder's UI state, even for folders the user has
 	 *  never visited yet (a sub-agent spawn from another folder, a
 	 *  background turn finishing while the user is elsewhere, etc.). */
-	bucketFor(folder: string): FolderViewState {
+	bucketFor(folder: string): FolderState {
 		let entry = this.byFolder.get(folder);
 		if (!entry) {
-			entry = new FolderViewState();
+			entry = new FolderState();
 			this.byFolder.set(folder, entry);
 		}
 		return entry;
 	}
 
+	/** Look up (and lazily create) the session bucket for a
+	 *  specific `(folder, session_id)`. Used by the event
+	 *  dispatcher to route session-scoped envelopes; the first
+	 *  event for a session id (e.g. a background turn from a
+	 *  previous IDE process emitting its first delta after
+	 *  rewire) mints a fresh bucket here. */
+	sessionStateFor(folder: string, sessionId: string): SessionViewState {
+		const f = this.bucketFor(folder);
+		let entry = f.sessionsById.get(sessionId);
+		if (!entry) {
+			entry = new SessionViewState();
+			f.sessionsById.set(sessionId, entry);
+		}
+		return entry;
+	}
+
 	/** Surface an "is anything running anywhere" flag for the
-	 *  status-bar pip / global indicators. Walks every bucket; cheap
-	 *  because we have at most a few folders bound at once. */
+	 *  status-bar pip / global indicators. Walks every session in
+	 *  every folder; cheap because we have at most a handful of
+	 *  folders × a handful of sessions each. */
 	get anyBusy(): boolean {
-		for (const bucket of this.byFolder.values()) {
-			if (bucket.busy) {
-				return true;
+		for (const folder of this.byFolder.values()) {
+			for (const session of folder.sessionsById.values()) {
+				if (session.busy) {
+					return true;
+				}
 			}
 		}
 		return false;
 	}
 
-	/** "Is the agent currently running a turn for this folder?"
+	/** "Is any session in this folder currently running a turn?"
 	 *  Used by the project-bar to surface a pulsing pip when a
 	 *  background turn is mid-flight in a folder the user isn't
-	 *  currently viewing. Goes through `bucketFor` (not a raw
-	 *  `byFolder.get`) so the read sets up reactivity on the
-	 *  bucket's `busy` `$state`; the consequent lazy-create of
-	 *  an empty bucket per bound folder is cheap (a handful of
-	 *  null fields). */
+	 *  currently viewing. Goes through `bucketFor` so the read
+	 *  sets up reactivity on the folder's `sessionsById`
+	 *  `SvelteMap`; the lazy-create of an empty folder bucket per
+	 *  bound folder is cheap. */
 	busyForFolder(folder: string): boolean {
-		return this.bucketFor(folder).busy;
+		const f = this.bucketFor(folder);
+		for (const session of f.sessionsById.values()) {
+			if (session.busy) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/** "Has an agent in this folder finished a turn that the user
@@ -828,22 +922,18 @@ class CoderPanelState {
 		return this.bucketFor(folder).attentionPending;
 	}
 
-	// Per-folder field forwards. Components keep reading
-	// `coder.rows`, `coder.busy`, etc. unchanged — the indirection
-	// through `current` keeps them on the right bucket while the
-	// user navigates between projects.
+	// Two-layer field forwards. Components keep reading
+	// `coder.rows`, `coder.busy`, etc. unchanged — folder-scoped
+	// reads route through `current` (the active folder's
+	// `FolderState`), session-scoped reads route through
+	// `currentSession` (the visible session inside that folder).
+	// Switching folders re-binds `current`; switching sessions
+	// within a folder re-binds `currentSession`.
 	get sessions(): CoderSessionSummary[] | null {
 		return this.current.sessions;
 	}
 	set sessions(value: CoderSessionSummary[] | null) {
 		this.current.sessions = value;
-	}
-
-	get activeSession(): CoderSessionSummary | null {
-		return this.current.activeSession;
-	}
-	set activeSession(value: CoderSessionSummary | null) {
-		this.current.activeSession = value;
 	}
 
 	get view(): CoderView {
@@ -853,69 +943,76 @@ class CoderPanelState {
 		this.current.view = value;
 	}
 
+	get activeSession(): CoderSessionSummary | null {
+		return this.currentSession.activeSession;
+	}
+	set activeSession(value: CoderSessionSummary | null) {
+		this.currentSession.activeSession = value;
+	}
+
 	get busy(): boolean {
-		return this.current.busy;
+		return this.currentSession.busy;
 	}
 	set busy(value: boolean) {
-		this.current.busy = value;
+		this.currentSession.busy = value;
 	}
 
 	get rows(): CoderRow[] {
-		return this.current.rows;
+		return this.currentSession.rows;
 	}
 	set rows(value: CoderRow[]) {
-		this.current.rows = value;
+		this.currentSession.rows = value;
 	}
 
 	get subagentSummaries(): Map<string, SubagentSummary> {
-		return this.current.subagentSummaries;
+		return this.currentSession.subagentSummaries;
 	}
 	set subagentSummaries(value: Map<string, SubagentSummary>) {
-		this.current.subagentSummaries = value;
+		this.currentSession.subagentSummaries = value;
 	}
 
 	get subagentTranscripts(): Map<string, SubagentTranscript> {
-		return this.current.subagentTranscripts;
+		return this.currentSession.subagentTranscripts;
 	}
 	set subagentTranscripts(value: Map<string, SubagentTranscript>) {
-		this.current.subagentTranscripts = value;
+		this.currentSession.subagentTranscripts = value;
 	}
 
 	get viewSubagentId(): string | null {
-		return this.current.viewSubagentId;
+		return this.currentSession.viewSubagentId;
 	}
 	set viewSubagentId(value: string | null) {
-		this.current.viewSubagentId = value;
+		this.currentSession.viewSubagentId = value;
 	}
 
 	get draft(): string {
-		return this.current.draft;
+		return this.currentSession.draft;
 	}
 	set draft(value: string) {
-		this.current.draft = value;
+		this.currentSession.draft = value;
 	}
 
 	get attachments(): ComposerAttachment[] {
-		return this.current.attachments;
+		return this.currentSession.attachments;
 	}
 	set attachments(value: ComposerAttachment[]) {
-		this.current.attachments = value;
+		this.currentSession.attachments = value;
 	}
 
 	get tokenUsage(): TokenUsageState | null {
-		return this.current.tokenUsage;
+		return this.currentSession.tokenUsage;
 	}
 
 	get compaction(): CompactionState | null {
-		return this.current.compaction;
+		return this.currentSession.compaction;
 	}
 
-	/** Per-folder todo list. The header pill reads it directly via
-	 *  `coder.todos`; the popover renders the same list with status
-	 *  glyphs. Empty array when the agent hasn't called
+	/** Per-session todo list. The header pill reads it directly
+	 *  via `coder.todos`; the popover renders the same list with
+	 *  status glyphs. Empty array when the agent hasn't called
 	 *  `todo_write` in the current session. */
 	get todos(): TodoItem[] {
-		return this.current.todos;
+		return this.currentSession.todos;
 	}
 
 	/** Counter the panel `$effect`s on to refocus the composer
@@ -1277,24 +1374,24 @@ class CoderPanelState {
 
 	/** Open a persisted session by id. The backend emits
 	 *  `session_loaded` + per-record replay events on the
-	 *  `coder:event` channel; we just react to those, so this
-	 *  method only needs to flip the panel into the session view. */
+	 *  `coder:event` channel; we just rebind the visible-session
+	 *  pointer here and let the dispatcher repopulate the bucket
+	 *  as those events land. Reopening a background session
+	 *  preserves any rows / token-usage / todos already
+	 *  accumulated under its id — `session_loaded` will clear
+	 *  them right before replay, which is fine. */
 	async openSession(id: string): Promise<void> {
-		this.rows = [];
-		this.subagentSummaries = new Map();
-		this.subagentTranscripts = new Map();
-		this.viewSubagentId = null;
-		this.busy = false;
-		// Wipe todos before replay; the session's last
-		// `tool_result` for `todo_write` (if any) will repopulate
-		// the bucket as the replay stream lands.
-		this.current.todos = [];
+		const folder = this.current;
+		folder.visibleSessionId = id;
+		folder.view = 'session';
 		try {
-			const summary = await ipc.coder.openSession(id);
-			this.activeSession = summary;
-			this.view = 'session';
+			await ipc.coder.openSession(id);
 		} catch (err) {
-			this.rows = [
+			// Surface the error in the (now-visible) session
+			// bucket. Pre-populating it before the IPC call
+			// would race the dispatcher's `session_loaded` clear
+			// of the same bucket, so we only write on failure.
+			this.sessionStateFor(this.activeFolderPath ?? NO_FOLDER_KEY, id).rows = [
 				{
 					kind: 'error',
 					id: `local-${Date.now()}`,
@@ -1304,31 +1401,33 @@ class CoderPanelState {
 		}
 	}
 
-	/** Drop the in-memory session and start a blank one. The
-	 *  panel renders the empty-session state until the user sends
-	 *  the first prompt; that prompt creates the disk-backed file
-	 *  via the `coder_send` path. */
+	/** Start a fresh runtime session in the active folder and
+	 *  make it visible. Per ADR 0016 this does **not** disturb
+	 *  any other in-flight session — those keep streaming
+	 *  events into their own buckets. */
 	async newSession(): Promise<void> {
+		const folder = this.current;
 		try {
-			await ipc.coder.newSession();
-			this.rows = [];
-			this.subagentSummaries = new Map();
-			this.subagentTranscripts = new Map();
-			this.viewSubagentId = null;
-			this.activeSession = null;
-			this.view = 'session';
-			this.busy = false;
-			// Clear the per-folder token-usage / compaction state so
-			// the context ring at the panel header doesn't carry
-			// the previous session's prompt-tokens count into a
-			// fresh blank session. The next `token_usage` event
-			// repopulates the ring from zero.
-			this.current.tokenUsage = null;
-			this.current.compaction = null;
-			// Same rationale for the todo list — a new session
-			// starts with no plan.
-			this.current.todos = [];
+			const summary = await ipc.coder.newSession();
+			folder.visibleSessionId = summary.id;
+			folder.view = 'session';
+			const session = this.sessionStateFor(this.activeFolderPath ?? NO_FOLDER_KEY, summary.id);
+			// Zero out the fresh bucket. (`sessionStateFor` just
+			// created it blank, but a previously-deleted-and-
+			// reissued id is conceivable — be explicit.)
+			session.rows = [];
+			session.subagentSummaries = new Map();
+			session.subagentTranscripts = new Map();
+			session.viewSubagentId = null;
+			session.busy = false;
+			session.tokenUsage = null;
+			session.compaction = null;
+			session.todos = [];
+			session.activeSession = null;
 		} catch (err) {
+			// Surface on the previously-visible session if any —
+			// otherwise the placeholder bucket. Either way the
+			// user sees the error inline.
 			this.rows = [{ kind: 'error', id: `local-${Date.now()}`, text: formatError(err) }];
 		}
 	}
@@ -1340,18 +1439,18 @@ class CoderPanelState {
 		try {
 			await ipc.coder.deleteSession(id);
 			await this.refreshSessions();
-			if (this.activeSession?.id === id) {
-				this.activeSession = null;
-				this.rows = [];
-				this.subagentSummaries = new Map();
-				this.subagentTranscripts = new Map();
-				this.viewSubagentId = null;
-				// Same teardown as `newSession`: drop the deleted
-				// session's token / compaction snapshot so the ring
-				// doesn't outlive its data.
-				this.current.tokenUsage = null;
-				this.current.compaction = null;
-				this.current.todos = [];
+			const folder = this.current;
+			// Drop the local bucket too — its in-flight subscription
+			// (if any) was cancelled backend-side, and leaving the
+			// stale rows around would be confusing if the same id
+			// gets reissued later.
+			folder.sessionsById.delete(id);
+			if (folder.visibleSessionId === id) {
+				// Fall back to the sessions list (the existing
+				// list-or-empty-session logic at the panel
+				// view layer handles the rest).
+				folder.visibleSessionId = null;
+				folder.view = (folder.sessions?.length ?? 0) > 0 ? 'list' : 'session';
 			}
 		} catch (err) {
 			// eslint-disable-next-line no-console
@@ -1530,11 +1629,24 @@ class CoderPanelState {
 	 *  re-hydrate; folders the user has already visited keep
 	 *  their bucket as it stands. */
 	async #hydrateSession(): Promise<void> {
+		const folder = this.current;
 		try {
 			const active = await ipc.coder.activeSession();
 			if (active) {
-				this.activeSession = active;
-				this.view = 'session';
+				// Adopt the backend's visible-session id. The
+				// session bucket's transcript / todos / etc. are
+				// not populated here — the live replay path
+				// (`open_session` → `session_loaded` + replay
+				// events) handles that whenever the user actually
+				// clicks into the session, and an already-
+				// running background turn lazy-creates its bucket
+				// on its first inbound event.
+				folder.visibleSessionId = active.id;
+				folder.view = 'session';
+				// Seed the bucket's `activeSession` metadata so
+				// the header reads sensibly before the user
+				// triggers a replay.
+				this.sessionStateFor(this.activeFolderPath ?? NO_FOLDER_KEY, active.id).activeSession = active;
 				return;
 			}
 		} catch {
@@ -1556,13 +1668,11 @@ class CoderPanelState {
 					// have to back out manually to recover. Direct
 					// IPC lets the error bubble to the catch below
 					// so we fall through to the sessions list
-					// instead. The state-reset that `openSession`
-					// does before its IPC call is a no-op here
-					// because the bucket is freshly initialised at
-					// hydration time.
+					// instead.
 					const summary = await ipc.coder.openSession(id);
-					this.activeSession = summary;
-					this.view = 'session';
+					folder.visibleSessionId = summary.id;
+					folder.view = 'session';
+					this.sessionStateFor(folderKey, summary.id).activeSession = summary;
 					return;
 				} catch {
 					// Stale pointer — the session no longer exists
@@ -1579,7 +1689,7 @@ class CoderPanelState {
 			// path; no need to double-toast here.
 		}
 		await this.refreshSessions();
-		this.view = (this.sessions?.length ?? 0) > 0 ? 'list' : 'session';
+		folder.view = (folder.sessions?.length ?? 0) > 0 ? 'list' : 'session';
 	}
 
 	async startDeviceFlow(): Promise<void> {
@@ -1617,12 +1727,14 @@ class CoderPanelState {
 			this.signInError = formatError(err);
 			return;
 		}
-		this.rows = [];
-		this.subagentSummaries = new Map();
-		this.subagentTranscripts = new Map();
-		this.viewSubagentId = null;
-		this.busy = false;
-		this.current.todos = [];
+		// Backend cancelled every runtime in every folder.
+		// Wipe every session bucket so the panel doesn't render
+		// stale transcripts on a re-sign-in, and clear each
+		// folder's visible-session pointer.
+		for (const folder of this.byFolder.values()) {
+			folder.sessionsById.clear();
+			folder.visibleSessionId = null;
+		}
 		await this.refreshStatus();
 	}
 
@@ -1805,7 +1917,7 @@ class CoderPanelState {
 	 *    backend's tagging contract), so a sub-agent's
 	 *    transcript builds up in the same bucket as the parent
 	 *    that spawned it. */
-	/** Flip a bucket's `attentionPending` flag to `true` iff this
+	/** Flip a folder's `attentionPending` flag to `true` iff this
 	 *  is a *background* completion — i.e. a turn that ended
 	 *  while the user was looking at a different folder (or no
 	 *  folder at all). An active-folder turn-end doesn't need
@@ -1816,8 +1928,12 @@ class CoderPanelState {
 	 *  The `NO_FOLDER_KEY` guard suppresses the badge for the
 	 *  pre-bind sentinel bucket: a turn that completed before
 	 *  any folder was active can't be associated with a folder
-	 *  bar to render on, so the flag would be dead state. */
-	#flagAttentionIfBackground(bucket: FolderViewState, folder: string): void {
+	 *  bar to render on, so the flag would be dead state.
+	 *
+	 *  Folder-scoped (not per-session) per ADR 0016: any session
+	 *  finishing in a background folder rolls up to the same
+	 *  folder-bar sparkle. */
+	#flagAttentionIfBackground(folderBucket: FolderState, folder: string): void {
 		if (folder === NO_FOLDER_KEY) {
 			return;
 		}
@@ -1825,30 +1941,88 @@ class CoderPanelState {
 		if (folder === active) {
 			return;
 		}
-		bucket.attentionPending = true;
+		folderBucket.attentionPending = true;
 	}
 
 	#dispatchEnvelope(envelope: CoderEventEnvelope): void {
+		// `folder_summary_ready` is its own global cache,
+		// untagged from any folder bucket.
 		if (envelope.event.kind === 'folder_summary_ready') {
 			const next = new Map(this.folderDescriptions);
 			next.set(envelope.event.folder, envelope.event.description);
 			this.folderDescriptions = next;
 			return;
 		}
-		const bucket = this.bucketFor(envelope.folder);
-		this.#applyEventToBucket(bucket, envelope.folder, envelope.event);
+		const folderBucket = this.bucketFor(envelope.folder);
+		// Folder-scoped events (`hub_sync_*`, `session_list_changed`)
+		// arrive with empty `session_id` per ADR 0016 — route
+		// them to the folder layer rather than minting a
+		// placeholder session bucket.
+		if (envelope.session_id === '') {
+			this.#applyFolderEvent(folderBucket, envelope.folder, envelope.event);
+			return;
+		}
+		const sessionBucket = this.sessionStateFor(envelope.folder, envelope.session_id);
+		this.#applySessionEvent(sessionBucket, folderBucket, envelope.folder, envelope.event);
 	}
 
-	/** Reduce one inner event into `bucket`. Mirrors the
-	 *  pre-multi-session `#applyEvent` body, with `this.X` reads
-	 *  replaced by `bucket.X`. The `folder` argument is needed
-	 *  for `session_list_changed` (we may need to refresh a
-	 *  non-active folder's session list). */
-	#applyEventToBucket(bucket: FolderViewState, folder: string, event: CoderEvent): void {
+	/** Handle one folder-scoped inner event (empty `session_id`
+	 *  on the envelope). Currently `session_list_changed`,
+	 *  `hub_sync_started`, `hub_sync_finished`. */
+	#applyFolderEvent(folder: FolderState, folderPath: string, event: CoderEvent): void {
+		switch (event.kind) {
+			case 'session_list_changed':
+				// Re-fetch the folder's session list. We can only
+				// re-fetch the **active** folder's list via the
+				// existing `coder_list_sessions` API (it uses the
+				// active folder server-side). For non-active
+				// folders, the folder's `sessions` cache will go
+				// stale until the user switches back; cheap to
+				// live with — the next visit refreshes via
+				// `refreshSessions`.
+				if (folderPath === (this.activeFolderPath ?? NO_FOLDER_KEY)) {
+					void this.refreshSessions();
+				} else {
+					// Mark stale so the next visit force-refetches.
+					folder.sessions = null;
+				}
+				return;
+			case 'hub_sync_started':
+				this.hubSyncState = {
+					...this.hubSyncState,
+					[event.session_id]: { phase: 'syncing' },
+				};
+				return;
+			case 'hub_sync_finished':
+				this.hubSyncState = {
+					...this.hubSyncState,
+					[event.session_id]: event.ok
+						? { phase: 'synced', atMs: Date.now() }
+						: { phase: 'failed', error: event.error ?? 'Upload failed' },
+				};
+				if (event.ok) {
+					this.loadHubBinding().catch(() => {});
+				}
+				return;
+			default:
+				// Other event kinds carry a non-empty `session_id`
+				// and shouldn't reach this arm. Ignore defensively
+				// rather than throw — a stray future folder-scoped
+				// event should be a no-op, not a crash.
+				return;
+		}
+	}
+
+	/** Handle one session-scoped inner event. `session` is the
+	 *  per-session bucket (lazy-created by `sessionStateFor`);
+	 *  `folder` is its containing folder bucket, needed for
+	 *  folder-level rollups (`attentionPending`, `sessions` list
+	 *  on title updates). */
+	#applySessionEvent(session: SessionViewState, folder: FolderState, folderPath: string, event: CoderEvent): void {
 		switch (event.kind) {
 			case 'user_message':
-				bucket.rows = [
-					...bucket.rows,
+				session.rows = [
+					...session.rows,
 					{
 						kind: 'user',
 						id: event.id,
@@ -1857,14 +2031,14 @@ class CoderPanelState {
 						queued: event.queued ?? false,
 					},
 				];
-				bucket.busy = true;
+				session.busy = true;
 				return;
 			case 'steer_drained':
 				// Runner moved (or `coder.unqueueSteer` popped) the
 				// queued message; flip the row out of "queued"
 				// styling. Idempotent — a duplicate event lands as
 				// a no-op (the row is already `queued: false`).
-				bucket.rows = bucket.rows.map((row) =>
+				session.rows = session.rows.map((row) =>
 					row.kind === 'user' && row.id === event.id ? { ...row, queued: false } : row,
 				);
 				return;
@@ -1874,16 +2048,19 @@ class CoderPanelState {
 				// first token. Idempotent: the runner only fires
 				// `start` once per id, but we'd no-op a duplicate
 				// rather than insert a phantom row.
-				if (bucket.rows.some((r) => r.kind === 'assistant' && r.id === event.id)) {
+				if (session.rows.some((r) => r.kind === 'assistant' && r.id === event.id)) {
 					return;
 				}
-				bucket.rows = [...bucket.rows, { kind: 'assistant', id: event.id, text: '', thinking: '', thinkingOpen: true }];
+				session.rows = [
+					...session.rows,
+					{ kind: 'assistant', id: event.id, text: '', thinking: '', thinkingOpen: true },
+				];
 				return;
 			case 'assistant_message_delta':
-				bucket.rows = appendDelta(bucket.rows, event.id, event.delta, 'text');
+				session.rows = appendDelta(session.rows, event.id, event.delta, 'text');
 				return;
 			case 'assistant_thinking_delta':
-				bucket.rows = appendDelta(bucket.rows, event.id, event.delta, 'thinking');
+				session.rows = appendDelta(session.rows, event.id, event.delta, 'thinking');
 				return;
 			case 'assistant_message_end':
 				// Canonical replacement at close — see the file
@@ -1893,15 +2070,15 @@ class CoderPanelState {
 				// the complete text). Auto-collapse the thinking
 				// block: the user already saw it stream, the answer
 				// is the takeaway.
-				bucket.rows = bucket.rows.map((row) =>
+				session.rows = session.rows.map((row) =>
 					row.kind === 'assistant' && row.id === event.id
 						? { ...row, text: event.text, thinking: event.thinking ?? row.thinking, thinkingOpen: false }
 						: row,
 				);
 				return;
 			case 'tool_call':
-				bucket.rows = [
-					...bucket.rows,
+				session.rows = [
+					...session.rows,
 					{
 						kind: 'tool',
 						id: event.id,
@@ -1916,7 +2093,7 @@ class CoderPanelState {
 				];
 				return;
 			case 'tool_result':
-				bucket.rows = bucket.rows.map((row) =>
+				session.rows = session.rows.map((row) =>
 					row.kind === 'tool' && row.id === event.id
 						? {
 								...row,
@@ -1928,7 +2105,7 @@ class CoderPanelState {
 						: row,
 				);
 				// Mirror the canonical post-merge list from a
-				// successful `todo_write` into the bucket so the
+				// successful `todo_write` into the session so the
 				// header pill / popover stay in lock-step with the
 				// model. Errored calls are skipped — the list
 				// hasn't actually changed in that case (the runner
@@ -1937,89 +2114,71 @@ class CoderPanelState {
 				// row's tool name; we don't have the name on the
 				// `tool_result` event itself. Replay re-emits the
 				// same `tool_call` + `tool_result` pair so this
-				// path also seeds the bucket on session reopen.
+				// path also seeds the session on reopen.
 				if (!event.is_error) {
-					const parent = bucket.rows.find((row) => row.kind === 'tool' && row.id === event.id);
+					const parent = session.rows.find((row) => row.kind === 'tool' && row.id === event.id);
 					if (parent && parent.kind === 'tool' && parent.name === 'todo_write') {
 						const next = extractTodos(event.result);
 						if (next !== null) {
-							bucket.todos = next;
+							session.todos = next;
 						}
 					}
 				}
 				return;
 			case 'turn_complete':
-				bucket.busy = false;
-				this.#flagAttentionIfBackground(bucket, folder);
+				session.busy = false;
+				this.#flagAttentionIfBackground(folder, folderPath);
 				return;
 			case 'aborted':
-				bucket.busy = false;
-				bucket.rows = [...bucket.rows, { kind: 'aborted', id: `aborted-${Date.now()}` }];
-				this.#flagAttentionIfBackground(bucket, folder);
+				session.busy = false;
+				session.rows = [...session.rows, { kind: 'aborted', id: `aborted-${Date.now()}` }];
+				this.#flagAttentionIfBackground(folder, folderPath);
 				return;
 			case 'error':
-				bucket.busy = false;
-				bucket.rows = [
-					...bucket.rows,
+				session.busy = false;
+				session.rows = [
+					...session.rows,
 					{
 						kind: 'error',
 						id: `error-${Date.now()}`,
 						text: event.message,
 					},
 				];
-				this.#flagAttentionIfBackground(bucket, folder);
+				this.#flagAttentionIfBackground(folder, folderPath);
 				return;
 			case 'session_loaded':
-				// Reset the bucket's transcript and adopt the new
-				// session's metadata. Replay events arrive
+				// Rebind the folder's visible-session pointer to
+				// the loaded session. Replay events arrive
 				// immediately after this one (fired by the backend
-				// on the same `coder:event` channel), so the rows
-				// fill in on the next handlers.
-				bucket.rows = [];
-				bucket.subagentSummaries = new Map();
-				bucket.subagentTranscripts = new Map();
-				bucket.viewSubagentId = null;
-				bucket.busy = false;
-				// Wipe the todo list before replay; the session's
-				// last `tool_result` for `todo_write` (if any)
-				// repopulates this in the per-record replay stream.
-				bucket.todos = [];
-				bucket.activeSession = {
+				// on the same `coder:event` channel) and land in
+				// the same session bucket via `sessionStateFor`.
+				folder.visibleSessionId = event.id;
+				session.rows = [];
+				session.subagentSummaries = new Map();
+				session.subagentTranscripts = new Map();
+				session.viewSubagentId = null;
+				session.busy = false;
+				// Wipe the todo list and compaction trace before
+				// replay; the session's last `tool_result` for
+				// `todo_write` (if any) repopulates `todos` in the
+				// per-record replay stream.
+				session.todos = [];
+				session.compaction = null;
+				session.activeSession = {
 					id: event.id,
 					title: event.title,
 					created_at_ms: event.created_at_ms,
 					updated_at_ms: event.updated_at_ms,
 				};
-				bucket.view = 'session';
+				folder.view = 'session';
 				return;
 			case 'session_title_updated':
-				if (bucket.activeSession?.id === event.id) {
-					bucket.activeSession = { ...bucket.activeSession, title: event.title };
+				if (session.activeSession?.id === event.id) {
+					session.activeSession = { ...session.activeSession, title: event.title };
 				}
-				if (bucket.sessions !== null) {
-					bucket.sessions = bucket.sessions.map((s) => (s.id === event.id ? { ...s, title: event.title } : s));
+				if (folder.sessions !== null) {
+					folder.sessions = folder.sessions.map((s) => (s.id === event.id ? { ...s, title: event.title } : s));
 				}
-				return;
-			case 'session_list_changed':
-				// Re-fetch the folder's session list. We can only
-				// re-fetch the **active** folder's list via the
-				// existing `coder_list_sessions` API (it uses the
-				// active folder server-side). For non-active
-				// folders, the bucket's `sessions` cache will go
-				// stale until the user switches back; cheap to
-				// live with — the next visit refreshes via
-				// `refreshSessions`.
-				if (folder === (this.activeFolderPath ?? NO_FOLDER_KEY)) {
-					void this.refreshSessions();
-				} else {
-					// Mark stale so the next visit force-refetches.
-					bucket.sessions = null;
-				}
-				return;
-			case 'folder_summary_ready':
-				// Handled at the envelope level — see
-				// `#dispatchEnvelope`. Should never reach this
-				// arm; keep the case for exhaustiveness.
 				return;
 			case 'subagent_spawned': {
 				const summary: SubagentSummary = {
@@ -2032,11 +2191,11 @@ class CoderPanelState {
 					tokensUsedEstimate: 0,
 					subSessionId: null,
 				};
-				const summaries = new Map(bucket.subagentSummaries);
+				const summaries = new Map(session.subagentSummaries);
 				summaries.set(event.tool_call_id, summary);
-				bucket.subagentSummaries = summaries;
+				session.subagentSummaries = summaries;
 
-				const transcripts = new Map(bucket.subagentTranscripts);
+				const transcripts = new Map(session.subagentTranscripts);
 				transcripts.set(event.subagent_id, {
 					id: event.subagent_id,
 					toolCallId: event.tool_call_id,
@@ -2044,27 +2203,27 @@ class CoderPanelState {
 					targetFolder: event.target_folder,
 					rows: [],
 				});
-				bucket.subagentTranscripts = transcripts;
+				session.subagentTranscripts = transcripts;
 				return;
 			}
 			case 'subagent_event': {
-				const transcripts = new Map(bucket.subagentTranscripts);
+				const transcripts = new Map(session.subagentTranscripts);
 				const existing = transcripts.get(event.subagent_id);
 				if (!existing) {
 					return;
 				}
 				const nextRows = applyInnerEventToRows(existing.rows, event.inner);
 				transcripts.set(event.subagent_id, { ...existing, rows: nextRows });
-				bucket.subagentTranscripts = transcripts;
+				session.subagentTranscripts = transcripts;
 				return;
 			}
 			case 'subagent_finished': {
-				const summaries = new Map(bucket.subagentSummaries);
+				const summaries = new Map(session.subagentSummaries);
 				const summary = findSummaryById(summaries, event.subagent_id);
 				if (!summary) {
 					return;
 				}
-				const transcript = bucket.subagentTranscripts.get(event.subagent_id);
+				const transcript = session.subagentTranscripts.get(event.subagent_id);
 				const lastAssistant = transcript?.rows
 					.toReversed()
 					.find((row): row is Extract<CoderRow, { kind: 'assistant' }> => row.kind === 'assistant');
@@ -2076,11 +2235,11 @@ class CoderPanelState {
 					tokensUsedEstimate: event.tokens_used_estimate,
 					subSessionId: summary.subSessionId,
 				});
-				bucket.subagentSummaries = summaries;
+				session.subagentSummaries = summaries;
 				return;
 			}
 			case 'token_usage':
-				bucket.tokenUsage = {
+				session.tokenUsage = {
 					prompt: event.prompt_tokens,
 					completion: event.completion_tokens,
 					total: event.total_tokens,
@@ -2091,14 +2250,14 @@ class CoderPanelState {
 				};
 				return;
 			case 'compaction_started':
-				bucket.compaction = {
+				session.compaction = {
 					phase: 'running',
 					messagesCompacted: event.messages_compacted,
 				};
 				return;
 			case 'compaction_complete': {
-				const previous = bucket.compaction;
-				bucket.compaction = {
+				const previous = session.compaction;
+				session.compaction = {
 					phase: 'done',
 					messagesCompacted: previous?.phase === 'running' ? previous.messagesCompacted : 0,
 					summary: event.summary,
@@ -2108,32 +2267,25 @@ class CoderPanelState {
 				// runs" so the ring shows the new (lower) prompt size
 				// immediately rather than waiting for the next
 				// `token_usage` event to land.
-				if (bucket.tokenUsage) {
-					bucket.tokenUsage = {
-						...bucket.tokenUsage,
+				if (session.tokenUsage) {
+					session.tokenUsage = {
+						...session.tokenUsage,
 						prompt: event.prompt_tokens_after,
 					};
 				}
 				return;
 			}
+			case 'folder_summary_ready':
+			case 'session_list_changed':
 			case 'hub_sync_started':
-				this.hubSyncState = {
-					...this.hubSyncState,
-					[event.session_id]: { phase: 'syncing' },
-				};
+			case 'hub_sync_finished':
+				// Folder-scoped — handled in `#applyFolderEvent`
+				// (or, for `folder_summary_ready`, at the
+				// envelope level). Keep the cases for
+				// exhaustiveness; a stray session-id-tagged
+				// envelope for one of these is a backend bug, not
+				// something the panel needs to react to.
 				return;
-			case 'hub_sync_finished': {
-				this.hubSyncState = {
-					...this.hubSyncState,
-					[event.session_id]: event.ok
-						? { phase: 'synced', atMs: Date.now() }
-						: { phase: 'failed', error: event.error ?? 'Upload failed' },
-				};
-				if (event.ok) {
-					this.loadHubBinding().catch(() => {});
-				}
-				return;
-			}
 		}
 	}
 

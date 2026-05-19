@@ -6,20 +6,36 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Outer envelope carrying a folder tag alongside the inner
-/// [`CoderEvent`]. Every event the runner emits goes through this
-/// shape on the wire so the multi-session frontend can route
-/// updates to the right per-folder UI bucket.
+/// Outer envelope carrying a (folder, session_id) tag alongside
+/// the inner [`CoderEvent`]. Every event the runner emits goes
+/// through this shape on the wire so the multi-session frontend
+/// can route updates to the right per-(folder, session) UI bucket
+/// — multiple sessions can run concurrently in the same folder
+/// (see [ADR 0016](../../../specs/decisions/0016-coder-concurrent-sessions.md)),
+/// so the folder alone isn't enough to disambiguate.
 ///
-/// Folder is the absolute path of the **session's bound folder**
+/// `folder` is the absolute path of the **session's bound folder**
 /// (matches `WorkspaceFolder.path`), even for sub-agent events:
 /// sub-agents belong to whichever project originated them, so a
 /// `SubagentEvent` arrives tagged with the **parent's** folder
 /// regardless of which folder the sub-agent's tools operate on
 /// (`target_folder` lives inside `SubagentSpawned.target_folder`).
+///
+/// `session_id` is the session whose runtime emitted the event.
+/// For sub-agent events that's the **parent's** session id (same
+/// rationale as `folder`). A handful of event variants are
+/// genuinely folder-scoped, not session-scoped
+/// ([`CoderEvent::FolderSummaryReady`], [`CoderEvent::HubSyncStarted`],
+/// [`CoderEvent::HubSyncFinished`]); those carry an empty string in
+/// this field and the frontend routes them to the folder-level
+/// handler rather than a specific session's bucket. Empty-string
+/// sentinel rather than `Option<String>` keeps the wire shape
+/// non-optional on the hot path and the TS mirror trivial.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoderEventEnvelope {
 	pub folder: String,
+	#[serde(default)]
+	pub session_id: String,
 	pub event: CoderEvent,
 }
 

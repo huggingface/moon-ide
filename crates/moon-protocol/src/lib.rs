@@ -26,7 +26,7 @@ pub mod workspace;
 pub use error::MoonError;
 
 /// Protocol version. Bumped on breaking changes; UI and agent must match.
-pub const PROTOCOL_VERSION: u32 = 0;
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Result alias used everywhere the protocol surfaces errors.
 pub type MoonResult<T> = std::result::Result<T, MoonError>;

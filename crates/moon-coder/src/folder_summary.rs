@@ -168,8 +168,13 @@ impl FolderSummaryService {
 			match outcome {
 				Ok(summary) => {
 					tracing::debug!(slug, "folder summary refreshed");
+					// Folder-scoped event: the summary belongs to
+					// the folder, not to any one session inside it.
+					// Empty `session_id` routes through the
+					// frontend's folder-level handler.
 					let _ = events.send(CoderEventEnvelope {
 						folder: folder_root.to_string(),
+						session_id: String::new(),
 						event: CoderEvent::FolderSummaryReady {
 							folder: folder_root.to_string(),
 							description: summary.description,

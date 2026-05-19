@@ -129,21 +129,113 @@ struct CoderState {
 	pub(crate) hub_sync: crate::hub_sync::HubSync,
 }
 
-/// Per-folder runtime: one in-memory `Session` plus one
-/// `TurnState`. Kept under separate mutexes so `abort` and `send`
-/// race on the same `TurnState` lock without holding the session
-/// while waiting for it (and inversely, the session can be
-/// updated mid-turn without contending with abort).
-struct FolderSession {
+/// One concurrently-runnable session in a folder. Holds the
+/// in-memory `Session` + its `TurnState` under separate mutexes
+/// so `abort` and `send` race on the same `TurnState` lock
+/// without holding the session while waiting for it (and
+/// inversely, the session can be updated mid-turn without
+/// contending with abort).
+///
+/// Multiple `SessionRuntime`s can live under one [`FolderSession`]
+/// — each one is independently runnable, with its own cancel
+/// token. See [ADR 0016](../../specs/decisions/0016-coder-concurrent-sessions.md).
+struct SessionRuntime {
 	session: Mutex<Session>,
 	turn: Mutex<TurnState>,
+}
+
+impl SessionRuntime {
+	fn new(session: Session) -> Self {
+		Self {
+			session: Mutex::new(session),
+			turn: Mutex::new(TurnState::default()),
+		}
+	}
+}
+
+/// Per-folder runtime state: many concurrently-runnable
+/// [`SessionRuntime`]s, plus a pointer to the one the panel is
+/// currently mounted on (the *visible* session).
+///
+/// The previous shape (one `Mutex<Session>` + one `Mutex<TurnState>`
+/// per folder) forced "one running turn per folder" because the
+/// session was a shared mutable slot: starting / opening another
+/// one had to first cancel the running turn or it would write
+/// into the new session. Splitting into per-id runtimes lets a
+/// background turn keep writing to *its own* `Session` while the
+/// user makes a new session visible. See [ADR 0016].
+///
+/// `visible` is `None` only on a brand-new folder we've never
+/// routed a command for. The first `active_visible_runtime`
+/// resolves it by allocating a blank runtime and pointing
+/// `visible` at it.
+struct FolderSession {
+	runtimes: RwLock<HashMap<String, Arc<SessionRuntime>>>,
+	visible: RwLock<Option<String>>,
 }
 
 impl FolderSession {
 	fn new() -> Self {
 		Self {
-			session: Mutex::new(Session::new_blank()),
-			turn: Mutex::new(TurnState::default()),
+			runtimes: RwLock::new(HashMap::new()),
+			visible: RwLock::new(None),
+		}
+	}
+
+	/// Look up a runtime by session id without creating one.
+	async fn runtime(&self, session_id: &str) -> Option<Arc<SessionRuntime>> {
+		self.runtimes.read().await.get(session_id).cloned()
+	}
+
+	/// Insert a runtime under `session_id` (replacing any existing
+	/// entry — the caller is responsible for ensuring the old one
+	/// is gone or about to be). Returns the inserted `Arc` for
+	/// convenience.
+	async fn insert_runtime(&self, session_id: String, runtime: Arc<SessionRuntime>) -> Arc<SessionRuntime> {
+		self.runtimes.write().await.insert(session_id, runtime.clone());
+		runtime
+	}
+
+	/// Make `session_id` the visible session. Does not touch any
+	/// runtime's turn — background turns keep streaming into their
+	/// own buckets on the frontend.
+	async fn set_visible(&self, session_id: String) {
+		*self.visible.write().await = Some(session_id);
+	}
+
+	/// Snapshot of the currently-visible session id, if any.
+	async fn visible_session_id(&self) -> Option<String> {
+		self.visible.read().await.clone()
+	}
+
+	/// Resolve to the visible runtime + its id, allocating a blank
+	/// one when no session has been mounted yet (first time we
+	/// route a command for this folder).
+	async fn visible_runtime(&self) -> (Arc<SessionRuntime>, String) {
+		if let Some(id) = self.visible_session_id().await {
+			if let Some(rt) = self.runtime(&id).await {
+				return (rt, id);
+			}
+			// Visible pointer drifted (entry removed by
+			// `delete_session` without picking a successor); fall
+			// through to allocating a fresh blank one.
+		}
+		let blank = Session::new_blank();
+		let id = blank.header.id.clone();
+		let rt = Arc::new(SessionRuntime::new(blank));
+		self.insert_runtime(id.clone(), rt.clone()).await;
+		self.set_visible(id.clone()).await;
+		(rt, id)
+	}
+
+	/// Cancel every running turn under this folder. Used by global
+	/// teardown paths (sign-out is the obvious one).
+	async fn cancel_all(&self) {
+		let runtimes: Vec<Arc<SessionRuntime>> = self.runtimes.read().await.values().cloned().collect();
+		for rt in runtimes {
+			if let Some(token) = rt.turn.lock().await.cancel.as_ref() {
+				token.cancel();
+			}
 		}
 	}
 }
@@ -158,29 +250,36 @@ struct TurnState {
 }
 
 /// Pre-tagged event sender. One `FolderEventSink` per running
-/// turn / sub-agent / auto-rename pass — captures the folder
-/// string once so emit sites don't have to thread it through
-/// every send call. Sub-agents share their parent's sink so
-/// their events arrive in the parent's folder bucket on the
-/// frontend (sub-agents belong to whichever project originated
-/// them).
+/// turn / sub-agent / auto-rename pass — captures the
+/// `(folder, session_id)` pair once so emit sites don't have to
+/// thread it through every send call. Sub-agents share their
+/// parent's sink so their events arrive in the parent's
+/// `(folder, session_id)` UI bucket on the frontend (sub-agents
+/// belong to whichever session originated them).
 #[derive(Clone)]
 pub(crate) struct FolderEventSink {
 	sender: broadcast::Sender<CoderEventEnvelope>,
 	folder: String,
+	session_id: String,
 }
 
 impl FolderEventSink {
-	pub(crate) fn new(sender: broadcast::Sender<CoderEventEnvelope>, folder: impl Into<String>) -> Self {
+	pub(crate) fn new(
+		sender: broadcast::Sender<CoderEventEnvelope>,
+		folder: impl Into<String>,
+		session_id: impl Into<String>,
+	) -> Self {
 		Self {
 			sender,
 			folder: folder.into(),
+			session_id: session_id.into(),
 		}
 	}
 
 	pub(crate) fn send(&self, event: CoderEvent) {
 		let _ = self.sender.send(CoderEventEnvelope {
 			folder: self.folder.clone(),
+			session_id: self.session_id.clone(),
 			event,
 		});
 	}
@@ -349,13 +448,9 @@ impl CoderState {
 	}
 
 	/// Resolve to `(active folder's FolderSession, folder path)`
-	/// or error with `NoActiveFolder`. Used by every command that
-	/// the user triggers from the panel — `send`, `abort`,
-	/// `list_sessions`, `new_session`, etc. Background tasks
-	/// (`run_turn`, `run_subagent`, `spawn_auto_rename`) close
-	/// over an `Arc<FolderSession>` from when they were spawned
-	/// and never re-resolve through this helper, so a folder
-	/// switch mid-turn doesn't redirect them.
+	/// or error with `NoActiveFolder`. Used by commands that
+	/// operate at the folder level (`list_sessions`, `new_session`,
+	/// the runtime-routing inside `open_session` / `delete_session`).
 	async fn active_folder_session(&self) -> Result<(Arc<FolderSession>, Utf8PathBuf), CoderError> {
 		let folder = self
 			.workspaces
@@ -365,6 +460,24 @@ impl CoderState {
 		let folder_path = Utf8PathBuf::from(folder.folder.path.clone());
 		let session = self.folder_session_for(&folder_path).await;
 		Ok((session, folder_path))
+	}
+
+	/// Resolve to `(visible SessionRuntime, session id, folder path)`
+	/// for the active folder. Used by every panel-driven command
+	/// that targets "the session the user is currently looking at":
+	/// `send`, `abort`, `active_session`, `unqueue_steer`. Lazy-
+	/// creates a blank runtime if the folder has never been
+	/// mounted before.
+	///
+	/// Background tasks (`run_turn`, `run_subagent`,
+	/// `spawn_auto_rename`, `maybe_autosync_to_hub`) close over an
+	/// `Arc<SessionRuntime>` from when they were spawned and never
+	/// re-resolve through this helper, so a folder switch / new-
+	/// session click mid-turn doesn't redirect them.
+	async fn active_visible_runtime(&self) -> Result<(Arc<SessionRuntime>, String, Utf8PathBuf), CoderError> {
+		let (fs, folder_path) = self.active_folder_session().await?;
+		let (rt, id) = fs.visible_runtime().await;
+		Ok((rt, id, folder_path))
 	}
 }
 
@@ -766,20 +879,33 @@ impl CoderHandle {
 			by.iter().map(|(p, fs)| (p.clone(), fs.clone())).collect()
 		};
 		for (folder_path, fs) in folders {
-			let usage = match fs.session.lock().await.last_usage {
-				Some(u) => u,
-				None => continue,
-			};
-			let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string());
-			sink.send(CoderEvent::TokenUsage {
-				prompt_tokens: usage.prompt_tokens,
-				completion_tokens: usage.completion_tokens,
-				total_tokens: usage.total_tokens,
-				context_window,
-				source: TokenUsageSource::Provider,
-				cache_read_tokens: usage.cache_read_input_tokens,
-				cache_creation_tokens: usage.cache_creation_input_tokens,
-			});
+			// Per-session ring repaint: every runtime in the folder
+			// has its own last_usage and its own context-ring
+			// bucket on the frontend, so we emit one TokenUsage
+			// event per runtime that has a number to report.
+			let runtimes: Vec<(String, Arc<SessionRuntime>)> = fs
+				.runtimes
+				.read()
+				.await
+				.iter()
+				.map(|(id, rt)| (id.clone(), rt.clone()))
+				.collect();
+			for (session_id, rt) in runtimes {
+				let usage = match rt.session.lock().await.last_usage {
+					Some(u) => u,
+					None => continue,
+				};
+				let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), session_id);
+				sink.send(CoderEvent::TokenUsage {
+					prompt_tokens: usage.prompt_tokens,
+					completion_tokens: usage.completion_tokens,
+					total_tokens: usage.total_tokens,
+					context_window,
+					source: TokenUsageSource::Provider,
+					cache_read_tokens: usage.cache_read_input_tokens,
+					cache_creation_tokens: usage.cache_creation_input_tokens,
+				});
+			}
 		}
 	}
 
@@ -876,17 +1002,30 @@ impl CoderHandle {
 				}
 			}
 		};
-		// `busy` reflects the **active folder's** turn only — the
-		// panel mirrors per-folder UI state, so other folders'
-		// running turns don't make this folder's composer disable
-		// (they update their own per-folder UI state when the user
-		// switches back).
+		// `busy` reflects the **active folder's visible session**
+		// turn only — the panel mirrors per-folder, per-session UI
+		// state, so background sessions in the same folder (or
+		// other folders entirely) don't make this session's
+		// composer disable. The frontend's sessions-list view
+		// surfaces a `running…` pip on every running session row
+		// across the folder via the per-bucket event stream.
+		//
+		// Two-step look-up rather than `visible_runtime()` so we
+		// don't lazy-create a blank runtime just to read its
+		// `busy` flag — that would litter the folder's runtimes
+		// map with empty entries every time the panel polls
+		// status on mount.
 		let busy = match self.state.workspaces.active_folder().await {
 			Some(folder) => {
 				let path = Utf8PathBuf::from(folder.folder.path.clone());
 				let fs = self.state.folder_session_for(&path).await;
-				let busy_now = fs.turn.lock().await.cancel.is_some();
-				busy_now
+				match fs.visible_session_id().await {
+					Some(id) => match fs.runtime(&id).await {
+						Some(rt) => rt.turn.lock().await.cancel.is_some(),
+						None => false,
+					},
+					None => false,
+				}
 			}
 			None => false,
 		};
@@ -1024,26 +1163,28 @@ impl CoderHandle {
 		Ok(())
 	}
 
-	/// Cancel every running turn across every folder. Used by
+	/// Cancel every running turn across every folder + every
+	/// concurrently-running session inside each folder. Used by
 	/// sign-out (semantic "this auth identity is no longer
 	/// driving the agent") and by tests that need a clean slate.
 	async fn abort_all(&self) {
-		let by = self.state.sessions_by_folder.read().await;
-		for fs in by.values() {
-			let turn = fs.turn.lock().await;
-			if let Some(token) = turn.cancel.as_ref() {
-				token.cancel();
-			}
+		let folders: Vec<Arc<FolderSession>> = self.state.sessions_by_folder.read().await.values().cloned().collect();
+		for fs in folders {
+			fs.cancel_all().await;
 		}
 	}
 
-	/// Snapshot of the **active folder's** session. `None` when
-	/// the session is blank (no user message yet) or no folder is
-	/// active — the panel uses this to render the empty /
-	/// "send your first message" state.
+	/// Snapshot of the **active folder's visible session**. `None`
+	/// when the session is blank (no user message yet) or no
+	/// folder is active — the panel uses this to render the empty
+	/// / "send your first message" state. Two-step look-up rather
+	/// than `visible_runtime()` so we don't lazy-create a blank
+	/// runtime entry on every status poll from the empty state.
 	pub async fn active_session(&self) -> Option<SessionSummary> {
 		let (fs, _) = self.state.active_folder_session().await.ok()?;
-		let session = fs.session.lock().await;
+		let id = fs.visible_session_id().await?;
+		let rt = fs.runtime(&id).await?;
+		let session = rt.session.lock().await;
 		if session.header.title.is_empty() && session.persisted_records == 0 {
 			return None;
 		}
@@ -1102,50 +1243,59 @@ impl CoderHandle {
 		Err(CoderError::Internal(format!("session jsonl not found: {direct}")))
 	}
 
-	/// Discard the active folder's in-memory session and start a
-	/// blank one. Doesn't touch disk — empty sessions never get a
-	/// file in the first place. Returns the new session's metadata
-	/// so the panel can reference it before the first send. Other
-	/// folders' sessions are untouched.
+	/// Allocate a fresh blank session under the active folder and
+	/// make it the visible one. Does **not** touch any other
+	/// session's running turn — previously-visible sessions whose
+	/// agent is still mid-turn keep streaming into their own UI
+	/// bucket on the frontend (see [ADR 0016]). Returns the new
+	/// session's metadata so the panel can reference it before
+	/// the first send.
 	pub async fn new_session(&self) -> Result<SessionSummary, CoderError> {
 		let (fs, _) = self.state.active_folder_session().await?;
-		// Abort the active folder's turn (if any) before swapping
-		// out its session. Other folders' running turns keep going.
-		{
-			let turn = fs.turn.lock().await;
-			if let Some(token) = turn.cancel.as_ref() {
-				token.cancel();
-			}
-		}
-		let mut session = fs.session.lock().await;
-		*session = Session::new_blank();
-		let summary = session.summary();
-		drop(session);
+		let blank = Session::new_blank();
+		let summary = blank.summary();
+		let id = blank.header.id.clone();
+		let rt = Arc::new(SessionRuntime::new(blank));
+		fs.insert_runtime(id.clone(), rt).await;
+		fs.set_visible(id).await;
 		// Empty sessions don't fire `SessionLoaded` (frontend
 		// reconciles to "blank state" on its own), but the list
 		// hasn't actually changed either — no disk impact yet.
 		Ok(summary)
 	}
 
-	/// Replace the active session with the persisted one
-	/// identified by `id` under the active workspace folder.
-	/// Replays the JSONL records as live events so the panel's
-	/// existing event handlers populate the transcript without a
-	/// special "loaded" code path beyond the initial reset.
+	/// Make the persisted session identified by `id` the visible
+	/// one under the active workspace folder. Replays the JSONL
+	/// records as live events so the panel's existing event
+	/// handlers populate the transcript without a special "loaded"
+	/// code path beyond the initial reset.
+	///
+	/// Does **not** cancel any other running turn — previously-
+	/// visible sessions whose agent is mid-turn keep streaming
+	/// into their own UI bucket on the frontend (see [ADR 0016]).
+	/// If `id` is already mounted as a runtime (the user clicked
+	/// a session that's been running in the background), we reuse
+	/// the existing runtime — its in-memory `messages` is the
+	/// source of truth, not the on-disk JSONL which may be lagging
+	/// the running turn by an iteration.
 	pub async fn open_session(&self, id: String) -> Result<SessionSummary, CoderError> {
 		sessions::validate_session_id(&id)?;
 		let (fs, folder_path) = self.state.active_folder_session().await?;
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
-		let LoadedSession { header, records } = sessions::load(&dir, &id).await?;
 
-		// Abort the active folder's turn before swapping its
-		// session out. Other folders' turns are untouched.
-		{
-			let turn = fs.turn.lock().await;
-			if let Some(token) = turn.cancel.as_ref() {
-				token.cancel();
-			}
-		}
+		// Fast path: this session id is already mounted as a
+		// runtime under the folder (most likely a background turn
+		// the user is clicking back to). Make it visible, fire a
+		// `SessionLoaded` so the panel re-hydrates from disk via
+		// its replay loop, and return.
+		//
+		// We *do* re-load the JSONL from disk for the panel's
+		// benefit (the frontend bucket may have been pruned across
+		// a webview reload), but the in-memory `Session` stays
+		// untouched — the running turn's `messages` is authoritative
+		// and clobbering it would corrupt the next iteration.
+		let already_mounted = fs.runtime(&id).await.is_some();
+		let LoadedSession { header, records } = sessions::load(&dir, &id).await?;
 
 		let mut messages: Vec<ChatMessage> = vec![ChatMessage::System {
 			content: PHASE_6_0_SYSTEM_PROMPT.to_string(),
@@ -1283,31 +1433,47 @@ impl CoderHandle {
 					(estimate, 0, estimate, 0, 0, TokenUsageSource::Estimate)
 				}
 			};
-		let session = Session {
-			header,
-			session_dir: Some(dir.clone()),
-			messages,
-			persisted_records: records.len() as u32,
-			auto_rename_pending: false,
-			// Seed the in-memory `last_usage` with whatever we
-			// recovered from disk. Without this the auto-
-			// compaction trigger wouldn't have a number to
-			// compare against until the first post-restore
-			// round-trip lands — and a session that was already
-			// near the compaction threshold when it got persisted
-			// would silently skip the compaction-before-send
-			// guard on the very next prompt.
-			last_usage,
-			todos: last_todos,
-			pending_steers: Vec::new(),
-		};
-		*fs.session.lock().await = session;
+		// If a runtime for this id already exists (background turn
+		// the user is clicking back to), skip the
+		// session-replacement step so we don't stomp the running
+		// turn's in-memory `messages` / `last_usage` / `todos`.
+		// The replay loop below still fires SessionLoaded + the
+		// historic events so the panel re-hydrates its bucket
+		// from disk; the runtime's in-memory state is what the
+		// next live event from the running turn will continue
+		// writing into, and the frontend reconciles deltas on top
+		// of the replayed transcript without conflict (the wire
+		// shape is idempotent at the row-id level).
+		if !already_mounted {
+			let session = Session {
+				header,
+				session_dir: Some(dir.clone()),
+				messages,
+				persisted_records: records.len() as u32,
+				auto_rename_pending: false,
+				// Seed the in-memory `last_usage` with whatever
+				// we recovered from disk. Without this the auto-
+				// compaction trigger wouldn't have a number to
+				// compare against until the first post-restore
+				// round-trip lands — and a session that was
+				// already near the compaction threshold when it
+				// got persisted would silently skip the
+				// compaction-before-send guard on the very next
+				// prompt.
+				last_usage,
+				todos: last_todos,
+				pending_steers: Vec::new(),
+			};
+			let rt = Arc::new(SessionRuntime::new(session));
+			fs.insert_runtime(id.clone(), rt).await;
+		}
+		fs.set_visible(id.clone()).await;
 
 		// Tell the panel to clear + reload, then fan out the
 		// records as the same events a live turn would emit.
 		// `SessionLoaded` carries the metadata so the sticky
 		// header doesn't need a follow-up IPC round trip.
-		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string());
+		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), id.clone());
 		sink.send(CoderEvent::SessionLoaded {
 			id: summary.id.clone(),
 			title: summary.title.clone(),
@@ -1402,21 +1568,40 @@ impl CoderHandle {
 	}
 
 	/// Delete a persisted session under the active workspace
-	/// folder. Idempotent. If the deleted session is the one
-	/// currently mounted in memory for that folder, replace it
-	/// with a blank one. Other folders' sessions are untouched.
+	/// folder. Idempotent. If the deleted session has a mounted
+	/// runtime, cancel its turn (if any) and drop the runtime;
+	/// when it was the visible session, fall back to "no visible
+	/// session" — the panel reconciles by clearing its bucket and
+	/// landing on either the sessions list or a fresh blank
+	/// session. Other folders' sessions are untouched.
 	pub async fn delete_session(&self, id: String) -> Result<(), CoderError> {
 		sessions::validate_session_id(&id)?;
 		let (fs, folder_path) = self.state.active_folder_session().await?;
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
 		sessions::delete(&dir, &id).await?;
-		{
-			let mut session = fs.session.lock().await;
-			if session.header.id == id {
-				*session = Session::new_blank();
+		// Drop the runtime entry (and cancel its in-flight turn,
+		// if any). Other sessions in the same folder keep running.
+		let removed = fs.runtimes.write().await.remove(&id);
+		if let Some(rt) = removed {
+			if let Some(token) = rt.turn.lock().await.cancel.as_ref() {
+				token.cancel();
 			}
 		}
-		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string());
+		// Clear the visible pointer if it was this session — the
+		// frontend's deletion handler is responsible for picking
+		// a successor (open another row from the list or
+		// `new_session` for a blank one).
+		{
+			let mut visible = fs.visible.write().await;
+			if visible.as_deref() == Some(id.as_str()) {
+				*visible = None;
+			}
+		}
+		// `SessionListChanged` is folder-scoped (it advertises a
+		// disk-level change, not anything specific to one runtime),
+		// so it goes out with an empty `session_id` and is routed
+		// through the frontend's folder-level handler.
+		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), String::new());
 		sink.send(CoderEvent::SessionListChanged);
 		Ok(())
 	}
@@ -1443,20 +1628,19 @@ impl CoderHandle {
 				}
 			}
 		}
-		let (fs, folder_path) = self.state.active_folder_session().await?;
+		let (rt, session_id, folder_path) = self.state.active_visible_runtime().await?;
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
 
-		// A second `send` while a turn is already in flight is a
-		// **steer**: queue the new user message and let the
-		// running `run_turn` drain it at its next iteration top.
-		// The composer stays open during a turn so the user can
-		// nudge the model mid-flight ("also do X", "actually
-		// scratch that, just summarise"). Other folders can have
-		// their own turns running simultaneously — the per-folder
-		// turn lock means switching projects doesn't stall the
-		// agent in the one you left behind.
+		// A second `send` while the **visible session's** turn is
+		// already in flight is a **steer**: queue the new user
+		// message and let the running `run_turn` drain it at its
+		// next iteration top. The composer stays open during a
+		// turn so the user can nudge the model mid-flight ("also
+		// do X", "actually scratch that, just summarise"). Other
+		// sessions (in the same folder or other folders) can have
+		// their own turns running simultaneously — see ADR 0016.
 		{
-			let turn = fs.turn.lock().await;
+			let turn = rt.turn.lock().await;
 			if turn.cancel.is_some() {
 				drop(turn);
 				// Mint the id up here so it's shared between the
@@ -1466,7 +1650,7 @@ impl CoderHandle {
 				// the panel saw, and the matching `SteerDrained`
 				// can target the same row.
 				let steer_id = new_message_id();
-				let mut session = fs.session.lock().await;
+				let mut session = rt.session.lock().await;
 				session.pending_steers.push(PendingSteer {
 					id: steer_id.clone(),
 					text: text.clone(),
@@ -1474,7 +1658,7 @@ impl CoderHandle {
 				});
 				session.header.updated_at_ms = current_time_ms();
 				drop(session);
-				let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string());
+				let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), session_id.clone());
 				sink.send(CoderEvent::UserMessage {
 					id: steer_id,
 					text,
@@ -1487,7 +1671,7 @@ impl CoderHandle {
 
 		let cancel = CancellationToken::new();
 		{
-			let mut turn = fs.turn.lock().await;
+			let mut turn = rt.turn.lock().await;
 			turn.cancel = Some(cancel.clone());
 		}
 
@@ -1495,7 +1679,7 @@ impl CoderHandle {
 		// title and locks the sessions dir; subsequent sends just
 		// append.
 		let (auto_rename_after, summary_to_announce) = {
-			let mut session = fs.session.lock().await;
+			let mut session = rt.session.lock().await;
 			let needs_loaded_event = session.header.title.is_empty() && session.persisted_records == 0;
 			if session.session_dir.is_none() {
 				session.session_dir = Some(dir.clone());
@@ -1532,7 +1716,7 @@ impl CoderHandle {
 			};
 			(auto_rename, summary)
 		};
-		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string());
+		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), session_id.clone());
 		if let Some(summary) = summary_to_announce {
 			// Fresh session graduating to "first message landed".
 			// Tell the UI so the sticky header switches from
@@ -1552,7 +1736,7 @@ impl CoderHandle {
 		// only loses the user's prompt from the saved transcript,
 		// the in-memory turn proceeds.
 		{
-			let mut session = fs.session.lock().await;
+			let mut session = rt.session.lock().await;
 			session.messages.push(ChatMessage::User {
 				content: text.clone(),
 				images: images.clone(),
@@ -1570,7 +1754,7 @@ impl CoderHandle {
 			if let Err(err) = sessions::append_record(&dir, &header, &record).await {
 				tracing::warn!(error = %err, "failed to persist user message");
 			} else {
-				let mut session = fs.session.lock().await;
+				let mut session = rt.session.lock().await;
 				session.persisted_records = session.persisted_records.saturating_add(1);
 			}
 		}
@@ -1584,17 +1768,17 @@ impl CoderHandle {
 		});
 
 		let state = self.state.clone();
-		let fs_for_turn = fs.clone();
+		let rt_for_turn = rt.clone();
 		let cancel_outer = cancel.clone();
 		let sink_for_turn = sink.clone();
 		let folder_for_turn = folder_path.clone();
 		tokio::spawn(async move {
-			let result = run_turn(&state, &fs_for_turn, &folder_for_turn, &sink_for_turn, cancel_outer).await;
-			fs_for_turn.turn.lock().await.cancel = None;
+			let result = run_turn(&state, &rt_for_turn, &folder_for_turn, &sink_for_turn, cancel_outer).await;
+			rt_for_turn.turn.lock().await.cancel = None;
 			match &result {
 				Ok(()) => {
 					sink_for_turn.send(CoderEvent::TurnComplete);
-					maybe_autosync_to_hub(&state, &fs_for_turn, &folder_for_turn).await;
+					maybe_autosync_to_hub(&state, &rt_for_turn, &folder_for_turn).await;
 				}
 				Err(CoderError::Aborted) => sink_for_turn.send(CoderEvent::Aborted),
 				Err(err) => {
@@ -1615,23 +1799,31 @@ impl CoderHandle {
 			// previous "Ok(())-only" rule those sessions kept the
 			// truncated-prompt fallback title forever.
 			if auto_rename_after {
-				spawn_auto_rename(state.clone(), fs_for_turn.clone(), sink_for_turn);
+				spawn_auto_rename(state.clone(), rt_for_turn.clone(), sink_for_turn);
 			}
 		});
 
 		Ok(())
 	}
 
-	/// Cancel the **active folder's** turn (if any). Background
-	/// turns running in other folders are left alone — switching
-	/// to one and hitting stop is a separate action. Just trips
-	/// the cancel token; the spawned turn observes it on its
-	/// next `select!` and exits.
+	/// Cancel the **active folder's visible session** turn (if
+	/// any). Background turns — in the same folder's other
+	/// sessions, or in any other folder — are left alone;
+	/// stopping one requires switching to it first (clicking
+	/// its row in the sessions list). Just trips the cancel
+	/// token; the spawned turn observes it on its next `select!`
+	/// and exits.
 	pub async fn abort(&self) {
 		let Ok((fs, _)) = self.state.active_folder_session().await else {
 			return;
 		};
-		let turn = fs.turn.lock().await;
+		let Some(id) = fs.visible_session_id().await else {
+			return;
+		};
+		let Some(rt) = fs.runtime(&id).await else {
+			return;
+		};
+		let turn = rt.turn.lock().await;
 		if let Some(token) = turn.cancel.as_ref() {
 			token.cancel();
 		}
@@ -1649,12 +1841,12 @@ impl CoderHandle {
 	/// know about the pop ahead of time (e.g. a sibling window
 	/// triggered the unqueue).
 	pub async fn unqueue_steer(&self, id: &str) -> Option<UnqueuedSteer> {
-		let (fs, folder_path) = self.state.active_folder_session().await.ok()?;
+		let (rt, session_id, folder_path) = self.state.active_visible_runtime().await.ok()?;
 		let popped = {
-			let mut session = fs.session.lock().await;
+			let mut session = rt.session.lock().await;
 			pop_pending_steer(&mut session, id)?
 		};
-		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string());
+		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), session_id);
 		sink.send(CoderEvent::SteerDrained { id: id.to_string() });
 		Some(UnqueuedSteer {
 			text: popped.text,
@@ -1694,7 +1886,7 @@ fn pop_pending_steer(session: &mut Session, id: &str) -> Option<PendingSteer> {
 /// no-ops when there's no binding, when autosync is off, or when
 /// the workspace's `session.json` fails to load (we log the
 /// failure but don't surface it; the next turn retries).
-async fn maybe_autosync_to_hub(state: &Arc<CoderState>, fs: &Arc<FolderSession>, folder_path: &Utf8Path) {
+async fn maybe_autosync_to_hub(state: &Arc<CoderState>, rt: &Arc<SessionRuntime>, folder_path: &Utf8Path) {
 	let workspace_id = state.workspaces.workspace_id().await;
 	let workspace_session = match moon_core::session::load(&state.workspaces_dir, &workspace_id).await {
 		Ok(s) => s,
@@ -1710,7 +1902,7 @@ async fn maybe_autosync_to_hub(state: &Arc<CoderState>, fs: &Arc<FolderSession>,
 		return;
 	}
 	let session_id = {
-		let session = fs.session.lock().await;
+		let session = rt.session.lock().await;
 		// An empty session has nothing to push — guard against
 		// the (rare but possible) race where the turn task
 		// finished but no records were ever persisted.
@@ -1726,7 +1918,7 @@ async fn maybe_autosync_to_hub(state: &Arc<CoderState>, fs: &Arc<FolderSession>,
 
 async fn run_turn(
 	state: &Arc<CoderState>,
-	fs: &Arc<FolderSession>,
+	rt: &Arc<SessionRuntime>,
 	folder_path: &Utf8Path,
 	sink: &FolderEventSink,
 	cancel: CancellationToken,
@@ -1767,7 +1959,7 @@ async fn run_turn(
 	// Sub-agent dispatch reads the same cache so the model's
 	// awareness of bound folders is consistent across parent +
 	// sub-agent prompts.
-	refresh_system_prompt(state, fs, folder_path).await;
+	refresh_system_prompt(state, rt, folder_path).await;
 	// Schedule background regeneration for any bound folder whose
 	// summary cache is missing or stale. Detached tokio tasks; we
 	// don't block the turn waiting for them to land. The next
@@ -1789,7 +1981,7 @@ async fn run_turn(
 		// and persisting then would interleave them and break
 		// session reload. Compaction below sees the steers in
 		// `messages` and folds them like any other history.
-		drain_pending_steers(fs, sink).await;
+		drain_pending_steers(rt, sink).await;
 
 		// Token-aware compaction before each round-trip. Reads the
 		// session's last-seen usage; if it crossed the threshold,
@@ -1799,8 +1991,8 @@ async fn run_turn(
 		// otherwise replay re-inflates the full pre-compaction
 		// transcript and the next turn instantly trips the
 		// provider's context-length cap.
-		let last_usage = fs.session.lock().await.last_usage;
-		let mut messages = fs.session.lock().await.messages.clone();
+		let last_usage = rt.session.lock().await.last_usage;
+		let mut messages = rt.session.lock().await.messages.clone();
 		let compaction = crate::compaction::compact_if_needed(
 			&state.inference,
 			sink,
@@ -1813,7 +2005,7 @@ async fn run_turn(
 		.await;
 		if let Some(applied) = compaction {
 			let (header, dir) = {
-				let mut session = fs.session.lock().await;
+				let mut session = rt.session.lock().await;
 				session.messages = messages.clone();
 				// Reset the trigger so we don't re-compact next
 				// iteration before the next response's usage lands.
@@ -1828,7 +2020,7 @@ async fn run_turn(
 				if let Err(err) = sessions::append_record(&dir, &header, &record).await {
 					tracing::warn!(error = %err, "failed to persist compaction record; reload will re-inflate the prefix");
 				} else {
-					let mut session = fs.session.lock().await;
+					let mut session = rt.session.lock().await;
 					session.persisted_records = session.persisted_records.saturating_add(1);
 				}
 			}
@@ -1931,7 +2123,7 @@ async fn run_turn(
 			.await?;
 
 		{
-			let mut session = fs.session.lock().await;
+			let mut session = rt.session.lock().await;
 			session.messages.push(response_to_message(&response));
 			// Stash whatever usage we have for the next iteration's
 			// compaction decision. Provider-supplied is exact; we
@@ -1950,7 +2142,7 @@ async fn run_turn(
 				}
 			}));
 		}
-		persist_assistant_record(fs, &response).await;
+		persist_assistant_record(rt, &response).await;
 		// Persist provider usage too, so a session reopened later
 		// — by the same IDE process or a fresh launch — restores
 		// the panel's context-usage ring with provider-exact
@@ -1958,7 +2150,7 @@ async fn run_turn(
 		// of the bytes/4 estimate that's `≈20–30 %` off in
 		// practice. No-op when the provider didn't emit usage;
 		// the open path falls back to the estimate in that case.
-		persist_usage_record(fs, &response).await;
+		persist_usage_record(rt, &response).await;
 
 		// Per-iteration token usage report. Drives the in-panel
 		// usage ring + the auto-compaction trigger. Provider-supplied
@@ -1996,7 +2188,7 @@ async fn run_turn(
 			return Ok(());
 		}
 
-		dispatch_tool_calls(state, fs, sink, &cx, &cancel, &response.tool_calls).await?;
+		dispatch_tool_calls(state, rt, sink, &cx, &cancel, &response.tool_calls).await?;
 	}
 
 	// Iteration cap reached. Rather than just bailing with an
@@ -2005,7 +2197,7 @@ async fn run_turn(
 	// final, tools-disabled wrap-up turn. It sees the full history
 	// it just produced, the tool budget exhausted note, and is
 	// instructed to write its best answer with what it has.
-	wrap_up_final_answer(state, fs, sink, &cancel, &tool_defs).await
+	wrap_up_final_answer(state, rt, sink, &cancel, &tool_defs).await
 }
 
 /// Final tools-disabled round-trip after the iteration cap is hit.
@@ -2023,7 +2215,7 @@ async fn run_turn(
 /// callers can grep for "the tools that were available at cap time".
 async fn wrap_up_final_answer(
 	state: &Arc<CoderState>,
-	fs: &Arc<FolderSession>,
+	rt: &Arc<SessionRuntime>,
 	sink: &FolderEventSink,
 	cancel: &CancellationToken,
 	tool_defs: &[crate::inference::ToolDefinition],
@@ -2043,7 +2235,7 @@ Do not call any more tools. Write a final response now using only what you've al
 done, what's still unfinished, and any uncertainty. If the user needs to take a follow-up action, say so explicitly.]"
 	);
 	{
-		let mut session = fs.session.lock().await;
+		let mut session = rt.session.lock().await;
 		session.messages.push(ChatMessage::user(sentinel_text.clone()));
 	}
 	{
@@ -2052,7 +2244,7 @@ done, what's still unfinished, and any uncertainty. If the user needs to take a 
 		// it inline. Lives entirely inside the lock-then-drop dance
 		// the regular user-message path uses, just inlined since
 		// we don't need a separate helper for the one-off case.
-		let session = fs.session.lock().await;
+		let session = rt.session.lock().await;
 		let header = session.header.clone();
 		let dir = session.session_dir.clone();
 		drop(session);
@@ -2069,7 +2261,7 @@ done, what's still unfinished, and any uncertainty. If the user needs to take a 
 			{
 				tracing::warn!(error = %err, "failed to persist tool-cap sentinel user message");
 			} else {
-				let mut session = fs.session.lock().await;
+				let mut session = rt.session.lock().await;
 				session.persisted_records = session.persisted_records.saturating_add(1);
 			}
 		}
@@ -2081,7 +2273,7 @@ done, what's still unfinished, and any uncertainty. If the user needs to take a 
 		queued: false,
 	});
 
-	let messages = fs.session.lock().await.messages.clone();
+	let messages = rt.session.lock().await.messages.clone();
 	let assistant_id = new_message_id();
 	let id_for_cb = assistant_id.clone();
 	let sink_for_cb = sink.clone();
@@ -2131,8 +2323,8 @@ done, what's still unfinished, and any uncertainty. If the user needs to take a 
 		});
 	}
 
-	fs.session.lock().await.messages.push(response_to_message(&response));
-	persist_assistant_record(fs, &response).await;
+	rt.session.lock().await.messages.push(response_to_message(&response));
+	persist_assistant_record(rt, &response).await;
 	emit_token_usage(sink, &models, &standard_model, &messages, &response);
 
 	Ok(())
@@ -2162,7 +2354,7 @@ const SUBAGENT_PARALLELISM_CAP: usize = 4;
 ///   in for individual `task` calls in mixed batches.
 async fn dispatch_tool_calls(
 	state: &Arc<CoderState>,
-	fs: &Arc<FolderSession>,
+	rt: &Arc<SessionRuntime>,
 	sink: &FolderEventSink,
 	cx: &ToolContext,
 	cancel: &CancellationToken,
@@ -2170,7 +2362,7 @@ async fn dispatch_tool_calls(
 ) -> Result<(), CoderError> {
 	let homogeneous_subagent = calls.len() >= 2 && calls.iter().all(|c| c.function.name == "task");
 	if homogeneous_subagent {
-		dispatch_subagent_batch(state, fs, sink, cx, cancel, calls).await
+		dispatch_subagent_batch(state, rt, sink, cx, cancel, calls).await
 	} else {
 		for call in calls {
 			if cancel.is_cancelled() {
@@ -2183,7 +2375,7 @@ async fn dispatch_tool_calls(
 				args: args.clone(),
 			});
 			let outcome = if call.function.name == "task" {
-				handle_task(state, fs, sink, cx, cancel, &call.id, &args).await
+				handle_task(state, rt, sink, cx, cancel, &call.id, &args).await
 			} else if call.function.name == "todo_write" {
 				// `todo_write` mutates per-session state owned by
 				// the runner (`Session.todos`), so it doesn't fit
@@ -2191,11 +2383,11 @@ async fn dispatch_tool_calls(
 				// expects. Short-circuit here, alongside
 				// `task`, before falling through to the
 				// generic registry dispatch.
-				handle_todo_write(fs, &args).await
+				handle_todo_write(rt, &args).await
 			} else {
 				state.tools.dispatch(&call.function.name, &args, cx, cancel).await
 			};
-			finish_tool_call(fs, sink, &call.id, outcome).await?;
+			finish_tool_call(rt, sink, &call.id, outcome).await?;
 		}
 		Ok(())
 	}
@@ -2208,7 +2400,7 @@ async fn dispatch_tool_calls(
 /// parent).
 async fn dispatch_subagent_batch(
 	state: &Arc<CoderState>,
-	fs: &Arc<FolderSession>,
+	rt: &Arc<SessionRuntime>,
 	sink: &FolderEventSink,
 	cx: &ToolContext,
 	cancel: &CancellationToken,
@@ -2230,7 +2422,7 @@ async fn dispatch_subagent_batch(
 	let mut tasks = Vec::with_capacity(calls.len());
 	for (call, args) in calls.iter().cloned().zip(parsed_args) {
 		let state_for_task = state.clone();
-		let fs_for_task = fs.clone();
+		let rt_for_task = rt.clone();
 		let sink_for_task = sink.clone();
 		let cx_for_task = cx.clone();
 		let cancel_for_task = cancel.clone();
@@ -2240,7 +2432,7 @@ async fn dispatch_subagent_batch(
 			let _permit = sem_for_task.acquire().await.expect("semaphore not closed");
 			handle_task(
 				&state_for_task,
-				&fs_for_task,
+				&rt_for_task,
 				&sink_for_task,
 				&cx_for_task,
 				&cancel_for_task,
@@ -2259,7 +2451,7 @@ async fn dispatch_subagent_batch(
 				call.id
 			))),
 		};
-		finish_tool_call(fs, sink, &call.id, outcome).await?;
+		finish_tool_call(rt, sink, &call.id, outcome).await?;
 	}
 	Ok(())
 }
@@ -2270,14 +2462,14 @@ async fn dispatch_subagent_batch(
 /// mode") is a recoverable signal, not a hard turn-failure.
 async fn handle_task(
 	state: &Arc<CoderState>,
-	fs: &Arc<FolderSession>,
+	rt: &Arc<SessionRuntime>,
 	sink: &FolderEventSink,
 	cx: &ToolContext,
 	cancel: &CancellationToken,
 	tool_call_id: &str,
 	args: &Value,
 ) -> Result<Value, CoderError> {
-	let parent_session_id = fs.session.lock().await.header.id.clone();
+	let parent_session_id = rt.session.lock().await.header.id.clone();
 	// Parent's bound folder is the sink's folder — that's the
 	// session this dispatch belongs to. Sub-agent JSONL lands
 	// under that slug regardless of which folder the sub-agent's
@@ -2299,7 +2491,7 @@ async fn handle_task(
 	// so replay needs no shape conversion. Best-effort: a write
 	// failure logs at warn but doesn't fail the spawn.
 	persist_parent_record(
-		fs,
+		rt,
 		SessionRecord::SubagentSpawned {
 			tool_call_id: tool_call_id.to_string(),
 			subagent_id: spec.id.clone(),
@@ -2346,7 +2538,7 @@ async fn handle_task(
 			result_preview: None,
 		},
 	};
-	persist_parent_record(fs, finished_record).await;
+	persist_parent_record(rt, finished_record).await;
 	let report = outcome?;
 	Ok(json!({
 		"result": report.result,
@@ -2377,9 +2569,9 @@ fn result_preview_from(result: &str) -> Option<String> {
 /// session's `session_dir` + header under the lock; logs at warn
 /// and proceeds on persistence errors (consistent with how the
 /// rest of the runner treats best-effort writes).
-async fn persist_parent_record(fs: &Arc<FolderSession>, record: SessionRecord) {
+async fn persist_parent_record(rt: &Arc<SessionRuntime>, record: SessionRecord) {
 	let (session_dir, header) = {
-		let session = fs.session.lock().await;
+		let session = rt.session.lock().await;
 		(session.session_dir.clone(), session.header.clone())
 	};
 	let Some(dir) = session_dir else {
@@ -2417,7 +2609,7 @@ async fn persist_parent_record(fs: &Arc<FolderSession>, record: SessionRecord) {
 /// the running turn, and a JSONL write hiccup shouldn't make the
 /// model retry a successful state mutation. This mirrors how
 /// other persistence sites in the runner treat disk failures.
-async fn handle_todo_write(fs: &Arc<FolderSession>, args: &Value) -> Result<Value, CoderError> {
+async fn handle_todo_write(rt: &Arc<SessionRuntime>, args: &Value) -> Result<Value, CoderError> {
 	#[derive(serde::Deserialize)]
 	struct TodoWriteArgs {
 		todos: Vec<crate::TodoItem>,
@@ -2435,7 +2627,7 @@ async fn handle_todo_write(fs: &Arc<FolderSession>, args: &Value) -> Result<Valu
 		}
 	}
 
-	let mut session = fs.session.lock().await;
+	let mut session = rt.session.lock().await;
 	let merged = crate::merge_todos(&session.todos, parsed.todos, parsed.merge);
 	session.todos = merged.clone();
 	let header = session.header.clone();
@@ -2455,7 +2647,7 @@ async fn handle_todo_write(fs: &Arc<FolderSession>, args: &Value) -> Result<Valu
 /// Shared "tool finished, push result + emit events + persist"
 /// epilogue used by both the sequential and the parallel paths.
 async fn finish_tool_call(
-	fs: &Arc<FolderSession>,
+	rt: &Arc<SessionRuntime>,
 	sink: &FolderEventSink,
 	tool_call_id: &str,
 	outcome: Result<Value, CoderError>,
@@ -2468,11 +2660,11 @@ async fn finish_tool_call(
 				result: value,
 				is_error: false,
 			});
-			fs.session.lock().await.messages.push(ChatMessage::Tool {
+			rt.session.lock().await.messages.push(ChatMessage::Tool {
 				tool_call_id: tool_call_id.to_string(),
 				content: content.clone(),
 			});
-			persist_tool_record(fs, tool_call_id, &content).await;
+			persist_tool_record(rt, tool_call_id, &content).await;
 			Ok(())
 		}
 		Err(CoderError::Aborted) => Err(CoderError::Aborted),
@@ -2484,11 +2676,11 @@ async fn finish_tool_call(
 				result: payload,
 				is_error: true,
 			});
-			fs.session.lock().await.messages.push(ChatMessage::Tool {
+			rt.session.lock().await.messages.push(ChatMessage::Tool {
 				tool_call_id: tool_call_id.to_string(),
 				content: content.clone(),
 			});
-			persist_tool_record(fs, tool_call_id, &content).await;
+			persist_tool_record(rt, tool_call_id, &content).await;
 			Ok(())
 		}
 	}
@@ -2506,7 +2698,7 @@ async fn finish_tool_call(
 /// active in its own prompt regardless of which folder the user
 /// is currently browsing — that's what keeps the model's
 /// "your folder" reference stable across folder switches.
-async fn refresh_system_prompt(state: &Arc<CoderState>, fs: &Arc<FolderSession>, folder_path: &Utf8Path) {
+async fn refresh_system_prompt(state: &Arc<CoderState>, rt: &Arc<SessionRuntime>, folder_path: &Utf8Path) {
 	let folders = state.workspaces.folders().await;
 	let container_mode = workspace_in_container_mode(&state.tools).await;
 	let prompt = compose_system_prompt(
@@ -2516,7 +2708,7 @@ async fn refresh_system_prompt(state: &Arc<CoderState>, fs: &Arc<FolderSession>,
 		container_mode,
 	)
 	.await;
-	let mut session = fs.session.lock().await;
+	let mut session = rt.session.lock().await;
 	if let Some(ChatMessage::System { content }) = session.messages.first_mut() {
 		*content = prompt;
 	} else {
@@ -2752,9 +2944,9 @@ async fn read_agent_rules(folder_root: &Utf8Path) -> Option<String> {
 /// turn that never gets to drain leaves the queue intact for
 /// garbage collection when the session itself is replaced
 /// (`load_session`, `clear_session`).
-async fn drain_pending_steers(fs: &Arc<FolderSession>, sink: &FolderEventSink) {
+async fn drain_pending_steers(rt: &Arc<SessionRuntime>, sink: &FolderEventSink) {
 	let (steers, dir, header) = {
-		let mut session = fs.session.lock().await;
+		let mut session = rt.session.lock().await;
 		if session.pending_steers.is_empty() {
 			return;
 		}
@@ -2789,7 +2981,7 @@ async fn drain_pending_steers(fs: &Arc<FolderSession>, sink: &FolderEventSink) {
 			tracing::warn!(error = %err, "failed to persist steered user message");
 			continue;
 		}
-		let mut session = fs.session.lock().await;
+		let mut session = rt.session.lock().await;
 		session.persisted_records = session.persisted_records.saturating_add(1);
 	}
 }
@@ -2797,9 +2989,9 @@ async fn drain_pending_steers(fs: &Arc<FolderSession>, sink: &FolderEventSink) {
 /// Append an `Assistant` record to the JSONL of the given
 /// folder's session. Best-effort: a write failure logs but
 /// doesn't fail the turn.
-async fn persist_assistant_record(fs: &Arc<FolderSession>, response: &AssistantResponse) {
+async fn persist_assistant_record(rt: &Arc<SessionRuntime>, response: &AssistantResponse) {
 	let (dir, header) = {
-		let session = fs.session.lock().await;
+		let session = rt.session.lock().await;
 		let Some(dir) = session.session_dir.clone() else {
 			return;
 		};
@@ -2814,7 +3006,7 @@ async fn persist_assistant_record(fs: &Arc<FolderSession>, response: &AssistantR
 		tracing::warn!(error = %err, "failed to persist assistant message");
 		return;
 	}
-	let mut session = fs.session.lock().await;
+	let mut session = rt.session.lock().await;
 	session.persisted_records = session.persisted_records.saturating_add(1);
 }
 
@@ -2831,12 +3023,12 @@ async fn persist_assistant_record(fs: &Arc<FolderSession>, response: &AssistantR
 /// renaming yet?" check, which keys off real conversational
 /// records (user / assistant / tool); a metadata sidecar like
 /// `Usage` shouldn't move it.
-async fn persist_usage_record(fs: &Arc<FolderSession>, response: &AssistantResponse) {
+async fn persist_usage_record(rt: &Arc<SessionRuntime>, response: &AssistantResponse) {
 	let Some(usage) = response.usage else {
 		return;
 	};
 	let (dir, header) = {
-		let session = fs.session.lock().await;
+		let session = rt.session.lock().await;
 		let Some(dir) = session.session_dir.clone() else {
 			return;
 		};
@@ -2854,9 +3046,9 @@ async fn persist_usage_record(fs: &Arc<FolderSession>, response: &AssistantRespo
 	}
 }
 
-async fn persist_tool_record(fs: &Arc<FolderSession>, tool_call_id: &str, content: &str) {
+async fn persist_tool_record(rt: &Arc<SessionRuntime>, tool_call_id: &str, content: &str) {
 	let (dir, header) = {
-		let session = fs.session.lock().await;
+		let session = rt.session.lock().await;
 		let Some(dir) = session.session_dir.clone() else {
 			return;
 		};
@@ -2870,7 +3062,7 @@ async fn persist_tool_record(fs: &Arc<FolderSession>, tool_call_id: &str, conten
 		tracing::warn!(error = %err, "failed to persist tool result");
 		return;
 	}
-	let mut session = fs.session.lock().await;
+	let mut session = rt.session.lock().await;
 	session.persisted_records = session.persisted_records.saturating_add(1);
 }
 
@@ -2884,7 +3076,7 @@ async fn persist_tool_record(fs: &Arc<FolderSession>, tool_call_id: &str, conten
 /// Tied to a specific `FolderSession` so the rename only applies
 /// to the session that just finished its first turn — other
 /// folders' sessions stay untouched.
-fn spawn_auto_rename(state: Arc<CoderState>, fs: Arc<FolderSession>, sink: FolderEventSink) {
+fn spawn_auto_rename(state: Arc<CoderState>, rt: Arc<SessionRuntime>, sink: FolderEventSink) {
 	tokio::spawn(async move {
 		// Snapshot the chat history without holding the session
 		// lock across the LLM call — turns / aborts must be able
@@ -2893,7 +3085,7 @@ fn spawn_auto_rename(state: Arc<CoderState>, fs: Arc<FolderSession>, sink: Folde
 		// caller's send-time critical section so a second send
 		// can't double-spawn us.
 		let (dir, header_snapshot, transcript) = {
-			let session = fs.session.lock().await;
+			let session = rt.session.lock().await;
 			let Some(dir) = session.session_dir.clone() else {
 				return;
 			};
@@ -2932,7 +3124,7 @@ fn spawn_auto_rename(state: Arc<CoderState>, fs: Arc<FolderSession>, sink: Folde
 		// Re-check: the user might have opened a different
 		// session while we were waiting on the model. Only apply
 		// when the active session is still the one we started.
-		let mut session = fs.session.lock().await;
+		let mut session = rt.session.lock().await;
 		if session.header.id != header_snapshot.id {
 			return;
 		}
@@ -3913,16 +4105,13 @@ mod tests {
 				images: Vec::new(),
 			},
 		];
-		let fs = Arc::new(FolderSession {
-			session: Mutex::new(session),
-			turn: Mutex::new(TurnState::default()),
-		});
+		let rt = Arc::new(SessionRuntime::new(session));
 
 		let (tx, mut rx) = broadcast::channel::<CoderEventEnvelope>(16);
-		let sink = FolderEventSink::new(tx, "/test/folder".to_string());
-		drain_pending_steers(&fs, &sink).await;
+		let sink = FolderEventSink::new(tx, "/test/folder".to_string(), "sess-steer".to_string());
+		drain_pending_steers(&rt, &sink).await;
 
-		let session = fs.session.lock().await;
+		let session = rt.session.lock().await;
 		assert!(session.pending_steers.is_empty());
 		match session.messages.last() {
 			Some(ChatMessage::User { content, .. }) => assert_eq!(content, "and then Y"),
@@ -3973,16 +4162,13 @@ mod tests {
 		session.session_dir = Some(dir);
 		let original_len = session.messages.len();
 		let original_updated = session.header.updated_at_ms;
-		let fs = Arc::new(FolderSession {
-			session: Mutex::new(session),
-			turn: Mutex::new(TurnState::default()),
-		});
+		let rt = Arc::new(SessionRuntime::new(session));
 
 		let (tx, _rx) = broadcast::channel::<CoderEventEnvelope>(8);
-		let sink = FolderEventSink::new(tx, "/test/folder".to_string());
-		drain_pending_steers(&fs, &sink).await;
+		let sink = FolderEventSink::new(tx, "/test/folder".to_string(), "sess-empty".to_string());
+		drain_pending_steers(&rt, &sink).await;
 
-		let session = fs.session.lock().await;
+		let session = rt.session.lock().await;
 		assert_eq!(session.messages.len(), original_len);
 		assert_eq!(session.header.updated_at_ms, original_updated);
 		assert_eq!(session.persisted_records, 0);
