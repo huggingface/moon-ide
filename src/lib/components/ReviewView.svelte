@@ -28,6 +28,13 @@
 	// switch, …) leaves the workspace state honest.
 	onDestroy(() => {
 		workspace.reviewVisibleFile = null;
+		// Drop any selection a child section published while we were
+		// live. Sections clear their own when unmounted, but the
+		// CodeMirror teardown order between us and our children
+		// isn't load-bearing here — clearing again is a no-op, and
+		// it guards against a section that didn't get to run its
+		// cleanup (e.g. throw during destroy).
+		workspace.setActiveSelection(null);
 		if (scrollFrame !== 0) {
 			cancelAnimationFrame(scrollFrame);
 			scrollFrame = 0;

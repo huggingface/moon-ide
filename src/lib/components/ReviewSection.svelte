@@ -99,6 +99,7 @@
 					detachHScrollSync = null;
 					merge?.destroy();
 					merge = undefined;
+					clearOurSelection();
 				};
 			}
 		}
@@ -109,8 +110,20 @@
 			detachHScrollSync = null;
 			merge?.destroy();
 			merge = undefined;
+			clearOurSelection();
 		};
 	});
+
+	// Drop the workspace selection snapshot only when it belongs to
+	// *our* section's path. Symmetric with the empty-selection
+	// branch in `publishReviewSelection` — keeps a sibling section's
+	// selection alive when this one unmounts (e.g. lazy mount churn).
+	function clearOurSelection() {
+		const current = workspace.activeSelection;
+		if (current !== null && current.path === path) {
+			workspace.setActiveSelection(null);
+		}
+	}
 
 	// Theme follows the workspace toggle without rebuilding state.
 	$effect(() => {
@@ -177,6 +190,19 @@
 			themeB.of(moonEditorTheme(workspace.effectiveTheme)),
 			langB.of(lang),
 			wrapB.of(workspace.lineWrap ? EditorView.lineWrapping : []),
+			// Selection-publish hook on the working-tree side so
+			// `Ctrl+L` can attach a highlighted span from the review
+			// view to the coder, the same way it does from a regular
+			// editor or the right pane of `DiffView`. We only wire
+			// the right side: the left is the base/HEAD snapshot,
+			// whose line numbers wouldn't match the file on disk and
+			// would mislead the model. Status `deleted` has an empty
+			// right side, so selection events never fire there.
+			EditorView.updateListener.of((update) => {
+				if (update.selectionSet) {
+					publishReviewSelection(update.state);
+				}
+			}),
 			...sharedReadOnly,
 		];
 
@@ -349,6 +375,42 @@
 
 	function toggleCollapsed() {
 		collapsed = !collapsed;
+	}
+
+	/**
+	 * Mirror of `Editor.svelte`'s `publishSelection` and
+	 * `DiffView.svelte`'s `publishDiffSelection` for the review
+	 * section's working-tree pane. Empty selections clear the
+	 * snapshot so `Ctrl+L` doesn't attach a stale highlight from
+	 * a section the user moved away from. Same off-by-one snap
+	 * when the drag ends at the start of a line the user didn't
+	 * actually mean to include.
+	 */
+	function publishReviewSelection(state: EditorState) {
+		const sel = state.selection.main;
+		if (sel.empty) {
+			// Only clear if the workspace snapshot is currently ours —
+			// otherwise we'd stomp on a selection another section just
+			// published. Side-by-side MergeViews don't share focus, but
+			// CodeMirror still dispatches `selectionSet` updates when a
+			// view loses focus and resets its selection.
+			const current = workspace.activeSelection;
+			if (current !== null && current.path === path) {
+				workspace.setActiveSelection(null);
+			}
+			return;
+		}
+		const fromLine = state.doc.lineAt(sel.from);
+		const toLine = state.doc.lineAt(sel.to);
+		const effectiveToLineNumber =
+			sel.to === toLine.from && toLine.number > fromLine.number ? toLine.number - 1 : toLine.number;
+		const text = state.doc.sliceString(sel.from, sel.to);
+		workspace.setActiveSelection({
+			path,
+			startLine: fromLine.number,
+			endLine: effectiveToLineNumber,
+			text,
+		});
 	}
 </script>
 

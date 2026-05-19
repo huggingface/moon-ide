@@ -56,9 +56,15 @@
 	// selection. Image and Markdown-preview can't produce one;
 	// diff view's right (working-tree) pane can — see
 	// `DiffView.svelte`'s `publishDiffSelection` — so we let it
-	// through. The hint anchors to the pane's top-right corner,
-	// which lands over the right pane in diff mode (where the
-	// editable side lives).
+	// through. The review view also publishes selections from its
+	// working-tree side (see `ReviewSection.svelte`), so the hint
+	// is allowed there too — the `activeFile.path` is the synthetic
+	// `review://…` token in that mode, so we relax the
+	// path-equality check for the review surface and just trust
+	// that the section produced the selection. The hint anchors
+	// to the pane's top-right corner, which lands over the right
+	// pane in diff mode and the top-right of the stacked sections
+	// in review mode.
 	const showCoderHint = $derived.by(() => {
 		const selection = workspace.activeSelection;
 		if (selection === null) {
@@ -67,8 +73,11 @@
 		if (activeFile === null || activeFile.kind !== 'text') {
 			return false;
 		}
-		if (showMarkdownPreview || showReview) {
+		if (showMarkdownPreview) {
 			return false;
+		}
+		if (showReview) {
+			return true;
 		}
 		return selection.path === activeFile.path;
 	});

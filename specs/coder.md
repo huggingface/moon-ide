@@ -883,12 +883,20 @@ The user can attach an editor selection to the composer via
 - The active editor publishes its non-empty selection to a
   workspace-level `activeSelection` snapshot (path + 1-based
   inclusive line range + the selected text captured at the
-  moment of update). Empty selections clear the snapshot.
+  moment of update). Empty selections clear the snapshot. The
+  regular editor, the right (working-tree) pane of the per-file
+  diff view, and the working-tree pane of each `ReviewSection`
+  in the aggregated review tab all publish through the same
+  snapshot — `Ctrl+L` works the same from every surface, and
+  the snapshot is keyed on the real file path even in review
+  mode (where the active tab path is the synthetic
+  `review://…` token).
 - The editor pane shows a small floating `Ctrl+L Add selection
 to Coder` pill in its top-right corner while the snapshot
-  belongs to that pane's file. The pill is keyboard-only — its
-  job is to remind the user the gesture exists, not to
-  duplicate it as a click target.
+  belongs to that pane's file (or while the pane is showing the
+  review tab and any section has published a selection). The
+  pill is keyboard-only — its job is to remind the user the
+  gesture exists, not to duplicate it as a click target.
 - `Ctrl+L` reads the snapshot and (a) inserts an inline
   `@path:start-end` token at the textarea's caret, (b) adds a
   matching `ComposerAttachment` to `coder.attachments`, (c)
