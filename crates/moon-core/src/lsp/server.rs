@@ -1173,7 +1173,14 @@ impl LspServer {
 				Some((id, patterns)) => {
 					let count = patterns.len();
 					self.watched_patterns.lock().await.insert(id.clone(), patterns);
-					tracing::debug!(lang = %self.language_id, registration_id = %id, watchers = count, "lsp: recorded watched-files registration");
+					// Trace, not debug: tsgo re-registers one
+					// watcher per (id, pattern) on every snapshot
+					// update, so a folder-switch + tab-restore
+					// burst can fire this dozens of times per
+					// second. Debug-level enrolment of the
+					// initial registration would be useful;
+					// per-replace spam isn't.
+					tracing::trace!(lang = %self.language_id, registration_id = %id, watchers = count, "lsp: recorded watched-files registration");
 				}
 				None => {
 					tracing::debug!(lang = %self.language_id, "lsp: skipping watched-files registration with no usable patterns");

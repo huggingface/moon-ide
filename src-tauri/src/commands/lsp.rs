@@ -376,14 +376,18 @@ async fn ensure_broker(state: &AppState, app: &AppHandle) -> Result<std::sync::A
 		if existing.root == root && existing.target == target {
 			return Ok(existing.broker.clone());
 		}
-		// Active folder or container target changed. Tear down
-		// and rebuild so the next `lsp_open` lands on a fresh
-		// broker pointed at the right place.
+		// Active folder or container target changed. Detach the
+		// teardown to a background task so the rebuild path
+		// doesn't hold `state.lsp` across `shutdown_all().await`
+		// — sequential per-server with 2s shutdown + 2s child-
+		// wait budgets, so synchronously waiting would gate
+		// every subsequent `lsp_*` IPC behind the full teardown
+		// (matching what `detach_lsp_teardown_if_root_changed`
+		// already does for the folder-switch entry point).
 		let old = guard.take().expect("guard.take after is_some");
-		old.broker.shutdown_all().await;
-		// `old` dropped here: its `_pump` receiver will return
-		// `Closed` once the broker's `broadcast::Sender` side
-		// drops below, and the pump exits.
+		tokio::spawn(async move {
+			old.broker.shutdown_all().await;
+		});
 	}
 
 	let (spawner, translator) = match &target {
