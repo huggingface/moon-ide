@@ -39,6 +39,20 @@
 	let treeMount: HTMLDivElement;
 	let tree: FileTree | undefined;
 
+	// Set to `true` while `applySelection` is mirroring
+	// `workspace.activePath` into Pierre's selection. Pierre fires
+	// `onSelectionChange` synchronously from `.select()`, and without
+	// this gate every tab switch would re-run the per-mode click
+	// policy in `activateRowFromTree` — flipping a modified file into
+	// diff mode just because the user clicked its tab while the
+	// changes-mode tree was the visible sidebar. Real user clicks
+	// reach `activateRowFromTree` through the wrapper-level
+	// `onTreeClick` handler, which already covers every click
+	// (including the already-selected-row case Pierre's selection
+	// callback misses), so silencing the callback here doesn't lose
+	// any genuine user gesture.
+	let syncingSelection = false;
+
 	// Tracks the Svelte component instance currently rendered inside
 	// Pierre's context-menu slot so we can tear it down when Pierre
 	// tells us to close (and when the menu is replaced with a new one
@@ -94,10 +108,14 @@
 				if (path === undefined) {
 					return;
 				}
+				// Skip programmatic selection mirrors (see
+				// `syncingSelection` above). Real user clicks still
+				// reach `activateRowFromTree` via `onTreeClick`.
+				if (syncingSelection) {
+					return;
+				}
 				// Both modes stay mounted (CSS-toggled visibility) so
-				// Pierre's `select()` calls — fired by our
-				// `applySelection` effect to keep both trees' tracked
-				// row in sync with `workspace.activePath` — produce
+				// Pierre's `select()` calls produce
 				// `onSelectionChange` events on the *hidden* tree
 				// too. Without this gate the hidden changes-view
 				// tree would fire its own activate (with
@@ -1461,21 +1479,33 @@
 		if (alreadyInSync && !opts.afterReset) {
 			return;
 		}
-		for (const sel of current) {
-			if (sel !== target) {
-				local.getItem(sel)?.deselect();
+		// Gate Pierre's `onSelectionChange` callback so it skips the
+		// per-mode click policy for this programmatic mirror — only
+		// genuine user clicks (routed via `onTreeClick`) should flip
+		// diff mode on. See `syncingSelection` above. Pierre fires
+		// the callback synchronously from `.select()` / `.deselect()`,
+		// so a simple flag scoped around the dispatch suffices; the
+		// `try / finally` keeps it correct even if Pierre throws.
+		syncingSelection = true;
+		try {
+			for (const sel of current) {
+				if (sel !== target) {
+					local.getItem(sel)?.deselect();
+				}
 			}
-		}
-		if (target !== null) {
-			// Expand collapsed ancestors first: select() works on a logical
-			// path even when the row isn't rendered, but scroll-into-view
-			// can only find DOM rows that actually exist. Without this,
-			// opening `crates/moon-core/src/host.rs` from a Markdown link
-			// (or after a session restore) leaves the file selected but
-			// hidden inside a collapsed `crates/moon-core/` segment.
-			expandAncestors(local, target);
-			local.getItem(target)?.select();
-			void scrollPathIntoView(local, target);
+			if (target !== null) {
+				// Expand collapsed ancestors first: select() works on a logical
+				// path even when the row isn't rendered, but scroll-into-view
+				// can only find DOM rows that actually exist. Without this,
+				// opening `crates/moon-core/src/host.rs` from a Markdown link
+				// (or after a session restore) leaves the file selected but
+				// hidden inside a collapsed `crates/moon-core/` segment.
+				expandAncestors(local, target);
+				local.getItem(target)?.select();
+				void scrollPathIntoView(local, target);
+			}
+		} finally {
+			syncingSelection = false;
 		}
 	}
 
