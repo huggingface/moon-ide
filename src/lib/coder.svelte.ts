@@ -2185,11 +2185,33 @@ class CoderPanelState {
 				session.busy = false;
 				this.#flagAttentionIfBackground(folder, folderPath);
 				return;
-			case 'aborted':
+			case 'aborted': {
 				session.busy = false;
-				session.rows = [...session.rows, { kind: 'aborted', id: `aborted-${Date.now()}` }];
+				// Finalize any tool rows that were mid-execution when
+				// the user stopped the turn. The runner short-circuits
+				// out of `finish_tool_call` on `CoderError::Aborted`
+				// without emitting a `ToolResult`, which would leave
+				// the row's elapsed counter ticking against `nowTick`
+				// indefinitely (and keep the panel's per-second
+				// interval awake). Mark them errored, freeze the
+				// duration, and let the trailing `aborted` notice
+				// explain why.
+				const abortedAt = Date.now();
+				session.rows = session.rows.map((row) =>
+					row.kind === 'tool' && !row.hasResult
+						? {
+								...row,
+								result: { aborted: true },
+								hasResult: true,
+								isError: true,
+								durationMs: Math.max(0, abortedAt - row.startedAt),
+							}
+						: row,
+				);
+				session.rows = [...session.rows, { kind: 'aborted', id: `aborted-${abortedAt}` }];
 				this.#flagAttentionIfBackground(folder, folderPath);
 				return;
+			}
 			case 'error':
 				session.busy = false;
 				session.rows = [
@@ -2310,6 +2332,28 @@ class CoderPanelState {
 					subSessionId: summary.subSessionId,
 				});
 				session.subagentSummaries = summaries;
+				// Finalize any in-flight tool rows inside the
+				// sub-agent's transcript for the same reason we do it
+				// on the parent's `aborted` case — a tool cancelled
+				// mid-execution never gets a `ToolResult`, so the
+				// pop-out's elapsed counter would tick forever.
+				if (transcript) {
+					const finishedAt = Date.now();
+					const cleanedRows = transcript.rows.map((row) =>
+						row.kind === 'tool' && !row.hasResult
+							? {
+									...row,
+									result: { aborted: true },
+									hasResult: true,
+									isError: true,
+									durationMs: Math.max(0, finishedAt - row.startedAt),
+								}
+							: row,
+					);
+					const transcripts = new Map(session.subagentTranscripts);
+					transcripts.set(event.subagent_id, { ...transcript, rows: cleanedRows });
+					session.subagentTranscripts = transcripts;
+				}
 				return;
 			}
 			case 'token_usage':
