@@ -380,7 +380,7 @@ impl ToolRegistry {
 			),
 			ToolDefinition::function(
 				"edit_file",
-				"Replace an exact substring inside a file in any currently-bound workspace folder. `find` must match the file (whitespace tolerant) and must be unique unless `occurrence` is given. To insert text, set `find` to the line you want to insert before/after and include it in `replace`. To delete, set `replace` to an empty string. Failure throws — when it does, retry with more surrounding context in `find` so the match becomes unique.",
+				"Replace a substring in a file. `find` matching is whitespace-tolerant (indent shifts and interior whitespace runs are forgiving). Must be unique unless `occurrence` is given. Empty `replace` deletes. Format-on-save runs after the edit, so `replace` doesn't need to match the formatter's exact output.",
 				json!({
 					"type": "object",
 					"properties": {
@@ -390,11 +390,11 @@ impl ToolRegistry {
 						},
 						"find": {
 							"type": "string",
-							"description": "Exact substring to locate. No regex; whitespace tolerant."
+							"description": "Substring to locate. No regex; whitespace-tolerant."
 						},
 						"replace": {
 							"type": "string",
-							"description": "Replacement text. Pass an empty string to delete the matched span."
+							"description": "Replacement text. Empty string deletes the matched span."
 						},
 						"occurrence": {
 							"type": "integer",
@@ -1036,13 +1036,24 @@ struct EditPlan {
 ///    with the file's match indent. This catches the "model is off
 ///    by one tab depth" failure mode without weakening exact-match
 ///    semantics — only kicks in when the strict match misses.
+/// 4. **Whitespace-collapsing fallback** — last resort for the
+///    "prettier rewrote it" failure mode: collapse every run of ASCII
+///    whitespace (space, tab, CR, LF) to a single space on both
+///    `find` and the file, anchor the comparison on `find.trim()`,
+///    and locate the match in normalised space. On success, splice
+///    the *original* file byte range that produced the matched
+///    normalised window and drop `replace` in verbatim. Catches the
+///    cases the indent stage can't — multi-space runs collapsed to
+///    one, line breaks rewritten as spaces (or vice-versa), trailing
+///    whitespace differences — without baking any per-formatter
+///    rules in.
 ///
-/// The fuzzy paths assume format-on-save will catch any residual
-/// indentation skew in `replace`. Without a formatter the edit may
-/// land with the model's exact (possibly mis-indented) replacement
-/// bytes shifted by the indent delta; that's the deliberate trade
-/// — fewer "find not found" loops at the cost of a one-off re-indent
-/// the formatter will normalise anyway.
+/// The fuzzy paths assume format-on-save runs after the splice and
+/// will catch any residual whitespace / indentation skew. Without a
+/// formatter the edit may land with the model's exact bytes dropped
+/// into a slightly different file shape; that's the deliberate trade
+/// — fewer "find not found" loops at the cost of a one-off
+/// re-format the formatter will normalise anyway.
 fn locate_edit(
 	text: &str,
 	find: &str,
@@ -1086,7 +1097,7 @@ fn locate_edit(
 
 	// Stage 3: per-line indent-tolerant. Only well-defined when
 	// `find` is line-aligned (every line is on its own); a mid-line
-	// `find` falls through to the no-match error below.
+	// `find` falls through to the next stage.
 	let fuzzy = find_indent_tolerant(text, find);
 	if !fuzzy.is_empty() {
 		let (chosen, picked) = select_fuzzy(&fuzzy, occurrence, path_for_error, text)?;
@@ -1101,12 +1112,33 @@ fn locate_edit(
 		});
 	}
 
+	// Stage 4: whitespace-collapsing. Normalises every run of ASCII
+	// whitespace to a single space on both sides, then anchors the
+	// match on `find.trim()` so we don't accidentally swallow file
+	// whitespace at the splice boundary. Last resort for cases where
+	// the file's shape no longer matches the model's — formatter
+	// rewrote a multi-line call into one line, split a long string
+	// across lines, collapsed indentation, etc.
+	let ws_hits = find_whitespace_collapsed(text, find);
+	if !ws_hits.is_empty() {
+		let (chosen, picked) = select_ws(&ws_hits, occurrence, path_for_error, text)?;
+		return Ok(EditPlan {
+			start: chosen.start,
+			end: chosen.end,
+			replace_text: replace.to_owned(),
+			total_matches: ws_hits.len(),
+			occurrence: picked,
+			mode: "fuzzy_whitespace",
+		});
+	}
+
 	Err(CoderError::tool_failed(
 		"edit_file",
 		format!(
-			"`find` not found in {path_for_error}. The file's bytes did not match `find` exactly, and no \
-indent-tolerant match was found either. Re-run `read_file` to see the current state of the file and pass \
-`find` with the same indentation (tabs vs. spaces, count) and line endings the file actually uses."
+			"`find` not found in {path_for_error}. The file's bytes did not match `find` exactly, no \
+indent-tolerant match was found, and no whitespace-collapsing match was found either. Re-run \
+`read_file` to see the current state of the file and pass `find` with content that actually appears \
+in it (whitespace differences are tolerated; missing or different non-whitespace characters are not)."
 		),
 	))
 }
@@ -1447,6 +1479,176 @@ fn strip_per_nonblank_line(text: &str, prefix: &str) -> String {
 	out
 }
 
+/// A single whitespace-collapsed hit. `start..end` is the byte range
+/// in the *original* file that the splice replaces — covers exactly
+/// the content the trimmed/normalised `find` anchored against,
+/// including any internal whitespace runs that got collapsed to a
+/// single space for matching. No re-indent of `replace`; format-on-save
+/// is expected to reshape the spliced text.
+struct WsMatch {
+	start: usize,
+	end: usize,
+}
+
+/// Whitespace-collapsing match. Normalises every run of ASCII
+/// whitespace (` `, `\t`, `\r`, `\n`) to a single space on both
+/// `find` and the file, then trims `find` so leading/trailing
+/// whitespace in the model's input doesn't force the splice to
+/// swallow file whitespace at the boundary. Returns the list of
+/// non-overlapping hits as original-file byte ranges.
+///
+/// Catches the cases the indent-tolerant stage can't: formatters
+/// (prettier, oxfmt, black) often rewrite multi-line function calls
+/// into one line or split a long string across several. After such a
+/// rewrite the model's earlier `find` no longer line-aligns, but the
+/// content it cares about is still there in the file — just spaced
+/// differently. This stage anchors on content, not shape.
+fn find_whitespace_collapsed(text: &str, find: &str) -> Vec<WsMatch> {
+	let norm_find = collapse_ws(find);
+	let norm_text = normalize_ws_with_map(text);
+	if norm_find.is_empty() || norm_text.text.is_empty() {
+		return Vec::new();
+	}
+	let hits = byte_offsets_of_bytes(&norm_text.text, &norm_find);
+	hits
+		.into_iter()
+		.map(|i| WsMatch {
+			start: norm_text.orig_start[i],
+			end: norm_text.orig_end[i + norm_find.len() - 1],
+		})
+		.collect()
+}
+
+fn select_ws<'a>(
+	matches: &'a [WsMatch],
+	occurrence: Option<usize>,
+	path: &str,
+	text: &str,
+) -> Result<(&'a WsMatch, usize), CoderError> {
+	match (matches.len(), occurrence) {
+		(0, _) => unreachable!("select_ws called with empty matches"),
+		(1, None | Some(1)) => Ok((&matches[0], 1)),
+		(n, None) => {
+			let lines: Vec<u32> = matches.iter().map(|m| line_number_at_byte(text, m.start)).collect();
+			let lines_csv = lines.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+			Err(CoderError::tool_failed(
+				"edit_file",
+				format!(
+					"`find` whitespace-collapsed match was ambiguous in {path} ({n} hits at lines \
+{lines_csv}); pass `occurrence` (1-based) or include more surrounding context"
+				),
+			))
+		}
+		(n, Some(idx)) if idx == 0 || idx > n => Err(CoderError::tool_failed(
+			"edit_file",
+			format!("occurrence {idx} out of range — `find` matched {n} times"),
+		)),
+		(_, Some(idx)) => Ok((&matches[idx - 1], idx)),
+	}
+}
+
+fn is_ascii_ws_byte(b: u8) -> bool {
+	matches!(b, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+/// Normalise a UTF-8 string for whitespace-tolerant matching.
+///
+/// Walks the bytes and rewrites runs of ASCII whitespace using a
+/// context-sensitive rule:
+///
+/// - Whitespace **between two word bytes** (`[A-Za-z0-9_]`) collapses
+///   to a single `' '`. This keeps `let foo` from matching `letfoo`
+///   — losing the space would turn separate identifiers into one.
+/// - Whitespace **adjacent to a non-word byte** on either side
+///   (punctuation like `(`, `)`, `,`, `=`, …, or the start/end of the
+///   string) is dropped entirely. Prettier-style reformatting moves
+///   freely around punctuation, so `foo( a, b )` and `foo(a,b,)` and
+///   `foo(\n\ta,\n\tb,\n)` all normalise to the same `foo(a,b,)`.
+///
+/// Bytes are emitted as `Vec<u8>` rather than `String` so multi-byte
+/// UTF-8 continuation bytes round-trip without re-encoding (and so
+/// the per-byte index map stays well-defined). All non-ASCII bytes
+/// are treated as non-word, which is the safe default — non-ASCII
+/// identifiers exist but they're rare and never collide with the
+/// ASCII-only word-boundary heuristic.
+fn normalize_ws_with_map(s: &str) -> NormalizedWs {
+	let bytes = s.as_bytes();
+	let mut text = Vec::with_capacity(bytes.len());
+	let mut orig_start = Vec::with_capacity(bytes.len());
+	let mut orig_end = Vec::with_capacity(bytes.len());
+	let mut i = 0;
+	let mut last_non_ws: Option<u8> = None;
+	while i < bytes.len() {
+		if is_ascii_ws_byte(bytes[i]) {
+			let run_start = i;
+			while i < bytes.len() && is_ascii_ws_byte(bytes[i]) {
+				i += 1;
+			}
+			let next = bytes.get(i).copied();
+			let keep = matches!(last_non_ws, Some(b) if is_word_byte(b)) && matches!(next, Some(b) if is_word_byte(b));
+			if keep {
+				text.push(b' ');
+				orig_start.push(run_start);
+				orig_end.push(i);
+			}
+			continue;
+		}
+		text.push(bytes[i]);
+		orig_start.push(i);
+		orig_end.push(i + 1);
+		last_non_ws = Some(bytes[i]);
+		i += 1;
+	}
+	NormalizedWs {
+		text,
+		orig_start,
+		orig_end,
+	}
+}
+
+/// The normalised form of a source text plus the per-byte mapping
+/// back to original byte ranges. For each byte `i` in
+/// [`NormalizedWs::text`], `orig_start[i]..orig_end[i]` is the byte
+/// range in the original input that produced it. See
+/// [`normalize_ws_with_map`] for the normalisation rule.
+struct NormalizedWs {
+	text: Vec<u8>,
+	orig_start: Vec<usize>,
+	orig_end: Vec<usize>,
+}
+
+/// Same context-sensitive normalisation as
+/// [`normalize_ws_with_map`] but without the index map — used to
+/// build the needle once for the search. Keeping a single source of
+/// truth for the rule prevents the two from drifting.
+fn collapse_ws(s: &str) -> Vec<u8> {
+	normalize_ws_with_map(s).text
+}
+
+fn is_word_byte(b: u8) -> bool {
+	b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Byte-level substring search. Same `+= needle.len()` advancement
+/// `byte_offsets_of` uses; needed here because the normalised text
+/// is `Vec<u8>` rather than `&str` (see [`NormalizedWs`] for why).
+fn byte_offsets_of_bytes(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
+	if needle.is_empty() || haystack.len() < needle.len() {
+		return Vec::new();
+	}
+	let mut hits = Vec::new();
+	let mut start = 0;
+	while start + needle.len() <= haystack.len() {
+		if &haystack[start..start + needle.len()] == needle {
+			hits.push(start);
+			start += needle.len();
+		} else {
+			start += 1;
+		}
+	}
+	hits
+}
+
 fn clamp_to_char_boundary(s: &str, max: usize) -> usize {
 	if s.len() <= max {
 		return s.len();
@@ -1713,6 +1915,128 @@ mod tests {
 		// the exact-match ambiguity error, not the indent-fuzzy
 		// one. The line numbers should still be listed.
 		assert!(msg.contains("lines 1, 2"), "error should list line numbers, got: {msg}");
+	}
+
+	#[test]
+	fn locate_edit_whitespace_fallback_collapses_multiple_spaces() {
+		// Prettier collapsed a `foo(  a,  b)` style call into the
+		// usual single-space convention. The model still has the
+		// pre-format `find` from an earlier `read_file`; the
+		// whitespace-collapse stage matches anyway and the splice
+		// covers exactly the content range (no `replace` re-shape —
+		// format-on-save handles that downstream).
+		let file = "let x = foo(a, b, c);\n";
+		let find = "foo(a,  b,  c)";
+		let replace = "foo(a, b, c, d)";
+		let plan = locate_edit(file, find, replace, None, "test.rs").expect("ws-collapse match");
+		assert_eq!(plan.mode, "fuzzy_whitespace");
+		assert_eq!(&file[plan.start..plan.end], "foo(a, b, c)");
+		assert_eq!(plan.replace_text, "foo(a, b, c, d)");
+	}
+
+	#[test]
+	fn locate_edit_whitespace_fallback_collapses_multi_line_call() {
+		// Mirror case: the file has the multi-line version, the
+		// model gives a single-line `find`. We still find it, and
+		// the splice spans the whole multi-line region so the
+		// replacement drops in cleanly. Format-on-save reshapes.
+		let file = "let x = foo(\n\ta,\n\tb,\n\tc,\n);\n";
+		let find = "foo(a, b, c,)";
+		let replace = "foo(a, b, c, d,)";
+		let plan = locate_edit(file, find, replace, None, "test.rs").expect("multi-line ws-collapse match");
+		assert_eq!(plan.mode, "fuzzy_whitespace");
+		assert_eq!(&file[plan.start..plan.end], "foo(\n\ta,\n\tb,\n\tc,\n)");
+		assert_eq!(plan.replace_text, "foo(a, b, c, d,)");
+	}
+
+	#[test]
+	fn locate_edit_whitespace_fallback_runs_after_indent_stage() {
+		// When the indent-tolerant stage can match, *it* takes
+		// precedence — `mode` is `fuzzy_indent`, not
+		// `fuzzy_whitespace`. Guards the ordering invariant: indent
+		// is conservative (preserves shape, re-indents `replace`),
+		// whitespace-collapse is the loosest net.
+		let file = "\terror: {\n\t\tname: x,\n\t},\n";
+		let find = "error: {\n\tname: x,\n},";
+		let replace = "error: {\n\tname: x,\n\tstatus: 500,\n},";
+		let plan = locate_edit(file, find, replace, None, "test.rs").expect("indent path takes precedence");
+		assert_eq!(plan.mode, "fuzzy_indent");
+	}
+
+	#[test]
+	fn locate_edit_whitespace_fallback_ambiguous_lists_lines() {
+		// Two whitespace-collapse hits, no `occurrence` → error
+		// names both line numbers so the model can disambiguate.
+		// Use a `find` that doesn't match exactly (different
+		// internal spacing) so it falls through to the ws stage
+		// before the multi-match check fires.
+		let file = "let a = foo(x, y);\nlet b = foo(x,  y);\n";
+		let find = "foo(x,   y)";
+		let err = locate_edit(file, find, "X", None, "dup.rs").unwrap_err();
+		let msg = err.to_string();
+		assert!(
+			msg.contains("whitespace-collapsed"),
+			"error should mention the stage, got: {msg}"
+		);
+		assert!(msg.contains("lines 1, 2"), "error should list line numbers, got: {msg}");
+	}
+
+	#[test]
+	fn locate_edit_whitespace_fallback_anchors_on_punctuation() {
+		// Sloppy whitespace inside punctuation (`(  a , b  )`)
+		// can't be reached by the indent stage (line content
+		// differs after the trim) but the ws-collapse stage drops
+		// whitespace adjacent to non-word characters and lands the
+		// match. Leading / trailing ws on `find` doesn't push the
+		// splice past the matched content — the normalisation
+		// strips both because they're adjacent to the
+		// start/end-of-string sentinel.
+		let file = "let x = foo(a,b);\n";
+		let find = "  foo(  a , b  )  ";
+		let replace = "foo(a, b, c)";
+		let plan = locate_edit(file, find, replace, None, "test.rs").expect("ws-collapse via punctuation");
+		assert_eq!(plan.mode, "fuzzy_whitespace");
+		assert_eq!(&file[plan.start..plan.end], "foo(a,b)");
+		assert_eq!(plan.replace_text, "foo(a, b, c)");
+	}
+
+	#[test]
+	fn collapse_ws_keeps_space_between_word_chars_only() {
+		// Between word chars: collapses to one space (don't merge
+		// adjacent identifiers).
+		assert_eq!(super::collapse_ws("a  b\tc\nd"), b"a b c d");
+		// Adjacent to punctuation / EOL: dropped entirely.
+		assert_eq!(super::collapse_ws("foo( a, b )"), b"foo(a,b)");
+		assert_eq!(super::collapse_ws("  hello  "), b"hello");
+		// All-whitespace inputs reduce to nothing.
+		assert_eq!(super::collapse_ws("   "), b"");
+		assert_eq!(super::collapse_ws(""), b"");
+	}
+
+	#[test]
+	fn normalize_ws_with_map_preserves_word_boundary_space() {
+		// `let  x = 1;` → `let x=1;` (space between `t` and `x`
+		// kept; whitespace around `=` and after `1` adjacent to
+		// non-word, dropped).
+		let norm = super::normalize_ws_with_map("let  x = 1;");
+		assert_eq!(norm.text, b"let x=1;");
+		// `l e t` map to bytes 0,1,2; the run "  " between `t`
+		// and `x` (bytes 3..5) emits ' ' → orig [3, 5); `x` → 5;
+		// the run " " (byte 6) around `=` is dropped; `=` → 7;
+		// the run " " (byte 8) dropped; `1` → 9; `;` → 10.
+		assert_eq!(norm.orig_start, vec![0, 1, 2, 3, 5, 7, 9, 10]);
+		assert_eq!(norm.orig_end, vec![1, 2, 3, 5, 6, 8, 10, 11]);
+	}
+
+	#[test]
+	fn normalize_ws_with_map_preserves_multibyte_utf8() {
+		// `é` is two bytes (0xC3 0xA9). Both bytes count as
+		// non-word and round-trip to themselves; the map is
+		// byte-precise so a hit ending on `é`'s last byte still
+		// lands on a valid char boundary in the original.
+		let norm = super::normalize_ws_with_map("café x");
+		assert_eq!(norm.text, b"caf\xC3\xA9x"); // " " before `x` is dropped — `é`'s last byte is non-word ASCII-wise.
+		assert_eq!(norm.orig_start.len(), norm.text.len());
 	}
 
 	#[test]
