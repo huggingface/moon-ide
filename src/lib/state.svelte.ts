@@ -1078,6 +1078,14 @@ class WorkspaceState {
 			this.blameByPath = new Map();
 			this.headByPath = new Map();
 			this.#headInFlight.clear();
+			// Existing-PR pointer is folder-scoped: two folders on
+			// the same branch name (commonly `main`) would otherwise
+			// reuse the previous folder's cached result. Reset both
+			// the URL and the "last queried branch" so the next
+			// `refreshGitBranch` re-queries against the new folder's
+			// remote.
+			this.gitExistingPrUrl = null;
+			this.gitExistingPrUrlBranch = null;
 		}
 		const tAdoptBlame = performance.now();
 		this.workspace = snapshot.folders.length === 0 ? null : snapshot;
@@ -1845,6 +1853,31 @@ class WorkspaceState {
 	});
 
 	/**
+	 * URL of the open GitHub PR matching the active folder's
+	 * current branch, or `null` when there isn't one (or `gh`
+	 * isn't installed / authed, the remote isn't GitHub, etc.).
+	 * Refreshed via `gh pr list --head <branch> --limit 1` — a
+	 * network call — so we only re-query when `gitBranch.name`
+	 * actually changes, plus once after a successful push /
+	 * publish / pull (a PR may have appeared or been closed
+	 * externally and a manual sync is the natural moment to find
+	 * out). The SCM panel uses this to retarget the "Open PR"
+	 * button at the existing PR instead of the create-PR URL when
+	 * one exists.
+	 */
+	gitExistingPrUrl = $state<string | null>(null);
+
+	/**
+	 * Branch name we last queried `gitExistingPrUrl` for. Used to
+	 * skip the network call when the branch hasn't changed since
+	 * the last refresh — `refreshGitBranch` runs on a fast cadence
+	 * (auto-fetch tick, every status pass) and we don't want to
+	 * spawn `gh` that often.
+	 */
+	private gitExistingPrUrlBranch: string | null = null;
+	private gitExistingPrUrlInFlight = false;
+
+	/**
 	 * SCM-filter toggle: when on, the sidebar swaps the regular
 	 * file tree for a changes-only view (only paths that appear in
 	 * `gitStatusEntries` with non-`ignored` status, fully expanded).
@@ -1923,6 +1956,57 @@ class WorkspaceState {
 				defaultBranchRemoteRef: null,
 				defaultBranchBehind: 0,
 			};
+		}
+		// Branch may have changed under us (external `git switch` /
+		// `gh pr checkout` from a terminal, or our own
+		// `switchToBranch`). Refresh the existing-PR pointer
+		// opportunistically when that happens; the network call
+		// short-circuits to `null` for non-GitHub / detached /
+		// gh-missing cases and stays cheap to skip.
+		void this.refreshGitExistingPrUrl({ force: false });
+	}
+
+	/**
+	 * Refresh `gitExistingPrUrl` from `gh pr list --head <branch>`.
+	 * Skipped (no-op) when the branch hasn't changed since the
+	 * last query unless `force` is set — push / publish / pull are
+	 * the gestures that earn a forced refresh, since a PR may
+	 * have been opened or closed by the same action.
+	 *
+	 * Errors collapse to `null`; this is a "give me a URL if you
+	 * have one" call, never load-bearing.
+	 */
+	async refreshGitExistingPrUrl({ force }: { force: boolean }) {
+		const branch = this.gitBranch.name;
+		if (branch === null) {
+			this.gitExistingPrUrl = null;
+			this.gitExistingPrUrlBranch = null;
+			return;
+		}
+		if (!force && branch === this.gitExistingPrUrlBranch) {
+			return;
+		}
+		if (this.gitExistingPrUrlInFlight) {
+			return;
+		}
+		this.gitExistingPrUrlInFlight = true;
+		try {
+			const url = await ipc.fs.gitExistingPrUrl();
+			// Branch may have flipped while gh was running; only
+			// commit the result when it still matches the branch
+			// we queried for (the next `refreshGitBranch` will
+			// reschedule otherwise).
+			if (this.gitBranch.name === branch) {
+				this.gitExistingPrUrl = url;
+				this.gitExistingPrUrlBranch = branch;
+			}
+		} catch {
+			if (this.gitBranch.name === branch) {
+				this.gitExistingPrUrl = null;
+				this.gitExistingPrUrlBranch = branch;
+			}
+		} finally {
+			this.gitExistingPrUrlInFlight = false;
 		}
 	}
 
@@ -2055,6 +2139,11 @@ class WorkspaceState {
 			await ipc.fs.gitPush();
 			this.flash('Push succeeded.');
 			void this.refreshActiveFolder();
+			// A push is the natural moment to check for a newly-
+			// opened PR (someone may have created one on github.com
+			// while we were ahead-but-not-yet-pushed, or our push
+			// itself unblocks an existing draft).
+			void this.refreshGitExistingPrUrl({ force: true });
 			return true;
 		} catch (err) {
 			this.flash(`Push failed: ${formatError(err)}`);
@@ -2076,6 +2165,13 @@ class WorkspaceState {
 			this.flash('Branch published.');
 			await this.refreshGitBranch();
 			void this.refreshActiveFolder();
+			// A freshly-published branch usually doesn't have a PR
+			// yet, but `gh pr create --fill` from a terminal could
+			// have produced one in parallel — same reasoning as
+			// `pushChanges`. Force the refresh so we don't keep
+			// pointing at the create-PR URL after the user already
+			// opened one out-of-band.
+			void this.refreshGitExistingPrUrl({ force: true });
 			return true;
 		} catch (err) {
 			this.flash(`Publish failed: ${formatError(err)}`);

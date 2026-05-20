@@ -379,6 +379,22 @@ pub trait WorkspaceHost: Send + Sync {
 	/// taking down the whole call.
 	async fn branch_list(&self, pr_scope: PrListScope) -> MoonResult<BranchList>;
 
+	/// URL of the open GitHub PR whose head ref matches the active
+	/// folder's current branch, if one exists. Single
+	/// `gh pr list --head <branch> --state open --json url --limit 1`
+	/// call — much cheaper than [`Self::branch_list`]'s full PR
+	/// fetch, but still a network round-trip, so callers should
+	/// refresh on branch change rather than on every status pass.
+	///
+	/// Returns `Ok(None)` for every "no existing PR" case the SCM
+	/// panel needs to fall back from: detached HEAD, non-GitHub
+	/// remote, `gh` missing or not authenticated, `gh` exited
+	/// non-zero, no PR open for this branch, or the call timed out.
+	/// The intent is "give me a URL to navigate to if you have
+	/// one"; ambiguity collapses to `None` so the UI's create-PR
+	/// fallback stays consistent.
+	async fn git_existing_pr_url(&self) -> MoonResult<Option<String>>;
+
 	/// Switch the active folder to `target`. `Local { name }` runs
 	/// `git switch <name>`; `Pr { number }` runs
 	/// `gh pr checkout <number>` so cross-fork PRs get the
@@ -1504,6 +1520,16 @@ impl WorkspaceHost for LocalHost {
 		// PR list — acceptable.
 		let _guard = self.git_lock().await;
 		run_branch_list(&self.root, pr_scope).await
+	}
+
+	async fn git_existing_pr_url(&self) -> MoonResult<Option<String>> {
+		// Same git lock as `branch_list` — gh's `pr list` resolves
+		// the active repo via the .git directory and we don't want
+		// to race a concurrent commit / switch. Best-effort: every
+		// failure collapses to `Ok(None)` so the SCM panel just
+		// falls back to its create-PR URL.
+		let _guard = self.git_lock().await;
+		Ok(run_git_existing_pr_url(&self.root).await)
 	}
 
 	async fn branch_switch(&self, target: &BranchSwitchTarget) -> MoonResult<()> {
@@ -2987,6 +3013,95 @@ fn parse_gh_pr_list(stdout: &[u8], now: SystemTime) -> Vec<(BranchListEntry, Opt
 		rows.push((entry, updated_at_unix));
 	}
 	rows
+}
+
+/// `gh pr list --head <branch> --state open --json url --limit 1` —
+/// the single open PR (if any) whose head ref matches the active
+/// folder's current branch. Returns `None` for every failure case
+/// the SCM panel needs to fall back from: not on a branch,
+/// non-GitHub remote, `gh` missing or unauthenticated, non-zero
+/// exit, timeout, parse error, no matching PR.
+///
+/// The bound is `--limit 1` because the SCM panel button only
+/// needs one URL to navigate to. GitHub doesn't allow two open PRs
+/// from the same head ref against the same base anyway; in the
+/// rare cross-base case we pick whichever `gh` returns first
+/// (newest by createdAt desc per `gh pr list`'s default sort).
+async fn run_git_existing_pr_url(root: &Utf8Path) -> Option<String> {
+	// Short-circuit on the cheap local checks. Same gates as the
+	// SCM panel's `prUrl` derived value, applied server-side so we
+	// don't spawn `gh` for branches we'd never link to anyway.
+	remote_web_url(root)?;
+	let branch = std::process::Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+		.output()
+		.ok()
+		.filter(|o| o.status.success())
+		.and_then(|o| String::from_utf8(o.stdout).ok())
+		.map(|s| s.trim().to_owned())
+		.filter(|s| !s.is_empty())?;
+
+	let mut cmd = tokio::process::Command::new("gh");
+	cmd
+		.current_dir(root.as_std_path())
+		.args([
+			"pr", "list", "--head", &branch, "--state", "open", "--json", "url", "--limit", "1",
+		])
+		.env("GH_PROMPT_DISABLED", "1")
+		.env("LC_ALL", "C")
+		.stdin(std::process::Stdio::null())
+		.stdout(std::process::Stdio::piped())
+		.stderr(std::process::Stdio::piped());
+
+	let child = match cmd.spawn() {
+		Ok(c) => c,
+		Err(err) => {
+			tracing::debug!(%err, "git_existing_pr_url: gh spawn failed");
+			return None;
+		}
+	};
+
+	let output = match tokio::time::timeout(GH_PR_LIST_TIMEOUT, child.wait_with_output()).await {
+		Ok(Ok(o)) => o,
+		Ok(Err(err)) => {
+			tracing::debug!(%err, "git_existing_pr_url: gh wait failed");
+			return None;
+		}
+		Err(_) => {
+			tracing::debug!(
+				timeout = GH_PR_LIST_TIMEOUT.as_secs(),
+				"git_existing_pr_url: gh timed out"
+			);
+			return None;
+		}
+	};
+
+	if !output.status.success() {
+		tracing::debug!(
+			stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+			"git_existing_pr_url: gh exited non-zero"
+		);
+		return None;
+	}
+
+	parse_gh_pr_url(&output.stdout)
+}
+
+/// Pull the first `url` string out of `gh pr list --json url`'s
+/// JSON array. Broken out for unit-testing without spawning `gh`.
+/// Returns `None` on parse failure, empty array, or a missing /
+/// non-string `url` field.
+fn parse_gh_pr_url(stdout: &[u8]) -> Option<String> {
+	let value: serde_json::Value = serde_json::from_slice(stdout).ok()?;
+	let arr = value.as_array()?;
+	let first = arr.first()?;
+	let url = first.get("url")?.as_str()?;
+	if url.is_empty() {
+		return None;
+	}
+	Some(url.to_owned())
 }
 
 /// Parse a UTC ISO 8601 timestamp (`YYYY-MM-DDTHH:MM:SSZ`, what
@@ -5991,6 +6106,31 @@ mod tests {
 		// JSON but not an array — gh shouldn't ever produce this,
 		// but we tolerate without panicking.
 		assert!(parse_gh_pr_list(br#"{"oops": true}"#, now).is_empty());
+	}
+
+	#[test]
+	fn parse_gh_pr_url_extracts_first_url_or_returns_none() {
+		// Empty array (no PR for this head) — the `Ok(None)` path.
+		assert_eq!(parse_gh_pr_url(b"[]"), None);
+		// Single hit — what `--limit 1` produces when a PR exists.
+		assert_eq!(
+			parse_gh_pr_url(br#"[{"url": "https://github.com/owner/repo/pull/42"}]"#),
+			Some("https://github.com/owner/repo/pull/42".to_owned()),
+		);
+		// Multi-element (defensive, gh shouldn't return >1 with
+		// `--limit 1`) — first wins.
+		assert_eq!(
+			parse_gh_pr_url(br#"[{"url": "https://a/1"}, {"url": "https://b/2"}]"#),
+			Some("https://a/1".to_owned()),
+		);
+		// Empty `url` string collapses to `None` rather than
+		// returning an unusable href.
+		assert_eq!(parse_gh_pr_url(br#"[{"url": ""}]"#), None);
+		// Garbage / missing fields stay `None`.
+		assert_eq!(parse_gh_pr_url(b""), None);
+		assert_eq!(parse_gh_pr_url(b"not json"), None);
+		assert_eq!(parse_gh_pr_url(br#"[{"notUrl": "x"}]"#), None);
+		assert_eq!(parse_gh_pr_url(br#"{"oops": true}"#), None);
 	}
 
 	#[tokio::test]

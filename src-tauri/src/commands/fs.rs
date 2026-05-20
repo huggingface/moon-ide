@@ -387,6 +387,17 @@ pub async fn fs_branch_list(state: State<'_, AppState>, pr_scope: PrListScope) -
 	entry.host.branch_list(pr_scope).await
 }
 
+/// URL of the open GitHub PR for the active folder's current
+/// branch, or `null` when there's no matching PR / `gh` isn't
+/// available. The SCM panel uses this to retarget the "Open PR"
+/// button at the existing PR when one exists, instead of the
+/// create-PR URL `GitBranchInfo.prUrl` always carries.
+#[tauri::command]
+pub async fn fs_git_existing_pr_url(state: State<'_, AppState>) -> Result<Option<String>, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.git_existing_pr_url().await
+}
+
 /// `git switch <name>` (Local) or `gh pr checkout <number>` (Pr).
 /// Errors propagate git / gh stderr verbatim — dirty-tree refusal,
 /// missing branch, gh auth required, network failure — so the

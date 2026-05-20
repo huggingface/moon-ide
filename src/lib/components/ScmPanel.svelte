@@ -191,15 +191,31 @@
 	// Hardcoding the default-branch names is the "hardcode first,
 	// configure later" rule from AGENTS.md; if a team uses a
 	// different default we'll add a config knob then.
-	const prUrl = $derived.by(() => {
+	//
+	// When `workspace.gitExistingPrUrl` is set (a `gh pr list
+	// --head <branch>` call resolved a matching open PR), prefer
+	// that over `branch.prUrl` so the button takes the user to the
+	// existing PR rather than the create-PR form. The gating above
+	// still applies to the visibility decision; the URL swap is
+	// orthogonal.
+	const prButtonVisible = $derived.by(() => {
 		if (branch.prUrl === null || !branch.hasUpstream) {
-			return null;
+			return false;
 		}
 		if (branch.name === 'main' || branch.name === 'master') {
+			return false;
+		}
+		return true;
+	});
+
+	const prUrl = $derived.by(() => {
+		if (!prButtonVisible) {
 			return null;
 		}
-		return branch.prUrl;
+		return workspace.gitExistingPrUrl ?? branch.prUrl;
 	});
+
+	const prIsExisting = $derived(prButtonVisible && workspace.gitExistingPrUrl !== null);
 
 	function openPr() {
 		if (prUrl === null) {
@@ -717,13 +733,8 @@
 					</button>
 				{/if}
 				{#if prUrl !== null}
-					<button
-						type="button"
-						class="icon-btn"
-						title={`Open pull request on GitHub (${prUrl})`}
-						aria-label="Open pull request on GitHub"
-						onclick={openPr}
-					>
+					{@const prLabel = prIsExisting ? 'View pull request on GitHub' : 'Open pull request on GitHub'}
+					<button type="button" class="icon-btn" title={`${prLabel} (${prUrl})`} aria-label={prLabel} onclick={openPr}>
 						<PullRequestIcon />
 					</button>
 				{/if}

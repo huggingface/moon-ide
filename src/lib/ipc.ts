@@ -162,6 +162,7 @@ export const ipc = {
 		gitFetch: () => invoke<void>('fs_git_fetch'),
 		gitHeadCommitMessage: () => invoke<string>('fs_git_head_commit_message'),
 		branchList: (prScope: PrListScope) => invoke<BranchList>('fs_branch_list', { prScope }),
+		gitExistingPrUrl: () => invoke<string | null>('fs_git_existing_pr_url'),
 		branchSwitch: (target: BranchSwitchTarget) => invoke<void>('fs_branch_switch', { target }),
 	},
 	search: {

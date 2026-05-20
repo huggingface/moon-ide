@@ -56,6 +56,14 @@ class DiagLogsStore {
 	#sources = new SvelteSet<string>();
 	#unlisten: UnlistenFn | null = null;
 	#started = false;
+	/** Live entries that arrived from the Tauri pump and haven't
+	 * been folded into [`#bySource`] yet. Drained on the next
+	 * flush tick — see [`#scheduleFlush`]. Snapshot backfill and
+	 * frontend-emitted entries take the direct [`#append`] path
+	 * instead so the user sees their own log lines / a freshly
+	 * opened backend source immediately. */
+	#pending: LogEntry[] = [];
+	#flushScheduled = false;
 
 	/** Start the live-event subscription + seed the known-source
 	 * list. Idempotent: repeated calls during dev hot-reloads are
@@ -66,7 +74,7 @@ class DiagLogsStore {
 		}
 		this.#started = true;
 		this.#unlisten = await listen<LogEntry>(ENTRY_EVENT, (event) => {
-			this.#append(event.payload);
+			this.#enqueue(event.payload);
 		});
 		try {
 			const sources = await ipc.logs.sources();
@@ -145,57 +153,146 @@ class DiagLogsStore {
 		this.#append(entry);
 	}
 
+	/** Live-pump fast path. Queues `entry` for the next flush tick.
+	 *
+	 * A noisy LSP server (e.g. rust-analyzer panic-recovering
+	 * mid-reindex after a big branch switch) can spew thousands
+	 * of stderr lines per second, each one a Tauri event. Folding
+	 * them in one-by-one means thousands of array clones and
+	 * SvelteMap mutations per second, which pins the webview's
+	 * JS thread and shows up as a frontend freeze. Coalescing
+	 * across one event-loop tick collapses that into one
+	 * allocation + one reactive set per affected source per tick.
+	 *
+	 * Snapshot backfill and frontend-emitted entries go through
+	 * [`#append`] instead — they're already low-volume and the
+	 * user expects them to appear synchronously. */
+	#enqueue(entry: LogEntry): void {
+		this.#pending.push(entry);
+		this.#scheduleFlush();
+	}
+
+	#scheduleFlush(): void {
+		if (this.#flushScheduled) {
+			return;
+		}
+		this.#flushScheduled = true;
+		// `setTimeout(0)` (not `queueMicrotask`) so each batch
+		// yields to the browser's render pipeline between bursts.
+		// Tauri delivers events as individual JS turns; microtasks
+		// would still flush per-event because they drain between
+		// each turn. A macrotask collapses everything queued in
+		// the current event-loop iteration.
+		setTimeout(() => {
+			this.#flushScheduled = false;
+			const batch = this.#pending;
+			if (batch.length === 0) {
+				return;
+			}
+			this.#pending = [];
+			this.#applyBatch(batch);
+		}, 0);
+	}
+
+	#applyBatch(batch: LogEntry[]): void {
+		// Group additions by source so each source pays one
+		// SvelteMap set regardless of how many entries from the
+		// burst belong to it.
+		const grouped = new Map<string, LogEntry[]>();
+		for (const entry of batch) {
+			this.#sources.add(entry.source);
+			const list = grouped.get(entry.source);
+			if (list) {
+				list.push(entry);
+			} else {
+				grouped.set(entry.source, [entry]);
+			}
+		}
+		for (const [source, additions] of grouped) {
+			const current = this.#bySource.get(source) ?? EMPTY;
+			const next = mergeEntries(current, additions);
+			if (next === null) {
+				continue;
+			}
+			this.#bySource.set(source, next);
+		}
+	}
+
+	/** Append a single entry directly into [`#bySource`]. Used by
+	 * snapshot backfill (`loadSnapshot`) and frontend-emitted
+	 * entries (`injectLocalEntry`) where one-allocation-per-call
+	 * is fine and the caller wants the result visible without
+	 * waiting for the live-pump flush tick. */
 	#append(entry: LogEntry): void {
 		this.#sources.add(entry.source);
-		const current = this.#bySource.get(entry.source);
-		if (!current) {
-			this.#bySource.set(entry.source, [entry]);
+		const current = this.#bySource.get(entry.source) ?? EMPTY;
+		const next = mergeEntries(current, [entry]);
+		if (next === null) {
 			return;
-		}
-		// Dedup by seq: backend pump + a `loadSnapshot` racing on
-		// the same source can otherwise insert the same entry
-		// twice. Cheap because the buffer is bounded.
-		if (current.some((e) => e.seq === entry.seq)) {
-			return;
-		}
-		// SvelteMap reactivity fires on `.set` but not on mutating
-		// the value array in place, so every append produces a new
-		// array and re-`set`s it. Matches the pattern in
-		// `composeLogs.svelte.ts`. The fast path slices in O(1)
-		// when the new entry sorts after the tail (live pump);
-		// late-arriving snapshot backfill slots in by time order.
-		const last = current[current.length - 1];
-		let next: LogEntry[];
-		if (last && entry.tsMs >= last.tsMs) {
-			next =
-				current.length >= MAX_ENTRIES_PER_SOURCE
-					? [...current.slice(current.length - MAX_ENTRIES_PER_SOURCE + 1), entry]
-					: [...current, entry];
-		} else {
-			const idx = findInsertIndex(current, entry);
-			next = [...current.slice(0, idx), entry, ...current.slice(idx)];
-			if (next.length > MAX_ENTRIES_PER_SOURCE) {
-				next = next.slice(next.length - MAX_ENTRIES_PER_SOURCE);
-			}
 		}
 		this.#bySource.set(entry.source, next);
 	}
 }
 
-const EMPTY: readonly LogEntry[] = Object.freeze([]);
-
-function findInsertIndex(buf: LogEntry[], entry: LogEntry): number {
-	for (let i = buf.length - 1; i >= 0; i--) {
-		const cur = buf[i];
-		if (cur === undefined) {
+/** Fold `additions` into `current`, returning a new array sorted
+ * by (`tsMs`, `seq`). Returns `null` when every addition is
+ * already in the buffer (a snapshot fetch racing the live stream
+ * is the only realistic shape) — the caller skips the `set` in
+ * that case.
+ *
+ * Fast path: when the buffer plus the additions form a single
+ * monotonically increasing seq run (live-pump common case), we
+ * concat + truncate without any dedup scan. The slow path covers
+ * out-of-order arrivals (a snapshot fetch returning entries the
+ * user emitted while the request was in flight) by Set-dedup and
+ * a single `sort` at the end. */
+function mergeEntries(current: readonly LogEntry[], additions: LogEntry[]): LogEntry[] | null {
+	if (additions.length === 0) {
+		return null;
+	}
+	let monotonic = true;
+	let prevSeq = current.length > 0 ? current[current.length - 1]!.seq : Number.NEGATIVE_INFINITY;
+	let prevTs = current.length > 0 ? current[current.length - 1]!.tsMs : Number.NEGATIVE_INFINITY;
+	for (const a of additions) {
+		// Backend seqs grow positively per-process; frontend ones
+		// decrease into the negatives from `frontendSeq`. Either
+		// way, a strictly increasing `seq` across the run means no
+		// (seq, source) collision is possible against the buffer
+		// or among the additions themselves — so the O(N) dedup
+		// scan is dead code on this path.
+		if (a.seq <= prevSeq || a.tsMs < prevTs) {
+			monotonic = false;
+			break;
+		}
+		prevSeq = a.seq;
+		prevTs = a.tsMs;
+	}
+	if (monotonic) {
+		const merged = current.length === 0 ? additions.slice() : [...current, ...additions];
+		return merged.length > MAX_ENTRIES_PER_SOURCE ? merged.slice(merged.length - MAX_ENTRIES_PER_SOURCE) : merged;
+	}
+	const seen = new Set<number>();
+	for (const e of current) {
+		seen.add(e.seq);
+	}
+	let added = 0;
+	const merged: LogEntry[] = current.slice();
+	for (const a of additions) {
+		if (seen.has(a.seq)) {
 			continue;
 		}
-		if (entry.tsMs >= cur.tsMs) {
-			return i + 1;
-		}
+		seen.add(a.seq);
+		merged.push(a);
+		added += 1;
 	}
-	return 0;
+	if (added === 0) {
+		return null;
+	}
+	merged.sort((x, y) => x.tsMs - y.tsMs || x.seq - y.seq);
+	return merged.length > MAX_ENTRIES_PER_SOURCE ? merged.slice(merged.length - MAX_ENTRIES_PER_SOURCE) : merged;
 }
+
+const EMPTY: readonly LogEntry[] = Object.freeze([]);
 
 export const diagLogs = new DiagLogsStore();
 
