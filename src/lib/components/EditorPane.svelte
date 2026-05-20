@@ -137,7 +137,7 @@
 			{/key}
 		{:else if activeFile && showReview}
 			{#key activeFile.path}
-				<ReviewView />
+				<ReviewView {side} />
 			{/key}
 		{:else if activeFile && showDiff}
 			{#key activeFile.path}

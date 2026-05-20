@@ -1,8 +1,15 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
-	import { workspace } from '../state.svelte';
+	import { workspace, type SplitSide } from '../state.svelte';
 	import ReviewSection from './ReviewSection.svelte';
 	import type { GitStatusEntry } from '../protocol';
+
+	// The pane this review tab lives in. Plumbed through so a
+	// section's Ctrl-click goto-def replaces the review tab in the
+	// same pane (instead of jumping to whichever pane currently has
+	// focus, which can differ when the user clicks across panes).
+	type Props = { side: SplitSide };
+	let { side }: Props = $props();
 
 	// One pair of refs the parent owns: the scrollable container
 	// (where we scroll) and a path→section element map (where
@@ -248,7 +255,7 @@
 				 sections would keep rendering against the prior
 				 baseline (build runs once on mount). -->
 			{#each entries as entry, i (`${entry.path}|${mergeBase ?? 'HEAD'}`)}
-				<ReviewSection path={entry.path} status={entry.status} {mergeBase} eager={i < 2} {registerSection} />
+				<ReviewSection path={entry.path} status={entry.status} {mergeBase} eager={i < 2} {registerSection} {side} />
 			{/each}
 		</div>
 	{/if}

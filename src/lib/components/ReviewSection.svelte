@@ -8,12 +8,15 @@
 	import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
 	import { MergeView, diff as rawDiff } from '@codemirror/merge';
 	import { ipc } from '../ipc';
-	import { workspace } from '../state.svelte';
+	import { workspace, type SplitSide } from '../state.svelte';
 	import { highlightTabs } from '../editor/highlightTabs';
 	import { languageFor } from '../editor/language';
 	import { moonEditorTheme } from '../editor/theme';
 	import { diffPureChangeExtension } from '../editor/diffPureChange';
 	import { diffGutterTintExtension } from '../editor/diffGutterTint';
+	import { filePathFacet } from '../editor/lsp';
+	import { hasGotoModifier, lspGotoDefinitionExtension } from '../editor/lspGotoDefinition';
+	import { lspLanguageFor } from '../editor/lspLanguage';
 	import type { EditorConfig, GitFileStatus } from '../protocol';
 
 	type Props = {
@@ -37,9 +40,14 @@
 		// by path. Bound, not a callback, because Svelte 5's `bindable`
 		// would be over-engineered for a single ref reach-through.
 		registerSection: (path: string, el: HTMLElement | null) => void;
+		// Pane the review tab lives in. Cross-file goto-def jumps
+		// pass this through to `workspace.jumpTo` so the target
+		// opens in the same pane that hosted the review tab — even
+		// when focus has moved elsewhere.
+		side: SplitSide;
 	};
 
-	let { path, status, mergeBase, eager, registerSection }: Props = $props();
+	let { path, status, mergeBase, eager, registerSection, side }: Props = $props();
 
 	let sectionEl: HTMLElement | undefined = $state();
 	let host: HTMLDivElement | undefined = $state();
@@ -50,15 +58,22 @@
 	let buildToken = 0;
 	// One-shot promise that resolves once the underlying file has
 	// been attached as an `OpenFile`. Lazily created on the first
-	// keystroke so an unedited section doesn't pay the load cost,
-	// shared across subsequent keystrokes so racing `readFile`
-	// calls can't reorder a stale `updateText` over a fresh one.
+	// keystroke (or first modifier-held hover, for goto-def) so an
+	// unscrolled section doesn't pay the load cost. Shared across
+	// every caller so racing `readFile`s can't reorder a stale
+	// `updateText` over a fresh one.
 	let backingReady: Promise<boolean> | null = null;
 	// Cleanup for the per-section horizontal scroll mirror set
 	// up at the tail of `build`. Stored at component scope so the
 	// `onMount` teardown (and the rebuild branch, if ever) can
 	// drop the DOM listeners without leaking across remounts.
 	let detachHScrollSync: (() => void) | null = null;
+	// Cleanup for the one-shot modifier-held mousemove listener
+	// that attaches the backing buffer (and thus issues LSP
+	// `didOpen`) on first goto-def probe. Self-removes after
+	// firing once; this handle covers the unmount-before-fire
+	// case so the listener doesn't outlive the section.
+	let detachGotoAttach: (() => void) | null = null;
 
 	// Theme + language compartments mirror DiffView's pattern so a
 	// theme toggle or language hot-swap reconfigures the live merge
@@ -123,6 +138,8 @@
 					buildToken++;
 					detachHScrollSync?.();
 					detachHScrollSync = null;
+					detachGotoAttach?.();
+					detachGotoAttach = null;
 					merge?.destroy();
 					merge = undefined;
 					clearOurSelection();
@@ -135,6 +152,8 @@
 			buildToken++;
 			detachHScrollSync?.();
 			detachHScrollSync = null;
+			detachGotoAttach?.();
+			detachGotoAttach = null;
 			merge?.destroy();
 			merge = undefined;
 			clearOurSelection();
@@ -241,13 +260,13 @@
 		// Working-tree side picks up the regular editor's editing
 		// stack — history, bracket close, indent-on-input, the
 		// standard keymaps — so typing in a review section feels
-		// the same as typing in `Editor.svelte`. LSP affordances
-		// (hover, goto-def, diagnostics, completion) are deliberately
-		// out of scope: review sections render N files at once and
-		// pinging `didOpen` per section would explode broker
-		// traffic on a 50-file branch. The user clicks the section
-		// header's path to open the file as a regular tab when
-		// they want LSP.
+		// the same as typing in `Editor.svelte`. Hover / diagnostics
+		// / completion are still out of scope (they'd require eager
+		// `didOpen` on every visible section, which explodes broker
+		// traffic on a 50-file branch); goto-definition is the only
+		// LSP affordance wired here and it only attaches the buffer
+		// on the first modifier-held hover (see `maybeAttachForGoto`
+		// below) — most sections will never trigger it.
 		const ec = workspace.editorConfigFor(path);
 		const editingExtensions: Extension[] = editable
 			? [
@@ -304,6 +323,43 @@
 			},
 		});
 
+		// LSP goto-definition. The extension itself probes the
+		// server on modifier-held mousemove and on modifier-held
+		// click; both code paths call `ipc.lsp.definition(path, …)`
+		// which returns `null` until the broker has seen a
+		// `didOpen` for `path`. We wire `ensureBackingBuffer`
+		// behind a one-shot `mousemove` listener (further down in
+		// `attachGotoListeners`) so the `didOpen` only fires once
+		// the user is actually probing this section with the
+		// modifier held — the cost stays proportional to user
+		// intent, not section count.
+		//
+		// The jump itself routes through `workspace.jumpTo`, which
+		// queues a pending caret position and calls `openFile` on
+		// the target. Since the target is never the synthetic
+		// `review://` path (only a real file path can come back
+		// from `textDocument/definition`), the target opens as a
+		// regular editor tab in the active pane — replacing the
+		// review tab on the same side. Exactly the "leave review
+		// mode and land on the function" behaviour we want.
+		const gotoExt: Extension[] =
+			lspLanguageFor(path) === null
+				? []
+				: [
+						filePathFacet.of(path),
+						lspGotoDefinitionExtension({
+							jumpTo: (target, position, folder) => workspace.jumpTo(target, position, side, folder),
+							resolveExternalUri: (uri) => workspace.resolveExternalUri(uri),
+							recordSourcePosition: (target, position) => {
+								const folder = workspace.activeFolderPath;
+								if (folder !== null) {
+									workspace.pushClickNavigation(folder, target, position);
+								}
+							},
+							flash: (msg) => workspace.flash(msg),
+						}),
+					];
+
 		const sideB: Extension[] = [
 			lineNumbers(),
 			diffGutterTintExtension('b'),
@@ -317,6 +373,7 @@
 			langB.of(lang),
 			wrapB.of(workspace.lineWrap ? EditorView.lineWrapping : []),
 			focusListener,
+			...gotoExt,
 			...editingExtensions,
 			// Selection-publish + edit-publish hook on the working-
 			// tree side. Selection routes to `Ctrl+L` (same as the
@@ -394,6 +451,32 @@
 		});
 
 		detachHScrollSync = wireHorizontalScrollSync(merge.a.scrollDOM, merge.b.scrollDOM);
+
+		// One-shot listener that attaches the backing buffer (and
+		// thus issues LSP `didOpen`) the moment the user holds the
+		// goto-def modifier over this section's right pane. Keeps
+		// the broker silent for sections the user only scrolls
+		// past — `ensureBackingBuffer` is itself idempotent, so a
+		// duplicate fire (e.g. via the editing path firing first)
+		// is harmless. Mouse-hover, not just key-down, so a user
+		// who Ctrl+Tabs out of the window and back doesn't trigger
+		// every visible section's load at once.
+		if (lspLanguageFor(path) !== null && status !== 'deleted') {
+			const onMove = (event: MouseEvent) => {
+				if (!hasGotoModifier(event)) {
+					return;
+				}
+				detachGotoAttach?.();
+				detachGotoAttach = null;
+				if (backingReady === null) {
+					backingReady = workspace.ensureBackingBuffer(path);
+				}
+			};
+			merge.b.scrollDOM.addEventListener('mousemove', onMove);
+			detachGotoAttach = () => {
+				merge?.b.scrollDOM.removeEventListener('mousemove', onMove);
+			};
+		}
 
 		mounted = true;
 		loading = false;
