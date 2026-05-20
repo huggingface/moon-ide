@@ -1246,6 +1246,53 @@ class CoderPanelState {
 		this.composerFocusTick = this.composerFocusTick + 1;
 	}
 
+	/** Resolve an `@`-mention pick into a textarea splice. Pointer-
+	 *  only by design: we don't read the file or build a chip, we
+	 *  just splice an `@path` token at the spot the user was
+	 *  typing. The model sees the pointer and calls `read_file` if
+	 *  it actually needs the contents — that keeps the prompt
+	 *  bounded on big picks and avoids the surprise of "I typed
+	 *  `@huge.json` and the next turn went over context".
+	 *
+	 *  The token has no `:start-end` suffix, so chip-removal
+	 *  regexes (which only touch `@path:N[-M]` shapes) leave it
+	 *  alone and the user can edit / delete it as plain text. */
+	addAttachmentFromMention(args: { path: string; rangeStart: number; rangeEnd: number }): void {
+		this.#replaceRangeWithToken(args.rangeStart, args.rangeEnd, `@${args.path}`);
+		this.composerFocusTick = this.composerFocusTick + 1;
+	}
+
+	/** Replace `[start, end)` in the textarea with `token` plus a
+	 *  trailing space (so the user can keep typing). Uses
+	 *  `execCommand('insertText')` so the textarea's native undo
+	 *  stack records the substitution as one step. Falls back to a
+	 *  direct draft write if the command is unavailable. */
+	#replaceRangeWithToken(start: number, end: number, token: string): void {
+		const ta = this.composerEl;
+		if (!ta) {
+			const before = this.draft.slice(0, start);
+			const after = this.draft.slice(end);
+			const trailing = after.length === 0 || !/^\s/.test(after) ? ' ' : '';
+			this.draft = `${before}${token}${trailing}${after}`;
+			return;
+		}
+		const after = this.draft.slice(end);
+		const trailing = after.length === 0 || !/^\s/.test(after) ? ' ' : '';
+		ta.focus();
+		ta.selectionStart = start;
+		ta.selectionEnd = end;
+		const ok = document.execCommand('insertText', false, `${token}${trailing}`);
+		if (!ok) {
+			const before = this.draft.slice(0, start);
+			this.draft = `${before}${token}${trailing}${after}`;
+			const caret = start + token.length + trailing.length;
+			queueMicrotask(() => {
+				ta.selectionStart = caret;
+				ta.selectionEnd = caret;
+			});
+		}
+	}
+
 	/** Cap on a single pasted image. 4 MB is conservative across
 	 *  providers — OpenAI tolerates 20 MB base64, Anthropic 5 MB,
 	 *  HF Inference is squishier. We measure the decoded blob size

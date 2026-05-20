@@ -35,7 +35,7 @@
 	import TrashIcon from './icons/TrashIcon.svelte';
 	import CodeIcon from './icons/CodeIcon.svelte';
 	import { ipc } from '../ipc';
-	import { formatError } from '../protocol';
+	import { formatError, type FileSearchResult } from '../protocol';
 	import { textInputUndo } from '../actions/textInputUndo';
 
 	let scrollEl: HTMLDivElement | undefined = $state();
@@ -219,6 +219,155 @@
 		});
 	});
 
+	// `@`-mention autocomplete state. `mention` is non-null while
+	// the caret sits in an active `@token`; the menu mounts whenever
+	// it is, and unmounts the moment the user types a space, deletes
+	// the `@`, blurs, or hits Esc. `mentionResults` is the latest
+	// debounced response from the file-search backend (same source
+	// as the command palette's file mode), so picking a match feels
+	// identical to `Ctrl+P` minus the modal.
+	type MentionState = {
+		// Byte (UTF-16 code-unit) offsets into the textarea value:
+		// `start` points at the `@`, `end` at the caret. The slice
+		// `[start, end)` is what gets replaced when the user picks.
+		start: number;
+		end: number;
+		query: string;
+	};
+	let mention = $state<MentionState | null>(null);
+	let mentionResults = $state<FileSearchResult[]>([]);
+	let mentionSelected = $state(0);
+	let mentionLoading = $state(false);
+	let mentionDebounce: ReturnType<typeof setTimeout> | null = null;
+	let mentionRequestId = 0;
+
+	function closeMention(): void {
+		mention = null;
+		mentionResults = [];
+		mentionSelected = 0;
+		mentionLoading = false;
+		if (mentionDebounce !== null) {
+			clearTimeout(mentionDebounce);
+			mentionDebounce = null;
+		}
+	}
+
+	/** Walk back from the caret to find an active `@`-mention. A
+	 *  mention is "active" when the nearest `@` is preceded by
+	 *  whitespace (or the start of the field) and everything from
+	 *  it up to the caret is non-whitespace + non-`@`. That rules
+	 *  out email addresses (`foo@bar.com`) and the existing
+	 *  `@path:N-M` chip tokens (which already carry a `:` we treat
+	 *  as a "this is a fully-formed token, no menu" signal). */
+	function detectMention(value: string, caret: number): MentionState | null {
+		// Scan backwards for `@`, bailing on whitespace.
+		let i = caret;
+		while (i > 0) {
+			const ch = value[i - 1];
+			if (ch === undefined) {
+				break;
+			}
+			if (/\s/.test(ch)) {
+				return null;
+			}
+			i -= 1;
+			if (value[i] === '@') {
+				break;
+			}
+		}
+		if (i === caret || value[i] !== '@') {
+			return null;
+		}
+		// `@` must be at start-of-field or follow whitespace —
+		// otherwise we're in the middle of a word (email, etc.).
+		if (i > 0) {
+			const prev = value[i - 1];
+			if (prev !== undefined && !/\s/.test(prev)) {
+				return null;
+			}
+		}
+		const query = value.slice(i + 1, caret);
+		// `path:N` shapes are pre-formed chip tokens — let them be.
+		if (query.includes(':')) {
+			return null;
+		}
+		return { start: i, end: caret, query };
+	}
+
+	function updateMention(): void {
+		if (!composer) {
+			closeMention();
+			return;
+		}
+		const state = detectMention(composer.value, composer.selectionStart ?? composer.value.length);
+		if (state === null) {
+			closeMention();
+			return;
+		}
+		const prev = mention;
+		mention = state;
+		if (prev === null || prev.query !== state.query) {
+			mentionSelected = 0;
+			void fetchMentionResults(state.query);
+		}
+	}
+
+	async function fetchMentionResults(query: string): Promise<void> {
+		// Bare `@` shows an empty menu with a "type to filter" hint —
+		// no backend round-trip until there's at least one query
+		// character. The backend treats empty queries as a no-op
+		// anyway (`search_files` short-circuits on `query.trim()`).
+		if (query.length === 0) {
+			mentionResults = [];
+			mentionLoading = false;
+			return;
+		}
+		if (mentionDebounce !== null) {
+			clearTimeout(mentionDebounce);
+		}
+		mentionLoading = true;
+		const requestId = ++mentionRequestId;
+		mentionDebounce = setTimeout(() => {
+			mentionDebounce = null;
+			void (async () => {
+				try {
+					const hits = await ipc.search.files({ query, limit: 8 });
+					// Drop stale responses: the user kept typing and a
+					// newer request is in flight, or they dismissed the
+					// menu entirely.
+					if (requestId !== mentionRequestId || mention === null) {
+						return;
+					}
+					mentionResults = hits;
+					mentionSelected = 0;
+				} catch (err) {
+					frontendLog('moon-ide', 'info', `coder mention: search failed: ${formatError(err)}`);
+					if (requestId === mentionRequestId) {
+						mentionResults = [];
+					}
+				} finally {
+					if (requestId === mentionRequestId) {
+						mentionLoading = false;
+					}
+				}
+			})();
+		}, 50);
+	}
+
+	function pickMention(index: number): void {
+		const state = mention;
+		const hit = mentionResults[index];
+		if (state === null || hit === undefined) {
+			return;
+		}
+		closeMention();
+		coder.addAttachmentFromMention({
+			path: hit.path,
+			rangeStart: state.start,
+			rangeEnd: state.end,
+		});
+	}
+
 	// Pull focus into the composer whenever the store bumps its
 	// focus tick (e.g. Ctrl+L from the editor pushes a selection
 	// onto `coder.attachments` and wants the user typing
@@ -248,6 +397,34 @@
 		// empty composer still falls through to the textarea's
 		// default no-op. Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y are wired
 		// by the `use:textInputUndo` action on the textarea below.
+		//
+		// `@`-mention menu (when mounted) intercepts Arrow / Enter /
+		// Tab / Escape *before* the regular composer bindings, so
+		// the user can drive the picker without those keys firing
+		// their default composer behaviour. Escape dismisses the
+		// menu only — it doesn't abort the turn at the same time.
+		if (mention !== null && mentionResults.length > 0) {
+			if (event.key === 'ArrowDown') {
+				event.preventDefault();
+				mentionSelected = (mentionSelected + 1) % mentionResults.length;
+				return;
+			}
+			if (event.key === 'ArrowUp') {
+				event.preventDefault();
+				mentionSelected = (mentionSelected - 1 + mentionResults.length) % mentionResults.length;
+				return;
+			}
+			if (event.key === 'Enter' || event.key === 'Tab') {
+				event.preventDefault();
+				pickMention(mentionSelected);
+				return;
+			}
+		}
+		if (mention !== null && event.key === 'Escape') {
+			event.preventDefault();
+			closeMention();
+			return;
+		}
 		if (event.key === 'Escape' && coder.busy) {
 			event.preventDefault();
 			await coder.abort();
@@ -276,6 +453,31 @@
 	function onComposerInput(event: Event): void {
 		const ta = event.currentTarget as HTMLTextAreaElement;
 		coder.draft = ta.value;
+		updateMention();
+	}
+
+	// Caret-only moves (arrow keys, mouse clicks) don't fire
+	// `input`, but they do change whether the caret sits inside an
+	// `@`-mention. `selectionchange` lives on the document and is
+	// the only event that fires reliably for both gestures across
+	// our webview targets; we filter to events targeting the
+	// composer so we don't react to selection changes elsewhere in
+	// the page (the editor, the file tree, …).
+	$effect(() => {
+		function onSelectionChange(): void {
+			if (composer && document.activeElement === composer) {
+				updateMention();
+			}
+		}
+		document.addEventListener('selectionchange', onSelectionChange);
+		return () => document.removeEventListener('selectionchange', onSelectionChange);
+	});
+
+	function onComposerBlur(): void {
+		// Close the menu when focus leaves the composer — clicking
+		// a menu row is handled by `onmousedown` before the blur
+		// fires, so the pick lands first.
+		closeMention();
 	}
 
 	/** Intercept clipboard pastes so we can pull image blobs into
@@ -1143,6 +1345,41 @@
 					{/each}
 				</div>
 			{/if}
+			{#if mention !== null}
+				<!-- `@`-mention picker. Mounts on `@`, dismisses on
+				     space / Esc / blur / no-match. Mouse picks fire
+				     on `mousedown` (not click) so the blur that
+				     follows doesn't dismiss the menu before the pick
+				     lands. -->
+				<div class="mention-menu" role="listbox" aria-label="File suggestions">
+					{#if mention.query.length === 0}
+						<div class="mention-hint">Type to filter files…</div>
+					{:else if mentionResults.length === 0}
+						<div class="mention-hint">
+							{mentionLoading ? 'Searching…' : 'No matches'}
+						</div>
+					{:else}
+						{#each mentionResults as hit, i (hit.path)}
+							<button
+								type="button"
+								class="mention-row"
+								class:active={i === mentionSelected}
+								role="option"
+								aria-selected={i === mentionSelected}
+								title={hit.path}
+								onmousedown={(e) => {
+									e.preventDefault();
+									pickMention(i);
+								}}
+								onmouseenter={() => (mentionSelected = i)}
+							>
+								<span class="mention-name">{baseName(hit.path)}</span>
+								<span class="mention-path">{hit.path}</span>
+							</button>
+						{/each}
+					{/if}
+				</div>
+			{/if}
 			<textarea
 				bind:this={composer}
 				use:textInputUndo
@@ -1150,11 +1387,12 @@
 					? 'Steer the running turn (Enter to send, Esc to stop)…'
 					: coder.attachments.length > 0
 						? 'Ask about the attached selection…'
-						: 'Ask the coder… (paste images to attach)'}
+						: 'Ask the coder… (@ to attach a file, paste images)'}
 				rows="3"
 				onkeydown={onComposerKey}
 				oninput={onComposerInput}
 				onpaste={onComposerPaste}
+				onblur={onComposerBlur}
 			></textarea>
 		</div>
 	{:else if coder.view === 'subagent'}
@@ -2394,6 +2632,59 @@
 		display: flex;
 		flex-direction: column;
 		gap: 6px;
+		position: relative;
+	}
+	.mention-menu {
+		position: absolute;
+		left: 8px;
+		right: 8px;
+		bottom: calc(100% - 8px);
+		max-height: 240px;
+		overflow-y: auto;
+		background: var(--m-bg-overlay);
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		box-shadow: 0 4px 12px rgb(0 0 0 / 18%);
+		z-index: 10;
+		display: flex;
+		flex-direction: column;
+		padding: 4px;
+		gap: 1px;
+	}
+	.mention-hint {
+		padding: 6px 8px;
+		font-size: 11px;
+		color: var(--m-fg-muted);
+	}
+	.mention-row {
+		display: flex;
+		align-items: baseline;
+		gap: 8px;
+		padding: 4px 8px;
+		background: transparent;
+		border: 0;
+		border-radius: 3px;
+		color: var(--m-fg);
+		font: inherit;
+		font-size: 12px;
+		cursor: pointer;
+		text-align: left;
+		min-width: 0;
+	}
+	.mention-row.active {
+		background: color-mix(in srgb, var(--m-accent) 18%, transparent);
+	}
+	.mention-name {
+		flex-shrink: 0;
+		font-weight: 500;
+	}
+	.mention-path {
+		color: var(--m-fg-muted);
+		font-size: 11px;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		min-width: 0;
 	}
 	.attachments {
 		display: flex;

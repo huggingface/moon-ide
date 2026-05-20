@@ -880,7 +880,8 @@ appended turns, close and re-open via the same button.
 ### Composer attachments
 
 The user can attach an editor selection to the composer via
-`Ctrl+L` (mirrors Cursor's "add to chat" gesture). Mechanics:
+`Ctrl+L` (mirrors Cursor's "add to chat" gesture), or pick a file
+inline by typing `@` (mirrors Cursor's `@`-mention). Mechanics:
 
 - The active editor publishes its non-empty selection to a
   workspace-level `activeSelection` snapshot (path + 1-based
@@ -913,6 +914,26 @@ to Coder` pill in its top-right corner while the snapshot
   to drop the chip _and_ strip every inline token (`@token`
   with at most one trailing whitespace) out of the draft so
   the chip and the inline references stay in sync.
+- Typing `@` in the composer opens an inline file picker
+  ("`@`-mention"). The token under the caret (the `@` plus
+  any non-whitespace characters up to the caret) is the live
+  query, debounced 50 ms into `ipc.search.files` — same
+  backend the command palette's file mode uses, so matches
+  rank identically. The menu floats above the textarea;
+  `↑ / ↓` navigate, `Enter` / `Tab` pick, `Esc` dismisses
+  without sending. Picking a file replaces the `@query` span
+  with `@path` (no `:start-end` suffix). **Pointer-only by
+  design** — we deliberately don't read the file or attach a
+  chip / `<code_selection>` block. The model gets the pointer
+  in the prose and calls `read_file` if it actually needs the
+  contents; that keeps the prompt bounded on big picks (no
+  surprise context blowups from `@huge.json`) and matches how
+  the model already navigates files via its tools. The user
+  who wants the contents inlined opens the file and uses
+  `Ctrl+L` on a selection (or the whole buffer) — the
+  selection path is the one and only "send me the bytes"
+  gesture. A bare `@` followed by a space (or `Esc`) leaves
+  the literal `@` in the prose.
 
 #### Wire shape (matches Cursor)
 
