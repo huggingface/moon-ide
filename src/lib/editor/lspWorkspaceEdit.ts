@@ -21,7 +21,7 @@
 // list and routes accordingly.
 
 import { ipc } from '../ipc';
-import type { LspWorkspaceEdit } from '../protocol';
+import { formatError, type LspWorkspaceEdit } from '../protocol';
 import { workspace } from '../state.svelte';
 import { applyEditsToText } from './lspRename';
 
@@ -77,7 +77,7 @@ export async function applyWorkspaceEdit(edit: LspWorkspaceEdit): Promise<Worksp
 		} catch (err) {
 			result.failures.push({
 				path: doc.path,
-				error: err instanceof Error ? err.message : String(err),
+				error: formatError(err),
 			});
 		}
 	}

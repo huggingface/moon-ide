@@ -36,7 +36,7 @@ import { Prec, StateEffect, StateField } from '@codemirror/state';
 import { EditorView, keymap, showPanel, type Panel } from '@codemirror/view';
 import { ipc } from '../ipc';
 import { workspace } from '../state.svelte';
-import type { LspPosition, LspWorkspaceEdit } from '../protocol';
+import { formatError, type LspPosition, type LspWorkspaceEdit } from '../protocol';
 import { filePathFacet } from './lsp';
 import { lspLanguageFor } from './lspLanguage';
 import { applyWorkspaceEdit } from './lspWorkspaceEdit';
@@ -188,7 +188,7 @@ async function runRename(state: RenameState, newName: string, view: EditorView):
 	try {
 		edit = await ipc.lsp.rename(state.path, state.languageId, state.position, newName);
 	} catch (err) {
-		workspace.flash(`Rename failed: ${formatErr(err)}`);
+		workspace.flash(`Rename failed: ${formatError(err)}`);
 		return;
 	}
 	if (edit.documentEdits.length === 0) {
@@ -207,13 +207,6 @@ async function runRename(state: RenameState, newName: string, view: EditorView):
 	workspace.flash(`Renamed '${state.placeholder}' → '${newName}' in ${total} ${fileWord}${dirtyHint}`);
 	view.dispatch({ effects: closeRenameEffect.of(null) });
 	view.focus();
-}
-
-function formatErr(err: unknown): string {
-	if (err instanceof Error) {
-		return err.message;
-	}
-	return String(err);
 }
 
 /**
@@ -244,7 +237,7 @@ function triggerRename(view: EditorView): boolean {
 		try {
 			prepared = await ipc.lsp.prepareRename(path, languageId, position, fallback);
 		} catch (err) {
-			workspace.flash(`Rename unavailable: ${formatErr(err)}`);
+			workspace.flash(`Rename unavailable: ${formatError(err)}`);
 			return;
 		}
 		const placeholder = prepared?.placeholder ?? fallback;
