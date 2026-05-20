@@ -2049,8 +2049,20 @@ async fn run_turn(
 		// event per delta. The post-call `emit_token_usage` below
 		// overrides everything with provider-exact numbers when
 		// the chunk arrives.
+		//
+		// Anchor the pre-call estimate on the prior turn's
+		// `last_usage` whenever we have one: the new prompt is
+		// the previous prompt + the previous assistant response +
+		// whatever was appended afterwards (new user message
+		// and/or tool results). Carrying the exact numbers
+		// forward and only estimating the tail keeps the ring
+		// from shrinking back to a bytes/4 approximation on
+		// providers (Anthropic especially) where bytes/4
+		// undercounts what the tokenizer actually sees. First
+		// turn has no `last_usage`, so we fall back to bytes/4 of
+		// the whole array.
 		const STREAM_USAGE_THROTTLE: std::time::Duration = std::time::Duration::from_millis(500);
-		let prompt_estimate = estimate_prompt_tokens(&messages);
+		let prompt_estimate = estimate_prompt_with_anchor(last_usage.as_ref(), &messages);
 		let context_window = models.context_window(&standard_model);
 		sink.send(CoderEvent::TokenUsage {
 			prompt_tokens: prompt_estimate,
@@ -3725,6 +3737,55 @@ fn maybe_emit_stream_usage(
 /// freshly pasted screenshot from looking free until the
 /// provider's first usage chunk lands.
 pub(crate) fn estimate_prompt_tokens(messages: &[ChatMessage]) -> u32 {
+	(message_bytes(messages) / 4) as u32
+}
+
+/// Pre-call prompt-token estimate that anchors on the last turn's
+/// exact usage figures when available. The new wire prompt is the
+/// previous prompt + the previous assistant response + everything
+/// appended after it (new user messages and tool results), so:
+///
+/// ```text
+/// estimate = last.prompt_tokens + last.completion_tokens
+///          + bytes/4(messages_after_last_assistant)
+/// ```
+///
+/// Anchoring matters because raw bytes/4 systematically undercounts
+/// what real tokenizers see — and once Anthropic's `prompt_tokens`
+/// includes the cached prefix (see `anthropic::merge_usage`), the
+/// previous turn's number is the closest thing we have to ground
+/// truth for the next prompt. Without this, the ring would shrink
+/// from the exact post-stream figure back to the cruder bytes/4 the
+/// moment the user hits send, then jump back when the new usage
+/// chunk arrives.
+///
+/// Falls back to the plain bytes/4 of the full array when:
+/// - there's no prior `last_usage` (very first turn of the
+///   session, or right after a compaction that reset it), or
+/// - the message list no longer contains an assistant turn (e.g.
+///   the compaction summary fused the prefix into a system
+///   message). In that case `last_usage.prompt_tokens` already
+///   covers everything currently in the array, so bytes/4 of the
+///   whole thing is a fine — and conservative — fallback.
+fn estimate_prompt_with_anchor(last_usage: Option<&TokenUsage>, messages: &[ChatMessage]) -> u32 {
+	let Some(last) = last_usage else {
+		return estimate_prompt_tokens(messages);
+	};
+	let Some(last_assistant_idx) = messages
+		.iter()
+		.rposition(|m| matches!(m, ChatMessage::Assistant { .. }))
+	else {
+		return estimate_prompt_tokens(messages);
+	};
+	let tail = &messages[last_assistant_idx + 1..];
+	let tail_estimate = (message_bytes(tail) / 4) as u32;
+	last
+		.prompt_tokens
+		.saturating_add(last.completion_tokens)
+		.saturating_add(tail_estimate)
+}
+
+fn message_bytes(messages: &[ChatMessage]) -> usize {
 	let mut bytes: usize = 0;
 	for msg in messages {
 		match msg {
@@ -3748,7 +3809,7 @@ pub(crate) fn estimate_prompt_tokens(messages: &[ChatMessage]) -> u32 {
 			}
 		}
 	}
-	(bytes / 4) as u32
+	bytes
 }
 
 /// `true` iff `base_url`'s host is loopback or `.local`. Used to
@@ -4221,5 +4282,82 @@ mod tests {
 		}];
 		assert!(pop_pending_steer(&mut session, "missing").is_none());
 		assert_eq!(session.pending_steers.len(), 1);
+	}
+
+	#[test]
+	fn estimate_prompt_with_anchor_falls_back_to_bytes_div_4_when_no_last_usage() {
+		let messages = vec![
+			ChatMessage::System {
+				content: "x".repeat(40),
+			},
+			ChatMessage::User {
+				content: "y".repeat(40),
+				images: Vec::new(),
+			},
+		];
+		// 80 bytes / 4 = 20.
+		assert_eq!(estimate_prompt_with_anchor(None, &messages), 20);
+	}
+
+	#[test]
+	fn estimate_prompt_with_anchor_anchors_on_prior_usage_and_estimates_tail() {
+		let last = TokenUsage {
+			prompt_tokens: 10_000,
+			completion_tokens: 500,
+			total_tokens: 10_500,
+			cache_read_input_tokens: 0,
+			cache_creation_input_tokens: 0,
+		};
+		let messages = vec![
+			ChatMessage::System { content: String::new() },
+			ChatMessage::User {
+				content: String::new(),
+				images: Vec::new(),
+			},
+			ChatMessage::Assistant {
+				content: Some(String::new()),
+				tool_calls: Vec::new(),
+			},
+			// 80 bytes appended after the last assistant turn:
+			// new user message + a tool result.
+			ChatMessage::User {
+				content: "u".repeat(40),
+				images: Vec::new(),
+			},
+			ChatMessage::Tool {
+				tool_call_id: String::new(),
+				content: "t".repeat(40),
+			},
+		];
+		// 10_000 (prompt) + 500 (completion) + 80/4 (tail) = 10_520.
+		assert_eq!(estimate_prompt_with_anchor(Some(&last), &messages), 10_520);
+	}
+
+	#[test]
+	fn estimate_prompt_with_anchor_falls_back_when_no_assistant_in_array() {
+		// Right after a compaction the prefix collapses into a
+		// single system message — no assistant turn left in the
+		// array. `last_usage` has been reset by the compaction
+		// path, but defensively the helper must still degrade
+		// gracefully if called with a stale snapshot.
+		let last = TokenUsage {
+			prompt_tokens: 99_999,
+			completion_tokens: 0,
+			total_tokens: 99_999,
+			cache_read_input_tokens: 0,
+			cache_creation_input_tokens: 0,
+		};
+		let messages = vec![
+			ChatMessage::System {
+				content: "x".repeat(40),
+			},
+			ChatMessage::User {
+				content: "y".repeat(40),
+				images: Vec::new(),
+			},
+		];
+		// No assistant → bytes/4 of the whole array (20), not
+		// the stale anchor.
+		assert_eq!(estimate_prompt_with_anchor(Some(&last), &messages), 20);
 	}
 }
