@@ -1809,7 +1809,11 @@
 						<div class="subagent-preview">{subagent.resultPreview}</div>
 					{/if}
 					<div class="subagent-footer">
-						<span class="subagent-tokens">~{subagent.tokensUsedEstimate} tok</span>
+						{#if subagent.tokensUsedEstimate > 0}
+							<span class="subagent-tokens">~{subagent.tokensUsedEstimate} tok</span>
+						{:else}
+							<span class="subagent-tokens placeholder">…</span>
+						{/if}
 						<span class="subagent-open">Open transcript →</span>
 					</div>
 				</button>
@@ -2624,6 +2628,12 @@
 	.subagent-open {
 		font-weight: 500;
 		color: var(--m-fg-muted);
+	}
+	/* Pre-first-round-trip placeholder — keeps the footer at a
+	   stable height while the sub-agent's first `token_usage`
+	   event hasn't arrived yet, without showing a stale `~0 tok`. */
+	.subagent-tokens.placeholder {
+		opacity: 0.5;
 	}
 	.composer {
 		flex-shrink: 0;

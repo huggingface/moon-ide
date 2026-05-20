@@ -2271,6 +2271,24 @@ class CoderPanelState {
 				const nextRows = applyInnerEventToRows(existing.rows, event.inner);
 				transcripts.set(event.subagent_id, { ...existing, rows: nextRows });
 				session.subagentTranscripts = transcripts;
+				// Live-update the collapsed card's token footer so the
+				// user sees the sub-agent's cost climb as it runs,
+				// instead of jumping from `~0 tok` to the final
+				// figure when `subagent_finished` lands. The sub-agent
+				// emits a wrapped `token_usage` after every LLM
+				// round-trip — same shape the parent uses — so we
+				// take its `total_tokens` as the running estimate.
+				if (event.inner.kind === 'token_usage') {
+					const summaries = new Map(session.subagentSummaries);
+					const summary = findSummaryById(summaries, event.subagent_id);
+					if (summary) {
+						summaries.set(summary.toolCallId, {
+							...summary,
+							tokensUsedEstimate: event.inner.total_tokens,
+						});
+						session.subagentSummaries = summaries;
+					}
+				}
 				return;
 			}
 			case 'subagent_finished': {
