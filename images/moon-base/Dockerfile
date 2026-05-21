@@ -100,14 +100,17 @@ RUN install -m 0755 -d /etc/apt/keyrings \
  && apt-get install -y --no-install-recommends gh \
  && rm -rf /var/lib/apt/lists/*
 
-# mongosh (the MongoDB shell) from MongoDB's official apt repo.
-# We pull only the `mongodb-mongosh` package — not the full
-# `mongodb-org` server stack — because the workspace container
-# doesn't host MongoDB itself; project services live as
+# mongosh (the MongoDB shell) plus the database tools
+# (`mongodump` / `mongorestore` / `mongoexport` / ...) from
+# MongoDB's official apt repo. We pull only those two packages —
+# not the full `mongodb-org` server stack — because the workspace
+# container doesn't host MongoDB itself; project services live as
 # host-daemon siblings via compose `include:` (ADR 0008). The
-# shell's the part the dev needs in their interactive container
-# terminal, the same way `gh` is here without `git` itself
-# needing to be a separate concern.
+# shell and the dump/restore tools are the parts the dev needs in
+# their interactive container terminal (snapshotting a project's
+# dev mongo, restoring a fixture into it, ad-hoc queries), the
+# same way `gh` is here without `git` itself needing to be a
+# separate concern.
 #
 # Pinned to the 8.0 channel, MongoDB's current server major as
 # of this image revision; mongosh 2.x in that channel speaks
@@ -126,9 +129,13 @@ RUN install -m 0755 -d /etc/apt/keyrings \
  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/mongodb-server-8.0.asc] https://repo.mongodb.org/apt/debian bookworm/mongodb-org/8.0 main" \
       > /etc/apt/sources.list.d/mongodb-org-8.0.list \
  && apt-get update \
- && apt-get install -y --no-install-recommends mongodb-mongosh \
+ && apt-get install -y --no-install-recommends \
+        mongodb-mongosh \
+        mongodb-database-tools \
  && rm -rf /var/lib/apt/lists/* \
- && mongosh --version
+ && mongosh --version \
+ && mongodump --version \
+ && mongorestore --version
 
 # Non-root user. UID 1000 lines up with the conventional "first user"
 # on Linux contributors' hosts; on Docker Desktop for macOS the

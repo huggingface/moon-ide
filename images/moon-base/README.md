@@ -74,13 +74,17 @@ the "polyglot toolchain" tradeoff we picked in ADR 0007.
   its dependency tree stays isolated from any project venv.
 - **`gh`** from GitHub's official apt repo (Debian's `gh`
   trails upstream by a release or two).
-- **`mongosh`** (the MongoDB shell) from MongoDB's official
-  apt repo, pinned to the 8.0 channel. Server is **not**
+- **`mongosh`** (the MongoDB shell) and the **MongoDB
+  database tools** (`mongodump`, `mongorestore`,
+  `mongoexport`, `mongoimport`, `bsondump`, `mongostat`,
+  `mongotop`, `mongofiles`) from MongoDB's official apt
+  repo, pinned to the 8.0 channel. Server is **not**
   bundled — projects that need MongoDB run it as a host-
   daemon sibling via compose `include:` (ADR 0008); the
-  shell is the only piece the dev needs at the interactive
-  prompt. mongosh 2.x speaks every server protocol from 4.4
-  onwards.
+  shell and the dump/restore tools are the pieces the dev
+  needs at the interactive prompt (ad-hoc queries,
+  snapshotting a dev mongo, restoring a fixture into it).
+  mongosh 2.x speaks every server protocol from 4.4 onwards.
 - **Comfort tooling**: `ripgrep` (`rg`), `fzf`, `bat` (the
   Debian `batcat` symlinked back to `bat`), `jq`.
 - **Standard plumbing**: `git`, `curl`, `wget`, `ca-certificates`,
