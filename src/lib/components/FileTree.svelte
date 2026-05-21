@@ -1843,7 +1843,9 @@
 	 *    path (so a click in the regular tree always lands in
 	 *    Source view, even if the path was previously toggled to
 	 *    Diff via the changes-view click, the gutter, or the tab
-	 *    toolbar). Then preview-open without stealing focus.
+	 *    toolbar). Then open the file and hand focus to the
+	 *    editor — typing right after the click should edit the
+	 *    file, not seed Pierre's tree search.
 	 *  - `'changes'` mode: set the diff-mode flag *only* for files
 	 *    with `modified` status — those are the rows where a
 	 *    side-by-side comparison has something to show. Added /
@@ -1863,6 +1865,13 @@
 	 * silently dropped by Pierre's selection-version check) and
 	 * the wrapper-click listener below (fires on every click,
 	 * including on the active row).
+	 *
+	 * We default to `focus: true` (the `openFile` default) so the
+	 * editor's focusTick effect pulls DOM focus onto CodeMirror.
+	 * Arrow-key navigation inside the tree is unaffected — Pierre
+	 * only fires `onSelectionChange` on click, not on focus
+	 * movement, so arrow keys still move Pierre's row cursor
+	 * without re-triggering this function.
 	 */
 	function activateRowFromTree(path: string) {
 		const item = tree?.getItem(path);
@@ -1885,7 +1894,7 @@
 		const status = workspace.gitStatusEntries.find((e) => e.path === path)?.status;
 		const wantsDiff = mode === 'changes' && status === 'modified';
 		workspace.setDiffMode(path, wantsDiff);
-		void workspace.openFile(path, undefined, { focus: false });
+		void workspace.openFile(path);
 	}
 
 	/**

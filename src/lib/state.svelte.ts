@@ -3348,13 +3348,12 @@ class WorkspaceState {
 
 	/**
 	 * Open `path` in the given pane. By default, opening a file pulls
-	 * editor focus — that's what tab clicks, the quick-open palette,
-	 * and session restore want. Pass `{ focus: false }` for surfaces
-	 * where the user is still navigating *around* files (most notably
-	 * the file tree, where arrow-key selection should preview-open
-	 * without yanking focus out of the tree); the tree separately
-	 * raises focus on Enter / double-click. `focusedSide` updates
-	 * either way so subsequent operations target the same pane.
+	 * editor focus — that's what tab clicks, file-tree clicks, the
+	 * quick-open palette, and session restore all want. `{ focus: false }`
+	 * is kept on the API for callers that want to update tabs without
+	 * stealing focus (session-restore-style flows), but no surface
+	 * currently exercises it. `focusedSide` updates either way so
+	 * subsequent operations target the same pane.
 	 */
 	/**
 	 * Open a fresh untitled buffer in `side`. Generates a synthetic
@@ -4546,8 +4545,11 @@ class WorkspaceState {
 		if (!this.suppressNavPush) {
 			this.pushFileSwitchEntry(path);
 		}
-		// `focus` defaults to true; the tree opts out via `{ focus: false }`
-		// so arrow-key navigation can preview-browse without stealing focus.
+		// `focus` defaults to true so every navigation gesture (tab
+		// click, tree-row click, palette quick-open, session restore)
+		// lands in the editor ready to type. Callers can pass
+		// `{ focus: false }` for the rare flow that wants to update
+		// the tab strip without stealing focus.
 		if (options.focus !== false) {
 			this.requestEditorFocus();
 		}

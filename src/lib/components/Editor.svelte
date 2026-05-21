@@ -32,7 +32,14 @@
 	let { file, side }: Props = $props();
 
 	let host: HTMLDivElement;
-	let view: EditorView | undefined;
+	// `view` is `$state` so the `focusTick` effect retries once
+	// `onMount` has built the CodeMirror view. Without this the very
+	// first file opened from a fresh launch (Ctrl+P / tab click on a
+	// newly mounted Editor) could miss the focus pull: the effect
+	// runs as soon as `focusTick` bumps but `view` is still
+	// `undefined`, and a plain `let` wouldn't re-trigger when
+	// `onMount` later assigns it.
+	let view: EditorView | undefined = $state();
 	const languageCompartment = new Compartment();
 	// Editorconfig settings live in their own compartment because they
 	// can change without the file changing — saving a `.editorconfig`

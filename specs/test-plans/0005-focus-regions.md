@@ -86,63 +86,63 @@ Prerequisites: `bun install`, host deps installed per `README.md`,
     is off-region; F6 enters at the start). `Shift+F6` from an
     off-region state enters at `status`.
 
-### Tree preview-open
+### Tree → editor focus
 
 15. Click a file in the tree. Expected: the file opens in the
-    editor, but the focused row indicator stays in the tree
-    (caret does **not** appear in CodeMirror; the tree's row
-    keeps the focus ring). The matching tab is shown as
-    active.
-16. Press `↓`/`↑`. Expected: the tree's focused row moves;
-    when it lands on a different file the editor preview
-    swaps to that file (selection and tab follow). Focus
-    remains in the tree the entire time. Skipping over
-    directories is fine — they're not opened in the editor,
-    just focused in the tree.
-17. Press `Enter` on a focused file row. Expected: focus jumps
-    to the editor and the caret blinks in CodeMirror. The
-    file is the one that was focused in the tree (handles the
-    case where Pierre's "focused" row is ahead of the
-    "selected" row after pure arrow-key navigation).
-18. Re-focus the tree (`Ctrl+0` or `F6`). Double-click another
-    file. Expected: the file opens AND focus moves to the
-    editor in one gesture.
-19. Single-click a directory. Expected: Pierre toggles its
-    expansion as before; nothing opens in the editor;
-    focus stays in the tree. Pressing `Enter` on a focused
-    directory row is a no-op (Pierre's `→`/`←` still expand
-    and collapse as before).
-20. Open the command palette (`Ctrl+P`), pick a file. Expected:
-    same as before — the file opens AND focus jumps into the
-    editor (the palette path keeps the default `focus: true`).
-21. Click an already-open tab in the tab strip. Expected: the
-    tab becomes active and focus moves to the editor (tab
-    clicks keep the default `focus: true`).
+    editor **and** the caret appears in CodeMirror — typing
+    immediately edits the file. The tree row is still
+    selected (highlighted) but no longer holds DOM focus.
+    Specifically, the first keystroke after the click does
+    **not** seed Pierre's tree search (the old preview-open
+    behaviour did, and that's the bug this change fixes).
+16. Re-focus the tree (`Ctrl+0` or `F6`). Press `↓`/`↑`.
+    Expected: the tree's focused row moves; Pierre only
+    fires `onSelectionChange` on click, so arrow keys don't
+    open files in the editor — they just move Pierre's row
+    cursor. Press `Enter` on a focused file row: the file
+    opens and the caret blinks in CodeMirror.
+17. Re-focus the tree, double-click a file. Expected: the
+    file opens AND focus moves to the editor (single click
+    already does both — double-click is just the
+    follow-through gesture and shouldn't break).
+18. Single-click a directory. Expected: Pierre toggles its
+    expansion as before; nothing opens in the editor; focus
+    stays on the directory row. Pressing `Enter` on a
+    focused directory row is a no-op (Pierre's `→`/`←` still
+    expand and collapse as before).
+19. Open the command palette (`Ctrl+P`), pick a file. Expected:
+    the file opens AND the caret lands in CodeMirror ready
+    to type. Verify on the **very first file open after a
+    fresh launch** too — the `let view` reactivity fix in
+    `Editor.svelte` makes the focus retry once `onMount`
+    finishes building the view.
+20. Click an already-open tab in the tab strip. Expected: the
+    tab becomes active and focus moves to the editor.
 
 ### Tab → tree scroll
 
-22. Open enough files that the file tree has visible scroll
+21. Open enough files that the file tree has visible scroll
     (resize the window if needed, or open a deep folder).
     Manually scroll the tree so the active file's row is
     nowhere on screen.
-23. Click a different tab in the tab strip. Expected: the file
+22. Click a different tab in the tab strip. Expected: the file
     tree scrolls so the newly active file's row is visible and
     selected, even if it was virtualized out of the rendered
     window. Focus stays in the editor (the slow-path focus
     park is restored before the call returns).
-24. Repeat with palette quick-open: open the palette, type the
+23. Repeat with palette quick-open: open the palette, type the
     name of a file far away in the tree, accept. Expected: the
     file opens, the editor has focus, and the tree has
     scrolled to the row.
 
 ### Dev-server cache (warning-free launches)
 
-25. Stop the dev server (`Ctrl+C` in the terminal running
+24. Stop the dev server (`Ctrl+C` in the terminal running
     `bun run dev`). One-time hygiene: delete the WebKitGTK
     cache for moon-ide so any stale entries from before this
     change are flushed —
     `rm -rf ~/.local/share/moon-ide/WebKitCache`.
-26. Restart `bun run dev`. Expected: the terminal logs no
+25. Restart `bun run dev`. Expected: the terminal logs no
     `[vite-plugin-svelte:load] failed to load virtual css
 module` warnings during startup, and none on subsequent
     cold relaunches. (Some warnings can still appear during
