@@ -123,6 +123,25 @@
 			detachStickyHbarA = null;
 			detachStickyHbarB?.();
 			detachStickyHbarB = null;
+			// Snapshot the right pane's caret + scroll before
+			// teardown so the matching `Editor.svelte` mount (or
+			// a later return to diff mode) can pick up where the
+			// user left off. Symmetric with `Editor.svelte`'s own
+			// unmount snapshot — together they preserve the caret
+			// across Ctrl+Shift+D toggles. History JSON is
+			// deliberately not captured here: the right pane is
+			// editable but the undo stack lives on the Editor
+			// surface's lifecycle, and feeding a MergeView-flavoured
+			// history JSON back into a regular EditorState would
+			// at best be a no-op and at worst confuse `fromJSON`.
+			const folder = workspace.activeFolderPath;
+			if (merge && !file.isDeleted && folder !== null) {
+				workspace.snapshotViewState(folder, file.path, {
+					caretOffset: merge.b.state.selection.main.head,
+					anchorOffset: merge.b.state.selection.main.anchor,
+					scrollTop: merge.b.scrollDOM.scrollTop,
+				});
+			}
 			merge?.destroy();
 			merge = undefined;
 			// Drop any selection snapshot the right pane published
@@ -506,8 +525,41 @@
 		detachStickyHbarA = attachStickyHScrollbar(merge.a.scrollDOM, merge.a.dom);
 		detachStickyHbarB = attachStickyHScrollbar(merge.b.scrollDOM, merge.b.dom);
 
+		// Caret restore order, highest precedence first:
+		//
+		//   1. View-state snapshot left by a previous mount of this
+		//      buffer (Editor or DiffView). This is what makes a
+		//      Ctrl+Shift+D toggle land back on the user's caret
+		//      instead of resetting to the first chunk.
+		//   2. First chunk's `fromB` — the legacy "open a 3000-line
+		//      file and jump to the one edit at line 2500" gesture
+		//      that fires on a clean first-time diff view.
+		//   3. Nothing (deleted-file panes have a read-only empty
+		//      right side; no chunks, no snapshot to restore).
+		//
+		// A pending goto-def jump still wins over both via the
+		// `pendingJumps` effect below, which queues another
+		// dispatch in a later microtask.
+		const folder = workspace.activeFolderPath;
+		const snapshot = folder !== null ? workspace.getViewState(folder, file.path) : null;
 		const chunks = merge.chunks;
-		if (chunks.length > 0 && !file.isDeleted) {
+		if (snapshot !== null && !file.isDeleted) {
+			const docLen = merge.b.state.doc.length;
+			// `caret` / `selAnchor` to dodge the outer-scope `head`
+			// (HEAD blob text) shadowing.
+			const caret = Math.min(snapshot.caretOffset, docLen);
+			const selAnchor = Math.min(snapshot.anchorOffset, docLen);
+			requestAnimationFrame(() => {
+				if (token !== buildToken || !merge) {
+					return;
+				}
+				merge.b.dispatch({
+					selection: caret === selAnchor ? EditorSelection.cursor(caret) : EditorSelection.range(selAnchor, caret),
+					effects: EditorView.scrollIntoView(caret, { y: 'center' }),
+				});
+				merge.b.scrollDOM.scrollTop = snapshot.scrollTop;
+			});
+		} else if (chunks.length > 0 && !file.isDeleted) {
 			const first = chunks[0];
 			if (first) {
 				const docLen = merge.b.state.doc.length;

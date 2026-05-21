@@ -94,18 +94,56 @@
 
 	onMount(() => {
 		void workspace.ensureEditorConfig(file.path);
-		const state = EditorState.create({
-			doc: file.text,
-			extensions: baseExtensions(),
-		});
+		const folder = workspace.activeFolderPath;
+		// Pick up a snapshot left by a previous mount of this buffer
+		// (most commonly: the user just toggled diff mode off, so the
+		// DiffView we replaced wrote the right pane's caret + scroll
+		// into the shared snapshot store). Without this the freshly-
+		// built state always starts at offset 0 and the caret the
+		// user had in either pane is lost on every flip.
+		const snapshot = folder !== null ? workspace.getViewState(folder, file.path) : null;
+		const state = snapshot?.historyJson
+			? buildStateWithHistory(file.text, snapshot.historyJson)
+			: EditorState.create({
+					doc: file.text,
+					extensions: baseExtensions(),
+				});
 		view = new EditorView({ state, parent: host });
 		currentPath = file.path;
+		if (snapshot !== null) {
+			const v = view;
+			const docLen = v.state.doc.length;
+			const head = Math.min(snapshot.caretOffset, docLen);
+			const anchor = Math.min(snapshot.anchorOffset, docLen);
+			v.dispatch({
+				selection: head === anchor ? EditorSelection.cursor(head) : EditorSelection.range(anchor, head),
+			});
+			queueMicrotask(() => {
+				v.scrollDOM.scrollTop = snapshot.scrollTop;
+			});
+		}
 		void applyLanguage(file.path, file.text);
 		return () => {
 			// Clear any selection snapshot tied to this view so a
 			// re-mount (HMR, file-tab close) doesn't leave the
 			// "Add to Coder" hint hovering over a dead path.
 			workspace.setActiveSelection(null);
+			// Persist caret + scroll + undo history so a remount of
+			// this same buffer (diff-mode toggle, HMR, pane shuffle)
+			// can pick up where the user left off. Tab swaps already
+			// snapshot via the path-change effect above; this covers
+			// the lifecycle path where the component goes away without
+			// the path having changed.
+			const v = view;
+			const folderForSnap = workspace.activeFolderPath;
+			if (v && currentPath !== null && folderForSnap !== null) {
+				workspace.snapshotViewState(folderForSnap, currentPath, {
+					caretOffset: v.state.selection.main.head,
+					anchorOffset: v.state.selection.main.anchor,
+					scrollTop: v.scrollDOM.scrollTop,
+					historyJson: v.state.toJSON({ history: historyField }),
+				});
+			}
 			view?.destroy();
 			view = undefined;
 		};
