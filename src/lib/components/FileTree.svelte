@@ -76,16 +76,71 @@
 	//    the git dot uncomfortably close to the hover ellipsis; the
 	//    extra right-margin on the git cell restores ~10px of visual
 	//    breathing room without touching the global row gap.
+	// Read the warning token from `--m-warning` defined on `:root`,
+	// resolved at module-import time. Pierre lives in a closed
+	// shadow root that doesn't inherit our custom properties, so
+	// the colour has to be baked into the injected stylesheet
+	// literally — referencing `var(--m-warning)` from inside the
+	// shadow would resolve to the unset default and render the
+	// badge invisible. Reading from `getComputedStyle(document.
+	// documentElement)` would mean re-running on theme flips; the
+	// IDE's only theme flip today is a hard reload, so the
+	// build-time read is enough.
+	const CONFLICT_BADGE_COLOR =
+		(typeof document !== 'undefined'
+			? getComputedStyle(document.documentElement).getPropertyValue('--m-warning').trim()
+			: '') || '#f0b86e';
+
 	const PIERRE_OVERRIDES_CSS = `
 [data-item-section='git'] {
 	margin-right: 8px;
 }
+/* Conflict-marker badge. The Pierre row decoration cell holds
+   our "!" text; we tint it with the IDE's warning token (baked
+   in at module load — see CONFLICT_BADGE_COLOR) and bump it to
+   bold so a single "!" on a busy row still catches the eye. */
+[data-item-section='decoration'] {
+	color: ${CONFLICT_BADGE_COLOR};
+	font-weight: 700;
+}
 `;
+
+	// Pierre's `gitStatus` option accepts a fixed vocabulary
+	// (`added | deleted | ignored | modified | renamed | untracked`).
+	// Our own enum extends it with `conflicted`, which Pierre would
+	// type-reject. Translate to the closest Pierre token (`modified`
+	// — a conflicted file *is* modified vs. HEAD on the non-conflict
+	// side) and overlay the actual conflict signal via
+	// `renderRowDecoration` below, so the row gets both the regular
+	// status colour and an unmistakable badge.
+	function entriesForPierre(entries: readonly GitStatusEntry[]) {
+		return entries.map((entry) => ({
+			path: entry.path,
+			status: entry.status === 'conflicted' ? ('modified' as const) : entry.status,
+		}));
+	}
+
+	// Per-file membership in `gitStatusEntries === 'conflicted'`,
+	// rebuilt on every status refresh. The `renderRowDecoration`
+	// callback Pierre invokes per visible row reads this set
+	// directly — building a `Set<string>` keeps the lookup O(1)
+	// even on repos with thousands of changed paths.
+	let conflictedPaths: ReadonlySet<string> = new Set();
+	function recomputeConflictedPaths(entries: readonly GitStatusEntry[]) {
+		const next = new Set<string>();
+		for (const entry of entries) {
+			if (entry.status === 'conflicted') {
+				next.add(entry.path);
+			}
+		}
+		conflictedPaths = next;
+	}
 
 	onMount(() => {
 		if (!treeMount) {
 			return;
 		}
+		recomputeConflictedPaths(untrack(() => workspace.gitStatusEntries));
 		tree = new FileTree({
 			paths: currentPaths(),
 			flattenEmptyDirectories: true,
@@ -99,7 +154,27 @@
 			// having to drill in.
 			initialExpansion: mode === 'changes' ? 'open' : 0,
 			search: true,
-			gitStatus: untrack(() => workspace.gitStatusEntries),
+			gitStatus: entriesForPierre(untrack(() => workspace.gitStatusEntries)),
+			// Per-row decoration for unmerged paths. Pierre's
+			// own `GitStatus` doesn't carry a `conflicted`
+			// token, so we map those rows to `modified` for the
+			// regular status colour (see `entriesForPierre`) and
+			// stamp a small "!" badge here on top. The badge sits
+			// in Pierre's dedicated decoration cell — it doesn't
+			// clash with the rename inline edit or the context-
+			// menu hover button.
+			renderRowDecoration: ({ item }) => {
+				if (item.kind !== 'file') {
+					return null;
+				}
+				if (!conflictedPaths.has(item.path)) {
+					return null;
+				}
+				return {
+					text: '!',
+					title: 'Unresolved merge conflict — edit the file to resolve, then save.',
+				};
+			},
 			onSelectionChange: (selectedPaths) => {
 				if (selectedPaths.length === 0) {
 					return;
@@ -657,7 +732,8 @@
 		if (!tree) {
 			return;
 		}
-		tree.setGitStatus(entries);
+		recomputeConflictedPaths(entries);
+		tree.setGitStatus(entriesForPierre(entries));
 		applyGitOverlay(tree, entries);
 	});
 
@@ -723,6 +799,13 @@
 			if (entry.path.length === 0) {
 				continue;
 			}
+			// Conflicted entries collapse to `modified` for the
+			// purpose of folder-dot severity — the row's badge
+			// already signals the conflict; the ancestor dot
+			// just needs the worst tracked colour, and a
+			// conflict is at least as "tracked-modified" as a
+			// regular modify.
+			const trackedStatus: TrackedStatus | 'ignored' = entry.status === 'conflicted' ? 'modified' : entry.status;
 			const stripped = entry.path.replace(/\/+$/, '');
 			const segments = stripped.split('/');
 			let cumulative = '';
@@ -730,13 +813,13 @@
 				const seg = segments[i] ?? '';
 				cumulative = cumulative === '' ? seg : `${cumulative}/${seg}`;
 				const key = `${cumulative}/`;
-				if (entry.status === 'ignored') {
+				if (trackedStatus === 'ignored') {
 					ignoredAncestors.add(key);
 					continue;
 				}
 				const existing = folderSeverity.get(key);
-				if (existing === undefined || SEVERITY[entry.status] > SEVERITY[existing]) {
-					folderSeverity.set(key, entry.status);
+				if (existing === undefined || SEVERITY[trackedStatus] > SEVERITY[existing]) {
+					folderSeverity.set(key, trackedStatus);
 				}
 			}
 		}

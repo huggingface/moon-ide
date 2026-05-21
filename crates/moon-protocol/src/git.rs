@@ -2,12 +2,16 @@
 //! Phase 5 for the end-state plan; this module carries only what the
 //! current slice ships:
 //!
-//! - A lowercase enum matching Pierre Trees' `GitStatus` vocabulary
-//!   (`'added' | 'modified' | 'deleted' | 'untracked' | 'ignored'`)
-//!   so the TS mirror maps directly without a conversion table.
+//! - A lowercase enum that extends Pierre Trees' built-in `GitStatus`
+//!   vocabulary with one extra value (`'conflicted'`) for unmerged
+//!   index entries. Pierre's own enum doesn't include conflicts, so
+//!   the frontend layers a `renderRowDecoration` badge on top of
+//!   whatever status Pierre already paints (typically `modified`);
+//!   the wire value `conflicted` lets us recognise those rows
+//!   without re-running `git ls-files --unmerged` on the frontend.
 //! - A `{ path, status }` pair; no staged-vs-worktree split, no
-//!   conflict marker, no per-hunk counts. The tree needs one label
-//!   per row; more granular views go in the SCM panel later.
+//!   per-hunk counts. The tree needs one label per row; more
+//!   granular views go in the SCM panel later.
 //!
 //! Renames aren't in the enum on purpose: we ask git with
 //! `--no-renames` so a rename lands as `deleted(old)` +
@@ -43,6 +47,20 @@ pub enum GitFileStatus {
 	/// in the index. Entire directories may be reported collapsed
 	/// (`target/`); the tree fades those rows without expanding.
 	Ignored,
+	/// Unmerged index entry — `git status` reported one of
+	/// `UU` / `AU` / `UA` / `DD` / `AA` / `UD` / `DU` for this
+	/// path. The file is in the middle of a merge or cherry-pick
+	/// the user needs to resolve before they can commit; the SCM
+	/// panel shifts into "merge in progress" mode when at least
+	/// one of these is present (see [`GitMergeState`]) and the
+	/// editor decorates the conflict markers inside the buffer.
+	///
+	/// Pierre's own `GitStatus` enum doesn't carry a `conflicted`
+	/// label — the frontend uses Pierre's `renderRowDecoration`
+	/// callback to stamp a separate badge on top of the regular
+	/// status colour (which usually reads `modified` for the
+	/// non-conflict side of the merge).
+	Conflicted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -454,4 +472,60 @@ pub struct GitFileBlame {
 	/// having to cross-reference folder bindings.
 	pub remote_url: String,
 	pub lines: Vec<GitLineBlame>,
+}
+
+/// Snapshot of an in-progress merge for the SCM panel. Surfaces
+/// the three things the panel needs to reshape itself when the
+/// working tree is mid-merge:
+///
+/// 1. Whether `.git/MERGE_HEAD` exists at all (gates the
+///    `Merging <ref>` header pill, the "Commit merge" / "Abort
+///    merge" buttons, and the suppression of the sync /
+///    update-from-main buttons).
+/// 2. A human-readable name for the ref being merged in
+///    (`merging_ref`), so the panel can say `Merging origin/main`
+///    instead of leaking a 40-char SHA.
+/// 3. The path list of unmerged entries — `git ls-files
+///    --unmerged` collapsed by path. Drives the "N files still
+///    have unresolved conflicts" hint and gates the commit
+///    button: as long as `unmerged_paths` is non-empty `git
+///    commit` would refuse, so the button does too.
+///
+/// The default value (`in_progress: false`, everything else empty
+/// / `None`) is what every non-merging state returns — including
+/// "not a git repo" and "git isn't installed". The SCM panel
+/// reads `in_progress` first; if it's `false` the other fields
+/// are irrelevant.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct GitMergeState {
+	/// `true` iff `.git/MERGE_HEAD` exists. The SCM panel uses
+	/// this as the master switch for "merge-in-progress mode"
+	/// (header pill, reshaped commit row, abort affordance,
+	/// hidden sync buttons).
+	pub in_progress: bool,
+	/// Short, user-recognisable label of the ref being merged.
+	/// Resolved with `git name-rev --name-only` against
+	/// `MERGE_HEAD`'s SHA when possible, so a freshly-pulled
+	/// `origin/main` reads as `"origin/main"` rather than its
+	/// commit hash. Falls back to the short SHA when
+	/// `name-rev` can't disambiguate (rare). `None` when
+	/// `MERGE_HEAD` doesn't exist or can't be read.
+	pub merging_ref: Option<String>,
+	/// Contents of `.git/MERGE_MSG` (git's default commit message
+	/// for the merge — `"Merge branch 'foo'"` and friends).
+	/// `None` when the file doesn't exist; the SCM panel uses
+	/// this to prefill the composer when the user enters
+	/// merge-in-progress mode with an empty draft, the same way
+	/// the amend toggle prefills from `HEAD`.
+	pub default_message: Option<String>,
+	/// Workspace-relative paths of files with unmerged index
+	/// entries (`git ls-files --unmerged`). One entry per path,
+	/// regardless of how many index stages the file has (a
+	/// regular `UU` conflict has three stages but is one path).
+	/// Empty during a merge means "every conflict has been
+	/// resolved; the user can commit"; non-empty blocks the
+	/// commit button and powers the "N unresolved" hint.
+	pub unmerged_paths: Vec<String>,
 }

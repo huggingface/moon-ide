@@ -619,6 +619,56 @@ button:focus-visible {
 	border-bottom: 2px solid var(--m-danger);
 }
 
+/* Merge-conflict block decoration. Two line classes:
+   - `cm-conflict-block` — every line of an unresolved conflict
+     range gets a soft warning tint so the eye can frame the
+     block at a glance.
+   - `cm-conflict-marker-line` — the `<<<<<<<` / `=======` /
+     `|||||||` / `>>>>>>>` lines themselves get a stronger tint
+     plus a left bar, so the structure of the block reads
+     without having to count `<` characters.
+   Both rules paint via `box-shadow` on the line element so they
+   stack with selection / active-line backgrounds instead of
+   stomping them. */
+.cm-line.cm-conflict-block {
+	background: color-mix(in srgb, var(--m-warning) 7%, transparent);
+}
+.cm-line.cm-conflict-marker-line {
+	background: color-mix(in srgb, var(--m-warning) 18%, transparent);
+	box-shadow: inset 2px 0 0 var(--m-warning);
+	font-weight: 600;
+}
+/* Per-block "Accept current / incoming / both" toolbar widget,
+   anchored at end-of-line on the opening `<<<<<<<`. Inline-block
+   so the marker line's text reflow stays sane on narrow widths;
+   the buttons themselves are flat affordances tinted by the
+   warning palette. */
+.cm-conflict-toolbar {
+	display: inline-flex;
+	gap: 4px;
+	margin-left: 12px;
+	vertical-align: middle;
+}
+.cm-conflict-btn {
+	appearance: none;
+	background: color-mix(in srgb, var(--m-warning) 18%, transparent);
+	color: var(--m-warning);
+	border: 1px solid color-mix(in srgb, var(--m-warning) 50%, transparent);
+	border-radius: 4px;
+	padding: 1px 8px;
+	font-size: 11px;
+	font-family: var(--m-font-mono);
+	cursor: pointer;
+	line-height: 1.4;
+}
+.cm-conflict-btn:hover {
+	background: color-mix(in srgb, var(--m-warning) 30%, transparent);
+}
+.cm-conflict-btn:focus-visible {
+	outline: 2px solid var(--m-warning);
+	outline-offset: 2px;
+}
+
 /* Git-change overview ruler. A thin column pinned to the editor's
    right edge, overlaying the native scrollbar, where every change
    in the file is plotted at its scaled vertical position. Invisible

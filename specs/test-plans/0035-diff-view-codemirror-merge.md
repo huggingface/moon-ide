@@ -72,7 +72,7 @@ Prerequisites: `bun install`, `bun run tauri dev`, a bound git-repo folder (moon
 
 ## Known limitations
 
-- No conflict-marker UI yet (`<<<<<<<` / `>>>>>>>` blocks render as plain text on both sides). When we wire conflict resolution we'll layer that on top of the same `MergeView`.
+- ~~No conflict-marker UI yet (`<<<<<<<` / `>>>>>>>` blocks render as plain text on both sides).~~ Shipped in Phase 5 §5.6 (test plan 0088), but on the **regular editor**, not the `MergeView` — the decoration + accept widgets live in `editor/conflictMarkers.ts` and ride the normal single-pane editor. The MergeView still renders the markers as plain text on both sides; we never had a reason to duplicate the decorator there because conflict resolution happens in the regular editor.
 - The right side has no LSP wiring. Diagnostics, hover, completion, goto-definition all live on the regular editor tab — open it side-by-side or `Alt+Left` to it. We avoided opening the same path through two CM views with separate `didOpen` round-trips; revisit if the team actually wants in-place LSP on the diff side.
 - Inline blame isn't on the diff tab either, by the same reasoning. The right side is a working buffer; blame is a regular-editor concern.
 - The revert-arrow control only flows HEAD → working tree (`revertControls: 'a-to-b'`). No "promote my edit into HEAD" — that would mean staging, which we haven't built.

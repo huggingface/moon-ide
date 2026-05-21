@@ -191,12 +191,15 @@ export type ThemeMode = 'system' | 'dark' | 'light';
 export type SystemTheme = 'dark' | 'light' | 'unspecified';
 
 /**
- * One path's git status. The vocabulary matches Pierre Trees' own
- * `GitStatus` type so frontend code can pass `GitStatusEntry[]`
- * straight through to `tree.setGitStatus`. Mirrors
- * `moon_protocol::git::GitFileStatus`.
+ * One path's git status. Five of the six tokens (`added`, `modified`,
+ * `deleted`, `untracked`, `ignored`) match Pierre Trees' built-in
+ * `GitStatus` so frontend code can pass `GitStatusEntry[]` straight
+ * through to `tree.setGitStatus`. The sixth (`conflicted`) is
+ * unique to us — Pierre's own enum doesn't carry it — and the
+ * `FileTree` component overlays a separate "!" badge for rows that
+ * report it. Mirrors `moon_protocol::git::GitFileStatus`.
  */
-export type GitFileStatus = 'added' | 'modified' | 'deleted' | 'untracked' | 'ignored';
+export type GitFileStatus = 'added' | 'modified' | 'deleted' | 'untracked' | 'ignored' | 'conflicted';
 
 /**
  * One row's git classification. `path` follows the usual trailing-
@@ -221,6 +224,20 @@ export type GitChangeSummary = {
 	added: number;
 	modified: number;
 	deleted: number;
+};
+
+/**
+ * Snapshot of an in-flight merge for the SCM panel. The panel
+ * reshapes itself (header pill, "Commit merge" / "Abort merge"
+ * buttons, hidden sync controls) when `inProgress` is `true`.
+ * Mirrors `moon_protocol::git::GitMergeState`. See the Rust doc
+ * for the field-by-field contract.
+ */
+export type GitMergeState = {
+	inProgress: boolean;
+	mergingRef: string | null;
+	defaultMessage: string | null;
+	unmergedPaths: string[];
 };
 
 /**

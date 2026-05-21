@@ -451,12 +451,81 @@ adding `!.git/` via `OverrideBuilder` on top of the existing
 `.gitignore` exclusions (`node_modules/`, `target/`, …) keep
 being respected for repos.
 
+### 5.6 — Merge conflict resolution
+
+**Status**: shipped — see `specs/test-plans/0088-merge-conflict-resolution.md`.
+
+Closes the long-standing "merge errors dead-end at a flash toast"
+gap that plans 0021 / 0035 / 0053 / 0065 all flagged as deferred.
+End-to-end the user flow is now:
+
+1. `git merge` fails (from "Update from main" or any external
+   gesture). The fs-watcher sees `.git/MERGE_HEAD` appear and
+   the SCM panel shifts into **merge-in-progress mode**: a
+   `Merging <ref>` pill in the header, the composer prefilled
+   from `.git/MERGE_MSG`, the regular split-button toggles
+   (amend, commit-to-new-branch) hidden, and the
+   sync / publish / update-from-main buttons hidden so the
+   user can't accidentally compound the mess.
+2. Conflicted rows in the file tree carry an extra `!` badge
+   via Pierre's `renderRowDecoration` callback, on top of
+   whatever colour Pierre paints for the row's regular status
+   (typically `modified`).
+3. The editor decorates `<<<<<<<` / `|||||||` / `=======` /
+   `>>>>>>>` blocks with a soft warning tint and an inline
+   widget toolbar (`Accept current` / `Accept incoming` /
+   `Accept both`) on the opening marker line. Each accept
+   button rewrites the block in place; the user can also edit
+   manually.
+4. Saving a file whose conflict markers are gone runs `git add`
+   under the hood, so the row's conflict badge clears the
+   moment the bytes hit disk — no manual staging gesture
+   needed (consistent with the "we don't expose the index"
+   stance the rest of the SCM panel takes).
+5. The reshaped commit row offers **Commit merge** and **Abort
+   merge** side by side. Commit merge runs the regular
+   `git_commit` path (which produces a two-parent merge commit
+   when `MERGE_HEAD` is present). Abort merge runs `git merge
+--abort`. Commit merge is disabled while
+   `gitMergeState.unmergedPaths` is non-empty; an
+   "N files still have unresolved conflicts" hint surfaces
+   under the row.
+6. **Soft warn on residual marker text.** If the user clicks
+   "Commit merge" while git's unmerged list is empty but a
+   tracked file still contains a column-0 `<<<<<<<` /
+   `=======` / `>>>>>>>` line, a confirm dialog lists the
+   offenders before letting the commit through. Catches the
+   "user marked it resolved by `git add` from a terminal
+   without actually editing" footgun.
+
+Architecturally:
+
+- `GitFileStatus` gains a `Conflicted` variant. The porcelain
+  mapper recognises `UU` / `AU` / `UA` / `DD` / `AA` / `UD` /
+  `DU`. Pierre's own enum doesn't include conflicts, so the
+  frontend maps the value to `'modified'` for `setGitStatus`
+  and layers the badge separately — Pierre's row colour stays
+  consistent with the rest of the change vocabulary.
+- New `GitMergeState` DTO + `git_merge_state` /
+  `git_merge_abort` host methods. Both serialise via the
+  per-folder git mutex (ADR 0015). `git_merge_state` reads
+  `.git/MERGE_HEAD` + `.git/MERGE_MSG` and runs `git ls-files
+--unmerged` for the path list.
+- New `git_add_paths` host method for the auto-stage-on-save
+  hook. Same lexical containment as `git_restore_paths`.
+- The fs-watcher's `.git/` whitelist grew from "just HEAD" to
+  also surface `.git/MERGE_HEAD` and `.git/MERGE_MSG`. The
+  frontend's `bindFolderChangeRefresh` listener kicks
+  `refreshGitMergeState` when either path appears in the
+  batch, so the panel reshapes itself live without a poll.
+- New CodeMirror extension `editor/conflictMarkers.ts`
+  decorates blocks and renders the accept-toolbar widget.
+  Gated on a `conflictedFacet`; the decorator is inert on
+  every regular buffer (a clean file that happens to contain
+  the marker syntax — e.g. this file — never paints).
+
 ## Still outstanding
 
-- **Conflict markers.** Tree row state when a file is in conflict
-  (`UU`, `AU`, etc.). Probably surfaces as a fourth Pierre
-  status colour plus an editor gutter widget; the SCM panel's
-  conflict-resolution flow is what drives the design.
 - **Per-hunk stage / discard.** Today's `Revert all` /
   `Discard changes` are file-level only. Per-hunk requires the
   diff view to surface a chooser; the architecture doesn't

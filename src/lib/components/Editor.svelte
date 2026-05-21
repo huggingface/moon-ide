@@ -23,6 +23,7 @@
 	import { lspRenameExtension } from '../editor/lspRename';
 	import { blameExtension, blameFacet } from '../editor/blame';
 	import { gitChangesExtension, goToNextChange, goToPreviousChange, headTextFacet } from '../editor/gitChanges';
+	import { conflictedFacet, conflictMarkersExtension } from '../editor/conflictMarkers';
 	import { workspace, type OpenFile, type SplitSide } from '../state.svelte';
 	import { languageFor } from '../editor/language';
 	import { moonEditorTheme } from '../editor/theme';
@@ -66,6 +67,11 @@
 	// value and the StateField re-runs its line diff on the next
 	// transaction.
 	const headCompartment = new Compartment();
+	// Conflicted-or-not facet: feeds the conflict-marker decorator.
+	// Separate compartment so `gitStatusEntries` swings (a save
+	// clearing the unmerged status, the user accepting a side via
+	// the widget) reconfigure exactly this one extension.
+	const conflictedCompartment = new Compartment();
 	// Soft-wrap toggle. Holds either `EditorView.lineWrapping` (when
 	// `workspace.lineWrap` is on) or an empty extension array (off,
 	// the default). A single window-global toggle drives every
@@ -387,6 +393,24 @@
 		});
 	});
 
+	// Pipe `gitStatusEntries[path].status === 'conflicted'` into
+	// the conflict-marker decorator so the buffer's `<<<<<<<`
+	// blocks light up exactly when the file is mid-merge — and
+	// stop the moment the user resolves it (the auto-stage hook
+	// in `saveActive` flips the row's status back to `modified`).
+	$effect(() => {
+		const v = view;
+		if (!v) {
+			return;
+		}
+		const conflicted = workspace.gitStatusEntries.some(
+			(entry) => entry.path === file.path && entry.status === 'conflicted',
+		);
+		v.dispatch({
+			effects: conflictedCompartment.reconfigure(conflictedFacet.of(conflicted)),
+		});
+	});
+
 	// Consume a pending jump (Ctrl/Cmd-click on an identifier lands
 	// here): `workspace.jumpTo` stashed the target position, and the
 	// Editor that ends up owning `file.path` applies the selection
@@ -556,6 +580,17 @@
 			// or the SCM panel's diff column.
 			gitChangesExtension(),
 			headCompartment.of(headTextFacet.of(workspace.headByPath.get(file.path) ?? null)),
+			// Merge-conflict-marker decorator. Stays inert on every
+			// regular buffer; `conflictedCompartment` flips it on
+			// when the active folder's `gitStatusEntries` reports
+			// the path as `conflicted`. See
+			// `src/lib/editor/conflictMarkers.ts`.
+			conflictMarkersExtension(),
+			conflictedCompartment.of(
+				conflictedFacet.of(
+					workspace.gitStatusEntries.some((entry) => entry.path === file.path && entry.status === 'conflicted'),
+				),
+			),
 			// Ctrl+Space → LSP only. Local autocomplete (Ctrl+T / palette) patches
 			// the buffer directly — it is not a CodeMirror completion source.
 			//

@@ -517,12 +517,20 @@ fn path_has_excluded_component(path: &Path) -> bool {
 /// (a single commit writes dozens of ref / index / log files) and
 /// `Access` events (read-only stat bumps from rust-analyzer,
 /// tsgo, anything walking `.gitignore`) — neither moves what the
-/// tree should render. The one `.git/` exception is `.git/HEAD`
-/// itself: external `git switch` / `git checkout <branch>` writes
-/// no working-tree files when the new branch's content matches
-/// the old one's, but always rewrites `.git/HEAD`. Letting that
-/// path through is how the SCM panel's branch label notices the
-/// terminal flipped to a different branch.
+/// tree should render. The `.git/` exceptions are the small set
+/// of top-level files the SCM panel observes:
+///
+///   - `.git/HEAD` — external `git switch` / `git checkout
+///     <branch>` writes no working-tree files when the new
+///     branch's content matches the old one's, but always
+///     rewrites `.git/HEAD`. Letting it through is how the SCM
+///     panel's branch label notices the terminal flipped to a
+///     different branch.
+///   - `.git/MERGE_HEAD` + `.git/MERGE_MSG` — these appear when
+///     `git merge` starts and disappear when it commits / aborts.
+///     Surfacing them lets `refreshGitMergeState` snap the SCM
+///     panel into / out of merge-in-progress mode without the
+///     user clicking anything.
 ///
 /// Surviving paths are made workspace-relative before storage;
 /// anything outside the current root is dropped so we don't
@@ -551,7 +559,7 @@ fn collect_event_paths(
 	};
 	let mut took_a_path = false;
 	for raw in &event.paths {
-		if is_in_dotgit(raw) && !is_dotgit_head(raw) {
+		if is_in_dotgit(raw) && !is_dotgit_observed_top_level(raw) {
 			continue;
 		}
 		// Belt-and-braces. The walker excludes `node_modules` so
@@ -587,17 +595,22 @@ fn collect_event_paths(
 	}
 }
 
-/// `true` for the watched `.git/HEAD` file specifically. We
-/// match by the last two path components rather than full-path
-/// equality so worktrees rooted at any depth match — and so we
-/// don't accidentally pick up `.git/refs/heads/HEAD`-style
-/// paths the day someone introduces them.
-fn is_dotgit_head(path: &Path) -> bool {
+/// `true` for the small set of `.git/` top-level files the
+/// frontend cares about: `HEAD` (external branch switches),
+/// `MERGE_HEAD` + `MERGE_MSG` (start / abort / finish of a
+/// merge), and `index` (commit / restore — though most consumers
+/// pick that up via the normal worktree events; harmless to let
+/// through). We match by the last two path components rather
+/// than full-path equality so worktrees rooted at any depth
+/// match — and so we don't accidentally pick up
+/// `.git/refs/heads/HEAD`-style paths.
+fn is_dotgit_observed_top_level(path: &Path) -> bool {
 	let mut components = path.components().rev();
 	let Some(last) = components.next() else {
 		return false;
 	};
-	if last.as_os_str() != "HEAD" {
+	let last = last.as_os_str();
+	if last != "HEAD" && last != "MERGE_HEAD" && last != "MERGE_MSG" {
 		return false;
 	}
 	let Some(parent) = components.next() else {

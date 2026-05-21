@@ -3,7 +3,7 @@ use moon_core::{read_host_file, write_host_file};
 use moon_protocol::fs::{CollectPathsResult, DirEntry, ReadFileResult, StatResult, WriteFileResult};
 use moon_protocol::git::{
 	BranchDiffStatus, BranchList, BranchSwitchTarget, GitBranchInfo, GitChangeSummary, GitCommitResult, GitFileBlame,
-	GitFileStatus, GitStatusEntry, PrListScope,
+	GitFileStatus, GitMergeState, GitStatusEntry, PrListScope,
 };
 use moon_protocol::MoonError;
 use tauri::State;
@@ -238,6 +238,17 @@ pub async fn fs_git_restore_paths(state: State<'_, AppState>, paths: Vec<String>
 	entry.host.git_restore_paths(&paths).await
 }
 
+/// `git add -- <paths>` for the active folder. The merge-
+/// resolution flow uses this to auto-clear a file's unmerged
+/// index entry once the user saves it without conflict markers
+/// — without it the row would keep its conflict badge until the
+/// commit step's `git add -A` ran.
+#[tauri::command]
+pub async fn fs_git_add_paths(state: State<'_, AppState>, paths: Vec<String>) -> Result<(), MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.git_add_paths(&paths).await
+}
+
 /// Per-line blame for `path`. Returns `None` (serialised as `null`)
 /// for anything that isn't a tracked file inside a git repo; the
 /// frontend treats a null response as "no inline annotation".
@@ -375,6 +386,28 @@ pub async fn fs_git_pull(state: State<'_, AppState>) -> Result<(), MoonError> {
 pub async fn fs_git_merge_default_branch(state: State<'_, AppState>, remote_ref: String) -> Result<(), MoonError> {
 	let entry = state.workspaces.require_active_folder().await?;
 	entry.host.git_merge_default_branch(&remote_ref).await
+}
+
+/// Snapshot of the active folder's in-flight merge for the SCM
+/// panel: whether `.git/MERGE_HEAD` exists, the ref being merged,
+/// `.git/MERGE_MSG`, and the unmerged-path list. Cheap to poll —
+/// the panel calls it on mount, after every git op that could
+/// change merge state, and whenever the fs-watcher reports a
+/// write inside `.git/`.
+#[tauri::command]
+pub async fn fs_git_merge_state(state: State<'_, AppState>) -> Result<GitMergeState, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.git_merge_state().await
+}
+
+/// `git merge --abort` for the active folder. The SCM panel
+/// exposes this as "Abort merge" when a merge is in progress;
+/// failures (no merge in progress, dirty pre-merge state) propagate
+/// git's stderr verbatim.
+#[tauri::command]
+pub async fn fs_git_merge_abort(state: State<'_, AppState>) -> Result<(), MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.git_merge_abort().await
 }
 
 /// Recent local branches + open GitHub PRs for the branch-switcher

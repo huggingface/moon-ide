@@ -109,7 +109,25 @@
 	// git ops in parallel is a recipe for "what just happened
 	// to my working tree".
 	let merging = $state(false);
-	let busy = $derived(committing || syncing || merging);
+	// `git merge --abort` gets its own flag for the same reason
+	// commit / sync / merge do — the button needs a spinner that
+	// doesn't piggy-back on a sibling op's busy state. Aborting
+	// is short (one git invocation, no hooks) but the user is in
+	// a "did this work?" frame of mind during a conflict, so the
+	// affordance has to feel definite.
+	let aborting = $state(false);
+	let busy = $derived(committing || syncing || merging || aborting);
+
+	// Master switch for the merge-in-progress UI shape. Reading
+	// off `workspace.gitMergeState.inProgress` keeps every
+	// reshape (header pill, hidden sync buttons, commit-row
+	// label swap) on a single source of truth that the fs-watcher
+	// drives. The `Merging <ref>` pill prefers `mergingRef`;
+	// `mergingRef` itself falls back to a short SHA inside the
+	// backend, so a missing ref never blanks the pill.
+	const mergeMode = $derived(workspace.gitMergeState.inProgress);
+	const unmergedCount = $derived(workspace.gitMergeState.unmergedPaths.length);
+	const mergeRefLabel = $derived(workspace.gitMergeState.mergingRef ?? 'merge');
 	let textarea: HTMLTextAreaElement | undefined = $state();
 
 	// Tracks the bytes we wrote into `workspace.commitDraft` from
@@ -121,6 +139,14 @@
 	// types or the AI suggestion lands — those are user-driven
 	// values, not the prefill.
 	let amendPrefill = $state('');
+
+	// Tracks the bytes we wrote into `workspace.commitDraft`
+	// from `.git/MERGE_MSG` when the panel entered merge-in-
+	// progress mode with an empty composer. Same shape as
+	// `amendPrefill`: the abort handler only clears the
+	// composer when the bytes still match the prefill, so a
+	// user-typed message during resolution survives the abort.
+	let mergePrefill = $state('');
 
 	// "Commit to new branch" inline form. `newBranchOpen` toggles
 	// the branch-name input row visible above the commit button;
@@ -139,8 +165,19 @@
 
 	// Amend-with-empty-message is valid (preserve previous
 	// subject); fresh commits still need a message. Push and pull
-	// buttons just need "not currently busy".
-	const canCommit = $derived(!busy && (amend || workspace.commitDraft.trim().length > 0));
+	// buttons just need "not currently busy". In merge-mode the
+	// gate adds "no unresolved conflicts remain" — git itself
+	// would refuse the commit otherwise, but disabling the button
+	// is the better surface.
+	const canCommit = $derived.by(() => {
+		if (busy) {
+			return false;
+		}
+		if (mergeMode) {
+			return unmergedCount === 0 && workspace.commitDraft.trim().length > 0;
+		}
+		return amend || workspace.commitDraft.trim().length > 0;
+	});
 
 	// "Commit to new branch" requires both a non-empty message and
 	// a non-empty branch name; amend doesn't apply (you can't
@@ -160,6 +197,9 @@
 	// backend; the label is the user-facing signal that "this
 	// gesture will do that thing".
 	const commitButtonLabel = $derived.by(() => {
+		if (mergeMode) {
+			return 'Commit merge';
+		}
 		if (newBranchOpen) {
 			return 'Commit to new branch';
 		}
@@ -504,11 +544,77 @@
 	}
 
 	async function onCommitClick() {
+		if (mergeMode) {
+			await commitMerge();
+			return;
+		}
 		if (newBranchOpen) {
 			await commitOnNewBranch();
 			return;
 		}
 		await commit();
+	}
+
+	/**
+	 * Finish the in-flight merge by committing the resolved tree.
+	 * The composer's bytes ride the regular `git_commit` path
+	 * server-side; with `.git/MERGE_HEAD` present, git produces a
+	 * two-parent merge commit. `workspace.commitMerge` handles
+	 * the post-success refresh + scm-filter reset.
+	 */
+	async function commitMerge() {
+		if (!canCommit) {
+			return;
+		}
+		committing = true;
+		try {
+			const ok = await workspace.commitMerge(workspace.commitDraft);
+			if (ok) {
+				workspace.commitDraft = '';
+				mergePrefill = '';
+				amend = false;
+				amendPrefill = '';
+				await tick();
+				autoSize();
+			}
+		} finally {
+			committing = false;
+			textarea?.focus();
+		}
+	}
+
+	/**
+	 * Abort the in-flight merge. Destructive (wipes whatever
+	 * conflict-resolution edits the user staged so far), but
+	 * cheaper to invoke than to undo by hand — the user can
+	 * always retry the merge. No confirm modal: the button label
+	 * is unambiguous, and stashing on cancel would require its
+	 * own UX. If a confirmation step turns out to be missed in
+	 * practice we'll add it then.
+	 */
+	async function abortMerge() {
+		if (busy) {
+			return;
+		}
+		aborting = true;
+		try {
+			const ok = await workspace.abortMerge();
+			if (ok) {
+				// Composer carried `MERGE_MSG`'s prefill or
+				// whatever the user typed during resolution.
+				// Either way it's no longer relevant once
+				// the merge is gone.
+				if (workspace.commitDraft === mergePrefill || mergePrefill.length === 0) {
+					workspace.commitDraft = '';
+				}
+				mergePrefill = '';
+				await tick();
+				autoSize();
+			}
+		} finally {
+			aborting = false;
+			textarea?.focus();
+		}
 	}
 
 	async function suggestBranchName() {
@@ -658,7 +764,7 @@
 	function onKeydown(event: KeyboardEvent) {
 		if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.isComposing) {
 			event.preventDefault();
-			void commit();
+			void onCommitClick();
 			return;
 		}
 		if (event.key === 'Escape' && workspace.commitDraft.length > 0) {
@@ -702,6 +808,34 @@
 	$effect(() => {
 		void workspace.commitDraft;
 		autoSize();
+	});
+
+	// Merge-in-progress prefill. When the panel notices a fresh
+	// merge (`mergeMode` flipped on, no draft yet), seed the
+	// composer with `.git/MERGE_MSG` — git's own default merge
+	// commit message — so the user only has to edit if they
+	// disagree. Same shape as the amend prefill: stamp the bytes
+	// into both the draft and `mergePrefill` so the abort
+	// handler can tell whether the user touched it.
+	$effect(() => {
+		const state = workspace.gitMergeState;
+		if (!state.inProgress) {
+			// Coming out of merge mode: drop the prefill marker
+			// so a later, unrelated draft change doesn't
+			// accidentally match a stale value.
+			mergePrefill = '';
+			return;
+		}
+		if (workspace.commitDraft.length > 0) {
+			return;
+		}
+		const msg = state.defaultMessage;
+		if (msg === null || msg.trim().length === 0) {
+			return;
+		}
+		workspace.commitDraft = msg;
+		mergePrefill = msg;
+		void tick().then(autoSize);
 	});
 
 	// Post-flush marker for folder-swap profiling: fires after the
@@ -784,6 +918,21 @@
 						vs {compareLabel}
 					</button>
 				{/if}
+				{#if mergeMode}
+					<!-- Status pill that announces "you are inside a merge". Click
+					     is no-op; the affordances live in the reshaped commit row
+					     below. Warning colour distinguishes the pill from the
+					     regular compare-baseline / changes pills. -->
+					<span
+						class="merge-pill"
+						title={unmergedCount > 0
+							? `Merging ${mergeRefLabel} — ${unmergedCount} unresolved`
+							: `Merging ${mergeRefLabel} — ready to commit`}
+						aria-label={`Merge in progress: ${mergeRefLabel}`}
+					>
+						Merging {mergeRefLabel}
+					</span>
+				{/if}
 				{#if changeCount > 0 || workspace.scmFilterOn}
 					<button
 						type="button"
@@ -812,7 +961,11 @@
 			class="input"
 			class:input-with-ai={coder.signedIn}
 			rows="1"
-			placeholder={amend ? 'Amend message (leave empty to keep)' : 'Commit message'}
+			placeholder={mergeMode
+				? 'Merge commit message'
+				: amend
+					? 'Amend message (leave empty to keep)'
+					: 'Commit message'}
 			aria-label="Commit message"
 			disabled={busy}
 			onkeydown={onKeydown}
@@ -835,7 +988,7 @@
 			</button>
 		{/if}
 	</div>
-	{#if newBranchOpen}
+	{#if newBranchOpen && !mergeMode}
 		<div class="new-branch-row">
 			<input
 				bind:this={newBranchInput}
@@ -869,13 +1022,26 @@
 			{/if}
 		</div>
 	{/if}
-	<!-- Single split-button "[Commit ...] [⎇] [✎]". The main label
-	     flips between Commit / Amend / Commit to new branch as the
-	     toggles change; the toggle icons live to its right and
-	     visually share its border. Branch + amend are mutually
-	     exclusive, enforced by `setAmend` / `setNewBranch`. -->
+	<!-- Commit row. Two shapes:
+
+	     - Regular: split-button "[Commit ...] [⎇] [✎]" with the
+	       new-branch + amend toggles, plus the main label flipping
+	       between Commit / Amend / Commit to new branch.
+	     - Merge-in-progress: paired "[Commit merge] [Abort merge]"
+	       buttons. The toggles drop out (amending into a new
+	       branch mid-merge isn't a coherent gesture), and the
+	       unresolved-conflict count surfaces as a hint below
+	       when the user can't yet commit. -->
 	<div class="commit-row" class:busy>
-		<button type="button" class="commit-btn" title={commitButtonLabel} disabled={!canSubmit} onclick={onCommitClick}>
+		<button
+			type="button"
+			class="commit-btn"
+			title={mergeMode && unmergedCount > 0
+				? `${unmergedCount} unresolved conflict${unmergedCount === 1 ? '' : 's'} — edit the file${unmergedCount === 1 ? '' : 's'} to resolve, then save`
+				: commitButtonLabel}
+			disabled={!canSubmit}
+			onclick={onCommitClick}
+		>
 			{#if committing}
 				<!-- Spinner only fires on actual commit (or revert,
 				     which borrows the same flag). Sync / publish
@@ -887,34 +1053,59 @@
 			{/if}
 			<span class="commit-btn-label">{commitButtonLabel}</span>
 		</button>
-		<button
-			type="button"
-			class="commit-btn-toggle"
-			class:active={newBranchOpen}
-			title={newBranchOpen
-				? 'Cancel commit-to-new-branch'
-				: 'Commit on a new branch (creates a fresh branch from HEAD)'}
-			aria-label={newBranchOpen ? 'Cancel commit-to-new-branch' : 'Commit on a new branch'}
-			aria-pressed={newBranchOpen}
-			disabled={busy}
-			onclick={() => void setNewBranch(!newBranchOpen)}
-		>
-			<BranchIcon size={12} />
-		</button>
-		<button
-			type="button"
-			class="commit-btn-toggle"
-			class:active={amend}
-			title={amend ? 'Amend HEAD on next commit (click to disable)' : 'Amend HEAD on next commit'}
-			aria-label={amend ? 'Amend mode on' : 'Toggle amend mode'}
-			aria-pressed={amend}
-			disabled={busy}
-			onclick={() => void setAmend(!amend)}
-		>
-			<span aria-hidden="true">✎</span>
-		</button>
+		{#if mergeMode}
+			<button
+				type="button"
+				class="commit-btn-toggle merge-abort"
+				title={`Abort the merge and restore the pre-merge working tree (git merge --abort)`}
+				aria-label="Abort merge"
+				disabled={busy}
+				onclick={() => void abortMerge()}
+			>
+				{#if aborting}
+					<span class="spinner" aria-hidden="true"></span>
+				{:else}
+					<span aria-hidden="true">✕</span>
+				{/if}
+			</button>
+		{:else}
+			<button
+				type="button"
+				class="commit-btn-toggle"
+				class:active={newBranchOpen}
+				title={newBranchOpen
+					? 'Cancel commit-to-new-branch'
+					: 'Commit on a new branch (creates a fresh branch from HEAD)'}
+				aria-label={newBranchOpen ? 'Cancel commit-to-new-branch' : 'Commit on a new branch'}
+				aria-pressed={newBranchOpen}
+				disabled={busy}
+				onclick={() => void setNewBranch(!newBranchOpen)}
+			>
+				<BranchIcon size={12} />
+			</button>
+			<button
+				type="button"
+				class="commit-btn-toggle"
+				class:active={amend}
+				title={amend ? 'Amend HEAD on next commit (click to disable)' : 'Amend HEAD on next commit'}
+				aria-label={amend ? 'Amend mode on' : 'Toggle amend mode'}
+				aria-pressed={amend}
+				disabled={busy}
+				onclick={() => void setAmend(!amend)}
+			>
+				<span aria-hidden="true">✎</span>
+			</button>
+		{/if}
 	</div>
-	{#if needsPublish}
+	{#if mergeMode && unmergedCount > 0}
+		<div class="merge-hint" role="status">
+			{unmergedCount}
+			file{unmergedCount === 1 ? '' : 's'} still
+			{unmergedCount === 1 ? 'has' : 'have'}
+			unresolved conflict{unmergedCount === 1 ? '' : 's'}.
+		</div>
+	{/if}
+	{#if !mergeMode && needsPublish}
 		<button
 			type="button"
 			class="sync-btn"
@@ -930,7 +1121,7 @@
 				<span class="sync-btn-arrow" aria-hidden="true">↑</span>
 			{/if}
 		</button>
-	{:else if canSync}
+	{:else if !mergeMode && canSync}
 		<button type="button" class="sync-btn" title={busy ? 'Syncing changes…' : syncTitle} disabled={busy} onclick={sync}>
 			<span class="sync-btn-icon" class:rotating={busy}><RefreshIcon size={12} /></span>
 			<span class="sync-btn-label">{busy ? 'Syncing…' : 'Sync Changes'}</span>
@@ -946,7 +1137,7 @@
 			{/if}
 		</button>
 	{/if}
-	{#if canMergeDefault && defaultBranchShortName !== null}
+	{#if !mergeMode && canMergeDefault && defaultBranchShortName !== null}
 		<!-- "Update from main" — separate button from sync because
 		     the underlying op is `git merge origin/main` against the
 		     *current* branch, not a pull of the current branch's
@@ -1468,6 +1659,49 @@
 	}
 	.compare-pill.active:hover {
 		filter: brightness(0.95);
+	}
+	/* "Merging <ref>" pill, only present while
+	   `workspace.gitMergeState.inProgress`. Warning palette
+	   distinguishes it from the regular changes-count + compare
+	   pills — the user is in a do-something-now state and the
+	   chrome should make that obvious. Inert (no hover / click);
+	   the actions live in the commit row below. */
+	.merge-pill {
+		display: inline-flex;
+		align-items: center;
+		height: 20px;
+		padding: 0 8px;
+		border: 1px solid color-mix(in srgb, var(--m-warning) 60%, transparent);
+		border-radius: 999px;
+		background: color-mix(in srgb, var(--m-warning) 14%, transparent);
+		color: var(--m-warning);
+		font-size: 10px;
+		font-family: var(--m-font-mono);
+		text-transform: lowercase;
+		letter-spacing: 0.04em;
+		white-space: nowrap;
+	}
+	/* Abort-merge button — sits in the commit-row toggle slot
+	   during merge mode. Same footprint as the regular toggles
+	   (so the row width stays stable when the panel flips
+	   modes), but loud danger colouring so it can't be confused
+	   with the harmless `✎` amend toggle. */
+	.commit-btn-toggle.merge-abort {
+		color: var(--m-danger);
+	}
+	.commit-btn-toggle.merge-abort:hover:not(:disabled) {
+		background: color-mix(in srgb, var(--m-danger) 14%, transparent);
+		color: var(--m-danger);
+	}
+	/* "N files still have unresolved conflicts" hint under the
+	   merge-mode commit row. Quiet (small, muted) so it informs
+	   without yelling — the buttons above already carry the
+	   loud signal. */
+	.merge-hint {
+		margin-top: 6px;
+		padding: 0 2px;
+		font-size: 11px;
+		color: var(--m-warning);
 	}
 	/* Full-width sync button beneath the composer — the unified
 	   alternative to separate push/pull icons. Hidden when the

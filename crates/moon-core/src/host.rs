@@ -10,7 +10,7 @@ use moon_protocol::editorconfig::EditorConfig;
 use moon_protocol::fs::{CollectPathsResult, DirEntry, EntryKind, ReadFileResult, StatResult, WriteFileResult};
 use moon_protocol::git::{
 	BranchDiffStatus, BranchList, BranchListEntry, BranchSwitchTarget, GitBranchInfo, GitCommitResult, GitFileBlame,
-	GitFileStatus, GitLineBlame, GitStatusEntry, PrListScope, PrListStatus,
+	GitFileStatus, GitLineBlame, GitMergeState, GitStatusEntry, PrListScope, PrListStatus,
 };
 use moon_protocol::{MoonError, MoonResult};
 use std::sync::Arc;
@@ -176,6 +176,21 @@ pub trait WorkspaceHost: Send + Sync {
 	/// a default between "unstage" and "delete".
 	async fn git_restore_paths(&self, paths: &[String]) -> MoonResult<()>;
 
+	/// `git add -- <paths>` — stage the given paths' current
+	/// working-tree content. Used by the merge-resolution flow
+	/// to auto-clear a file's unmerged index entry once the
+	/// user has saved it without conflict markers (saving alone
+	/// doesn't touch the index, so without this the SCM panel
+	/// would keep showing the row as conflicted until the
+	/// commit step's `git add -A` ran).
+	///
+	/// Errors propagate git's stderr; the merge-resolution
+	/// flow swallows them and lets the next status refresh
+	/// surface any persistent mismatch (the file genuinely
+	/// still has conflict markers, an index lock collision,
+	/// etc.).
+	async fn git_add_paths(&self, paths: &[String]) -> MoonResult<()>;
+
 	/// Per-line blame for a single tracked file. Returns `None` when
 	/// the path isn't inside a git repo, isn't tracked, or when the
 	/// `git` binary can't be found — the UI skips blame annotations
@@ -332,8 +347,41 @@ pub trait WorkspaceHost: Send + Sync {
 	/// to keep the remote-tracking ref current; this op never
 	/// fetches itself, matching the "merge means merge" contract
 	/// the button label sets up. Errors (conflicts, dirty tree,
-	/// unknown ref) propagate git's stderr verbatim.
+	/// unknown ref) propagate git's stderr verbatim — including
+	/// the `CONFLICT (content)` lines that the SCM panel uses to
+	/// shift into merge-in-progress mode after the call returns
+	/// (the panel then polls `git_merge_state`, which reads
+	/// `.git/MERGE_HEAD` directly).
 	async fn git_merge_default_branch(&self, remote_ref: &str) -> MoonResult<()>;
+
+	/// Snapshot of the working tree's in-flight merge — whether
+	/// one is in progress, the ref being merged, the default
+	/// commit message git wrote to `.git/MERGE_MSG`, and the
+	/// list of paths with unresolved conflicts.
+	///
+	/// Read from on-disk metadata (`.git/MERGE_HEAD`,
+	/// `.git/MERGE_MSG`) plus a single `git ls-files --unmerged`
+	/// — no `git status` invocation, so this is cheap to poll
+	/// when the SCM panel needs to refresh (after every
+	/// commit / restore / merge / abort gesture, and whenever the
+	/// fs-watcher reports a write inside `.git/`).
+	///
+	/// Returns the all-default value (`in_progress: false`) for
+	/// every "no merge to report" case: not a repo, git
+	/// unavailable, `MERGE_HEAD` missing. Real I/O errors (a
+	/// `MERGE_HEAD` we can't read, an `ls-files` failure)
+	/// downgrade to the same default — the panel should never
+	/// crash on a transient probe glitch.
+	async fn git_merge_state(&self) -> MoonResult<GitMergeState>;
+
+	/// `git merge --abort` — wind back an in-progress merge to
+	/// the pre-merge `HEAD`, restoring the working tree and
+	/// clearing `.git/MERGE_HEAD` / `.git/MERGE_MSG`. The SCM
+	/// panel's "Abort merge" button calls this when the user
+	/// decides the merge isn't worth resolving. Errors
+	/// (no merge in progress, dirty pre-merge state git
+	/// refuses to clobber) propagate stderr verbatim.
+	async fn git_merge_abort(&self) -> MoonResult<()>;
 
 	/// Subject + body of the current `HEAD` commit (`git log -1
 	/// --pretty=%B`). Used by the SCM panel to prefill the commit
@@ -1300,6 +1348,61 @@ impl WorkspaceHost for LocalHost {
 		Ok(())
 	}
 
+	async fn git_add_paths(&self, paths: &[String]) -> MoonResult<()> {
+		if paths.is_empty() {
+			return Ok(());
+		}
+		// Same lexical containment as `git_restore_paths` — we
+		// won't hand `..`-escaping or absolute strings to `git
+		// add`. Borrowed verbatim because the validation is the
+		// same and there's no third caller worth factoring it
+		// out for yet.
+		let mut rels = Vec::with_capacity(paths.len());
+		for raw in paths {
+			let trimmed = raw.trim_end_matches('/');
+			if trimmed.is_empty() {
+				continue;
+			}
+			let rel = Utf8PathBuf::from(trimmed);
+			if rel.is_absolute() {
+				return Err(MoonError::invalid(format!(
+					"git_add_paths rejects absolute path: {rel}"
+				)));
+			}
+			let mut depth = 0i32;
+			for seg in rel.components() {
+				match seg {
+					camino::Utf8Component::ParentDir => {
+						depth -= 1;
+						if depth < 0 {
+							return Err(MoonError::invalid(format!("git_add_paths rejects path escape: {rel}")));
+						}
+					}
+					camino::Utf8Component::Normal(_) => depth += 1,
+					camino::Utf8Component::CurDir => {}
+					camino::Utf8Component::Prefix(_) | camino::Utf8Component::RootDir => {
+						return Err(MoonError::invalid(format!("git_add_paths rejects rooted path: {rel}")));
+					}
+				}
+			}
+			rels.push(rel);
+		}
+		if rels.is_empty() {
+			return Ok(());
+		}
+		let guard = self.git_lock().await;
+		let root = self.root.clone();
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			let mut args = vec!["add", "--"];
+			let rel_strs: Vec<&str> = rels.iter().map(|r| r.as_str()).collect();
+			args.extend(rel_strs.iter().copied());
+			run_git_simple(&root, &args, "git add")
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_add_paths join error: {e}")))?
+	}
+
 	async fn git_blame(&self, path: &Utf8Path) -> MoonResult<Option<GitFileBlame>> {
 		// Path has to live inside the active folder — same lexical
 		// containment as `git_restore_paths`. We also refuse
@@ -1523,6 +1626,35 @@ impl WorkspaceHost for LocalHost {
 		})
 		.await
 		.map_err(|e| MoonError::Internal(format!("git_merge_default_branch join error: {e}")))?
+	}
+
+	async fn git_merge_state(&self) -> MoonResult<GitMergeState> {
+		// Holds the git mutex for the `ls-files` call. The
+		// MERGE_HEAD / MERGE_MSG reads are pure filesystem
+		// operations against `.git/` and don't need git's index
+		// lock, but bundling them under the same guard keeps
+		// the snapshot internally consistent — a concurrent
+		// `git merge --abort` can't half-clear the state from
+		// under us.
+		let guard = self.git_lock().await;
+		let root = self.root.clone();
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			Ok(read_git_merge_state(&root))
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_merge_state join error: {e}")))?
+	}
+
+	async fn git_merge_abort(&self) -> MoonResult<()> {
+		let guard = self.git_lock().await;
+		let root = self.root.clone();
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			run_git_simple(&root, &["merge", "--abort"], "git merge --abort")
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_merge_abort join error: {e}")))?
 	}
 
 	async fn git_fetch(&self) -> MoonResult<()> {
@@ -2474,6 +2606,147 @@ fn run_git_simple(root: &Utf8Path, args: &[&str], label: &str) -> MoonResult<()>
 		return Err(MoonError::IoError(format!("{label}: {combined}")));
 	}
 	Ok(())
+}
+
+/// Read the working tree's in-flight merge state. Pure I/O:
+///
+/// 1. `.git/MERGE_HEAD` existence drives `in_progress`. When it
+///    isn't there, every other field stays at its default and we
+///    skip the rest of the probes.
+/// 2. `.git/MERGE_HEAD`'s first line carries the SHA being
+///    merged in. We hand it to `git name-rev --name-only` to
+///    get back something human-recognisable (`origin/main`
+///    rather than 40 hex chars). Falls back to the short SHA
+///    when `name-rev` can't resolve a name — pathological case,
+///    but cheaper than panicking the UI.
+/// 3. `.git/MERGE_MSG` is git's default commit message for the
+///    merge (set the moment `git merge` is invoked). Used by
+///    the SCM panel to prefill the composer when the user
+///    enters merge-in-progress mode without a draft.
+/// 4. `git ls-files --unmerged -z` lists conflicted entries.
+///    A single conflicted file shows up three times (one per
+///    stage); we dedupe by path so the count matches what the
+///    SCM panel renders.
+///
+/// All probes are best-effort: an I/O failure on any one of
+/// them collapses that field to its default without dropping
+/// the others. The most common cause of a transient failure is
+/// a concurrent `git merge --abort` racing the read — by the
+/// next refresh tick the consistent post-abort state lands.
+fn read_git_merge_state(root: &Utf8Path) -> GitMergeState {
+	use std::process::Command;
+
+	let merge_head_path = root.join(".git").join("MERGE_HEAD");
+	let merge_head_raw = match std::fs::read_to_string(merge_head_path.as_std_path()) {
+		Ok(s) => s,
+		Err(_) => return GitMergeState::default(),
+	};
+	let merge_head = merge_head_raw
+		.lines()
+		.next()
+		.map(|s| s.trim().to_owned())
+		.unwrap_or_default();
+	if merge_head.is_empty() {
+		return GitMergeState::default();
+	}
+
+	// `name-rev --name-only` resolves a SHA to the closest
+	// ref-shaped name (`origin/main`, `tags/v1.2`, …).
+	// `--no-undefined` returns non-zero rather than the literal
+	// "undefined" placeholder when there's no resolvable name,
+	// which we'd rather fall through to the short SHA fallback
+	// for.
+	let merging_ref = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["name-rev", "--name-only", "--no-undefined", &merge_head])
+		.output()
+		.ok()
+		.filter(|o| o.status.success())
+		.and_then(|o| String::from_utf8(o.stdout).ok())
+		.map(|s| s.trim().to_owned())
+		.filter(|s| !s.is_empty())
+		.or_else(|| {
+			// Short-SHA fallback when `name-rev` declined.
+			// `rev-parse --short` is idempotent on an already-
+			// 40-char hex string, and on failure we just hand
+			// back the raw long SHA so the panel still has
+			// something to render.
+			Some(
+				Command::new("git")
+					.arg("-C")
+					.arg(root.as_std_path())
+					.args(["rev-parse", "--short", &merge_head])
+					.output()
+					.ok()
+					.filter(|o| o.status.success())
+					.and_then(|o| String::from_utf8(o.stdout).ok())
+					.map(|s| s.trim().to_owned())
+					.filter(|s| !s.is_empty())
+					.unwrap_or(merge_head.clone()),
+			)
+		});
+
+	let merge_msg_path = root.join(".git").join("MERGE_MSG");
+	let default_message = std::fs::read_to_string(merge_msg_path.as_std_path())
+		.ok()
+		.map(|s| s.trim_end_matches('\n').to_owned())
+		.filter(|s| !s.is_empty());
+
+	let unmerged_paths = list_unmerged_paths(root);
+
+	GitMergeState {
+		in_progress: true,
+		merging_ref,
+		default_message,
+		unmerged_paths,
+	}
+}
+
+/// `git ls-files --unmerged -z` — one record per index stage,
+/// `<mode> <sha> <stage>\tpath\0`. We only need the path; multiple
+/// stages for the same file collapse to a single entry because the
+/// SCM panel renders per-path, not per-stage.
+///
+/// Returns an empty vec on any failure (not a repo, git missing,
+/// no unmerged entries) — same "render no badges" fallback
+/// `read_git_merge_state` relies on.
+fn list_unmerged_paths(root: &Utf8Path) -> Vec<String> {
+	use std::process::Command;
+
+	let output = match Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["ls-files", "--unmerged", "-z"])
+		.output()
+	{
+		Ok(o) if o.status.success() => o,
+		_ => return Vec::new(),
+	};
+
+	// `-z` makes each record null-terminated and uses a tab
+	// between the metadata and the path. The metadata block is
+	// `<mode> <sha> <stage>`, so a `split_once('\t')` peels off
+	// the path. Dedupe with an ordered set so the surface stays
+	// deterministic across calls.
+	use std::collections::BTreeSet;
+	let mut paths: BTreeSet<String> = BTreeSet::new();
+	for record in output.stdout.split(|&b| b == 0) {
+		if record.is_empty() {
+			continue;
+		}
+		let Ok(text) = std::str::from_utf8(record) else {
+			continue;
+		};
+		let Some((_, path)) = text.split_once('\t') else {
+			continue;
+		};
+		if path.is_empty() {
+			continue;
+		}
+		paths.insert(path.replace('\\', "/"));
+	}
+	paths.into_iter().collect()
 }
 
 /// `git log -1 --pretty=%B` for the current `HEAD`. Returns the
@@ -4031,19 +4304,26 @@ fn classify_via_git_status(root: &Utf8Path) -> Option<Vec<GitStatusEntry>> {
 ///
 /// Each record is `XY<space>path\0` where `X` is the index status
 /// and `Y` the worktree status. We map that to a single label with
-/// this priority:
+/// this priority — **conflict codes dominate** so an unmerged row
+/// can't get masked by the file's other (modified / added) face:
 ///
-/// 1. Either column is `D` → `Deleted` (dominates so stage-then-
+/// 1. Unmerged combinations (`UU` / `AU` / `UA` / `DD` / `AA` /
+///    `UD` / `DU`) → `Conflicted`. Catches both content conflicts
+///    (`UU`) and the rarer add/add, modify/delete, delete/modify,
+///    and both-deleted variants. The SCM panel shifts into
+///    merge-in-progress mode based on `.git/MERGE_HEAD`, but
+///    `git ls-files --unmerged` agrees with these codes — the
+///    porcelain status is the canonical per-row signal.
+/// 2. Either column is `D` → `Deleted` (dominates so stage-then-
 ///    revert doesn't mask the on-disk state).
-/// 2. Either column is `A` → `Added` (staged-for-commit new file).
-/// 3. Either column is `M` / `T` → `Modified`.
-/// 4. `??` → `Untracked`.
-/// 5. `!!` → `Ignored`.
+/// 3. Either column is `A` → `Added` (staged-for-commit new file).
+/// 4. Either column is `M` / `T` → `Modified`.
+/// 5. `??` → `Untracked`.
+/// 6. `!!` → `Ignored`.
 ///
-/// Anything else (`UU` conflicts, `C` copies we didn't disable) is
-/// silently dropped — conflicts surface in the SCM panel per the
-/// roadmap, and we don't want a stray `copy` byte to paint an
-/// arbitrary row.
+/// Anything else (`C` copies we didn't disable, or any future code
+/// git introduces) is silently dropped — we'd rather skip a row
+/// than paint an arbitrary status on it.
 fn parse_porcelain_v1(buf: &[u8]) -> Vec<GitStatusEntry> {
 	let mut out = Vec::new();
 	// Porcelain records are `\0`-terminated but we can't just
@@ -4089,6 +4369,25 @@ fn parse_porcelain_v1(buf: &[u8]) -> Vec<GitStatusEntry> {
 }
 
 fn map_porcelain_status(x: char, y: char) -> Option<GitFileStatus> {
+	// Unmerged codes from `git status --porcelain` (see
+	// `gitstatus(5)` "Short Format" — the unmerged section):
+	//   D D  unmerged, both deleted
+	//   A U  unmerged, added by us
+	//   U D  unmerged, deleted by them
+	//   U A  unmerged, added by them
+	//   D U  unmerged, deleted by us
+	//   A A  unmerged, both added
+	//   U U  unmerged, both modified
+	// Match exhaustively rather than `x == 'U' || y == 'U'` so a
+	// hypothetical future code with a `U` on one side and an
+	// unrelated letter on the other doesn't silently get mapped
+	// here.
+	if matches!(
+		(x, y),
+		('D', 'D') | ('A', 'U') | ('U', 'D') | ('U', 'A') | ('D', 'U') | ('A', 'A') | ('U', 'U')
+	) {
+		return Some(GitFileStatus::Conflicted);
+	}
 	if x == 'D' || y == 'D' {
 		return Some(GitFileStatus::Deleted);
 	}
@@ -6029,6 +6328,184 @@ mod tests {
 		// Missing terminating NUL on the path — drop the trailing
 		// partial record.
 		assert!(parse_diff_name_status_z(b"M\0src/lib.rs").is_empty());
+	}
+
+	#[test]
+	fn map_porcelain_status_recognises_every_unmerged_combination() {
+		// All seven `git status --porcelain` unmerged codes (see
+		// `gitstatus(5)`'s "Short Format" table — the unmerged
+		// section). Each one must map to `Conflicted` so the SCM
+		// panel can shift into merge-in-progress mode and the
+		// row gets the conflict badge.
+		for (x, y) in [
+			('U', 'U'),
+			('A', 'U'),
+			('U', 'A'),
+			('D', 'D'),
+			('A', 'A'),
+			('U', 'D'),
+			('D', 'U'),
+		] {
+			assert_eq!(
+				map_porcelain_status(x, y),
+				Some(GitFileStatus::Conflicted),
+				"unmerged code `{x}{y}` should map to Conflicted",
+			);
+		}
+	}
+
+	#[test]
+	fn map_porcelain_status_preserves_existing_priority_for_non_conflict_codes() {
+		// Regression guard: the conflict arm is intentionally
+		// first, so a stale `D` / `A` code on one side of an
+		// unmerged pair doesn't shadow it. But the regular
+		// (non-unmerged) priorities must keep working — these
+		// are the rows the file tree paints today.
+		assert_eq!(map_porcelain_status('M', ' '), Some(GitFileStatus::Modified));
+		assert_eq!(map_porcelain_status(' ', 'M'), Some(GitFileStatus::Modified));
+		assert_eq!(map_porcelain_status('A', ' '), Some(GitFileStatus::Added));
+		assert_eq!(map_porcelain_status('D', ' '), Some(GitFileStatus::Deleted));
+		assert_eq!(map_porcelain_status(' ', 'D'), Some(GitFileStatus::Deleted));
+		assert_eq!(map_porcelain_status('?', '?'), Some(GitFileStatus::Untracked));
+		assert_eq!(map_porcelain_status('!', '!'), Some(GitFileStatus::Ignored));
+		// `C` (copy) and the catch-all stay dropped — same
+		// pre-conflict-feature behaviour.
+		assert_eq!(map_porcelain_status('C', ' '), None);
+		assert_eq!(map_porcelain_status(' ', ' '), None);
+	}
+
+	#[tokio::test]
+	async fn git_merge_state_returns_default_when_no_merge_in_progress() {
+		// Clean repo, no `MERGE_HEAD` — the trait method must
+		// return `in_progress: false` with every other field at
+		// its default. Same shape the SCM panel uses to decide
+		// "merge-in-progress mode is off".
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping git_merge_state default test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q"]);
+		run_git(&git, dir.path(), &["config", "user.email", "test@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "test"]);
+		std::fs::write(dir.path().join("README.md"), "hi\n").unwrap();
+		run_git(&git, dir.path(), &["add", "README.md"]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "init"]);
+
+		let state = host(&dir).git_merge_state().await.unwrap();
+		assert!(!state.in_progress, "no MERGE_HEAD → in_progress must be false");
+		assert!(state.merging_ref.is_none());
+		assert!(state.default_message.is_none());
+		assert!(state.unmerged_paths.is_empty());
+	}
+
+	#[tokio::test]
+	async fn git_merge_state_surfaces_in_progress_merge_with_unmerged_paths() {
+		// End-to-end probe of the merge-state pipeline:
+		//   1. Set up a repo with two branches that touch the
+		//      same line of the same file. Merging one into the
+		//      other produces a textbook content conflict.
+		//   2. After the failed merge, `.git/MERGE_HEAD` should
+		//      exist, `MERGE_MSG` should be populated, and
+		//      `ls-files --unmerged` should report `conflict.txt`.
+		//   3. `map_porcelain_status` should classify
+		//      `conflict.txt` as `Conflicted` — confirms the
+		//      status pipeline and the merge-state pipeline
+		//      agree on the same row.
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping git_merge_state conflict test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "test@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "test"]);
+		std::fs::write(dir.path().join("conflict.txt"), "base\n").unwrap();
+		run_git(&git, dir.path(), &["add", "conflict.txt"]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "base"]);
+		run_git(&git, dir.path(), &["switch", "-c", "feature"]);
+		std::fs::write(dir.path().join("conflict.txt"), "feature\n").unwrap();
+		run_git(&git, dir.path(), &["commit", "-q", "-am", "feature edit"]);
+		run_git(&git, dir.path(), &["switch", "main"]);
+		std::fs::write(dir.path().join("conflict.txt"), "mainline\n").unwrap();
+		run_git(&git, dir.path(), &["commit", "-q", "-am", "main edit"]);
+
+		// Now merge feature → main. Expected to fail with a
+		// content conflict, leaving `.git/MERGE_HEAD` behind.
+		let merge_failed = std::process::Command::new(&git)
+			.arg("-C")
+			.arg(dir.path())
+			.args(["merge", "--no-edit", "feature"])
+			.status()
+			.unwrap();
+		assert!(!merge_failed.success(), "merge should have hit a conflict");
+
+		let state = host(&dir).git_merge_state().await.unwrap();
+		assert!(state.in_progress, "MERGE_HEAD must exist after a conflicted merge");
+		assert!(
+			state.merging_ref.as_deref() == Some("feature") || state.merging_ref.as_deref() == Some("refs/heads/feature"),
+			"merging_ref should resolve to the feature branch; got {:?}",
+			state.merging_ref,
+		);
+		assert!(
+			state.default_message.as_deref().unwrap_or("").contains("feature"),
+			"MERGE_MSG should mention the feature branch; got {:?}",
+			state.default_message,
+		);
+		assert_eq!(
+			state.unmerged_paths,
+			vec!["conflict.txt".to_string()],
+			"the conflicted file should be the only unmerged path",
+		);
+
+		// And the porcelain pipeline should agree.
+		let entries = host(&dir).git_status_entries(&[]).await.unwrap();
+		let conflicted_paths: Vec<_> = entries
+			.iter()
+			.filter(|e| matches!(e.status, GitFileStatus::Conflicted))
+			.map(|e| e.path.clone())
+			.collect();
+		assert_eq!(conflicted_paths, vec!["conflict.txt".to_string()]);
+	}
+
+	#[tokio::test]
+	async fn git_merge_abort_clears_merge_state() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping git_merge_abort test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "test@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "test"]);
+		std::fs::write(dir.path().join("conflict.txt"), "base\n").unwrap();
+		run_git(&git, dir.path(), &["add", "conflict.txt"]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "base"]);
+		run_git(&git, dir.path(), &["switch", "-c", "feature"]);
+		std::fs::write(dir.path().join("conflict.txt"), "feature\n").unwrap();
+		run_git(&git, dir.path(), &["commit", "-q", "-am", "feature edit"]);
+		run_git(&git, dir.path(), &["switch", "main"]);
+		std::fs::write(dir.path().join("conflict.txt"), "mainline\n").unwrap();
+		run_git(&git, dir.path(), &["commit", "-q", "-am", "main edit"]);
+		let _ = std::process::Command::new(&git)
+			.arg("-C")
+			.arg(dir.path())
+			.args(["merge", "--no-edit", "feature"])
+			.status()
+			.unwrap();
+
+		host(&dir).git_merge_abort().await.unwrap();
+		let state = host(&dir).git_merge_state().await.unwrap();
+		assert!(
+			!state.in_progress,
+			"after `git merge --abort`, MERGE_HEAD should be gone"
+		);
+		assert!(state.unmerged_paths.is_empty());
+		// Worktree was restored to `main`'s pre-merge content.
+		assert_eq!(
+			std::fs::read_to_string(dir.path().join("conflict.txt")).unwrap(),
+			"mainline\n",
+		);
 	}
 
 	#[tokio::test]

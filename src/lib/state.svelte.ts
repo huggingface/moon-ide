@@ -20,6 +20,7 @@ import {
 	type GitBranchInfo,
 	type GitChangeSummary,
 	type GitFileBlame,
+	type GitMergeState,
 	type GitStatusEntry,
 	type LspDiagnostic,
 	type LspDiagnosticsEvent,
@@ -1853,6 +1854,31 @@ class WorkspaceState {
 	});
 
 	/**
+	 * Snapshot of the active folder's in-flight merge. The SCM
+	 * panel reshapes itself (Merging pill, Commit merge / Abort
+	 * merge buttons, hidden sync controls) when `inProgress` is
+	 * true. Mirrors `moon_protocol::git::GitMergeState`.
+	 *
+	 * Refreshed:
+	 *   - on folder switch alongside `refreshGitBranch`,
+	 *   - after every git op that could change merge state
+	 *     (commit, restore, merge attempt, abort),
+	 *   - from the fs-watcher when a `.git/` write lands —
+	 *     `MERGE_HEAD` / `MERGE_MSG` creation and removal both
+	 *     trigger one, so the panel feels live without a poll.
+	 *
+	 * Failures collapse to the default (no merge in progress) —
+	 * a transient probe glitch should never strand the panel in
+	 * a stale "Merging…" state.
+	 */
+	gitMergeState = $state<GitMergeState>({
+		inProgress: false,
+		mergingRef: null,
+		defaultMessage: null,
+		unmergedPaths: [],
+	});
+
+	/**
 	 * URL of the open GitHub PR matching the active folder's
 	 * current branch, or `null` when there isn't one (or `gh`
 	 * isn't installed / authed, the remote isn't GitHub, etc.).
@@ -1957,6 +1983,12 @@ class WorkspaceState {
 				defaultBranchBehind: 0,
 			};
 		}
+		// Merge state is a sibling probe — `.git/MERGE_HEAD`
+		// exists exactly while the working tree is mid-merge, and
+		// the branch refresh is the natural moment to fan a fresh
+		// snapshot to the panel. Cheap (small fs reads + one
+		// `ls-files --unmerged`) and idempotent.
+		void this.refreshGitMergeState();
 		// Branch may have changed under us (external `git switch` /
 		// `gh pr checkout` from a terminal, or our own
 		// `switchToBranch`). Refresh the existing-PR pointer
@@ -2214,7 +2246,144 @@ class WorkspaceState {
 			void this.refreshActiveFolder();
 			return true;
 		} catch (err) {
+			// Merge conflicts and dirty-tree refusals both land
+			// here. The post-call refresh below picks up the
+			// `.git/MERGE_HEAD` write so the SCM panel shifts
+			// into merge-in-progress mode without an extra
+			// click — even on the conflict path we want the
+			// user to land on a panel that's ready to drive
+			// the resolution flow, not a flash they have to
+			// dismiss before they can see what happened.
 			this.flash(`Merge failed: ${formatError(err)}`);
+			void this.refreshActiveFolder();
+			return false;
+		}
+	}
+
+	/**
+	 * Refresh `gitMergeState` from `git_merge_state`. Best-effort:
+	 * a probe failure collapses to "no merge in progress" rather
+	 * than stranding the panel on a stale snapshot. Awaited by
+	 * the panel's mount + post-op refresh paths so the next
+	 * render reflects the new state; called fire-and-forget by
+	 * the fs-watcher `.git/` branch.
+	 */
+	async refreshGitMergeState() {
+		try {
+			this.gitMergeState = await ipc.fs.gitMergeState();
+		} catch {
+			this.gitMergeState = {
+				inProgress: false,
+				mergingRef: null,
+				defaultMessage: null,
+				unmergedPaths: [],
+			};
+		}
+	}
+
+	/**
+	 * Finish an in-progress merge by running the regular
+	 * `git_commit` path with whatever bytes are in the composer.
+	 * Git resolves the rest: with `.git/MERGE_HEAD` present, the
+	 * commit it produces is a merge commit (two parents); the
+	 * unmerged-path gate is enforced server-side too. On success
+	 * we refresh both `gitBranch` and `gitMergeState` so the
+	 * panel reverts to its regular shape — the post-merge
+	 * commit clears `MERGE_HEAD`.
+	 *
+	 * Soft-warn first: scan every previously-conflicted file's
+	 * on-disk bytes for leftover marker lines. The unmerged
+	 * index can be empty (`git add` was run, or there were no
+	 * content conflicts) while a file still has `<<<<<<<` in
+	 * it — the staged version went into the index without the
+	 * markers being touched. Committing that is almost never
+	 * what the user meant, so we prompt for confirm before
+	 * letting git produce the merge commit.
+	 */
+	async commitMerge(message: string) {
+		const suspicious = await this.findLeftoverConflictMarkerFiles();
+		if (suspicious.length > 0) {
+			const ok = await confirm(
+				`The following file${suspicious.length === 1 ? '' : 's'} still contain${suspicious.length === 1 ? 's' : ''} merge-conflict markers:\n\n${suspicious.join('\n')}\n\nCommit anyway?`,
+				{ title: 'Commit merge?', kind: 'warning' },
+			);
+			if (!ok) {
+				return false;
+			}
+		}
+		try {
+			const result = await ipc.fs.gitCommit(message, false);
+			this.flash(`Committed ${result.shortSha}: ${result.summary}`);
+			this.scmFilterOn = false;
+			await this.refreshGitBranch();
+			void this.refreshActiveFolder();
+			return true;
+		} catch (err) {
+			this.flash(`Commit merge failed: ${formatError(err)}`);
+			return false;
+		}
+	}
+
+	/**
+	 * Sniff the working tree for files that still carry
+	 * `<<<<<<<` / `=======` / `>>>>>>>` lines despite git
+	 * reporting them as resolved (no longer in
+	 * `git ls-files --unmerged`). Best-effort: a read failure
+	 * for any one path drops that path from the result without
+	 * blocking the commit — git's own `nothing-to-commit` gate
+	 * is the hard backstop.
+	 *
+	 * We scan only paths git currently reports as `modified` /
+	 * `added` / `conflicted` (the rows that could conceivably
+	 * carry leftover markers). Untracked files are excluded —
+	 * `git commit` with `MERGE_HEAD` present wouldn't pick them
+	 * up anyway; the user would notice on the next normal
+	 * commit.
+	 */
+	async findLeftoverConflictMarkerFiles(): Promise<string[]> {
+		const candidates = new Set<string>();
+		for (const entry of this.gitStatusEntries) {
+			if (entry.status === 'modified' || entry.status === 'added' || entry.status === 'conflicted') {
+				candidates.add(entry.path);
+			}
+		}
+		if (candidates.size === 0) {
+			return [];
+		}
+		const out: string[] = [];
+		await Promise.all(
+			[...candidates].map(async (path) => {
+				try {
+					const res = await ipc.fs.readFile(path);
+					if (!res.is_binary && hasConflictMarkerLines(res.text)) {
+						out.push(path);
+					}
+				} catch {
+					// Read failure (file vanished between status
+					// and probe, etc.) — drop silently and let the
+					// commit proceed without flagging this row.
+				}
+			}),
+		);
+		return out.toSorted();
+	}
+
+	/**
+	 * `git merge --abort` — wind back the merge so the working
+	 * tree returns to the pre-merge HEAD. The flash uses git's
+	 * stderr verbatim for the failure case (no merge to abort,
+	 * dirty pre-merge state); success quietly refreshes the
+	 * panel and the tree.
+	 */
+	async abortMerge() {
+		try {
+			await ipc.fs.gitMergeAbort();
+			this.flash('Merge aborted.');
+			await this.refreshGitBranch();
+			void this.refreshActiveFolder();
+			return true;
+		} catch (err) {
+			this.flash(`Abort failed: ${formatError(err)}`);
 			return false;
 		}
 	}
@@ -2707,6 +2876,20 @@ class WorkspaceState {
 					`fs:changed paths=${payload.paths.length} topology=${payload.topologyChanged}${payload.paths.length === 0 ? '' : ` [${sample}${more}]`}`,
 				);
 				void this.refreshActiveFolder(subset, payload.topologyChanged);
+				// `.git/MERGE_HEAD` / `.git/MERGE_MSG` appear when
+				// the user starts a merge from a terminal (or
+				// our own merge IPC) and disappear when it
+				// commits / aborts. Either case flips the SCM
+				// panel into / out of merge-in-progress mode,
+				// so a dedicated re-probe keeps the panel live
+				// without waiting for the next branch refresh
+				// cadence. `refreshActiveFolder` above does
+				// `refreshGitBranch → refreshGitMergeState` on
+				// its own pass too; this is the surgical fast
+				// path for the `.git/`-only burst.
+				if (payload.paths.some((p) => p === '.git/MERGE_HEAD' || p === '.git/MERGE_MSG')) {
+					void this.refreshGitMergeState();
+				}
 				// Forward the fs-watcher batch to every running
 				// LSP server as `workspace/didChangeWatchedFiles`.
 				// Each server filters the paths through the globs
@@ -5051,6 +5234,13 @@ class WorkspaceState {
 				);
 				return;
 			}
+			// Capture pre-save conflict status so the auto-stage
+			// branch below knows whether to look at the post-save
+			// markers. Reading after the IPC could race a watcher
+			// burst that flips the status while we're awaiting.
+			const wasConflicted = this.gitStatusEntries.some(
+				(entry) => entry.path === file.path && entry.status === 'conflicted',
+			);
 			const result = await ipc.fs.writeFile(file.path, file.text);
 			// The pre-save pipeline (line endings, trim trailing ws, final
 			// newline) runs server-side, so the bytes on disk may not equal
@@ -5060,6 +5250,27 @@ class WorkspaceState {
 			// changed anything.
 			const fresh = await ipc.fs.readFile(file.path);
 			const freshText = fresh.is_binary ? file.text : fresh.text;
+			// Auto-stage during merge resolution: if the file was
+			// reported `conflicted` on entry and the saved bytes
+			// no longer carry any column-0 conflict markers, run
+			// `git add` so the unmerged index entry clears. Without
+			// this the row's conflict badge would persist (and
+			// commit-merge would refuse) until either the user
+			// clicked commit (which `git add -A`s the whole tree)
+			// or ran `git add` from a terminal. Best-effort: a
+			// failed `git add` is silent — the next status refresh
+			// will surface any persistent index mismatch.
+			if (wasConflicted && !hasConflictMarkerLines(freshText)) {
+				try {
+					await ipc.fs.gitAddPaths([file.path]);
+				} catch {
+					// Silent: the badge stays, the next refresh
+					// re-evaluates. We don't want to flash a toast
+					// for a transient `git add` failure during
+					// what feels like a routine save.
+				}
+				void this.refreshGitMergeState();
+			}
 			this.openFiles = this.openFiles.map((f) =>
 				f.path === file.path
 					? {
@@ -5550,6 +5761,50 @@ function resolveSystemTheme(theme: SystemTheme): boolean {
  * leaking trees we haven't seen in the wild yet.
  */
 const MAX_TREE_DEPTH = 16;
+
+/**
+ * Quick check for column-0 merge-conflict marker lines —
+ * `<<<<<<<`, `=======`, `>>>>>>>`. Used by `saveActive` to
+ * decide whether a file that was conflicted has actually had
+ * its markers cleared before running `git add` against it.
+ *
+ * Scans every line because a buffer may legitimately have only
+ * the closing marker present if the user deleted the opening
+ * one without the rest — git would still report the file as
+ * unmerged, and auto-staging it would leave a half-resolved
+ * commit. Conservative: any marker line at column 0 vetoes
+ * the auto-stage, the user resolves the rest from the row.
+ */
+function hasConflictMarkerLines(text: string): boolean {
+	let cursor = 0;
+	while (cursor < text.length) {
+		// `\n` only — git rewrites CRLF on porcelain output and
+		// our format-on-save normalises line endings before this
+		// runs.
+		const nl = text.indexOf('\n', cursor);
+		const end = nl === -1 ? text.length : nl;
+		// `startsWith` on a substring would allocate; check by
+		// index instead. `<` / `=` / `>` all need at least seven
+		// consecutive copies to match the marker.
+		if (matchesMarker(text, cursor, '<') || matchesMarker(text, cursor, '=') || matchesMarker(text, cursor, '>')) {
+			return true;
+		}
+		if (nl === -1) {
+			return false;
+		}
+		cursor = end + 1;
+	}
+	return false;
+}
+
+function matchesMarker(text: string, lineStart: number, ch: string): boolean {
+	for (let i = 0; i < 7; i++) {
+		if (text.charAt(lineStart + i) !== ch) {
+			return false;
+		}
+	}
+	return true;
+}
 
 function basename(path: string): string {
 	const i = path.lastIndexOf('/');

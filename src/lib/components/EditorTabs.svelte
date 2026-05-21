@@ -63,7 +63,10 @@
 			return false;
 		}
 		const status = workspace.gitStatusEntries.find((e) => e.path === activePath)?.status;
-		return status === 'modified';
+		// Conflicted files are also modified vs. HEAD — the
+		// conflict markers themselves are part of the diff —
+		// so the diff toggle is still useful while resolving.
+		return status === 'modified' || status === 'conflicted';
 	});
 	const currentView: ViewMode = $derived(diffMode ? 'diff' : previewMode === 'preview' ? 'preview' : 'source');
 	const showViewToggle = $derived(!activeIsDeleted && (activeIsMarkdown || canDiff));

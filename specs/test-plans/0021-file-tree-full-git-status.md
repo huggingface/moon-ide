@@ -89,8 +89,12 @@ with at least one commit.
 - Renames render as `deleted(old) + added(new)` — intentional per
   roadmap, but means a pure `git mv` touches two rows instead of
   one.
-- No conflict marker. Unmerged paths silently fall through the
-  porcelain mapper until we have an SCM panel to surface them.
+- ~~No conflict marker. Unmerged paths silently fall through the
+  porcelain mapper until we have an SCM panel to surface them.~~
+  **No longer accurate** — Phase 5 §5.6 (test plan 0088) extended
+  the porcelain mapper to recognise `UU` / `AU` / `UA` / `DD` /
+  `AA` / `UD` / `DU` and surface a `Conflicted` row state. The
+  file tree paints those rows with a `!` decoration badge.
 - Parsing drops `C` (copy) records and any porcelain byte
   combination we didn't explicitly map. That's the safe default
   (no fake marker); the alternative is rendering noise.
