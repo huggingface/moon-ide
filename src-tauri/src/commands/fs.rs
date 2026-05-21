@@ -219,7 +219,10 @@ pub async fn fs_git_change_summary(
 			// signal — the SCM panel inside the active folder still
 			// keeps the two distinct.
 			GitFileStatus::Added | GitFileStatus::Untracked => summary.added += 1,
-			GitFileStatus::Modified => summary.modified += 1,
+			// `Conflicted` rolls into `modified` for the project-bar
+			// summary, mirroring how Pierre's per-row colour maps it
+			// at the UI boundary (see test plan 0088).
+			GitFileStatus::Modified | GitFileStatus::Conflicted => summary.modified += 1,
 			GitFileStatus::Deleted => summary.deleted += 1,
 			GitFileStatus::Ignored => {}
 		}

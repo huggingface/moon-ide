@@ -33,31 +33,71 @@ const FILE_SEARCH_MIN_SCORE: i64 = 0;
 /// `WalkBuilder::git_ignore(true)` / `git_exclude(true)` — this
 /// override only patches the one case those features can't cover.
 ///
-/// `include_glob`, when provided, layers an *inclusion* override on
-/// top: anything not matching the user's glob is filtered out at
-/// walk time (the `ignore` crate short-circuits whole subtrees, so
-/// the speedup is real on `target/`-laden repos). Invalid globs are
-/// dropped with a `tracing::warn!` and the search runs unfiltered —
-/// breaking the search UI on a typo is worse than silently widening
-/// the scope.
-fn build_overrides(root: &Utf8Path, include_glob: Option<&str>) -> Override {
+/// Note: the user's `include_glob` is deliberately **not** added
+/// here. A positive glob in the override set is a *whitelist*
+/// match, which per the `ignore` crate's precedence rules
+/// short-circuits gitignore filtering — a query scoped to
+/// `packages/hub/` would then drag in `packages/hub/node_modules/`.
+/// `include_glob` lives in [`build_include_filter`] and is applied
+/// via `WalkBuilder::filter_entry` instead, so gitignore still wins.
+fn build_overrides(root: &Utf8Path) -> Override {
 	let mut builder = OverrideBuilder::new(root.as_std_path());
 	let _ = builder.add("!.git/");
-	if let Some(raw) = include_glob {
-		let trimmed = raw.trim();
-		if !trimmed.is_empty() {
-			let normalised = normalise_include_glob(trimmed);
-			if let Err(err) = builder.add(&normalised) {
-				tracing::warn!(
-					%err,
-					original = trimmed,
-					normalised = %normalised,
-					"invalid include_glob; running search without an include filter"
-				);
-			}
+	builder.build().unwrap_or_else(|_| Override::empty())
+}
+
+/// Compile the user's `include_glob` into a standalone matcher used
+/// by `filter_entry`. Returning `None` means "no filter" — either
+/// the caller passed nothing or the glob failed to parse (we warn
+/// and run unfiltered rather than break the search UI on a typo).
+///
+/// The matcher is *only* consulted on files; directories are always
+/// allowed through so the walker can descend into them and find the
+/// files inside (a leaf-level glob like `**/*.svelte` would never
+/// match a directory). Gitignore pruning has already happened by
+/// the time `filter_entry` runs, so anything ignored upstream stays
+/// pruned regardless of what the user typed.
+fn build_include_filter(root: &Utf8Path, include_glob: Option<&str>) -> Option<Override> {
+	let raw = include_glob?.trim();
+	if raw.is_empty() {
+		return None;
+	}
+	let normalised = normalise_include_glob(raw);
+	let mut builder = OverrideBuilder::new(root.as_std_path());
+	if let Err(err) = builder.add(&normalised) {
+		tracing::warn!(
+			%err,
+			original = raw,
+			normalised = %normalised,
+			"invalid include_glob; running search without an include filter"
+		);
+		return None;
+	}
+	match builder.build() {
+		Ok(ov) => Some(ov),
+		Err(err) => {
+			tracing::warn!(
+				%err,
+				original = raw,
+				normalised = %normalised,
+				"failed to build include_glob matcher; running search without an include filter"
+			);
+			None
 		}
 	}
-	builder.build().unwrap_or_else(|_| Override::empty())
+}
+
+/// True if `entry` should be kept under the include filter. Files
+/// are kept only when the override whitelists them; directories
+/// always survive so the walker can descend (a per-file glob like
+/// `**/*.svelte` would otherwise prune every directory and yield
+/// zero hits).
+fn include_filter_keeps(filter: &Override, entry: &ignore::DirEntry) -> bool {
+	let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+	if is_dir {
+		return true;
+	}
+	filter.matched(entry.path(), false).is_whitelist()
 }
 
 /// Convert the user's "scope to a path" input into a gitignore-style
@@ -111,7 +151,7 @@ pub fn search_files(root: &Utf8Path, opts: &FileSearchOptions) -> MoonResult<Vec
 		.git_ignore(true)
 		.git_exclude(true)
 		.ignore(true)
-		.overrides(build_overrides(root, None))
+		.overrides(build_overrides(root))
 		.build();
 
 	let mut walked_dirs: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
@@ -151,7 +191,7 @@ pub fn search_files(root: &Utf8Path, opts: &FileSearchOptions) -> MoonResult<Vec
 			.git_ignore(false)
 			.git_exclude(false)
 			.ignore(false)
-			.overrides(build_overrides(root, None))
+			.overrides(build_overrides(root))
 			.filter_entry(move |entry| {
 				let Some(ft) = entry.file_type() else {
 					return true;
@@ -302,13 +342,18 @@ pub fn search_content(root: &Utf8Path, opts: &ContentSearchOptions) -> MoonResul
 	let mut hits = Vec::new();
 	let mut truncated = false;
 
-	let walker = WalkBuilder::new(root.as_std_path())
+	let include_filter = build_include_filter(root, opts.include_glob.as_deref());
+	let mut walker_builder = WalkBuilder::new(root.as_std_path());
+	walker_builder
 		.hidden(false)
 		.git_ignore(true)
 		.git_exclude(true)
 		.ignore(true)
-		.overrides(build_overrides(root, opts.include_glob.as_deref()))
-		.build();
+		.overrides(build_overrides(root));
+	if let Some(filter) = include_filter {
+		walker_builder.filter_entry(move |entry| include_filter_keeps(&filter, entry));
+	}
+	let walker = walker_builder.build();
 
 	'outer: for entry in walker.flatten() {
 		let path = entry.path();
@@ -415,13 +460,18 @@ pub fn replace_content(root: &Utf8Path, opts: &ContentReplaceOptions) -> MoonRes
 	let mut total_replacements = 0u32;
 	let mut errors: Vec<ContentReplaceError> = Vec::new();
 
-	let walker = WalkBuilder::new(root.as_std_path())
+	let include_filter = build_include_filter(root, opts.include_glob.as_deref());
+	let mut walker_builder = WalkBuilder::new(root.as_std_path());
+	walker_builder
 		.hidden(false)
 		.git_ignore(true)
 		.git_exclude(true)
 		.ignore(true)
-		.overrides(build_overrides(root, opts.include_glob.as_deref()))
-		.build();
+		.overrides(build_overrides(root));
+	if let Some(filter) = include_filter {
+		walker_builder.filter_entry(move |entry| include_filter_keeps(&filter, entry));
+	}
+	let walker = walker_builder.build();
 
 	for entry in walker.flatten() {
 		let path = entry.path();
@@ -845,6 +895,48 @@ mod tests {
 	}
 
 	#[test]
+	fn content_search_include_glob_still_respects_gitignore() {
+		// Regression: a bare-path scope like `packages/hub` used
+		// to be expanded into a positive override glob, which
+		// per the `ignore` crate's precedence rules whitelists
+		// the matched path and **short-circuits gitignore**. The
+		// search then dragged in `packages/hub/node_modules/`
+		// even though the root `.gitignore` had `node_modules/`.
+		// The fix moves include filtering off the override
+		// matcher and into `filter_entry`, so gitignore pruning
+		// still happens upstream.
+		let dir = TempDir::new().unwrap();
+		std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+		std::fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
+		std::fs::create_dir_all(dir.path().join("packages/hub/src")).unwrap();
+		std::fs::create_dir_all(dir.path().join("packages/hub/node_modules/lodash")).unwrap();
+		std::fs::write(dir.path().join("packages/hub/src/index.ts"), "needle in src\n").unwrap();
+		std::fs::write(
+			dir.path().join("packages/hub/node_modules/lodash/index.js"),
+			"needle in deps\n",
+		)
+		.unwrap();
+
+		let opts = ContentSearchOptions {
+			query: "needle".into(),
+			include_glob: Some("packages/hub".into()),
+			max_matches: 100,
+			..Default::default()
+		};
+		let r = search_content(&root(&dir), &opts).unwrap();
+		assert!(
+			r.hits.iter().all(|h| !h.path.contains("node_modules/")),
+			"scoped search leaked into gitignored node_modules/: {:?}",
+			r.hits
+		);
+		assert!(
+			r.hits.iter().any(|h| h.path == "packages/hub/src/index.ts"),
+			"scoped search dropped the legitimate hit: {:?}",
+			r.hits
+		);
+	}
+
+	#[test]
 	fn content_search_include_glob_passes_explicit_globs_through() {
 		// `**/*.svelte` (or any pattern with a glob metacharacter)
 		// goes to the override builder verbatim — the user knows
@@ -1014,6 +1106,41 @@ mod tests {
 		assert_eq!(
 			std::fs::read_to_string(dir.path().join("vendor/b.txt")).unwrap(),
 			"todo\n"
+		);
+	}
+
+	#[test]
+	fn replace_content_include_glob_still_respects_gitignore() {
+		// Mirror of `content_search_include_glob_still_respects_gitignore`:
+		// a scoped replace must not rewrite files under a
+		// gitignored subdirectory just because the user typed a
+		// bare-path scope. (The original bug was caused by the
+		// override matcher whitelisting paths and bypassing
+		// gitignore.)
+		let dir = TempDir::new().unwrap();
+		std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+		std::fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
+		std::fs::create_dir_all(dir.path().join("packages/hub/src")).unwrap();
+		std::fs::create_dir_all(dir.path().join("packages/hub/node_modules/lodash")).unwrap();
+		std::fs::write(dir.path().join("packages/hub/src/index.ts"), "todo\n").unwrap();
+		std::fs::write(dir.path().join("packages/hub/node_modules/lodash/index.js"), "todo\n").unwrap();
+
+		let opts = ContentReplaceOptions {
+			query: "todo".into(),
+			replacement: "done".into(),
+			include_glob: Some("packages/hub".into()),
+			..Default::default()
+		};
+		let r = replace_content(&root(&dir), &opts).unwrap();
+		assert_eq!(r.files_changed, 1);
+		assert_eq!(
+			std::fs::read_to_string(dir.path().join("packages/hub/src/index.ts")).unwrap(),
+			"done\n"
+		);
+		assert_eq!(
+			std::fs::read_to_string(dir.path().join("packages/hub/node_modules/lodash/index.js")).unwrap(),
+			"todo\n",
+			"replace leaked into gitignored node_modules/"
 		);
 	}
 
