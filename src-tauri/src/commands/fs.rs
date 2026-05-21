@@ -353,9 +353,11 @@ pub async fn fs_git_publish_branch(state: State<'_, AppState>) -> Result<(), Moo
 	entry.host.git_publish_branch().await
 }
 
-/// Pull from the active folder's configured upstream using the
-/// user's `pull.rebase` preference. Failures (conflicts, dirty
-/// tree, no upstream) propagate git's stderr.
+/// `git pull --rebase` from the active folder's configured
+/// upstream. On a rebase conflict the backend aborts the rebase
+/// so the working tree is restored; the user resolves in their
+/// terminal and retries. Failures (conflicts, dirty tree, no
+/// upstream) propagate git's stderr.
 #[tauri::command]
 pub async fn fs_git_pull(state: State<'_, AppState>) -> Result<(), MoonError> {
 	let entry = state.workspaces.require_active_folder().await?;

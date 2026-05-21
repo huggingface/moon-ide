@@ -264,7 +264,11 @@
 		const a = branch.ahead;
 		const b = branch.behind;
 		if (a > 0 && b > 0) {
-			return `Pull ${b} and push ${a} commit${a === 1 && b === 1 ? '' : 's'}`;
+			// Diverged: first click rebases local commits on top
+			// of upstream, second click pushes. The tooltip
+			// mirrors what the click will actually do *right
+			// now* so it doesn't oversell the operation.
+			return `Rebase ${a} commit${a === 1 ? '' : 's'} onto ${b} upstream commit${b === 1 ? '' : 's'} (push on next click)`;
 		}
 		if (a > 0) {
 			return `Push ${a} commit${a === 1 ? '' : 's'} to upstream`;
@@ -589,10 +593,16 @@
 		syncing = true;
 		try {
 			if (initialBehind > 0) {
-				const ok = await workspace.pullChanges();
-				if (!ok) {
-					return;
-				}
+				// `pullChanges` runs `git pull --rebase`; on
+				// conflict the backend aborts the rebase so the
+				// working tree is restored. When the branch is
+				// diverged (both ahead and behind) we *only*
+				// pull on this click — pushing immediately after
+				// a rebase would surprise the user who hasn't
+				// had a chance to see the rebased history. The
+				// next click sees ahead-only and pushes.
+				await workspace.pullChanges();
+				return;
 			}
 			if (initialAhead > 0) {
 				await workspace.pushChanges();

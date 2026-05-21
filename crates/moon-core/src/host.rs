@@ -313,9 +313,12 @@ pub trait WorkspaceHost: Send + Sync {
 	/// verbatim.
 	async fn git_publish_branch(&self) -> MoonResult<()>;
 
-	/// `git pull` with no arguments — uses the user's configured
-	/// `pull.rebase` setting. Errors propagate git's stderr;
-	/// conflict markers in the working tree, dirty-tree refusals,
+	/// `git pull --rebase` — replay local commits on top of the
+	/// upstream tip. On conflict (or any other rebase failure) we
+	/// run `git rebase --abort` before returning so the working
+	/// tree is left exactly as it was before the call; the user
+	/// can then resolve in a terminal and retry. Errors propagate
+	/// git's stderr verbatim — conflicts, dirty-tree refusals,
 	/// and missing-upstream messages all stay readable.
 	async fn git_pull(&self) -> MoonResult<()>;
 
@@ -1482,7 +1485,25 @@ impl WorkspaceHost for LocalHost {
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
-			run_git_simple(&root, &["pull"], "git pull")
+			let result = run_git_simple(&root, &["pull", "--rebase"], "git pull --rebase");
+			if result.is_err() {
+				// Rebase mid-conflict leaves the working tree in
+				// detached "REBASE-IN-PROGRESS" state. The SCM
+				// panel's contract is "sync either succeeds or
+				// leaves the tree exactly as it was", so when
+				// a rebase is in flight we abort it so the user
+				// can resolve in their terminal of choice (or
+				// just try again later) without the worktree
+				// being half-rewritten. Best-effort: if the
+				// abort itself fails, we still surface the
+				// original pull error.
+				let rebase_dir = root.join(".git").join("rebase-merge");
+				let rebase_apply = root.join(".git").join("rebase-apply");
+				if rebase_dir.exists() || rebase_apply.exists() {
+					let _ = run_git_simple(&root, &["rebase", "--abort"], "git rebase --abort");
+				}
+			}
+			result
 		})
 		.await
 		.map_err(|e| MoonError::Internal(format!("git_pull join error: {e}")))?
