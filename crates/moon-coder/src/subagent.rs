@@ -193,7 +193,39 @@ pub(crate) async fn run_subagent(
 		mode: mode.as_wire().to_string(),
 	});
 
-	let outcome = run_subagent_inner(tools, inference, sink, coder_sessions_dir, models, &spec, cancel).await;
+	// Fresh per-turn format queue. The sub-agent's write/edit
+	// tools record into it instead of running the lint-staged
+	// chain inline; we drain it below regardless of how the
+	// sub-agent ended. See the ADR superseding 0013's per-tool-
+	// call invocation.
+	let format_queue = Arc::new(crate::tools::FormatQueue::default());
+
+	let outcome = run_subagent_inner(
+		tools,
+		inference,
+		sink,
+		coder_sessions_dir,
+		models,
+		&spec,
+		cancel,
+		format_queue.clone(),
+	)
+	.await;
+
+	// Flush before announcing the finish so by the time the
+	// parent's transcript shows `SubagentFinished` the files are
+	// already formatted on disk — important because the parent's
+	// next iteration may `read_file` against one of those paths
+	// to verify the sub-agent's work. Sub-agent tools today only
+	// write inside `spec.folder` (path routing happens in the
+	// parent's `ToolContext`, not the sub-agent's), so we can
+	// pull the host straight off the spec instead of looking it
+	// up through the workspace registry.
+	for (_folder_path, rel) in format_queue.drain() {
+		if let Err(err) = spec.folder.host.format_file(&rel).await {
+			tracing::warn!(path = %rel, %err, "format-on-save (sub-agent turn end): format_file failed");
+		}
+	}
 
 	let was_error = outcome.is_err();
 	sink.send(CoderEvent::SubagentFinished {
@@ -204,6 +236,7 @@ pub(crate) async fn run_subagent(
 	outcome
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_subagent_inner(
 	tools: &ToolRegistry,
 	inference: &InferenceClient,
@@ -212,6 +245,7 @@ async fn run_subagent_inner(
 	models: &CoderModels,
 	spec: &Subagent,
 	cancel: CancellationToken,
+	format_queue: Arc<crate::tools::FormatQueue>,
 ) -> Result<SubagentReport, CoderError> {
 	let standard_model = models.standard().to_owned();
 	let id = spec.id.clone();
@@ -299,7 +333,7 @@ async fn run_subagent_inner(
 	// describe a sub-sub-agent because the model never sees the
 	// tool.
 	let tool_defs = tools.definitions();
-	let cx = ToolContext::new(spec.folder.clone(), spec.mode);
+	let cx = ToolContext::with_format_queue(spec.folder.clone(), spec.mode, format_queue);
 
 	for iter in 0..MAX_TURN_ITERATIONS {
 		if cancel.is_cancelled() {

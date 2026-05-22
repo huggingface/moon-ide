@@ -53,7 +53,7 @@ The save pipeline runs in two stages:
 
 The editorconfig pass is essentially redundant for files a formatter owns (oxfmt / prettier / rustfmt all canonicalise line endings + trim + final newline themselves) but the cost is one in-memory string transform per save — cheap, idempotent, and it gives files without a lint-staged rule the same baseline.
 
-The full save seam is the `WorkspaceHost::save_file` trait method, not `WorkspaceHost::write_file`. `save_file` orchestrates both stages above. Every editor save (`fs_write_file`) and every coder/agent edit funnels through `save_file`; raw `write_file` stays available for tests and any future caller that wants exactly the bytes it hands in.
+The full save seam is the `WorkspaceHost::save_file` trait method, not `WorkspaceHost::write_file`. `save_file` orchestrates both stages above. Every editor save (`fs_write_file`) funnels through `save_file`; raw `write_file` stays available for tests, the coder's `write_file` / `edit_file` tools (which defer the pipeline to turn end via `WorkspaceHost::format_file` — see [ADR 0019](decisions/0019-coder-format-on-save-deferred.md)), and any future caller that wants exactly the bytes it hands in.
 
 ### Editor (CodeMirror) integration
 

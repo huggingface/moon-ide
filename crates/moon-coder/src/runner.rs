@@ -1773,8 +1773,26 @@ impl CoderHandle {
 		let sink_for_turn = sink.clone();
 		let folder_for_turn = folder_path.clone();
 		tokio::spawn(async move {
-			let result = run_turn(&state, &rt_for_turn, &folder_for_turn, &sink_for_turn, cancel_outer).await;
+			// One queue per turn. `run_turn` hands it to every
+			// dispatched `write_file` / `edit_file` via the
+			// `ToolContext`; the post-turn flush below runs the
+			// format-on-save pipeline against each unique path
+			// exactly once, regardless of how the turn ended
+			// (Ok / Aborted / Err — Esc'd or errored turns still
+			// land formatted bytes for whatever the model managed
+			// to write before bailing).
+			let format_queue = Arc::new(crate::tools::FormatQueue::default());
+			let result = run_turn(
+				&state,
+				&rt_for_turn,
+				&folder_for_turn,
+				&sink_for_turn,
+				cancel_outer,
+				format_queue.clone(),
+			)
+			.await;
 			rt_for_turn.turn.lock().await.cancel = None;
+			flush_format_queue(&state, &format_queue).await;
 			match &result {
 				Ok(()) => {
 					sink_for_turn.send(CoderEvent::TurnComplete);
@@ -1879,6 +1897,39 @@ fn pop_pending_steer(session: &mut Session, id: &str) -> Option<PendingSteer> {
 	Some(session.pending_steers.remove(idx))
 }
 
+/// Drain the turn's [`FormatQueue`] and run `host.format_file`
+/// against each touched path exactly once. Best-effort: a missing
+/// folder or a `format_file` error collapses to a `tracing::warn!`
+/// and the next path is still attempted. Fires after every turn
+/// (Ok / Aborted / Err) so a partial turn still lands formatted
+/// bytes for whatever the model managed to write before bailing —
+/// which matches the "treat the model's writes like ordinary
+/// `Ctrl+S` saves" mental model the rest of the IDE has.
+async fn flush_format_queue(state: &Arc<CoderState>, queue: &Arc<crate::tools::FormatQueue>) {
+	let entries = queue.drain();
+	if entries.is_empty() {
+		return;
+	}
+	for (folder_path, rel) in entries {
+		let Some(folder) = state.workspaces.folder_for_path(folder_path.as_str()).await else {
+			tracing::warn!(
+				folder = %folder_path,
+				path = %rel,
+				"format-on-save (turn end): bound folder gone before flush; skipping"
+			);
+			continue;
+		};
+		if let Err(err) = folder.host.format_file(&rel).await {
+			tracing::warn!(
+				folder = %folder_path,
+				path = %rel,
+				%err,
+				"format-on-save (turn end): format_file failed"
+			);
+		}
+	}
+}
+
 /// After a successful turn, check the workspace's
 /// [`coder_hub_bucket`] binding and, if `autosync` is on, enqueue
 /// a debounced upload of the active session's JSONL. Fire-and-
@@ -1922,6 +1973,7 @@ async fn run_turn(
 	folder_path: &Utf8Path,
 	sink: &FolderEventSink,
 	cancel: CancellationToken,
+	format_queue: Arc<crate::tools::FormatQueue>,
 ) -> Result<(), CoderError> {
 	// Snapshot the user's current model picks once at turn-start.
 	// A settings flip mid-turn doesn't retroactively change which
@@ -1952,7 +2004,7 @@ async fn run_turn(
 		.folder_for_path(folder_path.as_str())
 		.await
 		.ok_or(CoderError::NoActiveFolder)?;
-	let cx = ToolContext::new(folder_entry, CoderMode::Agent);
+	let cx = ToolContext::with_format_queue(folder_entry, CoderMode::Agent, format_queue);
 	// Compose a fresh system prompt and overwrite the session's
 	// `messages[0]`: the base prompt plus a "Bound folders"
 	// section keyed off whatever summaries are currently cached.

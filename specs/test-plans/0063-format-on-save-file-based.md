@@ -2,6 +2,7 @@
 
 - **Date**: 2026-05-07
 - **Phase**: Phase 1.5 / Phase 8 bootstrap slice — supersedes the stdin/stdout pipeline shipped in [test plan 0047](0047-format-on-save.md).
+- **Partially superseded by**: [ADR 0019](../decisions/0019-coder-format-on-save-deferred.md) for the coder-write path. The chain shape (file-path appended, mutate in place, continue past failures, container routing) still holds; only **when** the chain runs differs for coder-issued writes (turn end instead of per-tool-call).
 
 ## What shipped
 

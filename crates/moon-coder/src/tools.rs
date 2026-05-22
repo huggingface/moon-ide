@@ -18,7 +18,8 @@
 //! string like "ERROR: ..." as content confuses the model. Errors
 //! become `isError: true` content blocks at the loop layer.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -102,15 +103,94 @@ impl CoderMode {
 /// invocation. Lets the sub-agent runner (Phase C) point a
 /// concurrent dispatch at a different folder + mode pair without
 /// touching the global active-folder state.
+///
+/// Also carries a turn-scoped [`FormatQueue`] that `write_file` /
+/// `edit_file` push into instead of running the format-on-save
+/// pipeline inline. The runner drains the queue at turn end (see
+/// `run_turn` / `run_subagent`). One queue per turn, shared across
+/// every tool dispatch in that turn — parent and sub-agent each
+/// own their own.
 #[derive(Clone)]
 pub struct ToolContext {
 	pub folder: Arc<WorkspaceFolderEntry>,
 	pub mode: CoderMode,
+	pub format_queue: Arc<FormatQueue>,
 }
 
 impl ToolContext {
 	pub fn new(folder: Arc<WorkspaceFolderEntry>, mode: CoderMode) -> Self {
-		Self { folder, mode }
+		Self {
+			folder,
+			mode,
+			format_queue: Arc::new(FormatQueue::default()),
+		}
+	}
+
+	/// Like [`new`](Self::new) but reuses an existing queue. Used
+	/// when one logical turn fans out into multiple `ToolContext`s
+	/// (e.g. the parent's homogeneous-`task` parallel-dispatch
+	/// path) and we still want a single flush at the end.
+	pub fn with_format_queue(folder: Arc<WorkspaceFolderEntry>, mode: CoderMode, queue: Arc<FormatQueue>) -> Self {
+		Self {
+			folder,
+			mode,
+			format_queue: queue,
+		}
+	}
+}
+
+/// Per-turn set of files the coder's write/edit tools touched.
+///
+/// `write_file` / `edit_file` write raw bytes through
+/// [`WorkspaceHost::write_file`] and register the touched path
+/// here; at turn end the runner drains the queue and runs
+/// [`WorkspaceHost::format_file`] against each entry exactly once,
+/// regardless of how many times the model edited that file. See
+/// the ADR superseding 0013's per-tool-call invocation for why.
+#[derive(Default)]
+pub struct FormatQueue {
+	entries: Mutex<HashSet<FormatQueueEntry>>,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct FormatQueueEntry {
+	folder_path: String,
+	relative_path: Utf8PathBuf,
+}
+
+impl FormatQueue {
+	/// Record that `(folder, relative_path)` was written this turn.
+	/// Idempotent; the same path coming through N times still
+	/// flushes once.
+	pub fn record(&self, folder: &WorkspaceFolderEntry, relative_path: &Utf8Path) {
+		let entry = FormatQueueEntry {
+			folder_path: folder.folder.path.clone(),
+			relative_path: relative_path.to_path_buf(),
+		};
+		// `Mutex::lock` only fails on poisoning; treat that as a
+		// programmer error (some earlier panic inside a tool
+		// holding the guard) and ignore — the queue is a hint,
+		// not authoritative state.
+		let Ok(mut guard) = self.entries.lock() else {
+			return;
+		};
+		guard.insert(entry);
+	}
+
+	/// Drain the queue and return the recorded entries grouped for
+	/// the caller to dispatch against. The set is cleared so a
+	/// subsequent flush call is a no-op.
+	pub fn drain(&self) -> Vec<(String, Utf8PathBuf)> {
+		let Ok(mut guard) = self.entries.lock() else {
+			return Vec::new();
+		};
+		guard.drain().map(|e| (e.folder_path, e.relative_path)).collect()
+	}
+
+	/// `true` when no tool has registered a path yet. Used by the
+	/// runner to skip the flush log entirely on read-only turns.
+	pub fn is_empty(&self) -> bool {
+		self.entries.lock().map(|g| g.is_empty()).unwrap_or(true)
 	}
 }
 
@@ -380,7 +460,7 @@ impl ToolRegistry {
 			),
 			ToolDefinition::function(
 				"edit_file",
-				"Replace a substring in a file. `find` matching is whitespace-tolerant (indent shifts and interior whitespace runs are forgiving). Must be unique unless `occurrence` is given. Empty `replace` deletes. Format-on-save runs after the edit, so `replace` doesn't need to match the formatter's exact output.",
+				"Replace a substring in a file. `find` is whitespace-tolerant (indent shifts and interior whitespace runs forgiven) and must be unique unless `occurrence` is given. Empty `replace` deletes. Bytes the file holds between your edits in a turn are exactly what `write_file` / `edit_file` wrote — the format-on-save chain runs once per touched file at the end of the turn.",
 				json!({
 					"type": "object",
 					"properties": {
@@ -649,10 +729,18 @@ impl ToolRegistry {
 		let parsed: WriteFileArgs =
 			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("write_file", err.to_string()))?;
 		let (folder, resolved_path) = self.resolve_workspace_path(&parsed.path, cx, "write_file").await?;
-		let result = folder
-			.host
-			.save_file(Utf8Path::new(&resolved_path), &parsed.content)
-			.await?;
+		let resolved = Utf8Path::new(&resolved_path);
+		// Raw bytes-to-disk: the format-on-save pipeline (editorconfig
+		// + lint-staged) runs at turn end via `FormatQueue::drain`
+		// against the union of every path touched this turn. Doing
+		// the format inline here would mean (a) re-spawning prettier
+		// / eslint / rustfmt once per edit even when the model is
+		// about to edit the same file again two tool calls later,
+		// and (b) `eslint --fix` stripping an "unused" import in
+		// between the model adding the import and adding its first
+		// use. See the ADR superseding 0013's per-call invocation.
+		let result = folder.host.write_file(resolved, &parsed.content).await?;
+		cx.format_queue.record(&folder, resolved);
 		Ok(json!({
 			"path": parsed.path,
 			"bytes_written": parsed.content.len(),
@@ -695,7 +783,10 @@ impl ToolRegistry {
 		new_text.push_str(&plan.replace_text);
 		new_text.push_str(&original.text[plan.end..]);
 
-		let result = folder.host.save_file(path, &new_text).await?;
+		// Raw bytes-to-disk; format-on-save runs at turn end. See the
+		// `write_file` tool above for the rationale.
+		let result = folder.host.write_file(path, &new_text).await?;
+		cx.format_queue.record(&folder, path);
 		Ok(json!({
 			"path": parsed.path,
 			"replaced_at_byte": plan.start,

@@ -58,13 +58,32 @@ pub trait WorkspaceHost: Send + Sync {
 	/// `.editorconfig` line-ending / trim-ws / final-newline normalization,
 	/// then every command in the file's lint-staged chain (run in order,
 	/// against the file already on disk — same shape `bun run
-	/// lint-staged` uses on commit). Every editor save and every agent
-	/// write funnels through this, so the on-disk shape matches what
-	/// lint-staged would produce regardless of who issued the write.
-	/// Failures inside the formatter step never abort the save — callers
-	/// are guaranteed to land at least the editorconfig-normalised bytes.
-	/// See [specs/decisions/0012-format-on-save.md](../../../specs/decisions/0012-format-on-save.md).
+	/// lint-staged` uses on commit). Every editor save funnels through
+	/// this, so the on-disk shape matches what lint-staged would
+	/// produce regardless of who issued the write. Failures inside the
+	/// formatter step never abort the save — callers are guaranteed to
+	/// land at least the editorconfig-normalised bytes. See
+	/// [specs/decisions/0012-format-on-save.md](../../../specs/decisions/0012-format-on-save.md).
+	///
+	/// The coder's `write_file` / `edit_file` tools deliberately don't
+	/// route here — they write raw bytes via [`write_file`](Self::write_file)
+	/// and defer the save pipeline to [`format_file`](Self::format_file)
+	/// at turn end, so a multi-edit turn doesn't re-spawn the formatter
+	/// chain on every tool call and an `eslint --fix` between edits
+	/// can't strip an "unused" import the model intends to use two
+	/// edits later.
 	async fn save_file(&self, path: &Utf8Path, text: &str) -> MoonResult<WriteFileResult>;
+
+	/// Run the full save pipeline against the bytes already on disk
+	/// at `path`: read, apply the editorconfig pre-save transforms,
+	/// write back, then spawn the lint-staged chain. Same on-disk
+	/// shape as [`save_file`](Self::save_file) but starting from the
+	/// existing file rather than a fresh string. The coder calls
+	/// this at turn end against the union of files its write/edit
+	/// tools touched. Failures collapse to a `tracing::warn!` and
+	/// return the file's current stat; the caller never aborts on
+	/// format failure (best-effort, same posture as `save_file`).
+	async fn format_file(&self, path: &Utf8Path) -> MoonResult<WriteFileResult>;
 
 	async fn stat(&self, path: &Utf8Path) -> MoonResult<StatResult>;
 
@@ -528,6 +547,43 @@ impl LocalHost {
 	/// [ADR 0015]: ../../specs/decisions/0015-git-serialisation.md
 	async fn git_lock(&self) -> tokio::sync::OwnedMutexGuard<()> {
 		self.git_mutex.clone().lock_owned().await
+	}
+
+	/// Re-stat `path` after the lint-staged chain ran, returning a
+	/// fresh `WriteFileResult` so the caller's `mtime_ms` /
+	/// `bytes_written` match disk truth. Errors collapse to `None`
+	/// — same posture as the rest of the format pipeline: a stat
+	/// failure on a file we just wrote is worth a warn but never
+	/// aborts the save.
+	async fn restat_after_format(&self, path: &Utf8Path) -> Option<WriteFileResult> {
+		let abs_str = self.absolute_path(path).await.ok()?;
+		let abs = Utf8PathBuf::from(abs_str);
+		match tokio::fs::metadata(abs.as_std_path()).await {
+			Ok(metadata) => Some(WriteFileResult {
+				mtime_ms: metadata.modified().ok().and_then(system_time_to_ms),
+				bytes_written: metadata.len(),
+			}),
+			Err(err) => {
+				tracing::warn!(path = %abs, %err, "format-on-save: post-format stat failed");
+				None
+			}
+		}
+	}
+
+	/// Return the current `(mtime, size)` pair for `path` shaped as
+	/// a `WriteFileResult`. Used by `format_file` when the
+	/// editorconfig pre-save was a no-op and the lint-staged chain
+	/// didn't run either — the caller still needs a result, and the
+	/// current stat is the most accurate thing we can hand back.
+	async fn stat_as_write_result(&self, path: &Utf8Path) -> MoonResult<WriteFileResult> {
+		let resolved = self.resolve(path)?;
+		let metadata = tokio::fs::metadata(resolved.as_std_path())
+			.await
+			.map_err(MoonError::from)?;
+		Ok(WriteFileResult {
+			mtime_ms: metadata.modified().ok().and_then(system_time_to_ms),
+			bytes_written: metadata.len(),
+		})
 	}
 
 	/// Plug in a [`ShellResolverHandle`] so format-on-save (and any
@@ -1166,22 +1222,37 @@ impl WorkspaceHost for LocalHost {
 		if !self.run_formatter_chain(path).await {
 			return Ok(initial);
 		}
+		Ok(self.restat_after_format(path).await.unwrap_or(initial))
+	}
 
-		// Re-stat: the chain mutated the file, so the bytes-on-disk
-		// length and mtime have moved. Cheap (single `stat`), only
-		// runs when we actually formatted.
-		let abs_str = self.absolute_path(path).await?;
-		let abs = Utf8PathBuf::from(abs_str);
-		match tokio::fs::metadata(abs.as_std_path()).await {
-			Ok(metadata) => Ok(WriteFileResult {
-				mtime_ms: metadata.modified().ok().and_then(system_time_to_ms),
-				bytes_written: metadata.len(),
-			}),
-			Err(err) => {
-				tracing::warn!(path = %abs, %err, "format-on-save: post-format stat failed");
-				Ok(initial)
-			}
+	async fn format_file(&self, path: &Utf8Path) -> MoonResult<WriteFileResult> {
+		// Coder turn-end flush entry point. The bytes are already on
+		// disk (a previous `write_file` from the edit/write tool
+		// landed them). Run the same two stages `save_file` runs but
+		// sourced from disk: read → editorconfig → write back → lint
+		// -staged chain. Same best-effort posture: a missing tool or
+		// non-zero exit collapses to a warn and we return the current
+		// stat instead of aborting.
+		let read = self.read_file(path).await?;
+		if read.is_binary {
+			return self.stat_as_write_result(path).await;
 		}
+		let ec = self.editorconfig.for_path(path).await?;
+		let normalized = pre_save::apply_pipeline(&read.text, &ec);
+		let after_editorconfig = if normalized == read.text {
+			// Skip the write if editorconfig is a no-op so the mtime
+			// only moves when bytes actually change. Important for
+			// the file-watcher path: a turn full of trivial edits
+			// that leave bytes unchanged after editorconfig
+			// shouldn't fire watcher events.
+			self.stat_as_write_result(path).await?
+		} else {
+			self.write_file(path, &normalized).await?
+		};
+		if !self.run_formatter_chain(path).await {
+			return Ok(after_editorconfig);
+		}
+		Ok(self.restat_after_format(path).await.unwrap_or(after_editorconfig))
 	}
 
 	async fn git_status_entries(&self, paths: &[String]) -> MoonResult<Vec<GitStatusEntry>> {
@@ -7057,5 +7128,54 @@ mod tests {
 			!on_disk.contains("rustfmt-ran"),
 			"rustfmt fallback should not have fired; got: {on_disk:?}"
 		);
+	}
+
+	/// `format_file` is the coder's turn-end flush entry point: bytes
+	/// are already on disk (the agent's `write_file` / `edit_file`
+	/// tool landed them raw, with `host.write_file`), and we want
+	/// the same shape `save_file` would land if the user had typed
+	/// the file and hit `Ctrl+S`. Verify the chain runs and the
+	/// editorconfig pre-save normalises trailing whitespace on the
+	/// disk bytes.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn format_file_runs_editorconfig_and_lint_staged_chain_against_disk_bytes() {
+		let dir = TempDir::new().unwrap();
+		let h = host(&dir);
+
+		write_executable_script(
+			&dir.path().join("upper.sh"),
+			"#!/bin/sh\ntr '[:lower:]' '[:upper:]' < \"$1\" > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"\n",
+		);
+		std::fs::write(dir.path().join(".lintstagedrc.json"), r#"{ "*.txt": "./upper.sh" }"#).unwrap();
+		// Pre-seed the file with un-normalised bytes the way the
+		// coder's `write_file` tool would: raw, trailing whitespace
+		// intact, no final newline.
+		std::fs::write(dir.path().join("a.txt"), "hello world   ").unwrap();
+
+		let result = h.format_file(Utf8Path::new("a.txt")).await.unwrap();
+		let on_disk = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
+		// Editorconfig stripped the trailing run of spaces and added
+		// a final newline; lint-staged then uppercased the lot.
+		assert_eq!(on_disk, "HELLO WORLD\n");
+		assert_eq!(result.bytes_written, on_disk.len() as u64);
+	}
+
+	/// When the lint-staged chain doesn't match and editorconfig
+	/// is a no-op (bytes already canonical), `format_file` returns
+	/// the current stat without writing.
+	#[tokio::test]
+	async fn format_file_is_a_no_op_when_already_canonical_and_no_rule_matches() {
+		let dir = TempDir::new().unwrap();
+		let h = host(&dir);
+		std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+		let mtime_before = std::fs::metadata(dir.path().join("a.txt")).unwrap().modified().unwrap();
+		// Sleep briefly so a re-write would be detectable by mtime.
+		std::thread::sleep(std::time::Duration::from_millis(20));
+
+		let result = h.format_file(Utf8Path::new("a.txt")).await.unwrap();
+		let mtime_after = std::fs::metadata(dir.path().join("a.txt")).unwrap().modified().unwrap();
+		assert_eq!(mtime_before, mtime_after, "no-op format_file should not have written");
+		assert_eq!(result.bytes_written, 6);
 	}
 }

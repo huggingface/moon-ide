@@ -2,6 +2,7 @@
 
 - **Date**: 2026-05-05
 - **Phase**: Phase 8 (Lint / format) — early bootstrap slice
+- **Partially superseded by**: [ADR 0019](../decisions/0019-coder-format-on-save-deferred.md). The "coder/agent edits go through `save_file`" claim no longer holds: `write_file` / `edit_file` tools now write raw bytes and defer the full pipeline to turn end via `WorkspaceHost::format_file`. The `Ctrl+S` editor-save half of this plan still applies verbatim.
 
 ## What shipped
 
