@@ -29,6 +29,7 @@
 	} from '../editor/lsp';
 	import { diffPureChangeExtension } from '../editor/diffPureChange';
 	import { diffGutterTintExtension } from '../editor/diffGutterTint';
+	import { blameExtension, blameFacet } from '../editor/blame';
 	import { lspGotoDefinitionExtension } from '../editor/lspGotoDefinition';
 	import { lspOverviewExtension } from '../editor/lspOverview';
 	import { frontendLog } from '../logs.svelte';
@@ -98,6 +99,15 @@
 	// the other would wreck alignment between hunks.
 	const wrapA = new Compartment();
 	const wrapB = new Compartment();
+	// Right-pane git-blame facet. Same in-place reconfigure pattern
+	// as `Editor.svelte` so a late-arriving `workspace.blameByPath`
+	// entry lights up the current-line annotation without
+	// rebuilding the merge view. Left pane (HEAD blob) intentionally
+	// doesn't get blame: those lines are pinned to whatever HEAD
+	// says, and the per-line author is the same data we'd show on
+	// the editor view of the same file — duplicating it on both
+	// columns just adds visual noise.
+	const blameB = new Compartment();
 
 	// In single-tab model, `file.path` is stable for the lifetime of
 	// this DiffView instance — the EditorPane swaps Editor ↔ DiffView
@@ -362,6 +372,16 @@
 			? []
 			: [gitChangesExtension(), headB.of(headTextFacet.of(head)), overviewMountFacet.of(() => host)];
 
+		// Inline git-blame annotation, same as the regular editor.
+		// Deleted buffers skip it: the right pane is empty and
+		// read-only for them, so there's nothing to annotate.
+		// Staleness while typing matches editor mode — lines below
+		// an insertion show the wrong author until the next save
+		// re-runs `git blame`.
+		const blameExtensions: Extension[] = file.isDeleted
+			? []
+			: [blameExtension(), blameB.of(blameFacet.of(workspace.blameByPath.get(path) ?? null))];
+
 		const rightExtensions: Extension[] = [
 			lineNumbers(),
 			// Tint the line-number cell green on added / modified
@@ -390,6 +410,7 @@
 			highlightSelectionMatches(),
 			highlightTabs(),
 			...gitChangeExtensions,
+			...blameExtensions,
 			...lspExtensions,
 			keymap.of([
 				// Alt+Left / Alt+Right ride the global handler in
@@ -653,6 +674,23 @@
 			});
 			merge.b.focus();
 			workspace.consumePendingJump(folder, file.path);
+		});
+	});
+
+	// Blame updates from `workspace.blameByPath` (post-save refresh,
+	// folder swap, etc). Mirrors `Editor.svelte`'s same-named effect:
+	// reconfiguring the facet triggers the ViewPlugin's blame
+	// branch on the next CM transaction without rebuilding state.
+	// Skipped for deleted buffers — the right pane carries no
+	// blame extension to reconfigure.
+	$effect(() => {
+		const blame = workspace.blameByPath.get(file.path) ?? null;
+		const m = merge;
+		if (!m || file.isDeleted) {
+			return;
+		}
+		m.b.dispatch({
+			effects: blameB.reconfigure(blameFacet.of(blame)),
 		});
 	});
 

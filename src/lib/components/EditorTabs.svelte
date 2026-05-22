@@ -69,7 +69,21 @@
 		return status === 'modified' || status === 'conflicted';
 	});
 	const currentView: ViewMode = $derived(diffMode ? 'diff' : previewMode === 'preview' ? 'preview' : 'source');
-	const showViewToggle = $derived(!activeIsDeleted && (activeIsMarkdown || canDiff));
+	// Show the toggle group when:
+	//  - the file is markdown (Source/Preview always makes sense), or
+	//  - the file is currently modified vs. HEAD (`canDiff` —
+	//    Source/Diff is the useful pair), or
+	//  - the buffer is *already* in diff mode. This last branch
+	//    is the escape hatch for the case where the buffer is in
+	//    diff mode but its git status has since flipped to clean
+	//    (external commit, revert via the SCM panel, AI agent
+	//    landed the change, …). Without it, `canDiff` drops to
+	//    false, the toolbar disappears, and the user is stuck in
+	//    `DiffView` with no in-pane way out — only `Ctrl+Shift+D`
+	//    or the command palette. The toolbar staying visible with
+	//    a `Source` button (and a `Diff` button that's already
+	//    selected) lets the user flip back with one click.
+	const showViewToggle = $derived(!activeIsDeleted && (activeIsMarkdown || canDiff || diffMode));
 	// Revert icon: shows whenever there's a HEAD state to fall back
 	// to (modified or deleted). Untracked / added / clean don't get
 	// the icon — for those, "revert" either means trashing the file
@@ -485,7 +499,15 @@
 						Preview
 					</button>
 				{/if}
-				{#if canDiff}
+				{#if canDiff || diffMode}
+					<!-- Render the Diff button whenever Diff is either
+					     meaningful (`canDiff`) or currently active
+					     (`diffMode`). The `|| diffMode` branch covers
+					     the stuck-in-diff case described on
+					     `showViewToggle`: status flipped to clean
+					     while diff mode is still on, so we keep the
+					     button visible (selected) so the user can
+					     flip back to Source. -->
 					<button
 						type="button"
 						class="view-btn"

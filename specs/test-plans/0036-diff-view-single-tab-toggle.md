@@ -88,7 +88,7 @@ Prerequisites: `bun install`, `bun run tauri dev`, a bound git-repo folder with 
 1. In editor mode, hover over an identifier — LSP hover popover appears. Ctrl/Cmd-click — goto-def jumps. Both still work.
 2. Inline blame badge sits at end of the caret's line. Hovering it opens the commit tooltip.
 3. Flip into diff mode. **LSP affordances also work on the right pane**: hover popovers, Ctrl/Cmd-click goto-def, completion (manual trigger via `Ctrl-Space`), and diagnostics squigglies are all wired into the right-side editor. Edits route through the same `workspace.updateText` → `lspScheduleUpdate` path, so as you type the LSP server stays in sync.
-4. Inline blame is **not** wired into the diff view (the blame extension hooks into a single CM view; we keep it on editor mode only). Flip back for blame.
+4. **Inline blame** rides the right pane too: the same `BlameWidget` widget as the editor view annotates the caret's current line with author + relative date + commit summary, and the hover popover with PR linkification works the same way. Reconfigured live off `workspace.blameByPath` so a post-save refresh updates the badge without rebuilding the merge view. Skipped on deleted-file buffers (empty read-only right pane — nothing to annotate).
 5. Flip back to editor. All editor-side affordances return immediately, no state was lost.
 6. Open a fresh untitled file. Tri-state is hidden. LSP / autocomplete on a typed `untitled:` TS buffer works as before.
 
@@ -103,7 +103,7 @@ Prerequisites: `bun install`, `bun run tauri dev`, a bound git-repo folder with 
 ## Known limitations
 
 - Toggle is transient. We considered persisting it (like markdown preview's `previewModes` is) but diff is more of a "right now I want to see what changed" gesture; persisting it would mean a buffer the user left in diff mode three days ago re-opens to a `MergeView` instead of an editor, which is rarely what they want. Trivial to flip if the team disagrees in practice.
-- Inline blame doesn't render on the diff view (the blame badge widget assumes a single non-merge CM view); flip back to editor mode for blame.
+- Blame staleness while typing matches editor mode: lines below an insertion show the wrong author until the next save re-runs `git blame`. The single shared `OpenFile.text` buffer means a save in either view (Source or Diff) refreshes blame for both.
 - `revertControls: 'a-to-b'` only goes HEAD → working tree. No "promote my edit into HEAD" — that's staging, which we haven't built.
 - The Diff button reads as "Diff" rather than a richer label like "Changes" or an icon. Consistent with `Source` / `Preview`'s plain-text style; we'll revisit when icons land.
 - F7 / Shift-F7 (next/prev chunk) only fire when the right-side editor has focus. Outside it (e.g. focus is in the left pane), they don't.
