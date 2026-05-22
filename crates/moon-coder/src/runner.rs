@@ -341,7 +341,16 @@ struct Session {
 	/// shape forbids a user message between an `assistant` with
 	/// `tool_calls` and its `tool` result rows, so persisting at
 	/// queue time would corrupt the on-disk transcript and break
-	/// session reload. Pop with [`Coder::unqueue_steer`] (`ArrowUp`
+	/// session reload. When the model emits a final response with
+	/// no tool calls, `run_turn` re-checks this queue before
+	/// returning and loops one more iteration if it's non-empty —
+	/// otherwise a steer typed during the final streaming message
+	/// would sit here forever, since there'd be no next iteration
+	/// top to drain it. The spawn task wrapping `run_turn` also
+	/// re-checks under the `turn` lock so a steer that slips in
+	/// between the in-loop check and the spawn task clearing
+	/// `cancel` still earns another `run_turn` invocation.
+	/// Pop with [`Coder::unqueue_steer`] (`ArrowUp`
 	/// on an empty composer in the panel) to take a queued steer
 	/// back before drain. In-memory only; undrained steers don't
 	/// hit disk (they live here, not in the JSONL), so a reload
@@ -1773,26 +1782,52 @@ impl CoderHandle {
 		let sink_for_turn = sink.clone();
 		let folder_for_turn = folder_path.clone();
 		tokio::spawn(async move {
-			// One queue per turn. `run_turn` hands it to every
-			// dispatched `write_file` / `edit_file` via the
-			// `ToolContext`; the post-turn flush below runs the
-			// format-on-save pipeline against each unique path
-			// exactly once, regardless of how the turn ended
-			// (Ok / Aborted / Err — Esc'd or errored turns still
-			// land formatted bytes for whatever the model managed
-			// to write before bailing).
-			let format_queue = Arc::new(crate::tools::FormatQueue::default());
-			let result = run_turn(
-				&state,
-				&rt_for_turn,
-				&folder_for_turn,
-				&sink_for_turn,
-				cancel_outer,
-				format_queue.clone(),
-			)
-			.await;
-			rt_for_turn.turn.lock().await.cancel = None;
-			flush_format_queue(&state, &format_queue).await;
+			// Loop wrapper closes the race between `run_turn`
+			// returning `Ok(())` and the spawn task clearing
+			// `turn.cancel`: a steer queued in that window lands
+			// in `pending_steers` (because `send` still sees a
+			// turn in flight) but would otherwise be orphaned —
+			// `run_turn` already finished its in-loop "any
+			// stragglers?" check. Re-checking here under both the
+			// `turn` and `session` locks linearises with `send`'s
+			// turn→session take order: while we hold `turn`,
+			// `send` can't observe the just-cleared state and
+			// start a fresh turn, so either there's a steer to
+			// drain (we loop) or there isn't (we clear and exit).
+			//
+			// One format queue per `run_turn` call — between
+			// sub-turns we flush so the next iteration's tools
+			// see formatted bytes on disk, and we hand the next
+			// `run_turn` a fresh empty queue.
+			let result = loop {
+				let format_queue = Arc::new(crate::tools::FormatQueue::default());
+				let result = run_turn(
+					&state,
+					&rt_for_turn,
+					&folder_for_turn,
+					&sink_for_turn,
+					cancel_outer.clone(),
+					format_queue.clone(),
+				)
+				.await;
+				flush_format_queue(&state, &format_queue).await;
+				if !matches!(result, Ok(())) {
+					rt_for_turn.turn.lock().await.cancel = None;
+					break result;
+				}
+				let mut turn = rt_for_turn.turn.lock().await;
+				if rt_for_turn.session.lock().await.pending_steers.is_empty() {
+					turn.cancel = None;
+					break result;
+				}
+				// Stragglers from the race window. Drop the turn
+				// lock and re-enter `run_turn`; its iteration top
+				// will drain them into `messages` and run another
+				// LLM round-trip. Keep `cancel` set so a concurrent
+				// `send` still queues instead of starting a fresh
+				// turn.
+				drop(turn);
+			};
 			match &result {
 				Ok(()) => {
 					sink_for_turn.send(CoderEvent::TurnComplete);
@@ -2260,7 +2295,23 @@ async fn run_turn(
 		}
 
 		if response.tool_calls.is_empty() {
-			return Ok(());
+			// Final assistant message of the turn — unless the user
+			// queued a steer while it was streaming. We can't just
+			// return: `drain_pending_steers` runs at the **top** of
+			// each iteration, so a steer landing in `pending_steers`
+			// during the last response would be orphaned (the queue
+			// would sit there with no future iteration to drain it,
+			// because the next `send` starts a fresh turn rather than
+			// resuming this one). Peek the queue under the session
+			// lock; if non-empty, fall through to the next iteration
+			// where the existing drain at the top consumes it. The
+			// post-`run_turn` spawn task closes the residual race
+			// (steer queued between this check and the spawn task
+			// clearing `cancel`).
+			if rt.session.lock().await.pending_steers.is_empty() {
+				return Ok(());
+			}
+			continue;
 		}
 
 		dispatch_tool_calls(state, rt, sink, &cx, &cancel, &response.tool_calls).await?;

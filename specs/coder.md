@@ -96,7 +96,17 @@ Three control surfaces:
   on its next round-trip. Persistence happens at drain time, never
   at queue time, because the OpenAI / Anthropic chat shape forbids
   a user message between an `assistant.tool_calls` and its tool
-  result rows; persisting then would corrupt session reload.
+  result rows; persisting then would corrupt session reload. When
+  the model emits a final response with no tool calls — what would
+  otherwise end the turn — the runner re-checks `pending_steers`
+  under the session lock and, if non-empty, continues the loop
+  rather than returning, so a steer queued during the streaming of
+  the final assistant message still earns an extra LLM round-trip
+  instead of being orphaned. The spawn task wrapping `run_turn`
+  closes the residual race (steer queued between that check and
+  the turn task clearing `cancel`) by re-checking under both the
+  `turn` and `session` locks before clearing `cancel`; this take
+  order matches `send`'s, so the two are linearisable.
   Aborts (`Esc`) drop undrained steers — pressing Esc throws away
   in-flight intent, including queued context.
 - **Follow-up** (Alt+Enter while idle-but-just-finished): future —
