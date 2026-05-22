@@ -1798,7 +1798,18 @@ impl CoderHandle {
 					sink_for_turn.send(CoderEvent::TurnComplete);
 					maybe_autosync_to_hub(&state, &rt_for_turn, &folder_for_turn).await;
 				}
-				Err(CoderError::Aborted) => sink_for_turn.send(CoderEvent::Aborted),
+				Err(CoderError::Aborted) => {
+					// Backfill `Tool` results for any tool_call ids
+					// the assistant emitted before we cancelled —
+					// otherwise the next prompt in this session
+					// ships an unpaired `tool_use` to the provider
+					// and the HTTP call fails with a 400. Idempotent
+					// on disk: persisted `Tool` records mean
+					// reload-time recovery in `open_session` finds
+					// no further orphans to synthesise.
+					recover_in_memory_orphans(&rt_for_turn, &sink_for_turn).await;
+					sink_for_turn.send(CoderEvent::Aborted);
+				}
 				Err(err) => {
 					tracing::warn!(error = %err, "coder turn failed");
 					sink_for_turn.send(CoderEvent::Error {
@@ -2706,6 +2717,77 @@ async fn handle_todo_write(rt: &Arc<SessionRuntime>, args: &Value) -> Result<Val
 		}
 	}
 	Ok(json!({ "todos": merged }))
+}
+
+/// Walk the session's in-memory `messages` for assistant tool
+/// calls that never got a matching `Tool` result. Used when a
+/// turn ends in `Aborted` (Esc / panel close / sign-out) — the
+/// assistant record already landed in `messages` and on disk
+/// before the dispatcher was cancelled, so without recovery the
+/// next turn would ship a malformed history to the provider
+/// (Anthropic returns HTTP 400 "`tool_use` ids were found
+/// without `tool_result` blocks"; OpenAI / others reject it
+/// similarly). For each orphan we:
+///
+/// - Push a synthetic `ChatMessage::Tool` carrying the
+///   `INTERRUPTED_TOOL_RESULT_JSON` sentinel onto `messages` so
+///   the immediately-following user prompt has a valid
+///   assistant→tool→user sequence.
+/// - Append a matching `SessionRecord::Tool` to the JSONL so a
+///   reload sees the same shape we just produced in memory
+///   (reload-time orphan recovery in `open_session` then has
+///   nothing left to synthesise — idempotent).
+/// - Emit a `CoderEvent::ToolResult { is_error: true }` so the
+///   panel flips the row from "running" to error and the
+///   transcript matches what reload would render.
+///
+/// Order-preserving: orphans are appended to `messages` in the
+/// order their tool_calls appear in the transcript, matching
+/// `sessions::orphan_tool_call_ids`'s contract.
+async fn recover_in_memory_orphans(rt: &Arc<SessionRuntime>, sink: &FolderEventSink) {
+	// Snapshot the orphan ids under the session lock, then drop
+	// it before we hit the disk / event sink. Persistence
+	// re-acquires the lock briefly per record, which is cheap.
+	let orphan_ids: Vec<String> = {
+		let session = rt.session.lock().await;
+		let mut completed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+		for msg in &session.messages {
+			if let ChatMessage::Tool { tool_call_id, .. } = msg {
+				completed.insert(tool_call_id.as_str());
+			}
+		}
+		let mut orphans: Vec<String> = Vec::new();
+		for msg in &session.messages {
+			if let ChatMessage::Assistant { tool_calls, .. } = msg {
+				for call in tool_calls {
+					if !completed.contains(call.id.as_str()) {
+						orphans.push(call.id.clone());
+					}
+				}
+			}
+		}
+		orphans
+	};
+	if orphan_ids.is_empty() {
+		return;
+	}
+	{
+		let mut session = rt.session.lock().await;
+		for id in &orphan_ids {
+			session.messages.push(ChatMessage::Tool {
+				tool_call_id: id.clone(),
+				content: sessions::INTERRUPTED_TOOL_RESULT_JSON.to_string(),
+			});
+		}
+	}
+	for id in &orphan_ids {
+		persist_tool_record(rt, id, sessions::INTERRUPTED_TOOL_RESULT_JSON).await;
+		sink.send(CoderEvent::ToolResult {
+			id: id.clone(),
+			result: serde_json::json!({ "error": "Interrupted before tool completed." }),
+			is_error: true,
+		});
+	}
 }
 
 /// Shared "tool finished, push result + emit events + persist"
@@ -4411,5 +4493,151 @@ mod tests {
 		// No assistant → bytes/4 of the whole array (20), not
 		// the stale anchor.
 		assert_eq!(estimate_prompt_with_anchor(Some(&last), &messages), 20);
+	}
+
+	#[tokio::test]
+	async fn recover_in_memory_orphans_fills_unpaired_tool_calls() {
+		// Simulate the on-disk + in-memory state we land in
+		// after the user Esc's a turn mid-tool: the assistant
+		// record (with `tool_calls`) is in `messages` and the
+		// JSONL, but no matching `Tool` ever landed. Without
+		// recovery the very next `chat_completion` request
+		// ships an unpaired `tool_use` and gets HTTP 400.
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let header = header_for("sess-orphan");
+		let mut session = Session::new_blank();
+		session.header = header.clone();
+		session.session_dir = Some(dir.clone());
+		let assistant = ChatMessage::Assistant {
+			content: None,
+			tool_calls: vec![crate::inference::ToolCall {
+				id: "call-1".into(),
+				kind: "function".into(),
+				function: crate::inference::FunctionCall {
+					name: "read_file".into(),
+					arguments: "{}".into(),
+				},
+			}],
+		};
+		session.messages = vec![
+			ChatMessage::System { content: "sys".into() },
+			ChatMessage::user("read foo.rs"),
+			assistant.clone(),
+		];
+		// Persist the user + assistant records the way a real
+		// turn would have, so the disk shape we're testing
+		// recovery against matches production.
+		sessions::append_record(
+			&dir,
+			&header,
+			&SessionRecord::User {
+				text: "read foo.rs".into(),
+				images: Vec::new(),
+			},
+		)
+		.await
+		.unwrap();
+		sessions::append_record(
+			&dir,
+			&header,
+			&SessionRecord::Assistant {
+				content: None,
+				thinking: None,
+				tool_calls: match &assistant {
+					ChatMessage::Assistant { tool_calls, .. } => tool_calls.clone(),
+					_ => unreachable!(),
+				},
+			},
+		)
+		.await
+		.unwrap();
+		session.persisted_records = 2;
+		let rt = Arc::new(SessionRuntime::new(session));
+
+		let (events, _rx) = broadcast::channel(16);
+		let mut rx = events.subscribe();
+		let sink = FolderEventSink::new(events, "/tmp/folder", "sess-orphan");
+
+		recover_in_memory_orphans(&rt, &sink).await;
+
+		// In-memory: orphan filled with a synthetic Tool
+		// carrying the sentinel JSON.
+		let messages = rt.session.lock().await.messages.clone();
+		let tail = messages.last().expect("messages non-empty");
+		match tail {
+			ChatMessage::Tool { tool_call_id, content } => {
+				assert_eq!(tool_call_id, "call-1");
+				assert_eq!(content, sessions::INTERRUPTED_TOOL_RESULT_JSON);
+			}
+			other => panic!("expected Tool, got {other:?}"),
+		}
+
+		// On disk: a matching SessionRecord::Tool got appended,
+		// so a reload from `open_session` finds no orphan to
+		// re-synthesise (idempotent).
+		let loaded = sessions::load(&dir, "sess-orphan").await.unwrap();
+		assert!(sessions::orphan_tool_call_ids(&loaded.records).is_empty());
+		let last_record = loaded.records.last().expect("at least one record");
+		match last_record {
+			SessionRecord::Tool { tool_call_id, content } => {
+				assert_eq!(tool_call_id, "call-1");
+				assert_eq!(content, sessions::INTERRUPTED_TOOL_RESULT_JSON);
+			}
+			other => panic!("expected Tool record on disk, got {other:?}"),
+		}
+
+		// Event: panel sees an errored ToolResult so the row
+		// flips from "running" to error.
+		let envelope = rx.try_recv().expect("ToolResult event emitted");
+		match envelope.event {
+			CoderEvent::ToolResult { id, is_error, .. } => {
+				assert_eq!(id, "call-1");
+				assert!(is_error);
+			}
+			other => panic!("expected ToolResult event, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn recover_in_memory_orphans_is_idempotent_for_completed_calls() {
+		// When every tool_call already has a matching Tool
+		// message, recovery is a no-op — no extra messages
+		// pushed, no events emitted, no disk writes.
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let header = header_for("sess-clean");
+		let mut session = Session::new_blank();
+		session.header = header.clone();
+		session.session_dir = Some(dir.clone());
+		session.messages = vec![
+			ChatMessage::user("read foo.rs"),
+			ChatMessage::Assistant {
+				content: None,
+				tool_calls: vec![crate::inference::ToolCall {
+					id: "call-1".into(),
+					kind: "function".into(),
+					function: crate::inference::FunctionCall {
+						name: "read_file".into(),
+						arguments: "{}".into(),
+					},
+				}],
+			},
+			ChatMessage::Tool {
+				tool_call_id: "call-1".into(),
+				content: "{\"ok\":true}".into(),
+			},
+		];
+		let before_len = session.messages.len();
+		let rt = Arc::new(SessionRuntime::new(session));
+
+		let (events, _rx) = broadcast::channel(16);
+		let mut rx = events.subscribe();
+		let sink = FolderEventSink::new(events, "/tmp/folder", "sess-clean");
+
+		recover_in_memory_orphans(&rt, &sink).await;
+
+		assert_eq!(rt.session.lock().await.messages.len(), before_len);
+		assert!(rx.try_recv().is_err());
 	}
 }
