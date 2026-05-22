@@ -51,9 +51,36 @@ export function openHostTerminal(): void {
 }
 
 /** True when a container terminal can actually be spawned —
- * i.e. the workspace has an id and its container is up. */
+ * i.e. the workspace has an id and its container is up.
+ *
+ * Synchronous; reads whatever `container.state` happens to hold
+ * right now. Callers that race the startup probe (terminal
+ * spawn helpers in particular) should `await
+ * container.awaitRefreshed()` first — otherwise the pre-resolve
+ * `null` state reads as "not running" and they silently fall
+ * back to host. */
 export function canOpenContainerTerminal(): boolean {
 	return container.state === 'running' && workspace.workspace?.id !== undefined;
+}
+
+/** Open a terminal in the preferred environment: container when
+ *  the workspace shell is up, host otherwise. Awaits any
+ *  in-flight `container.refresh()` first so a click that lands
+ *  during the startup probe doesn't get host'd just because
+ *  `container.state` hasn't resolved yet.
+ *
+ *  This is the helper user-driven spawns should reach for. The
+ *  bottom-panel quick-host / quick-container buttons (where the
+ *  user has already picked) and the launcher popover (where the
+ *  popover is gated on a known state) call the specific helpers
+ *  directly. */
+export async function openPreferredTerminal(): Promise<void> {
+	await container.awaitRefreshed();
+	if (canOpenContainerTerminal()) {
+		openContainerTerminal();
+		return;
+	}
+	openHostTerminal();
 }
 
 /** Open a container terminal at `/workspace/<active-folder>`,
@@ -163,11 +190,11 @@ export function ensureActiveFolderTerminal(): void {
 		bottomPanel.setActive(existing.id);
 		return;
 	}
-	if (canOpenContainerTerminal()) {
-		openContainerTerminal();
-		return;
-	}
-	openHostTerminal();
+	// Spawn a fresh one in the preferred mode. `openPreferredTerminal`
+	// awaits the in-flight container refresh so a folder switch
+	// triggered before the startup probe resolves still picks the
+	// container when it's up.
+	void openPreferredTerminal();
 }
 
 /** Snapshot the bottom panel's currently-active terminal as the

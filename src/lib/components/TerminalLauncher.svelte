@@ -41,7 +41,13 @@
 	);
 	const activeFolder = $derived(workspace.activeFolder);
 
-	function toggle() {
+	async function toggle() {
+		// Wait for the startup `container.refresh()` to settle so
+		// a click that lands during the cold-launch probe doesn't
+		// see a stale `null` state and silently open a host
+		// terminal. After the await `containerRunning` reads
+		// whatever the daemon actually says.
+		await container.awaitRefreshed();
 		if (!containerRunning) {
 			openHostTerminal();
 			return;

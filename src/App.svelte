@@ -16,7 +16,7 @@
 	import { coder } from './lib/coder.svelte';
 	import { bottomPanel } from './lib/bottomPanel.svelte';
 	import { terminal } from './lib/terminal.svelte';
-	import { canOpenContainerTerminal, openContainerTerminal, openHostTerminal } from './lib/openTerminal';
+	import { openPreferredTerminal } from './lib/openTerminal';
 	import { palette, reloadWindow, searchQueryFromSelection } from './lib/commands.svelte';
 	import { cycleFocus } from './lib/focus';
 	import { ipc } from './lib/ipc';
@@ -386,11 +386,7 @@
 				// panel was already visible (we're hiding it) or
 				// when there's already at least one tab to focus.
 				if (!wasVisible && bottomPanel.tabs.length === 0 && workspace.workspace) {
-					if (canOpenContainerTerminal()) {
-						openContainerTerminal();
-					} else {
-						openHostTerminal();
-					}
+					void openPreferredTerminal();
 				}
 				return;
 			}

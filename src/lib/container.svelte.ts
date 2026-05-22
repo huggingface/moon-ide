@@ -6,12 +6,13 @@
 //! and `App.svelte`.
 //!
 //! Phase 2.0 surface: poll on demand (workspace change + after
-//! every mutating action) and react to `container:state` events.
-//! No periodic poller — if the user runs `docker compose down`
-//! from a terminal, the IDE state stays stale until the next
-//! mutating action or window focus refresh. That's an explicit
-//! 2.0 trade-off; 2.2 adds a docker-events watcher on the Rust
-//! side and the staleness window collapses.
+//! every mutating action, plus a window-focus refresh wired in
+//! `wireRuntime`) and react to `container:state` events. No
+//! periodic poller — if the user runs `docker compose down`
+//! from a terminal while the IDE has focus, the IDE state stays
+//! stale until the next mutating action or focus blur/regain.
+//! That's an explicit 2.0 trade-off; 2.2 adds a docker-events
+//! watcher on the Rust side and the staleness window collapses.
 
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
@@ -45,6 +46,11 @@ class ContainerPanelState {
 
 	#unlisten: UnlistenFn[] = [];
 	#runtimeWired = false;
+	/** In-flight `refresh()` promise. Callers that need a truthful
+	 *  status answer (the terminal-spawn helpers in particular) await
+	 *  this so they don't race the startup refresh and silently fall
+	 *  back to host. `null` between refreshes. */
+	#inFlightRefresh: Promise<void> | null = null;
 
 	/** True iff the IDE has a workspace open AND status has been loaded
 	 * at least once. The status-bar pip is hidden until then to avoid
@@ -56,6 +62,16 @@ class ContainerPanelState {
 	/** Convenience accessor for the high-level state. */
 	get state(): ContainerStatus['state'] | null {
 		return this.status?.state ?? null;
+	}
+
+	/** Resolve once any in-flight `refresh()` has settled. Used by
+	 *  terminal-spawn helpers so an early click during the startup
+	 *  probe doesn't see `status === null` and pick host by default.
+	 *  Resolves immediately when no refresh is pending. */
+	async awaitRefreshed(): Promise<void> {
+		if (this.#inFlightRefresh) {
+			await this.#inFlightRefresh;
+		}
 	}
 
 	/**
@@ -78,6 +94,16 @@ class ContainerPanelState {
 			// miss out on updates from background events (docker
 			// daemon state changes etc). No actionable surface to
 			// flash for.
+		}
+		// Re-probe on window focus so external `docker compose`
+		// activity (the user ran `up`/`down` from a host terminal
+		// while moon-ide was in the background) reconciles without
+		// needing a pip click. Cheap — one `docker compose ps` per
+		// focus event.
+		if (typeof window !== 'undefined') {
+			window.addEventListener('focus', () => {
+				void this.refresh();
+			});
 		}
 	}
 
@@ -113,12 +139,25 @@ class ContainerPanelState {
 	 * command.
 	 */
 	async refresh(): Promise<void> {
-		try {
-			this.status = await ipc.container.status();
-			this.lastError = null;
-		} catch (err) {
-			this.lastError = formatError(err);
+		// Coalesce concurrent callers onto the same in-flight probe
+		// so `awaitRefreshed()` sees a single source of truth and a
+		// follow-up `refresh()` from a click handler doesn't double
+		// up on the daemon round-trip.
+		if (this.#inFlightRefresh) {
+			return this.#inFlightRefresh;
 		}
+		const run = (async () => {
+			try {
+				this.status = await ipc.container.status();
+				this.lastError = null;
+			} catch (err) {
+				this.lastError = formatError(err);
+			} finally {
+				this.#inFlightRefresh = null;
+			}
+		})();
+		this.#inFlightRefresh = run;
+		return run;
 	}
 
 	async setup(): Promise<void> {
