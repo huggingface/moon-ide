@@ -153,17 +153,33 @@ pub struct GitBranchInfo {
 	/// Whether the current branch has a configured upstream
 	/// (`branch.<name>.remote` + `branch.<name>.merge`). `false`
 	/// when the branch was just created locally and never pushed,
-	/// when HEAD is detached, when the folder isn't a git repo,
-	/// and when the branch's upstream is configured but currently
-	/// unreachable. Distinguishes "in sync with upstream" (push +
-	/// pull are no-ops, `ahead == behind == 0`, `has_upstream ==
-	/// true`) from "no upstream yet" (the SCM panel renders a
-	/// "Publish branch" affordance instead of the sync button).
+	/// when HEAD is detached, and when the folder isn't a git
+	/// repo. Distinguishes "has an upstream" (the SCM panel
+	/// renders Sync Changes) from "no upstream yet" (Publish
+	/// branch). Note that `branch.<name>.remote` can be either a
+	/// named remote (`"origin"`) or a git URL (`gh pr checkout`
+	/// on a fork PR points it at the fork URL); both count as
+	/// having an upstream, see `upstream_tracked` for the
+	/// distinction the UI cares about.
 	pub has_upstream: bool,
+	/// Whether the configured upstream is a tracked named remote
+	/// — i.e. `@{u}` resolves to a `refs/remotes/...` ref. `true`
+	/// for the normal `git clone` / `git push -u origin` shape;
+	/// `false` for the `gh pr checkout` fork-PR shape where
+	/// `branch.<name>.remote` is a bare URL and no remote-tracking
+	/// ref exists. The SCM panel uses this to decide whether the
+	/// `ahead` / `behind` counts are meaningful — when `false`,
+	/// they're always `0` (we can't compute counts without a
+	/// remote-tracking ref) and the panel shows Sync Changes
+	/// without count badges so the user can still push commits
+	/// back to the fork. Always `false` when `has_upstream ==
+	/// false`.
+	pub upstream_tracked: bool,
 	/// Number of commits the local branch has that its configured
 	/// upstream doesn't — commits that would be sent on the next
 	/// `git push`. `0` when there's no upstream configured, no
-	/// HEAD, or the count couldn't be determined.
+	/// HEAD, the upstream isn't tracked (`upstream_tracked ==
+	/// false`), or the count couldn't be determined.
 	pub ahead: u32,
 	/// Number of commits the upstream has that the local branch
 	/// doesn't — commits that would be merged in on the next

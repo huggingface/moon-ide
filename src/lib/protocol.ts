@@ -277,16 +277,31 @@ export type GitBranchInfo = {
 	name: string | null;
 	headShortSha: string | null;
 	/**
-	 * Whether the current branch has a configured upstream. `false`
+	 * Whether the current branch has a configured upstream
+	 * (`branch.<name>.remote` + `branch.<name>.merge`). `false`
 	 * for a freshly-created local branch never pushed, detached
 	 * HEAD, non-repo folders, and folders without git available.
 	 * Lets the SCM panel pick between the sync button (upstream
 	 * exists) and a "Publish branch" affordance (no upstream yet).
+	 * Note: a fork-PR upstream (set by `gh pr checkout`, where
+	 * `branch.<name>.remote` is a URL rather than a named remote)
+	 * still counts as having an upstream; see `upstreamTracked`.
 	 */
 	hasUpstream: boolean;
-	/** Commits the local branch has that upstream doesn't (push count). 0 when no upstream / no HEAD. */
+	/**
+	 * Whether the configured upstream is a tracked named remote
+	 * (`@{u}` resolves to a `refs/remotes/...` ref). `false` for
+	 * the `gh pr checkout` fork-PR shape where the upstream is a
+	 * bare URL; in that state the backend can't compute ahead /
+	 * behind without a network call, so `ahead` and `behind` are
+	 * always 0 and the SCM panel renders Sync Changes without
+	 * count badges so the user can still push back to the fork.
+	 * Always `false` when `hasUpstream` is `false`.
+	 */
+	upstreamTracked: boolean;
+	/** Commits the local branch has that upstream doesn't (push count). 0 when no upstream / no HEAD / untracked upstream. */
 	ahead: number;
-	/** Commits upstream has that the local branch doesn't (pull count). 0 when no upstream / no HEAD. */
+	/** Commits upstream has that the local branch doesn't (pull count). 0 when no upstream / no HEAD / untracked upstream. */
 	behind: number;
 	/**
 	 * Pre-built URL for opening a PR against the repo's primary

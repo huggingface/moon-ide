@@ -1633,7 +1633,7 @@ impl WorkspaceHost for LocalHost {
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
-			run_git_simple(&root, &["push"], "git push")
+			run_git_push(&root)
 		})
 		.await
 		.map_err(|e| MoonError::Internal(format!("git_push join error: {e}")))?
@@ -1828,27 +1828,44 @@ fn run_git_branch(root: &Utf8Path) -> GitBranchInfo {
 		.map(|s| s.trim().to_owned())
 		.filter(|s| !s.is_empty());
 
-	// `rev-parse --abbrev-ref --symbolic-full-name @{u}` exits 0
-	// with the upstream short name iff one is configured; exits
-	// non-zero ("no upstream configured for branch X" /
-	// "HEAD does not point to a branch") otherwise. We only need
-	// the boolean — the actual upstream name isn't surfaced in
-	// the UI yet, and resolving it doesn't talk to the network.
-	let has_upstream = Command::new("git")
-		.arg("-C")
-		.arg(root.as_std_path())
-		.args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
-		.output()
-		.ok()
-		.is_some_and(|o| o.status.success());
+	// "Upstream configured" means git knows where `push` / `pull`
+	// should go — i.e. `branch.<name>.merge` is set (with an
+	// accompanying `branch.<name>.remote`, named or URL). We read
+	// the config keys directly instead of `git rev-parse @{u}`
+	// because `@{u}` requires the remote to be a *named* remote
+	// with a remote-tracking ref, and `gh pr checkout` on a fork
+	// PR points `branch.<name>.remote` at the fork's git URL —
+	// no named remote, no remote-tracking ref, but pushing /
+	// pulling does work. Detached HEAD / non-repo collapse to
+	// `false` via the `name` filter.
+	let has_upstream = name.as_deref().is_some_and(|n| read_branch_upstream(root, n).is_some());
+
+	// `@{u}` resolves iff the upstream is a *tracked* named
+	// remote (refs/remotes/<remote>/<branch> exists). For the
+	// fork-PR shape (URL-only upstream) it doesn't resolve, so
+	// ahead/behind below can't be computed and the SCM panel
+	// switches to count-less Sync Changes. Cheap to call — no
+	// network, just a ref lookup.
+	let upstream_tracked = has_upstream
+		&& Command::new("git")
+			.arg("-C")
+			.arg(root.as_std_path())
+			.args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+			.output()
+			.ok()
+			.is_some_and(|o| o.status.success());
 
 	// `rev-list --count --left-right HEAD...@{u}` prints
 	// `<ahead>\t<behind>`: commits we have that upstream doesn't,
 	// then commits upstream has that we don't. Errors silently
-	// when no upstream is configured (a freshly-created branch
-	// not yet pushed, detached HEAD, fresh repo with no commits,
-	// etc.); the (0, 0) fallback is exactly the right "render no
-	// badges" signal for the UI in those cases.
+	// when `@{u}` can't be resolved — no upstream configured
+	// (fresh branch not yet pushed, detached HEAD, fresh repo),
+	// or the upstream points at a URL rather than a named remote
+	// (fork-PR config — see `has_upstream` above). The (0, 0)
+	// fallback is exactly the right "render no badges" signal
+	// for the UI in those cases; the user can still hit Sync to
+	// push, and a follow-up fetch from a named remote will fill
+	// the counts in.
 	let (ahead, behind) = Command::new("git")
 		.arg("-C")
 		.arg(root.as_std_path())
@@ -1905,6 +1922,7 @@ fn run_git_branch(root: &Utf8Path) -> GitBranchInfo {
 		name,
 		head_short_sha,
 		has_upstream,
+		upstream_tracked,
 		ahead,
 		behind,
 		pr_url,
@@ -2652,11 +2670,58 @@ fn cap_summary_at_char_boundary(text: String, cap: usize) -> String {
 	clipped
 }
 
+/// Push the current branch to its configured upstream using an
+/// explicit refspec — `git push <remote> HEAD:<merge_ref>` — when
+/// `branch.<name>.merge` is set. Falls back to bare `git push`
+/// when no upstream is configured (which will fail with git's
+/// standard "no upstream branch" message — the SCM panel
+/// surfaces "Publish branch" before the user gets here, so this
+/// is the safety-net path).
+///
+/// We avoid bare `git push` in the configured-upstream case
+/// because `push.default = simple` (git's default since 2.0)
+/// refuses to push when the local branch name differs from the
+/// merge target's name. That's the exact shape `gh pr checkout`
+/// produces for a fork PR whose head is on the fork's default
+/// branch: the local branch is named `<owner>/<head>` (to avoid
+/// colliding with the upstream's default branch) while
+/// `branch.<name>.merge` is `refs/heads/<head>`. Plain `git push`
+/// dies with `fatal: The upstream branch of your current branch
+/// does not match the name of your current branch`; the explicit
+/// refspec sidesteps the `simple` check by telling git exactly
+/// what we want.
+///
+/// Stderr is surfaced verbatim on failure (auth refused, non-
+/// fast-forward, network down, …) so the user gets git's own
+/// actionable hint.
+fn run_git_push(root: &Utf8Path) -> MoonResult<()> {
+	use std::process::Command;
+
+	let name = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+		.output()
+		.ok()
+		.filter(|o| o.status.success())
+		.and_then(|o| String::from_utf8(o.stdout).ok())
+		.map(|s| s.trim().to_owned())
+		.filter(|s| !s.is_empty());
+
+	if let Some(branch) = name {
+		if let Some((remote, merge)) = read_branch_upstream(root, &branch) {
+			let refspec = format!("HEAD:{merge}");
+			return run_git_simple(root, &["push", &remote, &refspec], "git push");
+		}
+	}
+	run_git_simple(root, &["push"], "git push")
+}
+
 /// Run `git <args>` from `root` and surface stderr verbatim on
-/// failure. Used by `git_push` and `git_pull` (and any future
-/// "shoot a git command and see if it worked" SCM action) so
-/// network / auth / merge-conflict messages reach the user
-/// without us second-guessing their wording.
+/// failure. Used by `git_pull` (and any future "shoot a git
+/// command and see if it worked" SCM action) so network / auth /
+/// merge-conflict messages reach the user without us second-
+/// guessing their wording.
 fn run_git_simple(root: &Utf8Path, args: &[&str], label: &str) -> MoonResult<()> {
 	use std::process::Command;
 
@@ -3910,6 +3975,40 @@ fn parse_diff_name_status_z(buf: &[u8]) -> Vec<GitStatusEntry> {
 		});
 	}
 	out
+}
+
+/// Read the configured upstream for a local branch: the
+/// `branch.<name>.remote` and `branch.<name>.merge` pair. Returns
+/// `None` when either key is missing (no upstream configured, e.g.
+/// a freshly-created local branch not yet pushed).
+///
+/// `remote` is either a named remote (`"origin"`) or a git URL
+/// (`gh pr checkout` on a fork PR points `branch.<name>.remote`
+/// straight at the fork URL rather than adding a named remote).
+/// `merge` is the full ref on the remote (`"refs/heads/master"`).
+/// Both forms are valid inputs to `git push <remote> <local>:<merge>`,
+/// which is what `git_push` uses to sidestep the `push.default = simple`
+/// failure when the local branch name differs from the merge target
+/// name (the typical fork-PR layout, where gh names the local branch
+/// `<owner>/<head>` to avoid colliding with the default branch).
+fn read_branch_upstream(root: &Utf8Path, branch: &str) -> Option<(String, String)> {
+	use std::process::Command;
+
+	let read = |key: &str| -> Option<String> {
+		Command::new("git")
+			.arg("-C")
+			.arg(root.as_std_path())
+			.args(["config", "--get", &format!("branch.{branch}.{key}")])
+			.output()
+			.ok()
+			.filter(|o| o.status.success())
+			.and_then(|o| String::from_utf8(o.stdout).ok())
+			.map(|s| s.trim().to_owned())
+			.filter(|s| !s.is_empty())
+	};
+	let remote = read("remote")?;
+	let merge = read("merge")?;
+	Some((remote, merge))
 }
 
 /// Resolve the primary remote's web URL, normalised for link-
@@ -6230,6 +6329,166 @@ mod tests {
 			"expected default_branch_behind to drop to 0 after merge, got {post:?}"
 		);
 		assert_eq!(post.name.as_deref(), Some("feature"));
+	}
+
+	/// Reproduces the `gh pr checkout <N>` shape for a fork PR
+	/// whose `maintainerCanModify` is `true`: the local branch's
+	/// `remote` / `pushRemote` are the fork's git URL (not a
+	/// named remote) and `merge` is `refs/heads/<head>`. The
+	/// local branch is named `<owner>/<head>` to avoid colliding
+	/// with the upstream's default branch.
+	///
+	/// Asserts:
+	///   - `has_upstream == true` — we read `branch.<name>.merge`
+	///     directly, not via `@{u}`, so URL upstreams count.
+	///   - `upstream_tracked == false` — `@{u}` doesn't resolve
+	///     because no remote-tracking ref exists.
+	///   - `git_push` succeeds — it uses `git push <remote-url>
+	///     HEAD:<merge>`, sidestepping `push.default = simple`'s
+	///     local-name ≠ merge-target-name complaint. A plain
+	///     `git push` on this config would fail with `fatal: The
+	///     upstream branch of your current branch does not match
+	///     the name of your current branch`.
+	#[tokio::test]
+	async fn fork_pr_upstream_detected_and_push_uses_explicit_refspec() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping fork-PR-upstream test");
+			return;
+		};
+
+		let root = TempDir::new().unwrap();
+		let fork = root.path().join("fork.git");
+		let local = root.path().join("local");
+
+		// Bare fork remote with an initial commit on `master` so
+		// the explicit-refspec push has a target ref to update.
+		run_git(&git, root.path(), &["init", "--bare", "-q", "-b", "master", "fork.git"]);
+
+		let seed = root.path().join("seed");
+		std::fs::create_dir_all(&seed).unwrap();
+		run_git(&git, &seed, &["init", "-q", "-b", "master"]);
+		run_git(&git, &seed, &["config", "user.email", "s@example.com"]);
+		run_git(&git, &seed, &["config", "user.name", "Seed"]);
+		run_git(&git, &seed, &["remote", "add", "origin", fork.to_str().unwrap()]);
+		std::fs::write(seed.join("README.md"), "v1\n").unwrap();
+		run_git(&git, &seed, &["add", "."]);
+		run_git(&git, &seed, &["commit", "-q", "-m", "initial"]);
+		run_git(&git, &seed, &["push", "-q", "-u", "origin", "master"]);
+
+		// Clone the fork — stand-in for the upstream repo the
+		// maintainer is reviewing the PR from. The local-side
+		// clone here doesn't matter; we just need a working tree
+		// with a `branch.<name>.{remote,merge,pushRemote}` config
+		// that points at a URL.
+		run_git(&git, root.path(), &["clone", "-q", fork.to_str().unwrap(), "local"]);
+		run_git(&git, &local, &["config", "user.email", "l@example.com"]);
+		run_git(&git, &local, &["config", "user.name", "Local"]);
+
+		// `gh pr checkout` for a fork PR with `maintainerCanModify`:
+		// fetch the head ref into a local branch named after the
+		// PR author (to avoid clobbering the default branch), then
+		// set the per-branch remote / pushRemote to the fork URL
+		// and merge to the head ref. We skip the fetch step here
+		// (the clone already has `master` checked out at the same
+		// commit) and just stamp the config.
+		run_git(&git, &local, &["checkout", "-q", "-b", "mmunson99/master"]);
+		let fork_url = fork.to_str().unwrap();
+		run_git(&git, &local, &["config", "branch.mmunson99/master.remote", fork_url]);
+		run_git(
+			&git,
+			&local,
+			&["config", "branch.mmunson99/master.pushRemote", fork_url],
+		);
+		run_git(
+			&git,
+			&local,
+			&["config", "branch.mmunson99/master.merge", "refs/heads/master"],
+		);
+
+		let local_root = Utf8PathBuf::from_path_buf(local.canonicalize().unwrap()).unwrap();
+		let host = LocalHost::new(local_root.clone());
+		let branch = host.git_branch().await.unwrap();
+
+		assert_eq!(branch.name.as_deref(), Some("mmunson99/master"));
+		assert!(
+			branch.has_upstream,
+			"URL-based upstream from `gh pr checkout` must count as configured, got {branch:?}"
+		);
+		assert!(
+			!branch.upstream_tracked,
+			"`@{{u}}` can't resolve a URL remote — upstream_tracked must be false, got {branch:?}"
+		);
+		assert_eq!(branch.ahead, 0, "no remote-tracking ref → no count, got {branch:?}");
+		assert_eq!(branch.behind, 0, "no remote-tracking ref → no count, got {branch:?}");
+
+		// Land a local commit, then push. Bare `git push` would
+		// fail here with the `push.default = simple` complaint
+		// because the local branch is `mmunson99/master` while
+		// the merge target is `refs/heads/master`. Our `git_push`
+		// uses the explicit refspec so this succeeds.
+		std::fs::write(local.join("CHANGE.md"), "fork-pr edit\n").unwrap();
+		run_git(&git, &local, &["add", "."]);
+		run_git(&git, &local, &["commit", "-q", "-m", "fork PR edit"]);
+		host
+			.git_push()
+			.await
+			.expect("git_push must succeed for fork-PR upstream");
+
+		// Round-trip the fork to make sure the commit actually
+		// landed on `refs/heads/master` (the merge target), not
+		// `refs/heads/mmunson99/master`.
+		let verify = root.path().join("verify");
+		run_git(
+			&git,
+			root.path(),
+			&["clone", "-q", "-b", "master", fork.to_str().unwrap(), "verify"],
+		);
+		assert!(
+			verify.join("CHANGE.md").exists(),
+			"fork's `master` should carry the new commit after push"
+		);
+	}
+
+	/// Normal `git clone` + branch-with-upstream: `@{u}` resolves
+	/// to a `refs/remotes/origin/<branch>` ref, so we expose both
+	/// `has_upstream == true` and `upstream_tracked == true`, and
+	/// ahead / behind populate from `rev-list --left-right`.
+	#[tokio::test]
+	async fn named_remote_upstream_is_tracked_and_counts_work() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping named-remote-upstream test");
+			return;
+		};
+
+		let root = TempDir::new().unwrap();
+		let remote = root.path().join("remote.git");
+		let local = root.path().join("local");
+
+		run_git(&git, root.path(), &["init", "--bare", "-q", "-b", "main", "remote.git"]);
+		let seed = root.path().join("seed");
+		std::fs::create_dir_all(&seed).unwrap();
+		run_git(&git, &seed, &["init", "-q", "-b", "main"]);
+		run_git(&git, &seed, &["config", "user.email", "s@example.com"]);
+		run_git(&git, &seed, &["config", "user.name", "Seed"]);
+		run_git(&git, &seed, &["remote", "add", "origin", remote.to_str().unwrap()]);
+		std::fs::write(seed.join("README.md"), "v1\n").unwrap();
+		run_git(&git, &seed, &["add", "."]);
+		run_git(&git, &seed, &["commit", "-q", "-m", "initial"]);
+		run_git(&git, &seed, &["push", "-q", "-u", "origin", "main"]);
+
+		run_git(&git, root.path(), &["clone", "-q", remote.to_str().unwrap(), "local"]);
+		run_git(&git, &local, &["config", "user.email", "l@example.com"]);
+		run_git(&git, &local, &["config", "user.name", "Local"]);
+
+		let local_root = Utf8PathBuf::from_path_buf(local.canonicalize().unwrap()).unwrap();
+		let branch = LocalHost::new(local_root).git_branch().await.unwrap();
+
+		assert_eq!(branch.name.as_deref(), Some("main"));
+		assert!(branch.has_upstream, "cloned branch has origin/main as upstream");
+		assert!(
+			branch.upstream_tracked,
+			"named-remote upstream must be tracked, got {branch:?}"
+		);
 	}
 
 	#[test]

@@ -265,11 +265,19 @@
 	}
 
 	// `true` iff the branch has commits to pull or push — the sync
-	// button is hidden otherwise. Counts render as separate spans
+	// button is shown otherwise. Counts render as separate spans
 	// inside the button so each direction can carry its own glyph
 	// (`N↓` for behind, `M↑` for ahead). Diverged branches show
 	// both, matching Cursor's / VSCode's "Sync Changes" pattern.
-	const canSync = $derived(!needsPublish && (branch.ahead > 0 || branch.behind > 0));
+	//
+	// For a fork-PR upstream (`!upstreamTracked`) we can't compute
+	// ahead / behind without a network call, so the counters are
+	// always 0. We surface the sync button anyway — without the
+	// count badges — so the user can still push commits back to
+	// the fork after committing locally. The button is a no-op
+	// (git reports "Everything up-to-date") when there's nothing
+	// to push, which is acceptable for the edge case.
+	const canSync = $derived(!needsPublish && (branch.ahead > 0 || branch.behind > 0 || !branch.upstreamTracked));
 
 	// Local short name of the repo's default branch, derived from
 	// the remote-tracking ref (`origin/main` → `main`). Used in
@@ -315,6 +323,12 @@
 		}
 		if (b > 0) {
 			return `Pull ${b} commit${b === 1 ? '' : 's'} from upstream`;
+		}
+		if (branch.hasUpstream && !branch.upstreamTracked) {
+			// Fork-PR upstream — we don't have a remote-tracking
+			// ref to count against, so the button is "push any
+			// local commits back to the fork" without a count.
+			return 'Push commits to upstream fork';
 		}
 		return '';
 	});
@@ -693,7 +707,13 @@
 		}
 		const initialAhead = branch.ahead;
 		const initialBehind = branch.behind;
-		if (initialAhead === 0 && initialBehind === 0) {
+		// Untracked upstream (fork-PR config) has unknown counts —
+		// fall through to a plain push so the user can still
+		// publish their commits. `git push` reports "Everything
+		// up-to-date" with success when there's nothing to push,
+		// which is fine.
+		const untrackedUpstream = branch.hasUpstream && !branch.upstreamTracked;
+		if (!untrackedUpstream && initialAhead === 0 && initialBehind === 0) {
 			return;
 		}
 		syncing = true;
@@ -710,7 +730,7 @@
 				await workspace.pullChanges();
 				return;
 			}
-			if (initialAhead > 0) {
+			if (initialAhead > 0 || untrackedUpstream) {
 				await workspace.pushChanges();
 			}
 			// Wait for the branch counters to refresh before
