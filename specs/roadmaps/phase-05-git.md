@@ -462,7 +462,9 @@ End-to-end the user flow is now:
 1. `git merge` fails (from "Update from main" or any external
    gesture). The fs-watcher sees `.git/MERGE_HEAD` appear and
    the SCM panel shifts into **merge-in-progress mode**: a
-   `Merging <ref>` pill in the header, the composer prefilled
+   `Merging <ref>` banner on its own row above the composer
+   (full-width so long refs don't crowd the branch label), the
+   composer prefilled
    from `.git/MERGE_MSG`, the regular split-button toggles
    (amend, commit-to-new-branch) hidden, and the
    sync / publish / update-from-main buttons hidden so the

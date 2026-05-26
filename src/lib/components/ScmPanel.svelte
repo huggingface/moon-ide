@@ -120,11 +120,11 @@
 
 	// Master switch for the merge-in-progress UI shape. Reading
 	// off `workspace.gitMergeState.inProgress` keeps every
-	// reshape (header pill, hidden sync buttons, commit-row
+	// reshape (merge banner, hidden sync buttons, commit-row
 	// label swap) on a single source of truth that the fs-watcher
-	// drives. The `Merging <ref>` pill prefers `mergingRef`;
+	// drives. The `Merging <ref>` banner prefers `mergingRef`;
 	// `mergingRef` itself falls back to a short SHA inside the
-	// backend, so a missing ref never blanks the pill.
+	// backend, so a missing ref never blanks the banner.
 	const mergeMode = $derived(workspace.gitMergeState.inProgress);
 	const unmergedCount = $derived(workspace.gitMergeState.unmergedPaths.length);
 	const mergeRefLabel = $derived(workspace.gitMergeState.mergingRef ?? 'merge');
@@ -938,21 +938,6 @@
 						vs {compareLabel}
 					</button>
 				{/if}
-				{#if mergeMode}
-					<!-- Status pill that announces "you are inside a merge". Click
-					     is no-op; the affordances live in the reshaped commit row
-					     below. Warning colour distinguishes the pill from the
-					     regular compare-baseline / changes pills. -->
-					<span
-						class="merge-pill"
-						title={unmergedCount > 0
-							? `Merging ${mergeRefLabel} — ${unmergedCount} unresolved`
-							: `Merging ${mergeRefLabel} — ready to commit`}
-						aria-label={`Merge in progress: ${mergeRefLabel}`}
-					>
-						Merging {mergeRefLabel}
-					</span>
-				{/if}
 				{#if changeCount > 0 || workspace.scmFilterOn}
 					<button
 						type="button"
@@ -971,6 +956,25 @@
 					</button>
 				{/if}
 			</div>
+		</div>
+	{/if}
+	{#if mergeMode}
+		<!-- Full-width banner that announces "you are inside a merge".
+			     Lives on its own row (rather than as a header pill) so a
+			     long `mergingRef` like `origin/feature/long-name` or a
+			     12-char SHA fallback can't crowd the branch label and the
+			     header icons. Inert; the actions live in the reshaped
+			     commit row below. -->
+		<div
+			class="merge-banner"
+			role="status"
+			aria-label={`Merge in progress: ${mergeRefLabel}`}
+			title={unmergedCount > 0
+				? `Merging ${mergeRefLabel} — ${unmergedCount} unresolved`
+				: `Merging ${mergeRefLabel} — ready to commit`}
+		>
+			<span class="merge-banner-label">Merging</span>
+			<span class="merge-banner-ref">{mergeRefLabel}</span>
 		</div>
 	{/if}
 	<div class="composer">
@@ -1680,26 +1684,44 @@
 	.compare-pill.active:hover {
 		filter: brightness(0.95);
 	}
-	/* "Merging <ref>" pill, only present while
-	   `workspace.gitMergeState.inProgress`. Warning palette
-	   distinguishes it from the regular changes-count + compare
-	   pills — the user is in a do-something-now state and the
-	   chrome should make that obvious. Inert (no hover / click);
-	   the actions live in the commit row below. */
-	.merge-pill {
-		display: inline-flex;
-		align-items: center;
-		height: 20px;
-		padding: 0 8px;
+	/* "Merging <ref>" banner, only present while
+	   `workspace.gitMergeState.inProgress`. Sits on its own row
+	   between the header and composer so a long ref (or the
+	   short-SHA fallback) can't crowd the branch label and the
+	   header icons. Warning palette distinguishes it from the
+	   compare-baseline / changes pills — the user is in a
+	   do-something-now state and the chrome should make that
+	   obvious. The ref ellipsizes if it's longer than the panel
+	   is wide; the title attribute carries the full string plus
+	   the unresolved count. Inert (no hover / click); the
+	   actions live in the commit row below. */
+	.merge-banner {
+		display: flex;
+		align-items: baseline;
+		gap: 6px;
+		min-width: 0;
+		padding: 4px 8px;
 		border: 1px solid color-mix(in srgb, var(--m-warning) 60%, transparent);
-		border-radius: 999px;
+		border-radius: 4px;
 		background: color-mix(in srgb, var(--m-warning) 14%, transparent);
 		color: var(--m-warning);
-		font-size: 10px;
+		font-size: 11px;
+	}
+	.merge-banner-label {
+		flex-shrink: 0;
 		font-family: var(--m-font-mono);
+		font-size: 10px;
 		text-transform: lowercase;
 		letter-spacing: 0.04em;
+		opacity: 0.85;
+	}
+	.merge-banner-ref {
+		flex: 1;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
 		white-space: nowrap;
+		font-family: var(--m-font-mono);
 	}
 	/* Abort-merge button — sits in the commit-row toggle slot
 	   during merge mode. Same footprint as the regular toggles

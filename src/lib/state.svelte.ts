@@ -1856,9 +1856,10 @@ class WorkspaceState {
 
 	/**
 	 * Snapshot of the active folder's in-flight merge. The SCM
-	 * panel reshapes itself (Merging pill, Commit merge / Abort
-	 * merge buttons, hidden sync controls) when `inProgress` is
-	 * true. Mirrors `moon_protocol::git::GitMergeState`.
+	 * panel reshapes itself (Merging banner above the composer,
+	 * Commit merge / Abort merge buttons, hidden sync controls)
+	 * when `inProgress` is true. Mirrors
+	 * `moon_protocol::git::GitMergeState`.
 	 *
 	 * Refreshed:
 	 *   - on folder switch alongside `refreshGitBranch`,
@@ -2317,7 +2318,15 @@ class WorkspaceState {
 			const result = await ipc.fs.gitCommit(message, false);
 			this.flash(`Committed ${result.shortSha}: ${result.summary}`);
 			this.scmFilterOn = false;
-			await this.refreshGitBranch();
+			// Refresh `gitMergeState` *before* returning so the SCM
+			// panel's merge-prefill `$effect` sees `inProgress: false`
+			// the moment the local handler clears `commitDraft`. The
+			// fs-watcher would refresh us too once `.git/MERGE_HEAD`
+			// disappears, but on that path there's a window where the
+			// effect re-runs with stale `inProgress: true` +
+			// `defaultMessage`, restamping `MERGE_MSG` back into the
+			// composer the user just submitted.
+			await Promise.all([this.refreshGitBranch(), this.refreshGitMergeState()]);
 			void this.refreshActiveFolder();
 			return true;
 		} catch (err) {
@@ -2381,7 +2390,11 @@ class WorkspaceState {
 		try {
 			await ipc.fs.gitMergeAbort();
 			this.flash('Merge aborted.');
-			await this.refreshGitBranch();
+			// Refresh `gitMergeState` synchronously alongside the
+			// branch so the panel's merge-prefill `$effect` sees
+			// `inProgress: false` before the local handler touches
+			// `commitDraft`. Same race as `commitMerge`.
+			await Promise.all([this.refreshGitBranch(), this.refreshGitMergeState()]);
 			void this.refreshActiveFolder();
 			return true;
 		} catch (err) {

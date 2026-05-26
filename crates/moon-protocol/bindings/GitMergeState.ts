@@ -6,9 +6,9 @@
  * working tree is mid-merge:
  *
  * 1. Whether `.git/MERGE_HEAD` exists at all (gates the
- *    `Merging <ref>` header pill, the "Commit merge" / "Abort
- *    merge" buttons, and the suppression of the sync /
- *    update-from-main buttons).
+ *    `Merging <ref>` banner above the composer, the "Commit
+ *    merge" / "Abort merge" buttons, and the suppression of
+ *    the sync / update-from-main buttons).
  * 2. A human-readable name for the ref being merged in
  *    (`merging_ref`), so the panel can say `Merging origin/main`
  *    instead of leaking a 40-char SHA.
@@ -28,7 +28,7 @@ export type GitMergeState = {
 /**
  * `true` iff `.git/MERGE_HEAD` exists. The SCM panel uses
  * this as the master switch for "merge-in-progress mode"
- * (header pill, reshaped commit row, abort affordance,
+ * (merge banner, reshaped commit row, abort affordance,
  * hidden sync buttons).
  */
 inProgress: boolean, 

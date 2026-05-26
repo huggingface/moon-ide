@@ -14,7 +14,9 @@
   git mutex (ADR 0015). `git_merge_state` reads `.git/MERGE_HEAD` +
   `.git/MERGE_MSG` and runs `git ls-files --unmerged`.
 - **SCM panel merge-mode reshape.** When `gitMergeState.inProgress`
-  flips on: `Merging <ref>` warning pill in the header, composer
+  flips on: `Merging <ref>` warning banner on its own row between
+  the header and the composer (full-width so a long ref or the
+  short-SHA fallback can't crowd the branch label), composer
   prefilled from `.git/MERGE_MSG`, **Commit merge** + **Abort
   merge** in the commit row, sync / publish / update-from-main
   hidden, "N files still have unresolved conflicts" hint below
@@ -68,7 +70,8 @@ Open `/tmp/moon-conflict` in moon-ide.
    `CONFLICT (content): Merge conflict in conflict.txt` line.
 3. **Within ~500 ms** (one fs-watcher debounce window) the SCM
    panel reshapes:
-   - Header gains a `Merging feature` pill in the warning colour
+   - A `Merging feature` banner appears on its own row between
+     the header and the composer, in the warning colour
      (yellow-ish).
    - The composer textarea is pre-filled with `.git/MERGE_MSG`
      content — typically `Merge branch 'feature'` plus a
