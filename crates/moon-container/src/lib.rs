@@ -26,6 +26,7 @@ pub mod port_forward;
 pub mod project;
 pub mod project_compose;
 pub mod restart_override;
+mod status_cache;
 
 pub use compose::{
 	generate_compose, BoundMount, ComposeRender, ComposeRenderOptions, SshAgentForward, SSH_AGENT_CONTAINER_PATH,

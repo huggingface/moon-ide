@@ -62,6 +62,7 @@
 //!   [`crate::discovery::discover_root_compose`] picked.
 
 use std::ffi::OsStr;
+use std::time::Instant;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use moon_protocol::container::{ContainerState, ContainerStatus};
@@ -73,6 +74,7 @@ use crate::network::{
 };
 use crate::project::{folder_slug, project_name_for_folder, project_name_for_id, ProjectName};
 use crate::restart_override::ensure_restart_override;
+use crate::status_cache;
 
 /// Handle for a single bound folder's compose project.
 ///
@@ -173,11 +175,24 @@ impl ProjectCompose {
 	/// when the project simply hasn't been brought up yet — the
 	/// daemon has nothing for `-p moon-ws-default-<slug>` and
 	/// reports an empty container list.
+	///
+	/// Reads are TTL-cached (see [`crate::status_cache`]). Every
+	/// mutating method below invalidates the cache on success.
 	pub async fn status(&self) -> Result<ContainerStatus, LifecycleError> {
-		let output = self.docker_compose(["ps", "--all", "--format", "json"]).await?;
-		let services = parse_ps_output(&output.stdout).map_err(LifecycleError::ParseError)?;
-		let state = aggregate_state(&services);
-		Ok(ContainerStatus { state, services })
+		status_cache::get_or_fetch(&self.project, &self.compose_file, Instant::now(), || async {
+			let output = self.docker_compose(["ps", "--all", "--format", "json"]).await?;
+			let services = parse_ps_output(&output.stdout).map_err(LifecycleError::ParseError)?;
+			let state = aggregate_state(&services);
+			Ok(ContainerStatus { state, services })
+		})
+		.await
+	}
+
+	/// Drop the cached `status()` reading so the next call
+	/// re-probes `docker compose ps`. Called by every mutating
+	/// method after `docker compose` succeeds.
+	fn invalidate_status_cache(&self) {
+		status_cache::invalidate(&self.project, &self.compose_file);
 	}
 
 	/// `docker compose up -d --wait` — start all of the folder's
@@ -193,17 +208,20 @@ impl ProjectCompose {
 	/// `psql -h db`). See [`crate::network`].
 	pub async fn up(&self) -> Result<(), LifecycleError> {
 		self.docker_compose(["up", "-d", "--wait"]).await?;
+		self.invalidate_status_cache();
 		self.attach_workspace_dev().await;
 		Ok(())
 	}
 
 	pub async fn pause(&self) -> Result<(), LifecycleError> {
 		self.docker_compose(["pause"]).await?;
+		self.invalidate_status_cache();
 		Ok(())
 	}
 
 	pub async fn resume(&self) -> Result<(), LifecycleError> {
 		self.docker_compose(["unpause"]).await?;
+		self.invalidate_status_cache();
 		Ok(())
 	}
 
@@ -217,6 +235,7 @@ impl ProjectCompose {
 		self
 			.docker_compose(["up", "-d", "--force-recreate", "--pull", "always", "--wait"])
 			.await?;
+		self.invalidate_status_cache();
 		self.attach_workspace_dev().await;
 		Ok(())
 	}
@@ -236,6 +255,7 @@ impl ProjectCompose {
 	/// every start/stop cycle for no benefit.
 	pub async fn stop(&self) -> Result<(), LifecycleError> {
 		self.docker_compose(["stop"]).await?;
+		self.invalidate_status_cache();
 		Ok(())
 	}
 
@@ -254,6 +274,7 @@ impl ProjectCompose {
 	pub async fn down(&self) -> Result<(), LifecycleError> {
 		self.detach_workspace_dev().await;
 		self.docker_compose(["down"]).await?;
+		self.invalidate_status_cache();
 		Ok(())
 	}
 
@@ -272,6 +293,7 @@ impl ProjectCompose {
 	/// be on it yet. Idempotent on the already-attached path.
 	pub async fn start_service(&self, service: &str) -> Result<(), LifecycleError> {
 		self.docker_compose(["start", service]).await?;
+		self.invalidate_status_cache();
 		self.attach_workspace_dev().await;
 		Ok(())
 	}
@@ -281,6 +303,7 @@ impl ProjectCompose {
 	/// user can `start_service` it again without losing state.
 	pub async fn stop_service(&self, service: &str) -> Result<(), LifecycleError> {
 		self.docker_compose(["stop", service]).await?;
+		self.invalidate_status_cache();
 		Ok(())
 	}
 
@@ -291,6 +314,7 @@ impl ProjectCompose {
 	/// "recreate from a fresh image" workflow.
 	pub async fn restart_service(&self, service: &str) -> Result<(), LifecycleError> {
 		self.docker_compose(["restart", service]).await?;
+		self.invalidate_status_cache();
 		self.attach_workspace_dev().await;
 		Ok(())
 	}

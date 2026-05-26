@@ -182,6 +182,15 @@ After binding moon-landing into a moon-ide workspace:
   bars catch silent crashes, and a tight 2 s poll on the folder
   whose popover is open so the in-flight `up -d --wait` view
   doesn't freeze on the pre-mutation snapshot.
+- Both `Workspace::status()` and `ProjectCompose::status()` are
+  TTL-cached process-wide (1 s; see
+  [ADR 0020](decisions/0020-container-status-cache.md) and
+  `crates/moon-container/src/status_cache.rs`). The pollers above
+  drive the cache, and any other caller in the same second
+  reuses the same reading instead of re-shelling out to
+  `docker compose ps`. Mutating commands (`setup` / `pause` /
+  `up` / `down` / …) invalidate the slot on success so a
+  follow-up `status()` returns the post-mutation truth.
 - The user's app continues to run wherever it ran before —
   on the host (reaching services through published host
   ports, exactly as today) or, once Phase 2.1 routes

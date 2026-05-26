@@ -62,6 +62,7 @@
 //!   status pip's "Cancel" button.
 
 use std::ffi::OsStr;
+use std::time::Instant;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use moon_protocol::container::{ContainerState, ContainerStatus, ServiceStatus};
@@ -77,6 +78,7 @@ use crate::network::{connect_container_to_network, dev_container_name, project_d
 use crate::port_forward::stop_forwards;
 use crate::project::{project_name_for_id, ProjectName, ProjectNameError};
 use crate::project_compose::ProjectCompose;
+use crate::status_cache;
 
 /// The image reference written into a freshly generated
 /// `compose.yaml` if the caller doesn't override it.
@@ -291,6 +293,11 @@ impl Workspace {
 	/// `compose.yaml` yet — opening a fresh workspace is the
 	/// common case and we don't want to pay a `docker compose`
 	/// invocation per open just to confirm "no, still nothing".
+	///
+	/// Reads are TTL-cached (see [`crate::status_cache`]). Every
+	/// mutating method below invalidates the cache on success so
+	/// `pause()` followed immediately by `status()` reports the
+	/// fresh `Paused` rather than a stale `Running`.
 	pub async fn status(&self) -> Result<ContainerStatus, LifecycleError> {
 		if !self.compose_path.is_file() {
 			return Ok(ContainerStatus {
@@ -298,10 +305,20 @@ impl Workspace {
 				services: Vec::new(),
 			});
 		}
-		let output = self.docker_compose(["ps", "--all", "--format", "json"]).await?;
-		let services = parse_ps_output(&output.stdout).map_err(LifecycleError::ParseError)?;
-		let state = aggregate_state(&services);
-		Ok(ContainerStatus { state, services })
+		status_cache::get_or_fetch(&self.project, &self.compose_path, Instant::now(), || async {
+			let output = self.docker_compose(["ps", "--all", "--format", "json"]).await?;
+			let services = parse_ps_output(&output.stdout).map_err(LifecycleError::ParseError)?;
+			let state = aggregate_state(&services);
+			Ok(ContainerStatus { state, services })
+		})
+		.await
+	}
+
+	/// Drop any cached `status()` reading so the next call
+	/// re-probes `docker compose ps`. Called by every mutating
+	/// method after the underlying `docker compose` succeeds.
+	fn invalidate_status_cache(&self) {
+		status_cache::invalidate(&self.project, &self.compose_path);
 	}
 
 	/// First-time opt-in: regenerate the workspace's compose
@@ -317,6 +334,7 @@ impl Workspace {
 	pub async fn setup(&self, dev_image: &str) -> Result<(), LifecycleError> {
 		self.write_state(dev_image).await?;
 		self.docker_compose(["up", "-d", "--wait"]).await?;
+		self.invalidate_status_cache();
 		self.reattach_running_projects().await;
 		Ok(())
 	}
@@ -343,6 +361,7 @@ impl Workspace {
 			// mount set changes — that drops every prior project-
 			// network attachment, same as `rebuild`. Reattach.
 			self.docker_compose(["up", "-d", "--wait"]).await?;
+			self.invalidate_status_cache();
 			self.reattach_running_projects().await;
 		}
 		Ok(())
@@ -353,12 +372,14 @@ impl Workspace {
 	/// callers should check [`Workspace::status`] first.
 	pub async fn pause(&self) -> Result<(), LifecycleError> {
 		self.docker_compose(["pause"]).await?;
+		self.invalidate_status_cache();
 		Ok(())
 	}
 
 	/// Inverse of [`Workspace::pause`].
 	pub async fn resume(&self) -> Result<(), LifecycleError> {
 		self.docker_compose(["unpause"]).await?;
+		self.invalidate_status_cache();
 		Ok(())
 	}
 
@@ -380,6 +401,7 @@ impl Workspace {
 		self
 			.docker_compose(["up", "-d", "--force-recreate", "--pull", "always", "--wait"])
 			.await?;
+		self.invalidate_status_cache();
 		self.reattach_running_projects().await;
 		Ok(())
 	}
@@ -393,6 +415,7 @@ impl Workspace {
 	/// `docker compose pause` from a terminal.
 	pub async fn stop(&self) -> Result<(), LifecycleError> {
 		self.docker_compose(["stop"]).await?;
+		self.invalidate_status_cache();
 		Ok(())
 	}
 
@@ -412,6 +435,7 @@ impl Workspace {
 			tracing::warn!(%err, project = %self.project, "best-effort stop of port-forward sidecar before teardown failed");
 		}
 		self.docker_compose(["down"]).await?;
+		self.invalidate_status_cache();
 		Ok(())
 	}
 
