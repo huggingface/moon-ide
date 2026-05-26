@@ -21,8 +21,11 @@
 
 use camino::Utf8PathBuf;
 use moon_container::{ProjectCompose, Workspace as ContainerWorkspace, WorkspaceConfig};
-use moon_protocol::container::ContainerState;
+use moon_protocol::container::{ContainerState, ContainerStateChange, ProjectComposeStateChange, ProjectComposeStatus};
+use tauri::{AppHandle, Emitter};
 
+use crate::commands::container::CONTAINER_STATE_EVENT;
+use crate::commands::project_compose::PROJECT_COMPOSE_STATE_EVENT;
 use crate::state::AppState;
 
 /// Stop the workspace shell and every bound-folder compose project.
@@ -149,9 +152,8 @@ pub async fn stop_all(state: &AppState) {
 ///
 /// Best-effort. If `setup` fails, the pip surfaces the error via
 /// the user's first popover open — the IDE itself still launches.
-pub async fn auto_resume_shell(state: &AppState) {
+pub async fn auto_resume_shell(app: &AppHandle, state: &AppState) {
 	use moon_container::DEFAULT_DEV_IMAGE;
-	use moon_protocol::container::ContainerState;
 
 	let snapshot = state.workspaces.snapshot().await;
 	let workspace_id = snapshot.id.clone();
@@ -183,12 +185,35 @@ pub async fn auto_resume_shell(state: &AppState) {
 		// resume. `Running` / `Creating` means it's already up.
 		// `Failed` we leave alone so the user sees the error
 		// surface in the popover instead of silently retrying.
+		//
+		// Still emit the snapshot so the frontend's startup
+		// `container.refresh()` — which races with this task
+		// and may have grabbed a stale `Absent` before the
+		// daemon had any state to report — gets the truth.
+		emit_container_state(app, status);
 		return;
 	}
 
 	tracing::info!("auto_resume_shell: previous session left the workspace shell stopped, resuming");
 	if let Err(err) = shell.setup(DEFAULT_DEV_IMAGE).await {
 		tracing::warn!(error = %err, "auto_resume_shell: setup failed");
+	}
+	// Whether setup succeeded or failed, broadcast the
+	// post-resume status so the pip flips to `Running` (or to
+	// `Failed`) without waiting for a user click. Without this
+	// event the frontend's startup `container.refresh()` racing
+	// with us would leave the pip on its pre-setup snapshot
+	// until the next focus event or popover open.
+	match shell.status().await {
+		Ok(status) => emit_container_state(app, status),
+		Err(err) => tracing::warn!(error = %err, "auto_resume_shell: post-resume status query failed"),
+	}
+}
+
+fn emit_container_state(app: &AppHandle, status: moon_protocol::container::ContainerStatus) {
+	let payload = ContainerStateChange { status };
+	if let Err(err) = app.emit(CONTAINER_STATE_EVENT, &payload) {
+		tracing::warn!(error = %err, "auto_resume_shell: failed to emit container:state");
 	}
 }
 
@@ -215,7 +240,7 @@ pub async fn auto_resume_shell(state: &AppState) {
 /// this *after* [`auto_resume_shell`] so the workspace dev
 /// container exists by the time `compose up` tries to attach it
 /// to each project's network.
-pub async fn auto_resume_project_composes(state: &AppState) {
+pub async fn auto_resume_project_composes(app: &AppHandle, state: &AppState) {
 	let snapshot = state.workspaces.snapshot().await;
 	let workspace_id = snapshot.id.clone();
 	let state_dir = state.workspace_state_dir(&workspace_id);
@@ -257,10 +282,13 @@ pub async fn auto_resume_project_composes(state: &AppState) {
 		// If the daemon already has the project running (last
 		// session crashed without shutdown), `up` is a no-op
 		// at the docker layer — skip the round-trip anyway to
-		// keep startup snappy.
+		// keep startup snappy. Still emit so the folder bar's
+		// indicator paints `Running` on first frame instead of
+		// waiting for the user to open the popover.
 		match project.status().await {
 			Ok(status) if status.state == ContainerState::Running => {
 				tracing::info!(folder = %folder_path, "auto_resume_project_composes: already running, skipping");
+				emit_project_compose_state(app, &folder_path, Some(&project), status);
 				continue;
 			}
 			Ok(_) => {}
@@ -273,6 +301,39 @@ pub async fn auto_resume_project_composes(state: &AppState) {
 		if let Err(err) = project.up().await {
 			tracing::warn!(error = %err, folder = %folder_path, "auto_resume_project_composes: up failed");
 		}
+		// Re-snapshot and broadcast so the folder bar reflects
+		// the post-`up` state (`Running`, or `Failed` on
+		// partial-apply) without a manual poll. Without this
+		// the frontend's startup `projectCompose.refreshAll`
+		// races us and may have already cached the pre-`up`
+		// `Stopped` snapshot.
+		match project.status().await {
+			Ok(status) => emit_project_compose_state(app, &folder_path, Some(&project), status),
+			Err(err) => {
+				tracing::warn!(error = %err, folder = %folder_path, "auto_resume_project_composes: post-up status query failed");
+			}
+		}
+	}
+}
+
+fn emit_project_compose_state(
+	app: &AppHandle,
+	folder_path: &Utf8PathBuf,
+	pc: Option<&ProjectCompose>,
+	status: moon_protocol::container::ContainerStatus,
+) {
+	let project = ProjectComposeStatus {
+		folder_path: folder_path.to_string(),
+		compose_file: pc.map(|p| p.compose_file().to_string()),
+		project_name: pc.map(|p| p.project().as_str().to_owned()),
+		status,
+	};
+	let payload = ProjectComposeStateChange {
+		folder_path: folder_path.to_string(),
+		project,
+	};
+	if let Err(err) = app.emit(PROJECT_COMPOSE_STATE_EVENT, &payload) {
+		tracing::warn!(error = %err, "auto_resume_project_composes: failed to emit project_compose:state");
 	}
 }
 

@@ -489,8 +489,8 @@ pub fn run() {
 				let app_handle = app.handle().clone();
 				tauri::async_runtime::spawn(async move {
 					let state = app_handle.state::<AppState>();
-					shutdown::auto_resume_shell(&state).await;
-					shutdown::auto_resume_project_composes(&state).await;
+					shutdown::auto_resume_shell(&app_handle, &state).await;
+					shutdown::auto_resume_project_composes(&app_handle, &state).await;
 				});
 			}
 
