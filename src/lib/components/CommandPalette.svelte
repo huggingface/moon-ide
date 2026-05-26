@@ -136,10 +136,44 @@
 		// match. Acceptable until we wire a proper byte→UTF-16 mapper;
 		// landing on the wrong column on the right line beats not
 		// landing at all (the prior behavior).
-		void workspace.jumpTo(hit.path, {
-			line: Math.max(0, hit.line - 1),
-			character: Math.max(0, hit.column - 1),
-		});
+		void (async () => {
+			await workspace.jumpTo(hit.path, {
+				line: Math.max(0, hit.line - 1),
+				character: Math.max(0, hit.column - 1),
+			});
+			// `jumpTo` → `setActive` already bumped `focusTick`, but the
+			// caret can still end up on the file-tree row instead of in
+			// the editor for two race reasons:
+			//
+			//   1. `scrollPathIntoView` (FileTree.svelte) briefly parks
+			//      DOM focus on the tree's shadow scroll container so
+			//      Pierre's layout effect will autoscroll a virtualized
+			//      row. The prior focus it restores is whatever
+			//      `document.activeElement` was when the dance started
+			//      — for a palette click that's `<body>` (the palette
+			//      input was just unmounted), not the editor. Pierre's
+			//      next layout effect then sees focus still inside the
+			//      tree (the row Pierre focused during the dance) and
+			//      keeps it there.
+			//   2. If the file opens in diff mode (sticky `diffModeFor`
+			//      for `modified` files), `DiffView` builds its
+			//      `MergeView` lazily in `onMount` → `buildMerge`
+			//      (multiple awaits). The first `focusTick` bump fires
+			//      while `merge` is still `undefined`, so the
+			//      DiffView focus effect no-ops. When `merge` resolves
+			//      the effect re-runs, but the file-tree dance can
+			//      already have parked focus on the row by then.
+			//
+			// Re-bumping `focusTick` after `jumpTo` resolves wins case 1
+			// (the Editor's effect queues a microtask that fires after
+			// Pierre's restore). A second deferred bump on the next
+			// macrotask covers case 2 — by then `buildMerge` has
+			// usually progressed past the editorconfig/language awaits
+			// and `merge` is defined, so the DiffView effect can
+			// actually focus its right pane.
+			workspace.requestEditorFocus();
+			setTimeout(() => workspace.requestEditorFocus(), 0);
+		})();
 	}
 
 	function onKey(event: KeyboardEvent) {
