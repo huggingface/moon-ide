@@ -548,23 +548,63 @@
 
 		// Caret restore order, highest precedence first:
 		//
-		//   1. View-state snapshot left by a previous mount of this
+		//   1. Pending goto-def / search-hit jump — anything queued
+		//      via `workspace.jumpTo` before the diff view mounted
+		//      (Ctrl+Shift+F result, `Go to Definition` from the
+		//      palette, coder tool-block click). The `pendingJumps`
+		//      effect below applies it in a microtask; we just skip
+		//      the snapshot / first-chunk restore so the later rAF
+		//      doesn't clobber the jump's scroll target.
+		//   2. View-state snapshot left by a previous mount of this
 		//      buffer (Editor or DiffView). This is what makes a
 		//      Ctrl+Shift+D toggle land back on the user's caret
 		//      instead of resetting to the first chunk.
-		//   2. First chunk's `fromB` — the legacy "open a 3000-line
+		//   3. First chunk's `fromB` — the legacy "open a 3000-line
 		//      file and jump to the one edit at line 2500" gesture
 		//      that fires on a clean first-time diff view.
-		//   3. Nothing (deleted-file panes have a read-only empty
+		//   4. Nothing (deleted-file panes have a read-only empty
 		//      right side; no chunks, no snapshot to restore).
-		//
-		// A pending goto-def jump still wins over both via the
-		// `pendingJumps` effect below, which queues another
-		// dispatch in a later microtask.
 		const folder = workspace.activeFolderPath;
+		const pendingJump = folder !== null ? workspace.pendingJumps.get(`${folder}::${file.path}`) : undefined;
 		const snapshot = folder !== null ? workspace.getViewState(folder, file.path) : null;
 		const chunks = merge.chunks;
-		if (snapshot !== null && !file.isDeleted) {
+		if (pendingJump && folder !== null && !file.isDeleted) {
+			// Apply the pending jump here (inside `buildMerge`)
+			// rather than leaving it to the `pendingJumps`
+			// `$effect` below for two reasons:
+			//
+			//   1. Same rAF deferral as the snapshot / first-chunk
+			//      branches. Dispatching `scrollIntoView` in a
+			//      microtask right after `new MergeView` runs the
+			//      target before CM has computed layout, and the
+			//      scroll lands at 0 — same race the first-chunk
+			//      block already documents.
+			//   2. Consuming the jump here means snapshot /
+			//      first-chunk restore stays skipped, and the
+			//      `$effect` consumer below (which is still wired
+			//      for jumps that arrive *after* the diff view has
+			//      mounted, e.g. Ctrl-click goto-def) has nothing
+			//      to do this build.
+			const docLen = merge.b.state.doc.length;
+			const target = pendingJump;
+			// Consume now so the `$effect` consumer below — which
+			// re-runs when `merge` becomes defined and would
+			// otherwise also fire a microtask-timed dispatch
+			// (with the race the rAF below avoids) — sees an
+			// empty `pendingJumps` for this buffer.
+			workspace.consumePendingJump(folder, file.path);
+			requestAnimationFrame(() => {
+				if (token !== buildToken || !merge) {
+					return;
+				}
+				const offset = Math.min(offsetForLspPosition(merge.b, target), docLen);
+				merge.b.dispatch({
+					selection: EditorSelection.cursor(offset),
+					effects: EditorView.scrollIntoView(offset, { y: 'center' }),
+				});
+				merge.b.focus();
+			});
+		} else if (snapshot !== null && !file.isDeleted) {
 			const docLen = merge.b.state.doc.length;
 			// `caret` / `selAnchor` to dodge the outer-scope `head`
 			// (HEAD blob text) shadowing.
@@ -636,13 +676,14 @@
 	// `Editor.svelte`; deleted buffers skip it because their right
 	// pane is empty and read-only.
 	//
-	// Ordering matters: read `pendingJumps` (and the other reactive
-	// inputs) *before* the `merge` check. `merge` is a plain `let`
-	// assigned inside the async `buildMerge`, so it's not reactive
-	// — if we early-returned on `!m` first, the effect would
-	// subscribe to nothing and never re-run when a jump arrives.
-	// The other `$effect`s above use the same trick; they happen to
-	// also have an obvious reactive lead (theme, headByPath, …).
+	// `merge` is `$state` so this effect re-runs when `buildMerge`
+	// finally assigns it — that's how a jump queued before the
+	// MergeView finished building (e.g. a `Ctrl+Shift+F` hit that
+	// opens a modified file fresh into diff mode) still gets
+	// applied. `buildMerge` skips its own snapshot / first-chunk
+	// scroll-restore when a pending jump exists for the buffer,
+	// so the microtask dispatch below isn't fighting a later rAF
+	// for the viewport.
 	$effect(() => {
 		const folder = workspace.activeFolderPath;
 		if (folder === null || file.isDeleted) {
