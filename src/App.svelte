@@ -17,7 +17,7 @@
 	import { bottomPanel } from './lib/bottomPanel.svelte';
 	import { terminal } from './lib/terminal.svelte';
 	import { openPreferredTerminal } from './lib/openTerminal';
-	import { palette, reloadWindow, searchQueryFromSelection } from './lib/commands.svelte';
+	import { palette, reloadWindow, searchPaletteInitialQuery, searchQueryFromSelection } from './lib/commands.svelte';
 	import { cycleFocus } from './lib/focus';
 	import { ipc } from './lib/ipc';
 	import { formatError } from './lib/protocol';
@@ -210,15 +210,18 @@
 			if (event.shiftKey && key === 'f') {
 				event.preventDefault();
 				// Pre-fill with the editor selection, mirroring
-				// VS Code / Cursor. The palette input auto-selects
-				// on focus so the user can immediately retype to
-				// replace, or just hit Enter to run the search.
-				// Force the replace row closed so the muscle-memory
+				// VS Code / Cursor — and when there's nothing
+				// selected, fall back to the last needle we ran
+				// this session so reopening the palette doesn't
+				// force a retype. The input auto-selects on focus
+				// so the user can immediately retype to replace,
+				// or just hit Enter to re-run the search. Force
+				// the replace row closed so the muscle-memory
 				// "open search" shortcut never lands on the wider
 				// refactor layout if a previous Ctrl+Shift+H left
 				// it open.
 				palette.setReplaceOpen(false);
-				palette.show('search', searchQueryFromSelection());
+				palette.show('search', searchPaletteInitialQuery());
 				return;
 			}
 			if (event.shiftKey && key === 'h') {

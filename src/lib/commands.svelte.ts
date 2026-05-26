@@ -58,6 +58,21 @@ export function searchQueryFromSelection(): string {
 	return '';
 }
 
+/**
+ * Initial query for the search palette: editor selection wins, then
+ * the last content search we actually ran this session, then empty.
+ * Mirrors VS Code: reopening `Ctrl+Shift+F` with no selection drops
+ * you back on your previous needle so a quick "search, look at one
+ * hit, search again" loop doesn't re-type the term.
+ */
+export function searchPaletteInitialQuery(): string {
+	const fromSelection = searchQueryFromSelection();
+	if (fromSelection.length > 0) {
+		return fromSelection;
+	}
+	return palette.lastContentQuery;
+}
+
 export type PaletteMode = 'commands' | 'files' | 'search';
 
 class PaletteState {
@@ -95,6 +110,14 @@ class PaletteState {
 	 *  a large repo. The flag pumps a spinner + disables the button
 	 *  so users don't double-fire the same refactor. */
 	replaceRunning = $state(false);
+	/** Last non-empty needle that actually hit the backend via
+	 *  `runContentSearch`. `Ctrl+Shift+F` falls back to this when
+	 *  there's no editor selection to prefill from, mirroring VS
+	 *  Code's behaviour ("reopens with the previous search ready to
+	 *  re-run"). Per-window only — no persistence across IDE
+	 *  launches, no cross-window sync. Wait for someone to ask
+	 *  before broadening. */
+	lastContentQuery = '';
 
 	show(mode: PaletteMode, initialQuery = '') {
 		this.mode = mode;
@@ -231,7 +254,7 @@ export const builtInCommands: Command[] = [
 			// previous refactor session left it open, so the user
 			// who pressed Ctrl+Shift+F lands in the simplest layout.
 			palette.setReplaceOpen(false);
-			palette.show('search', searchQueryFromSelection());
+			palette.show('search', searchPaletteInitialQuery());
 		},
 	},
 	{
@@ -542,6 +565,13 @@ export async function runFileSearch(query: string) {
 export async function runContentSearch(query: string) {
 	if (!workspace.workspace) {
 		return;
+	}
+	// Remember the last actually-searched needle so a fresh
+	// Ctrl+Shift+F without a selection can prefill it (see
+	// `palette.lastContentQuery`). Skip empty queries — the user
+	// clearing the box shouldn't wipe the memory.
+	if (query.length > 0) {
+		palette.lastContentQuery = query;
 	}
 	palette.loading = true;
 	try {
