@@ -1199,6 +1199,23 @@ export type ContainerStateChange = {
 };
 
 /**
+ * Payload of the `editor:request` Tauri event. Emitted by the
+ * focus-socket listener (`src-tauri/src/focus_socket.rs`) when
+ * the in-container `moon-edit` shim sends an `E\n<path>\n`
+ * request — typically the result of `git commit --amend` (or
+ * any other tool that respects `$GIT_EDITOR`) running in a
+ * container terminal moon-ide opened. The frontend opens the
+ * file via `Workspace.openHostFile`, tags it with
+ * `pendingEdit = id`, and resolves the parked listener via
+ * `ipc.editorForward.finish` / `.cancel` when the user is done.
+ * See ADR 0021 and `specs/containers.md` § "Editor forwarding".
+ */
+export type EditRequest = {
+	id: string;
+	host_path: string;
+};
+
+/**
  * Status of one bound folder's compose project (its own
  * `docker-compose.yml`). The folder bar's compose indicator
  * reads this; `compose_file == null` means the folder has no

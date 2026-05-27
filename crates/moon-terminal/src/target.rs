@@ -40,6 +40,16 @@ pub enum TerminalTarget {
 		/// Override for the shell binary; `None` falls back to
 		/// `bash` (always present in `moon-base`).
 		shell: Option<TerminalShell>,
+		/// Extra environment variables to inject via
+		/// `docker exec -e KEY=VALUE`. Each entry produces one
+		/// `-e <key>=<value>` pair; the supervisor never
+		/// invents env vars on its own, so an empty `Vec` is
+		/// the default. Used to forward `$GIT_EDITOR` =
+		/// `moon-edit` and friends into IDE-launched container
+		/// terminals — see `specs/containers.md` § "Editor
+		/// forwarding" and ADR 0021.
+		#[serde(default)]
+		env: Vec<(String, String)>,
 	},
 }
 
@@ -76,6 +86,60 @@ pub fn container_name_for_workspace(workspace_id: &str) -> String {
 	format!("moon-ws-{workspace_id}-dev-1")
 }
 
+/// In-container path the workspace's `instance.sock` is
+/// bind-mounted at — see `MOON_EDIT_SOCKET_CONTAINER_PATH` in
+/// `moon-container::compose`. Duplicated here because the
+/// terminal supervisor doesn't (and shouldn't) depend on
+/// `moon-container`; keep the two in sync.
+pub const MOON_EDIT_CONTAINER_SOCK: &str = "/run/moon/instance.sock";
+
+/// Build the `(container, host)` path-map list for the bound
+/// folder set, as the `MOON_EDIT_PATH_MAP` env var consumed by
+/// the in-container `moon-edit` shim. The shim picks the longest
+/// matching container prefix; we emit the entries in the same
+/// order they were bound, which is also the order they were
+/// rendered into `compose.yaml`'s `volumes:` block, so the map
+/// matches the actual mount layout.
+///
+/// Bound folders without a usable basename (a single `/`, an
+/// empty path) are skipped — those don't get a `/workspace/<name>`
+/// bind in compose either, so there's nothing to map.
+pub fn moon_edit_path_map_for_bound_folders(bound_folders: &[Utf8PathBuf]) -> String {
+	let mut entries = Vec::with_capacity(bound_folders.len());
+	for folder in bound_folders {
+		let Some(basename) = folder.file_name() else {
+			continue;
+		};
+		if basename.is_empty() {
+			continue;
+		}
+		entries.push(format!("/workspace/{basename}={host}", host = folder.as_str()));
+	}
+	entries.join(":")
+}
+
+/// Build the standard `-e` env list the IDE injects into every
+/// container terminal so `git commit --amend` (and friends) hand
+/// off the editor to the host IDE. See ADR 0021.
+///
+/// Returns an empty `Vec` if `bound_folders` is empty — there's
+/// no usable path map without folders, so we don't set the
+/// editor vars at all (the user would just see a confusing
+/// "moon-edit: no MOON_EDIT_PATH_MAP entry matches" error).
+pub fn editor_forward_env_for_workspace(bound_folders: &[Utf8PathBuf]) -> Vec<(String, String)> {
+	let path_map = moon_edit_path_map_for_bound_folders(bound_folders);
+	if path_map.is_empty() {
+		return Vec::new();
+	}
+	vec![
+		("GIT_EDITOR".to_owned(), "moon-edit".to_owned()),
+		("EDITOR".to_owned(), "moon-edit".to_owned()),
+		("VISUAL".to_owned(), "moon-edit".to_owned()),
+		("MOON_EDIT_SOCK".to_owned(), MOON_EDIT_CONTAINER_SOCK.to_owned()),
+		("MOON_EDIT_PATH_MAP".to_owned(), path_map),
+	]
+}
+
 impl TerminalTarget {
 	/// Translate the target into a `portable_pty::CommandBuilder`.
 	///
@@ -102,6 +166,7 @@ impl TerminalTarget {
 				container_name,
 				cwd,
 				shell,
+				env,
 			} => {
 				let shell_str = shell.as_ref().map(|s| s.as_str()).unwrap_or("bash");
 				// `docker exec -it -w <cwd> <container> <shell>`
@@ -118,6 +183,18 @@ impl TerminalTarget {
 				cmd.arg(cwd.as_str());
 				cmd.arg("-e");
 				cmd.arg("TERM=xterm-256color");
+				for (key, value) in env {
+					// Bare-minimum sanity: `docker exec -e` accepts
+					// `KEY=VALUE` and a `\n` in either side would
+					// confuse it. Anything weirder than that is
+					// the caller's responsibility.
+					if key.contains('\n') || value.contains('\n') {
+						tracing::warn!(key = %key, "skipping container env entry with newline");
+						continue;
+					}
+					cmd.arg("-e");
+					cmd.arg(format!("{key}={value}"));
+				}
 				cmd.arg(container_name);
 				cmd.arg(shell_str);
 				cmd.env("TERM", "xterm-256color");
@@ -193,11 +270,44 @@ mod tests {
 			container_name: "moon-ws-default-dev-1".into(),
 			cwd: Utf8PathBuf::from("/workspace/moon-landing"),
 			shell: None,
+			env: Vec::new(),
 		};
 		// portable-pty doesn't expose the argv after building,
 		// so we just confirm the call doesn't panic and the
 		// builder accepts our shape. End-to-end coverage
 		// belongs in the manual test plan.
 		let _cmd = t.to_command();
+	}
+
+	#[test]
+	fn editor_forward_env_for_workspace_returns_empty_with_no_folders() {
+		assert!(editor_forward_env_for_workspace(&[]).is_empty());
+	}
+
+	#[test]
+	fn editor_forward_env_for_workspace_emits_full_set_when_folders_present() {
+		let env = editor_forward_env_for_workspace(&[
+			Utf8PathBuf::from("/home/me/code/moon-ide"),
+			Utf8PathBuf::from("/home/me/code/moon-landing"),
+		]);
+		let map: std::collections::HashMap<_, _> = env.iter().cloned().collect();
+		assert_eq!(map.get("GIT_EDITOR").map(String::as_str), Some("moon-edit"));
+		assert_eq!(map.get("EDITOR").map(String::as_str), Some("moon-edit"));
+		assert_eq!(map.get("VISUAL").map(String::as_str), Some("moon-edit"));
+		assert_eq!(
+			map.get("MOON_EDIT_SOCK").map(String::as_str),
+			Some(MOON_EDIT_CONTAINER_SOCK)
+		);
+		assert_eq!(
+			map.get("MOON_EDIT_PATH_MAP").map(String::as_str),
+			Some("/workspace/moon-ide=/home/me/code/moon-ide:/workspace/moon-landing=/home/me/code/moon-landing"),
+		);
+	}
+
+	#[test]
+	fn moon_edit_path_map_skips_folders_without_basename() {
+		let map =
+			moon_edit_path_map_for_bound_folders(&[Utf8PathBuf::from("/home/me/code/moon-ide"), Utf8PathBuf::from("/")]);
+		assert_eq!(map, "/workspace/moon-ide=/home/me/code/moon-ide");
 	}
 }

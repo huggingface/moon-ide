@@ -20,4 +20,7 @@ mod pty;
 mod target;
 
 pub use pty::{spawn, PtyError, PtySession};
-pub use target::{container_name_for_workspace, TerminalShell, TerminalTarget};
+pub use target::{
+	container_name_for_workspace, editor_forward_env_for_workspace, moon_edit_path_map_for_bound_folders, TerminalShell,
+	TerminalTarget, MOON_EDIT_CONTAINER_SOCK,
+};

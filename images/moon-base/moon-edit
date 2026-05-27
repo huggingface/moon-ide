@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+#
+# moon-edit — `$GIT_EDITOR` shim for moon-ide workspace containers.
+#
+# When the user runs `git commit --amend` (or any other tool
+# that respects $GIT_EDITOR / $EDITOR / $VISUAL) from a terminal
+# moon-ide opened, git invokes us with the path it wants edited.
+# We translate that path back to the host's view via the
+# `$MOON_EDIT_PATH_MAP` table moon-ide injects, send an
+# `E\n<host-path>\n` message on the per-workspace `instance.sock`,
+# and block on the reply:
+#
+#   OK\n     -> exit 0; git proceeds with the edited file.
+#   CANCEL\n -> exit 1; git aborts.
+#   anything else / EOF -> exit 1; git aborts.
+#
+# See ADR 0021 and `specs/containers.md` § "Editor forwarding"
+# for the design notes.
+
+set -euo pipefail
+
+die() {
+	echo "moon-edit: $*" >&2
+	exit 1
+}
+
+# Quick self-check used by the Dockerfile build to assert the
+# script and its dependencies are in place. Doesn't talk to a
+# socket — just confirms we can run and `ncat -U` is around.
+if [[ "${1:-}" == "--self-check" ]]; then
+	command -v ncat >/dev/null || die "ncat not on PATH"
+	echo "moon-edit: ok"
+	exit 0
+fi
+
+[[ $# -ge 1 ]] || die "usage: moon-edit <path>"
+
+argv_path=$1
+
+: "${MOON_EDIT_SOCK:?MOON_EDIT_SOCK not set}"
+: "${MOON_EDIT_PATH_MAP:?MOON_EDIT_PATH_MAP not set}"
+
+# Make the path absolute against $PWD. We deliberately don't
+# resolve symlinks or normalise `..` — we want exactly what git
+# was looking at, just with a leading `/`.
+if [[ "$argv_path" == /* ]]; then
+	container_abs=$argv_path
+else
+	# `$PWD` is set by `docker exec -w <cwd>` so it's reliable
+	# here; the `pwd` fallback covers the corner where someone
+	# unset it.
+	container_abs="${PWD:-$(pwd)}/$argv_path"
+fi
+
+# Walk $MOON_EDIT_PATH_MAP (`:`-separated <container>=<host>
+# entries) and pick the longest container prefix that's an
+# ancestor of $container_abs. The shim does this in user-space
+# rather than relying on the IDE to send back a host path
+# because git also re-invokes us with the same path style on
+# `--continue` etc., so the translation has to be deterministic.
+best_cont=
+best_host=
+IFS=: read -r -a entries <<< "$MOON_EDIT_PATH_MAP"
+for entry in "${entries[@]}"; do
+	[[ -n "$entry" ]] || continue
+	[[ "$entry" == *=* ]] || continue
+	cont=${entry%%=*}
+	host=${entry#*=}
+	[[ -n "$cont" && -n "$host" ]] || continue
+	# Component-boundary check: `/workspace/moon-ide` is a
+	# prefix of `/workspace/moon-ide/foo` but NOT of
+	# `/workspace/moon-ide2/foo`.
+	if [[ "$container_abs" == "$cont" \
+	   || "$container_abs" == "$cont"/* \
+	   || "$cont" == */ && "$container_abs" == "$cont"* ]]; then
+		if [[ ${#cont} -gt ${#best_cont} ]]; then
+			best_cont=$cont
+			best_host=$host
+		fi
+	fi
+done
+[[ -n "$best_cont" ]] || die "no MOON_EDIT_PATH_MAP entry matches $container_abs"
+
+remainder=${container_abs#"$best_cont"}
+host_path="${best_host}${remainder}"
+
+# Refuse newlines in the host path — the protocol is line-framed
+# and we'd corrupt the wire format. POSIX allows newlines in
+# filenames but nothing in a `git`-driven editor flow produces
+# them in practice; bail loudly if it ever happens.
+case $host_path in
+	*$'\n'*) die "host path contains a newline; cannot encode";;
+esac
+
+# Talk to the IDE listener. `ncat -U` is the Unix-socket
+# variant of netcat; bash itself has /dev/tcp but no
+# /dev/unix, which is why ncat is in the image. `--no-shutdown`
+# keeps the connection open after we finish writing so we can
+# read the IDE's blocking reply on the same socket.
+reply=$(printf 'E\n%s\n' "$host_path" \
+	| ncat -U --no-shutdown "$MOON_EDIT_SOCK") || die "could not reach $MOON_EDIT_SOCK"
+
+# Take just the first line of the reply — the listener replies
+# with one of `OK\n` or `CANCEL\n` and closes.
+first_line=${reply%%$'\n'*}
+case $first_line in
+	OK)     exit 0;;
+	CANCEL) die "edit cancelled";;
+	*)      die "unexpected reply from IDE: ${first_line:-<empty>}";;
+esac

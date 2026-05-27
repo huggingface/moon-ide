@@ -29,7 +29,8 @@ pub mod restart_override;
 mod status_cache;
 
 pub use compose::{
-	generate_compose, BoundMount, ComposeRender, ComposeRenderOptions, SshAgentForward, SSH_AGENT_CONTAINER_PATH,
+	generate_compose, BoundMount, ComposeRender, ComposeRenderOptions, MoonEditSocketMount, SshAgentForward,
+	MOON_EDIT_SOCKET_CONTAINER_PATH, SSH_AGENT_CONTAINER_PATH,
 };
 pub use discovery::{
 	discover_compose_files, discover_compose_files_for_folders, discover_root_compose, ComposeDiscovery,

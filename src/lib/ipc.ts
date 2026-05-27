@@ -194,6 +194,18 @@ export const ipc = {
 	editorconfig: {
 		forPath: (path: string) => invoke<EditorConfig>('editorconfig_for_path', { path }),
 	},
+	editorForward: {
+		// Resolve a pending `editor:request` event from the
+		// in-container `moon-edit` shim. `finish` writes the
+		// buffer's bytes first (caller's responsibility) and
+		// then drops this so the shim sees `OK\n` and `git`
+		// proceeds. `cancel` sends `CANCEL\n` so `git` aborts.
+		// Returns `false` if the id was unknown (already
+		// resolved, listener gone) — both cases are benign,
+		// the frontend treats them as success. See ADR 0021.
+		finish: (id: string) => invoke<boolean>('editor_forward_finish', { id }),
+		cancel: (id: string) => invoke<boolean>('editor_forward_cancel', { id }),
+	},
 	container: {
 		status: () => invoke<ContainerStatus>('container_status'),
 		setup: () => invoke<ContainerStatus>('container_setup'),

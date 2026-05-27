@@ -100,6 +100,42 @@ pub struct SshAgentForward {
 	pub host_socket: Utf8PathBuf,
 }
 
+/// In-container path that the workspace's `instance.sock` is
+/// bind-mounted at. Read-write — Unix-socket `connect()`
+/// requires write permission on the inode. The mount is only
+/// the socket file (not its parent dir), so the only "write"
+/// the container can perform through this mount is to speak
+/// the focus-socket protocol the IDE listener implements.
+///
+/// `moon-edit` (`crates/moon-edit`) is the in-container client
+/// and ships in `moon-base` at `/usr/local/bin/moon-edit`. See
+/// [`specs/containers.md`](../../../specs/containers.md)
+/// § "Editor forwarding" and [ADR 0021](../../../specs/decisions/0021-git-editor-forward.md).
+pub const MOON_EDIT_SOCKET_CONTAINER_PATH: &str = "/run/moon/instance.sock";
+
+/// Bind-mount of the workspace's `instance.sock` into the dev
+/// container so the in-container `moon-edit` shim can forward
+/// `$GIT_EDITOR` invocations to the host IDE.
+///
+/// The host path is always the per-workspace
+/// `<workspaces_dir>/<slug>/instance.sock` that the focus-socket
+/// listener binds **before any compose call runs** (see
+/// `src-tauri/src/focus_socket.rs::try_bind`). That ordering is
+/// load-bearing: if the file didn't exist at `compose up`
+/// time, Docker would auto-create the source as a regular
+/// empty file and shadow the real socket until the container is
+/// recreated.
+///
+/// Unlike `SshAgentForward`, this mount has no host-side
+/// detection step — the focus socket always exists for a bound
+/// workspace, so the lifecycle layer can populate the option
+/// unconditionally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoonEditSocketMount {
+	/// Absolute host-side path to the workspace's `instance.sock`.
+	pub host_socket: Utf8PathBuf,
+}
+
 /// In-container path the host's `~/.ssh/config` is bind-mounted
 /// at. We pin it to the `dev` user's `~/.ssh/config` so the
 /// in-container `ssh` reads it without `SSH_CONFIG=/whatever` on
@@ -298,6 +334,11 @@ pub struct ComposeRenderOptions<'a> {
 	/// dependent on whatever the bind-mounted config contains —
 	/// which is empty when the host uses the system keyring.
 	pub gh_token: Option<&'a HostGhToken>,
+	/// Optional bind-mount of the workspace's `instance.sock`
+	/// for editor forwarding. The lifecycle layer typically
+	/// populates this unconditionally — the focus-socket file
+	/// is guaranteed to exist by the time compose renders.
+	pub moon_edit_socket: Option<&'a MoonEditSocketMount>,
 }
 
 /// Wrap `value` in double quotes, escaping `\` and `"` so an
@@ -354,7 +395,10 @@ pub fn generate_compose(options: ComposeRenderOptions<'_>) -> ComposeRender {
 	let _ = writeln!(yaml, "    init: true");
 	let _ = writeln!(yaml, "    working_dir: /workspace");
 	let _ = writeln!(yaml, "    volumes:");
-	let has_extra_mount = options.ssh_agent.is_some() || options.ssh_config.is_some() || options.gh_config.is_some();
+	let has_extra_mount = options.ssh_agent.is_some()
+		|| options.ssh_config.is_some()
+		|| options.gh_config.is_some()
+		|| options.moon_edit_socket.is_some();
 	if options.bound_mounts.is_empty() && !has_extra_mount {
 		// Empty list is valid YAML and compose accepts it; this
 		// keeps the structure consistent for the no-folder /
@@ -401,6 +445,19 @@ pub fn generate_compose(options: ComposeRenderOptions<'_>) -> ComposeRender {
 				"      - {host}:{container}:ro",
 				host = gh.host_path.as_str(),
 				container = GH_CONFIG_CONTAINER_PATH,
+			);
+		}
+		if let Some(edit) = options.moon_edit_socket {
+			// Read-write by necessity — Unix-socket `connect()`
+			// needs write permission on the inode. The mount is
+			// just the socket file (the focus-socket protocol is
+			// the only "write" the container can perform); see
+			// ADR 0021.
+			let _ = writeln!(
+				yaml,
+				"      - {host}:{container}",
+				host = edit.host_socket.as_str(),
+				container = MOON_EDIT_SOCKET_CONTAINER_PATH,
 			);
 		}
 	}
@@ -472,6 +529,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			moon_edit_socket: None,
 		});
 
 		assert!(render.yaml.contains("name: moon-ws-default"));
@@ -507,6 +565,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			moon_edit_socket: None,
 		});
 		assert!(render.yaml.contains("    init: true"));
 	}
@@ -527,6 +586,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			moon_edit_socket: None,
 		});
 
 		assert!(render
@@ -549,6 +609,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			moon_edit_socket: None,
 		};
 		let a = generate_compose(opts.clone());
 		let b = generate_compose(opts);
@@ -568,6 +629,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			moon_edit_socket: None,
 		});
 		assert!(render.yaml.contains("image: huggingface/moon-base:0.1"));
 	}
@@ -584,6 +646,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			moon_edit_socket: None,
 		});
 		assert!(render.yaml.contains("name: moon-ws-scratch"));
 	}
@@ -603,6 +666,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			moon_edit_socket: None,
 		});
 
 		assert!(render
@@ -633,6 +697,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			moon_edit_socket: None,
 		});
 
 		assert!(!render.yaml.contains("    volumes:\n      []"));
@@ -660,6 +725,7 @@ mod tests {
 			git_identity: Some(&identity),
 			gh_config: None,
 			gh_token: None,
+			moon_edit_socket: None,
 		});
 
 		assert!(
@@ -692,6 +758,7 @@ mod tests {
 			git_identity: Some(&identity),
 			gh_config: None,
 			gh_token: None,
+			moon_edit_socket: None,
 		});
 
 		// One environment block, both keys inside it. Stable order
@@ -720,6 +787,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			moon_edit_socket: None,
 		});
 
 		assert!(
@@ -750,6 +818,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			moon_edit_socket: None,
 		});
 
 		assert!(!render.yaml.contains("    volumes:\n      []"));
@@ -781,6 +850,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			moon_edit_socket: None,
 		});
 
 		assert!(render
@@ -808,6 +878,7 @@ mod tests {
 			git_identity: None,
 			gh_config: Some(&gh),
 			gh_token: None,
+			moon_edit_socket: None,
 		});
 
 		assert!(
@@ -832,6 +903,7 @@ mod tests {
 			git_identity: None,
 			gh_config: Some(&gh),
 			gh_token: None,
+			moon_edit_socket: None,
 		});
 
 		assert!(!render.yaml.contains("    volumes:\n      []"));
@@ -857,6 +929,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: Some(&token),
+			moon_edit_socket: None,
 		});
 
 		assert!(render.yaml.contains("    environment:"), "got:\n{}", render.yaml);
@@ -882,6 +955,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: Some(&token),
+			moon_edit_socket: None,
 		});
 
 		assert!(
@@ -907,6 +981,7 @@ mod tests {
 			git_identity: Some(&identity),
 			gh_config: None,
 			gh_token: None,
+			moon_edit_socket: None,
 		});
 		// Double-quoted scalar with `"` → `\"` and `\` → `\\`.
 		assert!(
@@ -916,5 +991,65 @@ mod tests {
 			"got:\n{}",
 			render.yaml
 		);
+	}
+
+	#[test]
+	fn moon_edit_socket_emits_read_write_bind_mount() {
+		let project = project();
+		let edit = MoonEditSocketMount {
+			host_socket: Utf8PathBuf::from("/home/me/.local/share/moon-ide/workspaces/default/instance.sock"),
+		};
+		let render = generate_compose(ComposeRenderOptions {
+			project: &project,
+			dev_image: "moon-base:dev",
+			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
+			ssh_agent: None,
+			ssh_config: None,
+			git_identity: None,
+			gh_config: None,
+			gh_token: None,
+			moon_edit_socket: Some(&edit),
+		});
+		// Read-write (no `:ro` suffix) — Unix-socket connect needs
+		// write permission on the inode. The container-side path
+		// is the constant from compose.rs; the host path is
+		// whatever the workspace's state dir resolves to.
+		assert!(
+			render
+				.yaml
+				.contains("- /home/me/.local/share/moon-ide/workspaces/default/instance.sock:/run/moon/instance.sock\n"),
+			"got:\n{}",
+			render.yaml
+		);
+		// And **no** `:ro` on this particular mount.
+		assert!(
+			!render.yaml.contains("/run/moon/instance.sock:ro"),
+			"moon-edit socket must not be read-only; got:\n{}",
+			render.yaml
+		);
+	}
+
+	#[test]
+	fn moon_edit_socket_alone_does_not_render_empty_volumes_list() {
+		// When the only "mount" is the moon-edit socket (no bound
+		// folders, no ssh / gh forwards), we must still emit the
+		// bind line — the empty-list shortcut would drop it.
+		let project = project();
+		let edit = MoonEditSocketMount {
+			host_socket: Utf8PathBuf::from("/tmp/x/instance.sock"),
+		};
+		let render = generate_compose(ComposeRenderOptions {
+			project: &project,
+			dev_image: "moon-base:dev",
+			bound_mounts: &[],
+			ssh_agent: None,
+			ssh_config: None,
+			git_identity: None,
+			gh_config: None,
+			gh_token: None,
+			moon_edit_socket: Some(&edit),
+		});
+		assert!(!render.yaml.contains("volumes:\n      []"));
+		assert!(render.yaml.contains("- /tmp/x/instance.sock:/run/moon/instance.sock"));
 	}
 }

@@ -72,7 +72,7 @@ use tokio::process::Command;
 
 use crate::compose::{
 	generate_compose, BoundMount, ComposeRender, ComposeRenderOptions, GhConfigMount, HostGhToken, HostGitIdentity,
-	SshAgentForward, SshConfigMount,
+	MoonEditSocketMount, SshAgentForward, SshConfigMount,
 };
 use crate::network::{connect_container_to_network, dev_container_name, project_default_network};
 use crate::port_forward::stop_forwards;
@@ -245,6 +245,15 @@ impl Workspace {
 		let identity = detect_host_git_identity();
 		let gh_config = detect_host_gh_config();
 		let gh_token = detect_host_gh_token();
+		// The IDE's per-workspace focus socket lives next to
+		// `compose.yaml` in `state_dir`. It's bound pre-Tauri
+		// (`src-tauri/src/focus_socket.rs::try_bind`) so the
+		// path is guaranteed to exist by the time compose
+		// renders. Forwards `$GIT_EDITOR` into the host IDE
+		// from container terminals; see ADR 0021.
+		let moon_edit = MoonEditSocketMount {
+			host_socket: self.state_dir.join("instance.sock"),
+		};
 		generate_compose(ComposeRenderOptions {
 			project: &self.project,
 			dev_image,
@@ -254,6 +263,7 @@ impl Workspace {
 			git_identity: identity.as_ref(),
 			gh_config: gh_config.as_ref(),
 			gh_token: gh_token.as_ref(),
+			moon_edit_socket: Some(&moon_edit),
 		})
 	}
 

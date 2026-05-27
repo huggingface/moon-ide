@@ -1234,6 +1234,120 @@ LocalHost path doesn't go through the container) — the bind
 mount + env var exist so that a container terminal feels the
 same.
 
+## Editor forwarding
+
+`git commit` without `-m`, `git commit --amend`, `git rebase -i`,
+`gh pr edit`, `crontab -e`, and any other tool that respects the
+POSIX `$GIT_EDITOR` / `$EDITOR` / `$VISUAL` convention spawns an
+editor and blocks until the editor process exits. Inside a
+workspace shell container that fails today: `moon-base` doesn't
+ship `vim` / `nano`, and there's no in-container companion
+process the IDE could route through (intentional — see
+[ADR 0008](decisions/0008-host-shared-daemon.md)).
+
+moon-ide closes the gap by forwarding those invocations to the
+host IDE process, which opens the file as a normal editor tab,
+waits for the user to save + finish, and replies to the
+in-container caller. The blocking caller (`git`) sees a single
+editor process exit zero on success / non-zero on cancel — same
+contract `git` has with `vim`.
+
+Mechanism, end to end:
+
+- The per-workspace `instance.sock` already exists at
+  `<workspaces_dir>/<slug>/instance.sock` (single-instance lock
+  - focus IPC, see [ADR 0014](decisions/0014-process-per-workspace.md)).
+    Its on-the-wire protocol is extended additively with one new
+    message kind, `E\n<host-path>\n`, that **blocks** waiting for
+    either `OK\n` (user finished) or `CANCEL\n` (user closed the
+    tab without finishing). The framing helpers live in
+    [`moon_protocol::focus_socket`](../crates/moon-protocol/src/focus_socket.rs)
+    so the host and in-container halves can't drift.
+
+- `moon-base` ships a `moon-edit` binary at `/usr/local/bin/moon-edit`.
+  It's the only piece of this design that runs inside the
+  container, has no listener, and is invoked by `git` like any
+  other editor. The shim reads `$MOON_EDIT_SOCK` for the UDS
+  path, translates its argv path to an absolute host path via
+  `$MOON_EDIT_PATH_MAP` (`<container>=<host>[:<container>=<host>…]`,
+  same shape as `$PATH`), and round-trips the blocking edit.
+
+- The workspace's generated `compose.yaml` bind-mounts
+  `<workspaces_dir>/<slug>/instance.sock` to
+  `/run/moon/instance.sock` on the `dev` service. The mount is
+  **read-write on the socket file** (not its parent dir) — Unix-
+  socket `connect()` needs write permission on the inode, but
+  scoping the mount to the socket alone means the only "write"
+  the container can perform through it is to speak the protocol
+  the host's listener implements. Same posture as
+  [SSH agent forwarding](#ssh-agent-forwarding); narrower than
+  [`gh` config forwarding](#gh-config-forwarding).
+
+- **Env injection is per-`docker exec`, not in `compose.yaml`.**
+  Container terminals the IDE opens carry
+  `GIT_EDITOR=moon-edit`, `EDITOR=moon-edit`, `VISUAL=moon-edit`,
+  `MOON_EDIT_SOCK=/run/moon/instance.sock`, and
+  `MOON_EDIT_PATH_MAP=…` on their `docker exec -e` flags. Anything
+  else running in the container — an LSP launched via
+  `docker exec`, a coder agent's bash tool, a manual
+  `docker exec` from a host shell outside the IDE — sees the
+  variables unset and falls back to git's standard "no editor
+  configured" behaviour.
+
+  This is deliberate: setting `$GIT_EDITOR` workspace-wide would
+  make a `git commit --amend` somewhere deep in an LSP's
+  hypothetical commit hook silently block on a tab nobody's
+  going to open. Scoping the forward to interactive terminals
+  means a forwarded edit always corresponds to a user sitting at
+  a tab waiting for it.
+
+In-IDE UX:
+
+- The forwarded file opens through the same `Workspace.openHostFile`
+  path `Ctrl+O` uses for files outside every bound folder
+  (`OpenFile.isExternal = true`). That skips LSP / editorconfig /
+  git / blame for the commit-message buffer — none of which would
+  make sense for `COMMIT_EDITMSG`.
+- A new per-buffer flag `OpenFile.pendingEdit: EditId | null`
+  flags the tab as a forwarded-edit. The tab strip grows a
+  small "git is waiting · Finish" affordance; `Ctrl+S` saves and
+  finishes in one move, closing the tab without saving cancels.
+- Finishing = the IDE writes the buffer's bytes to the host
+  path, then sends `OK\n` on the parked socket connection. The
+  shim exits 0, `git` proceeds with the edited message.
+  Cancelling sends `CANCEL\n`; the shim exits 1; `git` falls
+  back to its existing "empty message" behaviour (which is
+  abort for `commit`, no-op for `rebase -i` if no instructions
+  changed).
+
+Failure modes:
+
+- **IDE quits mid-edit.** Socket connection drops; the shim
+  reads EOF; exits non-zero; `git` aborts. The user is the one
+  who quit, so this is the expected outcome.
+- **Container terminal launched outside the IDE.**
+  `$MOON_EDIT_SOCK` isn't set; `git` errors with the standard
+  "no editor configured" message. Acceptable — the user opened
+  a terminal moon-ide doesn't manage, so there's no tab to
+  forward to.
+- **A coder agent runs `git commit --amend` in its bash tool.**
+  Today: same as the previous case — the agent's terminal
+  doesn't carry the env vars. The agent should pass
+  `git commit -m "…"` explicitly; if a future agent needs the
+  forward, opting in is setting the env vars itself before the
+  spawn (the protocol and shim are ready).
+
+What this **doesn't** do (deferred):
+
+- Open a path passed via `$EDITOR` from a context that
+  shouldn't block (a CLI handoff, a `code .`-style "open this
+  here" command). The `O\n<path>\n` non-blocking variant of the
+  protocol slots in additively when somebody asks.
+- Forward `git mergetool` / `diff.tool` — those need a richer
+  protocol (open a 3-way diff, return only when the user marks
+  resolved) that's better addressed by the existing merge
+  conflict resolution flow ([test plan 0088](test-plans/0088-merge-conflict-resolution.md)).
+
 ## `WorkspaceHost::ContainerHost`
 
 The trait already exists from Phase 0:

@@ -278,6 +278,27 @@ RUN mkdir -p "${HOME}/.local" \
 RUN go install golang.org/x/tools/gopls@latest \
  && gopls version
 
+# moon-edit — the in-container `$GIT_EDITOR` shim that forwards
+# `git commit --amend` (and any other editor-spawning command)
+# to the host moon-ide via the per-workspace `instance.sock`.
+# See [ADR 0021](../../specs/decisions/0021-git-editor-forward.md)
+# and `specs/containers.md` § "Editor forwarding".
+#
+# Implementation is a small bash script that drives `ncat -U`
+# (Nmap's netcat, which speaks Unix-domain sockets unlike the
+# BSD netcat the base image would otherwise ship). The protocol
+# is deliberately newline-framed so a shell shim is enough — no
+# need for a compiled binary just to write two lines and read
+# one.
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ncat \
+ && rm -rf /var/lib/apt/lists/*
+USER ${USERNAME}
+
+COPY --chown=root:root --chmod=0755 moon-edit /usr/local/bin/moon-edit
+RUN moon-edit --self-check
+
 WORKDIR /workspace
 
 # moon-ide attaches with `docker exec` for everything (terminals, LSPs,

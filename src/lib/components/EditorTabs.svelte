@@ -469,6 +469,15 @@
 				ondragend={onDragEnd}
 			>
 				<span class="name">{file.name}</span>
+				{#if file.pendingEdit}
+					<span
+						class="pending-edit"
+						title="A container terminal is waiting for this edit. Ctrl+S to finish, close the tab to cancel."
+						aria-label="git is waiting for this edit"
+					>
+						git
+					</span>
+				{/if}
 				{#if file.isDirty}
 					<span class="dirty" aria-label="unsaved changes">●</span>
 				{/if}
@@ -628,6 +637,19 @@
 		color: var(--m-warning);
 		font-size: 10px;
 		line-height: 1;
+	}
+	.pending-edit {
+		/* Forwarded `$GIT_EDITOR` request — a container terminal
+		   is blocked on this buffer. See ADR 0021. */
+		background: var(--m-accent);
+		color: var(--m-bg);
+		font-family: var(--m-font-ui);
+		font-size: 10px;
+		line-height: 1;
+		padding: 1px 4px;
+		border-radius: 2px;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
 	}
 	.close {
 		display: inline-flex;

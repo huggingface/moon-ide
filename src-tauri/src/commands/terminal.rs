@@ -17,7 +17,7 @@ use base64::Engine;
 use camino::Utf8PathBuf;
 use moon_protocol::terminal::{TerminalClosed, TerminalOpenRequest, TerminalOutput, TerminalTarget as ProtocolTarget};
 use moon_protocol::MoonError;
-use moon_terminal::{container_name_for_workspace, spawn, TerminalTarget};
+use moon_terminal::{container_name_for_workspace, editor_forward_env_for_workspace, spawn, TerminalTarget};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -43,7 +43,23 @@ pub async fn terminal_open(
 	state: State<'_, AppState>,
 	request: TerminalOpenRequest,
 ) -> Result<String, MoonError> {
-	let target = into_internal_target(request.target, &state)?;
+	// For Container targets we also gather the bound-folder list,
+	// which the editor-forward env vars (`MOON_EDIT_PATH_MAP`)
+	// need. The snapshot read is async so we do it up here and
+	// pass the result into the sync target builder.
+	let bound_folders = if matches!(request.target, ProtocolTarget::Container { .. }) {
+		state
+			.workspaces
+			.snapshot()
+			.await
+			.folders
+			.into_iter()
+			.map(|f| Utf8PathBuf::from(f.path))
+			.collect::<Vec<_>>()
+	} else {
+		Vec::new()
+	};
+	let target = into_internal_target(request.target, &state, &bound_folders)?;
 
 	let stream_id = Uuid::new_v4().to_string();
 	let (cmd_tx, cmd_rx) = mpsc::channel::<TerminalCommand>(COMMAND_CHANNEL_DEPTH);
@@ -108,7 +124,11 @@ pub async fn terminal_close(state: State<'_, AppState>, stream_id: String) -> Re
 	Ok(())
 }
 
-fn into_internal_target(t: ProtocolTarget, state: &AppState) -> Result<TerminalTarget, MoonError> {
+fn into_internal_target(
+	t: ProtocolTarget,
+	state: &AppState,
+	bound_folders: &[Utf8PathBuf],
+) -> Result<TerminalTarget, MoonError> {
 	match t {
 		ProtocolTarget::Host { cwd } => Ok(TerminalTarget::Host {
 			cwd: cwd.map(Utf8PathBuf::from),
@@ -118,10 +138,19 @@ fn into_internal_target(t: ProtocolTarget, state: &AppState) -> Result<TerminalT
 			let id = state
 				.workspace_id()
 				.ok_or_else(|| MoonError::invalid("terminal_open: container target requires a bound workspace"))?;
+			// Inject the `$GIT_EDITOR` forwarding vars so
+			// `git commit --amend` and friends route back to the
+			// host IDE — see ADR 0021 and
+			// `specs/containers.md` § "Editor forwarding".
+			// The helper returns an empty list when there are
+			// no bound folders to build a path map from, which
+			// safely no-ops the feature for an empty workspace.
+			let env = editor_forward_env_for_workspace(bound_folders);
 			Ok(TerminalTarget::Container {
 				container_name: container_name_for_workspace(id),
 				cwd: Utf8PathBuf::from(cwd),
 				shell: None,
+				env,
 			})
 		}
 	}

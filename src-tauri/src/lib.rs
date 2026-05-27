@@ -146,6 +146,8 @@ pub fn run() {
 			commands::window::window_set_title,
 			commands::system::system_theme,
 			commands::editorconfig::editorconfig_for_path,
+			commands::editor_forward::editor_forward_finish,
+			commands::editor_forward::editor_forward_cancel,
 			commands::container::container_status,
 			commands::container::container_setup,
 			commands::container::container_pause,
@@ -271,9 +273,19 @@ pub fn run() {
 			// Wire the focus listener now that we have an
 			// `AppHandle`. Bound pre-Tauri to guarantee single
 			// instance even if app construction takes a beat.
+			// The editor registry sits behind an `Arc` so the
+			// listener task and the Tauri commands that resolve
+			// pending edits share one map (see
+			// `crate::focus_socket::EditorRegistry`).
+			let editor_registry = std::sync::Arc::new(focus_socket::EditorRegistry::new());
 			if let Some(listener) = listener {
-				focus_socket::spawn_focus_listener(listener, app.handle().clone());
+				focus_socket::spawn_focus_listener(
+					listener,
+					app.handle().clone(),
+					std::sync::Arc::clone(&editor_registry),
+				);
 			}
+			app.manage(editor_registry);
 
 			let workspace_id = match &mode {
 				AppMode::Workspace { id } => id.clone(),

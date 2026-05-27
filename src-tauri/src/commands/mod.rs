@@ -3,6 +3,7 @@ pub mod app_state;
 pub mod coder;
 pub mod compose_logs;
 pub mod container;
+pub mod editor_forward;
 pub mod editorconfig;
 pub mod fs;
 pub mod logs;

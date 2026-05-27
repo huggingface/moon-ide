@@ -16,6 +16,7 @@ import {
 	type CompareBaseline,
 	type BranchSwitchTarget,
 	type EditorConfig,
+	type EditRequest,
 	type FolderSession,
 	type GitBranchInfo,
 	type GitChangeSummary,
@@ -148,6 +149,16 @@ export type OpenFile = {
 	// those assume the file lives inside the active folder's host.
 	// Path is the absolute host path; tabs render the basename.
 	isExternal: boolean;
+	// Non-null when this buffer is parked waiting on a forwarded
+	// `$GIT_EDITOR` invocation from a container terminal — the
+	// `moon-edit` shim is blocked on the per-workspace
+	// `instance.sock` until the user finishes (Ctrl+S, or the
+	// tab's "Finish editing" affordance) or cancels (close the
+	// tab without saving). The value is the opaque `EditId` the
+	// backend sent in the `editor:request` event; we round-trip
+	// it through `ipc.editorForward.finish` / `.cancel`. See
+	// ADR 0021 and `specs/containers.md` § "Editor forwarding".
+	pendingEdit: string | null;
 };
 
 /**
@@ -1314,6 +1325,10 @@ class WorkspaceState {
 		void diagLogs.start();
 		this.wireNextEditProbe();
 		this.wireGitAutoFetch();
+		// Subscribe to forwarded `$GIT_EDITOR` requests from
+		// in-container terminals so `git commit --amend` etc.
+		// open a buffer in moon-ide. See ADR 0021.
+		void this.wireEditorForward();
 		void this.refreshNextEditServerStatusThenMaybeAutostart();
 		// Terminal output rides on its own event channel —
 		// see `terminal.svelte.ts`. Wired once at startup so
@@ -1597,6 +1612,113 @@ class WorkspaceState {
 	 * hidden, when no folder is active, and when a fetch is
 	 * already in flight.
 	 */
+	/**
+	 * Subscribe to forwarded `$GIT_EDITOR` requests from in-container
+	 * terminals. Pairs with `commands/editor_forward.rs` on the
+	 * backend and the `moon-edit` shim in moon-base. See ADR 0021
+	 * and `specs/containers.md` § "Editor forwarding".
+	 *
+	 * Idempotent — safe to call from `App.svelte`'s onMount even
+	 * with HMR, same convention as the other `wire*` helpers.
+	 */
+	private editorForwardWired = false;
+	private async wireEditorForward(): Promise<void> {
+		if (this.editorForwardWired) {
+			return;
+		}
+		this.editorForwardWired = true;
+		try {
+			await listen<EditRequest>('editor:request', (event) => {
+				void this.handleEditorRequest(event.payload);
+			});
+		} catch {
+			// Event bind failed — the `moon-edit` shim will time
+			// out waiting on the parked socket, which will surface
+			// as a `git commit` failure in the user's terminal.
+			// Nothing actionable to surface here.
+		}
+	}
+
+	private async handleEditorRequest(req: EditRequest) {
+		// Open the file as a host-external buffer (LSP / git /
+		// editorconfig skipped — appropriate for a commit message
+		// or a rebase todo, neither of which we want indexed).
+		// `openHostFile` is idempotent on path; if the buffer is
+		// already open (rare but possible if the user re-amends),
+		// it just focuses the existing tab.
+		await this.openHostFile(req.host_path);
+		// Tag the buffer with the parked-edit id. Lookup-by-path
+		// because the array reference may have been replaced by
+		// `openHostFile`'s reactive write.
+		this.openFiles = this.openFiles.map((f) => (f.path === req.host_path ? { ...f, pendingEdit: req.id } : f));
+		this.flash('Editing commit message — Ctrl+S to finish, close tab to cancel.');
+	}
+
+	/**
+	 * Resolve a forwarded edit by saving the buffer and replying
+	 * `OK\n` on the parked socket so `git` proceeds. Called from
+	 * the `Ctrl+S` save path when the active buffer carries a
+	 * `pendingEdit`, and from a dedicated "Finish editing" tab
+	 * affordance.
+	 *
+	 * Returns true when the edit was finished (the buffer existed
+	 * and the backend acknowledged). Returns false when there's
+	 * no longer a buffer to finish, in which case the caller
+	 * should fall through to the regular save path.
+	 */
+	async finishPendingEdit(path: string): Promise<boolean> {
+		const file = this.openFiles.find((f) => f.path === path);
+		if (!file || file.pendingEdit === null) {
+			return false;
+		}
+		const id = file.pendingEdit;
+		try {
+			await ipc.fs.writeFileHost(file.path, file.text);
+		} catch (err) {
+			this.flash(`Failed to save before finishing edit: ${formatError(err)}`);
+			return true;
+		}
+		// Clear dirty + pending state first so a fast subsequent
+		// close doesn't trigger the cancel-on-close path before the
+		// backend's resolve has landed.
+		this.openFiles = this.openFiles.map((f) =>
+			f.path === path
+				? {
+						...f,
+						isDirty: false,
+						loadedFingerprint: fingerprint(f.text),
+						pendingEdit: null,
+					}
+				: f,
+		);
+		try {
+			await ipc.editorForward.finish(id);
+		} catch (err) {
+			// Backend resolve failed. The shim will probably time out
+			// (which manifests as a `git commit` failure in the
+			// terminal). Surface the error so the user knows to
+			// retry from the terminal.
+			this.flash(`Editor handoff failed: ${formatError(err)}`);
+		}
+		void this.closeFile(path);
+		return true;
+	}
+
+	/**
+	 * Cancel a forwarded edit. Sent automatically when the user
+	 * closes the tab without finishing (`closeFile`), so a
+	 * `git commit` they decide against on second thought just
+	 * aborts cleanly instead of leaving the shim hung.
+	 */
+	async cancelPendingEdit(id: string): Promise<void> {
+		try {
+			await ipc.editorForward.cancel(id);
+		} catch {
+			// Same posture as `finish` — nothing actionable here
+			// since the user is on the way out of the tab.
+		}
+	}
+
 	private wireGitAutoFetch() {
 		if (this.gitAutoFetchWired || typeof window === 'undefined') {
 			return;
@@ -3577,6 +3699,7 @@ class WorkspaceState {
 			isDirty: false,
 			isDeleted: false,
 			isExternal: false,
+			pendingEdit: null,
 		};
 		this.openFiles = [...this.openFiles, file];
 		const tabs = this.tabsFor(side);
@@ -3613,6 +3736,7 @@ class WorkspaceState {
 				isDirty: false,
 				isDeleted: false,
 				isExternal: false,
+				pendingEdit: null,
 			};
 			this.openFiles = [...this.openFiles, file];
 		}
@@ -3854,6 +3978,7 @@ class WorkspaceState {
 				isDirty: false,
 				isDeleted: false,
 				isExternal: true,
+				pendingEdit: null,
 			};
 			this.openFiles = [...this.openFiles, file];
 		}
@@ -4013,6 +4138,7 @@ class WorkspaceState {
 			isDirty: false,
 			isDeleted: false,
 			isExternal: false,
+			pendingEdit: null,
 		};
 	}
 
@@ -4030,6 +4156,7 @@ class WorkspaceState {
 			isDirty: false,
 			isDeleted: false,
 			isExternal: false,
+			pendingEdit: null,
 		};
 	}
 
@@ -4073,6 +4200,7 @@ class WorkspaceState {
 			isDirty: false,
 			isDeleted: true,
 			isExternal: false,
+			pendingEdit: null,
 		};
 	}
 
@@ -4559,7 +4687,15 @@ class WorkspaceState {
 			// skip the matching teardown. Calling `lspClose` here
 			// would issue a `didClose` for a `didOpen` the broker
 			// never saw.
-			const wasExternal = this.openFiles.find((f) => f.path === path)?.isExternal === true;
+			const closing = this.openFiles.find((f) => f.path === path);
+			const wasExternal = closing?.isExternal === true;
+			// Cancel any parked `$GIT_EDITOR` request so the
+			// in-container shim exits non-zero and `git` aborts
+			// cleanly. Fire-and-forget — we're closing the tab
+			// regardless of the resolve result.
+			if (closing?.pendingEdit) {
+				void this.cancelPendingEdit(closing.pendingEdit);
+			}
 			this.openFiles = this.openFiles.filter((f) => f.path !== path);
 			if (this.previewModes.has(path)) {
 				const next = new Map(this.previewModes);
@@ -5215,6 +5351,14 @@ class WorkspaceState {
 		// surface for untitled.
 		if (file.isUntitled) {
 			await this.saveActiveAs();
+			return;
+		}
+		// Buffers parked on a forwarded `$GIT_EDITOR` request finish
+		// the edit instead of doing a regular save: write the bytes
+		// host-direct, reply `OK\n` on the parked socket, close the
+		// tab so the in-container `git commit` continues. See ADR 0021.
+		if (file.pendingEdit) {
+			await this.finishPendingEdit(file.path);
 			return;
 		}
 		// Clean buffers used to short-circuit here, but with the

@@ -10,6 +10,7 @@ pub mod coder_models;
 pub mod container;
 pub mod editorconfig;
 pub mod error;
+pub mod focus_socket;
 pub mod fs;
 pub mod git;
 pub mod logs;
