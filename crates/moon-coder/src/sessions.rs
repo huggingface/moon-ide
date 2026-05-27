@@ -273,11 +273,13 @@ pub(crate) fn record_to_pi_wire(record: &SessionRecord, header: &SessionHeader) 
 			content,
 			thinking,
 			tool_calls,
+			model,
 		} => pi_message_envelope(pi_assistant_message(
 			content.as_deref(),
 			thinking.as_deref(),
 			tool_calls,
 			header,
+			model.as_deref(),
 			None,
 		)),
 		SessionRecord::Tool { tool_call_id, content } => pi_message_envelope(pi_tool_result_message(tool_call_id, content)),
@@ -396,6 +398,7 @@ fn pi_assistant_message(
 	thinking: Option<&str>,
 	tool_calls: &[ToolCall],
 	header: &SessionHeader,
+	record_model: Option<&str>,
 	usage: Option<&SessionRecord>,
 ) -> serde_json::Value {
 	let mut blocks: Vec<serde_json::Value> = Vec::new();
@@ -418,7 +421,13 @@ fn pi_assistant_message(
 	for call in tool_calls {
 		blocks.push(pi_tool_call_block(call));
 	}
-	let (provider, model) = split_provider_model(&header.model);
+	// Prefer the record's stamp (what actually served the round-
+	// trip) over the session header's seed (set once at session
+	// creation, never updated when the user flips providers).
+	// Falling back to the header keeps historical sessions
+	// rendering with their best-available guess.
+	let model_source = record_model.unwrap_or(header.model.as_str());
+	let (provider, model) = split_provider_model(model_source);
 	let mut message = serde_json::Map::new();
 	message.insert("role".into(), serde_json::Value::String("assistant".into()));
 	message.insert("content".into(), serde_json::Value::Array(blocks));
@@ -713,12 +722,41 @@ fn parse_pi_assistant(msg: &serde_json::Value) -> Vec<SessionRecord> {
 	} else {
 		Some(thinkings.join("\n"))
 	};
+	// Empty-shell assistant rows — `{"role":"assistant","content":[]}`
+	// with no thinking, no text, no tool calls — were written by
+	// earlier versions whenever a provider bailed mid-stream or
+	// streamed only a usage chunk. Re-inflating one into a
+	// `ChatMessage::Assistant { content: None, tool_calls: [] }`
+	// poisons the next prompt on Anthropic (`text content blocks
+	// must contain non-whitespace text`) the moment the user
+	// reopens the session and sends. Drop the record on load —
+	// the surrounding `Usage` block (if any) still lands. The
+	// runner now refuses to persist these in the first place, so
+	// this only matters for sessions on disk from before the fix.
+	let is_empty_shell = content.as_deref().map(|t| t.trim().is_empty()).unwrap_or(true)
+		&& thinking.as_deref().map(|t| t.trim().is_empty()).unwrap_or(true)
+		&& tool_calls.is_empty();
 	let mut out: Vec<SessionRecord> = Vec::with_capacity(2);
-	out.push(SessionRecord::Assistant {
-		content,
-		thinking,
-		tool_calls,
-	});
+	if !is_empty_shell {
+		// Reconstruct the `provider/model` stamp from the pi-mono
+		// `provider` + `model` fields, when both are present —
+		// preserves the real route across reload so a later
+		// re-persist (e.g. orphan recovery) doesn't downgrade
+		// the record to the session header's seed.
+		let provider = msg.get("provider").and_then(|v| v.as_str());
+		let model_field = msg.get("model").and_then(|v| v.as_str());
+		let model = match (provider, model_field) {
+			(Some(p), Some(m)) => Some(format!("{p}/{m}")),
+			(None, Some(m)) => Some(m.to_string()),
+			_ => None,
+		};
+		out.push(SessionRecord::Assistant {
+			content,
+			thinking,
+			tool_calls,
+			model,
+		});
+	}
 	if let Some(usage) = msg.get("usage").and_then(parse_pi_usage_block) {
 		out.push(usage);
 	}
@@ -858,6 +896,20 @@ pub enum SessionRecord {
 		thinking: Option<String>,
 		#[serde(default, skip_serializing_if = "Vec::is_empty")]
 		tool_calls: Vec<ToolCall>,
+		/// Provider/model slug that actually served this round-
+		/// trip, in `provider/model` form (e.g. `anthropic/claude-
+		/// sonnet-4.5`). Stamped on the pi-mono assistant row in
+		/// place of the session header's seed model so the trace
+		/// viewer shows the real route per turn — the header's
+		/// `model` is only the **session creation** seed and stays
+		/// frozen even when the user flips providers mid-session.
+		///
+		/// `None` only for sessions on disk from before this
+		/// field shipped, in which case `pi_assistant_message`
+		/// falls back to `header.model` (the old behaviour). The
+		/// in-memory runner always populates it.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		model: Option<String>,
 	},
 	/// One tool result fed back to the model. `tool_call_id`
 	/// matches the `id` on the parent [`SessionRecord::Assistant`]
@@ -1659,6 +1711,7 @@ mod tests {
 				content: Some("hey".into()),
 				thinking: None,
 				tool_calls: Vec::new(),
+				model: None,
 			},
 		)
 		.await
@@ -1823,6 +1876,7 @@ mod tests {
 			&SessionRecord::Assistant {
 				content: Some("here's a plan".into()),
 				thinking: Some("let me think".into()),
+				model: None,
 				tool_calls: vec![ToolCall {
 					id: "call-1".into(),
 					kind: "function".into(),
@@ -1863,6 +1917,7 @@ mod tests {
 				content,
 				thinking,
 				tool_calls,
+				model: _,
 			} => {
 				assert_eq!(content.as_deref(), Some("here's a plan"));
 				assert_eq!(thinking.as_deref(), Some("let me think"));
@@ -1896,6 +1951,7 @@ mod tests {
 				content: Some("done".into()),
 				thinking: None,
 				tool_calls: Vec::new(),
+				model: None,
 			},
 		)
 		.await
@@ -1963,6 +2019,7 @@ mod tests {
 				content: Some("ok".into()),
 				thinking: None,
 				tool_calls: Vec::new(),
+				model: None,
 			},
 		)
 		.await
@@ -2396,6 +2453,7 @@ mod tests {
 				content: None,
 				thinking: None,
 				tool_calls: vec![make_tool_call("call-a", "bash")],
+				model: None,
 			},
 			SessionRecord::Tool {
 				tool_call_id: "call-a".into(),
@@ -2420,6 +2478,7 @@ mod tests {
 				content: None,
 				thinking: None,
 				tool_calls: vec![make_tool_call("call-a", "bash"), make_tool_call("call-b", "bash")],
+				model: None,
 			},
 			SessionRecord::Tool {
 				tool_call_id: "call-a".into(),
@@ -2439,6 +2498,7 @@ mod tests {
 				content: None,
 				thinking: None,
 				tool_calls: vec![make_tool_call("call-a", "bash")],
+				model: None,
 			},
 			SessionRecord::Tool {
 				tool_call_id: "call-a".into(),
@@ -2448,6 +2508,7 @@ mod tests {
 				content: None,
 				thinking: None,
 				tool_calls: vec![make_tool_call("call-b", "read_file")],
+				model: None,
 			},
 			SessionRecord::Tool {
 				tool_call_id: "call-b".into(),
@@ -2457,6 +2518,7 @@ mod tests {
 				content: None,
 				thinking: None,
 				tool_calls: vec![make_tool_call("call-c", "bash")],
+				model: None,
 			},
 		];
 		assert_eq!(orphan_tool_call_ids(&records), vec!["call-c".to_string()]);
@@ -2475,8 +2537,118 @@ mod tests {
 				content: Some("I don't know".into()),
 				thinking: None,
 				tool_calls: Vec::new(),
+				model: None,
 			},
 		];
 		assert!(orphan_tool_call_ids(&records).is_empty());
+	}
+
+	#[test]
+	fn empty_shell_assistant_row_drops_on_load() {
+		// An assistant envelope written by an older runner that
+		// landed `{"role":"assistant","content":[]}` on disk
+		// after the provider bailed mid-stream. Reinflating one
+		// into `ChatMessage::Assistant { content: None, tool_calls:
+		// [] }` poisons the next prompt on Anthropic (`text
+		// content blocks must contain non-whitespace text`).
+		// The load path must drop it so reopened sessions stay
+		// sendable.
+		let envelope = serde_json::json!({
+			"type": "message",
+			"message": {
+				"role": "assistant",
+				"content": [],
+				"provider": "anthropic",
+				"model": "claude-sonnet-4.5",
+				"usage": { "input": 100, "output": 0, "totalTokens": 100 },
+			},
+		});
+		let records = pi_wire_to_records(&envelope);
+		// Drop the assistant row, keep the usage block.
+		assert_eq!(records.len(), 1);
+		assert!(matches!(records[0], SessionRecord::Usage { .. }));
+	}
+
+	#[test]
+	fn whitespace_only_assistant_row_drops_on_load() {
+		// Same shape, but the empty shell came back as a single
+		// whitespace text block instead of `content: []`. Anthropic
+		// rejects both the same way; the load path treats them
+		// identically.
+		let envelope = serde_json::json!({
+			"type": "message",
+			"message": {
+				"role": "assistant",
+				"content": [{ "type": "text", "text": "   \n\t" }],
+			},
+		});
+		let records = pi_wire_to_records(&envelope);
+		assert!(records.is_empty(), "expected drop, got {records:?}");
+	}
+
+	#[test]
+	fn assistant_with_only_tool_calls_survives_load() {
+		// Tool-only assistant turns (no text, no thinking) are
+		// legitimate and must keep round-tripping. Only the
+		// fully-empty shell gets dropped.
+		let envelope = serde_json::json!({
+			"type": "message",
+			"message": {
+				"role": "assistant",
+				"content": [{
+					"type": "toolCall",
+					"id": "call-1",
+					"name": "bash",
+					"arguments": { "command": "ls" },
+				}],
+			},
+		});
+		let records = pi_wire_to_records(&envelope);
+		assert_eq!(records.len(), 1);
+		match &records[0] {
+			SessionRecord::Assistant {
+				content,
+				thinking,
+				tool_calls,
+				model,
+			} => {
+				assert!(content.is_none());
+				assert!(thinking.is_none());
+				assert_eq!(tool_calls.len(), 1);
+				assert_eq!(tool_calls[0].id, "call-1");
+				assert!(model.is_none());
+			}
+			other => panic!("expected Assistant, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn assistant_model_stamp_round_trips_through_pi_wire() {
+		// The runner stamps `provider/model` (e.g.
+		// `anthropic/claude-sonnet-4.5`) into the record. Pi-mono
+		// renders it as separate `provider` + `model` fields on
+		// the assistant envelope; on reload we glue them back
+		// together. End-to-end: the value the runner persisted
+		// is the value the next load reconstructs.
+		let header = make_test_header("sess-model-stamp");
+		let record = SessionRecord::Assistant {
+			content: Some("hello".into()),
+			thinking: None,
+			tool_calls: Vec::new(),
+			model: Some("anthropic/claude-sonnet-4.5".into()),
+		};
+		let wire = record_to_pi_wire(&record, &header);
+		// Sanity: pi envelope split the stamp into the conventional fields.
+		let msg = wire.get("message").unwrap();
+		assert_eq!(msg.get("provider").and_then(|v| v.as_str()), Some("anthropic"));
+		assert_eq!(msg.get("model").and_then(|v| v.as_str()), Some("claude-sonnet-4.5"));
+		// Round-trip back through the loader.
+		let records = pi_wire_to_records(&wire);
+		match &records[0] {
+			SessionRecord::Assistant { model, .. } => {
+				assert_eq!(model.as_deref(), Some("anthropic/claude-sonnet-4.5"));
+			}
+			other => panic!("expected Assistant, got {other:?}"),
+		}
 	}
 }

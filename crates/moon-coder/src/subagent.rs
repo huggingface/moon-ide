@@ -248,6 +248,7 @@ async fn run_subagent_inner(
 	format_queue: Arc<crate::tools::FormatQueue>,
 ) -> Result<SubagentReport, CoderError> {
 	let standard_model = models.standard().to_owned();
+	let pi_model = models.resolve_route().pi_provider_model(&standard_model);
 	let id = spec.id.clone();
 	let system_prompt = spec
 		.system_prompt_override
@@ -411,7 +412,12 @@ async fn run_subagent_inner(
 				StreamEvent::ToolCallDelta { .. } => {}
 			})
 			.await?;
-		if started.into_inner() {
+		// Same empty-shell guard the parent runner uses — skip
+		// pushing / persisting / emitting `End` for an Anthropic
+		// turn that bailed mid-stream. See
+		// [`crate::runner::assistant_response_is_empty`].
+		let response_is_empty = crate::runner::assistant_response_is_empty(&response);
+		if started.into_inner() && !response_is_empty {
 			sink.send(wrap_inner(
 				&id,
 				CoderEvent::AssistantMessageEnd {
@@ -429,17 +435,20 @@ async fn run_subagent_inner(
 		// updates land on the same wire as parent updates. The
 		// envelope is `SubagentEvent { inner: TokenUsage … }`.
 		emit_subagent_token_usage(sink, &id, models, &standard_model, &messages, &response);
-		messages.push(response_to_message(&response));
-		persist_subagent(
-			&session_dir,
-			&header,
-			&SessionRecord::Assistant {
-				content: response.content.clone(),
-				thinking: response.thinking.clone(),
-				tool_calls: response.tool_calls.clone(),
-			},
-		)
-		.await;
+		if !response_is_empty {
+			messages.push(response_to_message(&response));
+			persist_subagent(
+				&session_dir,
+				&header,
+				&SessionRecord::Assistant {
+					content: response.content.clone(),
+					thinking: response.thinking.clone(),
+					tool_calls: response.tool_calls.clone(),
+					model: Some(pi_model.clone()),
+				},
+			)
+			.await;
+		}
 
 		if response.tool_calls.is_empty() {
 			let result_text = response.content.clone().unwrap_or_default();
@@ -523,6 +532,7 @@ async fn run_subagent_inner(
 		&session_dir,
 		&header,
 		&standard_model,
+		&pi_model,
 		&mut messages,
 		&cancel,
 	)
@@ -569,6 +579,7 @@ async fn subagent_wrap_up(
 	session_dir: &Utf8Path,
 	header: &SessionHeader,
 	standard_model: &str,
+	pi_model: &str,
 	messages: &mut Vec<ChatMessage>,
 	cancel: &CancellationToken,
 ) -> Result<String, CoderError> {
@@ -635,7 +646,9 @@ Do not call any more tools. Write a final response now using only what you've al
 		})
 		.await?;
 
-	if started.into_inner() {
+	// Same empty-shell guard as the main sub-agent loop.
+	let response_is_empty = crate::runner::assistant_response_is_empty(&response);
+	if started.into_inner() && !response_is_empty {
 		sink.send(wrap_inner(
 			id,
 			CoderEvent::AssistantMessageEnd {
@@ -647,17 +660,20 @@ Do not call any more tools. Write a final response now using only what you've al
 	}
 
 	let final_text = response.content.clone().unwrap_or_default();
-	messages.push(response_to_message(&response));
-	persist_subagent(
-		session_dir,
-		header,
-		&SessionRecord::Assistant {
-			content: response.content.clone(),
-			thinking: response.thinking.clone(),
-			tool_calls: response.tool_calls.clone(),
-		},
-	)
-	.await;
+	if !response_is_empty {
+		messages.push(response_to_message(&response));
+		persist_subagent(
+			session_dir,
+			header,
+			&SessionRecord::Assistant {
+				content: response.content.clone(),
+				thinking: response.thinking.clone(),
+				tool_calls: response.tool_calls.clone(),
+				model: Some(pi_model.to_string()),
+			},
+		)
+		.await;
+	}
 	Ok(final_text)
 }
 

@@ -1336,6 +1336,7 @@ impl CoderHandle {
 					content,
 					tool_calls,
 					thinking: _,
+					model: _,
 				} => {
 					messages.push(ChatMessage::Assistant {
 						content: content.clone(),
@@ -2029,6 +2030,12 @@ async fn run_turn(
 	// `InferenceClient` instead.
 	let models = state.models.read().await.clone();
 	let standard_model = models.standard().to_owned();
+	// Resolved route snapshot so every persisted assistant
+	// record carries a `provider/model` stamp matching what
+	// actually served the round-trip. Snapshotted alongside
+	// `models` so a settings flip mid-turn doesn't make this
+	// turn's record claim a route it never spoke to.
+	let pi_model = models.resolve_route().pi_provider_model(&standard_model);
 
 	// Parent's tool list = registry's regular tools plus the
 	// `task` definition (delegation primitive). Sub-agents pick
@@ -2232,14 +2239,31 @@ async fn run_turn(
 			})
 			.await?;
 
-		{
+		// An assistant response with no text, no thinking, and no
+		// tool_calls is an empty shell — providers occasionally
+		// emit one when they bail mid-stream or return only a
+		// usage chunk. Pushing it onto `messages` / persisting it
+		// corrupts the next turn's history: Anthropic rejects
+		// assistant blocks that are empty or whitespace-only
+		// (`messages: text content blocks must contain
+		// non-whitespace text`), and on reload an empty record
+		// re-inflates into a `ChatMessage::Assistant` that trips
+		// the same 400. Drop it on the floor here; the usage
+		// figures still flow through `last_usage` /
+		// `persist_usage_record` / `emit_token_usage` below so
+		// the ring + compaction trigger stay accurate.
+		let response_is_empty = assistant_response_is_empty(&response);
+		if !response_is_empty {
 			let mut session = rt.session.lock().await;
 			session.messages.push(response_to_message(&response));
+		}
+		{
 			// Stash whatever usage we have for the next iteration's
 			// compaction decision. Provider-supplied is exact; we
 			// synthesise a `TokenUsage` from the bytes/4 estimate
 			// when missing so the threshold check still has a
 			// number to compare against.
+			let mut session = rt.session.lock().await;
 			session.last_usage = Some(response.usage.unwrap_or_else(|| {
 				let prompt = estimate_prompt_tokens(&messages);
 				let completion = estimate_completion_tokens(&response);
@@ -2252,7 +2276,9 @@ async fn run_turn(
 				}
 			}));
 		}
-		persist_assistant_record(rt, &response).await;
+		if !response_is_empty {
+			persist_assistant_record(rt, &response, Some(pi_model.clone())).await;
+		}
 		// Persist provider usage too, so a session reopened later
 		// — by the same IDE process or a fresh launch — restores
 		// the panel's context-usage ring with provider-exact
@@ -2269,14 +2295,19 @@ async fn run_turn(
 		// ring still moves on every turn.
 		emit_token_usage(sink, &models, &standard_model, &messages, &response);
 
-		// Always emit `End` *if* we ever started a bubble; otherwise
-		// the frontend would be stuck with an empty placeholder.
-		// The sequencing is `Start (once) → N × Delta (content
-		// and/or thinking) → End` — the UI uses `End.text` /
-		// `End.thinking` as the canonical replacements so any drift
-		// between concatenated deltas and the final assembly heals
-		// on close.
-		if content_started.into_inner() {
+		// Always emit `End` *if* we ever started a bubble and the
+		// final response actually carries something to render;
+		// otherwise the frontend would be stuck with an empty
+		// placeholder. The sequencing is `Start (once) → N × Delta
+		// (content and/or thinking) → End` — the UI uses
+		// `End.text` / `End.thinking` as the canonical replacements
+		// so any drift between concatenated deltas and the final
+		// assembly heals on close. Skipping `End` on an empty-shell
+		// response (no text, no thinking, no tool calls) lets the
+		// panel's start-without-end recovery prune the orphan
+		// bubble — without this an Anthropic turn that bailed
+		// mid-stream would leave a permanent empty row.
+		if content_started.into_inner() && !response_is_empty {
 			// Drop empty-string thinking on the canonical message —
 			// `Some("")` would force the UI to render an empty
 			// "Thoughts" disclosure for messages that didn't actually
@@ -2353,6 +2384,7 @@ async fn wrap_up_final_answer(
 	);
 	let models = state.models.read().await.clone();
 	let standard_model = models.standard().to_owned();
+	let pi_model = models.resolve_route().pi_provider_model(&standard_model);
 
 	let sentinel_id = new_message_id();
 	let sentinel_text = format!(
@@ -2436,7 +2468,11 @@ done, what's still unfinished, and any uncertainty. If the user needs to take a 
 		})
 		.await?;
 
-	if started.into_inner() {
+	// Same empty-shell guard as the main loop: skip pushing /
+	// persisting / emitting an `End` for an Anthropic turn that
+	// bailed mid-stream. See [`assistant_response_is_empty`].
+	let response_is_empty = assistant_response_is_empty(&response);
+	if started.into_inner() && !response_is_empty {
 		let canonical_thinking = if thinking_emitted.into_inner() {
 			response.thinking.clone()
 		} else {
@@ -2449,8 +2485,10 @@ done, what's still unfinished, and any uncertainty. If the user needs to take a 
 		});
 	}
 
-	rt.session.lock().await.messages.push(response_to_message(&response));
-	persist_assistant_record(rt, &response).await;
+	if !response_is_empty {
+		rt.session.lock().await.messages.push(response_to_message(&response));
+		persist_assistant_record(rt, &response, Some(pi_model)).await;
+	}
 	emit_token_usage(sink, &models, &standard_model, &messages, &response);
 
 	Ok(())
@@ -3185,8 +3223,11 @@ async fn drain_pending_steers(rt: &Arc<SessionRuntime>, sink: &FolderEventSink) 
 
 /// Append an `Assistant` record to the JSONL of the given
 /// folder's session. Best-effort: a write failure logs but
-/// doesn't fail the turn.
-async fn persist_assistant_record(rt: &Arc<SessionRuntime>, response: &AssistantResponse) {
+/// doesn't fail the turn. `pi_model` is the `provider/model`
+/// slug that actually served the round-trip — stamped on the
+/// persisted record so the pi-mono trace viewer renders the
+/// real route per turn, not the session header's seed.
+async fn persist_assistant_record(rt: &Arc<SessionRuntime>, response: &AssistantResponse, pi_model: Option<String>) {
 	let (dir, header) = {
 		let session = rt.session.lock().await;
 		let Some(dir) = session.session_dir.clone() else {
@@ -3198,6 +3239,7 @@ async fn persist_assistant_record(rt: &Arc<SessionRuntime>, response: &Assistant
 		content: response.content.clone(),
 		thinking: response.thinking.clone(),
 		tool_calls: response.tool_calls.clone(),
+		model: pi_model,
 	};
 	if let Err(err) = sessions::append_record(&dir, &header, &record).await {
 		tracing::warn!(error = %err, "failed to persist assistant message");
@@ -3587,6 +3629,7 @@ fn emit_replay_events(sink: &FolderEventSink, record: SessionRecord) {
 			content,
 			thinking,
 			tool_calls,
+			model: _,
 		} => {
 			let id = new_message_id();
 			let has_text = content.as_deref().map(|t| !t.is_empty()).unwrap_or(false);
@@ -3762,6 +3805,7 @@ fn subagent_replay_inners(record: SessionRecord) -> Vec<CoderEvent> {
 			content,
 			thinking,
 			tool_calls,
+			model: _,
 		} => {
 			let mut out = Vec::new();
 			let id = new_message_id();
@@ -3811,6 +3855,33 @@ fn response_to_message(response: &AssistantResponse) -> ChatMessage {
 		content: response.content.clone(),
 		tool_calls: response.tool_calls.clone(),
 	}
+}
+
+/// True iff `response` has no text, no thinking, and no tool
+/// calls — an empty shell the provider returned when it bailed
+/// mid-stream or only emitted a usage chunk. Callers (the main
+/// loop in `run_turn`, the wrap-up turn, and `run_subagent`)
+/// use this to skip pushing / persisting / emitting the
+/// message, because:
+///
+/// - Anthropic rejects assistant blocks with empty or
+///   whitespace-only text (`messages: text content blocks must
+///   contain non-whitespace text`). Shipping the empty shell on
+///   the next round-trip 400s.
+/// - The on-disk shape (`{"role":"assistant","content":[]}`)
+///   re-inflates on reload into the same offending shell, so a
+///   reopened session would 400 on the very first send.
+///
+/// Whitespace-only content counts as empty too — same Anthropic
+/// rule. Tool calls are kept verbatim; an assistant turn that
+/// emits only `tool_use` blocks is valid.
+pub(crate) fn assistant_response_is_empty(response: &AssistantResponse) -> bool {
+	if !response.tool_calls.is_empty() {
+		return false;
+	}
+	let text_empty = response.content.as_deref().map(str::trim).unwrap_or("").is_empty();
+	let thinking_empty = response.thinking.as_deref().map(str::trim).unwrap_or("").is_empty();
+	text_empty && thinking_empty
 }
 
 /// Emit a [`CoderEvent::TokenUsage`] report for one LLM round-trip.
@@ -4470,6 +4541,68 @@ mod tests {
 	}
 
 	#[test]
+	fn assistant_response_is_empty_flags_real_empties() {
+		// All-empty shell: no text, no thinking, no tool calls.
+		// Providers occasionally emit one when they bail mid-
+		// stream — the runner must not push or persist these.
+		let empty = AssistantResponse {
+			content: None,
+			thinking: None,
+			tool_calls: Vec::new(),
+			usage: None,
+		};
+		assert!(assistant_response_is_empty(&empty));
+
+		// Whitespace-only content is empty for our purposes —
+		// Anthropic rejects whitespace-only blocks the same way
+		// as empty arrays.
+		let whitespace = AssistantResponse {
+			content: Some("   \n\t".into()),
+			thinking: Some("   ".into()),
+			tool_calls: Vec::new(),
+			usage: None,
+		};
+		assert!(assistant_response_is_empty(&whitespace));
+	}
+
+	#[test]
+	fn assistant_response_is_empty_keeps_real_messages() {
+		// Text content: keep.
+		let text = AssistantResponse {
+			content: Some("hello".into()),
+			thinking: None,
+			tool_calls: Vec::new(),
+			usage: None,
+		};
+		assert!(!assistant_response_is_empty(&text));
+
+		// Thinking only: keep.
+		let thinking = AssistantResponse {
+			content: None,
+			thinking: Some("let me think".into()),
+			tool_calls: Vec::new(),
+			usage: None,
+		};
+		assert!(!assistant_response_is_empty(&thinking));
+
+		// Tool calls only (no text): legitimate tool-using turn.
+		let tool_only = AssistantResponse {
+			content: None,
+			thinking: None,
+			tool_calls: vec![crate::inference::ToolCall {
+				id: "call-1".into(),
+				kind: "function".into(),
+				function: crate::inference::FunctionCall {
+					name: "bash".into(),
+					arguments: "{}".into(),
+				},
+			}],
+			usage: None,
+		};
+		assert!(!assistant_response_is_empty(&tool_only));
+	}
+
+	#[test]
 	fn estimate_prompt_with_anchor_falls_back_to_bytes_div_4_when_no_last_usage() {
 		let messages = vec![
 			ChatMessage::System {
@@ -4599,6 +4732,7 @@ mod tests {
 					ChatMessage::Assistant { tool_calls, .. } => tool_calls.clone(),
 					_ => unreachable!(),
 				},
+				model: None,
 			},
 		)
 		.await

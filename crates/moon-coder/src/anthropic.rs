@@ -186,7 +186,8 @@ fn translate<'a>(messages: &'a [ChatMessage], mark_system_cache: bool, mark_last
 			}
 			ChatMessage::User { content, images } => {
 				let mut blocks: Vec<Block<'a>> = Vec::with_capacity(images.len() + 1);
-				if !content.is_empty() {
+				let trimmed = content.trim();
+				if !trimmed.is_empty() {
 					blocks.push(Block::Text {
 						text: content,
 						cache_control: None,
@@ -205,21 +206,23 @@ fn translate<'a>(messages: &'a [ChatMessage], mark_system_cache: bool, mark_last
 						tracing::warn!(mime = %img.mime, "skipping image attachment with unparsable data URL");
 					}
 				}
+				// Anthropic rejects empty content arrays *and*
+				// whitespace-only text blocks (`messages: text
+				// content blocks must contain non-whitespace
+				// text`). A user message with only whitespace +
+				// no images carries no signal anyway, so drop
+				// the row entirely rather than synthesising a
+				// no-op block that 400s.
 				if blocks.is_empty() {
-					// Anthropic rejects an empty content array.
-					// Fall back to a single space; the model
-					// ignores it but the request stays valid.
-					blocks.push(Block::Text {
-						text: " ",
-						cache_control: None,
-					});
+					tracing::debug!("dropping empty user message before sending to Anthropic");
+					continue;
 				}
 				push_or_merge_user(&mut out, blocks);
 			}
 			ChatMessage::Assistant { content, tool_calls } => {
 				let mut blocks: Vec<Block<'a>> = Vec::with_capacity(tool_calls.len() + 1);
 				if let Some(text) = content.as_deref() {
-					if !text.is_empty() {
+					if !text.trim().is_empty() {
 						blocks.push(Block::Text {
 							text,
 							cache_control: None,
@@ -234,15 +237,17 @@ fn translate<'a>(messages: &'a [ChatMessage], mark_system_cache: bool, mark_last
 						input,
 					});
 				}
+				// Empty-shell assistant turns (no text, no tool
+				// calls) used to be persisted by older runners
+				// whenever a provider bailed mid-stream. Anthropic
+				// rejects whitespace-only blocks now, so drop the
+				// row instead of papering over it with a space.
+				// The runner refuses to persist these going
+				// forward; this arm guards historical sessions
+				// loaded off disk.
 				if blocks.is_empty() {
-					// Defensive: an assistant turn with neither
-					// text nor tool calls shouldn't reach here,
-					// but emit a no-op text block rather than a
-					// 400 if it does.
-					blocks.push(Block::Text {
-						text: " ",
-						cache_control: None,
-					});
+					tracing::debug!("dropping empty assistant message before sending to Anthropic");
+					continue;
 				}
 				out.push(Message {
 					role: "assistant",
@@ -1404,5 +1409,86 @@ mod tests {
 		assert_eq!(summaries[1].context_length, Some(200000));
 		assert_eq!(summaries[2].id, "older-shape-no-context");
 		assert_eq!(summaries[2].context_length, None);
+	}
+
+	#[test]
+	fn translate_drops_empty_shell_assistant_messages() {
+		// Older runners persisted assistant messages with no
+		// text, no thinking, and no tool calls whenever a
+		// provider bailed mid-stream. On reload the runner now
+		// drops those records, but a session-loader race or a
+		// stale in-memory message could still feed one through —
+		// the wire translator is the last line of defence.
+		// Anthropic 400s with `text content blocks must contain
+		// non-whitespace text` if we emit a `" "` no-op block,
+		// so the translator drops the message instead.
+		let messages = vec![
+			ChatMessage::user("hello"),
+			ChatMessage::Assistant {
+				content: None,
+				tool_calls: Vec::new(),
+			},
+		];
+		let translated = translate(&messages, false, false);
+		// The empty shell is gone; only the user message survives.
+		assert_eq!(translated.messages.len(), 1);
+		assert_eq!(translated.messages[0].role, "user");
+	}
+
+	#[test]
+	fn translate_drops_whitespace_only_assistant_text() {
+		// Same shape, but the empty shell came back as
+		// `content: Some("   \n\t")` — Anthropic rejects that
+		// just like an empty array.
+		let messages = vec![
+			ChatMessage::user("hello"),
+			ChatMessage::Assistant {
+				content: Some("   \n\t".into()),
+				tool_calls: Vec::new(),
+			},
+		];
+		let translated = translate(&messages, false, false);
+		assert_eq!(translated.messages.len(), 1);
+		assert_eq!(translated.messages[0].role, "user");
+	}
+
+	#[test]
+	fn translate_keeps_assistant_tool_only_turns() {
+		// Tool-using assistant turns with no text are valid —
+		// don't drop them.
+		let messages = vec![
+			ChatMessage::user("run ls"),
+			ChatMessage::Assistant {
+				content: None,
+				tool_calls: vec![ToolCall {
+					id: "call-1".into(),
+					kind: "function".into(),
+					function: crate::inference::FunctionCall {
+						name: "bash".into(),
+						arguments: r#"{"command":"ls"}"#.into(),
+					},
+				}],
+			},
+		];
+		let translated = translate(&messages, false, false);
+		assert_eq!(translated.messages.len(), 2);
+		assert_eq!(translated.messages[1].role, "assistant");
+	}
+
+	#[test]
+	fn translate_drops_whitespace_only_user_message_without_images() {
+		// Same rule on the user side: an empty / whitespace-only
+		// user message with no images is dropped, not papered
+		// over with `" "`.
+		let messages = vec![
+			ChatMessage::user("hello"),
+			ChatMessage::User {
+				content: "   ".into(),
+				images: Vec::new(),
+			},
+		];
+		let translated = translate(&messages, false, false);
+		// Only the first user message survives.
+		assert_eq!(translated.messages.len(), 1);
 	}
 }

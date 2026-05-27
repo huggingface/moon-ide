@@ -171,6 +171,30 @@ impl ResolvedProvider {
 			}
 		}
 	}
+
+	/// Human-readable provider name we stamp on persisted
+	/// pi-mono assistant messages — `huggingface`, `anthropic`,
+	/// `openrouter`, or the user-provider's own id for the
+	/// generic [`Self::Custom`] case (e.g. a self-hosted vLLM
+	/// pinned under id `local-vllm`).
+	pub fn pi_provider_name(&self) -> &str {
+		match self {
+			Self::HuggingFace => "huggingface",
+			Self::Anthropic { .. } => "anthropic",
+			Self::OpenRouter { .. } => "openrouter",
+			Self::Custom { id, .. } => id.as_str(),
+		}
+	}
+
+	/// `provider/model`-shaped slug suitable for
+	/// [`crate::sessions::SessionRecord::Assistant::model`].
+	/// Combines [`Self::pi_provider_name`] with `model_slug`
+	/// using a `/` separator. The pi-mono trace viewer splits
+	/// on that boundary to render `provider · model` in its
+	/// per-message header — see [`crate::sessions::pi_assistant_message`].
+	pub fn pi_provider_model(&self, model_slug: &str) -> String {
+		format!("{}/{}", self.pi_provider_name(), model_slug)
+	}
 }
 
 impl CoderModels {
