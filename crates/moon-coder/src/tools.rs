@@ -1104,7 +1104,8 @@ struct EditPlan {
 	/// Which matcher succeeded. Surfaced verbatim in the tool result
 	/// so the model — and any human reading the session log — can see
 	/// when a fallback kicked in. The strings are part of the tool
-	/// protocol: `"exact"`, `"fuzzy_indent"`, `"fuzzy_unescape"`.
+	/// protocol: `"exact"`, `"fuzzy_unescape"`, `"fuzzy_backslash"`,
+	/// `"fuzzy_indent"`, `"fuzzy_whitespace"`.
 	mode: &'static str,
 }
 
@@ -1116,18 +1117,27 @@ struct EditPlan {
 ///    the model gets `find` byte-perfect on the first try.
 /// 2. **Unescape fallback** — if `find` contains the literal 2-char
 ///    sequences `\\n` / `\\t` (the model's escape-leakage failure
-///    mode — see `specs/test-plans/0068-edit-file-fuzzy-fallback.md`)
-///    and the unescaped form matches exactly while the original
-///    doesn't, treat that as the intended pattern. `replace` is
-///    unescaped in the same way so the splice is consistent.
-/// 3. **Indent-tolerant fallback** — strip per-line leading whitespace
+///    mode) and the unescaped form matches exactly while the
+///    original doesn't, treat that as the intended pattern.
+///    `replace` is unescaped in the same way so the splice is
+///    consistent.
+/// 3. **Backslash-run-collapsing fallback** — the model can't keep
+///    backslash counts straight across the JSON ⇄ source-string
+///    boundary, especially in regex literals and template-literal
+///    `RegExp(...)` patterns. Collapse every run of consecutive
+///    backslashes to a single backslash on both `find` and the
+///    file, then re-match. On a unique hit, splice the file's
+///    *original* byte range (so the file's escaping survives) and
+///    drop `replace` in verbatim — the model owns its own
+///    replacement bytes here, same as the whitespace stage below.
+/// 4. **Indent-tolerant fallback** — strip per-line leading whitespace
 ///    from both `find` and the file's lines, look for a line-aligned
 ///    match. On success, splice the *original* file lines' byte range
 ///    and re-indent `replace` so its first non-blank line lines up
 ///    with the file's match indent. This catches the "model is off
 ///    by one tab depth" failure mode without weakening exact-match
 ///    semantics — only kicks in when the strict match misses.
-/// 4. **Whitespace-collapsing fallback** — last resort for the
+/// 5. **Whitespace-collapsing fallback** — last resort for the
 ///    "prettier rewrote it" failure mode: collapse every run of ASCII
 ///    whitespace (space, tab, CR, LF) to a single space on both
 ///    `find` and the file, anchor the comparison on `find.trim()`,
@@ -1186,7 +1196,28 @@ fn locate_edit(
 		}
 	}
 
-	// Stage 3: per-line indent-tolerant. Only well-defined when
+	// Stage 3: backslash-run-collapsing. The model regularly sends
+	// a `find` whose backslash count is off by one — `\w` vs `\\w`
+	// in a template-literal `RegExp(...)`, `\\$&` vs `\\\\$&` in a
+	// JS string, etc. Normalise every run of consecutive `\` bytes
+	// to a single `\` on both sides, then re-search. Splice the
+	// file's original byte range so the file's own escaping
+	// survives the edit; `replace` is the model's responsibility,
+	// same as the whitespace stage.
+	let bs_hits = find_backslash_collapsed(text, find);
+	if !bs_hits.is_empty() {
+		let (chosen, picked) = select_bs(&bs_hits, occurrence, path_for_error, text)?;
+		return Ok(EditPlan {
+			start: chosen.start,
+			end: chosen.end,
+			replace_text: replace.to_owned(),
+			total_matches: bs_hits.len(),
+			occurrence: picked,
+			mode: "fuzzy_backslash",
+		});
+	}
+
+	// Stage 4: per-line indent-tolerant. Only well-defined when
 	// `find` is line-aligned (every line is on its own); a mid-line
 	// `find` falls through to the next stage.
 	let fuzzy = find_indent_tolerant(text, find);
@@ -1203,7 +1234,7 @@ fn locate_edit(
 		});
 	}
 
-	// Stage 4: whitespace-collapsing. Normalises every run of ASCII
+	// Stage 5: whitespace-collapsing. Normalises every run of ASCII
 	// whitespace to a single space on both sides, then anchors the
 	// match on `find.trim()` so we don't accidentally swallow file
 	// whitespace at the splice boundary. Last resort for cases where
@@ -1331,7 +1362,8 @@ fn has_literal_escape(find: &str) -> bool {
 /// backslash in `find` (real backslashes don't survive its own
 /// thought-to-JSON pipeline as `\\\\`), and translating it would
 /// confuse the rare case of someone editing a regex / printf
-/// string.
+/// string. Backslash-count mismatches have their own dedicated
+/// stage — see [`find_backslash_collapsed`].
 fn unescape_literals(s: &str) -> String {
 	let mut out = String::with_capacity(s.len());
 	let mut bytes = s.bytes().peekable();
@@ -1354,6 +1386,139 @@ fn unescape_literals(s: &str) -> String {
 		out.push(b as char);
 	}
 	out
+}
+
+/// A single backslash-collapsing hit. `start..end` is the byte range
+/// in the original file that the splice will replace; we don't carry
+/// any extra context because the replacement bytes come from the
+/// model verbatim (same shape as [`WsMatch`]).
+struct BsMatch {
+	start: usize,
+	end: usize,
+}
+
+/// Collapse every run of consecutive `\` bytes to a single `\` on
+/// both `find` and the file, then locate the needle in the file's
+/// normalised form. On a hit, the index map carries us back to the
+/// original-file byte range that produced it.
+///
+/// Why this stage exists: the model's tool-call pipeline (thought →
+/// JSON → us) regularly miscounts backslashes in regex literals,
+/// template-literal `RegExp(...)` patterns, and `String.replace`
+/// replacement strings. We saw a real session where the on-disk
+/// `(^|[^\\w-])@${escaped}` came back as `(^|[^\w-])@${escaped}` in
+/// `find` (under-escaped) and on the retry as `(^|[^\\\\w-])` (over-
+/// escaped). Both attempts failed against the exact / unescape /
+/// indent / whitespace stages, and the model gave up and wrote a
+/// less-good edit. Collapsing runs of backslashes catches both
+/// directions in one pass.
+///
+/// We splice the file's *original* byte range so the file's own
+/// escaping survives the edit — the model owns its `replace` bytes
+/// here, same trade as [`find_whitespace_collapsed`]. If `find`
+/// contains no `\` at all this stage is a no-op vs. Stage 1 and
+/// would just rediscover the exact match, so we early-return.
+fn find_backslash_collapsed(text: &str, find: &str) -> Vec<BsMatch> {
+	if !find.as_bytes().contains(&b'\\') {
+		return Vec::new();
+	}
+	let norm_find = collapse_backslash_runs(find);
+	let norm_text = normalize_backslash_runs_with_map(text);
+	if norm_find.is_empty() || norm_text.text.is_empty() {
+		return Vec::new();
+	}
+	let hits = byte_offsets_of_bytes(&norm_text.text, &norm_find);
+	hits
+		.into_iter()
+		.map(|i| BsMatch {
+			start: norm_text.orig_start[i],
+			end: norm_text.orig_end[i + norm_find.len() - 1],
+		})
+		.collect()
+}
+
+/// Mirror of [`select_ws`] for backslash-collapsed matches. Kept
+/// separate so the ambiguity error message names the right stage —
+/// helps when someone is reading a session log and trying to figure
+/// out which fallback misfired.
+fn select_bs<'a>(
+	matches: &'a [BsMatch],
+	occurrence: Option<usize>,
+	path: &str,
+	text: &str,
+) -> Result<(&'a BsMatch, usize), CoderError> {
+	match (matches.len(), occurrence) {
+		(0, _) => unreachable!("select_bs called with empty matches"),
+		(1, None | Some(1)) => Ok((&matches[0], 1)),
+		(n, None) => {
+			let lines: Vec<u32> = matches.iter().map(|m| line_number_at_byte(text, m.start)).collect();
+			let lines_csv = lines.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+			Err(CoderError::tool_failed(
+				"edit_file",
+				format!(
+					"`find` backslash-collapsed match was ambiguous in {path} ({n} hits at lines \
+{lines_csv}); pass `occurrence` (1-based) or include more surrounding context"
+				),
+			))
+		}
+		(n, Some(idx)) if idx == 0 || idx > n => Err(CoderError::tool_failed(
+			"edit_file",
+			format!("occurrence {idx} out of range — `find` matched {n} times"),
+		)),
+		(_, Some(idx)) => Ok((&matches[idx - 1], idx)),
+	}
+}
+
+/// Per-byte mapping from the backslash-collapsed form of a string
+/// back to original-file byte ranges. For each byte `i` in
+/// [`NormalizedBs::text`], `orig_start[i]..orig_end[i]` is the byte
+/// range in the original input that produced it — a run of N
+/// backslashes collapses to a single output byte whose range spans
+/// all N input bytes, so the splice picks up the file's actual
+/// escaping when we map back.
+struct NormalizedBs {
+	text: Vec<u8>,
+	orig_start: Vec<usize>,
+	orig_end: Vec<usize>,
+}
+
+/// Walk `s` once, emitting every non-`\` byte verbatim and every
+/// run of one-or-more `\` bytes as a single `\`, with the index map
+/// pointing at the full original run. Linear in input length; we
+/// touch each byte at most twice.
+fn normalize_backslash_runs_with_map(s: &str) -> NormalizedBs {
+	let bytes = s.as_bytes();
+	let mut text = Vec::with_capacity(bytes.len());
+	let mut orig_start = Vec::with_capacity(bytes.len());
+	let mut orig_end = Vec::with_capacity(bytes.len());
+	let mut i = 0;
+	while i < bytes.len() {
+		if bytes[i] == b'\\' {
+			let run_start = i;
+			while i < bytes.len() && bytes[i] == b'\\' {
+				i += 1;
+			}
+			text.push(b'\\');
+			orig_start.push(run_start);
+			orig_end.push(i);
+			continue;
+		}
+		text.push(bytes[i]);
+		orig_start.push(i);
+		orig_end.push(i + 1);
+		i += 1;
+	}
+	NormalizedBs {
+		text,
+		orig_start,
+		orig_end,
+	}
+}
+
+/// Same normalisation as [`normalize_backslash_runs_with_map`]
+/// without the index map — used to build the needle once.
+fn collapse_backslash_runs(s: &str) -> Vec<u8> {
+	normalize_backslash_runs_with_map(s).text
 }
 
 /// A single indent-tolerant hit. `start..end` is the byte range in
@@ -1959,6 +2124,73 @@ mod tests {
 		assert_eq!(plan.mode, "fuzzy_unescape");
 		assert_eq!(&file[plan.start..plan.end], "a\n\tb");
 		assert_eq!(plan.replace_text, "x\n\ty");
+	}
+
+	#[test]
+	fn locate_edit_backslash_fallback_handles_under_escape() {
+		// Real failure mode from a moon-coder session: the file
+		// contains a template-literal RegExp with source-level
+		// double-backslash escapes (`\\w`, `\\[`, `\\]`); the
+		// model's `find` had single backslashes (`\w`, `\[`,
+		// `\]`) because it lost a level of escaping somewhere in
+		// the thought-to-JSON pipeline. Stage 3 should locate
+		// the line, splice the file's original bytes, and drop
+		// the model's `replace` in verbatim.
+		let file = "  const tokenRe = new RegExp(`(^|[^\\\\w-])@${escaped}(?:\\\\[bot\\\\])?(?![\\\\w-])`, \"gi\");\n";
+		let find = "  const tokenRe = new RegExp(`(^|[^\\w-])@${escaped}(?:\\[bot\\])?(?![\\w-])`, \"gi\");";
+		let replace = "  const tokenRe = REPLACED;";
+		let plan = locate_edit(file, find, replace, None, "src/github.ts").expect("backslash-collapse match");
+		assert_eq!(plan.mode, "fuzzy_backslash");
+		// Splice covers the file's original line bytes (preserving
+		// the `\\w` double-backslashes), not the model's `\w`.
+		assert_eq!(
+			&file[plan.start..plan.end],
+			"  const tokenRe = new RegExp(`(^|[^\\\\w-])@${escaped}(?:\\\\[bot\\\\])?(?![\\\\w-])`, \"gi\");"
+		);
+		assert_eq!(plan.replace_text, "  const tokenRe = REPLACED;");
+	}
+
+	#[test]
+	fn locate_edit_backslash_fallback_handles_over_escape() {
+		// Mirror direction: model double-escaped where the file
+		// has a single backslash (`\\w` in find, `\w` on disk).
+		// Same stage catches both because we collapse *runs* of
+		// `\` on both sides.
+		let file = "const re = /\\w+/g;\n";
+		let find = "const re = /\\\\w+/g;";
+		let replace = "const re = /[a-z]+/g;";
+		let plan = locate_edit(file, find, replace, None, "src/foo.ts").expect("backslash-collapse match");
+		assert_eq!(plan.mode, "fuzzy_backslash");
+		assert_eq!(&file[plan.start..plan.end], "const re = /\\w+/g;");
+		assert_eq!(plan.replace_text, "const re = /[a-z]+/g;");
+	}
+
+	#[test]
+	fn locate_edit_backslash_fallback_skipped_when_find_has_no_backslash() {
+		// Cheap pre-check: `find` without any `\` should never
+		// engage Stage 3 — it'd just rediscover whatever Stage 1
+		// already saw. Important so a legitimate "not found"
+		// stays on Stage 1's exact path and surfaces the strict
+		// error rather than the backslash-stage one.
+		let file = "hello world\n";
+		let err = locate_edit(file, "missing", "x", None, "src/foo.rs").unwrap_err();
+		let msg = err.to_string();
+		// Falls through every stage to the final actionable error.
+		assert!(msg.contains("src/foo.rs"));
+		assert!(msg.contains("indent-tolerant"));
+	}
+
+	#[test]
+	fn locate_edit_backslash_fallback_yields_to_exact() {
+		// Exact must always win, even when `find` contains
+		// backslashes that *would* also match under collapse.
+		// Otherwise Stage 3 would steal hits and silently strip
+		// the model's intentional escaping in `replace`.
+		let file = "let s = \"a\\nb\";\n";
+		let find = "let s = \"a\\nb\";";
+		let replace = "let s = REPLACED;";
+		let plan = locate_edit(file, find, replace, None, "src/foo.rs").expect("exact match wins");
+		assert_eq!(plan.mode, "exact");
 	}
 
 	#[test]
