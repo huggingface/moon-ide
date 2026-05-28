@@ -297,6 +297,13 @@ class SessionViewState {
 	 *  replay because `tool_result` events are re-emitted as part
 	 *  of the replay stream. */
 	todos = $state<TodoItem[]>([]);
+	/** True while the runner is replaying a reopened session
+	 *  (`session_loaded` → ... → `turn_complete`). Used to gate
+	 *  the sessions-list re-sort on `user_message`: a live `send`
+	 *  bumps the row to the top, but replayed historical
+	 *  `UserMessage` events shouldn't. Cleared on the first
+	 *  `turn_complete` after the load. */
+	replaying = $state(false);
 }
 
 /** Per-bound-folder UI state. One instance per folder we've ever
@@ -2019,7 +2026,7 @@ class CoderPanelState {
 			return;
 		}
 		const sessionBucket = this.sessionStateFor(envelope.folder, envelope.session_id);
-		this.#applySessionEvent(sessionBucket, folderBucket, envelope.folder, envelope.event);
+		this.#applySessionEvent(sessionBucket, folderBucket, envelope.folder, envelope.session_id, envelope.event);
 	}
 
 	/** Handle one folder-scoped inner event (empty `session_id`
@@ -2073,8 +2080,17 @@ class CoderPanelState {
 	 *  per-session bucket (lazy-created by `sessionStateFor`);
 	 *  `folder` is its containing folder bucket, needed for
 	 *  folder-level rollups (`attentionPending`, `sessions` list
-	 *  on title updates). */
-	#applySessionEvent(session: SessionViewState, folder: FolderState, folderPath: string, event: CoderEvent): void {
+	 *  on title updates). `sessionId` mirrors the envelope so we
+	 *  can patch the folder-level sessions list (e.g. bump
+	 *  `updated_at_ms` for re-sort) without re-fetching from
+	 *  disk. */
+	#applySessionEvent(
+		session: SessionViewState,
+		folder: FolderState,
+		folderPath: string,
+		sessionId: string,
+		event: CoderEvent,
+	): void {
 		switch (event.kind) {
 			case 'user_message':
 				session.rows = [
@@ -2088,6 +2104,32 @@ class CoderPanelState {
 					},
 				];
 				session.busy = true;
+				// Mirror the backend's `updated_at_ms` bump (every
+				// `send` / queued steer bumps the header) into the
+				// in-memory sessions list and re-sort so the row
+				// floats to the top of the picker live, without a
+				// disk re-fetch. `SessionListChanged` only fires on
+				// first-persistence / rename / delete, so without
+				// this the list keeps its original creation-time
+				// order until the panel reloads. New sessions
+				// (first send before `session_loaded` lands) aren't
+				// in `folder.sessions` yet — `SessionListChanged`
+				// will refresh that branch.
+				if (!session.replaying && folder.sessions !== null) {
+					const now = Date.now();
+					let touched = false;
+					const next = folder.sessions.map((s) => {
+						if (s.id !== sessionId) {
+							return s;
+						}
+						touched = true;
+						return { ...s, updated_at_ms: now };
+					});
+					if (touched) {
+						next.sort((a, b) => b.updated_at_ms - a.updated_at_ms);
+						folder.sessions = next;
+					}
+				}
 				return;
 			case 'steer_drained':
 				// Runner moved (or `coder.unqueueSteer` popped) the
@@ -2183,6 +2225,12 @@ class CoderPanelState {
 				return;
 			case 'turn_complete':
 				session.busy = false;
+				// End of replay window: a `session_loaded` set
+				// `replaying = true` and the backend appends a
+				// terminator `TurnComplete` after replaying all
+				// records (runner.rs). Live turns clear an
+				// already-false flag — no-op.
+				session.replaying = false;
 				this.#flagAttentionIfBackground(folder, folderPath);
 				return;
 			case 'aborted': {
@@ -2236,6 +2284,12 @@ class CoderPanelState {
 				session.subagentTranscripts = new Map();
 				session.viewSubagentId = null;
 				session.busy = false;
+				// Gate the sessions-list re-sort: replayed
+				// `UserMessage` events shouldn't pretend the user
+				// just typed them. Cleared on the terminator
+				// `turn_complete` the backend appends after the
+				// replay stream.
+				session.replaying = true;
 				// Wipe the todo list and compaction trace before
 				// replay; the session's last `tool_result` for
 				// `todo_write` (if any) repopulates `todos` in the
