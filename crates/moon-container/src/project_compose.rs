@@ -191,8 +191,8 @@ impl ProjectCompose {
 	/// Drop the cached `status()` reading so the next call
 	/// re-probes `docker compose ps`. Called by every mutating
 	/// method after `docker compose` succeeds.
-	fn invalidate_status_cache(&self) {
-		status_cache::invalidate(&self.project, &self.compose_file);
+	async fn invalidate_status_cache(&self) {
+		status_cache::invalidate(&self.project, &self.compose_file).await;
 	}
 
 	/// `docker compose up -d --wait` — start all of the folder's
@@ -208,20 +208,20 @@ impl ProjectCompose {
 	/// `psql -h db`). See [`crate::network`].
 	pub async fn up(&self) -> Result<(), LifecycleError> {
 		self.docker_compose(["up", "-d", "--wait"]).await?;
-		self.invalidate_status_cache();
+		self.invalidate_status_cache().await;
 		self.attach_workspace_dev().await;
 		Ok(())
 	}
 
 	pub async fn pause(&self) -> Result<(), LifecycleError> {
 		self.docker_compose(["pause"]).await?;
-		self.invalidate_status_cache();
+		self.invalidate_status_cache().await;
 		Ok(())
 	}
 
 	pub async fn resume(&self) -> Result<(), LifecycleError> {
 		self.docker_compose(["unpause"]).await?;
-		self.invalidate_status_cache();
+		self.invalidate_status_cache().await;
 		Ok(())
 	}
 
@@ -235,7 +235,7 @@ impl ProjectCompose {
 		self
 			.docker_compose(["up", "-d", "--force-recreate", "--pull", "always", "--wait"])
 			.await?;
-		self.invalidate_status_cache();
+		self.invalidate_status_cache().await;
 		self.attach_workspace_dev().await;
 		Ok(())
 	}
@@ -255,7 +255,7 @@ impl ProjectCompose {
 	/// every start/stop cycle for no benefit.
 	pub async fn stop(&self) -> Result<(), LifecycleError> {
 		self.docker_compose(["stop"]).await?;
-		self.invalidate_status_cache();
+		self.invalidate_status_cache().await;
 		Ok(())
 	}
 
@@ -274,7 +274,7 @@ impl ProjectCompose {
 	pub async fn down(&self) -> Result<(), LifecycleError> {
 		self.detach_workspace_dev().await;
 		self.docker_compose(["down"]).await?;
-		self.invalidate_status_cache();
+		self.invalidate_status_cache().await;
 		Ok(())
 	}
 
@@ -293,7 +293,7 @@ impl ProjectCompose {
 	/// be on it yet. Idempotent on the already-attached path.
 	pub async fn start_service(&self, service: &str) -> Result<(), LifecycleError> {
 		self.docker_compose(["start", service]).await?;
-		self.invalidate_status_cache();
+		self.invalidate_status_cache().await;
 		self.attach_workspace_dev().await;
 		Ok(())
 	}
@@ -303,7 +303,7 @@ impl ProjectCompose {
 	/// user can `start_service` it again without losing state.
 	pub async fn stop_service(&self, service: &str) -> Result<(), LifecycleError> {
 		self.docker_compose(["stop", service]).await?;
-		self.invalidate_status_cache();
+		self.invalidate_status_cache().await;
 		Ok(())
 	}
 
@@ -314,7 +314,7 @@ impl ProjectCompose {
 	/// "recreate from a fresh image" workflow.
 	pub async fn restart_service(&self, service: &str) -> Result<(), LifecycleError> {
 		self.docker_compose(["restart", service]).await?;
-		self.invalidate_status_cache();
+		self.invalidate_status_cache().await;
 		self.attach_workspace_dev().await;
 		Ok(())
 	}

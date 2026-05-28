@@ -1,4 +1,5 @@
-//! Process-wide TTL cache in front of `docker compose ps`.
+//! Process-wide TTL cache + single-flight in front of
+//! `docker compose ps`.
 //!
 //! Why this exists
 //! ---------------
@@ -10,8 +11,10 @@
 //! string can fan into didChange, completion, pull-diagnostics
 //! and hover, sometimes per-language; with several open buffers
 //! and bound folders, that's 30+ `docker compose ps` calls in
-//! under a second. Each shell-out is 50–200 ms and blocks both
-//! the daemon and the IDE — the editor visibly freezes.
+//! under a second, mostly issued **concurrently** (the frontend
+//! fires them in parallel through Tauri's command runtime).
+//! Each shell-out is 50–200 ms and blocks both the daemon and
+//! the IDE — the editor visibly freezes.
 //!
 //! Shape
 //! -----
@@ -21,36 +24,50 @@
 //!   compose` lifecycle: project name pins `-p`, compose path
 //!   pins `-f`, and a `Workspace` / `ProjectCompose` always
 //!   passes both flags explicitly.
-//! - Value: the last `Ok(ContainerStatus)` and when it was
-//!   observed. Errors are **not** cached — a transient daemon
-//!   hiccup shouldn't pin the routing decision for a full TTL.
-//! - TTL: [`STATUS_TTL`] (currently 1 s). Long enough to collapse
-//!   the per-keystroke fanout into a single probe; short enough
-//!   that an external `docker compose down` reflects within the
-//!   same window the folder-bar already polls at (2 s).
+//! - Per key: an `Arc<Slot>` carrying a `tokio::sync::Mutex`
+//!   guarding the slot's last `Ok(ContainerStatus)` plus the
+//!   instant it was observed. The async mutex is what gives us
+//!   single-flight: concurrent miss callers serialise behind
+//!   the leader and pick up the leader's cached result on
+//!   acquire instead of each shelling out themselves.
+//! - TTL: [`STATUS_TTL`] (currently 1 s). Long enough to
+//!   collapse a per-keystroke burst into one shell-out; short
+//!   enough that an external `docker compose down` reflects
+//!   within the same window the folder-bar already polls at
+//!   (2 s).
+//! - Errors are **not** stored. A transient daemon hiccup
+//!   shouldn't pin the routing decision for a full TTL. A
+//!   failed leader fetch returns the error to its caller and
+//!   leaves the slot untouched; the next caller acquires the
+//!   slot mutex, sees no fresh entry, and tries again. Under
+//!   sustained failure that's one sequential retry per IPC,
+//!   not 20 concurrent retries — strictly an improvement, and
+//!   the daemon-healthy steady state is what we optimise for.
 //! - Mutating callers ([`Workspace::setup`], `pause`, `resume`,
 //!   `rebuild`, `stop`, `teardown`, and the [`ProjectCompose`]
 //!   equivalents) call [`invalidate`] after the mutation
-//!   completes. That way an internal `pause()` followed by
-//!   `status()` returns the fresh `Paused` state immediately,
-//!   not the pre-pause cached `Running`.
+//!   completes. The slot's `Entry` is reset to `None`; the
+//!   slot itself stays so an in-flight leader's fetch still
+//!   serves any followers already queued.
 //!
 //! Scope
 //! -----
 //!
-//! Strictly an optimisation for the read path. Does **not**
-//! serialise concurrent mutations or coalesce in-flight `ps`
-//! calls — two simultaneous cache misses each shell out, both
-//! write back, last writer wins. That's fine: `ps` is idempotent
-//! and the duplicate is rare (the first cache fill ends the
-//! race for the next [`STATUS_TTL`]).
+//! Single-flight is per key only. Two distinct projects whose
+//! compose files happen to share a daemon are still allowed to
+//! shell out concurrently — they're independent lifecycles and
+//! a folder-bar full of projects wants its own probe per row.
+//! Cross-project coalescing isn't worth the complexity for the
+//! call volumes we see (a workspace has on the order of a
+//! handful of projects, not thousands).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use moon_protocol::container::ContainerStatus;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::project::ProjectName;
 
@@ -76,23 +93,45 @@ impl CacheKey {
 	}
 }
 
+#[derive(Clone)]
 struct Entry {
 	at: Instant,
 	status: ContainerStatus,
 }
 
-static CACHE: Mutex<Option<HashMap<CacheKey, Entry>>> = Mutex::new(None);
-
-fn with_cache<R>(f: impl FnOnce(&mut HashMap<CacheKey, Entry>) -> R) -> R {
-	let mut guard = CACHE.lock().expect("status cache mutex poisoned");
-	let map = guard.get_or_insert_with(HashMap::new);
-	f(map)
+/// Per-key serialisation point. Holding [`Slot::entry`] across a
+/// fetch is what coalesces concurrent miss callers into a single
+/// shell-out.
+struct Slot {
+	entry: AsyncMutex<Option<Entry>>,
 }
 
-/// Read-through helper: returns the cached `ContainerStatus`
-/// when the entry is younger than [`STATUS_TTL`], otherwise calls
-/// `fetch`, stores any `Ok(…)` result, and returns it. Errors
-/// pass through uncached so the next caller retries immediately.
+impl Slot {
+	fn new() -> Self {
+		Self {
+			entry: AsyncMutex::new(None),
+		}
+	}
+}
+
+static CACHE: Mutex<Option<HashMap<CacheKey, Arc<Slot>>>> = Mutex::new(None);
+
+/// Look up or insert the per-key slot. Synchronous — the
+/// `std::sync::Mutex` is only ever held long enough to clone an
+/// `Arc`, so no async work runs while we hold it.
+fn slot_for(key: &CacheKey) -> Arc<Slot> {
+	let mut guard = CACHE.lock().expect("status cache mutex poisoned");
+	let map = guard.get_or_insert_with(HashMap::new);
+	map.entry(key.clone()).or_insert_with(|| Arc::new(Slot::new())).clone()
+}
+
+/// Read-through helper with single-flight semantics: at most one
+/// concurrent `fetch()` per `(project, compose_path)` key. The
+/// leader caches its `Ok(…)` result under the slot mutex; any
+/// followers that were queued behind it pick up that cached
+/// result on acquire and return without re-fetching. Errors
+/// propagate to the leader's caller without being stored, so the
+/// next caller (after the leader releases) tries again.
 pub(crate) async fn get_or_fetch<F, Fut, E>(
 	project: &ProjectName,
 	compose_path: &Utf8Path,
@@ -104,41 +143,63 @@ where
 	Fut: std::future::Future<Output = Result<ContainerStatus, E>>,
 {
 	let key = CacheKey::new(project, compose_path);
-	if let Some(hit) = with_cache(|map| {
-		map.get(&key).and_then(|entry| {
+	let slot = slot_for(&key);
+
+	// Fast path: a recent fresh entry is visible without
+	// blocking on anyone else. `try_lock` keeps the steady-state
+	// hit cheap even under contention — if a leader is mid-fetch
+	// we fall through to `lock().await` below and join the
+	// queue.
+	if let Ok(guard) = slot.entry.try_lock() {
+		if let Some(entry) = guard.as_ref() {
 			if now.duration_since(entry.at) < STATUS_TTL {
-				Some(entry.status.clone())
-			} else {
-				None
+				return Ok(entry.status.clone());
 			}
-		})
-	}) {
-		return Ok(hit);
+		}
+	}
+
+	// Slow path: serialise behind the slot mutex. Either we're
+	// the first miss in this burst (we'll do the fetch), or
+	// someone else is already fetching (we'll await them and
+	// inherit their result).
+	let mut guard = slot.entry.lock().await;
+
+	// Re-check freshness now that we hold the lock: if the
+	// leader populated while we waited, take the cached entry
+	// and return without fetching.
+	if let Some(entry) = guard.as_ref() {
+		if now.duration_since(entry.at) < STATUS_TTL {
+			return Ok(entry.status.clone());
+		}
 	}
 
 	let status = fetch().await?;
-	with_cache(|map| {
-		map.insert(
-			key,
-			Entry {
-				at: now,
-				status: status.clone(),
-			},
-		);
+	*guard = Some(Entry {
+		at: now,
+		status: status.clone(),
 	});
 	Ok(status)
 }
 
 /// Drop the cached reading for a compose lifecycle so the next
 /// `status()` re-probes. Mutating commands call this after they
-/// succeed (and after a failure that may have left the daemon
-/// in an indeterminate state) — every observable state change
-/// the IDE initiates flushes the cache.
-pub(crate) fn invalidate(project: &ProjectName, compose_path: &Utf8Path) {
+/// succeed — every observable state change the IDE initiates
+/// flushes the cache. The slot itself is preserved so any
+/// follower that's currently queued behind a leader still
+/// benefits from single-flight; only the cached `Entry` is
+/// cleared.
+///
+/// Async because the per-slot mutex is a `tokio::sync::Mutex`
+/// (we hold it across the `ps` shell-out). In the worst case (a
+/// leader is mid-fetch when the invalidator arrives) the call
+/// waits ~150 ms for the leader to finish, then clears its
+/// freshly-fetched value — exactly what we want, since that
+/// value would be the pre-mutation reading.
+pub(crate) async fn invalidate(project: &ProjectName, compose_path: &Utf8Path) {
 	let key = CacheKey::new(project, compose_path);
-	with_cache(|map| {
-		map.remove(&key);
-	});
+	let slot = slot_for(&key);
+	let mut entry = slot.entry.lock().await;
+	*entry = None;
 }
 
 #[cfg(test)]
@@ -147,6 +208,7 @@ mod tests {
 	use std::sync::Arc;
 
 	use moon_protocol::container::ContainerState;
+	use tokio::sync::Barrier;
 
 	use super::*;
 
@@ -246,7 +308,7 @@ mod tests {
 		.await
 		.unwrap();
 
-		invalidate(&project, &compose);
+		invalidate(&project, &compose).await;
 
 		let c = calls.clone();
 		let after = get_or_fetch::<_, _, ()>(&project, &compose, now, || async move {
@@ -310,6 +372,84 @@ mod tests {
 		.unwrap();
 		// `project_b` had no prior entry — its fetcher must run
 		// even though `project_a` cached at the same instant.
+		assert_eq!(calls.load(Ordering::SeqCst), 1);
+	}
+
+	/// The actual bug this module exists to fix: when N callers
+	/// race into `get_or_fetch` with an empty slot, exactly one
+	/// of them shells out — the rest serialise behind the
+	/// per-slot async mutex, see the leader's fresh entry on
+	/// acquire, and return it without re-fetching.
+	///
+	/// The fetcher uses a barrier so we don't depend on timing:
+	/// we explicitly hold the leader open until every caller has
+	/// reached `get_or_fetch`. That guarantees every miss path
+	/// has actually started (and queued behind the leader)
+	/// before the leader is allowed to complete.
+	/// The actual bug this module exists to fix: when N callers
+	/// race into `get_or_fetch` with an empty slot, exactly one
+	/// of them shells out — the rest serialise behind the
+	/// per-slot async mutex, see the leader's fresh entry on
+	/// acquire, and return it without re-fetching.
+	///
+	/// We use a 2-party barrier between the leader's fetcher and
+	/// the test driver so we don't depend on timing: the leader
+	/// suspends inside its fetcher until the test side has had
+	/// enough scheduler turns to queue every follower behind the
+	/// slot mutex. Only then does the test trip the barrier, the
+	/// leader completes, and the followers wake to find the
+	/// cached entry.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn concurrent_callers_coalesce_to_one_fetch() {
+		let (project, compose) = make_key("concurrent-coalesce");
+		let calls = Arc::new(AtomicUsize::new(0));
+		let now = Instant::now();
+		const CONCURRENCY: usize = 20;
+		// Only the leader invokes the fetcher (it's `FnOnce`),
+		// so only one waiter sits on the barrier from inside —
+		// the other party is the test driver itself.
+		let barrier = Arc::new(Barrier::new(2));
+
+		let mut tasks = Vec::with_capacity(CONCURRENCY);
+		for _ in 0..CONCURRENCY {
+			let project = project.clone();
+			let compose = compose.clone();
+			let calls = calls.clone();
+			let barrier = barrier.clone();
+			tasks.push(tokio::spawn(async move {
+				get_or_fetch::<_, _, ()>(&project, &compose, now, || async move {
+					calls.fetch_add(1, Ordering::SeqCst);
+					barrier.wait().await;
+					Ok(running())
+				})
+				.await
+				.unwrap()
+			}));
+		}
+
+		// Give every spawned task enough turns to reach the
+		// async-mutex acquire and queue behind the leader.
+		// `yield_now` is one scheduler turn; loop until we
+		// observe the calls counter tick (the leader has
+		// started its fetcher, so every other caller has
+		// already taken its slot lock path).
+		while calls.load(Ordering::SeqCst) == 0 {
+			tokio::task::yield_now().await;
+		}
+		// Extra turns: even after the leader is in-flight, the
+		// followers might not have reached `lock().await` yet.
+		// A handful of yields covers the scheduler's batching.
+		for _ in 0..8 {
+			tokio::task::yield_now().await;
+		}
+
+		barrier.wait().await;
+
+		for t in tasks {
+			let s = t.await.unwrap();
+			assert_eq!(s.state, ContainerState::Running);
+		}
+		// The whole point: exactly one shell-out, not 20.
 		assert_eq!(calls.load(Ordering::SeqCst), 1);
 	}
 }

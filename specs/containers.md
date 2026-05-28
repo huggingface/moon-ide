@@ -183,13 +183,18 @@ After binding moon-landing into a moon-ide workspace:
   whose popover is open so the in-flight `up -d --wait` view
   doesn't freeze on the pre-mutation snapshot.
 - Both `Workspace::status()` and `ProjectCompose::status()` are
-  TTL-cached process-wide (1 s; see
+  TTL-cached (1 s) **and** single-flight per `(project,
+compose-file)` key — concurrent miss callers serialise behind
+  one shell-out instead of each spawning their own
+  `docker compose ps`. It matters because the LSP layer's
+  fanout is concurrent (Tauri commands run in parallel), so a
+  pure TTL cache without single-flight wouldn't catch the
+  per-keystroke burst. See
   [ADR 0020](decisions/0020-container-status-cache.md) and
-  `crates/moon-container/src/status_cache.rs`). The pollers above
+  `crates/moon-container/src/status_cache.rs`. The pollers above
   drive the cache, and any other caller in the same second
-  reuses the same reading instead of re-shelling out to
-  `docker compose ps`. Mutating commands (`setup` / `pause` /
-  `up` / `down` / …) invalidate the slot on success so a
+  reuses the same reading. Mutating commands (`setup` / `pause`
+  / `up` / `down` / …) invalidate the slot on success so a
   follow-up `status()` returns the post-mutation truth.
 - The user's app continues to run wherever it ran before —
   on the host (reaching services through published host
