@@ -72,10 +72,20 @@ FIFO so a long-running commit can't starve a status poll
 forever, and a flurry of status polls can't starve a
 commit either.
 
-`collect_paths` also takes the lock because its
-`collapsed_ignored_dirs` seed step shells out to
-`git status`. `collect_paths_under` does not — it's a pure
-fs walk on a known-gitignored subtree.
+`collect_paths` also takes the lock, but **only across its
+`collapsed_ignored_dirs` seed step** — the `git status` shell-out
+that learns which ignored directories to collapse. The guard is
+dropped before the `read_dir` walk runs, so the walk (the slow
+part for big trees) does not block other git operations. Holding
+the lock across the walk used to freeze the whole IDE during a
+merge conflict against a divergent base: `git status` against the
+unmerged index can take 30 s+, and with the walk inside the same
+critical section every blame, status pill, autoStage, and branch
+query queued behind it. Narrowing the scope keeps the seed
+serialised (which is what git's index lock actually requires)
+without serialising the unrelated fs walk. `collect_paths_under`
+does not take the lock at all — it's a pure fs walk on a
+known-gitignored subtree.
 
 ### 2. Commit safety snapshot
 

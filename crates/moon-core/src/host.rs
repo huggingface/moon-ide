@@ -1328,16 +1328,28 @@ impl WorkspaceHost for LocalHost {
 		// it (which today does nothing more than reveal the
 		// collapsed badge — lazy descendant fetch is a follow-up).
 		// Non-repo folders return an empty skip set and the walk
-		// behaves exactly as before. The `collapsed_ignored_dirs`
-		// probe spawns `git status`, so we hold the per-folder git
-		// mutex for the seed step (and only the seed step — the
-		// walk itself is pure fs I/O and doesn't compete for git's
-		// index.lock).
+		// behaves exactly as before.
+		//
+		// Lock scope: the per-folder git mutex is held **only**
+		// across `collapsed_ignored_dirs` — the `git status`
+		// shell-out that competes with the index. The fs walk is
+		// pure `read_dir` and is explicitly run with the guard
+		// dropped so concurrent git operations (blame, branch
+		// list, autoStage on save, status refreshes …) aren't
+		// serialised behind a slow seed. This matters during a
+		// merge conflict against a divergent base, where
+		// `git status` against the unmerged index can take tens
+		// of seconds — see [ADR 0015](crate::specs#0015).
 		let guard = self.git_lock().await;
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
-			let _guard = guard;
-			let skip = collapsed_ignored_dirs(&root);
+			let skip = {
+				let _guard = guard;
+				collapsed_ignored_dirs(&root)
+			};
+			// Guard dropped here. The walk below runs without
+			// the git mutex held; nothing in `walk_paths` touches
+			// git.
 			let mut paths = Vec::new();
 			let mut depth_capped = Vec::new();
 			walk_paths(&root, "", &mut paths, &mut depth_capped, 0, max_depth, &skip);
