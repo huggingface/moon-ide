@@ -98,10 +98,24 @@ Prerequisites: `bun install`, host deps installed per `README.md`,
     `[escape](../../../etc/passwd)` and click it. Expected: nothing
     happens — the lexical resolver rejects the link before any IPC
     call. Even if it didn't, the host would refuse on resolve.
-14. **In-page anchors.** Click an in-page `[link](#anchor)` (or
-    use any of the auto-generated heading anchors once we ship
-    them). Expected: the article scrolls to the target without
-    leaving the tab.
+14. **In-page anchors.** Click an in-page `[link](#anchor)`.
+    Expected: the article smooth-scrolls to the target without
+    leaving the tab. Three flavours of target work:
+    - **Heading slugs.** Every heading gets an auto-generated GitHub-
+      style id, so `[jump](#known-limitations)` lands on the
+      `## Known limitations` section above. Duplicate headings get
+      `-1`, `-2`, … suffixes (first occurrence unsuffixed).
+    - **Explicit inline anchors.** A bare `<a name="sync-repos"></a>`
+      or `<a id="sync-repos"></a>` in the markdown source emits a
+      real anchor element. Anything else (other attributes, inner
+      content, single quotes) escapes to literal text — the narrow
+      whitelist keeps the raw-HTML surface minimal while supporting
+      the common "jump here" idiom.
+    - **`location.hash` does not update.** We resolve the anchor
+      ourselves rather than letting the browser do it, so navigation
+      listeners don't see junk fragments. Failed lookups (stale
+      link to a renamed heading) fall back to the browser's default
+      scroll so the user can see what they tried to hit.
 15. **Custom-scheme links.** A link with an unknown scheme
     (`steam://run/123`, `vscode://…`) does nothing.
 
@@ -129,11 +143,13 @@ Prerequisites: `bun install`, host deps installed per `README.md`,
   markdown file inside the workspace renders a broken image — we'd
   need to rewrite the URL to `convertFileSrc(absolutePath)`. Lands
   with the broader "linked assets" follow-up.
-- **Anchor-scroll inside a freshly-opened file is a follow-up.**
-  Clicking `[other](./other.md#section)` opens `other.md` and
-  drops the fragment; the renderer doesn't emit heading anchors
-  yet either, so there's nothing to scroll to inside the same
-  document beyond what the markdown source provides explicitly.
+- **Cross-file anchor-scroll is a follow-up.** Clicking
+  `[other](./other.md#section)` opens `other.md` but drops the
+  fragment — the file opens at the top, not at `#section`.
+  Same-document fragments and inline `<a name>` / `<a id>`
+  anchors work (see step 14); cross-file would need the open-file
+  IPC to carry the fragment through and the receiving view to
+  scroll on first render.
 - **`file://` and custom-scheme links** are still swallowed —
   same posture as before.
 - **Per-pane preview mode is not supported.** Same buffer in two

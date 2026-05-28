@@ -52,7 +52,121 @@ function buildMarkdownIt(linkify: boolean): MarkdownIt {
 	});
 	applyLinkRules(md);
 	applyFenceCopyRule(md);
+	applyHeadingAnchorRule(md);
+	applyInlineAnchorRule(md);
 	return md;
+}
+
+/**
+ * GitHub-style slug for a heading text. Lower-cases, strips
+ * anything that isn't an ASCII word character, dash, or space,
+ * then collapses runs of whitespace / dashes into single dashes.
+ *
+ * Exported for tests and for the inline `<a name=…>` rule which
+ * normalises the captured anchor name the same way headings do —
+ * so authors can refer to either with the same `#fragment` syntax
+ * without having to remember which side normalised what.
+ *
+ * Non-ASCII letters (CJK, accented latin, emoji) are deliberately
+ * stripped rather than transliterated. Authors who want a
+ * predictable anchor on a non-ASCII heading should add an explicit
+ * `<a name="…"></a>` next to it.
+ */
+export function slugifyHeading(text: string): string {
+	return text
+		.toLowerCase()
+		.replace(/[^\w\- ]+/g, '')
+		.trim()
+		.replace(/[\s-]+/g, '-');
+}
+
+/**
+ * Emit `id="…"` on every heading so `[link](#section-title)` and
+ * the browser's native fragment scroll just work. Slugs are
+ * de-duplicated within a single document by suffixing `-1`, `-2`,
+ * … on collisions (GitHub's behaviour). The first occurrence is
+ * unsuffixed so existing inbound links keep resolving even after
+ * a second heading with the same text appears.
+ */
+function applyHeadingAnchorRule(parser: MarkdownIt): void {
+	parser.core.ruler.push('heading_anchors', (state) => {
+		const seen = new Map<string, number>();
+		for (let i = 0; i < state.tokens.length; i++) {
+			const token = state.tokens[i];
+			if (!token || token.type !== 'heading_open') {
+				continue;
+			}
+			const inline = state.tokens[i + 1];
+			if (!inline || inline.type !== 'inline') {
+				continue;
+			}
+			const base = slugifyHeading(inline.content);
+			if (base === '') {
+				continue;
+			}
+			const count = seen.get(base) ?? 0;
+			seen.set(base, count + 1);
+			const slug = count === 0 ? base : `${base}-${count}`;
+			if (token.attrIndex('id') < 0) {
+				token.attrPush(['id', slug]);
+			}
+		}
+		return false;
+	});
+}
+
+/**
+ * Recognise inline `<a name="…"></a>` and `<a id="…"></a>` tags
+ * in the markdown source and emit them as real anchor elements.
+ *
+ * We otherwise run with `html: false` so arbitrary raw HTML in the
+ * source escapes to literal text — that's the first XSS layer. The
+ * narrow exception for empty named anchors is safe because the
+ * inline rule extracts only the name itself, slugifies it the same
+ * way headings do, and re-emits a clean `<a id="…"></a>` token. No
+ * other attributes survive, the tag must be empty (no inner HTML),
+ * and DOMPurify still scrubs the result. The author's intent —
+ * "place a link target here" — is preserved without widening the
+ * raw-HTML surface to anything else.
+ */
+function applyInlineAnchorRule(parser: MarkdownIt): void {
+	parser.inline.ruler.before('html_inline', 'named_anchor', (state, silent) => {
+		const src = state.src;
+		const start = state.pos;
+		if (src.charCodeAt(start) !== 0x3c /* < */) {
+			return false;
+		}
+		// Sticky regex anchored at the cursor — `y` flag means
+		// `lastIndex` controls where matching starts and the regex
+		// fails fast if the pattern doesn't fit at exactly that
+		// offset. No backtracking through the rest of the string.
+		ANCHOR_RE.lastIndex = start;
+		const match = ANCHOR_RE.exec(src);
+		if (!match) {
+			return false;
+		}
+		const name = match[1] ?? '';
+		if (name === '') {
+			return false;
+		}
+		if (!silent) {
+			const slug = slugifyHeading(name) || name;
+			const token = state.push('html_inline', '', 0);
+			token.content = `<a id="${escapeHtmlAttr(slug)}"></a>`;
+		}
+		state.pos = start + match[0].length;
+		return true;
+	});
+}
+
+// Sticky (`y`) so we only match starting exactly at `lastIndex`.
+// Whitespace is generous inside the tag; the outer shape is fixed:
+// opening tag with a `name` or `id` attribute, immediately closed
+// (`</a>` or self-closing). No other attributes.
+const ANCHOR_RE = /<a\s+(?:name|id)\s*=\s*"([^"<>]*)"\s*(?:\/\s*>|>\s*<\/a\s*>)/iy;
+
+function escapeHtmlAttr(value: string): string {
+	return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 // Wrap every fenced code block so a hover-revealed "Copy" button
@@ -260,6 +374,13 @@ async function copyTextWithFeedback(
 export const EXTERNAL_MARKDOWN_SCHEMES = new Set(['http:', 'https:', 'mailto:', 'tel:']);
 
 /**
+ * Test-only access to internals. Tests construct their own
+ * `MarkdownIt` to skip the highlighter (grammar imports break in
+ * the vitest environment) and apply just the rules under test.
+ */
+export const __test = { applyHeadingAnchorRule, applyInlineAnchorRule };
+
+/**
  * If `href` parses as an absolute URL with an allow-listed scheme,
  * open it via the Tauri opener plugin and return `true`. Returns
  * `false` for in-page fragments (`#foo`), relative paths, and
@@ -302,9 +423,11 @@ export function openExternalMarkdownLink(href: string): boolean {
  *     IDE because the host already pins paths under the workspace
  *     root anyway.
  *   - `?query` and `#fragment` are stripped before resolution; the
- *     fragment is dropped on the floor for now (anchor-scroll inside
- *     a freshly-opened file is a follow-up — the renderer doesn't
- *     emit heading anchors yet either).
+ *     fragment is dropped on the floor for now (cross-file anchor
+ *     scroll is a follow-up). Same-document fragments — including
+ *     auto-generated heading slugs and inline `<a name="…">` /
+ *     `<a id="…">` anchors — work directly via the browser's
+ *     fragment scroll, no IPC needed.
  *   - The host re-validates path boundaries on the first IPC call, so
  *     this function is only the first line of defence.
  */

@@ -263,6 +263,21 @@
 			return;
 		}
 		if (href.startsWith('#')) {
+			// Resolve in-page anchors against this article rather
+			// than letting the browser do it: native fragment scroll
+			// also updates `location.hash`, which under Tauri can
+			// fire navigation listeners and ends up as junk in the
+			// session-restore URL. `scrollIntoView` with `smooth`
+			// gives a nicer ride too. Falls back to the browser's
+			// default scroll if we can't find the target (e.g. a
+			// stale link to a since-renamed heading) — that lets
+			// the user see in the URL what they tried to hit.
+			const id = decodeURIComponent(href.slice(1));
+			const dest = id ? articleEl?.querySelector(`[id="${CSS.escape(id)}"]`) : null;
+			if (dest) {
+				event.preventDefault();
+				dest.scrollIntoView({ behavior: 'smooth', block: 'start' });
+			}
 			return;
 		}
 		event.preventDefault();
