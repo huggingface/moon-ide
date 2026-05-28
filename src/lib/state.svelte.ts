@@ -1651,7 +1651,7 @@ class WorkspaceState {
 		// because the array reference may have been replaced by
 		// `openHostFile`'s reactive write.
 		this.openFiles = this.openFiles.map((f) => (f.path === req.host_path ? { ...f, pendingEdit: req.id } : f));
-		this.flash('Editing commit message — Ctrl+S to finish, close tab to cancel.');
+		this.flash('Editing commit message — close the tab when done (right-click for Cancel).');
 	}
 
 	/**
@@ -1705,18 +1705,30 @@ class WorkspaceState {
 	}
 
 	/**
-	 * Cancel a forwarded edit. Sent automatically when the user
-	 * closes the tab without finishing (`closeFile`), so a
-	 * `git commit` they decide against on second thought just
-	 * aborts cleanly instead of leaving the shim hung.
+	 * Cancel a forwarded edit by path: send `CANCEL\n` on the
+	 * parked socket so `git` aborts, then close the tab. The
+	 * default close-tab path finishes the edit (matches the
+	 * "I'm done" muscle memory from every other editor); cancel
+	 * is the explicit right-click affordance for the "actually,
+	 * abort the commit" case.
 	 */
-	async cancelPendingEdit(id: string): Promise<void> {
+	async cancelPendingEditForPath(path: string): Promise<void> {
+		const file = this.openFiles.find((f) => f.path === path);
+		if (!file || file.pendingEdit === null) {
+			return;
+		}
+		const id = file.pendingEdit;
+		// Clear `pendingEdit` first so the follow-up `closeFile`
+		// doesn't recurse back through the "close = finish" hook
+		// at the top of closeFile.
+		this.openFiles = this.openFiles.map((f) => (f.path === path ? { ...f, pendingEdit: null } : f));
 		try {
 			await ipc.editorForward.cancel(id);
 		} catch {
-			// Same posture as `finish` — nothing actionable here
-			// since the user is on the way out of the tab.
+			// Best-effort — the shim will time out and `git` will
+			// abort either way.
 		}
+		void this.closeFile(path);
 	}
 
 	private wireGitAutoFetch() {
@@ -4642,6 +4654,17 @@ class WorkspaceState {
 		if (!file) {
 			return;
 		}
+		// Closing a tab parked on a forwarded `$GIT_EDITOR` request
+		// finishes the edit by default — same contract as closing
+		// a saved file in any other editor: "I'm done." Cancel
+		// requires an explicit affordance (right-click → Cancel
+		// edit). `finishPendingEdit` clears `pendingEdit` and
+		// re-invokes `closeFile`, which falls through to the
+		// regular close path below. See ADR 0021.
+		if (file.pendingEdit !== null) {
+			await this.finishPendingEdit(path);
+			return;
+		}
 		const otherSide: SplitSide = side === 'left' ? 'right' : 'left';
 		const otherHasIt = this.tabsFor(otherSide).includes(path);
 
@@ -4691,13 +4714,6 @@ class WorkspaceState {
 			// never saw.
 			const closing = this.openFiles.find((f) => f.path === path);
 			const wasExternal = closing?.isExternal === true;
-			// Cancel any parked `$GIT_EDITOR` request so the
-			// in-container shim exits non-zero and `git` aborts
-			// cleanly. Fire-and-forget — we're closing the tab
-			// regardless of the resolve result.
-			if (closing?.pendingEdit) {
-				void this.cancelPendingEdit(closing.pendingEdit);
-			}
 			this.openFiles = this.openFiles.filter((f) => f.path !== path);
 			if (this.previewModes.has(path)) {
 				const next = new Map(this.previewModes);

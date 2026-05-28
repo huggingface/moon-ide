@@ -333,6 +333,19 @@
 
 	function buildTabMenuItems(file: OpenFile): ContextMenuItem[] {
 		const items: ContextMenuItem[] = [];
+		// Forwarded `$GIT_EDITOR` request: closing the tab the
+		// normal way finishes the edit. Surface an explicit
+		// Cancel here so the user can abort the in-container
+		// `git commit` (or whatever) instead. See ADR 0021.
+		if (file.pendingEdit !== null) {
+			items.push({
+				id: 'cancel-pending-edit',
+				label: 'Cancel edit (abort git)',
+				onSelect: () => {
+					void workspace.cancelPendingEditForPath(file.path);
+				},
+			});
+		}
 		const absolute = absolutePathFor(file);
 		const copyPathItem: ContextMenuItem = {
 			id: 'copy-path',
