@@ -164,6 +164,15 @@
 				return false;
 			}
 			if (event.code === 'KeyV') {
+				// Returning `false` stops xterm from handling the
+				// keydown, but the browser still dispatches a
+				// follow-up `paste` event on xterm's hidden
+				// textarea, which xterm forwards through `onData`.
+				// Without `preventDefault()` here the clipboard
+				// contents land in the PTY twice — once from our
+				// manual `writeInput` below, once from xterm's
+				// own paste handler.
+				event.preventDefault();
 				void navigator.clipboard
 					.readText()
 					.then((text) => {
