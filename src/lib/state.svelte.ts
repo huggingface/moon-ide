@@ -4486,7 +4486,21 @@ class WorkspaceState {
 	 * `fs:changed` event for files that *we* just wrote).
 	 */
 	private async reloadOpenFileFromDisk(path: string) {
-		const next = await this.loadTextFile(path);
+		let next: OpenFile | null;
+		try {
+			next = await this.loadTextFile(path);
+		} catch (err) {
+			// `loadTextFile` throws when both the working-tree read and
+			// the HEAD fallback fail (file vanished + not tracked, IPC
+			// blew up, …). Every caller does `void reloadOpenFileFromDisk(…)`
+			// without a `.catch`, so without this swallow each failed
+			// reload bubbles up as an unhandled promise rejection — which
+			// is bad enough on its own (devtools toast spam) and, more
+			// importantly, leaves consumers of `frontendLog('editor.swap')`
+			// guessing why the editor body apparently froze.
+			frontendLog('editor.swap', 'warn', `reloadOpenFileFromDisk(${path}) failed: ${String(err)}`);
+			return;
+		}
 		if (!next) {
 			return;
 		}
@@ -4494,6 +4508,7 @@ class WorkspaceState {
 		if (current && current.kind === 'text' && next.kind === 'text' && current.text === next.text) {
 			return;
 		}
+		frontendLog('editor.swap', 'debug', `reloadOpenFileFromDisk(${path}) replaced OpenFile`);
 		this.openFiles = this.openFiles.map((f) => (f.path === path ? next : f));
 	}
 
