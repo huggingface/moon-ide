@@ -121,8 +121,10 @@
 	let currentHead: string | null = null;
 
 	onMount(() => {
+		frontendLog('editor.swap', 'debug', `DiffView(${side}) mount path=${file.path}`);
 		void buildMerge();
 		return () => {
+			frontendLog('editor.swap', 'debug', `DiffView(${side}) unmount path=${file.path}`);
 			// Bump the build token so any in-flight `buildMerge`
 			// resolves into a no-op instead of attaching to a
 			// destroyed host node.
@@ -165,6 +167,7 @@
 	async function buildMerge() {
 		const token = ++buildToken;
 		const path = file.path;
+		frontendLog('editor.swap', 'debug', `DiffView(${side}) buildMerge start path=${path} token=${token}`);
 		// Editorconfig + language load are async (the latter dynamic-
 		// imports the grammar). Resolve both before constructing CM
 		// state so we don't paint with the wrong settings for a frame.
@@ -197,12 +200,14 @@
 					? await ipc.fs.gitRefContent(mergeBase, path)
 					: await ipc.fs.gitHeadContent(path);
 			if (token !== buildToken) {
+				frontendLog('editor.swap', 'debug', `DiffView(${side}) buildMerge stale after HEAD fetch path=${path}`);
 				return;
 			}
 			head = fetched ?? '';
 		}
 
 		if (token !== buildToken) {
+			frontendLog('editor.swap', 'debug', `DiffView(${side}) buildMerge stale before MergeView path=${path}`);
 			return;
 		}
 
@@ -479,6 +484,12 @@
 		detachStickyHbarB?.();
 		detachStickyHbarB = null;
 
+		frontendLog(
+			'editor.swap',
+			'debug',
+			`DiffView(${side}) MergeView attach path=${path} token=${token} ` +
+				`headBytes=${head.length} rightBytes=${rightText.length}`,
+		);
 		merge = new MergeView({
 			a: { doc: head, extensions: sharedLeft },
 			b: { doc: rightText, extensions: rightExtensions },

@@ -106,6 +106,7 @@
 	}
 
 	onMount(() => {
+		frontendLog('editor.swap', 'debug', `Editor(${side}) mount path=${file.path}`);
 		void workspace.ensureEditorConfig(file.path);
 		const folder = workspace.activeFolderPath;
 		// Pick up a snapshot left by a previous mount of this buffer
@@ -137,6 +138,7 @@
 		}
 		void applyLanguage(file.path, file.text);
 		return () => {
+			frontendLog('editor.swap', 'debug', `Editor(${side}) unmount path=${currentPath ?? '∅'}`);
 			// Clear any selection snapshot tied to this view so a
 			// re-mount (HMR, file-tab close) doesn't leave the
 			// "Add to Coder" hint hovering over a dead path.
@@ -173,6 +175,7 @@
 			return;
 		}
 		if (file.path !== currentPath) {
+			frontendLog('editor.swap', 'debug', `Editor(${side}) in-place swap ${currentPath ?? '∅'} → ${file.path}`);
 			// "Save As" / first save of an untitled buffer rebinds the
 			// path on the same `OpenFile`; preserve selection, scroll,
 			// and undo history. We trust an explicit rename signal

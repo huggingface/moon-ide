@@ -4025,8 +4025,10 @@ class WorkspaceState {
 
 	setDiffMode(path: string, on: boolean) {
 		if (this.diffModes.has(path) === on) {
+			frontendLog('editor.swap', 'debug', `setDiffMode(${path}, ${on}) no-op`);
 			return;
 		}
+		frontendLog('editor.swap', 'debug', `setDiffMode(${path}, ${on})`);
 		const next = new Set(this.diffModes);
 		if (on) {
 			next.add(path);
@@ -4840,8 +4842,17 @@ class WorkspaceState {
 
 	setActive(path: string, side: SplitSide = this.focusedSide, options: { focus?: boolean } = {}) {
 		if (!this.tabsFor(side).includes(path)) {
+			frontendLog('editor.swap', 'debug', `setActive(${side}, ${path}) skipped — path not in tabs`);
 			return;
 		}
+		const prev = side === 'left' ? this.leftActive : this.rightActive;
+		frontendLog(
+			'editor.swap',
+			'debug',
+			`setActive(${side}) ${prev ?? '∅'} → ${path} ` +
+				`diffMode(prev)=${prev !== null && this.diffModes.has(prev)} ` +
+				`diffMode(next)=${this.diffModes.has(path)}`,
+		);
 		if (side === 'left') {
 			this.leftActive = path;
 		} else {

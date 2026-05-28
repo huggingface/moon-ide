@@ -10,6 +10,7 @@
 	import { workspace, type SplitSide } from '../state.svelte';
 	import { isMarkdownPath } from '../util/markdown';
 	import { isReviewPath } from '../util/reviewPath';
+	import { frontendLog } from '../logs.svelte';
 
 	type Props = { side: SplitSide };
 	let { side }: Props = $props();
@@ -102,6 +103,25 @@
 		void showDiff;
 		void showMarkdownPreview;
 		performance.mark(`moon:editorPane.${side}.update`);
+		const branch =
+			activeFile === null
+				? 'welcome'
+				: activeFile.kind === 'image'
+					? 'image'
+					: showReview
+						? 'review'
+						: showDiff
+							? 'diff'
+							: showMarkdownPreview
+								? 'markdown'
+								: 'editor';
+		frontendLog(
+			'editor.swap',
+			'debug',
+			`EditorPane(${side}) activePath=${activePath ?? '∅'} branch=${branch} ` +
+				`activeFile.path=${activeFile?.path ?? '∅'} showDiff=${showDiff} ` +
+				`showReview=${showReview} showMd=${showMarkdownPreview}`,
+		);
 	});
 
 	function focus() {
