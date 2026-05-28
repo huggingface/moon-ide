@@ -25,6 +25,7 @@
 //! activity.
 
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { untrack } from 'svelte';
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
 import { ipc } from './ipc';
@@ -195,42 +196,59 @@ class DiagLogsStore {
 	}
 
 	#applyBatch(batch: LogEntry[]): void {
-		// Group additions by source so each source pays one
-		// SvelteMap set regardless of how many entries from the
-		// burst belong to it.
-		const grouped = new Map<string, LogEntry[]>();
-		for (const entry of batch) {
-			this.#sources.add(entry.source);
-			const list = grouped.get(entry.source);
-			if (list) {
-				list.push(entry);
-			} else {
-				grouped.set(entry.source, [entry]);
+		// `untrack` wraps the SvelteMap/SvelteSet reads + writes
+		// so a caller running inside an `$effect` (e.g. an editor-
+		// swap debug trace) doesn't subscribe to `#bySource[src]`
+		// via our internal `.get(src)` and then re-fire itself
+		// from our subsequent `.set(src, …)`. Other components
+		// subscribed to the same source (the open LogsPanel) still
+		// update — `untrack` only suppresses tracking in the
+		// *current* reactive scope, not the global notification.
+		untrack(() => {
+			// Group additions by source so each source pays one
+			// SvelteMap set regardless of how many entries from
+			// the burst belong to it.
+			const grouped = new Map<string, LogEntry[]>();
+			for (const entry of batch) {
+				this.#sources.add(entry.source);
+				const list = grouped.get(entry.source);
+				if (list) {
+					list.push(entry);
+				} else {
+					grouped.set(entry.source, [entry]);
+				}
 			}
-		}
-		for (const [source, additions] of grouped) {
-			const current = this.#bySource.get(source) ?? EMPTY;
-			const next = mergeEntries(current, additions);
-			if (next === null) {
-				continue;
+			for (const [source, additions] of grouped) {
+				const current = this.#bySource.get(source) ?? EMPTY;
+				const next = mergeEntries(current, additions);
+				if (next === null) {
+					continue;
+				}
+				this.#bySource.set(source, next);
 			}
-			this.#bySource.set(source, next);
-		}
+		});
 	}
 
 	/** Append a single entry directly into [`#bySource`]. Used by
 	 * snapshot backfill (`loadSnapshot`) and frontend-emitted
 	 * entries (`injectLocalEntry`) where one-allocation-per-call
 	 * is fine and the caller wants the result visible without
-	 * waiting for the live-pump flush tick. */
+	 * waiting for the live-pump flush tick.
+	 *
+	 * See [`#applyBatch`] for why this is `untrack`ed — same
+	 * reasoning: `frontendLog` shows up in `$effect` bodies as a
+	 * debug-trace primitive and must not feed its own dependency
+	 * graph. */
 	#append(entry: LogEntry): void {
-		this.#sources.add(entry.source);
-		const current = this.#bySource.get(entry.source) ?? EMPTY;
-		const next = mergeEntries(current, [entry]);
-		if (next === null) {
-			return;
-		}
-		this.#bySource.set(entry.source, next);
+		untrack(() => {
+			this.#sources.add(entry.source);
+			const current = this.#bySource.get(entry.source) ?? EMPTY;
+			const next = mergeEntries(current, [entry]);
+			if (next === null) {
+				return;
+			}
+			this.#bySource.set(entry.source, next);
+		});
 	}
 }
 
