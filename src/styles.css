@@ -795,3 +795,20 @@ button:focus-visible {
 	outline-offset: 1px;
 	border-radius: 2px;
 }
+
+/* Markdown viewer find-in-document highlights.
+ *
+ * `MarkdownView.svelte` registers Ranges with the CSS Custom Highlight
+ * API under these names; the pseudo-element selectors below paint
+ * them. They live in the global stylesheet (not the component's
+ * scoped block) because `::highlight()` is matched against the
+ * elements that contain the highlighted text — Svelte's scoping
+ * would rewrite the selector and the highlight wouldn't paint. */
+::highlight(moon-md-find) {
+	background-color: rgba(255, 213, 79, 0.35);
+	color: inherit;
+}
+::highlight(moon-md-find-active) {
+	background-color: rgba(255, 167, 38, 0.7);
+	color: #11151f;
+}

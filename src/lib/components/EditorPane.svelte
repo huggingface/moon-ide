@@ -165,7 +165,7 @@
 			{/key}
 		{:else if activeFile && showMarkdownPreview}
 			{#key activeFile.path}
-				<MarkdownView file={activeFile} />
+				<MarkdownView file={activeFile} {side} />
 			{/key}
 		{:else if activeFile}
 			<Editor file={activeFile} {side} />
