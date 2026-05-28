@@ -273,6 +273,15 @@ pub trait WorkspaceHost: Send + Sync {
 	/// non-git workspaces still render cleanly.
 	async fn git_branch(&self) -> MoonResult<GitBranchInfo>;
 
+	/// Local branch names only (`git for-each-ref refs/heads`),
+	/// newest committer-date first and capped, with no `gh` /
+	/// network round-trip. Cheaper than [`Self::branch_list`] —
+	/// used by the terminal `Ctrl+K` command suggester to give
+	/// the model the set of real branch names so it can match a
+	/// user's abbreviated reference. Empty vec when the folder
+	/// isn't a git repo or `git` can't run.
+	async fn git_local_branches(&self) -> MoonResult<Vec<String>>;
+
 	/// Stage every working-tree change (`git add -A`) and commit
 	/// with `message`. When `amend` is `true`, `git commit --amend`
 	/// replaces the previous commit instead of creating a new one;
@@ -1598,6 +1607,24 @@ impl WorkspaceHost for LocalHost {
 		})
 		.await
 		.map_err(|e| MoonError::Internal(format!("git_branch join error: {e}")))?
+	}
+
+	async fn git_local_branches(&self) -> MoonResult<Vec<String>> {
+		let guard = self.git_lock().await;
+		let root = self.root.clone();
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			let names = run_branch_list_local(&root)
+				.into_iter()
+				.filter_map(|entry| match entry {
+					BranchListEntry::Local { name, .. } => Some(name),
+					BranchListEntry::Pr { .. } => None,
+				})
+				.collect();
+			Ok(names)
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_local_branches join error: {e}")))?
 	}
 
 	async fn git_commit_on_new_branch(&self, branch: &str, message: &str) -> MoonResult<GitCommitResult> {

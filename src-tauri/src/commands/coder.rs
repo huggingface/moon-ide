@@ -169,6 +169,47 @@ pub async fn coder_suggest_commit_message(state: State<'_, AppState>, message: S
 		.map_err(MoonError::from)
 }
 
+/// Translate a natural-language `request` into a single shell
+/// command for a terminal's `Ctrl+K` prompt. `target_kind` is the
+/// terminal's shell (`"host"` / `"container"`) and `cwd` its
+/// working directory — passed from the frontend since the
+/// terminal supervisor, not the workspace, owns that state. We
+/// fold in the active folder's git branch + local branch names so
+/// the model can resolve references like "the feat branch" or
+/// "rebase onto main". The result is prefilled into the PTY line
+/// (not executed); the user reviews it and presses Enter. Errors
+/// surface verbatim through a terminal flash — the user can still
+/// type the command manually.
+#[tauri::command]
+pub async fn coder_suggest_terminal_command(
+	state: State<'_, AppState>,
+	request: String,
+	target_kind: String,
+	cwd: String,
+) -> Result<String, MoonError> {
+	let mut ctx = moon_coder::TerminalCommandContext {
+		shell_kind: target_kind,
+		cwd,
+		..Default::default()
+	};
+	// Git context is best-effort: a non-git folder (or no active
+	// folder at all) just means the model gets less to work with,
+	// not a hard error — a Ctrl+K request might be a plain `ls`.
+	if let Ok(entry) = state.workspaces.require_active_folder().await {
+		if let Ok(branch) = entry.host.git_branch().await {
+			ctx.git_branch = branch.name.unwrap_or_default();
+		}
+		if let Ok(branches) = entry.host.git_local_branches().await {
+			ctx.git_branches = branches.join("\n");
+		}
+	}
+	state
+		.coder
+		.suggest_terminal_command(&request, &ctx)
+		.await
+		.map_err(MoonError::from)
+}
+
 /// Cancel the **active folder's** running turn, if any.
 /// Background turns running in other folders are left alone — the
 /// user has to switch to them and stop manually if they want

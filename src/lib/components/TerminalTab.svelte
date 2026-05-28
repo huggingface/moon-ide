@@ -2,6 +2,7 @@
 	import { Terminal, type ILink, type ILinkProvider, type ITheme } from '@xterm/xterm';
 	import { FitAddon } from '@xterm/addon-fit';
 	import { WebLinksAddon } from '@xterm/addon-web-links';
+	import { tick } from 'svelte';
 	import type { Attachment } from 'svelte/attachments';
 	import { openUrl } from '@tauri-apps/plugin-opener';
 	import '@xterm/xterm/css/xterm.css';
@@ -10,6 +11,8 @@
 	import { terminal as terminalStore } from '../terminal.svelte';
 	import { workspace } from '../state.svelte';
 	import { parseFileLinks, resolveTerminalLink } from '../terminalLinks';
+	import { ipc } from '../ipc';
+	import { formatError } from '../protocol';
 
 	// Body component for a `kind: 'terminal'` bottom-panel tab.
 	// Mounts an xterm.js Terminal wired to the store's IO bus:
@@ -34,6 +37,64 @@
 	const openError = $derived(session?.openError ?? null);
 
 	const encoder = new TextEncoder();
+
+	// Ctrl+K command-suggestion overlay. `promptOpen` toggles the
+	// inline input; `promptText` is the user's natural-language
+	// request; `promptBusy` disables the input while the model
+	// call is in flight; `promptError` shows a one-line failure
+	// under the input (the model was unreachable / returned
+	// nothing) without stealing the user's typed request.
+	let promptOpen = $state(false);
+	let promptText = $state('');
+	let promptBusy = $state(false);
+	let promptError = $state<string | null>(null);
+	// `bind:this` target for the overlay input so opening the
+	// overlay can focus it without a tick of mouse work.
+	let promptInput: HTMLInputElement | null = $state(null);
+
+	async function openCommandPrompt(): Promise<void> {
+		promptError = null;
+		promptOpen = true;
+		// Focus after the overlay paints. The input is rendered
+		// conditionally, so it doesn't exist until the DOM flush
+		// `tick()` awaits.
+		await tick();
+		promptInput?.focus();
+	}
+
+	function closeCommandPrompt(): void {
+		promptOpen = false;
+		promptText = '';
+		promptError = null;
+		promptBusy = false;
+		focusTerminal();
+	}
+
+	async function submitCommandPrompt(): Promise<void> {
+		const request = promptText.trim();
+		if (request.length === 0 || promptBusy) {
+			return;
+		}
+		promptBusy = true;
+		promptError = null;
+		const kind = tab.target.kind;
+		const cwd = tab.target.cwd ?? '';
+		try {
+			const command = await ipc.coder.suggestTerminalCommand(request, kind, cwd);
+			// Prefill: write the command into the PTY line as if
+			// typed. No trailing newline — the user reviews it and
+			// presses Enter. Close the overlay and hand focus back
+			// to xterm so Enter lands on the shell, not the input.
+			promptOpen = false;
+			promptText = '';
+			promptBusy = false;
+			focusTerminal();
+			await terminalStore.writeInput(tab.id, encoder.encode(command));
+		} catch (err) {
+			promptBusy = false;
+			promptError = formatError(err);
+		}
+	}
 
 	// Live handle to the xterm instance for the click-to-focus
 	// outer wrapper. Set by the attachment on mount and cleared
@@ -140,6 +201,13 @@
 		t.attachCustomKeyEventHandler((event) => {
 			if (event.type !== 'keydown' || !event.ctrlKey || event.altKey || event.metaKey) {
 				return true;
+			}
+			// Ctrl+K opens the natural-language command prompt. Swallow
+			// it so the shell never sees `^K` (which would kill to end
+			// of line in emacs-mode readline).
+			if (event.code === 'KeyK' && !event.shiftKey) {
+				void openCommandPrompt();
+				return false;
 			}
 			if (event.code === 'KeyC') {
 				const selected = t.getSelection();
@@ -374,6 +442,55 @@
 	{:else}
 		<div class="term-host" {@attach xtermAttachment}></div>
 	{/if}
+
+	{#if promptOpen}
+		<!-- Click the backdrop to dismiss; stop the click from
+		     bubbling to `.term-wrap`'s focus handler so the input
+		     keeps focus while open. -->
+		<div
+			class="cmd-prompt-backdrop"
+			role="presentation"
+			onclick={(e) => {
+				e.stopPropagation();
+				closeCommandPrompt();
+			}}
+		>
+			<form
+				class="cmd-prompt"
+				role="presentation"
+				onclick={(e) => e.stopPropagation()}
+				onsubmit={(e) => {
+					e.preventDefault();
+					void submitCommandPrompt();
+				}}
+			>
+				<div class="cmd-prompt-label">Describe a command</div>
+				<input
+					bind:this={promptInput}
+					bind:value={promptText}
+					class="cmd-prompt-input"
+					type="text"
+					placeholder="cherry pick last commit from feat-x"
+					disabled={promptBusy}
+					onkeydown={(e) => {
+						if (e.key === 'Escape') {
+							e.preventDefault();
+							closeCommandPrompt();
+						}
+					}}
+				/>
+				<div class="cmd-prompt-hint">
+					{#if promptBusy}
+						Generating…
+					{:else if promptError}
+						<span class="cmd-prompt-error">{promptError}</span>
+					{:else}
+						Enter to fill the prompt · Esc to cancel
+					{/if}
+				</div>
+			</form>
+		</div>
+	{/if}
 </div>
 
 <style>
@@ -399,5 +516,55 @@
 	.term-host :global(.xterm),
 	.term-host :global(.xterm-viewport) {
 		background-color: var(--m-bg) !important;
+	}
+	.cmd-prompt-backdrop {
+		position: absolute;
+		inset: 0;
+		display: flex;
+		align-items: flex-start;
+		justify-content: center;
+		padding-top: 14vh;
+		background: color-mix(in srgb, var(--m-bg) 55%, transparent);
+		z-index: 5;
+	}
+	.cmd-prompt {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		width: min(520px, 90%);
+		padding: 12px 14px;
+		border: 1px solid var(--m-border);
+		border-radius: 8px;
+		background: var(--m-panel, var(--m-bg));
+		box-shadow: 0 8px 28px rgb(0 0 0 / 35%);
+	}
+	.cmd-prompt-label {
+		font-size: 11px;
+		font-weight: 600;
+		letter-spacing: 0.03em;
+		text-transform: uppercase;
+		color: var(--m-fg-muted, var(--m-fg));
+	}
+	.cmd-prompt-input {
+		width: 100%;
+		padding: 7px 9px;
+		border: 1px solid var(--m-border);
+		border-radius: 6px;
+		background: var(--m-bg);
+		color: var(--m-fg);
+		font-family: inherit;
+		font-size: 13px;
+		outline: none;
+	}
+	.cmd-prompt-input:focus {
+		border-color: var(--m-accent, #4f8cff);
+	}
+	.cmd-prompt-hint {
+		font-size: 11px;
+		color: var(--m-fg-muted, var(--m-fg));
+		min-height: 14px;
+	}
+	.cmd-prompt-error {
+		color: var(--m-danger);
 	}
 </style>

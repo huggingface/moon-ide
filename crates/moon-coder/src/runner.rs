@@ -1151,6 +1151,51 @@ impl CoderHandle {
 		Ok(cleaned)
 	}
 
+	/// Translate a natural-language request into a single shell
+	/// command for a terminal's `Ctrl+K` prompt. The result is
+	/// prefilled into the PTY input line (not executed) so the
+	/// user reviews it and presses Enter themselves.
+	///
+	/// `request` is the user's free text ("cherry pick last commit
+	/// from feat-x"). `ctx` carries the terminal's situation —
+	/// host vs container shell, cwd, and the active folder's git
+	/// branch — so the model can disambiguate (e.g. which branch
+	/// "the other one" means) without a tool round-trip. Uses the
+	/// standard model rather than the cheap one: command synthesis
+	/// needs real reasoning about git / shell semantics, and it's
+	/// a one-shot call the user explicitly triggered.
+	///
+	/// Output is run through [`sanitise_terminal_command`] to keep
+	/// it to a single line and strip markdown fences the model
+	/// occasionally wraps a command in. Errors when the model call
+	/// fails or the response sanitises to empty.
+	pub async fn suggest_terminal_command(
+		&self,
+		request: &str,
+		ctx: &TerminalCommandContext,
+	) -> Result<String, CoderError> {
+		let prompt = build_terminal_command_prompt(request, ctx);
+		let messages = vec![
+			ChatMessage::System {
+				content: TERMINAL_COMMAND_SYSTEM_PROMPT.to_string(),
+			},
+			ChatMessage::user(prompt),
+		];
+		let model = self.state.models.read().await.standard().to_owned();
+		let cancel = CancellationToken::new();
+		let response = self
+			.state
+			.inference
+			.chat_completion(&model, &messages, &[], &cancel)
+			.await?;
+		let raw = response.content.unwrap_or_default();
+		let cleaned = sanitise_terminal_command(&raw);
+		if cleaned.is_empty() {
+			return Err(CoderError::Internal("terminal command suggestion was empty".into()));
+		}
+		Ok(cleaned)
+	}
+
 	pub async fn start_device_flow(&self) -> Result<DeviceCode, CoderError> {
 		self.state.auth.start_device_flow().await
 	}
@@ -3401,6 +3446,30 @@ const AUTO_RENAME_SYSTEM_PROMPT: &str = "You are a title generator. Given a shor
 /// One-shot system prompt for branch-name suggestion. Same
 /// minimal-preamble shape as the title generator: we want a
 /// kebab-cased identifier, not a sentence.
+/// Situational context for [`CoderRunner::suggest_terminal_command`].
+/// Gathered by the Tauri command from the terminal's target and
+/// the active folder's git state so the model can resolve "the
+/// other branch" / relative paths without a tool round-trip.
+#[derive(Debug, Default, Clone)]
+pub struct TerminalCommandContext {
+	/// `"host"` or `"container"` — picked up from the terminal's
+	/// `TerminalTarget`. Container shells are Debian (moon-base);
+	/// the host can be anything.
+	pub shell_kind: String,
+	/// Working directory the terminal was opened in. Empty when
+	/// unknown (e.g. a host shell with no cwd override).
+	pub cwd: String,
+	/// Current branch of the active folder, if it's a git repo.
+	/// Empty otherwise. Lets "rebase onto main" vs "merge the
+	/// current branch" land on the right ref.
+	pub git_branch: String,
+	/// Newline-joined list of the folder's local branches (capped
+	/// upstream) so "cherry-pick from feat-x" can match a real
+	/// branch name even when the user abbreviates it. Empty when
+	/// not a git repo.
+	pub git_branches: String,
+}
+
 const BRANCH_NAME_SYSTEM_PROMPT: &str = "You suggest git branch names. Given a draft commit message and/or a `git diff --stat` summary, return ONE short branch name in kebab-case (2 to 5 words, lowercase, hyphen-separated, no slashes, no quotes, no leading prefix like `feature/` or `fix/`). Output the name only, no explanation.";
 
 /// One-shot system prompt for commit-message suggestion. Asks
@@ -3553,6 +3622,82 @@ pub(crate) fn sanitise_branch_name(raw: &str) -> String {
 		clipped.pop();
 	}
 	clipped
+}
+
+/// One-shot system prompt for the terminal `Ctrl+K` command
+/// suggester. The single hard rule is "output exactly one shell
+/// command, nothing else" — the result is prefilled straight into
+/// the PTY line, so any prose, fences, or explanation would land
+/// in the user's command line as garbage. We tell it to favour
+/// the current shell/cwd context and to leave the command unrun
+/// (the user presses Enter), which keeps it from emitting things
+/// like `&& echo done` victory laps.
+const TERMINAL_COMMAND_SYSTEM_PROMPT: &str = "You translate a natural-language request into ONE shell command to be prefilled into a terminal prompt. Output ONLY the command, on a single line, with no explanation, no markdown, no code fences, no leading `$`, and no surrounding quotes. Use the provided shell kind, working directory, and git branch context to resolve ambiguous references (branch names, relative paths). If the request genuinely needs multiple steps, chain them with `&&` on one line. Do not invent flags or files you have no basis for. The user reviews the command and presses Enter, so never append confirmation echoes.";
+
+/// User-side prompt for the terminal-command pass. Ships the
+/// request plus whatever situational context we could gather,
+/// each under an explicit heading so a blank field reads as
+/// "no signal" rather than a missing argument.
+fn build_terminal_command_prompt(request: &str, ctx: &TerminalCommandContext) -> String {
+	let mut out = String::new();
+	out.push_str("Request:\n");
+	out.push_str(request.trim());
+	out.push_str("\n\nShell kind: ");
+	out.push_str(if ctx.shell_kind.is_empty() {
+		"(unknown)"
+	} else {
+		ctx.shell_kind.as_str()
+	});
+	out.push_str("\nWorking directory: ");
+	out.push_str(if ctx.cwd.is_empty() {
+		"(unknown)"
+	} else {
+		ctx.cwd.as_str()
+	});
+	out.push_str("\nCurrent git branch: ");
+	out.push_str(if ctx.git_branch.is_empty() {
+		"(not a git repo)"
+	} else {
+		ctx.git_branch.as_str()
+	});
+	if !ctx.git_branches.trim().is_empty() {
+		out.push_str("\nLocal branches:\n");
+		out.push_str(ctx.git_branches.trim());
+	}
+	out
+}
+
+/// Coerce a model-emitted command into a single clean line safe
+/// to prefill into a PTY. The model usually behaves, but it
+/// occasionally wraps the command in a ```` ```bash ```` fence,
+/// prefixes a `$ ` prompt, or appends an explanation on a second
+/// line — keep the first non-empty, non-fence line, strip a
+/// leading prompt marker, and drop a single layer of surrounding
+/// backticks. We deliberately do NOT strip shell quotes: they're
+/// meaningful inside a command.
+pub(crate) fn sanitise_terminal_command(raw: &str) -> String {
+	let mut command: Option<String> = None;
+	for line in raw.lines() {
+		let trimmed = line.trim();
+		if trimmed.is_empty() || trimmed.starts_with("```") {
+			continue;
+		}
+		command = Some(trimmed.to_string());
+		break;
+	}
+	let Some(mut s) = command else {
+		return String::new();
+	};
+	for prefix in ["$ ", "$", "# ", "> "] {
+		if let Some(rest) = s.strip_prefix(prefix) {
+			s = rest.trim_start().to_string();
+			break;
+		}
+	}
+	if s.len() >= 2 && s.starts_with('`') && s.ends_with('`') {
+		s = s[1..s.len() - 1].trim().to_string();
+	}
+	s.trim().to_string()
 }
 
 /// Cheap projection of `messages` for the rename pass: collapse
@@ -4149,6 +4294,38 @@ mod tests {
 		let long = "word ".repeat(50);
 		let out = sanitise_auto_title(&long);
 		assert!(out.ends_with('…'));
+	}
+
+	#[test]
+	fn sanitise_terminal_command_keeps_single_clean_line() {
+		assert_eq!(
+			sanitise_terminal_command("git cherry-pick feat-x@{1}"),
+			"git cherry-pick feat-x@{1}"
+		);
+		// Strip a leading prompt marker.
+		assert_eq!(sanitise_terminal_command("$ ls -la"), "ls -la");
+		// Strip a single layer of surrounding backticks.
+		assert_eq!(sanitise_terminal_command("`git status`"), "git status");
+		// Shell quotes inside the command are preserved.
+		assert_eq!(
+			sanitise_terminal_command("grep -r \"foo bar\" ."),
+			"grep -r \"foo bar\" ."
+		);
+	}
+
+	#[test]
+	fn sanitise_terminal_command_unwraps_code_fence_and_takes_first_command() {
+		let fenced = "```bash\ngit fetch origin\n```";
+		assert_eq!(sanitise_terminal_command(fenced), "git fetch origin");
+		// Drop a trailing explanation line.
+		let with_prose = "git rebase main\nThis rebases the current branch.";
+		assert_eq!(sanitise_terminal_command(with_prose), "git rebase main");
+	}
+
+	#[test]
+	fn sanitise_terminal_command_empty_when_only_noise() {
+		assert_eq!(sanitise_terminal_command("```\n```"), "");
+		assert_eq!(sanitise_terminal_command("   \n  "), "");
 	}
 
 	#[test]
