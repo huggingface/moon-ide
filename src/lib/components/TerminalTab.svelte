@@ -5,6 +5,7 @@
 	import { tick } from 'svelte';
 	import type { Attachment } from 'svelte/attachments';
 	import { openUrl } from '@tauri-apps/plugin-opener';
+	import { readText as clipboardReadText } from '@tauri-apps/plugin-clipboard-manager';
 	import '@xterm/xterm/css/xterm.css';
 
 	import type { TerminalTab } from '../bottomPanel.svelte';
@@ -37,6 +38,33 @@
 	const openError = $derived(session?.openError ?? null);
 
 	const encoder = new TextEncoder();
+
+	// Read the clipboard and write it into the PTY. We prefer
+	// the Tauri clipboard plugin over `navigator.clipboard`:
+	// the WebView only grants `navigator.clipboard.readText()`
+	// access to content it produced itself, so text copied from
+	// another application comes back empty (and on WebKitGTK the
+	// call rejects outright). The plugin reads the real OS
+	// clipboard. Fall back to `navigator.clipboard` only if the
+	// plugin throws (e.g. running in a plain browser dev build).
+	async function pasteFromClipboard(): Promise<void> {
+		let text = '';
+		try {
+			text = await clipboardReadText();
+		} catch {
+			try {
+				text = await navigator.clipboard.readText();
+			} catch {
+				// Silent failure beats a modal; the user can
+				// retry or fall back to a middle-click paste.
+				return;
+			}
+		}
+		if (text.length === 0) {
+			return;
+		}
+		await terminalStore.writeInput(tab.id, encoder.encode(text));
+	}
 
 	// Ctrl+K command-suggestion overlay. `promptOpen` toggles the
 	// inline input; `promptText` is the user's natural-language
@@ -241,17 +269,7 @@
 				// manual `writeInput` below, once from xterm's
 				// own paste handler.
 				event.preventDefault();
-				void navigator.clipboard
-					.readText()
-					.then((text) => {
-						if (text.length === 0) {
-							return;
-						}
-						void terminalStore.writeInput(tab.id, encoder.encode(text));
-					})
-					.catch(() => {
-						// As above — silent failure beats a modal.
-					});
+				void pasteFromClipboard();
 				return false;
 			}
 			if (event.shiftKey) {
