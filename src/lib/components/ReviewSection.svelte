@@ -698,7 +698,9 @@
 		border-radius: 6px;
 		background: var(--m-bg);
 		overflow: hidden;
-		scroll-margin-top: 12px;
+		/* Keep a scrolled-to section clear of the sticky banner so
+		 * its header isn't hidden behind it on `scrollIntoView`. */
+		scroll-margin-top: var(--m-review-banner-h, 12px);
 	}
 	.hdr {
 		display: flex;
@@ -708,7 +710,10 @@
 		background: var(--m-bg-1);
 		border-bottom: 1px solid var(--m-border);
 		position: sticky;
-		top: 0;
+		/* Park just below the review view's sticky banner instead of
+		 * sliding under it. `--m-review-banner-h` is defined on the
+		 * scrolling `.review-view`; falls back to 0 outside it. */
+		top: var(--m-review-banner-h, 0);
 		z-index: 2;
 	}
 	.review-section.collapsed .hdr {

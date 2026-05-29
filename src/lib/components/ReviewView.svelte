@@ -75,6 +75,22 @@
 		return 'HEAD';
 	});
 
+	// File whose diff section is currently nearest the top of the
+	// scroller. Surfaced in the sticky banner so the reader always
+	// knows which file they're looking at, even when a tall diff
+	// fills the viewport and that section's own header has scrolled
+	// out of reach. Falls back to the first entry before the user
+	// scrolls (seeded by `updateVisibleFile` on mount).
+	const visiblePath: string | null = $derived(workspace.reviewVisibleFile);
+	function fileName(p: string): string {
+		const slash = p.lastIndexOf('/');
+		return slash === -1 ? p : p.slice(slash + 1);
+	}
+	function dirName(p: string): string {
+		const slash = p.lastIndexOf('/');
+		return slash === -1 ? '' : p.slice(0, slash);
+	}
+
 	function registerSection(path: string, el: HTMLElement | null) {
 		if (el === null) {
 			sectionEls.delete(path);
@@ -243,6 +259,13 @@
 		{#if baselineLabel.length > 0}
 			<span class="vs">vs {baselineLabel}</span>
 		{/if}
+		{#if visiblePath}
+			<span class="current" title={visiblePath}>
+				{#if dirName(visiblePath)}<span class="dir">{dirName(visiblePath)}/</span>{/if}<span class="name"
+					>{fileName(visiblePath)}</span
+				>
+			</span>
+		{/if}
 		<span class="counts">{entries.length} file{entries.length === 1 ? '' : 's'}</span>
 	</div>
 	{#if entries.length === 0}
@@ -263,6 +286,11 @@
 
 <style>
 	.review-view {
+		/* Height of the sticky banner strip. Consumed by each
+		 * section's sticky header (`ReviewSection`) so a file's
+		 * header parks just below the banner instead of sliding
+		 * underneath it. */
+		--m-review-banner-h: 35px;
 		flex: 1;
 		min-width: 0;
 		min-height: 0;
@@ -279,9 +307,37 @@
 		display: flex;
 		align-items: baseline;
 		gap: 10px;
-		padding: 2px 4px;
+		/* Pull out into the scroller's padding so the sticky strip
+		 * spans edge-to-edge and fully masks diff content sliding
+		 * underneath it. The compensating padding restores the
+		 * original inset for the banner's own content. */
+		margin: -12px -12px 0;
+		padding: 10px 16px 8px;
 		color: var(--m-fg-muted);
 		font-size: 12px;
+		/* Stick to the top of the scroller so the reader always has
+		 * a "you are here" file label, even when a tall diff fills
+		 * the viewport and the per-section header is out of view. */
+		position: sticky;
+		top: 0;
+		z-index: 3;
+		background: var(--m-bg);
+		border-bottom: 1px solid var(--m-border);
+	}
+	.current {
+		flex: 1;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-family: var(--m-font-mono, monospace);
+	}
+	.current .dir {
+		color: var(--m-fg-muted);
+	}
+	.current .name {
+		color: var(--m-fg);
+		font-weight: 600;
 	}
 	.title {
 		color: var(--m-fg);
