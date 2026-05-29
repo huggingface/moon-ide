@@ -392,24 +392,23 @@
 				},
 			});
 		}
+		// Copy absolute path — available for both files and folders.
+		items.push({
+			id: 'copy-absolute-path',
+			label: 'Copy path',
+			onSelect: () => {
+				const absolute = absolutePathFor(item);
+				if (absolute !== null) {
+					void copyToClipboard(absolute, 'absolute path');
+				}
+			},
+		});
 		// Copy relative path — available for both files and folders.
 		items.push({
 			id: 'copy-relative-path',
 			label: 'Copy relative path',
 			onSelect: () => {
 				void copyToClipboard(item.path, 'relative path');
-			},
-		});
-
-		// Copy absolute path — available for both files and folders.
-		items.push({
-			id: 'copy-absolute-path',
-			label: 'Copy absolute path',
-			onSelect: () => {
-				const absolute = absolutePathFor(item);
-				if (absolute !== null) {
-					void copyToClipboard(absolute, 'absolute path');
-				}
 			},
 		});
 
