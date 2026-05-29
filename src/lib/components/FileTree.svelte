@@ -392,20 +392,76 @@
 				},
 			});
 		}
+		// Copy absolute path — available for both files and folders.
 		items.push({
-			id: 'copy-path',
+			id: 'copy-absolute-path',
 			label: 'Copy path',
 			onSelect: () => {
-				void navigator.clipboard?.writeText(item.path).catch(() => {
-					// Clipboard can reject when the window isn't
-					// focused during the prompt; the close already
-					// fired, so all we can do is drop the action.
-					// Not a user-facing error — any reason this
-					// would fail is a browser-policy boundary.
-				});
+				const absolute = absolutePathFor(item);
+				if (absolute !== null) {
+					void copyToClipboard(absolute, 'absolute path');
+				}
+			},
+		});
+		// Copy relative path — available for both files and folders.
+		items.push({
+			id: 'copy-relative-path',
+			label: 'Copy relative path',
+			onSelect: () => {
+				void copyToClipboard(item.path, 'relative path');
+			},
+		});
+
+		// Delete (move to trash) — available for both files and folders.
+		// Uses the same `workspace.trashPaths` flow as the Delete key.
+		// The confirmation dialog is handled internally by `trashPaths`.
+		items.push({
+			id: 'delete',
+			label: 'Delete',
+			kind: 'danger',
+			onSelect: () => {
+				void workspace.trashPaths([item.path]);
 			},
 		});
 		return items;
+	}
+
+	/**
+	 * Compute the absolute host path for a tree item. For files and
+	 * folders inside the active workspace folder, joins the folder
+	 * root with the item's relative path. Pierre's directory paths
+	 * carry a trailing slash; we preserve that for folder rows.
+	 */
+	function absolutePathFor(item: PierreContextMenuItem): string | null {
+		const root = workspace.activeFolderPath;
+		if (root === null) {
+			return null;
+		}
+		// Strip any trailing slash from the root before joining, then
+		// re-add the trailing slash for directory items.
+		const rootClean = root.replace(/\/+$/, '');
+		const itemPath = item.path;
+		const absolute = `${rootClean}/${itemPath}`;
+		// If the item is a directory (trailing slash), ensure the
+		// absolute path also ends with one.
+		if (item.kind === 'directory' && !absolute.endsWith('/')) {
+			return `${absolute}/`;
+		}
+		return absolute;
+	}
+
+	/**
+	 * Write `text` to the clipboard and flash a toast confirmation.
+	 * Swallows clipboard API rejections (can fail when the window
+	 * isn't focused) with a generic failure toast.
+	 */
+	async function copyToClipboard(text: string, label: string) {
+		try {
+			await navigator.clipboard.writeText(text);
+			workspace.flash(`Copied ${label}`);
+		} catch {
+			workspace.flash(`Could not copy ${label}`);
+		}
 	}
 
 	/**
