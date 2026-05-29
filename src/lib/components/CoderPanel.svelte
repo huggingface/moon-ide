@@ -48,6 +48,43 @@
 	let modelSettingsOpen = $state(false);
 	let hubSettingsOpen = $state(false);
 
+	// Per-session shell-target override popover (Auto / Force host).
+	// Anchored to the bash-target pip in the header.
+	let shellTargetOpen = $state(false);
+	let shellTargetWrap = $state<HTMLDivElement | null>(null);
+
+	async function selectShellTarget(forceHost: boolean): Promise<void> {
+		shellTargetOpen = false;
+		if (forceHost === coder.forceHostOverride) {
+			return;
+		}
+		await coder.setBashTargetOverride(forceHost);
+	}
+
+	// Outside-click / Escape dismiss for the shell-target popover.
+	$effect(() => {
+		if (!shellTargetOpen) {
+			return;
+		}
+		const onPointerDown = (event: PointerEvent) => {
+			if (shellTargetWrap?.contains(event.target as Node)) {
+				return;
+			}
+			shellTargetOpen = false;
+		};
+		const onKey = (event: KeyboardEvent) => {
+			if (event.key === 'Escape') {
+				shellTargetOpen = false;
+			}
+		};
+		window.addEventListener('pointerdown', onPointerDown);
+		window.addEventListener('keydown', onKey);
+		return () => {
+			window.removeEventListener('pointerdown', onPointerDown);
+			window.removeEventListener('keydown', onKey);
+		};
+	});
+
 	onMount(() => {
 		void coder.refreshStatus();
 		void coder.loadHubBinding();
@@ -1053,16 +1090,68 @@
 				<span class="who">{coder.identity.username}</span>
 			{/if}
 			{#if coder.bashTarget}
-				<span
-					class="target"
-					class:container={coder.bashTarget === 'container'}
-					title={coder.bashTarget === 'container'
-						? 'bash and shell tools run inside the workspace container'
-						: 'bash and shell tools run on the host machine'}
-					aria-label={coder.bashTarget === 'container' ? 'shell target: container' : 'shell target: host'}
-				>
-					<TerminalTargetIcon kind={coder.bashTarget} size={12} />
-				</span>
+				<div class="target-wrap" bind:this={shellTargetWrap}>
+					<button
+						type="button"
+						class="target"
+						class:container={coder.bashTarget === 'container'}
+						class:overridden={coder.forceHostOverride}
+						title={coder.forceHostOverride
+							? 'Forced to host mode — bash runs on the host, not the container. Click to change.'
+							: coder.bashTarget === 'container'
+								? 'bash and shell tools run inside the workspace container. Click to change.'
+								: 'bash and shell tools run on the host machine. Click to change.'}
+						aria-label="Shell target: {coder.bashTarget}{coder.forceHostOverride ? ' (forced)' : ''}"
+						aria-haspopup="menu"
+						aria-expanded={shellTargetOpen}
+						onclick={() => (shellTargetOpen = !shellTargetOpen)}
+					>
+						<TerminalTargetIcon kind={coder.bashTarget} size={12} />
+						{#if coder.forceHostOverride}
+							<span class="override-dot" aria-hidden="true"></span>
+						{/if}
+					</button>
+					{#if shellTargetOpen}
+						<div class="target-popover" role="menu" aria-label="Shell target override">
+							<button
+								type="button"
+								class="opt"
+								class:selected={!coder.forceHostOverride}
+								role="menuitemradio"
+								aria-checked={!coder.forceHostOverride}
+								onclick={() => selectShellTarget(false)}
+							>
+								<span class="opt-radio" aria-hidden="true"></span>
+								<span class="opt-text">
+									<span class="opt-title">Auto</span>
+									<span class="opt-sub">
+										Run bash in the workspace container when it's running.
+										{#if !coder.forceHostOverride && coder.bashTarget}
+											<em>Currently: {coder.bashTarget}.</em>
+										{/if}
+									</span>
+								</span>
+							</button>
+							<button
+								type="button"
+								class="opt"
+								class:selected={coder.forceHostOverride}
+								role="menuitemradio"
+								aria-checked={coder.forceHostOverride}
+								onclick={() => selectShellTarget(true)}
+							>
+								<span class="opt-radio" aria-hidden="true"></span>
+								<span class="opt-text">
+									<span class="opt-title">Force host</span>
+									<span class="opt-sub">
+										Run bash on the host machine even while the workspace is containerized. For inspecting Docker, host
+										networking, etc. Files are edited the same way either way.
+									</span>
+								</span>
+							</button>
+						</div>
+					{/if}
+				</div>
 			{/if}
 		</div>
 		<div class="actions">
@@ -1881,20 +1970,104 @@
 	   colour-mix tint on the container case keeps the boundary
 	   visually obvious — running `rm -rf .` on the wrong target is
 	   the kind of mistake the indicator earns its keep on. */
+	.target-wrap {
+		position: relative;
+		display: inline-flex;
+	}
 	.target {
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
+		gap: 2px;
 		color: var(--m-fg-subtle);
 		border: 1px solid var(--m-border);
 		border-radius: 3px;
 		padding: 1px 4px;
 		height: 18px;
+		cursor: pointer;
+		background: transparent;
+	}
+	.target:hover {
+		border-color: var(--m-border-strong, var(--m-border));
+		color: var(--m-fg);
 	}
 	.target.container {
 		color: var(--m-success);
 		border-color: color-mix(in srgb, var(--m-success) 50%, transparent);
 		background: color-mix(in srgb, var(--m-success) 10%, transparent);
+	}
+	/* Off-default badge: a session deliberately pinned to host even
+	   though auto would have picked the container. */
+	.target.overridden {
+		color: var(--m-warning, var(--m-fg));
+		border-color: color-mix(in srgb, var(--m-warning, var(--m-fg)) 55%, transparent);
+		background: color-mix(in srgb, var(--m-warning, var(--m-fg)) 12%, transparent);
+	}
+	.override-dot {
+		width: 4px;
+		height: 4px;
+		border-radius: 50%;
+		background: currentColor;
+	}
+	.target-popover {
+		position: absolute;
+		top: calc(100% + 4px);
+		left: 0;
+		z-index: 30;
+		width: 248px;
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		padding: 4px;
+		border: 1px solid var(--m-border);
+		border-radius: 6px;
+		background: var(--m-bg-elevated, var(--m-bg));
+		box-shadow: 0 6px 20px rgb(0 0 0 / 0.25);
+	}
+	.target-popover .opt {
+		display: flex;
+		gap: 8px;
+		align-items: flex-start;
+		padding: 6px 8px;
+		border: none;
+		border-radius: 4px;
+		background: transparent;
+		text-align: left;
+		cursor: pointer;
+		color: var(--m-fg);
+	}
+	.target-popover .opt:hover {
+		background: var(--m-bg-hover, color-mix(in srgb, var(--m-fg) 8%, transparent));
+	}
+	.target-popover .opt-radio {
+		flex: none;
+		margin-top: 3px;
+		width: 12px;
+		height: 12px;
+		border-radius: 50%;
+		border: 1px solid var(--m-border-strong, var(--m-border));
+	}
+	.target-popover .opt.selected .opt-radio {
+		border-color: var(--m-accent, var(--m-fg));
+		background: radial-gradient(circle, var(--m-accent, var(--m-fg)) 0 3px, transparent 4px);
+	}
+	.target-popover .opt-text {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+	}
+	.target-popover .opt-title {
+		font-size: 12px;
+		font-weight: 600;
+	}
+	.target-popover .opt-sub {
+		font-size: 11px;
+		line-height: 1.35;
+		color: var(--m-fg-muted);
+	}
+	.target-popover .opt-sub em {
+		font-style: normal;
+		color: var(--m-fg-subtle);
 	}
 	.actions {
 		display: flex;

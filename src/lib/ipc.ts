@@ -363,6 +363,7 @@ export const ipc = {
 		listSessions: () => invoke<CoderSessionSummary[]>('coder_list_sessions'),
 		activeSession: () => invoke<CoderSessionSummary | null>('coder_active_session'),
 		newSession: () => invoke<CoderSessionSummary>('coder_new_session'),
+		setBashTargetOverride: (forceHost: boolean) => invoke<boolean>('coder_set_bash_target_override', { forceHost }),
 		openSession: (id: string) => invoke<CoderSessionSummary>('coder_open_session', { id }),
 		deleteSession: (id: string) => invoke<void>('coder_delete_session', { id }),
 		sessionJsonlPath: (id: string) => invoke<string>('coder_session_jsonl_path', { id }),

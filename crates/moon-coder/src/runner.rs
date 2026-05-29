@@ -42,8 +42,8 @@ use crate::inference::{
 use crate::models::{self, CoderModels, ResolvedProvider, SharedCoderModels};
 use crate::providers::{self, ProviderKeyring};
 use crate::sessions::{
-	self, current_time_ms, new_session_id, session_title_from_prompt, sessions_dir, subagent_session_dir, LoadedSession,
-	SessionHeader, SessionRecord, SessionSummary, SESSION_SCHEMA_VERSION,
+	self, current_time_ms, new_session_id, session_title_from_prompt, sessions_dir, subagent_session_dir,
+	BashTargetOverride, LoadedSession, SessionHeader, SessionRecord, SessionSummary, SESSION_SCHEMA_VERSION,
 };
 use crate::subagent::{build_subagent_spec, run_subagent, task_tool_definition};
 use crate::tools::{CoderMode, ToolContext, ToolRegistry};
@@ -406,6 +406,7 @@ impl Session {
 				parent_tool_call_id: None,
 				subagent_mode: None,
 				subagent_target_folder: None,
+				bash_target_override: None,
 			},
 			session_dir: None,
 			messages: vec![ChatMessage::System {
@@ -1039,24 +1040,31 @@ impl CoderHandle {
 			None => false,
 		};
 		// `bash_target` mirrors what `tools::bash` would pick if it
-		// ran right now. Computed here so the panel header can show
-		// the indicator without waiting for the first `bash` call.
+		// ran right now for the active folder's *visible* session —
+		// so the header indicator reflects that session's per-session
+		// force-host override, not just the raw container state.
 		// `None` when no folder is active — chat still works, only
-		// tool calls would fail.
-		let bash_target = if self.state.workspaces.active_folder().await.is_some() {
-			Some(
-				crate::tools::resolve_bash_target(&self.state.workspaces, &self.state.workspaces_dir)
+		// tool calls would fail. `force_host_override` is surfaced
+		// separately so the panel can render the "off-default" badge
+		// without re-deriving the auto target.
+		let (bash_target, force_host_override) = match self.state.workspaces.active_folder().await {
+			Some(folder) => {
+				let path = Utf8PathBuf::from(folder.folder.path.clone());
+				let fs = self.state.folder_session_for(&path).await;
+				let force_host = self.visible_session_force_host(&fs).await;
+				let target = crate::tools::resolve_bash_target(&self.state.workspaces, &self.state.workspaces_dir, force_host)
 					.await
-					.to_string(),
-			)
-		} else {
-			None
+					.to_string();
+				(Some(target), force_host)
+			}
+			None => (None, false),
 		};
 		Ok(CoderStatus {
 			signed_in,
 			identity,
 			busy,
 			bash_target,
+			force_host_override,
 		})
 	}
 
@@ -1316,6 +1324,56 @@ impl CoderHandle {
 		// reconciles to "blank state" on its own), but the list
 		// hasn't actually changed either — no disk impact yet.
 		Ok(summary)
+	}
+
+	/// Set the per-session bash-target override for the **visible
+	/// session** under the active folder. `force_host = true` pins
+	/// this session's `bash` + format-on-save subprocesses to the
+	/// host even while the workspace runs in a container;
+	/// `force_host = false` restores the auto default. Mutates the
+	/// in-memory header and rewrites the on-disk header (best
+	/// effort — a not-yet-persisted session just carries it in
+	/// memory until first persist). No-op when no folder is active
+	/// or the visible session can't be resolved.
+	///
+	/// Per-session, not per-workspace: each concurrent session in a
+	/// folder keeps its own choice, and a fresh session always
+	/// starts auto. Returns the resolved state so the caller can
+	/// emit a fresh status without a round-trip.
+	pub async fn set_bash_target_override(&self, force_host: bool) -> Result<bool, CoderError> {
+		let (fs, _) = self.state.active_folder_session().await?;
+		let Some(id) = fs.visible_session_id().await else {
+			return Err(CoderError::NoActiveFolder);
+		};
+		let Some(rt) = fs.runtime(&id).await else {
+			return Err(CoderError::NoActiveFolder);
+		};
+		let (session_dir, header) = {
+			let mut session = rt.session.lock().await;
+			session.header.bash_target_override = force_host.then_some(BashTargetOverride::ForceHost);
+			(session.session_dir.clone(), session.header.clone())
+		};
+		if let Some(dir) = session_dir {
+			if let Err(err) = sessions::rewrite_header(&dir, &header).await {
+				tracing::warn!(?err, "failed to persist bash_target_override header rewrite");
+			}
+		}
+		Ok(force_host)
+	}
+
+	/// Read the force-host override of `fs`'s visible session
+	/// without lazy-creating a runtime (mirrors the two-step
+	/// look-up `status` uses for `busy`). `false` when no session
+	/// is visible yet.
+	async fn visible_session_force_host(&self, fs: &Arc<FolderSession>) -> bool {
+		let Some(id) = fs.visible_session_id().await else {
+			return false;
+		};
+		let Some(rt) = fs.runtime(&id).await else {
+			return false;
+		};
+		let forced = rt.session.lock().await.header.bash_target_override == Some(BashTargetOverride::ForceHost);
+		forced
 	}
 
 	/// Make the persisted session identified by `id` the visible
@@ -2102,14 +2160,19 @@ async fn run_turn(
 		.folder_for_path(folder_path.as_str())
 		.await
 		.ok_or(CoderError::NoActiveFolder)?;
-	let cx = ToolContext::with_format_queue(folder_entry, CoderMode::Agent, format_queue);
+	// Snapshot the per-session bash-target override once at
+	// turn-start (same posture as `models` above): a toggle
+	// mid-turn applies to the *next* turn, not in-flight commands.
+	let force_host_bash = rt.session.lock().await.header.bash_target_override == Some(BashTargetOverride::ForceHost);
+	let cx =
+		ToolContext::with_format_queue(folder_entry, CoderMode::Agent, format_queue).with_force_host_bash(force_host_bash);
 	// Compose a fresh system prompt and overwrite the session's
 	// `messages[0]`: the base prompt plus a "Bound folders"
 	// section keyed off whatever summaries are currently cached.
 	// Sub-agent dispatch reads the same cache so the model's
 	// awareness of bound folders is consistent across parent +
 	// sub-agent prompts.
-	refresh_system_prompt(state, rt, folder_path).await;
+	refresh_system_prompt(state, rt, folder_path, force_host_bash).await;
 	// Schedule background regeneration for any bound folder whose
 	// summary cache is missing or stale. Detached tokio tasks; we
 	// don't block the turn waiting for them to land. The next
@@ -2978,9 +3041,14 @@ async fn finish_tool_call(
 /// active in its own prompt regardless of which folder the user
 /// is currently browsing — that's what keeps the model's
 /// "your folder" reference stable across folder switches.
-async fn refresh_system_prompt(state: &Arc<CoderState>, rt: &Arc<SessionRuntime>, folder_path: &Utf8Path) {
+async fn refresh_system_prompt(
+	state: &Arc<CoderState>,
+	rt: &Arc<SessionRuntime>,
+	folder_path: &Utf8Path,
+	force_host_bash: bool,
+) {
 	let folders = state.workspaces.folders().await;
-	let container_mode = workspace_in_container_mode(&state.tools).await;
+	let container_mode = workspace_in_container_mode(&state.tools, force_host_bash).await;
 	let prompt = compose_system_prompt(
 		&folders,
 		Some(folder_path.as_str()),
@@ -3001,8 +3069,8 @@ async fn refresh_system_prompt(state: &Arc<CoderState>, rt: &Arc<SessionRuntime>
 /// `bash` tool dispatches against, so the system prompt's
 /// "Bound folders" rendering can't drift from how `bash` actually
 /// routes commands.
-async fn workspace_in_container_mode(tools: &ToolRegistry) -> bool {
-	tools.bash_target_is_container().await
+async fn workspace_in_container_mode(tools: &ToolRegistry, force_host_bash: bool) -> bool {
+	tools.bash_target_is_container(force_host_bash).await
 }
 
 /// Schedule background regeneration for any bound folder whose
@@ -4557,6 +4625,7 @@ mod tests {
 			parent_tool_call_id: None,
 			subagent_mode: None,
 			subagent_target_folder: None,
+			bash_target_override: None,
 		}
 	}
 

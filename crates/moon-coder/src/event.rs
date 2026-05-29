@@ -316,10 +316,21 @@ pub struct CoderStatus {
 	/// stop button visible across reloads (the event stream alone
 	/// doesn't survive a webview refresh).
 	pub busy: bool,
-	/// Where the `bash` tool will run for the active folder —
-	/// `"host"` or `"container"`. `None` when no folder is active
-	/// (the panel still works for chat without a folder; tool calls
-	/// just fail with `NoActiveFolder`). Mirrors the `target` field
-	/// emitted in `bash` tool results.
+	/// Where the `bash` tool will run for the active folder's
+	/// **visible session** — `"host"` or `"container"`. Reflects
+	/// that session's per-session force-host override (so a forced
+	/// session reads `"host"` even with the container running).
+	/// `None` when no folder is active (the panel still works for
+	/// chat without a folder; tool calls just fail with
+	/// `NoActiveFolder`). Mirrors the `target` field emitted in
+	/// `bash` tool results.
 	pub bash_target: Option<String>,
+	/// `true` when the active folder's visible session has the
+	/// force-host override engaged. Distinct from
+	/// `bash_target == "host"`: a session can resolve to host
+	/// simply because the container is down (auto), which is *not*
+	/// an override. The panel uses this to render the "off-default"
+	/// badge on the target pip and pre-select the radio in the
+	/// popover.
+	pub force_host_override: bool,
 }

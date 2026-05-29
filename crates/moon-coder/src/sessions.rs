@@ -132,6 +132,63 @@ pub struct SessionHeader {
 	/// and for sub-agent sessions that targeted the same folder as
 	/// their parent.
 	pub subagent_target_folder: Option<String>,
+	/// Per-session escape hatch for where the coder's `bash` /
+	/// shell tools run. `None` is the default ("auto"): `bash`
+	/// routes to the workspace shell container when it's running,
+	/// else to the host — the historical behaviour. `Some(ForceHost)`
+	/// pins this session's `bash` / shell tool to the host machine
+	/// even while the workspace runs in a container, so an agent
+	/// can inspect the host Docker daemon, host networking, etc.
+	/// File tools (`read_file` / `edit_file`) are unaffected —
+	/// they're already host-direct through the container bind mount.
+	/// Format-on-save is also unaffected: it follows the global
+	/// shell resolver and operates on the same bind-mounted bytes
+	/// regardless, so the override deliberately doesn't relocate it
+	/// (avoids a wider `WorkspaceHost::format_file` signature change
+	/// for a diagnostic escape hatch). Per session, not per
+	/// workspace:
+	/// diagnosing host-side state is a property of one
+	/// conversation, and concurrent sessions in the same folder can
+	/// each pick independently. Persisted so re-opening a session
+	/// restores the choice; a fresh session always starts `None`.
+	pub bash_target_override: Option<BashTargetOverride>,
+}
+
+/// Per-session override for the `bash` tool's execution target.
+///
+/// Only one non-default variant today — `ForceHost`. We don't have
+/// a `ForceContainer`: "auto" already prefers the container when
+/// it's running, and forcing the container while it's down only
+/// produces errors. If a concrete need for it shows up, add it
+/// then. The wire string (`"host"`) is part of the session-header
+/// JSON and the IPC payload — keep it in sync with
+/// `src/lib/protocol.ts` and `tools::BASH_TARGET_HOST`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BashTargetOverride {
+	/// Force `bash` / shell tools onto the host machine regardless
+	/// of container state.
+	ForceHost,
+}
+
+impl BashTargetOverride {
+	/// Wire string used in the session header JSON and IPC.
+	pub fn as_wire(self) -> &'static str {
+		match self {
+			BashTargetOverride::ForceHost => "host",
+		}
+	}
+
+	/// Parse a wire string back into an override. Anything that
+	/// isn't a recognised force-target (including `"auto"` and the
+	/// empty string) maps to `None` = the auto default, so a stray
+	/// or future value degrades to historical behaviour rather than
+	/// erroring a session load.
+	pub fn from_wire(s: &str) -> Option<Self> {
+		match s {
+			"host" => Some(BashTargetOverride::ForceHost),
+			_ => None,
+		}
+	}
 }
 
 const PI_SESSION_TYPE: &str = "session";
@@ -172,6 +229,9 @@ impl Serialize for SessionHeader {
 		if let Some(v) = &self.subagent_target_folder {
 			map.serialize_entry("subagent_target_folder", v)?;
 		}
+		if let Some(v) = &self.bash_target_override {
+			map.serialize_entry("bash_target_override", v.as_wire())?;
+		}
 		map.end()
 	}
 }
@@ -208,6 +268,8 @@ impl<'de> Deserialize<'de> for SessionHeader {
 			subagent_mode: Option<String>,
 			#[serde(default)]
 			subagent_target_folder: Option<String>,
+			#[serde(default)]
+			bash_target_override: Option<String>,
 		}
 		let raw = Raw::deserialize(deserializer)?;
 		Ok(SessionHeader {
@@ -222,6 +284,10 @@ impl<'de> Deserialize<'de> for SessionHeader {
 			parent_tool_call_id: raw.parent_tool_call_id,
 			subagent_mode: raw.subagent_mode,
 			subagent_target_folder: raw.subagent_target_folder,
+			bash_target_override: raw
+				.bash_target_override
+				.as_deref()
+				.and_then(BashTargetOverride::from_wire),
 		})
 	}
 }
@@ -1412,6 +1478,43 @@ pub async fn append_record(dir: &Utf8Path, header: &SessionHeader, record: &Sess
 	Ok(())
 }
 
+/// Rewrite the header (first line) of an already-persisted
+/// session JSONL in place. No-op (returns `Ok(())`) when the file
+/// doesn't exist yet — a not-yet-persisted session carries the
+/// header in memory and writes it on its first
+/// [`append_record`], so there's nothing on disk to fix.
+///
+/// Used by the per-session bash-target override toggle: flipping
+/// it mutates the in-memory header, and this keeps the on-disk
+/// copy truthful so a reload restores the choice. Reads the file
+/// fully (session JSONLs are small), swaps line 1 for the
+/// re-serialised header, and writes the whole thing back. The
+/// body lines are byte-preserved.
+pub async fn rewrite_header(dir: &Utf8Path, header: &SessionHeader) -> Result<(), CoderError> {
+	let path = session_path(dir, &header.id);
+	if !tokio::fs::try_exists(path.as_std_path()).await.unwrap_or(false) {
+		return Ok(());
+	}
+	let content = tokio::fs::read_to_string(path.as_std_path())
+		.await
+		.map_err(CoderError::from)?;
+	let header_line = serde_json::to_string(header).map_err(CoderError::from)?;
+	let mut out = String::with_capacity(content.len() + header_line.len());
+	out.push_str(&header_line);
+	// Re-attach every line after the first verbatim (including the
+	// trailing newline shape of the original).
+	if let Some(rest_start) = content.find('\n') {
+		out.push_str(&content[rest_start..]);
+	} else {
+		// Degenerate: file held only a header with no newline.
+		out.push('\n');
+	}
+	tokio::fs::write(path.as_std_path(), out.as_bytes())
+		.await
+		.map_err(CoderError::from)?;
+	Ok(())
+}
+
 /// Try to fold a `Usage` record into the last appended assistant
 /// line on disk. Returns `Ok(true)` when the fold landed and the
 /// caller should skip writing a stand-alone row; `Ok(false)`
@@ -1683,6 +1786,7 @@ mod tests {
 			parent_tool_call_id: None,
 			subagent_mode: None,
 			subagent_target_folder: None,
+			bash_target_override: None,
 		}
 	}
 
@@ -1739,6 +1843,70 @@ mod tests {
 		let summary = load_summary(&summary_path).await.unwrap();
 		assert_eq!(summary.title, "renamed by auto-pass");
 		assert_eq!(summary.id, "sess-test");
+	}
+
+	#[test]
+	fn bash_target_override_omitted_when_none_and_round_trips_force_host() {
+		// Auto (None) must not emit the key — keeps headers byte-clean
+		// for the common case and avoids churn on existing sessions.
+		let mut header = make_test_header("sess-bto");
+		assert_eq!(header.bash_target_override, None);
+		let json = serde_json::to_string(&header).unwrap();
+		assert!(
+			!json.contains("bash_target_override"),
+			"auto sessions must omit the override key, got {json}"
+		);
+
+		// ForceHost serialises as the `"host"` wire string and reloads.
+		header.bash_target_override = Some(BashTargetOverride::ForceHost);
+		let json = serde_json::to_string(&header).unwrap();
+		assert!(json.contains("\"bash_target_override\":\"host\""), "got {json}");
+		let back: SessionHeader = serde_json::from_str(&json).unwrap();
+		assert_eq!(back.bash_target_override, Some(BashTargetOverride::ForceHost));
+
+		// An unrecognised / future value degrades to auto rather than
+		// erroring the load.
+		let weird = json.replace("\"host\"", "\"someday-container\"");
+		let back: SessionHeader = serde_json::from_str(&weird).unwrap();
+		assert_eq!(back.bash_target_override, None);
+	}
+
+	#[tokio::test]
+	async fn rewrite_header_updates_first_line_and_preserves_body() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let mut header = make_test_header("sess-rewrite");
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::User {
+				text: "hi".into(),
+				images: Vec::new(),
+			},
+		)
+		.await
+		.unwrap();
+
+		// Flip the override and rewrite the header in place.
+		header.bash_target_override = Some(BashTargetOverride::ForceHost);
+		rewrite_header(&dir, &header).await.unwrap();
+
+		let loaded = load(&dir, "sess-rewrite").await.unwrap();
+		assert_eq!(loaded.header.bash_target_override, Some(BashTargetOverride::ForceHost));
+		// Body record survived the rewrite untouched.
+		assert_eq!(loaded.records.len(), 1);
+	}
+
+	#[tokio::test]
+	async fn rewrite_header_is_a_noop_for_unpersisted_session() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let header = make_test_header("sess-absent");
+		// No file on disk yet — must not error or create one.
+		rewrite_header(&dir, &header).await.unwrap();
+		assert!(!tokio::fs::try_exists(session_path(&dir, "sess-absent").as_std_path())
+			.await
+			.unwrap());
 	}
 
 	#[tokio::test]

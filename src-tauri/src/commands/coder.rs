@@ -257,6 +257,20 @@ pub async fn coder_new_session(state: State<'_, AppState>) -> Result<SessionSumm
 	state.coder.new_session().await.map_err(MoonError::from)
 }
 
+/// Set the per-session bash-target override for the active
+/// folder's visible session. `force_host = true` pins this
+/// session's `bash` / shell tool to the host machine even while
+/// the workspace runs in a container; `false` restores auto.
+/// Returns the resolved force-host state.
+#[tauri::command]
+pub async fn coder_set_bash_target_override(state: State<'_, AppState>, force_host: bool) -> Result<bool, MoonError> {
+	state
+		.coder
+		.set_bash_target_override(force_host)
+		.await
+		.map_err(MoonError::from)
+}
+
 /// Replace the in-memory session with the persisted one
 /// identified by `id`. Backend emits `session_loaded` + per-record
 /// replay events on the `coder:event` channel; the frontend reacts

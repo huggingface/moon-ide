@@ -1087,6 +1087,23 @@ class CoderPanelState {
 		return this.status?.bash_target ?? null;
 	}
 
+	/** True when the active folder's visible session is pinned to
+	 *  host mode via the per-session override. Distinct from
+	 *  `bashTarget === 'host'`: a session resolves to host whenever
+	 *  the container is down (auto), which is not an override. Drives
+	 *  the "off-default" badge on the target pip. */
+	get forceHostOverride(): boolean {
+		return this.status?.force_host_override ?? false;
+	}
+
+	/** Toggle the per-session force-host override for the active
+	 *  folder's visible session, then refresh status so the pip /
+	 *  badge / system-prompt path advertising all reconcile. */
+	async setBashTargetOverride(forceHost: boolean): Promise<void> {
+		await ipc.coder.setBashTargetOverride(forceHost);
+		await this.refreshStatus();
+	}
+
 	togglePanel(): void {
 		rightPanel.toggle('coder');
 	}

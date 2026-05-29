@@ -115,6 +115,13 @@ pub struct ToolContext {
 	pub folder: Arc<WorkspaceFolderEntry>,
 	pub mode: CoderMode,
 	pub format_queue: Arc<FormatQueue>,
+	/// When true, the `bash` tool routes to the host machine even
+	/// if the workspace shell container is running — the per-session
+	/// [`BashTargetOverride::ForceHost`](crate::sessions::BashTargetOverride)
+	/// escape hatch. Captured from the session at turn spawn; the
+	/// rest of the turn reads it from here so a settings flip
+	/// mid-turn doesn't relocate in-flight commands.
+	pub force_host_bash: bool,
 }
 
 impl ToolContext {
@@ -123,6 +130,7 @@ impl ToolContext {
 			folder,
 			mode,
 			format_queue: Arc::new(FormatQueue::default()),
+			force_host_bash: false,
 		}
 	}
 
@@ -135,7 +143,17 @@ impl ToolContext {
 			folder,
 			mode,
 			format_queue: queue,
+			force_host_bash: false,
 		}
+	}
+
+	/// Builder-style setter for the per-session force-host-bash
+	/// flag. Kept separate from the constructors so the sub-agent /
+	/// parallel-dispatch call sites that always run auto don't have
+	/// to thread it.
+	pub fn with_force_host_bash(mut self, force_host: bool) -> Self {
+		self.force_host_bash = force_host;
+		self
 	}
 }
 
@@ -231,8 +249,13 @@ impl ToolRegistry {
 	/// the synthetic `/workspace/<name>` mount the container
 	/// actually exposes (container mode). Falls back to host on
 	/// any docker-side failure, matching the bash tool's posture.
-	pub async fn bash_target_is_container(&self) -> bool {
-		resolve_bash_target(&self.workspaces, &self.workspaces_dir).await == BASH_TARGET_CONTAINER
+	///
+	/// `force_host` is the per-session override: when set, this
+	/// always reports `false` (host mode) so the system prompt
+	/// advertises host paths consistently with where `bash` will
+	/// actually run.
+	pub async fn bash_target_is_container(&self, force_host: bool) -> bool {
+		resolve_bash_target(&self.workspaces, &self.workspaces_dir, force_host).await == BASH_TARGET_CONTAINER
 	}
 
 	/// Build a [`ToolContext`] from the workspace's current active
@@ -849,7 +872,7 @@ impl ToolRegistry {
 			.unwrap_or(BASH_DEFAULT_TIMEOUT)
 			.min(BASH_MAX_TIMEOUT);
 
-		let (mut command, target_kind) = self.build_bash_command(folder, &parsed.cmd).await?;
+		let (mut command, target_kind) = self.build_bash_command(folder, &parsed.cmd, cx.force_host_bash).await?;
 		command
 			.kill_on_drop(true)
 			.stdin(std::process::Stdio::null())
@@ -923,8 +946,9 @@ impl ToolRegistry {
 		&self,
 		folder: &WorkspaceFolderEntry,
 		cmd: &str,
+		force_host: bool,
 	) -> Result<(tokio::process::Command, &'static str), CoderError> {
-		let target = resolve_bash_target(&self.workspaces, &self.workspaces_dir).await;
+		let target = resolve_bash_target(&self.workspaces, &self.workspaces_dir, force_host).await;
 		if target == BASH_TARGET_CONTAINER {
 			let workspace_id = self.workspaces.workspace_id().await;
 			let container_name = container_name_for_workspace(&workspace_id);
@@ -966,7 +990,21 @@ impl ToolRegistry {
 /// Called from both `tools::bash` and `runner::status` so the
 /// indicator pip and the actual command's `target` field can't
 /// drift.
-pub(crate) async fn resolve_bash_target(workspaces: &WorkspaceRegistry, workspaces_dir: &Utf8Path) -> &'static str {
+///
+/// `force_host` is the per-session escape hatch
+/// ([`crate::sessions::BashTargetOverride::ForceHost`]): when set,
+/// short-circuit to host without probing the container at all, so
+/// an agent can inspect host-side Docker / networking even while
+/// the workspace runs in a container. The default (`false`) keeps
+/// the historical auto behaviour.
+pub(crate) async fn resolve_bash_target(
+	workspaces: &WorkspaceRegistry,
+	workspaces_dir: &Utf8Path,
+	force_host: bool,
+) -> &'static str {
+	if force_host {
+		return BASH_TARGET_HOST;
+	}
 	let workspace_id = workspaces.workspace_id().await;
 	let bound: Vec<Utf8PathBuf> = workspaces
 		.folders()

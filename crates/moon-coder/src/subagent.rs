@@ -314,6 +314,9 @@ async fn run_subagent_inner(
 		parent_tool_call_id: Some(spec.parent_tool_call_id.clone()),
 		subagent_mode: Some(spec.mode.as_wire().to_string()),
 		subagent_target_folder: if target_differs { Some(target_folder_path) } else { None },
+		// Sub-agents always run with auto bash routing; a forced-host
+		// parent session doesn't leak its override into delegated work.
+		bash_target_override: None,
 	};
 
 	// Best-effort: persistence failures log at warn but never

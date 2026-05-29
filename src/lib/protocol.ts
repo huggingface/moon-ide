@@ -1356,6 +1356,14 @@ export type CoderStatus = {
 	 * workspace has no active folder yet.
 	 */
 	bash_target: 'host' | 'container' | null;
+	/**
+	 * True when the active folder's visible session has the per-session
+	 * force-host override engaged. Distinct from `bash_target === 'host'`:
+	 * a session resolves to host whenever the container is down (auto),
+	 * which is not an override. Drives the "off-default" badge on the
+	 * target pip and pre-selects the radio in the override popover.
+	 */
+	force_host_override: boolean;
 };
 
 /**
