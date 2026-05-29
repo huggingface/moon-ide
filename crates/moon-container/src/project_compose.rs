@@ -46,8 +46,10 @@
 //! projects on separate networks, but [`Self::up`] /
 //! [`Self::rebuild`] / [`Self::start_service`] /
 //! [`Self::restart_service`] follow up with a `docker network
-//! connect <project>_default <dev-container>` so the workspace
-//! shell can reach project services by compose service name —
+//! connect <project>_default <dev-container>` (best-effort, even
+//! when the lifecycle command itself errored on an unhealthy
+//! service) so the workspace shell can reach project services by
+//! compose service name —
 //! `mongosh mongodb://mongo:27017`, `psql -h db -U postgres`,
 //! `curl http://api:3000/health`. [`Self::down`] disconnects
 //! before tearing the network down. See [`crate::network`] for
@@ -201,16 +203,26 @@ impl ProjectCompose {
 	/// Used by the folder-bar "Start services" affordance. The
 	/// IDE never auto-invokes this; it's always a user click.
 	///
-	/// On success, attaches the workspace's `dev` container to
-	/// this project's default network (best effort) so a
-	/// container terminal can reach the project's services by
-	/// compose service name (`mongosh mongodb://mongo:27017`,
-	/// `psql -h db`). See [`crate::network`].
+	/// Attaches the workspace's `dev` container to this project's
+	/// default network (best effort) so a container terminal can
+	/// reach the project's services by compose service name
+	/// (`mongosh mongodb://mongo:27017`, `psql -h db`). See
+	/// [`crate::network`].
+	///
+	/// The attach runs even when `up --wait` returns an error.
+	/// `--wait` fails the whole command if *any* service is
+	/// unhealthy, but the project network and the services that
+	/// did come up are real — and the dev-side attach is
+	/// idempotent and harmless against a half-up project. Gating
+	/// it behind whole-project health would leave the dev
+	/// container un-attached whenever a single unrelated service
+	/// flakes, so we wire the dev side regardless and re-surface
+	/// the original `up` error.
 	pub async fn up(&self) -> Result<(), LifecycleError> {
-		self.docker_compose(["up", "-d", "--wait"]).await?;
+		let result = self.docker_compose(["up", "-d", "--wait"]).await;
 		self.invalidate_status_cache().await;
 		self.attach_workspace_dev().await;
-		Ok(())
+		result.map(|_| ())
 	}
 
 	pub async fn pause(&self) -> Result<(), LifecycleError> {
@@ -232,12 +244,12 @@ impl ProjectCompose {
 	/// any pre-existing attachment is gone by the time we get
 	/// here.
 	pub async fn rebuild(&self) -> Result<(), LifecycleError> {
-		self
+		let result = self
 			.docker_compose(["up", "-d", "--force-recreate", "--pull", "always", "--wait"])
-			.await?;
+			.await;
 		self.invalidate_status_cache().await;
 		self.attach_workspace_dev().await;
-		Ok(())
+		result.map(|_| ())
 	}
 
 	/// `docker compose stop` — SIGTERM all of the folder's
@@ -278,24 +290,35 @@ impl ProjectCompose {
 		Ok(())
 	}
 
-	/// `docker compose start <service>` — transition an existing
-	/// (created/stopped/exited) service container to `running`
-	/// **without** recreating it.
+	/// `docker compose up -d --no-deps <service>` — bring a single
+	/// service to `running`, creating and network-joining its
+	/// container if needed.
 	///
-	/// Used by the per-service "▶" affordance in the popover. If
-	/// the service has never been brought up (no container record
-	/// on the daemon yet) the daemon will error; that's the
-	/// caller's signal to use the project-level `up` instead.
+	/// Used by the per-service "▶" affordance in the popover. We
+	/// deliberately use `up` rather than bare `start`: `start`
+	/// only handles the pure `exited`/`stopped` → `running`
+	/// transition and assumes the container is already correctly
+	/// joined to the project network. A container left in
+	/// `created` by a partially-failed `up` (e.g. a host-port
+	/// conflict aborted the project before the network was fully
+	/// established) is exactly the case where `start` runs the
+	/// container but leaves it un-resolvable — `up` (re)creates
+	/// and (re)joins it idempotently, which is what the user
+	/// wants when recovering from such a failure. `--no-deps`
+	/// keeps the click scoped to the one service the user asked
+	/// for instead of dragging its `depends_on` graph up.
 	///
 	/// Re-attaches the workspace dev container after the start —
 	/// the project network survives across `stop`/`start`, but a
-	/// fresh workspace shell created since the last `up` won't
-	/// be on it yet. Idempotent on the already-attached path.
+	/// fresh workspace shell created since the last `up` won't be
+	/// on it yet. The attach runs even on the `up` error path
+	/// (see [`Self::up`] for why). Idempotent on the
+	/// already-attached path.
 	pub async fn start_service(&self, service: &str) -> Result<(), LifecycleError> {
-		self.docker_compose(["start", service]).await?;
+		let result = self.docker_compose(["up", "-d", "--no-deps", service]).await;
 		self.invalidate_status_cache().await;
 		self.attach_workspace_dev().await;
-		Ok(())
+		result.map(|_| ())
 	}
 
 	/// `docker compose stop <service>` — send SIGTERM to a single
@@ -313,10 +336,10 @@ impl ProjectCompose {
 	/// affordance. Use [`Self::rebuild`] for the heavier
 	/// "recreate from a fresh image" workflow.
 	pub async fn restart_service(&self, service: &str) -> Result<(), LifecycleError> {
-		self.docker_compose(["restart", service]).await?;
+		let result = self.docker_compose(["restart", service]).await;
 		self.invalidate_status_cache().await;
 		self.attach_workspace_dev().await;
-		Ok(())
+		result.map(|_| ())
 	}
 
 	/// Best-effort attach of the workspace `dev` container to

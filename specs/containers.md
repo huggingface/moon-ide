@@ -223,11 +223,30 @@ curl http://api:3000/health       # works
 The mechanism is a `docker network connect <project>_default
 <dev-container>` issued after every project `up` / `rebuild`
 / `start_service` / `restart_service`, and a matching
-`disconnect` before `down`. The workspace shell `setup` /
+`disconnect` before `down`. The attach is best-effort and runs
+**even when the lifecycle command itself errored** — `up
+--wait` fails the whole command if any one service is
+unhealthy, but the network and the services that did come up
+are real, so gating the dev-side attach behind whole-project
+health would strand the dev container whenever a single
+unrelated service flakes. The workspace shell `setup` /
 `rebuild` / `apply_bound_folders` reconciles by re-attaching
 across every running project — covers cold-start (project up
 before workspace shell) and dev-container recreate (which
 drops every prior attachment).
+
+The per-service "▶" runs `docker compose up -d --no-deps
+<service>`, **not** bare `docker compose start <service>`.
+`start` only handles the `exited`/`stopped` → `running`
+transition and assumes the container is already correctly
+joined to the project network; a container left in `created`
+by a partially-failed `up` (e.g. a host-port conflict aborted
+the project before its network was established) would `start`
+into a running-but-unresolvable state. `up -d --no-deps`
+(re)creates and (re)joins the single service idempotently,
+which is the right recovery primitive — and `--no-deps` keeps
+the click scoped to the one service rather than dragging its
+`depends_on` graph up.
 
 Limitations:
 

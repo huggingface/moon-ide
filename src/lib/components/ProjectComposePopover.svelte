@@ -92,11 +92,14 @@
 		}
 	});
 
-	// Per-row capability checks — mirror what `docker compose
-	// {start,stop,restart} <svc>` accepts. Restart on a `created`
-	// (never-started) container errors with "no such service
-	// container", so we gate it; for those rows the user wants
-	// project-level `up` instead.
+	// Per-row capability checks. Stop/restart mirror what
+	// `docker compose {stop,restart} <svc>` accepts. Restart on a
+	// `created` (never-started) container errors with "no such
+	// service container", so we gate it; for those rows the user
+	// wants Start instead — and Start is safe in any state because
+	// the backend's `start_service` runs `up -d --no-deps <svc>`
+	// (creates + network-joins + starts), not bare `start`. See
+	// `ProjectCompose::start_service` in moon-container.
 	function canStart(svc: ServiceStatus): boolean {
 		return svc.raw_state === 'created' || svc.raw_state === 'exited';
 	}
