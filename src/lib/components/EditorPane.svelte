@@ -127,6 +127,40 @@
 	function focus() {
 		workspace.focusSide(side);
 	}
+
+	// Holds the boundary's `reset` while the body is in its failed
+	// state. Cleared once we've reset. The auto-reset effect below
+	// calls it on the next `activePath` change so switching tabs
+	// recovers the pane without a manual click.
+	let pendingBoundaryReset: (() => void) | null = $state(null);
+
+	function onBodyError(error: unknown, reset: () => void) {
+		const detail =
+			error instanceof Error ? `${error.name}: ${error.message}\n${error.stack ?? '(no stack)'}` : String(error);
+		frontendLog(
+			'editor.swap',
+			'error',
+			`EditorPane(${side}) body boundary caught: activePath=${activePath ?? '∅'}\n${detail}`,
+		);
+		pendingBoundaryReset = reset;
+	}
+
+	// Auto-recover on navigation. When the body has crashed and the
+	// user switches to another tab (or any state change moves
+	// `activePath`), tear down the failed subtree and rebuild it for
+	// the new file. Without this the boundary would keep showing the
+	// fallback until the manual "Reload view" button is clicked,
+	// which is the exact "editor body froze on tab switch" symptom
+	// we're chasing.
+	$effect(() => {
+		void activePath;
+		const reset = pendingBoundaryReset;
+		if (reset === null) {
+			return;
+		}
+		pendingBoundaryReset = null;
+		reset();
+	});
 </script>
 
 <div
@@ -139,8 +173,18 @@
 >
 	<EditorTabs {side} />
 	<div class="body">
-		{#if activeFile?.kind === 'image'}
-			<!-- Image / Diff / Markdown / Review views build
+		<!-- Boundary so a throw inside a view component's render or
+		     its child effects (Editor / DiffView / MarkdownView /
+		     ReviewView / ImageView) is caught and surfaced instead
+		     of silently detaching EditorPane's own reactive scope.
+		     Symptom we're chasing: a tab switch updates the strip
+		     but the editor body freezes — consistent with a child
+		     effect crashing the flush. `onerror` logs the full
+		     error + stack to the `editor.swap` diag source; `reset`
+		     lets the next state change rebuild the body. -->
+		<svelte:boundary onerror={(error, reset) => onBodyError(error, reset)}>
+			{#if activeFile?.kind === 'image'}
+				<!-- Image / Diff / Markdown / Review views build
 			     CodeMirror / image state in `onMount` and don't
 			     watch `file.path` internally — `Editor` is the
 			     only view that handles path swaps in-place. Key
@@ -152,26 +196,39 @@
 			     still carries the original path in its closure and
 			     ends up writing the new file's text into the old
 			     file's buffer. -->
-			{#key activeFile.path}
-				<ImageView file={activeFile} />
-			{/key}
-		{:else if activeFile && showReview}
-			{#key activeFile.path}
-				<ReviewView {side} />
-			{/key}
-		{:else if activeFile && showDiff}
-			{#key activeFile.path}
-				<DiffView file={activeFile} {side} />
-			{/key}
-		{:else if activeFile && showMarkdownPreview}
-			{#key activeFile.path}
-				<MarkdownView file={activeFile} {side} />
-			{/key}
-		{:else if activeFile}
-			<Editor file={activeFile} {side} />
-		{:else}
-			<Welcome onPickFolder={pickFolder} />
-		{/if}
+				{#key activeFile.path}
+					<ImageView file={activeFile} />
+				{/key}
+			{:else if activeFile && showReview}
+				{#key activeFile.path}
+					<ReviewView {side} />
+				{/key}
+			{:else if activeFile && showDiff}
+				{#key activeFile.path}
+					<DiffView file={activeFile} {side} />
+				{/key}
+			{:else if activeFile && showMarkdownPreview}
+				{#key activeFile.path}
+					<MarkdownView file={activeFile} {side} />
+				{/key}
+			{:else if activeFile}
+				<Editor file={activeFile} {side} />
+			{:else}
+				<Welcome onPickFolder={pickFolder} />
+			{/if}
+			{#snippet failed(error, reset)}
+				<!-- Visible fallback so the pane isn't a blank void
+				     after a child crash. Clicking another tab (or any
+				     state change that re-keys the body) calls `reset`
+				     via the effect below; the button is the manual
+				     escape hatch. -->
+				<div class="body-error" role="alert">
+					<p>The editor view hit an error.</p>
+					<pre>{error instanceof Error ? error.message : String(error)}</pre>
+					<button type="button" onclick={reset}>Reload view</button>
+				</div>
+			{/snippet}
+		</svelte:boundary>
 		{#if showCoderHint}
 			<!-- Floating reminder for the Ctrl+L "add selection to
 				 coder" gesture. Visible only when the workspace's
@@ -210,6 +267,38 @@
 		min-height: 0;
 		display: flex;
 		position: relative;
+	}
+	.body-error {
+		flex: 1;
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 12px;
+		padding: 24px;
+		overflow: auto;
+		color: var(--m-fg);
+	}
+	.body-error pre {
+		margin: 0;
+		max-width: 100%;
+		white-space: pre-wrap;
+		word-break: break-word;
+		font-family: var(--m-font-mono, monospace);
+		font-size: 12px;
+		color: var(--m-danger);
+	}
+	.body-error button {
+		font-family: var(--m-font-ui);
+		font-size: 12px;
+		padding: 4px 12px;
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		background: var(--m-bg-1);
+		color: var(--m-fg);
+		cursor: pointer;
+	}
+	.body-error button:hover {
+		background: var(--m-bg-overlay);
 	}
 	/* Floating "Ctrl+L Add selection to Coder" hint. Anchored to
 	   the editor body's top-right corner, away from the file
