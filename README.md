@@ -71,3 +71,13 @@ bun run build:bin
 ```
 
 > **Phased delivery rule** — each phase ends with a hand-back to a human reviewer. AI agents do not start the next phase on their own. See [AGENTS.md](AGENTS.md#phased-delivery).
+
+## Before going public
+
+Things that still need to happen before this repo is made public:
+
+- **Publish the `moon-base` Docker image to Docker Hub.** The workspace dev image (`huggingface/moon-base`) must actually exist on Docker Hub so a fresh clone can pull it instead of building locally. See [images/moon-base/README.md](images/moon-base/README.md) and [ADR 0007](specs/decisions/0007-compose-and-moon-base.md).
+- **Improve the default model / provider onboarding.** Right now the flow assumes you connect to Hugging Face first, and the default model choice after connecting could be better. Ideally:
+  - Pick a sensible default model automatically after connecting to HF.
+  - Let the editor be used without connecting to HF at all, as long as a model provider is supplied another way.
+  - Rework the flow around "set the LLM provider" — connecting to HF becomes one option that's triggered (e.g. via the cloud icon) only when an HF provider is chosen.
