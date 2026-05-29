@@ -67,7 +67,7 @@ WebKitGTK provides the webview the Tauri app loads at runtime, so this set is re
 ```bash
 bun install
 bun run build:bin
-./target/release/moon-dekstop
+./target/release/moon-desktop
 ```
 
 > **Phased delivery rule** — each phase ends with a hand-back to a human reviewer. AI agents do not start the next phase on their own. See [AGENTS.md](AGENTS.md#phased-delivery).
