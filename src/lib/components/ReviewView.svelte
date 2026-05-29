@@ -24,18 +24,93 @@
 	// "currently visible" pointer too: the review button's toggle
 	// behaviour needs *something* to jump to even before the user
 	// has scrolled, and the first entry is a sensible default.
+	// Folder this review view belongs to, captured at mount. We key
+	// the scroll-restore snapshot off this rather than off the live
+	// active-folder pointer: on a folder switch, `onDestroy` fires
+	// *after* the active folder has already flipped, so reading the
+	// live pointer at teardown would stash this folder's position
+	// under the next folder's state. Captured at mount, it's always
+	// the folder we're actually rendering.
+	const ownerFolder: string | null = workspace.activeFolderPath;
+
+	// Index of the section we should scroll back to on mount, if a
+	// restore snapshot from a previous mount survived (tab or folder
+	// switch). `-1` means no restore — start at the top. Computed
+	// once at mount time rather than kept reactive: it only seeds the
+	// eager-mount decision and the one-shot scroll, and we don't want
+	// a later git refresh that shuffles `entries` to retroactively
+	// change which sections mounted eagerly.
+	const restoreSnapshot = workspace.reviewRestoreFor(ownerFolder);
+	const restorePath: string | null = restoreSnapshot?.path ?? null;
+	const restoreOffset: number = restoreSnapshot?.offset ?? 0;
+	const restoreIndex: number =
+		restorePath === null ? -1 : workspace.gitStatusEntries.findIndex((e) => e.path === restorePath);
+
 	onMount(() => {
 		scroller?.focus({ preventScroll: true });
 		updateVisibleFile();
+		if (restoreIndex >= 0) {
+			restoreScroll(restorePath as string, restoreOffset);
+		}
 	});
+
+	// Re-seat the scroll position at the saved section after a tab
+	// switch. Eager sections (`i <= restoreIndex`, see the `eager`
+	// prop below) build their MergeView asynchronously, so the
+	// target section's `offsetTop` keeps shifting as sections above
+	// it grow from placeholder height to full diff height. Rather
+	// than guess a single frame, we re-apply the target offset on
+	// each animation frame until it stops moving (or a deadline
+	// hits), which lands precisely once layout settles. The
+	// deadline guards against a section that never finishes building
+	// (e.g. an empty/errored diff) pinning us in a loop.
+	let restoreFrame = 0;
+	function cancelRestore() {
+		if (restoreFrame !== 0) {
+			cancelAnimationFrame(restoreFrame);
+			restoreFrame = 0;
+		}
+	}
+	function restoreScroll(path: string, offset: number) {
+		const deadline = performance.now() + 1500;
+		let lastTarget = -1;
+		let stableFrames = 0;
+		const step = () => {
+			restoreFrame = 0;
+			const el = sectionEls.get(path);
+			if (!el || !scroller) {
+				return;
+			}
+			const target = Math.max(0, el.offsetTop + offset);
+			scroller.scrollTop = target;
+			// Two consecutive frames at the same target = layout has
+			// settled; stop re-applying so the user can scroll freely.
+			if (target === lastTarget) {
+				stableFrames += 1;
+				if (stableFrames >= 2 || performance.now() >= deadline) {
+					return;
+				}
+			} else {
+				stableFrames = 0;
+				lastTarget = target;
+			}
+			restoreFrame = requestAnimationFrame(step);
+		};
+		restoreFrame = requestAnimationFrame(step);
+	}
 
 	// The pointer is only meaningful while the review pane is
 	// mounted. Clearing on destroy means closing the tab through
 	// any other route (tab-strip close, pane teardown on folder
 	// switch, …) leaves the workspace state honest.
 	onDestroy(() => {
+		captureRestore();
 		workspace.reviewVisibleFile = null;
 		workspace.reviewFocusPath = null;
+		if (restoreFrame !== 0) {
+			cancelAnimationFrame(restoreFrame);
+			restoreFrame = 0;
+		}
 		// Drop any selection a child section published while we were
 		// live. Sections clear their own when unmounted, but the
 		// CodeMirror teardown order between us and our children
@@ -166,6 +241,44 @@
 		});
 	}
 
+	// Snapshot the scroll position into this folder's restore slot so
+	// the next mount (after a tab *or folder* switch) lands back
+	// here. We store the nearest section's path plus the signed pixel
+	// offset of the scroller into that section, rather than a raw
+	// `scrollTop`: section heights are recomputed from scratch on
+	// remount (lazy MergeView builds), so an absolute offset would
+	// point at the wrong file. Path + intra-section delta survives
+	// the rebuild. Keyed off `ownerFolder` (captured at mount), not
+	// the live active folder — see its declaration.
+	function captureRestore() {
+		// Walk the mounted section refs directly rather than the
+		// reactive `entries` list: on a folder switch the git-status
+		// entries may have already flipped to the new folder by the
+		// time teardown runs, but `sectionEls` still holds *this*
+		// folder's sections until our children unmount.
+		if (!scroller || sectionEls.size === 0) {
+			workspace.setReviewRestoreFor(ownerFolder, null);
+			return;
+		}
+		const scrollTop = scroller.scrollTop;
+		let bestPath: string | null = null;
+		let bestEl: HTMLElement | null = null;
+		let bestDelta = Infinity;
+		for (const [path, el] of sectionEls) {
+			const delta = Math.abs(el.offsetTop - scrollTop);
+			if (delta < bestDelta) {
+				bestDelta = delta;
+				bestPath = path;
+				bestEl = el;
+			}
+		}
+		if (bestPath === null || bestEl === null) {
+			workspace.setReviewRestoreFor(ownerFolder, null);
+			return;
+		}
+		workspace.setReviewRestoreFor(ownerFolder, { path: bestPath, offset: scrollTop - bestEl.offsetTop });
+	}
+
 	// Keyboard nav between file sections. `n` / `p` mirror the
 	// terminal-pager convention; Alt-Down / Alt-Up are the GUI
 	// analogue. Bound on the scroll container so they only fire
@@ -212,6 +325,9 @@
 	}
 
 	function onKeyDown(event: KeyboardEvent) {
+		// Any genuine user interaction aborts an in-flight restore so
+		// we stop yanking the viewport back to the saved position.
+		cancelRestore();
 		// Ignore key events that originate from within an editor:
 		// CodeMirror panes are inside our scroller and capture focus
 		// when the user clicks into one. Routing `n` / `p` to "next
@@ -253,6 +369,8 @@
 	aria-label="Review changes"
 	onkeydown={onKeyDown}
 	onscroll={onScroll}
+	onwheel={cancelRestore}
+	onpointerdown={cancelRestore}
 >
 	<div class="banner">
 		<span class="title">Review changes</span>
@@ -277,8 +395,21 @@
 				 with a fresh `mergeBase` prop. Without it the
 				 sections would keep rendering against the prior
 				 baseline (build runs once on mount). -->
+			<!-- Eager-build the first two sections (so an unscrolled
+				 open shows content immediately) and, on a restore,
+				 everything up to and including the section we're
+				 scrolling back to — their final heights must be
+				 settled before `restoreScroll` can land on the right
+				 pixel. Sections below the restore target stay lazy. -->
 			{#each entries as entry, i (`${entry.path}|${mergeBase ?? 'HEAD'}`)}
-				<ReviewSection path={entry.path} status={entry.status} {mergeBase} eager={i < 2} {registerSection} {side} />
+				<ReviewSection
+					path={entry.path}
+					status={entry.status}
+					{mergeBase}
+					eager={i < 2 || i <= restoreIndex}
+					{registerSection}
+					{side}
+				/>
 			{/each}
 		</div>
 	{/if}

@@ -261,6 +261,22 @@ class FolderState {
 	// editor scratch buffers behave today.
 	commitDraft = $state('');
 
+	// Scroll-restore snapshot for this folder's Review changes
+	// pseudo-tab. `ReviewView` writes it on unmount (the file whose
+	// section was nearest the top of the viewport plus the pixel
+	// offset into that section) and reads it back on the next mount,
+	// so switching away — to another tab *or another folder* — and
+	// coming back lands the reader where they left off instead of
+	// scrolling to the top and re-lazy-loading every section.
+	// Per-folder so each folder's review keeps its own position; the
+	// review tab buffer itself already lives in this folder's
+	// `openFiles`, so it survives a folder switch the same way.
+	// In-memory only (not persisted): cleared when the review tab is
+	// actually closed (see `closeFile`). Keyed by path so a baseline
+	// flip — which remounts the sections under a new key but keeps
+	// the same `review://` tab — still restores.
+	reviewRestore = $state<{ path: string; offset: number } | null>(null);
+
 	constructor(public readonly folderPath: string) {}
 }
 
@@ -485,6 +501,31 @@ class WorkspaceState {
 	// `null` when no review tab is currently open or the review
 	// stack is empty.
 	reviewVisibleFile = $state<string | null>(null);
+
+	// Scroll-restore snapshot for the Review changes pseudo-tab,
+	// stored per-folder on `FolderState` (see the field there for the
+	// full rationale). `ReviewView` reads/writes it against the
+	// folder path it captured at mount — *not* via the active-folder
+	// proxy — because the snapshot is written from `onDestroy`, which
+	// on a folder switch fires *after* `active_folder` has already
+	// flipped to the new folder. Routing through the proxy would
+	// stash the old folder's scroll position under the new folder's
+	// state. Keying explicitly avoids that race.
+	reviewRestoreFor(folder: string | null): { path: string; offset: number } | null {
+		if (folder === null) {
+			return null;
+		}
+		return this.folderStates.get(folder)?.reviewRestore ?? null;
+	}
+	setReviewRestoreFor(folder: string | null, value: { path: string; offset: number } | null): void {
+		if (folder === null) {
+			return;
+		}
+		const fs = this.folderStates.get(folder);
+		if (fs) {
+			fs.reviewRestore = value;
+		}
+	}
 
 	// Path of the review section whose CodeMirror editor currently
 	// holds focus. `ReviewSection` updates this on focus / blur of
@@ -4722,6 +4763,13 @@ class WorkspaceState {
 		// break the "re-click an already-open file" flow (the existing
 		// entry would short-circuit the load).
 		if (!this.leftTabs.includes(path) && !this.rightTabs.includes(path)) {
+			// Closing the review tab for good drops its scroll-restore
+			// snapshot so the next open starts at the top rather than
+			// at a position from a now-stale session. Close runs in the
+			// active folder, so its `FolderState` is the right target.
+			if (isReviewPath(path)) {
+				this.setReviewRestoreFor(this.activeFolderPath, null);
+			}
 			// External buffers were never opened with the LSP / git
 			// machinery, so capture the flag before the filter and
 			// skip the matching teardown. Calling `lspClose` here
