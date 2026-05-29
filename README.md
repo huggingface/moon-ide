@@ -4,11 +4,10 @@ A team-specialized IDE built from scratch by assembling best-in-class components
 
 ## Vision
 
-- TypeScript-first (TS, Svelte, JSX/TSX, MD, JSON, CSS, HTML)
+- Built-in support for TS / Rust / Go
 - Native git-blame-on-hover
 - First-class linters/formatters: oxlint, oxfmt, prettier, eslint (+ plugins)
 - In-process coding agent ("coder"): Hugging Face Inference Providers via OAuth device-flow sign-in, container-aware tools, sessions backed by an HF private bucket
-- LSP nav (Ctrl+click, alt+left/right history)
 - Multi-repo workspaces with cross-repo agent queries
 - Containerised dev shells as a first-class concept: terminal/LSP/lint/format/build run in a single per-workspace container, only explicitly forwarded ports cross to the host
 - Innovative UIs (the web is the reason we picked Tauri)
