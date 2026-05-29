@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, mount as mountComponent, unmount } from 'svelte';
 	import { diffChars } from 'diff';
 	import { EditorState, Compartment, EditorSelection, Prec, Transaction } from '@codemirror/state';
 	import { EditorView, highlightActiveLine, highlightActiveLineGutter, keymap, lineNumbers } from '@codemirror/view';
@@ -25,6 +25,10 @@
 	import { gitChangesExtension, goToNextChange, goToPreviousChange, headTextFacet } from '../editor/gitChanges';
 	import { conflictedFacet, conflictMarkersExtension } from '../editor/conflictMarkers';
 	import { workspace, type OpenFile, type SplitSide } from '../state.svelte';
+	import { ipc } from '../ipc';
+	import ContextMenu from './ContextMenu.svelte';
+	import type { ContextMenuItem } from './contextMenu';
+	import { isReviewPath } from '../util/reviewPath';
 	import { languageFor } from '../editor/language';
 	import { moonEditorTheme } from '../editor/theme';
 	import { type EditorConfig, type LspPosition } from '../protocol';
@@ -161,6 +165,7 @@
 			}
 			view?.destroy();
 			view = undefined;
+			disposeEditorMenu();
 		};
 	});
 
@@ -755,6 +760,115 @@
 		});
 	}
 
+	// Right-click menu: "Copy GitHub link" / "Copy GitHub markdown
+	// link" for the lines under the selection (or the caret line when
+	// there's no range). Reuses `ContextMenu.svelte` portaled onto
+	// `document.body` — same approach as the tab strip's menu — so the
+	// popover isn't clipped by the editor's `overflow: hidden`.
+	let editorMenu: ReturnType<typeof mountComponent> | null = null;
+	let editorMenuHost: HTMLElement | null = null;
+
+	function disposeEditorMenu() {
+		if (editorMenu) {
+			void unmount(editorMenu);
+			editorMenu = null;
+		}
+		if (editorMenuHost) {
+			editorMenuHost.remove();
+			editorMenuHost = null;
+		}
+	}
+
+	// 1-based inclusive line range under the current selection, or the
+	// caret line when nothing is selected. Same off-by-one snap as
+	// `publishSelection` so a drag ending at a line start doesn't
+	// over-count.
+	function selectedLineRange(v: EditorView): { startLine: number; endLine: number } {
+		const sel = v.state.selection.main;
+		const fromLine = v.state.doc.lineAt(sel.from);
+		const toLine = v.state.doc.lineAt(sel.to);
+		const endLine = sel.to === toLine.from && toLine.number > fromLine.number ? toLine.number - 1 : toLine.number;
+		return { startLine: fromLine.number, endLine };
+	}
+
+	async function copyToClipboard(text: string, label: string) {
+		try {
+			await navigator.clipboard.writeText(text);
+			workspace.flash(`Copied ${label}`);
+		} catch {
+			workspace.flash(`Could not copy ${label}`);
+		}
+	}
+
+	async function copyPermalink(form: 'url' | 'markdown') {
+		if (view === undefined || currentPath === null) {
+			return;
+		}
+		const { startLine, endLine } = selectedLineRange(view);
+		const label = form === 'markdown' ? 'GitHub markdown link' : 'GitHub link';
+		try {
+			const link = await ipc.fs.gitPermalink(currentPath, startLine, endLine);
+			if (link === null) {
+				workspace.flash('No GitHub link (not a GitHub repo or no commits)');
+				return;
+			}
+			await copyToClipboard(form === 'markdown' ? link.markdown : link.url, label);
+		} catch {
+			workspace.flash(`Could not copy ${label}`);
+		}
+	}
+
+	function openEditorMenu(event: MouseEvent) {
+		// Only our own actions; let the platform menu through for
+		// untitled / external / review buffers where a permalink makes
+		// no sense.
+		if (currentPath === null || file.isUntitled || file.isExternal || isReviewPath(file.path)) {
+			return;
+		}
+		event.preventDefault();
+		disposeEditorMenu();
+
+		const items: ContextMenuItem[] = [
+			{
+				id: 'copy-github-link',
+				label: 'Copy GitHub link',
+				onSelect: () => {
+					void copyPermalink('url');
+				},
+			},
+			{
+				id: 'copy-github-markdown-link',
+				label: 'Copy GitHub markdown link',
+				onSelect: () => {
+					void copyPermalink('markdown');
+				},
+			},
+		];
+
+		const menuHost = document.createElement('div');
+		menuHost.setAttribute('data-editor-context-menu-root', 'true');
+		menuHost.style.position = 'fixed';
+		menuHost.style.top = '0';
+		menuHost.style.left = '0';
+		menuHost.style.width = '0';
+		menuHost.style.height = '0';
+		menuHost.style.zIndex = '9999';
+		document.body.appendChild(menuHost);
+
+		const anchorRect = { left: event.clientX, top: event.clientY, width: 0, height: 0 };
+		editorMenu = mountComponent(ContextMenu, {
+			target: menuHost,
+			props: {
+				items,
+				anchorRect,
+				onClose: () => {
+					disposeEditorMenu();
+				},
+			},
+		});
+		editorMenuHost = menuHost;
+	}
+
 	// CM offset → LSP position. Line numbers are 0-indexed in LSP /
 	// the protocol; CM's `line(n)` is 1-indexed, so we subtract.
 	// Character is UTF-16 codeunits from line start — matches both
@@ -846,7 +960,8 @@
 	}
 </script>
 
-<div class="editor" bind:this={host}></div>
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div class="editor" bind:this={host} oncontextmenu={openEditorMenu}></div>
 
 <style>
 	.editor {

@@ -102,6 +102,10 @@ Different jobs, different tools:
 
 The split matters because Pierre Diffs is display-only — forcing it to also edit would either duplicate CM's work or give us a second inferior editor. Keeping CM for every editable surface keeps "what works in the main editor" identical to "what works in the conflict editor".
 
+### Editor context menu
+
+Right-clicking inside the main `Editor` opens a small `ContextMenu.svelte` popover (the same component the tab strip and file tree use, portaled onto `document.body` so it isn't clipped by the editor's `overflow: hidden`). Today it carries two actions — **Copy GitHub link** and **Copy GitHub markdown link** — both operating on the lines under the current selection (or the caret line when nothing is selected). They route through `ipc.fs.gitPermalink` → `WorkspaceHost::git_permalink`, which builds a `github.com/<owner>/<repo>/blob/<HEAD-sha>/<path>#L<a>-L<b>` permalink pinned to the current commit SHA (so the link is stable across later commits, matching GitHub's own "Copy permalink"). The menu is suppressed for untitled / external / `review://` buffers — a permalink makes no sense there, so the platform menu shows instead. See [test plan 0091](test-plans/0091-editor-github-permalink.md).
+
 ### LSP hook
 
 Planned shape (not yet built): a per-file `ViewPlugin` subscribes to moon-core's LSP broker (one adapter per capability — hover, go-to-def, diagnostics, completions). The adapter translates LSP events into CM's `hoverTooltip`, `gotoDefinition` command, `setDiagnostics` effect, and `autocompletion` source respectively. Nothing goes to the UI that didn't come through moon-core — no direct LSP process ownership on the frontend.

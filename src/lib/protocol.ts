@@ -346,6 +346,16 @@ export type GitCommitResult = {
 };
 
 /**
+ * GitHub permalink (plain URL + Markdown form) for a path + line
+ * range, pinned to the current HEAD commit SHA. Mirrors
+ * `moon_protocol::git::GitPermalink`.
+ */
+export type GitPermalink = {
+	url: string;
+	markdown: string;
+};
+
+/**
  * One row in the branch-switcher palette. Discriminated union over
  * `kind`: `local` runs `git switch <name>`, `pr` runs
  * `gh pr checkout <number>` so cross-fork PRs work without manual

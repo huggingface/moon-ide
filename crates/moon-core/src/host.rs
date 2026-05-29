@@ -10,7 +10,7 @@ use moon_protocol::editorconfig::EditorConfig;
 use moon_protocol::fs::{CollectPathsResult, DirEntry, EntryKind, ReadFileResult, StatResult, WriteFileResult};
 use moon_protocol::git::{
 	BranchDiffStatus, BranchList, BranchListEntry, BranchSwitchTarget, GitBranchInfo, GitCommitResult, GitFileBlame,
-	GitFileStatus, GitLineBlame, GitMergeState, GitStatusEntry, PrListScope, PrListStatus,
+	GitFileStatus, GitLineBlame, GitMergeState, GitPermalink, GitStatusEntry, PrListScope, PrListStatus,
 };
 use moon_protocol::{MoonError, MoonResult};
 use std::sync::Arc;
@@ -221,6 +221,20 @@ pub trait WorkspaceHost: Send + Sync {
 	/// support in progress but hasn't stabilised; swapping the
 	/// implementation is a contained change behind this trait method.
 	async fn git_blame(&self, path: &Utf8Path) -> MoonResult<Option<GitFileBlame>>;
+
+	/// Build a GitHub permalink for `path` spanning lines
+	/// `start_line..=end_line` (1-based, inclusive). The link pins
+	/// the current `HEAD` commit SHA (not a branch ref) so it keeps
+	/// pointing at the same bytes after later commits — matching what
+	/// GitHub's own "Copy permalink" does.
+	///
+	/// Returns `Ok(None)` for every case the UI should treat as "no
+	/// link available, grey the menu item out": the folder's
+	/// `origin` / `upstream` remote isn't a recognised host
+	/// (currently `github.com`), the repo has no commits yet, or
+	/// `git` isn't on PATH. Path containment is enforced the same way
+	/// as [`Self::git_blame`] (no absolute paths, no `..` escapes).
+	async fn git_permalink(&self, path: &Utf8Path, start_line: u32, end_line: u32) -> MoonResult<Option<GitPermalink>>;
 
 	/// Contents of `path` at `HEAD`. Used as the "before" side of the
 	/// editor's git diff view, and as the displayable text for a
@@ -1531,6 +1545,46 @@ impl WorkspaceHost for LocalHost {
 		})
 		.await
 		.map_err(|e| MoonError::Internal(format!("git_blame join error: {e}")))?
+	}
+
+	async fn git_permalink(&self, path: &Utf8Path, start_line: u32, end_line: u32) -> MoonResult<Option<GitPermalink>> {
+		// Same containment envelope as `git_blame` / `git_ref_content`:
+		// reject empty, absolute, rooted, and `..`-escaping paths. The
+		// editor never legitimately asks for a permalink outside the
+		// active folder.
+		if path.as_str().is_empty() {
+			return Ok(None);
+		}
+		let rel = Utf8PathBuf::from(path.as_str().trim_end_matches('/'));
+		if rel.is_absolute() {
+			return Err(MoonError::invalid(format!(
+				"git_permalink rejects absolute path: {rel}"
+			)));
+		}
+		let mut depth = 0i32;
+		for seg in rel.components() {
+			match seg {
+				camino::Utf8Component::ParentDir => {
+					depth -= 1;
+					if depth < 0 {
+						return Err(MoonError::invalid(format!("git_permalink rejects path escape: {rel}")));
+					}
+				}
+				camino::Utf8Component::Normal(_) => depth += 1,
+				camino::Utf8Component::CurDir => {}
+				camino::Utf8Component::Prefix(_) | camino::Utf8Component::RootDir => {
+					return Err(MoonError::invalid(format!("git_permalink rejects rooted path: {rel}")));
+				}
+			}
+		}
+		let guard = self.git_lock().await;
+		let root = self.root.clone();
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			Ok(run_git_permalink(&root, &rel, start_line, end_line))
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_permalink join error: {e}")))?
 	}
 
 	async fn git_head_content(&self, path: &Utf8Path) -> MoonResult<Option<String>> {
@@ -4071,6 +4125,48 @@ fn read_branch_upstream(root: &Utf8Path, branch: &str) -> Option<(String, String
 /// self-hosted hosts get `None` until someone wires their PR-URL
 /// convention. Matches the scope discipline in AGENTS.md: add the
 /// other platforms when a user asks.
+/// Build a GitHub permalink (URL + Markdown) for `rel` spanning
+/// `start_line..=end_line`. Returns `None` when the remote isn't a
+/// recognised host, the repo has no `HEAD` commit, or `git` is
+/// missing — every "nothing to link to" case the editor menu
+/// collapses to a disabled item.
+fn run_git_permalink(root: &Utf8Path, rel: &Utf8Path, start_line: u32, end_line: u32) -> Option<GitPermalink> {
+	use std::process::Command;
+
+	let web = remote_web_url(root)?;
+	let sha = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["rev-parse", "HEAD"])
+		.output()
+		.ok()
+		.filter(|o| o.status.success())
+		.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+		.filter(|s| !s.is_empty())?;
+
+	// Normalise the line range: clamp to >= 1 and order start <= end
+	// so a backwards drag still produces a sane fragment.
+	let lo = start_line.max(1);
+	let hi = end_line.max(lo);
+	let fragment = if lo == hi {
+		format!("L{lo}")
+	} else {
+		format!("L{lo}-L{hi}")
+	};
+
+	// Percent-encode the path so spaces / `#` / `?` in a filename
+	// don't break the URL. `encode_branch_segment` already leaves the
+	// `/` separators literal, which is exactly what we want for a
+	// nested path.
+	let encoded_path = encode_branch_segment(rel.as_str());
+
+	let url = format!("{web}/blob/{sha}/{encoded_path}#{fragment}");
+	// Link text uses the un-encoded relative path + line range: it's
+	// display text in Markdown, so readability beats URL-safety.
+	let markdown = format!("[{rel}#{fragment}]({url})");
+	Some(GitPermalink { url, markdown })
+}
+
 fn remote_web_url(root: &Utf8Path) -> Option<String> {
 	use std::process::Command;
 
@@ -5323,6 +5419,110 @@ mod tests {
 
 		let blame = host(&dir).git_blame(Utf8Path::new("x.txt")).await.unwrap().unwrap();
 		assert_eq!(blame.remote_url, "https://github.com/moon/ide");
+	}
+
+	#[tokio::test]
+	async fn git_permalink_builds_pinned_github_link() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping permalink test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		std::fs::create_dir(dir.path().join("src")).unwrap();
+		std::fs::write(dir.path().join("src/lib.rs"), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+		run_git(&git, dir.path(), &["init", "-q"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "init"]);
+		run_git(
+			&git,
+			dir.path(),
+			&["remote", "add", "origin", "git@github.com:moon/ide.git"],
+		);
+
+		// Resolve the expected HEAD SHA so we can assert the link is
+		// pinned to the commit, not a branch ref.
+		let sha = String::from_utf8(
+			std::process::Command::new(&git)
+				.arg("-C")
+				.arg(dir.path())
+				.args(["rev-parse", "HEAD"])
+				.output()
+				.unwrap()
+				.stdout,
+		)
+		.unwrap()
+		.trim()
+		.to_owned();
+
+		// Multi-line range.
+		let link = host(&dir)
+			.git_permalink(Utf8Path::new("src/lib.rs"), 1, 3)
+			.await
+			.unwrap()
+			.expect("permalink should be Some for a GitHub repo");
+		assert_eq!(
+			link.url,
+			format!("https://github.com/moon/ide/blob/{sha}/src/lib.rs#L1-L3")
+		);
+		assert_eq!(
+			link.markdown,
+			format!("[src/lib.rs#L1-L3](https://github.com/moon/ide/blob/{sha}/src/lib.rs#L1-L3)")
+		);
+
+		// Single-line range drops the `-L<end>` suffix.
+		let single = host(&dir)
+			.git_permalink(Utf8Path::new("src/lib.rs"), 2, 2)
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(
+			single.url,
+			format!("https://github.com/moon/ide/blob/{sha}/src/lib.rs#L2")
+		);
+	}
+
+	#[tokio::test]
+	async fn git_permalink_returns_none_without_github_remote() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping permalink no-remote test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		std::fs::write(dir.path().join("x.txt"), "one\n").unwrap();
+		run_git(&git, dir.path(), &["init", "-q"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		run_git(&git, dir.path(), &["add", "x.txt"]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "init"]);
+		// No remote at all → None.
+		assert!(host(&dir)
+			.git_permalink(Utf8Path::new("x.txt"), 1, 1)
+			.await
+			.unwrap()
+			.is_none());
+		// A non-GitHub remote → still None.
+		run_git(
+			&git,
+			dir.path(),
+			&["remote", "add", "origin", "https://gitlab.com/moon/ide.git"],
+		);
+		assert!(host(&dir)
+			.git_permalink(Utf8Path::new("x.txt"), 1, 1)
+			.await
+			.unwrap()
+			.is_none());
+	}
+
+	#[tokio::test]
+	async fn git_permalink_rejects_path_escapes() {
+		let dir = TempDir::new().unwrap();
+		let err = host(&dir)
+			.git_permalink(Utf8Path::new("../secret.txt"), 1, 1)
+			.await
+			.unwrap_err();
+		assert!(matches!(err, MoonError::InvalidArgument(_)), "got {err:?}");
 	}
 
 	#[test]

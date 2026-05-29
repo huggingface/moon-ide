@@ -457,6 +457,30 @@ pub struct GitCommitResult {
 	pub summary: String,
 }
 
+/// A GitHub permalink for a path + line range, ready to paste into
+/// a PR comment, issue, or chat. Built from the active folder's
+/// `origin` / `upstream` remote and the current `HEAD` commit SHA,
+/// so the link survives later commits (the SHA pins the blob, not a
+/// branch ref that moves under it). `None` is returned when the
+/// folder isn't a GitHub-remote repo, has no commits yet, or `git`
+/// itself isn't on PATH — the editor's "Copy GitHub link" menu
+/// items go disabled in that case.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPermalink {
+	/// Plain URL — `https://github.com/<owner>/<repo>/blob/<sha>/<path>#L<start>(-L<end>)`.
+	/// Single-line selections drop the `-L<end>` suffix to match
+	/// what GitHub's own "Copy permalink" produces.
+	pub url: String,
+	/// Markdown form: `[<path>#L<start>(-L<end>)](<url>)`. The link
+	/// text is the workspace-relative path plus the line range so a
+	/// pasted reference reads sensibly even before the reader
+	/// follows it. GitHub renders this as a clickable line-range
+	/// link in PRs / issues / comments.
+	pub markdown: String,
+}
+
 /// Per-file blame report, one entry per source line. Indexing is
 /// 0-based so it lines up directly with CM's `doc.line(n + 1)`
 /// accessor; empty trailing lines (the "no-newline-at-EOF" corner

@@ -3,7 +3,7 @@ use moon_core::{read_host_file, write_host_file};
 use moon_protocol::fs::{CollectPathsResult, DirEntry, ReadFileResult, StatResult, WriteFileResult};
 use moon_protocol::git::{
 	BranchDiffStatus, BranchList, BranchSwitchTarget, GitBranchInfo, GitChangeSummary, GitCommitResult, GitFileBlame,
-	GitFileStatus, GitMergeState, GitStatusEntry, PrListScope,
+	GitFileStatus, GitMergeState, GitPermalink, GitStatusEntry, PrListScope,
 };
 use moon_protocol::MoonError;
 use tauri::State;
@@ -260,6 +260,24 @@ pub async fn fs_git_blame(state: State<'_, AppState>, path: String) -> Result<Op
 	let entry = state.workspaces.require_active_folder().await?;
 	let path = Utf8PathBuf::from(path);
 	entry.host.git_blame(&path).await
+}
+
+/// GitHub permalink (URL + Markdown) for `path` over the inclusive,
+/// 1-based line range `start_line..=end_line`. Pins the current
+/// `HEAD` commit SHA so the link survives later commits. Returns
+/// `None` (serialised as `null`) when the folder isn't a GitHub-remote
+/// repo, has no commits, or `git` isn't available — the editor's
+/// "Copy GitHub link" menu items grey out in that case.
+#[tauri::command]
+pub async fn fs_git_permalink(
+	state: State<'_, AppState>,
+	path: String,
+	start_line: u32,
+	end_line: u32,
+) -> Result<Option<GitPermalink>, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	let path = Utf8PathBuf::from(path);
+	entry.host.git_permalink(&path, start_line, end_line).await
 }
 
 /// `HEAD` content for `path`. Feeds the "before" side of the editor's
