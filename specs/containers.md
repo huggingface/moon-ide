@@ -590,6 +590,17 @@ look frozen for the ~10s of SIGTERM grace period; the actual
 stops run in a background tokio task off the Tauri event
 loop, and the process calls `app.exit(0)` once they finish.
 
+The single-instance lock is released **before** that compose
+teardown, not after: the background task first aborts the
+focus-socket listener (dropping its `UnixListener`) and unlinks
+`instance.sock`, then runs `stop_all`. Order matters because the
+listener keeps accepting connections until its task is dropped,
+so a relaunch that fires during the multi-second teardown would
+otherwise `probe_alive`-connect successfully and wrongly report
+the workspace as still in use. See
+[`crate::focus_socket::cleanup`](../src-tauri/src/focus_socket.rs)
+and the `RunEvent::ExitRequested` hook in `src-tauri/src/lib.rs`.
+
 This makes the IDE the **command centre** for everything it
 spawned. The user's mental model is "I closed moon-ide,
 nothing should be using my CPU and RAM that I can't see in

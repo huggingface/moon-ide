@@ -281,13 +281,13 @@ pub fn run() {
 			// pending edits share one map (see
 			// `crate::focus_socket::EditorRegistry`).
 			let editor_registry = std::sync::Arc::new(focus_socket::EditorRegistry::new());
-			if let Some(listener) = listener {
+			let focus_listener_abort = listener.map(|listener| {
 				focus_socket::spawn_focus_listener(
 					listener,
 					app.handle().clone(),
 					std::sync::Arc::clone(&editor_registry),
-				);
-			}
+				)
+			});
 			app.manage(editor_registry);
 
 			let workspace_id = match &mode {
@@ -477,6 +477,9 @@ pub fn run() {
 				mode.clone(),
 				logs,
 			);
+			if let Some(abort) = focus_listener_abort {
+				*state.focus_listener.blocking_lock() = Some(abort);
+			}
 
 			// Live OS colour-scheme tracking (Linux only — on macOS
 			// and Windows the webview's own `onThemeChanged` fires).
@@ -538,10 +541,23 @@ pub fn run() {
 				let app_handle = app.clone();
 				tauri::async_runtime::spawn(async move {
 					let state = app_handle.state::<AppState>();
-					shutdown::stop_all(&state).await;
+					// Release the single-instance lock *first*. Aborting
+					// the listener task drops its `UnixListener` (closing
+					// the listening fd) and unlinking the socket file
+					// removes the path; together they make a concurrent
+					// relaunch's `probe_alive` connect fail immediately.
+					// If this ran after `stop_all` instead, the listener
+					// would keep accepting connections for the whole
+					// (multi-second) compose/LSP teardown window and a
+					// relaunch would wrongly report the workspace as still
+					// in use.
+					if let Some(abort) = state.focus_listener.lock().await.take() {
+						abort.abort();
+					}
 					if let Some(id) = state.workspace_id() {
 						focus_socket::cleanup(&state.workspaces_dir, id).await;
 					}
+					shutdown::stop_all(&state).await;
 					app_handle.exit(0);
 				});
 			}

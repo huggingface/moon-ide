@@ -234,8 +234,12 @@ pub async fn send_focus(workspaces_dir: &Utf8Path, slug: &str) -> std::io::Resul
 ///   emits the `editor:request` Tauri event, and parks the
 ///   connection until the matching `resolve` call comes back
 ///   from the frontend.
-pub fn spawn_focus_listener(listener: UnixListener, app: AppHandle, registry: Arc<EditorRegistry>) {
-	tauri::async_runtime::spawn(async move {
+pub fn spawn_focus_listener(
+	listener: UnixListener,
+	app: AppHandle,
+	registry: Arc<EditorRegistry>,
+) -> tokio::task::AbortHandle {
+	let task = tokio::spawn(async move {
 		loop {
 			match listener.accept().await {
 				Ok((stream, _addr)) => {
@@ -254,6 +258,7 @@ pub fn spawn_focus_listener(listener: UnixListener, app: AppHandle, registry: Ar
 			}
 		}
 	});
+	task.abort_handle()
 }
 
 async fn handle_connection(mut stream: UnixStream, app: AppHandle, registry: Arc<EditorRegistry>) {
@@ -374,8 +379,11 @@ fn focus_main_window(app: &AppHandle) {
 }
 
 /// Best-effort cleanup: unlink the socket file. Called from the
-/// process's exit path so a clean shutdown leaves no stale
-/// file. Crashes still leave the file, but `try_bind` recovers.
+/// process's exit path — *before* the slower `stop_all` teardown
+/// and after the listener task is aborted — so a clean shutdown
+/// drops the single-instance lock immediately and a concurrent
+/// relaunch doesn't see the workspace as still in use. Crashes
+/// still leave the file, but `try_bind` recovers.
 pub async fn cleanup(workspaces_dir: &Utf8Path, slug: &str) {
 	let path = socket_path(workspaces_dir, slug);
 	if let Err(err) = tokio::fs::remove_file(&path).await {

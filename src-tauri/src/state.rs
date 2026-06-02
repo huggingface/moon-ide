@@ -65,6 +65,14 @@ pub struct AppState {
 	/// facing breadcrumbs are available in the bottom-panel
 	/// logs view instead of only in launcher stderr.
 	pub logs: Arc<LogSink>,
+	/// Abort handle for the per-workspace focus-socket listener
+	/// task (see [`crate::focus_socket::spawn_focus_listener`]).
+	/// Held so shutdown can drop the listening `UnixListener`
+	/// *before* the slow `stop_all` work runs — otherwise a
+	/// relaunch probing `instance.sock` connects successfully
+	/// for the whole shutdown window and reports the workspace
+	/// as still in use. `None` in preboot mode (no socket bound).
+	pub focus_listener: Mutex<Option<AbortHandle>>,
 }
 
 /// What this process is doing. Picked once at startup based on
@@ -135,6 +143,7 @@ impl AppState {
 			next_edit_server: Arc::new(NextEditServerSupervisor::default()),
 			mode,
 			logs,
+			focus_listener: Mutex::new(None),
 		}
 	}
 
