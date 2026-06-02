@@ -34,6 +34,8 @@
 	import FileIcon from './icons/FileIcon.svelte';
 	import TrashIcon from './icons/TrashIcon.svelte';
 	import CodeIcon from './icons/CodeIcon.svelte';
+	import RevertIcon from './icons/RevertIcon.svelte';
+	import EditIcon from './icons/EditIcon.svelte';
 	import { ipc } from '../ipc';
 	import { formatError, type FileSearchResult } from '../protocol';
 	import { textInputUndo } from '../actions/textInputUndo';
@@ -939,6 +941,33 @@
 		await coder.deleteSession(id);
 	}
 
+	/** Revert the visible session back to just before the user
+	 *  message with `rowId`, discarding it and everything after.
+	 *  Confirmed because it's a destructive rewrite of the on-disk
+	 *  transcript. */
+	async function onRevertToMessage(rowId: string): Promise<void> {
+		const ok = await confirm('Revert to this message? Everything after it will be permanently removed.', {
+			title: 'Revert session',
+			kind: 'warning',
+		});
+		if (!ok) {
+			return;
+		}
+		await coder.revertToMessage(rowId, { resend: false });
+	}
+
+	/** Drop the user message with `rowId` (and everything after)
+	 *  off the transcript and load its text back into the composer
+	 *  so the user can tweak it and re-send. No confirm dialog: the
+	 *  text isn't lost (it lands in the composer), and the gesture
+	 *  reads as "edit", which a modal would make feel heavier than
+	 *  it is. */
+	async function onEditAndResend(rowId: string): Promise<void> {
+		await coder.revertToMessage(rowId, { resend: true });
+		await tick();
+		composer?.focus();
+	}
+
 	/** Open a session's raw JSONL trace in the editor as a host-direct
 	 *  file (same machinery as Ctrl+O for files outside the workspace).
 	 *  Works for parent sessions and sub-agent ids alike — both live
@@ -1597,6 +1626,29 @@
 						class="queued-tag"
 						title="Waiting for the current turn to finish. Press ↑ on an empty composer to pull it back.">queued</span
 					>{/if}
+				{#if !row.queued && !coder.busy}
+					<!-- Hover-revealed revert affordances. Hidden while a
+							 turn runs (the backend refuses mid-turn) and on
+							 queued steers (not yet on disk, so no ordinal). -->
+					<span class="row-actions">
+						<button
+							type="button"
+							class="row-action"
+							title="Edit & resend — load this message back into the composer and drop everything after it"
+							onclick={() => onEditAndResend(row.id)}
+						>
+							<EditIcon size={12} />
+						</button>
+						<button
+							type="button"
+							class="row-action"
+							title="Revert to here — permanently remove this message and everything after it"
+							onclick={() => onRevertToMessage(row.id)}
+						>
+							<RevertIcon size={12} />
+						</button>
+					</span>
+				{/if}
 			</div>
 			{#if parsed.prose.trim().length > 0}
 				<div class="bubble">{parsed.prose}</div>
@@ -2367,10 +2419,42 @@
 		text-align: center;
 	}
 	.row-label {
+		display: flex;
+		align-items: center;
+		gap: 6px;
 		font-size: 10px;
 		text-transform: uppercase;
 		letter-spacing: 0.06em;
 		color: var(--m-fg-subtle);
+	}
+	.row-actions {
+		display: inline-flex;
+		align-items: center;
+		gap: 2px;
+		/* Revealed on row hover / keyboard focus so the label
+			 stays uncluttered at rest. */
+		opacity: 0;
+		transition: opacity 0.1s ease;
+	}
+	.row.user:hover .row-actions,
+	.row-actions:focus-within {
+		opacity: 1;
+	}
+	.row-action {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		padding: 2px;
+		border: none;
+		border-radius: 4px;
+		background: transparent;
+		color: var(--m-fg-subtle);
+		cursor: pointer;
+		line-height: 0;
+	}
+	.row-action:hover {
+		background: var(--m-bg-overlay);
+		color: var(--m-fg);
 	}
 	.bubble {
 		font-size: 13px;

@@ -1355,6 +1355,16 @@ export type UnqueuedSteer = {
 	images?: ImageAttachmentPayload[];
 };
 
+/** Return shape of `coder_revert_to_message`. Carries the dropped
+ *  user prompt (text + pasted images) so an "edit & resend" can
+ *  prefill the composer; a plain "revert to here" ignores it. The
+ *  trimmed transcript itself arrives as `coder:event` replay, not
+ *  in this payload. Mirrors `moon_coder::RevertedMessage`. */
+export type RevertedMessage = {
+	text: string;
+	images?: ImageAttachmentPayload[];
+};
+
 /** Snapshot returned by `coder_status`. Mirrors `moon_coder::CoderStatus`. */
 export type CoderStatus = {
 	signed_in: boolean;

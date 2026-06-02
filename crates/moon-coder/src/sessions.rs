@@ -1640,6 +1640,93 @@ async fn try_fold_usage_into_last_assistant(path: &Utf8Path, usage: &SessionReco
 	Ok(true)
 }
 
+/// Rewrite a session's JSONL to drop the `user_ordinal`-th user
+/// prompt and everything after it, powering the panel's "revert
+/// to this message" / "edit and resend" affordances.
+///
+/// `user_ordinal` is 0-based over [`SessionRecord::User`] records
+/// in transcript order — the same order the panel renders its
+/// `user` rows, so the Nth user bubble maps to the Nth user
+/// record without needing a stable per-message id on disk (the
+/// runner mints those fresh on every replay). Steers count as
+/// user records, matching how they render.
+///
+/// Returns the dropped user prompt (`text` + `images`) so the
+/// caller can prefill the composer for an edit-and-resend, plus
+/// the surviving records so the runner can rebuild its in-memory
+/// `messages` without a second disk read. Errors with
+/// [`CoderError::Internal`] when `user_ordinal` is out of range
+/// (no such user record) or the file doesn't exist.
+///
+/// The file is rewritten from the header plus the surviving
+/// records re-serialised one line each. Folded `usage` blocks
+/// come back off [`load`] as stand-alone [`SessionRecord::Usage`]
+/// records, so re-serialising them stand-alone round-trips
+/// cleanly through the next [`load`].
+#[derive(Debug)]
+pub struct RevertResult {
+	pub dropped_text: String,
+	pub dropped_images: Vec<crate::inference::ImageAttachment>,
+	pub surviving: Vec<SessionRecord>,
+}
+
+pub async fn truncate_before_user_record(
+	dir: &Utf8Path,
+	header: &SessionHeader,
+	user_ordinal: usize,
+) -> Result<RevertResult, CoderError> {
+	let path = session_path(dir, &header.id);
+	if !tokio::fs::try_exists(path.as_std_path()).await.unwrap_or(false) {
+		return Err(CoderError::Internal(
+			"session has no on-disk transcript to revert".into(),
+		));
+	}
+	let LoadedSession { records, .. } = load(dir, &header.id).await?;
+
+	let mut seen = 0usize;
+	let mut cut: Option<usize> = None;
+	for (idx, record) in records.iter().enumerate() {
+		if matches!(record, SessionRecord::User { .. }) {
+			if seen == user_ordinal {
+				cut = Some(idx);
+				break;
+			}
+			seen += 1;
+		}
+	}
+	let Some(cut) = cut else {
+		return Err(CoderError::Internal(format!(
+			"revert target out of range: session has {seen} user message(s), asked for #{user_ordinal}"
+		)));
+	};
+
+	let (dropped_text, dropped_images) = match &records[cut] {
+		SessionRecord::User { text, images } => (text.clone(), images.clone()),
+		// Unreachable: `cut` was chosen on a `User` match above.
+		_ => (String::new(), Vec::new()),
+	};
+
+	let surviving: Vec<SessionRecord> = records.into_iter().take(cut).collect();
+
+	let mut out = String::new();
+	out.push_str(&serde_json::to_string(header).map_err(CoderError::from)?);
+	out.push('\n');
+	for record in &surviving {
+		let wire = record_to_pi_wire(record, header);
+		out.push_str(&serde_json::to_string(&wire).map_err(CoderError::from)?);
+		out.push('\n');
+	}
+	tokio::fs::write(path.as_std_path(), out.as_bytes())
+		.await
+		.map_err(CoderError::from)?;
+
+	Ok(RevertResult {
+		dropped_text,
+		dropped_images,
+		surviving,
+	})
+}
+
 /// Delete a session file plus its sub-agent subdirectory (if any).
 /// Idempotent — a missing file or subdir is not an error so the
 /// UI's "delete then refresh" flow is well-defined even when two
@@ -2901,5 +2988,88 @@ mod tests {
 			}
 			other => panic!("expected Assistant, got {other:?}"),
 		}
+	}
+
+	/// Build a two-turn transcript on disk and return its dir +
+	/// header. Turn 1: user "first" → assistant. Turn 2: user
+	/// "second" → assistant. Used by the revert tests below.
+	async fn make_two_turn_session(id: &str) -> (tempfile::TempDir, Utf8PathBuf, SessionHeader) {
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let header = make_test_header(id);
+		for (user, assistant) in [("first", "reply-1"), ("second", "reply-2")] {
+			append_record(
+				&dir,
+				&header,
+				&SessionRecord::User {
+					text: user.into(),
+					images: Vec::new(),
+				},
+			)
+			.await
+			.unwrap();
+			append_record(
+				&dir,
+				&header,
+				&SessionRecord::Assistant {
+					content: Some(assistant.into()),
+					thinking: None,
+					tool_calls: Vec::new(),
+					model: None,
+				},
+			)
+			.await
+			.unwrap();
+		}
+		(tmp, dir, header)
+	}
+
+	#[tokio::test]
+	async fn truncate_before_user_record_drops_second_turn() {
+		let (_tmp, dir, header) = make_two_turn_session("sess-revert").await;
+		// Revert to the second user message (ordinal 1): keep
+		// turn 1 (user + assistant), drop turn 2.
+		let result = truncate_before_user_record(&dir, &header, 1).await.unwrap();
+		assert_eq!(result.dropped_text, "second");
+		assert_eq!(result.surviving.len(), 2);
+
+		let reloaded = load(&dir, "sess-revert").await.unwrap();
+		assert_eq!(reloaded.records.len(), 2);
+		assert!(matches!(&reloaded.records[0], SessionRecord::User { text, .. } if text == "first"));
+		assert!(
+			matches!(&reloaded.records[1], SessionRecord::Assistant { content, .. } if content.as_deref() == Some("reply-1"))
+		);
+		// Header is preserved verbatim.
+		assert_eq!(reloaded.header.id, "sess-revert");
+	}
+
+	#[tokio::test]
+	async fn truncate_before_user_record_first_message_empties_transcript() {
+		let (_tmp, dir, header) = make_two_turn_session("sess-revert-all").await;
+		let result = truncate_before_user_record(&dir, &header, 0).await.unwrap();
+		assert_eq!(result.dropped_text, "first");
+		assert!(result.surviving.is_empty());
+
+		let reloaded = load(&dir, "sess-revert-all").await.unwrap();
+		assert!(reloaded.records.is_empty());
+		// The file still exists with just its header line, so a
+		// subsequent send appends rather than re-writing a header.
+		assert!(
+			tokio::fs::try_exists(session_path(&dir, "sess-revert-all").as_std_path())
+				.await
+				.unwrap()
+		);
+	}
+
+	#[tokio::test]
+	async fn truncate_before_user_record_rejects_out_of_range() {
+		let (_tmp, dir, header) = make_two_turn_session("sess-revert-oob").await;
+		// Only 2 user messages (ordinals 0, 1); ordinal 2 is out
+		// of range.
+		let err = truncate_before_user_record(&dir, &header, 2).await.unwrap_err();
+		assert!(matches!(err, CoderError::Internal(_)), "got {err:?}");
+		// The transcript is untouched on the error path.
+		let reloaded = load(&dir, "sess-revert-oob").await.unwrap();
+		assert_eq!(reloaded.records.len(), 4);
 	}
 }

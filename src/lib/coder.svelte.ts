@@ -1870,6 +1870,58 @@ class CoderPanelState {
 		}
 	}
 
+	/** Map a user row's stable id to its 0-based ordinal among
+	 *  the transcript's user messages — the anchor the backend's
+	 *  `coder_revert_to_message` expects. Counts only non-queued
+	 *  user rows: a queued steer isn't persisted yet, so the
+	 *  backend's `User`-record count doesn't include it. Returns
+	 *  `null` when the id isn't a (non-queued) user row. */
+	#userOrdinalForRow(rowId: string): number | null {
+		let ordinal = 0;
+		for (const row of this.rows) {
+			if (row.kind !== 'user' || row.queued) {
+				continue;
+			}
+			if (row.id === rowId) {
+				return ordinal;
+			}
+			ordinal += 1;
+		}
+		return null;
+	}
+
+	/** Revert the visible session to just before the user message
+	 *  with `rowId`, dropping it and everything after it from both
+	 *  disk and the in-memory history. When `resend` is true the
+	 *  dropped prompt is dropped back into the composer (focus
+	 *  handled by the caller) so the user can edit and re-send;
+	 *  otherwise it's discarded. Refused by the backend mid-turn —
+	 *  the panel also hides the affordance while busy. The trimmed
+	 *  transcript repaints from the `open_session` replay the
+	 *  backend fires, so we don't touch `rows` here. */
+	async revertToMessage(rowId: string, options: { resend: boolean }): Promise<void> {
+		const ordinal = this.#userOrdinalForRow(rowId);
+		if (ordinal === null) {
+			return;
+		}
+		try {
+			const dropped = await ipc.coder.revertToMessage(ordinal);
+			if (options.resend) {
+				this.draft = dropped.text;
+			}
+			await this.refreshSessions();
+		} catch (err) {
+			this.rows = [
+				...this.rows,
+				{
+					kind: 'error',
+					id: `local-${Date.now()}`,
+					text: formatError(err),
+				},
+			];
+		}
+	}
+
 	async abort(): Promise<void> {
 		try {
 			await ipc.coder.abort();

@@ -1376,6 +1376,67 @@ impl CoderHandle {
 		forced
 	}
 
+	/// Revert the active folder's visible session back to just
+	/// before its `user_ordinal`-th user message, dropping that
+	/// message and everything that followed from both the on-disk
+	/// JSONL and the in-memory chat history.
+	///
+	/// `user_ordinal` is 0-based over the session's user messages
+	/// in transcript order — the same order the panel renders its
+	/// `user` rows. Steers count, matching how they render. The
+	/// runner mints fresh per-message ids on every replay, so the
+	/// ordinal (not a row id) is the reload-stable anchor.
+	///
+	/// Powers two panel affordances: "revert to here" (the user
+	/// discards the dropped text) and "edit & resend" (the panel
+	/// drops the returned text into the composer for the user to
+	/// tweak and re-send). The returned [`RevertedMessage`] carries
+	/// the dropped prompt for the latter; the former ignores it.
+	///
+	/// Refuses while the visible session's turn is in flight — the
+	/// transcript is being actively appended to and rewriting it
+	/// underneath the running loop would corrupt the next
+	/// iteration. The panel disables the affordance during a turn;
+	/// this is the backend belt-and-braces.
+	///
+	/// Implementation reuses [`Coder::open_session`] for the
+	/// reload: after the disk truncation we drop the mounted
+	/// runtime so `open_session` rebuilds the in-memory `Session`
+	/// from the now-shorter JSONL and replays the trimmed
+	/// transcript to the panel through the existing event path.
+	pub async fn revert_to_message(&self, user_ordinal: usize) -> Result<RevertedMessage, CoderError> {
+		let (rt, session_id, folder_path) = self.state.active_visible_runtime().await?;
+		// Refuse mid-turn — see doc comment. Checked under the
+		// turn lock so a concurrent `send` can't slip a turn in
+		// between the check and the truncation.
+		{
+			let turn = rt.turn.lock().await;
+			if turn.cancel.is_some() {
+				return Err(CoderError::Internal(
+					"cannot revert while a turn is running; stop it first".into(),
+				));
+			}
+		}
+		let header = rt.session.lock().await.header.clone();
+		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
+		let reverted = sessions::truncate_before_user_record(&dir, &header, user_ordinal).await?;
+
+		// Drop the mounted runtime so `open_session` takes its
+		// rebuild-from-disk path (the fast-path otherwise leaves
+		// the stale in-memory `messages` untouched). Any turn is
+		// already known-absent from the check above.
+		{
+			let (fs, _) = self.state.active_folder_session().await?;
+			fs.runtimes.write().await.remove(&session_id);
+		}
+		self.open_session(session_id).await?;
+
+		Ok(RevertedMessage {
+			text: reverted.dropped_text,
+			images: reverted.dropped_images,
+		})
+	}
+
 	/// Make the persisted session identified by `id` the visible
 	/// one under the active workspace folder. Replays the JSONL
 	/// records as live events so the panel's existing event
@@ -2032,6 +2093,16 @@ impl CoderHandle {
 /// Tauri command boundary in the obvious shape.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UnqueuedSteer {
+	pub text: String,
+	#[serde(default)]
+	pub images: Vec<ImageAttachment>,
+}
+
+/// Result of [`Coder::revert_to_message`] — the dropped user
+/// prompt, handed back so an "edit & resend" can prefill the
+/// composer. A plain "revert to here" ignores it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RevertedMessage {
 	pub text: String,
 	#[serde(default)]
 	pub images: Vec<ImageAttachment>,

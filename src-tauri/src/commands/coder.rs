@@ -6,7 +6,9 @@
 //! `specs/test-plans/0039-coder-skeleton.md`.
 
 use camino::Utf8PathBuf;
-use moon_coder::{CoderHandle, CoderStatus, DeviceCode, HfIdentity, ImageAttachment, SessionSummary, UnqueuedSteer};
+use moon_coder::{
+	CoderHandle, CoderStatus, DeviceCode, HfIdentity, ImageAttachment, RevertedMessage, SessionSummary, UnqueuedSteer,
+};
 use moon_core::app_state as app_state_store;
 use moon_core::session as core_session;
 use moon_protocol::coder_hub::{CoderHubBucket, HubNamespace, HubUploadAllSummary};
@@ -232,6 +234,28 @@ pub async fn coder_abort(state: State<'_, AppState>) -> Result<(), MoonError> {
 #[tauri::command]
 pub async fn coder_unqueue_steer(state: State<'_, AppState>, id: String) -> Result<Option<UnqueuedSteer>, MoonError> {
 	Ok(state.coder.unqueue_steer(&id).await)
+}
+
+/// Revert the active folder's visible session to just before its
+/// `user_ordinal`-th user message (0-based, in transcript order),
+/// dropping that message and everything after it from both disk
+/// and the in-memory chat history. Returns the dropped prompt so
+/// the panel's "edit & resend" can prefill the composer; a plain
+/// "revert to here" ignores the payload. The backend re-emits the
+/// trimmed transcript on the `coder:event` channel via the
+/// `open_session` reload path, so the panel rebuilds its rows from
+/// those events rather than from the return value. Refuses while a
+/// turn is in flight.
+#[tauri::command]
+pub async fn coder_revert_to_message(
+	state: State<'_, AppState>,
+	user_ordinal: usize,
+) -> Result<RevertedMessage, MoonError> {
+	state
+		.coder
+		.revert_to_message(user_ordinal)
+		.await
+		.map_err(MoonError::from)
 }
 
 /// List persisted sessions for the active workspace folder. Empty
