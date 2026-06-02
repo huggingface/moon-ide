@@ -115,7 +115,7 @@ async fn detach_lsp_teardown_if_root_changed(state: &AppState, snap: &WorkspaceR
 		}
 	};
 	if let Some(old) = old_handle {
-		tokio::spawn(async move {
+		tauri::async_runtime::spawn(async move {
 			old.broker.shutdown_all().await;
 		});
 	}

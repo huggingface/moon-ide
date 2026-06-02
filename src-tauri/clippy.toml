@@ -1,0 +1,12 @@
+# Tauri's `setup` callback runs synchronously on a thread that
+# isn't bound to the Tokio runtime, so `tokio::spawn` panics
+# there with "there is no reactor running". `tauri::async_runtime::spawn`
+# routes through Tauri's global runtime handle and works in
+# both setup-time and async-command contexts. Keep one entry
+# point for the whole desktop crate so the trap can't bite a
+# fourth time. See `focus_socket::spawn_focus_listener`,
+# `slack_poller::spawn`, and `system_theme_watcher::spawn`
+# for the historical run-ins.
+disallowed-methods = [
+	{ path = "tokio::spawn", reason = "use tauri::async_runtime::spawn instead — works in setup() and async commands; tokio::spawn panics outside a runtime context" },
+]

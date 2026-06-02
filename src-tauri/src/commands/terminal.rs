@@ -70,13 +70,13 @@ pub async fn terminal_open(
 	let session = spawn(&target, request.cols, request.rows).map_err(|e| MoonError::internal(e.to_string()))?;
 
 	let registry = state.terminal_streams.clone();
-	let supervisor = tokio::spawn(supervise(app, registry.clone(), stream_id.clone(), session, cmd_rx));
+	let supervisor = tauri::async_runtime::spawn(supervise(app, registry.clone(), stream_id.clone(), session, cmd_rx));
 
 	registry.lock().await.insert(
 		stream_id.clone(),
 		TerminalStreamHandle {
 			tx: cmd_tx,
-			abort: supervisor.abort_handle(),
+			abort: supervisor.inner().abort_handle(),
 		},
 	);
 	Ok(stream_id)

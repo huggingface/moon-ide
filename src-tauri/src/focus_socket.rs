@@ -239,7 +239,15 @@ pub fn spawn_focus_listener(
 	app: AppHandle,
 	registry: Arc<EditorRegistry>,
 ) -> tokio::task::AbortHandle {
-	let task = tokio::spawn(async move {
+	// `tauri::async_runtime::spawn` rather than `tokio::spawn` —
+	// `setup` runs synchronously on a thread that isn't bound to
+	// Tokio's runtime, so a bare `tokio::spawn` panics with
+	// "there is no reactor running". Same trap the slack poller
+	// and system theme watcher have notes about. The Tauri wrapper
+	// still drops onto the same Tokio runtime; we just have to
+	// reach through `inner()` for the `AbortHandle` we cache in
+	// `AppState::focus_listener`.
+	let task = tauri::async_runtime::spawn(async move {
 		loop {
 			match listener.accept().await {
 				Ok((stream, _addr)) => {
@@ -258,7 +266,7 @@ pub fn spawn_focus_listener(
 			}
 		}
 	});
-	task.abort_handle()
+	task.inner().abort_handle()
 }
 
 async fn handle_connection(mut stream: UnixStream, app: AppHandle, registry: Arc<EditorRegistry>) {

@@ -141,7 +141,7 @@ async fn spawn_supervisor(
 
 	let app_clone = app.clone();
 	let id_for_task = stream_id.clone();
-	let supervisor = tokio::spawn(async move {
+	let supervisor = tauri::async_runtime::spawn(async move {
 		// Move the child into the task so it gets dropped (and
 		// SIGKILL'd via `kill_on_drop`) when the task is aborted
 		// from `compose_logs_close`.
@@ -155,7 +155,7 @@ async fn spawn_supervisor(
 		let stdout_task = {
 			let app = app_clone.clone();
 			let id = id_for_task.clone();
-			tokio::spawn(async move {
+			tauri::async_runtime::spawn(async move {
 				let mut lines = BufReader::new(stdout).lines();
 				while let Ok(Some(text)) = lines.next_line().await {
 					let _ = app.emit(
@@ -172,7 +172,7 @@ async fn spawn_supervisor(
 		let stderr_task = {
 			let app = app_clone.clone();
 			let id = id_for_task.clone();
-			tokio::spawn(async move {
+			tauri::async_runtime::spawn(async move {
 				let mut lines = BufReader::new(stderr).lines();
 				while let Ok(Some(text)) = lines.next_line().await {
 					let _ = app.emit(
@@ -206,5 +206,5 @@ async fn spawn_supervisor(
 		);
 	});
 
-	Ok(supervisor.abort_handle())
+	Ok(supervisor.inner().abort_handle())
 }

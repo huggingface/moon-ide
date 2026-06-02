@@ -26,8 +26,8 @@ use moon_protocol::lsp::{
 };
 use moon_protocol::MoonError;
 use moon_terminal::{container_name_for_workspace, TerminalTarget};
+use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter, State};
-use tokio::task::JoinHandle;
 
 use crate::state::AppState;
 
@@ -385,7 +385,7 @@ async fn ensure_broker(state: &AppState, app: &AppHandle) -> Result<std::sync::A
 		// (matching what `detach_lsp_teardown_if_root_changed`
 		// already does for the folder-switch entry point).
 		let old = guard.take().expect("guard.take after is_some");
-		tokio::spawn(async move {
+		tauri::async_runtime::spawn(async move {
 			old.broker.shutdown_all().await;
 		});
 	}
@@ -418,7 +418,7 @@ async fn ensure_broker(state: &AppState, app: &AppHandle) -> Result<std::sync::A
 	let broker = LspBroker::new_with_spawner(root.clone(), spawner, translator, state.logs.clone());
 	let mut rx = broker.subscribe();
 	let app_clone = app.clone();
-	let pump = tokio::spawn(async move {
+	let pump = tauri::async_runtime::spawn(async move {
 		loop {
 			match rx.recv().await {
 				Ok(LspServerEvent::Diagnostics(ev)) => {
