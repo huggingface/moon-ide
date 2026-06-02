@@ -6,6 +6,7 @@
 	import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 	import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
 	import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
+	import { searchAsYouType } from '../editor/searchAsYouType';
 	import { MergeView, diff as rawDiff } from '@codemirror/merge';
 	import { ipc } from '../ipc';
 	import { workspace, type SplitSide } from '../state.svelte';
@@ -249,6 +250,7 @@
 			foldGutter(),
 			diffPureChangeExtension,
 			highlightSelectionMatches(),
+			searchAsYouType(),
 			highlightTabs(),
 			bracketMatching(),
 			themeA.of(moonEditorTheme(workspace.effectiveTheme)),
@@ -367,6 +369,7 @@
 			diffPureChangeExtension,
 			highlightActiveLine(),
 			highlightSelectionMatches(),
+			searchAsYouType(),
 			highlightTabs(),
 			bracketMatching(),
 			themeB.of(moonEditorTheme(workspace.effectiveTheme)),

@@ -6,6 +6,7 @@
 	import { highlightTabs } from '../editor/highlightTabs';
 	import { defaultKeymap, history, historyField, historyKeymap, indentWithTab } from '@codemirror/commands';
 	import { searchKeymap, highlightSelectionMatches } from '@codemirror/search';
+	import { searchAsYouType } from '../editor/searchAsYouType';
 	import { bracketMatching, foldGutter, indentOnInput, indentUnit } from '@codemirror/language';
 	import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from '@codemirror/autocomplete';
 	import {
@@ -532,6 +533,11 @@
 			indentOnInput(),
 			history(),
 			highlightSelectionMatches(),
+			// Ctrl+F search that jumps to the first match as you type
+			// (vs. the stock panel's commit-on-Enter). Must be present
+			// so `searchKeymap`'s `openSearchPanel` uses our custom
+			// panel rather than auto-enabling the default `search()`.
+			searchAsYouType(),
 			// Deleted-file tabs (working-tree copy gone, `file.text`
 			// holds the HEAD blob captured at open time) land in the
 			// regular Editor when the user clicked their row in the

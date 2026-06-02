@@ -4,6 +4,7 @@
 	import { EditorView, highlightActiveLine, highlightActiveLineGutter, keymap, lineNumbers } from '@codemirror/view';
 	import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 	import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
+	import { searchAsYouType } from '../editor/searchAsYouType';
 	import { bracketMatching, foldGutter, indentOnInput, indentUnit } from '@codemirror/language';
 	import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from '@codemirror/autocomplete';
 	import { MergeView, diff as rawDiff, goToNextChunk, goToPreviousChunk } from '@codemirror/merge';
@@ -269,6 +270,7 @@
 			EditorState.readOnly.of(true),
 			EditorView.editable.of(false),
 			highlightSelectionMatches(),
+			searchAsYouType(),
 			highlightTabs(),
 			themeA.of(moonEditorTheme(workspace.effectiveTheme)),
 			langA.of(lang),
@@ -413,6 +415,7 @@
 			indentOnInput(),
 			history(),
 			highlightSelectionMatches(),
+			searchAsYouType(),
 			highlightTabs(),
 			...gitChangeExtensions,
 			...blameExtensions,
