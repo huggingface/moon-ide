@@ -134,6 +134,25 @@ Repeat **Setup** + step 1 to get back into a merge.
      (no markers). `git status` is clean.
    - The flash toast reads `Merge aborted.`
 
+### 4b. Finish the merge externally (terminal)
+
+Repeat **Setup** + step 1 to get back into a merge, and let the
+composer keep its `MERGE_MSG` prefill untouched.
+
+8b. From a terminal: resolve the conflict by hand
+(`git checkout --theirs conflict.txt && git add conflict.txt`)
+and run `git commit --no-edit`. Expected, within one
+fs-watcher tick: - The `Merging feature` banner disappears and the panel
+reverts to its regular shape. - **The composer empties.** The untouched `MERGE_MSG` prefill
+belonged to the merge that's now committed; it must not
+linger as a draft for the next commit.
+8c. Repeat once more, but this time **edit** the composer (type
+over the prefill) before finishing the merge in the terminal
+with `git commit --no-edit`. Expected: the panel reverts, but
+the composer keeps the bytes you typed — a user-authored
+message survives an external finish, same as it survives an
+in-app abort.
+
 ### 5. Soft-warn on residual marker text
 
 Repeat **Setup** + step 1 to get back into a merge.

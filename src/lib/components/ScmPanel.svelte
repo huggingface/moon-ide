@@ -840,9 +840,18 @@
 	$effect(() => {
 		const state = workspace.gitMergeState;
 		if (!state.inProgress) {
-			// Coming out of merge mode: drop the prefill marker
+			// Coming out of merge mode (merge committed or aborted
+			// externally — e.g. via the terminal). If the composer
+			// still holds the untouched `MERGE_MSG` prefill, clear
+			// it: that message belonged to the merge that's now
+			// gone. A user-edited message survives, mirroring the
+			// abort handler's check. Then drop the prefill marker
 			// so a later, unrelated draft change doesn't
 			// accidentally match a stale value.
+			if (mergePrefill.length > 0 && workspace.commitDraft === mergePrefill) {
+				workspace.commitDraft = '';
+				void tick().then(autoSize);
+			}
 			mergePrefill = '';
 			return;
 		}
