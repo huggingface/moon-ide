@@ -1346,6 +1346,19 @@ pub async fn list_sessions(dir: &Utf8Path) -> Result<Vec<SessionSummary>, CoderE
 /// leaving the user staring at the truncated-prompt fallback even
 /// after the rename pass finished and persisted a real title.
 ///
+/// `updated_at_ms` comes from the file's **mtime**, not the header.
+/// The transcript is append-only and the header is written once at
+/// creation, so the header's own `updated_at_ms` is frozen at
+/// first-persistence time — a session that received follow-up
+/// messages would sort back to its creation slot on reopen if we
+/// trusted it. mtime is "last write to the file", which is exactly
+/// the activity signal we want, and it's free: every `append_record`
+/// touches it. We keep the header field for the in-process live
+/// bump + re-sort (`Coder::send` / the frontend), but on a
+/// cold read from disk mtime is authoritative. Fall back to the
+/// header value if the mtime can't be converted (pre-1970 / clock
+/// skew shouldn't happen, but we don't want to crash a list-load).
+///
 /// Full-file scan is acceptable here: session files are append-only
 /// and small (typically a few hundred lines), and the list view
 /// runs once per relaunch / once per `SessionListChanged` event.
@@ -1355,6 +1368,7 @@ pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError>
 	let file = tokio::fs::File::open(path.as_std_path())
 		.await
 		.map_err(CoderError::from)?;
+	let mtime_ms = file.metadata().await.ok().as_ref().and_then(file_mtime_ms);
 	let mut reader = BufReader::new(file);
 	let mut header_line = String::new();
 	reader.read_line(&mut header_line).await.map_err(CoderError::from)?;
@@ -1388,8 +1402,23 @@ pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError>
 		id: header.id,
 		title: header.title,
 		created_at_ms: header.created_at_ms,
-		updated_at_ms: header.updated_at_ms,
+		updated_at_ms: mtime_ms.unwrap_or(header.updated_at_ms),
 	})
+}
+
+/// File mtime as unix milliseconds. The on-disk authority for a
+/// session's "last activity" — the header's own `updated_at_ms` is
+/// frozen at creation (transcript is append-only, header written
+/// once), so reopen ordering and the restored header both key off
+/// this instead. `None` only on a missing file or a pre-epoch /
+/// clock-skew mtime we can't represent, in which case callers fall
+/// back to the frozen header value.
+fn file_mtime_ms(meta: &std::fs::Metadata) -> Option<i64> {
+	meta
+		.modified()
+		.ok()
+		.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+		.and_then(|d| i64::try_from(d.as_millis()).ok())
 }
 
 /// Full read: every JSONL line into [`SessionRecord`]s.
@@ -1398,11 +1427,18 @@ pub async fn load(dir: &Utf8Path, id: &str) -> Result<LoadedSession, CoderError>
 	let file = tokio::fs::File::open(path.as_std_path())
 		.await
 		.map_err(CoderError::from)?;
+	let mtime_ms = file.metadata().await.ok().as_ref().and_then(file_mtime_ms);
 	let mut reader = BufReader::new(file);
 	let mut header_line = String::new();
 	reader.read_line(&mut header_line).await.map_err(CoderError::from)?;
 	let mut header: SessionHeader = serde_json::from_str(header_line.trim_end())
 		.map_err(|err| CoderError::decode(path.as_str(), format!("could not parse session header: {err}")))?;
+	// Override the frozen header timestamp with the file's mtime so
+	// the restored in-memory session + the `session_loaded` event
+	// agree with the sessions-list ordering (also mtime-derived).
+	if let Some(mtime_ms) = mtime_ms {
+		header.updated_at_ms = mtime_ms;
+	}
 	let mut records: Vec<SessionRecord> = Vec::new();
 	let mut line = String::new();
 	loop {
@@ -1895,6 +1931,53 @@ mod tests {
 		assert_eq!(loaded.header.bash_target_override, Some(BashTargetOverride::ForceHost));
 		// Body record survived the rewrite untouched.
 		assert_eq!(loaded.records.len(), 1);
+	}
+
+	#[tokio::test]
+	async fn summary_updated_at_tracks_file_mtime_not_frozen_header() {
+		// The header's `updated_at_ms` is frozen at creation
+		// (header written once, transcript append-only). A
+		// follow-up record bumps the file's mtime but never the
+		// header, so `load_summary` must derive recency from mtime
+		// to sort the session by real activity on reopen.
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let header = make_test_header("sess-mtime");
+		let frozen = header.updated_at_ms;
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::User {
+				text: "first".into(),
+				images: Vec::new(),
+			},
+		)
+		.await
+		.unwrap();
+
+		// A second append a few ms later advances the mtime past
+		// the frozen header value.
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::User {
+				text: "second".into(),
+				images: Vec::new(),
+			},
+		)
+		.await
+		.unwrap();
+
+		let summary = load_summary(&session_path(&dir, "sess-mtime")).await.unwrap();
+		// mtime is "now-ish", which is far past the make_test_header
+		// frozen 2023 timestamp — proves we didn't read the header.
+		assert!(
+			summary.updated_at_ms > frozen,
+			"summary updated_at_ms {} should exceed frozen header {}",
+			summary.updated_at_ms,
+			frozen
+		);
 	}
 
 	#[tokio::test]
