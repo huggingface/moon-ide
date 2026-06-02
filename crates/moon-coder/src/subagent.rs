@@ -48,7 +48,9 @@
 //!   not include `task`, so a sub-agent literally cannot spawn a
 //!   sub-sub-agent.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use moon_core::WorkspaceFolderEntry;
@@ -76,6 +78,65 @@ use crate::tools::{CoderMode, ToolContext, ToolRegistry};
 /// don't ship a second timestamp scheme.
 fn new_subagent_id() -> String {
 	format!("sub-{}", new_session_id().trim_start_matches("sess-"))
+}
+
+/// Minimum gap between auto-fetches against the same folder. A
+/// parent that fans out four `task` calls against one folder in a
+/// single assistant message should only trigger one `git fetch`,
+/// not four; and a chatty session that keeps delegating to the
+/// same sibling shouldn't re-fetch on every spawn. 5 minutes is
+/// well below any realistic "refs went stale" window while still
+/// collapsing every burst.
+const SUBAGENT_FETCH_THROTTLE: Duration = Duration::from_secs(5 * 60);
+
+/// Last successful auto-fetch dispatch time, keyed by folder root.
+/// Process-global because sub-agents across every session and
+/// folder share the throttle — the thing we're rate-limiting is
+/// "hitting a given remote", which is per-folder, not per-session.
+fn subagent_fetch_throttle() -> &'static Mutex<HashMap<String, Instant>> {
+	static MAP: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> = std::sync::OnceLock::new();
+	MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Kick off a best-effort `git fetch` against the sub-agent's
+/// target folder so a sub-agent that inspects `origin/main`
+/// (`git log origin/main`, `git diff origin/main...HEAD`, …) sees
+/// fresh remote-tracking refs rather than whatever was last
+/// fetched. Demand-driven: the human-facing active folder already
+/// has its own periodic auto-fetch loop, but a sibling folder a
+/// sub-agent is dispatched against may not have been fetched in a
+/// long time — this closes that staleness window exactly when it
+/// would otherwise bite.
+///
+/// Fire-and-forget on purpose: a fetch is up to a 30s network call
+/// (capped inside `git_fetch`) and the sub-agent's opening tool
+/// calls are almost never an `origin/main` read, so blocking the
+/// dispatch on it would add latency for no benefit. The fetch races
+/// ahead of the sub-agent's reasoning and lands before it matters.
+/// A `git fetch` only moves remote-tracking refs — never the
+/// working tree, index, or `HEAD` — so there's no conflict risk and
+/// nothing to surprise an in-flight edit. Failures (offline, no
+/// upstream, auth refused, timeout) are swallowed by `git_fetch`'s
+/// own quiet path; the sub-agent just runs against whatever refs it
+/// has, same as before this existed.
+fn kick_off_subagent_fetch(folder: &Arc<WorkspaceFolderEntry>) {
+	let root = folder.folder.path.clone();
+	{
+		let mut throttle = subagent_fetch_throttle().lock().expect("throttle map poisoned");
+		let now = Instant::now();
+		if let Some(last) = throttle.get(&root) {
+			if now.duration_since(*last) < SUBAGENT_FETCH_THROTTLE {
+				return;
+			}
+		}
+		throttle.insert(root, now);
+	}
+	let host = folder.host.clone();
+	tokio::spawn(async move {
+		if let Err(err) = host.git_fetch().await {
+			tracing::debug!(%err, "sub-agent pre-fetch failed (ignored)");
+		}
+	});
 }
 
 /// Caller-provided plan for one sub-agent run. Built by the
@@ -192,6 +253,11 @@ pub(crate) async fn run_subagent(
 		target_folder: spec.folder.folder.path.clone(),
 		mode: mode.as_wire().to_string(),
 	});
+
+	// Refresh the target folder's remote-tracking refs so a
+	// sub-agent that inspects `origin/main` sees fresh data.
+	// Fire-and-forget + per-folder throttled; see the helper.
+	kick_off_subagent_fetch(&spec.folder);
 
 	// Fresh per-turn format queue. The sub-agent's write/edit
 	// tools record into it instead of running the lint-staged
