@@ -112,6 +112,12 @@ The one-time cert-trust install is what removes the browser's
 self-signed interstitial; after it the PWA loads cleanly. It's a
 per-device ritual the team performs once, alongside pairing.
 
+Pairing is the **whole** security boundary: a paired device can
+drive the coder, which can run anything via its `bash` tool, so
+there's no point fencing the relay's method surface (same threat
+model as the desktop — `coder.md` § Permissions). What the relay
+exposes is a scope decision, not a safety one.
+
 ## App form
 
 An **installable Svelte 5 + Vite PWA**, served by the bridge over

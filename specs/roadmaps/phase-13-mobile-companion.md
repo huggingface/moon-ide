@@ -70,11 +70,12 @@ gate at the end of each sub-phase is the usual roadmap rule.
   creates it as the shared crate both `moon-bridge` and the future
   `moon-remote` consume — that is the "build the network framing
   once" payoff.
-- The workspace process gains a relay endpoint on its
-  `instance.sock` (or accepts the `moon-remote` channel) exposing
-  the read-only-plus-coder-plus-git method subset the phone needs.
-  Scope the exposed methods to the v1 surface; don't relay the full
-  IPC surface.
+- The relay wires up the methods the PWA's screens actually call
+  (coder send/abort/sessions, git status/diff/commit, workspace
+  list). Not a security fence — pairing is the boundary, and a
+  paired device can drive the coder, which can run anything via
+  `bash`. It's just scope: no point wiring + testing a relay path
+  nothing calls. Add methods as screens need them.
 - Acceptance: a host-local CLI client of the bridge can
   `coder_list_sessions` / `coder_open_session` and receive
   `coder:event` notifications for a real running workspace. No
@@ -162,10 +163,6 @@ Prose, not milestones — revisit when someone asks. Mirrors
   remote-host story hasn't started by 13.1, this phase creates the
   shared framing crate; if it has, 13.1 consumes it. Decide at 13.1
   based on what exists then.
-- **Relay method allowlist.** Exactly which methods the phone-facing
-  relay exposes (coder + git + workspace-list, read-mostly) wants a
-  concrete list in `companion.md` before 13.1, so the surface is a
-  reviewed allowlist rather than "whatever the IDE has".
 - **QR-scan vs. manual entry on the phone.** Camera QR scan via
   `getUserMedia` is the happy path; a typed `wss://…` + code
   fallback may be enough for v1 and avoids a camera-permission
