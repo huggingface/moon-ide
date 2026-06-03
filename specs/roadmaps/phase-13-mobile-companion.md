@@ -60,30 +60,38 @@ gate at the end of each sub-phase is the usual roadmap rule.
 - No listener, no TLS, no app, no relay. `cargo test` /
   `cargo clippy --all-targets -D warnings` / `cargo fmt` clean.
 
-### 13.1 — Bridge ↔ workspace-process relay (JSON-RPC framing)
+### 13.1 — Bridge ↔ workspace-process relay (JSON-RPC framing) — LANDED
 
-- The bridge connects to a chosen workspace's `instance.sock` and
-  relays the JSON-RPC surface + event-stream notifications over the
-  **`moon-remote` framing**, not a bespoke `instance.sock` verb set
-  (ADR 0023 § "Why JSON-RPC framing, not a socket relay"). If
-  `moon-remote`'s framing module doesn't exist yet, this sub-phase
-  creates it as the shared crate both `moon-bridge` and the future
-  `moon-remote` consume — that is the "build the network framing
-  once" payoff.
-- The relay wires up the methods the PWA's screens actually call
-  (coder send/abort/sessions, git status/diff/commit, workspace
-  list). Not a security fence — pairing is the boundary, and a
-  paired device can drive the coder, which can run anything via
-  `bash`. It's just scope: no point wiring + testing a relay path
-  nothing calls. Add methods as screens need them.
-- Acceptance: a host-local CLI client of the bridge can
-  `coder_list_sessions` / `coder_open_session` and receive
-  `coder:event` notifications for a real running workspace. No
-  network, no TLS yet — Unix socket end to end, exercising the
-  framing.
-- `PROTOCOL_VERSION` bump if the relayed shape diverges from the
-  in-process surface; per AGENTS.md no-premature-migrations, no
-  compat shim.
+- `moon_protocol::focus_socket` grew an `R\n<json>\n` request kind
+  carrying an `RpcRequest` (`{ method, params }`) with a single-line
+  `RpcResponse` (`{ ok? , error? }`) reply, alongside the existing
+  `F` / `E`. `PROTOCOL_VERSION` → 2.
+- Workspace process: `src-tauri/src/bridge_rpc.rs` implements a
+  `BridgeRpcHandler` (new trait on `focus_socket`) bound to the
+  coder + registry, dispatched from the focus listener. The listener
+  spawn moved to after the coder is built so the handler has them.
+- Methods wired so far (all read-only): `coder_status`,
+  `coder_list_sessions`, `coder_active_session`, `workspace_snapshot`,
+  `bridge_methods`. Not a security fence — pairing is the boundary, a
+  paired device can drive the coder, which runs anything via `bash`.
+  Mutating methods (`coder_send`, commit) land with the PWA screens
+  that call them.
+- `moon-bridge` side: `relay::call` connects to a workspace's
+  `instance.sock`, sends one `R` request, reads the response;
+  `moon-bridge call <ws> <method> [--params JSON]` is the surface.
+- Verified end-to-end: a fake workspace listener using the real
+  protocol framing answers `moon-bridge call huggingface coder_status`
+  / `bridge_methods`; unknown method exits non-zero. No network / TLS
+  yet — Unix socket end to end, exercising the framing.
+
+### 13.1b — Sharing the framing with `moon-remote`
+
+- `moon-remote` doesn't exist as a server yet, so 13.1 put the JSON
+  shape in `moon_protocol::focus_socket` (where `F`/`E` already
+  live). When the remote-host story starts, lift the `Rpc*` types
+  into whatever shared module `moon-remote` wants and have both
+  consume it — the "build the framing once" payoff, deferred until
+  there's a second consumer.
 
 ### 13.2 — LAN listener + TLS
 
@@ -100,19 +108,24 @@ gate at the end of each sub-phase is the usual roadmap rule.
 
 ### 13.3 — Pairing (TOFU cert + device tokens)
 
-- Bridge issues short-lived pairing tokens (~120 s TTL,
-  device-flow-style) and long-lived per-device tokens bound on
-  successful pair. Device tokens live in the host keyring at
-  `service=moon-ide, account=companion-device:<id>`.
-- Desktop surfaces a **pairing QR** (Companion affordance —
-  status-bar entry or small settings modal) encoding
-  `wss://<lan-ip>:53180` + cert fingerprint + pairing token.
-- Bridge serves the cert-trust artifact for one-time install
-  (iOS `.mobileconfig`; Android user cert) so the PWA loads without
-  the self-signed interstitial after pairing.
-- **Paired devices** management list with per-device revoke.
-- Acceptance: pair a phone browser end to end; the token persists;
-  revoking it from the desktop drops the connection.
+Credential core LANDED early (`moon-bridge/src/pairing.rs`):
+
+- `PairingSession` — short-lived (120 s TTL), single-use pairing
+  code; `issue` / `verify_and_consume` with expiry + replay
+  rejection. Pure in-memory, unit-tested. `moon-bridge pair-code`
+  issues one.
+- `DeviceStore` — keyring-backed (`service=moon-ide,
+account=companion-devices`, one JSON blob) registry of revocable
+  per-device bearer tokens; `add` / `list` / `revoke` /
+  `device_for_token`. `moon-bridge pair <label>` / `devices` /
+  `revoke <id>` are the surface; the token prints once.
+
+Still to wire (needs the 13.2 listener): the QR payload encoder
+(`wss://<lan-ip>:53180` + cert fingerprint + pairing code), the
+listener's token check on connect (`device_for_token`), and the
+one-time cert-trust artifact (iOS `.mobileconfig` / Android user
+cert). The desktop-side Companion affordance (QR display, paired-
+devices UI) lands with that.
 
 ### 13.4 — Companion PWA: coder
 

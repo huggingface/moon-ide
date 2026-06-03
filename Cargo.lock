@@ -3054,12 +3054,16 @@ dependencies = [
  "camino",
  "clap",
  "dirs",
+ "keyring",
  "moon-core",
  "moon-protocol",
+ "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

@@ -27,7 +27,11 @@ pub mod workspace;
 pub use error::MoonError;
 
 /// Protocol version. Bumped on breaking changes; UI and agent must match.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// v2: `focus_socket::Request` grew an `Rpc` variant + `RpcRequest` /
+/// `RpcResponse` types so `moon-bridge` (Phase 13) can reach the
+/// workspace process's coder + git surface from outside the webview.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Result alias used everywhere the protocol surfaces errors.
 pub type MoonResult<T> = std::result::Result<T, MoonError>;

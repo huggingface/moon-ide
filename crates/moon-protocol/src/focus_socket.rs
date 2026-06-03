@@ -68,6 +68,17 @@ pub enum Request {
 	/// the listener is responsible for any normalisation /
 	/// validation it cares about.
 	Edit { host_path: String },
+	/// "Invoke a method and return its result." The body is a
+	/// single-line JSON-encoded [`RpcRequest`]. Used by `moon-bridge`
+	/// (Phase 13) to reach the workspace process's coder + git
+	/// surface from outside the Tauri webview. The listener replies
+	/// with a single-line JSON [`RpcResponse`] (sent via
+	/// [`encode_rpc_response`]) and closes the connection.
+	///
+	/// The body is one line because the framing is line-oriented;
+	/// JSON never contains a literal newline unless pretty-printed,
+	/// and we always send it compact.
+	Rpc { json: String },
 }
 
 /// Reply kinds the IDE listener sends back on the same
@@ -95,6 +106,12 @@ pub enum EncodeError {
 	/// shim-side error.
 	#[error("host path contains a newline; cannot encode")]
 	NewlineInPath,
+	/// `Request::Rpc { json }` body contained a literal newline.
+	/// We always send compact JSON, so this only happens if a
+	/// caller hand-built a pretty-printed body; refuse rather than
+	/// silently break the line framing.
+	#[error("rpc body contains a newline; cannot encode")]
+	NewlineInBody,
 }
 
 /// Decoding errors. Bytes from the wire are not trusted; every
@@ -110,6 +127,12 @@ pub enum ParseError {
 	/// `E\n…` body wasn't valid UTF-8.
 	#[error("edit body was not valid utf-8: {0}")]
 	BadUtf8(#[from] std::string::FromUtf8Error),
+	/// An `R` reply line was present and complete but wasn't valid
+	/// JSON for the expected shape. Distinct from [`Truncated`] so
+	/// the reader doesn't spin waiting for more bytes that won't fix
+	/// a malformed-but-complete line.
+	#[error("rpc response body was not valid json")]
+	BadRpcJson,
 }
 
 /// Maximum bytes the listener is willing to read for one request.
@@ -131,6 +154,15 @@ pub fn encode_request(req: &Request) -> Result<Vec<u8>, EncodeError> {
 			out.push(b'E');
 			out.push(b'\n');
 			out.extend_from_slice(host_path.as_bytes());
+			out.push(b'\n');
+		}
+		Request::Rpc { json } => {
+			if json.as_bytes().contains(&b'\n') {
+				return Err(EncodeError::NewlineInBody);
+			}
+			out.push(b'R');
+			out.push(b'\n');
+			out.extend_from_slice(json.as_bytes());
 			out.push(b'\n');
 		}
 	}
@@ -177,6 +209,16 @@ pub fn parse_request(buf: &[u8]) -> Result<(Request, usize), ParseError> {
 			let host_path = String::from_utf8(body.to_vec())?;
 			Ok((Request::Edit { host_path }, body_start + body_nl + 1))
 		}
+		b'R' => {
+			let body_start = after_tag;
+			let body_nl = buf[body_start..]
+				.iter()
+				.position(|&b| b == b'\n')
+				.ok_or(ParseError::Truncated)?;
+			let body = &buf[body_start..body_start + body_nl];
+			let json = String::from_utf8(body.to_vec())?;
+			Ok((Request::Rpc { json }, body_start + body_nl + 1))
+		}
 		other => Err(ParseError::UnknownTag { tag: other as char }),
 	}
 }
@@ -205,6 +247,75 @@ pub fn parse_reply(buf: &[u8]) -> Result<(Reply, usize), ParseError> {
 /// to await more data, not log an error.
 pub fn is_truncated(err: &ParseError) -> bool {
 	matches!(err, ParseError::Truncated)
+}
+
+/// One method invocation carried in a [`Request::Rpc`] body.
+///
+/// Deliberately minimal — `method` is a stable string the
+/// listener matches on, `params` is opaque JSON the handler
+/// destructures. This is the wire shape `moon-bridge` (and, later,
+/// the companion PWA via the bridge) uses to reach the workspace
+/// process's coder + git surface. The set of supported `method`
+/// strings is whatever the listener wires up (Phase 13), not a
+/// fixed enum here — keeping it a string means adding a method is a
+/// handler change, not a protocol-crate change.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RpcRequest {
+	pub method: String,
+	#[serde(default)]
+	pub params: serde_json::Value,
+}
+
+/// The listener's reply to a [`RpcRequest`]. Exactly one of `ok` /
+/// `error` is set. `ok` carries the method's result JSON; `error`
+/// carries a human-readable message (the workspace process's
+/// `MoonError` / `CoderError` display string).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RpcResponse {
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub ok: Option<serde_json::Value>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub error: Option<String>,
+}
+
+impl RpcResponse {
+	/// Build a success response.
+	pub fn ok(value: serde_json::Value) -> Self {
+		Self {
+			ok: Some(value),
+			error: None,
+		}
+	}
+
+	/// Build an error response.
+	pub fn error(message: impl Into<String>) -> Self {
+		Self {
+			ok: None,
+			error: Some(message.into()),
+		}
+	}
+}
+
+/// Encode an [`RpcResponse`] as a single-line framed reply ready to
+/// write to the socket. Always compact JSON + trailing `\n`.
+pub fn encode_rpc_response(resp: &RpcResponse) -> Vec<u8> {
+	// Serialisation of this fixed-shape struct can't fail; the
+	// fallback keeps the function infallible for callers in the
+	// hot socket path.
+	let mut line =
+		serde_json::to_string(resp).unwrap_or_else(|_| r#"{"error":"failed to encode rpc response"}"#.to_owned());
+	line.push('\n');
+	line.into_bytes()
+}
+
+/// Parse a single-line [`RpcResponse`] from `buf`. Mirror of
+/// [`parse_reply`] for the RPC path; returns the response and the
+/// bytes consumed so a buffered reader can advance.
+pub fn parse_rpc_response(buf: &[u8]) -> Result<(RpcResponse, usize), ParseError> {
+	let nl = buf.iter().position(|&b| b == b'\n').ok_or(ParseError::Truncated)?;
+	let line = std::str::from_utf8(&buf[..nl]).map_err(|_| ParseError::BadRpcJson)?;
+	let resp: RpcResponse = serde_json::from_str(line).map_err(|_| ParseError::BadRpcJson)?;
+	Ok((resp, nl + 1))
 }
 
 /// Convert a [`ParseError`] into a generic [`io::Error`] —
@@ -289,5 +400,51 @@ mod tests {
 	fn reply_round_trips() {
 		assert_eq!(parse_reply(&encode_reply(Reply::Ok)).unwrap().0, Reply::Ok);
 		assert_eq!(parse_reply(&encode_reply(Reply::Cancel)).unwrap().0, Reply::Cancel);
+	}
+
+	#[test]
+	fn parse_rpc_request_round_trips() {
+		let json = r#"{"method":"coder_status","params":{}}"#.to_string();
+		let bytes = encode_request(&Request::Rpc { json: json.clone() }).unwrap();
+		let (req, n) = parse_request(&bytes).unwrap();
+		assert_eq!(req, Request::Rpc { json });
+		assert_eq!(n, bytes.len());
+	}
+
+	#[test]
+	fn encode_rpc_refuses_newline_in_body() {
+		let err = encode_request(&Request::Rpc {
+			json: "{\n}".to_string(),
+		})
+		.unwrap_err();
+		assert!(matches!(err, EncodeError::NewlineInPath | EncodeError::NewlineInBody));
+		assert!(matches!(
+			encode_request(&Request::Rpc {
+				json: "{\n}".to_string()
+			})
+			.unwrap_err(),
+			EncodeError::NewlineInBody
+		));
+	}
+
+	#[test]
+	fn rpc_response_round_trips_ok_and_error() {
+		let ok = RpcResponse::ok(serde_json::json!({ "signed_in": true }));
+		let (parsed, n) = parse_rpc_response(&encode_rpc_response(&ok)).unwrap();
+		assert_eq!(parsed, ok);
+		assert_eq!(n, encode_rpc_response(&ok).len());
+
+		let err = RpcResponse::error("not signed in");
+		let (parsed, _) = parse_rpc_response(&encode_rpc_response(&err)).unwrap();
+		assert_eq!(parsed, err);
+		assert_eq!(parsed.error.as_deref(), Some("not signed in"));
+		assert!(parsed.ok.is_none());
+	}
+
+	#[test]
+	fn rpc_response_malformed_is_hard_fail_not_truncated() {
+		let err = parse_rpc_response(b"not json at all\n").unwrap_err();
+		assert!(matches!(err, ParseError::BadRpcJson));
+		assert!(!is_truncated(&err));
 	}
 }

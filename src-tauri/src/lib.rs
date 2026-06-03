@@ -14,6 +14,7 @@
 //! window of its own. See
 //! [specs/roadmaps/phase-07-multi-workspace.md].
 
+mod bridge_rpc;
 mod commands;
 mod focus_socket;
 mod fs_watcher;
@@ -282,14 +283,13 @@ pub fn run() {
 			// pending edits share one map (see
 			// `crate::focus_socket::EditorRegistry`).
 			let editor_registry = std::sync::Arc::new(focus_socket::EditorRegistry::new());
-			let focus_listener_abort = listener.map(|listener| {
-				focus_socket::spawn_focus_listener(
-					listener,
-					app.handle().clone(),
-					std::sync::Arc::clone(&editor_registry),
-				)
-			});
-			app.manage(editor_registry);
+			// The focus listener spawn is deferred until after the
+			// coder handle + workspace registry exist below, so the
+			// `R` (bridge RPC) request kind can dispatch against them
+			// (Phase 13). `F` (focus) / `E` (editor-forward) don't
+			// need them, but there's one listener for all three.
+			let deferred_focus_listener = listener;
+			app.manage(std::sync::Arc::clone(&editor_registry));
 
 			let workspace_id = match &mode {
 				AppMode::Workspace { id } => id.clone(),
@@ -456,6 +456,20 @@ pub fn run() {
 			let coder_for_prime = coder.clone();
 			tauri::async_runtime::spawn(async move {
 				coder_for_prime.prime_context_windows().await;
+			});
+
+			// Now that the coder + registry exist, spawn the focus
+			// listener with a bridge-RPC handler bound to them. See
+			// `crate::bridge_rpc` (Phase 13, mobile companion).
+			let bridge_rpc: std::sync::Arc<dyn focus_socket::BridgeRpcHandler> =
+				std::sync::Arc::new(bridge_rpc::BridgeRpc::new(coder.clone(), workspace_registry.clone()));
+			let focus_listener_abort = deferred_focus_listener.map(|listener| {
+				focus_socket::spawn_focus_listener(
+					listener,
+					app.handle().clone(),
+					std::sync::Arc::clone(&editor_registry),
+					bridge_rpc,
+				)
 			});
 
 			let logs = moon_core::LogSink::new();

@@ -238,6 +238,7 @@ pub fn spawn_focus_listener(
 	listener: UnixListener,
 	app: AppHandle,
 	registry: Arc<EditorRegistry>,
+	rpc: Arc<dyn BridgeRpcHandler>,
 ) -> tokio::task::AbortHandle {
 	// `tauri::async_runtime::spawn` rather than `tokio::spawn` —
 	// `setup` runs synchronously on a thread that isn't bound to
@@ -253,8 +254,9 @@ pub fn spawn_focus_listener(
 				Ok((stream, _addr)) => {
 					let app = app.clone();
 					let registry = Arc::clone(&registry);
+					let rpc = Arc::clone(&rpc);
 					tauri::async_runtime::spawn(async move {
-						handle_connection(stream, app, registry).await;
+						handle_connection(stream, app, registry, rpc).await;
 					});
 				}
 				Err(err) => {
@@ -269,7 +271,12 @@ pub fn spawn_focus_listener(
 	task.inner().abort_handle()
 }
 
-async fn handle_connection(mut stream: UnixStream, app: AppHandle, registry: Arc<EditorRegistry>) {
+async fn handle_connection(
+	mut stream: UnixStream,
+	app: AppHandle,
+	registry: Arc<EditorRegistry>,
+	rpc: Arc<dyn BridgeRpcHandler>,
+) {
 	// Read the request, looping until we have a complete framed
 	// message or we exceed the byte cap / time budget. The
 	// listener's only clients are sibling launcher processes
@@ -322,6 +329,49 @@ async fn handle_connection(mut stream: UnixStream, app: AppHandle, registry: Arc
 		Request::Edit { host_path } => {
 			handle_edit_request(stream, app, registry, host_path).await;
 		}
+		Request::Rpc { json } => {
+			handle_rpc_request(stream, rpc, json).await;
+		}
+	}
+}
+
+/// Handler the focus listener calls for an `R` (RPC) request. The
+/// `src-tauri` side implements this against the coder + workspace
+/// registry; the focus-socket module stays decoupled from those
+/// types by going through this trait. Phase 13 (mobile companion).
+#[async_trait::async_trait]
+pub trait BridgeRpcHandler: Send + Sync {
+	/// Dispatch one method call. Returns the result JSON or an error
+	/// message; the listener wraps either into an
+	/// [`moon_protocol::focus_socket::RpcResponse`].
+	async fn dispatch(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String>;
+}
+
+async fn handle_rpc_request(mut stream: UnixStream, rpc: Arc<dyn BridgeRpcHandler>, json: String) {
+	let request: moon_protocol::focus_socket::RpcRequest = match serde_json::from_str(&json) {
+		Ok(req) => req,
+		Err(err) => {
+			let resp = moon_protocol::focus_socket::RpcResponse::error(format!("malformed rpc request: {err}"));
+			write_rpc_response(&mut stream, &resp).await;
+			return;
+		}
+	};
+
+	let resp = match rpc.dispatch(&request.method, request.params).await {
+		Ok(value) => moon_protocol::focus_socket::RpcResponse::ok(value),
+		Err(message) => moon_protocol::focus_socket::RpcResponse::error(message),
+	};
+	write_rpc_response(&mut stream, &resp).await;
+}
+
+async fn write_rpc_response(stream: &mut UnixStream, resp: &moon_protocol::focus_socket::RpcResponse) {
+	let bytes = moon_protocol::focus_socket::encode_rpc_response(resp);
+	if let Err(err) = stream.write_all(&bytes).await {
+		tracing::warn!(error = %err, "focus listener: failed to write rpc response");
+		return;
+	}
+	if let Err(err) = stream.flush().await {
+		tracing::debug!(error = %err, "focus listener: rpc flush failed");
 	}
 }
 

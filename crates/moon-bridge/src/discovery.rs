@@ -88,7 +88,7 @@ pub fn resolve_config_dir() -> anyhow::Result<Utf8PathBuf> {
 
 /// Path of a workspace's instance socket. Mirrors
 /// `focus_socket::socket_path` in `src-tauri`.
-fn socket_path(workspaces_dir: &Utf8Path, slug: &str) -> Utf8PathBuf {
+pub fn socket_path(workspaces_dir: &Utf8Path, slug: &str) -> Utf8PathBuf {
 	workspaces_dir.join(slug).join("instance.sock")
 }
 
