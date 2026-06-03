@@ -139,10 +139,18 @@ ip>:<port>` + cert fingerprint + pairing code. LAN IP is detected
 - Verified live: two `serve`s on one port → second logs "already owns
   … exiting"; a `serve` with no live workspace self-exits exactly
   60 s in.
-- Deferred: actually bundling the `moon-bridge` binary + `companion/dist`
-  into the release artifact (tauri resources / sidecar config) —
-  `ensure_bridge_running` already resolves them next to the exe, so
-  it's a packaging task, not a code-shape one.
+- Build wiring (`--no-bundle`, the team's day-to-day path): `bun run
+build:bin` now builds the companion PWA, the IDE, and `moon-bridge`,
+  then `scripts/stage-bridge.mjs` copies `moon-bridge` + `companion/dist`
+  into `target/release/` next to `moon-desktop` — exactly where
+  `ensure_bridge_running` looks. Verified the three land side by side.
+- Deferred: the **bundled** installer path (`bun run build` →
+  AppImage / .deb / .app). There the exe runs from an install dir, not
+  `target/release/`, so the bridge + assets need tauri `externalBin`
+  (sidecar, target-triple-named) + `resources`, and a resource-dir
+  fallback in `ensure_bridge_running`. Until someone ships a bundle
+  it's a clean no-op (bundled IDE logs "binary not found", launches
+  fine). Not started — no installer is shipped yet.
 
 ### 13.3 — Pairing (TOFU cert + device tokens)
 

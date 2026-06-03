@@ -6,10 +6,11 @@
 	"scripts": {
 		"dev": "tauri dev",
 		"dev:vite": "vite",
-		"build": "tauri build",
-		"build:bin": "tauri build --no-bundle",
+		"build": "bun run build:companion && tauri build && bun run stage:bridge",
+		"build:bin": "bun run build:companion && tauri build --no-bundle && bun run stage:bridge",
 		"build:vite": "vite build",
 		"build:companion": "vite build --config companion/vite.config.ts",
+		"stage:bridge": "node scripts/stage-bridge.mjs",
 		"dev:companion": "vite --config companion/vite.config.ts",
 		"preview": "vite preview",
 		"tauri": "tauri",

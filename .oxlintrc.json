@@ -32,7 +32,7 @@
 	],
 	"overrides": [
 		{
-			"files": ["*.config.ts", "*.config.js", "vite.config.ts"],
+			"files": ["*.config.ts", "*.config.js", "vite.config.ts", "scripts/**"],
 			"rules": {
 				"no-console": "off"
 			}
