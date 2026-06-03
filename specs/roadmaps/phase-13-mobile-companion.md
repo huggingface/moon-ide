@@ -93,18 +93,31 @@ gate at the end of each sub-phase is the usual roadmap rule.
   consume it — the "build the framing once" payoff, deferred until
   there's a second consumer.
 
-### 13.2 — LAN listener + TLS
+### 13.2 — LAN listener + TLS — LANDED
 
-- Bridge binds one HTTPS + WebSocket listener (default
-  `0.0.0.0:53180`). Self-signed keypair + cert generated on first
-  run, persisted under `<XDG_DATA_HOME>/moon-ide/bridge/`.
-- WS frames carry the same JSON-RPC the 13.1 relay speaks; the
-  listener is a transport adapter in front of the relay, not a
-  second protocol.
-- Acceptance: a `wscat`-style client on another LAN machine (cert
-  trust bypassed for the test) can drive the coder surface over
-  WSS. This is the "explicit, named LAN surface" the invariant 3
-  requires — one listener, deliberately bound.
+- `moon-bridge serve` binds one TLS + WebSocket listener (default
+  `0.0.0.0:53180`). `tls.rs` generates-or-loads a self-signed cert +
+  key under `<data_local_dir>/moon-ide/bridge/` (stable fingerprint
+  across restarts so a pinned phone keeps trusting it) via `rcgen`;
+  TLS accept is `tokio-rustls` (ring provider), WS upgrade is
+  `tokio-tungstenite` over the TLS stream — no second protocol, the
+  listener is a transport adapter in front of `relay::call`.
+- `serve.rs` connection flow: TLS accept → WS upgrade → one JSON
+  message per frame, tagged `pair` or `call`. `call` authenticates
+  the device token against the `DeviceStore` (the whole boundary)
+  then relays to the workspace process; `pair` verifies the startup
+  code and mints a device (closing the 13.3 loop).
+- Startup emits the `PairingPayload` (the QR contents): `wss://<lan-
+ip>:<port>` + cert fingerprint + pairing code. LAN IP is detected
+  via the UDP-connect trick (no interface-enum dep).
+- Verified end-to-end against a fake phone (no-verify TLS client) +
+  fake workspace: TLS handshake → WS upgrade → routing → code verify
+  (correct accepted, wrong rejected with "did not match" _before_
+  any token store touch) → token-auth gate → relay round-trip. The
+  device-token persistence half (keyring `add` / `device_for_token`)
+  only fails in the headless CI container, which has no secret-
+  storage backend; it's the same keyring the coder / Slack tokens
+  already use on real machines.
 
 ### 13.3 — Pairing (TOFU cert + device tokens)
 

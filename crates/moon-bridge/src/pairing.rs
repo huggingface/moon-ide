@@ -129,6 +129,43 @@ pub enum PairError {
 	CodeMismatch,
 }
 
+/// The payload the desktop encodes into the pairing QR. The phone
+/// decodes it to learn where to connect (`url`), what cert
+/// fingerprint to pin (`fingerprint`), and the one-time code to
+/// present (`code`). Compact JSON so a QR holds it comfortably.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PairingPayload {
+	/// `wss://<lan-ip>:<port>` the phone connects to.
+	pub url: String,
+	/// SHA-256 cert fingerprint (colon-hex) the phone pins (TOFU).
+	pub fingerprint: String,
+	/// The short single-use pairing code (from [`PairingSession`]).
+	pub code: String,
+	/// Wire-format version so a future phone build can reject a
+	/// payload it doesn't understand instead of mis-parsing it.
+	pub v: u8,
+}
+
+impl PairingPayload {
+	/// Current payload version.
+	pub const VERSION: u8 = 1;
+
+	pub fn new(url: impl Into<String>, fingerprint: impl Into<String>, code: impl Into<String>) -> Self {
+		Self {
+			url: url.into(),
+			fingerprint: fingerprint.into(),
+			code: code.into(),
+			v: Self::VERSION,
+		}
+	}
+
+	/// Encode to the compact JSON string a QR generator consumes.
+	pub fn to_json(&self) -> String {
+		// Fixed shape; serialisation can't fail.
+		serde_json::to_string(self).unwrap_or_default()
+	}
+}
+
 /// One paired device's record.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PairedDevice {
@@ -283,5 +320,14 @@ mod tests {
 		assert_ne!(a.token, b.token);
 		assert_ne!(a.id, b.id);
 		assert_eq!(a.token.len(), 64); // two 32-char simple UUIDs
+	}
+
+	#[test]
+	fn pairing_payload_round_trips() {
+		let p = PairingPayload::new("wss://192.168.1.20:53180", "aa:bb:cc", "A1B2-C3D4");
+		let json = p.to_json();
+		let back: PairingPayload = serde_json::from_str(&json).unwrap();
+		assert_eq!(back, p);
+		assert_eq!(back.v, PairingPayload::VERSION);
 	}
 }

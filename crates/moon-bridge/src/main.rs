@@ -23,6 +23,14 @@
 mod discovery;
 mod pairing;
 mod relay;
+mod serve;
+mod tls;
+
+/// Default LAN port. IANA dynamic range, adjacent to the next-edit
+/// server's 53281 so the two moon-ide listeners cluster.
+const DEFAULT_PORT: u16 = 53180;
+
+use std::net::{IpAddr, SocketAddr};
 
 use clap::{Parser, Subcommand};
 
@@ -73,6 +81,22 @@ enum Command {
 	/// into the pairing QR). Prints the code and its TTL. The verify
 	/// half runs in the WSS listener (13.2).
 	PairCode,
+	/// Run the LAN WSS listener. Issues a pairing code at startup
+	/// (prints the QR payload), then serves until killed.
+	Serve {
+		/// Bind address. Defaults to `0.0.0.0:<DEFAULT_PORT>`.
+		#[arg(long)]
+		bind: Option<SocketAddr>,
+		/// LAN host the QR advertises (`wss://<host>:<port>`).
+		/// Defaults to the first non-loopback IPv4 address found,
+		/// falling back to `127.0.0.1` for a local-only test.
+		#[arg(long)]
+		advertise_host: Option<String>,
+		/// Start with pairing closed (only already-paired devices can
+		/// connect). Default is to open a pairing window at startup.
+		#[arg(long)]
+		no_pairing: bool,
+	},
 }
 
 #[tokio::main]
@@ -93,6 +117,11 @@ async fn main() -> anyhow::Result<()> {
 		Command::Devices => run_devices(),
 		Command::Revoke { id } => run_revoke(&id),
 		Command::PairCode => run_pair_code(),
+		Command::Serve {
+			bind,
+			advertise_host,
+			no_pairing,
+		} => run_serve(bind, advertise_host, no_pairing).await,
 	}
 }
 
@@ -171,6 +200,59 @@ fn run_revoke(id: &str) -> anyhow::Result<()> {
 		println!("No device with id {id}");
 	}
 	Ok(())
+}
+
+async fn run_serve(bind: Option<SocketAddr>, advertise_host: Option<String>, no_pairing: bool) -> anyhow::Result<()> {
+	// Install the ring crypto provider as the process default before
+	// any rustls config is built. moon-bridge's tree pulls only ring,
+	// but rustls resolves its provider from a process-global slot, so
+	// installing explicitly avoids a "no process-level default" panic
+	// if a future dep ever drags in a second provider.
+	let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+
+	let bind = bind.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], DEFAULT_PORT)));
+	let advertise_host = advertise_host.unwrap_or_else(|| detect_lan_ip().unwrap_or_else(|| "127.0.0.1".to_owned()));
+
+	let workspaces_dir = discovery::resolve_workspaces_dir()?;
+	let bridge_dir = tls::resolve_bridge_dir()?;
+	let tls_identity = tls::load_or_generate(&bridge_dir)?;
+	let devices = pairing::DeviceStore::open()?;
+
+	let pairing_session = if no_pairing {
+		None
+	} else {
+		let session = pairing::PairingSession::issue();
+		let url = format!("wss://{advertise_host}:{}", bind.port());
+		let payload = pairing::PairingPayload::new(&url, &tls_identity.fingerprint, session.code());
+		println!(
+			"Pairing open for {} seconds. Encode this into the QR:",
+			pairing::PAIRING_CODE_TTL.as_secs()
+		);
+		println!();
+		println!("  {}", payload.to_json());
+		println!();
+		println!("Or type-in: url {url}  code {}", session.code());
+		println!("Cert fingerprint (SHA-256): {}", tls_identity.fingerprint);
+		println!();
+		Some(session)
+	};
+
+	tracing::info!(%bind, advertise_host, "starting moon-bridge serve");
+	serve::serve(bind, tls_identity, workspaces_dir, devices, pairing_session).await
+}
+
+/// Best-effort first non-loopback IPv4 address: open a UDP socket
+/// "to" a public address (no packets are sent by `connect` on UDP)
+/// and read back the local address the OS picked. Avoids a
+/// network-interface enumeration dep for a host that just wants its
+/// own LAN IP.
+fn detect_lan_ip() -> Option<String> {
+	let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+	sock.connect("8.8.8.8:80").ok()?;
+	match sock.local_addr().ok()?.ip() {
+		IpAddr::V4(v4) if !v4.is_loopback() => Some(v4.to_string()),
+		_ => None,
+	}
 }
 
 fn run_pair_code() -> anyhow::Result<()> {
