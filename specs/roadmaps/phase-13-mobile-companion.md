@@ -195,9 +195,16 @@ Desktop Companion panel + mDNS LANDED (13.4b follow-on):
   `companion_status` / `companion_revoke_device` Tauri commands. No
   shared keyring writer (bridge stays sole owner), no second socket.
 
+Cert SANs cover the host's detected LAN IP (+ `moon-bridge.local`,
+`localhost`, loopback), so a browser hitting `https://<ip>:port`
+doesn't reject on a name mismatch after the user trusts the cert.
+The cert is stable for a fixed IP (the phone's pinned fingerprint
+keeps working); a network change regenerates it once — a deliberate,
+logged re-pair — tracked by a `bridge-cert-sans.txt` marker.
+
 Still to wire: the one-time cert-trust artifact (iOS `.mobileconfig`
-/ Android user cert) so the browser stops warning — for now the user
-accepts the self-signed cert once per device.
+/ Android user cert) so the browser stops warning at all — for now
+the user accepts the self-signed cert once per device.
 
 ### 13.4 — Companion PWA: shell + workspace switcher + coder read — LANDED (first slice)
 

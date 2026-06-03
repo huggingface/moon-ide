@@ -237,7 +237,10 @@ async fn run_serve(
 
 	let workspaces_dir = discovery::resolve_workspaces_dir()?;
 	let bridge_dir = tls::resolve_bridge_dir()?;
-	let tls_identity = tls::load_or_generate(&bridge_dir)?;
+	// Cover the detected LAN IP in the cert SANs so a browser hitting
+	// `https://<ip>:port` doesn't reject on a name mismatch. Stable
+	// for a fixed IP; a network change regenerates once (logged).
+	let tls_identity = tls::load_or_generate(&bridge_dir, detected_ip)?;
 	let devices = pairing::DeviceStore::open()?;
 
 	let url = format!("wss://{advertise_host}:{}", bind.port());
