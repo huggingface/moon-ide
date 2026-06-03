@@ -21,7 +21,7 @@
 // Append `--debug` for a debug-profile build.
 
 import { execFileSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, rmSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, renameSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -67,12 +67,18 @@ function placeInto(destDir) {
 
 	const srcBin = builtBridgePath();
 	const destBin = join(destDir, bridgeName);
-	// In exe-adjacent mode destDir *is* target/<profile>, so the
-	// built binary already sits at destBin — copying would be a
-	// remove-then-copy-onto-itself. Skip when they're the same file.
+	// In exe-adjacent mode destDir *is* target/<profile>, so the built
+	// binary already sits at destBin — nothing to copy.
 	if (resolve(srcBin) !== resolve(destBin)) {
-		rmSync(destBin, { force: true });
-		cpSync(srcBin, destBin);
+		// Write to a temp name then atomic-rename over destBin.
+		// rename(2) swaps the directory entry without touching a
+		// running process's open inode, so this never hits
+		// `ETXTBSY` ("Text file busy") when a previously-staged
+		// bridge is still running from this path.
+		const tmpBin = `${destBin}.new`;
+		rmSync(tmpBin, { force: true });
+		cpSync(srcBin, tmpBin);
+		renameSync(tmpBin, destBin);
 	}
 
 	const destWeb = join(destDir, 'companion');
