@@ -332,6 +332,9 @@ async fn handle_connection(
 		Request::Rpc { json } => {
 			handle_rpc_request(stream, rpc, json).await;
 		}
+		Request::Subscribe { json } => {
+			handle_subscribe_request(stream, rpc, json).await;
+		}
 	}
 }
 
@@ -345,6 +348,18 @@ pub trait BridgeRpcHandler: Send + Sync {
 	/// message; the listener wraps either into an
 	/// [`moon_protocol::focus_socket::RpcResponse`].
 	async fn dispatch(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String>;
+
+	/// Subscribe to an event stream for a `Subscribe` request. Returns
+	/// a receiver of JSON event payloads the listener forwards
+	/// one-per-line until the client disconnects, or an error string
+	/// if the method isn't a known stream. Implemented against the
+	/// coder's broadcast channel in `src-tauri`; the protocol crate
+	/// stays decoupled by trafficking in `serde_json::Value`.
+	async fn subscribe(
+		&self,
+		method: &str,
+		params: serde_json::Value,
+	) -> Result<tokio::sync::mpsc::Receiver<serde_json::Value>, String>;
 }
 
 async fn handle_rpc_request(mut stream: UnixStream, rpc: Arc<dyn BridgeRpcHandler>, json: String) {
@@ -362,6 +377,42 @@ async fn handle_rpc_request(mut stream: UnixStream, rpc: Arc<dyn BridgeRpcHandle
 		Err(message) => moon_protocol::focus_socket::RpcResponse::error(message),
 	};
 	write_rpc_response(&mut stream, &resp).await;
+}
+
+async fn handle_subscribe_request(mut stream: UnixStream, rpc: Arc<dyn BridgeRpcHandler>, json: String) {
+	let request: moon_protocol::focus_socket::RpcRequest = match serde_json::from_str(&json) {
+		Ok(req) => req,
+		Err(err) => {
+			let resp = moon_protocol::focus_socket::RpcResponse::error(format!("malformed subscribe request: {err}"));
+			write_rpc_response(&mut stream, &resp).await;
+			return;
+		}
+	};
+
+	let mut rx = match rpc.subscribe(&request.method, request.params).await {
+		Ok(rx) => rx,
+		Err(message) => {
+			let resp = moon_protocol::focus_socket::RpcResponse::error(message);
+			write_rpc_response(&mut stream, &resp).await;
+			return;
+		}
+	};
+
+	// Forward one event per line until the channel closes (the
+	// workspace stopped emitting) or the write fails (the bridge
+	// disconnected — the phone closed its WS). A failed write is the
+	// normal teardown path, logged at debug only.
+	while let Some(event) = rx.recv().await {
+		let resp = moon_protocol::focus_socket::RpcResponse::ok(event);
+		let bytes = moon_protocol::focus_socket::encode_rpc_response(&resp);
+		if stream.write_all(&bytes).await.is_err() {
+			tracing::debug!("subscribe stream: client disconnected");
+			return;
+		}
+		if stream.flush().await.is_err() {
+			return;
+		}
+	}
 }
 
 async fn write_rpc_response(stream: &mut UnixStream, resp: &moon_protocol::focus_socket::RpcResponse) {

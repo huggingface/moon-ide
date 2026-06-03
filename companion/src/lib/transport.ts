@@ -24,6 +24,7 @@ type ServerMessage =
 	| { type: 'paired'; device_id: string; token: string }
 	| { type: 'workspaces'; workspaces: unknown }
 	| { type: 'result'; value: unknown }
+	| { type: 'event'; event: unknown }
 	| { type: 'error'; message: string };
 
 export class BridgeError extends Error {}
@@ -60,10 +61,17 @@ export function clearConnection(): void {
 export class BridgeSocket {
 	#ws: WebSocket | null = null;
 	#pending: Array<{ resolve: (m: ServerMessage) => void; reject: (e: Error) => void }> = [];
+	#onEvent: ((event: unknown) => void) | null = null;
 	readonly url: string;
 
 	constructor(url: string) {
 		this.url = url;
+	}
+
+	/** Register a handler for server-pushed `event` frames (the coder
+	 * stream). Pushed events bypass the request/reply FIFO. */
+	onEvent(handler: (event: unknown) => void): void {
+		this.#onEvent = handler;
 	}
 
 	open(): Promise<void> {
@@ -80,18 +88,24 @@ export class BridgeSocket {
 				this.#pending = [];
 			});
 			ws.addEventListener('message', (ev) => {
-				const waiter = this.#pending.shift();
-				if (!waiter) {
-					return;
-				}
+				let msg: ServerMessage;
 				try {
 					const data = typeof ev.data === 'string' ? ev.data : '';
 					// The bridge only ever sends our ServerMessage shapes.
 					// eslint-disable-next-line typescript-eslint/no-unsafe-type-assertion
-					waiter.resolve(JSON.parse(data) as ServerMessage);
+					msg = JSON.parse(data) as ServerMessage;
 				} catch {
-					waiter.reject(new BridgeError('malformed reply from bridge'));
+					const waiter = this.#pending.shift();
+					waiter?.reject(new BridgeError('malformed reply from bridge'));
+					return;
 				}
+				// Pushed events are unsolicited — route them to the event
+				// handler rather than consuming a pending reply.
+				if (msg.type === 'event') {
+					this.#onEvent?.(msg.event);
+					return;
+				}
+				this.#pending.shift()?.resolve(msg);
 			});
 		});
 	}
@@ -138,6 +152,16 @@ export class BridgeSocket {
 		// Untyped JSON boundary — the caller declares the shape it expects.
 		// eslint-disable-next-line typescript-eslint/no-unsafe-type-assertion
 		return reply.workspaces as T;
+	}
+
+	/** Subscribe to a workspace's coder event stream. Events arrive via
+	 * the `onEvent` handler; this send has no direct reply. */
+	subscribe(token: string, workspace: string): void {
+		const ws = this.#ws;
+		if (!ws || ws.readyState !== WebSocket.OPEN) {
+			return;
+		}
+		ws.send(JSON.stringify({ type: 'subscribe', token, workspace }));
 	}
 
 	/** Invoke a relayed method on `workspace`, authenticated by `token`. */

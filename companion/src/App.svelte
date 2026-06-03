@@ -4,6 +4,7 @@
 	import PairScreen from './lib/PairScreen.svelte';
 	import WorkspaceList from './lib/WorkspaceList.svelte';
 	import WorkspaceView from './lib/WorkspaceView.svelte';
+	import SessionView from './lib/SessionView.svelte';
 
 	onMount(() => {
 		void app.boot();
@@ -23,6 +24,8 @@
 		<button class="ghost" onclick={() => app.unpair()}>Pair a different bridge</button>
 		<button class="primary" onclick={() => app.boot()}>Retry</button>
 	</div>
+{:else if app.activeWorkspace && app.activeSession}
+	<SessionView />
 {:else if app.activeWorkspace}
 	<WorkspaceView />
 {:else}

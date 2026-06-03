@@ -83,6 +83,61 @@ pub async fn call(socket_path: &Utf8Path, method: &str, params: serde_json::Valu
 	read_response(&mut stream).await
 }
 
+/// Open a streaming subscription against `socket_path` for `method`.
+/// Sends one `Subscribe` request, then invokes `on_event` for each
+/// event line the workspace pushes until the connection closes or
+/// `on_event` returns `false` (the caller wants to stop — e.g. the
+/// phone disconnected). Used to relay `coder_events` to the phone.
+pub async fn subscribe<F>(socket_path: &Utf8Path, method: &str, mut on_event: F) -> Result<(), RelayError>
+where
+	F: FnMut(serde_json::Value) -> bool,
+{
+	let mut stream = match tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(socket_path.as_std_path())).await {
+		Ok(Ok(stream)) => stream,
+		Ok(Err(source)) => {
+			return Err(RelayError::Connect {
+				path: socket_path.to_string(),
+				source,
+			})
+		}
+		Err(_) => return Err(RelayError::ConnectTimeout),
+	};
+
+	let rpc = RpcRequest {
+		method: method.to_owned(),
+		params: serde_json::Value::Null,
+	};
+	let json = serde_json::to_string(&rpc).map_err(|_| RelayError::BadReply)?;
+	let bytes = encode_request(&Request::Subscribe { json }).map_err(std::io::Error::from)?;
+	stream.write_all(&bytes).await?;
+	stream.flush().await?;
+
+	// Each event is one framed RpcResponse line. Accumulate bytes and
+	// drain every complete line as it arrives — no per-event timeout,
+	// since a quiet stream is normal (the agent is just idle).
+	let mut buf = Vec::with_capacity(1024);
+	let mut tmp = [0u8; 4096];
+	loop {
+		let n = stream.read(&mut tmp).await?;
+		if n == 0 {
+			return Ok(()); // workspace ended the stream
+		}
+		buf.extend_from_slice(&tmp[..n]);
+		// Drain whole lines.
+		while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+			let line: Vec<u8> = buf.drain(..=nl).collect();
+			let Ok((resp, _)) = parse_rpc_response(&line) else {
+				continue; // skip a malformed line rather than tear down
+			};
+			if let Some(event) = resp.ok {
+				if !on_event(event) {
+					return Ok(());
+				}
+			}
+		}
+	}
+}
+
 async fn read_response(stream: &mut UnixStream) -> Result<RpcResponse, RelayError> {
 	let mut buf = Vec::with_capacity(256);
 	loop {

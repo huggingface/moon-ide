@@ -208,16 +208,36 @@ devices UI).
   which land with the screen that calls them (next). The switcher +
   status + session list exercise the whole stack today.
 
-### 13.4b — Coder send / steer / abort + transcript
+### 13.4b — Coder send / abort + streaming transcript — LANDED
 
-- Add `coder_send` / `coder_abort` / `coder_open_session` to the
-  relay's method set and an `open_session` transcript view to the
-  PWA. Streaming (`coder:event`) over the WS needs the bridge to
-  forward the workspace process's event channel — a notification
-  path on top of the request/reply relay. Scoped as its own slice so
-  the request/reply surface lands and gets reviewed first.
-- Acceptance: from a paired phone, open a session, kick off a turn,
-  watch it stream, steer it, abort it.
+- Relay gained the mutating methods `coder_send` / `coder_abort` /
+  `coder_open_session` (drive the active folder's visible session —
+  the one the desktop has open; per-folder/session targeting from the
+  phone is a later refinement).
+- Streaming: a new `S` (Subscribe) request kind on
+  `moon_protocol::focus_socket` (alongside `R`) lets the workspace
+  push many `RpcResponse` lines on one held-open connection.
+  `BridgeRpcHandler::subscribe` bridges the coder's
+  `broadcast::Receiver<CoderEventEnvelope>` to an mpsc of JSON the
+  focus listener forwards. `relay::subscribe` drains it; the bridge's
+  WS layer splits the socket (writer task + mpsc) so pushed
+  `ServerMessage::Event` frames and request/reply replies share one
+  sink. The phone sends `{type:"subscribe"}`; events arrive as
+  `{type:"event"}` frames.
+- PWA: `transport.ts` routes pushed `event` frames to an `onEvent`
+  handler (bypassing the request/reply FIFO). `app.svelte.ts` reduces
+  the coder event grammar into three transcript row kinds (user /
+  assistant-with-delta-accumulation / tool-with-status).
+  `SessionView.svelte` renders the transcript + a composer (Enter
+  sends, Stop aborts while busy).
+- Verified: the streaming hop end-to-end against a fake workspace
+  (3 pushed delta events drained through `relay::subscribe`);
+  protocol round-trip test for `S`; full gauntlet clean. Not verified
+  live: a real agent turn over the phone — needs the keyring (pairing)
+  - a real IDE, same constraint as 13.2/13.4.
+- Deferred: image attachments in the phone composer; per-session
+  targeting; rich tool-body rendering (the phone shows tool name +
+  status, not the desktop's expandable input/output).
 
 ### 13.5 — Companion PWA: review & commit
 

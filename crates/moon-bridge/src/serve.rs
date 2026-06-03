@@ -55,6 +55,9 @@ enum ClientMessage {
 		#[serde(default)]
 		params: serde_json::Value,
 	},
+	/// Subscribe to a workspace's `coder:event` stream. The bridge
+	/// pushes `ServerMessage::Event` frames until the connection drops.
+	Subscribe { token: String, workspace: String },
 }
 
 /// Outbound reply to the phone.
@@ -67,6 +70,8 @@ enum ServerMessage {
 	Workspaces { workspaces: serde_json::Value },
 	/// A `call` result (the relayed method's `ok` payload).
 	Result { value: serde_json::Value },
+	/// One pushed event from a `subscribe` stream (a CoderEventEnvelope).
+	Event { event: serde_json::Value },
 	/// Anything went wrong — bad code, bad token, relay failure,
 	/// malformed frame. `message` is human-readable.
 	Error { message: String },
@@ -220,7 +225,7 @@ async fn handle_conn(
 	// The 101 handshake response was already written by read_request;
 	// wrap the raw stream as a server-role WebSocket (no second
 	// handshake).
-	let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+	let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
 		tls_stream,
 		tokio_tungstenite::tungstenite::protocol::Role::Server,
 		None,
@@ -228,44 +233,104 @@ async fn handle_conn(
 	.await;
 	tracing::debug!(%peer, "ws connection established");
 
-	while let Some(frame) = ws.next().await {
+	// Split the socket so a subscription's pushed events and the
+	// request/reply path can both write. A single writer task owns the
+	// sink; everything else sends `ServerMessage`s down an mpsc.
+	let (mut sink, mut source) = ws.split();
+	let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<ServerMessage>(256);
+
+	let writer = tokio::spawn(async move {
+		while let Some(msg) = out_rx.recv().await {
+			let json = serde_json::to_string(&msg).unwrap_or_else(|_| r#"{"type":"error","message":"encode failed"}"#.into());
+			if sink.send(Message::Text(json.into())).await.is_err() {
+				break;
+			}
+		}
+	});
+
+	while let Some(frame) = source.next().await {
 		let msg = frame?;
 		let text = match msg {
 			Message::Text(t) => t.to_string(),
 			Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
 			Message::Close(_) => break,
-			// Ping/pong/frame: tungstenite handles ping/pong itself;
-			// ignore anything else.
 			_ => continue,
 		};
-
-		let reply = handle_message(&ctx, &text).await;
-		let json = serde_json::to_string(&reply).unwrap_or_else(|_| r#"{"type":"error","message":"encode failed"}"#.into());
-		ws.send(Message::Text(json.into())).await?;
+		handle_message(&ctx, &text, &out_tx).await;
 	}
+
+	drop(out_tx);
+	let _ = writer.await;
 	Ok(())
 }
 
-async fn handle_message(ctx: &ServeCtx, text: &str) -> ServerMessage {
+async fn handle_message(ctx: &Arc<ServeCtx>, text: &str, out: &tokio::sync::mpsc::Sender<ServerMessage>) {
 	let parsed: ClientMessage = match serde_json::from_str(text) {
 		Ok(m) => m,
 		Err(err) => {
-			return ServerMessage::Error {
-				message: format!("malformed message: {err}"),
-			}
+			let _ = out
+				.send(ServerMessage::Error {
+					message: format!("malformed message: {err}"),
+				})
+				.await;
+			return;
 		}
 	};
 
 	match parsed {
-		ClientMessage::Pair { code, label } => handle_pair(ctx, &code, &label).await,
-		ClientMessage::Workspaces { token } => handle_workspaces(ctx, &token).await,
+		ClientMessage::Pair { code, label } => {
+			let _ = out.send(handle_pair(ctx, &code, &label).await).await;
+		}
+		ClientMessage::Workspaces { token } => {
+			let _ = out.send(handle_workspaces(ctx, &token).await).await;
+		}
 		ClientMessage::Call {
 			token,
 			workspace,
 			method,
 			params,
-		} => handle_call(ctx, &token, &workspace, &method, params).await,
+		} => {
+			let _ = out
+				.send(handle_call(ctx, &token, &workspace, &method, params).await)
+				.await;
+		}
+		ClientMessage::Subscribe { token, workspace } => {
+			handle_subscribe(ctx, &token, &workspace, out).await;
+		}
 	}
+}
+
+/// Start streaming `coder_events` from `workspace` to the phone.
+/// Spawns a task that relays each event as a `ServerMessage::Event`
+/// down the writer channel until the workspace ends the stream or the
+/// channel closes (phone disconnected).
+async fn handle_subscribe(
+	ctx: &Arc<ServeCtx>,
+	token: &str,
+	workspace: &str,
+	out: &tokio::sync::mpsc::Sender<ServerMessage>,
+) {
+	if let Err(reply) = check_token(ctx, token) {
+		let _ = out.send(reply).await;
+		return;
+	}
+	let socket = crate::discovery::socket_path(&ctx.workspaces_dir, workspace);
+	let out = out.clone();
+	tokio::spawn(async move {
+		let forward = |event: serde_json::Value| -> bool {
+			// `try_send` keeps the relay's event callback synchronous;
+			// a full/closed channel means the phone can't keep up or is
+			// gone, so stop the subscription.
+			out.try_send(ServerMessage::Event { event }).is_ok()
+		};
+		if let Err(err) = crate::relay::subscribe(&socket, "coder_events", forward).await {
+			let _ = out
+				.send(ServerMessage::Error {
+					message: format!("event stream ended: {err}"),
+				})
+				.await;
+		}
+	});
 }
 
 /// Check a presented device token. `Ok(())` if it maps to a paired

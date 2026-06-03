@@ -47,10 +47,10 @@
 	{:else}
 		<div class="list">
 			{#each app.sessions as s (s.id)}
-				<div class="card list-item">
+				<button class="card list-item" onclick={() => app.openSession(s.id)}>
 					<strong>{s.title || 'Untitled session'}</strong>
 					<span class="muted">{relativeTime(s.updated_at_ms)}</span>
-				</div>
+				</button>
 			{/each}
 		</div>
 	{/if}
@@ -58,8 +58,4 @@
 	{#if app.error}
 		<p class="error">{app.error}</p>
 	{/if}
-
-	<p class="muted">
-		Opening a session transcript and sending prompts land next — the bridge exposes read-only methods for now.
-	</p>
 </div>

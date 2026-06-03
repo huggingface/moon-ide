@@ -79,6 +79,14 @@ pub enum Request {
 	/// JSON never contains a literal newline unless pretty-printed,
 	/// and we always send it compact.
 	Rpc { json: String },
+	/// "Subscribe to an event stream." Like [`Request::Rpc`] but the
+	/// reply is **many** lines: the listener writes one compact-JSON
+	/// [`RpcResponse`] per event (its `ok` field carrying the event
+	/// payload) and keeps the connection open until the client
+	/// disconnects or the stream ends. Used by `moon-bridge` to relay
+	/// the workspace's `coder:event` stream to the phone. Same `R`-vs-
+	/// `S` split rationale as a unary vs server-streaming RPC.
+	Subscribe { json: String },
 }
 
 /// Reply kinds the IDE listener sends back on the same
@@ -165,6 +173,15 @@ pub fn encode_request(req: &Request) -> Result<Vec<u8>, EncodeError> {
 			out.extend_from_slice(json.as_bytes());
 			out.push(b'\n');
 		}
+		Request::Subscribe { json } => {
+			if json.as_bytes().contains(&b'\n') {
+				return Err(EncodeError::NewlineInBody);
+			}
+			out.push(b'S');
+			out.push(b'\n');
+			out.extend_from_slice(json.as_bytes());
+			out.push(b'\n');
+		}
 	}
 	Ok(out)
 }
@@ -209,7 +226,7 @@ pub fn parse_request(buf: &[u8]) -> Result<(Request, usize), ParseError> {
 			let host_path = String::from_utf8(body.to_vec())?;
 			Ok((Request::Edit { host_path }, body_start + body_nl + 1))
 		}
-		b'R' => {
+		b'R' | b'S' => {
 			let body_start = after_tag;
 			let body_nl = buf[body_start..]
 				.iter()
@@ -217,7 +234,12 @@ pub fn parse_request(buf: &[u8]) -> Result<(Request, usize), ParseError> {
 				.ok_or(ParseError::Truncated)?;
 			let body = &buf[body_start..body_start + body_nl];
 			let json = String::from_utf8(body.to_vec())?;
-			Ok((Request::Rpc { json }, body_start + body_nl + 1))
+			let req = if *tag_byte == b'S' {
+				Request::Subscribe { json }
+			} else {
+				Request::Rpc { json }
+			};
+			Ok((req, body_start + body_nl + 1))
 		}
 		other => Err(ParseError::UnknownTag { tag: other as char }),
 	}
@@ -408,6 +430,15 @@ mod tests {
 		let bytes = encode_request(&Request::Rpc { json: json.clone() }).unwrap();
 		let (req, n) = parse_request(&bytes).unwrap();
 		assert_eq!(req, Request::Rpc { json });
+		assert_eq!(n, bytes.len());
+	}
+
+	#[test]
+	fn parse_subscribe_request_round_trips() {
+		let json = r#"{"method":"coder_subscribe","params":{}}"#.to_string();
+		let bytes = encode_request(&Request::Subscribe { json: json.clone() }).unwrap();
+		let (req, n) = parse_request(&bytes).unwrap();
+		assert_eq!(req, Request::Subscribe { json });
 		assert_eq!(n, bytes.len());
 	}
 
