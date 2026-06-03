@@ -278,11 +278,17 @@ fn spawn_companion_watcher(
 
 /// Grace period before the first idle check, so the bridge doesn't
 /// exit in the gap between starting and the IDE that spawned it
-/// binding its own `instance.sock`.
-const IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+/// binding its own `instance.sock`. The IDE binds that socket very
+/// early (pre-Tauri, ADR 0014) and only spawns the bridge after
+/// setup, so a few seconds is ample — kept short so the bridge stops
+/// promptly after the last IDE closes (it would otherwise linger and
+/// hold its binary against the next in-IDE rebuild, ADR 0005).
+const IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How often the idle watcher re-checks for live workspaces.
-const IDLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+/// How often the idle watcher re-checks for live workspaces. Short so
+/// "closed the IDE → bridge gone" feels immediate; the cost is a
+/// couple of cheap socket probes per tick.
+const IDLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Exit the process once no workspace is live (ADR 0024). Discovery
 /// is the same signal the switcher uses, so "the last IDE closed"
