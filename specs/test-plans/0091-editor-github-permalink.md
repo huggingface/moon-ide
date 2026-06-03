@@ -8,7 +8,7 @@
 - Right-clicking inside the main editor now offers **Copy GitHub link** and **Copy GitHub markdown link** for the lines under the current selection (or the caret line when nothing is selected).
 - New `GitPermalink` DTO + `WorkspaceHost::git_permalink(path, start_line, end_line)` (`LocalHost` impl) that builds `https://github.com/<owner>/<repo>/blob/<sha>/<path>#L<start>(-L<end>)`, pinned to the current `HEAD` commit SHA so the link survives later commits.
 - The Markdown form is `[<path>#L<start>(-L<end>)](<url>)`; single-line ranges drop the `-L<end>` suffix to match GitHub's own "Copy permalink".
-- Wired through `fs_git_permalink` (Tauri) + `ipc.fs.gitPermalink`; the editor menu reuses `ContextMenu.svelte` portaled onto `document.body` (same approach as the tab-strip menu) and copies via `navigator.clipboard`.
+- Wired through `fs_git_permalink` (Tauri) + `ipc.fs.gitPermalink`; the editor menu reuses `ContextMenu.svelte` portaled onto `document.body` (same approach as the tab-strip menu) and copies via the Tauri clipboard plugin (`@tauri-apps/plugin-clipboard-manager`), falling back to `navigator.clipboard` only if the plugin throws. The plugin is required because the actions fire from a portaled menu that doesn't take focus, and `navigator.clipboard.writeText` rejects on WebKitGTK in that case — the cause of the original "Could not copy GitHub link" failure.
 - Resolution reuses the existing `remote_web_url` / `encode_branch_segment` helpers (currently `github.com` only).
 
 ## How to test

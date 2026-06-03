@@ -28,11 +28,12 @@
 	import { workspace, type OpenFile, type SplitSide } from '../state.svelte';
 	import { ipc } from '../ipc';
 	import ContextMenu from './ContextMenu.svelte';
+	import { writeText as clipboardWriteText } from '@tauri-apps/plugin-clipboard-manager';
 	import type { ContextMenuItem } from './contextMenu';
 	import { isReviewPath } from '../util/reviewPath';
 	import { languageFor } from '../editor/language';
 	import { moonEditorTheme } from '../editor/theme';
-	import { type EditorConfig, type LspPosition } from '../protocol';
+	import { formatError, type EditorConfig, type LspPosition } from '../protocol';
 
 	type Props = { file: OpenFile; side: SplitSide };
 	let { file, side }: Props = $props();
@@ -798,11 +799,22 @@
 	}
 
 	async function copyToClipboard(text: string, label: string) {
+		// Prefer the Tauri clipboard plugin: these actions fire from a
+		// ContextMenu portaled onto `document.body`, which doesn't take
+		// focus, and `navigator.clipboard.writeText` rejects on
+		// WebKitGTK when the triggering element isn't a focused input.
+		// Fall back to `navigator.clipboard` only if the plugin throws
+		// (e.g. a plain browser dev build) — same pattern as CoderPanel.
 		try {
-			await navigator.clipboard.writeText(text);
+			await clipboardWriteText(text);
 			workspace.flash(`Copied ${label}`);
 		} catch {
-			workspace.flash(`Could not copy ${label}`);
+			try {
+				await navigator.clipboard.writeText(text);
+				workspace.flash(`Copied ${label}`);
+			} catch {
+				workspace.flash(`Could not copy ${label}`);
+			}
 		}
 	}
 
@@ -819,8 +831,14 @@
 				return;
 			}
 			await copyToClipboard(form === 'markdown' ? link.markdown : link.url, label);
-		} catch {
-			workspace.flash(`Could not copy ${label}`);
+		} catch (err) {
+			// The clipboard write has its own flash inside
+			// `copyToClipboard`; reaching here means `gitPermalink`
+			// itself threw. Surface the real error instead of a generic
+			// "Could not copy" so a backend failure isn't mistaken for a
+			// clipboard problem.
+			frontendLog('moon-ide', 'error', `gitPermalink failed: ${formatError(err)}`);
+			workspace.flash(`Could not build ${label}: ${formatError(err)}`);
 		}
 	}
 
