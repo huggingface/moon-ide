@@ -1,9 +1,12 @@
 <script lang="ts">
+	import { mount as mountComponent, unmount } from 'svelte';
 	import { bottomPanel, type BottomPanelTab } from '../bottomPanel.svelte';
 	import { container } from '../container.svelte';
 	import { canOpenContainerTerminal, openContainerTerminal, openHostTerminal } from '../openTerminal';
 	import { workspace } from '../state.svelte';
-	import { terminalExitSuffix } from '../terminal.svelte';
+	import { terminal, terminalExitSuffix } from '../terminal.svelte';
+	import ContextMenu from './ContextMenu.svelte';
+	import type { ContextMenuItem } from './contextMenu';
 	import LogTab from './LogTab.svelte';
 	import LogsLauncher from './LogsLauncher.svelte';
 	import LogsPanel from './LogsPanel.svelte';
@@ -43,7 +46,110 @@
 
 	function handleClose(event: MouseEvent, id: string) {
 		event.stopPropagation();
+		closeTab(id);
+	}
+
+	// Closing a terminal tab has to kill the PTY, so it routes
+	// through the terminal store; every other kind is a pure
+	// chrome tab and goes straight to the panel. `terminal.close`
+	// falls back to `bottomPanel.closeTab` for ids it doesn't own.
+	function closeTab(id: string) {
+		const tab = bottomPanel.tabs.find((t) => t.id === id);
+		if (tab?.kind === 'terminal') {
+			void terminal.close(id);
+			return;
+		}
 		bottomPanel.closeTab(id);
+	}
+
+	// Right-click on a tab opens a Close / Close others / Close
+	// all menu, mirroring the editor tab strip. We re-use
+	// `ContextMenu.svelte` portaled onto `document.body` so it
+	// isn't clipped by the strip's horizontal scroll.
+	let activeTabMenu: ReturnType<typeof mountComponent> | null = null;
+	let activeTabMenuHost: HTMLElement | null = null;
+
+	$effect(() => {
+		return () => {
+			disposeTabMenu();
+		};
+	});
+
+	function disposeTabMenu() {
+		if (activeTabMenu) {
+			void unmount(activeTabMenu);
+			activeTabMenu = null;
+		}
+		if (activeTabMenuHost) {
+			activeTabMenuHost.remove();
+			activeTabMenuHost = null;
+		}
+	}
+
+	function buildTabMenuItems(tab: BottomPanelTab): ContextMenuItem[] {
+		const all = bottomPanel.tabs;
+		const hasOthers = all.some((t) => t.id !== tab.id);
+		return [
+			{
+				id: 'close',
+				label: 'Close',
+				onSelect: () => {
+					closeTab(tab.id);
+				},
+			},
+			{
+				id: 'close-others',
+				label: 'Close others',
+				disabled: !hasOthers,
+				onSelect: () => {
+					const others = bottomPanel.tabs.filter((t) => t.id !== tab.id).map((t) => t.id);
+					for (const id of others) {
+						closeTab(id);
+					}
+				},
+			},
+			{
+				id: 'close-all',
+				label: 'Close all',
+				disabled: all.length === 0,
+				onSelect: () => {
+					const ids = bottomPanel.tabs.map((t) => t.id);
+					for (const id of ids) {
+						closeTab(id);
+					}
+				},
+			},
+		];
+	}
+
+	function openTabMenu(event: MouseEvent, tab: BottomPanelTab) {
+		event.preventDefault();
+		event.stopPropagation();
+		disposeTabMenu();
+
+		const items = buildTabMenuItems(tab);
+		const host = document.createElement('div');
+		host.setAttribute('data-tab-context-menu-root', 'true');
+		host.style.position = 'fixed';
+		host.style.top = '0';
+		host.style.left = '0';
+		host.style.width = '0';
+		host.style.height = '0';
+		host.style.zIndex = '9999';
+		document.body.appendChild(host);
+
+		const anchorRect = { left: event.clientX, top: event.clientY, width: 0, height: 0 };
+		activeTabMenu = mountComponent(ContextMenu, {
+			target: host,
+			props: {
+				items,
+				anchorRect,
+				onClose: () => {
+					disposeTabMenu();
+				},
+			},
+		});
+		activeTabMenuHost = host;
 	}
 
 	function handleHide() {
@@ -98,7 +204,12 @@
 			{#each tabs as tab (tab.id)}
 				{@const chip = terminalChipFor(tab)}
 				{@const exitSuffix = tab.kind === 'terminal' ? terminalExitSuffix(tab.id) : ''}
-				<li class="tab-row" class:active={tab.id === activeId} role="presentation">
+				<li
+					class="tab-row"
+					class:active={tab.id === activeId}
+					role="presentation"
+					oncontextmenu={(e) => openTabMenu(e, tab)}
+				>
 					<button
 						type="button"
 						role="tab"
