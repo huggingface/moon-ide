@@ -44,3 +44,4 @@ manual.
 - [phase-06-coder.md](phase-06-coder.md)
 - [phase-07-multi-workspace.md](phase-07-multi-workspace.md)
 - [phase-11-slack-chat.md](phase-11-slack-chat.md)
+- [phase-13-mobile-companion.md](phase-13-mobile-companion.md)

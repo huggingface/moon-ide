@@ -2,6 +2,8 @@
 
 STATUS: planned — design only, no code yet. Decision record:
 [ADR 0023 — mobile companion via `moon-bridge`](decisions/0023-mobile-companion-bridge.md).
+Sub-phase work breakdown:
+[roadmaps/phase-13-mobile-companion.md](roadmaps/phase-13-mobile-companion.md).
 
 A phone companion that drives a running moon-ide over the LAN
 (typically the company VPN): run and steer coder sessions against a

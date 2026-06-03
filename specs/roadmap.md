@@ -27,7 +27,8 @@ The full phased plan. Update the **Status** column as phases land.
 | 9     | Custom tool plugins             | scaffolded  |
 | 10    | Theming                         | scaffolded  |
 | 11    | Slack chat panel                | scaffolded  |
-| 12+   | Innovation track                | open-ended  |
+| 12    | Innovation track                | open-ended  |
+| 13    | Mobile companion                | planned     |
 
 "Scaffolded" means: the module/spec slot exists but the feature is not real code yet. Each phase replaces "scaffolded" with "implemented" when its acceptance criteria are met.
 
@@ -154,7 +155,7 @@ A right-side panel that DMs a Slack bot (defaults to Hugging Face's [Moonbot](ht
 
 **Acceptance** (per sub-phase): Slack token + bot pick persist (11.0); read-only chat with Slack mrkdwn rendering (11.1 / 11.1.1); polling-driven thread updates + read receipts (11.2); send messages with reaction display (11.3 / 11.3.1); multi-bot panel (11.4). Deferred features (file attachments, AI session titles, hosted OAuth, etc.) live in [`slack-chat.md` § "What this phase deliberately doesn't do"](slack-chat.md#what-this-phase-deliberately-doesnt-do).
 
-## Phase 12+ — Innovation track
+## Phase 12 — Innovation track
 
 Open-ended. Examples:
 
@@ -162,3 +163,11 @@ Open-ended. Examples:
 - Agent-driven multi-file diffs with batch acceptance
 - Cross-repo refactor planner
 - Custom WebGL git lane renderer
+
+## Phase 13 — Mobile companion
+
+A phone companion that drives a running moon-ide over the LAN / VPN: run and steer coder sessions, and review + commit. Not a mobile IDE. A single host-resident `moon-bridge` daemon discovers running workspace processes by enumerating their per-workspace `instance.sock` files (the multi-workspace answer falls straight out of [ADR 0014](decisions/0014-process-per-workspace.md)) and relays the coder + git surface to the phone over the same JSON-RPC framing `moon-remote` uses — so the cloud / always-on future is a transport swap, not a second network transport. The app is an installable Svelte 5 PWA the bridge serves; native (Tauri mobile) is a deliberate future, not v1.
+
+Architectural spec: [companion.md](companion.md). Sub-phase work breakdown: [roadmaps/phase-13-mobile-companion.md](roadmaps/phase-13-mobile-companion.md). Decision: [ADR 0023 — mobile companion via `moon-bridge`](decisions/0023-mobile-companion-bridge.md).
+
+**Acceptance** (per sub-phase): `moon-bridge` crate + `instance.sock` workspace discovery (13.0); bridge ↔ process JSON-RPC relay over `moon-remote` framing (13.1); LAN HTTPS + WebSocket listener with self-signed TLS (13.2); TOFU-cert + device-token pairing with QR + revoke (13.3); PWA coder surface — workspace switcher, session run / steer / abort (13.4); PWA review & commit over the existing git layer (13.5). Deferred (full editing / terminal / LSP on phone, background-screen-off watching, detached overnight runs, multi-account, public-internet exposure, Windows host bridge) — see [`companion.md` § "What this deliberately doesn't do (v1)"](companion.md#what-this-deliberately-doesnt-do-v1).
