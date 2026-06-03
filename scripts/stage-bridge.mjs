@@ -1,52 +1,96 @@
-// Stage the companion bridge next to the IDE binary so the IDE's
-// `ensure_bridge_running` (ADR 0024) can find and auto-start it.
+// Stage the companion bridge so the IDE's `ensure_bridge_running`
+// (ADR 0024) can find and auto-start it, for both build paths:
+//
+//   - bundled build (`bun run build`): the bridge + PWA must live in
+//     `src-tauri/resources/bridge/` *before* `tauri build` runs, so
+//     the bundler copies them into the app's resource dir
+//     (`<resource>/bridge/...`). That's the `prepare` step.
+//   - --no-bundle (`bun run build:bin`): the exe runs straight from
+//     `target/<profile>/`, so after the build we also drop the bridge
+//     + PWA next to it (`target/<profile>/{moon-bridge, companion/}`).
+//     That's the `exe-adjacent` step.
 //
 // `tauri build` only compiles the desktop binary; `moon-bridge` is a
-// separate workspace member and the companion PWA is a separate Vite
-// app. This script builds both and copies them into the same
-// directory as the IDE exe (`target/<profile>/`), which is what
-// `current_exe().parent()` resolves to for a `--no-bundle` build:
+// separate workspace member and the PWA a separate Vite app, so this
+// script owns building + placing them. The IDE tries the resource dir
+// first, then exe-adjacent (see `ensure_bridge_running`).
 //
-//   target/<profile>/moon-bridge        (binary)
-//   target/<profile>/companion/         (built PWA, = companion/dist)
-//
-// Run after the IDE + companion builds (see package.json `build:bin`
-// / `build`). Bundled installers need these as tauri `resources` /
-// sidecar instead — tracked as a follow-up; this covers the
-// `--no-bundle` path the team uses day to day.
+// Usage:
+//   node scripts/stage-bridge.mjs prepare        # before tauri build
+//   node scripts/stage-bridge.mjs exe-adjacent   # after tauri build --no-bundle
+// Append `--debug` for a debug-profile build.
 
 import { execFileSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, rmSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+const mode = process.argv[2];
 const profile = process.argv.includes('--debug') ? 'debug' : 'release';
-const targetDir = join(repoRoot, 'target', profile);
 const bridgeName = process.platform === 'win32' ? 'moon-bridge.exe' : 'moon-bridge';
+
+if (mode !== 'prepare' && mode !== 'exe-adjacent') {
+	console.error('usage: stage-bridge.mjs <prepare|exe-adjacent> [--debug]');
+	process.exit(2);
+}
 
 function run(cmd, args) {
 	console.log(`> ${cmd} ${args.join(' ')}`);
 	execFileSync(cmd, args, { cwd: repoRoot, stdio: 'inherit' });
 }
 
-// 1. Build the moon-bridge binary into the same target profile dir.
+function builtBridgePath() {
+	const bin = join(repoRoot, 'target', profile, bridgeName);
+	if (!existsSync(bin)) {
+		throw new Error(`expected ${bin} after cargo build, but it is missing`);
+	}
+	return bin;
+}
+
+function builtDist() {
+	const dist = join(repoRoot, 'companion', 'dist');
+	if (!existsSync(dist)) {
+		throw new Error(`companion/dist not found — run \`bun run build:companion\` first (looked in ${dist})`);
+	}
+	return dist;
+}
+
+/**
+ * Copy the bridge binary + companion PWA into `destDir/`. Replaces
+ * only the two artifacts this script owns — it does not nuke the
+ * directory, so a tracked `.gitkeep` (kept in the resource dir so
+ * tauri-build's path validation passes on a fresh checkout) survives.
+ */
+function placeInto(destDir) {
+	mkdirSync(destDir, { recursive: true });
+
+	const srcBin = builtBridgePath();
+	const destBin = join(destDir, bridgeName);
+	// In exe-adjacent mode destDir *is* target/<profile>, so the
+	// built binary already sits at destBin — copying would be a
+	// remove-then-copy-onto-itself. Skip when they're the same file.
+	if (resolve(srcBin) !== resolve(destBin)) {
+		rmSync(destBin, { force: true });
+		cpSync(srcBin, destBin);
+	}
+
+	const destWeb = join(destDir, 'companion');
+	rmSync(destWeb, { recursive: true, force: true });
+	cpSync(builtDist(), destWeb, { recursive: true });
+	console.log(`Staged bridge + companion into ${destDir}`);
+}
+
+// Both modes need the binary built into target/<profile>/.
 run('cargo', ['build', '-p', 'moon-bridge', ...(profile === 'release' ? ['--release'] : [])]);
 
-// 2. Stage the built PWA next to the binary as `companion/`.
-const dist = join(repoRoot, 'companion', 'dist');
-if (!existsSync(dist)) {
-	throw new Error(`companion/dist not found — run \`bun run build:companion\` first (looked in ${dist})`);
+if (mode === 'prepare') {
+	// Populate the tauri resource source dir so `tauri build` bundles
+	// it (see tauri.conf.json > bundle > resources).
+	placeInto(join(repoRoot, 'src-tauri', 'resources', 'bridge'));
+} else {
+	// Drop next to the built exe for the --no-bundle path. `placeInto`
+	// is surgical (only its two artifacts), so it's safe to write
+	// straight into target/<profile> alongside moon-desktop.
+	placeInto(join(repoRoot, 'target', profile));
 }
-const stagedWeb = join(targetDir, 'companion');
-rmSync(stagedWeb, { recursive: true, force: true });
-mkdirSync(targetDir, { recursive: true });
-cpSync(dist, stagedWeb, { recursive: true });
-
-// 3. Sanity-check the binary landed where we expect.
-const bridgeBin = join(targetDir, bridgeName);
-if (!existsSync(bridgeBin)) {
-	throw new Error(`expected ${bridgeBin} after cargo build, but it is missing`);
-}
-
-console.log(`Staged companion bridge: ${bridgeBin} + ${stagedWeb}`);

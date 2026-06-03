@@ -1,0 +1,2 @@
+# Placeholder so tauri-build resource validation passes before
+# scripts/stage-bridge.mjs populates this dir. See ADR 0024.

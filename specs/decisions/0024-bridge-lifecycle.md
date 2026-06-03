@@ -121,10 +121,24 @@ dev/debug path and for anyone who wants to run the bridge explicitly.
   and one idle-watcher task. Both lean on machinery that already
   exists (the listener bind; the discovery enumeration).
 - The IDE gains a best-effort `Command::spawn` at the end of setup
-  (release only) plus the bundled `companion/dist` it points
-  `--web-root` at. How the dist is located/bundled is an
-  implementation detail (alongside the binary, or an embedded asset)
-  resolved in the change, not here.
+  (release only). Both build paths place the `moon-bridge` binary +
+  the companion PWA where `ensure_bridge_running` looks:
+  - **Bundled** (`bun run build`): tauri `bundle.resources` ships
+    them under the app's resource dir as `bridge/{moon-bridge,
+companion/}`; the IDE resolves it via `app.path().resolve("bridge",
+BaseDirectory::Resource)`. We bundle the binary as a **resource**
+    and spawn it ourselves (detached `std::process::Command`) rather
+    than via tauri's sidecar API, because the sidecar API ties the
+    child's lifetime to the app process — the exact coupling this ADR
+    avoids. Resources can lose the exec bit on copy, so the IDE
+    `chmod +x`es the binary before spawning.
+  - **`--no-bundle`** (`bun run build:bin`, the team's path): the
+    bridge + PWA are staged next to the exe in `target/<profile>/`.
+  - `scripts/stage-bridge.mjs` (`prepare` before bundling /
+    `exe-adjacent` after) builds `moon-bridge` and places both. The
+    resource source dir keeps a tracked `.gitkeep` so tauri-build's
+    resource-path validation passes on a fresh checkout before the
+    script populates it.
 - **The bridge port is now an implicit machine-wide singleton.** If
   another app squats `53180`, the bridge loses the election and the
   companion silently doesn't come up. Acceptable for an internal tool

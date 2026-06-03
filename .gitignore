@@ -24,3 +24,11 @@ bun.lockb
 # Per-workspace state moon-ide writes when run on this repo.
 # It is dev artifact, never project config — see specs/decisions/0005-bootstrap.md.
 .moon/
+
+# Staged companion bridge artifacts (built by scripts/stage-bridge.mjs
+# for bundling; see ADR 0024). The dir itself is tracked via a
+# .gitkeep so tauri-build's resource-path validation passes on a
+# fresh checkout; its built contents are regenerated every build.
+src-tauri/resources/bridge/*
+!src-tauri/resources/bridge/.gitkeep
+companion/dist/

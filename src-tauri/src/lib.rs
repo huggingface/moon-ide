@@ -517,7 +517,16 @@ pub fn run() {
 			// builds skip this — a forked child can't reach the vite dev
 			// server, and the developer runs `moon-bridge serve` by hand.
 			if !cfg!(debug_assertions) && matches!(mode, AppMode::Workspace { .. }) {
-				ensure_bridge_running();
+				// In a bundled build the bridge + PWA live under the
+				// tauri resource dir (`<resource>/bridge/`); in a
+				// `--no-bundle` build they sit next to the exe. Pass
+				// the resolved resource dir so the helper can try it
+				// first and fall back to exe-adjacent.
+				let resource_bridge_dir = app
+					.path()
+					.resolve("bridge", tauri::path::BaseDirectory::Resource)
+					.ok();
+				ensure_bridge_running(resource_bridge_dir);
 			}
 
 			// Auto-resume any compose project this workspace
@@ -632,41 +641,69 @@ fn resolve_config_dir() -> Result<Utf8PathBuf, String> {
 /// bridge is an optional affordance and must never block the editor
 /// from launching. The bridge's own port-bind owner-election means a
 /// duplicate child exits immediately, so we don't check first.
-fn ensure_bridge_running() {
-	let Ok(exe) = std::env::current_exe() else {
-		tracing::debug!("could not resolve current exe; skipping bridge auto-start");
-		return;
-	};
-	let Some(dir) = exe.parent() else {
-		return;
-	};
-	// The `moon-bridge` binary ships alongside `moon-ide` in the same
-	// bundle dir.
-	let bridge_bin = dir.join(if cfg!(windows) {
+fn ensure_bridge_running(resource_bridge_dir: Option<std::path::PathBuf>) {
+	let bin_name = if cfg!(windows) {
 		"moon-bridge.exe"
 	} else {
 		"moon-bridge"
-	});
-	if !bridge_bin.exists() {
-		tracing::debug!(path = %bridge_bin.display(), "moon-bridge binary not found next to exe; skipping auto-start");
-		return;
+	};
+
+	// Two layouts hold the bridge + companion PWA:
+	//   - bundled build:   `<resource>/bridge/{moon-bridge, companion/}`
+	//   - --no-bundle:     `<exe-dir>/{moon-bridge, companion/}`
+	// Try the resource dir first (it's the shipped artifact), then
+	// fall back to exe-adjacent for the dev/team `build:bin` path.
+	let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+	if let Some(dir) = resource_bridge_dir {
+		candidates.push(dir);
 	}
+	if let Ok(exe) = std::env::current_exe() {
+		if let Some(dir) = exe.parent() {
+			candidates.push(dir.to_path_buf());
+		}
+	}
+
+	let Some((bridge_bin, web_root)) = candidates.into_iter().find_map(|dir| {
+		let bin = dir.join(bin_name);
+		bin.exists().then(|| (bin, dir.join("companion")))
+	}) else {
+		tracing::debug!("moon-bridge binary not found in resource dir or next to exe; skipping auto-start");
+		return;
+	};
+
+	// Resources can lose the executable bit on copy; restore it so the
+	// spawn doesn't fail with EACCES on a freshly-installed bundle.
+	ensure_executable(&bridge_bin);
 
 	let mut cmd = std::process::Command::new(&bridge_bin);
 	cmd.arg("serve");
-	// Point the bridge at the bundled companion PWA if it's present
-	// next to the binary. Without it the bridge still runs (WS-only),
-	// so a missing dist is not fatal.
-	let web_root = dir.join("companion");
+	// Point the bridge at the companion PWA if present. Without it the
+	// bridge still runs (WS-only), so a missing dist is not fatal.
 	if web_root.is_dir() {
 		cmd.arg("--web-root").arg(&web_root);
 	}
 
 	match cmd.spawn() {
-		Ok(_) => tracing::info!("spawned moon-bridge serve (companion)"),
+		Ok(_) => tracing::info!(path = %bridge_bin.display(), "spawned moon-bridge serve (companion)"),
 		Err(err) => tracing::warn!(error = %err, "failed to spawn moon-bridge"),
 	}
 }
+
+#[cfg(unix)]
+fn ensure_executable(path: &std::path::Path) {
+	use std::os::unix::fs::PermissionsExt;
+	let Ok(meta) = std::fs::metadata(path) else {
+		return;
+	};
+	let mode = meta.permissions().mode();
+	// Add the execute bit for owner/group/other if missing.
+	if mode & 0o111 != 0o111 {
+		let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o111));
+	}
+}
+
+#[cfg(not(unix))]
+fn ensure_executable(_path: &std::path::Path) {}
 
 fn resolve_workspaces_dir() -> Result<Utf8PathBuf, String> {
 	let raw =

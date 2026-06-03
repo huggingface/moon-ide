@@ -139,18 +139,27 @@ ip>:<port>` + cert fingerprint + pairing code. LAN IP is detected
 - Verified live: two `serve`s on one port → second logs "already owns
   … exiting"; a `serve` with no live workspace self-exits exactly
   60 s in.
-- Build wiring (`--no-bundle`, the team's day-to-day path): `bun run
-build:bin` now builds the companion PWA, the IDE, and `moon-bridge`,
-  then `scripts/stage-bridge.mjs` copies `moon-bridge` + `companion/dist`
-  into `target/release/` next to `moon-desktop` — exactly where
-  `ensure_bridge_running` looks. Verified the three land side by side.
-- Deferred: the **bundled** installer path (`bun run build` →
-  AppImage / .deb / .app). There the exe runs from an install dir, not
-  `target/release/`, so the bridge + assets need tauri `externalBin`
-  (sidecar, target-triple-named) + `resources`, and a resource-dir
-  fallback in `ensure_bridge_running`. Until someone ships a bundle
-  it's a clean no-op (bundled IDE logs "binary not found", launches
-  fine). Not started — no installer is shipped yet.
+- Build wiring, **both paths** (ADR 0024 § Consequences):
+  - `--no-bundle` (`bun run build:bin`): builds companion + IDE +
+    `moon-bridge`, then `stage-bridge.mjs exe-adjacent` drops the
+    bridge + `companion/` into `target/release/` next to
+    `moon-desktop`. Verified the three land side by side and the
+    staged binary serves the staged PWA.
+  - bundled (`bun run build`): `stage-bridge.mjs prepare` populates
+    `src-tauri/resources/bridge/` _before_ `tauri build`, so tauri's
+    `bundle.resources` ships `bridge/{moon-bridge, companion/}` into
+    the app resource dir. `ensure_bridge_running` resolves it via
+    `BaseDirectory::Resource`, falling back to exe-adjacent, and
+    `chmod +x`es the binary (resources can lose the exec bit). We
+    bundle the binary as a resource and spawn it detached ourselves —
+    _not_ tauri's sidecar API, which would tie the bridge's lifetime
+    to the app process (the coupling ADR 0024 avoids).
+  - A tracked `src-tauri/resources/bridge/.gitkeep` keeps tauri-build's
+    resource-path validation happy on a fresh checkout.
+- Not verified live here: an actual AppImage/.deb run — the container
+  can't produce one. The bundled resolution path is verified by
+  construction (compiles; resource-dir-then-exe lookup; `--no-bundle`
+  spawn proven live). First real bundle build is the remaining check.
 
 ### 13.3 — Pairing (TOFU cert + device tokens)
 
