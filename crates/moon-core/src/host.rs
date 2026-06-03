@@ -1683,12 +1683,13 @@ impl WorkspaceHost for LocalHost {
 
 	async fn git_commit_on_new_branch(&self, branch: &str, message: &str) -> MoonResult<GitCommitResult> {
 		let guard = self.git_lock().await;
+		let target = self.shell_target().await;
 		let root = self.root.clone();
 		let branch = branch.to_owned();
 		let message = message.to_owned();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
-			run_git_commit_on_new_branch(&root, &branch, &message)
+			run_git_commit_on_new_branch(&root, &branch, &message, &target)
 		})
 		.await
 		.map_err(|e| MoonError::Internal(format!("git_commit_on_new_branch join error: {e}")))?
@@ -1711,11 +1712,12 @@ impl WorkspaceHost for LocalHost {
 			return Err(MoonError::invalid("commit message is empty"));
 		}
 		let guard = self.git_lock().await;
+		let target = self.shell_target().await;
 		let root = self.root.clone();
 		let owned = trimmed.to_owned();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
-			run_git_commit(&root, &owned, amend)
+			run_git_commit(&root, &owned, amend, &target)
 		})
 		.await
 		.map_err(|e| MoonError::Internal(format!("git_commit join error: {e}")))?
@@ -2151,12 +2153,57 @@ fn encode_branch_segment(branch: &str) -> String {
 /// `git stash create -u` silently drops untracked files on
 /// git ≤ 2.43 — but staging-as-Added pulls them into the index
 /// where a vanilla `git stash create` captures them.
-fn run_git_commit(root: &Utf8Path, message: &str, amend: bool) -> MoonResult<GitCommitResult> {
+/// Build a `git` invocation for `root` that lands in the right
+/// userland. For [`ShellTarget::Host`] this is `git -C <root> …`,
+/// exactly as before. For [`ShellTarget::Container`] it becomes
+/// `docker exec -w <server_root> <container> git -C <server_root> …`
+/// so the commit's pre-commit hook runs with the container's
+/// toolchain (`node_modules/.bin/`, fnm's Node, the pinned
+/// formatters) instead of whatever the host happens to have on
+/// `PATH` — the same routing principle format-on-save already
+/// uses (ADR 0013 § Container routing).
+///
+/// The `.git` directory is the same bytes on both sides through
+/// the bind mount, so index / object writes are coherent
+/// regardless of which userland git runs in; what changes is the
+/// hook's environment. Callers append the git subcommand and its
+/// arguments with `.arg(...)` / `.args(...)` as usual.
+///
+/// When the active folder lives outside the container bind mount
+/// (path translation fails) we fall back to host execution rather
+/// than spawning git against a path the in-container process
+/// can't see.
+fn git_command(target: &ShellTarget, root: &Utf8Path) -> std::process::Command {
 	use std::process::Command;
 
-	let stage = Command::new("git")
-		.arg("-C")
-		.arg(root.as_std_path())
+	match target {
+		ShellTarget::Host => {
+			let mut cmd = Command::new("git");
+			cmd.arg("-C").arg(root.as_std_path());
+			cmd
+		}
+		ShellTarget::Container { container_name, .. } => {
+			let Some(server_root) = target.translate_path(root) else {
+				let mut cmd = Command::new("git");
+				cmd.arg("-C").arg(root.as_std_path());
+				return cmd;
+			};
+			let mut cmd = Command::new("docker");
+			cmd
+				.arg("exec")
+				.arg("-w")
+				.arg(server_root.as_str())
+				.arg(container_name)
+				.arg("git")
+				.arg("-C")
+				.arg(server_root.as_str());
+			cmd
+		}
+	}
+}
+
+fn run_git_commit(root: &Utf8Path, message: &str, amend: bool, target: &ShellTarget) -> MoonResult<GitCommitResult> {
+	let stage = git_command(target, root)
 		.args(["add", "-A"])
 		.output()
 		.map_err(|e| MoonError::IoError(format!("git add failed to launch: {e}")))?;
@@ -2171,12 +2218,10 @@ fn run_git_commit(root: &Utf8Path, message: &str, amend: bool) -> MoonResult<Git
 		)));
 	}
 
-	let safety = take_commit_safety_snapshot(root);
+	let safety = take_commit_safety_snapshot(root, target);
 
-	let mut commit = Command::new("git");
+	let mut commit = git_command(target, root);
 	commit
-		.arg("-C")
-		.arg(root.as_std_path())
 		// Force the C locale so the "nothing to commit" detection
 		// below works regardless of the user's system language —
 		// otherwise git localises stdout (e.g. French outputs
@@ -2203,7 +2248,7 @@ fn run_git_commit(root: &Utf8Path, message: &str, amend: bool) -> MoonResult<Git
 		let stdout = String::from_utf8_lossy(&commit.stdout).to_string();
 		let stderr = String::from_utf8_lossy(&commit.stderr).trim().to_string();
 		if let Some(snap) = &safety {
-			try_restore_commit_safety_snapshot(root, snap);
+			try_restore_commit_safety_snapshot(root, snap, target);
 		}
 		// `git commit` prints "nothing to commit, working tree clean"
 		// (or one of several variants) on stdout when the index has
@@ -2225,9 +2270,7 @@ fn run_git_commit(root: &Utf8Path, message: &str, amend: bool) -> MoonResult<Git
 		)));
 	}
 
-	let short_sha = Command::new("git")
-		.arg("-C")
-		.arg(root.as_std_path())
+	let short_sha = git_command(target, root)
 		.args(["rev-parse", "--short", "HEAD"])
 		.output()
 		.ok()
@@ -2243,9 +2286,7 @@ fn run_git_commit(root: &Utf8Path, message: &str, amend: bool) -> MoonResult<Git
 	// message we just sent (it's by construction the new
 	// subject).
 	let summary = if amend && message.is_empty() {
-		Command::new("git")
-			.arg("-C")
-			.arg(root.as_std_path())
+		git_command(target, root)
 			.args(["log", "-1", "--pretty=%s"])
 			.output()
 			.ok()
@@ -2271,15 +2312,8 @@ fn run_git_commit(root: &Utf8Path, message: &str, amend: bool) -> MoonResult<Git
 /// dangling commit. Callers either reference it explicitly via
 /// [`try_restore_commit_safety_snapshot`] or let it be GC'd.
 /// Cost is sub-millisecond on a typical repo.
-fn take_commit_safety_snapshot(root: &Utf8Path) -> Option<String> {
-	use std::process::Command;
-
-	let output = Command::new("git")
-		.arg("-C")
-		.arg(root.as_std_path())
-		.args(["stash", "create"])
-		.output()
-		.ok()?;
+fn take_commit_safety_snapshot(root: &Utf8Path, target: &ShellTarget) -> Option<String> {
+	let output = git_command(target, root).args(["stash", "create"]).output().ok()?;
 	if !output.status.success() {
 		return None;
 	}
@@ -2319,30 +2353,20 @@ fn take_commit_safety_snapshot(root: &Utf8Path) -> Option<String> {
 /// Errors are never propagated — restoration is opportunistic
 /// and the caller is already returning a commit failure. The
 /// `tracing` lines are the supported triage channel.
-fn try_restore_commit_safety_snapshot(root: &Utf8Path, sha: &str) {
-	use std::process::Command;
-
-	let read_tree = Command::new("git")
-		.arg("-C")
-		.arg(root.as_std_path())
-		.args(["read-tree", "--reset", sha])
-		.output();
+fn try_restore_commit_safety_snapshot(root: &Utf8Path, sha: &str, target: &ShellTarget) {
+	let read_tree = git_command(target, root).args(["read-tree", "--reset", sha]).output();
 	let read_tree_ok = matches!(&read_tree, Ok(o) if o.status.success());
 	if !read_tree_ok {
 		log_safety_snapshot_failure(sha, "read-tree", &read_tree);
-		store_safety_snapshot_for_manual_recovery(root, sha);
+		store_safety_snapshot_for_manual_recovery(root, sha, target);
 		return;
 	}
 
-	let checkout = Command::new("git")
-		.arg("-C")
-		.arg(root.as_std_path())
-		.args(["checkout-index", "-a", "-f"])
-		.output();
+	let checkout = git_command(target, root).args(["checkout-index", "-a", "-f"]).output();
 	let checkout_ok = matches!(&checkout, Ok(o) if o.status.success());
 	if !checkout_ok {
 		log_safety_snapshot_failure(sha, "checkout-index", &checkout);
-		store_safety_snapshot_for_manual_recovery(root, sha);
+		store_safety_snapshot_for_manual_recovery(root, sha, target);
 		return;
 	}
 
@@ -2374,12 +2398,8 @@ fn log_safety_snapshot_failure(sha: &str, step: &str, result: &std::io::Result<s
 	}
 }
 
-fn store_safety_snapshot_for_manual_recovery(root: &Utf8Path, sha: &str) {
-	use std::process::Command;
-
-	let store = Command::new("git")
-		.arg("-C")
-		.arg(root.as_std_path())
+fn store_safety_snapshot_for_manual_recovery(root: &Utf8Path, sha: &str, target: &ShellTarget) {
+	let store = git_command(target, root)
 		.args([
 			"stash",
 			"store",
@@ -2405,15 +2425,16 @@ fn store_safety_snapshot_for_manual_recovery(root: &Utf8Path, sha: &str) {
 /// `git branch -D <branch>`) so the user's `HEAD` is back where
 /// it started — best-effort, the original error is what the
 /// caller surfaces.
-fn run_git_commit_on_new_branch(root: &Utf8Path, branch: &str, message: &str) -> MoonResult<GitCommitResult> {
-	use std::process::Command;
-
+fn run_git_commit_on_new_branch(
+	root: &Utf8Path,
+	branch: &str,
+	message: &str,
+	target: &ShellTarget,
+) -> MoonResult<GitCommitResult> {
 	if branch.is_empty() {
 		return Err(MoonError::invalid("branch name is empty"));
 	}
-	let check = Command::new("git")
-		.arg("-C")
-		.arg(root.as_std_path())
+	let check = git_command(target, root)
 		.args(["check-ref-format", "--branch", branch])
 		.output()
 		.map_err(|e| MoonError::IoError(format!("git check-ref-format failed to launch: {e}")))?;
@@ -2431,9 +2452,7 @@ fn run_git_commit_on_new_branch(root: &Utf8Path, branch: &str, message: &str) ->
 	// back to it. Detached HEAD returns a non-zero exit; we treat
 	// that as "no name to roll back to" and fall back to switching
 	// by SHA.
-	let previous_ref = Command::new("git")
-		.arg("-C")
-		.arg(root.as_std_path())
+	let previous_ref = git_command(target, root)
 		.args(["symbolic-ref", "--quiet", "--short", "HEAD"])
 		.output()
 		.ok()
@@ -2441,9 +2460,7 @@ fn run_git_commit_on_new_branch(root: &Utf8Path, branch: &str, message: &str) ->
 		.and_then(|o| String::from_utf8(o.stdout).ok())
 		.map(|s| s.trim().to_owned())
 		.filter(|s| !s.is_empty());
-	let previous_sha = Command::new("git")
-		.arg("-C")
-		.arg(root.as_std_path())
+	let previous_sha = git_command(target, root)
 		.args(["rev-parse", "HEAD"])
 		.output()
 		.ok()
@@ -2452,9 +2469,7 @@ fn run_git_commit_on_new_branch(root: &Utf8Path, branch: &str, message: &str) ->
 		.map(|s| s.trim().to_owned())
 		.filter(|s| !s.is_empty());
 
-	let switch = Command::new("git")
-		.arg("-C")
-		.arg(root.as_std_path())
+	let switch = git_command(target, root)
 		.args(["switch", "-c", branch])
 		.output()
 		.map_err(|e| MoonError::IoError(format!("git switch -c failed to launch: {e}")))?;
@@ -2468,7 +2483,7 @@ fn run_git_commit_on_new_branch(root: &Utf8Path, branch: &str, message: &str) ->
 		)));
 	}
 
-	let commit_result = run_git_commit(root, message, false);
+	let commit_result = run_git_commit(root, message, false, target);
 	match commit_result {
 		Ok(result) => Ok(result),
 		Err(err) => {
@@ -2478,20 +2493,11 @@ fn run_git_commit_on_new_branch(root: &Utf8Path, branch: &str, message: &str) ->
 			// original commit error, since that's the one the
 			// user has to act on.
 			let rollback_target = previous_ref.as_deref().or(previous_sha.as_deref());
-			if let Some(target) = rollback_target {
-				let switch_back = Command::new("git")
-					.arg("-C")
-					.arg(root.as_std_path())
-					.args(["switch", target])
-					.output();
+			if let Some(rollback_ref) = rollback_target {
+				let switch_back = git_command(target, root).args(["switch", rollback_ref]).output();
 				if let Err(e) = switch_back {
-					tracing::warn!(target = %target, error = %e, "rollback: git switch failed to launch");
-				} else if let Ok(out) = Command::new("git")
-					.arg("-C")
-					.arg(root.as_std_path())
-					.args(["branch", "-D", branch])
-					.output()
-				{
+					tracing::warn!(target = %rollback_ref, error = %e, "rollback: git switch failed to launch");
+				} else if let Ok(out) = git_command(target, root).args(["branch", "-D", branch]).output() {
 					if !out.status.success() {
 						let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
 						tracing::warn!(branch = %branch, stderr = %msg, "rollback: failed to delete fresh branch");
@@ -5716,6 +5722,61 @@ mod tests {
 			.output()
 			.unwrap();
 		assert_eq!(String::from_utf8_lossy(&head_branch.stdout).trim(), "main");
+	}
+
+	#[test]
+	fn git_command_host_runs_git_directly() {
+		let root = Utf8Path::new("/home/dev/code/proj");
+		let cmd = git_command(&ShellTarget::Host, root);
+		let std_cmd = cmd.get_program().to_owned();
+		assert_eq!(std_cmd, "git");
+		let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+		assert_eq!(args, vec!["-C", "/home/dev/code/proj"]);
+	}
+
+	#[test]
+	fn git_command_container_wraps_docker_exec_with_translated_root() {
+		// When the workspace shell container is running, the commit
+		// (and therefore its pre-commit hook) must run inside the
+		// container so the hook resolves the project's own
+		// toolchain. The `.git` bytes are identical through the
+		// bind mount, so this only changes the hook's environment.
+		let target = ShellTarget::Container {
+			container_name: "moon-ws-default-dev-1".into(),
+			host_root: Utf8PathBuf::from("/home/dev/code/proj"),
+			server_root: Utf8PathBuf::from("/workspace/proj"),
+		};
+		let cmd = git_command(&target, Utf8Path::new("/home/dev/code/proj"));
+		assert_eq!(cmd.get_program(), "docker");
+		let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+		assert_eq!(
+			args,
+			vec![
+				"exec",
+				"-w",
+				"/workspace/proj",
+				"moon-ws-default-dev-1",
+				"git",
+				"-C",
+				"/workspace/proj"
+			]
+		);
+	}
+
+	#[test]
+	fn git_command_container_falls_back_to_host_outside_mount() {
+		// A folder outside the bind mount can't be reached by an
+		// in-container git, so we run on the host rather than spawn
+		// against a path the container can't see.
+		let target = ShellTarget::Container {
+			container_name: "moon-ws-default-dev-1".into(),
+			host_root: Utf8PathBuf::from("/home/dev/code/proj"),
+			server_root: Utf8PathBuf::from("/workspace/proj"),
+		};
+		let cmd = git_command(&target, Utf8Path::new("/etc/elsewhere"));
+		assert_eq!(cmd.get_program(), "git");
+		let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+		assert_eq!(args, vec!["-C", "/etc/elsewhere"]);
 	}
 
 	#[tokio::test]
