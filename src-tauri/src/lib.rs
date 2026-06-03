@@ -509,6 +509,17 @@ pub fn run() {
 
 			app.manage(state);
 
+			// Ensure the mobile-companion bridge is running for this
+			// machine (ADR 0024). Best-effort, detached, release-only:
+			// every workspace launch fires a `moon-bridge serve` child;
+			// the bridge's own owner-election means at most one survives,
+			// and it self-exits when the last workspace closes. Dev
+			// builds skip this — a forked child can't reach the vite dev
+			// server, and the developer runs `moon-bridge serve` by hand.
+			if !cfg!(debug_assertions) && matches!(mode, AppMode::Workspace { .. }) {
+				ensure_bridge_running();
+			}
+
 			// Auto-resume any compose project this workspace
 			// had running last time. Workspace-mode only —
 			// preboot has no compose project to resume.
@@ -615,6 +626,48 @@ fn resolve_config_dir() -> Result<Utf8PathBuf, String> {
 /// so a wipe is `~/.config/<bundle_id>` plus
 /// `~/.local/share/<bundle_id>`, no surprise third
 /// directory.
+/// Fire a detached `moon-bridge serve` child for the mobile
+/// companion (ADR 0024). Best-effort: any failure (binary not found,
+/// no companion assets, spawn error) is logged and swallowed — the
+/// bridge is an optional affordance and must never block the editor
+/// from launching. The bridge's own port-bind owner-election means a
+/// duplicate child exits immediately, so we don't check first.
+fn ensure_bridge_running() {
+	let Ok(exe) = std::env::current_exe() else {
+		tracing::debug!("could not resolve current exe; skipping bridge auto-start");
+		return;
+	};
+	let Some(dir) = exe.parent() else {
+		return;
+	};
+	// The `moon-bridge` binary ships alongside `moon-ide` in the same
+	// bundle dir.
+	let bridge_bin = dir.join(if cfg!(windows) {
+		"moon-bridge.exe"
+	} else {
+		"moon-bridge"
+	});
+	if !bridge_bin.exists() {
+		tracing::debug!(path = %bridge_bin.display(), "moon-bridge binary not found next to exe; skipping auto-start");
+		return;
+	}
+
+	let mut cmd = std::process::Command::new(&bridge_bin);
+	cmd.arg("serve");
+	// Point the bridge at the bundled companion PWA if it's present
+	// next to the binary. Without it the bridge still runs (WS-only),
+	// so a missing dist is not fatal.
+	let web_root = dir.join("companion");
+	if web_root.is_dir() {
+		cmd.arg("--web-root").arg(&web_root);
+	}
+
+	match cmd.spawn() {
+		Ok(_) => tracing::info!("spawned moon-bridge serve (companion)"),
+		Err(err) => tracing::warn!(error = %err, "failed to spawn moon-bridge"),
+	}
+}
+
 fn resolve_workspaces_dir() -> Result<Utf8PathBuf, String> {
 	let raw =
 		dirs::data_local_dir().ok_or_else(|| "could not resolve local data dir for the current platform".to_owned())?;

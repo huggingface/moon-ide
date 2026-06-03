@@ -56,6 +56,17 @@ One per host machine. Responsibilities:
   but-not-running workspace (the same action `window_open` performs),
   so the phone isn't limited to whatever the desktop is focused on.
 
+### Lifecycle — the IDE owns it (ADR 0024)
+
+The user never runs the bridge by hand: **running the IDE makes the
+companion reachable.** Each release IDE launch fires a detached
+`moon-bridge serve` child; binding the LAN port is a machine-wide
+owner election, so at most one bridge survives no matter how many
+windows are open. The bridge self-exits when discovery finds zero
+live workspaces (the last IDE closed), so it's running iff an IDE is.
+Dev builds skip auto-start — run `moon-bridge serve --web-root
+companion/dist` by hand. Full design: [ADR 0024](decisions/0024-bridge-lifecycle.md).
+
 Why a single daemon and not one listener per Tauri process: per
 [ADR 0014](decisions/0014-process-per-workspace.md) workspace
 processes are ephemeral (one per workspace, spawned on demand,

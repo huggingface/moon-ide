@@ -100,7 +100,20 @@ pub async fn serve(
 	pairing: Option<PairingSession>,
 ) -> anyhow::Result<()> {
 	let acceptor = TlsAcceptor::from(tls.server_config);
-	let listener = TcpListener::bind(addr).await?;
+
+	// Binding the LAN port *is* the machine-wide owner election
+	// (ADR 0024): the first bridge to bind wins; a later one hits
+	// `AddrInUse` and exits cleanly, since a live owner already serves
+	// the whole machine. This is why every IDE can fire-and-forget a
+	// `serve` child on startup without coordinating.
+	let listener = match TcpListener::bind(addr).await {
+		Ok(l) => l,
+		Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+			tracing::info!(%addr, "another bridge already owns this port; exiting");
+			return Ok(());
+		}
+		Err(err) => return Err(err.into()),
+	};
 	tracing::info!(%addr, "moon-bridge listening");
 
 	let ctx = Arc::new(ServeCtx {
@@ -109,6 +122,14 @@ pub async fn serve(
 		devices,
 		pairing: Mutex::new(pairing),
 	});
+
+	// Idle watcher: when no workspace is live, the bridge has nothing
+	// to serve, so it exits (ADR 0024). Discovery is the same signal
+	// used for the switcher, so "the last IDE closed" needs no extra
+	// IPC. A grace period before the first check avoids a race where
+	// the bridge starts microseconds before the IDE that spawned it
+	// has bound its own `instance.sock`.
+	spawn_idle_watcher(ctx.workspaces_dir.clone());
 
 	loop {
 		let (stream, peer) = match listener.accept().await {
@@ -126,6 +147,42 @@ pub async fn serve(
 			}
 		});
 	}
+}
+
+/// Grace period before the first idle check, so the bridge doesn't
+/// exit in the gap between starting and the IDE that spawned it
+/// binding its own `instance.sock`.
+const IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often the idle watcher re-checks for live workspaces.
+const IDLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Exit the process once no workspace is live (ADR 0024). Discovery
+/// is the same signal the switcher uses, so "the last IDE closed"
+/// needs no extra IPC. Runs forever; the only way out is
+/// `std::process::exit` when the live count hits zero.
+fn spawn_idle_watcher(workspaces_dir: Utf8PathBuf) {
+	tokio::spawn(async move {
+		tokio::time::sleep(IDLE_GRACE).await;
+		// `config_dir` only decorates names; discovery's liveness
+		// doesn't depend on it, so a config-dir hiccup falls back to
+		// the workspaces dir as its own config root (harmless).
+		let config_dir = crate::discovery::resolve_config_dir().unwrap_or_else(|_| workspaces_dir.clone());
+		loop {
+			tokio::time::sleep(IDLE_INTERVAL).await;
+			// Only exit on a *successful* discovery reporting zero live
+			// workspaces. A transient discovery error keeps the bridge
+			// up rather than tearing it down on a filesystem blip.
+			match crate::discovery::discover(&workspaces_dir, &config_dir).await {
+				Ok(ws) if ws.iter().all(|w| !w.live) => {
+					tracing::info!("no live workspaces; bridge exiting");
+					std::process::exit(0);
+				}
+				Ok(_) => {}
+				Err(err) => tracing::debug!(error = %err, "idle check discovery failed; staying up"),
+			}
+		}
+	});
 }
 
 async fn handle_conn(

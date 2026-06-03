@@ -119,6 +119,31 @@ ip>:<port>` + cert fingerprint + pairing code. LAN IP is detected
   storage backend; it's the same keyring the coder / Slack tokens
   already use on real machines.
 
+### 13.2b — Bridge lifecycle: IDE auto-starts it, self-exits when idle — LANDED
+
+- Decision: [ADR 0024](../decisions/0024-bridge-lifecycle.md). The
+  user never runs the bridge by hand; running the IDE makes the
+  companion reachable.
+- `serve` owner-election: binding the LAN port _is_ the election — a
+  second bridge hits `AddrInUse` and exits 0. So every IDE can
+  fire-and-forget a `serve` child without coordinating.
+- `serve` idle watcher: a 30 s tick (after a 30 s startup grace)
+  exits the process when discovery reports zero live workspaces —
+  "last IDE closed" needs no IPC, it's the same signal the switcher
+  reads.
+- IDE side (`ensure_bridge_running`, release builds only): spawns a
+  detached `moon-bridge serve --web-root <dist>` child after setup,
+  resolving the binary + companion assets next to the exe. Best-
+  effort — a missing binary / dist is logged and skipped, never
+  blocks launch. Dev builds skip it (run `moon-bridge serve` by hand).
+- Verified live: two `serve`s on one port → second logs "already owns
+  … exiting"; a `serve` with no live workspace self-exits exactly
+  60 s in.
+- Deferred: actually bundling the `moon-bridge` binary + `companion/dist`
+  into the release artifact (tauri resources / sidecar config) —
+  `ensure_bridge_running` already resolves them next to the exe, so
+  it's a packaging task, not a code-shape one.
+
 ### 13.3 — Pairing (TOFU cert + device tokens)
 
 Credential core LANDED early (`moon-bridge/src/pairing.rs`):
