@@ -80,6 +80,19 @@ States the panel needs to render:
 | `tools`     | one or more `tool_execution_*` blocks expanding inline; abort enabled         |
 | `error`     | error banner above composer, "retry" / "continue" affordances                 |
 
+Tool rows render collapsed by default — a one-line summary (status
+dot, name, identifying-argument hint, status word, elapsed). The
+expanded body (syntax-highlighted file content, diff hunks, grep
+hits, terminal-style bash output, …) is rendered **lazily on first
+expand**: a collapsed `<details>` keeps its children mounted, so
+mounting every `ToolBody*` up front would run a grammar-load +
+highlight pass per row on the initial paint and stall the panel on
+a long, tool-heavy session. `CoderPanel` tracks which rows have
+been opened (`openedToolRows`, a `SvelteSet` of row ids keyed off
+`ontoggle`) and only mounts the body once a row has been expanded;
+the set is cleared on session/transcript swap. See test-plan 0076
+for the perf rationale and measurements.
+
 Three control surfaces:
 
 - **Abort** (`Esc`): cancels the in-flight HTTP / SSE / tool-call.

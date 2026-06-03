@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
+	import { SvelteSet } from 'svelte/reactivity';
 	import { confirm } from '@tauri-apps/plugin-dialog';
 	import { readImage, writeText as clipboardWriteText } from '@tauri-apps/plugin-clipboard-manager';
 	import { openUrl } from '@tauri-apps/plugin-opener';
@@ -246,6 +247,13 @@
 			// flag stays "false" from a previous-session
 			// scroll-up and the new conversation never anchors.
 			stickyBottom = true;
+			// Drop remembered tool-row expansions so a freshly
+			// loaded transcript starts with every body cold
+			// (collapsed = unmounted). Row ids are unique per
+			// session, so a stale id would never match anyway,
+			// but clearing keeps the set from growing unbounded
+			// across many session swaps.
+			openedToolRows.clear();
 		}
 		lastRowCount = count;
 		if (!stickyBottom) {
@@ -869,6 +877,30 @@
 	// when the underlying tick lands at 4.247s.
 	let nowTick = $state(Date.now());
 	const hasRunningTool = $derived(coder.rows.some((row) => row.kind === 'tool' && !row.hasResult));
+
+	// Lazy tool-body rendering. Tool rows render collapsed by
+	// default, but a `<details>` keeps its slotted children mounted
+	// even while closed — so without this gate every `ToolBody*`
+	// instance runs its grammar load + syntax-highlight pass on
+	// first paint, even for rows the user never expands. On a long
+	// session that fans out into hundreds of highlighter loads
+	// during the initial render and stalls the panel for seconds
+	// (the documented follow-up in test-plan 0076, rec'n 1).
+	//
+	// We render each tool body only once its `<details>` has been
+	// opened at least once, tracked here by row id. The set is
+	// sticky: re-collapsing a row keeps its body mounted (the work
+	// is already paid for, and tearing it down would re-run the
+	// highlighter on the next open). Cleared on session swap via
+	// the row-count reset below so a fresh transcript starts cold.
+	let openedToolRows = $state(new SvelteSet<string>());
+
+	function onToolToggle(event: Event, rowId: string): void {
+		const details = event.currentTarget;
+		if (details instanceof HTMLDetailsElement && details.open) {
+			openedToolRows.add(rowId);
+		}
+	}
 	$effect(() => {
 		if (!hasRunningTool) {
 			return;
@@ -1776,7 +1808,7 @@
 				 the name into the summary trades two short lines
 				 plus the inter-line gap for one. The args / result
 				 blocks render unchanged when the row is expanded. -->
-			<details>
+			<details ontoggle={(event) => onToolToggle(event, row.id)}>
 				<summary>
 					<span class="tool-dot" class:running={!row.hasResult} class:err={row.isError} aria-hidden="true"></span>
 					<span class="tool-name">{row.name}</span>
@@ -1799,11 +1831,20 @@
 						 interval. -->
 					<span class="tool-elapsed" class:running={!row.hasResult}>{fmtElapsed(elapsedMs, !row.hasResult)}</span>
 				</summary>
-				{#if row.name === 'bash'}
-					{@const bArgs = parseBashArgs(row.args)}
-					{@const bResult = row.hasResult ? parseBashResult(row.result) : null}
-					{@const bashCmd = bResult?.cmd ?? bArgs?.cmd ?? ''}
-					<!-- Terminal-style view: a `$ <cmd>` line, then
+				<!-- Body renders lazily: only once the row's `<details>`
+					 has been opened (`openedToolRows.has(row.id)`). A
+					 collapsed `<details>` keeps slotted children mounted,
+					 so without this gate every `ToolBody*` would run its
+					 grammar-load + highlight pass on first paint even
+					 though the row is closed. Deferring to first-open
+					 keeps the initial transcript render cheap regardless
+					 of how many tool calls the session holds. -->
+				{#if openedToolRows.has(row.id)}
+					{#if row.name === 'bash'}
+						{@const bArgs = parseBashArgs(row.args)}
+						{@const bResult = row.hasResult ? parseBashResult(row.result) : null}
+						{@const bashCmd = bResult?.cmd ?? bArgs?.cmd ?? ''}
+						<!-- Terminal-style view: a `$ <cmd>` line, then
 						 stdout / stderr blocks, then an `exit N` tag.
 						 Reads like the user just ran the command in a
 						 shell — much closer to the agent's mental
@@ -1812,36 +1853,36 @@
 						 args/result don't match the expected shape
 						 (legacy traces, tool errors that returned a
 						 plain string, etc.). -->
-					{#if bArgs !== null || bResult !== null}
-						<div class="bash-block">
-							<div class="bash-cmd">
-								<span class="bash-prompt" aria-hidden="true">$</span>
-								<span class="bash-cmd-text">{bashCmd}</span>
-							</div>
-							{#if bResult !== null}
-								{#if bResult.stdout.length > 0}
-									<pre class="bash-stream bash-stdout">{bResult.stdout}</pre>
-								{/if}
-								{#if bResult.stderr.length > 0}
-									<pre class="bash-stream bash-stderr">{bResult.stderr}</pre>
-								{/if}
-								<div class="bash-exit" class:err={bResult.exitCode !== 0 && bResult.exitCode !== null}>
-									exit {bResult.exitCode ?? '?'}{#if bResult.target}
-										<span class="bash-target"> · {bResult.target}</span>
-									{/if}
+						{#if bArgs !== null || bResult !== null}
+							<div class="bash-block">
+								<div class="bash-cmd">
+									<span class="bash-prompt" aria-hidden="true">$</span>
+									<span class="bash-cmd-text">{bashCmd}</span>
 								</div>
+								{#if bResult !== null}
+									{#if bResult.stdout.length > 0}
+										<pre class="bash-stream bash-stdout">{bResult.stdout}</pre>
+									{/if}
+									{#if bResult.stderr.length > 0}
+										<pre class="bash-stream bash-stderr">{bResult.stderr}</pre>
+									{/if}
+									<div class="bash-exit" class:err={bResult.exitCode !== 0 && bResult.exitCode !== null}>
+										exit {bResult.exitCode ?? '?'}{#if bResult.target}
+											<span class="bash-target"> · {bResult.target}</span>
+										{/if}
+									</div>
+								{/if}
+							</div>
+						{:else}
+							<div class="block-label">args</div>
+							<pre class="block">{fmtArgs(row.args)}</pre>
+							{#if row.hasResult}
+								<div class="block-label">result</div>
+								<pre class="block">{fmtArgs(row.result)}</pre>
 							{/if}
-						</div>
-					{:else}
-						<div class="block-label">args</div>
-						<pre class="block">{fmtArgs(row.args)}</pre>
-						{#if row.hasResult}
-							<div class="block-label">result</div>
-							<pre class="block">{fmtArgs(row.result)}</pre>
 						{/if}
-					{/if}
-				{:else if row.name === 'read_file'}
-					<!-- File-viewer view: path header, line numbers
+					{:else if row.name === 'read_file'}
+						<!-- File-viewer view: path header, line numbers
 						 in a sticky column, syntax-highlighted code
 						 in a scroll column. Same `@lezer/highlight`
 						 pipeline that paints fenced blocks in the
@@ -1849,65 +1890,66 @@
 						 shares colours with the live editor. The
 						 component falls back to the JSON view on
 						 unrecognised payload shapes itself. -->
-					<ToolBodyReadFile args={row.args} result={row.result} hasResult={row.hasResult} />
-				{:else if row.name === 'write_file'}
-					<!-- File-write view: header `wrote <path> · N kB`,
+						<ToolBodyReadFile args={row.args} result={row.result} hasResult={row.hasResult} />
+					{:else if row.name === 'write_file'}
+						<!-- File-write view: header `wrote <path> · N kB`,
 						 then the content rendered the same way as
 						 `read_file` (line numbers + highlighting).
 						 Lets the user see exactly what landed on
 						 disk without an extra `read_file` round-trip. -->
-					<ToolBodyWriteFile args={row.args} result={row.result} hasResult={row.hasResult} />
-				{:else if row.name === 'edit_file'}
-					<!-- Edit view: unified-diff style with a tinted
+						<ToolBodyWriteFile args={row.args} result={row.result} hasResult={row.hasResult} />
+					{:else if row.name === 'edit_file'}
+						<!-- Edit view: unified-diff style with a tinted
 						 red `find` block and a tinted green `replace`
 						 block. No syntax highlighting on the diff
 						 sides — partial-grammar colouring of a
 						 mid-expression edit is more often wrong than
 						 right; the diff colours carry the signal. -->
-					<ToolBodyEditFile args={row.args} result={row.result} hasResult={row.hasResult} />
-				{:else if row.name === 'grep'}
-					<!-- Grep view: pattern in a chip, count + truncation
+						<ToolBodyEditFile args={row.args} result={row.result} hasResult={row.hasResult} />
+					{:else if row.name === 'grep'}
+						<!-- Grep view: pattern in a chip, count + truncation
 						 flag in the meta line, then a scrollable hit
 						 list with `path:line  text` columns. Reads
 						 like `rg -n` output, which is also what the
 						 model sees in its own context. -->
-					<ToolBodyGrep args={row.args} result={row.result} hasResult={row.hasResult} />
-				{:else if row.name === 'list_dir'}
-					<!-- Listing view: kind glyph + name per row, with
+						<ToolBodyGrep args={row.args} result={row.result} hasResult={row.hasResult} />
+					{:else if row.name === 'list_dir'}
+						<!-- Listing view: kind glyph + name per row, with
 						 directories accented and getting a trailing
 						 `/`. A scrollable column so a large
 						 `node_modules`-style listing doesn't push the
 						 transcript page-tall. -->
-					<ToolBodyListDir args={row.args} result={row.result} hasResult={row.hasResult} />
-				{:else if row.name === 'web_search'}
-					<!-- SERP view: query in a chip, result count in the
+						<ToolBodyListDir args={row.args} result={row.result} hasResult={row.hasResult} />
+					{:else if row.name === 'web_search'}
+						<!-- SERP view: query in a chip, result count in the
 						 meta line, then one card per hit with title,
 						 URL, and snippet. Clicking the title opens
 						 the URL in the host's default browser via
 						 `tauri-plugin-opener`. -->
-					<ToolBodyWebSearch args={row.args} result={row.result} hasResult={row.hasResult} />
-				{:else if row.name === 'web_fetch'}
-					<!-- Page-content view: URL header (clickable to
+						<ToolBodyWebSearch args={row.args} result={row.result} hasResult={row.hasResult} />
+					{:else if row.name === 'web_fetch'}
+						<!-- Page-content view: URL header (clickable to
 						 open in browser) + Jina-extracted markdown
 						 rendered through the same pipeline an
 						 assistant message uses. Truncation flag in
 						 the header when the body was lopped at the
 						 200 kB cap. -->
-					<ToolBodyWebFetch args={row.args} result={row.result} hasResult={row.hasResult} />
-				{:else if row.name === 'todo_write'}
-					<!-- Plan view: status glyph per item, in-
+						<ToolBodyWebFetch args={row.args} result={row.result} hasResult={row.hasResult} />
+					{:else if row.name === 'todo_write'}
+						<!-- Plan view: status glyph per item, in-
 						 progress accented, completed / cancelled
 						 struck through. The header pill renders the
 						 same bucket of todos; this row shows the
 						 history of plan mutations as the agent
 						 works. -->
-					<ToolBodyTodoWrite args={row.args} result={row.result} hasResult={row.hasResult} />
-				{:else}
-					<div class="block-label">args</div>
-					<pre class="block">{fmtArgs(row.args)}</pre>
-					{#if row.hasResult}
-						<div class="block-label">result</div>
-						<pre class="block">{fmtArgs(row.result)}</pre>
+						<ToolBodyTodoWrite args={row.args} result={row.result} hasResult={row.hasResult} />
+					{:else}
+						<div class="block-label">args</div>
+						<pre class="block">{fmtArgs(row.args)}</pre>
+						{#if row.hasResult}
+							<div class="block-label">result</div>
+							<pre class="block">{fmtArgs(row.result)}</pre>
+						{/if}
 					{/if}
 				{/if}
 			</details>
