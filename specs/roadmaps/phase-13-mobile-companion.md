@@ -156,6 +156,19 @@ ip>:<port>` + cert fingerprint + pairing code. LAN IP is detected
     to the app process (the coupling ADR 0024 avoids).
   - A tracked `src-tauri/resources/bridge/.gitkeep` keeps tauri-build's
     resource-path validation happy on a fresh checkout.
+- **Self-host safe (bootstrap, [ADR 0005](../decisions/0005-bootstrap.md)).**
+  The team builds moon-ide from a terminal _inside_ a running
+  moon-ide, which has already auto-spawned the bridge — so the build
+  overwrites a binary that's currently executing. `stage-bridge.mjs`
+  stages the `moon-bridge` binary via write-temp + `renameSync` (not
+  copy-onto-path), so `rename(2)` swaps the directory entry without
+  touching the running process's inode — no `ETXTBSY`. Cargo/tauri
+  already relink their own binaries atomically. Verified: a full
+  rebuild with the bridge running from `target/release` exits clean.
+  Contract: the build always succeeds while the IDE runs; the
+  freshly-built bridge + PWA are picked up on the **next** IDE
+  launch (the still-running bridge keeps serving the old binary +
+  old PWA until then — restart to test changes).
 - Not verified live here: an actual AppImage/.deb run — the container
   can't produce one. The bundled resolution path is verified by
   construction (compiles; resource-dir-then-exe lookup; `--no-bundle`
