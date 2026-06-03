@@ -128,6 +128,34 @@
 		workspace.focusSide(side);
 	}
 
+	// Read directly in the markup (below) so this derived lands in
+	// the *template* render effect, not a side `$effect`. If the
+	// body freezes on a tab switch while the strip updates, the
+	// template effect is the thing that stopped — and this log line
+	// (which only the template effect can trigger) going silent
+	// while `setActive` keeps firing pins the blame on the render
+	// effect's reactive scope rather than on a stray side effect.
+	const bodyTrace = $derived.by(() => {
+		const branch =
+			activeFile === null
+				? 'welcome'
+				: activeFile.kind === 'image'
+					? 'image'
+					: showReview
+						? 'review'
+						: showDiff
+							? 'diff'
+							: showMarkdownPreview
+								? 'markdown'
+								: 'editor';
+		frontendLog(
+			'editor.swap',
+			'debug',
+			`EditorPane(${side}) RENDER activePath=${activePath ?? '∅'} branch=${branch} file=${activeFile?.path ?? '∅'}`,
+		);
+		return '';
+	});
+
 	// Holds the boundary's `reset` while the body is in its failed
 	// state. Cleared once we've reset. The auto-reset effect below
 	// calls it on the next `activePath` change so switching tabs
@@ -172,7 +200,7 @@
 	onfocusin={focus}
 >
 	<EditorTabs {side} />
-	<div class="body">
+	<div class="body" data-body-trace={bodyTrace}>
 		<!-- Boundary so a throw inside a view component's render or
 		     its child effects (Editor / DiffView / MarkdownView /
 		     ReviewView / ImageView) is caught and surfaced instead

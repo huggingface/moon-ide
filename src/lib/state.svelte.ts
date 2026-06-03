@@ -694,8 +694,25 @@ class WorkspaceState {
 		}
 	}
 
+	// Debug-only: when on, `leftActive` reads emit a diag-log line so
+	// we can see whether a stuck EditorPane is even re-reading the
+	// active path during a tab switch. Flip from the devtools console
+	// with `window.__moonTraceActiveReads = true`. Off by default —
+	// these reads are extremely hot.
+	private get traceActiveReads(): boolean {
+		return (globalThis as Record<string, unknown>).__moonTraceActiveReads === true;
+	}
+
 	get leftActive(): string | null {
-		return this.activeFolderState?.leftActive ?? null;
+		const v = this.activeFolderState?.leftActive ?? null;
+		if (this.traceActiveReads) {
+			frontendLog(
+				'editor.swap',
+				'debug',
+				`read leftActive → ${v ?? '∅'} (folderState=${this.activeFolderState ? 'set' : 'null'})`,
+			);
+		}
+		return v;
 	}
 	set leftActive(value: string | null) {
 		if (this.activeFolderState) {
