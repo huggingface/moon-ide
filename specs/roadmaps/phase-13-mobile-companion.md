@@ -133,30 +133,49 @@ account=companion-devices`, one JSON blob) registry of revocable
   `device_for_token`. `moon-bridge pair <label>` / `devices` /
   `revoke <id>` are the surface; the token prints once.
 
-Still to wire (needs the 13.2 listener): the QR payload encoder
-(`wss://<lan-ip>:53180` + cert fingerprint + pairing code), the
-listener's token check on connect (`device_for_token`), and the
-one-time cert-trust artifact (iOS `.mobileconfig` / Android user
-cert). The desktop-side Companion affordance (QR display, paired-
-devices UI) lands with that.
+Wired by 13.2: the QR payload (`PairingPayload`), the listener's
+`pair` handshake (`verify_and_consume` → `DeviceStore::add`), and
+the per-connection token check (`device_for_token`). Still to wire:
+the one-time cert-trust artifact (iOS `.mobileconfig` / Android user
+cert) and the desktop-side Companion affordance (QR display, paired-
+devices UI).
 
-### 13.4 — Companion PWA: coder
+### 13.4 — Companion PWA: shell + workspace switcher + coder read — LANDED (first slice)
 
-- Svelte 5 + Vite SPA the bridge serves over HTTPS, installable to
-  home screen. Reuses the IDE's existing coder Svelte components
-  (`CoderMessage`, `CoderToolCall`, the markdown pipeline) against
-  a WSS transport adapter instead of Tauri `invoke`.
-- Workspace switcher: the list of live (and launchable) workspace
-  processes from 13.0's discovery. Launch a not-running workspace
-  via `moon-ide --workspace <slug>` (the bridge spawns it, same as
-  `window_open`).
-- Coder surface: session list / open / new, transcript render off
-  `coder:event`, send / steer (`coder_send`), abort
-  (`coder_abort`). Concurrent / background sessions already work
-  backend-side (ADR 0016); the phone renders the per-`(folder,
-session)` buckets the desktop already routes.
-- Acceptance: from a paired phone, pick a workspace, open a coder
-  session, kick off a turn, watch it stream, steer it, abort it.
+- New `companion/` Vite + Svelte 5 app (own `vite.config.ts` /
+  `tsconfig.json` / `svelte.config.js`, builds to `companion/dist`).
+  Root `package.json` gains `build:companion` / `dev:companion` /
+  `check:companion`; the latter joins `bun run check`.
+- `transport.ts` is the WSS equivalent of `invoke`: `BridgeSocket`
+  opens the socket, `pair` / `workspaces` / `call` map to the
+  bridge's message shapes, the device token persists in
+  `localStorage` (FIFO reply matching since calls are sequential).
+- `app.svelte.ts` (runes, single store) drives three screens:
+  `PairScreen` (paste the QR payload or type url+code), `WorkspaceList`
+  (the switcher — live pip per workspace, from a new bridge-level
+  `workspaces` message backed by 13.0 discovery), and `WorkspaceView`
+  (coder status + session list for the picked workspace).
+- The bridge serves the built PWA: `http.rs` reads the request head
+  and branches static-GET vs WS-upgrade on the one TLS port; `serve
+--web-root companion/dist` turns it on. Path-traversal blocked,
+  SPA fallback to `index.html`.
+- Verified end-to-end over HTTPS (curl -k): index / manifest / JS
+  asset with correct content-types, SPA fallback, traversal blocked.
+- **Read-only first slice.** Sending prompts / steering / abort
+  (`coder_send` / `coder_abort`) need the relay's mutating methods,
+  which land with the screen that calls them (next). The switcher +
+  status + session list exercise the whole stack today.
+
+### 13.4b — Coder send / steer / abort + transcript
+
+- Add `coder_send` / `coder_abort` / `coder_open_session` to the
+  relay's method set and an `open_session` transcript view to the
+  PWA. Streaming (`coder:event`) over the WS needs the bridge to
+  forward the workspace process's event channel — a notification
+  path on top of the request/reply relay. Scoped as its own slice so
+  the request/reply surface lands and gets reviewed first.
+- Acceptance: from a paired phone, open a session, kick off a turn,
+  watch it stream, steer it, abort it.
 
 ### 13.5 — Companion PWA: review & commit
 

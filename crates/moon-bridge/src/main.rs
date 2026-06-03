@@ -21,6 +21,7 @@
 //! and [ADR 0023](../../../specs/decisions/0023-mobile-companion-bridge.md).
 
 mod discovery;
+mod http;
 mod pairing;
 mod relay;
 mod serve;
@@ -96,6 +97,10 @@ enum Command {
 		/// connect). Default is to open a pairing window at startup.
 		#[arg(long)]
 		no_pairing: bool,
+		/// Directory of built PWA assets to serve over HTTPS (the
+		/// companion's `companion/dist`). Omit to run WS-only.
+		#[arg(long)]
+		web_root: Option<std::path::PathBuf>,
 	},
 }
 
@@ -121,7 +126,8 @@ async fn main() -> anyhow::Result<()> {
 			bind,
 			advertise_host,
 			no_pairing,
-		} => run_serve(bind, advertise_host, no_pairing).await,
+			web_root,
+		} => run_serve(bind, advertise_host, no_pairing, web_root).await,
 	}
 }
 
@@ -202,7 +208,12 @@ fn run_revoke(id: &str) -> anyhow::Result<()> {
 	Ok(())
 }
 
-async fn run_serve(bind: Option<SocketAddr>, advertise_host: Option<String>, no_pairing: bool) -> anyhow::Result<()> {
+async fn run_serve(
+	bind: Option<SocketAddr>,
+	advertise_host: Option<String>,
+	no_pairing: bool,
+	web_root: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
 	// Install the ring crypto provider as the process default before
 	// any rustls config is built. moon-bridge's tree pulls only ring,
 	// but rustls resolves its provider from a process-global slot, so
@@ -237,8 +248,11 @@ async fn run_serve(bind: Option<SocketAddr>, advertise_host: Option<String>, no_
 		Some(session)
 	};
 
+	if let Some(root) = &web_root {
+		println!("Serving companion PWA from {}", root.display());
+	}
 	tracing::info!(%bind, advertise_host, "starting moon-bridge serve");
-	serve::serve(bind, tls_identity, workspaces_dir, devices, pairing_session).await
+	serve::serve(bind, tls_identity, workspaces_dir, web_root, devices, pairing_session).await
 }
 
 /// Best-effort first non-loopback IPv4 address: open a UDP socket

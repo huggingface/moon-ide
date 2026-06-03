@@ -1,0 +1,10 @@
+{
+	"name": "moon-ide companion",
+	"short_name": "moon-ide",
+	"description": "Run coder sessions and review changes on a moon-ide workspace from your phone",
+	"display": "standalone",
+	"start_url": "/",
+	"background_color": "#0d1117",
+	"theme_color": "#0d1117",
+	"icons": []
+}
