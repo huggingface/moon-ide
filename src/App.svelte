@@ -8,12 +8,14 @@
 	import Welcome from './lib/components/Welcome.svelte';
 	import BranchSwitcher from './lib/components/BranchSwitcher.svelte';
 	import CommandPalette from './lib/components/CommandPalette.svelte';
+	import CompanionModal from './lib/components/CompanionModal.svelte';
 	import ChatPanel from './lib/components/ChatPanel.svelte';
 	import CoderPanel from './lib/components/CoderPanel.svelte';
 	import BottomPanel from './lib/components/BottomPanel.svelte';
 	import { workspace } from './lib/state.svelte';
 	import { rightPanel } from './lib/rightPanel.svelte';
 	import { coder } from './lib/coder.svelte';
+	import { companion } from './lib/companion.svelte';
 	import { bottomPanel } from './lib/bottomPanel.svelte';
 	import { terminal } from './lib/terminal.svelte';
 	import { openPreferredTerminal } from './lib/openTerminal';
@@ -607,6 +609,9 @@
 	<BranchSwitcher />
 	<WorkspacePicker />
 	<WorkspaceCreate />
+	{#if companion.modalOpen}
+		<CompanionModal />
+	{/if}
 	{#if workspace.toast}
 		<div class="toast" role="status">{workspace.toast}</div>
 	{/if}

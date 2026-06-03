@@ -177,10 +177,27 @@ account=companion-devices`, one JSON blob) registry of revocable
 
 Wired by 13.2: the QR payload (`PairingPayload`), the listener's
 `pair` handshake (`verify_and_consume` → `DeviceStore::add`), and
-the per-connection token check (`device_for_token`). Still to wire:
-the one-time cert-trust artifact (iOS `.mobileconfig` / Android user
-cert) and the desktop-side Companion affordance (QR display, paired-
-devices UI).
+the per-connection token check (`device_for_token`).
+
+Desktop Companion panel + mDNS LANDED (13.4b follow-on):
+
+- `Companion: Pair a phone…` command palette entry opens
+  `CompanionModal.svelte`: a scannable QR of the pairing payload
+  (via `uqr`), the `moon-bridge.local` + IP addresses, the code, the
+  cert fingerprint, and a paired-devices list with Revoke.
+- mDNS (`mdns-sd`): the bridge advertises `moon-bridge.local` →
+  its LAN IP, so the phone reaches it by name regardless of IP. The
+  payload's `url` stays the raw IP (always works); `.local` is the
+  offered alternative since multicast is blocked on some networks.
+- Cross-process channel: the bridge publishes `companion-status.json`
+  (payload + devices) to the bridge dir and watches
+  `companion-revoke.json`; the IDE reads/writes these via
+  `companion_status` / `companion_revoke_device` Tauri commands. No
+  shared keyring writer (bridge stays sole owner), no second socket.
+
+Still to wire: the one-time cert-trust artifact (iOS `.mobileconfig`
+/ Android user cert) so the browser stops warning — for now the user
+accepts the self-signed cert once per device.
 
 ### 13.4 — Companion PWA: shell + workspace switcher + coder read — LANDED (first slice)
 

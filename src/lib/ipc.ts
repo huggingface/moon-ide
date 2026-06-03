@@ -401,4 +401,20 @@ export const ipc = {
 	ui: {
 		setRightPanel: (kind: RightPanelKind | null) => invoke<void>('ui_set_right_panel', { kind }),
 	},
+	companion: {
+		status: () => invoke<CompanionStatus>('companion_status'),
+		revokeDevice: (deviceId: string) => invoke<void>('companion_revoke_device', { deviceId }),
+	},
 } as const;
+
+/** Mobile-companion bridge status, read from the bridge's published
+ * status file (Phase 13.4b). `running: false` when the bridge isn't up. */
+export type CompanionStatus = {
+	running: boolean;
+	pairing_payload: string | null;
+	pairing_url: string | null;
+	pairing_code: string | null;
+	mdns_url: string | null;
+	fingerprint: string;
+	devices: { id: string; label: string; paired_at_ms: number }[];
+};

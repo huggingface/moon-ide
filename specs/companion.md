@@ -123,6 +123,17 @@ The one-time cert-trust install is what removes the browser's
 self-signed interstitial; after it the PWA loads cleanly. It's a
 per-device ritual the team performs once, alongside pairing.
 
+The desktop surfaces all this in a **Companion** modal (command
+palette → "Companion: Pair a phone…"): a QR of the pairing payload,
+the address + code, the fingerprint, and a paired-devices list with
+revoke. The bridge advertises `moon-bridge.local` over **mDNS**
+(`mdns-sd`) so the phone reaches it by name regardless of the host's
+IP; the raw IP rides in the payload as the fallback for networks
+that block multicast. Because the bridge is a separate process, it
+publishes its live state to `companion-status.json` (and watches
+`companion-revoke.json`) in the bridge dir, which the IDE reads/writes
+via the `companion_status` / `companion_revoke_device` commands.
+
 Pairing is the **whole** security boundary: a paired device can
 drive the coder, which can run anything via its `bash` tool, so
 there's no point fencing the relay's method surface (same threat

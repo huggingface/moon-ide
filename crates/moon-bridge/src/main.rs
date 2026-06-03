@@ -22,9 +22,11 @@
 
 mod discovery;
 mod http;
+mod mdns;
 mod pairing;
 mod relay;
 mod serve;
+mod status;
 mod tls;
 
 /// Default LAN port. IANA dynamic range, adjacent to the next-edit
@@ -222,18 +224,29 @@ async fn run_serve(
 	let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
 
 	let bind = bind.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], DEFAULT_PORT)));
-	let advertise_host = advertise_host.unwrap_or_else(|| detect_lan_ip().unwrap_or_else(|| "127.0.0.1".to_owned()));
+	let detected_ip = detect_lan_ipv4();
+	// The payload's `url` uses the raw IP because it always works; the
+	// `.local` name is offered alongside (`mdns_url`) since multicast
+	// is blocked on some networks. The phone tries `.local` first and
+	// falls back to the IP.
+	let advertise_host = advertise_host.unwrap_or_else(|| {
+		detected_ip
+			.map(|ip| ip.to_string())
+			.unwrap_or_else(|| "127.0.0.1".to_owned())
+	});
 
 	let workspaces_dir = discovery::resolve_workspaces_dir()?;
 	let bridge_dir = tls::resolve_bridge_dir()?;
 	let tls_identity = tls::load_or_generate(&bridge_dir)?;
 	let devices = pairing::DeviceStore::open()?;
 
-	let pairing_session = if no_pairing {
-		None
+	let url = format!("wss://{advertise_host}:{}", bind.port());
+	let mdns_url = detected_ip.map(|_| format!("wss://{}:{}", mdns::MDNS_HOSTNAME.trim_end_matches('.'), bind.port()));
+
+	let (pairing_session, pairing_payload) = if no_pairing {
+		(None, None)
 	} else {
 		let session = pairing::PairingSession::issue();
-		let url = format!("wss://{advertise_host}:{}", bind.port());
 		let payload = pairing::PairingPayload::new(&url, &tls_identity.fingerprint, session.code());
 		println!(
 			"Pairing open for {} seconds. Encode this into the QR:",
@@ -243,16 +256,46 @@ async fn run_serve(
 		println!("  {}", payload.to_json());
 		println!();
 		println!("Or type-in: url {url}  code {}", session.code());
+		if let Some(m) = &mdns_url {
+			println!("Or via mDNS: {m}");
+		}
 		println!("Cert fingerprint (SHA-256): {}", tls_identity.fingerprint);
 		println!();
-		Some(session)
+		(Some(session), Some(payload))
 	};
 
 	if let Some(root) = &web_root {
 		println!("Serving companion PWA from {}", root.display());
 	}
 	tracing::info!(%bind, advertise_host, "starting moon-bridge serve");
-	serve::serve(bind, tls_identity, workspaces_dir, web_root, devices, pairing_session).await
+
+	// Clear the status file on exit so the IDE's panel flips to
+	// "not running" promptly (the idle-exit path also relies on this).
+	let cleanup_dir = bridge_dir.clone();
+	let _guard = StatusCleanup(cleanup_dir);
+
+	serve::serve(serve::ServeConfig {
+		addr: bind,
+		tls: tls_identity,
+		workspaces_dir,
+		bridge_dir,
+		web_root,
+		devices,
+		pairing: pairing_session,
+		pairing_payload,
+		mdns_url,
+		advertise_ip: detected_ip,
+	})
+	.await
+}
+
+/// Removes the companion status file on drop (bridge exit), so the
+/// IDE's Companion panel sees "not running" without waiting.
+struct StatusCleanup(camino::Utf8PathBuf);
+impl Drop for StatusCleanup {
+	fn drop(&mut self) {
+		status::clear_status(&self.0);
+	}
 }
 
 /// Best-effort first non-loopback IPv4 address: open a UDP socket
@@ -260,11 +303,11 @@ async fn run_serve(
 /// and read back the local address the OS picked. Avoids a
 /// network-interface enumeration dep for a host that just wants its
 /// own LAN IP.
-fn detect_lan_ip() -> Option<String> {
+fn detect_lan_ipv4() -> Option<std::net::Ipv4Addr> {
 	let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
 	sock.connect("8.8.8.8:80").ok()?;
 	match sock.local_addr().ok()?.ip() {
-		IpAddr::V4(v4) if !v4.is_loopback() => Some(v4.to_string()),
+		IpAddr::V4(v4) if !v4.is_loopback() => Some(v4),
 		_ => None,
 	}
 }

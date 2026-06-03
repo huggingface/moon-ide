@@ -25,7 +25,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -92,18 +92,42 @@ struct ServeCtx {
 	pairing: Mutex<Option<PairingSession>>,
 }
 
-/// Run the listener until the process is killed. `addr` is typically
-/// `0.0.0.0:53180`. `pairing` is the code issued at startup (shown
-/// to the user via the QR); pass `None` to run with pairing closed
-/// (only already-paired devices can connect).
-pub async fn serve(
-	addr: SocketAddr,
-	tls: TlsIdentity,
-	workspaces_dir: Utf8PathBuf,
-	web_root: Option<std::path::PathBuf>,
-	devices: DeviceStore,
-	pairing: Option<PairingSession>,
-) -> anyhow::Result<()> {
+/// Inputs for [`serve`]. Bundled into a struct because the listener
+/// needs a fair few co-dependent pieces (TLS identity, the dirs it
+/// reads/writes, the startup pairing session + the payload it
+/// publishes for the IDE's Companion panel).
+pub struct ServeConfig {
+	pub addr: SocketAddr,
+	pub tls: TlsIdentity,
+	pub workspaces_dir: Utf8PathBuf,
+	pub bridge_dir: Utf8PathBuf,
+	pub web_root: Option<std::path::PathBuf>,
+	pub devices: DeviceStore,
+	pub pairing: Option<PairingSession>,
+	/// The pairing payload to publish in `companion-status.json` (the
+	/// IDE's panel renders it as a QR). `None` when pairing is closed.
+	pub pairing_payload: Option<crate::pairing::PairingPayload>,
+	/// The `wss://moon-bridge.local:<port>` URL when mDNS is up.
+	pub mdns_url: Option<String>,
+	/// LAN IP for mDNS advertising (the host's own address).
+	pub advertise_ip: Option<std::net::Ipv4Addr>,
+}
+
+/// Run the listener until the process is killed.
+pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
+	let ServeConfig {
+		addr,
+		tls,
+		workspaces_dir,
+		bridge_dir,
+		web_root,
+		devices,
+		pairing,
+		pairing_payload,
+		mdns_url,
+		advertise_ip,
+	} = cfg;
+	let fingerprint = tls.fingerprint.clone();
 	let acceptor = TlsAcceptor::from(tls.server_config);
 
 	// Binding the LAN port *is* the machine-wide owner election
@@ -121,12 +145,39 @@ pub async fn serve(
 	};
 	tracing::info!(%addr, "moon-bridge listening");
 
+	// Start mDNS so the phone can use `moon-bridge.local` (best-effort;
+	// the IP URL in the payload is the fallback when multicast is
+	// blocked). Held for the process lifetime.
+	let _mdns = match advertise_ip {
+		Some(ip) => crate::mdns::advertise(ip, addr.port())
+			.map_err(|err| tracing::warn!(error = %err, "mDNS advertise failed; .local name won't resolve"))
+			.ok(),
+		None => None,
+	};
+
 	let ctx = Arc::new(ServeCtx {
 		workspaces_dir,
 		web_root,
 		devices,
 		pairing: Mutex::new(pairing),
 	});
+
+	// Publish status for the IDE's Companion panel, and watch for
+	// revoke requests it drops. Both files live in the bridge dir.
+	write_companion_status(
+		&bridge_dir,
+		&ctx,
+		&fingerprint,
+		pairing_payload.as_ref(),
+		mdns_url.as_deref(),
+	);
+	spawn_companion_watcher(
+		bridge_dir.clone(),
+		Arc::clone(&ctx),
+		fingerprint,
+		pairing_payload,
+		mdns_url,
+	);
 
 	// Idle watcher: when no workspace is live, the bridge has nothing
 	// to serve, so it exits (ADR 0024). Discovery is the same signal
@@ -152,6 +203,77 @@ pub async fn serve(
 			}
 		});
 	}
+}
+
+/// Build + write the companion status file from current device state.
+fn write_companion_status(
+	bridge_dir: &Utf8Path,
+	ctx: &ServeCtx,
+	fingerprint: &str,
+	payload: Option<&crate::pairing::PairingPayload>,
+	mdns_url: Option<&str>,
+) {
+	let devices = ctx
+		.devices
+		.list()
+		.unwrap_or_default()
+		.into_iter()
+		.map(|d| crate::status::DeviceEntry {
+			id: d.id,
+			label: d.label,
+			paired_at_ms: d.paired_at_ms,
+		})
+		.collect();
+	let status = crate::status::CompanionStatus {
+		running: true,
+		pairing_payload: payload.map(|p| p.to_json()),
+		pairing_url: payload.map(|p| p.url.clone()),
+		pairing_code: payload.map(|p| p.code.clone()),
+		mdns_url: mdns_url.map(str::to_owned),
+		fingerprint: fingerprint.to_owned(),
+		devices,
+	};
+	if let Err(err) = crate::status::write_status(bridge_dir, &status) {
+		tracing::warn!(error = %err, "failed to write companion status");
+	}
+}
+
+/// Poll for revoke requests from the IDE and refresh the status file
+/// when the device list changes. Cheap 1 s poll — the panel is only
+/// open briefly during pairing management, and revoke is rare.
+fn spawn_companion_watcher(
+	bridge_dir: Utf8PathBuf,
+	ctx: Arc<ServeCtx>,
+	fingerprint: String,
+	payload: Option<crate::pairing::PairingPayload>,
+	mdns_url: Option<String>,
+) {
+	tokio::spawn(async move {
+		let mut last_count = ctx.devices.list().map(|d| d.len()).unwrap_or(0);
+		loop {
+			tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+			let mut dirty = false;
+			if let Some(req) = crate::status::take_revoke_request(&bridge_dir) {
+				match ctx.devices.revoke(&req.device_id) {
+					Ok(true) => tracing::info!(id = %req.device_id, "revoked companion device"),
+					Ok(false) => tracing::debug!(id = %req.device_id, "revoke: unknown device"),
+					Err(err) => tracing::warn!(error = %err, "revoke failed"),
+				}
+				dirty = true;
+			}
+			// Also refresh when a pair added a device (handle_pair
+			// doesn't carry the dir/fingerprint, so we detect the
+			// count change here rather than thread them through).
+			let count = ctx.devices.list().map(|d| d.len()).unwrap_or(last_count);
+			if count != last_count {
+				last_count = count;
+				dirty = true;
+			}
+			if dirty {
+				write_companion_status(&bridge_dir, &ctx, &fingerprint, payload.as_ref(), mdns_url.as_deref());
+			}
+		}
+	});
 }
 
 /// Grace period before the first idle check, so the bridge doesn't
