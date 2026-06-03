@@ -3047,6 +3047,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "moon-bridge"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "camino",
+ "clap",
+ "dirs",
+ "moon-core",
+ "moon-protocol",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "moon-coder"
 version = "0.0.0"
 dependencies = [

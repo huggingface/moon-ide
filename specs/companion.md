@@ -41,13 +41,14 @@ One per host machine. Responsibilities:
   `0.0.0.0:53180`. Self-signed TLS; keypair + cert generated on
   first run, persisted under `<XDG_DATA_HOME>/moon-ide/bridge/`.
   The cert fingerprint is the trust anchor (see [Pairing](#pairing)).
-- **Workspace discovery.** Enumerate
-  `<XDG_DATA_HOME>/moon-ide/workspaces/*/instance.sock`. A socket
+- **Workspace discovery** (implemented — `moon-bridge list`).
+  Enumerate `<data_local_dir>/moon-ide/workspaces/*/`. A socket
   that accepts a connection has a live owner; one that fails with
-  `ECONNREFUSED` is stale (not running) — exactly the liveness
-  probe [ADR 0014](decisions/0014-process-per-workspace.md) already
-  uses for single-instance enforcement. This list is the phone's
-  workspace switcher.
+  `ECONNREFUSED` (or is missing) is stale / not running — exactly
+  the liveness probe [ADR 0014](decisions/0014-process-per-workspace.md)
+  already uses for single-instance enforcement. Names and
+  last-active come from the `state.json` catalog. This list is the
+  phone's workspace switcher.
 - **Relay.** Forward JSON-RPC requests and event-stream
   subscriptions between the phone and the selected workspace
   process over that process's `instance.sock`.

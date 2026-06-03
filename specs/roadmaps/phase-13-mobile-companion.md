@@ -35,23 +35,30 @@ the cloud machine in this phase.
 Per sub-phase. Land in order; stop at each gate. The team handoff
 gate at the end of each sub-phase is the usual roadmap rule.
 
-### 13.0 — `moon-bridge` crate + workspace discovery (no app yet)
+### 13.0 — `moon-bridge` crate + workspace discovery (no app yet) — LANDED
 
-- New `crates/moon-bridge/` workspace member (add to
-  `Cargo.toml` `members` + `[workspace.dependencies]`). A binary
-  crate; depends on `moon-core` + `moon-protocol`.
-- Workspace discovery: enumerate
-  `<XDG_DATA_HOME>/moon-ide/workspaces/*/instance.sock`, probe
-  each (connect succeeds = live owner; `ECONNREFUSED` = stale),
-  return the live set with `{ id, name, last_active_at }` from the
-  catalog. Reuses the same liveness probe ADR 0014 already does for
-  single-instance enforcement.
-- No listener, no TLS, no app. A `moon-bridge --list` debug
-  subcommand that prints the discovered live workspaces is the
-  acceptance surface — proves discovery works against real running
-  IDE processes before any network code exists.
-- `STATUS` line in `companion.md` flips the discovery section to
-  partial.
+- New `crates/moon-bridge/` workspace member (binary crate;
+  depends on `moon-core` + `moon-protocol`, mirrors `moon-remote`'s
+  shape — a binary, so it's a `members` entry but not a
+  `[workspace.dependencies]` lib).
+- Workspace discovery (`src/discovery.rs`): enumerate
+  `<data_local_dir>/moon-ide/workspaces/*/`, probe each
+  `instance.sock` (connect within a 250 ms timeout = live owner;
+  refused / missing = stale or stopped), decorate with `name` +
+  `last_active_at` from the `state.json` catalog
+  (`moon_core::app_state::load`) when present, falling back to the
+  slug. Sorted live-first, then most-recently-active, then slug.
+  Re-implements the few lines of the focus-socket liveness probe
+  rather than depending on the `src-tauri` binary crate, so the
+  bridge stays a leaf linking only `moon-core` + `moon-protocol`.
+- `moon-bridge list` (`--json` for machine-readable) is the
+  acceptance surface. Verified end-to-end: a real `UnixListener`
+  bound at a workspace's `instance.sock` reports `running`; a
+  stale empty socket file reports `stopped`; a missing workspaces
+  dir is an empty list, not an error. Unit tests cover all four
+  paths.
+- No listener, no TLS, no app, no relay. `cargo test` /
+  `cargo clippy --all-targets -D warnings` / `cargo fmt` clean.
 
 ### 13.1 — Bridge ↔ workspace-process relay (JSON-RPC framing)
 

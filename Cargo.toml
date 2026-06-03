@@ -5,6 +5,7 @@ members = [
 	"crates/moon-protocol",
 	"crates/moon-core",
 	"crates/moon-remote",
+	"crates/moon-bridge",
 	"crates/moon-coder",
 	"crates/moon-slack",
 	"crates/moon-container",
