@@ -1533,8 +1533,21 @@ no shared component. ADR 0003 ("no adapter layer") still applies.
 - **Bucket browser** — "import session from bucket" UI for picking
   a chat up on a different machine. Bucket is backup-only at first.
 - **Multi-account** — one HF account per moon-ide install.
-- **Background agent runs** — the loop only runs while the panel
-  is active. A "run this overnight" mode is a Phase 12 problem.
+- **Detached / cross-restart agent runs** — a turn already runs
+  independently of whether its session is the visible one (it's a
+  spawned task closing over an `Arc<SessionRuntime>`; background
+  turns in any session keep streaming into their own bucket — see
+  [ADR 0016](decisions/0016-coder-concurrent-sessions.md)). The
+  boundary that remains is the **process**: a process restart kills
+  every in-flight turn, because the runtime map is in-memory only
+  (test plan [0085](test-plans/0085-coder-concurrent-sessions.md)).
+  Surviving "laptop closed / IDE restarted" needs the loop owned by
+  an always-on `moon-core` that clients attach to and detach from —
+  the same headless-core shape the [companion](companion.md) and
+  remote-host stories converge on. A "run this overnight" mode is a
+  later problem, but **don't deepen the loop ↔ process coupling** in
+  the meantime: keep the loop owned by `moon-core`, observed by
+  clients, never by a UI lifetime.
 
 ## Cross-spec touch-points
 
