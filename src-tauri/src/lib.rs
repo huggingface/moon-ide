@@ -650,7 +650,7 @@ fn ensure_bridge_running(resource_bridge_dir: Option<std::path::PathBuf>) {
 		"moon-bridge"
 	};
 
-	// Two layouts hold the bridge + companion PWA:
+	// Two source layouts hold the bridge + companion PWA:
 	//   - bundled build:   `<resource>/bridge/{moon-bridge, companion/}`
 	//   - --no-bundle:     `<exe-dir>/{moon-bridge, companion/}`
 	// Try the resource dir first (it's the shipped artifact), then
@@ -665,7 +665,7 @@ fn ensure_bridge_running(resource_bridge_dir: Option<std::path::PathBuf>) {
 		}
 	}
 
-	let Some((bridge_bin, web_root)) = candidates.into_iter().find_map(|dir| {
+	let Some((src_bin, src_web)) = candidates.into_iter().find_map(|dir| {
 		let bin = dir.join(bin_name);
 		bin.exists().then(|| (bin, dir.join("companion")))
 	}) else {
@@ -673,8 +673,18 @@ fn ensure_bridge_running(resource_bridge_dir: Option<std::path::PathBuf>) {
 		return;
 	};
 
-	// Resources can lose the executable bit on copy; restore it so the
-	// spawn doesn't fail with EACCES on a freshly-installed bundle.
+	// Critical for self-hosting (ADR 0005): the team rebuilds moon-ide
+	// from a terminal *inside* the running IDE. Both source layouts
+	// above live in the build tree (`target/release/...` or the
+	// bundled `resources/...`), and `tauri-build` / the staging script
+	// overwrite them on the next build. If we ran the bridge straight
+	// from there, the build would hit `ETXTBSY` ("Text file busy") on
+	// the running binary. So we copy the bridge + PWA to a stable
+	// runtime dir *outside* the build tree and run from there — the
+	// build can then freely replace the source copies.
+	let Some((bridge_bin, web_root)) = stage_bridge_runtime(&src_bin, &src_web, bin_name) else {
+		return;
+	};
 	ensure_executable(&bridge_bin);
 
 	let mut cmd = std::process::Command::new(&bridge_bin);
@@ -689,6 +699,72 @@ fn ensure_bridge_running(resource_bridge_dir: Option<std::path::PathBuf>) {
 		Ok(_) => tracing::info!(path = %bridge_bin.display(), "spawned moon-bridge serve (companion)"),
 		Err(err) => tracing::warn!(error = %err, "failed to spawn moon-bridge"),
 	}
+}
+
+/// Copy the bridge binary + companion PWA from a build-tree source
+/// into a stable runtime dir (`<data>/moon-ide/bridge/runtime/`) and
+/// return the runtime `(binary, web_root)` to spawn from. Returns
+/// `None` (logged) on any failure — the bridge is optional.
+///
+/// The binary is staged via write-temp + atomic rename so that even
+/// *this* copy can't fail when a prior runtime bridge is still running
+/// from the destination (e.g. relaunching the IDE before the old
+/// bridge's idle-exit fired). See `ensure_bridge_running` for why the
+/// runtime dir must be outside the build tree.
+fn stage_bridge_runtime(
+	src_bin: &std::path::Path,
+	src_web: &std::path::Path,
+	bin_name: &str,
+) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+	let runtime = dirs::data_local_dir()?
+		.join(BUNDLE_IDENTIFIER)
+		.join("bridge")
+		.join("runtime");
+	if let Err(err) = std::fs::create_dir_all(&runtime) {
+		tracing::warn!(error = %err, "could not create bridge runtime dir; skipping auto-start");
+		return None;
+	}
+
+	let dest_bin = runtime.join(bin_name);
+	let tmp_bin = runtime.join(format!("{bin_name}.new"));
+	let _ = std::fs::remove_file(&tmp_bin);
+	if let Err(err) = std::fs::copy(src_bin, &tmp_bin) {
+		tracing::warn!(error = %err, "could not stage bridge binary; skipping auto-start");
+		return None;
+	}
+	if let Err(err) = std::fs::rename(&tmp_bin, &dest_bin) {
+		tracing::warn!(error = %err, "could not install bridge binary; skipping auto-start");
+		return None;
+	}
+
+	// Refresh the PWA copy. A stale web dir is non-fatal (the bridge
+	// runs WS-only without it), so failures here only warn.
+	let dest_web = runtime.join("companion");
+	if src_web.is_dir() {
+		let _ = std::fs::remove_dir_all(&dest_web);
+		if let Err(err) = copy_dir_recursive(src_web, &dest_web) {
+			tracing::warn!(error = %err, "could not stage companion PWA; bridge will run WS-only");
+		}
+	}
+
+	Some((dest_bin, dest_web))
+}
+
+/// Minimal recursive directory copy for the companion PWA (a handful
+/// of small files). Avoids a dep for what `std::fs` covers.
+fn copy_dir_recursive(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+	std::fs::create_dir_all(dest)?;
+	for entry in std::fs::read_dir(src)? {
+		let entry = entry?;
+		let from = entry.path();
+		let to = dest.join(entry.file_name());
+		if entry.file_type()?.is_dir() {
+			copy_dir_recursive(&from, &to)?;
+		} else {
+			std::fs::copy(&from, &to)?;
+		}
+	}
+	Ok(())
 }
 
 #[cfg(unix)]
