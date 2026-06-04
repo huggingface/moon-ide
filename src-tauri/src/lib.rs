@@ -695,10 +695,46 @@ fn ensure_bridge_running(resource_bridge_dir: Option<std::path::PathBuf>) {
 		cmd.arg("--web-root").arg(&web_root);
 	}
 
+	// The bridge is meant to outlive the window that spawned it
+	// (ADR 0024), so detach it into its own session: `setsid` makes it
+	// a session leader with no controlling terminal, so closing the
+	// IDE doesn't SIGHUP it and it isn't in the IDE's process group.
+	detach_session(&mut cmd);
+
 	match cmd.spawn() {
-		Ok(_) => tracing::info!(path = %bridge_bin.display(), "spawned moon-bridge serve (companion)"),
+		Ok(child) => {
+			tracing::info!(path = %bridge_bin.display(), "spawned moon-bridge serve (companion)");
+			// Reap the child when it exits so a bridge that loses the
+			// port-bind owner election (and exits immediately) doesn't
+			// linger as a `<defunct>` zombie. A short-lived thread that
+			// `wait()`s collects it; for the winning bridge the thread
+			// simply parks until the bridge exits (or the IDE does, at
+			// which point init adopts and reaps it).
+			reap_in_background(child);
+		}
 		Err(err) => tracing::warn!(error = %err, "failed to spawn moon-bridge"),
 	}
+}
+
+/// Put the spawned process in its own process group so it survives
+/// the IDE closing and isn't signalled with the IDE's group (e.g. a
+/// terminal SIGINT/SIGHUP). `process_group(0)` makes the child its
+/// own group leader — std-only, no `libc` dependency.
+#[cfg(unix)]
+fn detach_session(cmd: &mut std::process::Command) {
+	use std::os::unix::process::CommandExt;
+	cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn detach_session(_cmd: &mut std::process::Command) {}
+
+/// Collect a child's exit status off-thread so it never zombies
+/// against the IDE while the IDE is alive.
+fn reap_in_background(mut child: std::process::Child) {
+	std::thread::spawn(move || {
+		let _ = child.wait();
+	});
 }
 
 /// Copy the bridge binary + companion PWA from a build-tree source
