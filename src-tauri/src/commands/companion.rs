@@ -57,13 +57,50 @@ pub async fn companion_status() -> Result<CompanionStatus, MoonError> {
 	let Ok(bytes) = tokio::fs::read(path.as_std_path()).await else {
 		return Ok(CompanionStatus::default());
 	};
-	match serde_json::from_slice(&bytes) {
-		Ok(status) => Ok(status),
+	let mut status: CompanionStatus = match serde_json::from_slice(&bytes) {
+		Ok(status) => status,
 		Err(err) => {
 			tracing::warn!(error = %err, "companion status parse failed");
-			Ok(CompanionStatus::default())
+			return Ok(CompanionStatus::default());
 		}
+	};
+
+	// The status file outlives the bridge if it crashed or was killed
+	// (a clean exit removes it, but SIGKILL / a crash won't). Trusting
+	// `running: true` from the file alone makes the status-bar pip lie
+	// after the bridge is gone. Confirm something is actually
+	// listening on the bridge port before reporting it as running.
+	if status.running && !bridge_port_alive(&status).await {
+		status.running = false;
 	}
+	Ok(status)
+}
+
+/// Best-effort liveness probe: can we open a TCP connection to the
+/// bridge's listen port on loopback? The bridge binds `0.0.0.0:<port>`
+/// so `127.0.0.1:<port>` reaches it. A refused/timed-out connect means
+/// the status file is stale.
+async fn bridge_port_alive(status: &CompanionStatus) -> bool {
+	let port = status
+		.pairing_url
+		.as_deref()
+		.or(status.mdns_url.as_deref())
+		.and_then(port_from_ws_url)
+		.unwrap_or(53180);
+	let addr = format!("127.0.0.1:{port}");
+	matches!(
+		tokio::time::timeout(
+			std::time::Duration::from_millis(250),
+			tokio::net::TcpStream::connect(&addr)
+		)
+		.await,
+		Ok(Ok(_))
+	)
+}
+
+/// Pull the port out of a `wss://host:port` URL.
+fn port_from_ws_url(url: &str) -> Option<u16> {
+	url.rsplit(':').next().and_then(|p| p.parse().ok())
 }
 
 /// Drop a revoke request for the bridge to pick up. The bridge polls
