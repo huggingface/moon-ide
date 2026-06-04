@@ -1080,6 +1080,18 @@ class CoderPanelState {
 	/** Tauri-listener cleanup; one entry per `wireRuntime` call. */
 	#unlisten: UnlistenFn[] = [];
 	#listenersWired = false;
+	/** Coalescing buffer for inbound `coder:event` envelopes.
+	 *  Tauri delivers each event as its own task, so a session
+	 *  replay (1000+ events fired back-to-back by the backend)
+	 *  would otherwise reduce one-per-task, triggering ~1000
+	 *  separate Svelte flushes — seconds of jank on a long session.
+	 *  We buffer arrivals and drain the whole queue in a single
+	 *  microtask, so all the `$state` mutations land in one task and
+	 *  Svelte coalesces them into one flush. Live (non-replay)
+	 *  events still apply within a microtask, which is effectively
+	 *  immediate. */
+	#envelopeQueue: CoderEventEnvelope[] = [];
+	#drainScheduled = false;
 	/** Flipped to `true` by `markWorkspaceReady()` once the
 	 *  `restoreAppState` folder-restore loop has finished mutating
 	 *  the **backend's** active folder. Per-folder hydration
@@ -1663,7 +1675,7 @@ class CoderPanelState {
 		this.#listenersWired = true;
 		try {
 			const unlisten = await listen<CoderEventEnvelope>(CODER_EVENT_CHANNEL, (event) => {
-				this.#dispatchEnvelope(event.payload);
+				this.#enqueueEnvelope(event.payload);
 			});
 			this.#unlisten.push(unlisten);
 		} catch {
@@ -1785,10 +1797,15 @@ class CoderPanelState {
 					// IPC lets the error bubble to the catch below
 					// so we fall through to the sessions list
 					// instead.
+					const ipcStart = performance.now();
 					const summary = await ipc.coder.openSession(id);
 					folder.visibleSessionId = summary.id;
 					folder.view = 'session';
-					this.sessionStateFor(folderKey, summary.id).activeSession = summary;
+					const bucket = this.sessionStateFor(folderKey, summary.id);
+					bucket.activeSession = summary;
+					// Profiling parity with the explicit-click path so the
+					// startup-hydrate open also reports its `ipc=` time.
+					bucket.openIpcMs = performance.now() - ipcStart;
 					return;
 				} catch {
 					// Stale pointer — the session no longer exists
@@ -2110,6 +2127,27 @@ class CoderPanelState {
 			return;
 		}
 		folderBucket.attentionPending = true;
+	}
+
+	/** Buffer one inbound envelope and schedule a drain. See the
+	 *  `#envelopeQueue` field for why we coalesce. */
+	#enqueueEnvelope(envelope: CoderEventEnvelope): void {
+		this.#envelopeQueue.push(envelope);
+		if (this.#drainScheduled) {
+			return;
+		}
+		this.#drainScheduled = true;
+		queueMicrotask(() => {
+			this.#drainScheduled = false;
+			// Snapshot + clear first so envelopes that arrive while
+			// we're dispatching (a live event mid-drain) queue a
+			// fresh drain rather than mutating the array under us.
+			const batch = this.#envelopeQueue;
+			this.#envelopeQueue = [];
+			for (const queued of batch) {
+				this.#dispatchEnvelope(queued);
+			}
+		});
 	}
 
 	#dispatchEnvelope(envelope: CoderEventEnvelope): void {
