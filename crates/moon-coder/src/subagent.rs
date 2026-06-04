@@ -429,13 +429,25 @@ async fn run_subagent_inner(
 		)
 		.await;
 		if let Some(applied) = compaction_outcome {
-			last_usage = None;
+			// Re-anchor on the compacted prompt's estimate (not
+			// `None`), so the next iteration's compaction check
+			// stays armed and re-fires if a single pass didn't get
+			// us under the threshold. Mirrors the parent loop.
+			let estimate = crate::runner::estimate_prompt_tokens(&messages);
+			last_usage = Some(TokenUsage {
+				prompt_tokens: estimate,
+				completion_tokens: 0,
+				total_tokens: estimate,
+				cache_read_input_tokens: 0,
+				cache_creation_input_tokens: 0,
+			});
 			persist_subagent(
 				&session_dir,
 				&header,
 				&SessionRecord::Compaction {
 					summary: applied.summary,
 					messages_compacted: applied.messages_compacted,
+					messages_kept: applied.messages_kept,
 				},
 			)
 			.await;

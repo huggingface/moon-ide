@@ -100,6 +100,13 @@ that aren't in the prefix. Do not include the entire transcript verbatim. Aim fo
 pub(crate) struct CompactionApplied {
 	pub summary: String,
 	pub messages_compacted: u32,
+	/// How many trailing messages rode through the fold unchanged
+	/// (`messages[cutoff..]` at the time of compaction). Persisted
+	/// into the `Compaction` record so replay can reproduce the
+	/// same cutoff — folding everything *except* the last
+	/// `messages_kept` messages — instead of draining the whole
+	/// prefix and dropping the recent turns we deliberately kept.
+	pub messages_kept: u32,
 }
 
 /// Inspect the last reported token usage; if the next prompt is
@@ -212,6 +219,13 @@ pub(crate) async fn compact_if_needed(
 		return None;
 	}
 
+	// Captured before the drain: everything from `cutoff` to the
+	// end rides through unchanged. Replay reproduces the cutoff
+	// from this count rather than re-deriving it (the K-user-turn
+	// heuristic could land differently if the constant changes
+	// between the write and the reopen).
+	let messages_kept = (messages.len() - cutoff) as u32;
+
 	apply_summary_to_messages(messages, cutoff, &summary);
 
 	let prompt_tokens_after = estimate_prompt_tokens(messages);
@@ -232,6 +246,7 @@ pub(crate) async fn compact_if_needed(
 	Some(CompactionApplied {
 		summary,
 		messages_compacted,
+		messages_kept,
 	})
 }
 
@@ -431,17 +446,19 @@ mod tests {
 	}
 
 	#[test]
-	fn replay_cutoff_at_len_drops_everything_since_system_prompt() {
-		// Replay-time shape: rebuild messages from JSONL records
-		// up through the Compaction record, then call
-		// `apply_summary_to_messages` with `cutoff = messages.len()`.
-		// Result must be exactly `[system_prompt, summary]` —
-		// reopening a compacted session shouldn't carry the
-		// pre-compaction transcript along.
+	fn replay_keeps_trailing_messages_from_messages_kept() {
+		// Replay-time shape mirroring the real on-disk order: the
+		// kept recent turns sit BEFORE the Compaction record (they
+		// were persisted as they happened, earlier in the run).
+		// Replay rebuilds the full transcript including them, then
+		// folds everything EXCEPT the last `messages_kept`. With
+		// messages_kept = 2 here we keep the last user/assistant
+		// pair, so the result is `[system, summary, u1, a1]`.
 		let mut msgs = vec![system("S"), user("u0"), assistant("a0"), user("u1"), assistant("a1")];
-		let cutoff = msgs.len();
+		let messages_kept = 2usize;
+		let cutoff = msgs.len().saturating_sub(messages_kept).max(1);
 		apply_summary_to_messages(&mut msgs, cutoff, "earlier turns: did stuff");
-		assert_eq!(msgs.len(), 2);
+		assert_eq!(msgs.len(), 4);
 		match &msgs[0] {
 			ChatMessage::System { content } => assert_eq!(content, "S"),
 			other => panic!("expected original system prompt at index 0, got {other:?}"),
@@ -455,41 +472,48 @@ mod tests {
 			}
 			other => panic!("expected summary system message at index 1, got {other:?}"),
 		}
+		// The last kept pair rides through untouched.
+		assert!(matches!(&msgs[2], ChatMessage::User { content, .. } if content == "u1"));
+		assert!(matches!(&msgs[3], ChatMessage::Assistant { content: Some(c), .. } if c == "a1"));
 	}
 
 	#[test]
 	fn live_apply_then_replay_apply_yield_same_shape() {
-		// Two paths reach the same in-memory `messages`:
-		//   1. live: drain `[1..cutoff]`, insert summary,
-		//      append the post-cutoff tail (already there).
-		//   2. replay: rebuild every record into messages,
-		//      then drain `[1..len]` on the Compaction record,
-		//      then keep appending newer records.
-		// Both must produce byte-identical output for the same
-		// summary; otherwise the prompt diverges between a live
-		// session and the same session reopened.
+		// Two paths must reach the same in-memory `messages`, with
+		// the kept turns sitting in their REAL on-disk position —
+		// BEFORE the Compaction record, because they were persisted
+		// as they happened. Earlier this test cheated by pushing
+		// the kept turns AFTER the compaction record; that masked a
+		// divergence where replay dropped them. Now both paths fold
+		// at the same cutoff (live via `find_cutoff_index`, replay
+		// via `messages_kept`) and must be byte-identical.
+		//
+		// 8 user turns, K=6 → live keeps u2..u7 (12 messages).
 		let live = {
-			let mut m = vec![
-				system("S"),
-				user("u0"),
-				assistant("a0"),
-				user("u1"),
-				assistant("a1"),
-				user("u2"),
-				assistant("a2"),
-			];
-			apply_summary_to_messages(&mut m, 5, "summary text");
-			m
-		};
-		let replay = {
-			let mut m = vec![system("S"), user("u0"), assistant("a0"), user("u1"), assistant("a1")];
-			let cutoff = m.len();
+			let mut m = vec![system("S")];
+			for i in 0..8 {
+				m.push(user(&format!("u{i}")));
+				m.push(assistant(&format!("a{i}")));
+			}
+			let cutoff = find_cutoff_index(&m).expect("cutoff");
 			apply_summary_to_messages(&mut m, cutoff, "summary text");
-			m.push(user("u2"));
-			m.push(assistant("a2"));
 			m
 		};
-		assert_eq!(live.len(), replay.len());
+		// Replay rebuilds the same full transcript (the kept turns
+		// are already on disk before the Compaction record), then
+		// folds everything except `messages_kept = 12`.
+		let replay = {
+			let mut m = vec![system("S")];
+			for i in 0..8 {
+				m.push(user(&format!("u{i}")));
+				m.push(assistant(&format!("a{i}")));
+			}
+			let messages_kept = 12usize;
+			let cutoff = m.len().saturating_sub(messages_kept).max(1);
+			apply_summary_to_messages(&mut m, cutoff, "summary text");
+			m
+		};
+		assert_eq!(live.len(), replay.len(), "live and replay diverged in length");
 		for (i, (a, b)) in live.iter().zip(replay.iter()).enumerate() {
 			let left = serde_json::to_string(a).unwrap();
 			let right = serde_json::to_string(b).unwrap();

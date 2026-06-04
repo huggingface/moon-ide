@@ -1431,9 +1431,6 @@
 			{#each coder.rows as row (row.id)}
 				{@render rowMarkup(row, true)}
 			{/each}
-			{#if coder.compaction}
-				{@render compactionMarkup(coder.compaction)}
-			{/if}
 		</div>
 		<div class="composer">
 			{#if coder.attachments.length > 0}
@@ -1620,14 +1617,14 @@
 	 controls whether `task` tool rows render the inline collapsed
 	 card; sub-agents themselves can't spawn sub-sub-agents (depth-1
 	 cap), so the flag is `false` in the sub-agent view. -->
-{#snippet compactionMarkup(state: import('../coder.svelte').CompactionState)}
-	<!-- Compaction disclosure: a single full-width row at the
-		 bottom of the transcript so it doesn't push past the
-		 user's most recent turn. While the fast-model summary
-		 call is in flight the row shows a "compacting…" pip; on
-		 completion it flips to a `<details>` with the synthetic
-		 summary that the agent now sees in place of the older
-		 middle of the history. -->
+{#snippet compactionMarkup(state: Extract<CoderRow, { kind: 'compaction' }>)}
+	<!-- Compaction disclosure rendered inline at the point the
+		 fold happened, so it scrolls away under later turns
+		 instead of staying pinned to the bottom. While the
+		 fast-model summary call is in flight the row shows a
+		 "compacting…" pip; on completion it flips to a `<details>`
+		 with the synthetic summary that the agent now sees in
+		 place of the older middle of the history. -->
 	<div class="row compaction" class:running={state.phase === 'running'}>
 		<div class="row-label">compaction</div>
 		{#if state.phase === 'running'}
@@ -2009,6 +2006,8 @@
 			<div class="row-label">error</div>
 			<div class="bubble">{row.text}</div>
 		</div>
+	{:else if row.kind === 'compaction'}
+		{@render compactionMarkup(row)}
 	{/if}
 {/snippet}
 

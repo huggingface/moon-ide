@@ -1532,17 +1532,25 @@ impl CoderHandle {
 				SessionRecord::TodosUpdate { todos } => {
 					last_todos = todos.clone();
 				}
-				SessionRecord::Compaction { summary, .. } => {
-					// Replay-time compaction: drop everything we
-					// rebuilt since the system prompt and replace
-					// it with the synthetic summary, exactly the
-					// way the live runtime did when the record was
-					// first written. Without this, reopening a
-					// session that was compacted mid-run would
-					// re-inflate the full pre-compaction
-					// transcript and the next turn would instantly
-					// trip the provider's context-length cap.
-					let cutoff = messages.len();
+				SessionRecord::Compaction {
+					summary, messages_kept, ..
+				} => {
+					// Replay-time compaction: fold the prefix we
+					// rebuilt since the system prompt into the
+					// synthetic summary, exactly the way the live
+					// runtime did. The live pass kept the last
+					// `messages_kept` messages (recent user turns +
+					// their replies) verbatim, so we reproduce that
+					// cutoff here — folding everything *except* the
+					// last `messages_kept`. Draining the whole
+					// prefix instead would silently drop the recent
+					// turns the live pass deliberately retained,
+					// diverging the reopened prompt from the live
+					// one. Without this fold at all, reopening would
+					// re-inflate the full pre-compaction transcript
+					// and the next turn would trip the provider's
+					// context-length cap.
+					let cutoff = messages.len().saturating_sub(*messages_kept as usize).max(1);
 					crate::compaction::apply_summary_to_messages(&mut messages, cutoff, summary);
 				}
 				SessionRecord::SubagentSpawned { .. } | SessionRecord::SubagentFinished { .. } => {
@@ -2291,15 +2299,31 @@ async fn run_turn(
 			let (header, dir) = {
 				let mut session = rt.session.lock().await;
 				session.messages = messages.clone();
-				// Reset the trigger so we don't re-compact next
-				// iteration before the next response's usage lands.
-				session.last_usage = None;
+				// Re-anchor the trigger on an estimate of the
+				// freshly-compacted prompt rather than clearing it.
+				// `None` would skip the compaction check entirely on
+				// the next iteration (it early-returns on missing
+				// usage), so a single pass that didn't get under the
+				// threshold — a large summary plus heavy kept turns —
+				// would sail one over-budget prompt to the provider
+				// before the next response's usage re-armed the
+				// guard. Seeding the estimate keeps the guard live
+				// and re-fires immediately if we're still over.
+				let estimate = estimate_prompt_tokens(&messages);
+				session.last_usage = Some(TokenUsage {
+					prompt_tokens: estimate,
+					completion_tokens: 0,
+					total_tokens: estimate,
+					cache_read_input_tokens: 0,
+					cache_creation_input_tokens: 0,
+				});
 				(session.header.clone(), session.session_dir.clone())
 			};
 			if let Some(dir) = dir {
 				let record = SessionRecord::Compaction {
 					summary: applied.summary,
 					messages_compacted: applied.messages_compacted,
+					messages_kept: applied.messages_kept,
 				};
 				if let Err(err) = sessions::append_record(&dir, &header, &record).await {
 					tracing::warn!(error = %err, "failed to persist compaction record; reload will re-inflate the prefix");
@@ -3987,16 +4011,29 @@ fn emit_replay_events(sink: &FolderEventSink, record: SessionRecord) {
 			// is sync; this arm exists to keep the match
 			// exhaustive.
 		}
-		SessionRecord::Compaction { .. } => {
-			// Compaction shapes the in-memory `messages` slice
-			// at replay time (see [`load_session`]); the panel
-			// has no per-record event to render — the compaction
-			// disclosure is keyed on the live
-			// `compaction_started` / `compaction_complete` event
-			// pair, and we deliberately don't re-fire those on
-			// reload (the user already saw the disclosure when
-			// the live compaction ran; reopening shouldn't pop
-			// it back open).
+		SessionRecord::Compaction {
+			summary,
+			messages_compacted,
+			..
+		} => {
+			// Compaction shapes the in-memory `messages` slice at
+			// replay time (see [`load_session`]). We also re-emit
+			// the `started` + `complete` event pair so the panel
+			// rebuilds the inline compaction disclosure at the
+			// point in the transcript where the fold happened —
+			// the summary the agent is actually running on stays
+			// visible after a reopen, instead of vanishing. The
+			// `complete` lands collapsed (the frontend's `<details>`
+			// defaults closed), so reopening doesn't pop it open.
+			sink.send(CoderEvent::CompactionStarted { messages_compacted });
+			sink.send(CoderEvent::CompactionComplete {
+				summary,
+				// Replay can't recover the exact post-fold token
+				// count, and the ring is re-anchored by the next
+				// live round-trip's estimate anyway. 0 keeps the
+				// disclosure honest without faking a number.
+				prompt_tokens_after: 0,
+			});
 		}
 	}
 }

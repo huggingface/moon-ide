@@ -352,7 +352,8 @@ pub(crate) fn record_to_pi_wire(record: &SessionRecord, header: &SessionHeader) 
 		SessionRecord::Compaction {
 			summary,
 			messages_compacted,
-		} => pi_compaction_row(summary, *messages_compacted),
+			messages_kept,
+		} => pi_compaction_row(summary, *messages_compacted, *messages_kept),
 		SessionRecord::TitleUpdate { title } => pi_message_envelope(pi_custom_message(
 			CUSTOM_TYPE_TITLE_UPDATE,
 			serde_json::json!({ "title": title }),
@@ -585,11 +586,11 @@ fn looks_like_tool_error(content: &str) -> bool {
 	map.len() == 1 && map.contains_key("error")
 }
 
-fn pi_compaction_row(summary: &str, messages_compacted: u32) -> serde_json::Value {
+fn pi_compaction_row(summary: &str, messages_compacted: u32, messages_kept: u32) -> serde_json::Value {
 	serde_json::json!({
 		"type": PI_COMPACTION_TYPE,
 		"summary": summary,
-		"details": { "messages_compacted": messages_compacted },
+		"details": { "messages_compacted": messages_compacted, "messages_kept": messages_kept },
 	})
 }
 
@@ -676,9 +677,15 @@ pub(crate) fn pi_wire_to_records(value: &serde_json::Value) -> Vec<SessionRecord
 			.and_then(|d| d.get("messages_compacted"))
 			.and_then(|v| v.as_u64())
 			.unwrap_or(0) as u32;
+		let messages_kept = value
+			.get("details")
+			.and_then(|d| d.get("messages_kept"))
+			.and_then(|v| v.as_u64())
+			.unwrap_or(0) as u32;
 		return vec![SessionRecord::Compaction {
 			summary,
 			messages_compacted,
+			messages_kept,
 		}];
 	}
 	if row_type != PI_MESSAGE_TYPE {
@@ -1013,20 +1020,29 @@ pub enum SessionRecord {
 		#[serde(default, skip_serializing_if = "u32_is_zero")]
 		cache_creation_input_tokens: u32,
 	},
-	/// One auto-compaction pass landed. The runtime drains the
-	/// older message prefix and replaces it with a synthetic
-	/// system message holding `summary`; this record is the
-	/// on-disk twin so replay reaches the same in-memory shape.
-	/// Without it, reopening a long session re-inflates the full
+	/// One auto-compaction pass landed. The runtime folds the
+	/// older message prefix into a synthetic system message
+	/// holding `summary`; this record is the on-disk twin so
+	/// replay reaches the same in-memory shape. Without it,
+	/// reopening a long session re-inflates the full
 	/// pre-compaction transcript and the next turn instantly
 	/// trips the provider's context-length cap.
 	///
-	/// `messages_compacted` mirrors the value the runtime emits
-	/// in [`crate::CoderEvent::CompactionStarted`], kept here
-	/// for symmetry / debugging — replay doesn't actually need
-	/// it (the truncation logic is purely "drop everything since
-	/// the system prompt and inject the summary").
-	Compaction { summary: String, messages_compacted: u32 },
+	/// `messages_compacted` is how many messages the live pass
+	/// folded (`messages[1..cutoff]`). `messages_kept` is how
+	/// many trailing messages rode through unchanged (the recent
+	/// user turns and their replies, `messages[cutoff..]`).
+	/// Replay needs `messages_kept`: it rebuilds the full
+	/// transcript linearly, then folds everything *except* the
+	/// last `messages_kept` messages, which reproduces the live
+	/// cutoff exactly. Without it replay would drain the whole
+	/// prefix and silently drop the recent turns the live pass
+	/// deliberately retained.
+	Compaction {
+		summary: String,
+		messages_compacted: u32,
+		messages_kept: u32,
+	},
 	/// Snapshot of the session's todo list after one `todo_write`
 	/// call. Append-only: each call writes one record carrying the
 	/// **full** post-merge list (the same list the model sees as
@@ -2486,6 +2502,7 @@ mod tests {
 			&SessionRecord::Compaction {
 				summary: "earlier turns: refactored foo into bar".into(),
 				messages_compacted: 42,
+				messages_kept: 12,
 			},
 		)
 		.await
@@ -2498,15 +2515,18 @@ mod tests {
 		assert_eq!(parsed["type"], "compaction");
 		assert_eq!(parsed["summary"], "earlier turns: refactored foo into bar");
 		assert_eq!(parsed["details"]["messages_compacted"], 42);
+		assert_eq!(parsed["details"]["messages_kept"], 12);
 
 		let loaded = load(&dir, "sess-compaction").await.unwrap();
 		match &loaded.records[0] {
 			SessionRecord::Compaction {
 				summary,
 				messages_compacted,
+				messages_kept,
 			} => {
 				assert_eq!(summary, "earlier turns: refactored foo into bar");
 				assert_eq!(*messages_compacted, 42);
+				assert_eq!(*messages_kept, 12);
 			}
 			other => panic!("expected Compaction, got {other:?}"),
 		}

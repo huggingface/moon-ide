@@ -87,7 +87,18 @@ export type CoderRow =
 			durationMs: number | null;
 	  }
 	| { kind: 'error'; id: string; text: string }
-	| { kind: 'aborted'; id: string };
+	| { kind: 'aborted'; id: string }
+	| {
+			kind: 'compaction';
+			id: string;
+			/** `'running'` while the fast-model summary call is in
+			 *  flight; `'done'` once `compaction_complete` lands and
+			 *  `summary` is populated. */
+			phase: 'running' | 'done';
+			messagesCompacted: number;
+			/** Empty until `phase === 'done'`. */
+			summary: string;
+	  };
 
 /** Which view of the Coder panel is mounted. `'list'` shows the
  *  sessions list (mirrors the Slack panel's "← Sessions" gesture);
@@ -2491,24 +2502,58 @@ class CoderPanelState {
 				};
 				return;
 			case 'compaction_started':
+				// Ring pulse signal (header) + an interleaved
+				// transcript row at the point compaction happened.
+				// The row scrolls away under subsequent turns
+				// instead of staying pinned to the bottom, and a
+				// second compaction in the same session appends a
+				// second row rather than overwriting the first.
 				session.compaction = {
 					phase: 'running',
 					messagesCompacted: event.messages_compacted,
 				};
+				session.rows = [
+					...session.rows,
+					{
+						kind: 'compaction',
+						id: nextCompactionRowId(),
+						phase: 'running',
+						messagesCompacted: event.messages_compacted,
+						summary: '',
+					},
+				];
 				return;
 			case 'compaction_complete': {
 				const previous = session.compaction;
+				const messagesCompacted = previous?.phase === 'running' ? previous.messagesCompacted : 0;
+				// An empty summary means compaction was skipped
+				// (fast-model call failed or returned nothing) — the
+				// in-flight pip must clear and nothing was folded, so
+				// drop the running row entirely. Otherwise flip it to
+				// the collapsed `done` disclosure in place.
+				session.rows = session.rows.flatMap((row) => {
+					if (row.kind !== 'compaction' || row.phase !== 'running') {
+						return [row];
+					}
+					if (event.summary.trim().length === 0) {
+						return [];
+					}
+					return [{ ...row, phase: 'done' as const, summary: event.summary, messagesCompacted }];
+				});
 				session.compaction = {
 					phase: 'done',
-					messagesCompacted: previous?.phase === 'running' ? previous.messagesCompacted : 0,
+					messagesCompacted,
 					summary: event.summary,
 					promptTokensAfter: event.prompt_tokens_after,
 				};
 				// Mirror the backend's "reset trigger after compaction
 				// runs" so the ring shows the new (lower) prompt size
 				// immediately rather than waiting for the next
-				// `token_usage` event to land.
-				if (session.tokenUsage) {
+				// `token_usage` event to land. A `0` is the replay
+				// sentinel (the post-fold count isn't recoverable on
+				// reopen) — skip it so we don't zero out the ring the
+				// replayed `Usage` records just populated.
+				if (session.tokenUsage && event.prompt_tokens_after > 0) {
 					session.tokenUsage = {
 						...session.tokenUsage,
 						prompt: event.prompt_tokens_after,
@@ -2609,6 +2654,30 @@ function applyInnerEventToRows(rows: CoderRow[], event: CoderEvent): CoderRow[] 
 						}
 					: row,
 			);
+		case 'compaction_started':
+			return [
+				...rows,
+				{
+					kind: 'compaction',
+					id: nextCompactionRowId(),
+					phase: 'running',
+					messagesCompacted: event.messages_compacted,
+					summary: '',
+				},
+			];
+		case 'compaction_complete':
+			// Patch the running row to `done`, or drop it on an
+			// empty (skipped) summary — same contract as the parent
+			// transcript in `#applySessionEvent`.
+			return rows.flatMap((row) => {
+				if (row.kind !== 'compaction' || row.phase !== 'running') {
+					return [row];
+				}
+				if (event.summary.trim().length === 0) {
+					return [];
+				}
+				return [{ ...row, phase: 'done' as const, summary: event.summary }];
+			});
 		default:
 			return rows;
 	}
@@ -2788,6 +2857,18 @@ function appendDelta(rows: CoderRow[], id: string, delta: string, field: 'text' 
 		next.push(seed);
 	}
 	return next;
+}
+
+/** Monotonic id for synthetic compaction transcript rows. The
+ *  backend's `compaction_started` / `compaction_complete` events
+ *  carry no id (there's at most one compaction in flight per
+ *  session), so the frontend mints its own to keep the row keyed
+ *  and patchable. Module-level so a second compaction in the same
+ *  session can't collide with the first. */
+let compactionRowSeq = 0;
+function nextCompactionRowId(): string {
+	compactionRowSeq += 1;
+	return `compaction-${compactionRowSeq}`;
 }
 
 export const coder = new CoderPanelState();
