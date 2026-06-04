@@ -227,6 +227,7 @@ fn current_status(
 		mdns_url: mdns_url.map(str::to_owned),
 		fingerprint: fingerprint.to_owned(),
 		devices,
+		build_id: crate::status::self_build_id(),
 	}
 }
 

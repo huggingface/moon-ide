@@ -27,6 +27,8 @@ pub struct CompanionStatus {
 	pub mdns_url: Option<String>,
 	pub fingerprint: String,
 	pub devices: Vec<DeviceEntry>,
+	#[serde(default)]
+	pub build_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -687,6 +687,23 @@ fn ensure_bridge_running(resource_bridge_dir: Option<std::path::PathBuf>) {
 	};
 	ensure_executable(&bridge_bin);
 
+	// If a bridge is already running, only replace it when it's a
+	// *different build* than the one we just staged. This is the
+	// multi-workspace-safe rule: a second window must NOT evict the
+	// current bridge the first window's relying on (same build → leave
+	// it, it serves every window). But a stale bridge from a previous
+	// build keeps the port forever (election is "first to bind"), so a
+	// fresh build must displace it — that's the self-host rebuild loop.
+	// Identity is the binary's hash, so it needs no version bumps.
+	match running_bridge_build_id() {
+		Some(running_id) if running_id == bridge_build_id(&bridge_bin) => {
+			tracing::debug!("a current-build bridge is already running; not respawning");
+			return;
+		}
+		Some(_) => evict_running_bridge(), // stale build — replace it
+		None => {}                         // nothing running — just spawn
+	}
+
 	let mut cmd = std::process::Command::new(&bridge_bin);
 	cmd.arg("serve");
 	// Point the bridge at the companion PWA if present. Without it the
@@ -714,6 +731,98 @@ fn ensure_bridge_running(resource_bridge_dir: Option<std::path::PathBuf>) {
 		}
 		Err(err) => tracing::warn!(error = %err, "failed to spawn moon-bridge"),
 	}
+}
+
+/// Query the running bridge's control socket for its `build_id`.
+/// `None` means no bridge is reachable (or it's too old to report
+/// one — which makes it stale by definition, so callers treat
+/// `Some("")` differently from `None`). A reachable old bridge with
+/// no `build_id` returns `Some(String::new())`, which won't match any
+/// real staged hash, so it gets evicted — correct.
+fn running_bridge_build_id() -> Option<String> {
+	use std::io::{Read, Write};
+
+	let raw = dirs::data_local_dir()?;
+	let sock = raw.join(BUNDLE_IDENTIFIER).join("bridge").join("control.sock");
+	let mut stream = std::os::unix::net::UnixStream::connect(&sock).ok()?;
+	let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+	let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(500)));
+	stream.write_all(b"{\"op\":\"status\"}\n").ok()?;
+	stream.flush().ok()?;
+
+	let mut buf = Vec::new();
+	let mut tmp = [0u8; 4096];
+	loop {
+		let n = stream.read(&mut tmp).ok()?;
+		if n == 0 {
+			break;
+		}
+		buf.extend_from_slice(&tmp[..n]);
+		if buf.contains(&b'\n') || buf.len() > 64 * 1024 {
+			break;
+		}
+	}
+	let end = buf.iter().position(|&b| b == b'\n').unwrap_or(buf.len());
+	let v: serde_json::Value = serde_json::from_slice(&buf[..end]).ok()?;
+	// An old bridge that doesn't report build_id yields "" — still
+	// `Some`, so it's seen as a (stale) running bridge and evicted.
+	Some(
+		v.get("build_id")
+			.and_then(|b| b.as_str())
+			.unwrap_or_default()
+			.to_owned(),
+	)
+}
+
+/// FNV-1a 64-bit hash of the staged bridge binary — must match the
+/// bridge's own `status::self_build_id` so equal builds compare equal.
+fn bridge_build_id(bin: &std::path::Path) -> String {
+	let Ok(bytes) = std::fs::read(bin) else {
+		return String::new();
+	};
+	let mut hash: u64 = 0xcbf29ce484222325;
+	for b in bytes {
+		hash ^= b as u64;
+		hash = hash.wrapping_mul(0x100000001b3);
+	}
+	format!("{hash:016x}")
+}
+
+/// Ask any running bridge to exit, via its control socket's
+/// `shutdown` op, then wait briefly for the LAN port to free so the
+/// replacement can bind. Best-effort and synchronous (runs in setup):
+/// no socket / refused connect means no bridge is running, nothing to
+/// do. A bridge too old to speak the control protocol won't shut down
+/// here — but those predate this code and won't be in a fresh build.
+fn evict_running_bridge() {
+	use std::io::Write;
+
+	let Some(raw) = dirs::data_local_dir() else {
+		return;
+	};
+	let sock = raw.join(BUNDLE_IDENTIFIER).join("bridge").join("control.sock");
+	if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) {
+		let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(500)));
+		let _ = stream.write_all(b"{\"op\":\"shutdown\"}\n");
+		let _ = stream.flush();
+	} else {
+		// No live bridge to evict.
+		return;
+	}
+
+	// Wait (up to ~2 s) for the port to free so our spawn can bind it.
+	for _ in 0..20 {
+		if std::net::TcpStream::connect_timeout(
+			&std::net::SocketAddr::from(([127, 0, 0, 1], 53180)),
+			std::time::Duration::from_millis(50),
+		)
+		.is_err()
+		{
+			return; // port is free
+		}
+		std::thread::sleep(std::time::Duration::from_millis(100));
+	}
+	tracing::warn!("old bridge didn't release the port in time; the new bridge may lose the election");
 }
 
 /// Put the spawned process in its own process group so it survives

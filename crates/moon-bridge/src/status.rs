@@ -67,6 +67,34 @@ pub struct CompanionStatus {
 	pub mdns_url: Option<String>,
 	pub fingerprint: String,
 	pub devices: Vec<DeviceEntry>,
+	/// Hash of this bridge's own executable. The IDE compares it to
+	/// the binary it's about to stage: same build → leave the running
+	/// bridge alone (another window started it); different → it's
+	/// stale, evict + respawn. Self-maintaining, no version bumps.
+	#[serde(default)]
+	pub build_id: String,
+}
+
+/// Hash the running executable to identify its build. Cheap (one read
+/// of the binary at startup) and good enough to tell "same build" from
+/// "different build" — we only need inequality detection, not crypto.
+pub fn self_build_id() -> String {
+	let Ok(exe) = std::env::current_exe() else {
+		return String::new();
+	};
+	let Ok(bytes) = std::fs::read(&exe) else {
+		return String::new();
+	};
+	// FNV-1a 64-bit over the binary; hex. Collisions across two
+	// different moon-bridge builds are astronomically unlikely and the
+	// failure mode (not evicting a stale bridge) is the pre-existing
+	// behaviour, so a non-crypto hash is fine.
+	let mut hash: u64 = 0xcbf29ce484222325;
+	for b in bytes {
+		hash ^= b as u64;
+		hash = hash.wrapping_mul(0x100000001b3);
+	}
+	format!("{hash:016x}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
