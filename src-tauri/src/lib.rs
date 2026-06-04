@@ -687,21 +687,34 @@ fn ensure_bridge_running(resource_bridge_dir: Option<std::path::PathBuf>) {
 	};
 	ensure_executable(&bridge_bin);
 
-	// If a bridge is already running, only replace it when it's a
-	// *different build* than the one we just staged. This is the
-	// multi-workspace-safe rule: a second window must NOT evict the
-	// current bridge the first window's relying on (same build → leave
-	// it, it serves every window). But a stale bridge from a previous
-	// build keeps the port forever (election is "first to bind"), so a
-	// fresh build must displace it — that's the self-host rebuild loop.
-	// Identity is the binary's hash, so it needs no version bumps.
-	match running_bridge_build_id() {
-		Some(running_id) if running_id == bridge_build_id(&bridge_bin) => {
-			tracing::debug!("a current-build bridge is already running; not respawning");
-			return;
+	// Decide whether to spawn, leave the running bridge be, or evict
+	// it. The contended resource is the LAN port (the owner election
+	// is "first to bind"), so port-occupancy is the source of truth;
+	// the control socket only tells us *which build* holds it.
+	//
+	// Multi-workspace-safe rule: a second window must NOT evict the
+	// current bridge the first window relies on. So:
+	// - port free                 -> nothing running; spawn.
+	// - same build_id             -> a current bridge (maybe another
+	//                                window's); leave it.
+	// - different / unreachable   -> a stale build holds the port;
+	//                                evict it, then spawn.
+	if !bridge_port_occupied() {
+		// nothing holding the port; fall through to spawn
+	} else {
+		match running_bridge_build_id() {
+			Some(running_id) if running_id == bridge_build_id(&bridge_bin) => {
+				tracing::debug!("a current-build bridge is already running; not respawning");
+				return;
+			}
+			// Reachable but different build: graceful shutdown.
+			Some(_) => evict_running_bridge(),
+			// Port occupied but the control socket doesn't answer: an
+			// un-talkable bridge (e.g. one built before the control
+			// socket existed). It can't be current — a current bridge
+			// would answer — so force it off the port.
+			None => force_evict_port_holder(),
 		}
-		Some(_) => evict_running_bridge(), // stale build — replace it
-		None => {}                         // nothing running — just spawn
 	}
 
 	let mut cmd = std::process::Command::new(&bridge_bin);
@@ -732,6 +745,50 @@ fn ensure_bridge_running(resource_bridge_dir: Option<std::path::PathBuf>) {
 		Err(err) => tracing::warn!(error = %err, "failed to spawn moon-bridge"),
 	}
 }
+
+/// True if something is listening on the bridge's LAN port. Probed by
+/// attempting to bind it: a refused bind means it's taken. This is the
+/// same resource the bridge's owner election contends, so it's the
+/// authoritative "is a bridge running" signal — more reliable than the
+/// control socket, which an old bridge may lack.
+fn bridge_port_occupied() -> bool {
+	// Bind 0.0.0.0:53180 to mirror what the bridge binds; if it's free
+	// we get the listener (and immediately drop it), if taken we error.
+	std::net::TcpListener::bind(("0.0.0.0", 53180)).is_err()
+}
+
+/// Force a bridge that holds the port but doesn't answer the control
+/// socket off the machine. Only reached when the port is occupied AND
+/// the control socket is silent, i.e. a pre-control-socket bridge that
+/// can't be asked to shut down. Sends SIGTERM to every `moon-bridge`
+/// process (there should be exactly the one stale holder; a current
+/// bridge would have answered the control socket and we'd never get
+/// here), then waits for the port to free.
+#[cfg(unix)]
+fn force_evict_port_holder() {
+	// SIGTERM every moon-bridge (there should be exactly the one stale
+	// holder; a current bridge would have answered the control socket
+	// and we'd never reach this branch). `pkill` keeps it dependency-
+	// free — no `libc` crate for one signal.
+	let status = std::process::Command::new("pkill")
+		.arg("-x")
+		.arg("moon-bridge")
+		.status();
+	if status.is_err() {
+		tracing::warn!("could not run pkill to evict stale bridge");
+		return;
+	}
+	for _ in 0..20 {
+		if !bridge_port_occupied() {
+			return;
+		}
+		std::thread::sleep(std::time::Duration::from_millis(100));
+	}
+	tracing::warn!("stale bridge didn't release the port after SIGTERM");
+}
+
+#[cfg(not(unix))]
+fn force_evict_port_holder() {}
 
 /// Query the running bridge's control socket for its `build_id`.
 /// `None` means no bridge is reachable (or it's too old to report
@@ -812,13 +869,8 @@ fn evict_running_bridge() {
 
 	// Wait (up to ~2 s) for the port to free so our spawn can bind it.
 	for _ in 0..20 {
-		if std::net::TcpStream::connect_timeout(
-			&std::net::SocketAddr::from(([127, 0, 0, 1], 53180)),
-			std::time::Duration::from_millis(50),
-		)
-		.is_err()
-		{
-			return; // port is free
+		if !bridge_port_occupied() {
+			return;
 		}
 		std::thread::sleep(std::time::Duration::from_millis(100));
 	}
