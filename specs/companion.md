@@ -129,10 +129,17 @@ the address + code, the fingerprint, and a paired-devices list with
 revoke. The bridge advertises `moon-bridge.local` over **mDNS**
 (`mdns-sd`) so the phone reaches it by name regardless of the host's
 IP; the raw IP rides in the payload as the fallback for networks
-that block multicast. Because the bridge is a separate process, it
-publishes its live state to `companion-status.json` (and watches
-`companion-revoke.json`) in the bridge dir, which the IDE reads/writes
-via the `companion_status` / `companion_revoke_device` commands.
+that block multicast.
+
+Because the bridge is a separate process, the IDE talks to it over a
+local **control socket** (`<bridge_dir>/control.sock`, newline-framed
+JSON): `status` returns the pairing payload + device list, `revoke`
+drops a paired device, `shutdown` asks it to exit. The
+`companion_status` / `companion_revoke_device` commands are the IDE's
+client. Liveness is intrinsic — a refused connect means the bridge
+isn't running, so the status-bar pip can't be lit by a stale file
+(an earlier file-based channel had exactly that bug). The bridge
+stays the sole keyring writer; the IDE only _asks_ it to revoke.
 
 Pairing is the **whole** security boundary: a paired device can
 drive the coder, which can run anything via its `bash` tool, so

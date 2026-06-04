@@ -25,7 +25,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::Utf8PathBuf;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -162,16 +162,11 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
 		pairing: Mutex::new(pairing),
 	});
 
-	// Publish status for the IDE's Companion panel, and watch for
-	// revoke requests it drops. Both files live in the bridge dir.
-	write_companion_status(
-		&bridge_dir,
-		&ctx,
-		&fingerprint,
-		pairing_payload.as_ref(),
-		mdns_url.as_deref(),
-	);
-	spawn_companion_watcher(
+	// Serve the local control socket the IDE's Companion panel uses
+	// for status / revoke / shutdown. Liveness is the connect itself,
+	// so there's no status file to go stale (replaces the old
+	// companion-status.json / companion-revoke.json files).
+	spawn_control_listener(
 		bridge_dir.clone(),
 		Arc::clone(&ctx),
 		fingerprint,
@@ -205,14 +200,14 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
 	}
 }
 
-/// Build + write the companion status file from current device state.
-fn write_companion_status(
-	bridge_dir: &Utf8Path,
+/// Snapshot the current companion state from live device state + the
+/// (immutable for the process) pairing display fields.
+fn current_status(
 	ctx: &ServeCtx,
 	fingerprint: &str,
 	payload: Option<&crate::pairing::PairingPayload>,
 	mdns_url: Option<&str>,
-) {
+) -> crate::status::CompanionStatus {
 	let devices = ctx
 		.devices
 		.list()
@@ -224,7 +219,7 @@ fn write_companion_status(
 			paired_at_ms: d.paired_at_ms,
 		})
 		.collect();
-	let status = crate::status::CompanionStatus {
+	crate::status::CompanionStatus {
 		running: true,
 		pairing_payload: payload.map(|p| p.to_json()),
 		pairing_url: payload.map(|p| p.url.clone()),
@@ -232,16 +227,14 @@ fn write_companion_status(
 		mdns_url: mdns_url.map(str::to_owned),
 		fingerprint: fingerprint.to_owned(),
 		devices,
-	};
-	if let Err(err) = crate::status::write_status(bridge_dir, &status) {
-		tracing::warn!(error = %err, "failed to write companion status");
 	}
 }
 
-/// Poll for revoke requests from the IDE and refresh the status file
-/// when the device list changes. Cheap 1 s poll — the panel is only
-/// open briefly during pairing management, and revoke is rare.
-fn spawn_companion_watcher(
+/// Bind the local control socket and serve `status` / `revoke` /
+/// `shutdown` from the IDE's Companion panel. Replaces the old
+/// status-file + revoke-file channel: a successful connect *is* the
+/// liveness signal, so nothing goes stale.
+fn spawn_control_listener(
 	bridge_dir: Utf8PathBuf,
 	ctx: Arc<ServeCtx>,
 	fingerprint: String,
@@ -249,29 +242,78 @@ fn spawn_companion_watcher(
 	mdns_url: Option<String>,
 ) {
 	tokio::spawn(async move {
-		let mut last_count = ctx.devices.list().map(|d| d.len()).unwrap_or(0);
+		let path = crate::status::control_sock_path(&bridge_dir);
+		// A stale socket file (previous crash) blocks bind; unlink and
+		// rebind. Safe because we already won the port election, so
+		// we're the one true bridge.
+		let _ = std::fs::remove_file(&path);
+		let listener = match tokio::net::UnixListener::bind(&path) {
+			Ok(l) => l,
+			Err(err) => {
+				tracing::warn!(error = %err, "could not bind companion control socket; panel will show not-running");
+				return;
+			}
+		};
+
 		loop {
-			tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-			let mut dirty = false;
-			if let Some(req) = crate::status::take_revoke_request(&bridge_dir) {
-				match ctx.devices.revoke(&req.device_id) {
-					Ok(true) => tracing::info!(id = %req.device_id, "revoked companion device"),
-					Ok(false) => tracing::debug!(id = %req.device_id, "revoke: unknown device"),
-					Err(err) => tracing::warn!(error = %err, "revoke failed"),
-				}
-				dirty = true;
-			}
-			// Also refresh when a pair added a device (handle_pair
-			// doesn't carry the dir/fingerprint, so we detect the
-			// count change here rather than thread them through).
-			let count = ctx.devices.list().map(|d| d.len()).unwrap_or(last_count);
-			if count != last_count {
-				last_count = count;
-				dirty = true;
-			}
-			if dirty {
-				write_companion_status(&bridge_dir, &ctx, &fingerprint, payload.as_ref(), mdns_url.as_deref());
-			}
+			let Ok((mut stream, _)) = listener.accept().await else {
+				continue;
+			};
+			let ctx = Arc::clone(&ctx);
+			let fingerprint = fingerprint.clone();
+			let payload = payload.clone();
+			let mdns_url = mdns_url.clone();
+			tokio::spawn(async move {
+				use tokio::io::{AsyncReadExt, AsyncWriteExt};
+				let mut buf = Vec::with_capacity(256);
+				let mut tmp = [0u8; 1024];
+				// Read one framed request line.
+				let req = loop {
+					let Ok(n) = stream.read(&mut tmp).await else {
+						return;
+					};
+					if n == 0 {
+						return;
+					}
+					buf.extend_from_slice(&tmp[..n]);
+					if let Some(req) = crate::status::parse_request(&buf) {
+						break req;
+					}
+					if buf.len() > 64 * 1024 {
+						return;
+					}
+				};
+
+				let resp = match req {
+					crate::status::ControlRequest::Status => crate::status::ControlResponse::Status(current_status(
+						&ctx,
+						&fingerprint,
+						payload.as_ref(),
+						mdns_url.as_deref(),
+					)),
+					crate::status::ControlRequest::Revoke { device_id } => match ctx.devices.revoke(&device_id) {
+						Ok(revoked) => {
+							if revoked {
+								tracing::info!(id = %device_id, "revoked companion device");
+							}
+							crate::status::ControlResponse::Revoked { revoked }
+						}
+						Err(err) => crate::status::ControlResponse::Error {
+							message: format!("revoke failed: {err}"),
+						},
+					},
+					crate::status::ControlRequest::Shutdown => {
+						let _ = stream
+							.write_all(&crate::status::encode_response(&crate::status::ControlResponse::Ok))
+							.await;
+						let _ = stream.flush().await;
+						tracing::info!("companion bridge shutting down on control request");
+						std::process::exit(0);
+					}
+				};
+				let _ = stream.write_all(&crate::status::encode_response(&resp)).await;
+				let _ = stream.flush().await;
+			});
 		}
 	});
 }

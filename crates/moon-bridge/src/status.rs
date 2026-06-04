@@ -1,39 +1,71 @@
-//! Cross-process state the desktop IDE reads to drive its Companion
-//! panel (Phase 13.4b).
+//! Local control channel between the desktop IDE and the bridge
+//! (Phase 13.4b).
 //!
-//! The bridge is a separate process from the IDE, and the live
-//! pairing code only exists in the running bridge's memory. So the
-//! bridge writes a small `companion-status.json` under the bridge dir
-//! that the IDE reads for display (pairing payload + paired devices),
-//! and watches a `companion-revoke.json` the IDE drops to request a
-//! revoke. File-based because it's the lowest-machinery channel
-//! between two co-host processes that already share the bridge dir —
-//! no second socket, and the bridge stays the single keyring writer
-//! (no cross-process keyring races).
+//! The bridge is a separate process that owns state the IDE can't see
+//! directly — the live pairing code (in memory) and the keyring
+//! device list. Earlier this crossed the process boundary via files
+//! (`companion-status.json` / `companion-revoke.json`), but a file is
+//! state without a heartbeat: a crashed/killed bridge leaves a stale
+//! "running" file behind, so the IDE had to TCP-probe the port to
+//! tell if the bridge was really alive.
+//!
+//! Instead the bridge listens on a Unix socket at
+//! `<bridge_dir>/control.sock` and answers `status` / `revoke` /
+//! `shutdown` requests. Liveness is intrinsic: if the IDE's
+//! `connect()` succeeds, the bridge is alive; if it's refused, it
+//! isn't. No file to go stale, same single-instance-detection shape
+//! as the per-workspace `instance.sock` (ADR 0014). The bridge stays
+//! the sole keyring writer — the IDE only *asks* it to revoke.
+//!
+//! Wire format: one compact-JSON [`ControlRequest`] line in, one
+//! compact-JSON [`ControlResponse`] line out, connection closed.
 
-use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
 
-pub const STATUS_FILE: &str = "companion-status.json";
-pub const REVOKE_FILE: &str = "companion-revoke.json";
+/// Control socket filename under the bridge dir.
+pub const CONTROL_SOCK: &str = "control.sock";
 
-/// What the IDE's Companion panel renders. Written by the bridge on
-/// startup and whenever the device list changes.
+/// What the IDE asks the bridge to do.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "lowercase")]
+pub enum ControlRequest {
+	/// Report current pairing payload + paired devices.
+	Status,
+	/// Revoke a paired device by id.
+	Revoke { device_id: String },
+	/// Ask the bridge to exit (e.g. before a rebuild).
+	Shutdown,
+}
+
+/// The bridge's reply.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ControlResponse {
+	Status(CompanionStatus),
+	/// `revoked: true` if a device was removed, false if unknown id.
+	Revoked {
+		revoked: bool,
+	},
+	Ok,
+	Error {
+		message: String,
+	},
+}
+
+/// The companion state the IDE's panel renders. `running` is implied
+/// by a successful connect now, but kept in the struct so the IDE has
+/// one shape to hold (set true when the response arrives).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CompanionStatus {
-	/// `true` while the bridge is serving (the file exists).
 	pub running: bool,
-	/// The pairing QR payload as compact JSON, or `null` when pairing
-	/// is closed (already consumed / `--no-pairing`).
+	/// Pairing QR payload (compact JSON), or `null` when pairing is
+	/// closed (consumed / `--no-pairing`).
 	pub pairing_payload: Option<String>,
-	/// Human type-in fallback: the `wss://…` URL and the code.
 	pub pairing_url: Option<String>,
 	pub pairing_code: Option<String>,
-	/// `.local` URL when mDNS advertising is up (IP URL otherwise).
+	/// `.local` URL when mDNS is up.
 	pub mdns_url: Option<String>,
-	/// Cert fingerprint (colon-hex) for the trust step.
 	pub fingerprint: String,
-	/// Paired devices (id + label + paired-at), tokens omitted.
 	pub devices: Vec<DeviceEntry>,
 }
 
@@ -44,32 +76,59 @@ pub struct DeviceEntry {
 	pub paired_at_ms: u128,
 }
 
-/// A revoke request the IDE drops for the bridge to act on.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RevokeRequest {
-	pub device_id: String,
+/// Path of the control socket under `bridge_dir`.
+pub fn control_sock_path(bridge_dir: &camino::Utf8Path) -> std::path::PathBuf {
+	bridge_dir.join(CONTROL_SOCK).into_std_path_buf()
 }
 
-/// Write the status atomically (temp file + rename) so the IDE never
-/// reads a half-written document.
-pub fn write_status(bridge_dir: &Utf8Path, status: &CompanionStatus) -> std::io::Result<()> {
-	let path = bridge_dir.join(STATUS_FILE);
-	let tmp = bridge_dir.join(format!("{STATUS_FILE}.tmp"));
-	let json = serde_json::to_vec_pretty(status).unwrap_or_default();
-	std::fs::write(&tmp, json)?;
-	std::fs::rename(&tmp, &path)
+/// Encode a response as a single framed line for the server side.
+pub fn encode_response(resp: &ControlResponse) -> Vec<u8> {
+	let mut line = serde_json::to_vec(resp).unwrap_or_else(|_| br#"{"kind":"error","message":"encode failed"}"#.to_vec());
+	line.push(b'\n');
+	line
 }
 
-/// Remove the status file (called on bridge exit so the IDE sees
-/// "not running").
-pub fn clear_status(bridge_dir: &Utf8Path) {
-	let _ = std::fs::remove_file(bridge_dir.join(STATUS_FILE));
+/// Parse one framed request line on the server side.
+pub fn parse_request(buf: &[u8]) -> Option<ControlRequest> {
+	let end = buf.iter().position(|&b| b == b'\n')?;
+	serde_json::from_slice(&buf[..end]).ok()
 }
 
-/// Take a pending revoke request, if any (removes the file).
-pub fn take_revoke_request(bridge_dir: &Utf8Path) -> Option<RevokeRequest> {
-	let path = bridge_dir.join(REVOKE_FILE);
-	let bytes = std::fs::read(&path).ok()?;
-	let _ = std::fs::remove_file(&path);
-	serde_json::from_slice(&bytes).ok()
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn request_round_trips() {
+		for req in [
+			ControlRequest::Status,
+			ControlRequest::Revoke {
+				device_id: "abc".into(),
+			},
+			ControlRequest::Shutdown,
+		] {
+			let mut line = serde_json::to_vec(&req).unwrap();
+			line.push(b'\n');
+			let parsed = parse_request(&line).unwrap();
+			// Compare via serialised form (no PartialEq needed).
+			assert_eq!(
+				serde_json::to_string(&parsed).unwrap(),
+				serde_json::to_string(&req).unwrap()
+			);
+		}
+	}
+
+	#[test]
+	fn response_round_trips() {
+		let resp = ControlResponse::Status(CompanionStatus {
+			running: true,
+			fingerprint: "aa:bb".into(),
+			..Default::default()
+		});
+		let bytes = encode_response(&resp);
+		assert!(bytes.ends_with(b"\n"));
+		let end = bytes.iter().position(|&b| b == b'\n').unwrap();
+		let back: ControlResponse = serde_json::from_slice(&bytes[..end]).unwrap();
+		assert!(matches!(back, ControlResponse::Status(s) if s.running && s.fingerprint == "aa:bb"));
+	}
 }

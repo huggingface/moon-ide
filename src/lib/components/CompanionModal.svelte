@@ -23,9 +23,10 @@
 	const qrSvg = $derived(status?.pairing_payload ? renderSVG(status.pairing_payload, { border: 2 }) : null);
 
 	async function revoke(id: string): Promise<void> {
+		// Revoke is synchronous over the control socket, so refresh
+		// immediately — no poll delay needed.
 		await ipc.companion.revokeDevice(id);
-		// The bridge picks up the request within ~1s; nudge a refresh.
-		setTimeout(() => void companion.refresh(), 1200);
+		await companion.refresh();
 	}
 
 	function relativeTime(ms: number): string {

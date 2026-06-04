@@ -272,10 +272,11 @@ async fn run_serve(
 	}
 	tracing::info!(%bind, advertise_host, "starting moon-bridge serve");
 
-	// Clear the status file on exit so the IDE's panel flips to
-	// "not running" promptly (the idle-exit path also relies on this).
+	// Remove the control socket on exit. Not strictly required — a
+	// dead socket refuses connect, which the IDE reads as
+	// "not running" — but it keeps the bridge dir tidy.
 	let cleanup_dir = bridge_dir.clone();
-	let _guard = StatusCleanup(cleanup_dir);
+	let _guard = ControlSockCleanup(cleanup_dir);
 
 	serve::serve(serve::ServeConfig {
 		addr: bind,
@@ -292,12 +293,13 @@ async fn run_serve(
 	.await
 }
 
-/// Removes the companion status file on drop (bridge exit), so the
-/// IDE's Companion panel sees "not running" without waiting.
-struct StatusCleanup(camino::Utf8PathBuf);
-impl Drop for StatusCleanup {
+/// Removes the control socket on drop (bridge exit). A dead socket
+/// would already read as "not running" via a refused connect; this
+/// just keeps the bridge dir tidy.
+struct ControlSockCleanup(camino::Utf8PathBuf);
+impl Drop for ControlSockCleanup {
 	fn drop(&mut self) {
-		status::clear_status(&self.0);
+		let _ = std::fs::remove_file(status::control_sock_path(&self.0));
 	}
 }
 
