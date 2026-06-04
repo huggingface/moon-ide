@@ -3356,7 +3356,7 @@
 		bottom: calc(100% - 8px);
 		max-height: 240px;
 		overflow-y: auto;
-		background: var(--m-bg-overlay);
+		background: var(--m-bg-2);
 		border: 1px solid var(--m-border);
 		border-radius: 4px;
 		box-shadow: 0 4px 12px rgb(0 0 0 / 18%);
