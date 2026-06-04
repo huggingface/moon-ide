@@ -154,6 +154,20 @@ pub enum CoderEvent {
 		updated_at_ms: i64,
 	},
 
+	/// A batch of events delivered as one envelope. Used by session
+	/// replay (`open_session`): a long transcript fans out into
+	/// hundreds-to-thousands of individual events, and Tauri
+	/// delivers each as its own event-loop task on the frontend —
+	/// reducing ~1 ms/event in pure IPC dispatch, which is seconds
+	/// of jank on a large session. Replaying through a single
+	/// `Replay` payload collapses that to one IPC crossing + one
+	/// frontend reduce pass. The frontend unpacks `events` and
+	/// applies each through the same per-event reducer a live turn
+	/// uses, so ordering and semantics are identical. Not used for
+	/// live turns — those stay one-event-per-emit so streaming
+	/// deltas land as they're produced.
+	Replay { events: Vec<CoderEvent> },
+
 	/// The active session's title was rewritten — either by the
 	/// auto-rename pass after the first turn, or (Phase 6.4+) by
 	/// an explicit user rename. Frontend updates the sticky

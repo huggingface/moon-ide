@@ -1666,11 +1666,24 @@ impl CoderHandle {
 			created_at_ms: summary.created_at_ms,
 			updated_at_ms: summary.updated_at_ms,
 		});
+		// Collect the entire replay into one `Vec` and ship it as a
+		// single `CoderEvent::Replay`. The frontend delivers each
+		// Tauri event as its own task, so fanning a 1000-record
+		// transcript out one-event-at-a-time costs ~1 ms/event in
+		// pure IPC dispatch — seconds of jank on a long session.
+		// One batched payload collapses that to a single IPC
+		// crossing + a single frontend reduce pass. `SessionLoaded`
+		// above stays a separate immediate event so the panel
+		// clears its bucket and enters "replaying" mode before the
+		// batch lands.
+		//
 		// Sub-agent records replay through a dedicated async path
 		// that pulls in each sub-agent's own JSONL so the popped-
-		// out transcript matches what the user originally saw,
-		// not just a synthetic preview. The other variants stay
-		// on the sync [`emit_replay_events`] path.
+		// out transcript matches what the user originally saw, not
+		// just a synthetic preview. The other variants go through
+		// the sync [`emit_replay_events`] path. Both push into the
+		// same buffer.
+		let mut replay_events: Vec<CoderEvent> = Vec::with_capacity(record_count + 2);
 		for record in records {
 			match record {
 				SessionRecord::SubagentSpawned {
@@ -1680,7 +1693,7 @@ impl CoderHandle {
 					ref mode,
 				} => {
 					replay_subagent_spawned(
-						&sink,
+						&mut replay_events,
 						&dir,
 						&summary.id,
 						tool_call_id.clone(),
@@ -1696,13 +1709,13 @@ impl CoderHandle {
 					was_error,
 					result_preview: _,
 				} => {
-					sink.send(CoderEvent::SubagentFinished {
+					replay_events.push(CoderEvent::SubagentFinished {
 						subagent_id,
 						tokens_used_estimate,
 						was_error,
 					});
 				}
-				other => emit_replay_events(&sink, other),
+				other => emit_replay_events(&mut replay_events, other),
 			}
 		}
 		// Surface every orphan tool call as an errored
@@ -1713,7 +1726,7 @@ impl CoderHandle {
 		// `is_error: true`, so the rendering is identical to a
 		// genuinely-failed tool.
 		for orphan_id in orphan_tool_call_ids {
-			sink.send(CoderEvent::ToolResult {
+			replay_events.push(CoderEvent::ToolResult {
 				id: orphan_id,
 				result: serde_json::json!({ "error": "Interrupted before tool completed." }),
 				is_error: true,
@@ -1730,7 +1743,7 @@ impl CoderHandle {
 		// even though no turn is in flight here — the ring keys
 		// off `prompt_tokens` regardless, so it's just the
 		// tooltip's "completion · total" line that benefits.
-		sink.send(CoderEvent::TokenUsage {
+		replay_events.push(CoderEvent::TokenUsage {
 			prompt_tokens: restore_prompt,
 			completion_tokens: restore_completion,
 			total_tokens: restore_total,
@@ -1748,8 +1761,10 @@ impl CoderHandle {
 		// explicit terminator at end-of-replay is correct in all
 		// cases: if the IDE was killed mid-turn we want busy=false
 		// anyway, since no real turn is running on the rehydrated
-		// session.
-		sink.send(CoderEvent::TurnComplete);
+		// session. It rides at the tail of the batch so the
+		// frontend closes the replay window in the same reduce pass.
+		replay_events.push(CoderEvent::TurnComplete);
+		sink.send(CoderEvent::Replay { events: replay_events });
 		let t_emitted = std::time::Instant::now();
 		tracing::info!(
 			target: "moon_profile",
@@ -3938,10 +3953,16 @@ fn sanitise_auto_title(raw: &str) -> String {
 /// session record. Fires assistant content as one final
 /// (Start, End) pair — no per-token replay, since the user has
 /// already seen it stream and we don't have the original timing.
-fn emit_replay_events(sink: &FolderEventSink, record: SessionRecord) {
+/// Translate one persisted record into the replay events the
+/// panel's reducer expects, **pushing into `out`** rather than
+/// emitting one-per-event. `open_session` collects the whole
+/// transcript into a single `Vec` and ships it as one
+/// [`CoderEvent::Replay`], so the frontend pays one IPC crossing
+/// instead of one-per-record.
+fn emit_replay_events(out: &mut Vec<CoderEvent>, record: SessionRecord) {
 	match record {
 		SessionRecord::User { text, images } => {
-			sink.send(CoderEvent::UserMessage {
+			out.push(CoderEvent::UserMessage {
 				id: new_message_id(),
 				text,
 				images,
@@ -3958,8 +3979,8 @@ fn emit_replay_events(sink: &FolderEventSink, record: SessionRecord) {
 			let has_text = content.as_deref().map(|t| !t.is_empty()).unwrap_or(false);
 			let has_thinking = thinking.as_deref().map(|t| !t.is_empty()).unwrap_or(false);
 			if has_text || has_thinking {
-				sink.send(CoderEvent::AssistantMessageStart { id: id.clone() });
-				sink.send(CoderEvent::AssistantMessageEnd {
+				out.push(CoderEvent::AssistantMessageStart { id: id.clone() });
+				out.push(CoderEvent::AssistantMessageEnd {
 					id,
 					text: content.unwrap_or_default(),
 					thinking: thinking.filter(|t| !t.is_empty()),
@@ -3967,7 +3988,7 @@ fn emit_replay_events(sink: &FolderEventSink, record: SessionRecord) {
 			}
 			for call in tool_calls {
 				let args = parse_tool_args(&call.function);
-				sink.send(CoderEvent::ToolCall {
+				out.push(CoderEvent::ToolCall {
 					id: call.id.clone(),
 					name: call.function.name,
 					args,
@@ -3989,7 +4010,7 @@ fn emit_replay_events(sink: &FolderEventSink, record: SessionRecord) {
 			// purposes (the panel's sole use is the red-tinted
 			// styling on the `tool` row).
 			let is_error = matches!(&result, Value::Object(map) if map.contains_key("error") && map.len() == 1);
-			sink.send(CoderEvent::ToolResult {
+			out.push(CoderEvent::ToolResult {
 				id: tool_call_id,
 				result,
 				is_error,
@@ -4040,8 +4061,8 @@ fn emit_replay_events(sink: &FolderEventSink, record: SessionRecord) {
 			// visible after a reopen, instead of vanishing. The
 			// `complete` lands collapsed (the frontend's `<details>`
 			// defaults closed), so reopening doesn't pop it open.
-			sink.send(CoderEvent::CompactionStarted { messages_compacted });
-			sink.send(CoderEvent::CompactionComplete {
+			out.push(CoderEvent::CompactionStarted { messages_compacted });
+			out.push(CoderEvent::CompactionComplete {
 				summary,
 				// Replay can't recover the exact post-fold token
 				// count, and the ring is re-anchored by the next
@@ -4065,7 +4086,7 @@ fn emit_replay_events(sink: &FolderEventSink, record: SessionRecord) {
 /// gracefully if it's missing (manual deletion, partial write,
 /// older session that pre-dated subagent persistence).
 async fn replay_subagent_spawned(
-	sink: &FolderEventSink,
+	out: &mut Vec<CoderEvent>,
 	parent_sessions_dir: &Utf8Path,
 	parent_session_id: &str,
 	tool_call_id: String,
@@ -4073,7 +4094,7 @@ async fn replay_subagent_spawned(
 	target_folder: String,
 	mode: String,
 ) {
-	sink.send(CoderEvent::SubagentSpawned {
+	out.push(CoderEvent::SubagentSpawned {
 		tool_call_id,
 		subagent_id: subagent_id.clone(),
 		target_folder,
@@ -4099,7 +4120,7 @@ async fn replay_subagent_spawned(
 		// out transcript.
 		let inners = subagent_replay_inners(record);
 		for inner in inners {
-			sink.send(CoderEvent::SubagentEvent {
+			out.push(CoderEvent::SubagentEvent {
 				subagent_id: subagent_id.clone(),
 				inner: Box::new(inner),
 			});
@@ -4111,7 +4132,7 @@ async fn replay_subagent_spawned(
 	// running row. Synthesise the matching error result so the
 	// popped-out transcript settles into a clean done state.
 	for orphan_id in orphan_tool_call_ids {
-		sink.send(CoderEvent::SubagentEvent {
+		out.push(CoderEvent::SubagentEvent {
 			subagent_id: subagent_id.clone(),
 			inner: Box::new(CoderEvent::ToolResult {
 				id: orphan_id,

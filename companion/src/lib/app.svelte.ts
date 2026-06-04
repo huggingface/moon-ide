@@ -248,7 +248,24 @@ class CompanionState {
 			return;
 		}
 		const ev = envelope.event;
-		if (!ev || typeof ev.type !== 'string') {
+		if (!ev) {
+			return;
+		}
+		// A `replay` batch packs a whole session's historic events
+		// into one envelope (desktop's `CoderEvent::Replay`, added
+		// for IPC-batching on session open). Unpack and feed each
+		// inner event back through this reducer so the phone sees
+		// the same transcript it would from the per-event stream.
+		if (ev.kind === 'replay') {
+			const inner = ev.events;
+			if (Array.isArray(inner)) {
+				for (const e of inner) {
+					this.#onCoderEvent({ ...envelope, event: e });
+				}
+			}
+			return;
+		}
+		if (typeof ev.type !== 'string') {
 			return;
 		}
 		switch (ev.type) {

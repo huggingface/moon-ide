@@ -2169,6 +2169,19 @@ class CoderPanelState {
 			return;
 		}
 		const sessionBucket = this.sessionStateFor(envelope.folder, envelope.session_id);
+		// A `replay` batch is the backend shipping a whole session's
+		// historic events as one payload (see `CoderEvent::Replay`).
+		// Unpack it and feed each inner event through the same
+		// per-event reducer a live turn uses — all synchronously, so
+		// the 1000+ mutations land in one Svelte flush instead of
+		// one-per-event. Ordering and semantics are identical to the
+		// old one-emit-per-record path.
+		if (envelope.event.kind === 'replay') {
+			for (const inner of envelope.event.events) {
+				this.#applySessionEvent(sessionBucket, folderBucket, envelope.folder, envelope.session_id, inner);
+			}
+			return;
+		}
 		this.#applySessionEvent(sessionBucket, folderBucket, envelope.folder, envelope.session_id, envelope.event);
 	}
 
