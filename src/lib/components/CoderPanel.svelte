@@ -496,8 +496,35 @@
 		pendingAnchorNode = null;
 	});
 
+	// Streaming-growth signal. The reducer mutates rows in place
+	// (`row.text += delta`, `row.result = …`) rather than
+	// reassigning `coder.rows`, so an append-only dep like
+	// `coder.rows.length` does NOT re-run while a turn streams its
+	// text/tool output in. Reading the last row's size-bearing
+	// fields here gives the auto-scroll effect a dep that ticks on
+	// every delta, so a sticky-bottom viewport keeps following the
+	// growing last bubble. Cheap: one row, a couple of `.length`
+	// reads.
+	const tailGrowth = $derived.by(() => {
+		const rows = coder.rows;
+		const last = rows[rows.length - 1];
+		if (last === undefined) {
+			return 0;
+		}
+		if (last.kind === 'assistant') {
+			return last.text.length + last.thinking.length;
+		}
+		if (last.kind === 'tool') {
+			return last.hasResult ? 1 : 0;
+		}
+		return 0;
+	});
+
 	$effect(() => {
 		const count = coder.rows.length;
+		// Register the streaming-growth dep so this effect re-runs
+		// on in-place text/result mutation, not just on append.
+		void tailGrowth;
 		if (count < lastRowCount) {
 			// Conversation reset: folder switch, sub-agent → main
 			// pop, or session swap shrinks the row list. Re-arm
@@ -523,6 +550,22 @@
 		}
 		const appended = count - lastRowCount;
 		lastRowCount = count;
+		// Re-confirm sticky-bottom against the *live* scroll
+		// position rather than the cached flag. Streaming a turn in
+		// place grows the last bubble's height without firing a
+		// scroll event, so `stickyBottom` (only updated by
+		// `onscroll`) can read stale-false while the user is in fact
+		// still pinned to the bottom. A stale-false read here used
+		// to bump `bottomClip` on the next append — detaching the
+		// window and popping the "Jump to latest" button even though
+		// the user never scrolled away. The live measurement closes
+		// that race.
+		if (scrollEl) {
+			const distance = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
+			if (bottomClip === 0 && distance <= STICKY_BOTTOM_THRESHOLD_PX) {
+				stickyBottom = true;
+			}
+		}
 		if (!stickyBottom) {
 			// The user is parked up in history (a steer sent
 			// mid-turn, then scrolled back to read; or a detached,

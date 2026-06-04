@@ -177,23 +177,15 @@ pub(crate) async fn compact_if_needed(
 		CoderEvent::CompactionStarted { messages_compacted },
 	);
 
-	let summary_call = vec![
-		ChatMessage::System {
-			content: SUMMARY_SYSTEM_PROMPT.to_string(),
-		},
-		ChatMessage::user(render_prefix_for_summary(older)),
-	];
-	let response = match inference
-		.chat_completion(models.cheap(), &summary_call, &[], cancel)
-		.await
-	{
-		Ok(r) => r,
-		Err(err) => {
-			tracing::warn!(error = %err, "compaction summary call failed; passing through uncompacted");
-			// Fire a synthetic Complete with empty summary so the
-			// frontend's "compacting…" pip clears. Otherwise the
-			// UI would be stuck waiting on a Complete that never
-			// arrives.
+	let summary = match summarise_prefix(inference, models, older, cancel).await {
+		Some(s) if !s.trim().is_empty() => s,
+		_ => {
+			// Either every summary call failed, or the model came
+			// back empty. Fire a synthetic Complete with an empty
+			// summary so the frontend's "compacting…" pip clears,
+			// and pass through uncompacted — the loop tries again
+			// next turn.
+			tracing::warn!("compaction summary unavailable; passing through uncompacted");
 			emit(
 				sink,
 				subagent_id_for_wrap,
@@ -205,19 +197,6 @@ pub(crate) async fn compact_if_needed(
 			return None;
 		}
 	};
-	let summary = response.content.clone().unwrap_or_default();
-	if summary.trim().is_empty() {
-		tracing::warn!("compaction summary came back empty; passing through uncompacted");
-		emit(
-			sink,
-			subagent_id_for_wrap,
-			CoderEvent::CompactionComplete {
-				summary: String::new(),
-				prompt_tokens_after: usage.prompt_tokens,
-			},
-		);
-		return None;
-	}
 
 	// Captured before the drain: everything from `cutoff` to the
 	// end rides through unchanged. Replay reproduces the cutoff
@@ -266,6 +245,185 @@ pub(crate) fn apply_summary_to_messages(messages: &mut Vec<ChatMessage>, cutoff:
 	);
 }
 
+/// Rough token estimate for a rendered string: bytes / 4, the
+/// same conventional ratio the runner's `estimate_prompt_tokens`
+/// uses. Good enough to keep each summary chunk under the cheap
+/// model's window with margin to spare.
+fn estimate_tokens(s: &str) -> usize {
+	s.len() / 4
+}
+
+/// Fraction of the cheap model's context window a single summary
+/// call's *input* is allowed to fill. The rest is headroom for
+/// the system prompt, the model's own summary output (which can
+/// run several thousand tokens), and estimate slop. Conservative
+/// on purpose: a summary call that itself 400s is the exact bug
+/// this chunking exists to avoid.
+const SUMMARY_INPUT_BUDGET: f32 = 0.55;
+
+/// Default budget (in estimated tokens) for one summary call when
+/// the cheap model's window is unknown (catalog not fetched). Maps
+/// to a conservative 128k-window model at [`SUMMARY_INPUT_BUDGET`].
+const SUMMARY_FALLBACK_BUDGET_TOKENS: usize = 70_000;
+
+/// Summarise the older message prefix into a single markdown
+/// block, chunking the input so no individual call to the cheap
+/// model exceeds its context window.
+///
+/// The earlier implementation rendered the entire prefix and sent
+/// it in one shot. On a long, heavily-cached session that prefix
+/// can be far larger than the cheap model's own window (e.g. a
+/// 700k-token history summarised by a 200k-window model), so the
+/// call 400'd every turn and compaction silently never ran — the
+/// session just kept growing past the cap. We now:
+///
+/// 1. Pack the rendered messages into chunks that each fit the
+///    cheap model's window (with headroom for the system prompt
+///    and the summary output).
+/// 2. Summarise each chunk independently.
+/// 3. If there was more than one chunk, fold the partial
+///    summaries together with a final pass (recursing if the
+///    concatenated partials are themselves too big).
+///
+/// Returns `None` only when *every* call failed; a partial set of
+/// successful chunk summaries still produces a usable result.
+async fn summarise_prefix(
+	inference: &InferenceClient,
+	models: &CoderModels,
+	older: &[ChatMessage],
+	cancel: &CancellationToken,
+) -> Option<String> {
+	let window = models.context_window(models.cheap());
+	let budget = if window == 0 {
+		SUMMARY_FALLBACK_BUDGET_TOKENS
+	} else {
+		((window as f32 * SUMMARY_INPUT_BUDGET) as usize).max(4_000)
+	};
+
+	let rendered: Vec<String> = older.iter().map(render_message_for_summary).collect();
+	let chunks = pack_into_chunks(&rendered, budget);
+	if chunks.is_empty() {
+		return None;
+	}
+
+	// Summarise each chunk. Tolerate per-chunk failures: a
+	// partial summary is more useful than none.
+	let mut partials: Vec<String> = Vec::new();
+	let multi = chunks.len() > 1;
+	for (i, chunk) in chunks.iter().enumerate() {
+		let intro = if multi {
+			format!(
+				"{PREFIX_INTRO}(This is part {} of {} of the session prefix.)\n\n",
+				i + 1,
+				chunks.len()
+			)
+		} else {
+			PREFIX_INTRO.to_string()
+		};
+		match summarise_once(inference, models, &format!("{intro}{chunk}"), cancel).await {
+			Some(s) if !s.trim().is_empty() => partials.push(s),
+			_ => tracing::warn!(chunk = i, "compaction chunk summary failed; skipping it"),
+		}
+	}
+	if partials.is_empty() {
+		return None;
+	}
+	if partials.len() == 1 {
+		return partials.into_iter().next();
+	}
+
+	// Fold the partials. If the concatenation is itself too big
+	// for one call, recurse — each level shrinks the input.
+	let combined = partials.join("\n\n---\n\n");
+	if estimate_tokens(&combined) <= budget {
+		let prompt = format!(
+			"The following are ordered partial summaries of consecutive slices of one coding session. \
+Merge them into a single coherent summary, preserving chronology and de-duplicating overlap:\n\n{combined}"
+		);
+		return summarise_once(inference, models, &prompt, cancel)
+			.await
+			.or(Some(combined));
+	}
+	// Too big even combined: wrap each partial back into a
+	// pseudo-message and recurse through the same chunker.
+	let pseudo: Vec<ChatMessage> = partials.into_iter().map(ChatMessage::user).collect();
+	Box::pin(summarise_prefix(inference, models, &pseudo, cancel)).await
+}
+
+/// Pack pre-rendered message blocks into chunks that each stay
+/// under `budget` estimated tokens. A single block bigger than the
+/// budget on its own (a huge tool result / pasted file) goes in
+/// its own chunk, truncated to the budget so the summary call
+/// can't 400 on it — losing the tail of one giant blob beats never
+/// compacting at all. Order is preserved so the chunk summaries
+/// stay chronological.
+fn pack_into_chunks(blocks: &[String], budget: usize) -> Vec<String> {
+	let mut chunks: Vec<String> = Vec::new();
+	let mut current = String::new();
+	for block in blocks {
+		if estimate_tokens(block) > budget {
+			if !current.is_empty() {
+				chunks.push(std::mem::take(&mut current));
+			}
+			let max_bytes = budget.saturating_mul(4);
+			let mut truncated = block.clone();
+			if truncated.len() > max_bytes {
+				truncated.truncate(floor_char_boundary(&truncated, max_bytes));
+				truncated.push_str("\n[… message truncated for summarisation …]\n");
+			}
+			chunks.push(truncated);
+			continue;
+		}
+		if estimate_tokens(&current) + estimate_tokens(block) > budget && !current.is_empty() {
+			chunks.push(std::mem::take(&mut current));
+		}
+		current.push_str(block);
+	}
+	if !current.is_empty() {
+		chunks.push(current);
+	}
+	chunks
+}
+
+/// One non-streaming summary call against the cheap model with the
+/// fixed [`SUMMARY_SYSTEM_PROMPT`]. Returns `None` on transport
+/// error so the caller can decide whether a partial result is
+/// still usable.
+async fn summarise_once(
+	inference: &InferenceClient,
+	models: &CoderModels,
+	user_content: &str,
+	cancel: &CancellationToken,
+) -> Option<String> {
+	let call = vec![
+		ChatMessage::System {
+			content: SUMMARY_SYSTEM_PROMPT.to_string(),
+		},
+		ChatMessage::user(user_content),
+	];
+	match inference.chat_completion(models.cheap(), &call, &[], cancel).await {
+		Ok(r) => r.content,
+		Err(err) => {
+			tracing::warn!(error = %err, "compaction summary call failed");
+			None
+		}
+	}
+}
+
+/// Largest char boundary `<= max` in `s`, so a truncation never
+/// splits a UTF-8 sequence. (`str::floor_char_boundary` is still
+/// unstable, so we inline the equivalent.)
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+	if max >= s.len() {
+		return s.len();
+	}
+	let mut i = max;
+	while i > 0 && !s.is_char_boundary(i) {
+		i -= 1;
+	}
+	i
+}
+
 /// Return the index of the K-th most recent user message
 /// (counting backwards from the end). Returns `None` when there
 /// aren't enough user messages in the prefix to keep — i.e. the
@@ -294,64 +452,59 @@ fn find_cutoff_index(messages: &[ChatMessage]) -> Option<usize> {
 	None
 }
 
-/// Flatten the older message slice into a single prompt the
-/// summarising fast-model call can ingest. Each message is
-/// labelled with its role so the model can distinguish "the
-/// user said …" from "the assistant said …" from "tool result
-/// …". Tool results are included verbatim — they're often the
-/// load-bearing artefact of the conversation (the file contents
-/// the agent actually read), and dropping them on the floor would
-/// make the summary fictionalise.
-fn render_prefix_for_summary(messages: &[ChatMessage]) -> String {
+/// Render one message into the role-labelled block the
+/// summarising model ingests. Tool results are included verbatim
+/// — they're often the load-bearing artefact of the conversation
+/// (the file contents the agent actually read), and dropping them
+/// on the floor would make the summary fictionalise.
+fn render_message_for_summary(msg: &ChatMessage) -> String {
 	let mut out = String::new();
-	out.push_str(
-		"Below is the prefix of an in-flight coding session that needs to be summarised. \
-Each block is one message; roles are explicit. The first message is the start of the session you should summarise.\n\n",
-	);
-	for msg in messages {
-		match msg {
-			ChatMessage::System { content } => {
-				out.push_str("### system\n");
-				out.push_str(content);
-				out.push_str("\n\n");
+	match msg {
+		ChatMessage::System { content } => {
+			out.push_str("### system\n");
+			out.push_str(content);
+			out.push_str("\n\n");
+		}
+		ChatMessage::User { content, images } => {
+			out.push_str("### user\n");
+			out.push_str(content);
+			if !images.is_empty() {
+				// Note image presence so the summary doesn't claim
+				// the user "didn't show me anything" when there
+				// were screenshots in the prefix. We can't usefully
+				// describe the pixels here (the cheap summary model
+				// never saw them), so a count is the honest minimum.
+				out.push_str(&format!("\n[{} attached image(s)]", images.len()));
 			}
-			ChatMessage::User { content, images } => {
-				out.push_str("### user\n");
-				out.push_str(content);
-				if !images.is_empty() {
-					// Note image presence so the summary doesn't
-					// claim the user "didn't show me anything"
-					// when there were screenshots in the prefix.
-					// We can't usefully describe the pixels here
-					// (the cheap summary model never saw them),
-					// so a count is the honest minimum.
-					out.push_str(&format!("\n[{} attached image(s)]", images.len()));
-				}
-				out.push_str("\n\n");
-			}
-			ChatMessage::Assistant { content, tool_calls } => {
-				out.push_str("### assistant\n");
-				if let Some(text) = content {
-					out.push_str(text);
-					out.push('\n');
-				}
-				for call in tool_calls {
-					out.push_str(&format!(
-						"[tool call: {} args={}]\n",
-						call.function.name, call.function.arguments
-					));
-				}
+			out.push_str("\n\n");
+		}
+		ChatMessage::Assistant { content, tool_calls } => {
+			out.push_str("### assistant\n");
+			if let Some(text) = content {
+				out.push_str(text);
 				out.push('\n');
 			}
-			ChatMessage::Tool { tool_call_id, content } => {
-				out.push_str(&format!("### tool ({tool_call_id})\n"));
-				out.push_str(content);
-				out.push_str("\n\n");
+			for call in tool_calls {
+				out.push_str(&format!(
+					"[tool call: {} args={}]\n",
+					call.function.name, call.function.arguments
+				));
 			}
+			out.push('\n');
+		}
+		ChatMessage::Tool { tool_call_id, content } => {
+			out.push_str(&format!("### tool ({tool_call_id})\n"));
+			out.push_str(content);
+			out.push_str("\n\n");
 		}
 	}
 	out
 }
+
+/// Header that prefixes the first chunk of rendered prefix in a
+/// summary call, so the model knows what it's looking at.
+const PREFIX_INTRO: &str = "Below is (part of) the prefix of an in-flight coding session that needs to be summarised. \
+Each block is one message; roles are explicit.\n\n";
 
 fn emit(sink: &FolderEventSink, subagent_id_for_wrap: Option<&str>, inner: CoderEvent) {
 	match subagent_id_for_wrap {
@@ -398,6 +551,51 @@ mod tests {
 	}
 	fn system(t: &str) -> ChatMessage {
 		ChatMessage::System { content: t.into() }
+	}
+
+	#[test]
+	fn pack_into_chunks_splits_when_over_budget() {
+		// Three ~equal blocks, budget fits ~2 of them. Expect the
+		// packer to start a new chunk rather than overflow.
+		let block = "x".repeat(400); // ~100 est tokens each
+		let blocks = vec![block.clone(), block.clone(), block.clone()];
+		let chunks = pack_into_chunks(&blocks, 150);
+		assert!(chunks.len() >= 2, "expected a split, got {} chunk(s)", chunks.len());
+		for c in &chunks {
+			assert!(
+				estimate_tokens(c) <= 150 || c.len() <= 600,
+				"a chunk overflowed the budget: {} est tokens",
+				estimate_tokens(c)
+			);
+		}
+	}
+
+	#[test]
+	fn pack_into_chunks_truncates_oversized_single_block() {
+		// One block far larger than the budget must still produce a
+		// chunk (truncated) rather than be dropped or 400 later.
+		let huge = "y".repeat(10_000); // ~2500 est tokens
+		let chunks = pack_into_chunks(&[huge], 100);
+		assert_eq!(chunks.len(), 1);
+		assert!(chunks[0].contains("message truncated"), "expected truncation marker");
+		assert!(estimate_tokens(&chunks[0]) <= 200, "truncated chunk still over budget");
+	}
+
+	#[test]
+	fn pack_into_chunks_keeps_small_history_as_one() {
+		let blocks = vec!["a".repeat(40), "b".repeat(40)];
+		let chunks = pack_into_chunks(&blocks, 100_000);
+		assert_eq!(chunks.len(), 1);
+	}
+
+	#[test]
+	fn floor_char_boundary_never_splits_utf8() {
+		let s = "héllo wörld";
+		for max in 0..=s.len() {
+			let b = floor_char_boundary(s, max);
+			assert!(s.is_char_boundary(b), "byte {b} is not a char boundary");
+			assert!(b <= max);
+		}
 	}
 
 	#[test]
