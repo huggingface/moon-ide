@@ -320,9 +320,18 @@ class SessionViewState {
 	 *  (`session_loaded`). Plain field, not `$state` — pure
 	 *  profiling: the terminating `turn_complete` logs the
 	 *  receive→reduce wall time for the whole replay so we can pair
-	 *  it with the backend's `moon_profile coder_open_session` line.
+	 *  it with the backend `coder_open_session` timings.
 	 *  `null` outside a replay. */
 	replayStartedAtMs: number | null = null;
+	/** How long the `coder_open_session` IPC call took to return
+	 *  (ms) — i.e. backend disk-load + history rebuild + pushing the
+	 *  replay events onto the channel, plus IPC framing. Captured by
+	 *  `openSession`, reported alongside the reduce time on the
+	 *  terminating `turn_complete` so the whole open cost lands in
+	 *  the in-app Logs tab without needing backend stderr. `null`
+	 *  when the session was reopened by a path other than an
+	 *  explicit `openSession` (e.g. HMR rehydrate). */
+	openIpcMs: number | null = null;
 }
 
 /** Per-bound-folder UI state. One instance per folder we've ever
@@ -1484,7 +1493,15 @@ class CoderPanelState {
 		folder.visibleSessionId = id;
 		folder.view = 'session';
 		try {
+			// Profiling: time the IPC round-trip so the open cost
+			// (backend load + rebuild + channel-push + IPC framing)
+			// is reported in the in-app Logs tab. Stash it on the
+			// session bucket; the terminating replay `turn_complete`
+			// reads it back. Set before the await so a reopen of a
+			// session whose bucket doesn't exist yet still records.
+			const ipcStart = performance.now();
 			await ipc.coder.openSession(id);
+			this.sessionStateFor(this.activeFolderPath ?? NO_FOLDER_KEY, id).openIpcMs = performance.now() - ipcStart;
 		} catch (err) {
 			// Surface the error in the (now-visible) session
 			// bucket. Pre-populating it before the IPC call
@@ -2316,18 +2333,30 @@ class CoderPanelState {
 				// records (runner.rs). Live turns clear an
 				// already-false flag — no-op.
 				if (session.replaying && session.replayStartedAtMs !== null) {
-					// Profiling: frontend receive→reduce wall time for
-					// the whole replay stream. Pair with the backend's
-					// `moon_profile coder_open_session …` line to split
-					// load/rebuild/emit (Rust) from IPC + reduce (JS).
+					// Profiling, all in the in-app Logs tab (source
+					// `coder.profile`) so it's readable without backend
+					// stderr:
+					//   ipc    — `coder_open_session` round-trip: backend
+					//            disk-load + history rebuild + pushing the
+					//            replay events onto the channel + IPC
+					//            framing. `?` when the session was
+					//            reopened by a non-`openSession` path.
+					//   reduce — receive → finish applying the replay
+					//            event stream (IPC fan-out delivery + the
+					//            JS reduce into rows).
+					// `ipc + reduce` ≈ the full click→painted-transcript
+					// cost. A large `ipc` points at the backend
+					// (per-record emit / full-JSONL parse); a large
+					// `reduce` points at the frontend.
+					const reduceMs = Math.round(performance.now() - session.replayStartedAtMs);
+					const ipcMs = session.openIpcMs === null ? '?' : Math.round(session.openIpcMs);
 					frontendLog(
-						'moon-ide',
+						'coder.profile',
 						'info',
-						`coder replay reduce: rows=${session.rows.length} reduce=${Math.round(
-							performance.now() - session.replayStartedAtMs,
-						)}ms`,
+						`open id=${sessionId} rows=${session.rows.length} ipc=${ipcMs}ms reduce=${reduceMs}ms`,
 					);
 				}
+				session.openIpcMs = null;
 				session.replayStartedAtMs = null;
 				session.replaying = false;
 				this.#flagAttentionIfBackground(folder, folderPath);
