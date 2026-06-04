@@ -283,6 +283,19 @@ function extractTodos(result: unknown): TodoItem[] | null {
 class SessionViewState {
 	rows = $state<CoderRow[]>([]);
 	busy = $state(false);
+	/** "This session's turn finished while the user was looking
+	 *  at a different session (or had the panel on the list /
+	 *  another folder)." Drives the orange `finished` marker on
+	 *  the session's row in the sessions list, so a user juggling
+	 *  several concurrent sessions notices "that one's done" the
+	 *  moment they come back to the list — without each row's
+	 *  result being on screen. Set on `turn_complete` / `aborted`
+	 *  / `error` whenever the session is not the one the user is
+	 *  currently following; cleared when the user opens / picks
+	 *  the session. The folder-level [`FolderState.attentionPending`]
+	 *  rollup stays as-is for the folder-bar sparkle; this is the
+	 *  per-row granularity inside the list. */
+	attentionPending = $state(false);
 	activeSession = $state<CoderSessionSummary | null>(null);
 	viewSubagentId = $state<string | null>(null);
 	subagentSummaries = $state<Map<string, SubagentSummary>>(new Map());
@@ -410,6 +423,16 @@ class FolderState {
 	 *  it). */
 	isSessionRunning(sessionId: string): boolean {
 		return this.sessionsById.get(sessionId)?.busy ?? false;
+	}
+
+	/** "Did this session's turn finish while the user was looking
+	 *  elsewhere, and they haven't opened it since?" Reads through
+	 *  the bucket's per-session `attentionPending` so the
+	 *  sessions-list paints the orange `finished` marker on every
+	 *  such row. Returns `false` when the session has no bucket
+	 *  yet. */
+	isSessionAttention(sessionId: string): boolean {
+		return this.sessionsById.get(sessionId)?.attentionPending ?? false;
 	}
 }
 
@@ -1492,6 +1515,12 @@ class CoderPanelState {
 		const folder = this.current;
 		folder.visibleSessionId = id;
 		folder.view = 'session';
+		// The user is now following this session — clear the
+		// per-row `finished` marker if a background turn lit it.
+		const opened = folder.sessionsById.get(id);
+		if (opened !== undefined) {
+			opened.attentionPending = false;
+		}
 		try {
 			// Profiling: time the IPC round-trip so the open cost
 			// (backend load + rebuild + channel-push + IPC framing)
@@ -1633,6 +1662,17 @@ class CoderPanelState {
 			const bucket = this.byFolder.get(path);
 			if (bucket !== undefined && bucket.attentionPending) {
 				bucket.attentionPending = false;
+			}
+			// If the session we're switching back into view is the
+			// one that finished while we were away, the user is now
+			// looking at it — drop its per-row `finished` marker too.
+			// (Switching to the list view leaves other rows' markers
+			// intact; only the visible session counts as "seen".)
+			if (bucket !== undefined && bucket.view === 'session' && bucket.visibleSessionId !== null) {
+				const visible = bucket.sessionsById.get(bucket.visibleSessionId);
+				if (visible !== undefined) {
+					visible.attentionPending = false;
+				}
 			}
 			// Kick off first-time hydration for this folder. Gated
 			// on `#workspaceReady` so the cold-start call from
@@ -2117,6 +2157,33 @@ class CoderPanelState {
 		folderBucket.attentionPending = true;
 	}
 
+	/** Flip a *session's* `attentionPending` flag iff its turn
+	 *  ended while the user wasn't following it. "Following" means
+	 *  all three hold: the session's folder is the active one, the
+	 *  panel is on the session view (not the sessions list), and
+	 *  the folder's `visibleSessionId` points at this session.
+	 *  Anything else — a different folder, the list view, or a
+	 *  different session mounted — is a background completion that
+	 *  earns the orange `finished` marker on this row.
+	 *
+	 *  This is the per-row counterpart to
+	 *  [`#flagAttentionIfBackground`]'s folder-level rollup: the
+	 *  folder-bar sparkle answers "any session here done?", this
+	 *  answers "which rows?". */
+	#flagSessionAttentionIfBackground(
+		session: SessionViewState,
+		folder: FolderState,
+		folderPath: string,
+		sessionId: string,
+	): void {
+		const active = this.activeFolderPath ?? NO_FOLDER_KEY;
+		const following = folderPath === active && folder.view === 'session' && folder.visibleSessionId === sessionId;
+		if (following) {
+			return;
+		}
+		session.attentionPending = true;
+	}
+
 	/** Route one inbound `coder:event` envelope to the right
 	 *  bucket. A `replay` envelope is unpacked into its inner events
 	 *  here (see the session-scoped branch); everything else
@@ -2346,8 +2413,13 @@ class CoderPanelState {
 				}
 				return;
 			}
-			case 'turn_complete':
+			case 'turn_complete': {
 				session.busy = false;
+				// Capture before the reset below: a replay
+				// terminator must not paint the per-row `finished`
+				// marker (reopening a session is the user actively
+				// following it, not a background completion).
+				const wasReplay = session.replaying;
 				// End of replay window: a `session_loaded` set
 				// `replaying = true` and the backend appends a
 				// terminator `TurnComplete` after replaying all
@@ -2381,7 +2453,11 @@ class CoderPanelState {
 				session.replayStartedAtMs = null;
 				session.replaying = false;
 				this.#flagAttentionIfBackground(folder, folderPath);
+				if (!wasReplay) {
+					this.#flagSessionAttentionIfBackground(session, folder, folderPath, sessionId);
+				}
 				return;
+			}
 			case 'aborted': {
 				session.busy = false;
 				// Finalize any tool rows that were mid-execution when
@@ -2404,6 +2480,7 @@ class CoderPanelState {
 				}
 				session.rows.push({ kind: 'aborted', id: `aborted-${abortedAt}` });
 				this.#flagAttentionIfBackground(folder, folderPath);
+				this.#flagSessionAttentionIfBackground(session, folder, folderPath, sessionId);
 				return;
 			}
 			case 'error':
@@ -2414,6 +2491,7 @@ class CoderPanelState {
 					text: event.message,
 				});
 				this.#flagAttentionIfBackground(folder, folderPath);
+				this.#flagSessionAttentionIfBackground(session, folder, folderPath, sessionId);
 				return;
 			case 'session_loaded':
 				// Rebind the folder's visible-session pointer to

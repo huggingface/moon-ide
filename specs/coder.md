@@ -816,7 +816,7 @@ Hydration is gated on a workspace-ready signal. The cold-start critical path is:
 
 The wire format reflects all of this: `coder:event` payloads are wrapped in a `CoderEventEnvelope { folder, session_id, event }` so the frontend can route updates to the right per-`(folder, session)` UI bucket. Sub-agent events arrive tagged with the **parent's** `(folder, session_id)` (sub-agents belong to whichever session originated them), so a parent in folder X session A with a sub-agent operating against folder Y still shows the sub-agent's collapsed card under A's transcript. A small set of event variants are genuinely folder-scoped, not session-scoped (`folder_summary_ready`, `hub_sync_started`, `hub_sync_finished`); those arrive with `session_id === ""` and the frontend's dispatcher routes them to a folder-level handler.
 
-The frontend mirrors the backend shape: a per-folder `FolderState` holds `sessionsById: SvelteMap<sessionId, SessionViewState>` plus folder-scoped fields (the on-disk sessions list, the panel-level view selector, an `attentionPending` rollup); each `SessionViewState` holds the per-session transcript, busy flag, todos, context ring, sub-agent cards, and composer draft/attachments. The sessions list paints a `running…` pip on every session whose `busy === true`, not just the visible one, so a user juggling concurrent agents in the same folder can see which ones are still working at a glance.
+The frontend mirrors the backend shape: a per-folder `FolderState` holds `sessionsById: SvelteMap<sessionId, SessionViewState>` plus folder-scoped fields (the on-disk sessions list, the panel-level view selector, an `attentionPending` rollup); each `SessionViewState` holds the per-session transcript, busy flag, a per-session `attentionPending` flag, todos, context ring, sub-agent cards, and composer draft/attachments. The sessions list paints a `running…` pip on every session whose `busy === true`, not just the visible one, plus a static `finished` marker on every session whose turn ended while the user wasn't following it (`attentionPending === true`), so a user juggling concurrent agents in the same folder can see both which ones are still working and which ones just finished at a glance. The per-session flag is the row-level counterpart to the folder-scoped `FolderState.attentionPending` rollup that drives the folder-bar sparkle.
 
 ### On disk
 
@@ -923,13 +923,26 @@ slot via `rightPanel.kind === 'coder'`:
   title plus a relative `updated_at_ms`. Hovering a row reveals
   two icon buttons on the right: an "open trace" `</>` button and
   a trash icon (with a confirm dialog on click). Clicking the
-  body of a row opens the session. The row whose id matches the
-  current folder bucket's `activeSession` and whose bucket is
-  `busy` paints a pulsing accent dot left of the title and a
-  `running…` label in the meta row, so a user juggling background
-  agents can see at a glance which session is mid-turn from the
-  list view (the busy state is per-folder; only one session per
-  project can be running at a time, so at most one row pulses).
+  body of a row opens the session. Each row carries one of two
+  per-session status cues so a user juggling several concurrent
+  sessions (per [ADR 0016](decisions/0016-coder-concurrent-sessions.md))
+  can triage the list at a glance:
+  - **Running** — the session's bucket is `busy`. A pulsing
+    accent dot left of the title plus a `running…` label in the
+    meta row. Every running session paints it, not just the
+    visible one.
+  - **Finished** — the session's turn ended
+    (`turn_complete` / `aborted` / `error`) while the user was
+    _not_ following it (a different session mounted, the list
+    view, or another folder active). A static amber dot
+    (`--m-warning`, no pulse — mirrors the folder-bar `.done`
+    sparkle) plus a `finished` label, so a user who started a
+    turn and switched to another session notices "that one's
+    done" the moment they come back to the list. Cleared when the
+    row is opened (`openSession`) or when the user switches back
+    to a folder whose visible session is the finished one
+    (`setActiveFolder`). Running takes precedence: a session
+    that's still busy never shows the finished marker.
 
 `+` from either view drops into a fresh empty session and lands
 focus in the composer. Empty sessions don't persist until the

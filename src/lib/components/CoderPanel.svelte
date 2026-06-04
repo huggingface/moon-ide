@@ -1628,22 +1628,32 @@
 					{#each coder.sessions as session (session.id)}
 						{@const isVisible = coder.currentSession.activeSession?.id === session.id}
 						{@const isRunning = coder.current.isSessionRunning(session.id)}
-						<li class="session-row" class:active={isVisible} class:running={isRunning}>
+						{@const isFinished = !isRunning && coder.current.isSessionAttention(session.id)}
+						<li class="session-row" class:active={isVisible} class:running={isRunning} class:finished={isFinished}>
 							<button
 								type="button"
 								class="session-pick"
 								onclick={() => onPickSession(session.id)}
-								title={isRunning ? 'Session is running — click to follow' : 'Open session'}
+								title={isRunning
+									? 'Session is running — click to follow'
+									: isFinished
+										? 'Finished while you were away — click to open'
+										: 'Open session'}
 							>
 								<div class="session-title">
 									{#if isRunning}
 										<span class="running-dot" aria-hidden="true"></span>
+									{:else if isFinished}
+										<span class="finished-dot" aria-hidden="true"></span>
 									{/if}
 									<span class="session-title-text">{session.title || '(untitled)'}</span>
 								</div>
 								<div class="session-meta">
 									{#if isRunning}
 										<span class="running-label">running…</span>
+										<span class="session-meta-sep">·</span>
+									{:else if isFinished}
+										<span class="finished-label">finished</span>
 										<span class="session-meta-sep">·</span>
 									{/if}
 									{formatRelative(session.updated_at_ms)}
@@ -2684,6 +2694,10 @@
 		color: var(--m-accent);
 		font-weight: 500;
 	}
+	.session-row.finished .finished-label {
+		color: var(--m-warning);
+		font-weight: 500;
+	}
 	.session-row .session-meta-sep {
 		color: var(--m-fg-subtle);
 	}
@@ -2715,6 +2729,20 @@
 		.running-dot {
 			animation: none;
 		}
+	}
+	/* Finished marker — a static amber dot on a session whose turn
+	   ended while the user was looking at a different session (or
+	   the list / another folder). Mirrors the folder-bar's `.done`
+	   sparkle: same `--m-warning` hue, and deliberately *no* pulse
+	   — the work is done, so a static cue says "this one's waiting
+	   on you" without over-claiming attention. Clears when the row
+	   is opened. */
+	.finished-dot {
+		flex-shrink: 0;
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		background: var(--m-warning);
 	}
 	.session-row-action {
 		opacity: 0;

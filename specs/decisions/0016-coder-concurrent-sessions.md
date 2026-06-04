@@ -130,6 +130,21 @@ and matches how `bucketFor` already works.
   folder-level rollup. A user juggling three running agents in
   folder X still sees one folder-bar pip; the granularity drops to
   the sessions list inside that folder.
+
+> **Addendum (per-session "finished" marker).** The folder-scoped
+> `attentionPending` rollup above answers "did anything here
+> finish?" but can't say _which_ session. `SessionViewState` later
+> gained its own per-session `attentionPending` flag for exactly
+> the same triage need the running pip serves: a session whose turn
+> ends while the user is following a _different_ session paints a
+> static amber `finished` marker on its row (mirrors the folder-bar
+> `.done` hue, no pulse). Set on `turn_complete` / `aborted` /
+> `error` when the session isn't the one being followed; cleared on
+> `openSession` and on `setActiveFolder` when the folder's visible
+> session is the finished one. The folder-level rollup is unchanged
+> — this is the per-row counterpart, same as the running pip is the
+> per-row counterpart of `busyForFolder`.
+
 - The composer draft / attachments become per-session. The Phase 6
   multi-session work made them per-folder; per-session is the
   natural next step now that the user can hold multiple in-flight
