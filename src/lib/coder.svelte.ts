@@ -319,13 +319,13 @@ class SessionViewState {
 	/** Wall-clock (ms) when the current replay window opened
 	 *  (`session_loaded`). Plain field, not `$state` — pure
 	 *  profiling: the terminating `turn_complete` logs the
-	 *  receive→reduce wall time for the whole replay so we can pair
-	 *  it with the backend `coder_open_session` timings.
-	 *  `null` outside a replay. */
+	 *  receive→reduce wall time for the whole replay (the
+	 *  `coder.profile` line in the in-app Logs tab). `null` outside
+	 *  a replay. */
 	replayStartedAtMs: number | null = null;
 	/** How long the `coder_open_session` IPC call took to return
-	 *  (ms) — i.e. backend disk-load + history rebuild + pushing the
-	 *  replay events onto the channel, plus IPC framing. Captured by
+	 *  (ms) — backend disk-load + history rebuild + serializing the
+	 *  one batched `Replay` payload, plus IPC framing. Captured by
 	 *  `openSession`, reported alongside the reduce time on the
 	 *  terminating `turn_complete` so the whole open cost lands in
 	 *  the in-app Logs tab without needing backend stderr. `null`
@@ -2252,10 +2252,9 @@ class CoderPanelState {
 				// In-place `push` rather than `rows = [...rows, x]`:
 				// `$state` arrays are deep proxies, so `push` is
 				// tracked and re-runs the windowing / auto-scroll
-				// derived. The spread-append was O(n) per event, which
-				// made replaying an N-record session O(n^2) and was the
-				// dominant cost of opening a long session (see test
-				// plan 0093 / the `moon_profile` replay timings).
+				// derived. The spread-append was O(n) per event, so a
+				// replay rebuilt the array N times (O(n^2)); in-place
+				// keeps it O(n).
 				session.rows.push({
 					kind: 'user',
 					id: event.id,

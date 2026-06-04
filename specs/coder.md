@@ -877,6 +877,8 @@ If the user stops the coder mid-tool (Esc, panel close, IDE quit) the assistant'
 
 Reload-time recovery deliberately doesn't mutate the JSONL — "load is read-only" — because the at-abort-time path is the canonical place to write the synthetic `Tool` record. The same orphan-scanning logic runs on sub-agent transcripts ([`replay_subagent_spawned`](../crates/moon-coder/src/runner.rs)).
 
+**Replay transport: one batch, not one-event-per-record.** `open_session` emits `SessionLoaded` (the panel clears its bucket and enters replay mode) and then collects the entire reconstructed event stream — every record's events, sub-agent transcripts, orphan results, the restore-time `TokenUsage`, and the terminating `TurnComplete` — into a single [`CoderEvent::Replay { events }`](../crates/moon-coder/src/event.rs). The frontend unpacks it and feeds each inner event through the same per-event reducer a live turn uses. This exists purely for performance: Tauri delivers each event as its own frontend event-loop task (~1 ms of pure dispatch each), so one-emit-per-record made opening a 1000-row session take seconds. The batch collapses that to one IPC crossing plus one synchronous reduce + flush (≈ 100 ms for a 1200-row session). Live turns are unaffected — they stay one-event-per-emit so streaming deltas land as produced. The companion ([`app.svelte.ts`](../companion/src/lib/app.svelte.ts)) unpacks `Replay` the same way.
+
 ### Revert and edit & resend
 
 The transcript lets the user rewind a session to an earlier point. Every user message row, at rest, reveals two hover affordances on its label:
