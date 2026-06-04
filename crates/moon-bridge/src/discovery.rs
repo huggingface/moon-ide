@@ -87,9 +87,11 @@ pub fn resolve_config_dir() -> anyhow::Result<Utf8PathBuf> {
 }
 
 /// Path of a workspace's instance socket. Mirrors
-/// `focus_socket::socket_path` in `src-tauri`.
+/// `focus_socket::socket_path` in `src-tauri`. The socket lives in
+/// a dedicated `run/` subdirectory so the dev container can mount
+/// that directory rather than the socket file (ADR 0026).
 pub fn socket_path(workspaces_dir: &Utf8Path, slug: &str) -> Utf8PathBuf {
-	workspaces_dir.join(slug).join("instance.sock")
+	workspaces_dir.join(slug).join("run").join("instance.sock")
 }
 
 /// Connect-and-handshake liveness check. We can't trust
@@ -186,9 +188,9 @@ mod tests {
 		let workspaces_dir = Utf8PathBuf::from_path_buf(tmp.path().join("workspaces")).unwrap();
 		let config_dir = Utf8PathBuf::from_path_buf(tmp.path().join("config")).unwrap();
 		std::fs::create_dir_all(workspaces_dir.join("huggingface")).unwrap();
-		std::fs::create_dir_all(workspaces_dir.join("gitaly")).unwrap();
+		std::fs::create_dir_all(workspaces_dir.join("gitaly").join("run")).unwrap();
 		// A stale socket file with nobody listening must read as dead.
-		std::fs::write(workspaces_dir.join("gitaly").join("instance.sock"), b"").unwrap();
+		std::fs::write(socket_path(&workspaces_dir, "gitaly"), b"").unwrap();
 
 		let found = discover(&workspaces_dir, &config_dir).await.unwrap();
 		assert_eq!(found.len(), 2);
@@ -205,8 +207,8 @@ mod tests {
 		let tmp = tempdir();
 		let workspaces_dir = Utf8PathBuf::from_path_buf(tmp.path().join("workspaces")).unwrap();
 		let config_dir = Utf8PathBuf::from_path_buf(tmp.path().join("config")).unwrap();
-		std::fs::create_dir_all(workspaces_dir.join("alive")).unwrap();
 		let sock = socket_path(&workspaces_dir, "alive");
+		std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
 		let _listener = tokio::net::UnixListener::bind(sock.as_std_path()).unwrap();
 
 		let found = discover(&workspaces_dir, &config_dir).await.unwrap();

@@ -30,7 +30,7 @@ mod status_cache;
 
 pub use compose::{
 	generate_compose, BoundMount, ComposeRender, ComposeRenderOptions, MoonEditSocketMount, SshAgentForward,
-	MOON_EDIT_SOCKET_CONTAINER_PATH, SSH_AGENT_CONTAINER_PATH,
+	MOON_EDIT_SOCKET_CONTAINER_PATH, MOON_EDIT_SOCKET_DIR_CONTAINER_PATH, SSH_AGENT_CONTAINER_PATH,
 };
 pub use discovery::{
 	discover_compose_files, discover_compose_files_for_folders, discover_root_compose, ComposeDiscovery,

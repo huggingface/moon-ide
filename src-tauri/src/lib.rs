@@ -631,7 +631,7 @@ fn resolve_config_dir() -> Result<Utf8PathBuf, String> {
 
 /// `<XDG_DATA_HOME>/<bundle_id>/workspaces/`. ADR 0007 puts
 /// per-workspace state (compose.yaml, bound-folders.json,
-/// session.json, instance.sock) under this root; commands
+/// session.json, run/instance.sock) under this root; commands
 /// compose the per-workspace dir from the workspace id at
 /// call time. Same `<bundle_id>` segment as the config dir
 /// so a wipe is `~/.config/<bundle_id>` plus

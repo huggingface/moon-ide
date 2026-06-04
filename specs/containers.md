@@ -1290,14 +1290,15 @@ contract `git` has with `vim`.
 Mechanism, end to end:
 
 - The per-workspace `instance.sock` already exists at
-  `<workspaces_dir>/<slug>/instance.sock` (single-instance lock
-  - focus IPC, see [ADR 0014](decisions/0014-process-per-workspace.md)).
-    Its on-the-wire protocol is extended additively with one new
-    message kind, `E\n<host-path>\n`, that **blocks** waiting for
-    either `OK\n` (user finished) or `CANCEL\n` (user closed the
-    tab without finishing). The framing helpers live in
-    [`moon_protocol::focus_socket`](../crates/moon-protocol/src/focus_socket.rs)
-    so the host and in-container halves can't drift.
+  `<workspaces_dir>/<slug>/run/instance.sock` (single-instance
+  lock + focus IPC, see [ADR 0014](decisions/0014-process-per-workspace.md);
+  the dedicated `run/` subdir is per [ADR 0026](decisions/0026-socket-dir-mount.md)).
+  Its on-the-wire protocol is extended additively with one new
+  message kind, `E\n<host-path>\n`, that **blocks** waiting for
+  either `OK\n` (user finished) or `CANCEL\n` (user closed the
+  tab without finishing). The framing helpers live in
+  [`moon_protocol::focus_socket`](../crates/moon-protocol/src/focus_socket.rs)
+  so the host and in-container halves can't drift.
 
 - `moon-base` ships a `moon-edit` binary at `/usr/local/bin/moon-edit`.
   It's the only piece of this design that runs inside the
@@ -1307,14 +1308,21 @@ Mechanism, end to end:
   `$MOON_EDIT_PATH_MAP` (`<container>=<host>[:<container>=<host>…]`,
   same shape as `$PATH`), and round-trips the blocking edit.
 
-- The workspace's generated `compose.yaml` bind-mounts
-  `<workspaces_dir>/<slug>/instance.sock` to
-  `/run/moon/instance.sock` on the `dev` service. The mount is
-  **read-write on the socket file** (not its parent dir) — Unix-
-  socket `connect()` needs write permission on the inode, but
-  scoping the mount to the socket alone means the only "write"
-  the container can perform through it is to speak the protocol
-  the host's listener implements. Same posture as
+- The workspace's generated `compose.yaml` bind-mounts the
+  socket's parent directory `<workspaces_dir>/<slug>/run` to
+  `/run/moon` on the `dev` service; the socket then resolves to
+  `/run/moon/instance.sock` inside the container. The mount is
+  **read-write** — Unix-socket `connect()` needs write permission
+  on the inode, and a read-only directory mount makes the socket
+  unreachable. We mount the **directory**, not the socket file
+  ([ADR 0026](decisions/0026-socket-dir-mount.md)): the socket's
+  inode is recreated on every IDE restart, and a file bind-mount
+  would either go stale (pinned to the old inode) or — if the
+  source is missing at `up` time — make Docker auto-create a
+  root-owned path that bricks the workspace. The `run/` directory
+  holds only the socket, so the exposed surface is the same as a
+  file mount plus the ability to delete/replace a throwaway
+  socket. Same read-write posture as
   [SSH agent forwarding](#ssh-agent-forwarding); narrower than
   [`gh` config forwarding](#gh-config-forwarding).
 

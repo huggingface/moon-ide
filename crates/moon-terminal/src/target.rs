@@ -86,11 +86,12 @@ pub fn container_name_for_workspace(workspace_id: &str) -> String {
 	format!("moon-ws-{workspace_id}-dev-1")
 }
 
-/// In-container path the workspace's `instance.sock` is
-/// bind-mounted at — see `MOON_EDIT_SOCKET_CONTAINER_PATH` in
-/// `moon-container::compose`. Duplicated here because the
-/// terminal supervisor doesn't (and shouldn't) depend on
-/// `moon-container`; keep the two in sync.
+/// In-container path the workspace's `instance.sock` resolves to.
+/// The socket's parent `run/` directory is bind-mounted at
+/// `/run/moon` (ADR 0026), so the socket appears here — see
+/// `MOON_EDIT_SOCKET_CONTAINER_PATH` in `moon-container::compose`.
+/// Duplicated here because the terminal supervisor doesn't (and
+/// shouldn't) depend on `moon-container`; keep the two in sync.
 pub const MOON_EDIT_CONTAINER_SOCK: &str = "/run/moon/instance.sock";
 
 /// Build the `(container, host)` path-map list for the bound

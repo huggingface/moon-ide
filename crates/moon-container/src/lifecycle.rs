@@ -95,6 +95,15 @@ pub const BOUND_FOLDERS_FILE: &str = "bound-folders.json";
 /// Filename of the generated compose file inside the state dir.
 pub const COMPOSE_FILE: &str = "compose.yaml";
 
+/// Subdirectory of the state dir holding the per-workspace focus
+/// socket (`instance.sock`) and nothing else. The dev container
+/// bind-mounts this directory rather than the socket file so the
+/// socket can be rebound across IDE restarts without the mount
+/// going stale, and so Docker never auto-creates the socket path
+/// as a root-owned entry. Mirrors `focus_socket::socket_dir`'s
+/// `run/` segment in `src-tauri`. See [ADR 0026](../../../specs/decisions/0026-socket-dir-mount.md).
+pub const SOCKET_DIR: &str = "run";
+
 /// Errors the lifecycle layer surfaces to callers.
 ///
 /// We keep `DockerMissing` and `DaemonUnreachable` distinct from
@@ -245,14 +254,17 @@ impl Workspace {
 		let identity = detect_host_git_identity();
 		let gh_config = detect_host_gh_config();
 		let gh_token = detect_host_gh_token();
-		// The IDE's per-workspace focus socket lives next to
-		// `compose.yaml` in `state_dir`. It's bound pre-Tauri
-		// (`src-tauri/src/focus_socket.rs::try_bind`) so the
-		// path is guaranteed to exist by the time compose
-		// renders. Forwards `$GIT_EDITOR` into the host IDE
-		// from container terminals; see ADR 0021.
+		// The IDE's per-workspace focus socket lives in the
+		// `run/` subdir of `state_dir`. moon-ide creates that
+		// directory before any compose call runs (pre-Tauri in
+		// `src-tauri/src/focus_socket.rs::try_bind`, and again in
+		// `write_state` below) so it's guaranteed to exist,
+		// user-owned, by the time compose renders. We mount the
+		// directory (ADR 0026), not the socket file. Forwards
+		// `$GIT_EDITOR` into the host IDE from container
+		// terminals; see ADR 0021.
 		let moon_edit = MoonEditSocketMount {
-			host_socket: self.state_dir.join("instance.sock"),
+			host_dir: self.state_dir.join(SOCKET_DIR),
 		};
 		generate_compose(ComposeRenderOptions {
 			project: &self.project,
@@ -289,6 +301,11 @@ impl Workspace {
 	/// re-apply via `docker compose up`).
 	pub async fn write_state(&self, dev_image: &str) -> Result<bool, LifecycleError> {
 		tokio::fs::create_dir_all(self.state_dir.as_std_path()).await?;
+		// Make sure the socket directory exists, user-owned,
+		// before the next `docker compose up` mounts it — Docker
+		// would otherwise auto-create a missing bind-mount source
+		// as a root-owned directory we can't bind into (ADR 0026).
+		tokio::fs::create_dir_all(self.state_dir.join(SOCKET_DIR).as_std_path()).await?;
 		let render = self.render_compose(dev_image);
 		let bound_json = render_bound_folders_json(&self.bound_folders);
 

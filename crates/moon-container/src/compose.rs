@@ -100,40 +100,53 @@ pub struct SshAgentForward {
 	pub host_socket: Utf8PathBuf,
 }
 
-/// In-container path that the workspace's `instance.sock` is
-/// bind-mounted at. Read-write — Unix-socket `connect()`
-/// requires write permission on the inode. The mount is only
-/// the socket file (not its parent dir), so the only "write"
-/// the container can perform through this mount is to speak
-/// the focus-socket protocol the IDE listener implements.
+/// In-container path the workspace's socket *directory* is
+/// bind-mounted at. We mount the directory rather than the socket
+/// file (ADR 0026) so the socket can be unlinked and rebound
+/// across IDE restarts without the container's mount going stale,
+/// and so a missing source can never make Docker auto-create the
+/// socket path as a root-owned file/dir. Read-write — Unix-socket
+/// `connect()` requires write permission on the inode, and a
+/// read-only directory mount makes the socket inside it
+/// unreachable.
+pub const MOON_EDIT_SOCKET_DIR_CONTAINER_PATH: &str = "/run/moon";
+
+/// In-container path the workspace's `instance.sock` resolves to,
+/// inside [`MOON_EDIT_SOCKET_DIR_CONTAINER_PATH`]. This is what
+/// `moon-edit` connects to (`$MOON_EDIT_SOCK`); the terminal
+/// supervisor sets the env var from its own copy of this string.
 ///
-/// `moon-edit` (`crates/moon-edit`) is the in-container client
-/// and ships in `moon-base` at `/usr/local/bin/moon-edit`. See
-/// [`specs/containers.md`](../../../specs/containers.md)
-/// § "Editor forwarding" and [ADR 0021](../../../specs/decisions/0021-git-editor-forward.md).
+/// `moon-edit` (`images/moon-base/moon-edit`) is the in-container
+/// client and ships in `moon-base` at `/usr/local/bin/moon-edit`.
+/// See [`specs/containers.md`](../../../specs/containers.md)
+/// § "Editor forwarding", [ADR 0021](../../../specs/decisions/0021-git-editor-forward.md),
+/// and [ADR 0026](../../../specs/decisions/0026-socket-dir-mount.md).
 pub const MOON_EDIT_SOCKET_CONTAINER_PATH: &str = "/run/moon/instance.sock";
 
-/// Bind-mount of the workspace's `instance.sock` into the dev
+/// Bind-mount of the workspace's socket directory into the dev
 /// container so the in-container `moon-edit` shim can forward
 /// `$GIT_EDITOR` invocations to the host IDE.
 ///
-/// The host path is always the per-workspace
-/// `<workspaces_dir>/<slug>/instance.sock` that the focus-socket
-/// listener binds **before any compose call runs** (see
-/// `src-tauri/src/focus_socket.rs::try_bind`). That ordering is
-/// load-bearing: if the file didn't exist at `compose up`
-/// time, Docker would auto-create the source as a regular
-/// empty file and shadow the real socket until the container is
-/// recreated.
+/// The host path is the per-workspace `run/` directory
+/// (`<workspaces_dir>/<slug>/run/`) that holds the focus socket
+/// and nothing else. moon-ide creates it before any compose call
+/// runs (`src-tauri/src/focus_socket.rs::try_bind`, plus the
+/// lifecycle layer's `write_state`), so it always exists,
+/// user-owned, at `compose up` time. Mounting the *directory*
+/// rather than the socket file (ADR 0026) means the socket coming
+/// and going across IDE restarts is visible live to the
+/// container, and a missing source can never trigger Docker's
+/// "auto-create as root" behaviour.
 ///
 /// Unlike `SshAgentForward`, this mount has no host-side
-/// detection step — the focus socket always exists for a bound
+/// detection step — the directory always exists for a bound
 /// workspace, so the lifecycle layer can populate the option
 /// unconditionally.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MoonEditSocketMount {
-	/// Absolute host-side path to the workspace's `instance.sock`.
-	pub host_socket: Utf8PathBuf,
+	/// Absolute host-side path to the workspace's socket
+	/// directory (`<workspaces_dir>/<slug>/run/`).
+	pub host_dir: Utf8PathBuf,
 }
 
 /// In-container path the host's `~/.ssh/config` is bind-mounted
@@ -334,10 +347,10 @@ pub struct ComposeRenderOptions<'a> {
 	/// dependent on whatever the bind-mounted config contains —
 	/// which is empty when the host uses the system keyring.
 	pub gh_token: Option<&'a HostGhToken>,
-	/// Optional bind-mount of the workspace's `instance.sock`
+	/// Optional bind-mount of the workspace's socket directory
 	/// for editor forwarding. The lifecycle layer typically
-	/// populates this unconditionally — the focus-socket file
-	/// is guaranteed to exist by the time compose renders.
+	/// populates this unconditionally — the `run/` directory is
+	/// guaranteed to exist by the time compose renders.
 	pub moon_edit_socket: Option<&'a MoonEditSocketMount>,
 }
 
@@ -449,15 +462,18 @@ pub fn generate_compose(options: ComposeRenderOptions<'_>) -> ComposeRender {
 		}
 		if let Some(edit) = options.moon_edit_socket {
 			// Read-write by necessity — Unix-socket `connect()`
-			// needs write permission on the inode. The mount is
-			// just the socket file (the focus-socket protocol is
-			// the only "write" the container can perform); see
-			// ADR 0021.
+			// needs write permission on the inode, and a
+			// read-only directory mount makes the socket inside
+			// unreachable. We mount the socket's parent `run/`
+			// directory (which holds only the socket) rather than
+			// the socket file, so the socket can be rebound across
+			// IDE restarts without the mount going stale; see
+			// ADR 0026.
 			let _ = writeln!(
 				yaml,
 				"      - {host}:{container}",
-				host = edit.host_socket.as_str(),
-				container = MOON_EDIT_SOCKET_CONTAINER_PATH,
+				host = edit.host_dir.as_str(),
+				container = MOON_EDIT_SOCKET_DIR_CONTAINER_PATH,
 			);
 		}
 	}
@@ -997,7 +1013,7 @@ mod tests {
 	fn moon_edit_socket_emits_read_write_bind_mount() {
 		let project = project();
 		let edit = MoonEditSocketMount {
-			host_socket: Utf8PathBuf::from("/home/me/.local/share/moon-ide/workspaces/default/instance.sock"),
+			host_dir: Utf8PathBuf::from("/home/me/.local/share/moon-ide/workspaces/default/run"),
 		};
 		let render = generate_compose(ComposeRenderOptions {
 			project: &project,
@@ -1011,20 +1027,19 @@ mod tests {
 			moon_edit_socket: Some(&edit),
 		});
 		// Read-write (no `:ro` suffix) — Unix-socket connect needs
-		// write permission on the inode. The container-side path
-		// is the constant from compose.rs; the host path is
-		// whatever the workspace's state dir resolves to.
+		// write permission on the inode. We mount the socket's
+		// parent `run/` directory (ADR 0026), not the socket file.
 		assert!(
 			render
 				.yaml
-				.contains("- /home/me/.local/share/moon-ide/workspaces/default/instance.sock:/run/moon/instance.sock\n"),
+				.contains("- /home/me/.local/share/moon-ide/workspaces/default/run:/run/moon\n"),
 			"got:\n{}",
 			render.yaml
 		);
 		// And **no** `:ro` on this particular mount.
 		assert!(
-			!render.yaml.contains("/run/moon/instance.sock:ro"),
-			"moon-edit socket must not be read-only; got:\n{}",
+			!render.yaml.contains("/run/moon:ro"),
+			"moon-edit socket dir must not be read-only; got:\n{}",
 			render.yaml
 		);
 	}
@@ -1036,7 +1051,7 @@ mod tests {
 		// bind line — the empty-list shortcut would drop it.
 		let project = project();
 		let edit = MoonEditSocketMount {
-			host_socket: Utf8PathBuf::from("/tmp/x/instance.sock"),
+			host_dir: Utf8PathBuf::from("/tmp/x/run"),
 		};
 		let render = generate_compose(ComposeRenderOptions {
 			project: &project,
@@ -1050,6 +1065,6 @@ mod tests {
 			moon_edit_socket: Some(&edit),
 		});
 		assert!(!render.yaml.contains("volumes:\n      []"));
-		assert!(render.yaml.contains("- /tmp/x/instance.sock:/run/moon/instance.sock"));
+		assert!(render.yaml.contains("- /tmp/x/run:/run/moon\n"));
 	}
 }

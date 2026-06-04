@@ -7,8 +7,12 @@
 //!    spawning a duplicate.
 //!
 //! A Unix domain socket at
-//! `<workspaces_dir>/<slug>/instance.sock` covers both. The
-//! owner process binds it on startup and listens for newline-
+//! `<workspaces_dir>/<slug>/run/instance.sock` covers both. It
+//! lives in its own `run/` subdirectory rather than directly
+//! under the slug dir so the dev container can bind-mount that
+//! *directory* (never the socket file) and still see the socket
+//! come and go across IDE restarts — see [ADR 0026](../../specs/decisions/0026-socket-dir-mount.md).
+//! The owner process binds it on startup and listens for newline-
 //! framed messages defined in [`moon_protocol::focus_socket`]:
 //!
 //! - `F\n` — "Focus your window." Fire-and-forget; the sender
@@ -28,7 +32,9 @@
 //! `OK\n` or `CANCEL\n` back on the same socket and closes it.
 //!
 //! Stale sockets (orphaned by a crash) are detected because
-//! `connect()`-then-write fails; we unlink and rebind. The socket
+//! `connect()`-then-write fails; we unlink and rebind. The same
+//! recovery clears a root-owned directory Docker may have left at
+//! the path from a botched bind mount (ADR 0026). The socket
 //! lives under the user's own data dir, so no extra ACL is
 //! needed beyond the user's umask.
 //!
@@ -151,9 +157,23 @@ impl EditorRegistry {
 	}
 }
 
-/// Path of the per-workspace single-instance socket.
+/// Directory holding the per-workspace single-instance socket.
+///
+/// The socket lives one level below the slug's state dir, in a
+/// dedicated `run/` directory that holds nothing else. The dev
+/// container bind-mounts *this directory* (not the socket file)
+/// so the socket can be unlinked and rebound across IDE restarts
+/// without the container's mount going stale, and so a missing
+/// source can never make Docker auto-create the socket path as a
+/// root-owned file/dir. See [ADR 0026](../../specs/decisions/0026-socket-dir-mount.md).
+pub fn socket_dir(workspaces_dir: &Utf8Path, slug: &str) -> PathBuf {
+	workspaces_dir.join(slug).join("run").into_std_path_buf()
+}
+
+/// Path of the per-workspace single-instance socket, inside
+/// [`socket_dir`].
 pub fn socket_path(workspaces_dir: &Utf8Path, slug: &str) -> PathBuf {
-	workspaces_dir.join(slug).join("instance.sock").into_std_path_buf()
+	socket_dir(workspaces_dir, slug).join("instance.sock")
 }
 
 /// Try to bind the socket for `slug`. On success the caller
@@ -175,16 +195,45 @@ pub async fn try_bind(workspaces_dir: &Utf8Path, slug: &str) -> std::io::Result<
 	match UnixListener::bind(&path) {
 		Ok(listener) => Ok(listener),
 		Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
-			// Someone has it — either a live sibling or a
-			// stale file from a crash. Probe.
+			// Something is at the path. Either a live sibling
+			// owns it, or it's debris: a stale socket file from
+			// a crash, or a root-owned directory Docker created
+			// when it found a missing bind-mount source (see
+			// ADR 0026). Probe — a real listener means a live
+			// owner; anything else we clear and rebind over.
 			if probe_alive(&path).await {
 				return Err(err);
 			}
-			tokio::fs::remove_file(&path).await.ok();
+			clear_stale_entry(&path).await?;
 			UnixListener::bind(&path)
 		}
 		Err(err) => Err(err),
 	}
+}
+
+/// Remove whatever non-socket debris is sitting at the lock path
+/// so a fresh `bind` can succeed. Two shapes show up in practice:
+///
+/// - A stale socket *file* left behind by a crashed owner.
+/// - A *directory* Docker created when it found the bind-mount
+///   source missing at `docker compose up` time — owned by root
+///   because the daemon runs as root (the bug ADR 0026 fixes by
+///   mounting the socket's parent dir instead of the file).
+///
+/// Removal is governed by the *parent* directory's permissions,
+/// which moon-ide owns, so even a root-owned empty directory
+/// unlinks cleanly. A non-empty root-owned directory (contents we
+/// can't unlink) surfaces the error rather than silently looping.
+async fn clear_stale_entry(path: &Path) -> std::io::Result<()> {
+	let meta = match tokio::fs::symlink_metadata(path).await {
+		Ok(meta) => meta,
+		Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+		Err(err) => return Err(err),
+	};
+	if meta.is_dir() {
+		return tokio::fs::remove_dir_all(path).await;
+	}
+	tokio::fs::remove_file(path).await
 }
 
 /// Returns true if a process is actively listening on the
@@ -504,6 +553,8 @@ pub async fn cleanup(workspaces_dir: &Utf8Path, slug: &str) {
 
 #[cfg(test)]
 mod tests {
+	use camino::Utf8PathBuf;
+
 	use super::*;
 
 	#[tokio::test]
@@ -531,5 +582,65 @@ mod tests {
 		// Resolve goes through — the sender's send returns Err
 		// but `resolve` swallows it.
 		assert!(reg.resolve(&id, EditOutcome::Cancelled).await);
+	}
+
+	/// Unique temp workspaces dir for a single test; removed on drop.
+	struct TmpWorkspaces(Utf8PathBuf);
+	impl Drop for TmpWorkspaces {
+		fn drop(&mut self) {
+			let _ = std::fs::remove_dir_all(&self.0);
+		}
+	}
+	fn tmp_workspaces() -> TmpWorkspaces {
+		let nanos = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap()
+			.as_nanos();
+		let p = std::env::temp_dir().join(format!("moon-focus-test-{nanos}-{:?}", std::thread::current().id()));
+		std::fs::create_dir_all(&p).unwrap();
+		TmpWorkspaces(Utf8PathBuf::from_path_buf(p).unwrap())
+	}
+
+	#[tokio::test]
+	async fn try_bind_creates_socket_in_run_dir() {
+		let tmp = tmp_workspaces();
+		let listener = try_bind(&tmp.0, "ws").await.expect("bind");
+		drop(listener);
+		assert!(socket_path(&tmp.0, "ws").exists());
+		assert!(socket_dir(&tmp.0, "ws").is_dir());
+	}
+
+	#[tokio::test]
+	async fn try_bind_recovers_from_stale_socket_file() {
+		let tmp = tmp_workspaces();
+		let dir = socket_dir(&tmp.0, "ws");
+		std::fs::create_dir_all(&dir).unwrap();
+		// A crashed owner left a socket file with nobody listening.
+		std::fs::write(socket_path(&tmp.0, "ws"), b"").unwrap();
+		// We must clear it and bind fresh rather than fail.
+		let _listener = try_bind(&tmp.0, "ws").await.expect("recover stale file");
+	}
+
+	#[tokio::test]
+	async fn try_bind_recovers_from_directory_at_socket_path() {
+		let tmp = tmp_workspaces();
+		// Stand in for the root-owned directory Docker leaves at
+		// the socket path from a botched bind mount (ADR 0026).
+		// We can only create a user-owned one in a test, but the
+		// recovery path (probe-dead -> remove_dir_all -> rebind)
+		// is identical.
+		std::fs::create_dir_all(socket_path(&tmp.0, "ws")).unwrap();
+		let _listener = try_bind(&tmp.0, "ws").await.expect("recover directory");
+	}
+
+	#[tokio::test]
+	async fn try_bind_refuses_when_a_live_owner_holds_the_socket() {
+		let tmp = tmp_workspaces();
+		let owner = try_bind(&tmp.0, "ws").await.expect("first bind");
+		// A second bind while the owner is alive must fail — that's
+		// the single-instance guarantee.
+		let err = try_bind(&tmp.0, "ws").await.expect_err("second bind");
+		assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+		drop(owner);
 	}
 }

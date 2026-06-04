@@ -88,7 +88,9 @@ Concretely:
   and caches that for the process's lifetime.
 - Single-instance enforcement + cross-process focus IPC
   uses a Unix domain socket bound at
-  `<XDG_DATA_HOME>/moon-ide/workspaces/<id>/instance.sock`.
+  `<XDG_DATA_HOME>/moon-ide/workspaces/<id>/run/instance.sock`
+  (the `run/` subdir is per [ADR 0026](0026-socket-dir-mount.md);
+  earlier it sat directly under `<id>/`).
   The owning process binds the socket on startup and
   spawns a listener that focuses `main` on any received
   byte. A would-be sibling probes the socket; success
