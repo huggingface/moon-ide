@@ -40,6 +40,7 @@ import {
 	type SubagentMode,
 } from './protocol';
 import { rightPanel } from './rightPanel.svelte';
+import { frontendLog } from './logs.svelte';
 
 const CODER_EVENT_CHANNEL = 'coder:event';
 
@@ -315,6 +316,13 @@ class SessionViewState {
 	 *  `UserMessage` events shouldn't. Cleared on the first
 	 *  `turn_complete` after the load. */
 	replaying = $state(false);
+	/** Wall-clock (ms) when the current replay window opened
+	 *  (`session_loaded`). Plain field, not `$state` — pure
+	 *  profiling: the terminating `turn_complete` logs the
+	 *  receive→reduce wall time for the whole replay so we can pair
+	 *  it with the backend's `moon_profile coder_open_session` line.
+	 *  `null` outside a replay. */
+	replayStartedAtMs: number | null = null;
 }
 
 /** Per-bound-folder UI state. One instance per folder we've ever
@@ -2173,16 +2181,20 @@ class CoderPanelState {
 	): void {
 		switch (event.kind) {
 			case 'user_message':
-				session.rows = [
-					...session.rows,
-					{
-						kind: 'user',
-						id: event.id,
-						text: event.text,
-						images: event.images ?? [],
-						queued: event.queued ?? false,
-					},
-				];
+				// In-place `push` rather than `rows = [...rows, x]`:
+				// `$state` arrays are deep proxies, so `push` is
+				// tracked and re-runs the windowing / auto-scroll
+				// derived. The spread-append was O(n) per event, which
+				// made replaying an N-record session O(n^2) and was the
+				// dominant cost of opening a long session (see test
+				// plan 0093 / the `moon_profile` replay timings).
+				session.rows.push({
+					kind: 'user',
+					id: event.id,
+					text: event.text,
+					images: event.images ?? [],
+					queued: event.queued ?? false,
+				});
 				session.busy = true;
 				// Mirror the backend's `updated_at_ms` bump (every
 				// `send` / queued steer bumps the header) into the
@@ -2211,34 +2223,33 @@ class CoderPanelState {
 					}
 				}
 				return;
-			case 'steer_drained':
+			case 'steer_drained': {
 				// Runner moved (or `coder.unqueueSteer` popped) the
 				// queued message; flip the row out of "queued"
 				// styling. Idempotent — a duplicate event lands as
 				// a no-op (the row is already `queued: false`).
-				session.rows = session.rows.map((row) =>
-					row.kind === 'user' && row.id === event.id ? { ...row, queued: false } : row,
-				);
+				const row = findRowById(session.rows, event.id);
+				if (row?.kind === 'user') {
+					row.queued = false;
+				}
 				return;
+			}
 			case 'assistant_message_start':
 				// Insert the empty bubble so the user sees the row
 				// land instantly, even before the model emits its
 				// first token. Idempotent: the runner only fires
 				// `start` once per id, but we'd no-op a duplicate
 				// rather than insert a phantom row.
-				if (session.rows.some((r) => r.kind === 'assistant' && r.id === event.id)) {
+				if (findRowById(session.rows, event.id)?.kind === 'assistant') {
 					return;
 				}
-				session.rows = [
-					...session.rows,
-					{ kind: 'assistant', id: event.id, text: '', thinking: '', thinkingOpen: true },
-				];
+				session.rows.push({ kind: 'assistant', id: event.id, text: '', thinking: '', thinkingOpen: true });
 				return;
 			case 'assistant_message_delta':
-				session.rows = appendDelta(session.rows, event.id, event.delta, 'text');
+				appendDelta(session.rows, event.id, event.delta, 'text');
 				return;
 			case 'assistant_thinking_delta':
-				session.rows = appendDelta(session.rows, event.id, event.delta, 'thinking');
+				appendDelta(session.rows, event.id, event.delta, 'thinking');
 				return;
 			case 'assistant_message_end':
 				// Canonical replacement at close — see the file
@@ -2248,40 +2259,36 @@ class CoderPanelState {
 				// the complete text). Auto-collapse the thinking
 				// block: the user already saw it stream, the answer
 				// is the takeaway.
-				session.rows = session.rows.map((row) =>
-					row.kind === 'assistant' && row.id === event.id
-						? { ...row, text: event.text, thinking: event.thinking ?? row.thinking, thinkingOpen: false }
-						: row,
-				);
+				{
+					const row = findRowById(session.rows, event.id);
+					if (row?.kind === 'assistant') {
+						row.text = event.text;
+						row.thinking = event.thinking ?? row.thinking;
+						row.thinkingOpen = false;
+					}
+				}
 				return;
 			case 'tool_call':
-				session.rows = [
-					...session.rows,
-					{
-						kind: 'tool',
-						id: event.id,
-						name: event.name,
-						args: event.args,
-						result: undefined,
-						hasResult: false,
-						isError: false,
-						startedAt: Date.now(),
-						durationMs: null,
-					},
-				];
+				session.rows.push({
+					kind: 'tool',
+					id: event.id,
+					name: event.name,
+					args: event.args,
+					result: undefined,
+					hasResult: false,
+					isError: false,
+					startedAt: Date.now(),
+					durationMs: null,
+				});
 				return;
-			case 'tool_result':
-				session.rows = session.rows.map((row) =>
-					row.kind === 'tool' && row.id === event.id
-						? {
-								...row,
-								result: event.result,
-								hasResult: true,
-								isError: event.is_error,
-								durationMs: Date.now() - row.startedAt,
-							}
-						: row,
-				);
+			case 'tool_result': {
+				const toolRow = findRowById(session.rows, event.id);
+				if (toolRow?.kind === 'tool') {
+					toolRow.result = event.result;
+					toolRow.hasResult = true;
+					toolRow.isError = event.is_error;
+					toolRow.durationMs = Date.now() - toolRow.startedAt;
+				}
 				// Mirror the canonical post-merge list from a
 				// successful `todo_write` into the session so the
 				// header pill / popover stay in lock-step with the
@@ -2293,16 +2300,14 @@ class CoderPanelState {
 				// `tool_result` event itself. Replay re-emits the
 				// same `tool_call` + `tool_result` pair so this
 				// path also seeds the session on reopen.
-				if (!event.is_error) {
-					const parent = session.rows.find((row) => row.kind === 'tool' && row.id === event.id);
-					if (parent && parent.kind === 'tool' && parent.name === 'todo_write') {
-						const next = extractTodos(event.result);
-						if (next !== null) {
-							session.todos = next;
-						}
+				if (!event.is_error && toolRow?.kind === 'tool' && toolRow.name === 'todo_write') {
+					const next = extractTodos(event.result);
+					if (next !== null) {
+						session.todos = next;
 					}
 				}
 				return;
+			}
 			case 'turn_complete':
 				session.busy = false;
 				// End of replay window: a `session_loaded` set
@@ -2310,6 +2315,20 @@ class CoderPanelState {
 				// terminator `TurnComplete` after replaying all
 				// records (runner.rs). Live turns clear an
 				// already-false flag — no-op.
+				if (session.replaying && session.replayStartedAtMs !== null) {
+					// Profiling: frontend receive→reduce wall time for
+					// the whole replay stream. Pair with the backend's
+					// `moon_profile coder_open_session …` line to split
+					// load/rebuild/emit (Rust) from IPC + reduce (JS).
+					frontendLog(
+						'moon-ide',
+						'info',
+						`coder replay reduce: rows=${session.rows.length} reduce=${Math.round(
+							performance.now() - session.replayStartedAtMs,
+						)}ms`,
+					);
+				}
+				session.replayStartedAtMs = null;
 				session.replaying = false;
 				this.#flagAttentionIfBackground(folder, folderPath);
 				return;
@@ -2325,31 +2344,25 @@ class CoderPanelState {
 				// duration, and let the trailing `aborted` notice
 				// explain why.
 				const abortedAt = Date.now();
-				session.rows = session.rows.map((row) =>
-					row.kind === 'tool' && !row.hasResult
-						? {
-								...row,
-								result: { aborted: true },
-								hasResult: true,
-								isError: true,
-								durationMs: Math.max(0, abortedAt - row.startedAt),
-							}
-						: row,
-				);
-				session.rows = [...session.rows, { kind: 'aborted', id: `aborted-${abortedAt}` }];
+				for (const row of session.rows) {
+					if (row.kind === 'tool' && !row.hasResult) {
+						row.result = { aborted: true };
+						row.hasResult = true;
+						row.isError = true;
+						row.durationMs = Math.max(0, abortedAt - row.startedAt);
+					}
+				}
+				session.rows.push({ kind: 'aborted', id: `aborted-${abortedAt}` });
 				this.#flagAttentionIfBackground(folder, folderPath);
 				return;
 			}
 			case 'error':
 				session.busy = false;
-				session.rows = [
-					...session.rows,
-					{
-						kind: 'error',
-						id: `error-${Date.now()}`,
-						text: event.message,
-					},
-				];
+				session.rows.push({
+					kind: 'error',
+					id: `error-${Date.now()}`,
+					text: event.message,
+				});
 				this.#flagAttentionIfBackground(folder, folderPath);
 				return;
 			case 'session_loaded':
@@ -2370,6 +2383,7 @@ class CoderPanelState {
 				// `turn_complete` the backend appends after the
 				// replay stream.
 				session.replaying = true;
+				session.replayStartedAtMs = performance.now();
 				// Wipe the todo list and compaction trace before
 				// replay; the session's last `tool_result` for
 				// `todo_write` (if any) repopulates `todos` in the
@@ -2424,8 +2438,12 @@ class CoderPanelState {
 				if (!existing) {
 					return;
 				}
-				const nextRows = applyInnerEventToRows(existing.rows, event.inner);
-				transcripts.set(event.subagent_id, { ...existing, rows: nextRows });
+				applyInnerEventToRows(existing.rows, event.inner);
+				// `applyInnerEventToRows` mutated `existing.rows` in
+				// place; reassign the Map entry (same array ref) so the
+				// `$state` Map field notifies and the sub-agent view
+				// re-renders.
+				transcripts.set(event.subagent_id, { ...existing });
 				session.subagentTranscripts = transcripts;
 				// Live-update the collapsed card's token footer so the
 				// user sees the sub-agent's cost climb as it runs,
@@ -2512,16 +2530,13 @@ class CoderPanelState {
 					phase: 'running',
 					messagesCompacted: event.messages_compacted,
 				};
-				session.rows = [
-					...session.rows,
-					{
-						kind: 'compaction',
-						id: nextCompactionRowId(),
-						phase: 'running',
-						messagesCompacted: event.messages_compacted,
-						summary: '',
-					},
-				];
+				session.rows.push({
+					kind: 'compaction',
+					id: nextCompactionRowId(),
+					phase: 'running',
+					messagesCompacted: event.messages_compacted,
+					summary: '',
+				});
 				return;
 			case 'compaction_complete': {
 				const previous = session.compaction;
@@ -2531,15 +2546,23 @@ class CoderPanelState {
 				// in-flight pip must clear and nothing was folded, so
 				// drop the running row entirely. Otherwise flip it to
 				// the collapsed `done` disclosure in place.
-				session.rows = session.rows.flatMap((row) => {
-					if (row.kind !== 'compaction' || row.phase !== 'running') {
-						return [row];
+				{
+					const idx = session.rows.findIndex((row) => row.kind === 'compaction' && row.phase === 'running');
+					if (idx !== -1) {
+						if (event.summary.trim().length === 0) {
+							// Skipped (fast-model call failed / empty) —
+							// drop the running row entirely.
+							session.rows.splice(idx, 1);
+						} else {
+							const row = session.rows[idx]!;
+							if (row.kind === 'compaction') {
+								row.phase = 'done';
+								row.summary = event.summary;
+								row.messagesCompacted = messagesCompacted;
+							}
+						}
 					}
-					if (event.summary.trim().length === 0) {
-						return [];
-					}
-					return [{ ...row, phase: 'done' as const, summary: event.summary, messagesCompacted }];
-				});
+				}
 				session.compaction = {
 					phase: 'done',
 					messagesCompacted,
@@ -2613,73 +2636,86 @@ function findSummaryById(summaries: Map<string, SubagentSummary>, subagentId: st
  *  cases — the only event kinds a sub-agent ever wraps. Other
  *  kinds (turn_complete, session_*, error, aborted) belong to the
  *  parent's lifecycle and are handled at the outer level. */
-function applyInnerEventToRows(rows: CoderRow[], event: CoderEvent): CoderRow[] {
+/** Reduce one inner sub-agent event onto a row list **in place**,
+ *  mirroring the parent's `#applySessionEvent`. Mutates `rows`
+ *  directly (returns void) so a sub-agent with many records replays
+ *  in O(n) rather than the O(n^2) the per-event `[...rows]` /
+ *  `.map` rebuild used to cost. The caller still reassigns the
+ *  enclosing `$state` Map so the transcript field stays reactive. */
+function applyInnerEventToRows(rows: CoderRow[], event: CoderEvent): void {
 	switch (event.kind) {
 		case 'assistant_message_start':
-			return [...rows, { kind: 'assistant', id: event.id, text: '', thinking: '', thinkingOpen: true }];
+			if (findRowById(rows, event.id)?.kind !== 'assistant') {
+				rows.push({ kind: 'assistant', id: event.id, text: '', thinking: '', thinkingOpen: true });
+			}
+			return;
 		case 'assistant_message_delta':
-			return appendDelta(rows, event.id, event.delta, 'text');
+			appendDelta(rows, event.id, event.delta, 'text');
+			return;
 		case 'assistant_thinking_delta':
-			return appendDelta(rows, event.id, event.delta, 'thinking');
-		case 'assistant_message_end':
-			return rows.map((row) =>
-				row.kind === 'assistant' && row.id === event.id
-					? { ...row, text: event.text, thinking: event.thinking ?? row.thinking, thinkingOpen: false }
-					: row,
-			);
+			appendDelta(rows, event.id, event.delta, 'thinking');
+			return;
+		case 'assistant_message_end': {
+			const row = findRowById(rows, event.id);
+			if (row?.kind === 'assistant') {
+				row.text = event.text;
+				row.thinking = event.thinking ?? row.thinking;
+				row.thinkingOpen = false;
+			}
+			return;
+		}
 		case 'tool_call':
-			return [
-				...rows,
-				{
-					kind: 'tool',
-					id: event.id,
-					name: event.name,
-					args: event.args,
-					result: undefined,
-					hasResult: false,
-					isError: false,
-					startedAt: Date.now(),
-					durationMs: null,
-				},
-			];
-		case 'tool_result':
-			return rows.map((row) =>
-				row.kind === 'tool' && row.id === event.id
-					? {
-							...row,
-							result: event.result,
-							hasResult: true,
-							isError: event.is_error,
-							durationMs: Date.now() - row.startedAt,
-						}
-					: row,
-			);
+			rows.push({
+				kind: 'tool',
+				id: event.id,
+				name: event.name,
+				args: event.args,
+				result: undefined,
+				hasResult: false,
+				isError: false,
+				startedAt: Date.now(),
+				durationMs: null,
+			});
+			return;
+		case 'tool_result': {
+			const row = findRowById(rows, event.id);
+			if (row?.kind === 'tool') {
+				row.result = event.result;
+				row.hasResult = true;
+				row.isError = event.is_error;
+				row.durationMs = Date.now() - row.startedAt;
+			}
+			return;
+		}
 		case 'compaction_started':
-			return [
-				...rows,
-				{
-					kind: 'compaction',
-					id: nextCompactionRowId(),
-					phase: 'running',
-					messagesCompacted: event.messages_compacted,
-					summary: '',
-				},
-			];
-		case 'compaction_complete':
+			rows.push({
+				kind: 'compaction',
+				id: nextCompactionRowId(),
+				phase: 'running',
+				messagesCompacted: event.messages_compacted,
+				summary: '',
+			});
+			return;
+		case 'compaction_complete': {
 			// Patch the running row to `done`, or drop it on an
 			// empty (skipped) summary — same contract as the parent
 			// transcript in `#applySessionEvent`.
-			return rows.flatMap((row) => {
-				if (row.kind !== 'compaction' || row.phase !== 'running') {
-					return [row];
-				}
+			const idx = rows.findIndex((row) => row.kind === 'compaction' && row.phase === 'running');
+			if (idx !== -1) {
 				if (event.summary.trim().length === 0) {
-					return [];
+					rows.splice(idx, 1);
+				} else {
+					const row = rows[idx]!;
+					if (row.kind === 'compaction') {
+						row.phase = 'done';
+						row.summary = event.summary;
+					}
 				}
-				return [{ ...row, phase: 'done' as const, summary: event.summary }];
-			});
+			}
+			return;
+		}
 		default:
-			return rows;
+			return;
 	}
 }
 
@@ -2837,26 +2873,39 @@ function countLines(text: string): number {
  *  If no row with that id exists yet (a delta arrived before the
  *  matching `assistant_message_start` — defensive against future
  *  provider quirks), insert a fresh row carrying just the delta. */
-function appendDelta(rows: CoderRow[], id: string, delta: string, field: 'text' | 'thinking'): CoderRow[] {
-	let found = false;
-	const next = rows.map((row) => {
-		if (row.kind === 'assistant' && row.id === id) {
-			found = true;
-			return { ...row, [field]: row[field] + delta };
+/** Find a row by id, scanning from the **end**. Row mutations
+ *  during a turn (deltas, tool results, message-end) almost always
+ *  target the most recently appended row — both live (the row that
+ *  just streamed in) and on replay (the record we just pushed) — so
+ *  a tail-first scan is O(1) in the common case instead of O(n). */
+function findRowById(rows: CoderRow[], id: string): CoderRow | undefined {
+	for (let i = rows.length - 1; i >= 0; i--) {
+		if (rows[i]!.id === id) {
+			return rows[i];
 		}
-		return row;
-	});
-	if (!found) {
-		const seed: CoderRow = {
-			kind: 'assistant',
-			id,
-			text: field === 'text' ? delta : '',
-			thinking: field === 'thinking' ? delta : '',
-			thinkingOpen: true,
-		};
-		next.push(seed);
 	}
-	return next;
+	return undefined;
+}
+
+/** Append a streaming delta to an assistant row's `text` / `thinking`
+ *  in place (seeding the row if the `start` event hasn't created it
+ *  yet). Mutates the `$state` array directly — Svelte tracks the
+ *  field write — so a long stream / replay is O(1) per delta rather
+ *  than the O(n) whole-array rebuild the previous `map` version paid
+ *  on every token. */
+function appendDelta(rows: CoderRow[], id: string, delta: string, field: 'text' | 'thinking'): void {
+	const row = findRowById(rows, id);
+	if (row?.kind === 'assistant') {
+		row[field] += delta;
+		return;
+	}
+	rows.push({
+		kind: 'assistant',
+		id,
+		text: field === 'text' ? delta : '',
+		thinking: field === 'thinking' ? delta : '',
+		thinkingOpen: true,
+	});
 }
 
 /** Monotonic id for synthetic compaction transcript rows. The

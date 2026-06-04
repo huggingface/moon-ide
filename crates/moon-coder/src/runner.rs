@@ -1452,6 +1452,7 @@ impl CoderHandle {
 	/// source of truth, not the on-disk JSONL which may be lagging
 	/// the running turn by an iteration.
 	pub async fn open_session(&self, id: String) -> Result<SessionSummary, CoderError> {
+		let t_start = std::time::Instant::now();
 		sessions::validate_session_id(&id)?;
 		let (fs, folder_path) = self.state.active_folder_session().await?;
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
@@ -1469,6 +1470,8 @@ impl CoderHandle {
 		// and clobbering it would corrupt the next iteration.
 		let already_mounted = fs.runtime(&id).await.is_some();
 		let LoadedSession { header, records } = sessions::load(&dir, &id).await?;
+		let record_count = records.len();
+		let t_loaded = std::time::Instant::now();
 
 		let mut messages: Vec<ChatMessage> = vec![ChatMessage::System {
 			content: PHASE_6_0_SYSTEM_PROMPT.to_string(),
@@ -1655,6 +1658,7 @@ impl CoderHandle {
 		// records as the same events a live turn would emit.
 		// `SessionLoaded` carries the metadata so the sticky
 		// header doesn't need a follow-up IPC round trip.
+		let t_rebuilt = std::time::Instant::now();
 		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), id.clone());
 		sink.send(CoderEvent::SessionLoaded {
 			id: summary.id.clone(),
@@ -1746,6 +1750,17 @@ impl CoderHandle {
 		// anyway, since no real turn is running on the rehydrated
 		// session.
 		sink.send(CoderEvent::TurnComplete);
+		let t_emitted = std::time::Instant::now();
+		tracing::info!(
+			target: "moon_profile",
+			"coder_open_session id={} records={} load={}ms rebuild={}ms emit={}ms total={}ms",
+			id,
+			record_count,
+			(t_loaded - t_start).as_millis(),
+			(t_rebuilt - t_loaded).as_millis(),
+			(t_emitted - t_rebuilt).as_millis(),
+			(t_emitted - t_start).as_millis(),
+		);
 		Ok(summary)
 	}
 
