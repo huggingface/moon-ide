@@ -26,6 +26,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use moon_container::{Workspace as ContainerWorkspace, WorkspaceConfig};
 use moon_core::{WorkspaceFolderEntry, WorkspaceRegistry};
 use moon_protocol::container::ContainerState;
+use moon_protocol::fs::{DirEntry, EntryKind, ReadFileResult, WriteFileResult};
 use moon_protocol::search::{ContentSearchHit, ContentSearchOptions};
 use moon_terminal::{container_name_for_workspace, TerminalTarget};
 use serde::Deserialize;
@@ -154,6 +155,36 @@ impl ToolContext {
 	pub fn with_force_host_bash(mut self, force_host: bool) -> Self {
 		self.force_host_bash = force_host;
 		self
+	}
+}
+
+/// Where a path argument resolved to. Produced by
+/// [`ToolRegistry::resolve_target`] and consumed by the four
+/// filesystem tools (`read_file` / `list_dir` / `write_file` /
+/// `edit_file`) so they can branch between the bound-folder host
+/// (which keeps format-on-save and the future in-container
+/// `RemoteHost`) and the container-aware out-of-workspace
+/// primitives.
+enum ResolvedTarget {
+	/// Path lands inside a bound folder. `relative` is the
+	/// portion inside the folder root (`.` for the root itself).
+	InWorkspace {
+		folder: Arc<WorkspaceFolderEntry>,
+		relative: String,
+	},
+	/// Absolute path outside every bound folder. Routed through
+	/// `docker exec` when the workspace shell container is running,
+	/// the host filesystem otherwise.
+	OutOfWorkspace { abs_path: Utf8PathBuf },
+}
+
+impl ResolvedTarget {
+	fn in_workspace(folder: Arc<WorkspaceFolderEntry>, relative: String) -> Self {
+		Self::InWorkspace { folder, relative }
+	}
+
+	fn out_of_workspace(abs_path: Utf8PathBuf) -> Self {
+		Self::OutOfWorkspace { abs_path }
 	}
 }
 
@@ -310,12 +341,30 @@ impl ToolRegistry {
 	/// in their tool context (the one they were spawned against),
 	/// but the routing logic is identical — it just collapses to
 	/// the no-op case when the path is already inside `cx.folder`.
-	async fn resolve_workspace_path(
+	///
+	/// Returns a [`ResolvedTarget`]:
+	///
+	/// - [`ResolvedTarget::InWorkspace`] when the path lands inside
+	///   a bound folder — the everyday case. The tool dispatches
+	///   through that folder's [`WorkspaceHost`], which keeps the
+	///   editorconfig / lint-staged / format-on-save pipeline and
+	///   (in the container world) the in-container `RemoteHost`.
+	/// - [`ResolvedTarget::OutOfWorkspace`] when the path is
+	///   absolute and outside every bound folder root (and not a
+	///   `/workspace/<name>` synthetic path). The tool routes
+	///   through the container-aware out-of-workspace primitives
+	///   ([`oow_read_file`] / [`oow_write_file`] / [`oow_read_dir`]),
+	///   which `docker exec` into the workspace shell container when
+	///   it's running and fall back to the host filesystem
+	///   otherwise — same target `bash` would pick. The host-root
+	///   gate is *not* applied here: arbitrary-path access is the
+	///   point. See ADR 0025.
+	async fn resolve_target(
 		&self,
 		raw: &str,
 		cx: &ToolContext,
 		tool: &'static str,
-	) -> Result<(Arc<WorkspaceFolderEntry>, String), CoderError> {
+	) -> Result<ResolvedTarget, CoderError> {
 		let folders = self.workspaces.folders().await;
 		let active_name = cx.folder.folder.name.as_str();
 		let path = Utf8Path::new(raw);
@@ -327,12 +376,23 @@ impl ToolRegistry {
 			// folder is a strict ancestor of another — the inner
 			// one wins, matching how the file tree groups them.
 			if let Some((target, relative)) = match_bound_folder_root(&folders, path) {
-				return Ok((target, relative));
+				return Ok(ResolvedTarget::in_workspace(target, relative));
 			}
 			// Synthetic `/workspace/<name>/...`: the container-mode
 			// surface from the system prompt. Looked up by basename
 			// against the bound folders just like the absolute-root
 			// case above.
+			//
+			// A `/workspace/<name>/...` path whose `<name>` is a
+			// bound folder routes to that folder's host. A
+			// `/workspace/<name>` whose `<name>` is *not* bound
+			// errors with the list of what is bound — the system
+			// prompt only ever advertises this form for bound
+			// folders, so an unbound `<name>` is a model mistake
+			// worth a precise nudge rather than a silent fall to
+			// the out-of-workspace path (where it'd surface as a
+			// generic "no such file" against a container mount
+			// point that doesn't exist).
 			if let Ok(rest) = path.strip_prefix("/workspace") {
 				let mut comps = rest.components();
 				if let Some(camino::Utf8Component::Normal(first)) = comps.next() {
@@ -344,13 +404,15 @@ impl ToolRegistry {
 					let tail = rest.strip_prefix(first).unwrap_or(Utf8Path::new(""));
 					let s = tail.as_str();
 					let resolved = if s.is_empty() { ".".to_string() } else { s.to_string() };
-					return Ok((target, resolved));
+					return Ok(ResolvedTarget::in_workspace(target, resolved));
 				}
 			}
-			// Absolute paths that don't match either pattern fall
-			// through to the active folder; the host's `resolve`
-			// rejects anything outside its root.
-			return Ok((cx.folder.clone(), raw.to_string()));
+			// Absolute path outside every bound folder root (and
+			// not a `/workspace/<name>` synthetic): route to the
+			// container-aware out-of-workspace primitives. No
+			// host-root gate — the agent can reach any path the
+			// bash target can. See ADR 0025.
+			return Ok(ResolvedTarget::out_of_workspace(path.to_path_buf()));
 		}
 
 		let mut comps = path.components();
@@ -358,7 +420,7 @@ impl ToolRegistry {
 			// Leading `./` is the explicit "I mean a path *inside*
 			// `cx.folder`, even if the first segment looks like a
 			// sibling's basename" opt-out. Pass through untouched.
-			Some(camino::Utf8Component::CurDir) => Ok((cx.folder.clone(), raw.to_string())),
+			Some(camino::Utf8Component::CurDir) => Ok(ResolvedTarget::in_workspace(cx.folder.clone(), raw.to_string())),
 			Some(camino::Utf8Component::Normal(name)) => {
 				if name != active_name {
 					if let Some(other) = folders.iter().find(|f| f.folder.name == name).cloned() {
@@ -370,12 +432,38 @@ impl ToolRegistry {
 							.map(|t| t.as_str().to_string())
 							.unwrap_or_default();
 						let resolved = if tail_str.is_empty() { ".".to_string() } else { tail_str };
-						return Ok((other, resolved));
+						return Ok(ResolvedTarget::in_workspace(other, resolved));
 					}
 				}
-				Ok((cx.folder.clone(), raw.to_string()))
+				Ok(ResolvedTarget::in_workspace(cx.folder.clone(), raw.to_string()))
 			}
-			_ => Ok((cx.folder.clone(), raw.to_string())),
+			// Relative paths that aren't a sibling basename (`..`,
+			// etc.) resolve against the active folder's host, which
+			// keeps the historical `..`-escape rejection for plain
+			// relative inputs. Only *absolute* paths reach the
+			// out-of-workspace branch above.
+			_ => Ok(ResolvedTarget::in_workspace(cx.folder.clone(), raw.to_string())),
+		}
+	}
+
+	/// Back-compat thin wrapper that flattens [`resolve_target`] to
+	/// the `(folder, relative)` pair for the in-workspace case and
+	/// errors on out-of-workspace inputs. The four fs tools call
+	/// [`resolve_target`] directly so they can branch; this stays
+	/// for any caller that only ever wants the in-workspace shape.
+	#[cfg(test)]
+	async fn resolve_workspace_path(
+		&self,
+		raw: &str,
+		cx: &ToolContext,
+		tool: &'static str,
+	) -> Result<(Arc<WorkspaceFolderEntry>, String), CoderError> {
+		match self.resolve_target(raw, cx, tool).await? {
+			ResolvedTarget::InWorkspace { folder, relative } => Ok((folder, relative)),
+			ResolvedTarget::OutOfWorkspace { abs_path } => Err(CoderError::tool_failed(
+				tool,
+				format!("{abs_path} is outside every bound folder"),
+			)),
 		}
 	}
 
@@ -389,13 +477,13 @@ impl ToolRegistry {
 		let mut defs = vec![
 			ToolDefinition::function(
 				"read_file",
-				"Read the contents of a file in any currently-bound workspace folder. Returns the file's text, with each line prefixed by `<line_number>|<line>`. Treat the prefix as metadata — it is not part of the file. Optional `start_line` / `end_line` (1-based, inclusive) read just a slice; both omitted means read the whole file (capped at 200 kB).",
+				"Read the contents of a file. Returns the file's text, with each line prefixed by `<line_number>|<line>`. Treat the prefix as metadata — it is not part of the file. Optional `start_line` / `end_line` (1-based, inclusive) read just a slice; both omitted means read the whole file (capped at 200 kB).",
 				json!({
 					"type": "object",
 					"properties": {
 					"path": {
 						"type": "string",
-						"description": "Either a path inside the active workspace folder (`src/foo.rs`), or an absolute path that lands inside any currently-bound folder. The system prompt's \"Bound folders\" section advertises each folder by the absolute path your tools accept for it (a host path on host mode, the synthetic `/workspace/<name>` mount when the workspace shell container is running)."
+						"description": "A relative path against the active folder (`src/foo.rs`), or any absolute path."
 					},
 					"start_line": {
 							"type": "integer",
@@ -411,13 +499,13 @@ impl ToolRegistry {
 			),
 			ToolDefinition::function(
 				"list_dir",
-				"List the immediate contents of a directory in any currently-bound workspace folder. Returns one entry per line in `kind  name` form.",
+				"List the immediate contents of a directory. Returns one entry per line in `kind  name` form.",
 				json!({
 					"type": "object",
 					"properties": {
 					"path": {
 						"type": "string",
-						"description": "`.` for the active folder root; a relative path (`src/`) for an active-folder subtree; or an absolute path inside any currently-bound folder (the form is shown in the \"Bound folders\" section of the system prompt).",
+						"description": "`.` for the active folder root, a relative path against it (`src/`), or any absolute path.",
 						"default": "."
 					}
 					}
@@ -465,13 +553,13 @@ impl ToolRegistry {
 			),
 			ToolDefinition::function(
 				"write_file",
-				"Overwrite a file with new content (or create it if missing) in any currently-bound workspace folder. Use for new files or whole-file rewrites; prefer `edit_file` for surgical changes inside a large file. The file's parent directory must already exist.",
+				"Overwrite a file with new content (or create it if missing). Use for new files or whole-file rewrites; prefer `edit_file` for surgical changes inside a large file. The file's parent directory must already exist.",
 				json!({
 					"type": "object",
 					"properties": {
 					"path": {
 						"type": "string",
-						"description": "Path in the target folder. Either active-folder-relative (`src/foo.rs`) or an absolute path inside any currently-bound folder (see the system prompt's \"Bound folders\" section for the right shape). Created if it does not exist."
+						"description": "A relative path against the active folder (`src/foo.rs`), or any absolute path. Created if it does not exist."
 					},
 					"content": {
 							"type": "string",
@@ -483,13 +571,13 @@ impl ToolRegistry {
 			),
 			ToolDefinition::function(
 				"edit_file",
-				"Replace a substring in a file. `find` is whitespace-tolerant (indent shifts and interior whitespace runs forgiven) and must be unique unless `occurrence` is given. Empty `replace` deletes. Bytes the file holds between your edits in a turn are exactly what `write_file` / `edit_file` wrote — the format-on-save chain runs once per touched file at the end of the turn.",
+				"Replace a substring in a file. `find` is whitespace-tolerant (indent shifts and interior whitespace runs forgiven) and must be unique unless `occurrence` is given. Empty `replace` deletes. Bytes the file holds between your edits in a turn are exactly what `write_file` / `edit_file` wrote — for files in a bound folder the format-on-save chain runs once per touched file at the end of the turn.",
 				json!({
 					"type": "object",
 					"properties": {
 					"path": {
 						"type": "string",
-						"description": "Path in the target folder. Either active-folder-relative or an absolute path inside any currently-bound folder (see the system prompt's \"Bound folders\" section for the right shape). The file must already exist."
+						"description": "A relative path against the active folder, or any absolute path. The file must already exist."
 						},
 						"find": {
 							"type": "string",
@@ -645,8 +733,10 @@ impl ToolRegistry {
 		if matches!(parsed.start_line, Some(0)) || matches!(parsed.end_line, Some(0)) {
 			return Err(CoderError::invalid_args("read_file", "line numbers are 1-based"));
 		}
-		let (folder, resolved_path) = self.resolve_workspace_path(&parsed.path, cx, "read_file").await?;
-		let result = folder.host.read_file(Utf8Path::new(&resolved_path)).await?;
+		let result = match self.resolve_target(&parsed.path, cx, "read_file").await? {
+			ResolvedTarget::InWorkspace { folder, relative } => folder.host.read_file(Utf8Path::new(&relative)).await?,
+			ResolvedTarget::OutOfWorkspace { abs_path } => self.oow_read_file(&abs_path, cx).await?,
+		};
 		if result.is_binary {
 			return Err(CoderError::tool_failed("read_file", "binary file"));
 		}
@@ -683,8 +773,10 @@ impl ToolRegistry {
 		}
 		let parsed: ListDirArgs =
 			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("list_dir", err.to_string()))?;
-		let (folder, resolved_path) = self.resolve_workspace_path(&parsed.path, cx, "list_dir").await?;
-		let entries = folder.host.read_dir(Utf8Path::new(&resolved_path)).await?;
+		let entries = match self.resolve_target(&parsed.path, cx, "list_dir").await? {
+			ResolvedTarget::InWorkspace { folder, relative } => folder.host.read_dir(Utf8Path::new(&relative)).await?,
+			ResolvedTarget::OutOfWorkspace { abs_path } => self.oow_read_dir(&abs_path, cx).await?,
+		};
 		let mut out = String::new();
 		for e in &entries {
 			let kind = match e.kind {
@@ -751,19 +843,31 @@ impl ToolRegistry {
 		}
 		let parsed: WriteFileArgs =
 			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("write_file", err.to_string()))?;
-		let (folder, resolved_path) = self.resolve_workspace_path(&parsed.path, cx, "write_file").await?;
-		let resolved = Utf8Path::new(&resolved_path);
-		// Raw bytes-to-disk: the format-on-save pipeline (editorconfig
-		// + lint-staged) runs at turn end via `FormatQueue::drain`
-		// against the union of every path touched this turn. Doing
-		// the format inline here would mean (a) re-spawning prettier
-		// / eslint / rustfmt once per edit even when the model is
-		// about to edit the same file again two tool calls later,
-		// and (b) `eslint --fix` stripping an "unused" import in
-		// between the model adding the import and adding its first
-		// use. See the ADR superseding 0013's per-call invocation.
-		let result = folder.host.write_file(resolved, &parsed.content).await?;
-		cx.format_queue.record(&folder, resolved);
+		let result = match self.resolve_target(&parsed.path, cx, "write_file").await? {
+			ResolvedTarget::InWorkspace { folder, relative } => {
+				let resolved = Utf8Path::new(&relative);
+				// Raw bytes-to-disk: the format-on-save pipeline
+				// (editorconfig + lint-staged) runs at turn end via
+				// `FormatQueue::drain` against the union of every
+				// path touched this turn. Doing the format inline
+				// here would mean (a) re-spawning prettier / eslint
+				// / rustfmt once per edit even when the model is
+				// about to edit the same file again two tool calls
+				// later, and (b) `eslint --fix` stripping an
+				// "unused" import in between the model adding the
+				// import and adding its first use. See the ADR
+				// superseding 0013's per-call invocation.
+				let result = folder.host.write_file(resolved, &parsed.content).await?;
+				cx.format_queue.record(&folder, resolved);
+				result
+			}
+			// Out-of-workspace writes bypass format-on-save
+			// entirely: there's no bound-folder host to anchor the
+			// editorconfig / lint-staged cascade, and an external
+			// file (`/etc/hosts`, `~/.config/...`) has no project
+			// config to apply. Raw bytes, no FormatQueue entry.
+			ResolvedTarget::OutOfWorkspace { abs_path } => self.oow_write_file(&abs_path, &parsed.content, cx).await?,
+		};
 		Ok(json!({
 			"path": parsed.path,
 			"bytes_written": parsed.content.len(),
@@ -786,9 +890,11 @@ impl ToolRegistry {
 		if parsed.find.is_empty() {
 			return Err(CoderError::invalid_args("edit_file", "`find` must not be empty"));
 		}
-		let (folder, resolved_path) = self.resolve_workspace_path(&parsed.path, cx, "edit_file").await?;
-		let path = Utf8Path::new(&resolved_path);
-		let original = folder.host.read_file(path).await?;
+		let target = self.resolve_target(&parsed.path, cx, "edit_file").await?;
+		let original = match &target {
+			ResolvedTarget::InWorkspace { folder, relative } => folder.host.read_file(Utf8Path::new(relative)).await?,
+			ResolvedTarget::OutOfWorkspace { abs_path } => self.oow_read_file(abs_path, cx).await?,
+		};
 		if original.is_binary {
 			return Err(CoderError::tool_failed("edit_file", "binary file"));
 		}
@@ -806,10 +912,20 @@ impl ToolRegistry {
 		new_text.push_str(&plan.replace_text);
 		new_text.push_str(&original.text[plan.end..]);
 
-		// Raw bytes-to-disk; format-on-save runs at turn end. See the
-		// `write_file` tool above for the rationale.
-		let result = folder.host.write_file(path, &new_text).await?;
-		cx.format_queue.record(&folder, path);
+		let result = match target {
+			ResolvedTarget::InWorkspace { folder, relative } => {
+				let path = Utf8Path::new(&relative);
+				// Raw bytes-to-disk; format-on-save runs at turn
+				// end. See the `write_file` tool above for the
+				// rationale.
+				let result = folder.host.write_file(path, &new_text).await?;
+				cx.format_queue.record(&folder, path);
+				result
+			}
+			// Out-of-workspace: raw bytes, no format-on-save. Same
+			// reasoning as `write_file`'s out-of-workspace arm.
+			ResolvedTarget::OutOfWorkspace { abs_path } => self.oow_write_file(&abs_path, &new_text, cx).await?,
+		};
 		Ok(json!({
 			"path": parsed.path,
 			"replaced_at_byte": plan.start,
@@ -975,6 +1091,322 @@ impl ToolRegistry {
 		command.arg("-lc").arg(cmd).current_dir(folder.folder.path.as_str());
 		Ok((command, BASH_TARGET_HOST))
 	}
+
+	/// `true` when out-of-workspace fs ops should route through the
+	/// workspace shell container. Same probe as `bash` so the file
+	/// tools and `bash` agree on where an external path lives — an
+	/// agent that `ls`'d `/etc` via `bash` and then `read_file`'d
+	/// `/etc/hosts` reaches the same filesystem both times.
+	async fn oow_target_is_container(&self, cx: &ToolContext) -> bool {
+		resolve_bash_target(&self.workspaces, &self.workspaces_dir, cx.force_host_bash).await == BASH_TARGET_CONTAINER
+	}
+
+	/// `docker exec` (no TTY) against the workspace shell container,
+	/// invoking `program` with `args` directly — no shell, so the
+	/// path arguments need no quoting and can't be re-interpreted.
+	async fn container_exec(&self, program: &str, args: &[&str]) -> tokio::process::Command {
+		let workspace_id = self.workspaces.workspace_id().await;
+		let container_name = container_name_for_workspace(&workspace_id);
+		let mut command = tokio::process::Command::new("docker");
+		command.arg("exec").arg(&container_name).arg(program);
+		for arg in args {
+			command.arg(arg);
+		}
+		command
+	}
+
+	/// Read an arbitrary absolute path, routed to the container when
+	/// it's running and the host otherwise. Mirrors the binary /
+	/// mtime shape of [`moon_core::read_host_file`] so the
+	/// `read_file` tool handles both arms identically.
+	///
+	/// In-container reads `cat` the file and stat its mtime in one
+	/// `docker exec` round-trip via a tiny `sh` wrapper; the host
+	/// arm calls [`moon_core::read_host_file`] directly.
+	async fn oow_read_file(&self, abs_path: &Utf8Path, cx: &ToolContext) -> Result<ReadFileResult, CoderError> {
+		if !self.oow_target_is_container(cx).await {
+			return Ok(moon_core::read_host_file(abs_path).await?);
+		}
+		// `cat -- <path>`: direct exec, no shell, so the path can't
+		// be word-split or glob-expanded. mtime comes from a
+		// separate `stat` exec — cheaper to reason about than
+		// multiplexing both onto one stdout, and the file tools
+		// only use mtime as an advisory freshness hint.
+		let mut cat = self.container_exec("cat", &["--", abs_path.as_str()]).await;
+		let output = run_capturing(&mut cat, "read_file").await?;
+		if !output.status.success() {
+			return Err(CoderError::tool_failed(
+				"read_file",
+				container_io_error(abs_path, &output.stderr),
+			));
+		}
+		let mtime_ms = self.container_stat_mtime_ms(abs_path).await;
+		if looks_binary_bytes(&output.stdout) {
+			return Ok(ReadFileResult {
+				text: String::new(),
+				mtime_ms,
+				is_binary: true,
+			});
+		}
+		let text = String::from_utf8(output.stdout)
+			.map_err(|e| CoderError::tool_failed("read_file", format!("{abs_path}: invalid UTF-8: {e}")))?;
+		Ok(ReadFileResult {
+			text,
+			mtime_ms,
+			is_binary: false,
+		})
+	}
+
+	/// Write raw bytes to an arbitrary absolute path, routed to the
+	/// container when it's running and the host otherwise. No
+	/// format-on-save either way — external files have no project
+	/// config (see the `write_file` tool's out-of-workspace arm).
+	async fn oow_write_file(
+		&self,
+		abs_path: &Utf8Path,
+		content: &str,
+		cx: &ToolContext,
+	) -> Result<WriteFileResult, CoderError> {
+		if !self.oow_target_is_container(cx).await {
+			return Ok(moon_core::write_host_file(abs_path, content).await?);
+		}
+		// `cp /dev/stdin <path>` with the content piped on stdin:
+		// direct exec (no shell redirection to quote), and `cp`
+		// from `/dev/stdin` lands the bytes verbatim. `-i` keeps
+		// stdin open for the pipe.
+		let mut cmd = self
+			.container_exec_stdin("cp", &["/dev/stdin", abs_path.as_str()])
+			.await;
+		cmd
+			.stdin(std::process::Stdio::piped())
+			.stdout(std::process::Stdio::piped())
+			.stderr(std::process::Stdio::piped());
+		let mut child = cmd
+			.spawn()
+			.map_err(|err| CoderError::tool_failed("write_file", format!("spawn failed: {err}")))?;
+		if let Some(mut stdin) = child.stdin.take() {
+			use tokio::io::AsyncWriteExt as _;
+			stdin
+				.write_all(content.as_bytes())
+				.await
+				.map_err(|err| CoderError::tool_failed("write_file", format!("write to container stdin: {err}")))?;
+			stdin
+				.shutdown()
+				.await
+				.map_err(|err| CoderError::tool_failed("write_file", format!("close container stdin: {err}")))?;
+		}
+		let output = child
+			.wait_with_output()
+			.await
+			.map_err(|err| CoderError::tool_failed("write_file", err.to_string()))?;
+		if !output.status.success() {
+			return Err(CoderError::tool_failed(
+				"write_file",
+				container_io_error(abs_path, &output.stderr),
+			));
+		}
+		let mtime_ms = self.container_stat_mtime_ms(abs_path).await;
+		Ok(WriteFileResult {
+			mtime_ms,
+			bytes_written: content.len() as u64,
+		})
+	}
+
+	/// List an arbitrary absolute directory, routed to the
+	/// container when it's running and the host otherwise. Returns
+	/// the same [`DirEntry`] shape `read_dir` produces (kind + name;
+	/// `path` carries the absolute child path so the model can feed
+	/// it straight back into another tool call).
+	async fn oow_read_dir(&self, abs_path: &Utf8Path, cx: &ToolContext) -> Result<Vec<DirEntry>, CoderError> {
+		if !self.oow_target_is_container(cx).await {
+			return host_read_dir_abs(abs_path).await;
+		}
+		// One `find` exec lists the directory's direct children with
+		// a type tag per line (`d`/`f`/`l`/`?`) so we don't need a
+		// `stat` per entry. `-maxdepth 1 -mindepth 1` is direct
+		// children only; `printf` keeps the framing fixed.
+		let arg = format!(
+			"find {} -maxdepth 1 -mindepth 1 -printf '%y\\t%f\\n' 2>&1",
+			shell_single_quote(abs_path.as_str())
+		);
+		let mut cmd = self.container_exec("sh", &["-c", &arg]).await;
+		let output = run_capturing(&mut cmd, "list_dir").await?;
+		if !output.status.success() {
+			return Err(CoderError::tool_failed(
+				"list_dir",
+				container_io_error(abs_path, &output.stdout),
+			));
+		}
+		let text = String::from_utf8_lossy(&output.stdout);
+		let mut entries = Vec::new();
+		for line in text.lines() {
+			let Some((tag, name)) = line.split_once('\t') else {
+				continue;
+			};
+			if name.is_empty() || name == ".git" {
+				continue;
+			}
+			let kind = match tag {
+				"d" => EntryKind::Dir,
+				"f" => EntryKind::File,
+				"l" => EntryKind::Symlink,
+				_ => EntryKind::Other,
+			};
+			entries.push(DirEntry {
+				is_hidden: name.starts_with('.'),
+				name: name.to_string(),
+				path: abs_path.join(name).to_string(),
+				kind,
+				size: None,
+				mtime_ms: None,
+			});
+		}
+		entries.sort_by(|a, b| match (a.kind, b.kind) {
+			(EntryKind::Dir, EntryKind::Dir) => a.name.cmp(&b.name),
+			(EntryKind::Dir, _) => std::cmp::Ordering::Less,
+			(_, EntryKind::Dir) => std::cmp::Ordering::Greater,
+			_ => a.name.cmp(&b.name),
+		});
+		Ok(entries)
+	}
+
+	/// Best-effort container-side mtime (epoch ms). Used only as the
+	/// advisory `mtime_ms` on read/write results, so any failure
+	/// collapses to `None` rather than failing the tool.
+	async fn container_stat_mtime_ms(&self, abs_path: &Utf8Path) -> Option<i64> {
+		// `stat -c %Y` is seconds since epoch on GNU coreutils
+		// (moon-base is Debian). Multiply to ms for parity with the
+		// host path's `system_time_to_ms`.
+		let mut cmd = self
+			.container_exec("stat", &["-c", "%Y", "--", abs_path.as_str()])
+			.await;
+		let output = run_capturing(&mut cmd, "stat").await.ok()?;
+		if !output.status.success() {
+			return None;
+		}
+		let secs: i64 = String::from_utf8_lossy(&output.stdout).trim().parse().ok()?;
+		Some(secs * 1000)
+	}
+
+	/// Like [`container_exec`](Self::container_exec) but adds `-i` so
+	/// stdin stays open for the caller to pipe bytes through.
+	async fn container_exec_stdin(&self, program: &str, args: &[&str]) -> tokio::process::Command {
+		let workspace_id = self.workspaces.workspace_id().await;
+		let container_name = container_name_for_workspace(&workspace_id);
+		let mut command = tokio::process::Command::new("docker");
+		command.arg("exec").arg("-i").arg(&container_name).arg(program);
+		for arg in args {
+			command.arg(arg);
+		}
+		command
+	}
+}
+
+/// Run `command` to completion capturing stdout/stderr, mapping a
+/// spawn / wait failure onto the named tool's `ToolFailed`. Caller
+/// inspects `output.status` for command-level failures.
+async fn run_capturing(
+	command: &mut tokio::process::Command,
+	tool: &'static str,
+) -> Result<std::process::Output, CoderError> {
+	command
+		.stdin(std::process::Stdio::null())
+		.stdout(std::process::Stdio::piped())
+		.stderr(std::process::Stdio::piped());
+	command
+		.output()
+		.await
+		.map_err(|err| CoderError::tool_failed(tool, format!("docker exec failed: {err}")))
+}
+
+/// Read an absolute host directory (out-of-workspace, no root
+/// gate). Mirrors `LocalHost::read_dir`'s entry shape but without
+/// the relative-path rewrite — `path` carries the absolute child
+/// path so the model can feed it straight back into another tool.
+async fn host_read_dir_abs(abs_path: &Utf8Path) -> Result<Vec<DirEntry>, CoderError> {
+	let mut read = tokio::fs::read_dir(abs_path.as_std_path())
+		.await
+		.map_err(|err| CoderError::tool_failed("list_dir", format!("{abs_path}: {err}")))?;
+	let mut entries = Vec::new();
+	while let Some(entry) = read
+		.next_entry()
+		.await
+		.map_err(|err| CoderError::tool_failed("list_dir", err.to_string()))?
+	{
+		let file_type = entry
+			.file_type()
+			.await
+			.map_err(|err| CoderError::tool_failed("list_dir", err.to_string()))?;
+		let kind = if file_type.is_dir() {
+			EntryKind::Dir
+		} else if file_type.is_symlink() {
+			EntryKind::Symlink
+		} else if file_type.is_file() {
+			EntryKind::File
+		} else {
+			EntryKind::Other
+		};
+		let name = entry.file_name().to_string_lossy().to_string();
+		if name == ".git" {
+			continue;
+		}
+		entries.push(DirEntry {
+			is_hidden: name.starts_with('.'),
+			path: abs_path.join(&name).to_string(),
+			name,
+			kind,
+			size: None,
+			mtime_ms: None,
+		});
+	}
+	entries.sort_by(|a, b| match (a.kind, b.kind) {
+		(EntryKind::Dir, EntryKind::Dir) => a.name.cmp(&b.name),
+		(EntryKind::Dir, _) => std::cmp::Ordering::Less,
+		(_, EntryKind::Dir) => std::cmp::Ordering::Greater,
+		_ => a.name.cmp(&b.name),
+	});
+	Ok(entries)
+}
+
+/// Same null-byte heuristic as `moon_core`'s `looks_binary`: a NUL
+/// in the first 8 kB means binary. Duplicated here because the
+/// container read path holds raw `Vec<u8>` from `docker exec`
+/// stdout rather than going through `read_host_file`.
+fn looks_binary_bytes(bytes: &[u8]) -> bool {
+	bytes[..bytes.len().min(8000)].contains(&0)
+}
+
+/// Build a useful error string from a failed container fs op. We
+/// surface the captured stderr (trimmed) when there is one, else a
+/// generic "no such file or permission denied" hint keyed on the
+/// path.
+fn container_io_error(abs_path: &Utf8Path, stderr: &[u8]) -> String {
+	let msg = String::from_utf8_lossy(stderr);
+	let trimmed = msg.trim();
+	if trimmed.is_empty() {
+		format!("{abs_path}: no such file or directory, or permission denied (in container)")
+	} else {
+		format!("{abs_path}: {trimmed}")
+	}
+}
+
+/// Single-quote a string for safe interpolation into an `sh -c`
+/// command. Wraps in `'...'` and escapes embedded single quotes as
+/// `'\''`. Used for the one place an out-of-workspace fs op needs a
+/// shell (`find` for `list_dir`); the read/write paths pass the
+/// path as a direct exec arg and don't need this.
+fn shell_single_quote(s: &str) -> String {
+	let mut out = String::with_capacity(s.len() + 2);
+	out.push('\'');
+	for ch in s.chars() {
+		if ch == '\'' {
+			out.push_str("'\\''");
+		} else {
+			out.push(ch);
+		}
+	}
+	out.push('\'');
+	out
 }
 
 /// Single source of truth for "should bash route through the
@@ -2702,20 +3134,77 @@ mod tests {
 		}
 
 		#[tokio::test]
-		async fn unrelated_absolute_path_passes_through_for_host_to_reject() {
-			// Absolute paths that don't start with `/workspace` are
-			// none of our business — the host's `resolve` will reject
-			// them. We don't want to second-guess that.
+		async fn unrelated_absolute_path_resolves_out_of_workspace() {
+			// Absolute paths outside every bound folder root now
+			// route to the out-of-workspace primitives (container
+			// when running, host otherwise) instead of being
+			// gated. See ADR 0025.
 			let one = TempDir::new().unwrap();
 			let one_path = camino::Utf8PathBuf::from_path_buf(one.path().to_path_buf()).unwrap();
 			let (registry, tools) = build_registry(&[one_path.as_path()]).await;
 			let cx = make_cx(&registry, 0).await;
-			let (folder, out) = tools
-				.resolve_workspace_path("/etc/passwd", &cx, "read_file")
+			let target = tools
+				.resolve_target("/etc/passwd", &cx, "read_file")
 				.await
-				.expect("unrelated absolute paths should pass through");
-			assert_eq!(out, "/etc/passwd");
-			assert!(Arc::ptr_eq(&folder, &cx.folder));
+				.expect("unrelated absolute paths resolve");
+			match target {
+				super::super::ResolvedTarget::OutOfWorkspace { abs_path } => {
+					assert_eq!(abs_path.as_str(), "/etc/passwd");
+				}
+				super::super::ResolvedTarget::InWorkspace { .. } => {
+					panic!("expected out-of-workspace routing for /etc/passwd")
+				}
+			}
+		}
+
+		#[tokio::test]
+		async fn out_of_workspace_read_write_round_trips_on_host() {
+			// No container in the test environment, so the
+			// out-of-workspace primitives fall back to the host
+			// filesystem. A file outside every bound folder should
+			// read and write the same bytes back — proving the gate
+			// is lifted end-to-end, not just at the resolver.
+			let bound = TempDir::new().unwrap();
+			let bound_path = camino::Utf8PathBuf::from_path_buf(bound.path().to_path_buf()).unwrap();
+			// A *separate* temp dir, deliberately not bound.
+			let external = TempDir::new().unwrap();
+			let external_path = camino::Utf8PathBuf::from_path_buf(external.path().canonicalize().unwrap()).unwrap();
+			let file = external_path.join("outside.txt");
+
+			let (registry, tools) = build_registry(&[bound_path.as_path()]).await;
+			let cx = make_cx(&registry, 0).await;
+
+			let write_args = serde_json::json!({ "path": file.as_str(), "content": "hello outside\n" });
+			tools
+				.write_file(&write_args, &cx)
+				.await
+				.expect("out-of-workspace write should succeed on host");
+
+			let read_args = serde_json::json!({ "path": file.as_str() });
+			let read = tools
+				.read_file(&read_args, &cx)
+				.await
+				.expect("out-of-workspace read should succeed on host");
+			assert_eq!(read["content"].as_str().unwrap(), "1|hello outside\n");
+		}
+
+		#[tokio::test]
+		async fn out_of_workspace_list_dir_lists_external_children_on_host() {
+			let bound = TempDir::new().unwrap();
+			let bound_path = camino::Utf8PathBuf::from_path_buf(bound.path().to_path_buf()).unwrap();
+			let external = TempDir::new().unwrap();
+			let external_path = camino::Utf8PathBuf::from_path_buf(external.path().canonicalize().unwrap()).unwrap();
+			std::fs::write(external_path.join("a.txt"), "x").unwrap();
+			std::fs::create_dir(external_path.join("sub")).unwrap();
+
+			let (registry, tools) = build_registry(&[bound_path.as_path()]).await;
+			let cx = make_cx(&registry, 0).await;
+
+			let args = serde_json::json!({ "path": external_path.as_str() });
+			let out = tools.list_dir(&args, &cx).await.expect("out-of-workspace list_dir");
+			let entries = out["entries"].as_str().unwrap();
+			assert!(entries.contains("dir  sub"), "entries: {entries}");
+			assert!(entries.contains("file a.txt"), "entries: {entries}");
 		}
 
 		#[tokio::test]
