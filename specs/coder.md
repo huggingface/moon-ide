@@ -93,6 +93,43 @@ been opened (`openedToolRows`, a `SvelteSet` of row ids keyed off
 the set is cleared on session/transcript swap. See test-plan 0076
 for the perf rationale and measurements.
 
+The transcript itself is **windowed**: `CoderPanel` renders only a
+slice of `coder.rows`, not the full history. It's a _floating_
+window with both edges tracked as offsets from the end of the row
+list — `visibleCount` (how many rows it spans, starting at
+`INITIAL_WINDOW = 50`) and `bottomClip` (how many rows are clipped
+off the bottom; `0` = anchored to the live tail). Older rows stay in
+the store but out of the DOM until the user scrolls near the top (or
+clicks the "Load older" pill), which pulls in `WINDOW_GROW_STEP`
+more rows with scroll anchoring (an element anchor on the first
+rendered row, so the viewport doesn't lurch). The mounted row count
+is **hard-capped at `WINDOW_MAX = 300`**: once a grow would exceed
+it the window stops growing and _slides_ — it drops the same number
+of rows off the (off-screen) bottom for each chunk pulled in at the
+top, detaching the bottom edge from the tail. A detached window can be reeled back toward the tail incrementally
+(a "Load newer" pill at the bottom, or scrolling down toward it,
+`growWindowDown`) or in one jump (a sticky **"Jump to latest"**
+button). Both directions, and both pills, share a single
+element-based scroll anchor (`captureScrollAnchor` pins the first or
+last rendered row so a cap-slide never unmounts the anchor node); a
+re-entrancy guard keeps the anchor's own programmatic scroll from
+cascading another grow.
+
+This is a deliberately "bastardized" virtualization — a sliding
+window rather than measured-height offset math — because coder rows
+are wildly variable in height and stream their height in over time,
+which a height-cache windower would have to constantly re-measure.
+While the bottom edge is anchored (`bottomClip === 0`), new rows
+land inside the window, so streaming and sticky-bottom auto-follow
+are unaffected; when the user is parked up in history, appended rows
+are clipped off the bottom (`bottomClip` bumps by the appended
+count) so nothing they're reading moves and the row count stays
+bounded. The window resets to the tail on any session / folder /
+sub-agent-view change, and on an in-session shrink (revert). The
+tradeoff: `Ctrl+F` only matches loaded rows. The sub-agent pop-out
+view is not windowed (transcripts there are small and in-memory).
+See test-plan 0093.
+
 Three control surfaces:
 
 - **Abort** (`Esc`): cancels the in-flight HTTP / SSE / tool-call.

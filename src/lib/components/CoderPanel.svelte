@@ -229,13 +229,272 @@
 	let lastRowCount = 0;
 	const STICKY_BOTTOM_THRESHOLD_PX = 24;
 
+	// Windowed (tail) transcript rendering. We only mount the last
+	// `visibleCount` rows of `coder.rows`; older rows live in the
+	// store but never hit the DOM until the user scrolls up far
+	// enough to ask for them. This is the "load more as you scroll
+	// up" virtualization: the common case (parked at the bottom
+	// watching the latest turn stream in) renders a small bounded
+	// slice no matter how many thousand rows the session holds, so
+	// opening a giant session paints a screenful instead of the
+	// whole history.
+	//
+	// We deliberately avoid fixed-height / measured-height
+	// virtualization: coder rows are wildly variable in height
+	// (a one-line tool summary vs. a 200-line read_file body vs. a
+	// long markdown reply) and stream their height in over time,
+	// so an offset-math windower would need constant re-measurement
+	// and would fight the streaming layout. A trailing window
+	// sidesteps all of that — no spacer divs, no height cache, and
+	// streaming / sticky-bottom keep working unchanged because new
+	// rows always land inside the window.
+	// A transcript child that's an actual row (not the "Load older" /
+	// "Load newer" pills or the "Jump to latest" button) — i.e. a
+	// valid scroll anchor. Hoisted to script top-level so it isn't
+	// recreated per `edgeRowEl` call.
+	function isAnchorRow(child: Element): child is HTMLElement {
+		return (
+			child instanceof HTMLElement &&
+			!child.classList.contains('load-older') &&
+			!child.classList.contains('jump-latest')
+		);
+	}
+
+	const INITIAL_WINDOW = 50;
+	const WINDOW_GROW_STEP = 50;
+	// Hard cap on how many rows the window ever mounts. Once a
+	// scroll-up grow would push past this, the window stops growing
+	// and instead *slides*: it drops `WINDOW_GROW_STEP` rows off the
+	// bottom (off-screen while the user reads history) for each
+	// chunk it pulls in at the top. So the DOM never holds more than
+	// ~`WINDOW_MAX` rows no matter how far the user scrolls back.
+	const WINDOW_MAX = 300;
+	// Grow the window when the user scrolls within this many px of
+	// the top — far enough ahead that the older rows are usually
+	// mounted before they scroll into view.
+	const LOAD_MORE_THRESHOLD_PX = 600;
+
+	// Floating window over `coder.rows`, both edges tracked as
+	// offsets from the *end* of the list so the bottom edge can
+	// detach from the live tail:
+	//   - `visibleCount`: how many rows the window spans (≤ WINDOW_MAX).
+	//   - `bottomClip`:   how many rows are clipped off the bottom
+	//                     (0 = window's bottom is the live tail).
+	// `windowEnd = len - bottomClip`, `windowStart = windowEnd -
+	// visibleCount`. When `bottomClip === 0` the window is anchored
+	// to the tail and the streaming / sticky-bottom logic below runs
+	// exactly as it did for the old tail-only window.
+	let visibleCount = $state(INITIAL_WINDOW);
+	let bottomClip = $state(0);
+
+	const windowEnd = $derived(Math.max(0, coder.rows.length - bottomClip));
+	const windowStart = $derived(Math.max(0, windowEnd - visibleCount));
+	const windowedRows = $derived(coder.rows.slice(windowStart, windowEnd));
+	const hiddenAbove = $derived(windowStart);
+	const hiddenBelow = $derived(coder.rows.length - windowEnd);
+
 	function onTranscriptScroll(): void {
 		if (!scrollEl) {
 			return;
 		}
 		const distance = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
-		stickyBottom = distance <= STICKY_BOTTOM_THRESHOLD_PX;
+		// Only treat the bottom as "sticky" when the window is
+		// actually anchored to the live tail; a detached window
+		// scrolled to its own bottom edge is not at the latest row.
+		stickyBottom = bottomClip === 0 && distance <= STICKY_BOTTOM_THRESHOLD_PX;
+		if (applyingAnchor) {
+			// This scroll event is our own anchor-compensation write,
+			// not a user gesture — don't let it trigger another grow.
+			return;
+		}
+		// Near the top with older rows still hidden: pull more
+		// history in. `captureScrollAnchor` pins the first rendered
+		// row so the viewport doesn't lurch when the slice changes
+		// (whether we grow or slide). Likewise near the bottom with
+		// newer rows clipped (a detached window): pull newer rows in
+		// as the user scrolls down toward them.
+		if (scrollEl.scrollTop <= LOAD_MORE_THRESHOLD_PX && hiddenAbove > 0) {
+			captureScrollAnchor();
+			growWindowUp();
+		} else if (distance <= LOAD_MORE_THRESHOLD_PX && hiddenBelow > 0) {
+			captureScrollAnchor('last');
+			growWindowDown();
+		}
 	}
+
+	/** Pull `WINDOW_GROW_STEP` older rows into the window. Below the
+	 *  `WINDOW_MAX` cap this just grows the span; at the cap it
+	 *  slides — the same number of rows are dropped off the bottom
+	 *  (which is off-screen while the user is up in history), so the
+	 *  mounted row count stays bounded. Either way the top edge
+	 *  moves up by one step, and the caller's scroll anchor keeps
+	 *  the viewport steady. */
+	function growWindowUp(): void {
+		if (hiddenAbove <= 0) {
+			return;
+		}
+		const step = Math.min(WINDOW_GROW_STEP, hiddenAbove);
+		if (visibleCount + step <= WINDOW_MAX) {
+			visibleCount += step;
+			return;
+		}
+		// At the cap: keep the span, drop `step` off the bottom.
+		visibleCount = WINDOW_MAX;
+		bottomClip += step;
+	}
+
+	/** Mirror of `growWindowUp` for the bottom edge: pull
+	 *  `WINDOW_GROW_STEP` newer rows into the window by un-clipping
+	 *  the bottom. Below the cap it extends the span downward; at the
+	 *  cap it slides — dropping the same number off the (off-screen)
+	 *  top so the mounted row count stays bounded. The caller's
+	 *  element anchor keeps the viewport steady either way. */
+	function growWindowDown(): void {
+		if (hiddenBelow <= 0) {
+			return;
+		}
+		const step = Math.min(WINDOW_GROW_STEP, hiddenBelow);
+		bottomClip -= step;
+		if (visibleCount + step > WINDOW_MAX) {
+			visibleCount = WINDOW_MAX;
+		} else {
+			visibleCount += step;
+		}
+	}
+
+	/** Snap the window back to the live tail and scroll to the
+	 *  bottom. The escape hatch from a detached (scrolled-up,
+	 *  bottom-clipped) window — surfaced as the "Jump to latest"
+	 *  button whenever `hiddenBelow > 0`. */
+	function jumpToLatest(): void {
+		bottomClip = 0;
+		visibleCount = INITIAL_WINDOW;
+		stickyBottom = true;
+		pendingAnchorNode = null;
+		void tick().then(() => {
+			if (scrollEl) {
+				scrollEl.scrollTop = scrollEl.scrollHeight;
+			}
+		});
+	}
+
+	// Scroll anchoring for a window slide. A grow prepends rows at
+	// the top (and, at the cap, drops rows off the bottom), both of
+	// which shift the scroll offset of everything the user is
+	// looking at. Total-height math only works for a pure prepend;
+	// the cap-slide also removes height below the viewport, so we
+	// anchor on a concrete DOM node instead: capture the first
+	// rendered row element + its viewport-relative top before the
+	// change, then after the DOM settles nudge `scrollTop` by how far
+	// that same (keyed, still-mounted) node moved. Correct whether
+	// rows were added above, removed below, or both.
+	let pendingAnchorNode: HTMLElement | null = null;
+	let pendingAnchorNodeTop = 0;
+	// Set while we apply the post-grow anchor's programmatic
+	// `scrollTop` write. That write fires `onscroll`, which would
+	// otherwise see the still-near-an-edge position and grow again,
+	// cascading the whole history in one gesture. The guard makes
+	// the synthetic scroll a no-op for the grow logic (sticky-bottom
+	// tracking still updates).
+	let applyingAnchor = false;
+
+	/** A rendered transcript row element at the requested edge,
+	 *  skipping the non-row chrome (the "Load older" / "Load newer"
+	 *  pills and the "Jump to latest" button). Used as the scroll
+	 *  anchor: we pin a row that's *stable* across the upcoming
+	 *  slice change — the first row when pulling history in at the
+	 *  top, the last row when pulling newer rows in at the bottom —
+	 *  so the anchor node never gets unmounted by a cap-slide. */
+	function edgeRowEl(edge: 'first' | 'last'): HTMLElement | null {
+		if (!scrollEl) {
+			return null;
+		}
+		const children = Array.from(scrollEl.children).filter(isAnchorRow);
+		if (children.length === 0) {
+			return null;
+		}
+		return edge === 'first' ? children[0]! : children[children.length - 1]!;
+	}
+
+	function captureScrollAnchor(edge: 'first' | 'last' = 'first'): void {
+		const el = edgeRowEl(edge);
+		if (el && scrollEl) {
+			pendingAnchorNode = el;
+			pendingAnchorNodeTop = el.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top;
+		}
+	}
+
+	// Explicit "Load older" click. Same grow + scroll-anchor path
+	// the scroll-up auto-grow takes, surfaced as a button at the
+	// top of the window so the user can pull in history without
+	// having to nudge the scrollbar to the very top.
+	function loadOlderRows(): void {
+		if (hiddenAbove <= 0) {
+			return;
+		}
+		captureScrollAnchor();
+		growWindowUp();
+	}
+
+	// Explicit "Load newer" click — mirror of "Load older" for a
+	// detached window's bottom edge. Surfaced as a pill at the
+	// bottom of the rendered rows so the user can reel the window
+	// back toward the tail a chunk at a time (vs. "Jump to latest",
+	// which snaps all the way).
+	function loadNewerRows(): void {
+		if (hiddenBelow <= 0) {
+			return;
+		}
+		captureScrollAnchor('last');
+		growWindowDown();
+	}
+	$effect(() => {
+		// Re-run whenever the rendered slice changes size.
+		void windowedRows.length;
+		if (pendingAnchorNode === null) {
+			return;
+		}
+		const node = pendingAnchorNode;
+		const prevTop = pendingAnchorNodeTop;
+		pendingAnchorNode = null;
+		void tick().then(() => {
+			if (!scrollEl || !node.isConnected) {
+				return;
+			}
+			const newTop = node.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top;
+			const delta = newTop - prevTop;
+			if (delta !== 0) {
+				applyingAnchor = true;
+				scrollEl.scrollTop += delta;
+				// Clear after the synthetic scroll event has been
+				// dispatched + handled. A microtask is enough — the
+				// `scroll` event fires synchronously on the assignment
+				// in WebKit, but rAF is the safe lower bound.
+				requestAnimationFrame(() => {
+					applyingAnchor = false;
+				});
+			}
+		});
+	});
+
+	// Collapse the render window back to the tail whenever the
+	// mounted session changes (session swap, folder switch, sub-
+	// agent pop-out). A freshly opened session should paint a
+	// screenful, not inherit a previous session's scrolled-open
+	// window — and the swap can grow the row list (so the
+	// row-count-shrink reset above wouldn't catch it). Reading the
+	// session id + view registers both as deps.
+	let lastWindowSessionKey = '';
+	$effect(() => {
+		const key = `${coder.view}:${coder.activeSession?.id ?? ''}:${coder.viewSubagentId ?? ''}`;
+		if (key === lastWindowSessionKey) {
+			return;
+		}
+		lastWindowSessionKey = key;
+		visibleCount = INITIAL_WINDOW;
+		bottomClip = 0;
+		pendingAnchorNode = null;
+	});
 
 	$effect(() => {
 		const count = coder.rows.length;
@@ -254,9 +513,29 @@
 			// but clearing keeps the set from growing unbounded
 			// across many session swaps.
 			openedToolRows.clear();
+			// A shrink within the same session (revert-to-message,
+			// sub-agent → main pop) invalidates the floating
+			// window's offsets — snap it back to the live tail so
+			// we don't end up clipping past the new, shorter list.
+			visibleCount = INITIAL_WINDOW;
+			bottomClip = 0;
+			pendingAnchorNode = null;
 		}
+		const appended = count - lastRowCount;
 		lastRowCount = count;
 		if (!stickyBottom) {
+			// The user is parked up in history (a steer sent
+			// mid-turn, then scrolled back to read; or a detached,
+			// bottom-clipped window). New rows land at the tail.
+			// We pin the *visible* rows in place by clipping the
+			// new arrivals off the bottom: `windowEnd = len -
+			// bottomClip` stays fixed, so nothing the user is
+			// looking at moves, the mounted row count stays
+			// bounded, and the "Jump to latest" button appears
+			// (because `hiddenBelow` is now > 0).
+			if (appended > 0) {
+				bottomClip += appended;
+			}
 			return;
 		}
 		void tick().then(() => {
@@ -1428,9 +1707,45 @@
 					Send a prompt to start. The agent can read files, list directories, search, and run shell commands.
 				</p>
 			{/if}
-			{#each coder.rows as row (row.id)}
+			{#if hiddenAbove > 0}
+				<!-- Older rows are kept out of the DOM by the trailing
+					 render window. Scrolling near the top grows the
+					 window automatically (with scroll anchoring); this
+					 button is the explicit affordance + a count so the
+					 user knows there's history above and isn't confused
+					 by a transcript that starts mid-conversation. -->
+				<button type="button" class="load-older" onclick={loadOlderRows}>
+					Load {Math.min(WINDOW_GROW_STEP, hiddenAbove)} older
+					{hiddenAbove === 1 ? 'message' : 'messages'} ({hiddenAbove} hidden)
+				</button>
+			{/if}
+			{#each windowedRows as row (row.id)}
 				{@render rowMarkup(row, true)}
 			{/each}
+			{#if hiddenBelow > 0}
+				<!-- Newer rows clipped off the bottom by a detached
+					 (slid) window. In-flow pill at the end of the
+					 rendered rows: scrolling down toward it reels newer
+					 rows in a chunk at a time (with scroll anchoring),
+					 symmetric with "Load older" at the top. The floating
+					 "Jump to latest" button below snaps straight to the
+					 tail instead. -->
+				<button type="button" class="load-older load-newer" onclick={loadNewerRows}>
+					Load {Math.min(WINDOW_GROW_STEP, hiddenBelow)} newer
+					{hiddenBelow === 1 ? 'message' : 'messages'} ({hiddenBelow} below)
+				</button>
+			{/if}
+			{#if hiddenBelow > 0}
+				<!-- Always-reachable escape hatch back to the live tail.
+					 Sticky-positioned at the bottom of the scroll
+					 viewport so the user doesn't have to scroll through
+					 clipped history to catch up to a streaming reply.
+					 Shown only while the window's bottom edge is detached
+					 from the tail (`hiddenBelow > 0`). -->
+				<button type="button" class="jump-latest" onclick={jumpToLatest} title="Jump to the latest message">
+					Jump to latest ↓ ({hiddenBelow} below)
+				</button>
+			{/if}
 		</div>
 		<div class="composer">
 			{#if coder.attachments.length > 0}
@@ -2448,6 +2763,55 @@
 		font-size: 12px;
 		color: var(--m-fg-subtle);
 		margin: 0;
+	}
+	/* Top-of-window affordance for the trailing render window. Sits
+	   above the oldest currently-mounted row when older history is
+	   held out of the DOM; clicking (or scrolling near it) grows the
+	   window backward. Centred, quiet, pill-shaped so it reads as a
+	   control rather than a transcript row. */
+	.load-older {
+		align-self: center;
+		flex-shrink: 0;
+		font: inherit;
+		font-size: 11px;
+		color: var(--m-fg-muted);
+		background: var(--m-bg-overlay);
+		border: 1px solid var(--m-border);
+		border-radius: 999px;
+		padding: 3px 12px;
+		cursor: pointer;
+	}
+	.load-older:hover {
+		color: var(--m-fg);
+		border-color: color-mix(in srgb, var(--m-accent) 40%, var(--m-border));
+		background: color-mix(in srgb, var(--m-accent) 10%, transparent);
+	}
+	/* "Jump to latest" escape hatch for a detached (bottom-clipped)
+	   window. Sticky to the bottom of the scroll viewport so it
+	   floats over the transcript as the user scrolls, centred, with
+	   a solid plate + shadow so it reads as an overlay control rather
+	   than a transcript row. `margin-top: auto` keeps it from adding
+	   height at the end of the flow; the negative bottom margin lets
+	   it overlap the last row's gap instead of pushing layout. */
+	.jump-latest {
+		position: sticky;
+		bottom: 8px;
+		align-self: center;
+		flex-shrink: 0;
+		margin-top: auto;
+		font: inherit;
+		font-size: 11px;
+		font-weight: 500;
+		color: var(--m-bg);
+		background: var(--m-accent);
+		border: 0;
+		border-radius: 999px;
+		padding: 5px 14px;
+		cursor: pointer;
+		box-shadow: 0 4px 12px rgb(0 0 0 / 0.25);
+	}
+	.jump-latest:hover {
+		filter: brightness(1.1);
 	}
 	.row {
 		display: flex;
