@@ -290,7 +290,10 @@ Changes` that surfaces when the repo's default branch
   label) opens a Cmd+P-style palette listing recent local
   branches plus open GitHub PRs in a single filterable list.
   Local rows come from `git for-each-ref refs/heads
---sort=-committerdate` (cap 20); PR rows come from `gh pr list`
+--sort=-committerdate` (cap 20, but the default branch is always
+  included even when it falls past the cap, flagged `isDefault` so
+  the palette keeps it visible — switching back to main is the most
+  common destination); PR rows come from `gh pr list`
   (cap 30) on the host (no container routing today — the
   LocalHost binds the active folder's `.git` the container would
   see anyway). Backend lives in `WorkspaceHost::branch_list` /

@@ -450,7 +450,12 @@ pub trait WorkspaceHost: Send + Sync {
 	/// returned [`BranchList`]:
 	///
 	/// 1. `local` — `git for-each-ref refs/heads`, sorted newest
-	///    first by committer date, capped at 20.
+	///    first by committer date, capped at 20. The repo's
+	///    default branch (`main` / `master`, from `origin/HEAD`)
+	///    is always included even when the cap would drop it, and
+	///    its row carries `is_default = true` so the palette can
+	///    keep it visible — switching back to it is the most
+	///    common destination.
 	/// 2. `prs` — open GitHub PRs via `gh pr list` (capped at
 	///    30). `pr_scope == All` is "every open PR";
 	///    `Participating` runs two `--search` queries
@@ -3283,7 +3288,8 @@ async fn run_branch_list(root: &Utf8Path, pr_scope: PrListScope) -> MoonResult<B
 /// [`BranchListEntry::Local`] rows. NUL-separated fields (`%00` in
 /// the format string) so a tab- or space-containing commit subject
 /// doesn't corrupt the parse — subjects regularly contain
-/// whitespace and the occasional control character.
+/// whitespace and the occasional control character. The default
+/// branch is force-included past the recency cap (see the body).
 fn run_branch_list_local(root: &Utf8Path) -> Vec<BranchListEntry> {
 	use std::process::Command;
 
@@ -3313,6 +3319,8 @@ fn run_branch_list_local(root: &Utf8Path) -> Vec<BranchListEntry> {
 		Ok(_) | Err(_) => return Vec::new(),
 	};
 
+	let default_name = resolve_default_local_branch(root);
+
 	let stdout = String::from_utf8_lossy(&output.stdout);
 	let mut rows = Vec::new();
 	for line in stdout.lines() {
@@ -3324,14 +3332,92 @@ fn run_branch_list_local(root: &Utf8Path) -> Vec<BranchListEntry> {
 			continue;
 		}
 		let is_current = current.as_deref() == Some(name);
+		let is_default = default_name.as_deref() == Some(name);
 		rows.push(BranchListEntry::Local {
 			name: name.to_owned(),
 			last_commit_subject: subject.to_owned(),
 			committer_date_relative: date.to_owned(),
 			is_current,
+			is_default,
 		});
 	}
+
+	// The `--count` cap is sorted by recency, so on a repo with
+	// more than `BRANCH_LIST_LOCAL_CAP` branches the default branch
+	// (`main` / `master`) can fall off the end if the user hasn't
+	// touched it lately. Switching back to it is the single most
+	// common destination, so always surface it: if a local branch
+	// matching the resolved default exists and didn't make the cut,
+	// fetch its row and append it.
+	if let Some(default_name) = default_name {
+		let already_listed = rows
+			.iter()
+			.any(|row| matches!(row, BranchListEntry::Local { name, .. } if *name == default_name));
+		if !already_listed {
+			if let Some(entry) = run_branch_list_local_one(root, &default_name, current.as_deref()) {
+				rows.push(entry);
+			}
+		}
+	}
+
 	rows
+}
+
+/// Short name of the local branch that tracks (or is) the repo's
+/// default branch — `main` / `master` for the common case. Derived
+/// from [`resolve_default_remote_ref`] by stripping the leading
+/// `origin/`, then confirming a matching local `refs/heads/<name>`
+/// actually exists (a fresh clone might have the remote-tracking
+/// ref without the local branch). Returns `None` when no default
+/// can be resolved or the local branch is absent.
+fn resolve_default_local_branch(root: &Utf8Path) -> Option<String> {
+	use std::process::Command;
+
+	let remote_ref = resolve_default_remote_ref(root)?;
+	let name = remote_ref.strip_prefix("origin/").unwrap_or(&remote_ref);
+	if name.is_empty() {
+		return None;
+	}
+	let exists = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{name}")])
+		.output()
+		.ok()
+		.is_some_and(|o| o.status.success());
+	exists.then(|| name.to_owned())
+}
+
+/// `git for-each-ref` for a single local branch — used to fetch the
+/// default branch's row when it fell outside the recency-capped
+/// listing. Mirrors the field layout of [`run_branch_list_local`].
+fn run_branch_list_local_one(root: &Utf8Path, name: &str, current: Option<&str>) -> Option<BranchListEntry> {
+	use std::process::Command;
+
+	let output = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args([
+			"for-each-ref",
+			"--format=%(committerdate:relative)%00%(subject)",
+			&format!("refs/heads/{name}"),
+		])
+		.output()
+		.ok()
+		.filter(|o| o.status.success())?;
+	let stdout = String::from_utf8_lossy(&output.stdout);
+	let line = stdout.lines().next()?;
+	let mut parts = line.splitn(2, '\0');
+	let date = parts.next().unwrap_or("");
+	let subject = parts.next().unwrap_or("");
+	Some(BranchListEntry::Local {
+		name: name.to_owned(),
+		last_commit_subject: subject.to_owned(),
+		committer_date_relative: date.to_owned(),
+		is_current: current == Some(name),
+		// Only ever called for the resolved default branch.
+		is_default: true,
+	})
 }
 
 /// PR section: probe the active folder's remote for GitHub-ness,
@@ -7319,6 +7405,69 @@ mod tests {
 		// section is suppressed without contacting gh.
 		assert!(matches!(result.pr_status, PrListStatus::NotGithub));
 		assert!(result.prs.is_empty());
+	}
+
+	#[tokio::test]
+	async fn branch_list_local_always_includes_default_branch_past_cap() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping default-branch cap test");
+			return;
+		};
+
+		let root = TempDir::new().unwrap();
+		let repo = root.path();
+		run_git(&git, repo, &["init", "-q", "-b", "main"]);
+		run_git(&git, repo, &["config", "user.email", "t@example.com"]);
+		run_git(&git, repo, &["config", "user.name", "Tester"]);
+		std::fs::write(repo.join("README.md"), "v1\n").unwrap();
+		run_git(&git, repo, &["add", "."]);
+		run_git(&git, repo, &["commit", "-q", "-m", "first commit"]);
+
+		// Point `origin/HEAD` at `main` without a real remote: a
+		// symbolic ref under `refs/remotes/origin/HEAD` is exactly
+		// what `git remote set-head` writes, and it's all
+		// `resolve_default_remote_ref` reads.
+		run_git(&git, repo, &["update-ref", "refs/remotes/origin/main", "main"]);
+		run_git(
+			&git,
+			repo,
+			&["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+		);
+
+		// Create more than the cap of fresher branches so `main`
+		// (committed first, hence oldest) falls off the recency
+		// window. Each gets its own commit so committer dates differ.
+		let extra = BRANCH_LIST_LOCAL_CAP + 5;
+		for i in 0..extra {
+			let name = format!("feat/{i:03}");
+			run_git(&git, repo, &["checkout", "-q", "-b", &name, "main"]);
+			std::fs::write(repo.join(format!("f{i}")), "x").unwrap();
+			run_git(&git, repo, &["add", "."]);
+			run_git(&git, repo, &["commit", "-q", "-m", &format!("work {i}")]);
+		}
+		// Land on a feature branch so `main` is neither current nor
+		// near the top of the recency sort.
+		run_git(&git, repo, &["checkout", "-q", "feat/000"]);
+
+		let utf8 = Utf8PathBuf::from_path_buf(repo.canonicalize().unwrap()).unwrap();
+		let result = LocalHost::new(utf8).branch_list(PrListScope::All).await.unwrap();
+
+		// `main` survived the cap and carries the default marker.
+		let main_row = result
+			.local
+			.iter()
+			.find(|e| matches!(e, BranchListEntry::Local { name, .. } if name == "main"));
+		assert!(
+			matches!(main_row, Some(BranchListEntry::Local { is_default: true, .. })),
+			"main should be present and flagged is_default, got {main_row:?}",
+		);
+		// Exactly one row is the default.
+		let default_count = result
+			.local
+			.iter()
+			.filter(|e| matches!(e, BranchListEntry::Local { is_default: true, .. }))
+			.count();
+		assert_eq!(default_count, 1);
 	}
 
 	#[tokio::test]

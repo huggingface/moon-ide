@@ -368,6 +368,7 @@ export type BranchListEntry =
 			lastCommitSubject: string;
 			committerDateRelative: string;
 			isCurrent: boolean;
+			isDefault: boolean;
 	  }
 	| {
 			kind: 'pr';

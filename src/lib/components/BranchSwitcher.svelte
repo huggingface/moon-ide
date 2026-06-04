@@ -98,12 +98,20 @@
 		// PRs) holds the hidden local rows; arrow nav skips them
 		// either to the first PR or stops at the last visible
 		// local row. The user can click "Show all" to make the
-		// hidden rows reachable.
+		// hidden rows reachable. The pinned default branch is the
+		// one exception — it renders below the window and stays
+		// keyboard-reachable.
 		const candidate = from + 1;
 		if (collapsed && candidate >= visibleLocalCount && candidate < firstPrIndex) {
+			if (pinnedDefaultIndex !== -1 && from < pinnedDefaultIndex) {
+				return pinnedDefaultIndex;
+			}
 			return firstPrIndex;
 		}
-		if (collapsed && firstPrIndex === -1 && candidate >= visibleLocalCount) {
+		if (collapsed && firstPrIndex === -1 && candidate >= visibleLocalCount && candidate < localRowCount) {
+			if (pinnedDefaultIndex !== -1 && from < pinnedDefaultIndex) {
+				return pinnedDefaultIndex;
+			}
 			return Math.max(0, visibleLocalCount - 1);
 		}
 		return Math.min(candidate, Math.max(0, rows.length - 1));
@@ -112,6 +120,9 @@
 	function prevSelection(from: number): number {
 		const candidate = from - 1;
 		if (collapsed && candidate >= visibleLocalCount && candidate < firstPrIndex) {
+			if (pinnedDefaultIndex !== -1 && from > pinnedDefaultIndex) {
+				return pinnedDefaultIndex;
+			}
 			return Math.max(0, visibleLocalCount - 1);
 		}
 		return Math.max(candidate, 0);
@@ -158,7 +169,25 @@
 		() => !branchesExpanded && query.trim() === '' && localRowCount > DEFAULT_BRANCH_LIMIT,
 	);
 	const visibleLocalCount: number = $derived.by(() => (collapsed ? DEFAULT_BRANCH_LIMIT : localRowCount));
-	const hiddenLocalCount: number = $derived.by(() => Math.max(0, localRowCount - visibleLocalCount));
+	// Index of the default-branch row within the flattened `rows`,
+	// or -1 when there's no default in the current filtered view.
+	// The backend always emits the default branch (even past the
+	// recency cap), but it can land in the collapsed tail; we pin
+	// it visible so switching back to main is always one click.
+	const defaultLocalIndex: number = $derived.by(() =>
+		rows.findIndex((r) => r.kind === 'local' && r.entry.isDefault && !r.entry.isCurrent),
+	);
+	// When collapsed, the default branch is shown out-of-band below
+	// the visible window iff it falls into the hidden tail.
+	const pinnedDefaultIndex: number = $derived.by(() =>
+		collapsed && defaultLocalIndex >= visibleLocalCount && defaultLocalIndex < localRowCount ? defaultLocalIndex : -1,
+	);
+	// The pinned default still counts as visible, so it must not be
+	// double-counted in the "Show N more" tally.
+	const hiddenLocalCount: number = $derived.by(() => {
+		const hidden = Math.max(0, localRowCount - visibleLocalCount);
+		return pinnedDefaultIndex === -1 ? hidden : Math.max(0, hidden - 1);
+	});
 
 	// PR section's empty-state message. The frontend treats
 	// `not_github` as "suppress the section entirely" — no
@@ -182,6 +211,38 @@
 
 	const showPrSection: boolean = $derived.by(() => workspace.branchSwitcher.list.prStatus.kind !== 'not_github');
 </script>
+
+{#snippet localRow(entry: Extract<BranchListEntry, { kind: 'local' }>, idx: number)}
+	<!-- Click activates a row; keyboard navigation lives on the
+		 always-focused <input> above (Enter activates the
+		 highlighted row, Arrow keys move it). Adding a per-row
+		 keyboard handler would require focusing the <li> on hover,
+		 which fights the input focus. Same pattern as
+		 CommandPalette. -->
+	<!-- svelte-ignore a11y_click_events_have_key_events -->
+	<li
+		class="result"
+		class:selected={idx === selected}
+		class:current={entry.isCurrent}
+		role="option"
+		aria-selected={idx === selected}
+		onmousemove={() => (selected = idx)}
+		onclick={() => activate(idx)}
+	>
+		<span class="title">
+			<span class="kind-icon" title="Local branch">
+				<BranchIcon size={13} />
+			</span>
+			<span class="branch-name">{entry.name}</span>
+			{#if entry.isCurrent}<span class="badge">current</span>{:else if entry.isDefault}<span class="badge">default</span
+				>{/if}
+			{#if entry.lastCommitSubject !== ''}
+				<span class="subject">{entry.lastCommitSubject}</span>
+			{/if}
+		</span>
+		<span class="meta">{entry.committerDateRelative}</span>
+	</li>
+{/snippet}
 
 {#if workspace.branchSwitcher.open}
 	<!-- Backdrop is a click target only; key events live on the
@@ -208,36 +269,16 @@
 				{/if}
 				{#each rows.slice(0, visibleLocalCount) as row, i (`local-${i}`)}
 					{#if row.kind === 'local'}
-						<!-- Click activates a row; keyboard navigation lives on
-							 the always-focused <input> above (Enter activates
-							 the highlighted row, Arrow keys move it). Adding
-							 a per-row keyboard handler would require focusing
-							 the <li> on hover, which fights the input focus.
-							 Same pattern as CommandPalette. -->
-						<!-- svelte-ignore a11y_click_events_have_key_events -->
-						<li
-							class="result"
-							class:selected={i === selected}
-							class:current={row.entry.isCurrent}
-							role="option"
-							aria-selected={i === selected}
-							onmousemove={() => (selected = i)}
-							onclick={() => activate(i)}
-						>
-							<span class="title">
-								<span class="kind-icon" title="Local branch">
-									<BranchIcon size={13} />
-								</span>
-								<span class="branch-name">{row.entry.name}</span>
-								{#if row.entry.isCurrent}<span class="badge">current</span>{/if}
-								{#if row.entry.lastCommitSubject !== ''}
-									<span class="subject">{row.entry.lastCommitSubject}</span>
-								{/if}
-							</span>
-							<span class="meta">{row.entry.committerDateRelative}</span>
-						</li>
+						{@render localRow(row.entry, i)}
 					{/if}
 				{/each}
+				{#if pinnedDefaultIndex !== -1 && rows[pinnedDefaultIndex]?.kind === 'local'}
+					<!-- Default branch pinned visible: it fell into the
+							 collapsed tail (older than the recency window) but
+							 switching back to it is the most common gesture, so
+							 we always surface its row here. -->
+					{@render localRow((rows[pinnedDefaultIndex] as Extract<Row, { kind: 'local' }>).entry, pinnedDefaultIndex)}
+				{/if}
 				{#if hiddenLocalCount > 0}
 					<!-- "Show all" expander. Click-only on purpose: the
 						 keyboard story is "type to filter" — typing any

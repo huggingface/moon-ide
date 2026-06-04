@@ -249,6 +249,15 @@ pub enum BranchListEntry {
 		/// the UI can render it as inert (no point switching to
 		/// the branch you're already on).
 		is_current: bool,
+		/// Marker for the repo's default branch (`main` /
+		/// `master`, resolved from `origin/HEAD`). The recency
+		/// cap can push the default branch off the end of the
+		/// list on a busy repo, so the backend always includes
+		/// its row and sets this flag; the frontend keeps it
+		/// visible even when the list is collapsed, since
+		/// switching back to the default branch is the most
+		/// common destination.
+		is_default: bool,
 	},
 	/// A GitHub pull request, as reported by `gh pr list`.
 	Pr {
