@@ -1,30 +1,21 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { renderSVG } from 'uqr';
-	import { ipc, type CompanionStatus } from '../ipc';
+	import { ipc } from '../ipc';
 	import { companion } from '../companion.svelte';
 
-	let status = $state<CompanionStatus | null>(null);
-	let pollTimer: ReturnType<typeof setInterval> | null = null;
-
-	async function refresh(): Promise<void> {
-		try {
-			status = await ipc.companion.status();
-		} catch {
-			status = null;
-		}
-	}
+	// The store owns the polled status (shared with the status-bar
+	// pip); the modal just renders it and keeps a poll ref alive while
+	// open so it refreshes a touch faster after a pair/revoke.
+	const status = $derived(companion.status);
 
 	onMount(() => {
-		void refresh();
-		// Poll so a fresh pair / revoke shows up without a manual reload.
-		pollTimer = setInterval(() => void refresh(), 2000);
+		companion.startPolling();
+		void companion.refresh();
 	});
 
 	onDestroy(() => {
-		if (pollTimer) {
-			clearInterval(pollTimer);
-		}
+		companion.stopPolling();
 	});
 
 	// The QR encodes the full pairing payload (url + fingerprint + code)
@@ -34,7 +25,7 @@
 	async function revoke(id: string): Promise<void> {
 		await ipc.companion.revokeDevice(id);
 		// The bridge picks up the request within ~1s; nudge a refresh.
-		setTimeout(() => void refresh(), 1200);
+		setTimeout(() => void companion.refresh(), 1200);
 	}
 
 	function relativeTime(ms: number): string {

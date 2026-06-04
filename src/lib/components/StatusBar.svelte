@@ -4,6 +4,7 @@
 	import { slack } from '../slack.svelte';
 	import { coder } from '../coder.svelte';
 	import { container, containerStateLabel } from '../container.svelte';
+	import { companion } from '../companion.svelte';
 	import ContainerPanel from './ContainerPanel.svelte';
 	import TerminalLauncher from './TerminalLauncher.svelte';
 	import ThemePicker from './ThemePicker.svelte';
@@ -319,6 +320,16 @@
 		};
 	});
 
+	// Keep a light poll of the companion bridge status alive while the
+	// status bar is mounted, so the companion pip reflects running /
+	// paired state at rest (cheap local file read every few seconds).
+	$effect(() => {
+		companion.startPolling();
+		return () => {
+			companion.stopPolling();
+		};
+	});
+
 	$effect(() => {
 		if (!autocompletePanelOpen) {
 			return;
@@ -585,6 +596,22 @@
 				ports{portsCount > 0 ? ` (${portsCount})` : ''}
 			</button>
 		{/if}
+		<!-- Companion (mobile pairing). Pip reflects bridge running
+			 state; click opens the pairing modal (QR + devices). The
+			 same modal is reachable from the command palette. -->
+		<button
+			type="button"
+			class="container"
+			class:active={companion.modalOpen}
+			title={companion.running
+				? `Companion bridge running${companion.deviceCount > 0 ? ` · ${companion.deviceCount} device${companion.deviceCount === 1 ? '' : 's'} paired` : ''}`
+				: 'Companion bridge not running'}
+			onclick={() => companion.toggle()}
+		>
+			<span class="icon" aria-hidden="true">☏</span>
+			<span class="pip" class:on={companion.running}></span>
+			companion{companion.deviceCount > 0 ? ` (${companion.deviceCount})` : ''}
+		</button>
 		<!-- Terminal launcher. Same popover the bottom-panel
 			 strip uses; placed here so the user can spawn a
 			 shell without opening the panel first. -->
@@ -711,6 +738,10 @@
 	.container.active {
 		color: var(--m-fg);
 		background: var(--m-bg-overlay);
+	}
+	.container .icon {
+		font-size: 12px;
+		line-height: 1;
 	}
 	.pip {
 		display: inline-block;
