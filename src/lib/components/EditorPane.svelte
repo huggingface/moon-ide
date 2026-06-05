@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import EditorTabs from './EditorTabs.svelte';
 	import Editor from './Editor.svelte';
 	import DiffView from './DiffView.svelte';
@@ -154,6 +155,35 @@
 			`EditorPane(${side}) RENDER activePath=${activePath ?? '∅'} branch=${branch} file=${activeFile?.path ?? '∅'}`,
 		);
 		return '';
+	});
+
+	onMount(() => {
+		frontendLog('editor.swap', 'debug', `EditorPane(${side}) MOUNT`);
+		return () => frontendLog('editor.swap', 'debug', `EditorPane(${side}) UNMOUNT`);
+	});
+
+	// Raw-state probe. Reads the workspace's per-folder state through
+	// the *same* getter chain EditorPane's deriveds use, but from a
+	// side `$effect` rather than the template render effect. Compares
+	// what the deriveds resolved (`activeFile`) against the raw
+	// lookup. If the raw lookup finds the file but `activeFile` is
+	// still null, the bug is a stale derived edge in EditorPane; if
+	// the raw lookup *also* comes back empty, the bug is upstream in
+	// `activeFolderState` / `openFiles` not being populated for the
+	// active path. Either way this pins which side of the funnel is
+	// broken when the body shows the empty state with a tab open.
+	$effect(() => {
+		const ap = side === 'left' ? workspace.leftActive : workspace.rightActive;
+		const openCount = workspace.openFiles.length;
+		const rawHit = ap === null ? false : workspace.openFiles.some((f) => f.path === ap);
+		const tabCount = workspace.tabsFor(side).length;
+		frontendLog(
+			'editor.swap',
+			'debug',
+			`EditorPane(${side}) STATE folder=${workspace.activeFolderPath ?? '∅'} rawActive=${ap ?? '∅'} ` +
+				`rawHitInOpenFiles=${rawHit} openFiles=${openCount} tabs=${tabCount} ` +
+				`derivedActiveFile=${activeFile?.path ?? '∅'}`,
+		);
 	});
 
 	// Holds the boundary's `reset` while the body is in its failed
