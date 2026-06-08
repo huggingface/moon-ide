@@ -694,25 +694,8 @@ class WorkspaceState {
 		}
 	}
 
-	// Debug-only: when on, `leftActive` reads emit a diag-log line so
-	// we can see whether a stuck EditorPane is even re-reading the
-	// active path during a tab switch. Flip from the devtools console
-	// with `window.__moonTraceActiveReads = true`. Off by default —
-	// these reads are extremely hot.
-	private get traceActiveReads(): boolean {
-		return (globalThis as Record<string, unknown>).__moonTraceActiveReads === true;
-	}
-
 	get leftActive(): string | null {
-		const v = this.activeFolderState?.leftActive ?? null;
-		if (this.traceActiveReads) {
-			frontendLog(
-				'editor.swap',
-				'debug',
-				`read leftActive → ${v ?? '∅'} (folderState=${this.activeFolderState ? 'set' : 'null'})`,
-			);
-		}
-		return v;
+		return this.activeFolderState?.leftActive ?? null;
 	}
 	set leftActive(value: string | null) {
 		if (this.activeFolderState) {
@@ -4095,10 +4078,8 @@ class WorkspaceState {
 
 	setDiffMode(path: string, on: boolean) {
 		if (this.diffModes.has(path) === on) {
-			frontendLog('editor.swap', 'debug', `setDiffMode(${path}, ${on}) no-op`);
 			return;
 		}
-		frontendLog('editor.swap', 'debug', `setDiffMode(${path}, ${on})`);
 		const next = new Set(this.diffModes);
 		if (on) {
 			next.add(path);
@@ -4550,13 +4531,12 @@ class WorkspaceState {
 		} catch (err) {
 			// `loadTextFile` throws when both the working-tree read and
 			// the HEAD fallback fail (file vanished + not tracked, IPC
-			// blew up, …). Every caller does `void reloadOpenFileFromDisk(…)`
-			// without a `.catch`, so without this swallow each failed
-			// reload bubbles up as an unhandled promise rejection — which
-			// is bad enough on its own (devtools toast spam) and, more
-			// importantly, leaves consumers of `frontendLog('editor.swap')`
-			// guessing why the editor body apparently froze.
-			frontendLog('editor.swap', 'warn', `reloadOpenFileFromDisk(${path}) failed: ${String(err)}`);
+			// blew up mid-watch, …). Every caller does
+			// `void reloadOpenFileFromDisk(…)` without a `.catch`, so
+			// without this swallow each failed reload surfaces as an
+			// unhandled promise rejection. Best-effort: keep the stale
+			// buffer, log, move on.
+			frontendLog('fs-watcher', 'warn', `reload of ${path} failed: ${String(err)}`);
 			return;
 		}
 		if (!next) {
@@ -4566,7 +4546,6 @@ class WorkspaceState {
 		if (current && current.kind === 'text' && next.kind === 'text' && current.text === next.text) {
 			return;
 		}
-		frontendLog('editor.swap', 'debug', `reloadOpenFileFromDisk(${path}) replaced OpenFile`);
 		this.openFiles = this.openFiles.map((f) => (f.path === path ? next : f));
 	}
 
@@ -4938,17 +4917,8 @@ class WorkspaceState {
 
 	setActive(path: string, side: SplitSide = this.focusedSide, options: { focus?: boolean } = {}) {
 		if (!this.tabsFor(side).includes(path)) {
-			frontendLog('editor.swap', 'debug', `setActive(${side}, ${path}) skipped — path not in tabs`);
 			return;
 		}
-		const prev = side === 'left' ? this.leftActive : this.rightActive;
-		frontendLog(
-			'editor.swap',
-			'debug',
-			`setActive(${side}) ${prev ?? '∅'} → ${path} ` +
-				`diffMode(prev)=${prev !== null && this.diffModes.has(prev)} ` +
-				`diffMode(next)=${this.diffModes.has(path)}`,
-		);
 		if (side === 'left') {
 			this.leftActive = path;
 		} else {

@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
 	import EditorTabs from './EditorTabs.svelte';
 	import Editor from './Editor.svelte';
 	import DiffView from './DiffView.svelte';
@@ -16,72 +15,79 @@
 	type Props = { side: SplitSide };
 	let { side }: Props = $props();
 
-	const activePath: string | null = $derived(side === 'left' ? workspace.leftActive : workspace.rightActive);
-	const activeFile = $derived.by(() => {
-		if (activePath === null) {
-			return null;
+	// Single source of truth for "what is this pane showing". One
+	// flat `$derived` reading the raw workspace state, instead of the
+	// previous chain of `$derived` reading `$derived` reading
+	// `$derived` (activePath → activeFile → showDiff/showMarkdown/…).
+	//
+	// That deep diamond was the bug behind "switch tabs, the strip
+	// updates but the editor body keeps showing the old file": under
+	// Svelte 5's lazy derived evaluation, a consuming effect (the
+	// template render) could read a *stale* cached `activeFile` while
+	// a sibling effect reading the raw `workspace.leftActive` saw the
+	// fresh value. Folding everything the body needs into one object
+	// computed from raw state means the template depends on exactly
+	// one derived, recomputed atomically on every active-path /
+	// openFiles / mode change — no intermediate edge to go stale.
+	const view = $derived.by(() => {
+		const path = side === 'left' ? workspace.leftActive : workspace.rightActive;
+		const file = path === null ? null : (workspace.openFiles.find((f) => f.path === path) ?? null);
+		if (file === null) {
+			return { path, file: null, kind: 'welcome' as const };
 		}
-		return workspace.openFiles.find((f) => f.path === activePath) ?? null;
+		if (file.kind === 'image') {
+			return { path, file, kind: 'image' as const };
+		}
+		// Review view: synthetic `review://…` buffer. Wins over
+		// everything else for that path.
+		if (isReviewPath(file.path)) {
+			return { path, file, kind: 'review' as const };
+		}
+		// Diff view: explicit user gesture (tab toggle, palette,
+		// Ctrl+Shift+D, gutter click, SCM changes-tree click on a
+		// modified row). Deleted files are NOT force-routed here —
+		// `Editor.svelte` shows their HEAD content read-only.
+		if (file.kind === 'text' && workspace.diffModeFor(file.path)) {
+			return { path, file, kind: 'diff' as const };
+		}
+		// Markdown preview: per-buffer toggle, suppressed when diff
+		// or review already claimed the buffer (handled above).
+		if (file.kind === 'text' && isMarkdownPath(file.path) && workspace.previewModeFor(file.path) === 'preview') {
+			return { path, file, kind: 'markdown' as const };
+		}
+		return { path, file, kind: 'editor' as const };
 	});
-	// Diff-view wins over markdown-preview. A buffer hits the diff
-	// pane only when the user has explicitly asked for it — via the
-	// tab toggle, the command palette, `Ctrl-Shift-D`, the gutter
-	// click, or (for `modified` files) a click in the SCM
-	// changes-only tree. Deleted-file tabs used to be force-routed
-	// here on the rationale that "there's no working tree to edit",
-	// but a single read-only Editor showing the HEAD content is
-	// what users actually want for "what was in this file before it
-	// was deleted?" — a side-by-side against an empty pane just
-	// halves the reading space. `Editor.svelte` flips itself
-	// read-only when `file.isDeleted`, so the normal view is safe.
-	const showReview = $derived(activeFile !== null && isReviewPath(activeFile.path));
-	const showDiff = $derived.by(() => {
-		if (activeFile === null || activeFile.kind !== 'text') {
-			return false;
-		}
-		if (showReview) {
-			return false;
-		}
-		return workspace.diffModeFor(activeFile.path);
-	});
-	const showMarkdownPreview = $derived(
-		activeFile !== null &&
-			activeFile.kind === 'text' &&
-			isMarkdownPath(activeFile.path) &&
-			workspace.previewModeFor(activeFile.path) === 'preview' &&
-			!showDiff &&
-			!showReview,
-	);
-	// Show the "Add to Coder" hint only when this pane is showing
-	// the file the workspace's `activeSelection` points at, and
-	// only over surfaces that actually expose a CodeMirror
-	// selection. Image and Markdown-preview can't produce one;
-	// diff view's right (working-tree) pane can — see
-	// `DiffView.svelte`'s `publishDiffSelection` — so we let it
-	// through. The review view also publishes selections from its
-	// working-tree side (see `ReviewSection.svelte`), so the hint
-	// is allowed there too — the `activeFile.path` is the synthetic
-	// `review://…` token in that mode, so we relax the
-	// path-equality check for the review surface and just trust
-	// that the section produced the selection. The hint anchors
-	// to the pane's top-right corner, which lands over the right
-	// pane in diff mode and the top-right of the stacked sections
-	// in review mode.
+
+	// Show the "Add to Coder" hint only when this pane is showing the
+	// file the workspace's `activeSelection` points at, and only over
+	// surfaces that actually expose a CodeMirror selection. Image and
+	// Markdown-preview can't produce one; diff view's right
+	// (working-tree) pane can — see `DiffView.svelte`'s
+	// `publishDiffSelection` — so we let it through. The review view
+	// also publishes selections from its working-tree side (see
+	// `ReviewSection.svelte`), so the hint is allowed there too — the
+	// `activeFile.path` is the synthetic `review://…` token in that
+	// mode, so we relax the path-equality check for the review
+	// surface and just trust that the section produced the selection.
+	// The hint anchors to the pane's top-right corner, which lands
+	// over the right pane in diff mode and the top-right of the
+	// stacked sections in review mode.
 	const showCoderHint = $derived.by(() => {
 		const selection = workspace.activeSelection;
 		if (selection === null) {
 			return false;
 		}
-		if (activeFile === null || activeFile.kind !== 'text') {
+		const file = view.file;
+		if (file === null || file.kind !== 'text') {
 			return false;
 		}
-		if (showMarkdownPreview) {
+		if (view.kind === 'markdown') {
 			return false;
 		}
-		if (showReview) {
+		if (view.kind === 'review') {
 			return true;
 		}
-		return selection.path === activeFile.path;
+		return selection.path === file.path;
 	});
 
 	async function pickFolder() {
@@ -95,123 +101,36 @@
 	// Post-flush marker for folder-swap profiling: fires after this
 	// pane has reconciled. The keyed Image/Diff/Markdown/Review
 	// blocks tear down and rebuild on path change; the regular
-	// Editor swaps state in place. Either way the mark lets us
-	// align EditorPane reconciliation against the rest of the
-	// cascade in a devtools timeline.
+	// Editor swaps state in place. Either way the mark lets us align
+	// EditorPane reconciliation against the rest of the cascade in a
+	// devtools timeline.
 	$effect(() => {
-		void activePath;
-		void showReview;
-		void showDiff;
-		void showMarkdownPreview;
+		void view;
 		performance.mark(`moon:editorPane.${side}.update`);
-		const branch =
-			activeFile === null
-				? 'welcome'
-				: activeFile.kind === 'image'
-					? 'image'
-					: showReview
-						? 'review'
-						: showDiff
-							? 'diff'
-							: showMarkdownPreview
-								? 'markdown'
-								: 'editor';
-		frontendLog(
-			'editor.swap',
-			'debug',
-			`EditorPane(${side}) activePath=${activePath ?? '∅'} branch=${branch} ` +
-				`activeFile.path=${activeFile?.path ?? '∅'} showDiff=${showDiff} ` +
-				`showReview=${showReview} showMd=${showMarkdownPreview}`,
-		);
 	});
 
 	function focus() {
 		workspace.focusSide(side);
 	}
 
-	// Read directly in the markup (below) so this derived lands in
-	// the *template* render effect, not a side `$effect`. If the
-	// body freezes on a tab switch while the strip updates, the
-	// template effect is the thing that stopped — and this log line
-	// (which only the template effect can trigger) going silent
-	// while `setActive` keeps firing pins the blame on the render
-	// effect's reactive scope rather than on a stray side effect.
-	const bodyTrace = $derived.by(() => {
-		const branch =
-			activeFile === null
-				? 'welcome'
-				: activeFile.kind === 'image'
-					? 'image'
-					: showReview
-						? 'review'
-						: showDiff
-							? 'diff'
-							: showMarkdownPreview
-								? 'markdown'
-								: 'editor';
-		frontendLog(
-			'editor.swap',
-			'debug',
-			`EditorPane(${side}) RENDER activePath=${activePath ?? '∅'} branch=${branch} file=${activeFile?.path ?? '∅'}`,
-		);
-		return '';
-	});
-
-	onMount(() => {
-		frontendLog('editor.swap', 'debug', `EditorPane(${side}) MOUNT`);
-		return () => frontendLog('editor.swap', 'debug', `EditorPane(${side}) UNMOUNT`);
-	});
-
-	// Raw-state probe. Reads the workspace's per-folder state through
-	// the *same* getter chain EditorPane's deriveds use, but from a
-	// side `$effect` rather than the template render effect. Compares
-	// what the deriveds resolved (`activeFile`) against the raw
-	// lookup. If the raw lookup finds the file but `activeFile` is
-	// still null, the bug is a stale derived edge in EditorPane; if
-	// the raw lookup *also* comes back empty, the bug is upstream in
-	// `activeFolderState` / `openFiles` not being populated for the
-	// active path. Either way this pins which side of the funnel is
-	// broken when the body shows the empty state with a tab open.
-	$effect(() => {
-		const ap = side === 'left' ? workspace.leftActive : workspace.rightActive;
-		const openCount = workspace.openFiles.length;
-		const rawHit = ap === null ? false : workspace.openFiles.some((f) => f.path === ap);
-		const tabCount = workspace.tabsFor(side).length;
-		frontendLog(
-			'editor.swap',
-			'debug',
-			`EditorPane(${side}) STATE folder=${workspace.activeFolderPath ?? '∅'} rawActive=${ap ?? '∅'} ` +
-				`rawHitInOpenFiles=${rawHit} openFiles=${openCount} tabs=${tabCount} ` +
-				`derivedActiveFile=${activeFile?.path ?? '∅'}`,
-		);
-	});
-
 	// Holds the boundary's `reset` while the body is in its failed
-	// state. Cleared once we've reset. The auto-reset effect below
-	// calls it on the next `activePath` change so switching tabs
-	// recovers the pane without a manual click.
+	// state. The auto-reset effect below calls it on the next view
+	// change so switching tabs recovers the pane without a click.
 	let pendingBoundaryReset: (() => void) | null = $state(null);
 
 	function onBodyError(error: unknown, reset: () => void) {
 		const detail =
 			error instanceof Error ? `${error.name}: ${error.message}\n${error.stack ?? '(no stack)'}` : String(error);
-		frontendLog(
-			'editor.swap',
-			'error',
-			`EditorPane(${side}) body boundary caught: activePath=${activePath ?? '∅'}\n${detail}`,
-		);
+		frontendLog('runtime', 'error', `EditorPane(${side}) body boundary caught: path=${view.path ?? '∅'}\n${detail}`);
 		pendingBoundaryReset = reset;
 	}
 
-	// Auto-recover on navigation. When the body has crashed and the
-	// user switches to another tab (or any state change moves
-	// `activePath`), tear down the failed subtree and rebuild it for
-	// the new file. Without this the boundary would keep showing the
-	// fallback until the manual "Reload view" button is clicked,
-	// which is the exact "editor body froze on tab switch" symptom
-	// we're chasing.
+	// Auto-recover on navigation: when the body has crashed and the
+	// active path changes, tear down the failed subtree and rebuild
+	// it for the new file rather than leaving the fallback up until
+	// the manual "Reload view" button is clicked.
 	$effect(() => {
-		void activePath;
+		void view.path;
 		const reset = pendingBoundaryReset;
 		if (reset === null) {
 			return;
@@ -230,18 +149,16 @@
 	onfocusin={focus}
 >
 	<EditorTabs {side} />
-	<div class="body" data-body-trace={bodyTrace}>
+	<div class="body">
 		<!-- Boundary so a throw inside a view component's render or
 		     its child effects (Editor / DiffView / MarkdownView /
 		     ReviewView / ImageView) is caught and surfaced instead
 		     of silently detaching EditorPane's own reactive scope.
-		     Symptom we're chasing: a tab switch updates the strip
-		     but the editor body freezes — consistent with a child
-		     effect crashing the flush. `onerror` logs the full
-		     error + stack to the `editor.swap` diag source; `reset`
-		     lets the next state change rebuild the body. -->
+		     `onerror` logs the full error + stack to the `runtime`
+		     diag source; the auto-reset effect rebuilds the body on
+		     the next navigation. -->
 		<svelte:boundary onerror={(error, reset) => onBodyError(error, reset)}>
-			{#if activeFile?.kind === 'image'}
+			{#if view.file && view.kind === 'image'}
 				<!-- Image / Diff / Markdown / Review views build
 			     CodeMirror / image state in `onMount` and don't
 			     watch `file.path` internally — `Editor` is the
@@ -254,23 +171,23 @@
 			     still carries the original path in its closure and
 			     ends up writing the new file's text into the old
 			     file's buffer. -->
-				{#key activeFile.path}
-					<ImageView file={activeFile} />
+				{#key view.file.path}
+					<ImageView file={view.file} />
 				{/key}
-			{:else if activeFile && showReview}
-				{#key activeFile.path}
+			{:else if view.file && view.kind === 'review'}
+				{#key view.file.path}
 					<ReviewView {side} />
 				{/key}
-			{:else if activeFile && showDiff}
-				{#key activeFile.path}
-					<DiffView file={activeFile} {side} />
+			{:else if view.file && view.kind === 'diff'}
+				{#key view.file.path}
+					<DiffView file={view.file} {side} />
 				{/key}
-			{:else if activeFile && showMarkdownPreview}
-				{#key activeFile.path}
-					<MarkdownView file={activeFile} {side} />
+			{:else if view.file && view.kind === 'markdown'}
+				{#key view.file.path}
+					<MarkdownView file={view.file} {side} />
 				{/key}
-			{:else if activeFile}
-				<Editor file={activeFile} {side} />
+			{:else if view.file}
+				<Editor file={view.file} {side} />
 			{:else}
 				<Welcome onPickFolder={pickFolder} />
 			{/if}
