@@ -16,38 +16,31 @@ nested.
 The IDE itself does not move into the container. The Tauri
 shell, moon-core, Slack, agent runtimes — everything that _is_
 moon-ide — stays host-side. The container is a sandbox the IDE
-shells into to run project commands; nothing about moon-ide's
-own runtime crosses into it.
+shells into to run project commands.
 
 The point is to make `bun dev`, `cargo run`, etc. work the same
-on every team member's machine without polluting the host's
-ports or polluting the host's `apt` / `pip` / `npm` global
-state — and to do that without granting the workspace
-`--privileged` access to the kernel, which is what nested
-Docker would need (see [ADR 0008](decisions/0008-host-shared-daemon.md)
-for the threat-model walk-through).
+on every machine without polluting the host's ports or global
+`apt` / `pip` / `npm` state — without granting the workspace
+`--privileged` kernel access, which nested Docker would need
+(see [ADR 0008](decisions/0008-host-shared-daemon.md)).
 
 ## Why this is a workspace concern, not a project concern
 
-moon-ide is a command center. A workspace can hold one project
-or fifteen — sibling repos in the same org, an active feature
-branch with its dependent libraries checked out alongside, a
-target repo plus the tooling repo that builds it. Cross-repo
-search, cross-repo agent queries, a single shell that can `cd`
-between them — all of these assume a shared dev environment.
+A workspace can hold one project or fifteen — sibling repos,
+a feature branch plus its dependent libraries, a target repo
+plus its tooling repo. Cross-repo search, agent queries, and a
+shell that `cd`s between them all assume a shared dev
+environment. Anchoring the container to a single project (the
+`devcontainer.json`-per-repo model) would mean four sibling
+repos fighting over four containers, four toolchain installs,
+four cached index sets. One container per workspace makes the
+multi-project case the simple case.
 
-If we anchored the container to a single project (the
-`devcontainer.json`-per-repo model), opening four sibling repos
-would mean four workspace containers fighting for ports, four
-toolchain installs to keep in sync, four sets of cached language
-indexes. One container per workspace makes the multi-project
-case the simple case.
-
-When two projects in the same workspace genuinely cannot share
-toolchains (Python 3.10 vs. 3.12, Rust nightly vs. stable, GPU
-pinning), that is the moment to graduate to multi-container —
-deferred to a sub-phase that lands behind a concrete request.
-See [Out of scope](#out-of-scope-for-phase-2-and-when-to-revisit).
+When two projects genuinely can't share toolchains (Python 3.10
+vs. 3.12, Rust nightly vs. stable, GPU pinning), that's the
+moment to graduate to multi-container — deferred behind a
+concrete request. See
+[Out of scope](#out-of-scope-for-phase-2-and-when-to-revisit).
 
 ## Workspace shell vs project services
 
@@ -70,15 +63,14 @@ on the host's daemon. The split is locked in by the
   clicks; it never auto-starts them and it never modifies
   the user's compose file.
 
-Why split: a stalled or broken project service shouldn't
-prevent the user from getting a terminal in the workspace.
-Pre-split moon-ide pulled every project's services in via
-`include:`, so a permission-denied volume in moon-landing's
-`gitaly` blocked `compose up --wait` for the whole project
-— including `dev` — and the IDE was unusable. Splitting
-means the workspace shell comes up in seconds (one image
-pull, no project-service health waits), and the user
-launches services per-folder when they actually need them.
+Why split: a broken project service shouldn't keep the user
+from getting a terminal. Pre-split, every project's services
+came in via `include:`, so a permission-denied volume in
+moon-landing's `gitaly` blocked `compose up --wait` for the
+whole project — `dev` included — and the IDE was unusable.
+Split, the workspace shell comes up in seconds (one image pull,
+no project-service health waits) and services launch per-folder
+on demand.
 
 ### The workspace's `compose.yaml`
 
@@ -172,30 +164,24 @@ After binding moon-landing into a moon-ide workspace:
 -p moon-ws-default-moon-landing up -d --wait`. The user
   logged into `registry.internal.huggingface.tech` on their
   host's daemon picks up the private images transparently.
-- If gitaly fails the volume permission check, the folder bar
-  flips its container glyph to red and the popover lists
-  `gitaly · exited (1)`. The workspace shell stays up — the user can still
-  open a terminal — and "Recreate" / "Down" sit on the
-  popover. The status freshens via two pollers (see
+- If gitaly fails its volume permission check, the folder bar's
+  glyph flips red and the popover lists `gitaly · exited (1)`.
+  The workspace shell stays up; "Recreate" / "Down" sit on the
+  popover. Status freshens via two pollers (see
   `crates/moon-ide/src/lib/projectCompose.svelte.ts`): a coarse
-  15 s background poll across every bound folder so closed-popover
-  bars catch silent crashes, and a tight 2 s poll on the folder
-  whose popover is open so the in-flight `up -d --wait` view
-  doesn't freeze on the pre-mutation snapshot.
-- Both `Workspace::status()` and `ProjectCompose::status()` are
+  15 s background poll across every bound folder (catches silent
+  crashes in closed-popover bars) and a tight 2 s poll on the
+  open popover's folder (so an in-flight `up -d --wait` view
+  doesn't freeze on the pre-mutation snapshot).
+- `Workspace::status()` and `ProjectCompose::status()` are
   TTL-cached (1 s) **and** single-flight per `(project,
-compose-file)` key — concurrent miss callers serialise behind
-  one shell-out instead of each spawning their own
-  `docker compose ps`. It matters because the LSP layer's
-  fanout is concurrent (Tauri commands run in parallel), so a
-  pure TTL cache without single-flight wouldn't catch the
-  per-keystroke burst. See
+compose-file)` key, so concurrent miss callers serialise
+  behind one `docker compose ps` instead of each spawning their
+  own — necessary because the LSP layer's Tauri-command fanout
+  is concurrent. Mutating commands (`setup` / `pause` / `up` /
+  `down` / …) invalidate the slot on success. See
   [ADR 0020](decisions/0020-container-status-cache.md) and
-  `crates/moon-container/src/status_cache.rs`. The pollers above
-  drive the cache, and any other caller in the same second
-  reuses the same reading. Mutating commands (`setup` / `pause`
-  / `up` / `down` / …) invalidate the slot on success so a
-  follow-up `status()` returns the post-mutation truth.
+  `crates/moon-container/src/status_cache.rs`.
 - The user's app continues to run wherever it ran before —
   on the host (reaching services through published host
   ports, exactly as today) or, once Phase 2.1 routes
@@ -353,7 +339,7 @@ nightly` or `uv python install 3.10` on top of `moon-base`
   from [ADR 0005](decisions/0005-bootstrap.md)).
 - A non-root `dev` user (uid 1000) with passwordless sudo. No
   Docker daemon, no Docker CLI — the workspace doesn't talk
-  to a daemon at all (see [Project services](#project-services-live-alongside-not-inside)).
+  to a daemon at all (see [Workspace shell vs project services](#workspace-shell-vs-project-services)).
 - An entrypoint that does **nothing** — moon-ide attaches with
   `docker exec` and runs commands on demand. No daemonised
   language servers waiting in the dark.
@@ -379,48 +365,35 @@ jobs feed a `docker buildx imagetools create` step that
 publishes the combined manifest. Docker pulls the right arch
 automatically based on the host.
 
-Builds run only on changes to `moon-base`'s sources (its
-Dockerfile, the bootstrap scripts, the workflow itself) — not
-on every moon-ide commit. The "infrequent build" model is
-fine because `moon-base` deliberately doesn't track moon-ide
-versions; it tracks toolchain versions. Concretely, the
-release-gate smoke test (`bun install && cargo check` inside
-the freshly built image) only runs when `moon-base` itself
-changes — moon-ide commits land without it. The contract is
-"`moon-base` builds moon-ide cleanly when published", not
-"every moon-ide commit re-validates `moon-base`".
+Builds run only on changes to `moon-base`'s own sources
+(Dockerfile, bootstrap scripts, the workflow), not on every
+moon-ide commit — `moon-base` tracks toolchain versions, not
+moon-ide versions. The release-gate smoke test
+(`bun install && cargo check` inside the fresh image) runs only
+when `moon-base` changes. The contract is "`moon-base` builds
+moon-ide cleanly when published", not "every moon-ide commit
+re-validates `moon-base`".
 
 #### Why Docker Hub, not GHCR or HF Hub
 
-Trade-offs we walked through, with their rejection reasons:
-
-- **GHCR**: ties the workspace's runtime base image to a
-  GitHub/Microsoft account. We'd rather not bake that
-  dependency into every team member's `docker pull` path
-  for a foundational artefact.
-- **Private Docker registry**: image needs to be public so
-  contributors and downstream users can pull it without
-  credential setup. Rules out anything self-hosted-and-gated.
-- **Hugging Face Spaces "run locally"**: HF Spaces only
-  ship `linux/amd64` artefacts; using them as the
-  distribution channel would lock arm64 (the primary target)
-  out of the picture.
-- **Docker Hub**: vendor-neutral relative to our existing
-  GitHub dependencies, public, multi-arch-native, idiomatic
-  (`docker pull huggingface/moon-base` works without a
-  registry prefix). Chosen.
+- **GHCR**: ties the base image to a GitHub/Microsoft account
+  in every `docker pull` path. Avoided for a foundational
+  artefact.
+- **Private registry**: the image must be public so
+  contributors pull without credential setup.
+- **HF Spaces "run locally"**: amd64-only, which locks out
+  arm64 (the primary target).
+- **Docker Hub**: vendor-neutral, public, multi-arch-native,
+  no registry prefix. Chosen.
 
 ### Why not devcontainer.json features
 
-Devcontainer "features" (`github-cli:1`, `python:1`, …) are
-nice for the per-project model, but they layer on top of
-whatever base image the user picked, which means every team
-relitigates toolchain decisions separately. By baking the
-polyglot toolchain into `moon-base`, every workspace inherits
-a known good setup with no configuration. Features for the
-rare cases that aren't covered can come back as Dockerfile
-lines in the user's `FROM moon-base AS team-dev` extension;
-we lose nothing.
+Devcontainer "features" (`github-cli:1`, `python:1`, …) layer
+on whatever base image the user picked, so every team
+relitigates toolchain decisions. Baking the polyglot toolchain
+into `moon-base` gives every workspace a known-good setup with
+no configuration; uncovered cases come back as Dockerfile lines
+in the team's `FROM moon-base` extension.
 
 ### How teams extend it
 
@@ -474,11 +447,10 @@ services:
     # ports: ["3000:3000"]
 ```
 
-A workspace whose root holds a project compose file (or whose
-sub-directories hold per-repo compose files) gets the same
-file with an `include:` block prepended — see
-[Project services](#project-services-live-alongside-not-inside)
-for the example.
+A workspace whose bound folders carry their own compose files
+does **not** fold them into this file; those run as separate
+per-folder projects — see
+[Workspace shell vs project services](#workspace-shell-vs-project-services).
 
 What gets auto-generated vs. user-owned:
 
@@ -495,27 +467,21 @@ What gets auto-generated vs. user-owned:
 
 ### Why compose, not devcontainer.json native
 
-Three reasons.
+1. **Image control.** Compose defaults to "any base image";
+   devcontainer.json nudges toward Microsoft's image family.
+2. **One layer of magic, not two.** `compose.yaml` +
+   `Dockerfile` is the industry-standard pair every team
+   already knows; devcontainer.json adds a translation step
+   that becomes compose anyway.
+3. **Multi-service is free.** Adding `db` / `redis` / a
+   GPU-pinned service is one more service entry, no new
+   abstraction.
 
-1. **Image control.** Compose makes "use any base image" the
-   default; devcontainer.json's documented path nudges users
-   toward Microsoft's image family.
-2. **One layer of magic instead of two.** `compose.yaml` +
-   `Dockerfile` is the boring industry-standard pair. Every
-   team running anything in production already knows it.
-   Devcontainer.json adds a translation step that eventually
-   becomes compose anyway.
-3. **Multi-service is free.** When a sub-phase needs to add
-   `db` / `redis` / a GPU-pinned service, compose gains a
-   service entry; no new abstraction.
-
-Devcontainer.json **interop** (reading a repo's existing
-`.devcontainer/devcontainer.json` and synthesising a compose
-service from it) is a separate concern, deferred to Phase 2.3.
-Decided at that phase, not now.
-
-See [ADR 0007](decisions/0007-compose-and-moon-base.md) for the
-full trade-off discussion.
+Devcontainer.json **interop** (synthesising a compose service
+from a repo's `.devcontainer/devcontainer.json`) is deferred to
+Phase 2.3. See
+[ADR 0007](decisions/0007-compose-and-moon-base.md) for the full
+trade-off.
 
 ## Lifecycle
 
@@ -532,44 +498,31 @@ full trade-off discussion.
 ### Stop semantics, and how to keep in-memory state
 
 The workspace shell's "Stop" button shells to `docker compose
-stop`: SIGTERM to the `dev` container, then to its services if
-they're part of the same project. Processes shut down,
-language servers re-init on next "Start", a running `bun dev`
-needs to be re-launched. That's the predictable, "I'm done
-for now" knob — and it matches the per-project popover, so
-the verb has the same meaning everywhere in the IDE.
+stop`: SIGTERM to `dev`, then its same-project services.
+Processes shut down, LSPs re-init on next "Start", a running
+`bun dev` needs relaunching. It's the predictable "done for now"
+knob, and it matches the per-project popover so the verb means
+the same thing everywhere.
 
-We considered Pause (`docker pause`, cgroup freezer) as the
-default instead. It preserves in-memory state — LSPs, shell
-history, the `bun dev` save loop, populated caches — for
-free. The argument for keeping it default was real: dev
-containers carry expensive warm state.
+We considered defaulting to Pause (`docker pause`, cgroup
+freezer), which preserves warm state — LSPs, shell history,
+caches — for free. We didn't, because:
 
-We didn't. Two reasons:
+- Per-project popovers have no Pause story (a kernel-frozen
+  mongo with paused replication is surprising), and aligning
+  the two vocabularies means one mental model.
+- Pause is a debugging tool, not a "log off for the evening"
+  one — the freezer leaves zombie sockets and confused outside
+  tooling. "Stop" then "Start" suits a quick suspend and lets
+  the system clean up.
 
-- Per-project compose popovers don't have a Pause story
-  (mongo/redis/gitaly init dances are cheap, and pause+resume
-  there means "kernel-frozen mongo with paused replication" —
-  surprising). Aligning the workspace shell's vocabulary with
-  the per-project one means one mental model.
-- Pause is a debugging tool more than a "log off for the
-  evening" tool. The kernel freezer leaves zombie sockets,
-  half-written file descriptors, and confused tooling outside
-  the container that tries to talk to the paused processes.
-  Most users who reach for it want a quick suspend; "Stop"
-  followed by "Start" is fine for that and gives the system
-  a chance to clean up.
+The `pause` / `resume` Tauri commands and `Workspace::pause` /
+`resume` stay on the backend for power users who shell to
+`docker compose pause` directly; the UI doesn't expose them.
 
-The `pause` / `resume` Tauri commands and `Workspace::pause`
-/ `resume` methods stay on the backend so power users can
-shell to `docker compose pause <project>` from a terminal
-when they really do want to keep state in memory across a
-laptop suspend, but the UI doesn't expose them.
-
-`Recreate` (the third button) shells to `up -d
---force-recreate --pull always --wait` — that's the "throw
-state away on purpose" knob, used after a moon-base bump or
-when something's wedged.
+`Recreate` shells to `up -d --force-recreate --pull always
+--wait` — the "throw state away on purpose" knob, for after a
+moon-base bump or when something's wedged.
 
 ### Why moon-ide owns shutdown
 
@@ -601,40 +554,25 @@ the workspace as still in use. See
 [`crate::focus_socket::cleanup`](../src-tauri/src/focus_socket.rs)
 and the `RunEvent::ExitRequested` hook in `src-tauri/src/lib.rs`.
 
-Releasing the lock early opens a different hole, though: a
-relaunch that fires _during_ the teardown now binds the freed
-lock successfully and runs its `auto_resume_*` while the old
-`stop_all` is still issuing `docker compose stop`. It queries
-container state mid-teardown, sees everything still `Running`,
-paints the pip green — and then the old process's `stop_all`
-reaches the containers and stops them (`exited (137)`), so the
-new window's pip and folder icons go dark a few seconds after
-launch and any default container terminal's `docker exec` dies
-with its parent. A **shutdown sentinel** closes this: the
-exiting process writes
-`<workspaces_dir>/<slug>/run/shutting-down` (body = its PID)
-_before_ it drops the lock, and removes it once `stop_all`
-returns. On the way in,
+Dropping the lock early would let a relaunch fired _during_ the
+teardown bind the freed lock and auto-resume against
+still-`Running` containers, only to have the old `stop_all` kill
+them out from under it. A **shutdown sentinel** prevents this:
+the exiting process writes `run/shutting-down` (body = its PID)
+before it drops the lock and removes it once `stop_all` returns;
 [`focus_socket::await_previous_shutdown`](../src-tauri/src/focus_socket.rs)
-blocks the new launch's auto-resume until that file is gone — so
-by the time `auto_resume_shell` runs, the containers are cleanly
-`Stopped` and it brings them back up instead of trusting a
-mid-teardown `Running`. The wait is bounded
-(`SHUTDOWN_WAIT_TIMEOUT`, ~45s) and short-circuits if the
-sentinel is stale (its writer PID is no longer alive, i.e. the
-previous owner was SIGKILLed mid-teardown) — in that case the
-containers may still be up and the existing "already running,
-skip" path handles them. No sentinel present (cold launch, or a
-relaunch well after the previous quit) returns immediately.
+holds the new launch's auto-resume until the file is gone (or the
+writer PID is dead, i.e. a SIGKILLed teardown, or a ~45s cap
+elapses). This also keeps the coder panel's per-process
+`container:state`-driven bash-target indicator honest — it
+re-probes off the new process's own resume event rather than a
+stale mid-teardown one.
 
-This makes the IDE the **command centre** for everything it
-spawned. The user's mental model is "I closed moon-ide,
-nothing should be using my CPU and RAM that I can't see in
-moon-ide". The alternative — leaving every compose project
-running after quit — collects ghost projects on the daemon
-that are tedious to enumerate (`docker compose ls --filter
-name=moon-ws-`) and, more importantly, easy for the user to
-**forget** they're paying for.
+This makes the IDE the **command centre** for what it spawned:
+"I closed moon-ide, nothing should be using CPU/RAM I can't see
+in moon-ide." The alternative — leaving every compose project
+running after quit — collects ghost projects the user easily
+forgets they're paying for.
 
 Symmetric resume on the way back in: both the workspace
 shell (via [`auto_resume_shell`] in
@@ -664,20 +602,11 @@ Two finer points keep the "user intent" signal accurate:
   trigger a confusing `compose up` against something that
   isn't part of the workspace anymore.
 
-We didn't always do this. The earlier policy was "only the
-workspace shell auto-resumes; per-folder projects always
-stay stopped on next launch," motivated by the worry that
-opening moon-ide for a one-off file read would silently
-spin up a heavy ten-service stack the user wasn't about to
-use. In practice the friction of re-clicking "Start
-services" for every relevant folder on every relaunch
-outweighed that worry: the team consistently _did_ want
-those services back, and the cost of starting them
-unintentionally is bounded (they're the user's own
-services, easy to see in the folder bar, easy to stop).
-Snapshotting "Running at quit" rather than always-on
-restores the convenience without resurrecting projects the
-user deliberately tore down.
+(An earlier policy resumed only the workspace shell and left
+per-folder projects stopped. The team consistently wanted those
+services back, and the cost of an unwanted start is bounded —
+visible in the folder bar, one click to stop — so we resume what
+was running at quit.)
 
 Failure modes are deliberately non-fatal:
 
@@ -726,17 +655,11 @@ SIGABRT (`134`), SIGBUS (`135`) and other genuine
 crashes are deliberately _not_ on the list — those still
 flip to `Failed`.
 
-The trade-off: a service that gets OOM-killed (also exit
-`137`) after start-up will look indistinguishable from
-"compose stop escalated to SIGKILL after the grace
-period". The user can still see the literal exit code in
-the per-service row text (`exited (137)`); it's the _dot
-colour and project-level aggregate_ that's been moved to
-the optimistic interpretation. We accept the false
-negative because in practice, OOM-kills inside a dev
-container are rare, and the user's next attempt to bring
-the project up will surface any persistent failure
-anyway.
+Trade-off: an OOM-kill (also exit `137`) is indistinguishable
+from a SIGKILL-escalated stop, so its dot stays muted. The
+literal `exited (137)` still shows in the per-service row, and
+OOM-kills in a dev container are rare, so we accept the false
+negative.
 
 ## Terminals
 
@@ -803,58 +726,41 @@ across IDE quits.
 
 The split is "host = the IDE; container = the project's
 tooling". Slack credentials live in the OS keyring; agent
-runtimes talk to remote APIs from the host (routing them
-through the container's network namespace would buy us
-nothing). The user's own tooling is project-level, and that's
-the container's entire job.
+runtimes hit remote APIs from the host (the container's network
+namespace would buy nothing).
 
 There is **no persistent moon-ide process inside the container**
-— no agent, no socket, no companion daemon. Every
-container-side process is either the user's (a shell, a build,
-an LSP they configured) or a short-lived `docker exec` the host
-kicks off on demand. The container is a sandbox the IDE shells
-into; it is not a place the IDE lives. If a future workload
-genuinely benefits from a sandboxed long-running companion (a
-moon-core-as-server for cross-repo indexing, an agent runner we
-want network-isolated, etc.) it'll be a separately-introduced
-process colocated with the project tooling — and that decision
-gets made when the use case shows up, not before.
+— no agent, no socket, no companion daemon. Every container-side
+process is the user's (shell, build, LSP) or a short-lived
+`docker exec` the host kicks off on demand. A future sandboxed
+long-running companion (moon-core-as-server for indexing, a
+network-isolated agent runner) would be introduced explicitly
+when the use case shows up.
 
 ### When the project _is_ moon-ide
 
 moon-ide is itself a Tauri app, so its build matrix is
-platform-coupled in a way most workspaces aren't. The shape:
+platform-coupled in a way most workspaces aren't:
 
-- The moon-ide binary the contributor launches is **host-native**
-  on every platform. The webview it loads at startup is a
-  system library: WebKitGTK on Linux, WKWebView on macOS.
-- The platform-native toolchain that produces that binary (Rust
-  - bun + the platform's webview dev headers + the platform's
-    linker) therefore lives on the host as well — putting it
-    inside a Linux container can't produce a macOS `.app`, and a
-    Linux binary built inside the container would still need
-    WebKitGTK on the host to actually launch.
-- Everything else — project tooling that doesn't care which
-  platform binary the build pipeline targets (rust-analyzer,
-  oxlint, oxfmt, prettier, `bun run check`, tests, the
-  `bun install` step itself) — lives in the container.
+- The launched binary is **host-native** on every platform, and
+  the webview it loads is a system library (WebKitGTK on Linux,
+  WKWebView on macOS).
+- The toolchain producing that binary (Rust + bun + the
+  platform's webview headers + linker) therefore lives on the
+  host: a Linux container can't produce a macOS `.app`, and a
+  Linux binary built inside it still needs host WebKitGTK to
+  launch.
+- Everything platform-agnostic — rust-analyzer, oxlint, oxfmt,
+  prettier, `bun run check`, tests, `bun install` — lives in the
+  container.
 
-Concretely:
-
-- **macOS contributors**: host gets Xcode CLT + rustup + bun +
-  Docker Desktop. macOS provides WebKit. The container handles
-  project tooling and (if needed) the cross-built Linux artefact.
-- **Linux contributors**: host gets WebKitGTK dev libraries
-  (`libwebkit2gtk-4.1-dev` + the rest listed in the
-  [README](../README.md#linux)) + rustup + bun + Docker Engine.
-  The container handles project tooling. WebKitGTK can't move
-  into the container because the binary needs it at launch on
-  the host.
-
-In practice the moon-ide repo's `package.json` and `Cargo.toml`
-work the same on both — Tauri's CLI picks the platform target
-automatically based on whoever's running the build. The
-container is the equaliser for everything _around_ that build.
+So macOS contributors put Xcode CLT + rustup + bun + Docker
+Desktop on the host (macOS provides WebKit); Linux contributors
+put WebKitGTK dev libraries
+([README](../README.md#linux)) + rustup + bun + Docker Engine
+on the host. Tauri's CLI picks the platform target
+automatically; the container is the equaliser for everything
+_around_ the build.
 
 ## Path mapping
 
@@ -990,12 +896,10 @@ their listeners on `0.0.0.0` already; that's why the side-
 container path through `mongodb://mongo:27017` worked without
 the `--host` ceremony.
 
-A future iteration could side-step this by chaining a second
-sidecar in `--network container:dev` mode that bridges dev's
-loopback onto its bridge IP, but it's two containers per
-workspace and the `--host` workaround is one-line in every
-mainstream framework. Hardcode the loopback-only contract,
-configure later.
+A second sidecar in `--network container:dev` mode could bridge
+dev's loopback onto its bridge IP, but that's two containers per
+workspace versus a one-line `--host` flag. Hardcode the
+loopback-only contract; configure later.
 
 ### What's not in scope
 
@@ -1080,13 +984,11 @@ build time. That keeps the first `git fetch` from prompting
 because non-interactive `docker exec` invocations would fail
 that prompt outright.
 
-The forward is re-evaluated every time `compose.yaml` is
-written (first set up, folder add/remove, `Rebuild`). Starting
-an agent after the IDE is already open means the user has to
-hit `Rebuild` to recreate the dev container with the mount in
-place. We accept that — Phase 2 doesn't have the lifecycle
-machinery to hot-swap volumes, and the case is rare enough
-that the manual rebuild step isn't a UX wart.
+The forward is re-evaluated on every `compose.yaml` write
+(setup, folder add/remove, `Rebuild`). Starting an agent after
+the IDE is open requires a `Rebuild` to pick up the mount —
+Phase 2 has no volume hot-swap, and the case is rare enough that
+the manual step is fine.
 
 What this **doesn't** do (deferred until somebody asks):
 
@@ -1160,14 +1062,12 @@ What this **doesn't** do (deferred until somebody asks):
 
 ## Git author identity from the host
 
-Without help, a fresh dev container has no git identity at all —
-the first `git commit` (or any tool that calls `git commit`,
-including coder agents) hits `*** Please tell me who you are`.
-Worse, in practice an LLM agent running in the container
-"helpfully" papers over this by running `git config user.email
-…` with whatever placeholder it invented (we've seen `Developer
-/ dev@huggingface.co`), and now commits go out with the wrong
-author until somebody notices.
+A fresh dev container has no git identity, so the first
+`git commit` (including any agent's) hits `*** Please tell me
+who you are`. Worse, an LLM agent tends to paper over this with
+`git config user.email …` and an invented placeholder (we've
+seen `Developer / dev@huggingface.co`), so commits go out with
+the wrong author until someone notices.
 
 moon-ide closes that gap by **carrying the host's
 `git config --global user.{name,email}` into the container as
@@ -1272,16 +1172,12 @@ token resolves fresh on each render — so `Rebuild container`
 after a host-side `gh auth refresh` picks up the new
 credentials.
 
-The token ends up in plaintext in the generated
-`compose.yaml` under
-`<dirs::data_local_dir>/moon-ide/workspaces/<id>/`. The state
-dir is the user's own data directory, not checked into any
-repo, and the trade-off — versus asking the user to re-login
-per-workspace — favours just-works auth in the team-of-one-
-dev-machine setting moon-ide targets. If a teammate is
-concerned about the on-disk footprint they can `gh auth
-logout` and skip the token forward entirely; the bind mount
-keeps preferences working.
+The token lands in plaintext in the generated `compose.yaml`
+under `<dirs::data_local_dir>/moon-ide/workspaces/<id>/` — the
+user's own data dir, not in any repo. The trade-off favours
+just-works auth over per-workspace re-login; anyone worried
+about the on-disk footprint can `gh auth logout` to skip the
+token (the bind mount still carries preferences).
 
 If `gh auth token` exits non-zero (the user has never
 logged in, or the `gh` binary isn't on `$PATH`), the
@@ -1363,12 +1259,10 @@ Mechanism, end to end:
   variables unset and falls back to git's standard "no editor
   configured" behaviour.
 
-  This is deliberate: setting `$GIT_EDITOR` workspace-wide would
-  make a `git commit --amend` somewhere deep in an LSP's
-  hypothetical commit hook silently block on a tab nobody's
-  going to open. Scoping the forward to interactive terminals
-  means a forwarded edit always corresponds to a user sitting at
-  a tab waiting for it.
+  Setting `$GIT_EDITOR` workspace-wide would let some background
+  `git commit --amend` block on a tab nobody opens. Scoping the
+  forward to interactive terminals means a forwarded edit always
+  has a user waiting at a tab.
 
 In-IDE UX:
 
@@ -1451,26 +1345,21 @@ trait WorkspaceHost: Send + Sync {
   the host can watch a bind-mounted directory; the container's
   writes are reflected instantly.
 
-This deliberately doesn't use the in-container agent injection
-model the old `specs/devcontainers.md` sketched (now
-`moon-remote`, see [ADR 0011](decisions/0011-rename-moon-agent-to-moon-remote.md)).
-That model is correct for **remote** hosts where there's no
-shared filesystem (SSH, Codespaces) and is preserved as the
-future `RemoteHost` variant. For local containers, bind-mount
+This deliberately avoids the in-container agent injection model
+the old `specs/devcontainers.md` sketched (now `moon-remote`,
+see [ADR 0011](decisions/0011-rename-moon-agent-to-moon-remote.md)).
+That model is right for **remote** hosts with no shared
+filesystem (SSH, Codespaces) and is kept as the future
+`RemoteHost` variant; for local containers, bind-mount + exec is
+simpler, faster, and ships no static-musl binary into the user's
+container.
 
-- exec is simpler, faster, and avoids shipping a static-musl
-  binary into the user's container.
-
-What this looks like for terminals (Phase 3): the IDE
-allocates a host-side PTY via `portable-pty` and bridges it
-to a `docker exec -it <container> <user-shell>`. One
-`docker exec` per terminal pane; closing the pane terminates
-the exec, which reaps the inner shell as its child. There's
-no shared listener inside the container, no socket to
-multiplex, no terminal server. The same pattern applies to
-LSP launches (Phase 4) and lint/format sidecars (Phase 8) —
-they're all just `docker exec`s parented to host-side
-process handles.
+For terminals (Phase 3): a host-side `portable-pty` PTY bridges
+to one `docker exec -it <container> <shell>` per pane; closing
+the pane terminates the exec and reaps the shell. No shared
+listener, no socket multiplexing, no terminal server. LSP
+launches (Phase 4) and lint/format sidecars (Phase 8) follow the
+same pattern — `docker exec`s parented to host-side handles.
 
 ## Frontend ↔ backend boundary
 
