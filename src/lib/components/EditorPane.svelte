@@ -30,8 +30,17 @@
 	// one derived, recomputed atomically on every active-path /
 	// openFiles / mode change — no intermediate edge to go stale.
 	const view = $derived.by(() => {
+		// Read both signals unconditionally and up front. An earlier
+		// version returned early when `path === null`, which meant the
+		// derived never subscribed to `openFiles` on that run — so when
+		// a freshly-opened folder later populated `openFiles` +
+		// `leftActive`, nothing re-ran this derived and the body stayed
+		// frozen on the empty state until a folder swap rebuilt the
+		// graph. Touching `openFiles` every run keeps the subscription
+		// alive regardless of which branch we take.
+		const openFiles = workspace.openFiles;
 		const path = side === 'left' ? workspace.leftActive : workspace.rightActive;
-		const file = path === null ? null : (workspace.openFiles.find((f) => f.path === path) ?? null);
+		const file = path === null ? null : (openFiles.find((f) => f.path === path) ?? null);
 		if (file === null) {
 			return { path, file: null, kind: 'welcome' as const };
 		}

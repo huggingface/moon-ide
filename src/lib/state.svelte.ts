@@ -635,13 +635,28 @@ class WorkspaceState {
 	 * active — proxied reads return defaults, proxied writes are
 	 * silent no-ops.
 	 */
-	private activeFolderState: FolderState | null = $derived.by(() => {
+	// Plain getter, deliberately *not* a `$derived`. A cached
+	// `$derived<FolderState>` was the source of a nasty stale-read
+	// bug: a consumer (e.g. `EditorPane`'s view derived) would read
+	// `workspace.leftActive` → `activeFolderState.leftActive`, but if
+	// `activeFolderState`'s cached object reference lagged the
+	// folder/map state for a tick, the consumer ended up subscribed
+	// to the wrong `FolderState` instance's field — so a later
+	// `setActive` mutating the *correct* instance never notified it,
+	// and the editor body froze on the old buffer until a folder
+	// swap rebuilt the graph. Resolving the lookup inline on every
+	// access means each caller subscribes directly to
+	// `activeFolderPath` + the `folderStates` map entry + the leaf
+	// `$state` field it reads — no intermediate cached reference to
+	// desync. The map lookup is O(1) and these getters aren't hot
+	// enough for the allocation-free derived to matter.
+	private get activeFolderState(): FolderState | null {
 		const path = this.activeFolderPath;
 		if (path === null) {
 			return null;
 		}
 		return this.folderStates.get(path) ?? null;
-	});
+	}
 
 	// Per-folder accessor proxies. Components (and most methods on
 	// this class) keep reaching for `workspace.openFiles` etc. — those
@@ -778,10 +793,18 @@ class WorkspaceState {
 	activePath: string | null = $derived(this.focusedSide === 'left' ? this.leftActive : this.rightActive);
 
 	activeFile: OpenFile | null = $derived.by(() => {
-		if (this.activePath === null) {
+		// Read `openFiles` before the early-out so this derived stays
+		// subscribed to the buffer list even when there's no active
+		// path yet (fresh folder open). Otherwise a later populate of
+		// `openFiles` + `activePath` wouldn't re-run this derived and
+		// every consumer would keep seeing `null`. See the matching
+		// note in `EditorPane.svelte`'s `view` derived.
+		const openFiles = this.openFiles;
+		const path = this.activePath;
+		if (path === null) {
 			return null;
 		}
-		return this.openFiles.find((f) => f.path === this.activePath) ?? null;
+		return openFiles.find((f) => f.path === path) ?? null;
 	});
 
 	/**
