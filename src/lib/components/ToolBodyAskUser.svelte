@@ -224,34 +224,43 @@
 		<pre class="block">{fmtJson(result)}</pre>
 	{/if}
 {:else}
-	<!-- In flight: the interactive prompt. -->
+	<!-- In flight: the interactive prompt. Free-flowing — no inner
+	     boxes, full-width option rows the width of the message
+	     column, a radio (single-select) or checkbox (multi-select)
+	     glyph per row. -->
 	<div class="ask-form" class:submitting={submitting || submitted}>
 		{#each questions as q (q.id)}
 			<div class="ask-question">
 				<div class="ask-question-text">{q.question}</div>
-				<div class="ask-options">
+				<div class="ask-options" role={q.allow_multiple ? 'group' : 'radiogroup'}>
 					{#each q.options as opt (opt.id)}
 						<button
 							type="button"
 							class="ask-option"
 							class:selected={isSelected(q.id, opt.id)}
+							role={q.allow_multiple ? 'checkbox' : 'radio'}
+							aria-checked={isSelected(q.id, opt.id)}
 							disabled={submitting || submitted}
 							onclick={() => onOptionClick(q, opt.id)}
 						>
-							{#if q.allow_multiple}<span class="ask-check" aria-hidden="true"
-									>{isSelected(q.id, opt.id) ? '☑' : '☐'}</span
-								>{/if}
-							{opt.label}
+							<span class="ask-marker" class:multi={q.allow_multiple} aria-hidden="true"></span>
+							<span class="ask-option-label">{opt.label}</span>
 						</button>
 					{/each}
 				</div>
-				<textarea
+				<input
 					class="ask-custom"
-					rows="1"
+					type="text"
 					placeholder="Or type a custom answer…"
 					bind:value={textByQuestion[q.id]}
 					disabled={submitting || submitted}
-				></textarea>
+					onkeydown={(e) => {
+						if (e.key === 'Enter') {
+							e.preventDefault();
+							void submit();
+						}
+					}}
+				/>
 			</div>
 		{/each}
 		<!-- Confirm button shown for multi-question prompts, multi-
@@ -273,17 +282,19 @@
 {/if}
 
 <style>
+	/* Free-flowing layout: no card background of its own (the row
+	   already provides one), full message-column width, generous
+	   vertical rhythm so a multi-question prompt reads like a form
+	   rather than a cramped popover. */
 	.ask-form {
 		display: flex;
 		flex-direction: column;
-		gap: 12px;
-		margin-top: 4px;
-		padding: 8px;
-		background: var(--m-bg);
-		border-radius: 4px;
+		gap: 14px;
+		margin-top: 6px;
 	}
 	.ask-form.submitting {
-		opacity: 0.7;
+		opacity: 0.6;
+		pointer-events: none;
 	}
 	.ask-question {
 		display: flex;
@@ -294,51 +305,81 @@
 		font-size: 12px;
 		font-weight: 500;
 		color: var(--m-fg);
+		line-height: 1.4;
 	}
+	/* Options stack vertically, each row spanning the full width —
+	   long labels wrap inside the row instead of being squeezed into
+	   a pill. */
 	.ask-options {
 		display: flex;
-		flex-wrap: wrap;
-		gap: 6px;
+		flex-direction: column;
+		gap: 3px;
 	}
 	.ask-option {
-		display: inline-flex;
-		align-items: center;
-		gap: 5px;
-		padding: 4px 10px;
+		display: flex;
+		align-items: flex-start;
+		gap: 8px;
+		width: 100%;
+		box-sizing: border-box;
+		padding: 6px 8px;
 		font-size: 12px;
+		line-height: 1.4;
+		text-align: left;
 		color: var(--m-fg);
-		background: var(--m-bg-raised, var(--m-bg));
-		border: 1px solid var(--m-border);
-		border-radius: 4px;
+		background: transparent;
+		border: none;
+		border-radius: 5px;
 		cursor: pointer;
 	}
 	.ask-option:hover:not(:disabled) {
-		border-color: var(--m-accent);
-	}
-	.ask-option.selected {
-		border-color: var(--m-accent);
-		background: color-mix(in srgb, var(--m-accent) 18%, var(--m-bg));
-		color: var(--m-accent);
-		font-weight: 500;
+		background: var(--m-bg-hover, color-mix(in srgb, var(--m-fg) 6%, transparent));
 	}
 	.ask-option:disabled {
 		cursor: default;
 	}
-	.ask-check {
-		font-family: var(--m-font-mono, ui-monospace, monospace);
+	/* Radio (single-select) / checkbox (multi-select) marker drawn
+	   as a small box so the row reads as a real choice control. */
+	.ask-marker {
+		flex: 0 0 auto;
+		width: 13px;
+		height: 13px;
+		margin-top: 1px;
+		border: 1.5px solid var(--m-border-strong, var(--m-border));
+		border-radius: 50%;
+		box-sizing: border-box;
+	}
+	.ask-marker.multi {
+		border-radius: 3px;
+	}
+	.ask-option.selected .ask-marker {
+		border-color: var(--m-accent);
+		background: radial-gradient(circle at center, var(--m-accent) 0 4px, transparent 4px);
+	}
+	.ask-option.selected .ask-marker.multi {
+		background: var(--m-accent);
+	}
+	.ask-option.selected .ask-option-label {
+		color: var(--m-accent);
+		font-weight: 500;
+	}
+	.ask-option-label {
+		flex: 1 1 auto;
+		min-width: 0;
 	}
 	.ask-custom {
 		width: 100%;
 		box-sizing: border-box;
-		resize: vertical;
-		min-height: 1.8em;
-		padding: 4px 6px;
+		margin-top: 2px;
+		padding: 5px 8px;
 		font-size: 12px;
 		font-family: inherit;
 		color: var(--m-fg);
-		background: var(--m-bg-raised, var(--m-bg));
+		background: var(--m-bg);
 		border: 1px solid var(--m-border);
-		border-radius: 4px;
+		border-radius: 5px;
+	}
+	.ask-custom::placeholder {
+		color: var(--m-fg-subtle);
 	}
 	.ask-custom:focus {
 		outline: none;
@@ -348,6 +389,7 @@
 		display: flex;
 		align-items: center;
 		gap: 10px;
+		margin-top: 2px;
 	}
 	.ask-submit {
 		padding: 5px 14px;
@@ -356,7 +398,7 @@
 		color: var(--m-accent-fg, #fff);
 		background: var(--m-accent);
 		border: none;
-		border-radius: 4px;
+		border-radius: 5px;
 		cursor: pointer;
 	}
 	.ask-submit:disabled {
@@ -368,19 +410,16 @@
 		color: var(--m-fg-subtle);
 		font-style: italic;
 	}
+	/* Settled summary: also free-flowing, no box. */
 	.ask-settled {
 		font-size: 12px;
 		color: var(--m-fg-subtle);
-		padding: 6px 8px;
-		background: var(--m-bg);
-		border-radius: 4px;
+		margin-top: 4px;
 	}
 	.ask-summary {
 		list-style: none;
-		margin: 4px 0 0;
-		padding: 6px 8px;
-		background: var(--m-bg);
-		border-radius: 4px;
+		margin: 6px 0 0;
+		padding: 0;
 		display: flex;
 		flex-direction: column;
 		gap: 6px;
@@ -388,7 +427,7 @@
 	.ask-summary li {
 		display: flex;
 		flex-direction: column;
-		gap: 2px;
+		gap: 1px;
 		font-size: 12px;
 	}
 	.ask-q {

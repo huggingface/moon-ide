@@ -497,6 +497,26 @@ impl CoderState {
 		let (rt, id) = fs.visible_runtime().await;
 		Ok((rt, id, folder_path))
 	}
+
+	/// Find the mounted runtime — in **any** folder — that's holding
+	/// an `ask_user` prompt parked under `call_id`. The prompt lives
+	/// on whichever session originated it, which may no longer be
+	/// the visible session (the user switched away to do something
+	/// else, then came back to answer). Scanning every folder's
+	/// runtimes keeps "answer later, from anywhere" working without
+	/// the caller having to know which session owns the prompt.
+	async fn runtime_holding_prompt(&self, call_id: &str) -> Option<Arc<SessionRuntime>> {
+		let folders: Vec<Arc<FolderSession>> = self.sessions_by_folder.read().await.values().cloned().collect();
+		for fs in folders {
+			let runtimes: Vec<Arc<SessionRuntime>> = fs.runtimes.read().await.values().cloned().collect();
+			for rt in runtimes {
+				if rt.prompts.holds(call_id).await {
+					return Some(rt);
+				}
+			}
+		}
+		None
+	}
 }
 
 impl CoderHandle {
@@ -1588,6 +1608,31 @@ impl CoderHandle {
 				content: sessions::INTERRUPTED_TOOL_RESULT_JSON.to_string(),
 			});
 		}
+		// When this session has a **live turn** still parked on an
+		// `ask_user` prompt (the user switched away and came back),
+		// the parked tool call looks like an orphan on disk — its
+		// matching `Tool` record isn't written until the prompt
+		// resolves. But it isn't interrupted: it's waiting for the
+		// human. Collect those live-parked ids so the replay below
+		// re-renders their interactive card (via the Assistant
+		// record's `tool_call` event) instead of slapping an
+		// "Interrupted before tool completed" result on them. Empty
+		// for the common reopen / cold-start case.
+		let live_parked_ids: std::collections::HashSet<String> = if already_mounted {
+			if let Some(rt) = fs.runtime(&id).await {
+				let mut set = std::collections::HashSet::new();
+				for orphan_id in &orphan_tool_call_ids {
+					if rt.prompts.holds(orphan_id).await {
+						set.insert(orphan_id.clone());
+					}
+				}
+				set
+			} else {
+				std::collections::HashSet::new()
+			}
+		} else {
+			std::collections::HashSet::new()
+		};
 		let summary = SessionSummary {
 			id: header.id.clone(),
 			title: header.title.clone(),
@@ -1731,6 +1776,13 @@ impl CoderHandle {
 		// `is_error: true`, so the rendering is identical to a
 		// genuinely-failed tool.
 		for orphan_id in orphan_tool_call_ids {
+			// A live-parked `ask_user` prompt is not interrupted —
+			// it's still waiting for the user. Leave its card in the
+			// interactive "waiting" state the replayed `tool_call`
+			// (from the Assistant record) already put it in.
+			if live_parked_ids.contains(&orphan_id) {
+				continue;
+			}
 			replay_events.push(CoderEvent::ToolResult {
 				id: orphan_id,
 				result: serde_json::json!({ "error": "Interrupted before tool completed." }),
@@ -2137,7 +2189,10 @@ impl CoderHandle {
 	/// no-op the panel can ignore — the row will settle off the
 	/// `tool_result` event either way.
 	pub async fn respond_to_prompt(&self, call_id: &str, response: PromptResponse) -> bool {
-		let Ok((rt, _, _)) = self.state.active_visible_runtime().await else {
+		// Resolve against whichever session actually owns the prompt,
+		// not the visible one — the user may have switched sessions
+		// (e.g. to report progress elsewhere) and come back to answer.
+		let Some(rt) = self.state.runtime_holding_prompt(call_id).await else {
 			return false;
 		};
 		rt.prompts.resolve(call_id, PromptOutcome::Answered(response)).await

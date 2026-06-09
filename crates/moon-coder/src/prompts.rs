@@ -39,7 +39,7 @@ pub fn ask_user_tool_definition() -> ToolDefinition {
 		"ask_user",
 		"Pause and ask the user one or more multiple-choice questions, then wait for their answer before continuing. \
 \
-You can ask several questions at once; each gets its own set of options. The user is **always** able to type a custom free-form answer instead of (or in addition to) picking an option, and they can also choose to skip the questions entirely and just keep typing in the composer — in which case you'll get a `skipped` result and should continue with whatever they say next. Phrase questions so the listed options cover the common cases but a custom answer still makes sense.",
+Be terse. A brief lead-in message before the call is fine (the user reads it), but don't dump a long analysis and don't repeat that lead-in inside the question. Each question is one short sentence; each option label is a short phrase (a few words), not a paragraph. You can ask several questions at once; each gets its own set of options. The user can always type a custom free-form answer, and can skip the whole prompt by sending a normal message instead — you'll get a `skipped` result, so read their next message and continue.",
 		json!({
 			"type": "object",
 			"properties": {
@@ -189,6 +189,14 @@ impl PromptRegistry {
 	/// normal steer path.
 	pub async fn has_pending(&self) -> bool {
 		!self.pending.lock().await.is_empty()
+	}
+
+	/// `true` when a prompt is parked under exactly `tool_call_id`.
+	/// Used to locate the runtime that owns a given prompt when the
+	/// answering panel may not be the visible session anymore (the
+	/// user switched sessions, then came back to answer).
+	pub async fn holds(&self, tool_call_id: &str) -> bool {
+		self.pending.lock().await.contains_key(tool_call_id)
 	}
 }
 

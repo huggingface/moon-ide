@@ -3185,14 +3185,12 @@
 		border-radius: 6px;
 		padding: 4px 8px;
 	}
-	/* `ask_user` renders an always-open card (no `<details>`), with a
-	   header line mirroring the collapsed tool summary's shape so it
-	   reads as part of the same family while staying actionable. */
+	/* `ask_user` renders an always-open prompt (no `<details>`,
+	   no heavy box) so it flows in the transcript like an assistant
+	   message rather than a collapsed tool row. Just a thin header
+	   line for identity, then the free-flowing form below. */
 	.row.tool.ask-user {
 		font-size: 12px;
-		background: var(--m-bg-overlay);
-		border-radius: 6px;
-		padding: 6px 8px;
 	}
 	.row.tool.ask-user .ask-user-header {
 		display: flex;

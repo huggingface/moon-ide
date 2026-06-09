@@ -685,11 +685,33 @@ between the loop and the panel. The runner parks a
    returns `Aborted` — the usual interrupted-tool recovery applies,
    no half-state for the model to puzzle over.
 
-Concurrency: only one `ask_user` call is parked at a time (the loop
-is single-turn-at-a-time and `ask_user` blocks the turn). The
-registry still keys by `tool_call_id` so a stale resolve (double-
-click, or a response racing the skip) targets the exact call and a
-mismatched id is a no-op rather than resolving the wrong prompt.
+Concurrency: only one `ask_user` call is parked at a time per
+session (the loop is single-turn-at-a-time and `ask_user` blocks the
+turn). The registry keys by `tool_call_id` so a stale resolve
+(double-click, or a response racing the skip) targets the exact call
+and a mismatched id is a no-op rather than resolving the wrong
+prompt.
+
+**Answer later, from anywhere.** The parked prompt lives on its
+session's `SessionRuntime`, which is a _background_ turn the moment
+the user navigates away — switching sessions, browsing another
+folder, or popping out to report progress doesn't cancel it. Two
+properties make "come back and answer" robust:
+
+- `coder_respond_to_prompt` resolves against the runtime that
+  actually _holds_ the prompt (`CoderState::runtime_holding_prompt`
+  scans every mounted runtime by `tool_call_id`), not the currently-
+  visible session. So the answer reaches the right parked oneshot
+  even if the user switched sessions in between.
+- `open_session`'s reload path treats a live-parked `ask_user` call
+  specially: when the session is `already_mounted` (its turn is
+  still running) and the orphan tool-call scanner flags the parked
+  `ask_user` id, replay **skips** the synthetic "Interrupted before
+  tool completed" `ToolResult` for it. The replayed `tool_call`
+  event (off the Assistant record) re-renders the interactive card
+  in its waiting state instead of painting it errored. Without this,
+  clicking back into a session with a pending prompt would
+  permanently kill the prompt.
 
 System-prompt guidance: the base prompt tells the agent **not** to
 use `ask_user` for clarification it could resolve by reading files,
