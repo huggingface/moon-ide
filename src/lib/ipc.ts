@@ -40,6 +40,7 @@ import type {
 	ImageAttachmentPayload,
 	UnqueuedSteer,
 	RevertedMessage,
+	PromptResponse,
 	LogEntry,
 	LogLevel,
 	LspCodeAction,
@@ -364,6 +365,8 @@ export const ipc = {
 			invoke<string>('coder_suggest_terminal_command', { request, targetKind, cwd }),
 		abort: () => invoke<void>('coder_abort'),
 		unqueueSteer: (id: string) => invoke<UnqueuedSteer | null>('coder_unqueue_steer', { id }),
+		respondToPrompt: (callId: string, response: PromptResponse) =>
+			invoke<boolean>('coder_respond_to_prompt', { callId, response }),
 		revertToMessage: (userOrdinal: number) => invoke<RevertedMessage>('coder_revert_to_message', { userOrdinal }),
 		listSessions: () => invoke<CoderSessionSummary[]>('coder_list_sessions'),
 		activeSession: () => invoke<CoderSessionSummary | null>('coder_active_session'),

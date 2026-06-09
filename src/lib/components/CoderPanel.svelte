@@ -13,6 +13,7 @@
 	import CoderModelSettingsModal from './CoderModelSettingsModal.svelte';
 	import HfBucketSettingsModal from './HfBucketSettingsModal.svelte';
 	import CoderThinking from './CoderThinking.svelte';
+	import ToolBodyAskUser from './ToolBodyAskUser.svelte';
 	import ToolBodyEditFile from './ToolBodyEditFile.svelte';
 	import ToolBodyGrep from './ToolBodyGrep.svelte';
 	import ToolBodyListDir from './ToolBodyListDir.svelte';
@@ -2225,6 +2226,21 @@
 				{/if}
 			</div>
 		{/if}
+	{:else if row.kind === 'tool' && row.name === 'ask_user'}
+		<!-- `ask_user` is interactive and must stay visible + actionable
+		     while the call is in flight — so it renders an always-open
+		     card rather than the collapsed `<details>` every other tool
+		     row uses (whose body is lazy-mounted only on first expand).
+		     The card itself flips to a read-only summary once the
+		     `tool_result` lands (answered or skipped). -->
+		<div class="row tool ask-user" class:err={row.isError}>
+			<div class="ask-user-header">
+				<span class="tool-dot" class:running={!row.hasResult} class:err={row.isError} aria-hidden="true"></span>
+				<span class="tool-name">ask_user</span>
+				<span class="tool-status">{!row.hasResult ? 'waiting for you…' : row.isError ? 'error' : 'done'}</span>
+			</div>
+			<ToolBodyAskUser args={row.args} result={row.result} hasResult={row.hasResult} callId={row.id} />
+		</div>
 	{:else if row.kind === 'tool'}
 		{@const subagent = withSubagentCards ? (coder.subagentSummaries.get(row.id) ?? null) : null}
 		{@const elapsedMs = row.hasResult ? (row.durationMs ?? 0) : Math.max(0, nowTick - row.startedAt)}
@@ -3168,6 +3184,23 @@
 		background: var(--m-bg-overlay);
 		border-radius: 6px;
 		padding: 4px 8px;
+	}
+	/* `ask_user` renders an always-open card (no `<details>`), with a
+	   header line mirroring the collapsed tool summary's shape so it
+	   reads as part of the same family while staying actionable. */
+	.row.tool.ask-user {
+		font-size: 12px;
+		background: var(--m-bg-overlay);
+		border-radius: 6px;
+		padding: 6px 8px;
+	}
+	.row.tool.ask-user .ask-user-header {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		color: var(--m-fg-muted);
+		min-height: 18px;
+		line-height: 1.2;
 	}
 	.row.tool details[open] {
 		padding: 6px 8px;

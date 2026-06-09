@@ -1,0 +1,37 @@
+# Test plan 0094: ask_user tool (multi-question prompts)
+
+- **Date**: 2026-05-19
+- **Phase**: Phase 6 — coder (post-6.5 follow-up)
+
+## What shipped
+
+- A new **parent-only** `ask_user` tool the agent can call to pause its turn and ask the user **one or more** multiple-choice questions, then block until the user responds. Args: `{ questions: [{ id, question, options: [{ id, label }], allow_multiple? }] }`. Result: `{ status: "answered", answers: [{ question_id, selected, free_text }] }` or `{ status: "skipped" }`.
+- A custom free-form answer is **always** available per question (textarea under every question) — there's no `allow_other` flag to opt into.
+- Bi-directional flow: the runner parks a `oneshot::Sender<PromptOutcome>` on the session's new `PromptRegistry` (`crates/moon-coder/src/prompts.rs`, on each `SessionRuntime`), keyed by `tool_call_id`, and `await`s it inside a `tokio::select!` against the turn's cancel token.
+- Two resolution paths: (a) the user answers the card → new Tauri command `coder_respond_to_prompt(call_id, response)` fires the oneshot with `Answered`; (b) the user ignores the card and sends a normal composer message → `Coder::send` notices the parked prompt and resolves it with `Skipped`, then the typed message flows through as an ordinary steer/continuation.
+- No new wire event: the panel renders the prompt off the existing `tool_call` row. `ToolBodyAskUser.svelte` is special-cased in `CoderPanel.svelte` to render an **always-open** card (not the collapsed lazy-mounted `<details>` every other tool body uses), since it must stay visible + actionable while the call is in flight. It flips to a read-only summary once the `tool_result` lands.
+- Tool definition lives in `prompts.rs::ask_user_tool_definition()` and is appended only to the parent's tool list (like `task_tool_definition()`), so sub-agents never see it.
+- System prompt gains an `## Asking the user` section telling the model when (genuine forks) and when not (clarification it could read, "should I proceed?" polling) to use it.
+
+## How to test
+
+Prerequisites: `bun install`, signed-in to a coder provider (HF or OpenRouter), at least one workspace folder open.
+
+1. **Single single-select question, click to answer.** Prompt: _"I want to add a config option. Use the `ask_user` tool to ask me whether it should default to on or off."_ Expected: a `tool_call` row named `ask_user` appears as an **open** card (not collapsed) with the question text and two+ option buttons, a "Or type a custom answer…" textarea, and a `waiting for you…` status. Click one option → it submits immediately (single question, single-select), the card flips to a read-only summary line (`<question> · <chosen label>`), the status flips to `done`, and the agent continues using your choice.
+2. **Custom answer.** Run step 1 again but instead of clicking an option, type a custom answer in the textarea and click **Send answer**. Expected: the card settles with your free text in the summary; the model's next message reflects the custom answer (check the tool result in the trace: `free_text` is populated, `selected` empty).
+3. **Multiple questions at once.** Prompt: _"Use ask_user to ask me three things: (a) target Node version, (b) whether to add tests, (c) license."_ Expected: one card with three question blocks, each with its own options + textarea, and a single **Send answer** button (no auto-submit when there's more than one question). Answer all three (mix clicks + a custom answer), click **Send answer**, confirm the agent acknowledges all three. Leave one blank and send → the result omits the blank question (`answers` has only the answered ones), and the model's response should not assume an answer for the skipped one.
+4. **Multi-select question.** Prompt: _"Use ask_user with allow_multiple to ask which test runners to support (vitest, jest, mocha)."_ Expected: that question renders checkboxes (`☐`/`☑`), no auto-submit; pick two, click **Send answer**, confirm both ids land in `selected`.
+5. **Skip by typing in the composer.** Trigger any `ask_user` prompt (step 1). Instead of answering the card, type a normal message in the composer (e.g. _"actually never mind, just pick whatever's idiomatic and move on"_) and press Enter. Expected: the card flips to `Skipped — the user continued with their own message.`, the tool result is `{ status: "skipped" }`, your typed message appears as the next user row, and the agent continues with your instruction (it does **not** wait further).
+6. **Abort while waiting.** Trigger a prompt, then press **Esc** (or close the panel). Expected: the turn aborts cleanly; the row settles as an interrupted/errored tool (same recovery as any other tool interrupted mid-flight). Sending a follow-up prompt does **not** 400 against the provider (orphan recovery synthesised the tool result).
+7. **Sub-agent exclusion.** Ask the agent to spawn a sub-agent and have _it_ ask you a question. Expected: the sub-agent cannot — `ask_user` isn't in its tool list. It should either answer from context or report back, not pause for input.
+8. **Validation.** Craft (via the trace / dev console, or coax the model) an `ask_user` call with a question that has fewer than 2 options, or an empty question id. Expected: `is_error: true` tool result with a clear message (`question ... needs at least 2 options` / `each question needs a non-empty id`); the model self-corrects next turn rather than parking an unrenderable prompt.
+9. **Reopen mid-prompt is not persisted as pending.** While a prompt is parked, switch to another session and back. Expected: the parked prompt is in-memory only; on reopen the replay shows the `tool_call` row but (if the turn was still live in this process) the card is whatever the live state is. After a process restart, the orphan-recovery path applies — no forever-"waiting" card.
+
+## Notes / risks
+
+- The skip path resolves **any** single parked prompt (`PromptRegistry::skip_any`) rather than by id, because `Coder::send` has the session but not the specific call id. Safe because only one prompt is ever parked per session (the loop is single-turn-at-a-time).
+- `coder_respond_to_prompt` returning `false` is a no-op the panel ignores — covers the race where the user clicks an answer just after a skip already resolved the prompt. The row settles off the `tool_result` either way.
+- Project-bar git-status refresh (`bindCoderRefresh`) sees an `ask_user` `tool_call` with no `args.path` and falls back to the all-folders fan-out — harmless (worst case = old behavior), per `specs/coder.md` § Project-bar git status.
+- The prompt block intentionally rides the existing `tool_call` / `tool_result` event pair — no protocol-version bump, no new `CoderEvent` variant.
+
+- Specs: [`specs/coder.md`](../coder.md#ask-user-tool).

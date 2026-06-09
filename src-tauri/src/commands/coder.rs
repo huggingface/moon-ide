@@ -7,7 +7,8 @@
 
 use camino::Utf8PathBuf;
 use moon_coder::{
-	CoderHandle, CoderStatus, DeviceCode, HfIdentity, ImageAttachment, RevertedMessage, SessionSummary, UnqueuedSteer,
+	CoderHandle, CoderStatus, DeviceCode, HfIdentity, ImageAttachment, PromptResponse, RevertedMessage, SessionSummary,
+	UnqueuedSteer,
 };
 use moon_core::app_state as app_state_store;
 use moon_core::session as core_session;
@@ -234,6 +235,24 @@ pub async fn coder_abort(state: State<'_, AppState>) -> Result<(), MoonError> {
 #[tauri::command]
 pub async fn coder_unqueue_steer(state: State<'_, AppState>, id: String) -> Result<Option<UnqueuedSteer>, MoonError> {
 	Ok(state.coder.unqueue_steer(&id).await)
+}
+
+/// Resolve an in-flight `ask_user` prompt on the active folder's
+/// visible session with the user's structured per-question answers.
+/// `call_id` is the tool-call id the panel saw on the prompt's
+/// `tool_call` event. Returns `false` (no-op) when there's no
+/// matching parked prompt — the user already skipped it by sending a
+/// composer message, the turn aborted, or the id is stale. Either
+/// way the row settles off the `tool_result` event. The user can
+/// always skip the prompt entirely by just sending a normal message
+/// instead of answering — that path runs through `coder_send`.
+#[tauri::command]
+pub async fn coder_respond_to_prompt(
+	state: State<'_, AppState>,
+	call_id: String,
+	response: PromptResponse,
+) -> Result<bool, MoonError> {
+	Ok(state.coder.respond_to_prompt(&call_id, response).await)
 }
 
 /// Revert the active folder's visible session to just before its

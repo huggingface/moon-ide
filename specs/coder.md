@@ -532,6 +532,7 @@ implementations are typed Rust:
 | `task`       | `(task, folder?, mode?, system_prompt?) -> { result, sub_session_id, tokens_used_estimate, mode, iterations_used }` | Delegates a self-contained task to a sub-agent and gets back a single summarised string. `folder` defaults to the parent's active folder. `mode` is `"research"` (read-only intent) or `"agent"` (default; full toolkit, same capabilities as the parent). The sub-agent inherits the parent's everyday driver model — there is no per-call model selector. Multiple `task` calls in one assistant message run in parallel (cap: 4 via `Semaphore`). Sub-agents cannot spawn sub-sub-agents — depth=1 cap is enforced by the parent's tool list including `task` while the sub-agent's does not. Available **only** to the top-level parent turn. (Internal Rust types and the `subagent.rs` module keep the `subagent` naming; only the wire/tool name surfaces as `task`.)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `web_search` | `(query, max_results?) -> { query, results, count }`                                                                | Open-web search via Tavily. `results` is a list of `{ title, url, snippet, published_date? }` entries sorted by Tavily's relevance ranking. `max_results` defaults to 8 and is capped at 20. Only advertised to the model when a Tavily API key is configured (model-settings popover → Web search); without a key the tool is hidden from the definitions list so the model never sees an unusable tool. See [§ Web search](#web-search).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `web_fetch`  | `(url) -> { url, markdown, truncated, bytes }`                                                                      | Fetch a single page and return Jina Reader's markdown extraction. `http`/`https` only; other schemes rejected at the boundary. Body capped at 200 kB — past that, `truncated: true` and the tail is dropped. Always available (Jina's free tier needs no key). Sub-agents in both modes can call it — fetching docs is read-only, no mutation risk. See [§ Web search](#web-search).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `ask_user`   | `(questions[{ id, question, options[{ id, label }], allow_multiple? }]) -> { status, answers? }`                    | Pause the turn and ask one or more multiple-choice questions, then **block** until the user answers (`status: "answered"`, with `answers[]`) or skips by sending a composer message (`status: "skipped"`). A custom free-form answer is always available per question. Bi-directional: the runner parks a `oneshot` on the session's [`PromptRegistry`](../crates/moon-coder/src/prompts.rs) and the panel resolves it via `coder_respond_to_prompt`. Parent-only (not advertised to sub-agents). See [§ Asking the user](#ask-user-tool).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 
 Tools that arrive **as separate commits when proven needed**, not
 in the initial slice:
@@ -548,7 +549,6 @@ in the initial slice:
   Useful so the agent can drop the user at the right place after
   a refactor.
 - `todo_write` — see [§ Todo list](#todo-list-tool).
-- `ask_user` — see [§ Asking the user](#ask-user-tool).
 
 ### Todo list tool
 
@@ -628,48 +628,77 @@ content>` when there's an item in flight, falling back to
 
 ### Ask user tool
 
-`ask_user` lets the agent pause its turn and ask the user a
-multiple-choice question. The natural use case is the moment
-where the agent legitimately doesn't know which of two valid
-paths to take and asking the human is cheaper than guessing
-wrong twice. Inspired by Cursor's `AskQuestion` shape.
+`ask_user` lets the agent pause its turn and ask the user **one or
+more** multiple-choice questions, then wait for the answer before
+continuing. The natural use case is the moment where the agent
+legitimately doesn't know which of several valid paths to take and
+asking the human is cheaper than guessing wrong twice. Inspired by
+Cursor's `AskQuestion` shape, generalised to a batch of questions.
+It's a **parent-only** tool (appended to the parent turn's tool
+list like `task`, never advertised to sub-agents — pausing for the
+human only makes sense where there's a panel + composer to answer
+through).
 
-| Field            | Type              | Notes                                                                                 |
-| ---------------- | ----------------- | ------------------------------------------------------------------------------------- |
-| `question`       | `string`          | What the agent wants to know. Rendered as the prompt text.                            |
-| `options`        | `[{ id, label }]` | Buttons the user can click. At least 2.                                               |
-| `allow_other`    | `bool`            | When `true`, an "Other…" textarea is shown alongside the buttons. Default `true`.     |
-| `allow_multiple` | `bool`            | Multi-select with a confirm button. Default `false` (single-select submits on click). |
+Args (`questions[]`, at least one entry):
 
-Wire shape: this is the first tool that needs **bi-directional**
-flow between the loop and the panel. The runner blocks the tool
-call on a `oneshot::Receiver<UserChoice>`:
+| Field            | Type              | Notes                                                                                        |
+| ---------------- | ----------------- | -------------------------------------------------------------------------------------------- |
+| `id`             | `string`          | Stable per-question id the agent assigns; answers are keyed back to it. Required, unique.    |
+| `question`       | `string`          | The question text shown to the user.                                                         |
+| `options`        | `[{ id, label }]` | Buttons the user can click. At least 2 per question.                                         |
+| `allow_multiple` | `bool`            | Multi-select (checkboxes + confirm) when `true`; single-select (click submits) when `false`. |
 
-1. Loop emits a normal `tool_call` event with `name: "ask_user"`.
-2. Frontend renders the prompt block with buttons (and the
-   "Other" textarea when allowed).
-3. User clicks an option → the panel calls a new Tauri command
-   `coder_respond_to_prompt(call_id, response)`.
-4. The backend resolves the oneshot; the tool returns
-   `{ choice: { id, label, free_text? } }`; the loop emits the
-   matching `tool_result` event and continues.
-5. If the user aborts the turn (or closes the panel) before
-   responding, the cancellation token short-circuits the
-   oneshot and the tool returns `Aborted` — no half-state for
-   the model to puzzle over.
+There is **no `allow_other` flag** — a custom free-form answer is
+_always_ available (a textarea under every question), so the agent
+doesn't need to opt into it. The prompt tells the agent to phrase
+questions so the listed options cover the common cases but a custom
+answer still makes sense.
 
-Concurrency: only one `ask_user` call is in flight at a time
-(the loop is single-turn-at-a-time and `ask_user` blocks the
-turn). A second call before the first resolves is a loop bug;
-the runner asserts on it rather than queueing.
+Wire shape: this is the one tool that needs **bi-directional** flow
+between the loop and the panel. The runner parks a
+`oneshot::Sender<PromptOutcome>` on the session's
+[`PromptRegistry`](../crates/moon-coder/src/prompts.rs) (keyed by
+`tool_call_id`) and `await`s the matching receiver:
 
-System-prompt guidance: the base prompt tells the agent **not**
-to use `ask_user` for clarification it could resolve by reading
-files. The tool is for genuine forks where the user's intent is
-the missing input — "rename it across the codebase or just
-locally?", "delete the old file or keep it for compat?". The
-prompt explicitly discourages "should I proceed?"-style polling
-because that turns the agent into a confirmation maze.
+1. Loop emits a normal `tool_call` event with `name: "ask_user"`
+   (no new event kind — the panel renders the prompt off the
+   existing `tool_call` row via `ToolBodyAskUser.svelte`, which is
+   special-cased to render an **always-open** card rather than the
+   collapsed lazy-mounted `<details>` every other tool body uses).
+2. The user resolves it one of **two** ways:
+   - **Answer the card.** Per-question option clicks + optional
+     custom text, then the panel calls `coder_respond_to_prompt(call_id, response)`.
+     The backend fires the oneshot with `PromptOutcome::Answered`;
+     the tool returns `{ status: "answered", answers: [{ question_id, selected, free_text }] }`.
+     Unanswered questions are simply omitted from `answers`.
+   - **Skip and keep typing.** The user ignores the card and sends
+     a normal composer message. `Coder::send` notices a prompt is
+     parked, resolves it with `PromptOutcome::Skipped`, and the
+     typed message proceeds as an ordinary steer/continuation. The
+     tool returns `{ status: "skipped" }` so the model knows to read
+     the user's next message instead of an answer.
+3. The loop emits the matching `tool_result` event either way and
+   continues. The card flips to a read-only summary on settle.
+4. If the user aborts the turn (or closes the panel) before
+   responding, the turn's cancel token short-circuits the
+   `tokio::select!`, the parked sender is cleaned up, and the tool
+   returns `Aborted` — the usual interrupted-tool recovery applies,
+   no half-state for the model to puzzle over.
+
+Concurrency: only one `ask_user` call is parked at a time (the loop
+is single-turn-at-a-time and `ask_user` blocks the turn). The
+registry still keys by `tool_call_id` so a stale resolve (double-
+click, or a response racing the skip) targets the exact call and a
+mismatched id is a no-op rather than resolving the wrong prompt.
+
+System-prompt guidance: the base prompt tells the agent **not** to
+use `ask_user` for clarification it could resolve by reading files,
+and **not** as a "should I proceed?" confirmation (that turns the
+agent into a confirmation maze). The tool is for genuine forks where
+the user's intent is the missing input — "rename it across the
+codebase or just locally?", "delete the old file or keep it for
+compat?". When the agent can reasonably infer the answer, it just
+proceeds.
 
 ### Web search
 
@@ -1562,6 +1591,7 @@ Tauri commands in `src-tauri/src/commands/coder.rs`:
 | `coder_session_jsonl_path(id)`                             | Resolves a session id (parent or sub-agent) to its absolute on-disk JSONL path; powers the panel's `</>` "open trace" affordance, which then opens the file via the host-direct file mechanism (see [test plan 0051](test-plans/0051-open-host-file.md))  |
 | `coder_send(text, mode: "send" \| "steer" \| "follow_up")` | Routes to the loop                                                                                                                                                                                                                                        |
 | `coder_abort()`                                            | Cancels the in-flight loop                                                                                                                                                                                                                                |
+| `coder_respond_to_prompt(call_id, response)`               | Resolves an in-flight `ask_user` prompt on the visible session with the user's structured per-question answers. Returns `false` (no-op) when nothing's parked — the user already skipped via a composer send, the turn aborted, or the id is stale        |
 | `coder_revert_to_message(user_ordinal)`                    | Truncates the visible session to just before its `user_ordinal`-th user message (drops it + everything after) and returns the dropped prompt for an edit-and-resend prefill. Refused mid-turn. See [§ Revert and edit & resend](#revert-and-edit--resend) |
 | `coder_set_model(slug)`                                    | Override on the active session                                                                                                                                                                                                                            |
 | `coder_set_sync_enabled(enabled)`                          | Per-workspace bucket-sync toggle                                                                                                                                                                                                                          |

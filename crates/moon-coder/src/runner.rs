@@ -40,6 +40,7 @@ use crate::inference::{
 	AssistantResponse, ChatMessage, FunctionCall, ImageAttachment, InferenceClient, StreamEvent, TokenUsage,
 };
 use crate::models::{self, CoderModels, ResolvedProvider, SharedCoderModels};
+use crate::prompts::{ask_user_tool_definition, PromptOutcome, PromptResponse};
 use crate::providers::{self, ProviderKeyring};
 use crate::sessions::{
 	self, current_time_ms, new_session_id, session_title_from_prompt, sessions_dir, subagent_session_dir,
@@ -142,6 +143,12 @@ struct CoderState {
 struct SessionRuntime {
 	session: Mutex<Session>,
 	turn: Mutex<TurnState>,
+	/// In-flight `ask_user` prompts parked on a `oneshot`, awaiting
+	/// the human. At most one at a time (the loop is single-turn);
+	/// resolved either by `coder_respond_to_prompt` (the user
+	/// answered the card) or by `send`'s skip path (the user sent a
+	/// normal composer message instead). See [`crate::prompts`].
+	prompts: crate::prompts::PromptRegistry,
 }
 
 impl SessionRuntime {
@@ -149,6 +156,7 @@ impl SessionRuntime {
 		Self {
 			session: Mutex::new(session),
 			turn: Mutex::new(TurnState::default()),
+			prompts: crate::prompts::PromptRegistry::default(),
 		}
 	}
 }
@@ -1841,6 +1849,17 @@ impl CoderHandle {
 			let turn = rt.turn.lock().await;
 			if turn.cancel.is_some() {
 				drop(turn);
+				// If the turn is parked on an `ask_user` prompt, a
+				// composer send is the user's "skip the questions and
+				// keep driving" gesture: resolve the parked prompt
+				// with `Skipped` so the tool returns and the loop
+				// continues, then let the typed message flow through
+				// as a normal steer below. Best-effort — a `false`
+				// return means the prompt resolved between the probe
+				// and now (raced an answer click), which is fine.
+				if rt.prompts.has_pending().await {
+					rt.prompts.skip_any().await;
+				}
 				// Mint the id up here so it's shared between the
 				// `PendingSteer` (the backend's queue handle) and
 				// the `UserMessage` event (the UI's queue handle).
@@ -2107,6 +2126,23 @@ impl CoderHandle {
 		})
 	}
 
+	/// Resolve an in-flight `ask_user` prompt on the active
+	/// folder's visible session with the user's structured answer.
+	///
+	/// `call_id` is the tool-call id the panel saw on the prompt's
+	/// `tool_call` event. Returns `true` when a matching parked
+	/// prompt was found and resolved; `false` when there was nothing
+	/// to resolve (the user already skipped it via a composer send,
+	/// the turn aborted, or the id is stale). A `false` return is a
+	/// no-op the panel can ignore — the row will settle off the
+	/// `tool_result` event either way.
+	pub async fn respond_to_prompt(&self, call_id: &str, response: PromptResponse) -> bool {
+		let Ok((rt, _, _)) = self.state.active_visible_runtime().await else {
+			return false;
+		};
+		rt.prompts.resolve(call_id, PromptOutcome::Answered(response)).await
+	}
+
 	pub fn subscribe(&self) -> broadcast::Receiver<CoderEventEnvelope> {
 		self.state.events.subscribe()
 	}
@@ -2243,6 +2279,11 @@ async fn run_turn(
 	// tool.
 	let mut tool_defs = state.tools.definitions();
 	tool_defs.push(task_tool_definition());
+	// `ask_user` is parent-only too: pausing for the human only
+	// makes sense at the top level where there's a panel + composer
+	// to answer through. Sub-agents (which build their list from the
+	// registry alone) never see it.
+	tool_defs.push(ask_user_tool_definition());
 	// Pin the tool context to the **session's** bound folder
 	// (captured at spawn time), not the live `active_folder()`.
 	// This is what makes "agent keeps running in folder X while
@@ -2759,6 +2800,13 @@ async fn dispatch_tool_calls(
 			});
 			let outcome = if call.function.name == "task" {
 				handle_task(state, rt, sink, cx, cancel, &call.id, &args).await
+			} else if call.function.name == "ask_user" {
+				// Bidirectional: parks a oneshot on the session's
+				// prompt registry and blocks the turn until the user
+				// answers the card, sends a normal composer message
+				// (skip), or aborts. The `tool_call` event already
+				// fired above, so the panel rendered the prompt.
+				handle_ask_user(rt, cancel, &call.id, &args).await
 			} else if call.function.name == "todo_write" {
 				// `todo_write` mutates per-session state owned by
 				// the runner (`Session.todos`), so it doesn't fit
@@ -3025,6 +3073,109 @@ async fn handle_todo_write(rt: &Arc<SessionRuntime>, args: &Value) -> Result<Val
 		}
 	}
 	Ok(json!({ "todos": merged }))
+}
+
+/// Handle an `ask_user` tool call: validate the questions, park a
+/// oneshot on the session's [`crate::prompts::PromptRegistry`] keyed
+/// by `tool_call_id`, then block until the human resolves it.
+///
+/// Three ways the wait ends:
+///
+/// - **Answered** — `coder_respond_to_prompt` fires the oneshot with
+///   the user's structured per-question choices. The tool returns
+///   `{ status: "answered", answers: [...] }` so the model sees
+///   exactly what was picked (option ids + any custom free text).
+/// - **Skipped** — the user ignored the card and sent a normal
+///   composer message; `Coder::send` resolves the oneshot with
+///   [`PromptOutcome::Skipped`]. The tool returns
+///   `{ status: "skipped" }` and the typed message arrives as the
+///   next user turn, so the model continues with the human's new
+///   instruction instead of an answer.
+/// - **Aborted** — the turn's cancel token trips (Esc / panel close
+///   / sign-out). The tool returns [`CoderError::Aborted`], which
+///   the loop turns into the usual interrupted-tool recovery.
+///
+/// Validation is light and mirrors `todo_write`: at least one
+/// question, every question needs a non-empty id and at least two
+/// options, every option needs a non-empty id. A malformed call
+/// comes back as `is_error: true` so the model can fix it next turn
+/// rather than parking a prompt the panel can't render.
+async fn handle_ask_user(
+	rt: &Arc<SessionRuntime>,
+	cancel: &CancellationToken,
+	tool_call_id: &str,
+	args: &Value,
+) -> Result<Value, CoderError> {
+	#[derive(serde::Deserialize)]
+	struct AskUserArgs {
+		questions: Vec<AskUserQuestion>,
+	}
+	#[derive(serde::Deserialize)]
+	struct AskUserQuestion {
+		id: String,
+		#[allow(dead_code)]
+		question: String,
+		options: Vec<AskUserOption>,
+	}
+	#[derive(serde::Deserialize)]
+	struct AskUserOption {
+		id: String,
+		#[allow(dead_code)]
+		label: String,
+	}
+	let parsed: AskUserArgs =
+		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("ask_user", err.to_string()))?;
+	if parsed.questions.is_empty() {
+		return Err(CoderError::invalid_args("ask_user", "provide at least one question"));
+	}
+	for q in &parsed.questions {
+		if q.id.trim().is_empty() {
+			return Err(CoderError::invalid_args(
+				"ask_user",
+				"each question needs a non-empty `id`",
+			));
+		}
+		if q.options.len() < 2 {
+			return Err(CoderError::invalid_args(
+				"ask_user",
+				format!("question `{}` needs at least 2 options", q.id),
+			));
+		}
+		for opt in &q.options {
+			if opt.id.trim().is_empty() {
+				return Err(CoderError::invalid_args(
+					"ask_user",
+					format!("an option in question `{}` has an empty `id`", q.id),
+				));
+			}
+		}
+	}
+
+	let rx = rt.prompts.register(tool_call_id).await;
+	let outcome = tokio::select! {
+		biased;
+		() = cancel.cancelled() => {
+			// Clean up the parked sender so a late resolve can't fire
+			// into a dropped receiver and confuse `has_pending`.
+			rt.prompts.resolve(tool_call_id, PromptOutcome::Skipped).await;
+			return Err(CoderError::Aborted);
+		}
+		res = rx => res,
+	};
+	match outcome {
+		// Sender dropped without a value (shouldn't happen outside
+		// teardown): treat as a skip so the model gets a clean
+		// "no answer, keep going" rather than an error.
+		Err(_) => Ok(json!({ "status": "skipped" })),
+		Ok(PromptOutcome::Skipped) => Ok(json!({
+			"status": "skipped",
+			"note": "The user chose not to answer and is continuing with their own message — read their next instruction and proceed accordingly.",
+		})),
+		Ok(PromptOutcome::Answered(PromptResponse { answers })) => Ok(json!({
+			"status": "answered",
+			"answers": answers,
+		})),
+	}
 }
 
 /// Walk the session's in-memory `messages` for assistant tool

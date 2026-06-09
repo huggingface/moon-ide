@@ -1474,6 +1474,51 @@ export type TokenUsageSource = 'provider' | 'estimate';
 export type SubagentMode = 'research' | 'agent';
 
 /**
+ * One option the agent offered for an `ask_user` question. The
+ * user clicks one (or several, for a multi-select question) of
+ * these, or types a custom answer instead. Mirrors the
+ * `options[]` entries the agent supplies in the `ask_user` tool
+ * args.
+ */
+export type AskUserOption = { id: string; label: string };
+
+/**
+ * One question in an `ask_user` prompt. Parsed out of the
+ * `tool_call` event's `args.questions[]` by `ToolBodyAskUser`.
+ * `allow_multiple` switches the question between single-select
+ * (click submits) and multi-select (checkboxes + confirm). The
+ * user can always also type a custom free-form answer.
+ */
+export type AskUserQuestion = {
+	id: string;
+	question: string;
+	options: AskUserOption[];
+	allow_multiple?: boolean;
+};
+
+/**
+ * The user's answer to one `ask_user` question, sent back via
+ * `coder_respond_to_prompt`. `selected` is the option ids they
+ * clicked; `free_text` is a custom answer they typed. Both can be
+ * present (tick a preset and add context); at least one is non-
+ * empty for an answered question. Mirrors
+ * `moon_coder::QuestionAnswer`.
+ */
+export type QuestionAnswer = {
+	question_id: string;
+	selected: string[];
+	free_text: string;
+};
+
+/**
+ * Structured `ask_user` response — one `QuestionAnswer` per
+ * question the user actually answered. Mirrors
+ * `moon_coder::PromptResponse`. Sent to the backend, which fires
+ * the parked oneshot and lets the tool return.
+ */
+export type PromptResponse = { answers: QuestionAnswer[] };
+
+/**
  * Outer envelope carrying a `(folder, session_id)` tag alongside
  * the inner event. Mirrors `moon_coder::CoderEventEnvelope`. The
  * frontend's multi-session dispatcher routes events to per-

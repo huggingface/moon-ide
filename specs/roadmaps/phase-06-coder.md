@@ -305,14 +305,24 @@ What ships:
   to abort).
 - Queue indicator UI above the composer.
 - `ask_user` tool per
-  [`coder.md`](../coder.md#ask-user-tool). Backend wires a
-  `oneshot::Receiver<UserChoice>` keyed by `tool_call_id`; new
-  Tauri command `coder_respond_to_prompt(call_id, response)`.
-  Cancellation tokens drop pending oneshots so abort is clean.
-- `CoderAskUser.svelte` block rendered inline in the transcript:
-  buttons for `options[]`, optional "Other…" textarea, optional
-  multi-select with a confirm button. Auto-scrolls into view when
-  it appears.
+  [`coder.md`](../coder.md#ask-user-tool) (shipped as a
+  **multi-question** prompt, see test plan 0094). Backend parks a
+  `oneshot::Sender<PromptOutcome>` on a per-session `PromptRegistry`
+  (`prompts.rs`) keyed by `tool_call_id`; new Tauri command
+  `coder_respond_to_prompt(call_id, response)`. Cancellation tokens
+  short-circuit the parked oneshot so abort is clean. A custom
+  answer is always available (no `allow_other` flag), and the user
+  can also **skip** the whole prompt by sending a normal composer
+  message — `Coder::send` resolves the parked prompt with `Skipped`
+  and the typed message proceeds as a steer.
+- `ToolBodyAskUser.svelte` rendered inline off the existing
+  `tool_call` row (no new wire event): per-question option buttons,
+  a custom-answer textarea per question, multi-select checkboxes +
+  confirm when `allow_multiple`, single-select auto-submit when
+  there's exactly one single-select question. Renders as an
+  always-open card (not the collapsed lazy-mounted tool body) so
+  it's visible + actionable while in flight, flipping to a
+  read-only summary on settle.
 
 ### 6.6 — System prompt + skills + context telemetry
 
