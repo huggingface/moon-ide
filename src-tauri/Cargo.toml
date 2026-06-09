@@ -53,6 +53,13 @@ reqwest = { workspace = true }
 # - macOS / Windows don't need it — the webview's native theme API
 #   answers correctly and fires change events — so the dep stays
 #   Linux-gated.
+# `libc::kill(pid, 0)` powers the shutdown-sentinel liveness check
+# in `focus_socket` (is the previous owner's teardown still
+# running, or did it crash?). Unix-only; Windows support is
+# deferred along with the rest of the single-instance plumbing.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 ashpd = "0.10"
 # Terminal IPC ferries arbitrary 8-bit PTY bytes (escape sequences,

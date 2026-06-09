@@ -601,6 +601,32 @@ the workspace as still in use. See
 [`crate::focus_socket::cleanup`](../src-tauri/src/focus_socket.rs)
 and the `RunEvent::ExitRequested` hook in `src-tauri/src/lib.rs`.
 
+Releasing the lock early opens a different hole, though: a
+relaunch that fires _during_ the teardown now binds the freed
+lock successfully and runs its `auto_resume_*` while the old
+`stop_all` is still issuing `docker compose stop`. It queries
+container state mid-teardown, sees everything still `Running`,
+paints the pip green — and then the old process's `stop_all`
+reaches the containers and stops them (`exited (137)`), so the
+new window's pip and folder icons go dark a few seconds after
+launch and any default container terminal's `docker exec` dies
+with its parent. A **shutdown sentinel** closes this: the
+exiting process writes
+`<workspaces_dir>/<slug>/run/shutting-down` (body = its PID)
+_before_ it drops the lock, and removes it once `stop_all`
+returns. On the way in,
+[`focus_socket::await_previous_shutdown`](../src-tauri/src/focus_socket.rs)
+blocks the new launch's auto-resume until that file is gone — so
+by the time `auto_resume_shell` runs, the containers are cleanly
+`Stopped` and it brings them back up instead of trusting a
+mid-teardown `Running`. The wait is bounded
+(`SHUTDOWN_WAIT_TIMEOUT`, ~45s) and short-circuits if the
+sentinel is stale (its writer PID is no longer alive, i.e. the
+previous owner was SIGKILLed mid-teardown) — in that case the
+containers may still be up and the existing "already running,
+skip" path handles them. No sentinel present (cold launch, or a
+relaunch well after the previous quit) returns immediately.
+
 This makes the IDE the **command centre** for everything it
 spawned. The user's mental model is "I closed moon-ide,
 nothing should be using my CPU and RAM that I can't see in

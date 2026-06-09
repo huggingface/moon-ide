@@ -3266,6 +3266,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "ignore",
+ "libc",
  "moon-coder",
  "moon-container",
  "moon-core",

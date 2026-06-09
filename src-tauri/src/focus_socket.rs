@@ -70,6 +70,21 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 /// thing scheduled after a fork.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Upper bound on how long a relaunch waits for the previous
+/// owner's `stop_all` teardown to finish before giving up and
+/// proceeding anyway. `stop_all` issues `docker compose stop`
+/// against the workspace shell plus every bound-folder project,
+/// each with a ~10s SIGTERM grace period; serialised, a busy
+/// workspace can legitimately take a while. We cap the wait so a
+/// crashed previous owner (sentinel left behind, teardown never
+/// finished) can't hang the new launch forever — on timeout we
+/// proceed, and the auto-resume path's "already running, skip"
+/// logic handles whatever the daemon actually has up.
+const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Poll interval while waiting for the shutdown sentinel to clear.
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(150);
+
 /// Tauri event emitted when a forwarded `$GIT_EDITOR` request
 /// arrives. The frontend opens the file as an external buffer,
 /// tags it with `pendingEdit = id`, and calls
@@ -551,6 +566,136 @@ pub async fn cleanup(workspaces_dir: &Utf8Path, slug: &str) {
 	}
 }
 
+/// Path of the per-workspace "shutdown in progress" sentinel, a
+/// sibling of [`socket_path`] in the same `run/` directory.
+fn shutdown_sentinel_path(workspaces_dir: &Utf8Path, slug: &str) -> PathBuf {
+	socket_dir(workspaces_dir, slug).join("shutting-down")
+}
+
+/// Mark this workspace as tearing down.
+///
+/// Written by the exiting process *before* it unlinks
+/// `instance.sock` and runs the multi-second `stop_all`, and
+/// removed by [`clear_shutdown_sentinel`] once `stop_all`
+/// returns. It exists to close a relaunch-during-shutdown race:
+/// the single-instance lock is released early (so a relaunch's
+/// `probe_alive` doesn't wrongly report the workspace as still in
+/// use), which means a quick relaunch can `try_bind` successfully
+/// while the previous `stop_all` is still issuing `docker compose
+/// stop`. Without the sentinel the new process would query
+/// container state mid-teardown, see the containers still
+/// `Running`, paint the pip green, then watch the old `stop_all`
+/// kill them out from under it (`exited (137)`). The sentinel lets
+/// [`await_previous_shutdown`] hold the new launch's auto-resume
+/// until the teardown finishes.
+///
+/// The file body is the writer's PID so a relaunch can tell a
+/// genuinely-in-progress teardown from a stale sentinel left by a
+/// crashed owner.
+pub async fn write_shutdown_sentinel(workspaces_dir: &Utf8Path, slug: &str) {
+	let path = shutdown_sentinel_path(workspaces_dir, slug);
+	if let Some(parent) = path.parent() {
+		if let Err(err) = tokio::fs::create_dir_all(parent).await {
+			tracing::debug!(error = %err, "write_shutdown_sentinel: create run dir failed");
+			return;
+		}
+	}
+	let body = std::process::id().to_string();
+	if let Err(err) = tokio::fs::write(&path, body).await {
+		tracing::debug!(error = %err, path = %path.display(), "write_shutdown_sentinel failed");
+	}
+}
+
+/// Remove the shutdown sentinel written by
+/// [`write_shutdown_sentinel`]. Called once `stop_all` has
+/// finished so a relaunch waiting on it can proceed. Best-effort:
+/// a crash before this point leaves the file, which
+/// [`await_previous_shutdown`] treats as stale once the writing
+/// PID is gone (and times out on regardless).
+pub async fn clear_shutdown_sentinel(workspaces_dir: &Utf8Path, slug: &str) {
+	let path = shutdown_sentinel_path(workspaces_dir, slug);
+	if let Err(err) = tokio::fs::remove_file(&path).await {
+		if err.kind() != std::io::ErrorKind::NotFound {
+			tracing::debug!(error = %err, path = %path.display(), "clear_shutdown_sentinel failed");
+		}
+	}
+}
+
+/// Block until the previous owner's `stop_all` teardown finishes,
+/// so a relaunch that fired during shutdown doesn't act on stale
+/// (still-`Running`) container state.
+///
+/// Returns once either the [`write_shutdown_sentinel`] file is
+/// gone (clean handoff: the previous process finished `stop_all`
+/// and removed it), the sentinel is stale (its writer PID is no
+/// longer alive — a crash mid-teardown), or
+/// [`SHUTDOWN_WAIT_TIMEOUT`] elapses (defensive cap). After this
+/// returns the containers are guaranteed stopped on the clean
+/// path, so the caller's `auto_resume_*` sees `Stopped` and brings
+/// them back up instead of trusting a mid-teardown `Running`.
+///
+/// No sentinel present is the overwhelmingly common case (cold
+/// launch, or a relaunch well after the previous quit) and returns
+/// immediately.
+pub async fn await_previous_shutdown(workspaces_dir: &Utf8Path, slug: &str) {
+	let path = shutdown_sentinel_path(workspaces_dir, slug);
+	if !path.exists() {
+		return;
+	}
+
+	tracing::info!(slug = %slug, "await_previous_shutdown: previous session still tearing down, waiting");
+	let deadline = tokio::time::Instant::now() + SHUTDOWN_WAIT_TIMEOUT;
+	loop {
+		match tokio::fs::read_to_string(&path).await {
+			Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+				tracing::info!(slug = %slug, "await_previous_shutdown: previous teardown finished");
+				return;
+			}
+			Err(err) => {
+				tracing::debug!(error = %err, "await_previous_shutdown: read failed; proceeding");
+				return;
+			}
+			Ok(body) => {
+				if !writer_is_alive(body.trim()) {
+					tracing::warn!(slug = %slug, "await_previous_shutdown: sentinel is stale (writer gone); proceeding");
+					return;
+				}
+			}
+		}
+		if tokio::time::Instant::now() >= deadline {
+			tracing::warn!(slug = %slug, "await_previous_shutdown: timed out waiting for previous teardown; proceeding");
+			return;
+		}
+		tokio::time::sleep(SHUTDOWN_POLL_INTERVAL).await;
+	}
+}
+
+/// Best-effort liveness check for the PID recorded in a shutdown
+/// sentinel. `kill(pid, 0)` returns success if the process exists
+/// (whether or not we could actually signal it). An unparseable
+/// body is treated as "not alive" so a malformed sentinel doesn't
+/// strand the launch. Unix-only, matching the rest of this module.
+fn writer_is_alive(body: &str) -> bool {
+	let Ok(pid) = body.parse::<i32>() else {
+		return false;
+	};
+	if pid <= 0 {
+		return false;
+	}
+	// SAFETY: `kill` with signal 0 performs only an existence /
+	// permission check and never delivers a signal, so there's no
+	// memory or process-state hazard.
+	let rc = unsafe { libc::kill(pid, 0) };
+	if rc == 0 {
+		return true;
+	}
+	// ESRCH = no such process (dead). EPERM = alive but we can't
+	// signal it (still counts as alive). Any other errno: be
+	// conservative and treat as alive so we wait rather than
+	// resume over a live teardown.
+	std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
 #[cfg(test)]
 mod tests {
 	use camino::Utf8PathBuf;
@@ -642,5 +787,65 @@ mod tests {
 		let err = try_bind(&tmp.0, "ws").await.expect_err("second bind");
 		assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
 		drop(owner);
+	}
+
+	#[tokio::test]
+	async fn await_previous_shutdown_returns_immediately_without_sentinel() {
+		let tmp = tmp_workspaces();
+		// No sentinel on disk: the common cold-launch path must not
+		// block. Wrap in a tight timeout so a regression that
+		// spins on the poll loop fails loudly.
+		tokio::time::timeout(Duration::from_secs(2), await_previous_shutdown(&tmp.0, "ws"))
+			.await
+			.expect("await_previous_shutdown should return immediately with no sentinel");
+	}
+
+	#[tokio::test]
+	async fn await_previous_shutdown_skips_stale_sentinel_from_dead_writer() {
+		let tmp = tmp_workspaces();
+		std::fs::create_dir_all(socket_dir(&tmp.0, "ws")).unwrap();
+		// PID 2^31-1 is effectively never live: a relaunch must treat
+		// the sentinel as stale and proceed rather than wait out the
+		// full timeout.
+		std::fs::write(shutdown_sentinel_path(&tmp.0, "ws"), i32::MAX.to_string()).unwrap();
+		tokio::time::timeout(Duration::from_secs(2), await_previous_shutdown(&tmp.0, "ws"))
+			.await
+			.expect("stale sentinel should not block past its dead writer");
+	}
+
+	#[tokio::test]
+	async fn await_previous_shutdown_unblocks_when_sentinel_cleared() {
+		let tmp = tmp_workspaces();
+		std::fs::create_dir_all(socket_dir(&tmp.0, "ws")).unwrap();
+		// Live writer (our own PID) so the wait can't short-circuit on
+		// staleness — it must block until the file is removed.
+		std::fs::write(shutdown_sentinel_path(&tmp.0, "ws"), std::process::id().to_string()).unwrap();
+		// Remove the sentinel from a plain OS thread after a short
+		// delay so the awaiting future has to actually block on the
+		// poll loop and then observe the file disappear. (A tokio
+		// task would trip the repo's `tokio::spawn` lint; a thread
+		// doing a blocking `fs::remove_file` exercises the same
+		// path.)
+		let sentinel = shutdown_sentinel_path(&tmp.0, "ws");
+		let clearer = std::thread::spawn(move || {
+			std::thread::sleep(Duration::from_millis(300));
+			std::fs::remove_file(&sentinel).unwrap();
+		});
+		tokio::time::timeout(Duration::from_secs(3), await_previous_shutdown(&tmp.0, "ws"))
+			.await
+			.expect("await should unblock once the sentinel is cleared");
+		clearer.join().unwrap();
+	}
+
+	#[test]
+	fn writer_is_alive_self_is_alive() {
+		assert!(writer_is_alive(&std::process::id().to_string()));
+	}
+
+	#[test]
+	fn writer_is_alive_garbage_is_not_alive() {
+		assert!(!writer_is_alive("not-a-pid"));
+		assert!(!writer_is_alive("0"));
+		assert!(!writer_is_alive("-5"));
 	}
 }

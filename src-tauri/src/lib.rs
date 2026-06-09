@@ -545,6 +545,17 @@ pub fn run() {
 				let app_handle = app.handle().clone();
 				tauri::async_runtime::spawn(async move {
 					let state = app_handle.state::<AppState>();
+					// If we relaunched while a previous instance was
+					// still tearing this workspace down, wait for that
+					// teardown to finish first. Otherwise auto-resume
+					// would query container state mid-`stop_all`, see
+					// the containers still `Running`, and paint the pip
+					// green right before the old process kills them
+					// (`exited (137)`). Common case (no previous
+					// teardown in flight) returns immediately.
+					if let Some(id) = state.workspace_id() {
+						focus_socket::await_previous_shutdown(&state.workspaces_dir, id).await;
+					}
 					shutdown::auto_resume_shell(&app_handle, &state).await;
 					shutdown::auto_resume_project_composes(&app_handle, &state).await;
 				});
@@ -592,10 +603,22 @@ pub fn run() {
 					if let Some(abort) = state.focus_listener.lock().await.take() {
 						abort.abort();
 					}
-					if let Some(id) = state.workspace_id() {
+					// Mark the workspace as tearing down *before* we drop
+					// the lock and run the (multi-second) `stop_all`. A
+					// relaunch that fires during this window binds the
+					// freed lock successfully but waits on this sentinel
+					// before auto-resuming, so it never acts on the
+					// still-`Running` containers we're about to stop. See
+					// `await_previous_shutdown`.
+					let workspace_id = state.workspace_id().map(str::to_owned);
+					if let Some(id) = workspace_id.as_deref() {
+						focus_socket::write_shutdown_sentinel(&state.workspaces_dir, id).await;
 						focus_socket::cleanup(&state.workspaces_dir, id).await;
 					}
 					shutdown::stop_all(&state).await;
+					if let Some(id) = workspace_id.as_deref() {
+						focus_socket::clear_shutdown_sentinel(&state.workspaces_dir, id).await;
+					}
 					app_handle.exit(0);
 				});
 			}
