@@ -817,11 +817,76 @@
 			event.preventDefault();
 			await coder.send();
 		}
+		// Atomic attachment tokens: a Backspace / Delete that would
+		// chip away at an `@`-mention token (a selection / terminal
+		// chip's inline reference) instead deletes the whole token
+		// in one stroke, so the reference behaves like a single
+		// block. Only fires on a collapsed caret with no modifiers
+		// — a range selection or a Ctrl/Alt-modified delete keeps
+		// its native behaviour. The resulting `input` event runs
+		// the usual sync, which drops the now-orphaned chip too.
+		if (
+			(event.key === 'Backspace' || event.key === 'Delete') &&
+			!event.ctrlKey &&
+			!event.altKey &&
+			!event.metaKey &&
+			composer !== undefined &&
+			composer.selectionStart === composer.selectionEnd
+		) {
+			const span = tokenSpanAtCaret(composer.value, composer.selectionStart, event.key === 'Backspace');
+			if (span !== null) {
+				event.preventDefault();
+				composer.setSelectionRange(span.start, span.end);
+				// `execCommand('delete')` keeps the native undo
+				// stack intact and fires `input`, so `onComposerInput`
+				// re-syncs the draft + chip strip from here.
+				const ok = document.execCommand('delete');
+				if (!ok) {
+					const next = composer.value.slice(0, span.start) + composer.value.slice(span.end);
+					composer.value = next;
+					coder.draft = next;
+					coder.syncAttachmentsToDraft(next);
+					composer.setSelectionRange(span.start, span.start);
+				}
+			}
+		}
+	}
+
+	/** Find the attachment token the caret sits in/adjacent to so a
+	 *  single Backspace / Delete can wipe it whole. Returns the
+	 *  `[start, end)` span of the matched token, or `null` when the
+	 *  caret isn't poised to chip into one. For Backspace the caret
+	 *  must be just after or inside the token (so the key would
+	 *  otherwise eat the last char); for Delete it must be at or
+	 *  inside the start (so the key would otherwise eat the first
+	 *  char). Image attachments carry no token and are skipped. */
+	function tokenSpanAtCaret(value: string, caret: number, backspace: boolean): { start: number; end: number } | null {
+		for (const att of coder.attachments) {
+			if (att.kind === 'image') {
+				continue;
+			}
+			const { token } = att;
+			let from = value.indexOf(token);
+			while (from !== -1) {
+				const to = from + token.length;
+				const hit = backspace ? caret > from && caret <= to : caret >= from && caret < to;
+				if (hit) {
+					return { start: from, end: to };
+				}
+				from = value.indexOf(token, from + 1);
+			}
+		}
+		return null;
 	}
 
 	function onComposerInput(event: Event): void {
 		const ta = event.currentTarget as HTMLTextAreaElement;
 		coder.draft = ta.value;
+		// Editing the prose mirrors back onto the chip strip:
+		// breaking (or deleting) a selection / terminal chip's
+		// inline token drops the chip, so a reference behaves like
+		// a chip in both directions.
+		coder.syncAttachmentsToDraft(ta.value);
 		updateMention();
 	}
 

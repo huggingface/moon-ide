@@ -1009,6 +1009,21 @@ to Coder` pill in its top-right corner while the snapshot
   to drop the chip _and_ strip every inline token (`@token`
   with at most one trailing whitespace) out of the draft so
   the chip and the inline references stay in sync.
+- The sync runs the other way too: editing the prose so a
+  selection / terminal chip's inline token is no longer
+  present _intact_ drops the matching chip. Image chips carry
+  no inline token, so plain typing never touches them; they're
+  only removed via their own `×`.
+- Inline tokens delete as one atomic block. A `Backspace` /
+  `Delete` (collapsed caret, no modifiers) that would chip a
+  character off a selection / terminal token instead removes
+  the entire token in a single stroke — a reference behaves
+  like a chip in the textarea, not a string of editable
+  characters. The delete goes through `execCommand('delete')`
+  so the native undo stack stays intact, and the resulting
+  `input` event drops the now-orphaned chip via the same prose
+  → chip sync. A range selection or a `Ctrl`/`Alt`-modified
+  delete keeps its native behaviour.
 - Typing `@` in the composer opens an inline file picker
   ("`@`-mention"). The token under the caret (the `@` plus
   any non-whitespace characters up to the caret) is the live

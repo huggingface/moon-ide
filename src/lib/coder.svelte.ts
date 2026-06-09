@@ -1445,6 +1445,24 @@ class CoderPanelState {
 		this.attachments = [];
 	}
 
+	/** Drop any token-bearing chip whose inline `@`-token is no
+	 *  longer present *intact* in the draft. Called from the
+	 *  composer's `input` handler so editing the prose mirrors
+	 *  back onto the chip strip: a selection / terminal chip
+	 *  behaves like a chip — break the token by even one
+	 *  character (delete part of `@foo.ts:1-5`, or wipe it
+	 *  outright) and the matching chip vanishes. Image chips have
+	 *  no token, so plain typing never touches them; they're only
+	 *  removed via their own `×`. No-op when nothing changed so we
+	 *  don't churn `attachments` (and re-run dependent effects) on
+	 *  every keystroke. */
+	syncAttachmentsToDraft(draft: string): void {
+		const surviving = this.attachments.filter((a) => a.kind === 'image' || draft.includes(a.token));
+		if (surviving.length !== this.attachments.length) {
+			this.attachments = surviving;
+		}
+	}
+
 	/** Insert `token` at the textarea's caret position, with a
 	 *  trailing space so the user can keep typing, and a leading
 	 *  space when the previous character isn't already
