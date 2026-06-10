@@ -52,6 +52,12 @@
 	let modelSettingsOpen = $state(false);
 	let hubSettingsOpen = $state(false);
 
+	// Full-size preview of a pasted image, opened by clicking its
+	// thumbnail in the transcript. We render an in-app lightbox
+	// rather than `target="_blank"`, which the Tauri webview can't
+	// honour for `data:` URLs.
+	let lightboxUrl = $state<string | null>(null);
+
 	// Per-session shell-target override popover (Auto / Force host).
 	// Anchored to the bash-target pip in the header.
 	let shellTargetOpen = $state(false);
@@ -87,6 +93,20 @@
 			window.removeEventListener('pointerdown', onPointerDown);
 			window.removeEventListener('keydown', onKey);
 		};
+	});
+
+	// Escape dismiss for the full-size image lightbox.
+	$effect(() => {
+		if (lightboxUrl === null) {
+			return;
+		}
+		const onKey = (event: KeyboardEvent) => {
+			if (event.key === 'Escape') {
+				lightboxUrl = null;
+			}
+		};
+		window.addEventListener('keydown', onKey);
+		return () => window.removeEventListener('keydown', onKey);
 	});
 
 	onMount(() => {
@@ -2076,6 +2096,21 @@
 	<HfBucketSettingsModal onClose={() => (hubSettingsOpen = false)} />
 {/if}
 
+{#if lightboxUrl}
+	<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+	<div
+		class="lightbox-backdrop"
+		onclick={() => (lightboxUrl = null)}
+		role="dialog"
+		aria-modal="true"
+		aria-label="Image preview"
+		tabindex="-1"
+	>
+		<img class="lightbox-image" src={lightboxUrl} alt="Pasted attachment at full size" />
+		<button type="button" class="lightbox-close" title="Close (Esc)" onclick={() => (lightboxUrl = null)}>×</button>
+	</div>
+{/if}
+
 <!-- Row renderer extracted as a snippet so the parent's session
 	 transcript and the sub-agent pop-out can share it without
 	 duplicating ~80 lines of conditional markup. `withSubagentCards`
@@ -2150,14 +2185,18 @@
 			{#if row.images.length > 0}
 				<!-- Pasted images, rendered as thumbnails so the
 								 user can recognise what they attached two
-								 turns ago. Clicking opens the data URL in a
-								 new tab — Tauri's webview lets the user
-								 zoom there for free. -->
+								 turns ago. Clicking opens an in-app
+								 lightbox at full size. -->
 				<div class="user-images">
 					{#each row.images as img, i (img.data_url + ':' + i)}
-						<a class="user-image" href={img.data_url} target="_blank" rel="noopener" title="Open image full-size">
+						<button
+							type="button"
+							class="user-image"
+							title="Open image full-size"
+							onclick={() => (lightboxUrl = img.data_url)}
+						>
 							<img src={img.data_url} alt={`pasted image ${i + 1}`} />
-						</a>
+						</button>
 					{/each}
 				</div>
 			{/if}
@@ -3646,16 +3685,56 @@
 	.user-image {
 		display: inline-block;
 		max-width: 320px;
+		padding: 0;
 		border: 1px solid var(--m-border);
 		border-radius: 4px;
 		overflow: hidden;
-		text-decoration: none;
+		background: none;
+		cursor: zoom-in;
 	}
 	.user-image img {
 		display: block;
 		max-width: 100%;
 		max-height: 240px;
 		height: auto;
+	}
+	.lightbox-backdrop {
+		position: fixed;
+		inset: 0;
+		z-index: 1000;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: 32px;
+		background: rgba(0, 0, 0, 0.8);
+		cursor: zoom-out;
+	}
+	.lightbox-image {
+		max-width: 100%;
+		max-height: 100%;
+		object-fit: contain;
+		border-radius: 4px;
+		box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+	}
+	.lightbox-close {
+		position: absolute;
+		top: 16px;
+		right: 16px;
+		width: 32px;
+		height: 32px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 22px;
+		line-height: 1;
+		color: var(--m-fg);
+		background: var(--m-bg-overlay);
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		cursor: pointer;
+	}
+	.lightbox-close:hover {
+		background: var(--m-bg);
 	}
 	textarea {
 		width: 100%;
