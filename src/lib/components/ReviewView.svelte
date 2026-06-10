@@ -430,7 +430,12 @@
 		overflow-y: auto;
 		background: var(--m-bg);
 		color: var(--m-fg);
-		padding: 12px;
+		/* No top padding on the scroller itself: the sticky banner
+		 * must park flush against the scroller's top edge, otherwise
+		 * a `padding-top` would leave a strip above it where scrolled
+		 * diff content peeks through. The banner and `.stack` supply
+		 * their own insets instead. */
+		padding: 0 12px 12px;
 		gap: 12px;
 		outline: none;
 	}
@@ -438,11 +443,10 @@
 		display: flex;
 		align-items: baseline;
 		gap: 10px;
-		/* Pull out into the scroller's padding so the sticky strip
-		 * spans edge-to-edge and fully masks diff content sliding
-		 * underneath it. The compensating padding restores the
-		 * original inset for the banner's own content. */
-		margin: -12px -12px 0;
+		/* Span edge-to-edge so the sticky strip fully masks diff
+		 * content sliding underneath it; the compensating padding
+		 * restores the original inset for the banner's own content. */
+		margin: 0 -12px;
 		padding: 10px 16px 8px;
 		color: var(--m-fg-muted);
 		font-size: 12px;
