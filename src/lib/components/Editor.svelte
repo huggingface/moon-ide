@@ -764,8 +764,8 @@
 		});
 	}
 
-	// Right-click menu: "Copy GitHub link" / "Copy GitHub markdown
-	// link" for the lines under the selection (or the caret line when
+	// Right-click menu: "Copy GitHub link" for the lines under the
+	// selection (or the caret line when
 	// there's no range). Reuses `ContextMenu.svelte` portaled onto
 	// `document.body` — same approach as the tab strip's menu — so the
 	// popover isn't clipped by the editor's `overflow: hidden`.
@@ -815,19 +815,19 @@
 		}
 	}
 
-	async function copyPermalink(form: 'url' | 'markdown') {
+	async function copyPermalink() {
 		if (view === undefined || currentPath === null) {
 			return;
 		}
 		const { startLine, endLine } = selectedLineRange(view);
-		const label = form === 'markdown' ? 'GitHub markdown link' : 'GitHub link';
+		const label = 'GitHub link';
 		try {
 			const link = await ipc.fs.gitPermalink(currentPath, startLine, endLine);
 			if (link === null) {
 				workspace.flash('No GitHub link (not a GitHub repo or no commits)');
 				return;
 			}
-			await copyToClipboard(form === 'markdown' ? link.markdown : link.url, label);
+			await copyToClipboard(link.url, label);
 		} catch (err) {
 			// The clipboard write has its own flash inside
 			// `copyToClipboard`; reaching here means `gitPermalink`
@@ -854,14 +854,7 @@
 				id: 'copy-github-link',
 				label: 'Copy GitHub link',
 				onSelect: () => {
-					void copyPermalink('url');
-				},
-			},
-			{
-				id: 'copy-github-markdown-link',
-				label: 'Copy GitHub markdown link',
-				onSelect: () => {
-					void copyPermalink('markdown');
+					void copyPermalink();
 				},
 			},
 		];
