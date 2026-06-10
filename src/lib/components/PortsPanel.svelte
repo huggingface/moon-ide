@@ -39,6 +39,15 @@
 
 	const liveForwards = $derived(ports.forwards);
 
+	// Only warn about conflicts whose host port is still present
+	// in the draft set. Dismissing (or re-typing) the offending
+	// row should make its warning disappear without waiting for
+	// the next Apply — the stale conflict is no longer actionable.
+	const visibleConflicts = $derived.by(() => {
+		const drafted = new Set(drafts.map((d) => Number(d.host_port.trim())));
+		return ports.conflicts.filter((c) => drafted.has(c.host_port));
+	});
+
 	$effect(() => {
 		// Re-seed the drafts from the live set whenever the
 		// store's forwarded list changes. Without this an external
@@ -270,11 +279,11 @@
 		{#if ports.lastError}<span class="form-error">{ports.lastError}</span>{/if}
 	</div>
 
-	{#if ports.conflicts.length > 0}
+	{#if visibleConflicts.length > 0}
 		<p class="conflict">
 			Host port already in use:
-			{#each ports.conflicts as c, i (c.host_port)}
-				<code>{c.host_port}</code>{i < ports.conflicts.length - 1 ? ', ' : ''}
+			{#each visibleConflicts as c, i (c.host_port)}
+				<code>{c.host_port}</code>{i < visibleConflicts.length - 1 ? ', ' : ''}
 			{/each}
 			. Pick a different host port and re-apply.
 		</p>
