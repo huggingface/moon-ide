@@ -48,6 +48,24 @@
 		return ports.conflicts.filter((c) => drafted.has(c.host_port));
 	});
 
+	// Per-row pending-edit check: true when this draft row differs
+	// from the applied forward at the same index. Add and remove
+	// commit instantly, so the only thing that stages is an
+	// in-place field edit — and we surface that per row, not as a
+	// global "you have unsaved changes" banner.
+	function rowDirty(idx: number): boolean {
+		const d = drafts[idx];
+		const a = liveForwards[idx];
+		if (!d || !a) {
+			return false;
+		}
+		return (
+			d.label.trim() !== a.label ||
+			d.container_port.trim() !== String(a.container_port) ||
+			(d.host_port.trim() || d.container_port.trim()) !== String(a.host_port)
+		);
+	}
+
 	$effect(() => {
 		// Re-seed the drafts from the live set whenever the
 		// store's forwarded list changes. Without this an external
@@ -64,8 +82,18 @@
 		drafts[idx] = { ...current, [key]: value };
 	}
 
-	function removeDraft(idx: number) {
+	async function removeDraft(idx: number) {
 		drafts = drafts.toSpliced(idx, 1);
+		await commit();
+	}
+
+	function revertDraft(idx: number) {
+		const applied = liveForwards[idx];
+		if (!applied) {
+			return;
+		}
+		drafts[idx] = draftFromForward(applied);
+		formError = null;
 	}
 
 	async function applyAdd() {
@@ -172,54 +200,58 @@
 			sidecar.
 		</p>
 	</header>
-	{#if drafts.length === 0}
-		<p class="empty">No forwards declared. Add one below.</p>
-	{:else}
-		<table>
-			<thead>
-				<tr>
-					<th>Label</th>
-					<th>Container</th>
-					<th>Host</th>
-					<th></th>
-					<th></th>
-				</tr>
-			</thead>
-			<tbody>
-				{#each drafts as draft, idx (idx)}
-					{@const hostNum = Number(draft.host_port)}
-					{@const health = Number.isFinite(hostNum) ? ports.healthFor(hostNum) : null}
-					<tr>
-						<td>
-							<input
-								type="text"
-								class="cell"
-								placeholder="vite"
-								value={draft.label}
-								oninput={(e) => setDraftField(idx, 'label', e.currentTarget.value)}
-							/>
-						</td>
-						<td>
-							<input
-								type="text"
-								class="cell port"
-								inputmode="numeric"
-								placeholder="3000"
-								value={draft.container_port}
-								oninput={(e) => setDraftField(idx, 'container_port', e.currentTarget.value)}
-							/>
-						</td>
-						<td>
-							<input
-								type="text"
-								class="cell port"
-								inputmode="numeric"
-								placeholder={draft.container_port || '3000'}
-								value={draft.host_port}
-								oninput={(e) => setDraftField(idx, 'host_port', e.currentTarget.value)}
-							/>
-						</td>
-						<td class="status-cell">
+	<div class="grid">
+		<div class="row head">
+			<span>Label</span>
+			<span>Container</span>
+			<span>Host</span>
+			<span></span>
+			<span></span>
+		</div>
+
+		{#if drafts.length === 0}
+			<p class="empty">No forwards declared. Add one below.</p>
+		{:else}
+			{#each drafts as draft, idx (idx)}
+				{@const hostNum = Number(draft.host_port)}
+				{@const health = Number.isFinite(hostNum) ? ports.healthFor(hostNum) : null}
+				<form
+					class="row"
+					onsubmit={(e) => {
+						e.preventDefault();
+						void commit();
+					}}
+				>
+					<input
+						type="text"
+						class="cell"
+						placeholder="vite"
+						value={draft.label}
+						oninput={(e) => setDraftField(idx, 'label', e.currentTarget.value)}
+					/>
+					<input
+						type="text"
+						class="cell port"
+						inputmode="numeric"
+						placeholder="3000"
+						value={draft.container_port}
+						oninput={(e) => setDraftField(idx, 'container_port', e.currentTarget.value)}
+					/>
+					<input
+						type="text"
+						class="cell port"
+						inputmode="numeric"
+						placeholder={draft.container_port || '3000'}
+						value={draft.host_port}
+						oninput={(e) => setDraftField(idx, 'host_port', e.currentTarget.value)}
+					/>
+					{#if rowDirty(idx)}
+						<span class="status">
+							<button type="submit" class="apply-edit" disabled={ports.busy}>Apply edit</button>
+							<button type="button" class="link" onclick={() => revertDraft(idx)}>revert</button>
+						</span>
+					{:else}
+						<span class="status">
 							<span class={dotClass(health)} title={healthLabel(health)}></span>
 							<button
 								type="button"
@@ -228,56 +260,56 @@
 								title="Open http://localhost:{draft.host_port} in your browser"
 								onclick={() => openInBrowser(Number(draft.host_port))}>open</button
 							>
-						</td>
-						<td class="actions-cell">
-							<button type="button" class="x" aria-label="Remove" onclick={() => removeDraft(idx)}>×</button>
-						</td>
-					</tr>
-				{/each}
-			</tbody>
-		</table>
-	{/if}
+						</span>
+					{/if}
+					<button
+						type="button"
+						class="x"
+						aria-label="Remove"
+						disabled={ports.busy}
+						onclick={() => void removeDraft(idx)}>×</button
+					>
+				</form>
+			{/each}
+		{/if}
 
-	<form
-		class="add-row"
-		onsubmit={(e) => {
-			e.preventDefault();
-			void applyAdd();
-		}}
-	>
-		<input
-			type="text"
-			class="cell"
-			placeholder="Label (optional)"
-			value={addDraft.label}
-			oninput={(e) => (addDraft.label = e.currentTarget.value)}
-		/>
-		<input
-			type="text"
-			class="cell port"
-			inputmode="numeric"
-			placeholder="Container port (e.g. 3000)"
-			value={addDraft.container_port}
-			oninput={(e) => (addDraft.container_port = e.currentTarget.value)}
-		/>
-		<input
-			type="text"
-			class="cell port"
-			inputmode="numeric"
-			placeholder="Host port (defaults to container)"
-			value={addDraft.host_port}
-			oninput={(e) => (addDraft.host_port = e.currentTarget.value)}
-		/>
-		<button type="submit" class="primary" disabled={ports.busy}>Add forward</button>
-	</form>
-
-	<div class="apply-row">
-		<button type="button" class="primary" disabled={ports.busy} onclick={() => void commit()}>
-			{ports.busy ? 'Applying…' : 'Apply'}
-		</button>
-		{#if formError}<span class="form-error">{formError}</span>{/if}
-		{#if ports.lastError}<span class="form-error">{ports.lastError}</span>{/if}
+		<form
+			class="row add"
+			onsubmit={(e) => {
+				e.preventDefault();
+				void applyAdd();
+			}}
+		>
+			<input
+				type="text"
+				class="cell"
+				placeholder="Label (optional)"
+				value={addDraft.label}
+				oninput={(e) => (addDraft.label = e.currentTarget.value)}
+			/>
+			<input
+				type="text"
+				class="cell port"
+				inputmode="numeric"
+				placeholder="3000"
+				value={addDraft.container_port}
+				oninput={(e) => (addDraft.container_port = e.currentTarget.value)}
+			/>
+			<input
+				type="text"
+				class="cell port"
+				inputmode="numeric"
+				placeholder="(= container)"
+				value={addDraft.host_port}
+				oninput={(e) => (addDraft.host_port = e.currentTarget.value)}
+			/>
+			<button type="submit" class="add-btn" disabled={ports.busy} title="Add forward">+ Add</button>
+			<span></span>
+		</form>
 	</div>
+
+	{#if formError}<p class="form-error">{formError}</p>{/if}
+	{#if ports.lastError}<p class="form-error">{ports.lastError}</p>{/if}
 
 	{#if visibleConflicts.length > 0}
 		<p class="conflict">
@@ -317,37 +349,44 @@
 		color: var(--m-fg-muted);
 		line-height: 1.4;
 	}
+	.grid {
+		display: grid;
+		grid-template-columns: minmax(120px, 1fr) 110px 110px auto 24px;
+		gap: 6px 10px;
+		align-items: center;
+		max-width: 640px;
+	}
+	.row {
+		display: grid;
+		grid-template-columns: subgrid;
+		grid-column: 1 / -1;
+		align-items: center;
+	}
+	.row.head {
+		font-weight: 500;
+		color: var(--m-fg-muted);
+		padding-bottom: 4px;
+		border-bottom: 1px solid var(--m-border);
+	}
+	.row.add {
+		padding-top: 8px;
+		margin-top: 2px;
+		border-top: 1px solid var(--m-border);
+	}
 	.empty {
+		grid-column: 1 / -1;
 		margin: 0;
 		color: var(--m-fg-muted);
 	}
-	table {
-		width: 100%;
-		border-collapse: collapse;
-	}
-	th {
-		text-align: left;
-		font-weight: 500;
-		padding: 4px 8px 4px 0;
-		color: var(--m-fg-muted);
-		border-bottom: 1px solid var(--m-border);
-	}
-	td {
-		padding: 4px 8px 4px 0;
-		vertical-align: middle;
-	}
-	.status-cell {
+	.status {
 		display: flex;
 		align-items: center;
 		gap: 8px;
-	}
-	.actions-cell {
-		text-align: right;
+		white-space: nowrap;
 	}
 	.cell {
 		font: inherit;
 		width: 100%;
-		max-width: 220px;
 		padding: 4px 6px;
 		background: var(--m-bg);
 		color: var(--m-fg);
@@ -355,7 +394,6 @@
 		border-radius: 3px;
 	}
 	.cell.port {
-		max-width: 110px;
 		font-variant-numeric: tabular-nums;
 	}
 	.cell:focus {
@@ -400,48 +438,59 @@
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
-		width: 18px;
-		height: 18px;
+		width: 22px;
+		height: 22px;
 		background: transparent;
 		border: none;
 		color: var(--m-fg-subtle);
-		font-size: 14px;
+		font-size: 15px;
 		cursor: pointer;
 		border-radius: 3px;
 	}
-	.x:hover {
+	.x:hover:not(:disabled) {
 		background: var(--m-bg-1);
 		color: var(--m-fg);
 	}
-	.add-row {
-		display: flex;
-		gap: 6px;
-		flex-wrap: wrap;
-		align-items: center;
-		padding-top: 8px;
-		border-top: 1px solid var(--m-border);
+	.x:disabled {
+		color: var(--m-fg-subtle);
+		cursor: not-allowed;
 	}
-	.apply-row {
-		display: flex;
-		align-items: center;
-		gap: 12px;
-	}
-	.primary {
+	.apply-edit {
 		font: inherit;
-		padding: 4px 10px;
+		padding: 2px 8px;
 		background: var(--m-accent);
 		color: var(--m-accent-fg, #fff);
 		border: 1px solid var(--m-accent);
 		border-radius: 3px;
 		cursor: pointer;
+		white-space: nowrap;
 	}
-	.primary:disabled {
+	.apply-edit:disabled {
 		background: var(--m-bg-1);
 		color: var(--m-fg-muted);
 		border-color: var(--m-border);
 		cursor: not-allowed;
 	}
+	.add-btn {
+		font: inherit;
+		justify-self: start;
+		padding: 4px 10px;
+		background: transparent;
+		color: var(--m-accent);
+		border: 1px solid var(--m-border);
+		border-radius: 3px;
+		cursor: pointer;
+		white-space: nowrap;
+	}
+	.add-btn:hover:not(:disabled) {
+		border-color: var(--m-accent);
+	}
+	.add-btn:disabled {
+		color: var(--m-fg-muted);
+		cursor: not-allowed;
+	}
 	.form-error {
+		margin: 0;
 		color: var(--m-error, #d96d6d);
 	}
 	.conflict {
