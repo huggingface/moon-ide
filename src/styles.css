@@ -638,6 +638,27 @@ button:focus-visible {
 	box-shadow: inset 2px 0 0 var(--m-warning);
 	font-weight: 600;
 }
+
+/* Enclosing-symbol label appended to `@codemirror/merge`'s
+   `… N unchanged lines` collapse placeholders in the Review changes
+   tab (editor/diffCollapseContext.ts). GitHub-style "which function
+   is this hunk in?" hint, derived from a text heuristic. Reads as a
+   quiet monospace aside separated from the line count. */
+.cm-collapsedLines .cm-collapseContext {
+	margin-inline-start: 12px;
+	padding-inline-start: 12px;
+	border-inline-start: 1px solid var(--m-border);
+	color: var(--m-fg-muted);
+	font-family: var(--m-font-mono, monospace);
+	opacity: 0.85;
+}
+/* The package decorates the placeholder with a trailing `⦚`
+   pseudo-element; suppress it when we've appended a context label
+   so the row reads `⦚ … N unchanged lines │ symbol` instead of
+   trailing a stray glyph after the symbol. */
+.cm-collapsedLines:has(.cm-collapseContext)::after {
+	content: none;
+}
 /* Per-block "Accept current / incoming / both" toolbar widget,
    anchored at end-of-line on the opening `<<<<<<<`. Inline-block
    so the marker line's text reflow stays sane on narrow widths;

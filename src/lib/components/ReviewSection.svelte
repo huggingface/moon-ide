@@ -15,6 +15,7 @@
 	import { moonEditorTheme } from '../editor/theme';
 	import { diffPureChangeExtension } from '../editor/diffPureChange';
 	import { diffGutterTintExtension } from '../editor/diffGutterTint';
+	import { diffCollapseContextExtension } from '../editor/diffCollapseContext';
 	import { filePathFacet } from '../editor/lsp';
 	import { hasGotoModifier, lspGotoDefinitionExtension } from '../editor/lspGotoDefinition';
 	import { lspLanguageFor } from '../editor/lspLanguage';
@@ -247,6 +248,7 @@
 		const sideA: Extension[] = [
 			lineNumbers(),
 			diffGutterTintExtension('a'),
+			diffCollapseContextExtension,
 			foldGutter(),
 			diffPureChangeExtension,
 			highlightSelectionMatches(),
@@ -365,6 +367,7 @@
 		const sideB: Extension[] = [
 			lineNumbers(),
 			diffGutterTintExtension('b'),
+			diffCollapseContextExtension,
 			foldGutter(),
 			diffPureChangeExtension,
 			highlightActiveLine(),

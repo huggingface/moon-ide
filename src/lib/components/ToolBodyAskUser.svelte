@@ -263,21 +263,25 @@
 				/>
 			</div>
 		{/each}
-		<!-- Confirm button shown for multi-question prompts, multi-
-		     select questions, or whenever a custom answer is in
-		     play. A single single-select question auto-submits on
-		     click, so the button is just a fallback there. -->
-		<div class="ask-actions">
-			<button
-				type="button"
-				class="ask-submit"
-				disabled={!anyAnswered || submitting || submitted}
-				onclick={() => void submit()}
-			>
-				{submitted ? 'Sent' : submitting ? 'Sending…' : 'Send answer'}
-			</button>
-			<span class="ask-skip-hint">or just type in the composer to skip</span>
-		</div>
+		<!-- Multi-question / multi-select prompts can't auto-submit
+		     on a single click, so they keep the confirm button. A
+		     lone question (single-select or custom answer) submits
+		     on option-click or Enter in the textarea, so its button
+		     would be pure redundancy — drop it and just show the
+		     skip hint. -->
+		{#if questions.length > 1 || questions.some((q) => q.allow_multiple)}
+			<div class="ask-actions">
+				<button
+					type="button"
+					class="ask-submit"
+					disabled={!anyAnswered || submitting || submitted}
+					onclick={() => void submit()}
+				>
+					{submitted ? 'Sent' : submitting ? 'Sending…' : 'Send answer'}
+				</button>
+				<span class="ask-skip-hint">or just type in the composer to skip</span>
+			</div>
+		{/if}
 	</div>
 {/if}
 
