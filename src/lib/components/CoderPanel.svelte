@@ -521,11 +521,42 @@
 		return 0;
 	});
 
+	// Sub-agent activity signal. A `task` tool row renders an
+	// inline collapsed card that gets *inserted* under the tool row
+	// when `subagent_spawned` lands, then mutates over the
+	// sub-agent's life (status pip flips on finish, token footer
+	// ticks, result preview fills in). Every one of those changes
+	// the card's rendered height, and *none* of them touch
+	// `coder.rows`, so `tailGrowth` above stays flat and the
+	// auto-scroll effect never re-runs — the viewport stalls the
+	// moment a sub-agent launches.
+	//
+	// The dominant case is the spawn itself: a fresh summary's
+	// numeric fields (`tokensUsedEstimate`, preview length) are all
+	// zero, so a value-only digest wouldn't change and the effect's
+	// `$derived` dep wouldn't fire. We therefore mix the summary
+	// *count* and a per-status tick into the digest, so a brand-new
+	// (all-zero) card still bumps the signal. Cheap: a handful of
+	// summaries, a couple of adds each.
+	const subagentGrowth = $derived.by(() => {
+		const summaries = coder.subagentSummaries;
+		let digest = summaries.size;
+		for (const summary of summaries.values()) {
+			digest += summary.tokensUsedEstimate + (summary.resultPreview?.length ?? 0);
+			if (summary.status !== 'running') {
+				digest += 1;
+			}
+		}
+		return digest;
+	});
+
 	$effect(() => {
 		const count = coder.rows.length;
-		// Register the streaming-growth dep so this effect re-runs
-		// on in-place text/result mutation, not just on append.
+		// Register the streaming-growth deps so this effect re-runs
+		// on in-place text/result mutation and on sub-agent card
+		// growth, not just on row append.
 		void tailGrowth;
+		void subagentGrowth;
 		if (count < lastRowCount) {
 			// Conversation reset: folder switch, sub-agent → main
 			// pop, or session swap shrinks the row list. Re-arm
