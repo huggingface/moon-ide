@@ -241,6 +241,84 @@ export type GitMergeState = {
 };
 
 /**
+ * Which side of the diff a review comment is anchored to —
+ * `'working'` (GitHub `RIGHT`, the code as it will land, the common
+ * case) or `'base'` (GitHub `LEFT`, the deleted / old side). Mirrors
+ * `moon_protocol::review::ReviewSide`.
+ */
+export type ReviewSide = 'base' | 'working';
+
+/**
+ * Where a [`ReviewComment`] points. `startLine` / `endLine` are a
+ * fast-path render hint; `fingerprint` is the source of truth used
+ * to re-locate the anchor after the text drifts. Mirrors
+ * `moon_protocol::review::ReviewAnchor`.
+ */
+export type ReviewAnchor = {
+	path: string;
+	side: ReviewSide;
+	/** 1-based, in the side's current text — a hint. */
+	startLine: number;
+	/** 1-based; equals `startLine` for single-line comments. */
+	endLine: number;
+	/** Hash of the trimmed anchored line text(s). */
+	fingerprint: string;
+	/** Merge-base / `HEAD` SHA the comment was written against. */
+	baselineRev: string;
+};
+
+/**
+ * One local-first review-comment draft. One author, one body, one
+ * anchor — no threading. Lives in the workspace session until
+ * published to GitHub and then cleared locally. Mirrors
+ * `moon_protocol::review::ReviewComment`.
+ */
+export type ReviewComment = {
+	/** ULID assigned on create. */
+	id: string;
+	anchor: ReviewAnchor;
+	/** Markdown comment text. */
+	body: string;
+	/** RFC3339 creation timestamp. */
+	createdAt: string;
+};
+
+/**
+ * A per-file "Viewed" mark, pinned to the ticked version's blob
+ * SHA. The frontend drops the mark when the file's current blob SHA
+ * no longer matches `reviewedRev`. Never published. Mirrors
+ * `moon_protocol::review::ReviewedFile`.
+ */
+export type ReviewedFile = {
+	path: string;
+	/** Blob SHA (`git hash-object`) of the ticked version. */
+	reviewedRev: string;
+	/** RFC3339 timestamp of when the file was marked reviewed. */
+	reviewedAt: string;
+};
+
+/**
+ * Request to publish a batch of local comments as one GitHub PR
+ * review. Mirrors `moon_protocol::review::PublishReviewRequest`.
+ * (The publish path itself lands in Phase 5.7.2.)
+ */
+export type PublishReviewRequest = {
+	body: string | null;
+	comments: ReviewComment[];
+};
+
+/**
+ * Outcome of a publish. `'no_pr'` when the current branch has no
+ * open PR (UI shows a create-PR CTA); `'published'` carries how many
+ * comments landed, the ids of any that couldn't be placed at the PR
+ * head (kept as local drafts), and the posted review URL. Mirrors
+ * the tagged enum `moon_protocol::review::PublishReviewResult`.
+ */
+export type PublishReviewResult =
+	| { kind: 'no_pr'; branch: string }
+	| { kind: 'published'; posted: number; lost: string[]; reviewUrl: string };
+
+/**
  * Per-line blame for the inline current-line annotation and its
  * hover tooltip. Mirrors `moon_protocol::git::GitLineBlame`. The
  * `isUncommitted` flag is a convenience peel-off of the all-zero
@@ -759,6 +837,10 @@ export type FolderSession = {
 	pr_scope: PrListScope;
 	/** SCM compare baseline — see `CompareBaseline`. */
 	compare_baseline: CompareBaseline;
+	/** Local-first review-comment drafts for this folder (Phase 5.7). */
+	review_comments: ReviewComment[];
+	/** Per-file "Viewed" marks for this folder (Phase 5.7). */
+	reviewed_files: ReviewedFile[];
 };
 
 /**

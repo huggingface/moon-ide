@@ -28,6 +28,10 @@ import {
 	type LspStatusEvent,
 	type NextEditProbeResult,
 	type NextEditServerSnapshot,
+	type PublishReviewResult,
+	type ReviewComment,
+	type ReviewedFile,
+	type ReviewSide,
 	type SplitSide,
 	type SystemTheme,
 	type ThemeMode,
@@ -276,6 +280,19 @@ class FolderState {
 	// flip — which remounts the sections under a new key but keeps
 	// the same `review://` tab — still restores.
 	reviewRestore = $state<{ path: string; offset: number } | null>(null);
+
+	// Local-first review-comment drafts for this folder (Phase
+	// 5.7). Anchored by content so they survive edits and rebases;
+	// persisted in `FolderSession.review_comments` and cleared once
+	// published to a GitHub PR. CRUD goes through `WorkspaceState`,
+	// which proxies the active folder.
+	reviewComments = $state<ReviewComment[]>([]);
+
+	// Per-file "Viewed" marks for this folder (Phase 5.7). Each is
+	// pinned to the blob SHA of the version that was ticked;
+	// `refreshReviewedFiles` drops entries whose file changed.
+	// Persisted in `FolderSession.reviewed_files`. Never published.
+	reviewedFiles = $state<ReviewedFile[]>([]);
 
 	constructor(public readonly folderPath: string) {}
 }
@@ -535,6 +552,204 @@ class WorkspaceState {
 	// the user is editing, not on the synthetic review buffer
 	// itself.
 	reviewFocusPath = $state<string | null>(null);
+
+	// --- Review comments (Phase 5.7) -----------------------------------
+	// All comment CRUD proxies the active folder's `FolderState`, the
+	// same shape as the `compareBaseline` / `reviewRestore` proxies.
+	// Every mutation persists the session so drafts survive a restart.
+
+	/** Comment drafts for the active folder. Empty when no folder. */
+	get reviewComments(): readonly ReviewComment[] {
+		return this.activeFolderState?.reviewComments ?? [];
+	}
+
+	/** Comment drafts anchored to `path`, in creation order. */
+	reviewCommentsForPath(path: string): ReviewComment[] {
+		return (this.activeFolderState?.reviewComments ?? []).filter((c) => c.anchor.path === path);
+	}
+
+	/**
+	 * Create a comment anchored to `path` lines `startLine..=endLine`
+	 * on `side`. `lineText` is the trimmed source of the anchored
+	 * line(s), used to compute the content fingerprint the publish
+	 * path and the re-anchoring pass key off. `baselineRev` is the
+	 * merge-base / HEAD SHA the review is being read against.
+	 */
+	addReviewComment(args: {
+		path: string;
+		side: ReviewSide;
+		startLine: number;
+		endLine: number;
+		lineText: string;
+		baselineRev: string;
+		body: string;
+	}): ReviewComment | null {
+		const fs = this.activeFolderState;
+		if (!fs) {
+			return null;
+		}
+		const comment: ReviewComment = {
+			id: crypto.randomUUID(),
+			anchor: {
+				path: args.path,
+				side: args.side,
+				startLine: args.startLine,
+				endLine: args.endLine,
+				fingerprint: reviewFingerprint(args.lineText),
+				baselineRev: args.baselineRev,
+			},
+			body: args.body,
+			createdAt: new Date().toISOString(),
+		};
+		fs.reviewComments = [...fs.reviewComments, comment];
+		this.persistAppState();
+		return comment;
+	}
+
+	/** Replace a comment's body. No-op if the id is unknown. */
+	editReviewComment(id: string, body: string): void {
+		const fs = this.activeFolderState;
+		if (!fs) {
+			return;
+		}
+		const next = fs.reviewComments.map((c) => (c.id === id ? { ...c, body } : c));
+		if (next.some((c, i) => c !== fs.reviewComments[i])) {
+			fs.reviewComments = next;
+			this.persistAppState();
+		}
+	}
+
+	/** Delete a comment by id. No-op if unknown. */
+	deleteReviewComment(id: string): void {
+		const fs = this.activeFolderState;
+		if (!fs) {
+			return;
+		}
+		const next = fs.reviewComments.filter((c) => c.id !== id);
+		if (next.length !== fs.reviewComments.length) {
+			fs.reviewComments = next;
+			this.persistAppState();
+		}
+	}
+
+	/**
+	 * Publish the active folder's review-comment drafts to the
+	 * current branch's GitHub PR as one review (Phase 5.7.2). On a
+	 * successful post, the comments that landed (everything except
+	 * the "lost" ids) are deleted locally — drafts only live until
+	 * they're on GitHub. Returns the backend result so the dialog can
+	 * report posted / lost / no-PR. `null` when there's no active
+	 * folder or no comments to publish.
+	 */
+	async publishReview(body: string | null): Promise<PublishReviewResult | null> {
+		const fs = this.activeFolderState;
+		if (!fs || fs.reviewComments.length === 0) {
+			return null;
+		}
+		const comments = [...fs.reviewComments];
+		const result = await ipc.fs.publishPrReview({ body, comments });
+		if (result.kind === 'published' && this.activeFolderState === fs) {
+			// Drop the comments that posted; keep the lost ones as
+			// local drafts so the user can retry / re-place them.
+			const lost = new Set(result.lost);
+			const submitted = new Set(comments.map((c) => c.id));
+			fs.reviewComments = fs.reviewComments.filter((c) => !submitted.has(c.id) || lost.has(c.id));
+			this.persistAppState();
+		}
+		return result;
+	}
+
+	/**
+	 * Re-pin a comment's line hint after the re-anchoring pass found
+	 * its fingerprint at a new location. Doesn't touch the
+	 * fingerprint or body. Persisted so the hint is fresh next launch.
+	 */
+	repinReviewComment(id: string, startLine: number, endLine: number): void {
+		const fs = this.activeFolderState;
+		if (!fs) {
+			return;
+		}
+		const next = fs.reviewComments.map((c) =>
+			c.id === id ? { ...c, anchor: { ...c.anchor, startLine, endLine } } : c,
+		);
+		if (next.some((c, i) => c !== fs.reviewComments[i])) {
+			fs.reviewComments = next;
+			this.persistAppState();
+		}
+	}
+
+	// --- Reviewed-file marks (Phase 5.7) -------------------------------
+
+	/** Reviewed-file marks for the active folder. */
+	get reviewedFiles(): readonly ReviewedFile[] {
+		return this.activeFolderState?.reviewedFiles ?? [];
+	}
+
+	/** Whether `path` is currently marked reviewed in the active folder. */
+	isFileReviewed(path: string): boolean {
+		return (this.activeFolderState?.reviewedFiles ?? []).some((r) => r.path === path);
+	}
+
+	/**
+	 * Mark `path` reviewed, pinned to its current blob SHA (resolved
+	 * via the host). A later `refreshReviewedFiles` clears the mark
+	 * if the file's SHA moves. Unticking is just removal. Resolving
+	 * the SHA can fail (file gone, no git); we no-op rather than store
+	 * a mark we can't validate.
+	 */
+	async setFileReviewed(path: string, reviewed: boolean): Promise<void> {
+		const fs = this.activeFolderState;
+		if (!fs) {
+			return;
+		}
+		if (!reviewed) {
+			const next = fs.reviewedFiles.filter((r) => r.path !== path);
+			if (next.length !== fs.reviewedFiles.length) {
+				fs.reviewedFiles = next;
+				this.persistAppState();
+			}
+			return;
+		}
+		const sha = await ipc.fs.gitBlobSha(path);
+		if (sha === null) {
+			return;
+		}
+		// The folder could have switched while the SHA resolved.
+		if (this.activeFolderState !== fs) {
+			return;
+		}
+		const mark: ReviewedFile = { path, reviewedRev: sha, reviewedAt: new Date().toISOString() };
+		fs.reviewedFiles = [...fs.reviewedFiles.filter((r) => r.path !== path), mark];
+		this.persistAppState();
+	}
+
+	/**
+	 * Drop reviewed-file marks whose pinned blob SHA no longer matches
+	 * the file's current SHA — i.e. the file changed (local edit, new
+	 * local commit, or pulled commit) since it was ticked, so the
+	 * "Viewed" state is stale and the row should re-surface for
+	 * re-review. Called from the git-status refresh. Resolves each
+	 * marked file's current blob SHA via the host (cheap — only the
+	 * handful of files that are actually marked). A file that no
+	 * longer resolves (deleted / unreadable) also clears.
+	 */
+	async refreshReviewedFiles(): Promise<void> {
+		const fs = this.activeFolderState;
+		if (!fs || fs.reviewedFiles.length === 0) {
+			return;
+		}
+		const marks = fs.reviewedFiles;
+		const shas = await Promise.all(marks.map((r) => ipc.fs.gitBlobSha(r.path).catch(() => null as string | null)));
+		// The folder could have switched while SHAs resolved.
+		if (this.activeFolderState !== fs) {
+			return;
+		}
+		const kept = fs.reviewedFiles.filter((r, i) => shas[i] === r.reviewedRev);
+		if (kept.length !== fs.reviewedFiles.length) {
+			fs.reviewedFiles = kept;
+			this.persistAppState();
+		}
+	}
 
 	// Linear navigation history, browser-style but position-aware (each
 	// entry pins a caret inside a file rather than just a path).
@@ -1516,6 +1731,10 @@ class WorkspaceState {
 					// don't carry the field; trust whatever lands.
 					fs.prScope = folderSession.pr_scope ?? 'all';
 					fs.compareBaseline = folderSession.compare_baseline ?? 'head';
+					// `#[serde(default)]` fills these as empty arrays for
+					// sessions written by older builds (Phase 5.7).
+					fs.reviewComments = folderSession.review_comments ?? [];
+					fs.reviewedFiles = folderSession.reviewed_files ?? [];
 				} finally {
 					if (previousActive !== null && previousActive !== folder.path) {
 						try {
@@ -1905,6 +2124,8 @@ class WorkspaceState {
 						focused_side: fs.focusedSide,
 						pr_scope: fs.prScope,
 						compare_baseline: fs.compareBaseline,
+						review_comments: fs.reviewComments,
+						reviewed_files: fs.reviewedFiles,
 					});
 				}
 			}
@@ -2844,6 +3065,12 @@ class WorkspaceState {
 				this.gitStatusEntries = [];
 			}
 		}
+		// Clear any reviewed-file marks whose file changed since it
+		// was ticked (a new commit / pull / local edit). Fire-and-
+		// forget — it only resolves SHAs for the few marked files and
+		// drops stale ones; the review tab's "Viewed" checkboxes
+		// repaint reactively.
+		void this.refreshReviewedFiles();
 		// `HEAD` moves whenever a git status refresh is warranted
 		// (commit, checkout, pull, reset). Re-fetch the content
 		// backing open text buffers so the gutter flips from
@@ -6162,6 +6389,31 @@ function buildDiscardMessage(toRestore: string[], toTrash: string[]): string {
 		parts.push(`move ${untrackedParts.join(' and ')} to the trash`);
 	}
 	return `Discard ${total} change${total === 1 ? '' : 's'}? This will ${parts.join(' and ')}. The restore step cannot be undone.`;
+}
+
+/**
+ * Content fingerprint for a review comment's anchored line(s)
+ * (Phase 5.7). The anchor's line numbers are a render hint; this
+ * fingerprint is the truth used to re-locate the anchor after the
+ * text drifts and, at publish time, to confirm the line still
+ * exists at the PR head. We trim each line and join with `\n` so
+ * pure indentation shifts (a reformat that re-indents the block)
+ * don't lose the anchor, then hash with the FNV-1a 32-bit variant —
+ * a tiny, dependency-free, deterministic hash; collision risk over
+ * a handful of nearby lines is negligible for a positioning hint.
+ */
+function reviewFingerprint(lineText: string): string {
+	const normalized = lineText
+		.split('\n')
+		.map((l) => l.trim())
+		.join('\n');
+	let hash = 0x811c9dc5;
+	for (let i = 0; i < normalized.length; i++) {
+		hash ^= normalized.charCodeAt(i);
+		// FNV prime, kept in 32-bit range via Math.imul.
+		hash = Math.imul(hash, 0x01000193);
+	}
+	return (hash >>> 0).toString(16).padStart(8, '0');
 }
 
 /**

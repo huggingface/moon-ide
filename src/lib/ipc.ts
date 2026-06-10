@@ -57,6 +57,8 @@ import type {
 	ForwardedPort,
 	ForwardedPortStatus,
 	PortsApplyResult,
+	PublishReviewRequest,
+	PublishReviewResult,
 	ReadFileResult,
 	RightPanelKind,
 	SlackBotProfile,
@@ -155,6 +157,9 @@ export const ipc = {
 		gitBlame: (path: string) => invoke<GitFileBlame | null>('fs_git_blame', { path }),
 		gitPermalink: (path: string, startLine: number, endLine: number) =>
 			invoke<GitPermalink | null>('fs_git_permalink', { path, startLine, endLine }),
+		gitBlobSha: (path: string) => invoke<string | null>('fs_git_blob_sha', { path }),
+		publishPrReview: (request: PublishReviewRequest) =>
+			invoke<PublishReviewResult>('fs_publish_pr_review', { request }),
 		gitHeadContent: (path: string) => invoke<string | null>('fs_git_head_content', { path }),
 		gitRefContent: (rev: string, path: string) => invoke<string | null>('fs_git_ref_content', { rev, path }),
 		gitDefaultBranchDiff: () => invoke<BranchDiffStatus | null>('fs_git_default_branch_diff'),

@@ -12,6 +12,7 @@ use moon_protocol::git::{
 	BranchDiffStatus, BranchList, BranchListEntry, BranchSwitchTarget, GitBranchInfo, GitCommitResult, GitFileBlame,
 	GitFileStatus, GitLineBlame, GitMergeState, GitPermalink, GitStatusEntry, PrListScope, PrListStatus,
 };
+use moon_protocol::review::{PublishReviewRequest, PublishReviewResult, ReviewSide};
 use moon_protocol::{MoonError, MoonResult};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -235,6 +236,34 @@ pub trait WorkspaceHost: Send + Sync {
 	/// `git` isn't on PATH. Path containment is enforced the same way
 	/// as [`Self::git_blame`] (no absolute paths, no `..` escapes).
 	async fn git_permalink(&self, path: &Utf8Path, start_line: u32, end_line: u32) -> MoonResult<Option<GitPermalink>>;
+
+	/// Blob SHA of the working-tree version of `path` (`git
+	/// hash-object`). Used to fingerprint reviewed-file marks
+	/// (Phase 5.7): a "Viewed" tick is pinned to this SHA, and the
+	/// frontend clears the mark when a later refresh reports a
+	/// different SHA — i.e. the file changed since it was ticked.
+	///
+	/// Returns `Ok(None)` for the cases the UI treats as "can't
+	/// fingerprint, leave unticked": the file doesn't exist on disk
+	/// (e.g. a working-tree-deleted entry) or `git` isn't on PATH.
+	/// Path containment is enforced the same way as
+	/// [`Self::git_permalink`].
+	async fn git_blob_sha(&self, path: &Utf8Path) -> MoonResult<Option<String>>;
+
+	/// Publish a batch of local review-comment drafts to the current
+	/// branch's GitHub PR as a single review (Phase 5.7.2). Shells
+	/// out to `gh` (never a raw token), so auth is inherited from the
+	/// user's `gh` login / the container's forwarded `GH_TOKEN`.
+	///
+	/// The flow: resolve the PR + head SHA via `gh pr view`; for each
+	/// comment re-anchor its content fingerprint against the PR-head
+	/// version of the file (`git show <head>:<path>`); post the
+	/// survivors as one `event: COMMENT` review via `gh api`. Returns
+	/// [`PublishReviewResult::NoPr`] when the branch has no open PR,
+	/// or [`PublishReviewResult::Published`] with the count posted,
+	/// the ids that couldn't be placed at the head (kept as local
+	/// drafts), and the review URL.
+	async fn publish_pr_review(&self, request: PublishReviewRequest) -> MoonResult<PublishReviewResult>;
 
 	/// Contents of `path` at `HEAD`. Used as the "before" side of the
 	/// editor's git diff view, and as the displayable text for a
@@ -1560,28 +1589,7 @@ impl WorkspaceHost for LocalHost {
 		if path.as_str().is_empty() {
 			return Ok(None);
 		}
-		let rel = Utf8PathBuf::from(path.as_str().trim_end_matches('/'));
-		if rel.is_absolute() {
-			return Err(MoonError::invalid(format!(
-				"git_permalink rejects absolute path: {rel}"
-			)));
-		}
-		let mut depth = 0i32;
-		for seg in rel.components() {
-			match seg {
-				camino::Utf8Component::ParentDir => {
-					depth -= 1;
-					if depth < 0 {
-						return Err(MoonError::invalid(format!("git_permalink rejects path escape: {rel}")));
-					}
-				}
-				camino::Utf8Component::Normal(_) => depth += 1,
-				camino::Utf8Component::CurDir => {}
-				camino::Utf8Component::Prefix(_) | camino::Utf8Component::RootDir => {
-					return Err(MoonError::invalid(format!("git_permalink rejects rooted path: {rel}")));
-				}
-			}
-		}
+		let rel = reject_uncontained_path("git_permalink", path)?;
 		let guard = self.git_lock().await;
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
@@ -1590,6 +1598,25 @@ impl WorkspaceHost for LocalHost {
 		})
 		.await
 		.map_err(|e| MoonError::Internal(format!("git_permalink join error: {e}")))?
+	}
+
+	async fn git_blob_sha(&self, path: &Utf8Path) -> MoonResult<Option<String>> {
+		let rel = reject_uncontained_path("git_blob_sha", path)?;
+		if rel.as_str().is_empty() {
+			return Ok(None);
+		}
+		let guard = self.git_lock().await;
+		let root = self.root.clone();
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			Ok(run_git_blob_sha(&root, &rel))
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_blob_sha join error: {e}")))?
+	}
+
+	async fn publish_pr_review(&self, request: PublishReviewRequest) -> MoonResult<PublishReviewResult> {
+		run_publish_pr_review(&self.root, request).await
 	}
 
 	async fn git_head_content(&self, path: &Utf8Path) -> MoonResult<Option<String>> {
@@ -3250,6 +3277,281 @@ async fn run_git_fetch_quiet(root: &Utf8Path) -> MoonResult<()> {
 	Ok(())
 }
 
+/// FNV-1a 32-bit hash of the trimmed-and-joined anchored line text.
+/// MUST match the frontend `reviewFingerprint` / `reviewLineFingerprint`
+/// byte-for-byte (trim each line, join with `\n`, FNV-1a, 8-hex-char
+/// lowercase) so a fingerprint written at comment-creation time
+/// re-resolves here against the PR-head version of the file.
+fn review_fingerprint(line_text: &str) -> String {
+	let normalized = line_text.split('\n').map(str::trim).collect::<Vec<_>>().join("\n");
+	let mut hash: u32 = 0x811c_9dc5;
+	for ch in normalized.chars() {
+		// The frontend hashes UTF-16 code units (`charCodeAt`); for
+		// the BMP that equals the char's code point. Non-BMP chars in
+		// an anchored line are vanishingly rare for source review;
+		// match the common case (code point == code unit) and accept
+		// that an astral-plane char would disagree (the comment just
+		// goes "lost" and stays a local draft, which is the safe
+		// failure mode).
+		hash ^= ch as u32;
+		hash = hash.wrapping_mul(0x0100_0193);
+	}
+	format!("{hash:08x}")
+}
+
+/// Re-locate a comment's anchor in `lines` (0-indexed file content)
+/// by fingerprint, mirroring the frontend `resolveAnchor`. Returns
+/// the 1-based `(start_line, end_line)` where the content now sits,
+/// or `None` if it can't be found within the search window (the
+/// "lost" case — the line changed at the PR head out from under us).
+fn resolve_anchor_in(lines: &[&str], start_line: u32, end_line: u32, fingerprint: &str) -> Option<(u32, u32)> {
+	const RADIUS: i64 = 40;
+	let span = end_line.saturating_sub(start_line) as i64;
+	let total = lines.len() as i64;
+	let range_text = |start_1based: i64| -> Option<String> {
+		let end_1based = start_1based + span;
+		if start_1based < 1 || end_1based > total {
+			return None;
+		}
+		let from = (start_1based - 1) as usize;
+		let to = end_1based as usize;
+		Some(lines[from..to].join("\n"))
+	};
+	let hint = start_line as i64;
+	if let Some(text) = range_text(hint) {
+		if review_fingerprint(&text) == fingerprint {
+			return Some((start_line, (start_line as i64 + span) as u32));
+		}
+	}
+	for delta in 1..=RADIUS {
+		for dir in [-1_i64, 1] {
+			let start = hint + dir * delta;
+			if let Some(text) = range_text(start) {
+				if review_fingerprint(&text) == fingerprint {
+					return Some((start as u32, (start + span) as u32));
+				}
+			}
+		}
+	}
+	None
+}
+
+/// `gh` timeout for the publish round-trips. Same ceiling as the PR
+/// list — a GitHub review POST is a single API call.
+const GH_PUBLISH_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+
+/// Resolve the open PR for the current branch via
+/// `gh pr view --json number,headRefOid,headRefName`. Returns
+/// `Ok(None)` when there's no PR (gh exits non-zero / empty), which
+/// the caller surfaces as [`PublishReviewResult::NoPr`].
+async fn gh_pr_head(root: &Utf8Path) -> MoonResult<Option<(u64, String)>> {
+	let mut cmd = tokio::process::Command::new("gh");
+	cmd
+		.current_dir(root.as_std_path())
+		.args(["pr", "view", "--json", "number,headRefOid,state"])
+		.env("GH_PROMPT_DISABLED", "1")
+		.env("LC_ALL", "C")
+		.stdin(std::process::Stdio::null())
+		.stdout(std::process::Stdio::piped())
+		.stderr(std::process::Stdio::piped());
+	let child = match cmd.spawn() {
+		Ok(c) => c,
+		Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+			return Err(MoonError::invalid("gh is not installed"));
+		}
+		Err(err) => return Err(MoonError::IoError(format!("gh pr view spawn: {err}"))),
+	};
+	let output = match tokio::time::timeout(GH_PUBLISH_TIMEOUT, child.wait_with_output()).await {
+		Ok(Ok(o)) => o,
+		Ok(Err(err)) => return Err(MoonError::IoError(format!("gh pr view: {err}"))),
+		Err(_) => return Err(MoonError::IoError("gh pr view timed out".to_owned())),
+	};
+	if !output.status.success() {
+		// gh exits non-zero when the branch has no associated PR —
+		// the expected "nothing to publish to" signal.
+		return Ok(None);
+	}
+	let value: serde_json::Value =
+		serde_json::from_slice(&output.stdout).map_err(|e| MoonError::Internal(format!("gh pr view JSON: {e}")))?;
+	let number = value.get("number").and_then(serde_json::Value::as_u64);
+	let head = value
+		.get("headRefOid")
+		.and_then(serde_json::Value::as_str)
+		.map(str::to_owned);
+	match (number, head) {
+		(Some(n), Some(h)) if !h.is_empty() => Ok(Some((n, h))),
+		_ => Ok(None),
+	}
+}
+
+/// Fetch the PR-head version of `path` (`git show <head>:<path>`).
+/// `None` when the path isn't in the head tree (a comment on a file
+/// the head doesn't have → every comment on it goes "lost").
+async fn git_show_at(root: &Utf8Path, rev: &str, path: &str) -> Option<String> {
+	let spec = format!("{}:{}", rev, path.replace('\\', "/"));
+	let output = tokio::process::Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.arg("show")
+		.arg(&spec)
+		.env("LC_ALL", "C")
+		.output()
+		.await
+		.ok()?;
+	if !output.status.success() {
+		return None;
+	}
+	String::from_utf8(output.stdout).ok()
+}
+
+/// `WorkspaceHost::publish_pr_review` body. See the trait doc for
+/// the flow. Kept as a free async fn so it composes the `gh` / `git`
+/// subprocess calls without holding the blocking pool.
+async fn run_publish_pr_review(root: &Utf8Path, request: PublishReviewRequest) -> MoonResult<PublishReviewResult> {
+	// 1. Resolve the PR + head SHA. No PR → caller shows create-PR CTA.
+	let branch = run_git_branch(root).name.unwrap_or_default();
+	let Some((number, head_sha)) = gh_pr_head(root).await? else {
+		return Ok(PublishReviewResult::NoPr { branch });
+	};
+
+	// 2. Reconcile each comment's anchor against the PR-head file.
+	//    Cache head-version content per path so N comments on one
+	//    file only fetch it once.
+	let mut head_files: std::collections::HashMap<String, Option<Vec<String>>> = std::collections::HashMap::new();
+	let mut review_comments: Vec<serde_json::Value> = Vec::new();
+	let mut lost: Vec<String> = Vec::new();
+
+	for comment in &request.comments {
+		let path = &comment.anchor.path;
+		if !head_files.contains_key(path) {
+			let content = git_show_at(root, &head_sha, path).await;
+			let lines = content.map(|c| c.split('\n').map(str::to_owned).collect::<Vec<_>>());
+			head_files.insert(path.clone(), lines);
+		}
+		let Some(Some(owned_lines)) = head_files.get(path) else {
+			// File not present at head → comment can't be placed.
+			lost.push(comment.id.clone());
+			continue;
+		};
+		let refs: Vec<&str> = owned_lines.iter().map(String::as_str).collect();
+		match resolve_anchor_in(
+			&refs,
+			comment.anchor.start_line,
+			comment.anchor.end_line,
+			&comment.anchor.fingerprint,
+		) {
+			Some((start, end)) => {
+				let side = match comment.anchor.side {
+					ReviewSide::Base => "LEFT",
+					ReviewSide::Working => "RIGHT",
+				};
+				let mut obj = serde_json::Map::new();
+				obj.insert("path".to_owned(), serde_json::Value::String(path.clone()));
+				obj.insert("body".to_owned(), serde_json::Value::String(comment.body.clone()));
+				obj.insert("line".to_owned(), serde_json::Value::Number(end.into()));
+				obj.insert("side".to_owned(), serde_json::Value::String(side.to_owned()));
+				if end > start {
+					obj.insert("start_line".to_owned(), serde_json::Value::Number(start.into()));
+					obj.insert("start_side".to_owned(), serde_json::Value::String(side.to_owned()));
+				}
+				review_comments.push(serde_json::Value::Object(obj));
+			}
+			None => lost.push(comment.id.clone()),
+		}
+	}
+
+	if review_comments.is_empty() {
+		// Nothing placed — don't post an empty review. Report all as
+		// lost so the UI keeps them and explains why.
+		return Ok(PublishReviewResult::Published {
+			posted: 0,
+			lost,
+			review_url: String::new(),
+		});
+	}
+
+	// 3. Post one atomic COMMENT review via `gh api`.
+	let mut payload = serde_json::Map::new();
+	payload.insert("commit_id".to_owned(), serde_json::Value::String(head_sha.clone()));
+	payload.insert("event".to_owned(), serde_json::Value::String("COMMENT".to_owned()));
+	if let Some(body) = request.body.as_ref().filter(|b| !b.trim().is_empty()) {
+		payload.insert("body".to_owned(), serde_json::Value::String(body.clone()));
+	}
+	let posted_count = review_comments.len() as u32;
+	payload.insert("comments".to_owned(), serde_json::Value::Array(review_comments));
+	let body_json = serde_json::Value::Object(payload).to_string();
+
+	let endpoint = format!("repos/{{owner}}/{{repo}}/pulls/{number}/reviews");
+	let review_url = gh_api_post_review(root, &endpoint, &body_json).await?;
+
+	Ok(PublishReviewResult::Published {
+		posted: posted_count,
+		lost,
+		review_url,
+	})
+}
+
+/// POST a review payload via `gh api --input -` (reads JSON from
+/// stdin so the nested `comments[]` array survives). Returns the
+/// posted review's `html_url`. `gh api` targets `api.github.com`,
+/// sets the auth header from the logged-in token, and adds the API
+/// version — no token handling on our side.
+async fn gh_api_post_review(root: &Utf8Path, endpoint: &str, body_json: &str) -> MoonResult<String> {
+	use tokio::io::AsyncWriteExt;
+
+	let mut cmd = tokio::process::Command::new("gh");
+	cmd
+		.current_dir(root.as_std_path())
+		.args([
+			"api",
+			"--method",
+			"POST",
+			"-H",
+			"Accept: application/vnd.github+json",
+			endpoint,
+			"--input",
+			"-",
+		])
+		.env("GH_PROMPT_DISABLED", "1")
+		.env("LC_ALL", "C")
+		.stdin(std::process::Stdio::piped())
+		.stdout(std::process::Stdio::piped())
+		.stderr(std::process::Stdio::piped());
+	let mut child = match cmd.spawn() {
+		Ok(c) => c,
+		Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+			return Err(MoonError::invalid("gh is not installed"));
+		}
+		Err(err) => return Err(MoonError::IoError(format!("gh api spawn: {err}"))),
+	};
+	if let Some(mut stdin) = child.stdin.take() {
+		stdin
+			.write_all(body_json.as_bytes())
+			.await
+			.map_err(|e| MoonError::IoError(format!("gh api stdin: {e}")))?;
+		// Drop stdin so gh sees EOF.
+		drop(stdin);
+	}
+	let output = match tokio::time::timeout(GH_PUBLISH_TIMEOUT, child.wait_with_output()).await {
+		Ok(Ok(o)) => o,
+		Ok(Err(err)) => return Err(MoonError::IoError(format!("gh api: {err}"))),
+		Err(_) => return Err(MoonError::IoError("gh api timed out".to_owned())),
+	};
+	if !output.status.success() {
+		let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+		return Err(MoonError::IoError(format!("gh api review POST failed: {stderr}")));
+	}
+	let value: serde_json::Value =
+		serde_json::from_slice(&output.stdout).map_err(|e| MoonError::Internal(format!("gh api review JSON: {e}")))?;
+	Ok(
+		value
+			.get("html_url")
+			.and_then(serde_json::Value::as_str)
+			.unwrap_or_default()
+			.to_owned(),
+	)
+}
+
 /// Cap on local-branch rows. Bumps when a real project hits it; 20
 /// is "Cmd+Shift+B for the last few branches I touched" territory.
 const BRANCH_LIST_LOCAL_CAP: usize = 20;
@@ -3967,6 +4269,69 @@ fn run_git_blame(root: &Utf8Path, path: &Utf8PathBuf) -> MoonResult<Option<GitFi
 /// hands us a flag-shaped or path-shaped rev, so any other
 /// input is either a bug or an attempt to confuse the underlying
 /// git invocation.
+/// Shared path-containment envelope for git helpers that take a
+/// workspace-relative path: reject absolute, rooted, and
+/// `..`-escaping paths (an empty path is allowed through — callers
+/// that can't act on it return `Ok(None)` themselves). `op` names
+/// the calling method for the error message. Trailing slashes are
+/// trimmed so a directory-style path normalises to its file form.
+fn reject_uncontained_path(op: &str, path: &Utf8Path) -> MoonResult<Utf8PathBuf> {
+	let rel = Utf8PathBuf::from(path.as_str().trim_end_matches('/'));
+	if rel.is_absolute() {
+		return Err(MoonError::invalid(format!("{op} rejects absolute path: {rel}")));
+	}
+	let mut depth = 0i32;
+	for seg in rel.components() {
+		match seg {
+			camino::Utf8Component::ParentDir => {
+				depth -= 1;
+				if depth < 0 {
+					return Err(MoonError::invalid(format!("{op} rejects path escape: {rel}")));
+				}
+			}
+			camino::Utf8Component::Normal(_) => depth += 1,
+			camino::Utf8Component::CurDir => {}
+			camino::Utf8Component::Prefix(_) | camino::Utf8Component::RootDir => {
+				return Err(MoonError::invalid(format!("{op} rejects rooted path: {rel}")));
+			}
+		}
+	}
+	Ok(rel)
+}
+
+/// `git hash-object <path>` — the blob SHA of the file's *current*
+/// on-disk bytes, regardless of index/HEAD state. This is what a
+/// reviewed-file mark is pinned to (Phase 5.7). Returns `Ok(None)`
+/// when the file is missing or `git` isn't on PATH; the caller
+/// treats both as "leave the row unticked". Invoked from the
+/// blocking pool.
+fn run_git_blob_sha(root: &Utf8Path, path: &Utf8PathBuf) -> Option<String> {
+	use std::process::Command;
+
+	let abs = root.join(path);
+	if !abs.as_std_path().is_file() {
+		return None;
+	}
+	let output = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.arg("hash-object")
+		.arg("--")
+		.arg(abs.as_std_path())
+		.output()
+		.ok()?;
+	if !output.status.success() {
+		return None;
+	}
+	let sha = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+	// A blob SHA is 40 hex chars; anything else is git surprising us.
+	if sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+		Some(sha)
+	} else {
+		None
+	}
+}
+
 fn is_safe_rev(rev: &str) -> bool {
 	if rev == "HEAD" {
 		return true;
@@ -5615,6 +5980,95 @@ mod tests {
 			.await
 			.unwrap_err();
 		assert!(matches!(err, MoonError::InvalidArgument(_)), "got {err:?}");
+	}
+
+	#[tokio::test]
+	async fn git_blob_sha_tracks_working_tree_content() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping blob-sha test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+		run_git(&git, dir.path(), &["init", "-q"]);
+
+		// SHA matches `git hash-object` of the working-tree bytes,
+		// regardless of index/commit state — the file is untracked
+		// here and still resolves.
+		let expected = String::from_utf8(
+			std::process::Command::new(&git)
+				.arg("-C")
+				.arg(dir.path())
+				.args(["hash-object", "a.txt"])
+				.output()
+				.unwrap()
+				.stdout,
+		)
+		.unwrap()
+		.trim()
+		.to_owned();
+		let got = host(&dir).git_blob_sha(Utf8Path::new("a.txt")).await.unwrap();
+		assert_eq!(got.as_deref(), Some(expected.as_str()));
+
+		// Editing the file changes the SHA — this is what makes a
+		// reviewed-file mark auto-clear when the file moves.
+		std::fs::write(dir.path().join("a.txt"), "hello world\n").unwrap();
+		let after = host(&dir).git_blob_sha(Utf8Path::new("a.txt")).await.unwrap();
+		assert!(after.is_some());
+		assert_ne!(after, got);
+
+		// A missing file yields `None`, not an error — the caller
+		// leaves the row unticked.
+		let missing = host(&dir).git_blob_sha(Utf8Path::new("nope.txt")).await.unwrap();
+		assert_eq!(missing, None);
+	}
+
+	#[tokio::test]
+	async fn git_blob_sha_rejects_path_escapes() {
+		let dir = TempDir::new().unwrap();
+		let err = host(&dir)
+			.git_blob_sha(Utf8Path::new("../secret.txt"))
+			.await
+			.unwrap_err();
+		assert!(matches!(err, MoonError::InvalidArgument(_)), "got {err:?}");
+	}
+
+	#[test]
+	fn review_fingerprint_matches_frontend() {
+		// Reference values produced by the TS `reviewFingerprint`
+		// (FNV-1a over trimmed-joined lines). Locks cross-language
+		// parity so a comment's fingerprint re-resolves at publish.
+		assert_eq!(super::review_fingerprint("fn b() {}"), "a0c2d750");
+		// Indentation is trimmed before hashing.
+		assert_eq!(
+			super::review_fingerprint("\tlet x = 1;"),
+			super::review_fingerprint("    let x = 1;  ")
+		);
+		assert_eq!(super::review_fingerprint("\tlet x = 1;"), "91ad1ca7");
+		assert_eq!(super::review_fingerprint("first\nsecond"), "9a3d2a39");
+	}
+
+	#[test]
+	fn resolve_anchor_in_finds_drifted_content() {
+		let lines = ["// new", "// new", "fn a() {}", "fn b() {}", "fn c() {}"];
+		// `fn b()` was on line 2 originally; the fingerprint relocates
+		// it to line 4.
+		let fp = super::review_fingerprint("fn b() {}");
+		assert_eq!(super::resolve_anchor_in(&lines, 2, 2, &fp), Some((4, 4)));
+	}
+
+	#[test]
+	fn resolve_anchor_in_reports_lost_when_gone() {
+		let lines = ["fn a() {}", "fn totally_different() {}", "fn c() {}"];
+		let fp = super::review_fingerprint("fn b() {}");
+		assert_eq!(super::resolve_anchor_in(&lines, 2, 2, &fp), None);
+	}
+
+	#[test]
+	fn resolve_anchor_in_handles_multiline() {
+		let lines = ["head", "head", "first", "second", "tail"];
+		let fp = super::review_fingerprint("first\nsecond");
+		assert_eq!(super::resolve_anchor_in(&lines, 1, 2, &fp), Some((3, 4)));
 	}
 
 	#[test]

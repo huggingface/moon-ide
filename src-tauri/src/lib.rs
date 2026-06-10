@@ -113,6 +113,8 @@ pub fn run() {
 			commands::fs::fs_git_add_paths,
 			commands::fs::fs_git_blame,
 			commands::fs::fs_git_permalink,
+			commands::fs::fs_git_blob_sha,
+			commands::fs::fs_publish_pr_review,
 			commands::fs::fs_git_head_content,
 			commands::fs::fs_git_ref_content,
 			commands::fs::fs_git_default_branch_diff,

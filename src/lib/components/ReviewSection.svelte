@@ -19,7 +19,16 @@
 	import { filePathFacet } from '../editor/lsp';
 	import { hasGotoModifier, lspGotoDefinitionExtension } from '../editor/lspGotoDefinition';
 	import { lspLanguageFor } from '../editor/lspLanguage';
-	import type { EditorConfig, GitFileStatus } from '../protocol';
+	import {
+		commentsForSide,
+		reanchorComments,
+		reviewCallbacksFacet,
+		reviewCommentsExtension,
+		reviewCommentsFacet,
+		reviewComposerFacet,
+		type ReviewCommentCallbacks,
+	} from '../editor/reviewComments';
+	import type { EditorConfig, GitFileStatus, ReviewComment, ReviewSide } from '../protocol';
 
 	type Props = {
 		path: string;
@@ -54,7 +63,12 @@
 	let sectionEl: HTMLElement | undefined = $state();
 	let host: HTMLDivElement | undefined = $state();
 	let merge: MergeView | undefined = $state();
-	let collapsed = $state(false);
+	// Explicit user collapse state. `null` = "follow the reviewed
+	// default" (collapsed once marked Viewed); a boolean is an
+	// explicit user override that survives until they toggle again.
+	// Re-marking Viewed (or a drift that clears it) resets the
+	// override so the default takes over again.
+	let collapseOverride = $state<boolean | null>(null);
 	let mounted = $state(false);
 	let loading = $state(false);
 	let buildToken = 0;
@@ -89,6 +103,32 @@
 	const wrapA = new Compartment();
 	const wrapB = new Compartment();
 	const ecB = new Compartment();
+	// Review-comment facets, one pair of compartments per side so the
+	// comment list / open-composer request reconfigure the live
+	// MergeView without a rebuild (same pattern as theme / wrap).
+	const commentsA = new Compartment();
+	const commentsB = new Compartment();
+	const composerA = new Compartment();
+	const composerB = new Compartment();
+
+	// Per-side open-composer requests. `null` = no composer open.
+	// Set from the section keybinding using the current selection;
+	// cleared on submit / cancel.
+	let composerBase = $state<{ startLine: number; endLine: number } | null>(null);
+	let composerWorking = $state<{ startLine: number; endLine: number } | null>(null);
+
+	// This section's comments, split by side. Reactive off the
+	// workspace store so a create / edit / delete repaints the cards.
+	const baseComments = $derived(commentsForSide(workspace.reviewCommentsForPath(path), 'base'));
+	const workingComments = $derived(commentsForSide(workspace.reviewCommentsForPath(path), 'working'));
+
+	// Is this file marked reviewed in the active folder? Drives the
+	// header "Viewed" checkbox and the default-collapsed state.
+	const reviewed = $derived(workspace.isFileReviewed(path));
+
+	// Effective collapse: an explicit user override wins; otherwise
+	// a reviewed file collapses by default (the user signed off).
+	const collapsed = $derived(collapseOverride ?? reviewed);
 
 	// Deleted-on-disk rows have no working tree to edit; everything
 	// else (modified / added / untracked) is fair game for fixes
@@ -223,6 +263,110 @@
 		return [EditorState.tabSize.of(Math.max(1, ec.tab_width)), indentUnit.of(unit)];
 	}
 
+	// The merge-base / HEAD SHA this section is reading the "before"
+	// side against — recorded on each comment so the publish path
+	// knows how far the world has moved. `null` baseline (vs HEAD)
+	// records the literal string `'HEAD'`.
+	function baselineRev(): string {
+		return mergeBase ?? 'HEAD';
+	}
+
+	function callbacksForSide(s: ReviewSide): ReviewCommentCallbacks {
+		return {
+			onSubmit: ({ startLine, endLine, lineText, body }) => {
+				workspace.addReviewComment({
+					path,
+					side: s,
+					startLine,
+					endLine,
+					lineText,
+					baselineRev: baselineRev(),
+					body,
+				});
+			},
+			onEdit: (id, body) => workspace.editReviewComment(id, body),
+			onDelete: (id) => workspace.deleteReviewComment(id),
+			onCloseComposer: () => {
+				if (s === 'base') {
+					composerBase = null;
+				} else {
+					composerWorking = null;
+				}
+			},
+			onAddAtLine: (line) => {
+				const req = { startLine: line, endLine: line };
+				if (s === 'base') {
+					composerBase = req;
+				} else {
+					composerWorking = req;
+				}
+			},
+		};
+	}
+
+	// Live-reconfigure the comment-list compartments when the store
+	// changes. `merge.a` is the base side, `merge.b` the working side.
+	$effect(() => {
+		const list: readonly ReviewComment[] = baseComments;
+		if (merge) {
+			merge.a.dispatch({ effects: commentsA.reconfigure(reviewCommentsFacet.of(list)) });
+		}
+	});
+	$effect(() => {
+		const list: readonly ReviewComment[] = workingComments;
+		if (merge) {
+			merge.b.dispatch({ effects: commentsB.reconfigure(reviewCommentsFacet.of(list)) });
+		}
+	});
+	$effect(() => {
+		const req = composerBase;
+		if (merge) {
+			merge.a.dispatch({ effects: composerA.reconfigure(reviewComposerFacet.of(req)) });
+		}
+	});
+	$effect(() => {
+		const req = composerWorking;
+		if (merge) {
+			merge.b.dispatch({ effects: composerB.reconfigure(reviewComposerFacet.of(req)) });
+		}
+	});
+
+	// Open the composer on whichever side currently has a selection,
+	// anchored to the selected line range. Wired to a keybinding on
+	// both sides (`Mod-Alt-c`). The base side (left) and working side
+	// (right) keep independent composers.
+	function openComposer(s: ReviewSide, view: EditorView): boolean {
+		const sel = view.state.selection.main;
+		const fromLine = view.state.doc.lineAt(sel.from).number;
+		const toLineRaw = view.state.doc.lineAt(sel.to).number;
+		// Same end-of-line snap as `publishReviewSelection`: a drag
+		// ending at the very start of a line didn't mean to include it.
+		const toLine = sel.to === view.state.doc.lineAt(sel.to).from && toLineRaw > fromLine ? toLineRaw - 1 : toLineRaw;
+		const req = { startLine: fromLine, endLine: toLine };
+		if (s === 'base') {
+			composerBase = req;
+		} else {
+			composerWorking = req;
+		}
+		return true;
+	}
+
+	// After a (re)build or a doc change settles, persist any comment
+	// whose fingerprint re-anchored to a new line so the stored hint
+	// stays fresh next launch. Rendering doesn't depend on this (the
+	// fingerprint re-resolves every build), so it runs out of band.
+	function persistReanchors() {
+		if (!merge) {
+			return;
+		}
+		for (const moved of reanchorComments(merge.a.state, baseComments)) {
+			workspace.repinReviewComment(moved.id, moved.startLine, moved.endLine);
+		}
+		for (const moved of reanchorComments(merge.b.state, workingComments)) {
+			workspace.repinReviewComment(moved.id, moved.startLine, moved.endLine);
+		}
+	}
+
 	async function build() {
 		if (mounted || loading || !host) {
 			return;
@@ -258,6 +402,12 @@
 			themeA.of(moonEditorTheme(workspace.effectiveTheme)),
 			langA.of(lang),
 			wrapA.of(workspace.lineWrap ? EditorView.lineWrapping : []),
+			// Review comments on the base (deleted / old) side.
+			reviewCommentsExtension(),
+			reviewCallbacksFacet.of(callbacksForSide('base')),
+			commentsA.of(reviewCommentsFacet.of(baseComments)),
+			composerA.of(reviewComposerFacet.of(composerBase)),
+			keymap.of([{ key: 'Mod-Alt-c', run: (view) => openComposer('base', view) }]),
 			...readOnlyA,
 		];
 
@@ -379,6 +529,15 @@
 			langB.of(lang),
 			wrapB.of(workspace.lineWrap ? EditorView.lineWrapping : []),
 			focusListener,
+			// Review comments on the working (added / context) side —
+			// the common case. The keybinding works regardless of
+			// editability so a `deleted` row's right pane (empty) still
+			// no-ops cleanly rather than swallowing the chord.
+			reviewCommentsExtension(),
+			reviewCallbacksFacet.of(callbacksForSide('working')),
+			commentsB.of(reviewCommentsFacet.of(workingComments)),
+			composerB.of(reviewComposerFacet.of(composerWorking)),
+			keymap.of([{ key: 'Mod-Alt-c', run: (view) => openComposer('working', view) }]),
 			...gotoExt,
 			...editingExtensions,
 			// Selection-publish + edit-publish hook on the working-
@@ -412,6 +571,9 @@
 						}
 						return ok;
 					});
+					// Re-anchor working-side comments against the edited
+					// doc so their stored line hints follow the text.
+					persistReanchors();
 				}
 			}),
 			...readOnlyB,
@@ -486,6 +648,8 @@
 
 		mounted = true;
 		loading = false;
+		// Settle any drifted comment hints once the diff is built.
+		persistReanchors();
 	}
 
 	/**
@@ -619,7 +783,16 @@
 	}
 
 	function toggleCollapsed() {
-		collapsed = !collapsed;
+		collapseOverride = !collapsed;
+	}
+
+	function toggleReviewed() {
+		const next = !reviewed;
+		// Re-marking Viewed clears any manual expand/collapse override
+		// so the reviewed-default (collapsed) takes effect; un-marking
+		// likewise resets so the section re-expands.
+		collapseOverride = null;
+		void workspace.setFileReviewed(path, next);
 	}
 
 	/**
@@ -685,6 +858,10 @@
 		{#if backingDirty}
 			<span class="dirty" title="Unsaved edits — Ctrl+S to save" aria-label="Unsaved edits">●</span>
 		{/if}
+		<label class="viewed" title="Mark this file reviewed. A new commit that changes it clears the mark.">
+			<input type="checkbox" checked={reviewed} onchange={toggleReviewed} />
+			<span>Viewed</span>
+		</label>
 	</header>
 	{#if !collapsed}
 		<div class="body" bind:this={host}></div>
@@ -804,6 +981,25 @@
 		margin-left: 4px;
 		flex: 0 0 auto;
 	}
+	.viewed {
+		display: inline-flex;
+		align-items: center;
+		gap: 5px;
+		flex: 0 0 auto;
+		margin-left: auto;
+		padding: 1px 4px;
+		font-size: 11px;
+		color: var(--m-fg-muted);
+		cursor: pointer;
+		user-select: none;
+	}
+	.viewed:hover {
+		color: var(--m-fg);
+	}
+	.viewed input {
+		margin: 0;
+		cursor: pointer;
+	}
 	.body {
 		display: flex;
 		min-height: 0;
@@ -880,5 +1076,161 @@
 	 * stays visible. */
 	.review-section :global(.cm-moon-pure-change .cm-changedText) {
 		background: transparent !important;
+	}
+
+	/* Inline review-comment cards + composer. Rendered by the CM
+	 * `reviewComments` extension into the editor DOM, so the
+	 * selectors are `:global`. Block widgets sit below their
+	 * anchored line; keep them visually distinct from code without
+	 * shouting. */
+	.review-section :global(.cm-review-card),
+	.review-section :global(.cm-review-composer) {
+		margin: 4px 8px 4px 28px;
+		border: 1px solid var(--m-border);
+		border-radius: 6px;
+		background: var(--m-bg-1);
+		font-family: var(--m-font-sans, system-ui, sans-serif);
+		font-size: 12px;
+		overflow: hidden;
+	}
+	.review-section :global(.cm-review-card-stale) {
+		opacity: 0.7;
+		border-style: dashed;
+	}
+	.review-section :global(.cm-review-card-head) {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding: 5px 8px;
+		border-bottom: 1px solid var(--m-border);
+		background: var(--m-bg-2, var(--m-bg-1));
+	}
+	.review-section :global(.cm-review-card-author) {
+		font-weight: 600;
+		color: var(--m-fg);
+	}
+	.review-section :global(.cm-review-card-time) {
+		color: var(--m-fg-muted);
+		font-size: 11px;
+	}
+	.review-section :global(.cm-review-card-staleflag) {
+		color: var(--m-git-modified, #e2c08d);
+		font-size: 10px;
+		text-transform: uppercase;
+		letter-spacing: 0.03em;
+	}
+	.review-section :global(.cm-review-card-spacer) {
+		flex: 1;
+	}
+	.review-section :global(.cm-review-card-btn) {
+		padding: 1px 6px;
+		background: transparent;
+		border: 1px solid transparent;
+		border-radius: 4px;
+		color: var(--m-fg-muted);
+		font-size: 11px;
+		cursor: pointer;
+	}
+	.review-section :global(.cm-review-card-btn:hover) {
+		color: var(--m-fg);
+		border-color: var(--m-border);
+	}
+	.review-section :global(.cm-review-card-body) {
+		padding: 6px 8px;
+		color: var(--m-fg);
+		word-break: break-word;
+		line-height: 1.4;
+	}
+	/* Tighten markdown block spacing inside the compact card. */
+	.review-section :global(.cm-review-markdown > :first-child) {
+		margin-top: 0;
+	}
+	.review-section :global(.cm-review-markdown > :last-child) {
+		margin-bottom: 0;
+	}
+	.review-section :global(.cm-review-markdown p) {
+		margin: 0 0 6px;
+	}
+	.review-section :global(.cm-review-markdown pre) {
+		margin: 6px 0;
+		padding: 6px 8px;
+		background: var(--m-bg);
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		overflow-x: auto;
+	}
+	.review-section :global(.cm-review-markdown code) {
+		font-family: var(--m-font-mono, monospace);
+		font-size: 11px;
+	}
+	/* Hover "+" gutter: the column collapses to nothing on rows
+	 * without a marker, so it only occupies width on the active row. */
+	.review-section :global(.cm-review-add-gutter) {
+		padding: 0;
+	}
+	.review-section :global(.cm-review-add-btn) {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 16px;
+		height: 16px;
+		padding: 0;
+		margin: 0 1px;
+		background: var(--m-accent, #4ec9b0);
+		border: none;
+		border-radius: 3px;
+		color: var(--m-bg);
+		font-size: 13px;
+		font-weight: 700;
+		line-height: 1;
+		cursor: pointer;
+	}
+	.review-section :global(.cm-review-add-btn:hover) {
+		filter: brightness(1.1);
+	}
+	.review-section :global(.cm-review-composer) {
+		padding: 6px;
+	}
+	.review-section :global(.cm-review-composer-input) {
+		display: block;
+		width: 100%;
+		box-sizing: border-box;
+		resize: vertical;
+		padding: 6px 8px;
+		background: var(--m-bg);
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		color: var(--m-fg);
+		font-family: var(--m-font-sans, system-ui, sans-serif);
+		font-size: 12px;
+		line-height: 1.4;
+	}
+	.review-section :global(.cm-review-composer-input:focus) {
+		outline: none;
+		border-color: var(--m-accent, #4ec9b0);
+	}
+	.review-section :global(.cm-review-composer-actions) {
+		display: flex;
+		justify-content: flex-end;
+		gap: 6px;
+		margin-top: 6px;
+	}
+	.review-section :global(.cm-review-composer-btn) {
+		padding: 3px 10px;
+		background: var(--m-bg-1);
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		color: var(--m-fg);
+		font-size: 11px;
+		cursor: pointer;
+	}
+	.review-section :global(.cm-review-composer-btn:hover) {
+		border-color: var(--m-fg-muted);
+	}
+	.review-section :global(.cm-review-composer-submit) {
+		background: var(--m-accent, #4ec9b0);
+		border-color: var(--m-accent, #4ec9b0);
+		color: var(--m-bg);
+		font-weight: 600;
 	}
 </style>

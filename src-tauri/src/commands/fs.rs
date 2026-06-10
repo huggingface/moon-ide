@@ -5,6 +5,7 @@ use moon_protocol::git::{
 	BranchDiffStatus, BranchList, BranchSwitchTarget, GitBranchInfo, GitChangeSummary, GitCommitResult, GitFileBlame,
 	GitFileStatus, GitMergeState, GitPermalink, GitStatusEntry, PrListScope,
 };
+use moon_protocol::review::{PublishReviewRequest, PublishReviewResult};
 use moon_protocol::MoonError;
 use tauri::State;
 
@@ -278,6 +279,33 @@ pub async fn fs_git_permalink(
 	let entry = state.workspaces.require_active_folder().await?;
 	let path = Utf8PathBuf::from(path);
 	entry.host.git_permalink(&path, start_line, end_line).await
+}
+
+/// Blob SHA of the working-tree version of `path` (`git
+/// hash-object`). Fingerprints reviewed-file marks (Phase 5.7): the
+/// frontend pins a "Viewed" tick to this SHA and clears the tick
+/// when a later refresh reports a different one. `None` (serialised
+/// as `null`) means the file is gone or `git` is unavailable — the
+/// caller leaves the row unticked.
+#[tauri::command]
+pub async fn fs_git_blob_sha(state: State<'_, AppState>, path: String) -> Result<Option<String>, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	let path = Utf8PathBuf::from(path);
+	entry.host.git_blob_sha(&path).await
+}
+
+/// Publish a batch of local review-comment drafts to the current
+/// branch's GitHub PR as one review (Phase 5.7.2). Shells out to
+/// `gh`; returns `NoPr` when the branch has no open PR, else
+/// `Published` with the posted count, the ids that couldn't be
+/// placed at the PR head, and the review URL.
+#[tauri::command]
+pub async fn fs_publish_pr_review(
+	state: State<'_, AppState>,
+	request: PublishReviewRequest,
+) -> Result<PublishReviewResult, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.publish_pr_review(request).await
 }
 
 /// `HEAD` content for `path`. Feeds the "before" side of the editor's

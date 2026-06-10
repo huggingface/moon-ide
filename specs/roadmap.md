@@ -21,6 +21,7 @@ The full phased plan. Update the **Status** column as phases land.
 | 3     | Terminal                        | scaffolded  |
 | 4     | LSP                             | in progress |
 | 5     | Git layer                       | in progress |
+| 5.7   | Review comments                 | implemented |
 | 6     | Coder (in-process AI agent)     | scaffolded  |
 | 7     | Multi-repo + cross-repo queries | scaffolded  |
 | 8     | Linting / formatting            | scaffolded  |
@@ -104,6 +105,12 @@ Architectural spec: [lsp.md](lsp.md). The [`tower-lsp` vs thin-client open quest
 Sub-phase work breakdown, tree-marker contract, what's landed, and outstanding work: [`roadmaps/phase-05-git.md`](roadmaps/phase-05-git.md).
 
 **Acceptance** (per sub-phase): tree markers via Pierre's `gitStatus` + porcelain status backing + auto-refresh + per-row Discard (5.0); inline blame at the caret with author + relative date + tooltip (5.1); `@codemirror/merge` diff view + single-tab toggle + git-change gutter + scrollbar overview ruler (5.2); SCM panel — branch label, change pill, revert-all, periodic auto-fetch, split commit button with branch + amend toggles, amend prefill, AI commit-message + branch-name sparkles, sync / publish spinners (5.3); `Ctrl+Shift+F` skips `.git/` explicitly while still respecting user `.gitignore` (5.4); merge-conflict resolution — `Conflicted` row state, `Merging <ref>` panel reshape, in-buffer accept widgets, auto-stage on save, abort merge, soft-warn on residual marker text (5.6). Deferred (per-hunk stage / discard, unstage of staged-new, guided pull / push failure recovery) — see [`roadmaps/phase-05-git.md` § "Still outstanding"](roadmaps/phase-05-git.md#still-outstanding).
+
+## Phase 5.7 — Review comments
+
+A per-folder **review state** layered on the [Review changes tab](test-plans/0074-review-changes-tab.md): inline review comments (local-first, publishable to a GitHub PR as one review once the branch is up) and reviewed-file "Viewed" marks for reviewing a large diff across several sittings. Comments are session drafts anchored by content (so they survive edits and rebases), reconciled against the PR head SHA at publish time to handle commit drift, posted via `gh`, then cleared locally. Reviewed-file marks are content-pinned (blob SHA) so a new commit touching a ticked file auto-un-ticks just that file. Architectural spec: [review-comments.md](review-comments.md). Decision: [ADR 0027 — local-first review comments](decisions/0027-review-comments.md). Sub-phase work breakdown: [roadmaps/phase-05.7-review-comments.md](roadmaps/phase-05.7-review-comments.md).
+
+**Acceptance** (per sub-phase): persisted `ReviewComment` + `ReviewedFile` schema + per-folder CRUD plumbed through `WorkspaceState` (5.7.0); inline composer + anchored comment widgets + per-section "Viewed" checkbox in `ReviewSection`, with content-fingerprint re-anchoring (stale state for lost anchors) and content-pinned reviewed marks that auto-clear on drift (5.7.1); `WorkspaceHost::publish_pr_review` shelling out to `gh` — resolve PR head, reconcile drift, post one atomic `COMMENT` review, clear published comments locally, surface lost/no-PR states (5.7.2). Deferred (threading / replies / resolve, displaying others' comments, GitLab/Bitbucket, `gh pr create`, APPROVE / REQUEST_CHANGES) — see [review-comments.md § "What this deliberately doesn't do"](review-comments.md#what-this-deliberately-doesnt-do).
 
 ## Phase 6 — Coder (in-process AI agent)
 

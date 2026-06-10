@@ -14,6 +14,7 @@ use crate::coder_hub::CoderHubBucket;
 use crate::coder_models::CoderProviderLock;
 use crate::git::{CompareBaseline, PrListScope};
 use crate::ports::ForwardedPort;
+use crate::review::{ReviewComment, ReviewedFile};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -66,6 +67,15 @@ pub struct FolderSession {
 	/// "what's modified since the last commit". Persisted per
 	/// folder for the same reason as `pr_scope`.
 	pub compare_baseline: CompareBaseline,
+	/// Local-first review-comment drafts for this folder (Phase
+	/// 5.7). Persisted until published to a GitHub PR and then
+	/// cleared. `#[serde(default)]` on the struct fills an empty
+	/// vec for sessions written by older builds.
+	pub review_comments: Vec<ReviewComment>,
+	/// Per-file "Viewed" marks for this folder (Phase 5.7).
+	/// Pinned to the ticked version's blob SHA; the frontend
+	/// drops stale entries on git-status refresh. Never published.
+	pub reviewed_files: Vec<ReviewedFile>,
 }
 
 /// Dummy `Default` so `#[serde(default)]` on the struct can fill
@@ -85,6 +95,8 @@ impl Default for FolderSession {
 			focused_side: SplitSide::Left,
 			pr_scope: PrListScope::default(),
 			compare_baseline: CompareBaseline::default(),
+			review_comments: Vec::new(),
+			reviewed_files: Vec::new(),
 		}
 	}
 }

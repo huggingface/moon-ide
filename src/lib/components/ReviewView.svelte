@@ -2,7 +2,7 @@
 	import { onDestroy, onMount } from 'svelte';
 	import { workspace, type SplitSide } from '../state.svelte';
 	import ReviewSection from './ReviewSection.svelte';
-	import type { GitStatusEntry } from '../protocol';
+	import { formatError, type GitStatusEntry } from '../protocol';
 
 	// The pane this review tab lives in. Plumbed through so a
 	// section's Ctrl-click goto-def replaces the review tab in the
@@ -157,6 +157,59 @@
 	// out of reach. Falls back to the first entry before the user
 	// scrolls (seeded by `updateVisibleFile` on mount).
 	const visiblePath: string | null = $derived(workspace.reviewVisibleFile);
+
+	// Review-state summary for the banner (Phase 5.7): how many
+	// unpublished comment drafts exist, and review progress across
+	// the changed files. Both come from the active folder's store.
+	const commentCount: number = $derived(workspace.reviewComments.length);
+	const reviewedCount: number = $derived.by(() => {
+		const paths = new Set(entries.map((e) => e.path));
+		return workspace.reviewedFiles.filter((r) => paths.has(r.path)).length;
+	});
+
+	// Publish dialog (Phase 5.7.2). `phase` walks the small state
+	// machine: closed → form (compose summary) → busy (gh round-trip)
+	// → done (show outcome). The outcome message is built from the
+	// `PublishReviewResult` the backend returns.
+	let publishPhase = $state<'closed' | 'form' | 'busy' | 'done'>('closed');
+	let publishSummary = $state('');
+	let publishOutcome = $state('');
+
+	function openPublish() {
+		publishSummary = '';
+		publishOutcome = '';
+		publishPhase = 'form';
+	}
+	function closePublish() {
+		if (publishPhase !== 'busy') {
+			publishPhase = 'closed';
+		}
+	}
+	async function doPublish() {
+		publishPhase = 'busy';
+		try {
+			const result = await workspace.publishReview(publishSummary.trim() || null);
+			if (result === null) {
+				publishOutcome = 'Nothing to publish.';
+			} else if (result.kind === 'no_pr') {
+				const branch = result.branch || 'this branch';
+				publishOutcome = `No open PR for ${branch}. Push the branch and open a PR, then publish.`;
+			} else if (result.posted === 0) {
+				publishOutcome =
+					result.lost.length > 0
+						? `Couldn't place ${result.lost.length} comment${result.lost.length === 1 ? '' : 's'} on the current PR head — kept as drafts.`
+						: 'Nothing was posted.';
+			} else {
+				const lostNote =
+					result.lost.length > 0 ? ` ${result.lost.length} couldn't be placed and stayed as drafts.` : '';
+				publishOutcome = `Posted ${result.posted} comment${result.posted === 1 ? '' : 's'} as one review.${lostNote}`;
+			}
+		} catch (err) {
+			publishOutcome = `Publish failed: ${formatError(err)}`;
+		}
+		publishPhase = 'done';
+	}
+
 	function fileName(p: string): string {
 		const slash = p.lastIndexOf('/');
 		return slash === -1 ? p : p.slice(slash + 1);
@@ -385,6 +438,25 @@
 			</span>
 		{/if}
 		<span class="counts">{entries.length} file{entries.length === 1 ? '' : 's'}</span>
+		{#if entries.length > 0}
+			<span class="progress" title="Files marked Viewed">{reviewedCount} / {entries.length} reviewed</span>
+		{/if}
+		{#if commentCount > 0}
+			<span class="comment-count" title="Unpublished review comments">
+				{commentCount} comment{commentCount === 1 ? '' : 's'}
+			</span>
+		{/if}
+		<button
+			type="button"
+			class="publish"
+			disabled={commentCount === 0}
+			title={commentCount === 0
+				? 'No review comments to publish'
+				: 'Publish your review comments to the branch PR on GitHub'}
+			onclick={openPublish}
+		>
+			Publish review →
+		</button>
 	</div>
 	{#if entries.length === 0}
 		<div class="empty">No changes against {baselineLabel.length > 0 ? baselineLabel : 'the baseline'}.</div>
@@ -414,6 +486,54 @@
 		</div>
 	{/if}
 </div>
+
+{#if publishPhase !== 'closed'}
+	<!-- svelte-ignore a11y_click_events_have_key_events -->
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<div class="pub-overlay" onclick={closePublish}>
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<div
+			class="pub-card"
+			role="dialog"
+			aria-modal="true"
+			aria-label="Publish review"
+			tabindex="-1"
+			onclick={(e) => e.stopPropagation()}
+		>
+			<header class="pub-head">
+				<h2>Publish review</h2>
+				<button type="button" class="pub-close" aria-label="Close" onclick={closePublish}>×</button>
+			</header>
+
+			{#if publishPhase === 'done'}
+				<p class="pub-outcome">{publishOutcome}</p>
+				<div class="pub-actions">
+					<button type="button" class="pub-btn pub-primary" onclick={() => (publishPhase = 'closed')}> Done </button>
+				</div>
+			{:else}
+				<p class="pub-lede">
+					{commentCount} comment{commentCount === 1 ? '' : 's'} will be posted to the branch's GitHub PR as one review. Comments
+					that can't be placed on the current PR head stay as local drafts.
+				</p>
+				<textarea
+					class="pub-summary"
+					bind:value={publishSummary}
+					rows="3"
+					placeholder="Optional review summary…"
+					disabled={publishPhase === 'busy'}
+				></textarea>
+				<div class="pub-actions">
+					<button type="button" class="pub-btn" onclick={closePublish} disabled={publishPhase === 'busy'}>
+						Cancel
+					</button>
+					<button type="button" class="pub-btn pub-primary" onclick={doPublish} disabled={publishPhase === 'busy'}>
+						{publishPhase === 'busy' ? 'Publishing…' : 'Publish'}
+					</button>
+				</div>
+			{/if}
+		</div>
+	</div>
+{/if}
 
 <style>
 	.review-view {
@@ -486,6 +606,28 @@
 		margin-left: auto;
 		font-variant-numeric: tabular-nums;
 	}
+	.progress {
+		font-variant-numeric: tabular-nums;
+	}
+	.comment-count {
+		color: var(--m-fg);
+		font-variant-numeric: tabular-nums;
+	}
+	.publish {
+		align-self: center;
+		padding: 3px 10px;
+		background: var(--m-accent, #4ec9b0);
+		border: 1px solid var(--m-accent, #4ec9b0);
+		border-radius: 4px;
+		color: var(--m-bg);
+		font-size: 11px;
+		font-weight: 600;
+		cursor: pointer;
+	}
+	.publish:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
 	.empty {
 		padding: 24px;
 		color: var(--m-fg-muted);
@@ -496,5 +638,98 @@
 		display: flex;
 		flex-direction: column;
 		gap: 12px;
+	}
+
+	/* Publish dialog */
+	.pub-overlay {
+		position: fixed;
+		inset: 0;
+		background: rgba(0, 0, 0, 0.5);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		z-index: 1000;
+	}
+	.pub-card {
+		width: min(440px, 92vw);
+		background: var(--m-bg-1);
+		color: var(--m-fg);
+		border: 1px solid var(--m-border);
+		border-radius: 10px;
+		padding: 16px;
+	}
+	.pub-head {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		margin-bottom: 8px;
+	}
+	.pub-head h2 {
+		margin: 0;
+		font-size: 15px;
+	}
+	.pub-close {
+		background: none;
+		border: none;
+		color: var(--m-fg-muted);
+		font-size: 20px;
+		line-height: 1;
+		cursor: pointer;
+	}
+	.pub-lede,
+	.pub-outcome {
+		color: var(--m-fg-muted);
+		font-size: 12px;
+		line-height: 1.5;
+		margin: 0 0 10px;
+	}
+	.pub-outcome {
+		color: var(--m-fg);
+	}
+	.pub-summary {
+		display: block;
+		width: 100%;
+		box-sizing: border-box;
+		resize: vertical;
+		padding: 8px;
+		background: var(--m-bg);
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		color: var(--m-fg);
+		font-family: var(--m-font-sans, system-ui, sans-serif);
+		font-size: 12px;
+		line-height: 1.4;
+	}
+	.pub-summary:focus {
+		outline: none;
+		border-color: var(--m-accent, #4ec9b0);
+	}
+	.pub-actions {
+		display: flex;
+		justify-content: flex-end;
+		gap: 8px;
+		margin-top: 12px;
+	}
+	.pub-btn {
+		padding: 5px 14px;
+		background: var(--m-bg);
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		color: var(--m-fg);
+		font-size: 12px;
+		cursor: pointer;
+	}
+	.pub-btn:hover:not(:disabled) {
+		border-color: var(--m-fg-muted);
+	}
+	.pub-btn:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+	.pub-primary {
+		background: var(--m-accent, #4ec9b0);
+		border-color: var(--m-accent, #4ec9b0);
+		color: var(--m-bg);
+		font-weight: 600;
 	}
 </style>
