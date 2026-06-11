@@ -14,6 +14,7 @@ This file is read by AI coding agents (Cursor, Claude Code, opencode, etc.) when
 - If a spec is wrong or incomplete and you fix the underlying code, **update the spec in the same change**.
 - New non-trivial decisions get a new ADR in `specs/decisions/NNNN-short-title.md`. Don't rewrite old ADRs; supersede them with a new one.
 - Keep specs short, opinionated, and current. They are not aspirational marketing.
+- Specs record **contracts and intent**: wire shapes, schemas, invariants, behavior the user can observe, and the _why_ behind non-obvious decisions (including rejected alternatives). They do **not** narrate the implementation — no lock orders, no function-by-function walkthroughs, no event-choreography play-by-plays, no Svelte/Rust internals that `git log -p` and code comments already cover. Litmus test: if the paragraph would have to change after a behavior-preserving refactor, it belongs in the code, not the spec. When detail matters, link the file or test plan instead of inlining it.
 - **Major features and phase deliverables** get a test plan in `specs/test-plans/NNNN-short-slug.md`, written before the commit (or while the human is testing). Routine bug fixes, small UI tweaks, new keybindings, single-file refactors, and incremental polish **skip the test plan** — `git log -p` plus a clear commit body covers what changed. When in doubt, **skip**. See [specs/test-plans/README.md](specs/test-plans/README.md) for what still earns a plan and the required headers.
 
 ## House rules

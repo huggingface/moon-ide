@@ -18,6 +18,22 @@ Living design docs for moon-ide. Read these before changing the system. Update t
 
 Phase files in `roadmaps/` are about **work** (verbs, milestones, acceptance bullets); area specs in `specs/<area>.md` are about the **system** (nouns, contracts, invariants). If a paragraph could plausibly fit in either, it belongs in the spec.
 
+## What belongs in a spec (and what doesn't)
+
+A spec is the contract a reader needs before touching an area — not a tour of the code. Keep:
+
+- Wire shapes, schemas, on-disk formats, command/event tables.
+- Invariants and behavior the user can observe.
+- The **why** behind non-obvious decisions, including rejected alternatives ("we tried 200, it was slow") — this is the part code can't carry.
+
+Leave out:
+
+- Implementation narration: lock orders, function-by-function walkthroughs, internal flag names, event choreography. That lives in code comments, commit messages, and test plans.
+- Anything that would have to change after a behavior-preserving refactor.
+- Long inline detail when a link to the file or test plan does the job.
+
+When a section keeps growing past what a new contributor needs to _use or change_ the area safely, that's the signal to condense it and push detail down into code/test plans.
+
 ## Status legend
 
 When a spec describes something not fully built, mark sections with one of:
