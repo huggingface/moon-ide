@@ -1744,21 +1744,32 @@
 				<ul class="session-list">
 					{#each coder.sessions as session (session.id)}
 						{@const isVisible = coder.currentSession.activeSession?.id === session.id}
-						{@const isRunning = coder.current.isSessionRunning(session.id)}
-						{@const isFinished = !isRunning && coder.current.isSessionAttention(session.id)}
-						<li class="session-row" class:active={isVisible} class:running={isRunning} class:finished={isFinished}>
+						{@const isAwaitingInput = coder.current.isSessionAwaitingInput(session.id)}
+						{@const isRunning = !isAwaitingInput && coder.current.isSessionRunning(session.id)}
+						{@const isFinished = !isAwaitingInput && !isRunning && coder.current.isSessionAttention(session.id)}
+						<li
+							class="session-row"
+							class:active={isVisible}
+							class:awaiting={isAwaitingInput}
+							class:running={isRunning}
+							class:finished={isFinished}
+						>
 							<button
 								type="button"
 								class="session-pick"
 								onclick={() => onPickSession(session.id)}
-								title={isRunning
-									? 'Session is running — click to follow'
-									: isFinished
-										? 'Finished while you were away — click to open'
-										: 'Open session'}
+								title={isAwaitingInput
+									? 'Agent needs your input — click to answer'
+									: isRunning
+										? 'Session is running — click to follow'
+										: isFinished
+											? 'Finished while you were away — click to open'
+											: 'Open session'}
 							>
 								<div class="session-title">
-									{#if isRunning}
+									{#if isAwaitingInput}
+										<span class="awaiting-dot" aria-hidden="true"></span>
+									{:else if isRunning}
 										<span class="running-dot" aria-hidden="true"></span>
 									{:else if isFinished}
 										<span class="finished-dot" aria-hidden="true"></span>
@@ -1766,7 +1777,10 @@
 									<span class="session-title-text">{session.title || '(untitled)'}</span>
 								</div>
 								<div class="session-meta">
-									{#if isRunning}
+									{#if isAwaitingInput}
+										<span class="awaiting-label">needs input</span>
+										<span class="session-meta-sep">·</span>
+									{:else if isRunning}
 										<span class="running-label">running…</span>
 										<span class="session-meta-sep">·</span>
 									{:else if isFinished}
@@ -2015,11 +2029,13 @@
 			<textarea
 				bind:this={composer}
 				use:textInputUndo
-				placeholder={coder.busy
-					? 'Steer the running turn (Enter to send, Esc to stop)…'
-					: coder.attachments.length > 0
-						? 'Ask about the attached selection…'
-						: 'Ask the coder… (@ to attach a file, paste images)'}
+				placeholder={coder.awaitingInput
+					? 'Answer the question above, or type here to skip and keep going…'
+					: coder.busy
+						? 'Steer the running turn (Enter to send, Esc to stop)…'
+						: coder.attachments.length > 0
+							? 'Ask about the attached selection…'
+							: 'Ask the coder… (@ to attach a file, paste images)'}
 				rows="3"
 				onkeydown={onComposerKey}
 				oninput={onComposerInput}
@@ -2845,6 +2861,10 @@
 		color: var(--m-accent);
 		font-weight: 500;
 	}
+	.session-row.awaiting .awaiting-label {
+		color: var(--m-accent);
+		font-weight: 500;
+	}
 	.session-row.finished .finished-label {
 		color: var(--m-warning);
 		font-weight: 500;
@@ -2876,8 +2896,35 @@
 			box-shadow: 0 0 0 0 color-mix(in srgb, var(--m-accent) 0%, transparent);
 		}
 	}
+	/* Needs-input dot — a turn parked on an `ask_user` prompt,
+	   waiting for the human. Accent hue like the running dot (it's
+	   the same agent, still mid-turn) but a slower halo pulse so
+	   "waiting on you" reads calmer than the working dot's brisk
+	   pulse. Distinct from the static amber finished dot, which
+	   means "done, go look"; this means "blocked, go answer". */
+	.awaiting-dot {
+		flex-shrink: 0;
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		background: var(--m-accent);
+		box-shadow: 0 0 0 0 color-mix(in srgb, var(--m-accent) 60%, transparent);
+		animation: session-awaiting-pulse 2.2s ease-in-out infinite;
+	}
+	@keyframes session-awaiting-pulse {
+		0% {
+			box-shadow: 0 0 0 0 color-mix(in srgb, var(--m-accent) 55%, transparent);
+		}
+		70% {
+			box-shadow: 0 0 0 5px color-mix(in srgb, var(--m-accent) 0%, transparent);
+		}
+		100% {
+			box-shadow: 0 0 0 0 color-mix(in srgb, var(--m-accent) 0%, transparent);
+		}
+	}
 	@media (prefers-reduced-motion: reduce) {
-		.running-dot {
+		.running-dot,
+		.awaiting-dot {
 			animation: none;
 		}
 	}

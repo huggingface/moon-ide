@@ -713,6 +713,22 @@ properties make "come back and answer" robust:
   clicking back into a session with a pending prompt would
   permanently kill the prompt.
 
+**Background "needs input" cue.** Because a parked prompt is a
+background turn the moment the user navigates away, the frontend
+needs to surface "this agent is waiting on you" without the panel
+open on that session. A live `ask_user` `tool_call` flips the
+session bucket's `awaitingInput` flag (cleared on the matching
+`tool_result`, on any turn terminator, and reset-then-re-derived on
+`session_loaded` replay — a still-parked prompt re-emits its
+`tool_call`, a resolved one doesn't). The session-list row swaps its
+`running…` pip for a `needs input` one, and the folder bar swaps the
+running sparkle for a question-bubble glyph — both taking precedence
+over the plain running state, since a turn parked on `ask_user` is
+`busy` but isn't _working_. When the user is following the session,
+the always-open interactive card in the transcript is the primary
+affordance and the composer placeholder switches to "answer above,
+or type here to skip".
+
 System-prompt guidance: the base prompt tells the agent **not** to
 use `ask_user` for clarification it could resolve by reading files,
 and **not** as a "should I proceed?" confirmation (that turns the
@@ -867,7 +883,7 @@ Hydration is gated on a workspace-ready signal. The cold-start critical path is:
 
 The wire format reflects all of this: `coder:event` payloads are wrapped in a `CoderEventEnvelope { folder, session_id, event }` so the frontend can route updates to the right per-`(folder, session)` UI bucket. Sub-agent events arrive tagged with the **parent's** `(folder, session_id)` (sub-agents belong to whichever session originated them), so a parent in folder X session A with a sub-agent operating against folder Y still shows the sub-agent's collapsed card under A's transcript. A small set of event variants are genuinely folder-scoped, not session-scoped (`folder_summary_ready`, `hub_sync_started`, `hub_sync_finished`); those arrive with `session_id === ""` and the frontend's dispatcher routes them to a folder-level handler.
 
-The frontend mirrors the backend shape: a per-folder `FolderState` holds `sessionsById: SvelteMap<sessionId, SessionViewState>` plus folder-scoped fields (the on-disk sessions list, the panel-level view selector, an `attentionPending` rollup); each `SessionViewState` holds the per-session transcript, busy flag, a per-session `attentionPending` flag, todos, context ring, sub-agent cards, and composer draft/attachments. The sessions list paints a `running…` pip on every session whose `busy === true`, not just the visible one, plus a static `finished` marker on every session whose turn ended while the user wasn't following it (`attentionPending === true`), so a user juggling concurrent agents in the same folder can see both which ones are still working and which ones just finished at a glance. The per-session flag is the row-level counterpart to the folder-scoped `FolderState.attentionPending` rollup that drives the folder-bar sparkle.
+The frontend mirrors the backend shape: a per-folder `FolderState` holds `sessionsById: SvelteMap<sessionId, SessionViewState>` plus folder-scoped fields (the on-disk sessions list, the panel-level view selector, an `attentionPending` rollup); each `SessionViewState` holds the per-session transcript, busy flag, an `awaitingInput` flag (parked on an `ask_user` prompt), a per-session `attentionPending` flag, todos, context ring, sub-agent cards, and composer draft/attachments. The sessions list paints a `running…` pip on every session whose `busy === true`, not just the visible one; a `needs input` pip on every session whose turn is parked on an `ask_user` prompt (`awaitingInput === true`, taking precedence over `running…` — the turn is `busy` but blocked on the user); plus a static `finished` marker on every session whose turn ended while the user wasn't following it (`attentionPending === true`). So a user juggling concurrent agents in the same folder can tell which ones are still working, which are waiting on them, and which just finished at a glance. These per-session flags are the row-level counterparts to the folder-scoped rollups (`busyForFolder` / `awaitingInputForFolder` / `attentionPendingForFolder`) that drive the folder-bar glyph — a question-bubble for needs-input, a pulsing sparkle for running, a static amber sparkle for finished.
 
 ### On disk
 
@@ -978,10 +994,18 @@ slot via `rightPanel.kind === 'coder'`:
   per-session status cues so a user juggling several concurrent
   sessions (per [ADR 0016](decisions/0016-coder-concurrent-sessions.md))
   can triage the list at a glance:
-  - **Running** — the session's bucket is `busy`. A pulsing
-    accent dot left of the title plus a `running…` label in the
-    meta row. Every running session paints it, not just the
-    visible one.
+  - **Needs input** — the session's turn is parked on an
+    `ask_user` prompt, waiting for the human (`awaitingInput`).
+    A slowly-pulsing accent dot plus a `needs input` label, with
+    a question-bubble glyph on the folder bar. Takes **precedence
+    over Running**: the turn is technically still `busy`, but it
+    isn't working — it's blocked on the user, and "answer me" is
+    the more actionable signal. Cleared when the prompt resolves
+    (`tool_result` for the `ask_user` call) or the turn ends.
+  - **Running** — the session's bucket is `busy` and **not**
+    parked on a prompt. A pulsing accent dot left of the title
+    plus a `running…` label in the meta row. Every running
+    session paints it, not just the visible one.
   - **Finished** — the session's turn ended
     (`turn_complete` / `aborted` / `error`) while the user was
     _not_ following it (a different session mounted, the list

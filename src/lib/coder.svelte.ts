@@ -283,6 +283,19 @@ function extractTodos(result: unknown): TodoItem[] | null {
 class SessionViewState {
 	rows = $state<CoderRow[]>([]);
 	busy = $state(false);
+	/** "This session's turn is parked on an `ask_user` prompt and
+	 *  is waiting for the human to answer (or skip)." Distinct from
+	 *  `busy`: the turn is still technically in flight (`busy`
+	 *  stays `true`), but it isn't *working* — it's blocked on
+	 *  input. Drives a dedicated "needs input" cue on the session
+	 *  row and the folder bar so a user juggling background agents
+	 *  can tell "this one is grinding" apart from "this one is
+	 *  waiting on me". Set when an `ask_user` `tool_call` lands
+	 *  without a result yet; cleared on its `tool_result`, on any
+	 *  turn terminator (`turn_complete` / `aborted` / `error`), and
+	 *  on `session_loaded` (the replayed transcript re-derives it
+	 *  if the live turn is still parked). */
+	awaitingInput = $state(false);
 	/** "This session's turn finished while the user was looking
 	 *  at a different session (or had the panel on the list /
 	 *  another folder)." Drives the orange `finished` marker on
@@ -423,6 +436,15 @@ class FolderState {
 	 *  it). */
 	isSessionRunning(sessionId: string): boolean {
 		return this.sessionsById.get(sessionId)?.busy ?? false;
+	}
+
+	/** "Is the session with `sessionId` parked on an `ask_user`
+	 *  prompt, waiting for the human?" Reads the bucket's
+	 *  per-session `awaitingInput` so the sessions-list row can
+	 *  swap its plain `running…` cue for a "needs input" one.
+	 *  `false` when the session has no bucket yet. */
+	isSessionAwaitingInput(sessionId: string): boolean {
+		return this.sessionsById.get(sessionId)?.awaitingInput ?? false;
 	}
 
 	/** "Did this session's turn finish while the user was looking
@@ -980,6 +1002,23 @@ class CoderPanelState {
 		return false;
 	}
 
+	/** "Is any session in this folder parked on an `ask_user`
+	 *  prompt, waiting for the human?" The folder bar reads this so
+	 *  a background folder whose agent is blocked on a question
+	 *  shows a distinct "needs input" glyph instead of the plain
+	 *  "running" pulse — telling the user *which* background agent
+	 *  is waiting on them. Same per-folder shape + reactivity as
+	 *  [`busyForFolder`]. */
+	awaitingInputForFolder(folder: string): boolean {
+		const f = this.bucketFor(folder);
+		for (const session of f.sessionsById.values()) {
+			if (session.awaitingInput) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	/** "Has an agent in this folder finished a turn that the user
 	 *  hasn't seen yet?" Same per-folder shape as [`busyForFolder`].
 	 *  The folder bar reads through this so a switch back to the
@@ -1022,6 +1061,17 @@ class CoderPanelState {
 	}
 	set busy(value: boolean) {
 		this.currentSession.busy = value;
+	}
+
+	/** True while the visible session's turn is parked on an
+	 *  `ask_user` prompt. The composer reads this to swap its
+	 *  "steer the running turn" placeholder for an "answer above,
+	 *  or type to skip" hint — the parked card is the primary
+	 *  affordance, but a user who jumps straight to the composer
+	 *  should know typing here skips the questions. Read-only
+	 *  forward; the flag is driven by the event reducer. */
+	get awaitingInput(): boolean {
+		return this.currentSession.awaitingInput;
 	}
 
 	get rows(): CoderRow[] {
@@ -1583,6 +1633,7 @@ class CoderPanelState {
 			session.subagentTranscripts = new Map();
 			session.viewSubagentId = null;
 			session.busy = false;
+			session.awaitingInput = false;
 			session.tokenUsage = null;
 			session.compaction = null;
 			session.todos = [];
@@ -2403,6 +2454,14 @@ class CoderPanelState {
 					startedAt: Date.now(),
 					durationMs: null,
 				});
+				// `ask_user` parks the turn waiting for the human —
+				// flip the "needs input" cue on so the row / folder
+				// bar stop reading as plain "running". Cleared on the
+				// matching `tool_result` (answered / skipped) or any
+				// turn terminator.
+				if (event.name === 'ask_user') {
+					session.awaitingInput = true;
+				}
 				return;
 			case 'tool_result': {
 				const toolRow = findRowById(session.rows, event.id);
@@ -2411,6 +2470,12 @@ class CoderPanelState {
 					toolRow.hasResult = true;
 					toolRow.isError = event.is_error;
 					toolRow.durationMs = Date.now() - toolRow.startedAt;
+					// The parked `ask_user` prompt just resolved
+					// (answered or skipped) — drop the "needs input"
+					// cue; the turn either continues working or ends.
+					if (toolRow.name === 'ask_user') {
+						session.awaitingInput = false;
+					}
 				}
 				// Mirror the canonical post-merge list from a
 				// successful `todo_write` into the session so the
@@ -2433,6 +2498,7 @@ class CoderPanelState {
 			}
 			case 'turn_complete': {
 				session.busy = false;
+				session.awaitingInput = false;
 				// Capture before the reset below: a replay
 				// terminator must not paint the per-row `finished`
 				// marker (reopening a session is the user actively
@@ -2478,6 +2544,7 @@ class CoderPanelState {
 			}
 			case 'aborted': {
 				session.busy = false;
+				session.awaitingInput = false;
 				// Finalize any tool rows that were mid-execution when
 				// the user stopped the turn. The runner short-circuits
 				// out of `finish_tool_call` on `CoderError::Aborted`
@@ -2503,6 +2570,7 @@ class CoderPanelState {
 			}
 			case 'error':
 				session.busy = false;
+				session.awaitingInput = false;
 				session.rows.push({
 					kind: 'error',
 					id: `error-${Date.now()}`,
@@ -2523,6 +2591,11 @@ class CoderPanelState {
 				session.subagentTranscripts = new Map();
 				session.viewSubagentId = null;
 				session.busy = false;
+				// Reset before replay. A live-parked `ask_user`
+				// re-emits its `tool_call` (with no `tool_result`)
+				// during replay, which flips this back to `true`;
+				// a settled session leaves it `false`.
+				session.awaitingInput = false;
 				// Gate the sessions-list re-sort: replayed
 				// `UserMessage` events shouldn't pretend the user
 				// just typed them. Cleared on the terminator

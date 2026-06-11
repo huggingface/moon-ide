@@ -3,6 +3,7 @@
 	import { projectCompose, projectComposeStateLabel } from '../projectCompose.svelte';
 	import { workspace } from '../state.svelte';
 	import ContainerIcon from './icons/ContainerIcon.svelte';
+	import QuestionBubbleIcon from './icons/QuestionBubbleIcon.svelte';
 	import SparklesIcon from './icons/SparklesIcon.svelte';
 	import ProjectComposePopover from './ProjectComposePopover.svelte';
 
@@ -13,11 +14,20 @@
 	//
 	// Each row exposes three passive readouts about the folder:
 	//
-	// - **Agent-state glyph** — an AI sparkle rendered right
-	//   after the folder name. Two states:
+	// - **Agent-state glyph** — an AI sparkle (or question bubble)
+	//   rendered right after the folder name. Three states, in
+	//   precedence order:
+	//     - **Needs input**: a question-bubble glyph while a turn
+	//       in the folder is parked on an `ask_user` prompt,
+	//       waiting for the human to answer. Takes precedence over
+	//       the running pulse — the turn is technically still in
+	//       flight, but it isn't *working*, it's blocked on the
+	//       user, and "answer me" is the more actionable signal.
+	//       A gentle pulse on the accent hue earns the attention
+	//       without the urgency of an error.
 	//     - **Running**: pulsing accent-coloured sparkle while a
-	//       turn is in flight for the folder (drives attention
-	//       through motion).
+	//       turn is in flight (and not parked) for the folder
+	//       (drives attention through motion).
 	//     - **Finished, not seen**: static amber sparkle after
 	//       a turn ends in a *non-active* folder, persisting
 	//       until the user clicks that folder bar to switch
@@ -26,8 +36,9 @@
 	//       completion. Cleared in `coder.setActiveFolder`.
 	//   Sits in the same per-row column as the git badges so it
 	//   doesn't push the name around. Reads through
-	//   `coder.busyForFolder` and `coder.attentionPendingForFolder`
-	//   so the glyph tracks the bucket's reactive `$state`.
+	//   `coder.awaitingInputForFolder`, `coder.busyForFolder` and
+	//   `coder.attentionPendingForFolder` so the glyph tracks the
+	//   bucket's reactive `$state`.
 	// - **Git change badges** (`+N ~N -N`) — added / modified /
 	//   deleted counts pulled from the per-folder
 	//   `gitChangeSummaries` map. Refreshed on workspace hydrate,
@@ -88,13 +99,16 @@
 		{@const modified = summary?.modified ?? 0}
 		{@const deleted = summary?.deleted ?? 0}
 		{@const hasChanges = added + modified + deleted > 0}
-		{@const agentRunning = coder.busyForFolder(folder.path)}
-		{@const agentDone = !agentRunning && coder.attentionPendingForFolder(folder.path)}
-		{@const barTitle = agentRunning
-			? `${folder.path}\n(agent running)`
-			: agentDone
-				? `${folder.path}\n(agent finished — click to view)`
-				: folder.path}
+		{@const agentAwaitingInput = coder.awaitingInputForFolder(folder.path)}
+		{@const agentRunning = !agentAwaitingInput && coder.busyForFolder(folder.path)}
+		{@const agentDone = !agentAwaitingInput && !agentRunning && coder.attentionPendingForFolder(folder.path)}
+		{@const barTitle = agentAwaitingInput
+			? `${folder.path}\n(agent needs your input)`
+			: agentRunning
+				? `${folder.path}\n(agent running)`
+				: agentDone
+					? `${folder.path}\n(agent finished — click to view)`
+					: folder.path}
 		<li class="bar" class:active={isActive}>
 			<button
 				type="button"
@@ -106,7 +120,15 @@
 			>
 				<span class="chev" aria-hidden="true">{isActive ? '▾' : '▸'}</span>
 				<span class="name">{folder.name}</span>
-				{#if agentRunning}
+				{#if agentAwaitingInput}
+					<span
+						class="agent-glyph awaiting"
+						aria-label="Agent needs your input"
+						title="Agent needs your input — click to answer"
+					>
+						<QuestionBubbleIcon size={12} />
+					</span>
+				{:else if agentRunning}
 					<span class="agent-glyph running" aria-label="Agent running" title="Agent running">
 						<SparklesIcon size={12} />
 					</span>
@@ -246,14 +268,19 @@
 		font-size: 10px;
 		text-align: center;
 	}
-	/* Agent-state glyph — an AI sparkle right after the folder
-	   name. Same SparklesIcon the SCM panel uses for AI
-	   suggestions so the "magic-is-happening" vocabulary stays
-	   consistent across the IDE. Two variants:
+	/* Agent-state glyph — an AI sparkle (or question bubble) right
+	   after the folder name. The SparklesIcon matches what the SCM
+	   panel uses for AI suggestions so the "magic-is-happening"
+	   vocabulary stays consistent across the IDE. Three variants:
 
-	   - `.running` — a turn is currently in flight for this
-	     folder. Accent colour + opacity pulse reads as "live"
-	     and earns the attention.
+	   - `.awaiting` — a turn is parked on an `ask_user` prompt,
+	     waiting for the human. A question-bubble glyph on the
+	     accent hue with a *gentler* pulse than `.running`: it
+	     needs the user's eye ("answer me") but isn't an error, so
+	     the motion is calmer than the working pulse.
+	   - `.running` — a turn is currently in flight (and not
+	     parked) for this folder. Accent colour + opacity pulse
+	     reads as "live" and earns the attention.
 	   - `.done` — a turn finished in this folder while the user
 	     was looking elsewhere, and the user hasn't visited the
 	     folder since. Amber colour, *no animation*: the work is
@@ -266,12 +293,22 @@
 		align-items: center;
 		justify-content: center;
 	}
+	.agent-glyph.awaiting {
+		color: var(--m-accent);
+		animation: agent-glyph-pulse 2.2s ease-in-out infinite;
+	}
 	.agent-glyph.running {
 		color: var(--m-accent);
 		animation: agent-glyph-pulse 1.4s ease-in-out infinite;
 	}
 	.agent-glyph.done {
 		color: var(--m-warning, var(--m-fg-muted));
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.agent-glyph.awaiting,
+		.agent-glyph.running {
+			animation: none;
+		}
 	}
 	@keyframes agent-glyph-pulse {
 		0%,
