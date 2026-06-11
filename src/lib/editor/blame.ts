@@ -324,7 +324,17 @@ function renderHoverContent(entry: GitLineBlame, remoteUrl: string): HTMLElement
 	dateLine.textContent = `${formatAbsoluteDate(entry.authorTime)} · ${formatRelativeDate(entry.authorTime)}`;
 	meta.appendChild(dateLine);
 	const shaLine = document.createElement('div');
-	shaLine.textContent = `commit ${entry.sha.slice(0, 8)}`;
+	const shaText = `commit ${entry.sha.slice(0, 8)}`;
+	// Link the sha to the commit page when the repo has a recognised
+	// remote — same `remoteUrl` the PR linkification rides on, so
+	// host support stays in one place (the backend's
+	// `remote_web_url`). GitHub's commit URL shape is
+	// `<web>/commit/<sha>`.
+	if (remoteUrl) {
+		shaLine.appendChild(externalLink(`${remoteUrl}/commit/${entry.sha}`, shaText));
+	} else {
+		shaLine.textContent = shaText;
+	}
 	meta.appendChild(shaLine);
 	frag.appendChild(meta);
 
@@ -340,6 +350,26 @@ function renderHoverContent(entry: GitLineBlame, remoteUrl: string): HTMLElement
 		frag.appendChild(body);
 	}
 	return frag;
+}
+
+/**
+ * Anchor that opens `href` in the user's default browser via the
+ * Tauri opener plugin rather than letting the webview follow the
+ * link — a raw navigation inside the app window would blow away the
+ * IDE. `preventDefault` covers both middle-click and Cmd/Ctrl-click,
+ * which fire `click` in Chromium.
+ */
+function externalLink(href: string, text: string): HTMLAnchorElement {
+	const a = document.createElement('a');
+	a.href = href;
+	a.className = 'cm-blame-pr-link';
+	a.rel = 'noopener noreferrer';
+	a.textContent = text;
+	a.addEventListener('click', (ev) => {
+		ev.preventDefault();
+		void openUrl(href);
+	});
+	return a;
 }
 
 /**
@@ -396,21 +426,7 @@ function linkifyCommitText(text: string, remoteUrl: string): DocumentFragment {
 		if (idx > last) {
 			frag.appendChild(document.createTextNode(text.slice(last, idx)));
 		}
-		const a = document.createElement('a');
-		a.href = href;
-		a.className = 'cm-blame-pr-link';
-		a.rel = 'noopener noreferrer';
-		a.textContent = full;
-		// Open via the Tauri opener plugin rather than letting the
-		// webview follow the link — a raw navigation inside the app
-		// window would blow away the IDE. `preventDefault` covers
-		// both middle-click and Cmd/Ctrl-click, which fire `click`
-		// in Chromium.
-		a.addEventListener('click', (ev) => {
-			ev.preventDefault();
-			void openUrl(href);
-		});
-		frag.appendChild(a);
+		frag.appendChild(externalLink(href, full));
 		last = after;
 	}
 	if (last < text.length) {
