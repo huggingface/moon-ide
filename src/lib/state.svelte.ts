@@ -1436,17 +1436,19 @@ class WorkspaceState {
 			}
 		}
 		const tAdoptFolderStates = performance.now();
-		// Hydrate the active folder's tree if it's a fresh state.
-		// On a swap to a previously-loaded folder the cached paths
-		// still match disk, but `gitStatusEntries` and `gitBranch`
-		// are workspace-level state still pointing at the prior
-		// folder's SCM data — re-classify against the cached paths
-		// so the SCM panel header (branch / ahead / behind) and the
-		// change-count badge snap to the new folder. Without this,
-		// re-visiting a folder shows the prior folder's branch and
-		// changes until the next watcher fire, the next 3-minute
-		// auto-fetch tick, or until something else nudges
-		// `refreshGitStatus`.
+		// (Re)walk the active folder's tree on first visit and on
+		// every folder switch. The switch case matters even when a
+		// cached path list exists: the fs-watcher only ever watches
+		// the *active* folder, so anything an external process (a
+		// terminal `cp`, a script, another tool) created or deleted
+		// in a non-active folder is invisible until we re-walk —
+		// the cached snapshot can be arbitrarily stale. The cached
+		// paths still paint instantly; the fresh walk reconciles in
+		// the background and FileTree's structural-equality skip
+		// makes the nothing-changed case free. `loadPaths` also
+		// re-runs `refreshGitStatus` against the fresh paths, which
+		// is what snaps the SCM panel header (branch / ahead /
+		// behind) and the change-count badge to the new folder.
 		//
 		// `loadPaths()` is **fire-and-forget** here: awaiting it
 		// would gate every caller of `adoptWorkspaceSnapshot` on a
@@ -1456,10 +1458,9 @@ class WorkspaceState {
 		// The frontend's `loadingPaths` flag covers the in-flight
 		// window; the tree paints with the spinner first, then
 		// reconciles when paths arrive.
-		if (this.activeFolderState && this.activeFolderState.paths.length === 0) {
+		const activeFolderChanged = previousActive !== snapshot.active_folder;
+		if (this.activeFolderState && (this.activeFolderState.paths.length === 0 || activeFolderChanged)) {
 			void this.loadPaths();
-		} else if (previousActive !== null && previousActive !== snapshot.active_folder) {
-			void this.refreshGitStatus(this.paths, null);
 		}
 		// Warm the per-folder compose snapshot for every bound
 		// folder so the bars paint with real data on first frame
@@ -2198,10 +2199,22 @@ class WorkspaceState {
 		});
 	}
 
+	/**
+	 * Monotonic token identifying the most recent `loadPaths` call.
+	 * A walk that comes back with a stale token was superseded
+	 * mid-flight — typically by a folder switch firing its own
+	 * walk — and must drop its result: the `paths` setter resolves
+	 * `activeFolderState` at assignment time, so a late walk from
+	 * folder A would otherwise write A's path list into folder B's
+	 * state.
+	 */
+	#loadPathsToken = 0;
+
 	async loadPaths(changedSubset: ReadonlySet<string> | null = null) {
 		if (!this.activeFolder) {
 			return;
 		}
+		const token = ++this.#loadPathsToken;
 		this.loadingPaths = true;
 		// Profiling: see `setActiveFolder` above for the wider
 		// timeline. The `walk` measure is the recursive backend
@@ -2218,6 +2231,11 @@ class WorkspaceState {
 			// dominated refresh latency (the walk itself is a
 			// sub-hundred-ms `read_dir` storm).
 			const collected = await ipc.fs.collectPaths(MAX_TREE_DEPTH);
+			if (token !== this.#loadPathsToken) {
+				// Superseded while on the wire — a newer walk owns
+				// the UI (and possibly a different active folder).
+				return;
+			}
 			const tWalk = performance.now();
 			performance.measure('moon:loadPaths.walk', 'moon:loadPaths.start');
 			performance.mark('moon:loadPaths.assign.start');
@@ -2241,7 +2259,13 @@ class WorkspaceState {
 		} catch (err) {
 			this.flash(`Failed to read folder: ${formatError(err)}`);
 		} finally {
-			this.loadingPaths = false;
+			// Only the latest call may clear the flag — a superseded
+			// walk resolving late must not hide the spinner (and
+			// re-open the `refreshActiveFolder` coalescing gate)
+			// while the newer walk is still in flight.
+			if (token === this.#loadPathsToken) {
+				this.loadingPaths = false;
+			}
 		}
 	}
 

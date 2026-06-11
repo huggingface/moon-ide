@@ -32,3 +32,4 @@ bun.lockb
 src-tauri/resources/bridge/*
 !src-tauri/resources/bridge/.gitkeep
 companion/dist/
+/coder-export/

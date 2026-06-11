@@ -170,8 +170,21 @@ fn restrict_key_perms(_path: &Utf8Path) {}
 mod tests {
 	use super::*;
 
+	/// `load_or_generate` builds a `ServerConfig`, which resolves the
+	/// process-global rustls CryptoProvider. `main` installs ring at
+	/// startup, but tests don't run `main` — and under
+	/// `cargo test --workspace` feature unification enables both
+	/// `ring` and `aws-lc-rs` on rustls (reqwest pulls in the
+	/// latter), so auto-detection bails instead of picking one.
+	/// Mirror `main`'s install here; `let _ =` because a second
+	/// test installing after the first is expected to fail.
+	fn install_crypto_provider() {
+		let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+	}
+
 	#[test]
 	fn generate_then_load_is_stable() {
+		install_crypto_provider();
 		let dir = std::env::temp_dir().join(format!("moon-bridge-tls-{}", uuid::Uuid::new_v4().simple()));
 		let dir = Utf8PathBuf::from_path_buf(dir).unwrap();
 
@@ -192,6 +205,7 @@ mod tests {
 
 	#[test]
 	fn changing_lan_ip_regenerates_cert() {
+		install_crypto_provider();
 		let dir = std::env::temp_dir().join(format!("moon-bridge-tls-ip-{}", uuid::Uuid::new_v4().simple()));
 		let dir = Utf8PathBuf::from_path_buf(dir).unwrap();
 
