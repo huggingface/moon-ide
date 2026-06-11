@@ -120,6 +120,19 @@
 	let currentPath: string | null = null;
 	let lastHandledAutocompleteEditorTick = 0;
 
+	// Mirror `currentPath` onto the host element. Deliberately
+	// imperative (not a reactive attribute): it records which buffer
+	// the CodeMirror state *actually* holds, as opposed to which one
+	// the template thinks it passed down. The "Debug: Dump Editor
+	// State" palette command reads it to localise a frozen layer —
+	// if the pane's `data-view-path` is fresh but this is stale, the
+	// in-place swap effect below stopped running.
+	function stampCmPath() {
+		if (host) {
+			host.dataset.cmPath = currentPath ?? '';
+		}
+	}
+
 	function runAutocompleteFromShortcut(editorView: EditorView): boolean {
 		frontendLog('editor.completion', 'debug', 'Ctrl+T pressed → applying next-edit autocomplete');
 		void applyAutocompleteFromEditorView(editorView);
@@ -161,6 +174,7 @@
 		view = new EditorView({ state, parent: host });
 		reviewWiring.attach(view);
 		currentPath = file.path;
+		stampCmPath();
 		if (snapshot !== null) {
 			const v = view;
 			const docLen = v.state.doc.length;
@@ -268,6 +282,7 @@
 				});
 			}
 			currentPath = file.path;
+			stampCmPath();
 			void workspace.ensureEditorConfig(file.path);
 			void applyLanguage(file.path, file.text);
 			if (renamed) {

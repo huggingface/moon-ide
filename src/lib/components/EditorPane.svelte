@@ -158,7 +158,13 @@
 	onfocusin={focus}
 >
 	<EditorTabs {side} />
-	<div class="body">
+	<!-- `data-view-*` are written by this template's render effect, so
+	     they record what the pane's body *actually last committed*.
+	     The "Debug: Dump Editor State" palette command compares them
+	     against the raw workspace state to tell a frozen template
+	     effect (state fresh, dataset stale) apart from broken state
+	     (both stale). Costs nothing; keep them. -->
+	<div class="body" data-view-path={view.path ?? ''} data-view-kind={view.kind}>
 		<!-- Boundary so a throw inside a view component's render or
 		     its child effects (Editor / DiffView / MarkdownView /
 		     ReviewView / ImageView) is caught and surfaced instead

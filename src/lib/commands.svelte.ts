@@ -6,6 +6,7 @@ import { slack } from './slack.svelte';
 import { ipc } from './ipc';
 import { formatError, type FileSearchResult, type ContentSearchHit } from './protocol';
 import { isMarkdownPath } from './util/markdown';
+import { frontendLog } from './logs.svelte';
 
 export type Command = {
 	id: string;
@@ -494,6 +495,33 @@ export const builtInCommands: Command[] = [
 				return;
 			}
 			workspace.toggleDiffMode(path);
+		},
+	},
+	{
+		id: 'debug.dumpEditorState',
+		// One-action capture for the intermittent "editor body frozen
+		// on the previous file" bug. Compares three layers per pane:
+		//
+		//   1. raw workspace state (`leftActive` / `openFiles` — the
+		//      source of truth),
+		//   2. what EditorPane's template last committed
+		//      (`data-view-path` / `data-view-kind` on `.body`),
+		//   3. which buffer the CodeMirror state actually holds
+		//      (`data-cm-path`, stamped by Editor's swap effect).
+		//
+		// Whichever pair diverges names the frozen layer. The dump
+		// lands in the `runtime` diag-logs source and on the
+		// clipboard, so "it happened again" → run this → paste.
+		title: 'Debug: Dump Editor State',
+		run: async () => {
+			const text = workspace.dumpEditorState();
+			frontendLog('runtime', 'info', text);
+			try {
+				await navigator.clipboard.writeText(text);
+				workspace.flash('Editor state dumped to clipboard + runtime logs');
+			} catch {
+				workspace.flash('Editor state dumped to runtime logs (clipboard failed)');
+			}
 		},
 	},
 ];

@@ -5241,6 +5241,92 @@ class WorkspaceState {
 			this.requestEditorFocus();
 		}
 		this.persistAppState();
+		this.scheduleEditorRenderCheck(side);
+	}
+
+	/**
+	 * Watchdog for the intermittent "editor body frozen on the
+	 * previous file" bug. `setActive` is plain imperative code, so it
+	 * keeps running even when a pane's Svelte render effect has
+	 * silently detached — which makes it the perfect place to verify,
+	 * a beat later, that the DOM actually caught up with the state.
+	 * `EditorPane` stamps what its template last committed onto
+	 * `.body[data-view-path]`; if that disagrees with the active path
+	 * once the flush + a couple frames have passed, we log a
+	 * `runtime` error with a timestamp so the event is captured even
+	 * if the user doesn't notice immediately. The 250ms delay is
+	 * generous — a healthy flush commits within one frame — and the
+	 * re-read of the *current* active path at check time means rapid
+	 * tab-hopping can't produce false positives.
+	 */
+	private scheduleEditorRenderCheck(side: SplitSide) {
+		setTimeout(() => {
+			const expected = side === 'left' ? this.leftActive : this.rightActive;
+			if (expected === null) {
+				return;
+			}
+			const body = document.querySelector<HTMLElement>(`[data-region="editor-${side}"] .body`);
+			if (body === null) {
+				return;
+			}
+			const rendered = body.dataset.viewPath ?? '';
+			if (rendered === expected) {
+				return;
+			}
+			// Capture the full diagnostic *now*, while the freeze is
+			// live — the user may switch folders (which un-freezes the
+			// pane and destroys the evidence) before thinking to run
+			// the palette command. The toast makes the detection
+			// visible; the dump in the `runtime` log makes it
+			// actionable later.
+			frontendLog(
+				'runtime',
+				'error',
+				`editor render watchdog: pane=${side} state.active=${expected} but DOM rendered=${rendered || '∅'} — ` +
+					`the pane's template effect appears frozen.\n${this.dumpEditorState()}`,
+			);
+			this.flash('Editor render bug detected — diagnostic captured (see runtime logs)');
+		}, 250);
+	}
+
+	/**
+	 * Diagnostic snapshot for the frozen-editor-pane bug. Compares,
+	 * per pane: the raw workspace state (source of truth), what
+	 * `EditorPane`'s template last committed to the DOM
+	 * (`data-view-path` / `data-view-kind`), and which buffer the
+	 * CodeMirror state actually holds (`data-cm-path`, stamped
+	 * imperatively by `Editor.svelte`'s swap effect). Whichever pair
+	 * diverges names the frozen layer: `STALE-TEMPLATE` means the
+	 * pane's render effect detached; `STALE-CM-SWAP` means the
+	 * template committed but the editor's in-place swap didn't run.
+	 * Called by the watchdog above (automatically, on detection) and
+	 * by the "Debug: Dump Editor State" palette command (manually).
+	 */
+	dumpEditorState(): string {
+		const lines: string[] = [`editor-state dump @ ${new Date().toISOString()}`];
+		lines.push(`activeFolder=${this.activeFolderPath ?? '∅'}`);
+		lines.push(`focusedSide=${this.focusedSide} hasSplit=${this.hasSplit}`);
+		lines.push(`openFiles=[${this.openFiles.map((f) => `${f.path}${f.isDirty ? '*' : ''}`).join(', ')}]`);
+		for (const side of ['left', 'right'] as const) {
+			if (side === 'right' && !this.hasSplit) {
+				continue;
+			}
+			const active = side === 'left' ? this.leftActive : this.rightActive;
+			const tabs = this.tabsFor(side);
+			const body = document.querySelector<HTMLElement>(`[data-region="editor-${side}"] .body`);
+			const cmHost = body?.querySelector<HTMLElement>('[data-cm-path]') ?? null;
+			const viewPath = body?.dataset.viewPath ?? '(no body el)';
+			const viewKind = body?.dataset.viewKind ?? '(no body el)';
+			const cmPath = cmHost?.dataset.cmPath ?? '(no editor el)';
+			const stateVsDom = active === (viewPath === '' ? null : viewPath) ? 'OK' : 'STALE-TEMPLATE';
+			const domVsCm = cmHost === null || viewPath === cmPath ? 'OK' : 'STALE-CM-SWAP';
+			lines.push(
+				`pane=${side} state.active=${active ?? '∅'} tabs=[${tabs.join(', ')}]\n` +
+					`  dom.viewPath=${viewPath} dom.viewKind=${viewKind} dom.cmPath=${cmPath}\n` +
+					`  template=${stateVsDom} cmSwap=${domVsCm}`,
+			);
+		}
+		return lines.join('\n');
 	}
 
 	/**
