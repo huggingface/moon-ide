@@ -25,6 +25,7 @@
 	import { blameExtension, blameFacet } from '../editor/blame';
 	import { gitChangesExtension, goToNextChange, goToPreviousChange, headTextFacet } from '../editor/gitChanges';
 	import { conflictedFacet, conflictMarkersExtension } from '../editor/conflictMarkers';
+	import { commentsForSide, reanchorComments, ReviewWiring } from '../editor/reviewComments';
 	import { workspace, type OpenFile, type SplitSide } from '../state.svelte';
 	import { ipc } from '../ipc';
 	import ContextMenu from './ContextMenu.svelte';
@@ -83,6 +84,36 @@
 	// the default). A single window-global toggle drives every
 	// editor pane through this compartment.
 	const lineWrapCompartment = new Compartment();
+	// Review comments (Phase 5.7) in the regular editor. Holds the
+	// full `ReviewWiring` bundle when the active folder is on a
+	// reviewable branch (open PR or off the default branch) and the
+	// buffer is a real workspace file; an empty extension otherwise.
+	// Gated so the hover "+" gutter and comment cards don't appear
+	// while the user is just editing on `main`.
+	const reviewCompartment = new Compartment();
+
+	// Working-side comment controller for this editor. `add` reads
+	// `currentPath` at call time so the same wiring instance follows
+	// the buffer the view currently holds across tab swaps.
+	const reviewWiring = new ReviewWiring('working', {
+		add: (args) => {
+			if (currentPath !== null) {
+				workspace.addReviewComment({ path: currentPath, ...args });
+			}
+		},
+		edit: (id, body) => workspace.editReviewComment(id, body),
+		remove: (id) => workspace.deleteReviewComment(id),
+		baselineRev: () =>
+			workspace.compareBaseline === 'default' ? (workspace.defaultBranchMergeBase ?? 'HEAD') : 'HEAD',
+	});
+
+	// Comments anchored to this buffer's working side.
+	const reviewComments = $derived(commentsForSide(workspace.reviewCommentsForPath(file.path), 'working'));
+	// Synthetic / external buffers can't take review comments (they
+	// have no workspace-relative path to anchor on GitHub).
+	const reviewEnabled = $derived(
+		workspace.isReviewableBranch && !file.isUntitled && !file.isExternal && !file.isDeleted && !isReviewPath(file.path),
+	);
 
 	// Each Editor instance owns one CM view that we re-target as the active file changes.
 	// We track the path the view currently holds so we know when to swap state.
@@ -128,6 +159,7 @@
 					extensions: baseExtensions(),
 				});
 		view = new EditorView({ state, parent: host });
+		reviewWiring.attach(view);
 		currentPath = file.path;
 		if (snapshot !== null) {
 			const v = view;
@@ -163,10 +195,27 @@
 					historyJson: v.state.toJSON({ history: historyField }),
 				});
 			}
+			reviewWiring.detach();
 			view?.destroy();
 			view = undefined;
 			disposeEditorMenu();
 		};
+	});
+
+	// Keep the review-comment bundle in sync with the gate and the
+	// comment list. A full compartment reconfigure (rather than the
+	// finer `syncComments`) also covers the gate flipping on a branch
+	// switch — the whole bundle appears / disappears in one step.
+	$effect(() => {
+		const enabled = reviewEnabled;
+		const comments = reviewComments;
+		const v = view;
+		if (!v) {
+			return;
+		}
+		v.dispatch({
+			effects: reviewCompartment.reconfigure(enabled ? reviewWiring.extension(comments) : []),
+		});
 	});
 
 	$effect(() => {
@@ -603,6 +652,9 @@
 					workspace.gitStatusEntries.some((entry) => entry.path === file.path && entry.status === 'conflicted'),
 				),
 			),
+			// Review comments: cards + hover "+" gutter + `Mod-Alt-c`,
+			// present only on reviewable branches (see `reviewEnabled`).
+			reviewCompartment.of(reviewEnabled ? reviewWiring.extension(reviewComments) : []),
 			// Ctrl+Space → LSP only. Local autocomplete (Ctrl+T / palette) patches
 			// the buffer directly — it is not a CodeMirror completion source.
 			//
@@ -682,6 +734,15 @@
 					const text = update.state.doc.toString();
 					if (currentPath !== null) {
 						workspace.updateText(currentPath, text);
+						// Re-pin any review-comment hints that drifted with
+						// this edit. Cheap: no-ops unless the buffer
+						// actually carries comments.
+						for (const moved of reanchorComments(
+							update.state,
+							commentsForSide(workspace.reviewCommentsForPath(currentPath), 'working'),
+						)) {
+							workspace.repinReviewComment(moved.id, moved.startLine, moved.endLine);
+						}
 					}
 				}
 				if (!update.selectionSet || currentPath === null) {

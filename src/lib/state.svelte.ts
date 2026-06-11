@@ -633,6 +633,32 @@ class WorkspaceState {
 	}
 
 	/**
+	 * Whether the active folder is in a state where leaving review
+	 * comments makes sense outside the Review tab: an open PR for
+	 * the branch, or any branch that isn't the default. Gates the
+	 * comment affordances in the regular editor and the diff view —
+	 * the Review changes tab stays ungated (opening it is already an
+	 * explicit "I'm reviewing" signal).
+	 */
+	get isReviewableBranch(): boolean {
+		const b = this.gitBranch;
+		if (b.name === null) {
+			return false;
+		}
+		if (b.prUrl !== null) {
+			return true;
+		}
+		const def = b.defaultBranchRemoteRef;
+		if (def === null) {
+			return false;
+		}
+		// `origin/main` → `main`; keeps nested branch names intact
+		// (`origin/feature/x` → `feature/x`).
+		const short = def.includes('/') ? def.slice(def.indexOf('/') + 1) : def;
+		return short !== b.name;
+	}
+
+	/**
 	 * Publish the active folder's review-comment drafts to the
 	 * current branch's GitHub PR as one review (Phase 5.7.2). On a
 	 * successful post, the comments that landed (everything except

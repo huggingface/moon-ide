@@ -56,6 +56,8 @@ Prerequisites: `bun install`, a git repo bound as the active folder with a branc
 
 > Note: this plan's original draft shipped without a gutter "+" and with plain-text comment bodies. Both landed in the same sub-phase shortly after: a hover-only **"+"** gutter button (hover any line → click + to comment there, no selection needed) and **markdown** rendering of comment bodies via the existing `renderMarkdown` pipeline. The keyboard path (`Ctrl+Alt+C` on a selection) still works for multi-line anchors.
 
+> Post-testing fixes (same sub-phase): (1) the "+" gutter now reserves a **fixed-width column**, so hovering no longer shifts the code horizontally; (2) comments are also available in the **regular editor** and the **diff view's working pane**, gated on `workspace.isReviewableBranch` (open PR, or any non-default branch) — on `main` with no PR the affordances don't render at all. Verify: open a file on a feature branch in plain Source mode, hover a line → "+" appears with no horizontal jump; switch to the default branch → no "+" anywhere outside the Review tab. All widget/composer styling moved into the extension's `baseTheme` so the three host surfaces render identically.
+
 ## Related
 
 - Spec: [`specs/review-comments.md`](../review-comments.md)

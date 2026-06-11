@@ -115,8 +115,20 @@ comments (tick a file with no comments; comment on an unticked file) and are
 
 ## UI surface
 
-The whole interaction lives inside `ReviewSection.svelte` / `ReviewView.svelte`;
-nothing new on the regular editor.
+Comments can be added from three surfaces, all driven by the same CM extension
+(`src/lib/editor/reviewComments.ts`, host glue via its `ReviewWiring`
+controller):
+
+- **The Review changes tab** — both panes of every section (base side = GitHub
+  `LEFT`, working side = `RIGHT`). Always available; opening the tab is already
+  an explicit "I'm reviewing" signal.
+- **The regular editor and the diff view's working pane** — gated on
+  `workspace.isReviewableBranch`: the branch has an open PR, or is any branch
+  other than the default. On the default branch with no PR the affordances stay
+  out of the way entirely (no gutter, no keybinding).
+
+The add-comment gutter reserves a **fixed-width column** so the hover "+"
+appearing never shifts the code horizontally.
 
 - **Add a comment.** Hover any line and click the gutter **"+"** (shown only on
   the hovered row), or select one or more lines and press `Ctrl+Alt+C`. Either

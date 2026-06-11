@@ -31,8 +31,25 @@
 // request), a `StateField` builds the block-widget `DecorationSet`,
 // and `WidgetType`s render the DOM.
 
-import { Facet, StateEffect, StateField, type EditorState, type Extension, type Range } from '@codemirror/state';
-import { Decoration, EditorView, gutter, GutterMarker, WidgetType, type DecorationSet } from '@codemirror/view';
+import {
+	Compartment,
+	Facet,
+	StateEffect,
+	StateField,
+	type EditorState,
+	type Extension,
+	type Range,
+} from '@codemirror/state';
+import {
+	Decoration,
+	EditorView,
+	gutter,
+	GutterMarker,
+	keymap,
+	ViewPlugin,
+	WidgetType,
+	type DecorationSet,
+} from '@codemirror/view';
 import { getCachedMarkdown, renderMarkdown } from '../markdown';
 import type { ReviewComment, ReviewSide } from '../protocol';
 
@@ -509,34 +526,306 @@ const addCommentGutter = gutter({
 });
 
 // Track the pointer and publish the hovered line into the field.
-// Empty gutter cells collapse to zero width (no spacer), so the "+"
-// column only takes space on the active row.
-const hoverTracker = EditorView.domEventHandlers({
-	mousemove(event, view) {
-		const line = view.state.doc.lineAt(view.posAtCoords({ x: event.clientX, y: event.clientY }, false)).number;
+// Listens on the editor's *outer* DOM (`view.dom`), not the content
+// element `EditorView.domEventHandlers` would target: the "+" lives
+// in a gutter, and a content-scoped `mouseleave` would fire the
+// moment the pointer travels from the code toward the button —
+// clearing the marker out from under the click. The outer element
+// covers gutters + content, so the marker survives the trip and
+// also appears when the pointer enters from the gutter side.
+const hoverTracker = ViewPlugin.define((view) => {
+	const move = (event: MouseEvent) => {
+		const pos = view.posAtCoords({ x: event.clientX, y: event.clientY }, false);
+		const line = view.state.doc.lineAt(pos).number;
 		if (view.state.field(hoverLineField, false) !== line) {
 			view.dispatch({ effects: setHoverLine.of(line) });
 		}
-		return false;
-	},
-	mouseleave(_event, view) {
+	};
+	const leave = () => {
 		if (view.state.field(hoverLineField, false) !== null) {
 			view.dispatch({ effects: setHoverLine.of(null) });
 		}
-		return false;
+	};
+	view.dom.addEventListener('mousemove', move);
+	view.dom.addEventListener('mouseleave', leave);
+	return {
+		destroy() {
+			view.dom.removeEventListener('mousemove', move);
+			view.dom.removeEventListener('mouseleave', leave);
+		},
+	};
+});
+
+// Styling for the cards, composer, and hover gutter. Lives on the
+// extension (not in any host component's CSS) so every surface that
+// wires review comments — review sections, the regular editor, the
+// diff view — renders them identically. Colors ride the app's
+// `--m-*` custom properties, which cascade from the document root.
+//
+// The add-comment gutter is given a **fixed width**: gutters size to
+// their content, and the "+" marker only exists on the hovered line,
+// so without the reservation the column would appear/disappear on
+// hover and shift the code horizontally (the original bug). 14px is
+// reserved once at mount and never changes.
+const reviewBaseTheme = EditorView.baseTheme({
+	'.cm-review-add-gutter': {
+		width: '14px',
+	},
+	'.cm-review-add-btn': {
+		display: 'inline-flex',
+		alignItems: 'center',
+		justifyContent: 'center',
+		width: '13px',
+		height: '13px',
+		padding: '0',
+		margin: '1px 0 0 1px',
+		background: 'var(--m-accent, #4ec9b0)',
+		border: 'none',
+		borderRadius: '3px',
+		color: 'var(--m-bg)',
+		fontSize: '11px',
+		fontWeight: '700',
+		lineHeight: '1',
+		cursor: 'pointer',
+	},
+	'.cm-review-card, .cm-review-composer': {
+		margin: '4px 8px 4px 28px',
+		border: '1px solid var(--m-border)',
+		borderRadius: '6px',
+		background: 'var(--m-bg-1)',
+		fontFamily: 'var(--m-font-sans, system-ui, sans-serif)',
+		fontSize: '12px',
+		overflow: 'hidden',
+	},
+	'.cm-review-card-stale': {
+		opacity: '0.7',
+		borderStyle: 'dashed',
+	},
+	'.cm-review-card-head': {
+		display: 'flex',
+		alignItems: 'center',
+		gap: '8px',
+		padding: '5px 8px',
+		borderBottom: '1px solid var(--m-border)',
+		background: 'var(--m-bg-2, var(--m-bg-1))',
+	},
+	'.cm-review-card-author': {
+		fontWeight: '600',
+		color: 'var(--m-fg)',
+	},
+	'.cm-review-card-time': {
+		color: 'var(--m-fg-muted)',
+		fontSize: '11px',
+	},
+	'.cm-review-card-staleflag': {
+		color: 'var(--m-git-modified, #e2c08d)',
+		fontSize: '10px',
+		textTransform: 'uppercase',
+		letterSpacing: '0.03em',
+	},
+	'.cm-review-card-spacer': {
+		flex: '1',
+	},
+	'.cm-review-card-btn': {
+		padding: '1px 6px',
+		background: 'transparent',
+		border: '1px solid transparent',
+		borderRadius: '4px',
+		color: 'var(--m-fg-muted)',
+		fontSize: '11px',
+		cursor: 'pointer',
+	},
+	'.cm-review-card-btn:hover': {
+		color: 'var(--m-fg)',
+		borderColor: 'var(--m-border)',
+	},
+	'.cm-review-card-body': {
+		padding: '6px 8px',
+		color: 'var(--m-fg)',
+		wordBreak: 'break-word',
+		lineHeight: '1.4',
+	},
+	'.cm-review-markdown > :first-child': {
+		marginTop: '0',
+	},
+	'.cm-review-markdown > :last-child': {
+		marginBottom: '0',
+	},
+	'.cm-review-markdown p': {
+		margin: '0 0 6px',
+	},
+	'.cm-review-markdown pre': {
+		margin: '6px 0',
+		padding: '6px 8px',
+		background: 'var(--m-bg)',
+		border: '1px solid var(--m-border)',
+		borderRadius: '4px',
+		overflowX: 'auto',
+	},
+	'.cm-review-markdown code': {
+		fontFamily: 'var(--m-font-mono, monospace)',
+		fontSize: '11px',
+	},
+	'.cm-review-composer': {
+		padding: '6px',
+	},
+	'.cm-review-composer-input': {
+		display: 'block',
+		width: '100%',
+		boxSizing: 'border-box',
+		resize: 'vertical',
+		padding: '6px 8px',
+		background: 'var(--m-bg)',
+		border: '1px solid var(--m-border)',
+		borderRadius: '4px',
+		color: 'var(--m-fg)',
+		fontFamily: 'var(--m-font-sans, system-ui, sans-serif)',
+		fontSize: '12px',
+		lineHeight: '1.4',
+	},
+	'.cm-review-composer-input:focus': {
+		outline: 'none',
+		borderColor: 'var(--m-accent, #4ec9b0)',
+	},
+	'.cm-review-composer-actions': {
+		display: 'flex',
+		justifyContent: 'flex-end',
+		gap: '6px',
+		marginTop: '6px',
+	},
+	'.cm-review-composer-btn': {
+		padding: '3px 10px',
+		background: 'var(--m-bg-1)',
+		border: '1px solid var(--m-border)',
+		borderRadius: '4px',
+		color: 'var(--m-fg)',
+		fontSize: '11px',
+		cursor: 'pointer',
+	},
+	'.cm-review-composer-btn:hover': {
+		borderColor: 'var(--m-fg-muted)',
+	},
+	'.cm-review-composer-submit': {
+		background: 'var(--m-accent, #4ec9b0)',
+		borderColor: 'var(--m-accent, #4ec9b0)',
+		color: 'var(--m-bg)',
+		fontWeight: '600',
 	},
 });
 
 /**
- * The review-comments CM extension. Wire into a `ReviewSection`
- * MergeView side together with `reviewCallbacksFacet.of(...)`,
- * `reviewCommentsFacet.of(...)`, and `reviewComposerFacet.of(...)`.
- * The `side` argument scopes which comments belong here so the
- * section can pass the base-side and working-side subsets to the
- * right editors.
+ * The review-comments CM extension. Most hosts should use
+ * [`ReviewWiring`] rather than assembling the facets by hand.
  */
 export function reviewCommentsExtension(): Extension {
-	return [reviewCommentsField, hoverLineField, addCommentGutter, hoverTracker];
+	return [reviewCommentsField, hoverLineField, addCommentGutter, hoverTracker, reviewBaseTheme];
+}
+
+/** Operations a host wires into a [`ReviewWiring`]. */
+export type ReviewWiringOps = {
+	/** Persist a new comment (the host adds `path` and stores it). */
+	add: (args: {
+		side: ReviewSide;
+		startLine: number;
+		endLine: number;
+		lineText: string;
+		baselineRev: string;
+		body: string;
+	}) => void;
+	edit: (id: string, body: string) => void;
+	remove: (id: string) => void;
+	/** The merge-base / HEAD SHA the host is currently reviewing against. */
+	baselineRev: () => string;
+};
+
+/**
+ * Per-editor controller that owns the comment-list / composer
+ * compartments and the open-composer state, so each host component
+ * (review section, editor, diff view) doesn't re-implement the same
+ * ~60 lines of glue. Framework-free: the host attaches the live
+ * `EditorView` once it exists and pushes reactive comment-list
+ * updates through [`ReviewWiring.syncComments`].
+ */
+export class ReviewWiring {
+	private readonly commentsComp = new Compartment();
+	private readonly composerComp = new Compartment();
+	private view: EditorView | null = null;
+
+	constructor(
+		private readonly side: ReviewSide,
+		private readonly ops: ReviewWiringOps,
+	) {}
+
+	/**
+	 * The full extension bundle for one editor: decorations + hover
+	 * gutter + facets + the `Mod-Alt-c` open-composer keybinding.
+	 * Safe to rebuild (e.g. when the host's state is recreated per
+	 * file); the compartments are reused across rebuilds.
+	 */
+	extension(initialComments: readonly ReviewComment[]): Extension {
+		const callbacks: ReviewCommentCallbacks = {
+			onSubmit: ({ startLine, endLine, lineText, body }) => {
+				this.ops.add({
+					side: this.side,
+					startLine,
+					endLine,
+					lineText,
+					baselineRev: this.ops.baselineRev(),
+					body,
+				});
+			},
+			onEdit: (id, body) => this.ops.edit(id, body),
+			onDelete: (id) => this.ops.remove(id),
+			onCloseComposer: () => this.setComposer(null),
+			onAddAtLine: (line) => this.setComposer({ startLine: line, endLine: line }),
+		};
+		return [
+			reviewCommentsExtension(),
+			reviewCallbacksFacet.of(callbacks),
+			this.commentsComp.of(reviewCommentsFacet.of(initialComments)),
+			this.composerComp.of(reviewComposerFacet.of(null)),
+			keymap.of([
+				{
+					key: 'Mod-Alt-c',
+					run: (view) => {
+						this.openFromSelection(view);
+						return true;
+					},
+				},
+			]),
+		];
+	}
+
+	/** Point the wiring at the live editor (idempotent). */
+	attach(view: EditorView): void {
+		this.view = view;
+	}
+
+	/** Drop the view reference on host teardown. */
+	detach(): void {
+		this.view = null;
+	}
+
+	/** Push a fresh comment list into the editor (reactive sync). */
+	syncComments(comments: readonly ReviewComment[]): void {
+		this.view?.dispatch({ effects: this.commentsComp.reconfigure(reviewCommentsFacet.of(comments)) });
+	}
+
+	/** Open the composer at the current selection's line range. */
+	openFromSelection(view: EditorView): void {
+		const sel = view.state.selection.main;
+		const fromLine = view.state.doc.lineAt(sel.from).number;
+		const toLineInfo = view.state.doc.lineAt(sel.to);
+		// Same end-of-line snap as the selection publishers: a drag
+		// ending at the very start of a line didn't mean to include it.
+		const toLine =
+			sel.to === toLineInfo.from && toLineInfo.number > fromLine ? toLineInfo.number - 1 : toLineInfo.number;
+		this.setComposer({ startLine: fromLine, endLine: toLine });
+	}
+
+	private setComposer(req: { startLine: number; endLine: number } | null): void {
+		this.view?.dispatch({ effects: this.composerComp.reconfigure(reviewComposerFacet.of(req)) });
+	}
 }
 
 /** Filter a comment list to one diff side. */

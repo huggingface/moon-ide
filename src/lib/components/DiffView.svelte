@@ -30,6 +30,7 @@
 	} from '../editor/lsp';
 	import { diffPureChangeExtension } from '../editor/diffPureChange';
 	import { diffGutterTintExtension } from '../editor/diffGutterTint';
+	import { commentsForSide, reanchorComments, ReviewWiring } from '../editor/reviewComments';
 	import { blameExtension, blameFacet } from '../editor/blame';
 	import { lspGotoDefinitionExtension } from '../editor/lspGotoDefinition';
 	import { lspOverviewExtension } from '../editor/lspOverview';
@@ -109,6 +110,22 @@
 	// the editor view of the same file — duplicating it on both
 	// columns just adds visual noise.
 	const blameB = new Compartment();
+	// Review comments (Phase 5.7) on the right (working) pane. Same
+	// gate and wiring shape as `Editor.svelte`; the left pane stays
+	// comment-free here — base-side comments live in the Review tab,
+	// where the full stacked-diff context makes them legible.
+	const reviewCompartment = new Compartment();
+	const reviewWiring = new ReviewWiring('working', {
+		add: (args) => {
+			workspace.addReviewComment({ path: file.path, ...args });
+		},
+		edit: (id, body) => workspace.editReviewComment(id, body),
+		remove: (id) => workspace.deleteReviewComment(id),
+		baselineRev: () =>
+			workspace.compareBaseline === 'default' ? (workspace.defaultBranchMergeBase ?? 'HEAD') : 'HEAD',
+	});
+	const reviewComments = $derived(commentsForSide(workspace.reviewCommentsForPath(file.path), 'working'));
+	const reviewEnabled = $derived(workspace.isReviewableBranch && !file.isDeleted);
 
 	// In single-tab model, `file.path` is stable for the lifetime of
 	// this DiffView instance — the EditorPane swaps Editor ↔ DiffView
@@ -153,6 +170,7 @@
 					scrollTop: merge.b.scrollDOM.scrollTop,
 				});
 			}
+			reviewWiring.detach();
 			merge?.destroy();
 			merge = undefined;
 			// Drop any selection snapshot the right pane published
@@ -161,6 +179,20 @@
 			// outlive the surface that produced its selection.
 			workspace.setActiveSelection(null);
 		};
+	});
+
+	// Keep the review-comment bundle in sync with the gate and the
+	// comment list (same full-reconfigure approach as `Editor.svelte`).
+	$effect(() => {
+		const enabled = reviewEnabled;
+		const comments = reviewComments;
+		const m = merge;
+		if (!m) {
+			return;
+		}
+		m.b.dispatch({
+			effects: reviewCompartment.reconfigure(enabled ? reviewWiring.extension(comments) : []),
+		});
 	});
 
 	async function buildMerge() {
@@ -415,6 +447,9 @@
 			...gitChangeExtensions,
 			...blameExtensions,
 			...lspExtensions,
+			// Review comments: cards + hover "+" gutter + `Mod-Alt-c`,
+			// only on reviewable branches (see `reviewEnabled`).
+			reviewCompartment.of(reviewEnabled ? reviewWiring.extension(reviewComments) : []),
 			keymap.of([
 				// Alt+Left / Alt+Right ride the global handler in
 				// `App.svelte` so they swallow consistently across
@@ -455,6 +490,14 @@
 					// the OpenFile buffer with the editor view) keeps
 					// state coherent across the diff/edit toggle.
 					workspace.updateText(path, next);
+					// Re-pin drifted review-comment hints (no-op unless
+					// the buffer carries comments).
+					for (const moved of reanchorComments(
+						update.state,
+						commentsForSide(workspace.reviewCommentsForPath(path), 'working'),
+					)) {
+						workspace.repinReviewComment(moved.id, moved.startLine, moved.endLine);
+					}
 				}
 				if (update.selectionSet) {
 					// Mirror the regular editor's selection-publish
@@ -548,6 +591,7 @@
 		detachHScrollSync = wireHorizontalScrollSync(merge.a.scrollDOM, merge.b.scrollDOM);
 		detachStickyHbarA = attachStickyHScrollbar(merge.a.scrollDOM, merge.a.dom);
 		detachStickyHbarB = attachStickyHScrollbar(merge.b.scrollDOM, merge.b.dom);
+		reviewWiring.attach(merge.b);
 
 		// Caret restore order, highest precedence first:
 		//
