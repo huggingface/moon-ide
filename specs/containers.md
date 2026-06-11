@@ -1,83 +1,62 @@
 # Containerised dev shells
 
-STATUS: planned — designed for Phase 2.
-
 ## Goal
 
 The user opens a workspace; moon-ide provisions a single Docker
-container that holds **the project's tooling** — terminals,
-LSPs, linters, formatters, build commands. The project's
-side-services (postgres, redis, mongo, …) come up alongside
-that container as **siblings on the host's daemon**, declared
-in the project's own `docker-compose.yml` and pulled into the
-workspace's compose project via compose `include:`. Nothing is
-nested.
+container that holds **the project's tooling** — terminals, LSPs,
+linters, formatters, build commands. The project's side-services
+(postgres, redis, mongo, …) come up alongside it as **siblings on
+the host's daemon**, declared in the project's own
+`docker-compose.yml`. Nothing is nested.
 
-The IDE itself does not move into the container. The Tauri
-shell, moon-core, Slack, agent runtimes — everything that _is_
-moon-ide — stays host-side. The container is a sandbox the IDE
-shells into to run project commands.
-
-The point is to make `bun dev`, `cargo run`, etc. work the same
-on every machine without polluting the host's ports or global
-`apt` / `pip` / `npm` state — without granting the workspace
-`--privileged` kernel access, which nested Docker would need
-(see [ADR 0008](decisions/0008-host-shared-daemon.md)).
+The IDE itself does not move into the container. The Tauri shell,
+moon-core, Slack, the coder — everything that _is_ moon-ide — stays
+host-side. The container is a sandbox the IDE shells into to run
+project commands: `bun dev`, `cargo run`, etc. work the same on
+every machine without polluting the host's ports or global
+`apt` / `pip` / `npm` state, and without `--privileged` kernel
+access ([ADR 0008](decisions/0008-host-shared-daemon.md)).
 
 ## Why this is a workspace concern, not a project concern
 
-A workspace can hold one project or fifteen — sibling repos,
-a feature branch plus its dependent libraries, a target repo
-plus its tooling repo. Cross-repo search, agent queries, and a
-shell that `cd`s between them all assume a shared dev
-environment. Anchoring the container to a single project (the
-`devcontainer.json`-per-repo model) would mean four sibling
-repos fighting over four containers, four toolchain installs,
-four cached index sets. One container per workspace makes the
-multi-project case the simple case.
-
-When two projects genuinely can't share toolchains (Python 3.10
-vs. 3.12, Rust nightly vs. stable, GPU pinning), that's the
-moment to graduate to multi-container — deferred behind a
-concrete request. See
-[Out of scope](#out-of-scope-for-phase-2-and-when-to-revisit).
+A workspace can hold one project or fifteen. Cross-repo search,
+agent queries, and a shell that `cd`s between repos all assume a
+shared dev environment; anchoring the container to a single project
+(the `devcontainer.json`-per-repo model) would mean sibling repos
+fighting over separate containers and toolchain installs. One
+container per workspace makes the multi-project case the simple
+case. When two projects genuinely can't share toolchains, that's
+the moment to graduate to multi-container — deferred behind a
+concrete request (see
+[Out of scope](#out-of-scope-for-phase-2--and-when-to-revisit)).
 
 ## Workspace shell vs project services
 
-moon-ide treats the workspace shell and the project services
-as two separate things, run as two separate compose projects
-on the host's daemon. The split is locked in by the
-[2026-04-29 amendment to ADR 0007](decisions/0007-compose-and-moon-base.md#amendment-2026-04-29--workspace-shell-vs-project-services).
+Two separate things, run as two separate compose projects on the
+host's daemon (locked in by the
+[2026-04-29 amendment to ADR 0007](decisions/0007-compose-and-moon-base.md#amendment-2026-04-29--workspace-shell-vs-project-services)):
 
 - **Workspace shell** — the moon-ide `dev` container. One per
-  workspace. Hosts terminals, language servers, agents, the
-  bound folders' bind mounts. Lifetime managed by the IDE
-  (the bottom-bar status pip's "Start / Stop / Recreate /
-  Down"). Compose project name: `moon-ws-<id>`.
+  workspace; hosts terminals, language servers, agents, the bound
+  folders' bind mounts. Lifetime managed by the IDE (status-pip
+  Start / Stop / Recreate / Down). Compose project `moon-ws-<id>`.
 - **Project services** — each bound folder's own
-  `docker-compose.yml` (mongo, redis, gitaly, …). Run as
-  **separate** compose projects, named
-  `moon-ws-<id>-<folder-slug>`, started/stopped on demand
-  by the user from the folder bar. moon-ide observes their
-  status and shells out to `docker compose` when the user
-  clicks; it never auto-starts them and it never modifies
+  `docker-compose.yml`, run as separate compose projects named
+  `moon-ws-<id>-<folder-slug>`, started/stopped on demand from the
+  folder bar. moon-ide never auto-starts them and never modifies
   the user's compose file.
 
-Why split: a broken project service shouldn't keep the user
-from getting a terminal. Pre-split, every project's services
-came in via `include:`, so a permission-denied volume in
-moon-landing's `gitaly` blocked `compose up --wait` for the
-whole project — `dev` included — and the IDE was unusable.
-Split, the workspace shell comes up in seconds (one image pull,
-no project-service health waits) and services launch per-folder
+Why split: a broken project service shouldn't keep the user from
+getting a terminal. Pre-split, one permission-denied volume in a
+project's compose blocked `up --wait` for the whole workspace.
+Split, the shell comes up in seconds and services launch per-folder
 on demand.
 
 ### The workspace's `compose.yaml`
 
 ```yaml
 # Generated by moon-ide. Mounts come from bound-folders.json;
-# project services live in each folder's own docker-compose.yml
-# and are managed per-folder, not from this file.
+# project services live in each folder's own docker-compose.yml.
 name: moon-ws-default
 
 services:
@@ -89,35 +68,23 @@ services:
     working_dir: /workspace
     command: ['sleep', 'infinity']
     init: true
-    # No `privileged: true`. We don't run nested Docker.
-    # See ADR 0008.
+    # No `privileged: true`. We don't run nested Docker. See ADR 0008.
 
 x-moon:
   shell-service: dev
 ```
 
-Only the `dev` service. No `include:`. `docker compose -f
-<state-dir>/compose.yaml -p moon-ws-default up -d --wait`
-brings up just the workspace shell.
+Only the `dev` service, no `include:`.
 
 ### Per-folder compose projects
 
-When a bound folder has a root-level `docker-compose.yml` (or
-`compose.yaml`), the folder bar in the sidebar grows a small
-**container glyph** tinted by the project's compose state
-(running / failed / paused / stopped / absent). Click opens a
-popover with Start / Stop / Recreate / Down and a service list
-— same vocabulary as the workspace shell's pip, scoped to that
-one folder's project.
+A bound folder with a root-level `docker-compose.yml` /
+`compose.yaml` gets a container glyph on its folder bar, tinted by
+compose state, opening a popover with Start / Stop / Recreate /
+Down and a service list. (Folder bars also carry `+N ~N -N` git
+badges, refreshed on status passes and coder tool events.)
 
-Folder bars also carry compact `+N ~N -N` git badges next to
-the folder name (added/untracked, modified, deleted counts for
-the working tree). They refresh on every active-folder status
-pass and on coder `tool_result` events, so an agent in folder
-A modifying folder B is visible from B's bar without B
-becoming active.
-
-Under the hood the IDE just shells out:
+Under the hood the IDE shells out:
 
 ```
 docker compose -f <folder>/docker-compose.yml \
@@ -126,1190 +93,479 @@ docker compose -f <folder>/docker-compose.yml \
   <up|pause|down|...>
 ```
 
-The second `-f` is a moon-ide-generated **restart-policy
-override** that neutralises `restart: always` (or any other
-policy) in the user's compose so the IDE's `docker compose stop`
-on quit isn't fought by the daemon. The user's compose file on
-disk is never modified — see
-[ADR 0017](decisions/0017-project-compose-restart-override.md)
-for the rationale. The folder slug is the lower-cased basename
-with non-alnum characters collapsed to `-`. Both projects share the
-`moon-ws-<id>-` prefix, so a single
-`docker compose ls --filter name=moon-ws-default-`
-enumerates everything the workspace owns:
+The second `-f` is a generated **restart-policy override** that
+neutralises `restart: always` so the IDE's `stop` on quit isn't
+fought by the daemon; the user's file is never modified
+([ADR 0017](decisions/0017-project-compose-restart-override.md)).
+Both projects share the `moon-ws-<id>-` prefix, so one
+`docker compose ls` filter enumerates everything the workspace owns.
 
-```
-$ docker compose ls
-NAME                              STATUS              CONFIG FILES
-moon-ws-default                   running(1)          ~/.local/share/moon-ide/workspaces/default/compose.yaml
-moon-ws-default-moon-landing      running(10)         /home/me/code/moon-landing/docker-compose.yml
-```
+Status freshness: a coarse 15 s background poll across bound
+folders plus a tight 2 s poll on an open popover. Status queries
+are TTL-cached (1 s) and single-flighted per project so concurrent
+callers serialise behind one `docker compose ps`
+([ADR 0020](decisions/0020-container-status-cache.md)).
 
 ### Walk-through: moon-landing
 
-moon-landing's `docker-compose.yml` declares ten services
-(mongo, mongot, gitaly, versitygw, meilisearch, dynamo, cas,
-cas-deps, redis, rabbitmq) and a comment on `mongo`'s
-healthcheck noting that "we run the app outside of docker".
-After binding moon-landing into a moon-ide workspace:
+moon-landing's compose declares ten services. After binding it:
 
-- moon-ide writes a dev-only `compose.yaml` to its state dir
-  with one bind mount (`/home/me/code/moon-landing →
-/workspace/moon-landing`). "Set up" brings up just the
-  `dev` container — fast, doesn't touch any project image.
-- The folder bar shows a muted container glyph (compose file
-  detected, services not running). The user clicks it and
-  hits "Start services"; the IDE runs
-  `docker compose -f /home/me/code/moon-landing/docker-compose.yml
--p moon-ws-default-moon-landing up -d --wait`. The user
-  logged into `registry.internal.huggingface.tech` on their
-  host's daemon picks up the private images transparently.
-- If gitaly fails its volume permission check, the folder bar's
-  glyph flips red and the popover lists `gitaly · exited (1)`.
-  The workspace shell stays up; "Recreate" / "Down" sit on the
-  popover. Status freshens via two pollers (see
-  `crates/moon-ide/src/lib/projectCompose.svelte.ts`): a coarse
-  15 s background poll across every bound folder (catches silent
-  crashes in closed-popover bars) and a tight 2 s poll on the
-  open popover's folder (so an in-flight `up -d --wait` view
-  doesn't freeze on the pre-mutation snapshot).
-- `Workspace::status()` and `ProjectCompose::status()` are
-  TTL-cached (1 s) **and** single-flight per `(project,
-compose-file)` key, so concurrent miss callers serialise
-  behind one `docker compose ps` instead of each spawning their
-  own — necessary because the LSP layer's Tauri-command fanout
-  is concurrent. Mutating commands (`setup` / `pause` / `up` /
-  `down` / …) invalidate the slot on success. See
-  [ADR 0020](decisions/0020-container-status-cache.md) and
-  `crates/moon-container/src/status_cache.rs`.
-- The user's app continues to run wherever it ran before —
-  on the host (reaching services through published host
-  ports, exactly as today) or, once Phase 2.1 routes
-  terminals through `dev`, from inside the workspace shell.
+- "Set up" brings up just the `dev` container — fast, no project
+  image touched.
+- The user clicks the folder-bar glyph → "Start services"; the IDE
+  runs the per-folder `up -d --wait`. Private images pull via
+  whatever registries the host's daemon is logged into.
+- If a service fails (e.g. gitaly's volume permissions), the glyph
+  flips red and the popover lists `gitaly · exited (1)` — the
+  workspace shell stays up.
+- The user's app runs wherever it ran before — host-side against
+  published ports, or inside the workspace shell.
 
-Crucially, **nothing in moon-landing's compose has to change**
-for this to work. moon-ide reads the file and shells out;
-it never writes back.
+Nothing in moon-landing's compose has to change. moon-ide reads the
+file and shells out; it never writes back.
 
 ### Networking
 
-Workspace shell and per-folder project services start as
-**separate compose projects on separate networks**, but the
-workspace shell's `dev` container is automatically attached
-to each running project's default network so service-name
-DNS works from a workspace terminal:
+The two compose projects start on separate networks, but the `dev`
+container is automatically attached to each running project's
+default network so service-name DNS works from a workspace
+terminal (`mongosh mongodb://mongo:27017`, `curl http://api:3000`).
 
-```bash
-# from a terminal in the workspace shell:
-mongosh mongodb://mongo:27017     # works
-psql -h db -U postgres            # works
-curl http://api:3000/health       # works
-```
+Mechanism: `docker network connect <project>_default <dev>` after
+every project `up` / `rebuild` / service start, `disconnect`
+before `down`. The attach is best-effort and runs even when the
+lifecycle command errored (an `up --wait` failed by one unhealthy
+service still created the network and the healthy services).
+Workspace-shell setup/rebuild reconciles by re-attaching across
+every running project, covering cold-start ordering and
+dev-container recreation.
 
-The mechanism is a `docker network connect <project>_default
-<dev-container>` issued after every project `up` / `rebuild`
-/ `start_service` / `restart_service`, and a matching
-`disconnect` before `down`. The attach is best-effort and runs
-**even when the lifecycle command itself errored** — `up
---wait` fails the whole command if any one service is
-unhealthy, but the network and the services that did come up
-are real, so gating the dev-side attach behind whole-project
-health would strand the dev container whenever a single
-unrelated service flakes. The workspace shell `setup` /
-`rebuild` / `apply_bound_folders` reconciles by re-attaching
-across every running project — covers cold-start (project up
-before workspace shell) and dev-container recreate (which
-drops every prior attachment).
-
-The per-service "▶" runs `docker compose up -d --no-deps
-<service>`, **not** bare `docker compose start <service>`.
-`start` only handles the `exited`/`stopped` → `running`
-transition and assumes the container is already correctly
-joined to the project network; a container left in `created`
-by a partially-failed `up` (e.g. a host-port conflict aborted
-the project before its network was established) would `start`
-into a running-but-unresolvable state. `up -d --no-deps`
-(re)creates and (re)joins the single service idempotently,
-which is the right recovery primitive — and `--no-deps` keeps
-the click scoped to the one service rather than dragging its
-`depends_on` graph up.
+The per-service "▶" runs `up -d --no-deps <service>`, not `start` —
+`start` can't recover a container left in `created` by a
+partially-failed `up`, while `up -d --no-deps` (re)creates and
+(re)joins the one service idempotently.
 
 Limitations:
 
-- We attach to the project's **default** network only
-  (`<project>_default`). A project that declares an explicit
-  top-level `networks:` block segmenting services into
-  separate tiers (frontend / backend / db) only gets the
-  default tier reachable by name from the dev container —
-  the user picked that segmentation deliberately. They can
-  still reach segmented services by host port if their
-  compose forwards them.
-- Cold-start ordering: if the user brings a project up while
-  the workspace shell is down, the project's `up` quietly
-  skips the attach (no dev container yet); the next workspace
-  `setup` reconciles. Logged at `warn` so a debugger can see
-  it; not surfaced as an error in the UI.
-- Cross-project service-name **collisions** across two bound
-  folders: if `repo-a` and `repo-b` both expose a service
-  named `mongo`, only the first one connected wins
-  resolution from the dev container. Compose still keeps the
-  two projects isolated from each other; the collision is
-  only at the cross-project DNS layer the dev container
-  sees. Rename one or use the host-ports fallback.
-
-Host ports still work as a fallback for projects with
-services explicitly exposed to the host
-(`ports: - "27017:27017"`): on Linux the dev container can
-reach them via the docker bridge gateway IP, on Docker
-Desktop via `host.docker.internal`. The cross-network
-attach is the recommended path because it doesn't require
-the user to publish ports they wouldn't otherwise need
-exposed.
+- Only the project's **default** network is attached. Explicitly
+  segmented tiers stay unreachable by name — the user picked that
+  segmentation; host ports remain the fallback.
+- Cross-project service-name collisions (two folders both expose
+  `mongo`): first one connected wins DNS from the dev container.
+- Host ports also work as a fallback (bridge gateway IP on Linux,
+  `host.docker.internal` on Docker Desktop).
 
 ### Why not nested
 
-The original sketch baked Docker-in-Docker into `moon-base`
-so the workspace container could run the project's
-`docker compose up` itself. That works, but DinD requires
-`--privileged` — full `CAP_SYS_ADMIN`, no seccomp, no
-AppArmor, raw `/dev` and `/sys`. In a multi-tenant SaaS that
-trade-off is well-understood; in a dev environment where the
-container is constantly running newly-fetched supply-chain
-code (`bun install`, `cargo build`, untrusted submodules), a
-single compromised dependency turns into host root.
-
-Sibling compose projects on the host's daemon give us
-isolation between workspace shell and project services
-without the kernel surface. The workspace runs unprivileged
-with Docker's default capability set; the host's daemon —
-which the user already trusts to manage all their other
-containers — runs the services. ADR 0008 records the full
-reasoning.
+DinD requires `--privileged` — full `CAP_SYS_ADMIN`, no seccomp, no
+AppArmor. A dev container constantly running newly-fetched
+supply-chain code (`bun install`, `cargo build`) would turn a single
+compromised dependency into host root. Sibling compose projects on
+the host's daemon give the same isolation without the kernel
+surface. ADR 0008 records the full reasoning.
 
 ### Multi-repo workspaces
 
-A workspace can bind any number of folders. Each folder with
-its own `docker-compose.yml` gets its own per-folder compose
-project, started/stopped independently from the others. There
-are no cross-repo `include:` collisions to manage anymore;
-service-name reuse across repos is fine because each repo's
-compose runs under a different project name.
+Each folder with its own compose file gets its own per-folder
+project, independent of the others. Service-name reuse across repos
+is fine — different project names.
 
 ## Single container, single image
 
 ### The `moon-base` image
 
 moon-ide publishes its own base image to Docker Hub
-(`huggingface/moon-base:<tag>`). Teams `FROM moon-base` to add
-their own toolchain on top.
+(`huggingface/moon-base:<tag>`); teams `FROM moon-base` to extend.
 
-What `moon-base` ships:
+What it ships:
 
-- **Debian stable** as the OS layer. Not Microsoft's
-  `mcr.microsoft.com/devcontainers/...` family — those are
-  fine, but for a long-lived workspace container we'd rather
-  control the base ourselves.
-- **Polyglot toolchain**: `bun`, rustup with the stable
-  toolchain, `fnm` + Node LTS + Corepack (so `.nvmrc` /
-  `.node-version` auto-switch with auto-install on `cd`, and
-  `pnpm` / `yarn` resolve from each project's `packageManager`
-  field), `uv` (Astral's Python toolchain manager), Go (pinned
-  via `GO_VERSION`, installed user-mode under
-  `~/.local/go`), the `hf` CLI installed via `uv tool` so its
-  dep tree stays isolated, and `gh` from GitHub's official apt
-  repo. Comfort tooling: `git`, `ripgrep`, `fzf`, `bat`, `jq`.
-  None of these lock a language version on the team — projects
-  opt in via their own `.nvmrc` / `rust-toolchain.toml` /
-  `pyproject.toml` / `go.mod`, and `rustup toolchain install
-nightly` or `uv python install 3.10` on top of `moon-base`
-  covers the rest.
-- **Language servers**: `rust-analyzer` (via
-  `rustup component add`) and `gopls` (via
-  `go install golang.org/x/tools/gopls@latest`). The moon-ide
-  LSP broker probes for these on first `.rs` / `.go` open and
-  runs the server inside the container via `docker exec` when
-  present, so a developer who hasn't installed the toolchain
-  on their host still gets diagnostics, hover, and goto-def.
-  Python / JS language servers follow the same pattern via
-  per-project install (`uv add --dev ty`,
-  `bun add -D @typescript/native-preview`) — see
+- **Debian stable** (not the Microsoft devcontainers family — we'd
+  rather control the base for a long-lived workspace container).
+- **Polyglot toolchain**: `bun`, rustup + stable, `fnm` + Node LTS +
+  Corepack, `uv`, Go (user-mode, pinned), the `hf` CLI, `gh`, plus
+  comfort tooling (`git`, `ripgrep`, `fzf`, `bat`, `jq`). Projects
+  pin their own versions via `.nvmrc` / `rust-toolchain.toml` /
+  `pyproject.toml` / `go.mod`.
+- **Language servers**: `rust-analyzer` and `gopls` baked in; the
+  LSP broker runs them in-container via `docker exec` when present.
+  Python / JS servers install per-project — see
   [LSP](lsp.md#container-backed-lsp).
-- **WebKitGTK dev libraries** so a fresh moon-ide checkout is
-  buildable inside its own container (the bootstrap concern
-  from [ADR 0005](decisions/0005-bootstrap.md)).
+- **WebKitGTK dev libraries** so a moon-ide checkout builds inside
+  its own container ([ADR 0005](decisions/0005-bootstrap.md)).
 - A non-root `dev` user (uid 1000) with passwordless sudo. No
-  Docker daemon, no Docker CLI — the workspace doesn't talk
-  to a daemon at all (see [Workspace shell vs project services](#workspace-shell-vs-project-services)).
+  Docker daemon or CLI inside.
 - An entrypoint that does **nothing** — moon-ide attaches with
-  `docker exec` and runs commands on demand. No daemonised
-  language servers waiting in the dark.
+  `docker exec` on demand.
 
-Versioning: `moon-base:<commit-sha>` for reproducibility,
-`moon-base:latest` for human convenience, `moon-base:major.minor`
-when breaking changes ship. The `compose.yaml` we generate
-points at a specific tag, not `latest`.
+Versioning: `<commit-sha>` for reproducibility, `major.minor` for
+breaking changes, `latest` for humans. Generated `compose.yaml`
+pins a specific tag.
 
 ### Distribution
 
-`moon-base` ships as a **multi-arch manifest** to **Docker
-Hub** (`huggingface/moon-base`):
-
-- `linux/amd64` — Linux contributors and CI smoke tests.
-- `linux/arm64` — the team's primary target (Mac-majority,
-  Apple Silicon).
-
-Built natively on both architectures via GitHub Actions
-(`ubuntu-24.04` + `ubuntu-24.04-arm` — both free for public
-repos, so no QEMU emulation in the path). Two parallel build
-jobs feed a `docker buildx imagetools create` step that
-publishes the combined manifest. Docker pulls the right arch
-automatically based on the host.
-
-Builds run only on changes to `moon-base`'s own sources
-(Dockerfile, bootstrap scripts, the workflow), not on every
-moon-ide commit — `moon-base` tracks toolchain versions, not
-moon-ide versions. The release-gate smoke test
-(`bun install && cargo check` inside the fresh image) runs only
-when `moon-base` changes. The contract is "`moon-base` builds
+Multi-arch manifest (`linux/amd64` + `linux/arm64` — the team is
+Mac-majority) on Docker Hub, built natively on both architectures
+via GitHub Actions (no QEMU) and combined with
+`buildx imagetools create`. Builds run only on changes to
+moon-base's own sources, with a `bun install && cargo check` smoke
+test inside the fresh image — the contract is "moon-base builds
 moon-ide cleanly when published", not "every moon-ide commit
-re-validates `moon-base`".
+re-validates moon-base".
 
-#### Why Docker Hub, not GHCR or HF Hub
-
-- **GHCR**: ties the base image to a GitHub/Microsoft account
-  in every `docker pull` path. Avoided for a foundational
-  artefact.
-- **Private registry**: the image must be public so
-  contributors pull without credential setup.
-- **HF Spaces "run locally"**: amd64-only, which locks out
-  arm64 (the primary target).
-- **Docker Hub**: vendor-neutral, public, multi-arch-native,
-  no registry prefix. Chosen.
+Why Docker Hub: GHCR ties the pull path to a GitHub account, a
+private registry breaks credential-free contributor pulls, and HF
+Spaces' registry is amd64-only. Docker Hub is vendor-neutral,
+public, and multi-arch-native.
 
 ### Why not devcontainer.json features
 
-Devcontainer "features" (`github-cli:1`, `python:1`, …) layer
-on whatever base image the user picked, so every team
-relitigates toolchain decisions. Baking the polyglot toolchain
-into `moon-base` gives every workspace a known-good setup with
-no configuration; uncovered cases come back as Dockerfile lines
-in the team's `FROM moon-base` extension.
-
-### How teams extend it
+Features layer on whatever base the user picked, so every team
+relitigates toolchain decisions. Baking the toolchain into
+`moon-base` gives a known-good setup with no configuration;
+uncovered cases become Dockerfile lines in the team's
+`FROM moon-base` extension:
 
 ```dockerfile
 FROM huggingface/moon-base:1.0
 
-# Team-specific tooling
 RUN apt-get update && apt-get install -y \
     awscli \
     redis-tools \
  && rm -rf /var/lib/apt/lists/*
-
-# Team-specific user
-ARG USERNAME=dev
-ARG UID=1000
-RUN useradd --uid ${UID} --create-home ${USERNAME}
-USER ${USERNAME}
 ```
-
-The team commits this `Dockerfile` to their repo at whatever
-path they like; the workspace's generated `compose.yaml`
-references it via `build.context`.
 
 ## Workspace config: `compose.yaml`
 
-The source of truth is the workspace's generated compose file
-at `<dirs::data_local_dir>/moon-ide/workspaces/<id>/compose.yaml`
-— standard Docker Compose syntax, regenerated by moon-ide
-whenever the bound-folder set changes (see [ADR 0007's state-dir
-amendment](decisions/0007-compose-and-moon-base.md#amendment-2026-04-29--state-dir-and-multi-folder-mounts)).
-moon-ide reads it on every workspace open, parses just enough
-to find the service it attaches to, and otherwise lets compose
-own its semantics.
+The source of truth is the generated compose file at
+`<dirs::data_local_dir>/moon-ide/workspaces/<id>/compose.yaml` —
+standard compose syntax, regenerated whenever the bound-folder set
+changes ([ADR 0007's state-dir amendment](decisions/0007-compose-and-moon-base.md#amendment-2026-04-29--state-dir-and-multi-folder-mounts)).
+moon-ide parses just enough to find the service it attaches to and
+otherwise lets compose own its semantics. Bound folders' own
+compose files are **not** folded in — they run as separate
+per-folder projects.
 
-A minimal generated config (workspace with no project-side
-compose):
-
-```yaml
-# <state-dir>/compose.yaml
-name: moon-ws-${WORKSPACE_ID}
-
-services:
-  dev:
-    image: huggingface/moon-base:1.0
-    volumes:
-      - ..:/workspace:cached
-    working_dir: /workspace
-    command: sleep infinity
-    init: true
-    # Declared forwards — listed for IDE discovery, not auto-bound.
-    # ports: ["3000:3000"]
-```
-
-A workspace whose bound folders carry their own compose files
-does **not** fold them into this file; those run as separate
-per-folder projects — see
-[Workspace shell vs project services](#workspace-shell-vs-project-services).
-
-What gets auto-generated vs. user-owned:
-
-- **Generated on first opt-in**: the file above, with the
-  `moon-base` image pinned to whatever tag the running
-  moon-ide build was paired with, and `include:` entries
-  populated from any project compose files moon-ide spotted
-  during workspace scan. The user can commit it, gitignore
-  it, or rewrite it as they please.
-- **User-owned thereafter**: every line. moon-ide never writes
-  back to `compose.yaml` after the first generation. Switching
-  images, adding services, changing mount strategies, adding
-  or removing `include:` entries — all manual.
-
-### Why compose, not devcontainer.json native
-
-1. **Image control.** Compose defaults to "any base image";
-   devcontainer.json nudges toward Microsoft's image family.
-2. **One layer of magic, not two.** `compose.yaml` +
-   `Dockerfile` is the industry-standard pair every team
-   already knows; devcontainer.json adds a translation step
-   that becomes compose anyway.
-3. **Multi-service is free.** Adding `db` / `redis` / a
-   GPU-pinned service is one more service entry, no new
-   abstraction.
-
-Devcontainer.json **interop** (synthesising a compose service
-from a repo's `.devcontainer/devcontainer.json`) is deferred to
-Phase 2.3. See
-[ADR 0007](decisions/0007-compose-and-moon-base.md) for the full
-trade-off.
+Why compose, not devcontainer.json native: image control (compose
+defaults to "any base image"), one layer of magic instead of two
+(devcontainer.json becomes compose anyway), and multi-service is
+free. Devcontainer.json **interop** is deferred to Phase 2.3
+([ADR 0007](decisions/0007-compose-and-moon-base.md)).
 
 ## Lifecycle
 
-| Event                                                          | What moon-ide does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| First workspace open (no container yet)                        | Pull image if absent → `docker compose -f <state-dir>/compose.yaml create` → `docker compose start`. Run `postCreateCommand` if compose declares one.                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| Subsequent workspace opens                                     | Look up container by name (`moon-ws-<short-hash>`). If `stopped` (the common case after a clean previous quit), auto-`compose up -d --wait`. No-op if already running, leave alone if `failed`/`absent`.                                                                                                                                                                                                                                                                                                                                                                                                     |
-| App quit / window close                                        | The IDE is the command centre: hide the window, then `docker compose stop` the workspace shell **and** every bound-folder compose project moon-ide knows about, then exit. Best-effort — per-step failures are logged and don't block exit. Before each per-folder stop, moon-ide snapshots whether that project was `Running` into `session.json`'s `compose_auto_resume` map; on next launch it auto-resumes both the workspace shell and every snapshotted-as-running folder. Folders the user had already stopped by hand stay stopped. See [`Why moon-ide owns shutdown`](#why-moon-ide-owns-shutdown). |
-| User clicks "Recreate"                                         | `docker compose up -d --force-recreate --pull always --wait` — recreate from current `compose.yaml`, pulling a fresh image first. Drops in-container state.                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| Compose file edited externally                                 | Detected on next workspace open via mtime; prompt for "Rebuild now?" before reattaching.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| Container deleted out-of-band (`docker rm` from another shell) | Detected on next open via `docker inspect` failure; recreate transparently.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| Image tag changed in `compose.yaml`                            | Treated as "Rebuild" — recreate from new image.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| Event                          | What moon-ide does                                                                                                     |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
+| First workspace open           | Pull image if absent → compose create + start.                                                                         |
+| Subsequent opens               | Auto-`up -d --wait` if `stopped`; no-op if running; leave alone if `failed` / `absent`.                                |
+| App quit / window close        | Hide window, `compose stop` the shell and every bound-folder project, snapshot what was running for resume, then exit. |
+| "Recreate"                     | `up -d --force-recreate --pull always --wait`. Drops in-container state.                                               |
+| Compose file edited externally | Detected via mtime on next open; prompt "Rebuild now?".                                                                |
+| Container deleted out-of-band  | Detected via `docker inspect` failure; recreate transparently.                                                         |
+| Image tag changed              | Treated as "Rebuild".                                                                                                  |
 
 ### Stop semantics, and how to keep in-memory state
 
-The workspace shell's "Stop" button shells to `docker compose
-stop`: SIGTERM to `dev`, then its same-project services.
-Processes shut down, LSPs re-init on next "Start", a running
-`bun dev` needs relaunching. It's the predictable "done for now"
-knob, and it matches the per-project popover so the verb means
-the same thing everywhere.
-
-We considered defaulting to Pause (`docker pause`, cgroup
-freezer), which preserves warm state — LSPs, shell history,
-caches — for free. We didn't, because:
-
-- Per-project popovers have no Pause story (a kernel-frozen
-  mongo with paused replication is surprising), and aligning
-  the two vocabularies means one mental model.
-- Pause is a debugging tool, not a "log off for the evening"
-  one — the freezer leaves zombie sockets and confused outside
-  tooling. "Stop" then "Start" suits a quick suspend and lets
-  the system clean up.
-
-The `pause` / `resume` Tauri commands and `Workspace::pause` /
-`resume` stay on the backend for power users who shell to
-`docker compose pause` directly; the UI doesn't expose them.
-
-`Recreate` shells to `up -d --force-recreate --pull always
---wait` — the "throw state away on purpose" knob, for after a
-moon-base bump or when something's wedged.
+"Stop" shells to `docker compose stop` — processes shut down, LSPs
+re-init on next Start. We considered defaulting to Pause (cgroup
+freezer, preserves warm state) but rejected it: per-project
+popovers have no sane Pause story (a kernel-frozen mongo is
+surprising), and the freezer leaves zombie sockets — Pause is a
+debugging tool, not a "log off for the evening" one. The
+`pause` / `resume` commands stay on the backend unexposed.
 
 ### Why moon-ide owns shutdown
 
-When the user quits the IDE, moon-ide doesn't just exit — it
-runs `docker compose stop` against:
+On quit, moon-ide `compose stop`s the workspace shell **and** every
+bound folder's compose project, then exits — the IDE is the command
+centre for what it spawned: "I closed moon-ide, nothing should be
+using CPU/RAM I can't see in moon-ide." The window hides first so
+the UI doesn't look frozen during the SIGTERM grace period; the
+stops run in a background task.
 
-- the workspace shell (`moon-ws-<id>`), and
-- every bound folder's compose project (`moon-ws-<id>-<slug>`)
-  that has a discoverable `docker-compose.yml` at its root.
+Ordering details that matter (implementation in
+`src-tauri/src/focus_socket.rs` and `shutdown.rs`): the
+single-instance lock is released before the teardown so a relaunch
+isn't told the workspace is in use, and a **shutdown sentinel**
+file holds the new launch's auto-resume until the old process's
+teardown finishes — otherwise the relaunch would resume containers
+the old process is about to stop.
 
-Then it exits. Per-folder compose projects get the
-restart-policy override applied at create time (see
-[ADR 0017](decisions/0017-project-compose-restart-override.md)),
-so `stop` is final — the daemon doesn't respawn services
-behind us even if the user's compose declared
-`restart: always`. The window is hidden first so the UI doesn't
-look frozen for the ~10s of SIGTERM grace period; the actual
-stops run in a background tokio task off the Tauri event
-loop, and the process calls `app.exit(0)` once they finish.
-
-The single-instance lock is released **before** that compose
-teardown, not after: the background task first aborts the
-focus-socket listener (dropping its `UnixListener`) and unlinks
-`instance.sock`, then runs `stop_all`. Order matters because the
-listener keeps accepting connections until its task is dropped,
-so a relaunch that fires during the multi-second teardown would
-otherwise `probe_alive`-connect successfully and wrongly report
-the workspace as still in use. See
-[`crate::focus_socket::cleanup`](../src-tauri/src/focus_socket.rs)
-and the `RunEvent::ExitRequested` hook in `src-tauri/src/lib.rs`.
-
-Dropping the lock early would let a relaunch fired _during_ the
-teardown bind the freed lock and auto-resume against
-still-`Running` containers, only to have the old `stop_all` kill
-them out from under it. A **shutdown sentinel** prevents this:
-the exiting process writes `run/shutting-down` (body = its PID)
-before it drops the lock and removes it once `stop_all` returns;
-[`focus_socket::await_previous_shutdown`](../src-tauri/src/focus_socket.rs)
-holds the new launch's auto-resume until the file is gone (or the
-writer PID is dead, i.e. a SIGKILLed teardown, or a ~45s cap
-elapses). This also keeps the coder panel's per-process
-`container:state`-driven bash-target indicator honest — it
-re-probes off the new process's own resume event rather than a
-stale mid-teardown one.
-
-This makes the IDE the **command centre** for what it spawned:
-"I closed moon-ide, nothing should be using CPU/RAM I can't see
-in moon-ide." The alternative — leaving every compose project
-running after quit — collects ghost projects the user easily
-forgets they're paying for.
-
-Symmetric resume on the way back in: both the workspace
-shell (via [`auto_resume_shell`] in
-`src-tauri/src/shutdown.rs`) and every per-folder compose
-project that was `Running` at the previous quit (via
-[`auto_resume_project_composes`] in the same file) come
-back up on the next launch. The "was running" decision is
-snapshotted into `WorkspaceSession.compose_auto_resume`
-during [`stop_all`], immediately before each project's
-`docker compose stop` — a `BTreeMap<folder_path, bool>`
-keyed by the bound folder's absolute path. Anything other
-than `Running` at snapshot time (so `Paused`, `Stopped`,
-`Failed`, `Absent`) is _not_ in the map, so projects the
-user took down deliberately stay down.
-
-Two finer points keep the "user intent" signal accurate:
-
-- The per-folder Stop and Down Tauri commands
-  (`project_compose_stop` / `project_compose_down`) clear
-  that folder's entry from the map immediately after the
-  successful stop. So "I stopped this on purpose, then quit
-  later" survives a SIGKILL — the map is already correct on
-  disk before the quit even starts.
-- [`auto_resume_project_composes`] iterates the workspace's
-  _current_ bound folders, not the map's keys, so a stale
-  entry for a folder the user has since unbound doesn't
-  trigger a confusing `compose up` against something that
-  isn't part of the workspace anymore.
-
-(An earlier policy resumed only the workspace shell and left
-per-folder projects stopped. The team consistently wanted those
-services back, and the cost of an unwanted start is bounded —
-visible in the folder bar, one click to stop — so we resume what
-was running at quit.)
-
-Failure modes are deliberately non-fatal:
-
-- `compose stop` on a project that doesn't exist on the
-  daemon yet: warning, exit continues. (Common: user opened
-  a folder, never started its services, then closed the
-  IDE.) Also produces no entry in `compose_auto_resume`,
-  since the pre-stop status query returns `Absent`.
-- IDE killed via SIGKILL, OS shutdown, kernel panic: the
-  shutdown hook never runs. Containers stay running; next
-  launch reads the _previous_ clean shutdown's
-  `compose_auto_resume` map. For each folder the map marks
-  as auto-resume, [`auto_resume_project_composes`] queries
-  status first and skips the `up` round-trip if the project
-  is already `Running` — so SIGKILL leaves the user with
-  exactly the same containers up, no spurious churn.
-- Auto-resume `setup` or per-folder `up` on launch fails
-  (image gone, daemon down, compose file deleted): logged
-  at `warn`, the IDE itself launches normally and the
-  failure surfaces in the relevant popover when the user
-  opens it. The remaining folders are still attempted.
+Symmetric resume: what was `Running` at quit comes back on the next
+launch — the workspace shell and every per-folder project
+snapshotted into `WorkspaceSession.compose_auto_resume` immediately
+before its stop. Projects the user stopped by hand aren't in the
+map (the per-folder Stop/Down commands clear their entry
+immediately, surviving a later SIGKILL), and resume iterates the
+current bound folders so stale entries for unbound folders are
+ignored. Failures are non-fatal: a project absent from the daemon
+logs a warning; a SIGKILLed IDE leaves containers running and the
+next launch skips the `up` for anything already `Running`; a failed
+auto-resume logs and surfaces in the popover.
 
 #### Signal-termination exits aren't failures
 
-Plenty of long-running services (JVMs especially —
-DynamoDB, MongoDB, MeiliSearch) exit with code `143` on
-SIGTERM, or `137` on SIGKILL escalation, when `compose
-stop` reaches them. A naive aggregator would surface that
-as `Failed`, which is wrong for two reasons:
-
-- **Visual noise.** The user clicked Stop. They don't want
-  to come back to a red panel five seconds later.
-- **Auto-resume regression.** `auto_resume_shell` only
-  brings the workspace shell back if the previous state
-  was exactly `Stopped`. With every JVM exiting `143` on
-  shutdown, the project lands in `Failed` and the next
-  launch silently refuses to resume.
-
-`is_stop_signal` (in `crates/moon-container/src/lifecycle.rs`,
-mirrored as `isStopSignal` in `src/lib/protocol.ts`)
-treats exit codes `130` (SIGINT), `137` (SIGKILL), and
-`143` (SIGTERM) as a clean stop. The aggregator counts
-them with the zero-exit bucket; the per-service
-indicator stays muted instead of red. SIGSEGV (`139`),
-SIGABRT (`134`), SIGBUS (`135`) and other genuine
-crashes are deliberately _not_ on the list — those still
-flip to `Failed`.
-
-Trade-off: an OOM-kill (also exit `137`) is indistinguishable
-from a SIGKILL-escalated stop, so its dot stays muted. The
-literal `exited (137)` still shows in the per-service row, and
-OOM-kills in a dev container are rare, so we accept the false
-negative.
+Many services (JVMs especially) exit `143` on SIGTERM or `137` on
+SIGKILL escalation when `compose stop` reaches them. Treating that
+as `Failed` would paint a red panel after a deliberate Stop and
+break auto-resume (which only resumes from a clean stop).
+`is_stop_signal` treats exit codes `130` / `137` / `143` as clean;
+genuine crash signals (SIGSEGV `139`, SIGABRT `134`, …) still flip
+to `Failed`. Trade-off: an OOM-kill (also `137`) shows muted — the
+literal `exited (137)` is still in the per-service row, and
+OOM-kills in a dev container are rare.
 
 ## Terminals
 
-Phase 3 ([roadmap](roadmaps/phase-03-terminal.md), [ADR 0009](decisions/0009-terminal-pty-and-targets.md))
-adds PTY-backed terminal sessions to the bottom panel. They
-matter to the container story because container terminals
-_are_ the workspace shell from the user's point of view —
-"what can I run inside the dev container right now" —
-and their lifecycle is tied to the workspace container's.
+Phase 3 ([ADR 0009](decisions/0009-terminal-pty-and-targets.md))
+adds PTY-backed terminals. Two targets, picked at open time and
+immutable per tab:
 
-Two targets, picked at open time and immutable per tab:
+- **Host** — the user's `$SHELL` on the host, cwd at the active
+  folder. Independent of the container's lifecycle.
+- **Container** — `docker exec -it` against the workspace shell,
+  cwd `/workspace/<basename>`. Disabled when the container isn't
+  running; does **not** survive Stop / Down / Recreate (the exec
+  dies and the tab shows `[exited (N)]` — open a fresh tab).
 
-- **Host** — spawns the user's `$SHELL` (fallback
-  `/bin/bash`) directly on the user's machine. cwd is the
-  active folder's host path. Independent of the workspace
-  container; survives a workspace container Stop / Down.
-- **Container** — `docker exec -it
-moon-ws-<id>-dev-1 <shell>` against the workspace
-  container. cwd is `/workspace/<basename>` for the active
-  folder. Disabled in the launcher popover when the
-  workspace container isn't running. **Does not** survive
-  a Stop / Down / Recreate of the container — the
-  `docker exec` dies with its parent and the tab flips to
-  `[exited (N)]`. The user opens a fresh tab against the
-  new container.
+The asymmetry is intentional: migrating tabs across lifecycle
+events would be confusing; the relationship is explicit.
 
-The asymmetry is intentional: Host terminals are
-"my machine right now"; Container terminals are
-"this specific container right now". Migrating between
-them at lifecycle events would be confusing — better to
-make the relationship explicit and let the user
-re-establish it when they care.
-
-PTY plumbing uses [`portable-pty`](https://docs.rs/portable-pty);
-both targets allocate a host-side master PTY and run their
-command (host shell, or `docker exec`) as the child. SIGWINCH
-propagates correctly through `docker exec`, so xterm-addon-fit
-resizes both the host PTY and the in-container TTY in one
-hop. See `crates/moon-terminal/` for the spawn helper and
-`src-tauri/src/commands/terminal.rs` for the supervisor that
-ferries bytes over Tauri events.
-
-`stop_all` (the IDE-quit path) aborts every open terminal
-supervisor before it does anything else — the supervisor's
-`PtySession` drops, the SIGKILL goes to the host shell or
-`docker exec`, and neither survives the IDE process. This
-is what keeps the daemon clean of orphaned exec sessions
-across IDE quits.
+Both targets allocate a host-side master PTY via `portable-pty`
+with the command (shell or `docker exec`) as the child; SIGWINCH
+propagates through `docker exec` so resize works in one hop. On IDE
+quit, every terminal supervisor is aborted first so no orphaned
+exec sessions outlive the process.
 
 ## What runs where
 
-| Concern                                                | Host (Tauri / moon-ide proper)                       | Workspace `dev` container | Project service containers (compose siblings)                                                                                                                                                                                                                                     |
-| ------------------------------------------------------ | ---------------------------------------------------- | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| UI rendering, Tauri shell, IPC routing                 | ✓                                                    |                           |                                                                                                                                                                                                                                                                                   |
-| Slack panel, Slack API calls                           | ✓                                                    |                           |                                                                                                                                                                                                                                                                                   |
-| Coder loop / LLM HTTP calls (Phase 6)                  | ✓                                                    |                           | Tools the loop dispatches (`bash`, `read_file`, …) cross to the container via `WorkspaceHost::spawn` exactly like the terminal does.                                                                                                                                              |
-| Git operations on the workspace                        | ✓ (status, fetch, push/pull, blame, diffs)           | ✓ (`commit` + its hooks)  | `git commit` / `git_commit_on_new_branch` route through `moon_core::shell::ShellTarget` so the pre-commit hook (`bunx lint-staged`, …) runs with the container's toolchain. Everything else stays host-side. See [ADR 0024](decisions/0024-git-commit-in-container.md).           |
-| `docker compose up` for the project's compose          | ✓ (moon-ide drives the host's daemon via `include:`) |                           |                                                                                                                                                                                                                                                                                   |
-| Project terminals                                      |                                                      | ✓                         |                                                                                                                                                                                                                                                                                   |
-| LSP servers                                            |                                                      | ✓                         |                                                                                                                                                                                                                                                                                   |
-| Linters / formatters (oxlint, oxfmt, prettier, eslint) |                                                      | ✓                         | Format-on-save dispatch lives behind `moon_core::shell::ShellTarget`; routes through `docker exec -w <cwd> <name>` whenever the workspace shell is `Running`. See [ADR 0013 § Container routing](decisions/0013-format-on-save-file-based.md#container-routing-added-2026-05-07). |
-| Build commands (`cargo`, `bun`, `npm`, `make`)         |                                                      | ✓                         |                                                                                                                                                                                                                                                                                   |
-| postgres / redis / mongo / …                           |                                                      |                           | ✓                                                                                                                                                                                                                                                                                 |
+| Concern                                        | Host (Tauri / moon-ide proper)             | Workspace `dev` container | Project service containers                                                                                                                                            |
+| ---------------------------------------------- | ------------------------------------------ | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| UI rendering, Tauri shell, IPC routing         | ✓                                          |                           |                                                                                                                                                                       |
+| Slack panel, Slack API calls                   | ✓                                          |                           |                                                                                                                                                                       |
+| Coder loop / LLM HTTP calls                    | ✓                                          |                           | Tools the loop dispatches (`bash`, `read_file`, …) cross to the container via `WorkspaceHost` exactly like the terminal does.                                         |
+| Git operations on the workspace                | ✓ (status, fetch, push/pull, blame, diffs) | ✓ (`commit` + its hooks)  | Commits route through `ShellTarget` so pre-commit hooks run with the container's toolchain ([ADR 0024](decisions/0024-git-commit-in-container.md)).                   |
+| `docker compose` lifecycle commands            | ✓ (drives the host's daemon)               |                           |                                                                                                                                                                       |
+| Project terminals                              |                                            | ✓                         |                                                                                                                                                                       |
+| LSP servers                                    |                                            | ✓                         |                                                                                                                                                                       |
+| Linters / formatters                           |                                            | ✓                         | Format-on-save routes through `docker exec` when the shell is `Running` ([ADR 0013](decisions/0013-format-on-save-file-based.md#container-routing-added-2026-05-07)). |
+| Build commands (`cargo`, `bun`, `npm`, `make`) |                                            | ✓                         |                                                                                                                                                                       |
+| postgres / redis / mongo / …                   |                                            |                           | ✓                                                                                                                                                                     |
 
-The split is "host = the IDE; container = the project's
-tooling". Slack credentials live in the OS keyring; agent
-runtimes hit remote APIs from the host (the container's network
-namespace would buy nothing).
-
-There is **no persistent moon-ide process inside the container**
-— no agent, no socket, no companion daemon. Every container-side
-process is the user's (shell, build, LSP) or a short-lived
-`docker exec` the host kicks off on demand. A future sandboxed
-long-running companion (moon-core-as-server for indexing, a
-network-isolated agent runner) would be introduced explicitly
-when the use case shows up.
+The split is "host = the IDE; container = the project's tooling".
+There is **no persistent moon-ide process inside the container** —
+every container-side process is the user's (shell, build, LSP) or a
+short-lived `docker exec`. A long-running in-container companion
+would be introduced explicitly when a use case shows up.
 
 ### When the project _is_ moon-ide
 
-moon-ide is itself a Tauri app, so its build matrix is
-platform-coupled in a way most workspaces aren't:
-
-- The launched binary is **host-native** on every platform, and
-  the webview it loads is a system library (WebKitGTK on Linux,
-  WKWebView on macOS).
-- The toolchain producing that binary (Rust + bun + the
-  platform's webview headers + linker) therefore lives on the
-  host: a Linux container can't produce a macOS `.app`, and a
-  Linux binary built inside it still needs host WebKitGTK to
-  launch.
-- Everything platform-agnostic — rust-analyzer, oxlint, oxfmt,
-  prettier, `bun run check`, tests, `bun install` — lives in the
-  container.
-
-So macOS contributors put Xcode CLT + rustup + bun + Docker
-Desktop on the host (macOS provides WebKit); Linux contributors
-put WebKitGTK dev libraries
-([README](../README.md#linux)) + rustup + bun + Docker Engine
-on the host. Tauri's CLI picks the platform target
-automatically; the container is the equaliser for everything
-_around_ the build.
+moon-ide is a Tauri app, so the binary-producing toolchain (Rust +
+bun + platform webview headers + linker) lives on the **host** — a
+Linux container can't produce a macOS `.app`. Everything
+platform-agnostic (rust-analyzer, lint, format, check, tests,
+`bun install`) lives in the container. The container is the
+equaliser for everything _around_ the build.
 
 ## Path mapping
 
-The workspace root is bind-mounted at a fixed path inside the
-container, by default `/workspace` (configurable via the
-`workspaceFolder` key in the generated `compose.yaml`'s
-top-level `x-moon` block — see [Forward compatibility](#forward-compatibility)).
-
-Path translation is a single function in `moon-container`:
+The workspace root bind-mounts at `/workspace` (configurable via
+`x-moon.workspace-folder`). Translation is one function in
+`moon-container`:
 
 ```rust
 struct PathMapping {
-    host_root: Utf8PathBuf,    // e.g. /home/eli/code/hf
+    host_root: Utf8PathBuf,      // e.g. /home/eli/code/hf
     container_root: Utf8PathBuf, // e.g. /workspace
-}
-
-impl PathMapping {
-    fn to_container(&self, host_path: &Utf8Path) -> Result<Utf8PathBuf>;
-    fn to_host(&self, container_path: &Utf8Path) -> Result<Utf8PathBuf>;
 }
 ```
 
-Used everywhere a value crosses the boundary: when we ship a
-file path to a container-running LSP, when we receive a
-diagnostic with a path back, when the user clicks an in-IDE
-link to a path the bot generated, etc. Identity mapping when
-no container is active.
-
-Subprojects: a workspace at `/home/eli/code/hf` containing
-`/home/eli/code/hf/moon-ide` and `/home/eli/code/hf/moon-bot`
-maps to `/workspace/moon-ide` and `/workspace/moon-bot` inside.
-The container sees one tree.
+Used wherever a path crosses the boundary (LSP requests,
+diagnostics coming back, links). Identity mapping when no container
+is active. Bound folders map to `/workspace/<basename>` each.
 
 ## Network and port forwarding
 
-The container runs on its own bridge network — the whole point
-of doing this is _not_ polluting the host's `localhost`. Ports
-the user wants to reach from the host are forwarded by an
-**IDE-managed proxy sidecar**, not by listing them in
-`compose.yaml`'s `ports:` map.
-
-### Why a sidecar (not `ports:` on `dev`)
-
-Compose treats `ports:` as part of the dev service's spec —
-adding or removing a forward forces a recreate of the dev
-container, which drops every terminal session, every in-progress
-LSP, every agent process. The whole point of "exposing a port"
-is that the user is iterating on something running inside the
-container; recreating the container kills that thing on every
-edit. The sidecar is a separate container with its own
-lifecycle, so port edits never touch `dev`.
+The container runs on its own bridge network — not polluting the
+host's `localhost` is the point. Ports the user wants on the host
+are forwarded by an **IDE-managed proxy sidecar**, not `ports:` on
+`dev`: compose treats `ports:` as part of the service spec, so
+every forward edit would recreate the dev container and kill the
+very process being iterated on. The sidecar has its own lifecycle.
 
 ### Mechanism
 
-For each workspace, moon-ide runs at most one proxy container:
-
-- Name: `moon-ws-<id>-ports-1`.
-- Image: `alpine/socat:1.8.0.3` (~5 MB; pinned tag).
-- Network: `moon-ws-<id>_default` — the workspace shell's
-  default network, so the proxy can resolve `dev` by name.
-- Publishes `127.0.0.1:<host_port>` for each declared forward;
-  fans `socat tcp-listen:<container_port>,fork,reuseaddr
-tcp:moon-ws-<id>-dev-1:<container_port>` listeners off a
-  single `sh -c '… & wait'` invocation.
-
-Adding or removing a forward = stop the sidecar, run a new one
-with the new port set. The dev container, terminals, and any
-in-flight `bun dev` are untouched.
+At most one proxy container per workspace:
+`moon-ws-<id>-ports-1`, image `alpine/socat` (pinned), attached to
+the workspace shell's default network, publishing
+`127.0.0.1:<host_port>` per declared forward with one socat
+listener each. Adding/removing a forward replaces the sidecar; the
+dev container is untouched.
 
 ### Storage and lifecycle
 
-Forwards are persisted per-workspace in `session.json` as
-[`ForwardedPort`](../crates/moon-protocol/src/ports.rs)
-entries (`container_port`, `host_port`, `label`). The host
-port defaults to the container port on the picker; the user
-re-types it on cross-workspace conflicts (workspace A:
-`3000 -> 3000`, workspace B: `3001 -> 3000`).
-
-Lifecycle integration:
-
-- `Workspace::teardown` stops the sidecar **before**
-  `compose down` — Docker refuses to remove a network with
-  active endpoints, and the sidecar attaches to the
-  workspace's default network. (Same hazard as the
-  cross-project attach in [`network.rs`](../crates/moon-container/src/network.rs).)
-- `Workspace::stop` leaves the sidecar running. It'll
-  proxy-fail to a stopped dev (socat returns "connection
-  refused" per accept), which is the right user-visible
-  behaviour: the user sees that their forward is up but
-  their server isn't.
-- `container_setup` / `container_rebuild` /
-  `container_apply_bound_folders` re-apply the persisted
-  forward set after the lifecycle command lands, so a fresh
-  workspace shell comes up with its forwards already wired.
+Forwards persist per-workspace in `session.json` as
+`ForwardedPort { container_port, host_port, label }` entries.
+`teardown` stops the sidecar before `compose down` (Docker refuses
+to remove a network with active endpoints); `stop` leaves it
+running (a connection-refused proxy correctly shows "forward up,
+server down"); setup/rebuild re-apply the persisted set.
 
 ### Conflict handling
 
-`ports_set` runs a pre-flight `TcpListener::bind("127.0.0.1:N")`
-per requested host port. Conflicts are returned on
-[`PortsApplyResult.conflicts`](../crates/moon-protocol/src/ports.rs)
-and _omitted_ from the sidecar — non-conflicting entries still
-come up. The user's full requested set is persisted regardless,
-so retrying after they stop whatever else was on `:N` brings
-the missing forward in without re-typing.
+`ports_set` pre-flights a bind per requested host port; conflicts
+are reported and omitted from the sidecar while non-conflicting
+entries still come up. The full requested set persists regardless,
+so a later retry brings the missing forward in without re-typing.
 
 ### Loopback only
 
-Forwards bind `127.0.0.1` exclusively. A `0.0.0.0` toggle
-(reach the workspace's dev server from another device on the
-LAN) is deferred until somebody concretely asks for it — see
-AGENTS.md's "hardcode first, configure later".
+Forwards bind `127.0.0.1` exclusively. A `0.0.0.0` toggle is
+deferred until someone asks ("hardcode first, configure later").
 
 ### Server inside the container must listen on `0.0.0.0`
 
-The proxy sidecar is a **separate** container on the workspace
-default network. Its socat connects to the dev container by its
-compose service name (`dev:<port>`), which the daemon's embedded
-DNS resolves to dev's bridge IP — _not_ its loopback. A server
-bound to `127.0.0.1:<port>` inside the dev container is only
-listening on dev's loopback interface, so the sidecar can't
-reach it.
-
-Practical consequence: dev servers need their "all interfaces"
-flag.
-
-- `vite --host` (or `host: true` in `vite.config.ts`)
-- `bun --host=0.0.0.0` / `bun dev` with `Bun.serve({ hostname: "0.0.0.0", ... })`
-- `next dev -H 0.0.0.0`
-- `python -m http.server --bind 0.0.0.0`
-
-Database / cache images (`mongo`, `postgres`, `redis`) ship with
-their listeners on `0.0.0.0` already; that's why the side-
-container path through `mongodb://mongo:27017` worked without
-the `--host` ceremony.
-
-A second sidecar in `--network container:dev` mode could bridge
-dev's loopback onto its bridge IP, but that's two containers per
-workspace versus a one-line `--host` flag. Hardcode the
-loopback-only contract; configure later.
+The sidecar reaches `dev` by its bridge IP, not its loopback — a
+server bound to `127.0.0.1` inside the container is unreachable.
+Dev servers need their all-interfaces flag (`vite --host`,
+`next dev -H 0.0.0.0`, …); database images already listen on
+`0.0.0.0`.
 
 ### What's not in scope
 
-- **Auto-detection.** No `ss -ltn` poll inside the dev
-  container — the user types the forward. Adding it later is
-  straightforward and mostly an opt-in default-off feature.
-- **devcontainer.json `forwardPorts` interop.** Phase 2.3.
-- **Surfacing the project compose's `ports:`.** A read-only
-  viewer for forwards published by per-folder
-  `docker-compose.yml` files can land alongside the proxy
-  picker; for now those forwards still work, they're just not
-  in the same panel.
-- **Presigned-URL rewriting** for s3/minio dev stacks. Out of
-  scope; the user works around it with hostnames in their app
-  config.
+Auto-detection of listening ports, devcontainer.json `forwardPorts`
+interop (Phase 2.3), surfacing per-folder compose `ports:` in the
+same panel, presigned-URL rewriting for s3/minio stacks.
 
 ### UI surface
 
-The forward map lives in the bottom panel's "Ports" tab and a
-status-bar entry next to the container pip:
-
-```
-● 3000 → http://localhost:3000   (vite)
-● 8080 → http://localhost:8080   (api)
-✕ 5432 → host port busy          [retry]
-```
-
-Status dots: green = live, amber = proxy down (workspace shell
-not running), red = host port busy. Clicking the host port
-opens `http://localhost:<host_port>` in the host's default
-browser.
+A "Ports" tab in the bottom panel plus a status-bar entry: one row
+per forward with a status dot (green live, amber proxy down, red
+host port busy) and a clickable `http://localhost:<port>` link.
 
 ## SSH agent forwarding
 
-`git fetch`, `git push`, `gh auth status`, and any other tool the
-user runs in a container terminal needs to reach the host's
-keys without copying private material across the host/container
-boundary. moon-ide solves this with **SSH agent forwarding**: the
-host's running agent socket is bind-mounted into the dev
-container at a fixed path and `SSH_AUTH_SOCK` is set to point at
-it. Private keys never enter the container — only the agent's
-"sign this challenge" RPC.
+In-container `git fetch` / `git push` / `gh` need the host's keys
+without copying private material across the boundary. The host's
+agent socket bind-mounts into `dev` at
+`/run/host-services/ssh-auth.sock` with `SSH_AUTH_SOCK` pointing at
+it — only the agent's "sign this challenge" RPC crosses; keys never
+enter the container.
 
-The generated `compose.yaml` carries the forward as a volume +
-environment pair on the `dev` service:
+Host-side resolution: on macOS, Docker Desktop's magic
+`/run/host-services/ssh-auth.sock` path (emitted unconditionally);
+on Linux, `$SSH_AUTH_SOCK` from the IDE's environment, skipped with
+a warning when unset. The in-container path reuses Docker Desktop's
+convention on both platforms.
 
-```yaml
-services:
-  dev:
-    volumes:
-      - <host-socket>:/run/host-services/ssh-auth.sock
-    environment:
-      SSH_AUTH_SOCK: /run/host-services/ssh-auth.sock
-```
+`moon-base` ships `openssh-client` and pre-seeds
+`/etc/ssh/ssh_known_hosts` with `github.com` / `gitlab.com` so the
+first non-interactive `git fetch` doesn't die on the host-key
+prompt. The forward is re-evaluated on every `compose.yaml` write;
+starting an agent after the IDE is open requires a Rebuild.
 
-Host-side resolution differs per platform:
-
-- **macOS (Docker Desktop)** uses the magic socket at
-  `/run/host-services/ssh-auth.sock`. Docker Desktop
-  special-cases that path and forwards reads to whatever agent
-  is running on the host (Keychain via `ssh-agent`,
-  `1password-cli`, etc.) — moon-ide just emits the mount
-  unconditionally.
-- **Linux** reads `$SSH_AUTH_SOCK` from the IDE's environment.
-  If it's set and the socket exists we bind it directly. If
-  not (no agent running, headless launch from a unit file), we
-  skip the volume + env block; the dev container still comes
-  up, just without agent access. A `tracing::warn!` flags the
-  silent skip so the user can correlate with "git fetch
-  doesn't work" later.
-
-The in-container path is `/run/host-services/ssh-auth.sock` on
-both platforms — we re-use Docker Desktop's convention so any
-tooling that already understands it works without per-OS
-branching inside the container.
-
-`moon-base` ships `openssh-client` (so `ssh` itself is on
-`PATH`) and a system-wide `/etc/ssh/ssh_known_hosts` pre-seeded
-with `github.com` and `gitlab.com` via `ssh-keyscan` at image
-build time. That keeps the first `git fetch` from prompting
-`Are you sure you want to continue connecting?` — important
-because non-interactive `docker exec` invocations would fail
-that prompt outright.
-
-The forward is re-evaluated on every `compose.yaml` write
-(setup, folder add/remove, `Rebuild`). Starting an agent after
-the IDE is open requires a `Rebuild` to pick up the mount —
-Phase 2 has no volume hot-swap, and the case is rare enough that
-the manual step is fine.
-
-What this **doesn't** do (deferred until somebody asks):
-
-- Forward GPG agents for signed commits. Same story — easy to
-  layer on per-team if it shows up.
-- Toggle the forward off via UI. Hardcoded on by default; an
-  `x-moon` key (or top-level setting) can come back when a
-  second concrete need appears.
+Deferred: GPG agent forwarding; a UI toggle for the forward.
 
 ## SSH config forwarding
 
-Agent forwarding alone isn't enough when the user's git remotes
-or interactive `ssh` invocations rely on **`Host` aliases**
-defined in `~/.ssh/config` (e.g. `ssh europe`, where `europe`
-expands to a specific `HostName` / `User` / `ProxyJump` combo).
-On the host that command resolves; inside the dev container,
-with no config to consult, OpenSSH falls back to treating
-`europe` as a literal DNS name and hangs.
+`Host` aliases in `~/.ssh/config` (`ssh europe`) don't resolve in a
+container with no config. moon-ide bind-mounts the host's
+`~/.ssh/config` — **only the config file**, never the keys — into
+the dev user's `~/.ssh/config`, read-only. Skipped when the file
+doesn't exist (Docker would auto-create an empty directory and
+shadow a later host config).
 
-moon-ide closes that gap by bind-mounting the host's
-`~/.ssh/config` into the container, read-only, at the dev
-user's `~/.ssh/config`:
-
-```yaml
-services:
-  dev:
-    volumes:
-      - /home/me/.ssh/config:/home/dev/.ssh/config:ro
-```
-
-**Only the config file**, not the rest of `~/.ssh/`. Private
-keys deliberately stay on the host — the agent forward
-(`SSH_AUTH_SOCK`, above) is the intended auth path, so an
-exfiltratable copy of the keys inside the container would
-defeat its whole purpose.
-
-Resolution: `$HOME/.ssh/config` on the IDE process's
-environment. Skipped (with a `tracing::debug!`) when the file
-doesn't exist — otherwise Docker would auto-create the source
-as an empty directory and shadow any later host config until
-the container is recreated. Re-evaluated on every
-`compose.yaml` write, same cadence as the agent forward.
-
-What follows from "config but no keys, no `~/.ssh/` dir":
-
-- **`IdentityFile`** lines referencing host-side key paths
-  (`~/.ssh/id_*`, `~/.ssh/keys/foo`) won't resolve inside the
-  container. OpenSSH silently skips missing identity files
-  and falls back to the agent, which is what we want anyway.
-- **`ProxyCommand`** lines that exec host-only binaries
-  (`cloudflared access ssh`, `aws ssm start-session`, …)
-  won't work inside the container — the binary isn't there.
-  Cross-boundary tooling limitation, not specific to this
-  mount.
-- **`Include`** directives pointing at non-mounted paths are
-  silently ignored by OpenSSH; the main config still applies.
-- **`ControlMaster` / `ControlPath`** writes go to the bind-
-  mounted `.ssh` parent dir, which Docker creates as root-
-  owned 0755. The user can't write a control socket there.
-  Connection multiplexing inside the container is therefore
-  off; not a regression for non-multiplexed flows.
-
-What this **doesn't** do (deferred until somebody asks):
-
-- Forward `~/.ssh/known_hosts`. The base image already
-  pre-seeds keys for `github.com` and `gitlab.com`; custom
-  hosts prompt on first connect in an interactive
-  `docker exec` and fail under non-interactive mode (workaround:
-  `-o StrictHostKeyChecking=accept-new`). Easy follow-up if it
-  bites someone.
+Consequences of "config but no keys": `IdentityFile` lines are
+silently skipped by OpenSSH (falls back to the agent — what we
+want); `ProxyCommand` lines exec'ing host-only binaries won't work;
+`Include` of non-mounted paths is ignored; `ControlMaster`
+multiplexing is off (the mount parent isn't user-writable).
+Deferred: forwarding `known_hosts` beyond the pre-seeded defaults.
 
 ## Git author identity from the host
 
-A fresh dev container has no git identity, so the first
-`git commit` (including any agent's) hits `*** Please tell me
-who you are`. Worse, an LLM agent tends to paper over this with
-`git config user.email …` and an invented placeholder (we've
-seen `Developer / dev@huggingface.co`), so commits go out with
-the wrong author until someone notices.
+A fresh container has no git identity, and an agent papers over the
+`Please tell me who you are` error with an invented one. moon-ide
+carries the host's `git config --global user.{name,email}` into the
+container as the four `GIT_AUTHOR_* / GIT_COMMITTER_*` env vars on
+the `dev` service.
 
-moon-ide closes that gap by **carrying the host's
-`git config --global user.{name,email}` into the container as
-environment variables** on the `dev` service:
-
-```yaml
-services:
-  dev:
-    environment:
-      GIT_AUTHOR_NAME: 'Eli Smith'
-      GIT_AUTHOR_EMAIL: 'eli@example.com'
-      GIT_COMMITTER_NAME: 'Eli Smith'
-      GIT_COMMITTER_EMAIL: 'eli@example.com'
-```
-
-`compose.yaml` shares **one** `environment:` block across the
-SSH agent forward (above) and the git identity — they sit on
-the same dev service.
-
-Why env vars and not a mounted `~/.gitconfig`:
-
-1. **Surgical surface.** Only the bits we actually want
-   (the identity). A mounted host gitconfig also drags in
-   credential helpers, signing settings, and per-tool aliases —
-   most of which point at host-only binaries that don't exist
-   in the container and surface as confusing
-   `git config --get` errors.
-2. **Layered safely.** Env vars take precedence over
-   `~/.gitconfig` inside the container, but per-repo
-   `.git/config` overrides still win — so a project that
-   intentionally pins a different identity (a bot account for
-   automated commits, etc.) keeps working.
-3. **Easy to reason about.** A glance at the generated
-   `compose.yaml` shows exactly which identity the container
-   will commit as; no "what's actually in
-   `/home/dev/.gitconfig` right now?" detective work.
-
-Resolution: `git config --global --get user.name` and
-`user.email`, run on the host at `compose.yaml` render time
-(once per workspace setup, again on `Rebuild`). Both have to
-return non-empty values; if **either** is missing we skip all
-four env vars and let the container's git refuse to commit on
-its own — that's the right "fail loudly rather than commit as
-the wrong person" fallback.
-
-Updates to the host's gitconfig propagate via the same
-`Rebuild container` affordance the SSH agent forward uses; we
-don't try to hot-swap container env vars at runtime.
-
-What this **doesn't** do (deferred):
-
-- Forward arbitrary gitconfig (signing keys, `pull.rebase`,
-  `core.editor`, …). The team uses defaults; nobody's asked
-  for more.
+Env vars rather than mounting `~/.gitconfig`: surgical (no
+credential helpers / signing settings pointing at host-only
+binaries), layered safely (per-repo `.git/config` still wins), and
+auditable at a glance in the generated compose. Resolved at
+compose-render time; if either value is missing, all four are
+skipped and git fails loudly rather than committing as the wrong
+person. Host gitconfig updates propagate via Rebuild.
 
 ## `gh` config forwarding
 
-The host's `gh` config directory bind-mounts into the dev
-container **read-only** at `/home/dev/.config/gh`, so an
-in-container `gh` shares the host's per-host preferences
-(default editor, default protocol, etc.). Sourced from
-`$GH_CONFIG_DIR` → `$XDG_CONFIG_HOME/gh` → `~/.config/gh`,
-and skipped entirely if none of those resolves to an existing
-directory (otherwise Docker would auto-create the source as
-empty and shadow any later host login until the container is
-recreated).
+The host's `gh` config dir bind-mounts read-only at
+`/home/dev/.config/gh` (resolved `$GH_CONFIG_DIR` →
+`$XDG_CONFIG_HOME/gh` → `~/.config/gh`; skipped if absent).
+Read-only on purpose: the host owns the auth — a container-side
+`gh auth login` silently mutating host state would be surprising.
 
-```yaml
-services:
-  dev:
-    volumes:
-      - /home/me/.config/gh:/home/dev/.config/gh:ro
-    environment:
-      GH_TOKEN: 'gho_…'
-```
+A `GH_TOKEN` env var rides alongside the mount because modern
+`gh auth login` stores credentials in the system keyring, which the
+container doesn't have — `hosts.yml` alone leaves in-container `gh`
+unauthenticated (and `gh api` returns confusing 404s on private
+repos). moon-ide runs `gh auth token` on the host at compose-render
+time and emits the result; `gh` reads `GH_TOKEN` ahead of stored
+credentials. The token lands in plaintext in the generated
+`compose.yaml` under the user's own data dir — just-works auth over
+per-workspace re-login; `gh auth logout` skips it. A non-zero
+`gh auth token` simply omits the line.
 
-Read-only on purpose: the host owns the auth, the container
-reads it. A container-side `gh auth login` would silently
-update the host's config (the bind mount is shared) which is
-surprising and hard to undo; tools that lazily write the
-config (`gh config set`) fail loudly inside the container
-instead of mutating host state.
-
-### Why a `GH_TOKEN` env var alongside the mount
-
-Mounting `~/.config/gh` alone isn't enough to authenticate
-the in-container `gh` when the host stores its credentials in
-the system keyring (macOS Keychain, GNOME Keyring, Wincred —
-the modern `gh auth login` default). In that mode `hosts.yml`
-carries no `oauth_token:` field, and the container has no
-keyring to fall back on, so `gh auth status` inside reports
-`The token in default is invalid.` Worse, `gh api …` against
-private endpoints quietly returns `HTTP 404` because the
-unauthenticated request can't see private repos.
-
-To close that gap moon-ide runs `gh auth token` on the host
-at compose-render time and emits the result as `GH_TOKEN` on
-the `dev` service's `environment:` block. `gh` always reads
-`GH_TOKEN` ahead of any stored credentials, so it works the
-same whichever way the host happens to be configured. The
-token resolves fresh on each render — so `Rebuild container`
-after a host-side `gh auth refresh` picks up the new
-credentials.
-
-The token lands in plaintext in the generated `compose.yaml`
-under `<dirs::data_local_dir>/moon-ide/workspaces/<id>/` — the
-user's own data dir, not in any repo. The trade-off favours
-just-works auth over per-workspace re-login; anyone worried
-about the on-disk footprint can `gh auth logout` to skip the
-token (the bind mount still carries preferences).
-
-If `gh auth token` exits non-zero (the user has never
-logged in, or the `gh` binary isn't on `$PATH`), the
-`GH_TOKEN` line is omitted and `gh` inside the container
-falls back to whatever the bind-mounted config carries —
-which is the right "match the host" behaviour.
-
-The IDE itself runs `gh pr list` / `gh pr checkout` against
-the **host's** `gh` for the branch-switcher palette (the
-LocalHost path doesn't go through the container) — the bind
-mount + env var exist so that a container terminal feels the
-same.
+The IDE's own `gh pr list` / `checkout` (branch-switcher palette)
+runs against the host's `gh`; the forward exists so a container
+terminal feels the same.
 
 ## Editor forwarding
 
-`git commit` without `-m`, `git commit --amend`, `git rebase -i`,
-`gh pr edit`, `crontab -e`, and any other tool that respects the
-POSIX `$GIT_EDITOR` / `$EDITOR` / `$VISUAL` convention spawns an
-editor and blocks until the editor process exits. Inside a
-workspace shell container that fails today: `moon-base` doesn't
-ship `vim` / `nano`, and there's no in-container companion
-process the IDE could route through (intentional — see
-[ADR 0008](decisions/0008-host-shared-daemon.md)).
+`git commit` without `-m`, `git rebase -i`, `crontab -e`, etc.
+spawn `$EDITOR` and block until it exits — which fails in a
+container with no editor and no in-container companion. moon-ide
+forwards those invocations to the host IDE, which opens the file as
+a normal tab, waits for the user to finish, and replies; the
+blocking caller sees a single editor process exit 0 (saved) or
+non-zero (cancelled), the same contract git has with vim.
 
-moon-ide closes the gap by forwarding those invocations to the
-host IDE process, which opens the file as a normal editor tab,
-waits for the user to save + finish, and replies to the
-in-container caller. The blocking caller (`git`) sees a single
-editor process exit zero on success / non-zero on cancel — same
-contract `git` has with `vim`.
+Mechanism:
 
-Mechanism, end to end:
+- The per-workspace `instance.sock`
+  ([ADR 0014](decisions/0014-process-per-workspace.md),
+  [ADR 0026](decisions/0026-socket-dir-mount.md)) gains a blocking
+  `E\n<host-path>\n` message answered with `OK\n` / `CANCEL\n`;
+  framing helpers live in `moon_protocol::focus_socket` so the two
+  halves can't drift.
+- `moon-base` ships a `moon-edit` shim that git invokes like any
+  editor: it reads `$MOON_EDIT_SOCK`, translates its argv path to a
+  host path via `$MOON_EDIT_PATH_MAP`, and round-trips the blocking
+  edit.
+- The socket's parent dir bind-mounts read-write at `/run/moon`
+  (directory, not file — the socket inode is recreated on every IDE
+  restart and a file mount would go stale; see ADR 0026).
+- **Env injection is per-`docker exec`, not workspace-wide**: only
+  IDE-opened container terminals carry
+  `GIT_EDITOR=moon-edit` & co. — anything else (LSP execs, agent
+  bash, outside shells) sees them unset and gets git's standard "no
+  editor configured" behaviour. Workspace-wide injection could
+  block a background command on a tab nobody opens.
 
-- The per-workspace `instance.sock` already exists at
-  `<workspaces_dir>/<slug>/run/instance.sock` (single-instance
-  lock + focus IPC, see [ADR 0014](decisions/0014-process-per-workspace.md);
-  the dedicated `run/` subdir is per [ADR 0026](decisions/0026-socket-dir-mount.md)).
-  Its on-the-wire protocol is extended additively with one new
-  message kind, `E\n<host-path>\n`, that **blocks** waiting for
-  either `OK\n` (user finished) or `CANCEL\n` (user closed the
-  tab without finishing). The framing helpers live in
-  [`moon_protocol::focus_socket`](../crates/moon-protocol/src/focus_socket.rs)
-  so the host and in-container halves can't drift.
+In-IDE UX: the forwarded file opens through the external-file path
+(no LSP / git / blame for `COMMIT_EDITMSG`), the tab shows a
+"git is waiting · Finish" affordance, `Ctrl+S` saves and finishes,
+closing without saving cancels.
 
-- `moon-base` ships a `moon-edit` binary at `/usr/local/bin/moon-edit`.
-  It's the only piece of this design that runs inside the
-  container, has no listener, and is invoked by `git` like any
-  other editor. The shim reads `$MOON_EDIT_SOCK` for the UDS
-  path, translates its argv path to an absolute host path via
-  `$MOON_EDIT_PATH_MAP` (`<container>=<host>[:<container>=<host>…]`,
-  same shape as `$PATH`), and round-trips the blocking edit.
+Failure modes: IDE quits mid-edit → shim reads EOF, exits non-zero,
+git aborts (expected — the user quit). Terminal launched outside
+the IDE → env unset, standard git error. An agent running
+`git commit --amend` in its bash tool hits the same unset-env case
+and should pass `-m` explicitly.
 
-- The workspace's generated `compose.yaml` bind-mounts the
-  socket's parent directory `<workspaces_dir>/<slug>/run` to
-  `/run/moon` on the `dev` service; the socket then resolves to
-  `/run/moon/instance.sock` inside the container. The mount is
-  **read-write** — Unix-socket `connect()` needs write permission
-  on the inode, and a read-only directory mount makes the socket
-  unreachable. We mount the **directory**, not the socket file
-  ([ADR 0026](decisions/0026-socket-dir-mount.md)): the socket's
-  inode is recreated on every IDE restart, and a file bind-mount
-  would either go stale (pinned to the old inode) or — if the
-  source is missing at `up` time — make Docker auto-create a
-  root-owned path that bricks the workspace. The `run/` directory
-  holds only the socket, so the exposed surface is the same as a
-  file mount plus the ability to delete/replace a throwaway
-  socket. Same read-write posture as
-  [SSH agent forwarding](#ssh-agent-forwarding); narrower than
-  [`gh` config forwarding](#gh-config-forwarding).
-
-- **Env injection is per-`docker exec`, not in `compose.yaml`.**
-  Container terminals the IDE opens carry
-  `GIT_EDITOR=moon-edit`, `EDITOR=moon-edit`, `VISUAL=moon-edit`,
-  `MOON_EDIT_SOCK=/run/moon/instance.sock`, and
-  `MOON_EDIT_PATH_MAP=…` on their `docker exec -e` flags. Anything
-  else running in the container — an LSP launched via
-  `docker exec`, a coder agent's bash tool, a manual
-  `docker exec` from a host shell outside the IDE — sees the
-  variables unset and falls back to git's standard "no editor
-  configured" behaviour.
-
-  Setting `$GIT_EDITOR` workspace-wide would let some background
-  `git commit --amend` block on a tab nobody opens. Scoping the
-  forward to interactive terminals means a forwarded edit always
-  has a user waiting at a tab.
-
-In-IDE UX:
-
-- The forwarded file opens through the same `Workspace.openHostFile`
-  path `Ctrl+O` uses for files outside every bound folder
-  (`OpenFile.isExternal = true`). That skips LSP / editorconfig /
-  git / blame for the commit-message buffer — none of which would
-  make sense for `COMMIT_EDITMSG`.
-- A new per-buffer flag `OpenFile.pendingEdit: EditId | null`
-  flags the tab as a forwarded-edit. The tab strip grows a
-  small "git is waiting · Finish" affordance; `Ctrl+S` saves and
-  finishes in one move, closing the tab without saving cancels.
-- Finishing = the IDE writes the buffer's bytes to the host
-  path, then sends `OK\n` on the parked socket connection. The
-  shim exits 0, `git` proceeds with the edited message.
-  Cancelling sends `CANCEL\n`; the shim exits 1; `git` falls
-  back to its existing "empty message" behaviour (which is
-  abort for `commit`, no-op for `rebase -i` if no instructions
-  changed).
-
-Failure modes:
-
-- **IDE quits mid-edit.** Socket connection drops; the shim
-  reads EOF; exits non-zero; `git` aborts. The user is the one
-  who quit, so this is the expected outcome.
-- **Container terminal launched outside the IDE.**
-  `$MOON_EDIT_SOCK` isn't set; `git` errors with the standard
-  "no editor configured" message. Acceptable — the user opened
-  a terminal moon-ide doesn't manage, so there's no tab to
-  forward to.
-- **A coder agent runs `git commit --amend` in its bash tool.**
-  Today: same as the previous case — the agent's terminal
-  doesn't carry the env vars. The agent should pass
-  `git commit -m "…"` explicitly; if a future agent needs the
-  forward, opting in is setting the env vars itself before the
-  spawn (the protocol and shim are ready).
-
-What this **doesn't** do (deferred):
-
-- Open a path passed via `$EDITOR` from a context that
-  shouldn't block (a CLI handoff, a `code .`-style "open this
-  here" command). The `O\n<path>\n` non-blocking variant of the
-  protocol slots in additively when somebody asks.
-- Forward `git mergetool` / `diff.tool` — those need a richer
-  protocol (open a 3-way diff, return only when the user marks
-  resolved) that's better addressed by the existing merge
-  conflict resolution flow ([test plan 0088](test-plans/0088-merge-conflict-resolution.md)).
+Deferred: a non-blocking `O\n<path>\n` "open this" variant;
+`git mergetool` forwarding (better served by the merge-conflict
+flow, test plan 0088).
 
 ## `WorkspaceHost::ContainerHost`
 
@@ -1329,129 +585,80 @@ trait WorkspaceHost: Send + Sync {
 
 `ContainerHost` is a thin wrapper:
 
-- **Filesystem ops**: identical to `LocalHost`. The bind mount
-  means host paths and container paths see the same bytes; we
-  read/write on the host side directly. No JSON-RPC, no
-  agent process, no in-container fs daemon. The path
-  translator only kicks in when we're shipping a path
-  _through_ the container (e.g., to an in-container LSP).
-- **`spawn`**: shells out to `docker exec <container> <cmd>`.
-  stdio is forwarded through `docker exec`'s pipes. Working
-  directory is translated via `PathMapping::to_container`.
-- **`open_pty`**: `docker exec -it <container> <shell>` with a
-  PTY allocated on the host side, attached via tokio's
-  `portable-pty`. The container sees a real TTY.
-- **`watch`**: same `notify`-backed watcher as `LocalHost` —
-  the host can watch a bind-mounted directory; the container's
-  writes are reflected instantly.
+- **Filesystem ops**: identical to `LocalHost` — the bind mount
+  means both sides see the same bytes, so reads/writes happen
+  host-side. Path translation only kicks in when shipping a path
+  _through_ the container (e.g. to an in-container LSP).
+- **`spawn`**: `docker exec <container> <cmd>`, cwd translated.
+- **`open_pty`**: `docker exec -it` with a host-side PTY.
+- **`watch`**: the same `notify` watcher — container writes to the
+  bind mount are visible to the host instantly.
 
-This deliberately avoids the in-container agent injection model
-the old `specs/devcontainers.md` sketched (now `moon-remote`,
-see [ADR 0011](decisions/0011-rename-moon-agent-to-moon-remote.md)).
-That model is right for **remote** hosts with no shared
-filesystem (SSH, Codespaces) and is kept as the future
+This deliberately avoids the in-container agent-injection model the
+old devcontainers sketch used. That model is right for **remote**
+hosts with no shared filesystem and is kept as the future
 `RemoteHost` variant; for local containers, bind-mount + exec is
-simpler, faster, and ships no static-musl binary into the user's
-container.
-
-For terminals (Phase 3): a host-side `portable-pty` PTY bridges
-to one `docker exec -it <container> <shell>` per pane; closing
-the pane terminates the exec and reaps the shell. No shared
-listener, no socket multiplexing, no terminal server. LSP
-launches (Phase 4) and lint/format sidecars (Phase 8) follow the
-same pattern — `docker exec`s parented to host-side handles.
+simpler and ships nothing into the user's container. LSP launches
+and lint/format sidecars follow the same pattern — `docker exec`s
+parented to host-side handles.
 
 ## Frontend ↔ backend boundary
-
-New tauri commands (Phase 2.0):
 
 | Command                                | Purpose                                                                                              |
 | -------------------------------------- | ---------------------------------------------------------------------------------------------------- |
 | `container_status`                     | `{ state: "absent" \| "creating" \| "running" \| "paused" \| "stopped" \| "error", error?: string }` |
-| `container_setup`                      | First-time bootstrap: write default `compose.yaml`, pull image, create + start. Idempotent.          |
-| `container_pause` / `container_resume` | Lifecycle hooks.                                                                                     |
+| `container_setup`                      | First-time bootstrap: write default `compose.yaml`, pull, create + start. Idempotent.                |
+| `container_pause` / `container_resume` | Lifecycle hooks (backend-only; UI doesn't expose Pause).                                             |
 | `container_rebuild`                    | `down` + recreate. Drops in-container state.                                                         |
 
-Push events:
-
-- `container:state` — emitted on every state transition for the
-  status-bar pip.
-- `container:logs` — streamed during `creating` / `rebuilding`
-  so the user sees image pulls + build output.
-- `container:error` — terminal failure; payload carries the
-  failing step.
+Push events: `container:state` (status-bar pip), `container:logs`
+(streamed during create/rebuild), `container:error`.
 
 ## Failure modes
 
-| Scenario                                        | UI behaviour                                                                                                                                                                                                         |
-| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Docker daemon not running                       | Banner: "Docker is not running. [Open Docker Desktop / install instructions]". Workspace opens host-side; container actions disabled.                                                                                |
-| Image pull fails (network, auth)                | Logs panel + retry button. Workspace opens host-side until resolved.                                                                                                                                                 |
-| Build fails (Dockerfile error)                  | Logs panel + "Edit Dockerfile" button. Container stays in `error` state.                                                                                                                                             |
-| Container exits unexpectedly mid-session        | Status pip flips to `stopped`, terminals show "Container stopped" + reconnect button.                                                                                                                                |
-| Bind-mount permission mismatch (uid/gid)        | Detected on first `read_file` failure; surface a one-time "Set container user to match host? [Yes / leave]" prompt that adds `user: "${UID}:${GID}"` to compose.                                                     |
-| Docker version too old (no `compose v2`)        | Refuse to start; show required version in the banner.                                                                                                                                                                |
-| Disk pressure (image pull no space)             | Surface Docker's error verbatim; we don't try to GC behind the user's back.                                                                                                                                          |
-| Slow bind-mount I/O on Docker Desktop for macOS | Generated `compose.yaml` declares the workspace mount with `:cached` consistency. Recommend VirtIO file sharing in Docker Desktop's settings; surface a one-line tip in the status-bar pip on first slow `read_dir`. |
+| Scenario                                        | UI behaviour                                                                                       |
+| ----------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| Docker daemon not running                       | Banner with install/open instructions. Workspace opens host-side; container actions disabled.      |
+| Image pull fails (network, auth)                | Logs panel + retry. Workspace opens host-side until resolved.                                      |
+| Build fails (Dockerfile error)                  | Logs panel + "Edit Dockerfile". Container stays `error`.                                           |
+| Container exits unexpectedly mid-session        | Pip flips to `stopped`; terminals show "Container stopped" + reconnect.                            |
+| Bind-mount permission mismatch (uid/gid)        | One-time prompt to add `user: "${UID}:${GID}"` to compose.                                         |
+| Docker version too old (no compose v2)          | Refuse to start; show required version.                                                            |
+| Disk pressure                                   | Surface Docker's error verbatim; no GC behind the user's back.                                     |
+| Slow bind-mount I/O on Docker Desktop for macOS | Mounts declared `:cached`; one-line tip recommending VirtIO file sharing on first slow `read_dir`. |
 
 ## Out of scope (for Phase 2 — and when to revisit)
 
-- **Multi-service compose UI.** Multi-service compose itself
-  is in scope from day one (the `include:` model brings
-  project services up alongside `dev`); what's _out_ of scope
-  for Phase 2.0 is a rich IDE-side picker for "which service
-  do new terminals attach to?", a per-service status panel,
-  and one-click "restart just `redis`" controls. Phase 2.0
-  attaches everything to the `dev` service and surfaces the
-  rest of the project's services only as a status pip + their
-  declared port forwards. Richer per-service UI lands in
-  Phase 2.4 once we have lived with the simpler version.
-- **Devcontainer.json interop.** Read a repo's existing
-  `.devcontainer/devcontainer.json` and translate it into a
-  compose service at workspace open. Deferred to Phase 2.3 so
-  we can debate the translation rules with concrete examples
-  (see the open question in [Phase 2 roadmap](roadmaps/phase-02-containers.md)).
-- **Per-project containers.** When two projects in the same
-  workspace can't share a toolchain. Add when divergence
-  appears; the architecture doesn't preclude it.
-- **Auto-rebuild on Dockerfile change.** v1 prompts on next
-  open. Auto-detect via fs-watch is a small follow-up.
-- **Podman / non-Docker engines.** Should mostly work via
-  `DOCKER_HOST`, but unverified. Address when somebody asks.
-- **Remote (non-local) Docker hosts.** Different problem
-  shape (no bind mount); revives the `moon-remote` injection
-  model for that variant.
-- **Windows host.** Nobody on the team uses Windows; Docker
-  Desktop should mostly work but is unverified. Surface
-  if/when somebody on the team or in a downstream user picks
-  it up.
+- **Rich multi-service UI** (per-service panels, "which service do
+  terminals attach to" pickers) — lands once we've lived with the
+  simple version.
+- **Devcontainer.json interop** — Phase 2.3, debated with concrete
+  examples.
+- **Per-project containers** — when two projects genuinely can't
+  share a toolchain. The architecture doesn't preclude it.
+- **Auto-rebuild on Dockerfile change** — v1 prompts on next open.
+- **Podman / non-Docker engines** — probably works via
+  `DOCKER_HOST`; unverified.
+- **Remote Docker hosts** — different shape (no bind mount);
+  revives the `moon-remote` injection model.
+- **Windows host** — nobody on the team uses it.
 
 ## Forward compatibility
 
 ### Multi-window
 
-Phase 2 ships one window = one workspace = one container.
-Two future shapes are explicitly preserved:
-
-- **Multiple windows of the same workspace.** Container is
-  keyed by workspace, not by window — the name pattern is
-  `moon-ws-<hash-of-workspace-id>`. If a future phase opens
-  the same workspace in a second window, both share the
-  container by construction.
-- **Multiple workspaces, multiple containers.** `AppState`'s
-  `last_session` slot will grow into a list as Phase 7
-  (multi-repo) lands. The persistence layer is structured
-  so this is a UI/lifecycle change, not a data-model rewrite.
+The container is keyed by workspace, not window
+(`moon-ws-<id>`), so a future second window on the same workspace
+shares the container by construction; multiple workspaces are a
+UI/lifecycle change, not a data-model rewrite.
 
 ### Multi-folder workspace (the "command centre" UX)
 
-A workspace is a list of folders the user has bound for the
-session. The compose project belongs to the workspace, not to
-any one folder; folders are the things that change while the
-project survives. The shape below is what ships post-Phase 2.5
-and is locked in by [ADR 0007](decisions/0007-compose-and-moon-base.md#amendment-2026-04-29--state-dir-and-multi-folder-mounts).
+A workspace is a list of folders; the compose project belongs to
+the workspace and survives folder churn
+([ADR 0007 amendment](decisions/0007-compose-and-moon-base.md#amendment-2026-04-29--state-dir-and-multi-folder-mounts)).
 
-#### Workspace state lives outside any repo
+Workspace state lives outside any repo:
 
 ```
 <dirs::data_local_dir>/moon-ide/workspaces/<id>/
@@ -1459,118 +666,60 @@ and is locked in by [ADR 0007](decisions/0007-compose-and-moon-base.md#amendment
 └── bound-folders.json    # the absolute path list compose.yaml was generated from
 ```
 
-`<id>` is the literal string `"default"` until Phase 7.2
-introduces user-named workspaces (slug ids like `huggingface`,
-`gitaly`, …). The layout is forward-compatible with that —
-named workspaces just become other entries under `workspaces/`,
-with workspace metadata (display name, last-active timestamp)
-tracked in `AppState`.
+`<id>` is `"default"` until named workspaces land; the layout
+already accommodates them as sibling entries.
 
-#### One compose project per workspace, not per folder
+`bound-folders.json` is the source of truth: the generator emits
+one bind mount per entry (`<absolute>:/workspace/<basename>`), and
+`working_dir: /workspace` keeps multi-folder from being a special
+case.
 
-Project name is `moon-ws-<id>` (so `moon-ws-default`),
-independent of any folder path. The workspace's compose
-project survives folder switches and folder add / remove;
-what changes when the bound-folder set changes is the
-contents of `compose.yaml`, not its identity.
+Folder lifecycle:
 
-#### Bound-folder set is the source of truth
-
-`bound-folders.json` is the list of absolute paths the user
-has bound into the workspace. The compose generator reads it
-and emits one bind mount per entry on the `dev` service:
-`<absolute>:/workspace/<basename>` — absolute paths, no
-`../` games (the file no longer lives near any repo).
-
-The workspace's `compose.yaml` does **not** include any
-project's own compose files; per-folder project services
-run as separate compose projects (see [Workspace shell vs
-project services](#workspace-shell-vs-project-services))
-and are discovered out-of-band per folder.
-
-`working_dir: /workspace` for the `dev` service so multi-folder
-isn't a special case — terminals just `cd workspace/<name>`
-into whichever folder they were spawned from. The Phase 3
-terminal owns picking the right cwd; the compose layout stays
-the same whether one or many folders are bound.
-
-#### Folder lifecycle within a workspace
-
-- **Add a folder** (sidebar `+`, welcome screen, command
-  palette): the IDE adds it to `bound-folders.json`,
-  regenerates the workspace's `compose.yaml` (with one more
-  bind mount), and — if the workspace shell is currently
-  `running` — runs `docker compose up -d --wait` to apply
-  the diff. The `dev` container is recreated because its
-  mount list changed; the workspace shell project doesn't
-  touch the new folder's services. Pre-opt-in (no
-  `compose.yaml` yet) is a no-op: the file is materialised
-  on first "Set up". The folder bar's container glyph
-  warms up shortly after by polling
-  `project_compose_status` for the new folder.
-- **Remove a folder** (per-bar `×`, with confirm): the
-  inverse on the workspace shell side — `compose.yaml`
-  regenerated, dev recreated on the next `up -d --wait`
-  if the project is running. The removed folder's own
-  per-folder compose project (if any) is **not** torn
-  down on the daemon: the user may have removed the
-  folder for declutter alone, and stopping running
-  services as a side effect would surprise. The project
-  remains visible in `docker compose ls` and the user can
-  re-bind the folder to manage it again.
+- **Add**: append to `bound-folders.json`, regenerate
+  `compose.yaml`, and — only if the shell is currently running —
+  `up -d --wait` to apply (the dev container recreates because its
+  mounts changed). Pre-opt-in is a no-op.
+- **Remove**: the inverse on the shell side. The folder's own
+  compose project is **not** torn down — the user may have removed
+  the folder for declutter; it stays visible in
+  `docker compose ls` and re-binding manages it again.
 - **Switch active folder**: zero-cost on the container side.
-  Neither the workspace shell project nor any per-folder
-  project moves; only the IDE's per-folder UI state (tab
-  strip, file tree, scroll position) swaps.
 
-The "is the project running?" check is the interesting bit:
-it keeps `Add folder` cheap when the user hasn't opted into
-containers yet (status `Absent`) and avoids surprise-recreating
-when the user has them paused on purpose. Explicit `Rebuild`
-covers the "I do want a force-recreate" case.
+The "is the shell running?" check keeps Add cheap pre-opt-in and
+avoids surprise recreates of a deliberately-stopped shell.
 
 #### Caches across `dev` recreation
 
-Recreating the `dev` container on every folder add/remove would
-nuke `~/.cargo`, `~/.bun`, `~/.cache` etc. and make multi-folder
-unusable for anyone whose workflow depends on them. The fix is
-named volumes for those paths, mounted on `dev`, so the bytes
-survive container recreation. Lands alongside Phase 3 (terminal)
-— the 2.0 `sleep infinity` dev container has no cache state
-worth preserving, so the named volumes can wait until they
-actually buy something.
+Recreating `dev` on every folder change would nuke `~/.cargo`,
+`~/.bun`, `~/.cache`. Named volumes for those paths make the bytes
+survive recreation; they land when there's cache state worth
+preserving.
 
 #### Inventory + GC
 
-The `moon-ws-<id>` naming scheme means there's exactly one
-compose project per workspace on the daemon. Stale projects
-from old layouts (the pre-2.5 `moon-ws-<hash-of-folder>` names)
-need a one-time cleanup; explicit `Tear down` + `docker compose
-ls` from a terminal cover the case for now. A "container
-management" surface listing every `moon-ws-*` project with bulk
-"tear down stale" affordances stays useful as multi-workspace
-sprawls — add when the inventory genuinely needs it.
+One compose project per workspace means `docker compose ls` plus
+explicit Tear-down covers cleanup for now. A "container management"
+surface with bulk "tear down stale" lands when multi-workspace
+sprawl genuinely needs it.
 
 ### Remote hosts
 
-`ContainerHost` is the local variant. The `RemoteHost`
-sketched in `architecture.md` (JSON-RPC over a forwarded
-socket to a `moon-remote` runtime on the remote machine) is
-deferred until somebody asks. It reuses the same
-`WorkspaceHost` trait, so adopting it later is additive.
+`ContainerHost` is the local variant. `RemoteHost` (JSON-RPC over a
+forwarded socket to `moon-remote` on the remote machine) is
+deferred until somebody asks; it reuses the same `WorkspaceHost`
+trait, so adopting it later is additive.
 
 ### `x-moon` extension keys in compose
 
-Compose tolerates any top-level `x-`-prefixed key as
-metadata. We use that to carry moon-ide-specific config
-without inventing a parallel format:
+Compose tolerates top-level `x-` keys as metadata; moon-ide uses
+that for its own config without inventing a parallel format:
 
 ```yaml
 x-moon:
-  shell-service: dev # which compose service do new terminals attach to
+  shell-service: dev # which compose service new terminals attach to
   workspace-folder: /workspace
-  container-name: moon-ws-foo # override the default hash-derived name
+  container-name: moon-ws-foo # override the default name
 ```
 
-`x-moon` keys are read but never written. The user owns the
-file.
+`x-moon` keys are read but never written. The user owns the file.
