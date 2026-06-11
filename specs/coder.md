@@ -435,8 +435,9 @@ orphan.
   auth via `x-api-key` + `anthropic-version`, system prompt as a
   top-level field, tool calls as `tool_use` / `tool_result`
   content blocks, images as base64 `image` blocks, native
-  `cache_control: {type: "ephemeral"}` markers, and a different
-  streaming SSE event grammar
+  `cache_control: {type: "ephemeral"}` markers, signed reasoning
+  blocks round-tripped on tool turns (see "Extended / adaptive
+  thinking" below), and a different streaming SSE event grammar
   (`message_start` / `content_block_*` / `message_delta` /
   `message_stop`). The translator merges adjacent
   `tool` / `user` messages into a single user-role Anthropic
@@ -484,6 +485,74 @@ keyless conventionally).
 The 401-refresh behaviour stays HF-only: a user provider that
 returns 401 surfaces the error to the user — there's no refresh
 token, just an API key the user has to fix in the picker.
+
+#### Extended / adaptive thinking (native Anthropic)
+
+Anthropic's newer models reason in `thinking` content blocks, and
+the wire contract around them is mandatory rather than optional —
+getting it wrong manifests as either "no reasoning shows up" or, on
+the always-thinking models, "the agent emits one batch of tool calls
+and then dies." Both were live bugs against `kind=anthropic` before
+this path existed. The native adapter
+([`crates/moon-coder/src/anthropic.rs`](../crates/moon-coder/src/anthropic.rs))
+handles three things:
+
+1. **Requesting thinking.** Calls to the modern adaptive models
+   (Fable 5, Mythos 5, Opus 4.6/4.7/4.8) send a `thinking` object —
+   `type: "adaptive"`, `display: "summarized"` — so reasoning
+   actually streams back. Without it these omitted-by-default models
+   return an empty `thinking` field and we'd surface no reasoning at
+   all. `type: "adaptive"` carries **no** `budget_tokens` (a manual
+   budget 400s on these models); the model picks its own depth, and
+   interleaved thinking between tool calls is automatic (no beta
+   header). Every other model sends **no** `thinking` object — most
+   importantly Haiku in its cheap-summarisation / auto-rename role,
+   where reasoning is pure latency and cost.
+   `thinking_config_for` / `is_adaptive_thinking_model` gate this by
+   the model-id family token. We deliberately don't support the older
+   manual `enabled` thinking shape: nobody routes work through
+   pre-adaptive models (Haiku-as-cheap-model is the one non-adaptive
+   exception, and it wants no thinking anyway).
+
+2. **Round-tripping signed blocks.** Each thinking block carries an
+   opaque, cryptographically signed `signature` (or, for safety-
+   redacted blocks, opaque `data`). The Messages API **requires** the
+   unmodified block to be echoed back, ahead of the `tool_use`
+   blocks, in the assistant turn that a `tool_result` answers — drop
+   it and the next round-trip 400s with `thinking blocks in the
+latest assistant message cannot be modified`. We can't reconstruct
+   the signature, so the whole block is carried opaque from one turn
+   to the next via a new `thinking_blocks: Vec<ThinkingBlock>` field
+   threaded through `AssistantResponse` → `ChatMessage::Assistant` →
+   `SessionRecord::Assistant`. The translator emits them first, in
+   order, before any text or `tool_use` block. Only the native
+   Anthropic path populates this; every other provider leaves it
+   empty (its reasoning rides in the human-readable `thinking` string
+   and never round-trips), so the OpenAI-compat wire body is
+   byte-for-byte unchanged. A thinking block with no signature is
+   dropped (`keep_thinking_block`) — nothing to replay, and emitting
+   one would 400.
+
+3. **Surviving reload.** The signed blocks persist into the session
+   JSONL as moon-specific fields on the pi-mono `thinking` /
+   `redacted_thinking` content blocks (the pi viewer ignores the
+   extra keys), so a session reopened mid-tool-loop on a thinking
+   model replays correctly instead of 400-ing on the first send.
+
+`max_tokens` is required by the API and is model-aware
+(`max_tokens_for`): the adaptive thinking models get a generous
+32 K ceiling that leaves room for reasoning _and_ a full answer;
+every other model (Haiku, anything unrecognised) keeps a
+conservative 8 K. The runner still owns real context bookkeeping via
+`compaction`.
+
+Thinking is incompatible with forced tool use
+(`tool_choice: any/tool`) and with `temperature` / `top_k`; we send
+none of those, so the default `auto` tool choice is fine. Anthropic's
+"graceful degradation" silently disables thinking for a request whose
+history is incompatible (e.g. an older assistant turn with no
+thinking block), so mixed-history sessions are tolerated rather than
+rejected.
 
 #### Prompt caching (Anthropic, native or via OpenRouter)
 

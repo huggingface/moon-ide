@@ -66,6 +66,47 @@ pub struct ImageAttachment {
 	pub mime: String,
 }
 
+/// One reasoning block the model emitted on an assistant turn,
+/// preserved verbatim so it can be replayed back to the provider on
+/// the next round-trip.
+///
+/// **Only the native Anthropic path (`kind=anthropic`) populates
+/// these.** Anthropic's extended / adaptive thinking models
+/// (Fable 5, Mythos 5, Opus 4.7+, …) emit cryptographically signed
+/// `thinking` blocks, and the Messages API *requires* the unmodified
+/// block to be echoed back in the assistant turn that precedes a
+/// `tool_result` — drop it and the next tool round-trip 400s with
+/// `thinking blocks in the latest assistant message cannot be
+/// modified`. We can't reconstruct the signature, so we carry the
+/// whole block opaque from one turn to the next.
+///
+/// Every other provider (HF router, OpenAI-compat custom, OpenRouter)
+/// leaves this empty: their reasoning either isn't signed or isn't
+/// required on replay, so it rides in the human-readable `thinking`
+/// string instead and never round-trips. Because the field is
+/// `skip_serializing_if = "Vec::is_empty"` everywhere it appears,
+/// non-Anthropic wire bodies stay byte-for-byte unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ThinkingBlock {
+	/// A regular thinking block. `thinking` is the (possibly empty,
+	/// when `display: "omitted"`) summary text; `signature` is the
+	/// opaque encrypted full-thinking token the API hands back and
+	/// expects verbatim on replay.
+	Thinking {
+		#[serde(default)]
+		thinking: String,
+		#[serde(default)]
+		signature: String,
+	},
+	/// A safety-redacted thinking block. `data` is opaque encrypted
+	/// content with no readable summary; replay it unchanged.
+	RedactedThinking {
+		#[serde(default)]
+		data: String,
+	},
+}
+
 /// One message in the conversation, in the OpenAI chat-completions
 /// shape. We keep the wire shape verbatim so the router doesn't need
 /// adapter code.
@@ -90,6 +131,16 @@ pub enum ChatMessage {
 	Assistant {
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		content: Option<String>,
+		/// Signed/redacted reasoning blocks from the native Anthropic
+		/// path, replayed verbatim before the `tool_use` blocks on the
+		/// next round-trip. Empty for every other provider, so the
+		/// OpenAI-compat wire body is unaffected (see [`ThinkingBlock`]).
+		#[serde(
+			default,
+			deserialize_with = "null_or_missing_as_default",
+			skip_serializing_if = "Vec::is_empty"
+		)]
+		thinking_blocks: Vec<ThinkingBlock>,
 		#[serde(
 			default,
 			deserialize_with = "null_or_missing_as_default",
@@ -236,7 +287,11 @@ fn build_wire_messages<'a>(messages: &'a [ChatMessage], cached_indexes: &[usize]
 			ChatMessage::User { content, images } => WireMessage::User {
 				content: wire_user_content(content, images, cache_here),
 			},
-			ChatMessage::Assistant { content, tool_calls } => WireMessage::Assistant {
+			ChatMessage::Assistant {
+				content, tool_calls, ..
+			} => WireMessage::Assistant {
+				// `thinking_blocks` is Anthropic-native-only and never
+				// rides on the OpenAI-compat wire, so it's dropped here.
 				// `cache_breakpoint_indexes` never targets an
 				// assistant turn (it skips backwards to the
 				// previous tool / user message), so `cache_here`
@@ -397,16 +452,24 @@ pub struct Choice {
 /// underlying provider exposes one. Different providers use
 /// different field names — DeepSeek and Qwen send
 /// `reasoning_content`, others send `reasoning` — so the
-/// deserializer accepts both as aliases. We don't echo it back to
-/// the model in subsequent chat turns: most providers don't expect
-/// their own reasoning in the history (and Anthropic-style
-/// "thinking blocks" with crypto-signing are out of scope here).
+/// deserializer accepts both as aliases. We don't echo this string
+/// back to the model: most providers don't expect their own
+/// reasoning in the history. The native Anthropic path is the
+/// exception — its signed reasoning rides in `thinking_blocks`
+/// (not this string) and *is* replayed verbatim, because the
+/// Messages API requires it on tool round-trips.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AssistantResponse {
 	#[serde(default)]
 	pub content: Option<String>,
 	#[serde(default, alias = "reasoning_content", alias = "reasoning")]
 	pub thinking: Option<String>,
+	/// Signed/redacted reasoning blocks, populated only by the native
+	/// Anthropic path. Carried alongside the human-readable `thinking`
+	/// string because Anthropic requires them echoed back verbatim on
+	/// the next tool round-trip (see [`ThinkingBlock`]).
+	#[serde(default, deserialize_with = "null_or_missing_as_default", skip_serializing)]
+	pub thinking_blocks: Vec<ThinkingBlock>,
 	#[serde(default, deserialize_with = "null_or_missing_as_default")]
 	pub tool_calls: Vec<ToolCall>,
 	/// Provider-reported usage for the round-trip that produced
@@ -1257,6 +1320,8 @@ fn finalize_response(
 	AssistantResponse {
 		content: if content.is_empty() { None } else { Some(content) },
 		thinking: if thinking.is_empty() { None } else { Some(thinking) },
+		// OpenAI-compat providers don't emit signed reasoning blocks.
+		thinking_blocks: Vec::new(),
 		tool_calls: tool_calls
 			.into_iter()
 			.filter(|b| !b.id.is_empty() || !b.name.is_empty())
@@ -1787,6 +1852,7 @@ mod tests {
 			ChatMessage::user("hi"),
 			ChatMessage::Assistant {
 				content: None,
+				thinking_blocks: Vec::new(),
 				tool_calls: vec![ToolCall {
 					id: "call_1".into(),
 					kind: "function".into(),
@@ -1806,6 +1872,7 @@ mod tests {
 			ChatMessage::user("hi"),
 			ChatMessage::Assistant {
 				content: None,
+				thinking_blocks: Vec::new(),
 				tool_calls: vec![ToolCall {
 					id: "call_1".into(),
 					kind: "function".into(),

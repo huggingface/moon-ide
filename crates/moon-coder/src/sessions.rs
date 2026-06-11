@@ -338,11 +338,13 @@ pub(crate) fn record_to_pi_wire(record: &SessionRecord, header: &SessionHeader) 
 		SessionRecord::Assistant {
 			content,
 			thinking,
+			thinking_blocks,
 			tool_calls,
 			model,
 		} => pi_message_envelope(pi_assistant_message(
 			content.as_deref(),
 			thinking.as_deref(),
+			thinking_blocks,
 			tool_calls,
 			header,
 			model.as_deref(),
@@ -463,18 +465,32 @@ fn strip_data_url_prefix<'a>(data_url: &'a str, mime: &'a str) -> (&'a str, &'a 
 fn pi_assistant_message(
 	content: Option<&str>,
 	thinking: Option<&str>,
+	thinking_blocks: &[crate::inference::ThinkingBlock],
 	tool_calls: &[ToolCall],
 	header: &SessionHeader,
 	record_model: Option<&str>,
 	usage: Option<&SessionRecord>,
 ) -> serde_json::Value {
 	let mut blocks: Vec<serde_json::Value> = Vec::new();
-	if let Some(thinking) = thinking {
-		if !thinking.is_empty() {
-			blocks.push(serde_json::json!({
-				"type": "thinking",
-				"thinking": thinking,
-			}));
+	// Signed Anthropic reasoning blocks (when present) own the
+	// thinking content: each one becomes a pi `thinking` /
+	// `redacted_thinking` content block carrying its opaque
+	// `signature` / `data` alongside the human-readable summary, so
+	// the round-trip survives reload and we can replay it verbatim.
+	// Otherwise fall back to the plain `thinking` summary string the
+	// non-Anthropic providers produce.
+	if thinking_blocks.is_empty() {
+		if let Some(thinking) = thinking {
+			if !thinking.is_empty() {
+				blocks.push(serde_json::json!({
+					"type": "thinking",
+					"thinking": thinking,
+				}));
+			}
+		}
+	} else {
+		for block in thinking_blocks {
+			blocks.push(pi_thinking_block(block));
 		}
 	}
 	if let Some(text) = content {
@@ -534,6 +550,56 @@ fn pi_assistant_message(
 /// failure (rare — a malformed `arguments` would already have
 /// broken the dispatch loop anyway, but we'd rather round-trip
 /// faithfully than panic).
+/// Render one signed/redacted reasoning block as a pi content
+/// block. The summary text rides in the standard `thinking` field
+/// (so the pi viewer renders it); the opaque `signature` / `data`
+/// ride in moon-specific sibling fields the viewer ignores but
+/// [`parse_pi_thinking_block`] reads back on reload.
+fn pi_thinking_block(block: &crate::inference::ThinkingBlock) -> serde_json::Value {
+	use crate::inference::ThinkingBlock;
+	match block {
+		ThinkingBlock::Thinking { thinking, signature } => serde_json::json!({
+			"type": "thinking",
+			"thinking": thinking,
+			"signature": signature,
+		}),
+		ThinkingBlock::RedactedThinking { data } => serde_json::json!({
+			"type": "redacted_thinking",
+			"data": data,
+		}),
+	}
+}
+
+/// Inverse of [`pi_thinking_block`]: reconstruct a signed/redacted
+/// reasoning block from a pi `thinking` / `redacted_thinking`
+/// content block. Returns `None` for a plain summary-only thinking
+/// block (no `signature`) — those carry no replayable signature and
+/// stay in the human-readable `thinking` string instead.
+fn parse_pi_thinking_block(block: &serde_json::Value) -> Option<crate::inference::ThinkingBlock> {
+	use crate::inference::ThinkingBlock;
+	match block.get("type").and_then(|v| v.as_str()) {
+		Some("redacted_thinking") => Some(ThinkingBlock::RedactedThinking {
+			data: block
+				.get("data")
+				.and_then(|v| v.as_str())
+				.unwrap_or_default()
+				.to_string(),
+		}),
+		Some("thinking") => {
+			let signature = block.get("signature").and_then(|v| v.as_str())?;
+			Some(ThinkingBlock::Thinking {
+				thinking: block
+					.get("thinking")
+					.and_then(|v| v.as_str())
+					.unwrap_or_default()
+					.to_string(),
+				signature: signature.to_string(),
+			})
+		}
+		_ => None,
+	}
+}
+
 fn pi_tool_call_block(call: &ToolCall) -> serde_json::Value {
 	let args = match serde_json::from_str::<serde_json::Value>(&call.function.arguments) {
 		Ok(v) => v,
@@ -750,6 +816,7 @@ fn parse_pi_assistant(msg: &serde_json::Value) -> Vec<SessionRecord> {
 	};
 	let mut texts: Vec<String> = Vec::new();
 	let mut thinkings: Vec<String> = Vec::new();
+	let mut thinking_blocks: Vec<crate::inference::ThinkingBlock> = Vec::new();
 	let mut tool_calls: Vec<ToolCall> = Vec::new();
 	for block in blocks {
 		let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -759,9 +826,16 @@ fn parse_pi_assistant(msg: &serde_json::Value) -> Vec<SessionRecord> {
 					texts.push(t.to_string());
 				}
 			}
-			"thinking" => {
+			"thinking" | "redacted_thinking" => {
+				// A signed (or redacted) Anthropic block round-trips as
+				// a replayable `ThinkingBlock`; a plain summary-only
+				// block (no signature) just feeds the human-readable
+				// `thinking` string.
 				if let Some(t) = block.get("thinking").and_then(|v| v.as_str()) {
 					thinkings.push(t.to_string());
+				}
+				if let Some(parsed) = parse_pi_thinking_block(block) {
+					thinking_blocks.push(parsed);
 				}
 			}
 			"toolCall" => {
@@ -826,6 +900,7 @@ fn parse_pi_assistant(msg: &serde_json::Value) -> Vec<SessionRecord> {
 		out.push(SessionRecord::Assistant {
 			content,
 			thinking,
+			thinking_blocks,
 			tool_calls,
 			model,
 		});
@@ -967,6 +1042,14 @@ pub enum SessionRecord {
 		content: Option<String>,
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		thinking: Option<String>,
+		/// Signed/redacted Anthropic reasoning blocks, preserved so a
+		/// reopened session can replay them on the next tool round-trip
+		/// (the Messages API rejects a tool turn whose preceding
+		/// assistant message dropped its thinking block). Empty for
+		/// every non-Anthropic provider. See
+		/// [`crate::inference::ThinkingBlock`].
+		#[serde(default, skip_serializing_if = "Vec::is_empty")]
+		thinking_blocks: Vec<crate::inference::ThinkingBlock>,
 		#[serde(default, skip_serializing_if = "Vec::is_empty")]
 		tool_calls: Vec<ToolCall>,
 		/// Provider/model slug that actually served this round-
@@ -1953,6 +2036,7 @@ mod tests {
 			&SessionRecord::Assistant {
 				content: Some("hey".into()),
 				thinking: None,
+				thinking_blocks: vec![],
 				tool_calls: Vec::new(),
 				model: None,
 			},
@@ -2230,6 +2314,7 @@ mod tests {
 			&SessionRecord::Assistant {
 				content: Some("here's a plan".into()),
 				thinking: Some("let me think".into()),
+				thinking_blocks: vec![],
 				model: None,
 				tool_calls: vec![ToolCall {
 					id: "call-1".into(),
@@ -2270,6 +2355,7 @@ mod tests {
 			SessionRecord::Assistant {
 				content,
 				thinking,
+				thinking_blocks: _,
 				tool_calls,
 				model: _,
 			} => {
@@ -2304,6 +2390,7 @@ mod tests {
 			&SessionRecord::Assistant {
 				content: Some("done".into()),
 				thinking: None,
+				thinking_blocks: vec![],
 				tool_calls: Vec::new(),
 				model: None,
 			},
@@ -2372,6 +2459,7 @@ mod tests {
 			&SessionRecord::Assistant {
 				content: Some("ok".into()),
 				thinking: None,
+				thinking_blocks: vec![],
 				tool_calls: Vec::new(),
 				model: None,
 			},
@@ -2810,6 +2898,7 @@ mod tests {
 			SessionRecord::Assistant {
 				content: None,
 				thinking: None,
+				thinking_blocks: vec![],
 				tool_calls: vec![make_tool_call("call-a", "bash")],
 				model: None,
 			},
@@ -2835,6 +2924,7 @@ mod tests {
 			SessionRecord::Assistant {
 				content: None,
 				thinking: None,
+				thinking_blocks: vec![],
 				tool_calls: vec![make_tool_call("call-a", "bash"), make_tool_call("call-b", "bash")],
 				model: None,
 			},
@@ -2855,6 +2945,7 @@ mod tests {
 			SessionRecord::Assistant {
 				content: None,
 				thinking: None,
+				thinking_blocks: vec![],
 				tool_calls: vec![make_tool_call("call-a", "bash")],
 				model: None,
 			},
@@ -2865,6 +2956,7 @@ mod tests {
 			SessionRecord::Assistant {
 				content: None,
 				thinking: None,
+				thinking_blocks: vec![],
 				tool_calls: vec![make_tool_call("call-b", "read_file")],
 				model: None,
 			},
@@ -2875,6 +2967,7 @@ mod tests {
 			SessionRecord::Assistant {
 				content: None,
 				thinking: None,
+				thinking_blocks: vec![],
 				tool_calls: vec![make_tool_call("call-c", "bash")],
 				model: None,
 			},
@@ -2894,6 +2987,7 @@ mod tests {
 			SessionRecord::Assistant {
 				content: Some("I don't know".into()),
 				thinking: None,
+				thinking_blocks: vec![],
 				tool_calls: Vec::new(),
 				model: None,
 			},
@@ -2967,6 +3061,7 @@ mod tests {
 			SessionRecord::Assistant {
 				content,
 				thinking,
+				thinking_blocks: _,
 				tool_calls,
 				model,
 			} => {
@@ -2992,6 +3087,7 @@ mod tests {
 		let record = SessionRecord::Assistant {
 			content: Some("hello".into()),
 			thinking: None,
+			thinking_blocks: vec![],
 			tool_calls: Vec::new(),
 			model: Some("anthropic/claude-sonnet-4.5".into()),
 		};
@@ -3005,6 +3101,84 @@ mod tests {
 		match &records[0] {
 			SessionRecord::Assistant { model, .. } => {
 				assert_eq!(model.as_deref(), Some("anthropic/claude-sonnet-4.5"));
+			}
+			other => panic!("expected Assistant, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn signed_thinking_blocks_round_trip_through_pi_wire() {
+		// A reopened session that was mid-tool-loop on a thinking
+		// model must replay the signed/redacted reasoning blocks
+		// verbatim, or the next round-trip 400s. Pin the persist →
+		// reload round-trip end-to-end.
+		use crate::inference::ThinkingBlock;
+		let header = make_test_header("sess-thinking");
+		let record = SessionRecord::Assistant {
+			content: None,
+			thinking: Some("let me think".into()),
+			thinking_blocks: vec![
+				ThinkingBlock::Thinking {
+					thinking: "let me think".into(),
+					signature: "sig-xyz".into(),
+				},
+				ThinkingBlock::RedactedThinking { data: "opaque".into() },
+			],
+			tool_calls: vec![ToolCall {
+				id: "toolu_1".into(),
+				kind: "function".into(),
+				function: crate::inference::FunctionCall {
+					name: "bash".into(),
+					arguments: r#"{"cmd":"ls"}"#.into(),
+				},
+			}],
+			model: Some("anthropic/claude-fable-5".into()),
+		};
+		let wire = record_to_pi_wire(&record, &header);
+		let records = pi_wire_to_records(&wire);
+		match &records[0] {
+			SessionRecord::Assistant { thinking_blocks, .. } => {
+				assert_eq!(thinking_blocks.len(), 2, "both reasoning blocks survive reload");
+				assert!(
+					matches!(&thinking_blocks[0], ThinkingBlock::Thinking { signature, .. } if signature == "sig-xyz"),
+					"signed thinking block preserves its signature"
+				);
+				assert!(
+					matches!(&thinking_blocks[1], ThinkingBlock::RedactedThinking { data } if data == "opaque"),
+					"redacted block preserves its opaque data"
+				);
+			}
+			other => panic!("expected Assistant, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn plain_summary_thinking_does_not_round_trip_as_replayable_block() {
+		// Non-Anthropic providers (or legacy rows) carry only a
+		// human-readable `thinking` string with no signature. That
+		// must NOT reconstruct into a replayable `ThinkingBlock` —
+		// there's no signature to replay, and emitting one would 400.
+		let header = make_test_header("sess-plain-thinking");
+		let record = SessionRecord::Assistant {
+			content: Some("the answer".into()),
+			thinking: Some("some reasoning".into()),
+			thinking_blocks: vec![],
+			tool_calls: Vec::new(),
+			model: Some("hf/deepseek".into()),
+		};
+		let wire = record_to_pi_wire(&record, &header);
+		let records = pi_wire_to_records(&wire);
+		match &records[0] {
+			SessionRecord::Assistant {
+				thinking,
+				thinking_blocks,
+				..
+			} => {
+				assert_eq!(thinking.as_deref(), Some("some reasoning"));
+				assert!(
+					thinking_blocks.is_empty(),
+					"summary-only thinking carries no replayable block"
+				);
 			}
 			other => panic!("expected Assistant, got {other:?}"),
 		}
@@ -3034,6 +3208,7 @@ mod tests {
 				&SessionRecord::Assistant {
 					content: Some(assistant.into()),
 					thinking: None,
+					thinking_blocks: vec![],
 					tool_calls: Vec::new(),
 					model: None,
 				},

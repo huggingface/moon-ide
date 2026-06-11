@@ -478,7 +478,9 @@ fn render_message_for_summary(msg: &ChatMessage) -> String {
 			}
 			out.push_str("\n\n");
 		}
-		ChatMessage::Assistant { content, tool_calls } => {
+		ChatMessage::Assistant {
+			content, tool_calls, ..
+		} => {
 			out.push_str("### assistant\n");
 			if let Some(text) = content {
 				out.push_str(text);
@@ -527,12 +529,14 @@ mod tests {
 	fn assistant(t: &str) -> ChatMessage {
 		ChatMessage::Assistant {
 			content: Some(t.into()),
+			thinking_blocks: vec![],
 			tool_calls: vec![],
 		}
 	}
 	fn assistant_with_tool(text: &str, tool: &str) -> ChatMessage {
 		ChatMessage::Assistant {
 			content: Some(text.into()),
+			thinking_blocks: vec![],
 			tool_calls: vec![ToolCall {
 				id: "call_1".into(),
 				kind: "function".into(),

@@ -524,6 +524,7 @@ async fn run_subagent_inner(
 				&SessionRecord::Assistant {
 					content: response.content.clone(),
 					thinking: response.thinking.clone(),
+					thinking_blocks: response.thinking_blocks.clone(),
 					tool_calls: response.tool_calls.clone(),
 					model: Some(pi_model.clone()),
 				},
@@ -749,6 +750,7 @@ Do not call any more tools. Write a final response now using only what you've al
 			&SessionRecord::Assistant {
 				content: response.content.clone(),
 				thinking: response.thinking.clone(),
+				thinking_blocks: response.thinking_blocks.clone(),
 				tool_calls: response.tool_calls.clone(),
 				model: Some(pi_model.to_string()),
 			},
@@ -873,6 +875,7 @@ async fn persist_subagent(dir: &Utf8Path, header: &SessionHeader, record: &Sessi
 fn response_to_message(response: &AssistantResponse) -> ChatMessage {
 	ChatMessage::Assistant {
 		content: response.content.clone(),
+		thinking_blocks: response.thinking_blocks.clone(),
 		tool_calls: response.tool_calls.clone(),
 	}
 }

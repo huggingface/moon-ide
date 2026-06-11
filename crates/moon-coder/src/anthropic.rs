@@ -41,17 +41,73 @@ use serde::{Deserialize, Serialize};
 use crate::error::{request_id_of, CoderError};
 use crate::inference::{
 	extract_data_lines, find_event_boundary, truncate_for_log, AssistantResponse, ChatMessage, FunctionCall,
-	ResolvedRoute, StreamEvent, TokenUsage, ToolCall, ToolDefinition,
+	ResolvedRoute, StreamEvent, ThinkingBlock, TokenUsage, ToolCall, ToolDefinition,
 };
 use moon_protocol::coder_models::{ProviderModelSummary, ProviderProbeResult};
 
-/// Ceiling on the model's reply length for one round-trip. Anthropic
-/// requires this field; pick something large enough that a verbose
-/// answer plus a few tool calls comfortably fits, but bounded so a
-/// runaway model can't burn the whole window in one shot. The
-/// runner handles the actual context bookkeeping via the
-/// `compaction` layer.
-const MAX_TOKENS: u32 = 8_192;
+/// Ceiling on the model's reply length for one round-trip.
+/// Anthropic *requires* this field (omitting it 400s), so we can't
+/// just leave it unset. With adaptive thinking the reasoning counts
+/// against this number, so the old 8 K was far too tight — the model
+/// could spend the whole allowance thinking and have nothing left to
+/// answer with, or get truncated mid-tool-call.
+///
+/// [`max_tokens_for`] gives the adaptive thinking models a generous
+/// ceiling that leaves room for reasoning *and* a full answer;
+/// everything else (Haiku as the cheap model, anything we don't
+/// recognise) keeps the conservative 8 K that every Claude accepts.
+/// The runner still owns real context bookkeeping via `compaction`.
+const MAX_TOKENS_DEFAULT: u32 = 8_192;
+const MAX_TOKENS_LARGE: u32 = 32_000;
+
+/// Output ceiling for one round-trip. The adaptive thinking models
+/// get the large ceiling (they're 128 K-output-capable and burn part
+/// of it thinking); every other model gets the conservative default.
+/// We stay well under each model's hard cap so the request is always
+/// accepted.
+fn max_tokens_for(model: &str) -> u32 {
+	if is_adaptive_thinking_model(model) {
+		MAX_TOKENS_LARGE
+	} else {
+		MAX_TOKENS_DEFAULT
+	}
+}
+
+/// True for the modern Claude models that use **adaptive** thinking:
+/// Fable 5, Mythos 5 / Preview, and Opus 4.6/4.7/4.8. These are the
+/// only models we enable thinking on — see [`thinking_config_for`].
+/// Matches on the stable family token in the slug so a new dated
+/// revision (`claude-opus-4-8-20260101`) still classifies correctly.
+fn is_adaptive_thinking_model(model: &str) -> bool {
+	let m = model.to_ascii_lowercase();
+	m.contains("fable-5")
+		|| m.contains("mythos")
+		|| m.contains("opus-4-6")
+		|| m.contains("opus-4.6")
+		|| m.contains("opus-4-7")
+		|| m.contains("opus-4.7")
+		|| m.contains("opus-4-8")
+		|| m.contains("opus-4.8")
+}
+
+/// Build the `thinking` request object, or `None` for models we
+/// don't enable thinking on. Only the adaptive thinking models get a
+/// `thinking` object: `type: "adaptive"` (these 400 on a manual
+/// `budget_tokens`) with `display: "summarized"` so reasoning is
+/// actually returned (they omit it by default). Every other model —
+/// notably Haiku in its cheap-summarisation / auto-rename role, where
+/// reasoning is pure latency and cost — sends no `thinking` at all.
+/// We deliberately don't support the older manual `enabled` shape:
+/// nobody routes coding work through pre-adaptive models.
+fn thinking_config_for(model: &str) -> Option<ThinkingConfig> {
+	if !is_adaptive_thinking_model(model) {
+		return None;
+	}
+	Some(ThinkingConfig {
+		kind: "adaptive",
+		display: "summarized",
+	})
+}
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
@@ -67,7 +123,22 @@ struct Request<'a> {
 	messages: Vec<Message<'a>>,
 	#[serde(skip_serializing_if = "Vec::is_empty")]
 	tools: Vec<Tool<'a>>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	thinking: Option<ThinkingConfig>,
 	stream: bool,
+}
+
+/// The `thinking` request object. The adaptive thinking models need
+/// this to *enable* reasoning and to *receive* the summary text;
+/// without it they default to `display: "omitted"` and we see no
+/// reasoning at all. `type` is always `"adaptive"` (the model picks
+/// its own depth; a manual `budget_tokens` 400s on these models), and
+/// `display: "summarized"` is what surfaces human-readable reasoning.
+#[derive(Debug, Serialize)]
+struct ThinkingConfig {
+	#[serde(rename = "type")]
+	kind: &'static str,
+	display: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -96,6 +167,17 @@ enum Block<'a> {
 		#[serde(skip_serializing_if = "Option::is_none")]
 		cache_control: Option<CacheControl>,
 	},
+	/// Replayed signed reasoning block (see [`ThinkingBlock`]). The
+	/// `signature` is the opaque token the API handed back; it must
+	/// be echoed unchanged or the request 400s.
+	Thinking {
+		thinking: &'a str,
+		signature: &'a str,
+	},
+	/// Replayed safety-redacted reasoning block; `data` is opaque.
+	RedactedThinking {
+		data: &'a str,
+	},
 	Image {
 		source: ImageSource<'a>,
 	},
@@ -110,6 +192,31 @@ enum Block<'a> {
 		#[serde(skip_serializing_if = "Option::is_none")]
 		cache_control: Option<CacheControl>,
 	},
+}
+
+/// Keep a reasoning block only when it carries something replayable:
+/// a signature (the encrypted full-thinking token the API verifies),
+/// or redacted data. A signature-less, text-only thinking block has
+/// nothing to round-trip — it'd 400 on replay (`signature` is
+/// required) — so drop it and let the summary survive in the
+/// human-readable `thinking` string instead.
+fn keep_thinking_block(block: &ThinkingBlock) -> bool {
+	match block {
+		ThinkingBlock::Thinking { signature, .. } => !signature.is_empty(),
+		ThinkingBlock::RedactedThinking { data } => !data.is_empty(),
+	}
+}
+
+/// Project a stored [`ThinkingBlock`] back onto its Anthropic wire
+/// shape for replay on the next round-trip.
+fn thinking_block_to_wire(block: &ThinkingBlock) -> Block<'_> {
+	match block {
+		ThinkingBlock::Thinking { thinking, signature } => Block::Thinking {
+			thinking: thinking.as_str(),
+			signature: signature.as_str(),
+		},
+		ThinkingBlock::RedactedThinking { data } => Block::RedactedThinking { data: data.as_str() },
+	}
 }
 
 #[derive(Debug, Serialize)]
@@ -219,8 +326,20 @@ fn translate<'a>(messages: &'a [ChatMessage], mark_system_cache: bool, mark_last
 				}
 				push_or_merge_user(&mut out, blocks);
 			}
-			ChatMessage::Assistant { content, tool_calls } => {
-				let mut blocks: Vec<Block<'a>> = Vec::with_capacity(tool_calls.len() + 1);
+			ChatMessage::Assistant {
+				content,
+				thinking_blocks,
+				tool_calls,
+			} => {
+				let mut blocks: Vec<Block<'a>> = Vec::with_capacity(thinking_blocks.len() + tool_calls.len() + 1);
+				// Signed reasoning blocks must come first and verbatim:
+				// Anthropic requires the unmodified thinking block to
+				// precede the `tool_use` blocks in the assistant turn
+				// that a `tool_result` answers, or the next round-trip
+				// 400s. See `ThinkingBlock`.
+				for tb in thinking_blocks {
+					blocks.push(thinking_block_to_wire(tb));
+				}
 				if let Some(text) = content.as_deref() {
 					if !text.trim().is_empty() {
 						blocks.push(Block::Text {
@@ -297,10 +416,12 @@ fn set_cache_marker_on_last_block(blocks: &mut [Block<'_>]) {
 		Block::Text { cache_control, .. } | Block::ToolResult { cache_control, .. } => {
 			*cache_control = Some(CacheControl::EPHEMERAL);
 		}
-		Block::Image { .. } | Block::ToolUse { .. } => {
+		Block::Image { .. } | Block::ToolUse { .. } | Block::Thinking { .. } | Block::RedactedThinking { .. } => {
 			// Anthropic doesn't allow `cache_control` on every
-			// block kind; image / tool_use don't accept it. Skip
-			// the marker rather than emit an invalid request.
+			// block kind; image / tool_use / thinking don't accept
+			// it. Skip the marker rather than emit an invalid
+			// request. (Thinking blocks never land last on a
+			// user-role message anyway — they're assistant-only.)
 		}
 	}
 }
@@ -363,10 +484,11 @@ pub(crate) async fn chat_completion(
 		.collect();
 	let body = Request {
 		model,
-		max_tokens: MAX_TOKENS,
+		max_tokens: max_tokens_for(model),
 		system: translated.system,
 		messages: translated.messages,
 		tools: tool_views,
+		thinking: thinking_config_for(model),
 		stream: false,
 	};
 
@@ -426,10 +548,11 @@ where
 		.collect();
 	let body = Request {
 		model,
-		max_tokens: MAX_TOKENS,
+		max_tokens: max_tokens_for(model),
 		system: translated.system,
 		messages: translated.messages,
 		tools: tool_views,
+		thinking: thinking_config_for(model),
 		stream: true,
 	};
 
@@ -517,6 +640,14 @@ struct StreamState {
 	/// runner-side `ToolCall` list packs only the tool_use ones,
 	/// so we keep the projection here.
 	block_to_tool: HashMap<u32, usize>,
+	/// Signed/redacted reasoning blocks, in wire order. The
+	/// `thinking` summary and the `signature` for a regular block
+	/// arrive as separate deltas on the same content-block index,
+	/// so we buffer per index and assemble on `content_block_stop`.
+	thinking_blocks: Vec<ThinkingBlock>,
+	/// Map from Anthropic `content_block` index → position in
+	/// `thinking_blocks` for the block currently streaming.
+	block_to_thinking: HashMap<u32, usize>,
 	usage: Option<TokenUsage>,
 }
 
@@ -544,7 +675,23 @@ impl StreamState {
 				ContentBlockSpec::Text { .. } => {
 					// nothing to do; the text accumulates via deltas
 				}
-				ContentBlockSpec::Thinking { .. } => {}
+				ContentBlockSpec::Thinking { thinking, signature } => {
+					// Register an ordered slot for this block; the
+					// summary text and signature stream in as deltas.
+					// The start event may already carry seed values
+					// (notably an empty `thinking` under
+					// `display: "omitted"`), so capture them now.
+					let pos = self.thinking_blocks.len();
+					self
+						.thinking_blocks
+						.push(ThinkingBlock::Thinking { thinking, signature });
+					self.block_to_thinking.insert(index, pos);
+				}
+				ContentBlockSpec::RedactedThinking { data } => {
+					// Redacted blocks arrive whole (no deltas); store
+					// in order so they replay before tool_use.
+					self.thinking_blocks.push(ThinkingBlock::RedactedThinking { data });
+				}
 				ContentBlockSpec::ToolUse { id, name, .. } => {
 					let pos = self.tool_calls.len();
 					self.tool_calls.push(ToolCallBuf {
@@ -560,6 +707,7 @@ impl StreamState {
 						arguments_delta: None,
 					});
 				}
+				ContentBlockSpec::Other => {}
 			},
 			StreamEventBody::ContentBlockDelta { index, delta } => match delta {
 				BlockDelta::TextDelta { text } => {
@@ -568,6 +716,11 @@ impl StreamState {
 				}
 				BlockDelta::ThinkingDelta { thinking } => {
 					self.thinking.push_str(&thinking);
+					if let Some(&pos) = self.block_to_thinking.get(&index) {
+						if let ThinkingBlock::Thinking { thinking: buf, .. } = &mut self.thinking_blocks[pos] {
+							buf.push_str(&thinking);
+						}
+					}
 					on_event(StreamEvent::ThinkingDelta { delta: &thinking });
 				}
 				BlockDelta::InputJsonDelta { partial_json } => {
@@ -581,7 +734,14 @@ impl StreamState {
 						});
 					}
 				}
-				BlockDelta::SignatureDelta { .. } | BlockDelta::Other => {}
+				BlockDelta::SignatureDelta { signature } => {
+					if let Some(&pos) = self.block_to_thinking.get(&index) {
+						if let ThinkingBlock::Thinking { signature: buf, .. } = &mut self.thinking_blocks[pos] {
+							buf.push_str(&signature);
+						}
+					}
+				}
+				BlockDelta::Other => {}
 			},
 			StreamEventBody::ContentBlockStop { .. } => {}
 			StreamEventBody::MessageDelta { usage, .. } => {
@@ -617,6 +777,7 @@ impl StreamState {
 			} else {
 				Some(self.thinking)
 			},
+			thinking_blocks: self.thinking_blocks.into_iter().filter(keep_thinking_block).collect(),
 			tool_calls: self
 				.tool_calls
 				.into_iter()
@@ -738,8 +899,13 @@ enum ContentBlockSpec {
 	},
 	Thinking {
 		#[serde(default)]
-		#[allow(dead_code)]
 		thinking: String,
+		#[serde(default)]
+		signature: String,
+	},
+	RedactedThinking {
+		#[serde(default)]
+		data: String,
 	},
 	ToolUse {
 		id: String,
@@ -748,6 +914,8 @@ enum ContentBlockSpec {
 		#[allow(dead_code)]
 		input: serde_json::Value,
 	},
+	#[serde(other)]
+	Other,
 }
 
 #[derive(Debug, Deserialize)]
@@ -763,7 +931,6 @@ enum BlockDelta {
 		partial_json: String,
 	},
 	SignatureDelta {
-		#[allow(dead_code)]
 		#[serde(default)]
 		signature: String,
 	},
@@ -809,6 +976,12 @@ enum NonStreamBlock {
 	Thinking {
 		#[serde(default)]
 		thinking: String,
+		#[serde(default)]
+		signature: String,
+	},
+	RedactedThinking {
+		#[serde(default)]
+		data: String,
 	},
 	ToolUse {
 		id: String,
@@ -824,11 +997,18 @@ impl NonStreamResponse {
 	fn into_assistant_response(self) -> AssistantResponse {
 		let mut content = String::new();
 		let mut thinking = String::new();
+		let mut thinking_blocks: Vec<ThinkingBlock> = Vec::new();
 		let mut tool_calls: Vec<ToolCall> = Vec::new();
 		for block in self.content {
 			match block {
 				NonStreamBlock::Text { text } => content.push_str(&text),
-				NonStreamBlock::Thinking { thinking: t } => thinking.push_str(&t),
+				NonStreamBlock::Thinking { thinking: t, signature } => {
+					thinking.push_str(&t);
+					thinking_blocks.push(ThinkingBlock::Thinking { thinking: t, signature });
+				}
+				NonStreamBlock::RedactedThinking { data } => {
+					thinking_blocks.push(ThinkingBlock::RedactedThinking { data });
+				}
 				NonStreamBlock::ToolUse { id, name, input } => {
 					let arguments = serde_json::to_string(&input).unwrap_or_else(|_| "{}".into());
 					tool_calls.push(ToolCall {
@@ -840,6 +1020,7 @@ impl NonStreamResponse {
 				NonStreamBlock::Other => {}
 			}
 		}
+		thinking_blocks.retain(keep_thinking_block);
 		let usage = self.usage.map(|u| {
 			let mut out = TokenUsage::default();
 			if let Some(v) = u.input_tokens {
@@ -868,6 +1049,7 @@ impl NonStreamResponse {
 		AssistantResponse {
 			content: if content.is_empty() { None } else { Some(content) },
 			thinking: if thinking.is_empty() { None } else { Some(thinking) },
+			thinking_blocks,
 			tool_calls,
 			usage,
 		}
@@ -1053,6 +1235,7 @@ mod tests {
 			user_msg("read foo.txt"),
 			ChatMessage::Assistant {
 				content: Some("on it".into()),
+				thinking_blocks: Vec::new(),
 				tool_calls: vec![ToolCall {
 					id: "toolu_x".into(),
 					kind: "function".into(),
@@ -1426,6 +1609,7 @@ mod tests {
 			ChatMessage::user("hello"),
 			ChatMessage::Assistant {
 				content: None,
+				thinking_blocks: Vec::new(),
 				tool_calls: Vec::new(),
 			},
 		];
@@ -1444,6 +1628,7 @@ mod tests {
 			ChatMessage::user("hello"),
 			ChatMessage::Assistant {
 				content: Some("   \n\t".into()),
+				thinking_blocks: Vec::new(),
 				tool_calls: Vec::new(),
 			},
 		];
@@ -1460,6 +1645,7 @@ mod tests {
 			ChatMessage::user("run ls"),
 			ChatMessage::Assistant {
 				content: None,
+				thinking_blocks: Vec::new(),
 				tool_calls: vec![ToolCall {
 					id: "call-1".into(),
 					kind: "function".into(),
@@ -1490,5 +1676,271 @@ mod tests {
 		let translated = translate(&messages, false, false);
 		// Only the first user message survives.
 		assert_eq!(translated.messages.len(), 1);
+	}
+
+	#[test]
+	fn translate_replays_thinking_blocks_before_tool_use() {
+		// The core Fable-5 fix: a signed thinking block on an
+		// assistant turn must be echoed back verbatim, *before* the
+		// tool_use blocks, or the next tool round-trip 400s.
+		let messages = vec![
+			ChatMessage::user("do the thing"),
+			ChatMessage::Assistant {
+				content: None,
+				thinking_blocks: vec![
+					ThinkingBlock::Thinking {
+						thinking: "let me think".into(),
+						signature: "sig-abc".into(),
+					},
+					ThinkingBlock::RedactedThinking {
+						data: "opaque-data".into(),
+					},
+				],
+				tool_calls: vec![ToolCall {
+					id: "toolu_1".into(),
+					kind: "function".into(),
+					function: FunctionCall {
+						name: "bash".into(),
+						arguments: r#"{"cmd":"ls"}"#.into(),
+					},
+				}],
+			},
+		];
+		let t = translate(&messages, false, false);
+		let assistant = &t.messages[1];
+		assert_eq!(assistant.role, "assistant");
+		// Order must be: thinking, redacted_thinking, tool_use.
+		match &assistant.content[0] {
+			Block::Thinking { thinking, signature } => {
+				assert_eq!(*thinking, "let me think");
+				assert_eq!(*signature, "sig-abc");
+			}
+			other => panic!("first block must be thinking, got {other:?}"),
+		}
+		match &assistant.content[1] {
+			Block::RedactedThinking { data } => assert_eq!(*data, "opaque-data"),
+			other => panic!("second block must be redacted_thinking, got {other:?}"),
+		}
+		match &assistant.content[2] {
+			Block::ToolUse { name, .. } => assert_eq!(*name, "bash"),
+			other => panic!("third block must be tool_use, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn stream_captures_thinking_block_signature_for_replay() {
+		// Streaming: a thinking block opens, summary streams via
+		// thinking_delta, the signature lands as signature_delta, then
+		// a tool_use block follows. The finalized response must carry
+		// the signed thinking block (so it round-trips) and the tool
+		// call.
+		let mut state = StreamState::default();
+		let mut noop = |_: StreamEvent<'_>| {};
+		state
+			.apply(
+				StreamEventBody::ContentBlockStart {
+					index: 0,
+					content_block: ContentBlockSpec::Thinking {
+						thinking: String::new(),
+						signature: String::new(),
+					},
+				},
+				&mut noop,
+			)
+			.unwrap();
+		state
+			.apply(
+				StreamEventBody::ContentBlockDelta {
+					index: 0,
+					delta: BlockDelta::ThinkingDelta {
+						thinking: "step one".into(),
+					},
+				},
+				&mut noop,
+			)
+			.unwrap();
+		state
+			.apply(
+				StreamEventBody::ContentBlockDelta {
+					index: 0,
+					delta: BlockDelta::SignatureDelta {
+						signature: "the-signature".into(),
+					},
+				},
+				&mut noop,
+			)
+			.unwrap();
+		state
+			.apply(StreamEventBody::ContentBlockStop { index: 0 }, &mut noop)
+			.unwrap();
+		state
+			.apply(
+				StreamEventBody::ContentBlockStart {
+					index: 1,
+					content_block: ContentBlockSpec::ToolUse {
+						id: "toolu_1".into(),
+						name: "read_file".into(),
+						input: serde_json::Value::Null,
+					},
+				},
+				&mut noop,
+			)
+			.unwrap();
+		let resp = state.finalize();
+		assert_eq!(resp.thinking.as_deref(), Some("step one"));
+		assert_eq!(resp.thinking_blocks.len(), 1);
+		match &resp.thinking_blocks[0] {
+			ThinkingBlock::Thinking { thinking, signature } => {
+				assert_eq!(thinking, "step one");
+				assert_eq!(signature, "the-signature");
+			}
+			other => panic!("expected signed thinking block, got {other:?}"),
+		}
+		assert_eq!(resp.tool_calls.len(), 1);
+	}
+
+	#[test]
+	fn stream_keeps_signature_only_omitted_thinking_block() {
+		// `display: "omitted"` path (Opus 4.8 / Fable 5 default): the
+		// thinking block opens, a single signature_delta arrives, no
+		// thinking_delta. The block carries no readable summary but
+		// MUST still round-trip — the signature is required on replay.
+		let mut state = StreamState::default();
+		let mut noop = |_: StreamEvent<'_>| {};
+		state
+			.apply(
+				StreamEventBody::ContentBlockStart {
+					index: 0,
+					content_block: ContentBlockSpec::Thinking {
+						thinking: String::new(),
+						signature: String::new(),
+					},
+				},
+				&mut noop,
+			)
+			.unwrap();
+		state
+			.apply(
+				StreamEventBody::ContentBlockDelta {
+					index: 0,
+					delta: BlockDelta::SignatureDelta {
+						signature: "omitted-sig".into(),
+					},
+				},
+				&mut noop,
+			)
+			.unwrap();
+		let resp = state.finalize();
+		// No readable summary…
+		assert_eq!(resp.thinking, None);
+		// …but the signed block survives for replay.
+		assert_eq!(resp.thinking_blocks.len(), 1);
+		match &resp.thinking_blocks[0] {
+			ThinkingBlock::Thinking { thinking, signature } => {
+				assert!(thinking.is_empty());
+				assert_eq!(signature, "omitted-sig");
+			}
+			other => panic!("expected signed thinking block, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn finalize_drops_signatureless_thinking_block() {
+		// A thinking block that never received a signature (some
+		// non-Anthropic-shaped reasoning, or a malformed stream)
+		// has nothing replayable and would 400 on replay — drop it
+		// from `thinking_blocks` (the summary still rides in the
+		// `thinking` string).
+		let mut state = StreamState::default();
+		let mut noop = |_: StreamEvent<'_>| {};
+		state
+			.apply(
+				StreamEventBody::ContentBlockStart {
+					index: 0,
+					content_block: ContentBlockSpec::Thinking {
+						thinking: String::new(),
+						signature: String::new(),
+					},
+				},
+				&mut noop,
+			)
+			.unwrap();
+		state
+			.apply(
+				StreamEventBody::ContentBlockDelta {
+					index: 0,
+					delta: BlockDelta::ThinkingDelta {
+						thinking: "reasoning with no signature".into(),
+					},
+				},
+				&mut noop,
+			)
+			.unwrap();
+		let resp = state.finalize();
+		assert_eq!(resp.thinking.as_deref(), Some("reasoning with no signature"));
+		assert!(resp.thinking_blocks.is_empty());
+	}
+
+	#[test]
+	fn non_stream_response_captures_signed_and_redacted_thinking() {
+		let body = serde_json::json!({
+			"content": [
+				{"type": "thinking", "thinking": "hmm", "signature": "sig-1"},
+				{"type": "redacted_thinking", "data": "redacted-1"},
+				{"type": "text", "text": "the answer"},
+			],
+			"usage": {"input_tokens": 5, "output_tokens": 3}
+		});
+		let parsed: NonStreamResponse = serde_json::from_value(body).unwrap();
+		let resp = parsed.into_assistant_response();
+		assert_eq!(resp.content.as_deref(), Some("the answer"));
+		assert_eq!(resp.thinking_blocks.len(), 2);
+		assert!(matches!(&resp.thinking_blocks[0], ThinkingBlock::Thinking { signature, .. } if signature == "sig-1"));
+		assert!(matches!(&resp.thinking_blocks[1], ThinkingBlock::RedactedThinking { data } if data == "redacted-1"));
+	}
+
+	#[test]
+	fn thinking_config_adaptive_for_modern_models() {
+		// Fable 5 / Mythos 5 / Opus 4.6-4.8 get adaptive thinking
+		// (no budget_tokens — a manual budget 400s on these models)
+		// with display=summarized so reasoning is actually returned.
+		for model in [
+			"claude-fable-5",
+			"claude-opus-4-8",
+			"claude-mythos-5",
+			"claude-opus-4-7",
+			"claude-opus-4-6",
+		] {
+			let cfg = thinking_config_for(model).unwrap_or_else(|| panic!("{model} should enable thinking"));
+			assert_eq!(cfg.kind, "adaptive", "{model} should be adaptive");
+			assert_eq!(cfg.display, "summarized");
+		}
+	}
+
+	#[test]
+	fn no_thinking_for_cheap_and_unknown_models() {
+		// Haiku (the cheap summarisation / auto-rename model) and any
+		// model we don't recognise send NO `thinking` object — we only
+		// enable thinking on the modern adaptive models.
+		for model in [
+			"claude-haiku-4-5-20251001",
+			"claude-3-5-haiku-20241022",
+			"claude-sonnet-4-5-20250929",
+			"some-unknown-model",
+		] {
+			assert!(
+				thinking_config_for(model).is_none(),
+				"{model} must not send a thinking object"
+			);
+		}
+	}
+
+	#[test]
+	fn max_tokens_large_for_adaptive_models_default_otherwise() {
+		assert_eq!(max_tokens_for("claude-opus-4-8"), MAX_TOKENS_LARGE);
+		assert_eq!(max_tokens_for("claude-fable-5"), MAX_TOKENS_LARGE);
+		// Haiku / unknown stay on the conservative ceiling.
+		assert_eq!(max_tokens_for("claude-haiku-4-5-20251001"), MAX_TOKENS_DEFAULT);
+		assert_eq!(max_tokens_for("claude-3-5-haiku-20241022"), MAX_TOKENS_DEFAULT);
 	}
 }

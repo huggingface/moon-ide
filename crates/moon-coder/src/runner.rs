@@ -1528,11 +1528,13 @@ impl CoderHandle {
 				SessionRecord::Assistant {
 					content,
 					tool_calls,
+					thinking_blocks,
 					thinking: _,
 					model: _,
 				} => {
 					messages.push(ChatMessage::Assistant {
 						content: content.clone(),
+						thinking_blocks: thinking_blocks.clone(),
 						tool_calls: tool_calls.clone(),
 					});
 				}
@@ -3668,6 +3670,7 @@ async fn persist_assistant_record(rt: &Arc<SessionRuntime>, response: &Assistant
 	let record = SessionRecord::Assistant {
 		content: response.content.clone(),
 		thinking: response.thinking.clone(),
+		thinking_blocks: response.thinking_blocks.clone(),
 		tool_calls: response.tool_calls.clone(),
 		model: pi_model,
 	};
@@ -4164,6 +4167,7 @@ fn emit_replay_events(out: &mut Vec<CoderEvent>, record: SessionRecord) {
 		SessionRecord::Assistant {
 			content,
 			thinking,
+			thinking_blocks: _,
 			tool_calls,
 			model: _,
 		} => {
@@ -4353,6 +4357,7 @@ fn subagent_replay_inners(record: SessionRecord) -> Vec<CoderEvent> {
 		SessionRecord::Assistant {
 			content,
 			thinking,
+			thinking_blocks: _,
 			tool_calls,
 			model: _,
 		} => {
@@ -4402,6 +4407,7 @@ fn subagent_replay_inners(record: SessionRecord) -> Vec<CoderEvent> {
 fn response_to_message(response: &AssistantResponse) -> ChatMessage {
 	ChatMessage::Assistant {
 		content: response.content.clone(),
+		thinking_blocks: response.thinking_blocks.clone(),
 		tool_calls: response.tool_calls.clone(),
 	}
 }
@@ -4601,7 +4607,9 @@ fn message_bytes(messages: &[ChatMessage]) -> usize {
 					bytes += img.data_url.len();
 				}
 			}
-			ChatMessage::Assistant { content, tool_calls } => {
+			ChatMessage::Assistant {
+				content, tool_calls, ..
+			} => {
 				bytes += content.as_deref().map(str::len).unwrap_or(0);
 				for call in tool_calls {
 					bytes += call.function.name.len();
@@ -4938,6 +4946,7 @@ mod tests {
 			},
 			ChatMessage::Assistant {
 				content: Some("done".into()),
+				thinking_blocks: Vec::new(),
 				tool_calls: Vec::new(),
 			},
 		];
@@ -4985,6 +4994,7 @@ mod tests {
 			ChatMessage::user("do thing"),
 			ChatMessage::Assistant {
 				content: None,
+				thinking_blocks: Vec::new(),
 				tool_calls: Vec::new(),
 			},
 			ChatMessage::Tool {
@@ -5130,6 +5140,7 @@ mod tests {
 		let empty = AssistantResponse {
 			content: None,
 			thinking: None,
+			thinking_blocks: Vec::new(),
 			tool_calls: Vec::new(),
 			usage: None,
 		};
@@ -5141,6 +5152,7 @@ mod tests {
 		let whitespace = AssistantResponse {
 			content: Some("   \n\t".into()),
 			thinking: Some("   ".into()),
+			thinking_blocks: Vec::new(),
 			tool_calls: Vec::new(),
 			usage: None,
 		};
@@ -5153,6 +5165,7 @@ mod tests {
 		let text = AssistantResponse {
 			content: Some("hello".into()),
 			thinking: None,
+			thinking_blocks: Vec::new(),
 			tool_calls: Vec::new(),
 			usage: None,
 		};
@@ -5162,6 +5175,7 @@ mod tests {
 		let thinking = AssistantResponse {
 			content: None,
 			thinking: Some("let me think".into()),
+			thinking_blocks: Vec::new(),
 			tool_calls: Vec::new(),
 			usage: None,
 		};
@@ -5171,6 +5185,7 @@ mod tests {
 		let tool_only = AssistantResponse {
 			content: None,
 			thinking: None,
+			thinking_blocks: Vec::new(),
 			tool_calls: vec![crate::inference::ToolCall {
 				id: "call-1".into(),
 				kind: "function".into(),
@@ -5216,6 +5231,7 @@ mod tests {
 			},
 			ChatMessage::Assistant {
 				content: Some(String::new()),
+				thinking_blocks: Vec::new(),
 				tool_calls: Vec::new(),
 			},
 			// 80 bytes appended after the last assistant turn:
@@ -5277,6 +5293,7 @@ mod tests {
 		session.session_dir = Some(dir.clone());
 		let assistant = ChatMessage::Assistant {
 			content: None,
+			thinking_blocks: Vec::new(),
 			tool_calls: vec![crate::inference::ToolCall {
 				id: "call-1".into(),
 				kind: "function".into(),
@@ -5310,6 +5327,7 @@ mod tests {
 			&SessionRecord::Assistant {
 				content: None,
 				thinking: None,
+				thinking_blocks: vec![],
 				tool_calls: match &assistant {
 					ChatMessage::Assistant { tool_calls, .. } => tool_calls.clone(),
 					_ => unreachable!(),
@@ -5381,6 +5399,7 @@ mod tests {
 			ChatMessage::user("read foo.rs"),
 			ChatMessage::Assistant {
 				content: None,
+				thinking_blocks: Vec::new(),
 				tool_calls: vec![crate::inference::ToolCall {
 					id: "call-1".into(),
 					kind: "function".into(),
