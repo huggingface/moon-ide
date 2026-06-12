@@ -30,4 +30,17 @@ exit_code: number,
  * `unhealthy`, `starting`). Empty string when the service
  * has no healthcheck.
  */
-health: string, };
+health: string, 
+/**
+ * True when the container is up but attached to **no**
+ * network — the residue of a failed start (typically a
+ * host-port conflict) whose rollback wiped the container's
+ * endpoint config. Such a service is unreachable by name
+ * and publishes nothing, no matter how healthy it claims to
+ * be, and only a recreate fixes it; the backend
+ * auto-recreates on the next lifecycle action and the UI
+ * surfaces it as failed meanwhile. Always `false` for
+ * containers that aren't running (stopped containers hold
+ * no endpoints, so the question is meaningless).
+ */
+networkless: boolean, };

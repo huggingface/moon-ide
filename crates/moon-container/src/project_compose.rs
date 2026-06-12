@@ -56,6 +56,10 @@
 //! the helper, idempotency rules, and the limitation around
 //! projects that override the default network.
 //!
+//! The same lifecycle actions also repair containers whose
+//! network endpoints were wiped by a failed start — see
+//! [`Self::heal_networkless_services`].
+//!
 //! What's not covered yet
 //! ----------------------
 //!
@@ -70,9 +74,12 @@ use camino::{Utf8Path, Utf8PathBuf};
 use moon_protocol::container::{ContainerState, ContainerStatus};
 
 use crate::discovery::{discover_root_compose, DiscoveredCompose};
-use crate::lifecycle::{aggregate_state, parse_ps_output, run_docker_compose_with_overrides, LifecycleError};
+use crate::lifecycle::{
+	aggregate_state, flag_networkless_services, parse_ps_output, run_docker_compose_with_overrides, LifecycleError,
+};
 use crate::network::{
-	connect_container_to_network, dev_container_name, disconnect_container_from_network, project_default_network,
+	connect_container_to_network, dev_container_name, disconnect_container_from_network, networkless_running_services,
+	project_default_network,
 };
 use crate::project::{folder_slug, project_name_for_folder, project_name_for_id, ProjectName};
 use crate::restart_override::ensure_restart_override;
@@ -183,7 +190,8 @@ impl ProjectCompose {
 	pub async fn status(&self) -> Result<ContainerStatus, LifecycleError> {
 		status_cache::get_or_fetch(&self.project, &self.compose_file, Instant::now(), || async {
 			let output = self.docker_compose(["ps", "--all", "--format", "json"]).await?;
-			let services = parse_ps_output(&output.stdout).map_err(LifecycleError::ParseError)?;
+			let mut services = parse_ps_output(&output.stdout).map_err(LifecycleError::ParseError)?;
+			flag_networkless_services(&self.project, &mut services).await;
 			let state = aggregate_state(&services);
 			Ok(ContainerStatus { state, services })
 		})
@@ -221,8 +229,9 @@ impl ProjectCompose {
 	pub async fn up(&self) -> Result<(), LifecycleError> {
 		let result = self.docker_compose(["up", "-d", "--wait"]).await;
 		self.invalidate_status_cache().await;
+		let healed = self.heal_networkless_services().await;
 		self.attach_workspace_dev().await;
-		result.map(|_| ())
+		result.map(|_| ()).and(healed)
 	}
 
 	pub async fn pause(&self) -> Result<(), LifecycleError> {
@@ -317,8 +326,9 @@ impl ProjectCompose {
 	pub async fn start_service(&self, service: &str) -> Result<(), LifecycleError> {
 		let result = self.docker_compose(["up", "-d", "--no-deps", service]).await;
 		self.invalidate_status_cache().await;
+		let healed = self.heal_networkless_services().await;
 		self.attach_workspace_dev().await;
-		result.map(|_| ())
+		result.map(|_| ()).and(healed)
 	}
 
 	/// `docker compose stop <service>` — send SIGTERM to a single
@@ -338,7 +348,55 @@ impl ProjectCompose {
 	pub async fn restart_service(&self, service: &str) -> Result<(), LifecycleError> {
 		let result = self.docker_compose(["restart", service]).await;
 		self.invalidate_status_cache().await;
+		let healed = self.heal_networkless_services().await;
 		self.attach_workspace_dev().await;
+		result.map(|_| ()).and(healed)
+	}
+
+	/// Detect running-but-networkless service containers and
+	/// force-recreate just those services.
+	///
+	/// A failed `docker start` (the classic trigger: a host-port
+	/// conflict against another project publishing the same
+	/// port) rolls back by wiping the container's stored network
+	/// endpoints. From then on every plain start — compose
+	/// `start`, `restart`, even `up` when the config hash hasn't
+	/// changed — brings the container up with only a loopback
+	/// interface: no service-name DNS, no published ports, yet
+	/// "running (healthy)" if its healthcheck talks to
+	/// `127.0.0.1`. The state never self-resolves; recreating
+	/// the container is the only cure, so we do exactly that,
+	/// scoped to the broken services (`--no-deps
+	/// --force-recreate <svc>...`).
+	///
+	/// Called after every lifecycle action that (re)starts
+	/// containers, and from the workspace shell's
+	/// setup/rebuild reconcile. Detection failures are logged
+	/// and swallowed (the probe must not make lifecycle ops less
+	/// reliable); a failed *recreate* is returned to the caller
+	/// — its stderr carries the real, actionable error (e.g.
+	/// "Bind for 0.0.0.0:27017 failed: port is already
+	/// allocated") that the silent zombie was hiding.
+	pub(crate) async fn heal_networkless_services(&self) -> Result<(), LifecycleError> {
+		let broken = match networkless_running_services(&self.project).await {
+			Ok(set) => set,
+			Err(err) => {
+				tracing::debug!(%err, project = %self.project, "network probe failed; skipping networkless heal");
+				return Ok(());
+			}
+		};
+		if broken.is_empty() {
+			return Ok(());
+		}
+		tracing::warn!(
+			project = %self.project,
+			services = ?broken,
+			"running containers hold no network endpoints (failed-start residue); force-recreating",
+		);
+		let mut args: Vec<&str> = vec!["up", "-d", "--no-deps", "--force-recreate"];
+		args.extend(broken.iter().map(String::as_str));
+		let result = self.docker_compose(args).await;
+		self.invalidate_status_cache().await;
 		result.map(|_| ())
 	}
 

@@ -1233,6 +1233,14 @@ export type ServiceStatus = {
 	exit_code: number;
 	/** Healthcheck verdict (`healthy`, `unhealthy`, `starting`); empty string when no healthcheck declared. */
 	health: string;
+	/**
+	 * Container is up but attached to no network — endpoint config
+	 * wiped by a failed start (typically a host-port conflict).
+	 * Unreachable by service name, publishes nothing, regardless of
+	 * health. The backend force-recreates it on the next lifecycle
+	 * action; until then the row renders as failed.
+	 */
+	networkless: boolean;
 };
 
 /**
@@ -1265,6 +1273,9 @@ export function isFailedService(svc: ServiceStatus): boolean {
 		return true;
 	}
 	if (svc.raw_state === 'running' && svc.health === 'unhealthy') {
+		return true;
+	}
+	if (svc.networkless) {
 		return true;
 	}
 	return false;

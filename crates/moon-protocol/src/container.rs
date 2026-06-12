@@ -50,10 +50,12 @@ pub enum ContainerState {
 	Stopped,
 	/// One of: a container is `dead`, the daemon reported a
 	/// state we don't recognise, a service exited with a
-	/// non-zero code, or the project is in a mixed state where
-	/// some services are running while others are stuck in
-	/// `created` (stalled `depends_on`) or have exited. The UI
-	/// shows the per-service detail so the user can decide.
+	/// non-zero code, a running service is attached to no
+	/// network (see [`ServiceStatus::networkless`]), or the
+	/// project is in a mixed state where some services are
+	/// running while others are stuck in `created` (stalled
+	/// `depends_on`) or have exited. The UI shows the
+	/// per-service detail so the user can decide.
 	Failed,
 }
 
@@ -80,6 +82,17 @@ pub struct ServiceStatus {
 	/// `unhealthy`, `starting`). Empty string when the service
 	/// has no healthcheck.
 	pub health: String,
+	/// True when the container is up but attached to **no**
+	/// network — the residue of a failed start (typically a
+	/// host-port conflict) whose rollback wiped the container's
+	/// endpoint config. Such a service is unreachable by name
+	/// and publishes nothing, no matter how healthy it claims to
+	/// be, and only a recreate fixes it; the backend
+	/// auto-recreates on the next lifecycle action and the UI
+	/// surfaces it as failed meanwhile. Always `false` for
+	/// containers that aren't running (stopped containers hold
+	/// no endpoints, so the question is meaningless).
+	pub networkless: bool,
 }
 
 /// Snapshot returned by `container_status` and embedded in

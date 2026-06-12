@@ -12,6 +12,13 @@
 	// pulse helps the user spot the hold-up at a glance even if
 	// they opened the popover after `up -d --wait` returned.
 	function isWaitingService(svc: ServiceStatus): boolean {
+		if (svc.networkless) {
+			// Never transient: a networkless container won't settle
+			// on its own (only a recreate fixes it), so a pulsing
+			// row would promise progress that isn't coming — even
+			// while its loopback healthcheck reports `starting`.
+			return false;
+		}
 		if (svc.raw_state === 'created') {
 			return true;
 		}
@@ -285,7 +292,17 @@
 								<span class="state-text">
 									{svc.raw_state}{svc.raw_state === 'exited' ? ` (${svc.exit_code})` : ''}
 								</span>
-								{#if svc.health === 'healthy'}
+								{#if svc.networkless}
+									<!-- Takes priority over the healthcheck verdict: with no
+									     network the container is unreachable no matter what a
+									     loopback healthcheck claims. -->
+									<span
+										class="health-bad"
+										title="Container is attached to no network — a failed start (usually a host-port conflict) wiped its endpoints. Restart the service to recreate it."
+									>
+										· no network
+									</span>
+								{:else if svc.health === 'healthy'}
 									<span class="health-ok" aria-label="healthy" title="healthy">✓</span>
 								{:else if svc.health === 'starting'}
 									<span class="health-warn">· starting</span>

@@ -334,7 +334,8 @@ impl Workspace {
 		}
 		status_cache::get_or_fetch(&self.project, &self.compose_path, Instant::now(), || async {
 			let output = self.docker_compose(["ps", "--all", "--format", "json"]).await?;
-			let services = parse_ps_output(&output.stdout).map_err(LifecycleError::ParseError)?;
+			let mut services = parse_ps_output(&output.stdout).map_err(LifecycleError::ParseError)?;
+			flag_networkless_services(&self.project, &mut services).await;
 			let state = aggregate_state(&services);
 			Ok(ContainerStatus { state, services })
 		})
@@ -485,6 +486,13 @@ impl Workspace {
 	///    drops every prior attachment. Reconcile here is the
 	///    only way to re-establish them without touching every
 	///    project's lifecycle.
+	///
+	/// Each project is also healed of running-but-networkless
+	/// containers first (see
+	/// [`ProjectCompose::heal_networkless_services`]) — this is
+	/// the path that repairs them on IDE relaunch, and it must
+	/// run before the `Running` gate below because a networkless
+	/// service drags the project's aggregate to `Failed`.
 	async fn reattach_running_projects(&self) {
 		let dev = dev_container_name(&self.project);
 		for folder in &self.bound_folders {
@@ -496,6 +504,13 @@ impl Workspace {
 					continue;
 				}
 			};
+			if let Err(err) = pc.heal_networkless_services().await {
+				// Keep going: the recreate's error is also visible
+				// through the project's Failed status + per-service
+				// detail, and one broken folder must not block the
+				// other folders' reattach.
+				tracing::warn!(%err, %folder, project = %pc.project(), "networkless heal failed during reattach");
+			}
 			let status = match pc.status().await {
 				Ok(s) => s,
 				Err(err) => {
@@ -918,6 +933,46 @@ impl From<PsEntry> for ServiceStatus {
 			raw_state: entry.state,
 			exit_code: entry.exit_code,
 			health: entry.health,
+			// `compose ps` doesn't report network attachments;
+			// the flag is filled in by `flag_networkless_services`
+			// from a separate `docker ps` probe.
+			networkless: false,
+		}
+	}
+}
+
+/// Cross-check `compose ps`'s view against the network probe and
+/// flag running services whose container holds **no** network
+/// endpoints (see [`crate::network::networkless_running_services`]
+/// for how containers get into that state and why it never
+/// self-resolves).
+///
+/// Best-effort: a probe failure leaves every flag `false` and
+/// logs at `debug` — status reporting must not become less
+/// available than `compose ps` itself just because the extra
+/// probe flaked. Skips the probe entirely when nothing is
+/// running, which keeps the common `Stopped`/`Absent` polls at
+/// one docker invocation.
+pub(crate) async fn flag_networkless_services(project: &ProjectName, services: &mut [ServiceStatus]) {
+	let any_up = services
+		.iter()
+		.any(|svc| matches!(svc.raw_state.as_str(), "running" | "paused" | "restarting"));
+	if !any_up {
+		return;
+	}
+	let networkless = match crate::network::networkless_running_services(project).await {
+		Ok(set) => set,
+		Err(err) => {
+			tracing::debug!(%err, %project, "network probe failed; skipping networkless detection");
+			return;
+		}
+	};
+	if networkless.is_empty() {
+		return;
+	}
+	for svc in services.iter_mut() {
+		if networkless.contains(&svc.name) {
+			svc.networkless = true;
 		}
 	}
 }
@@ -960,7 +1015,11 @@ pub(crate) fn is_stop_signal(exit_code: i32) -> bool {
 ///      `depends_on: service_completed_successfully` consumers
 ///      from ever starting). Signal-termination codes
 ///      (130/137/143; see [`is_stop_signal`]) are treated as a
-///      clean stop, not a failure.
+///      clean stop, not a failure, OR
+///    - any running container holds no network endpoints
+///      (`ServiceStatus::networkless` — wiped by a failed
+///      start; the service is unreachable and needs a
+///      recreate).
 /// 3. `Creating` — any container `restarting`, or a mix of
 ///    `running` + `created` (depends_on chains take time to
 ///    resolve during `compose up`; absent any non-zero exit
@@ -978,6 +1037,7 @@ pub(crate) fn aggregate_state(services: &[ServiceStatus]) -> ContainerState {
 		return ContainerState::Absent;
 	}
 	let mut any_paused = false;
+	let mut any_networkless = false;
 	let mut any_running = false;
 	let mut any_restarting = false;
 	let mut any_dead_or_unknown = false;
@@ -985,6 +1045,9 @@ pub(crate) fn aggregate_state(services: &[ServiceStatus]) -> ContainerState {
 	let mut any_exited_failed = false;
 	let mut any_created = false;
 	for svc in services {
+		if svc.networkless {
+			any_networkless = true;
+		}
 		match svc.raw_state.as_str() {
 			"paused" => any_paused = true,
 			"running" => any_running = true,
@@ -1007,7 +1070,11 @@ pub(crate) fn aggregate_state(services: &[ServiceStatus]) -> ContainerState {
 	if any_paused {
 		return ContainerState::Paused;
 	}
-	if any_dead_or_unknown || any_exited_failed {
+	// A running container with no network endpoints is broken no
+	// matter what its healthcheck says — unreachable by name,
+	// nothing published. Surface it as Failed so the folder-bar
+	// glyph flips instead of showing a green zombie.
+	if any_dead_or_unknown || any_exited_failed || any_networkless {
 		return ContainerState::Failed;
 	}
 	// `running` + `created` is the normal in-progress state
@@ -1049,6 +1116,7 @@ mod tests {
 			raw_state: raw.into(),
 			exit_code: 0,
 			health: String::new(),
+			networkless: false,
 		}
 	}
 
@@ -1058,6 +1126,14 @@ mod tests {
 			raw_state: "exited".into(),
 			exit_code: code,
 			health: String::new(),
+			networkless: false,
+		}
+	}
+
+	fn networkless(name: &str) -> ServiceStatus {
+		ServiceStatus {
+			networkless: true,
+			..svc(name, "running")
 		}
 	}
 
@@ -1288,6 +1364,28 @@ mod tests {
 		assert_eq!(
 			aggregate_state(&[svc("dev", "created"), svc("mongo", "created")]),
 			ContainerState::Stopped,
+		);
+	}
+
+	#[test]
+	fn aggregate_networkless_running_is_failed() {
+		// A running container with no network endpoints is a
+		// zombie — healthy-looking but unreachable. The glyph
+		// must flip even though every raw state says "running".
+		assert_eq!(
+			aggregate_state(&[networkless("mongo"), svc("redis", "running")]),
+			ContainerState::Failed,
+		);
+	}
+
+	#[test]
+	fn aggregate_paused_still_wins_over_networkless() {
+		// Precedence: paused is the user's explicit choice and
+		// stays the headline; the per-service flag carries the
+		// detail.
+		assert_eq!(
+			aggregate_state(&[networkless("mongo"), svc("redis", "paused")]),
+			ContainerState::Paused,
 		);
 	}
 

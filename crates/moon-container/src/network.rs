@@ -51,6 +51,8 @@
 //!
 //! [ADR 0008]: ../../specs/decisions/0008-host-shared-daemon.md
 
+use std::collections::BTreeSet;
+
 use tokio::process::Command;
 
 use crate::lifecycle::LifecycleError;
@@ -138,6 +140,75 @@ where
 	})
 }
 
+/// Compose services of `project` whose container is up but
+/// attached to **no** network at all.
+///
+/// That state is never legitimate — even `network_mode: host` /
+/// `none` report `host` / `none` in `docker ps`'s `Networks`
+/// column. It's the residue of a failed `docker start`: when the
+/// daemon aborts startup mid-way (the classic trigger is a
+/// host-port conflict, "Bind for 0.0.0.0:27017 failed: port is
+/// already allocated"), its rollback wipes the container's
+/// stored endpoint config. Every later plain `start` then
+/// "succeeds" with only a loopback interface, no service-name
+/// DNS, and no published ports — a zombie that looks healthy as
+/// long as its healthcheck talks to `127.0.0.1`. Only a
+/// recreate rebuilds the endpoints; see
+/// `ProjectCompose::heal_networkless_services`.
+///
+/// One `docker ps` round-trip (running containers only — a
+/// stopped container holds no endpoints, so the question is
+/// meaningless for it). Returns a sorted, deduplicated set of
+/// compose service names.
+pub(crate) async fn networkless_running_services(project: &ProjectName) -> Result<BTreeSet<String>, LifecycleError> {
+	let filter = format!("label=com.docker.compose.project={}", project.as_str());
+	let output = Command::new("docker")
+		.args([
+			"ps",
+			"--filter",
+			&filter,
+			"--format",
+			"{{.Label \"com.docker.compose.service\"}}\t{{.Networks}}",
+		])
+		.output()
+		.await
+		.map_err(|err| {
+			if err.kind() == std::io::ErrorKind::NotFound {
+				LifecycleError::DockerMissing
+			} else {
+				LifecycleError::Io(err)
+			}
+		})?;
+	if !output.status.success() {
+		let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+		if stderr.contains("Cannot connect to the Docker daemon") {
+			return Err(LifecycleError::DaemonUnreachable(stderr));
+		}
+		return Err(LifecycleError::DockerCommandFailed {
+			subcommand: "ps".to_owned(),
+			code: output.status.code().unwrap_or(-1),
+			stderr: stderr.trim().to_owned(),
+		});
+	}
+	Ok(parse_networkless_services(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Parse the `<service>\t<networks>` lines emitted by the
+/// `networkless_running_services` probe. Split out for testing.
+fn parse_networkless_services(stdout: &str) -> BTreeSet<String> {
+	let mut out = BTreeSet::new();
+	for line in stdout.lines() {
+		let Some((service, networks)) = line.split_once('\t') else {
+			continue;
+		};
+		let service = service.trim();
+		if !service.is_empty() && networks.trim().is_empty() {
+			out.insert(service.to_owned());
+		}
+	}
+	out
+}
+
 /// "container is already attached to this network" — the wording
 /// the daemon emits varies a bit across Docker / Podman versions
 /// (Docker 24+: "endpoint with name … already exists in network …";
@@ -190,6 +261,29 @@ mod tests {
 		));
 		assert!(is_already_attached("Endpoint already exists"));
 		assert!(!is_already_attached("Error: no such network: mynet"));
+	}
+
+	#[test]
+	fn networkless_probe_flags_only_empty_network_columns() {
+		let stdout = "mongo\t\nredis\tmoon-ws-default-app_default\nproxy\thost\nbatch\tnone\nmulti\tneta,netb\n";
+		let got = parse_networkless_services(stdout);
+		assert_eq!(got.into_iter().collect::<Vec<_>>(), vec!["mongo".to_owned()]);
+	}
+
+	#[test]
+	fn networkless_probe_tolerates_blank_and_malformed_lines() {
+		// No tab at all (docker changed its format?) and fully
+		// blank lines must not panic or produce phantom services.
+		let got = parse_networkless_services("\nmongo\n\t\nweird line without tab\n");
+		assert!(got.is_empty());
+	}
+
+	#[test]
+	fn networkless_probe_dedupes_replicas() {
+		// Two replicas of the same compose service, both broken,
+		// heal with a single `up --force-recreate <svc>`.
+		let got = parse_networkless_services("worker\t\nworker\t\n");
+		assert_eq!(got.len(), 1);
 	}
 
 	#[test]

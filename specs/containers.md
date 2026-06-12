@@ -145,6 +145,33 @@ The per-service "▶" runs `up -d --no-deps <service>`, not `start` —
 partially-failed `up`, while `up -d --no-deps` (re)creates and
 (re)joins the one service idempotently.
 
+### Networkless containers (failed-start residue)
+
+When the daemon aborts a container start midway (classic trigger:
+a host-port conflict — two bound projects both publishing
+`27017:27017`), its rollback wipes the container's stored network
+endpoints. Every later plain start then "succeeds" with only a
+loopback interface: no service-name DNS, no published ports, yet
+`running (healthy)` if the healthcheck talks to `127.0.0.1`. The
+state never self-resolves — compose `start`/`restart`/`up` all
+reuse the wiped endpoint config; only a recreate rebuilds it.
+
+Contract:
+
+- Status reporting cross-checks running containers against a
+  `docker ps` network probe and flags the broken ones
+  (`ServiceStatus.networkless`). A flagged service renders as
+  failed (`· no network` in the popover, red folder glyph) no
+  matter what its healthcheck claims. `network_mode: host`/`none`
+  are not flagged — those report `host`/`none`, not an empty
+  network list.
+- Every lifecycle action that (re)starts containers (project
+  `up`, per-service start/restart, workspace-shell setup/rebuild
+  reconcile) heals first: broken services get
+  `up -d --no-deps --force-recreate <svc>`. If the recreate fails
+  (e.g. the port is _still_ conflicted), that error — the real,
+  actionable one — is surfaced instead of the silent zombie.
+
 Limitations:
 
 - Only the project's **default** network is attached. Explicitly
