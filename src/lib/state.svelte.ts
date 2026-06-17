@@ -125,9 +125,10 @@ export type OpenFile = {
 	// a restart by design.
 	isUntitled: boolean;
 	text: string;
-	// Tauri asset:// URL for image files; empty string for text and
-	// untitled buffers. Text and untitled buffers stream their contents
-	// through `text`, image files render via this URL.
+	// Tauri asset:// URL for binary preview files (images, PDFs); empty
+	// string for text and untitled buffers. Text and untitled buffers
+	// stream their contents through `text`, preview files render via this
+	// URL.
 	previewUrl: string;
 	// Fingerprint of the bytes last known to be on disk. Comparing the
 	// current text's fingerprint against this lets us derive `isDirty`
@@ -1706,7 +1707,10 @@ class WorkspaceState {
 					for (const path of unique) {
 						try {
 							const kind = fileKindFor(path);
-							const file = kind === 'image' ? await this.loadImageFile(path) : await this.loadTextFile(path);
+							const file =
+								kind === 'image' || kind === 'pdf'
+									? await this.loadPreviewFile(path, kind)
+									: await this.loadTextFile(path);
 							if (file) {
 								loaded.push(file);
 							}
@@ -4243,7 +4247,8 @@ class WorkspaceState {
 		if (!existing) {
 			const kind = fileKindFor(path);
 			try {
-				const next = kind === 'image' ? await this.loadImageFile(path) : await this.loadTextFile(path);
+				const next =
+					kind === 'image' || kind === 'pdf' ? await this.loadPreviewFile(path, kind) : await this.loadTextFile(path);
 				if (!next) {
 					return;
 				}
@@ -4495,12 +4500,16 @@ class WorkspaceState {
 		};
 	}
 
-	private async loadImageFile(path: string): Promise<OpenFile> {
+	// Builds a read-only preview buffer for a binary file the webview can
+	// render directly from disk via the Tauri asset protocol (images, PDFs).
+	// The bytes never flow through `text`; the view component reads
+	// `previewUrl`.
+	private async loadPreviewFile(path: string, kind: 'image' | 'pdf'): Promise<OpenFile> {
 		const absolute = await ipc.fs.absolutePath(path);
 		return {
 			path,
 			name: basename(path),
-			kind: 'image',
+			kind,
 			isUntitled: false,
 			text: '',
 			previewUrl: convertFileSrc(absolute),
@@ -5960,11 +5969,11 @@ class WorkspaceState {
 			this.flash('Open a folder before saving.');
 			return;
 		}
-		if (file.kind === 'image') {
-			// Image buffers are read-only previews; "Save As" would need
-			// us to copy bytes through the host, which nobody has asked
-			// for yet. Refuse loudly rather than half-implement.
-			this.flash('Save As is not supported for image files.');
+		if (file.kind === 'image' || file.kind === 'pdf') {
+			// Image / PDF buffers are read-only previews; "Save As" would
+			// need us to copy bytes through the host, which nobody has
+			// asked for yet. Refuse loudly rather than half-implement.
+			this.flash(`Save As is not supported for ${file.kind} files.`);
 			return;
 		}
 

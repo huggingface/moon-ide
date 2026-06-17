@@ -3,6 +3,7 @@
 	import Editor from './Editor.svelte';
 	import DiffView from './DiffView.svelte';
 	import ImageView from './ImageView.svelte';
+	import PdfView from './PdfView.svelte';
 	import MarkdownView from './MarkdownView.svelte';
 	import ReviewView from './ReviewView.svelte';
 	import Welcome from './Welcome.svelte';
@@ -46,6 +47,9 @@
 		}
 		if (file.kind === 'image') {
 			return { path, file, kind: 'image' as const };
+		}
+		if (file.kind === 'pdf') {
+			return { path, file, kind: 'pdf' as const };
 		}
 		// Review view: synthetic `review://…` buffer. Wins over
 		// everything else for that path.
@@ -173,9 +177,13 @@
 		     diag source; the auto-reset effect rebuilds the body on
 		     the next navigation. -->
 		<svelte:boundary onerror={(error, reset) => onBodyError(error, reset)}>
-			{#if view.file && view.kind === 'image'}
-				<!-- Image / Diff / Markdown / Review views build
-			     CodeMirror / image state in `onMount` and don't
+			{#if view.file && view.kind === 'pdf'}
+				{#key view.file.path}
+					<PdfView file={view.file} />
+				{/key}
+			{:else if view.file && view.kind === 'image'}
+				<!-- PDF / Image / Diff / Markdown / Review views build
+			     CodeMirror / canvas / image state in `onMount` and don't
 			     watch `file.path` internally — `Editor` is the
 			     only view that handles path swaps in-place. Key
 			     the others on the path so a tab change behind the

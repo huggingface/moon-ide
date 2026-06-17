@@ -103,6 +103,13 @@ Different jobs, different tools:
 
 The split matters because Pierre Diffs is display-only — forcing it to also edit would either duplicate CM's work or give us a second inferior editor. Keeping CM for every editable surface keeps "what works in the main editor" identical to "what works in the conflict editor".
 
+### Binary file viewers
+
+`util/fileKind.ts` maps a path to a `FileKind` (`text` / `image` / `pdf`); anything not recognised as a previewable binary is `text`. Both binary kinds open as **read-only preview buffers**: `OpenFile.text` stays empty, the bytes never round-trip through the editor, and the buffer carries a `previewUrl` (`convertFileSrc(absolutePath)` — a Tauri asset-protocol URL that streams the on-disk bytes through the active host). All the `kind === 'text'` guards (LSP `didOpen`, blame, HEAD seed, format-on-save, Save As) naturally skip them. Save As is refused with a toast — copying bytes through the host is unimplemented until someone asks.
+
+- **Images** (`ImageView.svelte`): an `<img src={previewUrl}>` on a checkerboard, footer reports natural dimensions.
+- **PDFs** (`PdfView.svelte`): rendered with **pdf.js** (`pdfjs-dist`), one `<canvas>` per page stacked in a scrollable column. We rasterise ourselves rather than embedding an `<iframe>`/`<embed>` because WebKitGTK — the Linux / container webview — ships no native PDF viewer, so a browser-native embed renders blank there. The library (~400 kB) and its worker load lazily on first PDF open (dynamic `import('pdfjs-dist')`) so they stay out of the main bundle. Bytes are fetched from `previewUrl` as an `ArrayBuffer` and handed to pdf.js as `{ data }` (the asset protocol doesn't serve HTTP range requests, which pdf.js's URL path assumes). Read-only — no text selection, search, or zoom controls yet; add them when the team asks.
+
 ### Editor context menu
 
 Right-clicking inside the main `Editor` opens a small `ContextMenu.svelte` popover (the same component the tab strip and file tree use, portaled onto `document.body` so it isn't clipped by the editor's `overflow: hidden`). Today it carries a single action — **Copy GitHub link** — operating on the lines under the current selection (or the caret line when nothing is selected). It routes through `ipc.fs.gitPermalink` → `WorkspaceHost::git_permalink`, which builds a `github.com/<owner>/<repo>/blob/<HEAD-sha>/<path>#L<a>-L<b>` permalink pinned to the current commit SHA (so the link is stable across later commits, matching GitHub's own "Copy permalink"). The menu is suppressed for untitled / external / `review://` buffers — a permalink makes no sense there, so the platform menu shows instead. See [test plan 0091](test-plans/0091-editor-github-permalink.md).
