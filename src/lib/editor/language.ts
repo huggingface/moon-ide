@@ -307,8 +307,14 @@ export async function languageFor(filename: string, firstLine?: string): Promise
 		}
 		case 'yaml':
 		case 'yml': {
-			const { yaml } = await import('@codemirror/legacy-modes/mode/yaml');
-			return [StreamLanguage.define(yaml)];
+			// `@codemirror/lang-yaml` is the official Lezer grammar.
+			// We use it over the legacy `StreamLanguage` mode for the
+			// folding it brings: block mappings and sequences carry
+			// `foldNodeProp`, so the `foldGutter` gets fold markers
+			// for free (the stream mode had no fold info). Highlighting
+			// is also more accurate — anchors, tags, flow collections.
+			const { yaml } = await import('@codemirror/lang-yaml');
+			return [yaml()];
 		}
 		case 'dockerfile': {
 			const { dockerFile } = await import('@codemirror/legacy-modes/mode/dockerfile');

@@ -565,9 +565,9 @@
 			// the line they fold; pulls in `codeFolding()` as a
 			// dependency, so we don't add it separately. Languages
 			// that ship a Lezer grammar (TS/JS, JSON, Rust, Go,
-			// Python, HTML/Svelte, Vue, CSS, Markdown) declare fold
+			// Python, HTML/Svelte, Vue, CSS, Markdown, YAML) declare fold
 			// ranges via `languageData.foldNodeProp` and get folding
-			// for free; legacy `StreamLanguage` modes (TOML, YAML,
+			// for free; legacy `StreamLanguage` modes (TOML,
 			// shell, dockerfile, properties, ignore, dotenv, JSONL)
 			// have no fold info and render an empty marker column —
 			// same behaviour as VS Code for those grammars.

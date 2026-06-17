@@ -66,10 +66,7 @@ const LOADERS: Record<string, () => Promise<Parser>> = {
 		const { shell } = await import('@codemirror/legacy-modes/mode/shell');
 		return StreamLanguage.define(shell).parser;
 	},
-	yaml: async () => {
-		const { yaml } = await import('@codemirror/legacy-modes/mode/yaml');
-		return StreamLanguage.define(yaml).parser;
-	},
+	yaml: async () => (await import('@codemirror/lang-yaml')).yamlLanguage.parser,
 	dockerfile: async () => {
 		const { dockerFile } = await import('@codemirror/legacy-modes/mode/dockerfile');
 		return StreamLanguage.define(dockerFile).parser;
