@@ -897,6 +897,72 @@ impl LocalHost {
 		}
 		Ok(canonical)
 	}
+
+	/// Resolve a write target's parent directory, creating any
+	/// missing intermediate directories (`mkdir -p`) while staying
+	/// inside the workspace root.
+	///
+	/// `resolve` can't help here: it canonicalizes, which requires
+	/// the path to already exist. Instead we walk up to the deepest
+	/// existing ancestor, canonicalize *that* (resolving any symlinks
+	/// and `..` in the existing portion) and confirm it sits inside
+	/// the root, then create the missing tail beneath it. The missing
+	/// components don't exist yet, so they can't be symlinks and can't
+	/// escape the anchor; we still reject a `.`/`..` tail component so
+	/// a crafted relative path can't climb back out before the
+	/// directories are created.
+	async fn resolve_for_write(&self, parent: &Utf8Path) -> MoonResult<Utf8PathBuf> {
+		let candidate = if parent.is_absolute() {
+			parent.to_path_buf()
+		} else {
+			self.root.join(parent)
+		};
+
+		// Walk up until we hit an ancestor we can canonicalize,
+		// collecting the not-yet-existing tail (leaf-first).
+		let mut missing: Vec<String> = Vec::new();
+		let mut cursor = candidate.clone();
+		let anchor = loop {
+			match std::fs::canonicalize(cursor.as_std_path()) {
+				Ok(p) => {
+					break Utf8PathBuf::from_path_buf(p)
+						.map_err(|p| MoonError::Internal(format!("non-utf8 path: {}", p.display())))?;
+				}
+				Err(_) => {
+					// `file_name` is `None` for a `.` / `..` tail, so a
+					// path trying to climb out surfaces as an error
+					// rather than a stray `mkdir`.
+					let name = cursor
+						.file_name()
+						.ok_or_else(|| MoonError::invalid("path component is not a valid directory name"))?;
+					missing.push(name.to_string());
+					cursor = cursor
+						.parent()
+						.ok_or_else(|| MoonError::invalid("path has no parent directory"))?
+						.to_path_buf();
+				}
+			}
+		};
+
+		if !anchor.starts_with(&self.root) {
+			return Err(MoonError::PermissionDenied(format!(
+				"path {anchor} escapes workspace root"
+			)));
+		}
+
+		// Rebuild the tail root-first under the canonical anchor.
+		let mut resolved = anchor;
+		for name in missing.iter().rev() {
+			resolved = resolved.join(name);
+		}
+
+		if !missing.is_empty() {
+			tokio::fs::create_dir_all(resolved.as_std_path())
+				.await
+				.map_err(MoonError::from)?;
+		}
+		Ok(resolved)
+	}
 }
 
 #[async_trait]
@@ -1004,8 +1070,10 @@ impl WorkspaceHost for LocalHost {
 			.parent()
 			.ok_or_else(|| MoonError::invalid("path has no parent directory"))?;
 
-		// The parent must already exist; we don't auto-mkdir here.
-		let resolved_parent = self.resolve(parent)?;
+		// Auto-mkdir the parent chain (`mkdir -p`) so a write to a
+		// not-yet-existing subtree just works; `resolve_for_write`
+		// keeps the creation inside the workspace root.
+		let resolved_parent = self.resolve_for_write(parent).await?;
 		let file_name = candidate
 			.file_name()
 			.ok_or_else(|| MoonError::invalid("path has no file name"))?;
@@ -5340,6 +5408,36 @@ mod tests {
 		h.write_file(Utf8Path::new("a.txt"), "updated").await.unwrap();
 		let r2 = h.read_file(Utf8Path::new("a.txt")).await.unwrap();
 		assert_eq!(r2.text, "updated");
+	}
+
+	#[tokio::test]
+	async fn write_file_creates_missing_parents() {
+		let dir = TempDir::new().unwrap();
+		let h = host(&dir);
+
+		h.write_file(Utf8Path::new("a/b/c/hello.txt"), "hi").await.unwrap();
+
+		assert!(dir.path().join("a/b/c").is_dir());
+		let r = h.read_file(Utf8Path::new("a/b/c/hello.txt")).await.unwrap();
+		assert_eq!(r.text, "hi");
+	}
+
+	#[tokio::test]
+	async fn write_file_mkdir_p_stays_sandboxed() {
+		let dir = TempDir::new().unwrap();
+		let h = host(&dir);
+
+		// A `..` tail that would climb out of the root must be
+		// rejected before any directory is created.
+		let err = h
+			.write_file(Utf8Path::new("../escape/hello.txt"), "x")
+			.await
+			.unwrap_err();
+		assert!(
+			matches!(err, MoonError::InvalidArgument(_) | MoonError::PermissionDenied(_)),
+			"expected a sandbox rejection, got {err:?}"
+		);
+		assert!(!dir.path().parent().unwrap().join("escape").exists());
 	}
 
 	#[tokio::test]

@@ -553,7 +553,7 @@ impl ToolRegistry {
 			),
 			ToolDefinition::function(
 				"write_file",
-				"Overwrite a file with new content (or create it if missing). Use for new files or whole-file rewrites; prefer `edit_file` for surgical changes inside a large file. The file's parent directory must already exist.",
+				"Overwrite a file with new content (or create it if missing). Use for new files or whole-file rewrites; prefer `edit_file` for surgical changes inside a large file. Missing parent directories are created automatically (`mkdir -p`).",
 				json!({
 					"type": "object",
 					"properties": {

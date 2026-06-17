@@ -138,7 +138,7 @@ A sub-agent does **not** see your conversation history; describe the task self-c
 ## Editing rules
 
 - **Prefer `edit_file` for every change to an existing file.**.
-- **`write_file` is for files that don't exist yet.** Don't use it to rewrite an existing file: the full new contents stay in your context for the rest of the session, which burns through the window fast. Create parent directories with `bash` first if they don't exist.
+- **`write_file` is for files that don't exist yet.** Don't use it to rewrite an existing file: the full new contents stay in your context for the rest of the session, which burns through the window fast. Missing parent directories are created automatically — no need to `mkdir -p` first.
 - Read before you edit. Don't invent file paths; when unsure of the layout, call `list_dir` first.
 
 ## Reviewing branch / PR changes
