@@ -2525,7 +2525,7 @@
 					{/if}
 					<div class="subagent-footer">
 						{#if subagent.tokensUsedEstimate > 0}
-							<span class="subagent-tokens">~{subagent.tokensUsedEstimate} tok</span>
+							<span class="subagent-tokens">~{subagent.tokensUsedEstimate.toLocaleString()} tok</span>
 						{:else}
 							<span class="subagent-tokens placeholder">…</span>
 						{/if}
