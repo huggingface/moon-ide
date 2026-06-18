@@ -1533,7 +1533,11 @@ impl CoderHandle {
 		// untouched — the running turn's `messages` is authoritative
 		// and clobbering it would corrupt the next iteration.
 		let already_mounted = fs.runtime(&id).await.is_some();
-		let LoadedSession { header, records } = sessions::load(&dir, &id).await?;
+		let LoadedSession {
+			header,
+			records,
+			record_timestamps,
+		} = sessions::load(&dir, &id).await?;
 		let record_count = records.len();
 
 		let mut messages: Vec<ChatMessage> = vec![ChatMessage::System {
@@ -1778,7 +1782,7 @@ impl CoderHandle {
 		// the sync [`emit_replay_events`] path. Both push into the
 		// same buffer.
 		let mut replay_events: Vec<CoderEvent> = Vec::with_capacity(record_count + 2);
-		for record in records {
+		for (record, record_ts) in records.into_iter().zip(record_timestamps) {
 			match record {
 				SessionRecord::SubagentSpawned {
 					ref tool_call_id,
@@ -1809,7 +1813,7 @@ impl CoderHandle {
 						was_error,
 					});
 				}
-				other => emit_replay_events(&mut replay_events, other),
+				other => emit_replay_events(&mut replay_events, other, record_ts),
 			}
 		}
 		// Surface every orphan tool call as an errored
@@ -1977,6 +1981,7 @@ impl CoderHandle {
 					text,
 					images,
 					queued: true,
+					created_at_ms: Some(current_time_ms()),
 				});
 				return Ok(());
 			}
@@ -2078,6 +2083,7 @@ impl CoderHandle {
 			text: text.clone(),
 			images: images.clone(),
 			queued: false,
+			created_at_ms: Some(current_time_ms()),
 		});
 
 		let state = self.state.clone();
@@ -2713,6 +2719,7 @@ async fn run_turn(
 				id: assistant_id,
 				text: response.content.clone().unwrap_or_default(),
 				thinking: canonical_thinking,
+				created_at_ms: Some(current_time_ms()),
 			});
 		}
 
@@ -2820,6 +2827,7 @@ done, what's still unfinished, and any uncertainty. If the user needs to take a 
 		text: sentinel_text,
 		images: Vec::new(),
 		queued: false,
+		created_at_ms: Some(current_time_ms()),
 	});
 
 	let messages = rt.session.lock().await.messages.clone();
@@ -2873,6 +2881,7 @@ done, what's still unfinished, and any uncertainty. If the user needs to take a 
 			id: assistant_id,
 			text: response.content.clone().unwrap_or_default(),
 			thinking: canonical_thinking,
+			created_at_ms: Some(current_time_ms()),
 		});
 	}
 
@@ -4231,7 +4240,7 @@ fn sanitise_auto_title(raw: &str) -> String {
 /// transcript into a single `Vec` and ships it as one
 /// [`CoderEvent::Replay`], so the frontend pays one IPC crossing
 /// instead of one-per-record.
-fn emit_replay_events(out: &mut Vec<CoderEvent>, record: SessionRecord) {
+fn emit_replay_events(out: &mut Vec<CoderEvent>, record: SessionRecord, created_at_ms: i64) {
 	match record {
 		SessionRecord::User { text, images } => {
 			out.push(CoderEvent::UserMessage {
@@ -4239,6 +4248,7 @@ fn emit_replay_events(out: &mut Vec<CoderEvent>, record: SessionRecord) {
 				text,
 				images,
 				queued: false,
+				created_at_ms: Some(created_at_ms),
 			});
 		}
 		SessionRecord::Assistant {
@@ -4258,6 +4268,7 @@ fn emit_replay_events(out: &mut Vec<CoderEvent>, record: SessionRecord) {
 					id,
 					text: content.unwrap_or_default(),
 					thinking: thinking.filter(|t| !t.is_empty()),
+					created_at_ms: Some(created_at_ms),
 				});
 			}
 			for call in tool_calls {
@@ -4388,7 +4399,7 @@ async fn replay_subagent_spawned(
 		}
 	};
 	let orphan_tool_call_ids = sessions::orphan_tool_call_ids(&loaded.records);
-	for record in loaded.records {
+	for (record, record_ts) in loaded.records.into_iter().zip(loaded.record_timestamps) {
 		// Wrap each replayed event into a `SubagentEvent` so the
 		// frontend routes by `subagent_id` into the per-sub-agent
 		// transcript bucket. Skip records that have no
@@ -4396,7 +4407,7 @@ async fn replay_subagent_spawned(
 		// nested Subagent*) — those only matter for live
 		// runtime / context reconstruction, not for the popped-
 		// out transcript.
-		let inners = subagent_replay_inners(record);
+		let inners = subagent_replay_inners(record, record_ts);
 		for inner in inners {
 			out.push(CoderEvent::SubagentEvent {
 				subagent_id: subagent_id.clone(),
@@ -4428,13 +4439,14 @@ async fn replay_subagent_spawned(
 /// nested SubagentSpawned/Finished) — they'd be ignored by the
 /// frontend reducer anyway, but skipping them here keeps the IPC
 /// chatter down on a long-running sub-agent.
-fn subagent_replay_inners(record: SessionRecord) -> Vec<CoderEvent> {
+fn subagent_replay_inners(record: SessionRecord, created_at_ms: i64) -> Vec<CoderEvent> {
 	match record {
 		SessionRecord::User { text, images } => vec![CoderEvent::UserMessage {
 			id: new_message_id(),
 			text,
 			images,
 			queued: false,
+			created_at_ms: Some(created_at_ms),
 		}],
 		SessionRecord::Assistant {
 			content,
@@ -4454,6 +4466,7 @@ fn subagent_replay_inners(record: SessionRecord) -> Vec<CoderEvent> {
 					id,
 					text: content.unwrap_or_default(),
 					thinking: thinking.filter(|t| !t.is_empty()),
+					created_at_ms: Some(created_at_ms),
 				});
 			}
 			for call in tool_calls {

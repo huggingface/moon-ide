@@ -505,6 +505,7 @@ async fn run_subagent_inner(
 					id: assistant_id.clone(),
 					text: response.content.clone().unwrap_or_default(),
 					thinking: response.thinking.clone(),
+					created_at_ms: Some(current_time_ms()),
 				},
 			));
 		}
@@ -739,6 +740,7 @@ Do not call any more tools. Write a final response now using only what you've al
 				id: assistant_id,
 				text: response.content.clone().unwrap_or_default(),
 				thinking: response.thinking.clone(),
+				created_at_ms: Some(current_time_ms()),
 			},
 		));
 	}

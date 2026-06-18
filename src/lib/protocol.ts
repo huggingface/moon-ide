@@ -1508,12 +1508,25 @@ export type CoderEvent =
 			 *  the chat. Defaults to `false` (every non-steer
 			 *  message). */
 			queued?: boolean;
+			/** Unix-ms creation time. Stamped `now` on a live turn,
+			 *  carried from the persisted record on replay, so a
+			 *  reopened session shows real per-message times. Absent
+			 *  for pre-timestamp sessions. */
+			created_at_ms?: number | null;
 	  }
 	| { kind: 'steer_drained'; id: string }
 	| { kind: 'assistant_message_start'; id: string }
 	| { kind: 'assistant_message_delta'; id: string; delta: string }
 	| { kind: 'assistant_thinking_delta'; id: string; delta: string }
-	| { kind: 'assistant_message_end'; id: string; text: string; thinking?: string | null }
+	| {
+			kind: 'assistant_message_end';
+			id: string;
+			text: string;
+			thinking?: string | null;
+			/** Unix-ms creation time, same contract as
+			 *  `user_message.created_at_ms`. */
+			created_at_ms?: number | null;
+	  }
 	| { kind: 'tool_call'; id: string; name: string; args: unknown }
 	| { kind: 'tool_result'; id: string; result: unknown; is_error: boolean }
 	| { kind: 'turn_complete' }

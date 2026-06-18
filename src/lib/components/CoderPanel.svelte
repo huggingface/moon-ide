@@ -1580,6 +1580,18 @@
 		const months = Math.round(days / 30);
 		return RELATIVE_FORMATTER.format(-months, 'month');
 	}
+
+	// Short wall-clock label (e.g. "14:32") for the hover-revealed
+	// time next to a "you" / "coder" header. The full date rides in
+	// the element's `title` so the terse on-row form stays
+	// unobtrusive.
+	function formatClock(ms: number): string {
+		return new Date(ms).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+	}
+
+	function formatFullTimestamp(ms: number): string {
+		return new Date(ms).toLocaleString();
+	}
 </script>
 
 <div class="panel" data-region="coder">
@@ -2167,7 +2179,11 @@
 		{@const parsed = parseUserPrompt(row.text)}
 		<div class="row user" class:queued={row.queued}>
 			<div class="row-label">
-				you{#if row.queued}<span
+				you{#if row.createdAt > 0}<time
+						class="row-time"
+						datetime={new Date(row.createdAt).toISOString()}
+						title={formatFullTimestamp(row.createdAt)}>{formatClock(row.createdAt)}</time
+					>{/if}{#if row.queued}<span
 						class="queued-tag"
 						title="Waiting for the current turn to finish. Press ↑ on an empty composer to pull it back.">queued</span
 					>{/if}
@@ -2262,7 +2278,13 @@
 		{@const hasText = row.text.trim().length > 0}
 		{#if hasThinking || hasText}
 			<div class="row assistant">
-				<div class="row-label">coder</div>
+				<div class="row-label">
+					coder{#if row.createdAt > 0}<time
+							class="row-time"
+							datetime={new Date(row.createdAt).toISOString()}
+							title={formatFullTimestamp(row.createdAt)}>{formatClock(row.createdAt)}</time
+						>{/if}
+				</div>
 				{#if hasThinking}
 					<!-- Reasoning trace. Open while streaming so the user
 									 sees thoughts land, collapsed once the message
@@ -3100,6 +3122,22 @@
 		text-transform: uppercase;
 		letter-spacing: 0.06em;
 		color: var(--m-fg-subtle);
+	}
+	.row-time {
+		/* Per-message wall-clock time, revealed on row hover so
+			 the "you" / "coder" label stays uncluttered at rest.
+			 The full date is in the element's `title`. */
+		font-size: 10px;
+		text-transform: none;
+		letter-spacing: 0;
+		font-variant-numeric: tabular-nums;
+		color: var(--m-fg-subtle);
+		opacity: 0;
+		transition: opacity 0.1s ease;
+	}
+	.row:hover .row-time,
+	.row-label:focus-within .row-time {
+		opacity: 0.75;
 	}
 	.row-actions {
 		display: inline-flex;

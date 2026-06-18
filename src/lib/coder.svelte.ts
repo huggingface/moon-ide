@@ -74,8 +74,23 @@ export type CoderRow =
 			 *  targets queued rows. Flips to `false` on the
 			 *  matching `steer_drained` event. */
 			queued: boolean;
+			/** Unix-ms creation time, for the hover-revealed time
+			 *  next to the "You" header. From the event's
+			 *  `created_at_ms` (live `now` or persisted on replay);
+			 *  falls back to receive time for pre-timestamp
+			 *  sessions. */
+			createdAt: number;
 	  }
-	| { kind: 'assistant'; id: string; text: string; thinking: string; thinkingOpen: boolean }
+	| {
+			kind: 'assistant';
+			id: string;
+			text: string;
+			thinking: string;
+			thinkingOpen: boolean;
+			/** Unix-ms creation time, for the hover-revealed time
+			 *  next to the "Coder" header. See `user.createdAt`. */
+			createdAt: number;
+	  }
 	| {
 			kind: 'tool';
 			id: string;
@@ -2368,6 +2383,7 @@ class CoderPanelState {
 					text: event.text,
 					images: event.images ?? [],
 					queued: event.queued ?? false,
+					createdAt: event.created_at_ms ?? Date.now(),
 				});
 				session.busy = true;
 				// Mirror the backend's `updated_at_ms` bump (every
@@ -2417,7 +2433,14 @@ class CoderPanelState {
 				if (findRowById(session.rows, event.id)?.kind === 'assistant') {
 					return;
 				}
-				session.rows.push({ kind: 'assistant', id: event.id, text: '', thinking: '', thinkingOpen: true });
+				session.rows.push({
+					kind: 'assistant',
+					id: event.id,
+					text: '',
+					thinking: '',
+					thinkingOpen: true,
+					createdAt: Date.now(),
+				});
 				return;
 			case 'assistant_message_delta':
 				appendDelta(session.rows, event.id, event.delta, 'text');
@@ -2439,6 +2462,13 @@ class CoderPanelState {
 						row.text = event.text;
 						row.thinking = event.thinking ?? row.thinking;
 						row.thinkingOpen = false;
+						// Replay carries the persisted time on `end`
+						// (there's no separate `start` timing on disk);
+						// pin it so a reopened session shows the real
+						// time instead of the reopen-time `start` stamp.
+						if (event.created_at_ms) {
+							row.createdAt = event.created_at_ms;
+						}
 					}
 				}
 				return;
@@ -2865,7 +2895,14 @@ function applyInnerEventToRows(rows: CoderRow[], event: CoderEvent): void {
 	switch (event.kind) {
 		case 'assistant_message_start':
 			if (findRowById(rows, event.id)?.kind !== 'assistant') {
-				rows.push({ kind: 'assistant', id: event.id, text: '', thinking: '', thinkingOpen: true });
+				rows.push({
+					kind: 'assistant',
+					id: event.id,
+					text: '',
+					thinking: '',
+					thinkingOpen: true,
+					createdAt: Date.now(),
+				});
 			}
 			return;
 		case 'assistant_message_delta':
@@ -2880,6 +2917,9 @@ function applyInnerEventToRows(rows: CoderRow[], event: CoderEvent): void {
 				row.text = event.text;
 				row.thinking = event.thinking ?? row.thinking;
 				row.thinkingOpen = false;
+				if (event.created_at_ms) {
+					row.createdAt = event.created_at_ms;
+				}
 			}
 			return;
 		}
@@ -3124,6 +3164,7 @@ function appendDelta(rows: CoderRow[], id: string, delta: string, field: 'text' 
 		text: field === 'text' ? delta : '',
 		thinking: field === 'thinking' ? delta : '',
 		thinkingOpen: true,
+		createdAt: Date.now(),
 	});
 }
 

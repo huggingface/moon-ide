@@ -1312,6 +1312,16 @@ pub struct SessionSummary {
 pub struct LoadedSession {
 	pub header: SessionHeader,
 	pub records: Vec<SessionRecord>,
+	/// Per-record creation time in Unix-ms, aligned 1:1 with
+	/// `records` (a single JSONL line that fans out to two records
+	/// — an assistant row carrying a folded `usage` block — stamps
+	/// both with the line's timestamp). Read off the persisted
+	/// `timestamp` field; falls back to the header's creation time
+	/// for pre-timestamp (schema < 3) lines. Used by the replay
+	/// path to stamp the historical `created_at_ms` onto the
+	/// reconstructed `UserMessage` / `AssistantMessageEnd` events so
+	/// a reopened session shows real per-message times.
+	pub record_timestamps: Vec<i64>,
 }
 
 /// Resolve the sessions directory for one workspace folder under
@@ -1601,6 +1611,7 @@ pub async fn load(dir: &Utf8Path, id: &str) -> Result<LoadedSession, CoderError>
 		header.updated_at_ms = mtime_ms;
 	}
 	let mut records: Vec<SessionRecord> = Vec::new();
+	let mut record_timestamps: Vec<i64> = Vec::new();
 	let mut line = String::new();
 	loop {
 		line.clear();
@@ -1614,11 +1625,13 @@ pub async fn load(dir: &Utf8Path, id: &str) -> Result<LoadedSession, CoderError>
 		}
 		match serde_json::from_str::<serde_json::Value>(trimmed) {
 			Ok(value) => {
+				let line_ts = wire_line_timestamp_ms(&value).unwrap_or(header.created_at_ms);
 				for rec in pi_wire_to_records(&value) {
 					if let SessionRecord::TitleUpdate { title } = &rec {
 						header.title = title.clone();
 					}
 					records.push(rec);
+					record_timestamps.push(line_ts);
 				}
 			}
 			Err(err) => {
@@ -1626,7 +1639,24 @@ pub async fn load(dir: &Utf8Path, id: &str) -> Result<LoadedSession, CoderError>
 			}
 		}
 	}
-	Ok(LoadedSession { header, records })
+	Ok(LoadedSession {
+		header,
+		records,
+		record_timestamps,
+	})
+}
+
+/// Pull the creation timestamp (Unix-ms) off one pi-wire JSONL
+/// row, reading the per-message `timestamp` (the number we write on
+/// every message). Returns `None` for rows without one — compaction
+/// rows (no `message`, and they don't surface a per-row time in the
+/// UI) and pre-timestamp (schema < 3) lines — so the caller falls
+/// back to the header's creation time.
+fn wire_line_timestamp_ms(value: &serde_json::Value) -> Option<i64> {
+	value
+		.get("message")
+		.and_then(|m| m.get("timestamp"))
+		.and_then(|v| v.as_i64())
 }
 
 /// Append one record to a session's JSONL file. Creates the file

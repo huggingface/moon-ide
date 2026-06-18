@@ -495,7 +495,11 @@ weight and we omit it. What we do carry from pi v3:
   the row is flushed in `append_record`. Records are not stamped
   in-memory, so the rare revert/rewrite path re-stamps surviving
   rows with the rewrite instant rather than preserving the
-  originals.
+  originals. The `UserMessage` / `AssistantMessageEnd` events carry
+  the same time as `created_at_ms` (live `now`, persisted on
+  replay), and the panel reveals it as a wall-clock label next to
+  the `you` / `coder` header on row hover (full date in the
+  `title`).
 - `stopReason` on assistant rows (`stop` | `length` | `toolUse` |
   `error` | `aborted`), normalised from the provider's finish/stop
   reason by `inference::normalize_stop_reason`.

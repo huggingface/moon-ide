@@ -67,6 +67,13 @@ pub enum CoderEvent {
 		images: Vec<crate::inference::ImageAttachment>,
 		#[serde(default, skip_serializing_if = "std::ops::Not::not")]
 		queued: bool,
+		/// Unix-ms creation time. Stamped `now` on a live turn and
+		/// carried verbatim from the persisted record on replay, so
+		/// a reopened session shows real per-message times. `None`
+		/// only for pre-timestamp sessions; the panel then falls
+		/// back to wall-clock receive time.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		created_at_ms: Option<i64>,
 	},
 
 	/// A previously-queued steer has been drained into the chat
@@ -112,6 +119,12 @@ pub enum CoderEvent {
 		text: String,
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		thinking: Option<String>,
+		/// Unix-ms creation time, same contract as
+		/// [`UserMessage::created_at_ms`]: `now` live, persisted on
+		/// replay. The panel pins it onto the assistant row so the
+		/// header time survives a reopen.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		created_at_ms: Option<i64>,
 	},
 
 	/// The model issued a tool call. Fires before the tool runs so
