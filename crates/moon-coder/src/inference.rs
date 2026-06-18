@@ -480,6 +480,37 @@ pub struct AssistantResponse {
 	/// message — see `response_to_message` in `runner.rs`.
 	#[serde(default, skip_serializing)]
 	pub usage: Option<TokenUsage>,
+	/// Provider-reported stop reason, normalised to pi's
+	/// `stopReason` vocabulary via [`normalize_stop_reason`]
+	/// (`stop` | `length` | `toolUse` | `error` | `aborted`).
+	/// Populated by each provider's finalize path; `None` only on
+	/// the test fixtures that build a response by hand. Persisted
+	/// onto the session JSONL's assistant row (not echoed back to
+	/// the model — skipped on serialization like `usage`).
+	#[serde(default, skip_serializing)]
+	pub stop_reason: Option<String>,
+}
+
+/// Normalise a provider-reported finish/stop reason into pi's
+/// `stopReason` vocabulary: `stop` | `length` | `toolUse` |
+/// `error` | `aborted`. Covers the OpenAI chat-completions values
+/// (`stop` / `length` / `tool_calls` / `content_filter`) and the
+/// Anthropic Messages values (`end_turn` / `max_tokens` /
+/// `stop_sequence` / `tool_use` / `pause_turn` / `refusal`). When
+/// the provider omitted the field or sent something we don't
+/// recognise, fall back to the structural signal: a turn that
+/// emitted tool calls is `toolUse`, otherwise `stop`.
+pub(crate) fn normalize_stop_reason(raw: Option<&str>, has_tool_calls: bool) -> String {
+	let mapped = match raw.map(str::trim) {
+		Some("tool_calls") | Some("tool_use") => Some("toolUse"),
+		Some("length") | Some("max_tokens") | Some("model_length") => Some("length"),
+		Some("content_filter") | Some("refusal") => Some("error"),
+		Some("stop") | Some("end_turn") | Some("stop_sequence") | Some("pause_turn") => Some("stop"),
+		_ => None,
+	};
+	mapped
+		.unwrap_or(if has_tool_calls { "toolUse" } else { "stop" })
+		.to_string()
 }
 
 /// One SSE chunk in the OpenAI streaming shape. Fields use the same
@@ -506,12 +537,12 @@ struct StreamChoice {
 	delta: StreamDelta,
 	/// Provider-reported reason for the stream end (`stop`,
 	/// `tool_calls`, `length`, …). The runner doesn't branch on
-	/// this — `tool_calls.is_empty()` already tells us whether to
-	/// recurse — but we accept the field so the parser doesn't
-	/// reject the chunk that carries it.
-	#[serde(default, rename = "finish_reason")]
-	#[allow(dead_code)]
-	_finish_reason: Option<String>,
+	/// this to decide recursion — `tool_calls.is_empty()` already
+	/// tells us that — but the streaming accumulator captures the
+	/// last non-null value to stamp `stopReason` on the persisted
+	/// assistant record.
+	#[serde(default)]
+	finish_reason: Option<String>,
 }
 
 /// Per-chunk delta. Every field is optional — a chunk may carry
@@ -979,8 +1010,13 @@ impl InferenceClient {
 			.into_iter()
 			.next()
 			.map(|c| {
+				let finish_reason = c.finish_reason;
 				let mut msg = c.message;
 				msg.usage = usage;
+				msg.stop_reason = Some(normalize_stop_reason(
+					finish_reason.as_deref(),
+					!msg.tool_calls.is_empty(),
+				));
 				msg
 			})
 			.ok_or_else(|| CoderError::decode(&endpoint, "response had no choices"))
@@ -1163,6 +1199,7 @@ where
 	let mut thinking_buf = String::new();
 	let mut tool_call_bufs: Vec<ToolCallBuffer> = Vec::new();
 	let mut usage: Option<TokenUsage> = None;
+	let mut finish_reason: Option<String> = None;
 	let mut byte_stream = response.bytes_stream();
 	let mut sse_buf: Vec<u8> = Vec::new();
 
@@ -1188,7 +1225,13 @@ where
 				.map_err(|err| CoderError::decode("inference stream", format!("invalid utf-8 in SSE event: {err}")))?;
 			for data in extract_data_lines(event_text) {
 				if data == "[DONE]" {
-					return Ok(finalize_response(content_buf, thinking_buf, tool_call_bufs, usage));
+					return Ok(finalize_response(
+						content_buf,
+						thinking_buf,
+						tool_call_bufs,
+						usage,
+						finish_reason,
+					));
 				}
 				let chunk: StreamChunk = serde_json::from_str(data).map_err(|err| {
 					CoderError::decode(
@@ -1197,6 +1240,9 @@ where
 					)
 				})?;
 				accumulate_chunk(&chunk, &mut content_buf, &mut thinking_buf, &mut tool_call_bufs);
+				if let Some(reason) = chunk.choices.first().and_then(|c| c.finish_reason.clone()) {
+					finish_reason = Some(reason);
+				}
 				if let Some(u) = chunk.usage {
 					// Last-write-wins: providers occasionally emit a
 					// usage block on multiple chunks (e.g. thinking
@@ -1211,7 +1257,13 @@ where
 
 	// Some providers close the stream without an explicit `[DONE]`
 	// — treat clean EOF as success.
-	Ok(finalize_response(content_buf, thinking_buf, tool_call_bufs, usage))
+	Ok(finalize_response(
+		content_buf,
+		thinking_buf,
+		tool_call_bufs,
+		usage,
+		finish_reason,
+	))
 }
 
 /// Working state for one in-progress tool call. Only `arguments` is
@@ -1316,25 +1368,29 @@ fn finalize_response(
 	thinking: String,
 	tool_calls: Vec<ToolCallBuffer>,
 	usage: Option<TokenUsage>,
+	finish_reason: Option<String>,
 ) -> AssistantResponse {
+	let tool_calls: Vec<ToolCall> = tool_calls
+		.into_iter()
+		.filter(|b| !b.id.is_empty() || !b.name.is_empty())
+		.map(|b| ToolCall {
+			id: b.id,
+			kind: if b.kind.is_empty() { default_tool_type() } else { b.kind },
+			function: FunctionCall {
+				name: b.name,
+				arguments: b.arguments,
+			},
+		})
+		.collect();
+	let stop_reason = Some(normalize_stop_reason(finish_reason.as_deref(), !tool_calls.is_empty()));
 	AssistantResponse {
 		content: if content.is_empty() { None } else { Some(content) },
 		thinking: if thinking.is_empty() { None } else { Some(thinking) },
 		// OpenAI-compat providers don't emit signed reasoning blocks.
 		thinking_blocks: Vec::new(),
-		tool_calls: tool_calls
-			.into_iter()
-			.filter(|b| !b.id.is_empty() || !b.name.is_empty())
-			.map(|b| ToolCall {
-				id: b.id,
-				kind: if b.kind.is_empty() { default_tool_type() } else { b.kind },
-				function: FunctionCall {
-					name: b.name,
-					arguments: b.arguments,
-				},
-			})
-			.collect(),
+		tool_calls,
 		usage,
+		stop_reason,
 	}
 }
 
@@ -1640,6 +1696,24 @@ mod tests {
 	}
 
 	#[test]
+	fn normalize_stop_reason_maps_provider_vocabularies() {
+		// OpenAI chat-completions values.
+		assert_eq!(normalize_stop_reason(Some("stop"), false), "stop");
+		assert_eq!(normalize_stop_reason(Some("tool_calls"), false), "toolUse");
+		assert_eq!(normalize_stop_reason(Some("length"), false), "length");
+		assert_eq!(normalize_stop_reason(Some("content_filter"), false), "error");
+		// Anthropic Messages values.
+		assert_eq!(normalize_stop_reason(Some("end_turn"), false), "stop");
+		assert_eq!(normalize_stop_reason(Some("tool_use"), true), "toolUse");
+		assert_eq!(normalize_stop_reason(Some("max_tokens"), false), "length");
+		assert_eq!(normalize_stop_reason(Some("refusal"), false), "error");
+		// Missing / unrecognised falls back to the structural signal.
+		assert_eq!(normalize_stop_reason(None, true), "toolUse");
+		assert_eq!(normalize_stop_reason(None, false), "stop");
+		assert_eq!(normalize_stop_reason(Some("weird_new_reason"), false), "stop");
+	}
+
+	#[test]
 	fn extract_data_handles_multi_data_lines() {
 		// SSE allows multiple `data:` lines per event; the spec
 		// joins them with `\n`. OpenAI doesn't do this in practice,
@@ -1655,7 +1729,7 @@ mod tests {
 		// gets an id or name. Filter it so the chat-history append
 		// doesn't carry a phantom call.
 		let buf = vec![ToolCallBuffer::default()];
-		let resp = finalize_response(String::new(), String::new(), buf, None);
+		let resp = finalize_response(String::new(), String::new(), buf, None, None);
 		assert!(resp.tool_calls.is_empty());
 		assert!(resp.content.is_none());
 		assert!(resp.thinking.is_none());
@@ -1707,7 +1781,7 @@ mod tests {
 			let chunk: StreamChunk = serde_json::from_str(raw).unwrap();
 			accumulate_chunk(&chunk, &mut content, &mut thinking, &mut tcs);
 		}
-		let resp = finalize_response(content, thinking, tcs, None);
+		let resp = finalize_response(content, thinking, tcs, None, None);
 		assert_eq!(resp.tool_calls.len(), 1);
 		assert_eq!(resp.tool_calls[0].id, "call_x");
 		assert_eq!(resp.tool_calls[0].function.name, "read_file");
@@ -1737,7 +1811,7 @@ mod tests {
 			let chunk: StreamChunk = serde_json::from_str(arg_chunk_with_id).unwrap();
 			accumulate_chunk(&chunk, &mut content, &mut thinking, &mut tcs);
 		}
-		let resp = finalize_response(content, thinking, tcs, None);
+		let resp = finalize_response(content, thinking, tcs, None, None);
 		assert_eq!(resp.tool_calls.len(), 1);
 		assert_eq!(
 			resp.tool_calls[0].id, "call_x",
@@ -1776,7 +1850,7 @@ mod tests {
 			let chunk: StreamChunk = serde_json::from_str(raw).unwrap();
 			accumulate_chunk(&chunk, &mut content, &mut thinking, &mut tcs);
 		}
-		let resp = finalize_response(content, thinking, tcs, None);
+		let resp = finalize_response(content, thinking, tcs, None, None);
 		assert_eq!(resp.content.as_deref(), Some("Hello"));
 		assert_eq!(resp.thinking.as_deref(), Some("Let me think. Maybe a plan helps."));
 	}

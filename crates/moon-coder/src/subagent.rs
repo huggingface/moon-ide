@@ -527,6 +527,7 @@ async fn run_subagent_inner(
 					thinking_blocks: response.thinking_blocks.clone(),
 					tool_calls: response.tool_calls.clone(),
 					model: Some(pi_model.clone()),
+					stop_reason: response.stop_reason.clone(),
 				},
 			)
 			.await;
@@ -594,6 +595,7 @@ async fn run_subagent_inner(
 				&header,
 				&SessionRecord::Tool {
 					tool_call_id: call.id.clone(),
+					tool_name: call.function.name.clone(),
 					content,
 				},
 			)
@@ -753,6 +755,7 @@ Do not call any more tools. Write a final response now using only what you've al
 				thinking_blocks: response.thinking_blocks.clone(),
 				tool_calls: response.tool_calls.clone(),
 				model: Some(pi_model.to_string()),
+				stop_reason: response.stop_reason.clone(),
 			},
 		)
 		.await;

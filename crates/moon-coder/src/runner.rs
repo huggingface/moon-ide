@@ -1568,6 +1568,7 @@ impl CoderHandle {
 					thinking_blocks,
 					thinking: _,
 					model: _,
+					stop_reason: _,
 				} => {
 					messages.push(ChatMessage::Assistant {
 						content: content.clone(),
@@ -1575,7 +1576,11 @@ impl CoderHandle {
 						tool_calls: tool_calls.clone(),
 					});
 				}
-				SessionRecord::Tool { tool_call_id, content } => {
+				SessionRecord::Tool {
+					tool_call_id,
+					tool_name: _,
+					content,
+				} => {
 					messages.push(ChatMessage::Tool {
 						tool_call_id: tool_call_id.clone(),
 						content: content.clone(),
@@ -2944,7 +2949,7 @@ async fn dispatch_tool_calls(
 			} else {
 				state.tools.dispatch(&call.function.name, &args, cx, cancel).await
 			};
-			finish_tool_call(rt, sink, &call.id, outcome).await?;
+			finish_tool_call(rt, sink, &call.id, &call.function.name, outcome).await?;
 		}
 		Ok(())
 	}
@@ -3008,7 +3013,7 @@ async fn dispatch_subagent_batch(
 				call.id
 			))),
 		};
-		finish_tool_call(rt, sink, &call.id, outcome).await?;
+		finish_tool_call(rt, sink, &call.id, &call.function.name, outcome).await?;
 	}
 	Ok(())
 }
@@ -3333,7 +3338,7 @@ async fn recover_in_memory_orphans(rt: &Arc<SessionRuntime>, sink: &FolderEventS
 	// Snapshot the orphan ids under the session lock, then drop
 	// it before we hit the disk / event sink. Persistence
 	// re-acquires the lock briefly per record, which is cheap.
-	let orphan_ids: Vec<String> = {
+	let orphans: Vec<(String, String)> = {
 		let session = rt.session.lock().await;
 		let mut completed: std::collections::HashSet<&str> = std::collections::HashSet::new();
 		for msg in &session.messages {
@@ -3341,32 +3346,32 @@ async fn recover_in_memory_orphans(rt: &Arc<SessionRuntime>, sink: &FolderEventS
 				completed.insert(tool_call_id.as_str());
 			}
 		}
-		let mut orphans: Vec<String> = Vec::new();
+		let mut orphans: Vec<(String, String)> = Vec::new();
 		for msg in &session.messages {
 			if let ChatMessage::Assistant { tool_calls, .. } = msg {
 				for call in tool_calls {
 					if !completed.contains(call.id.as_str()) {
-						orphans.push(call.id.clone());
+						orphans.push((call.id.clone(), call.function.name.clone()));
 					}
 				}
 			}
 		}
 		orphans
 	};
-	if orphan_ids.is_empty() {
+	if orphans.is_empty() {
 		return;
 	}
 	{
 		let mut session = rt.session.lock().await;
-		for id in &orphan_ids {
+		for (id, _) in &orphans {
 			session.messages.push(ChatMessage::Tool {
 				tool_call_id: id.clone(),
 				content: sessions::INTERRUPTED_TOOL_RESULT_JSON.to_string(),
 			});
 		}
 	}
-	for id in &orphan_ids {
-		persist_tool_record(rt, id, sessions::INTERRUPTED_TOOL_RESULT_JSON).await;
+	for (id, name) in &orphans {
+		persist_tool_record(rt, id, name, sessions::INTERRUPTED_TOOL_RESULT_JSON).await;
 		sink.send(CoderEvent::ToolResult {
 			id: id.clone(),
 			result: serde_json::json!({ "error": "Interrupted before tool completed." }),
@@ -3381,6 +3386,7 @@ async fn finish_tool_call(
 	rt: &Arc<SessionRuntime>,
 	sink: &FolderEventSink,
 	tool_call_id: &str,
+	tool_name: &str,
 	outcome: Result<Value, CoderError>,
 ) -> Result<(), CoderError> {
 	match outcome {
@@ -3395,7 +3401,7 @@ async fn finish_tool_call(
 				tool_call_id: tool_call_id.to_string(),
 				content: content.clone(),
 			});
-			persist_tool_record(rt, tool_call_id, &content).await;
+			persist_tool_record(rt, tool_call_id, tool_name, &content).await;
 			Ok(())
 		}
 		Err(CoderError::Aborted) => Err(CoderError::Aborted),
@@ -3411,7 +3417,7 @@ async fn finish_tool_call(
 				tool_call_id: tool_call_id.to_string(),
 				content: content.clone(),
 			});
-			persist_tool_record(rt, tool_call_id, &content).await;
+			persist_tool_record(rt, tool_call_id, tool_name, &content).await;
 			Ok(())
 		}
 	}
@@ -3742,6 +3748,7 @@ async fn persist_assistant_record(rt: &Arc<SessionRuntime>, response: &Assistant
 		thinking_blocks: response.thinking_blocks.clone(),
 		tool_calls: response.tool_calls.clone(),
 		model: pi_model,
+		stop_reason: response.stop_reason.clone(),
 	};
 	if let Err(err) = sessions::append_record(&dir, &header, &record).await {
 		tracing::warn!(error = %err, "failed to persist assistant message");
@@ -3787,7 +3794,7 @@ async fn persist_usage_record(rt: &Arc<SessionRuntime>, response: &AssistantResp
 	}
 }
 
-async fn persist_tool_record(rt: &Arc<SessionRuntime>, tool_call_id: &str, content: &str) {
+async fn persist_tool_record(rt: &Arc<SessionRuntime>, tool_call_id: &str, tool_name: &str, content: &str) {
 	let (dir, header) = {
 		let session = rt.session.lock().await;
 		let Some(dir) = session.session_dir.clone() else {
@@ -3797,6 +3804,7 @@ async fn persist_tool_record(rt: &Arc<SessionRuntime>, tool_call_id: &str, conte
 	};
 	let record = SessionRecord::Tool {
 		tool_call_id: tool_call_id.to_string(),
+		tool_name: tool_name.to_string(),
 		content: content.to_string(),
 	};
 	if let Err(err) = sessions::append_record(&dir, &header, &record).await {
@@ -4239,6 +4247,7 @@ fn emit_replay_events(out: &mut Vec<CoderEvent>, record: SessionRecord) {
 			thinking_blocks: _,
 			tool_calls,
 			model: _,
+			stop_reason: _,
 		} => {
 			let id = new_message_id();
 			let has_text = content.as_deref().map(|t| !t.is_empty()).unwrap_or(false);
@@ -4260,7 +4269,11 @@ fn emit_replay_events(out: &mut Vec<CoderEvent>, record: SessionRecord) {
 				});
 			}
 		}
-		SessionRecord::Tool { tool_call_id, content } => {
+		SessionRecord::Tool {
+			tool_call_id,
+			tool_name: _,
+			content,
+		} => {
 			// `content` may not be valid JSON (the model wrote
 			// raw bytes for a tool output we serialised as a
 			// fallback). In that case, surface the raw string —
@@ -4429,6 +4442,7 @@ fn subagent_replay_inners(record: SessionRecord) -> Vec<CoderEvent> {
 			thinking_blocks: _,
 			tool_calls,
 			model: _,
+			stop_reason: _,
 		} => {
 			let mut out = Vec::new();
 			let id = new_message_id();
@@ -4452,7 +4466,11 @@ fn subagent_replay_inners(record: SessionRecord) -> Vec<CoderEvent> {
 			}
 			out
 		}
-		SessionRecord::Tool { tool_call_id, content } => {
+		SessionRecord::Tool {
+			tool_call_id,
+			tool_name: _,
+			content,
+		} => {
 			let result = match serde_json::from_str::<Value>(&content) {
 				Ok(value) => value,
 				Err(_) => Value::String(content),
@@ -5253,6 +5271,7 @@ mod tests {
 			thinking_blocks: Vec::new(),
 			tool_calls: Vec::new(),
 			usage: None,
+			stop_reason: None,
 		};
 		assert!(assistant_response_is_empty(&empty));
 
@@ -5265,6 +5284,7 @@ mod tests {
 			thinking_blocks: Vec::new(),
 			tool_calls: Vec::new(),
 			usage: None,
+			stop_reason: None,
 		};
 		assert!(assistant_response_is_empty(&whitespace));
 	}
@@ -5278,6 +5298,7 @@ mod tests {
 			thinking_blocks: Vec::new(),
 			tool_calls: Vec::new(),
 			usage: None,
+			stop_reason: None,
 		};
 		assert!(!assistant_response_is_empty(&text));
 
@@ -5288,6 +5309,7 @@ mod tests {
 			thinking_blocks: Vec::new(),
 			tool_calls: Vec::new(),
 			usage: None,
+			stop_reason: None,
 		};
 		assert!(!assistant_response_is_empty(&thinking));
 
@@ -5305,6 +5327,7 @@ mod tests {
 				},
 			}],
 			usage: None,
+			stop_reason: None,
 		};
 		assert!(!assistant_response_is_empty(&tool_only));
 	}
@@ -5443,6 +5466,7 @@ mod tests {
 					_ => unreachable!(),
 				},
 				model: None,
+				stop_reason: None,
 			},
 		)
 		.await
@@ -5475,7 +5499,11 @@ mod tests {
 		assert!(sessions::orphan_tool_call_ids(&loaded.records).is_empty());
 		let last_record = loaded.records.last().expect("at least one record");
 		match last_record {
-			SessionRecord::Tool { tool_call_id, content } => {
+			SessionRecord::Tool {
+				tool_call_id,
+				content,
+				tool_name: _,
+			} => {
 				assert_eq!(tool_call_id, "call-1");
 				assert_eq!(content, sessions::INTERRUPTED_TOOL_RESULT_JSON);
 			}

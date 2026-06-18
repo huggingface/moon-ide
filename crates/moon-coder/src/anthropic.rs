@@ -649,6 +649,10 @@ struct StreamState {
 	/// `thinking_blocks` for the block currently streaming.
 	block_to_thinking: HashMap<u32, usize>,
 	usage: Option<TokenUsage>,
+	/// Raw Anthropic `stop_reason` from the terminal `message_delta`
+	/// event (`end_turn` / `tool_use` / `max_tokens` / …),
+	/// normalised in `finalize`.
+	stop_reason: Option<String>,
 }
 
 #[derive(Default)]
@@ -744,7 +748,10 @@ impl StreamState {
 				BlockDelta::Other => {}
 			},
 			StreamEventBody::ContentBlockStop { .. } => {}
-			StreamEventBody::MessageDelta { usage, .. } => {
+			StreamEventBody::MessageDelta { delta, usage } => {
+				if let Some(reason) = delta.get("stop_reason").and_then(|v| v.as_str()) {
+					self.stop_reason = Some(reason.to_string());
+				}
 				if let Some(u) = usage {
 					self.usage = Some(merge_usage(self.usage, u));
 				}
@@ -766,6 +773,27 @@ impl StreamState {
 	}
 
 	fn finalize(self) -> AssistantResponse {
+		let tool_calls: Vec<ToolCall> = self
+			.tool_calls
+			.into_iter()
+			.filter(|b| !b.id.is_empty() || !b.name.is_empty())
+			.map(|b| ToolCall {
+				id: b.id,
+				kind: "function".into(),
+				function: FunctionCall {
+					name: b.name,
+					arguments: if b.arguments.is_empty() {
+						"{}".into()
+					} else {
+						b.arguments
+					},
+				},
+			})
+			.collect();
+		let stop_reason = Some(crate::inference::normalize_stop_reason(
+			self.stop_reason.as_deref(),
+			!tool_calls.is_empty(),
+		));
 		AssistantResponse {
 			content: if self.content.is_empty() {
 				None
@@ -778,24 +806,9 @@ impl StreamState {
 				Some(self.thinking)
 			},
 			thinking_blocks: self.thinking_blocks.into_iter().filter(keep_thinking_block).collect(),
-			tool_calls: self
-				.tool_calls
-				.into_iter()
-				.filter(|b| !b.id.is_empty() || !b.name.is_empty())
-				.map(|b| ToolCall {
-					id: b.id,
-					kind: "function".into(),
-					function: FunctionCall {
-						name: b.name,
-						arguments: if b.arguments.is_empty() {
-							"{}".into()
-						} else {
-							b.arguments
-						},
-					},
-				})
-				.collect(),
+			tool_calls,
 			usage: self.usage,
+			stop_reason,
 		}
 	}
 }
@@ -868,7 +881,6 @@ enum StreamEventBody {
 		index: u32,
 	},
 	MessageDelta {
-		#[allow(dead_code)]
 		#[serde(default)]
 		delta: serde_json::Value,
 		#[serde(default)]
@@ -964,6 +976,8 @@ struct NonStreamResponse {
 	content: Vec<NonStreamBlock>,
 	#[serde(default)]
 	usage: Option<AnthropicUsage>,
+	#[serde(default)]
+	stop_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -995,6 +1009,7 @@ enum NonStreamBlock {
 
 impl NonStreamResponse {
 	fn into_assistant_response(self) -> AssistantResponse {
+		let stop_reason_raw = self.stop_reason.clone();
 		let mut content = String::new();
 		let mut thinking = String::new();
 		let mut thinking_blocks: Vec<ThinkingBlock> = Vec::new();
@@ -1046,12 +1061,17 @@ impl NonStreamResponse {
 			out.total_tokens = out.prompt_tokens.saturating_add(out.completion_tokens);
 			out
 		});
+		let stop_reason = Some(crate::inference::normalize_stop_reason(
+			stop_reason_raw.as_deref(),
+			!tool_calls.is_empty(),
+		));
 		AssistantResponse {
 			content: if content.is_empty() { None } else { Some(content) },
 			thinking: if thinking.is_empty() { None } else { Some(thinking) },
 			thinking_blocks,
 			tool_calls,
 			usage,
+			stop_reason,
 		}
 	}
 }

@@ -470,20 +470,37 @@ The slug is `<basename>-<8-char FNV-1a hex>` of the folder's absolute
 path — deterministic, collision-free across same-basename folders.
 
 The first line is a header; every subsequent line is one record in
-**[pi-mono](https://github.com/badlogic/pi-mono)'s session-log wire
-shape**, so the file uploads to a HF dataset and renders directly in
-the Hub's pi trace viewer with no adapter. The in-memory enum is
-`SessionRecord`; conversion happens at the serialise/deserialise
-boundary in `sessions.rs`.
+**[pi](https://pi.dev)'s session-log wire shape**, so the file
+uploads to a HF dataset and renders in the Hub's pi trace viewer.
+The in-memory enum is `SessionRecord`; conversion happens at the
+serialise/deserialise boundary in `sessions.rs`.
 
 ```jsonl
-{"type":"session","version":2,"id":"sess-...","timestamp":"2026-05-18T12:14:33.421Z","cwd":"/workspace/moon-ide","title":"implement bucket sync","created_at_ms":1746440000123,"updated_at_ms":1746440045871,"model":"anthropic/claude-sonnet-4.5"}
-{"type":"message","message":{"role":"user","content":"do the thing"}}
-{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"sure…"},{"type":"toolCall","id":"call_1","name":"read_file","arguments":{"path":"…"}}],"provider":"anthropic","model":"claude-sonnet-4.5","usage":{"input":1234,"output":56,"totalTokens":1290}}}
-{"type":"message","message":{"role":"toolResult","toolCallId":"call_1","content":[{"type":"text","text":"…"}],"isError":false}}
-{"type":"compaction","summary":"earlier turns: …","details":{"messages_compacted":42}}
-{"type":"message","message":{"role":"custom","customType":"moon_title_update","display":false,"details":{"title":"add bucket sync upload task"}}}
+{"type":"session","version":3,"id":"sess-...","timestamp":"2026-05-18T12:14:33.421Z","cwd":"/workspace/moon-ide","title":"implement bucket sync","created_at_ms":1746440000123,"updated_at_ms":1746440045871,"model":"anthropic/claude-sonnet-4.5"}
+{"type":"message","timestamp":"2026-05-18T12:14:34.001Z","message":{"role":"user","content":"do the thing","timestamp":1746440074001}}
+{"type":"message","timestamp":"2026-05-18T12:14:38.220Z","message":{"role":"assistant","content":[{"type":"text","text":"sure…"},{"type":"toolCall","id":"call_1","name":"read_file","arguments":{"path":"…"}}],"provider":"anthropic","model":"claude-sonnet-4.5","stopReason":"toolUse","usage":{"input":1234,"output":56,"totalTokens":1290},"timestamp":1746440078220}}
+{"type":"message","timestamp":"2026-05-18T12:14:38.310Z","message":{"role":"toolResult","toolCallId":"call_1","toolName":"read_file","content":[{"type":"text","text":"…"}],"isError":false,"timestamp":1746440078310}}
+{"type":"compaction","timestamp":"2026-05-18T12:20:01.000Z","summary":"earlier turns: …","details":{"messages_compacted":42,"messages_kept":6}}
+{"type":"message","timestamp":"2026-05-18T12:14:45.000Z","message":{"role":"custom","customType":"moon_title_update","display":false,"details":{"title":"add bucket sync upload task"},"timestamp":1746440085000}}
 ```
+
+Schema `3` tracks pi's current format for the fields we use, **minus
+its tree structure** — Moon sessions are linear (no in-place
+branching), so pi's `id` / `parentId` entry linking would be dead
+weight and we omit it. What we do carry from pi v3:
+
+- A `timestamp` on every body line: ISO-8601 on the entry envelope
+  (pi's `SessionEntryBase.timestamp`) and Unix-ms inside each
+  message (pi's per-message `timestamp`). Both come from the moment
+  the row is flushed in `append_record`. Records are not stamped
+  in-memory, so the rare revert/rewrite path re-stamps surviving
+  rows with the rewrite instant rather than preserving the
+  originals.
+- `stopReason` on assistant rows (`stop` | `length` | `toolUse` |
+  `error` | `aborted`), normalised from the provider's finish/stop
+  reason by `inference::normalize_stop_reason`.
+- `toolName` on tool-result rows, so the viewer labels results
+  without cross-referencing the assistant record.
 
 Mapping notes (details live in `sessions.rs`):
 

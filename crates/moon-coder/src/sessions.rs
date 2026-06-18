@@ -55,17 +55,22 @@ use crate::inference::ToolCall;
 /// from older schemas are surfaced as parse errors at load time
 /// (the panel falls back to the empty state and logs a warning).
 ///
-/// `2` introduces the pi-mono compatible wire shape (single
+/// `2` introduced the pi-mono compatible wire shape (single
 /// `{type:"session", id, cwd, ...}` header + `{type:"message",
-/// message:{role:...}}` envelopes per record). Moon IDE's
-/// session JSONLs upload directly to a Hugging Face dataset and
-/// render through the pi harness in moon-landing without any
-/// extra adapter; Moon-specific records (title updates, todo
-/// snapshots, sub-agent metadata, standalone usage) ride in pi
+/// message:{role:...}}` envelopes per record). `3` picks up the
+/// per-line / per-message field additions from pi's current
+/// session format: a `timestamp` on every body line (ISO-8601 on
+/// the entry envelope, Unix-ms inside each message), `toolName`
+/// on tool-result messages, and `stopReason` on assistant
+/// messages. We deliberately do **not** adopt pi's tree structure
+/// (`id` / `parentId` linking) — Moon sessions are linear, with
+/// no in-place branching, so the tree fields would be dead
+/// weight. Moon-specific records (title updates, todo snapshots,
+/// sub-agent metadata, standalone usage) still ride in pi
 /// `custom` rows with no `content`, which the trace viewer
-/// silently skips. See [`record_to_pi_wire`] / [`pi_wire_to_record`]
+/// silently skips. See [`record_to_pi_wire`] / [`pi_wire_to_records`]
 /// for the boundary.
-pub const SESSION_SCHEMA_VERSION: u32 = 2;
+pub const SESSION_SCHEMA_VERSION: u32 = 3;
 
 /// File extension on every session file.
 const SESSION_EXT: &str = "jsonl";
@@ -75,7 +80,7 @@ const SESSION_EXT: &str = "jsonl";
 /// reading exactly one line.
 ///
 /// On disk the header is rendered into the pi-mono wire shape:
-/// `{"type":"session","version":2,"id":...,"timestamp":...,
+/// `{"type":"session","version":3,"id":...,"timestamp":...,
 /// "cwd":...,...}`. We keep the in-memory struct using the
 /// existing field names (so call sites and tests don't churn);
 /// the manual `Serialize` / `Deserialize` impls translate at the
@@ -332,88 +337,119 @@ pub(crate) fn iso8601_utc_ms(ms: i64) -> String {
 /// e.g. a sub-agent that streams a `Usage` before its first
 /// `Assistant` lands), in which case we emit a `moon_usage` custom
 /// row so the data still round-trips on reload.
-pub(crate) fn record_to_pi_wire(record: &SessionRecord, header: &SessionHeader) -> serde_json::Value {
+pub(crate) fn record_to_pi_wire(
+	record: &SessionRecord,
+	header: &SessionHeader,
+	timestamp_ms: i64,
+) -> serde_json::Value {
 	match record {
-		SessionRecord::User { text, images } => pi_message_envelope(pi_user_message(text, images)),
+		SessionRecord::User { text, images } => pi_message_envelope(pi_user_message(text, images), timestamp_ms),
 		SessionRecord::Assistant {
 			content,
 			thinking,
 			thinking_blocks,
 			tool_calls,
 			model,
-		} => pi_message_envelope(pi_assistant_message(
-			content.as_deref(),
-			thinking.as_deref(),
-			thinking_blocks,
-			tool_calls,
-			header,
-			model.as_deref(),
-			None,
-		)),
-		SessionRecord::Tool { tool_call_id, content } => pi_message_envelope(pi_tool_result_message(tool_call_id, content)),
+			stop_reason,
+		} => pi_message_envelope(
+			pi_assistant_message(
+				content.as_deref(),
+				thinking.as_deref(),
+				thinking_blocks,
+				tool_calls,
+				header,
+				model.as_deref(),
+				stop_reason.as_deref(),
+			),
+			timestamp_ms,
+		),
+		SessionRecord::Tool {
+			tool_call_id,
+			tool_name,
+			content,
+		} => pi_message_envelope(pi_tool_result_message(tool_call_id, tool_name, content), timestamp_ms),
 		SessionRecord::Compaction {
 			summary,
 			messages_compacted,
 			messages_kept,
-		} => pi_compaction_row(summary, *messages_compacted, *messages_kept),
-		SessionRecord::TitleUpdate { title } => pi_message_envelope(pi_custom_message(
-			CUSTOM_TYPE_TITLE_UPDATE,
-			serde_json::json!({ "title": title }),
-		)),
-		SessionRecord::TodosUpdate { todos } => pi_message_envelope(pi_custom_message(
-			CUSTOM_TYPE_TODOS_UPDATE,
-			serde_json::json!({ "todos": todos }),
-		)),
+		} => pi_compaction_row(summary, *messages_compacted, *messages_kept, timestamp_ms),
+		SessionRecord::TitleUpdate { title } => pi_message_envelope(
+			pi_custom_message(CUSTOM_TYPE_TITLE_UPDATE, serde_json::json!({ "title": title })),
+			timestamp_ms,
+		),
+		SessionRecord::TodosUpdate { todos } => pi_message_envelope(
+			pi_custom_message(CUSTOM_TYPE_TODOS_UPDATE, serde_json::json!({ "todos": todos })),
+			timestamp_ms,
+		),
 		SessionRecord::SubagentSpawned {
 			tool_call_id,
 			subagent_id,
 			target_folder,
 			mode,
-		} => pi_message_envelope(pi_custom_message(
-			CUSTOM_TYPE_SUBAGENT_SPAWNED,
-			serde_json::json!({
-				"tool_call_id": tool_call_id,
-				"subagent_id": subagent_id,
-				"target_folder": target_folder,
-				"mode": mode,
-			}),
-		)),
+		} => pi_message_envelope(
+			pi_custom_message(
+				CUSTOM_TYPE_SUBAGENT_SPAWNED,
+				serde_json::json!({
+					"tool_call_id": tool_call_id,
+					"subagent_id": subagent_id,
+					"target_folder": target_folder,
+					"mode": mode,
+				}),
+			),
+			timestamp_ms,
+		),
 		SessionRecord::SubagentFinished {
 			subagent_id,
 			tokens_used_estimate,
 			was_error,
 			result_preview,
-		} => pi_message_envelope(pi_custom_message(
-			CUSTOM_TYPE_SUBAGENT_FINISHED,
-			serde_json::json!({
-				"subagent_id": subagent_id,
-				"tokens_used_estimate": tokens_used_estimate,
-				"was_error": was_error,
-				"result_preview": result_preview,
-			}),
-		)),
+		} => pi_message_envelope(
+			pi_custom_message(
+				CUSTOM_TYPE_SUBAGENT_FINISHED,
+				serde_json::json!({
+					"subagent_id": subagent_id,
+					"tokens_used_estimate": tokens_used_estimate,
+					"was_error": was_error,
+					"result_preview": result_preview,
+				}),
+			),
+			timestamp_ms,
+		),
 		SessionRecord::Usage {
 			prompt_tokens,
 			completion_tokens,
 			total_tokens,
 			cache_read_input_tokens,
 			cache_creation_input_tokens,
-		} => pi_message_envelope(pi_custom_message(
-			CUSTOM_TYPE_USAGE,
-			pi_usage_details(
-				*prompt_tokens,
-				*completion_tokens,
-				*total_tokens,
-				*cache_read_input_tokens,
-				*cache_creation_input_tokens,
+		} => pi_message_envelope(
+			pi_custom_message(
+				CUSTOM_TYPE_USAGE,
+				pi_usage_details(
+					*prompt_tokens,
+					*completion_tokens,
+					*total_tokens,
+					*cache_read_input_tokens,
+					*cache_creation_input_tokens,
+				),
 			),
-		)),
+			timestamp_ms,
+		),
 	}
 }
 
-fn pi_message_envelope(inner: serde_json::Value) -> serde_json::Value {
+/// Wrap a pi `message` payload in its JSONL row envelope. Stamps
+/// the row twice, mirroring pi's current format: an ISO-8601
+/// `timestamp` on the envelope (pi's `SessionEntryBase.timestamp`)
+/// and a Unix-millisecond `timestamp` inside the message object
+/// (pi's per-message `timestamp`). Both come from the same instant
+/// — the moment [`append_record`] flushes the row.
+fn pi_message_envelope(mut inner: serde_json::Value, timestamp_ms: i64) -> serde_json::Value {
+	if let Some(obj) = inner.as_object_mut() {
+		obj.insert("timestamp".into(), serde_json::json!(timestamp_ms));
+	}
 	serde_json::json!({
 		"type": PI_MESSAGE_TYPE,
+		"timestamp": iso8601_utc_ms(timestamp_ms),
 		"message": inner,
 	})
 }
@@ -469,7 +505,7 @@ fn pi_assistant_message(
 	tool_calls: &[ToolCall],
 	header: &SessionHeader,
 	record_model: Option<&str>,
-	usage: Option<&SessionRecord>,
+	stop_reason: Option<&str>,
 ) -> serde_json::Value {
 	let mut blocks: Vec<serde_json::Value> = Vec::new();
 	// Signed Anthropic reasoning blocks (when present) own the
@@ -520,24 +556,10 @@ fn pi_assistant_message(
 	if !model.is_empty() {
 		message.insert("model".into(), serde_json::Value::String(model.to_string()));
 	}
-	if let Some(SessionRecord::Usage {
-		prompt_tokens,
-		completion_tokens,
-		total_tokens,
-		cache_read_input_tokens,
-		cache_creation_input_tokens,
-	}) = usage
-	{
-		message.insert(
-			"usage".into(),
-			pi_usage_block(
-				*prompt_tokens,
-				*completion_tokens,
-				*total_tokens,
-				*cache_read_input_tokens,
-				*cache_creation_input_tokens,
-			),
-		);
+	if let Some(reason) = stop_reason {
+		if !reason.is_empty() {
+			message.insert("stopReason".into(), serde_json::Value::String(reason.to_string()));
+		}
 	}
 	serde_json::Value::Object(message)
 }
@@ -626,14 +648,20 @@ fn split_provider_model(model: &str) -> (Option<&str>, &str) {
 	}
 }
 
-fn pi_tool_result_message(tool_call_id: &str, content: &str) -> serde_json::Value {
+fn pi_tool_result_message(tool_call_id: &str, tool_name: &str, content: &str) -> serde_json::Value {
 	let is_error = looks_like_tool_error(content);
-	serde_json::json!({
-		"role": "toolResult",
-		"toolCallId": tool_call_id,
-		"content": [{ "type": "text", "text": content }],
-		"isError": is_error,
-	})
+	let mut message = serde_json::Map::new();
+	message.insert("role".into(), serde_json::Value::String("toolResult".into()));
+	message.insert("toolCallId".into(), serde_json::Value::String(tool_call_id.to_string()));
+	if !tool_name.is_empty() {
+		message.insert("toolName".into(), serde_json::Value::String(tool_name.to_string()));
+	}
+	message.insert(
+		"content".into(),
+		serde_json::json!([{ "type": "text", "text": content }]),
+	);
+	message.insert("isError".into(), serde_json::Value::Bool(is_error));
+	serde_json::Value::Object(message)
 }
 
 /// Heuristic: did this tool result represent an error condition?
@@ -652,9 +680,15 @@ fn looks_like_tool_error(content: &str) -> bool {
 	map.len() == 1 && map.contains_key("error")
 }
 
-fn pi_compaction_row(summary: &str, messages_compacted: u32, messages_kept: u32) -> serde_json::Value {
+fn pi_compaction_row(
+	summary: &str,
+	messages_compacted: u32,
+	messages_kept: u32,
+	timestamp_ms: i64,
+) -> serde_json::Value {
 	serde_json::json!({
 		"type": PI_COMPACTION_TYPE,
+		"timestamp": iso8601_utc_ms(timestamp_ms),
 		"summary": summary,
 		"details": { "messages_compacted": messages_compacted, "messages_kept": messages_kept },
 	})
@@ -897,12 +931,14 @@ fn parse_pi_assistant(msg: &serde_json::Value) -> Vec<SessionRecord> {
 			(None, Some(m)) => Some(m.to_string()),
 			_ => None,
 		};
+		let stop_reason = msg.get("stopReason").and_then(|v| v.as_str()).map(str::to_string);
 		out.push(SessionRecord::Assistant {
 			content,
 			thinking,
 			thinking_blocks,
 			tool_calls,
 			model,
+			stop_reason,
 		});
 	}
 	if let Some(usage) = msg.get("usage").and_then(parse_pi_usage_block) {
@@ -913,6 +949,11 @@ fn parse_pi_assistant(msg: &serde_json::Value) -> Vec<SessionRecord> {
 
 fn parse_pi_tool_result(msg: &serde_json::Value) -> Option<SessionRecord> {
 	let tool_call_id = msg.get("toolCallId").and_then(|v| v.as_str())?.to_string();
+	let tool_name = msg
+		.get("toolName")
+		.and_then(|v| v.as_str())
+		.unwrap_or_default()
+		.to_string();
 	let content = msg.get("content").and_then(|v| v.as_array());
 	let body = match content {
 		Some(blocks) => {
@@ -930,6 +971,7 @@ fn parse_pi_tool_result(msg: &serde_json::Value) -> Option<SessionRecord> {
 	};
 	Some(SessionRecord::Tool {
 		tool_call_id,
+		tool_name,
 		content: body,
 	})
 }
@@ -1066,11 +1108,31 @@ pub enum SessionRecord {
 		/// in-memory runner always populates it.
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		model: Option<String>,
+		/// Provider-reported stop reason, normalised to pi's
+		/// `stopReason` vocabulary (`stop` | `length` | `toolUse` |
+		/// `error` | `aborted`) by
+		/// [`crate::inference::normalize_stop_reason`]. Stamped on
+		/// the pi assistant row so the trace viewer can label why
+		/// the turn ended. `None` only for records on disk from
+		/// before this field shipped; the runner always populates
+		/// it.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		stop_reason: Option<String>,
 	},
 	/// One tool result fed back to the model. `tool_call_id`
 	/// matches the `id` on the parent [`SessionRecord::Assistant`]
-	/// record's `tool_calls`.
-	Tool { tool_call_id: String, content: String },
+	/// record's `tool_calls`. `tool_name` is the function name of
+	/// that call, persisted so the pi `toolResult` row carries a
+	/// `toolName` (the trace viewer labels results by it) without
+	/// a second lookup against the assistant record. Empty only
+	/// for synthetic interrupted-tool sentinels and records on
+	/// disk from before this field shipped.
+	Tool {
+		tool_call_id: String,
+		#[serde(default)]
+		tool_name: String,
+		content: String,
+	},
 	/// The session title changed mid-stream. Replayed on reopen so
 	/// the auto-renamed title sticks across launches without a
 	/// rewrite-the-header-in-place dance.
@@ -1578,6 +1640,15 @@ pub async fn load(dir: &Utf8Path, id: &str) -> Result<LoadedSession, CoderError>
 /// — only seen when a sub-agent emits Usage before its first
 /// Assistant), we fall back to a stand-alone `moon_usage` custom
 /// row so the data still round-trips on reload.
+/// Milliseconds since the Unix epoch, clamped at 0 if the clock
+/// is somehow before 1970. Used to stamp every appended record.
+fn now_ms() -> i64 {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map(|d| d.as_millis() as i64)
+		.unwrap_or(0)
+}
+
 pub async fn append_record(dir: &Utf8Path, header: &SessionHeader, record: &SessionRecord) -> Result<(), CoderError> {
 	let path = session_path(dir, &header.id);
 	if let Some(parent) = path.parent() {
@@ -1605,7 +1676,7 @@ pub async fn append_record(dir: &Utf8Path, header: &SessionHeader, record: &Sess
 		file.write_all(header_line.as_bytes()).await.map_err(CoderError::from)?;
 		file.write_all(b"\n").await.map_err(CoderError::from)?;
 	}
-	let wire = record_to_pi_wire(record, header);
+	let wire = record_to_pi_wire(record, header, now_ms());
 	let body_line = serde_json::to_string(&wire).map_err(CoderError::from)?;
 	file.write_all(body_line.as_bytes()).await.map_err(CoderError::from)?;
 	file.write_all(b"\n").await.map_err(CoderError::from)?;
@@ -1807,11 +1878,19 @@ pub async fn truncate_before_user_record(
 
 	let surviving: Vec<SessionRecord> = records.into_iter().take(cut).collect();
 
+	// Re-stamp surviving records with the rewrite instant: the
+	// in-memory `SessionRecord`s don't carry their original
+	// per-line timestamps (we don't parse them back), and revert
+	// already re-bakes the prefix — replay mints fresh row ids and
+	// the file's mtime moves — so a refreshed timestamp is
+	// consistent with that. The fidelity loss only touches the
+	// rare edit-and-resend path.
+	let rewritten_at = now_ms();
 	let mut out = String::new();
 	out.push_str(&serde_json::to_string(header).map_err(CoderError::from)?);
 	out.push('\n');
 	for record in &surviving {
-		let wire = record_to_pi_wire(record, header);
+		let wire = record_to_pi_wire(record, header, rewritten_at);
 		out.push_str(&serde_json::to_string(&wire).map_err(CoderError::from)?);
 		out.push('\n');
 	}
@@ -2039,6 +2118,7 @@ mod tests {
 				thinking_blocks: vec![],
 				tool_calls: Vec::new(),
 				model: None,
+				stop_reason: None,
 			},
 		)
 		.await
@@ -2316,6 +2396,7 @@ mod tests {
 				thinking: Some("let me think".into()),
 				thinking_blocks: vec![],
 				model: None,
+				stop_reason: None,
 				tool_calls: vec![ToolCall {
 					id: "call-1".into(),
 					kind: "function".into(),
@@ -2358,6 +2439,7 @@ mod tests {
 				thinking_blocks: _,
 				tool_calls,
 				model: _,
+				stop_reason: _,
 			} => {
 				assert_eq!(content.as_deref(), Some("here's a plan"));
 				assert_eq!(thinking.as_deref(), Some("let me think"));
@@ -2393,6 +2475,7 @@ mod tests {
 				thinking_blocks: vec![],
 				tool_calls: Vec::new(),
 				model: None,
+				stop_reason: None,
 			},
 		)
 		.await
@@ -2462,6 +2545,7 @@ mod tests {
 				thinking_blocks: vec![],
 				tool_calls: Vec::new(),
 				model: None,
+				stop_reason: None,
 			},
 		)
 		.await
@@ -2630,6 +2714,7 @@ mod tests {
 			&header,
 			&SessionRecord::Tool {
 				tool_call_id: "call-1".into(),
+				tool_name: String::new(),
 				content: r#"{"stdout":"ok"}"#.into(),
 			},
 		)
@@ -2640,6 +2725,7 @@ mod tests {
 			&header,
 			&SessionRecord::Tool {
 				tool_call_id: "call-2".into(),
+				tool_name: String::new(),
 				content: INTERRUPTED_TOOL_RESULT_JSON.into(),
 			},
 		)
@@ -2660,7 +2746,11 @@ mod tests {
 
 		let loaded = load(&dir, "sess-tool").await.unwrap();
 		match &loaded.records[0] {
-			SessionRecord::Tool { tool_call_id, content } => {
+			SessionRecord::Tool {
+				tool_call_id,
+				content,
+				tool_name: _,
+			} => {
 				assert_eq!(tool_call_id, "call-1");
 				assert_eq!(content, r#"{"stdout":"ok"}"#);
 			}
@@ -2901,9 +2991,11 @@ mod tests {
 				thinking_blocks: vec![],
 				tool_calls: vec![make_tool_call("call-a", "bash")],
 				model: None,
+				stop_reason: None,
 			},
 			SessionRecord::Tool {
 				tool_call_id: "call-a".into(),
+				tool_name: String::new(),
 				content: r#"{"stdout":"ok"}"#.into(),
 			},
 		];
@@ -2927,9 +3019,11 @@ mod tests {
 				thinking_blocks: vec![],
 				tool_calls: vec![make_tool_call("call-a", "bash"), make_tool_call("call-b", "bash")],
 				model: None,
+				stop_reason: None,
 			},
 			SessionRecord::Tool {
 				tool_call_id: "call-a".into(),
+				tool_name: String::new(),
 				content: r#"{"stdout":"a"}"#.into(),
 			},
 		];
@@ -2948,9 +3042,11 @@ mod tests {
 				thinking_blocks: vec![],
 				tool_calls: vec![make_tool_call("call-a", "bash")],
 				model: None,
+				stop_reason: None,
 			},
 			SessionRecord::Tool {
 				tool_call_id: "call-a".into(),
+				tool_name: String::new(),
 				content: "{}".into(),
 			},
 			SessionRecord::Assistant {
@@ -2959,9 +3055,11 @@ mod tests {
 				thinking_blocks: vec![],
 				tool_calls: vec![make_tool_call("call-b", "read_file")],
 				model: None,
+				stop_reason: None,
 			},
 			SessionRecord::Tool {
 				tool_call_id: "call-b".into(),
+				tool_name: String::new(),
 				content: "{}".into(),
 			},
 			SessionRecord::Assistant {
@@ -2970,6 +3068,7 @@ mod tests {
 				thinking_blocks: vec![],
 				tool_calls: vec![make_tool_call("call-c", "bash")],
 				model: None,
+				stop_reason: None,
 			},
 		];
 		assert_eq!(orphan_tool_call_ids(&records), vec!["call-c".to_string()]);
@@ -2990,6 +3089,7 @@ mod tests {
 				thinking_blocks: vec![],
 				tool_calls: Vec::new(),
 				model: None,
+				stop_reason: None,
 			},
 		];
 		assert!(orphan_tool_call_ids(&records).is_empty());
@@ -3064,6 +3164,7 @@ mod tests {
 				thinking_blocks: _,
 				tool_calls,
 				model,
+				stop_reason: _,
 			} => {
 				assert!(content.is_none());
 				assert!(thinking.is_none());
@@ -3090,8 +3191,9 @@ mod tests {
 			thinking_blocks: vec![],
 			tool_calls: Vec::new(),
 			model: Some("anthropic/claude-sonnet-4.5".into()),
+			stop_reason: None,
 		};
-		let wire = record_to_pi_wire(&record, &header);
+		let wire = record_to_pi_wire(&record, &header, 0);
 		// Sanity: pi envelope split the stamp into the conventional fields.
 		let msg = wire.get("message").unwrap();
 		assert_eq!(msg.get("provider").and_then(|v| v.as_str()), Some("anthropic"));
@@ -3103,6 +3205,59 @@ mod tests {
 				assert_eq!(model.as_deref(), Some("anthropic/claude-sonnet-4.5"));
 			}
 			other => panic!("expected Assistant, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn pi_wire_stamps_timestamps_tool_name_and_stop_reason() {
+		// Schema 3 picked up pi's per-line / per-message field
+		// additions. Pin them on the wire shape: an ISO-8601
+		// `timestamp` on the envelope, a Unix-ms `timestamp` inside
+		// the message, `stopReason` on the assistant message, and
+		// `toolName` on the tool-result message.
+		let header = make_test_header("sess-v3-fields");
+		let ts: i64 = 1_700_000_000_123;
+
+		let assistant = SessionRecord::Assistant {
+			content: Some("done".into()),
+			thinking: None,
+			thinking_blocks: vec![],
+			tool_calls: Vec::new(),
+			model: Some("anthropic/claude-sonnet-4.5".into()),
+			stop_reason: Some("toolUse".into()),
+		};
+		let wire = record_to_pi_wire(&assistant, &header, ts);
+		assert_eq!(
+			wire.get("timestamp").and_then(|v| v.as_str()),
+			Some("2023-11-14T22:13:20.123Z"),
+			"envelope carries the ISO-8601 timestamp"
+		);
+		let msg = wire.get("message").unwrap();
+		assert_eq!(
+			msg.get("timestamp").and_then(|v| v.as_i64()),
+			Some(ts),
+			"message carries the Unix-ms timestamp"
+		);
+		assert_eq!(msg.get("stopReason").and_then(|v| v.as_str()), Some("toolUse"));
+		// stopReason survives the reload round-trip.
+		match &pi_wire_to_records(&wire)[0] {
+			SessionRecord::Assistant { stop_reason, .. } => {
+				assert_eq!(stop_reason.as_deref(), Some("toolUse"));
+			}
+			other => panic!("expected Assistant, got {other:?}"),
+		}
+
+		let tool = SessionRecord::Tool {
+			tool_call_id: "call-1".into(),
+			tool_name: "read_file".into(),
+			content: r#"{"ok":true}"#.into(),
+		};
+		let wire = record_to_pi_wire(&tool, &header, ts);
+		let msg = wire.get("message").unwrap();
+		assert_eq!(msg.get("toolName").and_then(|v| v.as_str()), Some("read_file"));
+		match &pi_wire_to_records(&wire)[0] {
+			SessionRecord::Tool { tool_name, .. } => assert_eq!(tool_name, "read_file"),
+			other => panic!("expected Tool, got {other:?}"),
 		}
 	}
 
@@ -3133,8 +3288,9 @@ mod tests {
 				},
 			}],
 			model: Some("anthropic/claude-fable-5".into()),
+			stop_reason: None,
 		};
-		let wire = record_to_pi_wire(&record, &header);
+		let wire = record_to_pi_wire(&record, &header, 0);
 		let records = pi_wire_to_records(&wire);
 		match &records[0] {
 			SessionRecord::Assistant { thinking_blocks, .. } => {
@@ -3165,8 +3321,9 @@ mod tests {
 			thinking_blocks: vec![],
 			tool_calls: Vec::new(),
 			model: Some("hf/deepseek".into()),
+			stop_reason: None,
 		};
-		let wire = record_to_pi_wire(&record, &header);
+		let wire = record_to_pi_wire(&record, &header, 0);
 		let records = pi_wire_to_records(&wire);
 		match &records[0] {
 			SessionRecord::Assistant {
@@ -3211,6 +3368,7 @@ mod tests {
 					thinking_blocks: vec![],
 					tool_calls: Vec::new(),
 					model: None,
+					stop_reason: None,
 				},
 			)
 			.await
