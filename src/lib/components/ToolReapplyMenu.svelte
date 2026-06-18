@@ -10,8 +10,10 @@
 	// extra click guards against an accidental clobber. Pure
 	// side-effect: the backend dispatches the call again and touches
 	// disk, but never the transcript or the JSONL.
+	import { mount as mountComponent, unmount } from 'svelte';
 	import ContextMenu from './ContextMenu.svelte';
 	import type { ContextMenuItem } from './contextMenu';
+	import SettingsIcon from './icons/SettingsIcon.svelte';
 	import { ipc } from '../ipc';
 	import { formatError } from '../protocol';
 	import { workspace } from '../state.svelte';
@@ -23,12 +25,31 @@
 
 	let { callId }: Props = $props();
 
-	let anchorRect = $state<{ left: number; top: number; width: number; height: number } | null>(null);
 	let busy = $state(false);
 
-	function openMenu(event: MouseEvent): void {
-		const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
-		anchorRect = { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+	// The menu is mounted into a portal host on `document.body`
+	// rather than rendered inline: the transcript scroll container
+	// clips and mis-positions a `position: fixed` popover, the same
+	// reason the tab / file-tree menus portal out. Torn down on
+	// close and on unmount.
+	let menu: ReturnType<typeof mountComponent> | null = null;
+	let menuHost: HTMLElement | null = null;
+
+	$effect(() => {
+		return () => {
+			disposeMenu();
+		};
+	});
+
+	function disposeMenu(): void {
+		if (menu) {
+			void unmount(menu);
+			menu = null;
+		}
+		if (menuHost) {
+			menuHost.remove();
+			menuHost = null;
+		}
 	}
 
 	async function reapply(): Promise<void> {
@@ -46,15 +67,40 @@
 		}
 	}
 
-	const items: ContextMenuItem[] = $derived([
-		{
-			id: 'reapply',
-			label: 'Re-apply this edit to disk',
-			title: 'Dispatch this edit again against the current file',
-			disabled: busy,
-			onSelect: () => void reapply(),
-		},
-	]);
+	function openMenu(event: MouseEvent): void {
+		event.stopPropagation();
+		disposeMenu();
+
+		const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+		const items: ContextMenuItem[] = [
+			{
+				id: 'reapply',
+				label: 'Re-apply this edit to disk',
+				title: 'Dispatch this edit again against the current file',
+				onSelect: () => void reapply(),
+			},
+		];
+
+		const host = document.createElement('div');
+		host.setAttribute('data-tool-reapply-menu-root', 'true');
+		host.style.position = 'fixed';
+		host.style.top = '0';
+		host.style.left = '0';
+		host.style.width = '0';
+		host.style.height = '0';
+		host.style.zIndex = '9999';
+		document.body.appendChild(host);
+
+		menu = mountComponent(ContextMenu, {
+			target: host,
+			props: {
+				items,
+				anchorRect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+				onClose: () => disposeMenu(),
+			},
+		});
+		menuHost = host;
+	}
 </script>
 
 <button
@@ -65,26 +111,8 @@
 	disabled={busy}
 	onclick={openMenu}
 >
-	<svg
-		xmlns="http://www.w3.org/2000/svg"
-		width="13"
-		height="13"
-		viewBox="0 0 16 16"
-		fill="none"
-		stroke="currentColor"
-		stroke-width="1.5"
-		stroke-linecap="round"
-		stroke-linejoin="round"
-		aria-hidden="true"
-		focusable="false"
-	>
-		<path d="M14 8a6 6 0 1 1-1.76-4.24" />
-		<path d="M14 2v4h-4" />
-	</svg>
+	<SettingsIcon size={13} />
 </button>
-{#if anchorRect !== null}
-	<ContextMenu {items} {anchorRect} onClose={() => (anchorRect = null)} />
-{/if}
 
 <style>
 	.reapply-cog {

@@ -448,6 +448,49 @@ button:focus-visible {
 	max-width: 100%;
 }
 
+/* Leading YAML frontmatter (`---` … `---`) is split out of the body
+   and rendered as a metadata table above the document — see
+   `frontmatterToHtml` in `src/lib/markdown.ts`. The muted panel fill
+   and dropped left border set it apart from author-written tables in
+   the body without shouting. */
+.markdown-body .md-frontmatter {
+	margin: 0 0 1.4em;
+	background: var(--m-bg-1);
+	border-radius: 6px;
+	overflow: hidden;
+}
+.markdown-body .md-frontmatter:first-child {
+	margin-top: 0;
+}
+.markdown-body table.md-frontmatter th,
+.markdown-body table.md-frontmatter td {
+	border-color: var(--m-border);
+	vertical-align: top;
+}
+.markdown-body table.md-frontmatter th[scope='row'] {
+	white-space: nowrap;
+	color: var(--m-fg-muted);
+	font-weight: 600;
+}
+.markdown-body .md-frontmatter-empty {
+	color: var(--m-fg-muted);
+	opacity: 0.7;
+}
+.markdown-body .md-frontmatter-nested {
+	display: block;
+	white-space: pre;
+	background: transparent;
+	padding: 0;
+}
+.markdown-body .md-frontmatter-raw {
+	padding: 0;
+}
+.markdown-body .md-frontmatter-raw pre {
+	margin: 0;
+	border: none;
+	background: transparent;
+}
+
 /* Syntax highlighting for fenced code blocks. Classes are emitted by
  * `@lezer/highlight`'s `classHighlighter` (see
  * `src/lib/editor/highlightCode.ts`). Colours reuse the editor's

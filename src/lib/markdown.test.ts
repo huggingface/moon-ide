@@ -1,9 +1,9 @@
 import MarkdownIt from 'markdown-it';
 import { describe, expect, it } from 'vitest';
 
-import { __test, slugifyHeading } from './markdown';
+import { __test, slugifyHeading, splitFrontmatter } from './markdown';
 
-const { applyHeadingAnchorRule, applyInlineAnchorRule } = __test;
+const { applyHeadingAnchorRule, applyInlineAnchorRule, frontmatterToHtml } = __test;
 
 // Build a bare markdown-it with just our two anchor rules. We skip
 // the highlighter (grammar imports require the editor's bundle
@@ -121,5 +121,89 @@ describe('inline anchor rule', () => {
 	it('refuses single-quoted attributes (out of scope for now)', () => {
 		const html = buildParser().render("<a name='foo'></a>\n");
 		expect(html).not.toContain('id="foo"');
+	});
+});
+
+describe('splitFrontmatter', () => {
+	it('splits a leading YAML block from the body', () => {
+		const { frontmatter, body } = splitFrontmatter('---\ntitle: Hello\n---\n\n# Body\n');
+		expect(frontmatter).toBe('title: Hello');
+		expect(body).toBe('\n# Body\n');
+	});
+
+	it('accepts `...` as a closing fence', () => {
+		const { frontmatter, body } = splitFrontmatter('---\ntitle: Hello\n...\nText\n');
+		expect(frontmatter).toBe('title: Hello');
+		expect(body).toBe('Text\n');
+	});
+
+	it('tolerates a leading BOM and CRLF newlines', () => {
+		const { frontmatter, body } = splitFrontmatter('\uFEFF---\r\ntitle: Hello\r\n---\r\nText\r\n');
+		expect(frontmatter).toBe('title: Hello');
+		expect(body).toBe('Text\r\n');
+	});
+
+	it('returns null when the document has no frontmatter', () => {
+		const source = '# Heading\n\nText.\n';
+		const { frontmatter, body } = splitFrontmatter(source);
+		expect(frontmatter).toBeNull();
+		expect(body).toBe(source);
+	});
+
+	it('ignores a `---` that is not at the very start', () => {
+		const source = 'Intro\n\n---\nnot: frontmatter\n---\n';
+		const { frontmatter, body } = splitFrontmatter(source);
+		expect(frontmatter).toBeNull();
+		expect(body).toBe(source);
+	});
+
+	it('does not treat a thematic break / setext heading as frontmatter', () => {
+		const source = 'Heading\n---\n\nBody\n';
+		const { frontmatter } = splitFrontmatter(source);
+		expect(frontmatter).toBeNull();
+	});
+});
+
+describe('frontmatterToHtml', () => {
+	it('renders a mapping as a key/value table', () => {
+		const html = frontmatterToHtml('title: Hello World\nlicense: mit');
+		expect(html).toContain('<table class="md-frontmatter">');
+		expect(html).toContain('<th scope="row">title</th>');
+		expect(html).toContain('<td>Hello World</td>');
+		expect(html).toContain('<th scope="row">license</th>');
+	});
+
+	it('renders a scalar list as inline chips', () => {
+		const html = frontmatterToHtml('tags:\n  - alpha\n  - beta');
+		expect(html).toContain('<code>alpha</code>');
+		expect(html).toContain('<code>beta</code>');
+	});
+
+	it('renders nested structures as indented JSON', () => {
+		const html = frontmatterToHtml('model-index:\n  name: m\n  results:\n    - task: x');
+		expect(html).toContain('md-frontmatter-nested');
+		expect(html).toContain('&quot;name&quot;');
+	});
+
+	it('shows an em dash for empty values', () => {
+		const html = frontmatterToHtml('thumbnail:');
+		expect(html).toContain('md-frontmatter-empty');
+	});
+
+	it('escapes HTML in keys and values', () => {
+		const html = frontmatterToHtml('title: <script>alert(1)</script>');
+		expect(html).not.toContain('<script>');
+		expect(html).toContain('&lt;script&gt;');
+	});
+
+	it('falls back to a raw YAML block for a non-mapping document', () => {
+		const html = frontmatterToHtml('- just\n- a\n- list');
+		expect(html).toContain('md-frontmatter-raw');
+		expect(html).not.toContain('<table');
+	});
+
+	it('falls back to a raw YAML block when the YAML is invalid', () => {
+		const html = frontmatterToHtml('title: [unterminated');
+		expect(html).toContain('md-frontmatter-raw');
 	});
 });

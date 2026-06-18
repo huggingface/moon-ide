@@ -1,5 +1,6 @@
 import MarkdownIt from 'markdown-it';
 import DOMPurify from 'dompurify';
+import { parse as parseYaml } from 'yaml';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { extractFenceLanguages, highlightCode, loadHighlighters } from './editor/highlightCode';
 
@@ -7,6 +8,15 @@ import { extractFenceLanguages, highlightCode, loadHighlighters } from './editor
 // preview that's safe to drop into `innerHTML`, not a full GitHub-
 // flavored renderer. Anything fancier (math, mermaid, footnotes) is
 // a follow-up — add it when someone on the team asks.
+//
+// A leading YAML frontmatter block (`---` … `---` at the very top of
+// the file, as used by Jekyll/Hugo docs and Hub model/dataset cards)
+// is split off before markdown-it sees it — otherwise the closing
+// `---` reads as a setext heading and the whole block renders as one
+// garbled `<h2>`. We parse it and render a small metadata table at
+// the top of the preview (GitHub's behaviour); unparseable or
+// non-mapping frontmatter falls back to a syntax-highlighted YAML
+// block so the source is still readable. See `splitFrontmatter`.
 //
 // Fenced code blocks are syntax-highlighted via CodeMirror's own
 // grammars (see `./editor/highlightCode.ts`). Same parser → same
@@ -249,6 +259,108 @@ export function getCachedMarkdown(source: string, options: { linkify?: boolean }
 }
 
 /**
+ * Detect a leading YAML frontmatter block and split it from the
+ * markdown body. The block must start at the very first byte (an
+ * optional BOM aside): a line containing only `---`, terminated by a
+ * later line of only `---` or `...`. Returns `frontmatter: null` when
+ * the source has no such block, in which case `body === source`.
+ *
+ * Deliberately conservative — a stray `---` further down the document
+ * is a horizontal rule (or a setext heading underline), never a
+ * frontmatter fence.
+ */
+export function splitFrontmatter(source: string): { frontmatter: string | null; body: string } {
+	const match = FRONTMATTER_RE.exec(source);
+	if (!match) {
+		return { frontmatter: null, body: source };
+	}
+	return { frontmatter: match[1] ?? '', body: source.slice(match[0].length) };
+}
+
+// Opening fence at offset 0 (optional UTF-8 BOM), body captured
+// lazily, closing fence (`---` or `...`) on its own line. The `\r?\n`
+// before the closing fence anchors it to a line start without needing
+// the `m` flag.
+const FRONTMATTER_RE = /^\uFEFF?---[ \t]*\r?\n([\s\S]*?)\r?\n(?:---|\.\.\.)[ \t]*(?:\r?\n|$)/;
+
+/**
+ * Render a parsed frontmatter block to HTML. A mapping becomes a
+ * borderless key/value table (GitHub's convention); anything else —
+ * a top-level sequence, a bare scalar, or YAML that fails to parse —
+ * falls back to the raw source in a syntax-highlighted YAML block so
+ * the author still sees their metadata.
+ *
+ * We parse with the `failsafe` schema so every scalar stays a string:
+ * the table is for display, and coercing `version: 1.0` to the number
+ * `1` or `date: 2024-01-01` to a `Date` object would misrepresent the
+ * source. Output is escaped here and sanitised again by DOMPurify.
+ */
+function frontmatterToHtml(raw: string): string {
+	let data: unknown;
+	try {
+		data = parseYaml(raw, { schema: 'failsafe' });
+	} catch {
+		data = undefined;
+	}
+	if (isPlainRecord(data)) {
+		const rows = Object.entries(data)
+			.map(
+				([key, value]) =>
+					`<tr><th scope="row">${escapeHtmlAttr(key)}</th><td>${renderFrontmatterValue(value)}</td></tr>`,
+			)
+			.join('');
+		if (rows !== '') {
+			return `<table class="md-frontmatter"><tbody>${rows}</tbody></table>`;
+		}
+	}
+	// `highlightCode` returns '' if the YAML grammar wasn't preloaded
+	// (it always is on the render path — see `renderMarkdown`); the
+	// plain `<pre>` keeps the source readable either way.
+	const highlighted = highlightCode(raw, 'yaml');
+	const block =
+		highlighted !== ''
+			? highlighted
+			: `<pre class="cm-code"><code class="language-yaml">${escapeHtmlAttr(raw)}</code></pre>`;
+	return `<div class="md-frontmatter md-frontmatter-raw">${block}</div>`;
+}
+
+function renderFrontmatterValue(value: unknown): string {
+	if (value === null || value === undefined || value === '') {
+		return '<span class="md-frontmatter-empty">—</span>';
+	}
+	if (Array.isArray(value)) {
+		if (value.length === 0) {
+			return '<span class="md-frontmatter-empty">—</span>';
+		}
+		// Scalar lists (tags, languages, …) render as inline chips;
+		// anything richer is dumped as indented JSON so nested
+		// structure stays legible without a recursive table renderer.
+		if (value.every(isScalar)) {
+			return value.map((item) => `<code>${escapeHtmlAttr(String(item))}</code>`).join(' ');
+		}
+		return `<code class="md-frontmatter-nested">${escapeHtmlAttr(JSON.stringify(value, null, 2))}</code>`;
+	}
+	if (typeof value === 'string') {
+		return escapeHtmlAttr(value);
+	}
+	if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+		return escapeHtmlAttr(String(value));
+	}
+	// `failsafe` YAML only yields strings / maps / sequences, so this
+	// branch is effectively unreachable — but stay total rather than
+	// stringifying an object to `[object Object]`.
+	return `<code class="md-frontmatter-nested">${escapeHtmlAttr(JSON.stringify(value, null, 2))}</code>`;
+}
+
+function isScalar(value: unknown): boolean {
+	return value === null || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean';
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
  * Render a Markdown string to sanitised HTML. Async because the
  * syntax-highlighter pre-loads the CodeMirror grammar for every
  * fenced-code language before the synchronous render — dynamic
@@ -277,9 +389,14 @@ export async function renderMarkdown(source: string, options: { linkify?: boolea
 	if (cached !== undefined) {
 		return cached;
 	}
-	await loadHighlighters(extractFenceLanguages(source));
+	const { frontmatter, body } = splitFrontmatter(source);
+	const langs = extractFenceLanguages(body);
+	if (frontmatter !== null) {
+		langs.push('yaml');
+	}
+	await loadHighlighters(langs);
 	const parser = linkify ? mdLinkified : md;
-	const html = parser.render(source);
+	const html = (frontmatter !== null ? frontmatterToHtml(frontmatter) : '') + parser.render(body);
 	const sanitised = DOMPurify.sanitize(html, {
 		// Block any URI scheme that isn't on the known-safe list.
 		// DOMPurify defaults already cover the common cases; this is
@@ -378,7 +495,7 @@ export const EXTERNAL_MARKDOWN_SCHEMES = new Set(['http:', 'https:', 'mailto:', 
  * `MarkdownIt` to skip the highlighter (grammar imports break in
  * the vitest environment) and apply just the rules under test.
  */
-export const __test = { applyHeadingAnchorRule, applyInlineAnchorRule };
+export const __test = { applyHeadingAnchorRule, applyInlineAnchorRule, frontmatterToHtml };
 
 /**
  * If `href` parses as an absolute URL with an allow-listed scheme,
