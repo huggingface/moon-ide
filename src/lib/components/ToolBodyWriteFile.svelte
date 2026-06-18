@@ -9,14 +9,17 @@
 		loadHighlighters,
 		openToolPath,
 	} from './toolBodyHelpers';
+	import ToolReapplyMenu from './ToolReapplyMenu.svelte';
 
 	interface Props {
 		args: unknown;
 		result: unknown;
 		hasResult: boolean;
+		/** Tool-call id, for the "re-apply to disk" recovery menu. */
+		callId: string;
 	}
 
-	let { args, result, hasResult }: Props = $props();
+	let { args, result, hasResult, callId }: Props = $props();
 
 	/** Match `crates/moon-coder/src/tools.rs`'s `WriteFileArgs`. */
 	function parseArgs(a: unknown): { path: string; content: string } | null {
@@ -135,6 +138,9 @@
 			{/if}
 			{#if resultP !== null && resultP.bytesWritten !== null}
 				<span class="wf-meta">{fmtBytes(resultP.bytesWritten)}</span>
+			{/if}
+			{#if path !== null}
+				<ToolReapplyMenu {callId} />
 			{/if}
 		</header>
 		{#if argsP !== null && argsP.content.length > 0}

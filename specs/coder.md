@@ -294,6 +294,24 @@ Possible later additions, as separate commits when proven needed:
 LSP wrappers (`goto_definition`, `find_references`, `hover`),
 read-only git wrappers, `apply_diff`, `editor_open`.
 
+### Manual re-apply (recovery)
+
+`write_file` / `edit_file` rows expose a tucked-away "re-apply to
+disk" affordance: a cog inside the **expanded** tool body opening a
+one-item menu (the extra click guards against an accidental
+`write_file` clobber). It re-dispatches the recorded call's args
+through the registry against the current file — the recovery hatch
+for "I reset / clobbered that file and want the agent's edit back"
+without re-running the turn. Scoped to the two file-writing tools;
+re-running `bash` / read / network calls out of band has no
+recovery value. Pure side-effect: nothing is appended to the
+transcript or JSONL, and the same turn-end format-on-save pass
+runs so the bytes match the original turn. A dispatch failure
+(e.g. an `edit_file` whose `find` no longer matches) surfaces as a
+flash. The call resolves against the active folder's **visible**
+session, so the lookup is by `tool_call_id` within that
+transcript.
+
 ### Todo list tool
 
 `todo_write` keeps a small in-context plan, same shape as the
@@ -974,6 +992,7 @@ Tauri commands in `src-tauri/src/commands/coder.rs`:
 | `coder_abort()`                                         | Cancels the visible session's in-flight turn                                                          |
 | `coder_respond_to_prompt(call_id, response)`            | Resolves a parked `ask_user` prompt; returns `false` when nothing's parked                            |
 | `coder_revert_to_message(user_ordinal)`                 | Truncates the visible session; returns the dropped prompt for edit-and-resend. Refused mid-turn       |
+| `coder_rerun_tool_call(tool_call_id)`                   | Reapplies a recorded `write_file` / `edit_file` to disk (recovery); transcript untouched              |
 | `coder_set_model(slug)` / `coder_set_model_settings(…)` | Model picks                                                                                           |
 | `coder_*_provider*` commands                            | Custom-provider CRUD, probe, per-provider catalog, keyring-only API-key set/clear                     |
 | `coder_set_sync_enabled(enabled)`                       | Per-workspace bucket-sync toggle                                                                      |

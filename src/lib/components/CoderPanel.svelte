@@ -2429,7 +2429,7 @@
 						 `read_file` (line numbers + highlighting).
 						 Lets the user see exactly what landed on
 						 disk without an extra `read_file` round-trip. -->
-						<ToolBodyWriteFile args={row.args} result={row.result} hasResult={row.hasResult} />
+						<ToolBodyWriteFile args={row.args} result={row.result} hasResult={row.hasResult} callId={row.id} />
 					{:else if row.name === 'edit_file'}
 						<!-- Edit view: unified-diff style with a tinted
 						 red `find` block and a tinted green `replace`
@@ -2437,7 +2437,7 @@
 						 sides — partial-grammar colouring of a
 						 mid-expression edit is more often wrong than
 						 right; the diff colours carry the signal. -->
-						<ToolBodyEditFile args={row.args} result={row.result} hasResult={row.hasResult} />
+						<ToolBodyEditFile args={row.args} result={row.result} hasResult={row.hasResult} callId={row.id} />
 					{:else if row.name === 'grep'}
 						<!-- Grep view: pattern in a chip, count + truncation
 						 flag in the meta line, then a scrollable hit

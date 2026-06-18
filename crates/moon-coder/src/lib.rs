@@ -43,7 +43,7 @@ pub use inference::{ImageAttachment, InferenceClient};
 pub use models::CoderModels;
 pub use prompts::{PromptOutcome, PromptResponse, QuestionAnswer};
 pub use providers::{new_provider_id, probe_provider, ProviderKeyring};
-pub use runner::{Coder, CoderHandle, RevertedMessage, TerminalCommandContext, UnqueuedSteer};
+pub use runner::{Coder, CoderHandle, RerunToolOutcome, RevertedMessage, TerminalCommandContext, UnqueuedSteer};
 pub use sessions::SessionSummary;
 pub use subagent::{Subagent, SubagentReport};
 pub use todo::{merge_todos, TodoItem, TodoStatus};

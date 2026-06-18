@@ -1465,6 +1465,43 @@ impl CoderHandle {
 		})
 	}
 
+	/// Manually re-dispatch a previously-recorded `write_file` /
+	/// `edit_file` tool call from the active folder's visible
+	/// session against the current workspace. The recovery
+	/// affordance for "I reset / clobbered a file and want the
+	/// agent's edit back" without re-running the whole turn.
+	///
+	/// Scoped to the two file-writing tools: re-running `bash`,
+	/// network, or read tools out of band has no recovery value
+	/// and could be destructive. An unsupported or unknown
+	/// `tool_call_id` errors so the panel can flash a reason.
+	///
+	/// Pure side-effect — nothing is appended to the transcript or
+	/// the JSONL; the row's recorded result stays the historical
+	/// record. The reapply runs the same turn-end format-on-save
+	/// pass a normal turn would, so the bytes match what the
+	/// original turn left on disk. A dispatch failure (e.g. an
+	/// `edit_file` whose `find` no longer matches the current file)
+	/// propagates as `Err` for the panel to surface.
+	pub async fn rerun_tool_call(&self, tool_call_id: String) -> Result<RerunToolOutcome, CoderError> {
+		let (rt, _, _) = self.state.active_visible_runtime().await?;
+		let (tool_name, args) = {
+			let session = rt.session.lock().await;
+			find_recorded_tool_call(&session.messages, &tool_call_id)
+				.ok_or_else(|| CoderError::Internal(format!("no tool call `{tool_call_id}` in the visible session")))?
+		};
+		if tool_name != "write_file" && tool_name != "edit_file" {
+			return Err(CoderError::Internal(format!(
+				"only write_file / edit_file can be reapplied, not `{tool_name}`"
+			)));
+		}
+		let cx = self.state.tools.context_for_active(CoderMode::Agent).await?;
+		let cancel = CancellationToken::new();
+		let result = self.state.tools.dispatch(&tool_name, &args, &cx, &cancel).await?;
+		flush_format_queue(&self.state, &cx.format_queue).await;
+		Ok(RerunToolOutcome { tool_name, result })
+	}
+
 	/// Make the persisted session identified by `id` the visible
 	/// one under the active workspace folder. Replays the JSONL
 	/// records as live events so the panel's existing event
@@ -2223,6 +2260,38 @@ pub struct RevertedMessage {
 	pub text: String,
 	#[serde(default)]
 	pub images: Vec<ImageAttachment>,
+}
+
+/// Result of [`Coder::rerun_tool_call`] — the tool that was
+/// reapplied plus its fresh dispatch result, handed back so the
+/// panel can confirm the reapply (e.g. "reapplied 1.2 kB"). Only
+/// the success payload reaches here; a dispatch failure propagates
+/// as `Err` instead.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RerunToolOutcome {
+	pub tool_name: String,
+	pub result: Value,
+}
+
+/// Find a recorded tool call by id in a session's message history
+/// and return its `(name, parsed args)`. Tool calls only ever live
+/// on assistant messages' `tool_calls`, so that's all we scan.
+/// `None` when no recorded call matches — already reverted away, a
+/// sub-agent's own call (not on the parent's transcript), or a
+/// stale id. Pure over `&[ChatMessage]` so it's unit-testable
+/// without a runtime.
+fn find_recorded_tool_call(messages: &[ChatMessage], tool_call_id: &str) -> Option<(String, Value)> {
+	for msg in messages {
+		let ChatMessage::Assistant { tool_calls, .. } = msg else {
+			continue;
+		};
+		for call in tool_calls {
+			if call.id == tool_call_id {
+				return Some((call.function.name.clone(), parse_tool_args(&call.function)));
+			}
+		}
+	}
+	None
 }
 
 /// Remove the first matching pending steer from `session` and
@@ -4690,6 +4759,47 @@ fn new_message_id() -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn assistant_with_call(id: &str, name: &str, arguments: &str) -> ChatMessage {
+		ChatMessage::Assistant {
+			content: None,
+			thinking_blocks: Vec::new(),
+			tool_calls: vec![crate::inference::ToolCall {
+				id: id.to_string(),
+				kind: "function".to_string(),
+				function: FunctionCall {
+					name: name.to_string(),
+					arguments: arguments.to_string(),
+				},
+			}],
+		}
+	}
+
+	#[test]
+	fn find_recorded_tool_call_returns_name_and_parsed_args() {
+		let messages = vec![
+			ChatMessage::user("do the thing"),
+			assistant_with_call("call_1", "edit_file", r#"{"path":"a.rs","find":"x","replace":"y"}"#),
+			ChatMessage::Tool {
+				tool_call_id: "call_1".into(),
+				content: "ok".into(),
+			},
+		];
+		let (name, args) = find_recorded_tool_call(&messages, "call_1").expect("call should be found");
+		assert_eq!(name, "edit_file");
+		assert_eq!(args["path"], "a.rs");
+		assert_eq!(args["find"], "x");
+	}
+
+	#[test]
+	fn find_recorded_tool_call_none_for_unknown_id() {
+		let messages = vec![assistant_with_call(
+			"call_1",
+			"write_file",
+			r#"{"path":"a.rs","content":"hi"}"#,
+		)];
+		assert!(find_recorded_tool_call(&messages, "nope").is_none());
+	}
 
 	#[test]
 	fn sanitise_strips_decorations() {

@@ -248,19 +248,23 @@
 						</button>
 					{/each}
 				</div>
-				<input
+				<!-- Multi-line so a custom answer can hold a paragraph.
+				     Keymap matches the composer: Enter submits, Shift+Enter
+				     inserts a newline (the default textarea behaviour we
+				     let through by only handling the unmodified Enter). -->
+				<textarea
 					class="ask-custom"
-					type="text"
-					placeholder="Or type a custom answer…"
+					rows="1"
+					placeholder="Or type a custom answer… (Shift+Enter for a new line)"
 					bind:value={textByQuestion[q.id]}
 					disabled={submitting || submitted}
 					onkeydown={(e) => {
-						if (e.key === 'Enter') {
+						if (e.key === 'Enter' && !e.shiftKey) {
 							e.preventDefault();
 							void submit();
 						}
 					}}
-				/>
+				></textarea>
 			</div>
 		{/each}
 		<!-- Multi-question / multi-select prompts can't auto-submit
@@ -377,10 +381,14 @@
 		padding: 5px 8px;
 		font-size: 12px;
 		font-family: inherit;
+		line-height: 1.4;
 		color: var(--m-fg);
 		background: var(--m-bg);
 		border: 1px solid var(--m-border);
 		border-radius: 5px;
+		resize: vertical;
+		min-height: 28px;
+		field-sizing: content;
 	}
 	.ask-custom::placeholder {
 		color: var(--m-fg-subtle);

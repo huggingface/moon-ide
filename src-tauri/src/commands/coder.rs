@@ -7,8 +7,8 @@
 
 use camino::Utf8PathBuf;
 use moon_coder::{
-	CoderHandle, CoderStatus, DeviceCode, HfIdentity, ImageAttachment, PromptResponse, RevertedMessage, SessionSummary,
-	UnqueuedSteer,
+	CoderHandle, CoderStatus, DeviceCode, HfIdentity, ImageAttachment, PromptResponse, RerunToolOutcome, RevertedMessage,
+	SessionSummary, UnqueuedSteer,
 };
 use moon_core::app_state as app_state_store;
 use moon_core::session as core_session;
@@ -275,6 +275,23 @@ pub async fn coder_revert_to_message(
 		.revert_to_message(user_ordinal)
 		.await
 		.map_err(MoonError::from)
+}
+
+/// Manually reapply a recorded `write_file` / `edit_file` tool
+/// call from the active folder's visible session. The recovery
+/// affordance behind the per-row "re-apply" control: a user who
+/// reset or clobbered a file can put the agent's edit back without
+/// re-running the turn. Pure side-effect — the transcript and
+/// JSONL are untouched. Errors when `tool_call_id` isn't a
+/// reapplyable call (unknown id, a non-write tool) or when the
+/// dispatch itself fails (e.g. an `edit_file` whose `find` no
+/// longer matches the current file).
+#[tauri::command]
+pub async fn coder_rerun_tool_call(
+	state: State<'_, AppState>,
+	tool_call_id: String,
+) -> Result<RerunToolOutcome, MoonError> {
+	state.coder.rerun_tool_call(tool_call_id).await.map_err(MoonError::from)
 }
 
 /// List persisted sessions for the active workspace folder. Empty

@@ -1,13 +1,16 @@
 <script lang="ts">
 	import { fmtJson, openToolPath, parseToolError } from './toolBodyHelpers';
+	import ToolReapplyMenu from './ToolReapplyMenu.svelte';
 
 	interface Props {
 		args: unknown;
 		result: unknown;
 		hasResult: boolean;
+		/** Tool-call id, for the "re-apply to disk" recovery menu. */
+		callId: string;
 	}
 
-	let { args, result, hasResult }: Props = $props();
+	let { args, result, hasResult, callId }: Props = $props();
 
 	/** Match `crates/moon-coder/src/tools.rs`'s `EditFileArgs`. */
 	function parseArgs(a: unknown): { path: string; find: string; replace: string; occurrence: number | null } | null {
@@ -115,6 +118,9 @@
 			{/if}
 			{#if occurrenceLabel !== null}
 				<span class="ef-meta">{occurrenceLabel}</span>
+			{/if}
+			{#if path !== null}
+				<ToolReapplyMenu {callId} />
 			{/if}
 		</header>
 		{#if errorMsg !== null}

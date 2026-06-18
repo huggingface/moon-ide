@@ -1459,6 +1459,14 @@ export type RevertedMessage = {
 	images?: ImageAttachmentPayload[];
 };
 
+/** Return shape of `coder_rerun_tool_call`. Carries the tool that
+ *  was reapplied plus its fresh dispatch result, so the panel can
+ *  confirm the reapply. Mirrors `moon_coder::RerunToolOutcome`. */
+export type RerunToolOutcome = {
+	tool_name: string;
+	result: unknown;
+};
+
 /** Snapshot returned by `coder_status`. Mirrors `moon_coder::CoderStatus`. */
 export type CoderStatus = {
 	signed_in: boolean;

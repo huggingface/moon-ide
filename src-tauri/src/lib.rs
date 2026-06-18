@@ -232,6 +232,7 @@ pub fn run() {
 			commands::coder::coder_unqueue_steer,
 			commands::coder::coder_respond_to_prompt,
 			commands::coder::coder_revert_to_message,
+			commands::coder::coder_rerun_tool_call,
 			commands::coder::coder_list_sessions,
 			commands::coder::coder_active_session,
 			commands::coder::coder_new_session,
