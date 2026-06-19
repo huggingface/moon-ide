@@ -325,6 +325,27 @@ class WorkspaceState {
 	// buffers / tabs without rebuilding them.
 	folderStates = new SvelteMap<string, FolderState>();
 
+	// Monotonic "editor view changed" signal. Bumped by every setter
+	// that mutates what an editor pane renders (open buffers, active
+	// path, focused side, diff/preview mode). `EditorPane`'s `view`
+	// derived reads this first thing so it has a guaranteed-fresh
+	// top-level dependency that *always* fires on navigation —
+	// independent of the `activeFolderState` getter funnel.
+	//
+	// Why this exists: reading per-folder fields goes
+	// `workspace.leftActive` → `activeFolderState` (resolves the
+	// `folderStates` map entry) → `.leftActive` on that `FolderState`
+	// instance. Empirically a consumer's subscription to the leaf
+	// field could go stale (the editor body froze on a buffer that
+	// was no longer even open, while the tab strip kept updating).
+	// Rather than chase the exact fine-grained-reactivity edge, this
+	// tick gives the body a dependency that can't be lost: a plain
+	// top-level `$state` the consumer re-reads every run and every
+	// mutating setter bumps. The watchdog also bumps it as a recovery
+	// nudge. Cheap (one integer) and the editor view is not a hot
+	// enough recompute for it to matter.
+	editorViewTick = $state(0);
+
 	loadingPaths = $state(false);
 	toast = $state<string | null>(null);
 
@@ -930,6 +951,7 @@ class WorkspaceState {
 	set openFiles(value: OpenFile[]) {
 		if (this.activeFolderState) {
 			this.activeFolderState.openFiles = value;
+			this.editorViewTick++;
 		}
 	}
 
@@ -957,6 +979,7 @@ class WorkspaceState {
 	set leftActive(value: string | null) {
 		if (this.activeFolderState) {
 			this.activeFolderState.leftActive = value;
+			this.editorViewTick++;
 		}
 	}
 
@@ -966,6 +989,7 @@ class WorkspaceState {
 	set rightActive(value: string | null) {
 		if (this.activeFolderState) {
 			this.activeFolderState.rightActive = value;
+			this.editorViewTick++;
 		}
 	}
 
@@ -984,6 +1008,7 @@ class WorkspaceState {
 	set focusedSide(value: SplitSide) {
 		if (this.activeFolderState) {
 			this.activeFolderState.focusedSide = value;
+			this.editorViewTick++;
 		}
 	}
 
@@ -993,6 +1018,7 @@ class WorkspaceState {
 	private set previewModes(value: Map<string, MarkdownView>) {
 		if (this.activeFolderState) {
 			this.activeFolderState.previewModes = value;
+			this.editorViewTick++;
 		}
 	}
 
@@ -1002,6 +1028,7 @@ class WorkspaceState {
 	private set diffModes(value: Set<string>) {
 		if (this.activeFolderState) {
 			this.activeFolderState.diffModes = value;
+			this.editorViewTick++;
 		}
 	}
 
@@ -1035,6 +1062,11 @@ class WorkspaceState {
 	activePath: string | null = $derived(this.focusedSide === 'left' ? this.leftActive : this.rightActive);
 
 	activeFile: OpenFile | null = $derived.by(() => {
+		// Guaranteed-fresh invalidation, same rationale as
+		// `EditorPane`'s `view` derived: the per-folder field reads
+		// below route through the `activeFolderState` getter funnel,
+		// whose leaf-field subscription can go stale. The tick can't.
+		void this.editorViewTick;
 		// Read `openFiles` before the early-out so this derived stays
 		// subscribed to the buffer list even when there's no active
 		// path yet (fresh folder open). Otherwise a later populate of
@@ -4252,17 +4284,30 @@ class WorkspaceState {
 				if (!next) {
 					return;
 				}
-				this.openFiles = [...this.openFiles, next];
-				// Notify the LSP broker only on first open — reopening
-				// an already-loaded buffer is a pure UI navigation
-				// event, the server still holds its open state. Skip
-				// for deleted buffers: there's no on-disk document
-				// for the server to track. Blame fetch is handled by
-				// `setActive` (called a few lines below) — that path
-				// covers session-restored files and cross-folder
-				// jumps too, neither of which come through here.
-				if (next.kind === 'text' && !next.isDeleted) {
-					this.lspOpen(next.path, next.text);
+				// Re-check after the await before appending. The
+				// `!existing` test above ran *before* `loadTextFile`
+				// suspended, so two concurrent `openFile(path)` calls
+				// (the file-tree click fires both `onSelectionChange`
+				// *and* the wrapper-click handler — see
+				// `activateRowFromTree`) could each pass that test and
+				// then each append, corrupting `openFiles` with a
+				// duplicate entry (observed in the wild). Only the call
+				// that still doesn't see the buffer appends + opens the
+				// LSP doc; the loser falls through to the shared
+				// tab-add + activate below, which are idempotent.
+				if (!this.openFiles.some((f) => f.path === path)) {
+					this.openFiles = [...this.openFiles, next];
+					// Notify the LSP broker only on first open —
+					// reopening an already-loaded buffer is a pure UI
+					// navigation event, the server still holds its open
+					// state. Skip for deleted buffers: there's no
+					// on-disk document for the server to track. Blame
+					// fetch is handled by `setActive` (called below) —
+					// that path covers session-restored files and
+					// cross-folder jumps too.
+					if (next.kind === 'text' && !next.isDeleted) {
+						this.lspOpen(next.path, next.text);
+					}
 				}
 			} catch (err) {
 				this.flash(`Failed to open ${path}: ${formatError(err)}`);
@@ -5306,19 +5351,32 @@ class WorkspaceState {
 			if (rendered === expected) {
 				return;
 			}
+			// Recovery nudge: bump the view tick so the pane's `view`
+			// derived (which reads it) is force-invalidated and the
+			// body recomputes from current state. With the tick now
+			// wired into every editor-state setter this freeze should
+			// no longer be reachable, but the nudge is cheap insurance
+			// and re-checks below whether it actually recovered.
+			this.editorViewTick++;
 			// Capture the full diagnostic *now*, while the freeze is
 			// live — the user may switch folders (which un-freezes the
 			// pane and destroys the evidence) before thinking to run
 			// the palette command. The toast makes the detection
 			// visible; the dump in the `runtime` log makes it
-			// actionable later.
-			frontendLog(
-				'runtime',
-				'error',
-				`editor render watchdog: pane=${side} state.active=${expected} but DOM rendered=${rendered || '∅'} — ` +
-					`the pane's template effect appears frozen.\n${this.dumpEditorState()}`,
-			);
-			this.flash('Editor render bug detected — diagnostic captured (see runtime logs)');
+			// actionable later. Re-read after a frame so the dump
+			// reflects whether the nudge above un-stuck it.
+			setTimeout(() => {
+				const stillStale = (body.dataset.viewPath ?? '') !== (side === 'left' ? this.leftActive : this.rightActive);
+				frontendLog(
+					'runtime',
+					stillStale ? 'error' : 'warn',
+					`editor render watchdog: pane=${side} detected stale render (DOM=${rendered || '∅'}, ` +
+						`state=${expected}); after tick nudge ${stillStale ? 'STILL STALE' : 'recovered'}.\n${this.dumpEditorState()}`,
+				);
+				if (stillStale) {
+					this.flash('Editor render bug detected — diagnostic captured (runtime logs)');
+				}
+			}, 0);
 		}, 250);
 	}
 

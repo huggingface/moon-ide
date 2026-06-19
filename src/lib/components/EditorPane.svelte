@@ -31,6 +31,16 @@
 	// one derived, recomputed atomically on every active-path /
 	// openFiles / mode change — no intermediate edge to go stale.
 	const view = $derived.by(() => {
+		// `editorViewTick` is a plain top-level `$state` bumped by every
+		// setter that changes what a pane renders. Reading it first
+		// gives this derived a dependency that *cannot* go stale — the
+		// per-folder field reads below go through the `activeFolderState`
+		// getter funnel, whose leaf-field subscription was empirically
+		// getting lost (body froze on a buffer no longer open while the
+		// tab strip kept updating). The tick is the guaranteed
+		// invalidation path; the field reads below still do the actual
+		// work.
+		void workspace.editorViewTick;
 		// Read both signals unconditionally and up front. An earlier
 		// version returned early when `path === null`, which meant the
 		// derived never subscribed to `openFiles` on that run — so when
