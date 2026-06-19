@@ -96,7 +96,11 @@ opens a tooltip with the full author, commit date, short hash, and
 commit subject. Backed by `WorkspaceHost::git_blame` /
 `fs_git_blame` shelling out to `git blame --porcelain -w`.
 Uncommitted edits render as `Uncommitted changes`; blame refreshes
-on save. Stale across live edits by design — the widget is a
+on save, on any external mutation that reloads the buffer from disk,
+and on a `.git/HEAD` move (external `git switch` / `checkout`) even
+when the branch's content is byte-identical — the fs-watcher
+forwards that write so the attribution re-attributes without a
+manual reload. Stale across live edits by design — the widget is a
 glance, not a ground truth.
 
 ### 5.2 — Diff view

@@ -3178,6 +3178,20 @@ class WorkspaceState {
 		// `null` means "we don't know which paths moved" (window
 		// focus, palette `Refresh File Tree`) — fall back to the
 		// conservative loop over every open buffer.
+		// A write to `.git/HEAD` (external `git switch` / `git
+		// checkout <branch>`) moves the repo's history pointer
+		// without necessarily touching a working-tree file: when the
+		// new branch's content matches the old, no per-file event
+		// fires. The fs-watcher forwards those `.git/` top-level
+		// writes (HEAD / MERGE_HEAD / MERGE_MSG) precisely so we can
+		// treat them as "history moved" and re-attribute open
+		// buffers' blame — otherwise the inline widget keeps showing
+		// the previous branch's authorship. We only re-blame buffers
+		// *not* in `changedSubset`: a switch that did change a file's
+		// bytes also fired that file's own working-tree event, so it
+		// reloads + re-blames through the branch below. Splitting it
+		// this way means no buffer is blamed twice in one pass.
+		const gitStateMoved = changedSubset !== null && subsetTouchesGitState(changedSubset);
 		for (const file of this.openFiles) {
 			if (file.kind !== 'text' || file.isDeleted) {
 				continue;
@@ -3189,15 +3203,26 @@ class WorkspaceState {
 			if (file.isExternal) {
 				continue;
 			}
-			if (changedSubset !== null && !changedSubset.has(file.path)) {
+			const inSubset = changedSubset === null || changedSubset.has(file.path);
+			if (!inSubset && !gitStateMoved) {
 				frontendLog(
 					'fs-watcher',
 					'debug',
-					`reload skipped: open file '${file.path}' not in subset of ${changedSubset.size} path(s)`,
+					`reload skipped: open file '${file.path}' not in subset of ${changedSubset?.size ?? 0} path(s)`,
 				);
 				continue;
 			}
 			this.refreshHead(file.path);
+			if (!inSubset) {
+				// History moved (branch switch / merge) but this
+				// file's bytes didn't change on disk, so there's
+				// nothing to reload — only the per-line attribution
+				// can differ across the two histories. Re-blame
+				// without touching the buffer.
+				frontendLog('fs-watcher', 'info', `re-blaming '${file.path}' after git state change (no working-tree edit)`);
+				this.scheduleBlameRefresh(file.path);
+				continue;
+			}
 			if (file.isDirty) {
 				frontendLog(
 					'fs-watcher',
@@ -3211,6 +3236,15 @@ class WorkspaceState {
 					`reloading '${file.path}' from disk (matched fs:changed${changedSubset === null ? ' [null subset → full sweep]' : ''})`,
 				);
 				void this.reloadOpenFileFromDisk(file.path);
+				// On-disk content changed → `git blame` may now
+				// report different commits (a fresh commit, a branch
+				// switch that rewrote these lines, a working-tree
+				// edit showing "Not Committed Yet"). The in-memory
+				// buffer won't re-attribute itself; kick a debounced
+				// refresh so the inline widget catches up. The
+				// per-path timer in `scheduleBlameRefresh` collapses
+				// this with any other trigger in the same burst.
+				this.scheduleBlameRefresh(file.path);
 			}
 		}
 		// Fan out to every bound folder's project-bar badge. The
@@ -6523,6 +6557,35 @@ function relativeToRoot(absolute: string, root: string): string | null {
 
 export function isUntitledPath(path: string): boolean {
 	return path.startsWith('untitled:');
+}
+
+/** True when the fs-watcher's changed-path set includes one of the
+ *  `.git/` top-level files it forwards for history-pointer moves.
+ *  Those writes shift what `git blame` attributes to each line even
+ *  when no working-tree file changes, so `refreshGitStatus` uses
+ *  this to decide whether to re-blame open buffers that weren't
+ *  themselves touched on disk. */
+function subsetTouchesGitState(subset: ReadonlySet<string>): boolean {
+	for (const p of subset) {
+		if (isGitStatePath(p)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/** Matches the backend allowlist in `fs_watcher.rs`
+ *  (`is_dotgit_observed_top_level`): a `.git/`-relative `HEAD`
+ *  (branch switch / checkout), or `MERGE_HEAD` / `MERGE_MSG` (a
+ *  merge starting / finishing). Path is forward-slash,
+ *  workspace-relative. */
+function isGitStatePath(path: string): boolean {
+	const parts = path.split('/');
+	const last = parts[parts.length - 1];
+	if (last !== 'HEAD' && last !== 'MERGE_HEAD' && last !== 'MERGE_MSG') {
+		return false;
+	}
+	return parts[parts.length - 2] === '.git';
 }
 
 /** True for any synthetic path that doesn't back onto a real
