@@ -2302,6 +2302,22 @@ class CoderPanelState {
 			for (const inner of envelope.event.events) {
 				this.#applySessionEvent(sessionBucket, folderBucket, envelope.folder, envelope.session_id, inner);
 			}
+			// The batch's trailing `turn_complete` terminator always
+			// clears `busy` (it exists so a *settled* reopened session
+			// doesn't render a phantom Stop button). A session whose
+			// turn is still streaming in the background is genuinely
+			// running, so re-assert its pip — otherwise clicking into a
+			// running session and backing out drops the sessions-list
+			// "running" badge. A live-parked `ask_user` shows as "needs
+			// input" instead; re-derive that from the replayed rows (an
+			// unanswered `ask_user` tool row), since the terminator
+			// cleared `awaitingInput` too.
+			if (envelope.event.in_flight) {
+				sessionBucket.busy = true;
+				sessionBucket.awaitingInput = sessionBucket.rows.some(
+					(row) => row.kind === 'tool' && row.name === 'ask_user' && !row.hasResult,
+				);
+			}
 			return;
 		}
 		this.#applySessionEvent(sessionBucket, folderBucket, envelope.folder, envelope.session_id, envelope.event);

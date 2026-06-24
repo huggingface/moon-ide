@@ -263,6 +263,13 @@ class CompanionState {
 					this.#onCoderEvent({ ...envelope, event: e });
 				}
 			}
+			// The batch ends with a `turn_complete` terminator that
+			// clears `busy`; re-assert it when the reopened session is
+			// still running in the background so the composer keeps
+			// showing Stop instead of Send.
+			if (ev.in_flight === true) {
+				this.busy = true;
+			}
 			return;
 		}
 		if (typeof ev.type !== 'string') {

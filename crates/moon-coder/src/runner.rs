@@ -1666,8 +1666,16 @@ impl CoderHandle {
 		// record's `tool_call` event) instead of slapping an
 		// "Interrupted before tool completed" result on them. Empty
 		// for the common reopen / cold-start case.
+		// `in_flight` rides alongside `live_parked_ids` off the same
+		// runtime lookup: it's `true` when this session has a turn
+		// still streaming in the background. The frontend uses it to
+		// keep the sessions-list "running" badge lit after the user
+		// clicks into a running session and backs out — the replay's
+		// trailing `TurnComplete` terminator would otherwise clear it.
+		let mut in_flight = false;
 		let live_parked_ids: std::collections::HashSet<String> = if already_mounted {
 			if let Some(rt) = fs.runtime(&id).await {
+				in_flight = rt.turn.lock().await.cancel.is_some();
 				let mut set = std::collections::HashSet::new();
 				for orphan_id in &orphan_tool_call_ids {
 					if rt.prompts.holds(orphan_id).await {
@@ -1863,13 +1871,19 @@ impl CoderHandle {
 		// log, so without this final nudge the panel would render
 		// the "stop" button after every restore — even for a session
 		// whose last turn finished cleanly hours ago. Sending an
-		// explicit terminator at end-of-replay is correct in all
-		// cases: if the IDE was killed mid-turn we want busy=false
-		// anyway, since no real turn is running on the rehydrated
-		// session. It rides at the tail of the batch so the
-		// frontend closes the replay window in the same reduce pass.
+		// explicit terminator at end-of-replay closes the replay
+		// window and resets busy. When the session is genuinely still
+		// running (`in_flight`), the frontend re-asserts the pip from
+		// the `Replay.in_flight` flag right after applying the batch,
+		// so a reopened-and-backed-out running session keeps its
+		// sessions-list badge. It rides at the tail of the batch so
+		// the frontend closes the replay window in the same reduce
+		// pass.
 		replay_events.push(CoderEvent::TurnComplete);
-		sink.send(CoderEvent::Replay { events: replay_events });
+		sink.send(CoderEvent::Replay {
+			events: replay_events,
+			in_flight,
+		});
 		Ok(summary)
 	}
 

@@ -461,6 +461,10 @@ The session list paints per-row status: **needs input** (parked on
 `ask_user`; takes precedence over running), **running** (busy), and
 **finished** (turn ended while the user wasn't following; cleared on
 open). Folder-bar glyphs mirror the same three states as rollups.
+Reopening a still-running session preserves these states: the replay
+batch's trailing `TurnComplete` terminator clears the pip, so `Replay`
+carries an `in_flight` flag and the frontend re-asserts **running** /
+**needs input** after applying the batch.
 
 ### On disk
 

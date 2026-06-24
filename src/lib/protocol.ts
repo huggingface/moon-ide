@@ -1546,7 +1546,7 @@ export type CoderEvent =
 	| { kind: 'aborted' }
 	| { kind: 'error'; message: string }
 	| { kind: 'session_loaded'; id: string; title: string; created_at_ms: number; updated_at_ms: number }
-	| { kind: 'replay'; events: CoderEvent[] }
+	| { kind: 'replay'; events: CoderEvent[]; in_flight: boolean }
 	| { kind: 'session_title_updated'; id: string; title: string }
 	| { kind: 'session_list_changed' }
 	| { kind: 'folder_summary_ready'; folder: string; description: string }

@@ -179,7 +179,17 @@ pub enum CoderEvent {
 	/// uses, so ordering and semantics are identical. Not used for
 	/// live turns — those stay one-event-per-emit so streaming
 	/// deltas land as they're produced.
-	Replay { events: Vec<CoderEvent> },
+	///
+	/// `in_flight` is `true` when the reopened session still has a
+	/// turn streaming in the background (the user clicked into a
+	/// running session and is about to back out again). The batch
+	/// always ends with a `TurnComplete` terminator so a *settled*
+	/// session's replayed `UserMessage` events don't leave a phantom
+	/// Stop button — but that terminator also clears the busy pip,
+	/// which would drop the sessions-list "running" badge on a
+	/// session whose turn is genuinely still running. The frontend
+	/// re-asserts the pip from this flag after applying the batch.
+	Replay { events: Vec<CoderEvent>, in_flight: bool },
 
 	/// The active session's title was rewritten — either by the
 	/// auto-rename pass after the first turn, or (Phase 6.4+) by
