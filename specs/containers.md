@@ -213,6 +213,10 @@ What it ships:
   comfort tooling (`git`, `ripgrep`, `fzf`, `bat`, `jq`). Projects
   pin their own versions via `.nvmrc` / `rust-toolchain.toml` /
   `pyproject.toml` / `go.mod`.
+- **Cluster tooling**: `helm` (user-mode, pinned) for the
+  Helm-chart-heavy infra / workloads repos. No Kubernetes daemon
+  or `kubectl` baked in — add those in a `FROM moon-base`
+  extension if a team needs them.
 - **Language servers**: `rust-analyzer` and `gopls` baked in; the
   LSP broker runs them in-container via `docker exec` when present.
   Python / JS servers install per-project — see

@@ -85,6 +85,9 @@ the "polyglot toolchain" tradeoff we picked in ADR 0007.
   needs at the interactive prompt (ad-hoc queries,
   snapshotting a dev mongo, restoring a fixture into it).
   mongosh 2.x speaks every server protocol from 4.4 onwards.
+- **`helm`** (pinned, user-mode) for the Helm-chart-heavy infra
+  and workloads repos. No `kubectl` or Kubernetes daemon baked
+  in — extend with `FROM moon-base` if a team needs them.
 - **Comfort tooling**: `ripgrep` (`rg`), `fzf`, `bat` (the
   Debian `batcat` symlinked back to `bat`), `jq`.
 - **Standard plumbing**: `git`, `curl`, `wget`, `ca-certificates`,

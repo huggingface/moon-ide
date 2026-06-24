@@ -278,6 +278,30 @@ RUN mkdir -p "${HOME}/.local" \
 RUN go install golang.org/x/tools/gopls@latest \
  && gopls version
 
+# Helm (the Kubernetes package manager). The org's infra and
+# workloads repos are Helm-chart-heavy (`apiVersion: v2` charts,
+# `helm dependency`/`lint`/`template`/`upgrade` in their CI and
+# Makefiles), so a dev poking at those clusters from a container
+# terminal wants `helm` on PATH. Installed user-mode from the
+# upstream tarball into `~/.local/bin` (already on PATH), same
+# pin-a-version pattern as Go / uv / fnm. v4 reads the v2 charts
+# every team already ships.
+#
+# `TARGETARCH` (still in scope from the Go block above) is
+# BuildKit's per-platform arch and matches Helm's tarball naming
+# (`amd64` / `arm64`) exactly. The tarball unpacks into a
+# `linux-<arch>/` directory; we lift just the `helm` binary out.
+# `--retry`: get.helm.sh occasionally hiccups during the build
+# window — back off rather than hard-fail on a transient blip.
+ARG HELM_VERSION=4.2.2
+RUN curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused \
+      "https://get.helm.sh/helm-v${HELM_VERSION}-linux-${TARGETARCH}.tar.gz" \
+      -o /tmp/helm.tar.gz \
+ && tar -C /tmp -xzf /tmp/helm.tar.gz "linux-${TARGETARCH}/helm" \
+ && install -D -m 0755 "/tmp/linux-${TARGETARCH}/helm" "${HOME}/.local/bin/helm" \
+ && rm -rf /tmp/helm.tar.gz "/tmp/linux-${TARGETARCH}" \
+ && helm version
+
 # moon-edit — the in-container `$GIT_EDITOR` shim that forwards
 # `git commit --amend` (and any other editor-spawning command)
 # to the host moon-ide via the per-workspace `instance.sock`.
