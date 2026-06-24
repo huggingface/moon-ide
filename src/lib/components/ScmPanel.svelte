@@ -214,16 +214,22 @@
 	// has no upstream configured (freshly-created locally, never
 	// pushed), `git push` would fail with "no upstream branch" —
 	// the user actually wants `git push -u origin <branch>` here.
-	// Detached HEAD (`branch.name === null`) is excluded; there's
-	// nothing to publish.
-	const needsPublish = $derived(branch.name !== null && !branch.hasUpstream);
+	// The same applies to a *foreign* upstream (`upstreamForeign`):
+	// a branch made with `git checkout -b feature origin/main`
+	// tracks `refs/heads/main`, so a plain push would target the
+	// shared branch. Publishing creates `origin/<branch>` and
+	// re-points tracking instead. Detached HEAD (`branch.name ===
+	// null`) is excluded; there's nothing to publish.
+	const needsPublish = $derived(branch.name !== null && (!branch.hasUpstream || branch.upstreamForeign));
 
 	// "Open PR" button visibility. We surface the affordance only
 	// when:
 	//   - the backend produced a PR URL (recognised remote host
 	//     and a non-detached branch, so `prUrl !== null`),
-	//   - the branch has been published (no point asking GitHub to
-	//     PR an upstream that doesn't exist),
+	//   - the branch has been published — i.e. not `needsPublish`
+	//     (no point asking GitHub to PR a remote branch that
+	//     doesn't exist yet, including the foreign-upstream case
+	//     where the branch only tracks the shared default branch),
 	//   - the branch isn't main / master (PR'ing the default branch
 	//     into itself is never the intent — and the extra click on
 	//     the branch you most often have checked out would be a
@@ -239,7 +245,7 @@
 	// still applies to the visibility decision; the URL swap is
 	// orthogonal.
 	const prButtonVisible = $derived.by(() => {
-		if (branch.prUrl === null || !branch.hasUpstream) {
+		if (branch.prUrl === null || needsPublish) {
 			return false;
 		}
 		if (branch.name === 'main' || branch.name === 'master') {

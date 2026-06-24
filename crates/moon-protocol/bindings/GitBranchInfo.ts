@@ -53,6 +53,24 @@ hasUpstream: boolean,
  */
 upstreamTracked: boolean, 
 /**
+ * Whether the configured upstream is a *foreign* tracked
+ * branch — a named-remote branch (`upstream_tracked ==
+ * true`) whose short name differs from the local branch.
+ * This is the `git checkout -b feature origin/main` shape:
+ * the new branch tracks `refs/heads/main` for pull / rebase
+ * purposes but has no remote branch of its own yet. Pushing
+ * to its configured upstream would fast-forward the *shared*
+ * branch (land the feature commits straight on `main`), so
+ * the SCM panel treats it exactly like an unpublished branch
+ * — it offers "Publish branch" (`git push -u origin HEAD`,
+ * which creates `origin/<branch>` and re-points tracking)
+ * rather than Sync Changes, and `git_push` refuses to update
+ * the foreign branch. `false` for the normal same-name
+ * upstream, the fork-PR URL shape, and whenever
+ * `upstream_tracked == false`.
+ */
+upstreamForeign: boolean, 
+/**
  * Number of commits the local branch has that its configured
  * upstream doesn't — commits that would be sent on the next
  * `git push`. `0` when there's no upstream configured, no

@@ -377,6 +377,19 @@ export type GitBranchInfo = {
 	 * Always `false` when `hasUpstream` is `false`.
 	 */
 	upstreamTracked: boolean;
+	/**
+	 * Whether the upstream is a *foreign* tracked branch — a
+	 * named-remote branch (`upstreamTracked`) whose name differs
+	 * from the local branch. This is the `git checkout -b feature
+	 * origin/main` shape: the branch tracks `refs/heads/main` for
+	 * pull / rebase but owns no remote branch yet. Pushing to that
+	 * upstream would land the feature commits straight on `main`,
+	 * so the SCM panel treats it like an unpublished branch and
+	 * offers "Publish branch" instead of Sync Changes. `false` for
+	 * the normal same-name upstream, the fork-PR URL shape, and
+	 * whenever `upstreamTracked` is `false`.
+	 */
+	upstreamForeign: boolean;
 	/** Commits the local branch has that upstream doesn't (push count). 0 when no upstream / no HEAD / untracked upstream. */
 	ahead: number;
 	/** Commits upstream has that the local branch doesn't (pull count). 0 when no upstream / no HEAD / untracked upstream. */

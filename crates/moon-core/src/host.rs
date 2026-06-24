@@ -2033,7 +2033,8 @@ fn run_git_branch(root: &Utf8Path) -> GitBranchInfo {
 	// no named remote, no remote-tracking ref, but pushing /
 	// pulling does work. Detached HEAD / non-repo collapse to
 	// `false` via the `name` filter.
-	let has_upstream = name.as_deref().is_some_and(|n| read_branch_upstream(root, n).is_some());
+	let upstream = name.as_deref().and_then(|n| read_branch_upstream(root, n));
+	let has_upstream = upstream.is_some();
 
 	// `@{u}` resolves iff the upstream is a *tracked* named
 	// remote (refs/remotes/<remote>/<branch> exists). For the
@@ -2049,6 +2050,25 @@ fn run_git_branch(root: &Utf8Path) -> GitBranchInfo {
 			.output()
 			.ok()
 			.is_some_and(|o| o.status.success());
+
+	// A tracked named-remote upstream whose branch name differs
+	// from the local branch is *foreign*: we branched off a
+	// shared ref (`git checkout -b feature origin/main` leaves
+	// `branch.feature.merge = refs/heads/main`) and don't own a
+	// remote branch yet. The SCM panel must treat this as an
+	// unpublished branch, never as "push to its upstream" — that
+	// would land our commits straight on `main`. The fork-PR
+	// shape is excluded by the `upstream_tracked` gate (URL
+	// remotes don't resolve `@{u}`), and a normal same-name
+	// upstream is excluded by the name comparison.
+	let upstream_foreign = upstream_tracked
+		&& match (&name, &upstream) {
+			(Some(local), Some((_, merge))) => {
+				let upstream_branch = merge.strip_prefix("refs/heads/").unwrap_or(merge.as_str());
+				upstream_branch != local.as_str()
+			}
+			_ => false,
+		};
 
 	// `rev-list --count --left-right HEAD...@{u}` prints
 	// `<ahead>\t<behind>`: commits we have that upstream doesn't,
@@ -2118,6 +2138,7 @@ fn run_git_branch(root: &Utf8Path) -> GitBranchInfo {
 		head_short_sha,
 		has_upstream,
 		upstream_tracked,
+		upstream_foreign,
 		ahead,
 		behind,
 		pr_url,
@@ -2869,26 +2890,31 @@ fn cap_summary_at_char_boundary(text: String, cap: usize) -> String {
 	clipped
 }
 
-/// Push the current branch to its configured upstream using an
-/// explicit refspec — `git push <remote> HEAD:<merge_ref>` — when
-/// `branch.<name>.merge` is set. Falls back to bare `git push`
-/// when no upstream is configured (which will fail with git's
-/// standard "no upstream branch" message — the SCM panel
-/// surfaces "Publish branch" before the user gets here, so this
-/// is the safety-net path).
+/// Push the current branch. Plain `git push` in almost every
+/// case — we only override git's own routing with an explicit
+/// `git push <remote> HEAD:<merge_ref>` refspec for the fork-PR
+/// shape, detected as a configured upstream whose `@{u}` does
+/// *not* resolve to a remote-tracking ref (a bare-URL remote).
 ///
-/// We avoid bare `git push` in the configured-upstream case
-/// because `push.default = simple` (git's default since 2.0)
-/// refuses to push when the local branch name differs from the
-/// merge target's name. That's the exact shape `gh pr checkout`
-/// produces for a fork PR whose head is on the fork's default
-/// branch: the local branch is named `<owner>/<head>` (to avoid
-/// colliding with the upstream's default branch) while
-/// `branch.<name>.merge` is `refs/heads/<head>`. Plain `git push`
-/// dies with `fatal: The upstream branch of your current branch
-/// does not match the name of your current branch`; the explicit
-/// refspec sidesteps the `simple` check by telling git exactly
-/// what we want.
+/// `gh pr checkout` on a fork PR names the local branch
+/// `<owner>/<head>` (to avoid colliding with the upstream's
+/// default branch) and points `branch.<name>.remote` at the
+/// fork URL with `merge` = `refs/heads/<head>`. Plain `git push`
+/// dies there with `fatal: The upstream branch of your current
+/// branch does not match the name of your current branch`
+/// (`push.default = simple`, git's default since 2.0), so the
+/// explicit refspec tells git exactly what we want.
+///
+/// For a *tracked* named-remote upstream we deliberately keep
+/// plain `git push` so git's `simple` name-match safety stays in
+/// force. That matters for the foreign-upstream shape — a branch
+/// created with `git checkout -b feature origin/main` tracks
+/// `refs/heads/main`, and an explicit `HEAD:refs/heads/main`
+/// would fast-forward the shared branch (land the feature
+/// commits on `main`). The SCM panel surfaces "Publish branch"
+/// for that state (and for the no-upstream state) so the user
+/// rarely reaches this with such a branch, but the gate here is
+/// the real guarantee.
 ///
 /// Stderr is surfaced verbatim on failure (auth refused, non-
 /// fast-forward, network down, …) so the user gets git's own
@@ -2909,8 +2935,31 @@ fn run_git_push(root: &Utf8Path) -> MoonResult<()> {
 
 	if let Some(branch) = name {
 		if let Some((remote, merge)) = read_branch_upstream(root, &branch) {
-			let refspec = format!("HEAD:{merge}");
-			return run_git_simple(root, &["push", &remote, &refspec], "git push");
+			// Only override git's own push routing for the fork-PR
+			// shape: a URL remote with no remote-tracking ref, where
+			// the local branch name intentionally differs from the
+			// PR head and `push.default = simple` would refuse. We
+			// detect it by `@{u}` *not* resolving. For any tracked
+			// named-remote upstream we defer to plain `git push` so
+			// git's own name-match safety stays in force — crucially,
+			// that stops us from fast-forwarding a *foreign* tracked
+			// branch (a feature branch made with `git checkout -b foo
+			// origin/main` tracks `refs/heads/main`; pushing
+			// `HEAD:refs/heads/main` would land the feature commits on
+			// `main`). The SCM panel routes such branches to
+			// `git_publish_branch` instead, but we guard here too so a
+			// direct `git_push` call can never do the wrong thing.
+			let tracked = Command::new("git")
+				.arg("-C")
+				.arg(root.as_std_path())
+				.args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+				.output()
+				.ok()
+				.is_some_and(|o| o.status.success());
+			if !tracked {
+				let refspec = format!("HEAD:{merge}");
+				return run_git_simple(root, &["push", &remote, &refspec], "git push");
+			}
 		}
 	}
 	run_git_simple(root, &["push"], "git push")
@@ -7000,6 +7049,27 @@ mod tests {
 		);
 	}
 
+	/// SHA a ref points at in a (bare) repo, or `None` when the ref
+	/// doesn't exist. Used to assert a push did / didn't move a
+	/// remote branch.
+	fn remote_ref_sha(git: &std::path::Path, repo: &std::path::Path, ref_name: &str) -> Option<String> {
+		let out = std::process::Command::new(git)
+			.arg("-C")
+			.arg(repo)
+			.args(["rev-parse", "--verify", "--quiet", ref_name])
+			.output()
+			.expect("spawn git rev-parse");
+		if !out.status.success() {
+			return None;
+		}
+		let sha = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+		if sha.is_empty() {
+			None
+		} else {
+			Some(sha)
+		}
+	}
+
 	#[tokio::test]
 	async fn git_fetch_advances_remote_tracking_ref() {
 		let Some(git) = which_git() else {
@@ -7426,6 +7496,105 @@ mod tests {
 		assert!(
 			branch.upstream_tracked,
 			"named-remote upstream must be tracked, got {branch:?}"
+		);
+		assert!(
+			!branch.upstream_foreign,
+			"same-name upstream is not foreign, got {branch:?}"
+		);
+	}
+
+	/// `git checkout -b feature origin/main` leaves the new branch
+	/// tracking `refs/heads/main` (remote `origin`, tracked) while
+	/// its own name differs. That is the *foreign* upstream shape:
+	/// `git_push` must never fast-forward the shared `main`, and the
+	/// SCM panel publishes the branch instead. Regression test for
+	/// "push a coder-created branch and it lands on remote main".
+	#[tokio::test]
+	async fn branch_off_default_is_foreign_and_push_spares_main() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping foreign-upstream test");
+			return;
+		};
+
+		let root = TempDir::new().unwrap();
+		let remote = root.path().join("remote.git");
+		let local = root.path().join("local");
+
+		run_git(&git, root.path(), &["init", "--bare", "-q", "-b", "main", "remote.git"]);
+		let seed = root.path().join("seed");
+		std::fs::create_dir_all(&seed).unwrap();
+		run_git(&git, &seed, &["init", "-q", "-b", "main"]);
+		run_git(&git, &seed, &["config", "user.email", "s@example.com"]);
+		run_git(&git, &seed, &["config", "user.name", "Seed"]);
+		run_git(&git, &seed, &["remote", "add", "origin", remote.to_str().unwrap()]);
+		std::fs::write(seed.join("README.md"), "v1\n").unwrap();
+		run_git(&git, &seed, &["add", "."]);
+		run_git(&git, &seed, &["commit", "-q", "-m", "initial"]);
+		run_git(&git, &seed, &["push", "-q", "-u", "origin", "main"]);
+
+		run_git(&git, root.path(), &["clone", "-q", remote.to_str().unwrap(), "local"]);
+		run_git(&git, &local, &["config", "user.email", "l@example.com"]);
+		run_git(&git, &local, &["config", "user.name", "Local"]);
+		// Belt-and-braces: pin the default push policy so the
+		// fallback path's safety doesn't hinge on the host's git
+		// global config.
+		run_git(&git, &local, &["config", "push.default", "simple"]);
+
+		// The coder's branch-creation shape: branch directly off the
+		// remote-tracking default ref.
+		run_git(&git, &local, &["checkout", "-q", "-b", "feature/foo", "origin/main"]);
+
+		let local_root = Utf8PathBuf::from_path_buf(local.canonicalize().unwrap()).unwrap();
+		let host = LocalHost::new(local_root.clone());
+		let branch = host.git_branch().await.unwrap();
+
+		assert_eq!(branch.name.as_deref(), Some("feature/foo"));
+		assert!(branch.has_upstream, "tracks origin/main, got {branch:?}");
+		assert!(branch.upstream_tracked, "origin/main is a tracked ref, got {branch:?}");
+		assert!(
+			branch.upstream_foreign,
+			"branch name differs from tracked upstream `main` → foreign, got {branch:?}"
+		);
+
+		// Land a local commit and capture the remote's `main` tip so
+		// we can prove a push attempt never moves it.
+		std::fs::write(local.join("CHANGE.md"), "feature edit\n").unwrap();
+		run_git(&git, &local, &["add", "."]);
+		run_git(&git, &local, &["commit", "-q", "-m", "feature work"]);
+		let main_before = remote_ref_sha(&git, &remote, "refs/heads/main");
+
+		// `git_push` must NOT update `main`. With the foreign upstream
+		// it falls back to plain `git push`, which `push.default =
+		// simple` rejects — so this errors, and crucially `main` is
+		// untouched.
+		let push = host.git_push().await;
+		assert!(
+			push.is_err(),
+			"plain push of a foreign-upstream branch should be refused"
+		);
+		assert_eq!(
+			remote_ref_sha(&git, &remote, "refs/heads/main"),
+			main_before,
+			"the feature commit must never land on remote main"
+		);
+
+		// Publishing is the right move: it creates `origin/feature/foo`
+		// and re-points tracking, after which the branch is no longer
+		// foreign and a normal sync works.
+		host.git_publish_branch().await.expect("publish must succeed");
+		assert!(
+			remote_ref_sha(&git, &remote, "refs/heads/feature/foo").is_some(),
+			"publish creates origin/feature/foo"
+		);
+		assert_eq!(
+			remote_ref_sha(&git, &remote, "refs/heads/main"),
+			main_before,
+			"publish must not touch remote main either"
+		);
+		let after = host.git_branch().await.unwrap();
+		assert!(
+			!after.upstream_foreign,
+			"after publishing, tracking points at origin/feature/foo, got {after:?}"
 		);
 	}
 
