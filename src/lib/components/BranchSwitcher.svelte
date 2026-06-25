@@ -2,6 +2,7 @@
 	import { workspace } from '../state.svelte';
 	import type { BranchListEntry, BranchSwitchTarget } from '../protocol';
 	import BranchIcon from './icons/BranchIcon.svelte';
+	import SparklesIcon from './icons/SparklesIcon.svelte';
 
 	let inputEl: HTMLInputElement | undefined = $state();
 	let query = $state('');
@@ -89,6 +90,16 @@
 		const target: BranchSwitchTarget =
 			row.kind === 'local' ? { kind: 'local', name: row.entry.name } : { kind: 'pr', number: row.entry.number };
 		void workspace.switchToBranch(target);
+	}
+
+	// Spin up an isolated coder agent on this branch (ADR 0028): its
+	// own git worktree + session, so it doesn't disturb the active
+	// folder's checkout or other agents. For a PR row the branch is
+	// its head ref (DWIM-created locally from the remote if needed).
+	function startIsolatedAgent(event: MouseEvent, branch: string) {
+		event.stopPropagation();
+		workspace.closeBranchSwitcher();
+		void workspace.newCoderWorktreeSession(branch);
 	}
 
 	function nextSelection(from: number): number {
@@ -241,6 +252,15 @@
 			{/if}
 		</span>
 		<span class="meta">{entry.committerDateRelative}</span>
+		<button
+			type="button"
+			class="agent-action"
+			title="Start an isolated coder agent on this branch (its own worktree)"
+			aria-label="Start an isolated coder agent on {entry.name}"
+			onclick={(e) => startIsolatedAgent(e, entry.name)}
+		>
+			<SparklesIcon size={13} />
+		</button>
 	</li>
 {/snippet}
 
@@ -329,6 +349,15 @@
 									<span class="meta">
 										<span class="date">{row.entry.updatedAtRelative}</span>
 									</span>
+									<button
+										type="button"
+										class="agent-action"
+										title="Start an isolated coder agent on this PR's branch (its own worktree)"
+										aria-label="Start an isolated coder agent on PR #{row.entry.number}"
+										onclick={(e) => startIsolatedAgent(e, row.entry.headRef)}
+									>
+										<SparklesIcon size={13} />
+									</button>
 								</li>
 							{/if}
 						{/each}
@@ -488,6 +517,30 @@
 		color: inherit;
 		opacity: 0.7;
 		white-space: nowrap;
+	}
+	/* Per-row "start an isolated agent on this branch" action.
+	   Hidden until the row is hovered/selected so it doesn't compete
+	   with the branch name; the row click still switches branches. */
+	.agent-action {
+		flex-shrink: 0;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		padding: 2px;
+		border: none;
+		background: transparent;
+		color: inherit;
+		cursor: pointer;
+		border-radius: 4px;
+		opacity: 0;
+	}
+	.result:hover .agent-action,
+	.result.selected .agent-action {
+		opacity: 0.85;
+	}
+	.agent-action:hover {
+		opacity: 1;
+		background: var(--m-bg-overlay);
 	}
 	.avatar {
 		width: 16px;

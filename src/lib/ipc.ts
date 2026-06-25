@@ -383,7 +383,8 @@ export const ipc = {
 		listSessions: () => invoke<CoderSessionSummary[]>('coder_list_sessions'),
 		activeSession: () => invoke<CoderSessionSummary | null>('coder_active_session'),
 		newSession: () => invoke<CoderSessionSummary>('coder_new_session'),
-		newWorktreeSession: () => invoke<NewWorktreeSession>('coder_new_worktree_session'),
+		newWorktreeSession: (baseBranch?: string) =>
+			invoke<NewWorktreeSession>('coder_new_worktree_session', { baseBranch: baseBranch ?? null }),
 		discardWorktree: (path: string, force: boolean) => invoke<Workspace>('coder_discard_worktree', { path, force }),
 		setBashTargetOverride: (forceHost: boolean) => invoke<boolean>('coder_set_bash_target_override', { forceHost }),
 		openSession: (id: string) => invoke<CoderSessionSummary>('coder_open_session', { id }),

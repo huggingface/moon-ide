@@ -405,7 +405,10 @@ pub async fn fs_git_worktree_add(
 	branch: String,
 ) -> Result<GitWorktree, MoonError> {
 	let entry = state.workspaces.require_active_folder().await?;
-	entry.host.git_worktree_add(&Utf8PathBuf::from(path), &branch).await
+	entry
+		.host
+		.git_worktree_add(&Utf8PathBuf::from(path), moon_core::host::WorktreeBranch::New(branch))
+		.await
 }
 
 /// List the active folder repository's working trees (main +

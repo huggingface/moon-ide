@@ -451,6 +451,17 @@ Staged so each step is reviewable on its own:
   container (create → repair → isolate → build → discard, shared-root
   mount with no recreate, prune survival); the full IDE-in-container
   path still wants a smoke-test.
+- **W.5 — base-branch selection (landed).** An isolated session can
+  start from an existing branch instead of a fresh one:
+  `coder_new_worktree_session` takes an optional `base_branch`, and
+  `git_worktree_add` grew a `WorktreeBranch::{New, Existing}` so
+  `Existing` checks the branch out (DWIM-creating a local tracking
+  branch from a remote, like `git switch`) without touching the
+  parent's checkout. Surfaced as a per-row "start isolated agent"
+  action in the `BranchSwitcher` (local branches + open-PR head refs).
+  Validated end-to-end against a live `moon-base` container (remote
+  branch → DWIM checkout → repair → container build, parent
+  undisturbed).
 - **W.4.1 — AI branch name (next).** Replace the `moon/agent-<id>`
   default with a cheap-model suggestion after the first turn (rename
   the live branch, update the folder origin + session header). Pure

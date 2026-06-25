@@ -62,6 +62,12 @@ git repo with at least one commit bound as a workspace folder.
 3. Start a second isolated session in the same folder and have it edit
    the same file. Expected: the two agents' changes are on two
    different branches in two different worktrees — no interleaving.
+   3b. Open the branch switcher, click the "start isolated agent" (✦)
+   action on an existing branch — a local one, or an open PR's branch
+   that only exists on the remote. Expected: an isolated session whose
+   worktree has that branch checked out (DWIM-created locally tracking
+   the remote for the PR case); the **parent's checked-out branch is
+   unchanged** and other agents keep running.
 4. Click the worktree folder row → SCM panel shows the worktree's
    diff; commit / push the branch. Expected: a normal commit on the
    isolated branch; the parent branch is untouched.

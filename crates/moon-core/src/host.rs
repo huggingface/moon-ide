@@ -23,6 +23,34 @@ use crate::lint_staged::{LintStagedRules, LintStagedService};
 use crate::pre_save;
 use crate::shell::{ShellResolverHandle, ShellTarget};
 
+/// What branch a freshly-created worktree should be on (ADR 0028).
+#[derive(Debug, Clone)]
+pub enum WorktreeBranch {
+	/// Create a fresh branch off the current `HEAD`
+	/// (`git worktree add -b <name> <path>`). The default
+	/// isolated-session behaviour.
+	New(String),
+	/// Check out an **existing** branch (`git worktree add <path>
+	/// <name>`), DWIM-creating a local tracking branch from a remote
+	/// of the same name when no local branch exists — the same
+	/// resolution `git switch <name>` does. Lets an isolated session
+	/// pick up a local or remote branch *without* checking it out in
+	/// the parent (which would disturb other agents). A branch can be
+	/// checked out in only one worktree, so this fails if `name` is
+	/// already checked out (in the parent or another worktree).
+	Existing(String),
+}
+
+impl WorktreeBranch {
+	/// The branch name either variant resolves to — used for the
+	/// worktree's display label, on-disk dir slug, and session header.
+	pub fn name(&self) -> &str {
+		match self {
+			WorktreeBranch::New(name) | WorktreeBranch::Existing(name) => name,
+		}
+	}
+}
+
 #[async_trait]
 pub trait WorkspaceHost: Send + Sync {
 	async fn read_dir(&self, path: &Utf8Path) -> MoonResult<Vec<DirEntry>>;
@@ -373,18 +401,21 @@ pub trait WorkspaceHost: Send + Sync {
 	/// commit failure is the actionable one).
 	async fn git_commit_on_new_branch(&self, branch: &str, message: &str) -> MoonResult<GitCommitResult>;
 
-	/// Create a linked worktree at `path` on a fresh branch `branch`
-	/// off the current `HEAD` (`git worktree add -b <branch> <path>`).
-	/// Backs worktree-backed coder sessions (ADR 0028): an isolated
-	/// session checks its branch out into its own working directory so
-	/// several agents can work one repo without colliding.
+	/// Create a linked worktree at `path` (`git worktree add`). Backs
+	/// worktree-backed coder sessions (ADR 0028): an isolated session
+	/// checks its branch out into its own working directory so several
+	/// agents can work one repo without colliding. `branch` selects a
+	/// fresh branch off `HEAD` ([`WorktreeBranch::New`]) or an
+	/// existing local/remote branch ([`WorktreeBranch::Existing`]) —
+	/// either way the parent's checkout is untouched.
 	///
-	/// `branch` is validated with `git check-ref-format --branch`
-	/// before anything is touched, so a malformed name fails fast.
-	/// Errors when the active folder isn't a git repo, `branch`
-	/// already exists, or `path` is non-empty — git's own stderr is
-	/// surfaced verbatim. Returns the freshly-created [`GitWorktree`].
-	async fn git_worktree_add(&self, path: &Utf8Path, branch: &str) -> MoonResult<GitWorktree>;
+	/// A new branch name is validated with `git check-ref-format
+	/// --branch` before anything is touched. Errors when the active
+	/// folder isn't a git repo, `path` is non-empty, or (for
+	/// `Existing`) the branch is already checked out in another
+	/// worktree — git's own stderr is surfaced verbatim. Returns the
+	/// freshly-created [`GitWorktree`].
+	async fn git_worktree_add(&self, path: &Utf8Path, branch: WorktreeBranch) -> MoonResult<GitWorktree>;
 
 	/// List the repository's working trees (`git worktree list
 	/// --porcelain`), including the main one (`is_main`). Used to
@@ -1842,17 +1873,17 @@ impl WorkspaceHost for LocalHost {
 		.map_err(|e| MoonError::Internal(format!("git_commit_on_new_branch join error: {e}")))?
 	}
 
-	async fn git_worktree_add(&self, path: &Utf8Path, branch: &str) -> MoonResult<GitWorktree> {
+	async fn git_worktree_add(&self, path: &Utf8Path, branch: WorktreeBranch) -> MoonResult<GitWorktree> {
 		let guard = self.git_lock().await;
 		let root = self.root.clone();
 		let path = path.to_owned();
-		let branch = branch.to_owned();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
 			// Always host (ADR 0028 W.4): worktrees live under the
 			// per-workspace state dir, outside every container bind
-			// mount, so only host git can reach them and the metadata
-			// it records (absolute host paths) only resolves host-side.
+			// mount, so only host git can reach them. Container-valid
+			// metadata is produced afterwards by `git_worktree_repair`
+			// (W.4.1).
 			run_git_worktree_add(&root, &path, &branch, &ShellTarget::Host)
 		})
 		.await
@@ -2758,29 +2789,49 @@ fn worktree_path_arg(target: &ShellTarget, path: &Utf8Path) -> String {
 fn run_git_worktree_add(
 	root: &Utf8Path,
 	path: &Utf8Path,
-	branch: &str,
+	branch: &WorktreeBranch,
 	target: &ShellTarget,
 ) -> MoonResult<GitWorktree> {
-	if branch.is_empty() {
+	let branch_name = branch.name();
+	if branch_name.is_empty() {
 		return Err(MoonError::invalid("branch name is empty"));
 	}
-	let check = git_command(target, root)
-		.args(["check-ref-format", "--branch", branch])
-		.output()
-		.map_err(|e| MoonError::IoError(format!("git check-ref-format failed to launch: {e}")))?;
-	if !check.status.success() {
-		let stderr = String::from_utf8_lossy(&check.stderr).trim().to_string();
-		let detail = if stderr.is_empty() {
-			format!("{branch:?} is not a valid git branch name")
-		} else {
-			format!("{branch:?}: {stderr}")
-		};
-		return Err(MoonError::invalid(detail));
+	// Validate only a *new* branch name we're about to mint. An
+	// existing branch is git's to validate when it resolves it —
+	// `check-ref-format` would also reject a remote-qualified DWIM
+	// target the user is allowed to pass.
+	if let WorktreeBranch::New(name) = branch {
+		let check = git_command(target, root)
+			.args(["check-ref-format", "--branch", name])
+			.output()
+			.map_err(|e| MoonError::IoError(format!("git check-ref-format failed to launch: {e}")))?;
+		if !check.status.success() {
+			let stderr = String::from_utf8_lossy(&check.stderr).trim().to_string();
+			let detail = if stderr.is_empty() {
+				format!("{name:?} is not a valid git branch name")
+			} else {
+				format!("{name:?}: {stderr}")
+			};
+			return Err(MoonError::invalid(detail));
+		}
 	}
 
 	let path_arg = worktree_path_arg(target, path);
-	let add = git_command(target, root)
-		.args(["worktree", "add", "-b", branch, &path_arg])
+	// `New(name)`  -> `git worktree add -b <name> <path>`  (fresh branch off HEAD)
+	// `Existing(n)` -> `git worktree add <path> <n>`        (check out existing;
+	//                  DWIM-creates a local tracking branch from a remote of
+	//                  the same name when no local branch exists, like `git switch`)
+	let mut cmd = git_command(target, root);
+	cmd.args(["worktree", "add"]);
+	match branch {
+		WorktreeBranch::New(name) => {
+			cmd.args(["-b", name, &path_arg]);
+		}
+		WorktreeBranch::Existing(name) => {
+			cmd.arg(&path_arg).arg(name);
+		}
+	}
+	let add = cmd
 		.output()
 		.map_err(|e| MoonError::IoError(format!("git worktree add failed to launch: {e}")))?;
 	if !add.status.success() {
@@ -2827,7 +2878,7 @@ fn run_git_worktree_add(
 
 	Ok(GitWorktree {
 		path: path.to_string(),
-		branch: Some(branch.to_owned()),
+		branch: Some(branch_name.to_owned()),
 		head,
 		is_main: false,
 		is_locked: locked,
@@ -6733,7 +6784,10 @@ mod tests {
 		let wt_parent = TempDir::new().unwrap();
 		let wt_path = Utf8PathBuf::from_path_buf(wt_parent.path().join("agent-wt")).unwrap();
 
-		let created = host(&dir).git_worktree_add(&wt_path, "moon/agent-1").await.unwrap();
+		let created = host(&dir)
+			.git_worktree_add(&wt_path, WorktreeBranch::New("moon/agent-1".into()))
+			.await
+			.unwrap();
 		assert_eq!(created.branch.as_deref(), Some("moon/agent-1"));
 		assert!(!created.is_main);
 		assert!(!created.head.is_empty());
@@ -6759,6 +6813,43 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn git_worktree_add_checks_out_existing_branch() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping worktree existing-branch test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		std::fs::write(dir.path().join("README.md"), "hi\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "initial"]);
+		// A pre-existing branch (e.g. a colleague's) we want an agent
+		// to pick up without the parent checking it out.
+		run_git(&git, dir.path(), &["branch", "feature-x"]);
+
+		let wt_parent = TempDir::new().unwrap();
+		let wt_path = Utf8PathBuf::from_path_buf(wt_parent.path().join("agent-wt")).unwrap();
+
+		let created = host(&dir)
+			.git_worktree_add(&wt_path, WorktreeBranch::Existing("feature-x".into()))
+			.await
+			.unwrap();
+		assert_eq!(
+			created.branch.as_deref(),
+			Some("feature-x"),
+			"checks out the existing branch"
+		);
+		assert!(created.is_locked);
+		// Parent stays on main — the whole point is not disturbing it.
+		let parent_head = std::fs::read_to_string(dir.path().join(".git/HEAD")).unwrap();
+		assert_eq!(parent_head.trim(), "ref: refs/heads/main");
+
+		host(&dir).git_worktree_remove(&wt_path, false).await.unwrap();
+	}
+
+	#[tokio::test]
 	async fn git_worktree_add_rejects_invalid_branch() {
 		let Some(git) = which_git() else {
 			eprintln!("git not on PATH — skipping worktree invalid-branch test");
@@ -6776,7 +6867,10 @@ mod tests {
 		let wt_path = Utf8PathBuf::from_path_buf(wt_parent.path().join("bad")).unwrap();
 		// Spaces are illegal in git ref names; we fail before creating
 		// anything on disk.
-		let err = host(&dir).git_worktree_add(&wt_path, "not a branch").await.unwrap_err();
+		let err = host(&dir)
+			.git_worktree_add(&wt_path, WorktreeBranch::New("not a branch".into()))
+			.await
+			.unwrap_err();
 		assert!(matches!(err, MoonError::InvalidArgument(_)), "got {err:?}");
 		assert!(!wt_path.exists(), "no worktree dir left behind");
 	}

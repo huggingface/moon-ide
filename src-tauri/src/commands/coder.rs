@@ -335,8 +335,21 @@ pub struct NewWorktreeSession {
 ///
 /// The active folder is unchanged — the user keeps working in the
 /// parent and the new session opens in the parent's panel.
+///
+/// `base_branch` picks the worktree's branch:
+/// - `None` → a fresh `moon/agent-<id>` off the parent's current
+///   `HEAD` (the default "start clean" case).
+/// - `Some(b)` → check out the **existing** branch `b` (local, or
+///   DWIM-created from a remote of the same name, like `git switch`)
+///   so an agent can work on it in isolation — the parent's checkout
+///   is never touched, so other agents aren't disturbed.
 #[tauri::command]
-pub async fn coder_new_worktree_session(state: State<'_, AppState>) -> Result<NewWorktreeSession, MoonError> {
+pub async fn coder_new_worktree_session(
+	state: State<'_, AppState>,
+	base_branch: Option<String>,
+) -> Result<NewWorktreeSession, MoonError> {
+	use moon_core::host::WorktreeBranch;
+
 	let parent = state.workspaces.require_active_folder().await?;
 	let parent_path = parent.folder.path.clone();
 	let parent_name = parent.folder.name.clone();
@@ -347,15 +360,21 @@ pub async fn coder_new_worktree_session(state: State<'_, AppState>) -> Result<Ne
 		.to_string();
 	let state_dir = state.workspace_state_dir(&workspace_id);
 
-	// Branch is the deliverable; the worktree lives outside any repo
-	// under the per-workspace state dir. A time-derived suffix keeps
-	// branches and on-disk paths unique without a random dep.
-	let now_ms = std::time::SystemTime::now()
-		.duration_since(std::time::UNIX_EPOCH)
-		.map(|d| d.as_millis())
-		.unwrap_or(0) as u64;
-	let suffix = format!("{:08x}", now_ms & 0xffff_ffff);
-	let branch = format!("moon/agent-{suffix}");
+	// The branch is the deliverable. Either mint a fresh
+	// `moon/agent-<id>` off HEAD, or attach to an existing branch the
+	// caller named. The branch name also drives the on-disk worktree
+	// dir, so a time-derived suffix keeps the auto case unique.
+	let spec = match base_branch.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+		Some(existing) => WorktreeBranch::Existing(existing.to_string()),
+		None => {
+			let now_ms = std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.map(|d| d.as_millis())
+				.unwrap_or(0) as u64;
+			WorktreeBranch::New(format!("moon/agent-{:08x}", now_ms & 0xffff_ffff))
+		}
+	};
+	let branch = spec.name().to_string();
 	let branch_slug = branch.replace('/', "-");
 
 	use std::hash::{Hash, Hasher};
@@ -368,8 +387,9 @@ pub async fn coder_new_worktree_session(state: State<'_, AppState>) -> Result<Ne
 		std::fs::create_dir_all(parent_dir.as_std_path()).map_err(MoonError::from)?;
 	}
 
-	// Create the worktree on a fresh branch off the parent repo.
-	parent.host.git_worktree_add(&worktree_path, &branch).await?;
+	// Create the worktree (fresh branch off HEAD, or check out the
+	// existing branch) — host-side; the parent's checkout is untouched.
+	parent.host.git_worktree_add(&worktree_path, spec).await?;
 
 	// Bind it as a nested folder; capture the canonical path the
 	// registry stored so the session's routing key matches exactly.

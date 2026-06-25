@@ -1043,7 +1043,17 @@ defaults to `moon/agent-<short-id>` at creation (no diff to summarise
 yet) and is renameable; an AI suggestion can replace it after the
 first turn.
 
-Created on opt-in (`git worktree add -b`), re-bound at startup (the
+An isolated session can either start a **fresh** `moon/agent-<id>`
+branch off the parent's current `HEAD` (the default), or be based on
+an **existing** branch — local, or a remote one DWIM-created locally
+the way `git switch` does. The latter is how you set an agent working
+on a colleague's branch: it's checked out only in the worktree, so the
+parent's checkout (and every other agent) is left undisturbed. The
+`BranchSwitcher` palette exposes this as a per-row "start isolated
+agent" action (local branches and open-PR head refs); the coder
+panel's worktree button covers the fresh-branch default.
+
+Created on opt-in (`git worktree add`), re-bound at startup (the
 folder's `origin` rides `session.json`), and **pruned** by the
 worktree row's `×` — run against the parent repo and guarded by a
 re-confirm when the worktree is dirty. Deleting the owning session

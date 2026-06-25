@@ -117,10 +117,21 @@ single directory walk. The bound-folder display name is
 slug so two worktrees from different parents can't collide on the
 `/workspace/<name>` container mount.
 
-The branch name defaults to a stable `moon/agent-<short-id>` at
-creation (there's no diff to summarise yet) and is renameable; an AI
-branch-name suggestion can replace it after the first turn, the same
-"any outcome of the first turn" trigger auto-rename already uses.
+A session can also start from an **existing** branch instead of a
+fresh one — a local branch, or a remote branch DWIM-created locally
+the way `git switch <name>` does. This is how you point an agent at a
+colleague's branch: it's checked out only in the worktree, so the
+parent's working tree (and every other agent) is undisturbed — which
+is the whole reason not to just `git switch` in the parent. A branch
+can be checked out in only one worktree, so this fails if the branch
+is already checked out somewhere (git's own constraint, surfaced
+verbatim).
+
+When starting fresh, the branch name defaults to a stable
+`moon/agent-<short-id>` at creation (there's no diff to summarise yet)
+and is renameable; an AI branch-name suggestion can replace it after
+the first turn, the same "any outcome of the first turn" trigger
+auto-rename already uses.
 
 ### Git primitives
 
@@ -129,10 +140,11 @@ same way every other git command is (`git_command(target, root)`,
 host or `docker exec`, serialised behind the per-folder git mutex per
 ADR 0015):
 
-- `git_worktree_add(path, branch)` — `git worktree add -b <branch> <path>`
-  from the current `HEAD`; validates the branch name with
-  `check-ref-format` first (reused verbatim from
-  `run_git_commit_on_new_branch`).
+- `git_worktree_add(path, branch)` where `branch` is `New(name)` →
+  `git worktree add -b <name> <path>` off `HEAD` (validated with
+  `check-ref-format`), or `Existing(name)` → `git worktree add <path>
+<name>`, letting git DWIM a local tracking branch from a remote when
+  no local exists.
 - `git_worktree_list()` — parses `git worktree list --porcelain`.
 - `git_worktree_remove(path)` — `git worktree remove [--force] <path>`.
 

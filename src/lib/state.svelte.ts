@@ -1397,9 +1397,9 @@ class WorkspaceState {
 	 * Container mounting of the worktree is deferred (ADR 0028 W.4),
 	 * so this deliberately doesn't nudge `container.syncBoundFolders()`.
 	 */
-	async newCoderWorktreeSession(): Promise<void> {
+	async newCoderWorktreeSession(baseBranch?: string): Promise<void> {
 		try {
-			const result = await ipc.coder.newWorktreeSession();
+			const result = await ipc.coder.newWorktreeSession(baseBranch);
 			await this.adoptWorkspaceSnapshot(result.workspace);
 			this.persistAppState();
 			coder.adoptCreatedSession(result.session);
