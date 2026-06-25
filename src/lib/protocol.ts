@@ -1714,6 +1714,13 @@ export type CoderSessionSummary = {
 	 * ordinary session. Lets the sessions list badge the row.
 	 */
 	worktreeBranch?: string | null;
+	/**
+	 * Branch this session's work was committed onto (ADR 0028). Set
+	 * when the user commits with the session open; drives the session
+	 * list's one-click "switch back to this branch" chip. Absent until
+	 * the session's work is first committed.
+	 */
+	committedBranch?: string | null;
 };
 
 /**

@@ -464,6 +464,28 @@ pub async fn coder_discard_worktree(
 	Ok(state.workspaces.snapshot().await)
 }
 
+/// Tie the active folder's visible coder session to the branch its
+/// work was just committed onto (ADR 0028). Resolves the current
+/// `HEAD` branch — so it covers both "commit on new branch" and a
+/// plain commit on the current branch — and stamps it on the session.
+/// Returns the updated summary so the panel can show a "switch back
+/// to this branch" chip; `None` when `HEAD` is detached or there's no
+/// persisted session to tie (e.g. a manual commit with nothing open).
+#[tauri::command]
+pub async fn coder_associate_branch(state: State<'_, AppState>) -> Result<Option<SessionSummary>, MoonError> {
+	let Some(folder) = state.workspaces.active_folder().await else {
+		return Ok(None);
+	};
+	let Some(branch) = folder.host.git_branch().await?.name else {
+		return Ok(None);
+	};
+	state
+		.coder
+		.set_visible_session_branch(branch)
+		.await
+		.map_err(MoonError::from)
+}
+
 /// Set the per-session bash-target override for the active
 /// folder's visible session. `force_host = true` pins this
 /// session's `bash` / shell tool to the host machine even while

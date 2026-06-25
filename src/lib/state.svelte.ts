@@ -2712,6 +2712,11 @@ class WorkspaceState {
 			this.scmFilterOn = false;
 			await this.refreshGitBranch();
 			void this.refreshActiveFolder();
+			// Tie the visible coder session to the branch this commit
+			// landed on (ADR 0028), so the session list can offer a
+			// one-click switch back. Best-effort; no-op without a
+			// persisted session open.
+			void coder.associateActiveSessionBranch();
 			return true;
 		} catch (err) {
 			this.flash(`Commit failed: ${formatError(err)}`);
@@ -2749,6 +2754,10 @@ class WorkspaceState {
 			this.scmFilterOn = false;
 			await this.refreshGitBranch();
 			void this.refreshActiveFolder();
+			// Same as `commitChanges`: tie the visible session to the
+			// branch we just landed on — here the freshly-created one
+			// (ADR 0028).
+			void coder.associateActiveSessionBranch();
 			return true;
 		} catch (err) {
 			this.flash(`Commit failed: ${formatError(err)}`);

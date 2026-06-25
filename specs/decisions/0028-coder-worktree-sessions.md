@@ -219,7 +219,26 @@ ADR 0015):
   worktree survives a hostile `git gc --prune=now` +
   `git worktree prune --expire=now` from inside the container, and the
   branch + commits persist after removal.
-- No migration: the header schema bump and the new folder
+- **Regular (non-worktree) sessions remember their branch too.** Not
+  every session wants the cost of a separate checkout — the common
+  flow is "work on main, commit the agent's result onto a branch,
+  switch back to main, repeat." So a session is tagged with the
+  branch its work was committed onto (`committed_branch` on the
+  header, set on any commit made with the session open — fresh branch
+  or current — to whatever `HEAD` lands on, rewritten in place,
+  most-recent wins). The session list shows a chip that `git switch`es
+  the folder back to that branch in one click. This gives the
+  "branch is the deliverable" tie to the lightweight flow, with the
+  worktree machinery reserved for genuine concurrency.
+- **Future direction (not built): promote-to-worktree on demand.**
+  Jumping back to a session's branch via `git switch` disturbs an
+  agent mid-run on the current branch. A natural extension is to
+  _reopen that session in a worktree on its branch_ instead of
+  switching the shared tree, and possibly to lean on worktrees
+  automatically once multiple agents run concurrently. Left as a note
+  rather than a commitment — the right trigger (manual vs. automatic)
+  needs real usage to settle.
+- No migration: the header schema bumps and the new folder
   discriminator are additive and pre-stable per
   [AGENTS.md § No premature migrations](../../AGENTS.md).
 

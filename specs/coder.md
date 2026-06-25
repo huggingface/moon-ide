@@ -1061,6 +1061,32 @@ keeps the worktree (the branch is the deliverable you may still PR).
 The **branch is never deleted by the IDE**: it's left in place for a
 later PR.
 
+### Regular sessions remember their branch
+
+A non-worktree session working on the main tree gets the same "the
+branch is the deliverable" tie without a worktree: whenever the user
+commits with a session open — a fresh "commit on new branch", or a
+plain commit on the current branch — the session is tagged with the
+branch `HEAD` landed on (`committed_branch` on the header, rewritten
+in place; most-recent-commit wins). The session list then shows a
+branch chip; clicking it `git switch`es the active folder back to that
+branch (git's own refusal on a dirty tree is surfaced as-is). So
+after juggling several agents across several branches off `main`, you
+return to a past session and jump to its branch in one click instead
+of hunting for the name. A blank, never-committed session is left
+untagged.
+
+Worktree sessions share the same chip (accent-tinted), showing the
+worktree's branch — but since that branch is checked out in the
+worktree's own bound folder, clicking jumps to _that folder_ rather
+than `git switch`ing the parent (which couldn't check it out anyway).
+
+A future direction (not built): when you want to revisit a session's
+branch but an agent is mid-run on the current one, switching the
+shared tree would disturb it — so we may offer to _reopen the old
+session in a worktree on its branch_ instead, and possibly lean on
+worktrees automatically once multiple agents are running concurrently.
+
 The git primitives (`git_worktree_add` / `_list` / `_remove`)
 serialise behind the per-folder git mutex ([ADR 0015](decisions/0015-git-serialisation.md)).
 In a containerised workspace, isolated sessions run their tooling

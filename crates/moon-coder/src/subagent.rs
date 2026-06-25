@@ -389,6 +389,9 @@ async fn run_subagent_inner(
 		// there and no extra routing field is needed.
 		worktree_root: None,
 		worktree_branch: None,
+		// Branch association is a top-level-session concern (the user
+		// commits from the panel); sub-agents never carry one.
+		committed_branch: None,
 	};
 
 	// Best-effort: persistence failures log at warn but never

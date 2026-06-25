@@ -417,6 +417,7 @@ impl Session {
 				bash_target_override: None,
 				worktree_root: None,
 				worktree_branch: None,
+				committed_branch: None,
 			},
 			session_dir: None,
 			messages: vec![ChatMessage::System {
@@ -437,6 +438,7 @@ impl Session {
 			created_at_ms: self.header.created_at_ms,
 			updated_at_ms: self.header.updated_at_ms,
 			worktree_branch: self.header.worktree_branch.clone(),
+			committed_branch: self.header.committed_branch.clone(),
 		}
 	}
 }
@@ -1425,6 +1427,43 @@ impl CoderHandle {
 		Ok(force_host)
 	}
 
+	/// Tag the active folder's **visible** session with the branch its
+	/// work was committed onto (ADR 0028), rewriting the on-disk
+	/// header so a re-open remembers it. Called whenever the user
+	/// commits with a session open — to whatever branch `HEAD` landed
+	/// on (a fresh "commit on new branch", or a plain commit on the
+	/// current one). Most-recent-commit wins.
+	///
+	/// Skips a not-yet-persisted (blank) session: a branch only means
+	/// something once the session has produced work the user
+	/// committed. Returns the updated summary so the panel can refresh
+	/// the row's chip without a reload; `None` when there's no
+	/// persisted visible session to tag (so a manual commit with no
+	/// real session open quietly ties nothing).
+	pub async fn set_visible_session_branch(&self, branch: String) -> Result<Option<SessionSummary>, CoderError> {
+		let (fs, _) = self.state.active_folder_session().await?;
+		let Some(id) = fs.visible_session_id().await else {
+			return Ok(None);
+		};
+		let Some(rt) = fs.runtime(&id).await else {
+			return Ok(None);
+		};
+		let (session_dir, summary, header) = {
+			let mut session = rt.session.lock().await;
+			if session.session_dir.is_none() {
+				return Ok(None);
+			}
+			session.header.committed_branch = Some(branch);
+			(session.session_dir.clone(), session.summary(), session.header.clone())
+		};
+		if let Some(dir) = session_dir {
+			if let Err(err) = sessions::rewrite_header(&dir, &header).await {
+				tracing::warn!(?err, "failed to persist committed_branch header rewrite");
+			}
+		}
+		Ok(Some(summary))
+	}
+
 	/// Read the force-host override of `fs`'s visible session
 	/// without lazy-creating a runtime (mirrors the two-step
 	/// look-up `status` uses for `busy`). `false` when no session
@@ -1731,6 +1770,7 @@ impl CoderHandle {
 			created_at_ms: header.created_at_ms,
 			updated_at_ms: header.updated_at_ms,
 			worktree_branch: header.worktree_branch.clone(),
+			committed_branch: header.committed_branch.clone(),
 		};
 		// Snapshot what the panel needs for the restore-time
 		// usage hint *before* the move into `Session`. We prefer
@@ -5178,6 +5218,7 @@ mod tests {
 			bash_target_override: None,
 			worktree_root: None,
 			worktree_branch: None,
+			committed_branch: None,
 		}
 	}
 

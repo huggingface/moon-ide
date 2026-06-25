@@ -1687,6 +1687,31 @@ class CoderPanelState {
 		this.rows = [{ kind: 'error', id: `local-${Date.now()}`, text: formatError(err) }];
 	}
 
+	/** Tie the active folder's visible session to the branch its work
+	 *  was just committed onto (ADR 0028) and reflect the resulting
+	 *  branch on the open session + its list row so the "switch back
+	 *  to this branch" chip appears without a reload. Best-effort:
+	 *  called from `WorkspaceState` after a commit; a no-op when no
+	 *  persisted session is open. */
+	async associateActiveSessionBranch(): Promise<void> {
+		try {
+			const updated = await ipc.coder.associateBranch();
+			if (!updated) {
+				return;
+			}
+			if (this.activeSession?.id === updated.id) {
+				this.activeSession = updated;
+			}
+			const list = this.sessions;
+			if (list) {
+				this.sessions = list.map((s) => (s.id === updated.id ? updated : s));
+			}
+		} catch (err) {
+			// eslint-disable-next-line no-console
+			console.warn('coder: failed to associate session branch', err);
+		}
+	}
+
 	/** Delete a persisted session (with no extra UI confirmation
 	 *  here — callers wrap in a `confirm()` dialog). Idempotent
 	 *  on the backend, so a double-click is safe. */

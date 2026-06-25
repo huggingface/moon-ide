@@ -74,8 +74,11 @@ use crate::inference::ToolCall;
 /// `4` adds the optional `worktree_root` / `worktree_branch` header
 /// fields for worktree-backed sessions (ADR 0028). They elide when
 /// absent, so an ordinary session's header is byte-identical to a
-/// schema-3 header apart from the version number.
-pub const SESSION_SCHEMA_VERSION: u32 = 4;
+/// schema-3 header apart from the version number. `5` adds the
+/// optional `committed_branch` — the branch a session's work was
+/// committed onto, so the panel can offer a one-click jump back to it
+/// (ADR 0028). Also elides when absent.
+pub const SESSION_SCHEMA_VERSION: u32 = 5;
 
 /// File extension on every session file.
 const SESSION_EXT: &str = "jsonl";
@@ -174,6 +177,15 @@ pub struct SessionHeader {
 	/// on. Informational — surfaced as a badge on the session row.
 	/// `None` whenever `worktree_root` is.
 	pub worktree_branch: Option<String>,
+	/// Branch this (regular, main-tree) session's work was committed
+	/// onto — set whenever the user commits with this session visible,
+	/// to whatever branch `HEAD` lands on (a fresh "commit on new
+	/// branch", or a plain commit on the current branch). Lets the
+	/// panel offer a one-click `git switch` back to a past session's
+	/// branch (ADR 0028). Most-recent-commit wins. `None` until the
+	/// session's work is first committed; unused for worktree sessions
+	/// (their branch is [`worktree_branch`](Self::worktree_branch)).
+	pub committed_branch: Option<String>,
 }
 
 /// Per-session override for the `bash` tool's execution target.
@@ -260,6 +272,9 @@ impl Serialize for SessionHeader {
 		if let Some(v) = &self.worktree_branch {
 			map.serialize_entry("worktree_branch", v)?;
 		}
+		if let Some(v) = &self.committed_branch {
+			map.serialize_entry("committed_branch", v)?;
+		}
 		map.end()
 	}
 }
@@ -302,6 +317,8 @@ impl<'de> Deserialize<'de> for SessionHeader {
 			worktree_root: Option<String>,
 			#[serde(default)]
 			worktree_branch: Option<String>,
+			#[serde(default)]
+			committed_branch: Option<String>,
 		}
 		let raw = Raw::deserialize(deserializer)?;
 		Ok(SessionHeader {
@@ -322,6 +339,7 @@ impl<'de> Deserialize<'de> for SessionHeader {
 				.and_then(BashTargetOverride::from_wire),
 			worktree_root: raw.worktree_root,
 			worktree_branch: raw.worktree_branch,
+			committed_branch: raw.committed_branch,
 		})
 	}
 }
@@ -1338,6 +1356,11 @@ pub struct SessionSummary {
 	/// ordinary session. Lets the sessions list badge the row.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub worktree_branch: Option<String>,
+	/// Branch this session's work was committed onto (ADR 0028), for
+	/// the session list's one-click "switch back to this branch"
+	/// chip. `None` until the session's work is committed.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub committed_branch: Option<String>,
 }
 
 /// Full load: header + every record in order. Used when the user
@@ -1609,6 +1632,7 @@ pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError>
 		created_at_ms: header.created_at_ms,
 		updated_at_ms: mtime_ms.unwrap_or(header.updated_at_ms),
 		worktree_branch: header.worktree_branch,
+		committed_branch: header.committed_branch,
 	})
 }
 
@@ -2155,6 +2179,7 @@ mod tests {
 			bash_target_override: None,
 			worktree_root: None,
 			worktree_branch: None,
+			committed_branch: None,
 		}
 	}
 

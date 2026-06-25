@@ -40,7 +40,7 @@
 	import RevertIcon from './icons/RevertIcon.svelte';
 	import EditIcon from './icons/EditIcon.svelte';
 	import { ipc } from '../ipc';
-	import { formatError, type FileSearchResult } from '../protocol';
+	import { formatError, type FileSearchResult, type CoderSessionSummary } from '../protocol';
 	import { textInputUndo } from '../actions/textInputUndo';
 
 	let scrollEl: HTMLDivElement | undefined = $state();
@@ -1407,6 +1407,28 @@
 		composer?.focus();
 	}
 
+	// Click on a session's branch chip (ADR 0028). For a regular
+	// session this `git switch`es the active folder back to the branch
+	// its work was committed onto (git refuses + flashes on a dirty
+	// tree). For a worktree session the branch lives in its own bound
+	// folder — switching the parent to it is impossible (it's already
+	// checked out there) — so we jump to that worktree folder instead.
+	function onSessionBranchChip(session: CoderSessionSummary): void {
+		const worktreeBranch = session.worktreeBranch;
+		if (worktreeBranch) {
+			const wt = workspace.workspace?.folders.find(
+				(f) => f.origin.kind === 'worktree' && f.origin.branch === worktreeBranch,
+			);
+			if (wt) {
+				void workspace.setActiveFolder(wt.path);
+			}
+			return;
+		}
+		if (session.committedBranch) {
+			void workspace.switchToBranch({ kind: 'local', name: session.committedBranch });
+		}
+	}
+
 	async function onDeleteSession(event: MouseEvent, id: string, title: string): Promise<void> {
 		// Stop the click from propagating into the row's "open"
 		// button — without this, deleting a session would also
@@ -1821,6 +1843,21 @@
 									{formatRelative(session.updated_at_ms)}
 								</div>
 							</button>
+							{#if session.worktreeBranch || session.committedBranch}
+								{@const isWorktree = Boolean(session.worktreeBranch)}
+								{@const branch = session.worktreeBranch ?? session.committedBranch}
+								<button
+									type="button"
+									class="session-branch-chip"
+									class:worktree={isWorktree}
+									title={isWorktree ? `Go to the worktree on ${branch}` : `Switch this folder to ${branch}`}
+									aria-label={isWorktree ? `Go to worktree on ${branch}` : `Switch to branch ${branch}`}
+									onclick={() => onSessionBranchChip(session)}
+								>
+									<BranchIcon size={11} />
+									<span class="chip-name">{branch}</span>
+								</button>
+							{/if}
 							<button
 								type="button"
 								class="icon session-row-action"
@@ -2999,6 +3036,41 @@
 	.session-row:hover .session-row-action,
 	.session-row:focus-within .session-row-action {
 		opacity: 1;
+	}
+	/* "Switch back to this session's branch" chip (ADR 0028). Always
+	   visible (unlike the hover-only icon actions) — the branch tie is
+	   the row's headline metadata, not a secondary action. */
+	.session-branch-chip {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		flex-shrink: 0;
+		max-width: 11rem;
+		padding: 1px 6px;
+		border: 1px solid var(--m-border);
+		border-radius: 999px;
+		background: transparent;
+		color: var(--m-fg-muted);
+		font-size: 11px;
+		cursor: pointer;
+	}
+	.session-branch-chip:hover {
+		color: var(--m-fg);
+		border-color: var(--m-accent);
+		background: var(--m-bg-overlay);
+	}
+	/* Worktree (isolated) sessions read with a faint accent so the
+	   list distinguishes "branch lives in its own checkout" from a
+	   regular session's committed-branch tie. */
+	.session-branch-chip.worktree {
+		color: var(--m-accent);
+		border-color: color-mix(in srgb, var(--m-accent) 45%, transparent);
+	}
+	.session-branch-chip .chip-name {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-family: var(--m-font-mono, monospace);
 	}
 	.hub-action.synced {
 		opacity: 0.55;
