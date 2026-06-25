@@ -35,6 +35,37 @@ pub struct WorkspaceFolder {
 	/// in the workspace.
 	pub name: String,
 	pub host: HostKind,
+	/// How this folder came to be bound. Defaults to
+	/// [`FolderOrigin::UserPicked`] — the only kind before
+	/// worktree-backed coder sessions (ADR 0028). `#[serde(default)]`
+	/// keeps older snapshots loading cleanly.
+	#[serde(default)]
+	pub origin: FolderOrigin,
+}
+
+/// Why a folder is bound into the workspace. Drives how the folder
+/// bar renders it and what happens when it's removed.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
+#[ts(export)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum FolderOrigin {
+	/// The user explicitly bound this folder ("Open folder…"). The
+	/// everyday case and the default.
+	#[default]
+	UserPicked,
+	/// An IDE-managed git worktree backing an isolated coder session
+	/// (ADR 0028). Rendered nested under `parent_path` in the folder
+	/// bar with the branch label; its lifecycle is tied to the owning
+	/// session — removing it prunes the worktree rather than merely
+	/// unbinding a directory the user picked.
+	Worktree {
+		/// Absolute path of the parent folder the worktree was
+		/// branched from — the folder bar nests under it.
+		parent_path: String,
+		/// Branch the worktree is checked out on. The folder bar
+		/// shows this as the row's label.
+		branch: String,
+	},
 }
 
 /// Catalog entry for a workspace the user has on this machine.

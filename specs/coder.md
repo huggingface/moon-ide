@@ -986,6 +986,86 @@ refreshes only those on turn boundaries. Anything ambiguous (`bash`,
 `grep`, sub-agent activity, missing path) fans out to refreshing
 every bound folder — correctness over cleverness.
 
+## Worktree sessions
+
+A session can opt into running in its own **git worktree** — an
+isolated working directory on a fresh branch, sharing the repo's
+object store — so several agents work the same project at once
+without stomping each other. The deliverable is the branch: each
+isolated agent accumulates its work (staged, unstaged, or committed)
+on its own branch, and the user turns each into its own commit / PR
+through the normal SCM flow. There is no forced merge-back. Opt-in is
+**per session** (a "new isolated session" affordance beside the
+ordinary `+`); an ordinary session drives the folder's main working
+tree as before. Full rationale and rejected alternatives:
+[ADR 0028](decisions/0028-coder-worktree-sessions.md).
+
+### The worktree is a bound folder
+
+The worktree directory is registered as a first-class bound workspace
+folder, so the file tree, SCM panel, per-folder git-change badges,
+diff view, review comments, terminal, and LSP all light up for it
+unchanged — it's just another repo root with its own `WorkspaceHost`
+and git mutex. A folder `origin` discriminator marks it as a
+session-worktree: it renders **nested under its parent** in the
+folder bar with a branch glyph, its lifecycle is tied to its owning
+session, and it is pruned (not merely unbound) when discarded.
+
+### Ownership vs. routing
+
+The session stays **owned by its parent folder** — its JSONL persists
+under the parent's slug and it appears in the parent's session list,
+where the user started it. Only **tool routing** diverges: the
+session's fs / `bash` / `grep` / git tools run against the worktree's
+host. Two optional header fields carry the binding:
+
+```
+worktree_root:   Option<String>   // absolute path of the worktree checkout
+worktree_branch: Option<String>   // branch the worktree is on
+```
+
+At turn time the runner resolves `cx.folder` to
+`folder_for_path(worktree_root)` when set, mirroring the
+`subagent_target_folder` precedent. The fields elide when `None`
+(ordinary sessions keep a byte-identical header); the schema version
+bumps to `4`. A worktree session's **sub-agents inherit the routing**
+— they default to the parent's active folder, now the worktree — so
+all of one agent's parallel work lands on the one branch.
+
+### Location, naming, lifecycle
+
+Worktrees live outside any repo, under the per-workspace state dir at
+`<workspaces_dir>/<workspace_id>/worktrees/<parent-slug>/<branch-slug>/`
+— keeps the parent's `git status` clean and cleanup to one directory
+walk. The directory basename embeds the parent slug so two worktrees
+can't collide on the `/workspace/<name>` container mount. The branch
+defaults to `moon/agent-<short-id>` at creation (no diff to summarise
+yet) and is renameable; an AI suggestion can replace it after the
+first turn.
+
+Created on opt-in (`git worktree add -b`), re-bound at startup (the
+folder's `origin` rides `session.json`), and **pruned** by the
+worktree row's `×` — run against the parent repo and guarded by a
+re-confirm when the worktree is dirty. Deleting the owning session
+keeps the worktree (the branch is the deliverable you may still PR).
+The **branch is never deleted by the IDE**: it's left in place for a
+later PR.
+
+The git primitives (`git_worktree_add` / `_list` / `_remove`)
+serialise behind the per-folder git mutex ([ADR 0015](decisions/0015-git-serialisation.md)).
+In a containerised workspace, isolated sessions run their tooling
+**in the container** so builds use the container toolchain. The whole
+worktrees tree is bind-mounted once at `/workspace/.worktrees` (so
+spinning up an isolated session never recreates the dev container);
+each worktree is created host-side then `git worktree repair`'d inside
+the container to hold the in-container paths, and its git / `bash` /
+format-on-save route container-side like any folder. Repair re-runs on
+container start, so metadata self-heals across restarts. Each worktree
+is `git worktree lock`ed (unlocked before removal) so a stray
+`git gc` / `git worktree prune` can't sever it. A pure-host workspace
+keeps everything host-side; while a container is down the worktree's
+git is unavailable until it comes back up (and repairs).
+
 ## UI placement
 
 A right-side panel docked to the editor area. Chat and coder are

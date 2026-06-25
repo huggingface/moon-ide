@@ -44,6 +44,15 @@ export type CollectPathsResult = {
 export type HostKind = 'local' | 'devcontainer';
 
 /**
+ * Why a folder is bound into the workspace. `userPicked` is the
+ * default ("Open folder…"); `worktree` is an IDE-managed git
+ * worktree backing an isolated coder session (ADR 0028), rendered
+ * nested under `parentPath` with the `branch` label. Mirrors
+ * `moon_protocol::workspace::FolderOrigin`.
+ */
+export type FolderOrigin = { kind: 'user_picked' } | { kind: 'worktree'; parentPath: string; branch: string };
+
+/**
  * One folder bound into a workspace. Mirrors
  * `moon_protocol::workspace::WorkspaceFolder`.
  */
@@ -51,6 +60,7 @@ export type WorkspaceFolder = {
 	path: string;
 	name: string;
 	host: HostKind;
+	origin: FolderOrigin;
 };
 
 /**
@@ -434,6 +444,21 @@ export type GitBranchInfo = {
 export type GitCommitResult = {
 	shortSha: string;
 	summary: string;
+};
+
+/**
+ * One linked working tree of a repository, from
+ * `git worktree list --porcelain`. Backs worktree-backed coder
+ * sessions (ADR 0028): each isolated session checks its branch out
+ * into its own worktree, which the IDE binds as a folder. Mirrors
+ * `moon_protocol::git::GitWorktree`.
+ */
+export type GitWorktree = {
+	path: string;
+	branch: string | null;
+	head: string;
+	isMain: boolean;
+	isLocked: boolean;
 };
 
 /**
@@ -854,6 +879,12 @@ export type FolderSession = {
 	review_comments: ReviewComment[];
 	/** Per-file "Viewed" marks for this folder (Phase 5.7). */
 	reviewed_files: ReviewedFile[];
+	/**
+	 * How this folder was bound — persisted so a worktree-backed
+	 * coder session's checkout re-binds as a nested worktree folder
+	 * on next launch (ADR 0028). See `FolderOrigin`.
+	 */
+	origin: FolderOrigin;
 };
 
 /**
@@ -1677,6 +1708,23 @@ export type CoderSessionSummary = {
 	title: string;
 	created_at_ms: number;
 	updated_at_ms: number;
+	/**
+	 * Branch of the git worktree this session runs in, for an
+	 * isolated (worktree-backed) session (ADR 0028). Absent for an
+	 * ordinary session. Lets the sessions list badge the row.
+	 */
+	worktreeBranch?: string | null;
+};
+
+/**
+ * Result of `coder_new_worktree_session`: the updated workspace
+ * snapshot (so the frontend renders the new nested worktree folder)
+ * plus the freshly-minted session to open. Mirrors the backend's
+ * `NewWorktreeSession`.
+ */
+export type NewWorktreeSession = {
+	workspace: Workspace;
+	session: CoderSessionSummary;
 };
 
 /**

@@ -70,7 +70,12 @@ use crate::inference::ToolCall;
 /// `custom` rows with no `content`, which the trace viewer
 /// silently skips. See [`record_to_pi_wire`] / [`pi_wire_to_records`]
 /// for the boundary.
-pub const SESSION_SCHEMA_VERSION: u32 = 3;
+///
+/// `4` adds the optional `worktree_root` / `worktree_branch` header
+/// fields for worktree-backed sessions (ADR 0028). They elide when
+/// absent, so an ordinary session's header is byte-identical to a
+/// schema-3 header apart from the version number.
+pub const SESSION_SCHEMA_VERSION: u32 = 4;
 
 /// File extension on every session file.
 const SESSION_EXT: &str = "jsonl";
@@ -157,6 +162,18 @@ pub struct SessionHeader {
 	/// each pick independently. Persisted so re-opening a session
 	/// restores the choice; a fresh session always starts `None`.
 	pub bash_target_override: Option<BashTargetOverride>,
+	/// Absolute path of the git worktree this session's tools run
+	/// against (ADR 0028). `None` for an ordinary session, which
+	/// drives its parent folder's main working tree. When set, the
+	/// runner routes `cx.folder` to the worktree while the session
+	/// stays filed under `cwd` (the parent folder) for persistence
+	/// and the sessions list. Falls back to the parent if the
+	/// worktree isn't bound (e.g. before startup re-binding lands).
+	pub worktree_root: Option<String>,
+	/// Branch the [`worktree_root`](Self::worktree_root) checkout is
+	/// on. Informational — surfaced as a badge on the session row.
+	/// `None` whenever `worktree_root` is.
+	pub worktree_branch: Option<String>,
 }
 
 /// Per-session override for the `bash` tool's execution target.
@@ -237,6 +254,12 @@ impl Serialize for SessionHeader {
 		if let Some(v) = &self.bash_target_override {
 			map.serialize_entry("bash_target_override", v.as_wire())?;
 		}
+		if let Some(v) = &self.worktree_root {
+			map.serialize_entry("worktree_root", v)?;
+		}
+		if let Some(v) = &self.worktree_branch {
+			map.serialize_entry("worktree_branch", v)?;
+		}
 		map.end()
 	}
 }
@@ -275,6 +298,10 @@ impl<'de> Deserialize<'de> for SessionHeader {
 			subagent_target_folder: Option<String>,
 			#[serde(default)]
 			bash_target_override: Option<String>,
+			#[serde(default)]
+			worktree_root: Option<String>,
+			#[serde(default)]
+			worktree_branch: Option<String>,
 		}
 		let raw = Raw::deserialize(deserializer)?;
 		Ok(SessionHeader {
@@ -293,6 +320,8 @@ impl<'de> Deserialize<'de> for SessionHeader {
 				.bash_target_override
 				.as_deref()
 				.and_then(BashTargetOverride::from_wire),
+			worktree_root: raw.worktree_root,
+			worktree_branch: raw.worktree_branch,
 		})
 	}
 }
@@ -1304,6 +1333,11 @@ pub struct SessionSummary {
 	pub title: String,
 	pub created_at_ms: i64,
 	pub updated_at_ms: i64,
+	/// Branch of the git worktree this session runs in, when it's a
+	/// worktree-backed (isolated) session (ADR 0028). `None` for an
+	/// ordinary session. Lets the sessions list badge the row.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub worktree_branch: Option<String>,
 }
 
 /// Full load: header + every record in order. Used when the user
@@ -1574,6 +1608,7 @@ pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError>
 		title: header.title,
 		created_at_ms: header.created_at_ms,
 		updated_at_ms: mtime_ms.unwrap_or(header.updated_at_ms),
+		worktree_branch: header.worktree_branch,
 	})
 }
 
@@ -2118,6 +2153,8 @@ mod tests {
 			subagent_mode: None,
 			subagent_target_folder: None,
 			bash_target_override: None,
+			worktree_root: None,
+			worktree_branch: None,
 		}
 	}
 

@@ -383,6 +383,12 @@ async fn run_subagent_inner(
 		// Sub-agents always run with auto bash routing; a forced-host
 		// parent session doesn't leak its override into delegated work.
 		bash_target_override: None,
+		// Sub-agents don't re-route via the header: their tools already
+		// run against `spec.folder` (which is the worktree when the
+		// parent is worktree-backed), so `cwd` above already points
+		// there and no extra routing field is needed.
+		worktree_root: None,
+		worktree_branch: None,
 	};
 
 	// Best-effort: persistence failures log at warn but never
@@ -1175,6 +1181,7 @@ mod tests {
 				path: "/abs/path/to/proj".into(),
 				name: "proj".into(),
 				host: moon_protocol::workspace::HostKind::Local,
+				origin: moon_protocol::workspace::FolderOrigin::UserPicked,
 			},
 			host: Arc::new(moon_core::LocalHost::new(camino::Utf8PathBuf::from(
 				"/abs/path/to/proj",

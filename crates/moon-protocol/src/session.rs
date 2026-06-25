@@ -15,6 +15,7 @@ use crate::coder_models::CoderProviderLock;
 use crate::git::{CompareBaseline, PrListScope};
 use crate::ports::ForwardedPort;
 use crate::review::{ReviewComment, ReviewedFile};
+use crate::workspace::FolderOrigin;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -76,6 +77,13 @@ pub struct FolderSession {
 	/// Pinned to the ticked version's blob SHA; the frontend
 	/// drops stale entries on git-status refresh. Never published.
 	pub reviewed_files: Vec<ReviewedFile>,
+	/// How this folder came to be bound (ADR 0028). Persisted so a
+	/// worktree-backed coder session's checkout is re-bound as a
+	/// nested worktree folder on next launch rather than promoted to
+	/// a plain top-level folder. Defaults to
+	/// [`FolderOrigin::UserPicked`] for folders written by older
+	/// builds.
+	pub origin: FolderOrigin,
 }
 
 /// Dummy `Default` so `#[serde(default)]` on the struct can fill
@@ -97,6 +105,7 @@ impl Default for FolderSession {
 			compare_baseline: CompareBaseline::default(),
 			review_comments: Vec::new(),
 			reviewed_files: Vec::new(),
+			origin: FolderOrigin::default(),
 		}
 	}
 }

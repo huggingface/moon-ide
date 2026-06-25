@@ -16,7 +16,7 @@ The full phased plan. Update the **Status** column as phases land.
 | 0     | Skeleton (open / edit / save)   | implemented |
 | 1     | Editor + navigation             | implemented |
 | 1.5   | Editor polish                   | scaffolded  |
-| 2     | Containerised dev shells        | scaffolded  |
+| 2     | Containerised dev shells        | in progress |
 | 2.5   | Multi-folder workspace UX       | scaffolded  |
 | 3     | Terminal                        | scaffolded  |
 | 4     | LSP                             | in progress |
@@ -119,6 +119,8 @@ A right-side coder panel that owns its loop end-to-end: streams from Hugging Fac
 Architectural spec: [`coder.md`](coder.md). Sub-phase work breakdown: [`roadmaps/phase-06-coder.md`](roadmaps/phase-06-coder.md). Decisions: [ADR 0010 — coder rewrite, not ACP](decisions/0010-coder-rewrite-not-acp.md), [ADR 0011 — rename `moon-agent` → `moon-remote`](decisions/0011-rename-moon-agent-to-moon-remote.md).
 
 **Acceptance** (per sub-phase): HF OAuth device-flow sign-in + read-only tool surface (6.0); SSE streaming + abort (6.1); mutating tools + container-aware bash (6.2); on-disk JSONL sessions + sidebar (6.3); model picker (6.4); steering + follow-up queues (6.5); `AGENTS.md` / `SYSTEM.md` / `SKILL.md` system-prompt assembly + compaction (6.6); per-user private HF bucket sync via `hf-xet` (6.7). Deliberately deferred (sub-agents, OpenRouter / custom providers, Anthropic OAuth, bucket browser, MCP, plan mode, permission popups) — see [`coder.md` § "Out of scope"](coder.md#out-of-scope-explicitly).
+
+**Follow-on — worktree sessions**: a session can opt into running in its own git worktree so several agents work one project at once and each lands an independent branch / PR. Staged W.0–W.4 in [`roadmaps/phase-06-coder.md` § Follow-on: worktree sessions](roadmaps/phase-06-coder.md#follow-on-worktree-sessions). Decision: [ADR 0028](decisions/0028-coder-worktree-sessions.md).
 
 ## Phase 7 — Multi-repo coordination
 

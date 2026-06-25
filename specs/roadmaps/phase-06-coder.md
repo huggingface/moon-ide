@@ -392,6 +392,70 @@ What ships:
 End of Phase 6. Hand back for human review per
 [`AGENTS.md` § Phased delivery](../../AGENTS.md#phased-delivery).
 
+## Follow-on: worktree sessions
+
+A post-Phase-6 capability built on the concurrent-session model
+([ADR 0016](../decisions/0016-coder-concurrent-sessions.md)): a session
+can opt into running in its own git worktree so several agents work the
+same project at once and each produces an independent branch / PR.
+Design and rejected alternatives:
+[ADR 0028](../decisions/0028-coder-worktree-sessions.md) and
+[`coder.md` § Worktree sessions](../coder.md#worktree-sessions). Test
+plan: [0098](../test-plans/0098-coder-worktree-sessions.md).
+
+Staged so each step is reviewable on its own:
+
+- **W.0 — git worktree primitives (landed).** `git_worktree_add` /
+  `_list` / `_remove` on `WorkspaceHost` (routed through
+  `git_command`, serialised behind the per-folder git mutex), the
+  `GitWorktree` protocol type, `fs_git_worktree_*` Tauri commands +
+  `ipc` wrappers. Unit-tested against a scratch repo on the host
+  target.
+- **W.1 — register a worktree as a bound folder (landed).** A
+  `FolderOrigin` discriminator on `WorkspaceFolder`
+  (`UserPicked` | `Worktree { parent_path, branch }`);
+  `WorkspaceRegistry::add_worktree_folder` (binds without stealing the
+  active folder); nested rendering under the parent in
+  `FolderBars.svelte` with the branch as the row label.
+- **W.2 — session ↔ worktree binding (landed).** `worktree_root` /
+  `worktree_branch` on the session header (schema → 4); the runner
+  routes `run_turn`'s `cx.folder` (and the prompt's active folder) to
+  the worktree while the session stays filed under its parent; the
+  `coder_new_worktree_session` command orchestrates create-worktree →
+  bind-folder → mint-session; a branch-glyph "new isolated session"
+  button in the coder panel.
+- **W.3 — lifecycle (landed).** `FolderOrigin` rides `session.json`
+  (`FolderSession.origin`), so `restore_session` re-binds worktree
+  folders via `add_worktree_folder` on launch and their sessions keep
+  routing to the checkout. The worktree row's `×` prunes the git
+  worktree via `coder_discard_worktree` (run against the parent repo),
+  re-confirming before `--force` when the worktree is dirty; the
+  branch is always kept and deleting the session never prunes.
+- **W.3.1 — AI branch name (next).** Replace the `moon/agent-<id>`
+  default with a cheap-model suggestion after the first turn (rename
+  the live branch, update the folder origin + session header). Pure
+  polish — the default branch name already works.
+- **W.4 — container-native isolated sessions (landed).** Isolated
+  sessions run their git / `bash` / format-on-save **in the
+  container** so builds use the container toolchain. The worktrees
+  tree is bind-mounted once at `/workspace/.worktrees` (no per-worktree
+  container recreate); worktrees are created host-side then
+  `git worktree repair`'d inside the container to hold the in-container
+  paths, and the shell resolver / `bash` cwd / `git_worktree_remove`
+  all map a worktree under that shared mount and run container-side
+  (host-side in a pure-host workspace). Repair re-runs on container
+  start/resume so metadata self-heals across restarts. Each worktree
+  is `git worktree lock`ed (unlocked before removal, preserved across
+  repair) so a stray `git gc` / `git worktree prune` can't sever it.
+  Git mechanics validated end-to-end against a live `moon-base`
+  container (create → repair → isolate → build → discard, shared-root
+  mount with no recreate, prune survival); the full IDE-in-container
+  path still wants a smoke-test.
+- **W.4.1 — AI branch name (next).** Replace the `moon/agent-<id>`
+  default with a cheap-model suggestion after the first turn (rename
+  the live branch, update the folder origin + session header). Pure
+  polish — the default branch name already works.
+
 ## What this phase deliberately doesn't do
 
 The full list lives in [`coder.md`'s "Out of scope"](../coder.md#out-of-scope-explicitly).

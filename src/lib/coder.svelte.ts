@@ -1634,31 +1634,57 @@ class CoderPanelState {
 	 *  any other in-flight session — those keep streaming
 	 *  events into their own buckets. */
 	async newSession(): Promise<void> {
-		const folder = this.current;
 		try {
 			const summary = await ipc.coder.newSession();
-			folder.visibleSessionId = summary.id;
-			folder.view = 'session';
-			const session = this.sessionStateFor(this.activeFolderPath ?? NO_FOLDER_KEY, summary.id);
-			// Zero out the fresh bucket. (`sessionStateFor` just
-			// created it blank, but a previously-deleted-and-
-			// reissued id is conceivable — be explicit.)
-			session.rows = [];
-			session.subagentSummaries = new Map();
-			session.subagentTranscripts = new Map();
-			session.viewSubagentId = null;
-			session.busy = false;
-			session.awaitingInput = false;
-			session.tokenUsage = null;
-			session.compaction = null;
-			session.todos = [];
-			session.activeSession = null;
+			this.installCreatedSession(summary);
 		} catch (err) {
 			// Surface on the previously-visible session if any —
 			// otherwise the placeholder bucket. Either way the
 			// user sees the error inline.
 			this.rows = [{ kind: 'error', id: `local-${Date.now()}`, text: formatError(err) }];
 		}
+	}
+
+	/** Install a session that was just minted backend-side into the
+	 *  active folder's panel state: make it visible, flip to the
+	 *  transcript view, and zero its bucket. Shared by [`newSession`]
+	 *  and the worktree-session flow ([`adoptCreatedSession`]). */
+	private installCreatedSession(summary: CoderSessionSummary): void {
+		const folder = this.current;
+		folder.visibleSessionId = summary.id;
+		folder.view = 'session';
+		const session = this.sessionStateFor(this.activeFolderPath ?? NO_FOLDER_KEY, summary.id);
+		// Zero out the fresh bucket. (`sessionStateFor` just
+		// created it blank, but a previously-deleted-and-
+		// reissued id is conceivable — be explicit.)
+		session.rows = [];
+		session.subagentSummaries = new Map();
+		session.subagentTranscripts = new Map();
+		session.viewSubagentId = null;
+		session.busy = false;
+		session.awaitingInput = false;
+		session.tokenUsage = null;
+		session.compaction = null;
+		session.todos = [];
+		session.activeSession = null;
+	}
+
+	/** Adopt an isolated worktree session created by the backend
+	 *  (ADR 0028). The caller adopts the updated workspace snapshot
+	 *  first (so the nested worktree folder is bound); this surfaces
+	 *  the session — filed under the still-active parent folder — in
+	 *  the panel and refreshes the sessions list so its row appears.
+	 */
+	adoptCreatedSession(summary: CoderSessionSummary): void {
+		this.installCreatedSession(summary);
+		void this.refreshSessions();
+	}
+
+	/** Render an error inline in the active session's transcript —
+	 *  used by flows orchestrated outside this store (e.g. the
+	 *  worktree-session creation in `WorkspaceState`). */
+	surfaceError(err: unknown): void {
+		this.rows = [{ kind: 'error', id: `local-${Date.now()}`, text: formatError(err) }];
 	}
 
 	/** Delete a persisted session (with no extra UI confirmation

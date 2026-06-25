@@ -1068,11 +1068,23 @@ impl ToolRegistry {
 		if target == BASH_TARGET_CONTAINER {
 			let workspace_id = self.workspaces.workspace_id().await;
 			let container_name = container_name_for_workspace(&workspace_id);
-			// Fall back to `/workspace` if the host path has no
-			// basename — same fallback `moon-terminal` uses for
-			// pathological inputs (`/`).
-			let container_cwd = TerminalTarget::container_cwd_for_folder(Utf8Path::new(&folder.folder.path))
-				.unwrap_or_else(|| Utf8PathBuf::from("/workspace"));
+			// Worktree-backed sessions (ADR 0028 W.4.1) live under the
+			// shared `/workspace/.worktrees` mount, not `/workspace/<name>`,
+			// so their `bash` cwd is computed against that mount.
+			// Everything else falls back to `/workspace` if the host
+			// path has no basename — same fallback `moon-terminal` uses
+			// for pathological inputs (`/`).
+			let folder_path = Utf8Path::new(&folder.folder.path);
+			let container_cwd = if matches!(
+				folder.folder.origin,
+				moon_protocol::workspace::FolderOrigin::Worktree { .. }
+			) {
+				let state_dir = self.workspaces_dir.join(&workspace_id);
+				moon_core::worktree::worktree_container_path(&state_dir, folder_path)
+					.unwrap_or_else(|| Utf8PathBuf::from("/workspace"))
+			} else {
+				TerminalTarget::container_cwd_for_folder(folder_path).unwrap_or_else(|| Utf8PathBuf::from("/workspace"))
+			};
 			// `docker exec` (no `-it`): we want captured
 			// stdout/stderr, not a TTY. Terminals get `-it`; the
 			// bash tool doesn't.

@@ -1335,6 +1335,13 @@ class WorkspaceState {
 		if (!folder) {
 			return;
 		}
+		// A worktree-backed session folder (ADR 0028) isn't a folder
+		// the user picked — removing it prunes the git worktree, not
+		// just the binding. Route to the dedicated discard flow.
+		if (folder.origin.kind === 'worktree') {
+			await this.discardWorktree(path);
+			return;
+		}
 		const folderState = this.folderStates.get(path);
 		const dirty = folderState?.openFiles.filter((f) => f.isDirty) ?? [];
 		const ok = await confirm(
@@ -1376,6 +1383,82 @@ class WorkspaceState {
 		} catch (err) {
 			this.flash(`Could not remove folder: ${formatError(err)}`);
 		}
+	}
+
+	/**
+	 * Spin up an isolated coder session in its own git worktree
+	 * (ADR 0028). The backend branches off the active folder's HEAD,
+	 * checks the branch out into a worktree, binds that worktree as
+	 * a nested folder, and mints a session — filed under the
+	 * still-active parent — whose tools route to the worktree. We
+	 * adopt the returned snapshot so the nested folder row renders,
+	 * then surface the new session in the panel.
+	 *
+	 * Container mounting of the worktree is deferred (ADR 0028 W.4),
+	 * so this deliberately doesn't nudge `container.syncBoundFolders()`.
+	 */
+	async newCoderWorktreeSession(): Promise<void> {
+		try {
+			const result = await ipc.coder.newWorktreeSession();
+			await this.adoptWorkspaceSnapshot(result.workspace);
+			this.persistAppState();
+			coder.adoptCreatedSession(result.session);
+		} catch (err) {
+			coder.surfaceError(err);
+			this.flash(`Could not start isolated session: ${formatError(err)}`);
+		}
+	}
+
+	/**
+	 * Discard a worktree-backed session folder (ADR 0028): prune the
+	 * git worktree and unbind it. The branch is kept — it's the
+	 * deliverable, left for a PR. `git worktree remove` refuses a
+	 * dirty worktree without `--force`, so a first failure prompts a
+	 * second confirm before forcing.
+	 */
+	async discardWorktree(path: string) {
+		const folder = this.workspace?.folders.find((f) => f.path === path);
+		if (!folder || folder.origin.kind !== 'worktree') {
+			return;
+		}
+		const branch = folder.origin.branch;
+		const ok = await confirm(
+			`Discard worktree on ${branch}?\n\nThe branch is kept — only the working copy is removed, so you can still open a PR from it later.`,
+			{ title: 'Discard worktree', okLabel: 'Discard', cancelLabel: 'Cancel' },
+		);
+		if (!ok) {
+			return;
+		}
+		try {
+			await this.pruneWorktree(path, false);
+		} catch (firstErr) {
+			// Most likely the worktree has uncommitted or untracked
+			// changes (git refuses without --force). Re-confirm, then
+			// force. Any other error surfaces here too — the message
+			// carries git's own stderr so the user knows what broke.
+			const forceOk = await confirm(
+				`This worktree has uncommitted or untracked changes that will be lost.\n\nDiscard them anyway?\n\n(${formatError(firstErr)})`,
+				{ title: 'Discard worktree', okLabel: 'Discard changes', cancelLabel: 'Cancel' },
+			);
+			if (!forceOk) {
+				return;
+			}
+			try {
+				await this.pruneWorktree(path, true);
+			} catch (secondErr) {
+				this.flash(`Could not discard worktree: ${formatError(secondErr)}`);
+			}
+		}
+	}
+
+	private async pruneWorktree(path: string, force: boolean) {
+		const ws = await ipc.coder.discardWorktree(path, force);
+		this.folderStates.delete(path);
+		this.pruneNavEntriesForFolder(path);
+		projectCompose.forget(path);
+		forgetTerminalMemoryFor(path);
+		await this.adoptWorkspaceSnapshot(ws);
+		this.persistAppState();
 	}
 
 	/**
@@ -2189,6 +2272,10 @@ class WorkspaceState {
 						compare_baseline: fs.compareBaseline,
 						review_comments: fs.reviewComments,
 						reviewed_files: fs.reviewedFiles,
+						// Persist how the folder was bound so a worktree
+						// (ADR 0028) re-binds as a worktree on next launch
+						// instead of becoming a plain top-level folder.
+						origin: folder.origin,
 					});
 				}
 			}

@@ -415,6 +415,8 @@ impl Session {
 				subagent_mode: None,
 				subagent_target_folder: None,
 				bash_target_override: None,
+				worktree_root: None,
+				worktree_branch: None,
 			},
 			session_dir: None,
 			messages: vec![ChatMessage::System {
@@ -434,6 +436,7 @@ impl Session {
 			title: self.header.title.clone(),
 			created_at_ms: self.header.created_at_ms,
 			updated_at_ms: self.header.updated_at_ms,
+			worktree_branch: self.header.worktree_branch.clone(),
 		}
 	}
 }
@@ -1354,6 +1357,39 @@ impl CoderHandle {
 		Ok(summary)
 	}
 
+	/// Create a fresh session under the **active (parent) folder**
+	/// that routes its tools to an already-created git worktree at
+	/// `worktree_root` on `branch` (ADR 0028). The session stays
+	/// filed under the parent — same sessions list, same JSONL slug
+	/// — but every turn's `cx.folder` resolves to the worktree, so
+	/// the agent's edits / builds land in the isolated checkout.
+	///
+	/// The caller is responsible for having created the worktree and
+	/// bound it as a folder first (so `folder_for_path(worktree_root)`
+	/// resolves at turn time); this only mints the session and stamps
+	/// the binding onto its header.
+	pub async fn new_worktree_session(
+		&self,
+		worktree_root: String,
+		branch: String,
+	) -> Result<SessionSummary, CoderError> {
+		let (fs, _) = self.state.active_folder_session().await?;
+		let mut blank = Session::new_blank();
+		blank.header.worktree_root = Some(worktree_root);
+		blank.header.worktree_branch = Some(branch);
+		// No bash-target override: a worktree folder routes to the
+		// container like any other folder (ADR 0028 W.4.1 — it sits
+		// under the shared `/workspace/.worktrees` mount), so the
+		// agent's builds get the container toolchain. The user can
+		// still force host via the per-session toggle.
+		let summary = blank.summary();
+		let id = blank.header.id.clone();
+		let rt = Arc::new(SessionRuntime::new(blank));
+		fs.insert_runtime(id.clone(), rt).await;
+		fs.set_visible(id).await;
+		Ok(summary)
+	}
+
 	/// Set the per-session bash-target override for the **visible
 	/// session** under the active folder. `force_host = true` pins
 	/// this session's `bash` + format-on-save subprocesses to the
@@ -1694,6 +1730,7 @@ impl CoderHandle {
 			title: header.title.clone(),
 			created_at_ms: header.created_at_ms,
 			updated_at_ms: header.updated_at_ms,
+			worktree_branch: header.worktree_branch.clone(),
 		};
 		// Snapshot what the panel needs for the restore-time
 		// usage hint *before* the move into `Session`. We prefer
@@ -2442,9 +2479,19 @@ async fn run_turn(
 	// closes over its `folder_path`, so its tools always operate
 	// against folder X regardless of whatever the user has
 	// foregrounded in the IDE.
+	// Worktree-backed sessions (ADR 0028) route their tools to the
+	// session's git worktree while staying filed under the parent
+	// folder (`folder_path`) for persistence + events. Fall back to
+	// the parent when the worktree isn't bound — e.g. before
+	// startup re-binding lands (W.3) or if the user discarded it.
+	let worktree_root = rt.session.lock().await.header.worktree_root.clone();
+	let routing_path: Utf8PathBuf = match worktree_root {
+		Some(root) if state.workspaces.folder_for_path(&root).await.is_some() => root.into(),
+		_ => folder_path.to_path_buf(),
+	};
 	let folder_entry = state
 		.workspaces
-		.folder_for_path(folder_path.as_str())
+		.folder_for_path(routing_path.as_str())
 		.await
 		.ok_or(CoderError::NoActiveFolder)?;
 	// Snapshot the per-session bash-target override once at
@@ -2459,7 +2506,10 @@ async fn run_turn(
 	// Sub-agent dispatch reads the same cache so the model's
 	// awareness of bound folders is consistent across parent +
 	// sub-agent prompts.
-	refresh_system_prompt(state, rt, folder_path, force_host_bash).await;
+	// Use the routing path (worktree when bound, else parent) as the
+	// prompt's "active folder" so the agent is oriented at the
+	// checkout its tools actually operate on.
+	refresh_system_prompt(state, rt, &routing_path, force_host_bash).await;
 	// Schedule background regeneration for any bound folder whose
 	// summary cache is missing or stale. Detached tokio tasks; we
 	// don't block the turn waiting for them to land. The next
@@ -5126,6 +5176,8 @@ mod tests {
 			subagent_mode: None,
 			subagent_target_folder: None,
 			bash_target_override: None,
+			worktree_root: None,
+			worktree_branch: None,
 		}
 	}
 

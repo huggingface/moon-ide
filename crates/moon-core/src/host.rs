@@ -10,7 +10,7 @@ use moon_protocol::editorconfig::EditorConfig;
 use moon_protocol::fs::{CollectPathsResult, DirEntry, EntryKind, ReadFileResult, StatResult, WriteFileResult};
 use moon_protocol::git::{
 	BranchDiffStatus, BranchList, BranchListEntry, BranchSwitchTarget, GitBranchInfo, GitCommitResult, GitFileBlame,
-	GitFileStatus, GitLineBlame, GitMergeState, GitPermalink, GitStatusEntry, PrListScope, PrListStatus,
+	GitFileStatus, GitLineBlame, GitMergeState, GitPermalink, GitStatusEntry, GitWorktree, PrListScope, PrListStatus,
 };
 use moon_protocol::review::{PublishReviewRequest, PublishReviewResult, ReviewSide};
 use moon_protocol::{MoonError, MoonResult};
@@ -372,6 +372,53 @@ pub trait WorkspaceHost: Send + Sync {
 	/// best-effort, errors are logged but not surfaced (the original
 	/// commit failure is the actionable one).
 	async fn git_commit_on_new_branch(&self, branch: &str, message: &str) -> MoonResult<GitCommitResult>;
+
+	/// Create a linked worktree at `path` on a fresh branch `branch`
+	/// off the current `HEAD` (`git worktree add -b <branch> <path>`).
+	/// Backs worktree-backed coder sessions (ADR 0028): an isolated
+	/// session checks its branch out into its own working directory so
+	/// several agents can work one repo without colliding.
+	///
+	/// `branch` is validated with `git check-ref-format --branch`
+	/// before anything is touched, so a malformed name fails fast.
+	/// Errors when the active folder isn't a git repo, `branch`
+	/// already exists, or `path` is non-empty — git's own stderr is
+	/// surfaced verbatim. Returns the freshly-created [`GitWorktree`].
+	async fn git_worktree_add(&self, path: &Utf8Path, branch: &str) -> MoonResult<GitWorktree>;
+
+	/// List the repository's working trees (`git worktree list
+	/// --porcelain`), including the main one (`is_main`). Used to
+	/// reconcile the IDE's session→worktree bindings against reality
+	/// at startup and on discard.
+	async fn git_worktree_list(&self) -> MoonResult<Vec<GitWorktree>>;
+
+	/// Prune the linked worktree at `path` (`git worktree remove`).
+	/// `force` passes `--force`, needed when the worktree has
+	/// uncommitted changes or is locked — the caller gates that
+	/// behind a confirm so an agent's work isn't silently dropped.
+	/// The branch is never deleted here; pruning a worktree leaves
+	/// its branch in place as the deliverable.
+	///
+	/// `path` is given **as the active shell target sees it**: a
+	/// host path in host mode, the in-container `/workspace/.worktrees/…`
+	/// path when the workspace runs in a container (where the
+	/// worktree's metadata holds container paths after
+	/// [`git_worktree_repair`]). The caller — which knows the
+	/// container state and the mapping — passes the right one.
+	async fn git_worktree_remove(&self, path: &Utf8Path, force: bool) -> MoonResult<()>;
+
+	/// `git worktree repair <worktree_container_path>` against this
+	/// (parent) repo, run in the container. Rewrites the worktree's
+	/// gitdir pointers to the in-container paths so container-side
+	/// git works on a worktree that was created host-side (ADR 0028
+	/// W.4.1). `worktree_container_path` is the worktree's
+	/// `/workspace/.worktrees/…` path. Best-effort and idempotent:
+	/// repairing an already-correct worktree is a no-op, so callers
+	/// fire it after create and on container start without tracking
+	/// state. No-op-equivalent in host mode (the routing keeps git
+	/// host-side there, where the host-path metadata is already
+	/// correct).
+	async fn git_worktree_repair(&self, worktree_container_path: &Utf8Path) -> MoonResult<()>;
 
 	/// Lightweight diff summary of the working tree against `HEAD`,
 	/// suitable for feeding to a small LLM that's suggesting a
@@ -1795,6 +1842,63 @@ impl WorkspaceHost for LocalHost {
 		.map_err(|e| MoonError::Internal(format!("git_commit_on_new_branch join error: {e}")))?
 	}
 
+	async fn git_worktree_add(&self, path: &Utf8Path, branch: &str) -> MoonResult<GitWorktree> {
+		let guard = self.git_lock().await;
+		let root = self.root.clone();
+		let path = path.to_owned();
+		let branch = branch.to_owned();
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			// Always host (ADR 0028 W.4): worktrees live under the
+			// per-workspace state dir, outside every container bind
+			// mount, so only host git can reach them and the metadata
+			// it records (absolute host paths) only resolves host-side.
+			run_git_worktree_add(&root, &path, &branch, &ShellTarget::Host)
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_worktree_add join error: {e}")))?
+	}
+
+	async fn git_worktree_list(&self) -> MoonResult<Vec<GitWorktree>> {
+		let guard = self.git_lock().await;
+		let root = self.root.clone();
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			run_git_worktree_list(&root, &ShellTarget::Host)
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_worktree_list join error: {e}")))?
+	}
+
+	async fn git_worktree_remove(&self, path: &Utf8Path, force: bool) -> MoonResult<()> {
+		let guard = self.git_lock().await;
+		// Remove runs where the worktree's metadata is valid: the
+		// container when the workspace runs there (the caller passes
+		// the `/workspace/.worktrees/…` path), the host otherwise.
+		let target = self.shell_target().await;
+		let root = self.root.clone();
+		let path = path.to_owned();
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			run_git_worktree_remove(&root, &path, force, &target)
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_worktree_remove join error: {e}")))?
+	}
+
+	async fn git_worktree_repair(&self, worktree_container_path: &Utf8Path) -> MoonResult<()> {
+		let guard = self.git_lock().await;
+		let target = self.shell_target().await;
+		let root = self.root.clone();
+		let wt = worktree_container_path.to_owned();
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			run_git_worktree_repair(&root, &wt, &target)
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_worktree_repair join error: {e}")))?
+	}
+
 	async fn git_diff_summary(&self) -> MoonResult<String> {
 		let guard = self.git_lock().await;
 		let root = self.root.clone();
@@ -2628,6 +2732,237 @@ fn run_git_commit_on_new_branch(
 			Err(err)
 		}
 	}
+}
+
+/// Resolve the worktree-`path` argument for a `git worktree` command.
+/// [`git_command`] only translates `root` through the bind mount, so
+/// under a container target we translate the destination path too —
+/// otherwise the in-container git would create the checkout at a host
+/// path it can't see. Falls back to the raw path when translation
+/// fails (the same best-effort posture `git_command` itself takes).
+fn worktree_path_arg(target: &ShellTarget, path: &Utf8Path) -> String {
+	match target {
+		ShellTarget::Host => path.to_string(),
+		ShellTarget::Container { .. } => target
+			.translate_path(path)
+			.map(|p| p.to_string())
+			.unwrap_or_else(|| path.to_string()),
+	}
+}
+
+/// `git worktree add -b <branch> <path>` — check out a fresh branch
+/// into its own working directory. Validates the branch name with
+/// `check-ref-format` first (same gate as
+/// [`run_git_commit_on_new_branch`]) so a malformed name fails before
+/// anything is written. See ADR 0028.
+fn run_git_worktree_add(
+	root: &Utf8Path,
+	path: &Utf8Path,
+	branch: &str,
+	target: &ShellTarget,
+) -> MoonResult<GitWorktree> {
+	if branch.is_empty() {
+		return Err(MoonError::invalid("branch name is empty"));
+	}
+	let check = git_command(target, root)
+		.args(["check-ref-format", "--branch", branch])
+		.output()
+		.map_err(|e| MoonError::IoError(format!("git check-ref-format failed to launch: {e}")))?;
+	if !check.status.success() {
+		let stderr = String::from_utf8_lossy(&check.stderr).trim().to_string();
+		let detail = if stderr.is_empty() {
+			format!("{branch:?} is not a valid git branch name")
+		} else {
+			format!("{branch:?}: {stderr}")
+		};
+		return Err(MoonError::invalid(detail));
+	}
+
+	let path_arg = worktree_path_arg(target, path);
+	let add = git_command(target, root)
+		.args(["worktree", "add", "-b", branch, &path_arg])
+		.output()
+		.map_err(|e| MoonError::IoError(format!("git worktree add failed to launch: {e}")))?;
+	if !add.status.success() {
+		let stderr = String::from_utf8_lossy(&add.stderr).trim().to_string();
+		let stdout = String::from_utf8_lossy(&add.stdout).trim().to_string();
+		let combined = if stderr.is_empty() { stdout } else { stderr };
+		return Err(MoonError::IoError(format!(
+			"git worktree add exited {}: {combined}",
+			add.status.code().unwrap_or(-1)
+		)));
+	}
+
+	// Lock the worktree so a `git worktree prune` can't sever it.
+	// This matters specifically for the containerised-workspace case
+	// (ADR 0028 W.4): the worktree lives on the host outside every
+	// bind mount, so the *in-container* parent repo sees its gitdir
+	// path as non-existent and flags it `prunable` — a container-side
+	// `git gc` / `git worktree prune` on the parent would then drop
+	// the worktree's admin entry and break it. Locking makes prune
+	// skip it. The discard path unlocks before removing
+	// (`run_git_worktree_remove`). Best-effort: a lock failure leaves
+	// a working (if unprotected) worktree rather than failing create.
+	let locked = git_command(target, root)
+		.args(["worktree", "lock", "--reason", WORKTREE_LOCK_REASON])
+		.arg(&path_arg)
+		.output()
+		.map(|o| o.status.success())
+		.unwrap_or(false);
+	if !locked {
+		tracing::warn!(worktree = %path, "git worktree lock failed; worktree is unprotected from prune");
+	}
+
+	// The new branch points at the commit we branched from — i.e.
+	// `root`'s current HEAD. Resolve it for the returned record; an
+	// empty string is acceptable (the frontend treats it as unknown).
+	let head = git_command(target, root)
+		.args(["rev-parse", "HEAD"])
+		.output()
+		.ok()
+		.filter(|o| o.status.success())
+		.and_then(|o| String::from_utf8(o.stdout).ok())
+		.map(|s| s.trim().to_owned())
+		.unwrap_or_default();
+
+	Ok(GitWorktree {
+		path: path.to_string(),
+		branch: Some(branch.to_owned()),
+		head,
+		is_main: false,
+		is_locked: locked,
+	})
+}
+
+/// Lock reason stamped on every IDE-managed worktree so
+/// `git worktree list` explains why it's locked. See
+/// [`run_git_worktree_add`].
+const WORKTREE_LOCK_REASON: &str = "moon-ide isolated session (ADR 0028)";
+
+/// `git worktree list --porcelain` → [`GitWorktree`] rows. The main
+/// working tree is git's first entry and gets `is_main = true`.
+fn run_git_worktree_list(root: &Utf8Path, target: &ShellTarget) -> MoonResult<Vec<GitWorktree>> {
+	let output = git_command(target, root)
+		.args(["worktree", "list", "--porcelain"])
+		.output()
+		.map_err(|e| MoonError::IoError(format!("git worktree list failed to launch: {e}")))?;
+	if !output.status.success() {
+		let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+		return Err(MoonError::IoError(format!(
+			"git worktree list exited {}: {stderr}",
+			output.status.code().unwrap_or(-1)
+		)));
+	}
+	let stdout = String::from_utf8_lossy(&output.stdout);
+	Ok(parse_worktree_porcelain(&stdout))
+}
+
+/// Parse `git worktree list --porcelain` output. Blocks are
+/// separated by blank lines; each opens with `worktree <path>` and
+/// carries `HEAD <sha>`, then either `branch refs/heads/<name>` or
+/// `detached`, and optionally `locked` / `bare`. The first block is
+/// always the repo's main working tree.
+fn parse_worktree_porcelain(stdout: &str) -> Vec<GitWorktree> {
+	let mut out = Vec::new();
+	let mut cur: Option<GitWorktree> = None;
+	let mut is_first = true;
+	for line in stdout.lines() {
+		if let Some(path) = line.strip_prefix("worktree ") {
+			if let Some(done) = cur.take() {
+				out.push(done);
+			}
+			cur = Some(GitWorktree {
+				path: path.trim().to_owned(),
+				branch: None,
+				head: String::new(),
+				is_main: std::mem::take(&mut is_first),
+				is_locked: false,
+			});
+		} else if let Some(head) = line.strip_prefix("HEAD ") {
+			if let Some(w) = cur.as_mut() {
+				w.head = head.trim().to_owned();
+			}
+		} else if let Some(refname) = line.strip_prefix("branch ") {
+			if let Some(w) = cur.as_mut() {
+				let name = refname.trim();
+				w.branch = Some(name.strip_prefix("refs/heads/").unwrap_or(name).to_owned());
+			}
+		} else if line.trim() == "detached" {
+			if let Some(w) = cur.as_mut() {
+				w.branch = None;
+			}
+		} else if line.trim() == "locked" || line.starts_with("locked ") {
+			if let Some(w) = cur.as_mut() {
+				w.is_locked = true;
+			}
+		}
+	}
+	if let Some(done) = cur.take() {
+		out.push(done);
+	}
+	out
+}
+
+/// `git worktree remove [--force] <path>` — prune a linked worktree.
+/// Never deletes the branch (ADR 0028: the branch is the deliverable).
+///
+/// IDE-managed worktrees are locked at creation (see
+/// [`run_git_worktree_add`]), and `git worktree remove` refuses a
+/// locked worktree, so we unlock first. The unlock is best-effort —
+/// it errors harmlessly on an already-unlocked worktree (older
+/// worktrees created before locking shipped), which we ignore.
+fn run_git_worktree_remove(root: &Utf8Path, path: &Utf8Path, force: bool, target: &ShellTarget) -> MoonResult<()> {
+	let path_arg = worktree_path_arg(target, path);
+	let _ = git_command(target, root)
+		.args(["worktree", "unlock"])
+		.arg(&path_arg)
+		.output();
+	let mut cmd = git_command(target, root);
+	cmd.args(["worktree", "remove"]);
+	if force {
+		cmd.arg("--force");
+	}
+	cmd.arg(&path_arg);
+	let out = cmd
+		.output()
+		.map_err(|e| MoonError::IoError(format!("git worktree remove failed to launch: {e}")))?;
+	if !out.status.success() {
+		let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+		let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+		let combined = if stderr.is_empty() { stdout } else { stderr };
+		return Err(MoonError::IoError(format!(
+			"git worktree remove exited {}: {combined}",
+			out.status.code().unwrap_or(-1)
+		)));
+	}
+	Ok(())
+}
+
+/// `git worktree repair <worktree_container_path>` against the parent
+/// repo. Run container-side (the caller's `target`), it rewrites the
+/// worktree's gitdir pointers to the in-container paths so a worktree
+/// created host-side becomes usable by container git. See the
+/// [`WorkspaceHost::git_worktree_repair`] trait doc. `git worktree
+/// repair` prints what it fixed to stderr but exits 0 on success, so
+/// we key off the status, not the output.
+fn run_git_worktree_repair(
+	root: &Utf8Path,
+	worktree_container_path: &Utf8Path,
+	target: &ShellTarget,
+) -> MoonResult<()> {
+	let out = git_command(target, root)
+		.args(["worktree", "repair"])
+		.arg(worktree_container_path.as_str())
+		.output()
+		.map_err(|e| MoonError::IoError(format!("git worktree repair failed to launch: {e}")))?;
+	if !out.status.success() {
+		let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+		return Err(MoonError::IoError(format!(
+			"git worktree repair exited {}: {stderr}",
+			out.status.code().unwrap_or(-1)
+		)));
+	}
+	Ok(())
 }
 
 /// Diff summary the SCM panel feeds to the AI branch-name
@@ -6377,6 +6712,90 @@ mod tests {
 			.unwrap();
 		assert!(head_branch.status.success());
 		assert_eq!(String::from_utf8_lossy(&head_branch.stdout).trim(), "feature/wip");
+	}
+
+	#[tokio::test]
+	async fn git_worktree_add_list_remove_round_trip() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping worktree round-trip test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		std::fs::write(dir.path().join("README.md"), "hi\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "initial"]);
+
+		// The worktree lives outside the repo (ADR 0028 places them in
+		// the per-workspace state dir), so use a separate temp parent.
+		let wt_parent = TempDir::new().unwrap();
+		let wt_path = Utf8PathBuf::from_path_buf(wt_parent.path().join("agent-wt")).unwrap();
+
+		let created = host(&dir).git_worktree_add(&wt_path, "moon/agent-1").await.unwrap();
+		assert_eq!(created.branch.as_deref(), Some("moon/agent-1"));
+		assert!(!created.is_main);
+		assert!(!created.head.is_empty());
+		// Locked at creation so a `git worktree prune` can't sever it
+		// (ADR 0028 W.4 — matters for the containerised case).
+		assert!(created.is_locked, "fresh worktree should be locked");
+		assert!(wt_path.join("README.md").exists(), "worktree was checked out");
+
+		let list = host(&dir).git_worktree_list().await.unwrap();
+		assert_eq!(list.len(), 2, "main tree plus the one we added");
+		assert!(list[0].is_main);
+		let linked = list.iter().find(|w| !w.is_main).expect("linked worktree present");
+		assert_eq!(linked.branch.as_deref(), Some("moon/agent-1"));
+		assert!(linked.is_locked, "list should report the worktree as locked");
+
+		// Remove unlocks first, so a locked worktree still removes
+		// cleanly without the caller having to unlock by hand.
+		host(&dir).git_worktree_remove(&wt_path, false).await.unwrap();
+		assert!(!wt_path.join("README.md").exists(), "worktree was pruned");
+		let after = host(&dir).git_worktree_list().await.unwrap();
+		assert_eq!(after.len(), 1);
+		assert!(after[0].is_main);
+	}
+
+	#[tokio::test]
+	async fn git_worktree_add_rejects_invalid_branch() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping worktree invalid-branch test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		std::fs::write(dir.path().join("README.md"), "hi\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "initial"]);
+
+		let wt_parent = TempDir::new().unwrap();
+		let wt_path = Utf8PathBuf::from_path_buf(wt_parent.path().join("bad")).unwrap();
+		// Spaces are illegal in git ref names; we fail before creating
+		// anything on disk.
+		let err = host(&dir).git_worktree_add(&wt_path, "not a branch").await.unwrap_err();
+		assert!(matches!(err, MoonError::InvalidArgument(_)), "got {err:?}");
+		assert!(!wt_path.exists(), "no worktree dir left behind");
+	}
+
+	#[test]
+	fn parse_worktree_porcelain_handles_branch_detached_locked() {
+		let sample = "worktree /repo/main\nHEAD aaaa1111\nbranch refs/heads/main\n\n\
+			worktree /wt/feat\nHEAD bbbb2222\nbranch refs/heads/feat/x\nlocked\n\n\
+			worktree /wt/detached\nHEAD cccc3333\ndetached\n";
+		let got = super::parse_worktree_porcelain(sample);
+		assert_eq!(got.len(), 3);
+		assert!(got[0].is_main);
+		assert_eq!(got[0].branch.as_deref(), Some("main"));
+		assert_eq!(got[0].head, "aaaa1111");
+		assert!(!got[1].is_main);
+		assert_eq!(got[1].branch.as_deref(), Some("feat/x"));
+		assert!(got[1].is_locked);
+		assert_eq!(got[2].branch, None);
+		assert_eq!(got[2].head, "cccc3333");
 	}
 
 	#[tokio::test]

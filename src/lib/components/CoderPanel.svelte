@@ -29,6 +29,7 @@
 	import SettingsIcon from './icons/SettingsIcon.svelte';
 	import SignOutIcon from './icons/SignOutIcon.svelte';
 	import PlusIcon from './icons/PlusIcon.svelte';
+	import BranchIcon from './icons/BranchIcon.svelte';
 	import CloudUploadIcon from './icons/CloudUploadIcon.svelte';
 	import CloudSyncIcon from './icons/CloudSyncIcon.svelte';
 	import ExternalLinkIcon from './icons/ExternalLinkIcon.svelte';
@@ -1391,6 +1392,15 @@
 		composer?.focus();
 	}
 
+	async function onNewWorktreeSession(): Promise<void> {
+		// Spin up an isolated session in its own git worktree
+		// (ADR 0028) so it can't collide with other agents in this
+		// folder. The folder bar grows a nested row for the worktree.
+		await workspace.newCoderWorktreeSession();
+		await tick();
+		composer?.focus();
+	}
+
 	async function onPickSession(id: string): Promise<void> {
 		await coder.openSession(id);
 		await tick();
@@ -1741,6 +1751,15 @@
 			<header class="sessions-header">
 				<span class="section-title">Sessions</span>
 				<div class="header-actions">
+					<button
+						type="button"
+						class="icon"
+						onclick={onNewWorktreeSession}
+						title="New isolated session (own git worktree + branch)"
+						aria-label="New isolated session"
+					>
+						<BranchIcon />
+					</button>
 					<button type="button" class="icon" onclick={onNewSession} title="New session" aria-label="New session">
 						<PlusIcon />
 					</button>
@@ -1893,6 +1912,15 @@
 					</button>
 				{/if}
 			{/if}
+			<button
+				type="button"
+				class="icon"
+				onclick={onNewWorktreeSession}
+				title="New isolated session (own git worktree + branch)"
+				aria-label="New isolated session"
+			>
+				<BranchIcon />
+			</button>
 			<button type="button" class="icon" onclick={onNewSession} title="New session" aria-label="New session">
 				<PlusIcon />
 			</button>

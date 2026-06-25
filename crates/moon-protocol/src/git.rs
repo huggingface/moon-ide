@@ -361,6 +361,41 @@ pub struct BranchList {
 	pub pr_status: PrListStatus,
 }
 
+/// One linked working tree of a repository, parsed from
+/// `git worktree list --porcelain`. The main working tree is
+/// included in git's output and carries the same shape, so callers
+/// that only want the *linked* (extra) worktrees filter on
+/// [`is_main`](Self::is_main).
+///
+/// Backs the worktree-session feature (ADR 0028): each isolated
+/// coder session checks out its branch into its own
+/// worktree, which the IDE then binds as a folder. The fields here
+/// are exactly what's needed to render and reconcile those bindings
+/// — the on-disk `path`, the `branch` it's on, and the `head` commit.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct GitWorktree {
+	/// Absolute path of the worktree's working directory, as git
+	/// reports it (`worktree <path>` in the porcelain output).
+	pub path: String,
+	/// Short branch name the worktree has checked out (`feat/foo`),
+	/// or `None` for a detached-HEAD worktree (`detached` in the
+	/// porcelain output).
+	pub branch: Option<String>,
+	/// 40-char commit hash the worktree's `HEAD` points at. Empty
+	/// only for a brand-new worktree git reports without a `HEAD`
+	/// line (rare; treated as "unknown").
+	pub head: String,
+	/// True for the repository's main working tree (the first entry
+	/// git lists). Linked worktrees the IDE creates are `false`.
+	pub is_main: bool,
+	/// True when git marks the worktree `locked` — it won't prune a
+	/// locked worktree without `--force`. The IDE surfaces this so a
+	/// discard prompt can explain why a plain remove was refused.
+	pub is_locked: bool,
+}
+
 /// Scope filter for `branch_list`'s PR section. `All` mirrors
 /// `gh pr list --state open` (every open PR in the repo);
 /// `Participating` uses GitHub's search qualifiers to keep only

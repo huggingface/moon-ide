@@ -51,16 +51,43 @@ impl ShellResolver for WorkspaceShellResolver {
 			return ShellTarget::Host;
 		};
 		let workspace_id = workspaces.workspace_id().await;
-		let bound: Vec<Utf8PathBuf> = workspaces
-			.folders()
-			.await
+		let state_dir = self.workspaces_dir.join(&workspace_id);
+		let entries = workspaces.folders().await;
+		// Worktree-backed session folders (ADR 0028) live under
+		// `<state_dir>/worktrees`, which the dev compose bind-mounts
+		// once at `/workspace/.worktrees`. So a worktree folder routes
+		// to the container like any other folder — its server_root is
+		// just computed under that shared mount instead of
+		// `/workspace/<name>`. (W.4.1; W.4 routed these host-side, but
+		// that left an isolated session building with the host
+		// toolchain, which is wrong for a container-first workflow.)
+		let worktree_server_root = entries
 			.iter()
+			.find(|entry| {
+				entry.folder.path == host_root.as_str()
+					&& matches!(
+						entry.folder.origin,
+						moon_protocol::workspace::FolderOrigin::Worktree { .. }
+					)
+			})
+			.and_then(|_| moon_core::worktree::worktree_container_path(&state_dir, host_root));
+		// Worktrees aren't individually bound — they sit under the
+		// shared worktrees-root mount — so keep them out of the
+		// per-folder bound-mount set used to resolve container status.
+		let bound: Vec<Utf8PathBuf> = entries
+			.iter()
+			.filter(|entry| {
+				!matches!(
+					entry.folder.origin,
+					moon_protocol::workspace::FolderOrigin::Worktree { .. }
+				)
+			})
 			.map(|entry| Utf8PathBuf::from(&entry.folder.path))
 			.collect();
 
 		let ws = match ContainerWorkspace::new(WorkspaceConfig {
 			workspace_id: workspace_id.clone(),
-			state_dir: self.workspaces_dir.join(&workspace_id),
+			state_dir,
 			bound_folders: bound,
 		}) {
 			Ok(ws) => ws,
@@ -72,8 +99,9 @@ impl ShellResolver for WorkspaceShellResolver {
 
 		match ws.status().await {
 			Ok(status) if matches!(status.state, ContainerState::Running) => {
-				let server_root =
-					TerminalTarget::container_cwd_for_folder(host_root).unwrap_or_else(|| Utf8PathBuf::from("/workspace"));
+				let server_root = worktree_server_root.unwrap_or_else(|| {
+					TerminalTarget::container_cwd_for_folder(host_root).unwrap_or_else(|| Utf8PathBuf::from("/workspace"))
+				});
 				ShellTarget::Container {
 					container_name: container_name_for_workspace(&workspace_id),
 					host_root: host_root.to_path_buf(),

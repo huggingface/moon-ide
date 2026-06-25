@@ -317,6 +317,133 @@ pub async fn coder_new_session(state: State<'_, AppState>) -> Result<SessionSumm
 	state.coder.new_session().await.map_err(MoonError::from)
 }
 
+/// Result of [`coder_new_worktree_session`]: the new bound-folder
+/// snapshot (so the frontend renders the nested worktree row) plus
+/// the freshly-minted session to open.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewWorktreeSession {
+	pub workspace: moon_protocol::workspace::Workspace,
+	pub session: SessionSummary,
+}
+
+/// Create an isolated coder session in its own git worktree
+/// (ADR 0028). Branches off the **active** folder's `HEAD`, checks
+/// the branch out into a worktree under the workspace state dir,
+/// binds that worktree as a nested folder, and mints a session
+/// (filed under the parent) whose tools route to the worktree.
+///
+/// The active folder is unchanged — the user keeps working in the
+/// parent and the new session opens in the parent's panel.
+#[tauri::command]
+pub async fn coder_new_worktree_session(state: State<'_, AppState>) -> Result<NewWorktreeSession, MoonError> {
+	let parent = state.workspaces.require_active_folder().await?;
+	let parent_path = parent.folder.path.clone();
+	let parent_name = parent.folder.name.clone();
+
+	let workspace_id = state
+		.workspace_id()
+		.ok_or_else(|| MoonError::invalid("no workspace bound (preboot mode)"))?
+		.to_string();
+	let state_dir = state.workspace_state_dir(&workspace_id);
+
+	// Branch is the deliverable; the worktree lives outside any repo
+	// under the per-workspace state dir. A time-derived suffix keeps
+	// branches and on-disk paths unique without a random dep.
+	let now_ms = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|d| d.as_millis())
+		.unwrap_or(0) as u64;
+	let suffix = format!("{:08x}", now_ms & 0xffff_ffff);
+	let branch = format!("moon/agent-{suffix}");
+	let branch_slug = branch.replace('/', "-");
+
+	use std::hash::{Hash, Hasher};
+	let mut hasher = std::collections::hash_map::DefaultHasher::new();
+	parent_path.hash(&mut hasher);
+	let parent_slug = format!("{parent_name}-{:08x}", hasher.finish() as u32);
+
+	let worktree_path = state_dir.join("worktrees").join(&parent_slug).join(&branch_slug);
+	if let Some(parent_dir) = worktree_path.parent() {
+		std::fs::create_dir_all(parent_dir.as_std_path()).map_err(MoonError::from)?;
+	}
+
+	// Create the worktree on a fresh branch off the parent repo.
+	parent.host.git_worktree_add(&worktree_path, &branch).await?;
+
+	// Bind it as a nested folder; capture the canonical path the
+	// registry stored so the session's routing key matches exactly.
+	let wt_entry = state
+		.workspaces
+		.add_worktree_folder(worktree_path, parent_path, branch.clone())
+		.await?;
+
+	let session = state
+		.coder
+		.new_worktree_session(wt_entry.folder.path.clone(), branch)
+		.await
+		.map_err(MoonError::from)?;
+
+	// If the workspace runs in a container, make the worktree usable
+	// by the isolated session's container git / `bash`: ensure the
+	// shared worktrees mount and repair the worktree's git metadata
+	// to the in-container paths (ADR 0028 W.4.1). No-op in host mode.
+	crate::commands::container::repair_worktrees(&state, true).await;
+
+	let workspace = state.workspaces.snapshot().await;
+	Ok(NewWorktreeSession { workspace, session })
+}
+
+/// Discard an isolated session's git worktree (ADR 0028): prune the
+/// linked worktree via its **parent** repo and unbind the folder.
+/// The branch is never deleted — it's the deliverable, left for a
+/// PR. `force` passes `git worktree remove --force`, needed when the
+/// worktree has uncommitted / untracked changes; the UI calls this
+/// without force first and re-confirms before forcing.
+///
+/// Returns the updated workspace snapshot so the frontend drops the
+/// nested folder row. Sessions still routed to the worktree fall
+/// back to their parent folder on their next turn.
+#[tauri::command]
+pub async fn coder_discard_worktree(
+	state: State<'_, AppState>,
+	path: String,
+	force: bool,
+) -> Result<moon_protocol::workspace::Workspace, MoonError> {
+	use moon_protocol::workspace::FolderOrigin;
+
+	let entry = state
+		.workspaces
+		.folder_for_path(&path)
+		.await
+		.ok_or_else(|| MoonError::NotFound(format!("folder {path}")))?;
+	let FolderOrigin::Worktree { parent_path, .. } = entry.folder.origin.clone() else {
+		return Err(MoonError::invalid(format!("{path} is not a worktree folder")));
+	};
+	let parent = state
+		.workspaces
+		.folder_for_path(&parent_path)
+		.await
+		.ok_or_else(|| MoonError::invalid("the worktree's parent folder is not bound; can't prune it"))?;
+
+	// `git worktree remove` runs where the worktree's metadata is
+	// valid: container-side (with the `/workspace/.worktrees/…` path)
+	// when the workspace runs in a container, host-side otherwise
+	// (ADR 0028 W.4.1). The parent host's own shell target matches.
+	let remove_path = if crate::commands::container::workspace_container_running(&state).await {
+		state
+			.workspace_id()
+			.map(|id| state.workspace_state_dir(id))
+			.and_then(|state_dir| moon_core::worktree::worktree_container_path(&state_dir, camino::Utf8Path::new(&path)))
+			.unwrap_or_else(|| camino::Utf8PathBuf::from(&path))
+	} else {
+		camino::Utf8PathBuf::from(&path)
+	};
+	parent.host.git_worktree_remove(&remove_path, force).await?;
+	state.workspaces.remove_folder(&path).await?;
+	Ok(state.workspaces.snapshot().await)
+}
+
 /// Set the per-session bash-target override for the active
 /// folder's visible session. `force_host = true` pins this
 /// session's `bash` / shell tool to the host machine even while

@@ -1,7 +1,9 @@
 <script lang="ts">
 	import { coder } from '../coder.svelte';
+	import type { WorkspaceFolder } from '../protocol';
 	import { projectCompose, projectComposeStateLabel } from '../projectCompose.svelte';
 	import { workspace } from '../state.svelte';
+	import BranchIcon from './icons/BranchIcon.svelte';
 	import ContainerIcon from './icons/ContainerIcon.svelte';
 	import QuestionBubbleIcon from './icons/QuestionBubbleIcon.svelte';
 	import SparklesIcon from './icons/SparklesIcon.svelte';
@@ -71,6 +73,48 @@
 	const folders = $derived(workspace.workspace?.folders ?? []);
 	const activePath = $derived(workspace.activeFolderPath);
 
+	// One rendered row. Worktree-backed coder sessions (ADR 0028)
+	// bind their checkout as a folder; we render those nested
+	// (`depth: 1`) directly under the parent they branched from, with
+	// the branch as the row label instead of the directory basename.
+	type FolderRow = { folder: WorkspaceFolder; branch: string | null; depth: number };
+
+	const orderedFolders = $derived.by((): FolderRow[] => {
+		const all = folders;
+		const childrenByParent = new Map<string, WorkspaceFolder[]>();
+		for (const f of all) {
+			if (f.origin.kind === 'worktree') {
+				const list = childrenByParent.get(f.origin.parentPath) ?? [];
+				list.push(f);
+				childrenByParent.set(f.origin.parentPath, list);
+			}
+		}
+		const rows: FolderRow[] = [];
+		for (const f of all) {
+			if (f.origin.kind === 'worktree') {
+				continue; // emitted under its parent below
+			}
+			rows.push({ folder: f, branch: null, depth: 0 });
+			for (const child of childrenByParent.get(f.path) ?? []) {
+				rows.push({
+					folder: child,
+					branch: child.origin.kind === 'worktree' ? child.origin.branch : null,
+					depth: 1,
+				});
+			}
+		}
+		// Orphan worktrees (parent not bound — shouldn't happen, but a
+		// stale snapshot could) surface at top level so they're never
+		// lost off-screen.
+		for (const f of all) {
+			const origin = f.origin;
+			if (origin.kind === 'worktree' && !all.some((p) => p.path === origin.parentPath)) {
+				rows.push({ folder: f, branch: origin.branch, depth: 0 });
+			}
+		}
+		return rows;
+	});
+
 	function summaryTitle(added: number, modified: number, deleted: number): string {
 		const parts: string[] = [];
 		if (added > 0) {
@@ -87,7 +131,9 @@
 </script>
 
 <ul class="bars" role="list">
-	{#each folders as folder (folder.path)}
+	{#each orderedFolders as row (row.folder.path)}
+		{@const folder = row.folder}
+		{@const isWorktree = row.depth > 0}
 		{@const isActive = folder.path === activePath}
 		{@const snap = projectCompose.snapshotFor(folder.path)}
 		{@const hasCompose = snap?.compose_file != null}
@@ -109,17 +155,22 @@
 				: agentDone
 					? `${folder.path}\n(agent finished — click to view)`
 					: folder.path}
-		<li class="bar" class:active={isActive}>
+		<li class="bar" class:active={isActive} class:worktree={isWorktree}>
 			<button
 				type="button"
 				class="bar-button"
-				title={barTitle}
+				title={isWorktree ? `${folder.path}\n(isolated worktree on ${row.branch})` : barTitle}
 				aria-current={isActive ? 'true' : undefined}
 				aria-expanded={isActive}
 				onclick={() => void workspace.setActiveFolder(folder.path)}
 			>
-				<span class="chev" aria-hidden="true">{isActive ? '▾' : '▸'}</span>
-				<span class="name">{folder.name}</span>
+				{#if isWorktree}
+					<span class="chev branch-glyph" aria-hidden="true"><BranchIcon size={12} /></span>
+					<span class="name">{row.branch}</span>
+				{:else}
+					<span class="chev" aria-hidden="true">{isActive ? '▾' : '▸'}</span>
+					<span class="name">{folder.name}</span>
+				{/if}
 				{#if agentAwaitingInput}
 					<span
 						class="agent-glyph awaiting"
@@ -239,6 +290,22 @@
 	}
 	.bar.active {
 		background: var(--m-bg-overlay);
+	}
+	/* Worktree-backed session folders (ADR 0028) render nested under
+	   their parent: indented, muted, with a branch glyph. */
+	.bar.worktree .bar-button {
+		padding-left: 22px;
+		color: var(--m-fg-muted);
+	}
+	.bar.worktree .name {
+		font-family: var(--m-font-mono, monospace);
+		font-size: 11px;
+	}
+	.branch-glyph {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		color: var(--m-fg-muted);
 	}
 	.bar-button {
 		flex: 1;

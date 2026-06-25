@@ -18,7 +18,7 @@
 //! are per-folder by construction.
 
 use camino::Utf8PathBuf;
-use moon_protocol::workspace::{HostKind, Workspace as WorkspaceRecord, WorkspaceFolder, WorkspaceId};
+use moon_protocol::workspace::{FolderOrigin, HostKind, Workspace as WorkspaceRecord, WorkspaceFolder, WorkspaceId};
 use moon_protocol::{MoonError, MoonResult};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
@@ -107,6 +107,33 @@ impl WorkspaceRegistry {
 	/// flips `active_folder_path` to it without inserting a second
 	/// copy or rebuilding the host.
 	pub async fn add_folder(&self, path: Utf8PathBuf) -> MoonResult<Arc<WorkspaceFolderEntry>> {
+		self.add_folder_with_origin(path, FolderOrigin::UserPicked, true).await
+	}
+
+	/// Bind an IDE-created git worktree at `path` as a folder
+	/// (ADR 0028). Marked [`FolderOrigin::Worktree`] so the folder
+	/// bar nests it under `parent_path` and its removal prunes the
+	/// worktree. Unlike [`add_folder`], this **does not** change the
+	/// active folder: an isolated session is created from its
+	/// parent's panel and the user stays there; the worktree only
+	/// becomes active if they click its row.
+	pub async fn add_worktree_folder(
+		&self,
+		path: Utf8PathBuf,
+		parent_path: String,
+		branch: String,
+	) -> MoonResult<Arc<WorkspaceFolderEntry>> {
+		self
+			.add_folder_with_origin(path, FolderOrigin::Worktree { parent_path, branch }, false)
+			.await
+	}
+
+	async fn add_folder_with_origin(
+		&self,
+		path: Utf8PathBuf,
+		origin: FolderOrigin,
+		set_active: bool,
+	) -> MoonResult<Arc<WorkspaceFolderEntry>> {
 		if !path.exists() {
 			return Err(MoonError::NotFound(path.to_string()));
 		}
@@ -122,7 +149,9 @@ impl WorkspaceRegistry {
 
 		if let Some(existing) = inner.folders.iter().find(|e| e.folder.path == canonical_str) {
 			let entry = existing.clone();
-			inner.active_folder_path = Some(canonical_str);
+			if set_active {
+				inner.active_folder_path = Some(canonical_str);
+			}
 			return Ok(entry);
 		}
 
@@ -131,6 +160,7 @@ impl WorkspaceRegistry {
 			path: canonical_str.clone(),
 			name,
 			host: HostKind::Local,
+			origin,
 		};
 		let mut local = LocalHost::new(canonical);
 		if let Some(resolver) = self.shell_resolver.get() {
@@ -144,7 +174,9 @@ impl WorkspaceRegistry {
 			host: Arc::new(local),
 		});
 		inner.folders.push(entry.clone());
-		inner.active_folder_path = Some(canonical_str);
+		if set_active {
+			inner.active_folder_path = Some(canonical_str);
+		}
 		Ok(entry)
 	}
 
@@ -300,6 +332,30 @@ mod tests {
 		let snap = registry.snapshot().await;
 		assert!(snap.folders.is_empty());
 		assert!(snap.active_folder.is_none());
+	}
+
+	#[tokio::test]
+	async fn add_worktree_folder_keeps_parent_active_and_marks_origin() {
+		let parent = TempDir::new().unwrap();
+		let wt = TempDir::new().unwrap();
+		let parent_path = Utf8PathBuf::from_path_buf(parent.path().to_path_buf()).unwrap();
+		let wt_path = Utf8PathBuf::from_path_buf(wt.path().to_path_buf()).unwrap();
+
+		let registry = test_registry();
+		let parent_entry = registry.add_folder(parent_path).await.unwrap();
+		let wt_entry = registry
+			.add_worktree_folder(wt_path, parent_entry.folder.path.clone(), "moon/agent-1".into())
+			.await
+			.unwrap();
+
+		// Worktree is bound but the parent stays active.
+		let snap = registry.snapshot().await;
+		assert_eq!(snap.folders.len(), 2);
+		assert_eq!(snap.active_folder.as_deref(), Some(parent_entry.folder.path.as_str()));
+		assert!(matches!(
+			&wt_entry.folder.origin,
+			FolderOrigin::Worktree { branch, .. } if branch == "moon/agent-1"
+		));
 	}
 
 	#[tokio::test]

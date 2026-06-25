@@ -3,7 +3,7 @@ use moon_core::{read_host_file, write_host_file};
 use moon_protocol::fs::{CollectPathsResult, DirEntry, ReadFileResult, StatResult, WriteFileResult};
 use moon_protocol::git::{
 	BranchDiffStatus, BranchList, BranchSwitchTarget, GitBranchInfo, GitChangeSummary, GitCommitResult, GitFileBlame,
-	GitFileStatus, GitMergeState, GitPermalink, GitStatusEntry, PrListScope,
+	GitFileStatus, GitMergeState, GitPermalink, GitStatusEntry, GitWorktree, PrListScope,
 };
 use moon_protocol::review::{PublishReviewRequest, PublishReviewResult};
 use moon_protocol::MoonError;
@@ -391,6 +391,39 @@ pub async fn fs_git_commit_on_new_branch(
 ) -> Result<GitCommitResult, MoonError> {
 	let entry = state.workspaces.require_active_folder().await?;
 	entry.host.git_commit_on_new_branch(&branch, &message).await
+}
+
+/// Create a linked git worktree at `path` on a fresh branch off the
+/// active folder's `HEAD`. Backs worktree-backed coder sessions
+/// (ADR 0028): the caller picks the on-disk `path` and the new
+/// `branch`; the host validates the branch name and surfaces git's
+/// own errors. Returns the freshly-created worktree record.
+#[tauri::command]
+pub async fn fs_git_worktree_add(
+	state: State<'_, AppState>,
+	path: String,
+	branch: String,
+) -> Result<GitWorktree, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.git_worktree_add(&Utf8PathBuf::from(path), &branch).await
+}
+
+/// List the active folder repository's working trees (main +
+/// linked). Used to reconcile session→worktree bindings.
+#[tauri::command]
+pub async fn fs_git_worktree_list(state: State<'_, AppState>) -> Result<Vec<GitWorktree>, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.git_worktree_list().await
+}
+
+/// Prune the linked worktree at `path`. `force` (`--force`) is
+/// needed when the worktree is dirty or locked; the UI gates that
+/// behind a confirm. The branch is never deleted — it's the
+/// deliverable left for a later PR.
+#[tauri::command]
+pub async fn fs_git_worktree_remove(state: State<'_, AppState>, path: String, force: bool) -> Result<(), MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.git_worktree_remove(&Utf8PathBuf::from(path), force).await
 }
 
 /// Push the active folder's current branch to its configured

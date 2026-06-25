@@ -6,7 +6,7 @@ import { parseFileLinks, resolveTerminalLink } from './terminalLinks';
 function folder(path: string): WorkspaceFolder {
 	const slash = path.lastIndexOf('/');
 	const name = slash === -1 ? path : path.slice(slash + 1);
-	return { path, name, host: 'local' };
+	return { path, name, host: 'local', origin: { kind: 'user_picked' } };
 }
 
 function ws(folders: WorkspaceFolder[]): Workspace {

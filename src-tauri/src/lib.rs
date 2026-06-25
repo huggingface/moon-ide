@@ -121,6 +121,9 @@ pub fn run() {
 			commands::fs::fs_git_branch,
 			commands::fs::fs_git_commit,
 			commands::fs::fs_git_commit_on_new_branch,
+			commands::fs::fs_git_worktree_add,
+			commands::fs::fs_git_worktree_list,
+			commands::fs::fs_git_worktree_remove,
 			commands::fs::fs_git_push,
 			commands::fs::fs_git_publish_branch,
 			commands::fs::fs_git_pull,
@@ -236,6 +239,8 @@ pub fn run() {
 			commands::coder::coder_list_sessions,
 			commands::coder::coder_active_session,
 			commands::coder::coder_new_session,
+			commands::coder::coder_new_worktree_session,
+			commands::coder::coder_discard_worktree,
 			commands::coder::coder_set_bash_target_override,
 			commands::coder::coder_open_session,
 			commands::coder::coder_delete_session,
@@ -1168,7 +1173,22 @@ async fn restore_session(
 	if !session.folders.is_empty() || session.active_folder_path.is_some() {
 		for folder in &session.folders {
 			let path = Utf8PathBuf::from(&folder.folder_path);
-			if let Err(e) = state.workspaces.add_folder(path.clone()).await {
+			// Worktree-backed session folders (ADR 0028) re-bind as
+			// nested worktree folders so their session keeps routing
+			// to the checkout. The git worktree itself persisted on
+			// disk, so this is just re-registering the binding. Folders
+			// are stored in insertion order, so a worktree's parent is
+			// always re-added before it.
+			let result = match &folder.origin {
+				moon_protocol::workspace::FolderOrigin::Worktree { parent_path, branch } => {
+					state
+						.workspaces
+						.add_worktree_folder(path.clone(), parent_path.clone(), branch.clone())
+						.await
+				}
+				moon_protocol::workspace::FolderOrigin::UserPicked => state.workspaces.add_folder(path.clone()).await,
+			};
+			if let Err(e) = result {
 				tracing::warn!(error = %e, path = %path, "failed to restore folder");
 			}
 		}
