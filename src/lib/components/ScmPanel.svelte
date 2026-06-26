@@ -43,6 +43,7 @@
 	import { isReviewPath } from '../util/reviewPath';
 	import BranchIcon from './icons/BranchIcon.svelte';
 	import MergeIcon from './icons/MergeIcon.svelte';
+	import SwitchIcon from './icons/SwitchIcon.svelte';
 	import PullRequestIcon from './icons/PullRequestIcon.svelte';
 	import RefreshIcon from './icons/RefreshIcon.svelte';
 	import RevertIcon from './icons/RevertIcon.svelte';
@@ -310,6 +311,21 @@
 	// fetch here, the merge runs against whatever the local
 	// remote-tracking ref points at right now.
 	const canMergeDefault = $derived(!busy && branch.defaultBranchRemoteRef !== null && branch.defaultBranchBehind > 0);
+
+	// One-click "switch to the default branch". Shown only when a
+	// default is known and we're not already on it — the common
+	// "I'm done on this branch, take me back to main to start fresh"
+	// gesture, without opening the branch switcher. A dirty tree is
+	// surfaced by git's own refusal (via `switchToBranch`).
+	const canSwitchToDefault = $derived(
+		!busy && defaultBranchShortName !== null && branch.name !== null && branch.name !== defaultBranchShortName,
+	);
+	async function switchToDefault() {
+		if (defaultBranchShortName === null) {
+			return;
+		}
+		await workspace.switchToBranch({ kind: 'local', name: defaultBranchShortName });
+	}
 
 	// Tooltip detail for the sync button. Plain-text fallback for
 	// the (Push / Pull / Sync) labels that we used to bake into
@@ -899,6 +915,18 @@
 				<span class="branch-name">{branchLabel}</span>
 			</button>
 			<div class="actions">
+				{#if canSwitchToDefault}
+					<button
+						type="button"
+						class="icon-btn"
+						title={`Switch to ${defaultBranchShortName}`}
+						aria-label={`Switch to ${defaultBranchShortName}`}
+						disabled={busy}
+						onclick={switchToDefault}
+					>
+						<SwitchIcon />
+					</button>
+				{/if}
 				{#if changeCount > 0}
 					<button
 						type="button"
