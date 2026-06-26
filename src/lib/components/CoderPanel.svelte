@@ -3130,6 +3130,9 @@
 	.session-branch-chip {
 		display: inline-flex;
 		align-items: center;
+		/* The row is `align-items: stretch`; without this the chip
+		   grows to the full two-line row height. */
+		align-self: center;
 		gap: 4px;
 		flex-shrink: 0;
 		max-width: 11rem;
