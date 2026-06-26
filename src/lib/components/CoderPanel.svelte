@@ -1407,6 +1407,15 @@
 		composer?.focus();
 	}
 
+	// Summary of the session currently visible in this folder's panel.
+	// `coder.activeSession` is null right after a session is created
+	// (it's only populated on load), so resolve from the list by the
+	// visible id — this is what lets a freshly-opened worktree session
+	// show its "isolated on <branch>" indicator immediately.
+	const visibleSessionSummary = $derived(
+		coder.sessions?.find((s) => s.id === coder.current.visibleSessionId) ?? coder.activeSession,
+	);
+
 	// Click on a session's branch chip (ADR 0028). For a regular
 	// session this `git switch`es the active folder back to the branch
 	// its work was committed onto (git refuses + flashes on a dirty
@@ -1927,6 +1936,15 @@
 			<span class="session-bar-title" title={coder.activeSession?.title ?? ''}>
 				{coder.activeSession?.title ?? 'New session'}
 			</span>
+			{#if visibleSessionSummary?.worktreeBranch}
+				<span
+					class="session-bar-worktree"
+					title="Isolated session — its own git worktree on {visibleSessionSummary.worktreeBranch}. Its changes stay on that branch; open the worktree folder in the bar to inspect them."
+				>
+					<BranchIcon size={12} />
+					<span class="wt-branch">{visibleSessionSummary.worktreeBranch}</span>
+				</span>
+			{/if}
 			{#if coder.activeSession}
 				<button
 					type="button"
@@ -1964,9 +1982,17 @@
 		</header>
 		<div class="transcript" bind:this={scrollEl} onscroll={onTranscriptScroll}>
 			{#if coder.rows.length === 0}
-				<p class="hint">
-					Send a prompt to start. The agent can read files, list directories, search, and run shell commands.
-				</p>
+				{#if visibleSessionSummary?.worktreeBranch}
+					<p class="hint">
+						Isolated session in its own git worktree on <code>{visibleSessionSummary.worktreeBranch}</code>. The agent's
+						edits and commits stay on that branch and don't touch your main checkout — the worktree shows as a nested
+						folder in the bar above. Send a prompt to start.
+					</p>
+				{:else}
+					<p class="hint">
+						Send a prompt to start. The agent can read files, list directories, search, and run shell commands.
+					</p>
+				{/if}
 			{/if}
 			{#if hiddenAbove > 0}
 				<!-- Older rows are kept out of the DOM by the trailing
@@ -2847,6 +2873,29 @@
 		text-overflow: ellipsis;
 		white-space: nowrap;
 		text-align: center;
+	}
+	/* "This session is isolated in a worktree" badge in the session
+	   bar (ADR 0028). Informative only — navigating to the worktree
+	   folder would drop the session view (the session is filed under
+	   the parent), so the user reaches the worktree's files via its
+	   nested row in the folder bar instead. */
+	.session-bar-worktree {
+		flex-shrink: 0;
+		max-width: 12rem;
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		padding: 1px 7px;
+		border: 1px solid color-mix(in srgb, var(--m-accent) 45%, transparent);
+		border-radius: 999px;
+		color: var(--m-accent);
+		font-size: 11px;
+	}
+	.session-bar-worktree .wt-branch {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-family: var(--m-font-mono, monospace);
 	}
 	/* Sessions list view. Sticky header pattern matches the chat
 	   panel — the section title + actions row stays glued to the

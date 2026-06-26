@@ -288,14 +288,26 @@
 	.bar:last-of-type {
 		border-bottom: none;
 	}
+	/* Active folder: an accent-tinted fill + a solid accent spine on
+	   the left edge. The old 3%-white wash was barely distinguishable
+	   from the inactive grey — especially for the muted worktree rows. */
 	.bar.active {
-		background: var(--m-bg-overlay);
+		background: color-mix(in srgb, var(--m-accent) 14%, transparent);
+		box-shadow: inset 2px 0 0 var(--m-accent);
 	}
 	/* Worktree-backed session folders (ADR 0028) render nested under
 	   their parent: indented, muted, with a branch glyph. */
 	.bar.worktree .bar-button {
 		padding-left: 22px;
 		color: var(--m-fg-muted);
+	}
+	/* When the worktree row is the active one, un-mute it so the
+	   accent fill reads as a real selection rather than dim grey. */
+	.bar.worktree.active .bar-button {
+		color: var(--m-fg);
+	}
+	.bar.worktree.active .branch-glyph {
+		color: var(--m-accent);
 	}
 	.bar.worktree .name {
 		font-family: var(--m-font-mono, monospace);

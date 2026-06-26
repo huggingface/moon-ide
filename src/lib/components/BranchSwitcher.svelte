@@ -526,21 +526,41 @@
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
-		padding: 2px;
-		border: none;
+		width: 24px;
+		height: 24px;
+		padding: 0;
+		border: 1px solid transparent;
 		background: transparent;
-		color: inherit;
+		color: var(--m-fg-subtle);
 		cursor: pointer;
-		border-radius: 4px;
+		border-radius: 5px;
 		opacity: 0;
+		transition:
+			opacity 0.1s,
+			color 0.1s,
+			background 0.1s,
+			border-color 0.1s;
 	}
 	.result:hover .agent-action,
 	.result.selected .agent-action {
-		opacity: 0.85;
-	}
-	.agent-action:hover {
 		opacity: 1;
-		background: var(--m-bg-overlay);
+	}
+	/* Clear, accent-tinted hover so the action reads as clickable
+	   (the bare 3% overlay was effectively invisible). */
+	.agent-action:hover {
+		color: var(--m-accent-strong);
+		background: var(--m-bg-3);
+		border-color: var(--m-accent);
+	}
+	/* On the selected row (accent background, dark text) invert the
+	   hover so it stays legible. */
+	.result.selected .agent-action {
+		color: #0d1017;
+	}
+	.result.selected .agent-action:hover {
+		background: rgba(13, 16, 23, 0.18);
+		border-color: rgba(13, 16, 23, 0.4);
+		color: #0d1017;
 	}
 	.avatar {
 		width: 16px;
