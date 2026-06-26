@@ -224,6 +224,11 @@ Wired through `src/lib/editor/lspRename.ts` + the
 
 - F2 fires `prepareRename`; servers that decline (punctuation,
   keywords) get a quiet flash, no panel.
+- The same extension is wired into the diff view's editable
+  right-hand pane and is reachable from the editor's right-click
+  menu (**Rename symbol**), so F2 / context-menu rename behave
+  identically in plain editing and while viewing a working-tree
+  diff.
 - A docked panel with prefilled input; Enter fires `rename`, Escape
   or editing the buffer behind the panel dismisses.
 - The returned `LspWorkspaceEdit` applies to open buffers through

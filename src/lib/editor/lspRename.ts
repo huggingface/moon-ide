@@ -214,8 +214,12 @@ async function runRename(state: RenameState, newName: string, view: EditorView):
  * key — a server-less buffer (markdown, JSON, log files) falls
  * through to CM's default F2 binding (which is unbound, so it's
  * a no-op).
+ *
+ * Exported so the editor's right-click menu can drive the same
+ * rename flow from a "Rename symbol" entry — it operates on the
+ * current caret position exactly like F2.
  */
-function triggerRename(view: EditorView): boolean {
+export function triggerRename(view: EditorView): boolean {
 	const path = view.state.facet(filePathFacet);
 	if (path === null) {
 		return false;

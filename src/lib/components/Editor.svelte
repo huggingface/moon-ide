@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount, mount as mountComponent, unmount } from 'svelte';
+	import { onMount } from 'svelte';
 	import { diffChars } from 'diff';
 	import { EditorState, Compartment, EditorSelection, Prec, Transaction } from '@codemirror/state';
 	import { EditorView, highlightActiveLine, highlightActiveLineGutter, keymap, lineNumbers } from '@codemirror/view';
@@ -22,19 +22,16 @@
 	import { lspGotoDefinitionExtension } from '../editor/lspGotoDefinition';
 	import { lspOverviewExtension } from '../editor/lspOverview';
 	import { lspRenameExtension } from '../editor/lspRename';
+	import { EditorContextMenu } from '../editor/editorContextMenu';
 	import { blameExtension, blameFacet } from '../editor/blame';
 	import { gitChangesExtension, goToNextChange, goToPreviousChange, headTextFacet } from '../editor/gitChanges';
 	import { conflictedFacet, conflictMarkersExtension } from '../editor/conflictMarkers';
 	import { commentsForSide, reanchorComments, ReviewWiring } from '../editor/reviewComments';
 	import { workspace, type OpenFile, type SplitSide } from '../state.svelte';
-	import { ipc } from '../ipc';
-	import ContextMenu from './ContextMenu.svelte';
-	import { writeText as clipboardWriteText } from '@tauri-apps/plugin-clipboard-manager';
-	import type { ContextMenuItem } from './contextMenu';
 	import { isReviewPath } from '../util/reviewPath';
 	import { languageFor } from '../editor/language';
 	import { moonEditorTheme } from '../editor/theme';
-	import { formatError, type EditorConfig, type LspPosition } from '../protocol';
+	import type { EditorConfig, LspPosition } from '../protocol';
 
 	type Props = { file: OpenFile; side: SplitSide };
 	let { file, side }: Props = $props();
@@ -840,123 +837,22 @@
 		});
 	}
 
-	// Right-click menu: "Copy GitHub link" for the lines under the
-	// selection (or the caret line when
-	// there's no range). Reuses `ContextMenu.svelte` portaled onto
-	// `document.body` — same approach as the tab strip's menu — so the
-	// popover isn't clipped by the editor's `overflow: hidden`.
-	let editorMenu: ReturnType<typeof mountComponent> | null = null;
-	let editorMenuHost: HTMLElement | null = null;
+	// Right-click menu: "Rename symbol" + "Copy GitHub link". Shared
+	// with the diff view's editable pane via `EditorContextMenu`.
+	const editorMenu = new EditorContextMenu();
 
 	function disposeEditorMenu() {
-		if (editorMenu) {
-			void unmount(editorMenu);
-			editorMenu = null;
-		}
-		if (editorMenuHost) {
-			editorMenuHost.remove();
-			editorMenuHost = null;
-		}
-	}
-
-	// 1-based inclusive line range under the current selection, or the
-	// caret line when nothing is selected. Same off-by-one snap as
-	// `publishSelection` so a drag ending at a line start doesn't
-	// over-count.
-	function selectedLineRange(v: EditorView): { startLine: number; endLine: number } {
-		const sel = v.state.selection.main;
-		const fromLine = v.state.doc.lineAt(sel.from);
-		const toLine = v.state.doc.lineAt(sel.to);
-		const endLine = sel.to === toLine.from && toLine.number > fromLine.number ? toLine.number - 1 : toLine.number;
-		return { startLine: fromLine.number, endLine };
-	}
-
-	async function copyToClipboard(text: string, label: string) {
-		// Prefer the Tauri clipboard plugin: these actions fire from a
-		// ContextMenu portaled onto `document.body`, which doesn't take
-		// focus, and `navigator.clipboard.writeText` rejects on
-		// WebKitGTK when the triggering element isn't a focused input.
-		// Fall back to `navigator.clipboard` only if the plugin throws
-		// (e.g. a plain browser dev build) — same pattern as CoderPanel.
-		try {
-			await clipboardWriteText(text);
-			workspace.flash(`Copied ${label}`);
-		} catch {
-			try {
-				await navigator.clipboard.writeText(text);
-				workspace.flash(`Copied ${label}`);
-			} catch {
-				workspace.flash(`Could not copy ${label}`);
-			}
-		}
-	}
-
-	async function copyPermalink() {
-		if (view === undefined || currentPath === null) {
-			return;
-		}
-		const { startLine, endLine } = selectedLineRange(view);
-		const label = 'GitHub link';
-		try {
-			const link = await ipc.fs.gitPermalink(currentPath, startLine, endLine);
-			if (link === null) {
-				workspace.flash('No GitHub link (not a GitHub repo or no commits)');
-				return;
-			}
-			await copyToClipboard(link.url, label);
-		} catch (err) {
-			// The clipboard write has its own flash inside
-			// `copyToClipboard`; reaching here means `gitPermalink`
-			// itself threw. Surface the real error instead of a generic
-			// "Could not copy" so a backend failure isn't mistaken for a
-			// clipboard problem.
-			frontendLog('moon-ide', 'error', `gitPermalink failed: ${formatError(err)}`);
-			workspace.flash(`Could not build ${label}: ${formatError(err)}`);
-		}
+		editorMenu.dispose();
 	}
 
 	function openEditorMenu(event: MouseEvent) {
 		// Only our own actions; let the platform menu through for
 		// untitled / external / review buffers where a permalink makes
 		// no sense.
-		if (currentPath === null || file.isUntitled || file.isExternal || isReviewPath(file.path)) {
+		if (view === undefined || currentPath === null || file.isUntitled || file.isExternal || isReviewPath(file.path)) {
 			return;
 		}
-		event.preventDefault();
-		disposeEditorMenu();
-
-		const items: ContextMenuItem[] = [
-			{
-				id: 'copy-github-link',
-				label: 'Copy GitHub link',
-				onSelect: () => {
-					void copyPermalink();
-				},
-			},
-		];
-
-		const menuHost = document.createElement('div');
-		menuHost.setAttribute('data-editor-context-menu-root', 'true');
-		menuHost.style.position = 'fixed';
-		menuHost.style.top = '0';
-		menuHost.style.left = '0';
-		menuHost.style.width = '0';
-		menuHost.style.height = '0';
-		menuHost.style.zIndex = '9999';
-		document.body.appendChild(menuHost);
-
-		const anchorRect = { left: event.clientX, top: event.clientY, width: 0, height: 0 };
-		editorMenu = mountComponent(ContextMenu, {
-			target: menuHost,
-			props: {
-				items,
-				anchorRect,
-				onClose: () => {
-					disposeEditorMenu();
-				},
-			},
-		});
-		editorMenuHost = menuHost;
+		editorMenu.open(event, view, currentPath);
 	}
 
 	// CM offset → LSP position. Line numbers are 0-indexed in LSP /

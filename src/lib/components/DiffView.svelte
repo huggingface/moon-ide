@@ -34,6 +34,10 @@
 	import { blameExtension, blameFacet } from '../editor/blame';
 	import { lspGotoDefinitionExtension } from '../editor/lspGotoDefinition';
 	import { lspOverviewExtension } from '../editor/lspOverview';
+	import { lspRenameExtension } from '../editor/lspRename';
+	import { lspLanguageFor } from '../editor/lspLanguage';
+	import { EditorContextMenu } from '../editor/editorContextMenu';
+	import { isReviewPath } from '../util/reviewPath';
 	import { frontendLog } from '../logs.svelte';
 	import type { EditorConfig } from '../protocol';
 
@@ -127,6 +131,25 @@
 	const reviewComments = $derived(commentsForSide(workspace.reviewCommentsForPath(file.path), 'working'));
 	const reviewEnabled = $derived(workspace.isReviewableBranch && !file.isDeleted);
 
+	// Right-click menu on the editable right-hand (working-tree) pane —
+	// same "Rename symbol" + "Copy GitHub link" actions as the regular
+	// editor, shared via `EditorContextMenu`. Left-pane (HEAD) clicks
+	// fall through to the platform menu.
+	const editorMenu = new EditorContextMenu();
+
+	function openDiffMenu(event: MouseEvent) {
+		if (merge === undefined || file.isExternal || isReviewPath(file.path)) {
+			return;
+		}
+		const rightDom = merge.b.dom;
+		if (!(event.target instanceof Node) || !rightDom.contains(event.target)) {
+			return;
+		}
+		// Deleted files have an empty, LSP-less right pane — no rename.
+		const canRename = !file.isDeleted && lspLanguageFor(file.path) !== null;
+		editorMenu.open(event, merge.b, file.path, { canRename });
+	}
+
 	// In single-tab model, `file.path` is stable for the lifetime of
 	// this DiffView instance — the EditorPane swaps Editor ↔ DiffView
 	// based on `diffModeFor(path)`, which remounts DiffView on each
@@ -171,6 +194,7 @@
 				});
 			}
 			reviewWiring.detach();
+			editorMenu.dispose();
 			merge?.destroy();
 			merge = undefined;
 			// Drop any selection snapshot the right pane published
@@ -339,6 +363,12 @@
 						},
 						flash: (msg) => workspace.flash(msg),
 					}),
+					// F2 rename on the editable right-hand pane — same
+					// extension and applier the regular editor uses. The
+					// docked rename panel mounts at the top of this pane;
+					// edits route through `applyWorkspaceEdit` exactly as
+					// in `Editor.svelte`.
+					lspRenameExtension(),
 					// `defaultKeymap: false` here mirrors `Editor.svelte`:
 					// with the default on, `autocompletion()` installs
 					// the upstream `completionKeymap` at `Prec.highest`
@@ -1062,7 +1092,8 @@
 </script>
 
 <div class="diff-view">
-	<div class="diff-host" bind:this={host}></div>
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<div class="diff-host" bind:this={host} oncontextmenu={openDiffMenu}></div>
 </div>
 
 <style>
