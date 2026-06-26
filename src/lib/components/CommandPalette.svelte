@@ -95,6 +95,27 @@
 		return palette.contentResults.length;
 	});
 
+	// Group content hits by file so the result list reads as
+	// "file → its matches" (VS Code's search panel layout), making
+	// the number of impacted files obvious at a glance. Hits arrive
+	// from the backend in walker order — already contiguous per
+	// file — so a single linear pass groups them. Each hit keeps its
+	// original flat index so keyboard navigation (`selected` counts
+	// only hit rows, not the file headers) and `activate` stay
+	// unchanged.
+	const contentGroups = $derived.by(() => {
+		const groups: { path: string; hits: { hit: (typeof palette.contentResults)[number]; index: number }[] }[] = [];
+		let current: (typeof groups)[number] | null = null;
+		palette.contentResults.forEach((hit, index) => {
+			if (!current || current.path !== hit.path) {
+				current = { path: hit.path, hits: [] };
+				groups.push(current);
+			}
+			current.hits.push({ hit, index });
+		});
+		return groups;
+	});
+
 	function placeholder() {
 		if (palette.mode === 'commands') {
 			return 'Type a command…';
@@ -398,19 +419,32 @@
 						<li class="empty">No files match.</li>
 					{/if}
 				{:else}
-					{#each palette.contentResults as hit, i (hit.path + ':' + hit.line + ':' + i)}
-						<!-- svelte-ignore a11y_click_events_have_key_events -->
-						<li
-							class="result content-row"
-							class:selected={i === selected}
-							role="option"
-							aria-selected={i === selected}
-							onmousemove={() => (selected = i)}
-							onclick={() => activate(i)}
-						>
-							<span class="loc">{hit.path}:{hit.line}</span>
-							<code class="line">{hit.line_text}</code>
+					{#if palette.contentResults.length > 0}
+						<li class="results-summary" role="presentation">
+							{palette.contentResults.length}
+							{palette.contentResults.length === 1 ? 'result' : 'results'} in {contentGroups.length}
+							{contentGroups.length === 1 ? 'file' : 'files'}
 						</li>
+					{/if}
+					{#each contentGroups as group (group.path)}
+						<li class="file-group" role="presentation">
+							<span class="file-path">{group.path}</span>
+							<span class="file-count">{group.hits.length}</span>
+						</li>
+						{#each group.hits as entry (group.path + ':' + entry.hit.line + ':' + entry.index)}
+							<!-- svelte-ignore a11y_click_events_have_key_events -->
+							<li
+								class="result content-row"
+								class:selected={entry.index === selected}
+								role="option"
+								aria-selected={entry.index === selected}
+								onmousemove={() => (selected = entry.index)}
+								onclick={() => activate(entry.index)}
+							>
+								<span class="loc">{entry.hit.line}</span>
+								<code class="line">{entry.hit.line_text}</code>
+							</li>
+						{/each}
 					{/each}
 					{#if palette.contentTruncated}
 						<li class="empty">More results available — narrow your search.</li>
@@ -615,10 +649,49 @@
 		color: inherit;
 		opacity: 0.7;
 	}
+	/* One-line tally above the grouped results so the "how many
+	   files?" answer is visible without scrolling. Non-selectable. */
+	.results-summary {
+		padding: 4px 14px 6px;
+		color: var(--m-fg-subtle);
+		font-size: 11px;
+	}
+	/* File header that introduces each group of matches. Reads as a
+	   path on the left with a match-count badge on the right; not a
+	   selectable row (keyboard nav walks the match rows only). */
+	.file-group {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		padding: 5px 14px;
+		color: var(--m-fg);
+		font-family: var(--m-font-mono);
+		font-size: 12px;
+	}
+	.file-group .file-path {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		direction: rtl;
+		text-align: left;
+	}
+	.file-group .file-count {
+		flex-shrink: 0;
+		min-width: 18px;
+		padding: 0 6px;
+		border-radius: 9px;
+		background: var(--m-bg-3);
+		color: var(--m-fg-muted);
+		font-size: 11px;
+		line-height: 16px;
+		text-align: center;
+	}
 	.content-row {
 		flex-direction: column;
 		align-items: flex-start;
 		gap: 2px;
+		padding-left: 26px;
 	}
 	.loc {
 		font-family: var(--m-font-mono);
