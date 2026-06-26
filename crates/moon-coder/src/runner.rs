@@ -470,16 +470,31 @@ impl CoderState {
 			.clone()
 	}
 
-	/// Resolve to `(active folder's FolderSession, folder path)`
+	/// The folder that owns the coder session list for the current
+	/// active folder (ADR 0028 — per-project session scoping). A
+	/// worktree folder defers to its **parent project root**, so a
+	/// parent and all its worktrees share one session list; any other
+	/// folder is its own root. `None` when nothing is active. The
+	/// parent fallback to the active folder covers an orphaned
+	/// worktree whose parent isn't bound (shouldn't happen post-W.3).
+	async fn coder_root_folder(&self) -> Option<Arc<WorkspaceFolderEntry>> {
+		let active = self.workspaces.active_folder().await?;
+		if let moon_protocol::workspace::FolderOrigin::Worktree { parent_path, .. } = &active.folder.origin {
+			if let Some(parent) = self.workspaces.folder_for_path(parent_path).await {
+				return Some(parent);
+			}
+		}
+		Some(active)
+	}
+
+	/// Resolve to `(coder-root folder's FolderSession, folder path)`
 	/// or error with `NoActiveFolder`. Used by commands that
 	/// operate at the folder level (`list_sessions`, `new_session`,
 	/// the runtime-routing inside `open_session` / `delete_session`).
+	/// Routes through [`Self::coder_root_folder`] so worktree folders
+	/// share their parent project's session list.
 	async fn active_folder_session(&self) -> Result<(Arc<FolderSession>, Utf8PathBuf), CoderError> {
-		let folder = self
-			.workspaces
-			.active_folder()
-			.await
-			.ok_or(CoderError::NoActiveFolder)?;
+		let folder = self.coder_root_folder().await.ok_or(CoderError::NoActiveFolder)?;
 		let folder_path = Utf8PathBuf::from(folder.folder.path.clone());
 		let session = self.folder_session_for(&folder_path).await;
 		Ok((session, folder_path))
@@ -1290,7 +1305,9 @@ impl CoderHandle {
 	/// Empty when the folder has none — including when no folder
 	/// is active at all (chat-only sessions aren't supported).
 	pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, CoderError> {
-		let Some(folder) = self.state.workspaces.active_folder().await else {
+		// Per-project scoping (ADR 0028): a worktree folder's sessions
+		// live under its parent project root, so list against that.
+		let Some(folder) = self.state.coder_root_folder().await else {
 			return Ok(Vec::new());
 		};
 		let folder_root = Utf8PathBuf::from(folder.folder.path.clone());
@@ -1316,7 +1333,9 @@ impl CoderHandle {
 	/// to open.
 	pub async fn session_jsonl_path(&self, id: String) -> Result<Utf8PathBuf, CoderError> {
 		sessions::validate_session_id(&id)?;
-		let Some(folder) = self.state.workspaces.active_folder().await else {
+		// Per-project scoping (ADR 0028): worktree sessions are filed
+		// under the parent project root.
+		let Some(folder) = self.state.coder_root_folder().await else {
 			return Err(CoderError::NoActiveFolder);
 		};
 		let folder_root = Utf8PathBuf::from(folder.folder.path.clone());

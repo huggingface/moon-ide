@@ -1529,7 +1529,16 @@ class WorkspaceState {
 		// background, just streaming events into their own bucket.
 		// The user sees the new folder's transcript / sessions list
 		// / draft / attachments restored intact when they return.
-		coder.setActiveFolder(snapshot.active_folder ?? null);
+		//
+		// Per-project session scoping (ADR 0028): a worktree folder
+		// resolves to its parent project root, so a parent and all its
+		// worktrees share one coder bucket (session list, transcript,
+		// draft). Selecting a worktree changes the file tree / SCM but
+		// not the coder panel. Mirrors the backend's `coder_root_folder`.
+		const active = snapshot.active_folder ?? null;
+		const activeEntry = active !== null ? (snapshot.folders.find((f) => f.path === active) ?? null) : null;
+		const coderRoot = activeEntry?.origin.kind === 'worktree' ? activeEntry.origin.parentPath : active;
+		coder.setActiveFolder(coderRoot ?? null);
 		const tAdoptCoder = performance.now();
 		// Drop FolderStates whose folders aren't bound anymore. Two-pass
 		// (collect-then-delete) so we never mutate the map while
@@ -2733,6 +2742,26 @@ class WorkspaceState {
 	 * surface success / failure via the same flash + refresh
 	 * pattern as `commitChanges`.
 	 */
+	/**
+	 * Keep a worktree folder's bar branch label in sync with its
+	 * actual checked-out branch (ADR 0028). The label comes from the
+	 * registry's `FolderOrigin::Worktree { branch }`, stamped at
+	 * creation; an in-worktree commit-on-new-branch or `git switch`
+	 * changes the real branch, so this re-stamps it and re-adopts the
+	 * snapshot. No-op when the active folder isn't a worktree.
+	 */
+	private async syncWorktreeBranchLabel(): Promise<void> {
+		if (this.activeFolder?.origin.kind !== 'worktree') {
+			return;
+		}
+		try {
+			const ws = await ipc.workspace.syncActiveWorktreeBranch();
+			await this.adoptWorkspaceSnapshot(ws);
+		} catch (err) {
+			frontendLog('workspace', 'warn', `worktree branch label sync failed: ${formatError(err)}`);
+		}
+	}
+
 	async commitChangesOnNewBranch(branch: string, message: string) {
 		const trimmedBranch = branch.trim();
 		const trimmedMessage = message.trim();
@@ -2758,6 +2787,9 @@ class WorkspaceState {
 			// branch we just landed on — here the freshly-created one
 			// (ADR 0028).
 			void coder.associateActiveSessionBranch();
+			// If this happened inside a worktree, the new branch is now
+			// its checked-out branch — re-stamp the folder bar label.
+			void this.syncWorktreeBranchLabel();
 			return true;
 		} catch (err) {
 			this.flash(`Commit failed: ${formatError(err)}`);
@@ -3175,6 +3207,8 @@ class WorkspaceState {
 			this.closeBranchSwitcher();
 			await this.refreshGitBranch();
 			void this.refreshActiveFolder();
+			// Switching a worktree's branch changes its bar label too.
+			void this.syncWorktreeBranchLabel();
 			return true;
 		} catch (err) {
 			this.flash(`Switch failed: ${formatError(err)}`);

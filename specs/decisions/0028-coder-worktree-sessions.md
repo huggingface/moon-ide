@@ -238,6 +238,20 @@ ADR 0015):
   automatically once multiple agents run concurrently. Left as a note
   rather than a commitment — the right trigger (manual vs. automatic)
   needs real usage to settle.
+- **Per-project session list.** The coder panel scopes its session
+  list to the **project root**, not the individual bound folder: a
+  worktree folder resolves to its parent (backend `coder_root_folder`,
+  frontend resolution in `adoptWorkspaceSnapshot`), so a parent and
+  all its worktrees share one list, transcript, and draft. Selecting a
+  worktree in the folder bar changes the file tree / SCM view (to
+  inspect that checkout) but leaves the coder panel put — each session
+  just advertises which branch/worktree it runs on via its chip.
+  Separate top-level projects keep separate lists.
+- **Worktree branch labels stay live.** The folder bar shows a
+  worktree's branch from the registry (`FolderOrigin::Worktree`),
+  stamped at creation; an in-worktree commit-on-new-branch or
+  `git switch` re-stamps it via `workspace_sync_active_worktree_branch`
+  so the label tracks the real checked-out branch.
 - No migration: the header schema bumps and the new folder
   discriminator are additive and pre-stable per
   [AGENTS.md § No premature migrations](../../AGENTS.md).

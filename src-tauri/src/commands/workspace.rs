@@ -40,6 +40,28 @@ pub async fn workspace_remove_folder(state: State<'_, AppState>, path: String) -
 	Ok(snap)
 }
 
+/// Re-stamp the active folder's worktree branch label from its
+/// actual checked-out branch (ADR 0028). The folder bar shows a
+/// worktree's branch from the registry, captured at creation; an
+/// in-worktree commit-on-new-branch or `git switch` changes the real
+/// branch, leaving the label stale. The frontend calls this after
+/// those ops; it's a no-op (returns the unchanged snapshot) when the
+/// active folder isn't a worktree. Returns the post-sync snapshot.
+#[tauri::command]
+pub async fn workspace_sync_active_worktree_branch(state: State<'_, AppState>) -> Result<WorkspaceRecord, MoonError> {
+	if let Some(folder) = state.workspaces.active_folder().await {
+		if matches!(
+			folder.folder.origin,
+			moon_protocol::workspace::FolderOrigin::Worktree { .. }
+		) {
+			if let Some(branch) = folder.host.git_branch().await?.name {
+				state.workspaces.set_worktree_branch(&folder.folder.path, &branch).await;
+			}
+		}
+	}
+	Ok(state.workspaces.snapshot().await)
+}
+
 /// Set the active folder. Errors if `path` isn't already a member of
 /// the workspace — callers should `workspace_open_local` to add new
 /// folders.

@@ -1437,24 +1437,41 @@
 	);
 
 	// Click on a session's branch chip (ADR 0028). For a regular
-	// session this `git switch`es the active folder back to the branch
-	// its work was committed onto (git refuses + flashes on a dirty
-	// tree). For a worktree session the branch lives in its own bound
-	// folder — switching the parent to it is impossible (it's already
-	// checked out there) — so we jump to that worktree folder instead.
+	// A session is associated with a **branch** (ADR 0028): the branch
+	// its work was committed onto, or its worktree's branch if it
+	// hasn't committed yet. Prefer the committed one — it tracks the
+	// live branch after a commit-on-new-branch.
+	function sessionBranch(session: CoderSessionSummary): string | null {
+		return session.committed_branch ?? session.worktree_branch ?? null;
+	}
+
+	// The bound worktree folder currently checked out on `branch`, if
+	// any. Resolved live (not from which header field set it), so it's
+	// correct after a branch is moved into / out of a worktree.
+	function worktreeFolderForBranch(branch: string | null): string | null {
+		if (branch === null) {
+			return null;
+		}
+		return (
+			workspace.workspace?.folders.find((f) => f.origin.kind === 'worktree' && f.origin.branch === branch)?.path ?? null
+		);
+	}
+
+	// Click on a session's branch chip: go to wherever the branch
+	// lives. If it's checked out in a worktree, focus that worktree
+	// folder (the file tree / SCM follow; the per-project session list
+	// stays put). Otherwise `git switch` the active folder to it (git
+	// refuses + flashes on a dirty tree).
 	function onSessionBranchChip(session: CoderSessionSummary): void {
-		const worktreeBranch = session.worktree_branch;
-		if (worktreeBranch) {
-			const wt = workspace.workspace?.folders.find(
-				(f) => f.origin.kind === 'worktree' && f.origin.branch === worktreeBranch,
-			);
-			if (wt) {
-				void workspace.setActiveFolder(wt.path);
-			}
+		const branch = sessionBranch(session);
+		if (branch === null) {
 			return;
 		}
-		if (session.committed_branch) {
-			void workspace.switchToBranch({ kind: 'local', name: session.committed_branch });
+		const worktreePath = worktreeFolderForBranch(branch);
+		if (worktreePath !== null) {
+			void workspace.setActiveFolder(worktreePath);
+		} else {
+			void workspace.switchToBranch({ kind: 'local', name: branch });
 		}
 	}
 
@@ -1874,15 +1891,15 @@
 									{formatRelative(session.updated_at_ms)}
 								</div>
 							</button>
-							{#if session.worktree_branch || session.committed_branch}
-								{@const isWorktree = Boolean(session.worktree_branch)}
-								{@const branch = session.worktree_branch ?? session.committed_branch}
+							{#if sessionBranch(session)}
+								{@const branch = sessionBranch(session)}
+								{@const inWorktree = worktreeFolderForBranch(branch) !== null}
 								<button
 									type="button"
 									class="session-branch-chip"
-									class:worktree={isWorktree}
-									title={isWorktree ? `Go to the worktree on ${branch}` : `Switch this folder to ${branch}`}
-									aria-label={isWorktree ? `Go to worktree on ${branch}` : `Switch to branch ${branch}`}
+									class:worktree={inWorktree}
+									title={inWorktree ? `Go to the worktree on ${branch}` : `Switch this folder to ${branch}`}
+									aria-label={inWorktree ? `Go to worktree on ${branch}` : `Switch to branch ${branch}`}
 									onclick={() => onSessionBranchChip(session)}
 								>
 									<BranchIcon size={11} />
@@ -1958,14 +1975,25 @@
 			<span class="session-bar-title" title={coder.activeSession?.title ?? ''}>
 				{coder.activeSession?.title || 'New session'}
 			</span>
-			{#if visibleSessionSummary?.worktree_branch}
-				<span
-					class="session-bar-worktree"
-					title="Isolated session — its own git worktree on {visibleSessionSummary.worktree_branch}. Its changes stay on that branch; open the worktree folder in the bar to inspect them."
-				>
-					<BranchIcon size={12} />
-					<span class="wt-branch">{visibleSessionSummary.worktree_branch}</span>
-				</span>
+			{#if visibleSessionSummary}
+				{@const summary = visibleSessionSummary}
+				{@const branch = sessionBranch(summary)}
+				{#if branch}
+					{@const inWorktree = worktreeFolderForBranch(branch) !== null}
+					<button
+						type="button"
+						class="session-bar-worktree"
+						class:plain={!inWorktree}
+						title={inWorktree
+							? `Runs in a git worktree on ${branch} — click to open that checkout`
+							: `This session's work is on ${branch} — click to switch this folder to it`}
+						aria-label={inWorktree ? `Go to worktree on ${branch}` : `Switch to branch ${branch}`}
+						onclick={() => onSessionBranchChip(summary)}
+					>
+						<BranchIcon size={12} />
+						<span class="wt-branch">{branch}</span>
+					</button>
+				{/if}
 			{/if}
 			{#if coder.activeSession}
 				<button
@@ -2912,11 +2940,11 @@
 		white-space: nowrap;
 		text-align: center;
 	}
-	/* "This session is isolated in a worktree" badge in the session
-	   bar (ADR 0028). Informative only — navigating to the worktree
-	   folder would drop the session view (the session is filed under
-	   the parent), so the user reaches the worktree's files via its
-	   nested row in the folder bar instead. */
+	/* The visible session's branch chip in the session bar (ADR
+	   0028). Click goes to wherever the branch lives — the worktree
+	   checkout (accent), or a plain `git switch` (muted, `.plain`).
+	   With the per-project session list, focusing a worktree keeps the
+	   transcript put, so this is safe to make clickable. */
 	.session-bar-worktree {
 		flex-shrink: 0;
 		max-width: 12rem;
@@ -2926,8 +2954,22 @@
 		padding: 1px 7px;
 		border: 1px solid color-mix(in srgb, var(--m-accent) 45%, transparent);
 		border-radius: 999px;
+		background: transparent;
 		color: var(--m-accent);
 		font-size: 11px;
+		cursor: pointer;
+	}
+	.session-bar-worktree:hover {
+		background: var(--m-bg-3);
+		border-color: var(--m-accent);
+	}
+	.session-bar-worktree.plain {
+		border-color: var(--m-border);
+		color: var(--m-fg-muted);
+	}
+	.session-bar-worktree.plain:hover {
+		color: var(--m-fg);
+		border-color: var(--m-fg-muted);
 	}
 	.session-bar-worktree .wt-branch {
 		overflow: hidden;

@@ -91,6 +91,7 @@ pub fn run() {
 			commands::workspace::workspace_open_local,
 			commands::workspace::workspace_remove_folder,
 			commands::workspace::workspace_set_active_folder,
+			commands::workspace::workspace_sync_active_worktree_branch,
 			commands::workspace::workspace_active,
 			commands::workspace::workspace_list,
 			commands::fs::fs_read_dir,

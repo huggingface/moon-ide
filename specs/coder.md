@@ -1061,25 +1061,29 @@ keeps the worktree (the branch is the deliverable you may still PR).
 The **branch is never deleted by the IDE**: it's left in place for a
 later PR.
 
-### Regular sessions remember their branch
+### A session is tied to a branch
 
-A non-worktree session working on the main tree gets the same "the
-branch is the deliverable" tie without a worktree: whenever the user
-commits with a session open — a fresh "commit on new branch", or a
-plain commit on the current branch — the session is tagged with the
-branch `HEAD` landed on (`committed_branch` on the header, rewritten
-in place; most-recent-commit wins). The session list then shows a
-branch chip; clicking it `git switch`es the active folder back to that
-branch (git's own refusal on a dirty tree is surfaced as-is). So
-after juggling several agents across several branches off `main`, you
-return to a past session and jump to its branch in one click instead
-of hunting for the name. A blank, never-committed session is left
-untagged.
+Every session carries a branch — the deliverable. A worktree session's
+branch is its checkout's; a main-tree session's is whatever `HEAD`
+landed on the last time the user committed with it open (a fresh
+"commit on new branch" or a plain commit; `committed_branch` on the
+header, rewritten in place, most-recent wins, preferred over the
+worktree's initial branch once set). A blank, never-committed
+non-worktree session has no branch yet.
 
-Worktree sessions share the same chip (accent-tinted), showing the
-worktree's branch — but since that branch is checked out in the
-worktree's own bound folder, clicking jumps to _that folder_ rather
-than `git switch`ing the parent (which couldn't check it out anyway).
+The session list (and the open session's header) shows that branch as
+a chip. Clicking it goes to **wherever the branch currently lives**,
+resolved live rather than from which field set it:
+
+- the branch is checked out in a bound worktree → focus that worktree
+  folder (the file tree / SCM follow; the per-project session list
+  stays put, so nothing about the conversation is lost);
+- otherwise → `git switch` the active folder to it (git's own refusal
+  on a dirty tree is surfaced as-is).
+
+So after juggling several agents across several branches off `main`,
+you return to a past session and land on its branch — or its
+worktree — in one click instead of hunting for the name.
 
 A future direction (not built): when you want to revisit a session's
 branch but an agent is mid-run on the current one, switching the

@@ -180,6 +180,41 @@ impl WorkspaceRegistry {
 		Ok(entry)
 	}
 
+	/// Sync a worktree folder's stored branch label to its actual
+	/// checked-out `branch` (ADR 0028). The folder bar shows the
+	/// worktree's branch from `FolderOrigin::Worktree { branch }`,
+	/// captured at creation; an in-worktree commit-on-new-branch or
+	/// `git switch` changes the real branch, so this re-stamps it.
+	/// No-op (`false`) for a non-worktree / unknown path or when the
+	/// label already matches. Reuses the folder's existing host, so
+	/// no git state is rebuilt.
+	pub async fn set_worktree_branch(&self, path: &str, branch: &str) -> bool {
+		let mut inner = self.inner.write().await;
+		let Some(pos) = inner.folders.iter().position(|e| e.folder.path == path) else {
+			return false;
+		};
+		let entry = &inner.folders[pos];
+		let FolderOrigin::Worktree {
+			parent_path,
+			branch: current,
+		} = &entry.folder.origin
+		else {
+			return false;
+		};
+		if current == branch {
+			return false;
+		}
+		let parent_path = parent_path.clone();
+		let mut folder = entry.folder.clone();
+		folder.origin = FolderOrigin::Worktree {
+			parent_path,
+			branch: branch.to_string(),
+		};
+		let host = entry.host.clone();
+		inner.folders[pos] = Arc::new(WorkspaceFolderEntry { folder, host });
+		true
+	}
+
 	/// Remove the folder at `path`. If it was active, the
 	/// previous folder in insertion order takes over (or the new first,
 	/// if index 0 was removed); when no folders remain the workspace
