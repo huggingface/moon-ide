@@ -291,7 +291,11 @@ the editor once the target buffer renders.
   `lspOpen` / `lspScheduleUpdate` (150 ms debounce) / `lspClose`
   wrappers.
 - **`editor/lsp.ts`** — CM adapters: lint gutter, hover tooltip,
-  and the completion source. Completion honours the server's
+  and the completion source. Completion replaces the whole
+  identifier under the caret — the range is extended forward past
+  any word characters that follow the caret, so accepting an item
+  mid-word (caret after `Ob` in `ObjectId`) rewrites the token
+  rather than inserting into it. It honours the server's
   `textEdit` range and chases lazy-resolved auto-import edits via
   `completionItem/resolve`: the primary insertion lands immediately
   and the import block follows in a second transaction once the

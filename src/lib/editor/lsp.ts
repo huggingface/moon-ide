@@ -442,6 +442,17 @@ function positionFor(view: EditorView, offset: number) {
 	};
 }
 
+/** End offset of the identifier the caret sits inside, scanning
+ *  forward from `pos` through `[\w$]` characters. Returns `pos`
+ *  unchanged when the caret isn't followed by word characters. `$`
+ *  is included for the same reason as in the completion source's
+ *  `matchBefore` — it's an identifier char in JS. */
+function wordEndAfter(doc: Text, pos: number): number {
+	const line = doc.lineAt(pos);
+	const trailing = /^[\w$]+/.exec(line.text.slice(pos - line.from));
+	return trailing ? pos + trailing[0].length : pos;
+}
+
 function hoverRange(view: EditorView, range: LspDiagnostic['range'] | null, fallback: number) {
 	if (!range) {
 		return { from: fallback, to: fallback };
@@ -514,6 +525,12 @@ export const lspCompletionSource: CompletionSource = async (
 	// off a `$foo` completion.
 	const word = context.matchBefore(/[\w$]+/);
 	const from = word ? word.from : context.pos;
+	// Extend the replace range past any word characters that sit
+	// *after* the caret so accepting an item mid-identifier
+	// rewrites the whole word instead of inserting into it (caret
+	// after "Ob" in "ObjectId" must yield "ObjectId", not
+	// "ObjectIdjectId").
+	const to = wordEndAfter(context.state.doc, context.pos);
 	// Build each option without the `undefined` branches so CM6's
 	// `exactOptionalPropertyTypes` stays happy — CM wants the keys
 	// absent rather than present-but-undefined. Writing each assign
@@ -521,7 +538,7 @@ export const lspCompletionSource: CompletionSource = async (
 	// narrow-tracking what's on the `Completion` type.
 	return {
 		from,
-		to: context.pos,
+		to,
 		options: list.items.map((item) => {
 			const option: Completion = {
 				label: item.label,
@@ -605,7 +622,13 @@ function primaryEditFor(
 	if (item.textEdit !== null) {
 		const start = offsetFor(doc, item.textEdit.range.start.line, item.textEdit.range.start.character);
 		const end = offsetFor(doc, item.textEdit.range.end.line, item.textEdit.range.end.character);
-		return { from: start, to: end, insert: item.textEdit.newText };
+		// The server's range ends at the caret (we advertise
+		// `insert_replace_support: false`), so on its own it leaves
+		// any trailing word characters behind. `fallbackTo` carries
+		// the word-end the completion source computed; take whichever
+		// reaches further so a mid-identifier accept rewrites the
+		// whole word.
+		return { from: start, to: Math.max(end, fallbackTo), insert: item.textEdit.newText };
 	}
 	return { from: fallbackFrom, to: fallbackTo, insert: item.insertText ?? item.label };
 }
