@@ -1410,6 +1410,25 @@ class WorkspaceState {
 	}
 
 	/**
+	 * Move the visible coder session into its own git worktree (ADR
+	 * 0028). Unlike `newCoderWorktreeSession`, the conversation is
+	 * preserved — only its summary refreshes (so the worktree chip
+	 * appears) and the new worktree folder is bound. On a non-default
+	 * branch the backend also resets the main tree to the default
+	 * branch; a dirty tree is refused with git's message.
+	 */
+	async moveCoderSessionToWorktree(): Promise<void> {
+		try {
+			const result = await ipc.coder.moveSessionToWorktree();
+			await this.adoptWorkspaceSnapshot(result.workspace);
+			this.persistAppState();
+			coder.adoptMovedSession(result.session);
+		} catch (err) {
+			this.flash(`Could not move session to a worktree: ${formatError(err)}`);
+		}
+	}
+
+	/**
 	 * Discard a worktree-backed session folder (ADR 0028): prune the
 	 * git worktree and unbind it. The branch is kept — it's the
 	 * deliverable, left for a PR. `git worktree remove` refuses a

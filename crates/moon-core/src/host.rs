@@ -417,6 +417,22 @@ pub trait WorkspaceHost: Send + Sync {
 	/// freshly-created [`GitWorktree`].
 	async fn git_worktree_add(&self, path: &Utf8Path, branch: WorktreeBranch) -> MoonResult<GitWorktree>;
 
+	/// Create a worktree at `path` on `branch`, optionally **moving**
+	/// the active checkout's current branch into it first (ADR 0028 —
+	/// "move this session into a worktree"). When `reset_main_to` is
+	/// `Some(default)`, the main tree is switched to `default` (which
+	/// frees the current branch so it can be checked out in the
+	/// worktree); the tree must be clean or this errors, and a failed
+	/// worktree-add rolls the switch back. When `None`, the main tree
+	/// is left untouched (the fresh-branch case). The whole switch +
+	/// add runs under the git lock so nothing interleaves.
+	async fn git_worktree_add_moving(
+		&self,
+		path: &Utf8Path,
+		branch: WorktreeBranch,
+		reset_main_to: Option<String>,
+	) -> MoonResult<GitWorktree>;
+
 	/// List the repository's working trees (`git worktree list
 	/// --porcelain`), including the main one (`is_main`). Used to
 	/// reconcile the IDE's session→worktree bindings against reality
@@ -1890,6 +1906,25 @@ impl WorkspaceHost for LocalHost {
 		.map_err(|e| MoonError::Internal(format!("git_worktree_add join error: {e}")))?
 	}
 
+	async fn git_worktree_add_moving(
+		&self,
+		path: &Utf8Path,
+		branch: WorktreeBranch,
+		reset_main_to: Option<String>,
+	) -> MoonResult<GitWorktree> {
+		let guard = self.git_lock().await;
+		let root = self.root.clone();
+		let path = path.to_owned();
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			// Host git (ADR 0028 W.4): the switch happens on the host
+			// main tree, and the worktree itself lives host-side.
+			run_git_worktree_add_moving(&root, &path, &branch, reset_main_to.as_deref(), &ShellTarget::Host)
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_worktree_add_moving join error: {e}")))?
+	}
+
 	async fn git_worktree_list(&self) -> MoonResult<Vec<GitWorktree>> {
 		let guard = self.git_lock().await;
 		let root = self.root.clone();
@@ -2883,6 +2918,59 @@ fn run_git_worktree_add(
 		is_main: false,
 		is_locked: locked,
 	})
+}
+
+/// Create a worktree, optionally resetting the main tree first (ADR
+/// 0028 — "move this session into a worktree"). With `reset_main_to =
+/// Some(default)`: requires a clean tree, switches the main checkout
+/// to `default` (freeing the current branch), then adds the worktree
+/// on `branch`; a failed add rolls the switch back so the main tree
+/// isn't stranded on `default` with the branch un-worktree'd. With
+/// `None`: a plain [`run_git_worktree_add`].
+fn run_git_worktree_add_moving(
+	root: &Utf8Path,
+	path: &Utf8Path,
+	branch: &WorktreeBranch,
+	reset_main_to: Option<&str>,
+	target: &ShellTarget,
+) -> MoonResult<GitWorktree> {
+	if let Some(default) = reset_main_to {
+		// `git status --porcelain` lists tracked changes *and*
+		// untracked files; either would be left behind by the move (the
+		// worktree is a fresh checkout at the branch tip), so block on
+		// both rather than silently lose work.
+		let status = git_command(target, root)
+			.args(["status", "--porcelain"])
+			.output()
+			.map_err(|e| MoonError::IoError(format!("git status failed to launch: {e}")))?;
+		if !status.stdout.is_empty() {
+			return Err(MoonError::invalid(
+				"Working tree has uncommitted changes — commit or stash them before moving the branch to a worktree.",
+			));
+		}
+		let switch = git_command(target, root)
+			.args(["switch", default])
+			.output()
+			.map_err(|e| MoonError::IoError(format!("git switch failed to launch: {e}")))?;
+		if !switch.status.success() {
+			let stderr = String::from_utf8_lossy(&switch.stderr).trim().to_string();
+			return Err(MoonError::IoError(format!("git switch {default} failed: {stderr}")));
+		}
+	}
+
+	match run_git_worktree_add(root, path, branch, target) {
+		Ok(worktree) => Ok(worktree),
+		Err(err) => {
+			// Roll the main tree back to the branch we moved off of, so
+			// a failed add leaves the checkout exactly where it started.
+			if reset_main_to.is_some() {
+				if let WorktreeBranch::Existing(original) = branch {
+					let _ = git_command(target, root).args(["switch", original]).output();
+				}
+			}
+			Err(err)
+		}
+	}
 }
 
 /// Lock reason stamped on every IDE-managed worktree so
@@ -6847,6 +6935,82 @@ mod tests {
 		assert_eq!(parent_head.trim(), "ref: refs/heads/main");
 
 		host(&dir).git_worktree_remove(&wt_path, false).await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn git_worktree_add_moving_resets_main_and_checks_out_branch() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping worktree move test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		std::fs::write(dir.path().join("README.md"), "hi\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "initial"]);
+		// Work on a feature branch (the main tree is currently on it).
+		run_git(&git, dir.path(), &["switch", "-qc", "feature-x"]);
+		std::fs::write(dir.path().join("feat.txt"), "feat\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "feature work"]);
+
+		let wt_parent = TempDir::new().unwrap();
+		let wt_path = Utf8PathBuf::from_path_buf(wt_parent.path().join("agent-wt")).unwrap();
+
+		let created = host(&dir)
+			.git_worktree_add_moving(
+				&wt_path,
+				WorktreeBranch::Existing("feature-x".into()),
+				Some("main".into()),
+			)
+			.await
+			.unwrap();
+		assert_eq!(created.branch.as_deref(), Some("feature-x"));
+		assert!(
+			wt_path.join("feat.txt").exists(),
+			"worktree carries the branch's content"
+		);
+		// Main tree reset to the default branch, freeing feature-x.
+		let main_head = std::fs::read_to_string(dir.path().join(".git/HEAD")).unwrap();
+		assert_eq!(main_head.trim(), "ref: refs/heads/main");
+
+		host(&dir).git_worktree_remove(&wt_path, false).await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn git_worktree_add_moving_errors_on_dirty_tree() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping worktree move dirty test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		std::fs::write(dir.path().join("README.md"), "hi\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "initial"]);
+		run_git(&git, dir.path(), &["switch", "-qc", "feature-x"]);
+		// Uncommitted change — the move must refuse rather than risk
+		// carrying it to the wrong branch.
+		std::fs::write(dir.path().join("dirty.txt"), "wip\n").unwrap();
+
+		let wt_parent = TempDir::new().unwrap();
+		let wt_path = Utf8PathBuf::from_path_buf(wt_parent.path().join("agent-wt")).unwrap();
+		let err = host(&dir)
+			.git_worktree_add_moving(
+				&wt_path,
+				WorktreeBranch::Existing("feature-x".into()),
+				Some("main".into()),
+			)
+			.await
+			.unwrap_err();
+		assert!(matches!(err, MoonError::InvalidArgument(_)), "got {err:?}");
+		// Main tree untouched — still on feature-x.
+		let head = std::fs::read_to_string(dir.path().join(".git/HEAD")).unwrap();
+		assert_eq!(head.trim(), "ref: refs/heads/feature-x");
 	}
 
 	#[tokio::test]

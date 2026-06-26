@@ -1675,6 +1675,22 @@ class CoderPanelState {
 	 *  the session — filed under the still-active parent folder — in
 	 *  the panel and refreshes the sessions list so its row appears.
 	 */
+	/** Reflect a session that was moved into a worktree (ADR 0028).
+	 *  Unlike `adoptCreatedSession`, the conversation is **not** reset
+	 *  — the session keeps its rows/history; we only refresh its
+	 *  summary so the worktree chip + header badge appear, and update
+	 *  its list row. */
+	adoptMovedSession(summary: CoderSessionSummary): void {
+		if (this.current.visibleSessionId === summary.id) {
+			this.activeSession = summary;
+		}
+		const list = this.sessions;
+		if (list) {
+			this.sessions = list.map((s) => (s.id === summary.id ? summary : s));
+		}
+		void this.refreshSessions();
+	}
+
 	adoptCreatedSession(summary: CoderSessionSummary): void {
 		this.installCreatedSession(summary);
 		// Keep the created summary as the visible session's active

@@ -1061,6 +1061,24 @@ keeps the worktree (the branch is the deliverable you may still PR).
 The **branch is never deleted by the IDE**: it's left in place for a
 later PR.
 
+#### The worktree button is context-aware
+
+- **On the sessions list** it starts a fresh isolated session in a new
+  worktree (a new `moon/agent-<id>` branch off `HEAD`).
+- **Inside a session** it _moves that session_ into a worktree,
+  conversation and all (`coder_move_session_to_worktree`): the header
+  gains `worktree_root`, so from the next turn its tools run in the
+  worktree, while the session stays in the same per-project list. The
+  branch follows the user's intent — on a **non-default** branch the
+  worktree checks out _that_ branch and the main tree is reset to the
+  default branch (keep the same PR, free the main tree); on the
+  **default** branch (or detached) it forks a fresh `moon/agent-<id>`.
+  The switch-then-add runs atomically under the git lock and **refuses
+  a dirty tree** (commit or stash first) rather than risk carrying
+  uncommitted work to the wrong branch. The button disables once the
+  session is already in a worktree. So "I want a new isolated session
+  while in one" is `+` (new blank session) then the worktree button.
+
 ### A session is tied to a branch
 
 Every session carries a branch — the deliverable. A worktree session's

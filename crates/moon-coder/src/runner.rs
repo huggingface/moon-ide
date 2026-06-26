@@ -1483,6 +1483,64 @@ impl CoderHandle {
 		Ok(Some(summary))
 	}
 
+	/// Move the active folder's **visible** session into a git
+	/// worktree (ADR 0028): stamp `worktree_root` + `worktree_branch`
+	/// on its header so the next turn's tools route to the worktree
+	/// checkout, and rewrite the on-disk header. The conversation is
+	/// untouched — it keeps its full history and stays in the same
+	/// (per-project) session list, it just starts operating on the
+	/// isolated branch. Works on a blank, not-yet-persisted session
+	/// too (the "+ then worktree" flow): the header rides in memory
+	/// until first persist. Returns the updated summary, or `None`
+	/// when there's no visible session. Errors if the session is
+	/// already in a worktree (the caller should branch on that).
+	pub async fn move_visible_session_to_worktree(
+		&self,
+		worktree_root: String,
+		branch: String,
+	) -> Result<Option<SessionSummary>, CoderError> {
+		let (fs, _) = self.state.active_folder_session().await?;
+		let Some(id) = fs.visible_session_id().await else {
+			return Ok(None);
+		};
+		let Some(rt) = fs.runtime(&id).await else {
+			return Ok(None);
+		};
+		let (session_dir, summary, header) = {
+			let mut session = rt.session.lock().await;
+			if session.header.worktree_root.is_some() {
+				return Err(CoderError::Internal(
+					"this session already runs in a worktree".to_string(),
+				));
+			}
+			session.header.worktree_root = Some(worktree_root);
+			session.header.worktree_branch = Some(branch);
+			(session.session_dir.clone(), session.summary(), session.header.clone())
+		};
+		if let Some(dir) = session_dir {
+			if let Err(err) = sessions::rewrite_header(&dir, &header).await {
+				tracing::warn!(?err, "failed to persist worktree-move header rewrite");
+			}
+		}
+		Ok(Some(summary))
+	}
+
+	/// Whether the active folder's visible session can be moved into a
+	/// worktree: there is one, and it isn't already in a worktree. The
+	/// move command checks this *before* creating any git worktree, so
+	/// the no-op cases don't strand an orphaned worktree.
+	pub async fn can_move_visible_session(&self) -> Result<bool, CoderError> {
+		let (fs, _) = self.state.active_folder_session().await?;
+		let Some(id) = fs.visible_session_id().await else {
+			return Ok(false);
+		};
+		let Some(rt) = fs.runtime(&id).await else {
+			return Ok(false);
+		};
+		let already = rt.session.lock().await.header.worktree_root.is_some();
+		Ok(!already)
+	}
+
 	/// Read the force-host override of `fs`'s visible session
 	/// without lazy-creating a runtime (mirrors the two-step
 	/// look-up `status` uses for `busy`). `false` when no session

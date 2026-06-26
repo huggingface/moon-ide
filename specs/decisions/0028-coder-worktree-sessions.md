@@ -238,6 +238,18 @@ ADR 0015):
   automatically once multiple agents run concurrently. Left as a note
   rather than a commitment — the right trigger (manual vs. automatic)
   needs real usage to settle.
+- **Move-into-worktree keeps the conversation.** The worktree button,
+  used inside a session, moves _that_ session into a worktree
+  (`coder_move_session_to_worktree`) rather than minting a fresh one:
+  it only stamps `worktree_root`/`worktree_branch` on the header, so
+  the conversation and its place in the (per-project) list are
+  untouched — the tools just re-route next turn. On a non-default
+  branch it checks that branch out in the worktree and resets the main
+  tree to the default branch (`git_worktree_add_moving` does the
+  clean-tree check + switch + add atomically under the git lock, with
+  rollback on failure); a dirty tree is refused. On the sessions list
+  the same button keeps its original meaning (a brand-new isolated
+  session).
 - **Per-project session list.** The coder panel scopes its session
   list to the **project root**, not the individual bound folder: a
   worktree folder resolves to its parent (backend `coder_root_folder`,

@@ -464,6 +464,105 @@ pub async fn coder_discard_worktree(
 	Ok(state.workspaces.snapshot().await)
 }
 
+/// Move the active folder's visible coder session into its own git
+/// worktree (ADR 0028) — the in-session counterpart to
+/// `coder_new_worktree_session`. The conversation keeps its history
+/// and stays in the same per-project session list; its tools just
+/// start operating on an isolated branch from the next turn.
+///
+/// Branch choice mirrors the worktree button's intent:
+/// - on a **non-default** branch `B`: the worktree checks out `B` and
+///   the main tree is reset to the default branch (so you keep the
+///   same branch / PR, with the main tree freed). Requires a clean
+///   tree — errors otherwise.
+/// - on the **default** branch (or detached / no known default): a
+///   fresh `moon/agent-<id>` branch off `HEAD`; the main tree is left
+///   as-is.
+#[tauri::command]
+pub async fn coder_move_session_to_worktree(state: State<'_, AppState>) -> Result<NewWorktreeSession, MoonError> {
+	use moon_core::host::WorktreeBranch;
+
+	let parent = state.workspaces.require_active_folder().await?;
+	if matches!(
+		parent.folder.origin,
+		moon_protocol::workspace::FolderOrigin::Worktree { .. }
+	) {
+		return Err(MoonError::invalid("the active folder is already an isolated worktree"));
+	}
+	// Bail before touching git if there's nothing movable, so we never
+	// strand an orphaned worktree.
+	if !state.coder.can_move_visible_session().await.map_err(MoonError::from)? {
+		return Err(MoonError::invalid(
+			"no movable session (none is open, or it already runs in a worktree)",
+		));
+	}
+	let parent_path = parent.folder.path.clone();
+	let parent_name = parent.folder.name.clone();
+
+	let workspace_id = state
+		.workspace_id()
+		.ok_or_else(|| MoonError::invalid("no workspace bound (preboot mode)"))?
+		.to_string();
+	let state_dir = state.workspace_state_dir(&workspace_id);
+
+	// Decide the branch + whether the main tree resets.
+	let info = parent.host.git_branch().await?;
+	let default = info
+		.default_branch_remote_ref
+		.as_deref()
+		.and_then(|r| r.rsplit_once('/').map(|(_, b)| b.to_string()));
+	let (spec, reset_to) = match (&info.name, &default) {
+		// Non-default branch with a known default: move it, reset main.
+		(Some(b), Some(d)) if b != d => (WorktreeBranch::Existing(b.clone()), Some(d.clone())),
+		// On the default branch, detached, or no known default: fork fresh off HEAD.
+		_ => {
+			let now_ms = std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.map(|d| d.as_millis())
+				.unwrap_or(0) as u64;
+			(
+				WorktreeBranch::New(format!("moon/agent-{:08x}", now_ms & 0xffff_ffff)),
+				None,
+			)
+		}
+	};
+	let branch = spec.name().to_string();
+	let branch_slug = branch.replace('/', "-");
+
+	use std::hash::{Hash, Hasher};
+	let mut hasher = std::collections::hash_map::DefaultHasher::new();
+	parent_path.hash(&mut hasher);
+	let parent_slug = format!("{parent_name}-{:08x}", hasher.finish() as u32);
+	let worktree_path = state_dir.join("worktrees").join(&parent_slug).join(&branch_slug);
+	if let Some(dir) = worktree_path.parent() {
+		std::fs::create_dir_all(dir.as_std_path()).map_err(MoonError::from)?;
+	}
+
+	// Git work first (atomic switch + add under the git lock). If it
+	// fails, the session and folder registry are untouched.
+	parent
+		.host
+		.git_worktree_add_moving(&worktree_path, spec, reset_to)
+		.await?;
+
+	let wt_entry = state
+		.workspaces
+		.add_worktree_folder(worktree_path, parent_path, branch.clone())
+		.await?;
+
+	let session = state
+		.coder
+		.move_visible_session_to_worktree(wt_entry.folder.path.clone(), branch)
+		.await
+		.map_err(MoonError::from)?
+		.ok_or_else(|| MoonError::invalid("no visible session to move"))?;
+
+	crate::commands::container::repair_worktrees(&state, true).await;
+
+	let workspace = state.workspaces.snapshot().await;
+	Ok(NewWorktreeSession { workspace, session })
+}
+
 /// Tie the active folder's visible coder session to the branch its
 /// work was just committed onto (ADR 0028). Resolves the current
 /// `HEAD` branch — so it covers both "commit on new branch" and a

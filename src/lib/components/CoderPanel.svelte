@@ -1421,6 +1421,50 @@
 		composer?.focus();
 	}
 
+	// The in-session worktree button **moves** the open session into a
+	// worktree (ADR 0028), keeping its conversation. On a non-default
+	// branch the backend moves that branch and resets the main tree to
+	// the default; on the default branch it forks a fresh one.
+	async function onMoveSessionToWorktree(): Promise<void> {
+		if (creatingWorktree) {
+			return;
+		}
+		creatingWorktree = true;
+		try {
+			await workspace.moveCoderSessionToWorktree();
+		} finally {
+			creatingWorktree = false;
+		}
+		await tick();
+		composer?.focus();
+	}
+
+	// The visible session is already isolated when its branch is
+	// checked out in a worktree — moving it again is a no-op, so the
+	// in-session worktree button disables.
+	const visibleSessionInWorktree = $derived.by(() => {
+		if (!visibleSessionSummary) {
+			return false;
+		}
+		return worktreeFolderForBranch(sessionBranch(visibleSessionSummary)) !== null;
+	});
+
+	const moveWorktreeButtonTitle = $derived.by(() => {
+		if (creatingWorktree) {
+			return 'Moving session into a worktree…';
+		}
+		if (visibleSessionInWorktree) {
+			return 'This session already runs in its own worktree';
+		}
+		const branch = workspace.gitBranch.name;
+		const defaultRef = workspace.gitBranch.defaultBranchRemoteRef;
+		const defaultName = defaultRef !== null ? defaultRef.split('/').slice(1).join('/') || defaultRef : null;
+		const isDefault = branch !== null && defaultName !== null && branch === defaultName;
+		return branch === null || isDefault
+			? 'Move this session into its own git worktree (on a fresh branch)'
+			: `Move this session into its own git worktree, keeping branch ${branch} (resets this folder to the default branch)`;
+	});
+
 	async function onPickSession(id: string): Promise<void> {
 		await coder.openSession(id);
 		await tick();
@@ -2021,10 +2065,10 @@
 				type="button"
 				class="icon"
 				class:creating={creatingWorktree}
-				onclick={onNewWorktreeSession}
-				disabled={creatingWorktree}
-				title={worktreeButtonTitle}
-				aria-label="New isolated session"
+				onclick={onMoveSessionToWorktree}
+				disabled={creatingWorktree || visibleSessionInWorktree}
+				title={moveWorktreeButtonTitle}
+				aria-label="Move session into a worktree"
 			>
 				<BranchIcon />
 			</button>
