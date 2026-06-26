@@ -1677,6 +1677,13 @@ class CoderPanelState {
 	 */
 	adoptCreatedSession(summary: CoderSessionSummary): void {
 		this.installCreatedSession(summary);
+		// Keep the created summary as the visible session's active
+		// summary so its worktree badge + "isolated on <branch>" hint
+		// render immediately. `installCreatedSession` nulls it, and the
+		// on-disk session list won't include this session until its
+		// first turn persists it (ADR 0028) — so without this the
+		// worktree link is invisible until the user sends a prompt.
+		this.sessionStateFor(this.activeFolderPath ?? NO_FOLDER_KEY, summary.id).activeSession = summary;
 		void this.refreshSessions();
 	}
 

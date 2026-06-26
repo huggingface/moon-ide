@@ -1392,11 +1392,31 @@
 		composer?.focus();
 	}
 
+	// Creating a worktree is slow (git worktree add + lock, and a
+	// container repair when the workspace is containerised), so the
+	// button shows a spinner + disables until it lands — otherwise a
+	// click looks like it did nothing for a second or two.
+	let creatingWorktree = $state(false);
+
+	const worktreeButtonTitle = $derived(
+		creatingWorktree
+			? 'Creating isolated worktree…'
+			: `New isolated session — forks a new branch off ${workspace.gitBranch.name ?? 'the current commit'}, in its own git worktree`,
+	);
+
 	async function onNewWorktreeSession(): Promise<void> {
 		// Spin up an isolated session in its own git worktree
 		// (ADR 0028) so it can't collide with other agents in this
 		// folder. The folder bar grows a nested row for the worktree.
-		await workspace.newCoderWorktreeSession();
+		if (creatingWorktree) {
+			return;
+		}
+		creatingWorktree = true;
+		try {
+			await workspace.newCoderWorktreeSession();
+		} finally {
+			creatingWorktree = false;
+		}
 		await tick();
 		composer?.focus();
 	}
@@ -1423,7 +1443,7 @@
 	// folder — switching the parent to it is impossible (it's already
 	// checked out there) — so we jump to that worktree folder instead.
 	function onSessionBranchChip(session: CoderSessionSummary): void {
-		const worktreeBranch = session.worktreeBranch;
+		const worktreeBranch = session.worktree_branch;
 		if (worktreeBranch) {
 			const wt = workspace.workspace?.folders.find(
 				(f) => f.origin.kind === 'worktree' && f.origin.branch === worktreeBranch,
@@ -1433,8 +1453,8 @@
 			}
 			return;
 		}
-		if (session.committedBranch) {
-			void workspace.switchToBranch({ kind: 'local', name: session.committedBranch });
+		if (session.committed_branch) {
+			void workspace.switchToBranch({ kind: 'local', name: session.committed_branch });
 		}
 	}
 
@@ -1785,8 +1805,10 @@
 					<button
 						type="button"
 						class="icon"
+						class:creating={creatingWorktree}
 						onclick={onNewWorktreeSession}
-						title="New isolated session (own git worktree + branch)"
+						disabled={creatingWorktree}
+						title={worktreeButtonTitle}
 						aria-label="New isolated session"
 					>
 						<BranchIcon />
@@ -1852,9 +1874,9 @@
 									{formatRelative(session.updated_at_ms)}
 								</div>
 							</button>
-							{#if session.worktreeBranch || session.committedBranch}
-								{@const isWorktree = Boolean(session.worktreeBranch)}
-								{@const branch = session.worktreeBranch ?? session.committedBranch}
+							{#if session.worktree_branch || session.committed_branch}
+								{@const isWorktree = Boolean(session.worktree_branch)}
+								{@const branch = session.worktree_branch ?? session.committed_branch}
 								<button
 									type="button"
 									class="session-branch-chip"
@@ -1934,15 +1956,15 @@
 				<ListIcon />
 			</button>
 			<span class="session-bar-title" title={coder.activeSession?.title ?? ''}>
-				{coder.activeSession?.title ?? 'New session'}
+				{coder.activeSession?.title || 'New session'}
 			</span>
-			{#if visibleSessionSummary?.worktreeBranch}
+			{#if visibleSessionSummary?.worktree_branch}
 				<span
 					class="session-bar-worktree"
-					title="Isolated session — its own git worktree on {visibleSessionSummary.worktreeBranch}. Its changes stay on that branch; open the worktree folder in the bar to inspect them."
+					title="Isolated session — its own git worktree on {visibleSessionSummary.worktree_branch}. Its changes stay on that branch; open the worktree folder in the bar to inspect them."
 				>
 					<BranchIcon size={12} />
-					<span class="wt-branch">{visibleSessionSummary.worktreeBranch}</span>
+					<span class="wt-branch">{visibleSessionSummary.worktree_branch}</span>
 				</span>
 			{/if}
 			{#if coder.activeSession}
@@ -1970,8 +1992,10 @@
 			<button
 				type="button"
 				class="icon"
+				class:creating={creatingWorktree}
 				onclick={onNewWorktreeSession}
-				title="New isolated session (own git worktree + branch)"
+				disabled={creatingWorktree}
+				title={worktreeButtonTitle}
 				aria-label="New isolated session"
 			>
 				<BranchIcon />
@@ -1982,11 +2006,11 @@
 		</header>
 		<div class="transcript" bind:this={scrollEl} onscroll={onTranscriptScroll}>
 			{#if coder.rows.length === 0}
-				{#if visibleSessionSummary?.worktreeBranch}
+				{#if visibleSessionSummary?.worktree_branch}
 					<p class="hint">
-						Isolated session in its own git worktree on <code>{visibleSessionSummary.worktreeBranch}</code>. The agent's
-						edits and commits stay on that branch and don't touch your main checkout — the worktree shows as a nested
-						folder in the bar above. Send a prompt to start.
+						Isolated session in its own git worktree on <code>{visibleSessionSummary.worktree_branch}</code>. The
+						agent's edits and commits stay on that branch and don't touch your main checkout — the worktree shows as a
+						nested folder in the bar above. Send a prompt to start.
 					</p>
 				{:else}
 					<p class="hint">
@@ -2848,6 +2872,20 @@
 	.icon.active:hover {
 		color: var(--m-accent);
 		filter: brightness(1.15);
+	}
+	/* Worktree-create in flight: spin the branch glyph + tint it
+	   accent so the click clearly registered while git works. */
+	.icon.creating {
+		color: var(--m-accent);
+		cursor: default;
+	}
+	.icon.creating :global(svg) {
+		animation: worktree-spin 0.8s linear infinite;
+	}
+	@keyframes worktree-spin {
+		to {
+			transform: rotate(360deg);
+		}
 	}
 	/* Sticky in-session header with "← Sessions" + title + "+
 	   new". Mirrors the chat panel's `.thread-header` shape so

@@ -1712,15 +1712,16 @@ export type CoderSessionSummary = {
 	 * Branch of the git worktree this session runs in, for an
 	 * isolated (worktree-backed) session (ADR 0028). Absent for an
 	 * ordinary session. Lets the sessions list badge the row.
+	 * Snake_case to match the rest of this (un-renamed) wire struct.
 	 */
-	worktreeBranch?: string | null;
+	worktree_branch?: string | null;
 	/**
 	 * Branch this session's work was committed onto (ADR 0028). Set
 	 * when the user commits with the session open; drives the session
 	 * list's one-click "switch back to this branch" chip. Absent until
 	 * the session's work is first committed.
 	 */
-	committedBranch?: string | null;
+	committed_branch?: string | null;
 };
 
 /**
