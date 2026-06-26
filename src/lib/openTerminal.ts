@@ -104,8 +104,23 @@ export function openContainerTerminal(): void {
 // `/home/me/code/moon-landing` → `/workspace/moon-landing`.
 // Mirrors `moon_terminal::TerminalTarget::container_cwd_for_folder`
 // — keep the two in sync.
+//
+// Worktree-backed folders (ADR 0028) are the exception: they live
+// under `<state_dir>/worktrees`, bind-mounted once at
+// `/workspace/.worktrees` (WORKTREE_CONTAINER_ROOT) rather than at
+// `/workspace/<basename>`. Without this a worktree terminal `chdir`s
+// to a path that doesn't exist in the container. Mirrors
+// `moon_core::worktree::worktree_container_path`.
 export function containerCwdFor(absolutePath: string): string {
 	const normalised = absolutePath.replace(/\/+$/, '');
+	const folder = workspace.workspace?.folders.find((f) => f.path === absolutePath || f.path === normalised);
+	if (folder?.origin.kind === 'worktree') {
+		const marker = '/worktrees/';
+		const idx = normalised.indexOf(marker);
+		if (idx >= 0) {
+			return `/workspace/.worktrees/${normalised.slice(idx + marker.length)}`;
+		}
+	}
 	const basename = normalised.slice(normalised.lastIndexOf('/') + 1);
 	if (basename.length === 0) {
 		return '/workspace';

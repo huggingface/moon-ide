@@ -259,6 +259,21 @@ ADR 0015):
   inspect that checkout) but leaves the coder panel put — each session
   just advertises which branch/worktree it runs on via its chip.
   Separate top-level projects keep separate lists.
+- **Worktree git reads must route through the container.** A
+  worktree's `.git` is repaired to in-container paths (so the agent's
+  container `bash`/builds resolve it), which means **host-side git
+  can't read it**. The IDE's git _writes_ (commit, etc.) already route
+  via `shell_target`, but several _reads_ run host-side for speed and
+  so come back empty on a worktree folder. `git_status_entries` now
+  tries host-side first (fast path for ordinary folders, unchanged)
+  and falls back to running git inside the container when that fails —
+  so a worktree's changes show up. The remaining host-side reads
+  (per-file diff, blame, `git_branch`, `git_default_branch_diff`) want
+  the same host-first/container-fallback treatment; until then a
+  worktree folder's diff view / blame / branch label can be blank in
+  container mode. The terminal cwd for a worktree folder maps under
+  the shared `/workspace/.worktrees` mount (frontend `containerCwdFor`
+  - backend `worktree_container_path`), not `/workspace/<basename>`.
 - **Worktree branch labels stay live.** The folder bar shows a
   worktree's branch from the registry (`FolderOrigin::Worktree`),
   stamped at creation; an in-worktree commit-on-new-branch or

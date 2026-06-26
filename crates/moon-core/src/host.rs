@@ -1481,11 +1481,12 @@ impl WorkspaceHost for LocalHost {
 		// single-threaded but fast enough for IDE-sized trees (tens
 		// of thousands of files) without `build_parallel`'s wiring.
 		let guard = self.git_lock().await;
+		let target = self.shell_target().await;
 		let root = self.root.clone();
 		let paths = paths.to_vec();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
-			classify_git_status(&root, &paths)
+			classify_git_status(&target, &root, &paths)
 		})
 		.await
 		.map_err(|e| MoonError::Internal(format!("git_status_entries join error: {e}")))?
@@ -5597,9 +5598,20 @@ fn collapsed_ignored_dirs(root: &Utf8Path) -> std::collections::BTreeSet<String>
 /// folders; loses the rest of the state machine (no add / modify /
 /// delete / untracked), which is fine because without git those
 /// concepts don't exist.
-fn classify_git_status(root: &Utf8Path, paths: &[String]) -> MoonResult<Vec<GitStatusEntry>> {
-	if let Some(entries) = classify_via_git_status(root) {
+fn classify_git_status(target: &ShellTarget, root: &Utf8Path, paths: &[String]) -> MoonResult<Vec<GitStatusEntry>> {
+	// Host-side first: fast, and correct for ordinary folders (their
+	// `.git` is host-native through the bind mount). A worktree-backed
+	// folder's `.git` points into the container (ADR 0028 W.4.1), so
+	// host git fails on it — fall back to running git inside the
+	// container, where the worktree's metadata resolves. Ordinary
+	// folders never reach the fallback, so they keep the host fast path.
+	if let Some(entries) = classify_via_git_status(&ShellTarget::Host, root) {
 		return Ok(entries);
+	}
+	if matches!(target, ShellTarget::Container { .. }) {
+		if let Some(entries) = classify_via_git_status(target, root) {
+			return Ok(entries);
+		}
 	}
 	classify_ignored_via_walker(root, paths)
 }
@@ -5631,12 +5643,8 @@ fn classify_git_status(root: &Utf8Path, paths: &[String]) -> MoonResult<Vec<GitS
 /// Returns `None` if git fails to start or exits non-zero — the
 /// "not a git repository" complaint is expected on pre-init folders
 /// and triggers the walker fallback. Stderr is swallowed on purpose.
-fn classify_via_git_status(root: &Utf8Path) -> Option<Vec<GitStatusEntry>> {
-	use std::process::Command;
-
-	let output = Command::new("git")
-		.arg("-C")
-		.arg(root.as_std_path())
+fn classify_via_git_status(target: &ShellTarget, root: &Utf8Path) -> Option<Vec<GitStatusEntry>> {
+	let output = git_command(target, root)
 		.args([
 			"status",
 			"--porcelain=v1",
