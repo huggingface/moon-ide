@@ -13,15 +13,6 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-/// In-container mount point for the per-workspace worktrees tree
-/// (ADR 0028 W.4.1). The dev compose bind-mounts
-/// `<state_dir>/worktrees` here once, so worktree-backed coder
-/// sessions are visible to container git / `bash` without
-/// recreating the dev container per worktree. Single source of
-/// truth shared by `moon-container` (compose generation) and
-/// `moon-core` (path mapping).
-pub const WORKTREE_CONTAINER_ROOT: &str = "/workspace/.worktrees";
-
 /// High-level state of the workspace's compose project.
 ///
 /// Drives the status-pip glyph and the "Set up" / "Pause" /

@@ -1,7 +1,12 @@
 # ADR 0028 — Worktree-backed coder sessions
 
 Date: 2026-06-03
-Status: accepted
+Status: accepted; container path-handling (W.4/W.4.1: out-of-repo
+location, the `/workspace/.worktrees` mount, `git worktree repair`, and
+the host-first/container-fallback git reads) superseded by
+[ADR 0029](0029-worktrees-inside-parent.md). The isolation model,
+lifecycle, per-project session list, and move-into-worktree behaviour
+described here still stand.
 
 ## Context
 

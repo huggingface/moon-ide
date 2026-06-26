@@ -1,47 +1,35 @@
-//! Worktree-backed coder sessions (ADR 0028): path mapping for the
-//! shared in-container worktrees mount.
+//! Worktree-backed coder sessions (ADR 0029): host↔container path
+//! mapping.
 //!
 //! A worktree-backed session checks its branch out into a directory
-//! under the per-workspace state dir at
-//! `<state_dir>/worktrees/<parent-slug>/<branch-slug>`. That tree is
-//! bind-mounted into the dev container **once**, at
-//! [`WORKTREE_CONTAINER_ROOT`], so new worktrees appear inside the
-//! running container without recreating it (docker can't hot-add a
-//! mount). This module is the single source of truth for the
-//! host↔container path mapping every layer needs — the shell
-//! resolver (git + format-on-save routing), the coder's `bash` cwd,
-//! and the create / repair / discard orchestration.
+//! **inside the parent repo** at `<parent>/.worktrees/<branch-slug>`,
+//! with `--relative-paths` git links (git >= 2.48). Because it rides
+//! inside the parent repo's existing bind mount, the same checkout is
+//! reachable inside the dev container at the parent's container mount
+//! plus the same relative tail — no separate mount, no `git worktree
+//! repair`, and host git keeps working when the container is down.
+//! This module maps a worktree's host path to its in-container path.
 //!
 //! See [`specs/coder.md` § Worktree sessions](../../../specs/coder.md).
 
 use camino::{Utf8Path, Utf8PathBuf};
 
-/// In-container mount point for the per-workspace worktrees tree —
-/// re-exported from `moon-protocol` (the single source of truth
-/// shared with `moon-container`'s compose generation). A host
-/// worktree at `<state_dir>/worktrees/<rel>` is visible at
-/// `/workspace/.worktrees/<rel>` inside the container. The leading
-/// dot keeps it clear of real bound folders (which mount at
-/// `/workspace/<name>`).
-pub use moon_protocol::container::WORKTREE_CONTAINER_ROOT;
+/// Directory name, under the parent repo, that holds its worktrees.
+/// Added to the parent's `.git/info/exclude` so it never shows up in
+/// the parent's `git status`.
+pub const WORKTREES_DIR_NAME: &str = ".worktrees";
 
-/// Host-side root holding every worktree for one workspace:
-/// `<state_dir>/worktrees`. `state_dir` is
-/// `<workspaces_dir>/<workspace_id>`.
-pub fn worktrees_host_root(state_dir: &Utf8Path) -> Utf8PathBuf {
-	state_dir.join("worktrees")
-}
-
-/// Map a worktree's absolute **host** path to its in-container path
-/// under [`WORKTREE_CONTAINER_ROOT`]. Returns `None` when `host_path`
-/// isn't under the worktrees root (i.e. it isn't an IDE worktree) —
-/// callers fall back to host execution in that case.
-pub fn worktree_container_path(state_dir: &Utf8Path, host_path: &Utf8Path) -> Option<Utf8PathBuf> {
-	let rel = host_path.strip_prefix(worktrees_host_root(state_dir)).ok()?;
-	if rel.as_str().is_empty() {
-		return Some(Utf8PathBuf::from(WORKTREE_CONTAINER_ROOT));
-	}
-	Some(Utf8Path::new(WORKTREE_CONTAINER_ROOT).join(rel))
+/// Map a worktree's absolute **host** path to its in-container path.
+/// The worktree lives at `<parent>/.worktrees/<rel>`; the parent repo
+/// is bind-mounted at `/workspace/<parent-basename>`, so the worktree
+/// is at `/workspace/<parent-basename>/<tail>` where `<tail>` is the
+/// worktree's path relative to the parent. Returns `None` when
+/// `worktree_host` isn't under `parent_host` (caller falls back to
+/// host execution) or the parent has no basename.
+pub fn worktree_container_path(parent_host: &Utf8Path, worktree_host: &Utf8Path) -> Option<Utf8PathBuf> {
+	let tail = worktree_host.strip_prefix(parent_host).ok()?;
+	let parent_basename = parent_host.file_name()?;
+	Some(Utf8Path::new("/workspace").join(parent_basename).join(tail))
 }
 
 #[cfg(test)]
@@ -49,31 +37,21 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn maps_worktree_host_path_under_root() {
-		let state = Utf8Path::new("/data/moon-ide/workspaces/default");
-		let host = Utf8Path::new("/data/moon-ide/workspaces/default/worktrees/repo-ab12/moon-agent-1");
+	fn maps_worktree_under_parent_mount() {
+		let parent = Utf8Path::new("/home/me/code/moon-landing");
+		let wt = Utf8Path::new("/home/me/code/moon-landing/.worktrees/moon-agent-1");
 		assert_eq!(
-			worktree_container_path(state, host).as_deref().map(Utf8Path::as_str),
-			Some("/workspace/.worktrees/repo-ab12/moon-agent-1")
+			worktree_container_path(parent, wt).as_deref().map(Utf8Path::as_str),
+			Some("/workspace/moon-landing/.worktrees/moon-agent-1")
 		);
 	}
 
 	#[test]
-	fn rejects_paths_outside_the_worktrees_root() {
-		let state = Utf8Path::new("/data/moon-ide/workspaces/default");
+	fn rejects_paths_outside_the_parent() {
+		let parent = Utf8Path::new("/home/me/code/moon-landing");
 		assert_eq!(
-			worktree_container_path(state, Utf8Path::new("/home/me/code/repo")),
+			worktree_container_path(parent, Utf8Path::new("/home/me/code/other/.worktrees/x")),
 			None
-		);
-	}
-
-	#[test]
-	fn maps_the_root_itself() {
-		let state = Utf8Path::new("/data/ws/default");
-		let host = Utf8Path::new("/data/ws/default/worktrees");
-		assert_eq!(
-			worktree_container_path(state, host).as_deref().map(Utf8Path::as_str),
-			Some("/workspace/.worktrees")
 		);
 	}
 }

@@ -105,20 +105,22 @@ export function openContainerTerminal(): void {
 // Mirrors `moon_terminal::TerminalTarget::container_cwd_for_folder`
 // — keep the two in sync.
 //
-// Worktree-backed folders (ADR 0028) are the exception: they live
-// under `<state_dir>/worktrees`, bind-mounted once at
-// `/workspace/.worktrees` (WORKTREE_CONTAINER_ROOT) rather than at
-// `/workspace/<basename>`. Without this a worktree terminal `chdir`s
-// to a path that doesn't exist in the container. Mirrors
+// Worktree-backed folders (ADR 0029) are the exception: they live
+// inside the parent repo at `<parent>/.worktrees/<slug>`, so they
+// ride the parent's bind mount — their container path is the parent's
+// `/workspace/<parent-basename>` mount plus the relative tail, not a
+// mount of their own. Without this a worktree terminal `chdir`s to a
+// path that doesn't exist in the container. Mirrors
 // `moon_core::worktree::worktree_container_path`.
 export function containerCwdFor(absolutePath: string): string {
 	const normalised = absolutePath.replace(/\/+$/, '');
 	const folder = workspace.workspace?.folders.find((f) => f.path === absolutePath || f.path === normalised);
 	if (folder?.origin.kind === 'worktree') {
-		const marker = '/worktrees/';
-		const idx = normalised.indexOf(marker);
-		if (idx >= 0) {
-			return `/workspace/.worktrees/${normalised.slice(idx + marker.length)}`;
+		const parent = folder.origin.parentPath.replace(/\/+$/, '');
+		if (normalised.startsWith(`${parent}/`)) {
+			const tail = normalised.slice(parent.length + 1);
+			const parentBasename = parent.slice(parent.lastIndexOf('/') + 1);
+			return `/workspace/${parentBasename}/${tail}`;
 		}
 	}
 	const basename = normalised.slice(normalised.lastIndexOf('/') + 1);

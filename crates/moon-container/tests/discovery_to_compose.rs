@@ -66,7 +66,6 @@ fn workspace_compose_is_dev_only_with_one_mount_per_folder() {
 		gh_config: None,
 		gh_token: None,
 		moon_edit_socket: None,
-		worktrees_root: None,
 	});
 
 	let yaml = &render.yaml;

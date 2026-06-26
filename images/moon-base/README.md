@@ -90,7 +90,10 @@ the "polyglot toolchain" tradeoff we picked in ADR 0007.
   in — extend with `FROM moon-base` if a team needs them.
 - **Comfort tooling**: `ripgrep` (`rg`), `fzf`, `bat` (the
   Debian `batcat` symlinked back to `bat`), `jq`.
-- **Standard plumbing**: `git`, `curl`, `wget`, `ca-certificates`,
+- **git built from source** (`GIT_VERSION`, >= 2.48) — moon-ide's
+  isolated worktree sessions use `git worktree add --relative-paths`
+  (ADR 0029), which Debian bookworm's 2.39 predates.
+- **Standard plumbing**: `curl`, `wget`, `ca-certificates`,
   `build-essential`, `less`, `sudo`, `unzip`, `xz-utils`,
   `openssh-client` (so `git` over SSH works inside the container
   when moon-ide forwards the host's agent — see

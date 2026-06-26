@@ -104,13 +104,6 @@ pub const COMPOSE_FILE: &str = "compose.yaml";
 /// `run/` segment in `src-tauri`. See [ADR 0026](../../../specs/decisions/0026-socket-dir-mount.md).
 pub const SOCKET_DIR: &str = "run";
 
-/// Subdirectory of the state dir holding worktree-backed coder
-/// session checkouts (ADR 0028). Bind-mounted into the dev
-/// container at `WORKTREE_CONTAINER_ROOT` so isolated sessions are
-/// visible to container git / `bash`. Must match
-/// `moon_core::worktree::worktrees_host_root`'s `worktrees` segment.
-pub const WORKTREES_DIR: &str = "worktrees";
-
 /// Errors the lifecycle layer surfaces to callers.
 ///
 /// We keep `DockerMissing` and `DaemonUnreachable` distinct from
@@ -273,11 +266,9 @@ impl Workspace {
 		let moon_edit = MoonEditSocketMount {
 			host_dir: self.state_dir.join(SOCKET_DIR),
 		};
-		// Worktree-backed coder sessions (ADR 0028 W.4.1) live under
-		// `<state_dir>/worktrees`; mount that tree once so new
-		// isolated sessions appear inside the running container
-		// without a recreate.
-		let worktrees_root = self.state_dir.join(WORKTREES_DIR);
+		// Worktree-backed coder sessions (ADR 0029) live inside each
+		// parent repo at `<parent>/.worktrees/…`, so they ride the
+		// parent's bind mount — no separate worktrees mount here.
 		generate_compose(ComposeRenderOptions {
 			project: &self.project,
 			dev_image,
@@ -288,7 +279,6 @@ impl Workspace {
 			gh_config: gh_config.as_ref(),
 			gh_token: gh_token.as_ref(),
 			moon_edit_socket: Some(&moon_edit),
-			worktrees_root: Some(&worktrees_root),
 		})
 	}
 
@@ -319,10 +309,6 @@ impl Workspace {
 		// would otherwise auto-create a missing bind-mount source
 		// as a root-owned directory we can't bind into (ADR 0026).
 		tokio::fs::create_dir_all(self.state_dir.join(SOCKET_DIR).as_std_path()).await?;
-		// Same reasoning for the worktrees-root bind source: create it
-		// user-owned before `docker compose up` so Docker doesn't
-		// auto-make it root-owned (ADR 0028 W.4.1).
-		tokio::fs::create_dir_all(self.state_dir.join(WORKTREES_DIR).as_std_path()).await?;
 		let render = self.render_compose(dev_image);
 		let bound_json = render_bound_folders_json(&self.bound_folders);
 

@@ -3,11 +3,12 @@
 # moon-base — the workspace dev image for moon-ide.
 #
 # What lives here today: WebKitGTK dev libraries (so a fresh
-# moon-ide checkout is buildable per ADR 0005), rustup with the
-# stable toolchain, bun, the polyglot CLIs we use across most
-# repos in the org (gh, uv, hf) plus comfort tooling (ripgrep,
-# fzf, bat, jq), and a non-root `dev` user with passwordless
-# sudo. The container runs unprivileged with the default Docker
+# moon-ide checkout is buildable per ADR 0005), a recent git built
+# from source (>= 2.48, for relative-path worktrees — ADR 0029),
+# rustup with the stable toolchain, bun, the polyglot CLIs we use
+# across most repos in the org (gh, uv, hf) plus comfort tooling
+# (ripgrep, fzf, bat, jq), and a non-root `dev` user with
+# passwordless sudo. The container runs unprivileged with the default Docker
 # capability set; project services come up as siblings on the
 # host's daemon via compose `include:` rather than nested inside
 # this container (ADR 0008). The multi-arch CI workflow lands
@@ -48,13 +49,39 @@ RUN apt-get update \
         ca-certificates \
         curl \
         wget \
-        git \
         less \
         openssh-client \
         sudo \
         unzip \
         xz-utils \
  && rm -rf /var/lib/apt/lists/*
+
+# git from upstream source. moon-ide's isolated worktree sessions
+# create worktrees with `git worktree add --relative-paths` (ADR
+# 0029), which needs git >= 2.48; Debian bookworm ships 2.39 and even
+# backports / trixie don't reach 2.48. Built into /usr/local (PATH
+# precedence over any system git) before the Go step below, which
+# shells out to git. Pin a version; bumps are intentional, same as
+# the Go / uv / helm pins. NO_TCLTK / NO_GITWEB drop the GUI / web
+# bits we never use; the OpenSSL + curl + expat + zlib dev headers
+# are git's build deps (libssl-dev already came from the webkit pass).
+ARG GIT_VERSION=2.51.0
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        libcurl4-openssl-dev \
+        libexpat1-dev \
+        gettext \
+        zlib1g-dev \
+ && curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused \
+      "https://www.kernel.org/pub/software/scm/git/git-${GIT_VERSION}.tar.xz" \
+      -o /tmp/git.tar.xz \
+ && mkdir -p /tmp/git-src \
+ && tar -C /tmp/git-src --strip-components=1 -xf /tmp/git.tar.xz \
+ && make -C /tmp/git-src -j"$(nproc)" prefix=/usr/local NO_TCLTK=1 NO_GITWEB=1 NO_INSTALL_HARDLINKS=1 all \
+ && make -C /tmp/git-src prefix=/usr/local NO_TCLTK=1 NO_GITWEB=1 NO_INSTALL_HARDLINKS=1 install \
+ && rm -rf /tmp/git.tar.xz /tmp/git-src \
+ && rm -rf /var/lib/apt/lists/* \
+ && git --version
 
 # Pre-seed system-wide known_hosts with the SSH host keys for the
 # git providers we actually use, so the first `git fetch` /

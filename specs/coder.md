@@ -1112,17 +1112,18 @@ worktrees automatically once multiple agents are running concurrently.
 The git primitives (`git_worktree_add` / `_list` / `_remove`)
 serialise behind the per-folder git mutex ([ADR 0015](decisions/0015-git-serialisation.md)).
 In a containerised workspace, isolated sessions run their tooling
-**in the container** so builds use the container toolchain. The whole
-worktrees tree is bind-mounted once at `/workspace/.worktrees` (so
-spinning up an isolated session never recreates the dev container);
-each worktree is created host-side then `git worktree repair`'d inside
-the container to hold the in-container paths, and its git / `bash` /
-format-on-save route container-side like any folder. Repair re-runs on
-container start, so metadata self-heals across restarts. Each worktree
-is `git worktree lock`ed (unlocked before removal) so a stray
-`git gc` / `git worktree prune` can't sever it. A pure-host workspace
-keeps everything host-side; while a container is down the worktree's
-git is unavailable until it comes back up (and repairs).
+**in the container** so builds use the container toolchain. The
+worktree lives **inside the parent repo** at `<parent>/.worktrees/<branch>`
+with `git worktree add --relative-paths` ([ADR 0029](decisions/0029-worktrees-inside-parent.md)),
+so it rides the parent's bind mount and its relative git links resolve
+the same on the host and in the container — no separate mount, no
+`git worktree repair`, and host git keeps working when the container is
+down. `/.worktrees/` is added to the parent's `.git/info/exclude` so it
+never dirties the parent's `git status`. Each worktree is
+`git worktree lock`ed (unlocked before removal). This needs git >= 2.48
+on the host (worktree creation errors with an "update git" message
+otherwise) and in moon-base (built from source); see ADR 0029 for the
+`extensions.relativeWorktrees` repo-config caveat.
 
 ## UI placement
 

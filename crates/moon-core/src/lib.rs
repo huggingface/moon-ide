@@ -27,7 +27,7 @@ pub use host::{read_host_file, write_host_file, LocalHost, WorkspaceHost};
 pub use logs::LogSink;
 pub use shell::{AlwaysHostResolver, ShellResolver, ShellResolverHandle, ShellTarget};
 pub use workspace::{WorkspaceFolderEntry, WorkspaceRegistry};
-pub use worktree::{worktree_container_path, worktrees_host_root, WORKTREE_CONTAINER_ROOT};
+pub use worktree::{worktree_container_path, WORKTREES_DIR_NAME};
 
 pub use moon_protocol as protocol;
 pub use next_edit_server::NextEditServerSupervisor;

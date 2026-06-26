@@ -48,8 +48,7 @@
 
 use std::fmt::Write as _;
 
-use camino::{Utf8Path, Utf8PathBuf};
-use moon_protocol::container::WORKTREE_CONTAINER_ROOT;
+use camino::Utf8PathBuf;
 
 use crate::project::ProjectName;
 
@@ -353,15 +352,6 @@ pub struct ComposeRenderOptions<'a> {
 	/// populates this unconditionally — the `run/` directory is
 	/// guaranteed to exist by the time compose renders.
 	pub moon_edit_socket: Option<&'a MoonEditSocketMount>,
-	/// Host path of the workspace's worktrees tree
-	/// (`<state_dir>/worktrees`), bind-mounted at
-	/// [`WORKTREE_CONTAINER_ROOT`] so worktree-backed coder
-	/// sessions (ADR 0028 W.4.1) are visible to container git /
-	/// `bash`. Mounting the root once — rather than each worktree
-	/// individually — means a new isolated session doesn't have to
-	/// recreate the dev container. `None` skips the mount (e.g. a
-	/// workspace that never uses worktrees, or in tests).
-	pub worktrees_root: Option<&'a Utf8Path>,
 }
 
 /// Wrap `value` in double quotes, escaping `\` and `"` so an
@@ -421,8 +411,7 @@ pub fn generate_compose(options: ComposeRenderOptions<'_>) -> ComposeRender {
 	let has_extra_mount = options.ssh_agent.is_some()
 		|| options.ssh_config.is_some()
 		|| options.gh_config.is_some()
-		|| options.moon_edit_socket.is_some()
-		|| options.worktrees_root.is_some();
+		|| options.moon_edit_socket.is_some();
 	if options.bound_mounts.is_empty() && !has_extra_mount {
 		// Empty list is valid YAML and compose accepts it; this
 		// keeps the structure consistent for the no-folder /
@@ -485,17 +474,6 @@ pub fn generate_compose(options: ComposeRenderOptions<'_>) -> ComposeRender {
 				"      - {host}:{container}",
 				host = edit.host_dir.as_str(),
 				container = MOON_EDIT_SOCKET_DIR_CONTAINER_PATH,
-			);
-		}
-		if let Some(worktrees_root) = options.worktrees_root {
-			// One stable mount for every worktree-backed session
-			// (ADR 0028 W.4.1) so creating one doesn't recreate the
-			// dev container.
-			let _ = writeln!(
-				yaml,
-				"      - {host}:{container}",
-				host = worktrees_root.as_str(),
-				container = WORKTREE_CONTAINER_ROOT,
 			);
 		}
 	}
@@ -568,7 +546,6 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			moon_edit_socket: None,
-			worktrees_root: None,
 		});
 
 		assert!(render.yaml.contains("name: moon-ws-default"));
@@ -605,33 +582,8 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			moon_edit_socket: None,
-			worktrees_root: None,
 		});
 		assert!(render.yaml.contains("    init: true"));
-	}
-
-	#[test]
-	fn worktrees_root_renders_as_a_single_stable_mount() {
-		// ADR 0028 W.4.1: the worktrees tree is bind-mounted once at
-		// `/workspace/.worktrees` so isolated sessions are visible to
-		// container git / bash without recreating the dev container.
-		let project = project();
-		let worktrees = Utf8PathBuf::from("/data/moon-ide/workspaces/default/worktrees");
-		let render = generate_compose(ComposeRenderOptions {
-			project: &project,
-			dev_image: "moon-base:dev",
-			bound_mounts: &[mount("/home/me/code/repo", "repo")],
-			ssh_agent: None,
-			ssh_config: None,
-			git_identity: None,
-			gh_config: None,
-			gh_token: None,
-			moon_edit_socket: None,
-			worktrees_root: Some(&worktrees),
-		});
-		assert!(render
-			.yaml
-			.contains("- /data/moon-ide/workspaces/default/worktrees:/workspace/.worktrees"));
 	}
 
 	#[test]
@@ -651,7 +603,6 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			moon_edit_socket: None,
-			worktrees_root: None,
 		});
 
 		assert!(render
@@ -675,7 +626,6 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			moon_edit_socket: None,
-			worktrees_root: None,
 		};
 		let a = generate_compose(opts.clone());
 		let b = generate_compose(opts);
@@ -696,7 +646,6 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			moon_edit_socket: None,
-			worktrees_root: None,
 		});
 		assert!(render.yaml.contains("image: huggingface/moon-base:0.1"));
 	}
@@ -714,7 +663,6 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			moon_edit_socket: None,
-			worktrees_root: None,
 		});
 		assert!(render.yaml.contains("name: moon-ws-scratch"));
 	}
@@ -735,7 +683,6 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			moon_edit_socket: None,
-			worktrees_root: None,
 		});
 
 		assert!(render
@@ -767,7 +714,6 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			moon_edit_socket: None,
-			worktrees_root: None,
 		});
 
 		assert!(!render.yaml.contains("    volumes:\n      []"));
@@ -796,7 +742,6 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			moon_edit_socket: None,
-			worktrees_root: None,
 		});
 
 		assert!(
@@ -830,7 +775,6 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			moon_edit_socket: None,
-			worktrees_root: None,
 		});
 
 		// One environment block, both keys inside it. Stable order
@@ -860,7 +804,6 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			moon_edit_socket: None,
-			worktrees_root: None,
 		});
 
 		assert!(
@@ -892,7 +835,6 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			moon_edit_socket: None,
-			worktrees_root: None,
 		});
 
 		assert!(!render.yaml.contains("    volumes:\n      []"));
@@ -925,7 +867,6 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			moon_edit_socket: None,
-			worktrees_root: None,
 		});
 
 		assert!(render
@@ -954,7 +895,6 @@ mod tests {
 			gh_config: Some(&gh),
 			gh_token: None,
 			moon_edit_socket: None,
-			worktrees_root: None,
 		});
 
 		assert!(
@@ -980,7 +920,6 @@ mod tests {
 			gh_config: Some(&gh),
 			gh_token: None,
 			moon_edit_socket: None,
-			worktrees_root: None,
 		});
 
 		assert!(!render.yaml.contains("    volumes:\n      []"));
@@ -1007,7 +946,6 @@ mod tests {
 			gh_config: None,
 			gh_token: Some(&token),
 			moon_edit_socket: None,
-			worktrees_root: None,
 		});
 
 		assert!(render.yaml.contains("    environment:"), "got:\n{}", render.yaml);
@@ -1034,7 +972,6 @@ mod tests {
 			gh_config: None,
 			gh_token: Some(&token),
 			moon_edit_socket: None,
-			worktrees_root: None,
 		});
 
 		assert!(
@@ -1061,7 +998,6 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			moon_edit_socket: None,
-			worktrees_root: None,
 		});
 		// Double-quoted scalar with `"` → `\"` and `\` → `\\`.
 		assert!(
@@ -1089,7 +1025,6 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			moon_edit_socket: Some(&edit),
-			worktrees_root: None,
 		});
 		// Read-write (no `:ro` suffix) — Unix-socket connect needs
 		// write permission on the inode. We mount the socket's
@@ -1128,7 +1063,6 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			moon_edit_socket: Some(&edit),
-			worktrees_root: None,
 		});
 		assert!(!render.yaml.contains("volumes:\n      []"));
 		assert!(render.yaml.contains("- /tmp/x/run:/run/moon\n"));

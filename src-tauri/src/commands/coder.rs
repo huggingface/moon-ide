@@ -352,13 +352,6 @@ pub async fn coder_new_worktree_session(
 
 	let parent = state.workspaces.require_active_folder().await?;
 	let parent_path = parent.folder.path.clone();
-	let parent_name = parent.folder.name.clone();
-
-	let workspace_id = state
-		.workspace_id()
-		.ok_or_else(|| MoonError::invalid("no workspace bound (preboot mode)"))?
-		.to_string();
-	let state_dir = state.workspace_state_dir(&workspace_id);
 
 	// The branch is the deliverable. Either mint a fresh
 	// `moon/agent-<id>` off HEAD, or attach to an existing branch the
@@ -377,12 +370,13 @@ pub async fn coder_new_worktree_session(
 	let branch = spec.name().to_string();
 	let branch_slug = branch.replace('/', "-");
 
-	use std::hash::{Hash, Hasher};
-	let mut hasher = std::collections::hash_map::DefaultHasher::new();
-	parent_path.hash(&mut hasher);
-	let parent_slug = format!("{parent_name}-{:08x}", hasher.finish() as u32);
-
-	let worktree_path = state_dir.join("worktrees").join(&parent_slug).join(&branch_slug);
+	// The worktree lives inside the parent repo at
+	// `<parent>/.worktrees/<branch-slug>` (ADR 0029) so it rides the
+	// parent's bind mount and resolves the same on the host and in the
+	// container via `--relative-paths` git links.
+	let worktree_path = camino::Utf8Path::new(&parent_path)
+		.join(moon_core::WORKTREES_DIR_NAME)
+		.join(&branch_slug);
 	if let Some(parent_dir) = worktree_path.parent() {
 		std::fs::create_dir_all(parent_dir.as_std_path()).map_err(MoonError::from)?;
 	}
@@ -403,12 +397,6 @@ pub async fn coder_new_worktree_session(
 		.new_worktree_session(wt_entry.folder.path.clone(), branch)
 		.await
 		.map_err(MoonError::from)?;
-
-	// If the workspace runs in a container, make the worktree usable
-	// by the isolated session's container git / `bash`: ensure the
-	// shared worktrees mount and repair the worktree's git metadata
-	// to the in-container paths (ADR 0028 W.4.1). No-op in host mode.
-	crate::commands::container::repair_worktrees(&state, true).await;
 
 	let workspace = state.workspaces.snapshot().await;
 	Ok(NewWorktreeSession { workspace, session })
@@ -446,15 +434,13 @@ pub async fn coder_discard_worktree(
 		.await
 		.ok_or_else(|| MoonError::invalid("the worktree's parent folder is not bound; can't prune it"))?;
 
-	// `git worktree remove` runs where the worktree's metadata is
-	// valid: container-side (with the `/workspace/.worktrees/…` path)
-	// when the workspace runs in a container, host-side otherwise
-	// (ADR 0028 W.4.1). The parent host's own shell target matches.
+	// `git worktree remove` runs against the parent repo on its active
+	// shell target. The worktree's relative links resolve under either
+	// mount (ADR 0029), so we just pass the path for that target:
+	// the in-container `/workspace/<parent>/.worktrees/…` path when the
+	// workspace runs in a container, the host path otherwise.
 	let remove_path = if crate::commands::container::workspace_container_running(&state).await {
-		state
-			.workspace_id()
-			.map(|id| state.workspace_state_dir(id))
-			.and_then(|state_dir| moon_core::worktree::worktree_container_path(&state_dir, camino::Utf8Path::new(&path)))
+		moon_core::worktree::worktree_container_path(camino::Utf8Path::new(&parent_path), camino::Utf8Path::new(&path))
 			.unwrap_or_else(|| camino::Utf8PathBuf::from(&path))
 	} else {
 		camino::Utf8PathBuf::from(&path)
@@ -497,13 +483,6 @@ pub async fn coder_move_session_to_worktree(state: State<'_, AppState>) -> Resul
 		));
 	}
 	let parent_path = parent.folder.path.clone();
-	let parent_name = parent.folder.name.clone();
-
-	let workspace_id = state
-		.workspace_id()
-		.ok_or_else(|| MoonError::invalid("no workspace bound (preboot mode)"))?
-		.to_string();
-	let state_dir = state.workspace_state_dir(&workspace_id);
 
 	// Decide the branch + whether the main tree resets.
 	let info = parent.host.git_branch().await?;
@@ -529,11 +508,11 @@ pub async fn coder_move_session_to_worktree(state: State<'_, AppState>) -> Resul
 	let branch = spec.name().to_string();
 	let branch_slug = branch.replace('/', "-");
 
-	use std::hash::{Hash, Hasher};
-	let mut hasher = std::collections::hash_map::DefaultHasher::new();
-	parent_path.hash(&mut hasher);
-	let parent_slug = format!("{parent_name}-{:08x}", hasher.finish() as u32);
-	let worktree_path = state_dir.join("worktrees").join(&parent_slug).join(&branch_slug);
+	// `<parent>/.worktrees/<branch-slug>` — inside the parent repo so it
+	// rides the parent's bind mount (ADR 0029).
+	let worktree_path = camino::Utf8Path::new(&parent_path)
+		.join(moon_core::WORKTREES_DIR_NAME)
+		.join(&branch_slug);
 	if let Some(dir) = worktree_path.parent() {
 		std::fs::create_dir_all(dir.as_std_path()).map_err(MoonError::from)?;
 	}
@@ -556,8 +535,6 @@ pub async fn coder_move_session_to_worktree(state: State<'_, AppState>) -> Resul
 		.await
 		.map_err(MoonError::from)?
 		.ok_or_else(|| MoonError::invalid("no visible session to move"))?;
-
-	crate::commands::container::repair_worktrees(&state, true).await;
 
 	let workspace = state.workspaces.snapshot().await;
 	Ok(NewWorktreeSession { workspace, session })

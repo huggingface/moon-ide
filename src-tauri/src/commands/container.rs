@@ -14,7 +14,7 @@
 //! after they finish so any background subscribers stay in
 //! lockstep without polling.
 
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::Utf8PathBuf;
 use moon_container::{
 	apply_forwards, list_forward_status, project_name_for_id, Workspace as ContainerWorkspace, WorkspaceConfig,
 	DEFAULT_DEV_IMAGE,
@@ -132,54 +132,6 @@ pub(crate) async fn workspace_container_running(state: &AppState) -> bool {
 	matches!(container.status().await, Ok(s) if matches!(s.state, ContainerState::Running))
 }
 
-/// Repair every worktree-backed folder's git metadata to the
-/// in-container paths (ADR 0028 W.4.1). A worktree is created
-/// host-side (host-path metadata); this rewrites it to the
-/// `/workspace/.worktrees/…` paths so the isolated session's
-/// container git / `bash` work. Run after the dev container comes up
-/// (setup / resume) and at worktree-create time.
-///
-/// Best-effort + idempotent: in host mode it no-ops (worktrees keep
-/// host metadata, routed host-side); repairing an already-correct
-/// worktree is harmless. `apply_mounts` ensures the shared
-/// worktrees-root mount is present first — needed at create time on
-/// a container that predates the mount; skip it right after a
-/// setup/resume that already rendered the current compose.
-pub(crate) async fn repair_worktrees(state: &AppState, apply_mounts: bool) {
-	let Ok(container) = workspace_handle(state).await else {
-		return;
-	};
-	match container.status().await {
-		Ok(s) if matches!(s.state, ContainerState::Running) => {}
-		_ => return,
-	}
-	if apply_mounts {
-		if let Err(err) = container.apply_bound_folders(DEFAULT_DEV_IMAGE).await {
-			tracing::warn!(%err, "worktree: could not apply container mounts before repair");
-			// Continue: the mount may already be present from an
-			// earlier start, in which case repair still succeeds.
-		}
-	}
-	let Some(id) = state.workspace_id() else {
-		return;
-	};
-	let state_dir = state.workspace_state_dir(id);
-	for entry in state.workspaces.folders().await {
-		let moon_protocol::workspace::FolderOrigin::Worktree { parent_path, .. } = &entry.folder.origin else {
-			continue;
-		};
-		let Some(ctr) = moon_core::worktree::worktree_container_path(&state_dir, Utf8Path::new(&entry.folder.path)) else {
-			continue;
-		};
-		let Some(parent) = state.workspaces.folder_for_path(parent_path).await else {
-			continue;
-		};
-		if let Err(err) = parent.host.git_worktree_repair(&ctr).await {
-			tracing::warn!(%err, worktree = %entry.folder.path, "worktree: container repair failed");
-		}
-	}
-}
-
 /// Pure query — does not emit. The UI polls this on focus and
 /// after long-running operations the user might have invoked
 /// outside the IDE.
@@ -198,11 +150,6 @@ pub async fn container_setup(app: AppHandle, state: State<'_, AppState>) -> Resu
 	reset_lsp_broker(&state).await;
 	let status = snapshot_and_emit(&app, &container).await?;
 	reapply_persisted_forwards(&app, &state, &status).await;
-	// The dev container just came up with the current compose (which
-	// includes the shared worktrees mount), so re-point every
-	// worktree's git metadata at the in-container paths (ADR 0028
-	// W.4.1). No extra apply needed.
-	repair_worktrees(&state, false).await;
 	Ok(status)
 }
 
@@ -220,9 +167,6 @@ pub async fn container_resume(app: AppHandle, state: State<'_, AppState>) -> Res
 	container.resume().await?;
 	reset_lsp_broker(&state).await;
 	let status = snapshot_and_emit(&app, &container).await?;
-	// Resuming restarts the dev container; re-point worktree git
-	// metadata at the in-container paths (ADR 0028 W.4.1).
-	repair_worktrees(&state, false).await;
 	Ok(status)
 }
 

@@ -446,26 +446,13 @@ pub trait WorkspaceHost: Send + Sync {
 	/// The branch is never deleted here; pruning a worktree leaves
 	/// its branch in place as the deliverable.
 	///
-	/// `path` is given **as the active shell target sees it**: a
-	/// host path in host mode, the in-container `/workspace/.worktrees/…`
-	/// path when the workspace runs in a container (where the
-	/// worktree's metadata holds container paths after
-	/// [`git_worktree_repair`]). The caller — which knows the
-	/// container state and the mapping — passes the right one.
+	/// `path` is given **as the active shell target sees it**: a host
+	/// path in host mode, the in-container
+	/// `/workspace/<parent>/.worktrees/…` path when the workspace runs
+	/// in a container. The worktree's relative git links resolve under
+	/// either mount (ADR 0029), so the caller just passes the path for
+	/// the active target.
 	async fn git_worktree_remove(&self, path: &Utf8Path, force: bool) -> MoonResult<()>;
-
-	/// `git worktree repair <worktree_container_path>` against this
-	/// (parent) repo, run in the container. Rewrites the worktree's
-	/// gitdir pointers to the in-container paths so container-side
-	/// git works on a worktree that was created host-side (ADR 0028
-	/// W.4.1). `worktree_container_path` is the worktree's
-	/// `/workspace/.worktrees/…` path. Best-effort and idempotent:
-	/// repairing an already-correct worktree is a no-op, so callers
-	/// fire it after create and on container start without tracking
-	/// state. No-op-equivalent in host mode (the routing keeps git
-	/// host-side there, where the host-path metadata is already
-	/// correct).
-	async fn git_worktree_repair(&self, worktree_container_path: &Utf8Path) -> MoonResult<()>;
 
 	/// Lightweight diff summary of the working tree against `HEAD`,
 	/// suitable for feeding to a small LLM that's suggesting a
@@ -1896,11 +1883,11 @@ impl WorkspaceHost for LocalHost {
 		let path = path.to_owned();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
-			// Always host (ADR 0028 W.4): worktrees live under the
-			// per-workspace state dir, outside every container bind
-			// mount, so only host git can reach them. Container-valid
-			// metadata is produced afterwards by `git_worktree_repair`
-			// (W.4.1).
+			// Always host (ADR 0029): the worktree is created inside
+			// the parent repo (`<parent>/.worktrees/…`) with
+			// `--relative-paths` links, so the same checkout resolves
+			// host-side and inside the container via the parent's bind
+			// mount. No container-side repair needed.
 			run_git_worktree_add(&root, &path, &branch, &ShellTarget::Host)
 		})
 		.await
@@ -1951,19 +1938,6 @@ impl WorkspaceHost for LocalHost {
 		})
 		.await
 		.map_err(|e| MoonError::Internal(format!("git_worktree_remove join error: {e}")))?
-	}
-
-	async fn git_worktree_repair(&self, worktree_container_path: &Utf8Path) -> MoonResult<()> {
-		let guard = self.git_lock().await;
-		let target = self.shell_target().await;
-		let root = self.root.clone();
-		let wt = worktree_container_path.to_owned();
-		tokio::task::spawn_blocking(move || {
-			let _guard = guard;
-			run_git_worktree_repair(&root, &wt, &target)
-		})
-		.await
-		.map_err(|e| MoonError::Internal(format!("git_worktree_repair join error: {e}")))?
 	}
 
 	async fn git_diff_summary(&self) -> MoonResult<String> {
@@ -2852,13 +2826,20 @@ fn run_git_worktree_add(
 		}
 	}
 
+	// Worktrees live *inside* the parent repo (`<parent>/.worktrees/…`)
+	// with `--relative-paths` links, so they resolve identically on the
+	// host and inside the dev container (the parent's bind mount carries
+	// the worktree along). That flag needs git >= 2.48; fail clearly so
+	// the user updates git rather than getting a cryptic worktree error.
+	require_relative_worktree_git(target, root)?;
+
 	let path_arg = worktree_path_arg(target, path);
-	// `New(name)`  -> `git worktree add -b <name> <path>`  (fresh branch off HEAD)
-	// `Existing(n)` -> `git worktree add <path> <n>`        (check out existing;
+	// `New(name)`  -> `git worktree add --relative-paths -b <name> <path>`  (fresh branch off HEAD)
+	// `Existing(n)` -> `git worktree add --relative-paths <path> <n>`        (check out existing;
 	//                  DWIM-creates a local tracking branch from a remote of
 	//                  the same name when no local branch exists, like `git switch`)
 	let mut cmd = git_command(target, root);
-	cmd.args(["worktree", "add"]);
+	cmd.args(["worktree", "add", "--relative-paths"]);
 	match branch {
 		WorktreeBranch::New(name) => {
 			cmd.args(["-b", name, &path_arg]);
@@ -2880,16 +2861,20 @@ fn run_git_worktree_add(
 		)));
 	}
 
-	// Lock the worktree so a `git worktree prune` can't sever it.
-	// This matters specifically for the containerised-workspace case
-	// (ADR 0028 W.4): the worktree lives on the host outside every
-	// bind mount, so the *in-container* parent repo sees its gitdir
-	// path as non-existent and flags it `prunable` — a container-side
-	// `git gc` / `git worktree prune` on the parent would then drop
-	// the worktree's admin entry and break it. Locking makes prune
-	// skip it. The discard path unlocks before removing
-	// (`run_git_worktree_remove`). Best-effort: a lock failure leaves
-	// a working (if unprotected) worktree rather than failing create.
+	// Keep `<parent>/.worktrees/` out of the parent repo's `git
+	// status`: the worktree lives inside the parent now (ADR 0029), so
+	// without this its directory shows up as untracked. Best-effort —
+	// a clean status is cosmetic, not worth failing a created worktree.
+	if let Err(err) = exclude_worktrees_dir(root, target) {
+		tracing::warn!(%err, repo = %root, "could not add .worktrees to the parent repo's git exclude");
+	}
+
+	// Lock the worktree to mark it IDE-managed (WORKTREE_LOCK_REASON)
+	// and keep `git worktree prune` from severing it if its checkout
+	// is ever temporarily absent. The discard path unlocks before
+	// removing (`run_git_worktree_remove`). Best-effort: a lock
+	// failure leaves a working (if unprotected) worktree rather than
+	// failing create.
 	let locked = git_command(target, root)
 		.args(["worktree", "lock", "--reason", WORKTREE_LOCK_REASON])
 		.arg(&path_arg)
@@ -2921,6 +2906,47 @@ fn run_git_worktree_add(
 	})
 }
 
+/// Append `/.worktrees/` to the parent repo's `info/exclude`
+/// (idempotently) so the in-repo worktrees directory (ADR 0029) never
+/// shows up as untracked in the parent's `git status`. Resolves the
+/// real git dir via `rev-parse --git-common-dir` so it's correct even
+/// when `.git` is a file (submodule / linked worktree parent).
+fn exclude_worktrees_dir(root: &Utf8Path, target: &ShellTarget) -> MoonResult<()> {
+	let line = format!("/{}/", crate::WORKTREES_DIR_NAME);
+	let out = git_command(target, root)
+		.args(["rev-parse", "--git-common-dir"])
+		.output()
+		.map_err(|e| MoonError::IoError(format!("git rev-parse --git-common-dir failed to launch: {e}")))?;
+	if !out.status.success() {
+		return Err(MoonError::IoError("git rev-parse --git-common-dir failed".to_string()));
+	}
+	let common = String::from_utf8_lossy(&out.stdout).trim().to_string();
+	let common_dir = {
+		let p = Utf8Path::new(&common);
+		if p.is_absolute() {
+			p.to_owned()
+		} else {
+			root.join(p)
+		}
+	};
+	let exclude = common_dir.join("info").join("exclude");
+	let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+	if existing.lines().any(|l| l.trim() == line) {
+		return Ok(());
+	}
+	if let Some(dir) = exclude.parent() {
+		std::fs::create_dir_all(dir).map_err(MoonError::from)?;
+	}
+	let mut content = existing;
+	if !content.is_empty() && !content.ends_with('\n') {
+		content.push('\n');
+	}
+	content.push_str(&line);
+	content.push('\n');
+	std::fs::write(&exclude, content).map_err(MoonError::from)?;
+	Ok(())
+}
+
 /// Create a worktree, optionally resetting the main tree first (ADR
 /// 0028 — "move this session into a worktree"). With `reset_main_to =
 /// Some(default)`: requires a clean tree, switches the main checkout
@@ -2935,6 +2961,9 @@ fn run_git_worktree_add_moving(
 	reset_main_to: Option<&str>,
 	target: &ShellTarget,
 ) -> MoonResult<GitWorktree> {
+	// Fail fast on old git before touching the main tree (the reset
+	// below would otherwise switch then roll back for nothing).
+	require_relative_worktree_git(target, root)?;
 	if let Some(default) = reset_main_to {
 		// `git status --porcelain` lists tracked changes *and*
 		// untracked files; either would be left behind by the move (the
@@ -2971,6 +3000,49 @@ fn run_git_worktree_add_moving(
 			}
 			Err(err)
 		}
+	}
+}
+
+/// Lowest git that supports `git worktree add --relative-paths`
+/// (git 2.48, Jan 2025). Isolated worktree sessions require it:
+/// relative links resolve both on the host *and* inside the dev
+/// container, where the same worktree is reachable via the parent
+/// repo's bind mount at a different absolute path (ADR 0029).
+const MIN_GIT_FOR_RELATIVE_WORKTREES: (u32, u32) = (2, 48);
+
+/// Parse `(major, minor)` from `git version`, e.g. `git version
+/// 2.48.1` → `(2, 48)`. `None` if git can't run or the output is
+/// unparseable.
+fn git_major_minor(target: &ShellTarget, root: &Utf8Path) -> Option<(u32, u32)> {
+	let out = git_command(target, root).arg("version").output().ok()?;
+	if !out.status.success() {
+		return None;
+	}
+	let text = String::from_utf8_lossy(&out.stdout);
+	// "git version 2.48.1" (Apple git appends " (Apple Git-…)").
+	let version = text.split_whitespace().nth(2)?;
+	let mut parts = version.split('.');
+	let major = parts.next()?.parse().ok()?;
+	let minor = parts.next()?.parse().ok()?;
+	Some((major, minor))
+}
+
+/// Error unless git is new enough for relative worktree links. Keeps
+/// the message actionable so the user updates git rather than hitting
+/// a downstream "unknown option `--relative-paths`" failure.
+fn require_relative_worktree_git(target: &ShellTarget, root: &Utf8Path) -> MoonResult<()> {
+	let (want_major, want_minor) = MIN_GIT_FOR_RELATIVE_WORKTREES;
+	match git_major_minor(target, root) {
+		Some(v) if v >= MIN_GIT_FOR_RELATIVE_WORKTREES => Ok(()),
+		Some((major, minor)) => Err(MoonError::invalid(format!(
+			"Isolated worktree sessions need git {want_major}.{want_minor} or newer (for relative \
+			 worktree links that work both on the host and inside the dev container). Your git is \
+			 {major}.{minor} — please update git and try again."
+		))),
+		None => Err(MoonError::invalid(format!(
+			"Could not determine your git version; isolated worktree sessions need git \
+			 {want_major}.{want_minor} or newer."
+		))),
 	}
 }
 
@@ -3072,33 +3144,6 @@ fn run_git_worktree_remove(root: &Utf8Path, path: &Utf8Path, force: bool, target
 		let combined = if stderr.is_empty() { stdout } else { stderr };
 		return Err(MoonError::IoError(format!(
 			"git worktree remove exited {}: {combined}",
-			out.status.code().unwrap_or(-1)
-		)));
-	}
-	Ok(())
-}
-
-/// `git worktree repair <worktree_container_path>` against the parent
-/// repo. Run container-side (the caller's `target`), it rewrites the
-/// worktree's gitdir pointers to the in-container paths so a worktree
-/// created host-side becomes usable by container git. See the
-/// [`WorkspaceHost::git_worktree_repair`] trait doc. `git worktree
-/// repair` prints what it fixed to stderr but exits 0 on success, so
-/// we key off the status, not the output.
-fn run_git_worktree_repair(
-	root: &Utf8Path,
-	worktree_container_path: &Utf8Path,
-	target: &ShellTarget,
-) -> MoonResult<()> {
-	let out = git_command(target, root)
-		.args(["worktree", "repair"])
-		.arg(worktree_container_path.as_str())
-		.output()
-		.map_err(|e| MoonError::IoError(format!("git worktree repair failed to launch: {e}")))?;
-	if !out.status.success() {
-		let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-		return Err(MoonError::IoError(format!(
-			"git worktree repair exited {}: {stderr}",
 			out.status.code().unwrap_or(-1)
 		)));
 	}
@@ -6867,6 +6912,10 @@ mod tests {
 			eprintln!("git not on PATH — skipping worktree round-trip test");
 			return;
 		};
+		if !relative_worktrees_supported() {
+			eprintln!("git < 2.48 (no relative worktrees) — skipping worktree round-trip test");
+			return;
+		}
 		let dir = TempDir::new().unwrap();
 		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
 		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
@@ -6875,10 +6924,10 @@ mod tests {
 		run_git(&git, dir.path(), &["add", "."]);
 		run_git(&git, dir.path(), &["commit", "-q", "-m", "initial"]);
 
-		// The worktree lives outside the repo (ADR 0028 places them in
-		// the per-workspace state dir), so use a separate temp parent.
-		let wt_parent = TempDir::new().unwrap();
-		let wt_path = Utf8PathBuf::from_path_buf(wt_parent.path().join("agent-wt")).unwrap();
+		// The worktree lives *inside* the parent repo (ADR 0029:
+		// `<parent>/.worktrees/<slug>`) so it rides the parent's bind
+		// mount and resolves the same on host and container.
+		let wt_path = Utf8PathBuf::from_path_buf(dir.path().join(".worktrees").join("agent-wt")).unwrap();
 
 		let created = host(&dir)
 			.git_worktree_add(&wt_path, WorktreeBranch::New("moon/agent-1".into()))
@@ -6887,10 +6936,30 @@ mod tests {
 		assert_eq!(created.branch.as_deref(), Some("moon/agent-1"));
 		assert!(!created.is_main);
 		assert!(!created.head.is_empty());
-		// Locked at creation so a `git worktree prune` can't sever it
-		// (ADR 0028 W.4 — matters for the containerised case).
+		// Locked at creation so a `git worktree prune` can't sever it.
 		assert!(created.is_locked, "fresh worktree should be locked");
 		assert!(wt_path.join("README.md").exists(), "worktree was checked out");
+
+		// Links are relative (`--relative-paths`) so they resolve under
+		// either mount — the whole point of ADR 0029.
+		let dot_git = std::fs::read_to_string(wt_path.join(".git")).unwrap();
+		let link = dot_git
+			.trim()
+			.strip_prefix("gitdir:")
+			.expect("a gitdir link")
+			.trim()
+			.to_string();
+		assert!(
+			link.starts_with('.'),
+			"worktree .git link should be relative, got {link:?}"
+		);
+
+		// `.worktrees/` is excluded so it never dirties the parent status.
+		let exclude = std::fs::read_to_string(dir.path().join(".git").join("info").join("exclude")).unwrap();
+		assert!(
+			exclude.lines().any(|l| l.trim() == "/.worktrees/"),
+			"parent info/exclude should hide .worktrees, got {exclude:?}"
+		);
 
 		let list = host(&dir).git_worktree_list().await.unwrap();
 		assert_eq!(list.len(), 2, "main tree plus the one we added");
@@ -6914,6 +6983,10 @@ mod tests {
 			eprintln!("git not on PATH — skipping worktree existing-branch test");
 			return;
 		};
+		if !relative_worktrees_supported() {
+			eprintln!("git < 2.48 (no relative worktrees) — skipping worktree existing-branch test");
+			return;
+		}
 		let dir = TempDir::new().unwrap();
 		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
 		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
@@ -6951,6 +7024,10 @@ mod tests {
 			eprintln!("git not on PATH — skipping worktree move test");
 			return;
 		};
+		if !relative_worktrees_supported() {
+			eprintln!("git < 2.48 (no relative worktrees) — skipping worktree move test");
+			return;
+		}
 		let dir = TempDir::new().unwrap();
 		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
 		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
@@ -7706,6 +7783,12 @@ mod tests {
 			.ok()
 			.filter(|o| o.status.success())
 			.map(|_| std::path::PathBuf::from("git"))
+	}
+
+	/// Worktree-add version-gates on git >= 2.48 (relative links), so
+	/// the real-`git worktree add` tests skip on older git.
+	fn relative_worktrees_supported() -> bool {
+		git_major_minor(&ShellTarget::Host, Utf8Path::new(".")).is_some_and(|v| v >= MIN_GIT_FOR_RELATIVE_WORKTREES)
 	}
 
 	fn run_git(git: &std::path::Path, cwd: &std::path::Path, args: &[&str]) {
