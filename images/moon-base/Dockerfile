@@ -3,12 +3,12 @@
 # moon-base — the workspace dev image for moon-ide.
 #
 # What lives here today: WebKitGTK dev libraries (so a fresh
-# moon-ide checkout is buildable per ADR 0005), a recent git built
-# from source (>= 2.48, for relative-path worktrees — ADR 0029),
-# rustup with the stable toolchain, bun, the polyglot CLIs we use
-# across most repos in the org (gh, uv, hf) plus comfort tooling
-# (ripgrep, fzf, bat, jq), and a non-root `dev` user with
-# passwordless sudo. The container runs unprivileged with the default Docker
+# moon-ide checkout is buildable per ADR 0005), a recent git (>= 2.48,
+# prebuilt from the git-core PPA — for relative-path worktrees, ADR
+# 0029), rustup with the stable toolchain, bun, the polyglot CLIs we
+# use across most repos in the org (gh, uv, hf) plus comfort tooling
+# (ripgrep, fzf, bat, jq), and a non-root `dev` user with passwordless
+# sudo. The container runs unprivileged with the default Docker
 # capability set; project services come up as siblings on the
 # host's daemon via compose `include:` rather than nested inside
 # this container (ADR 0008). The multi-arch CI workflow lands
@@ -53,33 +53,39 @@ RUN apt-get update \
         openssh-client \
         sudo \
         unzip \
-        xz-utils \
  && rm -rf /var/lib/apt/lists/*
 
-# git from upstream source. moon-ide's isolated worktree sessions
-# create worktrees with `git worktree add --relative-paths` (ADR
-# 0029), which needs git >= 2.48; Debian bookworm ships 2.39 and even
-# backports / trixie don't reach 2.48. Built into /usr/local (PATH
-# precedence over any system git) before the Go step below, which
-# shells out to git. Pin a version; bumps are intentional, same as
-# the Go / uv / helm pins. NO_TCLTK / NO_GITWEB drop the GUI / web
-# bits we never use; the OpenSSL + curl + expat + zlib dev headers
-# are git's build deps (libssl-dev already came from the webkit pass).
-ARG GIT_VERSION=2.51.0
+# git from the git-core PPA's prebuilt .deb (the same source the host
+# machine uses). moon-ide's isolated worktree sessions create
+# worktrees with `git worktree add --relative-paths` (ADR 0029),
+# which needs git >= 2.48; Debian bookworm ships 2.39 and even
+# backports / trixie don't reach 2.48. The PPA is Ubuntu-only, but
+# its jammy (22.04) build links against glibc >= 2.34 — bookworm's
+# 2.36 satisfies that, and all the shared-lib deps (perl, libpcre2,
+# libcurl3-gnutls, libexpat1, zlib) are satisfiable from bookworm's
+# own repos. We download the .deb, extract it into /usr/local (PATH
+# precedence over any system git), and install the runtime libs it
+# needs. Arm64 is served by the same PPA distro path. Pin the version;
+# bumps are intentional, same as the Go / uv / helm pins.
+ARG GIT_VERSION=2.54.0
+ARG GIT_PPA_BUILD=0ppa1~ubuntu22.04.1
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-        libcurl4-openssl-dev \
-        libexpat1-dev \
-        gettext \
-        zlib1g-dev \
+        dpkg-dev \
+        libcurl3-gnutls \
+        liberror-perl \
+        libexpat1 \
+        libpcre2-8-0 \
+        perl \
  && curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused \
-      "https://www.kernel.org/pub/software/scm/git/git-${GIT_VERSION}.tar.xz" \
-      -o /tmp/git.tar.xz \
- && mkdir -p /tmp/git-src \
- && tar -C /tmp/git-src --strip-components=1 -xf /tmp/git.tar.xz \
- && make -C /tmp/git-src -j"$(nproc)" prefix=/usr/local NO_TCLTK=1 NO_GITWEB=1 NO_INSTALL_HARDLINKS=1 all \
- && make -C /tmp/git-src prefix=/usr/local NO_TCLTK=1 NO_GITWEB=1 NO_INSTALL_HARDLINKS=1 install \
- && rm -rf /tmp/git.tar.xz /tmp/git-src \
+      "https://ppa.launchpadcontent.net/git-core/ppa/ubuntu/pool/main/g/git/git_${GIT_VERSION}-${GIT_PPA_BUILD}_$(dpkg --print-architecture).deb" \
+      -o /tmp/git.deb \
+ && mkdir -p /tmp/git-deb \
+ && dpkg-deb -x /tmp/git.deb /tmp/git-deb \
+ && cp -a /tmp/git-deb/usr/bin/git /usr/local/bin/git \
+ && cp -a /tmp/git-deb/usr/lib/git-core /usr/local/lib/git-core \
+ && cp -a /tmp/git-deb/usr/share/git-core /usr/local/share/git-core \
+ && rm -rf /tmp/git.deb /tmp/git-deb \
  && rm -rf /var/lib/apt/lists/* \
  && git --version
 

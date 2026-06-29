@@ -57,7 +57,8 @@ worktree::worktree_container_path`).
 `--relative-paths` needs git >= 2.48 (Jan 2025). The host git is
 version-gated: worktree creation errors with an actionable "update git"
 message on anything older, rather than failing downstream. moon-base
-builds git from source (>= 2.48) for the same reason — see below.
+installs a prebuilt git from the git-core PPA (>= 2.48) for the same
+reason — see below.
 
 ## Consequences
 
@@ -79,8 +80,10 @@ relativeWorktrees` (+ `core.repositoryformatversion = 1`) in the
     cloned/pushed — so teammates and CI cloning fresh are unaffected.
     The blast radius is the one machine that created the worktree.
   - On that machine, **both** host git and the container's git must be
-    > = 2.48. The host is version-gated; moon-base builds git from
-    > source. Any _other_ tool that touches the same local repo with an
+    > = 2.48. The host is version-gated; moon-base installs a
+    > prebuilt git from the git-core PPA (its jammy build links
+    > against glibc >= 2.34, which bookworm's 2.36 satisfies). Any
+    > _other_ tool that touches the same local repo with an
     > older git would also need updating.
   - The extension **persists after `git worktree remove`** — trying one
     worktree session tags the local repo for git >= 2.48 going forward.
@@ -134,5 +137,4 @@ relativeWorktrees` (+ `core.repositoryformatversion = 1`) in the
 - [ADR 0028 — worktree-backed coder sessions](0028-coder-worktree-sessions.md) —
   the feature this refines; everything outside container path-handling
   still applies.
-- [ADR 0007 — compose & moon-base](0007-compose-and-moon-base.md) — the
-  dev image that now builds git from source.
+- [ADR 0007 — compose & moon-base](0007-compose-and-moon-base.md) — the dev image that now installs a prebuilt git from the git-core PPA.

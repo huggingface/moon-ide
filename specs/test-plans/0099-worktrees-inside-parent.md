@@ -19,7 +19,8 @@ live on disk and in the dev container, per
 - `/.worktrees/` is added to the parent's `.git/info/exclude` so it
   never dirties the parent's `git status`.
 - Worktree creation version-gates on **git >= 2.48** (host) with an
-  actionable error; **moon-base builds git from source** so the
+  actionable error; **moon-base installs a prebuilt git** from the
+  git-core PPA (jammy build, compatible with bookworm's glibc) so the
   container git understands the `extensions.relativeWorktrees` repo
   config that `--relative-paths` sets.
 
