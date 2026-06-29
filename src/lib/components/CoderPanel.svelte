@@ -2241,6 +2241,15 @@
 				onpaste={onComposerPaste}
 				onblur={onComposerBlur}
 			></textarea>
+			{#if coder.busy && (coder.draft.trim().length > 0 || coder.attachments.length > 0)}
+				<!-- Interrupt: cancel the running turn and start a fresh
+				     one with the composed message. Shown only while a
+				     turn is running AND the composer has content — the
+				     "don't wait for this thinking to finish, go now" button. -->
+				<button type="button" class="interrupt" title="Interrupt and send now" onclick={() => coder.interrupt()}
+					>go now</button
+				>
+			{/if}
 		</div>
 	{:else if coder.view === 'subagent'}
 		<!-- Sub-agent pop-out: full transcript of one sub-agent, with
@@ -2925,6 +2934,19 @@
 	}
 	.stop:hover {
 		background: color-mix(in srgb, var(--m-warning, #d4a017) 14%, transparent);
+	}
+	.interrupt {
+		position: absolute;
+		right: 12px;
+		bottom: 12px;
+		font: inherit;
+		font-size: 11px;
+		font-weight: 600;
+		color: var(--m-accent, #4d9);
+
+		&:hover {
+			color: var(--m-accent);
+		}
 	}
 	.icon {
 		background: transparent;

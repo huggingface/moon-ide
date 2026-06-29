@@ -2289,6 +2289,16 @@ impl CoderHandle {
 				)
 				.await;
 				flush_format_queue(&state, &format_queue).await;
+				// An `interrupt_and_send` trips the cancel token AND
+				// pushes a steer. That steer must be drained into a
+				// fresh `run_turn`, not treated as a final abort:
+				// backfill orphans for the aborted turn, then loop
+				// back so the drained steer starts a new turn. Keep
+				// `cancel` set so a concurrent `send` keeps queueing.
+				if matches!(result, Err(CoderError::Aborted)) && !rt_for_turn.session.lock().await.pending_steers.is_empty() {
+					recover_in_memory_orphans(&rt_for_turn, &sink_for_turn).await;
+					continue;
+				}
 				if !matches!(result, Ok(())) {
 					rt_for_turn.turn.lock().await.cancel = None;
 					break result;
@@ -2369,6 +2379,73 @@ impl CoderHandle {
 		if let Some(token) = turn.cancel.as_ref() {
 			token.cancel();
 		}
+	}
+
+	/// Interrupt the running turn and start a fresh one with the
+	/// given message — the \"I don't want to wait for this
+	/// thinking to finish, here's what I actually want\" action.
+	/// Cancels the current turn (like [`abort`]) but **also**
+	/// queues `text` as a steer. The spawn loop's `Err(Aborted)`
+	/// branch detects the pending steer, recovers orphaned
+	/// tool-call results, and loops back into `run_turn` — which
+	/// drains the steer into chat history and runs a fresh LLM
+	/// round-trip on the new message. The UI sees an
+	/// uninterrupted `busy` stretch: no `Aborted` flash, just the
+	/// old thinking fading into the new turn.
+	///
+	/// If no turn is running, this is equivalent to [`send`].
+	/// If the active route can't authenticate, returns
+	/// [`CoderError::NotSignedIn`] (same gate as `send`).
+	pub async fn interrupt_and_send(&self, text: String, images: Vec<ImageAttachment>) -> Result<(), CoderError> {
+		// Auth gate — same as `send`.
+		let route = self.state.models.read().await.resolve_route();
+		match &route {
+			ResolvedProvider::HuggingFace => {
+				if !self.state.auth.has_valid_session().await {
+					return Err(CoderError::NotSignedIn);
+				}
+			}
+			ResolvedProvider::Custom { id, base_url }
+			| ResolvedProvider::OpenRouter { id, base_url }
+			| ResolvedProvider::Anthropic { id, base_url } => {
+				if !self.state.provider_keys.has_key(id) && !is_local_base_url(base_url) {
+					return Err(CoderError::NotSignedIn);
+				}
+			}
+		}
+		let (rt, session_id, folder_path) = self.state.active_visible_runtime().await?;
+		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), session_id.clone());
+		let steer_id = new_message_id();
+		{
+			let mut session = rt.session.lock().await;
+			session.pending_steers.push(PendingSteer {
+				id: steer_id.clone(),
+				text: text.clone(),
+				images: images.clone(),
+			});
+			session.header.updated_at_ms = current_time_ms();
+		}
+		// Skip any parked `ask_user` prompt so the tool returns
+		// and the turn reaches the cancellation point (the
+		// iteration boundary's `select!`).
+		if rt.prompts.has_pending().await {
+			rt.prompts.skip_any().await;
+		}
+		sink.send(CoderEvent::UserMessage {
+			id: steer_id,
+			text,
+			images,
+			queued: false,
+			created_at_ms: Some(current_time_ms()),
+		});
+		// Trip the cancel token: the running `run_turn` returns
+		// `Err(Aborted)`, the spawn loop sees the pending steer,
+		// recovers orphans, and loops back to drain it.
+		let turn = rt.turn.lock().await;
+		if let Some(token) = turn.cancel.as_ref() {
+			token.cancel();
+		}
+		Ok(())
 	}
 
 	/// Pop a queued steer by id from the active folder's session.
@@ -3731,6 +3808,22 @@ async fn compose_system_prompt(
 				out.push('\n');
 			}
 		}
+		// Personal coder instructions (gitignored, per-dev). Lives at
+		// `<active>/.moon/AGENTS.md` — not the repo's committed `AGENTS.md`,
+		// but a private addendum for overrides like "ignore TS crashes in
+		// dev". Same shape, separate section so the model treats it as a
+		// distinct layer (personal > team > base).
+		if let Some(personal) = read_personal_instructions(Utf8Path::new(active)).await {
+			out.push('\n');
+			out.push_str("## Personal coder instructions\n\n");
+			out.push_str(
+				"Verbatim contents of `.moon/AGENTS.md` from the active folder — your personal, gitignored overrides. These are authoritative for this dev's workflow and override both the project rules above and the base prompt when the three disagree.\n\n",
+			);
+			out.push_str(&personal);
+			if !out.ends_with('\n') {
+				out.push('\n');
+			}
+		}
 	}
 
 	if folders.is_empty() {
@@ -3865,6 +3958,33 @@ async fn read_agent_rules(folder_root: &Utf8Path) -> Option<String> {
 		return Some(text);
 	}
 	None
+}
+
+/// Read `.moon/AGENTS.md` from `folder_root` — a gitignored,
+/// per-developer addendum to the repo's committed `AGENTS.md`. Lets
+/// a dev encode personal coder overrides ("ignore TS crashes in dev",
+/// "always use `just` not `cargo`") without polluting the team's
+/// committed rules. Same byte-cap / truncation as [`read_agent_rules`].
+async fn read_personal_instructions(folder_root: &Utf8Path) -> Option<String> {
+	let path = folder_root.join(".moon").join("AGENTS.md");
+	let bytes = tokio::fs::read(path.as_std_path()).await.ok()?;
+	let truncated = bytes.len() > AGENT_RULES_MAX_BYTES;
+	let slice = if truncated {
+		&bytes[..AGENT_RULES_MAX_BYTES]
+	} else {
+		&bytes[..]
+	};
+	let mut text = String::from_utf8_lossy(slice).into_owned();
+	if text.trim().is_empty() {
+		return None;
+	}
+	if truncated {
+		if !text.ends_with('\n') {
+			text.push('\n');
+		}
+		text.push_str("\n... (truncated)\n");
+	}
+	Some(text)
 }
 
 /// Drain `pending_steers` into `session.messages` and persist

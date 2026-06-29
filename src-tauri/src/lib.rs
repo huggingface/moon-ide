@@ -233,6 +233,7 @@ pub fn run() {
 			commands::coder::coder_suggest_commit_message,
 			commands::coder::coder_suggest_terminal_command,
 			commands::coder::coder_abort,
+			commands::coder::coder_interrupt,
 			commands::coder::coder_unqueue_steer,
 			commands::coder::coder_respond_to_prompt,
 			commands::coder::coder_revert_to_message,
