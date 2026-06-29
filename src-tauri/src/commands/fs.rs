@@ -191,6 +191,15 @@ pub async fn fs_git_status_entries(
 	entry.host.git_status_entries(&paths).await
 }
 
+/// Resolve the active folder's `.git/info/exclude` path so the
+/// command palette can open it. Returns `None` when the folder isn't
+/// a git repo.
+#[tauri::command]
+pub async fn fs_git_exclude_path(state: State<'_, AppState>) -> Result<Option<String>, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.git_exclude_path().await
+}
+
 /// Aggregate added / modified / deleted counts for a single bound
 /// folder — feeds the per-folder badges on the project bar so the
 /// user can see at a glance which folders have working-tree

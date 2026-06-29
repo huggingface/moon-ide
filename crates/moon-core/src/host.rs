@@ -344,6 +344,13 @@ pub trait WorkspaceHost: Send + Sync {
 	/// non-git workspaces still render cleanly.
 	async fn git_branch(&self) -> MoonResult<GitBranchInfo>;
 
+	/// Absolute host path to the repo's `.git/info/exclude` —
+	/// resolved via `git rev-parse --git-common-dir`. Returns `None`
+	/// when the folder isn't a git repo (no `.git` dir). The command
+	/// palette uses this to open the exclude file for the active
+	/// folder.
+	async fn git_exclude_path(&self) -> MoonResult<Option<String>>;
+
 	/// Local branch names only (`git for-each-ref refs/heads`),
 	/// newest committer-date first and capped, with no `gh` /
 	/// network round-trip. Cheaper than [`Self::branch_list`] —
@@ -1845,6 +1852,18 @@ impl WorkspaceHost for LocalHost {
 		.map_err(|e| MoonError::Internal(format!("git_branch join error: {e}")))?
 	}
 
+	async fn git_exclude_path(&self) -> MoonResult<Option<String>> {
+		let guard = self.git_lock().await;
+		let root = self.root.clone();
+		let target = self.shell_target().await;
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			Ok(git_exclude_path(&root, &target).map(|p| p.to_string()))
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_exclude_path join error: {e}")))?
+	}
+
 	async fn git_local_branches(&self) -> MoonResult<Vec<String>> {
 		let guard = self.git_lock().await;
 		let root = self.root.clone();
@@ -2861,12 +2880,16 @@ fn run_git_worktree_add(
 		)));
 	}
 
-	// Keep `<parent>/.worktrees/` out of the parent repo's `git
-	// status`: the worktree lives inside the parent now (ADR 0029), so
-	// without this its directory shows up as untracked. Best-effort —
-	// a clean status is cosmetic, not worth failing a created worktree.
-	if let Err(err) = exclude_worktrees_dir(root, target) {
-		tracing::warn!(%err, repo = %root, "could not add .worktrees to the parent repo's git exclude");
+	// Keep `<parent>/.worktrees/` and `/.moon/` out of the parent
+	// repo's `git status`. The worktree lives inside the parent now
+	// (ADR 0029), and `.moon/AGENTS.md` is a per-dev instructions file
+	// (gitignored in moon-ide's own repo, but not in other projects
+	// the user opens). Both are local-only, best-effort — a clean
+	// status is cosmetic, not worth failing a created worktree.
+	for dir in [crate::WORKTREES_DIR_NAME, ".moon"] {
+		if let Err(err) = add_dir_to_git_exclude(root, dir, target) {
+			tracing::warn!(%err, repo = %root, dir, "could not add to the parent repo's git exclude");
+		}
 	}
 
 	// Lock the worktree to mark it IDE-managed (WORKTREE_LOCK_REASON)
@@ -2906,13 +2929,11 @@ fn run_git_worktree_add(
 	})
 }
 
-/// Append `/.worktrees/` to the parent repo's `info/exclude`
-/// (idempotently) so the in-repo worktrees directory (ADR 0029) never
-/// shows up as untracked in the parent's `git status`. Resolves the
-/// real git dir via `rev-parse --git-common-dir` so it's correct even
-/// when `.git` is a file (submodule / linked worktree parent).
-fn exclude_worktrees_dir(root: &Utf8Path, target: &ShellTarget) -> MoonResult<()> {
-	let line = format!("/{}/", crate::WORKTREES_DIR_NAME);
+/// Resolve the repo's git-common-dir via `git rev-parse
+/// --git-common-dir`, returning an absolute path. Correct even when
+/// `.git` is a file (submodule / linked worktree parent) — that's
+/// why `--git-common-dir` rather than `--git-dir`.
+fn git_common_dir(root: &Utf8Path, target: &ShellTarget) -> MoonResult<Utf8PathBuf> {
 	let out = git_command(target, root)
 		.args(["rev-parse", "--git-common-dir"])
 		.output()
@@ -2921,14 +2942,17 @@ fn exclude_worktrees_dir(root: &Utf8Path, target: &ShellTarget) -> MoonResult<()
 		return Err(MoonError::IoError("git rev-parse --git-common-dir failed".to_string()));
 	}
 	let common = String::from_utf8_lossy(&out.stdout).trim().to_string();
-	let common_dir = {
-		let p = Utf8Path::new(&common);
-		if p.is_absolute() {
-			p.to_owned()
-		} else {
-			root.join(p)
-		}
-	};
+	let p = Utf8Path::new(&common);
+	Ok(if p.is_absolute() { p.to_owned() } else { root.join(p) })
+}
+
+/// Idempotently append a `/<dir>/` line to the repo's
+/// `.git/info/exclude` so that directory never shows up as untracked
+/// in the parent's `git status`. Resolves the real git dir via
+/// [`git_common_dir`]. Creates the `info/` dir if missing.
+fn add_dir_to_git_exclude(root: &Utf8Path, dir: &str, target: &ShellTarget) -> MoonResult<()> {
+	let line = format!("/{dir}/");
+	let common_dir = git_common_dir(root, target)?;
 	let exclude = common_dir.join("info").join("exclude");
 	let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
 	if existing.lines().any(|l| l.trim() == line) {
@@ -2945,6 +2969,16 @@ fn exclude_worktrees_dir(root: &Utf8Path, target: &ShellTarget) -> MoonResult<()
 	content.push('\n');
 	std::fs::write(&exclude, content).map_err(MoonError::from)?;
 	Ok(())
+}
+
+/// Path to the repo's `.git/info/exclude` — resolved via
+/// [`git_common_dir`] so it's correct even when `.git` is a file.
+/// Returns `None` when the repo has no git-common-dir (not a repo,
+/// git unavailable).
+fn git_exclude_path(root: &Utf8Path, target: &ShellTarget) -> Option<Utf8PathBuf> {
+	git_common_dir(root, target)
+		.ok()
+		.map(|d| d.join("info").join("exclude"))
 }
 
 /// Create a worktree, optionally resetting the main tree first (ADR

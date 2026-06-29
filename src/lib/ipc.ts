@@ -155,6 +155,7 @@ export const ipc = {
 		trash: (path: string) => invoke<void>('fs_trash', { path }),
 		delete: (path: string) => invoke<void>('fs_delete', { path }),
 		gitStatusEntries: (paths: string[]) => invoke<GitStatusEntry[]>('fs_git_status_entries', { paths }),
+		gitExcludePath: () => invoke<string | null>('fs_git_exclude_path'),
 		gitChangeSummary: (folderPath: string) => invoke<GitChangeSummary>('fs_git_change_summary', { folderPath }),
 		gitRestorePaths: (paths: string[]) => invoke<void>('fs_git_restore_paths', { paths }),
 		gitAddPaths: (paths: string[]) => invoke<void>('fs_git_add_paths', { paths }),

@@ -281,6 +281,30 @@ export const builtInCommands: Command[] = [
 		run: () => workspace.openBranchSwitcher(),
 	},
 	{
+		id: 'git.openExclude',
+		title: 'Open git info/exclude',
+		visible: () => workspace.workspace !== null,
+		run: async () => {
+			const path = await ipc.fs.gitExcludePath();
+			if (path) {
+				await workspace.openHostFile(path);
+			}
+		},
+	},
+	{
+		id: 'coder.openInstructions',
+		title: 'Open coder instructions (.moon/AGENTS.md)',
+		visible: () => workspace.workspace !== null,
+		run: async () => {
+			const folder = workspace.activeFolder;
+			if (!folder) {
+				return;
+			}
+			const path = `${folder.path}/.moon/AGENTS.md`;
+			await workspace.openHostFile(path);
+		},
+	},
+	{
 		id: 'editor.toggleLineWrap',
 		title: 'Toggle Line Wrap',
 		shortcut: 'Alt+Z',
