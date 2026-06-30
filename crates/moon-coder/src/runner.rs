@@ -1642,6 +1642,56 @@ impl CoderHandle {
 		})
 	}
 
+	/// Replay from a specific user message: truncate the
+	/// session to just before that message (exactly
+	/// [`revert_to_message`]) and immediately re-send the dropped
+	/// prompt verbatim. The user-visible gesture is "re-run this
+	/// turn" — the same truncation as edit-and-resend, but the
+	/// prompt fires again without round-tripping through the
+	/// composer. Useful when the previous answer went sideways and
+	/// the user wants the same prompt retried against the current
+	/// model / workspace state.
+	///
+	/// Auth-gates **before** the destructive truncation: a
+	/// signed-out replay fails clean without rewriting the JSONL,
+	/// so the session isn't left truncated and unable to send.
+	/// Reuses [`revert_to_message`] for the truncate + remount +
+	/// replay, then [`send`] for the new turn — both refuse
+	/// mid-turn, so the composition inherits the same guard.
+	pub async fn replay_from_message(&self, user_ordinal: usize) -> Result<(), CoderError> {
+		self.ensure_can_send().await?;
+		let dropped = self.revert_to_message(user_ordinal).await?;
+		self.send(dropped.text, dropped.images).await
+	}
+
+	/// Pre-flight auth gate shared by every send-shaped entry
+	/// point ([`send`], [`interrupt_and_send`],
+	/// [`replay_from_message`]). HF needs OAuth; user providers
+	/// need a configured key (or a localhost `base_url`, where
+	/// keyless is conventional for Ollama / llama.cpp). Surfacing
+	/// this cleanly up front avoids letting the inference layer
+	/// fail on the first request, and for `replay_from_message`
+	/// keeps the destructive JSONL truncation from running before
+	/// a send that would never fire.
+	async fn ensure_can_send(&self) -> Result<(), CoderError> {
+		let route = self.state.models.read().await.resolve_route();
+		match &route {
+			ResolvedProvider::HuggingFace => {
+				if !self.state.auth.has_valid_session().await {
+					return Err(CoderError::NotSignedIn);
+				}
+			}
+			ResolvedProvider::Custom { id, base_url }
+			| ResolvedProvider::OpenRouter { id, base_url }
+			| ResolvedProvider::Anthropic { id, base_url } => {
+				if !self.state.provider_keys.has_key(id) && !is_local_base_url(base_url) {
+					return Err(CoderError::NotSignedIn);
+				}
+			}
+		}
+		Ok(())
+	}
+
 	/// Manually re-dispatch a previously-recorded `write_file` /
 	/// `edit_file` tool call from the active folder's visible
 	/// session against the current workspace. The recovery
@@ -2112,21 +2162,7 @@ impl CoderHandle {
 		// providers need a configured key (or a localhost
 		// `base_url`, where keyless is conventional for Ollama /
 		// llama.cpp).
-		let route = self.state.models.read().await.resolve_route();
-		match &route {
-			ResolvedProvider::HuggingFace => {
-				if !self.state.auth.has_valid_session().await {
-					return Err(CoderError::NotSignedIn);
-				}
-			}
-			ResolvedProvider::Custom { id, base_url }
-			| ResolvedProvider::OpenRouter { id, base_url }
-			| ResolvedProvider::Anthropic { id, base_url } => {
-				if !self.state.provider_keys.has_key(id) && !is_local_base_url(base_url) {
-					return Err(CoderError::NotSignedIn);
-				}
-			}
-		}
+		self.ensure_can_send().await?;
 		let (rt, session_id, folder_path) = self.state.active_visible_runtime().await?;
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
 
@@ -2423,21 +2459,7 @@ impl CoderHandle {
 	/// [`CoderError::NotSignedIn`] (same gate as `send`).
 	pub async fn interrupt_and_send(&self, text: String, images: Vec<ImageAttachment>) -> Result<(), CoderError> {
 		// Auth gate — same as `send`.
-		let route = self.state.models.read().await.resolve_route();
-		match &route {
-			ResolvedProvider::HuggingFace => {
-				if !self.state.auth.has_valid_session().await {
-					return Err(CoderError::NotSignedIn);
-				}
-			}
-			ResolvedProvider::Custom { id, base_url }
-			| ResolvedProvider::OpenRouter { id, base_url }
-			| ResolvedProvider::Anthropic { id, base_url } => {
-				if !self.state.provider_keys.has_key(id) && !is_local_base_url(base_url) {
-					return Err(CoderError::NotSignedIn);
-				}
-			}
-		}
+		self.ensure_can_send().await?;
 		let (rt, session_id, folder_path) = self.state.active_visible_runtime().await?;
 		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), session_id.clone());
 		let steer_id = new_message_id();

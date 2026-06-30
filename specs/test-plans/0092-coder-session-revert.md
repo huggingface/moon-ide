@@ -34,8 +34,25 @@
 - No undo of a revert — the truncation is a permanent JSONL rewrite. The user keeps the dropped text only when they chose "Edit & resend" (it's in the composer).
 - Sub-agent transcripts can't be reverted independently; reverting the parent past a `task` call drops the sub-agent's card along with the rest of the trimmed tail, but the sub-agent's own JSONL on disk is not pruned (forensic-only, same as today's delete-vs-subdir behaviour for finished sub-agents within a kept turn).
 
+## Addendum: replay from here (2026-06-18)
+
+A third hover action — **Replay from here** (circular-arrow + play
+glyph, leftmost of the three) — truncates exactly like edit & resend
+but immediately re-sends the original prompt verbatim instead of
+dropping it into the composer. One new command,
+`coder_replay_from_message(user_ordinal)`, composes the tested
+`revert_to_message` (truncate + reload) with `send`. It auth-gates
+**before** the destructive truncation, so a signed-out replay fails
+clean without rewriting the JSONL.
+
+To test: with a few finished turns, hover a user bubble and click the
+replay glyph (no confirm). Expected: that bubble and everything after
+vanish, then the same prompt fires a fresh turn — transcript ends with
+the new exchange. The icon, like revert/edit, is hidden while a turn is
+in flight and never appears on queued steers.
+
 ## Related
 
-- Spec: [`specs/coder.md` § Revert and edit & resend](../coder.md#revert-and-edit--resend), [§ Frontend ↔ backend boundary](../coder.md#frontend--backend-boundary).
+- Spec: [`specs/coder.md` § Revert, replay, and edit & resend](../coder.md#revert-replay-and-edit--resend), [§ Frontend ↔ backend boundary](../coder.md#frontend--backend-boundary).
 - Code: [`crates/moon-coder/src/sessions.rs`](../../crates/moon-coder/src/sessions.rs) (`truncate_before_user_record`), [`crates/moon-coder/src/runner.rs`](../../crates/moon-coder/src/runner.rs) (`revert_to_message`).
 - Prior coder session plans: [0043-coder-sessions.md](0043-coder-sessions.md), [0085-coder-concurrent-sessions.md](0085-coder-concurrent-sessions.md).

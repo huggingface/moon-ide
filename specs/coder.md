@@ -563,24 +563,34 @@ Replay ships as **one batched `Replay` event**, not
 one-emit-per-record — Tauri dispatch overhead made a 1000-row session
 take seconds to open otherwise. Live turns stay one-event-per-emit.
 
-### Revert and edit & resend
+### Revert, replay, and edit & resend
 
-Every user message row reveals two hover affordances:
+Every user message row reveals three hover affordances:
 
-- **Revert to here** — drops that message and everything after it
-  from disk and memory. Modal-confirmed (it permanently rewrites the
-  transcript).
+- **Replay from here** — drops that message and everything after it,
+  then re-sends the same prompt verbatim (re-run the turn without a
+  composer round-trip). No confirm (the same prompt fires again, so
+  nothing is lost).
 - **Edit & resend** — same truncation, but the dropped prompt loads
-  back into the composer. No confirm (the text isn't lost).
+  back into the composer for the user to tweak before sending. No
+  confirm (the text isn't lost).
+- **Revert to here** — drops that message and everything after it
+  from disk and memory, full stop. Modal-confirmed (it permanently
+  rewrites the transcript with no re-send).
 
-Both route through `coder_revert_to_message(user_ordinal)` — the
-anchor is the 0-based ordinal among the transcript's user records,
-because row ids are minted fresh on every replay and aren't
-reload-stable. Queued (undrained) steers are skipped by the ordinal
-count since they aren't on disk yet. Refused while a turn is in
-flight. After truncation the backend drops the mounted runtime and
-re-opens the session so the trimmed transcript repaints through the
-normal replay path.
+Revert and edit-and-resend route through
+`coder_revert_to_message(user_ordinal)`; replay routes through
+`coder_replay_from_message(user_ordinal)`, which is the same
+truncation immediately followed by a `send` of the dropped prompt
+(it auth-gates **before** the truncation, so a signed-out replay
+fails clean without rewriting the JSONL). The anchor is the 0-based
+ordinal among the transcript's user records, because row ids are
+minted fresh on every replay and aren't reload-stable. Queued
+(undrained) steers are skipped by the ordinal count since they
+aren't on disk yet. All three are refused while a turn is in flight.
+After truncation the backend drops the mounted runtime and re-opens
+the session so the trimmed transcript repaints through the normal
+replay path.
 
 ### Auto-rename
 
@@ -1156,6 +1166,7 @@ Tauri commands in `src-tauri/src/commands/coder.rs`:
 | `coder_abort()`                                         | Cancels the visible session's in-flight turn                                                          |
 | `coder_respond_to_prompt(call_id, response)`            | Resolves a parked `ask_user` prompt; returns `false` when nothing's parked                            |
 | `coder_revert_to_message(user_ordinal)`                 | Truncates the visible session; returns the dropped prompt for edit-and-resend. Refused mid-turn       |
+| `coder_replay_from_message(user_ordinal)`               | Truncates to before the message, then re-sends the same prompt (re-run the turn). Refused mid-turn    |
 | `coder_rerun_tool_call(tool_call_id)`                   | Reapplies a recorded `write_file` / `edit_file` to disk (recovery); transcript untouched              |
 | `coder_set_model(slug)` / `coder_set_model_settings(…)` | Model picks                                                                                           |
 | `coder_*_provider*` commands                            | Custom-provider CRUD, probe, per-provider catalog, keyring-only API-key set/clear                     |

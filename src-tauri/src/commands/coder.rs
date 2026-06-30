@@ -290,6 +290,25 @@ pub async fn coder_revert_to_message(
 		.map_err(MoonError::from)
 }
 
+/// Replay the active folder's visible session from its
+/// `user_ordinal`-th user message (0-based, transcript order):
+/// truncate to just before that message (the same rewrite as
+/// `coder_revert_to_message`) and immediately re-send the dropped
+/// prompt verbatim. The "re-run this turn" gesture — edit-and-resend
+/// without the composer round-trip. Auth-gates before the truncation
+/// so a signed-out replay fails clean without rewriting the JSONL.
+/// Refused while a turn is in flight. The trimmed transcript replays
+/// on `coder:event` (via the `coder_revert_to_message` reload), then
+/// the new turn's events stream as a normal send.
+#[tauri::command]
+pub async fn coder_replay_from_message(state: State<'_, AppState>, user_ordinal: usize) -> Result<(), MoonError> {
+	state
+		.coder
+		.replay_from_message(user_ordinal)
+		.await
+		.map_err(MoonError::from)
+}
+
 /// Manually reapply a recorded `write_file` / `edit_file` tool
 /// call from the active folder's visible session. The recovery
 /// affordance behind the per-row "re-apply" control: a user who

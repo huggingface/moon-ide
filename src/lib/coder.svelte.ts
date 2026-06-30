@@ -2161,6 +2161,36 @@ class CoderPanelState {
 		}
 	}
 
+	/** Replay the visible session from the user message with `rowId`:
+	 *  truncate to just before it (same rewrite as
+	 *  `revertToMessage`) and immediately re-send the original
+	 *  prompt verbatim — "re-run this turn" without the composer
+	 *  round-trip. The backend auth-gates before the destructive
+	 *  truncation and refuses mid-turn, so we (like revert) hide
+	 *  the affordance while busy. The trimmed transcript repaints
+	 *  from the revert's `open_session` replay, then the new
+	 *  turn's events stream as a normal send — no `rows` mutation
+	 *  here. */
+	async replayFromMessage(rowId: string): Promise<void> {
+		const ordinal = this.#userOrdinalForRow(rowId);
+		if (ordinal === null) {
+			return;
+		}
+		try {
+			await ipc.coder.replayFromMessage(ordinal);
+			await this.refreshSessions();
+		} catch (err) {
+			this.rows = [
+				...this.rows,
+				{
+					kind: 'error',
+					id: `local-${Date.now()}`,
+					text: formatError(err),
+				},
+			];
+		}
+	}
+
 	async abort(): Promise<void> {
 		try {
 			await ipc.coder.abort();

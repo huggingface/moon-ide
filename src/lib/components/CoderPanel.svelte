@@ -39,6 +39,7 @@
 	import CodeIcon from './icons/CodeIcon.svelte';
 	import RevertIcon from './icons/RevertIcon.svelte';
 	import EditIcon from './icons/EditIcon.svelte';
+	import ReplayIcon from './icons/ReplayIcon.svelte';
 	import { ipc } from '../ipc';
 	import { formatError, type FileSearchResult, type CoderSessionSummary } from '../protocol';
 	import { textInputUndo } from '../actions/textInputUndo';
@@ -1561,6 +1562,15 @@
 		composer?.focus();
 	}
 
+	/** Re-run the turn that started at `rowId`: truncate the session
+	 *  to just before that user message and re-send the original prompt
+	 *  verbatim. No confirm (no text is lost — the same prompt fires
+	 *  again), matching the edit-and-resend posture. The backend
+	 *  auth-gates before the destructive truncation. */
+	async function onReplayFromMessage(rowId: string): Promise<void> {
+		await coder.replayFromMessage(rowId);
+	}
+
 	/** Open a session's raw JSONL trace in the editor as a host-direct
 	 *  file (same machinery as Ctrl+O for files outside the workspace).
 	 *  Works for parent sessions and sub-agent ids alike — both live
@@ -2388,6 +2398,14 @@
 							 turn runs (the backend refuses mid-turn) and on
 							 queued steers (not yet on disk, so no ordinal). -->
 					<span class="row-actions">
+						<button
+							type="button"
+							class="row-action"
+							title="Replay from here — drop this message and everything after it, then re-send the same prompt"
+							onclick={() => onReplayFromMessage(row.id)}
+						>
+							<ReplayIcon size={12} />
+						</button>
 						<button
 							type="button"
 							class="row-action"

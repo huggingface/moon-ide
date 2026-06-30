@@ -383,6 +383,7 @@ export const ipc = {
 		respondToPrompt: (callId: string, response: PromptResponse) =>
 			invoke<boolean>('coder_respond_to_prompt', { callId, response }),
 		revertToMessage: (userOrdinal: number) => invoke<RevertedMessage>('coder_revert_to_message', { userOrdinal }),
+		replayFromMessage: (userOrdinal: number) => invoke<void>('coder_replay_from_message', { userOrdinal }),
 		rerunToolCall: (toolCallId: string) => invoke<RerunToolOutcome>('coder_rerun_tool_call', { toolCallId }),
 		listSessions: () => invoke<CoderSessionSummary[]>('coder_list_sessions'),
 		activeSession: () => invoke<CoderSessionSummary | null>('coder_active_session'),
