@@ -469,14 +469,20 @@ pub async fn coder_discard_worktree(
 /// and stays in the same per-project session list; its tools just
 /// start operating on an isolated branch from the next turn.
 ///
-/// Branch choice mirrors the worktree button's intent:
-/// - on a **non-default** branch `B`: the worktree checks out `B` and
-///   the main tree is reset to the default branch (so you keep the
-///   same branch / PR, with the main tree freed). Requires a clean
-///   tree — errors otherwise.
-/// - on the **default** branch (or detached / no known default): a
-///   fresh `moon/agent-<id>` branch off `HEAD`; the main tree is left
-///   as-is.
+/// Branch choice prefers the **session's associated branch**
+/// (`committed_branch` from the last commit made with this session
+/// open) over the main tree's current branch:
+/// - **session has an associated branch `B`**: the worktree checks out
+///   `B`. The main tree is reset to the default branch only if it was
+///   currently on `B` (freeing the main tree from the session's
+///   branch); if the main tree is on something else, it's left alone
+///   — the worktree becomes the isolated home for `B`.
+/// - **no associated branch** + on a **non-default** branch `B`: the
+///   worktree checks out `B` and the main tree is reset to the default
+///   branch. Requires a clean tree.
+/// - **no associated branch** + on the **default** branch (or detached
+///   / no known default): a fresh `moon/agent-<id>` branch off `HEAD`;
+///   the main tree is left as-is.
 #[tauri::command]
 pub async fn coder_move_session_to_worktree(state: State<'_, AppState>) -> Result<NewWorktreeSession, MoonError> {
 	use moon_core::host::WorktreeBranch;
@@ -497,25 +503,45 @@ pub async fn coder_move_session_to_worktree(state: State<'_, AppState>) -> Resul
 	}
 	let parent_path = parent.folder.path.clone();
 
-	// Decide the branch + whether the main tree resets.
+	// Decide the branch + whether the main tree resets. Prefer the
+	// session's associated branch (committed_branch) over the main
+	// tree's current branch — so the worktree opens on the session's
+	// own work, not whatever the main tree happens to be on (which
+	// could be a different session's branch).
+	let session_branch = state.coder.visible_session_branch().await.map_err(MoonError::from)?;
 	let info = parent.host.git_branch().await?;
 	let default = info
 		.default_branch_remote_ref
 		.as_deref()
 		.and_then(|r| r.rsplit_once('/').map(|(_, b)| b.to_string()));
-	let (spec, reset_to) = match (&info.name, &default) {
-		// Non-default branch with a known default: move it, reset main.
-		(Some(b), Some(d)) if b != d => (WorktreeBranch::Existing(b.clone()), Some(d.clone())),
-		// On the default branch, detached, or no known default: fork fresh off HEAD.
-		_ => {
-			let now_ms = std::time::SystemTime::now()
-				.duration_since(std::time::UNIX_EPOCH)
-				.map(|d| d.as_millis())
-				.unwrap_or(0) as u64;
-			(
-				WorktreeBranch::New(format!("moon/agent-{:08x}", now_ms & 0xffff_ffff)),
-				None,
-			)
+	let (spec, reset_to) = if let Some(b) = &session_branch {
+		// The session has an associated branch. Check it out in the
+		// worktree. Only reset the main tree if it's currently on that
+		// same branch (the main tree is being "freed" from it); if the
+		// main tree is on something else, leave it — the worktree is the
+		// isolated home for this branch now.
+		let reset_to = if info.name.as_deref() == Some(b.as_str()) {
+			default.clone()
+		} else {
+			None
+		};
+		(WorktreeBranch::Existing(b.clone()), reset_to)
+	} else {
+		match (&info.name, &default) {
+			// No session branch, on a non-default branch: move it, reset main.
+			(Some(b), Some(d)) if b != d => (WorktreeBranch::Existing(b.clone()), Some(d.clone())),
+			// No session branch, on the default branch / detached / no
+			// known default: fork fresh off HEAD.
+			_ => {
+				let now_ms = std::time::SystemTime::now()
+					.duration_since(std::time::UNIX_EPOCH)
+					.map(|d| d.as_millis())
+					.unwrap_or(0) as u64;
+				(
+					WorktreeBranch::New(format!("moon/agent-{:08x}", now_ms & 0xffff_ffff)),
+					None,
+				)
+			}
 		}
 	};
 	let branch = spec.name().to_string();

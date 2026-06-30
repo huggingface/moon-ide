@@ -1541,6 +1541,31 @@ impl CoderHandle {
 		Ok(!already)
 	}
 
+	/// The visible session's associated branch — `committed_branch`
+	/// (set by the last commit made with this session open), or
+	/// `worktree_branch` if the session already runs in a worktree.
+	/// `None` when no session is visible or the session has no
+	/// associated branch yet. Used by the worktree button to check
+	/// out the session's own branch instead of whatever the main tree
+	/// happens to be on.
+	pub async fn visible_session_branch(&self) -> Result<Option<String>, CoderError> {
+		let (fs, _) = self.state.active_folder_session().await?;
+		let Some(id) = fs.visible_session_id().await else {
+			return Ok(None);
+		};
+		let Some(rt) = fs.runtime(&id).await else {
+			return Ok(None);
+		};
+		let session = rt.session.lock().await;
+		Ok(
+			session
+				.header
+				.worktree_branch
+				.clone()
+				.or(session.header.committed_branch.clone()),
+		)
+	}
+
 	/// Read the force-host override of `fs`'s visible session
 	/// without lazy-creating a runtime (mirrors the two-step
 	/// look-up `status` uses for `busy`). `false` when no session
