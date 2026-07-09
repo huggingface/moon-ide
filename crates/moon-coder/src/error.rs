@@ -173,8 +173,35 @@ pub fn request_id_of(response: &reqwest::Response) -> Option<String> {
 
 impl From<reqwest::Error> for CoderError {
 	fn from(err: reqwest::Error) -> Self {
-		Self::Transport(err.to_string())
+		Self::Transport(format!("{err}{}", cause_chain_suffix(&err)))
 	}
+}
+
+/// Flatten an error's `source()` chain into a `": cause: cause"`
+/// suffix so the root reason survives into the display string.
+///
+/// `reqwest::Error`'s `Display` stops at the top layer — you get
+/// `error sending request for url (…)` with no hint at *why* the
+/// request failed (DNS resolution, connection refused, TLS
+/// handshake, timeout, …). That detail is only reachable through
+/// `std::error::Error::source`, so we stitch the chain back onto
+/// the message. Consecutive links whose text is already contained
+/// in the previous one are dropped to avoid `hyper`-style
+/// duplication ("error trying to connect" wrapping the same text).
+fn cause_chain_suffix(err: &dyn std::error::Error) -> String {
+	let mut suffix = String::new();
+	let mut previous = err.to_string();
+	let mut source = err.source();
+	while let Some(cause) = source {
+		let text = cause.to_string();
+		if !previous.contains(&text) {
+			suffix.push_str(": ");
+			suffix.push_str(&text);
+		}
+		previous = text;
+		source = cause.source();
+	}
+	suffix
 }
 
 impl From<keyring::Error> for CoderError {
@@ -251,6 +278,59 @@ mod tests {
 			!display.contains("[request id:"),
 			"should not emit the marker when no id is known: {display}"
 		);
+	}
+
+	#[derive(Debug)]
+	struct Layer {
+		message: String,
+		source: Option<Box<Layer>>,
+	}
+
+	impl std::fmt::Display for Layer {
+		fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+			f.write_str(&self.message)
+		}
+	}
+
+	impl std::error::Error for Layer {
+		fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+			self.source.as_deref().map(|s| s as &dyn std::error::Error)
+		}
+	}
+
+	#[test]
+	fn cause_chain_appends_root_reason() {
+		// Mirrors reqwest -> hyper -> io nesting: the top layer's
+		// Display hides the real reason, which is the deepest link.
+		let err = Layer {
+			message: "error sending request for url (https://router.huggingface.co/v1/chat/completions)".into(),
+			source: Some(Box::new(Layer {
+				message: "client error (Connect)".into(),
+				source: Some(Box::new(Layer {
+					message: "tcp connect error: Connection refused (os error 111)".into(),
+					source: None,
+				})),
+			})),
+		};
+		let suffix = cause_chain_suffix(&err);
+		assert_eq!(
+			suffix,
+			": client error (Connect): tcp connect error: Connection refused (os error 111)"
+		);
+	}
+
+	#[test]
+	fn cause_chain_skips_duplicated_wrapping() {
+		// A link whose text is already contained in its parent adds
+		// no information and should be dropped.
+		let err = Layer {
+			message: "outer: dns error".into(),
+			source: Some(Box::new(Layer {
+				message: "dns error".into(),
+				source: None,
+			})),
+		};
+		assert_eq!(cause_chain_suffix(&err), "");
 	}
 
 	#[test]
