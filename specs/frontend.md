@@ -91,6 +91,12 @@ Saves go through `ipc.fs.writeFile`. The editor only tracks dirty state; persist
 
 Anything not in that list is intentionally off. Notably **no** rectangular selection, **no** rainbow brackets (deferred — wants a Lezer-aware scan to skip strings/comments; will land as a small standalone extension when it's someone's actual itch).
 
+### Per-file language extensions
+
+`languageFor(path, firstLine?)` in `editor/language.ts` is the single entry point that picks a CodeMirror language extension for a buffer. It maps filename → extension (`.ts` → `javascript({ typescript: true })`, `.rs` → `rust()`, …), with filename-fallbacks for extensionless files the repo ships (`Cargo.lock` → toml, `Dockerfile.*` → dockerfile) and shebang sniffing for the rest. Diff and review editors share the same resolver so a file highlights identically in every pane.
+
+**GitHub Actions workflow files** (`.github/workflows/*.{yml,yaml}`) get a derived YAML grammar instead of the plain `yaml()`: the upstream Lezer YAML parser configured with a `parseMixed` wrapper that overlays the legacy shell stream-parser onto `run:` and `shell:` values. Both block scalars (`run: |` → `BlockLiteralContent`) and plain scalars (`run: echo x` → `Literal`) are overlaid; the wrapper climbs to the enclosing `Pair`, reads the `Key` text, and mounts the shell parser over the value's range only. Keys, `env:`, `with:`, and every other YAML node keep their original grammar — block-mapping folding and indentation survive untouched. Plain `.yml`/`.yaml` files outside `.github/workflows/` still get the standard `yaml()` extension. The overlay is a behaviour of the workflow grammar, not a separate file kind: LSP, git, blame, and editorconfig wiring are unchanged.
+
 ### Diff and conflict surfaces
 
 Different jobs, different tools:

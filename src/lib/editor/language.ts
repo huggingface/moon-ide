@@ -1,5 +1,6 @@
 import type { Extension } from '@codemirror/state';
-import { StreamLanguage } from '@codemirror/language';
+import { LRLanguage, LanguageSupport, StreamLanguage } from '@codemirror/language';
+import { type Input, type Parser, type SyntaxNode, type SyntaxNodeRef, parseMixed } from '@lezer/common';
 
 // Some files don't carry a useful extension and need to be matched by name.
 // We add an entry whenever moon-ide's own source tree contains such a file
@@ -35,6 +36,14 @@ const IGNORE_FILENAME_RE = /^\.[\w-]*ignore$/;
 // per-line tokenizer below handles `KEY=VALUE`, `# comment`,
 // `export `, and `${VAR}` interpolation inside double-quoted values.
 const ENV_FILENAME_RE = /^\.env(?:\..+)?$/;
+
+// `.github/workflows/*.yml` / `*.yaml` — GitHub Actions workflow files.
+// The `run:` values in these hold shell, so we overlay the shell grammar
+// onto them via `parseMixed` (see `githubActionsYaml`). Matched on the
+// full workspace-relative path so a plain `deploy.yml` elsewhere isn't
+// pulled into the Actions dialect. The moon-ide repo itself ships
+// `.github/workflows/moon-base.yml` — bootstrap, not speculation (ADR 0005).
+const WORKFLOW_PATH_RE = /^\.github\/workflows\/[^/]+\.(ya?ml)$/i;
 
 // Lazy ignore-file mode. CodeMirror's `StreamLanguage` is a thin
 // per-line tokenizer; for ignore files we only need one rule: a `#`
@@ -175,6 +184,96 @@ const SHEBANG_LANGUAGES: Record<string, string> = {
 	ash: 'sh',
 };
 
+// YAML key names whose scalar / block-scalar values we treat as shell
+// when the file is a GitHub Actions workflow. `run` is the script step;
+// `shell` carries the interpreter, which is shell-ish enough to read
+// well with the shell grammar (bash is a strict superset of sh and the
+// legacy mode handles both). Keys we don't list (`env`, `with`, …) keep
+// their normal YAML highlighting — overlaying them would mostly repaint
+// `KEY=VALUE` and `${{ }}` expressions as shell strings, which is a wash
+// and loses the YAML-pair structure the user expects.
+const RUN_SHELL_KEYS = new Set(['run', 'shell']);
+
+// Overlay the legacy shell stream-parser onto the `run:` / `shell:`
+// values of a GitHub Actions workflow YAML document.
+//
+// Why `parseMixed` + an overlay, not a bespoke tokenizer: the Lezer YAML
+// grammar already parses the value's range — `BlockLiteralContent` for
+// `|`/`>` block scalars, `Literal` for plain scalars (`run: echo x`).
+// We mount the shell parser over that range and let CodeMirror resolve
+// the inner tokens. Keys and every other YAML node keep their original
+// grammar — `Key`, `Pair`, block-mapping indentation, folding all
+// survive untouched.
+//
+// Key-walk: `BlockLiteralContent` / `Literal` sit under `BlockLiteral`
+// → `Pair`. We climb to the enclosing `Pair`, grab its `Key` child, and
+// read the key text from `input` (the `Input` arg `parseMixed` threads
+// into the nest callback — the `SyntaxNode` itself has no `read`). A
+// `Literal` that is itself a key (`Key > Literal`) is skipped: the climb
+// stops at the enclosing `Key`, not `Pair`, so it keeps its YAML
+// property-name styling.
+function isRunShellValue(node: SyntaxNodeRef, input: Input): boolean {
+	if (node.name !== 'BlockLiteralContent' && node.name !== 'Literal') {
+		return false;
+	}
+	let pair: SyntaxNode | null = node.node;
+	while (pair && pair.name !== 'Pair' && pair.name !== 'Key') {
+		pair = pair.parent;
+	}
+	if (!pair || pair.name === 'Key') {
+		return false;
+	}
+	const keyNode = pair.getChild('Key');
+	if (!keyNode) {
+		return false;
+	}
+	return RUN_SHELL_KEYS.has(input.read(keyNode.from, keyNode.to));
+}
+
+// The shell parser is built once and reused across every `run:` overlay
+// in the document. `StreamLanguage.define(shell).parser` is the raw
+// `Parser` the overlay machinery mounts; reusing it avoids building a
+// fresh stream-language wrapper per value.
+let shellParserCache: Parser | null = null;
+async function ensureShellParser(): Promise<Parser> {
+	if (shellParserCache) {
+		return shellParserCache;
+	}
+	const { shell } = await import('@codemirror/legacy-modes/mode/shell');
+	shellParserCache = StreamLanguage.define(shell).parser;
+	return shellParserCache;
+}
+
+// A `LanguageSupport` for GitHub Actions workflow YAML: the upstream
+// `yamlLanguage` with a `parseMixed` wrapper that overlays the shell
+// grammar onto `run:` / `shell:` values. Built lazily — only workflow
+// files pay for it. The `yamlLanguage` already carries the fold /
+// indent / comment props, so `configure({ wrap })` preserves them.
+let githubActionsYamlCache: LanguageSupport | null = null;
+async function githubActionsYaml(): Promise<LanguageSupport> {
+	if (githubActionsYamlCache) {
+		return githubActionsYamlCache;
+	}
+	const { yamlLanguage } = await import('@codemirror/lang-yaml');
+	await ensureShellParser();
+	const parser = yamlLanguage.parser.configure({
+		wrap: parseMixed((node, input) =>
+			isRunShellValue(node, input) ? { parser: shellParserCache!, overlay: [{ from: node.from, to: node.to }] } : null,
+		),
+	});
+	githubActionsYamlCache = new LanguageSupport(
+		LRLanguage.define({
+			name: 'github-actions',
+			parser,
+			languageData: {
+				commentTokens: { line: '#' },
+				indentOnInput: /^\s*[\]}]$/,
+			},
+		}),
+	);
+	return githubActionsYamlCache;
+}
+
 // Language extensions are loaded lazily so we don't bundle every grammar
 // up front. Returning [] means "no syntax extension yet, plain text is fine".
 //
@@ -187,6 +286,12 @@ export async function languageFor(filename: string, firstLine?: string): Promise
 	}
 	if (ENV_FILENAME_RE.test(baseName)) {
 		return [envLanguage];
+	}
+	// GitHub Actions workflow files get a shell-overlay YAML grammar
+	// (see `githubActionsYaml`). Checked on the full path so a plain
+	// `deploy.yml` elsewhere keeps the standard YAML grammar.
+	if (WORKFLOW_PATH_RE.test(filename)) {
+		return [await githubActionsYaml()];
 	}
 	let ext = FILENAME_LANGUAGES[baseName] ?? baseName.split('.').pop()?.toLowerCase() ?? '';
 	if (DOCKERFILE_VARIANT_RE.test(baseName)) {
@@ -348,3 +453,12 @@ export async function languageFor(filename: string, firstLine?: string): Promise
 			return [];
 	}
 }
+
+// Exposed for unit tests so they can exercise the workflow detection and
+// the shell-overlay tree walk without spinning up a full CodeMirror view.
+export const __test = {
+	WORKFLOW_PATH_RE,
+	RUN_SHELL_KEYS,
+	isRunShellValue,
+	githubActionsYaml,
+};
