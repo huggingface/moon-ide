@@ -2318,7 +2318,6 @@ impl CoderHandle {
 
 		let state = self.state.clone();
 		let rt_for_turn = rt.clone();
-		let cancel_outer = cancel.clone();
 		let sink_for_turn = sink.clone();
 		let folder_for_turn = folder_path.clone();
 		tokio::spawn(async move {
@@ -2339,6 +2338,23 @@ impl CoderHandle {
 			// sub-turns we flush so the next iteration's tools
 			// see formatted bytes on disk, and we hand the next
 			// `run_turn` a fresh empty queue.
+			//
+			// `cancel_outer` is the live token for the *current*
+			// `run_turn`. When we loop back — either because a
+			// `drain_steer_now` aborted with a pending steer, or
+			// because stragglers arrived in the race window — we
+			// mint a *fresh* `CancellationToken` and store it in
+			// `turn.cancel`. `CancellationToken` is one-shot: a
+			// cancelled token can't be un-cancelled, so reusing it
+			// would make the next `run_turn` bail at its
+			// iteration-top `is_cancelled()` guard before the
+			// steer ever drains — an infinite tight loop with
+			// `busy` stuck `true` and the stop button a no-op.
+			// Storing the fresh token in `turn.cancel` keeps
+			// `busy` accurate and lets a concurrent `send` keep
+			// queueing (it checks `turn.cancel.is_some()`, not the
+			// token's cancellation state).
+			let mut cancel_outer = cancel;
 			let result = loop {
 				let format_queue = Arc::new(crate::tools::FormatQueue::default());
 				let result = run_turn(
@@ -2355,10 +2371,12 @@ impl CoderHandle {
 				// pushes a steer. That steer must be drained into a
 				// fresh `run_turn`, not treated as a final abort:
 				// backfill orphans for the aborted turn, then loop
-				// back so the drained steer starts a new turn. Keep
-				// `cancel` set so a concurrent `send` keeps queueing.
+				// back so the drained steer starts a new turn. The
+				// old token is now permanently cancelled, so mint a
+				// fresh one for the next `run_turn`.
 				if matches!(result, Err(CoderError::Aborted)) && !rt_for_turn.session.lock().await.pending_steers.is_empty() {
 					recover_in_memory_orphans(&rt_for_turn, &sink_for_turn).await;
+					cancel_outer = fresh_cancel(&rt_for_turn).await;
 					continue;
 				}
 				if !matches!(result, Ok(())) {
@@ -2370,13 +2388,17 @@ impl CoderHandle {
 					turn.cancel = None;
 					break result;
 				}
-				// Stragglers from the race window. Drop the turn
-				// lock and re-enter `run_turn`; its iteration top
-				// will drain them into `messages` and run another
-				// LLM round-trip. Keep `cancel` set so a concurrent
-				// `send` still queues instead of starting a fresh
-				// turn.
+				// Stragglers from the race window. The current
+				// token is still live (the turn returned `Ok(())`),
+				// but we mint a fresh one anyway for symmetry with
+				// the abort path: the next `run_turn` is a new
+				// turn, and its cancel handle should be independent
+				// of the one that just finished. `send` keeps
+				// queueing because `turn.cancel` stays `Some`.
+				let fresh = CancellationToken::new();
+				turn.cancel = Some(fresh.clone());
 				drop(turn);
+				cancel_outer = fresh;
 			};
 			match &result {
 				Ok(()) => {
@@ -3652,6 +3674,20 @@ async fn handle_ask_user(
 /// Order-preserving: orphans are appended to `messages` in the
 /// order their tool_calls appear in the transcript, matching
 /// `sessions::orphan_tool_call_ids`'s contract.
+/// Mint a fresh `CancellationToken`, store it in `turn.cancel` (so
+/// `busy` stays accurate and `abort()`/`drain_steer_now` can cancel
+/// the new turn), and return the clone the spawn loop hands to the
+/// next `run_turn`. Used on the loop-back paths after an abort-with-
+/// steer or a straggler drain: the previous token is permanently
+/// cancelled (`CancellationToken` is one-shot), so reusing it would
+/// make the next `run_turn` bail at its iteration-top guard before
+/// the steer ever drains.
+async fn fresh_cancel(rt: &Arc<SessionRuntime>) -> CancellationToken {
+	let cancel = CancellationToken::new();
+	rt.turn.lock().await.cancel = Some(cancel.clone());
+	cancel
+}
+
 async fn recover_in_memory_orphans(rt: &Arc<SessionRuntime>, sink: &FolderEventSink) {
 	// Snapshot the orphan ids under the session lock, then drop
 	// it before we hit the disk / event sink. Persistence

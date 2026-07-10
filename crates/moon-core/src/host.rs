@@ -9,9 +9,9 @@ use camino::{Utf8Path, Utf8PathBuf};
 use moon_protocol::editorconfig::EditorConfig;
 use moon_protocol::fs::{CollectPathsResult, DirEntry, EntryKind, ReadFileResult, StatResult, WriteFileResult};
 use moon_protocol::git::{
-	BranchDiffStatus, BranchList, BranchListEntry, BranchSwitchTarget, CommitEntry, GitBranchInfo, GitCommitResult,
-	GitFileBlame, GitFileStatus, GitLineBlame, GitMergeState, GitPermalink, GitStatusEntry, GitWorktree, PrListScope,
-	PrListStatus,
+	BranchDiffStatus, BranchList, BranchListEntry, BranchSwitchTarget, CommitDiff, CommitEntry, GitBranchInfo,
+	GitCommitResult, GitFileBlame, GitFileStatus, GitLineBlame, GitMergeState, GitPermalink, GitStatusEntry, GitWorktree,
+	PrListScope, PrListStatus,
 };
 use moon_protocol::review::{PublishReviewRequest, PublishReviewResult, ReviewSide};
 use moon_protocol::{MoonError, MoonResult};
@@ -570,6 +570,16 @@ pub trait WorkspaceHost: Send + Sync {
 	/// the full body / parents / stat. Empty vec when the repo has no
 	/// commits yet, isn't a repo, or git is unavailable.
 	async fn git_log(&self, limit: u32) -> MoonResult<Vec<CommitEntry>>;
+
+	/// File-level diff for a single commit vs its first parent:
+	/// `git diff --name-status -z --no-renames <parent> <sha>`.
+	/// Resolves the parent SHA from `<sha>^` (so the frontend can pass
+	/// the commit SHA directly; `is_safe_rev` would reject the `^`
+	/// suffix downstream). Returns the parent SHA, commit SHA, subject,
+	/// and the changed-file list so the `commit://` pseudo-tab can
+	/// render per-file sections. `Ok(None)` when the commit doesn't
+	/// exist, isn't a repo, or git is unavailable.
+	async fn git_commit_diff(&self, sha: &str) -> MoonResult<Option<CommitDiff>>;
 
 	/// Recent branches + open PRs for the active folder, formatted
 	/// for the branch-switcher palette. Two sections in the
@@ -2167,6 +2177,18 @@ impl WorkspaceHost for LocalHost {
 		})
 		.await
 		.map_err(|e| MoonError::Internal(format!("git_log join error: {e}")))?
+	}
+
+	async fn git_commit_diff(&self, sha: &str) -> MoonResult<Option<CommitDiff>> {
+		let guard = self.git_lock().await;
+		let root = self.root.clone();
+		let sha = sha.to_owned();
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			Ok(run_git_commit_diff(&root, &sha))
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_commit_diff join error: {e}")))?
 	}
 }
 
@@ -3777,6 +3799,78 @@ fn run_git_log(root: &Utf8Path, limit: u32) -> Vec<CommitEntry> {
 			})
 		})
 		.collect()
+}
+
+/// File-level diff for a single commit vs its first parent. Resolves
+/// `<sha>^` to a real 40-hex SHA (since `is_safe_rev` rejects the `^`
+/// suffix downstream), then runs `git diff --name-status -z --no-renames`
+/// between parent and commit and parses with the existing
+/// `parse_diff_name_status_z`. Root commits (no parent) produce an empty
+/// `parent_sha`; every file reads as a pure addition. Returns `None`
+/// when the commit doesn't exist, isn't a repo, or git is unavailable.
+fn run_git_commit_diff(root: &Utf8Path, sha: &str) -> Option<CommitDiff> {
+	use std::process::Command;
+
+	// Validate the commit SHA is a 40-char hex string before passing
+	// it to git — mirrors `is_safe_rev` so we never feed git a
+	// flag-shaped string.
+	if !is_safe_rev(sha) {
+		return None;
+	}
+
+	// Resolve the first parent: `git rev-parse <sha>^`. For a root
+	// commit this exits non-zero; we treat that as "no parent" and
+	// leave `parent_sha` empty so the frontend renders every file as
+	// a pure addition.
+	let parent = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["rev-parse", &format!("{sha}^")])
+		.output()
+		.ok()?;
+	let parent_sha = if parent.status.success() {
+		String::from_utf8_lossy(&parent.stdout).trim().to_owned()
+	} else {
+		String::new()
+	};
+
+	// Grab the subject for the banner.
+	let subject_output = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["log", "-1", "--pretty=%s", sha])
+		.output()
+		.ok()?;
+	let subject = if subject_output.status.success() {
+		String::from_utf8_lossy(&subject_output.stdout).trim().to_owned()
+	} else {
+		return None;
+	};
+
+	// Root commit: every tracked file is an addition. `git diff`
+	// against a non-existent parent would fail, so diff against the
+	// empty tree instead.
+	let diff_arg = if parent_sha.is_empty() {
+		format!("4b825dc642cb6eb9a060e54bf8d69288fbee4904..{sha}")
+	} else {
+		format!("{parent_sha}..{sha}")
+	};
+	let diff = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["diff", "--name-status", "-z", "--no-renames", &diff_arg])
+		.output()
+		.ok()?;
+	if !diff.status.success() {
+		return None;
+	}
+	let entries = parse_diff_name_status_z(&diff.stdout);
+	Some(CommitDiff {
+		parent_sha,
+		commit_sha: sha.to_owned(),
+		subject,
+		entries,
+	})
 }
 
 /// Working-tree patch the SCM panel feeds to the AI commit-message
@@ -7793,6 +7887,71 @@ mod tests {
 		let dir = TempDir::new().unwrap();
 		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
 		assert_eq!(host(&dir).git_log(10).await.unwrap(), Vec::new());
+	}
+
+	#[tokio::test]
+	async fn git_commit_diff_lists_changed_files() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping git_commit_diff test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "Alice"]);
+		std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "First"]);
+		std::fs::write(dir.path().join("b.txt"), "beta\n").unwrap();
+		std::fs::write(dir.path().join("a.txt"), "alpha\nchanged\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "Second"]);
+
+		// Get the HEAD SHA.
+		let head = std::process::Command::new(&git)
+			.arg("-C")
+			.arg(dir.path())
+			.args(["rev-parse", "HEAD"])
+			.output()
+			.unwrap();
+		let sha = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+
+		let diff = host(&dir).git_commit_diff(&sha).await.unwrap();
+		let diff = diff.expect("commit diff should resolve");
+		assert_eq!(diff.commit_sha, sha);
+		assert!(!diff.parent_sha.is_empty(), "parent SHA should resolve");
+		assert_eq!(diff.subject, "Second");
+		// a.txt modified, b.txt added.
+		assert_eq!(diff.entries.len(), 2, "got {diff:?}");
+	}
+
+	#[tokio::test]
+	async fn git_commit_diff_root_commit_has_empty_parent() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping git_commit_diff root test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "Alice"]);
+		std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "Root"]);
+
+		let head = std::process::Command::new(&git)
+			.arg("-C")
+			.arg(dir.path())
+			.args(["rev-parse", "HEAD"])
+			.output()
+			.unwrap();
+		let sha = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+
+		let diff = host(&dir).git_commit_diff(&sha).await.unwrap();
+		let diff = diff.expect("root commit diff should resolve");
+		assert_eq!(diff.parent_sha, "", "root commit has no parent");
+		assert_eq!(diff.entries.len(), 1, "one file added");
+		assert_eq!(diff.entries[0].status, GitFileStatus::Added);
 	}
 
 	#[tokio::test]

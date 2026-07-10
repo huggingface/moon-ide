@@ -6,11 +6,13 @@
 	import PdfView from './PdfView.svelte';
 	import MarkdownView from './MarkdownView.svelte';
 	import ReviewView from './ReviewView.svelte';
+	import CommitView from './CommitView.svelte';
 	import Welcome from './Welcome.svelte';
 	import { open } from '@tauri-apps/plugin-dialog';
 	import { workspace, type SplitSide } from '../state.svelte';
 	import { isMarkdownPath } from '../util/markdown';
 	import { isReviewPath } from '../util/reviewPath';
+	import { isCommitPath } from '../util/commitPath';
 	import { frontendLog } from '../logs.svelte';
 
 	type Props = { side: SplitSide };
@@ -60,6 +62,12 @@
 		}
 		if (file.kind === 'pdf') {
 			return { path, file, kind: 'pdf' as const };
+		}
+		// Commit diff view: synthetic `commit://<sha>` buffer. Each
+		// commit gets its own tab; the view fetches the file list
+		// and blobs from the SHA embedded in the path.
+		if (isCommitPath(file.path)) {
+			return { path, file, kind: 'commit' as const };
 		}
 		// Review view: synthetic `review://…` buffer. Wins over
 		// everything else for that path.
@@ -206,6 +214,10 @@
 			     file's buffer. -->
 				{#key view.file.path}
 					<ImageView file={view.file} />
+				{/key}
+			{:else if view.file && view.kind === 'commit'}
+				{#key view.file.path}
+					<CommitView {side} />
 				{/key}
 			{:else if view.file && view.kind === 'review'}
 				{#key view.file.path}

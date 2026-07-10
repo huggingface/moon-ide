@@ -2,8 +2,8 @@ use camino::Utf8PathBuf;
 use moon_core::{read_host_file, write_host_file};
 use moon_protocol::fs::{CollectPathsResult, DirEntry, ReadFileResult, StatResult, WriteFileResult};
 use moon_protocol::git::{
-	BranchDiffStatus, BranchList, BranchSwitchTarget, CommitEntry, GitBranchInfo, GitChangeSummary, GitCommitResult,
-	GitFileBlame, GitFileStatus, GitMergeState, GitPermalink, GitStatusEntry, GitWorktree, PrListScope,
+	BranchDiffStatus, BranchList, BranchSwitchTarget, CommitDiff, CommitEntry, GitBranchInfo, GitChangeSummary,
+	GitCommitResult, GitFileBlame, GitFileStatus, GitMergeState, GitPermalink, GitStatusEntry, GitWorktree, PrListScope,
 };
 use moon_protocol::review::{PublishReviewRequest, PublishReviewResult};
 use moon_protocol::MoonError;
@@ -572,4 +572,15 @@ pub async fn fs_git_head_commit_message(state: State<'_, AppState>) -> Result<St
 pub async fn fs_git_log(state: State<'_, AppState>, limit: Option<u32>) -> Result<Vec<CommitEntry>, MoonError> {
 	let entry = state.workspaces.require_active_folder().await?;
 	entry.host.git_log(limit.unwrap_or(50)).await
+}
+
+/// File-level diff for a single commit vs its first parent. Returns
+/// the parent SHA, commit SHA, subject, and the changed-file list so
+/// the `commit://<sha>` pseudo-tab can render per-file diff sections.
+/// `Ok(None)` when the commit doesn't exist, isn't a repo, or git is
+/// unavailable.
+#[tauri::command]
+pub async fn fs_git_commit_diff(state: State<'_, AppState>, sha: String) -> Result<Option<CommitDiff>, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.git_commit_diff(&sha).await
 }

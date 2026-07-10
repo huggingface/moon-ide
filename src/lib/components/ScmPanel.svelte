@@ -164,6 +164,8 @@
 
 	const changeCount = $derived(workspace.scmChangeCount);
 	const commits = $derived(workspace.gitCommits);
+	let showAllCommits = $state(false);
+	const VISIBLE_COMMITS = 3;
 
 	// Amend-with-empty-message is valid (preserve previous
 	// subject); fresh commits still need a message. Push and pull
@@ -1247,19 +1249,31 @@
 		</button>
 	{/if}
 	{#if commits.length > 0}
-		<div class="commit-list" role="list" aria-label="Recent commits">
+		{@const visibleCommits = showAllCommits ? commits : commits.slice(0, VISIBLE_COMMITS)}
+		<div class="commit-list" aria-label="Recent commits">
 			<div class="commit-list-header">Recent commits</div>
-			{#each commits.slice(0, 10) as commit (commit.sha)}
-				<div
+			{#each visibleCommits as commit (commit.sha)}
+				<button
+					type="button"
 					class="commit-row"
-					role="listitem"
 					title={`${commit.subject}\n${commit.author} • ${commit.dateRelative}\n${commit.sha}`}
+					disabled={busy}
+					onclick={() => workspace.openCommitTab(commit.sha, commit.subject)}
 				>
 					<span class="commit-sha">{commit.shortSha}</span>
 					<span class="commit-subject">{commit.subject}</span>
 					<span class="commit-date">{commit.dateRelative}</span>
-				</div>
+				</button>
 			{/each}
+			{#if commits.length > VISIBLE_COMMITS && !showAllCommits}
+				<button type="button" class="commit-more" disabled={busy} onclick={() => (showAllCommits = true)}>
+					{commits.length - VISIBLE_COMMITS} more commit{commits.length - VISIBLE_COMMITS === 1 ? '' : 's'}…
+				</button>
+			{:else if showAllCommits && commits.length > VISIBLE_COMMITS}
+				<button type="button" class="commit-more" disabled={busy} onclick={() => (showAllCommits = false)}>
+					Show less
+				</button>
+			{/if}
 		</div>
 	{/if}
 </section>
@@ -1971,10 +1985,56 @@
 		display: flex;
 		align-items: baseline;
 		gap: 6px;
-		padding: 2px 0;
+		padding: 2px 4px;
+		margin: 0 -4px;
 		font-size: 11px;
 		line-height: 1.35;
 		min-width: 0;
+		appearance: none;
+		background: transparent;
+		border: none;
+		color: inherit;
+		text-align: left;
+		cursor: pointer;
+		border-radius: 4px;
+		width: 100%;
+	}
+	.commit-row:hover:not(:disabled) {
+		background: var(--m-bg-2);
+	}
+	.commit-row:focus-visible {
+		outline: 1px solid var(--m-accent);
+		outline-offset: -1px;
+	}
+	.commit-row:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+	.commit-more {
+		appearance: none;
+		background: transparent;
+		border: none;
+		color: var(--m-fg-subtle);
+		font: inherit;
+		font-size: 11px;
+		padding: 2px 4px;
+		margin: 0 -4px;
+		cursor: pointer;
+		text-align: left;
+		width: 100%;
+		border-radius: 4px;
+	}
+	.commit-more:hover:not(:disabled) {
+		color: var(--m-fg-muted);
+		background: var(--m-bg-2);
+	}
+	.commit-more:focus-visible {
+		outline: 1px solid var(--m-accent);
+		outline-offset: -1px;
+	}
+	.commit-more:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
 	}
 	.commit-sha {
 		flex-shrink: 0;

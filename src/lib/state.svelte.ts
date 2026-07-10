@@ -63,6 +63,7 @@ import { fingerprint, fingerprintEquals, type ContentFingerprint } from './util/
 import { fileKindFor, type FileKind } from './util/fileKind';
 import { isMarkdownPath } from './util/markdown';
 import { isReviewPath, REVIEW_PATH } from './util/reviewPath';
+import { commitPath, isCommitPath, shaFromCommitPath } from './util/commitPath';
 
 export type MarkdownView = 'source' | 'preview';
 
@@ -4392,6 +4393,41 @@ class WorkspaceState {
 	}
 
 	/**
+	 * Open (or focus, if already open) a per-commit diff pseudo-tab.
+	 * Each commit gets its own tab keyed on `commit://<sha>`; the
+	 * `CommitView` component reads the SHA from the path and fetches
+	 * the file list + blobs itself. Same synthetic-`OpenFile` shape as
+	 * `openReviewTab` so persistence, LSP, blame, and HEAD fetch all
+	 * skip it via `isSyntheticBufferPath`.
+	 */
+	openCommitTab(sha: string, subject: string, side: SplitSide = this.focusedSide) {
+		const path = commitPath(sha);
+		const existing = this.openFiles.find((f) => f.path === path);
+		if (!existing) {
+			const file: OpenFile = {
+				path,
+				name: subject.length > 0 ? subject : sha.slice(0, 7),
+				kind: 'text',
+				isUntitled: false,
+				text: '',
+				previewUrl: '',
+				loadedFingerprint: fingerprint(''),
+				loadedMtimeMs: null,
+				isDirty: false,
+				isDeleted: false,
+				isExternal: false,
+				pendingEdit: null,
+			};
+			this.openFiles = [...this.openFiles, file];
+		}
+		const tabs = this.tabsFor(side);
+		if (!tabs.includes(path)) {
+			this.setTabsFor(side, [...tabs, path]);
+		}
+		this.setActive(path, side);
+	}
+
+	/**
 	 * Lazily attach a backing `OpenFile` for a path that the user is
 	 * editing from inside a review section, without touching tab
 	 * strips or the active-side pointer. The review tab stays
@@ -4490,6 +4526,18 @@ class WorkspaceState {
 		// stub buffer on demand.
 		if (isReviewPath(path)) {
 			this.openReviewTab(side);
+			return;
+		}
+		if (isCommitPath(path)) {
+			// Commit pseudo-tab: the synthetic OpenFile is rebuilt
+			// on demand if it was closed (same pattern as review).
+			// We don't have the subject here, so fall back to the
+			// SHA for the tab name; the tab title updates via the
+			// existing file's `name` if the buffer already exists.
+			const sha = shaFromCommitPath(path);
+			if (sha !== null) {
+				this.openCommitTab(sha, '', side);
+			}
 			return;
 		}
 		const existing = this.openFiles.find((f) => f.path === path);
@@ -6773,13 +6821,13 @@ function isGitStatePath(path: string): boolean {
 
 /** True for any synthetic path that doesn't back onto a real
  *  on-disk file under a bound folder — `untitled:N` unsaved
- *  buffers and the `review://` pseudo-tab. Used by every gate
- *  that would otherwise route to the host's filesystem (LSP,
- *  blame, HEAD fetch, persistence, format-on-save, …) so we
- *  don't fire IPCs that are guaranteed to fail or, worse,
- *  silently match the wrong file. */
+ *  buffers, the `review://` pseudo-tab, and `commit://<sha>` per-
+ *  commit diff tabs. Used by every gate that would otherwise route
+ *  to the host's filesystem (LSP, blame, HEAD fetch, persistence,
+ *  format-on-save, …) so we don't fire IPCs that are guaranteed to
+ *  fail or, worse, silently match the wrong file. */
 export function isSyntheticBufferPath(path: string): boolean {
-	return isUntitledPath(path) || isReviewPath(path);
+	return isUntitledPath(path) || isReviewPath(path) || isCommitPath(path);
 }
 
 /**

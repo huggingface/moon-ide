@@ -92,7 +92,11 @@ Three control surfaces:
   lives on the queued message in the transcript, not in the composer,
   so it targets the exact steer it's attached to (`coder_drain_steer_now`
   by id). A stale click — the runner already drained the queue at its
-  last iteration top — is a silent no-op.
+  last iteration top — is a silent no-op. The loop-back mints a fresh
+  `CancellationToken` for the drained turn: `CancellationToken` is
+  one-shot, so the just-cancelled token can't be reused — the new
+  `run_turn` would bail at its iteration-top guard before the steer
+  drains, spinning the loop forever with `busy` stuck and stop dead.
 - **Follow-up** (Alt+Enter while idle-but-just-finished): future —
   not implemented. Sending while idle starts a fresh turn.
 

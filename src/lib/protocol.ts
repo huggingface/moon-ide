@@ -459,6 +459,19 @@ export type CommitEntry = {
 };
 
 /**
+ * File-level changes for a single commit vs its first parent. Mirrors
+ * `moon_protocol::git::CommitDiff`. The `commit://` pseudo-tab reads
+ * `parentSha` and `commitSha` via `gitRefContent` to render each
+ * section's base / after sides.
+ */
+export type CommitDiff = {
+	parentSha: string;
+	commitSha: string;
+	subject: string;
+	entries: GitStatusEntry[];
+};
+
+/**
  * One linked working tree of a repository, from
  * `git worktree list --porcelain`. Backs worktree-backed coder
  * sessions (ADR 0028): each isolated session checks its branch out

@@ -541,6 +541,32 @@ pub struct CommitEntry {
 	pub date_relative: String,
 }
 
+/// File-level changes for a single commit, returned by
+/// `git_commit_diff`. The frontend opens a `commit://<sha>` pseudo-tab
+/// whose sections read the base side from `parent_sha` and the after
+/// side from the commit's own SHA — both via the existing
+/// `git_ref_content` command, which already accepts any 40-char hex rev.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitDiff {
+	/// Full 40-char SHA of the commit's first parent. The frontend
+	/// passes this to `git_ref_content` for each section's base side.
+	/// Empty string when the commit has no parent (root commit) — the
+	/// base side renders empty and every file reads as a pure addition.
+	pub parent_sha: String,
+	/// Full 40-char SHA of the commit itself. The frontend passes this
+	/// to `git_ref_content` for each section's after side.
+	pub commit_sha: String,
+	/// First line of the commit message. Shown in the commit view's
+	/// banner alongside the short SHA.
+	pub subject: String,
+	/// File-level changes from `parent_sha` to `commit_sha`, parsed
+	/// with the same `--name-status -z --no-renames` discipline as
+	/// `BranchDiffStatus`.
+	pub entries: Vec<GitStatusEntry>,
+}
+
 /// A GitHub permalink for a path + line range, ready to paste into
 /// a PR comment, issue, or chat. Built from the active folder's
 /// `origin` / `upstream` remote and the current `HEAD` commit SHA,

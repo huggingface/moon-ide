@@ -3,6 +3,7 @@
 	import { workspace, type MarkdownView, type OpenFile, type SplitSide } from '../state.svelte';
 	import { isMarkdownPath } from '../util/markdown';
 	import { isReviewPath } from '../util/reviewPath';
+	import { isCommitPath } from '../util/commitPath';
 	import ContextMenu from './ContextMenu.svelte';
 	import type { ContextMenuItem } from './contextMenu';
 	import RevertIcon from './icons/RevertIcon.svelte';
@@ -309,7 +310,7 @@
 	}
 
 	function absolutePathFor(file: OpenFile): string | null {
-		if (file.isUntitled || isReviewPath(file.path)) {
+		if (file.isUntitled || isReviewPath(file.path) || isCommitPath(file.path)) {
 			return null;
 		}
 		if (file.isExternal) {
@@ -365,7 +366,7 @@
 		// external buffers `file.path` already *is* the absolute host
 		// path, so the relative entry would be a duplicate of "Copy
 		// path"; for untitled buffers there's no path at all.
-		if (!file.isExternal && !file.isUntitled && !isReviewPath(file.path)) {
+		if (!file.isExternal && !file.isUntitled && !isReviewPath(file.path) && !isCommitPath(file.path)) {
 			items.push({
 				id: 'copy-relative-path',
 				label: 'Copy relative path',
@@ -471,7 +472,7 @@
 				class:dragging={draggingPath === file.path}
 				class:drop-before={dropBeforePath === file.path}
 				aria-selected={activePath === file.path}
-				title={file.isUntitled || isReviewPath(file.path) ? file.name : file.path}
+				title={file.isUntitled || isReviewPath(file.path) || isCommitPath(file.path) ? file.name : file.path}
 				tabindex="0"
 				draggable="true"
 				onclick={() => workspace.setActive(file.path, side)}

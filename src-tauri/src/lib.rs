@@ -135,6 +135,7 @@ pub fn run() {
 			commands::fs::fs_git_fetch,
 			commands::fs::fs_git_head_commit_message,
 			commands::fs::fs_git_log,
+			commands::fs::fs_git_commit_diff,
 			commands::fs::fs_branch_list,
 			commands::fs::fs_git_existing_pr_url,
 			commands::fs::fs_branch_switch,
