@@ -377,8 +377,7 @@ export const ipc = {
 		suggestTerminalCommand: (request: string, targetKind: string, cwd: string) =>
 			invoke<string>('coder_suggest_terminal_command', { request, targetKind, cwd }),
 		abort: () => invoke<void>('coder_abort'),
-		interrupt: (text: string, images: ImageAttachmentPayload[] = []) =>
-			invoke<void>('coder_interrupt', { text, images }),
+		drainSteerNow: (id: string) => invoke<boolean>('coder_drain_steer_now', { id }),
 		unqueueSteer: (id: string) => invoke<UnqueuedSteer | null>('coder_unqueue_steer', { id }),
 		respondToPrompt: (callId: string, response: PromptResponse) =>
 			invoke<boolean>('coder_respond_to_prompt', { callId, response }),

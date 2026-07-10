@@ -72,11 +72,21 @@ Three control surfaces:
   calls. Aborting drops any queued steers.
 - **Steer** (Enter while streaming / running tools): the composer
   stays editable mid-turn. The message is queued, shows up in the
-  transcript immediately, and the running loop drains the queue
-  before its next LLM call — including one extra round-trip when a
-  steer arrives during the final assistant message. Steers are
-  persisted at drain time (the chat-completions shape forbids a user
-  message between an assistant `tool_calls` and its results).
+  transcript immediately as a muted "queued" row, and the running
+  loop drains the queue before its next LLM call — including one
+  extra round-trip when a steer arrives during the final assistant
+  message. Steers are persisted at drain time (the chat-completions
+  shape forbids a user message between an assistant `tool_calls` and
+  its results).
+- **Go now** (a "go now" button on the queued row): the user typed a
+  steer mid-turn but doesn't want to wait for the running turn to
+  settle. Cancels the current turn (like abort) and lets the spawn
+  loop drain that steer into a fresh turn immediately — no `Aborted`
+  flash, just the old thinking fading into the new turn. The affordance
+  lives on the queued message in the transcript, not in the composer,
+  so it targets the exact steer it's attached to (`coder_drain_steer_now`
+  by id). A stale click — the runner already drained the queue at its
+  last iteration top — is a silent no-op.
 - **Follow-up** (Alt+Enter while idle-but-just-finished): future —
   not implemented. Sending while idle starts a fresh turn.
 

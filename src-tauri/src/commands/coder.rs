@@ -225,17 +225,15 @@ pub async fn coder_abort(state: State<'_, AppState>) -> Result<(), MoonError> {
 	Ok(())
 }
 
-/// Interrupt the running turn and start a fresh one with the given
-/// message in one motion — the UI's "don't wait, go now" button. If
-/// no turn is running, equivalent to `coder_send`.
+/// "Go now" on a previously-queued steer — the button on the
+/// muted "queued" row in the transcript. Cancels the running turn
+/// and lets the spawn loop drain the steer into a fresh turn.
+/// Returns `false` (no-op) when `id` no longer matches a queued
+/// steer — the runner already drained it at its last iteration
+/// top.
 #[tauri::command]
-pub async fn coder_interrupt(
-	state: State<'_, AppState>,
-	text: String,
-	images: Vec<ImageAttachment>,
-) -> Result<(), MoonError> {
-	state.coder.interrupt_and_send(text, images).await?;
-	Ok(())
+pub async fn coder_drain_steer_now(state: State<'_, AppState>, id: String) -> Result<bool, MoonError> {
+	Ok(state.coder.drain_steer_now(&id).await)
 }
 
 /// Pop a previously-queued steer (a `send` issued while a turn

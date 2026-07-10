@@ -2251,15 +2251,6 @@
 				onpaste={onComposerPaste}
 				onblur={onComposerBlur}
 			></textarea>
-			{#if coder.busy && (coder.draft.trim().length > 0 || coder.attachments.length > 0)}
-				<!-- Interrupt: cancel the running turn and start a fresh
-				     one with the composed message. Shown only while a
-				     turn is running AND the composer has content — the
-				     "don't wait for this thinking to finish, go now" button. -->
-				<button type="button" class="interrupt" title="Interrupt and send now" onclick={() => coder.interrupt()}
-					>go now</button
-				>
-			{/if}
 		</div>
 	{:else if coder.view === 'subagent'}
 		<!-- Sub-agent pop-out: full transcript of one sub-agent, with
@@ -2392,6 +2383,11 @@
 					>{/if}{#if row.queued}<span
 						class="queued-tag"
 						title="Waiting for the current turn to finish. Press ↑ on an empty composer to pull it back.">queued</span
+					><button
+						type="button"
+						class="queued-go-now"
+						title="Don't wait for the current turn — interrupt and run this message now"
+						onclick={() => coder.drainSteerNow(row.id)}>go now</button
 					>{/if}
 				{#if !row.queued && !coder.busy}
 					<!-- Hover-revealed revert affordances. Hidden while a
@@ -2953,19 +2949,7 @@
 	.stop:hover {
 		background: color-mix(in srgb, var(--m-warning, #d4a017) 14%, transparent);
 	}
-	.interrupt {
-		position: absolute;
-		right: 12px;
-		bottom: 12px;
-		font: inherit;
-		font-size: 11px;
-		font-weight: 600;
-		color: var(--m-accent, #4d9);
 
-		&:hover {
-			color: var(--m-accent);
-		}
-	}
 	.icon {
 		background: transparent;
 		border: 0;
@@ -3570,6 +3554,21 @@
 		color: var(--m-fg-muted);
 		text-transform: none;
 		font-weight: 500;
+	}
+	.queued-go-now {
+		margin-left: 4px;
+		font: inherit;
+		font-size: 9px;
+		font-weight: 600;
+		color: var(--m-accent);
+		background: transparent;
+		border: 0;
+		padding: 1px 4px;
+		cursor: pointer;
+
+		&:hover {
+			color: var(--m-fg);
+		}
 	}
 	/* Inline references attached to a user message. Sit just below
 	   the prose bubble and read as quiet "links" rather than

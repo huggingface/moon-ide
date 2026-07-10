@@ -2200,41 +2200,22 @@ class CoderPanelState {
 		}
 	}
 
-	/** Interrupt the running turn and start a fresh one with the
-	 *  composed message — the "don't wait, go now" action. Drains
-	 *  the composer the same way `send` does; the backend cancels
-	 *  the old turn and seeds a new one with the message (no
-	 *  `Aborted` flash in the transcript). */
-	async interrupt(): Promise<void> {
-		const text = this.draft.trim();
-		const attachments = this.attachments;
-		if (text.length === 0 && attachments.length === 0) {
-			return;
-		}
-		const selectionAttachments: SelectionAttachment[] = [];
-		const imageAttachments: ImageComposerAttachment[] = [];
-		const terminalAttachments: TerminalAttachment[] = [];
-		for (const att of attachments) {
-			if (att.kind === 'selection') {
-				selectionAttachments.push(att);
-			} else if (att.kind === 'image') {
-				imageAttachments.push(att);
-			} else {
-				terminalAttachments.push(att);
-			}
-		}
-		const payload = renderPromptWithAttachments(text, selectionAttachments, terminalAttachments);
-		const images: ImageAttachmentPayload[] = imageAttachments.map((img) => ({
-			data_url: img.dataUrl,
-			mime: img.mime,
-		}));
-		this.draft = '';
-		this.clearAttachments();
-		this.busy = true;
+	/** "Go now" on a queued steer — the button on the muted
+	 *  "queued" row. The message is already in the backend's
+	 *  `pending_steers` (queued by a `send` issued while a turn
+	 *  was running); this cancels the running turn so the spawn
+	 *  loop drains the steer into a fresh turn immediately. No
+	 *  composer drain, no payload round-trip — the bytes are
+	 *  already queued. A `false` return (the steer already
+	 *  drained) is a silent no-op. `busy` is left untouched — the
+	 *  turn is already running (that's why the steer queued), and
+	 *  the spawn loop suppresses the `Aborted` event when a
+	 *  pending steer exists, so `busy` stays `true` through the
+	 *  abort-and-loop-back without any preemptive set here. */
+	async drainSteerNow(id: string): Promise<void> {
 		try {
-			await ipc.coder.interrupt(payload, images);
+			await ipc.coder.drainSteerNow(id);
 		} catch (err) {
-			this.busy = false;
 			this.rows = [
 				...this.rows,
 				{

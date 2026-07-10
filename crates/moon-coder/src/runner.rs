@@ -1665,14 +1665,15 @@ impl CoderHandle {
 	}
 
 	/// Pre-flight auth gate shared by every send-shaped entry
-	/// point ([`send`], [`interrupt_and_send`],
-	/// [`replay_from_message`]). HF needs OAuth; user providers
-	/// need a configured key (or a localhost `base_url`, where
-	/// keyless is conventional for Ollama / llama.cpp). Surfacing
-	/// this cleanly up front avoids letting the inference layer
-	/// fail on the first request, and for `replay_from_message`
-	/// keeps the destructive JSONL truncation from running before
-	/// a send that would never fire.
+	/// point ([`send`], [`replay_from_message`]). HF needs OAuth;
+	/// user providers need a configured key (or a localhost
+	/// `base_url`, where keyless is conventional for Ollama /
+	/// llama.cpp). Surfacing this cleanly up front avoids letting
+	/// the inference layer fail on the first request, and for
+	/// `replay_from_message` keeps the destructive JSONL
+	/// truncation from running before a send that would never
+	/// fire. `drain_steer_now` skips this gate — the steer it
+	/// drains was already accepted by an authenticated `send`.
 	async fn ensure_can_send(&self) -> Result<(), CoderError> {
 		let route = self.state.models.read().await.resolve_route();
 		match &route {
@@ -2350,7 +2351,7 @@ impl CoderHandle {
 				)
 				.await;
 				flush_format_queue(&state, &format_queue).await;
-				// An `interrupt_and_send` trips the cancel token AND
+				// A `drain_steer_now` trips the cancel token AND
 				// pushes a steer. That steer must be drained into a
 				// fresh `run_turn`, not treated as a final abort:
 				// backfill orphans for the aborted turn, then loop
@@ -2442,35 +2443,39 @@ impl CoderHandle {
 		}
 	}
 
-	/// Interrupt the running turn and start a fresh one with the
-	/// given message — the \"I don't want to wait for this
-	/// thinking to finish, here's what I actually want\" action.
-	/// Cancels the current turn (like [`abort`]) but **also**
-	/// queues `text` as a steer. The spawn loop's `Err(Aborted)`
-	/// branch detects the pending steer, recovers orphaned
-	/// tool-call results, and loops back into `run_turn` — which
-	/// drains the steer into chat history and runs a fresh LLM
-	/// round-trip on the new message. The UI sees an
+	/// "Go now" on a queued steer: the user typed a message mid-
+	/// turn (it landed in `pending_steers` and rendered as a
+	/// muted "queued" row), then decided they don't want to wait
+	/// for the running turn to settle. Cancels the current turn
+	/// (like [`abort`]) and flips the matching row out of "queued"
+	/// styling by emitting [`CoderEvent::SteerDrained`]. The
+	/// spawn loop's `Err(Aborted)` branch detects the still-pending
+	/// steer, recovers orphaned tool-call results, and loops back
+	/// into `run_turn`, which drains the steer into chat history
+	/// and runs a fresh LLM round-trip. The UI sees an
 	/// uninterrupted `busy` stretch: no `Aborted` flash, just the
 	/// old thinking fading into the new turn.
 	///
-	/// If no turn is running, this is equivalent to [`send`].
-	/// If the active route can't authenticate, returns
-	/// [`CoderError::NotSignedIn`] (same gate as `send`).
-	pub async fn interrupt_and_send(&self, text: String, images: Vec<ImageAttachment>) -> Result<(), CoderError> {
-		// Auth gate — same as `send`.
-		self.ensure_can_send().await?;
-		let (rt, session_id, folder_path) = self.state.active_visible_runtime().await?;
-		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), session_id.clone());
-		let steer_id = new_message_id();
+	/// Returns `false` (no-op) when `id` doesn't match a queued
+	/// steer on the active visible session — either it was never
+	/// queued, or the runner already drained it at the top of its
+	/// next iteration. Auth is **not** re-gated: the steer was
+	/// accepted by an already-authenticated `send`, and the model
+	/// round-trip will reuse the same route that's mid-flight.
+	pub async fn drain_steer_now(&self, id: &str) -> bool {
+		let Ok((rt, session_id, folder_path)) = self.state.active_visible_runtime().await else {
+			return false;
+		};
+		// Confirm the id is a live pending steer before doing
+		// anything destructive. We just need existence here so a
+		// stale "go now" click (the runner already drained the
+		// queue at its last iteration top) is a clean no-op
+		// rather than an abort with nothing to drain.
 		{
-			let mut session = rt.session.lock().await;
-			session.pending_steers.push(PendingSteer {
-				id: steer_id.clone(),
-				text: text.clone(),
-				images: images.clone(),
-			});
-			session.header.updated_at_ms = current_time_ms();
+			let session = rt.session.lock().await;
+			if !session.pending_steers.iter().any(|s| s.id == id) {
+				return false;
+			}
 		}
 		// Skip any parked `ask_user` prompt so the tool returns
 		// and the turn reaches the cancellation point (the
@@ -2478,13 +2483,12 @@ impl CoderHandle {
 		if rt.prompts.has_pending().await {
 			rt.prompts.skip_any().await;
 		}
-		sink.send(CoderEvent::UserMessage {
-			id: steer_id,
-			text,
-			images,
-			queued: false,
-			created_at_ms: Some(current_time_ms()),
-		});
+		// Flip the row out of "queued" styling now — the spawn
+		// loop's drain will re-append it as a real `User` record
+		// anyway, but the visual transition reads better as
+		// "queued → live" the instant the user hits go now.
+		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), session_id);
+		sink.send(CoderEvent::SteerDrained { id: id.to_string() });
 		// Trip the cancel token: the running `run_turn` returns
 		// `Err(Aborted)`, the spawn loop sees the pending steer,
 		// recovers orphans, and loops back to drain it.
@@ -2492,7 +2496,7 @@ impl CoderHandle {
 		if let Some(token) = turn.cancel.as_ref() {
 			token.cancel();
 		}
-		Ok(())
+		true
 	}
 
 	/// Pop a queued steer by id from the active folder's session.
