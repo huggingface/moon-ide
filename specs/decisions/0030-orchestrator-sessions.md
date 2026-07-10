@@ -75,12 +75,13 @@ Two traits make this a different shape from today's `task`:
 
 ## Decision
 
-An **orchestrator** is an ordinary `agent`-mode top-level coder session
+An **orchestrator** is a top-level coder session in a new `coordinator`
+mode (see [§ Fork 1](#fork-1--orchestrator-tool-surface-pure-coordinator--read-only-inspection))
 that can **spawn, observe, and interact with peer top-level sessions**
-("workers"), which are themselves ordinary coder sessions in worktrees.
-The sub-agent layer (`task`, depth-1 cap, synchronous-block, returns-one-
-string, hidden from the session list) is **unchanged** — workers may
-still spawn sub-agents under today's rules.
+("workers"). Workers are themselves ordinary `agent`-mode coder sessions
+in worktrees. The sub-agent layer (`task`, depth-1 cap, synchronous-
+block, returns-one-string, hidden from the session list) is
+**unchanged** — workers may still spawn sub-agents under today's rules.
 
 ### The orchestrator is an in-process client of the coder surface
 
@@ -209,52 +210,97 @@ be "coordinate these other workers." So:
   coordinator should hold that context"). The architecture permits
   them without requiring them at v1.
 
-## Two design forks left open
+## Resolved v1 forks
 
-These shape the implementation but don't change the shape above; both
-want a deliberate call before the first cut.
+### Fork 1 — orchestrator tool surface: pure coordinator + read-only inspection
 
-1. **What tools does the orchestrator have?** Two clean ends:
-   - **(A) Regular agent + coordinator tools.** The orchestrator is an
-     `agent`-mode top-level session with `spawn_worker` /
-     `observe_worker` / `steer_worker` / `respond_to_worker_prompt`
-     appended to its tool list, the way `task` and `ask_user` are
-     appended to a parent's list today. It keeps `read_file` / `bash`
-     / `edit_file` etc., so it can fetch issues with `bash` (`gh`) or
-     `web_fetch` itself and even step in and edit directly. Simplest;
-     one session kind; the model _can_ do work itself. Risk: the model
-     does the work itself instead of delegating, and the tool list is
-     large.
-   - **(B) Pure coordinator.** A distinct session kind with only the
-     worker-management tools (+ `bash` / `web_fetch` for issue
-     discovery, maybe `read_file`). It _cannot_ edit files directly —
-     it must delegate. Forces the delegation posture the use case
-     wants, at the cost of a new "kind" concept the spec currently
-     doesn't have (today: "top-level sessions are always `agent`;
-     mode is a sub-agent concept").
+The orchestrator is a **pure coordinator** in the spirit of option (B)
+above — no `write_file` / `edit_file`, it must delegate all mutation —
+but it keeps **read-only inspection tools** so it can reason about what
+its workers are doing without polluting its context with their
+transcripts:
 
-   The existing design's spirit leans (A) — the `task` precedent is
-   "append to the parent's tool list," not "a new session kind." But
-   the _behaviour_ the use case wants (it delegates rather than doing)
-   leans (B).
+- `read_file`, `list_dir`, `grep` — for codebase context when planning
+  or answering a worker's question.
+- `bash` (read-only intent, `research`-mode semantics) and `web_fetch` /
+  `web_search` — for issue discovery (`gh issue list`), looking at PRs,
+  reading docs.
+- `spawn_worker` / `observe_worker` / `steer_worker` / `abort_worker` /
+  `respond_to_worker_prompt` — the coordinator tools.
 
-2. **"Take over" and multi-client concurrency on one session.** Once a
-   worker is a real top-level session, two clients (you + the
-   orchestrator, and potentially the phone _too_) can all send to /
-   abort / answer the same session. The companion app raises the
-   identical question (phone + desktop, same session). So this is not
-   a new problem this ADR invents — it's the same multi-client-same-
-   session question, and whatever resolution the companion lands on
-   (first-writer-wins? "foreground client" claim? last-writer-wins
-   with event echo?) will bind the orchestrator too. Resolve it once,
-   in the companion's terms, not twice.
+It is a distinct session kind, not "an `agent`-mode session with
+coordinator tools appended." Today the spec says "top-level sessions are
+always `agent`; mode is a sub-agent concept" — this ADR adds one top-
+level mode (`coordinator`) alongside `agent`. The tool-list shape
+enforces the posture (the model _can't_ edit, so it _must_ delegate),
+which is the behaviour the use case wants. A regular `agent` session
+that happens to be doing coordination (option (A)) is still allowed —
+nothing prevents a user from running an `agent` session and using
+`spawn_worker` if that surfaces as a need — but the orchestrator the
+use case points at is `coordinator`.
 
-   The one asymmetry worth noting: the orchestrator is an
-   _autonomous_ client, so "it steered a worker I was looking at" is
-   more surprising than "my phone steered a session my desktop had
-   open." That may justify a small affordance — a toast when an agent
-   steers the session you're viewing — but the underlying concurrency
-   rule is shared with the companion.
+This adds a `coordinator` mode the spec doesn't have today. We accept
+the new concept rather than overload `agent` because the whole point is
+to _prevent_ the model from doing the work itself, and tool-list shape
+is the reliable enforcement (prompt-nudges aren't).
+
+### Supporting direction: per-turn diffs (not a v1 commitment)
+
+A pure coordinator that can't read worker transcripts still needs to
+_review what a worker changed_ — a diff, compact and current, not a
+stream of `tool_call` rows. This motivates a separate, smaller idea:
+**store per-turn diffs** — the working-tree diff attributable to one
+agent turn, persisted alongside the JSONL or derived from it.
+
+Two consumers, same storage:
+
+- The **orchestrator** gets "what did worker #2's last turn change?"
+  as a compact artifact in a dispatch packet, instead of either (a)
+  reading the worker's full transcript or (b) holding the worktree's
+  state in its own context.
+- The **IDE** gets a per-turn diff review surface ("show me what the
+  agent changed this turn"), which is independently useful for any
+  session — you review an agent run turn-by-turn the way you'd review
+  a colleague's commits.
+
+This is a supporting direction, **not a v1 commitment.** It's captured
+here because it's what makes the pure-coordinator posture viable for
+review, and because the "same storage, two consumers" pattern is
+consistent with the rest of this ADR. Shape, persistence, and whether
+it lands before or with the first orchestrator cut stay open.
+
+### Fork 2 — "take over": the orchestrator manages what it spawned; edge cases deferred
+
+v1 scoping, not a concurrency rule:
+
+- The orchestrator **only coordinates the sessions it spawned.** It
+  does not react to sessions it didn't create (other top-level
+  sessions, sessions the user opened by hand, sessions another
+  orchestrator spawned). Its dispatch queue is fed by its own workers
+  only.
+- The human (or the companion) can still **open a worker as a normal
+  active session** and stop / steer / answer its `ask_user` through the
+  existing surfaces — **we don't handle the multi-client edge cases
+  correctly for v1.** If both the orchestrator and the user steer the
+  same worker, last-writer-wins-ish, no claim protocol, no
+  "foreground client" arbitration. The orchestrator doesn't detect
+  or react to the human's intervention.
+- This is explicitly **deferred, not solved.** The full multi-client-
+  same-session concurrency question (orchestrator + desktop + phone
+  all attending one worker) is the companion app's question and gets
+  resolved once, in the companion's terms, later. The one asymmetry —
+  the orchestrator is an _autonomous_ client, so "it steered a worker
+  I was looking at" is more surprising than "my phone steered a
+  session my desktop had open" — may eventually justify a small
+  affordance (a toast when an agent steers the session you're
+  viewing), but not for v1.
+
+The practical effect: for v1, a worker is the orchestrator's to manage
+end-to-end, and "take over" is just _you opening the session_ — it
+works because the session is ordinary and the existing surfaces still
+apply, but the orchestrator carries on oblivious. That's good enough
+for the motivating use case (orchestrator drives workers to PRs, you
+can look at any of them) and keeps the scope of this ADR small.
 
 ## What this deliberately does not do
 
@@ -264,7 +310,16 @@ want a deliberate call before the first cut.
 - **Does not make workers a special session kind.** A worker is an
   ordinary top-level session in a worktree. The only thing that makes
   it a "worker" is that the orchestrator spawned it and holds a handle.
-  Open it yourself and it's just another session.
+  Open it yourself and it's just another session. (The orchestrator
+  _is_ a new top-level mode — `coordinator` — per Fork 1 above. That's
+  a mode on the _spawning_ side, not a kind on the _spawned_ side:
+  workers are plain `agent` sessions in worktrees.)
+- **Does not solve multi-client concurrency on a worker for v1.** If
+  the orchestrator and the human (or the phone) both steer the same
+  worker, behaviour is last-writer-wins-ish with no arbitration; the
+  orchestrator doesn't detect or react to the human's intervention.
+  See [§ Fork 2](#fork-2--take-over-the-orchestrator-manages-what-it-spawned-edge-cases-deferred).
+  Resolved later, in the companion's terms, once.
 - **Does not solve cross-restart survival.** "Run until each PR is
   opened" may outlive a single IDE session. The companion spec already
   names this boundary: detached / overnight runs need an always-on
