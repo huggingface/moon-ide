@@ -517,6 +517,30 @@ pub struct GitCommitResult {
 	pub summary: String,
 }
 
+/// One entry in the recent-commit list the SCM panel renders below the
+/// sync buttons. Keeps the shape minimal — the panel needs enough to
+/// identify each commit (short SHA, subject, author, relative date)
+/// without turning into a full `git log` viewer. A click on a row opens
+/// the diff view for that commit against its first parent.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitEntry {
+	/// First seven characters of the commit's SHA.
+	pub short_sha: String,
+	/// Full 40-character SHA. Used as the diff endpoint when the user
+	/// clicks a row — `git diff <parent>..<sha>` needs the full hash.
+	pub sha: String,
+	/// First line of the commit message.
+	pub subject: String,
+	/// Full author name as recorded on the commit.
+	pub author: String,
+	/// Relative date string from `git log --date=relative` — e.g.
+	/// `"2 hours ago"`. Pre-formatted by git so the frontend renders
+	/// it verbatim without a date library.
+	pub date_relative: String,
+}
+
 /// A GitHub permalink for a path + line range, ready to paste into
 /// a PR comment, issue, or chat. Built from the active folder's
 /// `origin` / `upstream` remote and the current `HEAD` commit SHA,

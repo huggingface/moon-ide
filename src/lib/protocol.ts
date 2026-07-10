@@ -447,6 +447,18 @@ export type GitCommitResult = {
 };
 
 /**
+ * One entry in the recent-commit list the SCM panel renders below the
+ * sync buttons. Mirrors `moon_protocol::git::CommitEntry`.
+ */
+export type CommitEntry = {
+	shortSha: string;
+	sha: string;
+	subject: string;
+	author: string;
+	dateRelative: string;
+};
+
+/**
  * One linked working tree of a repository, from
  * `git worktree list --porcelain`. Backs worktree-backed coder
  * sessions (ADR 0028): each isolated session checks its branch out

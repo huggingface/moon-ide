@@ -15,6 +15,7 @@ import {
 	type PrListScope,
 	type CompareBaseline,
 	type BranchSwitchTarget,
+	type CommitEntry,
 	type EditorConfig,
 	type EditRequest,
 	type FolderSession,
@@ -2502,6 +2503,17 @@ class WorkspaceState {
 	});
 
 	/**
+	 * Recent commits on the active folder's current branch. The SCM
+	 * panel renders these below the sync buttons — a compact list
+	 * (short SHA, subject, relative date) so the user always has a
+	 * glance at what just landed, especially when the working tree
+	 * is clean and the rest of the panel feels empty. Refreshed on
+	 * folder switch, after commits, and on every `refreshGitStatus`
+	 * pass so external commits surface without a manual refresh.
+	 */
+	gitCommits = $state<readonly CommitEntry[]>([]);
+
+	/**
 	 * URL of the open GitHub PR matching the active folder's
 	 * current branch, or `null` when there isn't one (or `gh`
 	 * isn't installed / authed, the remote isn't GitHub, etc.).
@@ -2621,6 +2633,26 @@ class WorkspaceState {
 		// short-circuits to `null` for non-GitHub / detached /
 		// gh-missing cases and stays cheap to skip.
 		void this.refreshGitExistingPrUrl({ force: false });
+		// Recent commits list is a sibling probe — a commit just
+		// landed (ours or external), so the panel's list should
+		// reflect the new tip. Best-effort: errors collapse to an
+		// empty list rather than a flash.
+		void this.refreshGitLog();
+	}
+
+	/**
+	 * Refresh `gitCommits` from `git log`. The SCM panel renders the
+	 * list below the sync buttons; a glance at recent commits is
+	 * especially useful when the working tree is clean. Failures
+	 * collapse to an empty list — a transient git glitch shouldn't
+	 * strand the panel with stale commits.
+	 */
+	async refreshGitLog() {
+		try {
+			this.gitCommits = await ipc.fs.gitLog();
+		} catch {
+			this.gitCommits = [];
+		}
 	}
 
 	/**

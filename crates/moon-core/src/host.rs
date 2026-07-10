@@ -9,8 +9,9 @@ use camino::{Utf8Path, Utf8PathBuf};
 use moon_protocol::editorconfig::EditorConfig;
 use moon_protocol::fs::{CollectPathsResult, DirEntry, EntryKind, ReadFileResult, StatResult, WriteFileResult};
 use moon_protocol::git::{
-	BranchDiffStatus, BranchList, BranchListEntry, BranchSwitchTarget, GitBranchInfo, GitCommitResult, GitFileBlame,
-	GitFileStatus, GitLineBlame, GitMergeState, GitPermalink, GitStatusEntry, GitWorktree, PrListScope, PrListStatus,
+	BranchDiffStatus, BranchList, BranchListEntry, BranchSwitchTarget, CommitEntry, GitBranchInfo, GitCommitResult,
+	GitFileBlame, GitFileStatus, GitLineBlame, GitMergeState, GitPermalink, GitStatusEntry, GitWorktree, PrListScope,
+	PrListStatus,
 };
 use moon_protocol::review::{PublishReviewRequest, PublishReviewResult, ReviewSide};
 use moon_protocol::{MoonError, MoonResult};
@@ -561,6 +562,14 @@ pub trait WorkspaceHost: Send + Sync {
 	/// there's nothing to diff (clean tree, not a repo, git
 	/// unavailable).
 	async fn git_diff_patch(&self) -> MoonResult<String>;
+
+	/// Recent commits on the current branch (`git log --pretty=…`),
+	/// capped at `limit` entries (default 50). Returns short SHA,
+	/// full SHA, subject, author, and a relative date per commit —
+	/// enough for the SCM panel's recent-commits list without pulling
+	/// the full body / parents / stat. Empty vec when the repo has no
+	/// commits yet, isn't a repo, or git is unavailable.
+	async fn git_log(&self, limit: u32) -> MoonResult<Vec<CommitEntry>>;
 
 	/// Recent branches + open PRs for the active folder, formatted
 	/// for the branch-switcher palette. Two sections in the
@@ -2148,6 +2157,17 @@ impl WorkspaceHost for LocalHost {
 		.await
 		.map_err(|e| MoonError::Internal(format!("git_diff_patch join error: {e}")))?
 	}
+
+	async fn git_log(&self, limit: u32) -> MoonResult<Vec<CommitEntry>> {
+		let guard = self.git_lock().await;
+		let root = self.root.clone();
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			Ok(run_git_log(&root, limit))
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_log join error: {e}")))?
+	}
 }
 
 /// `git symbolic-ref --short HEAD` for the branch name,
@@ -3710,6 +3730,53 @@ fn run_git_head_commit_message(root: &Utf8Path) -> String {
 		.unwrap_or_default()
 		.trim_end_matches('\n')
 		.to_string()
+}
+
+/// Recent commits on the current branch for the SCM panel's
+/// recent-commits list. `git log` with a `%x1f` (unit separator)
+/// delimiter between fields so we can split each line cleanly
+/// without fighting git's default newline-joined pretty format.
+/// Returns empty vec on any failure (no repo, no commits, git
+/// unavailable).
+fn run_git_log(root: &Utf8Path, limit: u32) -> Vec<CommitEntry> {
+	use std::process::Command;
+
+	let limit = limit.clamp(1, 200);
+	let output = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args([
+			"log",
+			&format!("-{limit}"),
+			"--pretty=%H%x1f%h%x1f%s%x1f%an%x1f%cr",
+			"--no-color",
+		])
+		.output();
+	let Ok(output) = output else {
+		return Vec::new();
+	};
+	if !output.status.success() {
+		return Vec::new();
+	}
+	let stdout = String::from_utf8_lossy(&output.stdout);
+	stdout
+		.lines()
+		.filter_map(|line| {
+			let mut parts = line.splitn(5, '\u{1f}');
+			let sha = parts.next()?.to_owned();
+			let short_sha = parts.next()?.to_owned();
+			let subject = parts.next()?.to_owned();
+			let author = parts.next()?.to_owned();
+			let date_relative = parts.next()?.to_owned();
+			Some(CommitEntry {
+				sha,
+				short_sha,
+				subject,
+				author,
+				date_relative,
+			})
+		})
+		.collect()
 }
 
 /// Working-tree patch the SCM panel feeds to the AI commit-message
@@ -7687,6 +7754,45 @@ mod tests {
 		// host returns empty string, callers treat as "nothing to
 		// prefill".
 		assert_eq!(host(&dir).git_head_commit_message().await.unwrap(), "");
+	}
+
+	#[tokio::test]
+	async fn git_log_returns_recent_commits() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping git_log test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "Alice"]);
+		std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "First commit"]);
+		std::fs::write(dir.path().join("b.txt"), "beta\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "Second commit"]);
+
+		let entries = host(&dir).git_log(10).await.unwrap();
+		assert_eq!(entries.len(), 2, "got {entries:?}");
+		// Newest first.
+		assert_eq!(entries[0].subject, "Second commit");
+		assert_eq!(entries[0].author, "Alice");
+		assert!(entries[0].sha.len() == 40, "full SHA: {}", entries[0].sha);
+		assert!(entries[0].short_sha.len() == 7, "short SHA: {}", entries[0].short_sha);
+		assert!(!entries[0].date_relative.is_empty());
+		assert_eq!(entries[1].subject, "First commit");
+	}
+
+	#[tokio::test]
+	async fn git_log_empty_when_no_commits() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping no-commits git_log test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		assert_eq!(host(&dir).git_log(10).await.unwrap(), Vec::new());
 	}
 
 	#[tokio::test]

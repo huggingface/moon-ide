@@ -163,6 +163,7 @@
 	let newBranchInput: HTMLInputElement | undefined = $state();
 
 	const changeCount = $derived(workspace.scmChangeCount);
+	const commits = $derived(workspace.gitCommits);
 
 	// Amend-with-empty-message is valid (preserve previous
 	// subject); fresh commits still need a message. Push and pull
@@ -1245,6 +1246,22 @@
 			{/if}
 		</button>
 	{/if}
+	{#if commits.length > 0}
+		<div class="commit-list" role="list" aria-label="Recent commits">
+			<div class="commit-list-header">Recent commits</div>
+			{#each commits.slice(0, 10) as commit (commit.sha)}
+				<div
+					class="commit-row"
+					role="listitem"
+					title={`${commit.subject}\n${commit.author} • ${commit.dateRelative}\n${commit.sha}`}
+				>
+					<span class="commit-sha">{commit.shortSha}</span>
+					<span class="commit-subject">{commit.subject}</span>
+					<span class="commit-date">{commit.dateRelative}</span>
+				</div>
+			{/each}
+		</div>
+	{/if}
 </section>
 
 <style>
@@ -1929,5 +1946,54 @@
 	.merge-default-btn:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
+	}
+	/* Recent-commits list — a compact stack below the sync buttons.
+	   Renders the last 10 commits on the current branch so the user
+	   always has a glance at what just landed, especially when the
+	   working tree is clean and the rest of the panel feels empty.
+	   Each row is read-only (no click-through to a commit diff yet);
+	   the tooltip carries the full SHA + author + date for context. */
+	.commit-list {
+		margin-top: 6px;
+		display: flex;
+		flex-direction: column;
+		gap: 1px;
+	}
+	.commit-list-header {
+		font-size: 10px;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		color: var(--m-fg-subtle);
+		padding: 2px 0 3px;
+	}
+	.commit-row {
+		display: flex;
+		align-items: baseline;
+		gap: 6px;
+		padding: 2px 0;
+		font-size: 11px;
+		line-height: 1.35;
+		min-width: 0;
+	}
+	.commit-sha {
+		flex-shrink: 0;
+		font-family: var(--m-font-mono, monospace);
+		font-size: 10px;
+		color: var(--m-fg-subtle);
+	}
+	.commit-subject {
+		flex: 1;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		color: var(--m-fg-muted);
+	}
+	.commit-date {
+		flex-shrink: 0;
+		font-size: 10px;
+		color: var(--m-fg-subtle);
+		font-variant-numeric: tabular-nums;
 	}
 </style>
