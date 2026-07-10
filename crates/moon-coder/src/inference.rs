@@ -23,6 +23,7 @@
 //! (sub-agents, future test fixtures).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -32,6 +33,19 @@ use crate::defaults::HF_ROUTER_BASE;
 use crate::error::{request_id_of, CoderError};
 use crate::models::{ResolvedProvider, SharedCoderModels};
 use crate::providers::ProviderKeyring;
+
+/// Ceiling on the TCP+TLS connect phase for inference HTTP requests.
+/// Protects against black-holed endpoints that accept the connection
+/// then never respond — without this a stuck handshake parks the turn
+/// in an uncancellable state. See [`InferenceClient::new`].
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Per-request timeout for non-streaming inference calls (the
+/// `chat_completion` JSON path and the `/v1/models` catalog fetch).
+/// Streaming sends deliberately omit this — a long generation is
+/// legitimate and is bounded by the cancel token + SSE liveness
+/// instead.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Some providers (DeepInfra at least) serialize "this chunk has no
 /// tool calls" as `tool_calls: null` instead of just omitting the
@@ -736,8 +750,17 @@ impl InferenceClient {
 		models: SharedCoderModels,
 		provider_keys: ProviderKeyring,
 	) -> Result<Self, CoderError> {
+		// `connect_timeout` caps the TCP+TLS handshake so a black-holed
+		// endpoint (proxy that accepts the connection then stalls, DNS
+		// hang, …) can't park a turn forever. We deliberately do NOT set a
+		// client-wide `.timeout()` here: a streaming generation can run
+		// for minutes and a blanket timeout would kill legitimate long
+		// turns. Non-streaming sends opt into a per-request timeout
+		// instead (see `send_once`). Streaming sends rely on the
+		// cancel-token `select!` plus the SSE read loop's own liveness.
 		let http = reqwest::Client::builder()
 			.user_agent(concat!("moon-ide/", env!("CARGO_PKG_VERSION")))
+			.connect_timeout(CONNECT_TIMEOUT)
 			.build()
 			.map_err(CoderError::from)?;
 		Ok(Self {
@@ -803,6 +826,38 @@ impl InferenceClient {
 		})
 	}
 
+	/// Cancel-aware wrapper around [`resolve_route_for_request`].
+	///
+	/// The inner method can hit the network (HF OAuth token refresh)
+	/// and historically ran *before* any cancel-aware `select!`,
+	/// which meant a stalled OAuth endpoint parked the turn in an
+	/// uncancellable `.await`: the cancel token tripped but nothing
+	/// polled it, so Esc did nothing and `busy` never cleared. Racing
+	/// it against `cancel` here ensures an abort lands as soon as the
+	/// token fires, regardless of which phase the turn is in.
+	async fn resolve_route_or_abort(
+		&self,
+		cancel: &tokio_util::sync::CancellationToken,
+	) -> Result<ResolvedRoute, CoderError> {
+		tokio::select! {
+			biased;
+			_ = cancel.cancelled() => Err(CoderError::Aborted),
+			route = self.resolve_route_for_request() => route,
+		}
+	}
+
+	/// Cancel-aware wrapper around [`Authenticator::refresh_now`],
+	/// used on the 401-retry path. Same rationale as
+	/// [`resolve_route_or_abort`]: the refresh round trip is a bare
+	/// `.await` that Esc must be able to interrupt.
+	async fn refresh_or_abort(&self, cancel: &tokio_util::sync::CancellationToken) -> Result<String, CoderError> {
+		tokio::select! {
+			biased;
+			_ = cancel.cancelled() => Err(CoderError::Aborted),
+			token = self.auth.refresh_now() => token,
+		}
+	}
+
 	/// GET `/v1/models` against the HF router → rich
 	/// [`RouterModel`] catalog with per-route pricing / throughput.
 	/// Only valid when the active provider is HF; the runner gates
@@ -824,6 +879,7 @@ impl InferenceClient {
 		let response = self
 			.http
 			.get(&endpoint)
+			.timeout(REQUEST_TIMEOUT)
 			.bearer_auth(&token)
 			.send()
 			.await
@@ -966,7 +1022,7 @@ impl InferenceClient {
 		tools: &[ToolDefinition],
 		cancel: &tokio_util::sync::CancellationToken,
 	) -> Result<AssistantResponse, CoderError> {
-		let route = self.resolve_route_for_request().await?;
+		let route = self.resolve_route_or_abort(cancel).await?;
 		if route.kind == RouteKind::Anthropic {
 			return crate::anthropic::chat_completion(&self.http, &route, model, messages, tools, cancel).await;
 		}
@@ -986,7 +1042,7 @@ impl InferenceClient {
 
 		if response.status() == reqwest::StatusCode::UNAUTHORIZED && route.is_huggingface() {
 			tracing::info!("HF inference returned 401; refreshing token and retrying once");
-			let refreshed = self.auth.refresh_now().await?;
+			let refreshed = self.refresh_or_abort(cancel).await?;
 			route.auth_token = Some(refreshed);
 			response = self.send_once(&endpoint, &route, &body, cancel).await?;
 		}
@@ -1046,7 +1102,7 @@ impl InferenceClient {
 	where
 		F: FnMut(StreamEvent<'_>),
 	{
-		let route = self.resolve_route_for_request().await?;
+		let route = self.resolve_route_or_abort(cancel).await?;
 		if route.kind == RouteKind::Anthropic {
 			return crate::anthropic::chat_completion_stream(&self.http, &route, model, messages, tools, cancel, on_event)
 				.await;
@@ -1073,7 +1129,7 @@ impl InferenceClient {
 
 		if response.status() == reqwest::StatusCode::UNAUTHORIZED && route.is_huggingface() {
 			tracing::info!("HF inference returned 401; refreshing token and retrying once");
-			let refreshed = self.auth.refresh_now().await?;
+			let refreshed = self.refresh_or_abort(cancel).await?;
 			route.auth_token = Some(refreshed);
 			response = self.send_once_stream(&endpoint, &route, &body, cancel).await?;
 		}
@@ -1105,7 +1161,11 @@ impl InferenceClient {
 		body: &ChatCompletionRequest<'_>,
 		cancel: &tokio_util::sync::CancellationToken,
 	) -> Result<reqwest::Response, CoderError> {
-		let mut builder = self.http.post(endpoint).json(body);
+		// Non-streaming: cap the whole round trip so a provider that
+		// accepts the request then stalls can't park the turn. Streaming
+		// sends skip this (see `send_once_stream`) — long generations are
+		// legitimate and bounded by the cancel token instead.
+		let mut builder = self.http.post(endpoint).json(body).timeout(REQUEST_TIMEOUT);
 		if let Some(token) = route.auth_token.as_deref() {
 			builder = builder.bearer_auth(token);
 		}

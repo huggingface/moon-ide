@@ -44,6 +44,16 @@ const REFRESH_LEAD_TIME_SECS: u64 = 60;
 /// forever.
 const POLL_TIMEOUT_FALLBACK: Duration = Duration::from_secs(15 * 60);
 
+/// Connect-phase timeout for auth HTTP requests (TCP + TLS handshake).
+const AUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Overall timeout for a single auth round trip (token refresh,
+/// userinfo, device-code request). All auth calls are short
+/// non-streaming requests, so a blanket timeout is safe — and
+/// essential: without it, a stalled OAuth endpoint parks the turn in
+/// an uncancellable `.await` (see the inference cancel-token flow).
+const AUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// What the server returns from the device-authorization endpoint.
 /// The `device_code` is the long secret the loop polls with; the
 /// `user_code` is the short one the UI shows. We keep both.
@@ -268,8 +278,15 @@ pub struct Authenticator {
 
 impl Authenticator {
 	pub fn new() -> Result<Self, CoderError> {
+		// All auth round trips are short non-streaming requests (device
+		// code, token refresh, userinfo), so a client-wide timeout is
+		// safe here — unlike the inference client, there's no long
+		// streaming generation to protect. `connect_timeout` is subsumed
+		// by the overall `timeout` but set explicitly for clarity.
 		let http = reqwest::Client::builder()
 			.user_agent(concat!("moon-ide/", env!("CARGO_PKG_VERSION")))
+			.connect_timeout(AUTH_CONNECT_TIMEOUT)
+			.timeout(AUTH_REQUEST_TIMEOUT)
 			.build()
 			.map_err(CoderError::from)?;
 		let store = TokenStore::new();

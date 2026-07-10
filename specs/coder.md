@@ -69,7 +69,13 @@ Three control surfaces:
 
 - **Abort** (`Esc`): cancels the in-flight HTTP / SSE / tool call.
   The session keeps the partial assistant message and completed tool
-  calls. Aborting drops any queued steers.
+  calls. Aborting drops any queued steers. The cancel token is raced
+  against _every_ network await in a turn — route resolution (which
+  may trigger an OAuth token refresh), the HTTP send, the SSE read
+  loop, and the 401-retry refresh — so Esc lands immediately
+  regardless of which phase the turn is in. Inference and auth HTTP
+  clients also carry a connect timeout so a black-holed endpoint
+  can't park a turn even if nobody clicks stop.
 - **Steer** (Enter while streaming / running tools): the composer
   stays editable mid-turn. The message is queued, shows up in the
   transcript immediately as a muted "queued" row, and the running
@@ -126,9 +132,13 @@ Scopes asked upfront:
 
 The HTTP middleware refreshes the access token when
 `expires_at - now < 60 s` and on a 401 (one retry), writing the new
-triple back to the keyring. A failed refresh drops the keyring entry,
-fires `coder:disconnected`, and the panel returns to the sign-in
-empty state; sessions and the bucket pointer stay.
+triple back to the keyring. The refresh round trip is raced against
+the turn's cancel token and capped by a 30 s client timeout, so a
+stalled OAuth endpoint can't hang an in-flight turn (Esc aborts
+immediately; otherwise the timeout surfaces a transport error). A
+failed refresh drops the keyring entry, fires `coder:disconnected`,
+and the panel returns to the sign-in empty state; sessions and the
+bucket pointer stay.
 
 ### Disconnect
 

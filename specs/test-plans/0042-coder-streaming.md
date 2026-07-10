@@ -29,7 +29,12 @@
   single `tool_call` event once fully assembled.
 - Esc-abort drops the SSE byte stream on the next chunk via
   the existing `CancellationToken` (same token already
-  cancelled in-flight tool calls).
+  cancelled in-flight tool calls). The token is also raced
+  against route resolution and the 401-retry token refresh, so
+  Esc lands even when the turn is parked in an OAuth round trip
+  (the original "hangs entirely" failure mode). Both HTTP
+  clients carry a connect timeout so a black-holed endpoint
+  can't park a turn without Esc either.
 - Frontend reconciles deltas by id; `CoderMarkdown` coalesces
   re-renders to one per `requestAnimationFrame` so a 30 Hz
   delta stream doesn't spawn 30 markdown renders per second.
@@ -68,6 +73,26 @@ markdown with H2 sections`.
    - `aborted` row appears below.
    - The composer re-enables; you can send another prompt
      immediately.
+
+### Esc-abort during route resolution / token refresh
+
+4b. Force the OAuth token to be near-expiry so the next request
+triggers a refresh: edit the cached token bundle's `expires_at` in
+the keyring (or temporarily lower `REFRESH_LEAD_TIME_SECS`), or
+point `HF_HUB_BASE` at a local server that accepts the TCP
+connection but never responds to `/oauth/token`. Send a prompt.
+While the turn is parked in the token-refresh round trip (before any
+SSE arrives), press `Esc`.
+
+Expected:
+
+- The turn aborts immediately (within a second), not after a
+  30 s timeout. The cancel token is raced against the refresh
+  `.await`, so Esc interrupts it.
+- `aborted` row appears; `busy` clears; composer re-enables.
+- If instead you _don't_ press Esc and the endpoint is truly
+  stalled, the turn surfaces a transport error within 30 s
+  (the auth client timeout) rather than hanging forever.
 
 ### Reasoning models (thinking blocks)
 
@@ -181,8 +206,9 @@ checker works`. Watch CPU usage (Activity Monitor / `top`)
   in 6.x and any future test fixtures) — its only behavioural
   diff vs. before is the explicit `stream: false` field on the
   wire.
-- `coder_abort` Tauri command still cancels both the SSE read
-  and any in-flight tool dispatch.
+- `coder_abort` Tauri command still cancels the SSE read,
+  any in-flight tool dispatch, _and_ the route-resolution /
+  401-retry token-refresh awaits.
 - A single `tool_call` event still pairs with a single
   `tool_result` event, keyed by id (same contract as Phase
   6.0).
