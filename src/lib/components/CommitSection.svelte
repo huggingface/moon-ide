@@ -325,4 +325,28 @@
 		font-size: 11px;
 		color: var(--m-fg-subtle);
 	}
+	/* Character-level change marker — same rules as
+	 * `ReviewSection.svelte` and `DiffView.svelte`: the library
+	 * default is a 2px bottom-edge gradient that reads as a loud
+	 * underline. Swap for a soft same-hue background (GitHub-style
+	 * inline diff highlight) using our palette tokens so theme flips
+	 * track. `!important` beats the package's themed rules. */
+	.commit-section :global(.cm-merge-b .cm-changedText) {
+		background: color-mix(in srgb, var(--m-success) 22%, transparent) !important;
+		border-radius: 2px;
+	}
+	.commit-section :global(.cm-merge-a .cm-changedText),
+	.commit-section :global(.cm-deletedChunk .cm-deletedText) {
+		background: color-mix(in srgb, var(--m-danger) 22%, transparent) !important;
+		border-radius: 2px;
+	}
+	.commit-section :global(.cm-merge-b .cm-deletedText) {
+		background: color-mix(in srgb, var(--m-danger) 22%, transparent) !important;
+	}
+	/* Pure-added / pure-deleted lines: the gutter tint already
+	 * conveys the line-level change, so clear the per-character
+	 * marker to avoid doubling up the same hue. */
+	.commit-section :global(.cm-moon-pure-change .cm-changedText) {
+		background: transparent !important;
+	}
 </style>

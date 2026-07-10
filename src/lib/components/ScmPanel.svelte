@@ -1255,7 +1255,7 @@
 			{#each visibleCommits as commit (commit.sha)}
 				<button
 					type="button"
-					class="commit-row"
+					class="commit-list-row"
 					title={`${commit.subject}\n${commit.author} • ${commit.dateRelative}\n${commit.sha}`}
 					disabled={busy}
 					onclick={() => workspace.openCommitTab(commit.sha, commit.subject)}
@@ -1981,7 +1981,7 @@
 		color: var(--m-fg-subtle);
 		padding: 2px 0 3px;
 	}
-	.commit-row {
+	.commit-list-row {
 		display: flex;
 		align-items: baseline;
 		gap: 6px;
@@ -1999,14 +1999,14 @@
 		border-radius: 4px;
 		width: 100%;
 	}
-	.commit-row:hover:not(:disabled) {
+	.commit-list-row:hover:not(:disabled) {
 		background: var(--m-bg-2);
 	}
-	.commit-row:focus-visible {
+	.commit-list-row:focus-visible {
 		outline: 1px solid var(--m-accent);
 		outline-offset: -1px;
 	}
-	.commit-row:disabled {
+	.commit-list-row:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
 	}
