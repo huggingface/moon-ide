@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onDestroy } from 'svelte';
 	import { getCachedMarkdown, handleMarkdownCopyClick, openExternalMarkdownLink, renderMarkdown } from '../markdown';
 	import { workspace } from '../state.svelte';
 	import { visibleOnce } from '../actions/visibleOnce';
@@ -38,7 +39,16 @@
 	let pendingSource = '';
 	let pendingFrame: number | null = null;
 	let renderToken = 0;
+	let renderInFlight = false;
+	let mounted = true;
 	let visible = $state(false);
+
+	// Flip `mounted` false on component destruction so an in-flight
+	// `renderMarkdown` promise that resolves after unmount skips its
+	// `html` write and doesn't schedule a dangling rAF.
+	onDestroy(() => {
+		mounted = false;
+	});
 
 	function scheduleRender(): void {
 		if (pendingFrame !== null) {
@@ -46,8 +56,17 @@
 		}
 		pendingFrame = requestAnimationFrame(() => {
 			pendingFrame = null;
+			// Don't start a new render while one is in flight — the
+			// in-flight render re-schedules on completion if the source
+			// has moved on (see below). This bounds CPU to one
+			// markdown-it + DOMPurify pass at a time instead of fanning
+			// out to one per rAF during a fast stream.
+			if (renderInFlight) {
+				return;
+			}
 			const source = pendingSource;
-			const token = ++renderToken;
+			const token = renderToken;
+			renderInFlight = true;
 			void (async () => {
 				// `linkify: true` so raw URLs in the model's prose
 				// become clickable. Differs from file-content
@@ -55,10 +74,32 @@
 				// linkify off because the author would have used
 				// `[text](url)` if they meant a link.
 				const rendered = await renderMarkdown(source, { linkify: true });
-				if (token !== renderToken) {
+				renderInFlight = false;
+				if (!mounted) {
 					return;
 				}
-				html = rendered;
+				// Only write `html` if no explicit invalidation (a
+				// cache hit in the effect, which bumps `renderToken`)
+				// happened while we were rendering. We deliberately do
+				// NOT bump the token here: doing so would invalidate
+				// every in-flight render on every rAF, and during
+				// continuous streaming (deltas every ~33 ms, rAF every
+				// ~16 ms) no render would ever complete before the next
+				// rAF bumped the token again. The result was `html`
+				// freezing on a stale snapshot for the entire stream —
+				// visible as a "flickering rectangle" of outdated text
+				// that stayed fixed until `assistant_message_end` broke
+				// the cycle.
+				if (token === renderToken) {
+					html = rendered;
+				}
+				// If the source changed while we were rendering, schedule
+				// a fresh render for the latest snapshot. Without this,
+				// the last delta before a render completed would be lost
+				// until the next effect re-run.
+				if (pendingSource !== source) {
+					scheduleRender();
+				}
 			})();
 		});
 	}
@@ -93,6 +134,15 @@
 			return () => {};
 		}
 		pendingSource = source;
+		// Bump the token on every new source so an in-flight render
+		// (started from an earlier delta) knows it's stale and skips
+		// the `html` write. Unlike the old code — which bumped the
+		// token inside the rAF callback on *every frame* — we only
+		// bump here, once per actual source change. During continuous
+		// streaming that's ~30 bumps/sec (one per delta), not ~60
+		// (one per rAF), so a renderMarkdown that takes ~5–15 ms has a
+		// real chance of completing between bumps.
+		renderToken++;
 		scheduleRender();
 		return () => {
 			if (pendingFrame !== null) {
