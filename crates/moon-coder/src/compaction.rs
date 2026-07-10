@@ -3,7 +3,7 @@
 //! When the per-turn token report says the next prompt is going to
 //! eat ~80% or more of the model's context window, we fold the
 //! older middle of the message history into a synthetic
-//! [`ChatMessage::System`] block authored by the fast model, and
+//! [`ChatMessage::System`] block authored by the standard model, and
 //! the runner continues from there. The leading system prompt
 //! (recomposed every turn by `refresh_system_prompt`) and the
 //! recent K user/assistant turns ride through unchanged so the
@@ -111,8 +111,8 @@ pub(crate) struct CompactionApplied {
 
 /// Inspect the last reported token usage; if the next prompt is
 /// likely to cross [`COMPACT_THRESHOLD`] of the context window,
-/// run a fast-model summary call and replace the older prefix of
-/// `messages` with a synthetic [`ChatMessage::System`] holding
+/// run a standard-model summary call and replace the older prefix
+/// of `messages` with a synthetic [`ChatMessage::System`] holding
 /// that summary.
 ///
 /// Returns `Some` when compaction actually ran (and `messages`
@@ -120,7 +120,7 @@ pub(crate) struct CompactionApplied {
 /// returned summary as a `SessionRecord::Compaction` so replay
 /// reaches the same shape. Returns `None` when the threshold
 /// wasn't met, when there isn't enough history to compact, or
-/// when the fast model call itself failed (logged at warn — the
+/// when the summary call itself failed (logged at warn — the
 /// agent keeps going and will try again on the next turn).
 ///
 /// `subagent_id_for_wrap` distinguishes parent vs sub-agent
@@ -138,9 +138,9 @@ pub(crate) async fn compact_if_needed(
 ) -> Option<CompactionApplied> {
 	let usage = last_usage?;
 	// Context-window cap is a property of the *driver* model — the
-	// one whose history we're trying to fit. The cheap model only
-	// has to chew through `messages[1..cutoff]` for the summary;
-	// its own window doesn't gate the decision.
+	// one whose history we're trying to fit. The summary call also
+	// uses the standard model (see `summarise_once`), so the same
+	// window gates both the trigger and the chunk budget.
 	let context = models.context_window(models.standard());
 	if context == 0 {
 		return None;
@@ -253,7 +253,7 @@ fn estimate_tokens(s: &str) -> usize {
 	s.len() / 4
 }
 
-/// Fraction of the cheap model's context window a single summary
+/// Fraction of the standard model's context window a single summary
 /// call's *input* is allowed to fill. The rest is headroom for
 /// the system prompt, the model's own summary output (which can
 /// run several thousand tokens), and estimate slop. Conservative
@@ -262,23 +262,23 @@ fn estimate_tokens(s: &str) -> usize {
 const SUMMARY_INPUT_BUDGET: f32 = 0.55;
 
 /// Default budget (in estimated tokens) for one summary call when
-/// the cheap model's window is unknown (catalog not fetched). Maps
+/// the standard model's window is unknown (catalog not fetched). Maps
 /// to a conservative 128k-window model at [`SUMMARY_INPUT_BUDGET`].
 const SUMMARY_FALLBACK_BUDGET_TOKENS: usize = 70_000;
 
 /// Summarise the older message prefix into a single markdown
-/// block, chunking the input so no individual call to the cheap
+/// block, chunking the input so no individual call to the standard
 /// model exceeds its context window.
 ///
 /// The earlier implementation rendered the entire prefix and sent
 /// it in one shot. On a long, heavily-cached session that prefix
-/// can be far larger than the cheap model's own window (e.g. a
+/// can be far larger than the model's own window (e.g. a
 /// 700k-token history summarised by a 200k-window model), so the
 /// call 400'd every turn and compaction silently never ran — the
 /// session just kept growing past the cap. We now:
 ///
 /// 1. Pack the rendered messages into chunks that each fit the
-///    cheap model's window (with headroom for the system prompt
+///    standard model's window (with headroom for the system prompt
 ///    and the summary output).
 /// 2. Summarise each chunk independently.
 /// 3. If there was more than one chunk, fold the partial
@@ -293,7 +293,15 @@ async fn summarise_prefix(
 	older: &[ChatMessage],
 	cancel: &CancellationToken,
 ) -> Option<String> {
-	let window = models.context_window(models.cheap());
+	// Use the standard model's window for the chunk budget, not the
+	// cheap model's. The prefix being summarised is the standard
+	// model's own history — its window is always large enough to hold
+	// chunks of it. The cheap model's window can be *smaller* than the
+	// standard model's (different provider, different limit), and the
+	// catalog's max-across-providers lookup can overestimate the
+	// cheap model's actual per-route limit — which 400'd the summary
+	// call every turn and made compaction a no-op.
+	let window = models.context_window(models.standard());
 	let budget = if window == 0 {
 		SUMMARY_FALLBACK_BUDGET_TOKENS
 	} else {
@@ -401,7 +409,10 @@ async fn summarise_once(
 		},
 		ChatMessage::user(user_content),
 	];
-	match inference.chat_completion(models.cheap(), &call, &[], cancel).await {
+	// Use the standard model for the summary call — same reason as the
+	// chunk budget above. The standard model's window is always large
+	// enough for the chunks; the cheap model's may not be.
+	match inference.chat_completion(models.standard(), &call, &[], cancel).await {
 		Ok(r) => r.content,
 		Err(err) => {
 			tracing::warn!(error = %err, "compaction summary call failed");

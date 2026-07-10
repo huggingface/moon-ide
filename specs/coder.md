@@ -826,12 +826,17 @@ sending:
 
 1. Keep the most recent 6 user turns (`RECENT_USER_TURNS_KEPT`); the
    oldest of those is the cut point.
-2. Summarise the prefix with the **cheap model** (intent, decisions,
-   files touched, state, next steps). The prefix is **chunked** so no
-   single summary call exceeds the cheap model's own window —
-   chunked summaries are merged with a final pass, recursing if
-   needed. Per-chunk failures are tolerated; the pass only gives up
-   if every call fails.
+2. Summarise the prefix with the **standard model** (intent,
+   decisions, files touched, state, next steps). The prefix is
+   **chunked** so no single summary call exceeds the standard
+   model's own window — chunked summaries are merged with a final
+   pass, recursing if needed. Per-chunk failures are tolerated; the
+   pass only gives up if every call fails. (The standard model is
+   used, not the cheap model, because the cheap model's actual
+   per-route context window can be smaller than the standard
+   model's — the catalog's max-across-providers lookup overestimates
+   the cheap model's limit, which 400'd the summary call every
+   turn and made compaction a silent no-op.)
 3. Replace the prefix with one synthetic system message carrying the
    summary at `messages[1]` (the composed system prompt at
    `messages[0]` is recomposed fresh every turn anyway).
