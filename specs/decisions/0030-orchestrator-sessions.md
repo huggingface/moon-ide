@@ -12,13 +12,14 @@ companion-bridge.md) is still the forcing function for the broader
 "coder surface as a client surface" cleanup; the orchestrator reuses
 the `CoderHandle` method set directly (in-process, not over WSS).
 
-Still **not** implemented (deferred, per the two-fork resolutions):
-events-as-messages (the dispatch-packet feeder that wakes the
-orchestrator's LLM loop on worker events) and the multi-entry batchable
-dispatch queue — the existing steer queue turns out to already be
-multi-entry FIFO with batched drain, so only the per-worker dispatch-
-packet shape remains. See [§ Resolved v1 forks](#resolved-v1-forks) and
-[§ What this deliberately does not do](#what-this-deliberately-does-not-do).
+The events-as-messages feeder is also landed: a background task
+subscribes to the coder event broadcast, filters for the orchestrator's
+workers, builds a dispatch packet on `TurnComplete`, and feeds it into
+the orchestrator's session via `send_to` — waking the orchestrator's
+LLM loop. The existing steer queue was already multi-entry FIFO with
+batched drain (the ADR's premise that it was one-at-a-time was stale),
+so only the feeder task itself was new. See [§ Orchestrator-specific
+mechanics](#orchestrator-specific-mechanics-the-genuinely-new-bits).
 
 ## Context
 
