@@ -1638,9 +1638,19 @@ class CoderPanelState {
 			const summary = await ipc.coder.newSession();
 			this.installCreatedSession(summary);
 		} catch (err) {
-			// Surface on the previously-visible session if any —
-			// otherwise the placeholder bucket. Either way the
-			// user sees the error inline.
+			this.rows = [{ kind: 'error', id: `local-${Date.now()}`, text: formatError(err) }];
+		}
+	}
+
+	/** Start a fresh **coordinator** (orchestrator) session (ADR 0030).
+	 *  Same as `newSession` but the backend stamps `mode: "coordinator"`
+	 *  so `run_turn` advertises the worker-management tools and seeds
+	 *  the coordinator system prompt. */
+	async newCoordinatorSession(): Promise<void> {
+		try {
+			const summary = await ipc.coder.newCoordinatorSession();
+			this.installCreatedSession(summary);
+		} catch (err) {
 			this.rows = [{ kind: 'error', id: `local-${Date.now()}`, text: formatError(err) }];
 		}
 	}

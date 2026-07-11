@@ -30,6 +30,7 @@
 	import SignOutIcon from './icons/SignOutIcon.svelte';
 	import PlusIcon from './icons/PlusIcon.svelte';
 	import BranchIcon from './icons/BranchIcon.svelte';
+	import SparklesIcon from './icons/SparklesIcon.svelte';
 	import CloudUploadIcon from './icons/CloudUploadIcon.svelte';
 	import CloudSyncIcon from './icons/CloudSyncIcon.svelte';
 	import ExternalLinkIcon from './icons/ExternalLinkIcon.svelte';
@@ -1393,6 +1394,12 @@
 		composer?.focus();
 	}
 
+	async function onNewCoordinatorSession(): Promise<void> {
+		await coder.newCoordinatorSession();
+		await tick();
+		composer?.focus();
+	}
+
 	// Creating a worktree is slow (git worktree add + lock, and a
 	// container repair when the workspace is containerised), so the
 	// button shows a spinner + disables until it lands — otherwise a
@@ -1884,6 +1891,15 @@
 					>
 						<BranchIcon />
 					</button>
+					<button
+						type="button"
+						class="icon"
+						onclick={onNewCoordinatorSession}
+						title="New coordinator session — an orchestrator that spawns and manages worker agents"
+						aria-label="New coordinator session"
+					>
+						<SparklesIcon />
+					</button>
 					<button type="button" class="icon" onclick={onNewSession} title="New session" aria-label="New session">
 						<PlusIcon />
 					</button>
@@ -2081,6 +2097,15 @@
 				aria-label="Move session into a worktree"
 			>
 				<BranchIcon />
+			</button>
+			<button
+				type="button"
+				class="icon"
+				onclick={onNewCoordinatorSession}
+				title="New coordinator session — an orchestrator that spawns and manages worker agents"
+				aria-label="New coordinator session"
+			>
+				<SparklesIcon />
 			</button>
 			<button type="button" class="icon" onclick={onNewSession} title="New session" aria-label="New session">
 				<PlusIcon />

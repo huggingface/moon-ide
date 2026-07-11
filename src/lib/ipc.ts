@@ -391,6 +391,7 @@ export const ipc = {
 		listSessions: () => invoke<CoderSessionSummary[]>('coder_list_sessions'),
 		activeSession: () => invoke<CoderSessionSummary | null>('coder_active_session'),
 		newSession: () => invoke<CoderSessionSummary>('coder_new_session'),
+		newCoordinatorSession: () => invoke<CoderSessionSummary>('coder_new_coordinator_session'),
 		newWorktreeSession: (baseBranch?: string) =>
 			invoke<NewWorktreeSession>('coder_new_worktree_session', { baseBranch: baseBranch ?? null }),
 		discardWorktree: (path: string, force: boolean) => invoke<Workspace>('coder_discard_worktree', { path, force }),

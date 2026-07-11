@@ -245,6 +245,7 @@ pub fn run() {
 			commands::coder::coder_list_sessions,
 			commands::coder::coder_active_session,
 			commands::coder::coder_new_session,
+			commands::coder::coder_new_coordinator_session,
 			commands::coder::coder_new_worktree_session,
 			commands::coder::coder_discard_worktree,
 			commands::coder::coder_associate_branch,

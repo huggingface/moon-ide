@@ -347,6 +347,16 @@ pub async fn coder_new_session(state: State<'_, AppState>) -> Result<SessionSumm
 	state.coder.new_session().await.map_err(MoonError::from)
 }
 
+/// Start a fresh **coordinator** (orchestrator) session (ADR 0030).
+/// Same as `coder_new_session` but stamps `mode: "coordinator"` on the
+/// header so `run_turn` advertises the worker-management tools
+/// (`spawn_worker` / `observe_worker` / etc.) instead of `task` /
+/// `ask_user`, and seeds the coordinator system prompt.
+#[tauri::command]
+pub async fn coder_new_coordinator_session(state: State<'_, AppState>) -> Result<SessionSummary, MoonError> {
+	state.coder.new_coordinator_session().await.map_err(MoonError::from)
+}
+
 /// Result of [`coder_new_worktree_session`]: the new bound-folder
 /// snapshot (so the frontend renders the nested worktree row) plus
 /// the freshly-minted session to open.

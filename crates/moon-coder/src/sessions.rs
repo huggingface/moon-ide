@@ -244,6 +244,7 @@ const CUSTOM_TYPE_TODOS_UPDATE: &str = "moon_todos_update";
 const CUSTOM_TYPE_SUBAGENT_SPAWNED: &str = "moon_subagent_spawned";
 const CUSTOM_TYPE_SUBAGENT_FINISHED: &str = "moon_subagent_finished";
 const CUSTOM_TYPE_USAGE: &str = "moon_usage";
+const CUSTOM_TYPE_ERROR: &str = "moon_error";
 
 impl Serialize for SessionHeader {
 	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -495,6 +496,10 @@ pub(crate) fn record_to_pi_wire(
 					*cache_creation_input_tokens,
 				),
 			),
+			timestamp_ms,
+		),
+		SessionRecord::Error { message } => pi_message_envelope(
+			pi_custom_message(CUSTOM_TYPE_ERROR, serde_json::json!({ "message": message })),
 			timestamp_ms,
 		),
 	}
@@ -1100,6 +1105,13 @@ fn parse_pi_custom(msg: &serde_json::Value) -> Option<SessionRecord> {
 				.map(str::to_string),
 		}),
 		CUSTOM_TYPE_USAGE => parse_pi_usage_block(&details),
+		CUSTOM_TYPE_ERROR => Some(SessionRecord::Error {
+			message: details
+				.get("message")
+				.and_then(|v| v.as_str())
+				.unwrap_or_default()
+				.to_string(),
+		}),
 		_ => None,
 	}
 }
@@ -1305,6 +1317,23 @@ pub enum SessionRecord {
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		result_preview: Option<String>,
 	},
+	/// A turn failed with a non-recoverable backend error — auth
+	/// gone bad mid-stream, a decode error from the router, a 400
+	/// from an unpaired / malformed tool call, etc. Persisted so
+	/// the error survives a session reopen: without it, the on-
+	/// disk transcript ends at the last successful record and the
+	/// failure is invisible to anyone debugging from the JSONL
+	/// later (the UI toast vanished the moment the panel closed or
+	/// reloaded). The record carries the provider's error string
+	/// verbatim; replay re-emits a [`crate::CoderEvent::Error`]
+	/// so the reopened transcript shows the failure inline.
+	///
+	/// The record rides in a pi `custom` row (`display:false`,
+	/// `moon_error`) alongside the other moon-specific records.
+	/// It does **not** shape the in-memory `messages` slice on
+	/// reload: an error is terminal for the turn it ended, not
+	/// part of the chat history the next turn sends to the model.
+	Error { message: String },
 }
 
 fn u32_is_zero(n: &u32) -> bool {
@@ -2772,6 +2801,45 @@ mod tests {
 				assert_eq!(out[1].status, crate::TodoStatus::Pending);
 			}
 			other => panic!("expected TodosUpdate, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn error_record_round_trips_via_custom() {
+		// A terminal turn error persists as a `moon_error` custom
+		// row and reloads as `SessionRecord::Error` so the reopened
+		// transcript shows the failure inline instead of trailing
+		// off at the last successful record.
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let header = make_test_header("sess-error");
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::Error {
+				message: "router 400: invalid tool arguments".into(),
+			},
+		)
+		.await
+		.unwrap();
+		let body = tokio::fs::read_to_string(session_path(&dir, "sess-error").as_std_path())
+			.await
+			.unwrap();
+		let line = body.lines().nth(1).expect("error line");
+		let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
+		assert_eq!(parsed["message"]["customType"], CUSTOM_TYPE_ERROR);
+		assert_eq!(parsed["message"]["display"], false);
+		assert_eq!(
+			parsed["message"]["details"]["message"],
+			"router 400: invalid tool arguments"
+		);
+
+		let loaded = load(&dir, "sess-error").await.unwrap();
+		match &loaded.records[0] {
+			SessionRecord::Error { message } => {
+				assert_eq!(message, "router 400: invalid tool arguments");
+			}
+			other => panic!("expected Error, got {other:?}"),
 		}
 	}
 

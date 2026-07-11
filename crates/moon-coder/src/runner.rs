@@ -128,6 +128,22 @@ struct CoderState {
 	/// continuations) and the panel's manual / "Sync all"
 	/// buttons (Tauri commands in `src-tauri/src/commands/coder.rs`).
 	pub(crate) hub_sync: crate::hub_sync::HubSync,
+	/// Orchestrator → worker registry (ADR 0030). Maps each
+	/// orchestrator session id to the set of worker session ids it
+	/// spawned, so the events-as-messages feeder can filter the
+	/// broadcast for just its workers and forward dispatch packets
+	/// back to the orchestrator. Lives on `CoderState` (not the
+	/// orchestrator's `SessionRuntime`) so the feeder task can read
+	/// it without holding a session lock.
+	coordinator_workers: Arc<RwLock<HashMap<String, CoordinatorWorkers>>>,
+}
+
+/// Tracks one orchestrator's spawned workers + whether the dispatch
+/// feeder task is already running for it.
+#[derive(Default)]
+struct CoordinatorWorkers {
+	worker_ids: std::collections::HashSet<String>,
+	feeder_running: bool,
 }
 
 /// One concurrently-runnable session in a folder. Holds the
@@ -633,6 +649,7 @@ impl CoderHandle {
 				models,
 				provider_keys,
 				hub_sync,
+				coordinator_workers: Arc::new(RwLock::new(HashMap::new())),
 			}),
 		})
 	}
@@ -1415,9 +1432,23 @@ impl CoderHandle {
 		let rt = Arc::new(SessionRuntime::new(blank));
 		fs.insert_runtime(id.clone(), rt).await;
 		fs.set_visible(id).await;
-		// Empty sessions don't fire `SessionLoaded` (frontend
-		// reconciles to "blank state" on its own), but the list
-		// hasn't actually changed either — no disk impact yet.
+		Ok(summary)
+	}
+
+	/// Allocate a fresh **coordinator** session under the active
+	/// folder and make it the visible one (ADR 0030). Same shape as
+	/// `new_session` but builds from `new_blank_with_mode(Coordinator)`
+	/// so the header carries `mode: "coordinator"`, the system prompt
+	/// seed is the coordinator prompt, and `run_turn` advertises the
+	/// worker-management tools instead of `task` / `ask_user`.
+	pub async fn new_coordinator_session(&self) -> Result<SessionSummary, CoderError> {
+		let (fs, _) = self.state.active_folder_session().await?;
+		let blank = Session::new_blank_with_mode(CoderMode::Coordinator);
+		let summary = blank.summary();
+		let id = blank.header.id.clone();
+		let rt = Arc::new(SessionRuntime::new(blank));
+		fs.insert_runtime(id.clone(), rt).await;
+		fs.set_visible(id).await;
 		Ok(summary)
 	}
 
@@ -1968,6 +1999,14 @@ impl CoderHandle {
 					// context-length cap.
 					let cutoff = messages.len().saturating_sub(*messages_kept as usize).max(1);
 					crate::compaction::apply_summary_to_messages(&mut messages, cutoff, summary);
+				}
+				SessionRecord::Error { .. } => {
+					// Terminal turn error — UI-only on reload. It
+					// doesn't become a chat message: the failure
+					// ended the turn, so sending a synthetic message
+					// to the model would be history the next turn
+					// never had. `emit_replay_events` re-emits the
+					// `CoderEvent::Error` for the panel.
 				}
 				SessionRecord::SubagentSpawned { .. } | SessionRecord::SubagentFinished { .. } => {
 					// Sub-agent records are UI-only: they rebuild
@@ -3003,6 +3042,7 @@ fn spawn_turn_loop(
 			}
 			Err(err) => {
 				tracing::warn!(error = %err, "coder turn failed");
+				persist_error_record(&rt_for_turn, &err.to_string()).await;
 				sink_for_turn.send(CoderEvent::Error {
 					message: err.to_string(),
 				});
@@ -4033,14 +4073,20 @@ async fn handle_spawn_worker(
 		.create_worktree_session(parsed.base_branch, CoderMode::Agent)
 		.await?;
 	let target_folder = summary.worktree_branch.as_deref().unwrap_or("").to_string();
-	// Seed the worker with the task prompt. This kicks off the
-	// worker's first turn as a detached spawned task.
+	// Seed the worker with the task prompt.
 	handle.send_to(&summary.id, task.to_string(), Vec::new()).await?;
-	// Emit a sub-agent-style event so the parent's transcript shows
-	// the spawn (reuses the existing `SubagentSpawned` shape the
-	// panel renders as a collapsed card). The `subagent_id` is the
-	// worker's session id — the handle the orchestrator uses to
-	// observe / steer / abort it.
+	// Register the worker under the orchestrator's session id so the
+	// events-as-messages feeder can filter the broadcast for it.
+	let orchestrator_id = sink.session_id.clone();
+	{
+		let mut workers = state.coordinator_workers.write().await;
+		let entry = workers.entry(orchestrator_id.clone()).or_default();
+		entry.worker_ids.insert(summary.id.clone());
+		if !entry.feeder_running {
+			entry.feeder_running = true;
+			spawn_dispatch_feeder(state.clone(), orchestrator_id.clone());
+		}
+	}
 	sink.send(CoderEvent::SubagentSpawned {
 		tool_call_id: tool_call_id.to_string(),
 		subagent_id: summary.id.clone(),
@@ -4052,6 +4098,48 @@ async fn handle_spawn_worker(
 		"branch": summary.worktree_branch,
 		"title": summary.title,
 	}))
+}
+
+/// Background task that subscribes to the coder event broadcast,
+/// filters for events from the orchestrator's workers, builds a
+/// dispatch packet, and feeds it into the orchestrator's session as a
+/// user message — waking the orchestrator's LLM loop (ADR 0030
+/// §events-as-messages). Runs for the orchestrator's lifetime; exits
+/// when the broadcast channel closes.
+fn spawn_dispatch_feeder(state: Arc<CoderState>, orchestrator_id: String) {
+	let handle = CoderHandle { state: state.clone() };
+	let mut rx = handle.subscribe();
+	tokio::spawn(async move {
+		loop {
+			let recv = rx.recv().await;
+			let Ok(envelope) = recv else { continue };
+			// Is this envelope from one of our workers?
+			let is_our_worker = {
+				let workers = state.coordinator_workers.read().await;
+				workers
+					.get(&orchestrator_id)
+					.is_some_and(|w| w.worker_ids.contains(&envelope.session_id))
+			};
+			if !is_our_worker {
+				continue;
+			}
+			let worker_id = envelope.session_id.clone();
+			// Only forward events that warrant a wake — not every
+			// streaming delta. `TurnComplete` (the worker finished
+			// its turn) is the one the ADR names as the primary
+			// wake signal; the orchestrator then calls
+			// `observe_worker` for a snapshot.
+			let packet = match &envelope.event {
+				CoderEvent::TurnComplete => Some(format!(
+					"Worker {worker_id} completed a turn. Use `observe_worker` to see its current state."
+				)),
+				_ => None,
+			};
+			if let Some(text) = packet {
+				let _ = handle.send_to(&orchestrator_id, text, Vec::new()).await;
+			}
+		}
+	});
 }
 
 /// `observe_worker` — fetch a compact snapshot of a worker's state.
@@ -4721,6 +4809,33 @@ async fn persist_tool_record(rt: &Arc<SessionRuntime>, tool_call_id: &str, tool_
 	session.persisted_records = session.persisted_records.saturating_add(1);
 }
 
+/// Append a [`SessionRecord::Error`] when a turn fails with a
+/// non-recoverable backend error (auth, decode, provider 400, etc.).
+/// Without this the on-disk transcript ends at the last successful
+/// record and the failure is invisible to anyone debugging from the
+/// JSONL after the fact — the UI toast already vanished by then.
+///
+/// Best-effort, same posture as the other persisters: a write
+/// failure logs but doesn't escalate the already-failing turn.
+/// `persisted_records` is **not** incremented — an error isn't a
+/// conversational record, so it shouldn't push the auto-rename
+/// "worth naming yet?" check (same rationale as `persist_usage_record`).
+async fn persist_error_record(rt: &Arc<SessionRuntime>, message: &str) {
+	let (dir, header) = {
+		let session = rt.session.lock().await;
+		let Some(dir) = session.session_dir.clone() else {
+			return;
+		};
+		(dir, session.header.clone())
+	};
+	let record = SessionRecord::Error {
+		message: message.to_string(),
+	};
+	if let Err(err) = sessions::append_record(&dir, &header, &record).await {
+		tracing::warn!(error = %err, "failed to persist error record");
+	}
+}
+
 /// Spawn the post-first-turn auto-rename pass. Calls the fast
 /// model with a tight prompt asking for a 4-6 word title, then
 /// persists the result via a `TitleUpdate` record + a
@@ -5233,6 +5348,13 @@ fn emit_replay_events(out: &mut Vec<CoderEvent>, record: SessionRecord, created_
 			// is sync; this arm exists to keep the match
 			// exhaustive.
 		}
+		SessionRecord::Error { message } => {
+			// Re-emit the terminal turn error so the reopened
+			// transcript shows the failure inline — the user
+			// remembers "it errored", and the JSONL now backs that
+			// up instead of trailing off mid-tool-loop.
+			out.push(CoderEvent::Error { message });
+		}
 		SessionRecord::Compaction {
 			summary,
 			messages_compacted,
@@ -5392,6 +5514,7 @@ fn subagent_replay_inners(record: SessionRecord, created_at_ms: i64) -> Vec<Code
 				is_error,
 			}]
 		}
+		SessionRecord::Error { message } => vec![CoderEvent::Error { message }],
 		SessionRecord::TitleUpdate { .. }
 		| SessionRecord::Usage { .. }
 		| SessionRecord::TodosUpdate { .. }

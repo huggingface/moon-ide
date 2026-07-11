@@ -545,9 +545,14 @@ Mapping notes (details live in `sessions.rs`):
 - `Usage` folds onto the prior assistant line's `usage` block on
   write and is re-emitted as a stand-alone record on load.
 - Moon-specific records (`TitleUpdate`, `TodosUpdate`,
-  `SubagentSpawned`, `SubagentFinished`) ride in pi `custom` rows
-  with `display:false` and a `moon_*` `customType`; the pi viewer
-  skips them silently.
+  `SubagentSpawned`, `SubagentFinished`, `Error`) ride in pi `custom`
+  rows with `display:false` and a `moon_*` `customType`; the pi viewer
+  skips them silently. `Error` is appended when a turn fails with a
+  non-recoverable backend error (auth, decode, provider 400); without
+  it the on-disk transcript trails off mid-tool-loop and the failure
+  is invisible to anyone debugging from the JSONL after the fact. It
+  doesn't shape the in-memory `messages` slice on reload — an error
+  ended the turn, so it isn't history the next turn sends.
 - Image attachments split the data-URL into pi's `data` + `mimeType`
   on write and re-prefix on load.
 
