@@ -1818,13 +1818,13 @@ impl CoderHandle {
 	/// continues with the new results in context.
 	///
 	/// Auth-gates **before** the destructive truncation (same posture
-	/// as [`replay_from_message`]). Refuses mid-turn. After
-	/// truncation the backend drops the mounted runtime and re-opens
-	/// the session so the trimmed transcript repaints through the
-	/// normal replay path. The orphan tool calls from the dropped
-	/// `Tool` records are stripped from `messages` before the resume
-	/// dispatch — `dispatch_tool_calls` will push fresh `ToolCall` /
-	/// `ToolResult` events and persist real `Tool` records.
+	/// as [`replay_from_message`]). Refuses mid-turn. Unlike
+	/// [`revert_to_message`], this does **not** drop the mounted
+	/// runtime and reopen — it mutates the existing runtime's
+	/// `messages` in place and fires a `SessionLoaded` + `Replay` so
+	/// the frontend clears and rebuilds to the checkpoint state. The
+	/// turn loop then runs on the same `rt`, so `abort` / `send`
+	/// target the right runtime.
 	pub async fn resume_from_assistant(&self, assistant_ordinal: usize) -> Result<(), CoderError> {
 		self.ensure_can_send().await?;
 		let (rt, session_id, folder_path) = self.state.active_visible_runtime().await?;
@@ -1841,36 +1841,95 @@ impl CoderHandle {
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
 		let resumed = sessions::truncate_before_assistant_record(&dir, &header, assistant_ordinal).await?;
 
-		// Drop the mounted runtime so `open_session` rebuilds
-		// in-memory `messages` from the now-shorter JSONL. Same
-		// pattern as `revert_to_message`.
-		{
-			let (fs, _) = self.state.active_folder_session().await?;
-			fs.runtimes.write().await.remove(&session_id);
-		}
-		self.open_session(session_id.clone()).await?;
+		// Load the surviving records from disk (the JSONL was just
+		// rewritten by the truncation) and rebuild `messages` from
+		// them. We skip orphan recovery — the kept Assistant's
+		// tool_calls are intentionally unpaired because we're about
+		// to re-dispatch them. Injecting "Interrupted" sentinels
+		// would feed the model stale error results alongside the
+		// fresh ones.
+		let LoadedSession {
+			records,
+			record_timestamps,
+			..
+		} = sessions::load(&dir, &header.id).await?;
+		let RebuiltMessages {
+			messages,
+			last_usage,
+			last_todos,
+		} = Self::rebuild_messages_from_records(&records);
 
-		// After reopen, `open_session`'s orphan-recovery injected
-		// synthetic `Tool` messages for the dropped `Tool` records
-		// (the kept `Assistant`'s tool_calls have no matching `Tool`
-		// records in the truncated JSONL). Strip those orphan
-		// `Tool` messages so the resume dispatch can push fresh
-		// real ones via `finish_tool_call` — otherwise the model
-		// would see the "Interrupted before tool completed"
-		// sentinels AND the fresh results, confusing the next
-		// round-trip.
-		let resume_call_ids: std::collections::HashSet<String> =
-			resumed.resume_tool_calls.iter().map(|c| c.id.clone()).collect();
+		// Mutate the existing runtime in place. We keep the same
+		// `Arc<SessionRuntime>` so `abort` / `send` / the turn loop
+		// all target the same `rt` — no stale-runtime split.
 		{
 			let mut session = rt.session.lock().await;
-			session.messages.retain(|msg| {
-				if let crate::inference::ChatMessage::Tool { tool_call_id, .. } = msg {
-					!resume_call_ids.contains(tool_call_id)
-				} else {
-					true
-				}
-			});
+			session.messages = messages;
+			session.last_usage = last_usage;
+			session.todos = last_todos;
+			session.persisted_records = records.len() as u32;
+			session.header.updated_at_ms = current_time_ms();
 		}
+
+		// Fire `SessionLoaded` + `Replay` so the frontend clears its
+		// bucket and rebuilds from the surviving records — the
+		// checkpoint state, ending at the kept Assistant row with no
+		// tool rows after it. `in_flight: true` on the replay keeps
+		// `busy` asserted so the panel shows the running state.
+		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), session_id.clone());
+		sink.send(CoderEvent::SessionLoaded {
+			id: header.id.clone(),
+			title: header.title.clone(),
+			created_at_ms: header.created_at_ms,
+			updated_at_ms: header.updated_at_ms,
+		});
+		let mut replay_events: Vec<CoderEvent> = Vec::with_capacity(records.len() + 2);
+		for (record, record_ts) in records.into_iter().zip(record_timestamps) {
+			match record {
+				SessionRecord::SubagentSpawned {
+					ref tool_call_id,
+					ref subagent_id,
+					ref target_folder,
+					ref mode,
+				} => {
+					replay_subagent_spawned(
+						&mut replay_events,
+						&dir,
+						&header.id,
+						tool_call_id.clone(),
+						subagent_id.clone(),
+						target_folder.clone(),
+						mode.clone(),
+					)
+					.await;
+				}
+				SessionRecord::SubagentFinished {
+					subagent_id,
+					tokens_used_estimate,
+					was_error,
+					result_preview: _,
+				} => {
+					replay_events.push(CoderEvent::SubagentFinished {
+						subagent_id,
+						tokens_used_estimate,
+						was_error,
+					});
+				}
+				other => emit_replay_events(&mut replay_events, other, record_ts),
+			}
+		}
+		// No orphan tool results — the kept Assistant's tool calls
+		// are about to be re-dispatched, not marked as interrupted.
+		// The trailing `TurnComplete` closes the replay window and
+		// sets `busy = false` on the frontend; `in_flight: true`
+		// re-asserts it immediately after — the turn is genuinely
+		// about to start (the resume dispatch fires within
+		// milliseconds).
+		replay_events.push(CoderEvent::TurnComplete);
+		sink.send(CoderEvent::Replay {
+			events: replay_events,
+			in_flight: true,
+		});
 
 		// Spawn the turn loop with the resume tool calls. The first
 		// iteration re-dispatches them; subsequent iterations make
@@ -1880,7 +1939,6 @@ impl CoderHandle {
 			let mut turn = rt.turn.lock().await;
 			turn.cancel = Some(cancel.clone());
 		}
-		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), session_id.clone());
 		let state = self.state.clone();
 		spawn_turn_loop(
 			state,
@@ -1974,49 +2032,22 @@ impl CoderHandle {
 	/// the existing runtime — its in-memory `messages` is the
 	/// source of truth, not the on-disk JSONL which may be lagging
 	/// the running turn by an iteration.
-	pub async fn open_session(&self, id: String) -> Result<SessionSummary, CoderError> {
-		sessions::validate_session_id(&id)?;
-		let (fs, folder_path) = self.state.active_folder_session().await?;
-		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
-
-		// Fast path: this session id is already mounted as a
-		// runtime under the folder (most likely a background turn
-		// the user is clicking back to). Make it visible, fire a
-		// `SessionLoaded` so the panel re-hydrates from disk via
-		// its replay loop, and return.
-		//
-		// We *do* re-load the JSONL from disk for the panel's
-		// benefit (the frontend bucket may have been pruned across
-		// a webview reload), but the in-memory `Session` stays
-		// untouched — the running turn's `messages` is authoritative
-		// and clobbering it would corrupt the next iteration.
-		let already_mounted = fs.runtime(&id).await.is_some();
-		let LoadedSession {
-			header,
-			records,
-			record_timestamps,
-		} = sessions::load(&dir, &id).await?;
-		let record_count = records.len();
-
+	/// Rebuild `Vec<ChatMessage>` from persisted records — the
+	/// message-history reconstruction `open_session` and
+	/// `resume_from_assistant` both need. Walks records linearly,
+	/// folding compaction summaries at the same cutoff the live pass
+	/// used, and tracking `last_usage` / `last_todos` (last-wins).
+	/// **Does not** inject orphan-recovery `Tool` messages — the
+	/// caller decides whether that's appropriate (open_session does
+	/// it separately; resume skips it because the orphans are about
+	/// to be re-dispatched).
+	fn rebuild_messages_from_records(records: &[SessionRecord]) -> RebuiltMessages {
 		let mut messages: Vec<ChatMessage> = vec![ChatMessage::System {
 			content: PHASE_6_0_SYSTEM_PROMPT.to_string(),
 		}];
-		// Last `Usage` record we saw while walking the JSONL.
-		// Drives the post-replay context-usage ring with
-		// provider-exact figures when the session has at least
-		// one such record; sessions written before this variant
-		// shipped fall through to the bytes/4 estimate below.
 		let mut last_usage: Option<TokenUsage> = None;
-		// Last `TodosUpdate` record. Same replay-last-wins shape
-		// as `last_usage`: we don't care about intermediate todo
-		// states, only what the agent's plan looked like at the
-		// moment the session was last persisted.
 		let mut last_todos: Vec<crate::TodoItem> = Vec::new();
-		// Reconstruct the chat history from the persisted records.
-		// Tool messages need to know their `tool_call_id`, which
-		// the persisted Assistant record carries verbatim — we
-		// echo it onto the rebuilt `ChatMessage::Tool`.
-		for record in &records {
+		for record in records {
 			match record {
 				SessionRecord::User { text, images } => {
 					messages.push(ChatMessage::User {
@@ -2070,43 +2101,49 @@ impl CoderHandle {
 				SessionRecord::Compaction {
 					summary, messages_kept, ..
 				} => {
-					// Replay-time compaction: fold the prefix we
-					// rebuilt since the system prompt into the
-					// synthetic summary, exactly the way the live
-					// runtime did. The live pass kept the last
-					// `messages_kept` messages (recent user turns +
-					// their replies) verbatim, so we reproduce that
-					// cutoff here — folding everything *except* the
-					// last `messages_kept`. Draining the whole
-					// prefix instead would silently drop the recent
-					// turns the live pass deliberately retained,
-					// diverging the reopened prompt from the live
-					// one. Without this fold at all, reopening would
-					// re-inflate the full pre-compaction transcript
-					// and the next turn would trip the provider's
-					// context-length cap.
 					let cutoff = messages.len().saturating_sub(*messages_kept as usize).max(1);
 					crate::compaction::apply_summary_to_messages(&mut messages, cutoff, summary);
 				}
-				SessionRecord::Error { .. } => {
-					// Terminal turn error — UI-only on reload. It
-					// doesn't become a chat message: the failure
-					// ended the turn, so sending a synthetic message
-					// to the model would be history the next turn
-					// never had. `emit_replay_events` re-emits the
-					// `CoderEvent::Error` for the panel.
-				}
-				SessionRecord::SubagentSpawned { .. } | SessionRecord::SubagentFinished { .. } => {
-					// Sub-agent records are UI-only: they rebuild
-					// the parent's collapsed cards on reload but
-					// don't shape the parent's `messages` slice.
-					// The sub-agent's text result is already stored
-					// as a `Tool` record's content in the
-					// surrounding tool_call / tool_result pair, so
-					// the parent's history is unaffected.
-				}
+				SessionRecord::Error { .. } => {}
+				SessionRecord::SubagentSpawned { .. } | SessionRecord::SubagentFinished { .. } => {}
 			}
 		}
+		RebuiltMessages {
+			messages,
+			last_usage,
+			last_todos,
+		}
+	}
+
+	pub async fn open_session(&self, id: String) -> Result<SessionSummary, CoderError> {
+		sessions::validate_session_id(&id)?;
+		let (fs, folder_path) = self.state.active_folder_session().await?;
+		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
+
+		// Fast path: this session id is already mounted as a
+		// runtime under the folder (most likely a background turn
+		// the user is clicking back to). Make it visible, fire a
+		// `SessionLoaded` so the panel re-hydrates from disk via
+		// its replay loop, and return.
+		//
+		// We *do* re-load the JSONL from disk for the panel's
+		// benefit (the frontend bucket may have been pruned across
+		// a webview reload), but the in-memory `Session` stays
+		// untouched — the running turn's `messages` is authoritative
+		// and clobbering it would corrupt the next iteration.
+		let already_mounted = fs.runtime(&id).await.is_some();
+		let LoadedSession {
+			header,
+			records,
+			record_timestamps,
+		} = sessions::load(&dir, &id).await?;
+		let record_count = records.len();
+
+		let RebuiltMessages {
+			messages,
+			last_usage,
+			last_todos,
+		} = Self::rebuild_messages_from_records(&records);
 		// Orphan tool calls = Assistant tool_calls that never got
 		// a matching `Tool` record (user stopped mid-tool, IDE
 		// crashed before the dispatcher returned, …). Inject a
@@ -2953,6 +2990,17 @@ pub struct RevertedMessage {
 	pub text: String,
 	#[serde(default)]
 	pub images: Vec<ImageAttachment>,
+}
+
+/// Rebuilt chat history from persisted records, returned by
+/// [`Coder::rebuild_messages_from_records`]. Carries the
+/// last-wins `usage` and `todos` alongside `messages` so both
+/// `open_session` and `resume_from_assistant` can seed the
+/// runtime's state without duplicating the record-walk logic.
+struct RebuiltMessages {
+	messages: Vec<ChatMessage>,
+	last_usage: Option<TokenUsage>,
+	last_todos: Vec<crate::TodoItem>,
 }
 
 /// Result of [`Coder::rerun_tool_call`] — the tool that was

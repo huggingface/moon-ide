@@ -169,6 +169,25 @@ pub(crate) async fn compact_if_needed(
 	if older.is_empty() {
 		return None;
 	}
+	// If the only thing in the compactable prefix is a previous
+	// compaction summary (all `System` messages), there is nothing
+	// new to fold — re-summarising a summary produces a same-size
+	// replacement and leaves the prompt just as over-budget. This
+	// happens when the kept recent turns contain exactly
+	// `RECENT_USER_TURNS_KEPT` user messages, so `find_cutoff_index`
+	// lands right after the summary at index 2. Without this guard
+	// the loop re-summarises the summary every iteration — a
+	// silent infinite no-op that wastes one LLM round-trip per
+	// tool call.
+	if older.iter().all(|m| matches!(m, ChatMessage::System { .. })) {
+		tracing::warn!(
+			prompt_tokens = usage.prompt_tokens,
+			context_window = context,
+			"compaction threshold crossed but the only compactable prefix is a prior summary; \
+			 the recent turns themselves are too large for the window — passing through"
+		);
+		return None;
+	}
 	let messages_compacted = older.len() as u32;
 
 	emit(
@@ -656,6 +675,34 @@ mod tests {
 		// messages later in the slice are fine because their
 		// parent assistant rides with them.
 		assert!(matches!(msgs[cutoff], ChatMessage::User { .. }));
+	}
+
+	#[test]
+	fn prefix_of_only_prior_summary_is_not_compactable() {
+		// Regression: after a compaction the in-memory layout is
+		//   [system, summary(System), <kept turns>]
+		// If the kept turns contain exactly RECENT_USER_TURNS_KEPT
+		// user messages, find_cutoff_index lands at index 2, so
+		// the "older" prefix is messages[1..2] = just the prior
+		// summary. Re-summarising a summary is a no-op that
+		// produces a same-size replacement and never gets under
+		// the threshold — the loop would spin forever re-running
+		// the LLM on its own output. The guard in
+		// `compact_if_needed` must detect this and bail.
+		let mut msgs = vec![system("S"), system("## Earlier conversation summary\n...")];
+		// Exactly 6 user turns (K=6) so the cutoff lands at index 2.
+		for i in 0..6 {
+			msgs.push(user(&format!("u{i}")));
+			msgs.push(assistant(&format!("a{i}")));
+		}
+		let cutoff = find_cutoff_index(&msgs).expect("cutoff should exist");
+		assert_eq!(cutoff, 2, "cutoff should land right after the summary");
+		let older = &msgs[1..cutoff];
+		assert_eq!(older.len(), 1);
+		assert!(
+			older.iter().all(|m| matches!(m, ChatMessage::System { .. })),
+			"the only compactable prefix should be the prior summary"
+		);
 	}
 
 	#[test]

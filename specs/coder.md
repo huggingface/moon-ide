@@ -894,7 +894,13 @@ hardcoded ("hardcode first, configure later").
 
 One edge case: if the retained recent turns alone exceed the window
 (a burst of huge tool results), compaction mitigates but can't get
-under the limit. Rare and self-limiting.
+under the limit. When the only thing in the compactable prefix is a
+prior compaction summary (all `System` messages — happens when the
+kept turns contain exactly `RECENT_USER_TURNS_KEPT` user messages),
+the pass bails instead of re-summarising the summary: re-summarising
+a summary produces a same-size replacement, never gets under
+threshold, and would spin the loop forever wasting one LLM
+round-trip per iteration. Rare and self-limiting.
 
 ### Iteration cap and final wrap-up
 
