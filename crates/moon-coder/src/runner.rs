@@ -40,7 +40,7 @@ use crate::inference::{
 	AssistantResponse, ChatMessage, FunctionCall, ImageAttachment, InferenceClient, StreamEvent, TokenUsage,
 };
 use crate::models::{self, CoderModels, ResolvedProvider, SharedCoderModels};
-use crate::prompts::{ask_user_tool_definition, PromptOutcome, PromptResponse};
+use crate::prompts::{ask_user_tool_definition, PromptOutcome, PromptResponse, QuestionAnswer};
 use crate::providers::{self, ProviderKeyring};
 use crate::sessions::{
 	self, current_time_ms, new_session_id, session_title_from_prompt, sessions_dir, subagent_session_dir,
@@ -386,10 +386,27 @@ struct PendingSteer {
 }
 
 impl Session {
-	/// Make a fresh session shell — id allocated, title empty
-	/// pending the first prompt, no folder bound.
+	/// Make a fresh session shell in the default top-level `Agent`
+	/// mode — id allocated, title empty pending the first prompt,
+	/// no folder bound. The historical constructor; most sessions
+	/// are ordinary `agent` sessions.
 	fn new_blank() -> Self {
+		Self::new_blank_with_mode(CoderMode::Agent)
+	}
+
+	/// Make a fresh session shell in a given top-level mode. The
+	/// mode is stamped onto the header (as its wire string, elided
+	/// for the `Agent` default to stay byte-compatible with pre-6
+	/// sessions) and drives the tool-list + system-prompt selection
+	/// in `run_turn`. A `Coordinator` shell gets the coordinator
+	/// system prompt as its seed `messages` entry instead of the
+	/// base `Agent` prompt.
+	fn new_blank_with_mode(mode: CoderMode) -> Self {
 		let now = current_time_ms();
+		let system_prompt = match mode {
+			CoderMode::Agent | CoderMode::Research => PHASE_6_0_SYSTEM_PROMPT.to_string(),
+			CoderMode::Coordinator => crate::coordinator::COORDINATOR_SYSTEM_PROMPT.to_string(),
+		};
 		Self {
 			header: SessionHeader {
 				schema: SESSION_SCHEMA_VERSION,
@@ -413,6 +430,11 @@ impl Session {
 				parent_session_id: None,
 				parent_tool_call_id: None,
 				subagent_mode: None,
+				// Top-level mode stamp. Elided for `Agent` (the
+				// default) so ordinary sessions stay byte-
+				// compatible with pre-6 transcripts; `Some` for
+				// `Coordinator` so the load path picks it up.
+				mode: (mode != CoderMode::Agent).then(|| mode.as_wire().to_string()),
 				subagent_target_folder: None,
 				bash_target_override: None,
 				worktree_root: None,
@@ -420,9 +442,7 @@ impl Session {
 				committed_branch: None,
 			},
 			session_dir: None,
-			messages: vec![ChatMessage::System {
-				content: PHASE_6_0_SYSTEM_PROMPT.to_string(),
-			}],
+			messages: vec![ChatMessage::System { content: system_prompt }],
 			persisted_records: 0,
 			auto_rename_pending: false,
 			last_usage: None,
@@ -439,6 +459,7 @@ impl Session {
 			updated_at_ms: self.header.updated_at_ms,
 			worktree_branch: self.header.worktree_branch.clone(),
 			committed_branch: self.header.committed_branch.clone(),
+			mode: self.header.mode.clone(),
 		}
 	}
 }
@@ -533,6 +554,28 @@ impl CoderState {
 				if rt.prompts.holds(call_id).await {
 					return Some(rt);
 				}
+			}
+		}
+		None
+	}
+
+	/// Find the mounted runtime + its owning folder path for a given
+	/// session id, scanning every folder (ADR 0030 — an orchestrator
+	/// driving a worker by id shouldn't have to know or care which
+	/// folder the worker was filed under). Returns `None` when no
+	/// mounted runtime matches — the session may not have been opened
+	/// yet, or may live in a folder this process doesn't track.
+	async fn runtime_for_session(&self, session_id: &str) -> Option<(Arc<SessionRuntime>, Utf8PathBuf)> {
+		let folders: Vec<(Utf8PathBuf, Arc<FolderSession>)> = self
+			.sessions_by_folder
+			.read()
+			.await
+			.iter()
+			.map(|(k, v)| (k.clone(), v.clone()))
+			.collect();
+		for (folder_path, fs) in folders {
+			if let Some(rt) = fs.runtime(session_id).await {
+				return Some((rt, folder_path));
 			}
 		}
 		None
@@ -1411,6 +1454,74 @@ impl CoderHandle {
 		Ok(summary)
 	}
 
+	/// Create an isolated coder session in its own git worktree —
+	/// the full orchestration the `coder_new_worktree_session`
+	/// Tauri command used to own, now promoted to a client-callable
+	/// method (ADR 0030 Prerequisite #2) so an in-process orchestrator
+	/// agent can mint workers via `spawn_worker` without going through
+	/// the Tauri command layer.
+	///
+	/// Steps: resolve the active (parent) folder, compute the branch
+	/// spec (fresh `moon/agent-<id>` off HEAD, or check out an existing
+	/// `base_branch`), derive the worktree path under
+	/// `<parent>/.worktrees/<branch-slug>`, `git worktree add`, bind
+	/// it as a nested folder, and mint a session (filed under the
+	/// parent) whose tools route to the worktree.
+	///
+	/// `mode` selects the new session's top-level mode — `Agent` for
+	/// an ordinary worker (the common case), `Coordinator` for a
+	/// sub-orchestrator. The active folder is unchanged; the new
+	/// session is set visible so the panel opens it, matching the
+	/// historical Tauri-command behaviour.
+	pub async fn create_worktree_session(
+		&self,
+		base_branch: Option<String>,
+		mode: CoderMode,
+	) -> Result<(SessionSummary, moon_protocol::workspace::Workspace), CoderError> {
+		use moon_core::host::WorktreeBranch;
+		let parent = self.state.workspaces.require_active_folder().await?;
+		let parent_path = parent.folder.path.clone();
+		let spec = match base_branch.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+			Some(existing) => WorktreeBranch::Existing(existing.to_string()),
+			None => {
+				let now_ms = std::time::SystemTime::now()
+					.duration_since(std::time::UNIX_EPOCH)
+					.map(|d| d.as_millis())
+					.unwrap_or(0) as u64;
+				WorktreeBranch::New(format!("moon/agent-{:08x}", now_ms & 0xffff_ffff))
+			}
+		};
+		let branch = spec.name().to_string();
+		let branch_slug = branch.replace('/', "-");
+		let worktree_path = camino::Utf8Path::new(&parent_path)
+			.join(moon_core::WORKTREES_DIR_NAME)
+			.join(&branch_slug);
+		if let Some(parent_dir) = worktree_path.parent() {
+			std::fs::create_dir_all(parent_dir.as_std_path())?;
+		}
+		parent.host.git_worktree_add(&worktree_path, spec).await?;
+		let wt_entry = self
+			.state
+			.workspaces
+			.add_worktree_folder(worktree_path, parent_path, branch.clone())
+			.await?;
+		// Mint the session in the chosen mode and stamp the worktree
+		// routing. Builds from `new_blank_with_mode` so a coordinator
+		// worker gets its system-prompt seed; an ordinary worker is
+		// `Agent`.
+		let (fs, _) = self.state.active_folder_session().await?;
+		let mut blank = Session::new_blank_with_mode(mode);
+		blank.header.worktree_root = Some(wt_entry.folder.path.clone());
+		blank.header.worktree_branch = Some(branch);
+		let summary = blank.summary();
+		let id = blank.header.id.clone();
+		let rt = Arc::new(SessionRuntime::new(blank));
+		fs.insert_runtime(id.clone(), rt).await;
+		fs.set_visible(id).await;
+		let workspace = self.state.workspaces.snapshot().await;
+		Ok((summary, workspace))
+	}
+
 	/// Set the per-session bash-target override for the **visible
 	/// session** under the active folder. `force_host = true` pins
 	/// this session's `bash` + format-on-save subprocesses to the
@@ -1924,6 +2035,7 @@ impl CoderHandle {
 			updated_at_ms: header.updated_at_ms,
 			worktree_branch: header.worktree_branch.clone(),
 			committed_branch: header.committed_branch.clone(),
+			mode: header.mode.clone(),
 		};
 		// Snapshot what the panel needs for the restore-time
 		// usage hint *before* the move into `Session`. We prefer
@@ -2320,125 +2432,14 @@ impl CoderHandle {
 		let rt_for_turn = rt.clone();
 		let sink_for_turn = sink.clone();
 		let folder_for_turn = folder_path.clone();
-		tokio::spawn(async move {
-			// Loop wrapper closes the race between `run_turn`
-			// returning `Ok(())` and the spawn task clearing
-			// `turn.cancel`: a steer queued in that window lands
-			// in `pending_steers` (because `send` still sees a
-			// turn in flight) but would otherwise be orphaned —
-			// `run_turn` already finished its in-loop "any
-			// stragglers?" check. Re-checking here under both the
-			// `turn` and `session` locks linearises with `send`'s
-			// turn→session take order: while we hold `turn`,
-			// `send` can't observe the just-cleared state and
-			// start a fresh turn, so either there's a steer to
-			// drain (we loop) or there isn't (we clear and exit).
-			//
-			// One format queue per `run_turn` call — between
-			// sub-turns we flush so the next iteration's tools
-			// see formatted bytes on disk, and we hand the next
-			// `run_turn` a fresh empty queue.
-			//
-			// `cancel_outer` is the live token for the *current*
-			// `run_turn`. When we loop back — either because a
-			// `drain_steer_now` aborted with a pending steer, or
-			// because stragglers arrived in the race window — we
-			// mint a *fresh* `CancellationToken` and store it in
-			// `turn.cancel`. `CancellationToken` is one-shot: a
-			// cancelled token can't be un-cancelled, so reusing it
-			// would make the next `run_turn` bail at its
-			// iteration-top `is_cancelled()` guard before the
-			// steer ever drains — an infinite tight loop with
-			// `busy` stuck `true` and the stop button a no-op.
-			// Storing the fresh token in `turn.cancel` keeps
-			// `busy` accurate and lets a concurrent `send` keep
-			// queueing (it checks `turn.cancel.is_some()`, not the
-			// token's cancellation state).
-			let mut cancel_outer = cancel;
-			let result = loop {
-				let format_queue = Arc::new(crate::tools::FormatQueue::default());
-				let result = run_turn(
-					&state,
-					&rt_for_turn,
-					&folder_for_turn,
-					&sink_for_turn,
-					cancel_outer.clone(),
-					format_queue.clone(),
-				)
-				.await;
-				flush_format_queue(&state, &format_queue).await;
-				// A `drain_steer_now` trips the cancel token AND
-				// pushes a steer. That steer must be drained into a
-				// fresh `run_turn`, not treated as a final abort:
-				// backfill orphans for the aborted turn, then loop
-				// back so the drained steer starts a new turn. The
-				// old token is now permanently cancelled, so mint a
-				// fresh one for the next `run_turn`.
-				if matches!(result, Err(CoderError::Aborted)) && !rt_for_turn.session.lock().await.pending_steers.is_empty() {
-					recover_in_memory_orphans(&rt_for_turn, &sink_for_turn).await;
-					cancel_outer = fresh_cancel(&rt_for_turn).await;
-					continue;
-				}
-				if !matches!(result, Ok(())) {
-					rt_for_turn.turn.lock().await.cancel = None;
-					break result;
-				}
-				let mut turn = rt_for_turn.turn.lock().await;
-				if rt_for_turn.session.lock().await.pending_steers.is_empty() {
-					turn.cancel = None;
-					break result;
-				}
-				// Stragglers from the race window. The current
-				// token is still live (the turn returned `Ok(())`),
-				// but we mint a fresh one anyway for symmetry with
-				// the abort path: the next `run_turn` is a new
-				// turn, and its cancel handle should be independent
-				// of the one that just finished. `send` keeps
-				// queueing because `turn.cancel` stays `Some`.
-				let fresh = CancellationToken::new();
-				turn.cancel = Some(fresh.clone());
-				drop(turn);
-				cancel_outer = fresh;
-			};
-			match &result {
-				Ok(()) => {
-					sink_for_turn.send(CoderEvent::TurnComplete);
-					maybe_autosync_to_hub(&state, &rt_for_turn, &folder_for_turn).await;
-				}
-				Err(CoderError::Aborted) => {
-					// Backfill `Tool` results for any tool_call ids
-					// the assistant emitted before we cancelled —
-					// otherwise the next prompt in this session
-					// ships an unpaired `tool_use` to the provider
-					// and the HTTP call fails with a 400. Idempotent
-					// on disk: persisted `Tool` records mean
-					// reload-time recovery in `open_session` finds
-					// no further orphans to synthesise.
-					recover_in_memory_orphans(&rt_for_turn, &sink_for_turn).await;
-					sink_for_turn.send(CoderEvent::Aborted);
-				}
-				Err(err) => {
-					tracing::warn!(error = %err, "coder turn failed");
-					sink_for_turn.send(CoderEvent::Error {
-						message: err.to_string(),
-					});
-				}
-			}
-			// Auto-rename fires regardless of how the turn ended.
-			// A successful turn gives the fast model the assistant's
-			// final answer to summarise into a title; an Esc'd or
-			// errored turn falls back to whatever bytes made it
-			// into the transcript (the user prompt at minimum,
-			// possibly some assistant content + tool results). The
-			// real-world failure mode this fixes: long tool-heavy
-			// turns the user often Esc's mid-flight — under the
-			// previous "Ok(())-only" rule those sessions kept the
-			// truncated-prompt fallback title forever.
-			if auto_rename_after {
-				spawn_auto_rename(state.clone(), rt_for_turn.clone(), sink_for_turn);
-			}
-		});
-
+		spawn_turn_loop(
+			state,
+			rt_for_turn,
+			sink_for_turn,
+			folder_for_turn,
+			cancel,
+			auto_rename_after,
+		);
 		Ok(())
 	}
 
@@ -2569,6 +2570,240 @@ impl CoderHandle {
 	pub fn subscribe(&self) -> broadcast::Receiver<CoderEventEnvelope> {
 		self.state.events.subscribe()
 	}
+
+	// ── Orchestrator-facing client surface (ADR 0030) ───────────
+	//
+	// By-id variants of the panel-driven methods. An orchestrator
+	// session drives its workers by id (not "the visible session"),
+	// so it needs `send_to` / `abort_session` / `observe_session`
+	// that target a specific runtime regardless of what the user
+	// has foregrounded. The visible-session methods above stay
+	// unchanged for the UI path.
+
+	/// Send a prompt to a specific session by id (ADR 0030). Unlike
+	/// `send` (which targets the active folder's visible session),
+	/// this resolves the runtime by id across all folders and seeds
+	/// it directly. Used by an orchestrator's `spawn_worker` /
+	/// `steer_worker` to drive a worker. If the worker's turn is
+	/// already running, the message is queued as a steer (same as a
+	/// user steering a visible session).
+	pub async fn send_to(&self, session_id: &str, text: String, images: Vec<ImageAttachment>) -> Result<(), CoderError> {
+		self.ensure_can_send().await?;
+		let Some((rt, folder_path)) = self.state.runtime_for_session(session_id).await else {
+			return Err(CoderError::Internal(format!(
+				"no mounted runtime for session {session_id}"
+			)));
+		};
+		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
+		// Steer-vs-spawn branch mirrors `send`. A worker whose turn
+		// is in flight gets the message queued as a steer.
+		{
+			let turn = rt.turn.lock().await;
+			if turn.cancel.is_some() {
+				drop(turn);
+				if rt.prompts.has_pending().await {
+					rt.prompts.skip_any().await;
+				}
+				let steer_id = new_message_id();
+				let mut session = rt.session.lock().await;
+				session.pending_steers.push(PendingSteer {
+					id: steer_id.clone(),
+					text: text.clone(),
+					images: images.clone(),
+				});
+				session.header.updated_at_ms = current_time_ms();
+				drop(session);
+				let sink = FolderEventSink::new(
+					self.state.events.clone(),
+					folder_path.to_string(),
+					session_id.to_string(),
+				);
+				sink.send(CoderEvent::UserMessage {
+					id: steer_id,
+					text,
+					images,
+					queued: true,
+					created_at_ms: Some(current_time_ms()),
+				});
+				return Ok(());
+			}
+		}
+		let cancel = CancellationToken::new();
+		{
+			let mut turn = rt.turn.lock().await;
+			turn.cancel = Some(cancel.clone());
+		}
+		// Bind / prep the session: first `send_to` allocates the
+		// title and locks the sessions dir, same as `send`.
+		let (auto_rename_after, summary_to_announce) = {
+			let mut session = rt.session.lock().await;
+			let needs_loaded_event = session.header.title.is_empty() && session.persisted_records == 0;
+			if session.session_dir.is_none() {
+				session.session_dir = Some(dir.clone());
+			}
+			if session.header.cwd.is_empty() {
+				session.header.cwd = folder_path.to_string();
+			}
+			if session.header.title.is_empty() {
+				session.header.title = crate::sessions::session_title_from_prompt(&text);
+				session.auto_rename_pending = true;
+			}
+			session.header.updated_at_ms = current_time_ms();
+			let auto_rename = session.auto_rename_pending;
+			session.auto_rename_pending = false;
+			let summary = if needs_loaded_event {
+				Some(session.summary())
+			} else {
+				None
+			};
+			(auto_rename, summary)
+		};
+		let sink = FolderEventSink::new(
+			self.state.events.clone(),
+			folder_path.to_string(),
+			session_id.to_string(),
+		);
+		if let Some(summary) = &summary_to_announce {
+			sink.send(CoderEvent::SessionLoaded {
+				id: summary.id.clone(),
+				title: summary.title.clone(),
+				created_at_ms: summary.created_at_ms,
+				updated_at_ms: summary.updated_at_ms,
+			});
+			sink.send(CoderEvent::SessionListChanged);
+		}
+		// Append the user message to in-memory chat history + the
+		// session JSONL, mirroring `send`'s persist path.
+		{
+			let mut session = rt.session.lock().await;
+			session.messages.push(ChatMessage::User {
+				content: text.clone(),
+				images: images.clone(),
+			});
+			let header = session.header.clone();
+			let dir = session.session_dir.clone().expect("session_dir set above");
+			drop(session);
+			let record = SessionRecord::User {
+				text: text.clone(),
+				images: images.clone(),
+			};
+			if let Err(err) = sessions::append_record(&dir, &header, &record).await {
+				tracing::warn!(error = %err, "failed to persist worker seed message");
+			} else {
+				let mut session = rt.session.lock().await;
+				session.persisted_records = session.persisted_records.saturating_add(1);
+			}
+		}
+		sink.send(CoderEvent::UserMessage {
+			id: new_message_id(),
+			text,
+			images,
+			queued: false,
+			created_at_ms: Some(current_time_ms()),
+		});
+		// Spawn the turn via the shared loop helper — same detached-task
+		// shape as `send`, so the worker gets the same steer-race
+		// recovery, format-queue flush, abort backfill, auto-rename,
+		// and hub-sync behaviour. The worker runs independently of
+		// the orchestrator's turn.
+		let state = self.state.clone();
+		let rt_for_turn = rt.clone();
+		let sink_for_turn = sink.clone();
+		let folder_for_turn = folder_path.clone();
+		spawn_turn_loop(
+			state,
+			rt_for_turn,
+			sink_for_turn,
+			folder_for_turn,
+			cancel,
+			auto_rename_after,
+		);
+		Ok(())
+	}
+
+	/// Abort a specific session's in-flight turn by id (ADR 0030).
+	/// No-op when the session isn't mounted or has no turn running.
+	/// Used by an orchestrator's `abort_worker`.
+	pub async fn abort_session(&self, session_id: &str) {
+		let Some((rt, _)) = self.state.runtime_for_session(session_id).await else {
+			return;
+		};
+		let turn = rt.turn.lock().await;
+		if let Some(token) = turn.cancel.as_ref() {
+			token.cancel();
+		}
+	}
+
+	/// Fetch a compact snapshot of a session's current state by id
+	/// (ADR 0030). The shape an orchestrator's `observe_worker` tool
+	/// returns — enough to decide what to do next without reading
+	/// the worker's full transcript. Returns `None` when the session
+	/// isn't mounted.
+	pub async fn observe_session(&self, session_id: &str) -> Option<WorkerSnapshot> {
+		let (rt, folder_path) = self.state.runtime_for_session(session_id).await?;
+		let session = rt.session.lock().await;
+		let running = rt.turn.lock().await.cancel.is_some();
+		let needs_input = rt.prompts.has_pending().await;
+		let turns = session
+			.messages
+			.iter()
+			.filter(|m| matches!(m, ChatMessage::Assistant { .. }))
+			.count();
+		// Last assistant text — the most recent thing the worker said.
+		let last_assistant = session
+			.messages
+			.iter()
+			.rev()
+			.find_map(|m| match m {
+				ChatMessage::Assistant { content: Some(t), .. } => Some(t.clone()),
+				_ => None,
+			})
+			.unwrap_or_default();
+		Some(WorkerSnapshot {
+			session_id: session_id.to_string(),
+			folder: folder_path.to_string(),
+			title: session.header.title.clone(),
+			branch: session
+				.header
+				.worktree_branch
+				.clone()
+				.or(session.header.committed_branch.clone())
+				.unwrap_or_default(),
+			turns: turns as u32,
+			running,
+			needs_input,
+			last_assistant,
+		})
+	}
+}
+
+/// Compact snapshot of a worker session's current state (ADR 0030).
+/// The shape an orchestrator's `observe_worker` tool returns — enough
+/// to decide what to do next (steer, abort, answer, report) without
+/// reading the worker's full transcript. Mirrors the dispatch-packet
+/// discipline: self-contained per-worker, not a transcript dump.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WorkerSnapshot {
+	/// The worker's session id (the handle `spawn_worker` returned).
+	pub session_id: String,
+	/// Folder the worker is filed under (the parent project root).
+	pub folder: String,
+	/// Human-readable title (from the seed prompt or auto-rename).
+	pub title: String,
+	/// Branch the worker's work lands on (worktree branch, or the
+	/// committed branch for a main-tree session). Empty when neither
+	/// is set yet.
+	pub branch: String,
+	/// Number of assistant turns the worker has completed so far.
+	pub turns: u32,
+	/// Whether the worker currently has a turn in flight.
+	pub running: bool,
+	/// Whether the worker is parked on an `ask_user` prompt waiting
+	/// for an answer (from the orchestrator or the user).
+	pub needs_input: bool,
+	/// The worker's most recent assistant message text. Empty when
+	/// the worker hasn't produced one yet.
+	pub last_assistant: String,
 }
 
 /// Result of a successful [`Coder::unqueue_steer`] — the bytes the
@@ -2703,6 +2938,82 @@ async fn maybe_autosync_to_hub(state: &Arc<CoderState>, rt: &Arc<SessionRuntime>
 		.enqueue_session_sync(workspace_id, folder_path.to_path_buf(), session_id);
 }
 
+/// Spawn the turn loop as a detached task. Shared by `Coder::send`
+/// (visible-session path) and `Coder::send_to` (by-id orchestrator
+/// path, ADR 0030) so both get the same steer-race recovery, format-
+/// queue flush, abort backfill, auto-rename, and hub-sync behaviour.
+/// Closing over `Arc<SessionRuntime>` is what makes the turn run
+/// detached — it keeps operating on its session regardless of what
+/// the user has foregrounded (ADR 0016).
+fn spawn_turn_loop(
+	state: Arc<CoderState>,
+	rt_for_turn: Arc<SessionRuntime>,
+	sink_for_turn: FolderEventSink,
+	folder_for_turn: Utf8PathBuf,
+	cancel: CancellationToken,
+	auto_rename_after: bool,
+) {
+	tokio::spawn(async move {
+		// Loop wrapper closes the race between `run_turn` returning
+		// `Ok(())` and the spawn task clearing `turn.cancel`: a steer
+		// queued in that window lands in `pending_steers` but would
+		// otherwise be orphaned. Re-checking here under both the
+		// `turn` and `session` locks linearises with `send`'s
+		// turn→session take order.
+		let mut cancel_outer = cancel;
+		let result = loop {
+			let format_queue = Arc::new(crate::tools::FormatQueue::default());
+			let result = run_turn(
+				&state,
+				&rt_for_turn,
+				&folder_for_turn,
+				&sink_for_turn,
+				cancel_outer.clone(),
+				format_queue.clone(),
+			)
+			.await;
+			flush_format_queue(&state, &format_queue).await;
+			if matches!(result, Err(CoderError::Aborted)) && !rt_for_turn.session.lock().await.pending_steers.is_empty() {
+				recover_in_memory_orphans(&rt_for_turn, &sink_for_turn).await;
+				cancel_outer = fresh_cancel(&rt_for_turn).await;
+				continue;
+			}
+			if !matches!(result, Ok(())) {
+				rt_for_turn.turn.lock().await.cancel = None;
+				break result;
+			}
+			let mut turn = rt_for_turn.turn.lock().await;
+			if rt_for_turn.session.lock().await.pending_steers.is_empty() {
+				turn.cancel = None;
+				break result;
+			}
+			let fresh = CancellationToken::new();
+			turn.cancel = Some(fresh.clone());
+			drop(turn);
+			cancel_outer = fresh;
+		};
+		match &result {
+			Ok(()) => {
+				sink_for_turn.send(CoderEvent::TurnComplete);
+				maybe_autosync_to_hub(&state, &rt_for_turn, &folder_for_turn).await;
+			}
+			Err(CoderError::Aborted) => {
+				recover_in_memory_orphans(&rt_for_turn, &sink_for_turn).await;
+				sink_for_turn.send(CoderEvent::Aborted);
+			}
+			Err(err) => {
+				tracing::warn!(error = %err, "coder turn failed");
+				sink_for_turn.send(CoderEvent::Error {
+					message: err.to_string(),
+				});
+			}
+		}
+		if auto_rename_after {
+			spawn_auto_rename(state.clone(), rt_for_turn.clone(), sink_for_turn);
+		}
+	});
+}
+
 async fn run_turn(
 	state: &Arc<CoderState>,
 	rt: &Arc<SessionRuntime>,
@@ -2726,19 +3037,6 @@ async fn run_turn(
 	// turn's record claim a route it never spoke to.
 	let pi_model = models.resolve_route().pi_provider_model(&standard_model);
 
-	// Parent's tool list = registry's regular tools plus the
-	// `task` definition (delegation primitive). Sub-agents pick
-	// from the registry alone (no `task`), which is how the
-	// depth-1 cap is enforced — a sub-agent literally cannot
-	// describe a sub-sub-agent because the model never sees the
-	// tool.
-	let mut tool_defs = state.tools.definitions();
-	tool_defs.push(task_tool_definition());
-	// `ask_user` is parent-only too: pausing for the human only
-	// makes sense at the top level where there's a panel + composer
-	// to answer through. Sub-agents (which build their list from the
-	// registry alone) never see it.
-	tool_defs.push(ask_user_tool_definition());
 	// Pin the tool context to the **session's** bound folder
 	// (captured at spawn time), not the live `active_folder()`.
 	// This is what makes "agent keeps running in folder X while
@@ -2761,12 +3059,46 @@ async fn run_turn(
 		.folder_for_path(routing_path.as_str())
 		.await
 		.ok_or(CoderError::NoActiveFolder)?;
-	// Snapshot the per-session bash-target override once at
-	// turn-start (same posture as `models` above): a toggle
-	// mid-turn applies to the *next* turn, not in-flight commands.
-	let force_host_bash = rt.session.lock().await.header.bash_target_override == Some(BashTargetOverride::ForceHost);
-	let cx =
-		ToolContext::with_format_queue(folder_entry, CoderMode::Agent, format_queue).with_force_host_bash(force_host_bash);
+	// Snapshot the per-session bash-target override + the top-level
+	// session mode once at turn-start (same posture as `models`
+	// above): a toggle / re-stamp mid-turn applies to the *next*
+	// turn, not in-flight commands. The mode drives both the
+	// `ToolContext` (so the dispatch-level write gate is right)
+	// and the tool-list composition below.
+	let (force_host_bash, mode) = {
+		let session = rt.session.lock().await;
+		(
+			session.header.bash_target_override == Some(BashTargetOverride::ForceHost),
+			CoderMode::from_top_level_wire(session.header.mode.as_deref()),
+		)
+	};
+	let cx = ToolContext::with_format_queue(folder_entry, mode, format_queue).with_force_host_bash(force_host_bash);
+	// Tool list composition branches on the top-level session mode
+	// (ADR 0030). The historical shape — `definitions()` plus
+	// `task` plus `ask_user` — is the ordinary `Agent` mode.
+	// `Coordinator` swaps the parent-only tools: `spawn_worker` and
+	// the worker-management tools replace `task`/`ask_user`, and the
+	// coordinator can't mutate files directly (it must delegate),
+	// though the write tools stay advertised so the dispatch-level
+	// gate produces a clear `read_only_mode` error if the model
+	// tries. Sub-agents pick from the registry alone (no `task`),
+	// which is how the depth-1 cap is enforced — a sub-agent
+	// literally cannot describe a sub-sub-agent because the model
+	// never sees the tool.
+	let mut tool_defs = state.tools.definitions();
+	if mode.allows_task_tool() {
+		tool_defs.push(task_tool_definition());
+	}
+	if mode.allows_ask_user() {
+		tool_defs.push(ask_user_tool_definition());
+	}
+	if mode == CoderMode::Coordinator {
+		tool_defs.push(crate::coordinator::spawn_worker_tool_definition());
+		tool_defs.push(crate::coordinator::observe_worker_tool_definition());
+		tool_defs.push(crate::coordinator::steer_worker_tool_definition());
+		tool_defs.push(crate::coordinator::abort_worker_tool_definition());
+		tool_defs.push(crate::coordinator::respond_to_worker_prompt_tool_definition());
+	}
 	// Compose a fresh system prompt and overwrite the session's
 	// `messages[0]`: the base prompt plus a "Bound folders"
 	// section keyed off whatever summaries are currently cached.
@@ -2776,7 +3108,7 @@ async fn run_turn(
 	// Use the routing path (worktree when bound, else parent) as the
 	// prompt's "active folder" so the agent is oriented at the
 	// checkout its tools actually operate on.
-	refresh_system_prompt(state, rt, &routing_path, force_host_bash).await;
+	refresh_system_prompt(state, rt, &routing_path, force_host_bash, mode).await;
 	// Schedule background regeneration for any bound folder whose
 	// summary cache is missing or stale. Detached tokio tasks; we
 	// don't block the turn waiting for them to land. The next
@@ -3286,6 +3618,20 @@ async fn dispatch_tool_calls(
 				// `task`, before falling through to the
 				// generic registry dispatch.
 				handle_todo_write(rt, &args).await
+			} else if call.function.name == "spawn_worker" {
+				// Coordinator-only (ADR 0030). Mints a peer
+				// top-level session in a worktree + seeds it with
+				// the task. Returns a handle (session id), not a
+				// blocking result — the worker runs detached.
+				handle_spawn_worker(state, sink, &call.id, &args).await
+			} else if call.function.name == "observe_worker" {
+				handle_observe_worker(state, &args).await
+			} else if call.function.name == "steer_worker" {
+				handle_steer_worker(state, &args).await
+			} else if call.function.name == "abort_worker" {
+				handle_abort_worker(state, &args).await
+			} else if call.function.name == "respond_to_worker_prompt" {
+				handle_respond_to_worker_prompt(state, &args).await
 			} else {
 				state.tools.dispatch(&call.function.name, &args, cx, cancel).await
 			};
@@ -3649,6 +3995,155 @@ async fn handle_ask_user(
 	}
 }
 
+// ── Coordinator tool handlers (ADR 0030) ─────────────────────
+//
+// These mint / observe / steer / abort / answer **peer top-level
+// sessions** (workers), not sub-agents. They call the by-id client
+// surface on `CoderHandle` (`create_worktree_session`, `send_to`,
+// `abort_session`, `observe_session`, `respond_to_prompt`) — the
+// same surface the companion app will use. The orchestrator is an
+// in-process client of the coder surface.
+
+/// `spawn_worker` — create a worker in a worktree + seed it with a
+/// task. Returns a handle (session id) immediately; the worker runs
+/// detached. The orchestrator's turn is not blocked.
+async fn handle_spawn_worker(
+	state: &Arc<CoderState>,
+	sink: &FolderEventSink,
+	tool_call_id: &str,
+	args: &Value,
+) -> Result<Value, CoderError> {
+	#[derive(serde::Deserialize)]
+	struct SpawnWorkerArgs {
+		task: String,
+		#[serde(default)]
+		base_branch: Option<String>,
+	}
+	let parsed: SpawnWorkerArgs =
+		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("spawn_worker", err.to_string()))?;
+	let task = parsed.task.trim();
+	if task.is_empty() {
+		return Err(CoderError::invalid_args("spawn_worker", "task must not be empty"));
+	}
+	// Mint the worker as an ordinary `Agent` session in a worktree.
+	// A sub-orchestrator would pass `Coordinator` here, but that's a
+	// later-scale concern; v1 workers are plain agents.
+	let handle = CoderHandle { state: state.clone() };
+	let (summary, _workspace) = handle
+		.create_worktree_session(parsed.base_branch, CoderMode::Agent)
+		.await?;
+	let target_folder = summary.worktree_branch.as_deref().unwrap_or("").to_string();
+	// Seed the worker with the task prompt. This kicks off the
+	// worker's first turn as a detached spawned task.
+	handle.send_to(&summary.id, task.to_string(), Vec::new()).await?;
+	// Emit a sub-agent-style event so the parent's transcript shows
+	// the spawn (reuses the existing `SubagentSpawned` shape the
+	// panel renders as a collapsed card). The `subagent_id` is the
+	// worker's session id — the handle the orchestrator uses to
+	// observe / steer / abort it.
+	sink.send(CoderEvent::SubagentSpawned {
+		tool_call_id: tool_call_id.to_string(),
+		subagent_id: summary.id.clone(),
+		target_folder,
+		mode: CoderMode::Agent.as_wire().to_string(),
+	});
+	Ok(json!({
+		"worker_id": summary.id,
+		"branch": summary.worktree_branch,
+		"title": summary.title,
+	}))
+}
+
+/// `observe_worker` — fetch a compact snapshot of a worker's state.
+async fn handle_observe_worker(state: &Arc<CoderState>, args: &Value) -> Result<Value, CoderError> {
+	#[derive(serde::Deserialize)]
+	struct ObserveArgs {
+		worker_id: String,
+	}
+	let parsed: ObserveArgs =
+		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("observe_worker", err.to_string()))?;
+	let handle = CoderHandle { state: state.clone() };
+	let Some(snapshot) = handle.observe_session(&parsed.worker_id).await else {
+		return Err(CoderError::invalid_args(
+			"observe_worker",
+			format!("no mounted session for worker_id `{}`", parsed.worker_id),
+		));
+	};
+	Ok(serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({ "error": "serialization failed" })))
+}
+
+/// `steer_worker` — send a steering message to a worker by id.
+async fn handle_steer_worker(state: &Arc<CoderState>, args: &Value) -> Result<Value, CoderError> {
+	#[derive(serde::Deserialize)]
+	struct SteerArgs {
+		worker_id: String,
+		text: String,
+	}
+	let parsed: SteerArgs =
+		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("steer_worker", err.to_string()))?;
+	if parsed.text.trim().is_empty() {
+		return Err(CoderError::invalid_args("steer_worker", "text must not be empty"));
+	}
+	let handle = CoderHandle { state: state.clone() };
+	handle.send_to(&parsed.worker_id, parsed.text, Vec::new()).await?;
+	Ok(json!({ "status": "steered" }))
+}
+
+/// `abort_worker` — cancel a worker's in-flight turn by id.
+async fn handle_abort_worker(state: &Arc<CoderState>, args: &Value) -> Result<Value, CoderError> {
+	#[derive(serde::Deserialize)]
+	struct AbortArgs {
+		worker_id: String,
+	}
+	let parsed: AbortArgs =
+		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("abort_worker", err.to_string()))?;
+	let handle = CoderHandle { state: state.clone() };
+	handle.abort_session(&parsed.worker_id).await;
+	Ok(json!({ "status": "aborted" }))
+}
+
+/// `respond_to_worker_prompt` — answer a worker's parked `ask_user`.
+/// Routes through the existing `respond_to_prompt` by-call-id scan
+/// (which already targets any session, not just the visible one).
+async fn handle_respond_to_worker_prompt(state: &Arc<CoderState>, args: &Value) -> Result<Value, CoderError> {
+	#[derive(serde::Deserialize)]
+	struct RespondArgs {
+		worker_id: String,
+		answers: Vec<QuestionAnswer>,
+	}
+	let parsed: RespondArgs = serde_json::from_value(args.clone())
+		.map_err(|err| CoderError::invalid_args("respond_to_worker_prompt", err.to_string()))?;
+	// Find the worker's parked prompt call id. A worker has at most
+	// one pending `ask_user` at a time (the loop blocks on it).
+	let handle = CoderHandle { state: state.clone() };
+	let Some(snapshot) = handle.observe_session(&parsed.worker_id).await else {
+		return Err(CoderError::invalid_args(
+			"respond_to_worker_prompt",
+			format!("no mounted session for worker_id `{}`", parsed.worker_id),
+		));
+	};
+	if !snapshot.needs_input {
+		return Ok(json!({ "status": "no_pending_prompt", "note": "the worker has no parked ask_user" }));
+	}
+	// Find the call id by scanning the worker's prompt registry.
+	let Some((rt, _)) = state.runtime_for_session(&parsed.worker_id).await else {
+		return Err(CoderError::invalid_args(
+			"respond_to_worker_prompt",
+			"worker runtime vanished between observe and respond",
+		));
+	};
+	let call_id = rt
+		.prompts
+		.pending_call_id()
+		.await
+		.ok_or_else(|| CoderError::invalid_args("respond_to_worker_prompt", "no pending prompt call id"))?;
+	let response = PromptResponse {
+		answers: parsed.answers,
+	};
+	let resolved = handle.respond_to_prompt(&call_id, response).await;
+	Ok(json!({ "status": if resolved { "answered" } else { "not_resolved" } }))
+}
+
 /// Walk the session's in-memory `messages` for assistant tool
 /// calls that never got a matching `Tool` result. Used when a
 /// turn ends in `Aborted` (Esc / panel close / sign-out) — the
@@ -3794,6 +4289,7 @@ async fn refresh_system_prompt(
 	rt: &Arc<SessionRuntime>,
 	folder_path: &Utf8Path,
 	force_host_bash: bool,
+	mode: CoderMode,
 ) {
 	let folders = state.workspaces.folders().await;
 	let container_mode = workspace_in_container_mode(&state.tools, force_host_bash).await;
@@ -3802,6 +4298,7 @@ async fn refresh_system_prompt(
 		Some(folder_path.as_str()),
 		&state.folder_summaries,
 		container_mode,
+		mode,
 	)
 	.await;
 	let mut session = rt.session.lock().await;
@@ -3852,7 +4349,11 @@ async fn kick_off_summary_refresh(state: &Arc<CoderState>, _sink: &FolderEventSi
 /// Build the parent's system prompt. Sections are concatenated in
 /// this order:
 ///
-/// 1. Base text from [`PHASE_6_0_SYSTEM_PROMPT`].
+/// 1. Base text — [`PHASE_6_0_SYSTEM_PROMPT`] for the ordinary
+///    `Agent` mode, the coordinator system prompt for
+///    `Coordinator` mode (ADR 0030). `Research` is a sub-agent-only
+///    mode and never reaches this top-level composer; if it ever
+///    does, it falls back to the agent prompt.
 /// 2. **Project rules** — verbatim contents of `AGENTS.md` (or
 ///    `CLAUDE.md` as a fallback) from the *active* folder root.
 ///    Projects that came from the Claude / Anthropic ecosystem
@@ -3876,9 +4377,17 @@ async fn compose_system_prompt(
 	active_path: Option<&str>,
 	summaries: &Arc<FolderSummaryService>,
 	container_mode: bool,
+	mode: CoderMode,
 ) -> String {
-	let mut out = String::with_capacity(PHASE_6_0_SYSTEM_PROMPT.len() + 1024);
-	out.push_str(PHASE_6_0_SYSTEM_PROMPT);
+	let base = match mode {
+		CoderMode::Coordinator => crate::coordinator::COORDINATOR_SYSTEM_PROMPT,
+		// `Research` is sub-agent-only; a top-level research session
+		// shouldn't exist, but fall back to the agent prompt rather
+		// than panic a turn if one ever does.
+		CoderMode::Agent | CoderMode::Research => PHASE_6_0_SYSTEM_PROMPT,
+	};
+	let mut out = String::with_capacity(base.len() + 1024);
+	out.push_str(base);
 	if !out.ends_with('\n') {
 		out.push('\n');
 	}
@@ -5498,6 +6007,7 @@ mod tests {
 			parent_session_id: None,
 			parent_tool_call_id: None,
 			subagent_mode: None,
+			mode: None,
 			subagent_target_folder: None,
 			bash_target_override: None,
 			worktree_root: None,

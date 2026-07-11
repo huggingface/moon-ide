@@ -67,6 +67,13 @@ const BASH_OUTPUT_MAX_BYTES: usize = 64_000;
 /// less capable than itself and hesitate to delegate non-trivial
 /// work. `agent` reads as "another instance of you" in the model's
 /// vocabulary and lifted that hesitation in dogfooding.
+///
+/// `Coordinator` is a top-level mode (ADR 0030) for orchestrator
+/// sessions: read-only like `Research` (`allows_writes` is false) but
+/// advertises a different tool list — `spawn_worker` and the worker-
+/// management tools instead of `task` / `ask_user` — and runs under
+/// a coordinator-specific system prompt. Top-level sessions pick the
+/// mode on creation; sub-agents stay `Research` / `Agent` only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoderMode {
 	/// Read-only intent. `read_file` / `list_dir` / `grep` / `bash`
@@ -78,6 +85,13 @@ pub enum CoderMode {
 	Research,
 	/// Full toolkit. Today's parent-turn behaviour.
 	Agent,
+	/// Top-level orchestrator mode (ADR 0030). Read-only like
+	/// `Research` (the coordinator must delegate mutation to its
+	/// workers) but with the worker-management tools in place of
+	/// `task` / `ask_user`. Top-level only — sub-agents never run
+	/// in this mode, so the `task` tool's JSON-schema `mode` enum
+	/// stays `["research", "agent"]`.
+	Coordinator,
 }
 
 impl CoderMode {
@@ -85,15 +99,73 @@ impl CoderMode {
 		matches!(self, Self::Agent)
 	}
 
+	/// Whether this mode advertises the sub-agent delegation tool
+	/// (`task`) to the model. Sub-agents don't (depth-1 cap); a
+	/// top-level coordinator doesn't either — it spawns peer
+	/// sessions via `spawn_worker`, not sub-agents via `task`.
+	/// Only the ordinary top-level `Agent` mode does.
+	pub fn allows_task_tool(self) -> bool {
+		matches!(self, Self::Agent)
+	}
+
+	/// Whether this mode advertises `ask_user`. Sub-agents don't
+	/// (no panel to answer through). A top-level coordinator
+	/// doesn't either (ADR 0030 §Fork 1 — the coordinator's
+	/// `ask_user`-equivalent is `respond_to_worker_prompt`, and
+	/// human questions route to the user via the worker's own
+	/// `ask_user`). Only the ordinary top-level `Agent` mode does.
+	pub fn allows_ask_user(self) -> bool {
+		matches!(self, Self::Agent)
+	}
+
 	/// Wire string used by event payloads (`SubagentSpawned.mode`,
-	/// the `mode` field on the `task` tool result, etc.).
-	/// Stable identifiers — `"research"` / `"agent"` — that the
+	/// the `mode` field on the `task` tool result, the top-level
+	/// session header's `mode` field). Stable identifiers —
+	/// `"research"` / `"agent"` / `"coordinator"` — that the
 	/// frontend reads verbatim, so don't rename without also
 	/// updating `src/lib/protocol.ts`.
 	pub fn as_wire(self) -> &'static str {
 		match self {
 			Self::Research => "research",
 			Self::Agent => "agent",
+			Self::Coordinator => "coordinator",
+		}
+	}
+
+	/// Parse a wire string back into a `CoderMode`. Accepts the
+	/// `as_wire` outputs; an unknown string errors with the valid
+	/// values named. Used for the top-level session header's `mode`
+	/// field on load — `None` / absent defaults to `Agent` (every
+	/// pre-coordinator session is an ordinary agent session).
+	pub fn from_wire(s: &str) -> Result<Self, CoderError> {
+		match s {
+			"research" => Ok(Self::Research),
+			"agent" => Ok(Self::Agent),
+			"coordinator" => Ok(Self::Coordinator),
+			other => Err(CoderError::invalid_args(
+				"mode",
+				format!("`{other}` is not a valid mode; expected `research`, `agent`, or `coordinator`"),
+			)),
+		}
+	}
+
+	/// Parse an optional wire string for the top-level session
+	/// header's `mode` field. `None` / absent → `Agent` (the
+	/// pre-coordinator default, byte-compatible with every existing
+	/// session on disk).
+	pub fn from_top_level_wire(s: Option<&str>) -> Self {
+		match s {
+			None | Some("agent") => Self::Agent,
+			Some("coordinator") => Self::Coordinator,
+			// `research` is a sub-agent-only mode; a top-level
+			// session carrying it (only via a hand-edited header)
+			// falls back to `Agent` rather than honouring a state
+			// that `run_turn` never sets. Logged by the caller.
+			Some("research") => Self::Agent,
+			Some(other) => {
+				tracing::warn!(mode = other, "unknown top-level session mode; falling back to agent");
+				Self::Agent
+			}
 		}
 	}
 }
@@ -3287,6 +3359,53 @@ mod tests {
 				.expect("nested bound folder path should resolve to the inner folder");
 			assert_eq!(out, "file.rs");
 			assert!(Arc::ptr_eq(&target, &inner_entry));
+		}
+	}
+
+	mod coordinator_mode {
+		use crate::CoderMode;
+
+		#[test]
+		fn coordinator_is_read_only() {
+			assert!(!CoderMode::Coordinator.allows_writes());
+			assert!(CoderMode::Agent.allows_writes());
+			assert!(!CoderMode::Research.allows_writes());
+		}
+
+		#[test]
+		fn coordinator_does_not_advertise_task_or_ask_user() {
+			// The depth-1 cap + the coordinator's "delegate, don't
+			// do" posture both hinge on these.
+			assert!(!CoderMode::Coordinator.allows_task_tool());
+			assert!(!CoderMode::Coordinator.allows_ask_user());
+			assert!(CoderMode::Agent.allows_task_tool());
+			assert!(CoderMode::Agent.allows_ask_user());
+		}
+
+		#[test]
+		fn coordinator_wire_string_round_trips() {
+			assert_eq!(CoderMode::Coordinator.as_wire(), "coordinator");
+			assert_eq!(CoderMode::from_wire("coordinator").unwrap(), CoderMode::Coordinator);
+			assert_eq!(CoderMode::from_wire("agent").unwrap(), CoderMode::Agent);
+			assert_eq!(CoderMode::from_wire("research").unwrap(), CoderMode::Research);
+			assert!(CoderMode::from_wire("bogus").is_err());
+		}
+
+		#[test]
+		fn from_top_level_wire_defaults_to_agent() {
+			// `None` / absent = the pre-coordinator default, byte-
+			// compatible with every existing session on disk.
+			assert_eq!(CoderMode::from_top_level_wire(None), CoderMode::Agent);
+			assert_eq!(CoderMode::from_top_level_wire(Some("agent")), CoderMode::Agent);
+			assert_eq!(
+				CoderMode::from_top_level_wire(Some("coordinator")),
+				CoderMode::Coordinator
+			);
+			// `research` is sub-agent-only; a top-level session
+			// carrying it falls back to `Agent`.
+			assert_eq!(CoderMode::from_top_level_wire(Some("research")), CoderMode::Agent);
+			// Unknown string: falls back to `Agent`, doesn't panic.
+			assert_eq!(CoderMode::from_top_level_wire(Some("bogus")), CoderMode::Agent);
 		}
 	}
 }

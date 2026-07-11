@@ -33,6 +33,9 @@ export type SessionSummary = {
 	id: string;
 	title: string;
 	updated_at_ms: number;
+	/** Top-level session mode (ADR 0030); absent for the default
+	 * `agent` mode, `"coordinator"` for an orchestrator session. */
+	mode?: string | null;
 };
 
 /** A rendered transcript row. We collapse the coder's fine-grained

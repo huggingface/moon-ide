@@ -378,57 +378,16 @@ pub async fn coder_new_worktree_session(
 	state: State<'_, AppState>,
 	base_branch: Option<String>,
 ) -> Result<NewWorktreeSession, MoonError> {
-	use moon_core::host::WorktreeBranch;
-
-	let parent = state.workspaces.require_active_folder().await?;
-	let parent_path = parent.folder.path.clone();
-
-	// The branch is the deliverable. Either mint a fresh
-	// `moon/agent-<id>` off HEAD, or attach to an existing branch the
-	// caller named. The branch name also drives the on-disk worktree
-	// dir, so a time-derived suffix keeps the auto case unique.
-	let spec = match base_branch.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
-		Some(existing) => WorktreeBranch::Existing(existing.to_string()),
-		None => {
-			let now_ms = std::time::SystemTime::now()
-				.duration_since(std::time::UNIX_EPOCH)
-				.map(|d| d.as_millis())
-				.unwrap_or(0) as u64;
-			WorktreeBranch::New(format!("moon/agent-{:08x}", now_ms & 0xffff_ffff))
-		}
-	};
-	let branch = spec.name().to_string();
-	let branch_slug = branch.replace('/', "-");
-
-	// The worktree lives inside the parent repo at
-	// `<parent>/.worktrees/<branch-slug>` (ADR 0029) so it rides the
-	// parent's bind mount and resolves the same on the host and in the
-	// container via `--relative-paths` git links.
-	let worktree_path = camino::Utf8Path::new(&parent_path)
-		.join(moon_core::WORKTREES_DIR_NAME)
-		.join(&branch_slug);
-	if let Some(parent_dir) = worktree_path.parent() {
-		std::fs::create_dir_all(parent_dir.as_std_path()).map_err(MoonError::from)?;
-	}
-
-	// Create the worktree (fresh branch off HEAD, or check out the
-	// existing branch) — host-side; the parent's checkout is untouched.
-	parent.host.git_worktree_add(&worktree_path, spec).await?;
-
-	// Bind it as a nested folder; capture the canonical path the
-	// registry stored so the session's routing key matches exactly.
-	let wt_entry = state
-		.workspaces
-		.add_worktree_folder(worktree_path, parent_path, branch.clone())
-		.await?;
-
-	let session = state
+	// Delegates to `CoderHandle::create_worktree_session` (ADR 0030
+	// Prerequisite #2 — promoted from a UI-only Tauri command to a
+	// client-callable method so an in-process orchestrator agent can
+	// mint workers via `spawn_worker` without going through the Tauri
+	// command layer). The UI path always mints an ordinary `Agent`
+	// worker; a coordinator is created the same way with `Coordinator`.
+	let (session, workspace) = state
 		.coder
-		.new_worktree_session(wt_entry.folder.path.clone(), branch)
-		.await
-		.map_err(MoonError::from)?;
-
-	let workspace = state.workspaces.snapshot().await;
+		.create_worktree_session(base_branch, moon_coder::tools::CoderMode::Agent)
+		.await?;
 	Ok(NewWorktreeSession { workspace, session })
 }
 

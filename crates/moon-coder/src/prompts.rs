@@ -198,6 +198,15 @@ impl PromptRegistry {
 	pub async fn holds(&self, tool_call_id: &str) -> bool {
 		self.pending.lock().await.contains_key(tool_call_id)
 	}
+
+	/// The `tool_call_id` of the single parked prompt, if any.
+	/// Used by an orchestrator's `respond_to_worker_prompt` (ADR 0030)
+	/// to discover the call id it needs to answer — a worker has at
+	/// most one pending `ask_user` at a time (the loop blocks on it).
+	/// `None` when no prompt is parked.
+	pub async fn pending_call_id(&self) -> Option<String> {
+		self.pending.lock().await.keys().next().cloned()
+	}
 }
 
 #[cfg(test)]

@@ -1747,6 +1747,13 @@ export type CoderSessionSummary = {
 	 * the session's work is first committed.
 	 */
 	committed_branch?: string | null;
+	/**
+	 * Top-level session mode (ADR 0030). Absent for the default
+	 * `agent` mode; `"coordinator"` marks an orchestrator session.
+	 * Lets the sessions list badge a coordinator row. Mirrors the
+	 * header's `mode` field.
+	 */
+	mode?: string | null;
 };
 
 /**

@@ -1,13 +1,24 @@
 # ADR 0030 — Orchestrator sessions: an agent as a client of the coder surface
 
 Date: 2026-07-10
-Status: proposed; design only, no code yet. Not on a phase roadmap. This
-ADR records the shape we converged on so the next conversation starts
-from it. It anticipates, and is gated on, two things that are also not
-built yet: the [companion app](0023-mobile-companion-bridge.md) turning
-the coder surface into a clean client surface, and
-[`coder_new_worktree_session`](../coder.md#worktree-sessions) being
-promoted from a UI-only Tauri command to a client-callable method.
+Status: accepted; first implementation cut landed. The coordinator
+mode, the `mode` header field, the `spawn_worker` / `observe_worker` /
+`steer_worker` / `abort_worker` / `respond_to_worker_prompt` tools, the
+by-id client surface (`send_to` / `abort_session` / `observe_session`),
+and the worktree-creation promotion (`create_worktree_session`) are
+implemented and tested. Not yet on a phase roadmap — this is the first
+concrete realization of the design. The [companion app](0023-mobile-
+companion-bridge.md) is still the forcing function for the broader
+"coder surface as a client surface" cleanup; the orchestrator reuses
+the `CoderHandle` method set directly (in-process, not over WSS).
+
+Still **not** implemented (deferred, per the two-fork resolutions):
+events-as-messages (the dispatch-packet feeder that wakes the
+orchestrator's LLM loop on worker events) and the multi-entry batchable
+dispatch queue — the existing steer queue turns out to already be
+multi-entry FIFO with batched drain, so only the per-worker dispatch-
+packet shape remains. See [§ Resolved v1 forks](#resolved-v1-forks) and
+[§ What this deliberately does not do](#what-this-deliberately-does-not-do).
 
 ## Context
 
@@ -331,28 +342,26 @@ can look at any of them) and keeps the scope of this ADR small.
 - **Does not require sub-orchestrators at v1.** Permitted by the
   design (a worker can be a coordinator), not required.
 
-## Prerequisites (gating, not blocking)
+## Prerequisites (now landed)
 
-This ADR is **design-only** and is gated on work that is also not
-built yet:
+The first implementation cut landed these, so the "gating" framing
+is now historical:
 
 1. **The companion app** turning the coder surface into a clean client
-   surface. The orchestrator is the first _in-process_ client of that
-   surface; building it before the surface is client-clean would
-   re-couple the loop to the webview, which is exactly what the
-   companion spec warns against.
-2. **`coder_new_worktree_session` as a client-callable method**, not a
-   UI-only Tauri command. (Trivial mechanically; the point is the
-   _promotion_, not the plumbing.)
-3. **`coder_respond_to_prompt` as a client-callable method** on every
-   session's parked prompts, not just the desktop's — and the
-   companion's v1 scope updated to list it, since "interact with coder
-   sessions like moon-ide" already implies it.
-
-None of these are blockers in the sense of "decide first"; they're
-gates in the sense of "land before, or alongside, the first
-orchestrator cut." The companion is the forcing function for (1) and
-most of (3); (2) is a small mechanical promotion.
+   surface — still not built. The orchestrator cut sidesteps this by
+   calling `CoderHandle` methods directly (in-process), not over WSS.
+   The companion remains the forcing function for the broader surface
+   cleanup (the `BridgeRpc` handler is the existing precedent for a
+   non-Tauri in-process consumer).
+2. **`coder_new_worktree_session` as a client-callable method** —
+   **landed** as `CoderHandle::create_worktree_session(base_branch,
+mode)`. The Tauri command is now a thin wrapper over it.
+3. **`coder_respond_to_prompt` as a client-callable method** —
+   **already was** client-callable (`CoderHandle::respond_to_prompt`
+   scans all folders by `call_id`, not just the visible session). The
+   orchestrator's `respond_to_worker_prompt` tool composes it with
+   the new `observe_session` + `pending_call_id` to discover the call
+   id by worker id.
 
 ## Alternatives considered
 
