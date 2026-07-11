@@ -523,10 +523,18 @@ Architecturally:
 - New `git_add_paths` host method for the auto-stage-on-save
   hook. Same lexical containment as `git_restore_paths`.
 - The fs-watcher's `.git/` whitelist grew from "just HEAD" to
-  also surface `.git/MERGE_HEAD` and `.git/MERGE_MSG`. The
-  frontend's `bindFolderChangeRefresh` listener kicks
-  `refreshGitMergeState` when either path appears in the
-  batch, so the panel reshapes itself live without a poll.
+  also surface `.git/MERGE_HEAD` and `.git/MERGE_MSG`, and later
+  `.git/index` (so an external `git reset --mixed` / `git add` /
+  `git restore --staged` — which rewrite the index without
+  touching a working-tree file — refreshes the SCM panel
+  immediately). The frontend's `bindFolderChangeRefresh`
+  listener kicks `refreshGitMergeState` when `MERGE_HEAD` /
+  `MERGE_MSG` appears in the batch, so the panel reshapes itself
+  live without a poll. Nested ref moves under `.git/refs/`
+  (`git reset --soft`, external commit, `git switch` to identical
+  content) are structurally unobservable by the non-recursive
+  `.git/` watch; the auto-fetch loop's HEAD-SHA snapshot is the
+  safety net for those.
 - New CodeMirror extension `editor/conflictMarkers.ts`
   decorates blocks and renders the accept-toolbar widget.
   Gated on a `conflictedFacet`; the decorator is inert on

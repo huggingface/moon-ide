@@ -26,7 +26,13 @@
 //! `target/` / build output that the user's `.gitignore` already
 //! says to ignore. `.git/` is excluded by `ignore` unconditionally
 //! and re-added as one non-recursive watch so we still see
-//! `.git/HEAD` rewrites for branch-switch detection.
+//! `.git/HEAD` rewrites (branch-switch detection), `.git/index`
+//! rewrites (external `git reset --mixed` / `git add` / `git
+//! restore --staged`), and `.git/MERGE_HEAD` / `.git/MERGE_MSG`
+//! (merge start / abort). Nested ref moves under `.git/refs/` are
+//! not watched (event-storm tradeoff); the auto-fetch loop's
+//! HEAD-SHA snapshot is the safety net for those — see
+//! `runGitAutoFetch` in `state.svelte.ts`.
 //!
 //! Cost of the manual approach: ~one inotify watch per source
 //! directory + a few hundred ms of walk on workspace open. Both
@@ -598,9 +604,11 @@ fn collect_event_paths(
 /// `true` for the small set of `.git/` top-level files the
 /// frontend cares about: `HEAD` (external branch switches),
 /// `MERGE_HEAD` + `MERGE_MSG` (start / abort / finish of a
-/// merge), and `index` (commit / restore — though most consumers
-/// pick that up via the normal worktree events; harmless to let
-/// through). We match by the last two path components rather
+/// merge), and `index` (commit / restore / `git reset --mixed`
+/// — the index rewrites even when no working-tree file changes,
+/// so without this the SCM panel stays stale after an external
+/// `git reset HEAD^1` or `git add` until the next focus/manual
+/// refresh). We match by the last two path components rather
 /// than full-path equality so worktrees rooted at any depth
 /// match — and so we don't accidentally pick up
 /// `.git/refs/heads/HEAD`-style paths.
@@ -610,7 +618,7 @@ fn is_dotgit_observed_top_level(path: &Path) -> bool {
 		return false;
 	};
 	let last = last.as_os_str();
-	if last != "HEAD" && last != "MERGE_HEAD" && last != "MERGE_MSG" {
+	if last != "HEAD" && last != "MERGE_HEAD" && last != "MERGE_MSG" && last != "index" {
 		return false;
 	}
 	let Some(parent) = components.next() else {

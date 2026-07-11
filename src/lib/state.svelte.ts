@@ -2227,22 +2227,50 @@ class WorkspaceState {
 		}
 		this.gitAutoFetchLastAt = now;
 		this.gitAutoFetchInFlight = true;
+		// Snapshot HEAD before the fetch. A fetch itself only moves
+		// remote-tracking refs — local HEAD/index/worktree are
+		// unchanged — but the branch refresh we run afterwards also
+		// picks up *external* ref moves the fs watcher can't see
+		// (a `git reset --soft` / external commit / `git switch` to
+		// identical content rewrites `.git/refs/heads/<branch>`,
+		// which the non-recursive `.git/` watch misses). When the
+		// SHA differs from the pre-fetch snapshot, kick a status
+		// refresh so the SCM panel catches up instead of staying
+		// stale until the next window-focus / manual refresh.
+		const shaBefore = this.gitBranch.headShortSha;
 		try {
-			await ipc.fs.gitFetch();
+			// Fetch failures (offline, no upstream, auth refused, 30s
+			// timeout) are silently swallowed — the user never asked
+			// us to fetch, so a flash toast / dev-console log would
+			// be noise. The user-visible signal is "Sync Changes"
+			// not appearing; the supported channel for triaging is
+			// `RUST_LOG=moon_core=debug` plus the dev tools' Network
+			// tab on the Tauri IPC.
+			try {
+				await ipc.fs.gitFetch();
+			} catch {
+				// Swallow — see above. Fall through to the branch
+				// refresh: it's a local git probe (no network) and
+				// still catches external ref moves the watcher can't.
+			}
 			// Fetch only moves remote-tracking refs; local working
 			// tree, index, HEAD all unchanged. Just refresh the
 			// branch readout so `behind` reflects the new upstream
 			// and the Sync Changes button surfaces. A full
-			// `refreshGitStatus` would be wasted work.
+			// `refreshGitStatus` would be wasted work — unless HEAD
+			// moved out from under us (see `shaBefore` above).
 			await this.refreshGitBranch();
+			if (this.gitBranch.headShortSha !== null && this.gitBranch.headShortSha !== shaBefore) {
+				frontendLog(
+					'fs-watcher',
+					'info',
+					`HEAD moved (${shaBefore} → ${this.gitBranch.headShortSha}) during auto-fetch — refreshing git status`,
+				);
+				void this.refreshGitStatus(this.paths, null);
+			}
 		} catch {
-			// Auto-fetch failures (offline, no upstream, auth refused,
-			// 30s timeout) are silently swallowed — the user never
-			// asked us to fetch, so a flash toast / dev-console log
-			// would be noise. The user-visible signal is "Sync
-			// Changes" not appearing; the supported channel for
-			// triaging is `RUST_LOG=moon_core=debug` plus the dev
-			// tools' Network tab on the Tauri IPC.
+			// `refreshGitBranch` itself is best-effort and shouldn't
+			// throw (it collapses to a null state), but guard anyway.
 		} finally {
 			this.gitAutoFetchInFlight = false;
 		}
@@ -3274,11 +3302,13 @@ class WorkspaceState {
 		// Refresh the branch label opportunistically alongside the
 		// status fetch — `git symbolic-ref` is cheap and we want the
 		// SCM panel header to update when external `git checkout` /
-		// `git switch` runs from a terminal. (We can't observe the
-		// `.git/HEAD` write directly: the fs-watcher filters `.git/`
-		// out to suppress the per-commit storm, so this opportunistic
-		// refresh on every status pass is how branch changes
-		// propagate back to the UI.)
+		// `git switch` runs from a terminal. The fs-watcher forwards
+		// `.git/HEAD` writes (so a symbolic-ref switch already
+		// triggers a refresh), but a `git switch` that only moves an
+		// existing branch ref rewrites `.git/refs/heads/<branch>`
+		// (nested, unwatched) and never touches `.git/HEAD` — so this
+		// opportunistic refresh on every status pass is the other
+		// half of how branch changes propagate back to the UI.
 		void this.refreshGitBranch();
 		// `'default'` baseline routes through `git diff
 		// --name-status` against the merge-base; the entries
@@ -6807,13 +6837,14 @@ function subsetTouchesGitState(subset: ReadonlySet<string>): boolean {
 
 /** Matches the backend allowlist in `fs_watcher.rs`
  *  (`is_dotgit_observed_top_level`): a `.git/`-relative `HEAD`
- *  (branch switch / checkout), or `MERGE_HEAD` / `MERGE_MSG` (a
- *  merge starting / finishing). Path is forward-slash,
- *  workspace-relative. */
+ *  (branch switch / checkout), `MERGE_HEAD` / `MERGE_MSG` (a
+ *  merge starting / finishing), or `index` (commit / restore /
+ *  reset — the index rewrites even when no working-tree file
+ *  changes). Path is forward-slash, workspace-relative. */
 function isGitStatePath(path: string): boolean {
 	const parts = path.split('/');
 	const last = parts[parts.length - 1];
-	if (last !== 'HEAD' && last !== 'MERGE_HEAD' && last !== 'MERGE_MSG') {
+	if (last !== 'HEAD' && last !== 'MERGE_HEAD' && last !== 'MERGE_MSG' && last !== 'index') {
 		return false;
 	}
 	return parts[parts.length - 2] === '.git';
