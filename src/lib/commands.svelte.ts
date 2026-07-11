@@ -32,22 +32,15 @@ export function commandTitle(cmd: Command): string {
 }
 
 /**
- * Pre-fill string for the "Search in Files…" palette. Mirrors
- * VS Code / Cursor: opening the workspace search with a non-empty
- * editor selection drops the selected text into the search box so
- * the user can hit Enter immediately. Multi-line selections
- * collapse to their first non-empty line — a multi-line ripgrep
- * pattern is rarely what the user meant, and the palette input is
- * single-line anyway. Returns `''` when there's nothing usable
- * (no selection, blank-only selection, or a payload long enough
- * that pre-filling would dominate the input field).
+ * Collapse a raw selection payload into one search-box line. The
+ * first non-empty line wins — a multi-line ripgrep pattern is
+ * rarely what the user meant and the palette input is single-line
+ * anyway. A first line over 200 chars returns `''` (long enough
+ * that pre-filling would dominate the field); blank-only returns
+ * `''`.
  */
-export function searchQueryFromSelection(): string {
-	const sel = workspace.activeSelection;
-	if (sel === null) {
-		return '';
-	}
-	for (const line of sel.text.split(/\r?\n/)) {
+function searchQueryFromText(text: string): string {
+	for (const line of text.split(/\r?\n/)) {
 		const trimmed = line.trim();
 		if (trimmed.length === 0) {
 			continue;
@@ -61,11 +54,42 @@ export function searchQueryFromSelection(): string {
 }
 
 /**
- * Initial query for the search palette: editor selection wins, then
- * the last content search we actually ran this session, then empty.
- * Mirrors VS Code: reopening `Ctrl+Shift+F` with no selection drops
- * you back on your previous needle so a quick "search, look at one
- * hit, search again" loop doesn't re-type the term.
+ * Pre-fill string for the "Search in Files…" palette. The focused
+ * surface's selection wins: when the coder composer holds focus its
+ * selection is used instead of a stale editor selection left from a
+ * previous task — the same "focus beats stale" rule Ctrl+L applies
+ * to terminal scrollback. The composer is read live at keystroke
+ * time (`composerEl` is already synced by CoderPanel) rather than
+ * via a tracked snapshot, so the value is always exact with no
+ * publish/clear lifecycle. Returns `''` when nothing usable is
+ * selected.
+ */
+export function searchQueryFromSelection(): string {
+	const composer = coder.composerEl;
+	if (composer !== null && document.activeElement === composer) {
+		const start = composer.selectionStart;
+		const end = composer.selectionEnd;
+		if (start !== end) {
+			const fromComposer = searchQueryFromText(composer.value.slice(start, end));
+			if (fromComposer.length > 0) {
+				return fromComposer;
+			}
+		}
+	}
+	const sel = workspace.activeSelection;
+	if (sel === null) {
+		return '';
+	}
+	return searchQueryFromText(sel.text);
+}
+
+/**
+ * Initial query for the search palette: the focused surface's
+ * selection wins, then the last content search we actually ran
+ * this session, then empty. Mirrors VS Code: reopening
+ * `Ctrl+Shift+F` with no selection drops you back on your previous
+ * needle so a quick "search, look at one hit, search again" loop
+ * doesn't re-type the term.
  */
 export function searchPaletteInitialQuery(): string {
 	const fromSelection = searchQueryFromSelection();
