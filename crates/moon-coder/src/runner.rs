@@ -3511,6 +3511,10 @@ async fn run_turn(
 		tool_defs.push(crate::coordinator::abort_worker_tool_definition());
 		tool_defs.push(crate::coordinator::respond_to_worker_prompt_tool_definition());
 		tool_defs.push(crate::coordinator::review_worker_changes_tool_definition());
+		tool_defs.push(crate::coordinator::workspace_scm_status_tool_definition());
+		tool_defs.push(crate::coordinator::commit_worker_changes_tool_definition());
+		tool_defs.push(crate::coordinator::clone_repo_tool_definition());
+		tool_defs.push(crate::coordinator::init_repo_tool_definition());
 	}
 	// Compose a fresh system prompt and overwrite the session's
 	// `messages[0]`: the base prompt plus a "Bound folders"
@@ -4063,6 +4067,14 @@ async fn dispatch_tool_calls(
 				handle_respond_to_worker_prompt(state, &args).await
 			} else if call.function.name == "review_worker_changes" {
 				handle_review_worker_changes(state, &args).await
+			} else if call.function.name == "workspace_scm_status" {
+				handle_workspace_scm_status(state, &args).await
+			} else if call.function.name == "commit_worker_changes" {
+				handle_commit_worker_changes(state, &args).await
+			} else if call.function.name == "clone_repo" {
+				handle_clone_repo(state, &args).await
+			} else if call.function.name == "init_repo" {
+				handle_init_repo(state, &args).await
 			} else {
 				state.tools.dispatch(&call.function.name, &args, cx, cancel).await
 			};
@@ -4691,6 +4703,339 @@ fn filter_diff_to_files(diff: &str, files: &std::collections::HashSet<&str>) -> 
 		}
 	}
 	out
+}
+
+/// `workspace_scm_status` — read-only SCM state for a worker's
+/// worktree (or the main folder). Composes branch info, file change
+/// counts, and the file list into one compact snapshot (ADR 0030).
+async fn handle_workspace_scm_status(state: &Arc<CoderState>, args: &Value) -> Result<Value, CoderError> {
+	#[derive(serde::Deserialize)]
+	struct ScmStatusArgs {
+		#[serde(default)]
+		worker_id: Option<String>,
+	}
+	let parsed: ScmStatusArgs = serde_json::from_value(args.clone())
+		.map_err(|err| CoderError::invalid_args("workspace_scm_status", err.to_string()))?;
+	// Resolve the folder to query. If `worker_id` is provided,
+	// resolve the worker's worktree root; otherwise use the active
+	// folder.
+	let routing_path = match &parsed.worker_id {
+		Some(worker_id) => {
+			let Some((rt, _)) = state.runtime_for_session(worker_id).await else {
+				return Err(CoderError::invalid_args(
+					"workspace_scm_status",
+					format!("no mounted session for worker_id `{worker_id}`"),
+				));
+			};
+			let session = rt.session.lock().await;
+			match session.header.worktree_root.clone() {
+				Some(root) if state.workspaces.folder_for_path(&root).await.is_some() => root,
+				_ => {
+					let Some((_, folder_path)) = state.runtime_for_session(worker_id).await else {
+						return Err(CoderError::invalid_args(
+							"workspace_scm_status",
+							"could not resolve folder for worker",
+						));
+					};
+					folder_path.to_string()
+				}
+			}
+		}
+		None => {
+			let (_, folder_path) = state.active_folder_session().await?;
+			folder_path.to_string()
+		}
+	};
+	let Some(folder) = state.workspaces.folder_for_path(&routing_path).await else {
+		return Err(CoderError::invalid_args(
+			"workspace_scm_status",
+			format!("no bound folder for path `{routing_path}`"),
+		));
+	};
+	// Compose the three git calls. Best-effort — individual failures
+	// produce empty/default values rather than erroring the whole tool.
+	let branch = folder.host.git_branch().await.unwrap_or_default();
+	let entries = folder.host.git_status_entries(&[]).await.unwrap_or_default();
+	// Fold entries into aggregate counts.
+	let mut added = 0u32;
+	let mut modified = 0u32;
+	let mut deleted = 0u32;
+	let files: Vec<Value> = entries
+		.iter()
+		.filter(|e| !matches!(e.status, moon_protocol::git::GitFileStatus::Ignored))
+		.map(|e| {
+			match e.status {
+				moon_protocol::git::GitFileStatus::Added | moon_protocol::git::GitFileStatus::Untracked => added += 1,
+				moon_protocol::git::GitFileStatus::Modified | moon_protocol::git::GitFileStatus::Conflicted => modified += 1,
+				moon_protocol::git::GitFileStatus::Deleted => deleted += 1,
+				moon_protocol::git::GitFileStatus::Ignored => {}
+			}
+			json!({
+				"path": e.path,
+				"status": format!("{:?}", e.status).to_lowercase(),
+			})
+		})
+		.collect();
+	Ok(json!({
+		"branch": {
+			"name": branch.name,
+			"head_short_sha": branch.head_short_sha,
+			"has_upstream": branch.has_upstream,
+			"ahead": branch.ahead,
+			"behind": branch.behind,
+			"default_branch_behind": branch.default_branch_behind,
+		},
+		"changes": {
+			"added": added,
+			"modified": modified,
+			"deleted": deleted,
+			"total": added + modified + deleted,
+		},
+		"files": files,
+	}))
+}
+
+/// `commit_worker_changes` — checkpoint a worker's uncommitted work
+/// with a git commit (ADR 0030). Resolves the worker's worktree,
+/// optionally AI-suggests a commit message from the diff, then runs
+/// `git add -A` + `git commit` — the same flow the IDE's SCM panel
+/// uses.
+async fn handle_commit_worker_changes(state: &Arc<CoderState>, args: &Value) -> Result<Value, CoderError> {
+	#[derive(serde::Deserialize)]
+	struct CommitArgs {
+		worker_id: String,
+		#[serde(default)]
+		message: Option<String>,
+	}
+	let parsed: CommitArgs = serde_json::from_value(args.clone())
+		.map_err(|err| CoderError::invalid_args("commit_worker_changes", err.to_string()))?;
+	let Some((rt, _)) = state.runtime_for_session(&parsed.worker_id).await else {
+		return Err(CoderError::invalid_args(
+			"commit_worker_changes",
+			format!("no mounted session for worker_id `{}`", parsed.worker_id),
+		));
+	};
+	let worktree_root = rt.session.lock().await.header.worktree_root.clone();
+	let routing_path = match worktree_root {
+		Some(root) if state.workspaces.folder_for_path(&root).await.is_some() => root,
+		_ => {
+			let Some((_, folder_path)) = state.runtime_for_session(&parsed.worker_id).await else {
+				return Err(CoderError::invalid_args(
+					"commit_worker_changes",
+					"could not resolve folder for worker",
+				));
+			};
+			folder_path.to_string()
+		}
+	};
+	let Some(folder) = state.workspaces.folder_for_path(&routing_path).await else {
+		return Err(CoderError::invalid_args(
+			"commit_worker_changes",
+			format!("no bound folder for path `{routing_path}`"),
+		));
+	};
+	// Determine the commit message. If the caller provided one, use
+	// it. Otherwise, pull the diff and AI-suggest a message.
+	let message = match &parsed.message {
+		Some(msg) if !msg.trim().is_empty() => msg.trim().to_owned(),
+		_ => {
+			let diff = folder.host.git_diff_patch().await.unwrap_or_default();
+			if diff.is_empty() {
+				return Err(CoderError::invalid_args(
+					"commit_worker_changes",
+					"nothing to commit — working tree is clean",
+				));
+			}
+			suggest_commit_message_from_state(state, &diff).await?
+		}
+	};
+	let result = folder.host.git_commit(&message, false).await?;
+	Ok(json!({
+		"short_sha": result.short_sha,
+		"summary": result.summary,
+	}))
+}
+
+/// AI-suggest a commit message from a diff patch, using the same
+/// cheap-model flow as `CoderHandle::suggest_commit_message` but
+/// accessible from a `&Arc<CoderState>`.
+async fn suggest_commit_message_from_state(state: &Arc<CoderState>, diff_patch: &str) -> Result<String, CoderError> {
+	let prompt = build_commit_message_prompt("", diff_patch);
+	let messages = vec![
+		ChatMessage::System {
+			content: COMMIT_MESSAGE_SYSTEM_PROMPT.to_string(),
+		},
+		ChatMessage::user(prompt),
+	];
+	let cheap_model = state.models.read().await.cheap().to_owned();
+	let cancel = CancellationToken::new();
+	let response = state
+		.inference
+		.chat_completion(&cheap_model, &messages, &[], &cancel)
+		.await?;
+	let raw = response.content.unwrap_or_default();
+	let cleaned = sanitise_commit_message(&raw);
+	if cleaned.is_empty() {
+		return Err(CoderError::Internal("commit message suggestion was empty".into()));
+	}
+	Ok(cleaned)
+}
+
+/// Validate that a git clone URL is safe for the coordinator to
+/// use. Rejects `file://` URLs and bare local paths (which would
+/// let the agent clone arbitrary host directories into the
+/// workspace), and requires a recognized remote scheme (`https://`,
+/// `http://`, `ssh://`, or `git@` SSH shorthand). This is a
+/// security boundary, not a UX hint — the coordinator must not be
+/// able to exfiltrate local filesystem contents via `git clone`.
+fn is_safe_clone_url(url: &str) -> bool {
+	let trimmed = url.trim();
+	if trimmed.is_empty() {
+		return false;
+	}
+	// Reject `file://` and bare local paths outright — cloning a
+	// local directory would let the agent read arbitrary host paths
+	// via the resulting workspace folder.
+	if trimmed.starts_with("file://") || trimmed.starts_with('/') || trimmed.starts_with('.') {
+		return false;
+	}
+	// Allow `https://`, `http://`, `ssh://`, and `git@host:path`
+	// (SSH shorthand). These are the only schemes that fetch from a
+	// remote, not the local filesystem.
+	trimmed.starts_with("https://")
+		|| trimmed.starts_with("http://")
+		|| trimmed.starts_with("ssh://")
+		|| trimmed.starts_with("git@")
+}
+
+/// Validate that a host path is safe for the coordinator to clone
+/// into or init at. Must be absolute, must not contain `..`
+/// components (no traversal), and must not be a system-critical
+/// path. This runs *before* the git command — `add_folder`'s
+/// existence check happens after the clone/init has already run.
+fn is_safe_host_path(path: &Utf8Path) -> bool {
+	if !path.is_absolute() {
+		return false;
+	}
+	// Reject any `..` component — prevents traversal outside the
+	// intended directory tree.
+	for component in path.components() {
+		if matches!(component, camino::Utf8Component::ParentDir) {
+			return false;
+		}
+	}
+	// Reject system-critical roots. The coordinator should never
+	// clone into `/`, `/etc`, `/usr`, `/bin`, `/var`, `/sys`,
+	// `/proc`, `/dev`, or `/boot`.
+	let depth = path.components().count();
+	if depth <= 2 {
+		// At or just below the filesystem root — too broad.
+		return false;
+	}
+	true
+}
+
+/// `clone_repo` — clone a git repo to a host path and register it
+/// as a workspace folder (ADR 0030).
+async fn handle_clone_repo(state: &Arc<CoderState>, args: &Value) -> Result<Value, CoderError> {
+	#[derive(serde::Deserialize)]
+	struct CloneArgs {
+		url: String,
+		#[serde(default)]
+		path: Option<String>,
+	}
+	let parsed: CloneArgs =
+		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("clone_repo", err.to_string()))?;
+	if !is_safe_clone_url(&parsed.url) {
+		return Err(CoderError::invalid_args(
+			"clone_repo",
+			"URL must be https://, http://, ssh://, or git@ (file:// and local paths are rejected)",
+		));
+	}
+	let (_, folder_path) = state.active_folder_session().await?;
+	// Resolve the destination path. If the caller provided one, use
+	// it. Otherwise, clone into a sibling of the active folder using
+	// the repo's basename.
+	let dest = match &parsed.path {
+		Some(p) => {
+			let path = Utf8PathBuf::from(p);
+			if !is_safe_host_path(&path) {
+				return Err(CoderError::invalid_args(
+					"clone_repo",
+					"path must be absolute, must not contain `..`, and must not be a system-critical path",
+				));
+			}
+			path
+		}
+		None => {
+			// Derive a safe basename from the URL. Strip `.git`,
+			// reject empty / traversal / shell metacharacters.
+			let basename = parsed
+				.url
+				.rsplit('/')
+				.next()
+				.and_then(|s| s.strip_suffix(".git").unwrap_or(s).strip_suffix('/').or(Some(s)))
+				.filter(|s| !s.is_empty() && !s.contains("..") && !s.contains('/'))
+				.unwrap_or("repo");
+			folder_path
+				.parent()
+				.map(Utf8Path::to_path_buf)
+				.unwrap_or_else(|| folder_path.clone())
+				.join(basename)
+		}
+	};
+	// Run the clone on the host via the active folder's host.
+	let Some(folder) = state.workspaces.folder_for_path(folder_path.as_str()).await else {
+		return Err(CoderError::invalid_args(
+			"clone_repo",
+			"could not resolve active folder host for git clone",
+		));
+	};
+	folder.host.git_clone(&parsed.url, &dest).await?;
+	let entry = state
+		.workspaces
+		.add_folder(dest)
+		.await
+		.map_err(|err| CoderError::Internal(format!("add_folder failed: {err}")))?;
+	Ok(json!({
+		"path": entry.folder.path,
+		"name": entry.folder.name,
+	}))
+}
+
+/// `init_repo` — initialize a new git repo at a host path and
+/// register it as a workspace folder (ADR 0030).
+async fn handle_init_repo(state: &Arc<CoderState>, args: &Value) -> Result<Value, CoderError> {
+	#[derive(serde::Deserialize)]
+	struct InitArgs {
+		path: String,
+	}
+	let parsed: InitArgs =
+		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("init_repo", err.to_string()))?;
+	let dest = Utf8PathBuf::from(&parsed.path);
+	if !is_safe_host_path(&dest) {
+		return Err(CoderError::invalid_args(
+			"init_repo",
+			"path must be absolute, must not contain `..`, and must not be a system-critical path",
+		));
+	}
+	let (_, folder_path) = state.active_folder_session().await?;
+	let Some(folder) = state.workspaces.folder_for_path(folder_path.as_str()).await else {
+		return Err(CoderError::invalid_args(
+			"init_repo",
+			"could not resolve active folder host for git init",
+		));
+	};
+	folder.host.git_init(&dest).await?;
+	let entry = state
+		.workspaces
+		.add_folder(dest)
+		.await
+		.map_err(|err| CoderError::Internal(format!("add_folder failed: {err}")))?;
+	Ok(json!({
+		"path": entry.folder.path,
+		"name": entry.folder.name,
+	}))
 }
 
 /// Walk the session's in-memory `messages` for assistant tool
@@ -7068,5 +7413,50 @@ mod tests {
 
 		assert_eq!(rt.session.lock().await.messages.len(), before_len);
 		assert!(rx.try_recv().is_err());
+	}
+
+	// ── Path sanitization for clone_repo / init_repo (ADR 0030) ──
+
+	#[test]
+	fn safe_clone_url_accepts_remote_schemes() {
+		assert!(is_safe_clone_url("https://github.com/foo/bar.git"));
+		assert!(is_safe_clone_url("http://example.com/repo"));
+		assert!(is_safe_clone_url("ssh://git@github.com/foo/bar"));
+		assert!(is_safe_clone_url("git@github.com:foo/bar.git"));
+	}
+
+	#[test]
+	fn safe_clone_url_rejects_file_and_local_paths() {
+		assert!(!is_safe_clone_url("file:///etc/passwd"));
+		assert!(!is_safe_clone_url("/home/user/secrets"));
+		assert!(!is_safe_clone_url("./relative/path"));
+		assert!(!is_safe_clone_url(""));
+		assert!(!is_safe_clone_url("   "));
+	}
+
+	#[test]
+	fn safe_host_path_accepts_deep_absolute() {
+		assert!(is_safe_host_path(Utf8Path::new("/home/user/projects/new-repo")));
+		assert!(is_safe_host_path(Utf8Path::new("/Users/dev/code/scratch")));
+	}
+
+	#[test]
+	fn safe_host_path_rejects_relative() {
+		assert!(!is_safe_host_path(Utf8Path::new("relative/path")));
+		assert!(!is_safe_host_path(Utf8Path::new("./relative")));
+	}
+
+	#[test]
+	fn safe_host_path_rejects_traversal() {
+		assert!(!is_safe_host_path(Utf8Path::new("/home/user/../../../etc")));
+		assert!(!is_safe_host_path(Utf8Path::new("/home/../root/secrets")));
+	}
+
+	#[test]
+	fn safe_host_path_rejects_system_roots() {
+		assert!(!is_safe_host_path(Utf8Path::new("/")));
+		assert!(!is_safe_host_path(Utf8Path::new("/etc")));
+		assert!(!is_safe_host_path(Utf8Path::new("/usr")));
+		assert!(!is_safe_host_path(Utf8Path::new("/var")));
 	}
 }

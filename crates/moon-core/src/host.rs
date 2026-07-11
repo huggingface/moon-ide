@@ -686,6 +686,22 @@ pub trait WorkspaceHost: Send + Sync {
 	///
 	/// `commit_sha` must pass `is_safe_rev` (HEAD or 40-char hex).
 	async fn git_diff_against(&self, commit_sha: &str, files: &[String]) -> MoonResult<String>;
+
+	/// Clone a git repository to a host path (ADR 0030). Runs
+	/// `git clone <url> <dest>` on the host — not the container —
+	/// because the destination path isn't bound yet. The caller
+	/// (`clone_repo` coordinator tool) registers the resulting
+	/// directory as a workspace folder after the clone succeeds.
+	/// Errors propagate git's stderr verbatim.
+	async fn git_clone(&self, url: &str, dest: &Utf8Path) -> MoonResult<()>;
+
+	/// Initialize a new git repository at a host path (ADR 0030).
+	/// Runs `git init <path>` on the host. The caller (`init_repo`
+	/// coordinator tool) registers the directory as a workspace
+	/// folder after init succeeds. Creates the directory if it
+	/// doesn't exist (git init does this natively). Errors
+	/// propagate git's stderr verbatim.
+	async fn git_init(&self, path: &Utf8Path) -> MoonResult<()>;
 }
 
 pub struct LocalHost {
@@ -2245,6 +2261,33 @@ impl WorkspaceHost for LocalHost {
 		})
 		.await
 		.map_err(|e| MoonError::Internal(format!("git_diff_against join error: {e}")))
+	}
+
+	async fn git_clone(&self, url: &str, dest: &Utf8Path) -> MoonResult<()> {
+		// Clone runs on the host — the destination isn't bound yet,
+		// so there's no container path to translate to. Same
+		// rationale as worktree ops (ADR 0028).
+		let guard = self.git_lock().await;
+		let url = url.to_owned();
+		let dest = dest.to_owned();
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			run_git_clone(&url, &dest)
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_clone join error: {e}")))?
+	}
+
+	async fn git_init(&self, path: &Utf8Path) -> MoonResult<()> {
+		// Init runs on the host — the path isn't bound yet.
+		let guard = self.git_lock().await;
+		let path = path.to_owned();
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			run_git_init(&path)
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_init join error: {e}")))?
 	}
 }
 
@@ -4159,6 +4202,43 @@ fn run_git_diff_against(root: &Utf8Path, commit_sha: &str, files: &[String]) -> 
 	};
 	let diff = String::from_utf8_lossy(&output.stdout).into_owned();
 	cap_patch_at_newline(diff, 64_000)
+}
+
+/// `git clone <url> <dest>` on the host. Runs without `-C` (the
+/// destination doesn't exist yet). Errors propagate git's stderr
+/// verbatim — auth failures, invalid URLs, network errors surface
+/// the actionable hint without us re-wrapping it.
+fn run_git_clone(url: &str, dest: &Utf8Path) -> MoonResult<()> {
+	use std::process::Command;
+	let output = Command::new("git").args(["clone", url, dest.as_str()]).output();
+	match output {
+		Ok(o) if o.status.success() => Ok(()),
+		Ok(o) => {
+			let stderr = String::from_utf8_lossy(&o.stderr);
+			let stdout = String::from_utf8_lossy(&o.stdout);
+			let msg = if !stderr.is_empty() { stderr } else { stdout };
+			Err(MoonError::invalid(msg.trim().to_string()))
+		}
+		Err(e) => Err(MoonError::Internal(format!("git clone failed to spawn: {e}"))),
+	}
+}
+
+/// `git init <path>` on the host. Creates the directory if it
+/// doesn't exist (git init does this natively). Errors propagate
+/// git's stderr verbatim.
+fn run_git_init(path: &Utf8Path) -> MoonResult<()> {
+	use std::process::Command;
+	let output = Command::new("git").args(["init", path.as_str()]).output();
+	match output {
+		Ok(o) if o.status.success() => Ok(()),
+		Ok(o) => {
+			let stderr = String::from_utf8_lossy(&o.stderr);
+			let stdout = String::from_utf8_lossy(&o.stdout);
+			let msg = if !stderr.is_empty() { stderr } else { stdout };
+			Err(MoonError::invalid(msg.trim().to_string()))
+		}
+		Err(e) => Err(MoonError::Internal(format!("git init failed to spawn: {e}"))),
+	}
 }
 
 /// `git fetch --quiet --no-tags` with prompts disabled and a 30s

@@ -56,6 +56,10 @@ You manage workers with:
 - `review_worker_changes(worker_id, files?)` — pull the full per-turn diff for a worker, optionally scoped to specific files. Use this when `observe_worker`'s diff summary shows files you want to actually inspect. Don't call it on every observe — only when you need the detail.
 - `steer_worker(worker_id, text)` — send a steering message to a worker mid-turn, the same way a user steers you. Queued; delivered at the worker's next loop iteration top.
 - `abort_worker(worker_id)` — cancel a worker's in-flight turn.
+- `workspace_scm_status(worker_id?)` — get the SCM (git) status of a worker's worktree or the main folder: branch name, ahead/behind upstream, files changed (added / modified / deleted counts + per-file list). Read-only — use this to check whether a worker should commit before you steer it to the next task.
+- `commit_worker_changes(worker_id, message?)` — commit a worker's uncommitted changes (`git add -A` + `git commit`, same as the IDE's SCM panel). Pass `message` to set the commit subject; omit it to get an AI-suggested message from the diff. Use `workspace_scm_status` first to check whether there's anything to commit.
+- `clone_repo(url, path?)` — clone a git repository to a host path and add it as a workspace folder. Use this when a task requires a dependency repo or a fresh checkout that isn't already in the workspace. The clone runs on the host so the path is immediately available. Omit `path` to clone into a sibling of the active folder.
+- `init_repo(path)` — initialize a new git repository at a host path and add it as a workspace folder. Use this when a task needs a fresh project (scratch repo, new microservice, test harness). Creates the directory if it doesn't exist.
 - `respond_to_worker_prompt(worker_id, answers)` — answer a worker's parked `ask_user` prompt. A worker that needs a decision from you raises `ask_user`; you see it via `observe_worker` and answer it with this tool.
 
 ## Your loop: passive until needed
@@ -179,6 +183,97 @@ pub fn abort_worker_tool_definition() -> ToolDefinition {
 	)
 }
 
+/// `clone_repo` — clone a git repository to a host path and add it
+/// as a workspace folder. The clone runs on the host (not the
+/// container) so the path is immediately bind-mountable.
+pub fn clone_repo_tool_definition() -> ToolDefinition {
+	ToolDefinition::function(
+		"clone_repo",
+		"Clone a git repository and add it as a workspace folder. The clone runs on the host filesystem so the resulting directory is immediately available to the IDE and container. Pass `path` to control where the repo lands (an absolute host path); omit it to clone into a sibling directory of the active folder. Returns the new folder's path and name. Use this when a task requires a dependency repo, a fresh checkout, or a reference codebase that isn't already in the workspace.",
+		json!({
+			"type": "object",
+			"properties": {
+				"url": {
+					"type": "string",
+					"description": "The git URL to clone (HTTPS or SSH)."
+				},
+				"path": {
+					"type": "string",
+					"description": "Optional absolute host path to clone into. If omitted, clones into a sibling of the active folder using the repo's basename."
+				}
+			},
+			"required": ["url"]
+		}),
+	)
+}
+
+/// `init_repo` — initialize a new git repository at a host path and
+/// add it as a workspace folder. Creates the directory if it doesn't
+/// exist.
+pub fn init_repo_tool_definition() -> ToolDefinition {
+	ToolDefinition::function(
+		"init_repo",
+		"Initialize a new git repository at a host path and add it as a workspace folder. Runs `git init` on the host, creating the directory if it doesn't exist. Use this when a task needs a fresh project — a scratch repo, a new microservice, a test harness. Returns the new folder's path and name.",
+		json!({
+			"type": "object",
+			"properties": {
+				"path": {
+					"type": "string",
+					"description": "Absolute host path for the new repo. The directory will be created if it doesn't exist."
+				}
+			},
+			"required": ["path"]
+		}),
+	)
+}
+
+/// `commit_worker_changes` — checkpoint a worker's uncommitted
+/// work with a git commit. Runs `git add -A` + `git commit` on the
+/// worker's worktree (the same flow the IDE's SCM panel uses). If
+/// `message` is omitted, an AI-suggested commit message is generated
+/// from the diff. Returns the commit's short SHA + summary.
+pub fn commit_worker_changes_tool_definition() -> ToolDefinition {
+	ToolDefinition::function(
+		"commit_worker_changes",
+		"Commit a worker's uncommitted changes — runs `git add -A` + `git commit` on the worker's worktree, the same flow the IDE's SCM panel uses. Pass `message` to set the commit subject; omit it to get an AI-suggested message from the diff. Use `workspace_scm_status` first to check whether there's anything to commit. Returns the commit's short SHA and summary, or an error if there's nothing to commit.",
+		json!({
+			"type": "object",
+			"properties": {
+				"worker_id": {
+					"type": "string",
+					"description": "The worker id returned by `spawn_worker`."
+				},
+				"message": {
+					"type": "string",
+					"description": "Optional commit message (subject line). If omitted, an AI-suggested message is generated from the diff."
+				}
+			},
+			"required": ["worker_id"]
+		}),
+	)
+}
+
+/// `workspace_scm_status` — read-only SCM state for a worker's
+/// worktree (or the main folder). Composes branch info, file change
+/// counts, and the file list into one compact snapshot so the
+/// coordinator can decide whether a worker's work should be committed
+/// before moving on.
+pub fn workspace_scm_status_tool_definition() -> ToolDefinition {
+	ToolDefinition::function(
+		"workspace_scm_status",
+		"Get the SCM (git) status of a worker's worktree — branch, ahead/behind upstream, files changed (added / modified / deleted counts + per-file list). Pass `worker_id` to check a specific worker's worktree; omit it to check the main workspace folder. Read-only — use this to decide whether a worker should commit before you steer it to the next task.",
+		json!({
+			"type": "object",
+			"properties": {
+				"worker_id": {
+					"type": "string",
+					"description": "Optional. The worker id returned by `spawn_worker`. If omitted, checks the main workspace folder."
+				}
+			}
+		}),
+	)
+}
+
 /// `review_worker_changes` — pull the full per-turn diff for a worker,
 /// optionally scoped to specific files. Use this when `observe_worker`'s
 /// diff summary shows files you want to actually review. Returns the
@@ -248,6 +343,16 @@ mod tests {
 			review_worker_changes_tool_definition().function.name,
 			"review_worker_changes"
 		);
+		assert_eq!(
+			workspace_scm_status_tool_definition().function.name,
+			"workspace_scm_status"
+		);
+		assert_eq!(
+			commit_worker_changes_tool_definition().function.name,
+			"commit_worker_changes"
+		);
+		assert_eq!(clone_repo_tool_definition().function.name, "clone_repo");
+		assert_eq!(init_repo_tool_definition().function.name, "init_repo");
 	}
 
 	#[test]
