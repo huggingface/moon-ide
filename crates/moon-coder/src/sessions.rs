@@ -1982,13 +1982,12 @@ pub struct RevertResult {
 }
 
 /// Result of [`truncate_before_assistant_record`]: the kept
-/// `Assistant`'s `tool_calls` ready for re-dispatch, plus the
-/// surviving records. The runner re-dispatches the tool calls
-/// against the current workspace and continues the turn loop.
+/// `Assistant`'s `tool_calls` ready for re-dispatch. The runner
+/// re-dispatches them against the current workspace and continues
+/// the turn loop.
 #[derive(Debug)]
 pub struct ResumeResult {
 	pub resume_tool_calls: Vec<ToolCall>,
-	pub surviving: Vec<SessionRecord>,
 }
 
 pub async fn truncate_before_user_record(
@@ -2133,10 +2132,7 @@ pub async fn truncate_before_assistant_record(
 		.await
 		.map_err(CoderError::from)?;
 
-	Ok(ResumeResult {
-		resume_tool_calls,
-		surviving,
-	})
+	Ok(ResumeResult { resume_tool_calls })
 }
 
 /// Delete a session file plus its sub-agent subdirectory (if any).

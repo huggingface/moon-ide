@@ -1320,6 +1320,32 @@
 	let nowTick = $state(Date.now());
 	const hasRunningTool = $derived(coder.rows.some((row) => row.kind === 'tool' && !row.hasResult));
 
+	// Precomputed set of mid-turn assistant row IDs — rows that have at
+	// least one tool row after them before the next user row. These are
+	// the eligible checkpoints for "resume the tool-loop from here".
+	// Single O(n) pass over `coder.rows` instead of an O(n) scan per
+	// assistant row in the template.
+	const midTurnAssistantIds = $derived.by(() => {
+		const ids = new Set<string>();
+		for (let i = 0; i < coder.rows.length; i++) {
+			const row = coder.rows[i]!;
+			if (row.kind !== 'assistant') {
+				continue;
+			}
+			for (let j = i + 1; j < coder.rows.length; j++) {
+				const next = coder.rows[j]!;
+				if (next.kind === 'user') {
+					break;
+				}
+				if (next.kind === 'tool') {
+					ids.add(row.id);
+					break;
+				}
+			}
+		}
+		return ids;
+	});
+
 	// Lazy tool-body rendering. Tool rows render collapsed by
 	// default, but a `<details>` keeps its slotted children mounted
 	// even while closed — so without this gate every `ToolBody*`
@@ -1586,22 +1612,6 @@
 	 *  nothing is lost (same posture as replay-from-message). */
 	async function onResumeFromAssistant(rowId: string): Promise<void> {
 		await coder.resumeFromAssistant(rowId);
-	}
-
-	/** Whether a tool row appears after `idx` before the next user row —
-	 *  the marker of a mid-turn assistant response eligible for
-	 *  "resume the tool-loop from here". */
-	function hasToolRowAfter(rows: CoderRow[], idx: number): boolean {
-		for (let i = idx + 1; i < rows.length; i++) {
-			const r = rows[i]!;
-			if (r.kind === 'user') {
-				return false;
-			}
-			if (r.kind === 'tool') {
-				return true;
-			}
-		}
-		return false;
 	}
 
 	/** Open a session's raw JSONL trace in the editor as a host-direct
@@ -2539,10 +2549,9 @@
 		{@const hasText = row.text.trim().length > 0}
 		<!-- A mid-turn assistant row (one followed by tool rows
 		     before the next user row) is an eligible checkpoint
-		     for "resume the tool-loop from here". Compute once so
-		     the hover affordance only renders on eligible rows. -->
-		{@const rowIdx = coder.rows.findIndex((r) => r.id === row.id)}
-		{@const isMidTurn = rowIdx !== -1 && hasToolRowAfter(coder.rows, rowIdx)}
+		     for "resume the tool-loop from here". The set is
+		     precomputed once per `coder.rows` change. -->
+		{@const isMidTurn = midTurnAssistantIds.has(row.id)}
 		{#if hasThinking || hasText}
 			<div class="row assistant">
 				<div class="row-label">

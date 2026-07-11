@@ -634,17 +634,20 @@ Routes through
 the 0-based ordinal among assistant records that have non-empty
 `tool_calls`. The backend truncates the JSONL to keep everything up
 to **and including** the target `Assistant` record, drops its `Tool`
-records (and everything after), re-opens the session so the trimmed
-transcript repaints, then re-dispatches the kept `Assistant`'s
-`tool_calls` against the current workspace via the normal
-`dispatch_tool_calls` path. The model is **not** re-prompted for that
-round-trip — its existing tool calls execute fresh against current
-workspace state, and the turn loop continues with the new results in
-context. Auth-gates before the truncation (same posture as
-`coder_replay_from_message`). Refused while a turn is in flight. No
-confirm (tool calls re-execute fresh, nothing is lost). After the
-re-dispatch, subsequent iterations make normal LLM calls with the
-fresh tool results in `messages`.
+records (and everything after), then mutates the existing runtime's
+`messages` in place (rebuilt from the surviving records without
+orphan-recovery — the kept tool calls are about to be re-dispatched,
+not marked as interrupted). It fires a `SessionLoaded` + `Replay`
+(with `in_flight: true`) so the frontend clears and rebuilds to the
+checkpoint state, then spawns the turn loop on the same runtime with
+the kept `Assistant`'s `tool_calls` as a resume parameter. The model
+is **not** re-prompted for that round-trip — its existing tool calls
+execute fresh against current workspace state, and the turn loop
+continues with the new results in context. Auth-gates before the
+truncation (same posture as `coder_replay_from_message`). Refused
+while a turn is in flight. No confirm (tool calls re-execute fresh,
+nothing is lost). After the re-dispatch, subsequent iterations make
+normal LLM calls with the fresh tool results in `messages`.
 
 ### Auto-rename
 

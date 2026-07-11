@@ -1883,6 +1883,13 @@ impl CoderHandle {
 			created_at_ms: header.created_at_ms,
 			updated_at_ms: header.updated_at_ms,
 		});
+		// The kept Assistant's tool_calls will be re-dispatched by
+		// the turn loop — don't emit `ToolCall` events for them in
+		// the replay, or the frontend would create tool rows that
+		// the re-dispatch's `ToolCall` events would duplicate (same
+		// IDs, new rows pushed).
+		let resume_call_ids: std::collections::HashSet<String> =
+			resumed.resume_tool_calls.iter().map(|c| c.id.clone()).collect();
 		let mut replay_events: Vec<CoderEvent> = Vec::with_capacity(records.len() + 2);
 		for (record, record_ts) in records.into_iter().zip(record_timestamps) {
 			match record {
@@ -1918,6 +1925,20 @@ impl CoderHandle {
 				other => emit_replay_events(&mut replay_events, other, record_ts),
 			}
 		}
+		// Filter out `ToolCall` events for the resume tool calls —
+		// the kept Assistant record's `emit_replay_events` emitted
+		// them, but the re-dispatch will emit fresh ones. Without
+		// this filter the frontend would have duplicate tool rows
+		// (replay creates one, re-dispatch creates another with the
+		// same id — `tool_call` always pushes a new row, it doesn't
+		// update by id the way `tool_result` does).
+		replay_events.retain(|event| {
+			if let CoderEvent::ToolCall { id, .. } = event {
+				!resume_call_ids.contains(id)
+			} else {
+				true
+			}
+		});
 		// No orphan tool results — the kept Assistant's tool calls
 		// are about to be re-dispatched, not marked as interrupted.
 		// The trailing `TurnComplete` closes the replay window and
@@ -2140,7 +2161,7 @@ impl CoderHandle {
 		let record_count = records.len();
 
 		let RebuiltMessages {
-			messages,
+			mut messages,
 			last_usage,
 			last_todos,
 		} = Self::rebuild_messages_from_records(&records);
