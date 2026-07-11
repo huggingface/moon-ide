@@ -621,6 +621,31 @@ After truncation the backend drops the mounted runtime and re-opens
 the session so the trimmed transcript repaints through the normal
 replay path.
 
+### Resume from a mid-turn agent response
+
+A mid-turn assistant row (one whose `tool_calls` are non-empty and
+are followed by `Tool` records before the next user message) reveals
+a fourth hover affordance: **Replay from here**. This is a different
+operation from the user-message replay above — it resumes the
+tool-loop from that checkpoint rather than re-sending a prompt.
+
+Routes through
+`coder_resume_from_assistant(assistant_ordinal)`, where the anchor is
+the 0-based ordinal among assistant records that have non-empty
+`tool_calls`. The backend truncates the JSONL to keep everything up
+to **and including** the target `Assistant` record, drops its `Tool`
+records (and everything after), re-opens the session so the trimmed
+transcript repaints, then re-dispatches the kept `Assistant`'s
+`tool_calls` against the current workspace via the normal
+`dispatch_tool_calls` path. The model is **not** re-prompted for that
+round-trip — its existing tool calls execute fresh against current
+workspace state, and the turn loop continues with the new results in
+context. Auth-gates before the truncation (same posture as
+`coder_replay_from_message`). Refused while a turn is in flight. No
+confirm (tool calls re-execute fresh, nothing is lost). After the
+re-dispatch, subsequent iterations make normal LLM calls with the
+fresh tool results in `messages`.
+
 ### Auto-rename
 
 After the first turn of a fresh session finishes — successfully,
@@ -1187,24 +1212,25 @@ card + "+ New session" when signed in with no session.
 
 Tauri commands in `src-tauri/src/commands/coder.rs`:
 
-| Command                                                 | Purpose                                                                                               |
-| ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `coder_start_device_flow()`                             | Returns `{ user_code, verification_uri, expires_in, interval }`; background poll runs in `moon-coder` |
-| `coder_status()`                                        | `{ signed_in, identity?, has_session, sync_enabled }`                                                 |
-| `coder_sign_out()`                                      | Drops keyring + identity                                                                              |
-| `coder_list_sessions()`                                 | Per-session summaries for the list view                                                               |
-| `coder_open_session(id?)`                               | Load `id`, or create a new session; returns the active id                                             |
-| `coder_delete_session(id)`                              | Removes JSONL (+ sub-agent subdir)                                                                    |
-| `coder_session_jsonl_path(id)`                          | Resolves a session id (parent or sub-agent) to its on-disk path; powers "open trace"                  |
-| `coder_send(text, mode)`                                | Routes to the loop (`send` / `steer` / `follow_up`)                                                   |
-| `coder_abort()`                                         | Cancels the visible session's in-flight turn                                                          |
-| `coder_respond_to_prompt(call_id, response)`            | Resolves a parked `ask_user` prompt; returns `false` when nothing's parked                            |
-| `coder_revert_to_message(user_ordinal)`                 | Truncates the visible session; returns the dropped prompt for edit-and-resend. Refused mid-turn       |
-| `coder_replay_from_message(user_ordinal)`               | Truncates to before the message, then re-sends the same prompt (re-run the turn). Refused mid-turn    |
-| `coder_rerun_tool_call(tool_call_id)`                   | Reapplies a recorded `write_file` / `edit_file` to disk (recovery); transcript untouched              |
-| `coder_set_model(slug)` / `coder_set_model_settings(…)` | Model picks                                                                                           |
-| `coder_*_provider*` commands                            | Custom-provider CRUD, probe, per-provider catalog, keyring-only API-key set/clear                     |
-| `coder_set_sync_enabled(enabled)`                       | Per-workspace bucket-sync toggle                                                                      |
+| Command                                                 | Purpose                                                                                                       |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `coder_start_device_flow()`                             | Returns `{ user_code, verification_uri, expires_in, interval }`; background poll runs in `moon-coder`         |
+| `coder_status()`                                        | `{ signed_in, identity?, has_session, sync_enabled }`                                                         |
+| `coder_sign_out()`                                      | Drops keyring + identity                                                                                      |
+| `coder_list_sessions()`                                 | Per-session summaries for the list view                                                                       |
+| `coder_open_session(id?)`                               | Load `id`, or create a new session; returns the active id                                                     |
+| `coder_delete_session(id)`                              | Removes JSONL (+ sub-agent subdir)                                                                            |
+| `coder_session_jsonl_path(id)`                          | Resolves a session id (parent or sub-agent) to its on-disk path; powers "open trace"                          |
+| `coder_send(text, mode)`                                | Routes to the loop (`send` / `steer` / `follow_up`)                                                           |
+| `coder_abort()`                                         | Cancels the visible session's in-flight turn                                                                  |
+| `coder_respond_to_prompt(call_id, response)`            | Resolves a parked `ask_user` prompt; returns `false` when nothing's parked                                    |
+| `coder_revert_to_message(user_ordinal)`                 | Truncates the visible session; returns the dropped prompt for edit-and-resend. Refused mid-turn               |
+| `coder_replay_from_message(user_ordinal)`               | Truncates to before the message, then re-sends the same prompt (re-run the turn). Refused mid-turn            |
+| `coder_resume_from_assistant(assistant_ordinal)`        | Truncates to the assistant message (kept), re-dispatches its tool calls, continues the turn. Refused mid-turn |
+| `coder_rerun_tool_call(tool_call_id)`                   | Reapplies a recorded `write_file` / `edit_file` to disk (recovery); transcript untouched                      |
+| `coder_set_model(slug)` / `coder_set_model_settings(…)` | Model picks                                                                                                   |
+| `coder_*_provider*` commands                            | Custom-provider CRUD, probe, per-provider catalog, keyring-only API-key set/clear                             |
+| `coder_set_sync_enabled(enabled)`                       | Per-workspace bucket-sync toggle                                                                              |
 
 Push events: `coder:event` (every loop event, envelope-wrapped),
 `coder:signed_out`, `coder:sync_state`.

@@ -2139,6 +2139,53 @@ class CoderPanelState {
 		return null;
 	}
 
+	/** The 0-based ordinal of an assistant row among all assistant
+	 *  rows that are followed by at least one tool row (i.e.
+	 *  mid-turn agent responses with tool calls). The backend's
+	 *  `truncate_before_assistant_record` counts the same way —
+	 *  only `Assistant` records with non-empty `tool_calls` are
+	 *  valid anchors. Returns `null` when the id isn't a mid-turn
+	 *  assistant row or the row is followed by no tools (the final
+	 *  answer). */
+	#assistantOrdinalForRow(rowId: string): number | null {
+		// Walk the rows once, tracking whether each assistant row
+		// is "mid-turn" (followed by at least one tool row before
+		// the next user row). Count mid-turn assistant rows up to
+		// the target, matching the backend's ordinal count — only
+		// `Assistant` records with non-empty `tool_calls` are valid
+		// anchors.
+		let ordinal = 0;
+		let found = false;
+		for (let i = 0; i < this.rows.length; i++) {
+			const row = this.rows[i]!;
+			if (row.kind !== 'assistant') {
+				continue;
+			}
+			// Check if this assistant row is mid-turn (has tool
+			// rows after it before the next user row).
+			let isMidTurn = false;
+			for (let j = i + 1; j < this.rows.length; j++) {
+				const inner = this.rows[j]!;
+				if (inner.kind === 'user') {
+					break;
+				}
+				if (inner.kind === 'tool') {
+					isMidTurn = true;
+					break;
+				}
+			}
+			if (!isMidTurn) {
+				continue;
+			}
+			if (row.id === rowId) {
+				found = true;
+				break;
+			}
+			ordinal += 1;
+		}
+		return found ? ordinal : null;
+	}
+
 	/** Revert the visible session to just before the user message
 	 *  with `rowId`, dropping it and everything after it from both
 	 *  disk and the in-memory history. When `resend` is true the
@@ -2188,6 +2235,39 @@ class CoderPanelState {
 		}
 		try {
 			await ipc.coder.replayFromMessage(ordinal);
+			await this.refreshSessions();
+		} catch (err) {
+			this.rows = [
+				...this.rows,
+				{
+					kind: 'error',
+					id: `local-${Date.now()}`,
+					text: formatError(err),
+				},
+			];
+		}
+	}
+
+	/** Resume the visible session from a mid-turn agent response
+	 *  with `rowId`: truncate the session to keep everything up to
+	 *  and including that assistant message, drop its tool results
+	 *  and everything after, then re-dispatch the kept assistant's
+	 *  tool calls against the current workspace and continue the
+	 *  turn loop. The model isn't re-prompted for that round-trip
+	 *  — its existing tool calls execute fresh and the loop
+	 *  continues with the new results in context. The backend
+	 *  auth-gates before the destructive truncation and refuses
+	 *  mid-turn, so we hide the affordance while busy. The trimmed
+	 *  transcript repaints from the `open_session` replay, then
+	 *  the re-dispatched tool calls stream as normal `tool_call` /
+	 *  `tool_result` events — no `rows` mutation here. */
+	async resumeFromAssistant(rowId: string): Promise<void> {
+		const ordinal = this.#assistantOrdinalForRow(rowId);
+		if (ordinal === null) {
+			return;
+		}
+		try {
+			await ipc.coder.resumeFromAssistant(ordinal);
 			await this.refreshSessions();
 		} catch (err) {
 			this.rows = [

@@ -1981,6 +1981,16 @@ pub struct RevertResult {
 	pub surviving: Vec<SessionRecord>,
 }
 
+/// Result of [`truncate_before_assistant_record`]: the kept
+/// `Assistant`'s `tool_calls` ready for re-dispatch, plus the
+/// surviving records. The runner re-dispatches the tool calls
+/// against the current workspace and continues the turn loop.
+#[derive(Debug)]
+pub struct ResumeResult {
+	pub resume_tool_calls: Vec<ToolCall>,
+	pub surviving: Vec<SessionRecord>,
+}
+
 pub async fn truncate_before_user_record(
 	dir: &Utf8Path,
 	header: &SessionHeader,
@@ -2042,6 +2052,89 @@ pub async fn truncate_before_user_record(
 	Ok(RevertResult {
 		dropped_text,
 		dropped_images,
+		surviving,
+	})
+}
+
+/// Truncate the session JSONL to keep everything up to **and
+/// including** the `assistant_ordinal`-th `Assistant` record, but
+/// **drop** the `Tool` records that immediately follow it (its tool
+/// results) and everything after. Returns the kept `Assistant`'s
+/// `tool_calls` so the runner can re-dispatch them against the
+/// current workspace — the "resume the tool-loop from this
+/// checkpoint" gesture.
+///
+/// Unlike [`truncate_before_user_record`], the cut target is an
+/// `Assistant` record and the surviving prefix **includes** it. The
+/// matching `Tool` records are deliberately dropped: re-dispatching
+/// the tool calls produces fresh `Tool` records with current results,
+/// which is the whole point. Keeping the stale ones would feed the
+/// model out-of-date tool outputs on the next round-trip.
+///
+/// Only `Assistant` records with non-empty `tool_calls` are valid
+/// anchors — resuming from a tool-call-less assistant is meaningless
+/// (the turn already ended there). Returns `CoderError::Internal` if
+/// the ordinal is out of range or the target has no tool calls.
+pub async fn truncate_before_assistant_record(
+	dir: &Utf8Path,
+	header: &SessionHeader,
+	assistant_ordinal: usize,
+) -> Result<ResumeResult, CoderError> {
+	let path = session_path(dir, &header.id);
+	if !tokio::fs::try_exists(path.as_std_path()).await.unwrap_or(false) {
+		return Err(CoderError::Internal(
+			"session has no on-disk transcript to resume".into(),
+		));
+	}
+	let LoadedSession { records, .. } = load(dir, &header.id).await?;
+
+	// Find the Nth Assistant record with non-empty tool_calls.
+	let mut seen = 0usize;
+	let mut cut: Option<usize> = None;
+	for (idx, record) in records.iter().enumerate() {
+		if let SessionRecord::Assistant { tool_calls, .. } = record {
+			if !tool_calls.is_empty() {
+				if seen == assistant_ordinal {
+					cut = Some(idx);
+					break;
+				}
+				seen += 1;
+			}
+		}
+	}
+	let Some(cut) = cut else {
+		return Err(CoderError::Internal(format!(
+			"resume target out of range: session has {seen} assistant message(s) with tool calls, asked for #{assistant_ordinal}"
+		)));
+	};
+
+	// Extract the kept Assistant's tool_calls for re-dispatch.
+	let resume_tool_calls = match &records[cut] {
+		SessionRecord::Assistant { tool_calls, .. } => tool_calls.clone(),
+		// Unreachable: `cut` was chosen on an Assistant match above.
+		_ => Vec::new(),
+	};
+
+	// Surviving = records[0..=cut] — everything up to and including
+	// the target Assistant. The Tool records that followed it
+	// (records[cut+1..]) are dropped along with everything else.
+	let surviving: Vec<SessionRecord> = records.into_iter().take(cut + 1).collect();
+
+	let rewritten_at = now_ms();
+	let mut out = String::new();
+	out.push_str(&serde_json::to_string(header).map_err(CoderError::from)?);
+	out.push('\n');
+	for record in &surviving {
+		let wire = record_to_pi_wire(record, header, rewritten_at);
+		out.push_str(&serde_json::to_string(&wire).map_err(CoderError::from)?);
+		out.push('\n');
+	}
+	tokio::fs::write(path.as_std_path(), out.as_bytes())
+		.await
+		.map_err(CoderError::from)?;
+
+	Ok(ResumeResult {
+		resume_tool_calls,
 		surviving,
 	})
 }

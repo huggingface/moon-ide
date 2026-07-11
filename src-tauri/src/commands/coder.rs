@@ -307,6 +307,32 @@ pub async fn coder_replay_from_message(state: State<'_, AppState>, user_ordinal:
 		.map_err(MoonError::from)
 }
 
+/// Resume the active folder's visible session from its
+/// `assistant_ordinal`-th assistant message with tool calls (0-based,
+/// among assistant records that have non-empty `tool_calls`):
+/// truncate the session to keep everything up to and including that
+/// assistant message, drop its tool results and everything after,
+/// then re-dispatch the kept assistant's tool calls against the
+/// current workspace and continue the turn loop. The "resume the
+/// tool-loop from this checkpoint" gesture — the model isn't
+/// re-prompted for that round-trip; its existing tool calls execute
+/// fresh and the loop continues with the new results in context.
+/// Auth-gates before the truncation. Refused while a turn is in
+/// flight. The trimmed transcript replays on `coder:event` (via the
+/// reload), then the re-dispatched tool calls stream as normal
+/// `tool_call` / `tool_result` events.
+#[tauri::command]
+pub async fn coder_resume_from_assistant(
+	state: State<'_, AppState>,
+	assistant_ordinal: usize,
+) -> Result<(), MoonError> {
+	state
+		.coder
+		.resume_from_assistant(assistant_ordinal)
+		.await
+		.map_err(MoonError::from)
+}
+
 /// Manually reapply a recorded `write_file` / `edit_file` tool
 /// call from the active folder's visible session. The recovery
 /// affordance behind the per-row "re-apply" control: a user who

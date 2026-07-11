@@ -1578,6 +1578,32 @@
 		await coder.replayFromMessage(rowId);
 	}
 
+	/** Resume the tool-loop from a mid-turn agent response: truncate
+	 *  the session to keep up to and including that assistant message,
+	 *  drop its tool results and everything after, then re-dispatch the
+	 *  kept assistant's tool calls against the current workspace and
+	 *  continue the turn. No confirm — the tool calls re-execute fresh,
+	 *  nothing is lost (same posture as replay-from-message). */
+	async function onResumeFromAssistant(rowId: string): Promise<void> {
+		await coder.resumeFromAssistant(rowId);
+	}
+
+	/** Whether a tool row appears after `idx` before the next user row —
+	 *  the marker of a mid-turn assistant response eligible for
+	 *  "resume the tool-loop from here". */
+	function hasToolRowAfter(rows: CoderRow[], idx: number): boolean {
+		for (let i = idx + 1; i < rows.length; i++) {
+			const r = rows[i]!;
+			if (r.kind === 'user') {
+				return false;
+			}
+			if (r.kind === 'tool') {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	/** Open a session's raw JSONL trace in the editor as a host-direct
 	 *  file (same machinery as Ctrl+O for files outside the workspace).
 	 *  Works for parent sessions and sub-agent ids alike — both live
@@ -2511,6 +2537,12 @@
 		     about in that case. -->
 		{@const hasThinking = row.thinking.length > 0}
 		{@const hasText = row.text.trim().length > 0}
+		<!-- A mid-turn assistant row (one followed by tool rows
+		     before the next user row) is an eligible checkpoint
+		     for "resume the tool-loop from here". Compute once so
+		     the hover affordance only renders on eligible rows. -->
+		{@const rowIdx = coder.rows.findIndex((r) => r.id === row.id)}
+		{@const isMidTurn = rowIdx !== -1 && hasToolRowAfter(coder.rows, rowIdx)}
 		{#if hasThinking || hasText}
 			<div class="row assistant">
 				<div class="row-label">
@@ -2519,6 +2551,22 @@
 							datetime={new Date(row.createdAt).toISOString()}
 							title={formatFullTimestamp(row.createdAt)}>{formatClock(row.createdAt)}</time
 						>{/if}
+					{#if isMidTurn && !coder.busy}
+						<!-- Hover-revealed "resume from here" affordance.
+						     Hidden while a turn runs (the backend refuses
+						     mid-turn) and on non-mid-turn rows (the final
+						     answer has no tool calls to re-dispatch). -->
+						<span class="row-actions">
+							<button
+								type="button"
+								class="row-action"
+								title="Replay from here — drop the tool results after this response and re-run its tool calls against the current workspace"
+								onclick={() => onResumeFromAssistant(row.id)}
+							>
+								<ReplayIcon size={12} />
+							</button>
+						</span>
+					{/if}
 				</div>
 				{#if hasThinking}
 					<!-- Reasoning trace. Open while streaming so the user
@@ -3474,6 +3522,7 @@
 		transition: opacity 0.1s ease;
 	}
 	.row.user:hover .row-actions,
+	.row.assistant:hover .row-actions,
 	.row-actions:focus-within {
 		opacity: 1;
 	}

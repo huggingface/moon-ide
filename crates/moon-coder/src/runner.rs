@@ -1806,6 +1806,94 @@ impl CoderHandle {
 		self.send(dropped.text, dropped.images).await
 	}
 
+	/// Resume the turn from a mid-turn agent response: truncate the
+	/// session to keep everything up to **and including** the
+	/// `assistant_ordinal`-th `Assistant` record (with tool calls),
+	/// drop its `Tool` records and everything after, then re-dispatch
+	/// the kept `Assistant`'s `tool_calls` against the current
+	/// workspace and continue the turn loop. The user-visible gesture
+	/// is "re-run the tool calls from this checkpoint" — the model
+	/// isn't re-prompted for that round-trip; its existing tool calls
+	/// execute fresh against current workspace state and the loop
+	/// continues with the new results in context.
+	///
+	/// Auth-gates **before** the destructive truncation (same posture
+	/// as [`replay_from_message`]). Refuses mid-turn. After
+	/// truncation the backend drops the mounted runtime and re-opens
+	/// the session so the trimmed transcript repaints through the
+	/// normal replay path. The orphan tool calls from the dropped
+	/// `Tool` records are stripped from `messages` before the resume
+	/// dispatch — `dispatch_tool_calls` will push fresh `ToolCall` /
+	/// `ToolResult` events and persist real `Tool` records.
+	pub async fn resume_from_assistant(&self, assistant_ordinal: usize) -> Result<(), CoderError> {
+		self.ensure_can_send().await?;
+		let (rt, session_id, folder_path) = self.state.active_visible_runtime().await?;
+		{
+			// Refuse mid-turn — same guard as `revert_to_message`.
+			let turn = rt.turn.lock().await;
+			if turn.cancel.is_some() {
+				return Err(CoderError::Internal(
+					"cannot resume while a turn is running; stop it first".into(),
+				));
+			}
+		}
+		let header = rt.session.lock().await.header.clone();
+		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
+		let resumed = sessions::truncate_before_assistant_record(&dir, &header, assistant_ordinal).await?;
+
+		// Drop the mounted runtime so `open_session` rebuilds
+		// in-memory `messages` from the now-shorter JSONL. Same
+		// pattern as `revert_to_message`.
+		{
+			let (fs, _) = self.state.active_folder_session().await?;
+			fs.runtimes.write().await.remove(&session_id);
+		}
+		self.open_session(session_id.clone()).await?;
+
+		// After reopen, `open_session`'s orphan-recovery injected
+		// synthetic `Tool` messages for the dropped `Tool` records
+		// (the kept `Assistant`'s tool_calls have no matching `Tool`
+		// records in the truncated JSONL). Strip those orphan
+		// `Tool` messages so the resume dispatch can push fresh
+		// real ones via `finish_tool_call` — otherwise the model
+		// would see the "Interrupted before tool completed"
+		// sentinels AND the fresh results, confusing the next
+		// round-trip.
+		let resume_call_ids: std::collections::HashSet<String> =
+			resumed.resume_tool_calls.iter().map(|c| c.id.clone()).collect();
+		{
+			let mut session = rt.session.lock().await;
+			session.messages.retain(|msg| {
+				if let crate::inference::ChatMessage::Tool { tool_call_id, .. } = msg {
+					!resume_call_ids.contains(tool_call_id)
+				} else {
+					true
+				}
+			});
+		}
+
+		// Spawn the turn loop with the resume tool calls. The first
+		// iteration re-dispatches them; subsequent iterations make
+		// normal LLM calls with the fresh results in context.
+		let cancel = CancellationToken::new();
+		{
+			let mut turn = rt.turn.lock().await;
+			turn.cancel = Some(cancel.clone());
+		}
+		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), session_id.clone());
+		let state = self.state.clone();
+		spawn_turn_loop(
+			state,
+			rt,
+			sink,
+			folder_path.to_path_buf(),
+			cancel,
+			false,
+			Some(resumed.resume_tool_calls),
+		);
+		Ok(())
+	}
+
 	/// Pre-flight auth gate shared by every send-shaped entry
 	/// point ([`send`], [`replay_from_message`]). HF needs OAuth;
 	/// user providers need a configured key (or a localhost
@@ -2478,6 +2566,7 @@ impl CoderHandle {
 			folder_for_turn,
 			cancel,
 			auto_rename_after,
+			None,
 		);
 		Ok(())
 	}
@@ -2756,6 +2845,7 @@ impl CoderHandle {
 			folder_for_turn,
 			cancel,
 			auto_rename_after,
+			None,
 		);
 		Ok(())
 	}
@@ -2991,6 +3081,7 @@ fn spawn_turn_loop(
 	folder_for_turn: Utf8PathBuf,
 	cancel: CancellationToken,
 	auto_rename_after: bool,
+	resume_tool_calls: Option<Vec<crate::inference::ToolCall>>,
 ) {
 	tokio::spawn(async move {
 		// Loop wrapper closes the race between `run_turn` returning
@@ -3000,6 +3091,7 @@ fn spawn_turn_loop(
 		// `turn` and `session` locks linearises with `send`'s
 		// turn→session take order.
 		let mut cancel_outer = cancel;
+		let mut resume = resume_tool_calls;
 		let result = loop {
 			let format_queue = Arc::new(crate::tools::FormatQueue::default());
 			let result = run_turn(
@@ -3009,6 +3101,10 @@ fn spawn_turn_loop(
 				&sink_for_turn,
 				cancel_outer.clone(),
 				format_queue.clone(),
+				// Only the first run_turn call gets the resume
+				// tool calls; subsequent loop iterations (steer
+				// drains after an abort) start fresh.
+				resume.take(),
 			)
 			.await;
 			flush_format_queue(&state, &format_queue).await;
@@ -3061,6 +3157,7 @@ async fn run_turn(
 	sink: &FolderEventSink,
 	cancel: CancellationToken,
 	format_queue: Arc<crate::tools::FormatQueue>,
+	mut resume_tool_calls: Option<Vec<crate::inference::ToolCall>>,
 ) -> Result<(), CoderError> {
 	// Snapshot the user's current model picks once at turn-start.
 	// A settings flip mid-turn doesn't retroactively change which
@@ -3228,6 +3325,22 @@ async fn run_turn(
 					let mut session = rt.session.lock().await;
 					session.persisted_records = session.persisted_records.saturating_add(1);
 				}
+			}
+		}
+
+		// Resume-from-checkpoint: on the first iteration only,
+		// re-dispatch the kept Assistant's pre-existing tool calls
+		// against the current workspace instead of calling the
+		// model. The fresh `Tool` results land in `messages` and on
+		// disk via the normal `dispatch_tool_calls` →
+		// `finish_tool_call` path, then `continue` runs the next
+		// iteration which makes a real LLM call with those results
+		// in context. Takes ownership once; subsequent iterations
+		// see `None` and follow the normal LLM-call path.
+		if let Some(calls) = resume_tool_calls.take() {
+			if !calls.is_empty() {
+				dispatch_tool_calls(state, rt, sink, &cx, &cancel, &calls).await?;
+				continue;
 			}
 		}
 
