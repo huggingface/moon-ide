@@ -114,6 +114,12 @@ export type CoderRow =
 			messagesCompacted: number;
 			/** Empty until `phase === 'done'`. */
 			summary: string;
+	  }
+	| {
+			kind: 'turn_diff';
+			id: string;
+			files: string[];
+			diff: string;
 	  };
 
 /** Which view of the Coder panel is mounted. `'list'` shows the
@@ -2761,6 +2767,18 @@ class CoderPanelState {
 						session.todos = next;
 					}
 				}
+				return;
+			}
+			case 'turn_diff': {
+				// Per-turn diff row (ADR 0030). Pushed alongside
+				// `turn_complete` when the agent's tools changed files.
+				// Rendered as a collapsible diff in the transcript.
+				session.rows.push({
+					kind: 'turn_diff',
+					id: `diff-${Date.now()}`,
+					files: event.files,
+					diff: event.diff,
+				});
 				return;
 			}
 			case 'turn_complete': {

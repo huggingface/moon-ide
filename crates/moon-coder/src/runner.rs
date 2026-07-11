@@ -383,6 +383,12 @@ struct Session {
 	/// matching [`CoderEvent::SteerDrained`] only when the steer
 	/// actually graduates into the chat.
 	pending_steers: Vec<PendingSteer>,
+	/// Last per-turn diff (ADR 0030). Set by `emit_turn_diff` at turn
+	/// end; read by `observe_session` so an orchestrator's
+	/// `observe_worker` gets the diff as a dispatch-packet artifact
+	/// without reading the worker's full transcript. `None` until the
+	/// first turn that touches files lands a `TurnDiff`.
+	last_turn_diff: Option<(Vec<String>, String)>,
 }
 
 /// One queued steer waiting to be drained into `session.messages`
@@ -464,6 +470,7 @@ impl Session {
 			last_usage: None,
 			todos: Vec::new(),
 			pending_steers: Vec::new(),
+			last_turn_diff: None,
 		}
 	}
 
@@ -2127,6 +2134,10 @@ impl CoderHandle {
 				}
 				SessionRecord::Error { .. } => {}
 				SessionRecord::SubagentSpawned { .. } | SessionRecord::SubagentFinished { .. } => {}
+				// TurnDiff is a metadata record — it doesn't shape the
+				// chat history sent to the model. The diff is a review
+				// artifact, not a message.
+				SessionRecord::TurnDiff { .. } => {}
 			}
 		}
 		RebuiltMessages {
@@ -2282,6 +2293,7 @@ impl CoderHandle {
 				last_usage,
 				todos: last_todos,
 				pending_steers: Vec::new(),
+				last_turn_diff: None,
 			};
 			let rt = Arc::new(SessionRuntime::new(session));
 			fs.insert_runtime(id.clone(), rt).await;
@@ -2960,6 +2972,10 @@ impl CoderHandle {
 			running,
 			needs_input,
 			last_assistant,
+			last_diff: session.last_turn_diff.as_ref().map(|(files, diff)| TurnDiffSnapshot {
+				files: files.clone(),
+				diff: diff.clone(),
+			}),
 		})
 	}
 }
@@ -2991,6 +3007,20 @@ pub struct WorkerSnapshot {
 	/// The worker's most recent assistant message text. Empty when
 	/// the worker hasn't produced one yet.
 	pub last_assistant: String,
+	/// The worker's last per-turn diff (ADR 0030) — the files the
+	/// agent's tools touched and the unified diff against the
+	/// baseline captured at turn start. `None` until the first turn
+	/// that touches files lands a `TurnDiff`. The diff text may be
+	/// empty when the turn's writes were identical to the baseline.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub last_diff: Option<TurnDiffSnapshot>,
+}
+
+/// Compact diff snapshot carried in [`WorkerSnapshot`] (ADR 0030).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TurnDiffSnapshot {
+	pub files: Vec<String>,
+	pub diff: String,
 }
 
 /// Result of a successful [`Coder::unqueue_steer`] — the bytes the
@@ -3074,12 +3104,18 @@ fn pop_pending_steer(session: &mut Session, id: &str) -> Option<PendingSteer> {
 /// bytes for whatever the model managed to write before bailing —
 /// which matches the "treat the model's writes like ordinary
 /// `Ctrl+S` saves" mental model the rest of the IDE has.
-async fn flush_format_queue(state: &Arc<CoderState>, queue: &Arc<crate::tools::FormatQueue>) {
+/// Drain the format queue and run `format_file` on each entry.
+/// Returns the drained entries so the caller can reuse them (e.g.
+/// for per-turn diff computation). Empty vec when nothing was queued.
+async fn flush_format_queue(
+	state: &Arc<CoderState>,
+	queue: &Arc<crate::tools::FormatQueue>,
+) -> Vec<(String, Utf8PathBuf)> {
 	let entries = queue.drain();
 	if entries.is_empty() {
-		return;
+		return Vec::new();
 	}
-	for (folder_path, rel) in entries {
+	for (folder_path, rel) in &entries {
 		let Some(folder) = state.workspaces.folder_for_path(folder_path.as_str()).await else {
 			tracing::warn!(
 				folder = %folder_path,
@@ -3088,7 +3124,7 @@ async fn flush_format_queue(state: &Arc<CoderState>, queue: &Arc<crate::tools::F
 			);
 			continue;
 		};
-		if let Err(err) = folder.host.format_file(&rel).await {
+		if let Err(err) = folder.host.format_file(rel).await {
 			tracing::warn!(
 				folder = %folder_path,
 				path = %rel,
@@ -3097,6 +3133,7 @@ async fn flush_format_queue(state: &Arc<CoderState>, queue: &Arc<crate::tools::F
 			);
 		}
 	}
+	entries
 }
 
 /// After a successful turn, check the workspace's
@@ -3136,6 +3173,96 @@ async fn maybe_autosync_to_hub(state: &Arc<CoderState>, rt: &Arc<SessionRuntime>
 		.enqueue_session_sync(workspace_id, folder_path.to_path_buf(), session_id);
 }
 
+/// Capture the baseline commit SHA for per-turn diff attribution
+/// (ADR 0030). Resolves the session's working-tree folder (worktree
+/// when bound, else parent) and calls `git_snapshot_baseline` on it.
+/// Returns `None` when not a repo, git unavailable, or the folder
+/// can't be resolved — all non-fatal, the turn just doesn't get a
+/// diff row.
+async fn capture_baseline(state: &Arc<CoderState>, folder_path: &Utf8Path) -> Option<String> {
+	let worktree_root = {
+		let session = rt_session_header(state, folder_path).await?;
+		session.worktree_root.clone()
+	};
+	let routing_path = match worktree_root {
+		Some(root) if state.workspaces.folder_for_path(&root).await.is_some() => root,
+		_ => folder_path.to_string(),
+	};
+	let folder = state.workspaces.folder_for_path(&routing_path).await?;
+	folder.host.git_snapshot_baseline().await.ok().flatten()
+}
+
+/// Read the session header for the visible runtime under `folder_path`.
+/// Helper for `capture_baseline` to get the worktree root without
+/// threading the `Arc<SessionRuntime>` through.
+async fn rt_session_header(state: &Arc<CoderState>, folder_path: &Utf8Path) -> Option<SessionHeader> {
+	let fs_map = state.sessions_by_folder.read().await;
+	let fs = fs_map.get(folder_path)?;
+	let visible_id = fs.visible_session_id().await?;
+	let rt = fs.runtime(&visible_id).await?;
+	let session = rt.session.lock().await;
+	Some(session.header.clone())
+}
+
+/// Compute the per-turn diff and emit + persist it (ADR 0030). Runs
+/// `git_diff_against(baseline_sha, files)` against the session's
+/// working tree, emits a `CoderEvent::TurnDiff` so the panel renders
+/// a collapsible diff row, and appends a `SessionRecord::TurnDiff`
+/// to the JSONL so reload + the companion + an orchestrator's
+/// `observe_worker` can all read it. Best-effort — git failures
+/// produce an empty diff, not an error.
+async fn emit_turn_diff(
+	state: &Arc<CoderState>,
+	rt: &Arc<SessionRuntime>,
+	sink: &FolderEventSink,
+	folder_path: &Utf8Path,
+	baseline_sha: &str,
+	files: &[(String, Utf8PathBuf)],
+) {
+	// Resolve the session's working-tree folder (worktree when bound).
+	let worktree_root = rt.session.lock().await.header.worktree_root.clone();
+	let routing_path = match worktree_root {
+		Some(root) if state.workspaces.folder_for_path(&root).await.is_some() => root,
+		_ => folder_path.to_string(),
+	};
+	let Some(folder) = state.workspaces.folder_for_path(&routing_path).await else {
+		return;
+	};
+	// Collect the relative file paths for the diff scope.
+	let file_paths: Vec<String> = files.iter().map(|(_, rel)| rel.to_string()).collect();
+	let diff = folder
+		.host
+		.git_diff_against(baseline_sha, &file_paths)
+		.await
+		.unwrap_or_default();
+	// Emit the live event so the panel renders the diff row.
+	sink.send(CoderEvent::TurnDiff {
+		files: file_paths.clone(),
+		diff: diff.clone(),
+	});
+	// Store on the session so `observe_session` can return it
+	// without re-running git.
+	{
+		let mut session = rt.session.lock().await;
+		session.last_turn_diff = Some((file_paths.clone(), diff.clone()));
+	}
+	// Persist the record so reload + companion + observe_worker
+	// can read it. Best-effort — a JSONL write failure logs but
+	// doesn't fail the turn.
+	let session = rt.session.lock().await;
+	if let Some(dir) = session.session_dir.clone() {
+		let header = session.header.clone();
+		drop(session);
+		let record = SessionRecord::TurnDiff {
+			files: file_paths,
+			diff,
+		};
+		if let Err(err) = sessions::append_record(&dir, &header, &record).await {
+			tracing::warn!(error = %err, "failed to persist turn diff record");
+		}
+	}
+}
+
 /// Spawn the turn loop as a detached task. Shared by `Coder::send`
 /// (visible-session path) and `Coder::send_to` (by-id orchestrator
 /// path, ADR 0030) so both get the same steer-race recovery, format-
@@ -3163,6 +3290,13 @@ fn spawn_turn_loop(
 		let mut resume = resume_tool_calls;
 		let result = loop {
 			let format_queue = Arc::new(crate::tools::FormatQueue::default());
+			// Capture the baseline SHA at turn start for per-turn
+			// diff attribution (ADR 0030). `git stash create`
+			// snapshots the working tree without touching it; HEAD
+			// is the fallback when the tree is clean. Best-effort —
+			// `None` means no git repo / git unavailable, in which
+			// case we skip the diff computation at turn end.
+			let baseline_sha = capture_baseline(&state, &folder_for_turn).await;
 			let result = run_turn(
 				&state,
 				&rt_for_turn,
@@ -3176,7 +3310,25 @@ fn spawn_turn_loop(
 				resume.take(),
 			)
 			.await;
-			flush_format_queue(&state, &format_queue).await;
+			let flushed_files = flush_format_queue(&state, &format_queue).await;
+			// Compute + emit the per-turn diff on a successful turn
+			// that touched files. Best-effort — a git failure or no
+			// baseline just means no diff row, not an error.
+			if matches!(result, Ok(())) {
+				if let Some(sha) = &baseline_sha {
+					if !flushed_files.is_empty() {
+						emit_turn_diff(
+							&state,
+							&rt_for_turn,
+							&sink_for_turn,
+							&folder_for_turn,
+							sha,
+							&flushed_files,
+						)
+						.await;
+					}
+				}
+			}
 			if matches!(result, Err(CoderError::Aborted)) && !rt_for_turn.session.lock().await.pending_steers.is_empty() {
 				recover_in_memory_orphans(&rt_for_turn, &sink_for_turn).await;
 				cancel_outer = fresh_cancel(&rt_for_turn).await;
@@ -5561,6 +5713,12 @@ fn emit_replay_events(out: &mut Vec<CoderEvent>, record: SessionRecord, created_
 				prompt_tokens_after: 0,
 			});
 		}
+		SessionRecord::TurnDiff { files, diff } => {
+			// Re-emit the per-turn diff so the reopened transcript
+			// shows the collapsible diff row where it originally
+			// appeared. A metadata record — doesn't shape `messages`.
+			out.push(CoderEvent::TurnDiff { files, diff });
+		}
 	}
 }
 
@@ -5702,7 +5860,8 @@ fn subagent_replay_inners(record: SessionRecord, created_at_ms: i64) -> Vec<Code
 		| SessionRecord::TodosUpdate { .. }
 		| SessionRecord::Compaction { .. }
 		| SessionRecord::SubagentSpawned { .. }
-		| SessionRecord::SubagentFinished { .. } => Vec::new(),
+		| SessionRecord::SubagentFinished { .. }
+		| SessionRecord::TurnDiff { .. } => Vec::new(),
 	}
 }
 

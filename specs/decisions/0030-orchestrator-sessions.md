@@ -256,30 +256,30 @@ the new concept rather than overload `agent` because the whole point is
 to _prevent_ the model from doing the work itself, and tool-list shape
 is the reliable enforcement (prompt-nudges aren't).
 
-### Supporting direction: per-turn diffs (not a v1 commitment)
+### Per-turn diffs (landed)
 
-A pure coordinator that can't read worker transcripts still needs to
-_review what a worker changed_ — a diff, compact and current, not a
-stream of `tool_call` rows. This motivates a separate, smaller idea:
-**store per-turn diffs** — the working-tree diff attributable to one
-agent turn, persisted alongside the JSONL or derived from it.
+This is now implemented as a **first-class session record**:
+`SessionRecord::TurnDiff { files, diff }`, emitted at turn end and
+persisted in the JSONL.
 
-Two consumers, same storage:
+The baseline is captured at turn start via `git stash create` (which
+snapshots the working tree as a dangling commit **without touching
+anything**) with a `git rev-parse HEAD` fallback when the tree is
+clean. At turn end, `git diff <baseline> -- <format-queue-files>` gives
+the per-turn diff scoped to the files the agent's `write_file` /
+`edit_file` tools touched. This handles every case: clean tree, dirty
+tree (pre-existing uncommitted changes excluded), mid-turn commits by
+the agent or the user.
 
-- The **orchestrator** gets "what did worker #2's last turn change?"
-  as a compact artifact in a dispatch packet, instead of either (a)
-  reading the worker's full transcript or (b) holding the worktree's
-  state in its own context.
-- The **IDE** gets a per-turn diff review surface ("show me what the
-  agent changed this turn"), which is independently useful for any
-  session — you review an agent run turn-by-turn the way you'd review
-  a colleague's commits.
+Three consumers, same storage:
 
-This is a supporting direction, **not a v1 commitment.** It's captured
-here because it's what makes the pure-coordinator posture viable for
-review, and because the "same storage, two consumers" pattern is
-consistent with the rest of this ADR. Shape, persistence, and whether
-it lands before or with the first orchestrator cut stay open.
+- The **orchestrator** gets the diff via `observe_worker` —
+  `WorkerSnapshot.last_diff` carries the last turn's files + diff text.
+- The **IDE** renders a collapsible diff row in the coder panel
+  transcript, so any session (not just coordinator-spawned workers)
+  shows what the agent changed each turn.
+- The **companion** receives the `turn_diff` event and can render a
+  compact summary on the phone.
 
 ### Fork 2 — "take over": the orchestrator manages what it spawned; edge cases deferred
 

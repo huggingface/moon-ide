@@ -1633,7 +1633,8 @@ export type CoderEvent =
 	| { kind: 'compaction_started'; messages_compacted: number }
 	| { kind: 'compaction_complete'; summary: string; prompt_tokens_after: number }
 	| { kind: 'hub_sync_started'; session_id: string }
-	| { kind: 'hub_sync_finished'; session_id: string; ok: boolean; error?: string };
+	| { kind: 'hub_sync_finished'; session_id: string; ok: boolean; error?: string }
+	| { kind: 'turn_diff'; files: string[]; diff: string };
 
 /**
  * Where the numbers in a `token_usage` event came from. `provider`

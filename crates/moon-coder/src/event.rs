@@ -328,6 +328,16 @@ pub enum CoderEvent {
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		error: Option<String>,
 	},
+	/// Per-turn working-tree diff (ADR 0030). Emitted alongside
+	/// [`CoderEvent::TurnComplete`] when the agent's tools changed
+	/// files during the turn. `files` is the format-queue's file
+	/// set (the files `write_file` / `edit_file` touched); `diff`
+	/// is the unified diff against the baseline SHA captured at turn
+	/// start. Empty `diff` when nothing changed. Any client can
+	/// render this — the desktop panel as a collapsible diff row,
+	/// the companion as a compact summary, an orchestrator as a
+	/// dispatch-packet artifact via `observe_worker`.
+	TurnDiff { files: Vec<String>, diff: String },
 }
 
 /// Where the token numbers in [`CoderEvent::TokenUsage`] came from.

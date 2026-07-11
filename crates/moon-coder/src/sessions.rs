@@ -245,6 +245,7 @@ const CUSTOM_TYPE_SUBAGENT_SPAWNED: &str = "moon_subagent_spawned";
 const CUSTOM_TYPE_SUBAGENT_FINISHED: &str = "moon_subagent_finished";
 const CUSTOM_TYPE_USAGE: &str = "moon_usage";
 const CUSTOM_TYPE_ERROR: &str = "moon_error";
+const CUSTOM_TYPE_TURN_DIFF: &str = "moon_turn_diff";
 
 impl Serialize for SessionHeader {
 	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -500,6 +501,13 @@ pub(crate) fn record_to_pi_wire(
 		),
 		SessionRecord::Error { message } => pi_message_envelope(
 			pi_custom_message(CUSTOM_TYPE_ERROR, serde_json::json!({ "message": message })),
+			timestamp_ms,
+		),
+		SessionRecord::TurnDiff { files, diff } => pi_message_envelope(
+			pi_custom_message(
+				CUSTOM_TYPE_TURN_DIFF,
+				serde_json::json!({ "files": files, "diff": diff }),
+			),
 			timestamp_ms,
 		),
 	}
@@ -1112,6 +1120,18 @@ fn parse_pi_custom(msg: &serde_json::Value) -> Option<SessionRecord> {
 				.unwrap_or_default()
 				.to_string(),
 		}),
+		CUSTOM_TYPE_TURN_DIFF => Some(SessionRecord::TurnDiff {
+			files: details
+				.get("files")
+				.and_then(|v| v.as_array())
+				.map(|arr| arr.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
+				.unwrap_or_default(),
+			diff: details
+				.get("diff")
+				.and_then(|v| v.as_str())
+				.unwrap_or_default()
+				.to_string(),
+		}),
 		_ => None,
 	}
 }
@@ -1334,6 +1354,20 @@ pub enum SessionRecord {
 	/// reload: an error is terminal for the turn it ended, not
 	/// part of the chat history the next turn sends to the model.
 	Error { message: String },
+	/// Per-turn working-tree diff (ADR 0030). Emitted at turn end,
+	/// carrying the files the agent's `write_file` / `edit_file`
+	/// tools touched (the format queue's file set) and the unified
+	/// diff of the working tree against the baseline SHA captured
+	/// at turn start (`git stash create` + HEAD fallback). Stored in
+	/// the JSONL so reload, the companion app, and an orchestrator's
+	/// `observe_worker` can all read it without re-running git.
+	///
+	/// A metadata record, like `Error` / `Usage` / `TodosUpdate` —
+	/// it does **not** shape the in-memory `messages` slice on
+	/// reload. The diff is a review artifact, not chat history.
+	/// Empty `diff` when nothing changed (read-only turn, or the
+	/// agent's writes were identical to the baseline).
+	TurnDiff { files: Vec<String>, diff: String },
 }
 
 fn u32_is_zero(n: &u32) -> bool {

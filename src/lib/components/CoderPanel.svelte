@@ -2857,6 +2857,18 @@
 		</div>
 	{:else if row.kind === 'compaction'}
 		{@render compactionMarkup(row)}
+	{:else if row.kind === 'turn_diff'}
+		<details class="row turn-diff">
+			<summary>
+				<span class="row-label">changes</span>
+				<span class="diff-files">{row.files.length} file{row.files.length === 1 ? '' : 's'} changed</span>
+			</summary>
+			{#if row.diff}
+				<pre class="diff-content">{row.diff}</pre>
+			{:else}
+				<p class="diff-empty">No textual changes detected.</p>
+			{/if}
+		</details>
 	{/if}
 {/snippet}
 
@@ -3495,6 +3507,42 @@
 		font-size: 11px;
 		color: var(--m-fg-subtle);
 		text-align: center;
+	}
+	/* Per-turn diff row (ADR 0030). A collapsible <details> with
+	   a summary line ("3 files changed") and a <pre> diff body.
+	   Styled to match the compaction disclosure's tone. */
+	.turn-diff {
+		font-size: 12px;
+		color: var(--m-fg-subtle);
+	}
+	.turn-diff > summary {
+		cursor: pointer;
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		padding: 4px 0;
+	}
+	.turn-diff .diff-files {
+		font-size: 11px;
+		color: var(--m-fg-muted);
+	}
+	.turn-diff .diff-content {
+		font-family: var(--m-mono, monospace);
+		font-size: 11px;
+		line-height: 1.4;
+		color: var(--m-fg);
+		background: var(--m-bg-2);
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		padding: 8px;
+		overflow-x: auto;
+		white-space: pre;
+		margin: 4px 0;
+	}
+	.turn-diff .diff-empty {
+		font-size: 11px;
+		color: var(--m-fg-subtle);
+		padding: 4px 0;
 	}
 	.row-label {
 		display: flex;

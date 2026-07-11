@@ -659,6 +659,33 @@ pub trait WorkspaceHost: Send + Sync {
 	/// surface them in dev mode; the auto-fetch loop downgrades
 	/// them to `tracing::debug!`.
 	async fn git_fetch(&self) -> MoonResult<()>;
+
+	/// Capture a baseline commit SHA for per-turn diff attribution
+	/// (ADR 0030). Runs `git stash create` — which returns a
+	/// dangling commit object capturing the current working-tree +
+	/// index state **without touching the working tree, index, or
+	/// HEAD** — and falls back to `git rev-parse HEAD` when the tree
+	/// is clean (stash create returns empty). The returned SHA is
+	/// the comparison point for `git_diff_against` at turn end, so
+	/// the diff shows only what changed *during this turn*,
+	/// regardless of pre-existing uncommitted changes, mid-turn
+	/// commits by the agent or the user, or concurrent sessions.
+	///
+	/// Read-only from git's perspective (creates an object, modifies
+	/// nothing), so concurrent turns can each snapshot independently.
+	/// Returns `Ok(None)` when not a repo or git is unavailable.
+	async fn git_snapshot_baseline(&self) -> MoonResult<Option<String>>;
+
+	/// Diff the working tree against a baseline commit SHA, scoped to
+	/// a file list (the turn's format-queue entries — the files the
+	/// agent's `write_file` / `edit_file` tools touched). Runs
+	/// `git diff <sha> --no-color -- <files…>`, capped at ~64 KB at
+	/// the next newline boundary so a massive diff doesn't overflow
+	/// the transcript / event / dispatch packet. Returns empty
+	/// string when nothing changed, not a repo, or git unavailable.
+	///
+	/// `commit_sha` must pass `is_safe_rev` (HEAD or 40-char hex).
+	async fn git_diff_against(&self, commit_sha: &str, files: &[String]) -> MoonResult<String>;
 }
 
 pub struct LocalHost {
@@ -2189,6 +2216,35 @@ impl WorkspaceHost for LocalHost {
 		})
 		.await
 		.map_err(|e| MoonError::Internal(format!("git_commit_diff join error: {e}")))?
+	}
+
+	async fn git_snapshot_baseline(&self) -> MoonResult<Option<String>> {
+		let guard = self.git_lock().await;
+		let root = self.root.clone();
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			run_git_snapshot_baseline(&root)
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_snapshot_baseline join error: {e}")))
+	}
+
+	async fn git_diff_against(&self, commit_sha: &str, files: &[String]) -> MoonResult<String> {
+		if !is_safe_rev(commit_sha) {
+			return Err(MoonError::invalid(format!(
+				"git_diff_against rejects commit_sha: {commit_sha:?} (expected \"HEAD\" or 40-char hex SHA)"
+			)));
+		}
+		let guard = self.git_lock().await;
+		let root = self.root.clone();
+		let sha = commit_sha.to_owned();
+		let files = files.to_vec();
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			run_git_diff_against(&root, &sha, &files)
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_diff_against join error: {e}")))
 	}
 }
 
@@ -4037,6 +4093,72 @@ fn cap_patch_at_newline(combined: String, cap: usize) -> String {
 	let mut out = combined[..cut].to_owned();
 	out.push_str("... (diff truncated)\n");
 	out
+}
+
+/// `git stash create` + `git rev-parse HEAD` fallback. Returns a
+/// baseline commit SHA for per-turn diff attribution (ADR 0030):
+/// - Dirty working tree → `git stash create` returns a dangling
+///   commit object capturing the current state (without touching the
+///   working tree, index, or HEAD). That SHA is the baseline.
+/// - Clean working tree → `git stash create` returns empty; fall
+///   back to HEAD.
+/// - Not a repo / no commits / git unavailable → `None`.
+///
+/// Read-only from git's perspective (creates an object, modifies
+/// nothing), so concurrent turns can each snapshot independently.
+fn run_git_snapshot_baseline(root: &Utf8Path) -> Option<String> {
+	use std::process::Command;
+	// `git stash create` — returns a commit SHA on stdout when there
+	// are uncommitted changes, empty stdout when the tree is clean.
+	// Never modifies the working tree, index, or HEAD.
+	let stash = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["stash", "create"])
+		.output()
+		.ok()
+		.filter(|o| o.status.success())
+		.and_then(|o| String::from_utf8(o.stdout).ok())
+		.map(|s| s.trim().to_owned());
+	if let Some(sha) = stash {
+		if !sha.is_empty() {
+			return Some(sha);
+		}
+	}
+	// Clean tree or `stash create` failed — fall back to HEAD.
+	let head = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["rev-parse", "HEAD"])
+		.output()
+		.ok()
+		.filter(|o| o.status.success())
+		.and_then(|o| String::from_utf8(o.stdout).ok())
+		.map(|s| s.trim().to_owned());
+	head.filter(|s| !s.is_empty())
+}
+
+/// `git diff <commit_sha> --no-color -- <files…>`, byte-capped at
+/// ~64 KB at the next newline boundary. Returns empty string when
+/// nothing changed, not a repo, or git unavailable. `commit_sha`
+/// must have been validated by `is_safe_rev` before calling.
+fn run_git_diff_against(root: &Utf8Path, commit_sha: &str, files: &[String]) -> String {
+	use std::process::Command;
+	if files.is_empty() {
+		return String::new();
+	}
+	let mut cmd = Command::new("git");
+	cmd.arg("-C").arg(root.as_std_path());
+	cmd.args(["diff", commit_sha, "--no-color", "--"]);
+	for f in files {
+		cmd.arg(f);
+	}
+	let output = match cmd.output() {
+		Ok(o) if o.status.success() => o,
+		_ => return String::new(),
+	};
+	let diff = String::from_utf8_lossy(&output.stdout).into_owned();
+	cap_patch_at_newline(diff, 64_000)
 }
 
 /// `git fetch --quiet --no-tags` with prompts disabled and a 30s
