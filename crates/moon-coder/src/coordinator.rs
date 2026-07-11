@@ -52,7 +52,8 @@ A **worker** is a peer top-level coder session in its own git worktree, on its o
 You manage workers with:
 
 - `spawn_worker(task, base_branch?)` — create a worker in a fresh worktree on a new `moon/agent-<id>` branch (or based on an existing branch when `base_branch` is given), seed it with a task prompt, and let it run. Returns a `worker_id` handle immediately — **it does not block**. The worker keeps running in the background.
-- `observe_worker(worker_id)` — fetch a compact snapshot of a worker's current state: its task, branch, turns-so-far, last assistant message, and whether it's running / idle / needs input (a parked `ask_user`). Use this to check on a worker without reading its full transcript.
+- `observe_worker(worker_id)` — fetch a compact snapshot of a worker's current state: its task, branch, turns-so-far, last assistant message, whether it's running / idle / needs input (a parked `ask_user`), and a **diff summary** (files changed + added/removed counts per file, not the full patch). Use this to check on a worker without reading its full transcript or flooding your context with patch text.
+- `review_worker_changes(worker_id, files?)` — pull the full per-turn diff for a worker, optionally scoped to specific files. Use this when `observe_worker`'s diff summary shows files you want to actually inspect. Don't call it on every observe — only when you need the detail.
 - `steer_worker(worker_id, text)` — send a steering message to a worker mid-turn, the same way a user steers you. Queued; delivered at the worker's next loop iteration top.
 - `abort_worker(worker_id)` — cancel a worker's in-flight turn.
 - `respond_to_worker_prompt(worker_id, answers)` — answer a worker's parked `ask_user` prompt. A worker that needs a decision from you raises `ask_user`; you see it via `observe_worker` and answer it with this tool.
@@ -178,6 +179,32 @@ pub fn abort_worker_tool_definition() -> ToolDefinition {
 	)
 }
 
+/// `review_worker_changes` — pull the full per-turn diff for a worker,
+/// optionally scoped to specific files. Use this when `observe_worker`'s
+/// diff summary shows files you want to actually review. Returns the
+/// unified diff text (capped at ~64 KB).
+pub fn review_worker_changes_tool_definition() -> ToolDefinition {
+	ToolDefinition::function(
+		"review_worker_changes",
+		"Pull the full per-turn diff for a worker, optionally scoped to specific files. `observe_worker` gives you a summary (files + added/removed counts); this tool gives you the actual patch text so you can review the changes. Use it when the summary shows something you want to inspect — don't call it on every observe, only when you need the detail. Pass `files` to review specific files; omit it to get the full diff for all changed files.",
+		json!({
+			"type": "object",
+			"properties": {
+				"worker_id": {
+					"type": "string",
+					"description": "The worker id returned by `spawn_worker`."
+				},
+				"files": {
+					"type": "array",
+					"items": { "type": "string" },
+					"description": "Optional list of file paths to scope the review to. Omit to get the full diff for all changed files."
+				}
+			},
+			"required": ["worker_id"]
+		}),
+	)
+}
+
 /// `respond_to_worker_prompt` — answer a worker's parked `ask_user`
 /// prompt. A worker that needs a decision from you raises `ask_user`;
 /// you see it via `observe_worker` and answer it with this tool.
@@ -216,6 +243,10 @@ mod tests {
 		assert_eq!(
 			respond_to_worker_prompt_tool_definition().function.name,
 			"respond_to_worker_prompt"
+		);
+		assert_eq!(
+			review_worker_changes_tool_definition().function.name,
+			"review_worker_changes"
 		);
 	}
 

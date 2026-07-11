@@ -2972,9 +2972,18 @@ impl CoderHandle {
 			running,
 			needs_input,
 			last_assistant,
-			last_diff: session.last_turn_diff.as_ref().map(|(files, diff)| TurnDiffSnapshot {
-				files: files.clone(),
-				diff: diff.clone(),
+			last_diff: session.last_turn_diff.as_ref().map(|(files, diff)| TurnDiffSummary {
+				files: files
+					.iter()
+					.map(|path| {
+						let (added, removed) = count_diff_lines_for_file(diff, path);
+						TurnDiffFileSummary {
+							path: path.clone(),
+							added,
+							removed,
+						}
+					})
+					.collect(),
 			}),
 		})
 	}
@@ -3013,14 +3022,32 @@ pub struct WorkerSnapshot {
 	/// that touches files lands a `TurnDiff`. The diff text may be
 	/// empty when the turn's writes were identical to the baseline.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub last_diff: Option<TurnDiffSnapshot>,
+	pub last_diff: Option<TurnDiffSummary>,
 }
 
-/// Compact diff snapshot carried in [`WorkerSnapshot`] (ADR 0030).
+/// Per-file change summary for the diff in [`WorkerSnapshot`] (ADR
+/// 0030). The default `observe_worker` return — enough for the
+/// coordinator to decide "on track" vs "sideways" without flooding
+/// its context with patch text. The full diff is a deliberate pull
+/// via `review_worker_changes`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TurnDiffSnapshot {
-	pub files: Vec<String>,
-	pub diff: String,
+pub struct TurnDiffFileSummary {
+	/// Relative path of the changed file.
+	pub path: String,
+	/// Lines added (insertions). Approximate — counted from the
+	/// unified diff hunk headers.
+	pub added: u32,
+	/// Lines removed (deletions). Approximate — same source.
+	pub removed: u32,
+}
+
+/// Compact diff summary carried in [`WorkerSnapshot`] (ADR 0030).
+/// Replaces the full patch text in the default observe return so the
+/// coordinator's context stays plan-shaped. Use `review_worker_changes`
+/// to pull the full diff when you need to actually review.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TurnDiffSummary {
+	pub files: Vec<TurnDiffFileSummary>,
 }
 
 /// Result of a successful [`Coder::unqueue_steer`] — the bytes the
@@ -3171,6 +3198,33 @@ async fn maybe_autosync_to_hub(state: &Arc<CoderState>, rt: &Arc<SessionRuntime>
 	state
 		.hub_sync
 		.enqueue_session_sync(workspace_id, folder_path.to_path_buf(), session_id);
+}
+
+/// Count added/removed lines for a specific file in a unified diff.
+/// Scans the diff for hunk headers (`+++` / `---` lines starting with
+/// `diff --git`) and counts `+` / `-` lines within that file's hunks.
+/// Approximate — doesn't parse hunk ranges, just counts prefix lines.
+/// Used by `observe_session` to build the per-file summary without
+/// returning the full patch text.
+fn count_diff_lines_for_file(diff: &str, path: &str) -> (u32, u32) {
+	let mut added = 0u32;
+	let mut removed = 0u32;
+	let mut in_file = false;
+	for line in diff.lines() {
+		if line.starts_with("diff --git") {
+			in_file = line.contains(&format!(" b/{path}"));
+			continue;
+		}
+		if !in_file {
+			continue;
+		}
+		if line.starts_with('+') && !line.starts_with("+++") {
+			added += 1;
+		} else if line.starts_with('-') && !line.starts_with("---") {
+			removed += 1;
+		}
+	}
+	(added, removed)
 }
 
 /// Capture the baseline commit SHA for per-turn diff attribution
@@ -3456,6 +3510,7 @@ async fn run_turn(
 		tool_defs.push(crate::coordinator::steer_worker_tool_definition());
 		tool_defs.push(crate::coordinator::abort_worker_tool_definition());
 		tool_defs.push(crate::coordinator::respond_to_worker_prompt_tool_definition());
+		tool_defs.push(crate::coordinator::review_worker_changes_tool_definition());
 	}
 	// Compose a fresh system prompt and overwrite the session's
 	// `messages[0]`: the base prompt plus a "Bound folders"
@@ -4006,6 +4061,8 @@ async fn dispatch_tool_calls(
 				handle_abort_worker(state, &args).await
 			} else if call.function.name == "respond_to_worker_prompt" {
 				handle_respond_to_worker_prompt(state, &args).await
+			} else if call.function.name == "review_worker_changes" {
+				handle_review_worker_changes(state, &args).await
 			} else {
 				state.tools.dispatch(&call.function.name, &args, cx, cancel).await
 			};
@@ -4564,6 +4621,76 @@ async fn handle_respond_to_worker_prompt(state: &Arc<CoderState>, args: &Value) 
 	};
 	let resolved = handle.respond_to_prompt(&call_id, response).await;
 	Ok(json!({ "status": if resolved { "answered" } else { "not_resolved" } }))
+}
+
+/// `review_worker_changes` — pull the full per-turn diff for a worker,
+/// optionally scoped to specific files. The deliberate-pull complement
+/// to `observe_worker`'s diff summary (ADR 0030).
+async fn handle_review_worker_changes(state: &Arc<CoderState>, args: &Value) -> Result<Value, CoderError> {
+	#[derive(serde::Deserialize)]
+	struct ReviewArgs {
+		worker_id: String,
+		#[serde(default)]
+		files: Option<Vec<String>>,
+	}
+	let parsed: ReviewArgs = serde_json::from_value(args.clone())
+		.map_err(|err| CoderError::invalid_args("review_worker_changes", err.to_string()))?;
+	let Some((rt, _)) = state.runtime_for_session(&parsed.worker_id).await else {
+		return Err(CoderError::invalid_args(
+			"review_worker_changes",
+			format!("no mounted session for worker_id `{}`", parsed.worker_id),
+		));
+	};
+	let session = rt.session.lock().await;
+	let Some((all_files, diff)) = session.last_turn_diff.as_ref() else {
+		return Ok(json!({ "diff": "", "note": "no turn diff available yet" }));
+	};
+	// If the caller specified files, filter the diff to just those.
+	// Otherwise return the full diff as stored.
+	let result_diff = match &parsed.files {
+		Some(requested) => {
+			let requested_set: std::collections::HashSet<&str> = requested.iter().map(|s| s.as_str()).collect();
+			filter_diff_to_files(diff, &requested_set)
+		}
+		None => diff.clone(),
+	};
+	let result_files: Vec<&String> = match &parsed.files {
+		Some(requested) => all_files.iter().filter(|f| requested.contains(f)).collect(),
+		None => all_files.iter().collect(),
+	};
+	Ok(json!({
+		"files": result_files,
+		"diff": result_diff,
+	}))
+}
+
+/// Extract the hunks from `diff` that belong to any file in `files`.
+/// Splits on `diff --git` headers and keeps only hunks whose header
+/// references a requested file. Returns the filtered diff text.
+fn filter_diff_to_files(diff: &str, files: &std::collections::HashSet<&str>) -> String {
+	let mut out = String::new();
+	let mut current_block: Vec<&str> = Vec::new();
+	let mut current_matches = false;
+	for line in diff.lines() {
+		if line.starts_with("diff --git") {
+			if current_matches && !current_block.is_empty() {
+				for block_line in &current_block {
+					out.push_str(block_line);
+					out.push('\n');
+				}
+			}
+			current_block.clear();
+			current_matches = files.iter().any(|f| line.contains(&format!(" b/{f}")));
+		}
+		current_block.push(line);
+	}
+	if current_matches && !current_block.is_empty() {
+		for block_line in &current_block {
+			out.push_str(block_line);
+			out.push('\n');
+		}
+	}
+	out
 }
 
 /// Walk the session's in-memory `messages` for assistant tool
