@@ -15,16 +15,23 @@
 //! `specs/coder.md` § Permissions). It's a scope decision: only wire
 //! up what something actually calls.
 //!
-//! Today's methods are all read-only snapshots, enough to prove the
-//! relay end to end and back the PWA's workspace + session list:
+//! The method set grows as the companion PWA's screens need it.
+//! It is **not** a security boundary — pairing is (a paired device
+//! can drive the coder, which can run anything via `bash`; same
+//! threat model as the desktop, see `specs/coder.md` § Permissions).
+//! It's a scope decision: only wire up what something actually calls.
 //!
+//! Current methods:
 //! - `coder_status` → [`CoderStatus`]
 //! - `coder_list_sessions` → `Vec<SessionSummary>`
 //! - `coder_active_session` → `Option<SessionSummary>`
 //! - `workspace_snapshot` → the folder list + active folder
-//!
-//! Mutating methods (`coder_send`, commit, …) land here when the
-//! PWA wires the screen that calls them.
+//! - `coder_open_session` / `coder_send` / `coder_abort` — drive the
+//!   active session (send a prompt, abort the turn).
+//! - `coder_new_session` / `coder_delete_session` — session lifecycle.
+//! - `coder_respond_to_prompt` — answer an `ask_user` tool call
+//!   (Phase 14; the companion can now fully attend a coordinator
+//!   session that raises a prompt).
 
 use std::sync::Arc;
 
@@ -86,6 +93,24 @@ impl BridgeRpcHandler for BridgeRpc {
 				self.coder.abort().await;
 				Ok(Value::Null)
 			}
+			// --- Phase 14: the companion drives sessions fully
+			// (new, delete, answer ask_user prompts). These mirror the
+			// desktop's `#[tauri::command]`s 1:1 — same coder handle,
+			// same PromptResponse type.
+			"coder_new_session" => {
+				let summary = self.coder.new_session().await.map_err(|e| e.to_string())?;
+				to_value(&summary)
+			}
+			"coder_delete_session" => {
+				let p: DeleteSessionParams = parse_params(params)?;
+				self.coder.delete_session(p.id).await.map_err(|e| e.to_string())?;
+				Ok(Value::Null)
+			}
+			"coder_respond_to_prompt" => {
+				let p: RespondToPromptParams = parse_params(params)?;
+				let accepted = self.coder.respond_to_prompt(&p.call_id, p.response).await;
+				Ok(serde_json::json!({ "accepted": accepted }))
+			}
 			"bridge_methods" => Ok(serde_json::json!({
 				"methods": SUPPORTED_METHODS,
 				"streams": SUPPORTED_STREAMS,
@@ -134,6 +159,17 @@ struct SendParams {
 	text: String,
 }
 
+#[derive(serde::Deserialize)]
+struct DeleteSessionParams {
+	id: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RespondToPromptParams {
+	call_id: String,
+	response: moon_coder::PromptResponse,
+}
+
 /// Parse a method's params object, mapping a shape mismatch to an
 /// error string the phone surfaces.
 fn parse_params<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, String> {
@@ -158,6 +194,9 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 	"coder_open_session",
 	"coder_send",
 	"coder_abort",
+	"coder_new_session",
+	"coder_delete_session",
+	"coder_respond_to_prompt",
 	"bridge_methods",
 ];
 

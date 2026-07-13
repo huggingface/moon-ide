@@ -24,6 +24,10 @@
 		<strong>{app.activeWorkspace}</strong>
 	</div>
 
+	<div class="row" style="justify-content: flex-end;">
+		<button class="ghost" onclick={() => app.newSession()}>+ New session</button>
+	</div>
+
 	{#if app.coderStatus}
 		<div class="card row" style="justify-content: space-between;">
 			<span>
@@ -47,16 +51,19 @@
 	{:else}
 		<div class="list">
 			{#each app.sessions as s (s.id)}
-				<button class="card list-item" onclick={() => app.openSession(s.id)}>
-					<strong>
-						{s.title || 'Untitled session'}
-						{#if s.mode === 'coordinator'}<span
-								class="badge"
-								title="Coordinator — an orchestrator that spawns and manages worker agents">coord</span
-							>{/if}
-					</strong>
-					<span class="muted">{relativeTime(s.updated_at_ms)}</span>
-				</button>
+				<div class="card list-item">
+					<button class="list-item-main" onclick={() => app.openSession(s.id)}>
+						<strong>
+							{s.title || 'Untitled session'}
+							{#if s.mode === 'coordinator'}<span
+									class="badge"
+									title="Coordinator — an orchestrator that spawns and manages worker agents">coord</span
+								>{/if}
+						</strong>
+						<span class="muted">{relativeTime(s.updated_at_ms)}</span>
+					</button>
+					<button class="ghost danger" title="Delete session" onclick={() => app.deleteSession(s.id)}>×</button>
+				</div>
 			{/each}
 		</div>
 	{/if}
@@ -65,3 +72,28 @@
 		<p class="error">{app.error}</p>
 	{/if}
 </div>
+
+<style>
+	.list-item {
+		display: flex;
+		align-items: center;
+		gap: 0.3rem;
+	}
+	.list-item-main {
+		flex: 1;
+		display: flex;
+		flex-direction: column;
+		gap: 0.2rem;
+		background: none;
+		border: none;
+		cursor: pointer;
+		text-align: left;
+		color: inherit;
+		padding: 0;
+	}
+	.danger {
+		color: var(--danger);
+		font-size: 1.1rem;
+		padding: 0.2rem 0.4rem;
+	}
+</style>

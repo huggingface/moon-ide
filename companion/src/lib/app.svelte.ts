@@ -1,10 +1,10 @@
 // App state for the companion PWA. Svelte 5 runes, single shared
 // store (same convention as the desktop app's `state.svelte.ts`).
 //
-// The companion is read-mostly for now (13.4): it pairs, lists
-// workspaces, and shows a workspace's coder status + session list.
-// Sending prompts / committing land when the backend exposes those
-// relay methods (see specs/roadmaps/phase-13-mobile-companion.md).
+// The companion can fully drive coder sessions: list, open, create,
+// delete, send prompts, abort, answer ask_user prompts, and render
+// the full event stream (thinking, tool calls with args, diffs, token
+// usage, sub-agents, compaction, session metadata).
 
 import { BridgeSocket, clearConnection, loadConnection, type Connection } from './transport';
 
@@ -41,23 +41,98 @@ export type SessionSummary = {
 	mode?: string | null;
 };
 
-/** A rendered transcript row. We collapse the coder's fine-grained
- * event grammar into three visible kinds for the phone. */
+/** A rendered transcript row. The phone collapses the coder's
+ * fine-grained event grammar into these visible kinds. */
 export type TranscriptRow =
-	| { kind: 'user'; id: string; text: string }
-	| { kind: 'assistant'; id: string; text: string }
-	| { kind: 'tool'; id: string; name: string; status: 'running' | 'done' | 'error' };
+	| { kind: 'user'; id: string; text: string; queued: boolean }
+	| { kind: 'assistant'; id: string; text: string; thinking: string }
+	| {
+			kind: 'tool';
+			id: string;
+			name: string;
+			args: string;
+			result: string;
+			status: 'running' | 'done' | 'error';
+	  }
+	| {
+			kind: 'ask_user';
+			id: string;
+			callId: string;
+			questions: AskUserQuestion[];
+			answered: boolean;
+	  }
+	| { kind: 'diff'; id: string; files: string[]; diff: string }
+	| { kind: 'tokens'; id: string; total: number; contextWindow: number }
+	| { kind: 'compaction'; id: string; summary: string; done: boolean }
+	| { kind: 'subagent'; id: string; subagentId: string; folder: string; finished: boolean };
 
-// The coder event is an open set on the wire (the desktop emits many
-// variants we don't render). We read it as a loose record and pull
-// fields defensively per type, rather than a closed union that would
-// choke on unknown variants.
-type RawEvent = { type?: string; [key: string]: unknown };
+/** One question in an ask_user tool call. */
+export type AskUserQuestion = {
+	id: string;
+	question: string;
+	options: Array<{ id: string; label: string }>;
+	multi: boolean;
+};
+
+/** A pending ask_user prompt awaiting the user's response. */
+export type PendingPrompt = {
+	callId: string;
+	questions: AskUserQuestion[];
+};
+
+// The coder event is an open set on the wire. We read it as a loose
+// record and pull fields defensively per type, rather than a closed
+// union that would choke on unknown variants.
+type RawEvent = { type?: string; kind?: string; [key: string]: unknown };
 type CoderEventEnvelope = { folder?: string; session_id?: string; event?: RawEvent };
 
 function str(ev: RawEvent, key: string): string {
 	const v = ev[key];
 	return typeof v === 'string' ? v : '';
+}
+
+function num(ev: RawEvent, key: string): number {
+	const v = ev[key];
+	return typeof v === 'number' ? v : 0;
+}
+
+function bool(ev: RawEvent, key: string): boolean {
+	return ev[key] === true;
+}
+
+/** Parse ask_user tool args into the question shapes the UI needs. */
+function parseAskUserArgs(args: unknown): AskUserQuestion[] {
+	if (typeof args !== 'object' || args === null) {
+		return [];
+	}
+	// eslint-disable-next-line typescript-eslint/no-unsafe-type-assertion
+	const a = args as { questions?: unknown[] };
+	if (!Array.isArray(a.questions)) {
+		return [];
+	}
+	return a.questions
+		.map((q): AskUserQuestion | null => {
+			if (typeof q !== 'object' || q === null) {
+				return null;
+			}
+			// eslint-disable-next-line typescript-eslint/no-unsafe-type-assertion
+			const qo = q as {
+				id?: string;
+				question?: string;
+				options?: Array<{ id?: string; label?: string }>;
+				multi?: boolean;
+			};
+			return {
+				id: qo.id ?? '',
+				question: qo.question ?? '',
+				options: (qo.options ?? []).map((o) => ({
+					id: o.id ?? '',
+					label: o.label ?? '',
+				})),
+				multi: qo.multi === true,
+			};
+		})
+		.filter((q): q is AskUserQuestion => q !== null);
 }
 
 type Phase = 'connecting' | 'pairing' | 'ready' | 'error';
@@ -75,9 +150,7 @@ class CompanionState {
 
 	/** The workspace the user picked, or null while choosing. */
 	activeWorkspace = $state<string | null>(null);
-	/** The owning IDE's id for the active workspace (empty = local).
-	 * Phase 14 — threaded through `call`/`subscribe` for carrier
-	 * selection. */
+	/** The owning IDE's id for the active workspace (empty = local). */
 	activeIde = $state('');
 
 	coderStatus = $state<CoderStatus | null>(null);
@@ -91,6 +164,10 @@ class CompanionState {
 	rows = $state<TranscriptRow[]>([]);
 	/** True while a turn is streaming (composer shows abort). */
 	busy = $state(false);
+	/** True when an ask_user prompt is blocking the turn. */
+	awaitingInput = $state(false);
+	/** The pending ask_user prompt, if awaitingInput. */
+	pendingPrompt = $state<PendingPrompt | null>(null);
 	subscribed = false;
 
 	/** Boot: if we already have a paired connection, reconnect; else pair. */
@@ -189,6 +266,36 @@ class CompanionState {
 		this.closeSession();
 	}
 
+	/** Create a new coder session and open it. */
+	async newSession(): Promise<void> {
+		if (!this.activeWorkspace) {
+			return;
+		}
+		try {
+			const summary = await this.#call<SessionSummary>(this.activeWorkspace, 'coder_new_session', {}, this.activeIde);
+			this.sessions = [summary, ...this.sessions];
+			await this.openSession(summary.id);
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
+	/** Delete a session by id. */
+	async deleteSession(id: string): Promise<void> {
+		if (!this.activeWorkspace) {
+			return;
+		}
+		try {
+			await this.#call(this.activeWorkspace, 'coder_delete_session', { id }, this.activeIde);
+			this.sessions = this.sessions.filter((s) => s.id !== id);
+			if (this.activeSession === id) {
+				this.closeSession();
+			}
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
 	/** Open a session: load it on the backend, replay its transcript
 	 * via the event stream, and subscribe to live events. */
 	async openSession(id: string): Promise<void> {
@@ -198,9 +305,9 @@ class CompanionState {
 		this.activeSession = id;
 		this.rows = [];
 		this.busy = false;
+		this.awaitingInput = false;
+		this.pendingPrompt = null;
 		try {
-			// Ensure we're receiving this workspace's event stream. The
-			// open_session call replays the transcript as events.
 			this.#ensureSubscribed(this.activeWorkspace, this.activeIde);
 			await this.#call(this.activeWorkspace, 'coder_open_session', { id }, this.activeIde);
 		} catch (e) {
@@ -212,6 +319,8 @@ class CompanionState {
 		this.activeSession = null;
 		this.rows = [];
 		this.busy = false;
+		this.awaitingInput = false;
+		this.pendingPrompt = null;
 	}
 
 	/** Send a prompt to the active session. */
@@ -240,6 +349,33 @@ class CompanionState {
 		}
 	}
 
+	/** Respond to an ask_user prompt. */
+	async respondToPrompt(
+		callId: string,
+		answers: Array<{ question_id: string; selected: string[]; free_text: string }>,
+	): Promise<void> {
+		if (!this.activeWorkspace) {
+			return;
+		}
+		try {
+			await this.#call(
+				this.activeWorkspace,
+				'coder_respond_to_prompt',
+				{ call_id: callId, response: { answers } },
+				this.activeIde,
+			);
+			this.awaitingInput = false;
+			this.pendingPrompt = null;
+			// Mark the ask_user row as answered.
+			const row = this.rows.find((r) => r.kind === 'ask_user' && r.callId === callId);
+			if (row && row.kind === 'ask_user') {
+				row.answered = true;
+			}
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
 	#ensureSubscribed(workspace: string, ide = ''): void {
 		if (this.subscribed || !this.#socket || !this.connection) {
 			return;
@@ -253,9 +389,7 @@ class CompanionState {
 	#onCoderEvent(raw: unknown): void {
 		// eslint-disable-next-line typescript-eslint/no-unsafe-type-assertion
 		const envelope = (raw ?? {}) as CoderEventEnvelope;
-		// Only render events for the session the phone has open. Other
-		// sessions / folders stream too (the desktop may be busy) but
-		// aren't shown here.
+		// Only render events for the session the phone has open.
 		if (this.activeSession && envelope.session_id && envelope.session_id !== this.activeSession) {
 			return;
 		}
@@ -264,10 +398,8 @@ class CompanionState {
 			return;
 		}
 		// A `replay` batch packs a whole session's historic events
-		// into one envelope (desktop's `CoderEvent::Replay`, added
-		// for IPC-batching on session open). Unpack and feed each
-		// inner event back through this reducer so the phone sees
-		// the same transcript it would from the per-event stream.
+		// into one envelope. Unpack and feed each inner event back
+		// through this reducer.
 		if (ev.kind === 'replay') {
 			const inner = ev.events;
 			if (Array.isArray(inner)) {
@@ -275,11 +407,7 @@ class CompanionState {
 					this.#onCoderEvent({ ...envelope, event: e });
 				}
 			}
-			// The batch ends with a `turn_complete` terminator that
-			// clears `busy`; re-assert it when the reopened session is
-			// still running in the background so the composer keeps
-			// showing Stop instead of Send.
-			if (ev.in_flight === true) {
+			if (bool(ev, 'in_flight')) {
 				this.busy = true;
 			}
 			return;
@@ -289,56 +417,220 @@ class CompanionState {
 		}
 		switch (ev.type) {
 			case 'user_message':
-				this.rows.push({ kind: 'user', id: str(ev, 'id'), text: str(ev, 'text') });
+				this.rows.push({
+					kind: 'user',
+					id: str(ev, 'id'),
+					text: str(ev, 'text'),
+					queued: bool(ev, 'queued'),
+				});
+				break;
+			case 'steer_drained':
+				this.rows = this.rows.filter((r) => !(r.kind === 'user' && r.id === str(ev, 'id')));
 				break;
 			case 'assistant_message_start':
 				this.busy = true;
-				this.rows.push({ kind: 'assistant', id: str(ev, 'id'), text: '' });
+				this.rows.push({ kind: 'assistant', id: str(ev, 'id'), text: '', thinking: '' });
 				break;
 			case 'assistant_message_delta':
-				this.#appendAssistant(str(ev, 'id'), str(ev, 'delta'));
+				this.#appendAssistant(str(ev, 'id'), str(ev, 'delta'), '');
+				break;
+			case 'assistant_thinking_delta':
+				this.#appendAssistant('', '', str(ev, 'delta'));
 				break;
 			case 'assistant_message_end':
-				this.#setAssistant(str(ev, 'id'), str(ev, 'text'));
+				this.#setAssistant(str(ev, 'id'), str(ev, 'text'), str(ev, 'thinking'));
 				break;
-			case 'tool_call':
-				this.rows.push({ kind: 'tool', id: str(ev, 'id'), name: str(ev, 'name'), status: 'running' });
+			case 'tool_call': {
+				const name = str(ev, 'name');
+				const args = ev['args'];
+				const argsStr = typeof args === 'object' ? JSON.stringify(args) : str(ev, 'args');
+				// ask_user gets its own row kind so the UI can render
+				// the interactive prompt.
+				if (name === 'ask_user') {
+					const questions = parseAskUserArgs(args);
+					const callId = str(ev, 'id');
+					this.rows.push({
+						kind: 'ask_user',
+						id: callId,
+						callId,
+						questions,
+						answered: false,
+					});
+					this.awaitingInput = true;
+					this.pendingPrompt = { callId, questions };
+				} else {
+					this.rows.push({
+						kind: 'tool',
+						id: str(ev, 'id'),
+						name,
+						args: argsStr,
+						result: '',
+						status: 'running',
+					});
+				}
 				break;
-			case 'tool_result':
-				this.#setToolStatus(str(ev, 'id'), ev['is_error'] === true ? 'error' : 'done');
+			}
+			case 'tool_result': {
+				const id = str(ev, 'id');
+				const isError = bool(ev, 'is_error');
+				// If this is the result of an ask_user, clear the
+				// awaitingInput flag.
+				const askRow = this.rows.find((r) => r.kind === 'ask_user' && r.callId === id);
+				if (askRow && askRow.kind === 'ask_user') {
+					this.awaitingInput = false;
+					this.pendingPrompt = null;
+				} else {
+					const result = ev['result'];
+					const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
+					this.#setToolResult(id, resultStr, isError ? 'error' : 'done');
+				}
 				break;
+			}
 			case 'turn_complete':
 			case 'aborted':
 				this.busy = false;
+				this.awaitingInput = false;
+				this.pendingPrompt = null;
 				break;
 			case 'error':
 				this.busy = false;
 				this.error = str(ev, 'message') || 'coder error';
 				break;
+			case 'session_loaded':
+				// Update the session title in the list if it changed.
+				this.#updateSessionTitle(str(ev, 'id'), str(ev, 'title'));
+				break;
+			case 'session_title_updated':
+				this.#updateSessionTitle(str(ev, 'id'), str(ev, 'title'));
+				break;
+			case 'session_list_changed':
+				// Refresh the session list from the backend.
+				if (this.activeWorkspace) {
+					void this.#refreshSessions();
+				}
+				break;
+			case 'token_usage': {
+				const total = num(ev, 'total_tokens');
+				const ctx = num(ev, 'context_window');
+				if (total > 0) {
+					this.rows.push({
+						kind: 'tokens',
+						id: `tok-${total}-${Date.now()}`,
+						total,
+						contextWindow: ctx,
+					});
+				}
+				break;
+			}
+			case 'turn_diff': {
+				const files = ev['files'];
+				const diff = str(ev, 'diff');
+				const fileList = Array.isArray(files) ? files.map(String) : [];
+				if (fileList.length > 0 || diff) {
+					this.rows.push({
+						kind: 'diff',
+						id: `diff-${Date.now()}`,
+						files: fileList,
+						diff,
+					});
+				}
+				break;
+			}
+			case 'compaction_started':
+				this.rows.push({
+					kind: 'compaction',
+					id: `comp-${Date.now()}`,
+					summary: '',
+					done: false,
+				});
+				break;
+			case 'compaction_complete': {
+				const summary = str(ev, 'summary');
+				const row = this.rows.findLast((r) => r.kind === 'compaction' && !r.done);
+				if (row && row.kind === 'compaction') {
+					row.summary = summary;
+					row.done = true;
+				}
+				break;
+			}
+			case 'subagent_spawned':
+				this.rows.push({
+					kind: 'subagent',
+					id: `sub-${str(ev, 'subagent_id')}`,
+					subagentId: str(ev, 'subagent_id'),
+					folder: str(ev, 'target_folder'),
+					finished: false,
+				});
+				break;
+			case 'subagent_finished': {
+				const sid = str(ev, 'subagent_id');
+				const row = this.rows.findLast((r) => r.kind === 'subagent' && r.subagentId === sid);
+				if (row && row.kind === 'subagent') {
+					row.finished = true;
+				}
+				break;
+			}
 			default:
 				break;
 		}
 	}
 
-	#appendAssistant(id: string, delta: string): void {
+	async #refreshSessions(): Promise<void> {
+		if (!this.activeWorkspace) {
+			return;
+		}
+		try {
+			this.sessions = await this.#call<SessionSummary[]>(
+				this.activeWorkspace,
+				'coder_list_sessions',
+				{},
+				this.activeIde,
+			);
+		} catch {
+			// Silent — the list will refresh on next manual open.
+		}
+	}
+
+	#updateSessionTitle(id: string, title: string): void {
+		const session = this.sessions.find((s) => s.id === id);
+		if (session) {
+			session.title = title;
+		}
+	}
+
+	#appendAssistant(id: string, delta: string, thinkingDelta: string): void {
+		// If id is empty, it's a thinking delta — append to the last
+		// assistant row's thinking field.
+		if (!id) {
+			const row = this.rows.findLast((r) => r.kind === 'assistant');
+			if (row && row.kind === 'assistant') {
+				row.thinking += thinkingDelta;
+			}
+			return;
+		}
 		const row = this.rows.find((r) => r.kind === 'assistant' && r.id === id);
 		if (row && row.kind === 'assistant') {
 			row.text += delta;
+			row.thinking += thinkingDelta;
 		} else {
-			this.rows.push({ kind: 'assistant', id, text: delta });
+			this.rows.push({ kind: 'assistant', id, text: delta, thinking: thinkingDelta });
 		}
 	}
 
-	#setAssistant(id: string, text: string): void {
+	#setAssistant(id: string, text: string, thinking: string): void {
 		const row = this.rows.find((r) => r.kind === 'assistant' && r.id === id);
 		if (row && row.kind === 'assistant') {
 			row.text = text;
+			if (thinking) {
+				row.thinking = thinking;
+			}
 		}
 	}
 
-	#setToolStatus(id: string, status: 'running' | 'done' | 'error'): void {
+	#setToolResult(id: string, result: string, status: 'done' | 'error'): void {
 		const row = this.rows.find((r) => r.kind === 'tool' && r.id === id);
 		if (row && row.kind === 'tool') {
+			row.result = result;
 			row.status = status;
 		}
 	}
