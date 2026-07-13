@@ -1,4 +1,4 @@
-//! The LAN WSS listener (Phase 13.2).
+//! The LAN WSS listener (Phase 13.2 + Phase 14.1).
 //!
 //! Binds one TLS + WebSocket listener, the single deliberate LAN
 //! surface the companion connects to (cross-cutting invariant 3:
@@ -7,7 +7,9 @@
 //! 1. TLS handshake (self-signed cert from [`crate::tls`]; the phone
 //!    pinned its fingerprint at pair time).
 //! 2. WebSocket upgrade.
-//! 3. One JSON message per frame. Two message shapes:
+//! 3. One JSON message per frame, tagged `type`. Two client types share
+//!    the one listener: **phones** (paired) and **IDEs** (enrolled,
+//!    Phase 14). Message shapes:
 //!    - **pair** `{"type":"pair","code","label"}` — verify the code
 //!      against the in-memory [`PairingSession`], mint + store a
 //!      device, reply with the token. One pairing window per process
@@ -17,11 +19,24 @@
 //!      relay to the workspace process via [`crate::relay::call`] and
 //!      reply with the result.
 //!
-//! Auth is the whole boundary: a valid device token can call any
-//! relayed method, which can drive the coder, which runs anything
-//! (see `specs/companion.md`). The token check is the gate; there is
-//! no per-method allowlist behind it.
+//!    - **enroll** — an IDE presents an enrollment code (Phase 14,
+//!      ADR 0031); verify against [`EnrollmentSession`], mint + store
+//!      an IDE, reply with the token. Symmetric mirror of `pair`.
+//!    - **register** — an enrolled IDE reports its live workspaces so
+//!      the bridge's remote-carrier registry stays current (discovery
+//!      inverts in remote mode: IDEs dial out, the bridge can't
+//!      enumerate a remote filesystem).
+//!    - **workspaces** / **call** / **subscribe** — phone → bridge,
+//!      authenticated by a device token. `call`/`subscribe` route to
+//!      whichever carrier owns the target workspace: local-carrier
+//!      over the Unix socket ([`crate::relay::call`], unchanged);
+//!      remote-carrier over the enrolled IDE's held-open WS (14.2).
+//!
+//! Auth is the whole boundary: a valid token (device or IDE) can drive
+//! the coder, which runs anything (see `specs/companion.md`). The token
+//! check is the gate; there is no per-method allowlist behind it.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -33,6 +48,7 @@ use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::enrollment::{EnrolledIde, EnrollmentSession, IdeStore};
 use crate::pairing::{DeviceStore, PairedDevice, PairingSession};
 use crate::tls::TlsIdentity;
 
@@ -40,7 +56,7 @@ use crate::tls::TlsIdentity;
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum ClientMessage {
-	/// Present a pairing code to obtain a device token.
+	/// Present a pairing code to obtain a device token (phone).
 	Pair { code: String, label: String },
 	/// List the workspaces on this host (the phone's switcher),
 	/// authenticated by a device token. Bridge-level, not
@@ -58,6 +74,22 @@ enum ClientMessage {
 	/// Subscribe to a workspace's `coder:event` stream. The bridge
 	/// pushes `ServerMessage::Event` frames until the connection drops.
 	Subscribe { token: String, workspace: String },
+	/// Present an enrollment code to obtain an IDE token (Phase 14,
+	/// ADR 0031). Mirror of `Pair` for the IDE↔bridge relationship.
+	/// `ide_id` is the IDE's self-assigned stable id (persisted in its
+	/// own keyring) so reconnections rebind to the same registry entry.
+	Enroll {
+		code: String,
+		label: String,
+		ide_id: String,
+	},
+	/// An enrolled IDE reports its live workspaces so the bridge's
+	/// remote-carrier registry stays current (Phase 14.1). Sent on
+	/// connect and whenever the IDE's workspace set changes.
+	Register {
+		token: String,
+		workspaces: Vec<RemoteWorkspace>,
+	},
 }
 
 /// Outbound reply to the phone.
@@ -66,6 +98,9 @@ enum ClientMessage {
 enum ServerMessage {
 	/// Pairing succeeded; carries the freshly-minted device token.
 	Paired { device_id: String, token: String },
+	/// Enrollment succeeded; carries the freshly-minted IDE token
+	/// (Phase 14, mirror of `Paired`).
+	Enrolled { ide_id: String, token: String },
 	/// The workspace list (reply to `workspaces`).
 	Workspaces { workspaces: serde_json::Value },
 	/// A `call` result (the relayed method's `ok` payload).
@@ -75,6 +110,23 @@ enum ServerMessage {
 	/// Anything went wrong — bad code, bad token, relay failure,
 	/// malformed frame. `message` is human-readable.
 	Error { message: String },
+}
+
+/// A workspace an enrolled IDE reports via `Register` (Phase 14). The
+/// bridge merges these into its `WorkspaceRegistry` as the
+/// remote-carrier half; the phone's switcher sees the union tagged with
+/// the owning IDE's id. Deliberately a subset of
+/// [`crate::discovery::DiscoveredWorkspace`] — remote IDEs report what
+/// they have open, not a filesystem probe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteWorkspace {
+	/// Workspace slug — the `moon-ide --workspace <id>` argument.
+	pub id: String,
+	/// Human-readable label (falls back to the slug on the phone).
+	pub name: String,
+	/// Last-active timestamp (Unix epoch seconds), if the IDE knows it.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub last_active_at: Option<i64>,
 }
 
 /// Everything a connection handler needs, shared across connections.
@@ -90,6 +142,35 @@ struct ServeCtx {
 	/// once consumed (single-use) — further `pair` attempts then fail
 	/// cleanly until the operator issues a new code (restart `serve`).
 	pairing: Mutex<Option<PairingSession>>,
+	/// Enrolled-IDE registry (Phase 14). Mirror of `devices` for the
+	/// IDE↔bridge relationship.
+	ides: IdeStore,
+	/// The single active enrollment session for this `serve` run,
+	/// behind a mutex so concurrent connections can't both consume it.
+	/// `None` once consumed (single-use). Mirror of `pairing`.
+	enrollment: Mutex<Option<EnrollmentSession>>,
+	/// Live enrolled IDEs that currently hold an open WS connection.
+	/// Keyed by `ide_id`; the value is the IDE's outbound message sink
+	/// and its last-reported workspace list. This is the
+	/// remote-carrier half of the workspace registry;
+	/// `call`/`subscribe` for a remote-carrier workspace forward
+	/// through here (14.2).
+	live_ides: Mutex<HashMap<String, IdeConnection>>,
+}
+
+/// A currently-connected enrolled IDE (Phase 14). Held in
+/// `ServeCtx::live_ides` keyed by `ide_id`.
+struct IdeConnection {
+	/// Sink to push messages down this IDE's WS (a forwarded `call`
+	/// or `subscribe` from a phone). Cloned from the per-connection
+	/// mpsc sender so multiple phones can talk to one IDE. Read by
+	/// the relay forwarding path (14.2); `allow` until then.
+	#[allow(dead_code)]
+	sink: tokio::sync::mpsc::Sender<ServerMessage>,
+	/// The workspaces this IDE last reported via `Register`. The
+	/// bridge surfaces these in the phone's `workspaces` reply
+	/// (union with local-carrier discovery).
+	workspaces: Vec<RemoteWorkspace>,
 }
 
 /// Inputs for [`serve`]. Bundled into a struct because the listener
@@ -111,6 +192,12 @@ pub struct ServeConfig {
 	pub mdns_url: Option<String>,
 	/// LAN IP for mDNS advertising (the host's own address).
 	pub advertise_ip: Option<std::net::Ipv4Addr>,
+	/// Enrolled-IDE registry (Phase 14). Mirror of `devices`.
+	pub ides: IdeStore,
+	/// The enrollment session for this `serve` run (Phase 14). `None`
+	/// when enrollment is closed (`--no-enrollment`). Mirror of
+	/// `pairing`.
+	pub enrollment: Option<EnrollmentSession>,
 }
 
 /// Run the listener until the process is killed.
@@ -126,6 +213,8 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
 		pairing_payload,
 		mdns_url,
 		advertise_ip,
+		ides,
+		enrollment,
 	} = cfg;
 	let fingerprint = tls.fingerprint.clone();
 	let acceptor = TlsAcceptor::from(tls.server_config);
@@ -160,6 +249,9 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
 		web_root,
 		devices,
 		pairing: Mutex::new(pairing),
+		ides,
+		enrollment: Mutex::new(enrollment),
+		live_ides: Mutex::new(HashMap::new()),
 	});
 
 	// Serve the local control socket the IDE's Companion panel uses
@@ -219,6 +311,17 @@ fn current_status(
 			paired_at_ms: d.paired_at_ms,
 		})
 		.collect();
+	let ides = ctx
+		.ides
+		.list()
+		.unwrap_or_default()
+		.into_iter()
+		.map(|i| crate::status::IdeEntry {
+			id: i.id,
+			label: i.label,
+			enrolled_at_ms: i.enrolled_at_ms,
+		})
+		.collect();
 	crate::status::CompanionStatus {
 		running: true,
 		pairing_payload: payload.map(|p| p.to_json()),
@@ -227,6 +330,7 @@ fn current_status(
 		mdns_url: mdns_url.map(str::to_owned),
 		fingerprint: fingerprint.to_owned(),
 		devices,
+		ides,
 		build_id: crate::status::self_build_id(),
 	}
 }
@@ -301,6 +405,21 @@ fn spawn_control_listener(
 						}
 						Err(err) => crate::status::ControlResponse::Error {
 							message: format!("revoke failed: {err}"),
+						},
+					},
+					crate::status::ControlRequest::RevokeIde { ide_id } => match ctx.ides.revoke(&ide_id) {
+						Ok(revoked) => {
+							if revoked {
+								tracing::info!(id = %ide_id, "revoked enrolled IDE");
+								// Also drop the live connection if
+								// present, so a revoked IDE can't keep
+								// forwarding until it reconnects.
+								ctx.live_ides.lock().await.remove(&ide_id);
+							}
+							crate::status::ControlResponse::Revoked { revoked }
+						}
+						Err(err) => crate::status::ControlResponse::Error {
+							message: format!("revoke-ide failed: {err}"),
 						},
 					},
 					crate::status::ControlRequest::Shutdown => {
@@ -419,6 +538,11 @@ async fn handle_conn(
 		}
 	});
 
+	// Track the ide_id this connection enrolled as (if any), so we can
+	// remove it from `live_ides` when the WS drops. An IDE that never
+	// enrolls (a phone) leaves this `None` and the cleanup is a no-op.
+	let conn_ide_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
 	while let Some(frame) = source.next().await {
 		let msg = frame?;
 		let text = match msg {
@@ -427,15 +551,30 @@ async fn handle_conn(
 			Message::Close(_) => break,
 			_ => continue,
 		};
-		handle_message(&ctx, &text, &out_tx).await;
+		handle_message(&ctx, &text, &out_tx, &conn_ide_id).await;
 	}
 
 	drop(out_tx);
 	let _ = writer.await;
+
+	// Connection cleanup: if this was an enrolled IDE, remove it from
+	// the live-IDE table so the phone's switcher no longer lists its
+	// workspaces. The IDE reconnects on restart (its stored token
+	// means a reconnect, not a re-enroll).
+	if let Some(ide_id) = conn_ide_id.lock().await.take() {
+		let mut live = ctx.live_ides.lock().await;
+		live.remove(&ide_id);
+		tracing::info!(%ide_id, "IDE disconnected; removed from live table");
+	}
 	Ok(())
 }
 
-async fn handle_message(ctx: &Arc<ServeCtx>, text: &str, out: &tokio::sync::mpsc::Sender<ServerMessage>) {
+async fn handle_message(
+	ctx: &Arc<ServeCtx>,
+	text: &str,
+	out: &tokio::sync::mpsc::Sender<ServerMessage>,
+	conn_ide_id: &Arc<Mutex<Option<String>>>,
+) {
 	let parsed: ClientMessage = match serde_json::from_str(text) {
 		Ok(m) => m,
 		Err(err) => {
@@ -467,6 +606,21 @@ async fn handle_message(ctx: &Arc<ServeCtx>, text: &str, out: &tokio::sync::mpsc
 		}
 		ClientMessage::Subscribe { token, workspace } => {
 			handle_subscribe(ctx, &token, &workspace, out).await;
+		}
+		ClientMessage::Enroll { code, label, ide_id } => {
+			let reply = handle_enroll(ctx, &code, &label, &ide_id).await;
+			// On a successful enroll, record the ide_id so the
+			// connection cleanup removes it from `live_ides` when the
+			// WS drops. A failed enroll (bad code) leaves it unset.
+			if let ServerMessage::Enrolled { ide_id: ok_id, .. } = &reply {
+				*conn_ide_id.lock().await = Some(ok_id.clone());
+			}
+			let _ = out.send(reply).await;
+		}
+		ClientMessage::Register { token, workspaces } => {
+			let _ = out
+				.send(handle_register(ctx, &token, workspaces, out.clone()).await)
+				.await;
 		}
 	}
 }
@@ -531,22 +685,44 @@ async fn handle_workspaces(ctx: &ServeCtx, token: &str) -> ServerMessage {
 			}
 		}
 	};
-	match crate::discovery::discover(&ctx.workspaces_dir, &config_dir).await {
-		Ok(found) => {
-			let workspaces = serde_json::json!(found
-				.iter()
-				.map(|w| serde_json::json!({
+	// Local-carrier workspaces (instance.sock discovery, unchanged).
+	let mut entries: Vec<serde_json::Value> = match crate::discovery::discover(&ctx.workspaces_dir, &config_dir).await {
+		Ok(found) => found
+			.iter()
+			.map(|w| {
+				serde_json::json!({
 					"id": w.id,
 					"name": w.name,
 					"last_active_at": w.last_active_at,
 					"live": w.live,
-				}))
-				.collect::<Vec<_>>());
-			ServerMessage::Workspaces { workspaces }
+					// Empty `ide` = local-carrier (this machine). The
+					// phone's switcher groups by it (14.4).
+					"ide": "",
+				})
+			})
+			.collect(),
+		Err(err) => {
+			return ServerMessage::Error {
+				message: format!("discovery failed: {err}"),
+			}
 		}
-		Err(err) => ServerMessage::Error {
-			message: format!("discovery failed: {err}"),
-		},
+	};
+	// Remote-carrier workspaces (enrolled IDEs in the live table, 14.1).
+	// Each is tagged with its owning IDE's id so the phone can group.
+	let live = ctx.live_ides.lock().await;
+	for (ide_id, conn) in live.iter() {
+		for w in &conn.workspaces {
+			entries.push(serde_json::json!({
+				"id": w.id,
+				"name": w.name,
+				"last_active_at": w.last_active_at,
+				"live": true,
+				"ide": ide_id,
+			}));
+		}
+	}
+	ServerMessage::Workspaces {
+		workspaces: serde_json::Value::Array(entries),
 	}
 }
 
@@ -575,6 +751,78 @@ async fn handle_pair(ctx: &ServeCtx, code: &str, label: &str) -> ServerMessage {
 		Err(err) => ServerMessage::Error {
 			message: format!("could not store device: {err}"),
 		},
+	}
+}
+
+/// Verify an enrollment code and mint an IDE token (Phase 14.1). Mirror
+/// of [`handle_pair`] for the IDE↔bridge relationship. The `ide_id` is
+/// the IDE's self-assigned stable id (persisted in its own keyring) so
+/// reconnections rebind to the same registry entry — a phone has no
+/// stable identity to offer, but an IDE does.
+async fn handle_enroll(ctx: &ServeCtx, code: &str, label: &str, ide_id: &str) -> ServerMessage {
+	let mut guard = ctx.enrollment.lock().await;
+	let Some(session) = guard.as_mut() else {
+		return ServerMessage::Error {
+			message: "enrollment is closed; ask the operator to issue a new enrollment code".into(),
+		};
+	};
+	if let Err(err) = session.verify_and_consume(code) {
+		return ServerMessage::Error {
+			message: err.to_string(),
+		};
+	}
+	// Consumed — drop the session so a replay can't re-enroll.
+	*guard = None;
+	drop(guard);
+
+	let ide = EnrolledIde::mint(ide_id, label);
+	match ctx.ides.add(ide) {
+		Ok(stored) => ServerMessage::Enrolled {
+			ide_id: stored.id,
+			token: stored.token,
+		},
+		Err(err) => ServerMessage::Error {
+			message: format!("could not store IDE: {err}"),
+		},
+	}
+}
+
+/// An enrolled IDE reports its live workspaces (Phase 14.1). Verifies
+/// the IDE token, then updates the live-IDE table with the reported
+/// workspace list + this connection's sink (so 14.2's forwarding can
+/// reach the IDE). The IDE re-sends `Register` whenever its open
+/// workspace set changes, keeping the bridge's registry live without
+/// polling.
+async fn handle_register(
+	ctx: &ServeCtx,
+	token: &str,
+	workspaces: Vec<RemoteWorkspace>,
+	sink: tokio::sync::mpsc::Sender<ServerMessage>,
+) -> ServerMessage {
+	let ide = match check_ide_token(ctx, token) {
+		Ok(ide) => ide,
+		Err(reply) => return reply,
+	};
+	let mut live = ctx.live_ides.lock().await;
+	live.insert(ide.id.clone(), IdeConnection { sink, workspaces });
+	tracing::info!(ide_id = %ide.id, "IDE registered workspaces");
+	ServerMessage::Result {
+		value: serde_json::json!({ "registered": true }),
+	}
+}
+
+/// Check a presented IDE token. `Ok(ide)` if it maps to an enrolled
+/// IDE; an `Error` [`ServerMessage`] otherwise. Mirror of
+/// [`check_token`] for IDEs.
+fn check_ide_token(ctx: &ServeCtx, token: &str) -> Result<EnrolledIde, ServerMessage> {
+	match ctx.ides.ide_for_token(token) {
+		Ok(Some(ide)) => Ok(ide),
+		Ok(None) => Err(ServerMessage::Error {
+			message: "unknown IDE token; enroll this IDE first".into(),
+		}),
+		Err(err) => Err(ServerMessage::Error {
+			message: format!("IDE token check failed: {err}"),
+		}),
 	}
 }
 

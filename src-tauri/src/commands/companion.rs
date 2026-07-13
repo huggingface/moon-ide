@@ -27,6 +27,10 @@ pub struct CompanionStatus {
 	pub mdns_url: Option<String>,
 	pub fingerprint: String,
 	pub devices: Vec<DeviceEntry>,
+	/// Enrolled IDEs (Phase 14, ADR 0031). Mirror of `devices` for the
+	/// IDE↔bridge relationship.
+	#[serde(default)]
+	pub ides: Vec<IdeEntry>,
 	#[serde(default)]
 	pub build_id: String,
 }
@@ -38,12 +42,26 @@ pub struct DeviceEntry {
 	pub paired_at_ms: u128,
 }
 
+/// One enrolled IDE (Phase 14). Mirror of `DeviceEntry`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdeEntry {
+	pub id: String,
+	pub label: String,
+	pub enrolled_at_ms: u128,
+}
+
 /// Control request wire shape (matches `moon_bridge::status`).
 #[derive(Serialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 enum ControlRequest {
 	Status,
-	Revoke { device_id: String },
+	Revoke {
+		device_id: String,
+	},
+	/// Revoke an enrolled IDE (Phase 14). Mirror of `Revoke`.
+	RevokeIde {
+		ide_id: String,
+	},
 }
 
 /// Control response wire shape.
@@ -119,6 +137,18 @@ pub async fn companion_status() -> Result<CompanionStatus, MoonError> {
 #[tauri::command]
 pub async fn companion_revoke_device(device_id: String) -> Result<(), MoonError> {
 	match control_request(&ControlRequest::Revoke { device_id }).await {
+		Ok(ControlResponse::Revoked { .. }) | Ok(ControlResponse::Ok) => Ok(()),
+		Ok(ControlResponse::Error { message }) => Err(MoonError::internal(message)),
+		Ok(_) => Ok(()),
+		Err(err) => Err(MoonError::internal(format!("bridge not reachable: {err}"))),
+	}
+}
+
+/// Ask the bridge to revoke an enrolled IDE (Phase 14, ADR 0031). Mirror
+/// of `companion_revoke_device` for the IDE↔bridge relationship.
+#[tauri::command]
+pub async fn companion_revoke_ide(ide_id: String) -> Result<(), MoonError> {
+	match control_request(&ControlRequest::RevokeIde { ide_id }).await {
 		Ok(ControlResponse::Revoked { .. }) | Ok(ControlResponse::Ok) => Ok(()),
 		Ok(ControlResponse::Error { message }) => Err(MoonError::internal(message)),
 		Ok(_) => Ok(()),

@@ -435,11 +435,13 @@ export const ipc = {
 	companion: {
 		status: () => invoke<CompanionStatus>('companion_status'),
 		revokeDevice: (deviceId: string) => invoke<void>('companion_revoke_device', { deviceId }),
+		revokeIde: (ideId: string) => invoke<void>('companion_revoke_ide', { ideId }),
 	},
 } as const;
 
 /** Mobile-companion bridge status, read from the bridge's published
- * status file (Phase 13.4b). `running: false` when the bridge isn't up. */
+ * status file (Phase 13.4b). `running: false` when the bridge isn't up.
+ * The `ides` field is the enrolled-IDE list (Phase 14, ADR 0031). */
 export type CompanionStatus = {
 	running: boolean;
 	pairing_payload: string | null;
@@ -448,4 +450,5 @@ export type CompanionStatus = {
 	mdns_url: string | null;
 	fingerprint: string;
 	devices: { id: string; label: string; paired_at_ms: number }[];
+	ides?: { id: string; label: string; enrolled_at_ms: number }[];
 };

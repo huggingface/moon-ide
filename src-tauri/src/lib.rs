@@ -226,6 +226,7 @@ pub fn run() {
 			commands::slack::slack_post_message,
 			commands::companion::companion_status,
 			commands::companion::companion_revoke_device,
+			commands::companion::companion_revoke_ide,
 			commands::coder::coder_status,
 			commands::coder::coder_folder_summary,
 			commands::coder::coder_start_device_flow,

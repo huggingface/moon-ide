@@ -121,6 +121,11 @@ enum Command {
 		/// connect). Default is to open a pairing window at startup.
 		#[arg(long)]
 		no_pairing: bool,
+		/// Start with enrollment closed (only already-enrolled IDEs can
+		/// connect). Default is to open an enrollment window at
+		/// startup (Phase 14, ADR 0031). Mirror of `--no-pairing`.
+		#[arg(long)]
+		no_enrollment: bool,
 		/// Directory of built PWA assets to serve over HTTPS (the
 		/// companion's `companion/dist`). Omit to run WS-only.
 		#[arg(long)]
@@ -153,8 +158,9 @@ async fn main() -> anyhow::Result<()> {
 			bind,
 			advertise_host,
 			no_pairing,
+			no_enrollment,
 			web_root,
-		} => run_serve(bind, advertise_host, no_pairing, web_root).await,
+		} => run_serve(bind, advertise_host, no_pairing, no_enrollment, web_root).await,
 	}
 }
 
@@ -279,6 +285,7 @@ async fn run_serve(
 	bind: Option<SocketAddr>,
 	advertise_host: Option<String>,
 	no_pairing: bool,
+	no_enrollment: bool,
 	web_root: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
 	// Install the ring crypto provider as the process default before
@@ -307,6 +314,7 @@ async fn run_serve(
 	// for a fixed IP; a network change regenerates once (logged).
 	let tls_identity = tls::load_or_generate(&bridge_dir, detected_ip)?;
 	let devices = pairing::DeviceStore::open()?;
+	let ides = enrollment::IdeStore::open()?;
 
 	let url = format!("wss://{advertise_host}:{}", bind.port());
 	let mdns_url = detected_ip.map(|_| format!("wss://{}:{}", mdns::MDNS_HOSTNAME.trim_end_matches('.'), bind.port()));
@@ -332,6 +340,23 @@ async fn run_serve(
 		(Some(session), Some(payload))
 	};
 
+	// Enrollment session (Phase 14). Mirror of the pairing block above:
+	// issue a single-use code unless `--no-enrollment`, print it for
+	// the operator to share with the IDE's enroll UI.
+	let enrollment_session = if no_enrollment {
+		None
+	} else {
+		let session = enrollment::EnrollmentSession::issue();
+		println!(
+			"Enrollment open for {} seconds. Share this code with an IDE's \"Connect to remote bridge\" UI:",
+			enrollment::ENROLLMENT_CODE_TTL.as_secs()
+		);
+		println!();
+		println!("  {}", session.code());
+		println!();
+		Some(session)
+	};
+
 	if let Some(root) = &web_root {
 		println!("Serving companion PWA from {}", root.display());
 	}
@@ -354,6 +379,8 @@ async fn run_serve(
 		pairing_payload,
 		mdns_url,
 		advertise_ip: detected_ip,
+		ides,
+		enrollment: enrollment_session,
 	})
 	.await
 }
