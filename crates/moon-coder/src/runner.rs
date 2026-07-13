@@ -2190,7 +2190,32 @@ impl CoderHandle {
 		// turn. The panel-side recovery (synthesising
 		// `ToolResult` events) lives in the replay loop below.
 		let orphan_tool_call_ids = sessions::orphan_tool_call_ids(&records);
+		// A cold restart (`!already_mounted`, below) can resume an
+		// interrupted `ask_user` prompt instead of erroring it: the
+		// call's args (questions/options) survive in the Assistant
+		// record, so re-dispatching it re-parks the prompt and the
+		// card re-renders interactive for the user to answer and carry
+		// on. Only `ask_user` is safe to re-run this way (it's pure
+		// parking — no side effects); any other orphaned tool, or a
+		// mixed tail, falls back to the interrupted-result path so we
+		// never blindly re-execute `bash` / file writes / sub-agents.
+		// Computed only for the cold path; a live (already-mounted)
+		// parked prompt is handled by `live_parked_ids` below.
+		let resume_ask_user_calls = if already_mounted {
+			Vec::new()
+		} else {
+			sessions::orphaned_ask_user_calls(&records)
+		};
+		let resume_ask_user_ids: std::collections::HashSet<String> =
+			resume_ask_user_calls.iter().map(|c| c.id.clone()).collect();
 		for orphan_id in &orphan_tool_call_ids {
+			// Skip the ask_user calls we're about to re-dispatch —
+			// injecting an "Interrupted" sentinel here would feed the
+			// model a stale error result alongside the fresh answer the
+			// re-dispatch produces.
+			if resume_ask_user_ids.contains(orphan_id) {
+				continue;
+			}
 			messages.push(ChatMessage::Tool {
 				tool_call_id: orphan_id.clone(),
 				content: sessions::INTERRUPTED_TOOL_RESULT_JSON.to_string(),
@@ -2206,12 +2231,14 @@ impl CoderHandle {
 		// record's `tool_call` event) instead of slapping an
 		// "Interrupted before tool completed" result on them. Empty
 		// for the common reopen / cold-start case.
-		// `in_flight` rides alongside `live_parked_ids` off the same
-		// runtime lookup: it's `true` when this session has a turn
-		// still streaming in the background. The frontend uses it to
-		// keep the sessions-list "running" badge lit after the user
-		// clicks into a running session and backs out — the replay's
-		// trailing `TurnComplete` terminator would otherwise clear it.
+		// `in_flight` is `true` when this session has a turn still
+		// running in the background (already mounted), OR when we're
+		// about to spawn a fresh turn to resume a parked `ask_user`
+		// prompt the user is reopening into. The frontend uses it to
+		// keep the sessions-list "running" / "needs input" badge lit
+		// after the user clicks into the session and backs out — the
+		// replay's trailing `TurnComplete` terminator would otherwise
+		// clear it.
 		let mut in_flight = false;
 		let live_parked_ids: std::collections::HashSet<String> = if already_mounted {
 			if let Some(rt) = fs.runtime(&id).await {
@@ -2388,6 +2415,12 @@ impl CoderHandle {
 			if live_parked_ids.contains(&orphan_id) {
 				continue;
 			}
+			// A cold-resumed `ask_user` prompt is about to be
+			// re-dispatched by the spawned turn loop (see below) —
+			// same idea, don't error its card.
+			if resume_ask_user_ids.contains(&orphan_id) {
+				continue;
+			}
 			replay_events.push(CoderEvent::ToolResult {
 				id: orphan_id,
 				result: serde_json::json!({ "error": "Interrupted before tool completed." }),
@@ -2428,11 +2461,61 @@ impl CoderHandle {
 		// sessions-list badge. It rides at the tail of the batch so
 		// the frontend closes the replay window in the same reduce
 		// pass.
+		// Filter out `ToolCall` events for the `ask_user` calls we're
+		// about to re-dispatch — same reason as `resume_from_assistant`:
+		// the re-dispatch emits fresh `ToolCall` events and the panel
+		// always pushes a new row (never dedups by id), so leaving the
+		// replayed ones in would render duplicate cards.
+		if !resume_ask_user_ids.is_empty() {
+			replay_events.retain(|event| {
+				if let CoderEvent::ToolCall { id, .. } = event {
+					!resume_ask_user_ids.contains(id)
+				} else {
+					true
+				}
+			});
+		}
+		// A resumed `ask_user` prompt is a genuine in-flight turn —
+		// the spawned loop picks it up within milliseconds. Assert
+		// `in_flight` so the frontend keeps the "needs input" / running
+		// badge lit instead of the trailing `TurnComplete` clearing it.
+		if !resume_ask_user_calls.is_empty() {
+			in_flight = true;
+		}
 		replay_events.push(CoderEvent::TurnComplete);
 		sink.send(CoderEvent::Replay {
 			events: replay_events,
 			in_flight,
 		});
+		// Cold-resume an interrupted `ask_user`: spawn a fresh turn
+		// loop whose first iteration re-dispatches the parked prompt.
+		// `handle_ask_user` registers a new oneshot on the
+		// `PromptRegistry`, the replayed card (re-rendered from the
+		// Assistant record above, minus the filtered `ToolCall` — the
+		// re-dispatch's fresh one lands momentarily) is already in its
+		// interactive "waiting" state, and `coder_respond_to_prompt`
+		// resolves the oneshot the moment the user picks an option. The
+		// turn then continues exactly as if the prompt had never been
+		// interrupted — same code path as `resume_from_assistant`.
+		if !resume_ask_user_calls.is_empty() {
+			if let Some(rt) = fs.runtime(&id).await {
+				let cancel = CancellationToken::new();
+				{
+					let mut turn = rt.turn.lock().await;
+					turn.cancel = Some(cancel.clone());
+				}
+				let state = self.state.clone();
+				spawn_turn_loop(
+					state,
+					rt,
+					sink,
+					folder_path.to_path_buf(),
+					cancel,
+					false,
+					Some(resume_ask_user_calls),
+				);
+			}
+		}
 		Ok(summary)
 	}
 

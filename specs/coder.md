@@ -393,6 +393,17 @@ reopening the session re-renders the card in its waiting state
 rather than painting it errored. The session list and folder bar
 show a "needs input" cue that takes precedence over "running".
 
+A cold restart (IDE quit + relaunch) also resumes a parked prompt
+instead of erroring it: the `ask_user` call's args survive in the
+Assistant record, so `open_session` re-dispatches the call via the
+same `resume_tool_calls` path `resume_from_assistant` uses, which
+re-parks a fresh oneshot and the card re-renders interactive.
+Answering it resolves the oneshot and the turn continues. Only
+`ask_user` orphans resume this way — a mixed orphan tail (an
+`ask_user` plus a side-effecting tool that never returned) falls
+back to the interrupted-result path so we never blindly re-run
+tools with side effects.
+
 Prompt guidance: not for clarification the agent could resolve by
 reading files, and not as a "should I proceed?" confirmation — only
 for genuine forks where the user's intent is the missing input.
