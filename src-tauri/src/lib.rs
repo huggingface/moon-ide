@@ -249,6 +249,7 @@ pub fn run() {
 			commands::coder::coder_new_coordinator_session,
 			commands::coder::coder_new_worktree_session,
 			commands::coder::coder_discard_worktree,
+			commands::coder::coder_merge_and_remove_worktree,
 			commands::coder::coder_associate_branch,
 			commands::coder::coder_move_session_to_worktree,
 			commands::coder::coder_set_bash_target_override,

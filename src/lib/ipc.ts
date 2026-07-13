@@ -397,6 +397,8 @@ export const ipc = {
 		newWorktreeSession: (baseBranch?: string) =>
 			invoke<NewWorktreeSession>('coder_new_worktree_session', { baseBranch: baseBranch ?? null }),
 		discardWorktree: (path: string, force: boolean) => invoke<Workspace>('coder_discard_worktree', { path, force }),
+		mergeAndRemoveWorktree: (path: string, baseBranch: string) =>
+			invoke<Workspace>('coder_merge_and_remove_worktree', { path, baseBranch }),
 		associateBranch: () => invoke<CoderSessionSummary | null>('coder_associate_branch'),
 		moveSessionToWorktree: () => invoke<NewWorktreeSession>('coder_move_session_to_worktree'),
 		setBashTargetOverride: (forceHost: boolean) => invoke<boolean>('coder_set_bash_target_override', { forceHost }),

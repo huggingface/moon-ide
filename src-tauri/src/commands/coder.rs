@@ -475,6 +475,68 @@ pub async fn coder_discard_worktree(
 	Ok(state.workspaces.snapshot().await)
 }
 
+/// Merge a worktree's branch into `base_branch` on the parent repo,
+/// then prune the worktree and unbind the folder (ADR 0028). The
+/// worktree's branch is kept — only the working copy is removed.
+///
+/// Runs on the **parent** folder's host: `git switch <base_branch>`
+/// → `git merge --no-edit <worktree_branch>` →
+/// `git worktree remove <path>`. If the merge fails (conflicts,
+/// dirty tree, unknown ref) the error propagates git's stderr
+/// verbatim and the worktree is left intact so the user can resolve
+/// conflicts in the SCM panel and retry.
+///
+/// Returns the updated workspace snapshot so the frontend drops the
+/// nested folder row.
+#[tauri::command]
+pub async fn coder_merge_and_remove_worktree(
+	state: State<'_, AppState>,
+	path: String,
+	base_branch: String,
+) -> Result<moon_protocol::workspace::Workspace, MoonError> {
+	use moon_protocol::git::BranchSwitchTarget;
+	use moon_protocol::workspace::FolderOrigin;
+
+	let entry = state
+		.workspaces
+		.folder_for_path(&path)
+		.await
+		.ok_or_else(|| MoonError::NotFound(format!("folder {path}")))?;
+	let FolderOrigin::Worktree {
+		parent_path, branch, ..
+	} = entry.folder.origin.clone()
+	else {
+		return Err(MoonError::invalid(format!("{path} is not a worktree folder")));
+	};
+	let parent = state
+		.workspaces
+		.folder_for_path(&parent_path)
+		.await
+		.ok_or_else(|| MoonError::invalid("the worktree's parent folder is not bound; can't merge"))?;
+
+	// Switch the parent to the base branch, then merge the
+	// worktree's branch into it. Both run on the parent's host so
+	// they share the same git index lock.
+	parent
+		.host
+		.branch_switch(&BranchSwitchTarget::Local {
+			name: base_branch.clone(),
+		})
+		.await?;
+	parent.host.git_merge_default_branch(&branch).await?;
+
+	// Merge succeeded — prune the worktree + unbind.
+	let remove_path = if crate::commands::container::workspace_container_running(&state).await {
+		moon_core::worktree::worktree_container_path(camino::Utf8Path::new(&parent_path), camino::Utf8Path::new(&path))
+			.unwrap_or_else(|| camino::Utf8PathBuf::from(&path))
+	} else {
+		camino::Utf8PathBuf::from(&path)
+	};
+	parent.host.git_worktree_remove(&remove_path, false).await?;
+	state.workspaces.remove_folder(&path).await?;
+	Ok(state.workspaces.snapshot().await)
+}
+
 /// Move the active folder's visible coder session into its own git
 /// worktree (ADR 0028) — the in-session counterpart to
 /// `coder_new_worktree_session`. The conversation keeps its history

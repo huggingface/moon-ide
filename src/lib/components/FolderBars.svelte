@@ -5,6 +5,7 @@
 	import { workspace } from '../state.svelte';
 	import BranchIcon from './icons/BranchIcon.svelte';
 	import ContainerIcon from './icons/ContainerIcon.svelte';
+	import MergeIcon from './icons/MergeIcon.svelte';
 	import QuestionBubbleIcon from './icons/QuestionBubbleIcon.svelte';
 	import SparklesIcon from './icons/SparklesIcon.svelte';
 	import ProjectComposePopover from './ProjectComposePopover.svelte';
@@ -165,6 +166,13 @@
 				: agentDone
 					? `${folder.path}\n(agent finished — click to view)`
 					: folder.path}
+		{@const defaultRef = workspace.gitBranch.defaultBranchRemoteRef}
+		{@const defaultBranchShort =
+			defaultRef === null
+				? null
+				: defaultRef.indexOf('/') < 0
+					? defaultRef
+					: defaultRef.slice(defaultRef.indexOf('/') + 1)}
 		<li class="bar" class:active={isActive} class:worktree={isWorktree}>
 			<button
 				type="button"
@@ -241,9 +249,23 @@
 				</button>
 			{:else}
 				<!-- Layout placeholder: keeps row width identical to
-				     folders that do have a compose file so the `×`
-				     button doesn't shift on hover. -->
+					     folders that do have a compose file so the `×`
+					     button doesn't shift on hover. -->
 				<span class="indicator placeholder" aria-hidden="true"></span>
+			{/if}
+			{#if isWorktree && defaultBranchShort !== null}
+				<button
+					type="button"
+					class="merge-worktree"
+					title={`Merge ${row.branch} into ${defaultBranchShort} and remove worktree`}
+					aria-label={`Merge ${row.branch} into ${defaultBranchShort} and remove worktree`}
+					onclick={(event) => {
+						event.stopPropagation();
+						void workspace.mergeAndRemoveWorktree(folder.path, defaultBranchShort);
+					}}
+				>
+					<MergeIcon size={13} />
+				</button>
 			{/if}
 			<button
 				type="button"
@@ -517,6 +539,30 @@
 		50% {
 			opacity: 0.4;
 		}
+	}
+	/* Merge-and-remove button on worktree rows. Same hover-reveal
+	   pattern as `.remove` so the two buttons appear together on
+	   hover and vanish when the mouse leaves the row. */
+	.merge-worktree {
+		flex-shrink: 0;
+		width: 22px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		background: transparent;
+		border: none;
+		color: var(--m-fg-subtle);
+		cursor: pointer;
+		opacity: 0;
+		transition: opacity 80ms;
+	}
+	.bar:hover .merge-worktree,
+	.merge-worktree:focus-visible {
+		opacity: 1;
+	}
+	.merge-worktree:hover {
+		color: var(--m-accent);
+		background: var(--m-bg-1);
 	}
 	.remove {
 		flex-shrink: 0;

@@ -1483,6 +1483,43 @@ class WorkspaceState {
 	}
 
 	/**
+	 * Merge a worktree's branch into the base (default) branch on
+	 * the parent repo, then prune the worktree and unbind the
+	 * folder. The worktree's branch is kept — only the working copy
+	 * is removed.
+	 *
+	 * If the merge fails (conflicts, dirty tree), the worktree is
+	 * left intact and the error is surfaced so the user can resolve
+	 * conflicts in the SCM panel and retry.
+	 */
+	async mergeAndRemoveWorktree(path: string, baseBranch: string) {
+		const folder = this.workspace?.folders.find((f) => f.path === path);
+		if (!folder || folder.origin.kind !== 'worktree') {
+			return;
+		}
+		const branch = folder.origin.branch;
+		const ok = await confirm(
+			`Merge ${branch} into ${baseBranch} and remove the worktree?\n\nThe branch is kept — only the working copy is removed.`,
+			{ title: 'Merge & remove worktree', okLabel: 'Merge & remove', cancelLabel: 'Cancel' },
+		);
+		if (!ok) {
+			return;
+		}
+		try {
+			const ws = await ipc.coder.mergeAndRemoveWorktree(path, baseBranch);
+			this.folderStates.delete(path);
+			this.pruneNavEntriesForFolder(path);
+			projectCompose.forget(path);
+			forgetTerminalMemoryFor(path);
+			await this.adoptWorkspaceSnapshot(ws);
+			this.persistAppState();
+			this.flash(`Merged ${branch} into ${baseBranch} and removed worktree.`);
+		} catch (err) {
+			this.flash(`Could not merge & remove worktree: ${formatError(err)}`);
+		}
+	}
+
+	/**
 	 * Apply a freshly returned `Workspace` snapshot from the backend:
 	 * update `this.workspace`, ensure each bound folder has a
 	 * matching `FolderState`, and (re)load the active folder's tree
