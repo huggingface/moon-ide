@@ -1716,6 +1716,56 @@ impl CoderHandle {
 		)
 	}
 
+	/// Clear `worktree_root` + `worktree_branch` on every mounted
+	/// runtime whose header points at `worktree_root`, persist the
+	/// header rewrite, and emit `SessionWorktreeCleared` so the
+	/// frontend patches its cached session state without a full
+	/// reload. Used after merging a worktree's branch and removing
+	/// the checkout — the session now drives its parent folder's
+	/// main tree, so the worktree routing must be dropped before
+	/// the next turn.
+	///
+	/// Walks every `FolderSession` in `sessions_by_folder` (the
+	/// matching sessions are filed under the parent project root,
+	/// but we don't assume that here). Best-effort: a failed
+	/// header rewrite logs and continues.
+	pub async fn clear_worktree_sessions(&self, worktree_root: &str) {
+		let folders: Vec<(Utf8PathBuf, Arc<FolderSession>)> = self
+			.state
+			.sessions_by_folder
+			.read()
+			.await
+			.iter()
+			.map(|(k, v)| (k.clone(), v.clone()))
+			.collect();
+		for (folder_path, fs) in folders {
+			let runtimes: Vec<Arc<SessionRuntime>> = fs.runtimes.read().await.values().cloned().collect();
+			for rt in runtimes {
+				let (id, session_dir, needs_clear) = {
+					let mut session = rt.session.lock().await;
+					if session.header.worktree_root.as_deref() == Some(worktree_root) {
+						session.header.worktree_root = None;
+						session.header.worktree_branch = None;
+						(
+							session.header.id.clone(),
+							session.session_dir.clone(),
+							session.header.clone(),
+						)
+					} else {
+						continue;
+					}
+				};
+				if let Some(dir) = session_dir {
+					if let Err(err) = sessions::rewrite_header(&dir, &needs_clear).await {
+						tracing::warn!(?err, "failed to clear worktree routing on session");
+					}
+				}
+				let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), id.clone());
+				sink.send(CoderEvent::SessionWorktreeCleared { id });
+			}
+		}
+	}
+
 	/// Read the force-host override of `fs`'s visible session
 	/// without lazy-creating a runtime (mirrors the two-step
 	/// look-up `status` uses for `busy`). `false` when no session

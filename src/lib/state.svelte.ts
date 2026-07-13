@@ -1484,9 +1484,9 @@ class WorkspaceState {
 
 	/**
 	 * Merge a worktree's branch into the base (default) branch on
-	 * the parent repo, then prune the worktree and unbind the
-	 * folder. The worktree's branch is kept — only the working copy
-	 * is removed.
+	 * the parent repo, then prune the worktree, delete the branch,
+	 * and unbind the folder. Sessions that were routed to the
+	 * worktree are cleared so they continue on the parent folder.
 	 *
 	 * If the merge fails (conflicts, dirty tree), the worktree is
 	 * left intact and the error is surfaced so the user can resolve
@@ -1499,7 +1499,7 @@ class WorkspaceState {
 		}
 		const branch = folder.origin.branch;
 		const ok = await confirm(
-			`Merge ${branch} into ${baseBranch} and remove the worktree?\n\nThe branch is kept — only the working copy is removed.`,
+			`Merge ${branch} into ${baseBranch} and remove the worktree?\n\nThe branch and working copy will be removed — the merged commits live on ${baseBranch}.`,
 			{ title: 'Merge & remove worktree', okLabel: 'Merge & remove', cancelLabel: 'Cancel' },
 		);
 		if (!ok) {
@@ -1513,7 +1513,7 @@ class WorkspaceState {
 			forgetTerminalMemoryFor(path);
 			await this.adoptWorkspaceSnapshot(ws);
 			this.persistAppState();
-			this.flash(`Merged ${branch} into ${baseBranch} and removed worktree.`);
+			this.flash(`Merged ${branch} into ${baseBranch} and removed worktree + branch.`);
 		} catch (err) {
 			this.flash(`Could not merge & remove worktree: ${formatError(err)}`);
 		}

@@ -214,6 +214,14 @@ pub enum CoderEvent {
 	/// re-opening sees it.
 	SessionTitleUpdated { id: String, title: String },
 
+	/// A session's worktree routing was cleared — its `worktree_root`
+	/// and `worktree_branch` were set to `None` (e.g. after merging
+	/// the worktree's branch and removing the checkout). The frontend
+	/// patches `activeSession` + the sessions-list row without a full
+	/// reload, mirroring `SessionTitleUpdated`. No worktree fields
+	/// means the session now drives its parent folder's main tree.
+	SessionWorktreeCleared { id: String },
+
 	/// The on-disk session list changed (new file, deleted file,
 	/// title bump). Frontend re-fetches via `coder_list_sessions`
 	/// rather than us pushing the full list — keeps the wire

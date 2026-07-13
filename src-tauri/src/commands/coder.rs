@@ -476,15 +476,21 @@ pub async fn coder_discard_worktree(
 }
 
 /// Merge a worktree's branch into `base_branch` on the parent repo,
-/// then prune the worktree and unbind the folder (ADR 0028). The
-/// worktree's branch is kept — only the working copy is removed.
+/// then prune the worktree, delete the branch, and unbind the folder
+/// (ADR 0028). The worktree's commits are now in the base branch, so
+/// neither the working copy nor the branch is needed anymore.
 ///
 /// Runs on the **parent** folder's host: `git switch <base_branch>`
 /// → `git merge --no-edit <worktree_branch>` →
-/// `git worktree remove <path>`. If the merge fails (conflicts,
-/// dirty tree, unknown ref) the error propagates git's stderr
-/// verbatim and the worktree is left intact so the user can resolve
-/// conflicts in the SCM panel and retry.
+/// `git worktree remove <path>` → `git branch -D <worktree_branch>`.
+/// If the merge fails (conflicts, dirty tree, unknown ref) the error
+/// propagates git's stderr verbatim and the worktree is left intact
+/// so the user can resolve conflicts in the SCM panel and retry.
+///
+/// Sessions that were routed to the worktree have their
+/// `worktree_root` / `worktree_branch` cleared so they seamlessly
+/// continue on the parent folder's main tree (now on `base_branch`
+/// with the merged changes).
 ///
 /// Returns the updated workspace snapshot so the frontend drops the
 /// nested folder row.
@@ -525,7 +531,12 @@ pub async fn coder_merge_and_remove_worktree(
 		.await?;
 	parent.host.git_merge_default_branch(&branch).await?;
 
-	// Merge succeeded — prune the worktree + unbind.
+	// Merge succeeded — clear worktree routing on affected sessions
+	// *before* pruning the checkout so the next turn falls back to
+	// the parent folder (now on base_branch with merged changes).
+	state.coder.clear_worktree_sessions(&path).await;
+
+	// Prune the worktree, delete the now-merged branch, and unbind.
 	let remove_path = if crate::commands::container::workspace_container_running(&state).await {
 		moon_core::worktree::worktree_container_path(camino::Utf8Path::new(&parent_path), camino::Utf8Path::new(&path))
 			.unwrap_or_else(|| camino::Utf8PathBuf::from(&path))
@@ -533,6 +544,13 @@ pub async fn coder_merge_and_remove_worktree(
 		camino::Utf8PathBuf::from(&path)
 	};
 	parent.host.git_worktree_remove(&remove_path, false).await?;
+	// Best-effort branch deletion — the merge + worktree removal
+	// already succeeded, so a branch-delete failure (e.g. git
+	// refusing because the branch is checked out elsewhere) is
+	// logged but not surfaced as a hard error.
+	if let Err(err) = parent.host.git_delete_branch(&branch).await {
+		tracing::warn!(?err, branch = %branch, "failed to delete merged worktree branch");
+	}
 	state.workspaces.remove_folder(&path).await?;
 	Ok(state.workspaces.snapshot().await)
 }

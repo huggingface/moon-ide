@@ -3102,6 +3102,23 @@ class CoderPanelState {
 					folder.sessions = folder.sessions.map((s) => (s.id === event.id ? { ...s, title: event.title } : s));
 				}
 				return;
+			case 'session_worktree_cleared':
+				// Patch the session's worktree fields to null without
+				// a full reload — the session now drives its parent
+				// folder's main tree (the worktree was merged + removed).
+				if (session.activeSession?.id === event.id) {
+					session.activeSession = {
+						...session.activeSession,
+						worktree_root: null,
+						worktree_branch: null,
+					};
+				}
+				if (folder.sessions !== null) {
+					folder.sessions = folder.sessions.map((s) =>
+						s.id === event.id ? { ...s, worktree_root: null, worktree_branch: null } : s,
+					);
+				}
+				return;
 			case 'subagent_spawned': {
 				const summary: SubagentSummary = {
 					id: event.subagent_id,

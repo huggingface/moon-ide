@@ -462,6 +462,14 @@ pub trait WorkspaceHost: Send + Sync {
 	/// the active target.
 	async fn git_worktree_remove(&self, path: &Utf8Path, force: bool) -> MoonResult<()>;
 
+	/// Delete a local branch (`git branch -D <name>`). Used after
+	/// merging a worktree session's branch into the base branch and
+	/// pruning the worktree — the branch's commits are now in the
+	/// base, so the branch itself is no longer needed. Errors
+	/// propagate git's stderr verbatim (branch not found, branch
+	/// checked out in a linked worktree, etc.).
+	async fn git_delete_branch(&self, name: &str) -> MoonResult<()>;
+
 	/// Lightweight diff summary of the working tree against `HEAD`,
 	/// suitable for feeding to a small LLM that's suggesting a
 	/// branch / commit name. Output is `git diff HEAD --stat -M -C`
@@ -2019,6 +2027,18 @@ impl WorkspaceHost for LocalHost {
 		})
 		.await
 		.map_err(|e| MoonError::Internal(format!("git_worktree_remove join error: {e}")))?
+	}
+
+	async fn git_delete_branch(&self, name: &str) -> MoonResult<()> {
+		let guard = self.git_lock().await;
+		let root = self.root.clone();
+		let name = name.to_owned();
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			run_git_simple(&root, &["branch", "-D", &name], &format!("git branch -D {name}"))
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_delete_branch join error: {e}")))?
 	}
 
 	async fn git_diff_summary(&self) -> MoonResult<String> {
