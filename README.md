@@ -71,6 +71,14 @@ bun run build:bin
 
 > **Phased delivery rule** — each phase ends with a hand-back to a human reviewer. AI agents do not start the next phase on their own. See [AGENTS.md](AGENTS.md#phased-delivery).
 
+## `moon-base` docker image
+
+Used for workspace containers, if not wanting to run dev processes on host machines.
+
+```
+docker build -t moon-base:dev images/moon-base/
+```
+
 ## Before wider release
 
 - **Publish the `moon-base` Docker image to Docker Hub.** The workspace dev image (`huggingface/moon-base`) must actually exist on Docker Hub so a fresh clone can pull it instead of building locally. See [images/moon-base/README.md](images/moon-base/README.md) and [ADR 0007](specs/decisions/0007-compose-and-moon-base.md).

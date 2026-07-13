@@ -639,7 +639,11 @@ records (and everything after), then mutates the existing runtime's
 orphan-recovery — the kept tool calls are about to be re-dispatched,
 not marked as interrupted). It fires a `SessionLoaded` + `Replay`
 (with `in_flight: true`) so the frontend clears and rebuilds to the
-checkpoint state, then spawns the turn loop on the same runtime with
+checkpoint state — `SessionLoaded` carries the ADR 0028 / ADR 0030
+optional header fields (`worktree_branch`, `committed_branch`,
+`mode`) so the worktree chip and coordinator badge survive the
+rebuild without waiting on a sessions-list refresh — then spawns
+the turn loop on the same runtime with
 the kept `Assistant`'s `tool_calls` as a resume parameter. The model
 is **not** re-prompted for that round-trip — its existing tool calls
 execute fresh against current workspace state, and the turn loop
@@ -665,13 +669,22 @@ Two views sharing the right-side slot (`rightPanel.kind === 'coder'`):
 
 - **Session view** — transcript + composer, with a sticky
   `← Sessions | <title> | +` strip. Default view when a session
-  exists.
+  exists. A coordinator (orchestrator) session — `mode:
+"coordinator"` on the header (ADR 0030) — shows a `coordinator`
+  badge left of the title and a coordinator-specific empty-state
+  hint ("delegates each task to a worker in its own worktree");
+  the worktree chip renders the same as on a regular session.
 - **Sessions list** — a row per persisted session (title + relative
   time), with hover affordances for "open trace" and delete
-  (confirmed), plus the per-row status cues described above.
+  (confirmed), plus the per-row status cues described above. A
+  coordinator row carries a short `coord` badge after the title so
+  orchestrator sessions are visually distinct from hand-started
+  ones.
 
 `+` from either view opens a fresh empty session with focus in the
-composer; empty sessions don't persist until the first message.
+composer; empty sessions don't persist until the first message. The
+sparkles button beside `+` opens a fresh **coordinator** session
+instead.
 
 ### Open the raw trace in the editor
 

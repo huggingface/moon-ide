@@ -2899,6 +2899,17 @@ class CoderPanelState {
 					title: event.title,
 					created_at_ms: event.created_at_ms,
 					updated_at_ms: event.updated_at_ms,
+					// Carry the ADR 0028 / ADR 0030 optional fields
+					// so the worktree chip + coordinator badge +
+					// empty-state hint survive a reload instead of
+					// blanking until the next list refresh. The wire
+					// shape elides them for an ordinary session; the
+					// summary type is `string | null` (no
+					// `undefined`), so normalise absent → null to
+					// satisfy `exactOptionalPropertyTypes`.
+					worktree_branch: event.worktree_branch ?? null,
+					committed_branch: event.committed_branch ?? null,
+					mode: event.mode ?? null,
 				};
 				folder.view = 'session';
 				return;

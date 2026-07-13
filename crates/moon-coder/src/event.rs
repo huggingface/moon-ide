@@ -159,12 +159,24 @@ pub enum CoderEvent {
 	/// created). Frontend clears its row list and starts replaying
 	/// the new session's records into it. Carries a snapshot of
 	/// the active session's metadata so the sticky header can
-	/// render without a separate IPC round trip.
+	/// render without a separate IPC round trip — including the
+	/// ADR 0028 / ADR 0030 optional fields the header badges off
+	/// (`worktree_branch`, `committed_branch`, `mode`), so a
+	/// reopened worktree / coordinator session keeps its badge /
+	/// chip / hint instead of losing them until the next list
+	/// refresh. All three elide for an ordinary session, keeping
+	/// the wire shape compact on the hot path.
 	SessionLoaded {
 		id: String,
 		title: String,
 		created_at_ms: i64,
 		updated_at_ms: i64,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		worktree_branch: Option<String>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		committed_branch: Option<String>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		mode: Option<String>,
 	},
 
 	/// A batch of events delivered as one envelope. Used by session

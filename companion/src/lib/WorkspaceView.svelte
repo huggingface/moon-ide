@@ -48,7 +48,13 @@
 		<div class="list">
 			{#each app.sessions as s (s.id)}
 				<button class="card list-item" onclick={() => app.openSession(s.id)}>
-					<strong>{s.title || 'Untitled session'}</strong>
+					<strong>
+						{s.title || 'Untitled session'}
+						{#if s.mode === 'coordinator'}<span
+								class="badge"
+								title="Coordinator — an orchestrator that spawns and manages worker agents">coord</span
+							>{/if}
+					</strong>
 					<span class="muted">{relativeTime(s.updated_at_ms)}</span>
 				</button>
 			{/each}

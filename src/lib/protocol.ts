@@ -1601,7 +1601,20 @@ export type CoderEvent =
 	| { kind: 'turn_complete' }
 	| { kind: 'aborted' }
 	| { kind: 'error'; message: string }
-	| { kind: 'session_loaded'; id: string; title: string; created_at_ms: number; updated_at_ms: number }
+	| {
+			kind: 'session_loaded';
+			id: string;
+			title: string;
+			created_at_ms: number;
+			updated_at_ms: number;
+			/** ADR 0028 / ADR 0030 optional fields, carried so a
+			 * reopened worktree / coordinator session keeps its
+			 * badge / chip / hint without waiting on a list
+			 * refresh. All absent for an ordinary session. */
+			worktree_branch?: string | null;
+			committed_branch?: string | null;
+			mode?: string | null;
+	  }
 	| { kind: 'replay'; events: CoderEvent[]; in_flight: boolean }
 	| { kind: 'session_title_updated'; id: string; title: string }
 	| { kind: 'session_list_changed' }

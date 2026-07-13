@@ -88,6 +88,20 @@ RUN apt-get update \
  && rm -rf /tmp/git.deb /tmp/git-deb \
  && rm -rf /var/lib/apt/lists/* \
  && git --version
+# The PPA .deb is built with a compiled-in exec-path of
+# `/usr/lib/git-core` (Ubuntu's install location), but we just
+# unpacked the helpers into `/usr/local/lib/git-core`. Without
+# redirection, `git` (2.54) shells sub-commands like `git-stash`
+# out to `/usr/lib/git-core/git-stash` → the Debian-packaged git
+# 2.39 — which then refuses repos tagged with
+# `extensions.relativeWorktrees` (set by `git worktree add
+# --relative-paths`, ADR 0029) with `fatal: unknown repository
+# extension found`. That breaks `git stash` outright and, via
+# lint-staged's `git stash create`, the husky pre-commit hook.
+# Point `GIT_EXEC_PATH` at the 2.54 helpers so every git
+# sub-command — stash, request-pull, submodule, etc. — resolves
+# to the same version as `/usr/local/bin/git`.
+ENV GIT_EXEC_PATH=/usr/local/lib/git-core
 
 # Pre-seed system-wide known_hosts with the SSH host keys for the
 # git providers we actually use, so the first `git fetch` /

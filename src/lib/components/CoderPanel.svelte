@@ -30,7 +30,7 @@
 	import SignOutIcon from './icons/SignOutIcon.svelte';
 	import PlusIcon from './icons/PlusIcon.svelte';
 	import BranchIcon from './icons/BranchIcon.svelte';
-	import SparklesIcon from './icons/SparklesIcon.svelte';
+	import CoordinatorIcon from './icons/CoordinatorIcon.svelte';
 	import CloudUploadIcon from './icons/CloudUploadIcon.svelte';
 	import CloudSyncIcon from './icons/CloudSyncIcon.svelte';
 	import ExternalLinkIcon from './icons/ExternalLinkIcon.svelte';
@@ -1523,6 +1523,15 @@
 		return session.committed_branch ?? session.worktree_branch ?? null;
 	}
 
+	// A coordinator (orchestrator) session — ADR 0030. The backend
+	// stamps `mode: "coordinator"` on the header; this lets the
+	// session-bar title + the sessions-list row badge it so the
+	// "New coordinator session" button is visibly distinct from a
+	// plain new session. `null` (no summary yet) is not one.
+	function isCoordinatorSession(session: CoderSessionSummary | null): boolean {
+		return session?.mode === 'coordinator';
+	}
+
 	// The bound worktree folder currently checked out on `branch`, if
 	// any. Resolved live (not from which header field set it), so it's
 	// correct after a branch is moved into / out of a worktree.
@@ -1934,7 +1943,7 @@
 						title="New coordinator session — an orchestrator that spawns and manages worker agents"
 						aria-label="New coordinator session"
 					>
-						<SparklesIcon />
+						<CoordinatorIcon />
 					</button>
 					<button type="button" class="icon" onclick={onNewSession} title="New session" aria-label="New session">
 						<PlusIcon />
@@ -1982,6 +1991,12 @@
 										<span class="finished-dot" aria-hidden="true"></span>
 									{/if}
 									<span class="session-title-text">{session.title || '(untitled)'}</span>
+									{#if isCoordinatorSession(session)}
+										<span
+											class="session-mode-badge coordinator"
+											title="Coordinator — an orchestrator that spawns and manages worker agents">coord</span
+										>
+									{/if}
 								</div>
 								<div class="session-meta">
 									{#if isAwaitingInput}
@@ -2079,6 +2094,12 @@
 				<ListIcon />
 			</button>
 			<span class="session-bar-title" title={coder.activeSession?.title ?? ''}>
+				{#if isCoordinatorSession(coder.activeSession)}
+					<span
+						class="session-mode-badge coordinator"
+						title="Coordinator — an orchestrator that spawns and manages worker agents">coordinator</span
+					>
+				{/if}
 				{coder.activeSession?.title || 'New session'}
 			</span>
 			{#if visibleSessionSummary}
@@ -2141,7 +2162,7 @@
 				title="New coordinator session — an orchestrator that spawns and manages worker agents"
 				aria-label="New coordinator session"
 			>
-				<SparklesIcon />
+				<CoordinatorIcon />
 			</button>
 			<button type="button" class="icon" onclick={onNewSession} title="New session" aria-label="New session">
 				<PlusIcon />
@@ -2154,6 +2175,13 @@
 						Isolated session in its own git worktree on <code>{visibleSessionSummary.worktree_branch}</code>. The
 						agent's edits and commits stay on that branch and don't touch your main checkout — the worktree shows as a
 						nested folder in the bar above. Send a prompt to start.
+					</p>
+				{:else if isCoordinatorSession(visibleSessionSummary)}
+					<p class="hint">
+						Coordinator session — an orchestrator that spawns and manages worker agents. It can't edit files itself; it
+						delegates each task to a worker in its own git worktree. Describe a goal (e.g. <em
+							>look at the open GitHub issues and open a PR for each</em
+						>) and it will decompose it into worker tasks.
 					</p>
 				{:else}
 					<p class="hint">
@@ -3227,6 +3255,33 @@
 		text-overflow: ellipsis;
 		white-space: nowrap;
 		min-width: 0;
+	}
+	/* Coordinator (orchestrator) mode badge — ADR 0030. Same pill
+	   shape as the sub-agent mode badge so the visual vocabulary
+	   is consistent across the panel. Rendered both in the sticky
+	   session-bar title (full word) and on each list row (short
+	   `coord` so it doesn't crowd the truncated title). */
+	.session-mode-badge {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		flex-shrink: 0;
+		padding: 1px 6px;
+		border-radius: 999px;
+		font-size: 10px;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+		line-height: 1.4;
+	}
+	.session-mode-badge.coordinator {
+		background: var(--m-accent);
+		color: var(--m-bg);
+	}
+	/* In the session-bar title the badge sits left of the title
+	   text; give it a touch more breathing room than the list row. */
+	.session-bar-title .session-mode-badge {
+		margin-right: 2px;
 	}
 	.session-meta {
 		display: flex;

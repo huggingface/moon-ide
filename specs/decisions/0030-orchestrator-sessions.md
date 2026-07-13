@@ -6,11 +6,15 @@ mode, the `mode` header field, the `spawn_worker` / `observe_worker` /
 `steer_worker` / `abort_worker` / `respond_to_worker_prompt` tools, the
 by-id client surface (`send_to` / `abort_session` / `observe_session`),
 and the worktree-creation promotion (`create_worktree_session`) are
-implemented and tested. Not yet on a phase roadmap — this is the first
-concrete realization of the design. The [companion app](0023-mobile-
-companion-bridge.md) is still the forcing function for the broader
-"coder surface as a client surface" cleanup; the orchestrator reuses
-the `CoderHandle` method set directly (in-process, not over WSS).
+implemented and tested. The `mode` field is now surfaced in the UI:
+the sticky session-bar and each sessions-list row badge a coordinator
+session (the `SessionLoaded` event carries `mode` / `worktree_branch` /
+`committed_branch` so the badge survives reload). Not yet on a phase
+roadmap — this is the first concrete realization of the design. The
+[companion app](0023-mobile-companion-bridge.md) is still the forcing
+function for the broader "coder surface as a client surface" cleanup;
+the orchestrator reuses the `CoderHandle` method set directly
+(in-process, not over WSS).
 
 The events-as-messages feeder is also landed: a background task
 subscribes to the coder event broadcast, filters for the orchestrator's

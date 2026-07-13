@@ -1889,6 +1889,9 @@ impl CoderHandle {
 			title: header.title.clone(),
 			created_at_ms: header.created_at_ms,
 			updated_at_ms: header.updated_at_ms,
+			worktree_branch: header.worktree_branch.clone(),
+			committed_branch: header.committed_branch.clone(),
+			mode: header.mode.clone(),
 		});
 		// The kept Assistant's tool_calls will be re-dispatched by
 		// the turn loop — don't emit `ToolCall` events for them in
@@ -2310,6 +2313,9 @@ impl CoderHandle {
 			title: summary.title.clone(),
 			created_at_ms: summary.created_at_ms,
 			updated_at_ms: summary.updated_at_ms,
+			worktree_branch: summary.worktree_branch.clone(),
+			committed_branch: summary.committed_branch.clone(),
+			mode: summary.mode.clone(),
 		});
 		// Collect the entire replay into one `Vec` and ship it as a
 		// single `CoderEvent::Replay`. The frontend delivers each
@@ -2584,6 +2590,9 @@ impl CoderHandle {
 				title: summary.title.clone(),
 				created_at_ms: summary.created_at_ms,
 				updated_at_ms: summary.updated_at_ms,
+				worktree_branch: summary.worktree_branch.clone(),
+				committed_branch: summary.committed_branch.clone(),
+				mode: summary.mode.clone(),
 			});
 			sink.send(CoderEvent::SessionListChanged);
 		}
@@ -2867,6 +2876,9 @@ impl CoderHandle {
 				title: summary.title.clone(),
 				created_at_ms: summary.created_at_ms,
 				updated_at_ms: summary.updated_at_ms,
+				worktree_branch: summary.worktree_branch.clone(),
+				committed_branch: summary.committed_branch.clone(),
+				mode: summary.mode.clone(),
 			});
 			sink.send(CoderEvent::SessionListChanged);
 		}
