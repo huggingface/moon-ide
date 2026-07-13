@@ -1554,12 +1554,17 @@ class WorkspaceState {
 		// Per-project session scoping (ADR 0028): a worktree folder
 		// resolves to its parent project root, so a parent and all its
 		// worktrees share one coder bucket (session list, transcript,
-		// draft). Selecting a worktree changes the file tree / SCM but
-		// not the coder panel. Mirrors the backend's `coder_root_folder`.
+		// draft). Mirrors the backend's `coder_root_folder`.
+		//
+		// The actual active folder path (which may be a worktree) is
+		// also forwarded so the coder panel can auto-switch to the
+		// latest session associated with that specific worktree — or
+		// the latest non-worktree session when the user switches back
+		// to the parent.
 		const active = snapshot.active_folder ?? null;
 		const activeEntry = active !== null ? (snapshot.folders.find((f) => f.path === active) ?? null) : null;
 		const coderRoot = activeEntry?.origin.kind === 'worktree' ? activeEntry.origin.parentPath : active;
-		coder.setActiveFolder(coderRoot ?? null);
+		coder.setActiveFolder(coderRoot ?? null, active);
 		const tAdoptCoder = performance.now();
 		// Drop FolderStates whose folders aren't bound anymore. Two-pass
 		// (collect-then-delete) so we never mutate the map while

@@ -1430,6 +1430,13 @@ pub struct SessionSummary {
 	pub title: String,
 	pub created_at_ms: i64,
 	pub updated_at_ms: i64,
+	/// Absolute path of the git worktree this session's tools run
+	/// against (ADR 0028). `None` for an ordinary session, which
+	/// drives its parent folder's main working tree. The frontend
+	/// uses this to auto-switch the visible session when the user
+	/// selects a worktree folder in the folder bar.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub worktree_root: Option<String>,
 	/// Branch of the git worktree this session runs in, when it's a
 	/// worktree-backed (isolated) session (ADR 0028). `None` for an
 	/// ordinary session. Lets the sessions list badge the row.
@@ -1716,6 +1723,7 @@ pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError>
 		title: header.title,
 		created_at_ms: header.created_at_ms,
 		updated_at_ms: mtime_ms.unwrap_or(header.updated_at_ms),
+		worktree_root: header.worktree_root,
 		worktree_branch: header.worktree_branch,
 		committed_branch: header.committed_branch,
 		mode: header.mode,
@@ -3782,6 +3790,7 @@ mod tests {
 				title: coord.title.clone(),
 				created_at_ms: coord.created_at_ms,
 				updated_at_ms: coord.updated_at_ms,
+				worktree_root: None,
 				worktree_branch: None,
 				committed_branch: None,
 				mode: coord.mode.clone(),
@@ -3794,6 +3803,7 @@ mod tests {
 				title: "t".into(),
 				created_at_ms: 1,
 				updated_at_ms: 1,
+				worktree_root: None,
 				worktree_branch: None,
 				committed_branch: None,
 				mode: None,

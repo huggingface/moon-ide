@@ -145,9 +145,19 @@
 		{@const modified = summary?.modified ?? 0}
 		{@const deleted = summary?.deleted ?? 0}
 		{@const hasChanges = added + modified + deleted > 0}
-		{@const agentAwaitingInput = coder.awaitingInputForFolder(folder.path)}
-		{@const agentRunning = !agentAwaitingInput && coder.busyForFolder(folder.path)}
-		{@const agentDone = !agentAwaitingInput && !agentRunning && coder.attentionPendingForFolder(folder.path)}
+		{@const coderRoot = isWorktree && folder.origin.kind === 'worktree' ? folder.origin.parentPath : folder.path}
+		{@const agentAwaitingInput = isWorktree
+			? coder.awaitingInputForWorktree(coderRoot, folder.path)
+			: coder.awaitingInputForFolder(folder.path)}
+		{@const agentRunning =
+			!agentAwaitingInput &&
+			(isWorktree ? coder.busyForWorktree(coderRoot, folder.path) : coder.busyForFolder(folder.path))}
+		{@const agentDone =
+			!agentAwaitingInput &&
+			!agentRunning &&
+			(isWorktree
+				? coder.attentionPendingForWorktree(coderRoot, folder.path)
+				: coder.attentionPendingForFolder(folder.path))}
 		{@const barTitle = agentAwaitingInput
 			? `${folder.path}\n(agent needs your input)`
 			: agentRunning
@@ -159,7 +169,9 @@
 			<button
 				type="button"
 				class="bar-button"
-				title={isWorktree ? `${folder.path}\n(isolated worktree on ${row.branch})` : barTitle}
+				title={isWorktree
+					? `${folder.path}\n(isolated worktree on ${row.branch})${agentAwaitingInput ? '\n(agent needs your input)' : agentRunning ? '\n(agent running)' : agentDone ? '\n(agent finished — click to view)' : ''}`
+					: barTitle}
 				aria-current={isActive ? 'true' : undefined}
 				aria-expanded={isActive}
 				onclick={() => void workspace.setActiveFolder(folder.path)}

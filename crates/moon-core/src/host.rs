@@ -5195,6 +5195,17 @@ fn run_branch_switch(root: &Utf8Path, target: &BranchSwitchTarget) -> MoonResult
 		};
 		return Err(MoonError::IoError(format!("{label}: {detail}")));
 	}
+	// `gh pr checkout` leaves HEAD on the freshly-created branch, so
+	// `symbolic-ref` gives the right name. Rewrite the per-branch
+	// remote/pushRemote from the fork's HTTPS URL to SSH when `origin`
+	// is SSH — otherwise pull/push route over HTTPS and prompt for
+	// credentials the user never set up (their key is SSH). Best-effort;
+	// a refused write is swallowed inside the helper.
+	if let BranchSwitchTarget::Pr { .. } = target {
+		if let Some(branch) = current_branch_name(root) {
+			normalize_fork_pr_remote_to_ssh(root, &branch);
+		}
+	}
 	Ok(())
 }
 
@@ -5593,6 +5604,105 @@ fn read_branch_upstream(root: &Utf8Path, branch: &str) -> Option<(String, String
 	let remote = read("remote")?;
 	let merge = read("merge")?;
 	Some((remote, merge))
+}
+
+/// `git -C <root> symbolic-ref --quiet --short HEAD` → the current
+/// branch name, or `None` when HEAD is detached (or git is absent).
+/// Inlined rather than shared because every existing call site has a
+/// slightly different surrounding shape and the body is tiny.
+fn current_branch_name(root: &Utf8Path) -> Option<String> {
+	use std::process::Command;
+
+	Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+		.output()
+		.ok()
+		.filter(|o| o.status.success())
+		.and_then(|o| String::from_utf8(o.stdout).ok())
+		.map(|s| s.trim().to_owned())
+		.filter(|s| !s.is_empty())
+}
+
+/// After `gh pr checkout` on a fork PR, `gh` stamps the fork's HTTPS
+/// clone URL into `branch.<name>.remote` / `.pushRemote`. When the
+/// repo's `origin` is SSH, rewrite those to the SSH form so push/pull
+/// use the user's key instead of prompting for HTTPS credentials.
+///
+/// Owner/repo is taken from the fork URL gh wrote (push still targets
+/// the fork — correct for maintainerCanModify PRs); only the scheme
+/// changes. No-op for same-repo PRs, non-GitHub remotes, or an HTTPS
+/// origin. `branch.<name>.merge` is never touched. Config writes are
+/// best-effort: a refused write is swallowed rather than failing the
+/// whole checkout.
+fn normalize_fork_pr_remote_to_ssh(root: &Utf8Path, branch: &str) {
+	use std::process::Command;
+
+	let read = |key: &str| -> Option<String> {
+		Command::new("git")
+			.arg("-C")
+			.arg(root.as_std_path())
+			.args(["config", "--get", &format!("branch.{branch}.{key}")])
+			.output()
+			.ok()
+			.filter(|o| o.status.success())
+			.and_then(|o| String::from_utf8(o.stdout).ok())
+			.map(|s| s.trim().to_owned())
+			.filter(|s| !s.is_empty())
+	};
+
+	// (1) The per-branch remote must be a GitHub HTTPS URL written by gh.
+	let fork_remote = read("remote").unwrap_or_default();
+	let Some(fork_path) = fork_remote
+		.strip_prefix("https://github.com/")
+		.or_else(|| fork_remote.strip_prefix("http://github.com/"))
+	else {
+		return;
+	};
+	// trim trailing '/' and '.git' — mirrors github_web_url's logic.
+	let fork_path = fork_path.trim_end_matches('/').trim_end_matches(".git");
+	if fork_path.is_empty() {
+		return;
+	}
+
+	// (2) `origin` must be a GitHub SSH URL (SCP-style or ssh://).
+	let Some(origin) = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["config", "--get", "remote.origin.url"])
+		.output()
+		.ok()
+		.filter(|o| o.status.success())
+		.and_then(|o| String::from_utf8(o.stdout).ok())
+		.map(|s| s.trim().to_owned())
+		.filter(|s| !s.is_empty())
+	else {
+		return;
+	};
+	let is_github_ssh = origin.strip_prefix("git@github.com:").is_some()
+		|| origin
+			.strip_prefix("ssh://")
+			.map(|r| r.strip_prefix("git@").unwrap_or(r))
+			.is_some_and(|r| r.starts_with("github.com/"));
+	if !is_github_ssh {
+		return;
+	}
+
+	// (3) Build the SSH form, preserving the fork's owner/repo.
+	let ssh = format!("git@github.com:{fork_path}.git");
+
+	// (4) Overwrite the single-valued keys. pushRemote may not yet be
+	// set; set it unconditionally — it's what gh writes and what
+	// `git push` honors. Swallow errors: a refused write must not
+	// fail the checkout.
+	for key in ["remote", "pushRemote"] {
+		let _ = Command::new("git")
+			.arg("-C")
+			.arg(root.as_std_path())
+			.args(["config", &format!("branch.{branch}.{key}"), &ssh])
+			.output();
+	}
 }
 
 /// Resolve the primary remote's web URL, normalised for link-
@@ -8724,6 +8834,206 @@ mod tests {
 			verify.join("CHANGE.md").exists(),
 			"fork's `master` should carry the new commit after push"
 		);
+	}
+
+	/// Read a single-valued git config key in `repo`, or `None` when
+	/// unset. Mirrors `remote_ref_sha`'s shape. Used to assert the
+	/// fork-PR remote/pushRemote/merge keys after normalization.
+	fn read_config(git: &std::path::Path, repo: &std::path::Path, key: &str) -> Option<String> {
+		let out = std::process::Command::new(git)
+			.arg("-C")
+			.arg(repo)
+			.args(["config", "--get", key])
+			.output()
+			.expect("spawn git config --get");
+		if !out.status.success() {
+			return None;
+		}
+		let val = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+		if val.is_empty() {
+			None
+		} else {
+			Some(val)
+		}
+	}
+
+	/// After `gh pr checkout` stamps a fork's HTTPS URL into the
+	/// per-branch config, moon-ide must rewrite it to SSH when `origin`
+	/// is SSH, so pull/push use the user's key instead of prompting.
+	#[tokio::test]
+	async fn fork_pr_checkout_rewrites_https_remote_to_origin_ssh_scheme() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping fork-PR SSH-rewrite test");
+			return;
+		};
+
+		let root = TempDir::new().unwrap();
+		let bare = root.path().join("origin.git");
+		let local = root.path().join("local");
+
+		// bare origin + seed commit on master
+		run_git(
+			&git,
+			root.path(),
+			&["init", "--bare", "-q", "-b", "master", "origin.git"],
+		);
+		let seed = root.path().join("seed");
+		std::fs::create_dir_all(&seed).unwrap();
+		run_git(&git, &seed, &["init", "-q", "-b", "master"]);
+		run_git(&git, &seed, &["config", "user.email", "s@example.com"]);
+		run_git(&git, &seed, &["config", "user.name", "Seed"]);
+		run_git(&git, &seed, &["remote", "add", "origin", bare.to_str().unwrap()]);
+		std::fs::write(seed.join("README.md"), "v1\n").unwrap();
+		run_git(&git, &seed, &["add", "."]);
+		run_git(&git, &seed, &["commit", "-q", "-m", "initial"]);
+		run_git(&git, &seed, &["push", "-q", "-u", "origin", "master"]);
+
+		// clone, then set origin to an SSH URL (simulating the user's real repo)
+		run_git(&git, root.path(), &["clone", "-q", bare.to_str().unwrap(), "local"]);
+		run_git(&git, &local, &["config", "user.email", "l@example.com"]);
+		run_git(&git, &local, &["config", "user.name", "Local"]);
+		// Point origin at an SSH URL — this is the condition that triggers the rewrite.
+		run_git(
+			&git,
+			&local,
+			&["remote", "set-url", "origin", "git@github.com:huggingface/Mongoku.git"],
+		);
+
+		// Simulate `gh pr checkout` on a fork PR: create the branch and stamp
+		// the fork's HTTPS URL into the per-branch config.
+		run_git(&git, &local, &["checkout", "-q", "-b", "danielmendonca/fix-base-path"]);
+		run_git(
+			&git,
+			&local,
+			&[
+				"config",
+				"branch.danielmendonca/fix-base-path.remote",
+				"https://github.com/danielmendonca/Mongoku.git",
+			],
+		);
+		run_git(
+			&git,
+			&local,
+			&[
+				"config",
+				"branch.danielmendonca/fix-base-path.pushRemote",
+				"https://github.com/danielmendonca/Mongoku.git",
+			],
+		);
+		run_git(
+			&git,
+			&local,
+			&[
+				"config",
+				"branch.danielmendonca/fix-base-path.merge",
+				"refs/heads/fix-base-path",
+			],
+		);
+
+		let local_root = Utf8PathBuf::from_path_buf(local.canonicalize().unwrap()).unwrap();
+
+		// Invoke the helper directly (it's the unit under test).
+		normalize_fork_pr_remote_to_ssh(&local_root, "danielmendonca/fix-base-path");
+
+		// remote + pushRemote must now be SSH, pointing at the FORK (danielmendonca), not origin.
+		let remote = read_config(&git, &local, "branch.danielmendonca/fix-base-path.remote");
+		let push_remote = read_config(&git, &local, "branch.danielmendonca/fix-base-path.pushRemote");
+		assert_eq!(remote.as_deref(), Some("git@github.com:danielmendonca/Mongoku.git"));
+		assert_eq!(
+			push_remote.as_deref(),
+			Some("git@github.com:danielmendonca/Mongoku.git")
+		);
+		// merge must be untouched.
+		let merge = read_config(&git, &local, "branch.danielmendonca/fix-base-path.merge");
+		assert_eq!(merge.as_deref(), Some("refs/heads/fix-base-path"));
+	}
+
+	/// Guard: when `origin` is itself HTTPS (no SSH key in play), the
+	/// rewrite must NOT fire — leave the config exactly as `gh` wrote it.
+	#[tokio::test]
+	async fn fork_pr_checkout_leaves_https_remote_when_origin_is_https() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping fork-PR HTTPS-origin guard test");
+			return;
+		};
+
+		let root = TempDir::new().unwrap();
+		let bare = root.path().join("origin.git");
+		let local = root.path().join("local");
+
+		run_git(
+			&git,
+			root.path(),
+			&["init", "--bare", "-q", "-b", "master", "origin.git"],
+		);
+		let seed = root.path().join("seed");
+		std::fs::create_dir_all(&seed).unwrap();
+		run_git(&git, &seed, &["init", "-q", "-b", "master"]);
+		run_git(&git, &seed, &["config", "user.email", "s@example.com"]);
+		run_git(&git, &seed, &["config", "user.name", "Seed"]);
+		run_git(&git, &seed, &["remote", "add", "origin", bare.to_str().unwrap()]);
+		std::fs::write(seed.join("README.md"), "v1\n").unwrap();
+		run_git(&git, &seed, &["add", "."]);
+		run_git(&git, &seed, &["commit", "-q", "-m", "initial"]);
+		run_git(&git, &seed, &["push", "-q", "-u", "origin", "master"]);
+
+		run_git(&git, root.path(), &["clone", "-q", bare.to_str().unwrap(), "local"]);
+		run_git(&git, &local, &["config", "user.email", "l@example.com"]);
+		run_git(&git, &local, &["config", "user.name", "Local"]);
+		// origin stays HTTPS — the rewrite must be a no-op.
+		run_git(
+			&git,
+			&local,
+			&[
+				"remote",
+				"set-url",
+				"origin",
+				"https://github.com/huggingface/Mongoku.git",
+			],
+		);
+
+		run_git(&git, &local, &["checkout", "-q", "-b", "danielmendonca/fix-base-path"]);
+		run_git(
+			&git,
+			&local,
+			&[
+				"config",
+				"branch.danielmendonca/fix-base-path.remote",
+				"https://github.com/danielmendonca/Mongoku.git",
+			],
+		);
+		run_git(
+			&git,
+			&local,
+			&[
+				"config",
+				"branch.danielmendonca/fix-base-path.pushRemote",
+				"https://github.com/danielmendonca/Mongoku.git",
+			],
+		);
+		run_git(
+			&git,
+			&local,
+			&[
+				"config",
+				"branch.danielmendonca/fix-base-path.merge",
+				"refs/heads/fix-base-path",
+			],
+		);
+
+		let local_root = Utf8PathBuf::from_path_buf(local.canonicalize().unwrap()).unwrap();
+		normalize_fork_pr_remote_to_ssh(&local_root, "danielmendonca/fix-base-path");
+
+		// Everything must be unchanged from what `gh` wrote.
+		let remote = read_config(&git, &local, "branch.danielmendonca/fix-base-path.remote");
+		let push_remote = read_config(&git, &local, "branch.danielmendonca/fix-base-path.pushRemote");
+		let merge = read_config(&git, &local, "branch.danielmendonca/fix-base-path.merge");
+		assert_eq!(remote.as_deref(), Some("https://github.com/danielmendonca/Mongoku.git"));
+		assert_eq!(
+			push_remote.as_deref(),
+			Some("https://github.com/danielmendonca/Mongoku.git")
+		);
+		assert_eq!(merge.as_deref(), Some("refs/heads/fix-base-path"));
 	}
 
 	/// Normal `git clone` + branch-with-upstream: `@{u}` resolves

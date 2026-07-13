@@ -944,6 +944,15 @@ class CoderPanelState {
 	 *  projects. */
 	activeFolderPath = $state<string | null>(null);
 
+	/** The **actual** active workspace folder path — which may be a
+	 *  git worktree rather than the coder root. Used to auto-switch
+	 *  the visible session when the user selects a worktree folder:
+	 *  sessions whose `worktree_root` matches this path are
+	 *  preferred; when it equals `activeFolderPath` (or is `null`)
+	 *  the user is on the parent and non-worktree sessions are
+	 *  preferred. `null` when no folder is active. */
+	#activeFolderActual = $state<string | null>(null);
+
 	/** Convenience: forwards to `bucketFor(activeFolderPath)`.
 	 *  Reading any per-folder field through this getter sets up
 	 *  a reactivity dependency on `activeFolderPath`, so a folder
@@ -1038,6 +1047,62 @@ class CoderPanelState {
 			}
 		}
 		return false;
+	}
+
+	/** Worktree-scoped variants of the three folder-level status
+	 *  reads above. Because a worktree folder shares its parent's
+	 *  coder bucket (ADR 0028), the generic `busyForFolder` /
+	 *  `awaitingInputForFolder` / `attentionPendingForFolder`
+	 *  reflect *any* session in the parent bucket — not just the
+	 *  one whose `worktree_root` matches the worktree row the user
+	 *  is looking at. These filter by `worktreeRoot` so the folder
+	 *  bar's agent-state glyph on a worktree row reflects only the
+	 *  session(s) running in that specific worktree. */
+	busyForWorktree(coderRoot: string, worktreeRoot: string): boolean {
+		const f = this.bucketFor(coderRoot);
+		for (const [id, session] of f.sessionsById) {
+			if (session.busy && this.#sessionWorktreeRoot(f, id) === worktreeRoot) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	awaitingInputForWorktree(coderRoot: string, worktreeRoot: string): boolean {
+		const f = this.bucketFor(coderRoot);
+		for (const [id, session] of f.sessionsById) {
+			if (session.awaitingInput && this.#sessionWorktreeRoot(f, id) === worktreeRoot) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	attentionPendingForWorktree(coderRoot: string, worktreeRoot: string): boolean {
+		const f = this.bucketFor(coderRoot);
+		for (const [id, session] of f.sessionsById) {
+			if (session.attentionPending && this.#sessionWorktreeRoot(f, id) === worktreeRoot) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** Resolve the `worktree_root` for a session id within a folder
+	 *  bucket. Checks the session bucket's `activeSession` summary
+	 *  first (set by `session_loaded` / `openSession`), then falls
+	 *  back to the folder's `sessions` list. Returns `null` for an
+	 *  ordinary (non-worktree) session. */
+	#sessionWorktreeRoot(folder: FolderState, sessionId: string): string | null {
+		const bucket = folder.sessionsById.get(sessionId);
+		if (bucket?.activeSession) {
+			return bucket.activeSession.worktree_root ?? null;
+		}
+		const list = folder.sessions;
+		if (list) {
+			return list.find((s) => s.id === sessionId)?.worktree_root ?? null;
+		}
+		return null;
 	}
 
 	/** "Has an agent in this folder finished a turn that the user
@@ -1823,9 +1888,18 @@ class CoderPanelState {
 	 *  through `current` after this update, so swapping projects
 	 *  is "render the new bucket's `$state` against the panel" —
 	 *  the previous folder's running turn keeps streaming events
-	 *  into its own bucket in the background. */
-	setActiveFolder(path: string | null): void {
+	 *  into its own bucket in the background.
+	 *
+	 *  `activeFolderActual` is the real workspace path the user
+	 *  selected — which may be a git worktree that resolves to
+	 *  `path` (the parent / coder root) for bucket purposes. When
+	 *  it differs from `path`, the panel auto-switches the visible
+	 *  session to the latest one whose `worktree_root` matches;
+	 *  when it equals `path`, non-worktree sessions are preferred
+	 *  instead. See ADR 0028 for the per-project scoping rationale. */
+	setActiveFolder(path: string | null, activeFolderActual?: string | null): void {
 		this.activeFolderPath = path;
+		this.#activeFolderActual = activeFolderActual ?? path;
 		// Clear any "agent finished, not seen yet" badge on the
 		// folder we're switching to — the user is now looking
 		// (or about to look). We only consult an existing bucket
@@ -1855,6 +1929,14 @@ class CoderPanelState {
 			// `markWorkspaceReady` flushes the active folder once
 			// the loop is done.
 			void this.#hydrateFolder(path);
+			// If the folder was already hydrated (the user is
+			// switching between a parent and its worktrees, which
+			// share one bucket), proactively switch the visible
+			// session to match the selected folder. First-time
+			// hydration handles this via `#hydrateSession`.
+			if (this.#hydratedFolders.has(path) && this.#workspaceReady) {
+				void this.#selectSessionForActiveFolder();
+			}
 		}
 	}
 
@@ -1925,6 +2007,59 @@ class CoderPanelState {
 		}
 	}
 
+	/** Pick the latest session matching the actual active folder's
+	 *  worktree context and switch the visible session to it.
+	 *
+	 *  When the active folder is a worktree (`#activeFolderActual`
+	 *  differs from `activeFolderPath`), the latest session whose
+	 *  `worktree_root` matches is preferred. When the user is on the
+	 *  parent (`#activeFolderActual` equals `activeFolderPath` or
+	 *  is `null`), the latest non-worktree session is preferred.
+	 *
+	 *  No-op when the sessions list hasn't loaded yet (first-time
+	 *  hydration handles it via `#hydrateSession`), or when the
+	 *  current visible session already matches. When no matching
+	 *  session exists, the panel falls back to the sessions list
+	 *  view so the user can pick one or start a new one. */
+	async #selectSessionForActiveFolder(): Promise<void> {
+		const folder = this.current;
+		const sessions = folder.sessions;
+		if (sessions === null || sessions.length === 0) {
+			return;
+		}
+		const match = this.#latestSessionForActiveFolder(sessions);
+		if (match !== null) {
+			// Already viewing the right session — nothing to do.
+			if (folder.visibleSessionId === match.id) {
+				return;
+			}
+			await this.openSession(match.id);
+		} else {
+			// No matching session for this worktree context — show
+			// the sessions list so the user can pick or start one.
+			folder.visibleSessionId = null;
+			folder.view = 'list';
+		}
+	}
+
+	/** Find the most recently updated session whose `worktree_root`
+	 *  matches the actual active folder. When the active folder is
+	 *  the parent (not a worktree), matches sessions with no
+	 *  `worktree_root` instead. Returns `null` when none match. */
+	#latestSessionForActiveFolder(sessions: CoderSessionSummary[]): CoderSessionSummary | null {
+		const isWorktree = this.#activeFolderActual !== null && this.#activeFolderActual !== this.activeFolderPath;
+		const target = isWorktree ? this.#activeFolderActual : null;
+		let best: CoderSessionSummary | null = null;
+		for (const s of sessions) {
+			if ((s.worktree_root ?? null) === target) {
+				if (best === null || s.updated_at_ms > best.updated_at_ms) {
+					best = s;
+				}
+			}
+		}
+		return best;
+	}
+
 	/** Idempotent per-folder hydration. Once the workspace folder
 	 *  loop has settled, calling this for the active folder runs
 	 *  the initial `refreshStatus` + `#hydrateSession` pair that
@@ -1948,11 +2083,16 @@ class CoderPanelState {
 
 	/** First-mount session hydration for the **active folder**.
 	 *  Tries to restore the active folder's in-memory session
-	 *  the backend already has (e.g. survived an HMR reload);
-	 *  if there's none, falls back to the remembered
-	 *  `last_session_by_folder[<active>]` from `AppState`;
-	 *  if that's also missing or no longer exists, shows the
-	 *  sessions list view. Best-effort throughout.
+	 *  the backend already has (e.g. survived an HMR reload),
+	 *  but only if it matches the worktree context — when the
+	 *  active folder is a worktree, the session's
+	 *  `worktree_root` must match that worktree's path, and
+	 *  when it's the parent, the session must be a non-worktree
+	 *  session. If the backend's session doesn't match (or
+	 *  there's none), loads the sessions list and picks the
+	 *  latest matching one. Falls back to the sessions list
+	 *  view when no matching session exists. Best-effort
+	 *  throughout.
 	 *
 	 *  Per-folder per the multi-session design: each folder
 	 *  hydrates independently. Switching folders doesn't
@@ -1960,71 +2100,65 @@ class CoderPanelState {
 	 *  their bucket as it stands. */
 	async #hydrateSession(): Promise<void> {
 		const folder = this.current;
+		// Determine the worktree context: when the actual active
+		// folder is a worktree, only sessions whose
+		// `worktree_root` matches are candidates; when it's the
+		// parent, only non-worktree sessions are.
+		const isWorktree = this.#activeFolderActual !== null && this.#activeFolderActual !== this.activeFolderPath;
+		const targetRoot = isWorktree ? this.#activeFolderActual : null;
 		try {
 			const active = await ipc.coder.activeSession();
 			if (active) {
-				// Adopt the backend's visible-session id. The
-				// session bucket's transcript / todos / etc. are
-				// not populated here — the live replay path
-				// (`open_session` → `session_loaded` + replay
-				// events) handles that whenever the user actually
-				// clicks into the session, and an already-
-				// running background turn lazy-creates its bucket
-				// on its first inbound event.
-				folder.visibleSessionId = active.id;
-				folder.view = 'session';
-				// Seed the bucket's `activeSession` metadata so
-				// the header reads sensibly before the user
-				// triggers a replay.
-				this.sessionStateFor(this.activeFolderPath ?? NO_FOLDER_KEY, active.id).activeSession = active;
-				return;
+				const activeRoot = active.worktree_root ?? null;
+				if (activeRoot === targetRoot) {
+					// Backend's visible session matches the
+					// worktree context — adopt it directly. The
+					// session bucket's transcript / todos / etc.
+					// are not populated here — the live replay
+					// path (`open_session` → `session_loaded` +
+					// replay events) handles that whenever the
+					// user actually clicks into the session, and
+					// an already-running background turn lazy-
+					// creates its bucket on its first inbound
+					// event.
+					folder.visibleSessionId = active.id;
+					folder.view = 'session';
+					// Seed the bucket's `activeSession` metadata
+					// so the header reads sensibly before the
+					// user triggers a replay.
+					this.sessionStateFor(this.activeFolderPath ?? NO_FOLDER_KEY, active.id).activeSession = active;
+					return;
+				}
+				// Backend's visible session is for a different
+				// worktree context — fall through to the
+				// sessions-list-based selection below rather
+				// than showing the wrong session.
 			}
 		} catch {
-			// fall through to last-session pointer
+			// fall through to sessions-list selection
 		}
-		try {
-			const appState = await ipc.appState.load();
-			const folderKey = this.activeFolderPath ?? NO_FOLDER_KEY;
-			const id = appState.coder.last_session_by_folder[folderKey];
-			if (id) {
+		// Load the sessions list so we can pick by worktree_root.
+		await this.refreshSessions();
+		const sessions = folder.sessions;
+		if (sessions !== null && sessions.length > 0) {
+			const match = this.#latestSessionForActiveFolder(sessions);
+			if (match !== null) {
 				try {
-					// Call the IPC directly rather than going
-					// through `this.openSession(id)`. The latter
-					// has its own try/catch that surfaces failures
-					// as an inline error row — correct for an
-					// explicit user click, but wrong for silent
-					// hydration: the row would mount with the
-					// error already in `rows` and the user would
-					// have to back out manually to recover. Direct
-					// IPC lets the error bubble to the catch below
-					// so we fall through to the sessions list
-					// instead.
 					const ipcStart = performance.now();
-					const summary = await ipc.coder.openSession(id);
+					const summary = await ipc.coder.openSession(match.id);
 					folder.visibleSessionId = summary.id;
 					folder.view = 'session';
-					const bucket = this.sessionStateFor(folderKey, summary.id);
+					const bucket = this.sessionStateFor(this.activeFolderPath ?? NO_FOLDER_KEY, summary.id);
 					bucket.activeSession = summary;
-					// Profiling parity with the explicit-click path so the
-					// startup-hydrate open also reports its `ipc=` time.
 					bucket.openIpcMs = performance.now() - ipcStart;
 					return;
 				} catch {
-					// Stale pointer — the session no longer exists
-					// on disk (manual rm, dev-cleanup of
-					// `~/.local/share/moon-ide/`, etc.). Fall
-					// through to the list view; the pointer will
-					// be overwritten the next time the user opens
-					// or sends in a session.
+					// Session vanished between list and open —
+					// fall through to the list view.
 				}
 			}
-		} catch {
-			// AppState load failures are already toast-surfaced
-			// from `state.svelte.ts:restoreAppState` on the main
-			// path; no need to double-toast here.
 		}
-		await this.refreshSessions();
-		folder.view = (folder.sessions?.length ?? 0) > 0 ? 'list' : 'session';
+		folder.view = (sessions?.length ?? 0) > 0 ? 'list' : 'session';
 	}
 
 	async startDeviceFlow(): Promise<void> {
@@ -2907,6 +3041,7 @@ class CoderPanelState {
 					// summary type is `string | null` (no
 					// `undefined`), so normalise absent → null to
 					// satisfy `exactOptionalPropertyTypes`.
+					worktree_root: event.worktree_root ?? null,
 					worktree_branch: event.worktree_branch ?? null,
 					committed_branch: event.committed_branch ?? null,
 					mode: event.mode ?? null,

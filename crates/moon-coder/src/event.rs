@@ -172,6 +172,8 @@ pub enum CoderEvent {
 		created_at_ms: i64,
 		updated_at_ms: i64,
 		#[serde(default, skip_serializing_if = "Option::is_none")]
+		worktree_root: Option<String>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
 		worktree_branch: Option<String>,
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		committed_branch: Option<String>,

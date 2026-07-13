@@ -1608,9 +1608,10 @@ export type CoderEvent =
 			created_at_ms: number;
 			updated_at_ms: number;
 			/** ADR 0028 / ADR 0030 optional fields, carried so a
-			 * reopened worktree / coordinator session keeps its
-			 * badge / chip / hint without waiting on a list
-			 * refresh. All absent for an ordinary session. */
+			 *  reopened worktree / coordinator session keeps its
+			 *  badge / chip / hint without waiting on a list
+			 *  refresh. All absent for an ordinary session. */
+			worktree_root?: string | null;
 			worktree_branch?: string | null;
 			committed_branch?: string | null;
 			mode?: string | null;
@@ -1747,6 +1748,15 @@ export type CoderSessionSummary = {
 	title: string;
 	created_at_ms: number;
 	updated_at_ms: number;
+	/**
+	 * Absolute path of the git worktree this session's tools run
+	 * against, for an isolated (worktree-backed) session (ADR 0028).
+	 * Absent for an ordinary session. The coder panel uses this to
+	 * auto-switch the visible session when the user selects a worktree
+	 * folder in the folder bar. Snake_case to match the Rust wire
+	 * struct.
+	 */
+	worktree_root?: string | null;
 	/**
 	 * Branch of the git worktree this session runs in, for an
 	 * isolated (worktree-backed) session (ADR 0028). Absent for an
