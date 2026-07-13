@@ -1,6 +1,9 @@
 # Companion app (mobile)
 
-STATUS: planned — design only, no code yet. Decision record:
+STATUS: shipped (Phase 13, v1) — local bridge + pairing + PWA. Remote
+/ relay mode is Phase 14; decision record:
+[ADR 0031 — remote / relay bridge topology](decisions/0031-remote-bridge-relay.md).
+Original v1 decision:
 [ADR 0023 — mobile companion via `moon-bridge`](decisions/0023-mobile-companion-bridge.md).
 Sub-phase work breakdown:
 [roadmaps/phase-13-mobile-companion.md](roadmaps/phase-13-mobile-companion.md).
@@ -179,24 +182,162 @@ requested surface:
 - **Workspace switcher.** The list of running and launchable
   workspace processes, from the `instance.sock` enumeration.
 
+## Remote / relay mode (Phase 14)
+
+The v1 bridge is host-local: the IDE spawns it, it enumerates
+`instance.sock` files on the shared filesystem, it dies with the last
+IDE. That rests on one assumption — **bridge and IDE share a host**, so
+the bridge can _find_ IDEs by reading a directory and _reach_ them over
+a Unix socket.
+
+Remote mode drops that assumption. The bridge runs somewhere else (a
+relay box on the VPN, a small always-on machine), and **both the IDE(s)
+and the phone(s) connect to it as clients.** The motivating
+properties: the bridge is not bound to one IDE (multiple IDEs enroll
+with the same bridge; the phone sees all their workspaces in one
+switcher), and local-vs-remote is an operator choice, not a build
+property. Local mode is exactly ADR 0024's behaviour and is unchanged.
+Decision record: [ADR 0031](decisions/0031-remote-bridge-relay.md).
+
+### Relay hub, not headless core
+
+The remote bridge is a **relay**: it forwards JSON-RPC between phones
+and IDEs over WebSocket connections. It holds **no coder state, no
+sessions, no git layer** — those stay on the IDE host, exactly where
+they are today. This is the load-bearing distinction from the "headless
+`moon-core`" shape the old "Cloud / always-on future" prose speculated
+about (see below). The requester asked for a bridge that can run
+remotely and serve multiple IDEs, **not** for the coder to move off the
+laptop; relay hub answers the actual ask with the minimum moving part.
+
+```
+remote / relay mode:
+
+ IDE-A (laptop) ──(outbound WSS, enrolled)──► bridge
+ IDE-B (laptop) ──(outbound WSS, enrolled)──► bridge
+ phone ──(WSS, paired)────────────────────────► bridge
+
+ the bridge routes call/subscribe from a phone to the IDE that owns
+ the target workspace; events stream back. The coder loop never moves
+ off the IDE host.
+```
+
+### Discovery inverts
+
+Local mode discovers IDEs by enumerating `instance.sock` files
+(possible only because bridge and IDE share a host). Remote mode
+**cannot** enumerate a remote filesystem, so discovery inverts: **the
+IDE dials out to the bridge and registers its workspaces.** The bridge
+holds a `WorkspaceRegistry` fed by two carriers:
+
+- **Local carrier** — the `instance.sock` enumeration (today's path,
+  unchanged).
+- **Remote carrier** — the set of currently-enrolled IDE connections,
+  each reporting its live workspaces.
+
+`call`/`subscribe` route to whichever carrier owns the target
+workspace: local-carrier over the Unix socket (`relay::call`,
+unchanged); remote-carrier over the held-open IDE WebSocket (a new
+forwarding path). The JSON-RPC framing on both hops is identical —
+the payoff of ADR 0023's framing decision. The phone's `workspaces`
+reply is the union, each entry namespaced by IDE so the switcher can
+group them.
+
+### Enrollment mirrors pairing
+
+Today only phones authenticate (TOFU cert pin + short single-use code →
+long-lived revocable bearer token). Remote mode adds the **symmetric**
+relationship (IDE ↔ bridge) using the same vocabulary, so there is one
+security model, not two:
+
+1. Bridge generates its TLS keypair + self-signed cert (unchanged).
+2. Operator runs `moon-bridge enroll-code` (mirror of `pair-code`) →
+   short-lived (120 s), single-use enrollment code.
+3. IDE's "Connect to remote bridge" affordance (command palette entry,
+   not a keybinding — Ctrl+T is `next_edit_complete`) takes the bridge
+   URL + code. The IDE **TOFU-pins the bridge cert** (same as a phone),
+   presents the code, the bridge mints a long-lived **IDE token** in the
+   bridge keyring at `service=moon-ide, account=companion-ides` (a 1:1
+   mirror of `companion-devices`).
+4. The IDE stores its token in **its own** keyring and reconnects with
+   it on restart — no re-enrollment per launch.
+5. A **Paired IDEs** list with per-IDE revoke is the management surface,
+   alongside the existing paired-devices list.
+
+`EnrolledIde` / `IdeStore` mirror `PairedDevice` / `DeviceStore`. The
+enrollment handshake (`enroll` → `enrolled`) mirrors `pair` → `paired`.
+**No per-method ACL** behind enrollment — same threat model as pairing:
+an enrolled IDE can drive the coder, which runs anything via `bash`.
+Enrollment is the boundary; what the relay exposes is a scope decision,
+not a safety one. mTLS (client certs for IDEs) is a documented future,
+not v1 — bearer tokens match the existing posture and are simpler to
+rotate/revoke.
+
+### Wire additions
+
+All additions are **new message tags** alongside the existing `pair` /
+`workspaces` / `call` / `subscribe`; none change existing shapes, so a
+phone that only knows today's protocol keeps working. `crates/moon-protocol/`
+stays the single source of truth (invariant 4); the WS message enums in
+`serve.rs` are the bridge's own transport adapter, not a divergent
+schema.
+
+- `Enroll { code, label, ide_id }` → `Enrolled { ide_id, token }`
+  (IDE presents an enrollment code + a stable self-assigned `ide_id` so
+  reconnections rebind to the same registry entry).
+- `Register { token, workspaces }` — an enrolled IDE reports its live
+  workspaces (slug + name + last-active). Sent on connect and whenever
+  the IDE's workspace set changes.
+- `Call` / `Subscribe` gain an optional `ide` field (the owning IDE's
+  id, or empty for local-carrier). The bridge resolves the carrier from
+  `(ide, workspace)`.
+- `Workspaces` reply — each entry gains an `ide` field; the phone's
+  switcher groups by it.
+
+The bridge ↔ IDE hop reuses the same WS framing; the IDE is a WS
+**client** (a new persistent outbound-connection module in the IDE), not
+a listener. It sends `Register` on connect + on workspace-set changes,
+and answers `call`/`subscribe` frames the bridge forwards to it by
+running them against the local `BridgeRpcHandler` (the same `BridgeRpc`
+the focus listener dispatches today) and sending the reply back up the
+socket. The IDE-side `BridgeRpcHandler` is reused unchanged; the only
+new IDE code is the persistent WS client + the enrollment UI.
+
+### What remote mode deliberately doesn't do
+
+- **Move the coder loop off the IDE.** Sessions, the JSONL, the git
+  layer all stay on the IDE host. The bridge forwards bytes; it does
+  not adopt the loop. This preserves the detached-loop constraint below
+  rather than building it.
+- **Auto-forward IDE listening ports through the bridge.** Violates
+  the explicit-forward invariant (invariant 3). The bridge is one
+  deliberate, enrollment-gated surface; IDEs do not expose their own
+  ports to the relay.
+- **Public-internet exposure.** Same v1 exclusion as local mode:
+  VPN / trusted network only.
+
 ## Cloud / always-on future
 
-The likely shape of "I want to kick off work, close the laptop, and
-keep going from the phone": a cloud dev machine runs **headless
-`moon-core`**, and both the laptop UI and the phone are _attaching
-clients_ over the same JSON-RPC surface — the laptop as a remote
-host (the `moon-remote` story already in
-[`architecture.md`](architecture.md#components)), the phone as a
-companion. Same schema, same channel framing; very likely the same
-daemon. `moon-bridge` and `moon-remote` are converging on one
-"headless core serving JSON-RPC over a channel" shape and may
-merge. This is **why the bridge ↔ process hop uses JSON-RPC framing
-now** — so the cloud box is a transport swap (local socket → WSS →
-SSH tunnel), not a second network transport that obsoletes the
-first.
+The _next_ shape after relay mode — "I want to kick off work, close the
+laptop, and keep going from the phone" — would move the coder loop
+itself off the laptop: a cloud dev machine runs **headless `moon-core`**,
+and both the laptop UI and the phone are _attaching clients_ over the
+same JSON-RPC surface. Same schema, same channel framing; very likely
+the same daemon. `moon-bridge` and `moon-remote` would converge on one
+"headless core serving JSON-RPC over a channel" shape and may merge.
 
-This is **not** v1. v1 is a laptop-local bridge; closing the laptop
-closes it, as asked. Only the framing decision is locked in early.
+This is **not** the relay-hub mode above. Relay hub (Phase 14) keeps the
+loop on the IDE and only forwards bytes; headless core moves the loop
+to the bridge machine. They share the JSON-RPC framing decision (that's
+why it was locked in early), but headless core is a much larger change
+that answers "work with the laptop closed, the loop elsewhere" — a
+question nobody has asked yet. If it's later requested, it supersedes
+ADR 0031 with a new one; the framing both rely on carries forward
+unchanged.
+
+This is **not** v1 or v1.5 (Phase 14). Only the framing decision is
+locked in early, so neither the relay hub nor the headless core pays
+for a second network transport.
 
 Two prerequisites the cloud future needs, written down so v1
 doesn't accidentally design them out:
@@ -212,7 +353,8 @@ doesn't accidentally design them out:
   Detached / overnight runs need the loop re-attachable across
   client connect/disconnect; the constraint for now is simply
   **don't deepen the loop ↔ process coupling** — the bridge work is
-  where that would otherwise creep in.
+  where that would otherwise creep in. Remote / relay mode (Phase 14)
+  honours this: the bridge forwards bytes and never adopts the loop.
 - **Sessions stay on the machine that runs the core.** The JSONL
   lives next to whichever `moon-core` owns the loop; clients render
   it, they don't own it. Already true today.
@@ -252,5 +394,9 @@ Prose, not commitments — revisit when someone asks:
   and the bridge's discovery mechanism.
 - [ADR 0021](decisions/0021-git-editor-forward.md) — precedent for
   extending the per-workspace socket's verb set.
+- [ADR 0024](decisions/0024-bridge-lifecycle.md) — the IDE-owns-it
+  lifecycle remote mode preserves unchanged for local operation.
+- [ADR 0031](decisions/0031-remote-bridge-relay.md) — the relay-hub
+  topology + IDE-enrollment auth for remote mode.
 - [`coder.md`](coder.md) — the coder surface the phone renders;
   device-flow + keyring patterns the pairing flow mirrors.

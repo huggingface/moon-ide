@@ -2,7 +2,8 @@
 //! moon-ide's coder + git surface to a mobile companion app over
 //! the LAN.
 //!
-//! Phase 13 (mobile companion). Shipped so far:
+//! Phase 13 (mobile companion) + Phase 14 (remote / relay bridge).
+//! Shipped so far:
 //!
 //! - 13.0 — workspace discovery (`list`): enumerate the per-workspace
 //!   `instance.sock` files moon-ide maintains (ADR 0014) and report
@@ -12,15 +13,21 @@
 //!   kind on the `moon-remote`-style JSON shape (ADR 0023).
 //! - 13.3 (core) — pairing (`pair` / `devices` / `revoke`): mint and
 //!   store revocable per-device bearer tokens in the OS keyring.
+//! - 14.0 (core) — IDE enrollment (`enroll-code` / `ides` /
+//!   `revoke-ide`): the symmetric counterpart for enrolling IDEs with
+//!   a remote relay bridge (ADR 0031).
 //!
-//! Still to come: the LAN HTTPS + WebSocket listener with TLS (13.2)
-//! and the companion PWA (13.4 / 13.5).
+//! Still to come: the LAN HTTPS + WebSocket listener with TLS (13.2,
+//! already wired into `serve`), the companion PWA (13.4 / 13.5), and
+//! the remote-relay wiring (14.1+: the bridge accepting enrolled IDEs
+//! and forwarding `call`/`subscribe` to them).
 //!
 //! See [`specs/companion.md`](../../../specs/companion.md),
 //! [`specs/roadmaps/phase-13-mobile-companion.md`](../../../specs/roadmaps/phase-13-mobile-companion.md),
 //! and [ADR 0023](../../../specs/decisions/0023-mobile-companion-bridge.md).
 
 mod discovery;
+mod enrollment;
 mod http;
 mod mdns;
 mod pairing;
@@ -84,6 +91,21 @@ enum Command {
 	/// into the pairing QR). Prints the code and its TTL. The verify
 	/// half runs in the WSS listener (13.2).
 	PairCode,
+	/// Issue a short-lived enrollment code for an IDE to present when
+	/// connecting to this bridge as a remote relay (Phase 14, ADR
+	/// 0031). Mirror of `pair-code` for the IDE↔bridge relationship.
+	/// Prints the code and its TTL; the verify half runs in the WSS
+	/// listener (14.1).
+	EnrollCode,
+	/// List enrolled IDEs (id, label, enrolled-at). Tokens are never
+	/// printed here. Mirror of `devices`.
+	Ides,
+	/// Revoke an enrolled IDE by id (as shown by `ides`). Mirror of
+	/// `revoke`.
+	RevokeIde {
+		/// IDE id to revoke.
+		id: String,
+	},
 	/// Run the LAN WSS listener. Issues a pairing code at startup
 	/// (prints the QR payload), then serves until killed.
 	Serve {
@@ -124,6 +146,9 @@ async fn main() -> anyhow::Result<()> {
 		Command::Devices => run_devices(),
 		Command::Revoke { id } => run_revoke(&id),
 		Command::PairCode => run_pair_code(),
+		Command::EnrollCode => run_enroll_code(),
+		Command::Ides => run_ides(),
+		Command::RevokeIde { id } => run_revoke_ide(&id),
 		Command::Serve {
 			bind,
 			advertise_host,
@@ -206,6 +231,46 @@ fn run_revoke(id: &str) -> anyhow::Result<()> {
 		println!("Revoked device {id}");
 	} else {
 		println!("No device with id {id}");
+	}
+	Ok(())
+}
+
+/// Issue a short-lived enrollment code for an IDE (Phase 14.0). Mirror
+/// of `run_pair_code` for the IDE↔bridge relationship. The session is
+/// dropped here: in 14.1 the `serve` listener holds it in memory and
+/// runs `verify_and_consume` when an IDE presents the code over WSS.
+/// This subcommand just demonstrates issuance.
+fn run_enroll_code() -> anyhow::Result<()> {
+	let session = enrollment::EnrollmentSession::issue();
+	println!("Enrollment code: {}", session.code());
+	println!("Valid for {} seconds.", enrollment::ENROLLMENT_CODE_TTL.as_secs());
+	Ok(())
+}
+
+/// List enrolled IDEs (Phase 14.0). Mirror of `run_devices`.
+fn run_ides() -> anyhow::Result<()> {
+	let store = enrollment::IdeStore::open()?;
+	let ides = store.list()?;
+	if ides.is_empty() {
+		println!("No enrolled IDEs.");
+		return Ok(());
+	}
+	let id_width = ides.iter().map(|i| i.id.len()).max().unwrap_or(2).max("ID".len());
+	let label_width = ides.iter().map(|i| i.label.len()).max().unwrap_or(5).max("LABEL".len());
+	println!("{:<id_width$}  {:<label_width$}  ENROLLED-AT-MS", "ID", "LABEL");
+	for i in &ides {
+		println!("{:<id_width$}  {:<label_width$}  {}", i.id, i.label, i.enrolled_at_ms);
+	}
+	Ok(())
+}
+
+/// Revoke an enrolled IDE by id (Phase 14.0). Mirror of `run_revoke`.
+fn run_revoke_ide(id: &str) -> anyhow::Result<()> {
+	let store = enrollment::IdeStore::open()?;
+	if store.revoke(id)? {
+		println!("Revoked IDE {id}");
+	} else {
+		println!("No IDE with id {id}");
 	}
 	Ok(())
 }
