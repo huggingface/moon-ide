@@ -1668,6 +1668,13 @@ class WorkspaceState {
 	 * gets re-saved. Called once on startup from `App.svelte`.
 	 */
 	async restoreAppState() {
+		// Register the coder→state callback so that opening a
+		// worktree-backed session switches the folder bar to that
+		// worktree. Done before any folder restore so the callback
+		// is live by the time hydration might open a session.
+		coder.registerWorktreeSessionCallback(async (worktreeRoot) => {
+			await this.setActiveFolder(worktreeRoot);
+		});
 		// Probe the OS theme (XDG portal / native API) and read the
 		// persisted `state.json` + per-workspace `session.json` in
 		// parallel — they're independent and all block the first

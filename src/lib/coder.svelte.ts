@@ -1257,6 +1257,25 @@ class CoderPanelState {
 	 *  running per project" contract). */
 	#hydratedFolders = new Set<string>();
 
+	/** Callback registered by `state.svelte.ts` so the coder panel
+	 *  can request a folder switch when the user opens a session
+	 *  that runs in a worktree (ADR 0028). `coder.svelte.ts`
+	 *  deliberately does not import `state.svelte.ts` to avoid a
+	 *  cycle, so this indirection lets the panel say "switch to
+	 *  this worktree folder" without a direct reference. `null`
+	 *  until registered; a no-op when unregistered (e.g. during
+	 *  isolated tests). */
+	#onWorktreeSessionOpen: ((worktreeRoot: string) => Promise<void>) | null = null;
+
+	/** Guard against the recursive loop: opening a worktree session
+	 *  fires `#onWorktreeSessionOpen` → `state.setActiveFolder` →
+	 *  `coder.setActiveFolder` → `#selectSessionForActiveFolder` →
+	 *  potentially `openSession` again. The cycle is naturally
+	 *  broken by the "already viewing the right session" check in
+	 *  `#selectSessionForActiveFolder`, but this flag is a belt-
+	 *  and-braces guard so an unexpected mismatch can't spiral. */
+	#suppressWorktreeSwitch = false;
+
 	get signedIn(): boolean {
 		return this.status?.signed_in ?? false;
 	}
@@ -1683,8 +1702,27 @@ class CoderPanelState {
 			// reads it back. Set before the await so a reopen of a
 			// session whose bucket doesn't exist yet still records.
 			const ipcStart = performance.now();
-			await ipc.coder.openSession(id);
+			const summary = await ipc.coder.openSession(id);
 			this.sessionStateFor(this.activeFolderPath ?? NO_FOLDER_KEY, id).openIpcMs = performance.now() - ipcStart;
+			// If the opened session runs in a worktree, switch the
+			// folder bar to that worktree so the file tree / SCM
+			// view matches what the agent is working on. Guarded
+			// against the recursive loop: the resulting folder
+			// switch calls `setActiveFolder` →
+			// `#selectSessionForActiveFolder`, which sees the
+			// visible session already matches and is a no-op.
+			// Also skipped when the worktree folder is already
+			// active (`#activeFolderActual` matches), which covers
+			// the folder-bar-click → session-open path.
+			const wt = summary.worktree_root;
+			if (wt && !this.#suppressWorktreeSwitch && this.#onWorktreeSessionOpen && this.#activeFolderActual !== wt) {
+				this.#suppressWorktreeSwitch = true;
+				try {
+					await this.#onWorktreeSessionOpen(wt);
+				} finally {
+					this.#suppressWorktreeSwitch = false;
+				}
+			}
 		} catch (err) {
 			// Surface the error in the (now-visible) session
 			// bucket. Pre-populating it before the IPC call
@@ -2005,6 +2043,14 @@ class CoderPanelState {
 		if (this.activeFolderPath !== null) {
 			void this.#hydrateFolder(this.activeFolderPath);
 		}
+	}
+
+	/** Register a callback the panel fires when the user opens a
+	 *  session whose `worktree_root` is set, so `state.svelte.ts`
+	 *  can switch the folder bar to that worktree. Called once
+	 *  during startup; the callback is stored, not invoked here. */
+	registerWorktreeSessionCallback(cb: (worktreeRoot: string) => Promise<void>): void {
+		this.#onWorktreeSessionOpen = cb;
 	}
 
 	/** Pick the latest session matching the actual active folder's
