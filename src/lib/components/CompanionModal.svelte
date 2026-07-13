@@ -9,9 +9,19 @@
 	// open so it refreshes a touch faster after a pair/revoke.
 	const status = $derived(companion.status);
 
+	// Tab: "local" = this machine runs the bridge (Phase 13 QR flow);
+	// "remote" = the IDE dials out to a relay bridge elsewhere (14.3).
+	// Defaults to local; auto-switches to remote if already connected.
+	let tab = $state<'local' | 'remote'>('local');
+
 	onMount(() => {
 		companion.startPolling();
 		void companion.refresh();
+		void companion.refreshRemote().then(() => {
+			if (companion.remoteStatus?.connected) {
+				tab = 'remote';
+			}
+		});
 	});
 
 	onDestroy(() => {
@@ -70,100 +80,133 @@
 	}
 </script>
 
-<div class="overlay" role="dialog" aria-modal="true" aria-label="Pair a phone">
+<div class="overlay" role="dialog" aria-modal="true" aria-label="Companion">
 	<div class="card">
 		<header>
 			<h2>Companion</h2>
 			<button type="button" class="close" aria-label="Close" onclick={() => companion.close()}>×</button>
 		</header>
 
-		{#if !status || !status.running}
-			<p class="lede">The companion bridge isn't running yet.</p>
-			<p class="hint">
-				It starts automatically with a release build of moon-ide. In a dev session, run
-				<code>moon-bridge serve --web-root companion/dist</code> in a terminal, then reopen this dialog.
-			</p>
-		{:else}
-			<p class="lede">
-				On your phone (same network/VPN), open the companion and scan this, or type the address + code.
-			</p>
+		<div class="tabs" role="tablist">
+			<button
+				type="button"
+				role="tab"
+				aria-selected={tab === 'local'}
+				class="tab"
+				class:active={tab === 'local'}
+				onclick={() => (tab = 'local')}
+			>
+				Local bridge
+			</button>
+			<button
+				type="button"
+				role="tab"
+				aria-selected={tab === 'remote'}
+				class="tab"
+				class:active={tab === 'remote'}
+				onclick={() => {
+					tab = 'remote';
+					void companion.refreshRemote();
+				}}
+			>
+				Remote relay
+			</button>
+		</div>
 
-			{#if qrSvg}
-				<!-- eslint-disable-next-line svelte/no-at-html-tags -->
-				<div class="qr">{@html qrSvg}</div>
-			{/if}
-
-			<div class="details">
-				{#if status.mdns_url}
-					<div class="row"><span class="k">Address</span><code>{status.mdns_url}</code></div>
-					<div class="row"><span class="k">or</span><code>{status.pairing_url}</code></div>
-				{:else}
-					<div class="row"><span class="k">Address</span><code>{status.pairing_url}</code></div>
-				{/if}
-				{#if status.pairing_code}
-					<div class="row"><span class="k">Code</span><code class="code">{status.pairing_code}</code></div>
-				{:else}
-					<p class="hint">Pairing window closed — restart the bridge to pair another device.</p>
-				{/if}
-			</div>
-
-			<p class="hint fp">
-				First time on a device, accept the self-signed certificate. Fingerprint:<br />
-				<code class="fingerprint">{status.fingerprint}</code>
-			</p>
-
-			<h3>Paired devices</h3>
-			{#if status.devices.length === 0}
-				<p class="hint">None yet.</p>
+		{#if tab === 'local'}
+			<!-- Local bridge: this machine runs moon-bridge, phones pair to it. -->
+			{#if !status || !status.running}
+				<p class="lede">The companion bridge isn't running yet.</p>
+				<p class="hint">
+					It starts automatically with a release build of moon-ide. In a dev session, run
+					<code>moon-bridge serve --web-root companion/dist</code> in a terminal, then reopen this dialog.
+				</p>
 			{:else}
-				<ul class="devices">
-					{#each status.devices as d (d.id)}
-						<li>
-							<span class="label">{d.label}</span>
-							<span class="meta">{relativeTime(d.paired_at_ms)}</span>
-							<button type="button" class="revoke" onclick={() => revoke(d.id)}>Revoke</button>
-						</li>
-					{/each}
-				</ul>
-			{/if}
+				<p class="lede">
+					On your phone (same network/VPN), open the companion and scan this, or type the address + code.
+				</p>
 
-			{#if status.ides && status.ides.length > 0}
-				<h3>Enrolled IDEs</h3>
-				<ul class="devices">
-					{#each status.ides as ide (ide.id)}
-						<li>
-							<span class="label">{ide.label}</span>
-							<span class="meta">{relativeTime(ide.enrolled_at_ms)}</span>
-							<button type="button" class="revoke" onclick={() => revokeIde(ide.id)}>Revoke</button>
-						</li>
-					{/each}
-				</ul>
-			{/if}
-
-			<hr class="sep" />
-
-			<section class="remote">
-				<h3>Remote bridge</h3>
-				{#if companion.remoteStatus?.connected}
-					<p class="hint">
-						Connected to <code>{companion.remoteStatus.bridge_url}</code>
-						{#if companion.remoteStatus.error}
-							— {companion.remoteStatus.error}
-						{/if}
-					</p>
-					<button type="button" class="revoke" onclick={() => disconnectRemote()}>Disconnect</button>
-				{:else}
-					<p class="hint">Connect this IDE to a remote relay bridge (Phase 14, ADR 0031).</p>
-					<form onsubmit={enrollRemote}>
-						<input type="text" placeholder="wss://relay-box:53180" bind:value={enrollUrl} required />
-						<input type="text" placeholder="enrollment code" bind:value={enrollCode} required />
-						<button type="submit">Enroll</button>
-					</form>
-					{#if enrollError}
-						<p class="hint" style="color: var(--danger, #f85149)">{enrollError}</p>
-					{/if}
+				{#if qrSvg}
+					<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+					<div class="qr">{@html qrSvg}</div>
 				{/if}
-			</section>
+
+				<div class="details">
+					{#if status.mdns_url}
+						<div class="row"><span class="k">Address</span><code>{status.mdns_url}</code></div>
+						<div class="row"><span class="k">or</span><code>{status.pairing_url}</code></div>
+					{:else}
+						<div class="row"><span class="k">Address</span><code>{status.pairing_url}</code></div>
+					{/if}
+					{#if status.pairing_code}
+						<div class="row"><span class="k">Code</span><code class="code">{status.pairing_code}</code></div>
+					{:else}
+						<p class="hint">Pairing window closed — restart the bridge to pair another device.</p>
+					{/if}
+				</div>
+
+				<p class="hint fp">
+					First time on a device, accept the self-signed certificate. Fingerprint:<br />
+					<code class="fingerprint">{status.fingerprint}</code>
+				</p>
+
+				<h3>Paired devices</h3>
+				{#if status.devices.length === 0}
+					<p class="hint">None yet.</p>
+				{:else}
+					<ul class="devices">
+						{#each status.devices as d (d.id)}
+							<li>
+								<span class="label">{d.label}</span>
+								<span class="meta">{relativeTime(d.paired_at_ms)}</span>
+								<button type="button" class="revoke" onclick={() => revoke(d.id)}>Revoke</button>
+							</li>
+						{/each}
+					</ul>
+				{/if}
+
+				{#if status.ides && status.ides.length > 0}
+					<h3>Enrolled IDEs</h3>
+					<ul class="devices">
+						{#each status.ides as ide (ide.id)}
+							<li>
+								<span class="label">{ide.label}</span>
+								<span class="meta">{relativeTime(ide.enrolled_at_ms)}</span>
+								<button type="button" class="revoke" onclick={() => revokeIde(ide.id)}>Revoke</button>
+							</li>
+						{/each}
+					</ul>
+				{/if}
+			{/if}
+		{:else}
+			<!-- Remote relay: the IDE dials out to a bridge elsewhere. -->
+			{#if companion.remoteStatus?.connected}
+				<p class="lede">
+					Connected to <code>{companion.remoteStatus.bridge_url}</code>
+				</p>
+				{#if companion.remoteStatus.error}
+					<p class="hint" style="color: var(--danger, #f85149)">{companion.remoteStatus.error}</p>
+				{/if}
+				<p class="hint">
+					This IDE is enrolled as <code>{companion.remoteStatus.ide_id}</code>. Phones paired to the remote bridge can
+					see this IDE's workspaces.
+				</p>
+				<button type="button" class="revoke" onclick={() => disconnectRemote()}>Disconnect</button>
+			{:else}
+				<p class="lede">Connect this IDE to a remote relay bridge.</p>
+				<p class="hint">
+					Run <code>moon-bridge serve</code> on the relay box (a machine on the same VPN), note the enrollment code it prints,
+					then enter it here.
+				</p>
+				<form onsubmit={enrollRemote} class="remote-form">
+					<input type="text" placeholder="wss://relay-box:53180" bind:value={enrollUrl} required />
+					<input type="text" placeholder="enrollment code" bind:value={enrollCode} required />
+					<button type="submit">Enroll</button>
+				</form>
+				{#if enrollError}
+					<p class="hint" style="color: var(--danger, #f85149)">{enrollError}</p>
+				{/if}
+			{/if}
 		{/if}
 	</div>
 </div>
@@ -288,17 +331,32 @@
 		cursor: pointer;
 		font-size: 0.8rem;
 	}
-	.sep {
-		border: none;
-		border-top: 1px solid var(--border, #30363d);
-		margin: 1rem 0;
+	.tabs {
+		display: flex;
+		gap: 0.25rem;
+		margin: 0.75rem 0;
 	}
-	.remote form {
+	.tab {
+		flex: 1;
+		background: none;
+		border: 1px solid var(--border, #30363d);
+		border-radius: 6px;
+		color: var(--fg-muted, #8b949e);
+		cursor: pointer;
+		padding: 0.4rem 0.5rem;
+		font-size: 0.85rem;
+	}
+	.tab.active {
+		background: var(--bg-input, #161b22);
+		color: var(--fg, #e6edf3);
+		border-color: var(--accent, #388bfd);
+	}
+	.remote-form {
 		display: flex;
 		gap: 0.4rem;
 		margin-top: 0.5rem;
 	}
-	.remote input {
+	.remote-form input {
 		flex: 1;
 		background: var(--bg-input, #161b22);
 		border: 1px solid var(--border, #30363d);
@@ -307,7 +365,7 @@
 		padding: 0.3rem 0.5rem;
 		font-size: 0.85rem;
 	}
-	.remote form button {
+	.remote-form button {
 		background: var(--accent, #388bfd);
 		border: none;
 		border-radius: 6px;
