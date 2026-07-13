@@ -1421,6 +1421,42 @@ pub fn orphan_tool_call_ids(records: &[SessionRecord]) -> Vec<String> {
 	orphans
 }
 
+/// Of the orphaned tool-call ids from [`orphan_tool_call_ids`], return
+/// those that are `ask_user` calls — the only kind safe to re-dispatch
+/// across a process restart. Every other tool has side effects
+/// (`bash`, file writes, sub-agent spawns) we must not blindly replay;
+/// `ask_user` is pure parking, so re-running it just re-parks the
+/// prompt and the card re-renders interactive for the user to answer.
+///
+/// Because `ask_user` blocks the turn until the user answers, at most
+/// one is ever in flight at a time — the orphan tail. Returns the
+/// cloned [`ToolCall`]s so [`crate::runner::Coder::open_session`] can
+/// hand them to the turn loop's `resume_tool_calls` path. Empty unless
+/// *every* orphan is an `ask_user` call: a mixed tail (one `ask_user`
+/// plus one `bash`, say) falls back to the interrupted-result path —
+/// we never partially resume.
+pub fn orphaned_ask_user_calls(records: &[SessionRecord]) -> Vec<ToolCall> {
+	let orphans = orphan_tool_call_ids(records);
+	if orphans.is_empty() {
+		return Vec::new();
+	}
+	let mut orphan_set: std::collections::HashSet<&str> = orphans.iter().map(String::as_str).collect();
+	let mut resumed: Vec<ToolCall> = Vec::with_capacity(orphans.len());
+	for record in records {
+		if let SessionRecord::Assistant { tool_calls, .. } = record {
+			for call in tool_calls {
+				if orphan_set.remove(call.id.as_str()) {
+					if call.function.name != "ask_user" {
+						return Vec::new();
+					}
+					resumed.push(call.clone());
+				}
+			}
+		}
+	}
+	resumed
+}
+
 /// Lightweight summary used by the panel's session list. Avoids
 /// loading every record off disk when the user just wants to pick
 /// a session.
@@ -3400,6 +3436,73 @@ mod tests {
 			},
 		];
 		assert!(orphan_tool_call_ids(&records).is_empty());
+	}
+
+	#[test]
+	fn orphaned_ask_user_calls_resumes_a_parked_prompt() {
+		// The reopen-after-quit shape: the model emitted an
+		// `ask_user` call, the user never answered it, and the
+		// process exited before the tool returned. The Assistant
+		// record carries the call (with its args) but no `Tool`
+		// record follows it — a resumable orphan.
+		let records = vec![
+			SessionRecord::User {
+				text: "ask me".into(),
+				images: Vec::new(),
+			},
+			SessionRecord::Assistant {
+				content: None,
+				thinking: None,
+				thinking_blocks: vec![],
+				tool_calls: vec![make_tool_call("call-a", "ask_user")],
+				model: None,
+				stop_reason: None,
+			},
+		];
+		let calls = orphaned_ask_user_calls(&records);
+		assert_eq!(calls.len(), 1);
+		assert_eq!(calls[0].id, "call-a");
+		assert_eq!(calls[0].function.name, "ask_user");
+	}
+
+	#[test]
+	fn orphaned_ask_user_calls_empty_when_no_orphans() {
+		// A completed ask_user round-trip: the Assistant record is
+		// followed by its `Tool` result. Nothing to resume.
+		let records = vec![
+			SessionRecord::Assistant {
+				content: None,
+				thinking: None,
+				thinking_blocks: vec![],
+				tool_calls: vec![make_tool_call("call-a", "ask_user")],
+				model: None,
+				stop_reason: None,
+			},
+			SessionRecord::Tool {
+				tool_call_id: "call-a".into(),
+				tool_name: String::new(),
+				content: r#"{"status":"answered"}"#.into(),
+			},
+		];
+		assert!(orphaned_ask_user_calls(&records).is_empty());
+	}
+
+	#[test]
+	fn orphaned_ask_user_calls_refuses_mixed_tail() {
+		// A mixed orphan tail — one `ask_user` plus one `bash` —
+		// must NOT be partially resumed: re-running `bash` would
+		// have side effects we can't safely replay. Fall back to
+		// the interrupted-result path (empty here = "no resumable
+		// calls"; the caller treats the ids as plain orphans).
+		let records = vec![SessionRecord::Assistant {
+			content: None,
+			thinking: None,
+			thinking_blocks: vec![],
+			tool_calls: vec![make_tool_call("call-a", "ask_user"), make_tool_call("call-b", "bash")],
+			model: None,
+			stop_reason: None,
+		}];
+		assert!(orphaned_ask_user_calls(&records).is_empty());
 	}
 
 	#[test]
