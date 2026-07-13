@@ -3,12 +3,16 @@
 // bridge's status so the status-bar item can show a live pip
 // (running? how many devices paired?) without opening the modal.
 
-import { ipc, type CompanionStatus } from './ipc';
+import { ipc, type CompanionStatus, type RemoteBridgeStatus } from './ipc';
 
 class CompanionState {
 	modalOpen = $state(false);
+	/** Remote-bridge enroll modal open (Phase 14.3). */
+	remoteModalOpen = $state(false);
 	/** Latest bridge status, or null before the first poll. */
 	status = $state<CompanionStatus | null>(null);
+	/** Latest remote-bridge connection status (Phase 14.3). */
+	remoteStatus = $state<RemoteBridgeStatus | null>(null);
 
 	#pollTimer: ReturnType<typeof setInterval> | null = null;
 	#refs = 0;
@@ -19,6 +23,15 @@ class CompanionState {
 
 	close(): void {
 		this.modalOpen = false;
+	}
+
+	openRemote(): void {
+		this.remoteModalOpen = true;
+		void this.refreshRemote();
+	}
+
+	closeRemote(): void {
+		this.remoteModalOpen = false;
 	}
 
 	toggle(): void {
@@ -38,6 +51,14 @@ class CompanionState {
 			this.status = await ipc.companion.status();
 		} catch {
 			this.status = null;
+		}
+	}
+
+	async refreshRemote(): Promise<void> {
+		try {
+			this.remoteStatus = await ipc.companion.remoteStatus();
+		} catch {
+			this.remoteStatus = null;
 		}
 	}
 

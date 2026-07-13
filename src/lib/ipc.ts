@@ -436,6 +436,10 @@ export const ipc = {
 		status: () => invoke<CompanionStatus>('companion_status'),
 		revokeDevice: (deviceId: string) => invoke<void>('companion_revoke_device', { deviceId }),
 		revokeIde: (ideId: string) => invoke<void>('companion_revoke_ide', { ideId }),
+		enroll: (bridgeUrl: string, code: string, label: string) =>
+			invoke<void>('companion_enroll', { bridgeUrl, code, label }),
+		remoteStatus: () => invoke<RemoteBridgeStatus>('companion_remote_status'),
+		remoteDisconnect: () => invoke<void>('companion_remote_disconnect'),
 	},
 } as const;
 
@@ -451,4 +455,14 @@ export type CompanionStatus = {
 	fingerprint: string;
 	devices: { id: string; label: string; paired_at_ms: number }[];
 	ides?: { id: string; label: string; enrolled_at_ms: number }[];
+};
+
+/** Remote / relay bridge connection status (Phase 14.3, ADR 0031).
+ * `connected: false` when the IDE isn't connected to a remote bridge
+ * (local mode). */
+export type RemoteBridgeStatus = {
+	connected: boolean;
+	bridge_url: string;
+	ide_id: string;
+	error: string | null;
 };

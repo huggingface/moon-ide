@@ -453,6 +453,11 @@ export const builtInCommands: Command[] = [
 		run: () => companion.open(),
 	},
 	{
+		id: 'companion.connectRemote',
+		title: 'Companion: Connect to remote bridge…',
+		run: () => companion.openRemote(),
+	},
+	{
 		id: 'chat.togglePanel',
 		// Wording flips with panel state — same diagnostic value as
 		// the theme toggle, and means the user knows which way the

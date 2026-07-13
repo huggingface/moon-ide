@@ -29,6 +29,34 @@
 		await companion.refresh();
 	}
 
+	async function revokeIde(ideId: string): Promise<void> {
+		await ipc.companion.revokeIde(ideId);
+		await companion.refresh();
+	}
+
+	// Remote-bridge enroll form state (Phase 14.3).
+	let enrollUrl = $state('');
+	let enrollCode = $state('');
+	let enrollError = $state<string | null>(null);
+
+	async function enrollRemote(event: Event): Promise<void> {
+		event.preventDefault();
+		enrollError = null;
+		try {
+			await ipc.companion.enroll(enrollUrl, enrollCode, 'moon-ide');
+			await companion.refreshRemote();
+			enrollUrl = '';
+			enrollCode = '';
+		} catch (err) {
+			enrollError = String(err);
+		}
+	}
+
+	async function disconnectRemote(): Promise<void> {
+		await ipc.companion.remoteDisconnect();
+		await companion.refreshRemote();
+	}
+
 	function relativeTime(ms: number): string {
 		const mins = Math.round((Date.now() - ms) / 60000);
 		if (mins < 1) {
@@ -98,6 +126,44 @@
 					{/each}
 				</ul>
 			{/if}
+
+			{#if status.ides && status.ides.length > 0}
+				<h3>Enrolled IDEs</h3>
+				<ul class="devices">
+					{#each status.ides as ide (ide.id)}
+						<li>
+							<span class="label">{ide.label}</span>
+							<span class="meta">{relativeTime(ide.enrolled_at_ms)}</span>
+							<button type="button" class="revoke" onclick={() => revokeIde(ide.id)}>Revoke</button>
+						</li>
+					{/each}
+				</ul>
+			{/if}
+
+			<hr class="sep" />
+
+			<section class="remote">
+				<h3>Remote bridge</h3>
+				{#if companion.remoteStatus?.connected}
+					<p class="hint">
+						Connected to <code>{companion.remoteStatus.bridge_url}</code>
+						{#if companion.remoteStatus.error}
+							— {companion.remoteStatus.error}
+						{/if}
+					</p>
+					<button type="button" class="revoke" onclick={() => disconnectRemote()}>Disconnect</button>
+				{:else}
+					<p class="hint">Connect this IDE to a remote relay bridge (Phase 14, ADR 0031).</p>
+					<form onsubmit={enrollRemote}>
+						<input type="text" placeholder="wss://relay-box:53180" bind:value={enrollUrl} required />
+						<input type="text" placeholder="enrollment code" bind:value={enrollCode} required />
+						<button type="submit">Enroll</button>
+					</form>
+					{#if enrollError}
+						<p class="hint" style="color: var(--danger, #f85149)">{enrollError}</p>
+					{/if}
+				{/if}
+			</section>
 		{/if}
 	</div>
 </div>
@@ -221,5 +287,33 @@
 		padding: 0.2rem 0.5rem;
 		cursor: pointer;
 		font-size: 0.8rem;
+	}
+	.sep {
+		border: none;
+		border-top: 1px solid var(--border, #30363d);
+		margin: 1rem 0;
+	}
+	.remote form {
+		display: flex;
+		gap: 0.4rem;
+		margin-top: 0.5rem;
+	}
+	.remote input {
+		flex: 1;
+		background: var(--bg-input, #161b22);
+		border: 1px solid var(--border, #30363d);
+		border-radius: 6px;
+		color: var(--fg, #e6edf3);
+		padding: 0.3rem 0.5rem;
+		font-size: 0.85rem;
+	}
+	.remote form button {
+		background: var(--accent, #388bfd);
+		border: none;
+		border-radius: 6px;
+		color: white;
+		cursor: pointer;
+		padding: 0.3rem 0.8rem;
+		font-size: 0.85rem;
 	}
 </style>

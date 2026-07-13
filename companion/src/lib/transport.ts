@@ -155,18 +155,26 @@ export class BridgeSocket {
 	}
 
 	/** Subscribe to a workspace's coder event stream. Events arrive via
-	 * the `onEvent` handler; this send has no direct reply. */
-	subscribe(token: string, workspace: string): void {
+	 * the `onEvent` handler; this send has no direct reply. `ide`
+	 * selects the carrier (empty = local, present = remote IDE). */
+	subscribe(token: string, workspace: string, ide = ''): void {
 		const ws = this.#ws;
 		if (!ws || ws.readyState !== WebSocket.OPEN) {
 			return;
 		}
-		ws.send(JSON.stringify({ type: 'subscribe', token, workspace }));
+		ws.send(JSON.stringify({ type: 'subscribe', token, workspace, ide }));
 	}
 
-	/** Invoke a relayed method on `workspace`, authenticated by `token`. */
-	async call<T = unknown>(token: string, workspace: string, method: string, params: unknown = {}): Promise<T> {
-		const reply = await this.#send({ type: 'call', token, workspace, method, params });
+	/** Invoke a relayed method on `workspace`, authenticated by `token`.
+	 * `ide` selects the carrier (empty = local, present = remote IDE). */
+	async call<T = unknown>(
+		token: string,
+		workspace: string,
+		method: string,
+		params: unknown = {},
+		ide = '',
+	): Promise<T> {
+		const reply = await this.#send({ type: 'call', token, workspace, method, params, ide });
 		if (reply.type === 'error') {
 			throw new BridgeError(reply.message);
 		}

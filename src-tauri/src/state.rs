@@ -73,6 +73,11 @@ pub struct AppState {
 	/// for the whole shutdown window and reports the workspace
 	/// as still in use. `None` in preboot mode (no socket bound).
 	pub focus_listener: Mutex<Option<AbortHandle>>,
+	/// Outbound remote-bridge connection handle (Phase 14.3, ADR
+	/// 0031). `None` when the IDE isn't connected to a remote bridge
+	/// (local mode). Held so the `companion_remote_status` /
+	/// `companion_remote_disconnect` commands can reach it.
+	pub remote_bridge: Mutex<Option<crate::remote_bridge::RemoteBridgeHandle>>,
 }
 
 /// What this process is doing. Picked once at startup based on
@@ -144,6 +149,7 @@ impl AppState {
 			mode,
 			logs,
 			focus_listener: Mutex::new(None),
+			remote_bridge: Mutex::new(None),
 		}
 	}
 
