@@ -29,10 +29,13 @@ pub const CONTROL_SOCK: &str = "control.sock";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum ControlRequest {
-	/// Report current pairing payload + paired devices.
+	/// Report current pairing payload + paired devices + enrolled IDEs.
 	Status,
 	/// Revoke a paired device by id.
 	Revoke { device_id: String },
+	/// Revoke an enrolled IDE by id (Phase 14, ADR 0031). Mirror of
+	/// `Revoke` for the IDE↔bridge relationship.
+	RevokeIde { ide_id: String },
 	/// Ask the bridge to exit (e.g. before a rebuild).
 	Shutdown,
 }
@@ -67,6 +70,11 @@ pub struct CompanionStatus {
 	pub mdns_url: Option<String>,
 	pub fingerprint: String,
 	pub devices: Vec<DeviceEntry>,
+	/// Enrolled IDEs (Phase 14, ADR 0031). Mirror of `devices` for
+	/// the IDE↔bridge relationship. The IDE's Companion panel renders
+	/// this list with revoke, alongside the paired-devices list.
+	#[serde(default)]
+	pub ides: Vec<IdeEntry>,
 	/// Hash of this bridge's own executable. The IDE compares it to
 	/// the binary it's about to stage: same build → leave the running
 	/// bridge alone (another window started it); different → it's
@@ -104,6 +112,15 @@ pub struct DeviceEntry {
 	pub paired_at_ms: u128,
 }
 
+/// One enrolled IDE (Phase 14). Mirror of [`DeviceEntry`] for the
+/// IDE↔bridge relationship.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdeEntry {
+	pub id: String,
+	pub label: String,
+	pub enrolled_at_ms: u128,
+}
+
 /// Path of the control socket under `bridge_dir`.
 pub fn control_sock_path(bridge_dir: &camino::Utf8Path) -> std::path::PathBuf {
 	bridge_dir.join(CONTROL_SOCK).into_std_path_buf()
@@ -132,6 +149,9 @@ mod tests {
 			ControlRequest::Status,
 			ControlRequest::Revoke {
 				device_id: "abc".into(),
+			},
+			ControlRequest::RevokeIde {
+				ide_id: "eli-laptop".into(),
 			},
 			ControlRequest::Shutdown,
 		] {

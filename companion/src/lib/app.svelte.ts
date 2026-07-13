@@ -22,6 +22,9 @@ export type WorkspaceListing = {
 	name: string;
 	last_active_at: number | null;
 	live: boolean;
+	/** Owning IDE's id (empty = local-carrier / this machine).
+	 * Phase 14, ADR 0031 — the switcher groups by this. */
+	ide?: string;
 };
 
 export type CoderStatus = {
@@ -72,6 +75,10 @@ class CompanionState {
 
 	/** The workspace the user picked, or null while choosing. */
 	activeWorkspace = $state<string | null>(null);
+	/** The owning IDE's id for the active workspace (empty = local).
+	 * Phase 14 — threaded through `call`/`subscribe` for carrier
+	 * selection. */
+	activeIde = $state('');
 
 	coderStatus = $state<CoderStatus | null>(null);
 	sessions = $state<SessionSummary[]>([]);
@@ -133,11 +140,11 @@ class CompanionState {
 		this.phase = 'pairing';
 	}
 
-	async #call<T>(workspace: string, method: string, params: unknown = {}): Promise<T> {
+	async #call<T>(workspace: string, method: string, params: unknown = {}, ide = ''): Promise<T> {
 		if (!this.#socket || !this.connection) {
 			throw new Error('not connected');
 		}
-		return this.#socket.call<T>(this.connection.token, workspace, method, params);
+		return this.#socket.call<T>(this.connection.token, workspace, method, params, ide);
 	}
 
 	/** Load the host's workspace list for the switcher. */
@@ -157,14 +164,15 @@ class CompanionState {
 	}
 
 	/** Open a workspace: load its coder status + session list. */
-	async openWorkspace(workspace: string): Promise<void> {
+	async openWorkspace(workspace: string, ide = ''): Promise<void> {
 		this.activeWorkspace = workspace;
+		this.activeIde = ide;
 		this.coderStatus = null;
 		this.sessions = [];
 		this.loadingSessions = true;
 		try {
-			this.coderStatus = await this.#call<CoderStatus>(workspace, 'coder_status');
-			this.sessions = await this.#call<SessionSummary[]>(workspace, 'coder_list_sessions');
+			this.coderStatus = await this.#call<CoderStatus>(workspace, 'coder_status', {}, ide);
+			this.sessions = await this.#call<SessionSummary[]>(workspace, 'coder_list_sessions', {}, ide);
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
 		} finally {
@@ -175,6 +183,7 @@ class CompanionState {
 	/** Back out of the active workspace to the switcher. */
 	closeWorkspace(): void {
 		this.activeWorkspace = null;
+		this.activeIde = '';
 		this.coderStatus = null;
 		this.sessions = [];
 		this.closeSession();
@@ -192,8 +201,8 @@ class CompanionState {
 		try {
 			// Ensure we're receiving this workspace's event stream. The
 			// open_session call replays the transcript as events.
-			this.#ensureSubscribed(this.activeWorkspace);
-			await this.#call(this.activeWorkspace, 'coder_open_session', { id });
+			this.#ensureSubscribed(this.activeWorkspace, this.activeIde);
+			await this.#call(this.activeWorkspace, 'coder_open_session', { id }, this.activeIde);
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
 		}
@@ -212,7 +221,7 @@ class CompanionState {
 		}
 		try {
 			this.busy = true;
-			await this.#call(this.activeWorkspace, 'coder_send', { text });
+			await this.#call(this.activeWorkspace, 'coder_send', { text }, this.activeIde);
 		} catch (e) {
 			this.busy = false;
 			this.error = e instanceof Error ? e.message : String(e);
@@ -225,18 +234,18 @@ class CompanionState {
 			return;
 		}
 		try {
-			await this.#call(this.activeWorkspace, 'coder_abort');
+			await this.#call(this.activeWorkspace, 'coder_abort', {}, this.activeIde);
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
 		}
 	}
 
-	#ensureSubscribed(workspace: string): void {
+	#ensureSubscribed(workspace: string, ide = ''): void {
 		if (this.subscribed || !this.#socket || !this.connection) {
 			return;
 		}
 		this.#socket.onEvent((raw) => this.#onCoderEvent(raw));
-		this.#socket.subscribe(this.connection.token, workspace);
+		this.#socket.subscribe(this.connection.token, workspace, ide);
 		this.subscribed = true;
 	}
 

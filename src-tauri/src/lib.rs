@@ -18,6 +18,7 @@ mod bridge_rpc;
 mod commands;
 mod focus_socket;
 mod fs_watcher;
+mod remote_bridge;
 mod shell_resolver;
 mod shutdown;
 mod slack_poller;
@@ -226,6 +227,10 @@ pub fn run() {
 			commands::slack::slack_post_message,
 			commands::companion::companion_status,
 			commands::companion::companion_revoke_device,
+			commands::companion::companion_revoke_ide,
+			commands::companion::companion_enroll,
+			commands::companion::companion_remote_status,
+			commands::companion::companion_remote_disconnect,
 			commands::coder::coder_status,
 			commands::coder::coder_folder_summary,
 			commands::coder::coder_start_device_flow,
@@ -485,6 +490,11 @@ pub fn run() {
 			// `crate::bridge_rpc` (Phase 13, mobile companion).
 			let bridge_rpc: std::sync::Arc<dyn focus_socket::BridgeRpcHandler> =
 				std::sync::Arc::new(bridge_rpc::BridgeRpc::new(coder.clone(), workspace_registry.clone()));
+			// Manage the bridge_rpc in Tauri state so the remote-bridge
+			// client (Phase 14.3) can reach it via `companion_enroll` —
+			// forwarded calls dispatch against the same handler the focus
+			// listener uses, reused unchanged.
+			app.manage(std::sync::Arc::clone(&bridge_rpc));
 			let focus_listener_abort = deferred_focus_listener.map(|listener| {
 				focus_socket::spawn_focus_listener(
 					listener,

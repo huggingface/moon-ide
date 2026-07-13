@@ -27,6 +27,10 @@ pub struct CompanionStatus {
 	pub mdns_url: Option<String>,
 	pub fingerprint: String,
 	pub devices: Vec<DeviceEntry>,
+	/// Enrolled IDEs (Phase 14, ADR 0031). Mirror of `devices` for the
+	/// IDE↔bridge relationship.
+	#[serde(default)]
+	pub ides: Vec<IdeEntry>,
 	#[serde(default)]
 	pub build_id: String,
 }
@@ -38,12 +42,26 @@ pub struct DeviceEntry {
 	pub paired_at_ms: u128,
 }
 
+/// One enrolled IDE (Phase 14). Mirror of `DeviceEntry`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdeEntry {
+	pub id: String,
+	pub label: String,
+	pub enrolled_at_ms: u128,
+}
+
 /// Control request wire shape (matches `moon_bridge::status`).
 #[derive(Serialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 enum ControlRequest {
 	Status,
-	Revoke { device_id: String },
+	Revoke {
+		device_id: String,
+	},
+	/// Revoke an enrolled IDE (Phase 14). Mirror of `Revoke`.
+	RevokeIde {
+		ide_id: String,
+	},
 }
 
 /// Control response wire shape.
@@ -124,4 +142,66 @@ pub async fn companion_revoke_device(device_id: String) -> Result<(), MoonError>
 		Ok(_) => Ok(()),
 		Err(err) => Err(MoonError::internal(format!("bridge not reachable: {err}"))),
 	}
+}
+
+/// Ask the bridge to revoke an enrolled IDE (Phase 14, ADR 0031). Mirror
+/// of `companion_revoke_device` for the IDE↔bridge relationship.
+#[tauri::command]
+pub async fn companion_revoke_ide(ide_id: String) -> Result<(), MoonError> {
+	match control_request(&ControlRequest::RevokeIde { ide_id }).await {
+		Ok(ControlResponse::Revoked { .. }) | Ok(ControlResponse::Ok) => Ok(()),
+		Ok(ControlResponse::Error { message }) => Err(MoonError::internal(message)),
+		Ok(_) => Ok(()),
+		Err(err) => Err(MoonError::internal(format!("bridge not reachable: {err}"))),
+	}
+}
+
+// --- Remote / relay bridge client commands (Phase 14.3, ADR 0031) ---
+// The IDE dials out to a remote bridge. These commands drive the
+// outbound WS client in `crate::remote_bridge`.
+
+/// Enroll this IDE with a remote bridge. Connects to `bridge_url`,
+/// presents the enrollment `code`, and stores the resulting token in
+/// the keyring. The `bridge_rpc` state holds the `BridgeRpcHandler`
+/// the forwarded calls dispatch to.
+#[tauri::command]
+pub async fn companion_enroll(
+	bridge_url: String,
+	code: String,
+	label: String,
+	bridge_rpc: tauri::State<'_, std::sync::Arc<dyn crate::focus_socket::BridgeRpcHandler>>,
+	state: tauri::State<'_, crate::state::AppState>,
+) -> Result<(), MoonError> {
+	let ide_id = match crate::remote_bridge::load_credential() {
+		Ok(Some(c)) => c.ide_id, // reuse existing id on re-enroll
+		_ => crate::remote_bridge::generate_ide_id(),
+	};
+	let handle = crate::remote_bridge::spawn(bridge_url, code, ide_id, label, bridge_rpc.inner().clone());
+	// Store the handle so the status/disconnect commands can reach it.
+	*state.remote_bridge.lock().await = Some(handle);
+	Ok(())
+}
+
+/// Report the current remote-bridge connection status (Phase 14.3).
+#[tauri::command]
+pub async fn companion_remote_status(
+	state: tauri::State<'_, crate::state::AppState>,
+) -> Result<crate::remote_bridge::RemoteBridgeStatus, MoonError> {
+	let guard = state.remote_bridge.lock().await;
+	Ok(match guard.as_ref() {
+		Some(handle) => handle.status(),
+		None => crate::remote_bridge::RemoteBridgeStatus::default(),
+	})
+}
+
+/// Disconnect from the remote bridge and forget the stored credential
+/// (Phase 14.3).
+#[tauri::command]
+pub async fn companion_remote_disconnect(state: tauri::State<'_, crate::state::AppState>) -> Result<(), MoonError> {
+	let mut guard = state.remote_bridge.lock().await;
+	if let Some(handle) = guard.take() {
+		handle.disconnect();
+	}
+	let _ = crate::remote_bridge::clear_credential();
+	Ok(())
 }
