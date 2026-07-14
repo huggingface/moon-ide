@@ -64,7 +64,7 @@ use crate::event::CoderEvent;
 use crate::inference::{
 	AssistantResponse, ChatMessage, FunctionCall, InferenceClient, StreamEvent, TokenUsage, ToolDefinition,
 };
-use crate::models::CoderModels;
+use crate::models::SharedCoderModels;
 use crate::runner::FolderEventSink;
 use crate::sessions::{
 	self, current_time_ms, new_session_id, sessions_dir, subagent_session_dir, SessionHeader, SessionRecord,
@@ -241,7 +241,7 @@ pub(crate) async fn run_subagent(
 	inference: &InferenceClient,
 	sink: &FolderEventSink,
 	coder_sessions_dir: &Utf8Path,
-	models: &CoderModels,
+	models: &SharedCoderModels,
 	spec: Subagent,
 	cancel: CancellationToken,
 ) -> Result<SubagentReport, CoderError> {
@@ -308,13 +308,14 @@ async fn run_subagent_inner(
 	inference: &InferenceClient,
 	sink: &FolderEventSink,
 	coder_sessions_dir: &Utf8Path,
-	models: &CoderModels,
+	models: &SharedCoderModels,
 	spec: &Subagent,
 	cancel: CancellationToken,
 	format_queue: Arc<crate::tools::FormatQueue>,
 ) -> Result<SubagentReport, CoderError> {
-	let standard_model = models.standard().to_owned();
-	let pi_model = models.resolve_route().pi_provider_model(&standard_model);
+	// Header seed only — the per-round-trip model comes from the
+	// fresh snapshot at the top of every loop iteration below.
+	let standard_model = models.read().await.standard().to_owned();
 	let id = spec.id.clone();
 	let system_prompt = spec
 		.system_prompt_override
@@ -422,6 +423,16 @@ async fn run_subagent_inner(
 			return Err(CoderError::Aborted);
 		}
 
+		// Fresh model snapshot per round-trip — same discipline as
+		// the parent loop in `run_turn`: the inference client
+		// resolves the *route* from the live shared handle per
+		// request, so the model slug must come from the same
+		// generation or a provider switch mid-run pairs the old
+		// provider's slug with the new provider's endpoint.
+		let models = models.read().await.clone();
+		let standard_model = models.standard().to_owned();
+		let pi_model = models.resolve_route().pi_provider_model(&standard_model);
+
 		// Compaction-before-send: if the last round's prompt size
 		// is bumping into the model's context window, fold the
 		// older messages into a synthetic system summary before
@@ -434,7 +445,7 @@ async fn run_subagent_inner(
 			inference,
 			sink,
 			Some(&id),
-			models,
+			&models,
 			last_usage.as_ref(),
 			&mut messages,
 			&cancel,
@@ -528,7 +539,7 @@ async fn run_subagent_inner(
 		// Wrap the parent runner's helper so the sub-agent's ring
 		// updates land on the same wire as parent updates. The
 		// envelope is `SubagentEvent { inner: TokenUsage … }`.
-		emit_subagent_token_usage(sink, &id, models, &standard_model, &messages, &response);
+		emit_subagent_token_usage(sink, &id, &models, &standard_model, &messages, &response);
 		if !response_is_empty {
 			messages.push(response_to_message(&response));
 			persist_subagent(
@@ -622,6 +633,9 @@ async fn run_subagent_inner(
 	// after N iterations" stub. The wrap-up reply becomes the
 	// sub-agent's `result` string (with a leading note so the
 	// parent's model knows the budget was exhausted).
+	let wrap_up_models = models.read().await.clone();
+	let standard_model = wrap_up_models.standard().to_owned();
+	let pi_model = wrap_up_models.resolve_route().pi_provider_model(&standard_model);
 	let wrap_up = subagent_wrap_up(
 		inference,
 		sink,

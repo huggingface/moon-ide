@@ -1666,10 +1666,24 @@ class CoderPanelState {
 	}
 
 	/** Refresh the persisted sessions list. Best-effort: a
-	 *  failure leaves the previous snapshot visible. */
+	 *  failure leaves the previous snapshot visible.
+	 *
+	 *  The backend lists for *its* active folder, so both the
+	 *  target bucket and the folder key are captured before the
+	 *  await: if the user switches folders while the IPC is in
+	 *  flight, the (old folder's) response is dropped instead of
+	 *  landing in whichever bucket happens to be current by then —
+	 *  a stale list in the new bucket makes the folder-switch
+	 *  auto-select open the *old* folder's session. */
 	async refreshSessions(): Promise<void> {
+		const path = this.activeFolderPath;
+		const folder = this.current;
 		try {
-			this.sessions = await ipc.coder.listSessions();
+			const list = await ipc.coder.listSessions();
+			if (this.activeFolderPath !== path) {
+				return;
+			}
+			folder.sessions = list;
 		} catch (err) {
 			// eslint-disable-next-line no-console
 			console.warn('coder: failed to list sessions', err);
@@ -1685,6 +1699,11 @@ class CoderPanelState {
 	 *  accumulated under its id — `session_loaded` will clear
 	 *  them right before replay, which is fine. */
 	async openSession(id: string): Promise<void> {
+		// Capture the folder key alongside the bucket: the awaits
+		// below can straddle a folder switch, and the post-await
+		// writes must land in the bucket that initiated the open,
+		// not whichever folder is current by then.
+		const folderKey = this.activeFolderPath ?? NO_FOLDER_KEY;
 		const folder = this.current;
 		folder.visibleSessionId = id;
 		folder.view = 'session';
@@ -1703,7 +1722,7 @@ class CoderPanelState {
 			// session whose bucket doesn't exist yet still records.
 			const ipcStart = performance.now();
 			const summary = await ipc.coder.openSession(id);
-			this.sessionStateFor(this.activeFolderPath ?? NO_FOLDER_KEY, id).openIpcMs = performance.now() - ipcStart;
+			this.sessionStateFor(folderKey, id).openIpcMs = performance.now() - ipcStart;
 			// If the opened session runs in a worktree, switch the
 			// folder bar to that worktree so the file tree / SCM
 			// view matches what the agent is working on. Guarded
@@ -1728,7 +1747,7 @@ class CoderPanelState {
 			// bucket. Pre-populating it before the IPC call
 			// would race the dispatcher's `session_loaded` clear
 			// of the same bucket, so we only write on failure.
-			this.sessionStateFor(this.activeFolderPath ?? NO_FOLDER_KEY, id).rows = [
+			this.sessionStateFor(folderKey, id).rows = [
 				{
 					kind: 'error',
 					id: `local-${Date.now()}`,
@@ -1966,15 +1985,19 @@ class CoderPanelState {
 			// restore loop (which is mid-flight at that point);
 			// `markWorkspaceReady` flushes the active folder once
 			// the loop is done.
-			void this.#hydrateFolder(path);
-			// If the folder was already hydrated (the user is
-			// switching between a parent and its worktrees, which
-			// share one bucket), proactively switch the visible
-			// session to match the selected folder. First-time
-			// hydration handles this via `#hydrateSession`.
-			if (this.#hydratedFolders.has(path) && this.#workspaceReady) {
-				void this.#selectSessionForActiveFolder();
-			}
+			//
+			// Once hydration settles (an immediate no-op for an
+			// already-hydrated folder), switch the visible session
+			// to match the selected folder. Sequenced behind the
+			// hydrate — not fired concurrently — so a first visit
+			// doesn't race two session-open paths against each
+			// other; `#selectSessionForActiveFolder` is a no-op
+			// when `#hydrateSession` already picked the right one.
+			void this.#hydrateFolder(path).then(() => {
+				if (this.#workspaceReady && this.activeFolderPath === path) {
+					return this.#selectSessionForActiveFolder();
+				}
+			});
 		}
 	}
 
@@ -2062,13 +2085,24 @@ class CoderPanelState {
 	 *  parent (`#activeFolderActual` equals `activeFolderPath` or
 	 *  is `null`), the latest non-worktree session is preferred.
 	 *
-	 *  No-op when the sessions list hasn't loaded yet (first-time
-	 *  hydration handles it via `#hydrateSession`), or when the
-	 *  current visible session already matches. When no matching
-	 *  session exists, the panel falls back to the sessions list
-	 *  view so the user can pick one or start a new one. */
+	 *  Fetches the sessions list first when it's missing — the
+	 *  list is legitimately `null` for an already-hydrated folder
+	 *  (a `session_list_changed` for a non-active folder stale-
+	 *  marks it), and bailing here used to leave the panel stuck
+	 *  on whatever the bucket last showed. No-op when the current
+	 *  visible session already matches. When no matching session
+	 *  exists, the panel falls back to the sessions list view so
+	 *  the user can pick one or start a new one. */
 	async #selectSessionForActiveFolder(): Promise<void> {
 		const folder = this.current;
+		if (folder.sessions === null) {
+			await this.refreshSessions();
+			if (this.current !== folder) {
+				// Folder switched while the list was loading — the
+				// switch's own select pass owns the new folder.
+				return;
+			}
+		}
 		const sessions = folder.sessions;
 		if (sessions === null || sessions.length === 0) {
 			return;
@@ -2145,6 +2179,7 @@ class CoderPanelState {
 	 *  re-hydrate; folders the user has already visited keep
 	 *  their bucket as it stands. */
 	async #hydrateSession(): Promise<void> {
+		const folderKey = this.activeFolderPath ?? NO_FOLDER_KEY;
 		const folder = this.current;
 		// Determine the worktree context: when the actual active
 		// folder is a worktree, only sessions whose
@@ -2158,21 +2193,24 @@ class CoderPanelState {
 				const activeRoot = active.worktree_root ?? null;
 				if (activeRoot === targetRoot) {
 					// Backend's visible session matches the
-					// worktree context — adopt it directly. The
-					// session bucket's transcript / todos / etc.
-					// are not populated here — the live replay
-					// path (`open_session` → `session_loaded` +
-					// replay events) handles that whenever the
-					// user actually clicks into the session, and
-					// an already-running background turn lazy-
-					// creates its bucket on its first inbound
-					// event.
+					// worktree context. If this webview already
+					// holds its transcript (bucket has rows),
+					// adopt it directly. Otherwise — fresh
+					// webview / first visit — go through a real
+					// `openSession` so the backend replays the
+					// records; a bare adopt here left the panel
+					// sitting on an *empty* session view with no
+					// path that would ever populate it.
+					const bucket = this.sessionStateFor(folderKey, active.id);
+					if (bucket.rows.length === 0) {
+						await this.openSession(active.id);
+						return;
+					}
 					folder.visibleSessionId = active.id;
 					folder.view = 'session';
 					// Seed the bucket's `activeSession` metadata
-					// so the header reads sensibly before the
-					// user triggers a replay.
-					this.sessionStateFor(this.activeFolderPath ?? NO_FOLDER_KEY, active.id).activeSession = active;
+					// so the header reads sensibly.
+					bucket.activeSession = active;
 					return;
 				}
 				// Backend's visible session is for a different
@@ -2194,7 +2232,7 @@ class CoderPanelState {
 					const summary = await ipc.coder.openSession(match.id);
 					folder.visibleSessionId = summary.id;
 					folder.view = 'session';
-					const bucket = this.sessionStateFor(this.activeFolderPath ?? NO_FOLDER_KEY, summary.id);
+					const bucket = this.sessionStateFor(folderKey, summary.id);
 					bucket.activeSession = summary;
 					bucket.openIpcMs = performance.now() - ipcStart;
 					return;

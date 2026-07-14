@@ -3585,21 +3585,6 @@ async fn run_turn(
 	format_queue: Arc<crate::tools::FormatQueue>,
 	mut resume_tool_calls: Option<Vec<crate::inference::ToolCall>>,
 ) -> Result<(), CoderError> {
-	// Snapshot the user's current model picks once at turn-start.
-	// A settings flip mid-turn doesn't retroactively change which
-	// model the in-flight requests are talking to; the *next* turn
-	// (or sub-agent, or auto-rename) will see the new pick. `bill_to`
-	// is read fresh per request via the shared handle inside
-	// `InferenceClient` instead.
-	let models = state.models.read().await.clone();
-	let standard_model = models.standard().to_owned();
-	// Resolved route snapshot so every persisted assistant
-	// record carries a `provider/model` stamp matching what
-	// actually served the round-trip. Snapshotted alongside
-	// `models` so a settings flip mid-turn doesn't make this
-	// turn's record claim a route it never spoke to.
-	let pi_model = models.resolve_route().pi_provider_model(&standard_model);
-
 	// Pin the tool context to the **session's** bound folder
 	// (captured at spawn time), not the live `active_folder()`.
 	// This is what makes "agent keeps running in folder X while
@@ -3687,6 +3672,21 @@ async fn run_turn(
 		if cancel.is_cancelled() {
 			return Err(CoderError::Aborted);
 		}
+
+		// Re-read the user's model picks at the top of every
+		// round-trip, matching the per-request route resolution
+		// inside `InferenceClient`. The two MUST come from the
+		// same snapshot generation: pinning the model slug at
+		// turn-start while the route floats per request meant a
+		// provider switch mid-turn sent the old provider's slug
+		// to the new provider's endpoint (e.g. an HF slug to
+		// Anthropic's `/v1/messages` → 404 `model: not found`).
+		// A flip mid-turn now cleanly applies to the *next*
+		// round-trip: model, route, and the persisted
+		// `provider/model` stamp all move together.
+		let models = state.models.read().await.clone();
+		let standard_model = models.standard().to_owned();
+		let pi_model = models.resolve_route().pi_provider_model(&standard_model);
 
 		// Drain any user steers queued via `send()` while this
 		// turn was running. Each one becomes a real
@@ -4348,13 +4348,12 @@ async fn handle_task(
 	// arrive in the parent's folder bucket on the frontend, which
 	// is exactly the multi-session contract: sub-agents belong to
 	// whichever project originated them.
-	let models_snapshot = state.models.read().await.clone();
 	let outcome = run_subagent(
 		&state.tools,
 		&state.inference,
 		sink,
 		&state.coder_sessions_dir,
-		&models_snapshot,
+		&state.models,
 		spec,
 		sub_cancel,
 	)
