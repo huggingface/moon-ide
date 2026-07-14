@@ -2,7 +2,14 @@
 	import { onMount } from 'svelte';
 	import { Compartment, EditorSelection, EditorState, Prec, type Extension } from '@codemirror/state';
 	import { EditorView, highlightActiveLine, highlightActiveLineGutter, keymap, lineNumbers } from '@codemirror/view';
-	import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
+	import {
+		addCursorAbove,
+		addCursorBelow,
+		defaultKeymap,
+		history,
+		historyKeymap,
+		indentWithTab,
+	} from '@codemirror/commands';
 	import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
 	import { searchAsYouType } from '../editor/searchAsYouType';
 	import { bracketMatching, foldGutter, indentOnInput, indentUnit } from '@codemirror/language';
@@ -495,6 +502,12 @@
 				...historyKeymap,
 				...searchKeymap,
 				indentWithTab,
+				// Multi-cursor: Ctrl+Shift+Up/Down aliases the
+				// `addCursorAbove` / `addCursorBelow` commands
+				// that `defaultKeymap` binds to Ctrl+Alt+Up/Down,
+				// for the VS Code / IntelliJ muscle memory.
+				{ key: 'Mod-Shift-ArrowUp', run: addCursorAbove },
+				{ key: 'Mod-Shift-ArrowDown', run: addCursorBelow },
 				// F7 / Shift-F7 mirror the CodeMirror reference
 				// merge example. Quick way to hop between hunks
 				// without leaving the keyboard.

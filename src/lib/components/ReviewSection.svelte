@@ -3,7 +3,14 @@
 	import { Compartment, EditorState, type Extension } from '@codemirror/state';
 	import { EditorView, highlightActiveLine, highlightActiveLineGutter, keymap, lineNumbers } from '@codemirror/view';
 	import { bracketMatching, foldGutter, indentOnInput, indentUnit } from '@codemirror/language';
-	import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
+	import {
+		addCursorAbove,
+		addCursorBelow,
+		defaultKeymap,
+		history,
+		historyKeymap,
+		indentWithTab,
+	} from '@codemirror/commands';
 	import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
 	import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
 	import { searchAsYouType } from '../editor/searchAsYouType';
@@ -355,6 +362,10 @@
 						...historyKeymap,
 						...searchKeymap,
 						indentWithTab,
+						// Multi-cursor: Ctrl+Shift+Up/Down aliases
+						// `addCursorAbove` / `addCursorBelow`.
+						{ key: 'Mod-Shift-ArrowUp', run: addCursorAbove },
+						{ key: 'Mod-Shift-ArrowDown', run: addCursorBelow },
 						// Ctrl+S inside a review section saves the
 						// underlying file, not the synthetic
 						// `review://` buffer that `saveActive` would

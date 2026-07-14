@@ -4,7 +4,15 @@
 	import { EditorState, Compartment, EditorSelection, Prec, Transaction } from '@codemirror/state';
 	import { EditorView, highlightActiveLine, highlightActiveLineGutter, keymap, lineNumbers } from '@codemirror/view';
 	import { highlightTabs } from '../editor/highlightTabs';
-	import { defaultKeymap, history, historyField, historyKeymap, indentWithTab } from '@codemirror/commands';
+	import {
+		addCursorAbove,
+		addCursorBelow,
+		defaultKeymap,
+		history,
+		historyField,
+		historyKeymap,
+		indentWithTab,
+	} from '@codemirror/commands';
 	import { searchKeymap, highlightSelectionMatches } from '@codemirror/search';
 	import { searchAsYouType } from '../editor/searchAsYouType';
 	import { bracketMatching, foldGutter, indentOnInput, indentUnit } from '@codemirror/language';
@@ -736,6 +744,16 @@
 				...historyKeymap,
 				...searchKeymap,
 				indentWithTab,
+				// Ctrl+Shift+Up / Down adds a cursor on the line
+				// above / below — CM ships `addCursorAbove` /
+				// `addCursorBelow` bound to Ctrl+Alt+Up/Down in
+				// `defaultKeymap`; this aliases the gesture to
+				// Ctrl+Shift too so it matches the VS Code / IntelliJ
+				// muscle memory the team is used to. Once cursors
+				// exist, Shift+arrows select, Backspace / Delete
+				// remove per-cursor — all stock CM behaviour.
+				{ key: 'Mod-Shift-ArrowUp', run: addCursorAbove },
+				{ key: 'Mod-Shift-ArrowDown', run: addCursorBelow },
 			]),
 			themeCompartment.of(moonEditorTheme(workspace.effectiveTheme)),
 			languageCompartment.of([]),
