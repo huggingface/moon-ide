@@ -467,7 +467,7 @@ export function gitChangesExtension(): Extension {
 /**
  * Sorted union of every line number that carries a git-change
  * marker (added / modified / deletion above / deletion below).
- * Used by the Alt-Up / Alt-Down navigation commands to step
+ * Used by the F7 / Shift-F7 navigation commands to step
  * between marked lines without caring which bucket they're in —
  * "next change" is the same gesture regardless of whether the
  * line is an addition, a modification, or anchors a deletion.
@@ -506,7 +506,7 @@ function jumpToLine(view: EditorView, lineNo: number): void {
  * Collapse a sorted line array into contiguous `[start, end]`
  * blocks. Two change lines are part of the same block when they're
  * directly adjacent (`n + 1 === next`); a gap of even one unchanged
- * line breaks the run. Used by the Alt-Up / Alt-Down nav so a
+ * line breaks the run. Used by the F7 / Shift-F7 nav so a
  * five-line modified hunk counts as one stop, not five.
  */
 function changeBlocks(lines: number[]): Array<{ start: number; end: number }> {
@@ -530,10 +530,10 @@ function changeBlocks(lines: number[]): Array<{ start: number; end: number }> {
  *
  * Returns `true` when the `gitChangesField` is installed (i.e. this
  * editor has the gitChanges extension) regardless of whether
- * there's somewhere to jump to — the binding deliberately shadows
- * CodeMirror's default `Alt-ArrowDown` (`moveLineDown`) even on a
- * clean buffer; the team wants Alt+Down to mean "next change", not
- * "move line", everywhere.
+ * there's somewhere to jump to — the binding (F7 / Shift-F7)
+ * deliberately swallows the key even on a clean buffer so a press
+ * with no changes to jump to doesn't fall through to an unrelated
+ * handler.
  *
  * Returns `false` when the field isn't installed so the binding
  * falls through to whatever else is bound (host-level handlers,

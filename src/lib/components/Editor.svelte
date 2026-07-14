@@ -697,14 +697,15 @@
 					// within-precedence ordering hands Ctrl-Space to
 					// it next) and `startCompletion` fires there.
 					{ key: 'Ctrl-Space', run: logCtrlSpace },
-					// Alt-Up / Alt-Down → step between git-change
-					// lines (the green/blue/red markers on the
-					// line-number gutter). Shadows CM's default
-					// `moveLineUp` / `moveLineDown` from
-					// `defaultKeymap` below; the team uses these
-					// keys for change navigation, not line moves.
-					{ key: 'Alt-ArrowUp', run: goToPreviousChange },
-					{ key: 'Alt-ArrowDown', run: goToNextChange },
+					// F7 / Shift-F7 → step between git-change lines
+					// (the green/blue/red markers on the line-number
+					// gutter). Same keys the diff view uses for
+					// `goToNextChunk` / `goToPreviousChunk`, so the
+					// gesture is the same across surfaces. Alt+Up /
+					// Alt+Down is left to CM's native `moveLineUp` /
+					// `moveLineDown` from `defaultKeymap` below.
+					{ key: 'F7', run: goToNextChange },
+					{ key: 'Shift-F7', run: goToPreviousChange },
 				]),
 			),
 			// `completionKeymap` lives at `Prec.high` so its

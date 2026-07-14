@@ -13,13 +13,7 @@
 	import { highlightTabs } from '../editor/highlightTabs';
 	import { languageFor } from '../editor/language';
 	import { moonEditorTheme } from '../editor/theme';
-	import {
-		gitChangesExtension,
-		goToNextChange,
-		goToPreviousChange,
-		headTextFacet,
-		overviewMountFacet,
-	} from '../editor/gitChanges';
+	import { gitChangesExtension, headTextFacet, overviewMountFacet } from '../editor/gitChanges';
 	import {
 		applyDiagnostics,
 		filePathFacet,
@@ -489,12 +483,13 @@
 				// handlers at default precedence where they'd lose
 				// to `defaultKeymap` for the popup-open keys.
 				//
-				// Alt-Up / Alt-Down step between git-change lines
-				// (same as the regular editor); listed before
-				// `...defaultKeymap` so within-keymap ordering
-				// beats CM's `moveLineUp` / `moveLineDown`.
-				{ key: 'Alt-ArrowUp', run: goToPreviousChange },
-				{ key: 'Alt-ArrowDown', run: goToNextChange },
+				// "Next change" in the diff view is the merge
+				// chunk nav (`goToNextChunk` / `goToPreviousChunk`)
+				// bound further down on F7 / Shift-F7 — same keys
+				// the regular editor uses for its git-change
+				// gutter nav, so the gesture is consistent across
+				// surfaces. Alt+Up / Alt+Down is left to CM's
+				// native `moveLineUp` / `moveLineDown`.
 				...closeBracketsKeymap,
 				...defaultKeymap,
 				...historyKeymap,
