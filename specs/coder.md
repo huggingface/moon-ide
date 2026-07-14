@@ -492,6 +492,17 @@ stale pointer (JSONL deleted out-of-band) falls through to the
 sessions list and self-heals on the next open/send. Background turns
 don't survive a process restart.
 
+Selection order on a folder switch (and on first hydration) is
+**last opened, else most recent**, scoped to the target worktree
+context. `last_session_by_folder` is keyed by the **actual** active
+folder path (the worktree path when a worktree is active), so a
+parent and each of its worktrees each remember their own last-opened
+session. The pointer wins when it still exists on disk; otherwise the
+most-recently-active session whose `worktree_root` matches the context
+takes over. Pure mtime is the fallback only — it must never win over a
+still-valid last-opened pointer, or a just-finished background turn
+in another session would hijack the one the user actually had open.
+
 The session list paints per-row status: **needs input** (parked on
 `ask_user`; takes precedence over running), **running** (busy), and
 **finished** (turn ended while the user wasn't following; cleared on

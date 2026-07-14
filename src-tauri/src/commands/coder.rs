@@ -366,6 +366,29 @@ pub async fn coder_active_session(state: State<'_, AppState>) -> Result<Option<S
 	Ok(state.coder.active_session().await)
 }
 
+/// The last-opened session id recorded for the **active workspace
+/// folder** in `AppState.coder.last_session_by_folder`. `None` when
+/// no entry exists (first visit, or the folder's last session was
+/// deleted). The panel uses this as the preferred pick on a folder
+/// switch, with mtime as the fallback — "last opened, else most
+/// recent".
+///
+/// Keyed by the **actual** active folder path (worktree-aware),
+/// matching `coder_open_session` / `coder_send` / `coder_delete_session`.
+/// So switching between a parent and its worktree resolves to the
+/// session the user last opened in *that* worktree context, not a
+/// single shared id for the whole coder root.
+#[tauri::command]
+pub async fn coder_last_opened_session(state: State<'_, AppState>) -> Result<Option<String>, MoonError> {
+	let Some(folder) = active_folder_path(&state).await else {
+		return Ok(None);
+	};
+	let app = app_state_store::load(&state.config_dir)
+		.await
+		.map_err(MoonError::from)?;
+	Ok(app.coder.last_session_by_folder.get(&folder).cloned())
+}
+
 /// Drop the in-memory session and start a blank one. Doesn't
 /// touch disk — empty sessions never write a file.
 #[tauri::command]

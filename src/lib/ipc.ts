@@ -392,6 +392,7 @@ export const ipc = {
 		rerunToolCall: (toolCallId: string) => invoke<RerunToolOutcome>('coder_rerun_tool_call', { toolCallId }),
 		listSessions: () => invoke<CoderSessionSummary[]>('coder_list_sessions'),
 		activeSession: () => invoke<CoderSessionSummary | null>('coder_active_session'),
+		lastOpenedSession: () => invoke<string | null>('coder_last_opened_session'),
 		newSession: () => invoke<CoderSessionSummary>('coder_new_session'),
 		newCoordinatorSession: () => invoke<CoderSessionSummary>('coder_new_coordinator_session'),
 		newWorktreeSession: (baseBranch?: string) =>

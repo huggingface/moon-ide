@@ -1995,7 +1995,7 @@ class CoderPanelState {
 			// when `#hydrateSession` already picked the right one.
 			void this.#hydrateFolder(path).then(() => {
 				if (this.#workspaceReady && this.activeFolderPath === path) {
-					return this.#selectSessionForActiveFolder();
+					void this.#selectSessionForActiveFolder();
 				}
 			});
 		}
@@ -2076,20 +2076,29 @@ class CoderPanelState {
 		this.#onWorktreeSessionOpen = cb;
 	}
 
-	/** Pick the latest session matching the actual active folder's
-	 *  worktree context and switch the visible session to it.
+	/** Pick the session to show for the active folder's worktree
+	 *  context and switch the visible session to it.
 	 *
-	 *  When the active folder is a worktree (`#activeFolderActual`
-	 *  differs from `activeFolderPath`), the latest session whose
-	 *  `worktree_root` matches is preferred. When the user is on the
-	 *  parent (`#activeFolderActual` equals `activeFolderPath` or
-	 *  is `null`), the latest non-worktree session is preferred.
+	 *  Selection order: **last opened** (the id the user last had
+	 *  visible in this worktree context, from
+	 *  `AppState.coder.last_session_by_folder` keyed by the actual
+	 *  folder path) when it still exists on disk, otherwise the
+	 *  **most recently active** matching session. This restores
+	 *  the pre-worktree-commit semantics the commit deleted: "last
+	 *  opened, else most recent" rather than purely mtime, which
+	 *  picked a just-finished background turn or a recently-errored
+	 *  session over the one the user actually had open.
 	 *
-	 *  Fetches the sessions list first when it's missing — the
-	 *  list is legitimately `null` for an already-hydrated folder
-	 *  (a `session_list_changed` for a non-active folder stale-
-	 *  marks it), and bailing here used to leave the panel stuck
-	 *  on whatever the bucket last showed. No-op when the current
+	 *  "Matching" means the session's `worktree_root` lines up with
+	 *  the actual active folder — the latest session in a worktree
+	 *  the user switched away from never wins on the parent, and
+	 *  vice versa.
+	 *
+	 *  Fetches the sessions list first when it's missing — the list
+	 *  is legitimately `null` for an already-hydrated folder (a
+	 *  `session_list_changed` for a non-active folder stale-marks
+	 *  it), and bailing here used to leave the panel stuck on
+	 *  whatever the bucket last showed. No-op when the current
 	 *  visible session already matches. When no matching session
 	 *  exists, the panel falls back to the sessions list view so
 	 *  the user can pick one or start a new one. */
@@ -2107,7 +2116,30 @@ class CoderPanelState {
 		if (sessions === null || sessions.length === 0) {
 			return;
 		}
-		const match = this.#latestSessionForActiveFolder(sessions);
+		// Prefer the last-opened session id for this worktree
+		// context when it's still on disk. Best-effort: a load
+		// failure or a stale id falls through to the mtime pick
+		// below — never an error row here.
+		let lastOpenedId: string | null = null;
+		try {
+			lastOpenedId = await ipc.coder.lastOpenedSession();
+		} catch {
+			// AppState read failed — fall back to mtime ranking.
+		}
+		let match: CoderSessionSummary | null = null;
+		if (lastOpenedId !== null) {
+			match = sessions.find((s) => s.id === lastOpenedId) ?? null;
+			if (match !== null && !this.#sessionMatchesActiveFolder(match)) {
+				// Pointer is for a different worktree context than
+				// the one we're entering (shouldn't happen given the
+				// key is the actual folder path, but defensive) —
+				// don't trust it.
+				match = null;
+			}
+		}
+		if (match === null) {
+			match = this.#latestSessionForActiveFolder(sessions);
+		}
 		if (match !== null) {
 			// Already viewing the right session — nothing to do.
 			if (folder.visibleSessionId === match.id) {
@@ -2122,16 +2154,23 @@ class CoderPanelState {
 		}
 	}
 
+	/** True when a session's `worktree_root` lines up with the
+	 *  actual active folder — the worktree path when on a worktree,
+	 *  `null` when on the parent. */
+	#sessionMatchesActiveFolder(s: CoderSessionSummary): boolean {
+		const isWorktree = this.#activeFolderActual !== null && this.#activeFolderActual !== this.activeFolderPath;
+		const target = isWorktree ? this.#activeFolderActual : null;
+		return (s.worktree_root ?? null) === target;
+	}
+
 	/** Find the most recently updated session whose `worktree_root`
 	 *  matches the actual active folder. When the active folder is
 	 *  the parent (not a worktree), matches sessions with no
 	 *  `worktree_root` instead. Returns `null` when none match. */
 	#latestSessionForActiveFolder(sessions: CoderSessionSummary[]): CoderSessionSummary | null {
-		const isWorktree = this.#activeFolderActual !== null && this.#activeFolderActual !== this.activeFolderPath;
-		const target = isWorktree ? this.#activeFolderActual : null;
 		let best: CoderSessionSummary | null = null;
 		for (const s of sessions) {
-			if ((s.worktree_root ?? null) === target) {
+			if (this.#sessionMatchesActiveFolder(s)) {
 				if (best === null || s.updated_at_ms > best.updated_at_ms) {
 					best = s;
 				}
@@ -2225,7 +2264,26 @@ class CoderPanelState {
 		await this.refreshSessions();
 		const sessions = folder.sessions;
 		if (sessions !== null && sessions.length > 0) {
-			const match = this.#latestSessionForActiveFolder(sessions);
+			// Same "last opened, else most recent" ranking the
+			// folder-switch path uses — the `last_session_by_folder`
+			// pointer (keyed by the actual folder path) first, then
+			// mtime. Restores the pre-worktree-commit fallback the
+			// commit deleted.
+			let match: CoderSessionSummary | null = null;
+			try {
+				const lastOpenedId = await ipc.coder.lastOpenedSession();
+				if (lastOpenedId !== null) {
+					const found = sessions.find((s) => s.id === lastOpenedId) ?? null;
+					if (found !== null && this.#sessionMatchesActiveFolder(found)) {
+						match = found;
+					}
+				}
+			} catch {
+				// AppState read failed — fall back to mtime ranking.
+			}
+			if (match === null) {
+				match = this.#latestSessionForActiveFolder(sessions);
+			}
 			if (match !== null) {
 				try {
 					const ipcStart = performance.now();

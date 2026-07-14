@@ -250,6 +250,7 @@ pub fn run() {
 			commands::coder::coder_rerun_tool_call,
 			commands::coder::coder_list_sessions,
 			commands::coder::coder_active_session,
+			commands::coder::coder_last_opened_session,
 			commands::coder::coder_new_session,
 			commands::coder::coder_new_coordinator_session,
 			commands::coder::coder_new_worktree_session,
