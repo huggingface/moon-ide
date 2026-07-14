@@ -12,10 +12,10 @@ This file is read by AI coding agents (Cursor, Claude Code, opencode, etc.) when
 ## Update-as-you-go
 
 - If a spec is wrong or incomplete and you fix the underlying code, **update the spec in the same change**.
-- New non-trivial decisions get a new ADR in `specs/decisions/NNNN-short-title.md`. Don't rewrite old ADRs; supersede them with a new one.
+- New non-trivial decisions get a new ADR in `specs/decisions/NNNN-short-title.md`. Don't rewrite old ADRs; supersede them with a new one. ADRs and roadmap entries stay as terse as specs do — context, decision, rejected alternatives — not a play-by-play of the implementation.
 - Keep specs short, opinionated, and current. They are not aspirational marketing.
 - Specs record **contracts and intent**: wire shapes, schemas, invariants, behavior the user can observe, and the _why_ behind non-obvious decisions (including rejected alternatives). They do **not** narrate the implementation — no lock orders, no function-by-function walkthroughs, no event-choreography play-by-plays, no Svelte/Rust internals that `git log -p` and code comments already cover. Litmus test: if the paragraph would have to change after a behavior-preserving refactor, it belongs in the code, not the spec. When detail matters, link the file or test plan instead of inlining it.
-- **Major features and phase deliverables** get a test plan in `specs/test-plans/NNNN-short-slug.md`, written before the commit (or while the human is testing). Routine bug fixes, small UI tweaks, new keybindings, single-file refactors, and incremental polish **skip the test plan** — `git log -p` plus a clear commit body covers what changed. When in doubt, **skip**. See [specs/test-plans/README.md](specs/test-plans/README.md) for what still earns a plan and the required headers.
+- **Test plans are outdated.** Don't create new ones and don't modify existing ones — the historical files in `specs/test-plans/` are left in place as a record but are no longer maintained. Record intent in ADRs and roadmap entries instead (terse — context, decision, alternatives); a clear commit body + `git log -p` covers everything else.
 
 ## House rules
 
@@ -85,4 +85,4 @@ These are enforced by reviewers and CI; breaking them is a real bug:
 - Commits should be atomic and tell a story; no "wip" or "fix" alone.
 - A change that touches both Rust and TS for the same feature lands in one commit.
 - Reference the spec/ADR you're implementing in the commit body when relevant.
-- When a commit ships with a test plan (major features / phase deliverables), reference it in the commit body: `Test plan: specs/test-plans/NNNN-...md`. The test plan file is part of the same commit. Most commits won't have one, and that's fine.
+- Commits no longer ship with test plans (see "Test plans are outdated" above).
