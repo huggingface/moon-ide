@@ -49,9 +49,10 @@ need full type info to find.
   and `suspicious` (warn) are on; `style` is on with the project rules.
 - **Type-checker**: `@typescript/native-preview` (the Go port of `tsc`,
   shipped as `tsgo`), used for `tsgo --noEmit` checks. The classic
-  `typescript` package stays as a dev dependency only because
-  `svelte-check` needs it; once `svelte-check` learns about `tsgo` we
-  drop classic `tsc`.
+  `typescript@6` package stays as a dev dependency because
+  `svelte-fast-check`'s `svelte2tsx` needs its programmatic JS API
+  (TS 7's `typescript` drops that API); `svelte-fast-check` itself
+  type-checks via `tsgo`.
 
 ### Svelte — Prettier (for now)
 
@@ -99,7 +100,7 @@ codebase, plus `:js` / `:rust` variants for the impatient:
   (`cargo clippy ... -- -D warnings`).
 - `bun run lint:fix` — auto-fixable JS/TS rules, plus a clippy run
   for visibility.
-- `bun run check` — `tsgo --noEmit`, `svelte-check`, and
+- `bun run check` — `tsgo --noEmit`, `svelte-fast-check`, and
   `cargo check` (excludes the Tauri shell, which needs system libs).
 - `bun run test` — `cargo test --workspace --exclude moon-desktop`.
 
@@ -111,7 +112,7 @@ formatters on staged files only.
 - One formatter for the whole JS/TS surface, one for Svelte, one for
   Rust. Three configs, no daisy-chaining of plugins.
 - We accept that Svelte template lint is weaker than the rest until
-  oxlint catches up. We compensate with `svelte-check` types.
+  oxlint catches up. We compensate with `svelte-fast-check` types.
 - We commit to the Oxc ecosystem evolving. If `oxlint --type-aware`
   regresses or the Svelte gap stays open for too long, we revisit and
   potentially fall back to ESLint for those files only.

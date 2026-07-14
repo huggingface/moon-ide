@@ -33,3 +33,6 @@ src-tauri/resources/bridge/*
 !src-tauri/resources/bridge/.gitkeep
 companion/dist/
 /coder-export/
+
+# svelte-fast-check generated tsx/tsconfig cache (check:svelte / check:companion).
+.fast-check/

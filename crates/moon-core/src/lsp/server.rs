@@ -113,18 +113,16 @@ pub enum DiscoveryStrategy {
 ///
 /// We target `tsgo` (Microsoft's native Go port of TypeScript, shipped
 /// as `@typescript/native-preview`) rather than the community
-/// `typescript-language-server` wrapper. Two reasons:
-///
-/// 1. It's already in moon-ide's devDependencies (used by the
-///    `check:ts` script) — no extra setup cost. Discovery finds it in
-///    `node_modules/.bin/` automatically.
-/// 2. `typescript-language-server`'s own README says it expects to be
-///    superseded by TS 7 / `tsgo`. Adopting the native port now avoids
-///    a migration later and gets the ~10× speed-up for free.
-///
-/// If a project ships `typescript-language-server` instead, flip this
-/// spec — the LSP wire format is identical and nothing else has to
-/// change. See [`specs/lsp.md`].
+/// `typescript-language-server` wrapper. TS 7's `typescript` package
+/// also ships a native `tsc` that speaks `--lsp --stdio`, but that
+/// package drops the programmatic JS API — so tooling that embeds the
+/// compiler (`svelte2tsx`, used by `svelte-fast-check`) still needs
+/// the classic `typescript@6` for its API. Keeping `tsgo` as the LSP
+/// sidesteps that split: version-independent, no Node runtime, ~10×
+/// faster than TS 6, and a fresh `bun install` is all a contributor
+/// needs. If a project ships `typescript-language-server` instead,
+/// flip this spec — the LSP wire format is identical and nothing else
+/// has to change. See [`specs/lsp.md`].
 pub const TS_SERVER: LspBinarySpec = LspBinarySpec {
 	language_id: "typescript",
 	bin_name: "tsgo",
