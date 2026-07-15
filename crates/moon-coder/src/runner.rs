@@ -1358,6 +1358,18 @@ impl CoderHandle {
 	/// / "send your first message" state. Two-step look-up rather
 	/// than `visible_runtime()` so we don't lazy-create a blank
 	/// runtime entry on every status poll from the empty state.
+	/// Coder-root folder path for the current active folder —
+	/// worktree folders resolve to their parent project root, same
+	/// routing every session command uses. `None` when no folder
+	/// is active. Exposed so the `coder_open_session` command can
+	/// build the last-session pointer key from the opened
+	/// summary's own worktree context instead of whatever folder
+	/// happens to be active once the open settles.
+	pub async fn coder_root_path(&self) -> Option<String> {
+		let (_, folder_path) = self.state.active_folder_session().await.ok()?;
+		Some(folder_path.into_string())
+	}
+
 	pub async fn active_session(&self) -> Option<SessionSummary> {
 		let (fs, _) = self.state.active_folder_session().await.ok()?;
 		let id = fs.visible_session_id().await?;
@@ -1861,7 +1873,8 @@ impl CoderHandle {
 	pub async fn replay_from_message(&self, user_ordinal: usize) -> Result<(), CoderError> {
 		self.ensure_can_send().await?;
 		let dropped = self.revert_to_message(user_ordinal).await?;
-		self.send(dropped.text, dropped.images).await
+		self.send(dropped.text, dropped.images).await?;
+		Ok(())
 	}
 
 	/// Resume the turn from a mid-turn agent response: truncate the
@@ -2610,7 +2623,7 @@ impl CoderHandle {
 		Ok(())
 	}
 
-	pub async fn send(&self, text: String, images: Vec<ImageAttachment>) -> Result<(), CoderError> {
+	pub async fn send(&self, text: String, images: Vec<ImageAttachment>) -> Result<SendTarget, CoderError> {
 		// Bail early if the active route can't authenticate —
 		// surface a clean error instead of letting the inference
 		// layer fail on the first request. HF needs OAuth; user
@@ -2619,6 +2632,15 @@ impl CoderHandle {
 		// llama.cpp).
 		self.ensure_can_send().await?;
 		let (rt, session_id, folder_path) = self.state.active_visible_runtime().await?;
+		// Snapshot where this message is going *now*, so callers
+		// can persist the "last opened session" pointer against
+		// the folder that actually received it — re-reading the
+		// active folder after the await races a project switch.
+		let target = SendTarget {
+			coder_root: folder_path.to_string(),
+			worktree_root: rt.session.lock().await.header.worktree_root.clone(),
+			session_id: session_id.clone(),
+		};
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
 
 		// A second `send` while the **visible session's** turn is
@@ -2667,7 +2689,7 @@ impl CoderHandle {
 					queued: true,
 					created_at_ms: Some(current_time_ms()),
 				});
-				return Ok(());
+				return Ok(target);
 			}
 		}
 
@@ -2787,7 +2809,7 @@ impl CoderHandle {
 			auto_rename_after,
 			None,
 		);
-		Ok(())
+		Ok(target)
 	}
 
 	/// Cancel the **active folder's visible session** turn (if
@@ -3232,6 +3254,34 @@ struct RebuiltMessages {
 	messages: Vec<ChatMessage>,
 	last_usage: Option<TokenUsage>,
 	last_todos: Vec<crate::TodoItem>,
+}
+
+/// Where a [`Coder::send`] actually landed, resolved when the send
+/// picked its target. Callers that persist the per-folder "last
+/// opened session" pointer must key off this instead of re-reading
+/// the active folder after the await — a user who hits Enter and
+/// immediately switches projects would otherwise pin the pointer
+/// under the *new* folder's key and leave the sending folder's
+/// pointer stale (the "project switch lands on an old session"
+/// bug).
+#[derive(Debug, Clone)]
+pub struct SendTarget {
+	/// Coder-root folder path — worktree sessions are filed under
+	/// their parent project root.
+	pub coder_root: String,
+	/// The session's git-worktree root when it runs in one.
+	pub worktree_root: Option<String>,
+	/// Session id the message went to.
+	pub session_id: String,
+}
+
+impl SendTarget {
+	/// Key for `AppState.coder.last_session_by_folder`: the actual
+	/// folder context the session drives — its worktree path when
+	/// it has one, else the coder root.
+	pub fn pointer_key(&self) -> &str {
+		self.worktree_root.as_deref().unwrap_or(&self.coder_root)
+	}
 }
 
 /// Result of [`Coder::rerun_tool_call`] — the tool that was

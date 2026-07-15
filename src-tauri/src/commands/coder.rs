@@ -102,8 +102,8 @@ pub async fn coder_sign_out(state: State<'_, AppState>) -> Result<(), MoonError>
 /// the `coder:event` channel. Errors here mean the turn never
 /// started (no auth, already-running turn, etc.).
 ///
-/// Pins `last_session_by_folder[active]` to the active session after
-/// a successful send. Two reasons:
+/// Pins `last_session_by_folder` to the session the send landed in.
+/// Two reasons:
 ///
 /// 1. `new_session` doesn't persist a pointer — empty sessions
 ///    aren't on disk yet, so there's no id worth remembering until
@@ -119,6 +119,13 @@ pub async fn coder_sign_out(state: State<'_, AppState>) -> Result<(), MoonError>
 ///    into a self-healing one — the first send after a relaunch
 ///    refreshes the pointer for next time.
 ///
+/// The pointer key + session id come from the [`SendTarget`] the
+/// send itself resolved — **not** from re-reading the active folder
+/// after the await. A user who hits Enter and immediately switches
+/// projects would otherwise pin the message's session under the new
+/// folder's key and leave the sending folder's pointer stale, so
+/// switching back later landed on an older session.
+///
 /// `persist_last_session` is a cheap no-op when the pointer
 /// already matches, so we don't bother gating it on "is the
 /// pointer stale".
@@ -128,13 +135,8 @@ pub async fn coder_send(
 	text: String,
 	images: Vec<ImageAttachment>,
 ) -> Result<(), MoonError> {
-	state.coder.send(text, images).await.map_err(MoonError::from)?;
-	let folder = active_folder_path(&state).await;
-	if let Some(folder) = folder {
-		if let Some(summary) = state.coder.active_session().await {
-			persist_last_session(&state.config_dir, &folder, Some(summary.id)).await;
-		}
-	}
+	let target = state.coder.send(text, images).await.map_err(MoonError::from)?;
+	persist_last_session(&state.config_dir, target.pointer_key(), Some(target.session_id.clone())).await;
 	Ok(())
 }
 
@@ -735,7 +737,16 @@ pub async fn coder_set_bash_target_override(state: State<'_, AppState>, force_ho
 #[tauri::command]
 pub async fn coder_open_session(state: State<'_, AppState>, id: String) -> Result<SessionSummary, MoonError> {
 	let summary = state.coder.open_session(id).await.map_err(MoonError::from)?;
-	let folder = active_folder_path(&state).await;
+	// Pointer key from the opened session's own worktree context
+	// (worktree path when it has one, else the coder root the open
+	// resolved against) — not the raw active folder. Opening a
+	// worktree session from the parent's list would otherwise
+	// clobber the parent's pointer with a session that gets
+	// filtered out on the next folder switch.
+	let folder = match summary.worktree_root.clone() {
+		Some(root) => Some(root),
+		None => state.coder.coder_root_path().await,
+	};
 	if let Some(folder) = folder {
 		persist_last_session(&state.config_dir, &folder, Some(summary.id.clone())).await;
 	}

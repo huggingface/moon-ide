@@ -2141,6 +2141,14 @@ class CoderPanelState {
 		} catch {
 			// AppState read failed — fall back to mtime ranking.
 		}
+		if (this.current !== folder) {
+			// Folder switched while the pointer was loading — the
+			// IPC read the *new* folder's pointer (the backend keys
+			// it off its live active folder), so acting on it here
+			// would open the wrong folder's session. The new
+			// switch's own select pass owns it.
+			return;
+		}
 		let match: CoderSessionSummary | null = null;
 		if (lastOpenedId !== null) {
 			match = sessions.find((s) => s.id === lastOpenedId) ?? null;
