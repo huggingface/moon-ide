@@ -1,41 +1,35 @@
 <script lang="ts">
 	import { onDestroy } from 'svelte';
-	import { getCachedMarkdown, handleMarkdownCopyClick, openExternalMarkdownLink, renderMarkdown } from '../markdown';
+	import {
+		getCachedMarkdownBlocks,
+		handleMarkdownCopyClick,
+		openExternalMarkdownLink,
+		renderMarkdownBlocks,
+		type MarkdownBlock,
+	} from '../markdown';
 	import { workspace } from '../state.svelte';
 	import { visibleOnce } from '../actions/visibleOnce';
 
 	type Props = { text: string };
 	let { text }: Props = $props();
 
-	// Same async-render dance as `MarkdownView.svelte`: `renderMarkdown`
-	// preloads CodeMirror grammars for every fenced-code language
-	// before the synchronous render, so the call has to be awaited.
+	// Block-level streaming render: instead of one `{@html html}` that
+	// rebuilds the entire markdown subtree on every chunk, we split the
+	// parsed token stream into top-level blocks (paragraphs, fences,
+	// lists, …) and render each independently. During streaming, only
+	// the last (still-growing) block changes between deltas; all earlier
+	// blocks are "frozen" and hit the per-block cache, so Svelte's keyed
+	// `{@html}` effect sees the same HTML string and skips the
+	// `innerHTML` write — frozen blocks' DOM nodes are never touched
+	// mid-stream. That is what eliminates the flicker that a
+	// whole-document `{@html}` rebuild caused.
 	//
-	// Streaming (Phase 6.1) lands ~30 deltas/second per assistant
-	// message. Re-running markdown-it + DOMPurify + grammar lookup
-	// once per delta is wasteful; coalesce to one render per
-	// animation frame and always pick up the *latest* source. The
-	// effect itself stays cheap — only `pendingSource` mutates per
-	// keystroke; the rAF callback does the actual work.
-	//
-	// Folder-switch fast path: if the text was rendered earlier in
-	// this dev session, `getCachedMarkdown` returns the sanitised
-	// HTML synchronously and we apply it during the same Svelte
-	// flush as the mount. Skipping the `rAF` + async `renderMarkdown`
-	// dance for cached rows is what lets a folder-swap back to an
-	// already-visited session avoid the cascade of N concurrent
-	// `{@html}` updates that previously batched into one big style
-	// recalc (test-plan 0076, ship 6).
-	//
-	// Cold-cache fast path: rows that are below the fold on mount
-	// stay as a plain-text placeholder until their `visibleOnce`
-	// observer fires (test-plan 0076, ship 7). The placeholder
-	// keeps the text searchable for `Ctrl+F` and roughly preserves
-	// row height; the async render only kicks off once the user
-	// scrolls close to the row, so a fresh folder swap into a long
-	// session no longer pays for N concurrent grammar loads + N
-	// concurrent `{@html}` swaps.
-	let html = $state('');
+	// See `renderMarkdownBlocks` in `src/lib/markdown.ts` for the
+	// token-level splitting and per-block caching. The rAF coalescer
+	// + renderToken guard + visibility gate below are the same shape
+	// as the old whole-string path — they now bound the block-array
+	// re-render instead of the whole-document one.
+	let blocks = $state<MarkdownBlock[]>([]);
 	let pendingSource = '';
 	let pendingFrame: number | null = null;
 	let renderToken = 0;
@@ -44,8 +38,8 @@
 	let visible = $state(false);
 
 	// Flip `mounted` false on component destruction so an in-flight
-	// `renderMarkdown` promise that resolves after unmount skips its
-	// `html` write and doesn't schedule a dangling rAF.
+	// `renderMarkdownBlocks` promise that resolves after unmount skips
+	// its `blocks` write and doesn't schedule a dangling rAF.
 	onDestroy(() => {
 		mounted = false;
 	});
@@ -56,11 +50,6 @@
 		}
 		pendingFrame = requestAnimationFrame(() => {
 			pendingFrame = null;
-			// Don't start a new render while one is in flight — the
-			// in-flight render re-schedules on completion if the source
-			// has moved on (see below). This bounds CPU to one
-			// markdown-it + DOMPurify pass at a time instead of fanning
-			// out to one per rAF during a fast stream.
 			if (renderInFlight) {
 				return;
 			}
@@ -68,35 +57,19 @@
 			const token = renderToken;
 			renderInFlight = true;
 			void (async () => {
-				// `linkify: true` so raw URLs in the model's prose
-				// become clickable. Differs from file-content
-				// rendering (`MarkdownView.svelte`), which leaves
-				// linkify off because the author would have used
-				// `[text](url)` if they meant a link.
-				const rendered = await renderMarkdown(source, { linkify: true });
+				const rendered = await renderMarkdownBlocks(source, { linkify: true });
 				renderInFlight = false;
 				if (!mounted) {
 					return;
 				}
-				// Only write `html` if no explicit invalidation (a
-				// cache hit in the effect, which bumps `renderToken`)
-				// happened while we were rendering. We deliberately do
-				// NOT bump the token here: doing so would invalidate
-				// every in-flight render on every rAF, and during
-				// continuous streaming (deltas every ~33 ms, rAF every
-				// ~16 ms) no render would ever complete before the next
-				// rAF bumped the token again. The result was `html`
-				// freezing on a stale snapshot for the entire stream —
-				// visible as a "flickering rectangle" of outdated text
-				// that stayed fixed until `assistant_message_end` broke
-				// the cycle.
+				// Same token-guard rationale as before: only write
+				// `blocks` if no explicit invalidation (a sync cache
+				// hit in the effect, which bumps `renderToken`)
+				// happened while we were rendering. See the comment
+				// in the `$effect` below.
 				if (token === renderToken) {
-					html = rendered;
+					blocks = rendered;
 				}
-				// If the source changed while we were rendering, schedule
-				// a fresh render for the latest snapshot. Without this,
-				// the last delta before a render completed would be lost
-				// until the next effect re-run.
 				if (pendingSource !== source) {
 					scheduleRender();
 				}
@@ -106,15 +79,15 @@
 
 	$effect(() => {
 		const source = text;
-		// Sync cache hit: apply rendered HTML inside the current
+		// Sync cache hit: apply the block array inside the current
 		// Svelte flush, no rAF, no async. Bumping `renderToken`
 		// invalidates any in-flight async render so a stale resolve
-		// doesn't overwrite the cached value we just installed.
-		// Cache hits skip the visibility gate entirely — applying a
-		// precomputed string is essentially free and matching the
+		// doesn't overwrite the cached blocks we just installed.
+		// Cache hits skip the visibility gate — applying a
+		// precomputed array is essentially free and matching the
 		// formatted layout on the first paint avoids a
 		// placeholder→content swap when the row is already on-screen.
-		const cached = getCachedMarkdown(source, { linkify: true });
+		const cached = getCachedMarkdownBlocks(source, { linkify: true });
 		if (cached !== undefined) {
 			pendingSource = source;
 			renderToken++;
@@ -122,7 +95,7 @@
 				cancelAnimationFrame(pendingFrame);
 				pendingFrame = null;
 			}
-			html = cached;
+			blocks = cached;
 			return () => {};
 		}
 		// Cache miss: defer the async render until the row is in
@@ -134,14 +107,6 @@
 			return () => {};
 		}
 		pendingSource = source;
-		// Bump the token on every new source so an in-flight render
-		// (started from an earlier delta) knows it's stale and skips
-		// the `html` write. Unlike the old code — which bumped the
-		// token inside the rAF callback on *every frame* — we only
-		// bump here, once per actual source change. During continuous
-		// streaming that's ~30 bumps/sec (one per delta), not ~60
-		// (one per rAF), so a renderMarkdown that takes ~5–15 ms has a
-		// real chance of completing between bumps.
 		renderToken++;
 		scheduleRender();
 		return () => {
@@ -199,15 +164,15 @@
 </script>
 
 <!--
-	Output of `renderMarkdown` has been DOMPurified upstream — see
-	`src/lib/markdown.ts` for the rationale. svelte-ignore: clicks
-	are delegated to anchors, the article isn't a button.
+	Output of `renderMarkdownBlocks` has been DOMPurified upstream —
+	see `src/lib/markdown.ts` for the rationale. svelte-ignore:
+	clicks are delegated to anchors, the article isn't a button.
 
 	`use:visibleOnce` flips `visible` once the row scrolls into
 	(or near) the viewport. The cache fast-path in the script
-	bypasses the gate by setting `html` synchronously; cache
+	bypasses the gate by setting `blocks` synchronously; cache
 	misses on off-screen rows fall through to the placeholder
-	until the observer fires. Once `html` is non-empty we always
+	until the observer fires. Once `blocks` is non-empty we always
 	render the formatted output — the placeholder is purely a
 	pre-render state, never a "scrolled away" state.
 -->
@@ -220,8 +185,10 @@
 		visible = true;
 	}}
 >
-	{#if html !== ''}
-		{@html html}
+	{#if blocks.length > 0}
+		{#each blocks as block (block.key)}
+			{@html block.html}
+		{/each}
 	{:else}
 		<span class="coder-md-placeholder">{text}</span>
 	{/if}

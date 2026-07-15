@@ -223,11 +223,14 @@ checker works`. Watch CPU usage (Activity Monitor / `top`)
   are not surfaced. The parser silently drops the field; add
   it as a separate event variant when a real prompt benefits
   from it. Out of scope for 6.1 per the roadmap update.
-- `CoderMarkdown` re-renders the _full_ assistant text every
-  rAF tick, not just the new tail. For a 5 KB final message
-  that's fine; for a 200 KB monster reply it'd start to hurt.
-  Streaming patches via DOM diffing land if anybody actually
-  hits this in practice.
+- ~~`CoderMarkdown` re-renders the _full_ assistant text every
+  rAF tick, not just the new tail.~~ Resolved by [ADR 0032](../decisions/0032-block-level-markdown-streaming.md):
+  `CoderMarkdown` now splits the parsed token stream into
+  top-level blocks and renders each independently. Frozen blocks
+  (everything except the still-growing tail) hit the per-block
+  cache and Svelte's keyed `{@html}` skips the `innerHTML` write,
+  so their DOM nodes survive across deltas — no flicker. Only the
+  live tail block is re-rendered.
 - Tool calls dispatch sequentially within one assistant turn.
   pi-mono's parallel dispatch is on the roadmap if a workload
   needs it.

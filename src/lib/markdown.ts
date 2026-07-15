@@ -1,5 +1,11 @@
 import MarkdownIt from 'markdown-it';
 import DOMPurify from 'dompurify';
+
+// markdown-it's types use `export =` (CommonJS), so the `Token`
+// type isn't directly importable. Infer it from `md.parse()` —
+// `parse` returns `Token[]`, so `ReturnType` gives us the array
+// and `number` indexes the element type.
+type MdToken = ReturnType<typeof md.parse>[number];
 import { parse as parseYaml } from 'yaml';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { extractFenceLanguages, highlightCode, loadHighlighters } from './editor/highlightCode';
@@ -259,6 +265,50 @@ export function getCachedMarkdown(source: string, options: { linkify?: boolean }
 }
 
 /**
+ * A single rendered top-level markdown block — one paragraph,
+ * heading, fenced code block, list, blockquote, table, etc. — with
+ * a stable key for Svelte's keyed `{#each}`.
+ *
+ * `renderMarkdownBlocks` splits the parsed token stream at block
+ * boundaries and renders each block independently. During streaming,
+ * only the last (still-growing) block changes between deltas; all
+ * earlier blocks are "frozen" — their source text, tokens, and
+ * rendered HTML are identical. Svelte's keyed `{@html}` effect sees
+ * the same HTML string for a frozen block and skips the `innerHTML`
+ * write, so frozen blocks' DOM nodes are never touched mid-stream.
+ * This is what eliminates the flicker that a whole-document
+ * `{@html}` rebuild causes.
+ */
+export type MarkdownBlock = {
+	key: string;
+	html: string;
+};
+
+/**
+ * Per-block rendered-HTML cache. Keyed by the block's source text
+ * (extracted from the token `map` line range) and its index in the
+ * document — the index disambiguates two blocks with the same source
+ * text whose HTML differs (e.g. duplicate headings whose `id` slugs
+ * are suffix-de-duplicated document-wide).
+ *
+ * The whole-source `markdownCache` above can't help during streaming:
+ * every delta changes the full source string, so every delta is a
+ * whole-source cache miss. The per-block cache isolates the frozen
+ * blocks from the live tail.
+ */
+const blockHtmlCache = new Map<string, string>();
+const BLOCK_HTML_CACHE_MAX = 2000;
+
+/**
+ * Whole-source → block-array cache. Lets `CoderMarkdown.svelte`'s
+ * sync fast path (folder swap, re-mount) skip the async
+ * `renderMarkdownBlocks` dance entirely when the full source was
+ * rendered earlier in the session.
+ */
+const blockArrayCache = new Map<string, MarkdownBlock[]>();
+const BLOCK_ARRAY_CACHE_MAX = 500;
+
+/**
  * Detect a leading YAML frontmatter block and split it from the
  * markdown body. The block must start at the very first byte (an
  * optional BOM aside): a line containing only `---`, terminated by a
@@ -423,6 +473,215 @@ export async function renderMarkdown(source: string, options: { linkify?: boolea
 }
 
 /**
+ * Split the flat markdown-it token array into top-level blocks. A
+ * block is a maximal run of tokens that starts at `level === 0` and
+ * continues until `level` returns to `0` after a close (or, for
+ * self-closing tokens like `fence` / `hr` / `code_block`, just that
+ * single token).
+ *
+ * Once markdown-it closes a top-level block and moves on, appending
+ * more source can never retroactively change it — no backtracking.
+ * Only the last block is "live" and still growing during a stream.
+ * That invariant is what makes per-block caching safe: a frozen
+ * block's source text, tokens, and rendered HTML are identical
+ * across deltas, so its cache entry is a permanent hit.
+ *
+ * The `map` property on block-opening tokens gives the `[startLine,
+ * endLine]` range in the source, which we use to extract the block's
+ * raw text for the cache key. Self-closing tokens (fence, hr, …)
+ * also carry `map`.
+ */
+function splitTopLevelBlocks(tokens: MdToken[], source: string): { text: string; tokens: MdToken[] }[] {
+	const blocks: { text: string; tokens: MdToken[] }[] = [];
+	const lines = source.split('\n');
+	let i = 0;
+	while (i < tokens.length) {
+		const token = tokens[i];
+		if (!token) {
+			i++;
+			continue;
+		}
+		// Only level-0 tokens start a top-level block.
+		if (token.level !== 0) {
+			i++;
+			continue;
+		}
+		if (token.nesting === 0) {
+			// Self-closing: fence, hr, code_block, reference, etc.
+			const text = extractTokenText(token, lines);
+			blocks.push({ text, tokens: [token] });
+			i++;
+			continue;
+		}
+		if (token.nesting === 1) {
+			// Opening token — collect until the matching close.
+			const start = i;
+			let depth = 1;
+			i++;
+			while (i < tokens.length && depth > 0) {
+				const t = tokens[i];
+				if (!t) {
+					i++;
+					continue;
+				}
+				if (t.nesting === 1) {
+					depth++;
+				} else if (t.nesting === -1) {
+					depth--;
+				}
+				i++;
+			}
+			const blockTokens = tokens.slice(start, i);
+			const text = extractTokenText(token, lines);
+			blocks.push({ text, tokens: blockTokens });
+			continue;
+		}
+		// Stray close at level 0 (shouldn't happen in well-formed
+		// output, but advance to avoid an infinite loop).
+		i++;
+	}
+	return blocks;
+}
+
+/**
+ * Extract the source text spanned by a block-opening token's `map`
+ * `[startLine, endLine)` range. Falls back to the joined `content`
+ * of the block's tokens when `map` is absent (some synthetic tokens
+ * don't carry source positions).
+ */
+function extractTokenText(openToken: MdToken, lines: string[]): string {
+	if (openToken.map) {
+		const [start, end] = openToken.map;
+		return lines.slice(start, end).join('\n');
+	}
+	return openToken.content ?? '';
+}
+
+/**
+ * Sync lookup against the block-array cache. Returns `undefined`
+ * for a miss — caller falls back to `renderMarkdownBlocks` (async).
+ * Used by `CoderMarkdown.svelte`'s fast path on folder swap /
+ * re-mount, identical in spirit to `getCachedMarkdown`.
+ */
+export function getCachedMarkdownBlocks(
+	source: string,
+	options: { linkify?: boolean } = {},
+): MarkdownBlock[] | undefined {
+	return blockArrayCache.get(markdownCacheKey(source, options.linkify ?? false));
+}
+
+/**
+ * Render a Markdown string to an array of independently-cached
+ * top-level blocks. Each block's HTML is cached by its source text
+ * and document position, so during streaming only the live tail
+ * block misses the cache — all frozen blocks short-circuit on a
+ * sync `Map.get`.
+ *
+ * The block-array itself is also cached by the full source string,
+ * so the whole-source fast path (`getCachedMarkdownBlocks`) skips
+ * even the token-level parse on a re-mount of an already-rendered
+ * message.
+ *
+ * The frontmatter is prepended as a synthetic block (index 0) so
+ * the keyed `{#each}` in `CoderMarkdown.svelte` can treat it
+ * uniformly with body blocks.
+ */
+export async function renderMarkdownBlocks(
+	source: string,
+	options: { linkify?: boolean } = {},
+): Promise<MarkdownBlock[]> {
+	const linkify = options.linkify ?? false;
+	const arrayKey = markdownCacheKey(source, linkify);
+	const cachedArray = blockArrayCache.get(arrayKey);
+	if (cachedArray !== undefined) {
+		return cachedArray;
+	}
+	const { frontmatter, body } = splitFrontmatter(source);
+	const langs = extractFenceLanguages(body);
+	if (frontmatter !== null) {
+		langs.push('yaml');
+	}
+	await loadHighlighters(langs);
+	const parser = linkify ? mdLinkified : md;
+	const tokens = parser.parse(body, {});
+	const rawBlocks = splitTopLevelBlocks(tokens, body);
+	const blocks: MarkdownBlock[] = [];
+	if (frontmatter !== null) {
+		blocks.push(renderFrontmatterBlock(frontmatter, 0));
+	}
+	for (let i = 0; i < rawBlocks.length; i++) {
+		const raw = rawBlocks[i];
+		if (!raw) {
+			continue;
+		}
+		blocks.push(renderBlock(raw.tokens, raw.text, i + (frontmatter !== null ? 1 : 0), parser));
+	}
+	blockArrayCache.set(arrayKey, blocks);
+	if (blockArrayCache.size > BLOCK_ARRAY_CACHE_MAX) {
+		const oldest = blockArrayCache.keys().next().value;
+		if (oldest !== undefined) {
+			blockArrayCache.delete(oldest);
+		}
+	}
+	return blocks;
+}
+
+/**
+ * Render a single block's token slice to sanitised HTML. The
+ * per-block cache key includes the block's source text and its
+ * document index — the index disambiguates blocks whose source text
+ * is identical but whose HTML differs (e.g. duplicate headings
+ * whose `id` slugs are suffix-de-duplicated document-wide by the
+ * heading-anchor rule).
+ */
+function renderBlock(tokens: MdToken[], sourceText: string, index: number, parser: MarkdownIt): MarkdownBlock {
+	const key = `${index}\x00${sourceText}`;
+	const cached = blockHtmlCache.get(key);
+	if (cached !== undefined) {
+		return { key, html: cached };
+	}
+	const raw = parser.renderer.render(tokens, parser.options, {});
+	const sanitised = DOMPurify.sanitize(raw, {
+		ALLOW_UNKNOWN_PROTOCOLS: false,
+		RETURN_TRUSTED_TYPE: false,
+		ADD_ATTR: ['type'],
+	});
+	blockHtmlCache.set(key, sanitised);
+	if (blockHtmlCache.size > BLOCK_HTML_CACHE_MAX) {
+		const oldest = blockHtmlCache.keys().next().value;
+		if (oldest !== undefined) {
+			blockHtmlCache.delete(oldest);
+		}
+	}
+	return { key, html: sanitised };
+}
+
+/**
+ * Render the frontmatter as a synthetic block at index 0.
+ */
+function renderFrontmatterBlock(frontmatter: string, index: number): MarkdownBlock {
+	const key = `${index}\x00${frontmatter}`;
+	const cached = blockHtmlCache.get(key);
+	if (cached !== undefined) {
+		return { key, html: cached };
+	}
+	const raw = frontmatterToHtml(frontmatter);
+	const sanitised = DOMPurify.sanitize(raw, {
+		ALLOW_UNKNOWN_PROTOCOLS: false,
+		RETURN_TRUSTED_TYPE: false,
+		ADD_ATTR: ['type'],
+	});
+	blockHtmlCache.set(key, sanitised);
+	if (blockHtmlCache.size > BLOCK_HTML_CACHE_MAX) {
+		const oldest = blockHtmlCache.keys().next().value;
+		if (oldest !== undefined) {
+			blockHtmlCache.delete(oldest);
+		}
+	}
+	return { key, html: sanitised };
+}
+
+/**
  * Click delegate for the "Copy" buttons rendered inside fenced
  * code blocks. Returns `true` if the click was handled (so the
  * caller can `event.preventDefault()` and stop further routing),
@@ -495,7 +754,7 @@ export const EXTERNAL_MARKDOWN_SCHEMES = new Set(['http:', 'https:', 'mailto:', 
  * `MarkdownIt` to skip the highlighter (grammar imports break in
  * the vitest environment) and apply just the rules under test.
  */
-export const __test = { applyHeadingAnchorRule, applyInlineAnchorRule, frontmatterToHtml };
+export const __test = { applyHeadingAnchorRule, applyInlineAnchorRule, frontmatterToHtml, splitTopLevelBlocks };
 
 /**
  * If `href` parses as an absolute URL with an allow-listed scheme,

@@ -164,6 +164,130 @@ describe('splitFrontmatter', () => {
 	});
 });
 
+describe('splitTopLevelBlocks', () => {
+	// We build a bare markdown-it (no highlighter, no DOMPurify) and
+	// parse + split. The test verifies two invariants:
+	//   1. The split correctly identifies block boundaries.
+	//   2. Frozen blocks' source text is stable across deltas —
+	//      the streaming invariant that makes per-block caching safe.
+	const { splitTopLevelBlocks } = __test;
+
+	function buildBareParser(): MarkdownIt {
+		const md = new MarkdownIt({ html: false, linkify: true });
+		applyHeadingAnchorRule(md);
+		applyInlineAnchorRule(md);
+		return md;
+	}
+
+	function split(md: MarkdownIt, source: string) {
+		const tokens = md.parse(source, {});
+		return splitTopLevelBlocks(tokens, source);
+	}
+
+	it('splits paragraphs, headings, and fences into separate blocks', () => {
+		const md = buildBareParser();
+		const source = '# Heading\n\nFirst paragraph.\n\nSecond paragraph.\n\n```js\nvar x = 1\n```\n';
+		const blocks = split(md, source);
+		expect(blocks).toHaveLength(4);
+		expect(blocks[0]?.text).toBe('# Heading');
+		expect(blocks[1]?.text).toBe('First paragraph.');
+		expect(blocks[2]?.text).toBe('Second paragraph.');
+		expect(blocks[3]?.text).toBe('```js\nvar x = 1\n```');
+	});
+
+	it('keeps a list as a single block', () => {
+		const md = buildBareParser();
+		const source = '- alpha\n- beta\n- gamma\n';
+		const blocks = split(md, source);
+		expect(blocks).toHaveLength(1);
+		expect(blocks[0]?.text).toBe('- alpha\n- beta\n- gamma');
+	});
+
+	it('keeps a nested list as a single block', () => {
+		const md = buildBareParser();
+		const source = '- top\n  - nested\n  - nested2\n- back\n';
+		const blocks = split(md, source);
+		expect(blocks).toHaveLength(1);
+	});
+
+	it('keeps a blockquote with multiple lines as one block', () => {
+		const md = buildBareParser();
+		const source = '> line one\n> line two\n>\n> line three\n';
+		const blocks = split(md, source);
+		expect(blocks).toHaveLength(1);
+		expect(blocks[0]?.text).toBe('> line one\n> line two\n>\n> line three');
+	});
+
+	it('treats a thematic break as its own block', () => {
+		const md = buildBareParser();
+		const source = 'Before\n\n---\n\nAfter\n';
+		const blocks = split(md, source);
+		expect(blocks).toHaveLength(3);
+		expect(blocks[1]?.text).toBe('---');
+	});
+
+	it('returns an empty array for empty input', () => {
+		const md = buildBareParser();
+		const blocks = split(md, '');
+		expect(blocks).toHaveLength(0);
+	});
+
+	it('produces identical source text for frozen blocks when the tail grows', () => {
+		// The streaming invariant: appending to the last block never
+		// changes the source text (or rendered HTML) of any earlier
+		// block. This is what makes per-block caching safe — frozen
+		// blocks' cache keys are permanent hits.
+		const md = buildBareParser();
+
+		// Delta 1: one paragraph, still growing
+		const d1 = 'First paragraph is here.';
+		const b1 = split(md, d1);
+
+		// Delta 2: first paragraph finished, second started
+		const d2 = 'First paragraph is here.\n\nSecond paragraph begins.';
+		const b2 = split(md, d2);
+
+		// Delta 3: second paragraph grew
+		const d3 = 'First paragraph is here.\n\nSecond paragraph begins to grow.';
+		const b3 = split(md, d3);
+
+		// The first block's text is identical across all deltas
+		expect(b1[0]?.text).toBe('First paragraph is here.');
+		expect(b2[0]?.text).toBe(b1[0]?.text);
+		expect(b3[0]?.text).toBe(b1[0]?.text);
+
+		// The second block only appears from delta 2 onward
+		expect(b2).toHaveLength(2);
+		expect(b3).toHaveLength(2);
+		expect(b2[1]?.text).toBe('Second paragraph begins.');
+		expect(b3[1]?.text).toBe('Second paragraph begins to grow.');
+	});
+
+	it('produces stable source text for blocks before a splitting fence', () => {
+		// When a paragraph finishes with \n\n and a fence starts, the
+		// paragraph becomes frozen and the fence is the new live tail.
+		// The paragraph's text must be identical to when it was the tail.
+		const md = buildBareParser();
+
+		const d1 = 'Here is some intro text.';
+		const b1 = split(md, d1);
+
+		const d2 = 'Here is some intro text.\n\n```rust\nfn main() {}';
+		const b2 = split(md, d2);
+
+		const d3 = 'Here is some intro text.\n\n```rust\nfn main() {}\nfn other() {}\n```';
+		const b3 = split(md, d3);
+
+		// Paragraph text is frozen and stable from delta 2 onward
+		expect(b2[0]?.text).toBe(b1[0]?.text);
+		expect(b3[0]?.text).toBe(b1[0]?.text);
+
+		// Fence block appears in delta 2 and grows in delta 3
+		expect(b2[1]?.text).toBe('```rust\nfn main() {}');
+		expect(b3[1]?.text).toBe('```rust\nfn main() {}\nfn other() {}\n```');
+	});
+});
+
 describe('frontmatterToHtml', () => {
 	it('renders a mapping as a key/value table', () => {
 		const html = frontmatterToHtml('title: Hello World\nlicense: mit');
