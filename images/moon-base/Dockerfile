@@ -131,6 +131,7 @@ RUN apt-get update \
         fzf \
         bat \
         jq \
+        vim \
  && rm -rf /var/lib/apt/lists/* \
  && ln -s /usr/bin/batcat /usr/local/bin/bat
 
