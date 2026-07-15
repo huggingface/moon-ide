@@ -1723,6 +1723,11 @@ class CoderPanelState {
 			const ipcStart = performance.now();
 			const summary = await ipc.coder.openSession(id);
 			this.sessionStateFor(folderKey, id).openIpcMs = performance.now() - ipcStart;
+			// The bash-target pip reflects the *visible* session's
+			// force-host override; re-probe now that the backend's
+			// visible-session pointer moved, or the header keeps the
+			// previous session's target.
+			void this.refreshStatus();
 			// If the opened session runs in a worktree, switch the
 			// folder bar to that worktree so the file tree / SCM
 			// view matches what the agent is working on. Guarded
@@ -1805,6 +1810,10 @@ class CoderPanelState {
 		session.compaction = null;
 		session.todos = [];
 		session.activeSession = null;
+		// Fresh sessions always start in Auto bash-target mode
+		// (ADR 0022) — re-probe so the header pip drops a stale
+		// force-host reading from the previously visible session.
+		void this.refreshStatus();
 	}
 
 	/** Adopt an isolated worktree session created by the backend
@@ -1993,9 +2002,15 @@ class CoderPanelState {
 			// doesn't race two session-open paths against each
 			// other; `#selectSessionForActiveFolder` is a no-op
 			// when `#hydrateSession` already picked the right one.
-			void this.#hydrateFolder(path).then(() => {
+			void this.#hydrateFolder(path).then(async () => {
 				if (this.#workspaceReady && this.activeFolderPath === path) {
-					void this.#selectSessionForActiveFolder();
+					await this.#selectSessionForActiveFolder();
+					// Status (bash-target pip, busy) is scoped to the
+					// active folder's visible session, but `#hydrateFolder`
+					// only probes on first hydration — switching back to a
+					// known folder would keep the previous folder's
+					// reading. Refresh after the session pointer settled.
+					void this.refreshStatus();
 				}
 			});
 		}
@@ -3018,7 +3033,11 @@ class CoderPanelState {
 					toolRow.result = event.result;
 					toolRow.hasResult = true;
 					toolRow.isError = event.is_error;
-					toolRow.durationMs = Date.now() - toolRow.startedAt;
+					// Prefer the backend-measured duration — the local
+					// diff collapses to ~0ms on replay, where the
+					// `tool_call` / `tool_result` events land
+					// back-to-back regardless of the original run time.
+					toolRow.durationMs = event.duration_ms ?? Date.now() - toolRow.startedAt;
 					// The parked `ask_user` prompt just resolved
 					// (answered or skipped) — drop the "needs input"
 					// cue; the turn either continues working or ends.
@@ -3502,7 +3521,9 @@ function applyInnerEventToRows(rows: CoderRow[], event: CoderEvent): void {
 				row.result = event.result;
 				row.hasResult = true;
 				row.isError = event.is_error;
-				row.durationMs = Date.now() - row.startedAt;
+				// Backend-measured when available — see the parent
+				// reducer's `tool_result` case.
+				row.durationMs = event.duration_ms ?? Date.now() - row.startedAt;
 			}
 			return;
 		}

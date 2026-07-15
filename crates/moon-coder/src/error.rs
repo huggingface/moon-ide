@@ -105,6 +105,14 @@ pub enum CoderError {
 	/// Catch-all for unexpected internal state.
 	#[error("internal error: {0}")]
 	Internal(String),
+
+	/// The provider returned consecutive empty completions (no
+	/// text, no thinking, no tool calls) — it bailed mid-stream or
+	/// only emitted a usage chunk, and the retries in the turn
+	/// loop didn't help. Surfaced as a real error instead of a
+	/// silent turn end so the user knows the model never answered.
+	#[error("the model returned an empty response after {attempts} attempts — try again, or switch model/provider")]
+	EmptyResponse { attempts: u32 },
 }
 
 impl CoderError {

@@ -432,7 +432,11 @@ pub(crate) fn record_to_pi_wire(
 			tool_call_id,
 			tool_name,
 			content,
-		} => pi_message_envelope(pi_tool_result_message(tool_call_id, tool_name, content), timestamp_ms),
+			duration_ms,
+		} => pi_message_envelope(
+			pi_tool_result_message(tool_call_id, tool_name, content, *duration_ms),
+			timestamp_ms,
+		),
 		SessionRecord::Compaction {
 			summary,
 			messages_compacted,
@@ -724,13 +728,21 @@ fn split_provider_model(model: &str) -> (Option<&str>, &str) {
 	}
 }
 
-fn pi_tool_result_message(tool_call_id: &str, tool_name: &str, content: &str) -> serde_json::Value {
+fn pi_tool_result_message(
+	tool_call_id: &str,
+	tool_name: &str,
+	content: &str,
+	duration_ms: Option<u64>,
+) -> serde_json::Value {
 	let is_error = looks_like_tool_error(content);
 	let mut message = serde_json::Map::new();
 	message.insert("role".into(), serde_json::Value::String("toolResult".into()));
 	message.insert("toolCallId".into(), serde_json::Value::String(tool_call_id.to_string()));
 	if !tool_name.is_empty() {
 		message.insert("toolName".into(), serde_json::Value::String(tool_name.to_string()));
+	}
+	if let Some(ms) = duration_ms {
+		message.insert("durationMs".into(), serde_json::Value::from(ms));
 	}
 	message.insert(
 		"content".into(),
@@ -1049,6 +1061,7 @@ fn parse_pi_tool_result(msg: &serde_json::Value) -> Option<SessionRecord> {
 		tool_call_id,
 		tool_name,
 		content: body,
+		duration_ms: msg.get("durationMs").and_then(|v| v.as_u64()),
 	})
 }
 
@@ -1227,6 +1240,16 @@ pub enum SessionRecord {
 		#[serde(default)]
 		tool_name: String,
 		content: String,
+		/// Wall-clock execution time of the tool call in
+		/// milliseconds, measured by the dispatcher. Replayed into
+		/// the panel's tool-row duration on reopen — without it
+		/// every historical row reads "0ms" (the frontend can only
+		/// diff its own event arrival times, which are back-to-back
+		/// during replay). `None` for records from before this
+		/// field shipped and for synthetic interrupted-tool
+		/// sentinels.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		duration_ms: Option<u64>,
 	},
 	/// The session title changed mid-stream. Replayed on reopen so
 	/// the auto-renamed title sticks across launches without a
@@ -3067,6 +3090,7 @@ mod tests {
 				tool_call_id: "call-1".into(),
 				tool_name: String::new(),
 				content: r#"{"stdout":"ok"}"#.into(),
+				duration_ms: None,
 			},
 		)
 		.await
@@ -3078,6 +3102,7 @@ mod tests {
 				tool_call_id: "call-2".into(),
 				tool_name: String::new(),
 				content: INTERRUPTED_TOOL_RESULT_JSON.into(),
+				duration_ms: None,
 			},
 		)
 		.await
@@ -3101,6 +3126,7 @@ mod tests {
 				tool_call_id,
 				content,
 				tool_name: _,
+				duration_ms: _,
 			} => {
 				assert_eq!(tool_call_id, "call-1");
 				assert_eq!(content, r#"{"stdout":"ok"}"#);
@@ -3348,6 +3374,7 @@ mod tests {
 				tool_call_id: "call-a".into(),
 				tool_name: String::new(),
 				content: r#"{"stdout":"ok"}"#.into(),
+				duration_ms: None,
 			},
 		];
 		assert!(orphan_tool_call_ids(&records).is_empty());
@@ -3376,6 +3403,7 @@ mod tests {
 				tool_call_id: "call-a".into(),
 				tool_name: String::new(),
 				content: r#"{"stdout":"a"}"#.into(),
+				duration_ms: None,
 			},
 		];
 		assert_eq!(orphan_tool_call_ids(&records), vec!["call-b".to_string()]);
@@ -3399,6 +3427,7 @@ mod tests {
 				tool_call_id: "call-a".into(),
 				tool_name: String::new(),
 				content: "{}".into(),
+				duration_ms: None,
 			},
 			SessionRecord::Assistant {
 				content: None,
@@ -3412,6 +3441,7 @@ mod tests {
 				tool_call_id: "call-b".into(),
 				tool_name: String::new(),
 				content: "{}".into(),
+				duration_ms: None,
 			},
 			SessionRecord::Assistant {
 				content: None,
@@ -3490,6 +3520,7 @@ mod tests {
 				tool_call_id: "call-a".into(),
 				tool_name: String::new(),
 				content: r#"{"status":"answered"}"#.into(),
+				duration_ms: None,
 			},
 		];
 		assert!(orphaned_ask_user_calls(&records).is_empty());
@@ -3669,12 +3700,19 @@ mod tests {
 			tool_call_id: "call-1".into(),
 			tool_name: "read_file".into(),
 			content: r#"{"ok":true}"#.into(),
+			duration_ms: Some(1234),
 		};
 		let wire = record_to_pi_wire(&tool, &header, ts);
 		let msg = wire.get("message").unwrap();
 		assert_eq!(msg.get("toolName").and_then(|v| v.as_str()), Some("read_file"));
+		assert_eq!(msg.get("durationMs").and_then(|v| v.as_u64()), Some(1234));
 		match &pi_wire_to_records(&wire)[0] {
-			SessionRecord::Tool { tool_name, .. } => assert_eq!(tool_name, "read_file"),
+			SessionRecord::Tool {
+				tool_name, duration_ms, ..
+			} => {
+				assert_eq!(tool_name, "read_file");
+				assert_eq!(*duration_ms, Some(1234));
+			}
 			other => panic!("expected Tool, got {other:?}"),
 		}
 	}

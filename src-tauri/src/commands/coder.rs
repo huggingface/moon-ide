@@ -383,9 +383,7 @@ pub async fn coder_last_opened_session(state: State<'_, AppState>) -> Result<Opt
 	let Some(folder) = active_folder_path(&state).await else {
 		return Ok(None);
 	};
-	let app = app_state_store::load(&state.config_dir)
-		.await
-		.map_err(MoonError::from)?;
+	let app = app_state_store::load(&state.config_dir).await?;
 	Ok(app.coder.last_session_by_folder.get(&folder).cloned())
 }
 

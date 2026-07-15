@@ -418,6 +418,12 @@ async fn run_subagent_inner(
 	let tool_defs = tools.definitions();
 	let cx = ToolContext::with_format_queue(spec.folder.clone(), spec.mode, format_queue);
 
+	// Consecutive empty-shell responses — same retry-then-fail
+	// posture as the parent loop in `run_turn`. Without it a
+	// provider that bails mid-stream makes the sub-agent return an
+	// empty `result` as a *success*, which the parent model (and
+	// the user) reads as "the sub-agent found nothing".
+	let mut empty_shell_attempts: usize = 0;
 	for iter in 0..MAX_TURN_ITERATIONS {
 		if cancel.is_cancelled() {
 			return Err(CoderError::Aborted);
@@ -541,6 +547,7 @@ async fn run_subagent_inner(
 		// envelope is `SubagentEvent { inner: TokenUsage … }`.
 		emit_subagent_token_usage(sink, &id, &models, &standard_model, &messages, &response);
 		if !response_is_empty {
+			empty_shell_attempts = 0;
 			messages.push(response_to_message(&response));
 			persist_subagent(
 				&session_dir,
@@ -558,6 +565,25 @@ async fn run_subagent_inner(
 		}
 
 		if response.tool_calls.is_empty() {
+			// Empty shell → retry the round-trip (nothing was
+			// appended to `messages`), then fail loudly. The error
+			// lands in the parent as the `task` tool's
+			// `is_error: true` result, so the parent model can
+			// react instead of trusting an empty summary.
+			if response_is_empty {
+				empty_shell_attempts += 1;
+				if empty_shell_attempts > crate::defaults::EMPTY_RESPONSE_RETRIES {
+					return Err(CoderError::EmptyResponse {
+						attempts: empty_shell_attempts as u32,
+					});
+				}
+				tracing::warn!(
+					attempt = empty_shell_attempts,
+					subagent = %id,
+					"provider returned an empty response; retrying the round-trip"
+				);
+				continue;
+			}
 			let result_text = response.content.clone().unwrap_or_default();
 			return Ok(SubagentReport {
 				result: result_text,
@@ -587,6 +613,7 @@ async fn run_subagent_inner(
 					args: args.clone(),
 				},
 			));
+			let dispatched_at = std::time::Instant::now();
 			let outcome = if call.function.name == "todo_write" {
 				// Same short-circuit shape as the parent runner —
 				// `todo_write` mutates per-session state
@@ -596,6 +623,7 @@ async fn run_subagent_inner(
 			} else {
 				tools.dispatch(&call.function.name, &args, &cx, &cancel).await
 			};
+			let duration_ms = u64::try_from(dispatched_at.elapsed().as_millis()).ok();
 			let (content, is_error) = match outcome {
 				Ok(value) => (value.to_string(), false),
 				Err(CoderError::Aborted) => return Err(CoderError::Aborted),
@@ -608,6 +636,7 @@ async fn run_subagent_inner(
 					id: call.id.clone(),
 					result: payload,
 					is_error,
+					duration_ms,
 				},
 			));
 			messages.push(ChatMessage::Tool {
@@ -621,6 +650,7 @@ async fn run_subagent_inner(
 					tool_call_id: call.id.clone(),
 					tool_name: call.function.name.clone(),
 					content,
+					duration_ms,
 				},
 			)
 			.await;

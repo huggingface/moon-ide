@@ -65,6 +65,15 @@ pub const HF_ROUTER_BASE: &str = "https://router.huggingface.co/v1";
 /// the wall-clock cost of inference, not the iteration count.
 pub const MAX_TURN_ITERATIONS: usize = 200;
 
+/// How many times a turn re-sends the same round-trip after the
+/// provider returned an empty shell (no text, no thinking, no tool
+/// calls — it bailed mid-stream or emitted only a usage chunk).
+/// Ending the turn on an empty shell reads as the agent silently
+/// stopping mid-work (and a sub-agent reports an empty result as
+/// success), so we retry a couple of times and then surface
+/// [`crate::error::CoderError::EmptyResponse`] instead.
+pub const EMPTY_RESPONSE_RETRIES: usize = 2;
+
 /// Per-model context-window size in tokens. Drives the in-panel
 /// usage ring and the auto-compaction threshold.
 ///

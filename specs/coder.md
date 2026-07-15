@@ -555,13 +555,26 @@ weight and we omit it. What we do carry from pi v3:
   reason by `inference::normalize_stop_reason`.
 - `toolName` on tool-result rows, so the viewer labels results
   without cross-referencing the assistant record.
+- `durationMs` on tool-result rows: the tool's wall-clock execution
+  time as measured by the dispatcher, carried on the live
+  `tool_result` event and replayed on reopen so historical rows keep
+  their real durations (before this, a reopened transcript showed
+  every tool as `0ms` — the frontend can only diff its own event
+  arrival times, which are back-to-back during replay). Absent on
+  synthetic interrupted-tool sentinels and pre-existing records; the
+  panel falls back to the local arrival-time diff.
 
 Mapping notes (details live in `sessions.rs`):
 
 - `User` / `Assistant` / `Tool` / `Compaction` map natively to pi
   rows. Fully-empty assistant turns (no text, no thinking, no tool
   calls) are not persisted and are dropped on load — re-inflating one
-  trips Anthropic's non-whitespace-text 400.
+  trips Anthropic's non-whitespace-text 400. At runtime an empty
+  shell is also never a valid _final_ answer: the turn loop (parent
+  and sub-agent) retries the round-trip up to
+  `EMPTY_RESPONSE_RETRIES` times, then fails the turn with
+  `CoderError::EmptyResponse` — previously the turn ended as a
+  phantom success and a sub-agent reported an empty result.
 - The per-assistant `provider` + `model` stamp reflects the route
   that actually served that round-trip, not the header's seed.
 - `Usage` folds onto the prior assistant line's `usage` block on

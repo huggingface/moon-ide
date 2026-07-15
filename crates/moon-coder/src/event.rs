@@ -142,6 +142,15 @@ pub enum CoderEvent {
 		id: String,
 		result: serde_json::Value,
 		is_error: bool,
+		/// Wall-clock execution time in milliseconds, measured by
+		/// the dispatcher around the tool run. Carried live *and*
+		/// on replay (from the persisted record) so the panel's
+		/// per-row duration survives a session reopen instead of
+		/// collapsing to the replay's back-to-back event spacing.
+		/// `None` for synthetic results (interrupted-tool
+		/// sentinels) and records from before the field shipped.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		duration_ms: Option<u64>,
 	},
 
 	/// The whole turn ended cleanly.

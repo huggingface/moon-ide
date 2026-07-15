@@ -32,7 +32,7 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::{Authenticator, DeviceCode, HfIdentity};
-use crate::defaults::{MAX_TURN_ITERATIONS, PHASE_6_0_SYSTEM_PROMPT};
+use crate::defaults::{EMPTY_RESPONSE_RETRIES, MAX_TURN_ITERATIONS, PHASE_6_0_SYSTEM_PROMPT};
 use crate::error::CoderError;
 use crate::event::{CoderEvent, CoderEventEnvelope, CoderStatus, TokenUsageSource};
 use crate::folder_summary::FolderSummaryService;
@@ -2156,6 +2156,7 @@ impl CoderHandle {
 					tool_call_id,
 					tool_name: _,
 					content,
+					duration_ms: _,
 				} => {
 					messages.push(ChatMessage::Tool {
 						tool_call_id: tool_call_id.clone(),
@@ -2475,6 +2476,7 @@ impl CoderHandle {
 				id: orphan_id,
 				result: serde_json::json!({ "error": "Interrupted before tool completed." }),
 				is_error: true,
+				duration_ms: None,
 			});
 		}
 		// Restore-time context-usage hint. `Provider` source when
@@ -3668,6 +3670,11 @@ async fn run_turn(
 	// turn will pick up whichever finished in the interim via the
 	// fresh `refresh_system_prompt` above.
 	kick_off_summary_refresh(state, sink).await;
+	// Consecutive empty-shell responses (provider bailed
+	// mid-stream). Reset on any real response; when it exceeds
+	// `EMPTY_RESPONSE_RETRIES` the turn fails loudly instead of
+	// ending as a phantom success.
+	let mut empty_shell_attempts: usize = 0;
 	for _iter in 0..MAX_TURN_ITERATIONS {
 		if cancel.is_cancelled() {
 			return Err(CoderError::Aborted);
@@ -3898,6 +3905,7 @@ async fn run_turn(
 		// the ring + compaction trigger stay accurate.
 		let response_is_empty = assistant_response_is_empty(&response);
 		if !response_is_empty {
+			empty_shell_attempts = 0;
 			let mut session = rt.session.lock().await;
 			session.messages.push(response_to_message(&response));
 		}
@@ -3971,6 +3979,25 @@ async fn run_turn(
 		}
 
 		if response.tool_calls.is_empty() {
+			// An empty shell isn't a final answer — the provider
+			// bailed. Re-send the same round-trip (nothing was
+			// appended to `messages`, so `continue` is a retry);
+			// after `EMPTY_RESPONSE_RETRIES` consecutive shells,
+			// fail the turn so the user sees an error banner
+			// instead of the agent silently stopping mid-work.
+			if response_is_empty {
+				empty_shell_attempts += 1;
+				if empty_shell_attempts > EMPTY_RESPONSE_RETRIES {
+					return Err(CoderError::EmptyResponse {
+						attempts: empty_shell_attempts as u32,
+					});
+				}
+				tracing::warn!(
+					attempt = empty_shell_attempts,
+					"provider returned an empty response; retrying the round-trip"
+				);
+				continue;
+			}
 			// Final assistant message of the turn — unless the user
 			// queued a steer while it was streaming. We can't just
 			// return: `drain_pending_steers` runs at the **top** of
@@ -4185,6 +4212,7 @@ async fn dispatch_tool_calls(
 				name: call.function.name.clone(),
 				args: args.clone(),
 			});
+			let dispatched_at = std::time::Instant::now();
 			let outcome = if call.function.name == "task" {
 				handle_task(state, rt, sink, cx, cancel, &call.id, &args).await
 			} else if call.function.name == "ask_user" {
@@ -4229,7 +4257,8 @@ async fn dispatch_tool_calls(
 			} else {
 				state.tools.dispatch(&call.function.name, &args, cx, cancel).await
 			};
-			finish_tool_call(rt, sink, &call.id, &call.function.name, outcome).await?;
+			let duration_ms = u64::try_from(dispatched_at.elapsed().as_millis()).ok();
+			finish_tool_call(rt, sink, &call.id, &call.function.name, outcome, duration_ms).await?;
 		}
 		Ok(())
 	}
@@ -4272,7 +4301,11 @@ async fn dispatch_subagent_batch(
 		let call_id = call.id.clone();
 		let task = tokio::spawn(async move {
 			let _permit = sem_for_task.acquire().await.expect("semaphore not closed");
-			handle_task(
+			// Timed from permit acquisition, not batch spawn, so a
+			// sub-agent queued behind the parallelism cap doesn't
+			// book its wait time as execution time.
+			let dispatched_at = std::time::Instant::now();
+			let outcome = handle_task(
 				&state_for_task,
 				&rt_for_task,
 				&sink_for_task,
@@ -4281,19 +4314,23 @@ async fn dispatch_subagent_batch(
 				&call_id,
 				&args,
 			)
-			.await
+			.await;
+			(outcome, u64::try_from(dispatched_at.elapsed().as_millis()).ok())
 		});
 		tasks.push((call, task));
 	}
 	for (call, task) in tasks {
-		let outcome = match task.await {
+		let (outcome, duration_ms) = match task.await {
 			Ok(o) => o,
-			Err(err) => Err(CoderError::Internal(format!(
-				"sub-agent task join error for {}: {err}",
-				call.id
-			))),
+			Err(err) => (
+				Err(CoderError::Internal(format!(
+					"sub-agent task join error for {}: {err}",
+					call.id
+				))),
+				None,
+			),
 		};
-		finish_tool_call(rt, sink, &call.id, &call.function.name, outcome).await?;
+		finish_tool_call(rt, sink, &call.id, &call.function.name, outcome, duration_ms).await?;
 	}
 	Ok(())
 }
@@ -5264,11 +5301,12 @@ async fn recover_in_memory_orphans(rt: &Arc<SessionRuntime>, sink: &FolderEventS
 		}
 	}
 	for (id, name) in &orphans {
-		persist_tool_record(rt, id, name, sessions::INTERRUPTED_TOOL_RESULT_JSON).await;
+		persist_tool_record(rt, id, name, sessions::INTERRUPTED_TOOL_RESULT_JSON, None).await;
 		sink.send(CoderEvent::ToolResult {
 			id: id.clone(),
 			result: serde_json::json!({ "error": "Interrupted before tool completed." }),
 			is_error: true,
+			duration_ms: None,
 		});
 	}
 }
@@ -5281,6 +5319,7 @@ async fn finish_tool_call(
 	tool_call_id: &str,
 	tool_name: &str,
 	outcome: Result<Value, CoderError>,
+	duration_ms: Option<u64>,
 ) -> Result<(), CoderError> {
 	match outcome {
 		Ok(value) => {
@@ -5289,12 +5328,13 @@ async fn finish_tool_call(
 				id: tool_call_id.to_string(),
 				result: value,
 				is_error: false,
+				duration_ms,
 			});
 			rt.session.lock().await.messages.push(ChatMessage::Tool {
 				tool_call_id: tool_call_id.to_string(),
 				content: content.clone(),
 			});
-			persist_tool_record(rt, tool_call_id, tool_name, &content).await;
+			persist_tool_record(rt, tool_call_id, tool_name, &content, duration_ms).await;
 			Ok(())
 		}
 		Err(CoderError::Aborted) => Err(CoderError::Aborted),
@@ -5305,12 +5345,13 @@ async fn finish_tool_call(
 				id: tool_call_id.to_string(),
 				result: payload,
 				is_error: true,
+				duration_ms,
 			});
 			rt.session.lock().await.messages.push(ChatMessage::Tool {
 				tool_call_id: tool_call_id.to_string(),
 				content: content.clone(),
 			});
-			persist_tool_record(rt, tool_call_id, tool_name, &content).await;
+			persist_tool_record(rt, tool_call_id, tool_name, &content, duration_ms).await;
 			Ok(())
 		}
 	}
@@ -5744,7 +5785,13 @@ async fn persist_usage_record(rt: &Arc<SessionRuntime>, response: &AssistantResp
 	}
 }
 
-async fn persist_tool_record(rt: &Arc<SessionRuntime>, tool_call_id: &str, tool_name: &str, content: &str) {
+async fn persist_tool_record(
+	rt: &Arc<SessionRuntime>,
+	tool_call_id: &str,
+	tool_name: &str,
+	content: &str,
+	duration_ms: Option<u64>,
+) {
 	let (dir, header) = {
 		let session = rt.session.lock().await;
 		let Some(dir) = session.session_dir.clone() else {
@@ -5756,6 +5803,7 @@ async fn persist_tool_record(rt: &Arc<SessionRuntime>, tool_call_id: &str, tool_
 		tool_call_id: tool_call_id.to_string(),
 		tool_name: tool_name.to_string(),
 		content: content.to_string(),
+		duration_ms,
 	};
 	if let Err(err) = sessions::append_record(&dir, &header, &record).await {
 		tracing::warn!(error = %err, "failed to persist tool result");
@@ -6252,6 +6300,7 @@ fn emit_replay_events(out: &mut Vec<CoderEvent>, record: SessionRecord, created_
 			tool_call_id,
 			tool_name: _,
 			content,
+			duration_ms,
 		} => {
 			// `content` may not be valid JSON (the model wrote
 			// raw bytes for a tool output we serialised as a
@@ -6271,6 +6320,7 @@ fn emit_replay_events(out: &mut Vec<CoderEvent>, record: SessionRecord, created_
 				id: tool_call_id,
 				result,
 				is_error,
+				duration_ms,
 			});
 		}
 		SessionRecord::TitleUpdate { .. } => {
@@ -6408,6 +6458,7 @@ async fn replay_subagent_spawned(
 				id: orphan_id,
 				result: serde_json::json!({ "error": "Interrupted before tool completed." }),
 				is_error: true,
+				duration_ms: None,
 			}),
 		});
 	}
@@ -6464,6 +6515,7 @@ fn subagent_replay_inners(record: SessionRecord, created_at_ms: i64) -> Vec<Code
 			tool_call_id,
 			tool_name: _,
 			content,
+			duration_ms,
 		} => {
 			let result = match serde_json::from_str::<Value>(&content) {
 				Ok(value) => value,
@@ -6474,6 +6526,7 @@ fn subagent_replay_inners(record: SessionRecord, created_at_ms: i64) -> Vec<Code
 				id: tool_call_id,
 				result,
 				is_error,
+				duration_ms,
 			}]
 		}
 		SessionRecord::Error { message } => vec![CoderEvent::Error { message }],
@@ -7503,6 +7556,7 @@ mod tests {
 				tool_call_id,
 				content,
 				tool_name: _,
+				duration_ms: _,
 			} => {
 				assert_eq!(tool_call_id, "call-1");
 				assert_eq!(content, sessions::INTERRUPTED_TOOL_RESULT_JSON);

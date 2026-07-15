@@ -1597,7 +1597,17 @@ export type CoderEvent =
 			created_at_ms?: number | null;
 	  }
 	| { kind: 'tool_call'; id: string; name: string; args: unknown }
-	| { kind: 'tool_result'; id: string; result: unknown; is_error: boolean }
+	| {
+			kind: 'tool_result';
+			id: string;
+			result: unknown;
+			is_error: boolean;
+			/** Wall-clock execution time measured by the backend
+			 *  dispatcher. Present live and on replay; absent for
+			 *  synthetic results (interrupted-tool sentinels) and
+			 *  records persisted before the field shipped. */
+			duration_ms?: number;
+	  }
 	| { kind: 'turn_complete' }
 	| { kind: 'aborted' }
 	| { kind: 'error'; message: string }
