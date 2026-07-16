@@ -45,9 +45,13 @@
 		// Wait for the startup `container.refresh()` to settle so
 		// a click that lands during the cold-launch probe doesn't
 		// see a stale `null` state and silently open a host
-		// terminal. After the await `containerRunning` reads
-		// whatever the daemon actually says.
+		// terminal, then for the launch-time auto-resume gate —
+		// mid-resume the daemon truthfully says `stopped`, which
+		// would skip the menu and host the terminal even though
+		// the shell is seconds from `running`. After the awaits
+		// `containerRunning` reads the settled state.
 		await container.awaitRefreshed();
+		await container.awaitStartupSettled();
 		if (!containerRunning) {
 			openHostTerminal();
 			return;

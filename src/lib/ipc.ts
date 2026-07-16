@@ -230,6 +230,9 @@ export const ipc = {
 	},
 	container: {
 		status: () => invoke<ContainerStatus>('container_status'),
+		// Resolves only after the backend's launch-time shell
+		// auto-resume has settled; see `container_await_startup`.
+		awaitStartup: () => invoke<ContainerStatus>('container_await_startup'),
 		setup: () => invoke<ContainerStatus>('container_setup'),
 		pause: () => invoke<ContainerStatus>('container_pause'),
 		resume: () => invoke<ContainerStatus>('container_resume'),

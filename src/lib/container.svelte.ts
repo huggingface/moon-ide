@@ -74,6 +74,30 @@ class ContainerPanelState {
 		}
 	}
 
+	/** Cached `container_await_startup` round-trip; see
+	 *  [`awaitStartupSettled`]. */
+	#startupSettled: Promise<void> | null = null;
+
+	/** Resolve once the backend's launch-time shell auto-resume
+	 *  (`auto_resume_shell`) has settled, folding the post-resume
+	 *  status into `status`. A plain `refresh()` mid-resume
+	 *  truthfully reports `stopped`/`creating`, so terminal-spawn
+	 *  helpers that only awaited it would fall back to host while
+	 *  the container was still coming up. One backend round-trip,
+	 *  cached for the session — the gate can't un-settle. */
+	awaitStartupSettled(): Promise<void> {
+		this.#startupSettled ??= (async () => {
+			try {
+				this.status = await ipc.container.awaitStartup();
+			} catch {
+				// Daemon down / no compose project — same failure
+				// surface as `refresh()`; callers proceed with the
+				// last known state and pick host.
+			}
+		})();
+		return this.#startupSettled;
+	}
+
 	/**
 	 * Bind the `container:state` Tauri event. Idempotent — safe to
 	 * call from `App.svelte`'s onMount even with HMR.

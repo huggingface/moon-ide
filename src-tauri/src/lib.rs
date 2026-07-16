@@ -161,6 +161,7 @@ pub fn run() {
 			commands::editor_forward::editor_forward_finish,
 			commands::editor_forward::editor_forward_cancel,
 			commands::container::container_status,
+			commands::container::container_await_startup,
 			commands::container::container_setup,
 			commands::container::container_pause,
 			commands::container::container_resume,
@@ -587,6 +588,11 @@ pub fn run() {
 						focus_socket::await_previous_shutdown(&state.workspaces_dir, id).await;
 					}
 					shutdown::auto_resume_shell(&app_handle, &state).await;
+					// Unblock `container_await_startup` waiters (the
+					// startup terminal auto-spawn) now that the shell's
+					// state is final — per-folder composes below don't
+					// affect the terminal's host-vs-container choice.
+					let _ = state.shell_auto_resume_settled.send(true);
 					shutdown::auto_resume_project_composes(&app_handle, &state).await;
 				});
 			}

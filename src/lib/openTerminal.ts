@@ -67,7 +67,10 @@ export function canOpenContainerTerminal(): boolean {
  *  the workspace shell is up, host otherwise. Awaits any
  *  in-flight `container.refresh()` first so a click that lands
  *  during the startup probe doesn't get host'd just because
- *  `container.state` hasn't resolved yet.
+ *  `container.state` hasn't resolved yet, then the launch-time
+ *  auto-resume gate — mid-resume a refresh truthfully reports
+ *  `stopped`, which is exactly the window where "prefer the
+ *  container" must wait rather than fall back to host.
  *
  *  This is the helper user-driven spawns should reach for. The
  *  bottom-panel quick-host / quick-container buttons (where the
@@ -76,6 +79,7 @@ export function canOpenContainerTerminal(): boolean {
  *  directly. */
 export async function openPreferredTerminal(): Promise<void> {
 	await container.awaitRefreshed();
+	await container.awaitStartupSettled();
 	if (canOpenContainerTerminal()) {
 		openContainerTerminal();
 		return;

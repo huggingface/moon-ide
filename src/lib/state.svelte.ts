@@ -2042,9 +2042,14 @@ class WorkspaceState {
 	 *
 	 * Awaits `containerRefresh` first so the target choice reflects
 	 * the daemon's current truth rather than the pre-hydrate `null`
-	 * status. Awaits `terminalRuntime` so the `terminal:output`
-	 * listener is attached before we spawn — otherwise the first
-	 * prompt bytes would be dropped on the floor.
+	 * status, then the launch-time auto-resume gate
+	 * (`container.awaitStartupSettled`) — the backend may still be
+	 * `docker compose up`-ing the shell it auto-resumes on launch,
+	 * and a refresh landing mid-resume truthfully reports `stopped`,
+	 * which would wrongly send this spawn to host. Awaits
+	 * `terminalRuntime` so the `terminal:output` listener is
+	 * attached before we spawn — otherwise the first prompt bytes
+	 * would be dropped on the floor.
 	 *
 	 * Skips silently when there's no workspace bound (a
 	 * `$HOME`-rooted host shell with no folder context isn't
@@ -2066,6 +2071,7 @@ class WorkspaceState {
 			return;
 		}
 		await containerRefresh;
+		await container.awaitStartupSettled();
 		await terminalRuntime;
 		if (bottomPanel.tabs.length > 0) {
 			return;
