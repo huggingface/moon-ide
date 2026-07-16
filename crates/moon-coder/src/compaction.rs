@@ -46,7 +46,7 @@
 use tokio_util::sync::CancellationToken;
 
 use crate::event::CoderEvent;
-use crate::inference::{ChatMessage, InferenceClient, TokenUsage};
+use crate::inference::{ChatMessage, InferenceClient, StreamEvent, TokenUsage};
 use crate::models::CoderModels;
 use crate::runner::{estimate_prompt_tokens, FolderEventSink};
 
@@ -196,7 +196,23 @@ pub(crate) async fn compact_if_needed(
 		CoderEvent::CompactionStarted { messages_compacted },
 	);
 
-	let summary = match summarise_prefix(inference, models, older, cancel).await {
+	// Progress heartbeat. A summary call can run minutes on a big
+	// prefix — without this the panel's "compacting…" row gives no
+	// sign of life. Tokens-written is the signal that moves in the
+	// common single-chunk case; chunk counters cover the chunked one.
+	let progress = |chunks_done: u32, chunks_total: u32, summary_tokens: u32| {
+		emit(
+			sink,
+			subagent_id_for_wrap,
+			CoderEvent::CompactionProgress {
+				chunks_done,
+				chunks_total,
+				summary_tokens,
+			},
+		);
+	};
+
+	let summary = match summarise_prefix(inference, models, older, &progress, cancel).await {
 		Some(s) if !s.trim().is_empty() => s,
 		_ => {
 			// Either every summary call failed, or the model came
@@ -306,10 +322,18 @@ const SUMMARY_FALLBACK_BUDGET_TOKENS: usize = 70_000;
 ///
 /// Returns `None` only when *every* call failed; a partial set of
 /// successful chunk summaries still produces a usable result.
+/// `progress` is invoked with `(chunks_done, chunks_total,
+/// summary_tokens)` once after chunking, continuously while each
+/// call streams its summary out, and again after each call settles,
+/// feeding the frontend's [`CoderEvent::CompactionProgress`]
+/// heartbeat. `summary_tokens` is cumulative across this level's
+/// calls; a re-chunking recursion restarts it from zero along with
+/// the chunk counters.
 async fn summarise_prefix(
 	inference: &InferenceClient,
 	models: &CoderModels,
 	older: &[ChatMessage],
+	progress: &(dyn Fn(u32, u32, u32) + Send + Sync),
 	cancel: &CancellationToken,
 ) -> Option<String> {
 	// Use the standard model's window for the chunk budget, not the
@@ -332,10 +356,15 @@ async fn summarise_prefix(
 	if chunks.is_empty() {
 		return None;
 	}
+	let chunks_total = chunks.len() as u32;
+	progress(0, chunks_total, 0);
 
 	// Summarise each chunk. Tolerate per-chunk failures: a
-	// partial summary is more useful than none.
+	// partial summary is more useful than none. `tokens_base`
+	// accumulates the finished calls' output so the streamed
+	// count keeps rising monotonically across chunks.
 	let mut partials: Vec<String> = Vec::new();
+	let mut tokens_base: u32 = 0;
 	let multi = chunks.len() > 1;
 	for (i, chunk) in chunks.iter().enumerate() {
 		let intro = if multi {
@@ -347,10 +376,16 @@ async fn summarise_prefix(
 		} else {
 			PREFIX_INTRO.to_string()
 		};
-		match summarise_once(inference, models, &format!("{intro}{chunk}"), cancel).await {
-			Some(s) if !s.trim().is_empty() => partials.push(s),
+		let base = tokens_base;
+		let on_tokens = |call_tokens: u32| progress(i as u32, chunks_total, base + call_tokens);
+		match summarise_once(inference, models, &format!("{intro}{chunk}"), &on_tokens, cancel).await {
+			Some(s) if !s.trim().is_empty() => {
+				tokens_base += estimate_tokens(&s) as u32;
+				partials.push(s);
+			}
 			_ => tracing::warn!(chunk = i, "compaction chunk summary failed; skipping it"),
 		}
+		progress((i + 1) as u32, chunks_total, tokens_base);
 	}
 	if partials.is_empty() {
 		return None;
@@ -367,14 +402,18 @@ async fn summarise_prefix(
 			"The following are ordered partial summaries of consecutive slices of one coding session. \
 Merge them into a single coherent summary, preserving chronology and de-duplicating overlap:\n\n{combined}"
 		);
-		return summarise_once(inference, models, &prompt, cancel)
+		// `chunks_done == chunks_total` marks the merge pass for
+		// the frontend's label.
+		let base = tokens_base;
+		let on_tokens = |call_tokens: u32| progress(chunks_total, chunks_total, base + call_tokens);
+		return summarise_once(inference, models, &prompt, &on_tokens, cancel)
 			.await
 			.or(Some(combined));
 	}
 	// Too big even combined: wrap each partial back into a
 	// pseudo-message and recurse through the same chunker.
 	let pseudo: Vec<ChatMessage> = partials.into_iter().map(ChatMessage::user).collect();
-	Box::pin(summarise_prefix(inference, models, &pseudo, cancel)).await
+	Box::pin(summarise_prefix(inference, models, &pseudo, progress, cancel)).await
 }
 
 /// Pack pre-rendered message blocks into chunks that each stay
@@ -412,14 +451,23 @@ fn pack_into_chunks(blocks: &[String], budget: usize) -> Vec<String> {
 	chunks
 }
 
-/// One non-streaming summary call against the cheap model with the
-/// fixed [`SUMMARY_SYSTEM_PROMPT`]. Returns `None` on transport
-/// error so the caller can decide whether a partial result is
-/// still usable.
+/// Report the streamed summary size every this many estimated
+/// tokens. Coarse enough that a 16k-token summary emits a few
+/// hundred events, fine enough that the counter visibly moves.
+const TOKEN_REPORT_STEP: u32 = 50;
+
+/// One summary call against the standard model with the fixed
+/// [`SUMMARY_SYSTEM_PROMPT`]. Streams the response so `on_tokens`
+/// can report the growing output size (estimated tokens, throttled
+/// to [`TOKEN_REPORT_STEP`]) — a single call can run minutes and
+/// this is the only liveness signal the panel gets. Returns `None`
+/// on transport error so the caller can decide whether a partial
+/// result is still usable.
 async fn summarise_once(
 	inference: &InferenceClient,
 	models: &CoderModels,
 	user_content: &str,
+	on_tokens: &(dyn Fn(u32) + Send + Sync),
 	cancel: &CancellationToken,
 ) -> Option<String> {
 	let call = vec![
@@ -431,7 +479,21 @@ async fn summarise_once(
 	// Use the standard model for the summary call — same reason as the
 	// chunk budget above. The standard model's window is always large
 	// enough for the chunks; the cheap model's may not be.
-	match inference.chat_completion(models.standard(), &call, &[], cancel).await {
+	let mut bytes = 0usize;
+	let mut last_reported = 0u32;
+	let result = inference
+		.chat_completion_stream(models.standard(), &call, &[], cancel, |ev| {
+			if let StreamEvent::ContentDelta { delta } = ev {
+				bytes += delta.len();
+				let tokens = (bytes / 4) as u32;
+				if tokens >= last_reported + TOKEN_REPORT_STEP {
+					last_reported = tokens;
+					on_tokens(tokens);
+				}
+			}
+		})
+		.await;
+	match result {
 		Ok(r) => r.content,
 		Err(err) => {
 			tracing::warn!(error = %err, "compaction summary call failed");

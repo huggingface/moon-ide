@@ -4,7 +4,7 @@
 	import { confirm } from '@tauri-apps/plugin-dialog';
 	import { readImage, writeText as clipboardWriteText } from '@tauri-apps/plugin-clipboard-manager';
 	import { openUrl } from '@tauri-apps/plugin-opener';
-	import { coder, type CoderRow } from '../coder.svelte';
+	import { coder, compactionProgressLabel, type CoderRow } from '../coder.svelte';
 	import { frontendLog } from '../logs.svelte';
 	import { slack } from '../slack.svelte';
 	import { workspace } from '../state.svelte';
@@ -2442,10 +2442,14 @@
 	<div class="row compaction" class:running={state.phase === 'running'}>
 		<div class="row-label">compaction</div>
 		{#if state.phase === 'running'}
+			{@const progress = compactionProgressLabel(state)}
 			<div class="bubble">
 				Compacting older turns into a summary
 				{#if state.messagesCompacted > 0}
 					({state.messagesCompacted} messages)
+				{/if}
+				{#if progress}
+					— {progress}
 				{/if}
 				…
 			</div>

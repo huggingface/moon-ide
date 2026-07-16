@@ -331,6 +331,26 @@ pub enum CoderEvent {
 		messages_compacted: u32,
 	},
 
+	/// Progress heartbeat while the compaction summary is being
+	/// written. `summary_tokens` is the estimated token count
+	/// (bytes/4) of summary text the model has streamed out so
+	/// far, cumulative across the pass's calls — the common
+	/// single-chunk case still gets a visibly moving number.
+	/// `chunks_done` / `chunks_total` cover the chunked case (the
+	/// prefix is split so each summary call fits the model's
+	/// window): emitted once right after chunking (`0/N`) and
+	/// again as each chunk settles; `chunks_done == chunks_total`
+	/// on a multi-chunk run means the final merge pass is in
+	/// flight. A re-chunking recursion (partials still too big)
+	/// restarts the counters with a new total. Not persisted /
+	/// replayed — purely a live-progress signal for the running
+	/// transcript row.
+	CompactionProgress {
+		chunks_done: u32,
+		chunks_total: u32,
+		summary_tokens: u32,
+	},
+
 	/// Compaction finished. `summary` is the fast-model output
 	/// that's now standing in for the old prefix; `prompt_tokens_after`
 	/// is the next round-trip's expected prompt size (system

@@ -112,6 +112,15 @@ export type CoderRow =
 			 *  `summary` is populated. */
 			phase: 'running' | 'done';
 			messagesCompacted: number;
+			/** Summary progress while running, from the streamed
+			 *  `compaction_progress` heartbeat: estimated tokens of
+			 *  summary text written so far, plus chunk counters for
+			 *  the chunked-prefix case. All `0` until the first
+			 *  heartbeat lands (and on replayed rows — the events
+			 *  aren't persisted). */
+			chunksDone: number;
+			chunksTotal: number;
+			summaryTokens: number;
 			/** Empty until `phase === 'done'`. */
 			summary: string;
 	  }
@@ -531,8 +540,50 @@ export type TokenUsageState = {
  * history.
  */
 export type CompactionState =
-	| { phase: 'running'; messagesCompacted: number }
+	| {
+			phase: 'running';
+			messagesCompacted: number;
+			chunksDone: number;
+			chunksTotal: number;
+			summaryTokens: number;
+	  }
 	| { phase: 'done'; messagesCompacted: number; summary: string; promptTokensAfter: number };
+
+/** Human-readable progress fragment for a running compaction,
+ *  shared by the transcript row and the context ring's tooltip.
+ *  The tokens-written count is the part that visibly moves (the
+ *  summary call streams); chunk counters only appear when the
+ *  prefix was split across several calls. `null` when there's
+ *  nothing beyond the generic "compacting…" to say — no
+ *  `compaction_progress` heartbeat received yet. */
+export function compactionProgressLabel(state: {
+	chunksDone: number;
+	chunksTotal: number;
+	summaryTokens: number;
+}): string | null {
+	const parts: string[] = [];
+	if (state.chunksTotal > 1) {
+		parts.push(
+			state.chunksDone >= state.chunksTotal
+				? 'merging part summaries'
+				: `part ${state.chunksDone + 1} of ${state.chunksTotal}`,
+		);
+	}
+	if (state.summaryTokens > 0) {
+		parts.push(`≈${formatTokenCount(state.summaryTokens)} tokens written`);
+	}
+	if (parts.length === 0) {
+		return null;
+	}
+	return parts.join(' · ');
+}
+
+function formatTokenCount(tokens: number): string {
+	if (tokens >= 1000) {
+		return `${(tokens / 1000).toFixed(1)}k`;
+	}
+	return String(tokens);
+}
 
 /** Per-session sync state for the row decoration in the session
  *  list. Held in `CoderPanelState.hubSyncState`, keyed by
@@ -3365,15 +3416,41 @@ class CoderPanelState {
 				session.compaction = {
 					phase: 'running',
 					messagesCompacted: event.messages_compacted,
+					chunksDone: 0,
+					chunksTotal: 0,
+					summaryTokens: 0,
 				};
 				session.rows.push({
 					kind: 'compaction',
 					id: nextCompactionRowId(),
 					phase: 'running',
 					messagesCompacted: event.messages_compacted,
+					chunksDone: 0,
+					chunksTotal: 0,
+					summaryTokens: 0,
 					summary: '',
 				});
 				return;
+			case 'compaction_progress': {
+				// Patch the running row + header state in place; the
+				// heartbeat carries no identity because at most one
+				// compaction is in flight per session.
+				if (session.compaction?.phase === 'running') {
+					session.compaction = {
+						...session.compaction,
+						chunksDone: event.chunks_done,
+						chunksTotal: event.chunks_total,
+						summaryTokens: event.summary_tokens,
+					};
+				}
+				const row = session.rows.find((r) => r.kind === 'compaction' && r.phase === 'running');
+				if (row && row.kind === 'compaction') {
+					row.chunksDone = event.chunks_done;
+					row.chunksTotal = event.chunks_total;
+					row.summaryTokens = event.summary_tokens;
+				}
+				return;
+			}
 			case 'compaction_complete': {
 				const previous = session.compaction;
 				const messagesCompacted = previous?.phase === 'running' ? previous.messagesCompacted : 0;
@@ -3541,9 +3618,21 @@ function applyInnerEventToRows(rows: CoderRow[], event: CoderEvent): void {
 				id: nextCompactionRowId(),
 				phase: 'running',
 				messagesCompacted: event.messages_compacted,
+				chunksDone: 0,
+				chunksTotal: 0,
+				summaryTokens: 0,
 				summary: '',
 			});
 			return;
+		case 'compaction_progress': {
+			const row = rows.find((r) => r.kind === 'compaction' && r.phase === 'running');
+			if (row && row.kind === 'compaction') {
+				row.chunksDone = event.chunks_done;
+				row.chunksTotal = event.chunks_total;
+				row.summaryTokens = event.summary_tokens;
+			}
+			return;
+		}
 		case 'compaction_complete': {
 			// Patch the running row to `done`, or drop it on an
 			// empty (skipped) summary — same contract as the parent

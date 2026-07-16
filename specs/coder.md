@@ -935,9 +935,14 @@ threshold.
 `compaction_started` / `compaction_complete` events render as an
 interleaved transcript row — a "compacting…" pip flipping to a
 `<details>` with the summary — which scrolls away naturally,
-stacks on repeat compactions, and survives reopen via replay. If
-every summary call fails, compaction is skipped and the agent
-continues with the uncompacted prompt.
+stacks on repeat compactions, and survives reopen via replay.
+While the pass runs, `compaction_progress` heartbeats stream live
+progress into the row (and the ring's tooltip): estimated summary
+tokens written so far (the summary call streams its output) plus
+`part i of N` / merge-pass counters when the prefix was chunked.
+Not persisted — replayed rows flip straight to done. If every
+summary call fails, compaction is skipped and the agent continues
+with the uncompacted prompt.
 
 Sub-agents run the same pass at the same threshold against their own
 history. Threshold, retained-turn count, and the summary prompt are

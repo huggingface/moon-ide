@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { TokenUsageState, CompactionState } from '../coder.svelte';
+	import { compactionProgressLabel, type TokenUsageState, type CompactionState } from '../coder.svelte';
 
 	type Props = {
 		usage: TokenUsageState | null;
@@ -103,7 +103,10 @@
 			lines.push(`cache: ${parts.join(' · ')}`);
 		}
 		if (compaction?.phase === 'running') {
-			lines.push(`Compacting older turns into a summary…`);
+			const progress = compactionProgressLabel(compaction);
+			lines.push(
+				progress ? `Compacting older turns into a summary — ${progress}…` : `Compacting older turns into a summary…`,
+			);
 		} else if (compaction?.phase === 'done') {
 			lines.push(`Last compaction folded ${compaction.messagesCompacted} messages into a summary.`);
 		}
