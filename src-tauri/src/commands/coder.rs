@@ -13,6 +13,7 @@ use moon_coder::{
 use moon_core::app_state as app_state_store;
 use moon_core::session as core_session;
 use moon_protocol::coder_hub::{CoderHubBucket, HubNamespace, HubUploadAllSummary};
+use moon_protocol::coder_mcp::{McpRunTarget, McpServerConfig, McpServerStatus};
 use moon_protocol::coder_models::{
 	CoderModelSettings, CoderProviderConfig, CoderProviderLock, ProviderModelSummary, ProviderProbeResult, RouterModel,
 };
@@ -1402,4 +1403,107 @@ pub async fn coder_set_web_search_key(state: State<'_, AppState>, key: String) -
 #[tauri::command]
 pub async fn coder_clear_web_search_key(state: State<'_, AppState>) -> Result<(), MoonError> {
 	state.coder.clear_web_search_key().map_err(MoonError::from)
+}
+
+/// The workspace's MCP server list: presets + custom entries,
+/// each with its per-workspace enabled flag. Cheap `session.json`
+/// read; no workspace bound degrades to the preset list with
+/// everything disabled so the settings section can still render.
+#[tauri::command]
+pub async fn coder_mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServerStatus>, MoonError> {
+	let Some(id) = state.workspace_id() else {
+		return Ok(moon_coder::mcp::server_rows(&Default::default()));
+	};
+	let session = core_session::load(&state.workspaces_dir, id).await?;
+	Ok(moon_coder::mcp::server_rows(&session.coder_mcp))
+}
+
+/// Flip one server's enabled flag for the active workspace. The
+/// next agent turn advertises (or stops advertising) the MCP
+/// meta-tools accordingly. Disabling also kills the server's live
+/// connection so the child process doesn't linger.
+#[tauri::command]
+pub async fn coder_mcp_set_enabled(state: State<'_, AppState>, id: String, enabled: bool) -> Result<(), MoonError> {
+	let Some(workspace_id) = state.workspace_id() else {
+		return Err(MoonError::invalid("no workspace bound to this process"));
+	};
+	let workspace_id = workspace_id.to_owned();
+	let mut session = core_session::load(&state.workspaces_dir, &workspace_id).await?;
+	let known = moon_coder::mcp::server_rows(&session.coder_mcp);
+	if !known.iter().any(|row| row.config.id == id) {
+		return Err(MoonError::invalid(format!("unknown MCP server `{id}`")));
+	}
+	let currently = session.coder_mcp.enabled.iter().any(|e| e == &id);
+	if currently == enabled {
+		return Ok(());
+	}
+	if enabled {
+		session.coder_mcp.enabled.push(id.clone());
+	} else {
+		session.coder_mcp.enabled.retain(|e| e != &id);
+		state.coder.mcp_drop_connection(&id).await;
+	}
+	core_session::save(&state.workspaces_dir, &workspace_id, &session).await
+}
+
+#[derive(Deserialize)]
+pub struct AddMcpServerArgs {
+	pub label: String,
+	pub command: String,
+	#[serde(default)]
+	pub args: Vec<String>,
+	pub runs: McpRunTarget,
+	#[serde(default)]
+	pub description: String,
+}
+
+/// Add a custom MCP server to the active workspace and enable it
+/// immediately — adding one is a statement of intent to use it.
+/// Returns the refreshed row list.
+#[tauri::command]
+pub async fn coder_mcp_add_custom(
+	state: State<'_, AppState>,
+	server: AddMcpServerArgs,
+) -> Result<Vec<McpServerStatus>, MoonError> {
+	let Some(workspace_id) = state.workspace_id() else {
+		return Err(MoonError::invalid("no workspace bound to this process"));
+	};
+	let workspace_id = workspace_id.to_owned();
+	let config = McpServerConfig {
+		id: moon_coder::mcp::new_custom_id(),
+		label: server.label.trim().to_string(),
+		command: server.command.trim().to_string(),
+		args: server.args,
+		runs: server.runs,
+		description: server.description.trim().to_string(),
+	};
+	moon_coder::mcp::validate_custom(&config)?;
+	let mut session = core_session::load(&state.workspaces_dir, &workspace_id).await?;
+	session.coder_mcp.enabled.push(config.id.clone());
+	session.coder_mcp.custom.push(config);
+	core_session::save(&state.workspaces_dir, &workspace_id, &session).await?;
+	Ok(moon_coder::mcp::server_rows(&session.coder_mcp))
+}
+
+/// Remove a custom MCP server (presets aren't removable — disable
+/// them instead). Kills any live connection. Returns the refreshed
+/// row list.
+#[tauri::command]
+pub async fn coder_mcp_remove_custom(
+	state: State<'_, AppState>,
+	id: String,
+) -> Result<Vec<McpServerStatus>, MoonError> {
+	let Some(workspace_id) = state.workspace_id() else {
+		return Err(MoonError::invalid("no workspace bound to this process"));
+	};
+	let workspace_id = workspace_id.to_owned();
+	let mut session = core_session::load(&state.workspaces_dir, &workspace_id).await?;
+	if !session.coder_mcp.custom.iter().any(|c| c.id == id) {
+		return Err(MoonError::invalid(format!("no custom MCP server `{id}`")));
+	}
+	session.coder_mcp.custom.retain(|c| c.id != id);
+	session.coder_mcp.enabled.retain(|e| e != &id);
+	state.coder.mcp_drop_connection(&id).await;
+	core_session::save(&state.workspaces_dir, &workspace_id, &session).await?;
+	Ok(moon_coder::mcp::server_rows(&session.coder_mcp))
 }

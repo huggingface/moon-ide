@@ -300,19 +300,21 @@ Every tool is a moon-core method dispatched through the active
 `WorkspaceHost`. The schema is JSON-Schema in the LLM request; the
 implementations are typed Rust:
 
-| Tool         | Signature                                                                                                           | Notes                                                                                                                                                                                                                                                                        |
-| ------------ | ------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `read_file`  | `(path, start_line?, end_line?) -> { content, start_line, end_line, total_lines, truncated, mtime_ms }`             | Lines prefixed `<line_no>\|<line>`; 1-based inclusive range, clamped to EOF with the effective range echoed back. Path routing per [§ Path resolution](#path-resolution-and-cross-folder-routing).                                                                           |
-| `write_file` | `(path, content) -> { path, bytes_written, mtime_ms }`                                                              | Creates missing parent directories automatically (`mkdir -p`), sandboxed to the workspace root.                                                                                                                                                                              |
-| `edit_file`  | `(path, find, replace, occurrence?) -> { path, bytes_written, mtime_ms, occurrence, total_matches, match_mode }`    | Exact match first, then escalating fuzzy stages (escape-leakage, backslash-run, indent-tolerant, whitespace-collapsing); `match_mode` reports which one hit. Non-unique match without `occurrence` errors with the matching line numbers.                                    |
-| `list_dir`   | `(path) -> DirEntry[]`                                                                                              | Gitignore-aware, same walk as the file tree.                                                                                                                                                                                                                                 |
-| `grep`       | `(pattern, case_sensitive?, max_matches?) -> { pattern, matches, count, truncated }`                                | `path:line: text` hits; long lines capped at 500 chars so one minified-bundle hit can't blow the context. Backed by the `ignore`/ripgrep dep.                                                                                                                                |
-| `bash`       | `(cmd, timeout_ms?) -> { cmd, target, stdout, stderr, exit_code }`                                                  | `docker exec … bash -c` when the workspace shell container is `Running`, else host `bash -lc` — same probe terminals and LSP use, with a per-session force-host override ([ADR 0022](decisions/0022-coder-host-mode-override.md)). `target` echoes `"host"` / `"container"`. |
-| `task`       | `(task, folder?, mode?, system_prompt?) -> { result, sub_session_id, tokens_used_estimate, mode, iterations_used }` | Delegates to a sub-agent — see [§ Sub-agents](#sub-agents). Parent-only; up to 4 run in parallel.                                                                                                                                                                            |
-| `web_search` | `(query, max_results?) -> { query, results, count }`                                                                | Tavily SERP. Only advertised when a key is configured. See [§ Web search](#web-search).                                                                                                                                                                                      |
-| `web_fetch`  | `(url) -> { url, markdown, truncated, bytes }`                                                                      | Jina Reader markdown extraction; `http`/`https` only, 200 kB cap. Always available.                                                                                                                                                                                          |
-| `ask_user`   | `(questions[…]) -> { status, answers? }`                                                                            | Pause the turn for multiple-choice questions. Parent-only. See [§ Ask user tool](#ask-user-tool).                                                                                                                                                                            |
-| `todo_write` | `(todos[], merge?) -> current full list`                                                                            | Session-scoped plan. See [§ Todo list tool](#todo-list-tool).                                                                                                                                                                                                                |
+| Tool             | Signature                                                                                                           | Notes                                                                                                                                                                                                                                                                        |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `read_file`      | `(path, start_line?, end_line?) -> { content, start_line, end_line, total_lines, truncated, mtime_ms }`             | Lines prefixed `<line_no>\|<line>`; 1-based inclusive range, clamped to EOF with the effective range echoed back. Path routing per [§ Path resolution](#path-resolution-and-cross-folder-routing).                                                                           |
+| `write_file`     | `(path, content) -> { path, bytes_written, mtime_ms }`                                                              | Creates missing parent directories automatically (`mkdir -p`), sandboxed to the workspace root.                                                                                                                                                                              |
+| `edit_file`      | `(path, find, replace, occurrence?) -> { path, bytes_written, mtime_ms, occurrence, total_matches, match_mode }`    | Exact match first, then escalating fuzzy stages (escape-leakage, backslash-run, indent-tolerant, whitespace-collapsing); `match_mode` reports which one hit. Non-unique match without `occurrence` errors with the matching line numbers.                                    |
+| `list_dir`       | `(path) -> DirEntry[]`                                                                                              | Gitignore-aware, same walk as the file tree.                                                                                                                                                                                                                                 |
+| `grep`           | `(pattern, case_sensitive?, max_matches?) -> { pattern, matches, count, truncated }`                                | `path:line: text` hits; long lines capped at 500 chars so one minified-bundle hit can't blow the context. Backed by the `ignore`/ripgrep dep.                                                                                                                                |
+| `bash`           | `(cmd, timeout_ms?) -> { cmd, target, stdout, stderr, exit_code }`                                                  | `docker exec … bash -c` when the workspace shell container is `Running`, else host `bash -lc` — same probe terminals and LSP use, with a per-session force-host override ([ADR 0022](decisions/0022-coder-host-mode-override.md)). `target` echoes `"host"` / `"container"`. |
+| `task`           | `(task, folder?, mode?, system_prompt?) -> { result, sub_session_id, tokens_used_estimate, mode, iterations_used }` | Delegates to a sub-agent — see [§ Sub-agents](#sub-agents). Parent-only; up to 4 run in parallel.                                                                                                                                                                            |
+| `web_search`     | `(query, max_results?) -> { query, results, count }`                                                                | Tavily SERP. Only advertised when a key is configured. See [§ Web search](#web-search).                                                                                                                                                                                      |
+| `web_fetch`      | `(url) -> { url, markdown, truncated, bytes }`                                                                      | Jina Reader markdown extraction; `http`/`https` only, 200 kB cap. Always available.                                                                                                                                                                                          |
+| `mcp_list_tools` | `(server) -> { server, tools, count }`                                                                              | Tool catalog of one enabled MCP server. Only advertised when the workspace has enabled servers. See [§ MCP servers](#mcp-servers).                                                                                                                                           |
+| `mcp_call`       | `(server, tool, args?) -> { server, tool, content }`                                                                | Invoke one MCP tool. Same gating as `mcp_list_tools`.                                                                                                                                                                                                                        |
+| `ask_user`       | `(questions[…]) -> { status, answers? }`                                                                            | Pause the turn for multiple-choice questions. Parent-only. See [§ Ask user tool](#ask-user-tool).                                                                                                                                                                            |
+| `todo_write`     | `(todos[], merge?) -> current full list`                                                                            | Session-scoped plan. See [§ Todo list tool](#todo-list-tool).                                                                                                                                                                                                                |
 
 Possible later additions, as separate commits when proven needed:
 LSP wrappers (`goto_definition`, `find_references`, `hover`),
@@ -430,6 +432,39 @@ and auto-compaction already handles the context-growth failure mode.
 Neither tool is mode-gated — both are read-only against the world.
 Errors surface as `is_error: true` tool results with the provider's
 verbatim error body.
+
+### MCP servers
+
+MCP (Model Context Protocol) servers reach the model through a
+**meta-tool surface**, not direct tool exposure ([ADR 0033](decisions/0033-coder-mcp.md)):
+`mcp_list_tools(server)` returns a server's tool catalog on demand,
+`mcp_call(server, tool, args)` invokes one. The enabled-server list
+(id + a model-facing description) rides in the meta-tool
+descriptions plus an `enum` on `server`; per-server schemas only
+cost context when actually fetched. Neither tool is advertised when
+the workspace has no enabled servers, and neither is mode-gated
+(same posture as `bash` — sub-agents get them too).
+
+- **Presets + customs.** One hardcoded preset: `playwright`
+  (`npx -y @playwright/mcp@latest`). Custom servers — label,
+  command + args (stdio transport only), run target, description —
+  live per workspace on `WorkspaceSession.coder_mcp`, managed from
+  the model-settings modal's "MCP servers" section via the
+  `coder_mcp_*` commands.
+- **Per-workspace enable set**, following the provider-lock
+  precedent. Toggles write through immediately; the next turn's
+  tool list reflects them.
+- **Per-server run target**: `host` (playwright's default — it
+  needs a real browser) or `container` (`docker exec -i` when the
+  workspace shell container is `Running`, host fallback — same
+  probe as `bash`).
+- **Lifecycle**: spawned lazily on first use, kept alive across
+  turns (a playwright browser session persists between calls),
+  killed on disable / remove / IDE exit, respawned on the next call
+  after a crash.
+- An MCP-level `isError` result throws, per the error model below.
+  Image content blocks (screenshots) render as a text placeholder —
+  tool-result images are future work.
 
 ### Error model
 
@@ -1302,6 +1337,7 @@ Tauri commands in `src-tauri/src/commands/coder.rs`:
 | `coder_set_model(slug)` / `coder_set_model_settings(…)` | Model picks                                                                                                   |
 | `coder_*_provider*` commands                            | Custom-provider CRUD, probe, per-provider catalog, keyring-only API-key set/clear                             |
 | `coder_set_sync_enabled(enabled)`                       | Per-workspace bucket-sync toggle                                                                              |
+| `coder_mcp_*` commands                                  | MCP server rows, per-workspace enable toggle, custom-server add/remove (see [§ MCP servers](#mcp-servers))    |
 
 Push events: `coder:event` (every loop event, envelope-wrapped),
 `coder:signed_out`, `coder:sync_state`.
@@ -1324,7 +1360,10 @@ Push events: `coder:event` (every loop event, envelope-wrapped),
 - **Pluggable agent binaries** (ACP) — superseded by ADR 0010.
 - **Plan mode** — the team can write plans into `AGENTS.md`.
 - **Permission popups** — see "Permissions" above.
-- **MCP** — same posture as pi.
+- **MCP beyond the meta-tool surface** — stdio transport and a
+  curated preset list only ([ADR 0033](decisions/0033-coder-mcp.md));
+  HTTP/SSE transports, direct per-tool exposure, and MCP resources /
+  prompts wait for a concrete need.
 - **Per-sub-agent abort UI** — parent abort cascades to all live
   sub-agents; individual cancel buttons wait for a real need.
 - **Background detached sub-agents** — sub-agents are

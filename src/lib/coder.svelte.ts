@@ -33,6 +33,8 @@ import {
 	type HubNamespace,
 	type HubUploadAllSummary,
 	type ImageAttachmentPayload,
+	type McpRunTarget,
+	type McpServerStatus,
 	type ProviderKind,
 	type ProviderModelSummary,
 	type ProviderProbeResult,
@@ -748,6 +750,56 @@ class CoderPanelState {
 		await ipc.coder.hubDisconnect();
 		this.hubBucket = null;
 		this.hubSyncState = {};
+	}
+
+	/** MCP server rows (presets + this workspace's custom entries,
+	 *  each with its enabled flag). `null` until the first
+	 *  [`loadMcpServers`] resolves. */
+	mcpServers = $state<McpServerStatus[] | null>(null);
+
+	/** Fetch the MCP server list for the settings section. Errors
+	 *  drop silently — the section renders its last snapshot (or
+	 *  stays hidden) until the next open. */
+	async loadMcpServers(): Promise<void> {
+		try {
+			this.mcpServers = await ipc.coder.mcpServers();
+		} catch {
+			// Ignored — see fn docstring.
+		}
+	}
+
+	/** Flip one server's per-workspace enabled flag. Optimistic
+	 *  update; reverts and rethrows on failure so the modal can
+	 *  surface the error inline. */
+	async setMcpEnabled(id: string, enabled: boolean): Promise<void> {
+		const previous = this.mcpServers;
+		if (this.mcpServers) {
+			this.mcpServers = this.mcpServers.map((row) => (row.id === id ? { ...row, enabled } : row));
+		}
+		try {
+			await ipc.coder.mcpSetEnabled(id, enabled);
+		} catch (err) {
+			this.mcpServers = previous;
+			throw err;
+		}
+	}
+
+	/** Add a custom MCP server to the workspace (enabled
+	 *  immediately). Throws so the add form can stay open with the
+	 *  error rendered inline. */
+	async addMcpServer(server: {
+		label: string;
+		command: string;
+		args: string[];
+		runs: McpRunTarget;
+		description: string;
+	}): Promise<void> {
+		this.mcpServers = await ipc.coder.mcpAddCustom(server);
+	}
+
+	/** Remove a custom MCP server (presets can only be disabled). */
+	async removeMcpServer(id: string): Promise<void> {
+		this.mcpServers = await ipc.coder.mcpRemoveCustom(id);
 	}
 
 	/** Push one session JSONL to the Hub right now. Used by the

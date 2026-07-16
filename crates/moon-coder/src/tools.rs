@@ -35,6 +35,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::CoderError;
 use crate::inference::ToolDefinition;
+use crate::mcp::{McpManager, McpSpawnTarget};
 use crate::web::WebClient;
 
 /// Hard cap on `bash` runtime — keeps a runaway tool call from
@@ -327,6 +328,7 @@ pub struct ToolRegistry {
 	workspaces: Arc<WorkspaceRegistry>,
 	workspaces_dir: Utf8PathBuf,
 	web: WebClient,
+	mcp: Arc<McpManager>,
 }
 
 impl ToolRegistry {
@@ -335,7 +337,15 @@ impl ToolRegistry {
 			workspaces,
 			workspaces_dir,
 			web,
+			mcp: Arc::new(McpManager::default()),
 		}
+	}
+
+	/// Shared [`McpManager`]. Exposed so the Tauri command layer
+	/// can drop a server's connection when the user disables or
+	/// removes it in settings.
+	pub fn mcp(&self) -> &Arc<McpManager> {
+		&self.mcp
 	}
 
 	/// Shared [`WebClient`]. Exposed so the Tauri command layer can
@@ -744,6 +754,180 @@ impl ToolRegistry {
 		defs
 	}
 
+	/// Meta-tool definitions for the workspace's enabled MCP
+	/// servers (ADR 0033). Empty when none are enabled, so the
+	/// model never sees tools that are guaranteed to error — same
+	/// posture as the Tavily-gated `web_search`.
+	///
+	/// Deliberately a meta-tool surface (`mcp_list_tools` +
+	/// `mcp_call`) rather than advertising every server tool
+	/// directly: the tool list stays stable across servers, and
+	/// per-server schemas only cost context when the model actually
+	/// asks for them. The enabled-server list rides in the
+	/// descriptions plus an `enum` on `server`, so a hallucinated
+	/// server name fails schema-side.
+	pub async fn mcp_definitions(&self) -> Vec<ToolDefinition> {
+		let config = self.mcp_workspace_config().await;
+		let servers = crate::mcp::enabled_servers(&config);
+		if servers.is_empty() {
+			return Vec::new();
+		}
+		let ids: Vec<&str> = servers.iter().map(|s| s.id.as_str()).collect();
+		let catalog = servers
+			.iter()
+			.map(|s| format!("- `{}` — {}", s.id, s.description))
+			.collect::<Vec<_>>()
+			.join("\n");
+		vec![
+			ToolDefinition::function(
+				"mcp_list_tools",
+				format!(
+					"List the tools an enabled MCP (Model Context Protocol) server exposes: name, description, and JSON-Schema input schema per tool. Call this once before the first `mcp_call` against a server in this session — don't guess tool names or argument shapes.\n\nEnabled servers:\n{catalog}"
+				),
+				json!({
+					"type": "object",
+					"properties": {
+						"server": {
+							"type": "string",
+							"enum": ids,
+							"description": "Id of the enabled MCP server to inspect."
+						}
+					},
+					"required": ["server"]
+				}),
+			),
+			ToolDefinition::function(
+				"mcp_call",
+				format!(
+					"Invoke one tool on an enabled MCP server. `args` must match the tool's input schema as reported by `mcp_list_tools`. The server process is spawned on first use and stays alive for the session, so state (e.g. an open browser page) persists across calls.\n\nEnabled servers:\n{catalog}"
+				),
+				json!({
+					"type": "object",
+					"properties": {
+						"server": {
+							"type": "string",
+							"enum": ids,
+							"description": "Id of the enabled MCP server."
+						},
+						"tool": {
+							"type": "string",
+							"description": "Tool name exactly as reported by `mcp_list_tools`."
+						},
+						"args": {
+							"type": "object",
+							"description": "Arguments matching the tool's input schema. Omit for tools that take none."
+						}
+					},
+					"required": ["server", "tool"]
+				}),
+			),
+		]
+	}
+
+	/// The workspace's persisted MCP config. Load failures degrade
+	/// to the empty default with a warn — same posture as every
+	/// other `session.json` consumer.
+	async fn mcp_workspace_config(&self) -> moon_protocol::coder_mcp::CoderMcpWorkspaceConfig {
+		let workspace_id = self.workspaces.workspace_id().await;
+		match moon_core::session::load(&self.workspaces_dir, &workspace_id).await {
+			Ok(session) => session.coder_mcp,
+			Err(err) => {
+				tracing::warn!(error = %err, "mcp: could not read session.json, treating as no servers");
+				Default::default()
+			}
+		}
+	}
+
+	/// Resolve where a server process should spawn. `runs:
+	/// container` follows the same probe as `bash` — container when
+	/// the workspace shell container is `Running`, host fallback
+	/// otherwise — so a container-flagged server still works (on
+	/// the host) when the container is down.
+	async fn mcp_spawn_target(
+		&self,
+		config: &moon_protocol::coder_mcp::McpServerConfig,
+		cx: &ToolContext,
+	) -> McpSpawnTarget {
+		let host_cwd = cx.folder.folder.path.clone();
+		if config.runs != moon_protocol::coder_mcp::McpRunTarget::Container {
+			return McpSpawnTarget::Host { cwd: host_cwd };
+		}
+		let target = resolve_bash_target(&self.workspaces, &self.workspaces_dir, cx.force_host_bash).await;
+		if target != BASH_TARGET_CONTAINER {
+			return McpSpawnTarget::Host { cwd: host_cwd };
+		}
+		let workspace_id = self.workspaces.workspace_id().await;
+		let container_cwd = TerminalTarget::container_cwd_for_folder(Utf8Path::new(&cx.folder.folder.path))
+			.unwrap_or_else(|| Utf8PathBuf::from("/workspace"));
+		McpSpawnTarget::Container {
+			name: container_name_for_workspace(&workspace_id),
+			cwd: container_cwd.to_string(),
+		}
+	}
+
+	/// Look up an enabled server by id, erroring with the enabled
+	/// list so the model can self-correct — same recovery shape as
+	/// the unbound-folder error in `resolve_target`.
+	async fn mcp_enabled_server(
+		&self,
+		tool: &'static str,
+		id: &str,
+	) -> Result<moon_protocol::coder_mcp::McpServerConfig, CoderError> {
+		let config = self.mcp_workspace_config().await;
+		let servers = crate::mcp::enabled_servers(&config);
+		servers.iter().find(|s| s.id == id).cloned().ok_or_else(|| {
+			let enabled: Vec<&str> = servers.iter().map(|s| s.id.as_str()).collect();
+			CoderError::invalid_args(
+				tool,
+				format!(
+					"no enabled MCP server `{id}`; enabled servers: [{}]",
+					enabled.join(", ")
+				),
+			)
+		})
+	}
+
+	async fn mcp_list_tools(
+		&self,
+		args: &Value,
+		cx: &ToolContext,
+		cancel: &CancellationToken,
+	) -> Result<Value, CoderError> {
+		#[derive(Deserialize)]
+		struct McpListToolsArgs {
+			server: String,
+		}
+		let parsed: McpListToolsArgs = serde_json::from_value(args.clone())
+			.map_err(|err| CoderError::invalid_args("mcp_list_tools", err.to_string()))?;
+		let server = self.mcp_enabled_server("mcp_list_tools", &parsed.server).await?;
+		let spawn = self.mcp_spawn_target(&server, cx).await;
+		let tools = self.mcp.list_tools(&server, &spawn, cancel).await?;
+		Ok(json!({
+			"server": parsed.server,
+			"count": tools.len(),
+			"tools": tools,
+		}))
+	}
+
+	async fn mcp_call(&self, args: &Value, cx: &ToolContext, cancel: &CancellationToken) -> Result<Value, CoderError> {
+		#[derive(Deserialize)]
+		struct McpCallArgs {
+			server: String,
+			tool: String,
+			#[serde(default)]
+			args: Value,
+		}
+		let parsed: McpCallArgs =
+			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("mcp_call", err.to_string()))?;
+		let server = self.mcp_enabled_server("mcp_call", &parsed.server).await?;
+		let spawn = self.mcp_spawn_target(&server, cx).await;
+		let call_args = if parsed.args.is_null() { json!({}) } else { parsed.args };
+		self
+			.mcp
+			.call_tool(&server, &spawn, &parsed.tool, call_args, cancel)
+			.await
+	}
+
 	pub async fn dispatch(
 		&self,
 		name: &str,
@@ -778,6 +962,13 @@ impl ToolRegistry {
 			// the kind of read-only inspection the mode exists for.
 			"web_search" => self.web_search(args, cancel).await,
 			"web_fetch" => self.web_fetch(args, cancel).await,
+			// MCP meta-tools are, like `bash`, not mode-gated: a
+			// Research sub-agent driving a read-heavy MCP server
+			// is legitimate, and "don't mutate" stays prompt-
+			// enforced. The definitions only exist when the
+			// workspace has enabled servers.
+			"mcp_list_tools" => self.mcp_list_tools(args, cx, cancel).await,
+			"mcp_call" => self.mcp_call(args, cx, cancel).await,
 			other => Err(CoderError::UnknownTool(other.to_string())),
 		}
 	}

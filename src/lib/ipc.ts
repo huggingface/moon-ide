@@ -10,6 +10,8 @@ import type {
 	CoderStatus,
 	HubNamespace,
 	HubUploadAllSummary,
+	McpRunTarget,
+	McpServerStatus,
 	ProviderKind,
 	ProviderModelSummary,
 	ProviderProbeResult,
@@ -434,6 +436,16 @@ export const ipc = {
 		hubUploadSession: (sessionId: string) => invoke<void>('coder_hub_upload_session', { sessionId }),
 		hubUploadAllSessions: () => invoke<HubUploadAllSummary>('coder_hub_upload_all_sessions'),
 		hubSessionUrl: (sessionId: string) => invoke<string>('coder_hub_session_url', { sessionId }),
+		mcpServers: () => invoke<McpServerStatus[]>('coder_mcp_servers'),
+		mcpSetEnabled: (id: string, enabled: boolean) => invoke<void>('coder_mcp_set_enabled', { id, enabled }),
+		mcpAddCustom: (server: {
+			label: string;
+			command: string;
+			args: string[];
+			runs: McpRunTarget;
+			description: string;
+		}) => invoke<McpServerStatus[]>('coder_mcp_add_custom', { server }),
+		mcpRemoveCustom: (id: string) => invoke<McpServerStatus[]>('coder_mcp_remove_custom', { id }),
 	},
 	ui: {
 		setRightPanel: (kind: RightPanelKind | null) => invoke<void>('ui_set_right_panel', { kind }),

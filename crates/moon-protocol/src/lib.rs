@@ -6,6 +6,7 @@
 pub mod app_info;
 pub mod app_state;
 pub mod coder_hub;
+pub mod coder_mcp;
 pub mod coder_models;
 pub mod container;
 pub mod editorconfig;

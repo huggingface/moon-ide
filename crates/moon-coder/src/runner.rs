@@ -736,6 +736,14 @@ impl CoderHandle {
 		self.state.tools.web().clear_tavily_key()
 	}
 
+	/// Kill a live MCP server connection, if any. Called by the
+	/// `coder_mcp_*` commands when the user disables or removes a
+	/// server so the child process doesn't linger; the next enable
+	/// + call respawns it fresh. Idempotent.
+	pub async fn mcp_drop_connection(&self, id: &str) {
+		self.state.tools.mcp().drop_connection(id).await;
+	}
+
 	/// Hot-swap the user-facing model picks for HF.
 	/// `standard` / `cheap` / `bill_to` apply only when the active
 	/// route is HF; user providers carry their own picks in
@@ -3703,6 +3711,10 @@ async fn run_turn(
 	// literally cannot describe a sub-sub-agent because the model
 	// never sees the tool.
 	let mut tool_defs = state.tools.definitions();
+	// MCP meta-tools (ADR 0033): only present when the workspace
+	// has enabled servers, so the model never sees a surface that
+	// is guaranteed to error.
+	tool_defs.extend(state.tools.mcp_definitions().await);
 	if mode.allows_task_tool() {
 		tool_defs.push(task_tool_definition());
 	}

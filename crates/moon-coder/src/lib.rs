@@ -25,6 +25,7 @@ pub mod event;
 pub mod folder_summary;
 pub mod hub_sync;
 pub mod inference;
+pub mod mcp;
 pub mod models;
 pub mod prompts;
 pub mod providers;

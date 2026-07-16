@@ -415,7 +415,11 @@ async fn run_subagent_inner(
 	// how the depth=1 cap is enforced: a sub-agent literally cannot
 	// describe a sub-sub-agent because the model never sees the
 	// tool.
-	let tool_defs = tools.definitions();
+	let mut tool_defs = tools.definitions();
+	// MCP meta-tools ride along when the workspace has enabled
+	// servers — a sub-agent driving playwright against its target
+	// folder's dev server is a natural delegation.
+	tool_defs.extend(tools.mcp_definitions().await);
 	let cx = ToolContext::with_format_queue(spec.folder.clone(), spec.mode, format_queue);
 
 	// Consecutive empty-shell responses — same retry-then-fail

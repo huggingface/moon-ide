@@ -1249,6 +1249,17 @@
 			case 'todo_write': {
 				return todoWriteHint(o);
 			}
+			case 'mcp_list_tools': {
+				return typeof o.server === 'string' ? o.server : null;
+			}
+			case 'mcp_call': {
+				const server = typeof o.server === 'string' ? o.server : null;
+				const tool = typeof o.tool === 'string' ? o.tool : null;
+				if (server !== null && tool !== null) {
+					return `${server}: ${tool}`;
+				}
+				return server ?? tool;
+			}
 			case 'task': {
 				const folder = typeof o.folder === 'string' && o.folder.length > 0 ? o.folder : null;
 				const mode = typeof o.mode === 'string' && o.mode.length > 0 ? o.mode : 'agent';

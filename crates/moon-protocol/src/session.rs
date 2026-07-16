@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 
 use crate::coder_hub::CoderHubBucket;
+use crate::coder_mcp::CoderMcpWorkspaceConfig;
 use crate::coder_models::CoderProviderLock;
 use crate::git::{CompareBaseline, PrListScope};
 use crate::ports::ForwardedPort;
@@ -168,6 +169,14 @@ pub struct WorkspaceSession {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	#[ts(optional, type = "CoderHubBucket | null")]
 	pub coder_hub_bucket: Option<CoderHubBucket>,
+	/// Per-workspace MCP server state: which servers (preset or
+	/// custom) are enabled here, plus any user-defined custom
+	/// servers. Backend-managed like the other coder fields —
+	/// `session_save`'s merge keeps the on-disk value through
+	/// frontend persist ticks; the `coder_mcp_*` commands are the
+	/// only writers. See [`crate::coder_mcp`].
+	#[serde(default, skip_serializing_if = "CoderMcpWorkspaceConfig::is_empty")]
+	pub coder_mcp: CoderMcpWorkspaceConfig,
 	/// Per-folder "this folder's `docker-compose.yml` project was
 	/// `Running` when the IDE quit last time" map, keyed by the
 	/// folder's absolute path. `shutdown::stop_all` populates

@@ -38,10 +38,12 @@
 
 	import { coder } from '../coder.svelte';
 	import { workspace } from '../state.svelte';
+	import { formatError } from '../protocol';
 	import type {
 		CoderModelSettings,
 		CoderProviderConfig,
 		CoderProviderLock,
+		McpRunTarget,
 		ProviderKind,
 		RouterModel,
 		RouterProvider,
@@ -164,6 +166,72 @@
 	// competing with the catalog-search input visually — users
 	// were clicking the wrong one when filtering models.
 	let webKeyEditing = $state(false);
+	// MCP servers section state. The rows themselves live on
+	// `coder.mcpServers` (loaded on mount); enable toggles write
+	// through immediately (per-workspace `session.json`, not part
+	// of the modal's save-once flow — same posture as the web key).
+	// The add-custom form parses one command line by whitespace:
+	// first token = executable, rest = args. Quoting is not
+	// supported; nobody's MCP launch command needs it yet.
+	type McpDraft = {
+		label: string;
+		commandLine: string;
+		runs: McpRunTarget;
+		description: string;
+	};
+	let mcpDraft = $state<McpDraft | null>(null);
+	let mcpBusy = $state(false);
+	let mcpError = $state<string | null>(null);
+
+	async function onToggleMcp(id: string, enabled: boolean): Promise<void> {
+		mcpError = null;
+		try {
+			await coder.setMcpEnabled(id, enabled);
+		} catch (err) {
+			mcpError = formatError(err);
+		}
+	}
+
+	async function onAddMcpServer(): Promise<void> {
+		if (mcpDraft === null) {
+			return;
+		}
+		const tokens = mcpDraft.commandLine.trim().split(/\s+/).filter(Boolean);
+		const command = tokens[0];
+		if (mcpDraft.label.trim().length === 0 || command === undefined) {
+			mcpError = 'Label and command are required.';
+			return;
+		}
+		mcpBusy = true;
+		mcpError = null;
+		try {
+			await coder.addMcpServer({
+				label: mcpDraft.label.trim(),
+				command,
+				args: tokens.slice(1),
+				runs: mcpDraft.runs,
+				description: mcpDraft.description.trim(),
+			});
+			mcpDraft = null;
+		} catch (err) {
+			mcpError = formatError(err);
+		} finally {
+			mcpBusy = false;
+		}
+	}
+
+	async function onRemoveMcpServer(id: string): Promise<void> {
+		mcpBusy = true;
+		mcpError = null;
+		try {
+			await coder.removeMcpServer(id);
+		} catch (err) {
+			mcpError = formatError(err);
+		} finally {
+			mcpBusy = false;
+		}
+	}
+
 	// Which model row is currently expanded — `null` for "all
 	// collapsed". Single-expansion is on purpose: showing two
 	// open provider tables at once is busy and the picker already
@@ -231,6 +299,7 @@
 			void coder.loadModels();
 		}
 		void coder.loadWebSearchConfigured();
+		void coder.loadMcpServers();
 	});
 
 	// Commit the textbox values back to whichever provider's slot
@@ -1411,6 +1480,97 @@
 					{/if}
 				{/if}
 			</section>
+
+			<!-- MCP servers. Per-workspace enable set — toggles write
+				 through immediately (session.json), independent of the
+				 modal's Save. The model sees enabled servers through
+				 the `mcp_list_tools` / `mcp_call` meta-tools from the
+				 next turn on. -->
+			<section class="mcp" aria-label="MCP servers">
+				<div class="label-row">
+					<span class="label-name">MCP servers</span>
+					{#if workspace.workspaceName !== null}
+						<span class="mcp-workspace">enabled for this workspace ({workspace.workspaceName})</span>
+					{/if}
+					<span class="flex-spacer"></span>
+					{#if mcpDraft === null}
+						<button
+							type="button"
+							class="secondary"
+							disabled={workspace.workspaceName === null || mcpBusy}
+							onclick={() => {
+								mcpDraft = { label: '', commandLine: '', runs: 'host', description: '' };
+								mcpError = null;
+							}}
+						>
+							+ Add server
+						</button>
+					{/if}
+				</div>
+				{#each coder.mcpServers ?? [] as row (row.id)}
+					<div class="mcp-row">
+						<label class="mcp-toggle">
+							<input
+								type="checkbox"
+								checked={row.enabled}
+								disabled={workspace.workspaceName === null || mcpBusy}
+								onchange={(e) => void onToggleMcp(row.id, e.currentTarget.checked)}
+							/>
+							<span class="mcp-label">{row.label}</span>
+						</label>
+						<code class="mcp-cmd" title={row.description}>{row.command} {row.args.join(' ')}</code>
+						<span class="mcp-runs">{row.runs}</span>
+						{#if !row.preset}
+							<button type="button" class="secondary" disabled={mcpBusy} onclick={() => void onRemoveMcpServer(row.id)}>
+								Remove
+							</button>
+						{/if}
+					</div>
+				{/each}
+				{#if mcpDraft !== null}
+					<div class="mcp-draft">
+						<input type="text" bind:value={mcpDraft.label} placeholder="Label" spellcheck="false" disabled={mcpBusy} />
+						<input
+							type="text"
+							bind:value={mcpDraft.commandLine}
+							placeholder="Command, e.g. npx -y @some/mcp-server"
+							spellcheck="false"
+							disabled={mcpBusy}
+						/>
+						<input
+							type="text"
+							bind:value={mcpDraft.description}
+							placeholder="One sentence for the model: what is this server good for?"
+							spellcheck="false"
+							disabled={mcpBusy}
+						/>
+						<div class="mcp-draft-actions">
+							<label class="mcp-runs-pick">
+								runs on
+								<select bind:value={mcpDraft.runs} disabled={mcpBusy}>
+									<option value="host">host</option>
+									<option value="container">container</option>
+								</select>
+							</label>
+							<span class="flex-spacer"></span>
+							<button type="button" class="secondary" disabled={mcpBusy} onclick={() => (mcpDraft = null)}>
+								Cancel
+							</button>
+							<button type="button" class="primary" disabled={mcpBusy} onclick={() => void onAddMcpServer()}>
+								Add
+							</button>
+						</div>
+					</div>
+				{/if}
+				<span class="hint">
+					Enabled servers surface to the agent as <code>mcp_list_tools</code> / <code>mcp_call</code> — it discovers a
+					server's tools on demand instead of carrying every schema every turn. Stdio transport only; servers marked
+					<code>container</code> run in the workspace shell container when it's up (host fallback).
+				</span>
+				{#if mcpError !== null}
+					<span class="error">{mcpError}</span>
+				{/if}
+			</section>
 		{/if}
 
 		<footer>
@@ -1845,6 +2005,90 @@
 	}
 	.flex-spacer {
 		flex: 1 1 auto;
+	}
+	.mcp {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		padding-top: 10px;
+		border-top: 1px solid var(--m-border);
+	}
+	.mcp .label-row .secondary {
+		flex: 0 0 auto;
+		padding: 2px 10px;
+		font-size: 11px;
+	}
+	.mcp-workspace {
+		font-size: 11px;
+		color: var(--m-fg-dim);
+	}
+	.mcp-row {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+	.mcp-toggle {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		flex: 0 0 auto;
+		cursor: pointer;
+	}
+	.mcp-label {
+		font-size: 12px;
+		font-weight: 600;
+	}
+	.mcp-cmd {
+		flex: 1 1 auto;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-size: 11px;
+		color: var(--m-fg-dim);
+	}
+	.mcp-runs {
+		flex: 0 0 auto;
+		font-size: 10px;
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+		color: var(--m-fg-dim);
+		border: 1px solid var(--m-border);
+		border-radius: 3px;
+		padding: 1px 5px;
+	}
+	.mcp-row .secondary {
+		flex: 0 0 auto;
+		padding: 2px 10px;
+		font-size: 11px;
+	}
+	.mcp-draft {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		padding: 8px;
+		border: 1px solid var(--m-border);
+		border-radius: 6px;
+	}
+	.mcp-draft input {
+		min-width: 0;
+	}
+	.mcp-draft-actions {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+	}
+	.mcp-draft-actions button {
+		flex: 0 0 auto;
+		padding: 2px 12px;
+		font-size: 11px;
+	}
+	.mcp-runs-pick {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		font-size: 11px;
+		color: var(--m-fg-dim);
 	}
 	.web-key-row {
 		display: flex;
