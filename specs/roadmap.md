@@ -96,7 +96,7 @@ Architectural spec: [lsp.md](lsp.md). The [`tower-lsp` vs thin-client open quest
 - Per-language availability pill in the status bar (`starting…`, `not available`, `crashed`, `stopped`) — `running` stays invisible. Tooltip reveals the resolved binary path (project-local vs global) on hover.
 - Stage 2 slice: **goto-definition** via Ctrl/Cmd-hover link preview + Ctrl/Cmd-click jump, routed through a **position-aware, cross-folder** navigation history (`Alt+Left` / `Alt+Right`). Nav entries carry `{ folder, path, line, character }`; clicks push, keyboard motion updates the tip, and folder swaps happen transparently on back/forward. Goto-definition into a sibling bound folder opens in that folder; only targets outside every bound folder still surface a toast.
 
-**Still outstanding for this phase**: Rust (rust-analyzer), Svelte (svelte-language-server), CSS / HTML / JSON / MD servers; go-to-definition with Ctrl-click underline; find-references panel; rename; code actions; navigation history (Alt-Left / Alt-Right); incremental document sync; signature help.
+**Still outstanding for this phase**: CSS / HTML / JSON / MD servers; find-references panel; code actions beyond quick-fixes; incremental document sync; signature help. (Rust, Svelte, go-to-definition, rename, and navigation history have since landed — see `specs/lsp.md`. Svelte rides `svelteserver` with the `@replit/codemirror-lang-svelte` grammar; TypeScript discovery additionally accepts a project-local `typescript@7` native `tsc`.)
 
 ## Phase 5 — Git
 

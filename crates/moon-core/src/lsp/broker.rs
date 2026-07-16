@@ -29,9 +29,9 @@ use tokio::sync::{broadcast, Mutex};
 
 use super::client::LspClientError;
 use super::server::{
-	container_binary_path, discover_binary, discover_oxlint_workspace_folders, resolve_install_hint, LspBinarySpec,
-	LspServer, LspServerEvent, PathTranslator, GO_SERVER, OXLINT_LANGUAGES, OXLINT_LINTER, PYTHON_SERVER, RUST_SERVER,
-	TS_SERVER,
+	container_binary_path, discover_oxlint_workspace_folders, discover_server_binary, resolve_install_hint,
+	LspBinarySpec, LspServer, LspServerEvent, PathTranslator, GO_SERVER, OXLINT_LANGUAGES, OXLINT_LINTER, PYTHON_SERVER,
+	RUST_SERVER, SVELTE_SERVER, TS_SERVER,
 };
 use super::spawn::LspSpawner;
 use crate::logs::LogSink;
@@ -233,6 +233,7 @@ impl LspBroker {
 			"rust" => Some(&RUST_SERVER),
 			"python" => Some(&PYTHON_SERVER),
 			"go" => Some(&GO_SERVER),
+			"svelte" => Some(&SVELTE_SERVER),
 			_ => None,
 		}
 	}
@@ -452,7 +453,7 @@ impl LspBroker {
 	async fn try_spawn_on(&self, spec: &LspBinarySpec, route: &SpawnerPair) -> SpawnOutcome {
 		let log_source = Self::log_source_for(spec.language_id);
 		let bin_path: PathBuf = match &route.spawner {
-			LspSpawner::Local => match discover_binary(spec.bin_name, spec.discovery, self.root.as_std_path()) {
+			LspSpawner::Local => match discover_server_binary(spec, self.root.as_std_path()) {
 				Some(p) => {
 					self
 						.log_sink

@@ -351,12 +351,18 @@ export async function languageFor(filename: string, firstLine?: string): Promise
 			return [css()];
 		}
 		case 'html':
-		case 'htm':
-		case 'svelte': {
-			// Svelte is rendered with the HTML grammar for now; a real Svelte
-			// grammar lands when we wire svelte-language-server in Phase 4.
+		case 'htm': {
 			const { html } = await import('@codemirror/lang-html');
 			return [html()];
+		}
+		case 'svelte': {
+			// Replit's Svelte SFC grammar — composes `lang-html` for
+			// the template with `lang-javascript` / `lang-css` for
+			// `<script>` / `<style>` blocks, mirroring what
+			// `@codemirror/lang-vue` does for Vue. Landed together
+			// with the svelte-language-server LSP wiring.
+			const { svelte } = await import('@replit/codemirror-lang-svelte');
+			return [svelte()];
 		}
 		case 'vue': {
 			// `@codemirror/lang-vue` is the official upstream Vue SFC

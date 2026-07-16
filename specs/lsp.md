@@ -1,10 +1,10 @@
 # LSP
 
-Status: partial — TypeScript, Rust, Python, and Go have diagnostics +
-hover + completion + goto-definition + F2 rename + nav history wired.
-All four route inside the workspace container when one is up (see
-[Container-backed LSP](#container-backed-lsp)), falling back to host
-LSP per-language. Other languages (Svelte, CSS, HTML, JSON) are
+Status: partial — TypeScript, Rust, Python, Go, and Svelte have
+diagnostics + hover + completion + goto-definition + F2 rename + nav
+history wired. All five route inside the workspace container when one
+is up (see [Container-backed LSP](#container-backed-lsp)), falling
+back to host LSP per-language. Other languages (CSS, HTML, JSON) are
 architecturally in scope, not yet wired.
 
 ## The non-negotiable invariant
@@ -28,7 +28,7 @@ moon-core::lsp::LspBroker — per-workspace, keyed on root path
      ├ LspClient           — JSON-RPC over framed stdio (reader/writer actors)
      └ translate::*        — lsp_types ↔ moon_protocol::lsp
   │  LSP JSON-RPC over stdin/stdout
-child process (tsgo --lsp --stdio, rust-analyzer, ty server, gopls)
+child process (tsgo --lsp --stdio, rust-analyzer, ty server, gopls, svelteserver --stdio)
 ```
 
 ## Decisions
@@ -71,22 +71,29 @@ tabs re-issue `didOpen` naturally on re-render. The user sees a short
 
 ### Per-language servers
 
-| Language   | Server          | Install                                      | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| ---------- | --------------- | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| TypeScript | `tsgo`          | `bun add -D @typescript/native-preview`      | Microsoft's native TS 7 port, not `typescript-language-server`: already in our devDependencies, upstream-aligned, no Node runtime, ~10× faster. TS 7 is GA; the `tsgo` preview channel is still the right LSP binary because TS 7's stable `typescript` package drops the programmatic JS API that `svelte2tsx` (used by `svelte-fast-check`) needs — so we keep `typescript@6` for that API and `tsgo` for the LSP. Switching the LSP to `typescript-language-server` is a one-string edit on the spec. |
-| Rust       | `rust-analyzer` | `rustup component add rust-analyzer`         | Ecosystem standard; no per-project install convention exists. No startup args; defaults suffice.                                                                                                                                                                                                                                                                                                                                                                                                         |
-| Python     | `ty`            | `uv add --dev ty` (or `uv tool install ty`)  | Astral's Rust-native checker. Beta — if a gap blocks us, `pyright-langserver` is a one-string edit.                                                                                                                                                                                                                                                                                                                                                                                                      |
-| Go         | `gopls`         | `go install golang.org/x/tools/gopls@latest` | The official Go LSP. No startup args; reads `go.mod` / `go.work` itself.                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Language   | Server          | Install                                      | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| ---------- | --------------- | -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| TypeScript | `tsgo`          | `bun add -D @typescript/native-preview`      | Microsoft's native TS 7 port, not `typescript-language-server`: already in our devDependencies, upstream-aligned, no Node runtime, ~10× faster. TS 7 is GA; the `tsgo` preview channel is still the _preferred_ LSP binary because TS 7's stable `typescript` package drops the programmatic JS API that `svelte2tsx` (used by `svelte-fast-check`) needs — so we keep `typescript@6` for that API and `tsgo` for the LSP. Projects that ship only `typescript@7` still get LSP: discovery falls back to the project-local native `tsc` (same binary, renamed upstream), version-gated on `node_modules/typescript/package.json` major ≥ 7 because typescript@6's `tsc` is the JS compiler with no `--lsp` mode. Switching the LSP to `typescript-language-server` is a one-string edit on the spec. |
+| Rust       | `rust-analyzer` | `rustup component add rust-analyzer`         | Ecosystem standard; no per-project install convention exists. No startup args; defaults suffice.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Python     | `ty`            | `uv add --dev ty` (or `uv tool install ty`)  | Astral's Rust-native checker. Beta — if a gap blocks us, `pyright-langserver` is a one-string edit.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| Go         | `gopls`         | `go install golang.org/x/tools/gopls@latest` | The official Go LSP. No startup args; reads `go.mod` / `go.work` itself.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Svelte     | `svelteserver`  | `bun add -D svelte-language-server`          | The server the official VS Code extension embeds; covers `<script>` TS/JS (own `svelte2tsx` projection), `<style>` CSS, and the template in one process. `.svelte` files only — `*.svelte.ts` modules are plain TS and go to `tsgo`. Declares a `typescript` peer (^5.9 \|\| ^6) the project supplies. No `--version` flag; the availability probe passes because the process exits 0 on stdin EOF (the probe nulls stdin).                                                                                                                                                                                                                                                                                                                                                                          |
 
 ### Binary discovery: ecosystem-idiomatic first, then PATH
 
 Per-language `DiscoveryStrategy`:
 
-- **`NodeModules`** (TS/JS): ancestor walk for
+- **`NodeModules`** (TS/JS, Svelte): ancestor walk for
   `node_modules/.bin/<bin>` (Node's own resolution), then a bounded
   downward scan (depth 4, skipping `node_modules` / `.git` /
   dot-dirs) for per-package install layouts, then `$PATH`. First
   match wins — a project-pinned copy always beats a global install.
+  TypeScript inserts one extra tier between the project-local and
+  `$PATH` lookups: a project-local `tsc` from `typescript@7+` (see
+  the table above). Ranking it above a global `tsgo` keeps
+  "project toolchain wins"; there is no `$PATH` tier for `tsc`
+  because a global copy's major version can't be checked with a
+  cheap manifest read.
 - **`CargoHome`** (Rust): `$CARGO_HOME/bin` (GUI-launched processes
   often don't have it on `PATH`), then `$PATH`.
 - **`PythonVenv`** (Python): ancestor walk for `.venv/bin/<bin>`,
@@ -154,9 +161,9 @@ fresh server doesn't start with an empty docs map (otherwise
 never flow).
 
 Image responsibility: `moon-base` pre-installs only servers with no
-per-project install convention (`rust-analyzer`, `gopls`). `tsgo`
-and `ty` are deliberately not baked in — their per-project installs
-are first-class and should win.
+per-project install convention (`rust-analyzer`, `gopls`). `tsgo`,
+`ty`, and `svelteserver` are deliberately not baked in — their
+per-project installs are first-class and should win.
 
 Non-goals for this slice: remote (SSH) LSP — `DockerExec` doesn't
 generalise; containers the user starts outside moon-ide.

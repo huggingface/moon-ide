@@ -114,15 +114,19 @@ pub enum DiscoveryStrategy {
 /// We target `tsgo` (Microsoft's native Go port of TypeScript, shipped
 /// as `@typescript/native-preview`) rather than the community
 /// `typescript-language-server` wrapper. TS 7's `typescript` package
-/// also ships a native `tsc` that speaks `--lsp --stdio`, but that
-/// package drops the programmatic JS API — so tooling that embeds the
-/// compiler (`svelte2tsx`, used by `svelte-fast-check`) still needs
-/// the classic `typescript@6` for its API. Keeping `tsgo` as the LSP
-/// sidesteps that split: version-independent, no Node runtime, ~10×
-/// faster than TS 6, and a fresh `bun install` is all a contributor
-/// needs. If a project ships `typescript-language-server` instead,
-/// flip this spec — the LSP wire format is identical and nothing else
-/// has to change. See [`specs/lsp.md`].
+/// also ships the same native binary renamed to `tsc` (speaking the
+/// same `--lsp --stdio`), but that package drops the programmatic JS
+/// API — so tooling that embeds the compiler (`svelte2tsx`, used by
+/// `svelte-fast-check`) still needs the classic `typescript@6` for
+/// its API, which is why `tsgo` stays the *preferred* binary. A
+/// project that ships only `typescript@7` still gets LSP: discovery
+/// falls back to the project's `.bin/tsc` when the resolved
+/// `typescript` package is major ≥ 7 (see [`discover_server_binary`]
+/// — the version gate matters because typescript@6's `tsc` is the JS
+/// compiler with no `--lsp` mode). If a project ships
+/// `typescript-language-server` instead, flip this spec — the LSP
+/// wire format is identical and nothing else has to change. See
+/// [`specs/lsp.md`].
 pub const TS_SERVER: LspBinarySpec = LspBinarySpec {
 	language_id: "typescript",
 	bin_name: "tsgo",
@@ -151,21 +155,23 @@ pub const TS_SERVER: LspBinarySpec = LspBinarySpec {
 /// matches moon-ide itself and is a reasonable default for a fresh
 /// repo.
 pub fn resolve_install_hint(spec: &LspBinarySpec, root: &Utf8Path) -> String {
-	if spec.language_id == "typescript" {
-		if root.join("pnpm-lock.yaml").exists() {
-			return "pnpm -wD add @typescript/native-preview".to_string();
-		}
-		if root.join("package-lock.json").exists() {
-			return "npm i -D @typescript/native-preview".to_string();
-		}
+	// npm-distributed servers get the lockfile-aware treatment; the
+	// static hint (a `bun add`) is the fallback for `bun.lock` or no
+	// recognised lockfile.
+	let npm_package = match spec.language_id {
+		"typescript" => Some("@typescript/native-preview"),
+		"oxlint" => Some("oxlint"),
+		"svelte" => Some("svelte-language-server"),
+		_ => None,
+	};
+	let Some(pkg) = npm_package else {
+		return spec.install_hint.to_string();
+	};
+	if root.join("pnpm-lock.yaml").exists() {
+		return format!("pnpm -wD add {pkg}");
 	}
-	if spec.language_id == "oxlint" {
-		if root.join("pnpm-lock.yaml").exists() {
-			return "pnpm -wD add oxlint".to_string();
-		}
-		if root.join("package-lock.json").exists() {
-			return "npm i -D oxlint".to_string();
-		}
+	if root.join("package-lock.json").exists() {
+		return format!("npm i -D {pkg}");
 	}
 	spec.install_hint.to_string()
 }
@@ -242,6 +248,33 @@ pub const GO_SERVER: LspBinarySpec = LspBinarySpec {
 	probe_args: &["version"],
 	install_hint: "go install golang.org/x/tools/gopls@latest",
 	discovery: DiscoveryStrategy::GoBin,
+};
+
+/// Svelte server — `svelteserver` from the `svelte-language-server`
+/// package, the same server the official VS Code extension embeds.
+/// Covers the whole component surface: TS/JS in `<script>` (via its
+/// own `svelte2tsx` projection), CSS in `<style>`, and the template.
+///
+/// Discovery is `NodeModules`, same as `tsgo` / `oxlint`: the
+/// per-project install is first-class (`bun add -D
+/// svelte-language-server`) and the package declares a `typescript`
+/// peer (^5.9 || ^6) the project supplies — two reasons it is *not*
+/// baked into `moon-base`. The `.bin` shim is a Node script
+/// (shebang-resolved), which is a given for any project that has
+/// `.svelte` files and a `node_modules/` in the first place.
+///
+/// `probe_args` is empty: the bin script has no `--version` flag —
+/// it unconditionally starts the LSP loop. The probe still
+/// terminates deterministically because [`LspSpawner::probe`] nulls
+/// stdin: the connection sees EOF immediately and the process exits
+/// zero. Costs one Node startup, paid once per routing decision.
+pub const SVELTE_SERVER: LspBinarySpec = LspBinarySpec {
+	language_id: "svelte",
+	bin_name: "svelteserver",
+	args: &["--stdio"],
+	probe_args: &[],
+	install_hint: "bun add -D svelte-language-server",
+	discovery: DiscoveryStrategy::NodeModules,
 };
 
 /// JS/TS linter — `oxlint`, run as a language server via its
@@ -1556,52 +1589,13 @@ impl LspServer {
 pub fn discover_binary(bin_name: &str, strategy: DiscoveryStrategy, start: &Path) -> Option<PathBuf> {
 	match strategy {
 		DiscoveryStrategy::NodeModules => {
-			let filename = if cfg!(windows) {
-				format!("{bin_name}.cmd")
-			} else {
-				bin_name.to_owned()
-			};
-			// Tier 1: hoisted layout — walk ancestors of `start`
-			// looking for `node_modules/.bin/<bin>`. Hits the
-			// common case (single-package projects, npm / pnpm /
-			// bun monorepos with a hoisted root `node_modules`).
-			for ancestor in start.ancestors() {
-				let candidate = ancestor.join("node_modules").join(".bin").join(&filename);
-				if candidate.exists() {
-					tracing::debug!(
-						bin = bin_name,
-						path = %candidate.display(),
-						"lsp: resolved via project-local node_modules"
-					);
-					return Some(candidate);
-				}
-			}
-			// Tier 2: per-workspace layout — pnpm / yarn workspaces
-			// with `nodeLinker: node-modules` install each
-			// package's deps into its own `node_modules/.bin/`.
-			// `start` is the IDE workspace root (e.g.
-			// `~/repo/`), but the closest `node_modules/.bin/`
-			// might live at `apps/api/node_modules/.bin/`. Walk a
-			// bounded subtree of `start` looking for those nested
-			// locations. Capped depth keeps a `node_modules`-free
-			// monorepo from costing a full filesystem walk on
-			// every spawn — typical hits are 2-3 levels deep
-			// (`apps/<pkg>/`, `packages/<pkg>/`).
-			if let Some(found) = scan_for_node_modules_bin(start, &filename, NODE_MODULES_SCAN_DEPTH) {
-				tracing::debug!(
-					bin = bin_name,
-					path = %found.display(),
-					"lsp: resolved via nested workspace node_modules"
-				);
-				return Some(found);
-			}
-			match which::which(bin_name) {
+			discover_node_modules_local(bin_name, start).or_else(|| match which::which(bin_name) {
 				Ok(path) => {
 					tracing::debug!(bin = bin_name, path = %path.display(), "lsp: resolved via PATH");
 					Some(path)
 				}
 				Err(_) => None,
-			}
+			})
 		}
 		DiscoveryStrategy::CargoHome => {
 			// 1. Ask rustup directly. When the tool is a rustup
@@ -1694,6 +1688,137 @@ pub fn discover_binary(bin_name: &str, strategy: DiscoveryStrategy, start: &Path
 			}
 		}
 	}
+}
+
+/// Project-local half of the `NodeModules` strategy — the two
+/// filesystem tiers without the trailing `$PATH` lookup. Split out
+/// so [`discover_server_binary`] can rank "project-local other
+/// binary" (TS 7's `tsc`) above "global copy of the preferred one".
+fn discover_node_modules_local(bin_name: &str, start: &Path) -> Option<PathBuf> {
+	let filename = if cfg!(windows) {
+		format!("{bin_name}.cmd")
+	} else {
+		bin_name.to_owned()
+	};
+	// Tier 1: hoisted layout — walk ancestors of `start`
+	// looking for `node_modules/.bin/<bin>`. Hits the
+	// common case (single-package projects, npm / pnpm /
+	// bun monorepos with a hoisted root `node_modules`).
+	for ancestor in start.ancestors() {
+		let candidate = ancestor.join("node_modules").join(".bin").join(&filename);
+		if candidate.exists() {
+			tracing::debug!(
+				bin = bin_name,
+				path = %candidate.display(),
+				"lsp: resolved via project-local node_modules"
+			);
+			return Some(candidate);
+		}
+	}
+	// Tier 2: per-workspace layout — pnpm / yarn workspaces
+	// with `nodeLinker: node-modules` install each
+	// package's deps into its own `node_modules/.bin/`.
+	// `start` is the IDE workspace root (e.g.
+	// `~/repo/`), but the closest `node_modules/.bin/`
+	// might live at `apps/api/node_modules/.bin/`. Walk a
+	// bounded subtree of `start` looking for those nested
+	// locations. Capped depth keeps a `node_modules`-free
+	// monorepo from costing a full filesystem walk on
+	// every spawn — typical hits are 2-3 levels deep
+	// (`apps/<pkg>/`, `packages/<pkg>/`).
+	if let Some(found) = scan_for_node_modules_bin(start, &filename, NODE_MODULES_SCAN_DEPTH) {
+		tracing::debug!(
+			bin = bin_name,
+			path = %found.display(),
+			"lsp: resolved via nested workspace node_modules"
+		);
+		return Some(found);
+	}
+	None
+}
+
+/// Spec-aware entry point for host binary discovery. Every server
+/// but TypeScript resolves purely by `bin_name` + strategy
+/// ([`discover_binary`]); TypeScript inserts one extra tier between
+/// "project-local `tsgo`" and "`tsgo` on `$PATH`": a project-local
+/// native `tsc` from `typescript@7+`. Ranking a project-pinned TS 7
+/// above a global `tsgo` keeps the invariant that the project's own
+/// toolchain always wins.
+pub fn discover_server_binary(spec: &LspBinarySpec, start: &Path) -> Option<PathBuf> {
+	if spec.language_id != TS_SERVER.language_id {
+		return discover_binary(spec.bin_name, spec.discovery, start);
+	}
+	if let Some(path) = discover_node_modules_local(spec.bin_name, start) {
+		return Some(path);
+	}
+	if let Some(path) = discover_ts7_tsc(start) {
+		tracing::debug!(
+			path = %path.display(),
+			"lsp: resolved via project-local typescript@7 tsc"
+		);
+		return Some(path);
+	}
+	match which::which(spec.bin_name) {
+		Ok(path) => {
+			tracing::debug!(bin = spec.bin_name, path = %path.display(), "lsp: resolved via PATH");
+			Some(path)
+		}
+		Err(_) => None,
+	}
+}
+
+/// TS 7 moved the native compiler into the mainline `typescript`
+/// package and renamed the binary `tsgo` → `tsc`; the same binary
+/// speaks `--lsp --stdio`. A project on `typescript@7` therefore
+/// gets LSP without installing `@typescript/native-preview` — but
+/// the version gate is load-bearing: `typescript@6`'s `tsc` is the
+/// JS compiler with no `--lsp` mode, so a bare `.bin/tsc` hit is
+/// not enough. We read the resolved
+/// `node_modules/typescript/package.json` sitting next to the
+/// `.bin` entry and require major ≥ 7.
+///
+/// No `$PATH` tier here: a global `tsc`'s version can't be checked
+/// with a cheap manifest read, and a global TS 7 install is not a
+/// shape the team uses.
+fn discover_ts7_tsc(start: &Path) -> Option<PathBuf> {
+	let filename = if cfg!(windows) { "tsc.cmd" } else { "tsc" };
+	for ancestor in start.ancestors() {
+		if let Some(found) = ts7_tsc_in(&ancestor.join("node_modules"), filename) {
+			return Some(found);
+		}
+	}
+	nested_ts7_tsc(start, filename)
+}
+
+/// Nested-workspace tier of [`discover_ts7_tsc`]: the first
+/// `*/node_modules/.bin/tsc` the bounded scan finds, version-gated.
+/// First-match semantics — a monorepo mixing `typescript@6` and
+/// `typescript@7` across packages resolves whichever the scan hits
+/// first, same posture as [`scan_for_node_modules_bin`] itself.
+fn nested_ts7_tsc(root: &Path, filename: &str) -> Option<PathBuf> {
+	let nested = scan_for_node_modules_bin(root, filename, NODE_MODULES_SCAN_DEPTH)?;
+	let node_modules = nested.parent()?.parent()?;
+	(typescript_major_version(node_modules)? >= 7).then_some(nested)
+}
+
+/// `node_modules/.bin/<filename>` inside `node_modules`, accepted
+/// only when the sibling `typescript` package is major ≥ 7.
+fn ts7_tsc_in(node_modules: &Path, filename: &str) -> Option<PathBuf> {
+	let candidate = node_modules.join(".bin").join(filename);
+	if !candidate.exists() {
+		return None;
+	}
+	(typescript_major_version(node_modules)? >= 7).then_some(candidate)
+}
+
+/// Major version of the `typescript` package resolved at
+/// `node_modules/typescript/package.json`, or `None` when the
+/// package (or a parseable version) isn't there. Follows symlinks,
+/// so pnpm's `.pnpm/`-backed layout reads the real manifest.
+fn typescript_major_version(node_modules: &Path) -> Option<u64> {
+	let manifest = std::fs::read_to_string(node_modules.join("typescript").join("package.json")).ok()?;
+	let json: serde_json::Value = serde_json::from_str(&manifest).ok()?;
+	json.get("version")?.as_str()?.split('.').next()?.parse().ok()
 }
 
 /// How deep we'll scan a workspace root for nested
@@ -1870,6 +1995,27 @@ pub fn container_binary_path(spec: &LspBinarySpec, translator: &PathTranslator) 
 						"lsp: resolved via container-side nested workspace node_modules"
 					);
 					return Some(path);
+				}
+			}
+			// Tier 3 (TypeScript only): a project-local native
+			// `tsc` from typescript@7+ — same version-gated
+			// fallback the host path takes in
+			// [`discover_server_binary`]. Only the mount root's
+			// own `node_modules` and descendants are reachable
+			// from the container, so no ancestor walk here (the
+			// container is Linux — plain filename, no `.cmd`).
+			if spec.language_id == TS_SERVER.language_id {
+				let host_match =
+					ts7_tsc_in(&host_root.join("node_modules"), "tsc").or_else(|| nested_ts7_tsc(host_root, "tsc"));
+				if let Some(host_match) = host_match {
+					if let Ok(rel) = host_match.strip_prefix(host_root) {
+						let path = server_root.join(rel);
+						tracing::debug!(
+							path = %path.display(),
+							"lsp: resolved via container-side typescript@7 tsc"
+						);
+						return Some(path);
+					}
 				}
 			}
 			tracing::debug!(
@@ -2102,6 +2248,88 @@ mod tests {
 			found.as_deref(),
 			Some(bin_path.as_path()),
 			"per-workspace node_modules under the workspace root must be discoverable"
+		);
+	}
+
+	/// Drop a fake `.bin/tsc` plus a `typescript/package.json` at
+	/// `version` into `root/node_modules/`. Returns the tsc path.
+	fn plant_tsc(root: &Path, version: &str) -> PathBuf {
+		let node_modules = root.join("node_modules");
+		let bin_dir = node_modules.join(".bin");
+		fs::create_dir_all(&bin_dir).unwrap();
+		let bin_name = if cfg!(windows) { "tsc.cmd" } else { "tsc" };
+		let bin_path = bin_dir.join(bin_name);
+		fs::write(&bin_path, b"#!/bin/sh\n").unwrap();
+		make_executable(&bin_path);
+		let pkg_dir = node_modules.join("typescript");
+		fs::create_dir_all(&pkg_dir).unwrap();
+		fs::write(
+			pkg_dir.join("package.json"),
+			format!("{{\"name\":\"typescript\",\"version\":\"{version}\"}}"),
+		)
+		.unwrap();
+		bin_path
+	}
+
+	/// A project shipping `typescript@7` (native `tsc` with `--lsp`)
+	/// and no `@typescript/native-preview` still resolves a TS LSP
+	/// binary: the version-gated `tsc` tier.
+	#[test]
+	fn discover_ts7_tsc_accepts_typescript_7() {
+		let tmp = tempfile::tempdir().unwrap();
+		let tsc = plant_tsc(tmp.path(), "7.0.1");
+		assert_eq!(discover_ts7_tsc(tmp.path()).as_deref(), Some(tsc.as_path()));
+	}
+
+	/// `typescript@6`'s `tsc` is the JS compiler with no `--lsp`
+	/// mode — the version gate must reject it, otherwise the broker
+	/// would spawn a child that never speaks LSP.
+	#[test]
+	fn discover_ts7_tsc_rejects_typescript_6() {
+		let tmp = tempfile::tempdir().unwrap();
+		plant_tsc(tmp.path(), "6.0.3");
+		assert_eq!(discover_ts7_tsc(tmp.path()), None);
+	}
+
+	/// A `.bin/tsc` without a resolvable `typescript` package
+	/// manifest (broken install, exotic layout) is rejected — no
+	/// version proof, no spawn.
+	#[test]
+	fn discover_ts7_tsc_rejects_tsc_without_manifest() {
+		let tmp = tempfile::tempdir().unwrap();
+		let bin_dir = tmp.path().join("node_modules").join(".bin");
+		fs::create_dir_all(&bin_dir).unwrap();
+		let bin_name = if cfg!(windows) { "tsc.cmd" } else { "tsc" };
+		fs::write(bin_dir.join(bin_name), b"#!/bin/sh\n").unwrap();
+		assert_eq!(discover_ts7_tsc(tmp.path()), None);
+	}
+
+	/// Nested-workspace layout: `apps/api/node_modules/.bin/tsc`
+	/// with typescript@7 resolves through the bounded scan tier.
+	#[test]
+	fn discover_ts7_tsc_finds_nested_workspace_install() {
+		let tmp = tempfile::tempdir().unwrap();
+		let pkg_root = tmp.path().join("apps").join("api");
+		fs::create_dir_all(&pkg_root).unwrap();
+		let tsc = plant_tsc(&pkg_root, "7.1.0");
+		assert_eq!(discover_ts7_tsc(tmp.path()).as_deref(), Some(tsc.as_path()));
+	}
+
+	/// When both a project-local `tsgo` and a `typescript@7` `tsc`
+	/// are installed, `tsgo` wins — it's the explicitly-installed
+	/// preview channel and today's default.
+	#[test]
+	fn discover_server_binary_prefers_tsgo_over_ts7_tsc() {
+		let tmp = tempfile::tempdir().unwrap();
+		plant_tsc(tmp.path(), "7.0.1");
+		let bin_dir = tmp.path().join("node_modules").join(".bin");
+		let tsgo_name = if cfg!(windows) { "tsgo.cmd" } else { "tsgo" };
+		let tsgo = bin_dir.join(tsgo_name);
+		fs::write(&tsgo, b"#!/bin/sh\n").unwrap();
+		make_executable(&tsgo);
+		assert_eq!(
+			discover_server_binary(&TS_SERVER, tmp.path()).as_deref(),
+			Some(tsgo.as_path())
 		);
 	}
 
@@ -2677,6 +2905,23 @@ mod tests {
 		let (_, patterns) = parse_watched_files_registration(reg).expect("relative pattern parses");
 		assert!(patterns[0].matcher.is_match("cmd/main.go"));
 		assert!(!patterns[0].matcher.is_match("README.md"));
+	}
+
+	/// The svelte server follows the same lockfile-aware hint shape
+	/// as the other npm-distributed servers.
+	#[test]
+	fn install_hint_for_svelte_follows_lockfile() {
+		let tmp = tempfile::tempdir().unwrap();
+		let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		assert_eq!(
+			resolve_install_hint(&SVELTE_SERVER, &root),
+			"bun add -D svelte-language-server"
+		);
+		fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: 6\n").unwrap();
+		assert_eq!(
+			resolve_install_hint(&SVELTE_SERVER, &root),
+			"pnpm -wD add svelte-language-server"
+		);
 	}
 
 	/// `pnpm-lock.yaml` at the workspace root flips the TS install

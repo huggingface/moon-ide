@@ -8,7 +8,7 @@
 //
 // Return `null` for file types that have no wired-up LSP server —
 // callers skip LSP calls entirely rather than surface "no server"
-// errors. Markdown, Svelte, etc. get `null` until their servers
+// errors. Markdown, CSS, etc. get `null` until their servers
 // land in a later stage.
 
 const BY_EXTENSION: Record<string, string> = {
@@ -27,14 +27,15 @@ const BY_EXTENSION: Record<string, string> = {
 	// `.py`, ty consumes both. (We don't surface a separate
 	// "python-stub" id; servers don't model that distinction.)
 	pyi: 'python',
+	svelte: 'svelte',
 };
 
 export function lspLanguageFor(path: string): string | null {
 	// Strip anything past the last `.`; then match the known table.
 	// Dotless files (`Dockerfile`, `.editorconfig`) never map to an
-	// LSP here — the shipped language servers only care about
-	// JS/TS, Rust, and Python, and the bootstrap files moon-ide
-	// handles specially are not language-server-backed.
+	// LSP here — every wired server keys off an extension, and the
+	// bootstrap files moon-ide handles specially are not
+	// language-server-backed.
 	const base = path.split('/').pop() ?? path;
 	const dot = base.lastIndexOf('.');
 	if (dot < 0) {
