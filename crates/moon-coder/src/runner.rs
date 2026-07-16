@@ -1974,14 +1974,16 @@ impl CoderHandle {
 					ref target_folder,
 					ref mode,
 				} => {
+					// The resume path refuses mid-turn (guard above), so
+					// no sub-agent can still be running here.
 					replay_subagent_spawned(
 						&mut replay_events,
-						&dir,
-						&header.id,
+						&subagent_session_dir(&dir, &header.id),
 						tool_call_id.clone(),
 						subagent_id.clone(),
 						target_folder.clone(),
 						mode.clone(),
+						false,
 					)
 					.await;
 				}
@@ -2285,16 +2287,6 @@ impl CoderHandle {
 				content: sessions::INTERRUPTED_TOOL_RESULT_JSON.to_string(),
 			});
 		}
-		// When this session has a **live turn** still parked on an
-		// `ask_user` prompt (the user switched away and came back),
-		// the parked tool call looks like an orphan on disk — its
-		// matching `Tool` record isn't written until the prompt
-		// resolves. But it isn't interrupted: it's waiting for the
-		// human. Collect those live-parked ids so the replay below
-		// re-renders their interactive card (via the Assistant
-		// record's `tool_call` event) instead of slapping an
-		// "Interrupted before tool completed" result on them. Empty
-		// for the common reopen / cold-start case.
 		// `in_flight` is `true` when this session has a turn still
 		// running in the background (already mounted), OR when we're
 		// about to spawn a fresh turn to resume a parked `ask_user`
@@ -2302,24 +2294,19 @@ impl CoderHandle {
 		// keep the sessions-list "running" / "needs input" badge lit
 		// after the user clicks into the session and backs out — the
 		// replay's trailing `TurnComplete` terminator would otherwise
-		// clear it.
+		// clear it. It also gates orphan-error synthesis below: a
+		// live turn's currently-executing tools (a running `task`
+		// sub-agent, a long `bash`, a parked `ask_user` prompt) look
+		// like orphans on disk — their `Tool` records aren't written
+		// until they finish — but they aren't interrupted, and the
+		// running turn will emit the real `ToolResult` when each
+		// lands.
 		let mut in_flight = false;
-		let live_parked_ids: std::collections::HashSet<String> = if already_mounted {
+		if already_mounted {
 			if let Some(rt) = fs.runtime(&id).await {
 				in_flight = rt.turn.lock().await.cancel.is_some();
-				let mut set = std::collections::HashSet::new();
-				for orphan_id in &orphan_tool_call_ids {
-					if rt.prompts.holds(orphan_id).await {
-						set.insert(orphan_id.clone());
-					}
-				}
-				set
-			} else {
-				std::collections::HashSet::new()
 			}
-		} else {
-			std::collections::HashSet::new()
-		};
+		}
 		let summary = SessionSummary {
 			id: header.id.clone(),
 			title: header.title.clone(),
@@ -2430,6 +2417,31 @@ impl CoderHandle {
 		// the sync [`emit_replay_events`] path. Both push into the
 		// same buffer.
 		let mut replay_events: Vec<CoderEvent> = Vec::with_capacity(record_count + 2);
+		// Sub-agents whose `SubagentFinished` record hasn't landed
+		// yet are still running when the turn is in flight — their
+		// transcripts must not get orphan-error synthesis either.
+		let finished_subagent_ids: std::collections::HashSet<&str> = records
+			.iter()
+			.filter_map(|r| match r {
+				SessionRecord::SubagentFinished { subagent_id, .. } => Some(subagent_id.as_str()),
+				_ => None,
+			})
+			.collect();
+		let live_subagent_ids: std::collections::HashSet<String> = if in_flight {
+			records
+				.iter()
+				.filter_map(|r| match r {
+					SessionRecord::SubagentSpawned { subagent_id, .. }
+						if !finished_subagent_ids.contains(subagent_id.as_str()) =>
+					{
+						Some(subagent_id.clone())
+					}
+					_ => None,
+				})
+				.collect()
+		} else {
+			std::collections::HashSet::new()
+		};
 		for (record, record_ts) in records.into_iter().zip(record_timestamps) {
 			match record {
 				SessionRecord::SubagentSpawned {
@@ -2438,14 +2450,15 @@ impl CoderHandle {
 					ref target_folder,
 					ref mode,
 				} => {
+					let still_running = live_subagent_ids.contains(subagent_id.as_str());
 					replay_subagent_spawned(
 						&mut replay_events,
-						&dir,
-						&summary.id,
+						&subagent_session_dir(&dir, &summary.id),
 						tool_call_id.clone(),
 						subagent_id.clone(),
 						target_folder.clone(),
 						mode.clone(),
+						still_running,
 					)
 					.await;
 				}
@@ -2471,26 +2484,30 @@ impl CoderHandle {
 		// `emit_replay_events` (and the live runtime) treat as
 		// `is_error: true`, so the rendering is identical to a
 		// genuinely-failed tool.
-		for orphan_id in orphan_tool_call_ids {
-			// A live-parked `ask_user` prompt is not interrupted —
-			// it's still waiting for the user. Leave its card in the
-			// interactive "waiting" state the replayed `tool_call`
-			// (from the Assistant record) already put it in.
-			if live_parked_ids.contains(&orphan_id) {
-				continue;
+		//
+		// Skipped entirely for a live turn (`in_flight`): its
+		// currently-executing tools — a running `task` sub-agent,
+		// a long `bash`, a parked `ask_user` prompt — are orphans
+		// on disk but not interrupted. Their rows stay in the
+		// replayed "running" state and the turn's real `ToolResult`
+		// events flip them when each tool lands. Abort persists
+		// interrupted sentinels in-process, so a mounted-but-idle
+		// session only has genuine orphans here.
+		if !in_flight {
+			for orphan_id in orphan_tool_call_ids {
+				// A cold-resumed `ask_user` prompt is about to be
+				// re-dispatched by the spawned turn loop (see below) —
+				// it's still waiting for the user, don't error its card.
+				if resume_ask_user_ids.contains(&orphan_id) {
+					continue;
+				}
+				replay_events.push(CoderEvent::ToolResult {
+					id: orphan_id,
+					result: serde_json::json!({ "error": "Interrupted before tool completed." }),
+					is_error: true,
+					duration_ms: None,
+				});
 			}
-			// A cold-resumed `ask_user` prompt is about to be
-			// re-dispatched by the spawned turn loop (see below) —
-			// same idea, don't error its card.
-			if resume_ask_user_ids.contains(&orphan_id) {
-				continue;
-			}
-			replay_events.push(CoderEvent::ToolResult {
-				id: orphan_id,
-				result: serde_json::json!({ "error": "Interrupted before tool completed." }),
-				is_error: true,
-				duration_ms: None,
-			});
 		}
 		// Restore-time context-usage hint. `Provider` source when
 		// we recovered a persisted `Usage` record (the ring renders
@@ -6450,19 +6467,20 @@ fn emit_replay_events(out: &mut Vec<CoderEvent>, record: SessionRecord, created_
 /// exists) and re-emit each of its records as `SubagentEvent`s so
 /// the popped-out transcript matches what the user originally saw.
 ///
-/// Sub-agent JSONLs sit at
-/// `<parent_sessions_dir>/<parent_session_id>/<subagent_id>.jsonl`
-/// — we don't recompute the path; we just probe it and skip
-/// gracefully if it's missing (manual deletion, partial write,
-/// older session that pre-dated subagent persistence).
+/// `sub_dir` is the parent's sub-agent directory
+/// (`<parent_sessions_dir>/<parent_session_id>/`, via
+/// [`subagent_session_dir`]) — we just probe
+/// `<sub_dir>/<subagent_id>.jsonl` and skip gracefully if it's
+/// missing (manual deletion, partial write, older session that
+/// pre-dated subagent persistence).
 async fn replay_subagent_spawned(
 	out: &mut Vec<CoderEvent>,
-	parent_sessions_dir: &Utf8Path,
-	parent_session_id: &str,
+	sub_dir: &Utf8Path,
 	tool_call_id: String,
 	subagent_id: String,
 	target_folder: String,
 	mode: String,
+	still_running: bool,
 ) {
 	out.push(CoderEvent::SubagentSpawned {
 		tool_call_id,
@@ -6471,8 +6489,7 @@ async fn replay_subagent_spawned(
 		mode,
 	});
 
-	let sub_dir = subagent_session_dir(parent_sessions_dir, parent_session_id);
-	let loaded = match sessions::load(&sub_dir, &subagent_id).await {
+	let loaded = match sessions::load(sub_dir, &subagent_id).await {
 		Ok(loaded) => loaded,
 		Err(err) => {
 			tracing::warn!(?err, %subagent_id, "skipping sub-agent transcript replay (load failed)");
@@ -6501,6 +6518,12 @@ async fn replay_subagent_spawned(
 	// `tool_result`, which the panel renders as a forever-
 	// running row. Synthesise the matching error result so the
 	// popped-out transcript settles into a clean done state.
+	// Not for a still-running sub-agent (`still_running`): its
+	// in-flight tools are orphans on disk but not interrupted —
+	// the live sub-agent's own events flip the rows as they land.
+	if still_running {
+		return;
+	}
 	for orphan_id in orphan_tool_call_ids {
 		out.push(CoderEvent::SubagentEvent {
 			subagent_id: subagent_id.clone(),

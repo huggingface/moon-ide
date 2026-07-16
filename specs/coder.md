@@ -623,6 +623,15 @@ points:
   is the canonical writer. Idempotent when abort-time recovery
   already ran.
 
+Reopening a session whose turn is **still running** (a background
+turn the user clicks back to) skips the errored-event synthesis
+entirely: the turn's currently-executing tools — a running `task`
+sub-agent, a long `bash`, a parked `ask_user` prompt — are orphans
+on disk (their tool records land only on completion) but not
+interrupted. Their rows replay in the running state and the live
+turn's real results flip them. The same exemption applies to a
+still-running sub-agent's own replayed transcript.
+
 Replay ships as **one batched `Replay` event**, not
 one-emit-per-record — Tauri dispatch overhead made a 1000-row session
 take seconds to open otherwise. Live turns stay one-event-per-emit.

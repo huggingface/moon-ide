@@ -1860,7 +1860,13 @@ class CoderPanelState {
 		session.tokenUsage = null;
 		session.compaction = null;
 		session.todos = [];
-		session.activeSession = null;
+		// Keep the created summary as the bucket's active summary. The
+		// on-disk session list won't include this session until its
+		// first turn persists it (ADR 0028), so this is the only
+		// source for the header's coordinator badge (ADR 0030), the
+		// mode-specific empty-state hint, and the worktree chip until
+		// the user sends a prompt.
+		session.activeSession = summary;
 		// Fresh sessions always start in Auto bash-target mode
 		// (ADR 0022) — re-probe so the header pip drops a stale
 		// force-host reading from the previously visible session.
@@ -1891,13 +1897,6 @@ class CoderPanelState {
 
 	adoptCreatedSession(summary: CoderSessionSummary): void {
 		this.installCreatedSession(summary);
-		// Keep the created summary as the visible session's active
-		// summary so its worktree badge + "isolated on <branch>" hint
-		// render immediately. `installCreatedSession` nulls it, and the
-		// on-disk session list won't include this session until its
-		// first turn persists it (ADR 0028) — so without this the
-		// worktree link is invisible until the user sends a prompt.
-		this.sessionStateFor(this.activeFolderPath ?? NO_FOLDER_KEY, summary.id).activeSession = summary;
 		void this.refreshSessions();
 	}
 
