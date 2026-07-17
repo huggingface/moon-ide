@@ -88,11 +88,16 @@ export default defineConfig(async ({ command }) => ({
 		// Vite 8 defaults to Oxc-based minification. Disable for tauri debug builds
 		// so source mapping back to TS is one-to-one.
 		minify: !process.env['TAURI_ENV_DEBUG'],
-		sourcemap: !!process.env['TAURI_ENV_DEBUG'],
+		// Always emit source maps, release builds included: a production
+		// stack trace like `index-BnGGoVCf.js:2:6013` is undebuggable
+		// without them, and the .map files only cost binary size (the
+		// webview fetches them lazily when devtools open, never at
+		// normal runtime).
+		sourcemap: true,
 		// We're packaged inside Tauri and served from the local filesystem;
 		// there's no network cost for a larger main chunk. CodeMirror core
 		// alone is sizeable and splitting it deeper would be a real refactor
-		// for no real benefit. 1.5 MB is a sane ceiling for an IDE bundle.
-		chunkSizeWarningLimit: 1500,
+		// for no real benefit. 2 MB is a sane ceiling for an IDE bundle.
+		chunkSizeWarningLimit: 2000,
 	},
 }));
