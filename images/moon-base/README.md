@@ -89,7 +89,8 @@ the "polyglot toolchain" tradeoff we picked in ADR 0007.
   and workloads repos. No `kubectl` or Kubernetes daemon baked
   in — extend with `FROM moon-base` if a team needs them.
 - **Comfort tooling**: `ripgrep` (`rg`), `fzf`, `bat` (the
-  Debian `batcat` symlinked back to `bat`), `jq`, `vim`.
+  Debian `batcat` symlinked back to `bat`), `jq`, `vim`,
+  `ss` (via `iproute2`).
 - **git from the git-core PPA** (`GIT_VERSION`, >= 2.48) —
   moon-ide's isolated worktree sessions use `git worktree add
 --relative-paths` (ADR 0029), which Debian bookworm's 2.39 predates.

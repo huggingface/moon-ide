@@ -48,6 +48,7 @@ RUN apt-get update \
         build-essential \
         ca-certificates \
         curl \
+        iproute2 \
         wget \
         less \
         openssh-client \
