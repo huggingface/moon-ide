@@ -19,6 +19,8 @@
 //! become `isError: true` content blocks at the loop layer.
 
 use std::collections::HashSet;
+use std::io::{Read, Seek};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -189,6 +191,11 @@ pub struct ToolContext {
 	pub folder: Arc<WorkspaceFolderEntry>,
 	pub mode: CoderMode,
 	pub format_queue: Arc<FormatQueue>,
+	/// Per-turn registry of detached background processes (ADR 0034).
+	/// `bash` with `detach: true` spawns into here; `read_process`
+	/// and `stop_process` read/kill from here; the runner calls
+	/// `cleanup()` at turn end.
+	pub background: Arc<BackgroundProcessRegistry>,
 	/// When true, the `bash` tool routes to the host machine even
 	/// if the workspace shell container is running — the per-session
 	/// [`BashTargetOverride::ForceHost`](crate::sessions::BashTargetOverride)
@@ -204,6 +211,7 @@ impl ToolContext {
 			folder,
 			mode,
 			format_queue: Arc::new(FormatQueue::default()),
+			background: Arc::new(BackgroundProcessRegistry::default()),
 			force_host_bash: false,
 		}
 	}
@@ -217,6 +225,7 @@ impl ToolContext {
 			folder,
 			mode,
 			format_queue: queue,
+			background: Arc::new(BackgroundProcessRegistry::default()),
 			force_host_bash: false,
 		}
 	}
@@ -227,6 +236,16 @@ impl ToolContext {
 	/// to thread it.
 	pub fn with_force_host_bash(mut self, force_host: bool) -> Self {
 		self.force_host_bash = force_host;
+		self
+	}
+
+	/// Builder-style setter for the per-turn background-process
+	/// registry (ADR 0034). The runner creates one `Arc` and shares
+	/// it across the turn so `bash` (spawn), `read_process` (poll),
+	/// `stop_process` (kill), and the turn-end `cleanup()` all reach
+	/// the same registry.
+	pub fn with_background(mut self, background: Arc<BackgroundProcessRegistry>) -> Self {
+		self.background = background;
 		self
 	}
 }
@@ -314,6 +333,368 @@ impl FormatQueue {
 	pub fn is_empty(&self) -> bool {
 		self.entries.lock().map(|g| g.is_empty()).unwrap_or(true)
 	}
+}
+
+/// Per-turn registry of detached background processes spawned by
+/// `bash` with `detach: true` (ADR 0034). Each entry holds the child
+/// handle and the host-side log file path; `read_process` tails the
+/// log and `stop_process` kills + reaps. At turn end
+/// [`BackgroundProcessRegistry::cleanup`] kills every still-running
+/// process and deletes the log files — for every termination
+/// (Ok / Aborted / Err), mirroring `FormatQueue::drain`.
+///
+/// Scoped to the turn (same lifetime as `FormatQueue`): the model is
+/// expected to poll `read_process` until completion before finishing
+/// its answer. Processes that are still running when the turn ends
+/// are killed as a safety net.
+#[derive(Default)]
+pub struct BackgroundProcessRegistry {
+	entries: Mutex<Vec<BackgroundProcess>>,
+}
+
+struct BackgroundProcess {
+	/// Opaque id returned to the model (e.g. `"bg_0"`, `"bg_1"`).
+	id: String,
+	/// The original command string — echoed back in `read_process`
+	/// results so the model doesn't have to track it separately.
+	cmd: String,
+	/// Where the command ran — `"host"` or `"container"`, same
+	/// vocabulary as the `bash` tool's `target` field.
+	target: &'static str,
+	/// Host-side log file collecting the process's stdout + stderr.
+	log_path: PathBuf,
+	/// The child handle. `None` once the process has been reaped
+	/// (either naturally, via `stop_process`, or via `cleanup`).
+	child: Option<tokio::process::Child>,
+	/// Exit code captured when the process was reaped, so subsequent
+	/// `read_process` calls after completion can still report it.
+	exit_code: Option<i32>,
+}
+
+impl BackgroundProcessRegistry {
+	/// Allocate the next monotonic id for a background process.
+	/// Uses the current entry count so ids are unique within a turn
+	/// (`bg_0`, `bg_1`, …). Concurrent calls are serialized by the
+	/// mutex inside `spawn`.
+	fn next_id(&self) -> String {
+		let count = self.entries.lock().map(|g| g.len()).unwrap_or(0);
+		format!("bg_{count}")
+	}
+
+	/// Spawn a detached process: the child's stdout+stderr are
+	/// redirected to a host-side log file, the handle is stored, and
+	/// the opaque id + log path are returned for the tool result.
+	/// The process runs until it exits, `stop_process` kills it, or
+	/// `cleanup` reaps it at turn end.
+	fn spawn(
+		&self,
+		id: String,
+		mut command: tokio::process::Command,
+		cmd: String,
+		target: &'static str,
+	) -> Result<(String, PathBuf, Option<u32>), CoderError> {
+		let log_path = background_log_path(&id);
+		if let Some(parent) = log_path.parent() {
+			std::fs::create_dir_all(parent)
+				.map_err(|err| CoderError::tool_failed("bash", format!("failed to create log dir: {err}")))?;
+		}
+		let log_file = std::fs::File::create(&log_path)
+			.map_err(|err| CoderError::tool_failed("bash", format!("failed to create log file: {err}")))?;
+		let stdout = std::process::Stdio::from(
+			log_file
+				.try_clone()
+				.map_err(|err| CoderError::tool_failed("bash", format!("failed to clone log file: {err}")))?,
+		);
+		let stderr = std::process::Stdio::from(log_file);
+		command
+			.stdin(std::process::Stdio::null())
+			.stdout(stdout)
+			.stderr(stderr)
+			.kill_on_drop(true);
+		let child = command
+			.spawn()
+			.map_err(|err| CoderError::tool_failed("bash", format!("spawn failed: {err}")))?;
+		let pid = child.id();
+		let Ok(mut guard) = self.entries.lock() else {
+			return Err(CoderError::tool_failed("bash", "registry lock poisoned"));
+		};
+		guard.push(BackgroundProcess {
+			id: id.clone(),
+			cmd,
+			target,
+			log_path: log_path.clone(),
+			child: Some(child),
+			exit_code: None,
+		});
+		Ok((id, log_path, pid))
+	}
+
+	/// Poll a detached process: optionally wait up to `wait_ms` for
+	/// it to exit, then return its running status, exit code (if
+	/// finished), and the tail of its log file.
+	async fn read(
+		&self,
+		id: &str,
+		wait_ms: u64,
+		tail_bytes: usize,
+		cancel: &CancellationToken,
+	) -> Result<Value, CoderError> {
+		// Scope the mutex guard so we drop it before any await —
+		// `try_wait` and `tokio::time::sleep` would otherwise hold
+		// it across a yield point.
+		let snapshot = {
+			let Ok(guard) = self.entries.lock() else {
+				return Err(CoderError::tool_failed("read_process", "registry lock poisoned"));
+			};
+			guard
+				.iter()
+				.find(|p| p.id == id)
+				.map(|p| (p.cmd.clone(), p.target, p.log_path.clone()))
+		};
+		let Some((cmd, target, log_path)) = snapshot else {
+			return Err(CoderError::tool_failed(
+				"read_process",
+				format!("no background process with id '{id}'"),
+			));
+		};
+
+		// If a wait was requested, poll until exit or timeout.
+		if wait_ms > 0 {
+			let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms);
+			loop {
+				if self.try_reap(id) {
+					break;
+				}
+				if cancel.is_cancelled() {
+					return Err(CoderError::Aborted);
+				}
+				if std::time::Instant::now() >= deadline {
+					break;
+				}
+				tokio::select! {
+					biased;
+					_ = cancel.cancelled() => return Err(CoderError::Aborted),
+					_ = tokio::time::sleep(Duration::from_millis(BG_POLL_INTERVAL_MS)) => {}
+				}
+			}
+		}
+
+		let (running, exit_code) = self.status(id);
+		let tail = read_tail(&log_path, tail_bytes);
+		Ok(json!({
+			"id": id,
+			"running": running,
+			"exit_code": exit_code,
+			"tail": tail,
+			"cmd": cmd,
+			"target": target,
+		}))
+	}
+
+	/// Kill a running process if it hasn't exited yet, then reap it.
+	/// Returns the exit code (0 if we killed it, the natural code if
+	/// it had already finished). No-op if the id doesn't exist or the
+	/// process was already reaped.
+	async fn stop(&self, id: &str) -> Result<Value, CoderError> {
+		// Take the child out of the entry under the lock, then drop
+		// the lock before awaiting `wait()` — `tokio::process::Child`
+		// is `Send` but `std::sync::MutexGuard` is not, and the guard
+		// can't span the await.
+		let (cmd, target, mut child) = {
+			let Ok(mut guard) = self.entries.lock() else {
+				return Err(CoderError::tool_failed("stop_process", "registry lock poisoned"));
+			};
+			let Some(proc) = guard.iter_mut().find(|p| p.id == id) else {
+				return Err(CoderError::tool_failed(
+					"stop_process",
+					format!("no background process with id '{id}'"),
+				));
+			};
+			(proc.cmd.clone(), proc.target, proc.child.take())
+		};
+
+		let killed;
+		let exit_code;
+		if let Some(child) = &mut child {
+			// Best-effort kill — the process may have just exited.
+			match child.try_wait() {
+				Ok(Some(status)) => {
+					// Already exited naturally.
+					killed = false;
+					exit_code = status.code();
+				}
+				_ => {
+					// Still running (or try_wait errored) — kill it.
+					let _ = child.start_kill();
+					let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+						.await
+						.ok()
+						.and_then(|r| r.ok());
+					killed = true;
+					exit_code = status.and_then(|s| s.code());
+				}
+			}
+		} else {
+			// Already reaped — retrieve the stored exit code.
+			killed = false;
+			exit_code = self.stored_exit_code(id);
+		}
+
+		// Store the exit code for future `read_process` calls.
+		self.store_exit_code(id, exit_code);
+
+		Ok(json!({
+			"id": id,
+			"killed": killed,
+			"exit_code": exit_code,
+			"cmd": cmd,
+			"target": target,
+		}))
+	}
+
+	/// Kill + reap every still-running process and delete log files.
+	/// Called at turn end by the runner, for every termination path.
+	pub async fn cleanup(&self) {
+		let entries = {
+			let Ok(mut guard) = self.entries.lock() else {
+				return;
+			};
+			std::mem::take(&mut *guard)
+		};
+		for mut proc in entries {
+			if let Some(child) = &mut proc.child {
+				let _ = child.start_kill();
+				// Reap with a short timeout so a stuck process
+				// doesn't hang turn-end indefinitely.
+				let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+			}
+			let _ = std::fs::remove_file(&proc.log_path);
+		}
+	}
+
+	/// Try to reap a process non-destructively. Returns `true` if the
+	/// process has exited (and was reaped). Does not remove the entry
+	/// — `read_process` still needs to report exit_code + tail after
+	/// the process finishes.
+	fn try_reap(&self, id: &str) -> bool {
+		let Ok(mut guard) = self.entries.lock() else {
+			return false;
+		};
+		let Some(proc) = guard.iter_mut().find(|p| p.id == id) else {
+			return false;
+		};
+		if let Some(child) = &mut proc.child {
+			match child.try_wait() {
+				Ok(Some(status)) => {
+					// Process exited — store the exit code and drop
+					// the handle so we stop polling it. The entry
+					// stays so `read_process` can still report.
+					proc.exit_code = status.code();
+					proc.child = None;
+					return true;
+				}
+				Ok(None) => return false,
+				Err(_) => return false,
+			}
+		}
+		// Already reaped previously.
+		true
+	}
+
+	/// Check whether a process is still running. Returns
+	/// `(running, exit_code)`. Calls `try_wait` internally so this
+	/// also reaps newly-exited processes.
+	fn status(&self, id: &str) -> (bool, Option<i32>) {
+		let Ok(mut guard) = self.entries.lock() else {
+			return (false, None);
+		};
+		let Some(proc) = guard.iter_mut().find(|p| p.id == id) else {
+			return (false, None);
+		};
+		if let Some(child) = &mut proc.child {
+			match child.try_wait() {
+				Ok(Some(status)) => {
+					proc.exit_code = status.code();
+					proc.child = None;
+					(false, status.code())
+				}
+				Ok(None) => (true, None),
+				Err(_) => (false, None),
+			}
+		} else {
+			// Already reaped — return the stored exit code.
+			(false, proc.exit_code)
+		}
+	}
+
+	/// Read the stored exit code for a reaped process.
+	fn stored_exit_code(&self, id: &str) -> Option<i32> {
+		let Ok(guard) = self.entries.lock() else {
+			return None;
+		};
+		guard.iter().find(|p| p.id == id).and_then(|p| p.exit_code)
+	}
+
+	/// Store the exit code for a process (after `stop_process` reaps
+	/// it) so subsequent `read_process` calls can still report it.
+	fn store_exit_code(&self, id: &str, code: Option<i32>) {
+		let Ok(mut guard) = self.entries.lock() else {
+			return;
+		};
+		if let Some(proc) = guard.iter_mut().find(|p| p.id == id) {
+			proc.exit_code = code;
+		}
+	}
+}
+
+/// Poll interval for `read_process`'s `wait_ms` loop. Short enough
+/// to feel responsive, long enough to not hammer the OS.
+const BG_POLL_INTERVAL_MS: u64 = 200;
+
+/// Default + cap for `read_process`'s `tail_bytes` parameter.
+const BG_DEFAULT_TAIL_BYTES: usize = 8_000;
+const BG_MAX_TAIL_BYTES: usize = 64_000;
+
+/// Default + cap for `read_process`'s `wait_ms` parameter.
+const BG_DEFAULT_WAIT_MS: u64 = 0;
+const BG_MAX_WAIT_MS: u64 = 60_000;
+
+/// Generate a host-side log file path for a background process.
+fn background_log_path(id: &str) -> PathBuf {
+	let mut path = std::env::temp_dir();
+	path.push("moon-coder-bg");
+	path.push(format!("{id}.log"));
+	path
+}
+
+/// Read the last `max_bytes` of a file as a UTF-8 string. If the
+/// file is smaller than `max_bytes`, returns the entire contents.
+fn read_tail(path: &Path, max_bytes: usize) -> String {
+	let Ok(metadata) = std::fs::metadata(path) else {
+		return String::new();
+	};
+	let file_len = metadata.len() as usize;
+	let Ok(mut file) = std::fs::File::open(path) else {
+		return String::new();
+	};
+	let start = file_len.saturating_sub(max_bytes);
+	if start > 0 {
+		if let Err(err) = file.seek(std::io::SeekFrom::Start(start as u64)) {
+			let _ = err;
+			return String::new();
+		}
+	}
+	let mut buf = Vec::with_capacity(max_bytes.min(file_len.saturating_sub(start)));
+	let _ = file.read_to_end(&mut buf);
+	// If we started mid-file, drop the first partial line so the
+	// tail starts at a clean line boundary.
+	if start > 0 && !buf.is_empty() {
+		if let Some(idx) = buf.iter().position(|&b| b == b'\n') {
+			buf = buf[idx + 1..].to_vec();
+		}
+	}
+	let cut = clamp_to_char_boundary_bytes(&buf, buf.len());
+	String::from_utf8_lossy(&buf[..cut]).into_owned()
 }
 
 /// Tools are dispatched by name. The registry holds the JSON-schema
@@ -617,7 +998,7 @@ impl ToolRegistry {
 			),
 			ToolDefinition::function(
 				"bash",
-				"Run a shell command in the active workspace folder. Returns stdout, stderr, exit_code. Times out after 120s by default.",
+				"Run a shell command in the active workspace folder. Returns stdout, stderr, exit_code. Times out after 120s by default. For long-running commands, pass `detach: true` — the process keeps running and you get back an `id` to poll with `read_process`.",
 				json!({
 					"type": "object",
 					"properties": {
@@ -627,10 +1008,50 @@ impl ToolRegistry {
 						},
 						"timeout_ms": {
 							"type": "integer",
-							"description": "Soft timeout in milliseconds. Capped at 600000 (10 minutes)."
+							"description": "Soft timeout in milliseconds. Capped at 600000 (10 minutes). Ignored when `detach` is true."
+						},
+						"detach": {
+							"type": "boolean",
+							"description": "When true, spawn the command as a detached background process. Returns immediately with `{ detached, id, pid, log_path }` instead of waiting for completion. Use `read_process(id)` to poll status and tail output, and `stop_process(id)` to kill it. The process is killed automatically when the turn ends if still running."
 						}
 					},
 					"required": ["cmd"]
+				}),
+			),
+			ToolDefinition::function(
+				"read_process",
+				"Poll a detached background process spawned by `bash` with `detach: true`. Returns its running status, exit code (if finished), and the tail of its stdout+stderr log. Pass `wait_ms` to block until the process exits (avoids busy-polling) — the call returns as soon as the process finishes or the wait elapses.",
+				json!({
+					"type": "object",
+					"properties": {
+						"id": {
+							"type": "string",
+							"description": "The process id returned by `bash` with `detach: true`."
+						},
+						"wait_ms": {
+							"type": "integer",
+							"description": "If > 0, block up to this many milliseconds waiting for the process to exit before returning. Capped at 60000 (60 seconds). Use this to avoid busy-polling: one `read_process(id, wait_ms=60000)` per minute is better than hundreds of instant polls. The call returns as soon as the process exits."
+						},
+						"tail_bytes": {
+							"type": "integer",
+							"description": "Maximum bytes of log output to return (from the end of the log). Defaults to 8000, capped at 64000."
+						}
+					},
+					"required": ["id"]
+				}),
+			),
+			ToolDefinition::function(
+				"stop_process",
+				"Kill a detached background process if it is still running, then reap it. No-op (returns `killed: false`) if the process already exited. Returns the exit code.",
+				json!({
+					"type": "object",
+					"properties": {
+						"id": {
+							"type": "string",
+							"description": "The process id returned by `bash` with `detach: true`."
+						}
+					},
+					"required": ["id"]
 				}),
 			),
 			ToolDefinition::function(
@@ -945,6 +1366,8 @@ impl ToolRegistry {
 			// "don't mutate" half is enforced via the sub-agent's
 			// system prompt — see Phase C's `run_subagent`.
 			"bash" => self.bash(args, cx, cancel).await,
+			"read_process" => self.read_process(args, cx, cancel).await,
+			"stop_process" => self.stop_process(args, cx).await,
 			"write_file" => {
 				if !cx.mode.allows_writes() {
 					return Err(CoderError::read_only_mode("write_file"));
@@ -1241,17 +1664,37 @@ impl ToolRegistry {
 			cmd: String,
 			#[serde(default)]
 			timeout_ms: Option<u64>,
+			#[serde(default)]
+			detach: bool,
 		}
 		let parsed: BashArgs =
 			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("bash", err.to_string()))?;
 		let folder = &cx.folder;
+		let (command, target_kind) = self.build_bash_command(folder, &parsed.cmd, cx.force_host_bash).await?;
+
+		// Detached path (ADR 0034): spawn into the per-turn registry,
+		// redirect output to a log file, return immediately. The
+		// model polls via `read_process` and kills via `stop_process`.
+		if parsed.detach {
+			let id = cx.background.next_id();
+			let (id, log_path, pid) = cx.background.spawn(id, command, parsed.cmd.clone(), target_kind)?;
+			return Ok(json!({
+				"detached": true,
+				"id": id,
+				"pid": pid,
+				"log_path": log_path.to_string_lossy(),
+				"cmd": parsed.cmd,
+				"target": target_kind,
+			}));
+		}
+
 		let timeout = parsed
 			.timeout_ms
 			.map(Duration::from_millis)
 			.unwrap_or(BASH_DEFAULT_TIMEOUT)
 			.min(BASH_MAX_TIMEOUT);
 
-		let (mut command, target_kind) = self.build_bash_command(folder, &parsed.cmd, cx.force_host_bash).await?;
+		let mut command = command;
 		command
 			.kill_on_drop(true)
 			.stdin(std::process::Stdio::null())
@@ -1288,6 +1731,43 @@ impl ToolRegistry {
 			"stdout": stdout,
 			"stderr": stderr,
 		}))
+	}
+
+	/// Poll a detached background process (ADR 0034). Tails the log
+	/// file and optionally blocks until the process exits.
+	async fn read_process(
+		&self,
+		args: &Value,
+		cx: &ToolContext,
+		cancel: &CancellationToken,
+	) -> Result<Value, CoderError> {
+		#[derive(Deserialize)]
+		struct ReadProcessArgs {
+			id: String,
+			#[serde(default)]
+			wait_ms: Option<u64>,
+			#[serde(default)]
+			tail_bytes: Option<usize>,
+		}
+		let parsed: ReadProcessArgs =
+			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("read_process", err.to_string()))?;
+		let wait_ms = parsed.wait_ms.unwrap_or(BG_DEFAULT_WAIT_MS).min(BG_MAX_WAIT_MS);
+		let tail_bytes = parsed
+			.tail_bytes
+			.unwrap_or(BG_DEFAULT_TAIL_BYTES)
+			.min(BG_MAX_TAIL_BYTES);
+		cx.background.read(&parsed.id, wait_ms, tail_bytes, cancel).await
+	}
+
+	/// Kill a detached background process if still running (ADR 0034).
+	async fn stop_process(&self, args: &Value, cx: &ToolContext) -> Result<Value, CoderError> {
+		#[derive(Deserialize)]
+		struct StopProcessArgs {
+			id: String,
+		}
+		let parsed: StopProcessArgs =
+			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("stop_process", err.to_string()))?;
+		cx.background.stop(&parsed.id).await
 	}
 
 	/// Build the platform-correct `bash` command for the active

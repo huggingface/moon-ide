@@ -3572,6 +3572,7 @@ fn spawn_turn_loop(
 		let mut resume = resume_tool_calls;
 		let result = loop {
 			let format_queue = Arc::new(crate::tools::FormatQueue::default());
+			let background = Arc::new(crate::tools::BackgroundProcessRegistry::default());
 			// Capture the baseline SHA at turn start for per-turn
 			// diff attribution (ADR 0030). `git stash create`
 			// snapshots the working tree without touching it; HEAD
@@ -3586,6 +3587,7 @@ fn spawn_turn_loop(
 				&sink_for_turn,
 				cancel_outer.clone(),
 				format_queue.clone(),
+				background.clone(),
 				// Only the first run_turn call gets the resume
 				// tool calls; subsequent loop iterations (steer
 				// drains after an abort) start fresh.
@@ -3593,6 +3595,10 @@ fn spawn_turn_loop(
 			)
 			.await;
 			let flushed_files = flush_format_queue(&state, &format_queue).await;
+			// Kill + reap any detached background processes still
+			// running at turn end (ADR 0034). Runs on every
+			// termination path, same as `flush_format_queue`.
+			background.cleanup().await;
 			// Compute + emit the per-turn diff on a successful turn
 			// that touched files. Best-effort — a git failure or no
 			// baseline just means no diff row, not an error.
@@ -3653,6 +3659,7 @@ fn spawn_turn_loop(
 	});
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_turn(
 	state: &Arc<CoderState>,
 	rt: &Arc<SessionRuntime>,
@@ -3660,6 +3667,7 @@ async fn run_turn(
 	sink: &FolderEventSink,
 	cancel: CancellationToken,
 	format_queue: Arc<crate::tools::FormatQueue>,
+	background: Arc<crate::tools::BackgroundProcessRegistry>,
 	mut resume_tool_calls: Option<Vec<crate::inference::ToolCall>>,
 ) -> Result<(), CoderError> {
 	// Pin the tool context to the **session's** bound folder
@@ -3697,7 +3705,9 @@ async fn run_turn(
 			CoderMode::from_top_level_wire(session.header.mode.as_deref()),
 		)
 	};
-	let cx = ToolContext::with_format_queue(folder_entry, mode, format_queue).with_force_host_bash(force_host_bash);
+	let cx = ToolContext::with_format_queue(folder_entry, mode, format_queue)
+		.with_force_host_bash(force_host_bash)
+		.with_background(background);
 	// Tool list composition branches on the top-level session mode
 	// (ADR 0030). The historical shape — `definitions()` plus
 	// `task` plus `ask_user` — is the ordinary `Agent` mode.

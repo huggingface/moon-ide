@@ -1202,6 +1202,81 @@
 		};
 	}
 
+	/** Detect a detached `bash` result (`detach: true`) — shape is
+	 *  `{ detached: true, id, pid, log_path, cmd, target }`. Used
+	 *  to render a "background process launched" body instead of
+	 *  the terminal-style stdout/stderr view. */
+	function parseBashDetachedResult(result: unknown): {
+		id: string;
+		pid: number | null;
+		cmd: string | null;
+		target: string | null;
+	} | null {
+		if (typeof result !== 'object' || result === null) {
+			return null;
+		}
+		const r = result as Record<string, unknown>;
+		if (r.detached !== true || typeof r.id !== 'string') {
+			return null;
+		}
+		return {
+			id: r.id,
+			pid: typeof r.pid === 'number' ? r.pid : null,
+			cmd: typeof r.cmd === 'string' ? r.cmd : null,
+			target: typeof r.target === 'string' ? r.target : null,
+		};
+	}
+
+	/** Parse `read_process` result — `{ id, running, exit_code, tail, cmd, target }`. */
+	function parseReadProcessResult(result: unknown): {
+		id: string;
+		running: boolean;
+		exitCode: number | null;
+		tail: string;
+		cmd: string | null;
+		target: string | null;
+	} | null {
+		if (typeof result !== 'object' || result === null) {
+			return null;
+		}
+		const r = result as Record<string, unknown>;
+		if (typeof r.id !== 'string' || typeof r.running !== 'boolean') {
+			return null;
+		}
+		return {
+			id: r.id,
+			running: r.running,
+			exitCode: typeof r.exit_code === 'number' ? r.exit_code : null,
+			tail: typeof r.tail === 'string' ? r.tail : '',
+			cmd: typeof r.cmd === 'string' ? r.cmd : null,
+			target: typeof r.target === 'string' ? r.target : null,
+		};
+	}
+
+	/** Parse `stop_process` result — `{ id, killed, exit_code, cmd, target }`. */
+	function parseStopProcessResult(result: unknown): {
+		id: string;
+		killed: boolean;
+		exitCode: number | null;
+		cmd: string | null;
+		target: string | null;
+	} | null {
+		if (typeof result !== 'object' || result === null) {
+			return null;
+		}
+		const r = result as Record<string, unknown>;
+		if (typeof r.id !== 'string' || typeof r.killed !== 'boolean') {
+			return null;
+		}
+		return {
+			id: r.id,
+			killed: r.killed,
+			exitCode: typeof r.exit_code === 'number' ? r.exit_code : null,
+			cmd: typeof r.cmd === 'string' ? r.cmd : null,
+			target: typeof r.target === 'string' ? r.target : null,
+		};
+	}
+
 	/** Single-line hint shown next to the tool name in the
 	 *  collapsed `<summary>` line — gives the user enough context
 	 *  to recognise a tool call without expanding it. The shape is
@@ -1266,6 +1341,10 @@
 				const taskText = typeof o.task === 'string' ? firstLine(o.task) : null;
 				const head = folder !== null ? `${folder} · ${mode}` : mode;
 				return taskText !== null ? `${head} — ${taskText}` : head;
+			}
+			case 'read_process':
+			case 'stop_process': {
+				return typeof o.id === 'string' ? o.id : null;
 			}
 			default:
 				return null;
@@ -2732,17 +2811,35 @@
 					{#if row.name === 'bash'}
 						{@const bArgs = parseBashArgs(row.args)}
 						{@const bResult = row.hasResult ? parseBashResult(row.result) : null}
-						{@const bashCmd = bResult?.cmd ?? bArgs?.cmd ?? ''}
-						<!-- Terminal-style view: a `$ <cmd>` line, then
-						 stdout / stderr blocks, then an `exit N` tag.
-						 Reads like the user just ran the command in a
-						 shell — much closer to the agent's mental
-						 model than a JSON dump of the same fields.
-						 Falls through to the JSON path below when the
-						 args/result don't match the expected shape
-						 (legacy traces, tool errors that returned a
-						 plain string, etc.). -->
-						{#if bArgs !== null || bResult !== null}
+						{@const bDetached = row.hasResult ? parseBashDetachedResult(row.result) : null}
+						{@const bashCmd = bResult?.cmd ?? bDetached?.cmd ?? bArgs?.cmd ?? ''}
+						{#if bDetached !== null}
+							<!-- Detached result (ADR 0034): the command was
+							 spawned as a background process. Show the
+							 command + the process id the model uses to
+							 poll via `read_process`. -->
+							<div class="bash-block">
+								<div class="bash-cmd">
+									<span class="bash-prompt" aria-hidden="true">$</span>
+									<span class="bash-cmd-text">{bashCmd}</span>
+								</div>
+								<div class="bash-exit">
+									detached · id={bDetached.id}{#if bDetached.pid !== null}
+										· pid={bDetached.pid}{/if}{#if bDetached.target}
+										<span class="bash-target"> · {bDetached.target}</span>
+									{/if}
+								</div>
+							</div>
+						{:else if bArgs !== null || bResult !== null}
+							<!-- Terminal-style view: a `$ <cmd>` line, then
+							 stdout / stderr blocks, then an `exit N` tag.
+							 Reads like the user just ran the command in a
+							 shell — much closer to the agent's mental
+							 model than a JSON dump of the same fields.
+							 Falls through to the JSON path below when the
+							 args/result don't match the expected shape
+							 (legacy traces, tool errors that returned a
+							 plain string, etc.). -->
 							<div class="bash-block">
 								<div class="bash-cmd">
 									<span class="bash-prompt" aria-hidden="true">$</span>
@@ -2761,6 +2858,58 @@
 										{/if}
 									</div>
 								{/if}
+							</div>
+						{:else}
+							<div class="block-label">args</div>
+							<pre class="block">{fmtArgs(row.args)}</pre>
+							{#if row.hasResult}
+								<div class="block-label">result</div>
+								<pre class="block">{fmtArgs(row.result)}</pre>
+							{/if}
+						{/if}
+					{:else if row.name === 'read_process'}
+						{@const rpResult = row.hasResult ? parseReadProcessResult(row.result) : null}
+						{#if rpResult !== null}
+							<div class="bash-block">
+								{#if rpResult.cmd !== null}
+									<div class="bash-cmd">
+										<span class="bash-prompt" aria-hidden="true">$</span>
+										<span class="bash-cmd-text">{rpResult.cmd}</span>
+									</div>
+								{/if}
+								{#if rpResult.tail.length > 0}
+									<pre class="bash-stream bash-stdout">{rpResult.tail}</pre>
+								{/if}
+								<div class="bash-exit" class:err={rpResult.exitCode !== null && rpResult.exitCode !== 0}>
+									{rpResult.running ? 'running' : 'exit'}
+									{rpResult.exitCode ?? '?'}{#if rpResult.target}
+										<span class="bash-target"> · {rpResult.target}</span>
+									{/if}
+								</div>
+							</div>
+						{:else}
+							<div class="block-label">args</div>
+							<pre class="block">{fmtArgs(row.args)}</pre>
+							{#if row.hasResult}
+								<div class="block-label">result</div>
+								<pre class="block">{fmtArgs(row.result)}</pre>
+							{/if}
+						{/if}
+					{:else if row.name === 'stop_process'}
+						{@const spResult = row.hasResult ? parseStopProcessResult(row.result) : null}
+						{#if spResult !== null}
+							<div class="bash-block">
+								{#if spResult.cmd !== null}
+									<div class="bash-cmd">
+										<span class="bash-prompt" aria-hidden="true">$</span>
+										<span class="bash-cmd-text">{spResult.cmd}</span>
+									</div>
+								{/if}
+								<div class="bash-exit">
+									{spResult.killed ? 'killed' : 'already exited'} · exit {spResult.exitCode ?? '?'}{#if spResult.target}
+										<span class="bash-target"> · {spResult.target}</span>
+									{/if}
+								</div>
 							</div>
 						{:else}
 							<div class="block-label">args</div>

@@ -150,6 +150,12 @@ A sub-agent does **not** see your conversation history; describe the task self-c
 - **`write_file` is for files that don't exist yet.** Don't use it to rewrite an existing file: the full new contents stay in your context for the rest of the session, which burns through the window fast. Missing parent directories are created automatically — no need to `mkdir -p` first.
 - Read before you edit. Don't invent file paths; when unsure of the layout, call `list_dir` first.
 
+## Background processes
+
+For commands that take longer than the 10-minute `bash` timeout (large builds, full test suites, long-running scripts), pass `detach: true` to `bash`. The process keeps running in the background and you get back an `id`. Poll it with `read_process(id, wait_ms=60000)` — the `wait_ms` blocks until the process exits or one minute elapses, so you don't need to busy-poll. Use `stop_process(id)` to kill a process early. Any process still running when the turn ends is killed automatically.
+
+Typical workflow: `bash(cmd, detach=true)` → `read_process(id, wait_ms=60000)` (repeat until `running: false`) → report the result.
+
 ## Reviewing branch / PR changes
 
 When asked to review a branch / PR against `main` (or `master`), ignore merge main into branch, scope to what the branch *adds*, not HEAD vs. the current base tip:

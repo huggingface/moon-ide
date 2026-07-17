@@ -265,6 +265,10 @@ pub(crate) async fn run_subagent(
 	// sub-agent ended. See the ADR superseding 0013's per-tool-
 	// call invocation.
 	let format_queue = Arc::new(crate::tools::FormatQueue::default());
+	// Per-turn background-process registry (ADR 0034). Same
+	// lifetime as the format queue — cleaned up regardless of how
+	// the sub-agent ended.
+	let background = Arc::new(crate::tools::BackgroundProcessRegistry::default());
 
 	let outcome = run_subagent_inner(
 		tools,
@@ -275,6 +279,7 @@ pub(crate) async fn run_subagent(
 		&spec,
 		cancel,
 		format_queue.clone(),
+		background.clone(),
 	)
 	.await;
 
@@ -292,6 +297,8 @@ pub(crate) async fn run_subagent(
 			tracing::warn!(path = %rel, %err, "format-on-save (sub-agent turn end): format_file failed");
 		}
 	}
+	// Kill + reap any detached processes the sub-agent left running.
+	background.cleanup().await;
 
 	let was_error = outcome.is_err();
 	sink.send(CoderEvent::SubagentFinished {
@@ -312,6 +319,7 @@ async fn run_subagent_inner(
 	spec: &Subagent,
 	cancel: CancellationToken,
 	format_queue: Arc<crate::tools::FormatQueue>,
+	background: Arc<crate::tools::BackgroundProcessRegistry>,
 ) -> Result<SubagentReport, CoderError> {
 	// Header seed only — the per-round-trip model comes from the
 	// fresh snapshot at the top of every loop iteration below.
@@ -420,7 +428,7 @@ async fn run_subagent_inner(
 	// servers — a sub-agent driving playwright against its target
 	// folder's dev server is a natural delegation.
 	tool_defs.extend(tools.mcp_definitions().await);
-	let cx = ToolContext::with_format_queue(spec.folder.clone(), spec.mode, format_queue);
+	let cx = ToolContext::with_format_queue(spec.folder.clone(), spec.mode, format_queue).with_background(background);
 
 	// Consecutive empty-shell responses — same retry-then-fail
 	// posture as the parent loop in `run_turn`. Without it a
@@ -992,7 +1000,7 @@ async fn handle_subagent_todo_write(
 
 const RESEARCH_SYSTEM_PROMPT: &str = r#"You are a research sub-agent inside moon-ide. You have been spawned by a parent agent to gather information from a workspace folder and report back. Your job is investigation, not editing.
 
-Tools available: `read_file`, `list_dir`, `grep`, and `bash`. You are scoped to a single folder (shown below); `grep` and `bash` run against it, and relative paths resolve inside it. You cannot spawn further sub-agents.
+Tools available: `read_file`, `list_dir`, `grep`, `bash`, `read_process`, and `stop_process`. You are scoped to a single folder (shown below); `grep` and `bash` run against it, and relative paths resolve inside it. You cannot spawn further sub-agents.
 
 The shell is for read-only inspection only — `git log`, `git diff --stat`, `cargo check`, `pytest --collect-only`, `ls -la`, `cat`, `wc`, and similar. Do **not** run commands that mutate the filesystem, network state, or remote services. No `git commit`, `git push`, `cargo build` (it writes to `target/`), `mv`, `rm`, `npm install`, `pip install`, redirection-to-file (`> path`, `>> path`), or anything that would change persistent state.
 
@@ -1001,7 +1009,7 @@ Return your findings as a single coherent text result when you finish. The paren
 
 const AGENT_SYSTEM_PROMPT: &str = r#"You are an agent sub-agent inside moon-ide. You have been spawned by a parent agent to perform a focused task in a workspace folder. Your capabilities are the same as the parent's — you can read, search, run commands, and edit files freely.
 
-Tools available: `read_file`, `list_dir`, `grep`, `bash`, `write_file`, `edit_file`. You are scoped to a single folder (shown below); `grep` and `bash` run against it, and relative paths resolve inside it. You cannot spawn further sub-agents.
+Tools available: `read_file`, `list_dir`, `grep`, `bash`, `read_process`, `stop_process`, `write_file`, `edit_file`. You are scoped to a single folder (shown below); `grep` and `bash` run against it, and relative paths resolve inside it. You cannot spawn further sub-agents.
 
 Read before you edit — don't invent file paths. Use `edit_file` for surgical changes inside large files; reach for `write_file` for new files and whole-file rewrites.
 
