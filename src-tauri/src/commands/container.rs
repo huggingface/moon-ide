@@ -141,24 +141,6 @@ pub async fn container_status(state: State<'_, AppState>) -> Result<ContainerSta
 	Ok(container.status().await?)
 }
 
-/// [`container_status`], gated on the launch-time auto-resume
-/// (`shutdown::auto_resume_shell`) having settled. The terminal
-/// auto-spawn paths call this instead of `container_status` so a
-/// terminal opened while the workspace shell is still `docker
-/// compose up`-ing lands in the container instead of silently
-/// falling back to host. Resolves immediately once the gate is
-/// open (and always in preboot mode).
-#[tauri::command]
-pub async fn container_await_startup(state: State<'_, AppState>) -> Result<ContainerStatus, MoonError> {
-	// The sender lives in `AppState` for the process lifetime, so
-	// `wait_for` only errs during teardown — fall through and
-	// report whatever status the daemon gives us.
-	let mut settled = state.shell_auto_resume_settled.subscribe();
-	let _ = settled.wait_for(|done| *done).await;
-	let container = workspace_handle(&state).await?;
-	Ok(container.status().await?)
-}
-
 /// First-time opt-in: regenerate `compose.yaml` from the current
 /// bound-folder set, then `docker compose up -d --wait`.
 #[tauri::command]

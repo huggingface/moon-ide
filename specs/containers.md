@@ -333,13 +333,18 @@ logs a warning; a SIGKILLed IDE leaves containers running and the
 next launch skips the `up` for anything already `Running`; a failed
 auto-resume logs and surfaces in the popover.
 
-Anything that spawns a terminal in the "preferred" environment
-(the launch-time bottom-panel auto-spawn, `Ctrl+J` on an empty
-panel, the launcher trigger) waits for the shell's auto-resume to
-settle first (`container_await_startup`) — a status probe landing
-mid-resume truthfully reports `stopped`, which would otherwise
-send the terminal to host even though the shell is seconds from
-`running`.
+The launch-time bottom-panel auto-spawn checks the container
+status after the startup `container.refresh()` settles; if the
+shell isn't up yet (the backend is still `docker compose up`-ing
+the auto-resumed shell), it defers the spawn until the
+`container:state` event fires `running` — up to a generous
+timeout (image pulls can take minutes). If the timeout fires or
+the shell settles on a non-running state, it falls back to host
+so the panel is never left empty. User-driven spawns
+(`Ctrl+J` on an empty panel, the launcher trigger) don't defer —
+they check the current status and pick host or container
+immediately, since the user just clicked and expects a terminal
+now.
 
 #### Signal-termination exits aren't failures
 
@@ -643,13 +648,12 @@ parented to host-side handles.
 
 ## Frontend ↔ backend boundary
 
-| Command                                | Purpose                                                                                                                                                                                  |
-| -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `container_status`                     | `{ state: "absent" \| "creating" \| "running" \| "paused" \| "stopped" \| "error", error?: string }`                                                                                     |
-| `container_await_startup`              | `container_status`, gated on the launch-time shell auto-resume having settled. Terminal spawns that prefer the container await this so they don't race the resume and fall back to host. |
-| `container_setup`                      | First-time bootstrap: write default `compose.yaml`, pull, create + start. Idempotent.                                                                                                    |
-| `container_pause` / `container_resume` | Lifecycle hooks (backend-only; UI doesn't expose Pause).                                                                                                                                 |
-| `container_rebuild`                    | `down` + recreate. Drops in-container state.                                                                                                                                             |
+| Command                                | Purpose                                                                                              |
+| -------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `container_status`                     | `{ state: "absent" \| "creating" \| "running" \| "paused" \| "stopped" \| "error", error?: string }` |
+| `container_setup`                      | First-time bootstrap: write default `compose.yaml`, pull, create + start. Idempotent.                |
+| `container_pause` / `container_resume` | Lifecycle hooks (backend-only; UI doesn't expose Pause).                                             |
+| `container_rebuild`                    | `down` + recreate. Drops in-container state.                                                         |
 
 Push events: `container:state` (status-bar pip), `container:logs`
 (streamed during create/rebuild), `container:error`.

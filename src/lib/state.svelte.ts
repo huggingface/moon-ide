@@ -2042,11 +2042,13 @@ class WorkspaceState {
 	 *
 	 * Awaits `containerRefresh` first so the target choice reflects
 	 * the daemon's current truth rather than the pre-hydrate `null`
-	 * status, then the launch-time auto-resume gate
-	 * (`container.awaitStartupSettled`) — the backend may still be
-	 * `docker compose up`-ing the shell it auto-resumes on launch,
-	 * and a refresh landing mid-resume truthfully reports `stopped`,
-	 * which would wrongly send this spawn to host. Awaits
+	 * status. If the container isn't up yet (the backend is still
+	 * `docker compose up`-ing the shell it auto-resumes on launch),
+	 * defers the spawn until the `container:state` event fires
+	 * `running` — up to a generous timeout (image pulls, slow
+	 * `compose up --wait`). If the timeout fires, or the shell
+	 * settles on a non-running state, falls back to host so the
+	 * panel is never left without a terminal. Awaits
 	 * `terminalRuntime` so the `terminal:output` listener is
 	 * attached before we spawn — otherwise the first prompt bytes
 	 * would be dropped on the floor.
@@ -2071,9 +2073,22 @@ class WorkspaceState {
 			return;
 		}
 		await containerRefresh;
-		await container.awaitStartupSettled();
 		await terminalRuntime;
 		if (bottomPanel.tabs.length > 0) {
+			return;
+		}
+		if (canOpenContainerTerminal()) {
+			openContainerTerminal();
+			return;
+		}
+		// Container isn't up yet — the launch-time auto-resume may
+		// still be bringing it up. Wait for it rather than falling
+		// back to host immediately; the `container:state` event
+		// fires from `auto_resume_shell` when the shell settles.
+		// Generous timeout: image pulls can take minutes, and a host
+		// fallback after 60 s is better than none after 0 s.
+		const started = await container.onceRunning(60_000);
+		if (!started || bottomPanel.tabs.length > 0 || !bottomPanel.visible) {
 			return;
 		}
 		if (canOpenContainerTerminal()) {

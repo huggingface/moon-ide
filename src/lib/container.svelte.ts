@@ -74,28 +74,59 @@ class ContainerPanelState {
 		}
 	}
 
-	/** Cached `container_await_startup` round-trip; see
-	 *  [`awaitStartupSettled`]. */
-	#startupSettled: Promise<void> | null = null;
-
-	/** Resolve once the backend's launch-time shell auto-resume
-	 *  (`auto_resume_shell`) has settled, folding the post-resume
-	 *  status into `status`. A plain `refresh()` mid-resume
-	 *  truthfully reports `stopped`/`creating`, so terminal-spawn
-	 *  helpers that only awaited it would fall back to host while
-	 *  the container was still coming up. One backend round-trip,
-	 *  cached for the session — the gate can't un-settle. */
-	awaitStartupSettled(): Promise<void> {
-		this.#startupSettled ??= (async () => {
-			try {
-				this.status = await ipc.container.awaitStartup();
-			} catch {
-				// Daemon down / no compose project — same failure
-				// surface as `refresh()`; callers proceed with the
-				// last known state and pick host.
-			}
-		})();
-		return this.#startupSettled;
+	/** Resolve when the container reaches `running`, or `false`
+	 *  if it doesn't within `timeoutMs` (or a non-running state
+	 *  arrives — `stopped`, `failed`, …). Used by the startup
+	 *  terminal auto-spawn to defer the host-vs-container choice
+	 *  until the launch-time auto-resume has brought the shell up,
+	 *  instead of blocking on a backend gate that can take minutes
+	 *  (image pull, slow `compose up --wait`). The `container:state`
+	 *  event already fires from `auto_resume_shell` when the shell
+	 *  comes up, so this just waits for that event — no new
+	 *  backend round-trip.
+	 *
+	 *  Resolves `true` immediately if the container is already
+	 *  running when called. Idempotent: multiple callers can race
+	 *  the same window; each gets its own resolution. */
+	async onceRunning(timeoutMs: number): Promise<boolean> {
+		if (this.state === 'running') {
+			return true;
+		}
+		return new Promise<boolean>((resolve) => {
+			let settled = false;
+			let unlistenPromise: Promise<UnlistenFn> | null = null;
+			const cleanup = () => {
+				if (unlistenPromise) {
+					void unlistenPromise.then((unlisten) => unlisten());
+				}
+			};
+			const timer = setTimeout(() => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				cleanup();
+				resolve(false);
+			}, timeoutMs);
+			unlistenPromise = listen<ContainerStateChange>(CONTAINER_STATE_EVENT, (event) => {
+				if (settled) {
+					return;
+				}
+				if (event.payload.status.state === 'running') {
+					settled = true;
+					clearTimeout(timer);
+					cleanup();
+					resolve(true);
+				} else if (event.payload.status.state === 'stopped' || event.payload.status.state === 'failed') {
+					// The shell settled on a non-running state — no
+					// point waiting further.
+					settled = true;
+					clearTimeout(timer);
+					cleanup();
+					resolve(false);
+				}
+			});
+		});
 	}
 
 	/**

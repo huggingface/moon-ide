@@ -79,7 +79,6 @@ export function canOpenContainerTerminal(): boolean {
  *  directly. */
 export async function openPreferredTerminal(): Promise<void> {
 	await container.awaitRefreshed();
-	await container.awaitStartupSettled();
 	if (canOpenContainerTerminal()) {
 		openContainerTerminal();
 		return;

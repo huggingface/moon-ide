@@ -51,7 +51,6 @@
 		// the shell is seconds from `running`. After the awaits
 		// `containerRunning` reads the settled state.
 		await container.awaitRefreshed();
-		await container.awaitStartupSettled();
 		if (!containerRunning) {
 			openHostTerminal();
 			return;

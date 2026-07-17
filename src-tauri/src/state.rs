@@ -73,14 +73,6 @@ pub struct AppState {
 	/// for the whole shutdown window and reports the workspace
 	/// as still in use. `None` in preboot mode (no socket bound).
 	pub focus_listener: Mutex<Option<AbortHandle>>,
-	/// Flipped to `true` once the launch-time workspace-shell
-	/// auto-resume ([`crate::shutdown::auto_resume_shell`]) has
-	/// settled. `container_await_startup` waits on it so the
-	/// startup terminal auto-spawn sees the post-resume container
-	/// state instead of racing the resume and silently falling
-	/// back to a host terminal. Starts `true` in preboot mode —
-	/// there is no shell to resume.
-	pub shell_auto_resume_settled: tokio::sync::watch::Sender<bool>,
 	/// Outbound remote-bridge connection handle (Phase 14.3, ADR
 	/// 0031). `None` when the IDE isn't connected to a remote bridge
 	/// (local mode). Held so the `companion_remote_status` /
@@ -143,7 +135,6 @@ impl AppState {
 		mode: AppMode,
 		logs: Arc<LogSink>,
 	) -> Self {
-		let (shell_auto_resume_settled, _) = tokio::sync::watch::channel(matches!(mode, AppMode::Preboot));
 		Self {
 			workspaces,
 			config_dir,
@@ -158,7 +149,6 @@ impl AppState {
 			mode,
 			logs,
 			focus_listener: Mutex::new(None),
-			shell_auto_resume_settled,
 			remote_bridge: Mutex::new(None),
 		}
 	}
