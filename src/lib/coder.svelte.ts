@@ -3180,7 +3180,7 @@ class CoderPanelState {
 				// Rendered as a collapsible diff in the transcript.
 				session.rows.push({
 					kind: 'turn_diff',
-					id: `diff-${Date.now()}`,
+					id: nextRowId('diff'),
 					files: event.files,
 					diff: event.diff,
 				});
@@ -3253,7 +3253,7 @@ class CoderPanelState {
 						row.durationMs = Math.max(0, abortedAt - row.startedAt);
 					}
 				}
-				session.rows.push({ kind: 'aborted', id: `aborted-${abortedAt}` });
+				session.rows.push({ kind: 'aborted', id: nextRowId('aborted') });
 				this.#flagAttentionIfBackground(folder, folderPath);
 				this.#flagSessionAttentionIfBackground(session, folder, folderPath, sessionId);
 				return;
@@ -3263,7 +3263,7 @@ class CoderPanelState {
 				session.awaitingInput = false;
 				session.rows.push({
 					kind: 'error',
-					id: `error-${Date.now()}`,
+					id: nextRowId('error'),
 					text: event.message,
 				});
 				this.#flagAttentionIfBackground(folder, folderPath);
@@ -3473,7 +3473,7 @@ class CoderPanelState {
 				};
 				session.rows.push({
 					kind: 'compaction',
-					id: nextCompactionRowId(),
+					id: nextRowId('compaction'),
 					phase: 'running',
 					messagesCompacted: event.messages_compacted,
 					chunksDone: 0,
@@ -3666,7 +3666,7 @@ function applyInnerEventToRows(rows: CoderRow[], event: CoderEvent): void {
 		case 'compaction_started':
 			rows.push({
 				kind: 'compaction',
-				id: nextCompactionRowId(),
+				id: nextRowId('compaction'),
 				phase: 'running',
 				messagesCompacted: event.messages_compacted,
 				chunksDone: 0,
@@ -3897,16 +3897,18 @@ function appendDelta(rows: CoderRow[], id: string, delta: string, field: 'text' 
 	});
 }
 
-/** Monotonic id for synthetic compaction transcript rows. The
- *  backend's `compaction_started` / `compaction_complete` events
- *  carry no id (there's at most one compaction in flight per
- *  session), so the frontend mints its own to keep the row keyed
- *  and patchable. Module-level so a second compaction in the same
- *  session can't collide with the first. */
-let compactionRowSeq = 0;
-function nextCompactionRowId(): string {
-	compactionRowSeq += 1;
-	return `compaction-${compactionRowSeq}`;
+/** Monotonic id for synthetic transcript rows (compaction, per-turn
+ *  diff, aborted, error) whose backing events carry no id of their
+ *  own. A timestamp is *not* a valid key here: an `open_session`
+ *  replay reduces the whole batch in one synchronous loop, so two
+ *  same-kind events (e.g. two `turn_diff`s in a multi-turn session)
+ *  land in the same `Date.now()` millisecond and blow up the
+ *  transcript's keyed `{#each}` with `each_key_duplicate`.
+ *  Module-level so ids stay unique across sessions and replays. */
+let syntheticRowSeq = 0;
+function nextRowId(prefix: string): string {
+	syntheticRowSeq += 1;
+	return `${prefix}-${syntheticRowSeq}`;
 }
 
 export const coder = new CoderPanelState();

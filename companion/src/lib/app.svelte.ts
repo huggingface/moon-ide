@@ -515,7 +515,7 @@ class CompanionState {
 				if (total > 0) {
 					this.rows.push({
 						kind: 'tokens',
-						id: `tok-${total}-${Date.now()}`,
+						id: nextRowId('tok'),
 						total,
 						contextWindow: ctx,
 					});
@@ -529,7 +529,7 @@ class CompanionState {
 				if (fileList.length > 0 || diff) {
 					this.rows.push({
 						kind: 'diff',
-						id: `diff-${Date.now()}`,
+						id: nextRowId('diff'),
 						files: fileList,
 						diff,
 					});
@@ -539,7 +539,7 @@ class CompanionState {
 			case 'compaction_started':
 				this.rows.push({
 					kind: 'compaction',
-					id: `comp-${Date.now()}`,
+					id: nextRowId('comp'),
 					summary: '',
 					done: false,
 				});
@@ -634,6 +634,17 @@ class CompanionState {
 			row.status = status;
 		}
 	}
+}
+
+/** Monotonic id for synthetic transcript rows (tokens, diff,
+ *  compaction) whose backing events carry no id. Timestamps are
+ *  not valid keys: a `replay` batch reduces synchronously, so two
+ *  same-kind events land in the same millisecond and collide in
+ *  the keyed `{#each}`. */
+let syntheticRowSeq = 0;
+function nextRowId(prefix: string): string {
+	syntheticRowSeq += 1;
+	return `${prefix}-${syntheticRowSeq}`;
 }
 
 export const app = new CompanionState();
