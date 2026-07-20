@@ -808,6 +808,75 @@ mod tests {
 	}
 
 	#[test]
+	fn content_search_skips_worktrees_dir_via_git_exclude() {
+		// Worktree-backed coder sessions (ADR 0029) check branches out
+		// at `<parent>/.worktrees/<slug>` and hide that directory via
+		// a `/.worktrees/` line in the parent's `.git/info/exclude`.
+		// A parent-rooted search must not descend into the worktrees —
+		// every hit would otherwise show up twice (once per checkout).
+		// Wired via `WalkBuilder::git_exclude(true)`; regression
+		// against flipping it off or the override set eating it.
+		let dir = TempDir::new().unwrap();
+		std::fs::create_dir_all(dir.path().join(".git/info")).unwrap();
+		std::fs::write(dir.path().join(".git/info/exclude"), "/.worktrees/\n").unwrap();
+		std::fs::create_dir_all(dir.path().join(".worktrees/moon-agent-1")).unwrap();
+		std::fs::write(
+			dir.path().join(".worktrees/moon-agent-1/dupe.txt"),
+			"needle in worktree\n",
+		)
+		.unwrap();
+		std::fs::write(dir.path().join("dupe.txt"), "needle in parent\n").unwrap();
+
+		let opts = ContentSearchOptions {
+			query: "needle".into(),
+			max_matches: 100,
+			..Default::default()
+		};
+		let r = search_content(&root(&dir), &opts).unwrap();
+		assert!(
+			r.hits.iter().all(|h| !h.path.starts_with(".worktrees/")),
+			"content search leaked into .worktrees/: {:?}",
+			r.hits
+		);
+		assert!(
+			r.hits.iter().any(|h| h.path == "dupe.txt"),
+			"parent checkout hit got dropped along with the worktrees filter: {:?}",
+			r.hits
+		);
+	}
+
+	#[test]
+	fn file_search_skips_worktrees_dir_via_git_exclude() {
+		// Same invariant as the content-search test above, but for the
+		// two-pass quick-open walker: pass 2 turns `git_exclude` *off*
+		// to surface files like `.env`, and relies on the walked-dirs
+		// allow-list to keep excluded directories pruned. A regression
+		// there would double every file name in the palette (parent
+		// copy + worktree copy).
+		let dir = TempDir::new().unwrap();
+		std::fs::create_dir_all(dir.path().join(".git/info")).unwrap();
+		std::fs::write(dir.path().join(".git/info/exclude"), "/.worktrees/\n").unwrap();
+		std::fs::create_dir_all(dir.path().join(".worktrees/moon-agent-1")).unwrap();
+		std::fs::write(dir.path().join(".worktrees/moon-agent-1/widget.ts"), "").unwrap();
+		std::fs::write(dir.path().join("widget.ts"), "").unwrap();
+
+		let opts = FileSearchOptions {
+			query: "widget".into(),
+			limit: 50,
+		};
+		let hits = search_files(&root(&dir), &opts).unwrap();
+		assert!(
+			hits.iter().all(|h| !h.path.starts_with(".worktrees/")),
+			"file search leaked into .worktrees/: {hits:?}"
+		);
+		assert_eq!(
+			hits.iter().filter(|h| h.path == "widget.ts").count(),
+			1,
+			"parent copy should surface exactly once: {hits:?}"
+		);
+	}
+
+	#[test]
 	fn content_search_whole_word_filters_substring_hits() {
 		// `whole_word: true` should match `print` standalone but not
 		// `println` / `imprinted`. Both case-sensitive and case-
