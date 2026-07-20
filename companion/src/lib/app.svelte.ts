@@ -336,7 +336,7 @@ class CompanionState {
 		}
 		this.error = null;
 		try {
-			await this.#call(workspace, 'workspace_launch', {}, ide);
+			await this.#call(workspace, 'workspace_launch', { workspace_id: workspace }, ide);
 			// Poll the workspace list so the phone sees it go live.
 			// The new process takes a moment to bind its socket; a
 			// single re-fetch after a short delay catches it, and
@@ -1006,12 +1006,22 @@ class CompanionState {
 				const total = num(ev, 'total_tokens');
 				const ctx = num(ev, 'context_window');
 				if (total > 0) {
-					this.rows.push({
-						kind: 'tokens',
-						id: nextRowId('tok'),
-						total,
-						contextWindow: ctx,
-					});
+					// Update the existing tokens row in place rather
+					// than appending a new one each time — the coder
+					// emits these frequently during a turn and each
+					// would otherwise become its own transcript row.
+					const existing = this.rows.findLast((r) => r.kind === 'tokens');
+					if (existing && existing.kind === 'tokens') {
+						existing.total = total;
+						existing.contextWindow = ctx;
+					} else {
+						this.rows.push({
+							kind: 'tokens',
+							id: nextRowId('tok'),
+							total,
+							contextWindow: ctx,
+						});
+					}
 				}
 				break;
 			}
