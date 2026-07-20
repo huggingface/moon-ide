@@ -107,6 +107,31 @@ Full details in [specs/editorconfig.md](specs/editorconfig.md) and [ADR 0013](sp
 
 Like LSP, the formatter chain runs inside the workspace shell container when one is up.
 
+## Phone companion & relay
+
+A paired phone can drive coder sessions and review work over the [companion PWA](specs/companion.md). On a shared LAN nothing needs setting up: release builds of the IDE auto-spawn a local `moon-bridge`, and the command palette's "Companion: Pair a phone…" shows the QR.
+
+When the phone and the IDE host don't share a network, run a **standing relay** on any always-on box behind a TLS front (design: [ADR 0035](specs/decisions/0035-public-relay-deployment.md)):
+
+```bash
+# build the relay binary + the PWA it serves
+cargo build --release -p moon-bridge
+bun run build:companion
+
+# on the relay box (nginx or similar terminates public TLS and
+# proxies WebSocket upgrades to this listener)
+moon-bridge serve --bind 127.0.0.1:53180 \
+    --advertise-url wss://bridge.example.com \
+    --no-idle-exit --web-root /path/to/companion-dist
+```
+
+Notes:
+
+- `--no-idle-exit` keeps the relay up with zero local workspaces (the local auto-spawned bridge must **not** set it); `--advertise-url` is what pairing QRs point phones at.
+- An enrollment code prints at startup (120 s, single-use). Enter it in the IDE via command palette → "Companion: Connect to remote bridge…"; the IDE stores a token and reconnects on its own from then on. Each open workspace registers itself, so the phone sees them all.
+- The keyring backend needs a Secret Service even headless — run under `dbus-run-session` with an unlocked `gnome-keyring-daemon` (see the ADR).
+- Phone pairing QRs are minted on demand from any enrolled IDE's Companion panel; no relay restart needed.
+
 ## `moon-base` docker image
 
 Used for workspace containers, if not wanting to run dev processes on host machines.
