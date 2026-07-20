@@ -67,19 +67,48 @@
 	function truncate(s: string, max: number): string {
 		return s.length > max ? s.slice(0, max) + '...' : s;
 	}
+
+	const title = $derived(app.sessions.find((s) => s.id === app.activeSession)?.title ?? '');
+
+	// Pin the transcript to the bottom while rows stream in, unless
+	// the user scrolled away to read — same gesture as the desktop's
+	// CoderThinking body (within-24px threshold absorbs subpixel
+	// scroll positions on HiDPI).
+	const PIN_THRESHOLD_PX = 24;
+	let transcriptEl = $state<HTMLDivElement>();
+	let pinned = $state(true);
+
+	function onTranscriptScroll(): void {
+		const el = transcriptEl;
+		if (!el) {
+			return;
+		}
+		pinned = el.scrollHeight - el.scrollTop - el.clientHeight <= PIN_THRESHOLD_PX;
+	}
+
+	$effect(() => {
+		const _trigger = app.rows.length;
+		void _trigger;
+		const el = transcriptEl;
+		if (!el || !pinned) {
+			return;
+		}
+		el.scrollTop = el.scrollHeight;
+	});
 </script>
 
 <div class="session">
 	<div class="row session-head">
-		<button class="ghost" onclick={() => app.closeSession()}>← Sessions</button>
+		<button class="ghost back" onclick={() => app.closeSession()}>←</button>
+		<strong class="session-title">{title || 'Untitled session'}</strong>
 		{#if app.busy}
-			<span class="muted">running…</span>
+			<span class="muted status">running…</span>
 		{:else if app.awaitingInput}
-			<span class="muted" style="color: var(--accent)">input needed</span>
+			<span class="status" style="color: var(--accent)">input needed</span>
 		{/if}
 	</div>
 
-	<div class="transcript">
+	<div class="transcript" bind:this={transcriptEl} onscroll={onTranscriptScroll}>
 		{#each app.rows as row (row.kind + row.id)}
 			{#if row.kind === 'user'}
 				<div class="bubble user" class:queued={row.queued}>
@@ -193,10 +222,6 @@
 		{/if}
 	</div>
 
-	{#if app.error}
-		<p class="error">{app.error}</p>
-	{/if}
-
 	<div class="composer">
 		<textarea bind:value={draft} onkeydown={onKeydown} placeholder="Message the coder — Enter to send" rows="2"
 		></textarea>
@@ -212,12 +237,30 @@
 	.session {
 		display: flex;
 		flex-direction: column;
-		height: 100vh;
+		/* dvh tracks the mobile browser chrome collapsing/expanding;
+		   vh alone leaves the composer hidden behind the toolbar. */
+		height: 100dvh;
 		padding: 0.75rem;
 		gap: 0.5rem;
 	}
 	.session-head {
-		justify-content: space-between;
+		gap: 0.5rem;
+	}
+	.back {
+		flex: none;
+		padding: 0.6rem 0.7rem;
+	}
+	.session-title {
+		flex: 1;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-size: 0.95rem;
+	}
+	.status {
+		flex: none;
+		font-size: 0.8rem;
 	}
 	.transcript {
 		flex: 1;

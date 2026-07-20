@@ -625,6 +625,37 @@ impl CoderState {
 		Ok((session, folder_path))
 	}
 
+	/// Coder-root path for an explicitly-named bound folder — the
+	/// folder-targeting mirror of [`Self::coder_root_folder`]. Errors
+	/// when `folder` isn't bound in the workspace. Used by the
+	/// bridge's folder-scoped session commands (the companion's
+	/// project switcher) so the phone can drive any bound folder
+	/// without touching the desktop's active-folder selection.
+	async fn coder_root_at(&self, folder: &str) -> Result<Utf8PathBuf, CoderError> {
+		let entry = self
+			.workspaces
+			.folder_for_path(folder)
+			.await
+			.ok_or_else(|| CoderError::Internal(format!("folder not bound in this workspace: {folder}")))?;
+		let root = self.coder_root_of(entry).await;
+		Ok(Utf8PathBuf::from(root.folder.path.clone()))
+	}
+
+	/// [`Self::active_folder_session`] when `folder` is `None`, else
+	/// the named folder's coder-root session. The shared resolution
+	/// for session commands that take an optional folder target.
+	async fn folder_session_or_active(
+		&self,
+		folder: Option<&str>,
+	) -> Result<(Arc<FolderSession>, Utf8PathBuf), CoderError> {
+		let Some(path) = folder else {
+			return self.active_folder_session().await;
+		};
+		let root = self.coder_root_at(path).await?;
+		let session = self.folder_session_for(&root).await;
+		Ok((session, root))
+	}
+
 	/// Resolve to `(visible SessionRuntime, session id, folder path)`
 	/// for the active folder. Used by every panel-driven command
 	/// that targets "the session the user is currently looking at":
@@ -1473,12 +1504,22 @@ impl CoderHandle {
 	/// Empty when the folder has none — including when no folder
 	/// is active at all (chat-only sessions aren't supported).
 	pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, CoderError> {
-		// Per-project scoping (ADR 0028): a worktree folder's sessions
-		// live under its parent project root, so list against that.
-		let Some(folder) = self.state.coder_root_folder().await else {
-			return Ok(Vec::new());
+		self.list_sessions_in(None).await
+	}
+
+	/// Folder-targeted [`Self::list_sessions`]: `folder` is a bound
+	/// folder's path (the companion's project switcher), `None`
+	/// lists the active folder's. Per-project scoping (ADR 0028):
+	/// a worktree folder's sessions live under its parent project
+	/// root, so list against that.
+	pub async fn list_sessions_in(&self, folder: Option<&str>) -> Result<Vec<SessionSummary>, CoderError> {
+		let folder_root = match folder {
+			Some(path) => self.state.coder_root_at(path).await?,
+			None => match self.state.coder_root_folder().await {
+				Some(f) => Utf8PathBuf::from(f.folder.path.clone()),
+				None => return Ok(Vec::new()),
+			},
 		};
-		let folder_root = Utf8PathBuf::from(folder.folder.path.clone());
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_root);
 		sessions::list_sessions(&dir).await
 	}
@@ -1548,7 +1589,15 @@ impl CoderHandle {
 	/// session's metadata so the panel can reference it before
 	/// the first send.
 	pub async fn new_session(&self) -> Result<SessionSummary, CoderError> {
-		let (fs, _) = self.state.active_folder_session().await?;
+		self.new_session_in(None).await
+	}
+
+	/// Folder-targeted [`Self::new_session`]: allocate the blank
+	/// session under the named bound folder instead of the active
+	/// one. Used by the bridge so the phone's project switcher can
+	/// start sessions in any folder.
+	pub async fn new_session_in(&self, folder: Option<&str>) -> Result<SessionSummary, CoderError> {
+		let (fs, _) = self.state.folder_session_or_active(folder).await?;
 		let blank = Session::new_blank();
 		let summary = blank.summary();
 		let id = blank.header.id.clone();
@@ -2348,8 +2397,16 @@ impl CoderHandle {
 	}
 
 	pub async fn open_session(&self, id: String) -> Result<SessionSummary, CoderError> {
+		self.open_session_in(None, id).await
+	}
+
+	/// Folder-targeted [`Self::open_session`]: load + replay the
+	/// session from the named bound folder's session list instead of
+	/// the active folder's. Used by the bridge so the phone's
+	/// project switcher can open sessions in any folder.
+	pub async fn open_session_in(&self, folder: Option<&str>, id: String) -> Result<SessionSummary, CoderError> {
 		sessions::validate_session_id(&id)?;
-		let (fs, folder_path) = self.state.active_folder_session().await?;
+		let (fs, folder_path) = self.state.folder_session_or_active(folder).await?;
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
 
 		// Fast path: this session id is already mounted as a
@@ -2738,8 +2795,15 @@ impl CoderHandle {
 	/// landing on either the sessions list or a fresh blank
 	/// session. Other folders' sessions are untouched.
 	pub async fn delete_session(&self, id: String) -> Result<(), CoderError> {
+		self.delete_session_in(None, id).await
+	}
+
+	/// Folder-targeted [`Self::delete_session`]. Used by the bridge
+	/// so the phone's project switcher can delete sessions in any
+	/// bound folder.
+	pub async fn delete_session_in(&self, folder: Option<&str>, id: String) -> Result<(), CoderError> {
 		sessions::validate_session_id(&id)?;
-		let (fs, folder_path) = self.state.active_folder_session().await?;
+		let (fs, folder_path) = self.state.folder_session_or_active(folder).await?;
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
 		sessions::delete(&dir, &id).await?;
 		// Drop the runtime entry (and cancel its in-flight turn,

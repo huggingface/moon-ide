@@ -211,7 +211,20 @@ pub async fn companion_enroll(
 		Ok(Some(c)) => c.ide_id, // reuse existing id on re-enroll
 		_ => crate::remote_bridge::generate_ide_id(),
 	};
-	let handle = crate::remote_bridge::spawn(bridge_url, code, ide_id, label, bridge_rpc.inner().clone());
+	// Register under this workspace's real identity (slug + catalog
+	// name) so the phone's switcher shows the workspace the user
+	// named, not the enroll label.
+	let slug = state.workspaces.workspace_id().await;
+	let meta = moon_core::app_state::load(&state.config_dir)
+		.await
+		.ok()
+		.and_then(|s| s.workspaces.into_iter().find(|m| m.id == slug));
+	let workspace = crate::remote_bridge::RemoteWorkspace {
+		id: slug.clone(),
+		name: meta.as_ref().map(|m| m.name.clone()).unwrap_or_else(|| slug.clone()),
+		last_active_at: meta.map(|m| m.last_active_at),
+	};
+	let handle = crate::remote_bridge::spawn(bridge_url, code, ide_id, label, workspace, bridge_rpc.inner().clone());
 	let mut status_rx = handle.status_receiver();
 	// Store the handle so the status/disconnect commands can reach it.
 	*state.remote_bridge.lock().await = Some(handle);

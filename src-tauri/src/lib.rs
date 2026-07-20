@@ -568,11 +568,21 @@ pub fn run() {
 					Ok(Some(cred)) => {
 						tracing::info!(bridge_url = %cred.bridge_url, "reconnecting to remote bridge with stored credential");
 						let rpc: tauri::State<'_, std::sync::Arc<dyn focus_socket::BridgeRpcHandler>> = app.state();
+						// Register under this workspace's real identity —
+						// slug + catalog name — so the phone's switcher
+						// shows "Hugging Face", not a hardcoded label.
+						let meta = loaded_state.workspaces.iter().find(|m| m.id == workspace_id);
+						let workspace = remote_bridge::RemoteWorkspace {
+							id: workspace_id.clone(),
+							name: meta.map(|m| m.name.clone()).unwrap_or_else(|| workspace_id.clone()),
+							last_active_at: meta.map(|m| m.last_active_at),
+						};
 						let handle = remote_bridge::spawn(
 							cred.bridge_url,
 							String::new(), // no code — the stored token authenticates
 							cred.ide_id,
 							"moon-ide".into(),
+							workspace,
 							rpc.inner().clone(),
 						);
 						let state: tauri::State<'_, AppState> = app.state();

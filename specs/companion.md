@@ -184,12 +184,21 @@ requested surface:
 - **Run / steer coder sessions.** Subscribe to `coder:event`,
   render the transcript, `coder_send` (send / steer), `coder_abort`.
   Session list / open / new reuse the existing `coder_*` commands.
+  Send / abort carry the phone's open `session_id` so they can't
+  land in whatever session the desktop happens to have visible.
 - **Review & commit.** Read-mostly diff review plus commit / amend /
   sync over the existing [git layer](roadmaps/phase-05-git.md).
   Diffs render on a phone; full editing does not, and isn't
   attempted.
 - **Workspace switcher.** The list of running and launchable
   workspace processes, from the `instance.sock` enumeration.
+- **Project switcher.** Inside a workspace, the phone lists the
+  bound folders (from `workspace_snapshot`, worktree folders hidden
+  — they share their parent's session list per ADR 0028) and scopes
+  the session commands with an explicit `folder` param. This is
+  phone-side targeting only: it never moves the desktop's
+  active-folder selection, which stays owned by the desktop UI (no
+  workspace-changed event exists for a remote mutation to ride).
 
 ## Remote / relay mode (Phase 14)
 
@@ -297,8 +306,15 @@ schema.
   (IDE presents an enrollment code + a stable self-assigned `ide_id` so
   reconnections rebind to the same registry entry).
 - `Register { token, workspaces }` — an enrolled IDE reports its live
-  workspaces (slug + name + last-active). Sent on connect and whenever
-  the IDE's workspace set changes.
+  workspaces (slug + catalog name + last-active — the same identity
+  the desktop shows, so the phone's switcher reads "Hugging Face",
+  not a process label). Sent on connect and whenever the IDE's
+  workspace set changes. Because moon-ide is process-per-workspace
+  (ADR 0014), every open workspace holds its **own** enrolled
+  connection under the shared `ide_id`; the bridge keys its live
+  table by connection (not by `ide_id`, which would clobber) and
+  routes `call`/`subscribe` by `(ide, workspace)`. The phone's
+  switcher sees the union.
 - `Call` / `Subscribe` gain an optional `ide` field (the owning IDE's
   id, or empty for local-carrier). The bridge resolves the carrier from
   `(ide, workspace)`.

@@ -11,9 +11,18 @@ import { BridgeSocket, clearConnection, loadConnection, type Connection } from '
 // Wire shapes mirror the bridge's read-only method results, which in
 // turn mirror moon-coder / moon-core types. Kept minimal — only the
 // fields the UI renders.
+export type WorkspaceFolder = {
+	path: string;
+	name: string;
+	/** `{ kind: "user_picked" }` or `{ kind: "worktree", … }` —
+	 * worktree folders are hidden from the phone's project switcher
+	 * (they share their parent project's session list, ADR 0028). */
+	origin?: { kind: string };
+};
+
 export type WorkspaceSnapshot = {
 	id: string;
-	folders: Array<{ path: string; name: string }>;
+	folders: WorkspaceFolder[];
 	active_folder: string | null;
 };
 
@@ -29,7 +38,6 @@ export type WorkspaceListing = {
 
 export type CoderStatus = {
 	signed_in: boolean;
-	running_turn: boolean;
 };
 
 export type SessionSummary = {
@@ -150,8 +158,18 @@ class CompanionState {
 
 	/** The workspace the user picked, or null while choosing. */
 	activeWorkspace = $state<string | null>(null);
+	/** Human-readable name of the active workspace (falls back to
+	 * the slug when the listing had none). */
+	activeWorkspaceName = $state('');
 	/** The owning IDE's id for the active workspace (empty = local). */
 	activeIde = $state('');
+
+	/** Bound folders of the active workspace (the project switcher).
+	 * Worktree folders are filtered out — they share their parent
+	 * project's session list. */
+	folders = $state<WorkspaceFolder[]>([]);
+	/** The folder (project) whose sessions the phone is browsing. */
+	activeFolder = $state<string | null>(null);
 
 	coderStatus = $state<CoderStatus | null>(null);
 	sessions = $state<SessionSummary[]>([]);
@@ -210,12 +228,70 @@ class CompanionState {
 		this.#socket = null;
 		this.connection = null;
 		this.activeWorkspace = null;
+		this.activeWorkspaceName = '';
+		this.folders = [];
+		this.activeFolder = null;
 		this.coderStatus = null;
 		this.sessions = [];
 		this.subscribed = false;
 		this.closeSession();
 		this.phase = 'pairing';
 	}
+
+	/** Clear the visible error (the banner's dismiss button). */
+	dismissError(): void {
+		this.error = null;
+	}
+
+	/** Reconnect after the PWA was backgrounded (a backgrounded tab's
+	 * WebSocket drops; the visibilitychange handler in `App.svelte`
+	 * calls this on resume). Re-opens the socket, re-subscribes the
+	 * event stream, and re-syncs the screen the user was on. */
+	async ensureConnected(): Promise<void> {
+		if (this.phase !== 'ready' || !this.connection || this.#reconnecting) {
+			return;
+		}
+		if (this.#socket?.isOpen()) {
+			return;
+		}
+		this.#reconnecting = true;
+		try {
+			const socket = new BridgeSocket(this.connection.url);
+			await socket.open();
+			this.#socket?.close();
+			this.#socket = socket;
+			this.subscribed = false;
+			this.error = null;
+			if (!this.activeWorkspace) {
+				await this.loadWorkspaces();
+				return;
+			}
+			this.#ensureSubscribed(this.activeWorkspace, this.activeIde);
+			await this.#refreshSessions();
+			if (this.activeSession) {
+				// Re-open to replay whatever streamed while we were
+				// backgrounded. Best-effort: a fresh session that never
+				// persisted has no JSONL yet, and its rows are still in
+				// memory anyway.
+				try {
+					this.rows = [];
+					await this.#call(
+						this.activeWorkspace,
+						'coder_open_session',
+						{ id: this.activeSession, folder: this.activeFolder },
+						this.activeIde,
+					);
+				} catch {
+					// Keep the in-memory transcript; the next send re-syncs.
+				}
+			}
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		} finally {
+			this.#reconnecting = false;
+		}
+	}
+	#reconnecting = false;
 
 	async #call<T>(workspace: string, method: string, params: unknown = {}, ide = ''): Promise<T> {
 		if (!this.#socket || !this.connection) {
@@ -240,16 +316,28 @@ class CompanionState {
 		}
 	}
 
-	/** Open a workspace: load its coder status + session list. */
-	async openWorkspace(workspace: string, ide = ''): Promise<void> {
+	/** Open a workspace: load its folder list (the project switcher),
+	 * coder status, and the active folder's session list. */
+	async openWorkspace(workspace: string, ide = '', name = ''): Promise<void> {
 		this.activeWorkspace = workspace;
+		this.activeWorkspaceName = name || workspace;
 		this.activeIde = ide;
+		this.folders = [];
+		this.activeFolder = null;
 		this.coderStatus = null;
 		this.sessions = [];
+		this.error = null;
 		this.loadingSessions = true;
 		try {
+			const snap = await this.#call<WorkspaceSnapshot>(workspace, 'workspace_snapshot', {}, ide);
+			this.folders = snap.folders.filter((f) => f.origin?.kind !== 'worktree');
+			// Default to the workspace's active folder when it's a
+			// switchable project; a worktree active folder falls back
+			// to the first project.
+			const active = this.folders.find((f) => f.path === snap.active_folder);
+			this.activeFolder = active?.path ?? this.folders[0]?.path ?? null;
 			this.coderStatus = await this.#call<CoderStatus>(workspace, 'coder_status', {}, ide);
-			this.sessions = await this.#call<SessionSummary[]>(workspace, 'coder_list_sessions', {}, ide);
+			this.sessions = await this.#loadSessions();
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
 		} finally {
@@ -257,24 +345,75 @@ class CompanionState {
 		}
 	}
 
+	/** Switch the phone to another project (bound folder) inside the
+	 * active workspace. Purely phone-side targeting — the desktop's
+	 * active folder is untouched. */
+	async openFolder(path: string): Promise<void> {
+		if (!this.activeWorkspace || this.activeFolder === path) {
+			return;
+		}
+		this.activeFolder = path;
+		this.closeSession();
+		this.sessions = [];
+		this.error = null;
+		this.loadingSessions = true;
+		try {
+			this.sessions = await this.#loadSessions();
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		} finally {
+			this.loadingSessions = false;
+		}
+	}
+
+	async #loadSessions(): Promise<SessionSummary[]> {
+		if (!this.activeWorkspace) {
+			return [];
+		}
+		return this.#call<SessionSummary[]>(
+			this.activeWorkspace,
+			'coder_list_sessions',
+			{ folder: this.activeFolder },
+			this.activeIde,
+		);
+	}
+
 	/** Back out of the active workspace to the switcher. */
 	closeWorkspace(): void {
 		this.activeWorkspace = null;
+		this.activeWorkspaceName = '';
 		this.activeIde = '';
+		this.folders = [];
+		this.activeFolder = null;
 		this.coderStatus = null;
 		this.sessions = [];
+		this.error = null;
 		this.closeSession();
 	}
 
-	/** Create a new coder session and open it. */
+	/** Create a new coder session and show it. The blank session is
+	 * only mounted in memory (nothing on disk until the first send),
+	 * so we deliberately don't `coder_open_session` it — that loads
+	 * the JSONL and would error with "no such file". */
 	async newSession(): Promise<void> {
 		if (!this.activeWorkspace) {
 			return;
 		}
 		try {
-			const summary = await this.#call<SessionSummary>(this.activeWorkspace, 'coder_new_session', {}, this.activeIde);
+			const summary = await this.#call<SessionSummary>(
+				this.activeWorkspace,
+				'coder_new_session',
+				{ folder: this.activeFolder },
+				this.activeIde,
+			);
 			this.sessions = [summary, ...this.sessions];
-			await this.openSession(summary.id);
+			this.#ensureSubscribed(this.activeWorkspace, this.activeIde);
+			this.activeSession = summary.id;
+			this.rows = [];
+			this.busy = false;
+			this.awaitingInput = false;
+			this.pendingPrompt = null;
+			this.error = null;
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
 		}
@@ -286,7 +425,7 @@ class CompanionState {
 			return;
 		}
 		try {
-			await this.#call(this.activeWorkspace, 'coder_delete_session', { id }, this.activeIde);
+			await this.#call(this.activeWorkspace, 'coder_delete_session', { id, folder: this.activeFolder }, this.activeIde);
 			this.sessions = this.sessions.filter((s) => s.id !== id);
 			if (this.activeSession === id) {
 				this.closeSession();
@@ -307,9 +446,10 @@ class CompanionState {
 		this.busy = false;
 		this.awaitingInput = false;
 		this.pendingPrompt = null;
+		this.error = null;
 		try {
 			this.#ensureSubscribed(this.activeWorkspace, this.activeIde);
-			await this.#call(this.activeWorkspace, 'coder_open_session', { id }, this.activeIde);
+			await this.#call(this.activeWorkspace, 'coder_open_session', { id, folder: this.activeFolder }, this.activeIde);
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
 		}
@@ -323,27 +463,29 @@ class CompanionState {
 		this.pendingPrompt = null;
 	}
 
-	/** Send a prompt to the active session. */
+	/** Send a prompt to the session the phone has open. Targeted by
+	 * `session_id` so it can't land in whatever session the desktop
+	 * happens to have visible. */
 	async sendPrompt(text: string): Promise<void> {
-		if (!this.activeWorkspace || !text.trim()) {
+		if (!this.activeWorkspace || !this.activeSession || !text.trim()) {
 			return;
 		}
 		try {
 			this.busy = true;
-			await this.#call(this.activeWorkspace, 'coder_send', { text }, this.activeIde);
+			await this.#call(this.activeWorkspace, 'coder_send', { text, session_id: this.activeSession }, this.activeIde);
 		} catch (e) {
 			this.busy = false;
 			this.error = e instanceof Error ? e.message : String(e);
 		}
 	}
 
-	/** Abort the running turn. */
+	/** Abort the open session's running turn. */
 	async abort(): Promise<void> {
-		if (!this.activeWorkspace) {
+		if (!this.activeWorkspace || !this.activeSession) {
 			return;
 		}
 		try {
-			await this.#call(this.activeWorkspace, 'coder_abort', {}, this.activeIde);
+			await this.#call(this.activeWorkspace, 'coder_abort', { session_id: this.activeSession }, this.activeIde);
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
 		}
@@ -504,8 +646,10 @@ class CompanionState {
 				this.#updateSessionTitle(str(ev, 'id'), str(ev, 'title'));
 				break;
 			case 'session_list_changed':
-				// Refresh the session list from the backend.
-				if (this.activeWorkspace) {
+				// Refresh the session list from the backend — but only
+				// when the change happened in the folder the phone is
+				// browsing (the envelope's folder is the coder root).
+				if (this.activeWorkspace && (!envelope.folder || envelope.folder === this.activeFolder)) {
 					void this.#refreshSessions();
 				}
 				break;
@@ -580,12 +724,7 @@ class CompanionState {
 			return;
 		}
 		try {
-			this.sessions = await this.#call<SessionSummary[]>(
-				this.activeWorkspace,
-				'coder_list_sessions',
-				{},
-				this.activeIde,
-			);
+			this.sessions = await this.#loadSessions();
 		} catch {
 			// Silent — the list will refresh on next manual open.
 		}

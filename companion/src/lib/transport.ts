@@ -115,6 +115,13 @@ export class BridgeSocket {
 		this.#ws = null;
 	}
 
+	/** Whether the underlying WebSocket is currently open. A
+	 * backgrounded PWA's socket drops silently; the app checks this
+	 * on resume to decide whether to reconnect. */
+	isOpen(): boolean {
+		return this.#ws?.readyState === WebSocket.OPEN;
+	}
+
 	#send(payload: unknown): Promise<ServerMessage> {
 		const ws = this.#ws;
 		if (!ws || ws.readyState !== WebSocket.OPEN) {

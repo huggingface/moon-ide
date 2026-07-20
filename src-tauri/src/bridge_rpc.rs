@@ -15,20 +15,19 @@
 //! `specs/coder.md` § Permissions). It's a scope decision: only wire
 //! up what something actually calls.
 //!
-//! The method set grows as the companion PWA's screens need it.
-//! It is **not** a security boundary — pairing is (a paired device
-//! can drive the coder, which can run anything via `bash`; same
-//! threat model as the desktop, see `specs/coder.md` § Permissions).
-//! It's a scope decision: only wire up what something actually calls.
-//!
 //! Current methods:
 //! - `coder_status` → [`CoderStatus`]
 //! - `coder_list_sessions` → `Vec<SessionSummary>`
 //! - `coder_active_session` → `Option<SessionSummary>`
-//! - `workspace_snapshot` → the folder list + active folder
-//! - `coder_open_session` / `coder_send` / `coder_abort` — drive the
-//!   active session (send a prompt, abort the turn).
-//! - `coder_new_session` / `coder_delete_session` — session lifecycle.
+//! - `workspace_snapshot` → the folder list + active folder (the
+//!   phone's project switcher)
+//! - `coder_open_session` / `coder_new_session` /
+//!   `coder_delete_session` — session lifecycle, folder-targeted via
+//!   an optional `folder` param so the phone drives any bound folder
+//!   without touching the desktop's active-folder selection.
+//! - `coder_send` / `coder_abort` — session-targeted via an optional
+//!   `session_id` (the session the phone has open), falling back to
+//!   the active folder's visible session.
 //! - `coder_respond_to_prompt` — answer an `ask_user` tool call
 //!   (Phase 14; the companion can now fully attend a coordinator
 //!   session that raises a prompt).
@@ -64,7 +63,12 @@ impl BridgeRpcHandler for BridgeRpc {
 				to_value(&status)
 			}
 			"coder_list_sessions" => {
-				let sessions = self.coder.list_sessions().await.map_err(|e| e.to_string())?;
+				let p: FolderParams = parse_params(params)?;
+				let sessions = self
+					.coder
+					.list_sessions_in(p.folder.as_deref())
+					.await
+					.map_err(|e| e.to_string())?;
 				to_value(&sessions)
 			}
 			"coder_active_session" => {
@@ -75,22 +79,46 @@ impl BridgeRpcHandler for BridgeRpc {
 				let snapshot = self.workspaces.snapshot().await;
 				to_value(&snapshot)
 			}
-			// --- Mutating: drive the active folder's visible session
-			// (the session the desktop has open). Per-folder/session
-			// targeting from the phone is a later refinement.
+			// --- Mutating: session commands. Folder-targeted — an
+			// optional `folder` param (a bound folder's path from
+			// `workspace_snapshot`) scopes the command to that
+			// folder's session list, so the phone's project switcher
+			// drives any folder without touching the desktop's
+			// active-folder selection. Absent `folder` falls back to
+			// the active folder.
 			"coder_open_session" => {
 				let p: OpenSessionParams = parse_params(params)?;
-				let summary = self.coder.open_session(p.id).await.map_err(|e| e.to_string())?;
+				let summary = self
+					.coder
+					.open_session_in(p.folder.as_deref(), p.id)
+					.await
+					.map_err(|e| e.to_string())?;
 				to_value(&summary)
 			}
 			"coder_send" => {
 				let p: SendParams = parse_params(params)?;
 				// Images aren't part of the phone composer yet.
-				self.coder.send(p.text, Vec::new()).await.map_err(|e| e.to_string())?;
+				// `session_id` (the session the phone has open) routes
+				// via `send_to` so the message can't land in whatever
+				// session the desktop happens to have visible.
+				match p.session_id {
+					Some(sid) => self
+						.coder
+						.send_to(&sid, p.text, Vec::new())
+						.await
+						.map_err(|e| e.to_string())?,
+					None => {
+						self.coder.send(p.text, Vec::new()).await.map_err(|e| e.to_string())?;
+					}
+				}
 				Ok(Value::Null)
 			}
 			"coder_abort" => {
-				self.coder.abort().await;
+				let p: AbortParams = parse_params(params)?;
+				match p.session_id {
+					Some(sid) => self.coder.abort_session(&sid).await,
+					None => self.coder.abort().await,
+				}
 				Ok(Value::Null)
 			}
 			// --- Phase 14: the companion drives sessions fully
@@ -98,12 +126,21 @@ impl BridgeRpcHandler for BridgeRpc {
 			// desktop's `#[tauri::command]`s 1:1 — same coder handle,
 			// same PromptResponse type.
 			"coder_new_session" => {
-				let summary = self.coder.new_session().await.map_err(|e| e.to_string())?;
+				let p: FolderParams = parse_params(params)?;
+				let summary = self
+					.coder
+					.new_session_in(p.folder.as_deref())
+					.await
+					.map_err(|e| e.to_string())?;
 				to_value(&summary)
 			}
 			"coder_delete_session" => {
 				let p: DeleteSessionParams = parse_params(params)?;
-				self.coder.delete_session(p.id).await.map_err(|e| e.to_string())?;
+				self
+					.coder
+					.delete_session_in(p.folder.as_deref(), p.id)
+					.await
+					.map_err(|e| e.to_string())?;
 				Ok(Value::Null)
 			}
 			"coder_respond_to_prompt" => {
@@ -149,19 +186,44 @@ impl BridgeRpcHandler for BridgeRpc {
 	}
 }
 
+/// Optional folder target shared by folder-scoped methods
+/// (`coder_list_sessions`, `coder_new_session`). `folder` is a bound
+/// folder's path from `workspace_snapshot`; absent = active folder.
+#[derive(serde::Deserialize)]
+struct FolderParams {
+	#[serde(default)]
+	folder: Option<String>,
+}
+
 #[derive(serde::Deserialize)]
 struct OpenSessionParams {
 	id: String,
+	#[serde(default)]
+	folder: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
 struct SendParams {
 	text: String,
+	/// Session to send into (routes via `send_to`). Absent = the
+	/// active folder's visible session.
+	#[serde(default)]
+	session_id: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct AbortParams {
+	/// Session whose turn to abort. Absent = the active folder's
+	/// visible session.
+	#[serde(default)]
+	session_id: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
 struct DeleteSessionParams {
 	id: String,
+	#[serde(default)]
+	folder: Option<String>,
 }
 
 #[derive(serde::Deserialize)]

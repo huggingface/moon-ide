@@ -215,13 +215,18 @@ struct ServeCtx {
 	advertise_url: String,
 	/// The TLS cert fingerprint for pairing payloads (TOFU pin).
 	fingerprint: String,
-	/// Live enrolled IDEs that currently hold an open WS connection.
-	/// Keyed by `ide_id`; the value is the IDE's outbound message sink
-	/// and its last-reported workspace list. This is the
-	/// remote-carrier half of the workspace registry;
-	/// `call`/`subscribe` for a remote-carrier workspace forward
-	/// through here (14.2).
-	live_ides: Mutex<HashMap<String, IdeConnection>>,
+	/// Live enrolled IDE connections. Keyed by a bridge-issued
+	/// per-connection id — **not** by `ide_id`, because moon-ide is
+	/// process-per-workspace (ADR 0014): one host runs one workspace
+	/// per process, every process connects with the same `ide_id`,
+	/// and keying by it made each `Register` clobber the previous
+	/// process's entry (the phone only ever saw one workspace per
+	/// host). The value carries the connection's `ide_id` and its
+	/// last-reported workspace list; `call`/`subscribe` resolve the
+	/// carrier by `(ide_id, workspace)` across all connections.
+	live_ides: Mutex<HashMap<u64, IdeConnection>>,
+	/// Monotonic counter for per-connection ids (keys of `live_ides`).
+	conn_counter: std::sync::atomic::AtomicU64,
 	/// Pending forwarded calls (Phase 14.2). Maps the bridge-issued
 	/// forward `id` to the phone connection awaiting the reply. When
 	/// the IDE replies with `ForwardResult`/`ForwardError`, the bridge
@@ -246,23 +251,26 @@ struct PendingForward {
 	/// Sink to push the reply/event back to the phone that issued the
 	/// original `call`/`subscribe`.
 	phone_sink: tokio::sync::mpsc::Sender<ServerMessage>,
-	/// The IDE this forward was sent to. Used by the disconnect sweep
-	/// (when an IDE's WS drops, all its in-flight forwards are reaped
-	/// and the phones are errored).
-	ide_id: String,
+	/// The IDE connection this forward was sent to (key of
+	/// `live_ides`). Used by the disconnect sweep (when an IDE's WS
+	/// drops, all its in-flight forwards are reaped and the phones
+	/// are errored).
+	conn_id: u64,
 }
 
-/// A currently-connected enrolled IDE (Phase 14). Held in
-/// `ServeCtx::live_ides` keyed by `ide_id`.
+/// A currently-connected enrolled IDE workspace process (Phase 14).
+/// Held in `ServeCtx::live_ides` keyed by the per-connection id.
 struct IdeConnection {
+	/// The enrolled IDE this connection authenticated as. Several
+	/// connections share one `ide_id` (one per open workspace
+	/// process on that host).
+	ide_id: String,
 	/// Sink to push messages down this IDE's WS (a forwarded `call`
 	/// or `subscribe` from a phone). Cloned from the per-connection
-	/// mpsc sender so multiple phones can talk to one IDE. Read by
-	/// the relay forwarding path (14.2); `allow` until then.
-	#[allow(dead_code)]
+	/// mpsc sender so multiple phones can talk to one IDE.
 	sink: tokio::sync::mpsc::Sender<ServerMessage>,
-	/// The workspaces this IDE last reported via `Register`. The
-	/// bridge surfaces these in the phone's `workspaces` reply
+	/// The workspaces this connection last reported via `Register`.
+	/// The bridge surfaces these in the phone's `workspaces` reply
 	/// (union with local-carrier discovery).
 	workspaces: Vec<RemoteWorkspace>,
 }
@@ -354,6 +362,7 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
 		advertise_url,
 		fingerprint: fingerprint.clone(),
 		live_ides: Mutex::new(HashMap::new()),
+		conn_counter: std::sync::atomic::AtomicU64::new(1),
 		pending_forwards: Mutex::new(HashMap::new()),
 		pending_streams: Mutex::new(HashMap::new()),
 		forward_counter: std::sync::atomic::AtomicU64::new(1),
@@ -510,10 +519,11 @@ fn spawn_control_listener(bridge_dir: Utf8PathBuf, ctx: Arc<ServeCtx>, mdns_url:
 						Ok(revoked) => {
 							if revoked {
 								tracing::info!(id = %ide_id, "revoked enrolled IDE");
-								// Also drop the live connection if
-								// present, so a revoked IDE can't keep
-								// forwarding until it reconnects.
-								ctx.live_ides.lock().await.remove(&ide_id);
+								// Also drop any live connections (one per
+								// workspace process), so a revoked IDE
+								// can't keep forwarding until it
+								// reconnects.
+								ctx.live_ides.lock().await.retain(|_, c| c.ide_id != ide_id);
 							}
 							crate::status::ControlResponse::Revoked { revoked }
 						}
@@ -637,10 +647,10 @@ async fn handle_conn(
 		}
 	});
 
-	// Track the ide_id this connection enrolled as (if any), so we can
-	// remove it from `live_ides` when the WS drops. An IDE that never
-	// enrolls (a phone) leaves this `None` and the cleanup is a no-op.
-	let conn_ide_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+	// Per-connection id — the `live_ides` key if this connection
+	// `Register`s as an IDE workspace process. A phone never
+	// registers, so its cleanup below is a no-op.
+	let conn_id = ctx.conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
 	while let Some(frame) = source.next().await {
 		let msg = frame?;
@@ -650,31 +660,28 @@ async fn handle_conn(
 			Message::Close(_) => break,
 			_ => continue,
 		};
-		handle_message(&ctx, &text, &out_tx, &conn_ide_id).await;
+		handle_message(&ctx, &text, &out_tx, conn_id).await;
 	}
 
 	drop(out_tx);
 	let _ = writer.await;
 
-	// Connection cleanup: if this was an enrolled IDE, remove it from
-	// the live-IDE table so the phone's switcher no longer lists its
-	// workspaces, and sweep all in-flight forwards for that IDE so
-	// phones awaiting replies get an error instead of hanging. The
-	// IDE reconnects on restart (its stored token means a reconnect,
-	// not a re-enroll).
-	if let Some(ide_id) = conn_ide_id.lock().await.take() {
-		{
-			let mut live = ctx.live_ides.lock().await;
-			live.remove(&ide_id);
-		}
+	// Connection cleanup: if this connection had registered as an IDE
+	// workspace process, remove it from the live table so the phone's
+	// switcher no longer lists its workspaces, and sweep all
+	// in-flight forwards for it so phones awaiting replies get an
+	// error instead of hanging. The IDE reconnects on restart (its
+	// stored token means a reconnect, not a re-enroll).
+	if let Some(conn) = ctx.live_ides.lock().await.remove(&conn_id) {
+		let ide_id = conn.ide_id;
 		// Sweep pending forwards: error every phone whose forwarded
-		// call was in-flight to this IDE.
+		// call was in-flight to this connection.
 		let mut errored = 0;
 		{
 			let mut pending = ctx.pending_forwards.lock().await;
 			let stale: Vec<u64> = pending
 				.iter()
-				.filter(|(_, pf)| pf.ide_id == ide_id)
+				.filter(|(_, pf)| pf.conn_id == conn_id)
 				.map(|(id, _)| *id)
 				.collect();
 			for id in stale {
@@ -694,7 +701,7 @@ async fn handle_conn(
 			let mut pending = ctx.pending_streams.lock().await;
 			let stale: Vec<u64> = pending
 				.iter()
-				.filter(|(_, pf)| pf.ide_id == ide_id)
+				.filter(|(_, pf)| pf.conn_id == conn_id)
 				.map(|(id, _)| *id)
 				.collect();
 			for id in stale {
@@ -709,17 +716,12 @@ async fn handle_conn(
 				}
 			}
 		}
-		tracing::info!(%ide_id, errored, "IDE disconnected; removed from live table, errored pending forwards");
+		tracing::info!(%ide_id, errored, "IDE workspace disconnected; removed from live table, errored pending forwards");
 	}
 	Ok(())
 }
 
-async fn handle_message(
-	ctx: &Arc<ServeCtx>,
-	text: &str,
-	out: &tokio::sync::mpsc::Sender<ServerMessage>,
-	conn_ide_id: &Arc<Mutex<Option<String>>>,
-) {
+async fn handle_message(ctx: &Arc<ServeCtx>, text: &str, out: &tokio::sync::mpsc::Sender<ServerMessage>, conn_id: u64) {
 	let parsed: ClientMessage = match serde_json::from_str(text) {
 		Ok(m) => m,
 		Err(err) => {
@@ -752,18 +754,13 @@ async fn handle_message(
 			handle_subscribe(ctx, &token, &workspace, &ide, out).await;
 		}
 		ClientMessage::Enroll { code, label, ide_id } => {
-			let reply = handle_enroll(ctx, &code, &label, &ide_id).await;
-			// On a successful enroll, record the ide_id so the
-			// connection cleanup removes it from `live_ides` when the
-			// WS drops. A failed enroll (bad code) leaves it unset.
-			if let ServerMessage::Enrolled { ide_id: ok_id, .. } = &reply {
-				*conn_ide_id.lock().await = Some(ok_id.clone());
-			}
-			let _ = out.send(reply).await;
+			// Enrollment only mints the token; the connection joins
+			// the live table when it `Register`s its workspaces.
+			let _ = out.send(handle_enroll(ctx, &code, &label, &ide_id).await).await;
 		}
 		ClientMessage::Register { token, workspaces } => {
 			let _ = out
-				.send(handle_register(ctx, &token, workspaces, out.clone()).await)
+				.send(handle_register(ctx, &token, workspaces, out.clone(), conn_id).await)
 				.await;
 		}
 		ClientMessage::PairCode { token } => {
@@ -834,13 +831,14 @@ async fn handle_subscribe(
 		return;
 	}
 
-	// Remote-carrier: forward the subscribe to the enrolled IDE.
+	// Remote-carrier: forward the subscribe to the IDE connection
+	// that owns `(ide, workspace)`.
 	let id = ctx.forward_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 	let live = ctx.live_ides.lock().await;
-	let Some(conn) = live.get(ide) else {
+	let Some((conn_id, conn)) = find_ide_conn(&live, ide, workspace) else {
 		let _ = out
 			.send(ServerMessage::Error {
-				message: format!("IDE `{ide}` is not connected"),
+				message: format!("IDE `{ide}` has no connected workspace `{workspace}`"),
 			})
 			.await;
 		return;
@@ -853,7 +851,7 @@ async fn handle_subscribe(
 			id,
 			PendingForward {
 				phone_sink: out.clone(),
-				ide_id: ide.to_owned(),
+				conn_id,
 			},
 		);
 	}
@@ -949,17 +947,18 @@ async fn handle_workspaces(ctx: &ServeCtx, token: &str) -> ServerMessage {
 			}
 		}
 	};
-	// Remote-carrier workspaces (enrolled IDEs in the live table, 14.1).
-	// Each is tagged with its owning IDE's id so the phone can group.
+	// Remote-carrier workspaces (enrolled IDE connections in the live
+	// table, 14.1). Each is tagged with its owning IDE's id so the
+	// phone can group by host.
 	let live = ctx.live_ides.lock().await;
-	for (ide_id, conn) in live.iter() {
+	for conn in live.values() {
 		for w in &conn.workspaces {
 			entries.push(serde_json::json!({
 				"id": w.id,
 				"name": w.name,
 				"last_active_at": w.last_active_at,
 				"live": true,
-				"ide": ide_id,
+				"ide": conn.ide_id,
 			}));
 		}
 	}
@@ -1039,25 +1038,33 @@ async fn handle_enroll(ctx: &ServeCtx, code: &str, label: &str, ide_id: &str) ->
 	}
 }
 
-/// An enrolled IDE reports its live workspaces (Phase 14.1). Verifies
-/// the IDE token, then updates the live-IDE table with the reported
-/// workspace list + this connection's sink (so 14.2's forwarding can
-/// reach the IDE). The IDE re-sends `Register` whenever its open
-/// workspace set changes, keeping the bridge's registry live without
-/// polling.
+/// An enrolled IDE workspace process reports its live workspaces
+/// (Phase 14.1). Verifies the IDE token, then upserts this
+/// connection's entry in the live table with the reported workspace
+/// list + sink (so 14.2's forwarding can reach it). Keyed by the
+/// per-connection id — several workspace processes on one host share
+/// an `ide_id` and each holds its own connection (ADR 0014).
 async fn handle_register(
 	ctx: &ServeCtx,
 	token: &str,
 	workspaces: Vec<RemoteWorkspace>,
 	sink: tokio::sync::mpsc::Sender<ServerMessage>,
+	conn_id: u64,
 ) -> ServerMessage {
 	let ide = match check_ide_token(ctx, token) {
 		Ok(ide) => ide,
 		Err(reply) => return reply,
 	};
 	let mut live = ctx.live_ides.lock().await;
-	live.insert(ide.id.clone(), IdeConnection { sink, workspaces });
-	tracing::info!(ide_id = %ide.id, "IDE registered workspaces");
+	live.insert(
+		conn_id,
+		IdeConnection {
+			ide_id: ide.id.clone(),
+			sink,
+			workspaces,
+		},
+	);
+	tracing::info!(ide_id = %ide.id, conn_id, "IDE registered workspaces");
 	ServerMessage::Result {
 		value: serde_json::json!({ "registered": true }),
 	}
@@ -1083,6 +1090,23 @@ async fn handle_pair_code(ctx: &ServeCtx, token: &str) -> ServerMessage {
 		code: payload.code,
 		fingerprint: payload.fingerprint,
 	}
+}
+
+/// Resolve the live IDE connection that owns `(ide_id, workspace)`.
+/// Several connections can share an `ide_id` (one per workspace
+/// process on that host, ADR 0014); the workspace slug picks the
+/// right one. No fallback to an ide-only match — the phone builds
+/// the pair from the `workspaces` reply, so a miss means the
+/// process is gone and the caller should error, not misroute.
+fn find_ide_conn<'a>(
+	live: &'a HashMap<u64, IdeConnection>,
+	ide_id: &str,
+	workspace: &str,
+) -> Option<(u64, &'a IdeConnection)> {
+	live
+		.iter()
+		.find(|(_, c)| c.ide_id == ide_id && c.workspaces.iter().any(|w| w.id == workspace))
+		.map(|(id, c)| (*id, c))
 }
 
 /// Check a presented IDE token. `Ok(ide)` if it maps to an enrolled
@@ -1141,15 +1165,16 @@ async fn handle_call(
 		return;
 	}
 
-	// Remote-carrier: forward to the enrolled IDE. Allocate a forward
-	// id, register the phone's sink so the `ForwardResult` reply can
-	// find it, and send the `ForwardCall` to the IDE's WS.
+	// Remote-carrier: forward to the IDE connection that owns
+	// `(ide, workspace)`. Allocate a forward id, register the
+	// phone's sink so the `ForwardResult` reply can find it, and
+	// send the `ForwardCall` to that connection's WS.
 	let id = ctx.forward_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 	let live = ctx.live_ides.lock().await;
-	let Some(conn) = live.get(ide) else {
+	let Some((conn_id, conn)) = find_ide_conn(&live, ide, workspace) else {
 		let _ = out
 			.send(ServerMessage::Error {
-				message: format!("IDE `{ide}` is not connected"),
+				message: format!("IDE `{ide}` has no connected workspace `{workspace}`"),
 			})
 			.await;
 		return;
@@ -1162,7 +1187,7 @@ async fn handle_call(
 			id,
 			PendingForward {
 				phone_sink: out.clone(),
-				ide_id: ide.to_owned(),
+				conn_id,
 			},
 		);
 	}

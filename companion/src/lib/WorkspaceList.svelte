@@ -55,8 +55,8 @@
 				<h2 class="group-header">This machine</h2>
 			{/if}
 			<div class="list">
-				{#each wss as ws (ws.id)}
-					<button class="card list-item" onclick={() => app.openWorkspace(ws.id, ws.ide ?? '')}>
+				{#each wss as ws ((ws.ide ?? '') + '/' + ws.id)}
+					<button class="card list-item" onclick={() => app.openWorkspace(ws.id, ws.ide ?? '', ws.name)}>
 						<div class="row">
 							<span class="pip" class:live={ws.live}></span>
 							<strong>{ws.name}</strong>
@@ -66,10 +66,6 @@
 				{/each}
 			</div>
 		{/each}
-	{/if}
-
-	{#if app.error}
-		<p class="error">{app.error}</p>
 	{/if}
 
 	<button class="ghost" onclick={() => app.unpair()}>Unpair this device</button>
