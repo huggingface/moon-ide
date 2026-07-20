@@ -34,3 +34,4 @@ tokio-tungstenite = "0.29"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { version = "1.18", features = ["v4"] }
+which = { workspace = true }

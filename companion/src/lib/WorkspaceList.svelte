@@ -56,13 +56,22 @@
 			{/if}
 			<div class="list">
 				{#each wss as ws ((ws.ide ?? '') + '/' + ws.id)}
-					<button class="card list-item" onclick={() => app.openWorkspace(ws.id, ws.ide ?? '', ws.name)}>
-						<div class="row">
-							<span class="pip" class:live={ws.live}></span>
-							<strong>{ws.name}</strong>
-						</div>
-						<span class="muted">{ws.live ? 'running' : 'stopped'} · {ws.id}</span>
-					</button>
+					<div class="card list-item ws-row">
+						<button class="ws-main" onclick={() => app.openWorkspace(ws.id, ws.ide ?? '', ws.name)}>
+							<div class="row">
+								<span class="pip" class:live={ws.live}></span>
+								<strong>{ws.name}</strong>
+							</div>
+							<span class="muted">{ws.live ? 'running' : 'stopped'} · {ws.id}</span>
+						</button>
+						{#if !ws.live}
+							<button
+								class="ghost launch-btn"
+								title="Start this workspace"
+								onclick={() => app.launchWorkspace(ws.id, ws.ide ?? '')}>Start</button
+							>
+						{/if}
+					</div>
 				{/each}
 			</div>
 		{/each}
@@ -72,6 +81,35 @@
 </div>
 
 <style>
+	.ws-row {
+		flex-direction: row;
+		align-items: center;
+		gap: 0.4rem;
+	}
+	.ws-main {
+		flex: 1;
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 0.2rem;
+		background: none;
+		border: none;
+		cursor: pointer;
+		text-align: left;
+		color: inherit;
+		padding: 0;
+	}
+	.ws-main strong {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.launch-btn {
+		flex: none;
+		min-height: 36px;
+		padding: 0.3rem 0.8rem;
+		font-size: 0.85rem;
+	}
 	.group-header {
 		font-size: 0.9rem;
 		text-transform: uppercase;

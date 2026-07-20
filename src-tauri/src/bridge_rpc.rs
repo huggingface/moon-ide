@@ -184,6 +184,20 @@ impl BridgeRpcHandler for BridgeRpc {
 					.map_err(|e| e.to_string())?;
 				to_value(&settings)
 			}
+			// Launch a sibling workspace process on this host. The
+			// phone asks the bridge to open a stopped workspace; the
+			// bridge forwards to the owning IDE (this method), which
+			// runs the same "focus or spawn" path as the desktop's
+			// `window_open` command. Local-carrier launches never
+			// reach here — the bridge handles those directly.
+			"workspace_launch" => {
+				let p: WorkspaceLaunchParams = parse_params(params)?;
+				let state = self.app_state()?;
+				crate::commands::window::window_open_impl(state.inner(), p.workspace_id)
+					.await
+					.map_err(|e| e.to_string())?;
+				Ok(Value::Null)
+			}
 			"coder_set_model_settings" => {
 				let p: SetModelSettingsParams = parse_params(params)?;
 				let state = self.app_state()?;
@@ -281,6 +295,11 @@ struct SetModelSettingsParams {
 	settings: moon_protocol::coder_models::CoderModelSettings,
 }
 
+#[derive(serde::Deserialize)]
+struct WorkspaceLaunchParams {
+	workspace_id: String,
+}
+
 /// Parse a method's params object, mapping a shape mismatch to an
 /// error string the phone surfaces.
 fn parse_params<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, String> {
@@ -310,6 +329,7 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 	"coder_respond_to_prompt",
 	"coder_get_model_settings",
 	"coder_set_model_settings",
+	"workspace_launch",
 	"bridge_methods",
 ];
 

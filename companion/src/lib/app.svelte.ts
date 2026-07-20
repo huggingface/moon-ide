@@ -286,6 +286,28 @@ class CompanionState {
 		this.error = null;
 	}
 
+	/** Launch a stopped workspace on its host. For a local-carrier
+	 * workspace (empty `ide`), the bridge spawns the desktop binary
+	 * directly. For a remote-carrier workspace, the bridge forwards
+	 * to the owning enrolled IDE, which runs the same "focus or
+	 * spawn" path as the desktop's `window_open`. */
+	async launchWorkspace(workspace: string, ide = ''): Promise<void> {
+		if (!this.#socket || !this.connection) {
+			return;
+		}
+		this.error = null;
+		try {
+			await this.#call(workspace, 'workspace_launch', {}, ide);
+			// Poll the workspace list so the phone sees it go live.
+			// The new process takes a moment to bind its socket; a
+			// single re-fetch after a short delay catches it, and
+			// the user can pull-to-refresh if they're early.
+			setTimeout(() => void this.loadWorkspaces(), 1500);
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
 	/** Reconnect after the PWA was backgrounded (a backgrounded tab's
 	 * WebSocket drops; the visibilitychange handler in `App.svelte`
 	 * calls this on resume). Re-opens the socket, re-subscribes the

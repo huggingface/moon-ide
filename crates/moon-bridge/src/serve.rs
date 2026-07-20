@@ -40,7 +40,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -1188,6 +1188,29 @@ async fn handle_call(
 		return;
 	}
 
+	// `workspace_launch` is bridge-level for local-carrier workspaces:
+	// the target process isn't running (that's the point), so there's
+	// no `instance.sock` to relay to. The bridge spawns the desktop
+	// binary directly — it's on the host and owns the workspaces dir.
+	// Remote-carrier launches fall through to the forward path: the
+	// enrolled IDE's `BridgeRpcHandler` runs `workspace_launch` and
+	// spawns its own sibling process (the same `window_open` path).
+	if ide.is_empty() && method == "workspace_launch" {
+		match handle_local_launch(&ctx.workspaces_dir, workspace).await {
+			Ok(()) => {
+				let _ = out
+					.send(ServerMessage::Result {
+						value: serde_json::json!({ "launched": true }),
+					})
+					.await;
+			}
+			Err(message) => {
+				let _ = out.send(ServerMessage::Error { message }).await;
+			}
+		}
+		return;
+	}
+
 	// Carrier selection (ADR 0031): empty `ide` = local-carrier
 	// (Unix socket, today's path); present `ide` = remote-carrier
 	// (forward to that enrolled IDE's held-open WS, 14.2).
@@ -1291,6 +1314,62 @@ async fn handle_call(
 /// session list), but the coder lock can be briefly contended
 /// mid-turn, so we're generous — mirrors `relay::RESPONSE_TIMEOUT`.
 const FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Spawn `moon-ide --workspace <slug>` for a local-carrier workspace
+/// the phone wants to open that isn't running yet. The desktop binary
+/// is resolved the same way `ensure_bridge_running` in `src-tauri` finds
+/// the bridge: exe-adjacent (the `--no-bundle` / dev layout), then the
+/// system PATH. Best-effort: a spawn failure surfaces as an error string
+/// the phone renders; the new process's own startup is async from here.
+///
+/// This is the "Launch" affordance from [specs/companion.md] § "What
+/// `moon-bridge` does": the bridge is the only process that can reach
+/// the host's process table for a local-carrier workspace (the phone
+/// can't, and the workspace's own `instance.sock` doesn't exist yet).
+async fn handle_local_launch(workspaces_dir: &Utf8Path, slug: &str) -> Result<(), String> {
+	use moon_protocol::workspace::validate_workspace_id;
+	validate_workspace_id(slug).map_err(|e| format!("invalid workspace id: {e}"))?;
+
+	// Already running? Focus it and return — same idempotent
+	// "focus or spawn" semantics as `window_open` on the desktop.
+	// The liveness probe is the same one `discovery` uses.
+	if crate::discovery::socket_path(workspaces_dir, slug).exists() {
+		// Best-effort connect: if it accepts, a live owner is there.
+		// We don't send a focus message (that's a desktop affordance);
+		// the phone just re-polls the workspace list and finds it live.
+		let path = crate::discovery::socket_path(workspaces_dir, slug);
+		if tokio::time::timeout(
+			std::time::Duration::from_millis(250),
+			tokio::net::UnixStream::connect(path.as_std_path()),
+		)
+		.await
+		.is_ok_and(|r| r.is_ok())
+		{
+			return Ok(());
+		}
+	}
+
+	// Resolve the desktop binary: exe-adjacent first (the layout for
+	// `--no-bundle` builds and dev runs), then fall back to PATH. The
+	// bridge binary sits next to the desktop binary in both layouts.
+	let bin_name = if cfg!(windows) { "moon-ide.exe" } else { "moon-ide" };
+	let exe = std::env::current_exe()
+		.ok()
+		.and_then(|e| e.parent().map(|p| p.join(bin_name)))
+		.filter(|p| p.exists())
+		.or_else(|| which::which(bin_name).ok());
+
+	let exe = exe.ok_or_else(|| format!("could not find the `{bin_name}` binary next to the bridge or on PATH"))?;
+
+	std::process::Command::new(&exe)
+		.arg("--workspace")
+		.arg(slug)
+		.spawn()
+		.map_err(|e| format!("failed to spawn `{}` for `{slug}`: {e}", exe.display()))?;
+
+	tracing::info!(%slug, "launched workspace from phone");
+	Ok(())
+}
 
 /// How often each connection's writer sends a WS Ping. Peers
 /// auto-pong, giving the read loop steady traffic to prove liveness

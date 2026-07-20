@@ -198,6 +198,13 @@ requested surface:
   attempted.
 - **Workspace switcher.** The list of running and launchable
   workspace processes, from the `instance.sock` enumeration.
+  Stopped workspaces show a **Start** button: the phone calls
+  `workspace_launch` on the bridge, which spawns `moon-ide --workspace
+<slug>` directly for local-carrier workspaces (the bridge is on the
+  host and owns the workspaces dir), or forwards to the owning
+  enrolled IDE for remote-carrier workspaces (the IDE runs its own
+  `window_open` "focus or spawn" path). Either way the phone
+  re-polls the list after ~1.5 s and the workspace appears live.
 - **Provider switch.** The workspace view surfaces the active LLM
   provider (HF or a configured user provider) with the per-workspace
   lock toggle, via `coder_get_model_settings` /

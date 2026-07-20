@@ -41,6 +41,13 @@ use crate::state::AppState;
 /// launcher's restore pick reflect the user's last touch.
 #[tauri::command]
 pub async fn window_open(state: State<'_, AppState>, workspace_id: String) -> Result<(), MoonError> {
+	window_open_impl(&state, workspace_id).await
+}
+
+/// Body of [`window_open`], shared with the bridge RPC surface
+/// (`crate::bridge_rpc`) so a "launch workspace" from the phone uses
+/// the exact same "focus or spawn" path as the desktop picker.
+pub(crate) async fn window_open_impl(state: &AppState, workspace_id: String) -> Result<(), MoonError> {
 	validate_workspace_id(&workspace_id)?;
 
 	if Some(workspace_id.as_str()) == state.workspace_id() {
@@ -54,7 +61,7 @@ pub async fn window_open(state: State<'_, AppState>, workspace_id: String) -> Re
 		focus_socket::send_focus(&state.workspaces_dir, &workspace_id)
 			.await
 			.map_err(|err| MoonError::Internal(format!("failed to focus existing window: {err}")))?;
-		bump_last_active(&state, &workspace_id).await;
+		bump_last_active(state, &workspace_id).await;
 		return Ok(());
 	}
 
@@ -62,7 +69,7 @@ pub async fn window_open(state: State<'_, AppState>, workspace_id: String) -> Re
 	// can actually spawn the child — in dev mode the user
 	// is told to restart `bun run dev`, and the next launch
 	// should restore the workspace they just asked for.
-	bump_last_active(&state, &workspace_id).await;
+	bump_last_active(state, &workspace_id).await;
 
 	if cfg!(debug_assertions) {
 		return Err(MoonError::invalid(format!(
