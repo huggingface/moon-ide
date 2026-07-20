@@ -22,6 +22,14 @@
 			void app.deleteSession(id);
 		}
 	}
+
+	/** Provider picker disclosure (collapsed by default). */
+	let providerOpen = $state(false);
+
+	function pickProvider(id: string | null): void {
+		providerOpen = false;
+		void app.setProvider(id);
+	}
 </script>
 
 <div class="screen">
@@ -50,6 +58,44 @@
 	{#if app.coderStatus && !app.coderStatus.signed_in}
 		<div class="card">
 			<span class="muted">Coder is not signed in on the desktop — sign in there first.</span>
+		</div>
+	{/if}
+
+	{#if app.modelSettings}
+		{@const settings = app.modelSettings}
+		{@const activeId = settings.active_provider ?? null}
+		<div class="card provider-card">
+			<button class="provider-row" onclick={() => (providerOpen = !providerOpen)} disabled={app.savingProvider}>
+				<span class="muted">Provider</span>
+				<strong class="provider-name">{app.providerLabel(activeId)}</strong>
+				<span class="chevron">{providerOpen ? '▴' : '▾'}</span>
+			</button>
+			{#if providerOpen}
+				<div class="provider-options">
+					<button class="provider-option" class:selected={activeId === null} onclick={() => pickProvider(null)}>
+						Hugging Face
+					</button>
+					{#each settings.providers as p (p.id)}
+						<button class="provider-option" class:selected={activeId === p.id} onclick={() => pickProvider(p.id)}>
+							{p.label || p.id}
+						</button>
+					{/each}
+				</div>
+			{/if}
+			<label class="lock-row">
+				<input
+					type="checkbox"
+					checked={settings.provider_lock != null}
+					disabled={app.savingProvider}
+					onchange={(e) => app.setProviderLock((e.target as HTMLInputElement).checked)}
+				/>
+				<span class="muted">
+					Locked to this workspace
+					{#if settings.provider_lock}
+						— ignores the global default
+					{/if}
+				</span>
+			</label>
 		</div>
 	{/if}
 
@@ -116,6 +162,64 @@
 		color: var(--accent-fg);
 		background: var(--accent);
 		border-color: var(--accent);
+	}
+	.provider-card {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+		padding: 0.6rem 0.8rem;
+	}
+	.provider-row {
+		display: flex;
+		align-items: center;
+		gap: 0.6rem;
+		background: none;
+		border: none;
+		padding: 0;
+		min-height: 32px;
+		text-align: left;
+		color: inherit;
+	}
+	.provider-name {
+		flex: 1;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.chevron {
+		color: var(--fg-muted);
+	}
+	.provider-options {
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
+	}
+	.provider-option {
+		background: none;
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		color: var(--fg);
+		text-align: left;
+		padding: 0.4rem 0.6rem;
+		min-height: 40px;
+		font-size: 0.9rem;
+	}
+	.provider-option.selected {
+		border-color: var(--accent);
+		background: var(--bg-elev-2);
+	}
+	.lock-row {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		font-size: 0.85rem;
+		min-height: 28px;
+	}
+	.lock-row input {
+		width: auto;
+		min-height: 0;
+		accent-color: var(--accent);
 	}
 	.session-row {
 		/* The global `.list-item` stacks children vertically (for the

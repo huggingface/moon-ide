@@ -850,8 +850,15 @@ async fn active_folder_path(state: &AppState) -> Option<String> {
 /// route writes correctly.
 #[tauri::command]
 pub async fn coder_get_model_settings(state: State<'_, AppState>) -> Result<CoderModelSettings, MoonError> {
+	get_model_settings_impl(&state).await
+}
+
+/// Body of [`coder_get_model_settings`], shared with the bridge RPC
+/// surface (`crate::bridge_rpc`) so the companion's provider screen
+/// reads the exact same shape the desktop picker does.
+pub(crate) async fn get_model_settings_impl(state: &AppState) -> Result<CoderModelSettings, MoonError> {
 	let models = state.coder.current_models().await;
-	let provider_lock = workspace_provider_lock(&state).await;
+	let provider_lock = workspace_provider_lock(state).await;
 	Ok(CoderModelSettings {
 		standard_model: models.standard,
 		cheap_model: models.cheap,
@@ -929,6 +936,15 @@ pub async fn coder_set_model_settings(
 	state: State<'_, AppState>,
 	settings: CoderModelSettings,
 ) -> Result<(), MoonError> {
+	set_model_settings_impl(&state, settings).await
+}
+
+/// Body of [`coder_set_model_settings`], shared with the bridge RPC
+/// surface (`crate::bridge_rpc`) so a provider switch from the
+/// companion applies + persists identically to one from the desktop
+/// picker (runner poke, per-workspace lock in `session.json`, global
+/// default in `state.json`).
+pub(crate) async fn set_model_settings_impl(state: &AppState, settings: CoderModelSettings) -> Result<(), MoonError> {
 	let bill_to = if settings.bill_to.is_empty() {
 		None
 	} else {
@@ -953,7 +969,7 @@ pub async fn coder_set_model_settings(
 	// retries against an unchanged baseline. (Reverse order
 	// would mean a transient session-write failure silently
 	// promoted a workspace pin to the global default.)
-	write_workspace_provider_lock(&state, provider_lock.clone()).await?;
+	write_workspace_provider_lock(state, provider_lock.clone()).await?;
 
 	let lock_active_provider = match &provider_lock {
 		Some(CoderProviderLock::Hf) => Some(None),

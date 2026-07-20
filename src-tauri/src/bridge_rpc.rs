@@ -43,14 +43,32 @@ use crate::focus_socket::BridgeRpcHandler;
 /// Concrete [`BridgeRpcHandler`] holding the handles the methods
 /// dispatch against. One per process, built in `lib::run`'s setup
 /// and handed to the focus listener.
+///
+/// `app` reaches the Tauri-managed [`crate::state::AppState`] for
+/// the model-settings methods, which share their bodies with the
+/// desktop's `#[tauri::command]`s. It's captured before
+/// `app.manage(state)` runs, so those methods resolve it lazily via
+/// `try_state` — by the time anything dispatches (focus listener /
+/// remote bridge, both spawned after setup) the state is managed.
 pub struct BridgeRpc {
 	coder: CoderHandle,
 	workspaces: Arc<WorkspaceRegistry>,
+	app: tauri::AppHandle,
 }
 
 impl BridgeRpc {
-	pub fn new(coder: CoderHandle, workspaces: Arc<WorkspaceRegistry>) -> Self {
-		Self { coder, workspaces }
+	pub fn new(coder: CoderHandle, workspaces: Arc<WorkspaceRegistry>, app: tauri::AppHandle) -> Self {
+		Self { coder, workspaces, app }
+	}
+
+	/// The Tauri-managed [`AppState`], or an error string for the
+	/// (should-be-impossible) dispatch-before-setup window.
+	fn app_state(&self) -> Result<tauri::State<'_, crate::state::AppState>, String> {
+		use tauri::Manager;
+		self
+			.app
+			.try_state::<crate::state::AppState>()
+			.ok_or_else(|| "app state not ready yet".to_owned())
 	}
 }
 
@@ -154,6 +172,26 @@ impl BridgeRpcHandler for BridgeRpc {
 				let accepted = self.coder.respond_to_prompt(&p.call_id, p.response).await;
 				Ok(serde_json::json!({ "accepted": accepted }))
 			}
+			// --- Model / provider settings. Same bodies as the
+			// desktop picker's commands, so a provider switch from
+			// the phone applies + persists identically (runner poke,
+			// per-workspace lock in `session.json`, global default in
+			// `state.json`).
+			"coder_get_model_settings" => {
+				let state = self.app_state()?;
+				let settings = crate::commands::coder::get_model_settings_impl(&state)
+					.await
+					.map_err(|e| e.to_string())?;
+				to_value(&settings)
+			}
+			"coder_set_model_settings" => {
+				let p: SetModelSettingsParams = parse_params(params)?;
+				let state = self.app_state()?;
+				crate::commands::coder::set_model_settings_impl(&state, p.settings)
+					.await
+					.map_err(|e| e.to_string())?;
+				Ok(Value::Null)
+			}
 			"bridge_methods" => Ok(serde_json::json!({
 				"methods": SUPPORTED_METHODS,
 				"streams": SUPPORTED_STREAMS,
@@ -238,6 +276,11 @@ struct RespondToPromptParams {
 	response: moon_coder::PromptResponse,
 }
 
+#[derive(serde::Deserialize)]
+struct SetModelSettingsParams {
+	settings: moon_protocol::coder_models::CoderModelSettings,
+}
+
 /// Parse a method's params object, mapping a shape mismatch to an
 /// error string the phone surfaces.
 fn parse_params<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, String> {
@@ -265,6 +308,8 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 	"coder_new_session",
 	"coder_delete_session",
 	"coder_respond_to_prompt",
+	"coder_get_model_settings",
+	"coder_set_model_settings",
 	"bridge_methods",
 ];
 

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { app, type AskUserQuestion } from './app.svelte';
+	import Markdown from './Markdown.svelte';
 
 	let draft = $state('');
 
@@ -123,7 +124,7 @@
 					</details>
 				{/if}
 				{#if row.text}
-					<div class="bubble assistant">{row.text}</div>
+					<div class="bubble assistant"><Markdown text={row.text} /></div>
 				{/if}
 			{:else if row.kind === 'tool'}
 				<details class="tool" class:error={row.status === 'error'}>
@@ -273,13 +274,14 @@
 	.bubble {
 		padding: 0.5rem 0.7rem;
 		border-radius: var(--radius);
-		white-space: pre-wrap;
 		word-break: break-word;
 	}
 	.bubble.user {
 		background: var(--bg-elev-2);
 		align-self: flex-end;
 		max-width: 85%;
+		/* User text is plain (not markdown) — keep typed newlines. */
+		white-space: pre-wrap;
 	}
 	.bubble.user.queued {
 		opacity: 0.6;

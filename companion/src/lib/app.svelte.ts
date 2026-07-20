@@ -40,6 +40,28 @@ export type CoderStatus = {
 	signed_in: boolean;
 };
 
+/** One user-added provider (mirror of `CoderProviderConfig`; only
+ * the fields the phone renders, the rest round-trips untouched). */
+export type ProviderEntry = {
+	id: string;
+	label: string;
+	[key: string]: unknown;
+};
+
+/** Per-workspace provider lock (mirror of `CoderProviderLock`). */
+export type ProviderLock = { kind: 'hf' } | { kind: 'user'; id: string };
+
+/** Mirror of `CoderModelSettings` — the read/write payload of
+ * `coder_get_model_settings` / `coder_set_model_settings`. The index
+ * signature keeps fields the phone doesn't know about round-tripping
+ * unmodified on writes. */
+export type ModelSettings = {
+	active_provider?: string | null;
+	providers: ProviderEntry[];
+	provider_lock?: ProviderLock | null;
+	[key: string]: unknown;
+};
+
 export type SessionSummary = {
 	id: string;
 	title: string;
@@ -183,6 +205,11 @@ class CompanionState {
 	activeFolder = $state<string | null>(null);
 
 	coderStatus = $state<CoderStatus | null>(null);
+	/** Model/provider settings for the open workspace, or null while
+	 * loading / when the workspace's IDE predates the methods. */
+	modelSettings = $state<ModelSettings | null>(null);
+	/** True while a provider switch / lock toggle is in flight. */
+	savingProvider = $state(false);
 	sessions = $state<SessionSummary[]>([]);
 	loadingSessions = $state(false);
 
@@ -247,6 +274,7 @@ class CompanionState {
 		this.folders = [];
 		this.activeFolder = null;
 		this.coderStatus = null;
+		this.modelSettings = null;
 		this.sessions = [];
 		this.#subscriptions.clear();
 		this.closeSession();
@@ -347,6 +375,7 @@ class CompanionState {
 			const active = this.folders.find((f) => f.path === snap.active_folder);
 			this.activeFolder = active?.path ?? this.folders[0]?.path ?? null;
 			this.coderStatus = await this.#call<CoderStatus>(workspace, 'coder_status', {}, ide);
+			void this.#loadModelSettings();
 			this.sessions = await this.#loadSessions();
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
@@ -396,9 +425,85 @@ class CompanionState {
 		this.folders = [];
 		this.activeFolder = null;
 		this.coderStatus = null;
+		this.modelSettings = null;
 		this.sessions = [];
 		this.error = null;
 		this.closeSession();
+	}
+
+	/** Best-effort read of the workspace's model/provider settings.
+	 * An IDE build that predates the methods just leaves the
+	 * provider card hidden. */
+	async #loadModelSettings(): Promise<void> {
+		if (!this.activeWorkspace) {
+			return;
+		}
+		try {
+			this.modelSettings = await this.#call<ModelSettings>(
+				this.activeWorkspace,
+				'coder_get_model_settings',
+				{},
+				this.activeIde,
+			);
+		} catch {
+			this.modelSettings = null;
+		}
+	}
+
+	/** Display label for a provider id (`null` = the implicit HF
+	 * route). Falls back to the raw id for a stale entry. */
+	providerLabel(id: string | null | undefined): string {
+		if (!id) {
+			return 'Hugging Face';
+		}
+		return this.modelSettings?.providers.find((p) => p.id === id)?.label || id;
+	}
+
+	/** Switch the workspace's active provider (`null` = Hugging
+	 * Face). When the workspace is locked, the lock is rewritten to
+	 * the new pick — same semantics as the desktop picker, where a
+	 * locked save interprets `active_provider` as the lock's value
+	 * and leaves the global default untouched. */
+	async setProvider(id: string | null): Promise<void> {
+		const settings = this.modelSettings;
+		if (!this.activeWorkspace || !settings) {
+			return;
+		}
+		this.savingProvider = true;
+		try {
+			const next: ModelSettings = { ...settings, active_provider: id };
+			if (settings.provider_lock) {
+				next.provider_lock = id ? { kind: 'user', id } : { kind: 'hf' };
+			}
+			await this.#call(this.activeWorkspace, 'coder_set_model_settings', { settings: next }, this.activeIde);
+			this.modelSettings = next;
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		} finally {
+			this.savingProvider = false;
+		}
+	}
+
+	/** Toggle the per-workspace provider lock. Locking pins the
+	 * current provider; unlocking makes the workspace follow (and
+	 * writes) the global default — desktop-picker semantics. */
+	async setProviderLock(locked: boolean): Promise<void> {
+		const settings = this.modelSettings;
+		if (!this.activeWorkspace || !settings) {
+			return;
+		}
+		this.savingProvider = true;
+		try {
+			const active = settings.active_provider ?? null;
+			const lock: ProviderLock | null = locked ? (active ? { kind: 'user', id: active } : { kind: 'hf' }) : null;
+			const next: ModelSettings = { ...settings, provider_lock: lock };
+			await this.#call(this.activeWorkspace, 'coder_set_model_settings', { settings: next }, this.activeIde);
+			this.modelSettings = next;
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		} finally {
+			this.savingProvider = false;
+		}
 	}
 
 	/** Create a new coder session and show it. The blank session is

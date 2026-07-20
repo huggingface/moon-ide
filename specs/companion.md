@@ -198,6 +198,13 @@ requested surface:
   attempted.
 - **Workspace switcher.** The list of running and launchable
   workspace processes, from the `instance.sock` enumeration.
+- **Provider switch.** The workspace view surfaces the active LLM
+  provider (HF or a configured user provider) with the per-workspace
+  lock toggle, via `coder_get_model_settings` /
+  `coder_set_model_settings` — the same read/write payload and
+  semantics as the desktop picker (a locked save pins the workspace;
+  an unlocked save writes the global default). Provider CRUD and
+  API keys stay desktop-only.
 - **Project switcher.** Inside a workspace, the phone lists the
   bound folders (from `workspace_snapshot`, worktree folders hidden
   — they share their parent's session list per ADR 0028) and scopes
