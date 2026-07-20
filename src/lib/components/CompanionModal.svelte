@@ -2,6 +2,7 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { renderSVG } from 'uqr';
 	import { ipc, type PairingQr } from '../ipc';
+	import { formatError } from '../protocol';
 	import { companion } from '../companion.svelte';
 
 	// The store owns the polled status (shared with the status-bar
@@ -42,7 +43,7 @@
 			localPair = await ipc.companion.pairCode();
 		} catch (err) {
 			localPair = null;
-			localPairError = String(err);
+			localPairError = formatError(err);
 		}
 	}
 
@@ -76,7 +77,7 @@
 			enrollUrl = '';
 			enrollCode = '';
 		} catch (err) {
-			enrollError = String(err);
+			enrollError = formatError(err);
 		} finally {
 			enrolling = false;
 		}
@@ -100,7 +101,7 @@
 			remotePair = await ipc.companion.remotePairCode();
 		} catch (err) {
 			remotePair = null;
-			remotePairError = String(err);
+			remotePairError = formatError(err);
 		}
 	}
 
