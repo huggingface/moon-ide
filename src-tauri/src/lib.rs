@@ -249,6 +249,7 @@ pub fn run() {
 			commands::coder::coder_resume_from_assistant,
 			commands::coder::coder_rerun_tool_call,
 			commands::coder::coder_list_sessions,
+			commands::coder::coder_search_sessions,
 			commands::coder::coder_active_session,
 			commands::coder::coder_last_opened_session,
 			commands::coder::coder_new_session,

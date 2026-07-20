@@ -1716,6 +1716,123 @@ pub async fn list_sessions(dir: &Utf8Path) -> Result<Vec<SessionSummary>, CoderE
 	Ok(summaries)
 }
 
+/// Search every top-level session in `dir` for a case-insensitive
+/// substring and return the matching session ids (no particular
+/// order — the panel filters its already-sorted list by id, so
+/// ordering here would be redundant work). Powers the session
+/// list's search box.
+///
+/// Matches against the *parsed* records — user prompts, assistant
+/// text + thinking, tool calls (name + arguments) and tool
+/// results, titles, persisted errors — never the raw JSONL bytes.
+/// A raw scan would false-positive on base64 image payloads and
+/// signed thinking blocks, whose alphabets contain most short
+/// query strings. Each file is scanned line-by-line and abandoned
+/// at the first match, so the common "query narrows to a few
+/// sessions" case doesn't pay for full transcripts. Unreadable
+/// files are skipped with a warning, same policy as
+/// [`list_sessions`]. Empty / whitespace-only queries yield an
+/// empty result — the caller shouldn't be filtering at all then.
+pub async fn search_sessions(dir: &Utf8Path, query: &str) -> Result<Vec<String>, CoderError> {
+	let needle = query.trim().to_lowercase();
+	if needle.is_empty() {
+		return Ok(Vec::new());
+	}
+	if !tokio::fs::try_exists(dir.as_std_path()).await.unwrap_or(false) {
+		return Ok(Vec::new());
+	}
+	let mut read_dir = tokio::fs::read_dir(dir.as_std_path()).await.map_err(CoderError::from)?;
+	let mut ids: Vec<String> = Vec::new();
+	while let Some(entry) = read_dir.next_entry().await.map_err(CoderError::from)? {
+		let path = entry.path();
+		if path.extension().and_then(|s| s.to_str()) != Some(SESSION_EXT) {
+			continue;
+		}
+		let utf8 = match Utf8PathBuf::from_path_buf(path) {
+			Ok(p) => p,
+			Err(_) => continue,
+		};
+		let Some(id) = utf8.file_stem() else {
+			continue;
+		};
+		match session_matches(&utf8, &needle).await {
+			Ok(true) => ids.push(id.to_string()),
+			Ok(false) => {}
+			Err(err) => {
+				tracing::warn!(error = %err, path = %utf8, "skipping unreadable session file in search");
+			}
+		}
+	}
+	Ok(ids)
+}
+
+/// Does one session file's title or transcript contain `needle`
+/// (already lowercased)? Streams the file and returns at the first
+/// hit. Broken lines are tolerated the same way [`load_summary`]
+/// tolerates them — a crash mid-write shouldn't hide the session
+/// from search.
+async fn session_matches(path: &Utf8Path, needle: &str) -> Result<bool, CoderError> {
+	let file = tokio::fs::File::open(path.as_std_path())
+		.await
+		.map_err(CoderError::from)?;
+	let mut reader = BufReader::new(file);
+	let mut header_line = String::new();
+	reader.read_line(&mut header_line).await.map_err(CoderError::from)?;
+	if let Ok(header) = serde_json::from_str::<SessionHeader>(header_line.trim_end()) {
+		if header.title.to_lowercase().contains(needle) {
+			return Ok(true);
+		}
+	}
+	let mut line = String::new();
+	loop {
+		line.clear();
+		let read = reader.read_line(&mut line).await.map_err(CoderError::from)?;
+		if read == 0 {
+			return Ok(false);
+		}
+		let trimmed = line.trim();
+		if trimmed.is_empty() {
+			continue;
+		}
+		let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+			continue;
+		};
+		if pi_wire_to_records(&value).iter().any(|r| record_matches(r, needle)) {
+			return Ok(true);
+		}
+	}
+}
+
+/// The record-level match predicate behind [`search_sessions`].
+/// Covers the fields a user would think of as "the transcript":
+/// prompts, assistant prose + reasoning, tool calls (a file path in
+/// an `edit_file` argument is a natural thing to search for) and
+/// their results, title renames, persisted errors. Metadata-only
+/// records (usage, todos snapshots, compaction bookkeeping,
+/// sub-agent lifecycle) don't participate.
+fn record_matches(record: &SessionRecord, needle: &str) -> bool {
+	let contains = |s: &str| s.to_lowercase().contains(needle);
+	match record {
+		SessionRecord::User { text, .. } => contains(text),
+		SessionRecord::Assistant {
+			content,
+			thinking,
+			tool_calls,
+			..
+		} => {
+			content.as_deref().is_some_and(contains)
+				|| thinking.as_deref().is_some_and(contains)
+				|| tool_calls
+					.iter()
+					.any(|c| contains(&c.function.name) || contains(&c.function.arguments))
+		}
+		SessionRecord::Tool { content, .. } => contains(content),
+		SessionRecord::TitleUpdate { title } => contains(title),
+		SessionRecord::Error { message } => contains(message),
+		_ => false,
+	}
+}
+
 /// Read the JSONL header line of a session file and project it onto
 /// a [`SessionSummary`]. Also scans the rest of the file for
 /// [`SessionRecord::TitleUpdate`] entries and folds the last one
@@ -3248,6 +3365,63 @@ mod tests {
 		assert_eq!(found, Some(session_path(&sub_dir, "sub-child")));
 		let not_found = find_subagent_session(&dir, "sess-parent").await;
 		assert_eq!(not_found, None);
+	}
+
+	#[tokio::test]
+	async fn search_sessions_matches_transcript_text_case_insensitively() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+
+		let bridge = make_test_header("sess-bridge");
+		append_record(
+			&dir,
+			&bridge,
+			&SessionRecord::User {
+				text: "wire the Bridge RPC into the panel".into(),
+				images: Vec::new(),
+			},
+		)
+		.await
+		.unwrap();
+
+		let other = make_test_header("sess-other");
+		append_record(
+			&dir,
+			&other,
+			&SessionRecord::User {
+				text: "rename the folder bar".into(),
+				images: Vec::new(),
+			},
+		)
+		.await
+		.unwrap();
+
+		// Assistant-only mention in a third session (no user prompt hit).
+		let assistant = make_test_header("sess-assistant");
+		append_record(
+			&dir,
+			&assistant,
+			&SessionRecord::Assistant {
+				content: Some("the bridge socket lives under instance.sock".into()),
+				thinking: None,
+				thinking_blocks: Vec::new(),
+				tool_calls: Vec::new(),
+				model: None,
+				stop_reason: None,
+			},
+		)
+		.await
+		.unwrap();
+
+		let mut hits = search_sessions(&dir, "BRIDGE").await.unwrap();
+		hits.sort();
+		assert_eq!(hits, vec!["sess-assistant".to_string(), "sess-bridge".to_string()]);
+
+		// Empty / whitespace query filters nothing.
+		assert!(search_sessions(&dir, "  ").await.unwrap().is_empty());
+		// Title matches count too ("sess-other title" header).
+		let title_hits = search_sessions(&dir, "sess-other title").await.unwrap();
+		assert_eq!(title_hits, vec!["sess-other".to_string()]);
 	}
 
 	#[tokio::test]

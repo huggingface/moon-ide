@@ -360,6 +360,16 @@ pub async fn coder_list_sessions(state: State<'_, AppState>) -> Result<Vec<Sessi
 	state.coder.list_sessions().await.map_err(MoonError::from)
 }
 
+/// Search the active folder's persisted sessions for a
+/// case-insensitive substring across titles and transcript text
+/// (user prompts, assistant text/thinking, tool calls/results).
+/// Returns matching session ids; the panel filters its
+/// already-loaded list client-side. Empty query → empty result.
+#[tauri::command]
+pub async fn coder_search_sessions(state: State<'_, AppState>, query: String) -> Result<Vec<String>, MoonError> {
+	state.coder.search_sessions(&query).await.map_err(MoonError::from)
+}
+
 /// Snapshot of the active in-memory session, if any. `None` for a
 /// blank session — the panel uses this to decide between "show
 /// the sessions list" and "show this session's transcript" on

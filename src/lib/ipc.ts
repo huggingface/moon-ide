@@ -393,6 +393,7 @@ export const ipc = {
 			invoke<void>('coder_resume_from_assistant', { assistantOrdinal }),
 		rerunToolCall: (toolCallId: string) => invoke<RerunToolOutcome>('coder_rerun_tool_call', { toolCallId }),
 		listSessions: () => invoke<CoderSessionSummary[]>('coder_list_sessions'),
+		searchSessions: (query: string) => invoke<string[]>('coder_search_sessions', { query }),
 		activeSession: () => invoke<CoderSessionSummary | null>('coder_active_session'),
 		lastOpenedSession: () => invoke<string | null>('coder_last_opened_session'),
 		newSession: () => invoke<CoderSessionSummary>('coder_new_session'),

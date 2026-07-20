@@ -2066,8 +2066,19 @@ class CoderPanelState {
 	 *  when it equals `path`, non-worktree sessions are preferred
 	 *  instead. See ADR 0028 for the per-project scoping rationale. */
 	setActiveFolder(path: string | null, activeFolderActual?: string | null): void {
+		const actual = activeFolderActual ?? path;
+		// No-op when neither pointer moved. `adoptWorkspaceSnapshot`
+		// funnels every snapshot through here — including adopts that
+		// only changed the folder *list* (binding a worktree folder for
+		// a fresh isolated session, removing an inactive folder). Those
+		// must not re-run the select pass below: a just-minted session
+		// isn't on disk until its first turn persists it (ADR 0028), so
+		// re-selecting would evict it back to the sessions list.
+		if (path === this.activeFolderPath && actual === this.#activeFolderActual) {
+			return;
+		}
 		this.activeFolderPath = path;
-		this.#activeFolderActual = activeFolderActual ?? path;
+		this.#activeFolderActual = actual;
 		// Clear any "agent finished, not seen yet" badge on the
 		// folder we're switching to — the user is now looking
 		// (or about to look). We only consult an existing bucket
@@ -2232,6 +2243,17 @@ class CoderPanelState {
 		const sessions = folder.sessions;
 		if (sessions === null || sessions.length === 0) {
 			return;
+		}
+		// A freshly-minted session (blank "+" session, or one just
+		// created/moved into a worktree) isn't in the on-disk list
+		// until its first turn persists it (ADR 0028), so the list
+		// can't vouch for it. If the visible session's own summary
+		// already matches this worktree context, keep it.
+		if (folder.view === 'session') {
+			const visible = folder.visibleSession().activeSession;
+			if (visible !== null && visible.id === folder.visibleSessionId && this.#sessionMatchesActiveFolder(visible)) {
+				return;
+			}
 		}
 		// Prefer the last-opened session id for this worktree
 		// context when it's still on disk. Best-effort: a load

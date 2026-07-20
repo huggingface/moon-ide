@@ -1403,6 +1403,21 @@ impl CoderHandle {
 		sessions::list_sessions(&dir).await
 	}
 
+	/// Search the active folder's on-disk sessions for a
+	/// case-insensitive substring across titles and transcript
+	/// text. Returns matching session ids — the panel filters its
+	/// already-loaded summaries client-side, so re-serialising
+	/// full summaries here would be wasted work. Same per-project
+	/// scoping as [`Self::list_sessions`].
+	pub async fn search_sessions(&self, query: &str) -> Result<Vec<String>, CoderError> {
+		let Some(folder) = self.state.coder_root_folder().await else {
+			return Ok(Vec::new());
+		};
+		let folder_root = Utf8PathBuf::from(folder.folder.path.clone());
+		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_root);
+		sessions::search_sessions(&dir, query).await
+	}
+
 	/// Resolve the on-disk JSONL path for a session id under the
 	/// active workspace folder. Used by the panel's "open trace"
 	/// affordance: the frontend takes the returned path, hands it

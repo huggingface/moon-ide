@@ -760,7 +760,11 @@ Two views sharing the right-side slot (`rightPanel.kind === 'coder'`):
   (confirmed), plus the per-row status cues described above. A
   coordinator row carries a short `coord` badge after the title so
   orchestrator sessions are visually distinct from hand-started
-  ones.
+  ones. A search box above the rows filters by transcript content:
+  the debounced query goes to `coder_search_sessions`, which scans
+  the on-disk JSONLs (summaries carry no transcript text) and
+  returns matching ids — matching parsed records, not raw JSONL
+  bytes, so base64 image payloads can't false-positive.
 
 `+` from either view opens a fresh empty session with focus in the
 composer; empty sessions don't persist until the first message. The
@@ -1326,6 +1330,7 @@ Tauri commands in `src-tauri/src/commands/coder.rs`:
 | `coder_status()`                                        | `{ signed_in, identity?, has_session, sync_enabled }`                                                         |
 | `coder_sign_out()`                                      | Drops keyring + identity                                                                                      |
 | `coder_list_sessions()`                                 | Per-session summaries for the list view                                                                       |
+| `coder_search_sessions(query)`                          | Ids of sessions whose title or transcript contains the query (case-insensitive); powers the list's search box |
 | `coder_open_session(id?)`                               | Load `id`, or create a new session; returns the active id                                                     |
 | `coder_delete_session(id)`                              | Removes JSONL (+ sub-agent subdir)                                                                            |
 | `coder_session_jsonl_path(id)`                          | Resolves a session id (parent or sub-agent) to its on-disk path; powers "open trace"                          |

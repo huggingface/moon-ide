@@ -1595,6 +1595,52 @@
 		composer?.focus();
 	}
 
+	// Sessions-list transcript search. The query goes to the backend
+	// (`coder_search_sessions` scans the on-disk JSONL transcripts —
+	// summaries carry no transcript text) which returns matching
+	// session ids; we filter the already-loaded list by id. `null`
+	// matches = no active filter (empty query). Debounced so a fast
+	// typist doesn't fan out one disk scan per keystroke.
+	let sessionSearch = $state('');
+	let sessionSearchMatches = $state<Set<string> | null>(null);
+
+	$effect(() => {
+		const query = sessionSearch.trim();
+		// Depend on the active folder too: the backend searches *its*
+		// active folder, so a folder switch must re-run the search
+		// rather than filter the new folder's list with stale ids.
+		void coder.activeFolderPath;
+		if (query === '') {
+			sessionSearchMatches = null;
+			return;
+		}
+		const timer = setTimeout(async () => {
+			try {
+				const ids = await ipc.coder.searchSessions(query);
+				// Drop stale responses: only apply if the query the
+				// round-trip was issued for is still what's typed.
+				if (sessionSearch.trim() === query) {
+					sessionSearchMatches = new Set(ids);
+				}
+			} catch (err) {
+				frontendLog('moon-ide', 'warn', `coder: session search failed: ${formatError(err)}`);
+			}
+		}, 200);
+		return () => clearTimeout(timer);
+	});
+
+	const filteredSessions = $derived.by(() => {
+		const sessions = coder.sessions;
+		const matches = sessionSearchMatches;
+		if (sessions === null) {
+			return null;
+		}
+		if (matches === null) {
+			return sessions;
+		}
+		return sessions.filter((s) => matches.has(s.id));
+	});
+
 	// Summary of the session currently visible in this folder's panel.
 	// `coder.activeSession` is null right after a session is created
 	// (it's only populated on load), so resolve from the list by the
@@ -2047,124 +2093,138 @@
 					No sessions yet. Click <strong>+</strong> above (or send a prompt) to start a fresh conversation.
 				</p>
 			{:else}
-				<ul class="session-list">
-					{#each coder.sessions as session (session.id)}
-						{@const isVisible = coder.currentSession.activeSession?.id === session.id}
-						{@const isAwaitingInput = coder.current.isSessionAwaitingInput(session.id)}
-						{@const isRunning = !isAwaitingInput && coder.current.isSessionRunning(session.id)}
-						{@const isFinished = !isAwaitingInput && !isRunning && coder.current.isSessionAttention(session.id)}
-						<li
-							class="session-row"
-							class:active={isVisible}
-							class:awaiting={isAwaitingInput}
-							class:running={isRunning}
-							class:finished={isFinished}
-						>
-							<button
-								type="button"
-								class="session-pick"
-								onclick={() => onPickSession(session.id)}
-								title={isAwaitingInput
-									? 'Agent needs your input — click to answer'
-									: isRunning
-										? 'Session is running — click to follow'
-										: isFinished
-											? 'Finished while you were away — click to open'
-											: 'Open session'}
+				{@const visibleSessions = filteredSessions ?? []}
+				<input
+					type="search"
+					class="session-search"
+					placeholder="Search transcripts…"
+					aria-label="Search session transcripts"
+					bind:value={sessionSearch}
+					spellcheck="false"
+					autocomplete="off"
+				/>
+				{#if visibleSessions.length === 0}
+					<p class="hint">No sessions match “{sessionSearch.trim()}”.</p>
+				{:else}
+					<ul class="session-list">
+						{#each visibleSessions as session (session.id)}
+							{@const isVisible = coder.currentSession.activeSession?.id === session.id}
+							{@const isAwaitingInput = coder.current.isSessionAwaitingInput(session.id)}
+							{@const isRunning = !isAwaitingInput && coder.current.isSessionRunning(session.id)}
+							{@const isFinished = !isAwaitingInput && !isRunning && coder.current.isSessionAttention(session.id)}
+							<li
+								class="session-row"
+								class:active={isVisible}
+								class:awaiting={isAwaitingInput}
+								class:running={isRunning}
+								class:finished={isFinished}
 							>
-								<div class="session-title">
-									{#if isAwaitingInput}
-										<span class="awaiting-dot" aria-hidden="true"></span>
-									{:else if isRunning}
-										<span class="running-dot" aria-hidden="true"></span>
-									{:else if isFinished}
-										<span class="finished-dot" aria-hidden="true"></span>
-									{/if}
-									<span class="session-title-text">{session.title || '(untitled)'}</span>
-									{#if isCoordinatorSession(session)}
-										<span
-											class="session-mode-badge coordinator"
-											title="Coordinator — an orchestrator that spawns and manages worker agents">coord</span
-										>
-									{/if}
-								</div>
-								<div class="session-meta">
-									{#if isAwaitingInput}
-										<span class="awaiting-label">needs input</span>
-										<span class="session-meta-sep">·</span>
-									{:else if isRunning}
-										<span class="running-label">running…</span>
-										<span class="session-meta-sep">·</span>
-									{:else if isFinished}
-										<span class="finished-label">finished</span>
-										<span class="session-meta-sep">·</span>
-									{/if}
-									{formatRelative(session.updated_at_ms)}
-								</div>
-							</button>
-							{#if sessionBranch(session)}
-								{@const branch = sessionBranch(session)}
-								{@const inWorktree = worktreeFolderForBranch(branch) !== null}
 								<button
 									type="button"
-									class="session-branch-chip"
-									class:worktree={inWorktree}
-									title={inWorktree ? `Go to the worktree on ${branch}` : `Switch this folder to ${branch}`}
-									aria-label={inWorktree ? `Go to worktree on ${branch}` : `Switch to branch ${branch}`}
-									onclick={() => onSessionBranchChip(session)}
+									class="session-pick"
+									onclick={() => onPickSession(session.id)}
+									title={isAwaitingInput
+										? 'Agent needs your input — click to answer'
+										: isRunning
+											? 'Session is running — click to follow'
+											: isFinished
+												? 'Finished while you were away — click to open'
+												: 'Open session'}
 								>
-									<BranchIcon size={11} />
-									<span class="chip-name">{branch}</span>
+									<div class="session-title">
+										{#if isAwaitingInput}
+											<span class="awaiting-dot" aria-hidden="true"></span>
+										{:else if isRunning}
+											<span class="running-dot" aria-hidden="true"></span>
+										{:else if isFinished}
+											<span class="finished-dot" aria-hidden="true"></span>
+										{/if}
+										<span class="session-title-text">{session.title || '(untitled)'}</span>
+										{#if isCoordinatorSession(session)}
+											<span
+												class="session-mode-badge coordinator"
+												title="Coordinator — an orchestrator that spawns and manages worker agents">coord</span
+											>
+										{/if}
+									</div>
+									<div class="session-meta">
+										{#if isAwaitingInput}
+											<span class="awaiting-label">needs input</span>
+											<span class="session-meta-sep">·</span>
+										{:else if isRunning}
+											<span class="running-label">running…</span>
+											<span class="session-meta-sep">·</span>
+										{:else if isFinished}
+											<span class="finished-label">finished</span>
+											<span class="session-meta-sep">·</span>
+										{/if}
+										{formatRelative(session.updated_at_ms)}
+									</div>
 								</button>
-							{/if}
-							<button
-								type="button"
-								class="icon session-row-action"
-								title="Open trace in editor"
-								aria-label="Open trace in editor"
-								onclick={(event) => onOpenTrace(event, session.id)}
-							>
-								<CodeIcon />
-							</button>
-							{#if coder.hubBucket}
-								{@const phase = hubRowState(session.id)}
-								<button
-									type="button"
-									class="icon session-row-action hub-action"
-									class:syncing={phase === 'syncing'}
-									class:synced={phase === 'synced'}
-									class:failed={phase === 'failed'}
-									title={hubRowTitle(session.id)}
-									aria-label={hubRowTitle(session.id)}
-									onclick={(event) => onUploadSession(event, session.id)}
-									disabled={phase === 'syncing'}
-								>
-									<CloudUploadIcon />
-								</button>
-								{#if coder.hubBucket.uploaded[session.id]}
+								{#if sessionBranch(session)}
+									{@const branch = sessionBranch(session)}
+									{@const inWorktree = worktreeFolderForBranch(branch) !== null}
 									<button
 										type="button"
-										class="icon session-row-action"
-										title="Open trace on Hugging Face (Alt-click to copy URL)"
-										aria-label="Open trace on Hugging Face"
-										onclick={(event) => onOpenTraceOnHub(event, session.id)}
+										class="session-branch-chip"
+										class:worktree={inWorktree}
+										title={inWorktree ? `Go to the worktree on ${branch}` : `Switch this folder to ${branch}`}
+										aria-label={inWorktree ? `Go to worktree on ${branch}` : `Switch to branch ${branch}`}
+										onclick={() => onSessionBranchChip(session)}
 									>
-										<ExternalLinkIcon />
+										<BranchIcon size={11} />
+										<span class="chip-name">{branch}</span>
 									</button>
 								{/if}
-							{/if}
-							<button
-								type="button"
-								class="icon session-row-action"
-								title="Delete session"
-								aria-label="Delete session"
-								onclick={(event) => onDeleteSession(event, session.id, session.title)}
-							>
-								<TrashIcon />
-							</button>
-						</li>
-					{/each}
-				</ul>
+								<button
+									type="button"
+									class="icon session-row-action"
+									title="Open trace in editor"
+									aria-label="Open trace in editor"
+									onclick={(event) => onOpenTrace(event, session.id)}
+								>
+									<CodeIcon />
+								</button>
+								{#if coder.hubBucket}
+									{@const phase = hubRowState(session.id)}
+									<button
+										type="button"
+										class="icon session-row-action hub-action"
+										class:syncing={phase === 'syncing'}
+										class:synced={phase === 'synced'}
+										class:failed={phase === 'failed'}
+										title={hubRowTitle(session.id)}
+										aria-label={hubRowTitle(session.id)}
+										onclick={(event) => onUploadSession(event, session.id)}
+										disabled={phase === 'syncing'}
+									>
+										<CloudUploadIcon />
+									</button>
+									{#if coder.hubBucket.uploaded[session.id]}
+										<button
+											type="button"
+											class="icon session-row-action"
+											title="Open trace on Hugging Face (Alt-click to copy URL)"
+											aria-label="Open trace on Hugging Face"
+											onclick={(event) => onOpenTraceOnHub(event, session.id)}
+										>
+											<ExternalLinkIcon />
+										</button>
+									{/if}
+								{/if}
+								<button
+									type="button"
+									class="icon session-row-action"
+									title="Delete session"
+									aria-label="Delete session"
+									onclick={(event) => onDeleteSession(event, session.id, session.title)}
+								>
+									<TrashIcon />
+								</button>
+							</li>
+						{/each}
+					</ul>
+				{/if}
 			{/if}
 		</div>
 	{:else if coder.view === 'session'}
@@ -3367,6 +3427,18 @@
 		display: flex;
 		align-items: center;
 		gap: 4px;
+	}
+	.session-search {
+		background: var(--m-bg-overlay);
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		color: var(--m-fg);
+		font-size: 12px;
+		padding: 4px 8px;
+	}
+	.session-search:focus {
+		outline: none;
+		border-color: color-mix(in srgb, var(--m-accent) 50%, transparent);
 	}
 	.session-list {
 		list-style: none;
