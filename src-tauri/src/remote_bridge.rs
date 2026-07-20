@@ -300,14 +300,21 @@ async fn run_connection_loop(
 		first_attempt = false;
 		match result {
 			Ok(()) => {
-				// Clean disconnect — stop.
+				// The bridge closed the WS cleanly — a bridge restart
+				// (redeploy, reboot) looks exactly like this. Treat it
+				// as a disconnect and reconnect with backoff; the only
+				// deliberate stop is `disconnect()` aborting the task.
+				tracing::info!("remote-bridge connection closed; reconnecting");
 				let _ = status_tx.send(RemoteBridgeStatus {
 					connected: false,
 					bridge_url: bridge_url.clone(),
 					ide_id: ide_id.clone(),
 					error: None,
 				});
-				return;
+				// A clean close means we did connect — start the
+				// backoff ladder over.
+				backoff = std::time::Duration::from_secs(1);
+				tokio::time::sleep(backoff).await;
 			}
 			Err(err) => {
 				tracing::warn!(error = %err, "remote-bridge connection lost; reconnecting");

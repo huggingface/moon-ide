@@ -52,6 +52,15 @@ use tokio::net::UnixListener;
 const BUNDLE_IDENTIFIER: &str = "moon-ide";
 
 pub fn run() {
+	// Install the ring crypto provider as the process default before
+	// anything builds a rustls config. Feature unification gives this
+	// binary both `ring` (our tokio-rustls) and `aws-lc-rs` (via
+	// reqwest), and rustls refuses to auto-pick between two providers:
+	// the remote-bridge WS client's `connect_async` would panic with
+	// "no process-level CryptoProvider" the moment it dials out.
+	// reqwest is unaffected either way (it picks its own provider).
+	let _ = rustls::crypto::ring::default_provider().install_default();
+
 	tracing_subscriber::fmt()
 		.with_env_filter(
 			tracing_subscriber::EnvFilter::try_from_default_env()
@@ -548,6 +557,31 @@ pub fn run() {
 			}
 
 			app.manage(state);
+
+			// Reconnect to a remote relay bridge when this IDE holds a
+			// stored enrollment credential (ADR 0031: the token means a
+			// reconnect, not a re-enroll). Without this, the outbound
+			// client only ever existed after an in-session enroll — an
+			// IDE restart silently dropped off the relay.
+			if matches!(mode, AppMode::Workspace { .. }) {
+				match remote_bridge::load_credential() {
+					Ok(Some(cred)) => {
+						tracing::info!(bridge_url = %cred.bridge_url, "reconnecting to remote bridge with stored credential");
+						let rpc: tauri::State<'_, std::sync::Arc<dyn focus_socket::BridgeRpcHandler>> = app.state();
+						let handle = remote_bridge::spawn(
+							cred.bridge_url,
+							String::new(), // no code — the stored token authenticates
+							cred.ide_id,
+							"moon-ide".into(),
+							rpc.inner().clone(),
+						);
+						let state: tauri::State<'_, AppState> = app.state();
+						*state.remote_bridge.blocking_lock() = Some(handle);
+					}
+					Ok(None) => {}
+					Err(err) => tracing::warn!(error = %err, "could not read remote-bridge credential"),
+				}
+			}
 
 			// Ensure the mobile-companion bridge is running for this
 			// machine (ADR 0024). Best-effort, detached, release-only:
