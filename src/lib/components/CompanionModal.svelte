@@ -44,14 +44,18 @@
 		await companion.refresh();
 	}
 
-	// Remote-bridge enroll form state (Phase 14.3).
+	// Remote-bridge enroll form state (Phase 14.3). The command
+	// resolves only once the handshake succeeds or fails, so the busy
+	// flag covers the real outcome, not just the spawn.
 	let enrollUrl = $state('');
 	let enrollCode = $state('');
 	let enrollError = $state<string | null>(null);
+	let enrolling = $state(false);
 
 	async function enrollRemote(event: Event): Promise<void> {
 		event.preventDefault();
 		enrollError = null;
+		enrolling = true;
 		try {
 			await ipc.companion.enroll(enrollUrl, enrollCode, 'moon-ide');
 			await companion.refreshRemote();
@@ -59,6 +63,8 @@
 			enrollCode = '';
 		} catch (err) {
 			enrollError = String(err);
+		} finally {
+			enrolling = false;
 		}
 	}
 
@@ -238,9 +244,9 @@
 					then enter it here.
 				</p>
 				<form onsubmit={enrollRemote} class="remote-form">
-					<input type="text" placeholder="wss://relay-box:53180" bind:value={enrollUrl} required />
-					<input type="text" placeholder="enrollment code" bind:value={enrollCode} required />
-					<button type="submit">Enroll</button>
+					<input type="text" placeholder="wss://relay-box:53180" bind:value={enrollUrl} required disabled={enrolling} />
+					<input type="text" placeholder="enrollment code" bind:value={enrollCode} required disabled={enrolling} />
+					<button type="submit" disabled={enrolling}>{enrolling ? 'Enrolling…' : 'Enroll'}</button>
 				</form>
 				{#if enrollError}
 					<p class="hint" style="color: var(--danger, #f85149)">{enrollError}</p>

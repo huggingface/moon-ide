@@ -177,9 +177,32 @@ pub async fn companion_enroll(
 		_ => crate::remote_bridge::generate_ide_id(),
 	};
 	let handle = crate::remote_bridge::spawn(bridge_url, code, ide_id, label, bridge_rpc.inner().clone());
+	let mut status_rx = handle.status_receiver();
 	// Store the handle so the status/disconnect commands can reach it.
 	*state.remote_bridge.lock().await = Some(handle);
-	Ok(())
+
+	// Wait for the handshake outcome so the UI gets real feedback: a
+	// bad code / unreachable bridge is an error here, not a silent
+	// `Ok` while the task fails in the background.
+	let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+	loop {
+		{
+			let status = status_rx.borrow();
+			if status.connected {
+				return Ok(());
+			}
+			if let Some(err) = &status.error {
+				return Err(MoonError::internal(err.clone()));
+			}
+		}
+		match tokio::time::timeout_at(deadline, status_rx.changed()).await {
+			Ok(Ok(())) => {}
+			// Sender dropped — the connection task ended without
+			// reporting; treat as failure.
+			Ok(Err(_)) => return Err(MoonError::internal("enrollment task ended unexpectedly")),
+			Err(_) => return Err(MoonError::internal("timed out waiting for the bridge; check the URL")),
+		}
+	}
 }
 
 /// Report the current remote-bridge connection status (Phase 14.3).

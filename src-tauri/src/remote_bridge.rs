@@ -589,9 +589,9 @@ impl RemoteBridgeHandle {
 		self.status_rx.borrow().clone()
 	}
 
-	/// Subscribe to status changes. Not yet wired to the UI; `allow`
-	/// until the Companion modal polls it.
-	#[allow(dead_code)]
+	/// Subscribe to status changes. `companion_enroll` awaits this to
+	/// report the enrollment outcome instead of returning before the
+	/// handshake even starts.
 	pub fn status_receiver(&self) -> tokio::sync::watch::Receiver<RemoteBridgeStatus> {
 		self.status_rx.clone()
 	}
