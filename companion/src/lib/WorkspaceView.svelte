@@ -30,6 +30,29 @@
 		providerOpen = false;
 		void app.setProvider(id);
 	}
+
+	/** Commit composer state. */
+	let commitMsg = $state('');
+	let committing = $state(false);
+
+	async function handleCommit(): Promise<void> {
+		if (!app.scmStatus || app.scmStatus.changes.total === 0) {
+			return;
+		}
+		committing = true;
+		const result = await app.commit(commitMsg);
+		committing = false;
+		if (result) {
+			commitMsg = '';
+		}
+	}
+
+	async function suggestMsg(): Promise<void> {
+		const msg = await app.suggestCommitMessage();
+		if (msg) {
+			commitMsg = msg;
+		}
+	}
 </script>
 
 <div class="screen">
@@ -104,6 +127,63 @@
 		</div>
 	{/if}
 
+	{#if app.scmStatus}
+		{@const scm = app.scmStatus}
+		<div class="card scm-card">
+			<div class="scm-head">
+				<span class="scm-branch">{scm.branch.name || 'detached HEAD'}</span>
+				{#if scm.branch.head_short_sha}
+					<span class="muted scm-sha">{scm.branch.head_short_sha}</span>
+				{/if}
+				{#if scm.branch.ahead > 0}
+					<span class="scm-ahead" title="Ahead of upstream">↑{scm.branch.ahead}</span>
+				{/if}
+				{#if scm.branch.behind > 0}
+					<span class="scm-behind" title="Behind upstream">↓{scm.branch.behind}</span>
+				{/if}
+			</div>
+			{#if scm.changes.total > 0}
+				<div class="scm-changes">
+					{#if scm.changes.added > 0}<span class="scm-change added">+{scm.changes.added}</span>{/if}
+					{#if scm.changes.modified > 0}<span class="scm-change modified">~{scm.changes.modified}</span>{/if}
+					{#if scm.changes.deleted > 0}<span class="scm-change deleted">-{scm.changes.deleted}</span>{/if}
+					<span class="muted">{scm.changes.total} file{scm.changes.total !== 1 ? 's' : ''} changed</span>
+				</div>
+				<details class="scm-files">
+					<summary>Show files</summary>
+					<div class="scm-file-list">
+						{#each scm.files as f (f.path)}
+							<div class="scm-file">
+								<span class="scm-file-status {f.status}">{f.status?.[0]?.toUpperCase()}</span>
+								<span class="scm-file-path">{f.path}</span>
+							</div>
+						{/each}
+					</div>
+				</details>
+				<div class="scm-commit">
+					<textarea
+						bind:value={commitMsg}
+						placeholder="Commit message…"
+						rows="2"
+						disabled={committing || app.committing}
+					></textarea>
+					<div class="scm-commit-actions">
+						<button class="ghost" onclick={suggestMsg} disabled={committing || app.committing} title="Suggest a message"
+							>✦</button
+						>
+						<button class="primary" onclick={handleCommit} disabled={committing || app.committing || !commitMsg.trim()}
+							>Commit</button
+						>
+					</div>
+				</div>
+			{:else}
+				<span class="muted">No changes</span>
+			{/if}
+		</div>
+	{:else if app.loadingScm}
+		<div class="card"><span class="muted">Loading SCM…</span></div>
+	{/if}
+
 	{#if app.loadingSessions}
 		<p class="muted">Loading…</p>
 	{:else if app.sessions.length === 0}
@@ -122,6 +202,11 @@
 						</strong>
 						<span class="muted">{relativeTime(s.updated_at_ms)}</span>
 					</button>
+					{#if app.busySessions.has(s.id)}
+						<span class="pip live" title="Running"></span>
+					{:else}
+						<span class="pip" title="Idle"></span>
+					{/if}
 					<button class="ghost danger" title="Delete session" onclick={() => confirmDelete(s.id, s.title)}>×</button>
 				</div>
 			{/each}
@@ -225,6 +310,124 @@
 		width: auto;
 		min-height: 0;
 		accent-color: var(--accent);
+	}
+	.scm-card {
+		display: flex;
+		flex-direction: column;
+		gap: 0.4rem;
+		padding: 0.6rem 0.8rem;
+	}
+	.scm-head {
+		display: flex;
+		align-items: center;
+		gap: 0.4rem;
+	}
+	.scm-branch {
+		font-weight: 600;
+		font-size: 0.9rem;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.scm-sha {
+		font-family: var(--mono, monospace);
+		font-size: 0.75rem;
+	}
+	.scm-ahead {
+		font-size: 0.75rem;
+		color: var(--accent);
+	}
+	.scm-behind {
+		font-size: 0.75rem;
+		color: var(--fg-muted);
+	}
+	.scm-changes {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		font-size: 0.85rem;
+	}
+	.scm-change {
+		font-weight: 600;
+		font-size: 0.8rem;
+	}
+	.scm-change.added {
+		color: #3fb950;
+	}
+	.scm-change.modified {
+		color: #d29922;
+	}
+	.scm-change.deleted {
+		color: #f85149;
+	}
+	.scm-files summary {
+		cursor: pointer;
+		font-size: 0.8rem;
+		color: var(--fg-muted);
+	}
+	.scm-file-list {
+		display: flex;
+		flex-direction: column;
+		gap: 0.15rem;
+		margin-top: 0.3rem;
+		max-height: 200px;
+		overflow-y: auto;
+	}
+	.scm-file {
+		display: flex;
+		align-items: center;
+		gap: 0.4rem;
+		font-size: 0.8rem;
+	}
+	.scm-file-status {
+		flex: none;
+		width: 1.2rem;
+		text-align: center;
+		font-weight: 700;
+		font-size: 0.7rem;
+	}
+	.scm-file-status.added {
+		color: #3fb950;
+	}
+	.scm-file-status.modified {
+		color: #d29922;
+	}
+	.scm-file-status.deleted {
+		color: #f85149;
+	}
+	.scm-file-status.untracked {
+		color: #3fb950;
+	}
+	.scm-file-status.conflicted {
+		color: #f85149;
+	}
+	.scm-file-path {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-family: var(--mono, monospace);
+		font-size: 0.75rem;
+	}
+	.scm-commit {
+		display: flex;
+		flex-direction: column;
+		gap: 0.4rem;
+	}
+	.scm-commit textarea {
+		resize: none;
+		font: inherit;
+		background: var(--bg-elev);
+		color: var(--fg);
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		padding: 0.4rem 0.5rem;
+	}
+	.scm-commit-actions {
+		display: flex;
+		gap: 0.4rem;
+	}
+	.scm-commit-actions .primary {
+		flex: 1;
 	}
 	.session-row {
 		/* The global `.list-item` stacks children vertically (for the

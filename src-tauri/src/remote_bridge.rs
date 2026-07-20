@@ -568,6 +568,20 @@ async fn connect_and_serve(
 							return;
 						}
 					};
+					// Ack the stream immediately with a synthetic
+					// event so the bridge marks it live before its
+					// startup timeout — an idle coder can go
+					// arbitrarily long before the first real event,
+					// and the bridge would otherwise reap the
+					// stream as dead. The phone's reducer ignores
+					// unknown event kinds.
+					let ack = IdeToBridge::ForwardEvent {
+						id,
+						event: serde_json::json!({ "event": { "kind": "stream_opened" } }),
+					};
+					if let Ok(json) = serde_json::to_string(&ack) {
+						let _ = sink.lock().await.send(Message::Text(json.into())).await;
+					}
 					while let Some(event) = rx.recv().await {
 						let frame = IdeToBridge::ForwardEvent { id, event };
 						let json = match serde_json::to_string(&frame) {

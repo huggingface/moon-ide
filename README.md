@@ -127,6 +127,7 @@ moon-bridge serve --bind 127.0.0.1:53180 \
 
 Notes:
 
+- Build the binary on a machine whose glibc is **not newer** than the relay box's (e.g. inside the `moon-base` workspace container, Debian 12) — a binary built against a newer glibc refuses to start there.
 - `--no-idle-exit` keeps the relay up with zero local workspaces (the local auto-spawned bridge must **not** set it); `--advertise-url` is what pairing QRs point phones at.
 - An enrollment code prints at startup (120 s, single-use). Enter it in the IDE via command palette → "Companion: Connect to remote bridge…"; the IDE stores a token and reconnects on its own from then on. Each open workspace registers itself, so the phone sees them all.
 - The keyring backend needs a Secret Service even headless — run under `dbus-run-session` with an unlocked `gnome-keyring-daemon` (see the ADR).

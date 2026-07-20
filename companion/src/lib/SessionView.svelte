@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tick } from 'svelte';
 	import { app, type AskUserQuestion } from './app.svelte';
 	import Markdown from './Markdown.svelte';
 
@@ -80,19 +81,182 @@
 	let transcriptEl = $state<HTMLDivElement>();
 	let pinned = $state(true);
 
+	// Trailing render window over `app.rows` — the phone-sized
+	// mirror of the desktop transcript windowing (test plan 0093).
+	// Opening a long session mounts only the last `INITIAL_WINDOW`
+	// rows; scrolling near the top (or the "Load older" pill) pulls
+	// more in with a scroll anchor so nothing lurches. The mounted
+	// count is capped at `WINDOW_MAX`: past it the window *slides*,
+	// clipping rows off the (off-screen) bottom and detaching from
+	// the live tail — "Load newer" / "Jump to latest" reel it back.
+	const INITIAL_WINDOW = 50;
+	const WINDOW_GROW_STEP = 50;
+	const WINDOW_MAX = 300;
+	const LOAD_MORE_THRESHOLD_PX = 600;
+
+	let visibleCount = $state(INITIAL_WINDOW);
+	let bottomClip = $state(0);
+
+	const windowEnd = $derived(Math.max(0, app.rows.length - bottomClip));
+	const windowStart = $derived(Math.max(0, windowEnd - visibleCount));
+	const windowedRows = $derived(app.rows.slice(windowStart, windowEnd));
+	const hiddenAbove = $derived(windowStart);
+	const hiddenBelow = $derived(app.rows.length - windowEnd);
+
+	// Scroll anchoring for a window change: pin a concrete edge row
+	// element + its viewport-relative top before the slice changes,
+	// then nudge `scrollTop` by how far it moved once the DOM
+	// settles. Works for prepend, clip, and cap-slide alike.
+	let pendingAnchorNode: HTMLElement | null = null;
+	let pendingAnchorNodeTop = 0;
+	// Set while applying the anchor's programmatic scroll so the
+	// synthetic scroll event doesn't re-trigger a grow and cascade
+	// the whole history in.
+	let applyingAnchor = false;
+
+	function isAnchorRow(child: Element): child is HTMLElement {
+		return (
+			child instanceof HTMLElement && !child.classList.contains('load-pill') && !child.classList.contains('jump-latest')
+		);
+	}
+
+	function edgeRowEl(edge: 'first' | 'last'): HTMLElement | null {
+		if (!transcriptEl) {
+			return null;
+		}
+		const children = Array.from(transcriptEl.children).filter(isAnchorRow);
+		if (children.length === 0) {
+			return null;
+		}
+		return edge === 'first' ? children[0]! : children[children.length - 1]!;
+	}
+
+	function captureScrollAnchor(edge: 'first' | 'last' = 'first'): void {
+		const el = edgeRowEl(edge);
+		if (el && transcriptEl) {
+			pendingAnchorNode = el;
+			pendingAnchorNodeTop = el.getBoundingClientRect().top - transcriptEl.getBoundingClientRect().top;
+		}
+	}
+
+	/** Pull older rows into the window; at the cap, slide instead
+	 *  (drop the same count off the off-screen bottom). */
+	function growWindowUp(): void {
+		if (hiddenAbove <= 0) {
+			return;
+		}
+		const step = Math.min(WINDOW_GROW_STEP, hiddenAbove);
+		if (visibleCount + step <= WINDOW_MAX) {
+			visibleCount += step;
+			return;
+		}
+		visibleCount = WINDOW_MAX;
+		bottomClip += step;
+	}
+
+	/** Mirror of `growWindowUp` for a detached bottom edge. */
+	function growWindowDown(): void {
+		if (hiddenBelow <= 0) {
+			return;
+		}
+		const step = Math.min(WINDOW_GROW_STEP, hiddenBelow);
+		bottomClip -= step;
+		visibleCount = Math.min(visibleCount + step, WINDOW_MAX);
+	}
+
+	function loadOlderRows(): void {
+		captureScrollAnchor('first');
+		growWindowUp();
+	}
+
+	function loadNewerRows(): void {
+		captureScrollAnchor('last');
+		growWindowDown();
+	}
+
+	/** Snap the window back to the live tail and scroll to the
+	 *  bottom — the escape hatch from a detached window. */
+	function jumpToLatest(): void {
+		bottomClip = 0;
+		visibleCount = INITIAL_WINDOW;
+		pendingAnchorNode = null;
+		pinned = true;
+		void tick().then(() => {
+			if (transcriptEl) {
+				transcriptEl.scrollTop = transcriptEl.scrollHeight;
+			}
+		});
+	}
+
 	function onTranscriptScroll(): void {
 		const el = transcriptEl;
 		if (!el) {
 			return;
 		}
-		pinned = el.scrollHeight - el.scrollTop - el.clientHeight <= PIN_THRESHOLD_PX;
+		const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+		// Only sticky when the window is anchored to the live tail;
+		// a detached window's bottom edge is not the latest row.
+		pinned = bottomClip === 0 && distance <= PIN_THRESHOLD_PX;
+		if (applyingAnchor) {
+			return;
+		}
+		if (el.scrollTop <= LOAD_MORE_THRESHOLD_PX && hiddenAbove > 0) {
+			loadOlderRows();
+		} else if (distance <= LOAD_MORE_THRESHOLD_PX && hiddenBelow > 0) {
+			loadNewerRows();
+		}
 	}
 
+	// Apply the captured scroll anchor after the windowed slice
+	// re-renders.
 	$effect(() => {
-		const _trigger = app.rows.length;
-		void _trigger;
+		void windowedRows;
+		if (pendingAnchorNode === null) {
+			return;
+		}
+		const node = pendingAnchorNode;
+		const prevTop = pendingAnchorNodeTop;
+		pendingAnchorNode = null;
+		void tick().then(() => {
+			if (!transcriptEl || !node.isConnected) {
+				return;
+			}
+			const newTop = node.getBoundingClientRect().top - transcriptEl.getBoundingClientRect().top;
+			const delta = newTop - prevTop;
+			if (delta !== 0) {
+				applyingAnchor = true;
+				transcriptEl.scrollTop += delta;
+				requestAnimationFrame(() => {
+					applyingAnchor = false;
+				});
+			}
+		});
+	});
+
+	let lastRowCount = 0;
+	$effect(() => {
+		const count = app.rows.length;
+		if (count < lastRowCount) {
+			// The transcript was reset (reconnect re-replays into an
+			// emptied list): snap the window back to the tail and
+			// re-arm sticky-bottom.
+			pinned = true;
+			visibleCount = INITIAL_WINDOW;
+			bottomClip = 0;
+			pendingAnchorNode = null;
+		}
+		const appended = count - lastRowCount;
+		lastRowCount = count;
 		const el = transcriptEl;
-		if (!el || !pinned) {
+		if (!el) {
+			return;
+		}
+		if (!pinned) {
+			// Reading history: clip new arrivals off the bottom so
+			// nothing on screen moves; "Jump to latest" appears.
+			if (appended > 0) {
+				bottomClip += appended;
+			}
 			return;
 		}
 		el.scrollTop = el.scrollHeight;
@@ -105,14 +269,19 @@
 		{#if isCoordinator}<span class="coord-badge" title="Coordinator — orchestrates worker agents">coord</span>{/if}
 		<strong class="session-title">{title || 'Untitled session'}</strong>
 		{#if app.busy}
-			<span class="muted status">running…</span>
+			<span class="pip live" title="Running"></span>
 		{:else if app.awaitingInput}
-			<span class="status" style="color: var(--accent)">input needed</span>
+			<span class="pip" style="background: var(--accent)" title="Input needed"></span>
 		{/if}
 	</div>
 
 	<div class="transcript" bind:this={transcriptEl} onscroll={onTranscriptScroll}>
-		{#each app.rows as row (row.kind + row.id)}
+		{#if hiddenAbove > 0}
+			<button type="button" class="load-pill" onclick={loadOlderRows}>
+				Load {Math.min(WINDOW_GROW_STEP, hiddenAbove)} older ({hiddenAbove} hidden)
+			</button>
+		{/if}
+		{#each windowedRows as row (row.kind + row.id)}
 			{#if row.kind === 'user'}
 				<div class="bubble user" class:queued={row.queued}>
 					{row.text}
@@ -220,6 +389,12 @@
 				</div>
 			{/if}
 		{/each}
+		{#if hiddenBelow > 0}
+			<button type="button" class="load-pill" onclick={loadNewerRows}>
+				Load {Math.min(WINDOW_GROW_STEP, hiddenBelow)} newer ({hiddenBelow} below)
+			</button>
+			<button type="button" class="jump-latest" onclick={jumpToLatest}>Jump to latest ↓</button>
+		{/if}
 		{#if app.rows.length === 0}
 			{#if isCoordinator}
 				<div class="empty-hint">
@@ -281,10 +456,6 @@
 		white-space: nowrap;
 		font-size: 0.95rem;
 	}
-	.status {
-		flex: none;
-		font-size: 0.8rem;
-	}
 	.transcript {
 		flex: 1;
 		overflow-y: auto;
@@ -292,6 +463,29 @@
 		flex-direction: column;
 		gap: 0.5rem;
 		padding: 0.25rem;
+	}
+	.load-pill {
+		flex: none;
+		align-self: center;
+		background: var(--bg-elev);
+		border: 1px solid var(--border);
+		border-radius: 999px;
+		color: var(--fg-muted);
+		font-size: 0.8rem;
+		padding: 0.4rem 0.9rem;
+	}
+	.jump-latest {
+		position: sticky;
+		bottom: 0.25rem;
+		flex: none;
+		align-self: center;
+		background: var(--bg-elev-2);
+		border: 1px solid var(--accent);
+		border-radius: 999px;
+		color: var(--fg);
+		font-size: 0.8rem;
+		padding: 0.4rem 0.9rem;
+		box-shadow: 0 2px 8px rgb(0 0 0 / 40%);
 	}
 	.bubble {
 		padding: 0.5rem 0.7rem;

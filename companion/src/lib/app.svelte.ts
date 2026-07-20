@@ -51,6 +51,29 @@ export type ProviderEntry = {
 /** Per-workspace provider lock (mirror of `CoderProviderLock`). */
 export type ProviderLock = { kind: 'hf' } | { kind: 'user'; id: string };
 
+/** SCM status for a bound folder (mirrors the bridge's
+ * `workspace_scm_status` response — itself a composite of
+ * `GitBranchInfo` + `git_status_entries`, folded the same way
+ * `fs_git_change_summary` / the coordinator's `workspace_scm_status`
+ * tool fold: untracked → added, conflicted → modified). */
+type ScmStatus = {
+	branch: {
+		name: string | null;
+		head_short_sha: string | null;
+		has_upstream: boolean;
+		ahead: number;
+		behind: number;
+	};
+	changes: { added: number; modified: number; deleted: number; total: number };
+	files: { path: string; status: string }[];
+};
+
+/** Result of `workspace_scm_commit` (mirrors `GitCommitResult`). */
+type ScmCommitResult = {
+	short_sha: string;
+	summary: string;
+};
+
 /** Mirror of `CoderModelSettings` — the read/write payload of
  * `coder_get_model_settings` / `coder_set_model_settings`. The index
  * signature keeps fields the phone doesn't know about round-tripping
@@ -210,6 +233,12 @@ class CompanionState {
 	modelSettings = $state<ModelSettings | null>(null);
 	/** True while a provider switch / lock toggle is in flight. */
 	savingProvider = $state(false);
+	/** SCM status for the active folder, or null while loading. */
+	scmStatus = $state<ScmStatus | null>(null);
+	/** True while fetching SCM status. */
+	loadingScm = $state(false);
+	/** True while a commit is in flight. */
+	committing = $state(false);
 	sessions = $state<SessionSummary[]>([]);
 	loadingSessions = $state(false);
 
@@ -218,8 +247,16 @@ class CompanionState {
 	activeSession = $state<string | null>(null);
 	/** Rendered transcript rows for the active session. */
 	rows = $state<TranscriptRow[]>([]);
-	/** True while a turn is streaming (composer shows abort). */
+	/** True while the open session's turn is streaming (composer
+	 * shows abort). */
 	busy = $state(false);
+	/** Sessions in the current folder that have a running turn,
+	 * tracked from the event stream (any `user_message` without a
+	 * matching `turn_complete` / `aborted` / `error`). Drives the
+	 * running pip in the session list — updated for *all* sessions,
+	 * not just the open one, so a background session's pip stays
+	 * lit while the user browses the list. */
+	busySessions = $state<Set<string>>(new Set());
 	/** True when an ask_user prompt is blocking the turn. */
 	awaitingInput = $state(false);
 	/** The pending ask_user prompt, if awaitingInput. */
@@ -275,7 +312,9 @@ class CompanionState {
 		this.activeFolder = null;
 		this.coderStatus = null;
 		this.modelSettings = null;
+		this.scmStatus = null;
 		this.sessions = [];
+		this.busySessions = new Set();
 		this.#subscriptions.clear();
 		this.closeSession();
 		this.phase = 'pairing';
@@ -398,6 +437,7 @@ class CompanionState {
 			this.activeFolder = active?.path ?? this.folders[0]?.path ?? null;
 			this.coderStatus = await this.#call<CoderStatus>(workspace, 'coder_status', {}, ide);
 			void this.#loadModelSettings();
+			void this.loadScmStatus();
 			this.sessions = await this.#loadSessions();
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
@@ -416,10 +456,13 @@ class CompanionState {
 		this.activeFolder = path;
 		this.closeSession();
 		this.sessions = [];
+		this.scmStatus = null;
+		this.busySessions = new Set();
 		this.error = null;
 		this.loadingSessions = true;
 		try {
 			this.sessions = await this.#loadSessions();
+			void this.loadScmStatus();
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
 		} finally {
@@ -448,7 +491,9 @@ class CompanionState {
 		this.activeFolder = null;
 		this.coderStatus = null;
 		this.modelSettings = null;
+		this.scmStatus = null;
 		this.sessions = [];
+		this.busySessions = new Set();
 		this.error = null;
 		this.closeSession();
 	}
@@ -509,6 +554,76 @@ class CompanionState {
 	/** Toggle the per-workspace provider lock. Locking pins the
 	 * current provider; unlocking makes the workspace follow (and
 	 * writes) the global default — desktop-picker semantics. */
+	/** Fetch the active folder's SCM status (branch + changed
+	 * files). Best-effort: an IDE build that predates the method
+	 * leaves the card hidden. */
+	async loadScmStatus(): Promise<void> {
+		if (!this.activeWorkspace || !this.activeFolder) {
+			return;
+		}
+		this.loadingScm = true;
+		try {
+			this.scmStatus = await this.#call<ScmStatus>(
+				this.activeWorkspace,
+				'workspace_scm_status',
+				{ folder: this.activeFolder },
+				this.activeIde,
+			);
+		} catch {
+			this.scmStatus = null;
+		} finally {
+			this.loadingScm = false;
+		}
+	}
+
+	/** Ask the fast model for a one-line commit subject from the
+	 * active folder's `git diff HEAD`. Mirrors the desktop's
+	 * sparkle button. Returns the suggestion; the caller decides
+	 * whether to auto-fill. */
+	async suggestCommitMessage(): Promise<string | null> {
+		if (!this.activeWorkspace || !this.activeFolder) {
+			return null;
+		}
+		try {
+			const result = await this.#call<{ message: string }>(
+				this.activeWorkspace,
+				'workspace_scm_suggest_message',
+				{ folder: this.activeFolder },
+				this.activeIde,
+			);
+			return result.message;
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+			return null;
+		}
+	}
+
+	/** Commit the active folder's staged + unstaged changes. When
+	 * `message` is empty, the backend auto-suggests one from the diff
+	 * (same fast-model path as the desktop's sparkle button). */
+	async commit(message: string, amend = false): Promise<ScmCommitResult | null> {
+		if (!this.activeWorkspace || !this.activeFolder) {
+			return null;
+		}
+		this.committing = true;
+		try {
+			const result = await this.#call<ScmCommitResult>(
+				this.activeWorkspace,
+				'workspace_scm_commit',
+				{ message, amend, folder: this.activeFolder },
+				this.activeIde,
+			);
+			// Refresh status after commit.
+			void this.loadScmStatus();
+			return result;
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+			return null;
+		} finally {
+			this.committing = false;
+		}
+	}
+
 	async setProviderLock(locked: boolean): Promise<void> {
 		const settings = this.modelSettings;
 		if (!this.activeWorkspace || !settings) {
@@ -730,15 +845,47 @@ class CompanionState {
 	}
 
 	/** Reduce a coder event envelope onto the transcript rows. */
+	/** Toggle a session's busy state in the `busySessions` set.
+	 * Replaces the set so Svelte reactivity fires. */
+	#markBusy(sid: string, busy: boolean): void {
+		const next = new Set(this.busySessions);
+		if (busy) {
+			next.add(sid);
+		} else {
+			next.delete(sid);
+		}
+		if (next.size !== this.busySessions.size || [...next].some((s) => !this.busySessions.has(s))) {
+			this.busySessions = next;
+		}
+	}
+
 	#onCoderEvent(raw: unknown): void {
 		// eslint-disable-next-line typescript-eslint/no-unsafe-type-assertion
 		const envelope = (raw ?? {}) as CoderEventEnvelope;
-		// Only render events for the session the phone has open.
-		if (this.activeSession && envelope.session_id && envelope.session_id !== this.activeSession) {
-			return;
-		}
 		const ev = envelope.event;
 		if (!ev) {
+			return;
+		}
+
+		// --- Per-session busy tracking (for the session list's
+		// running pip). Processed for *all* sessions before the
+		// active-session filter below, so a background session's
+		// pip stays lit while the user browses the list. The
+		// replay batch's `in_flight` flag also counts.
+		const eventSid = envelope.session_id;
+		if (eventSid) {
+			if (ev.kind === 'replay' && bool(ev, 'in_flight')) {
+				this.#markBusy(eventSid, true);
+			} else if (ev.kind === 'user_message') {
+				this.#markBusy(eventSid, true);
+			} else if (ev.kind === 'turn_complete' || ev.kind === 'aborted' || ev.kind === 'error') {
+				this.#markBusy(eventSid, false);
+			}
+		}
+
+		// Only render transcript events for the session the phone
+		// has open.
+		if (this.activeSession && eventSid && eventSid !== this.activeSession) {
 			return;
 		}
 		// A `replay` batch packs a whole session's historic events

@@ -70,6 +70,25 @@ impl BridgeRpc {
 			.try_state::<crate::state::AppState>()
 			.ok_or_else(|| "app state not ready yet".to_owned())
 	}
+
+	/// Resolve a bound folder by path (when the phone passes one) or
+	/// fall back to the desktop's active folder. Shared by the SCM
+	/// methods, which need a `WorkspaceFolderEntry` to call host
+	/// methods on — the same resolution `folder_session_or_active`
+	/// does in the coder runner.
+	async fn resolve_folder(
+		&self,
+		p: &FolderParams,
+	) -> Result<std::sync::Arc<moon_core::workspace::WorkspaceFolderEntry>, String> {
+		match &p.folder {
+			Some(path) => self
+				.workspaces
+				.folder_for_path(path)
+				.await
+				.ok_or_else(|| format!("no bound folder at `{path}`")),
+			None => self.workspaces.require_active_folder().await.map_err(|e| e.to_string()),
+		}
+	}
 }
 
 #[async_trait::async_trait]
@@ -220,6 +239,89 @@ impl BridgeRpcHandler for BridgeRpc {
 					.map_err(|e| e.to_string())?;
 				Ok(Value::Null)
 			}
+			// --- SCM (git) status + commit. Same host methods the
+			// desktop's SCM panel uses, exposed folder-targeted so
+			// the phone can inspect + commit any bound folder.
+			"workspace_scm_status" => {
+				let p: FolderParams = parse_params(params)?;
+				let folder = self.resolve_folder(&p).await?;
+				let branch = folder.host.git_branch().await.unwrap_or_default();
+				let entries = folder.host.git_status_entries(&[]).await.unwrap_or_default();
+				// Fold untracked → added, conflicted → modified
+				// (same as `fs_git_change_summary` / the
+				// coordinator's `workspace_scm_status` tool).
+				let mut added = 0u32;
+				let mut modified = 0u32;
+				let mut deleted = 0u32;
+				let mut files: Vec<Value> = Vec::new();
+				for e in &entries {
+					if matches!(e.status, moon_protocol::git::GitFileStatus::Ignored) {
+						continue;
+					}
+					match e.status {
+						moon_protocol::git::GitFileStatus::Added | moon_protocol::git::GitFileStatus::Untracked => added += 1,
+						moon_protocol::git::GitFileStatus::Modified | moon_protocol::git::GitFileStatus::Conflicted => {
+							modified += 1
+						}
+						moon_protocol::git::GitFileStatus::Deleted => deleted += 1,
+						moon_protocol::git::GitFileStatus::Ignored => {}
+					}
+					files.push(serde_json::json!({
+						"path": e.path,
+						"status": format!("{:?}", e.status).to_lowercase(),
+					}));
+				}
+				Ok(serde_json::json!({
+					"branch": {
+						"name": branch.name,
+						"head_short_sha": branch.head_short_sha,
+						"has_upstream": branch.has_upstream,
+						"ahead": branch.ahead,
+						"behind": branch.behind,
+					},
+					"changes": {
+						"added": added,
+						"modified": modified,
+						"deleted": deleted,
+						"total": added + modified + deleted,
+					},
+					"files": files,
+				}))
+			}
+			"workspace_scm_commit" => {
+				let p: ScmCommitParams = parse_params(params)?;
+				let folder = self.resolve_folder(&FolderParams { folder: p.folder }).await?;
+				// Auto-suggest when no message supplied — same
+				// fast-model prompt as the desktop's sparkle button
+				// and the coordinator's `commit_worker_changes`.
+				let message = if p.message.trim().is_empty() {
+					let diff = folder.host.git_diff_patch().await.unwrap_or_default();
+					self
+						.coder
+						.suggest_commit_message("", &diff)
+						.await
+						.map_err(|e| e.to_string())?
+				} else {
+					p.message
+				};
+				let result = folder
+					.host
+					.git_commit(&message, p.amend.unwrap_or(false))
+					.await
+					.map_err(|e| e.to_string())?;
+				to_value(&result)
+			}
+			"workspace_scm_suggest_message" => {
+				let p: FolderParams = parse_params(params)?;
+				let folder = self.resolve_folder(&p).await?;
+				let diff = folder.host.git_diff_patch().await.unwrap_or_default();
+				let suggestion = self
+					.coder
+					.suggest_commit_message("", &diff)
+					.await
+					.map_err(|e| e.to_string())?;
+				Ok(serde_json::json!({ "message": suggestion }))
+			}
 			"bridge_methods" => Ok(serde_json::json!({
 				"methods": SUPPORTED_METHODS,
 				"streams": SUPPORTED_STREAMS,
@@ -314,6 +416,16 @@ struct WorkspaceLaunchParams {
 	workspace_id: String,
 }
 
+#[derive(serde::Deserialize)]
+struct ScmCommitParams {
+	#[serde(default)]
+	message: String,
+	#[serde(default)]
+	amend: Option<bool>,
+	#[serde(default)]
+	folder: Option<String>,
+}
+
 /// Parse a method's params object, mapping a shape mismatch to an
 /// error string the phone surfaces.
 fn parse_params<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, String> {
@@ -345,6 +457,9 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 	"coder_get_model_settings",
 	"coder_set_model_settings",
 	"workspace_launch",
+	"workspace_scm_status",
+	"workspace_scm_commit",
+	"workspace_scm_suggest_message",
 	"bridge_methods",
 ];
 

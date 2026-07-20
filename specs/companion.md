@@ -167,6 +167,14 @@ exact frontend stack and existing coder / SCM components, needs no
 App Store review or distribution signing for an internal-LAN tool,
 and keeps everything in the one framework the team maintains.
 
+Installability: the manifest ships launcher + maskable icons
+(generated PNGs, `scripts/gen-companion-icons.mjs` — no native
+rasterizer dependency), iOS gets `apple-touch-icon` + its meta tags,
+and a small hand-rolled service worker (`companion/public/sw.js`)
+caches the app shell — network-first for navigations so deploys show
+on next load, cache-first for hashed `/assets/*`. The WS to the
+bridge is untouched by the worker.
+
 **Native (Tauri 2 mobile) is a deliberate future option**, not v1.
 It would reuse the same Svelte SPA wrapped in the same Tauri the
 IDE already uses, with native keychain / camera / cert-pinning and
@@ -212,6 +220,13 @@ requested surface:
   enrolled IDE for remote-carrier workspaces (the IDE runs its own
   `window_open` "focus or spawn" path). Either way the phone
   re-polls the list after ~1.5 s and the workspace appears live.
+- **SCM (git) status + commit.** The workspace view shows the
+  active folder's current branch, ahead/behind upstream, changed
+  file counts (added / modified / deleted) and a collapsible file
+  list. A commit composer with a sparkle button (auto-suggest via
+  the fast model, same prompt as the desktop's SCM panel) lets the
+  phone commit changes. All folder-targeted, reusing the same
+  `WorkspaceHost` git methods the desktop uses.
 - **Provider switch.** The workspace view surfaces the active LLM
   provider (HF or a configured user provider) with the per-workspace
   lock toggle, via `coder_get_model_settings` /

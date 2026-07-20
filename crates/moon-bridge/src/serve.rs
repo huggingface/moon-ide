@@ -266,6 +266,12 @@ struct PendingForward {
 	/// drops, all its in-flight forwards are reaped and the phones
 	/// are errored).
 	conn_id: u64,
+	/// For streams: set on the first `ForwardEvent` so the startup
+	/// timeout only reaps streams that never got any response from
+	/// the IDE. A live stream stays registered indefinitely — the
+	/// coder can be quiet for hours between events. Unused for
+	/// unary calls (they're removed on the first reply).
+	started: bool,
 }
 
 /// A currently-connected enrolled IDE workspace process (Phase 14).
@@ -828,8 +834,11 @@ async fn handle_message(ctx: &Arc<ServeCtx>, text: &str, out: &tokio::sync::mpsc
 			}
 		}
 		ClientMessage::ForwardEvent { id, event } => {
-			let pending = ctx.pending_streams.lock().await;
-			if let Some(entry) = pending.get(&id) {
+			let mut pending = ctx.pending_streams.lock().await;
+			if let Some(entry) = pending.get_mut(&id) {
+				// Mark the stream live so the startup timeout
+				// doesn't reap it (see `handle_subscribe`).
+				entry.started = true;
 				let _ = entry.phone_sink.try_send(ServerMessage::Event { event });
 			}
 		}
@@ -895,6 +904,7 @@ async fn handle_subscribe(
 			PendingForward {
 				phone_sink: out.clone(),
 				conn_id,
+				started: false,
 			},
 		);
 	}
@@ -916,25 +926,29 @@ async fn handle_subscribe(
 			.await;
 		return;
 	}
-	// Spawn a per-stream timeout task: if the IDE never sends even one
-	// event (and no `ForwardEnd`), reap the entry after `FORWARD_TIMEOUT`
-	// so the phone doesn't hold a dead subscription indefinitely. Note
-	// this only reaps *stale* streams — an active stream that's just
-	// quiet (the agent is idle) will have already received at least one
-	// event and the entry will have been touched. A quiet-but-alive
-	// stream is the normal case; the timeout only catches the
-	// "IDE accepted the subscribe but never responded at all" case.
+	// Spawn a per-stream startup timeout: if the IDE never sends even
+	// one event (and no `ForwardEnd`), reap the entry after
+	// `FORWARD_TIMEOUT` so the phone doesn't hold a dead subscription
+	// indefinitely. `started` is flipped by the first `ForwardEvent` —
+	// a live stream stays registered no matter how quiet it goes (the
+	// coder can idle for hours between events); the timeout only
+	// catches "the IDE accepted the subscribe but never responded at
+	// all". (An earlier version removed the entry unconditionally
+	// here, silently killing every live stream 10 s in — the phone
+	// looked frozen until the user re-opened the session.)
 	let ctx_for_timeout = Arc::clone(ctx);
 	tokio::spawn(async move {
 		tokio::time::sleep(FORWARD_TIMEOUT).await;
 		let mut pending = ctx_for_timeout.pending_streams.lock().await;
-		if let Some(entry) = pending.remove(&id) {
-			let _ = entry
-				.phone_sink
-				.send(ServerMessage::Error {
-					message: "forwarded stream timed out".into(),
-				})
-				.await;
+		if pending.get(&id).is_some_and(|entry| !entry.started) {
+			if let Some(entry) = pending.remove(&id) {
+				let _ = entry
+					.phone_sink
+					.send(ServerMessage::Error {
+						message: "forwarded stream timed out".into(),
+					})
+					.await;
+			}
 		}
 	});
 	// Events arrive asynchronously via `ForwardEvent` — see the dispatch
@@ -1275,6 +1289,7 @@ async fn handle_call(
 			PendingForward {
 				phone_sink: out.clone(),
 				conn_id,
+				started: false,
 			},
 		);
 	}
