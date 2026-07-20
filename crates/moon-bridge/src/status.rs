@@ -36,6 +36,10 @@ pub enum ControlRequest {
 	/// Revoke an enrolled IDE by id (Phase 14, ADR 0031). Mirror of
 	/// `Revoke` for the IDE↔bridge relationship.
 	RevokeIde { ide_id: String },
+	/// Mint a fresh phone-pairing code (Phase 14.5). Pairing is
+	/// on-demand everywhere: the local panel asks over this socket,
+	/// a remote IDE over its enrolled WS. There is no startup window.
+	PairCode,
 	/// Ask the bridge to exit (e.g. before a rebuild).
 	Shutdown,
 }
@@ -49,6 +53,14 @@ pub enum ControlResponse {
 	Revoked {
 		revoked: bool,
 	},
+	/// A freshly-minted phone-pairing payload (reply to `PairCode`,
+	/// Phase 14.5). `payload` is the compact JSON the QR encodes.
+	PairCode {
+		payload: String,
+		url: String,
+		code: String,
+		fingerprint: String,
+	},
 	Ok,
 	Error {
 		message: String,
@@ -61,11 +73,9 @@ pub enum ControlResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CompanionStatus {
 	pub running: bool,
-	/// Pairing QR payload (compact JSON), or `null` when pairing is
-	/// closed (consumed / `--no-pairing`).
-	pub pairing_payload: Option<String>,
-	pub pairing_url: Option<String>,
-	pub pairing_code: Option<String>,
+	/// The `wss://…` URL phones connect to. Pairing codes are minted
+	/// on demand (`PairCode`), so there is no startup payload here.
+	pub url: String,
 	/// `.local` URL when mDNS is up.
 	pub mdns_url: Option<String>,
 	pub fingerprint: String,

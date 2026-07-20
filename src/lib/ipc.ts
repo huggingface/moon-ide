@@ -452,6 +452,7 @@ export const ipc = {
 		status: () => invoke<CompanionStatus>('companion_status'),
 		revokeDevice: (deviceId: string) => invoke<void>('companion_revoke_device', { deviceId }),
 		revokeIde: (ideId: string) => invoke<void>('companion_revoke_ide', { ideId }),
+		pairCode: () => invoke<PairingQr>('companion_pair_code'),
 		enroll: (bridgeUrl: string, code: string, label: string) =>
 			invoke<void>('companion_enroll', { bridgeUrl, code, label }),
 		remoteStatus: () => invoke<RemoteBridgeStatus>('companion_remote_status'),
@@ -474,9 +475,9 @@ export type PairingQr = {
  * The `ides` field is the enrolled-IDE list (Phase 14, ADR 0031). */
 export type CompanionStatus = {
 	running: boolean;
-	pairing_payload: string | null;
-	pairing_url: string | null;
-	pairing_code: string | null;
+	/** The wss:// URL phones connect to. Pairing codes are minted on
+	 * demand via `pairCode`, not at bridge startup. */
+	url: string;
 	mdns_url: string | null;
 	fingerprint: string;
 	devices: { id: string; label: string; paired_at_ms: number }[];

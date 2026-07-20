@@ -28,9 +28,23 @@
 		companion.stopPolling();
 	});
 
-	// The QR encodes the full pairing payload (url + fingerprint + code)
-	// that the PWA's pair screen parses from a paste/scan.
-	const qrSvg = $derived(status?.pairing_payload ? renderSVG(status.pairing_payload, { border: 2 }) : null);
+	// Local-bridge pairing is on-demand (Phase 14.5): the button mints
+	// a fresh single-use code over the control socket. The QR encodes
+	// the full payload (url + fingerprint + code) that the PWA's pair
+	// screen parses from a paste/scan.
+	let localPair = $state<PairingQr | null>(null);
+	let localPairError = $state<string | null>(null);
+	const qrSvg = $derived(localPair ? renderSVG(localPair.payload, { border: 2 }) : null);
+
+	async function requestLocalPairCode(): Promise<void> {
+		localPairError = null;
+		try {
+			localPair = await ipc.companion.pairCode();
+		} catch (err) {
+			localPair = null;
+			localPairError = String(err);
+		}
+	}
 
 	async function revoke(id: string): Promise<void> {
 		// Revoke is synchronous over the control socket, so refresh
@@ -146,27 +160,35 @@
 				</p>
 			{:else}
 				<p class="lede">
-					On your phone (same network/VPN), open the companion and scan this, or type the address + code.
+					On your phone (same network/VPN), open the companion and scan a pairing QR, or type the address + code.
 				</p>
 
-				{#if qrSvg}
-					<!-- eslint-disable-next-line svelte/no-at-html-tags -->
-					<div class="qr">{@html qrSvg}</div>
+				{#if localPair}
+					{#if qrSvg}
+						<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+						<div class="qr">{@html qrSvg}</div>
+					{/if}
+					<div class="details">
+						{#if status.mdns_url}
+							<div class="row"><span class="k">Address</span><code>{status.mdns_url}</code></div>
+							<div class="row"><span class="k">or</span><code>{localPair.url}</code></div>
+						{:else}
+							<div class="row"><span class="k">Address</span><code>{localPair.url}</code></div>
+						{/if}
+						<div class="row"><span class="k">Code</span><code class="code">{localPair.code}</code></div>
+					</div>
+					<p class="hint">Single-use, valid ~2 minutes. Generate a new one per phone.</p>
+				{:else}
+					<div class="details">
+						<div class="row"><span class="k">Address</span><code>{status.mdns_url ?? status.url}</code></div>
+					</div>
 				{/if}
-
-				<div class="details">
-					{#if status.mdns_url}
-						<div class="row"><span class="k">Address</span><code>{status.mdns_url}</code></div>
-						<div class="row"><span class="k">or</span><code>{status.pairing_url}</code></div>
-					{:else}
-						<div class="row"><span class="k">Address</span><code>{status.pairing_url}</code></div>
-					{/if}
-					{#if status.pairing_code}
-						<div class="row"><span class="k">Code</span><code class="code">{status.pairing_code}</code></div>
-					{:else}
-						<p class="hint">Pairing window closed — restart the bridge to pair another device.</p>
-					{/if}
-				</div>
+				<button type="button" onclick={() => requestLocalPairCode()}>
+					{localPair ? 'New pairing code' : 'Show pairing QR'}
+				</button>
+				{#if localPairError}
+					<p class="hint" style="color: var(--danger, #f85149)">{localPairError}</p>
+				{/if}
 
 				<p class="hint fp">
 					First time on a device, accept the self-signed certificate. Fingerprint:<br />

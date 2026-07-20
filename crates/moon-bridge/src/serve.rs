@@ -278,10 +278,6 @@ pub struct ServeConfig {
 	pub bridge_dir: Utf8PathBuf,
 	pub web_root: Option<std::path::PathBuf>,
 	pub devices: DeviceStore,
-	pub pairing: Option<PairingSession>,
-	/// The pairing payload to publish in `companion-status.json` (the
-	/// IDE's panel renders it as a QR). `None` when pairing is closed.
-	pub pairing_payload: Option<crate::pairing::PairingPayload>,
 	/// The `wss://moon-bridge.local:<port>` URL when mDNS is up.
 	pub mdns_url: Option<String>,
 	/// LAN IP for mDNS advertising (the host's own address).
@@ -311,8 +307,6 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
 		bridge_dir,
 		web_root,
 		devices,
-		pairing,
-		pairing_payload,
 		mdns_url,
 		advertise_ip,
 		ides,
@@ -352,7 +346,9 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
 		workspaces_dir,
 		web_root,
 		devices,
-		pairing: Mutex::new(pairing),
+		// Pairing is on-demand (Phase 14.5): no session until the
+		// local panel or an enrolled IDE mints one.
+		pairing: Mutex::new(None),
 		ides,
 		enrollment: Mutex::new(enrollment),
 		advertise_url,
@@ -367,13 +363,7 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
 	// for status / revoke / shutdown. Liveness is the connect itself,
 	// so there's no status file to go stale (replaces the old
 	// companion-status.json / companion-revoke.json files).
-	spawn_control_listener(
-		bridge_dir.clone(),
-		Arc::clone(&ctx),
-		fingerprint,
-		pairing_payload,
-		mdns_url,
-	);
+	spawn_control_listener(bridge_dir.clone(), Arc::clone(&ctx), mdns_url);
 
 	// Idle watcher: when no workspace is live, the bridge has nothing
 	// to serve, so it exits (ADR 0024). Discovery is the same signal
@@ -405,14 +395,8 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
 	}
 }
 
-/// Snapshot the current companion state from live device state + the
-/// (immutable for the process) pairing display fields.
-fn current_status(
-	ctx: &ServeCtx,
-	fingerprint: &str,
-	payload: Option<&crate::pairing::PairingPayload>,
-	mdns_url: Option<&str>,
-) -> crate::status::CompanionStatus {
+/// Snapshot the current companion state from live device state.
+fn current_status(ctx: &ServeCtx, mdns_url: Option<&str>) -> crate::status::CompanionStatus {
 	let devices = ctx
 		.devices
 		.list()
@@ -437,11 +421,9 @@ fn current_status(
 		.collect();
 	crate::status::CompanionStatus {
 		running: true,
-		pairing_payload: payload.map(|p| p.to_json()),
-		pairing_url: payload.map(|p| p.url.clone()),
-		pairing_code: payload.map(|p| p.code.clone()),
+		url: ctx.advertise_url.clone(),
 		mdns_url: mdns_url.map(str::to_owned),
-		fingerprint: fingerprint.to_owned(),
+		fingerprint: ctx.fingerprint.clone(),
 		devices,
 		ides,
 		build_id: crate::status::self_build_id(),
@@ -452,13 +434,7 @@ fn current_status(
 /// `shutdown` from the IDE's Companion panel. Replaces the old
 /// status-file + revoke-file channel: a successful connect *is* the
 /// liveness signal, so nothing goes stale.
-fn spawn_control_listener(
-	bridge_dir: Utf8PathBuf,
-	ctx: Arc<ServeCtx>,
-	fingerprint: String,
-	payload: Option<crate::pairing::PairingPayload>,
-	mdns_url: Option<String>,
-) {
+fn spawn_control_listener(bridge_dir: Utf8PathBuf, ctx: Arc<ServeCtx>, mdns_url: Option<String>) {
 	tokio::spawn(async move {
 		let path = crate::status::control_sock_path(&bridge_dir);
 		// A stale socket file (previous crash) blocks bind; unlink and
@@ -478,8 +454,6 @@ fn spawn_control_listener(
 				continue;
 			};
 			let ctx = Arc::clone(&ctx);
-			let fingerprint = fingerprint.clone();
-			let payload = payload.clone();
 			let mdns_url = mdns_url.clone();
 			tokio::spawn(async move {
 				use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -503,12 +477,24 @@ fn spawn_control_listener(
 				};
 
 				let resp = match req {
-					crate::status::ControlRequest::Status => crate::status::ControlResponse::Status(current_status(
-						&ctx,
-						&fingerprint,
-						payload.as_ref(),
-						mdns_url.as_deref(),
-					)),
+					crate::status::ControlRequest::Status => {
+						crate::status::ControlResponse::Status(current_status(&ctx, mdns_url.as_deref()))
+					}
+					crate::status::ControlRequest::PairCode => {
+						// Local-panel mint (Phase 14.5): same semantics
+						// as the enrolled-IDE path — one live session,
+						// fresh code replaces the old.
+						let session = PairingSession::issue();
+						let payload = crate::pairing::PairingPayload::new(&ctx.advertise_url, &ctx.fingerprint, session.code());
+						*ctx.pairing.lock().await = Some(session);
+						tracing::info!("pairing window opened from the local panel");
+						crate::status::ControlResponse::PairCode {
+							payload: payload.to_json(),
+							url: payload.url,
+							code: payload.code,
+							fingerprint: payload.fingerprint,
+						}
+					}
 					crate::status::ControlRequest::Revoke { device_id } => match ctx.devices.revoke(&device_id) {
 						Ok(revoked) => {
 							if revoked {

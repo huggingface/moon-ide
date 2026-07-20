@@ -21,9 +21,10 @@ const CONTROL_SOCK: &str = "control.sock";
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CompanionStatus {
 	pub running: bool,
-	pub pairing_payload: Option<String>,
-	pub pairing_url: Option<String>,
-	pub pairing_code: Option<String>,
+	/// The `wss://…` URL phones connect to. Pairing codes are minted
+	/// on demand (`companion_pair_code`), not at bridge startup.
+	#[serde(default)]
+	pub url: String,
 	pub mdns_url: Option<String>,
 	pub fingerprint: String,
 	pub devices: Vec<DeviceEntry>,
@@ -62,6 +63,8 @@ enum ControlRequest {
 	RevokeIde {
 		ide_id: String,
 	},
+	/// Mint a fresh phone-pairing code (Phase 14.5).
+	PairCode,
 }
 
 /// Control response wire shape.
@@ -72,8 +75,17 @@ enum ControlResponse {
 	// The bridge reports `{ revoked: bool }`; the IDE doesn't act on
 	// the flag (it re-fetches status), so the payload is ignored.
 	Revoked {},
+	/// A freshly-minted phone-pairing payload (Phase 14.5).
+	PairCode {
+		payload: String,
+		url: String,
+		code: String,
+		fingerprint: String,
+	},
 	Ok,
-	Error { message: String },
+	Error {
+		message: String,
+	},
 }
 
 fn control_sock_path() -> Result<Utf8PathBuf, MoonError> {
@@ -152,6 +164,29 @@ pub async fn companion_revoke_ide(ide_id: String) -> Result<(), MoonError> {
 		Ok(ControlResponse::Revoked { .. }) | Ok(ControlResponse::Ok) => Ok(()),
 		Ok(ControlResponse::Error { message }) => Err(MoonError::internal(message)),
 		Ok(_) => Ok(()),
+		Err(err) => Err(MoonError::internal(format!("bridge not reachable: {err}"))),
+	}
+}
+
+/// Mint a fresh phone-pairing code from the local bridge (Phase 14.5).
+/// The panel renders the returned payload as a QR. Pairing is
+/// on-demand everywhere — there is no startup pairing window.
+#[tauri::command]
+pub async fn companion_pair_code() -> Result<crate::remote_bridge::PairingQr, MoonError> {
+	match control_request(&ControlRequest::PairCode).await {
+		Ok(ControlResponse::PairCode {
+			payload,
+			url,
+			code,
+			fingerprint,
+		}) => Ok(crate::remote_bridge::PairingQr {
+			payload,
+			url,
+			code,
+			fingerprint,
+		}),
+		Ok(ControlResponse::Error { message }) => Err(MoonError::internal(message)),
+		Ok(_) => Err(MoonError::internal("unexpected bridge reply")),
 		Err(err) => Err(MoonError::internal(format!("bridge not reachable: {err}"))),
 	}
 }

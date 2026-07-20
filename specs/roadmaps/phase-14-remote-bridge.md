@@ -203,6 +203,12 @@ enrolled WS, rendered as a QR in the Companion modal's remote tab
 (`companion_remote_pair_code`). Wire shape in
 [`companion.md`](../companion.md) § "Wire additions".
 
+Follow-on: the startup pairing window (and `--no-pairing`, and the
+`pair-code` CLI stub) were removed entirely — local mode mints on
+demand too, via a `PairCode` control-socket op and a "Show pairing QR"
+button in the local tab. One pairing mechanism everywhere; enrollment
+keeps its startup window as the trust bootstrap.
+
 ## What this phase deliberately doesn't do
 
 Prose, not milestones — mirrors

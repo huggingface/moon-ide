@@ -232,6 +232,7 @@ pub fn run() {
 			commands::companion::companion_remote_status,
 			commands::companion::companion_remote_disconnect,
 			commands::companion::companion_remote_pair_code,
+			commands::companion::companion_pair_code,
 			commands::coder::coder_status,
 			commands::coder::coder_folder_summary,
 			commands::coder::coder_start_device_flow,

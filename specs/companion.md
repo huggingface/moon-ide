@@ -113,6 +113,12 @@ secret storage already in use.
    - `wss://<lan-ip>:53180`
    - the bridge cert **fingerprint**
    - a short-lived **pairing token** (~120 s TTL).
+
+   Codes are minted **on demand** (a "Show pairing QR" button — the
+   local panel asks over the control socket, a remote-enrolled IDE
+   over its WS; roadmap 14.5). There is no startup pairing window:
+   one live single-use session at a time, a fresh mint replaces it.
+
 3. Phone scans → connects → **pins the fingerprint (TOFU)** →
    installs the bridge cert once (iOS: a `.mobileconfig` the bridge
    serves; Android: a user cert) → presents the pairing token.
@@ -251,8 +257,10 @@ relationship (IDE ↔ bridge) using the same vocabulary, so there is one
 security model, not two:
 
 1. Bridge generates its TLS keypair + self-signed cert (unchanged).
-2. Operator runs `moon-bridge enroll-code` (mirror of `pair-code`) →
-   short-lived (120 s), single-use enrollment code.
+2. A short-lived (120 s), single-use enrollment code prints at `serve`
+   startup (the operator reads it from the terminal / service journal).
+   Startup-only by design: enrollment bootstraps the trust that any
+   on-demand path would itself need.
 3. IDE's "Connect to remote bridge" affordance (command palette entry,
    not a keybinding — Ctrl+T is `next_edit_complete`) takes the bridge
    URL + code. The IDE **TOFU-pins the bridge cert** (same as a phone),

@@ -87,10 +87,6 @@ enum Command {
 		/// Device id to revoke.
 		id: String,
 	},
-	/// Issue a short-lived pairing code (what the desktop will encode
-	/// into the pairing QR). Prints the code and its TTL. The verify
-	/// half runs in the WSS listener (13.2).
-	PairCode,
 	/// Issue a short-lived enrollment code for an IDE to present when
 	/// connecting to this bridge as a remote relay (Phase 14, ADR
 	/// 0031). Mirror of `pair-code` for the IDE↔bridge relationship.
@@ -106,8 +102,9 @@ enum Command {
 		/// IDE id to revoke.
 		id: String,
 	},
-	/// Run the LAN WSS listener. Issues a pairing code at startup
-	/// (prints the QR payload), then serves until killed.
+	/// Run the LAN WSS listener. Issues an enrollment code at startup;
+	/// phone-pairing codes are minted on demand from the IDE (local
+	/// panel or enrolled remote IDE). Serves until killed.
 	Serve {
 		/// Bind address. Defaults to `0.0.0.0:<DEFAULT_PORT>`.
 		#[arg(long)]
@@ -117,13 +114,9 @@ enum Command {
 		/// falling back to `127.0.0.1` for a local-only test.
 		#[arg(long)]
 		advertise_host: Option<String>,
-		/// Start with pairing closed (only already-paired devices can
-		/// connect). Default is to open a pairing window at startup.
-		#[arg(long)]
-		no_pairing: bool,
-		/// Start with enrollment closed (only already-enrolled IDEs can
-		/// connect). Default is to open an enrollment window at
-		/// startup (Phase 14, ADR 0031). Mirror of `--no-pairing`.
+		/// Start with enrollment closed (only already-enrolled IDEs
+		/// can connect). Default is to open an enrollment window at
+		/// startup (Phase 14, ADR 0031).
 		#[arg(long)]
 		no_enrollment: bool,
 		/// Directory of built PWA assets to serve over HTTPS (the
@@ -165,14 +158,12 @@ async fn main() -> anyhow::Result<()> {
 		Command::Pair { label } => run_pair(&label),
 		Command::Devices => run_devices(),
 		Command::Revoke { id } => run_revoke(&id),
-		Command::PairCode => run_pair_code(),
 		Command::EnrollCode => run_enroll_code(),
 		Command::Ides => run_ides(),
 		Command::RevokeIde { id } => run_revoke_ide(&id),
 		Command::Serve {
 			bind,
 			advertise_host,
-			no_pairing,
 			no_enrollment,
 			web_root,
 			advertise_url,
@@ -181,7 +172,6 @@ async fn main() -> anyhow::Result<()> {
 			run_serve(ServeArgs {
 				bind,
 				advertise_host,
-				no_pairing,
 				no_enrollment,
 				web_root,
 				advertise_url,
@@ -314,7 +304,6 @@ fn run_revoke_ide(id: &str) -> anyhow::Result<()> {
 struct ServeArgs {
 	bind: Option<SocketAddr>,
 	advertise_host: Option<String>,
-	no_pairing: bool,
 	no_enrollment: bool,
 	web_root: Option<std::path::PathBuf>,
 	advertise_url: Option<String>,
@@ -325,7 +314,6 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 	let ServeArgs {
 		bind,
 		advertise_host,
-		no_pairing,
 		no_enrollment,
 		web_root,
 		advertise_url,
@@ -362,30 +350,14 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 	let url = advertise_url.unwrap_or_else(|| format!("wss://{advertise_host}:{}", bind.port()));
 	let mdns_url = detected_ip.map(|_| format!("wss://{}:{}", mdns::MDNS_HOSTNAME.trim_end_matches('.'), bind.port()));
 
-	let (pairing_session, pairing_payload) = if no_pairing {
-		(None, None)
-	} else {
-		let session = pairing::PairingSession::issue();
-		let payload = pairing::PairingPayload::new(&url, &tls_identity.fingerprint, session.code());
-		println!(
-			"Pairing open for {} seconds. Encode this into the QR:",
-			pairing::PAIRING_CODE_TTL.as_secs()
-		);
-		println!();
-		println!("  {}", payload.to_json());
-		println!();
-		println!("Or type-in: url {url}  code {}", session.code());
-		if let Some(m) = &mdns_url {
-			println!("Or via mDNS: {m}");
-		}
-		println!("Cert fingerprint (SHA-256): {}", tls_identity.fingerprint);
-		println!();
-		(Some(session), Some(payload))
-	};
+	// Phone pairing has no startup window (Phase 14.5): codes are
+	// minted on demand — by the local Companion panel over the
+	// control socket, or by an enrolled IDE over its WS.
 
-	// Enrollment session (Phase 14). Mirror of the pairing block above:
-	// issue a single-use code unless `--no-enrollment`, print it for
-	// the operator to share with the IDE's enroll UI.
+	// Enrollment session (Phase 14): issue a single-use code unless
+	// `--no-enrollment`, print it for the operator to share with the
+	// IDE's enroll UI. Startup-only because it bootstraps the trust
+	// an on-demand path would need.
 	let enrollment_session = if no_enrollment {
 		None
 	} else {
@@ -418,8 +390,6 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 		bridge_dir,
 		web_root,
 		devices,
-		pairing: pairing_session,
-		pairing_payload,
 		mdns_url,
 		advertise_ip: detected_ip,
 		ides,
@@ -452,16 +422,6 @@ fn detect_lan_ipv4() -> Option<std::net::Ipv4Addr> {
 		IpAddr::V4(v4) if !v4.is_loopback() => Some(v4),
 		_ => None,
 	}
-}
-
-fn run_pair_code() -> anyhow::Result<()> {
-	let session = pairing::PairingSession::issue();
-	println!("Pairing code: {}", session.code());
-	println!("Valid for {} seconds.", pairing::PAIRING_CODE_TTL.as_secs());
-	// The session is dropped here: the `serve` listener holds its own
-	// session in memory and runs `verify_and_consume` when the phone
-	// presents the code. This subcommand just demonstrates issuance.
-	Ok(())
 }
 
 fn print_json(found: &[discovery::DiscoveredWorkspace]) {
