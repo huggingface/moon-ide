@@ -454,9 +454,11 @@ pub async fn coder_new_worktree_session(
 	// mint workers via `spawn_worker` without going through the Tauri
 	// command layer). The UI path always mints an ordinary `Agent`
 	// worker; a coordinator is created the same way with `Coordinator`.
+	// `parent_folder: None` = UI-driven: the active folder at click
+	// time is the parent, and the new session becomes visible.
 	let (session, workspace) = state
 		.coder
-		.create_worktree_session(base_branch, moon_coder::tools::CoderMode::Agent)
+		.create_worktree_session(base_branch, moon_coder::tools::CoderMode::Agent, None)
 		.await?;
 	Ok(NewWorktreeSession { workspace, session })
 }

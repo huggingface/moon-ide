@@ -516,20 +516,27 @@ impl CoderState {
 	}
 
 	/// The folder that owns the coder session list for the current
-	/// active folder (ADR 0028 — per-project session scoping). A
-	/// worktree folder defers to its **parent project root**, so a
-	/// parent and all its worktrees share one session list; any other
-	/// folder is its own root. `None` when nothing is active. The
-	/// parent fallback to the active folder covers an orphaned
-	/// worktree whose parent isn't bound (shouldn't happen post-W.3).
+	/// active folder (ADR 0028 — per-project session scoping).
+	/// `None` when nothing is active.
 	async fn coder_root_folder(&self) -> Option<Arc<WorkspaceFolderEntry>> {
 		let active = self.workspaces.active_folder().await?;
-		if let moon_protocol::workspace::FolderOrigin::Worktree { parent_path, .. } = &active.folder.origin {
+		Some(self.coder_root_of(active).await)
+	}
+
+	/// The folder that owns the coder session list for `folder`
+	/// (ADR 0028 — per-project session scoping). A worktree folder
+	/// defers to its **parent project root**, so a parent and all its
+	/// worktrees share one session list; any other folder is its own
+	/// root. The parent fallback to the folder itself covers an
+	/// orphaned worktree whose parent isn't bound (shouldn't happen
+	/// post-W.3).
+	async fn coder_root_of(&self, folder: Arc<WorkspaceFolderEntry>) -> Arc<WorkspaceFolderEntry> {
+		if let moon_protocol::workspace::FolderOrigin::Worktree { parent_path, .. } = &folder.folder.origin {
 			if let Some(parent) = self.workspaces.folder_for_path(parent_path).await {
-				return Some(parent);
+				return parent;
 			}
 		}
-		Some(active)
+		folder
 	}
 
 	/// Resolve to `(coder-root folder's FolderSession, folder path)`
@@ -1544,16 +1551,37 @@ impl CoderHandle {
 	///
 	/// `mode` selects the new session's top-level mode — `Agent` for
 	/// an ordinary worker (the common case), `Coordinator` for a
-	/// sub-orchestrator. The active folder is unchanged; the new
-	/// session is set visible so the panel opens it, matching the
-	/// historical Tauri-command behaviour.
+	/// sub-orchestrator.
+	///
+	/// `parent_folder` pins the project the worktree is created off
+	/// and the session list the worker is filed under. `None` means
+	/// UI-driven: resolve the active folder at call time and set the
+	/// new session visible so the panel opens it (the historical
+	/// Tauri-command behaviour). `Some(path)` means agent-driven
+	/// (`spawn_worker`): the coordinator's own folder is used, and
+	/// the visible session is left alone — re-reading the active
+	/// folder here would file the worker under whatever project the
+	/// user happens to be looking at mid-turn, and flipping
+	/// visibility would silently redirect the user's composer to the
+	/// worker (coder.md: tools close over the session's bound folder,
+	/// not the live active folder).
 	pub async fn create_worktree_session(
 		&self,
 		base_branch: Option<String>,
 		mode: CoderMode,
+		parent_folder: Option<String>,
 	) -> Result<(SessionSummary, moon_protocol::workspace::Workspace), CoderError> {
 		use moon_core::host::WorktreeBranch;
-		let parent = self.state.workspaces.require_active_folder().await?;
+		let ui_driven = parent_folder.is_none();
+		let parent = match parent_folder {
+			Some(path) => self
+				.state
+				.workspaces
+				.folder_for_path(&path)
+				.await
+				.ok_or_else(|| CoderError::Internal(format!("no bound folder at `{path}`")))?,
+			None => self.state.workspaces.require_active_folder().await?,
+		};
 		let parent_path = parent.folder.path.clone();
 		let spec = match base_branch.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
 			Some(existing) => WorktreeBranch::Existing(existing.to_string()),
@@ -1582,8 +1610,11 @@ impl CoderHandle {
 		// Mint the session in the chosen mode and stamp the worktree
 		// routing. Builds from `new_blank_with_mode` so a coordinator
 		// worker gets its system-prompt seed; an ordinary worker is
-		// `Agent`.
-		let (fs, _) = self.state.active_folder_session().await?;
+		// `Agent`. Filed under the resolved parent's coder root —
+		// never re-read from the active folder, which may have
+		// changed since `parent` was resolved.
+		let root = self.state.coder_root_of(parent).await;
+		let fs = self.state.folder_session_for(Utf8Path::new(&root.folder.path)).await;
 		let mut blank = Session::new_blank_with_mode(mode);
 		blank.header.worktree_root = Some(wt_entry.folder.path.clone());
 		blank.header.worktree_branch = Some(branch);
@@ -1591,7 +1622,9 @@ impl CoderHandle {
 		let id = blank.header.id.clone();
 		let rt = Arc::new(SessionRuntime::new(blank));
 		fs.insert_runtime(id.clone(), rt).await;
-		fs.set_visible(id).await;
+		if ui_driven {
+			fs.set_visible(id).await;
+		}
 		let workspace = self.state.workspaces.snapshot().await;
 		Ok((summary, workspace))
 	}
@@ -4351,13 +4384,13 @@ async fn dispatch_tool_calls(
 			} else if call.function.name == "review_worker_changes" {
 				handle_review_worker_changes(state, &args).await
 			} else if call.function.name == "workspace_scm_status" {
-				handle_workspace_scm_status(state, &args).await
+				handle_workspace_scm_status(state, sink, &args).await
 			} else if call.function.name == "commit_worker_changes" {
 				handle_commit_worker_changes(state, &args).await
 			} else if call.function.name == "clone_repo" {
-				handle_clone_repo(state, &args).await
+				handle_clone_repo(state, sink, &args).await
 			} else if call.function.name == "init_repo" {
-				handle_init_repo(state, &args).await
+				handle_init_repo(state, sink, &args).await
 			} else {
 				state.tools.dispatch(&call.function.name, &args, cx, cancel).await
 			};
@@ -4761,10 +4794,13 @@ async fn handle_spawn_worker(
 	}
 	// Mint the worker as an ordinary `Agent` session in a worktree.
 	// A sub-orchestrator would pass `Coordinator` here, but that's a
-	// later-scale concern; v1 workers are plain agents.
+	// later-scale concern; v1 workers are plain agents. The worker's
+	// parent project is the **coordinator's own folder** (the sink's),
+	// never the live active folder — the user may have switched
+	// projects while this turn was running.
 	let handle = CoderHandle { state: state.clone() };
 	let (summary, _workspace) = handle
-		.create_worktree_session(parsed.base_branch, CoderMode::Agent)
+		.create_worktree_session(parsed.base_branch, CoderMode::Agent, Some(sink.folder().to_string()))
 		.await?;
 	let target_folder = summary.worktree_branch.as_deref().unwrap_or("").to_string();
 	// Seed the worker with the task prompt.
@@ -4999,7 +5035,11 @@ fn filter_diff_to_files(diff: &str, files: &std::collections::HashSet<&str>) -> 
 /// `workspace_scm_status` — read-only SCM state for a worker's
 /// worktree (or the main folder). Composes branch info, file change
 /// counts, and the file list into one compact snapshot (ADR 0030).
-async fn handle_workspace_scm_status(state: &Arc<CoderState>, args: &Value) -> Result<Value, CoderError> {
+async fn handle_workspace_scm_status(
+	state: &Arc<CoderState>,
+	sink: &FolderEventSink,
+	args: &Value,
+) -> Result<Value, CoderError> {
 	#[derive(serde::Deserialize)]
 	struct ScmStatusArgs {
 		#[serde(default)]
@@ -5008,8 +5048,9 @@ async fn handle_workspace_scm_status(state: &Arc<CoderState>, args: &Value) -> R
 	let parsed: ScmStatusArgs = serde_json::from_value(args.clone())
 		.map_err(|err| CoderError::invalid_args("workspace_scm_status", err.to_string()))?;
 	// Resolve the folder to query. If `worker_id` is provided,
-	// resolve the worker's worktree root; otherwise use the active
-	// folder.
+	// resolve the worker's worktree root; otherwise use the
+	// coordinator's own folder (never the live active folder — the
+	// user may have switched projects mid-turn).
 	let routing_path = match &parsed.worker_id {
 		Some(worker_id) => {
 			let Some((rt, _)) = state.runtime_for_session(worker_id).await else {
@@ -5032,10 +5073,7 @@ async fn handle_workspace_scm_status(state: &Arc<CoderState>, args: &Value) -> R
 				}
 			}
 		}
-		None => {
-			let (_, folder_path) = state.active_folder_session().await?;
-			folder_path.to_string()
-		}
+		None => sink.folder().to_string(),
 	};
 	let Some(folder) = state.workspaces.folder_for_path(&routing_path).await else {
 		return Err(CoderError::invalid_args(
@@ -5228,7 +5266,7 @@ fn is_safe_host_path(path: &Utf8Path) -> bool {
 
 /// `clone_repo` — clone a git repo to a host path and register it
 /// as a workspace folder (ADR 0030).
-async fn handle_clone_repo(state: &Arc<CoderState>, args: &Value) -> Result<Value, CoderError> {
+async fn handle_clone_repo(state: &Arc<CoderState>, sink: &FolderEventSink, args: &Value) -> Result<Value, CoderError> {
 	#[derive(serde::Deserialize)]
 	struct CloneArgs {
 		url: String,
@@ -5243,10 +5281,14 @@ async fn handle_clone_repo(state: &Arc<CoderState>, args: &Value) -> Result<Valu
 			"URL must be https://, http://, ssh://, or git@ (file:// and local paths are rejected)",
 		));
 	}
-	let (_, folder_path) = state.active_folder_session().await?;
+	// The coordinator's own folder anchors both the sibling-dest
+	// derivation and the host that runs the git command — never the
+	// live active folder (the user may have switched projects
+	// mid-turn).
+	let folder_path = Utf8PathBuf::from(sink.folder());
 	// Resolve the destination path. If the caller provided one, use
-	// it. Otherwise, clone into a sibling of the active folder using
-	// the repo's basename.
+	// it. Otherwise, clone into a sibling of the coordinator's
+	// folder using the repo's basename.
 	let dest = match &parsed.path {
 		Some(p) => {
 			let path = Utf8PathBuf::from(p);
@@ -5275,11 +5317,11 @@ async fn handle_clone_repo(state: &Arc<CoderState>, args: &Value) -> Result<Valu
 				.join(basename)
 		}
 	};
-	// Run the clone on the host via the active folder's host.
+	// Run the clone on the host via the coordinator folder's host.
 	let Some(folder) = state.workspaces.folder_for_path(folder_path.as_str()).await else {
 		return Err(CoderError::invalid_args(
 			"clone_repo",
-			"could not resolve active folder host for git clone",
+			"could not resolve the session's folder host for git clone",
 		));
 	};
 	folder.host.git_clone(&parsed.url, &dest).await?;
@@ -5296,7 +5338,7 @@ async fn handle_clone_repo(state: &Arc<CoderState>, args: &Value) -> Result<Valu
 
 /// `init_repo` — initialize a new git repo at a host path and
 /// register it as a workspace folder (ADR 0030).
-async fn handle_init_repo(state: &Arc<CoderState>, args: &Value) -> Result<Value, CoderError> {
+async fn handle_init_repo(state: &Arc<CoderState>, sink: &FolderEventSink, args: &Value) -> Result<Value, CoderError> {
 	#[derive(serde::Deserialize)]
 	struct InitArgs {
 		path: String,
@@ -5310,11 +5352,13 @@ async fn handle_init_repo(state: &Arc<CoderState>, args: &Value) -> Result<Value
 			"path must be absolute, must not contain `..`, and must not be a system-critical path",
 		));
 	}
-	let (_, folder_path) = state.active_folder_session().await?;
-	let Some(folder) = state.workspaces.folder_for_path(folder_path.as_str()).await else {
+	// The coordinator's own folder supplies the host that runs the
+	// git command — never the live active folder (the user may have
+	// switched projects mid-turn).
+	let Some(folder) = state.workspaces.folder_for_path(sink.folder()).await else {
 		return Err(CoderError::invalid_args(
 			"init_repo",
-			"could not resolve active folder host for git init",
+			"could not resolve the session's folder host for git init",
 		));
 	};
 	folder.host.git_init(&dest).await?;

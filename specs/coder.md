@@ -511,8 +511,12 @@ session's running turn.
 
 Tools captured by a running turn close over the **session's bound
 folder**, not the live active folder — switching folders mid-turn
-cannot redirect tool calls. `abort` targets the active folder's
-visible session only; sign-out is the one global cancel.
+cannot redirect tool calls. This includes the coordinator tools
+(ADR 0030): `spawn_worker` creates the worktree off and files the
+worker under the **coordinator's own project** (without touching the
+visible session), and `clone_repo` / `init_repo` /
+`workspace_scm_status` anchor to it too. `abort` targets the active
+folder's visible session only; sign-out is the one global cancel.
 
 `coder:event` payloads are wrapped in a
 `CoderEventEnvelope { folder, session_id, event }` so the frontend
