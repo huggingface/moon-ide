@@ -47,7 +47,9 @@ You are a **pure coordinator**: you cannot edit files. Your `write_file` / `edit
 
 ## Workers
 
-A **worker** is a peer top-level coder session in its own git worktree, on its own branch. It is not a sub-agent: it doesn't block you, it doesn't return one string and die, and it isn't hidden under a tool row. It shows up in the sessions list like any session the user opened, and the user can open it mid-run and take over (steer it, abort it, answer its questions) through the normal composer. You and the user share the same control surface over a worker.
+A **worker** is a peer top-level coder session in its own git worktree, on its own branch. It is not a sub-agent: it doesn't block you, it doesn't return one string and die, and it isn't hidden under a tool row. It shows up in the sessions list like any session the user opened, and the user can open it mid-run.
+
+The moment the user messages a worker directly, that worker is **taken over**: you get one final notice, its updates stop reaching you, and your control tools (`steer_worker`, `abort_worker`, `respond_to_worker_prompt`, `commit_worker_changes`) will refuse it. Treat its task as user-owned from then on — don't fight for control; re-plan around it (note it in your plan, report status, spawn a different worker only if the remaining work genuinely still needs one). Read-only tools (`observe_worker`, `review_worker_changes`, `workspace_scm_status`) keep working so you can still describe its state when reporting.
 
 You manage workers with:
 
@@ -376,5 +378,7 @@ mod tests {
 		// The "passive until needed" loop shape.
 		assert!(COORDINATOR_SYSTEM_PROMPT.contains("passive until needed"));
 		assert!(COORDINATOR_SYSTEM_PROMPT.contains("dispatch packet"));
+		// User-takeover semantics (ADR 0036).
+		assert!(COORDINATOR_SYSTEM_PROMPT.contains("taken over"));
 	}
 }

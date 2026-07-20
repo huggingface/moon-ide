@@ -518,6 +518,15 @@ visible session), and `clone_repo` / `init_repo` /
 `workspace_scm_status` anchor to it too. `abort` targets the active
 folder's visible session only; sign-out is the one global cancel.
 
+A direct user message into a coordinator-spawned worker **takes the
+worker over** ([ADR 0036](decisions/0036-worker-takeover.md)): the
+coordinator gets one final notice, stops receiving the worker's
+dispatch packets, and its control tools (`steer_worker`,
+`abort_worker`, `respond_to_worker_prompt`, `commit_worker_changes`)
+refuse the worker from then on — read-only observation still works.
+Viewing, panel-abort, and answering an `ask_user` card don't trigger
+takeover; the first typed message does.
+
 `coder:event` payloads are wrapped in a
 `CoderEventEnvelope { folder, session_id, event }` so the frontend
 routes updates to the right per-`(folder, session)` bucket.
