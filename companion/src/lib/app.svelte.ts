@@ -88,10 +88,21 @@ export type PendingPrompt = {
 	questions: AskUserQuestion[];
 };
 
-// The coder event is an open set on the wire. We read it as a loose
-// record and pull fields defensively per type, rather than a closed
-// union that would choke on unknown variants.
-type RawEvent = { type?: string; kind?: string; [key: string]: unknown };
+/** Reply shape of the bridge's observe-open (`coder_open_session`):
+ * the transcript replay rides in the response rather than the event
+ * stream. `events` are raw `CoderEvent`s fed through the same
+ * reducer live events use. */
+type ObservedSession = {
+	summary: SessionSummary;
+	events?: RawEvent[];
+	in_flight?: boolean;
+};
+
+// The coder event is an open set on the wire (`CoderEvent`, tagged
+// `kind`). We read it as a loose record and pull fields defensively
+// per kind, rather than a closed union that would choke on unknown
+// variants.
+type RawEvent = { kind?: string; [key: string]: unknown };
 type CoderEventEnvelope = { folder?: string; session_id?: string; event?: RawEvent };
 
 function str(ev: RawEvent, key: string): string {
@@ -186,7 +197,11 @@ class CompanionState {
 	awaitingInput = $state(false);
 	/** The pending ask_user prompt, if awaitingInput. */
 	pendingPrompt = $state<PendingPrompt | null>(null);
-	subscribed = false;
+	/** `(ide, workspace)` pairs the current socket already has an
+	 * event subscription for. Per-workspace, not per-socket — a
+	 * global boolean silently left every workspace after the first
+	 * one without live events. Cleared on reconnect / unpair. */
+	#subscriptions = new Set<string>();
 
 	/** Boot: if we already have a paired connection, reconnect; else pair. */
 	async boot(): Promise<void> {
@@ -233,7 +248,7 @@ class CompanionState {
 		this.activeFolder = null;
 		this.coderStatus = null;
 		this.sessions = [];
-		this.subscribed = false;
+		this.#subscriptions.clear();
 		this.closeSession();
 		this.phase = 'pairing';
 	}
@@ -260,7 +275,7 @@ class CompanionState {
 			await socket.open();
 			this.#socket?.close();
 			this.#socket = socket;
-			this.subscribed = false;
+			this.#subscriptions.clear();
 			this.error = null;
 			if (!this.activeWorkspace) {
 				await this.loadWorkspaces();
@@ -275,12 +290,7 @@ class CompanionState {
 				// memory anyway.
 				try {
 					this.rows = [];
-					await this.#call(
-						this.activeWorkspace,
-						'coder_open_session',
-						{ id: this.activeSession, folder: this.activeFolder },
-						this.activeIde,
-					);
+					await this.#openAndReplay(this.activeSession);
 				} catch {
 					// Keep the in-memory transcript; the next send re-syncs.
 				}
@@ -435,8 +445,10 @@ class CompanionState {
 		}
 	}
 
-	/** Open a session: load it on the backend, replay its transcript
-	 * via the event stream, and subscribe to live events. */
+	/** Open a session: subscribe to live events, then observe-open on
+	 * the backend — the transcript replay rides in the RPC response
+	 * (so it can't race the subscription, and the desktop's own
+	 * session view is never touched). */
 	async openSession(id: string): Promise<void> {
 		if (!this.activeWorkspace) {
 			return;
@@ -449,9 +461,39 @@ class CompanionState {
 		this.error = null;
 		try {
 			this.#ensureSubscribed(this.activeWorkspace, this.activeIde);
-			await this.#call(this.activeWorkspace, 'coder_open_session', { id, folder: this.activeFolder }, this.activeIde);
+			await this.#openAndReplay(id);
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
+	/** Observe-open `id` and reduce the returned replay into rows.
+	 * The trailing `turn_complete` terminator clears `busy`; a
+	 * still-streaming background turn re-asserts it via `in_flight`
+	 * (mirrors the desktop's replay handling). */
+	async #openAndReplay(id: string): Promise<void> {
+		if (!this.activeWorkspace) {
+			return;
+		}
+		const observed = await this.#call<ObservedSession>(
+			this.activeWorkspace,
+			'coder_open_session',
+			{ id, folder: this.activeFolder },
+			this.activeIde,
+		);
+		for (const event of observed.events ?? []) {
+			this.#onCoderEvent({ folder: this.activeFolder ?? '', session_id: id, event });
+		}
+		if (observed.in_flight) {
+			this.busy = true;
+			// Re-derive a live-parked ask_user prompt: its replayed
+			// tool_call set the prompt state, but the terminator
+			// cleared it again.
+			const pending = this.rows.find((r) => r.kind === 'ask_user' && !r.answered);
+			if (pending && pending.kind === 'ask_user') {
+				this.awaitingInput = true;
+				this.pendingPrompt = { callId: pending.callId, questions: pending.questions };
+			}
 		}
 	}
 
@@ -519,12 +561,18 @@ class CompanionState {
 	}
 
 	#ensureSubscribed(workspace: string, ide = ''): void {
-		if (this.subscribed || !this.#socket || !this.connection) {
+		if (!this.#socket || !this.connection) {
 			return;
 		}
-		this.#socket.onEvent((raw) => this.#onCoderEvent(raw));
+		const key = `${ide}\u0000${workspace}`;
+		if (this.#subscriptions.has(key)) {
+			return;
+		}
+		if (this.#subscriptions.size === 0) {
+			this.#socket.onEvent((raw) => this.#onCoderEvent(raw));
+		}
 		this.#socket.subscribe(this.connection.token, workspace, ide);
-		this.subscribed = true;
+		this.#subscriptions.add(key);
 	}
 
 	/** Reduce a coder event envelope onto the transcript rows. */
@@ -554,10 +602,10 @@ class CompanionState {
 			}
 			return;
 		}
-		if (typeof ev.type !== 'string') {
+		if (typeof ev.kind !== 'string') {
 			return;
 		}
-		switch (ev.type) {
+		switch (ev.kind) {
 			case 'user_message':
 				this.rows.push({
 					kind: 'user',

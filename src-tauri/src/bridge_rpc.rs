@@ -88,12 +88,18 @@ impl BridgeRpcHandler for BridgeRpc {
 			// the active folder.
 			"coder_open_session" => {
 				let p: OpenSessionParams = parse_params(params)?;
-				let summary = self
+				// Observe-open: mounts the runtime and returns
+				// `{ summary, events, in_flight }` — the replay rides
+				// in this response instead of the event channel, and
+				// the desktop's visible-session state is untouched, so
+				// a phone opening a session doesn't switch the desktop
+				// panel or light background-attention badges.
+				let observed = self
 					.coder
-					.open_session_in(p.folder.as_deref(), p.id)
+					.observe_session_in(p.folder.as_deref(), p.id)
 					.await
 					.map_err(|e| e.to_string())?;
-				to_value(&summary)
+				to_value(&observed)
 			}
 			"coder_send" => {
 				let p: SendParams = parse_params(params)?;

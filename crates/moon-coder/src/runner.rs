@@ -1589,21 +1589,28 @@ impl CoderHandle {
 	/// session's metadata so the panel can reference it before
 	/// the first send.
 	pub async fn new_session(&self) -> Result<SessionSummary, CoderError> {
-		self.new_session_in(None).await
-	}
-
-	/// Folder-targeted [`Self::new_session`]: allocate the blank
-	/// session under the named bound folder instead of the active
-	/// one. Used by the bridge so the phone's project switcher can
-	/// start sessions in any folder.
-	pub async fn new_session_in(&self, folder: Option<&str>) -> Result<SessionSummary, CoderError> {
-		let (fs, _) = self.state.folder_session_or_active(folder).await?;
+		let (fs, _) = self.state.active_folder_session().await?;
 		let blank = Session::new_blank();
 		let summary = blank.summary();
 		let id = blank.header.id.clone();
 		let rt = Arc::new(SessionRuntime::new(blank));
 		fs.insert_runtime(id.clone(), rt).await;
 		fs.set_visible(id).await;
+		Ok(summary)
+	}
+
+	/// Folder-targeted [`Self::new_session`] for the bridge: allocate
+	/// the blank session under the named bound folder instead of the
+	/// active one, and **don't** make it the folder's visible session
+	/// — the phone tracks its own open session (`send_to` targets it
+	/// by id) and must not hijack what the desktop is looking at.
+	pub async fn new_session_in(&self, folder: Option<&str>) -> Result<SessionSummary, CoderError> {
+		let (fs, _) = self.state.folder_session_or_active(folder).await?;
+		let blank = Session::new_blank();
+		let summary = blank.summary();
+		let id = blank.header.id.clone();
+		let rt = Arc::new(SessionRuntime::new(blank));
+		fs.insert_runtime(id, rt).await;
 		Ok(summary)
 	}
 
@@ -2397,14 +2404,39 @@ impl CoderHandle {
 	}
 
 	pub async fn open_session(&self, id: String) -> Result<SessionSummary, CoderError> {
-		self.open_session_in(None, id).await
+		let (summary, _) = self.open_session_impl(None, id, true).await?;
+		Ok(summary)
 	}
 
-	/// Folder-targeted [`Self::open_session`]: load + replay the
-	/// session from the named bound folder's session list instead of
-	/// the active folder's. Used by the bridge so the phone's
-	/// project switcher can open sessions in any folder.
-	pub async fn open_session_in(&self, folder: Option<&str>, id: String) -> Result<SessionSummary, CoderError> {
+	/// Observe-open for the bridge (the companion's session view):
+	/// load the session from the named bound folder, mount its
+	/// runtime (so `send_to` / `abort_session` work), and **return**
+	/// the replay instead of broadcasting it. Deliberately does not
+	/// touch the folder's visible-session pointer and emits nothing
+	/// on the event channel — a phone opening a session must not
+	/// hijack the desktop's panel or light background-attention
+	/// badges.
+	pub async fn observe_session_in(&self, folder: Option<&str>, id: String) -> Result<ObservedSession, CoderError> {
+		let (summary, replay) = self.open_session_impl(folder, id, false).await?;
+		let (events, in_flight) = replay.unwrap_or_default();
+		Ok(ObservedSession {
+			summary,
+			events,
+			in_flight,
+		})
+	}
+
+	/// Shared body of [`Self::open_session`] (focus: broadcast the
+	/// replay, set the visible pointer) and
+	/// [`Self::observe_session_in`] (return the replay, touch
+	/// nothing). Returns the replay payload as `Some` only in
+	/// observe mode.
+	async fn open_session_impl(
+		&self,
+		folder: Option<&str>,
+		id: String,
+		focus: bool,
+	) -> Result<(SessionSummary, Option<(Vec<CoderEvent>, bool)>), CoderError> {
 		sessions::validate_session_id(&id)?;
 		let (fs, folder_path) = self.state.folder_session_or_active(folder).await?;
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
@@ -2568,23 +2600,29 @@ impl CoderHandle {
 			let rt = Arc::new(SessionRuntime::new(session));
 			fs.insert_runtime(id.clone(), rt).await;
 		}
-		fs.set_visible(id.clone()).await;
+		if focus {
+			fs.set_visible(id.clone()).await;
+		}
 
 		// Tell the panel to clear + reload, then fan out the
 		// records as the same events a live turn would emit.
 		// `SessionLoaded` carries the metadata so the sticky
 		// header doesn't need a follow-up IPC round trip.
+		// Observe mode emits nothing — the desktop panel follows
+		// `SessionLoaded`, and a phone-side open must not switch it.
 		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), id.clone());
-		sink.send(CoderEvent::SessionLoaded {
-			id: summary.id.clone(),
-			title: summary.title.clone(),
-			created_at_ms: summary.created_at_ms,
-			updated_at_ms: summary.updated_at_ms,
-			worktree_root: summary.worktree_root.clone(),
-			worktree_branch: summary.worktree_branch.clone(),
-			committed_branch: summary.committed_branch.clone(),
-			mode: summary.mode.clone(),
-		});
+		if focus {
+			sink.send(CoderEvent::SessionLoaded {
+				id: summary.id.clone(),
+				title: summary.title.clone(),
+				created_at_ms: summary.created_at_ms,
+				updated_at_ms: summary.updated_at_ms,
+				worktree_root: summary.worktree_root.clone(),
+				worktree_branch: summary.worktree_branch.clone(),
+				committed_branch: summary.committed_branch.clone(),
+				mode: summary.mode.clone(),
+			});
+		}
 		// Collect the entire replay into one `Vec` and ship it as a
 		// single `CoderEvent::Replay`. The frontend delivers each
 		// Tauri event as its own task, so fanning a 1000-record
@@ -2751,10 +2789,18 @@ impl CoderHandle {
 			in_flight = true;
 		}
 		replay_events.push(CoderEvent::TurnComplete);
-		sink.send(CoderEvent::Replay {
-			events: replay_events,
-			in_flight,
-		});
+		// Focus: broadcast the batch for the desktop panel's reduce
+		// pass. Observe: hand it back to the caller (the bridge ships
+		// it in the RPC response) so nothing reaches the desktop.
+		let observed_replay = if focus {
+			sink.send(CoderEvent::Replay {
+				events: replay_events,
+				in_flight,
+			});
+			None
+		} else {
+			Some((replay_events, in_flight))
+		};
 		// Cold-resume an interrupted `ask_user`: spawn a fresh turn
 		// loop whose first iteration re-dispatches the parked prompt.
 		// `handle_ask_user` registers a new oneshot on the
@@ -2784,7 +2830,7 @@ impl CoderHandle {
 				);
 			}
 		}
-		Ok(summary)
+		Ok((summary, observed_replay))
 	}
 
 	/// Delete a persisted session under the active workspace
@@ -3523,6 +3569,18 @@ impl SendTarget {
 	pub fn pointer_key(&self) -> &str {
 		self.worktree_root.as_deref().unwrap_or(&self.coder_root)
 	}
+}
+
+/// Result of [`Coder::observe_session_in`] — the session's summary
+/// plus its full replay, returned to the caller (the bridge ships it
+/// in the `coder_open_session` RPC response) instead of broadcast on
+/// the event channel. `in_flight` mirrors `CoderEvent::Replay`'s
+/// flag: the session still has a turn streaming in the background.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ObservedSession {
+	pub summary: SessionSummary,
+	pub events: Vec<CoderEvent>,
+	pub in_flight: bool,
 }
 
 /// Result of [`Coder::rerun_tool_call`] — the tool that was

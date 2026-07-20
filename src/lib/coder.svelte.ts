@@ -3248,8 +3248,13 @@ class CoderPanelState {
 				session.openIpcMs = null;
 				session.replayStartedAtMs = null;
 				session.replaying = false;
-				this.#flagAttentionIfBackground(folder, folderPath);
+				// Both attention markers are gated on `!wasReplay`: a
+				// replay terminator is a reopen (the user — or the
+				// phone companion — actively looking), not a
+				// background completion, so it must not light the
+				// folder-bar sparkle either.
 				if (!wasReplay) {
+					this.#flagAttentionIfBackground(folder, folderPath);
 					this.#flagSessionAttentionIfBackground(session, folder, folderPath, sessionId);
 				}
 				return;

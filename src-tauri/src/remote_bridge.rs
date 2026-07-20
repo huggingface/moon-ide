@@ -45,6 +45,16 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::focus_socket::BridgeRpcHandler;
 
+/// How often the serve loop pings the bridge. Mirrors the bridge's
+/// own `PING_INTERVAL` — either side's pings give the other side's
+/// idle detector traffic, and keep the WS alive through proxy idle
+/// timeouts (nginx `proxy_read_timeout`, ADR 0035).
+const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Read-silence deadline before the connection is declared dead and
+/// the reconnect loop takes over. Three missed ping exchanges.
+const READ_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(95);
+
 /// Keyring coordinates for the IDE's stored remote-bridge credential.
 /// One entry per enrolled bridge; the IDE stores `{ bridge_url,
 /// ide_id, token }` so a reconnect doesn't re-enroll.
@@ -444,10 +454,22 @@ async fn connect_and_serve(
 	// or `recv() -> None` would spin the select loop.
 	let mut cmd_open = true;
 
+	// Keepalive: ping the bridge every `PING_INTERVAL` (it
+	// auto-pongs, and its own pings arrive here as traffic), and
+	// treat total read silence past `READ_IDLE_TIMEOUT` as a dead
+	// connection — a suspended laptop / dropped NAT entry otherwise
+	// leaves this task believing it's connected while the bridge
+	// has long stopped hearing from us. Bailing returns into the
+	// caller's reconnect-with-backoff loop.
+	let mut ping = tokio::time::interval(PING_INTERVAL);
+	ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+	let mut last_traffic = tokio::time::Instant::now();
+
 	loop {
 		let text = tokio::select! {
 			frame = source.next() => {
 				let Some(frame) = frame else { break };
+				last_traffic = tokio::time::Instant::now();
 				match frame {
 					Ok(Message::Text(t)) => t.to_string(),
 					Ok(Message::Binary(b)) => String::from_utf8_lossy(&b).into_owned(),
@@ -463,6 +485,18 @@ async fn connect_and_serve(
 						return Err(err.into());
 					}
 				}
+			}
+			_ = ping.tick() => {
+				if last_traffic.elapsed() > READ_IDLE_TIMEOUT {
+					for tx in pending_pair.drain(..) {
+						let _ = tx.send(Err("bridge connection lost".into()));
+					}
+					return Err(anyhow::anyhow!("bridge connection idle past deadline; reconnecting"));
+				}
+				if sink.lock().await.send(Message::Ping(Vec::new().into())).await.is_err() {
+					break;
+				}
+				continue;
 			}
 			cmd = cmd_rx.recv(), if cmd_open => {
 				match cmd {

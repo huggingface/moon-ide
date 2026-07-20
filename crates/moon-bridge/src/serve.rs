@@ -635,14 +635,36 @@ async fn handle_conn(
 	// Split the socket so a subscription's pushed events and the
 	// request/reply path can both write. A single writer task owns the
 	// sink; everything else sends `ServerMessage`s down an mpsc.
+	//
+	// The writer also sends a WS Ping every `PING_INTERVAL`.
+	// Browsers and tungstenite clients auto-pong, so a live peer
+	// always produces read-side traffic — which is what the read
+	// loop's `READ_IDLE_TIMEOUT` keys off to reap half-open
+	// connections (a suspended laptop / dropped NAT entry otherwise
+	// leaves a ghost IDE registration in the live table forever).
+	// The pings also keep idle WS connections alive through proxy
+	// idle timeouts (nginx `proxy_read_timeout`, ADR 0035).
 	let (mut sink, mut source) = ws.split();
 	let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<ServerMessage>(256);
 
 	let writer = tokio::spawn(async move {
-		while let Some(msg) = out_rx.recv().await {
-			let json = serde_json::to_string(&msg).unwrap_or_else(|_| r#"{"type":"error","message":"encode failed"}"#.into());
-			if sink.send(Message::Text(json.into())).await.is_err() {
-				break;
+		let mut ping = tokio::time::interval(PING_INTERVAL);
+		ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+		loop {
+			tokio::select! {
+				msg = out_rx.recv() => {
+					let Some(msg) = msg else { break };
+					let json =
+						serde_json::to_string(&msg).unwrap_or_else(|_| r#"{"type":"error","message":"encode failed"}"#.into());
+					if sink.send(Message::Text(json.into())).await.is_err() {
+						break;
+					}
+				}
+				_ = ping.tick() => {
+					if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
+						break;
+					}
+				}
 			}
 		}
 	});
@@ -652,9 +674,20 @@ async fn handle_conn(
 	// registers, so its cleanup below is a no-op.
 	let conn_id = ctx.conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-	while let Some(frame) = source.next().await {
-		let msg = frame?;
-		let text = match msg {
+	loop {
+		// A live peer pongs our periodic pings, so total read
+		// silence past the timeout means the connection is dead
+		// (half-open TCP) — fall through to the cleanup below
+		// instead of holding a ghost registration.
+		let frame = match tokio::time::timeout(READ_IDLE_TIMEOUT, source.next()).await {
+			Ok(Some(frame)) => frame?,
+			Ok(None) => break,
+			Err(_) => {
+				tracing::info!(%peer, conn_id, "connection idle past deadline; treating as dead");
+				break;
+			}
+		};
+		let text = match frame {
 			Message::Text(t) => t.to_string(),
 			Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
 			Message::Close(_) => break,
@@ -949,18 +982,32 @@ async fn handle_workspaces(ctx: &ServeCtx, token: &str) -> ServerMessage {
 	};
 	// Remote-carrier workspaces (enrolled IDE connections in the live
 	// table, 14.1). Each is tagged with its owning IDE's id so the
-	// phone can group by host.
+	// phone can group by host. Deduped by `(ide_id, workspace)`
+	// keeping the newest connection: an IDE that reconnects while
+	// its previous half-open connection awaits the idle reaper would
+	// otherwise list the same workspace twice.
 	let live = ctx.live_ides.lock().await;
-	for conn in live.values() {
+	let mut newest: HashMap<(String, String), (u64, &RemoteWorkspace)> = HashMap::new();
+	for (conn_id, conn) in live.iter() {
 		for w in &conn.workspaces {
-			entries.push(serde_json::json!({
-				"id": w.id,
-				"name": w.name,
-				"last_active_at": w.last_active_at,
-				"live": true,
-				"ide": conn.ide_id,
-			}));
+			let key = (conn.ide_id.clone(), w.id.clone());
+			let replace = newest.get(&key).is_none_or(|(existing, _)| existing < conn_id);
+			if replace {
+				newest.insert(key, (*conn_id, w));
+			}
 		}
+	}
+	let mut remote: Vec<_> = newest.into_iter().collect();
+	// Deterministic order for the phone (HashMap iteration isn't).
+	remote.sort_by(|((a_ide, a_ws), _), ((b_ide, b_ws), _)| a_ide.cmp(b_ide).then_with(|| a_ws.cmp(b_ws)));
+	for ((ide_id, _), (_, w)) in remote {
+		entries.push(serde_json::json!({
+			"id": w.id,
+			"name": w.name,
+			"last_active_at": w.last_active_at,
+			"live": true,
+			"ide": ide_id,
+		}));
 	}
 	ServerMessage::Workspaces {
 		workspaces: serde_json::Value::Array(entries),
@@ -1095,9 +1142,11 @@ async fn handle_pair_code(ctx: &ServeCtx, token: &str) -> ServerMessage {
 /// Resolve the live IDE connection that owns `(ide_id, workspace)`.
 /// Several connections can share an `ide_id` (one per workspace
 /// process on that host, ADR 0014); the workspace slug picks the
-/// right one. No fallback to an ide-only match — the phone builds
-/// the pair from the `workspaces` reply, so a miss means the
-/// process is gone and the caller should error, not misroute.
+/// right one, and the **newest** connection wins when a restarted
+/// process's ghost predecessor is still awaiting the idle reaper.
+/// No fallback to an ide-only match — the phone builds the pair
+/// from the `workspaces` reply, so a miss means the process is gone
+/// and the caller should error, not misroute.
 fn find_ide_conn<'a>(
 	live: &'a HashMap<u64, IdeConnection>,
 	ide_id: &str,
@@ -1105,7 +1154,8 @@ fn find_ide_conn<'a>(
 ) -> Option<(u64, &'a IdeConnection)> {
 	live
 		.iter()
-		.find(|(_, c)| c.ide_id == ide_id && c.workspaces.iter().any(|w| w.id == workspace))
+		.filter(|(_, c)| c.ide_id == ide_id && c.workspaces.iter().any(|w| w.id == workspace))
+		.max_by_key(|(id, _)| **id)
 		.map(|(id, c)| (*id, c))
 }
 
@@ -1241,3 +1291,13 @@ async fn handle_call(
 /// session list), but the coder lock can be briefly contended
 /// mid-turn, so we're generous — mirrors `relay::RESPONSE_TIMEOUT`.
 const FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often each connection's writer sends a WS Ping. Peers
+/// auto-pong, giving the read loop steady traffic to prove liveness
+/// and keeping idle connections alive through proxy idle timeouts.
+const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Read-silence deadline. Three missed ping/pong exchanges means the
+/// peer is gone (half-open TCP after a suspend / NAT drop); the
+/// connection is torn down and any IDE registration reaped.
+const READ_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(95);

@@ -186,6 +186,12 @@ requested surface:
   Session list / open / new reuse the existing `coder_*` commands.
   Send / abort carry the phone's open `session_id` so they can't
   land in whatever session the desktop happens to have visible.
+  Opening a session from the phone is an **observe-open**: the
+  runtime mounts (so send/abort by id work) and the transcript
+  replay returns in the RPC response, but the folder's
+  visible-session pointer stays untouched and nothing is broadcast
+  — the phone never switches the desktop's panel or lights its
+  background-attention badges.
 - **Review & commit.** Read-mostly diff review plus commit / amend /
   sync over the existing [git layer](roadmaps/phase-05-git.md).
   Diffs render on a phone; full editing does not, and isn't
@@ -328,6 +334,15 @@ fingerprint }` — an enrolled IDE asks the bridge to mint a fresh
   pairing window opens from "bridge startup only" to "on demand from
   the IDE". Codes keep the usual TTL + single-use semantics; one live
   pairing session at a time (a new request replaces the old code).
+
+Liveness: every WS connection (phone and IDE, both directions)
+carries a 30 s ping / 95 s read-idle deadline. Without it a
+half-open TCP (suspended laptop, dropped NAT entry) left a ghost
+workspace registration in the bridge's live table indefinitely; the
+pings double as traffic through proxy idle timeouts (nginx
+`proxy_read_timeout`, ADR 0035). The `workspaces` reply additionally
+dedupes by `(ide, workspace)` keeping the newest connection, so a
+restarted IDE doesn't list twice while its ghost awaits the reaper.
 
 The bridge ↔ IDE hop reuses the same WS framing; the IDE is a WS
 **client** (a new persistent outbound-connection module in the IDE), not
