@@ -436,6 +436,11 @@ class CompanionState {
 			const active = this.folders.find((f) => f.path === snap.active_folder);
 			this.activeFolder = active?.path ?? this.folders[0]?.path ?? null;
 			this.coderStatus = await this.#call<CoderStatus>(workspace, 'coder_status', {}, ide);
+			// Subscribe to the event stream immediately so the
+			// session list's running pips light up without having
+			// to open a session first. Without this, busySessions
+			// stays empty until the user opens a session.
+			this.#ensureSubscribed(workspace, ide);
 			void this.#loadModelSettings();
 			void this.loadScmStatus();
 			this.sessions = await this.#loadSessions();

@@ -1010,30 +1010,47 @@ async fn handle_workspaces(ctx: &ServeCtx, token: &str) -> ServerMessage {
 	// keeping the newest connection: an IDE that reconnects while
 	// its previous half-open connection awaits the idle reaper would
 	// otherwise list the same workspace twice.
+	//
+	// `live` is OR'd across all connections reporting the same
+	// `(ide_id, workspace)` — two IDE processes on the same host
+	// (same `ide_id` = hostname) each report the full catalog, but
+	// only the one that actually has the workspace open marks it
+	// `live: true`. A newest-wins replace would let a stale
+	// connection's `live: false` overwrite a live one.
 	let live = ctx.live_ides.lock().await;
-	let mut newest: HashMap<(String, String), (u64, &RemoteWorkspace)> = HashMap::new();
+	let mut best: HashMap<(String, String), (u64, bool, &RemoteWorkspace)> = HashMap::new();
 	for (conn_id, conn) in live.iter() {
 		for w in &conn.workspaces {
 			let key = (conn.ide_id.clone(), w.id.clone());
-			let replace = newest.get(&key).is_none_or(|(existing, _)| existing < conn_id);
-			if replace {
-				newest.insert(key, (*conn_id, w));
+			match best.get(&key) {
+				None => {
+					best.insert(key, (*conn_id, w.live, w));
+				}
+				Some(&(existing_conn, existing_live, _)) => {
+					// Keep the newest connection's metadata, but OR
+					// the live flag so a live report from any
+					// connection wins.
+					if conn_id >= &existing_conn {
+						best.insert(key, (*conn_id, existing_live || w.live, w));
+					} else if w.live && !existing_live {
+						// Older connection but it says live — OR it in.
+						if let Some(entry) = best.get_mut(&key) {
+							entry.1 = true;
+						}
+					}
+				}
 			}
 		}
 	}
-	let mut remote: Vec<_> = newest.into_iter().collect();
+	let mut remote: Vec<_> = best.into_iter().collect();
 	// Deterministic order for the phone (HashMap iteration isn't).
 	remote.sort_by(|((a_ide, a_ws), _), ((b_ide, b_ws), _)| a_ide.cmp(b_ide).then_with(|| a_ws.cmp(b_ws)));
-	for ((ide_id, _), (_, w)) in remote {
+	for ((ide_id, _), (_, live, w)) in remote {
 		entries.push(serde_json::json!({
 			"id": w.id,
 			"name": w.name,
 			"last_active_at": w.last_active_at,
-			// The IDE reports live/stopped per workspace in its
-			// `Register`; the bridge can't probe sockets on the
-			// IDE's host, so this field is the only liveness signal
-			// for remote-carrier workspaces.
-			"live": w.live,
+			"live": live,
 			"ide": ide_id,
 		}));
 	}
@@ -1175,6 +1192,12 @@ async fn handle_pair_code(ctx: &ServeCtx, token: &str) -> ServerMessage {
 /// No fallback to an ide-only match — the phone builds the pair
 /// from the `workspaces` reply, so a miss means the process is gone
 /// and the caller should error, not misroute.
+///
+/// When multiple connections match (every IDE process reports the
+/// full catalog, so all match any workspace), prefer the one that
+/// has the workspace marked `live: true` — that's the process that
+/// actually has it open. Fall back to newest-wins for the
+/// ghost-reconnect case where no connection claims it live.
 fn find_ide_conn<'a>(
 	live: &'a HashMap<u64, IdeConnection>,
 	ide_id: &str,
@@ -1183,7 +1206,11 @@ fn find_ide_conn<'a>(
 	live
 		.iter()
 		.filter(|(_, c)| c.ide_id == ide_id && c.workspaces.iter().any(|w| w.id == workspace))
-		.max_by_key(|(id, _)| **id)
+		// Prefer live, then newest — `max_by_key` on a tuple sorts
+		// lexicographically, so `(true, conn_id)` beats `(false, any)`.
+		.max_by_key(|(id, c)| {
+			(c.workspaces.iter().any(|w| w.id == workspace && w.live), **id)
+		})
 		.map(|(id, c)| (*id, c))
 }
 
