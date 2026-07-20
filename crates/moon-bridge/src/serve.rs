@@ -971,11 +971,13 @@ async fn handle_workspaces(ctx: &ServeCtx, token: &str) -> ServerMessage {
 async fn handle_pair(ctx: &ServeCtx, code: &str, label: &str) -> ServerMessage {
 	let mut guard = ctx.pairing.lock().await;
 	let Some(session) = guard.as_mut() else {
+		tracing::warn!("pair attempt while pairing is closed");
 		return ServerMessage::Error {
 			message: "pairing is closed; ask the desktop to start a new pairing".into(),
 		};
 	};
 	if let Err(err) = session.verify_and_consume(code) {
+		tracing::warn!(error = %err, "pair attempt rejected");
 		return ServerMessage::Error {
 			message: err.to_string(),
 		};
@@ -986,10 +988,13 @@ async fn handle_pair(ctx: &ServeCtx, code: &str, label: &str) -> ServerMessage {
 
 	let device = PairedDevice::mint(label);
 	match ctx.devices.add(device) {
-		Ok(stored) => ServerMessage::Paired {
-			device_id: stored.id,
-			token: stored.token,
-		},
+		Ok(stored) => {
+			tracing::info!(device_id = %stored.id, label = %stored.label, "device paired");
+			ServerMessage::Paired {
+				device_id: stored.id,
+				token: stored.token,
+			}
+		}
 		Err(err) => ServerMessage::Error {
 			message: format!("could not store device: {err}"),
 		},
@@ -1004,11 +1009,13 @@ async fn handle_pair(ctx: &ServeCtx, code: &str, label: &str) -> ServerMessage {
 async fn handle_enroll(ctx: &ServeCtx, code: &str, label: &str, ide_id: &str) -> ServerMessage {
 	let mut guard = ctx.enrollment.lock().await;
 	let Some(session) = guard.as_mut() else {
+		tracing::warn!(%ide_id, "enroll attempt while enrollment is closed");
 		return ServerMessage::Error {
 			message: "enrollment is closed; ask the operator to issue a new enrollment code".into(),
 		};
 	};
 	if let Err(err) = session.verify_and_consume(code) {
+		tracing::warn!(%ide_id, error = %err, "enroll attempt rejected");
 		return ServerMessage::Error {
 			message: err.to_string(),
 		};
@@ -1019,10 +1026,13 @@ async fn handle_enroll(ctx: &ServeCtx, code: &str, label: &str, ide_id: &str) ->
 
 	let ide = EnrolledIde::mint(ide_id, label);
 	match ctx.ides.add(ide) {
-		Ok(stored) => ServerMessage::Enrolled {
-			ide_id: stored.id,
-			token: stored.token,
-		},
+		Ok(stored) => {
+			tracing::info!(ide_id = %stored.id, label = %stored.label, "IDE enrolled");
+			ServerMessage::Enrolled {
+				ide_id: stored.id,
+				token: stored.token,
+			}
+		}
 		Err(err) => ServerMessage::Error {
 			message: format!("could not store IDE: {err}"),
 		},
