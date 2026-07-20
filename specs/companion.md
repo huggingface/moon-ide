@@ -109,10 +109,13 @@ secret storage already in use.
 
 1. Bridge generates its TLS keypair + self-signed cert on first run.
 2. Desktop surfaces a **pairing QR** (a "Companion" affordance,
-   home is the status bar or a small settings modal) encoding:
-   - `wss://<lan-ip>:53180`
-   - the bridge cert **fingerprint**
-   - a short-lived **pairing token** (~120 s TTL).
+   home is the status bar or a small settings modal). The QR encodes a
+   **link to the PWA itself** with the code in the fragment
+   (`https://<bridge-host>/#pair=<code>`), so a camera scan opens the
+   PWA and it pairs itself — the phone derives the WS URL from the
+   page origin (the PWA is served by the same listener), and the
+   fragment never reaches server logs. Type-in fallback: the URL +
+   code shown alongside the QR.
 
    Codes are minted **on demand** (a "Show pairing QR" button — the
    local panel asks over the control socket, a remote-enrolled IDE

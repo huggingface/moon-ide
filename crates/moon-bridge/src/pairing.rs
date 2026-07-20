@@ -129,40 +129,37 @@ pub enum PairError {
 	CodeMismatch,
 }
 
-/// The payload the desktop encodes into the pairing QR. The phone
-/// decodes it to learn where to connect (`url`), what cert
-/// fingerprint to pin (`fingerprint`), and the one-time code to
-/// present (`code`). Compact JSON so a QR holds it comfortably.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// What the desktop's pairing QR is built from: where the phone
+/// connects (`url`), the cert fingerprint shown for verification
+/// (`fingerprint`), and the one-time code to present (`code`). The QR
+/// itself encodes [`Self::to_link`], not this struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairingPayload {
 	/// `wss://<lan-ip>:<port>` the phone connects to.
 	pub url: String,
-	/// SHA-256 cert fingerprint (colon-hex) the phone pins (TOFU).
+	/// SHA-256 cert fingerprint (colon-hex) shown alongside the QR.
 	pub fingerprint: String,
 	/// The short single-use pairing code (from [`PairingSession`]).
 	pub code: String,
-	/// Wire-format version so a future phone build can reject a
-	/// payload it doesn't understand instead of mis-parsing it.
-	pub v: u8,
 }
 
 impl PairingPayload {
-	/// Current payload version.
-	pub const VERSION: u8 = 1;
-
 	pub fn new(url: impl Into<String>, fingerprint: impl Into<String>, code: impl Into<String>) -> Self {
 		Self {
 			url: url.into(),
 			fingerprint: fingerprint.into(),
 			code: code.into(),
-			v: Self::VERSION,
 		}
 	}
 
-	/// Encode to the compact JSON string a QR generator consumes.
-	pub fn to_json(&self) -> String {
-		// Fixed shape; serialisation can't fail.
-		serde_json::to_string(self).unwrap_or_default()
+	/// The link the QR encodes: the PWA's own address with the pairing
+	/// code in the fragment (`https://<host>/#pair=<code>`). A camera
+	/// scan opens the PWA directly and it pairs itself — the phone
+	/// derives the WS URL from the page origin, and the fragment never
+	/// reaches server logs. Type-in fallback stays `url` + `code`.
+	pub fn to_link(&self) -> String {
+		let https = self.url.replacen("wss://", "https://", 1);
+		format!("{https}/#pair={}", self.code)
 	}
 }
 
@@ -323,11 +320,10 @@ mod tests {
 	}
 
 	#[test]
-	fn pairing_payload_round_trips() {
+	fn payload_link_targets_the_pwa_with_code_in_fragment() {
+		let p = PairingPayload::new("wss://bridge.example.dev", "aa:bb:cc", "A1B2-C3D4");
+		assert_eq!(p.to_link(), "https://bridge.example.dev/#pair=A1B2-C3D4");
 		let p = PairingPayload::new("wss://192.168.1.20:53180", "aa:bb:cc", "A1B2-C3D4");
-		let json = p.to_json();
-		let back: PairingPayload = serde_json::from_str(&json).unwrap();
-		assert_eq!(back, p);
-		assert_eq!(back.v, PairingPayload::VERSION);
+		assert_eq!(p.to_link(), "https://192.168.1.20:53180/#pair=A1B2-C3D4");
 	}
 }

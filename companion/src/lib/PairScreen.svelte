@@ -1,10 +1,11 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import { app } from './app.svelte';
 
-	// The phone gets here either by scanning the desktop's QR (which
-	// fills these fields via the URL hash) or by typing the payload
-	// in. We parse a pasted JSON payload too, so a user can paste the
-	// whole QR string the desktop prints.
+	// The phone gets here by scanning the desktop's QR — a link to
+	// this very page with the code in the fragment
+	// (`https://<bridge>/#pair=<code>`), so a camera scan lands here
+	// and pairing starts by itself — or by typing the URL + code in.
 	let url = $state('');
 	let code = $state('');
 	let pasted = $state('');
@@ -12,21 +13,35 @@
 
 	const label = `${navigator.platform || 'phone'} companion`;
 
+	// The PWA is served by the bridge itself (directly or behind the
+	// relay's TLS front), so the page origin *is* the WS endpoint.
+	const originWsUrl = `wss://${window.location.host}`;
+
+	onMount(() => {
+		const scanned = /^#pair=([A-Za-z0-9-]+)$/.exec(window.location.hash)?.[1];
+		if (!scanned) {
+			return;
+		}
+		// Drop the single-use code from the address bar / history
+		// before anything else.
+		history.replaceState(null, '', window.location.pathname);
+		url = originWsUrl;
+		code = scanned;
+		void submit();
+	});
+
 	function applyPasted(): void {
 		const text = pasted.trim();
 		if (!text) {
 			return;
 		}
-		try {
-			const payload = JSON.parse(text) as { url?: string; code?: string };
-			if (payload.url) {
-				url = payload.url;
-			}
-			if (payload.code) {
-				code = payload.code;
-			}
-		} catch {
-			// Not JSON — leave the typed fields as-is.
+		// A pasted QR link (`https://…#pair=CODE`) fills both fields.
+		const link = /^https:\/\/([^/#?]+)[^#]*#pair=([A-Za-z0-9-]+)$/.exec(text);
+		const host = link?.[1];
+		const linkCode = link?.[2];
+		if (host && linkCode) {
+			url = `wss://${host}`;
+			code = linkCode;
 		}
 	}
 
@@ -47,8 +62,8 @@
 	</p>
 
 	<div class="card list">
-		<label for="paste">Paste pairing payload</label>
-		<input id="paste" bind:value={pasted} oninput={applyPasted} placeholder={'{"url":"wss://…","code":"…"}'} />
+		<label for="paste">Paste pairing link</label>
+		<input id="paste" bind:value={pasted} oninput={applyPasted} placeholder={'https://…#pair=A1B2-C3D4'} />
 	</div>
 
 	<div class="card list">

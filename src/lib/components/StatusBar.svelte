@@ -603,13 +603,17 @@
 			type="button"
 			class="container"
 			class:active={companion.modalOpen}
-			title={companion.running
-				? `Companion bridge running${companion.deviceCount > 0 ? ` · ${companion.deviceCount} device${companion.deviceCount === 1 ? '' : 's'} paired` : ''}`
-				: 'Companion bridge not running'}
+			title={companion.remoteConnected
+				? `Connected to relay ${companion.remoteStatus?.bridge_url ?? ''}`
+				: companion.remoteErrored
+					? `Relay connection failing: ${companion.remoteStatus?.error ?? ''}`
+					: companion.running
+						? `Companion bridge running${companion.deviceCount > 0 ? ` · ${companion.deviceCount} device${companion.deviceCount === 1 ? '' : 's'} paired` : ' · nothing paired yet'}`
+						: 'Companion bridge not running'}
 			onclick={() => companion.toggle()}
 		>
 			<span class="icon" aria-hidden="true">☏</span>
-			<span class="pip" class:on={companion.running}></span>
+			<span class="pip" class:on={companion.active} class:pip-warn={companion.remoteErrored}></span>
 			companion{companion.deviceCount > 0 ? ` (${companion.deviceCount})` : ''}
 		</button>
 		<!-- Terminal launcher. Same popover the bottom-panel

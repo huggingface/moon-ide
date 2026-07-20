@@ -46,12 +46,35 @@ class CompanionState {
 		return this.status?.devices.length ?? 0;
 	}
 
+	/** This IDE holds a live connection to a remote relay bridge. */
+	get remoteConnected(): boolean {
+		return this.remoteStatus?.connected ?? false;
+	}
+
+	/** The remote connection exists but is currently failing. */
+	get remoteErrored(): boolean {
+		return !this.remoteConnected && Boolean(this.remoteStatus?.error);
+	}
+
+	/**
+	 * Something is actually usable, not just "a process exists": the
+	 * remote relay link is up, or the local bridge has at least one
+	 * paired phone. The status-bar pip goes green on this — a running
+	 * bridge with nothing paired stays neutral.
+	 */
+	get active(): boolean {
+		return this.remoteConnected || (this.running && this.deviceCount > 0);
+	}
+
 	async refresh(): Promise<void> {
 		try {
 			this.status = await ipc.companion.status();
 		} catch {
 			this.status = null;
 		}
+		// The pip reflects the remote relay link too, so the poll keeps
+		// both halves fresh (not just when the modal opens).
+		await this.refreshRemote();
 	}
 
 	async refreshRemote(): Promise<void> {

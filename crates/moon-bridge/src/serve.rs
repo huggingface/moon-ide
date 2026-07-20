@@ -489,7 +489,7 @@ fn spawn_control_listener(bridge_dir: Utf8PathBuf, ctx: Arc<ServeCtx>, mdns_url:
 						*ctx.pairing.lock().await = Some(session);
 						tracing::info!("pairing window opened from the local panel");
 						crate::status::ControlResponse::PairCode {
-							payload: payload.to_json(),
+							payload: payload.to_link(),
 							url: payload.url,
 							code: payload.code,
 							fingerprint: payload.fingerprint,
@@ -1078,7 +1078,7 @@ async fn handle_pair_code(ctx: &ServeCtx, token: &str) -> ServerMessage {
 	*ctx.pairing.lock().await = Some(session);
 	tracing::info!("pairing window opened by enrolled IDE");
 	ServerMessage::PairPayload {
-		payload: payload.to_json(),
+		payload: payload.to_link(),
 		url: payload.url,
 		code: payload.code,
 		fingerprint: payload.fingerprint,
