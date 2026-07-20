@@ -2,8 +2,8 @@
 //! moon-ide's coder + git surface to a mobile companion app over
 //! the LAN.
 //!
-//! Phase 13 (mobile companion) + Phase 14 (remote / relay bridge).
-//! Shipped so far:
+//! Phase 13 (mobile companion) + Phase 14 (remote / relay bridge),
+//! both landed:
 //!
 //! - 13.0 — workspace discovery (`list`): enumerate the per-workspace
 //!   `instance.sock` files moon-ide maintains (ADR 0014) and report
@@ -11,16 +11,16 @@
 //! - 13.1 — relay (`call`): invoke a method on a chosen workspace
 //!   process over its `instance.sock`, using the `R` (RPC) request
 //!   kind on the `moon-remote`-style JSON shape (ADR 0023).
-//! - 13.3 (core) — pairing (`pair` / `devices` / `revoke`): mint and
-//!   store revocable per-device bearer tokens in the OS keyring.
-//! - 14.0 (core) — IDE enrollment (`enroll-code` / `ides` /
-//!   `revoke-ide`): the symmetric counterpart for enrolling IDEs with
-//!   a remote relay bridge (ADR 0031).
-//!
-//! Still to come: the LAN HTTPS + WebSocket listener with TLS (13.2,
-//! already wired into `serve`), the companion PWA (13.4 / 13.5), and
-//! the remote-relay wiring (14.1+: the bridge accepting enrolled IDEs
-//! and forwarding `call`/`subscribe` to them).
+//! - 13.2 / 13.4 — the LAN HTTPS + WebSocket listener with TLS
+//!   (`serve`), serving the companion PWA and its data channel.
+//! - 13.3 — pairing (`pair` / `devices` / `revoke`): mint and store
+//!   revocable per-device bearer tokens in the OS keyring.
+//! - 14.0–14.2 — IDE enrollment (`enroll-code` / `ides` /
+//!   `revoke-ide`) and the remote-relay wiring: the bridge accepts
+//!   enrolled IDEs over WSS and forwards `call`/`subscribe` to them
+//!   (ADR 0031). A standing relay deployment behind a
+//!   TLS-terminating proxy uses `serve --no-idle-exit
+//!   --advertise-url` (ADR 0035).
 //!
 //! See [`specs/companion.md`](../../../specs/companion.md),
 //! [`specs/roadmaps/phase-13-mobile-companion.md`](../../../specs/roadmaps/phase-13-mobile-companion.md),
@@ -130,6 +130,21 @@ enum Command {
 		/// companion's `companion/dist`). Omit to run WS-only.
 		#[arg(long)]
 		web_root: Option<std::path::PathBuf>,
+		/// Full `wss://…` URL to advertise in the pairing payload,
+		/// overriding the `wss://<host>:<port>` built from the bind
+		/// address. For a bridge behind a TLS-terminating reverse
+		/// proxy (ADR 0035), where the public URL differs from the
+		/// local bind.
+		#[arg(long)]
+		advertise_url: Option<String>,
+		/// Keep serving even when no local workspace is live. A
+		/// relay-mode bridge (ADR 0031/0035) has no local
+		/// `instance.sock`s at all — without this it would exit
+		/// seconds after start. Local auto-spawned bridges (ADR 0024)
+		/// must NOT set this, or they'd linger after the last IDE
+		/// closes.
+		#[arg(long)]
+		no_idle_exit: bool,
 	},
 }
 
@@ -160,7 +175,20 @@ async fn main() -> anyhow::Result<()> {
 			no_pairing,
 			no_enrollment,
 			web_root,
-		} => run_serve(bind, advertise_host, no_pairing, no_enrollment, web_root).await,
+			advertise_url,
+			no_idle_exit,
+		} => {
+			run_serve(ServeArgs {
+				bind,
+				advertise_host,
+				no_pairing,
+				no_enrollment,
+				web_root,
+				advertise_url,
+				no_idle_exit,
+			})
+			.await
+		}
 	}
 }
 
@@ -243,9 +271,9 @@ fn run_revoke(id: &str) -> anyhow::Result<()> {
 
 /// Issue a short-lived enrollment code for an IDE (Phase 14.0). Mirror
 /// of `run_pair_code` for the IDE↔bridge relationship. The session is
-/// dropped here: in 14.1 the `serve` listener holds it in memory and
-/// runs `verify_and_consume` when an IDE presents the code over WSS.
-/// This subcommand just demonstrates issuance.
+/// dropped here: the `serve` listener holds its own session in memory
+/// and runs `verify_and_consume` when an IDE presents the code over
+/// WSS. This subcommand just demonstrates issuance.
 fn run_enroll_code() -> anyhow::Result<()> {
 	let session = enrollment::EnrollmentSession::issue();
 	println!("Enrollment code: {}", session.code());
@@ -281,13 +309,28 @@ fn run_revoke_ide(id: &str) -> anyhow::Result<()> {
 	Ok(())
 }
 
-async fn run_serve(
+/// Arguments for `run_serve`, mirroring the `Serve` CLI variant so the
+/// clap surface and the runner stay in one-to-one shape.
+struct ServeArgs {
 	bind: Option<SocketAddr>,
 	advertise_host: Option<String>,
 	no_pairing: bool,
 	no_enrollment: bool,
 	web_root: Option<std::path::PathBuf>,
-) -> anyhow::Result<()> {
+	advertise_url: Option<String>,
+	no_idle_exit: bool,
+}
+
+async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
+	let ServeArgs {
+		bind,
+		advertise_host,
+		no_pairing,
+		no_enrollment,
+		web_root,
+		advertise_url,
+		no_idle_exit,
+	} = args;
 	// Install the ring crypto provider as the process default before
 	// any rustls config is built. moon-bridge's tree pulls only ring,
 	// but rustls resolves its provider from a process-global slot, so
@@ -316,7 +359,7 @@ async fn run_serve(
 	let devices = pairing::DeviceStore::open()?;
 	let ides = enrollment::IdeStore::open()?;
 
-	let url = format!("wss://{advertise_host}:{}", bind.port());
+	let url = advertise_url.unwrap_or_else(|| format!("wss://{advertise_host}:{}", bind.port()));
 	let mdns_url = detected_ip.map(|_| format!("wss://{}:{}", mdns::MDNS_HOSTNAME.trim_end_matches('.'), bind.port()));
 
 	let (pairing_session, pairing_payload) = if no_pairing {
@@ -381,6 +424,7 @@ async fn run_serve(
 		advertise_ip: detected_ip,
 		ides,
 		enrollment: enrollment_session,
+		idle_exit: !no_idle_exit,
 	})
 	.await
 }
@@ -413,9 +457,9 @@ fn run_pair_code() -> anyhow::Result<()> {
 	let session = pairing::PairingSession::issue();
 	println!("Pairing code: {}", session.code());
 	println!("Valid for {} seconds.", pairing::PAIRING_CODE_TTL.as_secs());
-	// The session is dropped here: in 13.2 the listener holds it in
-	// memory and runs `verify_and_consume` when the phone presents
-	// the code. This subcommand just demonstrates issuance.
+	// The session is dropped here: the `serve` listener holds its own
+	// session in memory and runs `verify_and_consume` when the phone
+	// presents the code. This subcommand just demonstrates issuance.
 	Ok(())
 }
 

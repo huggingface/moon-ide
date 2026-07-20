@@ -269,6 +269,11 @@ pub struct ServeConfig {
 	/// when enrollment is closed (`--no-enrollment`). Mirror of
 	/// `pairing`.
 	pub enrollment: Option<EnrollmentSession>,
+	/// Exit the process when no local workspace is live (ADR 0024,
+	/// the auto-spawned local bridge). `false` for a standing relay
+	/// deployment (ADR 0035) that serves remote-carrier IDEs and has
+	/// no local `instance.sock`s at all.
+	pub idle_exit: bool,
 }
 
 /// Run the listener until the process is killed.
@@ -286,6 +291,7 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
 		advertise_ip,
 		ides,
 		enrollment,
+		idle_exit,
 	} = cfg;
 	let fingerprint = tls.fingerprint.clone();
 	let acceptor = TlsAcceptor::from(tls.server_config);
@@ -345,8 +351,12 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
 	// used for the switcher, so "the last IDE closed" needs no extra
 	// IPC. A grace period before the first check avoids a race where
 	// the bridge starts microseconds before the IDE that spawned it
-	// has bound its own `instance.sock`.
-	spawn_idle_watcher(ctx.workspaces_dir.clone());
+	// has bound its own `instance.sock`. A standing relay
+	// (`--no-idle-exit`, ADR 0035) skips this: it serves
+	// remote-carrier IDEs and never has local workspaces.
+	if idle_exit {
+		spawn_idle_watcher(ctx.workspaces_dir.clone());
+	}
 
 	loop {
 		let (stream, peer) = match listener.accept().await {

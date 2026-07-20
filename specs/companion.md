@@ -314,7 +314,10 @@ new IDE code is the persistent WS client + the enrollment UI.
   deliberate, enrollment-gated surface; IDEs do not expose their own
   ports to the relay.
 - **Public-internet exposure.** Same v1 exclusion as local mode:
-  VPN / trusted network only.
+  VPN / trusted network only. Superseded for one deliberate deployment
+  by [ADR 0035](decisions/0035-public-relay-deployment.md): a standing
+  relay on a public VPS behind an nginx TLS front, accepted because the
+  token boundary (not the network) was always the load-bearing control.
 
 ## Cloud / always-on future
 
@@ -398,5 +401,8 @@ Prose, not commitments — revisit when someone asks:
   lifecycle remote mode preserves unchanged for local operation.
 - [ADR 0031](decisions/0031-remote-bridge-relay.md) — the relay-hub
   topology + IDE-enrollment auth for remote mode.
+- [ADR 0035](decisions/0035-public-relay-deployment.md) — the public
+  nginx-fronted standing-relay deployment (`serve --no-idle-exit
+--advertise-url`).
 - [`coder.md`](coder.md) — the coder surface the phone renders;
   device-flow + keyring patterns the pairing flow mirrors.

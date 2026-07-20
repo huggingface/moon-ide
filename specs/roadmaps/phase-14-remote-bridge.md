@@ -8,6 +8,12 @@ workspaces in one switcher. Local mode is unchanged (Phase 13 / ADR
 IDE enrollment](../decisions/0031-remote-bridge-relay.md). Architectural
 spec: [`companion.md`](../companion.md) § "Remote / relay mode".
 
+All sub-phases landed. A standing relay is deployed on a public VPS
+behind an nginx TLS front — see
+[ADR 0035](../decisions/0035-public-relay-deployment.md) for the
+deviation from the VPN-only posture and the `serve --no-idle-exit /
+--advertise-url` flags it added.
+
 ## Why this phase number
 
 Builds on Phase 13 (mobile companion), which shipped the host-local
@@ -30,7 +36,7 @@ elsewhere") stays prose in `companion.md`; this phase does not build it.
 Per sub-phase. Land in order; stop at each gate. The team handoff gate
 at the end of each sub-phase is the usual roadmap rule.
 
-### 14.0 — Enrollment credential core + enroll-code CLI
+### 14.0 — Enrollment credential core + enroll-code CLI — LANDED
 
 The symmetric counterpart to Phase 13.3's pairing core. Pure
 credential logic, unit-tested, no network.
@@ -64,7 +70,7 @@ enrolled_at_ms }`. The `id` is the IDE's self-assigned `ide_id`
 - `cargo test` / `cargo clippy --all-targets -D warnings` / `cargo fmt`
   clean.
 
-### 14.1 — Bridge accepts enrolled IDEs (WS server side)
+### 14.1 — Bridge accepts enrolled IDEs (WS server side) — LANDED
 
 The bridge gains a second inbound connection type: an enrolled IDE
 dialing in over WSS. This sub-phase wires the enrollment handshake and
@@ -105,7 +111,7 @@ ide_id }`; `CompanionStatus` gains an `ides: Vec<IdeEntry>` field.
   token → live-IDE table updated; wrong token → rejected. The phone
   pairing flow is unaffected.
 
-### 14.2 — Relay routes call/subscribe to enrolled IDEs
+### 14.2 — Relay routes call/subscribe to enrolled IDEs — LANDED
 
 The forwarding path. A phone's `call`/`subscribe` for a
 remote-carrier workspace goes over the held-open IDE WS instead of the
@@ -138,7 +144,7 @@ workspace)`. Empty/absent `ide` → local carrier (`relay::call`,
   fake IDE to the fake phone. Local-carrier `call` (to a real
   `instance.sock`) still works unchanged.
 
-### 14.3 — IDE-side outbound WS client + enrollment UI
+### 14.3 — IDE-side outbound WS client + enrollment UI — LANDED
 
 The IDE becomes a WS _client_ with a persistent outbound connection to a
 remote bridge, plus the UI to enroll.
@@ -173,7 +179,7 @@ remote bridge, plus the UI to enroll.
   Dropping the VPN → reconnects without re-enrollment. Local mode
   (auto-spawned bridge) still works alongside.
 
-### 14.4 — PWA: grouped workspace switcher
+### 14.4 — PWA: grouped workspace switcher — LANDED
 
 The phone's `WorkspaceList` groups workspaces by IDE (the new `ide`
 field), so a multi-IDE bridge is legible. Pure frontend; the bridge
