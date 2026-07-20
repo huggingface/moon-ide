@@ -193,6 +193,16 @@ already sends the `ide` tag from 14.2.
   switcher shows two groups; selecting a remote workspace drives it
   end to end.
 
+### 14.5 — IDE-mediated phone pairing — LANDED
+
+Remote mode initially inherited "pairing codes print at `serve`
+startup" from local mode, which on a standing relay means journal
+digging + a service restart per phone. Enrolled IDEs can now mint
+pairing codes on demand: `PairCode { token }` → `PairPayload` over the
+enrolled WS, rendered as a QR in the Companion modal's remote tab
+(`companion_remote_pair_code`). Wire shape in
+[`companion.md`](../companion.md) § "Wire additions".
+
 ## What this phase deliberately doesn't do
 
 Prose, not milestones — mirrors

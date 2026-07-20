@@ -194,6 +194,23 @@ pub async fn companion_remote_status(
 	})
 }
 
+/// Ask the remote bridge for a fresh phone-pairing payload (Phase
+/// 14.5). Requires a live enrolled connection; the panel renders the
+/// returned payload as a QR, exactly like local mode's startup QR.
+#[tauri::command]
+pub async fn companion_remote_pair_code(
+	state: tauri::State<'_, crate::state::AppState>,
+) -> Result<crate::remote_bridge::PairingQr, MoonError> {
+	let guard = state.remote_bridge.lock().await;
+	let handle = guard
+		.as_ref()
+		.ok_or_else(|| MoonError::internal("not connected to a remote bridge"))?;
+	handle
+		.request_pair_code()
+		.await
+		.map_err(|e| MoonError::internal(e.to_string()))
+}
+
 /// Disconnect from the remote bridge and forget the stored credential
 /// (Phase 14.3).
 #[tauri::command]

@@ -456,8 +456,18 @@ export const ipc = {
 			invoke<void>('companion_enroll', { bridgeUrl, code, label }),
 		remoteStatus: () => invoke<RemoteBridgeStatus>('companion_remote_status'),
 		remoteDisconnect: () => invoke<void>('companion_remote_disconnect'),
+		remotePairCode: () => invoke<PairingQr>('companion_remote_pair_code'),
 	},
 } as const;
+
+/** A phone-pairing payload minted by the remote bridge on this IDE's
+ * request (Phase 14.5). `payload` is the JSON the QR encodes. */
+export type PairingQr = {
+	payload: string;
+	url: string;
+	code: string;
+	fingerprint: string;
+};
 
 /** Mobile-companion bridge status, read from the bridge's published
  * status file (Phase 13.4b). `running: false` when the bridge isn't up.

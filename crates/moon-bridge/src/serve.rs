@@ -101,6 +101,13 @@ enum ClientMessage {
 		token: String,
 		workspaces: Vec<RemoteWorkspace>,
 	},
+	/// An enrolled IDE asks for a fresh phone-pairing code (Phase
+	/// 14.5). An enrolled IDE is already fully trusted (it is the
+	/// thing a paired phone would drive), so letting it mint phone
+	/// credentials adds no new capability — it just moves the QR to
+	/// the IDE's Companion panel instead of the relay's journal,
+	/// available on demand rather than only at `serve` startup.
+	PairCode { token: String },
 	// --- IDE → bridge forwarding replies (Phase 14.2) ---
 	// The IDE runs the forwarded call against its local
 	// `BridgeRpcHandler` and sends the result back with the matching
@@ -136,6 +143,16 @@ enum ServerMessage {
 	/// Anything went wrong — bad code, bad token, relay failure,
 	/// malformed frame. `message` is human-readable.
 	Error { message: String },
+	/// A fresh phone-pairing payload (reply to `PairCode`, Phase
+	/// 14.5). `payload` is the compact JSON the QR encodes; `url` /
+	/// `code` / `fingerprint` are unpacked for type-in fallback
+	/// display.
+	PairPayload {
+		payload: String,
+		url: String,
+		code: String,
+		fingerprint: String,
+	},
 	// --- bridge → IDE forwarding (Phase 14.2) ---
 	// The bridge sends a phone's call/subscribe to the IDE that owns
 	// the target workspace. The IDE runs it against its local
@@ -192,6 +209,12 @@ struct ServeCtx {
 	/// behind a mutex so concurrent connections can't both consume it.
 	/// `None` once consumed (single-use). Mirror of `pairing`.
 	enrollment: Mutex<Option<EnrollmentSession>>,
+	/// The `wss://…` URL phones should connect to, baked into
+	/// IDE-minted pairing payloads (Phase 14.5). Same value the
+	/// startup payload used.
+	advertise_url: String,
+	/// The TLS cert fingerprint for pairing payloads (TOFU pin).
+	fingerprint: String,
 	/// Live enrolled IDEs that currently hold an open WS connection.
 	/// Keyed by `ide_id`; the value is the IDE's outbound message sink
 	/// and its last-reported workspace list. This is the
@@ -274,6 +297,9 @@ pub struct ServeConfig {
 	/// deployment (ADR 0035) that serves remote-carrier IDEs and has
 	/// no local `instance.sock`s at all.
 	pub idle_exit: bool,
+	/// The `wss://…` URL phones connect to (the startup payload's
+	/// `url`), reused for IDE-minted pairing payloads (Phase 14.5).
+	pub advertise_url: String,
 }
 
 /// Run the listener until the process is killed.
@@ -292,6 +318,7 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
 		ides,
 		enrollment,
 		idle_exit,
+		advertise_url,
 	} = cfg;
 	let fingerprint = tls.fingerprint.clone();
 	let acceptor = TlsAcceptor::from(tls.server_config);
@@ -328,6 +355,8 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
 		pairing: Mutex::new(pairing),
 		ides,
 		enrollment: Mutex::new(enrollment),
+		advertise_url,
+		fingerprint: fingerprint.clone(),
 		live_ides: Mutex::new(HashMap::new()),
 		pending_forwards: Mutex::new(HashMap::new()),
 		pending_streams: Mutex::new(HashMap::new()),
@@ -751,6 +780,9 @@ async fn handle_message(
 				.send(handle_register(ctx, &token, workspaces, out.clone()).await)
 				.await;
 		}
+		ClientMessage::PairCode { token } => {
+			let _ = out.send(handle_pair_code(ctx, &token).await).await;
+		}
 		// IDE → bridge forwarding replies (14.2). These come from an
 		// enrolled IDE responding to a `ForwardCall`/`ForwardSubscribe`
 		// the bridge sent it. The bridge looks up the pending forward
@@ -1032,6 +1064,28 @@ async fn handle_register(
 	tracing::info!(ide_id = %ide.id, "IDE registered workspaces");
 	ServerMessage::Result {
 		value: serde_json::json!({ "registered": true }),
+	}
+}
+
+/// Mint a fresh phone-pairing code on request from an enrolled IDE
+/// (Phase 14.5). Replaces the active pairing session (there is one
+/// live code at a time, same as the startup window), and returns the
+/// payload for the IDE's Companion panel to render as a QR. The code
+/// keeps the usual TTL + single-use semantics; only *when* a window
+/// opens changes.
+async fn handle_pair_code(ctx: &ServeCtx, token: &str) -> ServerMessage {
+	if let Err(reply) = check_ide_token(ctx, token) {
+		return reply;
+	}
+	let session = PairingSession::issue();
+	let payload = crate::pairing::PairingPayload::new(&ctx.advertise_url, &ctx.fingerprint, session.code());
+	*ctx.pairing.lock().await = Some(session);
+	tracing::info!("pairing window opened by enrolled IDE");
+	ServerMessage::PairPayload {
+		payload: payload.to_json(),
+		url: payload.url,
+		code: payload.code,
+		fingerprint: payload.fingerprint,
 	}
 }
 

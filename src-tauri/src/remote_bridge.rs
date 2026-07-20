@@ -120,6 +120,15 @@ enum BridgeToIde {
 	/// Forward a phone's `subscribe` to this IDE. The IDE pushes
 	/// `ForwardEvent` frames until the stream ends, then `ForwardEnd`.
 	ForwardSubscribe { id: u64, workspace: String, method: String },
+	/// A fresh phone-pairing payload (reply to `PairCode`, Phase
+	/// 14.5). The IDE renders `payload` as a QR in its Companion
+	/// panel; `url` / `code` / `fingerprint` are the type-in fallback.
+	PairPayload {
+		payload: String,
+		url: String,
+		code: String,
+		fingerprint: String,
+	},
 }
 
 /// Outbound WS frame from the IDE to the bridge (tagged `type`).
@@ -145,6 +154,30 @@ enum IdeToBridge {
 	ForwardEvent { id: u64, event: serde_json::Value },
 	/// The IDE ended a forwarded `subscribe` stream.
 	ForwardEnd { id: u64 },
+	/// Ask the bridge to mint a fresh phone-pairing code (Phase
+	/// 14.5). The bridge trusts enrolled IDEs to open pairing
+	/// windows; the reply is `PairPayload`.
+	PairCode { token: String },
+}
+
+/// A phone-pairing payload the bridge minted on this IDE's request
+/// (Phase 14.5). Surfaced to the Companion panel, which renders
+/// `payload` as a QR.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairingQr {
+	pub payload: String,
+	pub url: String,
+	pub code: String,
+	pub fingerprint: String,
+}
+
+/// Commands the UI can send to the live connection task via the
+/// handle. One variant today; the channel exists so future
+/// UI-initiated requests (re-register, etc.) have a home.
+enum HandleCommand {
+	/// Request a fresh phone-pairing payload from the bridge. The
+	/// oneshot resolves when the bridge replies (or errors).
+	PairCode(tokio::sync::oneshot::Sender<Result<PairingQr, String>>),
 }
 
 /// A workspace the IDE reports to the bridge via `Register`. Mirror of
@@ -164,6 +197,8 @@ pub struct RemoteBridgeHandle {
 	task: tokio::task::AbortHandle,
 	/// A channel the UI can poll for connection status.
 	status_rx: tokio::sync::watch::Receiver<RemoteBridgeStatus>,
+	/// Commands into the live connection task (pair-code requests).
+	cmd_tx: tokio::sync::mpsc::Sender<HandleCommand>,
 }
 
 /// Connection status surfaced to the UI.
@@ -196,12 +231,14 @@ pub fn spawn(
 		ide_id: ide_id.clone(),
 		error: None,
 	});
+	let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<HandleCommand>(8);
 	let task = tauri::async_runtime::spawn(async move {
-		run_connection_loop(bridge_url, code, ide_id, label, rpc, status_tx).await;
+		run_connection_loop(bridge_url, code, ide_id, label, rpc, status_tx, cmd_rx).await;
 	});
 	RemoteBridgeHandle {
 		task: task.inner().abort_handle(),
 		status_rx,
+		cmd_tx,
 	}
 }
 
@@ -215,6 +252,7 @@ async fn run_connection_loop(
 	label: String,
 	rpc: Arc<dyn BridgeRpcHandler>,
 	status_tx: tokio::sync::watch::Sender<RemoteBridgeStatus>,
+	mut cmd_rx: tokio::sync::mpsc::Receiver<HandleCommand>,
 ) {
 	// If we have a stored credential, use it (reconnect). If not,
 	// this is a fresh enroll — use the code once, then store the
@@ -245,14 +283,14 @@ async fn run_connection_loop(
 		};
 
 		let result = match cred {
-			Some(c) => connect_and_serve(&c, &ide_id, &label, &rpc, &status_tx).await,
+			Some(c) => connect_and_serve(&c, &ide_id, &label, &rpc, &status_tx, &mut cmd_rx).await,
 			None => {
 				// Fresh enroll: connect, present the code, store the
 				// token, then fall through to the serve loop.
 				match connect_and_enroll(&bridge_url, &code, &ide_id, &label, &status_tx).await {
 					Ok(c) => {
 						let _ = store_credential(&c);
-						connect_and_serve(&c, &ide_id, &label, &rpc, &status_tx).await
+						connect_and_serve(&c, &ide_id, &label, &rpc, &status_tx, &mut cmd_rx).await
 					}
 					Err(err) => Err(err),
 				}
@@ -349,6 +387,7 @@ async fn connect_and_serve(
 	label: &str,
 	rpc: &Arc<dyn BridgeRpcHandler>,
 	status_tx: &tokio::sync::watch::Sender<RemoteBridgeStatus>,
+	cmd_rx: &mut tokio::sync::mpsc::Receiver<HandleCommand>,
 ) -> anyhow::Result<()> {
 	let ws = connect_wss(&cred.bridge_url).await?;
 	let (mut sink, mut source) = ws.split();
@@ -381,13 +420,53 @@ async fn connect_and_serve(
 	// and the event-forwarder tasks can both write.
 	let sink = Arc::new(Mutex::new(sink));
 
-	while let Some(frame) = source.next().await {
-		let msg = frame?;
-		let text = match msg {
-			Message::Text(t) => t.to_string(),
-			Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
-			Message::Close(_) => break,
-			_ => continue,
+	// Pair-code requests in flight (FIFO — the bridge answers frames
+	// in order on this connection). Resolved by `PairPayload`;
+	// drained with an error when the connection drops.
+	let mut pending_pair: std::collections::VecDeque<tokio::sync::oneshot::Sender<Result<PairingQr, String>>> =
+		std::collections::VecDeque::new();
+
+	// Stop polling the command channel once every sender is gone,
+	// or `recv() -> None` would spin the select loop.
+	let mut cmd_open = true;
+
+	loop {
+		let text = tokio::select! {
+			frame = source.next() => {
+				let Some(frame) = frame else { break };
+				match frame {
+					Ok(Message::Text(t)) => t.to_string(),
+					Ok(Message::Binary(b)) => String::from_utf8_lossy(&b).into_owned(),
+					Ok(Message::Close(_)) => break,
+					Ok(_) => continue,
+					Err(err) => {
+						// Fail pending pair requests before surfacing
+						// the error so the UI doesn't wait out its
+						// timeout.
+						for tx in pending_pair.drain(..) {
+							let _ = tx.send(Err("bridge connection lost".into()));
+						}
+						return Err(err.into());
+					}
+				}
+			}
+			cmd = cmd_rx.recv(), if cmd_open => {
+				match cmd {
+					Some(HandleCommand::PairCode(reply_tx)) => {
+						let req = IdeToBridge::PairCode { token: cred.token.clone() };
+						let json = serde_json::to_string(&req)?;
+						if sink.lock().await.send(Message::Text(json.into())).await.is_err() {
+							let _ = reply_tx.send(Err("bridge connection lost".into()));
+							break;
+						}
+						pending_pair.push_back(reply_tx);
+					}
+					// Handle dropped — keep serving; the connection
+					// outlives UI interest in commands.
+					None => cmd_open = false,
+				}
+				continue;
+			}
 		};
 		let parsed: BridgeToIde = match serde_json::from_str(&text) {
 			Ok(m) => m,
@@ -451,14 +530,43 @@ async fn connect_and_serve(
 			BridgeToIde::Result { .. } => {
 				// Register ack — harmless, no action needed.
 			}
+			BridgeToIde::PairPayload {
+				payload,
+				url,
+				code,
+				fingerprint,
+			} => match pending_pair.pop_front() {
+				Some(tx) => {
+					let _ = tx.send(Ok(PairingQr {
+						payload,
+						url,
+						code,
+						fingerprint,
+					}));
+				}
+				None => tracing::warn!("remote-bridge: unsolicited pair payload"),
+			},
 			BridgeToIde::Error { message } => {
-				tracing::warn!(%message, "remote-bridge error");
+				// The bridge's error frames carry no correlation id.
+				// If a pair-code request is in flight, the error is
+				// its reply (FIFO on this connection); otherwise it's
+				// a register/forward complaint — log it.
+				match pending_pair.pop_front() {
+					Some(tx) => {
+						let _ = tx.send(Err(message));
+					}
+					None => tracing::warn!(%message, "remote-bridge error"),
+				}
 			}
 			BridgeToIde::Enrolled { .. } => {
 				// Shouldn't happen in the serve loop (enroll is
 				// handled in `connect_and_enroll`), but ignore.
 			}
 		}
+	}
+	// Connection ended — fail anything still waiting for a reply.
+	for tx in pending_pair.drain(..) {
+		let _ = tx.send(Err("bridge connection closed".into()));
 	}
 	Ok(())
 }
@@ -491,6 +599,23 @@ impl RemoteBridgeHandle {
 	/// Disconnect and stop the connection task.
 	pub fn disconnect(&self) {
 		self.task.abort();
+	}
+
+	/// Ask the bridge for a fresh phone-pairing payload (Phase 14.5).
+	/// Errors if the connection is down or the bridge doesn't reply
+	/// within the timeout.
+	pub async fn request_pair_code(&self) -> anyhow::Result<PairingQr> {
+		let (tx, rx) = tokio::sync::oneshot::channel();
+		self
+			.cmd_tx
+			.send(HandleCommand::PairCode(tx))
+			.await
+			.map_err(|_| anyhow::anyhow!("remote-bridge connection task is not running"))?;
+		let reply = tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+			.await
+			.map_err(|_| anyhow::anyhow!("bridge did not reply to the pairing request in time"))?
+			.map_err(|_| anyhow::anyhow!("remote-bridge connection dropped mid-request"))?;
+		reply.map_err(|message| anyhow::anyhow!(message))
 	}
 }
 

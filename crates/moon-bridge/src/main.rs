@@ -425,6 +425,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 		ides,
 		enrollment: enrollment_session,
 		idle_exit: !no_idle_exit,
+		advertise_url: url,
 	})
 	.await
 }

@@ -67,11 +67,12 @@ and in the unit file, not here.
 
 ## Consequences
 
-- The pairing/enrollment codes print to the journal at service start;
-  pairing a new phone or enrolling a new IDE means restarting the
-  service and reading `journalctl` within 120 s. Acceptable for one
-  operator; revisit (control-socket verb to reopen a window) if it
-  chafes.
+- Enrollment codes print to the journal at service start; enrolling a
+  new IDE means restarting the service and reading `journalctl` within
+  120 s. Acceptable for one operator. Phone pairing does **not** share
+  this friction: an enrolled IDE mints pairing codes on demand
+  (`PairCode` → `PairPayload`, roadmap 14.5) and renders the QR in its
+  Companion panel.
 - The relay sees plaintext JSON-RPC after TLS termination — coder
   transcripts, file contents. The VPS is the trust boundary, same as
   ADR 0031's relay box, just with a hostile network around it.

@@ -293,6 +293,14 @@ schema.
   `(ide, workspace)`.
 - `Workspaces` reply — each entry gains an `ide` field; the phone's
   switcher groups by it.
+- `PairCode { token }` → `PairPayload { payload, url, code,
+fingerprint }` — an enrolled IDE asks the bridge to mint a fresh
+  phone-pairing code and renders the payload as a QR in its Companion
+  panel. An enrolled IDE is already fully trusted (it is what a paired
+  phone would drive), so this adds no capability — it moves _when_ a
+  pairing window opens from "bridge startup only" to "on demand from
+  the IDE". Codes keep the usual TTL + single-use semantics; one live
+  pairing session at a time (a new request replaces the old code).
 
 The bridge ↔ IDE hop reuses the same WS framing; the IDE is a WS
 **client** (a new persistent outbound-connection module in the IDE), not

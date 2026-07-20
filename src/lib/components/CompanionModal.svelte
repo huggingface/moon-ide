@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { renderSVG } from 'uqr';
-	import { ipc } from '../ipc';
+	import { ipc, type PairingQr } from '../ipc';
 	import { companion } from '../companion.svelte';
 
 	// The store owns the polled status (shared with the status-bar
@@ -65,6 +65,23 @@
 	async function disconnectRemote(): Promise<void> {
 		await ipc.companion.remoteDisconnect();
 		await companion.refreshRemote();
+	}
+
+	// IDE-minted phone pairing via the remote bridge (Phase 14.5).
+	// The bridge trusts enrolled IDEs to open pairing windows, so the
+	// QR renders right here — no relay-box journal digging.
+	let remotePair = $state<PairingQr | null>(null);
+	let remotePairError = $state<string | null>(null);
+	const remotePairQrSvg = $derived(remotePair ? renderSVG(remotePair.payload, { border: 2 }) : null);
+
+	async function requestRemotePairCode(): Promise<void> {
+		remotePairError = null;
+		try {
+			remotePair = await ipc.companion.remotePairCode();
+		} catch (err) {
+			remotePair = null;
+			remotePairError = String(err);
+		}
 	}
 
 	function relativeTime(ms: number): string {
@@ -191,6 +208,28 @@
 					This IDE is enrolled as <code>{companion.remoteStatus.ide_id}</code>. Phones paired to the remote bridge can
 					see this IDE's workspaces.
 				</p>
+
+				<h3>Pair a phone</h3>
+				{#if remotePair}
+					{#if remotePairQrSvg}
+						<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+						<div class="qr">{@html remotePairQrSvg}</div>
+					{/if}
+					<div class="details">
+						<div class="row"><span class="k">Address</span><code>{remotePair.url}</code></div>
+						<div class="row"><span class="k">Code</span><code class="code">{remotePair.code}</code></div>
+					</div>
+					<p class="hint">Single-use, valid ~2 minutes. Generate a new one per phone.</p>
+				{:else}
+					<p class="hint">Mint a fresh single-use pairing code on the relay and show it as a QR.</p>
+				{/if}
+				<button type="button" onclick={() => requestRemotePairCode()}>
+					{remotePair ? 'New pairing code' : 'Show pairing QR'}
+				</button>
+				{#if remotePairError}
+					<p class="hint" style="color: var(--danger, #f85149)">{remotePairError}</p>
+				{/if}
+
 				<button type="button" class="revoke" onclick={() => disconnectRemote()}>Disconnect</button>
 			{:else}
 				<p class="lede">Connect this IDE to a remote relay bridge.</p>
