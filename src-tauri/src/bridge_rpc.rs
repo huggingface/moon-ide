@@ -158,6 +158,20 @@ impl BridgeRpcHandler for BridgeRpc {
 					.map_err(|e| e.to_string())?;
 				to_value(&summary)
 			}
+			// Create a coordinator session (ADR 0030) in the named
+			// folder. Same observe-open semantics as `new_session`:
+			// the runtime mounts but the desktop's visible-session
+			// pointer is untouched. The phone can then send a goal
+			// prompt via `coder_send` (session-targeted).
+			"coder_new_coordinator_session" => {
+				let p: FolderParams = parse_params(params)?;
+				let summary = self
+					.coder
+					.new_coordinator_session_in(p.folder.as_deref())
+					.await
+					.map_err(|e| e.to_string())?;
+				to_value(&summary)
+			}
 			"coder_delete_session" => {
 				let p: DeleteSessionParams = parse_params(params)?;
 				self
@@ -325,6 +339,7 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 	"coder_send",
 	"coder_abort",
 	"coder_new_session",
+	"coder_new_coordinator_session",
 	"coder_delete_session",
 	"coder_respond_to_prompt",
 	"coder_get_model_settings",

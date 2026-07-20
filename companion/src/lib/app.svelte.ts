@@ -556,6 +556,33 @@ class CompanionState {
 		}
 	}
 
+	/** Create a coordinator session (ADR 0030) — an orchestrator
+	 * that spawns and manages worker agents in git worktrees. Can't
+	 * edit files itself; delegates each task to a worker. */
+	async newCoordinatorSession(): Promise<void> {
+		if (!this.activeWorkspace) {
+			return;
+		}
+		try {
+			const summary = await this.#call<SessionSummary>(
+				this.activeWorkspace,
+				'coder_new_coordinator_session',
+				{ folder: this.activeFolder },
+				this.activeIde,
+			);
+			this.sessions = [summary, ...this.sessions];
+			this.#ensureSubscribed(this.activeWorkspace, this.activeIde);
+			this.activeSession = summary.id;
+			this.rows = [];
+			this.busy = false;
+			this.awaitingInput = false;
+			this.pendingPrompt = null;
+			this.error = null;
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
 	/** Delete a session by id. */
 	async deleteSession(id: string): Promise<void> {
 		if (!this.activeWorkspace) {

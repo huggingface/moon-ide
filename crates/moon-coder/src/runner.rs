@@ -1631,6 +1631,21 @@ impl CoderHandle {
 		Ok(summary)
 	}
 
+	/// Folder-targeted [`Self::new_coordinator_session`] for the
+	/// bridge: allocate the coordinator session under the named
+	/// bound folder, mount its runtime, and **don't** make it the
+	/// folder's visible session — the phone tracks its own open
+	/// session and must not hijack what the desktop is looking at.
+	pub async fn new_coordinator_session_in(&self, folder: Option<&str>) -> Result<SessionSummary, CoderError> {
+		let (fs, _) = self.state.folder_session_or_active(folder).await?;
+		let blank = Session::new_blank_with_mode(CoderMode::Coordinator);
+		let summary = blank.summary();
+		let id = blank.header.id.clone();
+		let rt = Arc::new(SessionRuntime::new(blank));
+		fs.insert_runtime(id, rt).await;
+		Ok(summary)
+	}
+
 	/// Create a fresh session under the **active (parent) folder**
 	/// that routes its tools to an already-created git worktree at
 	/// `worktree_root` on `branch` (ADR 0028). The session stays

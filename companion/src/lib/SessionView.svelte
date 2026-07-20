@@ -70,6 +70,7 @@
 	}
 
 	const title = $derived(app.sessions.find((s) => s.id === app.activeSession)?.title ?? '');
+	const isCoordinator = $derived(app.sessions.find((s) => s.id === app.activeSession)?.mode === 'coordinator');
 
 	// Pin the transcript to the bottom while rows stream in, unless
 	// the user scrolled away to read — same gesture as the desktop's
@@ -101,6 +102,7 @@
 <div class="session">
 	<div class="row session-head">
 		<button class="ghost back" onclick={() => app.closeSession()}>←</button>
+		{#if isCoordinator}<span class="coord-badge" title="Coordinator — orchestrates worker agents">coord</span>{/if}
 		<strong class="session-title">{title || 'Untitled session'}</strong>
 		{#if app.busy}
 			<span class="muted status">running…</span>
@@ -219,12 +221,32 @@
 			{/if}
 		{/each}
 		{#if app.rows.length === 0}
-			<p class="muted">No messages yet. Send one below.</p>
+			{#if isCoordinator}
+				<div class="empty-hint">
+					<p><strong>Coordinator session</strong></p>
+					<p class="muted">
+						An orchestrator that spawns and manages worker agents. It can't edit files itself — it delegates each task
+						to a worker in its own git worktree.
+					</p>
+					<p class="muted">
+						Describe a goal (e.g. <em>look at the open GitHub issues and open a PR for each</em>) and it will decompose
+						it into worker tasks.
+					</p>
+				</div>
+			{:else}
+				<p class="muted">No messages yet. Send one below.</p>
+			{/if}
 		{/if}
 	</div>
 
 	<div class="composer">
-		<textarea bind:value={draft} onkeydown={onKeydown} placeholder="Message the coder — Enter to send" rows="2"
+		<textarea
+			bind:value={draft}
+			onkeydown={onKeydown}
+			placeholder={isCoordinator
+				? 'Describe a goal for the coordinator — Enter to send'
+				: 'Message the coder — Enter to send'}
+			rows="2"
 		></textarea>
 		{#if app.busy}
 			<button class="ghost" onclick={() => app.abort()}>Stop</button>
@@ -424,6 +446,30 @@
 		display: flex;
 		gap: 0.5rem;
 		align-items: flex-end;
+	}
+	.coord-badge {
+		flex: none;
+		font-size: 0.65rem;
+		font-weight: 600;
+		padding: 0.15em 0.4em;
+		border-radius: 999px;
+		background: var(--accent);
+		color: var(--accent-fg, #fff);
+		text-transform: uppercase;
+		letter-spacing: 0.03em;
+	}
+	.empty-hint {
+		padding: 1rem 0.5rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.4rem;
+	}
+	.empty-hint p {
+		margin: 0;
+		line-height: 1.4;
+	}
+	.empty-hint .muted {
+		font-size: 0.85rem;
 	}
 	.composer textarea {
 		flex: 1;

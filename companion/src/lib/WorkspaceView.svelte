@@ -36,6 +36,11 @@
 	<div class="row head">
 		<button class="ghost back" onclick={() => app.closeWorkspace()}>←</button>
 		<strong class="workspace-name">{app.activeWorkspaceName}</strong>
+		<button
+			class="ghost coord-btn"
+			title="New coordinator session — an orchestrator that spawns and manages worker agents"
+			onclick={() => app.newCoordinatorSession()}>✦</button
+		>
 		<button class="primary" onclick={() => app.newSession()}>+ New</button>
 	</div>
 
@@ -253,5 +258,23 @@
 		font-size: 1.1rem;
 		padding: 0.2rem 0.5rem;
 		border: none;
+	}
+	.coord-btn {
+		flex: none;
+		font-size: 1.1rem;
+		padding: 0.4rem 0.5rem;
+		line-height: 1;
+	}
+	.badge {
+		font-size: 0.7rem;
+		font-weight: 600;
+		padding: 0.1em 0.4em;
+		border-radius: 999px;
+		background: var(--accent);
+		color: var(--accent-fg, #fff);
+		margin-left: 0.3rem;
+		vertical-align: middle;
+		text-transform: uppercase;
+		letter-spacing: 0.03em;
 	}
 </style>
