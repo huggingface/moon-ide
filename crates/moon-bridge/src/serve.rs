@@ -187,6 +187,16 @@ pub struct RemoteWorkspace {
 	/// Last-active timestamp (Unix epoch seconds), if the IDE knows it.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub last_active_at: Option<i64>,
+	/// Whether this workspace is currently open (a process is
+	/// running for it on the reporting IDE's host). An enrolled IDE
+	/// reports its full catalog — open and stopped — so the phone's
+	/// switcher shows launchable workspaces even when no process is
+	/// listening. The bridge merges this with its own socket-probe
+	/// for local-carrier workspaces; for remote-carrier workspaces
+	/// this field is the only liveness signal (the bridge can't
+	/// probe sockets on the IDE's host).
+	#[serde(default)]
+	pub live: bool,
 }
 
 /// Everything a connection handler needs, shared across connections.
@@ -1005,7 +1015,11 @@ async fn handle_workspaces(ctx: &ServeCtx, token: &str) -> ServerMessage {
 			"id": w.id,
 			"name": w.name,
 			"last_active_at": w.last_active_at,
-			"live": true,
+			// The IDE reports live/stopped per workspace in its
+			// `Register`; the bridge can't probe sockets on the
+			// IDE's host, so this field is the only liveness signal
+			// for remote-carrier workspaces.
+			"live": w.live,
 			"ide": ide_id,
 		}));
 	}

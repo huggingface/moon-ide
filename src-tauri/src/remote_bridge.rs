@@ -205,6 +205,8 @@ pub struct RemoteWorkspace {
 	pub name: String,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub last_active_at: Option<i64>,
+	#[serde(default)]
+	pub live: bool,
 }
 
 /// The handle the IDE holds for its outbound remote-bridge connection.
@@ -239,7 +241,12 @@ pub fn spawn(
 	code: String,
 	ide_id: String,
 	label: String,
-	workspace: RemoteWorkspace,
+	// The full catalog of workspaces on this host, with the
+	// currently-open one marked `live: true`. The bridge unions
+	// these into the phone's switcher so stopped workspaces show
+	// up as launchable too — without this, the phone would only
+	// ever see the one workspace the IDE process owns.
+	workspaces: Vec<RemoteWorkspace>,
 	rpc: Arc<dyn BridgeRpcHandler>,
 ) -> RemoteBridgeHandle {
 	let (status_tx, status_rx) = tokio::sync::watch::channel(RemoteBridgeStatus {
@@ -250,7 +257,7 @@ pub fn spawn(
 	});
 	let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<HandleCommand>(8);
 	let task = tauri::async_runtime::spawn(async move {
-		run_connection_loop(bridge_url, code, ide_id, label, workspace, rpc, status_tx, cmd_rx).await;
+		run_connection_loop(bridge_url, code, ide_id, label, workspaces, rpc, status_tx, cmd_rx).await;
 	});
 	RemoteBridgeHandle {
 		task: task.inner().abort_handle(),
@@ -268,7 +275,7 @@ async fn run_connection_loop(
 	code: String,
 	ide_id: String,
 	label: String,
-	workspace: RemoteWorkspace,
+	workspaces: Vec<RemoteWorkspace>,
 	rpc: Arc<dyn BridgeRpcHandler>,
 	status_tx: tokio::sync::watch::Sender<RemoteBridgeStatus>,
 	mut cmd_rx: tokio::sync::mpsc::Receiver<HandleCommand>,
@@ -302,14 +309,14 @@ async fn run_connection_loop(
 		};
 
 		let result = match cred {
-			Some(c) => connect_and_serve(&c, &ide_id, &workspace, &rpc, &status_tx, &mut cmd_rx).await,
+			Some(c) => connect_and_serve(&c, &ide_id, &workspaces, &rpc, &status_tx, &mut cmd_rx).await,
 			None => {
 				// Fresh enroll: connect, present the code, store the
 				// token, then fall through to the serve loop.
 				match connect_and_enroll(&bridge_url, &code, &ide_id, &label, &status_tx).await {
 					Ok(c) => {
 						let _ = store_credential(&c);
-						connect_and_serve(&c, &ide_id, &workspace, &rpc, &status_tx, &mut cmd_rx).await
+						connect_and_serve(&c, &ide_id, &workspaces, &rpc, &status_tx, &mut cmd_rx).await
 					}
 					Err(err) => Err(err),
 				}
@@ -410,7 +417,7 @@ async fn connect_and_enroll(
 async fn connect_and_serve(
 	cred: &RemoteBridgeCredential,
 	ide_id: &str,
-	workspace: &RemoteWorkspace,
+	workspaces: &[RemoteWorkspace],
 	rpc: &Arc<dyn BridgeRpcHandler>,
 	status_tx: &tokio::sync::watch::Sender<RemoteBridgeStatus>,
 	cmd_rx: &mut tokio::sync::mpsc::Receiver<HandleCommand>,
@@ -418,15 +425,17 @@ async fn connect_and_serve(
 	let ws = connect_wss(&cred.bridge_url).await?;
 	let (mut sink, mut source) = ws.split();
 
-	// Send Register with this process's workspace identity (slug +
-	// catalog name). One workspace per Register because moon-ide is
-	// process-per-workspace (ADR 0014) — each open workspace holds
-	// its own outbound connection, and the bridge unions them into
-	// the phone's switcher.
-	let workspaces = vec![workspace.clone()];
+	// Send Register with this host's full workspace catalog — open
+	// and stopped — so the phone's switcher shows launchable
+	// workspaces even when no process is listening on them. Each
+	// open workspace process on the same host sends its own
+	// `Register`; the bridge unions them into the phone's switcher,
+	// deduping by `(ide_id, workspace)` keeping the newest. The
+	// `live` flag on each entry tells the bridge which ones are
+	// currently running.
 	let register = IdeToBridge::Register {
 		token: cred.token.clone(),
-		workspaces,
+		workspaces: workspaces.to_vec(),
 	};
 	let json = serde_json::to_string(&register)?;
 	sink.send(Message::Text(json.into())).await?;

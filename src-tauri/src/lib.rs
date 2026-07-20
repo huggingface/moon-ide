@@ -569,21 +569,31 @@ pub fn run() {
 					Ok(Some(cred)) => {
 						tracing::info!(bridge_url = %cred.bridge_url, "reconnecting to remote bridge with stored credential");
 						let rpc: tauri::State<'_, std::sync::Arc<dyn focus_socket::BridgeRpcHandler>> = app.state();
-						// Register under this workspace's real identity —
-						// slug + catalog name — so the phone's switcher
-						// shows "Hugging Face", not a hardcoded label.
-						let meta = loaded_state.workspaces.iter().find(|m| m.id == workspace_id);
-						let workspace = remote_bridge::RemoteWorkspace {
-							id: workspace_id.clone(),
-							name: meta.map(|m| m.name.clone()).unwrap_or_else(|| workspace_id.clone()),
-							last_active_at: meta.map(|m| m.last_active_at),
-						};
+						// Register the full workspace catalog — not
+						// just this process's open workspace — so
+						// the phone's switcher shows stopped
+						// workspaces as launchable too. The currently-
+						// open workspace is marked `live: true`; the
+						// rest are `live: false` (the bridge can't
+						// probe sockets on the IDE's host, so the
+						// IDE's report is the only liveness signal
+						// for remote-carrier workspaces).
+						let workspaces = loaded_state
+							.workspaces
+							.iter()
+							.map(|m| remote_bridge::RemoteWorkspace {
+								id: m.id.clone(),
+								name: m.name.clone(),
+								last_active_at: Some(m.last_active_at),
+								live: m.id == workspace_id,
+							})
+							.collect::<Vec<_>>();
 						let handle = remote_bridge::spawn(
 							cred.bridge_url,
 							String::new(), // no code — the stored token authenticates
 							cred.ide_id,
 							"moon-ide".into(),
-							workspace,
+							workspaces,
 							rpc.inner().clone(),
 						);
 						let state: tauri::State<'_, AppState> = app.state();
