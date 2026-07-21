@@ -47,10 +47,18 @@
 		}
 	}
 
+	/** True while the fast model is drafting a commit subject. */
+	let suggesting = $state(false);
+
 	async function suggestMsg(): Promise<void> {
-		const msg = await app.suggestCommitMessage();
-		if (msg) {
-			commitMsg = msg;
+		suggesting = true;
+		try {
+			const msg = await app.suggestCommitMessage();
+			if (msg) {
+				commitMsg = msg;
+			}
+		} finally {
+			suggesting = false;
 		}
 	}
 </script>
@@ -201,12 +209,22 @@
 						disabled={committing || app.committing}
 					></textarea>
 					<div class="scm-commit-actions">
-						<button class="ghost" onclick={suggestMsg} disabled={committing || app.committing} title="Suggest a message"
-							>✦</button
+						<button
+							class="ghost"
+							class:suggesting
+							onclick={suggestMsg}
+							disabled={suggesting || committing || app.committing}
+							title="Suggest a message"
 						>
-						<button class="primary" onclick={handleCommit} disabled={committing || app.committing || !commitMsg.trim()}
-							>Commit</button
+							✦
+						</button>
+						<button
+							class="primary"
+							onclick={handleCommit}
+							disabled={suggesting || committing || app.committing || !commitMsg.trim()}
 						>
+							Commit
+						</button>
 					</div>
 				</div>
 			{:else}
@@ -482,6 +500,14 @@
 	.scm-commit-actions {
 		display: flex;
 		gap: 0.4rem;
+	}
+	.scm-commit-actions .suggesting {
+		animation: sparkle-pulse 1s ease-in-out infinite;
+	}
+	@keyframes sparkle-pulse {
+		50% {
+			opacity: 0.3;
+		}
 	}
 	.scm-commit-actions .primary {
 		flex: 1;
