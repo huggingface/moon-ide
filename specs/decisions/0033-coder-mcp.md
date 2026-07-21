@@ -31,7 +31,11 @@ lookup, project-specific tooling) would restart the argument.
   enabled; the cost is one `mcp_list_tools` round-trip per server
   per session.
 - **Curated presets + per-workspace custom servers.** One preset
-  today: `playwright` (`npx -y @playwright/mcp@latest`). Custom
+  today: `playwright` (`npx -y @playwright/mcp@latest --browser
+chromium` — the server's default `chrome` channel wants real
+  Google Chrome at its standard install path, which isn't
+  installable on every distro; Playwright's bundled Chromium via
+  `npx playwright install chromium` is). Custom
   servers (label, command, args, run target, model-facing
   description) persist per workspace on
   `WorkspaceSession.coder_mcp`, alongside the enabled-id set.

@@ -448,7 +448,9 @@ the workspace has no enabled servers, and neither is mode-gated
 (same posture as `bash` — sub-agents get them too).
 
 - **Presets + customs.** One hardcoded preset: `playwright`
-  (`npx -y @playwright/mcp@latest`). Custom servers — label,
+  (`npx -y @playwright/mcp@latest --browser chromium` — pinned to
+  Playwright's bundled Chromium so it doesn't require real Google
+  Chrome on the host). Custom servers — label,
   command + args (stdio transport only), run target, description —
   live per workspace on `WorkspaceSession.coder_mcp`, managed from
   the model-settings modal's "MCP servers" section via the

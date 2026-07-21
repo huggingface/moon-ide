@@ -49,7 +49,17 @@ pub fn preset_servers() -> Vec<McpServerConfig> {
 		id: "playwright".into(),
 		label: "Playwright".into(),
 		command: "npx".into(),
-		args: vec!["-y".into(), "@playwright/mcp@latest".into()],
+		// `--browser chromium` pins Playwright's bundled Chromium
+		// (`npx playwright install chromium`) instead of the
+		// server's default `chrome` channel, which requires real
+		// Google Chrome at /opt/google/chrome — not installable on
+		// every distro and not something a dev box should need.
+		args: vec![
+			"-y".into(),
+			"@playwright/mcp@latest".into(),
+			"--browser".into(),
+			"chromium".into(),
+		],
 		// Host by default: driving a browser needs one installed,
 		// and moon-base doesn't ship browsers.
 		runs: McpRunTarget::Host,
