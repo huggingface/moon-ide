@@ -226,6 +226,11 @@ pub struct RemoteBridgeStatus {
 	pub bridge_url: String,
 	pub ide_id: String,
 	pub error: Option<String>,
+	/// Count of phone WS sessions connected to the relay. Updated
+	/// from the `Register` reply and periodically via the keepalive
+	/// flow. Drives the IDE's status-bar "companion (N)" badge.
+	#[serde(default)]
+	pub connected_phones: u64,
 }
 
 /// Spawn the outbound remote-bridge client. Connects to `bridge_url`,
@@ -254,6 +259,7 @@ pub fn spawn(
 		bridge_url: bridge_url.clone(),
 		ide_id: ide_id.clone(),
 		error: None,
+		connected_phones: 0,
 	});
 	let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<HandleCommand>(8);
 	let task = tauri::async_runtime::spawn(async move {
@@ -299,6 +305,7 @@ async fn run_connection_loop(
 					bridge_url: bridge_url.clone(),
 					ide_id: ide_id.clone(),
 					error: Some("enrollment did not complete".into()),
+					connected_phones: 0,
 				});
 				return;
 			}
@@ -336,6 +343,7 @@ async fn run_connection_loop(
 					bridge_url: bridge_url.clone(),
 					ide_id: ide_id.clone(),
 					error: None,
+					connected_phones: 0,
 				});
 				// A clean close means we did connect — start the
 				// backoff ladder over.
@@ -349,6 +357,7 @@ async fn run_connection_loop(
 					bridge_url: bridge_url.clone(),
 					ide_id: ide_id.clone(),
 					error: Some(err.to_string()),
+					connected_phones: 0,
 				});
 				tokio::time::sleep(backoff).await;
 				backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
@@ -394,6 +403,7 @@ async fn connect_and_enroll(
 					bridge_url: bridge_url.to_owned(),
 					ide_id: ok_id.clone(),
 					error: None,
+					connected_phones: 0,
 				});
 				return Ok(RemoteBridgeCredential {
 					bridge_url: bridge_url.to_owned(),
@@ -445,6 +455,7 @@ async fn connect_and_serve(
 		bridge_url: cred.bridge_url.clone(),
 		ide_id: ide_id.to_owned(),
 		error: None,
+		connected_phones: 0,
 	});
 
 	// Serve loop: read forwarded calls/subscribes from the bridge,
@@ -598,8 +609,14 @@ async fn connect_and_serve(
 					let _ = sink.lock().await.send(Message::Text(json.into())).await;
 				});
 			}
-			BridgeToIde::Result { .. } => {
-				// Register ack — harmless, no action needed.
+			BridgeToIde::Result { value } => {
+				// Register ack — extract the phone count the bridge
+				// reports so the status-bar badge stays current.
+				if let Some(count) = value.get("connected_phones").and_then(|v| v.as_u64()) {
+					let mut status = status_tx.borrow().clone();
+					status.connected_phones = count;
+					let _ = status_tx.send(status);
+				}
 			}
 			BridgeToIde::PairPayload {
 				payload,

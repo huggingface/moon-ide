@@ -201,6 +201,10 @@ pub struct RemoteWorkspace {
 
 /// Everything a connection handler needs, shared across connections.
 struct ServeCtx {
+	/// Count of currently-connected phone WS sessions. Incremented on
+	/// connect, decremented on disconnect — drives the IDE's status-bar
+	/// "companion (N)" badge so the dev knows a phone is listening.
+	connected_phones: std::sync::atomic::AtomicU64,
 	workspaces_dir: Utf8PathBuf,
 	/// Directory of built PWA assets to serve over HTTP. `None` runs
 	/// WS-only (e.g. a dev session pointing the PWA's Vite server at
@@ -367,6 +371,7 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
 	};
 
 	let ctx = Arc::new(ServeCtx {
+		connected_phones: std::sync::atomic::AtomicU64::new(0),
 		workspaces_dir,
 		web_root,
 		devices,
@@ -452,6 +457,7 @@ fn current_status(ctx: &ServeCtx, mdns_url: Option<&str>) -> crate::status::Comp
 		devices,
 		ides,
 		build_id: crate::status::self_build_id(),
+		connected_phones: ctx.connected_phones.load(std::sync::atomic::Ordering::Relaxed),
 	}
 }
 
@@ -689,6 +695,12 @@ async fn handle_conn(
 	// `Register`s as an IDE workspace process. A phone never
 	// registers, so its cleanup below is a no-op.
 	let conn_id = ctx.conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+	// Track whether this WS connection is a phone (vs an enrolled
+	// IDE). Increment the phone counter on the first phone-specific
+	// message; decrement on disconnect. IDEs never send phone
+	// messages — they send `Register`/`ForwardResult`/`ForwardEvent`.
+	let is_phone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+	let phone_ctx = std::sync::Arc::clone(&is_phone);
 
 	loop {
 		// A live peer pongs our periodic pings, so total read
@@ -709,11 +721,16 @@ async fn handle_conn(
 			Message::Close(_) => break,
 			_ => continue,
 		};
-		handle_message(&ctx, &text, &out_tx, conn_id).await;
+		handle_message(&ctx, &text, &out_tx, conn_id, &phone_ctx).await;
 	}
 
 	drop(out_tx);
 	let _ = writer.await;
+
+	// Decrement the phone counter if this was a phone connection.
+	if is_phone.load(std::sync::atomic::Ordering::Relaxed) {
+		ctx.connected_phones.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+	}
 
 	// Connection cleanup: if this connection had registered as an IDE
 	// workspace process, remove it from the live table so the phone's
@@ -770,7 +787,13 @@ async fn handle_conn(
 	Ok(())
 }
 
-async fn handle_message(ctx: &Arc<ServeCtx>, text: &str, out: &tokio::sync::mpsc::Sender<ServerMessage>, conn_id: u64) {
+async fn handle_message(
+	ctx: &Arc<ServeCtx>,
+	text: &str,
+	out: &tokio::sync::mpsc::Sender<ServerMessage>,
+	conn_id: u64,
+	is_phone: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
 	let parsed: ClientMessage = match serde_json::from_str(text) {
 		Ok(m) => m,
 		Err(err) => {
@@ -782,6 +805,19 @@ async fn handle_message(ctx: &Arc<ServeCtx>, text: &str, out: &tokio::sync::mpsc
 			return;
 		}
 	};
+
+	// Flag this as a phone connection on the first phone-specific
+	// message (incrementing the counter once per connection).
+	let is_phone_msg = matches!(
+		&parsed,
+		ClientMessage::Pair { .. }
+			| ClientMessage::Workspaces { .. }
+			| ClientMessage::Call { .. }
+			| ClientMessage::Subscribe { .. }
+	);
+	if is_phone_msg && !is_phone.swap(true, std::sync::atomic::Ordering::Relaxed) {
+		ctx.connected_phones.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+	}
 
 	match parsed {
 		ClientMessage::Pair { code, label } => {
@@ -1158,7 +1194,10 @@ async fn handle_register(
 	);
 	tracing::info!(ide_id = %ide.id, conn_id, "IDE registered workspaces");
 	ServerMessage::Result {
-		value: serde_json::json!({ "registered": true }),
+		value: serde_json::json!({
+			"registered": true,
+			"connected_phones": ctx.connected_phones.load(std::sync::atomic::Ordering::Relaxed),
+		}),
 	}
 }
 

@@ -604,7 +604,7 @@
 			class="container"
 			class:active={companion.modalOpen}
 			title={companion.remoteConnected
-				? `Connected to relay ${companion.remoteStatus?.bridge_url ?? ''}`
+				? `Connected to relay ${companion.remoteStatus?.bridge_url ?? ''}${companion.connectedPhoneCount > 0 ? ` · ${companion.connectedPhoneCount} phone${companion.connectedPhoneCount === 1 ? '' : 's'} connected` : ''}`
 				: companion.remoteErrored
 					? `Relay connection failing: ${companion.remoteStatus?.error ?? ''}`
 					: companion.running
@@ -614,7 +614,7 @@
 		>
 			<span class="icon" aria-hidden="true">☏</span>
 			<span class="pip" class:on={companion.active} class:pip-warn={companion.remoteErrored}></span>
-			companion{companion.deviceCount > 0 ? ` (${companion.deviceCount})` : ''}
+			companion{companion.connectedPhoneCount > 0 ? ` (${companion.connectedPhoneCount})` : ''}
 		</button>
 		<!-- Terminal launcher. Same popover the bottom-panel
 			 strip uses; placed here so the user can spawn a

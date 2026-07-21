@@ -91,6 +91,10 @@ pub struct CompanionStatus {
 	/// stale, evict + respawn. Self-maintaining, no version bumps.
 	#[serde(default)]
 	pub build_id: String,
+	/// Count of phone WS connections currently connected to this
+	/// bridge. Drives the IDE's status-bar "companion (N)" badge.
+	#[serde(default)]
+	pub connected_phones: u64,
 }
 
 /// Hash the running executable to identify its build. Cheap (one read

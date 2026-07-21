@@ -482,6 +482,7 @@ export type CompanionStatus = {
 	fingerprint: string;
 	devices: { id: string; label: string; paired_at_ms: number }[];
 	ides?: { id: string; label: string; enrolled_at_ms: number }[];
+	connected_phones?: number;
 };
 
 /** Remote / relay bridge connection status (Phase 14.3, ADR 0031).
@@ -492,4 +493,5 @@ export type RemoteBridgeStatus = {
 	bridge_url: string;
 	ide_id: string;
 	error: string | null;
+	connected_phones: number;
 };

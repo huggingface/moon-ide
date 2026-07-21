@@ -66,6 +66,13 @@ class CompanionState {
 		return this.remoteConnected || (this.running && this.deviceCount > 0);
 	}
 
+	/** Count of phone WS sessions currently connected to the bridge.
+	 * From the remote relay's `Register` reply (remote mode) or the
+	 * local bridge's control-socket status (local mode). */
+	get connectedPhoneCount(): number {
+		return this.remoteStatus?.connected_phones ?? this.status?.connected_phones ?? 0;
+	}
+
 	async refresh(): Promise<void> {
 		try {
 			this.status = await ipc.companion.status();
