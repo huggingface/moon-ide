@@ -513,13 +513,9 @@ Tools captured by a running turn close over the **session's bound
 folder**, not the live active folder — switching folders mid-turn
 cannot redirect tool calls. This includes the coordinator tools
 (ADR 0030): `spawn_worker` creates the worktree off and files the
-worker under the **coordinator's own project** by default, or under
-a different bound folder when `folder` is passed (e.g. one created
-by `init_repo` / `clone_repo`). In either case it does not touch the
-visible session — the UI stays on the coordinator. The
-`SubagentSpawned` event for a worker carries `worktree_root` so the
-tool-call card can offer a navigation link to the worker's session
-even when it's in another project. `clone_repo` / `init_repo` /
+worker under the **coordinator's own project** by default, or under a
+different bound folder when `folder` is passed (e.g. one created by
+`init_repo` / `clone_repo`). `clone_repo` / `init_repo` /
 `workspace_scm_status` anchor to the coordinator's own folder too.
 `abort` targets the active folder's visible session only; sign-out is
 the one global cancel.

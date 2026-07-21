@@ -1,37 +1,25 @@
-# ADR 0037 — Cross-project workers, no UI hijack, session navigation
+# ADR 0037 — Cross-project workers and session navigation
 
 Date: 2026-07-15
 Status: accepted
 
 ## Context
 
-ADR 0030 landed the coordinator / worker model with three gaps that
-surfaced once the `init_repo` / `clone_repo` tools were available:
+ADR 0030 landed the coordinator / worker model, but `spawn_worker`
+always created the worktree off the coordinator's own folder —
+hardcoded via `Some(sink.folder().to_string())`. The coordinator
+system prompt listed `init_repo` and `spawn_worker` side by side
+without caveat, so a model reading it would reasonably try
+`init_repo("/scratch/new-service")` then `spawn_worker("build the
+service")` expecting the worker to run in the new repo. It wouldn't —
+the worker landed in a worktree off the coordinator's project.
 
-1. **`spawn_worker` could not target a different project.** It always
-   created the worktree off the coordinator's own folder, hardcoded
-   via `Some(sink.folder().to_string())` in `handle_spawn_worker`. The
-   coordinator system prompt listed `init_repo` and `spawn_worker`
-   side by side without caveat, so a model reading it would reasonably
-   try `init_repo("/scratch/new-service")` then
-   `spawn_worker("build the service")` expecting the worker to run in
-   the new repo — it wouldn't. The worker landed in a worktree off the
-   coordinator's project.
-
-2. **The UI hijacked the visible session when a worker was spawned.**
-   `handle_spawn_worker` seeds the worker via `send_to`, which emits
-   `SessionLoaded` when the worker's first message lands. The
-   frontend's `session_loaded` handler unconditionally set
-   `folder.visibleSessionId = event.id`, switching the panel to the
-   worker — even though the user was looking at the coordinator.
-
-3. **No way to navigate from a `spawn_worker` / `observe_worker` tool
-   row to the worker's session.** The sub-agent card's "Open
-   transcript" button opened the sub-agent pop-out view, which doesn't
-   exist for workers (they're real top-level sessions in worktrees, not
-   hidden sub-agent transcripts). A worker in another project was
-   unreachable from the coordinator's panel without manually switching
-   folders and finding it in the sessions list.
+A second gap: the sub-agent card under a `spawn_worker` tool row
+offered "Open transcript →" (the sub-agent pop-out), but workers are
+real top-level sessions in worktrees, not hidden sub-agent
+transcripts. A worker in another project was unreachable from the
+coordinator's panel without manually switching folders and finding it
+in the sessions list.
 
 ## Decision
 
@@ -41,28 +29,17 @@ The tool definition and `handle_spawn_worker` accept an optional
 `folder` (absolute host path of a bound workspace folder). When
 provided, the worktree is created off that folder instead of the
 coordinator's own. The handler validates the folder is bound in the
-workspace — a folder that isn't bound can't host a worktree — and
-returns an actionable error pointing to `init_repo` / `clone_repo` if
-the model forgot that step.
+workspace and returns an actionable error pointing to `init_repo` /
+`clone_repo` if the model forgot that step.
 
 The `SubagentSpawned` event gains an optional `worktree_root` field
 (absent for `task` sub-agents, set for `spawn_worker` workers) so the
 frontend can distinguish the two and navigate to the worker's session.
 
-### The UI stays on the coordinator when a worker is spawned
-
-The frontend's `session_loaded` handler now checks whether the
-session id matches a known worker (by scanning the folder's session
-buckets' `subagentSummaries` for a matching `id`). If it does, the
-handler skips setting `folder.visibleSessionId` and
-`folder.view = 'session'` — the coordinator stays visible, and the
-worker's events land in its own session bucket in the background.
-
 ### Worker cards navigate to the session
 
-The sub-agent card under a `spawn_worker` tool row now shows "Open
-session →" (instead of "Open transcript →") when
-`worktreeRoot` is set. Clicking it calls
+The sub-agent card under a `spawn_worker` tool row shows "Open
+session →" when `worktree_root` is set. Clicking it calls
 `CoderPanelState.openWorkerSession(worktreeRoot, sessionId)`, which
 switches the folder bar to the worktree (if it isn't already active)
 and opens the session by id — the same flow as clicking a row in the
@@ -74,6 +51,19 @@ sessions list.
 collapsed row shows the worker id (or the task text for
 `spawn_worker`) inline, making them recognizable without expanding.
 
+### `merge_worker_changes` for local repos
+
+ADR 0030's prompt said "you do not merge work back" — correct for repos
+with a remote (the branch is the deliverable, the PR is the merge), but
+wrong for a local repo the coordinator just created with `init_repo`
+(no remote, no PR flow). The coordinator gains a
+`merge_worker_changes(worker_id, base_branch?)` tool that switches the
+parent repo to `base_branch` (default `main`) and runs
+`git merge --no-edit <worker_branch>` on the parent's host. The
+worker's worktree and branch are left intact — only the commits land.
+The system prompt now distinguishes: leave the branch for PR when
+there's a remote; `merge_worker_changes` for local repos.
+
 ## What this deliberately does not do
 
 - **Does not change the worker's session filing.** The worker is still
@@ -81,16 +71,15 @@ collapsed row shows the worker id (or the task text for
   controls where the worktree is created, not where the session JSONL
   lands). This keeps the coordinator's session list coherent — all
   workers it spawned are in its project's session list.
-- **Does not change `clone_repo` / `init_repo`'s active-folder
-  behavior.** Those tools use `add_folder` (which sets the folder
-  active) — but since the coordinator can't edit files, the active
-  folder flip is harmless (the coordinator doesn't operate on the
-  active folder's visible session).
 - **Does not add `folder` to the other coordinator control tools**
   (`observe_worker`, `steer_worker`, etc.). They resolve the worker
   by `worker_id` (session id) across all folders via
   `runtime_for_session`, so they already work cross-project without a
   `folder` parameter.
+- **Does not remove the worktree or delete the branch after a merge.**
+  `merge_worker_changes` only merges — the worktree and branch stay.
+  The coordinator (or user) can clean up via the existing
+  `coder_merge_and_remove_worktree` flow if needed.
 
 ## Related
 

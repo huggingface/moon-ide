@@ -1352,6 +1352,7 @@
 			case 'abort_worker':
 			case 'review_worker_changes':
 			case 'commit_worker_changes':
+			case 'merge_worker_changes':
 			case 'respond_to_worker_prompt': {
 				return typeof o.worker_id === 'string' ? firstLine(o.worker_id) : null;
 			}

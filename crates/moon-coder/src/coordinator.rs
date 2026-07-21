@@ -60,6 +60,7 @@ You manage workers with:
 - `abort_worker(worker_id)` — cancel a worker's in-flight turn.
 - `workspace_scm_status(worker_id?)` — get the SCM (git) status of a worker's worktree or the main folder: branch name, ahead/behind upstream, files changed (added / modified / deleted counts + per-file list). Read-only — use this to check whether a worker should commit before you steer it to the next task.
 - `commit_worker_changes(worker_id, message?)` — commit a worker's uncommitted changes (`git add -A` + `git commit`, same as the IDE's SCM panel). Pass `message` to set the commit subject; omit it to get an AI-suggested message from the diff. Use `workspace_scm_status` first to check whether there's anything to commit.
+- `merge_worker_changes(worker_id, base_branch?)` — merge a worker's branch into a base branch on the parent repo (defaults to `main`). Switches the parent to `base_branch`, then `git merge --no-edit <worker_branch>`. The worker's worktree and branch are left intact. Use `commit_worker_changes` first if the worker has uncommitted work. Use this for local repos without a PR flow; for repos with a remote, leave the branch for the user to PR instead.
 - `clone_repo(url, path?)` — clone a git repository to a host path and add it as a workspace folder. Use this when a task requires a dependency repo or a fresh checkout that isn't already in the workspace. The clone runs on the host so the path is immediately available. Omit `path` to clone into a sibling of the active folder.
 - `init_repo(path)` — initialize a new git repository at a host path and add it as a workspace folder. Use this when a task needs a fresh project (scratch repo, new microservice, test harness). Creates the directory if it doesn't exist.
 - `respond_to_worker_prompt(worker_id, answers)` — answer a worker's parked `ask_user` prompt. A worker that needs a decision from you raises `ask_user`; you see it via `observe_worker` and answer it with this tool.
@@ -83,7 +84,9 @@ You spawn **workers** (peer top-level sessions), not sub-agents. A worker *can* 
 
 ## Worktrees and branches
 
-Each worker runs in its own git worktree on its own branch — the branch is the deliverable. When the worker is done, its work is on that branch, ready for the user to review, commit, and PR through the normal SCM flow. You do not merge work back; you do not delete branches. `base_branch` lets you start a worker from an existing branch (e.g. a colleague's open-PR branch) instead of the default — useful for "continue this PR" tasks.
+Each worker runs in its own git worktree on its own branch — the branch is the deliverable. `base_branch` lets you start a worker from an existing branch (e.g. a colleague's open-PR branch) instead of the default — useful for "continue this PR" tasks.
+
+**When to merge vs leave for PR:** For repos with a remote, leave the worker's branch for the user to review and PR — the branch *is* the deliverable, and you should not merge it. For local repos without a remote (e.g. a scratch repo you created with `init_repo`), use `merge_worker_changes` to land the worker's committed work onto the base branch. Use `commit_worker_changes` first if the worker has uncommitted work, then `merge_worker_changes` to merge. You do not delete branches.
 
 ## Reading rules
 
@@ -259,6 +262,35 @@ pub fn commit_worker_changes_tool_definition() -> ToolDefinition {
 	)
 }
 
+/// `merge_worker_changes` — merge a worker's branch into a base
+/// branch on the parent repo. The parent repo is switched to
+/// `base_branch` (default: the repo's default branch), then `git
+/// merge --no-edit <worker_branch>` runs on the parent's host. The
+/// worker's worktree and branch are left intact — call this after
+/// `commit_worker_changes` to land committed work onto the base
+/// branch. Use this for local repos without a PR flow; for repos with
+/// a remote, leave the branch for the user to PR instead.
+pub fn merge_worker_changes_tool_definition() -> ToolDefinition {
+	ToolDefinition::function(
+		"merge_worker_changes",
+		"Merge a worker's branch into a base branch on the parent repo. Switches the parent repo to `base_branch` (defaults to `main`), then runs `git merge --no-edit <worker_branch>`. The worker's worktree and branch are left intact. Use `commit_worker_changes` first if the worker has uncommitted work. Use this for local repos without a PR flow — for repos with a remote, leave the branch for the user to PR instead. Returns the merge result or an error (conflicts, dirty tree, unknown ref).",
+		json!({
+			"type": "object",
+			"properties": {
+				"worker_id": {
+					"type": "string",
+					"description": "The worker id returned by `spawn_worker`."
+				},
+				"base_branch": {
+					"type": "string",
+					"description": "Optional. The branch to merge into. Defaults to `main`. Use this when the repo's default branch has a different name."
+				}
+			},
+			"required": ["worker_id"]
+		}),
+	)
+}
+
 /// `workspace_scm_status` — read-only SCM state for a worker's
 /// worktree (or the main folder). Composes branch info, file change
 /// counts, and the file list into one compact snapshot so the
@@ -356,6 +388,10 @@ mod tests {
 		assert_eq!(
 			commit_worker_changes_tool_definition().function.name,
 			"commit_worker_changes"
+		);
+		assert_eq!(
+			merge_worker_changes_tool_definition().function.name,
+			"merge_worker_changes"
 		);
 		assert_eq!(clone_repo_tool_definition().function.name, "clone_repo");
 		assert_eq!(init_repo_tool_definition().function.name, "init_repo");

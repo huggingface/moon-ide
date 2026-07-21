@@ -4033,6 +4033,7 @@ async fn run_turn(
 		tool_defs.push(crate::coordinator::review_worker_changes_tool_definition());
 		tool_defs.push(crate::coordinator::workspace_scm_status_tool_definition());
 		tool_defs.push(crate::coordinator::commit_worker_changes_tool_definition());
+		tool_defs.push(crate::coordinator::merge_worker_changes_tool_definition());
 		tool_defs.push(crate::coordinator::clone_repo_tool_definition());
 		tool_defs.push(crate::coordinator::init_repo_tool_definition());
 	}
@@ -4632,6 +4633,8 @@ async fn dispatch_tool_calls(
 				handle_workspace_scm_status(state, sink, &args).await
 			} else if call.function.name == "commit_worker_changes" {
 				handle_commit_worker_changes(state, &args).await
+			} else if call.function.name == "merge_worker_changes" {
+				handle_merge_worker_changes(state, &args).await
 			} else if call.function.name == "clone_repo" {
 				handle_clone_repo(state, sink, &args).await
 			} else if call.function.name == "init_repo" {
@@ -5503,6 +5506,87 @@ async fn handle_commit_worker_changes(state: &Arc<CoderState>, args: &Value) -> 
 	Ok(json!({
 		"short_sha": result.short_sha,
 		"summary": result.summary,
+	}))
+}
+
+/// `merge_worker_changes` — merge a worker's branch into a base
+/// branch on the parent repo (ADR 0037). Switches the parent repo to
+/// `base_branch` (default `main`), then runs `git merge --no-edit
+/// <worker_branch>` on the parent's host. The worker's worktree and
+/// branch are left intact — this only lands the commits, it doesn't
+/// clean up the worktree. Refuses a taken-over worker (ADR 0036).
+async fn handle_merge_worker_changes(state: &Arc<CoderState>, args: &Value) -> Result<Value, CoderError> {
+	#[derive(serde::Deserialize)]
+	struct MergeArgs {
+		worker_id: String,
+		#[serde(default)]
+		base_branch: Option<String>,
+	}
+	let parsed: MergeArgs = serde_json::from_value(args.clone())
+		.map_err(|err| CoderError::invalid_args("merge_worker_changes", err.to_string()))?;
+	refuse_if_taken_over(state, "merge_worker_changes", &parsed.worker_id).await?;
+	let Some((rt, _)) = state.runtime_for_session(&parsed.worker_id).await else {
+		return Err(CoderError::invalid_args(
+			"merge_worker_changes",
+			format!("no mounted session for worker_id `{}`", parsed.worker_id),
+		));
+	};
+	let (worktree_root, worktree_branch) = {
+		let session = rt.session.lock().await;
+		(
+			session.header.worktree_root.clone(),
+			session.header.worktree_branch.clone(),
+		)
+	};
+	let Some(worktree_path) = worktree_root else {
+		return Err(CoderError::invalid_args(
+			"merge_worker_changes",
+			"worker has no worktree_root — cannot merge a non-worktree session",
+		));
+	};
+	let Some(branch) = worktree_branch else {
+		return Err(CoderError::invalid_args(
+			"merge_worker_changes",
+			"worker has no worktree_branch — cannot merge without a branch name",
+		));
+	};
+	// Resolve the worktree folder to find its parent.
+	let Some(wt_entry) = state.workspaces.folder_for_path(&worktree_path).await else {
+		return Err(CoderError::invalid_args(
+			"merge_worker_changes",
+			format!("worktree folder `{worktree_path}` is not bound"),
+		));
+	};
+	let moon_protocol::workspace::FolderOrigin::Worktree { parent_path, .. } = wt_entry.folder.origin.clone() else {
+		return Err(CoderError::invalid_args(
+			"merge_worker_changes",
+			format!("`{worktree_path}` is not a worktree folder"),
+		));
+	};
+	let Some(parent) = state.workspaces.folder_for_path(&parent_path).await else {
+		return Err(CoderError::invalid_args(
+			"merge_worker_changes",
+			"the worktree's parent folder is not bound; can't merge",
+		));
+	};
+	let base = parsed.base_branch.as_deref().unwrap_or("main").trim();
+	if base.is_empty() {
+		return Err(CoderError::invalid_args(
+			"merge_worker_changes",
+			"base_branch must not be empty",
+		));
+	}
+	// Switch the parent to the base branch, then merge the worker's
+	// branch into it. Both run on the parent's host so they share the
+	// same git index lock.
+	parent
+		.host
+		.branch_switch(&moon_protocol::git::BranchSwitchTarget::Local { name: base.to_string() })
+		.await?;
+	parent.host.git_merge_default_branch(&branch).await?;
+	Ok(json!({
+		"merged_branch": branch,
+		"into": base,
 	}))
 }
 
