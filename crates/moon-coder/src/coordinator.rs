@@ -53,7 +53,7 @@ The moment the user messages a worker directly, that worker is **taken over**: y
 
 You manage workers with:
 
-- `spawn_worker(task, base_branch?)` — create a worker in a fresh worktree on a new `moon/agent-<id>` branch (or based on an existing branch when `base_branch` is given), seed it with a task prompt, and let it run. Returns a `worker_id` handle immediately — **it does not block**. The worker keeps running in the background.
+- `spawn_worker(task, base_branch?, folder?)` — create a worker in a fresh worktree on a new `moon/agent-<id>` branch (or based on an existing branch when `base_branch` is given), seed it with a task prompt, and let it run. Returns a `worker_id` handle immediately — **it does not block**. The worker keeps running in the background. By default the worktree is created off the coordinator's own project; pass `folder` to target a different bound workspace folder (e.g. one you just created with `init_repo` or `clone_repo` — pass the `path` that tool returned). The folder must already be bound in the workspace.
 - `observe_worker(worker_id)` — fetch a compact snapshot of a worker's current state: its task, branch, turns-so-far, last assistant message, whether it's running / idle / needs input (a parked `ask_user`), and a **diff summary** (files changed + added/removed counts per file, not the full patch). Use this to check on a worker without reading its full transcript or flooding your context with patch text.
 - `review_worker_changes(worker_id, files?)` — pull the full per-turn diff for a worker, optionally scoped to specific files. Use this when `observe_worker`'s diff summary shows files you want to actually inspect. Don't call it on every observe — only when you need the detail.
 - `steer_worker(worker_id, text)` — send a steering message to a worker mid-turn, the same way a user steers you. Queued; delivered at the worker's next loop iteration top.
@@ -105,7 +105,7 @@ Be concise. Do not narrate what each tool call is for; the UI already shows the 
 pub fn spawn_worker_tool_definition() -> ToolDefinition {
 	ToolDefinition::function(
 		"spawn_worker",
-		"Spawn a worker — a peer top-level coder session in its own git worktree on a fresh branch — and seed it with a task prompt. Returns a `worker_id` handle immediately; the worker runs in the background and does not block. The worker is an ordinary agent session (full toolkit, can edit files) in a worktree. It shows up in the sessions list and the user can take over. Use this to delegate a self-contained piece of work to an autonomous agent that produces its own branch / PR.",
+		"Spawn a worker — a peer top-level coder session in its own git worktree on a fresh branch — and seed it with a task prompt. Returns a `worker_id` handle immediately; the worker runs in the background and does not block. The worker is an ordinary agent session (full toolkit, can edit files) in a worktree. It shows up in the sessions list and the user can take over. Use this to delegate a self-contained piece of work to an autonomous agent that produces its own branch / PR.\n\nBy default the worktree is created off the coordinator's own project. Pass `folder` to target a different bound workspace folder — e.g. one you just created with `init_repo` or `clone_repo`. The folder must already be bound in the workspace.",
 		json!({
 			"type": "object",
 			"properties": {
@@ -116,6 +116,10 @@ pub fn spawn_worker_tool_definition() -> ToolDefinition {
 				"base_branch": {
 					"type": "string",
 					"description": "Optional existing branch to base the worker on instead of the default branch. A local branch, or a remote one DWIM-created locally the way `git switch` does. Useful for 'continue this PR' or 'work on top of colleague's branch' tasks. Omit for a fresh branch off the default."
+				},
+				"folder": {
+					"type": "string",
+					"description": "Optional. The absolute host path of a bound workspace folder to create the worktree under. Defaults to the coordinator's own folder. Use this to spawn a worker in a project you created with `init_repo` or `clone_repo` — pass the `path` that tool returned. The folder must already be bound in the workspace."
 				}
 			},
 			"required": ["task"]
@@ -365,8 +369,11 @@ mod tests {
 		assert_eq!(params["required"][0], "task");
 		// `base_branch` is optional.
 		assert!(params["properties"]["base_branch"].is_object());
+		// `folder` is optional.
+		assert!(params["properties"]["folder"].is_object());
 		let required: Vec<String> = serde_json::from_value(params["required"].clone()).unwrap();
 		assert!(!required.contains(&"base_branch".to_string()));
+		assert!(!required.contains(&"folder".to_string()));
 	}
 
 	#[test]

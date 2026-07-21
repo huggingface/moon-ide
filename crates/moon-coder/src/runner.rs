@@ -2173,6 +2173,7 @@ impl CoderHandle {
 					ref subagent_id,
 					ref target_folder,
 					ref mode,
+					ref worktree_root,
 				} => {
 					// The resume path refuses mid-turn (guard above), so
 					// no sub-agent can still be running here.
@@ -2183,6 +2184,7 @@ impl CoderHandle {
 						subagent_id.clone(),
 						target_folder.clone(),
 						mode.clone(),
+						worktree_root.clone(),
 						false,
 					)
 					.await;
@@ -2688,6 +2690,7 @@ impl CoderHandle {
 					ref subagent_id,
 					ref target_folder,
 					ref mode,
+					ref worktree_root,
 				} => {
 					let still_running = live_subagent_ids.contains(subagent_id.as_str());
 					replay_subagent_spawned(
@@ -2697,6 +2700,7 @@ impl CoderHandle {
 						subagent_id.clone(),
 						target_folder.clone(),
 						mode.clone(),
+						worktree_root.clone(),
 						still_running,
 					)
 					.await;
@@ -4754,6 +4758,7 @@ async fn handle_task(
 			subagent_id: spec.id.clone(),
 			target_folder: spec.folder.folder.path.clone(),
 			mode: spec.mode.as_wire().to_string(),
+			worktree_root: None,
 		},
 	)
 	.await;
@@ -5026,6 +5031,8 @@ async fn handle_spawn_worker(
 		task: String,
 		#[serde(default)]
 		base_branch: Option<String>,
+		#[serde(default)]
+		folder: Option<String>,
 	}
 	let parsed: SpawnWorkerArgs =
 		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("spawn_worker", err.to_string()))?;
@@ -5033,17 +5040,46 @@ async fn handle_spawn_worker(
 	if task.is_empty() {
 		return Err(CoderError::invalid_args("spawn_worker", "task must not be empty"));
 	}
+	// Resolve the parent folder for the worktree. The coordinator's
+	// own folder (the sink's) is the default; `folder` overrides it
+	// so a worker can be spawned in a project the coordinator just
+	// created via `init_repo` / `clone_repo`. Either way the parent
+	// is pinned to the session's bound folder, never the live active
+	// folder — the user may have switched projects while this turn
+	// was running.
+	let parent_folder = match &parsed.folder {
+		Some(f) => {
+			let path = f.trim();
+			if path.is_empty() {
+				return Err(CoderError::invalid_args(
+					"spawn_worker",
+					"folder must not be empty when provided",
+				));
+			}
+			// Verify the folder is bound in the workspace — a
+			// folder that isn't bound can't host a worktree.
+			if state.workspaces.folder_for_path(path).await.is_none() {
+				return Err(CoderError::invalid_args(
+					"spawn_worker",
+					format!("folder `{path}` is not a bound workspace folder; create it first with `init_repo` or `clone_repo`, or omit `folder` to use the coordinator's own project"),
+				));
+			}
+			path.to_string()
+		}
+		None => sink.folder().to_string(),
+	};
 	// Mint the worker as an ordinary `Agent` session in a worktree.
 	// A sub-orchestrator would pass `Coordinator` here, but that's a
-	// later-scale concern; v1 workers are plain agents. The worker's
-	// parent project is the **coordinator's own folder** (the sink's),
-	// never the live active folder — the user may have switched
-	// projects while this turn was running.
+	// later-scale concern; v1 workers are plain agents.
 	let handle = CoderHandle { state: state.clone() };
 	let (summary, _workspace) = handle
-		.create_worktree_session(parsed.base_branch, CoderMode::Agent, Some(sink.folder().to_string()))
+		.create_worktree_session(parsed.base_branch, CoderMode::Agent, Some(parent_folder.clone()))
 		.await?;
-	let target_folder = summary.worktree_branch.as_deref().unwrap_or("").to_string();
+	// `target_folder` is the worktree path the worker operates
+	// against — the same shape `SubagentSpawned.target_folder`
+	// carries for `task` sub-agents (their folder path), not the
+	// branch name.
+	let target_folder = summary.worktree_root.clone().unwrap_or(parent_folder);
 	// Seed the worker with the task prompt.
 	handle.send_to(&summary.id, task.to_string(), Vec::new()).await?;
 	// Register the worker under the orchestrator's session id so the
@@ -5057,15 +5093,36 @@ async fn handle_spawn_worker(
 	if spawn_feeder {
 		spawn_dispatch_feeder(state.clone(), orchestrator_id.clone());
 	}
+	// Persist the spawn into the coordinator's JSONL right away
+	// (before the worker's first turn) so a crash / kill mid-worker
+	// still leaves a record the coordinator can replay. The on-disk
+	// record mirrors `CoderEvent::SubagentSpawned` so replay needs no
+	// shape conversion. Best-effort: a write failure logs at warn but
+	// doesn't fail the spawn.
+	if let Some((orchestrator_rt, _)) = state.runtime_for_session(&orchestrator_id).await {
+		persist_parent_record(
+			&orchestrator_rt,
+			SessionRecord::SubagentSpawned {
+				tool_call_id: tool_call_id.to_string(),
+				subagent_id: summary.id.clone(),
+				target_folder: target_folder.clone(),
+				mode: CoderMode::Agent.as_wire().to_string(),
+				worktree_root: summary.worktree_root.clone(),
+			},
+		)
+		.await;
+	}
 	sink.send(CoderEvent::SubagentSpawned {
 		tool_call_id: tool_call_id.to_string(),
 		subagent_id: summary.id.clone(),
 		target_folder,
 		mode: CoderMode::Agent.as_wire().to_string(),
+		worktree_root: summary.worktree_root.clone(),
 	});
 	Ok(json!({
 		"worker_id": summary.id,
 		"branch": summary.worktree_branch,
+		"worktree_path": summary.worktree_root,
 		"title": summary.title,
 	}))
 }
@@ -6818,6 +6875,7 @@ fn emit_replay_events(out: &mut Vec<CoderEvent>, record: SessionRecord, created_
 /// `<sub_dir>/<subagent_id>.jsonl` and skip gracefully if it's
 /// missing (manual deletion, partial write, older session that
 /// pre-dated subagent persistence).
+#[allow(clippy::too_many_arguments)]
 async fn replay_subagent_spawned(
 	out: &mut Vec<CoderEvent>,
 	sub_dir: &Utf8Path,
@@ -6825,6 +6883,7 @@ async fn replay_subagent_spawned(
 	subagent_id: String,
 	target_folder: String,
 	mode: String,
+	worktree_root: Option<String>,
 	still_running: bool,
 ) {
 	out.push(CoderEvent::SubagentSpawned {
@@ -6832,6 +6891,7 @@ async fn replay_subagent_spawned(
 		subagent_id: subagent_id.clone(),
 		target_folder,
 		mode,
+		worktree_root,
 	});
 
 	let loaded = match sessions::load(sub_dir, &subagent_id).await {

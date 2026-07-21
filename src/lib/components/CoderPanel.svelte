@@ -1342,6 +1342,19 @@
 				const head = folder !== null ? `${folder} · ${mode}` : mode;
 				return taskText !== null ? `${head} — ${taskText}` : head;
 			}
+			case 'spawn_worker': {
+				const folder = typeof o.folder === 'string' && o.folder.length > 0 ? o.folder : null;
+				const taskText = typeof o.task === 'string' ? firstLine(o.task) : null;
+				return folder !== null && taskText !== null ? `${folder} — ${taskText}` : folder !== null ? folder : taskText;
+			}
+			case 'observe_worker':
+			case 'steer_worker':
+			case 'abort_worker':
+			case 'review_worker_changes':
+			case 'commit_worker_changes':
+			case 'respond_to_worker_prompt': {
+				return typeof o.worker_id === 'string' ? firstLine(o.worker_id) : null;
+			}
 			case 'read_process':
 			case 'stop_process': {
 				return typeof o.id === 'string' ? o.id : null;
@@ -3052,22 +3065,31 @@
 				{/if}
 			</details>
 			{#if subagent !== null}
-				<!-- Collapsed sub-agent card. Renders inline under
-								 the parent's `task` tool row so
-								 the parent transcript stays scannable while
-								 a click pops out into the full sub-agent
-								 transcript view (`coder.view = 'subagent'`).
-								 The mode badge inverts colour scheme by
-								 mode so a research / agent mix-up is
-								 obvious at a glance. -->
+				<!-- Collapsed sub-agent / worker card. Renders
+					 inline under the parent's `task` / `spawn_worker`
+					 tool row so the parent transcript stays scannable
+					 while a click opens the sub-agent transcript pop-out
+					 (`coder.view = 'subagent'`) or navigates to the
+					 worker's session (a real top-level session in a
+					 worktree — ADR 0030). The mode badge inverts
+					 colour scheme by mode so a research / agent mix-up
+					 is obvious at a glance. -->
 				<button
 					type="button"
 					class="subagent-card"
 					class:done={subagent.status === 'done'}
 					class:running={subagent.status === 'running'}
 					class:err={subagent.status === 'error'}
-					title={`Open sub-agent transcript (${subagent.targetFolder})`}
-					onclick={() => coder.openSubagent(subagent.id)}
+					title={subagent.worktreeRoot !== null
+						? `Open worker session (${subagent.targetFolder})`
+						: `Open sub-agent transcript (${subagent.targetFolder})`}
+					onclick={() => {
+						if (subagent.worktreeRoot !== null) {
+							void coder.openWorkerSession(subagent.worktreeRoot, subagent.id);
+						} else {
+							coder.openSubagent(subagent.id);
+						}
+					}}
 				>
 					<div class="subagent-card-header">
 						<span class="subagent-mode" class:research={subagent.mode === 'research'}>
@@ -3095,7 +3117,9 @@
 						{:else}
 							<span class="subagent-tokens placeholder">…</span>
 						{/if}
-						<span class="subagent-open">Open transcript →</span>
+						<span class="subagent-open">
+							{subagent.worktreeRoot !== null ? 'Open session →' : 'Open transcript →'}
+						</span>
 					</div>
 				</button>
 			{/if}

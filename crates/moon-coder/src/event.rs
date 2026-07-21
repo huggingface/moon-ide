@@ -256,6 +256,13 @@ pub enum CoderEvent {
 		subagent_id: String,
 		target_folder: String,
 		mode: String,
+		/// Set when the spawned entity is a coordinator worker
+		/// (ADR 0030 `spawn_worker`) — carries the worktree folder
+		/// path so the frontend can navigate to the worker's
+		/// session (a real top-level session) instead of the
+		/// sub-agent pop-out. Absent for `task` sub-agents.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		worktree_root: Option<String>,
 	},
 
 	/// One inner event from a sub-agent's runner. The frontend

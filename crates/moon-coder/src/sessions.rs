@@ -455,6 +455,7 @@ pub(crate) fn record_to_pi_wire(
 			subagent_id,
 			target_folder,
 			mode,
+			worktree_root,
 		} => pi_message_envelope(
 			pi_custom_message(
 				CUSTOM_TYPE_SUBAGENT_SPAWNED,
@@ -463,6 +464,7 @@ pub(crate) fn record_to_pi_wire(
 					"subagent_id": subagent_id,
 					"target_folder": target_folder,
 					"mode": mode,
+					"worktree_root": worktree_root,
 				}),
 			),
 			timestamp_ms,
@@ -1108,6 +1110,11 @@ fn parse_pi_custom(msg: &serde_json::Value) -> Option<SessionRecord> {
 				.and_then(|v| v.as_str())
 				.unwrap_or_default()
 				.to_string(),
+			worktree_root: details
+				.get("worktree_root")
+				.and_then(|v| v.as_str())
+				.filter(|s| !s.is_empty())
+				.map(|s| s.to_string()),
 		}),
 		CUSTOM_TYPE_SUBAGENT_FINISHED => Some(SessionRecord::SubagentFinished {
 			subagent_id: details
@@ -1340,6 +1347,10 @@ pub enum SessionRecord {
 		subagent_id: String,
 		target_folder: String,
 		mode: String,
+		/// Worktree folder path for a coordinator-spawned worker
+		/// (ADR 0030). Absent for `task` sub-agents.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		worktree_root: Option<String>,
 	},
 	/// One sub-agent finished (success or error). Mirrors
 	/// [`crate::CoderEvent::SubagentFinished`] plus a
@@ -3271,6 +3282,7 @@ mod tests {
 				subagent_id: "sub-x".into(),
 				target_folder: "/workspace/api".into(),
 				mode: "agent".into(),
+				worktree_root: None,
 			},
 		)
 		.await
@@ -3295,11 +3307,13 @@ mod tests {
 				subagent_id,
 				target_folder,
 				mode,
+				worktree_root,
 			} => {
 				assert_eq!(tool_call_id, "call-1");
 				assert_eq!(subagent_id, "sub-x");
 				assert_eq!(target_folder, "/workspace/api");
 				assert_eq!(mode, "agent");
+				assert_eq!(*worktree_root, None);
 			}
 			other => panic!("expected SubagentSpawned, got {other:?}"),
 		}

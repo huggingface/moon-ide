@@ -1631,7 +1631,14 @@ export type CoderEvent =
 	| { kind: 'session_worktree_cleared'; id: string }
 	| { kind: 'session_list_changed' }
 	| { kind: 'folder_summary_ready'; folder: string; description: string }
-	| { kind: 'subagent_spawned'; tool_call_id: string; subagent_id: string; target_folder: string; mode: SubagentMode }
+	| {
+			kind: 'subagent_spawned';
+			tool_call_id: string;
+			subagent_id: string;
+			target_folder: string;
+			mode: SubagentMode;
+			worktree_root?: string | null;
+	  }
 	| { kind: 'subagent_event'; subagent_id: string; inner: CoderEvent }
 	| { kind: 'subagent_finished'; subagent_id: string; tokens_used_estimate: number; was_error: boolean }
 	| {

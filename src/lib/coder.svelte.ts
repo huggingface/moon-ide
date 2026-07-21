@@ -158,6 +158,14 @@ export type SubagentSummary = {
 	resultPreview: string | null;
 	tokensUsedEstimate: number;
 	subSessionId: string | null;
+	/** The worktree folder path for a coordinator-spawned worker
+	 *  (ADR 0030). `null` for a `task` sub-agent (sub-agents don't
+	 *  have a worktree — `targetFolder` is the folder they operate
+	 *  against). When set, the sub-agent card's "Open" button
+	 *  navigates to the worker's session via
+	 *  [`CoderPanelState.openWorkerSession`] instead of the
+	 *  sub-agent pop-out view. */
+	worktreeRoot: string | null;
 };
 
 /** Full transcript for one sub-agent, populated incrementally
@@ -3296,13 +3304,34 @@ class CoderPanelState {
 				this.#flagAttentionIfBackground(folder, folderPath);
 				this.#flagSessionAttentionIfBackground(session, folder, folderPath, sessionId);
 				return;
-			case 'session_loaded':
+			case 'session_loaded': {
+				// A `SessionLoaded` from a coordinator-spawned
+				// worker's first `send_to` must NOT hijack the
+				// visible session — the user is looking at the
+				// coordinator, and the `SubagentSpawned` event
+				// already registered the worker. Detect this by
+				// scanning the folder's session buckets for a
+				// `subagentSummaries` entry whose id matches —
+				// the coordinator's bucket holds the worker card.
+				let isWorker = false;
+				for (const sb of folder.sessionsById.values()) {
+					if ([...sb.subagentSummaries.values()].some((s) => s.id === event.id)) {
+						isWorker = true;
+						break;
+					}
+				}
 				// Rebind the folder's visible-session pointer to
-				// the loaded session. Replay events arrive
-				// immediately after this one (fired by the backend
-				// on the same `coder:event` channel) and land in
-				// the same session bucket via `sessionStateFor`.
-				folder.visibleSessionId = event.id;
+				// the loaded session — unless this is a worker,
+				// in which case the coordinator stays visible.
+				// Replay events arrive immediately after this one
+				// (fired by the backend on the same `coder:event`
+				// channel) and land in the same session bucket via
+				// `sessionStateFor`. For a worker, they land in the
+				// worker's own bucket without disturbing the
+				// coordinator's view.
+				if (!isWorker) {
+					folder.visibleSessionId = event.id;
+				}
 				session.rows = [];
 				session.subagentSummaries = new Map();
 				session.subagentTranscripts = new Map();
@@ -3344,8 +3373,11 @@ class CoderPanelState {
 					committed_branch: event.committed_branch ?? null,
 					mode: event.mode ?? null,
 				};
-				folder.view = 'session';
+				if (!isWorker) {
+					folder.view = 'session';
+				}
 				return;
+			}
 			case 'session_title_updated':
 				if (session.activeSession?.id === event.id) {
 					session.activeSession = { ...session.activeSession, title: event.title };
@@ -3381,6 +3413,7 @@ class CoderPanelState {
 					resultPreview: null,
 					tokensUsedEstimate: 0,
 					subSessionId: null,
+					worktreeRoot: event.worktree_root ?? null,
 				};
 				const summaries = new Map(session.subagentSummaries);
 				summaries.set(event.tool_call_id, summary);
@@ -3598,6 +3631,25 @@ class CoderPanelState {
 		}
 		this.viewSubagentId = subagentId;
 		this.view = 'subagent';
+	}
+
+	/** Navigate to a coordinator-spawned worker session. Workers are
+	 *  real top-level sessions in worktrees (ADR 0030), not sub-agent
+	 *  pop-outs — so "opening" them means switching the folder bar to
+	 *  the worktree (if it isn't already active) and opening the
+	 *  session by id, the same flow as clicking a row in the sessions
+	 *  list. `worktreeRoot` is the worktree folder path the worker
+	 *  operates against; `sessionId` is the worker's session id. */
+	async openWorkerSession(worktreeRoot: string | null, sessionId: string): Promise<void> {
+		if (worktreeRoot !== null && this.#activeFolderActual !== worktreeRoot && this.#onWorktreeSessionOpen !== null) {
+			this.#suppressWorktreeSwitch = true;
+			try {
+				await this.#onWorktreeSessionOpen(worktreeRoot);
+			} finally {
+				this.#suppressWorktreeSwitch = false;
+			}
+		}
+		await this.openSession(sessionId);
 	}
 
 	/** Return from a sub-agent pop-out to the parent's session

@@ -252,6 +252,7 @@ pub(crate) async fn run_subagent(
 		subagent_id: id.clone(),
 		target_folder: spec.folder.folder.path.clone(),
 		mode: mode.as_wire().to_string(),
+		worktree_root: None,
 	});
 
 	// Refresh the target folder's remote-tracking refs so a
