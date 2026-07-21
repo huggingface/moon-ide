@@ -255,6 +255,22 @@ pub(crate) async fn run_subagent(
 		worktree_root: None,
 	});
 
+	// Mirror the task into the sub-agent's own transcript as a
+	// user message, so the pop-out shows what the sub-agent was
+	// asked to do. Matches the persisted `SessionRecord::User`
+	// that `subagent_replay_inners` re-emits on reload — without
+	// this the live view starts at the first assistant delta.
+	sink.send(wrap_inner(
+		&id,
+		CoderEvent::UserMessage {
+			id: format!("{id}::task"),
+			text: spec.task.clone(),
+			images: Vec::new(),
+			queued: false,
+			created_at_ms: Some(current_time_ms()),
+		},
+	));
+
 	// Refresh the target folder's remote-tracking refs so a
 	// sub-agent that inspects `origin/main` sees fresh data.
 	// Fire-and-forget + per-folder throttled; see the helper.
@@ -757,6 +773,19 @@ Do not call any more tools. Write a final response now using only what you've al
 		},
 	)
 	.await;
+	// Live-mirror the sentinel into the pop-out, same as the
+	// task message at spawn — the persisted record above covers
+	// the reload/replay path.
+	sink.send(wrap_inner(
+		id,
+		CoderEvent::UserMessage {
+			id: format!("{id}::wrap-up-sentinel"),
+			text: sentinel,
+			images: Vec::new(),
+			queued: false,
+			created_at_ms: Some(current_time_ms()),
+		},
+	));
 
 	let assistant_id = format!("{id}::wrap-up");
 	let id_for_cb = assistant_id.clone();

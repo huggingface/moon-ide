@@ -1119,7 +1119,11 @@ so only top-level sessions land in the picker; "open trace" routes
 Sub-agents render as collapsed cards under the parent's `task` row:
 folder, mode badge, status pip, result preview, token footer. Click
 pops out a dedicated transcript view (same row components, different
-rows source) with a back arrow. `SubagentSpawned` / `SubagentFinished`
+rows source) with a back arrow. The pop-out opens with the task as a
+user-message row (the runner live-mirrors it, and the wrap-up
+sentinel, as wrapped `UserMessage` events — matching what replay
+reconstructs from the JSONL's `User` records), so the transcript
+always shows what the sub-agent was asked to do. `SubagentSpawned` / `SubagentFinished`
 records on the parent's JSONL rebuild the cards on reload, and the
 sub-agent's own JSONL replays into the pop-out; a missing sub-agent
 file degrades to card-only with a warn.

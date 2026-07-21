@@ -2591,10 +2591,12 @@
 
 <!-- Row renderer extracted as a snippet so the parent's session
 	 transcript and the sub-agent pop-out can share it without
-	 duplicating ~80 lines of conditional markup. `withSubagentCards`
-	 controls whether `task` tool rows render the inline collapsed
-	 card; sub-agents themselves can't spawn sub-sub-agents (depth-1
-	 cap), so the flag is `false` in the sub-agent view. -->
+	 duplicating ~80 lines of conditional markup. `inParentTranscript`
+	 gates the parent-only affordances: the inline collapsed card
+	 under `task` tool rows (sub-agents can't spawn sub-sub-agents —
+	 depth-1 cap) and the user-row revert/replay actions (those
+	 resolve ordinals against the parent session, so they'd be
+	 dead buttons on sub-agent rows). -->
 {#snippet compactionMarkup(state: Extract<CoderRow, { kind: 'compaction' }>)}
 	<!-- Compaction disclosure rendered inline at the point the
 		 fold happened, so it scrolls away under later turns
@@ -2628,7 +2630,7 @@
 	</div>
 {/snippet}
 
-{#snippet rowMarkup(row: CoderRow, withSubagentCards: boolean)}
+{#snippet rowMarkup(row: CoderRow, inParentTranscript: boolean)}
 	{#if row.kind === 'user'}
 		{@const parsed = parseUserPrompt(row.text)}
 		<div class="row user" class:queued={row.queued}>
@@ -2646,10 +2648,12 @@
 						title="Don't wait for the current turn — interrupt and run this message now"
 						onclick={() => coder.drainSteerNow(row.id)}>go now</button
 					>{/if}
-				{#if !row.queued && !coder.busy}
+				{#if inParentTranscript && !row.queued && !coder.busy}
 					<!-- Hover-revealed revert affordances. Hidden while a
-							 turn runs (the backend refuses mid-turn) and on
-							 queued steers (not yet on disk, so no ordinal). -->
+							 turn runs (the backend refuses mid-turn), on
+							 queued steers (not yet on disk, so no ordinal),
+							 and in the sub-agent pop-out (ordinals resolve
+							 against the parent session). -->
 					<span class="row-actions">
 						<button
 							type="button"
@@ -2838,7 +2842,7 @@
 			<ToolBodyAskUser args={row.args} result={row.result} hasResult={row.hasResult} callId={row.id} />
 		</div>
 	{:else if row.kind === 'tool'}
-		{@const subagent = withSubagentCards ? (coder.subagentSummaries.get(row.id) ?? null) : null}
+		{@const subagent = inParentTranscript ? (coder.subagentSummaries.get(row.id) ?? null) : null}
 		{@const elapsedMs = row.hasResult ? (row.durationMs ?? 0) : Math.max(0, nowTick - row.startedAt)}
 		{@const hint = toolHint(row.name, row.args)}
 		<div class="row tool" class:err={row.isError}>

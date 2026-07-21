@@ -3687,6 +3687,19 @@ function findSummaryById(summaries: Map<string, SubagentSummary>, subagentId: st
  *  enclosing `$state` Map so the transcript field stays reactive. */
 function applyInnerEventToRows(rows: CoderRow[], event: CoderEvent): void {
 	switch (event.kind) {
+		case 'user_message':
+			// The sub-agent's task at spawn time, plus the
+			// iteration-cap wrap-up sentinel when it fires. Never
+			// queued — sub-agents can't be steered mid-flight.
+			rows.push({
+				kind: 'user',
+				id: event.id,
+				text: event.text,
+				images: event.images ?? [],
+				queued: false,
+				createdAt: event.created_at_ms ?? Date.now(),
+			});
+			return;
 		case 'assistant_message_start':
 			if (findRowById(rows, event.id)?.kind !== 'assistant') {
 				rows.push({
