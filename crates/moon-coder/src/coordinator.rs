@@ -86,7 +86,7 @@ You spawn **workers** (peer top-level sessions), not sub-agents. A worker *can* 
 
 Each worker runs in its own git worktree on its own branch — the branch is the deliverable. `base_branch` lets you start a worker from an existing branch (e.g. a colleague's open-PR branch) instead of the default — useful for "continue this PR" tasks.
 
-**When to merge vs leave for PR:** For repos with a remote, leave the worker's branch for the user to review and PR — the branch *is* the deliverable, and you should not merge it. For local repos without a remote (e.g. a scratch repo you created with `init_repo`), use `merge_worker_changes` to land the worker's committed work onto the base branch. Use `commit_worker_changes` first if the worker has uncommitted work, then `merge_worker_changes` to merge. You do not delete branches.
+If you need to merge worker changes into your current branch, you can use `merge_worker_changes` to land the worker's committed work. Use `commit_worker_changes` first if the worker has uncommitted work. It depends on the task, sometimes you just want workers to make or update PRs.
 
 ## Reading rules
 
