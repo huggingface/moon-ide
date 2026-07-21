@@ -2731,7 +2731,19 @@
 				{/if}
 			</div>
 			{#if parsed.prose.trim().length > 0}
-				<div class="bubble">{parsed.prose}</div>
+				{#if inParentTranscript}
+					<div class="bubble">{parsed.prose}</div>
+				{:else}
+					<!-- Sub-agent user rows are usually model-authored
+						 markdown (the `task` instructions the parent
+						 wrote, the cap sentinel), so render them like
+						 assistant bubbles. Parent user rows stay plain
+						 pre-wrap — user-typed text with inline `@`
+						 tokens shouldn't be reinterpreted as markup. -->
+					<div class="bubble user-md">
+						<CoderMarkdown text={parsed.prose} />
+					</div>
+				{/if}
 			{/if}
 			{#if row.images.length > 0}
 				<!-- Pasted images, rendered as thumbnails so the
@@ -4027,6 +4039,13 @@
 	}
 	.row.user .bubble {
 		background: color-mix(in srgb, var(--m-accent) 18%, transparent);
+	}
+	/* Markdown-rendered user bubbles (sub-agent pop-out): same
+	   `pre-wrap` opt-out as `.assistant-bubble` — the markdown
+	   article emits real block-level HTML, so pre-wrap would turn
+	   the source's newlines into doubled spacing. */
+	.user-md {
+		white-space: normal;
 	}
 	/* Queued steer styling: dim the bubble + ref chips so the
 	   row reads as "waiting room" instead of "live message".

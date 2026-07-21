@@ -1123,7 +1123,9 @@ rows source) with a back arrow. The pop-out opens with the task as a
 user-message row (the runner live-mirrors it, and the wrap-up
 sentinel, as wrapped `UserMessage` events — matching what replay
 reconstructs from the JSONL's `User` records), so the transcript
-always shows what the sub-agent was asked to do.
+always shows what the sub-agent was asked to do. Sub-agent user
+rows render as markdown (the task is model-authored prose with
+headings / bullets / fences); parent user rows stay plain text.
 
 The pop-out has a composer (`coder_continue_subagent`) with two
 behaviours keyed off the run state:
