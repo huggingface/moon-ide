@@ -220,6 +220,11 @@ requested surface:
   enrolled IDE for remote-carrier workspaces (the IDE runs its own
   `window_open` "focus or spawn" path). Either way the phone
   re-polls the list after ~1.5 s and the workspace appears live.
+- **Switch to default branch.** When the folder is on a feature
+  branch, a "⇄ Switch to main" chip switches the working tree back
+  to the default branch (`workspace_scm_switch_branch`, wrapping the
+  same `branch_switch` host method as the desktop's switcher).
+  Disabled while the tree is dirty — commit or discard first.
 - **SCM (git) status + commit.** The workspace view shows the
   active folder's current branch, ahead/behind upstream, changed
   file counts (added / modified / deleted) and a collapsible file

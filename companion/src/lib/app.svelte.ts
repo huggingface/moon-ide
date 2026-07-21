@@ -63,6 +63,10 @@ type ScmStatus = {
 		has_upstream: boolean;
 		ahead: number;
 		behind: number;
+		/** e.g. "origin/main"; null when there's no remote default. */
+		default_branch_remote_ref?: string | null;
+		/** Commits the default branch has that HEAD doesn't. */
+		default_branch_behind?: number;
 	};
 	changes: { added: number; modified: number; deleted: number; total: number };
 	files: { path: string; status: string }[];
@@ -505,8 +509,11 @@ class CompanionState {
 		);
 	}
 
-	/** Back out of the active workspace to the switcher. */
+	/** Back out of the active workspace to the switcher. Refreshes
+	 * the workspace list so the live/stopped flags are current — a
+	 * list fetched hours ago can show closed workspaces as running. */
 	closeWorkspace(): void {
+		void this.loadWorkspaces();
 		this.activeWorkspace = null;
 		this.activeWorkspaceName = '';
 		this.activeIde = '';
@@ -671,6 +678,30 @@ class CompanionState {
 				this.scmStatus.branch.behind = branch.behind;
 			}
 			void this.loadScmStatus();
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		} finally {
+			this.scmBusy = false;
+		}
+	}
+
+	/** Switch the active folder's working tree to a local branch by
+	 * name — the "back to main" chip. Errors (dirty tree, unknown
+	 * branch) surface verbatim from git. */
+	async scmSwitchBranch(name: string): Promise<void> {
+		if (!this.activeWorkspace || !this.activeFolder || !name) {
+			return;
+		}
+		this.scmBusy = true;
+		this.error = null;
+		try {
+			await this.#call(
+				this.activeWorkspace,
+				'workspace_scm_switch_branch',
+				{ name, folder: this.activeFolder },
+				this.activeIde,
+			);
+			await this.loadScmStatus();
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
 		} finally {

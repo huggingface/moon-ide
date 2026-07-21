@@ -129,6 +129,8 @@
 
 	{#if app.scmStatus}
 		{@const scm = app.scmStatus}
+		{@const defaultBranch = scm.branch.default_branch_remote_ref?.split('/').slice(1).join('/') ?? null}
+		{@const onDefaultBranch = defaultBranch === null || scm.branch.name === defaultBranch}
 		<div class="card scm-card">
 			<div class="scm-head">
 				<span class="scm-branch">{scm.branch.name || 'detached HEAD'}</span>
@@ -156,6 +158,18 @@
 					</button>
 				{/if}
 			</div>
+			{#if !onDefaultBranch && defaultBranch}
+				<button
+					class="ghost scm-default-btn"
+					onclick={() => app.scmSwitchBranch(defaultBranch)}
+					disabled={app.scmBusy || scm.changes.total > 0}
+					title={scm.changes.total > 0
+						? 'Commit or discard the working-tree changes first'
+						: `Switch the working tree back to ${defaultBranch}`}
+				>
+					⇄ Switch to {defaultBranch}
+				</button>
+			{/if}
 			{#if scm.changes.total > 0}
 				<div class="scm-changes">
 					{#if scm.changes.added > 0}<span class="scm-change added">+{scm.changes.added}</span>{/if}
@@ -352,6 +366,13 @@
 		padding: 0.15rem 0.6rem;
 		font-size: 0.75rem;
 		line-height: 1.3;
+	}
+	.scm-default-btn {
+		align-self: flex-start;
+		padding: 0.2rem 0.6rem;
+		font-size: 0.75rem;
+		border: 1px solid var(--border);
+		border-radius: 999px;
 	}
 	.scm-ahead {
 		font-size: 0.75rem;

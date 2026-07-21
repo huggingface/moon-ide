@@ -146,9 +146,62 @@
 				return `poll ${p('id') || 'process'}`;
 			case 'stop_process':
 				return `stop ${p('id') || 'process'}`;
+			case 'spawn_worker':
+				return 'spawn worker';
+			case 'observe_worker':
+				return 'observe worker';
+			case 'steer_worker':
+				return 'steer worker';
+			case 'abort_worker':
+				return 'abort worker';
+			case 'commit_worker_changes':
+				return 'commit worker changes';
+			case 'merge_worker_changes':
+				return 'merge worker changes';
+			case 'review_worker_changes':
+				return 'review worker changes';
+			case 'respond_to_worker_prompt':
+				return 'answer worker prompt';
 			default:
 				return name;
 		}
+	}
+
+	/** Coordinator tools that target a worker by `worker_id` in
+	 * their args. A worker id *is* the worker's session id, so a
+	 * tool row can deep-link to that session. */
+	const WORKER_ARG_TOOLS = new Set([
+		'observe_worker',
+		'steer_worker',
+		'abort_worker',
+		'commit_worker_changes',
+		'merge_worker_changes',
+		'review_worker_changes',
+		'respond_to_worker_prompt',
+		'workspace_scm_status',
+	]);
+
+	/** Pull a `worker_id` field out of a raw JSON string. */
+	function pullWorkerId(raw: string): string | null {
+		try {
+			const parsed = JSON.parse(raw) as Record<string, unknown>;
+			return typeof parsed['worker_id'] === 'string' ? (parsed['worker_id'] as string) : null;
+		} catch {
+			return null;
+		}
+	}
+
+	/** Extract the worker session id a tool row refers to, or null.
+	 * `spawn_worker` carries it in the result (`worker_id`); the
+	 * other worker tools carry it in the args. */
+	function workerSessionId(name: string, argsStr: string, result: string): string | null {
+		if (name === 'spawn_worker') {
+			return result ? pullWorkerId(result) : null;
+		}
+		if (WORKER_ARG_TOOLS.has(name)) {
+			return argsStr ? pullWorkerId(argsStr) : null;
+		}
+		return null;
 	}
 
 	/** Structured tool body content for tools where a simple
@@ -516,6 +569,7 @@
 				{/if}
 			{:else if row.kind === 'tool'}
 				{@const body = toolBody(row.name, row.args, row.result)}
+				{@const workerId = workerSessionId(row.name, row.args, row.result)}
 				<details class="tool" class:error={row.status === 'error'}>
 					<summary>
 						<span class="pip" class:live={row.status === 'running'}></span>
@@ -537,6 +591,9 @@
 						<pre class="tool-content">{truncate(body.text, 400)}</pre>
 					{:else if row.result}
 						<div class="tool-result-preview">{toolResultPreview(row.name, row.result)}</div>
+					{/if}
+					{#if workerId}
+						<button class="ghost worker-link" onclick={() => app.openSession(workerId)}> → Open worker session </button>
 					{/if}
 				</details>
 			{:else if row.kind === 'ask_user'}
@@ -606,6 +663,12 @@
 					<span class="pip" class:live={!row.finished}></span>
 					Sub-agent {#if row.folder}in {row.folder}{/if}
 					{#if row.finished}✓{:else}running…{/if}
+					<!-- A worker's subagent id is its session id; research
+					     sub-agents (task tool) have no session, so only
+					     link when the id resolves in the session list. -->
+					{#if app.sessions.some((s) => s.id === row.subagentId)}
+						<button class="ghost worker-link" onclick={() => app.openSession(row.subagentId)}>open →</button>
+					{/if}
 				</div>
 			{/if}
 		{/each}
@@ -822,6 +885,17 @@
 		background: rgba(63, 185, 80, 0.1);
 		border-left: 3px solid #3fb950;
 		color: #7ee78c;
+	}
+	.worker-link {
+		font-size: 0.75rem;
+		padding: 0.2rem 0.6rem;
+		margin: 0.25rem 0 0.25rem 1rem;
+		border: 1px solid var(--border);
+		border-radius: 999px;
+		color: var(--accent);
+	}
+	.subagent .worker-link {
+		margin: 0;
 	}
 	.tool-content {
 		font-size: 0.72rem;

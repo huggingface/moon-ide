@@ -920,16 +920,22 @@ async fn handle_subscribe(
 	}
 
 	// Remote-carrier: forward the subscribe to the IDE connection
-	// that owns `(ide, workspace)`.
+	// that has `workspace` open.
 	let id = ctx.forward_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-	let live = ctx.live_ides.lock().await;
-	let Some((conn_id, conn)) = find_ide_conn(&live, ide, workspace) else {
-		let _ = out
-			.send(ServerMessage::Error {
-				message: format!("IDE `{ide}` has no connected workspace `{workspace}`"),
-			})
-			.await;
-		return;
+	let (conn_id, conn_sink) = {
+		let live = ctx.live_ides.lock().await;
+		match find_ide_conn(&live, ide, workspace) {
+			Some((conn_id, conn)) => (conn_id, conn.sink.clone()),
+			None => {
+				drop(live);
+				let _ = out
+					.send(ServerMessage::Error {
+						message: format!("IDE `{ide}` has no connected workspace `{workspace}` — it may have been closed"),
+					})
+					.await;
+				return;
+			}
+		}
 	};
 	// Register the pending stream *before* sending, so the first
 	// `ForwardEvent` can't arrive before the entry exists.
@@ -944,8 +950,7 @@ async fn handle_subscribe(
 			},
 		);
 	}
-	if conn
-		.sink
+	if conn_sink
 		.send(ServerMessage::ForwardSubscribe {
 			id,
 			workspace: workspace.to_owned(),
@@ -954,6 +959,10 @@ async fn handle_subscribe(
 		.await
 		.is_err()
 	{
+		// Dead writer — reap the ghost connection right away (same
+		// as the call path) so the next subscribe doesn't hit it.
+		ctx.live_ides.lock().await.remove(&conn_id);
+		tracing::info!(%ide, conn_id, "reaped dead IDE connection on subscribe failure");
 		ctx.pending_streams.lock().await.remove(&id);
 		let _ = out
 			.send(ServerMessage::Error {
@@ -1223,20 +1232,16 @@ async fn handle_pair_code(ctx: &ServeCtx, token: &str) -> ServerMessage {
 	}
 }
 
-/// Resolve the live IDE connection that owns `(ide_id, workspace)`.
-/// Several connections can share an `ide_id` (one per workspace
-/// process on that host, ADR 0014); the workspace slug picks the
-/// right one, and the **newest** connection wins when a restarted
+/// Resolve the live IDE connection that has `workspace` **open**
+/// (`live: true` in its `Register` report). Several connections can
+/// share an `ide_id` (one per workspace process on that host, ADR
+/// 0014) and every process reports the *full* catalog — matching on
+/// mere presence would route a call for a closed workspace to some
+/// other process on that host (misroute: the call would execute
+/// against the wrong workspace's coder). Requiring `live` means a
+/// stale phone click gets the clean "no connected workspace" error
+/// instead. The **newest** connection wins when a restarted
 /// process's ghost predecessor is still awaiting the idle reaper.
-/// No fallback to an ide-only match — the phone builds the pair
-/// from the `workspaces` reply, so a miss means the process is gone
-/// and the caller should error, not misroute.
-///
-/// When multiple connections match (every IDE process reports the
-/// full catalog, so all match any workspace), prefer the one that
-/// has the workspace marked `live: true` — that's the process that
-/// actually has it open. Fall back to newest-wins for the
-/// ghost-reconnect case where no connection claims it live.
 fn find_ide_conn<'a>(
 	live: &'a HashMap<u64, IdeConnection>,
 	ide_id: &str,
@@ -1244,12 +1249,21 @@ fn find_ide_conn<'a>(
 ) -> Option<(u64, &'a IdeConnection)> {
 	live
 		.iter()
-		.filter(|(_, c)| c.ide_id == ide_id && c.workspaces.iter().any(|w| w.id == workspace))
-		// Prefer live, then newest — `max_by_key` on a tuple sorts
-		// lexicographically, so `(true, conn_id)` beats `(false, any)`.
-		.max_by_key(|(id, c)| {
-			(c.workspaces.iter().any(|w| w.id == workspace && w.live), **id)
-		})
+		.filter(|(_, c)| c.ide_id == ide_id && c.workspaces.iter().any(|w| w.id == workspace && w.live))
+		.max_by_key(|(id, _)| **id)
+		.map(|(id, c)| (*id, c))
+}
+
+/// Resolve *any* live connection for `ide_id`, newest first. Used by
+/// the remote-carrier `workspace_launch` forward — its target
+/// workspace is stopped by definition (that's the point), so the
+/// live-workspace lookup above can never match; any process on the
+/// host can spawn the sibling.
+fn find_ide_conn_any<'a>(live: &'a HashMap<u64, IdeConnection>, ide_id: &str) -> Option<(u64, &'a IdeConnection)> {
+	live
+		.iter()
+		.filter(|(_, c)| c.ide_id == ide_id)
+		.max_by_key(|(id, _)| **id)
 		.map(|(id, c)| (*id, c))
 }
 
@@ -1332,19 +1346,32 @@ async fn handle_call(
 		return;
 	}
 
-	// Remote-carrier: forward to the IDE connection that owns
-	// `(ide, workspace)`. Allocate a forward id, register the
-	// phone's sink so the `ForwardResult` reply can find it, and
-	// send the `ForwardCall` to that connection's WS.
+	// Remote-carrier: forward to the IDE connection that has
+	// `workspace` open. `workspace_launch` targets a *stopped*
+	// workspace, so it routes to any live connection of that host
+	// instead. Allocate a forward id, register the phone's sink so
+	// the `ForwardResult` reply can find it, and send the
+	// `ForwardCall` to that connection's WS.
 	let id = ctx.forward_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-	let live = ctx.live_ides.lock().await;
-	let Some((conn_id, conn)) = find_ide_conn(&live, ide, workspace) else {
-		let _ = out
-			.send(ServerMessage::Error {
-				message: format!("IDE `{ide}` has no connected workspace `{workspace}`"),
-			})
-			.await;
-		return;
+	let (conn_id, conn_sink) = {
+		let live = ctx.live_ides.lock().await;
+		let found = if method == "workspace_launch" {
+			find_ide_conn_any(&live, ide)
+		} else {
+			find_ide_conn(&live, ide, workspace)
+		};
+		match found {
+			Some((conn_id, conn)) => (conn_id, conn.sink.clone()),
+			None => {
+				drop(live);
+				let _ = out
+					.send(ServerMessage::Error {
+						message: format!("IDE `{ide}` has no connected workspace `{workspace}` — it may have been closed"),
+					})
+					.await;
+				return;
+			}
+		}
 	};
 	// Register the pending forward *before* sending, so the reply
 	// can't arrive before the entry exists.
@@ -1359,10 +1386,12 @@ async fn handle_call(
 			},
 		);
 	}
-	// Send the ForwardCall to the IDE. If the send fails (IDE gone),
-	// clean up the pending entry and error the phone immediately.
-	if conn
-		.sink
+	// Send the ForwardCall to the IDE. If the send fails the
+	// connection's writer is dead (half-open ghost awaiting the idle
+	// reaper) — reap it from the live table right away so the next
+	// call doesn't hit it, clean up the pending entry, and error the
+	// phone immediately.
+	if conn_sink
 		.send(ServerMessage::ForwardCall {
 			id,
 			workspace: workspace.to_owned(),
@@ -1372,6 +1401,8 @@ async fn handle_call(
 		.await
 		.is_err()
 	{
+		ctx.live_ides.lock().await.remove(&conn_id);
+		tracing::info!(%ide, conn_id, "reaped dead IDE connection on forward failure");
 		ctx.pending_forwards.lock().await.remove(&id);
 		let _ = out
 			.send(ServerMessage::Error {

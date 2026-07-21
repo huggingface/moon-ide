@@ -292,6 +292,8 @@ impl BridgeRpcHandler for BridgeRpc {
 						"has_upstream": branch.has_upstream,
 						"ahead": branch.ahead,
 						"behind": branch.behind,
+						"default_branch_remote_ref": branch.default_branch_remote_ref,
+						"default_branch_behind": branch.default_branch_behind,
 					},
 					"changes": {
 						"added": added,
@@ -340,6 +342,21 @@ impl BridgeRpcHandler for BridgeRpc {
 			// `WorkspaceHost` methods the desktop's SCM panel uses.
 			// Each refreshes branch info after the op so the phone's
 			// ahead/behind indicators update immediately.
+			// Switch the folder's working tree to a local branch by
+			// name — the phone's "back to main" gesture. Errors
+			// (dirty tree, unknown branch) propagate git's stderr
+			// verbatim, same as the desktop's branch switcher.
+			"workspace_scm_switch_branch" => {
+				let p: SwitchBranchParams = parse_params(params)?;
+				let folder = self.resolve_folder(&FolderParams { folder: p.folder }).await?;
+				folder
+					.host
+					.branch_switch(&moon_protocol::git::BranchSwitchTarget::Local { name: p.name })
+					.await
+					.map_err(|e| e.to_string())?;
+				let branch = folder.host.git_branch().await.unwrap_or_default();
+				to_value(&branch)
+			}
 			"workspace_scm_sync" => {
 				let p: FolderParams = parse_params(params)?;
 				let folder = self.resolve_folder(&p).await?;
@@ -454,6 +471,13 @@ struct WorkspaceLaunchParams {
 }
 
 #[derive(serde::Deserialize)]
+struct SwitchBranchParams {
+	name: String,
+	#[serde(default)]
+	folder: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
 struct RevertParams {
 	session_id: String,
 	user_ordinal: usize,
@@ -505,6 +529,7 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 	"workspace_scm_commit",
 	"workspace_scm_suggest_message",
 	"workspace_scm_sync",
+	"workspace_scm_switch_branch",
 	"bridge_methods",
 ];
 
