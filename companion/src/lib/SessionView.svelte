@@ -70,6 +70,159 @@
 		return s.length > max ? s.slice(0, max) + '...' : s;
 	}
 
+	function short(s: string, n = 40): string {
+		return s.length > n ? s.slice(0, n) + '…' : s;
+	}
+
+	/** Build a human-readable summary line for a tool call from its
+	 * name + raw JSON args string. Falls back to the tool name alone
+	 * when args are missing or unparseable. */
+	function toolSummary(name: string, argsStr: string): string {
+		if (!argsStr) {
+			return name;
+		}
+		let args: Record<string, unknown>;
+		try {
+			args = JSON.parse(argsStr) as Record<string, unknown>;
+		} catch {
+			return name;
+		}
+		const p = (k: string): string => (typeof args[k] === 'string' ? (args[k] as string) : '');
+		switch (name) {
+			case 'read_file': {
+				const path = p('path') || 'file';
+				const range =
+					p('start_line') || p('end_line') ? `:${p('start_line') || 1}${p('end_line') ? '-' + p('end_line') : ''}` : '';
+				return `read ${path}${range}`;
+			}
+			case 'write_file':
+				return `write ${p('path') || 'file'}`;
+			case 'edit_file': {
+				const find = short(p('find'), 30);
+				return `edit ${p('path') || 'file'} — "${find}"`;
+			}
+			case 'list_dir':
+				return `list ${p('path') || 'dir'}`;
+			case 'grep':
+				return `grep "${short(p('pattern'), 30)}"`;
+			case 'bash': {
+				const cmd = p('cmd');
+				if (!cmd) {
+					return 'bash';
+				}
+				const firstLine = cmd.split('\n')[0] ?? '';
+				return `$ ${short(firstLine, 50)}`;
+			}
+			case 'web_search':
+				return `search "${short(p('query'), 30)}"`;
+			case 'web_fetch':
+				return p('url') ? short(p('url'), 50) : 'web fetch';
+			case 'todo_write':
+				return 'update todo';
+			case 'ask_user':
+				return 'ask user';
+			case 'read_process':
+				return `poll ${p('id') || 'process'}`;
+			case 'stop_process':
+				return `stop ${p('id') || 'process'}`;
+			default:
+				return name;
+		}
+	}
+
+	/** Structured tool body content for tools where a simple
+	 * text preview isn't enough — `edit_file` shows a diff-like
+	 * find→replace view, `write_file` shows a content preview.
+	 * Returns `null` when the tool doesn't have structured body
+	 * (caller falls through to `toolResultPreview`). */
+	type ToolBody = { kind: 'diff'; find: string; replace: string } | { kind: 'content'; text: string };
+
+	function toolBody(name: string, argsStr: string, _result: string): ToolBody | null {
+		let args: Record<string, unknown>;
+		try {
+			args = JSON.parse(argsStr) as Record<string, unknown>;
+		} catch {
+			return null;
+		}
+		const p = (k: string): string => (typeof args[k] === 'string' ? (args[k] as string) : '');
+		if (name === 'edit_file') {
+			const find = p('find');
+			const replace = p('replace');
+			if (!find && !replace) {
+				return null;
+			}
+			return { kind: 'diff', find, replace };
+		}
+		if (name === 'write_file') {
+			const content = p('content');
+			if (!content) {
+				return null;
+			}
+			return { kind: 'content', text: content };
+		}
+		return null;
+	}
+
+	/** Extract the most useful preview from a tool result string.
+	 * Tool-specific parsing where the JSON shape is known, falling
+	 * back to a plain-text truncation. */
+	function toolResultPreview(name: string, result: string): string {
+		if (!result) {
+			return '';
+		}
+		// bash returns {cmd, target, exit_code, stdout, stderr}.
+		if (name === 'bash') {
+			try {
+				const parsed = JSON.parse(result) as Record<string, unknown>;
+				const stdout = typeof parsed['stdout'] === 'string' ? (parsed['stdout'] as string) : '';
+				const stderr = typeof parsed['stderr'] === 'string' ? (parsed['stderr'] as string) : '';
+				const code = typeof parsed['exit_code'] === 'number' ? parsed['exit_code'] : null;
+				const out = stdout || stderr || '';
+				const prefix = code !== null && code !== 0 ? `[exit ${code}] ` : '';
+				return truncate(prefix + out, 300);
+			} catch {
+				return truncate(result, 300);
+			}
+		}
+		// read_file returns line-prefixed content; show a short
+		// snippet without the line-number prefixes.
+		if (name === 'read_file') {
+			const lines = result.split('\n').slice(0, 5);
+			const stripped = lines.map((l) => l.replace(/^\d+\|/, '')).join('\n');
+			return truncate(stripped, 300);
+		}
+		// grep returns `path:line: match` lines; show the first few.
+		if (name === 'grep') {
+			const lines = result.split('\n').filter((l) => l.trim());
+			const count = lines.length;
+			if (count === 0) {
+				return 'no matches';
+			}
+			return truncate(`${count} match${count === 1 ? '' : 'es'}\n${lines.slice(0, 3).join('\n')}`, 300);
+		}
+		// Generic fallback: try JSON, then plain text.
+		try {
+			const parsed = JSON.parse(result);
+			if (typeof parsed === 'string') {
+				return truncate(parsed, 200);
+			}
+			if (parsed && typeof parsed === 'object') {
+				if (typeof parsed['error'] === 'string') {
+					return truncate(parsed['error'], 200);
+				}
+				if (typeof parsed['content'] === 'string') {
+					return truncate(parsed['content'], 200);
+				}
+				if (typeof parsed['output'] === 'string') {
+					return truncate(parsed['output'], 200);
+				}
+			}
+		} catch {
+			// Not JSON — treat as plain text.
+		}
+		return truncate(result, 200);
+	}
+
 	const title = $derived(app.sessions.find((s) => s.id === app.activeSession)?.title ?? '');
 	const isCoordinator = $derived(app.sessions.find((s) => s.id === app.activeSession)?.mode === 'coordinator');
 
@@ -275,6 +428,21 @@
 		{/if}
 	</div>
 
+	{#if app.tokenUsage}
+		<div
+			class="token-bar"
+			title="{app.tokenUsage.total.toLocaleString()} / {app.tokenUsage.contextWindow.toLocaleString()} tokens"
+		>
+			<span class="token-pct">{app.tokenUsage.pct}%</span>
+			<div class="token-meter">
+				<div class="token-fill" style="width: {Math.min(100, app.tokenUsage.pct)}%"></div>
+			</div>
+			<span class="token-detail"
+				>{app.tokenUsage.total.toLocaleString()} / {app.tokenUsage.contextWindow.toLocaleString()}</span
+			>
+		</div>
+	{/if}
+
 	<div class="transcript" bind:this={transcriptEl} onscroll={onTranscriptScroll}>
 		{#if hiddenAbove > 0}
 			<button type="button" class="load-pill" onclick={loadOlderRows}>
@@ -298,17 +466,28 @@
 					<div class="bubble assistant"><Markdown text={row.text} /></div>
 				{/if}
 			{:else if row.kind === 'tool'}
+				{@const body = toolBody(row.name, row.args, row.result)}
 				<details class="tool" class:error={row.status === 'error'}>
 					<summary>
 						<span class="pip" class:live={row.status === 'running'}></span>
-						{row.name}
-						{#if row.status === 'done'}✓{:else if row.status === 'error'}✗{/if}
+						<span class="tool-name">{toolSummary(row.name, row.args)}</span>
+						{#if row.status === 'done'}<span class="tool-check">✓</span>{:else if row.status === 'error'}<span
+								class="tool-check">✗</span
+							>{/if}
 					</summary>
-					{#if row.args}
-						<pre class="tool-args">{truncate(row.args, 500)}</pre>
-					{/if}
-					{#if row.result}
-						<pre class="tool-result">{truncate(row.result, 500)}</pre>
+					{#if body?.kind === 'diff'}
+						<div class="tool-diff">
+							{#if body.find}
+								<pre class="diff-old">{truncate(body.find, 400)}</pre>
+							{/if}
+							{#if body.replace}
+								<pre class="diff-new">{truncate(body.replace, 400)}</pre>
+							{/if}
+						</div>
+					{:else if body?.kind === 'content'}
+						<pre class="tool-content">{truncate(body.text, 400)}</pre>
+					{:else if row.result}
+						<div class="tool-result-preview">{toolResultPreview(row.name, row.result)}</div>
 					{/if}
 				</details>
 			{:else if row.kind === 'ask_user'}
@@ -362,14 +541,6 @@
 						<pre class="diff-body">{truncate(row.diff, 1000)}</pre>
 					{/if}
 				</details>
-			{:else if row.kind === 'tokens'}
-				<div class="tokens">
-					{#if row.contextWindow > 0}
-						{Math.round((row.total / row.contextWindow) * 100)}% context ({row.total.toLocaleString()} / {row.contextWindow.toLocaleString()})
-					{:else}
-						{row.total.toLocaleString()} tokens
-					{/if}
-				</div>
 			{:else if row.kind === 'compaction'}
 				<div class="compaction">
 					{#if row.done}
@@ -524,7 +695,7 @@
 		padding: 0.3rem 0;
 	}
 	.tool {
-		font-size: 0.85rem;
+		font-size: 0.8rem;
 		color: var(--fg-muted);
 	}
 	.tool summary {
@@ -536,20 +707,69 @@
 	.tool.error {
 		color: var(--danger);
 	}
-	.tool-args,
-	.tool-result {
+	.tool-name {
+		font-family: var(--mono, monospace);
 		font-size: 0.75rem;
-		white-space: pre-wrap;
-		word-break: break-all;
-		margin: 0.3rem 0;
-		padding: 0.3rem;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.tool-check {
+		flex: none;
+		font-size: 0.7rem;
+	}
+	.tool-result-preview {
+		font-size: 0.72rem;
+		font-family: var(--mono, monospace);
+		color: var(--fg);
+		margin: 0.25rem 0 0.25rem 1rem;
+		padding: 0.25rem 0.4rem;
 		background: var(--bg-elev);
 		border-radius: var(--radius);
-		max-height: 200px;
+		white-space: pre-wrap;
+		word-break: break-word;
+		max-height: 120px;
 		overflow-y: auto;
 	}
-	.tool-result {
-		color: var(--fg);
+	.tool-diff {
+		margin: 0.25rem 0 0.25rem 1rem;
+		display: flex;
+		flex-direction: column;
+		gap: 1px;
+	}
+	.diff-old,
+	.diff-new {
+		font-size: 0.72rem;
+		font-family: var(--mono, monospace);
+		margin: 0;
+		padding: 0.25rem 0.4rem;
+		white-space: pre-wrap;
+		word-break: break-word;
+		max-height: 150px;
+		overflow-y: auto;
+		border-radius: var(--radius);
+	}
+	.diff-old {
+		background: rgba(248, 81, 73, 0.12);
+		border-left: 3px solid #f85149;
+		color: #ffa19b;
+	}
+	.diff-new {
+		background: rgba(63, 185, 80, 0.1);
+		border-left: 3px solid #3fb950;
+		color: #7ee78c;
+	}
+	.tool-content {
+		font-size: 0.72rem;
+		font-family: var(--mono, monospace);
+		margin: 0.25rem 0 0.25rem 1rem;
+		padding: 0.25rem 0.4rem;
+		background: var(--bg-elev);
+		border-radius: var(--radius);
+		white-space: pre-wrap;
+		word-break: break-word;
+		max-height: 200px;
+		overflow-y: auto;
 	}
 	.ask-user {
 		background: var(--bg-elev);
@@ -621,10 +841,39 @@
 		max-height: 250px;
 		overflow-y: auto;
 	}
-	.tokens {
-		font-size: 0.7rem;
+	.token-bar {
+		flex: none;
+		display: flex;
+		align-items: center;
+		gap: 0.4rem;
+		padding: 0.25rem 0.6rem;
+		background: var(--bg-elev);
+		border-bottom: 1px solid var(--border);
+		font-size: 0.65rem;
 		color: var(--fg-muted);
-		text-align: right;
+	}
+	.token-pct {
+		flex: none;
+		font-weight: 600;
+		min-width: 2.5rem;
+	}
+	.token-meter {
+		flex: 1;
+		height: 4px;
+		background: var(--border);
+		border-radius: 2px;
+		overflow: hidden;
+	}
+	.token-fill {
+		height: 100%;
+		background: var(--accent);
+		border-radius: 2px;
+		transition: width 0.3s ease;
+	}
+	.token-detail {
+		flex: none;
+		font-family: var(--mono, monospace);
+		font-size: 0.6rem;
 	}
 	.compaction {
 		font-size: 0.8rem;

@@ -322,6 +322,29 @@ impl BridgeRpcHandler for BridgeRpc {
 					.map_err(|e| e.to_string())?;
 				Ok(serde_json::json!({ "message": suggestion }))
 			}
+			// --- SCM push / pull / fetch. Thin wrappers over the same
+			// `WorkspaceHost` methods the desktop's SCM panel uses.
+			// Each refreshes branch info after the op so the phone's
+			// ahead/behind indicators update immediately.
+			"workspace_scm_sync" => {
+				let p: FolderParams = parse_params(params)?;
+				let folder = self.resolve_folder(&p).await?;
+				// Same logic as the desktop's `sync()`: if behind,
+				// pull (rebase) first; if ahead (or diverged after
+				// the pull), push. A diverged branch only pulls on
+				// the first click — the user reviews the rebased
+				// history before the next click pushes.
+				let branch = folder.host.git_branch().await.unwrap_or_default();
+				if branch.behind > 0 {
+					folder.host.git_pull().await.map_err(|e| e.to_string())?;
+				}
+				let after_pull = folder.host.git_branch().await.unwrap_or_default();
+				if after_pull.ahead > 0 || (branch.has_upstream && !branch.upstream_tracked) {
+					folder.host.git_push().await.map_err(|e| e.to_string())?;
+				}
+				let final_branch = folder.host.git_branch().await.unwrap_or_default();
+				to_value(&final_branch)
+			}
 			"bridge_methods" => Ok(serde_json::json!({
 				"methods": SUPPORTED_METHODS,
 				"streams": SUPPORTED_STREAMS,
@@ -460,6 +483,7 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 	"workspace_scm_status",
 	"workspace_scm_commit",
 	"workspace_scm_suggest_message",
+	"workspace_scm_sync",
 	"bridge_methods",
 ];
 

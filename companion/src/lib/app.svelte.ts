@@ -239,6 +239,8 @@ class CompanionState {
 	loadingScm = $state(false);
 	/** True while a commit is in flight. */
 	committing = $state(false);
+	/** True while a push/pull/fetch is in flight. */
+	scmBusy = $state(false);
 	sessions = $state<SessionSummary[]>([]);
 	loadingSessions = $state(false);
 
@@ -250,6 +252,22 @@ class CompanionState {
 	/** True while the open session's turn is streaming (composer
 	 * shows abort). */
 	busy = $state(false);
+	/** Latest token usage for the open session, or null. Derived
+	 * from the transcript's tokens row (updated in place by the
+	 * `token_usage` event handler). The SessionView renders this in
+	 * a sticky bar so it stays visible during streaming. */
+	get tokenUsage(): { total: number; contextWindow: number; pct: number } | null {
+		const row = this.rows.findLast((r) => r.kind === 'tokens');
+		if (!row || row.kind !== 'tokens' || row.total === 0) {
+			return null;
+		}
+		return {
+			total: row.total,
+			contextWindow: row.contextWindow,
+			pct: row.contextWindow > 0 ? Math.round((row.total / row.contextWindow) * 100) : 0,
+		};
+	}
+
 	/** Sessions in the current folder that have a running turn,
 	 * tracked from the event stream (any `user_message` without a
 	 * matching `turn_complete` / `aborted` / `error`). Drives the
@@ -629,6 +647,37 @@ class CompanionState {
 		}
 	}
 
+	/** Sync the active folder's branch with upstream — same
+	 * context-aware logic as the desktop's "Sync Changes" button:
+	 * if behind, pull (rebase) first; if ahead (or after the pull),
+	 * push. A diverged branch only pulls on the first click — the
+	 * user reviews the rebased history before the next click pushes.
+	 * The IDE auto-fetches on its own; this is the manual gesture. */
+	async scmSync(): Promise<void> {
+		if (!this.activeWorkspace || !this.activeFolder || !this.scmStatus) {
+			return;
+		}
+		this.scmBusy = true;
+		this.error = null;
+		try {
+			const branch = await this.#call<{ ahead: number; behind: number }>(
+				this.activeWorkspace,
+				'workspace_scm_sync',
+				{ folder: this.activeFolder },
+				this.activeIde,
+			);
+			if (this.scmStatus) {
+				this.scmStatus.branch.ahead = branch.ahead;
+				this.scmStatus.branch.behind = branch.behind;
+			}
+			void this.loadScmStatus();
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		} finally {
+			this.scmBusy = false;
+		}
+	}
+
 	async setProviderLock(locked: boolean): Promise<void> {
 		const settings = this.modelSettings;
 		if (!this.activeWorkspace || !settings) {
@@ -912,17 +961,40 @@ class CompanionState {
 			return;
 		}
 		switch (ev.kind) {
-			case 'user_message':
-				this.rows.push({
-					kind: 'user',
-					id: str(ev, 'id'),
-					text: str(ev, 'text'),
-					queued: bool(ev, 'queued'),
-				});
+			case 'user_message': {
+				const msgId = str(ev, 'id');
+				// If the row already exists (the message was queued
+				// and `steer_drained` already flipped it to
+				// `queued: false`), update it in place instead of
+				// pushing a duplicate.
+				const existing = this.rows.findLast((r) => r.kind === 'user' && r.id === msgId);
+				if (existing && existing.kind === 'user') {
+					existing.text = str(ev, 'text');
+					existing.queued = bool(ev, 'queued');
+				} else {
+					this.rows.push({
+						kind: 'user',
+						id: msgId,
+						text: str(ev, 'text'),
+						queued: bool(ev, 'queued'),
+					});
+				}
 				break;
-			case 'steer_drained':
-				this.rows = this.rows.filter((r) => !(r.kind === 'user' && r.id === str(ev, 'id')));
+			}
+			case 'steer_drained': {
+				// The runner drained the queued message into the
+				// active turn. Flip the row out of "queued" styling
+				// rather than removing it — the desktop does the
+				// same (the `user_message` event with
+				// `queued: false` would otherwise re-add it, but
+				// there's a visible gap between removal and re-add).
+				// Idempotent: a duplicate event is a no-op.
+				const row = this.rows.findLast((r) => r.kind === 'user' && r.id === str(ev, 'id'));
+				if (row && row.kind === 'user') {
+					row.queued = false;
+				}
 				break;
+			}
 			case 'assistant_message_start':
 				this.busy = true;
 				this.rows.push({ kind: 'assistant', id: str(ev, 'id'), text: '', thinking: '' });

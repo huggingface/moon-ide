@@ -141,6 +141,20 @@
 				{#if scm.branch.behind > 0}
 					<span class="scm-behind" title="Behind upstream">↓{scm.branch.behind}</span>
 				{/if}
+				{#if scm.branch.ahead > 0 || scm.branch.behind > 0}
+					<button
+						class="ghost scm-sync-btn"
+						onclick={() => app.scmSync()}
+						disabled={app.scmBusy}
+						title={scm.branch.ahead > 0 && scm.branch.behind > 0
+							? `Pull ${scm.branch.behind} and push ${scm.branch.ahead} (rebase first)`
+							: scm.branch.ahead > 0
+								? `Push ${scm.branch.ahead} commit${scm.branch.ahead === 1 ? '' : 's'}`
+								: `Pull ${scm.branch.behind} commit${scm.branch.behind === 1 ? '' : 's'}`}
+					>
+						{app.scmBusy ? 'Syncing…' : 'Sync'}
+					</button>
+				{/if}
 			</div>
 			{#if scm.changes.total > 0}
 				<div class="scm-changes">
@@ -332,6 +346,12 @@
 	.scm-sha {
 		font-family: var(--mono, monospace);
 		font-size: 0.75rem;
+	}
+	.scm-sync-btn {
+		margin-left: auto;
+		padding: 0.15rem 0.6rem;
+		font-size: 0.75rem;
+		line-height: 1.3;
 	}
 	.scm-ahead {
 		font-size: 0.75rem;
