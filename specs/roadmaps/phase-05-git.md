@@ -211,7 +211,11 @@ The right-side-of-the-folder-bar SCM panel:
 
 - Branch label (or short HEAD SHA in the detached-HEAD case),
   open-PR button when the upstream is a recognised host and the
-  branch isn't `main` / `master`, revert-all icon, an off-by-
+  branch isn't `main` / `master` (the create-PR URL carries a
+  `?body=` footer linking the open coder session's uploaded Hub
+  trace, when one exists — see
+  [coder.md § Bucket sync](../coder.md#bucket-sync-hf-buckets)),
+  revert-all icon, an off-by-
   default `vs <default-branch>` pill (flips the per-folder
   compare baseline — see §5.2), and the change-count pill that
   doubles as the "filter to changes only" toggle. The `vs main`

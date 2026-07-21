@@ -910,6 +910,17 @@ the bytes through `hf-xet`, bind the resulting hash at
 `(bytes, at_ms)`. `HubSyncStarted` / `HubSyncFinished` events drive
 the per-row idle / syncing / synced / failed decoration.
 
+### PR body prefill
+
+The SCM panel's **Open PR** button (create path only — GitHub
+ignores query params on an existing PR) appends
+`?body=<footer>` to the `pull/new/<branch>` URL, where the footer
+links the currently open session's trace viewer URL. Gated on a
+bound bucket **and** an `uploaded` marker for that session (the
+viewer 404s otherwise). Best-effort: any miss opens the plain
+create-PR URL. Scoped deliberately to the one open session — no
+branch-matching across the session list until someone asks.
+
 ### Failure mode
 
 A failed upload is a `tracing::warn!` plus a red cloud icon with the

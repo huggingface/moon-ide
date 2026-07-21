@@ -271,7 +271,32 @@
 		if (prUrl === null) {
 			return;
 		}
-		void openUrl(prUrl);
+		const url = prUrl;
+		void (async () => {
+			await openUrl(prIsExisting ? url : await withTraceFooter(url));
+		})();
+	}
+
+	// GitHub's create-PR page prefills the description from a
+	// `?body=` query param, so the create path appends a footer
+	// linking the currently open coder session's Hub trace — but
+	// only when the workspace has a bucket bound and that session
+	// has actually been uploaded (the viewer URL 404s otherwise).
+	// Best-effort by design: any miss (no session, IPC error)
+	// falls back to the plain create-PR URL rather than blocking
+	// the click. The existing-PR path never gets here — query
+	// params do nothing on an already-open PR.
+	async function withTraceFooter(base: string): Promise<string> {
+		try {
+			const [binding, session] = await Promise.all([ipc.coder.hubGetBinding(), ipc.coder.activeSession()]);
+			if (binding === null || session === null || binding.uploaded[session.id] === undefined) {
+				return base;
+			}
+			const traceUrl = await ipc.coder.hubSessionUrl(session.id);
+			return `${base}?body=${encodeURIComponent(`---\n\nAgent trace: ${traceUrl}`)}`;
+		} catch {
+			return base;
+		}
 	}
 
 	// `true` iff the branch has commits to pull or push — the sync
