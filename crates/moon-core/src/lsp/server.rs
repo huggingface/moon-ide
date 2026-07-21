@@ -120,9 +120,9 @@ pub enum DiscoveryStrategy {
 /// `svelte-fast-check`) still needs the classic `typescript@6` for
 /// its API, which is why `tsgo` stays the *preferred* binary. A
 /// project that ships only `typescript@7` still gets LSP: discovery
-/// falls back to the project's `.bin/tsc` when the resolved
-/// `typescript` package is major ≥ 7 (see [`discover_server_binary`]
-/// — the version gate matters because typescript@6's `tsc` is the JS
+/// falls back to the project's `.bin/tsc` when the package backing
+/// that bin entry is major ≥ 7 (see [`discover_server_binary`] —
+/// the version gate matters because typescript@6's `tsc` is the JS
 /// compiler with no `--lsp` mode). If a project ships
 /// `typescript-language-server` instead, flip this spec — the LSP
 /// wire format is identical and nothing else has to change. See
@@ -1773,9 +1773,8 @@ pub fn discover_server_binary(spec: &LspBinarySpec, start: &Path) -> Option<Path
 /// gets LSP without installing `@typescript/native-preview` — but
 /// the version gate is load-bearing: `typescript@6`'s `tsc` is the
 /// JS compiler with no `--lsp` mode, so a bare `.bin/tsc` hit is
-/// not enough. We read the resolved
-/// `node_modules/typescript/package.json` sitting next to the
-/// `.bin` entry and require major ≥ 7.
+/// not enough. We resolve which package the `.bin` entry actually
+/// launches (see [`tsc_major_version`]) and require major ≥ 7.
 ///
 /// No `$PATH` tier here: a global `tsc`'s version can't be checked
 /// with a cheap manifest read, and a global TS 7 install is not a
@@ -1797,18 +1796,101 @@ fn discover_ts7_tsc(start: &Path) -> Option<PathBuf> {
 /// first, same posture as [`scan_for_node_modules_bin`] itself.
 fn nested_ts7_tsc(root: &Path, filename: &str) -> Option<PathBuf> {
 	let nested = scan_for_node_modules_bin(root, filename, NODE_MODULES_SCAN_DEPTH)?;
-	let node_modules = nested.parent()?.parent()?;
-	(typescript_major_version(node_modules)? >= 7).then_some(nested)
+	let node_modules = nested.parent()?.parent()?.to_path_buf();
+	(tsc_major_version(&node_modules, &nested)? >= 7).then_some(nested)
 }
 
 /// `node_modules/.bin/<filename>` inside `node_modules`, accepted
-/// only when the sibling `typescript` package is major ≥ 7.
+/// only when the package backing it is major ≥ 7.
 fn ts7_tsc_in(node_modules: &Path, filename: &str) -> Option<PathBuf> {
 	let candidate = node_modules.join(".bin").join(filename);
 	if !candidate.exists() {
 		return None;
 	}
-	(typescript_major_version(node_modules)? >= 7).then_some(candidate)
+	(tsc_major_version(node_modules, &candidate)? >= 7).then_some(candidate)
+}
+
+/// Major version of the package a `.bin/tsc` candidate actually
+/// launches. Preferred source: follow the bin entry to its target
+/// script (npm/bun symlink, or pnpm's shell shim parsed for its
+/// `exec` target) and read the nearest `package.json` above it.
+/// Fallback: the conventional sibling
+/// `node_modules/typescript/package.json`.
+///
+/// Following the bin target matters because pnpm catalogs can
+/// alias `typescript` to `@typescript/typescript6` (keeping the
+/// programmatic JS API) while a *different* alias pins the native
+/// `typescript@7`, whose `tsc` bin owns the `.bin/tsc` slot —
+/// moon-landing ships exactly this shape. The sibling manifest
+/// alone would report major 6 and wrongly reject a perfectly good
+/// native binary.
+fn tsc_major_version(node_modules: &Path, candidate: &Path) -> Option<u64> {
+	bin_target_major_version(candidate).or_else(|| typescript_major_version(node_modules))
+}
+
+/// Major version of the package that owns the script a
+/// `node_modules/.bin` entry points at, or `None` when the entry's
+/// target can't be resolved.
+fn bin_target_major_version(candidate: &Path) -> Option<u64> {
+	let target = resolve_bin_target(candidate)?;
+	let target = target.canonicalize().unwrap_or(target);
+	for dir in target.ancestors().skip(1) {
+		let manifest = dir.join("package.json");
+		if manifest.is_file() {
+			return manifest_major_version(&manifest);
+		}
+	}
+	None
+}
+
+/// The script a `node_modules/.bin` entry launches: the link
+/// target for symlink layouts (npm, bun), or the exec target
+/// parsed out of pnpm's POSIX shell shim. `None` for shapes we
+/// don't recognise (Windows `.cmd` shims included) — the caller
+/// falls back to the sibling-manifest check.
+fn resolve_bin_target(candidate: &Path) -> Option<PathBuf> {
+	let parent = candidate.parent()?;
+	let meta = std::fs::symlink_metadata(candidate).ok()?;
+	if meta.file_type().is_symlink() {
+		let link = std::fs::read_link(candidate).ok()?;
+		if link.is_absolute() {
+			return Some(link);
+		}
+		return Some(parent.join(link));
+	}
+	let text = std::fs::read_to_string(candidate).ok()?;
+	Some(parent.join(pnpm_shim_exec_target(&text)?))
+}
+
+/// Exec target of a pnpm shell shim: on an `exec …` line, the last
+/// `"$basedir/<path>"` token that isn't the bundled-`node` probe is
+/// the script being run (earlier `$basedir` references set up
+/// `NODE_PATH` and the node launcher itself).
+fn pnpm_shim_exec_target(text: &str) -> Option<&str> {
+	const MARKER: &str = "\"$basedir/";
+	for line in text.lines() {
+		let line = line.trim_start();
+		if !line.starts_with("exec ") {
+			continue;
+		}
+		let mut last = None;
+		let mut rest = line;
+		while let Some(pos) = rest.find(MARKER) {
+			let after = &rest[pos + MARKER.len()..];
+			let Some(end) = after.find('"') else {
+				break;
+			};
+			let token = &after[..end];
+			if token != "node" {
+				last = Some(token);
+			}
+			rest = &after[end + 1..];
+		}
+		if last.is_some() {
+			return last;
+		}
+	}
+	None
 }
 
 /// Major version of the `typescript` package resolved at
@@ -1816,7 +1898,12 @@ fn ts7_tsc_in(node_modules: &Path, filename: &str) -> Option<PathBuf> {
 /// package (or a parseable version) isn't there. Follows symlinks,
 /// so pnpm's `.pnpm/`-backed layout reads the real manifest.
 fn typescript_major_version(node_modules: &Path) -> Option<u64> {
-	let manifest = std::fs::read_to_string(node_modules.join("typescript").join("package.json")).ok()?;
+	manifest_major_version(&node_modules.join("typescript").join("package.json"))
+}
+
+/// The `version` field's major component from a `package.json`.
+fn manifest_major_version(manifest: &Path) -> Option<u64> {
+	let manifest = std::fs::read_to_string(manifest).ok()?;
 	let json: serde_json::Value = serde_json::from_str(&manifest).ok()?;
 	json.get("version")?.as_str()?.split('.').next()?.parse().ok()
 }
@@ -2313,6 +2400,156 @@ mod tests {
 		fs::create_dir_all(&pkg_root).unwrap();
 		let tsc = plant_tsc(&pkg_root, "7.1.0");
 		assert_eq!(discover_ts7_tsc(tmp.path()).as_deref(), Some(tsc.as_path()));
+	}
+
+	/// moon-landing's pnpm-catalog alias shape: `node_modules/typescript`
+	/// is `@typescript/typescript6@6.x` (kept for the programmatic JS
+	/// API), while `.bin/tsc` is a pnpm shell shim exec'ing the native
+	/// `typescript@7` installed under the `@typescript/native` alias.
+	/// The gate must follow the shim to its real package instead of
+	/// trusting the sibling `typescript` manifest.
+	#[cfg(unix)]
+	#[test]
+	fn discover_ts7_tsc_accepts_aliased_native_ts7_behind_pnpm_shim() {
+		let tmp = tempfile::tempdir().unwrap();
+		let node_modules = tmp.path().join("node_modules");
+		// Sibling `typescript` resolves to the 6.x alias.
+		let ts6 = node_modules.join("typescript");
+		fs::create_dir_all(&ts6).unwrap();
+		fs::write(
+			ts6.join("package.json"),
+			"{\"name\":\"@typescript/typescript6\",\"version\":\"6.0.2\"}",
+		)
+		.unwrap();
+		// Real native TS 7 lives in the pnpm virtual store…
+		let real = node_modules
+			.join(".pnpm")
+			.join("typescript@7.0.2")
+			.join("node_modules")
+			.join("typescript");
+		fs::create_dir_all(real.join("bin")).unwrap();
+		fs::write(
+			real.join("package.json"),
+			"{\"name\":\"typescript\",\"version\":\"7.0.2\"}",
+		)
+		.unwrap();
+		fs::write(real.join("bin").join("tsc"), b"import \"../lib/tsc.js\"\n").unwrap();
+		// …reached through the `@typescript/native` alias symlink.
+		let scope = node_modules.join("@typescript");
+		fs::create_dir_all(&scope).unwrap();
+		std::os::unix::fs::symlink(
+			Path::new("../.pnpm/typescript@7.0.2/node_modules/typescript"),
+			scope.join("native"),
+		)
+		.unwrap();
+		// pnpm shell shim in `.bin/tsc`.
+		let bin_dir = node_modules.join(".bin");
+		fs::create_dir_all(&bin_dir).unwrap();
+		let shim = bin_dir.join("tsc");
+		fs::write(
+			&shim,
+			concat!(
+				"#!/bin/sh\n",
+				"basedir=$(dirname \"$(echo \"$0\" | sed -e 's,\\\\,/,g')\")\n",
+				"if [ -x \"$basedir/node\" ]; then\n",
+				"  exec \"$basedir/node\"  \"$basedir/../@typescript/native/bin/tsc\" \"$@\"\n",
+				"else\n",
+				"  exec node  \"$basedir/../@typescript/native/bin/tsc\" \"$@\"\n",
+				"fi\n",
+			),
+		)
+		.unwrap();
+		make_executable(&shim);
+		assert_eq!(
+			discover_ts7_tsc(tmp.path()).as_deref(),
+			Some(shim.as_path()),
+			"a native TS 7 behind an alias must pass the version gate"
+		);
+	}
+
+	/// The inverse alias shape: when the `.bin/tsc` shim resolves to a
+	/// 6.x package, the gate rejects it even if the sibling
+	/// `typescript` manifest claims 7 — the bin target is what would
+	/// actually be spawned.
+	#[cfg(unix)]
+	#[test]
+	fn discover_ts7_tsc_rejects_shim_targeting_typescript_6() {
+		let tmp = tempfile::tempdir().unwrap();
+		let node_modules = tmp.path().join("node_modules");
+		let ts7 = node_modules.join("typescript");
+		fs::create_dir_all(&ts7).unwrap();
+		fs::write(
+			ts7.join("package.json"),
+			"{\"name\":\"typescript\",\"version\":\"7.0.0\"}",
+		)
+		.unwrap();
+		let legacy = node_modules.join("typescript-legacy");
+		fs::create_dir_all(legacy.join("bin")).unwrap();
+		fs::write(
+			legacy.join("package.json"),
+			"{\"name\":\"typescript-legacy\",\"version\":\"6.0.2\"}",
+		)
+		.unwrap();
+		fs::write(legacy.join("bin").join("tsc"), b"#!/usr/bin/env node\n").unwrap();
+		let bin_dir = node_modules.join(".bin");
+		fs::create_dir_all(&bin_dir).unwrap();
+		let shim = bin_dir.join("tsc");
+		fs::write(
+			&shim,
+			"#!/bin/sh\nexec node  \"$basedir/../typescript-legacy/bin/tsc\" \"$@\"\n",
+		)
+		.unwrap();
+		make_executable(&shim);
+		assert_eq!(discover_ts7_tsc(tmp.path()), None);
+	}
+
+	/// npm / bun symlink `.bin` layout: the link target's owning
+	/// package decides the version, same as the pnpm shim path.
+	#[cfg(unix)]
+	#[test]
+	fn discover_ts7_tsc_follows_bin_symlink() {
+		let tmp = tempfile::tempdir().unwrap();
+		let node_modules = tmp.path().join("node_modules");
+		let ts6 = node_modules.join("typescript");
+		fs::create_dir_all(&ts6).unwrap();
+		fs::write(
+			ts6.join("package.json"),
+			"{\"name\":\"@typescript/typescript6\",\"version\":\"6.0.2\"}",
+		)
+		.unwrap();
+		let native = node_modules.join("@typescript").join("native");
+		fs::create_dir_all(native.join("bin")).unwrap();
+		fs::write(
+			native.join("package.json"),
+			"{\"name\":\"typescript\",\"version\":\"7.0.2\"}",
+		)
+		.unwrap();
+		fs::write(native.join("bin").join("tsc"), b"import \"../lib/tsc.js\"\n").unwrap();
+		let bin_dir = node_modules.join(".bin");
+		fs::create_dir_all(&bin_dir).unwrap();
+		let link = bin_dir.join("tsc");
+		std::os::unix::fs::symlink(Path::new("../@typescript/native/bin/tsc"), &link).unwrap();
+		assert_eq!(discover_ts7_tsc(tmp.path()).as_deref(), Some(link.as_path()));
+	}
+
+	/// Parser unit: the shim's `NODE_PATH` export and the bundled-node
+	/// probe both mention `$basedir` — only the exec line's script
+	/// token counts.
+	#[test]
+	fn pnpm_shim_exec_target_picks_script_not_node() {
+		let shim = concat!(
+			"#!/bin/sh\n",
+			"basedir=$(dirname \"$(echo \"$0\" | sed -e 's,\\\\,/,g')\")\n",
+			"if [ -z \"$NODE_PATH\" ]; then\n",
+			"  export NODE_PATH=\"/workspace/x/node_modules/.pnpm/typescript@7.0.2/node_modules\"\n",
+			"fi\n",
+			"if [ -x \"$basedir/node\" ]; then\n",
+			"  exec \"$basedir/node\"  \"$basedir/../@typescript/native/bin/tsc\" \"$@\"\n",
+			"else\n",
+			"  exec node  \"$basedir/../@typescript/native/bin/tsc\" \"$@\"\n",
+			"fi\n",
+		);
+		assert_eq!(pnpm_shim_exec_target(shim), Some("../@typescript/native/bin/tsc"));
 	}
 
 	/// When both a project-local `tsgo` and a `typescript@7` `tsc`
