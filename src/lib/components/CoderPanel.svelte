@@ -61,6 +61,29 @@
 	// honour for `data:` URLs.
 	let lightboxUrl = $state<string | null>(null);
 
+	// Draft for the sub-agent pop-out's composer. Separate from
+	// the parent's `coder.draft` so switching between the pop-out
+	// and the parent never clobbers either text.
+	let subagentDraft = $state('');
+
+	async function onSubagentComposerKey(e: KeyboardEvent): Promise<void> {
+		if (e.key !== 'Enter' || e.shiftKey) {
+			return;
+		}
+		e.preventDefault();
+		const text = subagentDraft.trim();
+		const subId = coder.viewSubagentId;
+		if (text.length === 0 || subId === null) {
+			return;
+		}
+		// Running → steer; finished → resume with a follow-up.
+		// `false` means nothing to continue — keep the draft so
+		// the text isn't lost.
+		if (await coder.continueSubagent(subId, text)) {
+			subagentDraft = '';
+		}
+	}
+
 	// Per-session shell-target override popover (Auto / Force host).
 	// Anchored to the bash-target pip in the header.
 	let shellTargetOpen = $state(false);
@@ -2507,14 +2530,17 @@
 		</div>
 	{:else if coder.view === 'subagent'}
 		<!-- Sub-agent pop-out: full transcript of one sub-agent, with
-			 a back-arrow returning to the parent's session. No
-			 composer (sub-agents take their task at spawn time and
-			 finish on their own; the user can't drive them
-			 mid-flight). The row renderer is the same one the
-			 parent uses, so streaming sub-agents update live in
-			 this view too. -->
+			 a back-arrow returning to the parent's session. The row
+			 renderer is the same one the parent uses, so streaming
+			 sub-agents update live in this view too. The composer
+			 queues mid-flight steers while the sub-agent runs
+			 (drained at its next iteration) and sends follow-ups
+			 once it settled (resuming the sub-agent's loop without
+			 involving the parent agent). -->
 		{@const subId = coder.viewSubagentId}
 		{@const transcript = subId !== null ? (coder.subagentTranscripts.get(subId) ?? null) : null}
+		{@const subagentRunning =
+			transcript !== null && coder.subagentSummaries.get(transcript.toolCallId)?.status === 'running'}
 		<header class="session-bar">
 			<button
 				type="button"
@@ -2542,6 +2568,14 @@
 					>
 						<CodeIcon />
 					</button>
+					{#if subagentRunning}
+						<button
+							type="button"
+							class="stop"
+							title="Stop this sub-agent (parent and siblings keep running)"
+							onclick={() => coder.abortSubagent(subId)}>stop</button
+						>
+					{/if}
 				{/if}
 			{:else}
 				<span class="session-bar-title">Sub-agent</span>
@@ -2559,6 +2593,18 @@
 				{/each}
 			{/if}
 		</div>
+		{#if transcript !== null}
+			<div class="composer">
+				<textarea
+					bind:value={subagentDraft}
+					placeholder={subagentRunning
+						? 'Steer the sub-agent… (Enter to send)'
+						: 'Follow up with the sub-agent… (Enter to send)'}
+					rows="2"
+					onkeydown={onSubagentComposerKey}
+				></textarea>
+			</div>
+		{/if}
 	{/if}
 </div>
 
@@ -2641,13 +2687,15 @@
 						title={formatFullTimestamp(row.createdAt)}>{formatClock(row.createdAt)}</time
 					>{/if}{#if row.queued}<span
 						class="queued-tag"
-						title="Waiting for the current turn to finish. Press ↑ on an empty composer to pull it back.">queued</span
-					><button
-						type="button"
-						class="queued-go-now"
-						title="Don't wait for the current turn — interrupt and run this message now"
-						onclick={() => coder.drainSteerNow(row.id)}>go now</button
-					>{/if}
+						title={inParentTranscript
+							? 'Waiting for the current turn to finish. Press ↑ on an empty composer to pull it back.'
+							: "Waiting for the sub-agent's next iteration."}>queued</span
+					>{#if inParentTranscript}<button
+							type="button"
+							class="queued-go-now"
+							title="Don't wait for the current turn — interrupt and run this message now"
+							onclick={() => coder.drainSteerNow(row.id)}>go now</button
+						>{/if}{/if}
 				{#if inParentTranscript && !row.queued && !coder.busy}
 					<!-- Hover-revealed revert affordances. Hidden while a
 							 turn runs (the backend refuses mid-turn), on

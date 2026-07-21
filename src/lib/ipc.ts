@@ -385,6 +385,9 @@ export const ipc = {
 		abort: () => invoke<void>('coder_abort'),
 		drainSteerNow: (id: string) => invoke<boolean>('coder_drain_steer_now', { id }),
 		unqueueSteer: (id: string) => invoke<UnqueuedSteer | null>('coder_unqueue_steer', { id }),
+		continueSubagent: (subagentId: string, text: string) =>
+			invoke<boolean>('coder_continue_subagent', { subagentId, text }),
+		abortSubagent: (subagentId: string) => invoke<boolean>('coder_abort_subagent', { subagentId }),
 		respondToPrompt: (callId: string, response: PromptResponse) =>
 			invoke<boolean>('coder_respond_to_prompt', { callId, response }),
 		revertToMessage: (userOrdinal: number) => invoke<RevertedMessage>('coder_revert_to_message', { userOrdinal }),

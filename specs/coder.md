@@ -1123,7 +1123,35 @@ rows source) with a back arrow. The pop-out opens with the task as a
 user-message row (the runner live-mirrors it, and the wrap-up
 sentinel, as wrapped `UserMessage` events — matching what replay
 reconstructs from the JSONL's `User` records), so the transcript
-always shows what the sub-agent was asked to do. `SubagentSpawned` / `SubagentFinished`
+always shows what the sub-agent was asked to do.
+
+The pop-out has a composer (`coder_continue_subagent`) with two
+behaviours keyed off the run state:
+
+- **Running → mid-flight steer.** Same contract as parent steers:
+  the row renders queued immediately, drains into the sub-agent's
+  history at the top of its next iteration (persisting at drain
+  time and flipping via `SteerDrained`), and a steer that lands
+  during the final assistant message buys one extra round-trip
+  instead of being dropped. Steers still queued when the run
+  settles are discarded (their rows are removed on
+  `SubagentFinished`).
+- **Finished → follow-up.** The sub-agent resumes: history is
+  rebuilt from its JSONL, the text lands as a new user message, and
+  a fresh detached loop runs against the same target folder and
+  mode. The parent agent is deliberately not involved — its history
+  still ends at the original `task` tool result; follow-ups are
+  user ↔ sub-agent only. The card flips back to `running` (the
+  re-emitted `SubagentSpawned` merges into the existing card /
+  transcript instead of resetting them). Resume requires the
+  target folder to still be bound and the JSONL to exist on disk;
+  otherwise the send is refused and the draft is kept.
+
+While a sub-agent runs — original dispatch or resume — the pop-out
+header shows a stop button (`coder_abort_subagent`) that cancels
+just that sub-agent: a dispatch run's token is a child of the
+parent turn's, so the parent and sibling sub-agents keep going (the
+parent sees the `task` call return `Aborted`). `SubagentSpawned` / `SubagentFinished`
 records on the parent's JSONL rebuild the cards on reload, and the
 sub-agent's own JSONL replays into the pop-out; a missing sub-agent
 file degrades to card-only with a warn.
@@ -1355,6 +1383,8 @@ Tauri commands in `src-tauri/src/commands/coder.rs`:
 | `coder_session_jsonl_path(id)`                          | Resolves a session id (parent or sub-agent) to its on-disk path; powers "open trace"                          |
 | `coder_send(text, mode)`                                | Routes to the loop (`send` / `steer` / `follow_up`)                                                           |
 | `coder_abort()`                                         | Cancels the visible session's in-flight turn                                                                  |
+| `coder_continue_subagent(subagent_id, text)`            | Steers a running sub-agent, or resumes a finished one with a follow-up; `false` when nothing to continue      |
+| `coder_abort_subagent(subagent_id)`                     | Cancels one sub-agent's own token; parent turn and siblings unaffected                                        |
 | `coder_respond_to_prompt(call_id, response)`            | Resolves a parked `ask_user` prompt; returns `false` when nothing's parked                                    |
 | `coder_revert_to_message(user_ordinal)`                 | Truncates the visible session; returns the dropped prompt for edit-and-resend. Refused mid-turn               |
 | `coder_replay_from_message(user_ordinal)`               | Truncates to before the message, then re-sends the same prompt (re-run the turn). Refused mid-turn            |

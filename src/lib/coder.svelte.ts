@@ -2754,6 +2754,48 @@ class CoderPanelState {
 		}
 	}
 
+	/** Send a message to a sub-agent from the pop-out composer.
+	 *  Running → mid-flight steer (the queued row arrives via the
+	 *  wrapped `user_message` event, nothing to append locally);
+	 *  finished → resumes the sub-agent with the text as a
+	 *  follow-up, without involving the parent agent. Returns
+	 *  `false` when there's nothing to continue — the caller keeps
+	 *  the draft so the text isn't lost. */
+	async continueSubagent(subagentId: string, text: string): Promise<boolean> {
+		try {
+			return await ipc.coder.continueSubagent(subagentId, text);
+		} catch (err) {
+			this.rows = [
+				...this.rows,
+				{
+					kind: 'error',
+					id: `local-${Date.now()}`,
+					text: formatError(err),
+				},
+			];
+			return false;
+		}
+	}
+
+	/** Stop one running sub-agent (the pop-out's stop button).
+	 *  Scoped: the parent turn and sibling sub-agents keep
+	 *  running. A `false` return (already finished) is a silent
+	 *  no-op. */
+	async abortSubagent(subagentId: string): Promise<void> {
+		try {
+			await ipc.coder.abortSubagent(subagentId);
+		} catch (err) {
+			this.rows = [
+				...this.rows,
+				{
+					kind: 'error',
+					id: `local-${Date.now()}`,
+					text: formatError(err),
+				},
+			];
+		}
+	}
+
 	/** Pop the most recently queued steer from the active folder's
 	 *  transcript back into the composer.
 	 *
@@ -3404,29 +3446,39 @@ class CoderPanelState {
 				}
 				return;
 			case 'subagent_spawned': {
+				// Re-emitted on a user-driven resume (pop-out
+				// follow-up) with the same ids — merge instead of
+				// reset so the existing transcript rows and the
+				// card's accumulated preview / token figures
+				// survive the status flip back to `running`.
+				const summaries = new Map(session.subagentSummaries);
+				const prev = summaries.get(event.tool_call_id) ?? null;
 				const summary: SubagentSummary = {
 					id: event.subagent_id,
 					toolCallId: event.tool_call_id,
 					targetFolder: event.target_folder,
 					mode: event.mode,
 					status: 'running',
-					resultPreview: null,
-					tokensUsedEstimate: 0,
-					subSessionId: null,
+					resultPreview: prev?.resultPreview ?? null,
+					tokensUsedEstimate: prev?.tokensUsedEstimate ?? 0,
+					subSessionId: prev?.subSessionId ?? null,
 					worktreeRoot: event.worktree_root ?? null,
 				};
-				const summaries = new Map(session.subagentSummaries);
 				summaries.set(event.tool_call_id, summary);
 				session.subagentSummaries = summaries;
 
 				const transcripts = new Map(session.subagentTranscripts);
-				transcripts.set(event.subagent_id, {
-					id: event.subagent_id,
-					toolCallId: event.tool_call_id,
-					mode: event.mode,
-					targetFolder: event.target_folder,
-					rows: [],
-				});
+				const existing = transcripts.get(event.subagent_id);
+				transcripts.set(
+					event.subagent_id,
+					existing ?? {
+						id: event.subagent_id,
+						toolCallId: event.tool_call_id,
+						mode: event.mode,
+						targetFolder: event.target_folder,
+						rows: [],
+					},
+				);
 				session.subagentTranscripts = transcripts;
 				return;
 			}
@@ -3489,17 +3541,28 @@ class CoderPanelState {
 				// pop-out's elapsed counter would tick forever.
 				if (transcript) {
 					const finishedAt = Date.now();
-					const cleanedRows = transcript.rows.map((row) =>
-						row.kind === 'tool' && !row.hasResult
-							? {
-									...row,
-									result: { aborted: true },
-									hasResult: true,
-									isError: true,
-									durationMs: Math.max(0, finishedAt - row.startedAt),
-								}
-							: row,
-					);
+					// Also drop still-queued steers: the runner's steer
+					// channel closed with them undelivered, so keeping
+					// the muted rows would suggest they reached the
+					// model. Mirrors the parent dropping its queue on
+					// abort.
+					const cleanedRows: CoderRow[] = [];
+					for (const row of transcript.rows) {
+						if (row.kind === 'user' && row.queued) {
+							continue;
+						}
+						if (row.kind === 'tool' && !row.hasResult) {
+							cleanedRows.push({
+								...row,
+								result: { aborted: true },
+								hasResult: true,
+								isError: true,
+								durationMs: Math.max(0, finishedAt - row.startedAt),
+							});
+							continue;
+						}
+						cleanedRows.push(row);
+					}
 					const transcripts = new Map(session.subagentTranscripts);
 					transcripts.set(event.subagent_id, { ...transcript, rows: cleanedRows });
 					session.subagentTranscripts = transcripts;
@@ -3688,16 +3751,34 @@ function findSummaryById(summaries: Map<string, SubagentSummary>, subagentId: st
 function applyInnerEventToRows(rows: CoderRow[], event: CoderEvent): void {
 	switch (event.kind) {
 		case 'user_message':
-			// The sub-agent's task at spawn time, plus the
-			// iteration-cap wrap-up sentinel when it fires. Never
-			// queued — sub-agents can't be steered mid-flight.
+			// The sub-agent's task at spawn time, the iteration-cap
+			// wrap-up sentinel, and mid-flight steers from the
+			// pop-out composer (those arrive `queued: true` and
+			// flip on the matching `steer_drained`).
 			rows.push({
 				kind: 'user',
 				id: event.id,
 				text: event.text,
 				images: event.images ?? [],
-				queued: false,
+				queued: event.queued ?? false,
 				createdAt: event.created_at_ms ?? Date.now(),
+			});
+			return;
+		case 'steer_drained': {
+			const row = findRowById(rows, event.id);
+			if (row?.kind === 'user') {
+				row.queued = false;
+			}
+			return;
+		}
+		case 'error':
+			// Only user-driven resumes emit this (a tool-dispatch
+			// run's error rides back on the parent's tool result
+			// instead).
+			rows.push({
+				kind: 'error',
+				id: nextRowId('error'),
+				text: event.message,
 			});
 			return;
 		case 'assistant_message_start':

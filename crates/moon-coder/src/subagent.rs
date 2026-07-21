@@ -47,6 +47,11 @@
 //! - Depth cap: hardcoded to 1. The sub-agent's own tool list does
 //!   not include `task`, so a sub-agent literally cannot spawn a
 //!   sub-sub-agent.
+//! - User continuation: the pop-out composer steers a running
+//!   sub-agent mid-flight (queued, drained at the next iteration
+//!   top) and resumes a finished one with a follow-up (history
+//!   rebuilt from its JSONL, fresh detached loop, parent agent not
+//!   involved). See [`queue_subagent_steer`] / [`resume_subagent`].
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -137,6 +142,157 @@ fn kick_off_subagent_fetch(folder: &Arc<WorkspaceFolderEntry>) {
 			tracing::debug!(%err, "sub-agent pre-fetch failed (ignored)");
 		}
 	});
+}
+
+/// One steer queued against a running sub-agent from the pop-out
+/// composer. Mirrors the parent's `PendingSteer` contract: the
+/// panel renders a muted "queued" row the moment the steer is
+/// accepted (via a wrapped `UserMessage { queued: true }`), and
+/// the sub-agent drains it into its message history at the top of
+/// its next iteration, flipping the row with a `SteerDrained`.
+#[derive(Debug, Clone)]
+struct QueuedSubagentSteer {
+	id: String,
+	text: String,
+}
+
+/// Live steer channel for one running sub-agent. An entry exists
+/// exactly while the sub-agent's loop runs — registered before
+/// `SubagentSpawned` is announced, removed once the loop settles —
+/// so a steer against an absent id means "not running" and the
+/// caller gets `false` back. The sink is the sub-agent's own
+/// (parent-tagged) sink, captured so queue-time emission lands in
+/// the same UI bucket as the rest of the sub-agent's events. The
+/// cancel token is the run's own (a child of the parent turn's for
+/// tool-dispatch runs, a fresh root for user-resumed runs), so the
+/// pop-out's stop button can abort one sub-agent without touching
+/// its siblings or the parent.
+struct SubagentSteerChannel {
+	queue: Vec<QueuedSubagentSteer>,
+	sink: FolderEventSink,
+	cancel: CancellationToken,
+}
+
+/// Process-global registry, same pattern as the fetch throttle
+/// above: sub-agents run deep inside the parent's tool dispatch,
+/// so the Tauri command layer can't reach them through `Coder`'s
+/// session state — the id-keyed map is the rendezvous point.
+fn subagent_steer_registry() -> &'static Mutex<HashMap<String, SubagentSteerChannel>> {
+	static MAP: std::sync::OnceLock<Mutex<HashMap<String, SubagentSteerChannel>>> = std::sync::OnceLock::new();
+	MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Queue a mid-flight steer against a running sub-agent. Emits the
+/// queued `UserMessage` row into the sub-agent's transcript
+/// immediately; the text reaches the model at the top of the
+/// sub-agent's next iteration. Returns `false` when the sub-agent
+/// isn't running (finished, aborted, or unknown id) — the message
+/// is not delivered and the caller should keep it.
+pub(crate) fn queue_subagent_steer(subagent_id: &str, text: String) -> bool {
+	let mut registry = subagent_steer_registry().lock().expect("steer registry poisoned");
+	let Some(channel) = registry.get_mut(subagent_id) else {
+		return false;
+	};
+	let steer_id = crate::runner::new_message_id();
+	channel.queue.push(QueuedSubagentSteer {
+		id: steer_id.clone(),
+		text: text.clone(),
+	});
+	channel.sink.send(wrap_inner(
+		subagent_id,
+		CoderEvent::UserMessage {
+			id: steer_id,
+			text,
+			images: Vec::new(),
+			queued: true,
+			created_at_ms: Some(current_time_ms()),
+		},
+	));
+	true
+}
+
+fn register_subagent_steer_channel(subagent_id: &str, sink: FolderEventSink, cancel: CancellationToken) {
+	subagent_steer_registry()
+		.lock()
+		.expect("steer registry poisoned")
+		.insert(
+			subagent_id.to_string(),
+			SubagentSteerChannel {
+				queue: Vec::new(),
+				sink,
+				cancel,
+			},
+		);
+}
+
+/// Atomically claim `subagent_id` for a user-driven resume: if no
+/// channel exists, register one (with a fresh root token) and
+/// return it for the resumed run; if one appeared in the meantime
+/// (the sub-agent is running after all), queue `text` as an
+/// ordinary steer instead and return `None`. Single registry lock
+/// so a double-click / concurrent continue can't spawn two loops
+/// over the same JSONL.
+pub(crate) fn claim_subagent_for_resume(
+	subagent_id: &str,
+	text: &str,
+	sink: &FolderEventSink,
+) -> Option<CancellationToken> {
+	let mut registry = subagent_steer_registry().lock().expect("steer registry poisoned");
+	if registry.contains_key(subagent_id) {
+		drop(registry);
+		queue_subagent_steer(subagent_id, text.to_string());
+		return None;
+	}
+	let cancel = CancellationToken::new();
+	registry.insert(
+		subagent_id.to_string(),
+		SubagentSteerChannel {
+			queue: Vec::new(),
+			sink: sink.clone(),
+			cancel: cancel.clone(),
+		},
+	);
+	Some(cancel)
+}
+
+/// Cancel a running sub-agent's own token — the pop-out's stop
+/// button. Scoped to the one sub-agent: a tool-dispatch run's
+/// token is a *child* of the parent turn's, so cancelling it never
+/// propagates upward (the parent just sees the `task` call return
+/// `Aborted` and reacts). Returns `false` when nothing is running
+/// under that id.
+pub(crate) fn abort_subagent(subagent_id: &str) -> bool {
+	let registry = subagent_steer_registry().lock().expect("steer registry poisoned");
+	match registry.get(subagent_id) {
+		Some(channel) => {
+			channel.cancel.cancel();
+			true
+		}
+		None => false,
+	}
+}
+
+/// Drop the channel. Any still-queued steers are discarded — same
+/// contract as the parent's abort dropping its queue; the frontend
+/// removes the corresponding queued rows on `SubagentFinished`.
+fn unregister_subagent_steer_channel(subagent_id: &str) {
+	subagent_steer_registry()
+		.lock()
+		.expect("steer registry poisoned")
+		.remove(subagent_id);
+}
+
+fn take_queued_subagent_steers(subagent_id: &str) -> Vec<QueuedSubagentSteer> {
+	let mut registry = subagent_steer_registry().lock().expect("steer registry poisoned");
+	match registry.get_mut(subagent_id) {
+		Some(channel) => std::mem::take(&mut channel.queue),
+		None => Vec::new(),
+	}
+}
+
+fn has_queued_subagent_steers(subagent_id: &str) -> bool {
+	let registry = subagent_steer_registry().lock().expect("steer registry poisoned");
+	registry.get(subagent_id).map(|c| !c.queue.is_empty()).unwrap_or(false)
 }
 
 /// Caller-provided plan for one sub-agent run. Built by the
@@ -247,6 +403,11 @@ pub(crate) async fn run_subagent(
 ) -> Result<SubagentReport, CoderError> {
 	let id = spec.id.clone();
 	let mode = spec.mode;
+	// Open the steer channel before announcing the spawn, so the
+	// pop-out can never see a running sub-agent whose composer
+	// bounces. Closed (and any undelivered steers dropped) after
+	// the loop settles, before `SubagentFinished` goes out.
+	register_subagent_steer_channel(&id, sink.clone(), cancel.clone());
 	sink.send(CoderEvent::SubagentSpawned {
 		tool_call_id: spec.parent_tool_call_id.clone(),
 		subagent_id: id.clone(),
@@ -271,99 +432,17 @@ pub(crate) async fn run_subagent(
 		},
 	));
 
-	// Refresh the target folder's remote-tracking refs so a
-	// sub-agent that inspects `origin/main` sees fresh data.
-	// Fire-and-forget + per-folder throttled; see the helper.
-	kick_off_subagent_fetch(&spec.folder);
-
-	// Fresh per-turn format queue. The sub-agent's write/edit
-	// tools record into it instead of running the lint-staged
-	// chain inline; we drain it below regardless of how the
-	// sub-agent ended. See the ADR superseding 0013's per-tool-
-	// call invocation.
-	let format_queue = Arc::new(crate::tools::FormatQueue::default());
-	// Per-turn background-process registry (ADR 0034). Same
-	// lifetime as the format queue — cleaned up regardless of how
-	// the sub-agent ended.
-	let background = Arc::new(crate::tools::BackgroundProcessRegistry::default());
-
-	let outcome = run_subagent_inner(
-		tools,
-		inference,
-		sink,
-		coder_sessions_dir,
-		models,
-		&spec,
-		cancel,
-		format_queue.clone(),
-		background.clone(),
-	)
-	.await;
-
-	// Flush before announcing the finish so by the time the
-	// parent's transcript shows `SubagentFinished` the files are
-	// already formatted on disk — important because the parent's
-	// next iteration may `read_file` against one of those paths
-	// to verify the sub-agent's work. Sub-agent tools today only
-	// write inside `spec.folder` (path routing happens in the
-	// parent's `ToolContext`, not the sub-agent's), so we can
-	// pull the host straight off the spec instead of looking it
-	// up through the workspace registry.
-	for (_folder_path, rel) in format_queue.drain() {
-		if let Err(err) = spec.folder.host.format_file(&rel).await {
-			tracing::warn!(path = %rel, %err, "format-on-save (sub-agent turn end): format_file failed");
-		}
-	}
-	// Kill + reap any detached processes the sub-agent left running.
-	background.cleanup().await;
-
-	let was_error = outcome.is_err();
-	sink.send(CoderEvent::SubagentFinished {
-		subagent_id: id.clone(),
-		tokens_used_estimate: outcome.as_ref().ok().map(|r| r.tokens_used_estimate).unwrap_or(0),
-		was_error,
-	});
-	outcome
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_subagent_inner(
-	tools: &ToolRegistry,
-	inference: &InferenceClient,
-	sink: &FolderEventSink,
-	coder_sessions_dir: &Utf8Path,
-	models: &SharedCoderModels,
-	spec: &Subagent,
-	cancel: CancellationToken,
-	format_queue: Arc<crate::tools::FormatQueue>,
-	background: Arc<crate::tools::BackgroundProcessRegistry>,
-) -> Result<SubagentReport, CoderError> {
 	// Header seed only — the per-round-trip model comes from the
-	// fresh snapshot at the top of every loop iteration below.
+	// fresh snapshot at the top of every loop iteration.
 	let standard_model = models.read().await.standard().to_owned();
-	let id = spec.id.clone();
 	let system_prompt = spec
 		.system_prompt_override
 		.clone()
 		.unwrap_or_else(|| build_subagent_system_prompt(spec.mode, &spec.folder, &spec.task));
-	let mut messages: Vec<ChatMessage> = vec![
-		ChatMessage::System {
-			content: system_prompt.clone(),
-		},
+	let messages: Vec<ChatMessage> = vec![
+		ChatMessage::System { content: system_prompt },
 		ChatMessage::user(spec.task.clone()),
 	];
-	// Most-recent provider-supplied usage. Populated whenever an
-	// LLM call returns a `usage` block; `None` when every round
-	// fell back to the bytes/4 estimate. Used both to drive the
-	// compaction trigger and as the eventual `tokens_used_estimate`
-	// the parent sees back.
-	let mut last_usage: Option<TokenUsage> = None;
-	// Sub-agent-local todo list. Sub-agents see `todo_write`
-	// advertised on the same footing the parent does and maintain
-	// their own scratchpad; it never bubbles up to the parent's
-	// pill (the parent has its own list) but the per-call result
-	// renders inside the sub-agent's transcript card.
-	let mut todos: Vec<crate::TodoItem> = Vec::new();
 
 	// JSONL transcript lives under the **parent** folder's slug,
 	// nested inside a per-parent-session subdirectory:
@@ -436,6 +515,228 @@ async fn run_subagent_inner(
 	)
 	.await;
 
+	let state = SubagentLoopState {
+		messages,
+		last_usage: None,
+		todos: Vec::new(),
+	};
+	run_subagent_wrapped(
+		tools,
+		inference,
+		sink,
+		models,
+		&spec,
+		session_dir,
+		header,
+		state,
+		cancel,
+	)
+	.await
+}
+
+/// Resume a *finished* sub-agent with a user follow-up (the
+/// pop-out composer after the run settled). The caller —
+/// [`crate::runner::Coder::continue_subagent`] — already rebuilt
+/// the message history from the sub-agent's JSONL and claimed the
+/// steer channel via [`claim_subagent_for_resume`], so this only
+/// re-announces the spawn (the frontend keeps the existing
+/// transcript rows and flips the card back to `running`), appends
+/// and persists the follow-up, and re-enters the shared loop. The
+/// parent agent is deliberately not involved: a follow-up is
+/// user ↔ sub-agent; the parent's history still ends at the
+/// original `task` tool result.
+pub(crate) async fn resume_subagent(
+	tools: &ToolRegistry,
+	inference: &InferenceClient,
+	sink: &FolderEventSink,
+	models: &SharedCoderModels,
+	resume: SubagentResume,
+	cancel: CancellationToken,
+) -> Result<SubagentReport, CoderError> {
+	let SubagentResume {
+		spec,
+		session_dir,
+		header,
+		mut messages,
+		last_usage,
+		todos,
+		follow_up,
+	} = resume;
+	let id = spec.id.clone();
+	sink.send(CoderEvent::SubagentSpawned {
+		tool_call_id: spec.parent_tool_call_id.clone(),
+		subagent_id: id.clone(),
+		target_folder: spec.folder.folder.path.clone(),
+		mode: spec.mode.as_wire().to_string(),
+		worktree_root: None,
+	});
+	sink.send(wrap_inner(
+		&id,
+		CoderEvent::UserMessage {
+			id: crate::runner::new_message_id(),
+			text: follow_up.clone(),
+			images: Vec::new(),
+			queued: false,
+			created_at_ms: Some(current_time_ms()),
+		},
+	));
+	messages.push(ChatMessage::user(follow_up.clone()));
+	persist_subagent(
+		&session_dir,
+		&header,
+		&SessionRecord::User {
+			text: follow_up,
+			images: Vec::new(),
+		},
+	)
+	.await;
+
+	let state = SubagentLoopState {
+		messages,
+		last_usage,
+		todos,
+	};
+	run_subagent_wrapped(
+		tools,
+		inference,
+		sink,
+		models,
+		&spec,
+		session_dir,
+		header,
+		state,
+		cancel,
+	)
+	.await
+}
+
+/// Everything [`crate::runner::Coder::continue_subagent`] rebuilds
+/// from a finished sub-agent's JSONL before handing off to
+/// [`resume_subagent`].
+pub(crate) struct SubagentResume {
+	pub spec: Subagent,
+	pub session_dir: Utf8PathBuf,
+	pub header: SessionHeader,
+	pub messages: Vec<ChatMessage>,
+	pub last_usage: Option<TokenUsage>,
+	pub todos: Vec<crate::TodoItem>,
+	pub follow_up: String,
+}
+
+/// Mutable loop state threaded into [`run_subagent_loop`]. Fresh
+/// runs start with just the system + task messages; resumed runs
+/// carry the history rebuilt from the sub-agent's JSONL.
+struct SubagentLoopState {
+	messages: Vec<ChatMessage>,
+	/// Most-recent provider-supplied usage. Populated whenever an
+	/// LLM call returns a `usage` block; `None` when every round
+	/// fell back to the bytes/4 estimate. Drives the compaction
+	/// trigger and the eventual `tokens_used_estimate` the parent
+	/// sees back.
+	last_usage: Option<TokenUsage>,
+	/// Sub-agent-local todo list. Sub-agents see `todo_write`
+	/// advertised on the same footing the parent does and maintain
+	/// their own scratchpad; it never bubbles up to the parent's
+	/// pill but the per-call result renders inside the sub-agent's
+	/// transcript card.
+	todos: Vec<crate::TodoItem>,
+}
+
+/// Shared body of [`run_subagent`] and [`resume_subagent`]: format
+/// queue + background-process lifecycle around the LLM loop, then
+/// channel teardown and the `SubagentFinished` announcement.
+#[allow(clippy::too_many_arguments)]
+async fn run_subagent_wrapped(
+	tools: &ToolRegistry,
+	inference: &InferenceClient,
+	sink: &FolderEventSink,
+	models: &SharedCoderModels,
+	spec: &Subagent,
+	session_dir: Utf8PathBuf,
+	header: SessionHeader,
+	state: SubagentLoopState,
+	cancel: CancellationToken,
+) -> Result<SubagentReport, CoderError> {
+	let id = spec.id.clone();
+	// Refresh the target folder's remote-tracking refs so a
+	// sub-agent that inspects `origin/main` sees fresh data.
+	// Fire-and-forget + per-folder throttled; see the helper.
+	kick_off_subagent_fetch(&spec.folder);
+
+	// Fresh per-turn format queue. The sub-agent's write/edit
+	// tools record into it instead of running the lint-staged
+	// chain inline; we drain it below regardless of how the
+	// sub-agent ended. See the ADR superseding 0013's per-tool-
+	// call invocation.
+	let format_queue = Arc::new(crate::tools::FormatQueue::default());
+	// Per-turn background-process registry (ADR 0034). Same
+	// lifetime as the format queue — cleaned up regardless of how
+	// the sub-agent ended.
+	let background = Arc::new(crate::tools::BackgroundProcessRegistry::default());
+
+	let outcome = run_subagent_loop(
+		tools,
+		inference,
+		sink,
+		models,
+		spec,
+		&session_dir,
+		&header,
+		state,
+		cancel,
+		format_queue.clone(),
+		background.clone(),
+	)
+	.await;
+
+	// Flush before announcing the finish so by the time the
+	// parent's transcript shows `SubagentFinished` the files are
+	// already formatted on disk — important because the parent's
+	// next iteration may `read_file` against one of those paths
+	// to verify the sub-agent's work. Sub-agent tools today only
+	// write inside `spec.folder` (path routing happens in the
+	// parent's `ToolContext`, not the sub-agent's), so we can
+	// pull the host straight off the spec instead of looking it
+	// up through the workspace registry.
+	for (_folder_path, rel) in format_queue.drain() {
+		if let Err(err) = spec.folder.host.format_file(&rel).await {
+			tracing::warn!(path = %rel, %err, "format-on-save (sub-agent turn end): format_file failed");
+		}
+	}
+	// Kill + reap any detached processes the sub-agent left running.
+	background.cleanup().await;
+	unregister_subagent_steer_channel(&id);
+
+	let was_error = outcome.is_err();
+	sink.send(CoderEvent::SubagentFinished {
+		subagent_id: id,
+		tokens_used_estimate: outcome.as_ref().ok().map(|r| r.tokens_used_estimate).unwrap_or(0),
+		was_error,
+	});
+	outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_subagent_loop(
+	tools: &ToolRegistry,
+	inference: &InferenceClient,
+	sink: &FolderEventSink,
+	models: &SharedCoderModels,
+	spec: &Subagent,
+	session_dir: &Utf8Path,
+	header: &SessionHeader,
+	state: SubagentLoopState,
+	cancel: CancellationToken,
+	format_queue: Arc<crate::tools::FormatQueue>,
+	background: Arc<crate::tools::BackgroundProcessRegistry>,
+) -> Result<SubagentReport, CoderError> {
+	let id = spec.id.clone();
+	let SubagentLoopState {
+		mut messages,
+		mut last_usage,
+		mut todos,
+	} = state;
+
 	// The sub-agent's tool list deliberately omits `task`. That's
 	// how the depth=1 cap is enforced: a sub-agent literally cannot
 	// describe a sub-sub-agent because the model never sees the
@@ -456,6 +757,25 @@ async fn run_subagent_inner(
 	for iter in 0..MAX_TURN_ITERATIONS {
 		if cancel.is_cancelled() {
 			return Err(CoderError::Aborted);
+		}
+
+		// Drain any steers the user queued from the pop-out
+		// composer: append to the history + persist, then flip the
+		// queued row via `SteerDrained` — same contract as the
+		// parent loop's `drain_pending_steers` (steers persist at
+		// drain time, in queue order).
+		for steer in take_queued_subagent_steers(&id) {
+			messages.push(ChatMessage::user(steer.text.clone()));
+			persist_subagent(
+				session_dir,
+				header,
+				&SessionRecord::User {
+					text: steer.text,
+					images: Vec::new(),
+				},
+			)
+			.await;
+			sink.send(wrap_inner(&id, CoderEvent::SteerDrained { id: steer.id }));
 		}
 
 		// Fresh model snapshot per round-trip — same discipline as
@@ -500,8 +820,8 @@ async fn run_subagent_inner(
 				cache_creation_input_tokens: 0,
 			});
 			persist_subagent(
-				&session_dir,
-				&header,
+				session_dir,
+				header,
 				&SessionRecord::Compaction {
 					summary: applied.summary,
 					messages_compacted: applied.messages_compacted,
@@ -579,8 +899,8 @@ async fn run_subagent_inner(
 			empty_shell_attempts = 0;
 			messages.push(response_to_message(&response));
 			persist_subagent(
-				&session_dir,
-				&header,
+				session_dir,
+				header,
 				&SessionRecord::Assistant {
 					content: response.content.clone(),
 					thinking: response.thinking.clone(),
@@ -611,6 +931,14 @@ async fn run_subagent_inner(
 					subagent = %id,
 					"provider returned an empty response; retrying the round-trip"
 				);
+				continue;
+			}
+			// A steer that landed during the final assistant
+			// message would otherwise be dropped on the floor —
+			// give it another round-trip instead (the loop-top
+			// drain picks it up). Mirrors the parent runner's
+			// extra iteration for late steers.
+			if has_queued_subagent_steers(&id) {
 				continue;
 			}
 			let result_text = response.content.clone().unwrap_or_default();
@@ -648,7 +976,7 @@ async fn run_subagent_inner(
 				// `todo_write` mutates per-session state
 				// (`todos`), so it can't go through the stateless
 				// registry dispatch.
-				handle_subagent_todo_write(&mut todos, &args, &session_dir, &header).await
+				handle_subagent_todo_write(&mut todos, &args, session_dir, header).await
 			} else {
 				tools.dispatch(&call.function.name, &args, &cx, &cancel).await
 			};
@@ -673,8 +1001,8 @@ async fn run_subagent_inner(
 				content: content.clone(),
 			});
 			persist_subagent(
-				&session_dir,
-				&header,
+				session_dir,
+				header,
 				&SessionRecord::Tool {
 					tool_call_id: call.id.clone(),
 					tool_name: call.function.name.clone(),
@@ -699,8 +1027,8 @@ async fn run_subagent_inner(
 		inference,
 		sink,
 		spec,
-		&session_dir,
-		&header,
+		session_dir,
+		header,
 		&standard_model,
 		&pi_model,
 		&mut messages,
@@ -1046,7 +1374,7 @@ Read before you edit — don't invent file paths. Use `edit_file` for surgical c
 Return a single coherent text result when you finish. The parent will see only that string and a short transcript of your tool calls; do not address them as "you" or assume shared context.
 "#;
 
-fn build_subagent_system_prompt(mode: CoderMode, folder: &Arc<WorkspaceFolderEntry>, task: &str) -> String {
+pub(crate) fn build_subagent_system_prompt(mode: CoderMode, folder: &Arc<WorkspaceFolderEntry>, task: &str) -> String {
 	let base = match mode {
 		CoderMode::Research => RESEARCH_SYSTEM_PROMPT,
 		CoderMode::Agent => AGENT_SYSTEM_PROMPT,
@@ -1287,5 +1615,60 @@ mod tests {
 		assert!(prompt.contains("research sub-agent"));
 		assert!(prompt.contains("investigate auth flow"));
 		assert!(prompt.contains("/abs/path/to/proj"));
+	}
+
+	#[test]
+	fn steer_registry_queues_drains_and_rejects_after_unregister() {
+		let (sender, mut receiver) = tokio::sync::broadcast::channel(16);
+		let sink = FolderEventSink::new(sender, "/folder", "sess-parent");
+
+		// Unknown id → rejected, nothing emitted.
+		assert!(!queue_subagent_steer("sub-nope", "hello".into()));
+
+		register_subagent_steer_channel("sub-steer-test", sink, CancellationToken::new());
+		assert!(!has_queued_subagent_steers("sub-steer-test"));
+		assert!(queue_subagent_steer("sub-steer-test", "first".into()));
+		assert!(queue_subagent_steer("sub-steer-test", "second".into()));
+		assert!(has_queued_subagent_steers("sub-steer-test"));
+
+		// Queue-time emission: one wrapped queued UserMessage per steer.
+		for expected in ["first", "second"] {
+			let envelope = receiver.try_recv().unwrap();
+			let CoderEvent::SubagentEvent { subagent_id, inner } = envelope.event else {
+				panic!("expected SubagentEvent");
+			};
+			assert_eq!(subagent_id, "sub-steer-test");
+			let CoderEvent::UserMessage { text, queued, .. } = *inner else {
+				panic!("expected wrapped UserMessage");
+			};
+			assert_eq!(text, expected);
+			assert!(queued);
+		}
+
+		// Drain preserves queue order and empties the channel.
+		let drained = take_queued_subagent_steers("sub-steer-test");
+		assert_eq!(
+			drained.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+			vec!["first", "second"]
+		);
+		assert!(!has_queued_subagent_steers("sub-steer-test"));
+
+		// After the run settles, the channel is gone and steers bounce.
+		unregister_subagent_steer_channel("sub-steer-test");
+		assert!(!queue_subagent_steer("sub-steer-test", "too late".into()));
+
+		// Resume claim: no channel → registers one and hands back
+		// its token; a raced second claim queues a steer instead.
+		let sink = FolderEventSink::new(tokio::sync::broadcast::channel(16).0, "/folder", "sess-parent");
+		let token = claim_subagent_for_resume("sub-steer-test", "follow up", &sink).expect("claim should register");
+		assert!(claim_subagent_for_resume("sub-steer-test", "raced follow up", &sink).is_none());
+		assert!(has_queued_subagent_steers("sub-steer-test"));
+
+		// Per-sub-agent abort cancels the claimed token; after the
+		// channel is gone it's a no-op.
+		assert!(abort_subagent("sub-steer-test"));
+		assert!(token.is_cancelled());
+		unregister_subagent_steer_channel("sub-steer-test");
+		assert!(!abort_subagent("sub-steer-test"));
 	}
 }

@@ -3270,6 +3270,141 @@ impl CoderHandle {
 		})
 	}
 
+	/// Continue a sub-agent from the pop-out composer, by id
+	/// through the process-global steer registry (the sub-agent
+	/// runs deep inside its parent's tool dispatch, so there's no
+	/// session handle to go through).
+	///
+	/// - **Running** → mid-flight steer: the text queues, renders
+	///   as a muted row immediately, and drains into the
+	///   sub-agent's history at the top of its next iteration.
+	/// - **Finished** → resume: rebuild the history from the
+	///   sub-agent's JSONL and run a fresh detached loop with the
+	///   text as a follow-up user message. The parent agent is
+	///   deliberately not involved — its history still ends at the
+	///   original `task` tool result; follow-ups are user ↔
+	///   sub-agent only.
+	///
+	/// Returns `false` when there's nothing to continue (unknown
+	/// id, or no JSONL on disk); the panel keeps the draft.
+	pub async fn continue_subagent(&self, subagent_id: &str, text: String) -> Result<bool, CoderError> {
+		// Fast path: still running → steer.
+		if crate::subagent::queue_subagent_steer(subagent_id, text.clone()) {
+			return Ok(true);
+		}
+		sessions::validate_session_id(subagent_id)?;
+		let Some(folder) = self.state.coder_root_folder().await else {
+			return Err(CoderError::NoActiveFolder);
+		};
+		let folder_root = Utf8PathBuf::from(folder.folder.path.clone());
+		let slug_dir = sessions_dir(&self.state.coder_sessions_dir, &folder_root);
+		let Some(jsonl_path) = sessions::find_subagent_session(&slug_dir, subagent_id).await else {
+			return Ok(false);
+		};
+		let Some(session_dir) = jsonl_path.parent().map(Utf8Path::to_path_buf) else {
+			return Ok(false);
+		};
+		let LoadedSession { header, records, .. } = sessions::load(&session_dir, subagent_id).await?;
+		let (Some(parent_session_id), Some(parent_tool_call_id)) =
+			(header.parent_session_id.clone(), header.parent_tool_call_id.clone())
+		else {
+			// Not a sub-agent trace (or a pre-sub-agent schema);
+			// nothing to resume.
+			return Ok(false);
+		};
+		let mode = match header.subagent_mode.as_deref() {
+			Some(wire) => CoderMode::from_wire(wire)?,
+			None => CoderMode::Agent,
+		};
+		// The sub-agent's tools must land in the same folder they
+		// originally operated against; if that folder is no longer
+		// bound, refuse rather than silently retargeting.
+		let target = header
+			.subagent_target_folder
+			.clone()
+			.unwrap_or_else(|| header.cwd.clone());
+		let bound = self.state.workspaces.folders().await;
+		let Some(target_entry) = bound.iter().find(|f| f.folder.path == target).cloned() else {
+			return Err(CoderError::Internal(format!(
+				"sub-agent folder `{target}` is not bound — bind it to follow up with this sub-agent"
+			)));
+		};
+		let task = records
+			.iter()
+			.find_map(|r| match r {
+				SessionRecord::User { text, .. } => Some(text.clone()),
+				_ => None,
+			})
+			.unwrap_or_default();
+		let RebuiltMessages {
+			mut messages,
+			last_usage,
+			last_todos,
+		} = Self::rebuild_messages_from_records(&records);
+		// The rebuild seeds the parent's system prompt; swap in the
+		// sub-agent's own (mode + target folder + original task).
+		messages[0] = ChatMessage::System {
+			content: crate::subagent::build_subagent_system_prompt(mode, &target_entry, &task),
+		};
+		let spec = crate::subagent::Subagent {
+			id: subagent_id.to_string(),
+			parent_session_id: parent_session_id.clone(),
+			parent_tool_call_id,
+			parent_folder: folder_root.clone(),
+			task,
+			system_prompt_override: None,
+			mode,
+			folder: target_entry,
+		};
+		// Events land in the parent session's UI bucket, same as
+		// the original run.
+		let sink = FolderEventSink::new(self.state.events.clone(), folder_root.to_string(), parent_session_id);
+		let Some(cancel) = crate::subagent::claim_subagent_for_resume(subagent_id, &text, &sink) else {
+			// Raced with a live run — the text went in as an
+			// ordinary steer instead.
+			return Ok(true);
+		};
+		let resume = crate::subagent::SubagentResume {
+			spec,
+			session_dir,
+			header,
+			messages,
+			last_usage,
+			todos: last_todos,
+			follow_up: text,
+		};
+		let state = self.state.clone();
+		let subagent_id = subagent_id.to_string();
+		tokio::spawn(async move {
+			let outcome =
+				crate::subagent::resume_subagent(&state.tools, &state.inference, &sink, &state.models, resume, cancel).await;
+			if let Err(err) = outcome {
+				// The pop-out's card already flipped to `error` via
+				// `SubagentFinished`; surface the message inside
+				// the transcript too (there's no parent tool result
+				// to carry it on a user-driven resume).
+				if !matches!(err, CoderError::Aborted) {
+					sink.send(CoderEvent::SubagentEvent {
+						subagent_id: subagent_id.clone(),
+						inner: Box::new(CoderEvent::Error {
+							message: err.to_string(),
+						}),
+					});
+				}
+				tracing::warn!(%err, subagent = %subagent_id, "resumed sub-agent ended with error");
+			}
+		});
+		Ok(true)
+	}
+
+	/// Cancel one running sub-agent's own token — the pop-out's
+	/// stop button. Never propagates to the parent turn or sibling
+	/// sub-agents. Returns `false` when nothing is running under
+	/// that id.
+	pub fn abort_subagent(&self, subagent_id: &str) -> bool {
+		crate::subagent::abort_subagent(subagent_id)
+	}
+
 	/// Resolve an in-flight `ask_user` prompt on the active
 	/// folder's visible session with the user's structured answer.
 	///
@@ -7501,7 +7636,7 @@ fn parse_tool_args(call: &FunctionCall) -> Value {
 	})
 }
 
-fn new_message_id() -> String {
+pub(crate) fn new_message_id() -> String {
 	// 64-bit nanosecond timestamp suffices for a single-process
 	// session — collisions would require two events in the same
 	// nanosecond, which can't happen on the loop's single-threaded

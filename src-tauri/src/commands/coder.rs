@@ -251,6 +251,32 @@ pub async fn coder_unqueue_steer(state: State<'_, AppState>, id: String) -> Resu
 	Ok(state.coder.unqueue_steer(&id).await)
 }
 
+/// Send a message to a sub-agent from the pop-out composer.
+/// Running → queues a mid-flight steer (the queued row lands via a
+/// wrapped `user_message` event; the text reaches the model at the
+/// sub-agent's next iteration top). Finished → resumes the
+/// sub-agent with the text as a follow-up user message, without
+/// involving the parent agent. Returns `false` when there's
+/// nothing to continue (unknown id / no transcript on disk) — the
+/// panel keeps the draft.
+#[tauri::command]
+pub async fn coder_continue_subagent(
+	state: State<'_, AppState>,
+	subagent_id: String,
+	text: String,
+) -> Result<bool, MoonError> {
+	Ok(state.coder.continue_subagent(&subagent_id, text).await?)
+}
+
+/// Stop one running sub-agent (the pop-out's stop button). Cancels
+/// only that sub-agent's token — the parent turn and sibling
+/// sub-agents keep running. Returns `false` when nothing is
+/// running under that id.
+#[tauri::command]
+pub fn coder_abort_subagent(state: State<'_, AppState>, subagent_id: String) -> Result<bool, MoonError> {
+	Ok(state.coder.abort_subagent(&subagent_id))
+}
+
 /// Resolve an in-flight `ask_user` prompt on the active folder's
 /// visible session with the user's structured per-question answers.
 /// `call_id` is the tool-call id the panel saw on the prompt's
