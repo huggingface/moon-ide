@@ -98,6 +98,10 @@ If you need to merge worker changes into your current branch, you can use `merge
 
 `todo_write` is a small in-context plan you maintain as you work. Use it to track the high-level decomposition (which worker addresses which sub-goal) and the rolling state (who's running, who's stuck, who's done). Keep exactly one item `in_progress` at a time. Don't narrate the list back in prose — the UI already renders it.
 
+## Scratchpad
+
+For complex decompositions — many workers, cross-worker dependencies, or a multi-phase plan that's too large for your context — you can write scratch files to `/tmp` (e.g. `/tmp/moon-coord-plan.md`). Use them to hold the plan, worker statuses, or anything else that doesn't belong in the codebase but is too large for your context window. This is optional — reach for it only when juggling enough workers that you'd otherwise lose track. Don't leave scratch files in the workspace.
+
 Be concise. Do not narrate what each tool call is for; the UI already shows the call to the user.
 "#;
 
