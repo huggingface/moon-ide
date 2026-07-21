@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { Text } from '@codemirror/state';
 
-import { enclosingSymbol } from './diffCollapseContext';
+import { enclosingStack, enclosingSymbol } from './diffCollapseContext';
 
 // `fromLine` is 1-based and points at the first *visible* line after
 // the collapsed region — the same value the view plugin computes
@@ -65,5 +65,55 @@ describe('enclosingSymbol', () => {
 	it('handles arrow-function property assignments', () => {
 		const src = ['const obj = {', '\thandler: (e) => {', '\t\tprocess(e);', '\t\tlog(e);', '\t},', '};'].join('\n');
 		expect(symbolAfter(src, 4)).toBe('handler: (e) =>');
+	});
+});
+
+// The sticky-scroll header consumes the full chain, outermost first.
+function stackAfter(src: string, fromLine: number) {
+	return enclosingStack(Text.of(src.split('\n')), fromLine);
+}
+
+describe('enclosingStack', () => {
+	it('returns the full chain outermost-first with line numbers', () => {
+		const src = [
+			'class Widget {',
+			'\trender() {',
+			'\t\tconst items = list.map((x) => {',
+			'\t\t\treturn x + 1;',
+			'\t\t});',
+			'\t}',
+			'}',
+		].join('\n');
+		expect(stackAfter(src, 4)).toEqual([
+			{ line: 1, label: 'class Widget' },
+			{ line: 2, label: 'render()' },
+		]);
+	});
+
+	it('is empty for top-level code', () => {
+		const src = ['const a = 1;', 'const b = 2;'].join('\n');
+		expect(stackAfter(src, 2)).toEqual([]);
+	});
+
+	it('skips control flow but keeps climbing to outer scopes', () => {
+		const src = [
+			'impl Foo {',
+			'\tpub fn bar(&self) -> u32 {',
+			'\t\tif cond {',
+			'\t\t\tdo_thing();',
+			'\t\t}',
+			'\t}',
+			'}',
+		].join('\n');
+		expect(stackAfter(src, 4)).toEqual([
+			{ line: 1, label: 'impl Foo' },
+			{ line: 2, label: 'pub fn bar(&self) -> u32' },
+		]);
+	});
+
+	it('agrees with enclosingSymbol on the innermost entry', () => {
+		const src = ['class A {', '\tmethod() {', '\t\twork();', '\t}', '}'].join('\n');
+		const stack = stackAfter(src, 3);
+		expect(stack[stack.length - 1]?.label).toBe(symbolAfter(src, 3));
 	});
 });

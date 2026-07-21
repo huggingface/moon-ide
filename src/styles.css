@@ -702,6 +702,58 @@ button:focus-visible {
 .cm-collapsedLines:has(.cm-collapseContext)::after {
 	content: none;
 }
+/* Sticky enclosing-scope header (editor/stickyScroll.ts) — VS Code's
+   "sticky scroll". A zero-height sticky wrapper prepended to
+   `.cm-editor`; the rows overlay the top of whichever container
+   actually scrolls (`.cm-scroller` in the editor, `.cm-mergeView`
+   in the diff view). z-index sits above the gutters (200) and below
+   `.cm-panels` (300). Font family/size inherit from the `.cm-editor`
+   theme block; row line-height and the gutter-mirroring number
+   column are set inline from live measurements. */
+.cm-stickyScroll {
+	position: sticky;
+	top: 0;
+	height: 0;
+	flex: none;
+	z-index: 250;
+}
+.cm-stickyScroll-rows {
+	position: absolute;
+	top: 0;
+	left: 0;
+	right: 0;
+	overflow: hidden;
+	background: var(--m-editor-bg);
+	border-bottom: 1px solid var(--m-border);
+	box-shadow: 0 2px 6px color-mix(in srgb, #000 14%, transparent);
+}
+.cm-stickyScroll-row {
+	display: flex;
+	white-space: pre;
+	overflow: hidden;
+	cursor: pointer;
+}
+.cm-stickyScroll-row:hover {
+	background: var(--m-editor-line-active);
+}
+.cm-stickyScroll-num {
+	flex: none;
+	box-sizing: border-box;
+	text-align: right;
+	color: var(--m-fg-subtle);
+	border-right: 1px solid var(--m-border);
+	background: var(--m-editor-bg);
+}
+/* `.cm-line` supplies CM's own horizontal padding so columns align
+   with real document lines; it also carries `flex-basis: 100%` in
+   wrapped mode, hence the explicit shrink-friendly sizing. */
+.cm-stickyScroll-code {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: pre;
+}
 /* Per-block "Accept current / incoming / both" toolbar widget,
    anchored at end-of-line on the opening `<<<<<<<`. Inline-block
    so the marker line's text reflow stays sane on narrow widths;

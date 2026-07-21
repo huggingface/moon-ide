@@ -74,23 +74,30 @@ function indentOf(text: string): number {
 	return n;
 }
 
+/** One enclosing definition: its 1-based line number plus the
+ *  compact label `summarise` produced from the signature. */
+export interface EnclosingDef {
+	line: number;
+	label: string;
+}
+
 /**
- * Walk upward from `fromLine` (1-based, the first visible line
- * *after* the collapsed region) looking for the nearest enclosing
- * definition: the closest preceding line that looks like a
- * definition and sits at a strictly smaller indent than the line
- * the fold gives way to. Returns the trimmed signature, or `null`
- * when nothing convincing is found.
+ * Walk upward from `fromLine` (1-based) collecting the full chain of
+ * enclosing definitions: at each step, the closest preceding line
+ * that looks like a definition and sits at a strictly smaller indent
+ * than everything accepted so far. Returns outermost-first (so
+ * `class Foo` precedes `method bar()`); empty when the reference
+ * line is top-level or nothing convincing is found.
  */
-export function enclosingSymbol(doc: Text, fromLine: number): string | null {
+export function enclosingStack(doc: Text, fromLine: number): EnclosingDef[] {
 	if (fromLine < 1 || fromLine > doc.lines) {
-		return null;
+		return [];
 	}
 	// Reference indent: the indent of the first non-blank line at or
-	// after the fold. The enclosing scope must be shallower than
-	// this. Using the post-fold line (rather than the fold's own
-	// lines) matches GitHub: the label describes the code you're
-	// about to read.
+	// after `fromLine`. The enclosing scopes must be shallower than
+	// this. Using the following line (rather than a blank line's own
+	// zero indent) matches GitHub: the label describes the code
+	// you're about to read.
 	let refIndent = -1;
 	for (let n = fromLine; n <= doc.lines; n++) {
 		const text = doc.line(n).text;
@@ -100,11 +107,11 @@ export function enclosingSymbol(doc: Text, fromLine: number): string | null {
 		}
 	}
 	if (refIndent <= 0) {
-		// Top-level code after the fold has no enclosing scope to
-		// name, and a negative ref means the rest of the doc is
-		// blank.
-		return null;
+		// A top-level reference line has no enclosing scope to name,
+		// and a negative ref means the rest of the doc is blank.
+		return [];
 	}
+	const found: EnclosingDef[] = [];
 	let bestIndent = refIndent;
 	// Bound the climb so a pathological file can't make this O(doc).
 	const limit = Math.max(1, fromLine - 4000);
@@ -119,18 +126,29 @@ export function enclosingSymbol(doc: Text, fromLine: number): string | null {
 			continue;
 		}
 		if (looksLikeDefinition(trimmed)) {
-			return summarise(trimmed);
+			found.push({ line: n, label: summarise(trimmed) });
 		}
-		// Tighten the bar: once we step out to a shallower indent
-		// that *isn't* a definition (e.g. a bare `{` continuation or
-		// an attribute), keep climbing but never re-accept a deeper
-		// line.
+		// Tighten the bar: every accepted definition — and every
+		// shallower line that *isn't* one (e.g. a bare `{`
+		// continuation or an attribute) — lowers the indent ceiling,
+		// so we never re-accept a deeper line.
 		bestIndent = indent;
 		if (bestIndent === 0) {
 			break;
 		}
 	}
-	return null;
+	return found.toReversed();
+}
+
+/**
+ * Innermost enclosing definition for `fromLine` (1-based, the first
+ * visible line *after* a collapsed region). Returns the trimmed
+ * signature, or `null` when nothing convincing is found.
+ */
+export function enclosingSymbol(doc: Text, fromLine: number): string | null {
+	const stack = enclosingStack(doc, fromLine);
+	const innermost = stack[stack.length - 1];
+	return innermost === undefined ? null : innermost.label;
 }
 
 // Trim a signature to a compact label: drop a trailing opening

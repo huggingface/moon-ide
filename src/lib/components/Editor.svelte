@@ -15,6 +15,7 @@
 	} from '@codemirror/commands';
 	import { searchKeymap, highlightSelectionMatches } from '@codemirror/search';
 	import { searchAsYouType } from '../editor/searchAsYouType';
+	import { stickyScrollExtension } from '../editor/stickyScroll';
 	import { bracketMatching, foldGutter, indentOnInput, indentUnit } from '@codemirror/language';
 	import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from '@codemirror/autocomplete';
 	import {
@@ -605,6 +606,9 @@
 			// so `searchKeymap`'s `openSearchPanel` uses our custom
 			// panel rather than auto-enabling the default `search()`.
 			searchAsYouType(),
+			// Sticky enclosing-scope header (VS Code's "sticky
+			// scroll") — see `editor/stickyScroll.ts`.
+			stickyScrollExtension,
 			// Deleted-file tabs (working-tree copy gone, `file.text`
 			// holds the HEAD blob captured at open time) land in the
 			// regular Editor when the user clicked their row in the

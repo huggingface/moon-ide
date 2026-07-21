@@ -12,6 +12,7 @@
 	} from '@codemirror/commands';
 	import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
 	import { searchAsYouType } from '../editor/searchAsYouType';
+	import { stickyScrollExtension } from '../editor/stickyScroll';
 	import { bracketMatching, foldGutter, indentOnInput, indentUnit } from '@codemirror/language';
 	import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from '@codemirror/autocomplete';
 	import { MergeView, diff as rawDiff, goToNextChunk, goToPreviousChunk } from '@codemirror/merge';
@@ -324,6 +325,10 @@
 			highlightSelectionMatches(),
 			searchAsYouType(),
 			highlightTabs(),
+			// Sticky enclosing-scope header, one per pane. The plugin
+			// detects that `.cm-mergeView` (not the pane's scroller)
+			// owns vertical scroll — see `editor/stickyScroll.ts`.
+			stickyScrollExtension,
 			themeA.of(moonEditorTheme(workspace.effectiveTheme)),
 			langA.of(lang),
 			ecA.of(editorConfigExtensions(ec)),
@@ -475,6 +480,8 @@
 			highlightSelectionMatches(),
 			searchAsYouType(),
 			highlightTabs(),
+			// Same sticky enclosing-scope header as the left pane.
+			stickyScrollExtension,
 			...gitChangeExtensions,
 			...blameExtensions,
 			...lspExtensions,
