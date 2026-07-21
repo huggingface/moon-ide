@@ -844,6 +844,66 @@ class CompanionState {
 		}
 	}
 
+	/** 0-based ordinal of a user row among all non-queued user rows
+	 * — the backend's `User`-record count matches this (same walk
+	 * as the desktop's `#userOrdinalForRow`). */
+	#userOrdinal(rowId: string): number | null {
+		let ordinal = 0;
+		for (const row of this.rows) {
+			if (row.kind !== 'user' || row.queued) {
+				continue;
+			}
+			if (row.id === rowId) {
+				return ordinal;
+			}
+			ordinal += 1;
+		}
+		return null;
+	}
+
+	/** Revert the open session to just before the user message with
+	 * `rowId` (dropping it and everything after from disk), repaint
+	 * the transcript from the truncated JSONL, and return the
+	 * dropped prompt text so the caller can seed the composer
+	 * ("edit & resend") or re-send it verbatim ("replay"). Refused
+	 * by the backend mid-turn; the UI hides the affordance while
+	 * busy. */
+	async revertToMessage(rowId: string): Promise<string | null> {
+		if (!this.activeWorkspace || !this.activeSession || this.busy) {
+			return null;
+		}
+		const ordinal = this.#userOrdinal(rowId);
+		if (ordinal === null) {
+			return null;
+		}
+		const sessionId = this.activeSession;
+		try {
+			const reverted = await this.#call<{ text: string }>(
+				this.activeWorkspace,
+				'coder_revert_to_message',
+				{ session_id: sessionId, user_ordinal: ordinal },
+				this.activeIde,
+			);
+			// Repaint from the truncated JSONL.
+			this.rows = [];
+			await this.#openAndReplay(sessionId);
+			return reverted.text;
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+			return null;
+		}
+	}
+
+	/** Replay from the user message with `rowId`: revert to just
+	 * before it, then immediately re-send the dropped prompt
+	 * verbatim — "re-run this turn". */
+	async replayFromMessage(rowId: string): Promise<void> {
+		const text = await this.revertToMessage(rowId);
+		if (text !== null && text.trim()) {
+			await this.sendPrompt(text);
+		}
+	}
+
 	/** Abort the open session's running turn. */
 	async abort(): Promise<void> {
 		if (!this.activeWorkspace || !this.activeSession) {

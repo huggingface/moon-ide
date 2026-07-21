@@ -227,6 +227,13 @@ requested surface:
   the fast model, same prompt as the desktop's SCM panel) lets the
   phone commit changes. All folder-targeted, reusing the same
   `WorkspaceHost` git methods the desktop uses.
+- **Edit & resend / replay.** Tapping a user bubble (idle sessions
+  only) reveals two chips: _Edit & resend_ truncates the session to
+  just before that message and drops the text back into the
+  composer; _Replay_ truncates and re-sends the same prompt
+  verbatim. Backed by a session-targeted `coder_revert_to_message`
+  (the desktop's visible session and panel are untouched; the phone
+  repaints via observe-open).
 - **Provider switch.** The workspace view surfaces the active LLM
   provider (HF or a configured user provider) with the per-workspace
   lock toggle, via `coder_get_model_settings` /

@@ -2055,6 +2055,53 @@ impl CoderHandle {
 		})
 	}
 
+	/// Session-targeted [`Self::revert_to_message`] for the phone
+	/// (bridge RPC). Resolves the runtime by `session_id` instead of
+	/// the desktop's visible pointer, and reloads through the
+	/// observe path (`focus = false`) so the desktop's panel and
+	/// visible-session pointer are untouched. The phone re-opens the
+	/// session afterwards (`coder_open_session`) to repaint its
+	/// transcript from the truncated JSONL.
+	pub async fn revert_to_message_in(
+		&self,
+		session_id: &str,
+		user_ordinal: usize,
+	) -> Result<RevertedMessage, CoderError> {
+		let (rt, folder_path) = self
+			.state
+			.runtime_for_session(session_id)
+			.await
+			.ok_or_else(|| CoderError::Internal(format!("session `{session_id}` is not mounted")))?;
+		// Refuse mid-turn — same guard as the desktop path.
+		{
+			let turn = rt.turn.lock().await;
+			if turn.cancel.is_some() {
+				return Err(CoderError::Internal(
+					"cannot revert while a turn is running; stop it first".into(),
+				));
+			}
+		}
+		let header = rt.session.lock().await.header.clone();
+		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
+		let reverted = sessions::truncate_before_user_record(&dir, &header, user_ordinal).await?;
+
+		// Drop the mounted runtime so the reload rebuilds from the
+		// now-shorter JSONL, then remount via the observe path (no
+		// visible steal, no broadcast).
+		{
+			let (fs, _) = self.state.folder_session_or_active(Some(folder_path.as_str())).await?;
+			fs.runtimes.write().await.remove(session_id);
+		}
+		self
+			.open_session_impl(Some(folder_path.as_str()), session_id.to_owned(), false)
+			.await?;
+
+		Ok(RevertedMessage {
+			text: reverted.dropped_text,
+			images: reverted.dropped_images,
+		})
+	}
+
 	/// Replay from a specific user message: truncate the
 	/// session to just before that message (exactly
 	/// [`revert_to_message`]) and immediately re-send the dropped

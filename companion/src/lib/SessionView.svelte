@@ -5,6 +5,27 @@
 
 	let draft = $state('');
 
+	// User-row id whose action chips (edit & resend / replay) are
+	// showing. Tap a user bubble to toggle; any action clears it.
+	let actionsFor = $state<string | null>(null);
+
+	function toggleActions(rowId: string): void {
+		actionsFor = actionsFor === rowId ? null : rowId;
+	}
+
+	async function editAndResend(rowId: string): Promise<void> {
+		actionsFor = null;
+		const text = await app.revertToMessage(rowId);
+		if (text !== null) {
+			draft = text;
+		}
+	}
+
+	async function replayFrom(rowId: string): Promise<void> {
+		actionsFor = null;
+		await app.replayFromMessage(rowId);
+	}
+
 	// Per-question answer state for the active ask_user prompt.
 	// Map of questionId → { selected: Set<string>, freeText: string }
 	let answers = $state<Record<string, { selected: Set<string>; freeText: string }>>({});
@@ -451,10 +472,38 @@
 		{/if}
 		{#each windowedRows as row (row.kind + row.id)}
 			{#if row.kind === 'user'}
-				<div class="bubble user" class:queued={row.queued}>
+				<div
+					class="bubble user"
+					class:queued={row.queued}
+					class:actionable={!app.busy && !row.queued}
+					role="button"
+					tabindex="0"
+					onclick={() => toggleActions(row.id)}
+					onkeydown={(e) => {
+						if (e.key === 'Enter' || e.key === ' ') {
+							e.preventDefault();
+							toggleActions(row.id);
+						}
+					}}
+				>
 					{row.text}
 					{#if row.queued}<span class="queued-tag">queued</span>{/if}
 				</div>
+				{#if actionsFor === row.id && !app.busy && !row.queued}
+					<div class="user-actions">
+						<button
+							class="ghost action-chip"
+							onclick={() => editAndResend(row.id)}
+							title="Drop this message and everything after it; put the text back in the composer"
+							>✎ Edit & resend</button
+						>
+						<button
+							class="ghost action-chip"
+							onclick={() => replayFrom(row.id)}
+							title="Drop this message and everything after it, then re-send the same prompt">↻ Replay</button
+						>
+					</div>
+				{/if}
 			{:else if row.kind === 'assistant'}
 				{#if row.thinking}
 					<details class="thinking">
@@ -672,6 +721,21 @@
 	}
 	.bubble.user.queued {
 		opacity: 0.6;
+	}
+	.bubble.user.actionable {
+		cursor: pointer;
+	}
+	.user-actions {
+		display: flex;
+		gap: 0.4rem;
+		justify-content: flex-end;
+		margin-top: -0.2rem;
+	}
+	.action-chip {
+		font-size: 0.75rem;
+		padding: 0.25rem 0.6rem;
+		border: 1px solid var(--border);
+		border-radius: 999px;
 	}
 	.queued-tag {
 		font-size: 0.7rem;

@@ -156,6 +156,20 @@ impl BridgeRpcHandler for BridgeRpc {
 				}
 				Ok(Value::Null)
 			}
+			// Truncate a session to just before the `user_ordinal`-th
+			// user message and return the dropped prompt text — the
+			// phone's "edit & resend" / "replay" gesture. Session-
+			// targeted; the desktop's visible session is untouched.
+			// The phone re-opens the session afterwards to repaint.
+			"coder_revert_to_message" => {
+				let p: RevertParams = parse_params(params)?;
+				let reverted = self
+					.coder
+					.revert_to_message_in(&p.session_id, p.user_ordinal)
+					.await
+					.map_err(|e| e.to_string())?;
+				Ok(serde_json::json!({ "text": reverted.text }))
+			}
 			"coder_abort" => {
 				let p: AbortParams = parse_params(params)?;
 				match p.session_id {
@@ -440,6 +454,12 @@ struct WorkspaceLaunchParams {
 }
 
 #[derive(serde::Deserialize)]
+struct RevertParams {
+	session_id: String,
+	user_ordinal: usize,
+}
+
+#[derive(serde::Deserialize)]
 struct ScmCommitParams {
 	#[serde(default)]
 	message: String,
@@ -477,6 +497,7 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 	"coder_new_coordinator_session",
 	"coder_delete_session",
 	"coder_respond_to_prompt",
+	"coder_revert_to_message",
 	"coder_get_model_settings",
 	"coder_set_model_settings",
 	"workspace_launch",
