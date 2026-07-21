@@ -230,6 +230,36 @@ impl Workspace {
 		&self.bound_folders
 	}
 
+	/// The bound-folder set the compose state on disk was last
+	/// emitted from (`bound-folders.json`, written by
+	/// [`Workspace::write_state`]). When the dev container is
+	/// `Running`, this is the set of folders it actually
+	/// bind-mounts — a folder bound to the workspace *after* the
+	/// container came up (e.g. via the coordinator's `init_repo` /
+	/// `clone_repo` tools) is in the registry's set but not here,
+	/// and container-routed subprocesses would land in a cwd that
+	/// doesn't exist. Callers use this to fall back to host routing
+	/// for such folders.
+	///
+	/// Empty when the file is missing or unreadable — the safe
+	/// direction, since host routing always works.
+	pub async fn applied_bound_folders(&self) -> Vec<Utf8PathBuf> {
+		let Ok(text) = tokio::fs::read_to_string(self.bound_folders_path.as_std_path()).await else {
+			return Vec::new();
+		};
+		#[derive(serde::Deserialize)]
+		struct BoundFolders {
+			folders: Vec<String>,
+		}
+		match serde_json::from_str::<BoundFolders>(&text) {
+			Ok(parsed) => parsed.folders.into_iter().map(Utf8PathBuf::from).collect(),
+			Err(err) => {
+				tracing::warn!(%err, path = %self.bound_folders_path, "could not parse bound-folders.json; treating as empty");
+				Vec::new()
+			}
+		}
+	}
+
 	/// True iff `<state_dir>/compose.yaml` exists. Doesn't say
 	/// anything about whether the containers are up.
 	pub fn is_initialized(&self) -> bool {
@@ -1429,6 +1459,29 @@ mod tests {
 			.await
 			.unwrap();
 		assert!(bound_json.contains(folder.as_str()));
+	}
+
+	#[tokio::test]
+	async fn applied_bound_folders_round_trips_write_state() {
+		let tmp = tempfile::tempdir().unwrap();
+		let state_dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let folder = Utf8PathBuf::from("/home/me/code/moon-landing");
+		let ws = workspace_in(state_dir.clone(), vec![folder.clone()]);
+
+		// Nothing emitted yet → empty (safe host-routing direction).
+		assert!(ws.applied_bound_folders().await.is_empty());
+
+		ws.write_state(DEFAULT_DEV_IMAGE).await.unwrap();
+		assert_eq!(ws.applied_bound_folders().await, vec![folder.clone()]);
+
+		// A registry set that grew after the emit isn't reflected —
+		// that's the point: the file records what the compose state
+		// (and thus a running container's mounts) was built from.
+		let grown = workspace_in(
+			state_dir,
+			vec![folder.clone(), Utf8PathBuf::from("/home/me/code/new-repo")],
+		);
+		assert_eq!(grown.applied_bound_folders().await, vec![folder]);
 	}
 
 	#[tokio::test]

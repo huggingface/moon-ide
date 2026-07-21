@@ -215,10 +215,17 @@ impl WorkspaceRegistry {
 		true
 	}
 
-	/// Remove the folder at `path`. If it was active, the
-	/// previous folder in insertion order takes over (or the new first,
-	/// if index 0 was removed); when no folders remain the workspace
-	/// is empty and `active_folder` is `None`.
+	/// Remove the folder at `path`, cascading to any worktree
+	/// folders that ride it (ADR 0029: a worktree's checkout lives
+	/// *inside* the parent repo, so a worktree row without its
+	/// parent is an orphan — nothing else can reach it). Disk is
+	/// untouched; re-adding the parent later brings the worktrees'
+	/// checkouts back with it.
+	///
+	/// If the active folder was removed (directly or via the
+	/// cascade), the entry before it in insertion order takes over
+	/// (or the new first); when no folders remain the workspace is
+	/// empty and `active_folder` is `None`.
 	pub async fn remove_folder(&self, path: &str) -> MoonResult<()> {
 		let mut inner = self.inner.write().await;
 		let pos = inner
@@ -226,9 +233,18 @@ impl WorkspaceRegistry {
 			.iter()
 			.position(|e| e.folder.path == path)
 			.ok_or_else(|| MoonError::NotFound(format!("folder {path}")))?;
-		inner.folders.remove(pos);
-		if inner.active_folder_path.as_deref() == Some(path) {
-			let new_idx = pos.saturating_sub(1);
+		inner.folders.retain(|e| {
+			if e.folder.path == path {
+				return false;
+			}
+			!matches!(&e.folder.origin, FolderOrigin::Worktree { parent_path, .. } if parent_path == path)
+		});
+		let active_still_bound = inner
+			.active_folder_path
+			.as_deref()
+			.is_some_and(|active| inner.folders.iter().any(|e| e.folder.path == active));
+		if !active_still_bound {
+			let new_idx = pos.saturating_sub(1).min(inner.folders.len().saturating_sub(1));
 			inner.active_folder_path = inner.folders.get(new_idx).map(|e| e.folder.path.clone());
 		}
 		Ok(())
@@ -391,6 +407,35 @@ mod tests {
 			&wt_entry.folder.origin,
 			FolderOrigin::Worktree { branch, .. } if branch == "moon/agent-1"
 		));
+	}
+
+	#[tokio::test]
+	async fn remove_folder_cascades_to_its_worktrees() {
+		let parent = TempDir::new().unwrap();
+		let wt = TempDir::new().unwrap();
+		let other = TempDir::new().unwrap();
+		let parent_path = Utf8PathBuf::from_path_buf(parent.path().to_path_buf()).unwrap();
+		let wt_path = Utf8PathBuf::from_path_buf(wt.path().to_path_buf()).unwrap();
+		let other_path = Utf8PathBuf::from_path_buf(other.path().to_path_buf()).unwrap();
+
+		let registry = test_registry();
+		let other_entry = registry.add_folder(other_path).await.unwrap();
+		let parent_entry = registry.add_folder(parent_path).await.unwrap();
+		registry
+			.add_worktree_folder(wt_path, parent_entry.folder.path.clone(), "moon/agent-1".into())
+			.await
+			.unwrap();
+		assert_eq!(registry.snapshot().await.folders.len(), 3);
+
+		// Removing the parent unbinds its worktree too — a worktree
+		// row without its parent is an orphan in the folder bar.
+		registry.remove_folder(&parent_entry.folder.path).await.unwrap();
+		let snap = registry.snapshot().await;
+		assert_eq!(snap.folders.len(), 1);
+		assert_eq!(snap.folders[0].path, other_entry.folder.path);
+		// The active pointer (was the parent) fell back to a
+		// still-bound folder, not the removed worktree.
+		assert_eq!(snap.active_folder.as_deref(), Some(other_entry.folder.path.as_str()));
 	}
 
 	#[tokio::test]

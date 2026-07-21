@@ -747,9 +747,11 @@ impl ToolRegistry {
 	/// `force_host` is the per-session override: when set, this
 	/// always reports `false` (host mode) so the system prompt
 	/// advertises host paths consistently with where `bash` will
-	/// actually run.
-	pub async fn bash_target_is_container(&self, force_host: bool) -> bool {
-		resolve_bash_target(&self.workspaces, &self.workspaces_dir, force_host).await == BASH_TARGET_CONTAINER
+	/// actually run. `folder` is the session's bound folder — a
+	/// folder the running container doesn't mount reports `false`
+	/// too, matching the bash tool's host fallback.
+	pub async fn bash_target_is_container(&self, force_host: bool, folder: &WorkspaceFolderEntry) -> bool {
+		resolve_bash_target(&self.workspaces, &self.workspaces_dir, force_host, folder).await == BASH_TARGET_CONTAINER
 	}
 
 	/// Build a [`ToolContext`] from the workspace's current active
@@ -1273,7 +1275,7 @@ impl ToolRegistry {
 		if config.runs != moon_protocol::coder_mcp::McpRunTarget::Container {
 			return McpSpawnTarget::Host { cwd: host_cwd };
 		}
-		let target = resolve_bash_target(&self.workspaces, &self.workspaces_dir, cx.force_host_bash).await;
+		let target = resolve_bash_target(&self.workspaces, &self.workspaces_dir, cx.force_host_bash, &cx.folder).await;
 		if target != BASH_TARGET_CONTAINER {
 			return McpSpawnTarget::Host { cwd: host_cwd };
 		}
@@ -1807,7 +1809,7 @@ impl ToolRegistry {
 		cmd: &str,
 		force_host: bool,
 	) -> Result<(tokio::process::Command, &'static str), CoderError> {
-		let target = resolve_bash_target(&self.workspaces, &self.workspaces_dir, force_host).await;
+		let target = resolve_bash_target(&self.workspaces, &self.workspaces_dir, force_host, folder).await;
 		if target == BASH_TARGET_CONTAINER {
 			let workspace_id = self.workspaces.workspace_id().await;
 			let container_name = container_name_for_workspace(&workspace_id);
@@ -1850,7 +1852,8 @@ impl ToolRegistry {
 	/// agent that `ls`'d `/etc` via `bash` and then `read_file`'d
 	/// `/etc/hosts` reaches the same filesystem both times.
 	async fn oow_target_is_container(&self, cx: &ToolContext) -> bool {
-		resolve_bash_target(&self.workspaces, &self.workspaces_dir, cx.force_host_bash).await == BASH_TARGET_CONTAINER
+		resolve_bash_target(&self.workspaces, &self.workspaces_dir, cx.force_host_bash, &cx.folder).await
+			== BASH_TARGET_CONTAINER
 	}
 
 	/// `docker exec` (no TTY) against the workspace shell container,
@@ -2185,10 +2188,37 @@ pub(crate) async fn resolve_bash_target(
 	workspaces: &WorkspaceRegistry,
 	workspaces_dir: &Utf8Path,
 	force_host: bool,
+	folder: &WorkspaceFolderEntry,
 ) -> &'static str {
 	if force_host {
 		return BASH_TARGET_HOST;
 	}
+	let Some(applied) = running_container_applied_folders(workspaces, workspaces_dir).await else {
+		return BASH_TARGET_HOST;
+	};
+	// The container only mounts the folders its compose state was
+	// emitted from. A folder bound *after* the container came up
+	// (coordinator `init_repo` / `clone_repo`) isn't mounted —
+	// container-routed commands would land in a cwd that doesn't
+	// exist. Route those to the host until the container is
+	// re-synced. Worktree folders ride their parent's mount.
+	let mount_root = moon_core::worktree::effective_mount_root(&folder.folder);
+	if applied.iter().any(|p| p.as_str() == mount_root) {
+		BASH_TARGET_CONTAINER
+	} else {
+		BASH_TARGET_HOST
+	}
+}
+
+/// When the workspace shell container is `Running`, return the
+/// bound-folder set its compose state was emitted from (the folders
+/// it actually mounts). `None` when there's no running container —
+/// config unavailable, status probe failed, or any state other than
+/// `Running` — so callers collapse to host routing.
+pub(crate) async fn running_container_applied_folders(
+	workspaces: &WorkspaceRegistry,
+	workspaces_dir: &Utf8Path,
+) -> Option<Vec<Utf8PathBuf>> {
 	let workspace_id = workspaces.workspace_id().await;
 	let bound: Vec<Utf8PathBuf> = workspaces
 		.folders()
@@ -2203,16 +2233,16 @@ pub(crate) async fn resolve_bash_target(
 	}) {
 		Ok(ws) => ws,
 		Err(err) => {
-			tracing::debug!(%err, "coder: container config unavailable, routing bash to host");
-			return BASH_TARGET_HOST;
+			tracing::debug!(%err, "coder: container config unavailable, routing to host");
+			return None;
 		}
 	};
 	match ws.status().await {
-		Ok(status) if matches!(status.state, ContainerState::Running) => BASH_TARGET_CONTAINER,
-		Ok(_) => BASH_TARGET_HOST,
+		Ok(status) if matches!(status.state, ContainerState::Running) => Some(ws.applied_bound_folders().await),
+		Ok(_) => None,
 		Err(err) => {
-			tracing::debug!(%err, "coder: container status query failed, routing bash to host");
-			BASH_TARGET_HOST
+			tracing::debug!(%err, "coder: container status query failed, routing to host");
+			None
 		}
 	}
 }

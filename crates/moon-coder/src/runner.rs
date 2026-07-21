@@ -1287,9 +1287,10 @@ impl CoderHandle {
 				let path = Utf8PathBuf::from(folder.folder.path.clone());
 				let fs = self.state.folder_session_for(&path).await;
 				let force_host = self.visible_session_force_host(&fs).await;
-				let target = crate::tools::resolve_bash_target(&self.state.workspaces, &self.state.workspaces_dir, force_host)
-					.await
-					.to_string();
+				let target =
+					crate::tools::resolve_bash_target(&self.state.workspaces, &self.state.workspaces_dir, force_host, &folder)
+						.await
+						.to_string();
 				(Some(target), force_host)
 			}
 			None => (None, false),
@@ -5082,6 +5083,7 @@ async fn handle_spawn_worker(
 	// against — the same shape `SubagentSpawned.target_folder`
 	// carries for `task` sub-agents (their folder path), not the
 	// branch name.
+	let parent_folder_for_note = parent_folder.clone();
 	let target_folder = summary.worktree_root.clone().unwrap_or(parent_folder);
 	// Seed the worker with the task prompt.
 	handle.send_to(&summary.id, task.to_string(), Vec::new()).await?;
@@ -5122,12 +5124,18 @@ async fn handle_spawn_worker(
 		mode: CoderMode::Agent.as_wire().to_string(),
 		worktree_root: summary.worktree_root.clone(),
 	});
-	Ok(json!({
+	let mut result = json!({
 		"worker_id": summary.id,
 		"branch": summary.worktree_branch,
 		"worktree_path": summary.worktree_root,
 		"title": summary.title,
-	}))
+	});
+	// The worktree rides its parent folder's bind mount — if the
+	// running container doesn't mount the parent (a repo created via
+	// `init_repo` / `clone_repo` after the container came up), tell
+	// the coordinator the worker runs with the host toolchain.
+	attach_container_mount_note(state, &parent_folder_for_note, &mut result).await;
+	Ok(result)
 }
 
 /// Background task that subscribes to the coder event broadcast,
@@ -5715,11 +5723,7 @@ async fn handle_clone_repo(state: &Arc<CoderState>, sink: &FolderEventSink, args
 				.and_then(|s| s.strip_suffix(".git").unwrap_or(s).strip_suffix('/').or(Some(s)))
 				.filter(|s| !s.is_empty() && !s.contains("..") && !s.contains('/'))
 				.unwrap_or("repo");
-			folder_path
-				.parent()
-				.map(Utf8Path::to_path_buf)
-				.unwrap_or_else(|| folder_path.clone())
-				.join(basename)
+			sibling_dest(&folder_path, basename)
 		}
 	};
 	// Run the clone on the host via the coordinator folder's host.
@@ -5735,31 +5739,70 @@ async fn handle_clone_repo(state: &Arc<CoderState>, sink: &FolderEventSink, args
 		.add_folder(dest)
 		.await
 		.map_err(|err| CoderError::Internal(format!("add_folder failed: {err}")))?;
-	Ok(json!({
+	let mut result = json!({
 		"path": entry.folder.path,
 		"name": entry.folder.name,
-	}))
+	});
+	attach_container_mount_note(state, &entry.folder.path, &mut result).await;
+	Ok(result)
 }
 
-/// `init_repo` — initialize a new git repo at a host path and
-/// register it as a workspace folder (ADR 0030).
+/// Validate a directory name for `init_repo`: a single path
+/// component, no traversal, no hidden/flag-like prefixes, and a
+/// filesystem-safe charset. The name lands as a sibling directory of
+/// the coordinator's project — never an arbitrary path (the model,
+/// given a free path, picks `/tmp`; new projects belong next to the
+/// projects the user already works in).
+fn is_valid_repo_name(name: &str) -> bool {
+	!name.is_empty()
+		&& name.len() <= 100
+		&& !name.starts_with(['.', '-'])
+		&& name
+			.chars()
+			.all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// The sibling destination for a new repo next to the coordinator's
+/// project folder: `<parent-of-coordinator-folder>/<name>`. Shared by
+/// `init_repo` (always) and `clone_repo` (when no explicit path is
+/// given).
+fn sibling_dest(coordinator_folder: &Utf8Path, name: &str) -> Utf8PathBuf {
+	coordinator_folder
+		.parent()
+		.map(Utf8Path::to_path_buf)
+		.unwrap_or_else(|| coordinator_folder.to_path_buf())
+		.join(name)
+}
+
+/// `init_repo` — initialize a new git repo as a sibling of the
+/// coordinator's project folder and register it as a workspace
+/// folder (ADR 0030 / ADR 0037).
 async fn handle_init_repo(state: &Arc<CoderState>, sink: &FolderEventSink, args: &Value) -> Result<Value, CoderError> {
 	#[derive(serde::Deserialize)]
 	struct InitArgs {
-		path: String,
+		name: String,
 	}
 	let parsed: InitArgs =
 		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("init_repo", err.to_string()))?;
-	let dest = Utf8PathBuf::from(&parsed.path);
-	if !is_safe_host_path(&dest) {
+	let name = parsed.name.trim();
+	if !is_valid_repo_name(name) {
 		return Err(CoderError::invalid_args(
 			"init_repo",
-			"path must be absolute, must not contain `..`, and must not be a system-critical path",
+			"name must be a single directory name (letters, digits, `-`, `_`, `.`; not starting with `.` or `-`)",
 		));
 	}
-	// The coordinator's own folder supplies the host that runs the
-	// git command — never the live active folder (the user may have
-	// switched projects mid-turn).
+	// The coordinator's own folder anchors the sibling destination
+	// and supplies the host that runs the git command — never the
+	// live active folder (the user may have switched projects
+	// mid-turn).
+	let folder_path = Utf8PathBuf::from(sink.folder());
+	let dest = sibling_dest(&folder_path, name);
+	if dest.exists() {
+		return Err(CoderError::invalid_args(
+			"init_repo",
+			format!("`{dest}` already exists — pick a different name"),
+		));
+	}
 	let Some(folder) = state.workspaces.folder_for_path(sink.folder()).await else {
 		return Err(CoderError::invalid_args(
 			"init_repo",
@@ -5772,10 +5815,38 @@ async fn handle_init_repo(state: &Arc<CoderState>, sink: &FolderEventSink, args:
 		.add_folder(dest)
 		.await
 		.map_err(|err| CoderError::Internal(format!("add_folder failed: {err}")))?;
-	Ok(json!({
+	let mut result = json!({
 		"path": entry.folder.path,
 		"name": entry.folder.name,
-	}))
+	});
+	attach_container_mount_note(state, &entry.folder.path, &mut result).await;
+	Ok(result)
+}
+
+/// When the workspace shell container is running but doesn't mount
+/// `folder_root` (the folder was bound after the container came up),
+/// attach a `note` to a tool result so the coordinator knows sessions
+/// there run with the **host** toolchain until the user re-syncs or
+/// restarts the container. Silent when there's no running container
+/// or the folder is mounted.
+async fn attach_container_mount_note(state: &Arc<CoderState>, folder_root: &str, result: &mut Value) {
+	let applied = crate::tools::running_container_applied_folders(&state.workspaces, &state.workspaces_dir).await;
+	let Some(applied) = applied else {
+		return;
+	};
+	if applied.iter().any(|p| p.as_str() == folder_root) {
+		return;
+	}
+	if let Some(obj) = result.as_object_mut() {
+		obj.insert(
+			"note".to_string(),
+			json!(
+				"the workspace shell container is running but does not mount this folder; \
+				 bash / builds for sessions here run on the host toolchain until the user \
+				 restarts the workspace container"
+			),
+		);
+	}
 }
 
 /// Walk the session's in-memory `messages` for assistant tool
@@ -5930,7 +6001,7 @@ async fn refresh_system_prompt(
 	mode: CoderMode,
 ) {
 	let folders = state.workspaces.folders().await;
-	let container_mode = workspace_in_container_mode(&state.tools, force_host_bash).await;
+	let container_mode = workspace_in_container_mode(&state.tools, force_host_bash, folder_path, &folders).await;
 	let prompt = compose_system_prompt(
 		&folders,
 		Some(folder_path.as_str()),
@@ -5947,13 +6018,23 @@ async fn refresh_system_prompt(
 	}
 }
 
-/// Probe whether the workspace's shell container is currently
-/// running. Reuses the same `resolve_bash_target` plumbing the
-/// `bash` tool dispatches against, so the system prompt's
-/// "Bound folders" rendering can't drift from how `bash` actually
-/// routes commands.
-async fn workspace_in_container_mode(tools: &ToolRegistry, force_host_bash: bool) -> bool {
-	tools.bash_target_is_container(force_host_bash).await
+/// Probe whether this session's `bash` would route to the workspace
+/// shell container. Reuses the same `resolve_bash_target` plumbing
+/// the `bash` tool dispatches against — including the per-folder
+/// mount check — so the system prompt's "Bound folders" rendering
+/// can't drift from how `bash` actually routes commands. `false`
+/// when the session's folder isn't among the bound entries (defensive
+/// — a just-unbound folder mid-turn).
+async fn workspace_in_container_mode(
+	tools: &ToolRegistry,
+	force_host_bash: bool,
+	folder_path: &Utf8Path,
+	folders: &[Arc<WorkspaceFolderEntry>],
+) -> bool {
+	let Some(folder) = folders.iter().find(|f| f.folder.path == folder_path.as_str()) else {
+		return false;
+	};
+	tools.bash_target_is_container(force_host_bash, folder).await
 }
 
 /// Schedule background regeneration for any bound folder whose
@@ -8271,5 +8352,31 @@ mod tests {
 		assert!(!is_safe_host_path(Utf8Path::new("/etc")));
 		assert!(!is_safe_host_path(Utf8Path::new("/usr")));
 		assert!(!is_safe_host_path(Utf8Path::new("/var")));
+	}
+
+	#[test]
+	fn repo_name_accepts_plain_directory_names() {
+		assert!(is_valid_repo_name("my-service"));
+		assert!(is_valid_repo_name("scratch_2"));
+		assert!(is_valid_repo_name("dashboard.v2"));
+	}
+
+	#[test]
+	fn repo_name_rejects_paths_traversal_and_flags() {
+		assert!(!is_valid_repo_name(""));
+		assert!(!is_valid_repo_name("a/b"));
+		assert!(!is_valid_repo_name("/tmp/foo"));
+		assert!(!is_valid_repo_name(".."));
+		assert!(!is_valid_repo_name(".hidden"));
+		assert!(!is_valid_repo_name("-rf"));
+		assert!(!is_valid_repo_name("has space"));
+	}
+
+	#[test]
+	fn sibling_dest_lands_next_to_the_coordinator_folder() {
+		assert_eq!(
+			sibling_dest(Utf8Path::new("/home/me/code/moon-landing"), "dashboard"),
+			Utf8Path::new("/home/me/code/dashboard")
+		);
 	}
 }

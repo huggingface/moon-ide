@@ -15,7 +15,7 @@
 //! `moon_core::lsp` so `moon-remote` (future remote runtime) and the
 //! Tauri shell share the same behaviour.
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use moon_container::{Workspace as ContainerWorkspace, WorkspaceConfig};
 use moon_core::lsp::server::PathTranslator;
 use moon_core::lsp::{LspBroker, LspServerEvent, LspSpawner};
@@ -368,6 +368,7 @@ async fn ensure_broker(state: &AppState, app: &AppHandle) -> Result<std::sync::A
 			.iter()
 			.map(|f| Utf8PathBuf::from(&f.path))
 			.collect::<Vec<_>>(),
+		&root,
 	)
 	.await;
 
@@ -457,7 +458,18 @@ async fn ensure_broker(state: &AppState, app: &AppHandle) -> Result<std::sync::A
 /// `Host` rather than bubbling an error up to the `lsp_open`
 /// caller: a container problem shouldn't prevent the user from
 /// getting diagnostics on host-installed Rust.
-async fn resolve_target(state: &AppState, workspace_id: &str, bound_folders: &[Utf8PathBuf]) -> BrokerTarget {
+///
+/// `root` is the active folder the broker will serve. A running
+/// container that doesn't mount it (the folder was bound after the
+/// container came up — coordinator `init_repo` / `clone_repo`)
+/// resolves to `Host` too: a container-spawned LSP would see no
+/// files at the translated path.
+async fn resolve_target(
+	state: &AppState,
+	workspace_id: &str,
+	bound_folders: &[Utf8PathBuf],
+	root: &Utf8Path,
+) -> BrokerTarget {
 	let state_dir = state.workspace_state_dir(workspace_id);
 	let ws = match ContainerWorkspace::new(WorkspaceConfig {
 		workspace_id: workspace_id.to_owned(),
@@ -471,9 +483,22 @@ async fn resolve_target(state: &AppState, workspace_id: &str, bound_folders: &[U
 		}
 	};
 	match ws.status().await {
-		Ok(status) if matches!(status.state, ContainerState::Running) => BrokerTarget::Container {
-			container_name: container_name_for_workspace(workspace_id),
-		},
+		Ok(status) if matches!(status.state, ContainerState::Running) => {
+			let mount_root = state
+				.workspaces
+				.folder_for_path(root.as_str())
+				.await
+				.map(|entry| moon_core::worktree::effective_mount_root(&entry.folder).to_owned())
+				.unwrap_or_else(|| root.to_string());
+			let applied = ws.applied_bound_folders().await;
+			if !applied.iter().any(|p| p.as_str() == mount_root) {
+				tracing::debug!(%root, "lsp: folder not mounted in running container, using host spawner");
+				return BrokerTarget::Host;
+			}
+			BrokerTarget::Container {
+				container_name: container_name_for_workspace(workspace_id),
+			}
+		}
 		Ok(_) => BrokerTarget::Host,
 		Err(err) => {
 			tracing::debug!(%err, "lsp: container status query failed, using host spawner");

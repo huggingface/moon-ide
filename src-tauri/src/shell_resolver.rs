@@ -96,6 +96,24 @@ impl ShellResolver for WorkspaceShellResolver {
 
 		match ws.status().await {
 			Ok(status) if matches!(status.state, ContainerState::Running) => {
+				// The running container only mounts the folders its
+				// compose state was emitted from. A folder bound
+				// after the container came up (coordinator
+				// `init_repo` / `clone_repo`) isn't mounted —
+				// container-routed subprocesses would land in a cwd
+				// that doesn't exist. Route those to the host until
+				// the container is re-synced. Worktree folders ride
+				// their parent's mount, so check the parent.
+				let mount_root = entries
+					.iter()
+					.find(|entry| entry.folder.path == host_root.as_str())
+					.map(|entry| moon_core::worktree::effective_mount_root(&entry.folder).to_owned())
+					.unwrap_or_else(|| host_root.to_string());
+				let applied = ws.applied_bound_folders().await;
+				if !applied.iter().any(|p| p.as_str() == mount_root) {
+					tracing::debug!(%host_root, "shell-resolver: folder not mounted in running container, routing to host");
+					return ShellTarget::Host;
+				}
 				let server_root = worktree_server_root.unwrap_or_else(|| {
 					TerminalTarget::container_cwd_for_folder(host_root).unwrap_or_else(|| Utf8PathBuf::from("/workspace"))
 				});

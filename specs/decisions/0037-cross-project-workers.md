@@ -51,6 +51,34 @@ sessions list.
 collapsed row shows the worker id (or the task text for
 `spawn_worker`) inline, making them recognizable without expanding.
 
+### `init_repo` takes a name, not a path
+
+The first cut let the model pick any absolute host path — and given a
+free path it picked `/tmp`, stranding the new project outside the
+user's project tree. `init_repo(name)` now creates the repo as a
+**sibling of the coordinator's project folder** (same parent
+directory), mirroring `clone_repo`'s no-path default. The model
+chooses a directory name; the location is fixed.
+
+### Host routing for folders the running container doesn't mount
+
+A folder bound while the workspace shell container is already running
+(`init_repo` / `clone_repo`) is not in the container's compose mount
+set — container-routed subprocesses would land in a cwd that doesn't
+exist, which is how "the worker can't write files" manifested. All
+three shell-routing decisions (coder `bash`, format-on-save, LSP) now
+check the folder's effective mount root (worktree → parent) against
+`bound-folders.json` — the set the compose state was last emitted
+from — and fall back to the **host** toolchain when it's missing.
+Routing flips to the container automatically once the user restarts /
+re-syncs it. `init_repo` / `clone_repo` / `spawn_worker` results carry
+a `note` when this applies so the coordinator can tell the user.
+
+Rejected alternative: auto-running the compose bound-folder sync from
+the coder tool. `up -d` on a mount-set change **recreates the dev
+container**, killing every other session's container processes
+mid-turn — too disruptive as an implicit agent side effect.
+
 ### `merge_worker_changes` for local repos
 
 ADR 0030's prompt said "you do not merge work back" — correct for repos

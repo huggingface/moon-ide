@@ -32,6 +32,18 @@ pub fn worktree_container_path(parent_host: &Utf8Path, worktree_host: &Utf8Path)
 	Some(Utf8Path::new("/workspace").join(parent_basename).join(tail))
 }
 
+/// The host path whose bind mount a folder rides in the dev
+/// container: a worktree folder rides its **parent's** mount
+/// (ADR 0029), everything else rides its own. This is the path to
+/// check against the container's mounted-folder set when deciding
+/// host-vs-container routing for a folder's subprocesses.
+pub fn effective_mount_root(folder: &moon_protocol::workspace::WorkspaceFolder) -> &str {
+	match &folder.origin {
+		moon_protocol::workspace::FolderOrigin::Worktree { parent_path, .. } => parent_path,
+		_ => &folder.path,
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
