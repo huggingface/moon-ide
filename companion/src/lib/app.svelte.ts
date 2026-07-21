@@ -279,6 +279,27 @@ class CompanionState {
 	 * not just the open one, so a background session's pip stays
 	 * lit while the user browses the list. */
 	busySessions = $state<Set<string>>(new Set());
+	/** Folders (project paths) where a live turn finished while the
+	 * phone was looking elsewhere — the project chip's "finished"
+	 * dot. Cleared when the user opens the folder. */
+	folderAttention = $state<Set<string>>(new Set());
+	/** Which folder each busy session runs in (from the event
+	 * envelope), for the project chips' running pips. */
+	#sessionFolder = new Map<string, string>();
+
+	/** Folders with at least one running turn. Recomputed when
+	 * `busySessions` changes (the map entry is written in the same
+	 * tick as the set replacement). */
+	get busyFolders(): Set<string> {
+		const out = new Set<string>();
+		for (const sid of this.busySessions) {
+			const folder = this.#sessionFolder.get(sid);
+			if (folder) {
+				out.add(folder);
+			}
+		}
+		return out;
+	}
 	/** True when an ask_user prompt is blocking the turn. */
 	awaitingInput = $state(false);
 	/** The pending ask_user prompt, if awaitingInput. */
@@ -337,6 +358,8 @@ class CompanionState {
 		this.scmStatus = null;
 		this.sessions = [];
 		this.busySessions = new Set();
+		this.folderAttention = new Set();
+		this.#sessionFolder.clear();
 		this.#subscriptions.clear();
 		this.closeSession();
 		this.phase = 'pairing';
@@ -484,7 +507,13 @@ class CompanionState {
 		this.closeSession();
 		this.sessions = [];
 		this.scmStatus = null;
-		this.busySessions = new Set();
+		// Opening the folder acknowledges its "finished" dot. The
+		// busy set stays — it spans all folders in the workspace.
+		if (this.folderAttention.has(path)) {
+			const next = new Set(this.folderAttention);
+			next.delete(path);
+			this.folderAttention = next;
+		}
 		this.error = null;
 		this.loadingSessions = true;
 		try {
@@ -524,6 +553,8 @@ class CompanionState {
 		this.scmStatus = null;
 		this.sessions = [];
 		this.busySessions = new Set();
+		this.folderAttention = new Set();
+		this.#sessionFolder.clear();
 		this.error = null;
 		this.closeSession();
 	}
@@ -836,7 +867,7 @@ class CompanionState {
 			this.activeIde,
 		);
 		for (const event of observed.events ?? []) {
-			this.#onCoderEvent({ folder: this.activeFolder ?? '', session_id: id, event });
+			this.#onCoderEvent({ folder: this.activeFolder ?? '', session_id: id, event }, true);
 		}
 		if (observed.in_flight) {
 			this.busy = true;
@@ -1004,7 +1035,7 @@ class CompanionState {
 		}
 	}
 
-	#onCoderEvent(raw: unknown): void {
+	#onCoderEvent(raw: unknown, fromReplay = false): void {
 		// eslint-disable-next-line typescript-eslint/no-unsafe-type-assertion
 		const envelope = (raw ?? {}) as CoderEventEnvelope;
 		const ev = envelope.event;
@@ -1013,18 +1044,35 @@ class CompanionState {
 		}
 
 		// --- Per-session busy tracking (for the session list's
-		// running pip). Processed for *all* sessions before the
-		// active-session filter below, so a background session's
-		// pip stays lit while the user browses the list. The
-		// replay batch's `in_flight` flag also counts.
+		// running pip and the project chips' folder pips).
+		// Processed for *all* sessions before the active-session
+		// filter below, so a background session's pip stays lit
+		// while the user browses the list. The replay batch's
+		// `in_flight` flag also counts. Replayed historical events
+		// still toggle busy (net no-op: each user_message pairs
+		// with its turn_complete) but never flag folder attention —
+		// only a *live* completion is "work finished".
 		const eventSid = envelope.session_id;
+		const eventFolder = envelope.folder || this.activeFolder || '';
 		if (eventSid) {
 			if (ev.kind === 'replay' && bool(ev, 'in_flight')) {
 				this.#markBusy(eventSid, true);
+				this.#sessionFolder.set(eventSid, eventFolder);
 			} else if (ev.kind === 'user_message') {
 				this.#markBusy(eventSid, true);
+				this.#sessionFolder.set(eventSid, eventFolder);
 			} else if (ev.kind === 'turn_complete' || ev.kind === 'aborted' || ev.kind === 'error') {
 				this.#markBusy(eventSid, false);
+				// A live turn_complete in a folder the phone isn't
+				// looking at lights that project chip's "finished"
+				// dot (cleared when the user opens the folder).
+				if (!fromReplay && ev.kind === 'turn_complete' && eventFolder && eventFolder !== this.activeFolder) {
+					if (!this.folderAttention.has(eventFolder)) {
+						const next = new Set(this.folderAttention);
+						next.add(eventFolder);
+						this.folderAttention = next;
+					}
+				}
 			}
 		}
 
@@ -1040,7 +1088,7 @@ class CompanionState {
 			const inner = ev.events;
 			if (Array.isArray(inner)) {
 				for (const e of inner) {
-					this.#onCoderEvent({ ...envelope, event: e });
+					this.#onCoderEvent({ ...envelope, event: e }, true);
 				}
 			}
 			if (bool(ev, 'in_flight')) {

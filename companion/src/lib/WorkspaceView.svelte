@@ -78,6 +78,11 @@
 					onclick={() => app.openFolder(f.path)}
 				>
 					{f.name}
+					{#if app.busyFolders.has(f.path)}
+						<span class="pip live" title="An agent is running here"></span>
+					{:else if app.folderAttention.has(f.path)}
+						<span class="finished-dot" title="An agent finished here">✦</span>
+					{/if}
 				</button>
 			{/each}
 		</div>
@@ -280,6 +285,17 @@
 		color: var(--accent-fg);
 		background: var(--accent);
 		border-color: var(--accent);
+	}
+	.project-chip .pip {
+		margin-left: 0.3rem;
+	}
+	.finished-dot {
+		margin-left: 0.3rem;
+		color: var(--accent);
+		font-size: 0.8rem;
+	}
+	.project-chip.active .finished-dot {
+		color: var(--accent-fg);
 	}
 	.provider-card {
 		display: flex;

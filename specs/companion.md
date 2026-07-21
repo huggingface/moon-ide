@@ -220,6 +220,12 @@ requested surface:
   enrolled IDE for remote-carrier workspaces (the IDE runs its own
   `window_open` "focus or spawn" path). Either way the phone
   re-polls the list after ~1.5 s and the workspace appears live.
+- **Project chip indicators.** The workspace view's project switcher
+  badges each folder: a live pip while any of its sessions has a
+  running turn, and a "finished" dot when a live turn completed
+  while the phone was looking at another folder (cleared on opening
+  the folder). Tracked phone-side from the event stream's envelope
+  `folder`; replayed historical events never flag "finished".
 - **Switch to default branch.** When the folder is on a feature
   branch, a "⇄ Switch to main" chip switches the working tree back
   to the default branch (`workspace_scm_switch_branch`, wrapping the
