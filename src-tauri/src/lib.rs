@@ -1265,6 +1265,18 @@ async fn restore_session(
 			// always re-added before it.
 			let result = match &folder.origin {
 				moon_protocol::workspace::FolderOrigin::Worktree { parent_path, branch } => {
+					// An orphan worktree (its parent didn't restore —
+					// removed from the session, or gone from disk) is
+					// unreachable in the folder bar and can't be
+					// discarded through the parent. Skip it so the
+					// workspace self-heals instead of re-binding a row
+					// the user can't act on. Folders are stored in
+					// insertion order, so a surviving parent is always
+					// re-added before its worktrees.
+					if state.workspaces.folder_for_path(parent_path).await.is_none() {
+						tracing::warn!(path = %path, parent = %parent_path, "skipping orphan worktree folder (parent not restored)");
+						continue;
+					}
 					state
 						.workspaces
 						.add_worktree_folder(path.clone(), parent_path.clone(), branch.clone())

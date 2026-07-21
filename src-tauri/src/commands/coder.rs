@@ -489,24 +489,38 @@ pub async fn coder_discard_worktree(
 	let FolderOrigin::Worktree { parent_path, .. } = entry.folder.origin.clone() else {
 		return Err(MoonError::invalid(format!("{path} is not a worktree folder")));
 	};
-	let parent = state
-		.workspaces
-		.folder_for_path(&parent_path)
-		.await
-		.ok_or_else(|| MoonError::invalid("the worktree's parent folder is not bound; can't prune it"))?;
 
-	// `git worktree remove` runs against the parent repo on its active
-	// shell target. The worktree's relative links resolve under either
-	// mount (ADR 0029), so we just pass the path for that target:
-	// the in-container `/workspace/<parent>/.worktrees/…` path when the
-	// workspace runs in a container, the host path otherwise.
-	let remove_path = if crate::commands::container::workspace_container_running(&state).await {
-		moon_core::worktree::worktree_container_path(camino::Utf8Path::new(&parent_path), camino::Utf8Path::new(&path))
-			.unwrap_or_else(|| camino::Utf8PathBuf::from(&path))
-	} else {
-		camino::Utf8PathBuf::from(&path)
-	};
-	parent.host.git_worktree_remove(&remove_path, force).await?;
+	match state.workspaces.folder_for_path(&parent_path).await {
+		Some(parent) => {
+			// `git worktree remove` runs against the parent repo on its
+			// active shell target. The worktree's relative links resolve
+			// under either mount (ADR 0029), so we just pass the path for
+			// that target: the in-container `/workspace/<parent>/.worktrees/…`
+			// path when the workspace runs in a container, the host path
+			// otherwise.
+			let remove_path = if crate::commands::container::workspace_container_running(&state).await {
+				moon_core::worktree::worktree_container_path(camino::Utf8Path::new(&parent_path), camino::Utf8Path::new(&path))
+					.unwrap_or_else(|| camino::Utf8PathBuf::from(&path))
+			} else {
+				camino::Utf8PathBuf::from(&path)
+			};
+			parent.host.git_worktree_remove(&remove_path, force).await?;
+		}
+		None => {
+			// Orphan worktree — its parent was removed from the workspace
+			// (or never restored). When the parent repo still exists on
+			// disk, prune through a transient host rooted at it so the
+			// checkout + git metadata go away too; errors still propagate
+			// so the UI's force-confirm flow works. When the parent repo
+			// is gone from disk there's nothing to prune — just unbind.
+			let parent_root = camino::Utf8PathBuf::from(&parent_path);
+			if parent_root.is_dir() {
+				use moon_core::host::WorkspaceHost as _;
+				let host = moon_core::host::LocalHost::new(parent_root);
+				host.git_worktree_remove(camino::Utf8Path::new(&path), force).await?;
+			}
+		}
+	}
 	state.workspaces.remove_folder(&path).await?;
 	Ok(state.workspaces.snapshot().await)
 }
