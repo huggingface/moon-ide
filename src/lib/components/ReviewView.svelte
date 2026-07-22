@@ -1,8 +1,8 @@
 <script lang="ts">
-	import { onDestroy, onMount } from 'svelte';
+	import { onDestroy, onMount, tick } from 'svelte';
 	import { workspace, type SplitSide } from '../state.svelte';
 	import ReviewSection from './ReviewSection.svelte';
-	import { formatError, type GitStatusEntry, type ReviewComment } from '../protocol';
+	import { formatError, type GitStatusEntry, type GitFileStatus, type ReviewComment } from '../protocol';
 	import { getCachedMarkdown, renderMarkdown } from '../markdown';
 
 	// The pane this review tab lives in. Plumbed through so a
@@ -34,24 +34,125 @@
 	// the folder we're actually rendering.
 	const ownerFolder: string | null = workspace.activeFolderPath;
 
+	// Folder the currently-rendered sections belong to. Initialized to
+	// `ownerFolder` and updated by the folder-switch effect below. Lives
+	// at module scope (not inside the effect) so the effect can read the
+	// *previous* value before overwriting it on a switch.
+	let renderedFolder: string | null = ownerFolder;
+
 	// Index of the section we should scroll back to on mount, if a
 	// restore snapshot from a previous mount survived (tab or folder
-	// switch). `-1` means no restore — start at the top. Computed
-	// once at mount time rather than kept reactive: it only seeds the
-	// eager-mount decision and the one-shot scroll, and we don't want
-	// a later git refresh that shuffles `entries` to retroactively
-	// change which sections mounted eagerly.
-	const restoreSnapshot = workspace.reviewRestoreFor(ownerFolder);
-	const restorePath: string | null = restoreSnapshot?.path ?? null;
-	const restoreOffset: number = restoreSnapshot?.offset ?? 0;
-	const restoreIndex: number =
-		restorePath === null ? -1 : workspace.gitStatusEntries.findIndex((e) => e.path === restorePath);
+	// switch). `-1` means no restore — start at the top. Derived off
+	// the *live* folder pointer (not the once-captured `ownerFolder`)
+	// because `ReviewView` doesn't remount on a folder switch, so
+	// the eager-mount decision has to re-evaluate for the new folder's
+	// entries the same way the scroll-restore effect does.
+	const restorePath: string | null = $derived.by(() => {
+		const folder = workspace.activeFolderPath;
+		return folder === null ? null : (workspace.reviewRestoreFor(folder)?.path ?? null);
+	});
+	const restoreOffset: number = $derived.by(() => {
+		const folder = workspace.activeFolderPath;
+		return folder === null ? 0 : (workspace.reviewRestoreFor(folder)?.offset ?? 0);
+	});
+	const restoreIndex: number = $derived.by(() => {
+		const path = restorePath;
+		if (path === null) {
+			return -1;
+		}
+		return entries.findIndex((e) => e.path === path);
+	});
+	// Snapshot captured at first mount only for the one-shot
+	// `onMount` restore (a regular tab switch remounts this view,
+	// so the mount-time read is the right one for that path).
+	const firstMountSnapshot = workspace.reviewRestoreFor(ownerFolder);
 
 	onMount(() => {
 		scroller?.focus({ preventScroll: true });
 		updateVisibleFile();
-		if (restoreIndex >= 0) {
-			restoreScroll(restorePath as string, restoreOffset);
+		// Seed the rendered-folder tracker so the folder-switch effect
+		// below doesn't treat the first mount as a "switch" and replay
+		// the restore a second time. `renderedFolder` is initialized to
+		// `ownerFolder` for the same reason.
+		renderedFolder = ownerFolder;
+		const path = firstMountSnapshot?.path ?? null;
+		const offset = firstMountSnapshot?.offset ?? 0;
+		const idx = path === null ? -1 : entries.findIndex((e) => e.path === path);
+		if (idx >= 0 && path !== null) {
+			restoreScroll(path, offset);
+		}
+	});
+
+	// Folder-switch scroll restore. `ReviewView` is keyed off the
+	// constant `review://default-branch` path, so it does NOT remount
+	// on a folder switch — its `onMount` / `onDestroy` don't fire, and
+	// `captureRestore()` (which lives in `onDestroy`) never runs.
+	// Meanwhile the `ReviewSection` children *do* remount, because their
+	// keys are derived from `gitStatusEntries` (the new folder's
+	// changed-file list). The scroller element is reused, so the
+	// `scrollTop` from the old folder survives into the new folder's
+	// freshly-lazy-loading sections and lands at a meaningless position
+	// (often past the bottom once the new (shorter) list mounts, which
+	// snaps back to top — the reported bug).
+	//
+	// Track the *folder whose entries are currently rendered*; when it
+	// changes we capture the previous folder's position (via the live
+	// mirror — children may be mid-teardown) and then restore the new
+	// folder's saved snapshot, falling back to the top. Saves a round
+	// trip through the unmount/remount cycle that would otherwise lose
+	// `sectionEls`.
+	$effect(() => {
+		// Depend on the live entries: this re-runs when the new
+		// folder's git status arrives and the entry list flips.
+		const list = entries;
+		// The folder whose entries we're now showing is whatever
+		// folder owns `list[0]?.path` — but entries are folder-
+		// relative paths with no folder tag, so we can't read the
+		// folder from them directly. Use the live active folder
+		// pointer instead: only one folder's review is mounted at a
+		// time, and `entries` re-derives off the active folder's
+		// `gitStatusEntries`, so when this effect re-runs with a
+		// non-empty list the active folder *is* the folder we're
+		// rendering. (On a switch to a folder with no changes, `list`
+		// is empty and we still want to reset to the top.)
+		const liveFolder = workspace.activeFolderPath;
+		if (liveFolder === renderedFolder) {
+			return;
+		}
+		// Folder is changing. Capture the outgoing folder's position
+		// before `sectionEls` is cleared, using the live mirror (the
+		// children for the old folder may already be tearing down,
+		// but the mirror captured the last settled frame).
+		if (renderedFolder !== null && lastVisiblePath !== null) {
+			workspace.setReviewRestoreFor(renderedFolder, { path: lastVisiblePath, offset: 0 });
+		}
+		renderedFolder = liveFolder;
+		// Restore the incoming folder's saved snapshot, or reset to
+		// the top when it has none.
+		const snap = liveFolder === null ? null : workspace.reviewRestoreFor(liveFolder);
+		const snapPath = snap?.path ?? null;
+		const snapOffset = snap?.offset ?? 0;
+		const snapIndex = snapPath === null ? -1 : list.findIndex((e) => e.path === snapPath);
+		if (snapIndex >= 0) {
+			// Defer until the matching section element has registered
+			// (it mounts reactively with `entries`). One rAF is
+			// usually enough because the `eager` prop already forced
+			// sections `i <= restoreIndex` to build up front.
+			const tryScroll = () => {
+				const el = sectionEls.get(snapPath as string);
+				if (el && scroller) {
+					restoreScroll(snapPath as string, snapOffset);
+				} else {
+					requestAnimationFrame(tryScroll);
+				}
+			};
+			requestAnimationFrame(tryScroll);
+		} else if (scroller) {
+			// No snapshot or the saved file is no longer in the
+			// diff: park at the top so the user isn't stranded at
+			// the old folder's scroll position.
+			cancelRestore();
+			scroller.scrollTop = 0;
 		}
 	});
 
@@ -232,6 +333,26 @@
 		const slash = p.lastIndexOf('/');
 		return slash === -1 ? p : p.slice(slash + 1);
 	}
+
+	// Single-letter status glyph for the files-menu rows. Mirrors
+	// `ReviewSection`'s `statusLabel` minus the unknown-status fallback
+	// (the review view only renders known statuses).
+	function statusInitial(s: GitFileStatus): string {
+		switch (s) {
+			case 'added':
+				return 'A';
+			case 'modified':
+				return 'M';
+			case 'deleted':
+				return 'D';
+			case 'untracked':
+				return 'U';
+			case 'conflicted':
+				return 'C';
+			default:
+				return '·';
+		}
+	}
 	// "L42" or "L10–14" — the anchor label shown in the publish preview.
 	function lineLabel(c: ReviewComment): string {
 		const { startLine, endLine } = c.anchor;
@@ -326,17 +447,38 @@
 	// reactive state pointlessly. The handler also runs once on
 	// mount so the pointer is set before the user touches the
 	// scroller.
+	//
+	// `lastScrollTop` / `lastVisiblePath` are a continuous mirror of
+	// the scroller's position kept in sync on every settled frame.
+	// They exist because of a Svelte teardown ordering problem: when
+	// this view unmounts (folder switch, tab close), child
+	// `ReviewSection` components are torn down *before* this view's
+	// own `onDestroy` runs, so by the time `captureRestore()` reads
+	// `sectionEls` the map is already empty (every child's
+	// `onMount` cleanup called `registerSection(path, null)`). The
+	// `scrollTop` of the detaching scroller is also unreliable once
+	// the DOM is mid-removal. Keeping a live mirror means `onDestroy`
+	// always has a usable {path, scrollTop} pair to translate into a
+	// restore snapshot even though the children that produced the
+	// offsets are gone.
 	let scrollFrame = 0;
+	let lastScrollTop = 0;
+	let lastVisiblePath: string | null = null;
 	function updateVisibleFile() {
 		const list = entries;
 		if (list.length === 0) {
 			workspace.reviewVisibleFile = null;
+			lastVisiblePath = null;
 			return;
 		}
 		const idx = findNearestIndex();
 		const entry = list[idx];
 		if (entry !== undefined) {
 			workspace.reviewVisibleFile = entry.path;
+			lastVisiblePath = entry.path;
+		}
+		if (scroller) {
+			lastScrollTop = scroller.scrollTop;
 		}
 	}
 	function onScroll() {
@@ -364,27 +506,49 @@
 		// entries may have already flipped to the new folder by the
 		// time teardown runs, but `sectionEls` still holds *this*
 		// folder's sections until our children unmount.
-		if (!scroller || sectionEls.size === 0) {
-			workspace.setReviewRestoreFor(ownerFolder, null);
-			return;
-		}
-		const scrollTop = scroller.scrollTop;
-		let bestPath: string | null = null;
-		let bestEl: HTMLElement | null = null;
-		let bestDelta = Infinity;
-		for (const [path, el] of sectionEls) {
-			const delta = Math.abs(el.offsetTop - scrollTop);
-			if (delta < bestDelta) {
-				bestDelta = delta;
-				bestPath = path;
-				bestEl = el;
+		//
+		// On unmount, Svelte tears children down before the parent's
+		// `onDestroy`, so by the time we reach here `sectionEls` is
+		// usually empty (every child's `onMount` cleanup already
+		// removed itself). We can't recompute `offsetTop` from a
+		// freshly-detaching DOM either. Fall back to the live mirror
+		// (kept current on every settled scroll frame; see
+		// `updateVisibleFile`) — it carries the path of the section
+		// that was nearest the top and the `scrollTop` at that frame,
+		// which is enough to restore to the same file even if the
+		// intra-section pixel precision of the `offsetTop`-based path
+		// is lost. That's strictly better than landing back at the
+		// top, which is what happened before the mirror existed.
+		if (sectionEls.size > 0 && scroller) {
+			const scrollTop = scroller.scrollTop;
+			let bestPath: string | null = null;
+			let bestEl: HTMLElement | null = null;
+			let bestDelta = Infinity;
+			for (const [path, el] of sectionEls) {
+				const delta = Math.abs(el.offsetTop - scrollTop);
+				if (delta < bestDelta) {
+					bestDelta = delta;
+					bestPath = path;
+					bestEl = el;
+				}
+			}
+			if (bestPath !== null && bestEl !== null) {
+				workspace.setReviewRestoreFor(ownerFolder, { path: bestPath, offset: scrollTop - bestEl.offsetTop });
+				return;
 			}
 		}
-		if (bestPath === null || bestEl === null) {
-			workspace.setReviewRestoreFor(ownerFolder, null);
+		// Teardown path: children are already gone. Use the mirror.
+		if (lastVisiblePath !== null) {
+			// `offset` is best-effort 0 here; the precise intra-section
+			// pixel delta can't be recovered without the child DOM.
+			// `restoreScroll` aligns to the section's `offsetTop`, so a
+			// 0 offset lands at the top of the captured file's section —
+			// which is exactly the "at least open back scrolled to the
+			// same file" the user asked for.
+			workspace.setReviewRestoreFor(ownerFolder, { path: lastVisiblePath, offset: 0 });
 			return;
 		}
-		workspace.setReviewRestoreFor(ownerFolder, { path: bestPath, offset: scrollTop - bestEl.offsetTop });
+		workspace.setReviewRestoreFor(ownerFolder, null);
 	}
 
 	// Keyboard nav between file sections. `n` / `p` mirror the
@@ -465,6 +629,59 @@
 			jumpRelative(-1);
 		}
 	}
+
+	// File-jump menu. When a review spans dozens of changed files,
+	// `n` / `p` and the changes-tree click are clunky ways to land on a
+	// specific one. A "Files" button in the banner opens a filterable
+	// popover that lists every entry and calls `scrollTo(path)` on pick —
+	// same thing the SCM changes-tree does, just discoverable from the
+	// banner so the user doesn't have to side-channel through the tree.
+	let filesMenuOpen = $state(false);
+	let filesFilter = $state('');
+	let filesBtnEl: HTMLButtonElement | undefined = $state();
+	let filesInputEl: HTMLInputElement | undefined = $state();
+
+	const filteredEntries: readonly { path: string; status: GitFileStatus }[] = $derived.by(() => {
+		const q = filesFilter.trim().toLowerCase();
+		if (q.length === 0) {
+			return entries;
+		}
+		return entries.filter((e) => e.path.toLowerCase().includes(q));
+	});
+
+	function openFilesMenu() {
+		filesFilter = '';
+		filesMenuOpen = true;
+		// Focus the filter input once Svelte has mounted it.
+		void tick().then(() => {
+			filesInputEl?.focus();
+		});
+	}
+
+	function closeFilesMenu() {
+		filesMenuOpen = false;
+	}
+
+	function pickFile(path: string) {
+		filesMenuOpen = false;
+		scrollTo(path);
+	}
+
+	function onFilesMenuKeydown(event: KeyboardEvent) {
+		if (event.key === 'Escape') {
+			event.preventDefault();
+			filesMenuOpen = false;
+			filesBtnEl?.focus();
+			return;
+		}
+		// Backspace-empty closes to the banner button (fast dismiss
+		// without reaching for Esc).
+		if (event.key === 'Backspace' && filesFilter.length === 0 && filesInputEl === document.activeElement) {
+			event.preventDefault();
+			filesMenuOpen = false;
+			filesBtnEl?.focus();
+		}
+	}
 </script>
 
 <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
@@ -492,6 +709,23 @@
 				>
 			</span>
 		{/if}
+		<button
+			type="button"
+			class="files"
+			disabled={entries.length === 0}
+			title={entries.length === 0 ? 'No changed files' : 'Jump to a file in the review'}
+			aria-expanded={filesMenuOpen}
+			bind:this={filesBtnEl}
+			onclick={() => {
+				if (filesMenuOpen) {
+					closeFilesMenu();
+				} else {
+					openFilesMenu();
+				}
+			}}
+		>
+			Files
+		</button>
 		<span class="counts">{entries.length} file{entries.length === 1 ? '' : 's'}</span>
 		{#if entries.length > 0}
 			<span class="progress" title="Files marked Viewed">{reviewedCount} / {entries.length} reviewed</span>
@@ -513,6 +747,56 @@
 			Publish review →
 		</button>
 	</div>
+	{#if filesMenuOpen}
+		<!-- Filter-and-jump menu for large reviews. Anchored under
+		     the Files button; closes on Escape, click-outside, and
+		     picking a row. The list reuses `entries` (the same
+		     filtered list the sections render) so the menu always
+		     matches what's mounted. -->
+		<!-- svelte-ignore a11y_click_events_have_key_events -->
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<div class="files-overlay" onclick={closeFilesMenu}>
+			<!-- svelte-ignore a11y_no_static_element_interactions -->
+			<div
+				class="files-menu"
+				role="dialog"
+				aria-label="Jump to file"
+				aria-modal="false"
+				tabindex="-1"
+				onkeydown={onFilesMenuKeydown}
+				onclick={(e) => e.stopPropagation()}
+			>
+				<input
+					class="files-filter"
+					type="search"
+					placeholder="Filter files…"
+					bind:value={filesFilter}
+					bind:this={filesInputEl}
+				/>
+				<ul class="files-list">
+					{#if filteredEntries.length === 0}
+						<li class="files-empty">No files match "{filesFilter}".</li>
+					{:else}
+						{#each filteredEntries as entry (entry.path)}
+							<li>
+								<button
+									type="button"
+									class="files-row"
+									class:current={visiblePath === entry.path}
+									title={entry.path}
+									onclick={() => pickFile(entry.path)}
+								>
+									<span class="status status-{entry.status}">{statusInitial(entry.status)}</span>
+									{#if dirName(entry.path)}<span class="dir">{dirName(entry.path)}/</span>{/if}
+									<span class="name">{fileName(entry.path)}</span>
+								</button>
+							</li>
+						{/each}
+					{/if}
+				</ul>
+			</div>
+		</div>
+	{/if}
 	{#if entries.length === 0}
 		<div class="empty">No changes against {baselineLabel.length > 0 ? baselineLabel : 'the baseline'}.</div>
 	{:else}
@@ -684,6 +968,28 @@
 	.vs {
 		font-family: var(--m-font-mono, monospace);
 	}
+	.files {
+		align-self: center;
+		padding: 3px 10px;
+		background: var(--m-bg);
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		color: var(--m-fg);
+		font-size: 11px;
+		font-weight: 600;
+		cursor: pointer;
+	}
+	.files:hover:not(:disabled) {
+		border-color: var(--m-fg-muted);
+	}
+	.files:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+	.files[aria-expanded='true'] {
+		border-color: var(--m-accent, #4ec9b0);
+		color: var(--m-accent, #4ec9b0);
+	}
 	.counts {
 		margin-left: auto;
 		font-variant-numeric: tabular-nums;
@@ -709,6 +1015,114 @@
 	.publish:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
+	}
+	/* File-jump menu. Anchored under the Files button via a fixed
+	 * overlay; the card sits just below the banner. */
+	.files-overlay {
+		position: fixed;
+		inset: 0;
+		z-index: 100;
+	}
+	.files-menu {
+		position: fixed;
+		top: var(--m-review-banner-h, 35px);
+		left: 16px;
+		width: min(420px, calc(100vw - 32px));
+		max-height: min(60vh, 480px);
+		display: flex;
+		flex-direction: column;
+		background: var(--m-bg-2);
+		border: 1px solid var(--m-border-strong);
+		border-radius: 8px;
+		box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+		overflow: hidden;
+		z-index: 101;
+	}
+	.files-filter {
+		padding: 8px 10px;
+		background: var(--m-bg);
+		border-bottom: 1px solid var(--m-border);
+		color: var(--m-fg);
+		font-size: 12px;
+		font-family: var(--m-font-mono, monospace);
+		outline: none;
+	}
+	.files-filter::placeholder {
+		color: var(--m-fg-subtle);
+	}
+	.files-list {
+		list-style: none;
+		margin: 0;
+		padding: 4px;
+		overflow-y: auto;
+		min-height: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 1px;
+	}
+	.files-empty {
+		padding: 12px;
+		color: var(--m-fg-muted);
+		font-size: 12px;
+		font-style: italic;
+		text-align: center;
+	}
+	.files-row {
+		display: inline-flex;
+		align-items: baseline;
+		gap: 4px;
+		width: 100%;
+		padding: 4px 6px;
+		background: transparent;
+		border: none;
+		border-radius: 4px;
+		color: var(--m-fg);
+		font-family: var(--m-font-mono, monospace);
+		font-size: 12px;
+		text-align: left;
+		cursor: pointer;
+		white-space: nowrap;
+	}
+	.files-row:hover {
+		background: var(--m-bg-1);
+	}
+	.files-row.current {
+		color: var(--m-accent, #4ec9b0);
+	}
+	.files-row .status {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		min-width: 14px;
+		font-size: 10px;
+		font-weight: 600;
+		flex-shrink: 0;
+	}
+	.files-row .status-modified {
+		color: var(--m-git-modified, #e2c08d);
+	}
+	.files-row .status-added {
+		color: var(--m-git-added, #4ec9b0);
+	}
+	.files-row .status-deleted {
+		color: var(--m-git-deleted, #f48771);
+	}
+	.files-row .status-untracked,
+	.files-row .status-ignored {
+		color: var(--m-fg-muted);
+	}
+	.files-row .status-conflicted {
+		color: var(--m-warning, #e2c08d);
+	}
+	.files-row .dir {
+		color: var(--m-fg-muted);
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.files-row .name {
+		font-weight: 600;
+		overflow: hidden;
+		text-overflow: ellipsis;
 	}
 	.empty {
 		padding: 24px;

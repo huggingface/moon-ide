@@ -809,7 +809,14 @@
 		border: 1px solid var(--m-border);
 		border-radius: 6px;
 		background: var(--m-bg);
-		overflow: hidden;
+		/* `visible` (not `hidden`) so the sticky `.hdr` anchors to the
+		 * outer `.review-view` scroller instead of this section box
+		 * (which is exactly its content height, so `hidden` would make
+		 * the header never actually stick). The body wrapper below
+		 * reapplies `overflow: hidden` to keep the MergeView's
+		 * horizontal-scrollbar overflow and the rounded corner clip
+		 * contained, so this only relaxes clipping for the header. */
+		overflow: visible;
 		/* Keep a scrolled-to section clear of the sticky banner so
 		 * its header isn't hidden behind it on `scrollIntoView`. */
 		scroll-margin-top: var(--m-review-banner-h, 12px);
@@ -824,13 +831,22 @@
 		position: sticky;
 		/* Park just below the review view's sticky banner instead of
 		 * sliding under it. `--m-review-banner-h` is defined on the
-		 * scrolling `.review-view`; falls back to 0 outside it. */
+		 * scrolling `.review-view`; falls back to 0 outside it.
+		 * Effective because the section is `overflow: visible`, so the
+		 * nearest scrollport is `.review-view`. */
 		top: var(--m-review-banner-h, 0);
 		z-index: 2;
+		/* Span the section's full width so the sticky strip masks
+		 * diff content sliding under it edge-to-edge. The section's
+		 * card has `padding: 0 12px` on the outer scroller, so we
+		 * compensate here the same way the banner does. */
+		margin: 0 -10px;
+		padding: 6px 20px;
 	}
 	.review-section.collapsed .hdr {
 		border-bottom: none;
 	}
+
 	.caret {
 		display: inline-flex;
 		align-items: center;
@@ -932,6 +948,12 @@
 	.body {
 		display: flex;
 		min-height: 0;
+		/* Clips the MergeView's horizontal-scrollbar overflow and
+		 * keeps the diff from bleeding past the card's rounded
+		 * bottom corners — the containment the section box used
+		 * to provide via `overflow: hidden` before we relaxed it
+		 * so the sticky header could anchor to the outer scroller. */
+		overflow: hidden;
 	}
 	.placeholder {
 		padding: 12px;
