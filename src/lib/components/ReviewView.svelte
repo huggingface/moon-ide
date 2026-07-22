@@ -2,7 +2,8 @@
 	import { onDestroy, onMount } from 'svelte';
 	import { workspace, type SplitSide } from '../state.svelte';
 	import ReviewSection from './ReviewSection.svelte';
-	import { formatError, type GitStatusEntry } from '../protocol';
+	import { formatError, type GitStatusEntry, type ReviewComment } from '../protocol';
+	import { getCachedMarkdown, renderMarkdown } from '../markdown';
 
 	// The pane this review tab lives in. Plumbed through so a
 	// section's Ctrl-click goto-def replaces the review tab in the
@@ -162,6 +163,23 @@
 	// unpublished comment drafts exist, and review progress across
 	// the changed files. Both come from the active folder's store.
 	const commentCount: number = $derived(workspace.reviewComments.length);
+	// Drafts shown in the publish dialog so the user can verify each
+	// comment's body + anchor before it leaves the machine. Grouped by
+	// file (the review tab itself is the per-line source of truth; this
+	// is the consolidated "what will go to GitHub" view the spec calls
+	// for — `review-comments.md` § "Review summary").
+	const publishDrafts: readonly { path: string; comments: readonly ReviewComment[] }[] = $derived.by(() => {
+		const groups = new Map<string, ReviewComment[]>();
+		for (const c of workspace.reviewComments) {
+			const list = groups.get(c.anchor.path);
+			if (list) {
+				list.push(c);
+			} else {
+				groups.set(c.anchor.path, [c]);
+			}
+		}
+		return [...groups.entries()].map(([path, comments]) => ({ path, comments }));
+	});
 	const reviewedCount: number = $derived.by(() => {
 		const paths = new Set(entries.map((e) => e.path));
 		return workspace.reviewedFiles.filter((r) => paths.has(r.path)).length;
@@ -214,9 +232,46 @@
 		const slash = p.lastIndexOf('/');
 		return slash === -1 ? p : p.slice(slash + 1);
 	}
+	// "L42" or "L10–14" — the anchor label shown in the publish preview.
+	function lineLabel(c: ReviewComment): string {
+		const { startLine, endLine } = c.anchor;
+		return startLine === endLine ? `L${startLine}` : `L${startLine}\u2013${endLine}`;
+	}
 	function dirName(p: string): string {
 		const slash = p.lastIndexOf('/');
 		return slash === -1 ? '' : p.slice(0, slash);
+	}
+
+	// Render a comment body as markdown into the bound element. Mirrors
+	// the `renderMarkdownInto` helper the inline cards use: sync cache
+	// hit → innerHTML now; miss → text first, swap when the async
+	// render resolves. The `.markdown-body` class is global
+	// (`styles.css`) so the output looks identical to the inline card.
+	function commentBody(el: HTMLElement, body: string) {
+		const cached = getCachedMarkdown(body);
+		if (cached !== undefined) {
+			el.innerHTML = cached;
+			return;
+		}
+		el.textContent = body;
+		void renderMarkdown(body).then((html) => {
+			if (el.isConnected) {
+				el.innerHTML = html;
+			}
+		});
+	}
+
+	// Open the comment's file at its anchor line. For the "I can't find
+	// this comment" case — a draft on a file no longer in the diff, or
+	// anchored to an older revision — the only place to *read* it was
+	// this dialog; this action makes the dialog the way back to the
+	// code too. Jumps to the line in the pane the review tab lives in.
+	function openCommentFile(c: ReviewComment) {
+		if (publishPhase === 'busy') {
+			return;
+		}
+		closePublish();
+		void workspace.jumpTo(c.anchor.path, { line: c.anchor.startLine - 1, character: 0 }, side);
 	}
 
 	function registerSection(path: string, el: HTMLElement | null) {
@@ -515,6 +570,33 @@
 					{commentCount} comment{commentCount === 1 ? '' : 's'} will be posted to the branch's GitHub PR as one review. Comments
 					that can't be placed on the current PR head stay as local drafts.
 				</p>
+				<ul class="pub-drafts">
+					{#each publishDrafts as group (group.path)}
+						<li class="pub-draft-group">
+							<div class="pub-draft-path" title={group.path}>
+								{#if dirName(group.path)}<span class="dir">{dirName(group.path)}/</span>{/if}<span class="name"
+									>{fileName(group.path)}</span
+								>
+							</div>
+							<ul class="pub-draft-comments">
+								{#each group.comments as c (c.id)}
+									<li class="pub-draft-comment">
+										<button
+											type="button"
+											class="pub-draft-jump"
+											title="Open this file at line {c.anchor.startLine}"
+											disabled={publishPhase === 'busy'}
+											onclick={() => openCommentFile(c)}
+										>
+											<span class="pub-draft-loc">{c.anchor.side === 'base' ? 'left' : 'right'} {lineLabel(c)}</span>
+										</button>
+										<div class="pub-draft-body markdown-body" use:commentBody={c.body}></div>
+									</li>
+								{/each}
+							</ul>
+						</li>
+					{/each}
+				</ul>
 				<textarea
 					class="pub-summary"
 					bind:value={publishSummary}
@@ -703,6 +785,91 @@
 	.pub-summary:focus {
 		outline: none;
 		border-color: var(--m-accent, #4ec9b0);
+	}
+	/* Per-comment preview so the user can verify each draft's body
+	 * and anchor before it leaves the machine. Mirrors the banner's
+	 * file-path styling (dir muted, name bold). */
+	.pub-drafts {
+		list-style: none;
+		margin: 0 0 10px;
+		padding: 0;
+		max-height: 220px;
+		overflow-y: auto;
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		background: var(--m-bg);
+	}
+	.pub-draft-group {
+		padding: 6px 10px;
+	}
+	.pub-draft-group + .pub-draft-group {
+		border-top: 1px solid var(--m-border);
+	}
+	.pub-draft-path {
+		font-family: var(--m-font-mono, monospace);
+		font-size: 11px;
+		margin-bottom: 4px;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.pub-draft-path .dir {
+		color: var(--m-fg-muted);
+	}
+	.pub-draft-path .name {
+		color: var(--m-fg);
+		font-weight: 600;
+	}
+	.pub-draft-comments {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+	.pub-draft-comment {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+	}
+	.pub-draft-jump {
+		align-self: flex-start;
+		display: inline-flex;
+		align-items: baseline;
+		gap: 4px;
+		padding: 1px 6px;
+		background: var(--m-bg);
+		border: 1px solid var(--m-border);
+		border-radius: 3px;
+		color: var(--m-fg-muted);
+		font-family: var(--m-font-mono, monospace);
+		font-size: 10px;
+		cursor: pointer;
+		line-height: 1.4;
+	}
+	.pub-draft-jump:hover:not(:disabled) {
+		border-color: var(--m-accent, #4ec9b0);
+		color: var(--m-fg);
+	}
+	.pub-draft-jump:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+	.pub-draft-loc {
+		white-space: nowrap;
+	}
+	.pub-draft-body {
+		font-size: 12px;
+		line-height: 1.4;
+		color: var(--m-fg);
+		word-break: break-word;
+	}
+	:global(.pub-draft-body > :first-child) {
+		margin-top: 0;
+	}
+	:global(.pub-draft-body > :last-child) {
+		margin-bottom: 0;
 	}
 	.pub-actions {
 		display: flex;

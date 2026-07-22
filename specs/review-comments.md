@@ -148,8 +148,12 @@ appearing never shifts the code horizontally.
 - **Review summary.** The sticky banner (`Review changes · vs <base> · N files`)
   also gains a comment count and a **"Publish review →"** CTA when there are
   unposted comments. The CTA opens a small dialog: an optional review-summary
-  `body`, a preview of which comments will post / drift / can't be placed, and a
-  Publish button.
+  `body`, a per-comment preview list (file, side, line, markdown-rendered body —
+  each row clickable to open the file at that line, so a comment on a file no
+  longer in the diff, or anchored to an older revision, is still reachable), and
+  a Publish button. Drift reconciliation (which comments land / drift / are
+  lost) happens at publish time in the backend against the PR head, not as a
+  pre-flight preview here.
 - **No-PR state.** If `gh pr view` finds no PR for the branch, the dialog shows
   "No open PR for `<branch>`" and links to the create-PR URL the SCM panel
   already builds (`<repo>/pull/new/<branch>`). Comments stay as local drafts.
