@@ -81,3 +81,6 @@ ashpd = "0.10"
 # JSON payload codec; base64 framing keeps the wire format honest.
 # `base64` 0.22 ships the `Engine` trait we use directly.
 base64 = "0.22"
+
+[dev-dependencies]
+tempfile = { workspace = true }

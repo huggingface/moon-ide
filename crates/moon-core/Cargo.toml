@@ -35,4 +35,4 @@ url = { workspace = true }
 reqwest = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3.16"
+tempfile = { workspace = true }

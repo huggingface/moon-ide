@@ -2300,13 +2300,13 @@ class WorkspaceState {
 		// Snapshot HEAD before the fetch. A fetch itself only moves
 		// remote-tracking refs — local HEAD/index/worktree are
 		// unchanged — but the branch refresh we run afterwards also
-		// picks up *external* ref moves the fs watcher can't see
-		// (a `git reset --soft` / external commit / `git switch` to
-		// identical content rewrites `.git/refs/heads/<branch>`,
-		// which the non-recursive `.git/` watch misses). When the
-		// SHA differs from the pre-fetch snapshot, kick a status
-		// refresh so the SCM panel catches up instead of staying
-		// stale until the next window-focus / manual refresh.
+		// picks up external ref moves in the cases the fs watcher
+		// can't observe (it watches `.git/refs/` these days, but
+		// inotify watch exhaustion, attach failures and network
+		// mounts still leave blind spots). When the SHA differs
+		// from the pre-fetch snapshot, kick a status refresh so the
+		// SCM panel catches up instead of staying stale until the
+		// next window-focus / manual refresh.
 		const shaBefore = this.gitBranch.headShortSha;
 		try {
 			// Fetch failures (offline, no upstream, auth refused, 30s
@@ -3373,12 +3373,11 @@ class WorkspaceState {
 		// status fetch — `git symbolic-ref` is cheap and we want the
 		// SCM panel header to update when external `git checkout` /
 		// `git switch` runs from a terminal. The fs-watcher forwards
-		// `.git/HEAD` writes (so a symbolic-ref switch already
-		// triggers a refresh), but a `git switch` that only moves an
-		// existing branch ref rewrites `.git/refs/heads/<branch>`
-		// (nested, unwatched) and never touches `.git/HEAD` — so this
-		// opportunistic refresh on every status pass is the other
-		// half of how branch changes propagate back to the UI.
+		// `.git/HEAD` writes and ref moves under `.git/refs/`
+		// (commit / push / fetch), so this opportunistic refresh is
+		// belt-and-braces for the cases inotify can't observe (watch
+		// limit exhaustion, network mounts) plus the ahead/behind
+		// counts, which change with the status anyway.
 		void this.refreshGitBranch();
 		// `'default'` baseline routes through `git diff
 		// --name-status` against the merge-base; the entries
@@ -3750,9 +3749,14 @@ class WorkspaceState {
 				// that don't register watchers (rust-analyzer
 				// post-init, push-only servers) silently no-op
 				// inside the per-server filter, so the broad
-				// fan-out is cheap.
-				if (payload.paths.length > 0) {
-					void ipc.lsp.notifyFilesChanged(payload.paths).catch((err) => {
+				// fan-out is cheap. Git metadata paths stay out:
+				// the watcher forwards `.git/HEAD` / `.git/refs/`
+				// writes for the SCM panel, but no language
+				// server wants per-commit `.git` churn — a
+				// `**/*`-glob server would re-index for nothing.
+				const lspPaths = payload.paths.filter((p) => p !== '.git' && !p.startsWith('.git/'));
+				if (lspPaths.length > 0) {
+					void ipc.lsp.notifyFilesChanged(lspPaths).catch((err) => {
 						frontendLog('lsp.refresh', 'warn', `notifyFilesChanged failed: ${formatError(err)}`);
 					});
 				}

@@ -25,14 +25,23 @@
 //! `fs.inotify.max_user_watches` budget) on `node_modules` /
 //! `target/` / build output that the user's `.gitignore` already
 //! says to ignore. `.git/` is excluded by `ignore` unconditionally
-//! and re-added as one non-recursive watch so we still see
-//! `.git/HEAD` rewrites (branch-switch detection), `.git/index`
-//! rewrites (external `git reset --mixed` / `git add` / `git
-//! restore --staged`), and `.git/MERGE_HEAD` / `.git/MERGE_MSG`
-//! (merge start / abort). Nested ref moves under `.git/refs/` are
-//! not watched (event-storm tradeoff); the auto-fetch loop's
-//! HEAD-SHA snapshot is the safety net for those — see
-//! `runGitAutoFetch` in `state.svelte.ts`.
+//! and re-added by hand: one non-recursive watch on `.git/`
+//! itself (HEAD, index, MERGE_HEAD / MERGE_MSG, ORIG_HEAD,
+//! FETCH_HEAD, packed-refs) plus one recursive watch on
+//! `.git/refs/` so external ref moves — an agent or terminal
+//! `git commit`, a `git push` updating the remote-tracking ref,
+//! a `git fetch` — surface immediately instead of waiting for
+//! the 3-minute auto-fetch tick. Event filtering keeps the rest
+//! of the `.git/` churn (objects, logs, transient `*.lock`
+//! files) away from the frontend; see `is_dotgit_observed`.
+//! Linked worktrees keep their git metadata *outside* the
+//! workspace root (`.git` is a file pointing at the main repo);
+//! `attach` resolves the worktree's private gitdir and the
+//! shared commondir, watches those too, and maps their events
+//! back into a synthetic `.git/` namespace so the frontend sees
+//! the same shape either way. The auto-fetch loop's HEAD-SHA
+//! snapshot remains the safety net when inotify is unavailable
+//! — see `runGitAutoFetch` in `state.svelte.ts`.
 //!
 //! Cost of the manual approach: ~one inotify watch per source
 //! directory + a few hundred ms of walk on workspace open. Both
@@ -243,16 +252,12 @@ async fn run(app: AppHandle, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
 					}
 				}
 				let prev_count = pending_paths.len();
-				collect_event_paths(
-					&res,
-					current.as_ref().map(WatchedRoot::root),
-					&mut pending_paths,
-					&mut pending_topology,
-				);
+				collect_event_paths(&res, current.as_ref(), &mut pending_paths, &mut pending_topology);
 				if pending_paths.len() == prev_count {
-					// Event was filtered (`.git/`, access bump,
-					// `node_modules/`, out-of-root) — nothing to
-					// emit, nothing to schedule.
+					// Event was filtered (unobserved `.git/`
+					// churn, access bump, `node_modules/`,
+					// out-of-root) — nothing to emit, nothing
+					// to schedule.
 					continue;
 				}
 				let now = Instant::now();
@@ -328,19 +333,47 @@ async fn poll_optional_sleep(slot: &mut Option<Pin<Box<Sleep>>>) {
 struct WatchedRoot {
 	root: PathBuf,
 	watched_dirs: HashSet<PathBuf>,
+	/// Absolute directory prefixes whose events belong to the
+	/// repo's `.git/` namespace even though they live outside
+	/// `root`. Empty for a regular checkout (`.git/` is under the
+	/// root and strips naturally); for a linked worktree it holds
+	/// the private gitdir (`<main>/.git/worktrees/<name>`) and
+	/// the shared commondir (`<main>/.git`), most-specific first.
+	/// `relativize` maps an event under either prefix to a
+	/// synthetic `.git/<suffix>` workspace-relative path so the
+	/// downstream filter and the frontend see one shape.
+	dotgit_aliases: Vec<PathBuf>,
 }
 
 impl WatchedRoot {
-	fn root(&self) -> &Path {
-		&self.root
+	/// Map an absolute event path to the workspace-relative path
+	/// the frontend keys on, or `None` when the event is outside
+	/// both the root and every `.git` alias prefix (stale watch
+	/// after a root swap, symlink escape).
+	fn relativize(&self, raw: &Path) -> Option<PathBuf> {
+		for alias in &self.dotgit_aliases {
+			if let Ok(suffix) = raw.strip_prefix(alias) {
+				return Some(Path::new(".git").join(suffix));
+			}
+		}
+		let rel = raw.strip_prefix(&self.root).ok()?;
+		if rel.as_os_str().is_empty() {
+			// `notify` sometimes reports the watched root itself
+			// for directory-attribute events; the empty relative
+			// path isn't useful to the frontend (it can't
+			// intersect any open buffer).
+			return None;
+		}
+		Some(rel.to_path_buf())
 	}
 
 	/// Walk the workspace tree (gitignore-aware, `follow_links(false)`,
 	/// excluding `node_modules` and `.git`) and register a
-	/// non-recursive inotify watch per directory. `.git/` is
-	/// re-watched non-recursively *as one entry* so we still see
-	/// the `.git/HEAD` rewrite that external `git switch` /
-	/// `git checkout` use to flip branches.
+	/// non-recursive inotify watch per directory. Git metadata is
+	/// re-watched by hand (`.git/` top level plus `.git/refs/`;
+	/// gitdir + commondir for a linked worktree) so external git
+	/// activity — branch switches, commits, pushes, fetches —
+	/// reaches the SCM panel. See the module docs.
 	fn attach(watcher: &mut RecommendedWatcher, root: PathBuf) -> Self {
 		let mut watched_dirs: HashSet<PathBuf> = HashSet::new();
 		// Watch the workspace root itself first so events for
@@ -363,27 +396,74 @@ impl WatchedRoot {
 					path = %root.display(),
 					"failed to attach fs watcher; live refresh will be unavailable for this folder"
 				);
-				return WatchedRoot { root, watched_dirs };
+				return WatchedRoot {
+					root,
+					watched_dirs,
+					dotgit_aliases: Vec::new(),
+				};
 			}
 		}
 		// `.git/` would otherwise be invisible to the walker —
-		// `ignore` skips it unconditionally — but we need
-		// `.git/HEAD` writes to detect external branch switches.
-		// Watching `.git/` non-recursively gives us the entries
-		// directly inside (HEAD, index, ORIG_HEAD, MERGE_HEAD)
-		// without the per-commit storm of `.git/refs/` /
-		// `.git/objects/` writes that motivated the original
-		// `.git/` filter.
+		// `ignore` skips it unconditionally — but the SCM panel
+		// needs to hear about git metadata writes: `.git/HEAD`
+		// (branch switch), `.git/index` (stage / reset), and ref
+		// moves under `.git/refs/` (commit, push, fetch, branch
+		// create / delete). Two watches cover it: `.git/` itself
+		// non-recursively for the top-level files, and
+		// `.git/refs/` recursively for the (small, symlink-free)
+		// ref tree — notify's recursive walker following symlinks
+		// is a non-issue there, unlike the working tree. The
+		// event filter (`is_dotgit_observed`) drops the rest of
+		// the churn (`objects/`, `logs/`, `*.lock`) before it can
+		// reach the frontend.
+		let mut dotgit_aliases: Vec<PathBuf> = Vec::new();
 		let dotgit = root.join(".git");
 		if dotgit.is_dir() {
-			match watcher.watch(&dotgit, RecursiveMode::NonRecursive) {
-				Ok(()) => {
-					watched_dirs.insert(dotgit);
-				}
-				Err(e) => {
-					tracing::debug!(error = %e, "failed to watch .git/ for branch-switch detection");
+			let refs = dotgit.join("refs");
+			for (path, mode) in [(dotgit, RecursiveMode::NonRecursive), (refs, RecursiveMode::Recursive)] {
+				match watcher.watch(&path, mode) {
+					Ok(()) => {
+						watched_dirs.insert(path);
+					}
+					Err(e) => {
+						tracing::debug!(error = %e, path = %path.display(), "failed to watch git metadata dir");
+					}
 				}
 			}
+		} else if let Some((gitdir, commondir)) = resolve_worktree_git_dirs(&dotgit, &root) {
+			// Linked worktree: the metadata lives in the main
+			// repo. Watch the private gitdir (HEAD, index,
+			// MERGE_HEAD — everything per-worktree) plus the
+			// shared commondir (packed-refs) and its `refs/`
+			// tree, and remember the prefixes so `relativize`
+			// can fold their events back into `.git/<name>`.
+			// Order matters: the gitdir lives *under* the
+			// commondir, so the more specific prefix must strip
+			// first — `<gitdir>/HEAD` is the worktree's own HEAD
+			// and must map to `.git/HEAD`, not
+			// `.git/worktrees/<name>/HEAD`.
+			let refs = commondir.join("refs");
+			let watches = [
+				(gitdir.clone(), RecursiveMode::NonRecursive),
+				(commondir.clone(), RecursiveMode::NonRecursive),
+				(refs, RecursiveMode::Recursive),
+			];
+			for (path, mode) in watches {
+				if watched_dirs.contains(&path) {
+					continue;
+				}
+				match watcher.watch(&path, mode) {
+					Ok(()) => {
+						watched_dirs.insert(path);
+					}
+					Err(e) => {
+						tracing::debug!(error = %e, path = %path.display(), "failed to watch worktree git metadata dir");
+					}
+				}
+			}
+			dotgit_aliases.push(gitdir);
+			dotgit_aliases.push(commondir);
+			dotgit_aliases.dedup();
 		}
 		let walker = WalkBuilder::new(&root)
 			.follow_links(false)
@@ -429,7 +509,11 @@ impl WatchedRoot {
 			watch_failures,
 			"fs watcher attached",
 		);
-		WatchedRoot { root, watched_dirs }
+		WatchedRoot {
+			root,
+			watched_dirs,
+			dotgit_aliases,
+		}
 	}
 
 	fn detach(self, watcher: &mut RecommendedWatcher) {
@@ -519,34 +603,75 @@ fn path_has_excluded_component(path: &Path) -> bool {
 	})
 }
 
+/// Resolve a linked worktree's git metadata directories from its
+/// `.git` *file* (`gitdir: <path>` pointing at
+/// `<main>/.git/worktrees/<name>`). Returns `(gitdir, commondir)`
+/// canonicalised, or `None` when the root isn't a linked worktree
+/// (or the pointer is stale). The commondir is where the shared
+/// state lives — `refs/`, `packed-refs` — while the gitdir holds
+/// the per-worktree files (`HEAD`, `index`, `MERGE_HEAD`,
+/// `FETCH_HEAD`, `commondir`).
+///
+/// Known imprecision: the commondir's own top-level `HEAD` is the
+/// *main* checkout's HEAD, and `relativize` folds it to
+/// `.git/HEAD` just like the worktree's. That can trigger a
+/// refresh for a branch switch that happened in the sibling
+/// checkout — harmless, because every refresh re-probes actual
+/// git state rather than trusting the path.
+fn resolve_worktree_git_dirs(dotgit_file: &Path, root: &Path) -> Option<(PathBuf, PathBuf)> {
+	if !dotgit_file.is_file() {
+		return None;
+	}
+	let content = std::fs::read_to_string(dotgit_file).ok()?;
+	let pointer = content.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
+	let gitdir = if Path::new(pointer).is_absolute() {
+		PathBuf::from(pointer)
+	} else {
+		root.join(pointer)
+	};
+	// Canonicalise so the registered watch paths and the event
+	// paths notify reports agree byte-for-byte — the `gitdir:`
+	// pointer and especially the `commondir` file (usually the
+	// relative `../..`) would otherwise leave `..` components in
+	// the alias prefixes and `strip_prefix` would never match.
+	let gitdir = std::fs::canonicalize(&gitdir).ok()?;
+	let commondir = match std::fs::read_to_string(gitdir.join("commondir")) {
+		Ok(s) => {
+			let s = s.trim();
+			if Path::new(s).is_absolute() {
+				PathBuf::from(s)
+			} else {
+				gitdir.join(s)
+			}
+		}
+		Err(_) => gitdir.clone(),
+	};
+	let commondir = std::fs::canonicalize(&commondir).ok()?;
+	Some((gitdir, commondir))
+}
+
 /// Sift one notify event into `pending`. Drops `.git/` churn
-/// (a single commit writes dozens of ref / index / log files) and
-/// `Access` events (read-only stat bumps from rust-analyzer,
-/// tsgo, anything walking `.gitignore`) — neither moves what the
-/// tree should render. The `.git/` exceptions are the small set
-/// of top-level files the SCM panel observes:
+/// (a single commit writes object, log and lock files alongside
+/// the ref) and `Access` events (read-only stat bumps from
+/// rust-analyzer, tsgo, anything walking `.gitignore`) — neither
+/// moves what the tree should render. The `.git/` paths that
+/// *do* survive are the ones the SCM panel observes — see
+/// `is_dotgit_observed`.
 ///
-///   - `.git/HEAD` — external `git switch` / `git checkout
-///     <branch>` writes no working-tree files when the new
-///     branch's content matches the old one's, but always
-///     rewrites `.git/HEAD`. Letting it through is how the SCM
-///     panel's branch label notices the terminal flipped to a
-///     different branch.
-///   - `.git/MERGE_HEAD` + `.git/MERGE_MSG` — these appear when
-///     `git merge` starts and disappear when it commits / aborts.
-///     Surfacing them lets `refreshGitMergeState` snap the SCM
-///     panel into / out of merge-in-progress mode without the
-///     user clicking anything.
-///
-/// Surviving paths are made workspace-relative before storage;
-/// anything outside the current root is dropped so we don't
+/// Surviving paths are made workspace-relative before storage
+/// (worktree git metadata folds into the synthetic `.git/`
+/// namespace via `WatchedRoot::relativize`); anything outside
+/// the current root and its git aliases is dropped so we don't
 /// accidentally publish paths from a previous root after a swap.
 /// Sticky-flips `topology` to `true` for any Create / Remove /
 /// Rename — the frontend uses that to decide whether the
-/// recursive `collect_paths` walk is needed.
+/// recursive `collect_paths` walk is needed. `.git/` paths never
+/// count towards topology: git metadata isn't rendered in the
+/// tree, and a commit's loose-ref create / remove would
+/// otherwise force a full re-walk for nothing.
 fn collect_event_paths(
 	res: &notify::Result<Event>,
-	root: Option<&Path>,
+	watched: Option<&WatchedRoot>,
 	pending: &mut HashSet<PathBuf>,
 	topology: &mut bool,
 ) {
@@ -560,12 +685,18 @@ fn collect_event_paths(
 	if matches!(event.kind, EventKind::Access(_)) {
 		return;
 	}
-	let Some(root) = root else {
+	let Some(watched) = watched else {
 		return;
 	};
-	let mut took_a_path = false;
+	let mut took_a_tree_path = false;
 	for raw in &event.paths {
-		if is_in_dotgit(raw) && !is_dotgit_observed_top_level(raw) {
+		let Some(rel) = watched.relativize(raw) else {
+			continue;
+		};
+		if is_in_dotgit(&rel) {
+			if is_dotgit_observed(&rel) {
+				pending.insert(rel);
+			}
 			continue;
 		}
 		// Belt-and-braces. The walker excludes `node_modules` so
@@ -575,56 +706,65 @@ fn collect_event_paths(
 		// `node_modules/...` paths to the frontend's per-buffer
 		// reload loop and cause `subset.has(open_file.path)`
 		// mismatches.
-		if path_has_excluded_component(raw) {
+		if path_has_excluded_component(&rel) {
 			continue;
 		}
-		let Ok(rel) = raw.strip_prefix(root) else {
-			continue;
-		};
-		// `notify` sometimes reports the watched root itself for
-		// directory-attribute events; the empty relative path
-		// isn't useful to the frontend (it can't intersect any
-		// open buffer) so we drop it.
-		if rel.as_os_str().is_empty() {
-			continue;
-		}
-		pending.insert(rel.to_path_buf());
-		took_a_path = true;
+		pending.insert(rel);
+		took_a_tree_path = true;
 	}
-	// Only classify topology when at least one in-root path
-	// survived filtering. Otherwise every `.git/`-only event
-	// would flip the flag for nothing. `.git/HEAD` writes are
-	// always plain modifications, so this branch never trips
-	// for them — `is_topology_event(Modify(_))` returns `false`.
-	if took_a_path && is_topology_event(&event.kind) {
+	if took_a_tree_path && is_topology_event(&event.kind) {
 		*topology = true;
 	}
 }
 
-/// `true` for the small set of `.git/` top-level files the
-/// frontend cares about: `HEAD` (external branch switches),
-/// `MERGE_HEAD` + `MERGE_MSG` (start / abort / finish of a
-/// merge), and `index` (commit / restore / `git reset --mixed`
-/// — the index rewrites even when no working-tree file changes,
-/// so without this the SCM panel stays stale after an external
-/// `git reset HEAD^1` or `git add` until the next focus/manual
-/// refresh). We match by the last two path components rather
-/// than full-path equality so worktrees rooted at any depth
-/// match — and so we don't accidentally pick up
-/// `.git/refs/heads/HEAD`-style paths.
-fn is_dotgit_observed_top_level(path: &Path) -> bool {
-	let mut components = path.components().rev();
-	let Some(last) = components.next() else {
-		return false;
-	};
-	let last = last.as_os_str();
-	if last != "HEAD" && last != "MERGE_HEAD" && last != "MERGE_MSG" && last != "index" {
+/// `true` for the workspace-relative `.git/` paths the frontend
+/// cares about:
+///
+///   - `.git/HEAD` — external `git switch` / `git checkout
+///     <branch>` writes no working-tree files when the new
+///     branch's content matches the old one's, but always
+///     rewrites `.git/HEAD`.
+///   - `.git/index` — commit / `git add` / `git reset --mixed`
+///     rewrite the index even when no working-tree file changes.
+///   - `.git/MERGE_HEAD` + `.git/MERGE_MSG` — appear when
+///     `git merge` starts and disappear when it commits /
+///     aborts; `refreshGitMergeState` keys off them.
+///   - `.git/ORIG_HEAD` — written by merge / rebase / reset,
+///     often alongside a ref move we'd want anyway.
+///   - `.git/FETCH_HEAD` — an external `git fetch` may move only
+///     remote-tracking refs, but it always rewrites this.
+///   - `.git/packed-refs` — ref updates after a `git pack-refs`
+///     land here instead of a loose ref file.
+///   - anything under `.git/refs/` except git's transient
+///     `*.lock` files — loose ref moves: commit, push (updates
+///     the remote-tracking ref), fetch, branch create / delete.
+///
+/// Everything else under `.git/` (objects, logs, hooks, temp
+/// lock files) is churn the frontend must never see — a single
+/// commit would otherwise fan out into dozens of emits.
+fn is_dotgit_observed(rel: &Path) -> bool {
+	let mut components = rel.components();
+	if components.next().map(|c| c.as_os_str()) != Some(std::ffi::OsStr::new(".git")) {
 		return false;
 	}
-	let Some(parent) = components.next() else {
+	let Some(second) = components.next() else {
 		return false;
 	};
-	parent.as_os_str() == ".git"
+	let second = second.as_os_str();
+	if second == "refs" {
+		let is_lock = rel.extension().is_some_and(|e| e == "lock");
+		return !is_lock;
+	}
+	if components.next().is_some() {
+		return false;
+	}
+	second == "HEAD"
+		|| second == "ORIG_HEAD"
+		|| second == "FETCH_HEAD"
+		|| second == "MERGE_HEAD"
+		|| second == "MERGE_MSG"
+		|| second == "index"
+		|| second == "packed-refs"
 }
 
 /// `true` for events that change which entries the tree should
@@ -660,4 +800,221 @@ fn path_to_forward_slash(p: PathBuf) -> String {
 
 fn is_in_dotgit(path: &Path) -> bool {
 	path.components().any(|c| c.as_os_str() == ".git")
+}
+
+#[cfg(test)]
+mod tests {
+	use notify::event::DataChange;
+
+	use super::*;
+
+	fn plain_root() -> WatchedRoot {
+		WatchedRoot {
+			root: PathBuf::from("/ws"),
+			watched_dirs: HashSet::new(),
+			dotgit_aliases: Vec::new(),
+		}
+	}
+
+	fn event(kind: EventKind, paths: &[&str]) -> Event {
+		let mut e = Event::new(kind);
+		for p in paths {
+			e = e.add_path(PathBuf::from(p));
+		}
+		e
+	}
+
+	fn modify(paths: &[&str]) -> Event {
+		event(EventKind::Modify(ModifyKind::Data(DataChange::Any)), paths)
+	}
+
+	fn collect(e: Event, watched: &WatchedRoot) -> (Vec<String>, bool) {
+		let mut pending = HashSet::new();
+		let mut topology = false;
+		collect_event_paths(&Ok(e), Some(watched), &mut pending, &mut topology);
+		let mut paths: Vec<String> = pending.into_iter().map(path_to_forward_slash).collect();
+		paths.sort();
+		(paths, topology)
+	}
+
+	#[test]
+	fn observed_dotgit_files_survive_filtering() {
+		let root = plain_root();
+		for name in [
+			"HEAD",
+			"index",
+			"MERGE_HEAD",
+			"MERGE_MSG",
+			"ORIG_HEAD",
+			"FETCH_HEAD",
+			"packed-refs",
+		] {
+			let raw = format!("/ws/.git/{name}");
+			let (paths, topology) = collect(modify(&[&raw]), &root);
+			assert_eq!(paths, vec![format!(".git/{name}")], "{name} should survive");
+			assert!(!topology);
+		}
+	}
+
+	#[test]
+	fn ref_moves_survive_but_lock_files_do_not() {
+		let (paths, _) = collect(
+			modify(&[
+				"/ws/.git/refs/heads/feature/x",
+				"/ws/.git/refs/heads/feature/x.lock",
+				"/ws/.git/refs/remotes/origin/main",
+			]),
+			&plain_root(),
+		);
+		assert_eq!(
+			paths,
+			vec![
+				".git/refs/heads/feature/x".to_string(),
+				".git/refs/remotes/origin/main".to_string()
+			]
+		);
+	}
+
+	#[test]
+	fn dotgit_churn_is_dropped() {
+		let (paths, topology) = collect(
+			modify(&[
+				"/ws/.git/objects/ab/cdef0123",
+				"/ws/.git/logs/HEAD",
+				"/ws/.git/logs/refs/heads/main",
+				"/ws/.git/COMMIT_EDITMSG",
+				"/ws/.git/index.lock",
+				"/ws/.git/HEAD.lock",
+			]),
+			&plain_root(),
+		);
+		assert!(paths.is_empty(), "got {paths:?}");
+		assert!(!topology);
+	}
+
+	#[test]
+	fn dotgit_events_never_flip_topology() {
+		// A commit creates / removes loose ref files; that must
+		// not force the frontend's recursive tree re-walk.
+		let (paths, topology) = collect(
+			event(EventKind::Create(CreateKind::File), &["/ws/.git/refs/heads/main"]),
+			&plain_root(),
+		);
+		assert_eq!(paths, vec![".git/refs/heads/main".to_string()]);
+		assert!(!topology);
+	}
+
+	#[test]
+	fn tree_create_flips_topology() {
+		let (paths, topology) = collect(
+			event(EventKind::Create(CreateKind::File), &["/ws/src/new.rs"]),
+			&plain_root(),
+		);
+		assert_eq!(paths, vec!["src/new.rs".to_string()]);
+		assert!(topology);
+	}
+
+	#[test]
+	fn node_modules_and_out_of_root_paths_are_dropped() {
+		let (paths, topology) = collect(
+			event(
+				EventKind::Create(CreateKind::File),
+				&["/ws/node_modules/foo/index.js", "/elsewhere/file.txt", "/ws"],
+			),
+			&plain_root(),
+		);
+		assert!(paths.is_empty(), "got {paths:?}");
+		assert!(!topology);
+	}
+
+	#[test]
+	fn worktree_aliases_fold_into_synthetic_dotgit() {
+		let watched = WatchedRoot {
+			root: PathBuf::from("/ws/wt"),
+			watched_dirs: HashSet::new(),
+			// Most-specific first: the gitdir lives under the
+			// commondir, mirroring `attach`'s push order.
+			dotgit_aliases: vec![PathBuf::from("/main/.git/worktrees/wt"), PathBuf::from("/main/.git")],
+		};
+		let (paths, topology) = collect(
+			modify(&[
+				"/main/.git/worktrees/wt/HEAD",
+				"/main/.git/worktrees/wt/index",
+				"/main/.git/refs/heads/feature",
+				"/main/.git/packed-refs",
+				"/main/.git/objects/ab/cdef0123",
+				"/main/.git/worktrees/other/HEAD",
+			]),
+			&watched,
+		);
+		assert_eq!(
+			paths,
+			vec![
+				".git/HEAD".to_string(),
+				".git/index".to_string(),
+				".git/packed-refs".to_string(),
+				".git/refs/heads/feature".to_string(),
+			]
+		);
+		assert!(!topology);
+	}
+
+	#[test]
+	fn nested_dotgit_outside_root_level_is_dropped() {
+		let (paths, _) = collect(modify(&["/ws/vendor/dep/.git/HEAD"]), &plain_root());
+		assert!(paths.is_empty(), "got {paths:?}");
+	}
+
+	#[test]
+	fn resolves_gitdir_and_commondir_of_a_real_linked_worktree() {
+		let tmp = tempfile::tempdir().expect("tempdir");
+		let main = tmp.path().join("main");
+		std::fs::create_dir(&main).expect("mkdir main");
+		let git = |args: &[&str], cwd: &Path| {
+			let out = std::process::Command::new("git")
+				.args(args)
+				.current_dir(cwd)
+				.env("GIT_AUTHOR_NAME", "t")
+				.env("GIT_AUTHOR_EMAIL", "t@t")
+				.env("GIT_COMMITTER_NAME", "t")
+				.env("GIT_COMMITTER_EMAIL", "t@t")
+				.output()
+				.expect("spawn git");
+			assert!(
+				out.status.success(),
+				"git {args:?}: {}",
+				String::from_utf8_lossy(&out.stderr)
+			);
+		};
+		git(&["init", "-q", "-b", "main"], &main);
+		git(&["commit", "-q", "--allow-empty", "-m", "init"], &main);
+		let wt = tmp.path().join("wt");
+		git(
+			&[
+				"worktree",
+				"add",
+				"-q",
+				"-b",
+				"feature",
+				wt.to_str().expect("utf8"),
+				"main",
+			],
+			&main,
+		);
+
+		let dotgit = wt.join(".git");
+		assert!(dotgit.is_file(), "worktree .git should be a pointer file");
+		let (gitdir, commondir) = resolve_worktree_git_dirs(&dotgit, &wt).expect("resolve");
+		let canonical_main_git = std::fs::canonicalize(main.join(".git")).expect("canonicalize");
+		assert_eq!(commondir, canonical_main_git);
+		assert!(
+			gitdir.starts_with(canonical_main_git.join("worktrees")),
+			"gitdir {gitdir:?}"
+		);
+		assert!(gitdir.join("HEAD").is_file());
+		assert!(commondir.join("refs").is_dir());
+
+		// A plain checkout's `.git` directory is not a pointer.
+		assert!(resolve_worktree_git_dirs(&main.join(".git"), &main).is_none());
+	}
 }

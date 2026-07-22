@@ -30,6 +30,7 @@ moon-protocol = { path = "crates/moon-protocol" }
 moon-coder = { path = "crates/moon-coder" }
 moon-slack = { path = "crates/moon-slack" }
 moon-container = { path = "crates/moon-container" }
+tempfile = "3.16"
 moon-terminal = { path = "crates/moon-terminal" }
 
 anyhow = "1.0"

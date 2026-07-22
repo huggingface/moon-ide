@@ -196,8 +196,10 @@ leave the server on a stale view. Two closures:
 - **Server-driven (steady state).** We advertise
   `didChangeWatchedFiles` dynamic registration + diagnostics
   `refreshSupport`. Servers register their watch globs; the
-  frontend's `fs:changed` listener forwards each batch and the
-  broker fans out per-server, filtered through that server's globs.
+  frontend's `fs:changed` listener forwards each batch (minus
+  `.git/` metadata paths, which the watcher surfaces for the SCM
+  panel but no server wants) and the broker fans out per-server,
+  filtered through that server's globs.
   Servers respond with `workspace/diagnostic/refresh`, which makes
   the broker re-pull every open buffer on that server. The watcher
   carries no per-path change kind, so we send `Changed` for
