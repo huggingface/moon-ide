@@ -227,6 +227,16 @@ pub struct GitBranchInfo {
 	/// the count couldn't be determined. The SCM panel shows the
 	/// "Update from main" button iff this is `> 0`.
 	pub default_branch_behind: u32,
+	/// Local short name of the branch `git switch -` would return
+	/// to — the previous checked-out branch, resolved via
+	/// `git rev-parse --abbrev-ref @{-1}`. `None` when there's no
+	/// previous switch recorded (fresh repo, `@{-1}` doesn't
+	/// resolve), or when the previous state was detached HEAD (git
+	/// only records branch names, so `@{-1}` abbreviates to empty).
+	/// Lets the SCM panel render a "switch back to <branch>" button
+	/// while sitting on the default branch, without keeping its own
+	/// history.
+	pub previous_branch: Option<String>,
 }
 
 /// One row in the branch-switcher palette. Two kinds today: a

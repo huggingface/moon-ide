@@ -294,6 +294,7 @@ impl BridgeRpcHandler for BridgeRpc {
 						"behind": branch.behind,
 						"default_branch_remote_ref": branch.default_branch_remote_ref,
 						"default_branch_behind": branch.default_branch_behind,
+						"previous_branch": branch.previous_branch,
 					},
 					"changes": {
 						"added": added,

@@ -231,6 +231,14 @@ requested surface:
   to the default branch (`workspace_scm_switch_branch`, wrapping the
   same `branch_switch` host method as the desktop's switcher).
   Disabled while the tree is dirty — commit or discard first.
+- **Switch back to previous branch.** The mirror gesture: when the
+  folder is _on_ its default branch and git remembers a previous
+  branch (`@{-1}`), a "⇄ Switch to <branch>" chip swaps the working
+  tree back to it. The previous branch name is forwarded in the
+  `workspace_scm_status` response's `branch.previous_branch` field
+  (resolved server-side from `git rev-parse --abbrev-ref @{-1}`), so
+  the chip hides itself when there's no recorded previous branch
+  (fresh repo, or the prior state was detached HEAD).
 - **SCM (git) status + commit.** The workspace view shows the
   active folder's current branch, ahead/behind upstream, changed
   file counts (added / modified / deleted) and a collapsible file

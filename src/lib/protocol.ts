@@ -434,6 +434,13 @@ export type GitBranchInfo = {
 	 * affordance iff this is `> 0`.
 	 */
 	defaultBranchBehind: number;
+	/**
+	 * Local short name of the branch `git switch -` would return
+	 * to — the previous checked-out branch. `null` when there's no
+	 * previous switch recorded (fresh repo, detached HEAD prior),
+	 * so the SCM panel can hide its "switch back" affordance.
+	 */
+	previousBranch: string | null;
 };
 
 /**

@@ -2573,6 +2573,7 @@ class WorkspaceState {
 		prUrl: null,
 		defaultBranchRemoteRef: null,
 		defaultBranchBehind: 0,
+		previousBranch: null,
 	});
 
 	/**
@@ -2717,6 +2718,7 @@ class WorkspaceState {
 				prUrl: null,
 				defaultBranchRemoteRef: null,
 				defaultBranchBehind: 0,
+				previousBranch: null,
 			};
 		}
 		// Merge state is a sibling probe — `.git/MERGE_HEAD`

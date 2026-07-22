@@ -67,6 +67,10 @@ type ScmStatus = {
 		default_branch_remote_ref?: string | null;
 		/** Commits the default branch has that HEAD doesn't. */
 		default_branch_behind?: number;
+		/** Branch `git switch -` would return to; null when there's no
+		 * recorded previous branch. Drives the "switch back" chip on the
+		 * default branch. */
+		previous_branch?: string | null;
 	};
 	changes: { added: number; modified: number; deleted: number; total: number };
 	files: { path: string; status: string }[];

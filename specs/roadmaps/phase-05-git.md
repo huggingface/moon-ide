@@ -294,6 +294,20 @@ Changes` that surfaces when the repo's default branch
   round-trip is needed. Conflicts / dirty-tree refusals propagate
   git's stderr verbatim via flash; an in-app abort affordance is
   a later concern (Phase 5's full conflict UI).
+- **Switch back to previous branch.** The one-click `⇄` "switch
+  to the default branch" button in the SCM panel header has a
+  mirror for the inverse gesture: when the working tree is _on_
+  the default branch and git remembers a previous branch
+  (`@{-1}`), a `⇄` icon button renders next to it that switches
+  back to that branch (`git switch <name>` via the same
+  `branch_switch` path). The previous branch name rides on the
+  existing `git_branch` IPC as `GitBranchInfo.previousBranch`
+  (resolved `git rev-parse --abbrev-ref @{-1}`), so no extra
+  round-trip is needed and the label stays current as the user
+  switches around. Hidden when there's no recorded previous
+  branch (fresh repo, or prior state was detached HEAD — git's
+  branch stack only records branch names) or when it would
+  target the branch the tree is already on.
 - **Branch switcher.** Cmd+Shift+B (and a click on the branch
   label) opens a Cmd+P-style palette listing recent local
   branches plus open GitHub PRs in a single filterable list.

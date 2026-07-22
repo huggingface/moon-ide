@@ -355,6 +355,28 @@
 		await workspace.switchToBranch({ kind: 'local', name: defaultBranchShortName });
 	}
 
+	// "Switch back" — the inverse of `switchToDefault`, shown when we're
+	// sitting on the default branch and git remembers a previous branch
+	// (`@{-1}`). Reuses the same `git switch <name>` path so a dirty tree
+	// is surfaced by git's own refusal and the branch label refreshes
+	// through the regular `switchToBranch` flow. Hidden when there's no
+	// recorded previous branch (fresh repo, or the previous state was
+	// detached HEAD) or when it would target the branch we're already on.
+	const canSwitchToPrevious = $derived(
+		!busy &&
+			workspace.gitBranch.name !== null &&
+			workspace.gitBranch.name === defaultBranchShortName &&
+			workspace.gitBranch.previousBranch !== null &&
+			workspace.gitBranch.previousBranch !== workspace.gitBranch.name,
+	);
+	async function switchToPrevious() {
+		const target = workspace.gitBranch.previousBranch;
+		if (target === null || target === workspace.gitBranch.name) {
+			return;
+		}
+		await workspace.switchToBranch({ kind: 'local', name: target });
+	}
+
 	// Tooltip detail for the sync button. Plain-text fallback for
 	// the (Push / Pull / Sync) labels that we used to bake into
 	// the button text.
@@ -951,6 +973,18 @@
 						aria-label={`Switch to ${defaultBranchShortName}`}
 						disabled={busy}
 						onclick={switchToDefault}
+					>
+						<SwitchIcon />
+					</button>
+				{/if}
+				{#if canSwitchToPrevious}
+					<button
+						type="button"
+						class="icon-btn"
+						title={`Switch back to ${workspace.gitBranch.previousBranch}`}
+						aria-label={`Switch back to ${workspace.gitBranch.previousBranch}`}
+						disabled={busy}
+						onclick={switchToPrevious}
 					>
 						<SwitchIcon />
 					</button>

@@ -2435,6 +2435,7 @@ fn run_git_branch(root: &Utf8Path) -> GitBranchInfo {
 		_ => None,
 	};
 
+	let previous_branch = resolve_previous_branch(root);
 	let default_branch_remote_ref = resolve_default_remote_ref(root);
 	// Hide the "Update from main" affordance when we're already
 	// on the default branch — the regular `Sync Changes` button
@@ -2469,6 +2470,48 @@ fn run_git_branch(root: &Utf8Path) -> GitBranchInfo {
 		pr_url,
 		default_branch_remote_ref,
 		default_branch_behind,
+		previous_branch,
+	}
+}
+
+/// Best-effort resolution of the previous checked-out branch — the
+/// ref `git switch -` would land on. Reads `@{-1}` (git's own
+/// most-recent branch stack) via `git rev-parse --abbrev-ref`, which
+/// returns the empty string when `@{-1}` points at a detached commit
+/// (git only records branch names, not SHAs, in its branch stack) and
+/// fails outright when no previous switch has been recorded yet (a
+/// fresh repo that's only ever been on one branch). Both collapse to
+/// `None`; the SCM panel hides its "switch back" affordance in those
+/// cases. Resolved on every `git_branch` call so the label stays
+/// current as the user switches around — no client-side history to
+/// drift out of sync.
+fn resolve_previous_branch(root: &Utf8Path) -> Option<String> {
+	use std::process::Command;
+
+	let name = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["rev-parse", "--abbrev-ref", "@{-1}"])
+		.output()
+		.ok()
+		.filter(|o| o.status.success())
+		.and_then(|o| String::from_utf8(o.stdout).ok())
+		.map(|s| s.trim().to_owned())
+		.filter(|s| !s.is_empty())?;
+	// `@{-1}` can abbreviate to a remote-tracking ref
+	// (`origin/main`) when the previous checkout was of that ref
+	// directly; strip the remote prefix so the label and the
+	// `git switch <name>` we issue on click both use the local short
+	// name. `git switch origin/main` would create a new local branch
+	// named `origin/main`, which is not what the chip means.
+	let stripped = name.split_once('/').map(|(_, short)| short.to_owned()).unwrap_or(name);
+	// `HEAD` means `@{-1}` resolved to the current branch — git
+	// returns it when the previous-entry pointer happens to alias
+	// the current ref. Not useful as a "switch back" target.
+	if stripped == "HEAD" {
+		None
+	} else {
+		Some(stripped)
 	}
 }
 
@@ -8629,6 +8672,80 @@ mod tests {
 			"expected default_branch_behind=1 after fetch, got {branch:?}"
 		);
 		assert_eq!(branch.name.as_deref(), Some("feature"));
+	}
+
+	/// `previous_branch` tracks git's own `@{-1}` so the SCM panel
+	/// can render its "switch back" affordance entirely from the
+	/// `git_branch` response. After switching from `feature` to
+	/// `main`, `@{-1}` points at `feature`; a fresh repo with no
+	/// prior switch yields `None`; a prior detached-HEAD state also
+	/// yields `None` (git's branch stack records branch names only, so
+	/// `@{-1}` abbreviates to empty).
+	#[tokio::test]
+	async fn git_branch_reports_previous_branch_after_switch() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping previous-branch test");
+			return;
+		};
+
+		let root = TempDir::new().unwrap();
+		let repo = root.path();
+		run_git(&git, repo, &["init", "-q", "-b", "main"]);
+		run_git(&git, repo, &["config", "user.email", "t@example.com"]);
+		run_git(&git, repo, &["config", "user.name", "T"]);
+		std::fs::write(repo.join("README.md"), "v1\n").unwrap();
+		run_git(&git, repo, &["add", "."]);
+		run_git(&git, repo, &["commit", "-q", "-m", "one"]);
+		run_git(&git, repo, &["switch", "-q", "-c", "feature"]);
+
+		let utf8 = Utf8PathBuf::from_path_buf(repo.canonicalize().unwrap()).unwrap();
+		// On `feature` with no prior switch from another branch, @{-1}
+		// resolves to `main` (the branch `feature` was created from).
+		let branch = LocalHost::new(utf8.clone()).git_branch().await.unwrap();
+		assert_eq!(branch.name.as_deref(), Some("feature"));
+		assert_eq!(
+			branch.previous_branch.as_deref(),
+			Some("main"),
+			"expected @{{-1}} to resolve to main, got {branch:?}",
+		);
+
+		// Switch back to `main`: @{-1} now points at `feature`.
+		run_git(&git, repo, &["switch", "-q", "main"]);
+		let branch = LocalHost::new(utf8.clone()).git_branch().await.unwrap();
+		assert_eq!(branch.name.as_deref(), Some("main"));
+		assert_eq!(
+			branch.previous_branch.as_deref(),
+			Some("feature"),
+			"expected @{{-1}} to flip to feature after switching back, got {branch:?}",
+		);
+	}
+
+	/// A fresh repo that has only ever sat on one branch has no `@{-1}`
+	/// entry, so `previous_branch` must be `None` — the SCM panel hides
+	/// its "switch back" affordance in that state.
+	#[tokio::test]
+	async fn git_branch_previous_branch_is_none_in_fresh_repo() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping fresh-repo previous-branch test");
+			return;
+		};
+
+		let root = TempDir::new().unwrap();
+		let repo = root.path();
+		run_git(&git, repo, &["init", "-q", "-b", "main"]);
+		run_git(&git, repo, &["config", "user.email", "t@example.com"]);
+		run_git(&git, repo, &["config", "user.name", "T"]);
+		std::fs::write(repo.join("README.md"), "v1\n").unwrap();
+		run_git(&git, repo, &["add", "."]);
+		run_git(&git, repo, &["commit", "-q", "-m", "one"]);
+
+		let utf8 = Utf8PathBuf::from_path_buf(repo.canonicalize().unwrap()).unwrap();
+		let branch = LocalHost::new(utf8).git_branch().await.unwrap();
+		assert_eq!(branch.name.as_deref(), Some("main"));
+		assert_eq!(
+			branch.previous_branch, None,
+			"fresh repo has no previous switch — previous_branch must be None, got {branch:?}",
+		);
 	}
 
 	/// On the default branch itself the "Update from main" button

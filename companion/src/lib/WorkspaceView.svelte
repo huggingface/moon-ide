@@ -183,6 +183,18 @@
 					⇄ Switch to {defaultBranch}
 				</button>
 			{/if}
+			{#if onDefaultBranch && scm.branch.previous_branch && scm.branch.previous_branch !== scm.branch.name}
+				<button
+					class="ghost scm-default-btn"
+					onclick={() => app.scmSwitchBranch(scm.branch.previous_branch!)}
+					disabled={app.scmBusy || scm.changes.total > 0}
+					title={scm.changes.total > 0
+						? 'Commit or discard the working-tree changes first'
+						: `Switch back to ${scm.branch.previous_branch}`}
+				>
+					⇄ Switch to {scm.branch.previous_branch}
+				</button>
+			{/if}
 			{#if scm.changes.total > 0}
 				<div class="scm-changes">
 					{#if scm.changes.added > 0}<span class="scm-change added">+{scm.changes.added}</span>{/if}
