@@ -5,6 +5,9 @@ Status: accepted; amends [`specs/coder.md`](../coder.md) (the
 `bash` tool routing notes) and references the cross-project
 networking work in
 [`crates/moon-container/src/network.rs`](../../crates/moon-container/src/network.rs).
+The turn-start snapshot posture for `resolve_bash_target` is
+amended by [ADR 0041](0041-live-host-mode-toggle.md) — the toggle
+now applies to the next tool dispatch of an in-flight turn.
 
 ## Context
 

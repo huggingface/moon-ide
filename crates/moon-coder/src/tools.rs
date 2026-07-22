@@ -199,10 +199,13 @@ pub struct ToolContext {
 	/// When true, the `bash` tool routes to the host machine even
 	/// if the workspace shell container is running — the per-session
 	/// [`BashTargetOverride::ForceHost`](crate::sessions::BashTargetOverride)
-	/// escape hatch. Captured from the session at turn spawn; the
-	/// rest of the turn reads it from here so a settings flip
-	/// mid-turn doesn't relocate in-flight commands.
-	pub force_host_bash: bool,
+	/// escape hatch. Shared with the owning `SessionRuntime` (the
+	/// runner clones the session's live flag in at turn spawn), so a
+	/// toggle mid-turn re-routes the *next* tool dispatch instead of
+	/// waiting for a fresh turn — a long-running agent doesn't force
+	/// the user to sit out the rest of the turn on the wrong target.
+	/// An in-flight command keeps the target it started with.
+	force_host_bash: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ToolContext {
@@ -212,7 +215,7 @@ impl ToolContext {
 			mode,
 			format_queue: Arc::new(FormatQueue::default()),
 			background: Arc::new(BackgroundProcessRegistry::default()),
-			force_host_bash: false,
+			force_host_bash: Arc::new(std::sync::atomic::AtomicBool::new(false)),
 		}
 	}
 
@@ -226,17 +229,29 @@ impl ToolContext {
 			mode,
 			format_queue: queue,
 			background: Arc::new(BackgroundProcessRegistry::default()),
-			force_host_bash: false,
+			force_host_bash: Arc::new(std::sync::atomic::AtomicBool::new(false)),
 		}
 	}
 
 	/// Builder-style setter for the per-session force-host-bash
-	/// flag. Kept separate from the constructors so the sub-agent /
-	/// parallel-dispatch call sites that always run auto don't have
-	/// to thread it.
-	pub fn with_force_host_bash(mut self, force_host: bool) -> Self {
+	/// flag — the session's **live** flag, shared so a mid-turn
+	/// toggle applies to the next tool dispatch. Kept separate from
+	/// the constructors so call sites that always run auto don't
+	/// have to thread it.
+	pub fn with_force_host_bash(mut self, force_host: Arc<std::sync::atomic::AtomicBool>) -> Self {
 		self.force_host_bash = force_host;
 		self
+	}
+
+	/// Current value of the per-session force-host-bash flag.
+	pub fn force_host_bash(&self) -> bool {
+		self.force_host_bash.load(std::sync::atomic::Ordering::Relaxed)
+	}
+
+	/// The shared live flag itself — for handing down to a
+	/// sub-agent's `ToolContext` so it follows the same toggle.
+	pub fn force_host_bash_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+		self.force_host_bash.clone()
 	}
 
 	/// Builder-style setter for the per-turn background-process
@@ -841,6 +856,7 @@ impl ToolRegistry {
 			// folder is a strict ancestor of another — the inner
 			// one wins, matching how the file tree groups them.
 			if let Some((target, relative)) = match_bound_folder_root(&folders, path) {
+				let (target, relative) = collapse_worktree_parent(cx, target, relative);
 				return Ok(ResolvedTarget::in_workspace(target, relative));
 			}
 			// Synthetic `/workspace/<name>/...`: the container-mode
@@ -869,6 +885,7 @@ impl ToolRegistry {
 					let tail = rest.strip_prefix(first).unwrap_or(Utf8Path::new(""));
 					let s = tail.as_str();
 					let resolved = if s.is_empty() { ".".to_string() } else { s.to_string() };
+					let (target, resolved) = collapse_worktree_parent(cx, target, resolved);
 					return Ok(ResolvedTarget::in_workspace(target, resolved));
 				}
 			}
@@ -897,6 +914,7 @@ impl ToolRegistry {
 							.map(|t| t.as_str().to_string())
 							.unwrap_or_default();
 						let resolved = if tail_str.is_empty() { ".".to_string() } else { tail_str };
+						let (other, resolved) = collapse_worktree_parent(cx, other, resolved);
 						return Ok(ResolvedTarget::in_workspace(other, resolved));
 					}
 				}
@@ -1275,7 +1293,7 @@ impl ToolRegistry {
 		if config.runs != moon_protocol::coder_mcp::McpRunTarget::Container {
 			return McpSpawnTarget::Host { cwd: host_cwd };
 		}
-		let target = resolve_bash_target(&self.workspaces, &self.workspaces_dir, cx.force_host_bash, &cx.folder).await;
+		let target = resolve_bash_target(&self.workspaces, &self.workspaces_dir, cx.force_host_bash(), &cx.folder).await;
 		if target != BASH_TARGET_CONTAINER {
 			return McpSpawnTarget::Host { cwd: host_cwd };
 		}
@@ -1672,7 +1690,9 @@ impl ToolRegistry {
 		let parsed: BashArgs =
 			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("bash", err.to_string()))?;
 		let folder = &cx.folder;
-		let (command, target_kind) = self.build_bash_command(folder, &parsed.cmd, cx.force_host_bash).await?;
+		let (command, target_kind) = self
+			.build_bash_command(folder, &parsed.cmd, cx.force_host_bash())
+			.await?;
 
 		// Detached path (ADR 0034): spawn into the per-turn registry,
 		// redirect output to a log file, return immediately. The
@@ -1852,7 +1872,7 @@ impl ToolRegistry {
 	/// agent that `ls`'d `/etc` via `bash` and then `read_file`'d
 	/// `/etc/hosts` reaches the same filesystem both times.
 	async fn oow_target_is_container(&self, cx: &ToolContext) -> bool {
-		resolve_bash_target(&self.workspaces, &self.workspaces_dir, cx.force_host_bash, &cx.folder).await
+		resolve_bash_target(&self.workspaces, &self.workspaces_dir, cx.force_host_bash(), &cx.folder).await
 			== BASH_TARGET_CONTAINER
 	}
 
@@ -2297,6 +2317,44 @@ fn match_bound_folder_root(
 		}
 	}
 	best.map(|(f, r, _)| (f, r))
+}
+
+/// Collapse a resolution that landed on the **parent project** of the
+/// context's worktree back into the worktree checkout.
+///
+/// A worktree-backed session owns exactly one branch: when it
+/// addresses the parent project by name or absolute path (picked up
+/// from the system prompt's folder list, a sub-agent's report, or
+/// shell output), it means "my project" — so the read or write must
+/// stay in the isolated checkout. Without this, a single
+/// parent-addressed `write_file` silently lands on the main working
+/// tree and defeats the isolation the worktree exists for (ADR 0040).
+///
+/// Paths that spell out this worktree's own `.worktrees/<slug>/…`
+/// tail are stripped to worktree-relative; paths into a *different*
+/// worktree under the same parent (another agent's checkout) are
+/// left addressed as-is.
+fn collapse_worktree_parent(
+	cx: &ToolContext,
+	target: Arc<WorkspaceFolderEntry>,
+	relative: String,
+) -> (Arc<WorkspaceFolderEntry>, String) {
+	let moon_protocol::workspace::FolderOrigin::Worktree { parent_path, .. } = &cx.folder.folder.origin else {
+		return (target, relative);
+	};
+	if target.folder.path != *parent_path {
+		return (target, relative);
+	}
+	if Utf8Path::new(&relative).starts_with(moon_core::WORKTREES_DIR_NAME) {
+		let full = Utf8Path::new(parent_path).join(&relative);
+		let Ok(tail) = full.strip_prefix(cx.folder.folder.path.as_str()) else {
+			return (target, relative);
+		};
+		let s = tail.as_str();
+		let stripped = if s.is_empty() { ".".to_string() } else { s.to_string() };
+		return (cx.folder.clone(), stripped);
+	}
+	(cx.folder.clone(), relative)
 }
 
 /// Build the "no bound folder named `<name>`" error returned by
@@ -3869,6 +3927,122 @@ mod tests {
 				.expect("bare sibling basename should list its root");
 			assert_eq!(out, ".");
 			assert!(Arc::ptr_eq(&target, &other));
+		}
+
+		/// Parent project + a worktree bound under it at
+		/// `.worktrees/moon-agent-1` (plus a second, unbound
+		/// worktree dir), mirroring what `create_worktree_session`
+		/// registers (ADR 0029). Returns the `TempDir` guard so the
+		/// tree outlives the test body.
+		async fn build_registry_with_worktree() -> (Arc<WorkspaceRegistry>, ToolRegistry, TempDir) {
+			let parent = TempDir::new().unwrap();
+			let parent_path = camino::Utf8PathBuf::from_path_buf(parent.path().canonicalize().unwrap()).unwrap();
+			let wt_path = parent_path.join(".worktrees/moon-agent-1");
+			std::fs::create_dir_all(wt_path.as_std_path()).unwrap();
+			std::fs::create_dir_all(parent_path.join(".worktrees/moon-agent-2").as_std_path()).unwrap();
+			let registry = Arc::new(WorkspaceRegistry::new("test-workspace".into()));
+			registry.add_folder(parent_path.clone()).await.unwrap();
+			registry
+				.add_worktree_folder(wt_path, parent_path.to_string(), "moon/agent-1".into())
+				.await
+				.unwrap();
+			let workspaces_dir = Utf8PathBuf::from(parent_path.parent().unwrap());
+			let web = crate::web::WebClient::new().expect("web client builds in tests");
+			let tools = ToolRegistry::new(registry.clone(), workspaces_dir, web);
+			(registry, tools, parent)
+		}
+
+		#[tokio::test]
+		async fn worktree_session_absolute_parent_path_collapses_to_worktree() {
+			let (registry, tools, _guard) = build_registry_with_worktree().await;
+			let cx = make_cx(&registry, 1).await;
+			let parent = registry.folders().await[0].clone();
+			let raw = format!("{}/src/foo.rs", parent.folder.path);
+			let (target, out) = tools
+				.resolve_workspace_path(&raw, &cx, "write_file")
+				.await
+				.expect("parent-rooted absolute path should resolve");
+			assert_eq!(out, "src/foo.rs");
+			assert!(
+				Arc::ptr_eq(&target, &cx.folder),
+				"a worktree session addressing its parent must stay in the worktree"
+			);
+		}
+
+		#[tokio::test]
+		async fn worktree_session_synthetic_parent_path_collapses_to_worktree() {
+			let (registry, tools, _guard) = build_registry_with_worktree().await;
+			let cx = make_cx(&registry, 1).await;
+			let parent_name = registry.folders().await[0].folder.name.clone();
+			let raw = format!("/workspace/{parent_name}/src/foo.rs");
+			let (target, out) = tools
+				.resolve_workspace_path(&raw, &cx, "write_file")
+				.await
+				.expect("synthetic parent path should resolve");
+			assert_eq!(out, "src/foo.rs");
+			assert!(Arc::ptr_eq(&target, &cx.folder));
+		}
+
+		#[tokio::test]
+		async fn worktree_session_parent_basename_collapses_to_worktree() {
+			let (registry, tools, _guard) = build_registry_with_worktree().await;
+			let cx = make_cx(&registry, 1).await;
+			let parent_name = registry.folders().await[0].folder.name.clone();
+			let raw = format!("{parent_name}/src/foo.rs");
+			let (target, out) = tools
+				.resolve_workspace_path(&raw, &cx, "edit_file")
+				.await
+				.expect("parent basename path should resolve");
+			assert_eq!(out, "src/foo.rs");
+			assert!(Arc::ptr_eq(&target, &cx.folder));
+		}
+
+		#[tokio::test]
+		async fn worktree_session_own_tail_under_parent_strips_to_worktree_relative() {
+			// The container-mode form the system prompt now
+			// advertises: the worktree spelled out as a tail under
+			// the parent's mount.
+			let (registry, tools, _guard) = build_registry_with_worktree().await;
+			let cx = make_cx(&registry, 1).await;
+			let parent_name = registry.folders().await[0].folder.name.clone();
+			let raw = format!("/workspace/{parent_name}/.worktrees/moon-agent-1/src/foo.rs");
+			let (target, out) = tools
+				.resolve_workspace_path(&raw, &cx, "read_file")
+				.await
+				.expect("own worktree tail should resolve");
+			assert_eq!(out, "src/foo.rs");
+			assert!(Arc::ptr_eq(&target, &cx.folder));
+		}
+
+		#[tokio::test]
+		async fn worktree_session_other_worktree_tail_stays_on_parent() {
+			// Another agent's checkout under the same parent is
+			// *not* collapsed — the path is physically correct as
+			// addressed.
+			let (registry, tools, _guard) = build_registry_with_worktree().await;
+			let cx = make_cx(&registry, 1).await;
+			let parent = registry.folders().await[0].clone();
+			let raw = format!("{}/.worktrees/moon-agent-2/src/foo.rs", parent.folder.path);
+			let (target, out) = tools
+				.resolve_workspace_path(&raw, &cx, "read_file")
+				.await
+				.expect("sibling worktree tail should resolve");
+			assert_eq!(out, ".worktrees/moon-agent-2/src/foo.rs");
+			assert!(Arc::ptr_eq(&target, &parent));
+		}
+
+		#[tokio::test]
+		async fn parent_session_parent_path_untouched_by_worktree_collapse() {
+			let (registry, tools, _guard) = build_registry_with_worktree().await;
+			let cx = make_cx(&registry, 0).await;
+			let parent = registry.folders().await[0].clone();
+			let raw = format!("{}/src/foo.rs", parent.folder.path);
+			let (target, out) = tools
+				.resolve_workspace_path(&raw, &cx, "write_file")
+				.await
+				.expect("parent path from a parent session should resolve");
+			assert_eq!(out, "src/foo.rs");
+			assert!(Arc::ptr_eq(&target, &parent));
 		}
 
 		#[tokio::test]

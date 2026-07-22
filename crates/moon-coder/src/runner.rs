@@ -238,14 +238,23 @@ struct SessionRuntime {
 	/// answered the card) or by `send`'s skip path (the user sent a
 	/// normal composer message instead). See [`crate::prompts`].
 	prompts: crate::prompts::PromptRegistry,
+	/// Live mirror of `header.bash_target_override` — shared into
+	/// every turn's `ToolContext`, so flipping the per-session
+	/// host/container toggle re-routes the next tool dispatch of an
+	/// in-flight turn instead of waiting for a fresh one. The header
+	/// stays the persisted source of truth; this is its in-memory
+	/// shadow.
+	force_host_bash: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SessionRuntime {
 	fn new(session: Session) -> Self {
+		let force_host = session.header.bash_target_override == Some(BashTargetOverride::ForceHost);
 		Self {
 			session: Mutex::new(session),
 			turn: Mutex::new(TurnState::default()),
 			prompts: crate::prompts::PromptRegistry::default(),
+			force_host_bash: Arc::new(std::sync::atomic::AtomicBool::new(force_host)),
 		}
 	}
 }
@@ -1801,6 +1810,11 @@ impl CoderHandle {
 			session.header.bash_target_override = force_host.then_some(BashTargetOverride::ForceHost);
 			(session.session_dir.clone(), session.header.clone())
 		};
+		// Flip the live flag too: an in-flight turn's `ToolContext`
+		// shares it, so the toggle applies to the next tool dispatch
+		// rather than the next turn.
+		rt.force_host_bash
+			.store(force_host, std::sync::atomic::Ordering::Relaxed);
 		if let Some(dir) = session_dir {
 			if let Err(err) = sessions::rewrite_header(&dir, &header).await {
 				tracing::warn!(?err, "failed to persist bash_target_override header rewrite");
@@ -2359,7 +2373,19 @@ impl CoderHandle {
 				"only write_file / edit_file can be reapplied, not `{tool_name}`"
 			)));
 		}
-		let cx = self.state.tools.context_for_active(CoderMode::Agent).await?;
+		// Route like `run_turn` does: a worktree-backed session
+		// reapplies into its worktree checkout, not whatever folder
+		// happens to be active (ADR 0028/0040).
+		let worktree_root = rt.session.lock().await.header.worktree_root.clone();
+		let worktree_folder = match worktree_root {
+			Some(root) => self.state.workspaces.folder_for_path(&root).await,
+			None => None,
+		};
+		let cx = match worktree_folder {
+			Some(folder) => ToolContext::new(folder, CoderMode::Agent),
+			None => self.state.tools.context_for_active(CoderMode::Agent).await?,
+		}
+		.with_force_host_bash(rt.force_host_bash.clone());
 		let cancel = CancellationToken::new();
 		let result = self.state.tools.dispatch(&tool_name, &args, &cx, &cancel).await?;
 		flush_format_queue(&self.state, &cx.format_queue).await;
@@ -4168,21 +4194,22 @@ async fn run_turn(
 		.folder_for_path(routing_path.as_str())
 		.await
 		.ok_or(CoderError::NoActiveFolder)?;
-	// Snapshot the per-session bash-target override + the top-level
-	// session mode once at turn-start (same posture as `models`
-	// above): a toggle / re-stamp mid-turn applies to the *next*
-	// turn, not in-flight commands. The mode drives both the
-	// `ToolContext` (so the dispatch-level write gate is right)
-	// and the tool-list composition below.
-	let (force_host_bash, mode) = {
+	// Snapshot the top-level session mode once at turn-start (same
+	// posture as `models` above): a re-stamp mid-turn applies to
+	// the *next* turn. The mode drives both the `ToolContext` (so
+	// the dispatch-level write gate is right) and the tool-list
+	// composition below. The bash-target override is different: the
+	// runtime's **live** flag is shared into the context, so the
+	// host/container toggle re-routes the next tool dispatch of an
+	// in-flight turn (a long turn shouldn't pin the user to the
+	// wrong target).
+	let mode = {
 		let session = rt.session.lock().await;
-		(
-			session.header.bash_target_override == Some(BashTargetOverride::ForceHost),
-			CoderMode::from_top_level_wire(session.header.mode.as_deref()),
-		)
+		CoderMode::from_top_level_wire(session.header.mode.as_deref())
 	};
+	let force_host_bash = rt.force_host_bash.load(std::sync::atomic::Ordering::Relaxed);
 	let cx = ToolContext::with_format_queue(folder_entry, mode, format_queue)
-		.with_force_host_bash(force_host_bash)
+		.with_force_host_bash(rt.force_host_bash.clone())
 		.with_background(background);
 	// Tool list composition branches on the top-level session mode
 	// (ADR 0030). The historical shape — `definitions()` plus
@@ -6233,6 +6260,15 @@ async fn kick_off_summary_refresh(state: &Arc<CoderState>, _sink: &FolderEventSi
 	let folders = state.workspaces.folders().await;
 	let cheap_model = state.models.read().await.cheap().to_owned();
 	for entry in folders {
+		// A worktree checkout is the same codebase as its parent;
+		// the prompt composer falls back to the parent's summary, so
+		// generating a duplicate here would be pure model spend.
+		if matches!(
+			entry.folder.origin,
+			moon_protocol::workspace::FolderOrigin::Worktree { .. }
+		) {
+			continue;
+		}
 		let folder_root = Utf8PathBuf::from(&entry.folder.path);
 		if state.folder_summaries.cached(folder_root.as_path()).await.is_some() {
 			continue;
@@ -6326,6 +6362,18 @@ async fn compose_system_prompt(
 	if folders.is_empty() {
 		return out;
 	}
+	// When the session runs in a worktree, its parent project gets a
+	// dedicated annotation below (paths there re-route into the
+	// worktree, ADR 0040) instead of the generic "sibling" one.
+	let active_worktree: Option<(&str, &str)> = folders
+		.iter()
+		.find(|f| active_path == Some(f.folder.path.as_str()))
+		.and_then(|f| match &f.folder.origin {
+			moon_protocol::workspace::FolderOrigin::Worktree { parent_path, branch } => {
+				Some((parent_path.as_str(), branch.as_str()))
+			}
+			_ => None,
+		});
 	// Look up cached summaries up-front so the rendered section
 	// never half-blocks on disk reads inside a `for` loop.
 	let mut entries: Vec<(String, String, Option<String>, bool)> = Vec::with_capacity(folders.len());
@@ -6333,12 +6381,38 @@ async fn compose_system_prompt(
 	for folder in folders {
 		let folder_path = folder.folder.path.clone();
 		let folder_name = folder.folder.name.clone();
-		let cached = summaries.cached(Utf8Path::new(&folder_path)).await;
+		let mut cached = summaries.cached(Utf8Path::new(&folder_path)).await;
+		// A worktree is the same codebase as its parent — reuse the
+		// parent's summary rather than showing "(summary still
+		// generating)" for the checkout the agent works in.
+		if cached.is_none() {
+			if let moon_protocol::workspace::FolderOrigin::Worktree { parent_path, .. } = &folder.folder.origin {
+				cached = summaries.cached(Utf8Path::new(parent_path)).await;
+			}
+		}
 		if cached.is_some() {
 			any_cached = true;
 		}
+		// Container mode renders each folder at the path the shell
+		// container actually exposes. A worktree has no mount of its
+		// own — it rides the parent's at
+		// `/workspace/<parent>/.worktrees/<slug>` (ADR 0029), so
+		// `/workspace/<name>` would advertise a path that doesn't
+		// exist and push the model toward the parent's instead.
+		let display_path = if container_mode {
+			match &folder.folder.origin {
+				moon_protocol::workspace::FolderOrigin::Worktree { parent_path, .. } => {
+					moon_core::worktree::worktree_container_path(Utf8Path::new(parent_path), Utf8Path::new(&folder_path))
+						.map(|p| p.to_string())
+						.unwrap_or_else(|| format!("/workspace/{folder_name}"))
+				}
+				_ => format!("/workspace/{folder_name}"),
+			}
+		} else {
+			folder_path.clone()
+		};
 		let is_active = active_path == Some(folder_path.as_str());
-		entries.push((folder_name, folder_path, cached.map(|s| s.description), is_active));
+		entries.push((folder_path, display_path, cached.map(|s| s.description), is_active));
 	}
 	// Only emit the section when at least one folder has a real
 	// description. A 1-folder workspace whose summary hasn't
@@ -6359,17 +6433,23 @@ async fn compose_system_prompt(
 			"All folders currently bound to this workspace, listed with their absolute host paths. Your file-routing tools (`read_file`, `list_dir`, `write_file`, `edit_file`) accept these absolute paths to address any bound folder; `grep` and `bash` always run against the **active** folder, so for searches or commands in a non-active folder, use `task` with `folder: \"<name>\"`.\n\n",
 		);
 	}
-	for (name, path, description, is_active) in &entries {
+	for (path, display_path, description, is_active) in &entries {
 		out.push_str("- `");
-		if container_mode {
-			out.push_str("/workspace/");
-			out.push_str(name);
-		} else {
-			out.push_str(path);
-		}
+		out.push_str(display_path);
 		out.push('`');
 		if *is_active {
-			out.push_str(" **(active — your tools operate here)**");
+			match active_worktree {
+				Some((_, branch)) => {
+					out.push_str(&format!(
+						" **(active — your tools operate here; an isolated git worktree on branch `{branch}`)**"
+					));
+				}
+				None => out.push_str(" **(active — your tools operate here)**"),
+			}
+		} else if active_worktree.is_some_and(|(parent, _)| parent == path) {
+			out.push_str(
+				" — the parent checkout your worktree was created from. Do **not** work here: paths addressing this folder resolve into your active worktree, and all your work must stay on your worktree's branch",
+			);
 		} else {
 			out.push_str(" — sibling, reach via `task`");
 		}

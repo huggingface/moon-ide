@@ -1425,8 +1425,20 @@ pub fn build_subagent_spec(
 
 	let folder = match args.get("folder").and_then(Value::as_str) {
 		None | Some("") => parent_active_folder.clone(),
-		Some(name) => find_bound_folder(bound_folders, name)
-			.ok_or_else(|| CoderError::tool_failed("task", format!("folder `{name}` is not bound")))?,
+		Some(name) => {
+			let found = find_bound_folder(bound_folders, name)
+				.ok_or_else(|| CoderError::tool_failed("task", format!("folder `{name}` is not bound")))?;
+			// A worktree-backed session naming its own parent project
+			// means "my project" (ADR 0040): route the sub-agent to
+			// the worktree so its work stays on the session's branch
+			// instead of leaking into the parent's main working tree.
+			match &parent_active_folder.folder.origin {
+				moon_protocol::workspace::FolderOrigin::Worktree { parent_path, .. } if *parent_path == found.folder.path => {
+					parent_active_folder.clone()
+				}
+				_ => found,
+			}
+		}
 	};
 
 	let mode = match args.get("mode").and_then(Value::as_str) {
@@ -1513,6 +1525,43 @@ mod tests {
 		assert_eq!(spec.task, "do the thing");
 		assert!(Arc::ptr_eq(&spec.folder, &active));
 		assert_eq!(spec.parent_folder, parent_folder);
+	}
+
+	#[tokio::test]
+	async fn build_spec_collapses_parent_target_to_worktree() {
+		// A worktree-backed session that names its own parent
+		// project targets the *worktree* (ADR 0040) — the sub-agent's
+		// work must stay on the session's branch.
+		let dir = TempDir::new().unwrap();
+		let parent_path = Utf8PathBuf::from_path_buf(dir.path().canonicalize().unwrap()).unwrap();
+		let wt_path = parent_path.join(".worktrees/moon-agent-1");
+		std::fs::create_dir_all(wt_path.as_std_path()).unwrap();
+		let registry = WorkspaceRegistry::new("test-workspace".into());
+		registry.add_folder(parent_path.clone()).await.unwrap();
+		registry
+			.add_worktree_folder(wt_path, parent_path.to_string(), "moon/agent-1".into())
+			.await
+			.unwrap();
+		let folders = registry.folders().await;
+		let parent = folders[0].clone();
+		let worktree = folders[1].clone();
+		let args = make_args(&format!(
+			r#"{{ "task": "do the thing", "folder": "{}" }}"#,
+			parent.folder.name
+		));
+		let spec = build_subagent_spec(
+			"sess-x".into(),
+			"call-1".into(),
+			parent_folder_for(&folders, 0),
+			&args,
+			&worktree,
+			&folders,
+		)
+		.unwrap();
+		assert!(
+			Arc::ptr_eq(&spec.folder, &worktree),
+			"parent-named target from a worktree session must collapse to the worktree"
+		);
 	}
 
 	#[tokio::test]
