@@ -2176,7 +2176,9 @@
 										{:else if isFinished}
 											<span class="finished-dot" aria-hidden="true"></span>
 										{/if}
-										<span class="session-title-text">{session.title || '(untitled)'}</span>
+										<span class="session-title-text" title={session.title || '(untitled)'}
+											>{session.title || '(untitled)'}</span
+										>
 										{#if isCoordinatorSession(session)}
 											<span
 												class="session-mode-badge coordinator"
