@@ -132,8 +132,10 @@ export type ReviewCommentCallbacks = {
 	onDelete: (id: string) => void;
 	/** Close the composer (clears the open-composer request). */
 	onCloseComposer: () => void;
-	/** Open the composer anchored at a single 1-based line (gutter +). */
-	onAddAtLine: (line: number) => void;
+	/** Open the composer from the gutter "+" on a hovered line. The
+	 * view is passed so the handler can widen the anchor to the full
+	 * multi-line selection when the user has one spanning the row. */
+	onAddAtLine: (view: EditorView, line: number) => void;
 };
 
 /** The comments anchored to this editor's side, in creation order. */
@@ -210,6 +212,7 @@ class CommentCardWidget extends WidgetType {
 	constructor(
 		private readonly comment: ReviewComment,
 		private readonly stale: boolean,
+		private readonly resolvedRange: readonly [number, number] | null,
 		private readonly callbacks: ReviewCommentCallbacks,
 	) {
 		super();
@@ -220,8 +223,23 @@ class CommentCardWidget extends WidgetType {
 			other instanceof CommentCardWidget &&
 			other.comment.id === this.comment.id &&
 			other.comment.body === this.comment.body &&
-			other.stale === this.stale
+			other.stale === this.stale &&
+			((other.resolvedRange === null && this.resolvedRange === null) ||
+				(other.resolvedRange !== null &&
+					this.resolvedRange !== null &&
+					other.resolvedRange[0] === this.resolvedRange[0] &&
+					other.resolvedRange[1] === this.resolvedRange[1]))
 		);
+	}
+
+	private rangeLabel(): string {
+		// Prefer the resolved (drift-corrected) range when fresh;
+		// fall back to the stored hint so the label still tells the
+		// user *which lines* the comment anchors even when stale.
+		const r = this.resolvedRange;
+		const start = r !== null ? r[0] : this.comment.anchor.startLine;
+		const end = r !== null ? r[1] : this.comment.anchor.endLine;
+		return start === end ? `L${start}` : `L${start}\u2013L${end}`;
 	}
 
 	toDOM(view: EditorView): HTMLElement {
@@ -235,6 +253,11 @@ class CommentCardWidget extends WidgetType {
 		who.className = 'cm-review-card-author';
 		who.textContent = 'You';
 		head.appendChild(who);
+		const range = document.createElement('span');
+		range.className = 'cm-review-card-range';
+		range.textContent = this.rangeLabel();
+		range.title = 'Comment anchored to this line range';
+		head.appendChild(range);
 		const when = document.createElement('span');
 		when.className = 'cm-review-card-time';
 		when.textContent = relativeTime(this.comment.createdAt);
@@ -279,7 +302,7 @@ class CommentCardWidget extends WidgetType {
 	}
 
 	private beginEdit(view: EditorView, root: HTMLElement) {
-		const editor = buildComposerForm(this.comment.body, 'Save', {
+		const editor = buildComposerForm(this.comment.body, 'Save', null, {
 			onCancel: () => {
 				// Re-render from state by nudging a no-op selection so
 				// the StateField rebuilds the card.
@@ -313,7 +336,9 @@ class ComposerWidget extends WidgetType {
 
 	toDOM(view: EditorView): HTMLElement {
 		const lineText = lineRangeText(view.state, this.startLine, this.endLine) ?? '';
-		const form = buildComposerForm('', 'Comment', {
+		const rangeLabel =
+			this.startLine === this.endLine ? `L${this.startLine}` : `L${this.startLine}\u2013L${this.endLine}`;
+		const form = buildComposerForm('', 'Comment', rangeLabel, {
 			onCancel: () => this.callbacks.onCloseComposer(),
 			onSubmit: (text) => {
 				this.callbacks.onSubmit({
@@ -339,12 +364,20 @@ class ComposerWidget extends WidgetType {
 function buildComposerForm(
 	initial: string,
 	submitLabel: string,
+	rangeLabel: string | null,
 	handlers: { onCancel: () => void; onSubmit: (text: string) => void },
 ): { root: HTMLElement; textarea: HTMLTextAreaElement } {
 	const root = document.createElement('div');
 	root.className = 'cm-review-composer';
 	root.contentEditable = 'false';
 	root.addEventListener('mousedown', (e) => e.stopPropagation());
+
+	if (rangeLabel !== null) {
+		const chip = document.createElement('div');
+		chip.className = 'cm-review-composer-range';
+		chip.textContent = rangeLabel;
+		root.appendChild(chip);
+	}
 
 	const textarea = document.createElement('textarea');
 	textarea.className = 'cm-review-composer-input';
@@ -411,17 +444,30 @@ function buildDecorations(state: EditorState): DecorationSet {
 	for (const comment of comments) {
 		const resolved = resolveAnchor(state, comment);
 		const stale = resolved === null;
-		// Anchor the card below the resolved line (or the hint line,
-		// clamped, when stale so it still renders somewhere sensible).
-		// Re-pinning the persisted hint is a separate, non-render-path
-		// concern (`reanchorComments`); the fingerprint re-resolves
-		// every build regardless, so rendering never depends on the
-		// stored hint being fresh.
-		const lineNo = resolved !== null ? resolved[1] : Math.min(Math.max(1, comment.anchor.endLine), state.doc.lines);
-		const line = state.doc.line(lineNo);
+		// Resolve the visible line range: the drift-corrected span
+		// when the fingerprint still matches, else the stored hint
+		// clamped to the doc so a stale comment still renders in a
+		// sensible place.
+		const startLineNo =
+			resolved !== null ? resolved[0] : Math.min(Math.max(1, comment.anchor.startLine), state.doc.lines);
+		const endLineNo = resolved !== null ? resolved[1] : Math.min(Math.max(1, comment.anchor.endLine), state.doc.lines);
+		// Highlight the anchored rows so a multi-line comment is
+		// visibly distinct from a single-line one. The tint spans
+		// startLine..endLine inclusive; combined with the card
+		// dropped below the last row it reads as a clear block.
+		if (endLineNo >= startLineNo && endLineNo <= state.doc.lines) {
+			const from = state.doc.line(startLineNo).from;
+			const to = state.doc.line(endLineNo).to;
+			ranges.push(
+				Decoration.mark({
+					attributes: { class: 'cm-review-anchor-span' },
+				}).range(from, to),
+			);
+		}
+		const line = state.doc.line(endLineNo);
 		ranges.push(
 			Decoration.widget({
-				widget: new CommentCardWidget(comment, stale, callbacks),
+				widget: new CommentCardWidget(comment, stale, resolved, callbacks),
 				side: 1,
 				block: true,
 			}).range(line.to),
@@ -486,6 +532,7 @@ class AddCommentMarker extends GutterMarker {
 	constructor(
 		private readonly line: number,
 		private readonly callbacks: ReviewCommentCallbacks,
+		private readonly view: EditorView,
 	) {
 		super();
 	}
@@ -503,7 +550,7 @@ class AddCommentMarker extends GutterMarker {
 		btn.addEventListener('mousedown', (e) => e.preventDefault());
 		btn.addEventListener('click', (e) => {
 			e.stopPropagation();
-			this.callbacks.onAddAtLine(this.line);
+			this.callbacks.onAddAtLine(this.view, this.line);
 		});
 		return btn;
 	}
@@ -518,7 +565,7 @@ const addCommentGutter = gutter({
 			return null;
 		}
 		const line = view.state.doc.lineAt(lineBlock.from).number;
-		return line === hovered ? new AddCommentMarker(line, callbacks) : null;
+		return line === hovered ? new AddCommentMarker(line, callbacks, view) : null;
 	},
 	// Recompute markers whenever the hovered line changes.
 	lineMarkerChange: (update) =>
@@ -613,6 +660,27 @@ const reviewBaseTheme = EditorView.baseTheme({
 		fontWeight: '600',
 		color: 'var(--m-fg)',
 	},
+	'.cm-review-card-range': {
+		fontFamily: 'var(--m-font-mono, monospace)',
+		fontSize: '10px',
+		fontVariantNumeric: 'tabular-nums',
+		color: 'var(--m-fg-muted)',
+		background: 'var(--m-bg-overlay, var(--m-bg))',
+		border: '1px solid var(--m-border)',
+		borderRadius: '3px',
+		padding: '0 4px',
+		lineHeight: '1.6',
+		whiteSpace: 'nowrap',
+	},
+	'.cm-review-anchor-span': {
+		background: 'color-mix(in srgb, var(--m-accent, #4ec9b0) 8%, transparent)',
+		// A subtle left bar marks the anchored range without
+		// competing with the per-line change gutter tint. Three
+		// stacked box-shadows draw a 2px bar on the left edge
+		// spanning the whole range (mark decorations apply
+		// inline across the wrapped lines).
+		boxShadow: 'inset 2px 0 0 var(--m-accent, #4ec9b0)',
+	},
 	'.cm-review-card-time': {
 		color: 'var(--m-fg-muted)',
 		fontSize: '11px',
@@ -622,6 +690,11 @@ const reviewBaseTheme = EditorView.baseTheme({
 		fontSize: '10px',
 		textTransform: 'uppercase',
 		letterSpacing: '0.03em',
+	},
+	'.cm-review-card-stale .cm-review-card-range': {
+		// A stale card keeps its range label but de-emphasises it so
+		// the "line changed" badge reads as the actionable signal.
+		opacity: '0.6',
 	},
 	'.cm-review-card-spacer': {
 		flex: '1',
@@ -668,6 +741,18 @@ const reviewBaseTheme = EditorView.baseTheme({
 	},
 	'.cm-review-composer': {
 		padding: '6px',
+	},
+	'.cm-review-composer-range': {
+		fontFamily: 'var(--m-font-mono, monospace)',
+		fontSize: '10px',
+		fontVariantNumeric: 'tabular-nums',
+		color: 'var(--m-fg-muted)',
+		background: 'var(--m-bg-overlay, var(--m-bg))',
+		border: '1px solid var(--m-border)',
+		borderRadius: '3px',
+		padding: '1px 5px',
+		marginBottom: '4px',
+		display: 'inline-block',
 	},
 	'.cm-review-composer-input': {
 		display: 'block',
@@ -777,7 +862,7 @@ export class ReviewWiring {
 			onEdit: (id, body) => this.ops.edit(id, body),
 			onDelete: (id) => this.ops.remove(id),
 			onCloseComposer: () => this.setComposer(null),
-			onAddAtLine: (line) => this.setComposer({ startLine: line, endLine: line }),
+			onAddAtLine: (view, line) => this.openFromGutter(view, line),
 		};
 		return [
 			reviewCommentsExtension(),
@@ -821,6 +906,29 @@ export class ReviewWiring {
 		const toLine =
 			sel.to === toLineInfo.from && toLineInfo.number > fromLine ? toLineInfo.number - 1 : toLineInfo.number;
 		this.setComposer({ startLine: fromLine, endLine: toLine });
+	}
+
+	/**
+	 * Open the composer from the gutter "+" on a hovered line. When
+	 * the user has a multi-line selection that covers the clicked
+	 * line, anchor the comment to the full selection range instead
+	 * of just the row — so a drag-then-click-+ flow produces a
+	 * multi-line comment. Falls back to the single line when the
+	 * selection is empty or doesn't overlap the row.
+	 */
+	openFromGutter(view: EditorView, line: number): void {
+		const sel = view.state.selection.main;
+		if (!sel.empty) {
+			const fromLine = view.state.doc.lineAt(sel.from).number;
+			const toLineInfo = view.state.doc.lineAt(sel.to);
+			const toLine =
+				sel.to === toLineInfo.from && toLineInfo.number > fromLine ? toLineInfo.number - 1 : toLineInfo.number;
+			if (line >= fromLine && line <= toLine) {
+				this.setComposer({ startLine: fromLine, endLine: toLine });
+				return;
+			}
+		}
+		this.setComposer({ startLine: line, endLine: line });
 	}
 
 	private setComposer(req: { startLine: number; endLine: number } | null): void {
