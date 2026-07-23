@@ -708,7 +708,19 @@ async fn handle_conn(
 		// (half-open TCP) — fall through to the cleanup below
 		// instead of holding a ghost registration.
 		let frame = match tokio::time::timeout(READ_IDLE_TIMEOUT, source.next()).await {
-			Ok(Some(frame)) => frame?,
+			// A read error is the *normal* death path (process
+			// killed, TCP reset, proxy dropped the upstream) —
+			// break to the cleanup below. An earlier version
+			// propagated the error with `?`, returning before the
+			// cleanup ever ran: every uncleanly-closed IDE left a
+			// ghost registration that kept its workspace "live" in
+			// the phone's switcher (and phone connections skipped
+			// the counter decrement the same way).
+			Ok(Some(Ok(frame))) => frame,
+			Ok(Some(Err(err))) => {
+				tracing::info!(%peer, conn_id, error = %err, "connection read error; treating as dead");
+				break;
+			}
 			Ok(None) => break,
 			Err(_) => {
 				tracing::info!(%peer, conn_id, "connection idle past deadline; treating as dead");
