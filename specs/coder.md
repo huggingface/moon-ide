@@ -192,6 +192,12 @@ Picks live in `AppState.coder.*` and hot-swap into the runner's
 round-trip. Per-session model in the JSONL header is informational
 metadata only — the runner reads the active pick from `CoderModels`.
 
+The composer placeholder names the model the next turn will use
+(`Ask <model>…`). It reads `resolved_standard_model` off the
+settings payload — a read-only field the runner fills on read (and
+ignores on write) so the fallback chain (provider pick → HF pick →
+hardcoded default) lives in one place.
+
 Why HF as primary: the team's home turf, one auth flow, billing via
 the user's HF account, and provider-routed access to everything the
 team uses. Other providers are additive.

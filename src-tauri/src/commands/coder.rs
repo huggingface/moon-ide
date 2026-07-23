@@ -899,6 +899,8 @@ pub async fn coder_get_model_settings(state: State<'_, AppState>) -> Result<Code
 pub(crate) async fn get_model_settings_impl(state: &AppState) -> Result<CoderModelSettings, MoonError> {
 	let models = state.coder.current_models().await;
 	let provider_lock = workspace_provider_lock(state).await;
+	// Resolve before the fields move out of `models` below.
+	let resolved_standard_model = models.standard().to_owned();
 	Ok(CoderModelSettings {
 		standard_model: models.standard,
 		cheap_model: models.cheap,
@@ -911,6 +913,7 @@ pub(crate) async fn get_model_settings_impl(state: &AppState) -> Result<CoderMod
 		// risk a write through a stale clone.
 		context_window_overrides: (*models.context_window_overrides).clone(),
 		provider_lock,
+		resolved_standard_model,
 	})
 }
 

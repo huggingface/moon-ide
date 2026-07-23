@@ -695,12 +695,27 @@ class CoderPanelState {
 	async saveModelSettings(next: CoderModelSettings): Promise<void> {
 		try {
 			await ipc.coder.setModelSettings(next);
-			this.modelSettings = next;
+			// Re-read instead of trusting `next`: the runner fills
+			// read-only fields (`resolved_standard_model`) that the
+			// echoed payload would carry stale.
+			this.modelSettings = await ipc.coder.getModelSettings();
 			this.modelsError = null;
 		} catch (err) {
 			this.modelsError = formatError(err);
 			throw err;
 		}
+	}
+
+	/** Short display name of the model the next turn will use —
+	 *  the resolved standard slug with the org prefix and any
+	 *  `:provider` suffix stripped (`Qwen/Qwen3.5-397B-A17B:scaleway`
+	 *  → `Qwen3.5-397B-A17B`). `null` until the first
+	 *  [`loadModelSettings`] lands. */
+	get currentModelName(): string | null {
+		const slug = this.modelSettings?.resolved_standard_model ?? '';
+		const bare = slug.split(':')[0] ?? '';
+		const name = bare.split('/').at(-1) ?? '';
+		return name === '' ? null : name;
 	}
 
 	/** Fetch the current workspace's HF Hub binding into

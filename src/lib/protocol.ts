@@ -1859,6 +1859,11 @@ export type CoderModelSettings = {
 	 *  global default untouched, so toggling provider in another
 	 *  workspace doesn't drag this one along. */
 	provider_lock?: CoderProviderLock | null;
+	/** Effective standard-model slug the next round-trip will use,
+	 *  after the runner's fallback chain (active provider's pick →
+	 *  HF pick → hardcoded default). Read-only: filled by the
+	 *  runner on read, ignored on write. */
+	resolved_standard_model: string;
 };
 
 /** Per-workspace lock on the coder's active provider. Mirrors

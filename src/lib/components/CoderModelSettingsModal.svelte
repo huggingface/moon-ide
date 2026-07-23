@@ -892,6 +892,9 @@
 				Object.entries(slugCaps).filter(([, v]) => Number.isFinite(v) && v > 0),
 			),
 			provider_lock: providerLock,
+			// Read-only field; the runner ignores it on write and
+			// recomputes it on the post-save re-read.
+			resolved_standard_model: '',
 		};
 		try {
 			await coder.saveModelSettings(next);

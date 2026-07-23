@@ -198,6 +198,14 @@ pub struct CoderModelSettings {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	#[ts(optional, type = "CoderProviderLock | null")]
 	pub provider_lock: Option<CoderProviderLock>,
+	/// Effective standard-model slug the next round-trip will use,
+	/// after the runner's fallback chain (active provider's pick →
+	/// HF pick → hardcoded default) has been applied. Read-only:
+	/// filled by the runner on read so the UI can show "which model
+	/// am I talking to" without duplicating the fallback logic;
+	/// ignored on write.
+	#[serde(default)]
+	pub resolved_standard_model: String,
 }
 
 /// Wire-protocol shape of one user-added provider. Three flavours:

@@ -53,4 +53,13 @@ context_window_overrides: { [key in string]: number },
  * default isn't touched. When the lock is `None`, writes
  * fall through to the global default like before.
  */
-provider_lock?: CoderProviderLock | null, };
+provider_lock?: CoderProviderLock | null, 
+/**
+ * Effective standard-model slug the next round-trip will use,
+ * after the runner's fallback chain (active provider's pick →
+ * HF pick → hardcoded default) has been applied. Read-only:
+ * filled by the runner on read so the UI can show "which model
+ * am I talking to" without duplicating the fallback logic;
+ * ignored on write.
+ */
+resolved_standard_model: string, };

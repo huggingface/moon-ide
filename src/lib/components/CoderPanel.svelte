@@ -138,6 +138,9 @@
 	onMount(() => {
 		void coder.refreshStatus();
 		void coder.loadHubBinding();
+		// Prime the model snapshot so the composer placeholder can
+		// name the model without waiting for the settings modal.
+		void coder.loadModelSettings();
 	});
 
 	function hubRowState(sessionId: string): 'idle' | 'syncing' | 'synced' | 'failed' {
@@ -2522,7 +2525,7 @@
 						? 'Steer the running turn (Enter to send, Esc to stop)…'
 						: coder.attachments.length > 0
 							? 'Ask about the attached selection…'
-							: 'Ask the coder… (@ to attach a file, paste images)'}
+							: `Ask ${coder.currentModelName ?? 'the coder'}… (@ to attach a file, paste images)`}
 				rows="3"
 				onkeydown={onComposerKey}
 				oninput={onComposerInput}
