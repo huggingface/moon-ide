@@ -231,7 +231,12 @@ user provider that 401s surfaces the error.
   llama.cpp, LiteLLM, …).
 - `open_router` — same wire path as `custom`, but the picker knows
   the URL preset / key dashboard, and Anthropic prompt-cache markers
-  fire on `anthropic/*` slugs.
+  fire on `anthropic/*` slugs. The picker also shows the credit
+  balance (`coder_openrouter_credits` → `OpenRouterCredits`): account
+  remaining from `GET /credits`, per-key usage and optional spend cap
+  from `GET /key` — both authenticate with the stored inference key,
+  no provisioning key needed. Fetch failures render "unavailable" and
+  never block the rest of the modal.
 - `anthropic` — Anthropic native (`/v1/messages`) via
   `crates/moon-coder/src/anthropic.rs`: different auth headers,
   system prompt as a top-level field, `tool_use` / `tool_result`

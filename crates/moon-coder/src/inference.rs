@@ -1006,6 +1006,61 @@ impl InferenceClient {
 		Ok(raw.data.into_iter().map(provider_catalog::flatten).collect())
 	}
 
+	/// OpenRouter credit status: `GET {base_url}/key` (per-key
+	/// usage + optional spend cap) plus `GET {base_url}/credits`
+	/// (account balance). Both authenticate with the inference
+	/// key itself — no provisioning key needed. OpenRouter-only:
+	/// these are OpenRouter management endpoints, not part of the
+	/// OpenAI-compat surface, so the runner gates the call on
+	/// `ProviderKind::OpenRouter`.
+	pub async fn openrouter_credits(
+		&self,
+		base_url: &str,
+		api_key: &str,
+	) -> Result<moon_protocol::coder_models::OpenRouterCredits, CoderError> {
+		let trimmed = base_url.trim_end_matches('/');
+		let key: openrouter_credits::KeyBody = self.openrouter_get(&format!("{trimmed}/key"), api_key).await?;
+		let credits: openrouter_credits::CreditsBody = self.openrouter_get(&format!("{trimmed}/credits"), api_key).await?;
+		Ok(moon_protocol::coder_models::OpenRouterCredits {
+			total_credits: credits.data.total_credits,
+			total_usage: credits.data.total_usage,
+			key_usage: key.data.usage,
+			key_limit: key.data.limit,
+			key_limit_remaining: key.data.limit_remaining,
+			is_free_tier: key.data.is_free_tier,
+		})
+	}
+
+	/// One authenticated GET against an OpenRouter management
+	/// endpoint, with the same error surfacing as the catalog
+	/// fetch: non-2xx propagates the body verbatim, decode
+	/// failures log the raw payload via [`crate::auth::decode_body`].
+	async fn openrouter_get<T: serde::de::DeserializeOwned>(
+		&self,
+		endpoint: &str,
+		api_key: &str,
+	) -> Result<T, CoderError> {
+		let response = self
+			.http
+			.get(endpoint)
+			.bearer_auth(api_key)
+			.send()
+			.await
+			.map_err(CoderError::from)?;
+		let status = response.status();
+		let request_id = request_id_of(&response);
+		let body = response.text().await.map_err(CoderError::from)?;
+		if !status.is_success() {
+			return Err(CoderError::http(
+				endpoint.to_string(),
+				status.as_u16(),
+				body,
+				request_id,
+			));
+		}
+		crate::auth::decode_body(endpoint, &body)
+	}
+
 	/// One non-streaming chat-completions round trip.
 	///
 	/// HF: auto-refresh on 401 — the first response that comes
@@ -1548,6 +1603,44 @@ pub type SharedInference = Arc<InferenceClient>;
 /// the minimal view. Pricing is normalised to **$/million
 /// tokens** at this boundary so the protocol type and UI never
 /// have to second-guess units.
+/// Wire shapes for OpenRouter's `/key` and `/credits` management
+/// endpoints. Tolerant on purpose — fields OpenRouter adds later
+/// are ignored, and every figure defaults to zero / absent so a
+/// shape drift degrades the display instead of erroring the modal.
+mod openrouter_credits {
+	use serde::Deserialize;
+
+	#[derive(Deserialize)]
+	pub(super) struct KeyBody {
+		pub(super) data: KeyData,
+	}
+
+	#[derive(Deserialize)]
+	pub(super) struct KeyData {
+		#[serde(default)]
+		pub(super) usage: f64,
+		#[serde(default)]
+		pub(super) limit: Option<f64>,
+		#[serde(default)]
+		pub(super) limit_remaining: Option<f64>,
+		#[serde(default)]
+		pub(super) is_free_tier: bool,
+	}
+
+	#[derive(Deserialize)]
+	pub(super) struct CreditsBody {
+		pub(super) data: CreditsData,
+	}
+
+	#[derive(Deserialize)]
+	pub(super) struct CreditsData {
+		#[serde(default)]
+		pub(super) total_credits: f64,
+		#[serde(default)]
+		pub(super) total_usage: f64,
+	}
+}
+
 mod provider_catalog {
 	use serde::Deserialize;
 

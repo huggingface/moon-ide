@@ -12,6 +12,7 @@ import type {
 	HubUploadAllSummary,
 	McpRunTarget,
 	McpServerStatus,
+	OpenRouterCredits,
 	ProviderKind,
 	ProviderModelSummary,
 	ProviderProbeResult,
@@ -416,6 +417,7 @@ export const ipc = {
 		setModelSettings: (settings: CoderModelSettings) => invoke<void>('coder_set_model_settings', { settings }),
 		listModels: () => invoke<RouterModel[]>('coder_list_models'),
 		listProviderModels: (id: string) => invoke<ProviderModelSummary[]>('coder_list_provider_models', { id }),
+		openrouterCredits: (id: string) => invoke<OpenRouterCredits>('coder_openrouter_credits', { id }),
 		newProviderId: () => invoke<string>('coder_new_provider_id'),
 		probeProvider: (baseUrl: string, apiKey: string, kind: ProviderKind = 'custom') =>
 			invoke<ProviderProbeResult>('coder_probe_provider', {

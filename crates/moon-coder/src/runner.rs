@@ -1234,6 +1234,37 @@ impl CoderHandle {
 		Ok(catalog)
 	}
 
+	/// OpenRouter credit status (account balance + per-key
+	/// usage/cap) for a configured provider. Gated on
+	/// `ProviderKind::OpenRouter` — the `/key` and `/credits`
+	/// endpoints are OpenRouter's management API, not part of the
+	/// OpenAI-compat surface — and on a stored key, since the
+	/// endpoints authenticate with the inference key itself.
+	pub async fn openrouter_credits(
+		&self,
+		provider_id: &str,
+	) -> Result<moon_protocol::coder_models::OpenRouterCredits, CoderError> {
+		let snapshot = self.state.models.read().await;
+		let entry = snapshot
+			.providers
+			.iter()
+			.find(|p| p.id == provider_id)
+			.ok_or_else(|| CoderError::Internal(format!("unknown provider id: {provider_id}")))?;
+		if entry.kind != moon_protocol::coder_models::ProviderKind::OpenRouter {
+			return Err(CoderError::Internal(format!(
+				"provider {provider_id} is not an OpenRouter provider"
+			)));
+		}
+		let base_url = entry.base_url.clone();
+		drop(snapshot);
+		let api_key = self
+			.state
+			.provider_keys
+			.get(provider_id)
+			.ok_or_else(|| CoderError::Internal(format!("no API key configured for provider {provider_id}")))?;
+		self.state.inference.openrouter_credits(&base_url, &api_key).await
+	}
+
 	pub async fn status(&self) -> Result<CoderStatus, CoderError> {
 		let identity = self.state.auth.identity().await?;
 		// `signed_in` is route-aware: HF needs OAuth; a user

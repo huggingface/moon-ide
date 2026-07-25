@@ -318,6 +318,34 @@ pub struct ProviderProbeResult {
 	pub sample_model_ids: Vec<String>,
 }
 
+/// OpenRouter credit status for a configured provider key.
+/// Combined result of `GET /key` (per-key usage / optional spend
+/// cap) and `GET /credits` (account balance) so the picker
+/// renders both with one round trip. Both endpoints authenticate
+/// with the inference key itself — no provisioning key needed.
+/// All figures are US dollars.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[ts(export)]
+pub struct OpenRouterCredits {
+	/// Account-level: total credits ever purchased (`/credits`).
+	pub total_credits: f64,
+	/// Account-level: total spend across the account (`/credits`).
+	/// Remaining balance = `total_credits - total_usage`.
+	pub total_usage: f64,
+	/// Lifetime spend attributed to the current key (`/key`).
+	pub key_usage: f64,
+	/// Optional per-key spend cap. `None` = uncapped (the common
+	/// case) — the key draws on the account balance directly.
+	#[ts(optional, type = "number | null")]
+	pub key_limit: Option<f64>,
+	/// Headroom left under the per-key cap. `None` when uncapped.
+	#[ts(optional, type = "number | null")]
+	pub key_limit_remaining: Option<f64>,
+	/// `true` for keys on OpenRouter's free tier (stricter rate
+	/// limits; the picker renders a small flag).
+	pub is_free_tier: bool,
+}
+
 /// One row of a user-added provider's `/v1/models` catalog.
 ///
 /// Minimum required: `id`. Everything else is best-effort and

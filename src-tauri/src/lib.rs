@@ -280,6 +280,7 @@ pub fn run() {
 			commands::coder::coder_set_model_settings,
 			commands::coder::coder_list_models,
 			commands::coder::coder_list_provider_models,
+			commands::coder::coder_openrouter_credits,
 			commands::coder::coder_new_provider_id,
 			commands::coder::coder_probe_provider,
 			commands::coder::coder_save_provider,

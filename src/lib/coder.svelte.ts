@@ -35,6 +35,7 @@ import {
 	type ImageAttachmentPayload,
 	type McpRunTarget,
 	type McpServerStatus,
+	type OpenRouterCredits,
 	type ProviderKind,
 	type ProviderModelSummary,
 	type ProviderProbeResult,
@@ -909,6 +910,33 @@ class CoderPanelState {
 			this.modelsError = formatError(err);
 		} finally {
 			this.modelsLoading = false;
+		}
+	}
+
+	/** OpenRouter credit status per provider id. `undefined` =
+	 *  never fetched, `null` = last fetch failed (the picker
+	 *  renders "unavailable"). Cached per-id like
+	 *  [`providerModels`]; the picker's Refresh gesture
+	 *  re-fetches in place. */
+	providerCredits = $state<Record<string, OpenRouterCredits | null>>({});
+	creditsLoading = $state(false);
+
+	async loadProviderCredits(id: string): Promise<void> {
+		if (this.creditsLoading) {
+			return;
+		}
+		this.creditsLoading = true;
+		try {
+			const credits = await ipc.coder.openrouterCredits(id);
+			this.providerCredits = { ...this.providerCredits, [id]: credits };
+		} catch {
+			// Cache the failure so the picker stops spinning; the
+			// next explicit Refresh retries. Not surfaced through
+			// `modelsError` — a balance hiccup shouldn't block the
+			// catalog UI.
+			this.providerCredits = { ...this.providerCredits, [id]: null };
+		} finally {
+			this.creditsLoading = false;
 		}
 	}
 

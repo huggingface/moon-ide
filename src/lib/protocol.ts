@@ -1880,6 +1880,20 @@ export type ProviderProbeResult = {
 	sample_model_ids: string[];
 };
 
+/** OpenRouter credit status for a configured provider key.
+ *  Mirrors `moon_protocol::coder_models::OpenRouterCredits`.
+ *  All figures are US dollars; account balance remaining is
+ *  `total_credits - total_usage`. `key_limit*` are null when the
+ *  key has no per-key spend cap (the common case). */
+export type OpenRouterCredits = {
+	total_credits: number;
+	total_usage: number;
+	key_usage: number;
+	key_limit?: number | null;
+	key_limit_remaining?: number | null;
+	is_free_tier: boolean;
+};
+
 /**
  * Catalog entry for a user-added provider. Mirrors
  * `moon_protocol::coder_models::ProviderModelSummary`.

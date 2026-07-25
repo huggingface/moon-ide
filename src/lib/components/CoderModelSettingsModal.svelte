@@ -503,6 +503,34 @@
 		activeProviderId === null ? null : (providers.find((p) => p.id === activeProviderId) ?? null),
 	);
 	const isHfActive = $derived(activeProviderId === null);
+	// OpenRouter credit status for the active provider tab.
+	// `undefined` = not fetched yet (or not applicable), `null` =
+	// fetch failed. Fetched lazily by the effect below the first
+	// time the tab is shown with a key configured; the Refresh
+	// gesture re-fetches on demand.
+	const activeCredits = $derived(
+		activeProvider !== null && activeProvider.kind === 'open_router'
+			? coder.providerCredits[activeProvider.id]
+			: undefined,
+	);
+	$effect(() => {
+		const entry = activeProvider;
+		if (entry === null || entry.kind !== 'open_router' || !entry.has_api_key) {
+			return;
+		}
+		if (coder.providerCredits[entry.id] === undefined) {
+			void coder.loadProviderCredits(entry.id);
+		}
+	});
+
+	// Dollar figures from OpenRouter span "$0.0042 used" keys to
+	// "$500 topped-up" accounts; two decimals except tiny non-zero
+	// values, which get four so they don't render as $0.00.
+	function fmtUsd(n: number): string {
+		const abs = Math.abs(n);
+		const digits = abs > 0 && abs < 1 ? 4 : 2;
+		return `${n < 0 ? '-' : ''}$${abs.toFixed(digits)}`;
+	}
 	// Human-readable name for the currently-active provider —
 	// used by the lock-row label so the user can confirm at a
 	// glance which provider they're about to pin.
@@ -1187,6 +1215,50 @@
 					</span>
 				</label>
 
+				{#if activeProvider !== null && activeProvider.kind === 'open_router'}
+					{@const orId = activeProvider.id}
+					<div class="field">
+						<span class="label-row">
+							<span class="label-name">Credits</span>
+							{#if activeProvider.has_api_key}
+								<button
+									type="button"
+									class="catalog-refresh"
+									title="Re-fetch the credit balance from OpenRouter"
+									onclick={() => coder.loadProviderCredits(orId)}
+								>
+									Refresh
+								</button>
+							{/if}
+						</span>
+						{#if !activeProvider.has_api_key}
+							<span class="hint">Add an API key to see the remaining credit balance.</span>
+						{:else if activeCredits === undefined}
+							<span class="hint">Loading credit balance…</span>
+						{:else if activeCredits === null}
+							<span class="hint">Balance unavailable — check the API key, or hit Refresh to retry.</span>
+						{:else}
+							<span class="credits-line">
+								<strong>{fmtUsd(activeCredits.total_credits - activeCredits.total_usage)}</strong> remaining
+								<span class="credits-detail">
+									· {fmtUsd(activeCredits.total_usage)} of {fmtUsd(activeCredits.total_credits)} used
+									{#if activeCredits.is_free_tier}
+										· free tier
+									{/if}
+								</span>
+							</span>
+							<span class="hint">
+								{#if activeCredits.key_limit !== null && activeCredits.key_limit !== undefined}
+									This key: {fmtUsd(activeCredits.key_usage)} used, {fmtUsd(activeCredits.key_limit_remaining ?? 0)} left
+									of its {fmtUsd(activeCredits.key_limit)} cap.
+								{:else}
+									This key: {fmtUsd(activeCredits.key_usage)} used · no per-key spend cap.
+								{/if}
+							</span>
+						{/if}
+					</div>
+				{/if}
+
 				{#if isHfActive}
 					<label class="field">
 						<span class="label-row">
@@ -1723,6 +1795,20 @@
 		color: var(--m-fg);
 		font-family: var(--m-font-mono, ui-monospace, monospace);
 		font-size: 10.5px;
+	}
+	/* OpenRouter credit balance line. The headline number carries
+	   the visual weight; the parenthetical breakdown stays muted
+	   like a hint so the row doesn't compete with the slug fields. */
+	.credits-line {
+		font-size: 12px;
+		color: var(--m-fg);
+	}
+	.credits-line strong {
+		font-family: var(--m-font-mono, ui-monospace, monospace);
+	}
+	.credits-detail {
+		font-size: 11px;
+		color: var(--m-fg-muted);
 	}
 	/* Per-tier context-window cap input. Sits below the slug
 	   field on the same `.field` flex column; keeps the visual

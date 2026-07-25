@@ -15,7 +15,8 @@ use moon_core::session as core_session;
 use moon_protocol::coder_hub::{CoderHubBucket, HubNamespace, HubUploadAllSummary};
 use moon_protocol::coder_mcp::{McpRunTarget, McpServerConfig, McpServerStatus};
 use moon_protocol::coder_models::{
-	CoderModelSettings, CoderProviderConfig, CoderProviderLock, ProviderModelSummary, ProviderProbeResult, RouterModel,
+	CoderModelSettings, CoderProviderConfig, CoderProviderLock, OpenRouterCredits, ProviderModelSummary,
+	ProviderProbeResult, RouterModel,
 };
 use moon_protocol::MoonError;
 use serde::Deserialize;
@@ -1169,6 +1170,16 @@ pub async fn coder_list_provider_models(
 	id: String,
 ) -> Result<Vec<ProviderModelSummary>, MoonError> {
 	state.coder.list_provider_models(&id).await.map_err(MoonError::from)
+}
+
+/// OpenRouter credit status for a provider: account balance from
+/// `/credits`, per-key usage + optional spend cap from `/key`.
+/// The picker shows it on the OpenRouter tab when a key is
+/// configured. Errors (bad key, network, non-OpenRouter id)
+/// propagate verbatim; the modal renders them as "unavailable".
+#[tauri::command]
+pub async fn coder_openrouter_credits(state: State<'_, AppState>, id: String) -> Result<OpenRouterCredits, MoonError> {
+	state.coder.openrouter_credits(&id).await.map_err(MoonError::from)
 }
 
 /// Side-channel persist of a brand-new provider entry. Used by
