@@ -1155,24 +1155,40 @@ class CompanionState {
 				const name = str(ev, 'name');
 				const args = ev['args'];
 				const argsStr = typeof args === 'object' ? JSON.stringify(args) : str(ev, 'args');
+				const callId = str(ev, 'id');
+				// Idempotent by id: observing a session whose turn is
+				// still running replays the persisted assistant record
+				// (the whole tool-call batch, written before the first
+				// tool dispatches) and the live turn then emits its own
+				// `tool_call` for the calls that hadn't started yet. A
+				// second row for the same id would trip the keyed
+				// `{#each}`'s `each_key_duplicate`.
+				const known = this.rows.findLast((r) => (r.kind === 'tool' || r.kind === 'ask_user') && r.id === callId);
 				// ask_user gets its own row kind so the UI can render
 				// the interactive prompt.
 				if (name === 'ask_user') {
 					const questions = parseAskUserArgs(args);
-					const callId = str(ev, 'id');
-					this.rows.push({
-						kind: 'ask_user',
-						id: callId,
-						callId,
-						questions,
-						answered: false,
-					});
-					this.awaitingInput = true;
-					this.pendingPrompt = { callId, questions };
+					if (known?.kind !== 'ask_user') {
+						this.rows.push({
+							kind: 'ask_user',
+							id: callId,
+							callId,
+							questions,
+							answered: false,
+						});
+					}
+					// An already-answered prompt must not re-park the
+					// composer when its `tool_call` is re-observed.
+					if (known?.kind !== 'ask_user' || !known.answered) {
+						this.awaitingInput = true;
+						this.pendingPrompt = { callId, questions };
+					}
+				} else if (known?.kind === 'tool') {
+					known.args = argsStr;
 				} else {
 					this.rows.push({
 						kind: 'tool',
-						id: str(ev, 'id'),
+						id: callId,
 						name,
 						args: argsStr,
 						result: '',

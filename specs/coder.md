@@ -701,6 +701,19 @@ Replay ships as **one batched `Replay` event**, not
 one-emit-per-record — Tauri dispatch overhead made a 1000-row session
 take seconds to open otherwise. Live turns stay one-event-per-emit.
 
+Reducer contract: **a transcript row's id is its identity, and
+`tool_call` is an upsert on that id, not an append.** A mid-turn
+reopen replays the persisted assistant record, which carries the
+_whole_ tool-call batch (it's written before the first tool
+dispatches), and the still-running turn then emits its own
+`tool_call` for every call that hadn't started yet — so the same id
+legitimately arrives twice. Re-dispatched calls (resume from
+assistant, resumed `ask_user`) reuse the model's original id for the
+same reason. Appending instead of upserting duplicates the row and
+trips the keyed `{#each}`'s `each_key_duplicate`, which kills the
+panel until a reload. Holds for the desktop panel, the sub-agent
+pop-out, and the phone companion.
+
 ### Revert, replay, and edit & resend
 
 Every user message row reveals three hover affordances:

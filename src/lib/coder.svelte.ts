@@ -3231,27 +3231,18 @@ class CoderPanelState {
 					}
 				}
 				return;
-			case 'tool_call':
-				session.rows.push({
-					kind: 'tool',
-					id: event.id,
-					name: event.name,
-					args: event.args,
-					result: undefined,
-					hasResult: false,
-					isError: false,
-					startedAt: Date.now(),
-					durationMs: null,
-				});
+			case 'tool_call': {
+				const pending = upsertToolCallRow(session.rows, event);
 				// `ask_user` parks the turn waiting for the human —
 				// flip the "needs input" cue on so the row / folder
 				// bar stop reading as plain "running". Cleared on the
 				// matching `tool_result` (answered / skipped) or any
 				// turn terminator.
-				if (event.name === 'ask_user') {
+				if (pending && event.name === 'ask_user') {
 					session.awaitingInput = true;
 				}
 				return;
+			}
 			case 'tool_result': {
 				const toolRow = findRowById(session.rows, event.id);
 				if (toolRow?.kind === 'tool') {
@@ -3855,17 +3846,7 @@ function applyInnerEventToRows(rows: CoderRow[], event: CoderEvent): void {
 			return;
 		}
 		case 'tool_call':
-			rows.push({
-				kind: 'tool',
-				id: event.id,
-				name: event.name,
-				args: event.args,
-				result: undefined,
-				hasResult: false,
-				isError: false,
-				startedAt: Date.now(),
-				durationMs: null,
-			});
+			upsertToolCallRow(rows, event);
 			return;
 		case 'tool_result': {
 			const row = findRowById(rows, event.id);
@@ -4111,6 +4092,69 @@ function appendDelta(rows: CoderRow[], id: string, delta: string, field: 'text' 
 		thinkingOpen: true,
 		createdAt: Date.now(),
 	});
+}
+
+/** Tool row with `id` among the last few rows, or `null`. The scan
+ *  is tail-bounded because the only way the same tool-call id
+ *  arrives twice is from the *same* assistant batch (see
+ *  [`upsertToolCallRow`]), whose rows sit at the tail — and an
+ *  unbounded scan would be a whole-array walk per `tool_call`,
+ *  turning a long replay back into O(n^2). */
+const TOOL_ROW_DEDUP_TAIL = 64;
+function findToolRowInTail(rows: CoderRow[], id: string): Extract<CoderRow, { kind: 'tool' }> | null {
+	const stop = Math.max(0, rows.length - TOOL_ROW_DEDUP_TAIL);
+	for (let i = rows.length - 1; i >= stop; i--) {
+		const row = rows[i]!;
+		if (row.kind === 'tool' && row.id === id) {
+			return row;
+		}
+	}
+	return null;
+}
+
+/** Insert the tool row for a `tool_call` event, or refresh the
+ *  existing row when one with that id is already in the list.
+ *
+ *  The upsert (rather than a bare `push`) is the transcript's
+ *  idempotency contract: reopening a session whose turn is still
+ *  running replays the persisted assistant record — which carries
+ *  the *whole* tool-call batch, written before the first tool
+ *  dispatches — and the live turn then emits its own `tool_call`
+ *  for every call that hadn't started yet. Pushing a second row
+ *  for the same id blows up the transcript's keyed `{#each}` with
+ *  `each_key_duplicate`, which kills the panel until a reload.
+ *  Same shape for a re-dispatched call (resume-from-assistant,
+ *  resumed `ask_user`), which deliberately reuses the model's
+ *  original tool-call id.
+ *
+ *  Returns `true` when the row is still awaiting its result, so
+ *  callers can drive the `ask_user` parked-turn cue off it. */
+function upsertToolCallRow(rows: CoderRow[], event: Extract<CoderEvent, { kind: 'tool_call' }>): boolean {
+	const existing = findToolRowInTail(rows, event.id);
+	if (existing !== null) {
+		if (existing.hasResult) {
+			return false;
+		}
+		// The call is (re-)starting now: re-baseline the elapsed
+		// counter so a row replayed at reopen-time doesn't book the
+		// reopen→start gap as execution time.
+		existing.name = event.name;
+		existing.args = event.args;
+		existing.startedAt = Date.now();
+		return true;
+	}
+	rows.push({
+		kind: 'tool',
+		id: event.id,
+		name: event.name,
+		args: event.args,
+		result: undefined,
+		hasResult: false,
+		isError: false,
+		startedAt: Date.now(),
+		durationMs: null,
+	});
+	return true;
 }
 
 /** Monotonic id for synthetic transcript rows (compaction, per-turn
