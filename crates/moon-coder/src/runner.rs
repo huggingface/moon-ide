@@ -1728,11 +1728,20 @@ impl CoderHandle {
 	/// the Tauri command layer.
 	///
 	/// Steps: resolve the active (parent) folder, compute the branch
-	/// spec (fresh `moon/agent-<id>` off HEAD, or check out an existing
-	/// `base_branch`), derive the worktree path under
-	/// `<parent>/.worktrees/<branch-slug>`, `git worktree add`, bind
-	/// it as a nested folder, and mint a session (filed under the
+	/// spec (fresh `moon/<name>` or `moon/agent-<id>` off HEAD, or
+	/// check out an existing `base_branch`), derive the worktree path
+	/// under `<parent>/.worktrees/<branch-slug>`, `git worktree add`,
+	/// bind it as a nested folder, and mint a session (filed under the
 	/// parent) whose tools route to the worktree.
+	///
+	/// `branch_name` names the fresh branch (ADR 0042): a coordinator
+	/// passes the worker's `name` so the branch / worktree / session
+	/// chip read as `moon/fix-login-redirect` instead of an opaque
+	/// `moon/agent-1a2b3c4d`. Slugged and de-duplicated against the
+	/// parent's existing branches + worktree dirs. `None` (the UI
+	/// path — nobody has described the work yet) keeps the timestamp
+	/// default. Ignored when `base_branch` is given: that session
+	/// continues an existing branch, which already has a name.
 	///
 	/// `mode` selects the new session's top-level mode — `Agent` for
 	/// an ordinary worker (the common case), `Coordinator` for a
@@ -1753,6 +1762,7 @@ impl CoderHandle {
 	pub async fn create_worktree_session(
 		&self,
 		base_branch: Option<String>,
+		branch_name: Option<String>,
 		mode: CoderMode,
 		parent_folder: Option<String>,
 	) -> Result<(SessionSummary, moon_protocol::workspace::Workspace), CoderError> {
@@ -1770,13 +1780,16 @@ impl CoderHandle {
 		let parent_path = parent.folder.path.clone();
 		let spec = match base_branch.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
 			Some(existing) => WorktreeBranch::Existing(existing.to_string()),
-			None => {
-				let now_ms = std::time::SystemTime::now()
-					.duration_since(std::time::UNIX_EPOCH)
-					.map(|d| d.as_millis())
-					.unwrap_or(0) as u64;
-				WorktreeBranch::New(format!("moon/agent-{:08x}", now_ms & 0xffff_ffff))
-			}
+			None => WorktreeBranch::New(match branch_name.as_deref().and_then(worker_branch_slug) {
+				Some(slug) => free_worker_branch(&parent, &parent_path, &slug).await,
+				None => {
+					let now_ms = std::time::SystemTime::now()
+						.duration_since(std::time::UNIX_EPOCH)
+						.map(|d| d.as_millis())
+						.unwrap_or(0) as u64;
+					format!("moon/agent-{:08x}", now_ms & 0xffff_ffff)
+				}
+			}),
 		};
 		let branch = spec.name().to_string();
 		let branch_slug = branch.replace('/', "-");
@@ -3710,6 +3723,83 @@ impl CoderHandle {
 	}
 }
 
+/// Longest slug we keep from a coordinator-supplied worker name.
+/// Branch names have no practical git limit; this is about the UI —
+/// the sessions-list branch chip and the worktree directory name stay
+/// readable.
+const WORKER_BRANCH_SLUG_MAX: usize = 40;
+
+/// Slug a coordinator-supplied worker name into the path component of
+/// a `moon/<slug>` branch (ADR 0042). Lowercases, collapses every run
+/// of non-alphanumerics into a single `-`, trims separators from both
+/// ends, and caps the length. Returns `None` when nothing usable
+/// survives (e.g. a name of pure punctuation) so the caller can reject
+/// the argument instead of inventing a branch name.
+///
+/// The output is `[a-z0-9]([a-z0-9-]*[a-z0-9])?`, which sidesteps every
+/// `git check-ref-format` trap (`..`, trailing `.`, `.lock`, spaces,
+/// leading `-`) without needing to enumerate them.
+fn worker_branch_slug(name: &str) -> Option<String> {
+	let mut slug = String::with_capacity(name.len());
+	for ch in name.chars() {
+		if ch.is_ascii_alphanumeric() {
+			slug.push(ch.to_ascii_lowercase());
+			continue;
+		}
+		if !slug.ends_with('-') {
+			slug.push('-');
+		}
+	}
+	// A `moon-` prefix in the name would otherwise read as
+	// `moon/moon-fix-login` once the namespace is prepended.
+	let trimmed = slug.trim_matches('-');
+	let trimmed = trimmed.strip_prefix("moon-").unwrap_or(trimmed);
+	let mut slug = trimmed.to_string();
+	if slug.len() > WORKER_BRANCH_SLUG_MAX {
+		slug.truncate(WORKER_BRANCH_SLUG_MAX);
+		// Prefer a word boundary over a chopped-off word, unless that
+		// would throw away most of the name.
+		if let Some(boundary) = slug.rfind('-').filter(|at| *at > WORKER_BRANCH_SLUG_MAX / 2) {
+			slug.truncate(boundary);
+		}
+	}
+	let slug = slug.trim_end_matches('-').to_string();
+	(!slug.is_empty()).then_some(slug)
+}
+
+/// Pick a `moon/<slug>` branch name that doesn't collide with an
+/// existing branch or a leftover worktree directory in `parent`,
+/// suffixing `-2`, `-3`, … as needed. Two workers named the same thing
+/// (a retry, or the same fix attempted twice) must not fail the spawn.
+///
+/// A branch-listing failure degrades to "assume nothing is taken":
+/// `git worktree add` still refuses a duplicate, so the worst case is
+/// the spawn erroring the way it would have before ADR 0042.
+async fn free_worker_branch(parent: &moon_core::WorkspaceFolderEntry, parent_path: &str, slug: &str) -> String {
+	let taken = parent.host.git_local_branches().await.unwrap_or_default();
+	let worktrees = camino::Utf8Path::new(parent_path).join(moon_core::WORKTREES_DIR_NAME);
+	for suffix in 1u32..100 {
+		let candidate = match suffix {
+			1 => format!("moon/{slug}"),
+			n => format!("moon/{slug}-{n}"),
+		};
+		if taken.iter().any(|b| b == &candidate) {
+			continue;
+		}
+		if worktrees.join(candidate.replace('/', "-")).exists() {
+			continue;
+		}
+		return candidate;
+	}
+	// Absurd volume of same-named workers: fall back to the
+	// timestamp scheme rather than loop forever.
+	let now_ms = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|d| d.as_millis())
+		.unwrap_or(0) as u64;
+	format!("moon/{slug}-{:08x}", now_ms & 0xffff_ffff)
+}
+
 /// Compact snapshot of a worker session's current state (ADR 0030).
 /// The shape an orchestrator's `observe_worker` tool returns — enough
 /// to decide what to do next (steer, abort, answer, report) without
@@ -5273,6 +5363,7 @@ async fn handle_spawn_worker(
 	#[derive(serde::Deserialize)]
 	struct SpawnWorkerArgs {
 		task: String,
+		name: String,
 		#[serde(default)]
 		base_branch: Option<String>,
 		#[serde(default)]
@@ -5283,6 +5374,15 @@ async fn handle_spawn_worker(
 	let task = parsed.task.trim();
 	if task.is_empty() {
 		return Err(CoderError::invalid_args("spawn_worker", "task must not be empty"));
+	}
+	// The name becomes the branch / worktree / session chip (ADR
+	// 0042), so reject one that slugs to nothing rather than
+	// silently falling back to an opaque `moon/agent-<id>`.
+	if worker_branch_slug(&parsed.name).is_none() {
+		return Err(CoderError::invalid_args(
+			"spawn_worker",
+			"name must contain at least one letter or digit — it becomes the worker's branch name",
+		));
 	}
 	// Resolve the parent folder for the worktree. The coordinator's
 	// own folder (the sink's) is the default; `folder` overrides it
@@ -5317,7 +5417,12 @@ async fn handle_spawn_worker(
 	// later-scale concern; v1 workers are plain agents.
 	let handle = CoderHandle { state: state.clone() };
 	let (summary, _workspace) = handle
-		.create_worktree_session(parsed.base_branch, CoderMode::Agent, Some(parent_folder.clone()))
+		.create_worktree_session(
+			parsed.base_branch,
+			Some(parsed.name),
+			CoderMode::Agent,
+			Some(parent_folder.clone()),
+		)
 		.await?;
 	// `target_folder` is the worktree path the worker operates
 	// against — the same shape `SubagentSpawned.target_folder`
@@ -7807,6 +7912,80 @@ mod tests {
 			assert_eq!(reg.take_over("sess-ordinary"), None);
 			assert_eq!(reg.take_over("orch-1"), None);
 			assert!(reg.feeds("orch-1", "w-1"));
+		}
+	}
+
+	mod worker_branch_names {
+		use super::super::worker_branch_slug;
+
+		#[test]
+		fn kebab_case_names_pass_through() {
+			assert_eq!(
+				worker_branch_slug("fix-login-redirect").as_deref(),
+				Some("fix-login-redirect")
+			);
+		}
+
+		#[test]
+		fn prose_names_collapse_to_a_slug() {
+			assert_eq!(
+				worker_branch_slug("Fix the login redirect!").as_deref(),
+				Some("fix-the-login-redirect")
+			);
+			assert_eq!(
+				worker_branch_slug("  spaces  and   tabs\t").as_deref(),
+				Some("spaces-and-tabs")
+			);
+			assert_eq!(worker_branch_slug("feat/add retry").as_deref(), Some("feat-add-retry"));
+		}
+
+		#[test]
+		fn a_leading_moon_prefix_is_dropped() {
+			// Otherwise the namespace doubles up: `moon/moon-fix`.
+			assert_eq!(worker_branch_slug("moon/fix-login").as_deref(), Some("fix-login"));
+			assert_eq!(worker_branch_slug("moon-fix-login").as_deref(), Some("fix-login"));
+		}
+
+		#[test]
+		fn long_names_are_capped_without_a_trailing_separator() {
+			let slug = worker_branch_slug("port the s3 client over to the new endpoints and delete the old one").unwrap();
+			assert!(slug.len() <= super::super::WORKER_BRANCH_SLUG_MAX);
+			assert!(!slug.ends_with('-'));
+			// Cut on a word boundary, not mid-word.
+			assert_eq!(slug, "port-the-s3-client-over-to-the-new");
+		}
+
+		#[test]
+		fn unusable_names_are_rejected() {
+			// `spawn_worker` errors instead of silently falling back
+			// to an opaque `moon/agent-<id>`.
+			assert_eq!(worker_branch_slug("###"), None);
+			assert_eq!(worker_branch_slug(""), None);
+			assert_eq!(worker_branch_slug("   "), None);
+		}
+
+		#[test]
+		fn slugs_are_git_ref_safe() {
+			// Every trap `git check-ref-format` cares about reduces to
+			// `[a-z0-9-]` with alphanumeric ends.
+			for raw in [
+				"../escape",
+				"a..b",
+				"trailing.lock",
+				"-leading",
+				"trailing.",
+				"with space",
+			] {
+				let slug = worker_branch_slug(raw).unwrap();
+				assert!(
+					slug
+						.chars()
+						.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+					"{slug}"
+				);
+				assert!(!slug.starts_with('-') && !slug.ends_with('-'), "{slug}");
+				assert!(!slug.contains("--"), "{slug}");
+			}
 		}
 	}
 

@@ -147,7 +147,7 @@
 			case 'stop_process':
 				return `stop ${p('id') || 'process'}`;
 			case 'spawn_worker':
-				return 'spawn worker';
+				return p('name') ? `spawn worker ${p('name')}` : 'spawn worker';
 			case 'observe_worker':
 				return 'observe worker';
 			case 'steer_worker':

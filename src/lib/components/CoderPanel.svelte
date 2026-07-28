@@ -1370,8 +1370,13 @@
 			}
 			case 'spawn_worker': {
 				const folder = typeof o.folder === 'string' && o.folder.length > 0 ? o.folder : null;
+				// The worker's name (ADR 0042) is its branch, so lead
+				// with it — it's the handle the user sees again on the
+				// session row's branch chip.
+				const workerName = typeof o.name === 'string' && o.name.length > 0 ? o.name : null;
 				const taskText = typeof o.task === 'string' ? firstLine(o.task) : null;
-				return folder !== null && taskText !== null ? `${folder} — ${taskText}` : folder !== null ? folder : taskText;
+				const head = folder !== null && workerName !== null ? `${folder} · ${workerName}` : (workerName ?? folder);
+				return head !== null && taskText !== null ? `${head} — ${taskText}` : (head ?? taskText);
 			}
 			case 'observe_worker':
 			case 'steer_worker':

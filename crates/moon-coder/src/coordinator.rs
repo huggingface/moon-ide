@@ -53,7 +53,7 @@ The moment the user messages a worker directly, that worker is **taken over**: y
 
 You manage workers with:
 
-- `spawn_worker(task, base_branch?, folder?)` — create a worker in a fresh worktree on a new `moon/agent-<id>` branch (or based on an existing branch when `base_branch` is given), seed it with a task prompt, and let it run. Returns a `worker_id` handle immediately — **it does not block**. The worker keeps running in the background. By default the worktree is created off the coordinator's own project; pass `folder` to target a different bound workspace folder (e.g. one you just created with `init_repo` or `clone_repo` — pass the `path` that tool returned). The folder must already be bound in the workspace.
+- `spawn_worker(task, name, base_branch?, folder?)` — create a worker in a fresh worktree on a new `moon/<name>` branch (or based on an existing branch when `base_branch` is given), seed it with a task prompt, and let it run. `name` is a short kebab-case name for the deliverable (`fix-login-redirect`) — it becomes the branch, the worktree directory, and the chip the user sees in the sessions list, so name the work, never the worker (`worker-2` tells the user nothing). Returns a `worker_id` handle immediately — **it does not block**. The worker keeps running in the background. By default the worktree is created off the coordinator's own project; pass `folder` to target a different bound workspace folder (e.g. one you just created with `init_repo` or `clone_repo` — pass the `path` that tool returned). The folder must already be bound in the workspace.
 - `observe_worker(worker_id)` — fetch a compact snapshot of a worker's current state: its task, branch, turns-so-far, last assistant message, whether it's running / idle / needs input (a parked `ask_user`), and a **diff summary** (files changed + added/removed counts per file, not the full patch). Use this to check on a worker without reading its full transcript or flooding your context with patch text.
 - `review_worker_changes(worker_id, files?)` — pull the full per-turn diff for a worker, optionally scoped to specific files. Use this when `observe_worker`'s diff summary shows files you want to actually inspect. Don't call it on every observe — only when you need the detail.
 - `steer_worker(worker_id, text)` — send a steering message to a worker mid-turn, the same way a user steers you. Queued; delivered at the worker's next loop iteration top.
@@ -84,7 +84,7 @@ You spawn **workers** (peer top-level sessions), not sub-agents. A worker *can* 
 
 ## Worktrees and branches
 
-Each worker runs in its own git worktree on its own branch — the branch is the deliverable. `base_branch` lets you start a worker from an existing branch (e.g. a colleague's open-PR branch) instead of the default — useful for "continue this PR" tasks.
+Each worker runs in its own git worktree on its own branch — the branch is the deliverable, and `spawn_worker`'s `name` is what it's called (`moon/<name>`). That name is the user's handle on the worker: it labels the branch, the worktree directory under `.worktrees/`, and the session row in the panel, so pick one that describes the deliverable and don't reuse it across workers doing different work. `base_branch` lets you start a worker from an existing branch (e.g. a colleague's open-PR branch) instead of the default — useful for "continue this PR" tasks.
 
 If you need to merge worker changes into your current branch, you can use `merge_worker_changes` to land the worker's committed work. Use `commit_worker_changes` first if the worker has uncommitted work. It depends on the task, sometimes you just want workers to make or update PRs.
 
@@ -112,13 +112,17 @@ Be concise. Do not narrate what each tool call is for; the UI already shows the 
 pub fn spawn_worker_tool_definition() -> ToolDefinition {
 	ToolDefinition::function(
 		"spawn_worker",
-		"Spawn a worker — a peer top-level coder session in its own git worktree on a fresh branch — and seed it with a task prompt. Returns a `worker_id` handle immediately; the worker runs in the background and does not block. The worker is an ordinary agent session (full toolkit, can edit files) in a worktree. It shows up in the sessions list and the user can take over. Use this to delegate a self-contained piece of work to an autonomous agent that produces its own branch / PR.\n\nBy default the worktree is created off the coordinator's own project. Pass `folder` to target a different bound workspace folder — e.g. one you just created with `init_repo` or `clone_repo`. The folder must already be bound in the workspace.",
+		"Spawn a worker — a peer top-level coder session in its own git worktree on a fresh branch — and seed it with a task prompt. Returns a `worker_id` handle immediately; the worker runs in the background and does not block. The worker is an ordinary agent session (full toolkit, can edit files) in a worktree. It shows up in the sessions list and the user can take over. Use this to delegate a self-contained piece of work to an autonomous agent that produces its own branch / PR.\n\nYou must give the worker a short `name`: it becomes its branch (`moon/<name>`), its worktree directory, and the chip the user sees in the sessions list, so the user can tell your workers apart at a glance.\n\nBy default the worktree is created off the coordinator's own project. Pass `folder` to target a different bound workspace folder — e.g. one you just created with `init_repo` or `clone_repo`. The folder must already be bound in the workspace.",
 		json!({
 			"type": "object",
 			"properties": {
 				"task": {
 					"type": "string",
 					"description": "Self-contained description of what the worker should do. Include any context the worker needs — it does not see your conversation history. The worker is an autonomous agent with the full toolkit; describe the goal, not the steps."
+				},
+				"name": {
+					"type": "string",
+					"description": "Short name for the work, 2-4 words, kebab-case (e.g. `fix-login-redirect`, `port-s3-client`). Becomes the worker's branch `moon/<name>`, its worktree directory, and the branch chip in the sessions list — name the deliverable, not the worker (`add-retry-backoff`, not `worker-3`). Slugged to `[a-z0-9-]` and suffixed `-2`, `-3`, … if that branch already exists. Ignored when `base_branch` is given (the worker continues a branch that already has a name)."
 				},
 				"base_branch": {
 					"type": "string",
@@ -129,7 +133,7 @@ pub fn spawn_worker_tool_definition() -> ToolDefinition {
 					"description": "Optional. The absolute host path of a bound workspace folder to create the worktree under. Defaults to the coordinator's own folder. Use this to spawn a worker in a project you created with `init_repo` or `clone_repo` — pass the `path` that tool returned. The folder must already be bound in the workspace."
 				}
 			},
-			"required": ["task"]
+			"required": ["task", "name"]
 		}),
 	)
 }
@@ -404,16 +408,20 @@ mod tests {
 	}
 
 	#[test]
-	fn spawn_worker_requires_task() {
+	fn spawn_worker_requires_task_and_name() {
 		let params = spawn_worker_tool_definition().function.parameters;
 		assert_eq!(params["type"], "object");
 		assert!(params["properties"]["task"].is_object());
-		assert_eq!(params["required"][0], "task");
+		// `name` is required too (ADR 0042) — the branch / worktree /
+		// session chip are named after it.
+		assert!(params["properties"]["name"].is_object());
+		let required: Vec<String> = serde_json::from_value(params["required"].clone()).unwrap();
+		assert!(required.contains(&"task".to_string()));
+		assert!(required.contains(&"name".to_string()));
 		// `base_branch` is optional.
 		assert!(params["properties"]["base_branch"].is_object());
 		// `folder` is optional.
 		assert!(params["properties"]["folder"].is_object());
-		let required: Vec<String> = serde_json::from_value(params["required"].clone()).unwrap();
 		assert!(!required.contains(&"base_branch".to_string()));
 		assert!(!required.contains(&"folder".to_string()));
 	}

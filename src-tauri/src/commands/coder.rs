@@ -485,7 +485,7 @@ pub async fn coder_new_worktree_session(
 	// time is the parent, and the new session becomes visible.
 	let (session, workspace) = state
 		.coder
-		.create_worktree_session(base_branch, moon_coder::tools::CoderMode::Agent, None)
+		.create_worktree_session(base_branch, None, moon_coder::tools::CoderMode::Agent, None)
 		.await?;
 	Ok(NewWorktreeSession { workspace, session })
 }

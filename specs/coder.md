@@ -1331,6 +1331,12 @@ machinery of its own. The branch defaults to `moon/agent-<short-id>`
 at creation (no diff to summarise yet) and is renameable; an AI
 suggestion can replace it after the first turn.
 
+A **coordinator-spawned worker** skips that default: `spawn_worker`
+requires a `name` and the branch is `moon/<name-slug>`
+([ADR 0042](decisions/0042-named-worker-branches.md)), so the branch,
+the worktree directory, and the session row's branch chip all read as
+the work the worker was given.
+
 An isolated session can either start a **fresh** `moon/agent-<id>`
 branch off the parent's current `HEAD` (the default), or be based on
 an **existing** branch — local, or a remote one DWIM-created locally
