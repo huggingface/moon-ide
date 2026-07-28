@@ -24,6 +24,15 @@ Because the worktree directory is already derived from the branch
 the branch, one argument names all three surfaces with no frontend
 change.
 
+The same name is also the worker's **session title**, set at creation
+instead of at first message. So the sessions-list row reads
+`fix-login-redirect` the moment the worker spawns, matching its branch
+chip, rather than a truncated copy of the task prompt that the
+[auto-rename](../coder.md#auto-rename) cheap-model call replaces one
+turn later. A pre-set title suppresses that call — the coordinator
+already named the work, and a second name for the same thing is worse
+than one.
+
 - **Required, not optional.** Optional means the model omits it and
   the fleet is anonymous again. A name that slugs to nothing (pure
   punctuation) is an `invalid_args` error rather than a silent
@@ -48,10 +57,13 @@ change.
   the model the `moon/` namespace and ref-syntax rules for no gain.
   Slugging a human-readable name is the same UX with none of the
   failure modes.
-- **Name the worker, not the branch** (a separate label on the session
-  header). Rejected: it adds a field, a persisted header change, and
-  frontend work to render it — while the branch chip, already onscreen,
-  is exactly the affordance the user reads.
+- **A separate "worker label" field on the session header.** Rejected:
+  it adds a persisted field and frontend work to render it, while the
+  branch chip and the session title — both already onscreen — carry the
+  name for free.
+- **Let the auto-rename overwrite the seeded title.** Rejected: the
+  row would silently stop matching the branch chip one turn in, and the
+  coordinator's chosen name is the one the user was told about.
 - **Rename the branch after the first turn** from a cheap-model summary
   (phase 6's W.3.1 / W.4.1 idea, still open for the UI path).
   Rejected here: the coordinator already knows the task before the

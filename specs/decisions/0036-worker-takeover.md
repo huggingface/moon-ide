@@ -1,7 +1,12 @@
 # ADR 0036 — Worker takeover: a direct user message unhooks a worker from its coordinator
 
 Date: 2026-07-14
-Status: accepted; implemented.
+Status: **superseded in full** by
+[ADR 0043 — a user message to a worker notifies the coordinator, it
+doesn't unhook it](0043-user-message-notifies-coordinator.md). Takeover
+shipped, then came out: a user message now feeds the coordinator a
+notice quoting the message and leaves the link intact. Kept as the
+record of why arbitration was tried.
 
 ## Context
 

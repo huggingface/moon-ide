@@ -533,14 +533,16 @@ different bound folder when `folder` is passed (e.g. one created by
 `abort` targets the active folder's visible session only; sign-out is
 the one global cancel.
 
-A direct user message into a coordinator-spawned worker **takes the
-worker over** ([ADR 0036](decisions/0036-worker-takeover.md)): the
-coordinator gets one final notice, stops receiving the worker's
-dispatch packets, and its control tools (`steer_worker`,
-`abort_worker`, `respond_to_worker_prompt`, `commit_worker_changes`)
-refuse the worker from then on — read-only observation still works.
-Viewing, panel-abort, and answering an `ask_user` card don't trigger
-takeover; the first typed message does.
+A direct user message into a coordinator-spawned worker **notifies the
+coordinator and nothing more**
+([ADR 0043](decisions/0043-user-message-notifies-coordinator.md)): the
+coordinator's session receives a dispatch notice naming the worker and
+quoting the message (truncated to 200 characters), on every such
+message. Nothing else changes: the worker stays hooked up, dispatch
+packets keep flowing, and every control tool keeps working on it. Both
+the desktop composer and the phone notify; coordinator
+traffic (`send_to`) doesn't. Viewing a worker, aborting it from the
+panel, and answering its `ask_user` card notify nobody.
 
 `coder:event` payloads are wrapped in a
 `CoderEventEnvelope { folder, session_id, event }` so the frontend
@@ -783,7 +785,9 @@ title, replacing the truncated-prompt fallback in memory, persisting
 as a `TitleUpdate` record, and emitting `session_title_updated`.
 "Any outcome" matters because long tool-heavy first turns are
 routinely Esc'd; failures keep the truncated-prompt fallback. Runs
-once per session.
+once per session, and **not at all** for a session that was already
+titled at creation — a coordinator-spawned worker keeps the name the
+coordinator gave it ([ADR 0042](decisions/0042-named-worker-branches.md)).
 
 ### Sidebar UI
 
@@ -1334,8 +1338,8 @@ suggestion can replace it after the first turn.
 A **coordinator-spawned worker** skips that default: `spawn_worker`
 requires a `name` and the branch is `moon/<name-slug>`
 ([ADR 0042](decisions/0042-named-worker-branches.md)), so the branch,
-the worktree directory, and the session row's branch chip all read as
-the work the worker was given.
+the worktree directory, the session row's branch chip, and the
+session's **title** all read as the work the worker was given.
 
 An isolated session can either start a **fresh** `moon/agent-<id>`
 branch off the parent's current `HEAD` (the default), or be based on

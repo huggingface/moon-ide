@@ -142,12 +142,15 @@ impl BridgeRpcHandler for BridgeRpc {
 				let p: SendParams = parse_params(params)?;
 				// Images aren't part of the phone composer yet.
 				// `session_id` (the session the phone has open) routes
-				// via `send_to` so the message can't land in whatever
-				// session the desktop happens to have visible.
+				// via `send_to_as_user` so the message can't land in
+				// whatever session the desktop happens to have visible
+				// — and, when the target is a coordinator's worker, so
+				// the coordinator hears about it (ADR 0043) exactly as
+				// it would for a desktop message.
 				match p.session_id {
 					Some(sid) => self
 						.coder
-						.send_to(&sid, p.text, Vec::new())
+						.send_to_as_user(&sid, p.text, Vec::new())
 						.await
 						.map_err(|e| e.to_string())?,
 					None => {

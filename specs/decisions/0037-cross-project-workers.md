@@ -113,5 +113,5 @@ there's a remote; `merge_worker_changes` for local repos.
 
 - [ADR 0030 — orchestrator sessions](0030-orchestrator-sessions.md) —
   the coordinator / worker model this builds on.
-- [ADR 0036 — worker takeover](0036-worker-takeover.md) — the
-  "user messaged a worker directly" semantics, unchanged here.
+- [ADR 0043 — a user message notifies the coordinator](0043-user-message-notifies-coordinator.md)
+  — the "user messaged a worker directly" semantics, unchanged here.

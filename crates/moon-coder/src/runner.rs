@@ -22,7 +22,7 @@
 //! 6. Cap iterations at [`MAX_TURN_ITERATIONS`] so a misbehaving
 //!    model can't run forever.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -138,10 +138,9 @@ struct CoderState {
 	coordinator_workers: Arc<RwLock<CoordinatorRegistry>>,
 }
 
-/// In-memory orchestrator → worker links (ADR 0030) plus the user-
-/// takeover state (ADR 0036). Not persisted: neither the feeder task
-/// nor a background turn survives a process restart, so a restarted
-/// coordinator has no live workers to take over anyway.
+/// In-memory orchestrator → worker links (ADR 0030). Not persisted:
+/// neither the feeder task nor a background turn survives a process
+/// restart, so a restarted coordinator has no live workers anyway.
 #[derive(Default)]
 struct CoordinatorRegistry {
 	by_orchestrator: HashMap<String, CoordinatorWorkers>,
@@ -151,19 +150,8 @@ struct CoordinatorRegistry {
 /// feeder task is already running for it.
 #[derive(Default)]
 struct CoordinatorWorkers {
-	/// Worker session id → link state.
-	workers: HashMap<String, WorkerLink>,
+	workers: HashSet<String>,
 	feeder_running: bool,
-}
-
-/// Per-worker link state under an orchestrator.
-#[derive(Default)]
-struct WorkerLink {
-	/// The user messaged the worker directly, taking it over
-	/// (ADR 0036): the feeder stops forwarding its events and the
-	/// orchestrator's control tools refuse it. One-way — there is
-	/// no hand-back.
-	taken_over: bool,
 }
 
 impl CoordinatorRegistry {
@@ -172,50 +160,32 @@ impl CoordinatorRegistry {
 	/// registered for this orchestrator).
 	fn register(&mut self, orchestrator_id: &str, worker_id: &str) -> bool {
 		let entry = self.by_orchestrator.entry(orchestrator_id.to_string()).or_default();
-		entry.workers.entry(worker_id.to_string()).or_default();
+		entry.workers.insert(worker_id.to_string());
 		let spawn_feeder = !entry.feeder_running;
 		entry.feeder_running = true;
 		spawn_feeder
 	}
 
 	/// Whether `orchestrator_id`'s feeder should forward events from
-	/// `session_id`: it must be a registered worker the user hasn't
-	/// taken over.
+	/// `session_id` — i.e. whether it's one of its workers. A user
+	/// message into a worker does **not** unhook it (ADR 0043); the
+	/// coordinator keeps receiving its updates.
 	fn feeds(&self, orchestrator_id: &str, session_id: &str) -> bool {
 		self
 			.by_orchestrator
 			.get(orchestrator_id)
-			.and_then(|entry| entry.workers.get(session_id))
-			.is_some_and(|link| !link.taken_over)
+			.is_some_and(|entry| entry.workers.contains(session_id))
 	}
 
-	/// Whether the user has taken `worker_id` over from whichever
-	/// orchestrator spawned it. Used by the coordinator's control
-	/// tools to refuse a user-owned worker.
-	fn is_taken_over(&self, worker_id: &str) -> bool {
+	/// The orchestrator that spawned `worker_id`, if any. Used to
+	/// tell a coordinator that the user just messaged one of its
+	/// workers (ADR 0043).
+	fn orchestrator_of(&self, worker_id: &str) -> Option<&str> {
 		self
 			.by_orchestrator
-			.values()
-			.any(|entry| entry.workers.get(worker_id).is_some_and(|link| link.taken_over))
-	}
-
-	/// Mark `worker_id` as taken over by the user. Returns the owning
-	/// orchestrator's session id on the live → taken-over transition
-	/// (so the caller notifies the orchestrator exactly once); `None`
-	/// when the session isn't a live worker — not registered under
-	/// any orchestrator, or already taken over.
-	fn take_over(&mut self, worker_id: &str) -> Option<String> {
-		for (orchestrator_id, entry) in &mut self.by_orchestrator {
-			let Some(link) = entry.workers.get_mut(worker_id) else {
-				continue;
-			};
-			if link.taken_over {
-				return None;
-			}
-			link.taken_over = true;
-			return Some(orchestrator_id.clone());
-		}
-		None
+			.iter()
+			.find(|(_, entry)| entry.workers.contains(worker_id))
+			.map(|(orchestrator_id, _)| orchestrator_id.as_str())
 	}
 }
 
@@ -1778,10 +1748,11 @@ impl CoderHandle {
 			None => self.state.workspaces.require_active_folder().await?,
 		};
 		let parent_path = parent.folder.path.clone();
+		let name_slug = branch_name.as_deref().and_then(worker_branch_slug);
 		let spec = match base_branch.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
 			Some(existing) => WorktreeBranch::Existing(existing.to_string()),
-			None => WorktreeBranch::New(match branch_name.as_deref().and_then(worker_branch_slug) {
-				Some(slug) => free_worker_branch(&parent, &parent_path, &slug).await,
+			None => WorktreeBranch::New(match &name_slug {
+				Some(slug) => free_worker_branch(&parent, &parent_path, slug).await,
 				None => {
 					let now_ms = std::time::SystemTime::now()
 						.duration_since(std::time::UNIX_EPOCH)
@@ -1814,6 +1785,15 @@ impl CoderHandle {
 		let root = self.state.coder_root_of(parent).await;
 		let fs = self.state.folder_session_for(Utf8Path::new(&root.folder.path)).await;
 		let mut blank = Session::new_blank_with_mode(mode);
+		// A named worker is titled after its name (ADR 0042): the
+		// sessions-list row reads `fix-login-redirect` from the moment
+		// it spawns, matching its branch chip, instead of a truncated
+		// task blob that a cheap-model title replaces a turn later.
+		// A pre-set title also suppresses the auto-rename — the
+		// coordinator already named this work.
+		if let Some(slug) = name_slug {
+			blank.header.title = slug;
+		}
 		blank.header.worktree_root = Some(wt_entry.folder.path.clone());
 		blank.header.worktree_branch = Some(branch);
 		let summary = blank.summary();
@@ -3037,35 +3017,11 @@ impl CoderHandle {
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
 
 		// A direct user message into a coordinator-spawned worker
-		// **takes the session over** (ADR 0036): the dispatch feeder
-		// stops waking the coordinator for this worker and the
-		// coordinator's control tools refuse it from now on. Runs
-		// before the steer branch so a mid-turn nudge takes over
-		// just like a fresh prompt. The coordinator gets one final
-		// dispatch packet so it re-plans instead of waiting on a
-		// worker that now answers to the user.
-		let taken_over_from = self.state.coordinator_workers.write().await.take_over(&session_id);
-		if let Some(orchestrator_id) = taken_over_from {
-			let notice = format!(
-				"The user has taken over worker {session_id} by messaging it directly. \
-				 You will no longer receive its updates, and `steer_worker` / `abort_worker` / \
-				 `respond_to_worker_prompt` / `commit_worker_changes` will refuse it. Treat its \
-				 task as user-owned and re-plan around it. Read-only tools (`observe_worker`, \
-				 `review_worker_changes`, `workspace_scm_status`) still work if you need its \
-				 state for a summary."
-			);
-			let handle = CoderHandle {
-				state: self.state.clone(),
-			};
-			// Detached so the user's send isn't blocked on the
-			// orchestrator's wake bookkeeping; failure (orchestrator
-			// unmounted / deleted) only costs the notice.
-			tokio::spawn(async move {
-				if let Err(err) = handle.send_to(&orchestrator_id, notice, Vec::new()).await {
-					tracing::warn!(?err, "failed to notify coordinator of worker takeover");
-				}
-			});
-		}
+		// **tells the coordinator** what the user said (ADR 0043) and
+		// changes nothing else — the worker stays hooked up. Runs
+		// before the steer branch so a mid-turn nudge notifies the
+		// same way a fresh prompt does.
+		self.notify_coordinator_of_user_message(&session_id, &text).await;
 
 		// A second `send` while the **visible session's** turn is
 		// already in flight is a **steer**: queue the new user
@@ -3128,7 +3084,10 @@ impl CoderHandle {
 		// append.
 		let (auto_rename_after, summary_to_announce) = {
 			let mut session = rt.session.lock().await;
-			let needs_loaded_event = session.header.title.is_empty() && session.persisted_records == 0;
+			// "Nothing on disk yet" is the freshness test, not "no
+			// title": a coordinator-spawned worker is pre-titled at
+			// creation (ADR 0042) and still has to announce itself.
+			let needs_loaded_event = session.persisted_records == 0;
 			if session.session_dir.is_none() {
 				session.session_dir = Some(dir.clone());
 			}
@@ -3508,6 +3467,71 @@ impl CoderHandle {
 	// has foregrounded. The visible-session methods above stay
 	// unchanged for the UI path.
 
+	/// [`Self::send_to`] for a message the **user** typed (the phone's
+	/// composer, which targets a session by id rather than "the
+	/// visible one"). Identical except that it also tells the
+	/// coordinator when the target is one of its workers (ADR 0043) —
+	/// the desktop's `send` does the same. Coordinator-originated
+	/// traffic uses plain `send_to`, which stays silent: a coordinator
+	/// doesn't need to be told what it just said.
+	pub async fn send_to_as_user(
+		&self,
+		session_id: &str,
+		text: String,
+		images: Vec<ImageAttachment>,
+	) -> Result<(), CoderError> {
+		self.notify_coordinator_of_user_message(session_id, &text).await;
+		self.send_to(session_id, text, images).await
+	}
+
+	/// Tell the coordinator that the user just messaged one of its
+	/// workers directly, quoting the message (truncated). No-op when
+	/// the session isn't a registered worker.
+	///
+	/// The worker stays hooked up (ADR 0043): the dispatch feeder
+	/// keeps forwarding its events and every control tool keeps
+	/// working. The notice exists so the coordinator's next turn
+	/// accounts for an instruction it didn't issue instead of
+	/// contradicting it.
+	async fn notify_coordinator_of_user_message(&self, session_id: &str, text: &str) {
+		let trimmed = text.trim();
+		if trimmed.is_empty() {
+			return;
+		}
+		let Some(orchestrator_id) = self
+			.state
+			.coordinator_workers
+			.read()
+			.await
+			.orchestrator_of(session_id)
+			.map(str::to_string)
+		else {
+			return;
+		};
+		let notice = format!(
+			"The user sent worker {session_id} a message directly: \"{}\"\n\n\
+			 Nothing else changed — its updates keep reaching you and your control tools still \
+			 work on it.",
+			truncate_for_notice(trimmed, USER_MESSAGE_NOTICE_MAX)
+		);
+		let handle = CoderHandle {
+			state: self.state.clone(),
+		};
+		// Detached so the user's send isn't blocked on the
+		// orchestrator's wake bookkeeping; failure (orchestrator
+		// unmounted / deleted) only costs the notice.
+		let orchestrator_id_for_log = orchestrator_id.clone();
+		tokio::spawn(async move {
+			if let Err(err) = handle.send_to(&orchestrator_id, notice, Vec::new()).await {
+				tracing::warn!(
+					?err,
+					orchestrator_id = %orchestrator_id_for_log,
+					"failed to notify coordinator of a user message to its worker"
+				);
+			}
+		});
+	}
+
 	/// Send a prompt to a specific session by id (ADR 0030). Unlike
 	/// `send` (which targets the active folder's visible session),
 	/// this resolves the runtime by id across all folders and seeds
@@ -3565,7 +3589,10 @@ impl CoderHandle {
 		// title and locks the sessions dir, same as `send`.
 		let (auto_rename_after, summary_to_announce) = {
 			let mut session = rt.session.lock().await;
-			let needs_loaded_event = session.header.title.is_empty() && session.persisted_records == 0;
+			// "Nothing on disk yet" is the freshness test, not "no
+			// title": a coordinator-spawned worker is pre-titled at
+			// creation (ADR 0042) and still has to announce itself.
+			let needs_loaded_event = session.persisted_records == 0;
 			if session.session_dir.is_none() {
 				session.session_dir = Some(dir.clone());
 			}
@@ -3721,6 +3748,24 @@ impl CoderHandle {
 			}),
 		})
 	}
+}
+
+/// How much of a user's worker message we quote into the coordinator's
+/// dispatch notice (ADR 0043). Enough for the intent of a typical
+/// nudge; a wall of text would eat the coordinator's context for a
+/// message it doesn't own.
+const USER_MESSAGE_NOTICE_MAX: usize = 200;
+
+/// Clamp `text` to `max` characters (not bytes — the cut must land on
+/// a char boundary), appending an ellipsis + the dropped-character
+/// count so the reader knows it's looking at a fragment.
+fn truncate_for_notice(text: &str, max: usize) -> String {
+	let total = text.chars().count();
+	if total <= max {
+		return text.to_string();
+	}
+	let kept: String = text.chars().take(max).collect();
+	format!("{kept}… ({} more characters)", total - max)
 }
 
 /// Longest slug we keep from a coordinator-supplied worker name.
@@ -5496,15 +5541,15 @@ fn spawn_dispatch_feeder(state: Arc<CoderState>, orchestrator_id: String) {
 		loop {
 			let recv = rx.recv().await;
 			let Ok(envelope) = recv else { continue };
-			// Is this envelope from one of our live workers? A worker
-			// the user took over (ADR 0036) no longer feeds the
-			// orchestrator — its updates belong to the user.
-			let is_live_worker = state
+			// Is this envelope from one of our workers? A user
+			// message into a worker doesn't unhook it (ADR 0043) —
+			// only spawning registers, and nothing unregisters.
+			let is_our_worker = state
 				.coordinator_workers
 				.read()
 				.await
 				.feeds(&orchestrator_id, &envelope.session_id);
-			if !is_live_worker {
+			if !is_our_worker {
 				continue;
 			}
 			let worker_id = envelope.session_id.clone();
@@ -5544,25 +5589,6 @@ async fn handle_observe_worker(state: &Arc<CoderState>, args: &Value) -> Result<
 	Ok(serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({ "error": "serialization failed" })))
 }
 
-/// Refuse a coordinator **control** tool aimed at a worker the user
-/// has taken over (ADR 0036). Read-only tools (`observe_worker`,
-/// `review_worker_changes`, `workspace_scm_status`) deliberately
-/// skip this guard — the coordinator may still report on a
-/// user-owned worker's state, it just can't drive it.
-async fn refuse_if_taken_over(state: &Arc<CoderState>, tool: &str, worker_id: &str) -> Result<(), CoderError> {
-	if state.coordinator_workers.read().await.is_taken_over(worker_id) {
-		return Err(CoderError::invalid_args(
-			tool,
-			format!(
-				"worker `{worker_id}` was taken over by the user and no longer answers to you — \
-				 do not steer, abort, answer, or commit it; use `observe_worker` / \
-				 `review_worker_changes` / `workspace_scm_status` for read-only state"
-			),
-		));
-	}
-	Ok(())
-}
-
 /// `steer_worker` — send a steering message to a worker by id.
 async fn handle_steer_worker(state: &Arc<CoderState>, args: &Value) -> Result<Value, CoderError> {
 	#[derive(serde::Deserialize)]
@@ -5575,7 +5601,6 @@ async fn handle_steer_worker(state: &Arc<CoderState>, args: &Value) -> Result<Va
 	if parsed.text.trim().is_empty() {
 		return Err(CoderError::invalid_args("steer_worker", "text must not be empty"));
 	}
-	refuse_if_taken_over(state, "steer_worker", &parsed.worker_id).await?;
 	let handle = CoderHandle { state: state.clone() };
 	handle.send_to(&parsed.worker_id, parsed.text, Vec::new()).await?;
 	Ok(json!({ "status": "steered" }))
@@ -5589,7 +5614,6 @@ async fn handle_abort_worker(state: &Arc<CoderState>, args: &Value) -> Result<Va
 	}
 	let parsed: AbortArgs =
 		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("abort_worker", err.to_string()))?;
-	refuse_if_taken_over(state, "abort_worker", &parsed.worker_id).await?;
 	let handle = CoderHandle { state: state.clone() };
 	handle.abort_session(&parsed.worker_id).await;
 	Ok(json!({ "status": "aborted" }))
@@ -5606,7 +5630,6 @@ async fn handle_respond_to_worker_prompt(state: &Arc<CoderState>, args: &Value) 
 	}
 	let parsed: RespondArgs = serde_json::from_value(args.clone())
 		.map_err(|err| CoderError::invalid_args("respond_to_worker_prompt", err.to_string()))?;
-	refuse_if_taken_over(state, "respond_to_worker_prompt", &parsed.worker_id).await?;
 	// Find the worker's parked prompt call id. A worker has at most
 	// one pending `ask_user` at a time (the loop blocks on it).
 	let handle = CoderHandle { state: state.clone() };
@@ -5814,7 +5837,6 @@ async fn handle_commit_worker_changes(state: &Arc<CoderState>, args: &Value) -> 
 	}
 	let parsed: CommitArgs = serde_json::from_value(args.clone())
 		.map_err(|err| CoderError::invalid_args("commit_worker_changes", err.to_string()))?;
-	refuse_if_taken_over(state, "commit_worker_changes", &parsed.worker_id).await?;
 	let Some((rt, _)) = state.runtime_for_session(&parsed.worker_id).await else {
 		return Err(CoderError::invalid_args(
 			"commit_worker_changes",
@@ -5867,7 +5889,7 @@ async fn handle_commit_worker_changes(state: &Arc<CoderState>, args: &Value) -> 
 /// `base_branch` (default `main`), then runs `git merge --no-edit
 /// <worker_branch>` on the parent's host. The worker's worktree and
 /// branch are left intact — this only lands the commits, it doesn't
-/// clean up the worktree. Refuses a taken-over worker (ADR 0036).
+/// clean up the worktree.
 async fn handle_merge_worker_changes(state: &Arc<CoderState>, args: &Value) -> Result<Value, CoderError> {
 	#[derive(serde::Deserialize)]
 	struct MergeArgs {
@@ -5877,7 +5899,6 @@ async fn handle_merge_worker_changes(state: &Arc<CoderState>, args: &Value) -> R
 	}
 	let parsed: MergeArgs = serde_json::from_value(args.clone())
 		.map_err(|err| CoderError::invalid_args("merge_worker_changes", err.to_string()))?;
-	refuse_if_taken_over(state, "merge_worker_changes", &parsed.worker_id).await?;
 	let Some((rt, _)) = state.runtime_for_session(&parsed.worker_id).await else {
 		return Err(CoderError::invalid_args(
 			"merge_worker_changes",
@@ -7881,37 +7902,58 @@ mod tests {
 		}
 
 		#[test]
-		fn feeds_only_live_workers_of_the_right_orchestrator() {
+		fn feeds_only_workers_of_the_right_orchestrator() {
 			let mut reg = CoordinatorRegistry::default();
 			reg.register("orch-1", "w-1");
 			assert!(reg.feeds("orch-1", "w-1"));
 			assert!(!reg.feeds("orch-1", "w-other"));
 			assert!(!reg.feeds("orch-2", "w-1"));
-			reg.take_over("w-1");
-			assert!(!reg.feeds("orch-1", "w-1"));
 		}
 
 		#[test]
-		fn take_over_transitions_once_and_names_the_orchestrator() {
+		fn a_user_message_never_unhooks_a_worker() {
+			// ADR 0043: the user messaging a worker is a notice, not
+			// a handover — the feeder keeps forwarding forever.
 			let mut reg = CoordinatorRegistry::default();
 			reg.register("orch-1", "w-1");
-			assert!(!reg.is_taken_over("w-1"));
-			// First user message: transition + notify target.
-			assert_eq!(reg.take_over("w-1").as_deref(), Some("orch-1"));
-			assert!(reg.is_taken_over("w-1"));
-			// Subsequent messages: no second notice.
-			assert_eq!(reg.take_over("w-1"), None);
+			for _ in 0..3 {
+				assert_eq!(reg.orchestrator_of("w-1"), Some("orch-1"));
+				assert!(reg.feeds("orch-1", "w-1"));
+			}
 		}
 
 		#[test]
-		fn take_over_ignores_sessions_that_are_not_workers() {
+		fn orchestrator_of_ignores_sessions_that_are_not_workers() {
 			let mut reg = CoordinatorRegistry::default();
 			reg.register("orch-1", "w-1");
 			// An ordinary session (or the coordinator itself) is not
-			// a worker — messaging it must not mark anything.
-			assert_eq!(reg.take_over("sess-ordinary"), None);
-			assert_eq!(reg.take_over("orch-1"), None);
-			assert!(reg.feeds("orch-1", "w-1"));
+			// a worker — messaging it notifies nobody.
+			assert_eq!(reg.orchestrator_of("sess-ordinary"), None);
+			assert_eq!(reg.orchestrator_of("orch-1"), None);
+		}
+	}
+
+	mod user_message_notice {
+		use super::super::{truncate_for_notice, USER_MESSAGE_NOTICE_MAX};
+
+		#[test]
+		fn short_messages_are_quoted_whole() {
+			assert_eq!(truncate_for_notice("skip the e2e tests", 200), "skip the e2e tests");
+		}
+
+		#[test]
+		fn long_messages_are_clamped_and_say_how_much_was_dropped() {
+			let msg = "x".repeat(USER_MESSAGE_NOTICE_MAX + 42);
+			let out = truncate_for_notice(&msg, USER_MESSAGE_NOTICE_MAX);
+			assert!(out.starts_with(&"x".repeat(USER_MESSAGE_NOTICE_MAX)));
+			assert!(out.ends_with("… (42 more characters)"));
+		}
+
+		#[test]
+		fn the_cut_lands_on_a_char_boundary() {
+			// Byte-slicing a multi-byte char would panic.
+			let msg = "é".repeat(10);
+			assert_eq!(truncate_for_notice(&msg, 4), "éééé… (6 more characters)");
 		}
 	}
 

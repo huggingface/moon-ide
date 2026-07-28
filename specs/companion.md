@@ -196,8 +196,10 @@ requested surface:
   truncating title can't ellipsise it away — plus a
   coordinator-specific empty-state hint describing the delegation
   model. Workers are ordinary sessions in the per-
-  project list — opening one and sending a message takes it over
-  from the coordinator (ADR 0036), same as the desktop.
+  project list — opening one and sending a message feeds the
+  coordinator a notice quoting what you said and leaves the worker
+  hooked up ([ADR 0043](decisions/0043-user-message-notifies-coordinator.md)),
+  same as the desktop.
 - **Run / steer coder sessions.** Subscribe to `coder:event`,
   render the transcript, `coder_send` (send / steer), `coder_abort`.
   Session list / open / new reuse the existing `coder_*` commands.
