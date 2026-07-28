@@ -462,6 +462,17 @@ pub trait WorkspaceHost: Send + Sync {
 	/// the active target.
 	async fn git_worktree_remove(&self, path: &Utf8Path, force: bool) -> MoonResult<()>;
 
+	/// Forget a worktree whose checkout is **already gone**: unlock
+	/// it (IDE worktrees are locked at creation and `git worktree
+	/// prune` skips locked entries), then `git worktree prune`.
+	///
+	/// A checkout can vanish behind the IDE's back — an agent running
+	/// `git worktree remove` in a shell, a manual `rm -rf` — and the
+	/// stale `.git/worktrees/<slug>` entry then refuses a later
+	/// `git worktree add` at the same path. Callers treat this as
+	/// best-effort housekeeping, not a gate.
+	async fn git_worktree_forget(&self, path: &Utf8Path) -> MoonResult<()>;
+
 	/// Delete a local branch (`git branch -D <name>`). Used after
 	/// merging a worktree session's branch into the base branch and
 	/// pruning the worktree — the branch's commits are now in the
@@ -2029,6 +2040,21 @@ impl WorkspaceHost for LocalHost {
 		.map_err(|e| MoonError::Internal(format!("git_worktree_remove join error: {e}")))?
 	}
 
+	async fn git_worktree_forget(&self, path: &Utf8Path) -> MoonResult<()> {
+		let guard = self.git_lock().await;
+		// Same target rationale as `git_worktree_remove`: prune runs
+		// where the worktree metadata is valid.
+		let target = self.shell_target().await;
+		let root = self.root.clone();
+		let path = path.to_owned();
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			run_git_worktree_forget(&root, &path, &target)
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_worktree_forget join error: {e}")))?
+	}
+
 	async fn git_delete_branch(&self, name: &str) -> MoonResult<()> {
 		let guard = self.git_lock().await;
 		let root = self.root.clone();
@@ -3382,6 +3408,30 @@ fn run_git_worktree_remove(root: &Utf8Path, path: &Utf8Path, force: bool, target
 		let combined = if stderr.is_empty() { stdout } else { stderr };
 		return Err(MoonError::IoError(format!(
 			"git worktree remove exited {}: {combined}",
+			out.status.code().unwrap_or(-1)
+		)));
+	}
+	Ok(())
+}
+
+/// `git worktree unlock <path>` (best-effort — IDE worktrees are
+/// locked at creation and prune skips locked entries) then
+/// `git worktree prune`. Only ever called for a checkout that is
+/// already gone from disk; a live worktree is removed with
+/// [`run_git_worktree_remove`] instead.
+fn run_git_worktree_forget(root: &Utf8Path, path: &Utf8Path, target: &ShellTarget) -> MoonResult<()> {
+	let _ = git_command(target, root)
+		.args(["worktree", "unlock"])
+		.arg(worktree_path_arg(target, path))
+		.output();
+	let out = git_command(target, root)
+		.args(["worktree", "prune"])
+		.output()
+		.map_err(|e| MoonError::IoError(format!("git worktree prune failed to launch: {e}")))?;
+	if !out.status.success() {
+		let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+		return Err(MoonError::IoError(format!(
+			"git worktree prune exited {}: {stderr}",
 			out.status.code().unwrap_or(-1)
 		)));
 	}
@@ -7545,6 +7595,64 @@ mod tests {
 		let after = host(&dir).git_worktree_list().await.unwrap();
 		assert_eq!(after.len(), 1);
 		assert!(after[0].is_main);
+	}
+
+	/// A checkout that vanished behind the IDE's back (an agent's
+	/// `git worktree remove` in a shell, a manual `rm -rf`) leaves
+	/// stale metadata that refuses a later `worktree add` at the same
+	/// path. `git_worktree_forget` reaps it — including the lock we
+	/// put on at creation, which plain `git worktree prune` skips.
+	#[tokio::test]
+	async fn git_worktree_forget_reaps_a_vanished_locked_checkout() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping worktree forget test");
+			return;
+		};
+		if !relative_worktrees_supported() {
+			eprintln!("git < 2.48 (no relative worktrees) — skipping worktree forget test");
+			return;
+		}
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		std::fs::write(dir.path().join("README.md"), "hi\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "initial"]);
+		let wt_path = Utf8PathBuf::from_path_buf(dir.path().join(".worktrees").join("moon-gone")).unwrap();
+		host(&dir)
+			.git_worktree_add(&wt_path, WorktreeBranch::New("moon/gone".into()))
+			.await
+			.unwrap();
+		// Simulate the checkout disappearing without git being told.
+		std::fs::remove_dir_all(wt_path.as_std_path()).unwrap();
+		assert_eq!(
+			host(&dir).git_worktree_list().await.unwrap().len(),
+			2,
+			"git still lists it"
+		);
+
+		host(&dir).git_worktree_forget(&wt_path).await.unwrap();
+
+		let after = host(&dir).git_worktree_list().await.unwrap();
+		assert_eq!(after.len(), 1, "stale entry reaped");
+		assert!(after[0].is_main);
+		// The branch is the deliverable — forgetting the checkout
+		// never deletes it.
+		assert!(
+			host(&dir)
+				.git_local_branches()
+				.await
+				.unwrap()
+				.iter()
+				.any(|b| b == "moon/gone"),
+			"branch kept"
+		);
+		// And the path is reusable again.
+		host(&dir)
+			.git_worktree_add(&wt_path, WorktreeBranch::Existing("moon/gone".into()))
+			.await
+			.unwrap();
 	}
 
 	#[tokio::test]

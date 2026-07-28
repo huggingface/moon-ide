@@ -549,7 +549,11 @@ panel, and answering its `ask_user` card notify nobody.
 routes updates to the right per-`(folder, session)` bucket.
 Sub-agent events carry the **parent's** coordinates. A few
 folder-scoped variants (`folder_summary_ready`, `hub_sync_*`) arrive
-with an empty `session_id`.
+with an empty `session_id`, and `workspace_folders_changed` is
+workspace-global — the frontend re-fetches the workspace snapshot when
+a coordinator binds or unbinds a folder
+([ADR 0044](decisions/0044-idempotent-worktree-removal.md)), the one
+folder-set change no UI command returns a snapshot for.
 
 `AppState.coder.last_session_by_folder` records the last-visible
 session per project and is restored when the panel first mounts a
@@ -1358,6 +1362,17 @@ re-confirm when the worktree is dirty. Deleting the owning session
 keeps the worktree (the branch is the deliverable you may still PR).
 The **branch is never deleted by the IDE**: it's left in place for a
 later PR.
+
+Removal is **idempotent** ([ADR 0044](decisions/0044-idempotent-worktree-removal.md)):
+when the checkout is already gone from disk — an agent ran `git
+worktree remove` in a shell, someone `rm -rf`'d it — closing the row
+forgets the stale git metadata (unlock + `git worktree prune`) and
+unbinds without erroring. A checkout that's still there behaves as
+before, so a dirty-tree refusal still drives the force re-confirm.
+A coordinator cleans up after its own workers with
+`discard_worker_worktree`, which does the same thing plus clears the
+worktree routing on the worker's session; it refuses a running worker
+and a dirty worktree (without `force`), and keeps the branch.
 
 #### The worktree button is context-aware
 

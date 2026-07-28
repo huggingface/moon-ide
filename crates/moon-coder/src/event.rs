@@ -237,6 +237,18 @@ pub enum CoderEvent {
 	/// shape small at the cost of one extra round trip.
 	SessionListChanged,
 
+	/// The set of bound workspace folders changed from an **agent**
+	/// path — a coordinator's `spawn_worker` (new worktree),
+	/// `clone_repo` / `init_repo` (new project), or
+	/// `discard_worker_worktree` (folder gone). Every UI-driven bind /
+	/// unbind returns a fresh `Workspace` snapshot from its own
+	/// command, but an agent-driven one has no such round trip, so
+	/// without this the folder bar shows a stale set until the user
+	/// happens to trigger some other snapshot. The frontend re-fetches
+	/// `workspace_active` and adopts it; no payload, because the
+	/// snapshot is the payload and it isn't folder-scoped.
+	WorkspaceFoldersChanged,
+
 	/// A bound folder's cached summary just refreshed. The runner
 	/// uses this to refresh the parent's "Bound folders" section in
 	/// the system prompt on the next turn; the project bar can

@@ -1421,6 +1421,11 @@ class CoderPanelState {
 	 *  isolated tests). */
 	#onWorktreeSessionOpen: ((worktreeRoot: string) => Promise<void>) | null = null;
 
+	/** Same indirection for `workspace_folders_changed` (ADR 0044):
+	 *  a coordinator bound / unbound a folder, so the workspace
+	 *  snapshot needs re-adopting. `null` until registered. */
+	#onWorkspaceFoldersChanged: (() => Promise<void>) | null = null;
+
 	/** Guard against the recursive loop: opening a worktree session
 	 *  fires `#onWorktreeSessionOpen` → `state.setActiveFolder` →
 	 *  `coder.setActiveFolder` → `#selectSessionForActiveFolder` →
@@ -2255,6 +2260,13 @@ class CoderPanelState {
 		this.#onWorktreeSessionOpen = cb;
 	}
 
+	/** Register the callback fired on `workspace_folders_changed`
+	 *  (ADR 0044) so `state.svelte.ts` can re-adopt the workspace
+	 *  snapshot after a coordinator bound or unbound a folder. */
+	registerWorkspaceFoldersChangedCallback(cb: () => Promise<void>): void {
+		this.#onWorkspaceFoldersChanged = cb;
+	}
+
 	/** Pick the session to show for the active folder's worktree
 	 *  context and switch the visible session to it.
 	 *
@@ -3024,6 +3036,12 @@ class CoderPanelState {
 			this.folderDescriptions = next;
 			return;
 		}
+		// A coordinator bound or unbound a folder (ADR 0044). Global,
+		// not folder-scoped: the workspace snapshot is what changed.
+		if (envelope.event.kind === 'workspace_folders_changed') {
+			void this.#onWorkspaceFoldersChanged?.();
+			return;
+		}
 		const folderBucket = this.bucketFor(envelope.folder);
 		// Folder-scoped events (`hub_sync_*`, `session_list_changed`)
 		// arrive with empty `session_id` per ADR 0016 — route
@@ -3707,6 +3725,7 @@ class CoderPanelState {
 			}
 			case 'folder_summary_ready':
 			case 'session_list_changed':
+			case 'workspace_folders_changed':
 			case 'hub_sync_started':
 			case 'hub_sync_finished':
 				// Folder-scoped — handled in `#applyFolderEvent`

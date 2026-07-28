@@ -4410,6 +4410,7 @@ async fn run_turn(
 		tool_defs.push(crate::coordinator::workspace_scm_status_tool_definition());
 		tool_defs.push(crate::coordinator::commit_worker_changes_tool_definition());
 		tool_defs.push(crate::coordinator::merge_worker_changes_tool_definition());
+		tool_defs.push(crate::coordinator::discard_worker_worktree_tool_definition());
 		tool_defs.push(crate::coordinator::clone_repo_tool_definition());
 		tool_defs.push(crate::coordinator::init_repo_tool_definition());
 	}
@@ -5011,6 +5012,8 @@ async fn dispatch_tool_calls(
 				handle_commit_worker_changes(state, &args).await
 			} else if call.function.name == "merge_worker_changes" {
 				handle_merge_worker_changes(state, &args).await
+			} else if call.function.name == "discard_worker_worktree" {
+				handle_discard_worker_worktree(state, sink, &args).await
 			} else if call.function.name == "clone_repo" {
 				handle_clone_repo(state, sink, &args).await
 			} else if call.function.name == "init_repo" {
@@ -5514,6 +5517,10 @@ async fn handle_spawn_worker(
 		mode: CoderMode::Agent.as_wire().to_string(),
 		worktree_root: summary.worktree_root.clone(),
 	});
+	// The worker's worktree just became a bound folder; the folder bar
+	// has no other way to learn about a bind it didn't initiate
+	// (ADR 0044).
+	sink.send(CoderEvent::WorkspaceFoldersChanged);
 	let mut result = json!({
 		"worker_id": summary.id,
 		"branch": summary.worktree_branch,
@@ -5964,6 +5971,100 @@ async fn handle_merge_worker_changes(state: &Arc<CoderState>, args: &Value) -> R
 	}))
 }
 
+/// `discard_worker_worktree` — remove a finished worker's checkout and
+/// unbind its folder (ADR 0044). The branch is kept; the worker's
+/// session stays in the list and falls back to the parent project.
+///
+/// This is the agent-side twin of the `coder_discard_worktree` Tauri
+/// command, and shares its idempotence: a checkout that's already gone
+/// from disk is forgotten (stale git metadata pruned) rather than
+/// erroring.
+async fn handle_discard_worker_worktree(
+	state: &Arc<CoderState>,
+	sink: &FolderEventSink,
+	args: &Value,
+) -> Result<Value, CoderError> {
+	#[derive(serde::Deserialize)]
+	struct DiscardArgs {
+		worker_id: String,
+		#[serde(default)]
+		force: bool,
+	}
+	let parsed: DiscardArgs = serde_json::from_value(args.clone())
+		.map_err(|err| CoderError::invalid_args("discard_worker_worktree", err.to_string()))?;
+	let Some((rt, _)) = state.runtime_for_session(&parsed.worker_id).await else {
+		return Err(CoderError::invalid_args(
+			"discard_worker_worktree",
+			format!("no mounted session for worker_id `{}`", parsed.worker_id),
+		));
+	};
+	// Never yank a checkout out from under a running turn — the
+	// worker's next tool call would write into a deleted directory.
+	if rt.turn.lock().await.cancel.is_some() {
+		return Err(CoderError::invalid_args(
+			"discard_worker_worktree",
+			format!(
+				"worker `{}` has a turn in flight — wait for it to finish or `abort_worker` first",
+				parsed.worker_id
+			),
+		));
+	}
+	let (worktree_root, worktree_branch) = {
+		let session = rt.session.lock().await;
+		(
+			session.header.worktree_root.clone(),
+			session.header.worktree_branch.clone(),
+		)
+	};
+	let Some(worktree_path) = worktree_root else {
+		return Err(CoderError::invalid_args(
+			"discard_worker_worktree",
+			"worker has no worktree_root — there is no checkout to discard",
+		));
+	};
+	let Some(wt_entry) = state.workspaces.folder_for_path(&worktree_path).await else {
+		return Err(CoderError::invalid_args(
+			"discard_worker_worktree",
+			format!("worktree folder `{worktree_path}` is not bound"),
+		));
+	};
+	let moon_protocol::workspace::FolderOrigin::Worktree { parent_path, .. } = wt_entry.folder.origin.clone() else {
+		return Err(CoderError::invalid_args(
+			"discard_worker_worktree",
+			format!("`{worktree_path}` is not a worktree folder"),
+		));
+	};
+	// The checkout lives on the host under `<parent>/.worktrees/<slug>`
+	// (ADR 0029) even when the workspace runs in a container, so a
+	// host-side `is_dir` is a valid liveness test; `git_worktree_remove`
+	// translates the path for whichever shell target the parent runs on.
+	let checkout_gone = !Utf8Path::new(&worktree_path).is_dir();
+	if let Some(parent) = state.workspaces.folder_for_path(&parent_path).await {
+		let path = Utf8Path::new(&worktree_path);
+		if checkout_gone {
+			if let Err(err) = parent.host.git_worktree_forget(path).await {
+				tracing::warn!(error = %err, worktree = %worktree_path, "git worktree prune failed for an already-removed checkout");
+			}
+		} else {
+			parent.host.git_worktree_remove(path, parsed.force).await?;
+		}
+	}
+	state.workspaces.remove_folder(&worktree_path).await?;
+	// Sessions that routed to the checkout drive the parent's main
+	// tree from here on (and the panel drops their worktree chip).
+	let handle = CoderHandle { state: state.clone() };
+	handle.clear_worktree_sessions(&worktree_path).await;
+	// The folder bar has no other way to learn about an unbind it
+	// didn't initiate.
+	sink.send(CoderEvent::WorkspaceFoldersChanged);
+	Ok(json!({
+		"status": "discarded",
+		"worktree_path": worktree_path,
+		"branch": worktree_branch,
+		"note": "the branch is kept; the worker's session now runs against the parent project",
+	}))
+}
+
 /// AI-suggest a commit message from a diff patch, using the same
 /// cheap-model flow as `CoderHandle::suggest_commit_message` but
 /// accessible from a `&Arc<CoderState>`.
@@ -6105,6 +6206,9 @@ async fn handle_clone_repo(state: &Arc<CoderState>, sink: &FolderEventSink, args
 		.add_folder(dest)
 		.await
 		.map_err(|err| CoderError::Internal(format!("add_folder failed: {err}")))?;
+	// The folder bar has no other way to learn about a bind it didn't
+	// initiate (ADR 0044).
+	sink.send(CoderEvent::WorkspaceFoldersChanged);
 	let mut result = json!({
 		"path": entry.folder.path,
 		"name": entry.folder.name,
@@ -6181,6 +6285,9 @@ async fn handle_init_repo(state: &Arc<CoderState>, sink: &FolderEventSink, args:
 		.add_folder(dest)
 		.await
 		.map_err(|err| CoderError::Internal(format!("add_folder failed: {err}")))?;
+	// The folder bar has no other way to learn about a bind it didn't
+	// initiate (ADR 0044).
+	sink.send(CoderEvent::WorkspaceFoldersChanged);
 	let mut result = json!({
 		"path": entry.folder.path,
 		"name": entry.folder.name,

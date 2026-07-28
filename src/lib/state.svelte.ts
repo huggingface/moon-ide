@@ -1712,6 +1712,19 @@ class WorkspaceState {
 		coder.registerWorktreeSessionCallback(async (worktreeRoot) => {
 			await this.setActiveFolder(worktreeRoot);
 		});
+		// A coordinator bound or unbound a folder (ADR 0044) — every
+		// UI-driven bind returns a snapshot from its own command, but an
+		// agent-driven one has no round trip to piggyback on.
+		coder.registerWorkspaceFoldersChangedCallback(async () => {
+			try {
+				const ws = await ipc.workspace.active();
+				if (ws) {
+					await this.adoptWorkspaceSnapshot(ws);
+				}
+			} catch (err) {
+				frontendLog('workspace', 'warn', `workspace refresh after an agent folder change failed: ${formatError(err)}`);
+			}
+		});
 		// Probe the OS theme (XDG portal / native API) and read the
 		// persisted `state.json` + per-workspace `session.json` in
 		// parallel — they're independent and all block the first

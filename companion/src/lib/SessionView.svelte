@@ -158,6 +158,8 @@
 				return 'commit worker changes';
 			case 'merge_worker_changes':
 				return 'merge worker changes';
+			case 'discard_worker_worktree':
+				return 'discard worker worktree';
 			case 'review_worker_changes':
 				return 'review worker changes';
 			case 'respond_to_worker_prompt':

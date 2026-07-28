@@ -61,6 +61,7 @@ You manage workers with:
 - `workspace_scm_status(worker_id?)` — get the SCM (git) status of a worker's worktree or the main folder: branch name, ahead/behind upstream, files changed (added / modified / deleted counts + per-file list). Read-only — use this to check whether a worker should commit before you steer it to the next task.
 - `commit_worker_changes(worker_id, message?)` — commit a worker's uncommitted changes (`git add -A` + `git commit`, same as the IDE's SCM panel). Pass `message` to set the commit subject; omit it to get an AI-suggested message from the diff. Use `workspace_scm_status` first to check whether there's anything to commit.
 - `merge_worker_changes(worker_id, base_branch?)` — merge a worker's branch into a base branch on the parent repo (defaults to `main`). Switches the parent to `base_branch`, then `git merge --no-edit <worker_branch>`. The worker's worktree and branch are left intact. Use `commit_worker_changes` first if the worker has uncommitted work. Use this for local repos without a PR flow; for repos with a remote, leave the branch for the user to PR instead.
+- `discard_worker_worktree(worker_id, force?)` — remove a finished worker's checkout and unbind its folder, so it stops cluttering the user's project bar. The branch is kept. Do this once the work is landed (merged, or pushed for a PR); it refuses a running worker and, without `force`, one with uncommitted changes. Never remove a worktree with `bash` — the folder would stay bound and the user would be left cleaning it up by hand.
 - `clone_repo(url, path?)` — clone a git repository to a host path and add it as a workspace folder. Use this when a task requires a dependency repo or a fresh checkout that isn't already in the workspace. The clone runs on the host so the path is immediately available. Omit `path` to clone into a sibling of the active folder.
 - `init_repo(name)` — initialize a new git repository as a **sibling of your project folder** (same parent directory) and add it as a workspace folder. You pass a directory name, not a path — the location is fixed. Use this when a task needs a fresh project (scratch repo, new microservice, test harness). Pass the returned path to `spawn_worker`'s `folder` to put a worker in it.
 - `respond_to_worker_prompt(worker_id, answers)` — answer a worker's parked `ask_user` prompt. A worker that needs a decision from you raises `ask_user`; you see it via `observe_worker` and answer it with this tool.
@@ -301,6 +302,33 @@ pub fn merge_worker_changes_tool_definition() -> ToolDefinition {
 	)
 }
 
+/// `discard_worker_worktree` — remove a finished worker's checkout
+/// and unbind its folder (ADR 0044). The branch is kept: it is the
+/// deliverable. This is the coordinator's cleanup tool; without it a
+/// long run leaves one bound folder per worker in the user's project
+/// bar, and a `git worktree remove` through `bash` would leave the
+/// folder bound (the workspace registry never learns about it).
+pub fn discard_worker_worktree_tool_definition() -> ToolDefinition {
+	ToolDefinition::function(
+		"discard_worker_worktree",
+		"Remove a finished worker's git worktree and unbind its folder from the workspace, cleaning it out of the user's project bar. **The branch is kept** — it's the deliverable, still there to PR or merge. Use this once a worker's work is landed (merged, or committed and pushed for a PR) and the checkout is no longer needed. Refuses while the worker's turn is running (abort it first) and refuses a worktree with uncommitted changes unless `force` is set — commit or merge first rather than forcing, or you'll throw the worker's work away. The worker's session stays in the list and falls back to the parent project.",
+		json!({
+			"type": "object",
+			"properties": {
+				"worker_id": {
+					"type": "string",
+					"description": "The worker id returned by `spawn_worker`."
+				},
+				"force": {
+					"type": "boolean",
+					"description": "Discard even when the worktree has uncommitted or untracked changes (`git worktree remove --force`). Those changes are lost. Default false — prefer `commit_worker_changes` first."
+				}
+			},
+			"required": ["worker_id"]
+		}),
+	)
+}
+
 /// `workspace_scm_status` — read-only SCM state for a worker's
 /// worktree (or the main folder). Composes branch info, file change
 /// counts, and the file list into one compact snapshot so the
@@ -403,6 +431,10 @@ mod tests {
 			merge_worker_changes_tool_definition().function.name,
 			"merge_worker_changes"
 		);
+		assert_eq!(
+			discard_worker_worktree_tool_definition().function.name,
+			"discard_worker_worktree"
+		);
 		assert_eq!(clone_repo_tool_definition().function.name, "clone_repo");
 		assert_eq!(init_repo_tool_definition().function.name, "init_repo");
 	}
@@ -424,6 +456,15 @@ mod tests {
 		assert!(params["properties"]["folder"].is_object());
 		assert!(!required.contains(&"base_branch".to_string()));
 		assert!(!required.contains(&"folder".to_string()));
+	}
+
+	#[test]
+	fn discard_worker_worktree_requires_a_worker_and_defaults_to_no_force() {
+		let params = discard_worker_worktree_tool_definition().function.parameters;
+		assert!(params["properties"]["worker_id"].is_object());
+		assert_eq!(params["properties"]["force"]["type"], "boolean");
+		let required: Vec<String> = serde_json::from_value(params["required"].clone()).unwrap();
+		assert_eq!(required, vec!["worker_id".to_string()]);
 	}
 
 	#[test]
