@@ -256,13 +256,13 @@
 			{#each app.sessions as s (s.id)}
 				<div class="card list-item session-row">
 					<button class="list-item-main" onclick={() => app.openSession(s.id)}>
-						<strong>
-							{s.title || 'Untitled session'}
+						<span class="title-line">
 							{#if s.mode === 'coordinator'}<span
 									class="badge"
 									title="Coordinator — an orchestrator that spawns and manages worker agents">coord</span
 								>{/if}
-						</strong>
+							<strong>{s.title || 'Untitled session'}</strong>
+						</span>
 						<span class="muted">{relativeTime(s.updated_at_ms)}</span>
 					</button>
 					{#if app.busySessions.has(s.id)}
@@ -545,7 +545,18 @@
 		color: inherit;
 		padding: 0;
 	}
+	/* Badge first, title second: the title truncates, so a badge
+	   after it would be the first thing ellipsised away on a phone
+	   with the long auto-generated titles the coder writes. */
+	.title-line {
+		display: flex;
+		align-items: center;
+		gap: 0.3rem;
+		min-width: 0;
+		max-width: 100%;
+	}
 	.list-item-main strong {
+		min-width: 0;
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
@@ -562,17 +573,5 @@
 		font-size: 1.1rem;
 		padding: 0.4rem 0.5rem;
 		line-height: 1;
-	}
-	.badge {
-		font-size: 0.7rem;
-		font-weight: 600;
-		padding: 0.1em 0.4em;
-		border-radius: 999px;
-		background: var(--accent);
-		color: var(--accent-fg, #fff);
-		margin-left: 0.3rem;
-		vertical-align: middle;
-		text-transform: uppercase;
-		letter-spacing: 0.03em;
 	}
 </style>

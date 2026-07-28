@@ -191,9 +191,11 @@ requested surface:
 
 - **Coordinator sessions (ADR 0030).** The phone can create
   coordinator sessions (the `✦` button in the workspace view, via
-  `coder_new_coordinator_session`), and the session view renders a
-  `coord` badge + a coordinator-specific empty-state hint describing
-  the delegation model. Workers are ordinary sessions in the per-
+  `coder_new_coordinator_session`), and both the session list row and
+  the session view render a `coord` badge — left of the title, so the
+  truncating title can't ellipsise it away — plus a
+  coordinator-specific empty-state hint describing the delegation
+  model. Workers are ordinary sessions in the per-
   project list — opening one and sending a message takes it over
   from the coordinator (ADR 0036), same as the desktop.
 - **Run / steer coder sessions.** Subscribe to `coder:event`,

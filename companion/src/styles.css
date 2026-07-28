@@ -148,13 +148,13 @@ a {
 }
 
 /* Coordinator (orchestrator) mode badge — ADR 0030. Small pill
-   after the session title so an orchestrator session is visually
+   before the session title so an orchestrator session is visually
    distinct from a hand-started one on the phone. Mirrors the
    desktop panel's `.session-mode-badge`. */
 .badge {
 	display: inline-flex;
+	flex: none;
 	align-items: center;
-	margin-left: 0.4rem;
 	padding: 0 0.4rem;
 	border-radius: 999px;
 	background: var(--accent);

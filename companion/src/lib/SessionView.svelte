@@ -493,7 +493,7 @@
 <div class="session">
 	<div class="row session-head">
 		<button class="ghost back" onclick={() => app.closeSession()}>←</button>
-		{#if isCoordinator}<span class="coord-badge" title="Coordinator — orchestrates worker agents">coord</span>{/if}
+		{#if isCoordinator}<span class="badge" title="Coordinator — orchestrates worker agents">coord</span>{/if}
 		<strong class="session-title">{title || 'Untitled session'}</strong>
 		{#if app.busy}
 			<span class="pip live" title="Running"></span>
@@ -1027,17 +1027,6 @@
 		display: flex;
 		gap: 0.5rem;
 		align-items: flex-end;
-	}
-	.coord-badge {
-		flex: none;
-		font-size: 0.65rem;
-		font-weight: 600;
-		padding: 0.15em 0.4em;
-		border-radius: 999px;
-		background: var(--accent);
-		color: var(--accent-fg, #fff);
-		text-transform: uppercase;
-		letter-spacing: 0.03em;
 	}
 	.empty-hint {
 		padding: 1rem 0.5rem;
