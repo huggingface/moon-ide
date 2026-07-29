@@ -278,9 +278,26 @@ Three contract points the native adapter must honour (details in
    as moon-specific fields on the pi `thinking` content blocks, so a
    session reopened mid-tool-loop replays without a 400.
 
-`max_tokens` is model-aware (32 K for adaptive-thinking models, 8 K
-otherwise). Thinking is incompatible with forced tool choice and
-`temperature` / `top_k`; we send none of those.
+`max_tokens` **fails open**: 32 K for everything except the families
+whose hard output cap is lower (Haiku, Claude 3), which get 8 K. The
+list of exceptions is a denylist on purpose — an allowlist silently
+capped every model released after it was written at 8 K, which shows
+up as answers cut off mid-sentence, not as an error (see
+[ADR 0045](decisions/0045-output-cap-continuation.md)). Thinking is
+incompatible with forced tool choice and `temperature` / `top_k`; we
+send none of those.
+
+#### Truncated answers (`stop_reason: "length"`)
+
+A response that stops at the output ceiling is a fragment, never a
+final answer. Both the parent loop and the sub-agent loop detect it
+and re-ask, up to `OUTPUT_CAP_CONTINUATIONS` times, by appending a
+visible user sentinel telling the model to resume where it stopped.
+The parent renders the continuation as a second assistant bubble; a
+sub-agent joins its fragments so the parent receives one report. If
+the budget runs out with the answer still truncated, the sub-agent
+report ends with an explicit `[Report truncated: …]` marker rather
+than pretending to be complete.
 
 #### Prompt caching (Anthropic, native or via OpenRouter)
 
@@ -1145,7 +1162,9 @@ Sub-agents share the parent's `MAX_TURN_ITERATIONS` cap (a tighter
 50-iteration cap existed and bailed real refactors mid-flight).
 Hitting the cap triggers the same tools-disabled final wrap-up,
 prefixed so the parent knows the budget ran out. The old byte-budget
-cap was removed when auto-compaction shipped.
+cap was removed when auto-compaction shipped. A report that runs into
+the provider's _output_-token ceiling is continued rather than
+returned as a fragment — see § Truncated answers.
 
 ### Persistence
 

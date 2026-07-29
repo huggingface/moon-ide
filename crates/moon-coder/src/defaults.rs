@@ -74,6 +74,27 @@ pub const MAX_TURN_ITERATIONS: usize = 200;
 /// [`crate::error::CoderError::EmptyResponse`] instead.
 pub const EMPTY_RESPONSE_RETRIES: usize = 2;
 
+/// How many extra round-trips a single assistant answer may take
+/// after the provider cut it off at the output-token ceiling
+/// (`stop_reason: "length"`). Each continuation re-sends the history
+/// with [`OUTPUT_CAP_CONTINUATION_PROMPT`] appended, so the model
+/// picks up exactly where it stopped. Without this a long write-up
+/// (a sub-agent's audit report, a big refactor plan) silently ends
+/// mid-sentence and the caller treats the fragment as the whole
+/// answer. Three continuations is ~4x the ceiling — past that the
+/// model is rambling, not answering.
+pub const OUTPUT_CAP_CONTINUATIONS: usize = 3;
+
+/// Sentinel appended as a user message when the previous assistant
+/// message was cut off at the output-token ceiling. Persisted and
+/// rendered like any other user turn, same posture as the
+/// tool-budget wrap-up sentinel: the transcript should make it
+/// obvious why an answer arrived in two bubbles.
+pub const OUTPUT_CAP_CONTINUATION_PROMPT: &str =
+	"[Your previous message hit the output-token limit and was cut off mid-sentence. \
+Continue it from exactly where it stopped — do not restart, do not repeat what you already wrote, \
+and do not apologise. If the remaining content is long, prioritise finishing the substance over formatting.]";
+
 /// Per-model context-window size in tokens. Drives the in-panel
 /// usage ring and the auto-compaction threshold.
 ///

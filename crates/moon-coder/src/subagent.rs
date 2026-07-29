@@ -63,7 +63,7 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::compaction;
-use crate::defaults::MAX_TURN_ITERATIONS;
+use crate::defaults::{MAX_TURN_ITERATIONS, OUTPUT_CAP_CONTINUATIONS, OUTPUT_CAP_CONTINUATION_PROMPT};
 use crate::error::CoderError;
 use crate::event::CoderEvent;
 use crate::inference::{
@@ -754,6 +754,13 @@ async fn run_subagent_loop(
 	// empty `result` as a *success*, which the parent model (and
 	// the user) reads as "the sub-agent found nothing".
 	let mut empty_shell_attempts: usize = 0;
+	// Fragments of a report the provider cut off at the
+	// output-token ceiling, in order. The parent gets them joined
+	// back together — a sub-agent report that stops mid-sentence is
+	// worse than useless, because the parent has no way to tell a
+	// truncated audit from a complete one.
+	let mut report_fragments: Vec<String> = Vec::new();
+	let mut output_cap_continuations: usize = 0;
 	for iter in 0..MAX_TURN_ITERATIONS {
 		if cancel.is_cancelled() {
 			return Err(CoderError::Aborted);
@@ -941,15 +948,55 @@ async fn run_subagent_loop(
 			if has_queued_subagent_steers(&id) {
 				continue;
 			}
-			let result_text = response.content.clone().unwrap_or_default();
+			// Cut off at the output-token ceiling: keep the
+			// fragment and ask for the rest, so the parent gets
+			// the whole report instead of everything up to the
+			// sentence the ceiling landed in.
+			if response.hit_output_cap() && output_cap_continuations < OUTPUT_CAP_CONTINUATIONS {
+				output_cap_continuations += 1;
+				tracing::warn!(
+					subagent = %id,
+					continuation = output_cap_continuations,
+					"sub-agent report hit the output-token ceiling; asking the model to continue"
+				);
+				report_fragments.push(response.content.clone().unwrap_or_default());
+				messages.push(ChatMessage::user(OUTPUT_CAP_CONTINUATION_PROMPT.to_owned()));
+				persist_subagent(
+					session_dir,
+					header,
+					&SessionRecord::User {
+						text: OUTPUT_CAP_CONTINUATION_PROMPT.to_owned(),
+						images: Vec::new(),
+					},
+				)
+				.await;
+				continue;
+			}
+			report_fragments.push(response.content.clone().unwrap_or_default());
+			// Still truncated after the continuation budget: say
+			// so in the report itself. The parent model reads the
+			// result as prose, so an inline marker is the only
+			// channel that reliably reaches it.
+			if response.hit_output_cap() {
+				report_fragments.push(format!(
+					"\n\n[Report truncated: the model hit the output-token ceiling after \
+{OUTPUT_CAP_CONTINUATIONS} continuations. Treat everything above as partial.]"
+				));
+			}
 			return Ok(SubagentReport {
-				result: result_text,
+				result: report_fragments.join(""),
 				tokens_used_estimate: tokens_used_for_report(&messages, last_usage),
 				sub_session_id: id.clone(),
 				mode: spec.mode,
 				iterations_used: (iter + 1) as u32,
 			});
 		}
+
+		// The model went back to tool work after a continuation, so
+		// whatever it had started writing is superseded by the
+		// report it'll write at the end. Drop the fragments — they
+		// stay in `messages` as history either way.
+		report_fragments.clear();
 
 		// Sub-agents dispatch their tools sequentially today —
 		// recursive parallelism (a sub-agent's own tools running

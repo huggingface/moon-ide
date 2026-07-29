@@ -505,6 +505,18 @@ pub struct AssistantResponse {
 	pub stop_reason: Option<String>,
 }
 
+impl AssistantResponse {
+	/// True when the provider stopped generating because it ran
+	/// into the output-token ceiling rather than because the model
+	/// was done. The text we hold is a fragment — usually cut
+	/// mid-sentence — so callers must either continue the message
+	/// or tell the user it's incomplete, never treat it as a final
+	/// answer.
+	pub fn hit_output_cap(&self) -> bool {
+		self.stop_reason.as_deref() == Some("length")
+	}
+}
+
 /// Normalise a provider-reported finish/stop reason into pi's
 /// `stopReason` vocabulary: `stop` | `length` | `toolUse` |
 /// `error` | `aborted`. Covers the OpenAI chat-completions values
@@ -1864,6 +1876,24 @@ mod tests {
 		assert_eq!(normalize_stop_reason(None, true), "toolUse");
 		assert_eq!(normalize_stop_reason(None, false), "stop");
 		assert_eq!(normalize_stop_reason(Some("weird_new_reason"), false), "stop");
+	}
+
+	#[test]
+	fn hit_output_cap_only_on_a_length_stop() {
+		let with = |reason: Option<&str>| AssistantResponse {
+			content: Some("partial".into()),
+			thinking: None,
+			thinking_blocks: Vec::new(),
+			tool_calls: Vec::new(),
+			usage: None,
+			stop_reason: reason.map(str::to_owned),
+		};
+		assert!(with(Some("length")).hit_output_cap());
+		assert!(!with(Some("stop")).hit_output_cap());
+		assert!(!with(Some("toolUse")).hit_output_cap());
+		// Hand-built fixtures (and providers that omit the field)
+		// must not read as truncated.
+		assert!(!with(None).hit_output_cap());
 	}
 
 	#[test]

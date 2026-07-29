@@ -52,25 +52,40 @@ use moon_protocol::coder_models::{ProviderModelSummary, ProviderProbeResult};
 /// could spend the whole allowance thinking and have nothing left to
 /// answer with, or get truncated mid-tool-call.
 ///
-/// [`max_tokens_for`] gives the adaptive thinking models a generous
-/// ceiling that leaves room for reasoning *and* a full answer;
-/// everything else (Haiku as the cheap model, anything we don't
-/// recognise) keeps the conservative 8 K that every Claude accepts.
+/// [`max_tokens_for`] gives every frontier model a generous ceiling
+/// that leaves room for reasoning *and* a full answer; only the
+/// small-output families keep the conservative 8 K.
 /// The runner still owns real context bookkeeping via `compaction`.
 const MAX_TOKENS_DEFAULT: u32 = 8_192;
 const MAX_TOKENS_LARGE: u32 = 32_000;
 
-/// Output ceiling for one round-trip. The adaptive thinking models
-/// get the large ceiling (they're 128 K-output-capable and burn part
-/// of it thinking); every other model gets the conservative default.
-/// We stay well under each model's hard cap so the request is always
-/// accepted.
+/// Output ceiling for one round-trip. **Default-large**: anything we
+/// don't positively recognise as a small-output model gets
+/// [`MAX_TOKENS_LARGE`], which every Claude from 4.x on accepts
+/// (they're 128 K-output-capable and burn part of it thinking).
+///
+/// The list used to be the other way round — an allowlist of known
+/// adaptive-thinking slugs, everything else 8 K — and that silently
+/// mangled every model released after the list was written: a
+/// `claude-opus-5` research write-up would stop mid-sentence at
+/// `stop_reason: "length"`. Failing open costs one 400 on a model
+/// with a smaller hard cap (loud, fixable); failing closed costs
+/// truncated answers nobody notices.
 fn max_tokens_for(model: &str) -> u32 {
-	if is_adaptive_thinking_model(model) {
-		MAX_TOKENS_LARGE
-	} else {
+	if is_small_output_model(model) {
 		MAX_TOKENS_DEFAULT
+	} else {
+		MAX_TOKENS_LARGE
 	}
+}
+
+/// True for the Claude families whose hard output cap is at or below
+/// [`MAX_TOKENS_DEFAULT`]: every Haiku, and the whole Claude 3
+/// generation. Asking these for 32 K is a 400, so they're the
+/// explicit exceptions to the default-large rule above.
+fn is_small_output_model(model: &str) -> bool {
+	let m = model.to_ascii_lowercase();
+	m.contains("haiku") || m.contains("claude-3")
 }
 
 /// True for the modern Claude models that use **adaptive** thinking:
@@ -1956,11 +1971,17 @@ mod tests {
 	}
 
 	#[test]
-	fn max_tokens_large_for_adaptive_models_default_otherwise() {
+	fn max_tokens_large_unless_the_model_is_a_known_small_output_family() {
 		assert_eq!(max_tokens_for("claude-opus-4-8"), MAX_TOKENS_LARGE);
 		assert_eq!(max_tokens_for("claude-fable-5"), MAX_TOKENS_LARGE);
-		// Haiku / unknown stay on the conservative ceiling.
+		// A model newer than this list must not silently fall back
+		// to 8 K — that's what truncated sub-agent reports at
+		// `stop_reason: "length"`.
+		assert_eq!(max_tokens_for("claude-opus-5"), MAX_TOKENS_LARGE);
+		assert_eq!(max_tokens_for("some-unknown-model"), MAX_TOKENS_LARGE);
+		// Haiku / Claude 3 can't accept more than 8 K of output.
 		assert_eq!(max_tokens_for("claude-haiku-4-5-20251001"), MAX_TOKENS_DEFAULT);
 		assert_eq!(max_tokens_for("claude-3-5-haiku-20241022"), MAX_TOKENS_DEFAULT);
+		assert_eq!(max_tokens_for("claude-3-opus-20240229"), MAX_TOKENS_DEFAULT);
 	}
 }

@@ -32,7 +32,10 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::{Authenticator, DeviceCode, HfIdentity};
-use crate::defaults::{EMPTY_RESPONSE_RETRIES, MAX_TURN_ITERATIONS, PHASE_6_0_SYSTEM_PROMPT};
+use crate::defaults::{
+	EMPTY_RESPONSE_RETRIES, MAX_TURN_ITERATIONS, OUTPUT_CAP_CONTINUATIONS, OUTPUT_CAP_CONTINUATION_PROMPT,
+	PHASE_6_0_SYSTEM_PROMPT,
+};
 use crate::error::CoderError;
 use crate::event::{CoderEvent, CoderEventEnvelope, CoderStatus, TokenUsageSource};
 use crate::folder_summary::FolderSummaryService;
@@ -4435,6 +4438,11 @@ async fn run_turn(
 	// `EMPTY_RESPONSE_RETRIES` the turn fails loudly instead of
 	// ending as a phantom success.
 	let mut empty_shell_attempts: usize = 0;
+	// Continuations spent re-asking the model to finish an answer
+	// the provider cut off at the output-token ceiling. Capped by
+	// `OUTPUT_CAP_CONTINUATIONS`; never reset, so a pathological
+	// turn can't loop on it.
+	let mut output_cap_continuations: usize = 0;
 	for _iter in 0..MAX_TURN_ITERATIONS {
 		if cancel.is_cancelled() {
 			return Err(CoderError::Aborted);
@@ -4758,6 +4766,21 @@ async fn run_turn(
 				);
 				continue;
 			}
+			// The provider cut the answer off at the output-token
+			// ceiling — what we have is a fragment, not a final
+			// message. Ask for the rest instead of ending the turn
+			// mid-sentence. The partial is already in `messages`
+			// (and on disk), so the model sees its own tail and
+			// resumes from it.
+			if response.hit_output_cap() && output_cap_continuations < OUTPUT_CAP_CONTINUATIONS {
+				output_cap_continuations += 1;
+				tracing::warn!(
+					continuation = output_cap_continuations,
+					"assistant message hit the output-token ceiling; asking the model to continue"
+				);
+				push_sentinel_user_message(rt, sink, OUTPUT_CAP_CONTINUATION_PROMPT.to_owned()).await;
+				continue;
+			}
 			// Final assistant message of the turn — unless the user
 			// queued a steer while it was streaming. We can't just
 			// return: `drain_pending_steers` runs at the **top** of
@@ -4789,6 +4812,44 @@ async fn run_turn(
 	wrap_up_final_answer(state, rt, sink, &cancel, &tool_defs).await
 }
 
+/// Append a synthetic user message to the live history, the JSONL,
+/// and the panel. Used for the runner's two sentinels — the
+/// tool-budget wrap-up and the output-cap continuation. They're real
+/// conversation turns, not a hidden side-channel: rereading the
+/// session later has to make it obvious why the assistant suddenly
+/// stopped calling tools, or why one answer arrived in two bubbles.
+/// Persistence is best-effort; a write failure logs and the turn
+/// carries on with the in-memory history.
+async fn push_sentinel_user_message(rt: &Arc<SessionRuntime>, sink: &FolderEventSink, text: String) {
+	{
+		let mut session = rt.session.lock().await;
+		session.messages.push(ChatMessage::user(text.clone()));
+	}
+	let (dir, header) = {
+		let session = rt.session.lock().await;
+		(session.session_dir.clone(), session.header.clone())
+	};
+	if let Some(dir) = dir {
+		let record = SessionRecord::User {
+			text: text.clone(),
+			images: Vec::new(),
+		};
+		if let Err(err) = sessions::append_record(&dir, &header, &record).await {
+			tracing::warn!(error = %err, "failed to persist sentinel user message");
+		} else {
+			let mut session = rt.session.lock().await;
+			session.persisted_records = session.persisted_records.saturating_add(1);
+		}
+	}
+	sink.send(CoderEvent::UserMessage {
+		id: new_message_id(),
+		text,
+		images: Vec::new(),
+		queued: false,
+		created_at_ms: Some(current_time_ms()),
+	});
+}
+
 /// Final tools-disabled round-trip after the iteration cap is hit.
 /// Appends a sentinel user message asking the model to finish and
 /// streams the response with `tools = []` so the model literally
@@ -4818,51 +4879,12 @@ async fn wrap_up_final_answer(
 	let standard_model = models.standard().to_owned();
 	let pi_model = models.resolve_route().pi_provider_model(&standard_model);
 
-	let sentinel_id = new_message_id();
 	let sentinel_text = format!(
 		"[Tool-call budget exhausted: you've used all {MAX_TURN_ITERATIONS} tool-call iterations available for this turn. \
 Do not call any more tools. Write a final response now using only what you've already gathered: summarise what was \
 done, what's still unfinished, and any uncertainty. If the user needs to take a follow-up action, say so explicitly.]"
 	);
-	{
-		let mut session = rt.session.lock().await;
-		session.messages.push(ChatMessage::user(sentinel_text.clone()));
-	}
-	{
-		// Best-effort persist of the sentinel into the JSONL — same
-		// shape as a real user turn so re-loading the session shows
-		// it inline. Lives entirely inside the lock-then-drop dance
-		// the regular user-message path uses, just inlined since
-		// we don't need a separate helper for the one-off case.
-		let session = rt.session.lock().await;
-		let header = session.header.clone();
-		let dir = session.session_dir.clone();
-		drop(session);
-		if let Some(dir) = dir {
-			if let Err(err) = sessions::append_record(
-				&dir,
-				&header,
-				&SessionRecord::User {
-					text: sentinel_text.clone(),
-					images: Vec::new(),
-				},
-			)
-			.await
-			{
-				tracing::warn!(error = %err, "failed to persist tool-cap sentinel user message");
-			} else {
-				let mut session = rt.session.lock().await;
-				session.persisted_records = session.persisted_records.saturating_add(1);
-			}
-		}
-	}
-	sink.send(CoderEvent::UserMessage {
-		id: sentinel_id,
-		text: sentinel_text,
-		images: Vec::new(),
-		queued: false,
-		created_at_ms: Some(current_time_ms()),
-	});
+	push_sentinel_user_message(rt, sink, sentinel_text).await;
 
 	let messages = rt.session.lock().await.messages.clone();
 	let assistant_id = new_message_id();
