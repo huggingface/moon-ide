@@ -57,12 +57,15 @@ const CODER_EVENT_CHANNEL = 'coder:event';
  *  the message is still streaming so the user can watch reasoning
  *  land, auto-collapsed on `assistant_message_end`.
  *
- *  Tool rows carry `startedAt` (epoch ms, set on `tool_call`) and
- *  `durationMs` (set on `tool_result`). The panel uses the first to
- *  drive a live ticking elapsed counter while the tool runs and the
- *  second to display the precise elapsed time once the call settles
- *  — useful for spotting slow tools (multi-second `bash` tail,
- *  multi-megabyte `read_file`) at a glance. */
+ *  Tool rows carry `startedAt` (epoch ms, from the `tool_call`
+ *  event's `started_at_ms` — the backend's dispatch time, not the
+ *  moment we observed the event, so a reopen doesn't restart a
+ *  running row's counter) and `durationMs` (set on `tool_result`).
+ *  The panel uses the first to drive a live ticking elapsed counter
+ *  while the tool runs and the second to display the precise elapsed
+ *  time once the call settles — useful for spotting slow tools
+ *  (multi-second `bash` tail, multi-megabyte `read_file`) at a
+ *  glance. */
 export type CoderRow =
 	| {
 			kind: 'user';
@@ -2773,6 +2776,34 @@ class CoderPanelState {
 		}
 	}
 
+	/** Re-run the round-trip that failed — the retry button on a
+	 *  trailing error row. Nothing is truncated: the error row stays
+	 *  put and the retry's output appends below it, which is also
+	 *  what retires the affordance (the panel only offers it on the
+	 *  last row). `busy` is set optimistically so the composer locks
+	 *  and the stop button appears without waiting for the first
+	 *  streamed event. */
+	async retryLastTurn(): Promise<void> {
+		if (this.busy) {
+			return;
+		}
+		this.busy = true;
+		try {
+			await ipc.coder.retryLastTurn();
+			await this.refreshSessions();
+		} catch (err) {
+			this.busy = false;
+			this.rows = [
+				...this.rows,
+				{
+					kind: 'error',
+					id: `local-${Date.now()}`,
+					text: formatError(err),
+				},
+			];
+		}
+	}
+
 	async abort(): Promise<void> {
 		try {
 			await ipc.coder.abort();
@@ -4159,7 +4190,7 @@ function upsertToolCallRow(rows: CoderRow[], event: Extract<CoderEvent, { kind: 
 		// reopen→start gap as execution time.
 		existing.name = event.name;
 		existing.args = event.args;
-		existing.startedAt = Date.now();
+		existing.startedAt = event.started_at_ms ?? Date.now();
 		return true;
 	}
 	rows.push({
@@ -4170,7 +4201,7 @@ function upsertToolCallRow(rows: CoderRow[], event: Extract<CoderEvent, { kind: 
 		result: undefined,
 		hasResult: false,
 		isError: false,
-		startedAt: Date.now(),
+		startedAt: event.started_at_ms ?? Date.now(),
 		durationMs: null,
 	});
 	return true;

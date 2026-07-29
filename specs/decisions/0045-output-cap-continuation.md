@@ -25,6 +25,13 @@ Two independent defects lined up:
    a fragment was returned as the turn's result, and a sub-agent's
    fragment became the `task` tool's result with no signal that it was
    incomplete.
+3. **The ceiling can also land inside a tool call**, and that path was
+   worse. A big `write_file` cut off mid-`content` yields a `tool_use`
+   block whose arguments aren't valid JSON; `parse_tool_args` logged a
+   warning and passed `{}`, so the tool answered "missing field
+   `path`". That reads to the model as a schema mistake, not a size
+   problem, so the natural recovery is to re-send the same oversized
+   call — and hit the same ceiling.
 
 Truncation is the worst failure mode we ship: it looks exactly like
 success. Both defects had to be individually harmless-looking to
@@ -50,7 +57,16 @@ concatenate their fragments so the parent receives one report, and
 append an explicit `[Report truncated: …]` marker if the continuation
 budget runs out with the answer still incomplete.
 
-The two fixes are deliberately both kept. The ceiling fix makes
+**A tool call with unparseable arguments is refused, not
+dispatched.** The refusal names the cause (cut off at the
+output-token limit, N bytes received), states plainly that nothing
+was written or run, and gives the recovery: chunk the write, or make
+a targeted `edit_file` instead of rewriting the file. Broken JSON —
+not the stop reason — is what triggers the refusal, so a complete
+call in a response the ceiling truncated _after_ it still runs; the
+stop reason only picks the wording.
+
+The fixes are deliberately all kept. The ceiling fix makes
 truncation rare; the continuation fix means that when it happens
 anyway — a genuinely enormous answer, a provider on the
 OpenAI-compatible path with its own lower default, a future model —
@@ -76,6 +92,13 @@ the system degrades to "answer arrives in two bubbles" instead of
 - **Surface truncation to the user and stop.** An error banner on a
   90 %-complete audit is worse than the missing 10 %; the model can
   finish the sentence itself.
+- **Continue a truncated _tool call_ the way we continue prose.**
+  Asking the model to resume mid-JSON means trusting it to reproduce
+  a byte-exact prefix boundary, and a wrong guess writes a corrupt
+  file. Refusing and letting it retry smaller is the only safe move.
+- **Keep passing `{}` and let the tool's schema error do the
+  talking.** It's the status quo, and it's what turned a size problem
+  into an unproductive retry loop.
 - **Enable adaptive thinking for unrecognised models too** (the same
   allowlist governs `thinking_config_for`). Left alone on purpose:
   sending `thinking: adaptive` to a model that doesn't support it

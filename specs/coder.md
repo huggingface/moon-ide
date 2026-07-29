@@ -83,7 +83,10 @@ Three control surfaces:
   extra round-trip when a steer arrives during the final assistant
   message. Steers are persisted at drain time (the chat-completions
   shape forbids a user message between an assistant `tool_calls` and
-  its results).
+  its results). Until then the queue lives on the session runtime,
+  which outlives a session switch and a folder switch — so a reopen
+  replays the undrained steers (queued rows, same ids) on top of the
+  disk-driven transcript. Only a process restart loses them.
 - **Go now** (a "go now" button on the queued row): the user typed a
   steer mid-turn but doesn't want to wait for the running turn to
   settle. Cancels the current turn (like abort) and lets the spawn
@@ -290,14 +293,25 @@ send none of those.
 #### Truncated answers (`stop_reason: "length"`)
 
 A response that stops at the output ceiling is a fragment, never a
-final answer. Both the parent loop and the sub-agent loop detect it
-and re-ask, up to `OUTPUT_CAP_CONTINUATIONS` times, by appending a
-visible user sentinel telling the model to resume where it stopped.
-The parent renders the continuation as a second assistant bubble; a
-sub-agent joins its fragments so the parent receives one report. If
-the budget runs out with the answer still truncated, the sub-agent
-report ends with an explicit `[Report truncated: …]` marker rather
-than pretending to be complete.
+final answer. There are two halves to this, because the ceiling can
+land in prose or inside a tool call:
+
+- **Prose.** Both the parent loop and the sub-agent loop re-ask, up
+  to `OUTPUT_CAP_CONTINUATIONS` times, by appending a visible user
+  sentinel telling the model to resume where it stopped. The parent
+  renders the continuation as a second assistant bubble; a sub-agent
+  joins its fragments so the parent receives one report. If the
+  budget runs out with the answer still truncated, the sub-agent
+  report ends with an explicit `[Report truncated: …]` marker rather
+  than pretending to be complete.
+- **Tool calls.** A tool call whose arguments don't parse as JSON is
+  **refused, never dispatched** — nothing is written or run — and the
+  model gets a tool result saying the arguments were cut off and how
+  to recover (chunk the write, or use `edit_file`). This is the
+  large-`write_file` case; the previous behaviour passed `{}` to the
+  tool, which surfaced as "missing field `path`" and sent the model
+  straight back into the same oversized call. Calls that parse still
+  run, including in a response that was truncated after them.
 
 #### Prompt caching (Anthropic, native or via OpenRouter)
 
@@ -720,6 +734,16 @@ interrupted. Their rows replay in the running state and the live
 turn's real results flip them. The same exemption applies to a
 still-running sub-agent's own replayed transcript.
 
+Elapsed time is **wall-clock from the backend, both directions**:
+`tool_call` carries `started_at_ms` and `tool_result` carries
+`duration_ms`, so neither a running row's ticking counter nor a
+finished row's readout is derived from when the frontend happened to
+observe the event. Without the former, clicking back into a session
+restarts every running row's timer from zero — most visibly a `task`
+sub-agent that's been going for minutes. On replay `started_at_ms` is
+the enclosing assistant record's line timestamp (written immediately
+before the batch dispatches).
+
 Replay ships as **one batched `Replay` event**, not
 one-emit-per-record — Tauri dispatch overhead made a 1000-row session
 take seconds to open otherwise. Live turns stay one-event-per-emit.
@@ -797,6 +821,23 @@ truncation (same posture as `coder_replay_from_message`). Refused
 while a turn is in flight. No confirm (tool calls re-execute fresh,
 nothing is lost). After the re-dispatch, subsequent iterations make
 normal LLM calls with the fresh tool results in `messages`.
+
+### Retry a failed turn
+
+A **trailing** error row (and only a trailing one — anything earlier
+is history, since a later turn already ran past it) carries a
+`retry` button, routed through `coder_retry_last_turn`
+([ADR 0046](decisions/0046-retry-a-failed-turn.md)). Unlike the
+three affordances above it truncates nothing: everything the dead
+turn completed is already persisted and still valid, the `Error`
+record stays on disk, the row stays in the transcript, and the retry
+appends below it. That's also what retires the button — rows past it
+mean it's no longer the tail. The backend re-runs orphan recovery
+first (the failure path, unlike abort, can leave a mid-dispatch tool
+call unanswered, which the providers reject) and then spawns the
+turn loop with no resume parameter, i.e. "call the model again with
+the messages we have". Auth-gated, refused mid-turn, and refused on
+a session with no messages.
 
 ### Auto-rename
 

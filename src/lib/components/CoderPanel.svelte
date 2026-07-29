@@ -1482,6 +1482,19 @@
 		return ids;
 	});
 
+	// The one error row that gets a retry button: the transcript's
+	// last row, when the panel is idle. Anything earlier is history
+	// — the turn after it already ran — and the backend's retry is
+	// "call the model again with the messages we have", which only
+	// means "redo the thing that failed" at the tail.
+	const retryableErrorRowId = $derived.by(() => {
+		if (coder.busy) {
+			return null;
+		}
+		const last = coder.rows.at(-1);
+		return last?.kind === 'error' ? last.id : null;
+	});
+
 	// Lazy tool-body rendering. Tool rows render collapsed by
 	// default, but a `<details>` keeps its slotted children mounted
 	// even while closed — so without this gate every `ToolBody*`
@@ -3204,7 +3217,24 @@
 		<div class="row notice">aborted</div>
 	{:else if row.kind === 'error'}
 		<div class="row error" role="alert">
-			<div class="row-label">error</div>
+			<div class="row-label">
+				error
+				{#if inParentTranscript && row.id === retryableErrorRowId}
+					<!-- Retry the round-trip that failed. Nothing is
+							 truncated: this row stays put and the retry's
+							 output appends below it, which is also what
+							 retires the button. Always visible rather than
+							 hover-revealed like the user-row affordances —
+							 it's the recovery path out of a dead turn, and
+							 there's at most one on screen. -->
+					<button
+						type="button"
+						class="error-retry"
+						title="Re-run the request that failed. Everything above is kept."
+						onclick={() => coder.retryLastTurn()}>retry</button
+					>
+				{/if}
+			</div>
 			<div class="bubble">{row.text}</div>
 		</div>
 	{:else if row.kind === 'compaction'}
@@ -4086,6 +4116,21 @@
 	}
 	.queued-go-now {
 		margin-left: 4px;
+		font: inherit;
+		font-size: 9px;
+		font-weight: 600;
+		color: var(--m-accent);
+		background: transparent;
+		border: 0;
+		padding: 1px 4px;
+		cursor: pointer;
+
+		&:hover {
+			color: var(--m-fg);
+		}
+	}
+	.error-retry {
+		margin-left: 6px;
 		font: inherit;
 		font-size: 9px;
 		font-weight: 600;

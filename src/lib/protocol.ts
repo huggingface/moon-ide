@@ -1603,7 +1603,18 @@ export type CoderEvent =
 			 *  `user_message.created_at_ms`. */
 			created_at_ms?: number | null;
 	  }
-	| { kind: 'tool_call'; id: string; name: string; args: unknown }
+	| {
+			kind: 'tool_call';
+			id: string;
+			name: string;
+			args: unknown;
+			/** Unix-ms dispatch time. Present live and on replay (from
+			 *  the enclosing assistant record's timestamp) so a
+			 *  still-running row's elapsed counter survives a session
+			 *  reopen. Absent for records persisted before the field
+			 *  shipped; the panel falls back to `Date.now()`. */
+			started_at_ms?: number | null;
+	  }
 	| {
 			kind: 'tool_result';
 			id: string;

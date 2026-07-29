@@ -432,11 +432,13 @@ struct Session {
 	/// Pop with [`Coder::unqueue_steer`] (`ArrowUp`
 	/// on an empty composer in the panel) to take a queued steer
 	/// back before drain. In-memory only; undrained steers don't
-	/// hit disk (they live here, not in the JSONL), so a reload
-	/// can't recover them — acceptable since the panel pairs
-	/// queue-time emission of a [`CoderEvent::UserMessage`] with a
-	/// matching [`CoderEvent::SteerDrained`] only when the steer
-	/// actually graduates into the chat.
+	/// hit disk (they live here, not in the JSONL), so a process
+	/// restart can't recover them. A *session* reopen can, though:
+	/// the queue outlives `open_session` (the runtime isn't
+	/// remounted for a live turn), so the replay re-emits one
+	/// queued [`CoderEvent::UserMessage`] per entry and the panel
+	/// gets its muted row, "go now" button and `ArrowUp`-unqueue
+	/// back.
 	pending_steers: Vec<PendingSteer>,
 	/// Last per-turn diff (ADR 0030). Set by `emit_turn_diff` at turn
 	/// end; read by `observe_session` so an orchestrator's
@@ -460,6 +462,9 @@ struct PendingSteer {
 	id: String,
 	text: String,
 	images: Vec<ImageAttachment>,
+	/// Unix-ms queue time, replayed as the row's `created_at_ms`
+	/// so a reopen doesn't restamp the steer to "now".
+	queued_at_ms: i64,
 }
 
 impl Session {
@@ -2341,6 +2346,51 @@ impl CoderHandle {
 		Ok(())
 	}
 
+	/// Re-run the round-trip that failed, without re-typing the
+	/// prompt. Anchored on the visible session's live state rather
+	/// than an ordinal: the transcript's tail *is* the checkpoint —
+	/// everything the turn completed before it died is already
+	/// persisted, so retrying is just "call the model again with
+	/// the messages we have".
+	///
+	/// Nothing is truncated. The `Error` record stays on disk and
+	/// the error row stays in the transcript: it happened, and the
+	/// retry's output appends below it (the panel only offers the
+	/// affordance on a *trailing* error row, so a successful retry
+	/// retires the button by pushing rows past it). Orphan recovery
+	/// runs first because the failure path — unlike abort — leaves
+	/// any mid-dispatch tool calls unpaired in `messages`, and the
+	/// providers reject a request with an unanswered `tool_use`.
+	pub async fn retry_last_turn(&self) -> Result<(), CoderError> {
+		self.ensure_can_send().await?;
+		let (rt, session_id, folder_path) = self.state.active_visible_runtime().await?;
+		{
+			// Refuse mid-turn — same guard as `resume_from_assistant`.
+			let turn = rt.turn.lock().await;
+			if turn.cancel.is_some() {
+				return Err(CoderError::Internal(
+					"cannot retry while a turn is running; stop it first".into(),
+				));
+			}
+		}
+		if rt.session.lock().await.messages.is_empty() {
+			return Err(CoderError::Internal(
+				"nothing to retry: the session has no messages".into(),
+			));
+		}
+		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), session_id);
+		recover_in_memory_orphans(&rt, &sink).await;
+		rt.session.lock().await.header.updated_at_ms = current_time_ms();
+		let cancel = CancellationToken::new();
+		{
+			let mut turn = rt.turn.lock().await;
+			turn.cancel = Some(cancel.clone());
+		}
+		let state = self.state.clone();
+		spawn_turn_loop(state, rt, sink, folder_path.to_path_buf(), cancel, false, None);
+		Ok(())
+	}
+
 	/// Pre-flight auth gate shared by every send-shaped entry
 	/// point ([`send`], [`replay_from_message`]). HF needs OAuth;
 	/// user providers need a configured key (or a localhost
@@ -2638,9 +2688,18 @@ impl CoderHandle {
 		// running turn will emit the real `ToolResult` when each
 		// lands.
 		let mut in_flight = false;
+		// Undrained steers live on the runtime, not the JSONL, so
+		// the disk-driven replay below can't see them. Snapshot them
+		// here and re-emit at the tail of the batch, otherwise
+		// clicking away from a session with a queued steer and back
+		// loses the muted row (and its "go now" / unqueue
+		// affordances) even though the backend will still feed the
+		// message to the running turn.
+		let mut pending_steers: Vec<PendingSteer> = Vec::new();
 		if already_mounted {
 			if let Some(rt) = fs.runtime(&id).await {
 				in_flight = rt.turn.lock().await.cancel.is_some();
+				pending_steers = rt.session.lock().await.pending_steers.clone();
 			}
 		}
 		let summary = SessionSummary {
@@ -2908,6 +2967,20 @@ impl CoderHandle {
 		if !resume_ask_user_calls.is_empty() {
 			in_flight = true;
 		}
+		// Queued-but-undrained steers ride at the tail, ahead of the
+		// terminator: they're the newest thing in the transcript, and
+		// the ids match the live `PendingSteer`s so the eventual
+		// `SteerDrained` (and `coder_unqueue_steer` / `drain now`)
+		// still target the right row.
+		for steer in pending_steers {
+			replay_events.push(CoderEvent::UserMessage {
+				id: steer.id,
+				text: steer.text,
+				images: steer.images,
+				queued: true,
+				created_at_ms: Some(steer.queued_at_ms),
+			});
+		}
 		replay_events.push(CoderEvent::TurnComplete);
 		// Focus: broadcast the batch for the desktop panel's reduce
 		// pass. Observe: hand it back to the caller (the bridge ships
@@ -3056,13 +3129,15 @@ impl CoderHandle {
 				// the panel saw, and the matching `SteerDrained`
 				// can target the same row.
 				let steer_id = new_message_id();
+				let queued_at_ms = current_time_ms();
 				let mut session = rt.session.lock().await;
 				session.pending_steers.push(PendingSteer {
 					id: steer_id.clone(),
 					text: text.clone(),
 					images: images.clone(),
+					queued_at_ms,
 				});
-				session.header.updated_at_ms = current_time_ms();
+				session.header.updated_at_ms = queued_at_ms;
 				drop(session);
 				let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), session_id.clone());
 				sink.send(CoderEvent::UserMessage {
@@ -3070,7 +3145,7 @@ impl CoderHandle {
 					text,
 					images,
 					queued: true,
-					created_at_ms: Some(current_time_ms()),
+					created_at_ms: Some(queued_at_ms),
 				});
 				return Ok(target);
 			}
@@ -3560,13 +3635,15 @@ impl CoderHandle {
 					rt.prompts.skip_any().await;
 				}
 				let steer_id = new_message_id();
+				let queued_at_ms = current_time_ms();
 				let mut session = rt.session.lock().await;
 				session.pending_steers.push(PendingSteer {
 					id: steer_id.clone(),
 					text: text.clone(),
 					images: images.clone(),
+					queued_at_ms,
 				});
-				session.header.updated_at_ms = current_time_ms();
+				session.header.updated_at_ms = queued_at_ms;
 				drop(session);
 				let sink = FolderEventSink::new(
 					self.state.events.clone(),
@@ -3578,7 +3655,7 @@ impl CoderHandle {
 					text,
 					images,
 					queued: true,
-					created_at_ms: Some(current_time_ms()),
+					created_at_ms: Some(queued_at_ms),
 				});
 				return Ok(());
 			}
@@ -4545,7 +4622,10 @@ async fn run_turn(
 		// see `None` and follow the normal LLM-call path.
 		if let Some(calls) = resume_tool_calls.take() {
 			if !calls.is_empty() {
-				dispatch_tool_calls(state, rt, sink, &cx, &cancel, &calls).await?;
+				// Replayed from a checkpoint, so the calls come off
+				// disk rather than a live stream — no output cap in
+				// play.
+				dispatch_tool_calls(state, rt, sink, &cx, &cancel, &calls, false).await?;
 				continue;
 			}
 		}
@@ -4800,7 +4880,16 @@ async fn run_turn(
 			continue;
 		}
 
-		dispatch_tool_calls(state, rt, sink, &cx, &cancel, &response.tool_calls).await?;
+		dispatch_tool_calls(
+			state,
+			rt,
+			sink,
+			&cx,
+			&cancel,
+			&response.tool_calls,
+			response.hit_output_cap(),
+		)
+		.await?;
 	}
 
 	// Iteration cap reached. Rather than just bailing with an
@@ -4979,8 +5068,17 @@ async fn dispatch_tool_calls(
 	cx: &ToolContext,
 	cancel: &CancellationToken,
 	calls: &[crate::inference::ToolCall],
+	hit_output_cap: bool,
 ) -> Result<(), CoderError> {
-	let homogeneous_subagent = calls.len() >= 2 && calls.iter().all(|c| c.function.name == "task");
+	// A batch with a truncated call in it falls through to the
+	// sequential path, which refuses that one call and runs the
+	// rest. Losing parallelism on a broken batch is a fine price
+	// for keeping the refusal in exactly one place.
+	let homogeneous_subagent = calls.len() >= 2
+		&& calls.iter().all(|c| c.function.name == "task")
+		&& calls
+			.iter()
+			.all(|c| tool_args_or_refusal(&c.function, hit_output_cap).is_ok());
 	if homogeneous_subagent {
 		dispatch_subagent_batch(state, rt, sink, cx, cancel, calls).await
 	} else {
@@ -4988,11 +5086,28 @@ async fn dispatch_tool_calls(
 			if cancel.is_cancelled() {
 				return Err(CoderError::Aborted);
 			}
-			let args = parse_tool_args(&call.function);
+			let args = match tool_args_or_refusal(&call.function, hit_output_cap) {
+				Ok(args) => args,
+				Err(err) => {
+					// The row still has to appear (and the API
+					// still needs a `tool_result` for every
+					// `tool_use` block) — it just carries the
+					// refusal instead of a result.
+					sink.send(CoderEvent::ToolCall {
+						id: call.id.clone(),
+						name: call.function.name.clone(),
+						args: Value::Object(Default::default()),
+						started_at_ms: Some(current_time_ms()),
+					});
+					finish_tool_call(rt, sink, &call.id, &call.function.name, Err(err), None).await?;
+					continue;
+				}
+			};
 			sink.send(CoderEvent::ToolCall {
 				id: call.id.clone(),
 				name: call.function.name.clone(),
 				args: args.clone(),
+				started_at_ms: Some(current_time_ms()),
 			});
 			let dispatched_at = std::time::Instant::now();
 			let outcome = if call.function.name == "task" {
@@ -5067,11 +5182,13 @@ async fn dispatch_subagent_batch(
 	// present in the parent's transcript before any sub-agent
 	// starts streaming events of its own.
 	let parsed_args: Vec<Value> = calls.iter().map(|c| parse_tool_args(&c.function)).collect();
+	let batch_started_at_ms = current_time_ms();
 	for (call, args) in calls.iter().zip(parsed_args.iter()) {
 		sink.send(CoderEvent::ToolCall {
 			id: call.id.clone(),
 			name: call.function.name.clone(),
 			args: args.clone(),
+			started_at_ms: Some(batch_started_at_ms),
 		});
 	}
 
@@ -7475,6 +7592,15 @@ fn emit_replay_events(out: &mut Vec<CoderEvent>, record: SessionRecord, created_
 					id: call.id.clone(),
 					name: call.function.name,
 					args,
+					// The assistant record is written immediately
+					// before the batch dispatches, so its line
+					// timestamp is the batch's start. Exact for a
+					// parallel batch (and for the single-call case
+					// that covers a long-running `task`); for a
+					// sequentially-dispatched batch the later calls
+					// over-report until their live `ToolCall`
+					// re-baselines them.
+					started_at_ms: Some(created_at_ms),
 				});
 			}
 		}
@@ -7698,6 +7824,7 @@ fn subagent_replay_inners(record: SessionRecord, created_at_ms: i64) -> Vec<Code
 					id: call.id.clone(),
 					name: call.function.name,
 					args,
+					started_at_ms: Some(created_at_ms),
 				});
 			}
 			out
@@ -7987,6 +8114,60 @@ fn estimate_completion_tokens(response: &AssistantResponse) -> u32 {
 /// convention. Decode it lazily; if it fails to parse fall back to
 /// an empty object so the tool dispatcher reports a clean
 /// `InvalidToolArgs` error instead of a low-level decode panic.
+/// Parse a tool call's arguments, or refuse the call outright when
+/// the JSON doesn't parse.
+///
+/// Unparseable arguments almost always mean the response was cut off
+/// at the output-token ceiling *inside* the arguments blob — a big
+/// `write_file` is the classic case. Dispatching anyway (the old
+/// behaviour: warn, pass `{}`) turns a truncation into a schema
+/// error like "missing field `path`", which tells the model nothing
+/// about what actually happened, so it retries the same oversized
+/// call and loops until the iteration cap.
+///
+/// `hit_output_cap` comes from the response's stop reason and only
+/// changes the wording — the refusal itself is driven by the JSON
+/// being broken, which is the precise signal. A complete call in a
+/// truncated response (the cap landed after this block closed) still
+/// parses and still runs.
+pub(crate) fn tool_args_or_refusal(call: &FunctionCall, hit_output_cap: bool) -> Result<Value, CoderError> {
+	if call.arguments.trim().is_empty() {
+		return Ok(Value::Object(Default::default()));
+	}
+	match serde_json::from_str::<Value>(&call.arguments) {
+		Ok(value) => Ok(value),
+		Err(_) if hit_output_cap => {
+			tracing::warn!(
+				tool = %call.name,
+				bytes = call.arguments.len(),
+				"tool-call arguments were cut off at the output-token ceiling; refusing the call"
+			);
+			Err(CoderError::invalid_args(
+				call.name.clone(),
+				format!(
+					"the arguments were cut off by the output-token limit after {} bytes and did not parse as JSON, \
+so the call was NOT executed — nothing was written or run. Retry with a smaller payload: split a large `write_file` \
+into a first chunk plus follow-up `edit_file` calls that append the rest, or make a targeted `edit_file` instead of \
+rewriting the whole file.",
+					call.arguments.len()
+				),
+			))
+		}
+		Err(err) => {
+			tracing::warn!(
+				tool = %call.name,
+				error = %err,
+				bytes = call.arguments.len(),
+				"could not parse tool-call arguments as JSON; refusing the call"
+			);
+			Err(CoderError::invalid_args(
+				call.name.clone(),
+				format!("arguments were not valid JSON ({err}); the call was not executed"),
+			))
+		}
+	}
+}
+
 fn parse_tool_args(call: &FunctionCall) -> Value {
 	if call.arguments.trim().is_empty() {
 		return Value::Object(Default::default());
@@ -8199,6 +8380,57 @@ mod tests {
 			r#"{"path":"a.rs","content":"hi"}"#,
 		)];
 		assert!(find_recorded_tool_call(&messages, "nope").is_none());
+	}
+
+	#[test]
+	fn truncated_write_file_call_is_refused_not_dispatched_empty() {
+		// A `write_file` cut off mid-`content` by the output-token
+		// ceiling. The old behaviour passed `{}` through, which the
+		// tool rejected as "missing field `path`" — a message that
+		// sends the model straight back into the same oversized
+		// call.
+		let call = FunctionCall {
+			name: "write_file".into(),
+			arguments: r#"{"path":"big.rs","content":"fn main() {\n    let x ="#.into(),
+		};
+		let err = tool_args_or_refusal(&call, true).expect_err("truncated args must be refused");
+		let message = err.to_string();
+		assert!(message.contains("cut off"), "{message}");
+		assert!(message.contains("NOT executed"), "{message}");
+		// The recovery advice is the point of the message.
+		assert!(message.contains("edit_file"), "{message}");
+	}
+
+	#[test]
+	fn complete_call_in_a_truncated_response_still_runs() {
+		// The ceiling landed after this block closed — the JSON is
+		// intact, so refusing it would cost a pointless retry.
+		let call = FunctionCall {
+			name: "grep".into(),
+			arguments: r#"{"pattern":"storage"}"#.into(),
+		};
+		let args = tool_args_or_refusal(&call, true).expect("valid JSON must dispatch");
+		assert_eq!(args["pattern"], "storage");
+	}
+
+	#[test]
+	fn empty_arguments_are_an_empty_object_not_a_refusal() {
+		let call = FunctionCall {
+			name: "workspace_scm_status".into(),
+			arguments: String::new(),
+		};
+		let args = tool_args_or_refusal(&call, false).expect("no-arg tools must dispatch");
+		assert_eq!(args, serde_json::json!({}));
+	}
+
+	#[test]
+	fn malformed_arguments_without_a_length_stop_are_refused_too() {
+		let call = FunctionCall {
+			name: "read_file".into(),
+			arguments: "not json at all".into(),
+		};
+		let err = tool_args_or_refusal(&call, false).expect_err("garbage args must be refused");
+		assert!(err.to_string().contains("not valid JSON"), "{err}");
 	}
 
 	#[test]
@@ -8521,11 +8753,13 @@ mod tests {
 				id: "steer-1".into(),
 				text: "also do X".into(),
 				images: Vec::new(),
+				queued_at_ms: 0,
 			},
 			PendingSteer {
 				id: "steer-2".into(),
 				text: "and then Y".into(),
 				images: Vec::new(),
+				queued_at_ms: 0,
 			},
 		];
 		let rt = Arc::new(SessionRuntime::new(session));
@@ -8608,6 +8842,7 @@ mod tests {
 				id: "a".into(),
 				text: "first".into(),
 				images: Vec::new(),
+				queued_at_ms: 0,
 			},
 			PendingSteer {
 				id: "b".into(),
@@ -8616,11 +8851,13 @@ mod tests {
 					data_url: "data:image/png;base64,xxx".into(),
 					mime: "image/png".into(),
 				}],
+				queued_at_ms: 0,
 			},
 			PendingSteer {
 				id: "c".into(),
 				text: "last".into(),
 				images: Vec::new(),
+				queued_at_ms: 0,
 			},
 		];
 
@@ -8641,6 +8878,7 @@ mod tests {
 			id: "a".into(),
 			text: "first".into(),
 			images: Vec::new(),
+			queued_at_ms: 0,
 		}];
 		assert!(pop_pending_steer(&mut session, "missing").is_none());
 		assert_eq!(session.pending_steers.len(), 1);

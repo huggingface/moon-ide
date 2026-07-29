@@ -133,6 +133,16 @@ pub enum CoderEvent {
 		id: String,
 		name: String,
 		args: serde_json::Value,
+		/// Unix-ms dispatch time. Carried live *and* on replay
+		/// (from the enclosing assistant record's line timestamp)
+		/// so a still-running row's elapsed counter survives a
+		/// session reopen instead of restarting from zero — the
+		/// visible symptom being a long `task` sub-agent whose
+		/// `1m35s` snaps back to `0s` when the user switches away
+		/// and back. `None` for records from before the field
+		/// shipped; the panel falls back to `now`.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		started_at_ms: Option<i64>,
 	},
 
 	/// The tool finished. `is_error` is `true` when the tool

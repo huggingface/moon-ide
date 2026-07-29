@@ -66,9 +66,7 @@ use crate::compaction;
 use crate::defaults::{MAX_TURN_ITERATIONS, OUTPUT_CAP_CONTINUATIONS, OUTPUT_CAP_CONTINUATION_PROMPT};
 use crate::error::CoderError;
 use crate::event::CoderEvent;
-use crate::inference::{
-	AssistantResponse, ChatMessage, FunctionCall, InferenceClient, StreamEvent, TokenUsage, ToolDefinition,
-};
+use crate::inference::{AssistantResponse, ChatMessage, InferenceClient, StreamEvent, TokenUsage, ToolDefinition};
 use crate::models::SharedCoderModels;
 use crate::runner::FolderEventSink;
 use crate::sessions::{
@@ -1008,17 +1006,28 @@ async fn run_subagent_loop(
 			if cancel.is_cancelled() {
 				return Err(CoderError::Aborted);
 			}
-			let args = parse_tool_args(&call.function);
+			// Same refusal as the parent loop: arguments that don't
+			// parse mean the ceiling landed inside them, so the
+			// call never runs. See `tool_args_or_refusal`.
+			let refusal = crate::runner::tool_args_or_refusal(&call.function, response.hit_output_cap());
+			let args = refusal
+				.as_ref()
+				.ok()
+				.cloned()
+				.unwrap_or_else(|| Value::Object(Default::default()));
 			sink.send(wrap_inner(
 				&id,
 				CoderEvent::ToolCall {
 					id: call.id.clone(),
 					name: call.function.name.clone(),
 					args: args.clone(),
+					started_at_ms: Some(current_time_ms()),
 				},
 			));
 			let dispatched_at = std::time::Instant::now();
-			let outcome = if call.function.name == "todo_write" {
+			let outcome = if let Err(err) = refusal {
+				Err(err)
+			} else if call.function.name == "todo_write" {
 				// Same short-circuit shape as the parent runner —
 				// `todo_write` mutates per-session state
 				// (`todos`), so it can't go through the stateless
@@ -1356,10 +1365,6 @@ fn response_to_message(response: &AssistantResponse) -> ChatMessage {
 		thinking_blocks: response.thinking_blocks.clone(),
 		tool_calls: response.tool_calls.clone(),
 	}
-}
-
-fn parse_tool_args(function: &FunctionCall) -> Value {
-	serde_json::from_str(&function.arguments).unwrap_or(Value::Null)
 }
 
 /// Sub-agent counterpart to [`crate::runner::handle_todo_write`].

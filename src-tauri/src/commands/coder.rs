@@ -363,6 +363,17 @@ pub async fn coder_resume_from_assistant(
 		.map_err(MoonError::from)
 }
 
+/// Re-run the round-trip that failed in the active folder's visible
+/// session — the retry affordance on a trailing error row. Nothing is
+/// truncated: the error stays in the transcript and on disk, and the
+/// retry's output appends below it. Auth-gates, refused while a turn
+/// is in flight, and errors when the session has no messages to
+/// retry against.
+#[tauri::command]
+pub async fn coder_retry_last_turn(state: State<'_, AppState>) -> Result<(), MoonError> {
+	state.coder.retry_last_turn().await.map_err(MoonError::from)
+}
+
 /// Manually reapply a recorded `write_file` / `edit_file` tool
 /// call from the active folder's visible session. The recovery
 /// affordance behind the per-row "re-apply" control: a user who
