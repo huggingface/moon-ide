@@ -215,7 +215,10 @@ async fn is_proxy_running(workspace_project: &ProjectName) -> Result<bool, Lifec
 		})?;
 	if !output.status.success() {
 		let stderr = String::from_utf8_lossy(&output.stderr);
-		if stderr.contains("No such object") || stderr.contains("Error: No such object") {
+		// Docker ≥ 29 lowercases this ("error: no such object: …");
+		// older daemons say "Error: No such object: …". Match
+		// case-insensitively rather than pin to one phrasing.
+		if stderr.to_ascii_lowercase().contains("no such object") {
 			return Ok(false);
 		}
 		if stderr.contains("Cannot connect to the Docker daemon") {
@@ -343,6 +346,25 @@ mod tests {
 		assert_eq!(proxy_container_name(&project), "moon-ws-default-ports-1");
 		let project = project_name_for_id("foo-bar").unwrap();
 		assert_eq!(proxy_container_name(&project), "moon-ws-foo-bar-ports-1");
+	}
+
+	#[test]
+	fn not_found_phrasings_accepted_case_insensitively() {
+		// Pin the phrasings we match so a future "tidy the
+		// strings" edit can't silently re-break Docker ≥ 29.
+		for stderr in [
+			"error: no such object: moon-ws-foo-ports-1",
+			"Error: No such object: moon-ws-foo-ports-1",
+			"Error response from daemon: No such object: moon-ws-foo-ports-1",
+		] {
+			assert!(
+				stderr.to_ascii_lowercase().contains("no such object"),
+				"phrasing must be recognised: {stderr}"
+			);
+		}
+		assert!(!"error: permission denied"
+			.to_ascii_lowercase()
+			.contains("no such object"));
 	}
 
 	#[test]
