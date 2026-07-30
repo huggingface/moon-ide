@@ -283,6 +283,34 @@ fn spawn_args(config: &McpServerConfig) -> Vec<String> {
 	args
 }
 
+/// Per-call argument adjustments. `--output-dir` only covers
+/// *server-chosen* filenames: when the model passes an explicit
+/// `filename` (playwright's screenshot / snapshot / PDF tools all
+/// take one), the MCP resolves it against the server cwd — a bare
+/// name like `shot.png` would land at the folder root, unscoped.
+/// Prefix bare filenames with the pinned output dir so every
+/// playwright artefact lands under `.moon/playwright/`. Absolute
+/// paths and already-nested relative paths pass through — the
+/// model meant those.
+fn scoped_args(config: &McpServerConfig, mut args: Value) -> Value {
+	if config.id != "playwright" {
+		return args;
+	}
+	let Some(scoped) = args
+		.get("filename")
+		.and_then(Value::as_str)
+		.filter(|name| !name.contains(['/', '\\']))
+		.map(|name| format!("{PLAYWRIGHT_OUTPUT_DIR}/{name}"))
+	else {
+		return args;
+	};
+	args
+		.as_object_mut()
+		.expect("mcp args object")
+		.insert("filename".into(), scoped.into());
+	args
+}
+
 /// Where to spawn a server process, resolved by the caller (the
 /// tool registry knows the workspace's container name + cwd; this
 /// module doesn't probe docker itself). MCP servers follow the
@@ -785,6 +813,28 @@ rl.on('line', (line) => {
 		// verbatim.
 		let server = custom("mcp-1");
 		assert_eq!(spawn_args(&server), server.args);
+	}
+
+	#[test]
+	fn scoped_args_prefix_bare_playwright_filenames() {
+		let preset = &preset_servers()[0];
+		// Bare name → pinned under the output dir.
+		let args = scoped_args(preset, json!({ "filename": "shot.png", "type": "png" }));
+		assert_eq!(
+			args.get("filename").and_then(Value::as_str),
+			Some(".moon/playwright/shot.png")
+		);
+		// Absolute and nested paths pass through untouched.
+		let args = scoped_args(preset, json!({ "filename": "/tmp/shot.png" }));
+		assert_eq!(args.get("filename").and_then(Value::as_str), Some("/tmp/shot.png"));
+		let args = scoped_args(preset, json!({ "filename": "shots/a.png" }));
+		assert_eq!(args.get("filename").and_then(Value::as_str), Some("shots/a.png"));
+		// No filename arg → unchanged; non-playwright → unchanged.
+		let args = scoped_args(preset, json!({ "url": "https://x" }));
+		assert!(args.get("filename").is_none());
+		let other = custom("mcp-1");
+		let args = scoped_args(&other, json!({ "filename": "shot.png" }));
+		assert_eq!(args.get("filename").and_then(Value::as_str), Some("shot.png"));
 	}
 
 	#[test]

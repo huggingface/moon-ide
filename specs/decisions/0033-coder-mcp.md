@@ -91,7 +91,10 @@ Three changes after the preset met real use:
   versa). The dir is **relative** so one value is valid on both
   spawn targets: the active folder is bind-mounted, so host and
   container writes land in the same bytes, under a dir that's
-  already gitignored.
+  already gitignored. `--output-dir` only governs _server-chosen_
+  names, so a bare `filename` argument (which the MCP resolves
+  against its cwd, dropping the artefact at the folder root) is
+  rewritten into the same dir per call.
 - **Container-local paths in tool results are rewritten to host
   paths** (`/workspace/<folder>/…` → the folder's host path) so
   the model can hand a reported screenshot path straight to
@@ -125,3 +128,9 @@ Three changes after the preset met real use:
   (full-size on click); the JSON fallback strips the
   base64-bearing `images` key so expanding an `mcp_call` row
   doesn't dump megabytes of text.
+
+  Note on playwright specifically: it returns an inline image
+  block only when _it_ picks the filename. Asked to save under an
+  explicit `filename`, it reports a path and no pixels — the
+  model gets the image by `read_file`-ing that path, which is
+  half of why the `read_file` half of this work matters.
