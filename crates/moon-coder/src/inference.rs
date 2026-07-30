@@ -390,6 +390,48 @@ fn wire_user_content<'a>(content: &'a str, images: &'a [ImageAttachment], cache_
 	WireContent::Blocks(blocks)
 }
 
+/// Build the error for a failed round-trip, and for the one status
+/// where the bare provider message isn't actionable — 413, whose
+/// body is a flat `request entity too large` — say how big what we
+/// sent actually was and how much of it was pixels. Without those
+/// numbers the only visible cause is "the last thing I did", which
+/// in practice is whatever small image tipped a body that had been
+/// growing for an hour (ADR 0049).
+fn request_error(
+	endpoint: &str,
+	status: reqwest::StatusCode,
+	text: String,
+	request_id: Option<String>,
+	body: &ChatCompletionRequest<'_>,
+	messages: &[ChatMessage],
+) -> CoderError {
+	if status != reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+		return CoderError::http(endpoint, status.as_u16(), text, request_id);
+	}
+	let total = serde_json::to_vec(body).map(|json| json.len()).unwrap_or(0);
+	let images: Vec<usize> = messages
+		.iter()
+		.flat_map(|message| match message {
+			ChatMessage::User { images, .. } | ChatMessage::Tool { images, .. } => images.as_slice(),
+			_ => &[],
+		})
+		.map(|image| image.data_url.len())
+		.collect();
+	let mb = |bytes: usize| bytes as f64 / 1_000_000.0;
+	let detail = format!(
+		"{text} — sent {:.1} MB, of which {} image attachment(s) account for {:.1} MB",
+		mb(total),
+		images.len(),
+		mb(images.iter().sum())
+	);
+	tracing::warn!(
+		body_bytes = total,
+		images = images.len(),
+		"provider rejected the request as too large"
+	);
+	CoderError::http(endpoint, status.as_u16(), detail, request_id)
+}
+
 /// Tool definition handed to the model in the request. Mirrors
 /// OpenAI's `{ "type": "function", "function": { ... } }` shape.
 #[derive(Debug, Clone, Serialize)]
@@ -872,6 +914,21 @@ impl InferenceClient {
 		})
 	}
 
+	/// How much image payload the next request may carry, or `None`
+	/// when the route imposes no interesting limit.
+	///
+	/// Only the HF router gets a budget: moon-landing caps
+	/// `/v1/chat/completions` bodies at 5 MiB, while Anthropic
+	/// accepts 32 MB and a user's own `base_url` is their business.
+	/// Deliberately does not go through
+	/// [`Self::resolve_route_for_request`] — that can hit the
+	/// network for an OAuth refresh, and this runs once per
+	/// round-trip just to read a number.
+	pub(crate) async fn image_wire_budget(&self) -> Option<crate::images::ImageWireBudget> {
+		let snapshot = self.models.read().await.clone();
+		matches!(snapshot.resolve_route(), ResolvedProvider::HuggingFace).then_some(crate::images::HF_IMAGE_WIRE_BUDGET)
+	}
+
 	/// Cancel-aware wrapper around [`resolve_route_for_request`].
 	///
 	/// The inner method can hit the network (HF OAuth token refresh)
@@ -1157,7 +1214,7 @@ impl InferenceClient {
 			out = recv => out.map_err(CoderError::from)?,
 		};
 		if !status.is_success() {
-			return Err(CoderError::http(endpoint, status.as_u16(), text, request_id));
+			return Err(request_error(&endpoint, status, text, request_id, &body, messages));
 		}
 
 		let parsed: ChatCompletionResponse = crate::auth::decode_body(&endpoint, &text)?;
@@ -1246,7 +1303,7 @@ impl InferenceClient {
 				_ = cancel.cancelled() => return Err(CoderError::Aborted),
 				out = recv => out.map_err(CoderError::from)?,
 			};
-			return Err(CoderError::http(endpoint, status.as_u16(), text, request_id));
+			return Err(request_error(&endpoint, status, text, request_id, &body, messages));
 		}
 
 		consume_sse_stream(response, cancel, |chunk| {

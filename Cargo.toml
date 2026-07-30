@@ -58,6 +58,13 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # every platform falls back to the in-memory mock and tokens silently
 # disappear between launches. `crypto-rust` keeps us off system OpenSSL.
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+# Lossless WebP for image attachments (ADR 0049): the coder
+# re-encodes captured PNG screenshots before they enter the chat
+# history, which roughly halves what every subsequent request
+# carries. `default-features = false` keeps the heavy `image` crate
+# out — we only need the libwebp encoder, fed by `png`'s decoder.
+webp = { version = "0.3", default-features = false }
+png = "0.18"
 ts-rs = { version = "12.0", features = ["serde-compat", "serde-json-impl"] }
 lsp-types = "0.97"
 which = "8.0"

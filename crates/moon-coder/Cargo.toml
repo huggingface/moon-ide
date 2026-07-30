@@ -24,6 +24,7 @@ moon-container = { workspace = true }
 
 async-trait = { workspace = true }
 base64 = { workspace = true }
+png = { workspace = true }
 camino = { workspace = true }
 futures-util = { workspace = true }
 keyring = { workspace = true }
@@ -35,6 +36,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+webp = { workspace = true }
 # Hugging Face Xet client. Used by `hub_sync.rs` to upload coder
 # session JSONLs into a workspace-scoped bucket so the Hub can
 # render them in its pi-mono trace viewer. The crate publishes as

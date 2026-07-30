@@ -176,7 +176,7 @@ impl McpManager {
 		if result.get("isError").and_then(Value::as_bool).unwrap_or(false) {
 			return Err(CoderError::tool_failed("mcp_call", text));
 		}
-		let images = collect_images(&result);
+		let images = collect_images(&result).await;
 		let mut out = json!({
 			"server": config.id,
 			"tool": tool,
@@ -648,7 +648,11 @@ fn render_content(result: &Value) -> String {
 /// attachments, for the runner's `images` convention. Oversized
 /// or malformed blocks are skipped (their placeholder stays in
 /// the rendered text either way).
-fn collect_images(result: &Value) -> Vec<crate::inference::ImageAttachment> {
+///
+/// Async because screenshots get re-encoded on the way through
+/// (see [`crate::images`]) and that's CPU-bound enough to belong
+/// on the blocking pool — a playwright frame runs ~0.2 s.
+async fn collect_images(result: &Value) -> Vec<crate::inference::ImageAttachment> {
 	let Some(blocks) = result.get("content").and_then(Value::as_array) else {
 		return Vec::new();
 	};
@@ -664,15 +668,16 @@ fn collect_images(result: &Value) -> Vec<crate::inference::ImageAttachment> {
 			tracing::debug!(bytes = data.len(), "mcp: skipping oversized or empty image block");
 			continue;
 		}
+		let data = data.to_string();
 		let mime = block
 			.get("mimeType")
 			.and_then(Value::as_str)
 			.unwrap_or("image/png")
 			.to_string();
-		images.push(crate::inference::ImageAttachment {
-			data_url: format!("data:{mime};base64,{data}"),
-			mime,
-		});
+		match tokio::task::spawn_blocking(move || crate::images::attachment_from_base64(&data, &mime)).await {
+			Ok(attachment) => images.push(attachment),
+			Err(err) => tracing::warn!(error = %err, "mcp: image encoding task died; dropping the block"),
+		}
 	}
 	images
 }
@@ -876,8 +881,8 @@ rl.on('line', (line) => {
 		assert!(text.contains("image/png"));
 	}
 
-	#[test]
-	fn collect_images_builds_typed_attachments() {
+	#[tokio::test]
+	async fn collect_images_builds_typed_attachments() {
 		let result = json!({
 			"content": [
 				{ "type": "text", "text": "shot taken" },
@@ -885,19 +890,19 @@ rl.on('line', (line) => {
 				{ "type": "image", "data": "" },
 			]
 		});
-		let images = collect_images(&result);
+		let images = collect_images(&result).await;
 		assert_eq!(images.len(), 1, "empty data blocks are skipped");
 		assert_eq!(images[0].mime, "image/png");
 		assert_eq!(images[0].data_url, "data:image/png;base64,QUJD");
 	}
 
-	#[test]
-	fn collect_images_skips_oversized_blocks() {
+	#[tokio::test]
+	async fn collect_images_skips_oversized_blocks() {
 		let big = "A".repeat(IMAGE_MAX_BASE64_CHARS + 1);
 		let result = json!({
 			"content": [{ "type": "image", "mimeType": "image/png", "data": big }]
 		});
-		assert!(collect_images(&result).is_empty());
+		assert!(collect_images(&result).await.is_empty());
 	}
 
 	#[test]

@@ -561,7 +561,7 @@ the workspace has no enabled servers, and neither is mode-gated
   screenshot path feeds straight into `read_file`.
 - **Tool-result images are first-class.** MCP `image` content
   blocks (screenshots) and `read_file` on an image file (png /
-  jpg / gif / webp, ≤ 10 MB) both reach the model as typed image
+  jpg / gif / webp, ≤ 3 MB) both reach the model as typed image
   blocks: the tool result's `"images"` key leaves the JSON text
   projection and is re-attached per provider (Anthropic nested
   `tool_result` blocks; OpenAI-compat `image_url` parts). Images
@@ -570,6 +570,11 @@ the workspace has no enabled servers, and neither is mode-gated
   pixels. The panel and companion render them as thumbnails with
   a full-size lightbox; JSON fallback views strip the `images`
   key so the base64 never dumps into a `<pre>`.
+- **Captured PNGs are re-encoded to lossless WebP** before they
+  enter the history — same pixels, ~40% fewer bytes on every
+  subsequent round-trip. An image is re-sent for the rest of the
+  session, so its bytes are paid once per turn, and the HF router
+  caps a request body at 5 MiB. See [ADR 0049](decisions/0049-image-payload-budget.md).
 - **Lifecycle**: spawned lazily on first use, kept alive across
   turns (a playwright browser session persists between calls),
   killed on disable / remove / IDE exit, respawned on the next call
@@ -1012,6 +1017,28 @@ Pasting images into the composer attaches them as thumbnail chips
 `image_url` data-URL blocks. Persisted on the `User` record
 (`skip_serializing_if` empty, so old transcripts keep their shape)
 and replayed as clickable thumbnails.
+
+### Image byte budget
+
+Vision input is billed per tile, so images are cheap in tokens and
+expensive in bytes — a 1440x900 screenshot runs ~1,700 tokens and
+200-500 kB. Token-triggered compaction therefore cannot see a request
+body filling up with screenshots, and a session can sit far under its
+context window while every request is rejected as too large.
+
+Two mechanisms, both in `crates/moon-coder/src/images.rs`:
+
+- PNG attachments are re-encoded to lossless WebP at capture, once.
+- Past a per-route byte ceiling (HF router only, since that's the
+  route with a 5 MiB body cap), the oldest attachments are dropped
+  from the **outgoing copy** of the history down to a lower floor.
+  The session, its JSONL and the panel keep every image, so raising
+  the budget restores them. The ceiling/floor gap is deliberate:
+  dropping an image rewrites the prompt prefix, so trimming rarely
+  and deeply costs one prompt-cache miss instead of one per
+  screenshot.
+
+Rationale, measurements and rejected encodings: [ADR 0049](decisions/0049-image-payload-budget.md).
 
 ### Compaction
 

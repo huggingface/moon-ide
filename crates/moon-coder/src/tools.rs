@@ -59,7 +59,13 @@ const READ_FILE_MAX_BYTES: usize = 200_000;
 /// providers downscale aggressively past a few megapixels anyway,
 /// so past this we refuse rather than burn the context window on
 /// diminishing returns.
-const IMAGE_MAX_BYTES: usize = 10_000_000;
+///
+/// Also kept under the wire budget's ceiling (ADR 0049) on purpose:
+/// at 3 MB a re-encoded attachment lands around 2.3 MB of base64, so
+/// no single image can exceed the budget by itself. Refusing with a
+/// message the model can act on beats attaching something the
+/// budget then has to drop behind its back.
+const IMAGE_MAX_BYTES: usize = 3_000_000;
 
 /// `bash` stdout/stderr cap. Same rationale as `READ_FILE_MAX_BYTES`
 /// — the model doesn't need megabytes of output to reason about a
@@ -2189,15 +2195,19 @@ impl ToolRegistry {
 				),
 			));
 		}
-		use base64::Engine;
-		let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+		// The text projection reports the *file's* mime and size —
+		// that's what the model asked about. Whether we re-encode for
+		// transport (see `crate::images`) is our business, not
+		// something the model should reason about.
+		let note = format!("[image file — {mime}, {:.1} kB, attached]", bytes.len() as f64 / 1000.0);
+		let mime = mime.to_string();
+		let attachment = tokio::task::spawn_blocking(move || crate::images::attachment_from_bytes(&bytes, &mime))
+			.await
+			.map_err(|err| CoderError::tool_failed("read_file", format!("{path}: image encoding failed: {err}")))?;
 		Ok(json!({
 			"path": path,
-			"content": format!("[image file — {mime}, {:.1} kB, attached]", bytes.len() as f64 / 1000.0),
-			"images": [{
-				"data_url": format!("data:{mime};base64,{data}"),
-				"mime": mime,
-			}],
+			"content": note,
+			"images": [attachment],
 		}))
 	}
 

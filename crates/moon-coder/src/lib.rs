@@ -24,6 +24,7 @@ pub mod error;
 pub mod event;
 pub mod folder_summary;
 pub mod hub_sync;
+mod images;
 pub mod inference;
 pub mod mcp;
 pub mod models;

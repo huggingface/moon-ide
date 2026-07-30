@@ -446,6 +446,13 @@ struct Session {
 	/// without reading the worker's full transcript. `None` until the
 	/// first turn that touches files lands a `TurnDiff`.
 	last_turn_diff: Option<(Vec<String>, String)>,
+	/// Images held back from the wire because the accumulated
+	/// payload crossed the route's budget (ADR 0049). Keyed by
+	/// payload hash, grows only, and deliberately *not* persisted:
+	/// a reopened session starts with a cold prompt cache anyway, so
+	/// re-deciding from scratch costs nothing and a raised budget
+	/// takes effect on reload.
+	elided_images: std::collections::HashSet<u64>,
 }
 
 /// One queued steer waiting to be drained into `session.messages`
@@ -531,6 +538,7 @@ impl Session {
 			todos: Vec::new(),
 			pending_steers: Vec::new(),
 			last_turn_diff: None,
+			elided_images: std::collections::HashSet::new(),
 		}
 	}
 
@@ -2777,6 +2785,7 @@ impl CoderHandle {
 				todos: last_todos,
 				pending_steers: Vec::new(),
 				last_turn_diff: None,
+				elided_images: std::collections::HashSet::new(),
 			};
 			let rt = Arc::new(SessionRuntime::new(session));
 			fs.insert_runtime(id.clone(), rt).await;
@@ -3077,6 +3086,10 @@ impl CoderHandle {
 	}
 
 	pub async fn send(&self, text: String, images: Vec<ImageAttachment>) -> Result<SendTarget, CoderError> {
+		// Shrink pasted screenshots before they enter the history —
+		// they're re-sent on every subsequent round-trip, so this is
+		// the only place it's free (see `crate::images`).
+		let images = crate::images::reencode_all(images).await;
 		// Bail early if the active route can't authenticate —
 		// surface a clean error instead of letting the inference
 		// layer fail on the first request. HF needs OAuth; user
@@ -3622,6 +3635,7 @@ impl CoderHandle {
 	/// already running, the message is queued as a steer (same as a
 	/// user steering a visible session).
 	pub async fn send_to(&self, session_id: &str, text: String, images: Vec<ImageAttachment>) -> Result<(), CoderError> {
+		let images = crate::images::reencode_all(images).await;
 		self.ensure_can_send().await?;
 		let Some((rt, folder_path)) = self.state.runtime_for_session(session_id).await else {
 			return Err(CoderError::Internal(format!(
@@ -4617,6 +4631,30 @@ async fn run_turn(
 					session.persisted_records = session.persisted_records.saturating_add(1);
 				}
 			}
+		}
+
+		// Image budget (ADR 0049). Screenshots are cheap in tokens
+		// and expensive in bytes, so compaction — which triggers on
+		// the token count — never sees them coming. This trims the
+		// oldest attachments off the *wire copy* once they pile up;
+		// `session.messages` keeps them all, so the panel and a
+		// later reload are unaffected.
+		if let Some(budget) = state.inference.image_wire_budget().await {
+			let elided = {
+				let mut session = rt.session.lock().await;
+				let mut marked = std::mem::take(&mut session.elided_images);
+				let newly = crate::images::plan_elision(&messages, budget, &mut marked);
+				if newly > 0 {
+					tracing::info!(
+						newly,
+						total = marked.len(),
+						"image payload over budget; dropping the oldest attachments from the prompt"
+					);
+				}
+				session.elided_images = marked;
+				session.elided_images.clone()
+			};
+			crate::images::apply_elision(&mut messages, &elided);
 		}
 
 		// Resume-from-checkpoint: on the first iteration only,
@@ -8043,18 +8081,35 @@ fn maybe_emit_stream_usage(
 	});
 }
 
-/// Rough byte-count of every chat message — covers system / user /
-/// assistant / tool. Includes `tool_calls` argument strings since
-/// those land in the prompt verbatim and can be substantial when
-/// the model emits long structured arguments. Image attachments
-/// add their data-URL length to the count: the bytes/4 estimate
-/// is still a coarse approximation for vision tokens (providers
-/// typically charge per tile or a fixed amount per image rather
-/// than by base64 length), but counting *something* keeps a
-/// freshly pasted screenshot from looking free until the
-/// provider's first usage chunk lands.
+/// Flat per-image token cost for the estimate. Vision input is
+/// billed per tile, not per byte: the 1440x900 screenshots in a
+/// measured session cost ~1,730 tokens each whether their base64 ran
+/// 90 kB or 500 kB. The old bytes/4 rule counted the data URL and so
+/// overstated one screenshot by more than 10x — enough to make the
+/// context ring jump ~24k tokens the instant an image landed, which
+/// is what sent us looking for a context bug that wasn't there
+/// (ADR 0049).
+const IMAGE_TOKENS: u32 = 1_700;
+
+/// Rough token estimate for a chat history — covers system / user /
+/// assistant / tool. Text goes at bytes/4, which undercounts what a
+/// real tokenizer sees on code and JSON; images go at a flat
+/// [`IMAGE_TOKENS`] each. Only used until the provider's own usage
+/// numbers land (and to seed the compaction guard right after a
+/// compaction, where there is no fresh usage yet).
 pub(crate) fn estimate_prompt_tokens(messages: &[ChatMessage]) -> u32 {
-	(message_bytes(messages) / 4) as u32
+	let text = (message_bytes(messages) / 4) as u32;
+	text.saturating_add(IMAGE_TOKENS.saturating_mul(image_count(messages)))
+}
+
+fn image_count(messages: &[ChatMessage]) -> u32 {
+	messages
+		.iter()
+		.map(|message| match message {
+			ChatMessage::User { images, .. } | ChatMessage::Tool { images, .. } => images.len() as u32,
+			_ => 0,
+		})
+		.sum()
 }
 
 /// Pre-call prompt-token estimate that anchors on the last turn's
@@ -8095,7 +8150,7 @@ fn estimate_prompt_with_anchor(last_usage: Option<&TokenUsage>, messages: &[Chat
 		return estimate_prompt_tokens(messages);
 	};
 	let tail = &messages[last_assistant_idx + 1..];
-	let tail_estimate = (message_bytes(tail) / 4) as u32;
+	let tail_estimate = estimate_prompt_tokens(tail);
 	last
 		.prompt_tokens
 		.saturating_add(last.completion_tokens)
@@ -8107,12 +8162,9 @@ fn message_bytes(messages: &[ChatMessage]) -> usize {
 	for msg in messages {
 		match msg {
 			ChatMessage::System { content } => bytes += content.len(),
-			ChatMessage::User { content, images } => {
-				bytes += content.len();
-				for img in images {
-					bytes += img.data_url.len();
-				}
-			}
+			// Image payloads are counted per attachment by
+			// `estimate_prompt_tokens`, not by their base64 length.
+			ChatMessage::User { content, images: _ } => bytes += content.len(),
 			ChatMessage::Assistant {
 				content, tool_calls, ..
 			} => {
@@ -8125,13 +8177,10 @@ fn message_bytes(messages: &[ChatMessage]) -> usize {
 			ChatMessage::Tool {
 				tool_call_id,
 				content,
-				images,
+				images: _,
 			} => {
 				bytes += tool_call_id.len();
 				bytes += content.len();
-				for img in images {
-					bytes += img.data_url.len();
-				}
 			}
 		}
 	}
