@@ -24,6 +24,11 @@ pub struct AppInfo {
 	/// `None` in preboot mode and as a defensive fallback
 	/// when the catalog and the CLI arg disagree.
 	pub workspace_name: Option<String>,
+	/// User-chosen badge colour as `#rrggbb`, mirrored from the
+	/// catalog so the frontend can tint the chrome (ADR 0047)
+	/// without a second IPC. `None` means "use the deterministic
+	/// hash-derived hue". `None` in preboot mode.
+	pub workspace_color: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]

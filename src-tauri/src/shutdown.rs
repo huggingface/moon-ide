@@ -21,10 +21,10 @@
 
 use camino::Utf8PathBuf;
 use moon_container::{ProjectCompose, Workspace as ContainerWorkspace, WorkspaceConfig};
-use moon_protocol::container::{ContainerState, ContainerStateChange, ProjectComposeStateChange, ProjectComposeStatus};
+use moon_protocol::container::{ContainerState, ProjectComposeStateChange, ProjectComposeStatus};
 use tauri::{AppHandle, Emitter};
 
-use crate::commands::container::CONTAINER_STATE_EVENT;
+use crate::commands::container::{emit_container_state, reapply_persisted_forwards};
 use crate::commands::project_compose::PROJECT_COMPOSE_STATE_EVENT;
 use crate::state::AppState;
 
@@ -190,7 +190,15 @@ pub async fn auto_resume_shell(app: &AppHandle, state: &AppState) {
 		// `container.refresh()` — which races with this task
 		// and may have grabbed a stale `Absent` before the
 		// daemon had any state to report — gets the truth.
-		emit_container_state(app, status);
+		emit_container_state(app, &status);
+		// A shell that survived the IDE restart kept its proxy
+		// sidecar (it has its own lifecycle), so this is
+		// normally a cheap stop-and-recreate of an identical
+		// sidecar. What it actually covers is the drift cases:
+		// the daemon itself restarted (sidecar is `--rm`, so
+		// it's gone while `dev` may still be `Running`), or the
+		// sidecar died on its own.
+		reapply_persisted_forwards(app, state, &status).await;
 		return;
 	}
 
@@ -204,16 +212,16 @@ pub async fn auto_resume_shell(app: &AppHandle, state: &AppState) {
 	// event the frontend's startup `container.refresh()` racing
 	// with us would leave the pip on its pre-setup snapshot
 	// until the next focus event or popover open.
+	//
+	// `compose stop` leaves the proxy sidecar alive but pointing
+	// at a dead dev; the fresh shell is up now, so re-wire the
+	// persisted forwards before the user notices they 404.
 	match shell.status().await {
-		Ok(status) => emit_container_state(app, status),
+		Ok(status) => {
+			emit_container_state(app, &status);
+			reapply_persisted_forwards(app, state, &status).await;
+		}
 		Err(err) => tracing::warn!(error = %err, "auto_resume_shell: post-resume status query failed"),
-	}
-}
-
-fn emit_container_state(app: &AppHandle, status: moon_protocol::container::ContainerStatus) {
-	let payload = ContainerStateChange { status };
-	if let Err(err) = app.emit(CONTAINER_STATE_EVENT, &payload) {
-		tracing::warn!(error = %err, "auto_resume_shell: failed to emit container:state");
 	}
 }
 

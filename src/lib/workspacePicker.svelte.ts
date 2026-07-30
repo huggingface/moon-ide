@@ -16,6 +16,7 @@ import { ipc } from './ipc';
 import { formatError } from './protocol';
 import type { WorkspaceMeta } from './protocol';
 import { currentWorkspaceId } from './workspace-id';
+import { applyWorkspaceAccent } from './workspaceTheme';
 
 class WorkspacePickerStore {
 	visible = $state(false);
@@ -100,9 +101,18 @@ class WorkspacePickerStore {
 		const previous = meta.color ?? null;
 		const next = color.trim().length === 0 ? null : color.trim();
 		this.entries = this.entries.map((m) => (m.id === meta.id ? { ...m, color: next } : m));
+		// Re-tint the chrome live when the recoloured workspace is
+		// the one this process owns — same optimistic semantics as
+		// the swatch above.
+		if (meta.id === currentWorkspaceId()) {
+			applyWorkspaceAccent(meta.id, next);
+		}
 		try {
 			await ipc.workspaces.setColor(meta.id, next ?? '');
 		} catch (err) {
+			if (meta.id === currentWorkspaceId()) {
+				applyWorkspaceAccent(meta.id, previous);
+			}
 			this.error = formatError(err);
 			this.entries = this.entries.map((m) => (m.id === meta.id ? { ...m, color: previous } : m));
 		}

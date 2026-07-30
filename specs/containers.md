@@ -452,7 +452,10 @@ Forwards persist per-workspace in `session.json` as
 `teardown` stops the sidecar before `compose down` (Docker refuses
 to remove a network with active endpoints); `stop` leaves it
 running (a connection-refused proxy correctly shows "forward up,
-server down"); setup/rebuild re-apply the persisted set.
+server down"); setup/rebuild re-apply the persisted set, and the
+startup auto-resume re-applies too — it runs whether the shell was
+`Stopped` or already `Running`, which covers sidecar drift (a
+daemon restart removes the `--rm` sidecar while `dev` survives).
 
 ### Conflict handling
 

@@ -322,12 +322,15 @@
 	.bar:last-of-type {
 		border-bottom: none;
 	}
-	/* Active folder: an accent-tinted fill + a solid accent spine on
-	   the left edge. The old 3%-white wash was barely distinguishable
-	   from the inactive grey — especially for the muted worktree rows. */
+	/* Active folder: a workspace-tinted fill + a solid spine on the
+	   left edge. `--m-ws-accent` carries the workspace's identity
+	   colour (ADR 0047) — this is the strongest "which workspace am
+	   I in" signal since the bar sits at the top of the sidebar.
+	   The old 3%-white wash was barely distinguishable from the
+	   inactive grey — especially for the muted worktree rows. */
 	.bar.active {
-		background: color-mix(in srgb, var(--m-accent) 14%, transparent);
-		box-shadow: inset 2px 0 0 var(--m-accent);
+		background: var(--m-ws-accent-soft);
+		box-shadow: inset 2px 0 0 var(--m-ws-accent);
 	}
 	/* Worktree-backed session folders (ADR 0028) render nested under
 	   their parent: indented, muted, with a branch glyph. */

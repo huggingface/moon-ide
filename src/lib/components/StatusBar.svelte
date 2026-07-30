@@ -665,7 +665,11 @@
 		right: 0;
 		height: 24px;
 		background: var(--m-bg-1);
-		border-top: 1px solid var(--m-border);
+		/* The 2px workspace-coloured stripe is the status bar's share
+		   of the identity tint (ADR 0047): always visible, far from
+		   the red/green git + diagnostics pips it must not compete
+		   with, and quieter than tinting the whole bar. */
+		border-top: 2px solid var(--m-ws-accent);
 		display: flex;
 		align-items: center;
 		justify-content: space-between;

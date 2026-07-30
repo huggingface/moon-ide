@@ -18,4 +18,11 @@ workspaceId: string | null,
  * `None` in preboot mode and as a defensive fallback
  * when the catalog and the CLI arg disagree.
  */
-workspaceName: string | null, };
+workspaceName: string | null, 
+/**
+ * User-chosen badge colour as `#rrggbb`, mirrored from the
+ * catalog so the frontend can tint the chrome (ADR 0047)
+ * without a second IPC. `None` means "use the deterministic
+ * hash-derived hue". `None` in preboot mode.
+ */
+workspaceColor: string | null, };

@@ -92,6 +92,10 @@ export type AppInfo = {
 	mode: AppInfoMode;
 	workspaceId: WorkspaceId | null;
 	workspaceName: string | null;
+	/** User-chosen badge colour as `#rrggbb`; `null` means the
+	 * deterministic hash-derived hue. Feeds the chrome tint
+	 * (ADR 0047). */
+	workspaceColor: string | null;
 };
 
 /**

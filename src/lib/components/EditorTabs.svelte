@@ -612,7 +612,11 @@
 	.tab.active {
 		background: var(--m-bg);
 		color: var(--m-fg);
-		box-shadow: inset 0 -2px 0 var(--m-accent);
+		/* Workspace identity tint rather than the neutral accent —
+		   the active tab sits dead-centre in the user's view, so
+		   it's the cheapest always-on "which workspace" reminder
+		   (ADR 0047). */
+		box-shadow: inset 0 -2px 0 var(--m-ws-accent);
 	}
 	/* Same tab is "active" in the unfocused split: keep the body
 	highlighted (so the user can still tell which tab is current over

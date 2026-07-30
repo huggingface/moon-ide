@@ -56,11 +56,18 @@ async fn workspace_handle(state: &AppState) -> Result<ContainerWorkspace, MoonEr
 /// event. Called by every mutating command after it completes.
 async fn snapshot_and_emit(app: &AppHandle, container: &ContainerWorkspace) -> Result<ContainerStatus, MoonError> {
 	let status = container.status().await?;
+	emit_container_state(app, &status);
+	Ok(status)
+}
+
+/// Broadcast a `container:state` event for an already-fetched
+/// status. Shared with the startup auto-resume path, which owns
+/// its status query rather than going through a mutating command.
+pub(crate) fn emit_container_state(app: &AppHandle, status: &ContainerStatus) {
 	let payload = ContainerStateChange { status: status.clone() };
 	if let Err(err) = app.emit(CONTAINER_STATE_EVENT, &payload) {
 		tracing::warn!(error = %err, "failed to emit container:state");
 	}
-	Ok(status)
 }
 
 /// Drop any live LSP broker after a container mutation. The next
@@ -76,12 +83,12 @@ async fn reset_lsp_broker(state: &AppState) {
 /// Re-apply the persisted port-forward set after a workspace
 /// lifecycle event that may have torn the proxy sidecar down
 /// (setup post-teardown, rebuild, apply_bound_folders triggering
-/// a dev recreate). Best-effort: failures are logged at `warn`
-/// and don't fail the underlying lifecycle command — the user
-/// can retry from the Ports panel. Skipped when the workspace
-/// shell isn't running yet (we don't want to spin up a sidecar
-/// pointing at a stopped dev).
-async fn reapply_persisted_forwards(app: &AppHandle, state: &AppState, status: &ContainerStatus) {
+/// a dev recreate, startup auto-resume). Best-effort: failures
+/// are logged at `warn` and don't fail the underlying lifecycle
+/// command — the user can retry from the Ports panel. Skipped
+/// when the workspace shell isn't running (we don't want to spin
+/// up a sidecar pointing at a stopped dev).
+pub(crate) async fn reapply_persisted_forwards(app: &AppHandle, state: &AppState, status: &ContainerStatus) {
 	if !matches!(status.state, ContainerState::Running) {
 		return;
 	}

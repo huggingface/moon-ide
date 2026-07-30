@@ -71,6 +71,20 @@
 	--m-warning: #f0b86e;
 	--m-danger: #ff7a8a;
 
+	/* Workspace identity tint (ADR 0047). Filled in by JS at boot
+	   (`applyWorkspaceAccent` in `lib/workspaceTheme.ts`) from the
+	   workspace's badge colour; the fallbacks below only cover the
+	   brief pre-hydrate window and the vitest environment. The
+	   `.light` class swaps in the `*-light` variants — both are
+	   written up-front so a theme flip is a pure CSS change.
+	   Identity surfaces only: folder bars, editor tabs, status bar.
+	   Deliberately *not* `--m-syntax-*` — code readability stays
+	   palette-owned. */
+	--m-ws-accent: var(--m-accent);
+	--m-ws-accent-soft: rgba(126, 163, 255, 0.22);
+	--m-ws-accent-light: var(--m-accent);
+	--m-ws-accent-soft-light: rgba(67, 96, 200, 0.16);
+
 	/* Inline code accent — used by chat / Slack messages only.
 	   Distinct from `--m-fg` so `\`code\`` reads as a token at a
 	   glance; matches Slack's soft pink-red pill. The Markdown
@@ -158,6 +172,9 @@
 
 :root.light {
 	color-scheme: light;
+	/* Workspace tint light variants (see the dark block above). */
+	--m-ws-accent: var(--m-ws-accent-light);
+	--m-ws-accent-soft: var(--m-ws-accent-soft-light);
 	--m-bg: #fafbfd;
 	--m-bg-1: #f1f3f8;
 	--m-bg-2: #e9edf5;

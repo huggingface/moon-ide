@@ -19,14 +19,16 @@ pub async fn app_info(state: State<'_, AppState>) -> Result<AppInfo, MoonError> 
 			mode: AppInfoMode::Preboot,
 			workspace_id: None,
 			workspace_name: None,
+			workspace_color: None,
 		}),
 		AppMode::Workspace { id } => {
 			let catalog = moon_core::app_state::load(&state.config_dir).await?;
-			let name = catalog.workspaces.iter().find(|m| &m.id == id).map(|m| m.name.clone());
+			let meta = catalog.workspaces.iter().find(|m| &m.id == id);
 			Ok(AppInfo {
 				mode: AppInfoMode::Workspace,
 				workspace_id: Some(id.clone()),
-				workspace_name: name,
+				workspace_name: meta.map(|m| m.name.clone()),
+				workspace_color: meta.and_then(|m| m.color.clone()),
 			})
 		}
 	}
