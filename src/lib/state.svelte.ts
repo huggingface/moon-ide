@@ -4742,32 +4742,47 @@ class WorkspaceState {
 		}
 		const existing = this.openFiles.find((f) => f.path === absolutePath);
 		if (!existing) {
-			let result;
-			try {
-				result = await ipc.fs.readFileHost(absolutePath);
-			} catch (err) {
-				this.flash(`Failed to open ${absolutePath}: ${formatError(err)}`);
-				return;
+			// Images / PDFs can't ride the text loader, and the
+			// asset protocol `loadPreviewFile` uses is host-only —
+			// so external previews come back as a `data:` URL from
+			// a command that also knows how to read a
+			// container-only path (an agent's screenshot under
+			// `/tmp`, say).
+			const kind = fileKindFor(absolutePath);
+			if (kind === 'image' || kind === 'pdf') {
+				const external = await this.loadExternalPreviewFile(absolutePath, kind);
+				if (!external) {
+					return;
+				}
+				this.openFiles = [...this.openFiles, external];
+			} else {
+				let result;
+				try {
+					result = await ipc.fs.readFileHost(absolutePath);
+				} catch (err) {
+					this.flash(`Failed to open ${absolutePath}: ${formatError(err)}`);
+					return;
+				}
+				if (result.is_binary) {
+					this.flash(`Cannot open binary file: ${absolutePath}`);
+					return;
+				}
+				const file: OpenFile = {
+					path: absolutePath,
+					name: basename(absolutePath),
+					kind: 'text',
+					isUntitled: false,
+					text: result.text,
+					previewUrl: '',
+					loadedFingerprint: fingerprint(result.text),
+					loadedMtimeMs: result.mtime_ms,
+					isDirty: false,
+					isDeleted: false,
+					isExternal: true,
+					pendingEdit: null,
+				};
+				this.openFiles = [...this.openFiles, file];
 			}
-			if (result.is_binary) {
-				this.flash(`Cannot open binary file: ${absolutePath}`);
-				return;
-			}
-			const file: OpenFile = {
-				path: absolutePath,
-				name: basename(absolutePath),
-				kind: 'text',
-				isUntitled: false,
-				text: result.text,
-				previewUrl: '',
-				loadedFingerprint: fingerprint(result.text),
-				loadedMtimeMs: result.mtime_ms,
-				isDirty: false,
-				isDeleted: false,
-				isExternal: true,
-				pendingEdit: null,
-			};
-			this.openFiles = [...this.openFiles, file];
 		}
 		const tabs = this.tabsFor(side);
 		if (!tabs.includes(absolutePath)) {
@@ -4947,6 +4962,38 @@ class WorkspaceState {
 			isDirty: false,
 			isDeleted: false,
 			isExternal: false,
+			pendingEdit: null,
+		};
+	}
+
+	// Same read-only preview buffer for an image / PDF **outside**
+	// every bound folder. The asset protocol can't serve these (it
+	// resolves against the workspace root, and it only ever reads
+	// the host filesystem), so the bytes arrive inline as a `data:`
+	// URL — see `fs_read_preview_host`, which reads the host first
+	// and falls back to the workspace container for a path that
+	// only exists in there. `null` on failure, with the reason
+	// flashed.
+	private async loadExternalPreviewFile(absolutePath: string, kind: 'image' | 'pdf'): Promise<OpenFile | null> {
+		let dataUrl: string;
+		try {
+			dataUrl = await ipc.fs.readPreviewHost(absolutePath);
+		} catch (err) {
+			this.flash(`Failed to open ${absolutePath}: ${formatError(err)}`);
+			return null;
+		}
+		return {
+			path: absolutePath,
+			name: basename(absolutePath),
+			kind,
+			isUntitled: false,
+			text: '',
+			previewUrl: dataUrl,
+			loadedFingerprint: fingerprint(''),
+			loadedMtimeMs: null,
+			isDirty: false,
+			isDeleted: false,
+			isExternal: true,
 			pendingEdit: null,
 		};
 	}

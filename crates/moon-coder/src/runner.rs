@@ -711,6 +711,7 @@ impl CoderHandle {
 		coder_sessions_dir: Utf8PathBuf,
 		folder_summaries_dir: Utf8PathBuf,
 		initial_models: CoderModels,
+		terminals: Arc<moon_terminal::TerminalRegistry>,
 	) -> Result<Self, CoderError> {
 		let auth = Authenticator::new()?;
 		// Warm the per-provider keyring from the persisted
@@ -732,7 +733,7 @@ impl CoderHandle {
 		let models = models::shared(initial_models);
 		let inference = InferenceClient::new(auth.clone(), models.clone(), provider_keys.clone())?;
 		let web = crate::web::WebClient::new()?;
-		let tools = ToolRegistry::new(workspaces.clone(), workspaces_dir.clone(), web);
+		let tools = ToolRegistry::new(workspaces.clone(), workspaces_dir.clone(), web, terminals);
 		let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 		let folder_summaries = Arc::new(FolderSummaryService::new(folder_summaries_dir));
 		let hub_sync = crate::hub_sync::HubSync::new(
@@ -4477,6 +4478,10 @@ async fn run_turn(
 	// has enabled servers, so the model never sees a surface that
 	// is guaranteed to error.
 	tool_defs.extend(state.tools.mcp_definitions().await);
+	// Terminal inspection (ADR 0048): present only while this
+	// project has a terminal open, so an agent can read the dev
+	// server the user already started instead of racing it.
+	tool_defs.extend(state.tools.terminal_definitions(&cx).await);
 	if mode.allows_task_tool() {
 		tool_defs.push(task_tool_definition());
 	}

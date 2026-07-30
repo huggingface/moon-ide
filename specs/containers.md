@@ -380,6 +380,13 @@ propagates through `docker exec` so resize works in one hop. On IDE
 quit, every terminal supervisor is aborted first so no orphaned
 exec sessions outlive the process.
 
+Open terminals — either target — are also registered with the
+project they were opened for and keep a bounded ring of their
+output, which is what the coder's read-only `list_terminals` /
+`read_terminal` tools serve
+([ADR 0048](decisions/0048-coder-reads-terminals.md),
+[coder.md § Reading the user's terminals](coder.md#reading-the-users-terminals)).
+
 ## What runs where
 
 | Concern                                        | Host (Tauri / moon-ide proper)             | Workspace `dev` container | Project service containers                                                                                                                                            |

@@ -1,4 +1,4 @@
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use moon_core::{read_host_file, write_host_file};
 use moon_protocol::fs::{CollectPathsResult, DirEntry, ReadFileResult, StatResult, WriteFileResult};
 use moon_protocol::git::{
@@ -105,6 +105,58 @@ pub async fn fs_write_file(
 pub async fn fs_read_file_host(path: String) -> Result<ReadFileResult, MoonError> {
 	let path = Utf8PathBuf::from(path);
 	read_host_file(&path).await
+}
+
+/// Largest binary we'll inline as a `data:` URL for preview. The
+/// in-workspace path streams from disk via the Tauri asset
+/// protocol and has no such limit; this one pays base64 in memory,
+/// so cap it rather than wedge the webview on a 200 MB PDF.
+const PREVIEW_MAX_BYTES: usize = 25_000_000;
+
+/// Read an image / PDF at an absolute path **outside** every bound
+/// folder and return it as a `data:` URL the webview can render.
+///
+/// In-workspace previews don't come through here — they use
+/// `convertFileSrc` (the Tauri asset protocol), which streams from
+/// disk. That protocol is host-only, though, so it can't serve a
+/// file that exists solely inside the workspace container; this
+/// command routes through the active folder's `WorkspaceHost`,
+/// which falls back to `docker exec cat` in that case.
+#[tauri::command]
+pub async fn fs_read_preview_host(state: State<'_, AppState>, path: String) -> Result<String, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	let abs = Utf8PathBuf::from(&path);
+	let mime = preview_mime(&abs).ok_or_else(|| MoonError::invalid(format!("{path}: not a previewable image or PDF")))?;
+	let bytes = entry.host.read_preview_bytes(&abs).await?;
+	if bytes.len() > PREVIEW_MAX_BYTES {
+		return Err(MoonError::invalid(format!(
+			"{path}: {:.1} MB is over the {:.0} MB preview limit",
+			bytes.len() as f64 / 1_000_000.0,
+			PREVIEW_MAX_BYTES as f64 / 1_000_000.0
+		)));
+	}
+	let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
+	Ok(format!("data:{mime};base64,{encoded}"))
+}
+
+/// Extension → MIME for the types the preview views render. Mirrors
+/// `src/lib/util/fileKind.ts`'s `IMAGE_EXTS` (plus `pdf`) — keep the
+/// two in step, or the frontend will route a file here that we then
+/// refuse.
+fn preview_mime(path: &Utf8Path) -> Option<&'static str> {
+	let ext = path.extension()?.to_ascii_lowercase();
+	Some(match ext.as_str() {
+		"png" => "image/png",
+		"jpg" | "jpeg" => "image/jpeg",
+		"gif" => "image/gif",
+		"webp" => "image/webp",
+		"svg" => "image/svg+xml",
+		"bmp" => "image/bmp",
+		"ico" => "image/x-icon",
+		"avif" => "image/avif",
+		"pdf" => "application/pdf",
+		_ => return None,
+	})
 }
 
 /// Companion to [`fs_read_file_host`] — saves an external buffer back to
@@ -583,4 +635,44 @@ pub async fn fs_git_log(state: State<'_, AppState>, limit: Option<u32>) -> Resul
 pub async fn fs_git_commit_diff(state: State<'_, AppState>, sha: String) -> Result<Option<CommitDiff>, MoonError> {
 	let entry = state.workspaces.require_active_folder().await?;
 	entry.host.git_commit_diff(&sha).await
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// The mapping must stay in step with `fileKindFor` in
+	/// `src/lib/util/fileKind.ts` — the frontend only routes a path
+	/// here when *it* thinks the file is an image or a PDF, so a
+	/// gap here surfaces as "not a previewable image or PDF" on a
+	/// file the tab bar happily opened.
+	#[test]
+	fn preview_mime_covers_every_frontend_preview_extension() {
+		for (name, expected) in [
+			("a.png", "image/png"),
+			("a.jpg", "image/jpeg"),
+			("a.jpeg", "image/jpeg"),
+			("a.gif", "image/gif"),
+			("a.webp", "image/webp"),
+			("a.svg", "image/svg+xml"),
+			("a.bmp", "image/bmp"),
+			("a.ico", "image/x-icon"),
+			("a.avif", "image/avif"),
+			("a.pdf", "application/pdf"),
+		] {
+			assert_eq!(
+				preview_mime(Utf8Path::new(name)),
+				Some(expected),
+				"missing mapping for {name}"
+			);
+		}
+	}
+
+	#[test]
+	fn preview_mime_is_case_insensitive_and_rejects_other_types() {
+		assert_eq!(preview_mime(Utf8Path::new("/tmp/Shot.PNG")), Some("image/png"));
+		assert_eq!(preview_mime(Utf8Path::new("a.rs")), None);
+		assert_eq!(preview_mime(Utf8Path::new("a.mp4")), None);
+		assert_eq!(preview_mime(Utf8Path::new("noext")), None);
+	}
 }

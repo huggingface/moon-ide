@@ -352,6 +352,8 @@ implementations are typed Rust:
 | `bash`           | `(cmd, timeout_ms?, detach?) -> { cmd, target, stdout, stderr, exit_code } \| { detached, id, pid, log_path, cmd, target }` | `docker exec … bash -c` when the workspace shell container is `Running`, else host `bash -lc` — same probe terminals and LSP use, with a per-session force-host override ([ADR 0022](decisions/0022-coder-host-mode-override.md)) read live at dispatch time, so a mid-turn toggle re-routes the next command ([ADR 0041](decisions/0041-live-host-mode-toggle.md)). `target` echoes `"host"` / `"container"`. `detach: true` spawns a background process and returns immediately with an `id` — see [ADR 0034](decisions/0034-detached-background-processes.md). |
 | `read_process`   | `(id, wait_ms?, tail_bytes?) -> { id, running, exit_code, tail, cmd, target }`                                              | Poll a detached background process. Tails the log file; `wait_ms` blocks until exit (capped 60 s). See [ADR 0034](decisions/0034-detached-background-processes.md).                                                                                                                                                                                                                                                                                                                                                                                               |
 | `stop_process`   | `(id) -> { id, killed, exit_code, cmd, target }`                                                                            | Kill a detached background process if still running. See [ADR 0034](decisions/0034-detached-background-processes.md).                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `list_terminals` | `() -> { folder, count, terminals[] }`                                                                                      | The user's open terminals **for this project**. Only advertised when there's at least one. See [§ Reading the user's terminals](#reading-the-users-terminals).                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `read_terminal`  | `(id, lines?) -> { id, target, cwd, running, exit_code, lines_returned, truncated, output }`                                | Rendered tail of one terminal's output. Read-only; same gating as `list_terminals`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `task`           | `(task, folder?, mode?, system_prompt?) -> { result, sub_session_id, tokens_used_estimate, mode, iterations_used }`         | Delegates to a sub-agent — see [§ Sub-agents](#sub-agents). Parent-only; up to 4 run in parallel.                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `web_search`     | `(query, max_results?) -> { query, results, count }`                                                                        | Tavily SERP. Only advertised when a key is configured. See [§ Web search](#web-search).                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `web_fetch`      | `(url) -> { url, markdown, truncated, bytes }`                                                                              | Jina Reader markdown extraction; `http`/`https` only, 200 kB cap. Always available.                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
@@ -453,6 +455,42 @@ tools with side effects.
 Prompt guidance: not for clarification the agent could resolve by
 reading files, and not as a "should I proceed?" confirmation — only
 for genuine forks where the user's intent is the missing input.
+
+### Reading the user's terminals
+
+`list_terminals` / `read_terminal` let a session see the terminals
+the user has open **for its own project** and read what they
+printed ([ADR 0048](decisions/0048-coder-reads-terminals.md)), so
+"the dev server is erroring" is answerable by reading the dev
+server instead of starting a second one through `bash`.
+
+- **Read-only.** There is no write / resize / close counterpart:
+  the agent runs its own commands with `bash` (`detach` for long
+  ones), and the user's terminals stay the user's.
+- **Folder-scoped.** Every terminal is tagged at open time with
+  the bound folder it was opened for; both tools only see
+  terminals matching the session's routing folder, so a worktree
+  session sees its worktree's terminals and not its parent's. A
+  terminal from another project is refused like an unknown id,
+  listing this project's ids for recovery. Sub-agents get the same
+  surface against their own target folder.
+- **Advertised only while the project has a terminal open** (same
+  posture as the MCP meta-tools). The tool list is rebuilt every
+  turn, so they appear as soon as the user opens one.
+- **Output is what's on screen.** Each terminal keeps a bounded
+  ring of raw PTY bytes (256 kB) which a read replays through a
+  throwaway terminal emulator: escape sequences applied,
+  `\r`-redrawn progress lines collapsed to their final state. The
+  UI's own xterm.js scrollback is larger and independent, so a
+  read can reach less far back than the user can scroll.
+- **Lifetime is the tab's.** A terminal whose shell exited stays
+  readable (`running: false` plus its exit code) and is dropped
+  when the tab closes.
+- Reads default to 200 lines, capped at 2000 lines / 100 kB per
+  call, with `truncated` set when anything was dropped. Terminals
+  can hold output the user didn't mean to share; the tool
+  description says so and tells the model not to quote back more
+  than the task needs.
 
 ### Web search
 

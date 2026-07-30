@@ -30,7 +30,9 @@ use moon_core::{WorkspaceFolderEntry, WorkspaceRegistry};
 use moon_protocol::container::ContainerState;
 use moon_protocol::fs::{DirEntry, EntryKind, ReadFileResult, WriteFileResult};
 use moon_protocol::search::{ContentSearchHit, ContentSearchOptions};
-use moon_terminal::{container_name_for_workspace, TerminalTarget};
+use moon_terminal::{
+	container_name_for_workspace, TerminalRegistry, TerminalTarget, DEFAULT_READ_LINES, MAX_READ_LINES,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -718,6 +720,22 @@ fn read_tail(path: &Path, max_bytes: usize) -> String {
 	String::from_utf8_lossy(&buf[..cut]).into_owned()
 }
 
+/// Shared JSON shape for one terminal, used by both
+/// `list_terminals` rows and the `read_terminal` result so the
+/// model sees the same field names either way.
+fn terminal_info_json(info: &moon_terminal::TerminalInfo) -> Value {
+	json!({
+		"id": info.id,
+		"target": info.kind.as_str(),
+		"cwd": info.cwd,
+		"cols": info.cols,
+		"rows": info.rows,
+		"running": info.running,
+		"exit_code": info.exit_code,
+		"buffered_bytes": info.buffered_bytes,
+	})
+}
+
 /// Tools are dispatched by name. The registry holds the JSON-schema
 /// descriptors handed to the LLM, the workspace registry the runtime
 /// needs to resolve container state for `bash`, the workspaces
@@ -731,15 +749,25 @@ pub struct ToolRegistry {
 	workspaces_dir: Utf8PathBuf,
 	web: WebClient,
 	mcp: Arc<McpManager>,
+	/// The IDE's open terminal tabs, shared from the Tauri layer so
+	/// `list_terminals` / `read_terminal` see exactly what the user
+	/// sees (ADR 0048).
+	terminals: Arc<TerminalRegistry>,
 }
 
 impl ToolRegistry {
-	pub fn new(workspaces: Arc<WorkspaceRegistry>, workspaces_dir: Utf8PathBuf, web: WebClient) -> Self {
+	pub fn new(
+		workspaces: Arc<WorkspaceRegistry>,
+		workspaces_dir: Utf8PathBuf,
+		web: WebClient,
+		terminals: Arc<TerminalRegistry>,
+	) -> Self {
 		Self {
 			workspaces,
 			workspaces_dir,
 			web,
 			mcp: Arc::new(McpManager::default()),
+			terminals,
 		}
 	}
 
@@ -1271,6 +1299,128 @@ impl ToolRegistry {
 		]
 	}
 
+	/// Terminal-inspection tools, advertised only when the session's
+	/// own project actually has a terminal open (ADR 0048).
+	///
+	/// Gated for the same reason the MCP meta-tools are: with no
+	/// terminals the pair can only answer "there are none", and an
+	/// always-present `list_terminals` invites the model to burn a
+	/// round-trip discovering that. The flip side is that the tools
+	/// appear mid-session the moment the user opens a terminal —
+	/// the tool list is rebuilt every turn, so that lands without
+	/// any special handling.
+	///
+	/// Scope is the session's folder: a worktree session sees its
+	/// worktree's terminals, its parent project's are somebody
+	/// else's business.
+	pub async fn terminal_definitions(&self, cx: &ToolContext) -> Vec<ToolDefinition> {
+		let folder = Utf8Path::new(cx.folder.folder.path.as_str());
+		let open = self.terminals.list_for_folder(folder).await;
+		if open.is_empty() {
+			return Vec::new();
+		}
+		let inventory = open
+			.iter()
+			.map(|t| {
+				let state = match (t.running, t.exit_code) {
+					(true, _) => "running".to_owned(),
+					(false, Some(code)) => format!("exited {code}"),
+					(false, None) => "exited".to_owned(),
+				};
+				format!("- `{}` — {} shell in `{}` ({state})", t.id, t.kind.as_str(), t.cwd)
+			})
+			.collect::<Vec<_>>()
+			.join("\n");
+		vec![
+			ToolDefinition::function(
+				"list_terminals",
+				format!(
+					"List the terminals the user has open for this project, with each one's shell target, working directory, and whether its shell is still running. Use this to find the id to pass to `read_terminal`.\n\nCurrently open:\n{inventory}"
+				),
+				json!({
+					"type": "object",
+					"properties": {}
+				}),
+			),
+			ToolDefinition::function(
+				"read_terminal",
+				format!(
+					"Read the recent output of one of the user's open terminals — what is actually on their screen, with escape sequences applied and `\\r`-redrawn progress lines collapsed. Use it to see how a dev server, watcher, or test run the user started is doing instead of starting a competing one with `bash`. Read-only: this cannot type into a terminal or run anything. Terminals may contain output the user did not mean to share (tokens, secrets, unrelated projects) — read what you need for the task at hand and don't quote more of it back than necessary.\n\nCurrently open:\n{inventory}"
+				),
+				json!({
+					"type": "object",
+					"properties": {
+						"id": {
+							"type": "string",
+							"description": "Terminal id from `list_terminals`."
+						},
+						"lines": {
+							"type": "integer",
+							"description": format!("How many lines from the end of the terminal to return. Defaults to {DEFAULT_READ_LINES}, capped at {MAX_READ_LINES}.")
+						}
+					},
+					"required": ["id"]
+				}),
+			),
+		]
+	}
+
+	/// Every terminal open for the session's folder.
+	async fn list_terminals(&self, cx: &ToolContext) -> Result<Value, CoderError> {
+		let folder = Utf8Path::new(cx.folder.folder.path.as_str());
+		let open = self.terminals.list_for_folder(folder).await;
+		let terminals: Vec<Value> = open.iter().map(terminal_info_json).collect();
+		Ok(json!({
+			"folder": cx.folder.folder.name,
+			"count": terminals.len(),
+			"terminals": terminals,
+		}))
+	}
+
+	/// Rendered tail of one terminal's output.
+	///
+	/// A terminal belonging to another folder is refused as if it
+	/// didn't exist — same shape as an unknown id, listing this
+	/// project's terminals so the model can self-correct. Leaking
+	/// "that id exists but is another project's" would be a worse
+	/// answer than the recovery hint.
+	async fn read_terminal(&self, args: &Value, cx: &ToolContext) -> Result<Value, CoderError> {
+		#[derive(Deserialize)]
+		struct ReadTerminalArgs {
+			id: String,
+			#[serde(default)]
+			lines: Option<usize>,
+		}
+		let parsed: ReadTerminalArgs =
+			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("read_terminal", err.to_string()))?;
+		let folder = Utf8Path::new(cx.folder.folder.path.as_str());
+		let scoped = self.terminals.list_for_folder(folder).await;
+		if !scoped.iter().any(|t| t.id == parsed.id) {
+			let known: Vec<&str> = scoped.iter().map(|t| t.id.as_str()).collect();
+			return Err(CoderError::invalid_args(
+				"read_terminal",
+				format!(
+					"no terminal `{}` open for this project; open terminals: [{}]",
+					parsed.id,
+					known.join(", ")
+				),
+			));
+		}
+		let read = self
+			.terminals
+			.read(&parsed.id, parsed.lines)
+			.await
+			.ok_or_else(|| CoderError::tool_failed("read_terminal", "terminal closed while being read"))?;
+		let mut out = terminal_info_json(&read.info);
+		let text = read.lines.join("\n");
+		if let Value::Object(map) = &mut out {
+			map.insert("lines_returned".into(), json!(read.lines.len()));
+			map.insert("truncated".into(), json!(read.truncated));
+			map.insert("output".into(), json!(text));
+		}
+		Ok(out)
+	}
+
 	/// The workspace's persisted MCP config. Load failures degrade
 	/// to the empty default with a warn — same posture as every
 	/// other `session.json` consumer.
@@ -1429,6 +1579,11 @@ impl ToolRegistry {
 			"bash" => self.bash(args, cx, cancel).await,
 			"read_process" => self.read_process(args, cx, cancel).await,
 			"stop_process" => self.stop_process(args, cx).await,
+			// Reading a terminal is read-only against the user's own
+			// screen, so it isn't mode-gated — a Research sub-agent
+			// checking why the dev server is unhappy is the point.
+			"list_terminals" => self.list_terminals(cx).await,
+			"read_terminal" => self.read_terminal(args, cx).await,
 			"write_file" => {
 				if !cx.mode.allows_writes() {
 					return Err(CoderError::read_only_mode("write_file"));
@@ -3927,6 +4082,122 @@ mod tests {
 		assert_eq!(out, "src/lib.rs:42:     let x = compute_thing(input);\n");
 	}
 
+	/// The coder half of ADR 0048: what the model is offered and
+	/// which terminals it can reach. Rendering itself is covered by
+	/// `moon_terminal::registry`'s own tests.
+	mod terminals {
+		use super::super::{CoderMode, ToolContext, ToolRegistry};
+		use camino::{Utf8Path, Utf8PathBuf};
+		use moon_core::WorkspaceRegistry;
+		use moon_terminal::{TerminalKind, TerminalRegistration, TerminalRegistry};
+		use std::sync::Arc;
+		use tempfile::TempDir;
+
+		async fn harness(folder_count: usize) -> (Vec<Utf8PathBuf>, Vec<TempDir>, Arc<TerminalRegistry>, ToolRegistry) {
+			let dirs: Vec<TempDir> = (0..folder_count).map(|_| TempDir::new().unwrap()).collect();
+			let paths: Vec<Utf8PathBuf> = dirs
+				.iter()
+				.map(|d| Utf8PathBuf::from_path_buf(d.path().to_path_buf()).unwrap())
+				.collect();
+			let workspaces = Arc::new(WorkspaceRegistry::new("test-workspace".into()));
+			for path in &paths {
+				workspaces.add_folder(path.clone()).await.unwrap();
+			}
+			let terminals = Arc::new(TerminalRegistry::default());
+			let web = crate::web::WebClient::new().expect("web client builds in tests");
+			let tools = ToolRegistry::new(workspaces.clone(), Utf8PathBuf::from("/tmp"), web, terminals.clone());
+			(paths, dirs, terminals, tools)
+		}
+
+		async fn cx_for(tools: &ToolRegistry, idx: usize) -> ToolContext {
+			let folders = tools.workspaces.folders().await;
+			ToolContext::new(folders[idx].clone(), CoderMode::Agent)
+		}
+
+		fn registration(folder: &Utf8Path) -> TerminalRegistration {
+			TerminalRegistration {
+				kind: TerminalKind::Container,
+				cwd: "/workspace/proj".into(),
+				folder: Some(folder.to_path_buf()),
+				cols: 80,
+				rows: 24,
+			}
+		}
+
+		#[tokio::test]
+		async fn tools_are_hidden_until_a_terminal_is_open() {
+			let (paths, _dirs, terminals, tools) = harness(1).await;
+			let cx = cx_for(&tools, 0).await;
+			assert!(tools.terminal_definitions(&cx).await.is_empty());
+
+			terminals.register("t1", registration(&paths[0])).await;
+			let names: Vec<String> = tools
+				.terminal_definitions(&cx)
+				.await
+				.into_iter()
+				.map(|def| def.function.name)
+				.collect();
+			assert_eq!(names, vec!["list_terminals", "read_terminal"]);
+		}
+
+		/// A sibling project's terminal must not make the tools
+		/// appear, or a session would be offered a surface with
+		/// nothing in it for that project.
+		#[tokio::test]
+		async fn a_sibling_folders_terminal_does_not_advertise_the_tools() {
+			let (paths, _dirs, terminals, tools) = harness(2).await;
+			terminals.register("sibling", registration(&paths[1])).await;
+			let cx = cx_for(&tools, 0).await;
+			assert!(tools.terminal_definitions(&cx).await.is_empty());
+		}
+
+		#[tokio::test]
+		async fn list_only_returns_this_projects_terminals() {
+			let (paths, _dirs, terminals, tools) = harness(2).await;
+			terminals.register("mine", registration(&paths[0])).await;
+			terminals.register("theirs", registration(&paths[1])).await;
+			let cx = cx_for(&tools, 0).await;
+			let out = tools.list_terminals(&cx).await.expect("listing succeeds");
+			assert_eq!(out["count"], 1);
+			assert_eq!(out["terminals"][0]["id"], "mine");
+		}
+
+		#[tokio::test]
+		async fn read_returns_the_rendered_output() {
+			let (paths, _dirs, terminals, tools) = harness(1).await;
+			terminals.register("t1", registration(&paths[0])).await;
+			terminals
+				.record_output("t1", b"$ bun run dev\r\nready in 312ms\r\n")
+				.await;
+			let cx = cx_for(&tools, 0).await;
+			let out = tools
+				.read_terminal(&serde_json::json!({ "id": "t1" }), &cx)
+				.await
+				.expect("read succeeds");
+			assert_eq!(out["output"], "$ bun run dev\nready in 312ms");
+			assert_eq!(out["running"], true);
+			assert_eq!(out["target"], "container");
+		}
+
+		/// Another project's terminal is refused exactly like an
+		/// unknown id, with this project's ids listed so the model
+		/// can recover in one step.
+		#[tokio::test]
+		async fn read_refuses_another_projects_terminal() {
+			let (paths, _dirs, terminals, tools) = harness(2).await;
+			terminals.register("mine", registration(&paths[0])).await;
+			terminals.register("theirs", registration(&paths[1])).await;
+			let cx = cx_for(&tools, 0).await;
+			let err = tools
+				.read_terminal(&serde_json::json!({ "id": "theirs" }), &cx)
+				.await
+				.expect_err("cross-project read is refused");
+			let message = err.to_string();
+			assert!(message.contains("no terminal `theirs`"), "{message}");
+			assert!(message.contains("mine"), "{message}");
+		}
+	}
+
 	mod cross_folder {
 		use super::super::{image_mime_for, CoderMode, ToolContext, ToolRegistry};
 		use crate::error::CoderError;
@@ -3942,7 +4213,7 @@ mod tests {
 			}
 			let workspaces_dir = Utf8PathBuf::from(paths[0].parent().unwrap_or(camino::Utf8Path::new("/tmp")));
 			let web = crate::web::WebClient::new().expect("web client builds in tests");
-			let tool_registry = ToolRegistry::new(registry.clone(), workspaces_dir, web);
+			let tool_registry = ToolRegistry::new(registry.clone(), workspaces_dir, web, Arc::default());
 			(registry, tool_registry)
 		}
 
@@ -4077,7 +4348,7 @@ mod tests {
 				.unwrap();
 			let workspaces_dir = Utf8PathBuf::from(parent_path.parent().unwrap());
 			let web = crate::web::WebClient::new().expect("web client builds in tests");
-			let tools = ToolRegistry::new(registry.clone(), workspaces_dir, web);
+			let tools = ToolRegistry::new(registry.clone(), workspaces_dir, web, Arc::default());
 			(registry, tools, parent)
 		}
 

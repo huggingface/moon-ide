@@ -18,3 +18,11 @@ tracing = { workspace = true }
 # Cross-platform PTY (Unix `posix_openpt` / Windows ConPTY) from
 # the Wezterm project. See ADR 0009.
 portable-pty = "0.9"
+# Terminal emulator used by `registry.rs` to turn a terminal's raw
+# retained PTY bytes back into the text the user is looking at
+# (`\r` redraws collapsed, escape sequences applied) when the coder
+# reads a terminal. See ADR 0048.
+vt100 = "0.16"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

@@ -745,6 +745,9 @@ async fn run_subagent_loop(
 	// folder's dev server is a natural delegation.
 	tool_defs.extend(tools.mcp_definitions().await);
 	let cx = ToolContext::with_format_queue(spec.folder.clone(), spec.mode, format_queue).with_background(background);
+	// Terminals of the sub-agent's *own* target folder (ADR 0048) —
+	// the same folder its `bash` and `grep` run against.
+	tool_defs.extend(tools.terminal_definitions(&cx).await);
 
 	// Consecutive empty-shell responses — same retry-then-fail
 	// posture as the parent loop in `run_turn`. Without it a

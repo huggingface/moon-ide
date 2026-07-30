@@ -345,6 +345,22 @@ pub trait WorkspaceHost: Send + Sync {
 	/// non-git workspaces still render cleanly.
 	async fn git_branch(&self) -> MoonResult<GitBranchInfo>;
 
+	/// Read raw bytes for a binary preview (image / PDF) at an
+	/// **absolute** path that may live outside every bound folder —
+	/// the one read that deliberately isn't workspace-root-gated,
+	/// because the user clicked a concrete path (a screenshot an
+	/// agent reported, a fixture in `~/Downloads`).
+	///
+	/// Routing, host first: the bind mount means anything inside a
+	/// bound folder is readable host-side, and that's also the
+	/// least surprising answer for a path that exists on both
+	/// sides. Only when the host has no such file and the
+	/// workspace shell container is running do we `cat` the same
+	/// path inside the container — that's the case a
+	/// container-only `/tmp` artefact needs, and the Tauri asset
+	/// protocol (host-only) can never serve it.
+	async fn read_preview_bytes(&self, abs_path: &Utf8Path) -> MoonResult<Vec<u8>>;
+
 	/// Absolute host path to the repo's `.git/info/exclude` —
 	/// resolved via `git rev-parse --git-common-dir`. Returns `None`
 	/// when the folder isn't a git repo (no `.git` dir). The command
@@ -1435,6 +1451,37 @@ impl WorkspaceHost for LocalHost {
 
 	async fn absolute_path(&self, path: &Utf8Path) -> MoonResult<String> {
 		Ok(self.resolve(path)?.to_string())
+	}
+
+	async fn read_preview_bytes(&self, abs_path: &Utf8Path) -> MoonResult<Vec<u8>> {
+		if !abs_path.is_absolute() {
+			return Err(MoonError::invalid(format!("preview path must be absolute: {abs_path}")));
+		}
+		let host_err = match read_host_bytes(abs_path).await {
+			Ok(bytes) => return Ok(bytes),
+			Err(err) => err,
+		};
+		let ShellTarget::Container { container_name, .. } = self.shell_target().await else {
+			return Err(host_err);
+		};
+		// `cat --` with no shell: the path can't be word-split or
+		// glob-expanded. Mirrors the coder's out-of-workspace read.
+		let out = tokio::process::Command::new("docker")
+			.arg("exec")
+			.arg(&container_name)
+			.arg("cat")
+			.arg("--")
+			.arg(abs_path.as_str())
+			.output()
+			.await
+			.map_err(|err| MoonError::IoError(format!("docker exec cat failed to launch: {err}")))?;
+		if !out.status.success() {
+			// The host error is the more useful one to surface:
+			// the container attempt is the fallback, and "no such
+			// file on the host" is what the user most likely hit.
+			return Err(host_err);
+		}
+		Ok(out.stdout)
 	}
 
 	async fn trash_path(&self, path: &Utf8Path) -> MoonResult<()> {
@@ -6513,6 +6560,16 @@ fn looks_binary(bytes: &[u8]) -> bool {
 /// shape as [`WorkspaceHost::read_file`] (binary detection + mtime), so the
 /// frontend handles the two paths interchangeably. The caller is responsible
 /// for whatever boundary makes sense at the UI layer.
+/// Read a file's raw bytes straight from the host filesystem,
+/// bypassing every `WorkspaceHost` (and therefore every
+/// workspace-root check) — the byte-oriented sibling of
+/// [`read_host_file`], which throws the bytes away for binaries.
+/// Used by the binary-preview path (images / PDFs outside every
+/// bound folder).
+pub async fn read_host_bytes(path: &Utf8Path) -> MoonResult<Vec<u8>> {
+	tokio::fs::read(path.as_std_path()).await.map_err(MoonError::from)
+}
+
 pub async fn read_host_file(path: &Utf8Path) -> MoonResult<ReadFileResult> {
 	let bytes = tokio::fs::read(path.as_std_path()).await.map_err(MoonError::from)?;
 	let metadata = tokio::fs::metadata(path.as_std_path()).await.map_err(MoonError::from)?;
@@ -6575,6 +6632,55 @@ mod tests {
 	fn host(dir: &TempDir) -> LocalHost {
 		let root = Utf8PathBuf::from_path_buf(dir.path().canonicalize().unwrap()).unwrap();
 		LocalHost::new(root)
+	}
+
+	/// `read_preview_bytes` is deliberately *not* workspace-root
+	/// gated — the whole point is previewing a path the user
+	/// clicked (an agent's screenshot, a fixture elsewhere on the
+	/// disk) that `resolve()` would reject.
+	#[tokio::test]
+	async fn read_preview_bytes_reads_binaries_outside_the_workspace_root() {
+		let dir = TempDir::new().unwrap();
+		let outside = TempDir::new().unwrap();
+		let png = Utf8PathBuf::from_path_buf(outside.path().canonicalize().unwrap())
+			.unwrap()
+			.join("shot.png");
+		// NUL bytes: `read_host_file` would report this as binary
+		// and hand back no content at all.
+		let bytes: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x00];
+		std::fs::write(png.as_std_path(), bytes).unwrap();
+
+		let host = host(&dir);
+		assert_eq!(host.read_preview_bytes(&png).await.unwrap(), bytes);
+		// The workspace-gated reader still refuses it.
+		assert!(host.read_file(&png).await.is_err());
+	}
+
+	#[tokio::test]
+	async fn read_preview_bytes_requires_an_absolute_path() {
+		let dir = TempDir::new().unwrap();
+		let err = host(&dir)
+			.read_preview_bytes(Utf8Path::new("relative/shot.png"))
+			.await
+			.expect_err("relative paths are rejected");
+		assert!(err.to_string().contains("must be absolute"), "got: {err}");
+	}
+
+	/// With no shell resolver installed the target is `Host`, so a
+	/// missing file surfaces the host's own IO error rather than
+	/// attempting (and mis-reporting) a container read.
+	#[tokio::test]
+	async fn read_preview_bytes_missing_file_reports_the_host_error() {
+		let dir = TempDir::new().unwrap();
+		let missing = Utf8PathBuf::from_path_buf(dir.path().canonicalize().unwrap())
+			.unwrap()
+			.join("nope.png");
+		let err = host(&dir).read_preview_bytes(&missing).await.expect_err("no such file");
+		let msg = err.to_string();
+		assert!(
+			!msg.contains("docker"),
+			"should not mention the container fallback: {msg}"
+		);
 	}
 
 	#[tokio::test]

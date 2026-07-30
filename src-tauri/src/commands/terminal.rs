@@ -7,6 +7,14 @@
 //! aborts the supervisor; the `PtySession` is dropped, which
 //! SIGKILLs the child (host shell or `docker exec`).
 //!
+//! Each open terminal is also recorded in
+//! [`AppState::terminals`](crate::state::AppState::terminals) —
+//! its target, cwd, owning project, and a bounded ring of its raw
+//! output — so the coder's `list_terminals` / `read_terminal`
+//! tools can inspect the terminals of the project they're working
+//! in (ADR 0048). Registration tracks the *tab*: an exited shell
+//! stays readable and is dropped on `terminal_close`.
+//!
 //! See ADR 0009 for the wire-format rationale and the host /
 //! container target split.
 //!
@@ -17,7 +25,10 @@ use base64::Engine;
 use camino::Utf8PathBuf;
 use moon_protocol::terminal::{TerminalClosed, TerminalOpenRequest, TerminalOutput, TerminalTarget as ProtocolTarget};
 use moon_protocol::MoonError;
-use moon_terminal::{container_name_for_workspace, editor_forward_env_for_workspace, spawn, TerminalTarget};
+use moon_terminal::{
+	container_name_for_workspace, editor_forward_env_for_workspace, spawn, TerminalKind, TerminalRegistration,
+	TerminalRegistry, TerminalTarget,
+};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -59,6 +70,7 @@ pub async fn terminal_open(
 	} else {
 		Vec::new()
 	};
+	let registration = registration_for(&request);
 	let target = into_internal_target(request.target, &state, &bound_folders)?;
 
 	let stream_id = Uuid::new_v4().to_string();
@@ -69,8 +81,19 @@ pub async fn terminal_open(
 	// command's error rather than a silent close event later.
 	let session = spawn(&target, request.cols, request.rows).map_err(|e| MoonError::internal(e.to_string()))?;
 
+	// Register before the supervisor starts so no output chunk can
+	// race ahead of the entry it belongs in.
+	state.terminals.register(&stream_id, registration).await;
+
 	let registry = state.terminal_streams.clone();
-	let supervisor = tauri::async_runtime::spawn(supervise(app, registry.clone(), stream_id.clone(), session, cmd_rx));
+	let supervisor = tauri::async_runtime::spawn(supervise(
+		app,
+		registry.clone(),
+		state.terminals.clone(),
+		stream_id.clone(),
+		session,
+		cmd_rx,
+	));
 
 	registry.lock().await.insert(
 		stream_id.clone(),
@@ -107,6 +130,9 @@ pub async fn terminal_resize(
 	cols: u16,
 	rows: u16,
 ) -> Result<(), MoonError> {
+	// Mirror the new size onto the registry entry so a coder read
+	// renders the terminal at the width the user is looking at.
+	state.terminals.record_resize(&stream_id, cols, rows).await;
 	let registry = state.terminal_streams.lock().await;
 	let Some(handle) = registry.get(&stream_id) else {
 		return Ok(());
@@ -121,7 +147,32 @@ pub async fn terminal_close(state: State<'_, AppState>, stream_id: String) -> Re
 	if let Some(handle) = handle {
 		handle.abort.abort();
 	}
+	// The tab is gone, so its scrollback is no longer something the
+	// user can see either — drop it rather than leaving output the
+	// coder could still read. Aborting the supervisor skips its own
+	// cleanup tail, so this is the only place a user-closed terminal
+	// gets forgotten.
+	state.terminals.forget(&stream_id).await;
 	Ok(())
+}
+
+/// Metadata the registry keeps for a terminal, taken off the open
+/// request before `target` is consumed by the internal conversion.
+/// `cwd` is recorded in the target's own path space — a host path
+/// for host terminals, an in-container path for container ones —
+/// which is what a reader needs to make sense of the shell's output.
+fn registration_for(request: &TerminalOpenRequest) -> TerminalRegistration {
+	let (kind, cwd) = match &request.target {
+		ProtocolTarget::Host { cwd } => (TerminalKind::Host, cwd.clone().unwrap_or_else(|| "~".to_owned())),
+		ProtocolTarget::Container { cwd } => (TerminalKind::Container, cwd.clone()),
+	};
+	TerminalRegistration {
+		kind,
+		cwd,
+		folder: request.folder.as_deref().map(Utf8PathBuf::from),
+		cols: request.cols,
+		rows: request.rows,
+	}
 }
 
 fn into_internal_target(
@@ -163,6 +214,7 @@ fn into_internal_target(
 async fn supervise(
 	app: AppHandle,
 	registry: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, TerminalStreamHandle>>>,
+	terminals: std::sync::Arc<TerminalRegistry>,
 	stream_id: String,
 	mut session: moon_terminal::PtySession,
 	mut cmd_rx: mpsc::Receiver<TerminalCommand>,
@@ -173,6 +225,7 @@ async fn supervise(
 				let Some(bytes) = chunk else {
 					break;
 				};
+				terminals.record_output(&stream_id, &bytes).await;
 				let payload = TerminalOutput {
 					stream_id: stream_id.clone(),
 					data: BASE64.encode(&bytes),
@@ -212,6 +265,10 @@ async fn supervise(
 	drop(session);
 
 	registry.lock().await.remove(&stream_id);
+	// Keep the registry entry: the tab is still there showing the
+	// output, so a coder read should still answer for it. The entry
+	// goes away with the tab, in `terminal_close`.
+	terminals.mark_exited(&stream_id, code).await;
 
 	let _ = app.emit(
 		TERMINAL_CLOSED_EVENT,

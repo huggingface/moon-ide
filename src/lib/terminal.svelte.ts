@@ -118,11 +118,16 @@ class TerminalStore {
 	 * `terminal` tab in the bottom panel, and return the stream
 	 * id. The bottom panel becomes visible as a side effect —
 	 * the user clicked + Terminal to see something.
+	 *
+	 * `folder` is the bound folder the terminal belongs to (the
+	 * active project at open time). The backend records it so the
+	 * coder's terminal-reading tools only ever see the terminals
+	 * of the project a session is working in — see ADR 0048.
 	 */
-	async open(target: TerminalTarget, cols: number, rows: number): Promise<string> {
+	async open(target: TerminalTarget, cols: number, rows: number, folder: string | null): Promise<string> {
 		bottomPanel.show();
 
-		const request: TerminalOpenRequest = { target, cols, rows };
+		const request: TerminalOpenRequest = { target, cols, rows, folder };
 		let streamId: string;
 		try {
 			streamId = await ipc.terminal.open(request);

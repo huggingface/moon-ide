@@ -6,4 +6,22 @@ import type { TerminalTarget } from "./TerminalTarget";
  * xterm.js's initial fit; the supervisor sends them straight
  * through to `PtySize` on the backend.
  */
-export type TerminalOpenRequest = { target: TerminalTarget, cols: number, rows: number, };
+export type TerminalOpenRequest = { target: TerminalTarget, cols: number, rows: number, 
+/**
+ * Absolute **host** path of the bound folder this terminal is
+ * being opened for — the project the user was in when they hit
+ * `+ Terminal`. Recorded in
+ * [`moon_terminal::TerminalRegistry`] so the coder's
+ * `list_terminals` / `read_terminal` tools can scope
+ * themselves to the session's own project or worktree
+ * (ADR 0048).
+ *
+ * Passed explicitly rather than derived from `cwd`: a worktree
+ * rides its parent's bind mount, so its container `cwd` is a
+ * path *under* the parent's folder, and any user `cd` makes
+ * the shell's live cwd a lie about which project the terminal
+ * belongs to. `None` for a terminal with no project behind it
+ * (a `$HOME` shell in a folder-less workspace); those never
+ * match a folder-scoped listing.
+ */
+folder: string | null, };

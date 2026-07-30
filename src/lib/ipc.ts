@@ -156,6 +156,9 @@ export const ipc = {
 		rename: (from: string, to: string) => invoke<void>('fs_rename', { from, to }),
 		stat: (path: string) => invoke<StatResult>('fs_stat', { path }),
 		absolutePath: (path: string) => invoke<string>('fs_absolute_path', { path }),
+		// Returns a `data:` URL. Only for previews outside every bound
+		// folder — in-workspace files stream via `convertFileSrc`.
+		readPreviewHost: (path: string) => invoke<string>('fs_read_preview_host', { path }),
 		trash: (path: string) => invoke<void>('fs_trash', { path }),
 		delete: (path: string) => invoke<void>('fs_delete', { path }),
 		gitStatusEntries: (paths: string[]) => invoke<GitStatusEntry[]>('fs_git_status_entries', { paths }),

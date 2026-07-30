@@ -1120,6 +1120,11 @@ export type TerminalOpenRequest = {
 	target: TerminalTarget;
 	cols: number;
 	rows: number;
+	/** Absolute host path of the bound folder this terminal is
+	 * being opened for, so the backend can scope the coder's
+	 * `list_terminals` / `read_terminal` tools to one project
+	 * (ADR 0048). `null` when no folder is active. */
+	folder: string | null;
 };
 
 /** One chunk of terminal output. Bytes are base64-encoded —

@@ -23,7 +23,7 @@ pub mod shell;
 pub mod workspace;
 pub mod worktree;
 
-pub use host::{read_host_file, write_host_file, LocalHost, WorkspaceHost};
+pub use host::{read_host_bytes, read_host_file, write_host_file, LocalHost, WorkspaceHost};
 pub use logs::LogSink;
 pub use shell::{AlwaysHostResolver, ShellResolver, ShellResolverHandle, ShellTarget};
 pub use workspace::{WorkspaceFolderEntry, WorkspaceRegistry};

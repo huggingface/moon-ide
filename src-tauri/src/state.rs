@@ -5,6 +5,7 @@ use camino::Utf8PathBuf;
 use moon_coder::CoderHandle;
 use moon_core::{LogSink, NextEditServerSupervisor, WorkspaceRegistry};
 use moon_slack::{SlackClient, TokenStore};
+use moon_terminal::TerminalRegistry;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::AbortHandle;
 
@@ -47,6 +48,13 @@ pub struct AppState {
 	pub log_streams: Arc<Mutex<HashMap<String, AbortHandle>>>,
 	/// Registry of active terminal sessions.
 	pub terminal_streams: Arc<Mutex<HashMap<String, TerminalStreamHandle>>>,
+	/// What's open in the terminal tabs, plus each terminal's
+	/// retained output. Distinct from `terminal_streams`, which
+	/// holds the write/abort handles this process needs: this one is
+	/// the read side, shared with `moon-coder` so an agent can list
+	/// and read the terminals of the project it's working in
+	/// (ADR 0048).
+	pub terminals: Arc<TerminalRegistry>,
 	/// Filesystem watcher actor.
 	pub fs_watcher: FsWatcherHandle,
 	/// LSP broker plus its event-pump task.
@@ -134,6 +142,7 @@ impl AppState {
 		coder: CoderHandle,
 		mode: AppMode,
 		logs: Arc<LogSink>,
+		terminals: Arc<TerminalRegistry>,
 	) -> Self {
 		Self {
 			workspaces,
@@ -142,6 +151,7 @@ impl AppState {
 			slack,
 			log_streams: Arc::new(Mutex::new(HashMap::new())),
 			terminal_streams: Arc::new(Mutex::new(HashMap::new())),
+			terminals,
 			fs_watcher,
 			lsp: Arc::new(Mutex::new(None)),
 			coder,

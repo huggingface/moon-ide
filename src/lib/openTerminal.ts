@@ -43,11 +43,12 @@ const lastTerminalByFolder = new Map<string, string>();
 /** Open a host terminal rooted at the active folder
  * (or `$HOME` when no folder is selected). */
 export function openHostTerminal(): void {
+	const folder = workspace.activeFolder?.path ?? null;
 	const target: TerminalTarget = {
 		kind: 'host',
-		cwd: workspace.activeFolder?.path ?? null,
+		cwd: folder,
 	};
-	void terminalStore.open(target, DEFAULT_COLS, DEFAULT_ROWS);
+	void terminalStore.open(target, DEFAULT_COLS, DEFAULT_ROWS, folder);
 }
 
 /** True when a container terminal can actually be spawned —
@@ -101,7 +102,7 @@ export function openContainerTerminal(): void {
 		kind: 'container',
 		cwd,
 	};
-	void terminalStore.open(target, DEFAULT_COLS, DEFAULT_ROWS);
+	void terminalStore.open(target, DEFAULT_COLS, DEFAULT_ROWS, folder?.path ?? null);
 }
 
 // `/home/me/code/moon-landing` → `/workspace/moon-landing`.

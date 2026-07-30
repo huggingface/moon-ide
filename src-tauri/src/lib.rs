@@ -110,6 +110,7 @@ pub fn run() {
 			commands::fs::fs_read_file,
 			commands::fs::fs_write_file,
 			commands::fs::fs_read_file_host,
+			commands::fs::fs_read_preview_host,
 			commands::fs::fs_write_file_host,
 			commands::fs::fs_create_file,
 			commands::fs::fs_create_dir,
@@ -483,12 +484,18 @@ pub fn run() {
 				context_window_overrides: std::sync::Arc::new(loaded_state.coder.context_window_overrides.clone()),
 				..moon_coder::CoderModels::default()
 			};
+			// Shared with the coder so its `list_terminals` /
+			// `read_terminal` tools see the same open terminals the
+			// user does (ADR 0048). Created here because both
+			// `CoderHandle::new` and `AppState::new` need it.
+			let terminals = std::sync::Arc::new(moon_terminal::TerminalRegistry::default());
 			let coder = CoderHandle::new(
 				workspace_registry.clone(),
 				workspaces_dir.clone(),
 				coder_sessions_dir,
 				folder_summaries_dir,
 				initial_coder_models,
+				terminals.clone(),
 			)
 			.map_err(|err| format!("could not init moon-coder: {err}"))?;
 			commands::coder::spawn_event_pump(app.handle().clone(), coder.clone());
@@ -545,6 +552,7 @@ pub fn run() {
 				coder,
 				mode.clone(),
 				logs,
+				terminals,
 			);
 			if let Some(abort) = focus_listener_abort {
 				*state.focus_listener.blocking_lock() = Some(abort);
