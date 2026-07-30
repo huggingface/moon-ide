@@ -84,28 +84,15 @@ Three changes after the preset met real use:
   the playwright back door) and sits next to the dev servers it
   exercises. Chromium dies with a container Recreate; respawn is
   on-demand, bounded by the npx cache.
-- **`--output-dir .moon/playwright` is pinned at spawn.** The
-  symptom that prompted it: screenshots landing in `$TMPDIR` — a
-  host `/tmp` path the coder's container-mode tools can't resolve
-  (and vice versa). The pin stays because the default is a
-  **moving target**: we launch `@playwright/mcp@latest`, and where
-  it puts artefacts absent an explicit dir has already shifted
-  across versions (0.0.78 derives it from the first MCP root,
-  falling back to the server's process cwd, and only uses the temp
-  dir when that is a system dir or unwritable). Pinning makes
-  placement version-independent and puts artefacts under the
-  already-gitignored `.moon/`. The dir is **relative** so one
-  value is valid on both
-  spawn targets: the active folder is bind-mounted, so host and
-  container writes land in the same bytes, under a dir that's
-  already gitignored. `--output-dir` only governs _server-chosen_
-  names, so a bare `filename` argument (which the MCP resolves
-  against its cwd, dropping the artefact at the folder root) is
-  rewritten into the same dir per call.
+- **Screenshots were landing in `$TMPDIR`** — a host `/tmp` path
+  the coder's container-mode tools can't resolve (and vice versa).
+  Fixed at the time with a pinned `--output-dir`; superseded by
+  the `roots` capability below, which is where the server actually
+  gets its output root from.
 - **Container-local paths in tool results are rewritten to host
   paths** (`/workspace/<folder>/…` → the folder's host path) so
   the model can hand a reported screenshot path straight to
-  `read_file`. Only the active folder's mount pair is translated.
+  `read_file`.
 - Preset also gained `--headless` (the coder drives via snapshots;
   a headed window on the dev's display is noise, and containers
   have none).
@@ -172,17 +159,24 @@ denied: … outside allowed roots`. That's playwright's own
   playwright servers fight over the browser profile (`Browser is
 already in use … use --isolated`), which costs more than the
   wart.
-- **`--output-dir` stays**, and roots is why it's now a preference
-  rather than a workaround: the default would be
-  `<root>/.playwright-mcp`, which shows up as untracked in any
-  repo, while `.moon/` is already added to `.git/info/exclude`
-  per repo (`add_dir_to_git_exclude`) — so artefacts stay
-  invisible to `git status` everywhere.
-- **Bare `filename` arguments still get scoped** into the output
-  dir. Verified: even with roots declared, playwright resolves a
-  model-supplied bare name against the workspace root, i.e. the
-  repo root. A name with a separator (`docs/shot.png`) is left
-  alone — a bare name expresses no location intent, a path does.
+- **No playwright-specific argv or argument rewriting remains.**
+  The earlier `--output-dir .moon/playwright` pin and the
+  bare-`filename` rewrite are both gone: with roots declared,
+  placement is already deterministic, so the client no longer
+  carries per-server path policy. Artefacts land in the server's
+  own default, `<roots[0]>/.playwright-mcp`, and a model-supplied
+  `filename` lands exactly where the model asked (playwright
+  resolves bare names against the workspace root).
+
+  Accepted cost: `.playwright-mcp/` is untracked in a repo that
+  doesn't ignore it, so it shows in `git status`. Note the
+  `.moon/`-is-already-excluded argument for keeping the pin does
+  **not** hold — `add_dir_to_git_exclude` only runs on the
+  worktree-creation path, so `.moon/` is excluded in repos where a
+  worktree session was created and nowhere else. If artefact noise
+  becomes annoying, the fix is generic (exclude moon-managed dirs
+  when a folder is bound), not a per-server flag.
+
 - Inbound requests we don't implement now get a JSON-RPC `-32601`
   reply instead of silence, so a server waiting on one can't
   hang. `listChanged: false`: roots are read at handshake, and a

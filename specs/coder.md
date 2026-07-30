@@ -513,13 +513,14 @@ the workspace has no enabled servers, and neither is mode-gated
   writable without per-server path workarounds. Servers that ask
   for something we don't implement get a `-32601` reply rather
   than silence.
-- **Playwright output is pinned to `<active-folder>/.moon/
-playwright/`** (`--output-dir`, relative so both spawn targets
-  resolve it through the bind mount) — screenshots and PDFs land
-  under one gitignored host path whichever side the server runs
-  on. Container-local paths in tool results (`/workspace/<folder>/
-…`) are rewritten to host paths before the model sees them, so
-  a reported screenshot path feeds straight into `read_file`.
+- **No per-server path policy in the client.** Where a server
+  writes its artefacts follows from the roots it was given —
+  playwright puts them in `<roots[0]>/.playwright-mcp` — so the
+  coder carries no `--output-dir` pin and does not rewrite
+  `filename` arguments. Container-local paths in tool results
+  (`/workspace/<folder>/…`) are rewritten to host paths before the
+  model sees them, for every bound folder's mount, so a reported
+  screenshot path feeds straight into `read_file`.
 - **Tool-result images are first-class.** MCP `image` content
   blocks (screenshots) and `read_file` on an image file (png /
   jpg / gif / webp, ≤ 10 MB) both reach the model as typed image

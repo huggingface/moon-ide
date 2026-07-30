@@ -65,6 +65,11 @@ pub fn preset_servers() -> Vec<McpServerConfig> {
 			// container.
 			"--headless".into(),
 		],
+		// No `--output-dir`: artefacts land in the server's own
+		// default, `<roots[0]>/.playwright-mcp`, which the `roots`
+		// capability makes deterministic (see ADR 0033). The
+		// trade-off is a visible untracked dir in repos that don't
+		// ignore it.
 		description: "Browser automation via Playwright: navigate, click, type, take accessibility snapshots and \
 		              screenshots of real pages. Use it to exercise or debug a running web app."
 			.into(),
@@ -163,7 +168,6 @@ impl McpManager {
 		cancel: &CancellationToken,
 	) -> Result<Value, CoderError> {
 		let conn = self.connection(config, spawn, cancel).await?;
-		let args = scoped_args(config, args);
 		let params = json!({ "name": tool, "arguments": args });
 		let result = self
 			.request(&conn, config, "tools/call", params, CALL_TIMEOUT, cancel)
@@ -265,61 +269,6 @@ impl McpManager {
 		}
 		result
 	}
-}
-
-/// The output files a playwright MCP server writes (screenshots,
-/// PDFs, session state), relative to the server's spawn cwd — the
-/// active folder's root. Relative on purpose: the folder is
-/// bind-mounted into the workspace container, so one value is
-/// valid on both spawn targets, and the file lands under the same
-/// host path either way. `.moon/` is the folder's gitignored
-/// per-dev state dir.
-const PLAYWRIGHT_OUTPUT_DIR: &str = ".moon/playwright";
-
-/// Argv actually passed to the server: the configured args plus
-/// moon-managed per-spawn additions. Today that's just the
-/// playwright preset's `--output-dir`, which pins artefacts to a
-/// path that resolves the same on both spawn targets. We launch
-/// `@latest`, so the server's own default is a moving target
-/// (it has landed in `$TMPDIR` — unreachable across the
-/// host/container boundary — in past versions); pinning keeps
-/// placement version-independent. Preset-specific and therefore
-/// matched on id rather than inferred from argv.
-fn spawn_args(config: &McpServerConfig) -> Vec<String> {
-	let mut args = config.args.clone();
-	if config.id == "playwright" {
-		args.push("--output-dir".into());
-		args.push(PLAYWRIGHT_OUTPUT_DIR.into());
-	}
-	args
-}
-
-/// Per-call argument adjustments. `--output-dir` only covers
-/// *server-chosen* filenames: when the model passes an explicit
-/// `filename` (playwright's screenshot / snapshot / PDF tools all
-/// take one), the MCP resolves it against the server cwd — a bare
-/// name like `shot.png` would land at the folder root, unscoped.
-/// Prefix bare filenames with the pinned output dir so every
-/// playwright artefact lands under `.moon/playwright/`. Absolute
-/// paths and already-nested relative paths pass through — the
-/// model meant those.
-fn scoped_args(config: &McpServerConfig, mut args: Value) -> Value {
-	if config.id != "playwright" {
-		return args;
-	}
-	let Some(scoped) = args
-		.get("filename")
-		.and_then(Value::as_str)
-		.filter(|name| !name.contains(['/', '\\']))
-		.map(|name| format!("{PLAYWRIGHT_OUTPUT_DIR}/{name}"))
-	else {
-		return args;
-	};
-	args
-		.as_object_mut()
-		.expect("mcp args object")
-		.insert("filename".into(), scoped.into());
-	args
 }
 
 /// One workspace directory advertised to servers over the MCP
@@ -478,7 +427,7 @@ impl McpConnection {
 		let mut command = match &target.kind {
 			McpSpawnKind::Host { cwd } => {
 				let mut command = tokio::process::Command::new(&config.command);
-				command.args(spawn_args(config)).current_dir(cwd);
+				command.args(&config.args).current_dir(cwd);
 				command
 			}
 			// `-i` keeps stdin open — that *is* the transport.
@@ -492,7 +441,7 @@ impl McpConnection {
 					.arg(cwd)
 					.arg(name)
 					.arg(&config.command)
-					.args(spawn_args(config));
+					.args(&config.args);
 				command
 			}
 		};
@@ -963,44 +912,6 @@ rl.on('line', (line) => {
 		assert!(chromium, "preset should pin Playwright's bundled chromium");
 	}
 
-	#[test]
-	fn spawn_args_pin_playwright_output_to_shared_folder_state() {
-		let preset = &preset_servers()[0];
-		let args = spawn_args(preset);
-		let pair = args
-			.windows(2)
-			.find(|w| w[0] == "--output-dir")
-			.expect("playwright spawn args should carry --output-dir");
-		assert_eq!(pair[1], ".moon/playwright");
-
-		// Non-playwright servers spawn with their configured argv
-		// verbatim.
-		let server = custom("mcp-1");
-		assert_eq!(spawn_args(&server), server.args);
-	}
-
-	#[test]
-	fn scoped_args_prefix_bare_playwright_filenames() {
-		let preset = &preset_servers()[0];
-		// Bare name → pinned under the output dir.
-		let args = scoped_args(preset, json!({ "filename": "shot.png", "type": "png" }));
-		assert_eq!(
-			args.get("filename").and_then(Value::as_str),
-			Some(".moon/playwright/shot.png")
-		);
-		// Absolute and nested paths pass through untouched.
-		let args = scoped_args(preset, json!({ "filename": "/tmp/shot.png" }));
-		assert_eq!(args.get("filename").and_then(Value::as_str), Some("/tmp/shot.png"));
-		let args = scoped_args(preset, json!({ "filename": "shots/a.png" }));
-		assert_eq!(args.get("filename").and_then(Value::as_str), Some("shots/a.png"));
-		// No filename arg → unchanged; non-playwright → unchanged.
-		let args = scoped_args(preset, json!({ "url": "https://x" }));
-		assert!(args.get("filename").is_none());
-		let other = custom("mcp-1");
-		let args = scoped_args(&other, json!({ "filename": "shot.png" }));
-		assert_eq!(args.get("filename").and_then(Value::as_str), Some("shot.png"));
-	}
-
 	/// A container spawn over two bound folders: `app` (active)
 	/// and `lib`.
 	fn container_target() -> McpSpawnTarget {
@@ -1035,11 +946,11 @@ rl.on('line', (line) => {
 	#[test]
 	fn container_target_rewrites_reported_paths_to_host() {
 		let target = container_target();
-		let text = "### Screenshot\nsaved to /workspace/app/.moon/playwright/page-1.png\nroot is /workspace/app";
+		let text = "### Screenshot\nsaved to /workspace/app/.playwright-mcp/page-1.png\nroot is /workspace/app";
 		let rewritten = target.host_paths(text);
 		assert_eq!(
 			rewritten,
-			"### Screenshot\nsaved to /home/me/code/app/.moon/playwright/page-1.png\nroot is /home/me/code/app"
+			"### Screenshot\nsaved to /home/me/code/app/.playwright-mcp/page-1.png\nroot is /home/me/code/app"
 		);
 	}
 
@@ -1078,7 +989,7 @@ rl.on('line', (line) => {
 			}],
 			mounts: Vec::new(),
 		};
-		let text = "saved to /home/me/code/app/.moon/playwright/page-1.png";
+		let text = "saved to /home/me/code/app/.playwright-mcp/page-1.png";
 		assert_eq!(target.host_paths(text), text);
 	}
 
