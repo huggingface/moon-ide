@@ -349,9 +349,9 @@ class SessionViewState {
 	 *  result being on screen. Set on `turn_complete` / `aborted`
 	 *  / `error` whenever the session is not the one the user is
 	 *  currently following; cleared when the user opens / picks
-	 *  the session. The folder-level [`FolderState.attentionPending`]
-	 *  rollup stays as-is for the folder-bar sparkle; this is the
-	 *  per-row granularity inside the list. */
+	 *  the session. The folder-bar sparkle rolls these per-session
+	 *  flags up (see [`CoderPanelState.attentionPendingForFolder`]);
+	 *  this is the per-row granularity inside the list. */
 	attentionPending = $state(false);
 	activeSession = $state<CoderSessionSummary | null>(null);
 	viewSubagentId = $state<string | null>(null);
@@ -411,29 +411,14 @@ class SessionViewState {
  *
  *  Holds folder-scoped fields plus a map of per-session buckets.
  *  Per ADR 0016, several sessions can run concurrently in one
- *  folder; folder-level fields here are rolled up across them
- *  (`attentionPending` is "any session in this folder finished
- *  while the user was looking elsewhere"). Session-scoped fields
- *  live on [`SessionViewState`] under `sessionsById`. */
+ *  folder; folder-bar status rollups derive from the per-session
+ *  buckets (`sessionsById`), so session-scoped fields live on
+ *  [`SessionViewState`]. */
 class FolderState {
 	/** On-disk sessions list (lazy-fetched). */
 	sessions = $state<CoderSessionSummary[] | null>(null);
 	/** Panel-level view selector for this folder. */
 	view = $state<CoderView>('session');
-	/** "An agent in this folder finished a turn while the user
-	 *  wasn't looking, and they haven't visited the folder
-	 *  since." Drives the static amber sparkle on the folder bar
-	 *  for non-active projects with completed work, so a user
-	 *  juggling background agents notices "that one's done"
-	 *  without needing the panel open. Set on
-	 *  `turn_complete` / `aborted` / `error` only for folders
-	 *  that are not currently active (an active-folder
-	 *  completion is something the user is already looking at).
-	 *  Cleared in [`setActiveFolder`] when the user switches to
-	 *  the folder. Folder-scoped (not per-session) so the badge
-	 *  rolls up: any session finishing in a background folder
-	 *  lights the same sparkle. */
-	attentionPending = $state(false);
 	/** Session id the panel is currently mounted on for this
 	 *  folder; `null` when there is no visible session (cold
 	 *  start before hydration, or after deleting the visible
@@ -618,7 +603,7 @@ export type HubSyncRowState =
  *  collide with a real absolute path. */
 const NO_FOLDER_KEY = '';
 
-class CoderPanelState {
+export class CoderPanelState {
 	/** Whether the right-side slot is currently mounted with the
 	 *  coder surface. Derived from the shared `rightPanel.kind` —
 	 *  chat and coder share one slot. */
@@ -1172,34 +1157,38 @@ class CoderPanelState {
 		return false;
 	}
 
-	/** "Is any session in this folder currently running a turn?"
-	 *  Used by the project-bar to surface a pulsing pip when a
-	 *  background turn is mid-flight in a folder the user isn't
-	 *  currently viewing. Goes through `bucketFor` so the read
-	 *  sets up reactivity on the folder's `sessionsById`
-	 *  `SvelteMap`; the lazy-create of an empty folder bucket per
-	 *  bound folder is cheap. */
+	/** "Is any session rooted at this folder itself currently
+	 *  running a turn?" Used by the project-bar to surface a
+	 *  pulsing pip when a background turn is mid-flight in a
+	 *  folder the user isn't currently viewing. Goes through
+	 *  `bucketFor` so the read sets up reactivity on the folder's
+	 *  `sessionsById` `SvelteMap`; the lazy-create of an empty
+	 *  folder bucket per bound folder is cheap. */
 	busyForFolder(folder: string): boolean {
-		const f = this.bucketFor(folder);
-		for (const session of f.sessionsById.values()) {
-			if (session.busy) {
-				return true;
-			}
-		}
-		return false;
+		return this.#rollupForFolder(folder, (session) => session.busy);
 	}
 
-	/** "Is any session in this folder parked on an `ask_user`
-	 *  prompt, waiting for the human?" The folder bar reads this so
-	 *  a background folder whose agent is blocked on a question
-	 *  shows a distinct "needs input" glyph instead of the plain
-	 *  "running" pulse — telling the user *which* background agent
-	 *  is waiting on them. Same per-folder shape + reactivity as
-	 *  [`busyForFolder`]. */
+	/** "Is any session rooted at this folder itself parked on an
+	 *  `ask_user` prompt, waiting for the human?" The folder bar
+	 *  reads this so a background folder whose agent is blocked on
+	 *  a question shows a distinct "needs input" glyph instead of
+	 *  the plain "running" pulse — telling the user *which*
+	 *  background agent is waiting on them. Same per-folder shape
+	 *  + reactivity as [`busyForFolder`]. */
 	awaitingInputForFolder(folder: string): boolean {
+		return this.#rollupForFolder(folder, (session) => session.awaitingInput);
+	}
+
+	/** Shared rollup behind the `*ForFolder` reads. Only sessions
+	 *  rooted at the folder itself count: a worktree session shares
+	 *  its parent's coder bucket (ADR 0028), so an unfiltered scan
+	 *  would paint the parent row's glyph for a worktree agent's
+	 *  state — the worktree row surfaces those via its own
+	 *  `*ForWorktree` reads. */
+	#rollupForFolder(folder: string, flag: (session: SessionViewState) => boolean): boolean {
 		const f = this.bucketFor(folder);
-		for (const session of f.sessionsById.values()) {
-			if (session.awaitingInput) {
+		for (const [id, session] of f.sessionsById) {
+			if (flag(session) && this.#sessionWorktreeRoot(f, id) === null) {
 				return true;
 			}
 		}
@@ -1210,9 +1199,9 @@ class CoderPanelState {
 	 *  reads above. Because a worktree folder shares its parent's
 	 *  coder bucket (ADR 0028), the generic `busyForFolder` /
 	 *  `awaitingInputForFolder` / `attentionPendingForFolder`
-	 *  reflect *any* session in the parent bucket — not just the
-	 *  one whose `worktree_root` matches the worktree row the user
-	 *  is looking at. These filter by `worktreeRoot` so the folder
+	 *  reflect sessions rooted at the parent itself — not the one
+	 *  whose `worktree_root` matches the worktree row the user is
+	 *  looking at. These filter by `worktreeRoot` so the folder
 	 *  bar's agent-state glyph on a worktree row reflects only the
 	 *  session(s) running in that specific worktree. */
 	busyForWorktree(coderRoot: string, worktreeRoot: string): boolean {
@@ -1262,13 +1251,14 @@ class CoderPanelState {
 		return null;
 	}
 
-	/** "Has an agent in this folder finished a turn that the user
-	 *  hasn't seen yet?" Same per-folder shape as [`busyForFolder`].
-	 *  The folder bar reads through this so a switch back to the
-	 *  folder (which clears the flag in [`setActiveFolder`]) re-
-	 *  renders the bar without the badge. */
+	/** "Has an agent rooted at this folder itself finished a turn
+	 *  the user hasn't seen yet?" Rolls up the per-session
+	 *  [`SessionViewState.attentionPending`] flags (same per-folder
+	 *  shape + worktree exclusion as [`busyForFolder`]) so the
+	 *  folder bar re-renders when a switch back to the folder
+	 *  clears them in [`setActiveFolder`]. */
 	attentionPendingForFolder(folder: string): boolean {
-		return this.bucketFor(folder).attentionPending;
+		return this.#rollupForFolder(folder, (session) => session.attentionPending);
 	}
 
 	// Two-layer field forwards. Components keep reading
@@ -2138,17 +2128,8 @@ class CoderPanelState {
 		}
 		this.activeFolderPath = path;
 		this.#activeFolderActual = actual;
-		// Clear any "agent finished, not seen yet" badge on the
-		// folder we're switching to — the user is now looking
-		// (or about to look). We only consult an existing bucket
-		// rather than `bucketFor` so we don't lazy-create empty
-		// buckets on every folder switch; a folder with no bucket
-		// has no flag to clear by definition.
 		if (path !== null) {
 			const bucket = this.byFolder.get(path);
-			if (bucket !== undefined && bucket.attentionPending) {
-				bucket.attentionPending = false;
-			}
 			// If the session we're switching back into view is the
 			// one that finished while we were away, the user is now
 			// looking at it — drop its per-row `finished` marker too.
@@ -3000,33 +2981,6 @@ class CoderPanelState {
 	 *    backend's tagging contract), so a sub-agent's
 	 *    transcript builds up in the same bucket as the parent
 	 *    that spawned it. */
-	/** Flip a folder's `attentionPending` flag to `true` iff this
-	 *  is a *background* completion — i.e. a turn that ended
-	 *  while the user was looking at a different folder (or no
-	 *  folder at all). An active-folder turn-end doesn't need
-	 *  the badge: the user is already on the panel, the result
-	 *  is already on screen, and lighting up an "agent finished"
-	 *  cue would just be visual noise.
-	 *
-	 *  The `NO_FOLDER_KEY` guard suppresses the badge for the
-	 *  pre-bind sentinel bucket: a turn that completed before
-	 *  any folder was active can't be associated with a folder
-	 *  bar to render on, so the flag would be dead state.
-	 *
-	 *  Folder-scoped (not per-session) per ADR 0016: any session
-	 *  finishing in a background folder rolls up to the same
-	 *  folder-bar sparkle. */
-	#flagAttentionIfBackground(folderBucket: FolderState, folder: string): void {
-		if (folder === NO_FOLDER_KEY) {
-			return;
-		}
-		const active = this.activeFolderPath ?? NO_FOLDER_KEY;
-		if (folder === active) {
-			return;
-		}
-		folderBucket.attentionPending = true;
-	}
-
 	/** Flip a *session's* `attentionPending` flag iff its turn
 	 *  ended while the user wasn't following it. "Following" means
 	 *  all three hold: the session's folder is the active one, the
@@ -3034,12 +2988,10 @@ class CoderPanelState {
 	 *  the folder's `visibleSessionId` points at this session.
 	 *  Anything else — a different folder, the list view, or a
 	 *  different session mounted — is a background completion that
-	 *  earns the orange `finished` marker on this row.
-	 *
-	 *  This is the per-row counterpart to
-	 *  [`#flagAttentionIfBackground`]'s folder-level rollup: the
-	 *  folder-bar sparkle answers "any session here done?", this
-	 *  answers "which rows?". */
+	 *  earns the orange `finished` marker on this row. The folder
+	 *  bar's "agent finished" sparkle is a rollup of these
+	 *  per-session flags (see [`attentionPendingForFolder`] /
+	 *  [`attentionPendingForWorktree`]). */
 	#flagSessionAttentionIfBackground(
 		session: SessionViewState,
 		folder: FolderState,
@@ -3165,11 +3117,11 @@ class CoderPanelState {
 	/** Handle one session-scoped inner event. `session` is the
 	 *  per-session bucket (lazy-created by `sessionStateFor`);
 	 *  `folder` is its containing folder bucket, needed for
-	 *  folder-level rollups (`attentionPending`, `sessions` list
-	 *  on title updates). `sessionId` mirrors the envelope so we
-	 *  can patch the folder-level sessions list (e.g. bump
-	 *  `updated_at_ms` for re-sort) without re-fetching from
-	 *  disk. */
+	 *  folder-level rollups (`sessions` list on title updates,
+	 *  background-completion following checks). `sessionId` mirrors
+	 *  the envelope so we can patch the folder-level sessions list
+	 *  (e.g. bump `updated_at_ms` for re-sort) without re-fetching
+	 *  from disk. */
 	#applySessionEvent(
 		session: SessionViewState,
 		folder: FolderState,
@@ -3381,13 +3333,12 @@ class CoderPanelState {
 				session.openIpcMs = null;
 				session.replayStartedAtMs = null;
 				session.replaying = false;
-				// Both attention markers are gated on `!wasReplay`: a
+				// The attention marker is gated on `!wasReplay`: a
 				// replay terminator is a reopen (the user — or the
 				// phone companion — actively looking), not a
 				// background completion, so it must not light the
 				// folder-bar sparkle either.
 				if (!wasReplay) {
-					this.#flagAttentionIfBackground(folder, folderPath);
 					this.#flagSessionAttentionIfBackground(session, folder, folderPath, sessionId);
 				}
 				return;
@@ -3414,7 +3365,6 @@ class CoderPanelState {
 					}
 				}
 				session.rows.push({ kind: 'aborted', id: nextRowId('aborted') });
-				this.#flagAttentionIfBackground(folder, folderPath);
 				this.#flagSessionAttentionIfBackground(session, folder, folderPath, sessionId);
 				return;
 			}
@@ -3426,7 +3376,6 @@ class CoderPanelState {
 					id: nextRowId('error'),
 					text: event.message,
 				});
-				this.#flagAttentionIfBackground(folder, folderPath);
 				this.#flagSessionAttentionIfBackground(session, folder, folderPath, sessionId);
 				return;
 			case 'session_loaded': {

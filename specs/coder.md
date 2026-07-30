@@ -608,7 +608,10 @@ in another session would hijack the one the user actually had open.
 The session list paints per-row status: **needs input** (parked on
 `ask_user`; takes precedence over running), **running** (busy), and
 **finished** (turn ended while the user wasn't following; cleared on
-open). Folder-bar glyphs mirror the same three states as rollups.
+open). Folder-bar glyphs mirror the same three states as rollups of the
+per-session flags, scoped by worktree context: a worktree session's
+state shows only on its worktree row, never on the parent row (the
+parent row counts sessions rooted at the parent itself).
 Reopening a still-running session preserves these states: the replay
 batch's trailing `TurnComplete` terminator clears the pip, so `Replay`
 carries an `in_flight` flag and the frontend re-asserts **running** /

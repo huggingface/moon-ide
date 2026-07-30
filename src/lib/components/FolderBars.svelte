@@ -32,16 +32,21 @@
 	//       turn is in flight (and not parked) for the folder
 	//       (drives attention through motion).
 	//     - **Finished, not seen**: static amber sparkle after
-	//       a turn ends in a *non-active* folder, persisting
-	//       until the user clicks that folder bar to switch
-	//       active. Lets a user juggling background agents see
-	//       "this one's done, look at it" without missing the
-	//       completion. Cleared in `coder.setActiveFolder`.
+	//       a turn ends while the user wasn't following that
+	//       session, persisting until the user opens it. Lets a
+	//       user juggling background agents see "this one's done,
+	//       look at it" without missing the completion. Cleared
+	//       when the finished session becomes visible (folder
+	//       switch / session pick via `coder.setActiveFolder` /
+	//       `coder.openSession`).
 	//   Sits in the same per-row column as the git badges so it
 	//   doesn't push the name around. Reads through
 	//   `coder.awaitingInputForFolder`, `coder.busyForFolder` and
-	//   `coder.attentionPendingForFolder` so the glyph tracks the
-	//   bucket's reactive `$state`.
+	//   `coder.attentionPendingForFolder` (or their
+	//   `*ForWorktree` counterparts on a worktree row — ADR 0028)
+	//   so the glyph tracks the bucket's reactive `$state`. A
+	//   worktree session's state shows on the worktree row only,
+	//   never on the parent row.
 	// - **Git change badges** (`+N ~N -N`) — added / modified /
 	//   deleted counts pulled from the per-folder
 	//   `gitChangeSummaries` map. Refreshed on workspace hydrate,
