@@ -490,9 +490,12 @@ the workspace has no enabled servers, and neither is mode-gated
 (same posture as `bash` — sub-agents get them too).
 
 - **Presets + customs.** One hardcoded preset: `playwright`
-  (`npx -y @playwright/mcp@latest --browser chromium` — pinned to
-  Playwright's bundled Chromium so it doesn't require real Google
-  Chrome on the host). Custom servers — label,
+  (`npx -y @playwright/mcp@latest --browser chromium --headless
+--image-responses omit` — pinned to Playwright's bundled
+  Chromium so it doesn't require real Google Chrome; headless
+  because the coder drives via snapshots, not a window on the
+  dev's display; image blocks omitted because they render as a
+  text placeholder today). Custom servers — label,
   command + args (stdio transport only), run target, description —
   live per workspace on `WorkspaceSession.coder_mcp`, managed from
   the model-settings modal's "MCP servers" section via the
@@ -500,10 +503,19 @@ the workspace has no enabled servers, and neither is mode-gated
 - **Per-workspace enable set**, following the provider-lock
   precedent. Toggles write through immediately; the next turn's
   tool list reflects them.
-- **Per-server run target**: `host` (playwright's default — it
-  needs a real browser) or `container` (`docker exec -i` when the
-  workspace shell container is `Running`, host fallback — same
-  probe as `bash`).
+- **Per-server run target**: `container` (playwright's default —
+  the browser joins the coder's sandbox and sits next to the dev
+  servers it exercises; the one-time chromium download rides the
+  container's npx cache) or `host`. `container` spawns via
+  `docker exec -i` when the workspace shell container is
+  `Running`, host fallback — same probe as `bash`.
+- **Playwright output is pinned to `<active-folder>/.moon/
+playwright/`** (`--output-dir`, relative so both spawn targets
+  resolve it through the bind mount) — screenshots and PDFs land
+  under one gitignored host path whichever side the server runs
+  on. Container-local paths in tool results (`/workspace/<folder>/
+…`) are rewritten to host paths before the model sees them, so
+  a reported screenshot path feeds straight into `read_file`.
 - **Lifecycle**: spawned lazily on first use, kept alive across
   turns (a playwright browser session persists between calls),
   killed on disable / remove / IDE exit, respawned on the next call

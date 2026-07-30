@@ -59,10 +59,23 @@ pub fn preset_servers() -> Vec<McpServerConfig> {
 			"@playwright/mcp@latest".into(),
 			"--browser".into(),
 			"chromium".into(),
+			// The coder drives the browser via snapshots; a headed
+			// window popping open on the dev's display is noise,
+			// and in-container runs have no display anyway.
+			"--headless".into(),
+			// Image content blocks render as a text placeholder
+			// (ADR 0033) — carrying base64 screenshots through
+			// the pipe is dead weight until tool-result images land.
+			"--image-responses".into(),
+			"omit".into(),
 		],
-		// Host by default: driving a browser needs one installed,
-		// and moon-base doesn't ship browsers.
-		runs: McpRunTarget::Host,
+		// Container by default (amendment, ADR 0033): the
+		// browser then lives in the same sandbox as the coder's
+		// `bash` and next to the dev servers it exercises. The
+		// one-time `chromium` download rides the container's npx
+		// cache; a down container falls back to the host, same
+		// probe as `bash`.
+		runs: McpRunTarget::Container,
 		description: "Browser automation via Playwright: navigate, click, type, take accessibility snapshots and \
 		              screenshots of real pages. Use it to exercise or debug a running web app."
 			.into(),
@@ -165,7 +178,7 @@ impl McpManager {
 		let result = self
 			.request(&conn, config, "tools/call", params, CALL_TIMEOUT, cancel)
 			.await?;
-		let text = render_content(&result);
+		let text = spawn.host_paths(&render_content(&result));
 		if result.get("isError").and_then(Value::as_bool).unwrap_or(false) {
 			return Err(CoderError::tool_failed("mcp_call", text));
 		}
@@ -242,12 +255,80 @@ impl McpManager {
 	}
 }
 
+/// The output files a playwright MCP server writes (screenshots,
+/// PDFs, session state), relative to the server's spawn cwd — the
+/// active folder's root. Relative on purpose: the folder is
+/// bind-mounted into the workspace container, so one value is
+/// valid on both spawn targets, and the file lands under the same
+/// host path either way. `.moon/` is the folder's gitignored
+/// per-dev state dir.
+const PLAYWRIGHT_OUTPUT_DIR: &str = ".moon/playwright";
+
+/// Argv actually passed to the server: the configured args plus
+/// moon-managed per-spawn additions. Today that's just the
+/// playwright preset's `--output-dir` — the MCP otherwise picks
+/// `<cwd>/.playwright-mcp` or, when the cwd isn't writable,
+/// `$TMPDIR/.playwright-mcp`, and a host-side `/tmp` path is
+/// unreachable from the coder's container-mode tools (and vice
+/// versa). Preset-specific and therefore matched on id rather
+/// than inferred from argv.
+fn spawn_args(config: &McpServerConfig) -> Vec<String> {
+	let mut args = config.args.clone();
+	if config.id == "playwright" {
+		args.push("--output-dir".into());
+		args.push(PLAYWRIGHT_OUTPUT_DIR.into());
+	}
+	args
+}
+
 /// Where to spawn a server process, resolved by the caller (the
 /// tool registry knows the workspace's container name + cwd; this
 /// module doesn't probe docker itself).
 pub enum McpSpawnTarget {
-	Host { cwd: String },
-	Container { name: String, cwd: String },
+	Host {
+		cwd: String,
+	},
+	Container {
+		name: String,
+		cwd: String,
+		/// The active folder's bind-mount pair
+		/// (`host_root` → `container_root`, e.g. `/home/me/app` →
+		/// `/workspace/app`). Used to rewrite container-local
+		/// paths a server reports (a saved screenshot under
+		/// `/workspace/app/…`) back to the host path the coder's
+		/// filesystem tools resolve against.
+		host_root: String,
+		container_root: String,
+	},
+}
+
+impl McpSpawnTarget {
+	/// Rewrite container-local absolute paths in `text` to their
+	/// host-side equivalent. No-op on the host target — those
+	/// servers already report host paths.
+	fn host_paths(&self, text: &str) -> String {
+		match self {
+			McpSpawnTarget::Host { .. } => text.to_owned(),
+			McpSpawnTarget::Container {
+				host_root,
+				container_root,
+				..
+			} => {
+				let mut out = text.to_owned();
+				for sep in ['/', ' '] {
+					let from = format!("{container_root}{sep}");
+					let to = format!("{host_root}{sep}");
+					out = out.replace(&from, &to);
+				}
+				if let Some(prefix) = out.strip_suffix(container_root) {
+					if prefix.ends_with(' ') {
+						out = format!("{prefix}{host_root}");
+					}
+				}
+				out
+			}
+		}
+	}
 }
 
 /// In-flight requests parked on their response oneshots, keyed by
@@ -267,12 +348,12 @@ impl McpConnection {
 		let mut command = match target {
 			McpSpawnTarget::Host { cwd } => {
 				let mut command = tokio::process::Command::new(&config.command);
-				command.args(&config.args).current_dir(cwd);
+				command.args(spawn_args(config)).current_dir(cwd);
 				command
 			}
 			// `-i` keeps stdin open — that *is* the transport.
 			// No `-t`: a TTY would garble the JSON framing.
-			McpSpawnTarget::Container { name, cwd } => {
+			McpSpawnTarget::Container { name, cwd, .. } => {
 				let mut command = tokio::process::Command::new("docker");
 				command
 					.arg("exec")
@@ -281,7 +362,7 @@ impl McpConnection {
 					.arg(cwd)
 					.arg(name)
 					.arg(&config.command)
-					.args(&config.args);
+					.args(spawn_args(config));
 				command
 			}
 		};
@@ -605,5 +686,72 @@ rl.on('line', (line) => {
 		let text = render_content(&result);
 		assert!(text.starts_with("hello\n["));
 		assert!(text.contains("image/png"));
+	}
+
+	#[test]
+	fn preset_spawns_headless_in_container_and_omits_images() {
+		let preset = &preset_servers()[0];
+		assert_eq!(preset.id, "playwright");
+		assert!(matches!(preset.runs, McpRunTarget::Container));
+		assert!(preset.args.iter().any(|a| a == "--headless"));
+		let omit = preset
+			.args
+			.windows(2)
+			.any(|w| w[0] == "--image-responses" && w[1] == "omit");
+		assert!(omit, "preset should pass `--image-responses omit`");
+	}
+
+	#[test]
+	fn spawn_args_pin_playwright_output_to_shared_folder_state() {
+		let preset = &preset_servers()[0];
+		let args = spawn_args(preset);
+		let pair = args
+			.windows(2)
+			.find(|w| w[0] == "--output-dir")
+			.expect("playwright spawn args should carry --output-dir");
+		assert_eq!(pair[1], ".moon/playwright");
+
+		// Non-playwright servers spawn with their configured argv
+		// verbatim.
+		let server = custom("mcp-1");
+		assert_eq!(spawn_args(&server), server.args);
+	}
+
+	#[test]
+	fn container_target_rewrites_reported_paths_to_host() {
+		let target = McpSpawnTarget::Container {
+			name: "moon-ws-default-dev-1".into(),
+			cwd: "/workspace/app".into(),
+			host_root: "/home/me/code/app".into(),
+			container_root: "/workspace/app".into(),
+		};
+		let text = "### Screenshot\nsaved to /workspace/app/.moon/playwright/page-1.png\nroot is /workspace/app";
+		let rewritten = target.host_paths(text);
+		assert_eq!(
+			rewritten,
+			"### Screenshot\nsaved to /home/me/code/app/.moon/playwright/page-1.png\nroot is /home/me/code/app"
+		);
+	}
+
+	#[test]
+	fn container_rewrite_ignores_unrelated_workspace_paths() {
+		let target = McpSpawnTarget::Container {
+			name: "moon-ws-default-dev-1".into(),
+			cwd: "/workspace/app".into(),
+			host_root: "/home/me/code/app".into(),
+			container_root: "/workspace/app".into(),
+		};
+		// A sibling folder's mount isn't ours to translate.
+		let text = "see /workspace/other/file.txt";
+		assert_eq!(target.host_paths(text), text);
+	}
+
+	#[test]
+	fn host_target_leaves_paths_untouched() {
+		let target = McpSpawnTarget::Host {
+			cwd: "/home/me/code/app".into(),
+		};
+		let text = "saved to /home/me/code/app/.moon/playwright/page-1.png";
+		assert_eq!(target.host_paths(text), text);
 	}
 }

@@ -1303,6 +1303,8 @@ impl ToolRegistry {
 		McpSpawnTarget::Container {
 			name: container_name_for_workspace(&workspace_id),
 			cwd: container_cwd.to_string(),
+			host_root: host_cwd,
+			container_root: container_cwd.to_string(),
 		}
 	}
 

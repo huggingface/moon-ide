@@ -70,3 +70,33 @@ chromium` — the server's default `chrome` channel wants real
   pi JSONL tool-result shape is text-only today; image blocks
   render as a placeholder. The accessibility snapshot (text) is
   playwright MCP's primary interface anyway.
+
+## Amendment 2026-07-30 — playwright in the container, shared output dir
+
+Three changes after the preset met real use:
+
+- **Playwright defaults to `container`, not `host`.** The original
+  reason was "moon-base ships no browser", but the cost turned out
+  to be one `npx playwright install chromium` on first use, cached
+  in the container's home. In exchange the browser joins the
+  sandbox the rest of the coder's tools already run in (a
+  container-mode session no longer reaches host resources through
+  the playwright back door) and sits next to the dev servers it
+  exercises. Chromium dies with a container Recreate; respawn is
+  on-demand, bounded by the npx cache.
+- **`--output-dir .moon/playwright` is pinned at spawn.** The MCP
+  otherwise writes screenshots to `<cwd>/.playwright-mcp` or, for
+  an unwritable cwd, `$TMPDIR/.playwright-mcp` — a host `/tmp`
+  path the coder's container-mode tools can't resolve (and vice
+  versa). The dir is **relative** so one value is valid on both
+  spawn targets: the active folder is bind-mounted, so host and
+  container writes land in the same bytes, under a dir that's
+  already gitignored.
+- **Container-local paths in tool results are rewritten to host
+  paths** (`/workspace/<folder>/…` → the folder's host path) so
+  the model can hand a reported screenshot path straight to
+  `read_file`. Only the active folder's mount pair is translated.
+- Preset also gained `--headless` (the coder drives via snapshots;
+  a headed window on the dev's display is noise, and containers
+  have none) and `--image-responses omit` (image blocks render as
+  a placeholder today — the base64 was dead weight).
