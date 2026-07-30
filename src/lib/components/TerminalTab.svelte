@@ -447,6 +447,12 @@
 			foreground: v('--m-fg', '#e1e3e8'),
 			cursor: v('--m-fg', '#e1e3e8'),
 			cursorAccent: v('--m-bg', '#0e0f12'),
+			// Links / highlighted URLs / anything else xterm paints
+			// blue should pick up the workspace hue (ADR 0047) — the
+			// terminal is otherwise ANSI-colour territory, which is
+			// program output and stays untouched.
+			blue: v('--m-accent', '#7ea3ff'),
+			brightBlue: v('--m-accent-strong', '#a8c0ff'),
 			selectionBackground: v('--m-selection', '#264f78'),
 		};
 	}

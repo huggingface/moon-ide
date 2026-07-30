@@ -153,9 +153,9 @@ The user picks one of three modes in the status-bar theme picker — **System**,
 - Live OS-theme flips go through the same platform split. On Linux a tokio task in the desktop shell subscribes to `Settings.receive_color_scheme_changed` via ashpd and re-broadcasts each change as the `system:theme-changed` Tauri event, which the frontend `listen`s for. On macOS / Windows `getCurrentWindow().onThemeChanged` fires directly on the webview, so the Linux watcher compiles to a no-op there. `matchMedia` is left wired as a last-resort fallback for non-Tauri dev shells (vite-only).
 - Surfaces that can't read CSS variables (CodeMirror's `dark: boolean` build-time flag, xterm.js's option-bag palette) have their own `$effect` blocks keyed on `effectiveTheme` and reconfigure when it flips.
 
-### Workspace identity tint
+### Workspace colour scheme
 
-Each workspace's badge colour (`WorkspaceMeta.color`, else the hash-derived hue) also tints the chrome so multiple open windows are distinguishable at a glance — see [ADR 0047](decisions/0047-workspace-chrome-tint.md). JS writes derived `--m-ws-accent*` custom properties on `:root` at hydrate (light + dark variants up front; `:root.light` picks which is live). Only identity surfaces consume them: active folder bar, focused editor-tab underline, status-bar stripe. Syntax highlighting and the neutral `--m-*` palette are deliberately untouched.
+Each workspace's badge colour (`WorkspaceMeta.color`, else the hash-derived hue) drives a full per-workspace colour scheme so multiple open windows are distinguishable at a glance — see [ADR 0047](decisions/0047-workspace-chrome-tint.md). At hydrate, JS derives the whole `--m-*` surface/border/text/accent token set from the colour's hue and writes it on `:root` (dark values on the plain names, light on `*-light` twins; `:root.light` re-points the plain names at the twins, so theme flips stay pure CSS). Surfaces get the hue at low saturation, text stays neutral, and `--m-accent` carries the hue at full voice so every existing accent consumer follows for free. Warning re-pins to amber unless the workspace hue is amber itself. Syntax highlighting (`--m-syntax-*`) and ANSI terminal colours are deliberately untouched.
 
 ## Window state
 

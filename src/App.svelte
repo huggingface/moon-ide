@@ -24,7 +24,7 @@
 	import { ipc } from './lib/ipc';
 	import { formatError } from './lib/protocol';
 	import { resolveAppInfo } from './lib/workspace-id';
-	import { applyWorkspaceAccent } from './lib/workspaceTheme';
+	import { applyWorkspaceScheme } from './lib/workspaceTheme';
 	import { workspacePicker } from './lib/workspacePicker.svelte';
 	import { workspaceCreate } from './lib/workspaceCreate.svelte';
 	import WorkspacePicker from './lib/components/WorkspacePicker.svelte';
@@ -440,9 +440,9 @@
 			return;
 		}
 		workspace.workspaceName = info.workspaceName ?? info.workspaceId;
-		// Paint the workspace identity tint before the chrome first
-		// renders so no frame shows the neutral fallback accent.
-		applyWorkspaceAccent(info.workspaceId, info.workspaceColor);
+		// Paint the workspace colour scheme before the chrome first
+		// renders so no frame shows the neutral fallback palette.
+		applyWorkspaceScheme(info.workspaceId, info.workspaceColor);
 		// The backend has already replayed the persisted folder list and
 		// active-folder pointer at launch (see src-tauri/src/lib.rs),
 		// so the first call to `workspace_active` returns the full,

@@ -71,19 +71,14 @@
 	--m-warning: #f0b86e;
 	--m-danger: #ff7a8a;
 
-	/* Workspace identity tint (ADR 0047). Filled in by JS at boot
-	   (`applyWorkspaceAccent` in `lib/workspaceTheme.ts`) from the
-	   workspace's badge colour; the fallbacks below only cover the
-	   brief pre-hydrate window and the vitest environment. The
-	   `.light` class swaps in the `*-light` variants — both are
-	   written up-front so a theme flip is a pure CSS change.
-	   Identity surfaces only: folder bars, editor tabs, status bar.
-	   Deliberately *not* `--m-syntax-*` — code readability stays
-	   palette-owned. */
+	/* Workspace identity tint (ADR 0047). Alias of `--m-accent` for
+	   surfaces whose job is workspace identity (folder bar, active
+	   tab, status-bar stripe) as opposed to generic interactivity —
+	   both resolve to the workspace-derived accent at runtime, but
+	   the separate name keeps a future "decouple identity from
+	   interactive accent" change to a one-line edit. */
 	--m-ws-accent: var(--m-accent);
 	--m-ws-accent-soft: rgba(126, 163, 255, 0.22);
-	--m-ws-accent-light: var(--m-accent);
-	--m-ws-accent-soft-light: rgba(67, 96, 200, 0.16);
 
 	/* Inline code accent — used by chat / Slack messages only.
 	   Distinct from `--m-fg` so `\`code\`` reads as a token at a
@@ -172,24 +167,29 @@
 
 :root.light {
 	color-scheme: light;
-	/* Workspace tint light variants (see the dark block above). */
-	--m-ws-accent: var(--m-ws-accent-light);
-	--m-ws-accent-soft: var(--m-ws-accent-soft-light);
-	--m-bg: #fafbfd;
-	--m-bg-1: #f1f3f8;
-	--m-bg-2: #e9edf5;
-	--m-bg-3: #dde2ee;
-	--m-bg-overlay: rgba(0, 0, 0, 0.04);
-	--m-border: #d6dbe6;
-	--m-border-strong: #b8c0d2;
-	--m-fg: #16192a;
-	--m-fg-muted: #5e6885;
-	--m-fg-subtle: #8a93ab;
-	--m-accent: #4360c8;
-	--m-accent-strong: #2a3fa1;
+	/* Workspace scheme light variants (ADR 0047): every token the
+	   workspace generator writes has a `*-light` twin; the light
+	   values below are the pre-hydrate fallbacks matching the
+	   generator's defaults. `--m-ws-accent` needs no remap — it
+	   aliases `--m-accent`, which is remapped like everything
+	   else. */
+	--m-bg: var(--m-bg-light, #fafbfd);
+	--m-bg-1: var(--m-bg-1-light, #f1f3f8);
+	--m-bg-2: var(--m-bg-2-light, #e9edf5);
+	--m-bg-3: var(--m-bg-3-light, #dde2ee);
+	--m-bg-overlay: var(--m-bg-overlay-light, rgba(0, 0, 0, 0.04));
+	--m-border: var(--m-border-light, #d6dbe6);
+	--m-border-strong: var(--m-border-strong-light, #b8c0d2);
+	--m-fg: var(--m-fg-light, #16192a);
+	--m-fg-muted: var(--m-fg-muted-light, #5e6885);
+	--m-fg-subtle: var(--m-fg-subtle-light, #8a93ab);
+	--m-accent: var(--m-accent-light, #4360c8);
+	--m-accent-strong: var(--m-accent-strong-light, #2a3fa1);
+	--m-warning: var(--m-warning-light, #b45309);
+	--m-editor-selection: var(--m-editor-selection-light, rgba(67, 96, 200, 0.15));
+	--m-ws-accent-soft: var(--m-ws-accent-soft-light, rgba(67, 96, 200, 0.16));
 	--m-editor-bg: var(--m-bg);
 	--m-editor-line-active: rgba(0, 0, 0, 0.02);
-	--m-editor-selection: rgba(67, 96, 200, 0.15);
 	--m-code-fg: #c7254e;
 	--m-code-bg: rgba(199, 37, 78, 0.08);
 	--m-code-border: rgba(199, 37, 78, 0.18);

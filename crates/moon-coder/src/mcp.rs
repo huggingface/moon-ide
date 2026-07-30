@@ -163,6 +163,7 @@ impl McpManager {
 		cancel: &CancellationToken,
 	) -> Result<Value, CoderError> {
 		let conn = self.connection(config, spawn, cancel).await?;
+		let args = scoped_args(config, args);
 		let params = json!({ "name": tool, "arguments": args });
 		let result = self
 			.request(&conn, config, "tools/call", params, CALL_TIMEOUT, cancel)

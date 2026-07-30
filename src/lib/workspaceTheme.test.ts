@@ -1,6 +1,7 @@
+// @vitest-environment happy-dom
 import { describe, expect, it } from 'vitest';
 
-import { deriveWorkspaceAccent, parseHexColor, rgbToHsl } from './workspaceTheme';
+import { applyWorkspaceScheme, deriveWorkspaceAccent, parseHexColor, rgbToHsl } from './workspaceTheme';
 
 describe('parseHexColor', () => {
 	it('parses 6-digit hex with and without the leading #', () => {
@@ -45,12 +46,57 @@ describe('deriveWorkspaceAccent', () => {
 		expect(dark.accent).toBe('hsl(223 65% 72%)');
 		expect(dark.soft).toBe('hsl(223 65% 72% / 0.22)');
 		const light = deriveWorkspaceAccent('#7ea3ff', 'light');
-		expect(light.accent).toBe('hsl(223 65% 40%)');
-		expect(light.soft).toBe('hsl(223 65% 40% / 0.16)');
+		expect(light.accent).toBe('hsl(223 60% 38%)');
+		expect(light.soft).toBe('hsl(223 60% 38% / 0.16)');
 	});
 
 	it('rescues achromatic picks with zero saturation rather than a NaN hue', () => {
-		expect(deriveWorkspaceAccent('#333333', 'dark').accent).toBe('hsl(0 0% 72%)');
-		expect(deriveWorkspaceAccent('not-a-color', 'light').accent).toBe('hsl(0 0% 40%)');
+		expect(deriveWorkspaceAccent('#333333', 'dark').accent).toBe('hsl(0 65% 72%)');
+		expect(deriveWorkspaceAccent('not-a-color', 'light').accent).toBe('hsl(0 60% 38%)');
+	});
+});
+
+describe('applyWorkspaceScheme', () => {
+	it('writes both palettes keyed on the workspace hue', () => {
+		applyWorkspaceScheme('dummy', '#ffd700');
+		const style = document.documentElement.style;
+		// Hue 51 (yellow). Dark surfaces carry a whisper of it; the
+		// accent carries the identity at full voice.
+		expect(style.getPropertyValue('--m-bg')).toBe('hsl(51 2% 8%)');
+		expect(style.getPropertyValue('--m-accent')).toBe('hsl(51 65% 72%)');
+		expect(style.getPropertyValue('--m-accent-light')).toBe('hsl(51 60% 38%)');
+		// Hue 51 sits close to both warning ramps (dark 27, light
+		// 25), so both push toward orange to stay distinguishable.
+		expect(style.getPropertyValue('--m-warning')).toBe('hsl(40 80% 70%)');
+		expect(style.getPropertyValue('--m-warning-light')).toBe('hsl(38 90% 32%)');
+	});
+
+	it('keeps the warning ramp on a far hue', () => {
+		applyWorkspaceScheme('dummy', '#7ea3ff');
+		const style = document.documentElement.style;
+		expect(style.getPropertyValue('--m-warning')).toBe('hsl(27 80% 70%)');
+	});
+
+	it('an amber workspace also moves warning off its own hue', () => {
+		// Amber (45) is even closer to the 27 ramp than gold.
+		applyWorkspaceScheme('dummy', '#f0b000');
+		const style = document.documentElement.style;
+		expect(style.getPropertyValue('--m-warning')).toBe('hsl(40 80% 70%)');
+	});
+
+	it('falls back to the deterministic hash hue on garbage input', () => {
+		// `defaultWorkspaceColor('moon-ide')` hashes to some hue H;
+		// an unparseable stored colour must produce the same scheme
+		// as no colour at all (mirrors the window icon).
+		applyWorkspaceScheme('moon-ide', null);
+		const fromNull = document.documentElement.style.getPropertyValue('--m-accent');
+		applyWorkspaceScheme('moon-ide', 'not-a-color');
+		expect(document.documentElement.style.getPropertyValue('--m-accent')).toBe(fromNull);
+	});
+
+	it('is a no-op in preboot mode (no workspace bound)', () => {
+		document.documentElement.style.removeProperty('--m-accent');
+		applyWorkspaceScheme(null, '#ffd700');
+		expect(document.documentElement.style.getPropertyValue('--m-accent')).toBe('');
 	});
 });
