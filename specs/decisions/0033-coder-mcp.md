@@ -84,11 +84,18 @@ Three changes after the preset met real use:
   the playwright back door) and sits next to the dev servers it
   exercises. Chromium dies with a container Recreate; respawn is
   on-demand, bounded by the npx cache.
-- **`--output-dir .moon/playwright` is pinned at spawn.** The MCP
-  otherwise writes screenshots to `<cwd>/.playwright-mcp` or, for
-  an unwritable cwd, `$TMPDIR/.playwright-mcp` — a host `/tmp`
-  path the coder's container-mode tools can't resolve (and vice
-  versa). The dir is **relative** so one value is valid on both
+- **`--output-dir .moon/playwright` is pinned at spawn.** The
+  symptom that prompted it: screenshots landing in `$TMPDIR` — a
+  host `/tmp` path the coder's container-mode tools can't resolve
+  (and vice versa). The pin stays because the default is a
+  **moving target**: we launch `@playwright/mcp@latest`, and where
+  it puts artefacts absent an explicit dir has already shifted
+  across versions (0.0.78 derives it from the first MCP root,
+  falling back to the server's process cwd, and only uses the temp
+  dir when that is a system dir or unwritable). Pinning makes
+  placement version-independent and puts artefacts under the
+  already-gitignored `.moon/`. The dir is **relative** so one
+  value is valid on both
   spawn targets: the active folder is bind-mounted, so host and
   container writes land in the same bytes, under a dir that's
   already gitignored. `--output-dir` only governs _server-chosen_
@@ -134,3 +141,49 @@ Three changes after the preset met real use:
   explicit `filename`, it reports a path and no pixels — the
   model gets the image by `read_file`-ing that path, which is
   half of why the `read_file` half of this work matters.
+
+## Amendment 2026-07-30 (3) — the `roots` capability
+
+The client now advertises `roots` and answers the server→client
+`roots/list` request with **every bound folder, active folder
+first**, in the spawn target's path space (container paths for a
+container spawn). This replaces relying on the server's process
+cwd, which is where playwright's output dir and file-access
+sandbox were previously coming from _by accident_.
+
+Verified against a real `@playwright/mcp`: it requests `roots/list`
+when the capability is advertised, and `roots[0]` overrides the cwd
+fallback for both its output dir and its sandbox.
+
+Consequences and limits:
+
+- **Only `roots[0]` scopes playwright's file access** (`[output
+dir, first root]`). Advertising the full set is still correct
+  protocol behaviour and costs nothing, but a sibling bound folder
+  stays unreachable — writing into it fails with `File access
+denied: … outside allowed roots`. That's playwright's own
+  single-workspace-root limit, not something the client can fix.
+  Active-folder-first ordering is what makes the common case
+  right.
+- One connection is shared per workspace, so `roots[0]` is the
+  folder that spawned the server. A session in a _different_
+  folder therefore inherits the first folder's sandbox; a
+  disable/enable respawns it. Not keyed per folder because two
+  playwright servers fight over the browser profile (`Browser is
+already in use … use --isolated`), which costs more than the
+  wart.
+- **`--output-dir` stays**, and roots is why it's now a preference
+  rather than a workaround: the default would be
+  `<root>/.playwright-mcp`, which shows up as untracked in any
+  repo, while `.moon/` is already added to `.git/info/exclude`
+  per repo (`add_dir_to_git_exclude`) — so artefacts stay
+  invisible to `git status` everywhere.
+- **Bare `filename` arguments still get scoped** into the output
+  dir. Verified: even with roots declared, playwright resolves a
+  model-supplied bare name against the workspace root, i.e. the
+  repo root. A name with a separator (`docs/shot.png`) is left
+  alone — a bare name expresses no location intent, a path does.
+- Inbound requests we don't implement now get a JSON-RPC `-32601`
+  reply instead of silence, so a server waiting on one can't
+  hang. `listChanged: false`: roots are read at handshake, and a
+  bound-folder change mid-session is covered by respawning.

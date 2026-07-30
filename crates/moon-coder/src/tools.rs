@@ -37,7 +37,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::CoderError;
 use crate::inference::ToolDefinition;
-use crate::mcp::{McpManager, McpSpawnTarget};
+use crate::mcp::{McpManager, McpMount, McpRoot, McpSpawnKind, McpSpawnTarget};
 use crate::web::WebClient;
 
 /// Hard cap on `bash` runtime — keeps a runaway tool call from
@@ -1289,20 +1289,61 @@ impl ToolRegistry {
 	/// as `bash` — container when the workspace shell container is
 	/// `Running`, host otherwise. MCP servers ride the workspace
 	/// mode rather than carrying a per-server run target.
+	///
+	/// Also assembles the `roots` set advertised at handshake: one
+	/// entry per bound folder in the spawn target's path space,
+	/// **active folder first** (servers that take a single
+	/// workspace root use that one), plus the mount pairs needed
+	/// to translate container paths back for the model.
 	async fn mcp_spawn_target(&self, cx: &ToolContext) -> McpSpawnTarget {
 		let host_cwd = cx.folder.folder.path.clone();
 		let target = resolve_bash_target(&self.workspaces, &self.workspaces_dir, cx.force_host_bash(), &cx.folder).await;
+		// Bound folders with the active one hoisted to the front.
+		let mut folders: Vec<String> = vec![host_cwd.clone()];
+		for entry in self.workspaces.folders().await {
+			if entry.folder.path != host_cwd {
+				folders.push(entry.folder.path.clone());
+			}
+		}
+		let root_name = |path: &str| Utf8Path::new(path).file_name().unwrap_or("workspace").to_owned();
 		if target != BASH_TARGET_CONTAINER {
-			return McpSpawnTarget::Host { cwd: host_cwd };
+			let roots = folders
+				.iter()
+				.map(|path| McpRoot {
+					path: path.clone(),
+					name: root_name(path),
+				})
+				.collect();
+			return McpSpawnTarget {
+				kind: McpSpawnKind::Host { cwd: host_cwd },
+				roots,
+				mounts: Vec::new(),
+			};
 		}
 		let workspace_id = self.workspaces.workspace_id().await;
-		let container_cwd = TerminalTarget::container_cwd_for_folder(Utf8Path::new(&cx.folder.folder.path))
-			.unwrap_or_else(|| Utf8PathBuf::from("/workspace"));
-		McpSpawnTarget::Container {
-			name: container_name_for_workspace(&workspace_id),
-			cwd: container_cwd.to_string(),
-			host_root: host_cwd,
-			container_root: container_cwd.to_string(),
+		let container_path = |path: &str| {
+			TerminalTarget::container_cwd_for_folder(Utf8Path::new(path)).unwrap_or_else(|| Utf8PathBuf::from("/workspace"))
+		};
+		let mut roots = Vec::with_capacity(folders.len());
+		let mut mounts = Vec::with_capacity(folders.len());
+		for path in &folders {
+			let container_root = container_path(path).to_string();
+			roots.push(McpRoot {
+				path: container_root.clone(),
+				name: root_name(path),
+			});
+			mounts.push(McpMount {
+				host_root: path.clone(),
+				container_root,
+			});
+		}
+		McpSpawnTarget {
+			kind: McpSpawnKind::Container {
+				name: container_name_for_workspace(&workspace_id),
+				cwd: container_path(&host_cwd).to_string(),
+			},
+			roots,
+			mounts,
 		}
 	}
 

@@ -216,9 +216,19 @@ impl McpManager {
 		// Handshake while holding the map lock: serialises
 		// concurrent first-calls onto one spawn instead of racing
 		// two children for the same server id.
+		// `roots` tells the server which directories this session
+		// is about — the workspace's bound folders. Servers use it
+		// to scope file access and to resolve relative paths
+		// (playwright derives both its output dir and its
+		// file-access sandbox from the first root), so declaring
+		// it beats every per-server path workaround. `listChanged:
+		// false` because we don't push updates: a server picks its
+		// roots up at handshake, and a bound-folder change during
+		// a live session is rare enough to be covered by the
+		// respawn on disable/enable.
 		let init_params = json!({
 			"protocolVersion": MCP_PROTOCOL_VERSION,
-			"capabilities": {},
+			"capabilities": { "roots": { "listChanged": false } },
 			"clientInfo": { "name": "moon-ide", "version": env!("CARGO_PKG_VERSION") },
 		});
 		conn
@@ -268,12 +278,13 @@ const PLAYWRIGHT_OUTPUT_DIR: &str = ".moon/playwright";
 
 /// Argv actually passed to the server: the configured args plus
 /// moon-managed per-spawn additions. Today that's just the
-/// playwright preset's `--output-dir` — the MCP otherwise picks
-/// `<cwd>/.playwright-mcp` or, when the cwd isn't writable,
-/// `$TMPDIR/.playwright-mcp`, and a host-side `/tmp` path is
-/// unreachable from the coder's container-mode tools (and vice
-/// versa). Preset-specific and therefore matched on id rather
-/// than inferred from argv.
+/// playwright preset's `--output-dir`, which pins artefacts to a
+/// path that resolves the same on both spawn targets. We launch
+/// `@latest`, so the server's own default is a moving target
+/// (it has landed in `$TMPDIR` — unreachable across the
+/// host/container boundary — in past versions); pinning keeps
+/// placement version-independent. Preset-specific and therefore
+/// matched on id rather than inferred from argv.
 fn spawn_args(config: &McpServerConfig) -> Vec<String> {
 	let mut args = config.args.clone();
 	if config.id == "playwright" {
@@ -311,6 +322,24 @@ fn scoped_args(config: &McpServerConfig, mut args: Value) -> Value {
 	args
 }
 
+/// One workspace directory advertised to servers over the MCP
+/// `roots` capability, in the *server's* path space (container
+/// paths for a container spawn).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpRoot {
+	pub path: String,
+	pub name: String,
+}
+
+/// A bound folder's bind-mount pair, used to rewrite paths a
+/// container-side server reports back into host paths the coder's
+/// filesystem tools resolve against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpMount {
+	pub host_root: String,
+	pub container_root: String,
+}
+
 /// Where to spawn a server process, resolved by the caller (the
 /// tool registry knows the workspace's container name + cwd; this
 /// module doesn't probe docker itself). MCP servers follow the
@@ -318,52 +347,116 @@ fn scoped_args(config: &McpServerConfig, mut args: Value) -> Value {
 /// otherwise — wherever the coder's `bash` would run. There is
 /// deliberately no per-server knob (an early `runs` config field
 /// was removed unused; the workspace mode *is* the answer).
-pub enum McpSpawnTarget {
-	Host {
-		cwd: String,
-	},
-	Container {
-		name: String,
-		cwd: String,
-		/// The active folder's bind-mount pair
-		/// (`host_root` → `container_root`, e.g. `/home/me/app` →
-		/// `/workspace/app`). Used to rewrite container-local
-		/// paths a server reports (a saved screenshot under
-		/// `/workspace/app/…`) back to the host path the coder's
-		/// filesystem tools resolve against.
-		host_root: String,
-		container_root: String,
-	},
+pub struct McpSpawnTarget {
+	pub kind: McpSpawnKind,
+	/// Bound folders to advertise via `roots/list`, **active
+	/// folder first** — servers that accept a single workspace
+	/// root take the first one (playwright derives its output
+	/// dir and its file-access sandbox from it).
+	pub roots: Vec<McpRoot>,
+	/// Mount pairs for container→host path rewriting. Empty for
+	/// a host spawn (paths already are host paths).
+	pub mounts: Vec<McpMount>,
+}
+
+pub enum McpSpawnKind {
+	Host { cwd: String },
+	Container { name: String, cwd: String },
 }
 
 impl McpSpawnTarget {
 	/// Rewrite container-local absolute paths in `text` to their
 	/// host-side equivalent, so the model can hand a reported
 	/// file path straight to the (host-side) filesystem tools.
-	/// No-op on the host target — those servers already report
-	/// host paths.
+	/// Covers every bound folder's mount, not just the active
+	/// one — a server told about all roots can report a path in
+	/// any of them. No-op for a host spawn.
 	fn host_paths(&self, text: &str) -> String {
-		let McpSpawnTarget::Container {
-			host_root,
-			container_root,
-			..
-		} = self
-		else {
-			return text.to_owned();
-		};
 		let mut out = text.to_owned();
-		for sep in ['/', ' '] {
-			let from = format!("{container_root}{sep}");
-			let to = format!("{host_root}{sep}");
-			out = out.replace(&from, &to);
-		}
-		if let Some(prefix) = out.strip_suffix(container_root) {
-			if prefix.ends_with(' ') {
-				out = format!("{prefix}{host_root}");
-			}
+		for mount in &self.mounts {
+			out = replace_path_prefix(&out, &mount.container_root, &mount.host_root);
 		}
 		out
 	}
+}
+
+/// Replace every occurrence of `from` in `text` with `to`, but only
+/// where `from` ends at a **path boundary** — end of string, or a
+/// character that can't continue a path segment. Without the
+/// boundary check, mapping `/workspace/app` would also rewrite the
+/// unrelated `/workspace/app-2`. Servers embed paths in prose
+/// (`saved to <p>`, `denied: <p>, <p>`), so the boundary set has to
+/// cover punctuation, not just `/`.
+fn replace_path_prefix(text: &str, from: &str, to: &str) -> String {
+	if from.is_empty() {
+		return text.to_owned();
+	}
+	let mut out = String::with_capacity(text.len());
+	let mut rest = text;
+	while let Some(idx) = rest.find(from) {
+		let (before, matched) = rest.split_at(idx);
+		let after = &matched[from.len()..];
+		out.push_str(before);
+		let continues_segment = after
+			.chars()
+			.next()
+			.is_some_and(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | '~'));
+		out.push_str(if continues_segment { from } else { to });
+		rest = after;
+	}
+	out.push_str(rest);
+	out
+}
+
+/// The `roots/list` result: one entry per bound folder as a
+/// `file://` URI, in the server's own path space. Order is
+/// meaningful — servers that only take a single workspace root use
+/// the first, which is why the caller puts the active folder there.
+fn roots_result(roots: &[McpRoot]) -> Value {
+	let entries: Vec<Value> = roots
+		.iter()
+		.map(|root| {
+			json!({
+				"uri": file_uri(&root.path),
+				"name": root.name,
+			})
+		})
+		.collect();
+	json!({ "roots": entries })
+}
+
+/// `file://` URI for an absolute path. Percent-encodes the few
+/// characters that would otherwise break URI parsing on the
+/// server side; the segment separator is left intact.
+fn file_uri(path: &str) -> String {
+	let mut out = String::from("file://");
+	for ch in path.chars() {
+		match ch {
+			'%' => out.push_str("%25"),
+			' ' => out.push_str("%20"),
+			'#' => out.push_str("%23"),
+			'?' => out.push_str("%3F"),
+			c => out.push(c),
+		}
+	}
+	out
+}
+
+/// Write one newline-delimited JSON-RPC message. Shared by the
+/// request path and the reader task's reply path so the framing
+/// lives in one place.
+async fn write_line(stdin: &mut ChildStdin, message: &Value) -> Result<(), CoderError> {
+	let mut line =
+		serde_json::to_string(message).map_err(|err| CoderError::Internal(format!("mcp: serialize message: {err}")))?;
+	line.push('\n');
+	stdin
+		.write_all(line.as_bytes())
+		.await
+		.map_err(|err| CoderError::tool_failed("mcp_call", format!("MCP server stdin closed: {err}")))?;
+	stdin
+		.flush()
+		.await
+		.map_err(|err| CoderError::tool_failed("mcp_call", format!("MCP server stdin closed: {err}")))
 }
 
 /// In-flight requests parked on their response oneshots, keyed by
@@ -373,22 +466,24 @@ type PendingMap = Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<Result<Value
 
 struct McpConnection {
 	child: std::sync::Mutex<Child>,
-	stdin: Mutex<ChildStdin>,
+	/// Shared with the reader task, which writes responses to
+	/// server→client requests (`roots/list`) on the same pipe.
+	stdin: Arc<Mutex<ChildStdin>>,
 	pending: PendingMap,
 	next_id: AtomicU64,
 }
 
 impl McpConnection {
 	fn spawn(config: &McpServerConfig, target: &McpSpawnTarget) -> Result<Self, CoderError> {
-		let mut command = match target {
-			McpSpawnTarget::Host { cwd } => {
+		let mut command = match &target.kind {
+			McpSpawnKind::Host { cwd } => {
 				let mut command = tokio::process::Command::new(&config.command);
 				command.args(spawn_args(config)).current_dir(cwd);
 				command
 			}
 			// `-i` keeps stdin open — that *is* the transport.
 			// No `-t`: a TTY would garble the JSON framing.
-			McpSpawnTarget::Container { name, cwd, .. } => {
+			McpSpawnKind::Container { name, cwd } => {
 				let mut command = tokio::process::Command::new("docker");
 				command
 					.arg("exec")
@@ -416,18 +511,24 @@ impl McpConnection {
 			.stdout
 			.take()
 			.ok_or_else(|| CoderError::Internal("mcp: child stdout not piped".into()))?;
-		let stdin = child
-			.stdin
-			.take()
-			.ok_or_else(|| CoderError::Internal("mcp: child stdin not piped".into()))?;
+		let stdin = Arc::new(Mutex::new(
+			child
+				.stdin
+				.take()
+				.ok_or_else(|| CoderError::Internal("mcp: child stdin not piped".into()))?,
+		));
 		let pending: PendingMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
-		// Reader: one task per connection routes responses to the
-		// parked oneshots. Requests *from* the server (we advertise
-		// no capabilities, so none are expected) and notifications
-		// are ignored. On EOF every pending call fails with "server
-		// exited".
+		// Reader: one task per connection. Three kinds of inbound
+		// message:
+		//   - responses (`id`, no `method`) → the parked oneshot;
+		//   - requests (`id` + `method`) → answered here, on the
+		//     same pipe (that's `roots/list`, see `roots_result`);
+		//   - notifications (`method`, no `id`) → logged, dropped.
+		// On EOF every pending call fails with "server exited".
 		let reader_pending = pending.clone();
+		let reader_stdin = stdin.clone();
 		let server_id = config.id.clone();
+		let roots = target.roots.clone();
 		tokio::spawn(async move {
 			let mut lines = BufReader::new(stdout).lines();
 			while let Ok(Some(line)) = lines.next_line().await {
@@ -435,9 +536,32 @@ impl McpConnection {
 					tracing::debug!(server = %server_id, "mcp: skipping non-JSON stdout line");
 					continue;
 				};
+				let method = message.get("method").and_then(Value::as_str);
 				let Some(id) = message.get("id").and_then(Value::as_u64) else {
+					if let Some(method) = method {
+						tracing::debug!(server = %server_id, method, "mcp: ignoring server notification");
+					}
 					continue;
 				};
+				// Server→client request. Every request must get a
+				// reply or the server blocks forever waiting —
+				// hence the explicit "method not found" for
+				// anything we don't implement.
+				if let Some(method) = method {
+					let reply = match method {
+						"roots/list" => json!({ "jsonrpc": "2.0", "id": id, "result": roots_result(&roots) }),
+						_ => json!({
+							"jsonrpc": "2.0",
+							"id": id,
+							"error": { "code": -32601, "message": format!("method `{method}` not supported by moon-ide") },
+						}),
+					};
+					let mut guard = reader_stdin.lock().await;
+					if let Err(err) = write_line(&mut guard, &reply).await {
+						tracing::debug!(server = %server_id, error = %err, method, "mcp: failed to answer server request");
+					}
+					continue;
+				}
 				let Some(sender) = reader_pending.lock().expect("mcp pending lock").remove(&id) else {
 					continue;
 				};
@@ -473,7 +597,7 @@ impl McpConnection {
 		}
 		Ok(Self {
 			child: std::sync::Mutex::new(child),
-			stdin: Mutex::new(stdin),
+			stdin,
 			pending,
 			next_id: AtomicU64::new(1),
 		})
@@ -526,18 +650,8 @@ impl McpConnection {
 	}
 
 	async fn write_line(&self, message: &Value) -> Result<(), CoderError> {
-		let mut line =
-			serde_json::to_string(message).map_err(|err| CoderError::Internal(format!("mcp: serialize request: {err}")))?;
-		line.push('\n');
 		let mut stdin = self.stdin.lock().await;
-		stdin
-			.write_all(line.as_bytes())
-			.await
-			.map_err(|err| CoderError::tool_failed("mcp_call", format!("MCP server stdin closed: {err}")))?;
-		stdin
-			.flush()
-			.await
-			.map_err(|err| CoderError::tool_failed("mcp_call", format!("MCP server stdin closed: {err}")))
+		write_line(&mut stdin, message).await
 	}
 }
 
@@ -704,15 +818,40 @@ mod tests {
 			eprintln!("skipping: node not on PATH");
 			return;
 		}
+		// The fake server exercises the inbound direction too: on
+		// `initialize` it fires a `roots/list` request back at us
+		// (like playwright does) and then reports what it got as
+		// an `echo_roots` tool result.
 		const FAKE_SERVER: &str = r#"
 const rl = require('readline').createInterface({ input: process.stdin });
+let seenRoots = 'none';
+let nextId = 1000;
 rl.on('line', (line) => {
 	const msg = JSON.parse(line);
 	const reply = (result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }) + '\n');
 	if (msg.method === 'initialize') {
+		const caps = msg.params && msg.params.capabilities || {};
 		reply({ protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'fake', version: '1.0' } });
-	} else if (msg.method === 'tools/list') {
+		if (caps.roots) {
+			process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: nextId++, method: 'roots/list' }) + '\n');
+			// Also probe an unsupported request: we must get an
+			// error reply rather than silence.
+			process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: nextId++, method: 'sampling/createMessage' }) + '\n');
+		}
+		return;
+	}
+	if (msg.method === undefined && msg.result && msg.result.roots) {
+		seenRoots = msg.result.roots.map((r) => r.uri).join(',');
+		return;
+	}
+	if (msg.method === undefined && msg.error) {
+		seenRoots += '|err:' + msg.error.code;
+		return;
+	}
+	if (msg.method === 'tools/list') {
 		reply({ tools: [{ name: 'echo', description: 'echoes', inputSchema: { type: 'object' } }] });
+	} else if (msg.method === 'tools/call' && msg.params.name === 'echo_roots') {
+		reply({ content: [{ type: 'text', text: seenRoots }], isError: false });
 	} else if (msg.method === 'tools/call' && msg.params.name === 'echo') {
 		reply({ content: [{ type: 'text', text: 'echo: ' + msg.params.arguments.text }], isError: false });
 	} else if (msg.method === 'tools/call') {
@@ -727,7 +866,20 @@ rl.on('line', (line) => {
 			args: vec!["-e".into(), FAKE_SERVER.into()],
 			..Default::default()
 		};
-		let spawn = McpSpawnTarget::Host { cwd: "/tmp".into() };
+		let spawn = McpSpawnTarget {
+			kind: McpSpawnKind::Host { cwd: "/tmp".into() },
+			roots: vec![
+				McpRoot {
+					path: "/tmp/app".into(),
+					name: "app".into(),
+				},
+				McpRoot {
+					path: "/tmp/lib".into(),
+					name: "lib".into(),
+				},
+			],
+			mounts: Vec::new(),
+		};
 		let manager = McpManager::default();
 		let cancel = CancellationToken::new();
 
@@ -740,6 +892,18 @@ rl.on('line', (line) => {
 			.await
 			.expect("tools/call");
 		assert_eq!(result.get("content").and_then(Value::as_str), Some("echo: hi"));
+
+		// The server's `roots/list` was answered with both bound
+		// folders, in order, and its unsupported request got a
+		// JSON-RPC "method not found" instead of hanging.
+		let roots = manager
+			.call_tool(&config, &spawn, "echo_roots", json!({}), &cancel)
+			.await
+			.expect("tools/call echo_roots");
+		assert_eq!(
+			roots.get("content").and_then(Value::as_str),
+			Some("file:///tmp/app,file:///tmp/lib|err:-32601")
+		);
 
 		let err = manager
 			.call_tool(&config, &spawn, "nope", json!({}), &cancel)
@@ -837,14 +1001,40 @@ rl.on('line', (line) => {
 		assert_eq!(args.get("filename").and_then(Value::as_str), Some("shot.png"));
 	}
 
+	/// A container spawn over two bound folders: `app` (active)
+	/// and `lib`.
+	fn container_target() -> McpSpawnTarget {
+		McpSpawnTarget {
+			kind: McpSpawnKind::Container {
+				name: "moon-ws-default-dev-1".into(),
+				cwd: "/workspace/app".into(),
+			},
+			roots: vec![
+				McpRoot {
+					path: "/workspace/app".into(),
+					name: "app".into(),
+				},
+				McpRoot {
+					path: "/workspace/lib".into(),
+					name: "lib".into(),
+				},
+			],
+			mounts: vec![
+				McpMount {
+					host_root: "/home/me/code/app".into(),
+					container_root: "/workspace/app".into(),
+				},
+				McpMount {
+					host_root: "/home/me/code/lib".into(),
+					container_root: "/workspace/lib".into(),
+				},
+			],
+		}
+	}
+
 	#[test]
 	fn container_target_rewrites_reported_paths_to_host() {
-		let target = McpSpawnTarget::Container {
-			name: "moon-ws-default-dev-1".into(),
-			cwd: "/workspace/app".into(),
-			host_root: "/home/me/code/app".into(),
-			container_root: "/workspace/app".into(),
-		};
+		let target = container_target();
 		let text = "### Screenshot\nsaved to /workspace/app/.moon/playwright/page-1.png\nroot is /workspace/app";
 		let rewritten = target.host_paths(text);
 		assert_eq!(
@@ -853,25 +1043,88 @@ rl.on('line', (line) => {
 		);
 	}
 
+	/// Every advertised root is translated, not just the active
+	/// folder's — a server told about all roots can report a path
+	/// in any of them (the file-access-denied message lists them
+	/// all, for instance).
 	#[test]
-	fn container_rewrite_ignores_unrelated_workspace_paths() {
-		let target = McpSpawnTarget::Container {
-			name: "moon-ws-default-dev-1".into(),
-			cwd: "/workspace/app".into(),
-			host_root: "/home/me/code/app".into(),
-			container_root: "/workspace/app".into(),
-		};
-		// A sibling folder's mount isn't ours to translate.
-		let text = "see /workspace/other/file.txt";
+	fn container_target_rewrites_sibling_folder_paths_too() {
+		let target = container_target();
+		let text = "denied: /workspace/lib/fixtures/a.png outside roots: /workspace/app, /workspace/lib";
+		assert_eq!(
+			target.host_paths(text),
+			"denied: /home/me/code/lib/fixtures/a.png outside roots: /home/me/code/app, /home/me/code/lib"
+		);
+	}
+
+	#[test]
+	fn container_rewrite_leaves_unmounted_paths_alone() {
+		let target = container_target();
+		// Not a bound folder, and a same-prefix sibling that
+		// must not be mangled into `/home/me/code/app-2`.
+		let text = "see /workspace/other/file.txt and /workspace/app-2/x";
 		assert_eq!(target.host_paths(text), text);
 	}
 
 	#[test]
 	fn host_target_leaves_paths_untouched() {
-		let target = McpSpawnTarget::Host {
-			cwd: "/home/me/code/app".into(),
+		let target = McpSpawnTarget {
+			kind: McpSpawnKind::Host {
+				cwd: "/home/me/code/app".into(),
+			},
+			roots: vec![McpRoot {
+				path: "/home/me/code/app".into(),
+				name: "app".into(),
+			}],
+			mounts: Vec::new(),
 		};
 		let text = "saved to /home/me/code/app/.moon/playwright/page-1.png";
 		assert_eq!(target.host_paths(text), text);
+	}
+
+	#[test]
+	fn replace_path_prefix_respects_segment_boundaries() {
+		let f = |text| replace_path_prefix(text, "/ws/app", "/host/app");
+		// Boundaries: separator, punctuation, quote, end of input.
+		assert_eq!(f("/ws/app/x.png"), "/host/app/x.png");
+		assert_eq!(f("a /ws/app, b"), "a /host/app, b");
+		assert_eq!(f("(/ws/app)"), "(/host/app)");
+		assert_eq!(f("\"/ws/app\""), "\"/host/app\"");
+		assert_eq!(f("at /ws/app"), "at /host/app");
+		assert_eq!(f("/ws/app:8080"), "/host/app:8080");
+		// Not boundaries — a longer sibling directory name.
+		assert_eq!(f("/ws/app-2/x"), "/ws/app-2/x");
+		assert_eq!(f("/ws/apple"), "/ws/apple");
+		assert_eq!(f("/ws/app.bak"), "/ws/app.bak");
+		// Repeated occurrences all get rewritten.
+		assert_eq!(f("/ws/app and /ws/app/x"), "/host/app and /host/app/x");
+	}
+
+	#[test]
+	fn roots_result_emits_file_uris_in_order() {
+		let target = container_target();
+		let result = roots_result(&target.roots);
+		let roots = result.get("roots").and_then(Value::as_array).expect("roots array");
+		assert_eq!(roots.len(), 2);
+		// Active folder first — servers that take a single
+		// workspace root use `roots[0]`.
+		assert_eq!(
+			roots[0].get("uri").and_then(Value::as_str),
+			Some("file:///workspace/app")
+		);
+		assert_eq!(roots[0].get("name").and_then(Value::as_str), Some("app"));
+		assert_eq!(
+			roots[1].get("uri").and_then(Value::as_str),
+			Some("file:///workspace/lib")
+		);
+	}
+
+	#[test]
+	fn file_uri_escapes_characters_that_break_uri_parsing() {
+		assert_eq!(file_uri("/home/me/my code"), "file:///home/me/my%20code");
+		assert_eq!(file_uri("/tmp/a#b?c"), "file:///tmp/a%23b%3Fc");
+		assert_eq!(file_uri("/tmp/100%"), "file:///tmp/100%25");
+		// Separators stay intact.
+		assert_eq!(file_uri("/a/b/c"), "file:///a/b/c");
 	}
 }

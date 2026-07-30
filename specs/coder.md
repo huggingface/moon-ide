@@ -505,6 +505,14 @@ the workspace has no enabled servers, and neither is mode-gated
   the workspace shell container is `Running`, host otherwise —
   the same probe as `bash`. There is no per-server run-target
   knob (one existed briefly and was removed unused, ADR 0033).
+- **Bound folders are declared via the MCP `roots` capability**,
+  active folder first, in the spawn target's path space. That's
+  how a server learns which directories the session is about;
+  playwright derives both its output dir and its file-access
+  sandbox from `roots[0]`, so the active folder is readable and
+  writable without per-server path workarounds. Servers that ask
+  for something we don't implement get a `-32601` reply rather
+  than silence.
 - **Playwright output is pinned to `<active-folder>/.moon/
 playwright/`** (`--output-dir`, relative so both spawn targets
   resolve it through the bind mount) — screenshots and PDFs land
