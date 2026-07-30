@@ -113,6 +113,11 @@ export type TranscriptRow =
 			name: string;
 			args: string;
 			result: string;
+			/** Images the tool returned (a `read_file` on an image,
+			 *  an MCP screenshot), extracted from the result
+			 *  payload at the event boundary so the preview
+			 *  text never carries the base64. */
+			images: ToolImage[];
 			status: 'running' | 'done' | 'error';
 	  }
 	| {
@@ -134,6 +139,48 @@ export type AskUserQuestion = {
 	options: Array<{ id: string; label: string }>;
 	multi: boolean;
 };
+
+/** One image a tool returned, in renderable form. Mirrors the
+ * runner's `"images": [{ data_url, mime }]` convention. */
+export type ToolImage = { dataUrl: string; mime: string };
+
+/** Extract the `images` key of a tool-result payload. `[]` for
+ * anything else — error envelopes, text-only results, old
+ * traces. */
+function toolImagesOf(result: unknown): ToolImage[] {
+	const o = asRecord(result);
+	if (o === null || !Array.isArray(o.images)) {
+		return [];
+	}
+	const out: ToolImage[] = [];
+	for (const item of o.images) {
+		const img = asRecord(item);
+		if (img !== null && typeof img.data_url === 'string' && img.data_url.length > 0) {
+			out.push({ dataUrl: img.data_url, mime: typeof img.mime === 'string' ? img.mime : 'image' });
+		}
+	}
+	return out;
+}
+
+/** The payload minus its `images` key, for text preview — the
+ * raw JSON would otherwise dump megabytes of base64. */
+function withoutToolImages(result: unknown): unknown {
+	const o = asRecord(result);
+	if (o === null || !('images' in o)) {
+		return result;
+	}
+	const { images: _images, ...rest } = o;
+	return rest;
+}
+
+/** Narrow an `unknown` payload to a string-keyed record without
+ * a cast the linter flags — the `typeof` check is the guard. */
+function asRecord(value: unknown): Record<string, unknown> | null {
+	if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+		return null;
+	}
+	return { ...value };
+}
 
 /** A pending ask_user prompt awaiting the user's response. */
 export type PendingPrompt = {
@@ -1192,6 +1239,7 @@ class CompanionState {
 						name,
 						args: argsStr,
 						result: '',
+						images: [],
 						status: 'running',
 					});
 				}
@@ -1208,8 +1256,10 @@ class CompanionState {
 					this.pendingPrompt = null;
 				} else {
 					const result = ev['result'];
-					const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
-					this.#setToolResult(id, resultStr, isError ? 'error' : 'done');
+					const images = toolImagesOf(result);
+					const stripped = withoutToolImages(result);
+					const resultStr = typeof stripped === 'string' ? stripped : JSON.stringify(stripped);
+					this.#setToolResult(id, resultStr, isError ? 'error' : 'done', images);
 				}
 				break;
 			}
@@ -1361,10 +1411,11 @@ class CompanionState {
 		}
 	}
 
-	#setToolResult(id: string, result: string, status: 'done' | 'error'): void {
+	#setToolResult(id: string, result: string, status: 'done' | 'error', images: ToolImage[] = []): void {
 		const row = this.rows.find((r) => r.kind === 'tool' && r.id === id);
 		if (row && row.kind === 'tool') {
 			row.result = result;
+			row.images = images;
 			row.status = status;
 		}
 	}

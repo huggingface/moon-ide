@@ -520,7 +520,9 @@ playwright/`** (`--output-dir`, relative so both spawn targets
   `tool_result` blocks; OpenAI-compat `image_url` parts). Images
   persist as pi `image` content blocks so reopened sessions
   re-send them; compaction shows the summary model a count, not
-  pixels.
+  pixels. The panel and companion render them as thumbnails with
+  a full-size lightbox; JSON fallback views strip the `images`
+  key so the base64 never dumps into a `<pre>`.
 - **Lifecycle**: spawned lazily on first use, kept alive across
   turns (a playwright browser session persists between calls),
   killed on disable / remove / IDE exit, respawned on the next call

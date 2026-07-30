@@ -5,6 +5,10 @@
 
 	let draft = $state('');
 
+	// Full-size preview target for a tool-returned image
+	// (screenshot, image-file read).
+	let lightboxUrl = $state<string | null>(null);
+
 	// User-row id whose action chips (edit & resend / replay) are
 	// showing. Tap a user bubble to toggle; any action clears it.
 	let actionsFor = $state<string | null>(null);
@@ -594,6 +598,17 @@
 					{:else if row.result}
 						<div class="tool-result-preview">{toolResultPreview(row.name, row.result)}</div>
 					{/if}
+					{#if row.images.length > 0}
+						<!-- Screenshots / image-file reads the tool
+						     returned; click opens full-size. -->
+						<div class="tool-images">
+							{#each row.images as img, i (img.dataUrl.length + ':' + i)}
+								<button type="button" class="tool-image" onclick={() => (lightboxUrl = img.dataUrl)}>
+									<img src={img.dataUrl} alt="{img.mime} returned by {row.name} ({i + 1})" />
+								</button>
+							{/each}
+						</div>
+					{/if}
 					{#if workerId}
 						<button class="ghost worker-link" onclick={() => app.openSession(workerId)}> → Open worker session </button>
 					{/if}
@@ -715,6 +730,21 @@
 		{/if}
 	</div>
 </div>
+
+{#if lightboxUrl !== null}
+	<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+	<div
+		class="lightbox-backdrop"
+		onclick={() => (lightboxUrl = null)}
+		role="dialog"
+		aria-modal="true"
+		aria-label="Image preview"
+		tabindex="-1"
+	>
+		<img class="lightbox-image" src={lightboxUrl} alt="Tool result at full size" />
+		<button type="button" class="lightbox-close" title="Close" onclick={() => (lightboxUrl = null)}>×</button>
+	</div>
+{/if}
 
 <style>
 	.session {
@@ -859,6 +889,51 @@
 		word-break: break-word;
 		max-height: 120px;
 		overflow-y: auto;
+	}
+	.tool-images {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 6px;
+		margin: 0.25rem 0 0.25rem 1rem;
+	}
+	.tool-image {
+		padding: 0;
+		border: 1px solid var(--border, #333);
+		border-radius: var(--radius);
+		background: var(--bg-elev);
+		cursor: zoom-in;
+		overflow: hidden;
+	}
+	.tool-image img {
+		display: block;
+		max-width: 200px;
+		max-height: 140px;
+		object-fit: contain;
+	}
+	.lightbox-backdrop {
+		position: fixed;
+		inset: 0;
+		z-index: 90;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		background: rgba(0, 0, 0, 0.75);
+	}
+	.lightbox-image {
+		max-width: 92vw;
+		max-height: 92vh;
+		object-fit: contain;
+		border-radius: var(--radius);
+	}
+	.lightbox-close {
+		position: absolute;
+		top: 12px;
+		right: 16px;
+		border: none;
+		background: transparent;
+		color: #fff;
+		font-size: 24px;
+		cursor: pointer;
 	}
 	.tool-diff {
 		margin: 0.25rem 0 0.25rem 1rem;

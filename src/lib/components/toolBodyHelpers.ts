@@ -136,6 +136,57 @@ export function parseToolError(result: unknown): string | null {
 	return msg.length > 0 ? msg : null;
 }
 
+/** One image a tool returned, in renderable form. Mirrors the
+ *  runner's typed-image convention (`ImageAttachment` in
+ *  `crates/moon-coder/src/inference.rs`): results advertise
+ *  images under an `"images": [{ data_url, mime }]` key —
+ *  `read_file` on an image file and `mcp_call` screenshot blocks
+ *  are the two producers today. */
+export type ToolImage = { dataUrl: string; mime: string };
+
+/** Extract the `images` key of a tool result. Returns `[]` for
+ *  anything else — old traces, error envelopes, tools that never
+ *  produce images. */
+export function parseToolImages(result: unknown): ToolImage[] {
+	const o = asRecord(result);
+	if (o === null || !Array.isArray(o.images)) {
+		return [];
+	}
+	const out: ToolImage[] = [];
+	for (const item of o.images) {
+		const img = asRecord(item);
+		if (img === null || typeof img.data_url !== 'string' || img.data_url.length === 0) {
+			continue;
+		}
+		out.push({
+			dataUrl: img.data_url,
+			mime: typeof img.mime === 'string' ? img.mime : 'image',
+		});
+	}
+	return out;
+}
+
+/** The result payload minus its `images` key, for text rendering:
+ *  the raw JSON fallback would otherwise dump megabytes of base64
+ *  into the `<pre>`. Returns non-object results unchanged. */
+export function withoutToolImages(result: unknown): unknown {
+	const o = asRecord(result);
+	if (o === null || !('images' in o)) {
+		return result;
+	}
+	const { images: _images, ...rest } = o;
+	return rest;
+}
+
+/** Narrow an `unknown` payload to a string-keyed record without
+ *  a cast the linter flags — the `typeof` check is the guard. */
+function asRecord(value: unknown): Record<string, unknown> | null {
+	if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+		return null;
+	}
+	return { ...value };
+}
+
 /** Map a workspace-relative path to a fence id understood by
  *  `highlightCode`. Mirrors the canonical / alias lists in
  *  `src/lib/editor/highlightCode.ts`; returns `null` for any

@@ -7,7 +7,9 @@
 		highlightCode,
 		loadHighlighters,
 		openToolPath,
+		withoutToolImages,
 	} from './toolBodyHelpers';
+	import ToolImages from './ToolImages.svelte';
 
 	interface Props {
 		args: unknown;
@@ -143,7 +145,11 @@
 	<pre class="block">{fmtJson(args)}</pre>
 	{#if hasResult}
 		<div class="block-label">result</div>
-		<pre class="block">{fmtJson(result)}</pre>
+		<!-- Image reads land here (their `content` is a note, not
+	     numbered lines, so the code view above rejects them);
+	     the pixels render instead of the base64-bearing JSON. -->
+		<ToolImages {result} />
+		<pre class="block">{fmtJson(withoutToolImages(result))}</pre>
 	{/if}
 {:else}
 	<div class="rf-block">

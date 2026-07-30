@@ -120,4 +120,8 @@ Three changes after the preset met real use:
   accepted by OpenRouter et al. though strictly outside OpenAI's
   schema); images persist as pi `image` content blocks so a
   reopened session re-sends them. Compaction and the summary
-  model see `[N tool-result image(s)]`, never the pixels.
+  model see `[N tool-result image(s)]`, never the pixels. The
+  panel and the companion render tool-result images as thumbnails
+  (full-size on click); the JSON fallback strips the
+  base64-bearing `images` key so expanding an `mcp_call` row
+  doesn't dump megabytes of text.

@@ -22,6 +22,8 @@
 	import ToolBodyWebFetch from './ToolBodyWebFetch.svelte';
 	import ToolBodyWebSearch from './ToolBodyWebSearch.svelte';
 	import ToolBodyWriteFile from './ToolBodyWriteFile.svelte';
+	import ToolImages from './ToolImages.svelte';
+	import { withoutToolImages } from './toolBodyHelpers';
 	import TerminalTargetIcon from './TerminalTargetIcon.svelte';
 	import ContextRing from './ContextRing.svelte';
 	import CoderTodoPill from './CoderTodoPill.svelte';
@@ -3148,7 +3150,11 @@
 						<pre class="block">{fmtArgs(row.args)}</pre>
 						{#if row.hasResult}
 							<div class="block-label">result</div>
-							<pre class="block">{fmtArgs(row.result)}</pre>
+							<!-- mcp_call screenshots land in this generic
+							     branch; render the pixels and strip the
+							     base64-bearing key from the JSON dump. -->
+							<ToolImages result={row.result} />
+							<pre class="block">{fmtArgs(withoutToolImages(row.result))}</pre>
 						{/if}
 					{/if}
 				{/if}
