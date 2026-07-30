@@ -203,10 +203,21 @@ enum Block<'a> {
 	},
 	ToolResult {
 		tool_use_id: &'a str,
-		content: &'a str,
+		content: ToolResultContent<'a>,
 		#[serde(skip_serializing_if = "Option::is_none")]
 		cache_control: Option<CacheControl>,
 	},
+}
+
+/// A `tool_result` block's `content`. `Text` is the string shape
+/// every result used until tool images shipped; `Blocks` kicks in
+/// when the tool returned images — the Messages API accepts a
+/// nested array of `text` / `image` blocks there.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ToolResultContent<'a> {
+	Text(&'a str),
+	Blocks(Vec<Block<'a>>),
 }
 
 /// Keep a reasoning block only when it carries something replayable:
@@ -388,10 +399,36 @@ fn translate<'a>(messages: &'a [ChatMessage], mark_system_cache: bool, mark_last
 					content: blocks,
 				});
 			}
-			ChatMessage::Tool { tool_call_id, content } => {
+			ChatMessage::Tool {
+				tool_call_id,
+				content,
+				images,
+			} => {
+				let result_content = if images.is_empty() {
+					ToolResultContent::Text(content)
+				} else {
+					let mut blocks = vec![Block::Text {
+						text: content,
+						cache_control: None,
+					}];
+					for img in images {
+						if let Some((media_type, data)) = split_data_url(&img.data_url) {
+							blocks.push(Block::Image {
+								source: ImageSource {
+									kind: "base64",
+									media_type,
+									data,
+								},
+							});
+						} else {
+							tracing::warn!(mime = %img.mime, "skipping tool image with unparsable data URL");
+						}
+					}
+					ToolResultContent::Blocks(blocks)
+				};
 				let block = Block::ToolResult {
 					tool_use_id: tool_call_id,
-					content,
+					content: result_content,
 					cache_control: None,
 				};
 				push_or_merge_user(&mut out, vec![block]);
@@ -1234,10 +1271,12 @@ mod tests {
 			ChatMessage::Tool {
 				tool_call_id: "toolu_a".into(),
 				content: "result a".into(),
+				images: Vec::new(),
 			},
 			ChatMessage::Tool {
 				tool_call_id: "toolu_b".into(),
 				content: "result b".into(),
+				images: Vec::new(),
 			},
 			user_msg("now do this"),
 		];
@@ -1250,7 +1289,7 @@ mod tests {
 				tool_use_id, content, ..
 			} => {
 				assert_eq!(*tool_use_id, "toolu_a");
-				assert_eq!(*content, "result a");
+				assert!(matches!(content, ToolResultContent::Text("result a")));
 			}
 			_ => panic!("first block should be tool_result"),
 		}
@@ -1262,6 +1301,45 @@ mod tests {
 			Block::Text { text, .. } => assert_eq!(*text, "now do this"),
 			_ => panic!("third block should be text"),
 		}
+	}
+
+	#[test]
+	fn translate_tool_with_images_nests_blocks_in_tool_result() {
+		let messages = vec![ChatMessage::Tool {
+			tool_call_id: "toolu_a".into(),
+			content: "[image attached]".into(),
+			images: vec![ImageAttachment {
+				data_url: "data:image/png;base64,QUJD".into(),
+				mime: "image/png".into(),
+			}],
+		}];
+		let t = translate(&messages, false, false);
+		assert_eq!(t.messages.len(), 1);
+		let Block::ToolResult { content, .. } = &t.messages[0].content[0] else {
+			panic!("expected tool_result block");
+		};
+		// The serialized request body must carry the nested
+		// text + image block array the Messages API documents
+		// for image-bearing tool results.
+		let json = serde_json::to_string(content).unwrap();
+		assert_eq!(
+			json,
+			r#"[{"type":"text","text":"[image attached]"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"QUJD"}}]"#
+		);
+	}
+
+	#[test]
+	fn translate_tool_without_images_keeps_string_content() {
+		let messages = vec![ChatMessage::Tool {
+			tool_call_id: "toolu_a".into(),
+			content: "plain".into(),
+			images: Vec::new(),
+		}];
+		let t = translate(&messages, false, false);
+		let Block::ToolResult { content, .. } = &t.messages[0].content[0] else {
+			panic!("expected tool_result block");
+		};
+		assert!(matches!(content, ToolResultContent::Text("plain")));
 	}
 
 	#[test]
@@ -1329,6 +1407,7 @@ mod tests {
 			ChatMessage::Tool {
 				tool_call_id: "toolu_a".into(),
 				content: "ok".into(),
+				images: Vec::new(),
 			},
 		];
 		let t = translate(&messages, true, true);

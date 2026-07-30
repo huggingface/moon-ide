@@ -43,7 +43,6 @@
 		CoderModelSettings,
 		CoderProviderConfig,
 		CoderProviderLock,
-		McpRunTarget,
 		ProviderKind,
 		RouterModel,
 		RouterProvider,
@@ -176,7 +175,6 @@
 	type McpDraft = {
 		label: string;
 		commandLine: string;
-		runs: McpRunTarget;
 		description: string;
 	};
 	let mcpDraft = $state<McpDraft | null>(null);
@@ -209,7 +207,6 @@
 				label: mcpDraft.label.trim(),
 				command,
 				args: tokens.slice(1),
-				runs: mcpDraft.runs,
 				description: mcpDraft.description.trim(),
 			});
 			mcpDraft = null;
@@ -1574,7 +1571,7 @@
 							class="secondary"
 							disabled={workspace.workspaceName === null || mcpBusy}
 							onclick={() => {
-								mcpDraft = { label: '', commandLine: '', runs: 'host', description: '' };
+								mcpDraft = { label: '', commandLine: '', description: '' };
 								mcpError = null;
 							}}
 						>
@@ -1594,7 +1591,6 @@
 							<span class="mcp-label">{row.label}</span>
 						</label>
 						<code class="mcp-cmd" title={row.description}>{row.command} {row.args.join(' ')}</code>
-						<span class="mcp-runs">{row.runs}</span>
 						{#if !row.preset}
 							<button type="button" class="secondary" disabled={mcpBusy} onclick={() => void onRemoveMcpServer(row.id)}>
 								Remove
@@ -1620,13 +1616,6 @@
 							disabled={mcpBusy}
 						/>
 						<div class="mcp-draft-actions">
-							<label class="mcp-runs-pick">
-								runs on
-								<select bind:value={mcpDraft.runs} disabled={mcpBusy}>
-									<option value="host">host</option>
-									<option value="container">container</option>
-								</select>
-							</label>
 							<span class="flex-spacer"></span>
 							<button type="button" class="secondary" disabled={mcpBusy} onclick={() => (mcpDraft = null)}>
 								Cancel
@@ -1638,9 +1627,9 @@
 					</div>
 				{/if}
 				<span class="hint">
-					Enabled servers surface to the agent as <code>mcp_list_tools</code> / <code>mcp_call</code> — it discovers a
-					server's tools on demand instead of carrying every schema every turn. Stdio transport only; servers marked
-					<code>container</code> run in the workspace shell container when it's up (host fallback).
+					Enabled servers surface to the agent as <code>mcp_list_tools</code> / <code>mcp_call</code> — it discovers a server's
+					tools on demand instead of carrying every schema every turn. Stdio transport only; servers run where the workspace
+					runs — in the shell container when it's up, on the host otherwise.
 				</span>
 				{#if mcpError !== null}
 					<span class="error">{mcpError}</span>
@@ -2136,16 +2125,6 @@
 		font-size: 11px;
 		color: var(--m-fg-dim);
 	}
-	.mcp-runs {
-		flex: 0 0 auto;
-		font-size: 10px;
-		text-transform: uppercase;
-		letter-spacing: 0.06em;
-		color: var(--m-fg-dim);
-		border: 1px solid var(--m-border);
-		border-radius: 3px;
-		padding: 1px 5px;
-	}
 	.mcp-row .secondary {
 		flex: 0 0 auto;
 		padding: 2px 10px;
@@ -2171,13 +2150,6 @@
 		flex: 0 0 auto;
 		padding: 2px 12px;
 		font-size: 11px;
-	}
-	.mcp-runs-pick {
-		display: flex;
-		align-items: center;
-		gap: 6px;
-		font-size: 11px;
-		color: var(--m-fg-dim);
 	}
 	.web-key-row {
 		display: flex;

@@ -13,7 +13,7 @@ use moon_coder::{
 use moon_core::app_state as app_state_store;
 use moon_core::session as core_session;
 use moon_protocol::coder_hub::{CoderHubBucket, HubNamespace, HubUploadAllSummary};
-use moon_protocol::coder_mcp::{McpRunTarget, McpServerConfig, McpServerStatus};
+use moon_protocol::coder_mcp::{McpServerConfig, McpServerStatus};
 use moon_protocol::coder_models::{
 	CoderModelSettings, CoderProviderConfig, CoderProviderLock, OpenRouterCredits, ProviderModelSummary,
 	ProviderProbeResult, RouterModel,
@@ -1578,7 +1578,6 @@ pub struct AddMcpServerArgs {
 	pub command: String,
 	#[serde(default)]
 	pub args: Vec<String>,
-	pub runs: McpRunTarget,
 	#[serde(default)]
 	pub description: String,
 }
@@ -1600,7 +1599,6 @@ pub async fn coder_mcp_add_custom(
 		label: server.label.trim().to_string(),
 		command: server.command.trim().to_string(),
 		args: server.args,
-		runs: server.runs,
 		description: server.description.trim().to_string(),
 	};
 	moon_coder::mcp::validate_custom(&config)?;

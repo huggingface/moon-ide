@@ -2023,10 +2023,6 @@ export type UploadedMarker = {
  *  Mirrors `moon_protocol::coder_hub::HubNamespace`. */
 export type HubNamespace = { kind: 'user'; name: string } | { kind: 'org'; name: string };
 
-/** Where an MCP server process runs. Mirrors
- *  `moon_protocol::coder_mcp::McpRunTarget`. */
-export type McpRunTarget = 'host' | 'container';
-
 /** One row of the MCP settings list: a preset or per-workspace
  *  custom server plus its enabled flag. Mirrors
  *  `moon_protocol::coder_mcp::McpServerStatus` (with its flattened
@@ -2036,7 +2032,6 @@ export type McpServerStatus = {
 	label: string;
 	command: string;
 	args: string[];
-	runs: McpRunTarget;
 	description: string;
 	preset: boolean;
 	enabled: boolean;

@@ -433,8 +433,9 @@ pub(crate) fn record_to_pi_wire(
 			tool_name,
 			content,
 			duration_ms,
+			images,
 		} => pi_message_envelope(
-			pi_tool_result_message(tool_call_id, tool_name, content, *duration_ms),
+			pi_tool_result_message(tool_call_id, tool_name, content, *duration_ms, images),
 			timestamp_ms,
 		),
 		SessionRecord::Compaction {
@@ -735,6 +736,7 @@ fn pi_tool_result_message(
 	tool_name: &str,
 	content: &str,
 	duration_ms: Option<u64>,
+	images: &[crate::inference::ImageAttachment],
 ) -> serde_json::Value {
 	let is_error = looks_like_tool_error(content);
 	let mut message = serde_json::Map::new();
@@ -746,10 +748,12 @@ fn pi_tool_result_message(
 	if let Some(ms) = duration_ms {
 		message.insert("durationMs".into(), serde_json::Value::from(ms));
 	}
-	message.insert(
-		"content".into(),
-		serde_json::json!([{ "type": "text", "text": content }]),
-	);
+	let mut blocks = vec![serde_json::json!({ "type": "text", "text": content })];
+	for image in images {
+		let (data, mime) = strip_data_url_prefix(&image.data_url, &image.mime);
+		blocks.push(serde_json::json!({ "type": "image", "mimeType": mime, "data": data }));
+	}
+	message.insert("content".into(), serde_json::Value::Array(blocks));
 	message.insert("isError".into(), serde_json::Value::Bool(is_error));
 	serde_json::Value::Object(message)
 }
@@ -1045,25 +1049,38 @@ fn parse_pi_tool_result(msg: &serde_json::Value) -> Option<SessionRecord> {
 		.unwrap_or_default()
 		.to_string();
 	let content = msg.get("content").and_then(|v| v.as_array());
-	let body = match content {
-		Some(blocks) => {
-			let mut text_parts: Vec<String> = Vec::new();
-			for block in blocks {
-				if block.get("type").and_then(|v| v.as_str()) == Some("text") {
+	let mut text_parts: Vec<String> = Vec::new();
+	let mut images: Vec<crate::inference::ImageAttachment> = Vec::new();
+	if let Some(blocks) = content {
+		for block in blocks {
+			match block.get("type").and_then(|v| v.as_str()) {
+				Some("text") => {
 					if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
 						text_parts.push(t.to_string());
 					}
 				}
+				Some("image") => {
+					let data = block.get("data").and_then(|v| v.as_str()).unwrap_or("");
+					let mime = block
+						.get("mimeType")
+						.and_then(|v| v.as_str())
+						.unwrap_or("image/png")
+						.to_string();
+					images.push(crate::inference::ImageAttachment {
+						data_url: format!("data:{mime};base64,{data}"),
+						mime,
+					});
+				}
+				_ => {}
 			}
-			text_parts.join("\n")
 		}
-		None => String::new(),
-	};
+	}
 	Some(SessionRecord::Tool {
 		tool_call_id,
 		tool_name,
-		content: body,
+		content: text_parts.join("\n"),
 		duration_ms: msg.get("durationMs").and_then(|v| v.as_u64()),
+		images,
 	})
 }
 
@@ -1257,6 +1274,11 @@ pub enum SessionRecord {
 		/// sentinels.
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		duration_ms: Option<u64>,
+		/// Images the tool returned (screenshots, an image file
+		/// the model read), persisted as pi `image` content blocks
+		/// so a reopened session can re-send them to the provider.
+		#[serde(default, skip_serializing_if = "Vec::is_empty")]
+		images: Vec<crate::inference::ImageAttachment>,
 	},
 	/// The session title changed mid-stream. Replayed on reopen so
 	/// the auto-renamed title sticks across launches without a
@@ -3219,6 +3241,7 @@ mod tests {
 				tool_name: String::new(),
 				content: r#"{"stdout":"ok"}"#.into(),
 				duration_ms: None,
+				images: Vec::new(),
 			},
 		)
 		.await
@@ -3231,6 +3254,7 @@ mod tests {
 				tool_name: String::new(),
 				content: INTERRUPTED_TOOL_RESULT_JSON.into(),
 				duration_ms: None,
+				images: Vec::new(),
 			},
 		)
 		.await
@@ -3255,6 +3279,7 @@ mod tests {
 				content,
 				tool_name: _,
 				duration_ms: _,
+				images: _,
 			} => {
 				assert_eq!(tool_call_id, "call-1");
 				assert_eq!(content, r#"{"stdout":"ok"}"#);
@@ -3563,6 +3588,7 @@ mod tests {
 				tool_name: String::new(),
 				content: r#"{"stdout":"ok"}"#.into(),
 				duration_ms: None,
+				images: Vec::new(),
 			},
 		];
 		assert!(orphan_tool_call_ids(&records).is_empty());
@@ -3592,6 +3618,7 @@ mod tests {
 				tool_name: String::new(),
 				content: r#"{"stdout":"a"}"#.into(),
 				duration_ms: None,
+				images: Vec::new(),
 			},
 		];
 		assert_eq!(orphan_tool_call_ids(&records), vec!["call-b".to_string()]);
@@ -3616,6 +3643,7 @@ mod tests {
 				tool_name: String::new(),
 				content: "{}".into(),
 				duration_ms: None,
+				images: Vec::new(),
 			},
 			SessionRecord::Assistant {
 				content: None,
@@ -3630,6 +3658,7 @@ mod tests {
 				tool_name: String::new(),
 				content: "{}".into(),
 				duration_ms: None,
+				images: Vec::new(),
 			},
 			SessionRecord::Assistant {
 				content: None,
@@ -3709,6 +3738,7 @@ mod tests {
 				tool_name: String::new(),
 				content: r#"{"status":"answered"}"#.into(),
 				duration_ms: None,
+				images: Vec::new(),
 			},
 		];
 		assert!(orphaned_ask_user_calls(&records).is_empty());
@@ -3889,6 +3919,7 @@ mod tests {
 			tool_name: "read_file".into(),
 			content: r#"{"ok":true}"#.into(),
 			duration_ms: Some(1234),
+			images: Vec::new(),
 		};
 		let wire = record_to_pi_wire(&tool, &header, ts);
 		let msg = wire.get("message").unwrap();
@@ -3900,6 +3931,44 @@ mod tests {
 			} => {
 				assert_eq!(tool_name, "read_file");
 				assert_eq!(*duration_ms, Some(1234));
+			}
+			other => panic!("expected Tool, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn tool_images_round_trip_through_pi_wire() {
+		// A tool result carrying an image persists the pixels as
+		// pi `image` content blocks (not as base64 in the text)
+		// and a reload rebuilds the typed attachment, so a
+		// reopened session re-sends the screenshot to the model.
+		use crate::inference::ImageAttachment;
+		let header = make_test_header("sess-tool-img");
+		let ts = 1_700_000_000_000i64;
+		let record = SessionRecord::Tool {
+			tool_call_id: "call-9".into(),
+			tool_name: "mcp_call".into(),
+			content: r#"{"content":"[image/png image attached — ~1 kB]"}"#.into(),
+			duration_ms: None,
+			images: vec![ImageAttachment {
+				data_url: "data:image/png;base64,QUJD".into(),
+				mime: "image/png".into(),
+			}],
+		};
+		let wire = record_to_pi_wire(&record, &header, ts);
+		let msg = wire.get("message").unwrap();
+		let blocks = msg.get("content").and_then(|v| v.as_array()).unwrap();
+		assert_eq!(blocks.len(), 2, "text + image blocks");
+		assert_eq!(blocks[1].get("type").and_then(|v| v.as_str()), Some("image"));
+		assert_eq!(blocks[1].get("mimeType").and_then(|v| v.as_str()), Some("image/png"));
+		assert_eq!(blocks[1].get("data").and_then(|v| v.as_str()), Some("QUJD"));
+
+		match &pi_wire_to_records(&wire)[0] {
+			SessionRecord::Tool { images, content, .. } => {
+				assert_eq!(images.len(), 1);
+				assert_eq!(images[0].data_url, "data:image/png;base64,QUJD");
+				assert_eq!(images[0].mime, "image/png");
+				assert_eq!(content, r#"{"content":"[image/png image attached — ~1 kB]"}"#);
 			}
 			other => panic!("expected Tool, got {other:?}"),
 		}

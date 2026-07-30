@@ -23,6 +23,7 @@ moon-terminal = { workspace = true }
 moon-container = { workspace = true }
 
 async-trait = { workspace = true }
+base64 = { workspace = true }
 camino = { workspace = true }
 futures-util = { workspace = true }
 keyring = { workspace = true }

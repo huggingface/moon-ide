@@ -33,7 +33,6 @@ import {
 	type HubNamespace,
 	type HubUploadAllSummary,
 	type ImageAttachmentPayload,
-	type McpRunTarget,
 	type McpServerStatus,
 	type OpenRouterCredits,
 	type ProviderKind,
@@ -799,13 +798,7 @@ export class CoderPanelState {
 	/** Add a custom MCP server to the workspace (enabled
 	 *  immediately). Throws so the add form can stay open with the
 	 *  error rendered inline. */
-	async addMcpServer(server: {
-		label: string;
-		command: string;
-		args: string[];
-		runs: McpRunTarget;
-		description: string;
-	}): Promise<void> {
+	async addMcpServer(server: { label: string; command: string; args: string[]; description: string }): Promise<void> {
 		this.mcpServers = await ipc.coder.mcpAddCustom(server);
 	}
 

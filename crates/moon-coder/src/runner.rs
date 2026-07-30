@@ -2525,10 +2525,12 @@ impl CoderHandle {
 					tool_name: _,
 					content,
 					duration_ms: _,
+					images,
 				} => {
 					messages.push(ChatMessage::Tool {
 						tool_call_id: tool_call_id.clone(),
 						content: content.clone(),
+						images: images.clone(),
 					});
 				}
 				SessionRecord::TitleUpdate { .. } => {}
@@ -2671,6 +2673,7 @@ impl CoderHandle {
 			messages.push(ChatMessage::Tool {
 				tool_call_id: orphan_id.clone(),
 				content: sessions::INTERRUPTED_TOOL_RESULT_JSON.to_string(),
+				images: Vec::new(),
 			});
 		}
 		// `in_flight` is `true` when this session has a turn still
@@ -6533,11 +6536,12 @@ async fn recover_in_memory_orphans(rt: &Arc<SessionRuntime>, sink: &FolderEventS
 			session.messages.push(ChatMessage::Tool {
 				tool_call_id: id.clone(),
 				content: sessions::INTERRUPTED_TOOL_RESULT_JSON.to_string(),
+				images: Vec::new(),
 			});
 		}
 	}
 	for (id, name) in &orphans {
-		persist_tool_record(rt, id, name, sessions::INTERRUPTED_TOOL_RESULT_JSON, None).await;
+		persist_tool_record(rt, id, name, sessions::INTERRUPTED_TOOL_RESULT_JSON, None, &[]).await;
 		sink.send(CoderEvent::ToolResult {
 			id: id.clone(),
 			result: serde_json::json!({ "error": "Interrupted before tool completed." }),
@@ -6559,7 +6563,14 @@ async fn finish_tool_call(
 ) -> Result<(), CoderError> {
 	match outcome {
 		Ok(value) => {
-			let content = value.to_string();
+			// Images ride typed on `ChatMessage::Tool.images`
+			// (and pi `image` content blocks on disk), not as
+			// base64 inside the JSON text the model reads — so
+			// strip the tool's `images` key from the text
+			// projection. The panel event keeps the full value;
+			// the UI renders what it wants.
+			let (images, text_value) = split_tool_images(value.clone());
+			let content = text_value.to_string();
 			sink.send(CoderEvent::ToolResult {
 				id: tool_call_id.to_string(),
 				result: value,
@@ -6569,8 +6580,9 @@ async fn finish_tool_call(
 			rt.session.lock().await.messages.push(ChatMessage::Tool {
 				tool_call_id: tool_call_id.to_string(),
 				content: content.clone(),
+				images: images.clone(),
 			});
-			persist_tool_record(rt, tool_call_id, tool_name, &content, duration_ms).await;
+			persist_tool_record(rt, tool_call_id, tool_name, &content, duration_ms, &images).await;
 			Ok(())
 		}
 		Err(CoderError::Aborted) => Err(CoderError::Aborted),
@@ -6586,11 +6598,29 @@ async fn finish_tool_call(
 			rt.session.lock().await.messages.push(ChatMessage::Tool {
 				tool_call_id: tool_call_id.to_string(),
 				content: content.clone(),
+				images: Vec::new(),
 			});
-			persist_tool_record(rt, tool_call_id, tool_name, &content, duration_ms).await;
+			persist_tool_record(rt, tool_call_id, tool_name, &content, duration_ms, &[]).await;
 			Ok(())
 		}
 	}
+}
+
+/// Split a tool result into the images it returned and the
+/// text-only JSON projection the model sees. Convention: a tool
+/// advertises images as an `"images": [{ data_url, mime }]` key
+/// on its result object (the shape `read_file` emits for image
+/// files and `mcp_call` builds from MCP image blocks). Anything
+/// else — no key, wrong shape — passes through with no images.
+pub(crate) fn split_tool_images(value: Value) -> (Vec<crate::inference::ImageAttachment>, Value) {
+	let Value::Object(mut map) = value else {
+		return (Vec::new(), value);
+	};
+	let Some(raw) = map.remove("images") else {
+		return (Vec::new(), Value::Object(map));
+	};
+	let images = serde_json::from_value::<Vec<crate::inference::ImageAttachment>>(raw).unwrap_or_default();
+	(images, Value::Object(map))
 }
 
 /// Recompose the session's system prompt (`messages[0]`) from the
@@ -7090,6 +7120,7 @@ async fn persist_tool_record(
 	tool_name: &str,
 	content: &str,
 	duration_ms: Option<u64>,
+	images: &[crate::inference::ImageAttachment],
 ) {
 	let (dir, header) = {
 		let session = rt.session.lock().await;
@@ -7103,6 +7134,7 @@ async fn persist_tool_record(
 		tool_name: tool_name.to_string(),
 		content: content.to_string(),
 		duration_ms,
+		images: images.to_vec(),
 	};
 	if let Err(err) = sessions::append_record(&dir, &header, &record).await {
 		tracing::warn!(error = %err, "failed to persist tool result");
@@ -7609,15 +7641,24 @@ fn emit_replay_events(out: &mut Vec<CoderEvent>, record: SessionRecord, created_
 			tool_name: _,
 			content,
 			duration_ms,
+			images,
 		} => {
 			// `content` may not be valid JSON (the model wrote
 			// raw bytes for a tool output we serialised as a
 			// fallback). In that case, surface the raw string —
 			// the panel renders it inside a `<pre>` either way.
-			let result = match serde_json::from_str::<Value>(&content) {
+			let mut result = match serde_json::from_str::<Value>(&content) {
 				Ok(value) => value,
 				Err(_) => Value::String(content),
 			};
+			// Re-attach persisted images to the replayed payload
+			// so the panel can render them (live results carry
+			// them under the same key).
+			if !images.is_empty() {
+				if let Value::Object(map) = &mut result {
+					map.insert("images".into(), serde_json::to_value(images).unwrap_or_default());
+				}
+			}
 			// We don't persist `is_error` — derive it: the result
 			// looks like `{"error":"…"}` for failures and
 			// arbitrary JSON otherwise. Close enough for replay
@@ -7834,11 +7875,17 @@ fn subagent_replay_inners(record: SessionRecord, created_at_ms: i64) -> Vec<Code
 			tool_name: _,
 			content,
 			duration_ms,
+			images,
 		} => {
-			let result = match serde_json::from_str::<Value>(&content) {
+			let mut result = match serde_json::from_str::<Value>(&content) {
 				Ok(value) => value,
 				Err(_) => Value::String(content),
 			};
+			if !images.is_empty() {
+				if let Value::Object(map) = &mut result {
+					map.insert("images".into(), serde_json::to_value(images).unwrap_or_default());
+				}
+			}
 			let is_error = matches!(&result, Value::Object(map) if map.contains_key("error") && map.len() == 1);
 			vec![CoderEvent::ToolResult {
 				id: tool_call_id,
@@ -8070,9 +8117,16 @@ fn message_bytes(messages: &[ChatMessage]) -> usize {
 					bytes += call.function.arguments.len();
 				}
 			}
-			ChatMessage::Tool { tool_call_id, content } => {
+			ChatMessage::Tool {
+				tool_call_id,
+				content,
+				images,
+			} => {
 				bytes += tool_call_id.len();
 				bytes += content.len();
+				for img in images {
+					bytes += img.data_url.len();
+				}
 			}
 		}
 	}
@@ -8198,6 +8252,39 @@ pub(crate) fn new_message_id() -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn split_tool_images_extracts_the_convention_key() {
+		let value = json!({
+			"path": "shot.png",
+			"content": "[image file — image/png, attached]",
+			"images": [{ "data_url": "data:image/png;base64,QUJD", "mime": "image/png" }],
+		});
+		let (images, text) = split_tool_images(value);
+		assert_eq!(images.len(), 1);
+		assert_eq!(images[0].mime, "image/png");
+		// The pixels leave the text projection the model reads.
+		assert!(text.get("images").is_none());
+		assert_eq!(
+			text.get("content").and_then(Value::as_str),
+			Some("[image file — image/png, attached]")
+		);
+	}
+
+	#[test]
+	fn split_tool_images_passes_plain_results_through() {
+		let value = json!({ "content": "plain text result" });
+		let (images, text) = split_tool_images(value.clone());
+		assert!(images.is_empty());
+		assert_eq!(text, value);
+
+		// A malformed `images` key degrades to no images rather
+		// than failing the tool call.
+		let value = json!({ "content": "x", "images": "not-an-array" });
+		let (images, text) = split_tool_images(value);
+		assert!(images.is_empty());
+		assert!(text.get("images").is_none());
+	}
 
 	mod coordinator_registry {
 		use super::super::CoordinatorRegistry;
@@ -8364,6 +8451,7 @@ mod tests {
 			ChatMessage::Tool {
 				tool_call_id: "call_1".into(),
 				content: "ok".into(),
+				images: Vec::new(),
 			},
 		];
 		let (name, args) = find_recorded_tool_call(&messages, "call_1").expect("call should be found");
@@ -8685,6 +8773,7 @@ mod tests {
 			ChatMessage::Tool {
 				tool_call_id: "x".into(),
 				content: "tool body".into(),
+				images: Vec::new(),
 			},
 			ChatMessage::Assistant {
 				content: Some("done".into()),
@@ -8746,6 +8835,7 @@ mod tests {
 			ChatMessage::Tool {
 				tool_call_id: "tc-1".into(),
 				content: "{}".into(),
+				images: Vec::new(),
 			},
 		];
 		session.pending_steers = vec![
@@ -9000,6 +9090,7 @@ mod tests {
 			ChatMessage::Tool {
 				tool_call_id: String::new(),
 				content: "t".repeat(40),
+				images: Vec::new(),
 			},
 		];
 		// 10_000 (prompt) + 500 (completion) + 80/4 (tail) = 10_520.
@@ -9109,7 +9200,9 @@ mod tests {
 		let messages = rt.session.lock().await.messages.clone();
 		let tail = messages.last().expect("messages non-empty");
 		match tail {
-			ChatMessage::Tool { tool_call_id, content } => {
+			ChatMessage::Tool {
+				tool_call_id, content, ..
+			} => {
 				assert_eq!(tool_call_id, "call-1");
 				assert_eq!(content, sessions::INTERRUPTED_TOOL_RESULT_JSON);
 			}
@@ -9128,6 +9221,7 @@ mod tests {
 				content,
 				tool_name: _,
 				duration_ms: _,
+				images: _,
 			} => {
 				assert_eq!(tool_call_id, "call-1");
 				assert_eq!(content, sessions::INTERRUPTED_TOOL_RESULT_JSON);
@@ -9175,6 +9269,7 @@ mod tests {
 			ChatMessage::Tool {
 				tool_call_id: "call-1".into(),
 				content: "{\"ok\":true}".into(),
+				images: Vec::new(),
 			},
 		];
 		let before_len = session.messages.len();

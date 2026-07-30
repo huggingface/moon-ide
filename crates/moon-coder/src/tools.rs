@@ -53,6 +53,12 @@ const BASH_MAX_TIMEOUT: Duration = Duration::from_secs(600);
 /// useful — most source files fit comfortably.
 const READ_FILE_MAX_BYTES: usize = 200_000;
 
+/// Largest image `read_file` will attach for the model. Vision
+/// providers downscale aggressively past a few megapixels anyway,
+/// so past this we refuse rather than burn the context window on
+/// diminishing returns.
+const IMAGE_MAX_BYTES: usize = 10_000_000;
+
 /// `bash` stdout/stderr cap. Same rationale as `READ_FILE_MAX_BYTES`
 /// — the model doesn't need megabytes of output to reason about a
 /// command's outcome.
@@ -960,7 +966,7 @@ impl ToolRegistry {
 		let mut defs = vec![
 			ToolDefinition::function(
 				"read_file",
-				"Read the contents of a file. Returns the file's text, with each line prefixed by `<line_number>|<line>`. Treat the prefix as metadata — it is not part of the file. Optional `start_line` / `end_line` (1-based, inclusive) read just a slice; both omitted means read the whole file (capped at 200 kB).",
+				"Read the contents of a file. Returns the file's text, with each line prefixed by `<line_number>|<line>`. Treat the prefix as metadata — it is not part of the file. Optional `start_line` / `end_line` (1-based, inclusive) read just a slice; both omitted means read the whole file (capped at 200 kB). Image files (png, jpg/jpeg, gif, webp) come back as attached images you can see; other binary files error.",
 				json!({
 					"type": "object",
 					"properties": {
@@ -1279,20 +1285,12 @@ impl ToolRegistry {
 		}
 	}
 
-	/// Resolve where a server process should spawn. `runs:
-	/// container` follows the same probe as `bash` — container when
-	/// the workspace shell container is `Running`, host fallback
-	/// otherwise — so a container-flagged server still works (on
-	/// the host) when the container is down.
-	async fn mcp_spawn_target(
-		&self,
-		config: &moon_protocol::coder_mcp::McpServerConfig,
-		cx: &ToolContext,
-	) -> McpSpawnTarget {
+	/// Resolve where a server process should spawn: the same probe
+	/// as `bash` — container when the workspace shell container is
+	/// `Running`, host otherwise. MCP servers ride the workspace
+	/// mode rather than carrying a per-server run target.
+	async fn mcp_spawn_target(&self, cx: &ToolContext) -> McpSpawnTarget {
 		let host_cwd = cx.folder.folder.path.clone();
-		if config.runs != moon_protocol::coder_mcp::McpRunTarget::Container {
-			return McpSpawnTarget::Host { cwd: host_cwd };
-		}
 		let target = resolve_bash_target(&self.workspaces, &self.workspaces_dir, cx.force_host_bash(), &cx.folder).await;
 		if target != BASH_TARGET_CONTAINER {
 			return McpSpawnTarget::Host { cwd: host_cwd };
@@ -1343,7 +1341,7 @@ impl ToolRegistry {
 		let parsed: McpListToolsArgs = serde_json::from_value(args.clone())
 			.map_err(|err| CoderError::invalid_args("mcp_list_tools", err.to_string()))?;
 		let server = self.mcp_enabled_server("mcp_list_tools", &parsed.server).await?;
-		let spawn = self.mcp_spawn_target(&server, cx).await;
+		let spawn = self.mcp_spawn_target(cx).await;
 		let tools = self.mcp.list_tools(&server, &spawn, cancel).await?;
 		Ok(json!({
 			"server": parsed.server,
@@ -1363,7 +1361,7 @@ impl ToolRegistry {
 		let parsed: McpCallArgs =
 			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("mcp_call", err.to_string()))?;
 		let server = self.mcp_enabled_server("mcp_call", &parsed.server).await?;
-		let spawn = self.mcp_spawn_target(&server, cx).await;
+		let spawn = self.mcp_spawn_target(cx).await;
 		let call_args = if parsed.args.is_null() { json!({}) } else { parsed.args };
 		self
 			.mcp
@@ -1441,11 +1439,21 @@ impl ToolRegistry {
 		if matches!(parsed.start_line, Some(0)) || matches!(parsed.end_line, Some(0)) {
 			return Err(CoderError::invalid_args("read_file", "line numbers are 1-based"));
 		}
-		let result = match self.resolve_target(&parsed.path, cx, "read_file").await? {
-			ResolvedTarget::InWorkspace { folder, relative } => folder.host.read_file(Utf8Path::new(&relative)).await?,
-			ResolvedTarget::OutOfWorkspace { abs_path } => self.oow_read_file(&abs_path, cx).await?,
+		let resolved = self.resolve_target(&parsed.path, cx, "read_file").await?;
+		let result = match &resolved {
+			ResolvedTarget::InWorkspace { folder, relative } => folder.host.read_file(Utf8Path::new(relative)).await?,
+			ResolvedTarget::OutOfWorkspace { abs_path } => self.oow_read_file(abs_path, cx).await?,
 		};
 		if result.is_binary {
+			// Image files aren't an error: the model is
+			// vision-capable, so return the pixels as a typed
+			// image attachment (the runner's `images`
+			// convention) — reading back a playwright screenshot
+			// is the case this exists for. Other binaries keep
+			// the old hard error.
+			if let Some(mime) = image_mime_for(&parsed.path) {
+				return self.read_image_result(&resolved, &parsed.path, mime, cx).await;
+			}
 			return Err(CoderError::tool_failed("read_file", "binary file"));
 		}
 		let total_lines = if result.text.is_empty() {
@@ -1934,6 +1942,69 @@ impl ToolRegistry {
 		})
 	}
 
+	/// Read an image file and return it as the runner's typed
+	/// `images` convention: the text projection is a one-line
+	/// note, the pixels ride alongside. `WorkspaceHost` doesn't
+	/// surface binary content, so in-workspace bytes come straight
+	/// from the host filesystem — valid under both routings: the
+	/// folder is bind-mounted into the container at identical
+	/// bytes and the file tools already run host-side per
+	/// `ContainerHost`. Out-of-workspace reads mirror
+	/// [`Self::oow_read_file`]'s container `cat` path.
+	async fn read_image_result(
+		&self,
+		resolved: &ResolvedTarget,
+		path: &str,
+		mime: &str,
+		cx: &ToolContext,
+	) -> Result<Value, CoderError> {
+		let bytes = match resolved {
+			ResolvedTarget::InWorkspace { folder, relative } => {
+				let abs = Utf8Path::new(&folder.folder.path).join(relative);
+				tokio::fs::read(abs.as_std_path())
+					.await
+					.map_err(|err| CoderError::tool_failed("read_file", format!("{path}: {err}")))?
+			}
+			ResolvedTarget::OutOfWorkspace { abs_path } => {
+				if self.oow_target_is_container(cx).await {
+					let mut cat = self.container_exec("cat", &["--", abs_path.as_str()]).await;
+					let output = run_capturing(&mut cat, "read_file").await?;
+					if !output.status.success() {
+						return Err(CoderError::tool_failed(
+							"read_file",
+							container_io_error(abs_path, &output.stderr),
+						));
+					}
+					output.stdout
+				} else {
+					tokio::fs::read(abs_path.as_std_path())
+						.await
+						.map_err(|err| CoderError::tool_failed("read_file", format!("{path}: {err}")))?
+				}
+			}
+		};
+		if bytes.len() > IMAGE_MAX_BYTES {
+			return Err(CoderError::tool_failed(
+				"read_file",
+				format!(
+					"{path}: image is {:.1} MB, over the {:.1} MB limit",
+					bytes.len() as f64 / 1_000_000.0,
+					IMAGE_MAX_BYTES as f64 / 1_000_000.0
+				),
+			));
+		}
+		use base64::Engine;
+		let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+		Ok(json!({
+			"path": path,
+			"content": format!("[image file — {mime}, {:.1} kB, attached]", bytes.len() as f64 / 1000.0),
+			"images": [{
+				"data_url": format!("data:{mime};base64,{data}"),
+				"mime": mime,
+			}],
+		}))
+	}
+
 	/// Write raw bytes to an arbitrary absolute path, routed to the
 	/// container when it's running and the host otherwise. No
 	/// format-on-save either way — external files have no project
@@ -2143,6 +2214,21 @@ async fn host_read_dir_abs(abs_path: &Utf8Path) -> Result<Vec<DirEntry>, CoderEr
 		_ => a.name.cmp(&b.name),
 	});
 	Ok(entries)
+}
+
+/// The image extensions `read_file` will return as pixels rather
+/// than erroring on, mapped to their MIME type. Extension-based
+/// (no magic-byte sniffing): the model already knows the name it
+/// asked for, and a mislabeled extension is the user's own doing.
+fn image_mime_for(path: &str) -> Option<&'static str> {
+	let ext = Utf8Path::new(path).extension()?.to_ascii_lowercase();
+	Some(match ext.as_str() {
+		"png" => "image/png",
+		"jpg" | "jpeg" => "image/jpeg",
+		"gif" => "image/gif",
+		"webp" => "image/webp",
+		_ => return None,
+	})
 }
 
 /// Same null-byte heuristic as `moon_core`'s `looks_binary`: a NUL
@@ -3801,7 +3887,7 @@ mod tests {
 	}
 
 	mod cross_folder {
-		use super::super::{CoderMode, ToolContext, ToolRegistry};
+		use super::super::{image_mime_for, CoderMode, ToolContext, ToolRegistry};
 		use crate::error::CoderError;
 		use camino::Utf8PathBuf;
 		use moon_core::WorkspaceRegistry;
@@ -4144,6 +4230,53 @@ mod tests {
 				.await
 				.expect("out-of-workspace read should succeed on host");
 			assert_eq!(read["content"].as_str().unwrap(), "1|hello outside\n");
+		}
+
+		#[tokio::test]
+		async fn read_file_returns_image_files_as_typed_attachments() {
+			// A PNG (NUL bytes in the header → binary by the
+			// `looks_binary` heuristic) used to be a hard
+			// "binary file" error; now it comes back as a typed
+			// image the runner forwards to the model.
+			let bound = TempDir::new().unwrap();
+			let bound_path = camino::Utf8PathBuf::from_path_buf(bound.path().to_path_buf()).unwrap();
+			// Smallest valid PNG header + a NUL, enough to trip
+			// the binary sniff.
+			let png_bytes: [u8; 12] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D];
+			std::fs::write(bound.path().join("shot.png"), png_bytes).unwrap();
+
+			let (registry, tools) = build_registry(&[bound_path.as_path()]).await;
+			let cx = make_cx(&registry, 0).await;
+			let read = tools
+				.read_file(&serde_json::json!({ "path": "shot.png" }), &cx)
+				.await
+				.expect("image read should succeed");
+			assert!(read["content"].as_str().unwrap().contains("image/png"));
+			let images = read["images"].as_array().expect("images key present");
+			assert_eq!(images.len(), 1);
+			assert_eq!(images[0]["mime"].as_str().unwrap(), "image/png");
+			let data_url = images[0]["data_url"].as_str().unwrap();
+			assert!(data_url.starts_with("data:image/png;base64,"), "got: {data_url}");
+
+			// Non-image binaries keep the old hard error.
+			std::fs::write(bound.path().join("blob.bin"), [0u8, 1, 2, 3]).unwrap();
+			let err = tools
+				.read_file(&serde_json::json!({ "path": "blob.bin" }), &cx)
+				.await
+				.expect_err("non-image binary still errors");
+			assert!(err.to_string().contains("binary file"), "got: {err}");
+		}
+
+		#[test]
+		fn image_mime_for_maps_known_extensions_only() {
+			assert_eq!(image_mime_for("a/b/shot.PNG"), Some("image/png"));
+			assert_eq!(image_mime_for("x.jpeg"), Some("image/jpeg"));
+			assert_eq!(image_mime_for("x.jpg"), Some("image/jpeg"));
+			assert_eq!(image_mime_for("x.webp"), Some("image/webp"));
+			assert_eq!(image_mime_for("x.gif"), Some("image/gif"));
+			assert_eq!(image_mime_for("x.svg"), None);
+			assert_eq!(image_mime_for("x.bmp"), None);
+			assert_eq!(image_mime_for("noext"), None);
 		}
 
 		#[tokio::test]

@@ -586,9 +586,19 @@ fn render_message_for_summary(msg: &ChatMessage) -> String {
 			}
 			out.push('\n');
 		}
-		ChatMessage::Tool { tool_call_id, content } => {
+		ChatMessage::Tool {
+			tool_call_id,
+			content,
+			images,
+		} => {
 			out.push_str(&format!("### tool ({tool_call_id})\n"));
 			out.push_str(content);
+			if !images.is_empty() {
+				// Same posture as user attachments: the summary
+				// model never saw the pixels, so a count keeps it
+				// from fictionalising "no screenshot was taken".
+				out.push_str(&format!("\n[{} tool-result image(s)]", images.len()));
+			}
 			out.push_str("\n\n");
 		}
 	}
@@ -643,6 +653,7 @@ mod tests {
 		ChatMessage::Tool {
 			tool_call_id: "call_1".into(),
 			content: t.into(),
+			images: Vec::new(),
 		}
 	}
 	fn system(t: &str) -> ChatMessage {

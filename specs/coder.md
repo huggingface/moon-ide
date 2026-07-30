@@ -490,25 +490,21 @@ the workspace has no enabled servers, and neither is mode-gated
 (same posture as `bash` — sub-agents get them too).
 
 - **Presets + customs.** One hardcoded preset: `playwright`
-  (`npx -y @playwright/mcp@latest --browser chromium --headless
---image-responses omit` — pinned to Playwright's bundled
-  Chromium so it doesn't require real Google Chrome; headless
-  because the coder drives via snapshots, not a window on the
-  dev's display; image blocks omitted because they render as a
-  text placeholder today). Custom servers — label,
-  command + args (stdio transport only), run target, description —
+  (`npx -y @playwright/mcp@latest --browser chromium --headless`
+  — pinned to Playwright's bundled Chromium so it doesn't require
+  real Google Chrome; headless because the coder drives via
+  snapshots, not a window on the dev's display). Custom servers —
+  label, command + args (stdio transport only), description —
   live per workspace on `WorkspaceSession.coder_mcp`, managed from
   the model-settings modal's "MCP servers" section via the
   `coder_mcp_*` commands.
 - **Per-workspace enable set**, following the provider-lock
   precedent. Toggles write through immediately; the next turn's
   tool list reflects them.
-- **Per-server run target**: `container` (playwright's default —
-  the browser joins the coder's sandbox and sits next to the dev
-  servers it exercises; the one-time chromium download rides the
-  container's npx cache) or `host`. `container` spawns via
-  `docker exec -i` when the workspace shell container is
-  `Running`, host fallback — same probe as `bash`.
+- **Servers run where the workspace runs**: `docker exec -i` when
+  the workspace shell container is `Running`, host otherwise —
+  the same probe as `bash`. There is no per-server run-target
+  knob (one existed briefly and was removed unused, ADR 0033).
 - **Playwright output is pinned to `<active-folder>/.moon/
 playwright/`** (`--output-dir`, relative so both spawn targets
   resolve it through the bind mount) — screenshots and PDFs land
@@ -516,13 +512,20 @@ playwright/`** (`--output-dir`, relative so both spawn targets
   on. Container-local paths in tool results (`/workspace/<folder>/
 …`) are rewritten to host paths before the model sees them, so
   a reported screenshot path feeds straight into `read_file`.
+- **Tool-result images are first-class.** MCP `image` content
+  blocks (screenshots) and `read_file` on an image file (png /
+  jpg / gif / webp, ≤ 10 MB) both reach the model as typed image
+  blocks: the tool result's `"images"` key leaves the JSON text
+  projection and is re-attached per provider (Anthropic nested
+  `tool_result` blocks; OpenAI-compat `image_url` parts). Images
+  persist as pi `image` content blocks so reopened sessions
+  re-send them; compaction shows the summary model a count, not
+  pixels.
 - **Lifecycle**: spawned lazily on first use, kept alive across
   turns (a playwright browser session persists between calls),
   killed on disable / remove / IDE exit, respawned on the next call
   after a crash.
 - An MCP-level `isError` result throws, per the error model below.
-  Image content blocks (screenshots) render as a text placeholder —
-  tool-result images are future work.
 
 ### Error model
 

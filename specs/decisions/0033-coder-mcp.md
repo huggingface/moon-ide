@@ -98,5 +98,26 @@ Three changes after the preset met real use:
   `read_file`. Only the active folder's mount pair is translated.
 - Preset also gained `--headless` (the coder drives via snapshots;
   a headed window on the dev's display is noise, and containers
-  have none) and `--image-responses omit` (image blocks render as
-  a placeholder today — the base64 was dead weight).
+  have none).
+
+## Amendment 2026-07-30 (2) — no run-target knob; tool-result images land
+
+- **The `runs: host|container` field is gone.** Every server
+  follows the workspace: `docker exec` when the shell container is
+  running, host otherwise — the same probe as `bash`, and the only
+  answer that ever made sense. The per-server option was removed
+  before anything used the host leg; `#[serde(default)]` absorbs
+  the stale key in existing `session.json` files.
+- **"Tool-result images — deferred" is resolved.** MCP `image`
+  content blocks (playwright screenshots) now reach the model as
+  typed image blocks instead of a text placeholder, and
+  `read_file` on an image file (png / jpg / gif / webp, ≤ 10 MB)
+  returns the pixels the same way — the binary-file hard error
+  only remains for non-image binaries. Mechanism: a tool result's
+  `"images"` key is stripped from the JSON text the model reads
+  and re-attached as typed blocks (Anthropic `tool_result` nested
+  blocks; OpenAI-compat `image_url` parts on the tool message —
+  accepted by OpenRouter et al. though strictly outside OpenAI's
+  schema); images persist as pi `image` content blocks so a
+  reopened session re-sends them. Compaction and the summary
+  model see `[N tool-result image(s)]`, never the pixels.

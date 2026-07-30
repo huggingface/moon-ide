@@ -1037,10 +1037,17 @@ async fn run_subagent_loop(
 				tools.dispatch(&call.function.name, &args, &cx, &cancel).await
 			};
 			let duration_ms = u64::try_from(dispatched_at.elapsed().as_millis()).ok();
-			let (content, is_error) = match outcome {
-				Ok(value) => (value.to_string(), false),
+			// Same image convention as the parent runner: a
+			// tool's `images` key leaves the text projection and
+			// rides typed (the sub-agent's `read_file` on a
+			// screenshot is the case that needs it).
+			let (content, is_error, images) = match outcome {
+				Ok(value) => {
+					let (images, text_value) = crate::runner::split_tool_images(value);
+					(text_value.to_string(), false, images)
+				}
 				Err(CoderError::Aborted) => return Err(CoderError::Aborted),
-				Err(err) => (json!({ "error": err.to_string() }).to_string(), true),
+				Err(err) => (json!({ "error": err.to_string() }).to_string(), true, Vec::new()),
 			};
 			let payload: Value = serde_json::from_str(&content).unwrap_or_else(|_| Value::String(content.clone()));
 			sink.send(wrap_inner(
@@ -1055,6 +1062,7 @@ async fn run_subagent_loop(
 			messages.push(ChatMessage::Tool {
 				tool_call_id: call.id.clone(),
 				content: content.clone(),
+				images: images.clone(),
 			});
 			persist_subagent(
 				session_dir,
@@ -1064,6 +1072,7 @@ async fn run_subagent_loop(
 					tool_name: call.function.name.clone(),
 					content,
 					duration_ms,
+					images,
 				},
 			)
 			.await;

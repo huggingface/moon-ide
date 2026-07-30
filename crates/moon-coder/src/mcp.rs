@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use moon_protocol::coder_mcp::{CoderMcpWorkspaceConfig, McpRunTarget, McpServerConfig, McpServerStatus};
+use moon_protocol::coder_mcp::{CoderMcpWorkspaceConfig, McpServerConfig, McpServerStatus};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
@@ -61,21 +61,10 @@ pub fn preset_servers() -> Vec<McpServerConfig> {
 			"chromium".into(),
 			// The coder drives the browser via snapshots; a headed
 			// window popping open on the dev's display is noise,
-			// and in-container runs have no display anyway.
+			// and the server runs in the (display-less) workspace
+			// container.
 			"--headless".into(),
-			// Image content blocks render as a text placeholder
-			// (ADR 0033) — carrying base64 screenshots through
-			// the pipe is dead weight until tool-result images land.
-			"--image-responses".into(),
-			"omit".into(),
 		],
-		// Container by default (amendment, ADR 0033): the
-		// browser then lives in the same sandbox as the coder's
-		// `bash` and next to the dev servers it exercises. The
-		// one-time `chromium` download rides the container's npx
-		// cache; a down container falls back to the host, same
-		// probe as `bash`.
-		runs: McpRunTarget::Container,
 		description: "Browser automation via Playwright: navigate, click, type, take accessibility snapshots and \
 		              screenshots of real pages. Use it to exercise or debug a running web app."
 			.into(),
@@ -182,11 +171,23 @@ impl McpManager {
 		if result.get("isError").and_then(Value::as_bool).unwrap_or(false) {
 			return Err(CoderError::tool_failed("mcp_call", text));
 		}
-		Ok(json!({
+		let images = collect_images(&result);
+		let mut out = json!({
 			"server": config.id,
 			"tool": tool,
 			"content": text,
-		}))
+		});
+		// `images` is the runner's typed-image convention: the
+		// key leaves the text projection and reaches the model as
+		// real image blocks. A playwright screenshot is the case
+		// this exists for.
+		if !images.is_empty() {
+			out
+				.as_object_mut()
+				.expect("mcp result object")
+				.insert("images".into(), serde_json::to_value(images).unwrap_or_default());
+		}
+		Ok(out)
 	}
 
 	/// Drop (and thereby kill) a server's connection, if any. Called
@@ -283,7 +284,11 @@ fn spawn_args(config: &McpServerConfig) -> Vec<String> {
 
 /// Where to spawn a server process, resolved by the caller (the
 /// tool registry knows the workspace's container name + cwd; this
-/// module doesn't probe docker itself).
+/// module doesn't probe docker itself). MCP servers follow the
+/// workspace: container when the shell is running, host
+/// otherwise — wherever the coder's `bash` would run. There is
+/// deliberately no per-server knob (an early `runs` config field
+/// was removed unused; the workspace mode *is* the answer).
 pub enum McpSpawnTarget {
 	Host {
 		cwd: String,
@@ -304,30 +309,31 @@ pub enum McpSpawnTarget {
 
 impl McpSpawnTarget {
 	/// Rewrite container-local absolute paths in `text` to their
-	/// host-side equivalent. No-op on the host target — those
-	/// servers already report host paths.
+	/// host-side equivalent, so the model can hand a reported
+	/// file path straight to the (host-side) filesystem tools.
+	/// No-op on the host target — those servers already report
+	/// host paths.
 	fn host_paths(&self, text: &str) -> String {
-		match self {
-			McpSpawnTarget::Host { .. } => text.to_owned(),
-			McpSpawnTarget::Container {
-				host_root,
-				container_root,
-				..
-			} => {
-				let mut out = text.to_owned();
-				for sep in ['/', ' '] {
-					let from = format!("{container_root}{sep}");
-					let to = format!("{host_root}{sep}");
-					out = out.replace(&from, &to);
-				}
-				if let Some(prefix) = out.strip_suffix(container_root) {
-					if prefix.ends_with(' ') {
-						out = format!("{prefix}{host_root}");
-					}
-				}
-				out
+		let McpSpawnTarget::Container {
+			host_root,
+			container_root,
+			..
+		} = self
+		else {
+			return text.to_owned();
+		};
+		let mut out = text.to_owned();
+		for sep in ['/', ' '] {
+			let from = format!("{container_root}{sep}");
+			let to = format!("{host_root}{sep}");
+			out = out.replace(&from, &to);
+		}
+		if let Some(prefix) = out.strip_suffix(container_root) {
+			if prefix.ends_with(' ') {
+				out = format!("{prefix}{host_root}");
 			}
 		}
+		out
 	}
 }
 
@@ -506,11 +512,18 @@ impl McpConnection {
 	}
 }
 
+/// Largest image we forward to the model from an MCP result,
+/// measured in base64 characters (~1.5 MB decoded). Playwright
+/// screenshots at default viewport are far below this; anything
+/// bigger stays a placeholder so one result can't crowd out the
+/// context window.
+const IMAGE_MAX_BASE64_CHARS: usize = 2_000_000;
+
 /// Flatten a `tools/call` result's content blocks to the text the
-/// model sees. Text blocks pass through; image / audio / resource
-/// blocks become placeholders — feeding tool-result images back to
-/// the model is future work (the pi JSONL tool-result shape is
-/// text-only today).
+/// model reads. Text blocks pass through; image blocks become a
+/// one-line placeholder — the pixels themselves ride separately
+/// (see [`collect_images`]); audio / resource blocks stay
+/// placeholders.
 fn render_content(result: &Value) -> String {
 	let Some(blocks) = result.get("content").and_then(Value::as_array) else {
 		return result.to_string();
@@ -525,7 +538,7 @@ fn render_content(result: &Value) -> String {
 			Some("image") => {
 				let mime = block.get("mimeType").and_then(Value::as_str).unwrap_or("image");
 				let bytes = block.get("data").and_then(Value::as_str).map(str::len).unwrap_or(0);
-				out.push_str(&format!("[{mime} image, ~{} kB base64 — not displayed]", bytes / 1000));
+				out.push_str(&format!("[{mime} image attached — ~{} kB]", bytes / 1000));
 			}
 			Some("resource") | Some("resource_link") => {
 				out.push_str(&format!(
@@ -537,6 +550,39 @@ fn render_content(result: &Value) -> String {
 		}
 	}
 	out
+}
+
+/// Collect a `tools/call` result's image blocks as typed
+/// attachments, for the runner's `images` convention. Oversized
+/// or malformed blocks are skipped (their placeholder stays in
+/// the rendered text either way).
+fn collect_images(result: &Value) -> Vec<crate::inference::ImageAttachment> {
+	let Some(blocks) = result.get("content").and_then(Value::as_array) else {
+		return Vec::new();
+	};
+	let mut images = Vec::new();
+	for block in blocks {
+		if block.get("type").and_then(Value::as_str) != Some("image") {
+			continue;
+		}
+		let Some(data) = block.get("data").and_then(Value::as_str) else {
+			continue;
+		};
+		if data.is_empty() || data.len() > IMAGE_MAX_BASE64_CHARS {
+			tracing::debug!(bytes = data.len(), "mcp: skipping oversized or empty image block");
+			continue;
+		}
+		let mime = block
+			.get("mimeType")
+			.and_then(Value::as_str)
+			.unwrap_or("image/png")
+			.to_string();
+		images.push(crate::inference::ImageAttachment {
+			data_url: format!("data:{mime};base64,{data}"),
+			mime,
+		});
+	}
+	images
 }
 
 /// Mint an id for a custom server — `mcp-<unix-ms>`, same shape
@@ -689,16 +735,39 @@ rl.on('line', (line) => {
 	}
 
 	#[test]
-	fn preset_spawns_headless_in_container_and_omits_images() {
+	fn collect_images_builds_typed_attachments() {
+		let result = json!({
+			"content": [
+				{ "type": "text", "text": "shot taken" },
+				{ "type": "image", "mimeType": "image/png", "data": "QUJD" },
+				{ "type": "image", "data": "" },
+			]
+		});
+		let images = collect_images(&result);
+		assert_eq!(images.len(), 1, "empty data blocks are skipped");
+		assert_eq!(images[0].mime, "image/png");
+		assert_eq!(images[0].data_url, "data:image/png;base64,QUJD");
+	}
+
+	#[test]
+	fn collect_images_skips_oversized_blocks() {
+		let big = "A".repeat(IMAGE_MAX_BASE64_CHARS + 1);
+		let result = json!({
+			"content": [{ "type": "image", "mimeType": "image/png", "data": big }]
+		});
+		assert!(collect_images(&result).is_empty());
+	}
+
+	#[test]
+	fn preset_runs_chromium_headless() {
 		let preset = &preset_servers()[0];
 		assert_eq!(preset.id, "playwright");
-		assert!(matches!(preset.runs, McpRunTarget::Container));
 		assert!(preset.args.iter().any(|a| a == "--headless"));
-		let omit = preset
+		let chromium = preset
 			.args
 			.windows(2)
-			.any(|w| w[0] == "--image-responses" && w[1] == "omit");
-		assert!(omit, "preset should pass `--image-responses omit`");
+			.any(|w| w[0] == "--browser" && w[1] == "chromium");
+		assert!(chromium, "preset should pin Playwright's bundled chromium");
 	}
 
 	#[test]

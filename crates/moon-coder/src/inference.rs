@@ -165,6 +165,11 @@ pub enum ChatMessage {
 	Tool {
 		tool_call_id: String,
 		content: String,
+		/// Images the tool returned (a `read_file` on a PNG, a
+		/// playwright screenshot block). Same wire treatment as
+		/// user-attached images; empty for virtually every call.
+		#[serde(default, skip_serializing_if = "Vec::is_empty")]
+		images: Vec<ImageAttachment>,
 	},
 }
 
@@ -314,9 +319,13 @@ fn build_wire_messages<'a>(messages: &'a [ChatMessage], cached_indexes: &[usize]
 				content: content.as_deref(),
 				tool_calls,
 			},
-			ChatMessage::Tool { tool_call_id, content } => WireMessage::Tool {
+			ChatMessage::Tool {
 				tool_call_id,
-				content: wire_text_content(content, cache_here),
+				content,
+				images,
+			} => WireMessage::Tool {
+				tool_call_id,
+				content: wire_tool_content(content, images, cache_here),
 			},
 		};
 		out.push(wire);
@@ -332,6 +341,31 @@ fn wire_text_content(content: &str, cache_here: bool) -> WireContent<'_> {
 		text: content,
 		cache_control: Some(CacheControl::EPHEMERAL),
 	}])
+}
+
+/// Build the wire content for a Tool message: the plain string
+/// (or single cache-marked text block) unless the tool returned
+/// images, in which case the text block is followed by one
+/// `image_url` block per image — the same blocks shape user
+/// attachments use. Strictly, OpenAI's chat-completions schema
+/// types `tool` content as string-only, but OpenRouter and the
+/// other OpenAI-compat routers we run through accept (and
+/// vision models consume) content-part arrays there.
+fn wire_tool_content<'a>(content: &'a str, images: &'a [ImageAttachment], cache_here: bool) -> WireContent<'a> {
+	if images.is_empty() {
+		return wire_text_content(content, cache_here);
+	}
+	let mut blocks: Vec<WireBlock<'a>> = Vec::with_capacity(images.len() + 1);
+	blocks.push(WireBlock::Text {
+		text: content,
+		cache_control: cache_here.then_some(CacheControl::EPHEMERAL),
+	});
+	for img in images {
+		blocks.push(WireBlock::ImageUrl {
+			image_url: WireImageUrl { url: &img.data_url },
+		});
+	}
+	WireContent::Blocks(blocks)
 }
 
 /// Build the wire content for a User message, hoisting into the
@@ -2142,6 +2176,7 @@ mod tests {
 			ChatMessage::Tool {
 				tool_call_id: "call_1".into(),
 				content: "/etc /var".into(),
+				images: Vec::new(),
 			},
 		];
 		assert_eq!(cache_breakpoint_indexes(&messages, &route, model), vec![0, 3]);
@@ -2159,6 +2194,7 @@ mod tests {
 			ChatMessage::Tool {
 				tool_call_id: "call_1".into(),
 				content: "ok".into(),
+				images: Vec::new(),
 			},
 		];
 		let wire = build_wire_messages(&messages, &[]);
@@ -2180,6 +2216,7 @@ mod tests {
 			ChatMessage::Tool {
 				tool_call_id: "call_1".into(),
 				content: "ok".into(),
+				images: Vec::new(),
 			},
 		];
 		// Mark system + tool (typical 2-breakpoint placement for
@@ -2194,6 +2231,23 @@ mod tests {
 		// single text block; tool_call_id is preserved.
 		assert!(json.contains(
 			r#"{"role":"tool","tool_call_id":"call_1","content":[{"type":"text","text":"ok","cache_control":{"type":"ephemeral"}}]}"#
+		));
+	}
+
+	#[test]
+	fn wire_tool_with_images_emits_text_then_image_url_blocks() {
+		let messages = vec![ChatMessage::Tool {
+			tool_call_id: "call_1".into(),
+			content: "[image file — image/png, attached]".into(),
+			images: vec![ImageAttachment {
+				data_url: "data:image/png;base64,QUJD".into(),
+				mime: "image/png".into(),
+			}],
+		}];
+		let wire = build_wire_messages(&messages, &[]);
+		let json = serde_json::to_string(&wire).unwrap();
+		assert!(json.contains(
+			r#""role":"tool","tool_call_id":"call_1","content":[{"type":"text","text":"[image file — image/png, attached]"},{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD"}}]"#
 		));
 	}
 

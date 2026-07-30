@@ -11,26 +11,17 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-/// Where an MCP server process runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS, Default)]
-#[ts(export)]
-#[serde(rename_all = "snake_case")]
-pub enum McpRunTarget {
-	/// Spawned directly on the host — the right default for
-	/// servers that need host resources (playwright needs a real
-	/// browser, which moon-base doesn't ship).
-	#[default]
-	Host,
-	/// Spawned via `docker exec -i` inside the workspace shell
-	/// container when it's running (falls back to host otherwise,
-	/// same posture as the `bash` tool).
-	Container,
-}
-
 /// One MCP server definition — either a hardcoded preset
 /// (moon-coder's `mcp::preset_servers`) or a user-defined custom
 /// entry persisted per workspace.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+///
+/// Servers spawn via `docker exec` in the workspace shell
+/// container — the same sandbox the coder's `bash` runs in — so
+/// there is no per-server run-target knob. An early `runs:
+/// host|container` field was removed before any server used the
+/// host option; `#[serde(default)]` absorbs the key in existing
+/// `session.json` files.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 #[serde(default)]
 pub struct McpServerConfig {
@@ -43,25 +34,10 @@ pub struct McpServerConfig {
 	pub command: String,
 	/// Arguments passed verbatim.
 	pub args: Vec<String>,
-	/// Host or container spawn — per-server, not global.
-	pub runs: McpRunTarget,
 	/// 1-2 sentences surfaced to the model in the meta-tool
 	/// descriptions so it knows when the server is worth a
 	/// `mcp_list_tools` round-trip.
 	pub description: String,
-}
-
-impl Default for McpServerConfig {
-	fn default() -> Self {
-		Self {
-			id: String::new(),
-			label: String::new(),
-			command: String::new(),
-			args: Vec::new(),
-			runs: McpRunTarget::Host,
-			description: String::new(),
-		}
-	}
 }
 
 /// Per-workspace MCP state, persisted on
