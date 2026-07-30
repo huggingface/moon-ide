@@ -60,6 +60,13 @@ whose shell exited stays readable — its output is still on the user's
 screen, so it should still answer — and is dropped when the tab
 closes.
 
+**A pasted terminal selection names its terminal.** `Ctrl+L` from a
+terminal pane already ships the highlighted scrollback as a
+`<terminal_output>` block; it now carries the source terminal's id, so
+the obvious follow-up ("did it recover?", "show me more of that") is a
+`read_terminal` call rather than a guess between same-named tabs. The
+paste stays the snapshot the user chose; the id makes it a pointer too.
+
 Reads are capped (200 lines by default, 2000 and 100 kB per call) and
 the tool description tells the model that terminals may hold output
 the user did not mean to share, and not to quote more of it back than

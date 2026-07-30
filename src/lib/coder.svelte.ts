@@ -234,7 +234,11 @@ export type ImageComposerAttachment = {
  *  disambiguated with a `#N` suffix when multiple captures share
  *  the same label) so the model has an in-prose pointer to the
  *  matching `<terminal_output>` element in the trailing
- *  `<context>` block. */
+ *  `<context>` block. `terminalId` is the source terminal's live
+ *  stream id, passed to the model so it can call `read_terminal`
+ *  on that exact terminal when the pasted slice isn't enough
+ *  (ADR 0048) — `null` for a capture whose terminal we couldn't
+ *  identify. */
 export type TerminalAttachment = {
 	kind: 'terminal';
 	id: string;
@@ -242,6 +246,7 @@ export type TerminalAttachment = {
 	text: string;
 	label: string;
 	lineCount: number;
+	terminalId: string | null;
 };
 
 /** Anything the chip strip can hold. The three shapes share the
@@ -1508,8 +1513,14 @@ export class CoderPanelState {
 	 *  selections get). When several captures share the same label
 	 *  we suffix `#2`, `#3`, … so the tokens stay distinct;
 	 *  reattaching the *exact* same scrollback reuses the original
-	 *  token so the draft already has the right pointer. */
-	addAttachmentFromTerminal(snapshot: { text: string; label: string }): void {
+	 *  token so the draft already has the right pointer.
+	 *
+	 *  `streamId` rides along so the `<terminal_output>` block can
+	 *  name the terminal it came from: a pasted slice is a snapshot,
+	 *  and the follow-up question ("did it recover?", "show me more
+	 *  of that") is answered by `read_terminal` on the same
+	 *  terminal rather than by guessing between same-named tabs. */
+	addAttachmentFromTerminal(snapshot: { text: string; label: string; streamId: string | null }): void {
 		const text = snapshot.text;
 		if (text.length === 0) {
 			return;
@@ -1517,7 +1528,8 @@ export class CoderPanelState {
 		rightPanel.set('coder');
 		this.view = 'session';
 		const dup = this.attachments.find(
-			(a): a is TerminalAttachment => a.kind === 'terminal' && a.text === text && a.label === snapshot.label,
+			(a): a is TerminalAttachment =>
+				a.kind === 'terminal' && a.text === text && a.label === snapshot.label && a.terminalId === snapshot.streamId,
 		);
 		const token = dup ? dup.token : this.#nextTerminalToken(snapshot.label);
 		if (!dup) {
@@ -1531,6 +1543,7 @@ export class CoderPanelState {
 					text,
 					label: snapshot.label,
 					lineCount,
+					terminalId: snapshot.streamId,
 				},
 			];
 		}
@@ -3908,7 +3921,7 @@ function applyInnerEventToRows(rows: CoderRow[], event: CoderEvent): void {
  *  Empty draft + non-empty attachments is a valid send — we ship
  *  just the context block so "explain this" with one selection
  *  works. */
-function renderPromptWithAttachments(
+export function renderPromptWithAttachments(
 	text: string,
 	attachments: SelectionAttachment[],
 	terminalAttachments: TerminalAttachment[],
@@ -3930,9 +3943,13 @@ function renderPromptWithAttachments(
 		// into the draft so the model can correlate the in-prose
 		// pointer with the matching context element when the user
 		// attached output from several terminals (or several
-		// disjoint snippets from one).
+		// disjoint snippets from one). `terminal_id` is the handle
+		// for `read_terminal`, so the model can go back to the
+		// live terminal instead of treating the paste as all there
+		// is; omitted when unknown rather than emitted empty.
+		const idAttr = att.terminalId === null ? '' : ` terminal_id="${escapeXmlAttr(att.terminalId)}"`;
 		blocks.push(
-			`<terminal_output token="${escapeXmlAttr(att.token)}" label="${escapeXmlAttr(att.label)}">\n${att.text}\n</terminal_output>`,
+			`<terminal_output token="${escapeXmlAttr(att.token)}" label="${escapeXmlAttr(att.label)}"${idAttr}>\n${att.text}\n</terminal_output>`,
 		);
 	}
 	if (blocks.length === 0) {

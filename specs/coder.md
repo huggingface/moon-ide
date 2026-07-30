@@ -958,6 +958,13 @@ auto-tail. Empty sessions surface a toast instead of a phantom tab.
 
 ### Composer attachments
 
+- `Ctrl+L` from a terminal pane attaches the highlighted
+  scrollback instead, as a `<terminal_output>` block carrying the
+  source terminal's id — so the model can follow up with
+  `read_terminal` on that exact terminal rather than treating the
+  paste as all there is (the id is absent for a capture whose
+  terminal can't be identified, and a since-closed terminal fails
+  the read with the usual recovery hint).
 - `Ctrl+L` attaches the active editor selection (also works from
   diff panes and review sections): inserts an inline
   `@path:start-end` token at the caret, adds a chip above the

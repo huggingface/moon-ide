@@ -360,6 +360,7 @@
 					coder.addAttachmentFromTerminal({
 						text: terminalSelection.text,
 						label: terminalSelection.label,
+						streamId: terminalSelection.streamId,
 					});
 					return;
 				}
@@ -371,6 +372,7 @@
 					coder.addAttachmentFromTerminal({
 						text: terminalSelection.text,
 						label: terminalSelection.label,
+						streamId: terminalSelection.streamId,
 					});
 					return;
 				}

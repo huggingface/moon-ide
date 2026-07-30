@@ -1345,7 +1345,7 @@ impl ToolRegistry {
 			ToolDefinition::function(
 				"read_terminal",
 				format!(
-					"Read the recent output of one of the user's open terminals — what is actually on their screen, with escape sequences applied and `\\r`-redrawn progress lines collapsed. Use it to see how a dev server, watcher, or test run the user started is doing instead of starting a competing one with `bash`. Read-only: this cannot type into a terminal or run anything. Terminals may contain output the user did not mean to share (tokens, secrets, unrelated projects) — read what you need for the task at hand and don't quote more of it back than necessary.\n\nCurrently open:\n{inventory}"
+					"Read the recent output of one of the user's open terminals — what is actually on their screen, with escape sequences applied and `\\r`-redrawn progress lines collapsed. Use it to see how a dev server, watcher, or test run the user started is doing instead of starting a competing one with `bash`. When the user pastes terminal output into their message, the `<terminal_output>` block's `terminal_id` attribute is a valid id here — use it to read the live terminal instead of treating the paste as everything there is. Read-only: this cannot type into a terminal or run anything. Terminals may contain output the user did not mean to share (tokens, secrets, unrelated projects) — read what you need for the task at hand and don't quote more of it back than necessary.\n\nCurrently open:\n{inventory}"
 				),
 				json!({
 					"type": "object",
