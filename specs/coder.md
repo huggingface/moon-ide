@@ -1245,6 +1245,16 @@ calls in one assistant message run concurrently (4-permit
 semaphore). The wire name is `task` (what every agent product calls
 this); Rust internals keep the `subagent` naming.
 
+For a concurrent batch, each call's `ToolResult` event fires the
+moment that sub-agent finishes — not when its earlier siblings do —
+so the panel can stop that row's elapsed timer while the rest of the
+batch is still running. The conversation-history push is the mirror
+image: results land on `messages` in the model's original tool-call
+order once the whole batch resolves, so the next round-trip and any
+persisted replay stay deterministic. (Firing events in call order
+instead left finished-but-later rows pinned in the live "running…"
+state until the longest sibling settled.)
+
 ```jsonschema
 task(
   task: string,                    // self-contained; sub-agent doesn't see the parent's transcript

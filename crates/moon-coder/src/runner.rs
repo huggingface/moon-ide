@@ -5217,6 +5217,17 @@ async fn dispatch_tool_calls(
 /// history stays deterministic. Cancellation cascades automatically
 /// via `cancel.child_token()` (the parent's token is the child's
 /// parent).
+///
+/// Each sub-agent's `ToolResult` **event** fires the moment that
+/// sub-agent finishes — not when its earlier siblings do — so the
+/// panel can stop that row's elapsed timer even while the rest of
+/// the batch is still running. (An earlier implementation awaited
+/// the spawn handles in call order, which stranded later rows in
+/// the live "running…" state until the longest-running sibling
+/// settled.) The `messages` push, by contrast, is reassembled in
+/// the model's original call order once the whole batch resolves,
+/// so the conversation history the next LLM round-trip sees — and
+/// anything persisted from it — is deterministic across replays.
 async fn dispatch_subagent_batch(
 	state: &Arc<CoderState>,
 	rt: &Arc<SessionRuntime>,
@@ -5249,6 +5260,7 @@ async fn dispatch_subagent_batch(
 		let cancel_for_task = cancel.clone();
 		let sem_for_task = sem.clone();
 		let call_id = call.id.clone();
+		let call_name = call.function.name.clone();
 		let task = tokio::spawn(async move {
 			let _permit = sem_for_task.acquire().await.expect("semaphore not closed");
 			// Timed from permit acquisition, not batch spawn, so a
@@ -5265,24 +5277,63 @@ async fn dispatch_subagent_batch(
 				&args,
 			)
 			.await;
-			(outcome, u64::try_from(dispatched_at.elapsed().as_millis()).ok())
+			let duration_ms = u64::try_from(dispatched_at.elapsed().as_millis()).ok();
+			// Emit + persist immediately on completion so this row's
+			// timer stops in the UI; the `ChatMessage::Tool` for the
+			// conversation history rides back to the caller, which
+			// reassembles the batch in call order before pushing.
+			let message =
+				match emit_tool_result(&rt_for_task, &sink_for_task, &call_id, &call_name, outcome, duration_ms).await {
+					Ok(message) => message,
+					Err(err) => return Err(err),
+				};
+			Ok(message)
 		});
-		tasks.push((call, task));
+		tasks.push(task);
 	}
-	for (call, task) in tasks {
-		let (outcome, duration_ms) = match task.await {
-			Ok(o) => o,
-			Err(err) => (
-				Err(CoderError::Internal(format!(
-					"sub-agent task join error for {}: {err}",
-					call.id
-				))),
-				None,
-			),
-		};
-		finish_tool_call(rt, sink, &call.id, &call.function.name, outcome, duration_ms).await?;
+	// Await every handle, collecting the per-call tool message (or
+	// first error) so the `messages` push below lands in the model's
+	// original tool-call order regardless of completion order. A
+	// `join_all` (not an early-return `?` loop) guarantees a slow
+	// sibling never blocks an already-finished sub-agent's message
+	// from being recorded, and a panicking task can't strand the
+	// rest of the batch's results.
+	let joined = futures_util::future::join_all(tasks).await;
+	let mut messages = Vec::with_capacity(joined.len());
+	let mut first_err: Option<CoderError> = None;
+	for (call, result) in calls.iter().zip(joined) {
+		match result {
+			// Sub-agent ran to completion and its `ToolResult` already
+			// went out over the sink inside the spawned task.
+			Ok(Ok(message)) => messages.push(message),
+			// The sub-agent's emit was aborted — propagate the
+			// short-circuit so the turn loop bails the same way the
+			// sequential path does. Sibling messages already collected
+			// stay in `messages` and are pushed below before we return.
+			Ok(Err(err)) => {
+				first_err.get_or_insert(err);
+			}
+			// Join error (panic / cancellation): surface a synthetic
+			// errored tool message so the next LLM round-trip still
+			// sees a `tool_result` for every `tool_use` — Anthropic
+			// 400s the request otherwise.
+			Err(join_err) => {
+				first_err.get_or_insert_with(|| {
+					CoderError::Internal(format!("sub-agent task join error for {}: {join_err}", call.id))
+				});
+				messages.push(ChatMessage::Tool {
+					tool_call_id: call.id.clone(),
+					content: json!({ "error": "sub-agent task failed" }).to_string(),
+					images: Vec::new(),
+				});
+			}
+		}
 	}
-	Ok(())
+	rt.session.lock().await.messages.extend(messages);
+	match first_err {
+		Some(err) => Err(err),
+		None => Ok(()),
+	}
 }
 
 /// Build + run a `Subagent` from the JSON args. Validation
@@ -6595,16 +6646,28 @@ async fn recover_in_memory_orphans(rt: &Arc<SessionRuntime>, sink: &FolderEventS
 	}
 }
 
-/// Shared "tool finished, push result + emit events + persist"
-/// epilogue used by both the sequential and the parallel paths.
-async fn finish_tool_call(
+/// Emit the `ToolResult` event + persist the tool record for a
+/// finished call, and build the `ChatMessage::Tool` that belongs on
+/// the session's conversation history. Does **not** push that
+/// message — the caller decides *when* and *in what order* it lands
+/// on `messages`:
+///
+/// - The sequential path pushes immediately via [`finish_tool_call`].
+/// - The parallel sub-agent batch defers the push so it can
+///   reassemble results in the model's original call order, even
+///   though the events themselves fire per-completion.
+///
+/// Returns `Err(CoderError::Aborted)` (without emitting anything)
+/// when the tool itself was aborted, matching the turn-loop's
+/// short-circuit contract.
+async fn emit_tool_result(
 	rt: &Arc<SessionRuntime>,
 	sink: &FolderEventSink,
 	tool_call_id: &str,
 	tool_name: &str,
 	outcome: Result<Value, CoderError>,
 	duration_ms: Option<u64>,
-) -> Result<(), CoderError> {
+) -> Result<ChatMessage, CoderError> {
 	match outcome {
 		Ok(value) => {
 			// Images ride typed on `ChatMessage::Tool.images`
@@ -6621,13 +6684,12 @@ async fn finish_tool_call(
 				is_error: false,
 				duration_ms,
 			});
-			rt.session.lock().await.messages.push(ChatMessage::Tool {
-				tool_call_id: tool_call_id.to_string(),
-				content: content.clone(),
-				images: images.clone(),
-			});
 			persist_tool_record(rt, tool_call_id, tool_name, &content, duration_ms, &images).await;
-			Ok(())
+			Ok(ChatMessage::Tool {
+				tool_call_id: tool_call_id.to_string(),
+				content,
+				images,
+			})
 		}
 		Err(CoderError::Aborted) => Err(CoderError::Aborted),
 		Err(err) => {
@@ -6639,15 +6701,32 @@ async fn finish_tool_call(
 				is_error: true,
 				duration_ms,
 			});
-			rt.session.lock().await.messages.push(ChatMessage::Tool {
-				tool_call_id: tool_call_id.to_string(),
-				content: content.clone(),
-				images: Vec::new(),
-			});
 			persist_tool_record(rt, tool_call_id, tool_name, &content, duration_ms, &[]).await;
-			Ok(())
+			Ok(ChatMessage::Tool {
+				tool_call_id: tool_call_id.to_string(),
+				content,
+				images: Vec::new(),
+			})
 		}
 	}
+}
+
+/// Shared "tool finished, push result + emit events + persist"
+/// epilogue used by the sequential dispatch path. Thin wrapper over
+/// [`emit_tool_result`] that pushes the resulting message onto the
+/// session's conversation history right away (sequential dispatch
+/// already runs in call order, so no reassembly is needed).
+async fn finish_tool_call(
+	rt: &Arc<SessionRuntime>,
+	sink: &FolderEventSink,
+	tool_call_id: &str,
+	tool_name: &str,
+	outcome: Result<Value, CoderError>,
+	duration_ms: Option<u64>,
+) -> Result<(), CoderError> {
+	let message = emit_tool_result(rt, sink, tool_call_id, tool_name, outcome, duration_ms).await?;
+	rt.session.lock().await.messages.push(message);
+	Ok(())
 }
 
 /// Split a tool result into the images it returned and the
