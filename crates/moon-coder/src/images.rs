@@ -117,36 +117,42 @@ pub(crate) async fn reencode_all(attachments: Vec<ImageAttachment>) -> Vec<Image
 	out
 }
 
-/// How much base64 image payload we'll put on the wire before
-/// dropping the oldest attachments, and how far back down to go
-/// once we start.
+/// Limits on what the wire carries, in both bytes and attachments.
 ///
-/// The HF router rejects a request body over 5 MiB (moon-landing's
-/// `express.json({ limit: "5MB" })` on `/v1/chat/completions`).
-/// Everything else in a long session — tool output, source files,
-/// the system prompt, tool definitions — is bounded by compaction
-/// at 80% of the context window, so roughly 1 MB of text. Images
-/// get the rest, minus margin.
+/// `ceiling` / `floor`: base64 bytes. The HF router rejects a request
+/// body over 5 MiB (moon-landing's `express.json({ limit: "5MB" })`),
+/// and everything else in a long session — tool output, source files,
+/// the system prompt, tool definitions — is bounded by compaction at
+/// 80% of the context window, so roughly 1 MB of text. Images get the
+/// rest, minus margin.
 ///
-/// The gap between `ceiling` and `floor` is what keeps prompt
-/// caching viable. Dropping an image rewrites the prompt prefix
-/// from that point on, so a plain "keep the newest N bytes" rule
-/// would invalidate the cache on *every* new screenshot. Cutting
-/// deep and rarely trades that for one recompute per ~2 MB of new
-/// screenshots.
+/// `max_count`: distinct attachments on the wire at once, a
+/// provider-side limit the byte budget can't see. Scaleway
+/// hard-rejects with `400 Too many images were provided, we currently
+/// limit the number of images per conversation to 60` — and after
+/// ADR 0049's WebP re-encode made images small enough that the byte
+/// budget never fires, the count became the binding constraint. We
+/// leave margin below 60.
+///
+/// The byte hysteresis (`ceiling` vs `floor`) is what keeps prompt
+/// caching viable: dropping an image rewrites the prompt prefix from
+/// that point on, so cutting deep and rarely costs one recompute per
+/// ~2 MB of new screenshots rather than one per turn.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ImageWireBudget {
 	pub(crate) ceiling: usize,
 	pub(crate) floor: usize,
+	pub(crate) max_count: u32,
 }
 
 /// Raise these (or return `None` from
 /// [`crate::inference::InferenceClient::image_wire_budget`]) when
-/// the router's body limit goes up — nothing is destroyed by
-/// elision, so a bigger budget immediately puts the images back.
+/// the router's limits move — nothing is destroyed by elision, so a
+/// bigger budget immediately puts the images back.
 pub(crate) const HF_IMAGE_WIRE_BUDGET: ImageWireBudget = ImageWireBudget {
 	ceiling: 3_500_000,
 	floor: 1_500_000,
+	max_count: 50,
 };
 
 /// Bytes of image payload `messages` would put on the wire, ignoring
@@ -158,9 +164,23 @@ pub(crate) fn wire_bytes(messages: &[ChatMessage], elided: &HashSet<u64>) -> usi
 		.sum()
 }
 
-/// Mark oldest-first until the payload is back under `budget.floor`,
-/// but only once it has crossed `budget.ceiling`. Returns how many
-/// images were newly marked.
+/// Distinct payloads on the wire, ignoring anything already marked
+/// for elision. Counted by hash, so byte-identical screenshots — a
+/// duplicate MCP screenshot, the same frame pasted twice — cost one
+/// slot against `max_count`, matching how they cost one cache entry.
+pub(crate) fn wire_image_count(messages: &[ChatMessage], elided: &HashSet<u64>) -> usize {
+	images_in_order(messages)
+		.map(image_key)
+		.filter(|key| !elided.contains(key))
+		.collect::<HashSet<u64>>()
+		.len()
+}
+
+/// Mark oldest-first until the payload is back under `budget.floor`
+/// *and* the attachment count is back under `budget.max_count`. The
+/// byte leg only plans new drops once the payload has crossed
+/// `budget.ceiling`; the count leg fires the moment it overflows —
+/// both hard limits, neither negotiable.
 ///
 /// `elided` is the session's running set and only ever grows, which
 /// is what makes the wire prefix stable between events. Keying on
@@ -170,18 +190,26 @@ pub(crate) fn wire_bytes(messages: &[ChatMessage], elided: &HashSet<u64>) -> usi
 /// elide together.
 pub(crate) fn plan_elision(messages: &[ChatMessage], budget: ImageWireBudget, elided: &mut HashSet<u64>) -> usize {
 	let mut bytes = wire_bytes(messages, elided);
-	if bytes <= budget.ceiling {
+	let mut count = wire_image_count(messages, elided);
+	let over_bytes = bytes > budget.ceiling;
+	let over_count = count > budget.max_count as usize;
+	if !over_bytes && !over_count {
 		return 0;
 	}
 	let mut newly_elided = 0;
 	for image in images_in_order(messages) {
-		if bytes <= budget.floor {
+		// Bytes get hysteresis, count doesn't: a hard provider cap
+		// can't be rode up against the way a cache-cost trade-off can.
+		let bytes_ok = bytes <= budget.floor;
+		let count_ok = count <= budget.max_count as usize;
+		if bytes_ok && count_ok {
 			break;
 		}
 		if !elided.insert(image_key(image)) {
 			continue;
 		}
 		bytes = bytes.saturating_sub(image.data_url.len());
+		count -= 1;
 		newly_elided += 1;
 	}
 	newly_elided
@@ -411,6 +439,9 @@ mod tests {
 	const TEST_BUDGET: ImageWireBudget = ImageWireBudget {
 		ceiling: 1_000_000,
 		floor: 400_000,
+		// Generous so the byte tests aren't also fighting a count cap;
+		// count tests set their own.
+		max_count: 10_000,
 	};
 
 	#[test]
@@ -487,5 +518,67 @@ mod tests {
 		assert_eq!(plan_elision(&messages, TEST_BUDGET, &mut elided), 1);
 		assert_eq!(elided.len(), 1);
 		assert_eq!(wire_bytes(&messages, &elided), 0, "both copies leave the wire");
+	}
+
+	/// Bytes tiny (the WebP world), count the binding limit — the
+	/// shape that actually produced the 400 in the wild.
+	#[test]
+	fn the_count_cap_drops_oldest_when_bytes_are_fine() {
+		let budget = ImageWireBudget {
+			max_count: 3,
+			..TEST_BUDGET
+		};
+		// 6 x 1 kB = 6 kB, nowhere near the byte ceiling — but 6
+		// attachments against a cap of 3.
+		let messages = history_with_images(&[1, 1, 1, 1, 1, 1]);
+		let mut elided = HashSet::new();
+		assert_eq!(plan_elision(&messages, budget, &mut elided), 3);
+		assert_eq!(wire_image_count(&messages, &elided), 3);
+		assert_eq!(wire_bytes(&messages, &elided), 3_000, "the three newest survive");
+
+		let kept: Vec<&ImageAttachment> = images_in_order(&messages)
+			.filter(|image| !elided.contains(&image_key(image)))
+			.collect();
+		assert!(kept[0].data_url.starts_with("data:image/webp;base64,3"));
+	}
+
+	/// Duplicates share one slot against the count cap, just as they
+	/// share one cache entry — counting them per occurrence would
+	/// elide images the provider never counted.
+	#[test]
+	fn duplicates_count_once_against_the_cap() {
+		let budget = ImageWireBudget {
+			max_count: 2,
+			..TEST_BUDGET
+		};
+		let mut messages = history_with_images(&[1, 1]);
+		messages.push(ChatMessage::Tool {
+			tool_call_id: "call_dup".into(),
+			content: "{}".into(),
+			images: vec![ImageAttachment {
+				data_url: format!("data:image/webp;base64,{}", "A".repeat(1000)),
+				mime: "image/webp".into(),
+			}],
+		});
+		// Copy the duplicate into a second message: 4 attachments,
+		// 3 distinct payloads, cap 2.
+		let dup = match &messages[2] {
+			ChatMessage::Tool { images, .. } => images[0].clone(),
+			_ => unreachable!(),
+		};
+		messages.push(ChatMessage::Tool {
+			tool_call_id: "call_dup2".into(),
+			content: "{}".into(),
+			images: vec![dup],
+		});
+		assert_eq!(wire_image_count(&messages, &HashSet::new()), 3);
+
+		let mut elided = HashSet::new();
+		assert_eq!(
+			plan_elision(&messages, budget, &mut elided),
+			1,
+			"one distinct payload must go"
+		);
+		assert_eq!(wire_image_count(&messages, &elided), 2);
 	}
 }

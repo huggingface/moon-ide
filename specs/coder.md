@@ -1030,13 +1030,13 @@ Two mechanisms, both in `crates/moon-coder/src/images.rs`:
 
 - PNG attachments are re-encoded to lossless WebP at capture, once.
 - Past a per-route byte ceiling (HF router only, since that's the
-  route with a 5 MiB body cap), the oldest attachments are dropped
-  from the **outgoing copy** of the history down to a lower floor.
-  The session, its JSONL and the panel keep every image, so raising
-  the budget restores them. The ceiling/floor gap is deliberate:
-  dropping an image rewrites the prompt prefix, so trimming rarely
-  and deeply costs one prompt-cache miss instead of one per
-  screenshot.
+  route with a 5 MiB body cap) or a provider attachment-count cap
+  (Scaleway hard-rejects at 60; we hold 50), the oldest attachments
+  are dropped from the **outgoing copy** of the history. The session,
+  its JSONL and the panel keep every image, so raising the budget
+  restores them. The byte ceiling/floor gap is deliberate: dropping
+  an image rewrites the prompt prefix, so trimming rarely and deeply
+  costs one prompt-cache miss instead of one per screenshot.
 
 Rationale, measurements and rejected encodings: [ADR 0049](decisions/0049-image-payload-budget.md).
 

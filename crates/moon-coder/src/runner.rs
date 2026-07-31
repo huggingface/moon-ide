@@ -447,7 +447,8 @@ struct Session {
 	/// first turn that touches files lands a `TurnDiff`.
 	last_turn_diff: Option<(Vec<String>, String)>,
 	/// Images held back from the wire because the accumulated
-	/// payload crossed the route's budget (ADR 0049). Keyed by
+	/// payload crossed the route's budget — bytes or attachment
+	/// count, whichever trips first (ADR 0049). Keyed by
 	/// payload hash, grows only, and deliberately *not* persisted:
 	/// a reopened session starts with a cold prompt cache anyway, so
 	/// re-deciding from scratch costs nothing and a raised budget

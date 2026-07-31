@@ -84,6 +84,17 @@ Three properties matter:
   messages, and incidentally dedupes: two byte-identical screenshots
   share a key. (The measured session contained one such pair.)
 
+### Cap the attachment count as well as the bytes
+
+WebP made the byte budget nearly unreachable, which exposed the next
+provider constraint: Scaleway hard-rejects with `400 Too many images
+were provided, we currently limit the number of images per
+conversation to 60`. The transcript that hit it carried 100 images
+(82 tool results, 18 pasted) across ~700 round-trips. `ImageWireBudget`
+gains a `max_count` (50, with margin) enforced by the same sticky
+oldest-first elision, counted by payload hash so a duplicate
+screenshot costs one slot, matching the one cache entry it costs.
+
 ### Estimate images at a flat per-image token cost
 
 `IMAGE_TOKENS = 1_700` per attachment instead of base64 length / 4,

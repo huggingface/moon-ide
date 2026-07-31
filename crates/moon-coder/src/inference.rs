@@ -390,13 +390,14 @@ fn wire_user_content<'a>(content: &'a str, images: &'a [ImageAttachment], cache_
 	WireContent::Blocks(blocks)
 }
 
-/// Build the error for a failed round-trip, and for the one status
-/// where the bare provider message isn't actionable — 413, whose
-/// body is a flat `request entity too large` — say how big what we
-/// sent actually was and how much of it was pixels. Without those
-/// numbers the only visible cause is "the last thing I did", which
-/// in practice is whatever small image tipped a body that had been
-/// growing for an hour (ADR 0049).
+/// Build the error for a failed round-trip, and for the two
+/// image-related rejections where the bare provider message isn't
+/// actionable: 413, whose body is a flat `request entity too
+/// large`, and a 400 complaining about image count. Say how big
+/// what we sent actually was and how much of it was pixels — without
+/// those numbers the only visible cause is "the last thing I did",
+/// which in practice is whatever small image tipped a body that had
+/// been growing for an hour (ADR 0049).
 fn request_error(
 	endpoint: &str,
 	status: reqwest::StatusCode,
@@ -405,7 +406,8 @@ fn request_error(
 	body: &ChatCompletionRequest<'_>,
 	messages: &[ChatMessage],
 ) -> CoderError {
-	if status != reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+	let too_many_images = status == reqwest::StatusCode::BAD_REQUEST && text.to_lowercase().contains("too many images");
+	if status != reqwest::StatusCode::PAYLOAD_TOO_LARGE && !too_many_images {
 		return CoderError::http(endpoint, status.as_u16(), text, request_id);
 	}
 	let total = serde_json::to_vec(body).map(|json| json.len()).unwrap_or(0);
