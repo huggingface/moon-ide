@@ -192,9 +192,16 @@ otherwise have to coordinate in-app:
   catalog entry, most-recently-active first, with live
   filter. Selecting a row calls `window_open(slug)` —
   focus existing process or spawn fresh. Each row has a
-  "Forget" affordance that calls `workspace_delete`,
-  hidden for the caller's own workspace; the backend
-  refuses for any workspace whose instance lock is live.
+  "Rename" affordance that swaps the label for an inline
+  input and calls `workspace_rename` — display name only,
+  the slug (state dir, compose project, instance socket)
+  is immutable, so renaming a live workspace is safe; the
+  owning process repaints its title bar live when it's the
+  one renamed, siblings pick the new name up on next
+  launch. Each row also has a "Forget" affordance that
+  calls `workspace_delete`, hidden for the caller's own
+  workspace; the backend refuses for any workspace whose
+  instance lock is live.
 - `Ctrl+Shift+A`: same folder picker the welcome screen's
   "Open folder" button uses.
 - `Ctrl+Shift+W`: `window_close()` (exits the process).

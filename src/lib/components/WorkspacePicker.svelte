@@ -20,6 +20,12 @@
 	}
 
 	function onModalKeydown(event: KeyboardEvent) {
+		// While a row is being inline-renamed the rename input owns
+		// every key — Enter / Escape are handled by `onRenameKeydown`
+		// and palette navigation stays parked until the rename ends.
+		if (workspacePicker.renamingId !== null) {
+			return;
+		}
 		if (event.key === 'Escape') {
 			event.preventDefault();
 			workspacePicker.close();
@@ -42,6 +48,20 @@
 			if (meta) {
 				void workspacePicker.activate(meta);
 			}
+		}
+	}
+
+	function onRenameKeydown(meta: WorkspaceMeta, event: KeyboardEvent) {
+		if (event.key === 'Enter') {
+			event.preventDefault();
+			event.stopPropagation();
+			void workspacePicker.commitRename(meta);
+			return;
+		}
+		if (event.key === 'Escape') {
+			event.preventDefault();
+			event.stopPropagation();
+			workspacePicker.cancelRename();
 		}
 	}
 
@@ -111,49 +131,74 @@
 								aria-label="Workspace colour"
 							/>
 						</label>
-						<button
-							type="button"
-							class="row-main"
-							onclick={() => void workspacePicker.activate(meta)}
-							onmouseenter={() => (workspacePicker.selectedIndex = i)}
-						>
-							<div class="row-name">
-								{meta.name}
-								{#if isCurrent}
-									<span class="badge">current</span>
-								{/if}
-							</div>
-							<div class="row-meta">
-								<span class="slug">{meta.id}</span>
-								<span class="dot">·</span>
-								<span>{formatRelative(meta.last_active_at)}</span>
-							</div>
-						</button>
-						{#if meta.color !== null && meta.color !== undefined}
+						{#if workspacePicker.renamingId === meta.id}
+							<input
+								type="text"
+								class="rename-input"
+								bind:value={workspacePicker.renameDraft}
+								onkeydown={(e) => onRenameKeydown(meta, e)}
+								onclick={(e) => e.stopPropagation()}
+								use:focusOnMount
+								autocomplete="off"
+								spellcheck="false"
+								aria-label="Rename workspace"
+							/>
+						{:else}
 							<button
 								type="button"
-								class="reset-color"
-								title="Reset to default colour"
-								onclick={(e) => {
-									e.stopPropagation();
-									void workspacePicker.setColor(meta, '');
-								}}
+								class="row-main"
+								onclick={() => void workspacePicker.activate(meta)}
+								onmouseenter={() => (workspacePicker.selectedIndex = i)}
 							>
-								Reset
+								<div class="row-name">
+									{meta.name}
+									{#if isCurrent}
+										<span class="badge">current</span>
+									{/if}
+								</div>
+								<div class="row-meta">
+									<span class="slug">{meta.id}</span>
+									<span class="dot">·</span>
+									<span>{formatRelative(meta.last_active_at)}</span>
+								</div>
 							</button>
-						{/if}
-						{#if !isCurrent}
+							{#if meta.color !== null && meta.color !== undefined}
+								<button
+									type="button"
+									class="reset-color"
+									title="Reset to default colour"
+									onclick={(e) => {
+										e.stopPropagation();
+										void workspacePicker.setColor(meta, '');
+									}}
+								>
+									Reset
+								</button>
+							{/if}
 							<button
 								type="button"
-								class="forget"
-								title="Forget this workspace"
+								class="rename"
+								title="Rename this workspace"
 								onclick={(e) => {
 									e.stopPropagation();
-									void workspacePicker.forget(meta);
+									workspacePicker.startRename(meta);
 								}}
 							>
-								Forget
+								Rename
 							</button>
+							{#if !isCurrent}
+								<button
+									type="button"
+									class="forget"
+									title="Forget this workspace"
+									onclick={(e) => {
+										e.stopPropagation();
+										void workspacePicker.forget(meta);
+									}}
+								>
+									Forget
+								</button>
+							{/if}
 						{/if}
 					</div>
 				{:else}
@@ -280,6 +325,26 @@
 		background: var(--m-bg-2);
 		color: var(--m-fg-danger, #ff6b6b);
 		border-color: var(--m-fg-danger, #ff6b6b);
+	}
+	.rename {
+		background: transparent;
+		border: 1px solid var(--m-border);
+		color: var(--m-fg-muted);
+		font-size: 11px;
+		padding: 4px 8px;
+		border-radius: 4px;
+		font-family: inherit;
+		cursor: pointer;
+	}
+	.rename:hover {
+		background: var(--m-bg-2);
+		color: var(--m-fg);
+		border-color: var(--m-border-strong);
+	}
+	.rename-input {
+		flex: 1;
+		min-width: 0;
+		margin: 4px 6px 4px 0;
 	}
 	/* Colour swatch on each row. The visible bit is the rounded
 	 * `.swatch-dot` painted with the workspace's badge colour;

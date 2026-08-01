@@ -11,10 +11,18 @@
 // workspace is filtered out of the deletable set; the backend
 // also refuses to delete a workspace whose instance lock is
 // held by a live sibling process.
+//
+// A "Rename" affordance per row swaps the row's label for an
+// inline input (Enter commits, Escape cancels). Renaming only
+// touches the display name — the slug (state dir, compose
+// project, instance socket) is immutable, so a live sibling
+// process keeps working untouched; it picks the new name up on
+// next launch.
 
 import { ipc } from './ipc';
 import { formatError } from './protocol';
 import type { WorkspaceMeta } from './protocol';
+import { workspace } from './state.svelte';
 import { currentWorkspaceId } from './workspace-id';
 import { applyWorkspaceScheme } from './workspaceTheme';
 
@@ -25,6 +33,10 @@ class WorkspacePickerStore {
 	error = $state<string | null>(null);
 	loading = $state(false);
 	selectedIndex = $state(0);
+	/** Id of the row currently being inline-renamed; `null` when no rename is in flight. */
+	renamingId = $state<string | null>(null);
+	/** Draft text of the inline rename input. */
+	renameDraft = $state('');
 
 	get filtered(): WorkspaceMeta[] {
 		const q = this.query.trim().toLowerCase();
@@ -46,6 +58,8 @@ class WorkspacePickerStore {
 		this.visible = false;
 		this.query = '';
 		this.error = null;
+		this.renamingId = null;
+		this.renameDraft = '';
 	}
 
 	async refresh() {
@@ -88,6 +102,44 @@ class WorkspacePickerStore {
 		try {
 			await ipc.workspaces.delete(meta.id);
 			await this.refresh();
+		} catch (err) {
+			this.error = formatError(err);
+		}
+	}
+
+	/** Put `meta`'s row into inline-rename mode. The filter input
+	 * stays untouched — the rename draft is a separate field so
+	 * starting a rename doesn't clobber what the user typed to
+	 * find the row. */
+	startRename(meta: WorkspaceMeta) {
+		this.renamingId = meta.id;
+		this.renameDraft = meta.name;
+		this.error = null;
+	}
+
+	cancelRename() {
+		this.renamingId = null;
+		this.renameDraft = '';
+	}
+
+	/** Commit the inline rename. Renaming the process's own
+	 * workspace re-syncs `workspace.workspaceName` so the title
+	 * bar (`App.svelte`'s `$effect`) repaints immediately —
+	 * sibling processes pick the new name up from the catalog on
+	 * their next launch. */
+	async commitRename(meta: WorkspaceMeta) {
+		const name = this.renameDraft.trim();
+		if (name.length === 0) {
+			this.error = 'Workspace name must not be empty.';
+			return;
+		}
+		try {
+			const updated = await ipc.workspaces.rename(meta.id, name);
+			this.entries = this.entries.map((m) => (m.id === updated.id ? updated : m));
+			if (updated.id === currentWorkspaceId()) {
+				workspace.workspaceName = updated.name;
+			}
+			this.cancelRename();
 		} catch (err) {
 			this.error = formatError(err);
 		}
