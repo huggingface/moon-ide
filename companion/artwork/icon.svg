@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+	<defs>
+		<linearGradient id="bg" x1="0" y1="0" x2="0.7" y2="1">
+			<stop offset="0" stop-color="#141b26" />
+			<stop offset="1" stop-color="#0d1117" />
+		</linearGradient>
+		<linearGradient id="moon" x1="0" y1="0" x2="0.5" y2="1">
+			<stop offset="0" stop-color="#9bc0ff" />
+			<stop offset="0.55" stop-color="#5b9dff" />
+			<stop offset="1" stop-color="#2f81f7" />
+		</linearGradient>
+	</defs>
+	<!-- Launcher corner radius is baked into the PNG by the generator;
+	     this square is the full-bleed (maskable / apple-touch) version. -->
+	<rect width="512" height="512" fill="url(#bg)" />
+	<circle cx="437" cy="88" r="2.6" fill="#e6edf3" opacity="0.5" />
+	<circle cx="466" cy="201" r="2.2" fill="#e6edf3" opacity="0.45" />
+	<circle cx="392" cy="48" r="1.9" fill="#e6edf3" opacity="0.4" />
+	<circle cx="58" cy="332" r="2.4" fill="#e6edf3" opacity="0.5" />
+	<circle cx="85" cy="429" r="2" fill="#e6edf3" opacity="0.45" />
+	<circle cx="30" cy="247" r="1.8" fill="#e6edf3" opacity="0.35" />
+	<circle cx="475" cy="330" r="1.9" fill="#e6edf3" opacity="0.35" />
+	<!-- Shallow elliptical orbit around the moon. -->
+	<g transform="rotate(-26 256 256)">
+		<ellipse
+			cx="256"
+			cy="256"
+			rx="207"
+			ry="88"
+			fill="none"
+			stroke="#58a6ff"
+			stroke-width="5"
+			stroke-opacity="0.35"
+			stroke-linecap="round"
+			stroke-dasharray="0.02 8"
+		/>
+	</g>
+	<!-- Crescent: full disc minus an offset bite. -->
+	<path
+		d="M 186.2 121.5 A 164 164 0 1 0 186.2 390.5 A 216 216 0 0 1 186.2 121.5 Z"
+		fill="url(#moon)"
+	/>
+	<!-- Spark on the upper ring arc. -->
+	<path
+		d="M 352 86 L 363.7 127.3 L 405 139 L 363.7 150.7 L 352 192 L 340.3 150.7 L 299 139 L 340.3 127.3 Z"
+		fill="#a5c8ff"
+	/>
+</svg>

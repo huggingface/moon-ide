@@ -168,12 +168,20 @@ App Store review or distribution signing for an internal-LAN tool,
 and keeps everything in the one framework the team maintains.
 
 Installability: the manifest ships launcher + maskable icons
-(generated PNGs, `scripts/gen-companion-icons.mjs` — no native
-rasterizer dependency), iOS gets `apple-touch-icon` + its meta tags,
+(`companion/artwork/icon.svg` — a crescent moon with an orbit ring
+and spark — rasterized to PNGs by `scripts/gen-companion-icons.mjs`,
+which re-implements that exact geometry with no native rasterizer
+dependency), iOS gets `apple-touch-icon` + its meta tags,
 and a small hand-rolled service worker (`companion/public/sw.js`)
 caches the app shell — network-first for navigations so deploys show
 on next load, cache-first for hashed `/assets/*`. The WS to the
 bridge is untouched by the worker.
+
+The composer follows mobile-messenger convention (Telegram): one
+pill bubble holding an auto-growing textarea and an inset circular
+send/stop button. On touch-primary devices (`pointer: coarse`) Enter
+inserts a newline and the button sends; on hardware keyboards Enter
+sends and Shift+Enter newlines, same as the desktop composer.
 
 **Native (Tauri 2 mobile) is a deliberate future option**, not v1.
 It would reuse the same Svelte SPA wrapped in the same Tauri the

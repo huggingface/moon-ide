@@ -5,6 +5,36 @@
 
 	let draft = $state('');
 
+	// The composer textarea; auto-grows with the draft up to a cap.
+	let draftEl: HTMLTextAreaElement | null = $state(null);
+
+	// True on touch-primary devices (phones, tablets): the on-screen
+	// keyboard's Enter is a newline key and sending happens via the
+	// inset button. False on desktops with a hardware keyboard: Enter
+	// sends, Shift+Enter newline (matches the desktop composer).
+	let coarse = $state(false);
+
+	$effect(() => {
+		const mq = window.matchMedia('(pointer: coarse)');
+		coarse = mq.matches;
+		const onChange = (e: MediaQueryListEvent): void => {
+			coarse = e.matches;
+		};
+		mq.addEventListener('change', onChange);
+		return () => mq.removeEventListener('change', onChange);
+	});
+
+	// Grow the bubble with the draft (Telegram-style) up to ~9 lines;
+	// past that the textarea scrolls.
+	$effect(() => {
+		void draft;
+		const el = draftEl;
+		if (el) {
+			el.style.height = '0px';
+			el.style.height = `${el.scrollHeight}px`;
+		}
+	});
+
 	// Full-size preview target for a tool-returned image
 	// (screenshot, image-file read).
 	let lightboxUrl = $state<string | null>(null);
@@ -44,8 +74,10 @@
 	}
 
 	function onKeydown(e: KeyboardEvent): void {
-		// Enter sends; Shift+Enter newline (matches the desktop composer).
-		if (e.key === 'Enter' && !e.shiftKey) {
+		// Hardware keyboards: Enter sends, Shift+Enter newline. Touch
+		// keyboards: Enter is a plain newline key — the send button is
+		// the send path, like Telegram/WhatsApp on phones.
+		if (!coarse && e.key === 'Enter' && !e.shiftKey) {
 			e.preventDefault();
 			void send();
 		}
@@ -716,17 +748,27 @@
 
 	<div class="composer">
 		<textarea
+			bind:this={draftEl}
 			bind:value={draft}
 			onkeydown={onKeydown}
-			placeholder={isCoordinator
-				? 'Describe a goal for the coordinator — Enter to send'
-				: 'Message the coder — Enter to send'}
-			rows="2"
+			placeholder={isCoordinator ? 'Describe a goal for the coordinator' : 'Message the coder'}
+			rows="1"
 		></textarea>
 		{#if app.busy}
-			<button class="ghost" onclick={() => app.abort()}>Stop</button>
+			<button class="send-btn stop" title="Stop" aria-label="Stop" onclick={() => app.abort()}>
+				<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"
+					><rect x="6.5" y="6.5" width="11" height="11" rx="2" fill="currentColor" /></svg
+				>
+			</button>
 		{:else}
-			<button class="primary" onclick={send} disabled={!draft.trim()}>Send</button>
+			<button class="send-btn" title="Send" aria-label="Send" onclick={send} disabled={!draft.trim()}>
+				<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"
+					><path
+						fill="currentColor"
+						d="M3.4 20.4l17.5-7.5c0.8-0.4 0.8-1.5 0-1.9L3.4 3.6c-0.7-0.3-1.5 0.2-1.5 1l0 5.3c0 0.5 0.4 0.9 0.9 1L17 12 2.8 13.1c-0.5 0.1-0.9 0.5-0.9 1l0 5.3c0 0.8 0.8 1.3 1.5 1z"
+					/></svg
+				>
+			</button>
 		{/if}
 	</div>
 </div>
@@ -1104,6 +1146,39 @@
 		display: flex;
 		gap: 0.5rem;
 		align-items: flex-end;
+		background: var(--bg-elev);
+		border: 1px solid var(--border);
+		/* Pill: one continuous bubble holding the textarea and the
+		   inset send button, Telegram-style. */
+		border-radius: 24px;
+		padding: 0.4rem 0.4rem 0.4rem 0.9rem;
+	}
+	.composer:focus-within {
+		border-color: var(--accent);
+	}
+	/* Inset circular send / stop button. */
+	.send-btn {
+		flex: none;
+		width: 40px;
+		height: 40px;
+		display: grid;
+		place-items: center;
+		border: none;
+		border-radius: 50%;
+		background: var(--accent);
+		color: var(--accent-fg, #fff);
+		padding: 0;
+	}
+	.send-btn svg {
+		/* Optical centering: the paper-plane glyph sits slightly
+		   left of its viewBox centre. */
+		margin-left: 2px;
+	}
+	.send-btn.stop svg {
+		margin-left: 0;
+	}
+	.send-btn:disabled {
+		opacity: 0.45;
 	}
 	.empty-hint {
 		padding: 1rem 0.5rem;
@@ -1120,12 +1195,15 @@
 	}
 	.composer textarea {
 		flex: 1;
+		min-width: 0;
 		resize: none;
 		font: inherit;
-		background: var(--bg-elev);
+		background: none;
 		color: var(--fg);
-		border: 1px solid var(--border);
-		border-radius: var(--radius);
-		padding: 0.5rem;
+		border: none;
+		outline: none;
+		padding: 0.55rem 0.2rem;
+		/* Auto-grows via JS; capped around 9 lines of text. */
+		max-height: 11.5em;
 	}
 </style>
