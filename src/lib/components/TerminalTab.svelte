@@ -9,8 +9,10 @@
 	import '@xterm/xterm/css/xterm.css';
 
 	import type { TerminalTab } from '../bottomPanel.svelte';
+	import { container } from '../container.svelte';
 	import { terminal as terminalStore } from '../terminal.svelte';
 	import { workspace } from '../state.svelte';
+	import { scanHistoryChunk } from '../terminalHistory';
 	import { parseFileLinks, resolveTerminalLink } from '../terminalLinks';
 	import { ipc } from '../ipc';
 	import { formatError } from '../protocol';
@@ -36,8 +38,38 @@
 
 	const session = $derived(terminalStore.sessionFor(tab.id));
 	const openError = $derived(session?.openError ?? null);
-
+	/** Container-loss close reasons keep the tab and swap xterm
+	 * for a respawn banner; shell exits close the tab outright in
+	 * the store, so they never reach this. */
+	const closedReason = $derived(session?.closedReason ?? null);
+	const containerRunning = $derived(container.state === 'running');
 	const encoder = new TextEncoder();
+	const decoder = new TextDecoder();
+
+	/** User opted to respawn as soon as the container is back. */
+	let waitingForContainer = $state(false);
+
+	function respawn(): void {
+		waitingForContainer = false;
+		void terminalStore.restart(tab.id);
+	}
+
+	async function waitAndRespawn(): Promise<void> {
+		waitingForContainer = true;
+		const started = await container.onceRunning(120_000);
+		waitingForContainer = false;
+		if (!started) {
+			return;
+		}
+		// The user may have closed the tab while we waited.
+		if (terminalStore.sessionFor(tab.id)?.closedReason) {
+			await terminalStore.restart(tab.id);
+		}
+	}
+
+	function closeThisTab(): void {
+		void terminalStore.close(tab.id);
+	}
 
 	// Read the clipboard and write it into the PTY. We prefer
 	// the Tauri clipboard plugin over `navigator.clipboard`:
@@ -129,6 +161,27 @@
 	// on unmount. Not `$state` — the click handler reads it
 	// imperatively; no view depends on it.
 	let term: Terminal | null = null;
+
+	// Shell-history capture. The persistence + restart features
+	// need "the command this terminal last ran"; the shell's own
+	// `PROMPT_COMMAND` hook (injected by the backend) echoes it
+	// base64'd at every prompt, and `terminalHistory.ts` picks
+	// the marker out of the output stream. Shells without
+	// `PROMPT_COMMAND` never emit it — the recorded command
+	// stays whatever the spawn/replay seeded.
+	let cmdScanBuf = '';
+
+	/** Scan one decoded output chunk for history markers,
+	 * recording captures into the store. Returns the text with
+	 * marker lines stripped — the user never sees the hook. */
+	function scanCommandCapture(streamId: string, text: string): string {
+		const { buf, scan } = scanHistoryChunk(cmdScanBuf, text);
+		cmdScanBuf = buf;
+		if (scan.captured !== null) {
+			terminalStore.recordCommand(streamId, scan.captured);
+		}
+		return scan.visible;
+	}
 
 	// Inline attachment that owns the entire xterm lifecycle:
 	// construction on mount, every event hookup, the
@@ -290,16 +343,28 @@
 		refit();
 
 		// Hook the store's IO bus. The writer pushes raw bytes
-		// from the supervisor straight into xterm — its ANSI
-		// parser handles colour, cursor, alt-screen, etc.
+		// from the supervisor into xterm — its ANSI parser
+		// handles colour, cursor, alt-screen, etc. Bytes take a
+		// detour through the history-capture scanner first:
+		// `MOONCMD` marker lines are lifted out (they never
+		// render) and recorded as the terminal's latest command.
 		terminalStore.setWriter(tab.id, (bytes) => {
-			t.write(bytes);
+			const visible = scanCommandCapture(tab.id, decoder.decode(bytes, { stream: true }));
+			if (visible.length > 0) {
+				t.write(encoder.encode(visible));
+			}
 		});
 
 		// Forward keystrokes (and pasted text) to the supervisor.
 		// `onData` already decodes xterm's input modes correctly
 		// (e.g. arrow keys → CSI sequences); we just transport.
+		// A dead session (container lost, open failed) swallows
+		// input — the respawn banner owns the interaction then.
 		t.onData((data) => {
+			const s = terminalStore.sessionFor(tab.id);
+			if (s?.closedReason || s?.openError) {
+				return;
+			}
 			void terminalStore.writeInput(tab.id, encoder.encode(data));
 		});
 
@@ -463,6 +528,28 @@
 		<div class="error" role="alert">
 			Failed to open terminal: {openError}
 		</div>
+	{:else if closedReason === 'container_stopped' || closedReason === 'container_not_running'}
+		<!-- The environment died (Stop / Recreate / boot race);
+		     the shell is gone but the tab stays so the user can
+		     respawn it once the container is back. -->
+		<div class="lost" role="status">
+			<div class="lost-title">Workspace container isn't running</div>
+			<div class="lost-sub">
+				This terminal's shell exited with it. Respawn a fresh shell — the last command runs again and up-arrow walks the
+				same history.
+			</div>
+			<div class="lost-actions">
+				{#if containerRunning}
+					<button type="button" class="lost-btn" onclick={respawn}>Respawn terminal</button>
+				{:else}
+					<button type="button" class="lost-btn" onclick={waitAndRespawn}>Respawn when running</button>
+				{/if}
+				<button type="button" class="lost-btn subtle" onclick={closeThisTab}>Close tab</button>
+			</div>
+			{#if waitingForContainer}
+				<div class="lost-waiting">Waiting for the container to reach running…</div>
+			{/if}
+		</div>
 	{:else}
 		<div class="term-host" {@attach xtermAttachment}></div>
 	{/if}
@@ -529,6 +616,59 @@
 	.error {
 		padding: 8px 12px;
 		color: var(--m-danger);
+	}
+	.lost {
+		flex: 1;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		justify-content: center;
+		gap: 8px;
+		padding: 16px;
+		text-align: center;
+	}
+	.lost-title {
+		font-size: 13px;
+		font-weight: 600;
+		color: var(--m-fg);
+	}
+	.lost-sub {
+		font-size: 12px;
+		color: var(--m-fg-muted);
+		max-width: 420px;
+		line-height: 1.5;
+	}
+	.lost-actions {
+		display: flex;
+		gap: 8px;
+		margin-top: 4px;
+	}
+	.lost-btn {
+		font: inherit;
+		font-size: 12px;
+		padding: 5px 12px;
+		border-radius: 5px;
+		border: 1px solid var(--m-border-strong);
+		background: var(--m-bg-2);
+		color: var(--m-fg);
+		cursor: pointer;
+	}
+	.lost-btn:hover {
+		background: var(--m-bg-overlay);
+		border-color: var(--m-accent, #4f8cff);
+	}
+	.lost-btn.subtle {
+		background: transparent;
+		border-color: var(--m-border);
+		color: var(--m-fg-muted);
+	}
+	.lost-btn.subtle:hover {
+		color: var(--m-fg);
+		border-color: var(--m-border-strong);
+	}
+	.lost-waiting {
+		font-size: 11px;
+		color: var(--m-fg-muted);
 	}
 	.term-host {
 		flex: 1;

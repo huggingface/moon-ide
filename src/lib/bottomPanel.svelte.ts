@@ -29,19 +29,23 @@
 //! -----------
 //!
 //! Visibility and height ride along with the rest of `AppState`
-//! through `WorkspaceState.persistAppState`. Tab contents are
-//! deliberately not persisted — they're backed by running
-//! processes (`docker compose logs -f`, …) that don't survive a
-//! launch, and silently re-spawning the user's previous tabs at
-//! startup would surprise.
+//! through `WorkspaceState.persistAppState`. Log / diag tab
+//! contents are deliberately not persisted — they're backed by
+//! running processes (`docker compose logs -f`, …) that don't
+//! survive a launch. Terminal tabs are the exception: the
+//! terminal store persists a restore recipe (target + folder +
+//! the shell-history line the terminal last ran) into
+//! `AppState.bottom_panel.terminals` and replays it on launch —
+//! see `terminal.svelte.ts` and ADR 0009's persistence section.
 //!
-//! One exception: when launch finds the panel visible with no
-//! tabs (the user left it open last shutdown), `WorkspaceState`'s
-//! `restoreAppState` auto-spawns a single terminal so the panel
-//! has a sensible default body instead of an empty strip. Container
-//! terminal when the workspace shell is running, host otherwise.
-//! That's a default, not a replay — what gets opened is decided
-//! at launch time, not read from disk.
+//! When launch finds the panel visible with no tabs and no
+//! persisted terminals (first run, or the last shutdown had the
+//! panel empty), `WorkspaceState`'s `restoreAppState` auto-spawns
+//! a single terminal so the panel has a sensible default body
+//! instead of an empty strip. Container terminal when the
+//! workspace shell is running, host otherwise. That's a default,
+//! not a replay — what gets opened is decided at launch time,
+//! not read from disk.
 
 import type { BottomPanelAppState, TerminalTarget } from './protocol';
 
@@ -160,7 +164,10 @@ class BottomPanelStore {
 		this.#height = clampHeight(state.height);
 	}
 
-	serialise(): BottomPanelAppState {
+	serialise(): Omit<BottomPanelAppState, 'terminals'> {
+		// The `terminals` slice is the terminal store's to write
+		// (`terminal.serialisePersisted`); the panel only owns the
+		// chrome. `WorkspaceState.persistAppState` merges the two.
 		return { visible: this.#visible, height: this.#height };
 	}
 
@@ -237,6 +244,27 @@ class BottomPanelStore {
 	findPortsTab(): PortsTab | null {
 		const tab = this.#tabs.find((t) => t.kind === 'ports');
 		return tab && tab.kind === 'ports' ? tab : null;
+	}
+
+	/** Re-point the tab with `oldId` at `newId`, keeping its
+	 * strip position, title, and active state. Terminal restart
+	 * uses this: the fresh PTY gets a new stream id, but the tab
+	 * the user is looking at shouldn't move. No-op when `oldId`
+	 * isn't in the strip. */
+	replaceTabId(oldId: string, newId: string): void {
+		const idx = this.#tabs.findIndex((t) => t.id === oldId);
+		const tab = idx === -1 ? undefined : this.#tabs[idx];
+		if (tab === undefined) {
+			return;
+		}
+		// Mutate the tab's id in place (preserving its concrete
+		// variant) rather than spreading — a union spread widens
+		// to a bare `{ id }` and needs an unsafe assertion.
+		tab.id = newId;
+		this.#tabs = this.#tabs.toSpliced(idx, 1, tab);
+		if (this.#activeId === oldId) {
+			this.#activeId = newId;
+		}
 	}
 
 	closeTab(id: string): void {

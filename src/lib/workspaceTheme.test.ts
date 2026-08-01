@@ -56,32 +56,37 @@ describe('deriveWorkspaceAccent', () => {
 	});
 });
 
+/** The generated scheme lives in an owned `<style>` rule, not
+ * inline custom properties, so the `.light` cascade remap can
+ * beat it. Read the rule text back for assertions. */
+function schemeCss(): string {
+	return document.getElementById('moon-workspace-scheme')?.textContent ?? '';
+}
+
 describe('applyWorkspaceScheme', () => {
 	it('writes both palettes keyed on the workspace hue', () => {
 		applyWorkspaceScheme('dummy', '#ffd700');
-		const style = document.documentElement.style;
+		const css = schemeCss();
 		// Hue 51 (yellow). Dark surfaces carry a whisper of it; the
 		// accent carries the identity at full voice.
-		expect(style.getPropertyValue('--m-bg')).toBe('hsl(51 2% 8%)');
-		expect(style.getPropertyValue('--m-accent')).toBe('hsl(51 65% 72%)');
-		expect(style.getPropertyValue('--m-accent-light')).toBe('hsl(51 60% 38%)');
+		expect(css).toContain('--m-bg: hsl(51 2% 8%)');
+		expect(css).toContain('--m-accent: hsl(51 65% 72%)');
+		expect(css).toContain('--m-accent-light: hsl(51 60% 38%)');
 		// Hue 51 sits close to both warning ramps (dark 27, light
 		// 25), so both push toward orange to stay distinguishable.
-		expect(style.getPropertyValue('--m-warning')).toBe('hsl(40 80% 70%)');
-		expect(style.getPropertyValue('--m-warning-light')).toBe('hsl(38 90% 32%)');
+		expect(css).toContain('--m-warning: hsl(40 80% 70%)');
+		expect(css).toContain('--m-warning-light: hsl(38 90% 32%)');
 	});
 
 	it('keeps the warning ramp on a far hue', () => {
 		applyWorkspaceScheme('dummy', '#7ea3ff');
-		const style = document.documentElement.style;
-		expect(style.getPropertyValue('--m-warning')).toBe('hsl(27 80% 70%)');
+		expect(schemeCss()).toContain('--m-warning: hsl(27 80% 70%)');
 	});
 
 	it('an amber workspace also moves warning off its own hue', () => {
 		// Amber (45) is even closer to the 27 ramp than gold.
 		applyWorkspaceScheme('dummy', '#f0b000');
-		const style = document.documentElement.style;
-		expect(style.getPropertyValue('--m-warning')).toBe('hsl(40 80% 70%)');
+		expect(schemeCss()).toContain('--m-warning: hsl(40 80% 70%)');
 	});
 
 	it('falls back to the deterministic hash hue on garbage input', () => {
@@ -89,14 +94,27 @@ describe('applyWorkspaceScheme', () => {
 		// an unparseable stored colour must produce the same scheme
 		// as no colour at all (mirrors the window icon).
 		applyWorkspaceScheme('moon-ide', null);
-		const fromNull = document.documentElement.style.getPropertyValue('--m-accent');
+		const fromNull = schemeCss();
 		applyWorkspaceScheme('moon-ide', 'not-a-color');
-		expect(document.documentElement.style.getPropertyValue('--m-accent')).toBe(fromNull);
+		expect(schemeCss()).toBe(fromNull);
 	});
 
 	it('is a no-op in preboot mode (no workspace bound)', () => {
-		document.documentElement.style.removeProperty('--m-accent');
+		document.getElementById('moon-workspace-scheme')?.remove();
 		applyWorkspaceScheme(null, '#ffd700');
-		expect(document.documentElement.style.getPropertyValue('--m-accent')).toBe('');
+		expect(document.getElementById('moon-workspace-scheme')).toBeNull();
+	});
+
+	// Regression test for the stuck-dark bug: the scheme must NOT
+	// be written as inline custom properties on :root, because an
+	// inline value beats the `:root.light` stylesheet remap in the
+	// cascade and leaves surfaces dark on a theme flip. Assert the
+	// dark values live in a cascade-participating `<style>` rule
+	// while :root itself carries no inline `--m-bg`.
+	it('does not inline the scheme on :root (theme flip must win the cascade)', () => {
+		document.documentElement.style.removeProperty('--m-bg');
+		applyWorkspaceScheme('dummy', '#7ea3ff');
+		expect(document.documentElement.style.getPropertyValue('--m-bg')).toBe('');
+		expect(schemeCss()).toContain('--m-bg: hsl(223 2% 8%)');
 	});
 });

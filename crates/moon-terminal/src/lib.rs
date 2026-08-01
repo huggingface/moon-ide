@@ -28,6 +28,6 @@ pub use registry::{
 	SCROLLBACK_BYTES,
 };
 pub use target::{
-	container_name_for_workspace, editor_forward_env_for_workspace, moon_edit_path_map_for_bound_folders, TerminalShell,
-	TerminalTarget, MOON_EDIT_CONTAINER_SOCK,
+	container_name_for_workspace, container_running, editor_forward_env_for_workspace,
+	moon_edit_path_map_for_bound_folders, TerminalShell, TerminalTarget, MOON_EDIT_CONTAINER_SOCK,
 };

@@ -181,7 +181,7 @@ export function ensureActiveFolderTerminal(): void {
 		const tab = tabs.find((t) => t.id === remembered);
 		if (tab && tab.kind === 'terminal') {
 			const session = terminalStore.sessionFor(remembered);
-			if (!session?.closed) {
+			if (session && session.closedReason === null) {
 				bottomPanel.setActive(remembered);
 				return;
 			}
@@ -199,10 +199,11 @@ export function ensureActiveFolderTerminal(): void {
 		if (t.target.cwd !== expectedCwd) {
 			return false;
 		}
-		// Skip exited terminals — re-using a dead PTY isn't a
-		// thing; the user wants a live shell on the new folder.
+		// Skip dead terminals (environment lost) — re-using a
+		// dead PTY isn't a thing; the user wants a live shell on
+		// the new folder.
 		const session = terminalStore.sessionFor(t.id);
-		if (session?.closed) {
+		if (session && session.closedReason !== null) {
 			return false;
 		}
 		return true;

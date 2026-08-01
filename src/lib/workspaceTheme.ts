@@ -142,10 +142,28 @@ export function deriveWorkspaceAccent(color: string, theme: ResolvedTheme): { ac
 	return { accent: hslCss(h, 65, 72), soft: hslCss(h, 65, 72, 0.22) };
 }
 
-/** Paint the workspace scheme on `:root`. Both palettes are written
- * at once — the dark set to the plain token names, the light set to
- * their `*-light` twins, and the stylesheet's `:root.light` block
- * re-points the plain names at the twins. `workspaceId` is the
+/** ID of the owned `<style>` element that carries the generated
+ * scheme. We write a stylesheet, not inline custom properties,
+ * because an inline `:root` value beats the `:root.light` remap in
+ * the cascade — which is exactly the bug that left surfaces stuck
+ * dark on a theme flip. */
+const SCHEME_STYLE_ID = 'moon-workspace-scheme';
+
+function renderScheme(h: number): string {
+	const dark = Object.entries(buildDark(h))
+		.map(([name, value]) => `${name}: ${value};`)
+		.join(' ');
+	const light = Object.entries(buildLight(h))
+		.map(([name, value]) => `${name}-light: ${value};`)
+		.join(' ');
+	return `:root { ${dark} ${light} }`;
+}
+
+/** Paint the workspace scheme. Everything lives in one owned
+ * `:root { … }` rule: the plain token names get the dark values,
+ * the `*-light` twins the light values, and the app stylesheet's
+ * `:root.light` block re-points the plain names at the twins — so
+ * the theme flip is a pure cascade change. `workspaceId` is the
  * fallback source when `color` is null or unparseable (mirrors the
  * window icon's behaviour). */
 export function applyWorkspaceScheme(workspaceId: string | null, color: string | null): void {
@@ -154,11 +172,14 @@ export function applyWorkspaceScheme(workspaceId: string | null, color: string |
 	}
 	const rgb = color === null ? null : parseHexColor(color);
 	const h = Math.round(rgbToHsl(rgb ?? parseHexColor(defaultWorkspaceColor(workspaceId)) ?? { r: 0, g: 0, b: 0 }).h);
-	const style = document.documentElement.style;
-	for (const [name, value] of Object.entries(buildDark(h))) {
-		style.setProperty(name, value);
+	// `getElementById` returns the generic `HTMLElement`; a
+	// `querySelector('style#…')` narrows to `HTMLStyleElement`
+	// natively, no assertion needed.
+	let el = document.querySelector<HTMLStyleElement>(`style#${SCHEME_STYLE_ID}`);
+	if (el === null) {
+		el = document.createElement('style');
+		el.id = SCHEME_STYLE_ID;
+		document.head.appendChild(el);
 	}
-	for (const [name, value] of Object.entries(buildLight(h))) {
-		style.setProperty(`${name}-light`, value);
-	}
+	el.textContent = renderScheme(h);
 }

@@ -101,7 +101,18 @@ impl Drop for PtySession {
 /// the read / wait pump threads. Returns a `PtySession` whose
 /// `next_output` channel begins yielding bytes as soon as the
 /// child writes anything.
-pub fn spawn(target: &TerminalTarget, cols: u16, rows: u16) -> Result<PtySession, PtyError> {
+///
+/// `command` (when `Some`) is typed into the fresh shell as if the
+/// user had typed it — restart of an exited tab, or session replay
+/// after an IDE relaunch. Delivery is a raw write after a short
+/// delay: the shell needs a moment to initialise readline before
+/// keystrokes land correctly, and writing bytes (rather than
+/// changing the spawned argv) is what makes the line land in the
+/// shell's *own* history, so an up-arrow afterwards walks the same
+/// session the command came from. Readline's bracketed-paste mode
+/// keeps an embedded newline from auto-executing mid-line — the
+/// trailing `\n` we append is what runs it.
+pub fn spawn(target: &TerminalTarget, cols: u16, rows: u16, command: Option<&str>) -> Result<PtySession, PtyError> {
 	let pty_system = native_pty_system();
 	let pair = pty_system
 		.openpty(PtySize {
@@ -137,6 +148,27 @@ pub fn spawn(target: &TerminalTarget, cols: u16, rows: u16) -> Result<PtySession
 
 	let master = Arc::new(Mutex::new(pair.master));
 	let writer = Arc::new(Mutex::new(writer));
+
+	// Replay a restart / restore command into the fresh shell.
+	// The write task needs its own handle on the master — the
+	// session's `writer` Arc moves into `PtySession` below.
+	if let Some(command) = command {
+		let mut bytes = command.as_bytes().to_vec();
+		bytes.push(b'\n');
+		let writer = writer.clone();
+		tokio::spawn(async move {
+			// Shell readline init isn't instant; writing too
+			// early loses bytes or lands them before the prompt.
+			// 300 ms is comfortably past bash/zsh startup even
+			// under `docker exec`, and invisible next to the
+			// spawn itself.
+			tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+			let mut writer = writer.lock().await;
+			if let Err(e) = writer.write_all(&bytes).and_then(|()| writer.flush()) {
+				tracing::warn!(error = %e, "terminal command replay write failed");
+			}
+		});
+	}
 
 	// Bounded channel: 64 chunks ≈ 256 KB at the 4 KB chunk
 	// size the reader uses. If the consumer falls behind we

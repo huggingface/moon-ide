@@ -8,6 +8,16 @@ import type { TerminalTarget } from "./TerminalTarget";
  */
 export type TerminalOpenRequest = { target: TerminalTarget, cols: number, rows: number, 
 /**
+ * Command to run inside the fresh shell right after spawn
+ * (typed in as if the user had typed it). Used by "restart"
+ * on an exited tab and by session replay on IDE launch — the
+ * frontend seeds it from the shell-history line it captured
+ * when the terminal was last used, so the restored terminal
+ * lands with its previous command already run and the rest
+ * of the session's history available via up-arrow.
+ */
+command: string | null, 
+/**
  * Absolute **host** path of the bound folder this terminal is
  * being opened for — the project the user was in when they hit
  * `+ Terminal`. Recorded in

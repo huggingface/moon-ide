@@ -1790,13 +1790,16 @@ class WorkspaceState {
 		// paint without the user lifting a finger.
 		rightPanel.hydrate(state.right_panel);
 		slack.hydrate(state.slack);
-		// Same for the bottom panel — visibility and height. Tab
-		// contents (log streams) are not persisted by design: they
-		// back onto running processes that don't survive a launch.
-		// Bind the change handler before hydrating so the first user
-		// interaction triggers a save.
+		// Same for the bottom panel — visibility and height. Log
+		// streams aren't persisted (they back onto running processes
+		// that don't survive a launch); terminal tabs are, via the
+		// terminal store's own slice. Bind the change handlers
+		// before hydrating so the first user interaction triggers a
+		// save.
 		bottomPanel.bindOnChange(() => this.persistAppState());
 		bottomPanel.hydrate(state.bottom_panel);
+		terminal.bindOnChange(() => this.persistAppState());
+		terminal.hydratePersisted(state.bottom_panel.terminals ?? []);
 		// Bind Tauri push events + window-focus listener once the
 		// Tauri runtime is up. Idempotent — `wireRuntime` early-returns
 		// on subsequent calls (HMR-safe).
@@ -1870,11 +1873,11 @@ class WorkspaceState {
 		const ws = this.workspace;
 		if (!ws || !session || session.folders.length === 0) {
 			// Even without a session to replay we still want to give
-			// the bottom-panel auto-spawn a shot — the panel's
-			// visibility is in `state` (just hydrated above) and is
-			// independent from the per-folder tab session restored
-			// below.
-			void this.spawnInitialBottomPanelTerminal(containerRefresh, terminalRuntime);
+			// the bottom-panel terminal restore a shot — the panel's
+			// visibility and the persisted terminal list are in
+			// `state` (just hydrated above) and are independent from
+			// the per-folder tab session restored below.
+			void this.restoreBottomPanelTerminals(containerRefresh, terminalRuntime);
 			// No folder loop to fight with — let the coder panel
 			// hydrate the active folder immediately. Idempotent;
 			// the `setActiveFolder` call earlier in the bootstrap
@@ -2037,42 +2040,32 @@ class WorkspaceState {
 		// active folder so the initial paint already shows the right
 		// indent settings.
 		await Promise.all(this.openFiles.map((f) => this.ensureEditorConfig(f.path)));
-		// Auto-spawn one terminal when the bottom panel was
-		// restored as visible but came back without any tabs. Tab
-		// contents aren't persisted by design (ADR 0009), so a
-		// panel the user left open at last shutdown otherwise
-		// reappears as a meaningless empty strip.
-		void this.spawnInitialBottomPanelTerminal(containerRefresh, terminalRuntime);
+		// Re-spawn the persisted terminal tabs (or one default
+		// terminal when there's nothing persisted) so a panel the
+		// user left open at last shutdown doesn't reappear as a
+		// meaningless empty strip. See ADR 0009's persistence
+		// section.
+		void this.restoreBottomPanelTerminals(containerRefresh, terminalRuntime);
 	}
 
 	/**
-	 * Open one terminal into the bottom panel iff the panel was
-	 * restored as visible but no tab kind populated it during
-	 * launch. Picks `container` over `host` whenever the workspace
-	 * shell is up — that's the environment the user's active folder
-	 * actually runs in. Falls back to `host` otherwise (container
-	 * down, paused, or workspace lacks a container project).
+	 * Restore the bottom panel's terminals at launch: replay the
+	 * persisted terminal list if there is one (fresh shells, each
+	 * with its last-run command typed back in), else fall back to
+	 * spawning one default terminal so a visible-but-empty panel
+	 * doesn't reappear as a meaningless strip.
 	 *
-	 * Awaits `containerRefresh` first so the target choice reflects
-	 * the daemon's current truth rather than the pre-hydrate `null`
-	 * status. If the container isn't up yet (the backend is still
-	 * `docker compose up`-ing the shell it auto-resumes on launch),
-	 * defers the spawn until the `container:state` event fires
-	 * `running` — up to a generous timeout (image pulls, slow
-	 * `compose up --wait`). If the timeout fires, or the shell
-	 * settles on a non-running state, falls back to host so the
-	 * panel is never left without a terminal. Awaits
-	 * `terminalRuntime` so the `terminal:output` listener is
-	 * attached before we spawn — otherwise the first prompt bytes
-	 * would be dropped on the floor.
-	 *
-	 * Skips silently when there's no workspace bound (a
-	 * `$HOME`-rooted host shell with no folder context isn't
-	 * useful) or when something else has populated the panel
-	 * between hydrate and the awaits resolving (a log stream
-	 * starting itself, a follow-up gesture from the user).
+	 * Both paths await `containerRefresh` / `terminalRuntime` so
+	 * the target choice and the spawn reflect the daemon's truth
+	 * and the output listener is attached before the first PTY
+	 * bytes arrive. Container terminals defer to the launch-time
+	 * auto-resume's `container:state` event rather than erroring
+	 * out while the shell is still booting. Skips silently when
+	 * something else populated the panel first (a log stream
+	 * starting itself, a user gesture that landed during the
+	 * awaits) — the user's live action always wins over a replay.
 	 */
-	private async spawnInitialBottomPanelTerminal(
+	private async restoreBottomPanelTerminals(
 		containerRefresh: Promise<void>,
 		terminalRuntime: Promise<void>,
 	): Promise<void> {
@@ -2085,9 +2078,16 @@ class WorkspaceState {
 		if (bottomPanel.tabs.length > 0) {
 			return;
 		}
+		const restored = await terminal.restoreTerminals(containerRefresh, terminalRuntime);
+		if (restored) {
+			return;
+		}
+		// Nothing persisted (first run, or the last shutdown had
+		// no terminals) — the old default: one terminal, container
+		// when the workspace shell is up, host otherwise.
 		await containerRefresh;
 		await terminalRuntime;
-		if (bottomPanel.tabs.length > 0) {
+		if (bottomPanel.tabs.length > 0 || !bottomPanel.visible) {
 			return;
 		}
 		if (canOpenContainerTerminal()) {
@@ -2436,7 +2436,7 @@ class WorkspaceState {
 				workspaces: [],
 				theme: this.theme,
 				slack: { active_bot: null, active_thread_ts: null },
-				bottom_panel: bottomPanel.serialise(),
+				bottom_panel: { ...bottomPanel.serialise(), terminals: terminal.serialisePersisted() },
 				right_panel: null,
 				coder: { last_session_by_folder: {} },
 				next_edit: {

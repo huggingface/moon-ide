@@ -1074,13 +1074,27 @@ export type AppState = {
 	next_edit: NextEditAppState;
 };
 
-/** Bottom-panel chrome state. Tabs/log streams are intentionally
+/** Bottom-panel chrome state. Log-stream tabs are intentionally
  * not persisted — they're tied to running compose log processes
- * that don't survive a launch. Mirrors
- * `moon_protocol::app_state::BottomPanelAppState`. */
+ * that don't survive a launch. Terminal tabs are: target, owning
+ * folder, and the shell-history line the terminal last ran, so a
+ * relaunch can re-spawn the same terminals with their commands
+ * replayed. Mirrors `moon_protocol::app_state::BottomPanelAppState`. */
 export type BottomPanelAppState = {
 	visible: boolean;
 	height: number;
+	terminals: PersistedTerminal[];
+};
+
+/** One terminal tab's restore recipe. Mirrors
+ * `moon_protocol::app_state::PersistedTerminal`. */
+export type PersistedTerminal = {
+	target: TerminalTarget;
+	folder: string | null;
+	/** Shell-history line to replay into the fresh shell on
+	 * restore — what one up-arrow in the old shell would have
+	 * produced. `null` when nothing was ever run. */
+	command: string | null;
 };
 
 /** One line of streamed `docker compose logs` output. Mirrors
@@ -1120,6 +1134,12 @@ export type TerminalOpenRequest = {
 	target: TerminalTarget;
 	cols: number;
 	rows: number;
+	/** Command to type into the fresh shell right after spawn —
+	 * restart of an exited tab, or session replay on launch.
+	 * Delivered as keystrokes so the line lands in the shell's
+	 * own history (an up-arrow afterwards keeps walking the
+	 * same session). `null` for a bare prompt. */
+	command?: string | null;
 	/** Absolute host path of the bound folder this terminal is
 	 * being opened for, so the backend can scope the coder's
 	 * `list_terminals` / `read_terminal` tools to one project
@@ -1135,11 +1155,24 @@ export type TerminalOutput = {
 	data: string;
 };
 
+/** Why a terminal session ended. Drives the frontend's
+ * auto-close / auto-respawn policy: shell exits (the user's
+ * own Ctrl+D / `exit`) close the tab; container losses keep
+ * it and offer to respawn. Mirrors
+ * `moon_protocol::terminal::TerminalCloseReason`. */
+export type TerminalCloseReason =
+	| 'shell_exited'
+	| 'container_shell_exited'
+	| 'container_stopped'
+	| 'container_not_running'
+	| 'unknown';
+
 /** Final event for a terminal session when its child exits.
  * Mirrors `moon_protocol::terminal::TerminalClosed`. */
 export type TerminalClosed = {
 	stream_id: string;
 	code: number | null;
+	reason: TerminalCloseReason;
 };
 
 /** Default llama-server listen port (IANA dynamic range; avoids 8080 and similar). */
@@ -1152,7 +1185,7 @@ export const defaultAppState: AppState = {
 	workspaces: [],
 	theme: 'system',
 	slack: { active_bot: null, active_thread_ts: null },
-	bottom_panel: { visible: false, height: 240 },
+	bottom_panel: { visible: false, height: 240, terminals: [] },
 	right_panel: null,
 	coder: { last_session_by_folder: {} },
 	next_edit: {

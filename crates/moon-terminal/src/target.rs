@@ -119,6 +119,18 @@ pub fn moon_edit_path_map_for_bound_folders(bound_folders: &[Utf8PathBuf]) -> St
 	entries.join(":")
 }
 
+/// Shell-history echo hook, prepended to `PROMPT_COMMAND` in
+/// every spawned shell (host and container). bash ≥ 5.1 runs
+/// `PROMPT_COMMAND` just before displaying each primary prompt;
+/// this one-liner echoes the newest history entry, base64'd,
+/// with a marker the frontend's output scanner recognises. The
+/// user's rc files append their own hooks after it harmlessly.
+/// Shells without `PROMPT_COMMAND` ignore the env var entirely
+/// — history capture silently stays at whatever the spawn
+/// replayed. See ADR 0009's persistence section.
+pub const HISTORY_ECHO_HOOK: &str =
+	"history 1 | sed \"s/^ *[0-9]* *//\" | base64 -w0 2>/dev/null | sed \"s/^/MOONCMD/\"";
+
 /// Build the standard `-e` env list the IDE injects into every
 /// container terminal so `git commit --amend` (and friends) hand
 /// off the editor to the host IDE. See ADR 0021.
@@ -146,7 +158,11 @@ impl TerminalTarget {
 	///
 	/// Sets `TERM=xterm-256color` on both targets so prompts and
 	/// TUIs render correctly; the in-container case adds
-	/// `docker exec -it -w <cwd> <name> <shell>` framing.
+	/// `docker exec -it -w <cwd> <name> <shell>` framing. Both
+	/// targets prepend [`HISTORY_ECHO_HOOK`] to `PROMPT_COMMAND`
+	/// so the shell echoes its newest history entry at every
+	/// prompt — how the frontend learns "the command this
+	/// terminal last ran" for persistence and restart.
 	pub fn to_command(&self) -> CommandBuilder {
 		match self {
 			TerminalTarget::Host { cwd, shell } => {
@@ -161,6 +177,7 @@ impl TerminalTarget {
 					cmd.cwd(home.as_path());
 				}
 				cmd.env("TERM", "xterm-256color");
+				prepend_prompt_command(&mut cmd);
 				cmd
 			}
 			TerminalTarget::Container {
@@ -184,6 +201,8 @@ impl TerminalTarget {
 				cmd.arg(cwd.as_str());
 				cmd.arg("-e");
 				cmd.arg("TERM=xterm-256color");
+				cmd.arg("-e");
+				cmd.arg(prompt_command_value_for_container());
 				for (key, value) in env {
 					// Bare-minimum sanity: `docker exec -e` accepts
 					// `KEY=VALUE` and a `\n` in either side would
@@ -216,6 +235,53 @@ impl TerminalTarget {
 		let basename = folder.file_name()?;
 		Some(Utf8PathBuf::from(format!("/workspace/{basename}")))
 	}
+}
+
+/// Best-effort liveness probe for a container terminal's target
+/// container, used by the supervisor to classify a `docker exec`
+/// exit: if the container is gone, the terminal died because its
+/// environment did (user Stop / Recreate / crash); if it's still
+/// up, the exit came from the in-container shell itself. One
+/// `docker inspect` — cheap enough to run once per close.
+///
+/// `false` covers every negative case uniformly (container
+/// stopped, name unknown after a recreate-in-progress, docker
+/// CLI missing): the frontend treats them all as "respawn when
+/// the container comes back".
+pub async fn container_running(container_name: &str) -> bool {
+	let output = tokio::process::Command::new("docker")
+		.args(["inspect", "-f", "{{.State.Running}}", container_name])
+		.output()
+		.await;
+	match output {
+		Ok(out) => String::from_utf8_lossy(&out.stdout).trim() == "true",
+		Err(_) => false,
+	}
+}
+
+/// Set `PROMPT_COMMAND` on a host shell's env: our history hook
+/// plus any inherited value. bash ≥ 5.1 treats `PROMPT_COMMAND`
+/// as an array when declared with `-a`, but the common env-var
+/// form is a single `;`-separated string — our hook goes first so
+/// even a user's rc files that *replace* the variable only lose
+/// history echo, never break the shell.
+fn prepend_prompt_command(cmd: &mut CommandBuilder) {
+	let inherited = std::env::var("PROMPT_COMMAND").unwrap_or_default();
+	let value = if inherited.is_empty() {
+		HISTORY_ECHO_HOOK.to_owned()
+	} else {
+		format!("{HISTORY_ECHO_HOOK};{inherited}")
+	};
+	cmd.env("PROMPT_COMMAND", value);
+}
+
+/// The `-e PROMPT_COMMAND=…` entry for `docker exec`. No host-side
+/// inheritance — the container's shell starts from its own env, so
+/// the hook is the whole value. Kept separate from
+/// [`prepend_prompt_command`] because the container path goes
+/// through argv, not the builder's env table.
+fn prompt_command_value_for_container() -> String {
+	format!("PROMPT_COMMAND={HISTORY_ECHO_HOOK}")
 }
 
 /// Default host shell: `$SHELL` if set, else `/bin/bash`. We

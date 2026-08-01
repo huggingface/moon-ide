@@ -1,7 +1,8 @@
 //! Tauri commands wrapping [`moon_core::app_state`].
 //!
 //! AppState is split across multiple writers:
-//! - The frontend's persist path owns `theme`, `bottom_panel`, and
+//! - The frontend's persist path owns `theme`, `bottom_panel`
+//!   (visibility + height + the terminal restore list), and
 //!   `next_edit` and hits this `app_state_save` command on every
 //!   navigation.
 //! - The Slack tauri commands own `slack.*` and write via their own

@@ -41,6 +41,41 @@ pub enum TerminalTarget {
 	},
 }
 
+/// Why a terminal session ended. Classified by the supervisor
+/// at close time so the frontend can tell "the user exited the
+/// shell" (Ctrl+D, `exit` — code 0) from "the environment went
+/// away" (container stopped mid-session, `docker exec` refused
+/// because the container wasn't running yet). Drives the
+/// auto-close / auto-respawn policy in `terminal.svelte.ts`:
+/// shell exits close the tab, container losses keep it and
+/// offer to respawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalCloseReason {
+	/// The host shell process itself exited (any code — Ctrl+D
+	/// and `exit` both land here with code 0).
+	ShellExited,
+	/// The `docker exec` child exited, and the workspace
+	/// container was still running afterwards — so the exit came
+	/// from the in-container shell (or command), not from the
+	/// environment going away.
+	ContainerShellExited,
+	/// The `docker exec` child exited and the workspace container
+	/// is *not* running any more (user stopped it, Recreate,
+	/// crash) — the terminal died because its environment did.
+	ContainerStopped,
+	/// `docker exec` never started the remote process (container
+	/// still booting after an IDE relaunch / recreate, name not
+	/// found, daemon unreachable). Same UX treatment as
+	/// `ContainerStopped`: keep the tab, respawn when the
+	/// container is back.
+	ContainerNotRunning,
+	/// portable-pty couldn't translate the exit (supervisor
+	/// cancelled, signal it can't map).
+	Unknown,
+}
+
 /// Open request payload for `terminal_open`. Cols/rows match
 /// xterm.js's initial fit; the supervisor sends them straight
 /// through to `PtySize` on the backend.
@@ -50,6 +85,15 @@ pub struct TerminalOpenRequest {
 	pub target: TerminalTarget,
 	pub cols: u16,
 	pub rows: u16,
+	/// Command to run inside the fresh shell right after spawn
+	/// (typed in as if the user had typed it). Used by "restart"
+	/// on an exited tab and by session replay on IDE launch — the
+	/// frontend seeds it from the shell-history line it captured
+	/// when the terminal was last used, so the restored terminal
+	/// lands with its previous command already run and the rest
+	/// of the session's history available via up-arrow.
+	#[serde(default)]
+	pub command: Option<String>,
 	/// Absolute **host** path of the bound folder this terminal is
 	/// being opened for — the project the user was in when they hit
 	/// `+ Terminal`. Recorded in
@@ -84,9 +128,10 @@ pub struct TerminalOutput {
 
 /// Final event for a terminal session, emitted exactly once
 /// on `terminal:closed` when the underlying child exits. The
-/// frontend marks the tab as no-longer-streaming and disables
-/// input on receipt; subsequent `terminal_close` calls for
-/// this id are no-ops.
+/// frontend reacts per [`TerminalCloseReason`]: shell exits
+/// (the user's own Ctrl+D / `exit`) close the tab, environment
+/// losses keep it and offer to respawn. Subsequent
+/// `terminal_close` calls for this id are no-ops.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct TerminalClosed {
@@ -95,4 +140,5 @@ pub struct TerminalClosed {
 	/// `None` for signals it couldn't translate or for
 	/// supervisor-cancelled streams.
 	pub code: Option<i32>,
+	pub reason: TerminalCloseReason,
 }

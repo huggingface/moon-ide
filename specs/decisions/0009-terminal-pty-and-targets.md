@@ -1,7 +1,8 @@
 # ADR 0009 — Terminal: portable-pty + host/container targets
 
 Date: 2026-05-03
-Status: accepted
+Status: accepted — the "No persistence in 3.0" section is
+superseded by [ADR 0050](0050-terminal-persistence-and-restart.md)
 
 ## Context
 
@@ -113,7 +114,7 @@ on a `read(2)` boundary), and Tauri's IPC payload codec
 is JSON. xterm.js `write()` accepts byte arrays so the
 frontend `atob`s on the way back out.
 
-### No persistence in 3.0
+### No persistence in 3.0 — superseded
 
 PTY state can't survive an IDE restart anyway — the
 `Child` is gone, the in-memory scrollback is gone. We
@@ -122,6 +123,16 @@ deliberately don't persist tab metadata either: the cost
 titles) outweighs the value (typing `Ctrl+T` is fast).
 Reconsider when someone reports a real workflow that
 needs it.
+
+**Superseded by [ADR 0050](0050-terminal-persistence-and-restart.md).**
+The workflow showed up: relaunching the IDE should bring
+back the same terminals with the same commands. ADR 0050
+persists the terminal _recipe_ (target + folder + the
+shell-history line the terminal last ran) and replays it
+into fresh shells on launch, adds a restart affordance for
+exited terminals, and auto-closes tabs whose shell exits
+(Ctrl+D) — while keeping the container-loss case recoverable
+via a respawn banner.
 
 ## Consequences
 

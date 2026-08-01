@@ -88,19 +88,32 @@ What ships:
   popover wired into the panel strip and the status
   bar.
 
-What doesn't ship in 3.0 (and when to revisit):
+What shipped after 3.0 (persistence & restart, ADR 0050):
 
-- **Terminal persistence across IDE restart.** Reopening
-  shells with stale state would surprise the user; if
-  someone asks for it specifically, we can persist tab
-  metadata (title, target, cwd) and re-spawn fresh
-  shells on next launch. (Post-3.0 polish: when launch
-  finds the bottom panel visible-but-empty, we now
-  auto-spawn one default terminal — container if the
-  workspace shell is up, host otherwise — to avoid the
-  "empty strip" UX. That's a default, not persistence,
-  and it sidesteps the surprise risk above. See
-  [test plan 0026](../test-plans/0026-bottom-panel-auto-terminal.md).)
+- **Terminal persistence across IDE restart.** The terminal
+  _recipe_ (target + owning folder + the shell-history line
+  the terminal last ran, captured from the shell's own
+  `PROMPT_COMMAND` hook) persists in
+  `AppState.bottom_panel.terminals`. On launch each entry
+  re-spawns as a fresh shell with its command typed back in —
+  relaunching the IDE restores the full terminal setup.
+  Container entries wait for the auto-resume to reach
+  `running` first. See
+  [ADR 0050](../decisions/0050-terminal-persistence-and-restart.md).
+- **Auto-close on shell exit / respawn on environment loss.**
+  The supervisor classifies each close (`shell_exited`,
+  `container_shell_exited`, `container_stopped`,
+  `container_not_running`). Shell exits (Ctrl+D, `exit`, a
+  finished command) close the tab outright; a container loss
+  keeps the tab and offers to respawn the shell (replaying
+  its command) once the container is back.
+- **Restart.** An exited terminal's tab offers "Respawn",
+  which opens a fresh PTY on the same target with the
+  recorded command typed in, keeping the tab's strip
+  position.
+
+What still doesn't ship (and when to revisit):
+
 - **Splits.** xterm.js doesn't have a built-in pane
   manager; we'd need to layer one. Defer until someone
   wants two terminals visible at once badly enough to

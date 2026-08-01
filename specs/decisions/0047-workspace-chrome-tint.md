@@ -15,10 +15,18 @@ mode.
 
 One colour per workspace, reused from the existing badge colour; no
 new setting. At hydrate, JS derives a full token set from that
-colour's hue and writes every `--m-*` custom property onto `:root`
-— twice (dark set to the plain names, light set to `*-light`
-twins), so flipping `.light` stays a pure CSS change with no JS
-round-trip.
+colour's hue and renders it as one `:root { … }` rule in an owned
+`<style>` element — dark values on the plain `--m-*` names, light
+values on their `*-light` twins. The app stylesheet's `:root.light`
+block re-points the plain names at the twins, so flipping `.light`
+is a pure cascade change with no JS round-trip.
+
+The scheme must live in a stylesheet rule, **not** inline custom
+properties on `:root`: an inline `:root` value beats the
+`:root.light` remap in the cascade, which leaves surfaces stuck
+dark on a theme flip (the first cut of this had exactly that bug —
+only the syntax tokens, which are never written inline, went
+light).
 
 The derivation is engineered per palette, not sampled:
 
