@@ -372,6 +372,36 @@
 		}
 	}
 
+	// Context-cap editor: tap the token widget to expand. The draft
+	// is in k (`500` = a 500k cap), seeded from the loaded settings
+	// each time the editor opens.
+	let capOpen = $state(false);
+	let capDraft = $state('');
+
+	function toggleCapEditor(): void {
+		capOpen = !capOpen;
+		if (capOpen) {
+			const ctx = app.contextCap;
+			capDraft = ctx?.capK ? String(ctx.capK) : '';
+		}
+	}
+
+	function saveCap(): void {
+		const parsed = parseInt(capDraft, 10);
+		capOpen = false;
+		void app.setContextCap(Number.isFinite(parsed) && parsed > 0 ? parsed : null);
+	}
+
+	function onCapKeydown(e: KeyboardEvent): void {
+		if (e.key === 'Enter') {
+			e.preventDefault();
+			saveCap();
+		} else if (e.key === 'Escape') {
+			e.preventDefault();
+			capOpen = false;
+		}
+	}
+
 	// Pin the transcript to the bottom while rows stream in, unless
 	// the user scrolled away to read — same gesture as the desktop's
 	// CoderThinking body (within-24px threshold absorbs subpixel
@@ -601,17 +631,59 @@
 	</div>
 
 	{#if app.tokenUsage}
-		<div
-			class="token-bar"
-			title="{app.tokenUsage.total.toLocaleString()} / {app.tokenUsage.contextWindow.toLocaleString()} tokens"
-		>
-			<span class="token-pct">{app.tokenUsage.pct}%</span>
-			<div class="token-meter">
-				<div class="token-fill" style="width: {Math.min(100, app.tokenUsage.pct)}%"></div>
-			</div>
-			<span class="token-detail"
-				>{app.tokenUsage.total.toLocaleString()} / {app.tokenUsage.contextWindow.toLocaleString()}</span
+		{@const usage = app.tokenUsage}
+		<div class="token-widget">
+			<button
+				class="token-bar"
+				class:cap-open={capOpen}
+				title="{usage.total.toLocaleString()} / {usage.contextWindow.toLocaleString()} tokens — tap to set the context cap"
+				onclick={toggleCapEditor}
 			>
+				<span class="token-pct">{usage.pct}%</span>
+				<div class="token-meter">
+					<div class="token-fill" style="width: {Math.min(100, usage.pct)}%"></div>
+				</div>
+				<span class="token-detail">{usage.total.toLocaleString()} / {usage.contextWindow.toLocaleString()}</span>
+			</button>
+			{#if capOpen}
+				{@const ctx = app.contextCap}
+				<div class="cap-editor">
+					<div class="cap-line">
+						<span class="cap-usage">
+							{usage.total.toLocaleString()} of {usage.contextWindow.toLocaleString()} tokens{#if ctx}&nbsp;· <span
+									class="cap-model">{ctx.slug}</span
+								>{/if}
+						</span>
+					</div>
+					<div class="cap-controls">
+						<input
+							class="cap-input"
+							type="number"
+							min="0"
+							step="10"
+							inputmode="numeric"
+							placeholder={ctx ? 'model max' : ''}
+							bind:value={capDraft}
+							onkeydown={onCapKeydown}
+							disabled={app.savingProvider}
+						/>
+						<span class="cap-unit">k</span>
+						<button class="ghost" onclick={saveCap} disabled={app.savingProvider}>Save</button>
+						{#if ctx?.capK}
+							<button
+								class="ghost"
+								title="Clear the cap (use the model's full window)"
+								onclick={() => {
+									capOpen = false;
+									void app.setContextCap(null);
+								}}
+								disabled={app.savingProvider}>Clear</button
+							>
+						{/if}
+					</div>
+					<p class="muted cap-hint">Cap the context in thousands of tokens. Empty = the model's full window.</p>
+				</div>
+			{/if}
 		</div>
 	{/if}
 
@@ -1191,16 +1263,64 @@
 		max-height: 250px;
 		overflow-y: auto;
 	}
-	.token-bar {
+	.token-widget {
 		flex: none;
+		background: var(--bg-elev);
+		border-bottom: 1px solid var(--border);
+	}
+	.token-bar {
 		display: flex;
 		align-items: center;
 		gap: 0.4rem;
+		width: 100%;
 		padding: 0.25rem 0.6rem;
-		background: var(--bg-elev);
-		border-bottom: 1px solid var(--border);
+		background: none;
+		border: none;
+		font: inherit;
 		font-size: 0.65rem;
 		color: var(--fg-muted);
+		cursor: pointer;
+		text-align: left;
+	}
+	.token-bar.cap-open {
+		color: var(--fg);
+	}
+	.cap-editor {
+		padding: 0.2rem 0.6rem 0.5rem;
+		border-top: 1px solid var(--border);
+	}
+	.cap-line {
+		font-size: 0.7rem;
+		color: var(--fg-muted);
+		margin-bottom: 0.4rem;
+	}
+	.cap-model {
+		font-family: var(--mono, monospace);
+		font-size: 0.65rem;
+	}
+	.cap-controls {
+		display: flex;
+		align-items: center;
+		gap: 0.4rem;
+	}
+	.cap-input {
+		width: 6rem;
+		min-width: 0;
+		font: inherit;
+		background: var(--bg-elev-2);
+		color: var(--fg);
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		padding: 0.35rem 0.5rem;
+	}
+	.cap-unit {
+		color: var(--fg-muted);
+		font-size: 0.8rem;
+	}
+	.cap-hint {
+		margin: 0.4rem 0 0;
+		font-size: 0.7rem;
+		line-height: 1.35;
 	}
 	.token-pct {
 		flex: none;

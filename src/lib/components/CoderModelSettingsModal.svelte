@@ -803,21 +803,26 @@
 	const cheapDetails = $derived(slugDetails(cheapModel));
 
 	// Editor binding for the cap input next to the standard /
-	// cheap model fields. `''` means "no cap"; non-empty values
-	// are persisted as positive integers in `slugCaps`. The
-	// derived getter reads from `slugCaps[slug]`; the setter
-	// writes back, removing the entry on clear so the saved
-	// `context_window_overrides` map stays minimal. Keying off
-	// the live slug means switching the standard model's slug
-	// flips the cap input to whatever's stored against the new
-	// slug — caps survive a model swap.
+	// cheap model fields, in **thousands of tokens** (k) — `500`
+	// means a 500k cap. `''` means "no cap". The derived getter
+	// reads `slugCaps[slug]` (tokens) and renders it in k; the
+	// setter writes back tokens (×1000), removing the entry on
+	// clear so the saved `context_window_overrides` map stays
+	// minimal. Keying off the live slug means switching the model's
+	// slug flips the cap input to whatever's stored against the
+	// new slug — caps survive a model swap.
 	function readCapFor(slug: string): string {
 		const trimmed = slug.trim();
 		if (trimmed.length === 0) {
 			return '';
 		}
 		const v = slugCaps[trimmed];
-		return v === undefined || v === 0 ? '' : String(v);
+		if (v === undefined || v === 0) {
+			return '';
+		}
+		// Round to the nearest k; sub-k caps (never typed, but a
+		// hand-edited state.json could hold one) still round-trip.
+		return String(Math.round(v / 1000));
 	}
 	function writeCapFor(slug: string, raw: string): void {
 		const trimmed = slug.trim();
@@ -831,7 +836,7 @@
 		} else {
 			const n = Number(digits);
 			if (Number.isFinite(n) && n > 0) {
-				next[trimmed] = n;
+				next[trimmed] = n * 1000;
 			} else {
 				delete next[trimmed];
 			}
@@ -853,6 +858,21 @@
 		}
 		return `${n}`;
 	}
+
+	// The model's catalog context window for the slug, shown next
+	// to the cap input so the user caps against a known ceiling
+	// rather than guessing. `null` when the slug isn't resolvable
+	// to a catalog entry (custom provider, catalog not loaded).
+	function catalogCtxFor(slug: string): number | null {
+		const hit = resolveSlug(slug);
+		if (hit === null) {
+			return null;
+		}
+		const provider = hit.provider ?? pickRepresentative(hit.model);
+		return provider?.context_length ?? null;
+	}
+	const standardCatalogCtx = $derived(catalogCtxFor(standardModel));
+	const cheapCatalogCtx = $derived(catalogCtxFor(cheapModel));
 
 	// Orgs we surface in the bill-to dropdown: only the ones the user
 	// explicitly authorized moon-ide for at the OAuth consent screen.
@@ -1156,16 +1176,18 @@
 							class="cap-input"
 							inputmode="numeric"
 							value={standardCapInput}
-							placeholder="leave blank for model max"
+							placeholder={standardCatalogCtx !== null ? shortTokens(standardCatalogCtx) : 'model max'}
 							spellcheck="false"
 							autocomplete="off"
 							disabled={standardModel.trim().length === 0}
 							oninput={(e) => writeCapFor(standardModel, (e.target as HTMLInputElement).value)}
 							onfocusin={() => (editingTier = 'standard')}
 						/>
-						<span class="cap-unit">tokens</span>
-						{#if standardCapInput.length > 0}
-							<span class="cap-hint">≈ {shortTokens(Number(standardCapInput))}</span>
+						<span class="cap-unit">k</span>
+						{#if standardCatalogCtx !== null}
+							<span class="cap-hint" title="The model's catalog context window"
+								>/ {shortTokens(standardCatalogCtx)}</span
+							>
 						{/if}
 					</span>
 				</label>
@@ -1198,16 +1220,16 @@
 							class="cap-input"
 							inputmode="numeric"
 							value={cheapCapInput}
-							placeholder="leave blank for model max"
+							placeholder={cheapCatalogCtx !== null ? shortTokens(cheapCatalogCtx) : 'model max'}
 							spellcheck="false"
 							autocomplete="off"
 							disabled={cheapModel.trim().length === 0}
 							oninput={(e) => writeCapFor(cheapModel, (e.target as HTMLInputElement).value)}
 							onfocusin={() => (editingTier = 'cheap')}
 						/>
-						<span class="cap-unit">tokens</span>
-						{#if cheapCapInput.length > 0}
-							<span class="cap-hint">≈ {shortTokens(Number(cheapCapInput))}</span>
+						<span class="cap-unit">k</span>
+						{#if cheapCatalogCtx !== null}
+							<span class="cap-hint" title="The model's catalog context window">/ {shortTokens(cheapCatalogCtx)}</span>
 						{/if}
 					</span>
 				</label>

@@ -31,34 +31,6 @@
 		void app.setProvider(id);
 	}
 
-	/** Context-cap editor: local draft in tokens (string so the
-	 * field can be cleared), synced from the loaded settings. */
-	let capDraft = $state('');
-	let capSyncedFor = $state('');
-
-	// Re-seed the draft whenever the resolved model or its stored
-	// cap changes underneath us (settings load, a desktop edit).
-	$effect(() => {
-		const ctx = app.contextCap;
-		const key = ctx ? `${ctx.slug}:${ctx.cap ?? ''}` : '';
-		if (key !== capSyncedFor) {
-			capSyncedFor = key;
-			capDraft = ctx?.cap ? String(ctx.cap) : '';
-		}
-	});
-
-	function saveCap(): void {
-		const parsed = parseInt(capDraft, 10);
-		void app.setContextCap(Number.isFinite(parsed) && parsed > 0 ? parsed : null);
-	}
-
-	function onCapKeydown(e: KeyboardEvent): void {
-		if (e.key === 'Enter') {
-			e.preventDefault();
-			saveCap();
-		}
-	}
-
 	/** Commit composer state. */
 	let commitMsg = $state('');
 	let committing = $state(false);
@@ -165,36 +137,6 @@
 					{/if}
 				</span>
 			</label>
-			{#if app.contextCap}
-				{@const ctx = app.contextCap}
-				<div class="cap-row">
-					<span class="muted" title={ctx.slug}>Context cap</span>
-					<input
-						class="cap-input"
-						type="number"
-						min="0"
-						step="1000"
-						inputmode="numeric"
-						placeholder="catalog"
-						bind:value={capDraft}
-						onkeydown={onCapKeydown}
-						disabled={app.savingProvider}
-					/>
-					<button class="ghost" onclick={saveCap} disabled={app.savingProvider}>Save</button>
-					{#if ctx.cap}
-						<button
-							class="ghost"
-							title="Clear cap (use the catalog window)"
-							onclick={() => void app.setContextCap(null)}
-							disabled={app.savingProvider}>Clear</button
-						>
-					{/if}
-				</div>
-				<p class="muted cap-hint">
-					Max tokens per round-trip for {ctx.slug}. Empty = the model's catalog window. The runner clamps to the lower
-					of the two, so the usage ring and auto-compaction respect it.
-				</p>
-			{/if}
 		</div>
 	{/if}
 
@@ -443,28 +385,7 @@
 		min-height: 0;
 		accent-color: var(--accent);
 	}
-	.cap-row {
-		display: flex;
-		align-items: center;
-		gap: 0.5rem;
-		font-size: 0.85rem;
-		margin-top: 0.4rem;
-	}
-	.cap-input {
-		width: 7.5rem;
-		min-width: 0;
-		font: inherit;
-		background: var(--bg-elev-2);
-		color: var(--fg);
-		border: 1px solid var(--border);
-		border-radius: var(--radius);
-		padding: 0.3rem 0.5rem;
-	}
-	.cap-hint {
-		margin: 0.35rem 0 0;
-		font-size: 0.75rem;
-		line-height: 1.35;
-	}
+
 	.scm-card {
 		display: flex;
 		flex-direction: column;

@@ -290,11 +290,15 @@ max_events)`, which replays the slice ending just before that
   semantics as the desktop picker (a locked save pins the workspace;
   an unlocked save writes the global default). Provider CRUD and
   API keys stay desktop-only. The same settings payload round-trips
-  the **context-window cap** (`context_window_overrides`): the
-  workspace view edits the cap for the resolved standard model, and
-  since the runner clamps `min(catalog, cap)` at every
+  the **context-window cap** (`context_window_overrides`): tapping
+  the session's token-usage widget expands an editor for the
+  resolved standard model's cap — entered in **thousands of
+  tokens** (`500` = a 500k cap), empty = the model's full catalog
+  window, with the current `used / window` shown for reference.
+  Since the runner clamps `min(catalog, cap)` at every
   `CoderModels::context_window` call site, the phone's usage ring
-  and auto-compaction respect it identically to the desktop.
+  and auto-compaction respect it identically to the desktop (whose
+  picker also edits in k).
 - **Project switcher.** Inside a workspace, the phone lists the
   bound folders (from `workspace_snapshot`, worktree folders hidden
   — they share their parent's session list per ADR 0028) and scopes

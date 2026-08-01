@@ -850,24 +850,26 @@ class CompanionState {
 	}
 
 	/** Context-window cap for the current standard model, in
-	 * tokens, or null when the catalog window is used directly.
-	 * Reads `context_window_overrides[resolved_standard_model]`
-	 * (the runner falls back to the suffix-stripped base too, but
-	 * the phone edits the resolved slug). */
-	get contextCap(): { slug: string; cap: number | null } | null {
+	 * **thousands of tokens (k)**, or null when the catalog window is
+	 * used directly. Reads `context_window_overrides[resolved_standard_model]`
+	 * (the runner falls back to the suffix-stripped base too, but the
+	 * phone edits the resolved slug). */
+	get contextCap(): { slug: string; capK: number | null } | null {
 		const s = this.modelSettings;
 		const slug = s?.resolved_standard_model;
 		if (!s || !slug) {
 			return null;
 		}
-		return { slug, cap: s.context_window_overrides?.[slug] ?? null };
+		const tokens = s.context_window_overrides?.[slug];
+		return { slug, capK: tokens && tokens > 0 ? Math.round(tokens / 1000) : null };
 	}
 
 	/** Set or clear the context-window cap for the current standard
-	 * model. `capTokens <= 0` / null clears the override (back to the
-	 * catalog window). Round-trips through `coder_set_model_settings`
-	 * so the desktop picker and the runner both pick it up. */
-	async setContextCap(capTokens: number | null): Promise<void> {
+	 * model, in **k** (`500` → a 500k cap). `capK <= 0` / null clears
+	 * the override (back to the catalog window). Round-trips through
+	 * `coder_set_model_settings` so the desktop picker and the runner
+	 * both pick it up. */
+	async setContextCap(capK: number | null): Promise<void> {
 		const settings = this.modelSettings;
 		const slug = settings?.resolved_standard_model;
 		if (!this.activeWorkspace || !settings || !slug) {
@@ -876,8 +878,8 @@ class CompanionState {
 		this.savingProvider = true;
 		try {
 			const overrides = { ...settings.context_window_overrides };
-			if (capTokens && capTokens > 0) {
-				overrides[slug] = Math.round(capTokens);
+			if (capK && capK > 0) {
+				overrides[slug] = Math.round(capK) * 1000;
 			} else {
 				delete overrides[slug];
 			}
