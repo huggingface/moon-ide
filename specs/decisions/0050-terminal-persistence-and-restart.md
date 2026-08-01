@@ -67,19 +67,24 @@ hook to `PROMPT_COMMAND` in every spawned shell (host and
 container):
 
 ```
-history 1 | sed "s/^ *[0-9]* *//" | base64 -w0 | sed "s/^/MOONCMD/"
+history -a; history 1 | sed "s/^ *[0-9]* *//" | base64 -w0 | sed "s/^/MOONCMD/"
 ```
 
 bash ≥ 5.1 runs `PROMPT_COMMAND` just before displaying each
-primary prompt, so after every command the shell itself echoes
-its newest history entry, base64'd, with a marker the
-frontend's output scanner recognises. The scanner lifts the
-marker line out of the byte stream (the user never sees it) and
-records the decoded command on the session. Because the source
-is the shell's history, the capture is authoritative — it
-covers `cd`, aliases, and commands the user recalled with
-up-arrow and edited before running, none of which a
-screen-scrape sees.
+primary prompt. `history -a` first appends the just-run line to
+the history file (bash only flushes it at shell exit otherwise,
+so a bare `history 1` would read a stale entry), then the hook
+echoes the newest entry base64'd with a `MOONCMD` marker. The
+frontend's scanner lifts the marker token out of the byte
+stream — a streaming regex strips `MOONCMD<base64>` (plus the
+hook's own trailing `\r\n`) wherever it appears and holds back
+a trailing marker-eligible run so a token split across PTY
+chunk boundaries is rejoined rather than leaking through. The
+user never sees the hook's echo; the decoded command is
+recorded on the session. Because the source is the shell's
+history, the capture is authoritative — it covers `cd`,
+aliases, and commands the user recalled with up-arrow and
+edited before running, none of which a screen-scrape sees.
 
 Degradation is explicit: shells without `PROMPT_COMMAND` (zsh
 without a bash-compat shim, fish) never emit the marker, so the

@@ -121,15 +121,16 @@ pub fn moon_edit_path_map_for_bound_folders(bound_folders: &[Utf8PathBuf]) -> St
 
 /// Shell-history echo hook, prepended to `PROMPT_COMMAND` in
 /// every spawned shell (host and container). bash ≥ 5.1 runs
-/// `PROMPT_COMMAND` just before displaying each primary prompt;
-/// this one-liner echoes the newest history entry, base64'd,
-/// with a marker the frontend's output scanner recognises. The
-/// user's rc files append their own hooks after it harmlessly.
-/// Shells without `PROMPT_COMMAND` ignore the env var entirely
-/// — history capture silently stays at whatever the spawn
-/// replayed. See ADR 0009's persistence section.
+/// `PROMPT_COMMAND` just before displaying each primary prompt.
+/// `history -a` first appends the just-run line to the history
+/// file (bash only writes it at shell exit otherwise), then the
+/// newest entry is echoed base64'd with a marker the frontend's
+/// output scanner recognises. The user's rc files append their
+/// own hooks after it harmlessly. Shells without `PROMPT_COMMAND`
+/// ignore the env var entirely — history capture silently stays
+/// at whatever the spawn replayed. See ADR 0050.
 pub const HISTORY_ECHO_HOOK: &str =
-	"history 1 | sed \"s/^ *[0-9]* *//\" | base64 -w0 2>/dev/null | sed \"s/^/MOONCMD/\"";
+	"history -a; history 1 | sed \"s/^ *[0-9]* *//\" | base64 -w0 2>/dev/null | sed \"s/^/MOONCMD/\"";
 
 /// Build the standard `-e` env list the IDE injects into every
 /// container terminal so `git commit --amend` (and friends) hand
