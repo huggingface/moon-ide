@@ -338,6 +338,40 @@
 	const title = $derived(app.sessions.find((s) => s.id === app.activeSession)?.title ?? '');
 	const isCoordinator = $derived(app.sessions.find((s) => s.id === app.activeSession)?.mode === 'coordinator');
 
+	// Title rename: tap the title to edit inline. The rename
+	// propagates to the IDE via the broadcast `session_title_updated`
+	// (app.renameSession), so the local input just resets.
+	let editingTitle = $state(false);
+	let titleDraft = $state('');
+	let titleInputEl = $state<HTMLInputElement | null>(null);
+
+	function startRename(): void {
+		titleDraft = title;
+		editingTitle = true;
+		void tick().then(() => {
+			titleInputEl?.focus();
+			titleInputEl?.select();
+		});
+	}
+
+	async function commitRename(): Promise<void> {
+		const next = titleDraft.trim();
+		editingTitle = false;
+		if (next && next !== title) {
+			await app.renameSession(next);
+		}
+	}
+
+	function onRenameKeydown(e: KeyboardEvent): void {
+		if (e.key === 'Enter') {
+			e.preventDefault();
+			void commitRename();
+		} else if (e.key === 'Escape') {
+			e.preventDefault();
+			editingTitle = false;
+		}
+	}
+
 	// Pin the transcript to the bottom while rows stream in, unless
 	// the user scrolled away to read — same gesture as the desktop's
 	// CoderThinking body (within-24px threshold absorbs subpixel
@@ -430,6 +464,19 @@
 	}
 
 	function loadOlderRows(): void {
+		// Locally-loaded history exhausted but the session has older
+		// pages on disk: fetch the next page, expanding the window
+		// top by the rows it prepends so they come into view (the
+		// scroll anchor keeps position). `visibleCount` honours the
+		// cap; past it the window slides and "Load newer" / "Jump to
+		// latest" reel the bottom back.
+		if (hiddenAbove <= 0 && app.hasMoreHistory) {
+			captureScrollAnchor('first');
+			void app.loadOlderHistory().then(() => {
+				visibleCount = Math.min(WINDOW_MAX, visibleCount + app.lastOlderPageRows);
+			});
+			return;
+		}
 		captureScrollAnchor('first');
 		growWindowUp();
 	}
@@ -532,7 +579,20 @@
 	<div class="row session-head">
 		<button class="ghost back" onclick={() => app.closeSession()}>←</button>
 		{#if isCoordinator}<span class="badge" title="Coordinator — orchestrates worker agents">coord</span>{/if}
-		<strong class="session-title">{title || 'Untitled session'}</strong>
+		{#if editingTitle}
+			<input
+				bind:this={titleInputEl}
+				class="session-title-input"
+				bind:value={titleDraft}
+				onkeydown={onRenameKeydown}
+				onblur={() => void commitRename()}
+				enterkeyhint="done"
+			/>
+		{:else}
+			<button class="session-title" title="Rename session" onclick={startRename}>
+				<strong>{title || 'Untitled session'}</strong>
+			</button>
+		{/if}
 		{#if app.busy}
 			<span class="pip live" title="Running"></span>
 		{:else if app.awaitingInput}
@@ -559,6 +619,10 @@
 		{#if hiddenAbove > 0}
 			<button type="button" class="load-pill" onclick={loadOlderRows}>
 				Load {Math.min(WINDOW_GROW_STEP, hiddenAbove)} older ({hiddenAbove} hidden)
+			</button>
+		{:else if app.hasMoreHistory}
+			<button type="button" class="load-pill" disabled={app.loadingOlder} onclick={loadOlderRows}>
+				{app.loadingOlder ? 'Loading…' : 'Load older'}
 			</button>
 		{/if}
 		{#each windowedRows as row (row.kind + row.id)}
@@ -754,22 +818,30 @@
 			placeholder={isCoordinator ? 'Describe a goal for the coordinator' : 'Message the coder'}
 			rows="1"
 		></textarea>
+		<!-- Send stays available while a turn runs: the message queues
+		     as a steer (`coder_send` → `send_to_as_user`), same as the
+		     desktop. Stop is a separate, smaller button next to it. -->
 		{#if app.busy}
 			<button class="send-btn stop" title="Stop" aria-label="Stop" onclick={() => app.abort()}>
-				<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"
+				<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"
 					><rect x="6.5" y="6.5" width="11" height="11" rx="2" fill="currentColor" /></svg
 				>
 			</button>
-		{:else}
-			<button class="send-btn" title="Send" aria-label="Send" onclick={send} disabled={!draft.trim()}>
-				<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"
-					><path
-						fill="currentColor"
-						d="M3.4 20.4l17.5-7.5c0.8-0.4 0.8-1.5 0-1.9L3.4 3.6c-0.7-0.3-1.5 0.2-1.5 1l0 5.3c0 0.5 0.4 0.9 0.9 1L17 12 2.8 13.1c-0.5 0.1-0.9 0.5-0.9 1l0 5.3c0 0.8 0.8 1.3 1.5 1z"
-					/></svg
-				>
-			</button>
 		{/if}
+		<button
+			class="send-btn"
+			title={app.busy ? 'Queue message' : 'Send'}
+			aria-label={app.busy ? 'Queue message' : 'Send'}
+			onclick={send}
+			disabled={!draft.trim()}
+		>
+			<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"
+				><path
+					fill="currentColor"
+					d="M3.4 20.4l17.5-7.5c0.8-0.4 0.8-1.5 0-1.9L3.4 3.6c-0.7-0.3-1.5 0.2-1.5 1l0 5.3c0 0.5 0.4 0.9 0.9 1L17 12 2.8 13.1c-0.5 0.1-0.9 0.5-0.9 1l0 5.3c0 0.8 0.8 1.3 1.5 1z"
+				/></svg
+			>
+		</button>
 	</div>
 </div>
 
@@ -808,10 +880,31 @@
 	.session-title {
 		flex: 1;
 		min-width: 0;
+		background: none;
+		border: none;
+		padding: 0;
+		color: inherit;
+		text-align: left;
+		cursor: text;
+	}
+	.session-title strong {
+		display: block;
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
 		font-size: 0.95rem;
+	}
+	.session-title-input {
+		flex: 1;
+		min-width: 0;
+		font: inherit;
+		font-size: 0.95rem;
+		font-weight: 600;
+		background: var(--bg-elev);
+		color: var(--fg);
+		border: 1px solid var(--accent);
+		border-radius: var(--radius);
+		padding: 0.2rem 0.4rem;
 	}
 	.transcript {
 		flex: 1;
@@ -1173,6 +1266,15 @@
 		/* Optical centering: the paper-plane glyph sits slightly
 		   left of its viewBox centre. */
 		margin-left: 2px;
+	}
+	/* Stop sits beside send (a queued steer is the common action
+	   mid-turn), so it shrinks and drops to a muted danger tone. */
+	.send-btn.stop {
+		width: 34px;
+		height: 34px;
+		background: var(--bg-elev-2);
+		color: var(--danger);
+		border: 1px solid var(--border);
 	}
 	.send-btn.stop svg {
 		margin-left: 0;

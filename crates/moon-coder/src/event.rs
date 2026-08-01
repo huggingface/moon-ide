@@ -224,6 +224,18 @@ pub enum CoderEvent {
 	/// re-asserts the pip from this flag after applying the batch.
 	Replay { events: Vec<CoderEvent>, in_flight: bool },
 
+	/// Marks the start of a *windowed* replay: the observe path
+	/// (`observe_session_in` with `max_events`) replays only the
+	/// newest slice of a long transcript, and inserts this as the
+	/// first event so the client knows earlier history exists and
+	/// where to resume from. `before_event_ordinal` is the index
+	/// (in the full, unwindowed replay's event sequence) at which
+	/// the returned window begins — the value the next
+	/// `session_history_older` call passes as its exclusive upper
+	/// bound. Only ever emitted by the windowed observe path; a
+	/// full replay (desktop) and live turns never carry it.
+	HistoryWindowStart { before_event_ordinal: usize },
+
 	/// The active session's title was rewritten — either by the
 	/// auto-rename pass after the first turn, or (Phase 6.4+) by
 	/// an explicit user rename. Frontend updates the sticky

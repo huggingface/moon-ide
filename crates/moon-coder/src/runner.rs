@@ -2149,7 +2149,7 @@ impl CoderHandle {
 			fs.runtimes.write().await.remove(session_id);
 		}
 		self
-			.open_session_impl(Some(folder_path.as_str()), session_id.to_owned(), false)
+			.open_session_impl(Some(folder_path.as_str()), session_id.to_owned(), false, None)
 			.await?;
 
 		Ok(RevertedMessage {
@@ -2584,7 +2584,7 @@ impl CoderHandle {
 	}
 
 	pub async fn open_session(&self, id: String) -> Result<SessionSummary, CoderError> {
-		let (summary, _) = self.open_session_impl(None, id, true).await?;
+		let (summary, _) = self.open_session_impl(None, id, true, None).await?;
 		Ok(summary)
 	}
 
@@ -2596,27 +2596,279 @@ impl CoderHandle {
 	/// on the event channel — a phone opening a session must not
 	/// hijack the desktop's panel or light background-attention
 	/// badges.
-	pub async fn observe_session_in(&self, folder: Option<&str>, id: String) -> Result<ObservedSession, CoderError> {
-		let (summary, replay) = self.open_session_impl(folder, id, false).await?;
-		let (events, in_flight) = replay.unwrap_or_default();
+	pub async fn observe_session_in(
+		&self,
+		folder: Option<&str>,
+		id: String,
+		max_events: Option<usize>,
+	) -> Result<ObservedSession, CoderError> {
+		let (summary, replay) = self.open_session_impl(folder, id, false, max_events).await?;
+		let (events, in_flight, has_more) = replay.unwrap_or_default();
 		Ok(ObservedSession {
 			summary,
 			events,
 			in_flight,
+			has_more,
 		})
+	}
+
+	/// Fetch the next-older window of a session's transcript for the
+	/// companion's upward-scroll pagination. Replays the window
+	/// ending just before the record that produced `before_event_ordinal`
+	/// in the full replay, so the phone can prepend it.
+	///
+	/// Read-only: unlike [`Self::observe_session_in`] this does not
+	/// mount a runtime or spawn a resumed prompt; it's a pure disk
+	/// replay of a slice. `before_event_ordinal` is the
+	/// [`CoderEvent::HistoryWindowStart`] ordinal from the previous
+	/// fetch (or `usize::MAX` for the newest window — the same thing
+	/// `observe_session_in(.., Some(max))` returns).
+	pub async fn session_history_older(
+		&self,
+		folder: Option<&str>,
+		id: String,
+		before_event_ordinal: usize,
+		max_events: usize,
+	) -> Result<HistoryWindow, CoderError> {
+		sessions::validate_session_id(&id)?;
+		let (_, folder_path) = self.state.folder_session_or_active(folder).await?;
+		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
+		let LoadedSession {
+			records,
+			record_timestamps,
+			..
+		} = sessions::load(&dir, &id).await?;
+		// `before_event_ordinal` is an exclusive end in the full
+		// event sequence (the start ordinal the previous window
+		// reported); replay [0, that) and take its newest max_events.
+		let (events, _replayed, total, window_start) = Self::replay_window(
+			&dir,
+			&id,
+			records,
+			record_timestamps,
+			Some(before_event_ordinal),
+			max_events,
+			false,
+		)
+		.await;
+		Ok(HistoryWindow {
+			events,
+			has_more: window_start > 0,
+			before_event_ordinal: window_start,
+			total_events: total,
+		})
+	}
+
+	/// Rename a session (the companion's title edit). Sets the
+	/// title on the in-memory runtime when mounted and always
+	/// persists a `TitleUpdate` record to the JSONL so a re-open
+	/// replays it, then broadcasts `SessionTitleUpdated` +
+	/// `SessionListChanged` on the folder's event channel — the
+	/// desktop panel and any phone subscribed to the workspace see
+	/// the new title without a refresh.
+	///
+	/// The folder is resolved from the optional `folder` target when
+	/// given (the phone's project switcher), else from the mounted
+	/// runtime (a session the caller opened by id), else the active
+	/// folder. Refuses an empty title — the truncated-prompt
+	/// fallback is always better than a blank one.
+	pub async fn rename_session_in(
+		&self,
+		folder: Option<&str>,
+		id: String,
+		title: String,
+	) -> Result<SessionSummary, CoderError> {
+		sessions::validate_session_id(&id)?;
+		let title = title.trim();
+		if title.is_empty() {
+			return Err(CoderError::Internal("session title cannot be empty".into()));
+		}
+		// Resolve the owning folder: explicit target first, then a
+		// mounted runtime (so an id-only rename finds its folder),
+		// else the active folder.
+		let (folder_path, mounted) = match folder {
+			Some(f) => {
+				let (_, path) = self.state.folder_session_or_active(Some(f)).await?;
+				let rt = self.state.runtime_for_session(&id).await.map(|(rt, _)| rt);
+				(path, rt)
+			}
+			None => match self.state.runtime_for_session(&id).await {
+				Some((rt, path)) => (path, Some(rt)),
+				None => {
+					let (_, path) = self.state.folder_session_or_active(None).await?;
+					(path, None)
+				}
+			},
+		};
+		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
+
+		// Update the mounted runtime's header if present; take the
+		// header for the disk append from it, else load from disk.
+		let header = match &mounted {
+			Some(rt) => {
+				let mut session = rt.session.lock().await;
+				session.header.title = title.to_string();
+				session.header.updated_at_ms = current_time_ms();
+				session.header.clone()
+			}
+			None => {
+				let LoadedSession { mut header, .. } = sessions::load(&dir, &id).await?;
+				header.title = title.to_string();
+				header
+			}
+		};
+		sessions::append_record(
+			&dir,
+			&header,
+			&SessionRecord::TitleUpdate {
+				title: title.to_string(),
+			},
+		)
+		.await?;
+
+		// Notify every subscriber (desktop panel + observing phones).
+		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), id.clone());
+		sink.send(CoderEvent::SessionTitleUpdated {
+			id: id.clone(),
+			title: title.to_string(),
+		});
+		sink.send(CoderEvent::SessionListChanged);
+
+		Ok(SessionSummary {
+			id: header.id,
+			title: header.title,
+			created_at_ms: header.created_at_ms,
+			updated_at_ms: header.updated_at_ms,
+			worktree_root: header.worktree_root,
+			worktree_branch: header.worktree_branch,
+			committed_branch: header.committed_branch,
+			mode: header.mode,
+		})
+	}
+
+	/// Assemble the replayed event stream for `records`, taking the
+	/// newest `max_events` events of the window that ends at
+	/// `before_event_ordinal` (`None` = the stream's end).
+	///
+	/// The window is taken over *events*, not records: the full
+	/// record list is replayed through [`emit_replay_events`] (and
+	/// the async sub-agent path) into one buffer, then sliced. That
+	/// keeps the phone's windows aligned to exactly what the UI
+	/// renders, at the cost of materialising the full event vec —
+	/// acceptable next to the JSONL parse the open already pays.
+	///
+	/// Returns `(events, replayed_event_count, total_event_count,
+	/// window_start_ordinal)`: `window_start_ordinal` is the index
+	/// in the full event sequence where the returned window begins
+	/// (0 when the whole transcript fit), and is the
+	/// `before_event_ordinal` the next "load older" call passes.
+	#[allow(clippy::too_many_arguments)]
+	async fn replay_window(
+		dir: &Utf8Path,
+		session_id: &str,
+		records: Vec<SessionRecord>,
+		record_timestamps: Vec<i64>,
+		before_event_ordinal: Option<usize>,
+		max_events: usize,
+		in_flight: bool,
+	) -> (Vec<CoderEvent>, usize, usize, usize) {
+		let mut all: Vec<CoderEvent> = Vec::with_capacity(records.len() + 2);
+		// Sub-agents whose `SubagentFinished` record hasn't landed
+		// yet are still running when the turn is in flight — their
+		// transcripts must not get orphan-error synthesis either.
+		let finished_subagent_ids: std::collections::HashSet<&str> = records
+			.iter()
+			.filter_map(|r| match r {
+				SessionRecord::SubagentFinished { subagent_id, .. } => Some(subagent_id.as_str()),
+				_ => None,
+			})
+			.collect();
+		let live_subagent_ids: std::collections::HashSet<String> = if in_flight {
+			records
+				.iter()
+				.filter_map(|r| match r {
+					SessionRecord::SubagentSpawned { subagent_id, .. }
+						if !finished_subagent_ids.contains(subagent_id.as_str()) =>
+					{
+						Some(subagent_id.clone())
+					}
+					_ => None,
+				})
+				.collect()
+		} else {
+			std::collections::HashSet::new()
+		};
+		for (record, record_ts) in records.into_iter().zip(record_timestamps) {
+			match record {
+				SessionRecord::SubagentSpawned {
+					ref tool_call_id,
+					ref subagent_id,
+					ref target_folder,
+					ref mode,
+					ref worktree_root,
+				} => {
+					let still_running = live_subagent_ids.contains(subagent_id.as_str());
+					replay_subagent_spawned(
+						&mut all,
+						&subagent_session_dir(dir, session_id),
+						tool_call_id.clone(),
+						subagent_id.clone(),
+						target_folder.clone(),
+						mode.clone(),
+						worktree_root.clone(),
+						still_running,
+					)
+					.await;
+				}
+				SessionRecord::SubagentFinished {
+					subagent_id,
+					tokens_used_estimate,
+					was_error,
+					result_preview: _,
+				} => {
+					all.push(CoderEvent::SubagentFinished {
+						subagent_id,
+						tokens_used_estimate,
+						was_error,
+					});
+				}
+				other => emit_replay_events(&mut all, other, record_ts),
+			}
+		}
+		let total = all.len();
+		let end = before_event_ordinal.map(|o| o.min(total)).unwrap_or(total);
+		// Window over the event stream: the newest `max_events`
+		// events of `[0, end)`. `start` is where the window begins
+		// in the full sequence.
+		let window_len = end.min(max_events);
+		let start = end - window_len;
+		let window: Vec<CoderEvent> = all.into_iter().skip(start).collect();
+		let replayed = window.len();
+		(window, replayed, total, start)
 	}
 
 	/// Shared body of [`Self::open_session`] (focus: broadcast the
 	/// replay, set the visible pointer) and
 	/// [`Self::observe_session_in`] (return the replay, touch
 	/// nothing). Returns the replay payload as `Some` only in
-	/// observe mode.
+	/// observe mode, carrying `(events, in_flight, has_more)`.
+	///
+	/// `max_events` (observe mode only) windows the replayed
+	/// transcript to its newest `max_events` events — the
+	/// companion's open path passes it so a very long session (or
+	/// one carrying pasted images) doesn't ship its whole history
+	/// over the phone's WS before a single row renders. The window
+	/// is taken over *events* (what the UI renders), not records;
+	/// the full record list still drives the runtime rebuild, so
+	/// the mounted session's `messages` stay complete for the next
+	/// turn. `None` replays everything (the desktop's behaviour).
 	async fn open_session_impl(
 		&self,
 		folder: Option<&str>,
 		id: String,
 		focus: bool,
-	) -> Result<(SessionSummary, Option<(Vec<CoderEvent>, bool)>), CoderError> {
+		max_events: Option<usize>,
+	) -> Result<(SessionSummary, Option<(Vec<CoderEvent>, bool, bool)>), CoderError> {
 		sessions::validate_session_id(&id)?;
 		let (fs, folder_path) = self.state.folder_session_or_active(folder).await?;
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
@@ -2638,7 +2890,6 @@ impl CoderHandle {
 			records,
 			record_timestamps,
 		} = sessions::load(&dir, &id).await?;
-		let record_count = records.len();
 
 		let RebuiltMessages {
 			mut messages,
@@ -2825,75 +3076,30 @@ impl CoderHandle {
 		// clears its bucket and enters "replaying" mode before the
 		// batch lands.
 		//
-		// Sub-agent records replay through a dedicated async path
-		// that pulls in each sub-agent's own JSONL so the popped-
-		// out transcript matches what the user originally saw, not
-		// just a synthetic preview. The other variants go through
-		// the sync [`emit_replay_events`] path. Both push into the
-		// same buffer.
-		let mut replay_events: Vec<CoderEvent> = Vec::with_capacity(record_count + 2);
-		// Sub-agents whose `SubagentFinished` record hasn't landed
-		// yet are still running when the turn is in flight — their
-		// transcripts must not get orphan-error synthesis either.
-		let finished_subagent_ids: std::collections::HashSet<&str> = records
-			.iter()
-			.filter_map(|r| match r {
-				SessionRecord::SubagentFinished { subagent_id, .. } => Some(subagent_id.as_str()),
-				_ => None,
-			})
-			.collect();
-		let live_subagent_ids: std::collections::HashSet<String> = if in_flight {
-			records
-				.iter()
-				.filter_map(|r| match r {
-					SessionRecord::SubagentSpawned { subagent_id, .. }
-						if !finished_subagent_ids.contains(subagent_id.as_str()) =>
-					{
-						Some(subagent_id.clone())
-					}
-					_ => None,
-				})
-				.collect()
-		} else {
-			std::collections::HashSet::new()
-		};
-		for (record, record_ts) in records.into_iter().zip(record_timestamps) {
-			match record {
-				SessionRecord::SubagentSpawned {
-					ref tool_call_id,
-					ref subagent_id,
-					ref target_folder,
-					ref mode,
-					ref worktree_root,
-				} => {
-					let still_running = live_subagent_ids.contains(subagent_id.as_str());
-					replay_subagent_spawned(
-						&mut replay_events,
-						&subagent_session_dir(&dir, &summary.id),
-						tool_call_id.clone(),
-						subagent_id.clone(),
-						target_folder.clone(),
-						mode.clone(),
-						worktree_root.clone(),
-						still_running,
-					)
-					.await;
-				}
-				SessionRecord::SubagentFinished {
-					subagent_id,
-					tokens_used_estimate,
-					was_error,
-					result_preview: _,
-				} => {
-					replay_events.push(CoderEvent::SubagentFinished {
-						subagent_id,
-						tokens_used_estimate,
-						was_error,
-					});
-				}
-				other => emit_replay_events(&mut replay_events, other, record_ts),
-			}
+		// When `max_events` is set (the companion's observe path),
+		// only the *newest* window of the transcript is replayed —
+		// see the fn doc. The replay assembly itself (records →
+		// events, sub-agent transcription) is shared with
+		// [`Self::session_history_older`] via [`Self::replay_window`].
+		let limit = max_events.unwrap_or(usize::MAX);
+		let (mut replay_events, _replayed_count, _total_events, window_start) =
+			Self::replay_window(&dir, &summary.id, records, record_timestamps, None, limit, in_flight).await;
+		let has_more = max_events.is_some() && window_start > 0;
+		if has_more {
+			// Tell the phone where the visible window starts in the
+			// full replay's event sequence, so its "load older" call
+			// asks for the slice ending just before it.
+			replay_events.insert(
+				0,
+				CoderEvent::HistoryWindowStart {
+					before_event_ordinal: window_start,
+				},
+			);
 		}
+		// The window was taken over the *full* event stream; the
+		// orphan / usage / terminator events below are appended on
+		// top and always belong to the visible tail, so a windowed
+		// observe still gets them.
 		// Surface every orphan tool call as an errored
 		// `ToolResult` event so the panel flips its row from
 		// "running" to "error". The synthetic JSON content
@@ -3006,7 +3212,7 @@ impl CoderHandle {
 			});
 			None
 		} else {
-			Some((replay_events, in_flight))
+			Some((replay_events, in_flight, has_more))
 		};
 		// Cold-resume an interrupted `ask_user`: spawn a fresh turn
 		// loop whose first iteration re-dispatches the parked prompt.
@@ -4074,6 +4280,30 @@ pub struct ObservedSession {
 	pub summary: SessionSummary,
 	pub events: Vec<CoderEvent>,
 	pub in_flight: bool,
+	/// True when `events` is a *windowed* tail of a longer
+	/// transcript (the observe path was given `max_events` and the
+	/// session had more). The first event is then
+	/// [`CoderEvent::HistoryWindowStart`], whose ordinal resumes the
+	/// pagination. Absent/`false` for a full replay.
+	#[serde(default)]
+	pub has_more: bool,
+}
+
+/// Result of [`Coder::session_history_older`] — the next-older
+/// window of a session's transcript for the companion's upward
+/// pagination. `events` are plain replay events (no terminator /
+/// usage / orphan synthesis — those belong to the tail the initial
+/// observe already shipped); the phone prepends them.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HistoryWindow {
+	pub events: Vec<CoderEvent>,
+	/// True when history older than this window exists.
+	pub has_more: bool,
+	/// The full-sequence ordinal where this window begins — pass as
+	/// `before_event_ordinal` for the next-older page.
+	pub before_event_ordinal: usize,
+	/// Total events in the full transcript (informational).
+	pub total_events: usize,
 }
 
 /// Result of [`Coder::rerun_tool_call`] — the tool that was

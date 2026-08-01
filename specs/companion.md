@@ -210,7 +210,25 @@ requested surface:
   same as the desktop.
 - **Run / steer coder sessions.** Subscribe to `coder:event`,
   render the transcript, `coder_send` (send / steer), `coder_abort`.
-  Session list / open / new reuse the existing `coder_*` commands.
+  Opening a session is **windowed** (`coder_open_session` with
+  `max_events`): only the newest slice of a long transcript is
+  replayed over the WS, so a very long or image-heavy session
+  renders immediately instead of shipping its whole JSONL up front.
+  The backend mounts the runtime from the _full_ record list (the
+  next turn's `messages` stay complete) and inserts a
+  `history_window_start` boundary event carrying the full-sequence
+  ordinal where the window begins; the phone's upward scroll /
+  "Load older" pill then pages earlier history in via
+  `coder_session_history_older(id, before_event_ordinal,
+max_events)`, which replays the slice ending just before that
+  ordinal and prepends it. Session list / new reuse the existing
+  `coder_*` commands. The composer keeps **send available while a
+  turn runs** (the message queues as a steer, same as the desktop);
+  Stop is a separate smaller button. The session title is editable
+  inline from the header (`coder_rename_session`): the backend
+  persists a `TitleUpdate` and broadcasts `session_title_updated`,
+  so the desktop panel and every subscribed phone pick the new
+  title up off the event channel without a refresh.
   Send / abort carry the phone's open `session_id` so they can't
   land in whatever session the desktop happens to have visible.
   Opening a session from the phone is an **observe-open**: the
@@ -271,7 +289,12 @@ requested surface:
   `coder_set_model_settings` — the same read/write payload and
   semantics as the desktop picker (a locked save pins the workspace;
   an unlocked save writes the global default). Provider CRUD and
-  API keys stay desktop-only.
+  API keys stay desktop-only. The same settings payload round-trips
+  the **context-window cap** (`context_window_overrides`): the
+  workspace view edits the cap for the resolved standard model, and
+  since the runner clamps `min(catalog, cap)` at every
+  `CoderModels::context_window` call site, the phone's usage ring
+  and auto-compaction respect it identically to the desktop.
 - **Project switcher.** Inside a workspace, the phone lists the
   bound folders (from `workspace_snapshot`, worktree folders hidden
   — they share their parent's session list per ADR 0028) and scopes

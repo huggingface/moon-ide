@@ -133,10 +133,23 @@ impl BridgeRpcHandler for BridgeRpc {
 				// panel or light background-attention badges.
 				let observed = self
 					.coder
-					.observe_session_in(p.folder.as_deref(), p.id)
+					.observe_session_in(p.folder.as_deref(), p.id, p.max_events)
 					.await
 					.map_err(|e| e.to_string())?;
 				to_value(&observed)
+			}
+			"coder_session_history_older" => {
+				let p: SessionHistoryOlderParams = parse_params(params)?;
+				// Upward pagination: the previous window's
+				// `before_event_ordinal` is this call's exclusive
+				// upper bound. Read-only — mounts nothing, emits
+				// nothing on the desktop's event channel.
+				let window = self
+					.coder
+					.session_history_older(p.folder.as_deref(), p.id, p.before_event_ordinal, p.max_events)
+					.await
+					.map_err(|e| e.to_string())?;
+				to_value(&window)
 			}
 			"coder_send" => {
 				let p: SendParams = parse_params(params)?;
@@ -180,6 +193,19 @@ impl BridgeRpcHandler for BridgeRpc {
 					None => self.coder.abort().await,
 				}
 				Ok(Value::Null)
+			}
+			"coder_rename_session" => {
+				let p: RenameSessionParams = parse_params(params)?;
+				// Persists + broadcasts; the desktop panel and any
+				// observing phone pick the new title up off the event
+				// channel, so the phone doesn't need to patch its own
+				// copy.
+				let summary = self
+					.coder
+					.rename_session_in(p.folder.as_deref(), p.id, p.title)
+					.await
+					.map_err(|e| e.to_string())?;
+				to_value(&summary)
 			}
 			// --- Phase 14: the companion drives sessions fully
 			// (new, delete, answer ask_user prompts). These mirror the
@@ -432,6 +458,33 @@ struct OpenSessionParams {
 	id: String,
 	#[serde(default)]
 	folder: Option<String>,
+	/// Window the replayed transcript to its newest `max_events`
+	/// events. The companion always sets this so a very long session
+	/// (or one with pasted images) doesn't ship its whole history
+	/// over the phone's WS before the first row renders; absent =
+	/// full replay (legacy callers).
+	#[serde(default)]
+	max_events: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct RenameSessionParams {
+	id: String,
+	title: String,
+	#[serde(default)]
+	folder: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct SessionHistoryOlderParams {
+	id: String,
+	#[serde(default)]
+	folder: Option<String>,
+	/// Exclusive upper bound: replay the window ending just before
+	/// this full-sequence ordinal (the `before_event_ordinal` the
+	/// previous window's response carried).
+	before_event_ordinal: usize,
+	max_events: usize,
 }
 
 #[derive(serde::Deserialize)]
@@ -519,6 +572,8 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 	"coder_active_session",
 	"workspace_snapshot",
 	"coder_open_session",
+	"coder_session_history_older",
+	"coder_rename_session",
 	"coder_send",
 	"coder_abort",
 	"coder_new_session",

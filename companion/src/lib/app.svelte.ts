@@ -90,6 +90,15 @@ export type ModelSettings = {
 	active_provider?: string | null;
 	providers: ProviderEntry[];
 	provider_lock?: ProviderLock | null;
+	/** Per-slug context-window caps in tokens (mirror of
+	 * `CoderModelSettings::context_window_overrides`). The runner
+	 * clamps `min(catalog, cap)`, so the usage ring and auto-
+	 * compaction already respect it — this map is how it's edited. */
+	context_window_overrides?: Record<string, number>;
+	/** Effective standard-model slug (runner's fallback chain
+	 * applied) — the model the usage ring / cap editor targets.
+	 * Read-only on the wire. */
+	resolved_standard_model?: string;
 	[key: string]: unknown;
 };
 
@@ -196,6 +205,19 @@ type ObservedSession = {
 	summary: SessionSummary;
 	events?: RawEvent[];
 	in_flight?: boolean;
+	/** True when `events` is the windowed tail of a longer
+	 * transcript; the first event is then a `history_window_start`
+	 * carrying the ordinal to resume pagination from. */
+	has_more?: boolean;
+};
+
+/** Reply shape of `coder_session_history_older` (upward
+ * pagination). `events` are plain replay events to prepend. */
+type HistoryWindow = {
+	events?: RawEvent[];
+	has_more: boolean;
+	before_event_ordinal: number;
+	total_events: number;
 };
 
 // The coder event is an open set on the wire (`CoderEvent`, tagged
@@ -304,6 +326,23 @@ class CompanionState {
 	activeSession = $state<string | null>(null);
 	/** Rendered transcript rows for the active session. */
 	rows = $state<TranscriptRow[]>([]);
+	/** True when the open session has older history on disk beyond
+	 * what `rows` holds (the open was windowed). Drives the "load
+	 * older" affordance. */
+	hasMoreHistory = $state(false);
+	/** Full-sequence ordinal where the currently-loaded window
+	 * begins; the exclusive upper bound for the next older page. */
+	#oldestEventOrdinal = 0;
+	/** True while an older page is being fetched. */
+	loadingOlder = $state(false);
+	/** Rows the most recent older-page fetch prepended — the view
+	 * expands its render window by this so the new rows show. */
+	lastOlderPageRows = $state(0);
+	/** When set, `#onCoderEvent` and its helpers push into this
+	 * array instead of `this.rows` — used to reduce an older-page
+	 * fetch into a throwaway buffer that gets prepended in one
+	 * assignment. */
+	#rowsOverride: TranscriptRow[] | null = null;
 	/** True while the open session's turn is streaming (composer
 	 * shows abort). */
 	busy = $state(false);
@@ -810,6 +849,48 @@ class CompanionState {
 		}
 	}
 
+	/** Context-window cap for the current standard model, in
+	 * tokens, or null when the catalog window is used directly.
+	 * Reads `context_window_overrides[resolved_standard_model]`
+	 * (the runner falls back to the suffix-stripped base too, but
+	 * the phone edits the resolved slug). */
+	get contextCap(): { slug: string; cap: number | null } | null {
+		const s = this.modelSettings;
+		const slug = s?.resolved_standard_model;
+		if (!s || !slug) {
+			return null;
+		}
+		return { slug, cap: s.context_window_overrides?.[slug] ?? null };
+	}
+
+	/** Set or clear the context-window cap for the current standard
+	 * model. `capTokens <= 0` / null clears the override (back to the
+	 * catalog window). Round-trips through `coder_set_model_settings`
+	 * so the desktop picker and the runner both pick it up. */
+	async setContextCap(capTokens: number | null): Promise<void> {
+		const settings = this.modelSettings;
+		const slug = settings?.resolved_standard_model;
+		if (!this.activeWorkspace || !settings || !slug) {
+			return;
+		}
+		this.savingProvider = true;
+		try {
+			const overrides = { ...settings.context_window_overrides };
+			if (capTokens && capTokens > 0) {
+				overrides[slug] = Math.round(capTokens);
+			} else {
+				delete overrides[slug];
+			}
+			const next: ModelSettings = { ...settings, context_window_overrides: overrides };
+			await this.#call(this.activeWorkspace, 'coder_set_model_settings', { settings: next }, this.activeIde);
+			this.modelSettings = next;
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		} finally {
+			this.savingProvider = false;
+		}
+	}
+
 	/** Create a new coder session and show it. The blank session is
 	 * only mounted in memory (nothing on disk until the first send),
 	 * so we deliberately don't `coder_open_session` it — that loads
@@ -894,6 +975,9 @@ class CompanionState {
 		this.busy = false;
 		this.awaitingInput = false;
 		this.pendingPrompt = null;
+		this.hasMoreHistory = false;
+		this.#oldestEventOrdinal = 0;
+		this.loadingOlder = false;
 		this.error = null;
 		try {
 			this.#ensureSubscribed(this.activeWorkspace, this.activeIde);
@@ -903,10 +987,18 @@ class CompanionState {
 		}
 	}
 
+	/** How many events the open / older-page calls ask for. Sized so
+	 * the phone renders quickly (its render window starts at 50
+	 * rows) while one page of scrolling feels instant. */
+	static readonly HISTORY_PAGE_EVENTS = 120;
+
 	/** Observe-open `id` and reduce the returned replay into rows.
 	 * The trailing `turn_complete` terminator clears `busy`; a
 	 * still-streaming background turn re-asserts it via `in_flight`
-	 * (mirrors the desktop's replay handling). */
+	 * (mirrors the desktop's replay handling). The replay is
+	 * windowed (`max_events`) so a long / image-heavy session
+	 * doesn't ship its whole history over the WS up front — the
+	 * `history_window_start` boundary event seeds `hasMoreHistory`. */
 	async #openAndReplay(id: string): Promise<void> {
 		if (!this.activeWorkspace) {
 			return;
@@ -914,7 +1006,7 @@ class CompanionState {
 		const observed = await this.#call<ObservedSession>(
 			this.activeWorkspace,
 			'coder_open_session',
-			{ id, folder: this.activeFolder },
+			{ id, folder: this.activeFolder, max_events: CompanionState.HISTORY_PAGE_EVENTS },
 			this.activeIde,
 		);
 		for (const event of observed.events ?? []) {
@@ -933,12 +1025,83 @@ class CompanionState {
 		}
 	}
 
+	/** Fetch the next-older page of the open session's transcript
+	 * and prepend it. Called by the view when upward scroll has
+	 * exhausted the locally-windowed rows. No-op when there's
+	 * nothing older or a fetch is already in flight. */
+	async loadOlderHistory(): Promise<void> {
+		if (!this.activeWorkspace || !this.activeSession || !this.hasMoreHistory || this.loadingOlder) {
+			return;
+		}
+		const sessionId = this.activeSession;
+		this.loadingOlder = true;
+		try {
+			const page = await this.#call<HistoryWindow>(
+				this.activeWorkspace,
+				'coder_session_history_older',
+				{
+					id: sessionId,
+					folder: this.activeFolder,
+					before_event_ordinal: this.#oldestEventOrdinal,
+					max_events: CompanionState.HISTORY_PAGE_EVENTS,
+				},
+				this.activeIde,
+			);
+			// Reduce the page's events into a throwaway buffer (the
+			// reducer + helpers target `#rowsOverride` while set),
+			// then prepend it in one assignment so the view's window
+			// slice moves once and the scroll anchor holds position.
+			const older: TranscriptRow[] = [];
+			this.#rowsOverride = older;
+			try {
+				for (const event of page.events ?? []) {
+					this.#onCoderEvent({ folder: this.activeFolder ?? '', session_id: sessionId, event }, true);
+				}
+			} finally {
+				this.#rowsOverride = null;
+			}
+			if (older.length > 0) {
+				this.rows = [...older, ...this.rows];
+			}
+			this.lastOlderPageRows = older.length;
+			this.hasMoreHistory = page.has_more;
+			this.#oldestEventOrdinal = page.before_event_ordinal;
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		} finally {
+			this.loadingOlder = false;
+		}
+	}
+
 	closeSession(): void {
 		this.activeSession = null;
 		this.rows = [];
 		this.busy = false;
 		this.awaitingInput = false;
 		this.pendingPrompt = null;
+		this.hasMoreHistory = false;
+		this.#oldestEventOrdinal = 0;
+		this.loadingOlder = false;
+	}
+
+	/** Rename the session the phone has open. The backend persists
+	 * a `TitleUpdate` and broadcasts `session_title_updated`, which
+	 * both the desktop panel and this phone's own subscription apply
+	 * — so the rename propagates to the IDE without a refresh. */
+	async renameSession(title: string): Promise<void> {
+		if (!this.activeWorkspace || !this.activeSession || !title.trim()) {
+			return;
+		}
+		try {
+			await this.#call(
+				this.activeWorkspace,
+				'coder_rename_session',
+				{ id: this.activeSession, title: title.trim(), folder: this.activeFolder },
+				this.activeIde,
+			);
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		}
 	}
 
 	/** Send a prompt to the session the phone has open. Targeted by
@@ -1105,6 +1268,15 @@ class CompanionState {
 		// only a *live* completion is "work finished".
 		const eventSid = envelope.session_id;
 		const eventFolder = envelope.folder || this.activeFolder || '';
+		// Title updates apply to the sessions list (and the open
+		// header, which reads from it) regardless of which session
+		// is active — processed before the active-session filter so
+		// a rename from the desktop, or of a background session,
+		// still lands.
+		if (ev.kind === 'session_title_updated') {
+			this.#updateSessionTitle(str(ev, 'id'), str(ev, 'title'));
+			return;
+		}
 		if (eventSid) {
 			if (ev.kind === 'replay' && bool(ev, 'in_flight')) {
 				this.#markBusy(eventSid, true);
@@ -1150,6 +1322,14 @@ class CompanionState {
 		if (typeof ev.kind !== 'string') {
 			return;
 		}
+		// The windowed-replay boundary event: records where the
+		// visible window starts and flags that older history exists.
+		if (ev.kind === 'history_window_start') {
+			this.hasMoreHistory = true;
+			this.#oldestEventOrdinal = num(ev, 'before_event_ordinal');
+			return;
+		}
+		const rows = this.#rowsOverride ?? this.rows;
 		switch (ev.kind) {
 			case 'user_message': {
 				const msgId = str(ev, 'id');
@@ -1157,12 +1337,12 @@ class CompanionState {
 				// and `steer_drained` already flipped it to
 				// `queued: false`), update it in place instead of
 				// pushing a duplicate.
-				const existing = this.rows.findLast((r) => r.kind === 'user' && r.id === msgId);
+				const existing = rows.findLast((r) => r.kind === 'user' && r.id === msgId);
 				if (existing && existing.kind === 'user') {
 					existing.text = str(ev, 'text');
 					existing.queued = bool(ev, 'queued');
 				} else {
-					this.rows.push({
+					rows.push({
 						kind: 'user',
 						id: msgId,
 						text: str(ev, 'text'),
@@ -1179,7 +1359,7 @@ class CompanionState {
 				// `queued: false` would otherwise re-add it, but
 				// there's a visible gap between removal and re-add).
 				// Idempotent: a duplicate event is a no-op.
-				const row = this.rows.findLast((r) => r.kind === 'user' && r.id === str(ev, 'id'));
+				const row = rows.findLast((r) => r.kind === 'user' && r.id === str(ev, 'id'));
 				if (row && row.kind === 'user') {
 					row.queued = false;
 				}
@@ -1187,7 +1367,7 @@ class CompanionState {
 			}
 			case 'assistant_message_start':
 				this.busy = true;
-				this.rows.push({ kind: 'assistant', id: str(ev, 'id'), text: '', thinking: '' });
+				rows.push({ kind: 'assistant', id: str(ev, 'id'), text: '', thinking: '' });
 				break;
 			case 'assistant_message_delta':
 				this.#appendAssistant(str(ev, 'id'), str(ev, 'delta'), '');
@@ -1210,13 +1390,13 @@ class CompanionState {
 				// `tool_call` for the calls that hadn't started yet. A
 				// second row for the same id would trip the keyed
 				// `{#each}`'s `each_key_duplicate`.
-				const known = this.rows.findLast((r) => (r.kind === 'tool' || r.kind === 'ask_user') && r.id === callId);
+				const known = rows.findLast((r) => (r.kind === 'tool' || r.kind === 'ask_user') && r.id === callId);
 				// ask_user gets its own row kind so the UI can render
 				// the interactive prompt.
 				if (name === 'ask_user') {
 					const questions = parseAskUserArgs(args);
 					if (known?.kind !== 'ask_user') {
-						this.rows.push({
+						rows.push({
 							kind: 'ask_user',
 							id: callId,
 							callId,
@@ -1233,7 +1413,7 @@ class CompanionState {
 				} else if (known?.kind === 'tool') {
 					known.args = argsStr;
 				} else {
-					this.rows.push({
+					rows.push({
 						kind: 'tool',
 						id: callId,
 						name,
@@ -1250,7 +1430,7 @@ class CompanionState {
 				const isError = bool(ev, 'is_error');
 				// If this is the result of an ask_user, clear the
 				// awaitingInput flag.
-				const askRow = this.rows.find((r) => r.kind === 'ask_user' && r.callId === id);
+				const askRow = rows.find((r) => r.kind === 'ask_user' && r.callId === id);
 				if (askRow && askRow.kind === 'ask_user') {
 					this.awaitingInput = false;
 					this.pendingPrompt = null;
@@ -1296,12 +1476,12 @@ class CompanionState {
 					// than appending a new one each time — the coder
 					// emits these frequently during a turn and each
 					// would otherwise become its own transcript row.
-					const existing = this.rows.findLast((r) => r.kind === 'tokens');
+					const existing = rows.findLast((r) => r.kind === 'tokens');
 					if (existing && existing.kind === 'tokens') {
 						existing.total = total;
 						existing.contextWindow = ctx;
 					} else {
-						this.rows.push({
+						rows.push({
 							kind: 'tokens',
 							id: nextRowId('tok'),
 							total,
@@ -1316,7 +1496,7 @@ class CompanionState {
 				const diff = str(ev, 'diff');
 				const fileList = Array.isArray(files) ? files.map(String) : [];
 				if (fileList.length > 0 || diff) {
-					this.rows.push({
+					rows.push({
 						kind: 'diff',
 						id: nextRowId('diff'),
 						files: fileList,
@@ -1326,7 +1506,7 @@ class CompanionState {
 				break;
 			}
 			case 'compaction_started':
-				this.rows.push({
+				rows.push({
 					kind: 'compaction',
 					id: nextRowId('comp'),
 					summary: '',
@@ -1335,7 +1515,7 @@ class CompanionState {
 				break;
 			case 'compaction_complete': {
 				const summary = str(ev, 'summary');
-				const row = this.rows.findLast((r) => r.kind === 'compaction' && !r.done);
+				const row = rows.findLast((r) => r.kind === 'compaction' && !r.done);
 				if (row && row.kind === 'compaction') {
 					row.summary = summary;
 					row.done = true;
@@ -1343,7 +1523,7 @@ class CompanionState {
 				break;
 			}
 			case 'subagent_spawned':
-				this.rows.push({
+				rows.push({
 					kind: 'subagent',
 					id: `sub-${str(ev, 'subagent_id')}`,
 					subagentId: str(ev, 'subagent_id'),
@@ -1353,7 +1533,7 @@ class CompanionState {
 				break;
 			case 'subagent_finished': {
 				const sid = str(ev, 'subagent_id');
-				const row = this.rows.findLast((r) => r.kind === 'subagent' && r.subagentId === sid);
+				const row = rows.findLast((r) => r.kind === 'subagent' && r.subagentId === sid);
 				if (row && row.kind === 'subagent') {
 					row.finished = true;
 				}
@@ -1383,26 +1563,28 @@ class CompanionState {
 	}
 
 	#appendAssistant(id: string, delta: string, thinkingDelta: string): void {
+		const rows = this.#rowsOverride ?? this.rows;
 		// If id is empty, it's a thinking delta — append to the last
 		// assistant row's thinking field.
 		if (!id) {
-			const row = this.rows.findLast((r) => r.kind === 'assistant');
+			const row = rows.findLast((r) => r.kind === 'assistant');
 			if (row && row.kind === 'assistant') {
 				row.thinking += thinkingDelta;
 			}
 			return;
 		}
-		const row = this.rows.find((r) => r.kind === 'assistant' && r.id === id);
+		const row = rows.find((r) => r.kind === 'assistant' && r.id === id);
 		if (row && row.kind === 'assistant') {
 			row.text += delta;
 			row.thinking += thinkingDelta;
 		} else {
-			this.rows.push({ kind: 'assistant', id, text: delta, thinking: thinkingDelta });
+			rows.push({ kind: 'assistant', id, text: delta, thinking: thinkingDelta });
 		}
 	}
 
 	#setAssistant(id: string, text: string, thinking: string): void {
-		const row = this.rows.find((r) => r.kind === 'assistant' && r.id === id);
+		const rows = this.#rowsOverride ?? this.rows;
+		const row = rows.find((r) => r.kind === 'assistant' && r.id === id);
 		if (row && row.kind === 'assistant') {
 			row.text = text;
 			if (thinking) {
@@ -1412,7 +1594,8 @@ class CompanionState {
 	}
 
 	#setToolResult(id: string, result: string, status: 'done' | 'error', images: ToolImage[] = []): void {
-		const row = this.rows.find((r) => r.kind === 'tool' && r.id === id);
+		const rows = this.#rowsOverride ?? this.rows;
+		const row = rows.find((r) => r.kind === 'tool' && r.id === id);
 		if (row && row.kind === 'tool') {
 			row.result = result;
 			row.images = images;
