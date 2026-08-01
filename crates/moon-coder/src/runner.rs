@@ -1332,6 +1332,33 @@ impl CoderHandle {
 		})
 	}
 
+	/// Session ids in `folder` (or the active folder when `folder`
+	/// is `None`) that currently have a turn in flight — the set
+	/// the companion's session list lights its "running" pip from.
+	/// The phone seeds this on workspace open / refresh: its pip is
+	/// otherwise purely event-driven, so sessions already running
+	/// when the phone subscribes (or a queued steer that never
+	/// emitted a live `user_message`) would never light.
+	pub async fn running_sessions_in(&self, folder: Option<&str>) -> Vec<String> {
+		let Ok((fs, _)) = self.state.folder_session_or_active(folder).await else {
+			return Vec::new();
+		};
+		let runtimes: Vec<(String, Arc<SessionRuntime>)> = fs
+			.runtimes
+			.read()
+			.await
+			.iter()
+			.map(|(k, v)| (k.clone(), v.clone()))
+			.collect();
+		let mut running = Vec::new();
+		for (id, rt) in runtimes {
+			if rt.turn.lock().await.cancel.is_some() {
+				running.push(id);
+			}
+		}
+		running
+	}
+
 	/// Returns the cached "Bound folders" description for `folder`
 	/// when one exists and is still in sync with the on-disk
 	/// manifests. `None` when the cache is cold or stale —

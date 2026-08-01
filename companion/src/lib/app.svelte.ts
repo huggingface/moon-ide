@@ -578,6 +578,7 @@ class CompanionState {
 			this.#ensureSubscribed(workspace, ide);
 			void this.#loadModelSettings();
 			void this.loadScmStatus();
+			void this.#loadRunningSessions();
 			this.sessions = await this.#loadSessions();
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
@@ -609,6 +610,7 @@ class CompanionState {
 		try {
 			this.sessions = await this.#loadSessions();
 			void this.loadScmStatus();
+			void this.#loadRunningSessions();
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
 		} finally {
@@ -1251,6 +1253,29 @@ class CompanionState {
 		}
 	}
 
+	/** Seed the session list's "running" pips from the backend's
+	 * authoritative set. The pip is otherwise event-driven and
+	 * misses sessions already in flight when the phone subscribes,
+	 * and queued steers (which emit no live `user_message`). Called
+	 * on workspace open and each folder's session-list refresh. */
+	async #loadRunningSessions(): Promise<void> {
+		if (!this.activeWorkspace) {
+			return;
+		}
+		try {
+			const running = await this.#call<string[]>(
+				this.activeWorkspace,
+				'coder_running_sessions',
+				{ folder: this.activeFolder },
+				this.activeIde,
+			);
+			this.busySessions = new Set(running);
+		} catch {
+			// An IDE build that predates the method leaves the pip
+			// event-driven (degrades to the old behaviour).
+		}
+	}
+
 	#onCoderEvent(raw: unknown, fromReplay = false): void {
 		// eslint-disable-next-line typescript-eslint/no-unsafe-type-assertion
 		const envelope = (raw ?? {}) as CoderEventEnvelope;
@@ -1263,11 +1288,11 @@ class CompanionState {
 		// running pip and the project chips' folder pips).
 		// Processed for *all* sessions before the active-session
 		// filter below, so a background session's pip stays lit
-		// while the user browses the list. The replay batch's
-		// `in_flight` flag also counts. Replayed historical events
-		// still toggle busy (net no-op: each user_message pairs
-		// with its turn_complete) but never flag folder attention —
-		// only a *live* completion is "work finished".
+		// while the user browses the list. The set is seeded from
+		// the backend on load and then kept current by *live*
+		// events; replay only asserts it via the batch's `in_flight`
+		// flag. A live completion in another folder lights that
+		// project chip's "finished" dot — a replayed one never does.
 		const eventSid = envelope.session_id;
 		const eventFolder = envelope.folder || this.activeFolder || '';
 		// Title updates apply to the sessions list (and the open
@@ -1279,11 +1304,18 @@ class CompanionState {
 			this.#updateSessionTitle(str(ev, 'id'), str(ev, 'title'));
 			return;
 		}
+		// Don't let a *replayed* user_message / turn flip the pip:
+		// a windowed replay pairs its user_message with a trailing
+		// turn_complete terminator, so a settled session nets out —
+		// but a queued steer replays a user_message with no
+		// terminator, and would leave the pip stuck on. The pip is
+		// driven by live events + the backend-seeded set; replay
+		// only lights it via the batch's `in_flight` flag.
 		if (eventSid) {
 			if (ev.kind === 'replay' && bool(ev, 'in_flight')) {
 				this.#markBusy(eventSid, true);
 				this.#sessionFolder.set(eventSid, eventFolder);
-			} else if (ev.kind === 'user_message') {
+			} else if (!fromReplay && ev.kind === 'user_message') {
 				this.#markBusy(eventSid, true);
 				this.#sessionFolder.set(eventSid, eventFolder);
 			} else if (ev.kind === 'turn_complete' || ev.kind === 'aborted' || ev.kind === 'error') {

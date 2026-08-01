@@ -108,6 +108,14 @@ impl BridgeRpcHandler for BridgeRpc {
 					.map_err(|e| e.to_string())?;
 				to_value(&sessions)
 			}
+			"coder_running_sessions" => {
+				let p: FolderParams = parse_params(params)?;
+				// Seed for the phone's session-list "running" pip —
+				// the pip is otherwise event-driven and misses
+				// sessions already in flight at subscribe time.
+				let running = self.coder.running_sessions_in(p.folder.as_deref()).await;
+				to_value(&running)
+			}
 			"coder_active_session" => {
 				let active = self.coder.active_session().await;
 				to_value(&active)
@@ -569,6 +577,7 @@ fn to_value<T: serde::Serialize>(value: &T) -> Result<Value, String> {
 pub const SUPPORTED_METHODS: &[&str] = &[
 	"coder_status",
 	"coder_list_sessions",
+	"coder_running_sessions",
 	"coder_active_session",
 	"workspace_snapshot",
 	"coder_open_session",

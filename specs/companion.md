@@ -228,7 +228,15 @@ max_events)`, which replays the slice ending just before that
   inline from the header (`coder_rename_session`): the backend
   persists a `TitleUpdate` and broadcasts `session_title_updated`,
   so the desktop panel and every subscribed phone pick the new
-  title up off the event channel without a refresh.
+  title up off the event channel without a refresh. The session
+  list's **"running" pip is seeded from the backend**
+  (`coder_running_sessions`) on workspace open and each folder's
+  session-list refresh — it's otherwise event-driven and would
+  miss sessions already in flight at subscribe time or a queued
+  steer (which emits no live `user_message`) — then kept current
+  by live events; a replayed `user_message` never flips it (a
+  windowed replay pairs it with a trailing `turn_complete`, but a
+  queued steer has no terminator).
   Send / abort carry the phone's open `session_id` so they can't
   land in whatever session the desktop happens to have visible.
   Opening a session from the phone is an **observe-open**: the
