@@ -7,7 +7,9 @@
 # prebuilt from the git-core PPA — for relative-path worktrees, ADR
 # 0029), rustup with the stable toolchain, bun, the polyglot CLIs we
 # use across most repos in the org (gh, uv, hf) plus comfort tooling
-# (ripgrep, fzf, bat, jq), and a non-root `dev` user with passwordless
+# (ripgrep, fzf, bat, jq), a Playwright browser runtime for the
+# coder's MCP preset (system deps + one pre-installed chromium,
+# ADR 0033), and a non-root `dev` user with passwordless
 # sudo. The container runs unprivileged with the default Docker
 # capability set; project services come up as siblings on the
 # host's daemon via compose `include:` rather than nested inside
@@ -350,6 +352,66 @@ RUN curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused \
  && install -D -m 0755 "/tmp/linux-${TARGETARCH}/helm" "${HOME}/.local/bin/helm" \
  && rm -rf /tmp/helm.tar.gz "/tmp/linux-${TARGETARCH}" \
  && helm version
+
+# Playwright browser runtime for the coder's playwright MCP preset
+# (ADR 0033). Two halves:
+#
+# 1. System deps. The MCP server hard-gates every browser launch on
+#    its own system-dependency check (it runs playwright's
+#    `validateDependenciesLinux` at startup; a failure is not cached,
+#    so the first call also reports the browser as "not installed").
+#    A user-space `LD_LIBRARY_PATH` fix can't help: the server spawns
+#    via `docker exec`, which reads neither `.bashrc` nor profile
+#    files. So the deps have to be real system packages. The list is
+#    playwright's own `install-deps chromium` set for bookworm —
+#    mostly X libs (the headed binary's link deps apply to headless
+#    too), CJK/emoji fonts (page rendering without them produces
+#    tofu screenshots), and xvfb (playwright wraps headed launches in
+#    it when there's no X display; harmless for `--headless`).
+# 2. A pre-installed browser revision. `~/.cache/ms-playwright` is
+#    container-private, so every fresh workspace container otherwise
+#    pays a ~170 MB download on first `mcp_call` — and the MCP
+#    dep-check's "not installed" error message sends the model off
+#    re-downloading it anyway. The revision must match the MCP
+#    server's own playwright dependency (`--browser chromium`
+#    resolves to the `chrome-for-testing` channel alias, whose
+#    executable the registry looks up at *its* chromium revision —
+#    a browser installed by any other playwright version is
+#    invisible to it). So we ask npm for `@playwright/mcp@latest`'s
+#    playwright version and install with exactly that. The image's
+#    normal rebuild cadence keeps the pair current; a project
+#    pinning a different playwright keeps working — its revision
+#    just downloads on demand as before.
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        fonts-freefont-ttf \
+        fonts-ipafont-gothic \
+        fonts-liberation \
+        fonts-noto-color-emoji \
+        fonts-tlwg-loma-otf \
+        fonts-unifont \
+        fonts-wqy-zenhei \
+        libfontenc1 \
+        libnss3 \
+        libnspr4 \
+        libxaw7 \
+        libxfont2 \
+        libxkbfile1 \
+        libxmu6 \
+        libxpm4 \
+        libxt6 \
+        x11-xkb-utils \
+        xfonts-encodings \
+        xfonts-scalable \
+        xfonts-utils \
+        xserver-common \
+        xvfb \
+ && rm -rf /var/lib/apt/lists/*
+USER ${USERNAME}
+RUN PLAYWRIGHT_VERSION="$(npm view @playwright/mcp@latest dependencies.playwright)" \
+ && echo "playwright MCP's playwright: ${PLAYWRIGHT_VERSION}" \
+ && npx -y "playwright@${PLAYWRIGHT_VERSION}" install chromium
 
 # moon-edit — the in-container `$GIT_EDITOR` shim that forwards
 # `git commit --amend` (and any other editor-spawning command)

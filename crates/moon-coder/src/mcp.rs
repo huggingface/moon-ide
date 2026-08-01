@@ -65,6 +65,7 @@ pub fn preset_servers() -> Vec<McpServerConfig> {
 			// container.
 			"--headless".into(),
 		],
+		env: Default::default(),
 		// No `--output-dir`: artefacts land in the server's own
 		// default, `<roots[0]>/.playwright-mcp`, which the `roots`
 		// capability makes deterministic (see ADR 0033). The
@@ -427,21 +428,21 @@ impl McpConnection {
 		let mut command = match &target.kind {
 			McpSpawnKind::Host { cwd } => {
 				let mut command = tokio::process::Command::new(&config.command);
-				command.args(&config.args).current_dir(cwd);
+				command.args(&config.args).current_dir(cwd).envs(&config.env);
 				command
 			}
 			// `-i` keeps stdin open — that *is* the transport.
 			// No `-t`: a TTY would garble the JSON framing.
 			McpSpawnKind::Container { name, cwd } => {
 				let mut command = tokio::process::Command::new("docker");
-				command
-					.arg("exec")
-					.arg("-i")
-					.arg("-w")
-					.arg(cwd)
-					.arg(name)
-					.arg(&config.command)
-					.args(&config.args);
+				command.arg("exec").arg("-i").arg("-w").arg(cwd);
+				// `docker exec` inherits the container's image env only
+				// (no login shell, no .bashrc), so per-server env has to
+				// ride on the exec call itself.
+				for (key, value) in &config.env {
+					command.arg("-e").arg(format!("{key}={value}"));
+				}
+				command.arg(name).arg(&config.command).args(&config.args);
 				command
 			}
 		};

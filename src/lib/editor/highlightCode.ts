@@ -54,6 +54,10 @@ const LOADERS: Record<string, () => Promise<Parser>> = {
 	rust: async () => (await import('@codemirror/lang-rust')).rustLanguage.parser,
 	go: async () => (await import('@codemirror/lang-go')).goLanguage.parser,
 	python: async () => (await import('@codemirror/lang-python')).pythonLanguage.parser,
+	dart: async () => {
+		const { dart } = await import('@codemirror/legacy-modes/mode/clike');
+		return StreamLanguage.define(dart).parser;
+	},
 	toml: async () => {
 		const { toml } = await import('@codemirror/legacy-modes/mode/toml');
 		return StreamLanguage.define(toml).parser;

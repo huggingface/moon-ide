@@ -531,10 +531,15 @@ the workspace has no enabled servers, and neither is mode-gated
   (`npx -y @playwright/mcp@latest --browser chromium --headless`
   — pinned to Playwright's bundled Chromium so it doesn't require
   real Google Chrome; headless because the coder drives via
-  snapshots, not a window on the dev's display). Custom servers —
-  label, command + args (stdio transport only), description —
-  live per workspace on `WorkspaceSession.coder_mcp`, managed from
-  the model-settings modal's "MCP servers" section via the
+  snapshots, not a window on the dev's display). The browser's
+  system dependencies and a chromium revision (matched to the
+  MCP server's own playwright version) ship in moon-base — the
+  MCP server hard-gates launches on its own dep check, which no
+  user-space env fix can reach through `docker exec` (ADR 0033).
+  Custom servers — label, command + args (stdio transport
+  only), per-server env overrides, description — live per
+  workspace on `WorkspaceSession.coder_mcp`, managed from the
+  model-settings modal's "MCP servers" section via the
   `coder_mcp_*` commands.
 - **Per-workspace enable set**, following the provider-lock
   precedent. Toggles write through immediately; the next turn's

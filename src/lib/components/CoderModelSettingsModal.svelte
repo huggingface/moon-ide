@@ -175,11 +175,31 @@
 	type McpDraft = {
 		label: string;
 		commandLine: string;
+		envLines: string;
 		description: string;
 	};
 	let mcpDraft = $state<McpDraft | null>(null);
 	let mcpBusy = $state(false);
 	let mcpError = $state<string | null>(null);
+
+	// One `KEY=VALUE` per line; blank lines ignored. Anything
+	// without an `=` is a user error worth surfacing — silently
+	// dropping it would misconfigure the server.
+	function parseEnvLines(raw: string): Record<string, string> {
+		const env: Record<string, string> = {};
+		for (const line of raw.split('\n')) {
+			const trimmed = line.trim();
+			if (trimmed.length === 0) {
+				continue;
+			}
+			const eq = trimmed.indexOf('=');
+			if (eq <= 0) {
+				throw new Error(`env line "${trimmed}" is not KEY=VALUE`);
+			}
+			env[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1).trim();
+		}
+		return env;
+	}
 
 	async function onToggleMcp(id: string, enabled: boolean): Promise<void> {
 		mcpError = null;
@@ -207,6 +227,7 @@
 				label: mcpDraft.label.trim(),
 				command,
 				args: tokens.slice(1),
+				env: parseEnvLines(mcpDraft.envLines),
 				description: mcpDraft.description.trim(),
 			});
 			mcpDraft = null;
@@ -1593,7 +1614,7 @@
 							class="secondary"
 							disabled={workspace.workspaceName === null || mcpBusy}
 							onclick={() => {
-								mcpDraft = { label: '', commandLine: '', description: '' };
+								mcpDraft = { label: '', commandLine: '', envLines: '', description: '' };
 								mcpError = null;
 							}}
 						>
@@ -1634,6 +1655,13 @@
 							type="text"
 							bind:value={mcpDraft.description}
 							placeholder="One sentence for the model: what is this server good for?"
+							spellcheck="false"
+							disabled={mcpBusy}
+						/>
+						<input
+							type="text"
+							bind:value={mcpDraft.envLines}
+							placeholder="Extra env (optional), KEY=VALUE"
 							spellcheck="false"
 							disabled={mcpBusy}
 						/>

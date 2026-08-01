@@ -445,8 +445,13 @@ export const ipc = {
 		hubSessionUrl: (sessionId: string) => invoke<string>('coder_hub_session_url', { sessionId }),
 		mcpServers: () => invoke<McpServerStatus[]>('coder_mcp_servers'),
 		mcpSetEnabled: (id: string, enabled: boolean) => invoke<void>('coder_mcp_set_enabled', { id, enabled }),
-		mcpAddCustom: (server: { label: string; command: string; args: string[]; description: string }) =>
-			invoke<McpServerStatus[]>('coder_mcp_add_custom', { server }),
+		mcpAddCustom: (server: {
+			label: string;
+			command: string;
+			args: string[];
+			env: Record<string, string>;
+			description: string;
+		}) => invoke<McpServerStatus[]>('coder_mcp_add_custom', { server }),
 		mcpRemoveCustom: (id: string) => invoke<McpServerStatus[]>('coder_mcp_remove_custom', { id }),
 	},
 	ui: {

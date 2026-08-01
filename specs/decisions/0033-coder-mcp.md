@@ -181,3 +181,70 @@ already in use … use --isolated`), which costs more than the
   reply instead of silence, so a server waiting on one can't
   hang. `listChanged: false`: roots are read at handshake, and a
   bound-folder change mid-session is covered by respawning.
+
+## Amendment 2026-08-01 (4) — the browser belongs to the image
+
+Observed failure: a fresh workspace container left the playwright
+preset unusable, and the failure mode actively misled the model.
+Root causes, in the order they surfaced:
+
+1. **The MCP server's startup dep check hard-fails every browser
+   launch when system libs are missing, and writes no
+   `DEPENDENCIES_VALIDATED` marker on failure.** Every call then
+   re-reports the browser as "not installed" — even with
+   `~/.cache/ms-playwright/chromium-*` fully populated — sending
+   the model into an install/retry loop (`install-browser`,
+   succeed, launch, fail, repeat).
+2. **moon-base had quietly lost the browser system libs.** The
+   deps (`libnss3`, X libs, fonts) previously arrived transitively
+   via the WebKitGTK build packages in the same apt layer; the
+   image never declared them for playwright's sake. Slimming the
+   layer dropped them. Workspaces whose containers predated the
+   slimming kept working — the coder had installed playwright's
+   dep list into those containers' filesystems by hand — which
+   made the breakage look workspace-specific and non-obvious to
+   diagnose.
+3. **No env escape hatch.** `docker exec` reads neither `.bashrc`
+   nor profile files, and the MCP client passed no per-server
+   env. The model found the correct fix (user-local
+   `LD_LIBRARY_PATH`) and still couldn't apply it to a running
+   server.
+4. **The browser revision must match the MCP server's own
+   playwright.** `--browser chromium` resolves to the
+   `chrome-for-testing` channel (renamed upstream in 0.0.78); at
+   launch the registry looks the executable up at the server's
+   pinned chromium revision. A browser installed by any other
+   playwright version — including `playwright@latest`, which had
+   already moved one revision ahead of the MCP's pinned
+   `1.62.0-alpha` — is invisible to it, and the "not installed"
+   error gives no hint that revisions are the mismatch.
+
+Decisions:
+
+- **Playwright's `install-deps chromium` package set and a
+  pre-installed chromium revision are moon-base's job now**
+  (`images/moon-base/Dockerfile`), not the session's. The image
+  is where "a browser that launches" is guaranteed; per-container
+  downloads and apt runs were only ever paying for the image's
+  omission. The Dockerfile derives the browser install from the
+  MCP package itself at build time (`npm view
+@playwright/mcp@latest dependencies.playwright` feeds `npx
+playwright@<that> install chromium`), so the pair can't drift
+  apart again (cause 4). A project pinning a different playwright
+  keeps working — its revision downloads on demand as before.
+- **`McpServerConfig.env` (string map) exists as the escape
+  hatch**, threaded onto `docker exec -e` for container spawns
+  and `Command::envs` for host spawns. Empty for presets; custom
+  servers need it for config the server reads from env. This is
+  for the _next_ server with env-shaped config — playwright
+  itself needs nothing now that the image carries its deps.
+- **The preset keeps `@playwright/mcp@latest`, unpinned.**
+  Pinning buys reproducibility against upstream behaviour changes
+  (the `--browser chromium` flag's meaning moved to the
+  `chrome-for-testing` channel alias in 0.0.78 — harmless once
+  the alias resolves to the same bundled chromium, but the kind
+  of drift a pin would have hidden) at the cost of shipping a
+  stale server against a moving protocol. The server's own
+  npx-cache behaviour already means "latest" resolves per
+  container, not per moon-ide release; a pin would add a third
+  version source to reason about without stopping that.

@@ -402,6 +402,18 @@ export async function languageFor(filename: string, firstLine?: string): Promise
 			const { python } = await import('@codemirror/lang-python');
 			return [python()];
 		}
+		case 'dart': {
+			// No `@lezer/dart` grammar exists upstream. The CM5 legacy
+			// mode is exported from `clike` (same upstream file, so it
+			// ships inside `@codemirror/legacy-modes` — no new dep).
+			// It handles Dart's `$` / `${}` string interpolation,
+			// `r'…'` raw strings, triple-quoted strings, and `@`
+			// annotations, which is what actually makes Dart readable —
+			// a plain keyword-and-string clike would mis-highlight the
+			// moment a string interpolates.
+			const { dart } = await import('@codemirror/legacy-modes/mode/clike');
+			return [StreamLanguage.define(dart)];
+		}
 		case 'toml': {
 			const { toml } = await import('@codemirror/legacy-modes/mode/toml');
 			return [StreamLanguage.define(toml)];

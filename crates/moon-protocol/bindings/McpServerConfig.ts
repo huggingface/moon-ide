@@ -31,6 +31,15 @@ command: string,
  */
 args: Array<string>, 
 /**
+ * Extra environment for the server process, applied over the
+ * spawn environment (host env for a host spawn, the
+ * container's `docker exec` env otherwise). Empty for every
+ * preset; custom servers use it for config the server reads
+ * from env (`LD_LIBRARY_PATH`-style workarounds, tokens,
+ * feature flags).
+ */
+env: { [key in string]: string }, 
+/**
  * 1-2 sentences surfaced to the model in the meta-tool
  * descriptions so it knows when the server is worth a
  * `mcp_list_tools` round-trip.

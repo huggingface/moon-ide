@@ -9,6 +9,7 @@
 //! [`crate::session::WorkspaceSession::coder_mcp`].
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use ts_rs::TS;
 
 /// One MCP server definition — either a hardcoded preset
@@ -34,6 +35,14 @@ pub struct McpServerConfig {
 	pub command: String,
 	/// Arguments passed verbatim.
 	pub args: Vec<String>,
+	/// Extra environment for the server process, applied over the
+	/// spawn environment (host env for a host spawn, the
+	/// container's `docker exec` env otherwise). Empty for every
+	/// preset; custom servers use it for config the server reads
+	/// from env (`LD_LIBRARY_PATH`-style workarounds, tokens,
+	/// feature flags).
+	#[serde(skip_serializing_if = "BTreeMap::is_empty")]
+	pub env: BTreeMap<String, String>,
 	/// 1-2 sentences surfaced to the model in the meta-tool
 	/// descriptions so it knows when the server is worth a
 	/// `mcp_list_tools` round-trip.

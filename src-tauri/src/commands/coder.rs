@@ -1579,6 +1579,8 @@ pub struct AddMcpServerArgs {
 	#[serde(default)]
 	pub args: Vec<String>,
 	#[serde(default)]
+	pub env: std::collections::BTreeMap<String, String>,
+	#[serde(default)]
 	pub description: String,
 }
 
@@ -1599,6 +1601,7 @@ pub async fn coder_mcp_add_custom(
 		label: server.label.trim().to_string(),
 		command: server.command.trim().to_string(),
 		args: server.args,
+		env: server.env,
 		description: server.description.trim().to_string(),
 	};
 	moon_coder::mcp::validate_custom(&config)?;
