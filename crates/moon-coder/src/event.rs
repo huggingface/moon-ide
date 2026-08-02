@@ -53,12 +53,16 @@ pub enum CoderEvent {
 	///
 	/// `queued: true` marks a steer that arrived while a turn was
 	/// already running and is now sitting in the pending-steers
-	/// queue, *not yet* in `session.messages`. The runner flips
-	/// the state by emitting a matching [`SteerDrained`] event the
-	/// moment the steer is moved into the chat at the top of the
-	/// next iteration. The UI uses the flag to render the row in
-	/// a muted "queued" style and to know whether
-	/// `coder_unqueue_steer` can still pop it back into the
+	/// queue, *not yet* in `session.messages`. It renders as a
+	/// provisional muted bubble parked at the position where the
+	/// user sent it. The moment the steer is moved into the chat
+	/// at the top of the next iteration, the runner emits a
+	/// matching [`SteerDrained`] (which removes that placeholder)
+	/// followed by a fresh `UserMessage { queued: false }` that
+	/// re-inserts the message at the **bottom** of the transcript
+	/// — where it actually lands in history, after the answer
+	/// that was already streaming. Until then the flag tells the
+	/// UI `coder_unqueue_steer` can still pop it back into the
 	/// composer.
 	UserMessage {
 		id: String,
@@ -76,10 +80,13 @@ pub enum CoderEvent {
 		created_at_ms: Option<i64>,
 	},
 
-	/// A previously-queued steer has been drained into the chat
-	/// (or unqueued / aborted away — same effect from the UI's
-	/// point of view). Carries the original [`UserMessage::id`] so
-	/// the panel can flip the matching row out of "queued" mode.
+	/// A previously-queued steer has left the provisional queue —
+	/// drained into the chat, unqueued back to the composer, or
+	/// aborted away. Carries the original [`UserMessage::id`] of
+	/// the placeholder row so the panel **removes** it. On a real
+	/// drain this is immediately followed by a fresh
+	/// [`UserMessage`] (`queued: false`, new id) appended at the
+	/// bottom of the transcript; on an un-queue nothing follows.
 	SteerDrained { id: String },
 
 	/// A new assistant message bubble has started in the current

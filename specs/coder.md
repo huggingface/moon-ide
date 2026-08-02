@@ -69,7 +69,10 @@ Three control surfaces:
 
 - **Abort** (`Esc`): cancels the in-flight HTTP / SSE / tool call.
   The session keeps the partial assistant message and completed tool
-  calls. Aborting drops any queued steers. The cancel token is raced
+  calls. A queued steer is **not** dropped — the spawn loop's
+  `Err(Aborted)` branch sees the still-pending steer and loops back
+  to drain it into a fresh turn (use `Ctrl+Up` to un-queue instead).
+  The cancel token is raced
   against _every_ network await in a turn — route resolution (which
   may trigger an OAuth token refresh), the HTTP send, the SSE read
   loop, and the 401-retry refresh — so Esc lands immediately
@@ -77,16 +80,31 @@ Three control surfaces:
   clients also carry a connect timeout so a black-holed endpoint
   can't park a turn even if nobody clicks stop.
 - **Steer** (Enter while streaming / running tools): the composer
-  stays editable mid-turn. The message is queued, shows up in the
-  transcript immediately as a muted "queued" row, and the running
-  loop drains the queue before its next LLM call — including one
-  extra round-trip when a steer arrives during the final assistant
-  message. Steers are persisted at drain time (the chat-completions
-  shape forbids a user message between an assistant `tool_calls` and
-  its results). Until then the queue lives on the session runtime,
-  which outlives a session switch and a folder switch — so a reopen
-  replays the undrained steers (queued rows, same ids) on top of the
-  disk-driven transcript. Only a process restart loses them.
+  stays editable mid-turn. The message is queued and shows up
+  immediately as a muted "queued" placeholder bubble, parked at the
+  position where it was sent. The running loop drains the queue
+  before its next LLM call — including one extra round-trip when a
+  steer arrives during the final assistant message. Steers are
+  persisted at drain time (the chat-completions shape forbids a user
+  message between an assistant `tool_calls` and its results).
+  **Drained steers land at the bottom of the transcript, not where
+  they were parked.** A steer typed mid-turn is sent before the
+  answer that was still streaming, but the model never saw it when
+  producing that answer — so parking the bubble there would
+  misrepresent causality. On drain the runner removes the
+  placeholder (`SteerDrained { id }`) and re-appends the message as
+  a fresh `UserMessage { queued: false, new id, drain-time ts }` at
+  the end of the transcript, matching where it lands in
+  `session.messages` and in the JSONL (after the in-flight answer).
+  The queued placeholder is thus purely provisional; the revert
+  ordinal counts only non-queued user rows, so removal is
+  ordinal-neutral. An **un-queue** (`Ctrl+Up`) is the one case where
+  `SteerDrained` is _not_ followed by a re-append — the message went
+  back into the composer. Until drained, the queue lives on the
+  session runtime, which outlives a session switch and a folder
+  switch — so a reopen replays the undrained steers (queued rows,
+  same ids) on top of the disk-driven transcript. Only a process
+  restart loses them.
 - **Go now** (a "go now" button on the queued row): the user typed a
   steer mid-turn but doesn't want to wait for the running turn to
   settle. Cancels the current turn (like abort) and lets the spawn
@@ -1411,11 +1429,12 @@ behaviours keyed off the run state:
 - **Running → mid-flight steer.** Same contract as parent steers:
   the row renders queued immediately, drains into the sub-agent's
   history at the top of its next iteration (persisting at drain
-  time and flipping via `SteerDrained`), and a steer that lands
-  during the final assistant message buys one extra round-trip
-  instead of being dropped. Steers still queued when the run
-  settles are discarded (their rows are removed on
-  `SubagentFinished`).
+  time — the placeholder is removed via `SteerDrained` and the
+  message re-appended at the bottom as a fresh `UserMessage`, same
+  as the parent loop), and a steer that lands during the final
+  assistant message buys one extra round-trip instead of being
+  dropped. Steers still queued when the run settles are discarded
+  (their rows are removed on `SubagentFinished`).
 - **Finished → follow-up.** The sub-agent resumes: history is
   rebuilt from its JSONL, the text lands as a new user message, and
   a fresh detached loop runs against the same target folder and

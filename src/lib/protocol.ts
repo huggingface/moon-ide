@@ -1631,11 +1631,15 @@ export type CoderEvent =
 			text: string;
 			images?: ImageAttachmentPayload[];
 			/** `true` when this message is a steer the user sent
-			 *  while a turn was already running; it now sits in the
-			 *  runner's pending-steers queue and hasn't been drained
-			 *  into `messages` yet. The matching `steer_drained`
-			 *  event arrives the moment the runner moves it into
-			 *  the chat. Defaults to `false` (every non-steer
+			 *  while a turn was already running; it sits in the
+			 *  runner's pending-steers queue as a provisional
+			 *  bubble parked at the send position, not yet in
+			 *  `messages`. When the runner drains it into the chat,
+			 *  a matching `steer_drained` removes the placeholder
+			 *  and a fresh `user_message` (`queued: false`, new id)
+			 *  re-appends the real message at the bottom of the
+			 *  transcript — after the answer that was already
+			 *  streaming. Defaults to `false` (every non-steer
 			 *  message). */
 			queued?: boolean;
 			/** Unix-ms creation time. Stamped `now` on a live turn,
@@ -1644,6 +1648,11 @@ export type CoderEvent =
 			 *  for pre-timestamp sessions. */
 			created_at_ms?: number | null;
 	  }
+	/** A queued steer left the provisional queue (drained into the
+	 *  chat, unqueued back to the composer, or aborted away). Remove
+	 *  the placeholder row carrying this id. On a real drain a fresh
+	 *  `user_message` follows immediately; on an un-queue nothing
+	 *  does. */
 	| { kind: 'steer_drained'; id: string }
 	| { kind: 'assistant_message_start'; id: string }
 	| { kind: 'assistant_message_delta'; id: string; delta: string }

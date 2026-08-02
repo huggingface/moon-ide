@@ -1374,36 +1374,26 @@ class CompanionState {
 		const rows = this.#rowsOverride ?? this.rows;
 		switch (ev.kind) {
 			case 'user_message': {
-				const msgId = str(ev, 'id');
-				// If the row already exists (the message was queued
-				// and `steer_drained` already flipped it to
-				// `queued: false`), update it in place instead of
-				// pushing a duplicate.
-				const existing = rows.findLast((r) => r.kind === 'user' && r.id === msgId);
-				if (existing && existing.kind === 'user') {
-					existing.text = str(ev, 'text');
-					existing.queued = bool(ev, 'queued');
-				} else {
-					rows.push({
-						kind: 'user',
-						id: msgId,
-						text: str(ev, 'text'),
-						queued: bool(ev, 'queued'),
-					});
-				}
+				// A queued steer arrives as a provisional bubble; a
+				// drained one arrives as a fresh `queued: false` message
+				// (new id) appended at the bottom. Either way it's a
+				// plain append — ids never collide with an existing row.
+				rows.push({
+					kind: 'user',
+					id: str(ev, 'id'),
+					text: str(ev, 'text'),
+					queued: bool(ev, 'queued'),
+				});
 				break;
 			}
 			case 'steer_drained': {
-				// The runner drained the queued message into the
-				// active turn. Flip the row out of "queued" styling
-				// rather than removing it — the desktop does the
-				// same (the `user_message` event with
-				// `queued: false` would otherwise re-add it, but
-				// there's a visible gap between removal and re-add).
-				// Idempotent: a duplicate event is a no-op.
-				const row = rows.findLast((r) => r.kind === 'user' && r.id === str(ev, 'id'));
-				if (row && row.kind === 'user') {
-					row.queued = false;
+				// Remove the provisional queued placeholder. On a real
+				// drain the runner follows with a fresh `user_message`
+				// appended at the bottom (after the answer that was
+				// already streaming); on an un-queue nothing follows.
+				const idx = rows.findLastIndex((r) => r.kind === 'user' && r.id === str(ev, 'id'));
+				if (idx !== -1) {
+					rows.splice(idx, 1);
 				}
 				break;
 			}

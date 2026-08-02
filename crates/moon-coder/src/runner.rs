@@ -3753,16 +3753,17 @@ impl CoderHandle {
 
 	/// "Go now" on a queued steer: the user typed a message mid-
 	/// turn (it landed in `pending_steers` and rendered as a
-	/// muted "queued" row), then decided they don't want to wait
-	/// for the running turn to settle. Cancels the current turn
-	/// (like [`abort`]) and flips the matching row out of "queued"
-	/// styling by emitting [`CoderEvent::SteerDrained`]. The
-	/// spawn loop's `Err(Aborted)` branch detects the still-pending
+	/// muted "queued" placeholder row), then decided they don't
+	/// want to wait for the running turn to settle. Cancels the
+	/// current turn (like [`abort`]) and removes the placeholder
+	/// row by emitting [`CoderEvent::SteerDrained`]. The spawn
+	/// loop's `Err(Aborted)` branch detects the still-pending
 	/// steer, recovers orphaned tool-call results, and loops back
 	/// into `run_turn`, which drains the steer into chat history
-	/// and runs a fresh LLM round-trip. The UI sees an
-	/// uninterrupted `busy` stretch: no `Aborted` flash, just the
-	/// old thinking fading into the new turn.
+	/// (re-emitting it as a real `UserMessage` at the bottom) and
+	/// runs a fresh LLM round-trip. The UI sees an uninterrupted
+	/// `busy` stretch: no `Aborted` flash, just the old thinking
+	/// fading into the new turn.
 	///
 	/// Returns `false` (no-op) when `id` doesn't match a queued
 	/// steer on the active visible session — either it was never
@@ -3791,15 +3792,21 @@ impl CoderHandle {
 		if rt.prompts.has_pending().await {
 			rt.prompts.skip_any().await;
 		}
-		// Flip the row out of "queued" styling now — the spawn
-		// loop's drain will re-append it as a real `User` record
-		// anyway, but the visual transition reads better as
-		// "queued → live" the instant the user hits go now.
+		// Remove the placeholder row now — the spawn loop's drain
+		// will re-append it as a real `UserMessage` at the bottom
+		// anyway, and the visual transition reads better as
+		// "queued → gone → fresh message" the instant the user hits
+		// go now.
 		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), session_id);
 		sink.send(CoderEvent::SteerDrained { id: id.to_string() });
 		// Trip the cancel token: the running `run_turn` returns
 		// `Err(Aborted)`, the spawn loop sees the pending steer,
-		// recovers orphans, and loops back to drain it.
+		// recovers orphans, and loops back to drain it. The steer
+		// stays in `pending_steers` until that drain — so the queued
+		// row the `SteerDrained` above just removed gets re-rendered
+		// as the drain emits its fresh `UserMessage`. Between the two
+		// the message briefly has no visible row, which reads as the
+		// old turn dissolving into the new one.
 		let turn = rt.turn.lock().await;
 		if let Some(token) = turn.cancel.as_ref() {
 			token.cancel();
@@ -3815,9 +3822,11 @@ impl CoderHandle {
 	/// drained into the chat at the top of the latest `run_turn`
 	/// iteration (too late, no undo), or no folder is active.
 	/// Emits a [`CoderEvent::SteerDrained`] for the popped id so
-	/// the row's "queued" styling flips even if the panel didn't
-	/// know about the pop ahead of time (e.g. a sibling window
-	/// triggered the unqueue).
+	/// the queued row is removed even if the panel didn't know
+	/// about the pop ahead of time (e.g. a sibling window
+	/// triggered the unqueue). Unlike the drain path this is a
+	/// pure removal — no `UserMessage` follows, because the
+	/// message went back into the composer rather than the chat.
 	pub async fn unqueue_steer(&self, id: &str) -> Option<UnqueuedSteer> {
 		let (rt, session_id, folder_path) = self.state.active_visible_runtime().await.ok()?;
 		let popped = {
@@ -8079,12 +8088,27 @@ async fn drain_pending_steers(rt: &Arc<SessionRuntime>, sink: &FolderEventSink) 
 		let header = session.header.clone();
 		(drained, dir, header)
 	};
-	// Tell the panel the queued rows just graduated — chip-strip
-	// "unqueue" disappears, and the row's muted styling clears.
-	// We emit before persistence so the UI flip is immediate
-	// regardless of disk latency.
+	// Tell the panel the queued rows just graduated. The contract
+	// is remove-then-append, not flip-in-place: `SteerDrained`
+	// drops the provisional queued bubble (which was parked at
+	// send position, above the in-flight answer), and a fresh
+	// `UserMessage { queued: false }` re-inserts the message at
+	// the **bottom** of the transcript — matching where it lands
+	// in `messages` and on disk (after the answer that was already
+	// streaming when the user typed it). A new id + drain-time
+	// timestamp make the appended row indistinguishable from a
+	// normally-sent message and avoid colliding with the removed
+	// placeholder's id. Emitted before persistence so the UI
+	// update is immediate regardless of disk latency.
 	for steer in &steers {
 		sink.send(CoderEvent::SteerDrained { id: steer.id.clone() });
+		sink.send(CoderEvent::UserMessage {
+			id: new_message_id(),
+			text: steer.text.clone(),
+			images: steer.images.clone(),
+			queued: false,
+			created_at_ms: Some(current_time_ms()),
+		});
 	}
 	let Some(dir) = dir else {
 		return;
@@ -10052,16 +10076,30 @@ mod tests {
 		assert_eq!(session.persisted_records, 2);
 		drop(session);
 
-		// Exactly one SteerDrained per drained steer, in queue
-		// order — the panel flips the matching rows out of
-		// "queued" styling in the order they were sent.
-		let mut drained_ids = Vec::new();
+		// Per drained steer the panel gets a `SteerDrained` (remove
+		// the placeholder) immediately followed by a fresh
+		// `UserMessage { queued: false }` (re-append the real message
+		// at the bottom) — in queue order. Assert the interleaved
+		// sequence, not just the drained ids.
+		let mut sequence = Vec::new();
 		while let Ok(env) = rx.try_recv() {
-			if let CoderEvent::SteerDrained { id } = env.event {
-				drained_ids.push(id);
+			match env.event {
+				CoderEvent::SteerDrained { id } => sequence.push(("drained".to_string(), id)),
+				CoderEvent::UserMessage { id, text, queued, .. } => {
+					assert!(!queued, "re-appended steer must not be flagged queued");
+					sequence.push((format!("user:{text}"), id));
+				}
+				_ => {}
 			}
 		}
-		assert_eq!(drained_ids, vec!["steer-1".to_string(), "steer-2".to_string()]);
+		let kinds: Vec<&str> = sequence.iter().map(|(k, _)| k.as_str()).collect();
+		assert_eq!(kinds, vec!["drained", "user:also do X", "drained", "user:and then Y"]);
+		// The placeholder ids are the ones removed; the re-appended
+		// rows carry fresh ids distinct from them.
+		assert_eq!(sequence[0].1, "steer-1");
+		assert_ne!(sequence[1].1, "steer-1");
+		assert_eq!(sequence[2].1, "steer-2");
+		assert_ne!(sequence[3].1, "steer-2");
 
 		let jsonl = tokio::fs::read_to_string(sessions::session_path(&dir, "sess-steer").as_std_path())
 			.await

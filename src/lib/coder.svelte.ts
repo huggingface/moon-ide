@@ -76,8 +76,10 @@ export type CoderRow =
 			 *  and not yet drained into the chat). The panel
 			 *  renders these rows in a muted "queued" style and
 			 *  the composer's `Ctrl+Up` un-queue gesture only
-			 *  targets queued rows. Flips to `false` on the
-			 *  matching `steer_drained` event. */
+			 *  targets queued rows. On drain the matching
+			 *  `steer_drained` removes this provisional row and a
+			 *  fresh `user_message` re-appends the real message
+			 *  (`queued: false`) at the bottom of the transcript. */
 			queued: boolean;
 			/** Unix-ms creation time, for the hover-revealed time
 			 *  next to the "You" header. From the event's
@@ -2916,8 +2918,8 @@ export class CoderPanelState {
 	 *     transcript, since the runner emits `UserMessage` as
 	 *     soon as the steer is queued).
 	 *  2. Call `coder_unqueue_steer(id)`. The runner removes the
-	 *     matching `PendingSteer` and emits `steer_drained` so
-	 *     the row's queued style flips off in lockstep with the
+	 *     matching `PendingSteer` and emits `steer_drained`, which
+	 *     removes the provisional queued row in lockstep with the
 	 *     transcript edit below — handy for sibling windows.
 	 *  3. Restore the original text to the draft, push the
 	 *     original images back as composer chips, drop the row
@@ -3212,13 +3214,19 @@ export class CoderPanelState {
 				}
 				return;
 			case 'steer_drained': {
-				// Runner moved (or `coder.unqueueSteer` popped) the
-				// queued message; flip the row out of "queued"
-				// styling. Idempotent — a duplicate event lands as
-				// a no-op (the row is already `queued: false`).
-				const row = findRowById(session.rows, event.id);
-				if (row?.kind === 'user') {
-					row.queued = false;
+				// The queued steer left the provisional queue — remove
+				// its placeholder row. On a real drain the runner
+				// immediately follows with a fresh `user_message`
+				// (`queued: false`, new id) appended at the bottom of
+				// the transcript, so the message lands after the answer
+				// that was already streaming (matching history + disk).
+				// On an un-queue nothing follows — the message went back
+				// into the composer. Removal by id is positional-safety
+				// neutral: queued rows are excluded from the revert
+				// ordinal either way.
+				const idx = session.rows.findIndex((r) => r.kind === 'user' && r.id === event.id);
+				if (idx !== -1) {
+					session.rows.splice(idx, 1);
 				}
 				return;
 			}
@@ -3828,8 +3836,11 @@ function applyInnerEventToRows(rows: CoderRow[], event: CoderEvent): void {
 		case 'user_message':
 			// The sub-agent's task at spawn time, the iteration-cap
 			// wrap-up sentinel, and mid-flight steers from the
-			// pop-out composer (those arrive `queued: true` and
-			// flip on the matching `steer_drained`).
+			// pop-out composer. Steers arrive `queued: true` as a
+			// provisional bubble; the matching `steer_drained` removes
+			// it and a fresh `queued: false` `user_message` re-appends
+			// the real message at the bottom (same contract as the
+			// parent loop).
 			rows.push({
 				kind: 'user',
 				id: event.id,
@@ -3840,9 +3851,12 @@ function applyInnerEventToRows(rows: CoderRow[], event: CoderEvent): void {
 			});
 			return;
 		case 'steer_drained': {
-			const row = findRowById(rows, event.id);
-			if (row?.kind === 'user') {
-				row.queued = false;
+			// Remove the provisional queued bubble (see the parent
+			// reducer); the fresh `user_message` that a real drain
+			// emits right after re-appends it at the bottom.
+			const idx = rows.findIndex((r) => r.kind === 'user' && r.id === event.id);
+			if (idx !== -1) {
+				rows.splice(idx, 1);
 			}
 			return;
 		}

@@ -838,22 +838,35 @@ async fn run_subagent_loop(
 		}
 
 		// Drain any steers the user queued from the pop-out
-		// composer: append to the history + persist, then flip the
-		// queued row via `SteerDrained` — same contract as the
-		// parent loop's `drain_pending_steers` (steers persist at
-		// drain time, in queue order).
+		// composer: append to the history + persist, then swap the
+		// provisional queued bubble for a real message at the
+		// bottom — remove the placeholder via `SteerDrained` and
+		// re-append a fresh `UserMessage { queued: false }`. Same
+		// contract as the parent loop's `drain_pending_steers`
+		// (steers persist at drain time, in queue order, and land in
+		// history after the answer that was already streaming).
 		for steer in take_queued_subagent_steers(&id) {
 			messages.push(ChatMessage::user(steer.text.clone()));
 			persist_subagent(
 				session_dir,
 				header,
 				&SessionRecord::User {
-					text: steer.text,
+					text: steer.text.clone(),
 					images: Vec::new(),
 				},
 			)
 			.await;
 			sink.send(wrap_inner(&id, CoderEvent::SteerDrained { id: steer.id }));
+			sink.send(wrap_inner(
+				&id,
+				CoderEvent::UserMessage {
+					id: crate::runner::new_message_id(),
+					text: steer.text,
+					images: Vec::new(),
+					queued: false,
+					created_at_ms: Some(crate::sessions::current_time_ms()),
+				},
+			));
 		}
 
 		// Fresh model snapshot per round-trip — same discipline as
