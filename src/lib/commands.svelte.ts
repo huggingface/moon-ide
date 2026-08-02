@@ -205,11 +205,6 @@ export const builtInCommands: Command[] = [
 		},
 	},
 	{
-		id: 'workspace.refreshTree',
-		title: 'Refresh File Tree',
-		run: () => void workspace.loadPaths(),
-	},
-	{
 		id: 'editor.openFile',
 		title: 'Open File…',
 		shortcut: 'Ctrl+O',

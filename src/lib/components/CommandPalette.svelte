@@ -9,6 +9,7 @@
 		type Command,
 	} from '../commands.svelte';
 	import { workspace } from '../state.svelte';
+	import FileIcon from './icons/FileIcon.svelte';
 
 	let inputEl: HTMLInputElement | undefined = $state();
 	let replaceInputEl: HTMLInputElement | undefined = $state();
@@ -115,6 +116,18 @@
 		});
 		return groups;
 	});
+
+	/** Split a result path into its directory prefix and basename so
+	 *  the file-group header can render the filename in a stronger
+	 *  voice than the (often long, low-signal) directory — that's the
+	 *  part the eye scans for when telling one group from the next. */
+	function splitFilePath(path: string): { dir: string; base: string } {
+		const slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+		if (slash === -1) {
+			return { dir: '', base: path };
+		}
+		return { dir: path.slice(0, slash + 1), base: path.slice(slash + 1) };
+	}
 
 	function placeholder() {
 		if (palette.mode === 'commands') {
@@ -427,8 +440,12 @@
 						</li>
 					{/if}
 					{#each contentGroups as group (group.path)}
+						{@const file = splitFilePath(group.path)}
 						<li class="file-group" role="presentation">
-							<span class="file-path">{group.path}</span>
+							<span class="file-icon"><FileIcon size={13} /></span>
+							<span class="file-path" title={group.path}>
+								{#if file.dir}<span class="file-dir">{file.dir}</span>{/if}<span class="file-base">{file.base}</span>
+							</span>
 							<span class="file-count">{group.hits.length}</span>
 						</li>
 						{#each group.hits as entry (group.path + ':' + entry.hit.line + ':' + entry.index)}
@@ -657,41 +674,82 @@
 		font-size: 11px;
 	}
 	/* File header that introduces each group of matches. Reads as a
-	   path on the left with a match-count badge on the right; not a
-	   selectable row (keyboard nav walks the match rows only). */
+	   section break — tinted background + file glyph + the filename in
+	   a strong voice (directory recedes to muted) with a match-count
+	   badge on the right; not a selectable row (keyboard nav walks the
+	   match rows only). The background and stronger filename are what
+	   separate it from the match rows beneath, which the old single
+	   mono line made indistinguishable. */
 	.file-group {
 		display: flex;
 		align-items: center;
-		justify-content: space-between;
-		gap: 12px;
-		padding: 5px 14px;
+		gap: 7px;
+		margin: 6px 6px 2px;
+		padding: 4px 8px;
+		border-radius: 5px;
+		background: var(--m-bg-3);
 		color: var(--m-fg);
-		font-family: var(--m-font-mono);
 		font-size: 12px;
 	}
+	.file-group .file-icon {
+		flex-shrink: 0;
+		display: inline-flex;
+		color: var(--m-fg-muted);
+	}
 	.file-group .file-path {
+		flex: 1;
+		min-width: 0;
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+		/* Leading-edge ellipsis keeps the filename visible when the
+		   path overflows: the tail (base name) is the signal. */
 		direction: rtl;
 		text-align: left;
+	}
+	.file-group .file-dir {
+		color: var(--m-fg-subtle);
+	}
+	.file-group .file-base {
+		color: var(--m-fg);
+		font-weight: 600;
 	}
 	.file-group .file-count {
 		flex-shrink: 0;
 		min-width: 18px;
 		padding: 0 6px;
 		border-radius: 9px;
-		background: var(--m-bg-3);
+		background: var(--m-bg-2);
 		color: var(--m-fg-muted);
 		font-size: 11px;
 		line-height: 16px;
 		text-align: center;
 	}
+	/* Match rows nest under their file header: a left guide line makes
+	   the group read as one block, so a file path is never mistaken for
+	   a match. The guide stops before the next header. */
 	.content-row {
+		position: relative;
 		flex-direction: column;
 		align-items: flex-start;
 		gap: 2px;
-		padding-left: 26px;
+		margin-left: 18px;
+		padding-left: 12px;
+	}
+	.content-row::before {
+		content: '';
+		position: absolute;
+		left: 0;
+		top: 0;
+		bottom: 0;
+		width: 2px;
+		border-radius: 1px;
+		background: var(--m-border);
+		opacity: 0.6;
+	}
+	.content-row.selected::before {
+		background: var(--m-accent);
+		opacity: 1;
 	}
 	.loc {
 		font-family: var(--m-font-mono);
