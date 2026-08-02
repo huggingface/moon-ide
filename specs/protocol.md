@@ -25,6 +25,7 @@ STATUS: partial — Phase 0 ships fs operations via Tauri commands. Streams (`fs
 - `fs.readFile({ path }) -> { bytes, encoding, mtimeMs }`
 - `fs.writeFile({ path, bytes }) -> { mtimeMs }`
 - `fs.stat({ path }) -> Stat`
+- `fs.revealInFolder({ path })` — host-side: opens the desktop file manager with the (absolute) path selected via `tauri-plugin-opener`. Not a `WorkspaceHost` method; the file manager always runs on the host. See [ADR 0051](decisions/0051-tab-rename-reveal-live-previews.md).
 - `fs.watch({ path }) -> SubscriptionId` (event stream `fs.event`)
 - `fs.unwatch({ subscriptionId })`
 

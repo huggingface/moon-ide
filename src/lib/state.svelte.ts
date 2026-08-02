@@ -132,6 +132,12 @@ export type OpenFile = {
 	// stream their contents through `text`, preview files render via this
 	// URL.
 	previewUrl: string;
+	// Monotonic counter bumped when the on-disk bytes behind a preview
+	// buffer changed (`fs:changed` observed the path). The view
+	// components key their `<img>` / pdf.js document on it so a stale
+	// cached render is replaced instead of surviving until the tab is
+	// closed. Meaningless for text buffers; stays 0 there.
+	previewToken: number;
 	// Fingerprint of the bytes last known to be on disk. Comparing the
 	// current text's fingerprint against this lets us derive `isDirty`
 	// without keeping a second full copy of the file in memory. Untitled
@@ -3491,6 +3497,17 @@ class WorkspaceState {
 		// this way means no buffer is blamed twice in one pass.
 		const gitStateMoved = changedSubset !== null && subsetTouchesGitState(changedSubset);
 		for (const file of this.openFiles) {
+			// Image / PDF previews carry no text, so the reload path
+			// below can't see them. Bounce their byte source instead:
+			// only when the watcher named this exact file — the null-
+			// subset full sweep is for git-state moves (branch switch,
+			// commit) and binary rows aren't tracked there anyway.
+			if (file.kind === 'image' || file.kind === 'pdf') {
+				if (changedSubset !== null && changedSubset.has(file.path)) {
+					void this.refreshPreviewFile(file.path);
+				}
+				continue;
+			}
 			if (file.kind !== 'text' || file.isDeleted) {
 				continue;
 			}
@@ -4426,6 +4443,7 @@ class WorkspaceState {
 			isDeleted: false,
 			isExternal: false,
 			pendingEdit: null,
+			previewToken: 0,
 		};
 		this.openFiles = [...this.openFiles, file];
 		const tabs = this.tabsFor(side);
@@ -4463,6 +4481,7 @@ class WorkspaceState {
 				isDeleted: false,
 				isExternal: false,
 				pendingEdit: null,
+				previewToken: 0,
 			};
 			this.openFiles = [...this.openFiles, file];
 		}
@@ -4536,6 +4555,7 @@ class WorkspaceState {
 				isDeleted: false,
 				isExternal: false,
 				pendingEdit: null,
+				previewToken: 0,
 			};
 			this.openFiles = [...this.openFiles, file];
 		}
@@ -4780,6 +4800,7 @@ class WorkspaceState {
 					isDeleted: false,
 					isExternal: true,
 					pendingEdit: null,
+					previewToken: 0,
 				};
 				this.openFiles = [...this.openFiles, file];
 			}
@@ -4941,6 +4962,7 @@ class WorkspaceState {
 			isDeleted: false,
 			isExternal: false,
 			pendingEdit: null,
+			previewToken: 0,
 		};
 	}
 
@@ -4963,6 +4985,7 @@ class WorkspaceState {
 			isDeleted: false,
 			isExternal: false,
 			pendingEdit: null,
+			previewToken: 0,
 		};
 	}
 
@@ -4995,7 +5018,43 @@ class WorkspaceState {
 			isDeleted: false,
 			isExternal: true,
 			pendingEdit: null,
+			previewToken: 0,
 		};
+	}
+
+	/**
+	 * Re-pull the bytes behind an open image / PDF buffer after the
+	 * fs-watcher observed the file change. Preview buffers have no
+	 * dirty state (read-only), so unlike `reloadOpenFileFromDisk`
+	 * there's nothing to protect — always re-resolve. The webview
+	 * caches `asset:` responses per URL, so a changed file needs a
+	 * changed URL: `previewToken` rides as a dummy query param and
+	 * re-keys the view components (`ImageView` / `PdfView`), which
+	 * rebuild their render against the fresh bytes. On error (file
+	 * deleted mid-preview, container down) we keep showing the stale
+	 * render — a toast per watched binary write would be noise.
+	 */
+	private async refreshPreviewFile(path: string) {
+		const current = this.openFiles.find((f) => f.path === path);
+		if (!current || (current.kind !== 'image' && current.kind !== 'pdf')) {
+			return;
+		}
+		const token = current.previewToken + 1;
+		try {
+			if (current.isExternal) {
+				const dataUrl = await ipc.fs.readPreviewHost(path);
+				this.openFiles = this.openFiles.map((f) =>
+					f.path === path ? { ...f, previewUrl: dataUrl, previewToken: token } : f,
+				);
+				return;
+			}
+			const absolute = await ipc.fs.absolutePath(path);
+			this.openFiles = this.openFiles.map((f) =>
+				f.path === path ? { ...f, previewUrl: `${convertFileSrc(absolute)}?t=${token}`, previewToken: token } : f,
+			);
+		} catch (err) {
+			frontendLog('fs-watcher', 'warn', `preview reload of ${path} failed: ${formatError(err)}`);
+		}
 	}
 
 	/**
@@ -5039,6 +5098,7 @@ class WorkspaceState {
 			isDeleted: true,
 			isExternal: false,
 			pendingEdit: null,
+			previewToken: 0,
 		};
 	}
 
@@ -5088,6 +5148,20 @@ class WorkspaceState {
 	 */
 	async renamePath(from: string, to: string) {
 		if (from === to) {
+			return;
+		}
+		// A dirty buffer's on-disk rename would strand the unsaved
+		// text: the buffer rebinds to the new path while disk holds
+		// stale bytes, and the next Ctrl+S silently publishes those
+		// edits under the new name. Force the user to resolve the
+		// dirty state (save or discard) first. Images / PDFs are
+		// never dirty; a directory can't be dirty either — but its
+		// dirty descendants block the move, since they'd rebase onto
+		// the new prefix.
+		const dirtyPrefix = from.endsWith('/') ? from : `${from}/`;
+		const dirty = this.openFiles.find((f) => f.isDirty && (f.path === from || f.path.startsWith(dirtyPrefix)));
+		if (dirty) {
+			this.flash(`Save or discard changes to ${dirty.path} before renaming.`);
 			return;
 		}
 		try {
@@ -5141,6 +5215,24 @@ class WorkspaceState {
 		if (stamp !== null) {
 			this.lastRename = stamp;
 			this.renameTick += 1;
+		}
+		this.persistAppState();
+	}
+
+	/**
+	 * Reveal a workspace-relative path in the host's file manager
+	 * (Explorer / Finder / freedesktop FileManager1). The backend
+	 * command takes an absolute host path, so resolve through the
+	 * active folder's host first — same translation
+	 * `fs_absolute_path` gives the copy-path menu entries. Errors
+	 * surface as a toast (missing file manager, headless host).
+	 */
+	async revealInFolder(path: string) {
+		try {
+			const absolute = await ipc.fs.absolutePath(path);
+			await ipc.fs.revealInFolder(absolute);
+		} catch (err) {
+			this.flash(`Could not reveal ${path}: ${formatError(err)}`);
 		}
 	}
 

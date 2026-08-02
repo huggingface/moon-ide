@@ -161,6 +161,10 @@ export const ipc = {
 		readPreviewHost: (path: string) => invoke<string>('fs_read_preview_host', { path }),
 		trash: (path: string) => invoke<void>('fs_trash', { path }),
 		delete: (path: string) => invoke<void>('fs_delete', { path }),
+		// Reveal an absolute host path in the host's file manager
+		// (Explorer / Finder / FileManager1 dbus). Callers resolve the
+		// workspace-relative path via `fs_absolute_path` first.
+		revealInFolder: (path: string) => invoke<void>('fs_reveal_in_folder', { path }),
 		gitStatusEntries: (paths: string[]) => invoke<GitStatusEntry[]>('fs_git_status_entries', { paths }),
 		gitExcludePath: () => invoke<string | null>('fs_git_exclude_path'),
 		gitChangeSummary: (folderPath: string) => invoke<GitChangeSummary>('fs_git_change_summary', { folderPath }),

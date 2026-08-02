@@ -217,6 +217,11 @@ What it ships:
   Helm-chart-heavy infra / workloads repos. No Kubernetes daemon
   or `kubectl` baked in — add those in a `FROM moon-base`
   extension if a team needs them.
+- **Homebrew on Linux** (linuxbrew, pinned release) at the
+  canonical `/home/linuxbrew/.linuxbrew` prefix — the escape
+  hatch for CLI formulae with no apt / upstream-tarball story.
+  `brew install` works as the `dev` user; casks are macOS-only
+  and unsupported.
 - **Language servers**: `rust-analyzer` and `gopls` baked in; the
   LSP broker runs them in-container via `docker exec` when present.
   Python / JS servers install per-project — see

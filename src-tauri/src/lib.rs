@@ -119,6 +119,7 @@ pub fn run() {
 			commands::fs::fs_absolute_path,
 			commands::fs::fs_trash,
 			commands::fs::fs_delete,
+			commands::fs::fs_reveal_in_folder,
 			commands::fs::fs_git_status_entries,
 			commands::fs::fs_git_exclude_path,
 			commands::fs::fs_git_change_summary,

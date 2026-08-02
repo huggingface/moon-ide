@@ -1,12 +1,14 @@
 <script lang="ts">
 	import { mount as mountComponent, unmount } from 'svelte';
 	import { workspace, type MarkdownView, type OpenFile, type SplitSide } from '../state.svelte';
+	import { ipc } from '../ipc';
 	import { isMarkdownPath } from '../util/markdown';
 	import { isReviewPath } from '../util/reviewPath';
 	import { isCommitPath } from '../util/commitPath';
 	import ContextMenu from './ContextMenu.svelte';
 	import type { ContextMenuItem } from './contextMenu';
 	import RevertIcon from './icons/RevertIcon.svelte';
+	import { formatError } from '../protocol';
 
 	type Props = { side: SplitSide };
 	let { side }: Props = $props();
@@ -323,6 +325,95 @@
 		return `${root.replace(/\/+$/, '')}/${file.path}`;
 	}
 
+	// Inline tab rename. `renamingPath` holds the buffer being renamed
+	// (its name span swaps for an input); `renameDraft` is the input's
+	// value. The flow commits on Enter/blur and cancels on Escape —
+	// same contract as the file tree's inline rename. Kept out of
+	// `WorkspaceState`: this is pure tab-strip chrome.
+	let renamingPath = $state<string | null>(null);
+	let renameDraft = $state('');
+
+	function canRenameFile(file: OpenFile): boolean {
+		return !file.isUntitled && !file.isExternal && !isReviewPath(file.path) && !isCommitPath(file.path);
+	}
+
+	function startTabRename(file: OpenFile) {
+		renamingPath = file.path;
+		renameDraft = file.name;
+	}
+
+	function cancelTabRename() {
+		renamingPath = null;
+		renameDraft = '';
+	}
+
+	async function commitTabRename() {
+		const path = renamingPath;
+		if (path === null) {
+			return;
+		}
+		const file = workspace.openFiles.find((f) => f.path === path);
+		renamingPath = null;
+		const name = renameDraft.trim();
+		renameDraft = '';
+		if (!file || name.length === 0 || name === file.name) {
+			return;
+		}
+		// Leaf-name only, like the file tree's rename input: any `/`
+		// or `\\` would smuggle a directory move into a "rename"
+		// gesture, and the tree's flow has the same constraint.
+		if (name.includes('/') || name.includes('\\')) {
+			workspace.flash('The new name cannot contain path separators.');
+			return;
+		}
+		const lastSlash = path.lastIndexOf('/');
+		const to = lastSlash < 0 ? name : `${path.slice(0, lastSlash + 1)}${name}`;
+		if (to === path) {
+			return;
+		}
+		const treePathSet = new Set(workspace.paths);
+		if (treePathSet.has(to)) {
+			workspace.flash(`A file named ${name} already exists there.`);
+			return;
+		}
+		await workspace.renamePath(path, to);
+	}
+
+	function onRenameKeydown(event: KeyboardEvent) {
+		if (event.key === 'Enter') {
+			event.preventDefault();
+			void commitTabRename();
+			return;
+		}
+		if (event.key === 'Escape') {
+			event.preventDefault();
+			cancelTabRename();
+		}
+	}
+
+	// Focus + preselect the editable segment once the input mounts.
+	// For `foo/bar.ts` that's `bar` — the extension usually stays, so
+	// a keystroke replaces the stem without touching the suffix.
+	function initRenameInput(input: HTMLInputElement) {
+		requestAnimationFrame(() => {
+			input.focus();
+			const dot = input.value.lastIndexOf('.');
+			input.setSelectionRange(0, dot > 0 ? dot : input.value.length);
+		});
+	}
+
+	async function revealInFileManager(file: OpenFile) {
+		if (file.isExternal) {
+			try {
+				await ipc.fs.revealInFolder(file.path);
+			} catch (err) {
+				workspace.flash(`Could not reveal ${file.path}: ${formatError(err)}`);
+			}
+			return;
+		}
+		await workspace.revealInFolder(file.path);
+	}
+
 	async function copyToClipboard(text: string, label: string) {
 		try {
 			await navigator.clipboard.writeText(text);
@@ -347,7 +438,33 @@
 				},
 			});
 		}
+		// Rename the file on disk via an inline edit of the tab
+		// label. Same guarantees as the file tree's Rename (which
+		// stays available): open buffers rebind to the new path.
+		// Untitled / external / pseudo buffers don't have an
+		// in-workspace path to rename, so the entry drops out for
+		// them. Dirty buffers get the entry but `renamePath`
+		// refuses until the edits are saved or discarded.
+		if (canRenameFile(file)) {
+			items.push({
+				id: 'rename',
+				label: 'Rename…',
+				onSelect: () => {
+					startTabRename(file);
+				},
+			});
+		}
 		const absolute = absolutePathFor(file);
+		if (absolute !== null) {
+			items.push({
+				id: 'reveal-in-folder',
+				label: 'Reveal in file manager',
+				title: absolute,
+				onSelect: () => {
+					void revealInFileManager(file);
+				},
+			});
+		}
 		const copyPathItem: ContextMenuItem = {
 			id: 'copy-path',
 			label: 'Copy path',
@@ -482,7 +599,20 @@
 				ondragover={(e) => onTabDragOver(e, file.path)}
 				ondragend={onDragEnd}
 			>
-				<span class="name">{file.name}</span>
+				{#if renamingPath === file.path}
+					<input
+						class="rename-input"
+						type="text"
+						bind:value={renameDraft}
+						use:initRenameInput
+						onkeydown={onRenameKeydown}
+						onblur={() => void commitTabRename()}
+						onclick={(e) => e.stopPropagation()}
+						ondblclick={(e) => e.stopPropagation()}
+					/>
+				{:else}
+					<span class="name">{file.name}</span>
+				{/if}
 				{#if file.pendingEdit}
 					<span
 						class="pending-edit"
@@ -650,6 +780,21 @@
 	}
 	.name {
 		font-family: var(--m-font-ui);
+	}
+	/* Inline rename input standing in for the tab label. Slightly
+	   wider than the typical name so the caret isn't crammed against
+	   the edge; the strip's overflow-x scrolls if the tab grows. */
+	.rename-input {
+		font-family: var(--m-font-ui);
+		font-size: 12px;
+		color: var(--m-fg);
+		background: var(--m-bg-3);
+		border: 1px solid var(--m-accent);
+		border-radius: 3px;
+		padding: 1px 4px;
+		width: 16ch;
+		min-width: 8ch;
+		outline: none;
 	}
 	.dirty {
 		color: var(--m-warning);

@@ -412,6 +412,17 @@
 			},
 		});
 
+		// Open the host's file manager with this row selected. Directory
+		// paths carry a trailing slash Pierre-style; `fs_absolute_path`
+		// handles the join either way.
+		items.push({
+			id: 'reveal-in-folder',
+			label: 'Reveal in file manager',
+			onSelect: () => {
+				void workspace.revealInFolder(item.path);
+			},
+		});
+
 		// Delete (move to trash) — available for both files and folders.
 		// Uses the same `workspace.trashPaths` flow as the Delete key.
 		// The confirmation dialog is handled internally by `trashPaths`.

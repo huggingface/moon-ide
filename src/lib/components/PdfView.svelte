@@ -75,6 +75,13 @@
 	}
 
 	$effect(() => {
+		// Track the preview token explicitly: `refreshPreviewFile`
+		// bumps it when the watcher sees the PDF's bytes change on
+		// disk, and this effect must re-run against the fresh
+		// (cache-busted) `previewUrl` — the asset URL alone stays
+		// identical for an unchanged token.
+		void file.previewToken;
+		void file.previewUrl;
 		render();
 	});
 </script>

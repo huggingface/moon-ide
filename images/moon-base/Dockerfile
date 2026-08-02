@@ -434,6 +434,46 @@ USER ${USERNAME}
 COPY --chown=root:root --chmod=0755 moon-edit /usr/local/bin/moon-edit
 RUN moon-edit --self-check
 
+# Homebrew on Linux (linuxbrew) — user-mode package manager for
+# CLI formulae that have no apt / upstream-tarball story we want
+# to maintain by hand (kept as the image's last layer: its fetch
+# is the flakiest and the most likely to change, so nothing else
+# should have to rebuild behind it). Homebrew's Linux
+# requirements are a non-root user with sudo (present),
+# build-essential, git, curl (all present), plus `procps` and
+# `file` (added here). The official install script clones
+# Homebrew/brew with full history (~1 GB of git objects); we use
+# a shallow clone of the pinned tag instead — brew reads its
+# version from `git describe` and updates via git, so a repo
+# (even depth-1) is strictly better than a bare tarball.
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        procps \
+        file \
+ && rm -rf /var/lib/apt/lists/*
+USER ${USERNAME}
+# /home/linuxbrew/.linuxbrew is linuxbrew's canonical prefix —
+# using it (over $HOME/.linuxbrew) matters because many bottles
+# are poured with that prefix baked into their shebangs, and
+# `dev` is uid 1000 here just like the installer would create.
+ENV HOMEBREW_PREFIX=/home/linuxbrew/.linuxbrew \
+    HOMEBREW_CELLAR=/home/linuxbrew/.linuxbrew/Cellar \
+    HOMEBREW_REPOSITORY=/home/linuxbrew/.linuxbrew/Homebrew \
+    PATH=/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}
+# Pin the brew release; bumps are intentional (same posture as
+# the Go / uv / helm pins). Check
+# https://github.com/Homebrew/brew/releases for the current tag.
+ARG HOMEBREW_VERSION=6.0.14
+RUN sudo install -d -o "${USERNAME}" -g "${USERNAME}" "${HOMEBREW_PREFIX}" \
+ && git clone --depth 1 --branch "${HOMEBREW_VERSION}" \
+      https://github.com/Homebrew/brew "${HOMEBREW_REPOSITORY}" \
+ && git -C "${HOMEBREW_REPOSITORY}" fetch --depth 1 origin main \
+ && mkdir -p "${HOMEBREW_PREFIX}/bin" \
+ && ln -sf "${HOMEBREW_REPOSITORY}/bin/brew" "${HOMEBREW_PREFIX}/bin/brew" \
+ && echo 'eval "$(brew shellenv)"' >> "/home/${USERNAME}/.bashrc" \
+ && brew --version
+
 WORKDIR /workspace
 
 # moon-ide attaches with `docker exec` for everything (terminals, LSPs,

@@ -16,12 +16,19 @@
 
 <div class="viewer">
 	<div class="canvas">
-		<img src={file.previewUrl} alt={file.name} onload={onLoad} />
+		<!-- Re-key on `previewToken`: `WorkspaceState.refreshPreviewFile`
+		     bumps it (and cache-busts the asset URL) when the watcher
+		     sees the bytes change on disk. Without the key, Svelte would
+		     patch `src` on the same img element and a cached or
+		     partially-decoded render could linger. -->
+		{#key file.previewToken}
+			<img src={file.previewUrl} alt={file.name} onload={onLoad} />
+		{/key}
 	</div>
 	<footer class="meta">
 		<span class="name">{file.name}</span>
 		{#if naturalWidth > 0}
-			<span class="dim">{naturalWidth} Ã {naturalHeight}</span>
+			<span class="dim">{naturalWidth} × {naturalHeight}</span>
 		{/if}
 	</footer>
 </div>
