@@ -7,8 +7,8 @@
 
 use camino::Utf8PathBuf;
 use moon_coder::{
-	CoderHandle, CoderStatus, DeviceCode, HfIdentity, ImageAttachment, PromptResponse, RerunToolOutcome, RevertedMessage,
-	SessionSummary, UnqueuedSteer,
+	CoderHandle, CoderStatus, DeviceCode, DisconnectWorkerOutcome, HfIdentity, ImageAttachment, PromptResponse,
+	RerunToolOutcome, RevertedMessage, SessionSummary, UnqueuedSteer,
 };
 use moon_core::app_state as app_state_store;
 use moon_core::session as core_session;
@@ -453,6 +453,27 @@ pub async fn coder_new_session(state: State<'_, AppState>) -> Result<SessionSumm
 #[tauri::command]
 pub async fn coder_new_coordinator_session(state: State<'_, AppState>) -> Result<SessionSummary, MoonError> {
 	state.coder.new_coordinator_session().await.map_err(MoonError::from)
+}
+
+/// Whether `session_id` is registered as a coordinator-spawned worker
+/// (ADR 0052) — attached or already disconnected. The session bar
+/// shows its disconnect affordance only when this is true.
+#[tauri::command]
+pub async fn coder_is_coordinator_worker(state: State<'_, AppState>, session_id: String) -> Result<bool, MoonError> {
+	Ok(state.coder.is_coordinator_worker(&session_id).await)
+}
+
+/// Unhook a coordinator-spawned worker from its orchestrator (ADR
+/// 0052). The session keeps its transcript, branch, and worktree; an
+/// in-flight turn runs to completion. Clicking again while already
+/// disconnected cancels that turn ("stop it now"). Returns which of
+/// those happened so the panel can toast accordingly.
+#[tauri::command]
+pub async fn coder_disconnect_worker(
+	state: State<'_, AppState>,
+	session_id: String,
+) -> Result<DisconnectWorkerOutcome, MoonError> {
+	Ok(state.coder.disconnect_worker(&session_id).await)
 }
 
 /// Result of [`coder_new_worktree_session`]: the new bound-folder

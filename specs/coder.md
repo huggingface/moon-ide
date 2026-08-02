@@ -649,6 +649,17 @@ the desktop composer and the phone notify; coordinator
 traffic (`send_to`) doesn't. Viewing a worker, aborting it from the
 panel, and answering its `ask_user` card notify nobody.
 
+The explicit counterpart is the session bar's **disconnect** button,
+shown only on a coordinator-spawned worker
+([ADR 0052](decisions/0052-disconnect-worker-from-coordinator.md)):
+it unhooks the worker — the feeder stops forwarding, the coordinator
+gets one final notice, and its mutating control tools
+(`steer_worker`, `abort_worker`, `respond_to_worker_prompt`,
+`commit_worker_changes`, `merge_worker_changes`,
+`discard_worker_worktree`) start refusing it. The worker keeps its
+transcript, branch, and worktree, and an in-flight turn runs to
+completion; clicking the button a second time cancels that turn.
+
 `coder:event` payloads are wrapped in a
 `CoderEventEnvelope { folder, session_id, event }` so the frontend
 routes updates to the right per-`(folder, session)` bucket.

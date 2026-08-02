@@ -1585,6 +1585,18 @@ export type RerunToolOutcome = {
 	result: unknown;
 };
 
+/** Return shape of `coder_disconnect_worker` (ADR 0052). Mirrors
+ *  `moon_coder::DisconnectWorkerOutcome`:
+ *  - `disconnected` — the link was just cut; the coordinator is
+ *    being told (right away when the worker is idle, after its
+ *    in-flight turn otherwise).
+ *  - `aborted` — second click: already disconnected, and the
+ *    in-flight turn was cancelled.
+ *  - `already_disconnected` — second click with nothing to cancel.
+ *  - `not_a_worker` — the session isn't coordinator-spawned;
+ *    nothing happened. */
+export type DisconnectWorkerOutcome = 'disconnected' | 'aborted' | 'already_disconnected' | 'not_a_worker';
+
 /** Snapshot returned by `coder_status`. Mirrors `moon_coder::CoderStatus`. */
 export type CoderStatus = {
 	signed_in: boolean;

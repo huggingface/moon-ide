@@ -46,6 +46,7 @@ import type {
 	UnqueuedSteer,
 	RevertedMessage,
 	RerunToolOutcome,
+	DisconnectWorkerOutcome,
 	PromptResponse,
 	LogEntry,
 	LogLevel,
@@ -410,6 +411,8 @@ export const ipc = {
 		lastOpenedSession: () => invoke<string | null>('coder_last_opened_session'),
 		newSession: () => invoke<CoderSessionSummary>('coder_new_session'),
 		newCoordinatorSession: () => invoke<CoderSessionSummary>('coder_new_coordinator_session'),
+		isCoordinatorWorker: (sessionId: string) => invoke<boolean>('coder_is_coordinator_worker', { sessionId }),
+		disconnectWorker: (sessionId: string) => invoke<DisconnectWorkerOutcome>('coder_disconnect_worker', { sessionId }),
 		newWorktreeSession: (baseBranch?: string) =>
 			invoke<NewWorktreeSession>('coder_new_worktree_session', { baseBranch: baseBranch ?? null }),
 		discardWorktree: (path: string, force: boolean) => invoke<Workspace>('coder_discard_worktree', { path, force }),

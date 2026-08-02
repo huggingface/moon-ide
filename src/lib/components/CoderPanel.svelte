@@ -43,6 +43,7 @@
 	import RevertIcon from './icons/RevertIcon.svelte';
 	import EditIcon from './icons/EditIcon.svelte';
 	import ReplayIcon from './icons/ReplayIcon.svelte';
+	import DisconnectIcon from './icons/DisconnectIcon.svelte';
 	import { ipc } from '../ipc';
 	import { formatError, type FileSearchResult, type CoderSessionSummary } from '../protocol';
 	import { textInputUndo } from '../actions/textInputUndo';
@@ -67,6 +68,30 @@
 	// the parent's `coder.draft` so switching between the pop-out
 	// and the parent never clobbers either text.
 	let subagentDraft = $state('');
+
+	// Whether the visible session is registered as a coordinator-
+	// spawned worker (ADR 0052). Probed backend-side (the link is
+	// in-memory only — nothing on the summary marks a worker) and
+	// re-checked whenever the panel switches sessions, so a worker
+	// shows the disconnect affordance and an ordinary session never
+	// does.
+	let visibleIsWorker = $state(false);
+	$effect(() => {
+		const id = coder.current.visibleSessionId;
+		if (id === null) {
+			visibleIsWorker = false;
+			return;
+		}
+		let cancelled = false;
+		void ipc.coder.isCoordinatorWorker(id).then((isWorker) => {
+			if (!cancelled) {
+				visibleIsWorker = isWorker;
+			}
+		});
+		return () => {
+			cancelled = true;
+		};
+	});
 
 	async function onSubagentComposerKey(e: KeyboardEvent): Promise<void> {
 		if (e.key !== 'Enter' || e.shiftKey) {
@@ -1759,6 +1784,22 @@
 		}
 	}
 
+	/** Disconnect the visible session from its coordinator (ADR
+	 *  0052). No confirm dialog: nothing is lost — the session keeps
+	 *  its transcript, branch, and worktree, and the coordinator is
+	 *  told. A second click on an already-disconnected worker is the
+	 *  "stop it now" path and cancels its in-flight turn. */
+	async function onDisconnectWorker(id: string): Promise<void> {
+		try {
+			const message = await coder.disconnectWorker(id);
+			if (message !== null) {
+				workspace.flash(message);
+			}
+		} catch (err) {
+			workspace.flash(`Could not disconnect worker: ${formatError(err)}`);
+		}
+	}
+
 	async function onDeleteSession(event: MouseEvent, id: string, title: string): Promise<void> {
 		// Stop the click from propagating into the row's "open"
 		// button — without this, deleting a session would also
@@ -2334,6 +2375,22 @@
 						<span class="wt-branch">{branch}</span>
 					</button>
 				{/if}
+			{/if}
+			{#if visibleIsWorker && coder.activeSession}
+				<!-- A coordinator-spawned worker (ADR 0052). The first
+				     click unhooks it from its orchestrator (the
+				     coordinator is told and loses control); a second
+				     click, while a turn is still running, is the "stop
+				     it now" path. Hidden for every other session. -->
+				<button
+					type="button"
+					class="icon"
+					onclick={() => onDisconnectWorker(coder.activeSession!.id)}
+					title="Disconnect from coordinator — it stops receiving this session's updates and loses its control tools; click again to stop the current turn"
+					aria-label="Disconnect session from its coordinator"
+				>
+					<DisconnectIcon />
+				</button>
 			{/if}
 			{#if coder.activeSession}
 				<button

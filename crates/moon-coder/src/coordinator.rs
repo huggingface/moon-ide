@@ -51,6 +51,8 @@ A **worker** is a peer top-level coder session in its own git worktree, on its o
 
 The user can message a worker directly at any time. When that happens you get a notice quoting what they said (truncated). Nothing else changes — you keep the worker, its updates still reach you, and every control tool still works on it. Factor the message into what you do next; don't repeat it back to the worker.
 
+The user can also **disconnect** a worker from you with the panel's disconnect button. When that happens you get one final notice naming the worker (right away if it was idle, after its current turn if it was running). From then on the worker is theirs: its updates stop reaching you, your control tools (`steer_worker`, `abort_worker`, `respond_to_worker_prompt`, `commit_worker_changes`, `merge_worker_changes`, `discard_worker_worktree`) refuse it, and you must not wait on it or try to drive it — re-plan without it. Its session, branch, and worktree are untouched; the user is taking over.
+
 You manage workers with:
 
 - `spawn_worker(task, name, base_branch?, folder?)` — create a worker in a fresh worktree on a new `moon/<name>` branch (or based on an existing branch when `base_branch` is given), seed it with a task prompt, and let it run. `name` is a short kebab-case name for the deliverable (`fix-login-redirect`) — it becomes the branch, the worktree directory, and the worker's session title in the panel, so name the work, never the worker (`worker-2` tells the user nothing). Returns a `worker_id` handle immediately — **it does not block**. The worker keeps running in the background. By default the worktree is created off the coordinator's own project; pass `folder` to target a different bound workspace folder (e.g. one you just created with `init_repo` or `clone_repo` — pass the `path` that tool returned). The folder must already be bound in the workspace.
@@ -488,5 +490,9 @@ mod tests {
 		// (ADR 0043) — the prompt must not claim tools will refuse it.
 		assert!(COORDINATOR_SYSTEM_PROMPT.contains("message a worker directly"));
 		assert!(!COORDINATOR_SYSTEM_PROMPT.contains("taken over"));
+		// The disconnect gesture (ADR 0052) is the explicit handover —
+		// the prompt names it and the refusal the tools will enforce.
+		assert!(COORDINATOR_SYSTEM_PROMPT.contains("disconnect"));
+		assert!(COORDINATOR_SYSTEM_PROMPT.contains("refuse"));
 	}
 }

@@ -2013,6 +2013,27 @@ export class CoderPanelState {
 		void this.refreshSessions();
 	}
 
+	/** Unhook a coordinator-spawned worker from its orchestrator
+	 *  (ADR 0052). The session keeps transcript / branch / worktree;
+	 *  the coordinator gets one final notice and its control tools
+	 *  start refusing the worker. A second click on an already-
+	 *  disconnected worker cancels its in-flight turn ("stop it
+	 *  now"). Returns a user-facing line for the caller to flash,
+	 *  or `null` when the session wasn't a worker at all. */
+	async disconnectWorker(sessionId: string): Promise<string | null> {
+		const outcome = await ipc.coder.disconnectWorker(sessionId);
+		if (outcome === 'disconnected') {
+			return 'Worker disconnected from its coordinator.';
+		}
+		if (outcome === 'aborted') {
+			return 'Worker turn stopped.';
+		}
+		if (outcome === 'already_disconnected') {
+			return 'Worker is already disconnected.';
+		}
+		return null;
+	}
+
 	/** Render an error inline in the active session's transcript —
 	 *  used by flows orchestrated outside this store (e.g. the
 	 *  worktree-session creation in `WorkspaceState`). */

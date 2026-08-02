@@ -47,8 +47,8 @@ pub use models::CoderModels;
 pub use prompts::{PromptOutcome, PromptResponse, QuestionAnswer};
 pub use providers::{new_provider_id, probe_provider, ProviderKeyring};
 pub use runner::{
-	Coder, CoderHandle, RerunToolOutcome, RevertedMessage, TerminalCommandContext, TurnDiffFileSummary, TurnDiffSummary,
-	UnqueuedSteer, WorkerSnapshot,
+	Coder, CoderHandle, DisconnectWorkerOutcome, RerunToolOutcome, RevertedMessage, TerminalCommandContext,
+	TurnDiffFileSummary, TurnDiffSummary, UnqueuedSteer, WorkerSnapshot,
 };
 pub use sessions::SessionSummary;
 pub use subagent::{Subagent, SubagentReport};

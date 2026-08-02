@@ -155,6 +155,12 @@ struct CoordinatorRegistry {
 struct CoordinatorWorkers {
 	workers: HashSet<String>,
 	feeder_running: bool,
+	/// Workers the user explicitly disconnected from this
+	/// orchestrator (ADR 0052). Kept in the map (not removed) so
+	/// the feeder can deliver one final `TurnComplete` notice after
+	/// unhooking — the orchestrator needs to hear that the worker
+	/// left the fleet or it would keep waiting on it.
+	disconnected: HashSet<String>,
 }
 
 impl CoordinatorRegistry {
@@ -172,23 +178,85 @@ impl CoordinatorRegistry {
 	/// Whether `orchestrator_id`'s feeder should forward events from
 	/// `session_id` — i.e. whether it's one of its workers. A user
 	/// message into a worker does **not** unhook it (ADR 0043); the
-	/// coordinator keeps receiving its updates.
+	/// coordinator keeps receiving its updates. An explicit
+	/// disconnect does (ADR 0052).
 	fn feeds(&self, orchestrator_id: &str, session_id: &str) -> bool {
 		self
 			.by_orchestrator
 			.get(orchestrator_id)
-			.is_some_and(|entry| entry.workers.contains(session_id))
+			.is_some_and(|entry| entry.workers.contains(session_id) && !entry.disconnected.contains(session_id))
 	}
 
-	/// The orchestrator that spawned `worker_id`, if any. Used to
-	/// tell a coordinator that the user just messaged one of its
-	/// workers (ADR 0043).
+	/// The orchestrator that spawned `worker_id`, if any and still
+	/// attached. Used to tell a coordinator that the user just
+	/// messaged one of its workers (ADR 0043).
 	fn orchestrator_of(&self, worker_id: &str) -> Option<&str> {
+		self
+			.by_orchestrator
+			.iter()
+			.find(|(_, entry)| entry.workers.contains(worker_id) && !entry.disconnected.contains(worker_id))
+			.map(|(orchestrator_id, _)| orchestrator_id.as_str())
+	}
+
+	/// Mark `worker_id` disconnected from `orchestrator_id` (ADR
+	/// 0052). Returns `true` when the link existed and was still
+	/// attached — the caller then notifies the orchestrator.
+	fn disconnect(&mut self, orchestrator_id: &str, worker_id: &str) -> bool {
+		let Some(entry) = self.by_orchestrator.get_mut(orchestrator_id) else {
+			return false;
+		};
+		entry.workers.contains(worker_id) && entry.disconnected.insert(worker_id.to_string())
+	}
+
+	/// Take the orchestrator ↔ worker link out entirely. The feeder
+	/// calls this right after its final wake lands so a later
+	/// disconnect attempt finds nothing to detach. Returns `true`
+	/// when `worker_id` was registered under `orchestrator_id` at
+	/// all (attached or already disconnected) — i.e. whether the
+	/// caller should let the UI show / hide the affordance.
+	fn remove(&mut self, orchestrator_id: &str, worker_id: &str) -> bool {
+		let Some(entry) = self.by_orchestrator.get_mut(orchestrator_id) else {
+			return false;
+		};
+		let was_worker = entry.workers.remove(worker_id);
+		entry.disconnected.remove(worker_id);
+		was_worker
+	}
+
+	/// Whether `worker_id` is registered as a worker of any
+	/// orchestrator — attached or disconnected. Drives the
+	/// session-bar disconnect affordance (ADR 0052), which must
+	/// also reach an already-disconnected worker so a second click
+	/// can end its current turn.
+	fn is_worker(&self, worker_id: &str) -> bool {
+		self
+			.by_orchestrator
+			.values()
+			.any(|entry| entry.workers.contains(worker_id))
+	}
+
+	/// The orchestrator `worker_id` belongs to — **including** when
+	/// already disconnected. The disconnect command targets the
+	/// entry regardless of attachment so the control-tool refusal
+	/// (`steer_worker` & co.) is keyed off the same lookup.
+	fn owning_orchestrator_of(&self, worker_id: &str) -> Option<&str> {
 		self
 			.by_orchestrator
 			.iter()
 			.find(|(_, entry)| entry.workers.contains(worker_id))
 			.map(|(orchestrator_id, _)| orchestrator_id.as_str())
+	}
+
+	/// Whether the coordinator's control tools may still act on
+	/// `worker_id` — i.e. it's a registered, still-attached worker
+	/// (ADR 0052). Unregistered sessions stay unaffected: nothing
+	/// here gates a coordinator from steering a session it never
+	/// spawned.
+	fn controls(&self, worker_id: &str) -> bool {
+		!self
+			.by_orchestrator
+			.values()
+			.any(|entry| entry.disconnected.contains(worker_id))
 	}
 }
 
@@ -4080,6 +4148,118 @@ impl CoderHandle {
 			}),
 		})
 	}
+
+	/// Whether `session_id` is registered as a coordinator-spawned
+	/// worker — attached or already disconnected (ADR 0052). Drives
+	/// the session-bar disconnect affordance, which must also reach
+	/// an already-disconnected worker so a second click can end its
+	/// current turn.
+	pub async fn is_coordinator_worker(&self, session_id: &str) -> bool {
+		self.state.coordinator_workers.read().await.is_worker(session_id)
+	}
+
+	/// Unhook a coordinator-spawned worker from its orchestrator
+	/// (ADR 0052). The session itself is never touched: it keeps its
+	/// transcript, branch, and worktree, and its in-flight turn (if
+	/// any) runs to completion — the feeder drops the link fully once
+	/// that final turn lands and tells the orchestrator. When the
+	/// worker is idle the orchestrator hears it right away instead.
+	///
+	/// Clicking the affordance a second time (worker already
+	/// disconnected) is the "stop it now" path and cancels the
+	/// in-flight turn. A session no coordinator spawned returns
+	/// [`DisconnectWorkerOutcome::NotAWorker`] and is left alone.
+	pub async fn disconnect_worker(&self, session_id: &str) -> DisconnectWorkerOutcome {
+		let orchestrator_id = self
+			.state
+			.coordinator_workers
+			.read()
+			.await
+			.owning_orchestrator_of(session_id)
+			.map(str::to_string);
+		let Some(orchestrator_id) = orchestrator_id else {
+			return DisconnectWorkerOutcome::NotAWorker;
+		};
+		let freshly_cut = self
+			.state
+			.coordinator_workers
+			.write()
+			.await
+			.disconnect(&orchestrator_id, session_id);
+		if !freshly_cut {
+			// Second click: already unhooked. If its turn is still
+			// running, this is the user's "stop it now" — cancel it.
+			// The feeder then delivers the final wake right away
+			// (the abort emits a `TurnComplete`) and removes the link.
+			let Some((rt, _)) = self.state.runtime_for_session(session_id).await else {
+				return DisconnectWorkerOutcome::AlreadyDisconnected;
+			};
+			let token = rt.turn.lock().await.cancel.clone();
+			let Some(token) = token else {
+				return DisconnectWorkerOutcome::AlreadyDisconnected;
+			};
+			token.cancel();
+			return DisconnectWorkerOutcome::Aborted;
+		}
+		// First click: the link is cut. If the worker is idle it
+		// will never emit the `TurnComplete` the feeder uses to
+		// deliver the final wake, so notify the orchestrator now and
+		// drop the link entirely.
+		let running = match self.state.runtime_for_session(session_id).await {
+			Some((rt, _)) => rt.turn.lock().await.cancel.is_some(),
+			None => false,
+		};
+		if running {
+			return DisconnectWorkerOutcome::Disconnected;
+		}
+		self
+			.state
+			.coordinator_workers
+			.write()
+			.await
+			.remove(&orchestrator_id, session_id);
+		let handle = CoderHandle {
+			state: self.state.clone(),
+		};
+		// Detached — the click isn't blocked on the orchestrator's
+		// wake bookkeeping; failure (orchestrator unmounted /
+		// deleted) only costs the notice.
+		let session_id = session_id.to_string();
+		tokio::spawn(async move {
+			let _ = handle
+				.send_to(
+					&orchestrator_id,
+					format!(
+						"Worker {session_id} was disconnected by the user. It is no longer attached to you: \
+						 its updates won't reach you any more and your control tools (steer / abort / commit / \
+						 merge / respond) refuse it. Its session, branch, and worktree are untouched — the user \
+						 owns it from here. Don't wait on it; adjust your plan."
+					),
+					Vec::new(),
+				)
+				.await;
+		});
+		DisconnectWorkerOutcome::Disconnected
+	}
+}
+
+/// Outcome of [`CoderHandle::disconnect_worker`] (ADR 0052).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisconnectWorkerOutcome {
+	/// The session is a still-attached worker: the link was cut and
+	/// the coordinator is being told (immediately when idle, after
+	/// its in-flight turn otherwise — see the dispatch feeder).
+	Disconnected,
+	/// The session was already disconnected and still had a turn in
+	/// flight, which was cancelled — the second-click "stop it now"
+	/// path.
+	Aborted,
+	/// The session was already disconnected with nothing to cancel.
+	AlreadyDisconnected,
+	/// The session isn't registered as any coordinator's worker;
+	/// nothing happened.
+	NotAWorker,
 }
 
 /// How much of a user's worker message we quote into the coordinator's
@@ -6042,32 +6222,63 @@ fn spawn_dispatch_feeder(state: Arc<CoderState>, orchestrator_id: String) {
 		loop {
 			let recv = rx.recv().await;
 			let Ok(envelope) = recv else { continue };
-			// Is this envelope from one of our workers? A user
-			// message into a worker doesn't unhook it (ADR 0043) —
-			// only spawning registers, and nothing unregisters.
+			let worker_id = envelope.session_id.clone();
+			// Is this envelope from one of our attached workers? A
+			// user message into a worker doesn't unhook it (ADR
+			// 0043); an explicit disconnect does (ADR 0052).
 			let is_our_worker = state
 				.coordinator_workers
 				.read()
 				.await
-				.feeds(&orchestrator_id, &envelope.session_id);
-			if !is_our_worker {
+				.feeds(&orchestrator_id, &worker_id);
+			if is_our_worker {
+				// Only forward events that warrant a wake — not every
+				// streaming delta. `TurnComplete` (the worker finished
+				// its turn) is the one the ADR names as the primary
+				// wake signal; the orchestrator then calls
+				// `observe_worker` for a snapshot.
+				if matches!(envelope.event, CoderEvent::TurnComplete) {
+					let _ = handle
+						.send_to(
+							&orchestrator_id,
+							format!("Worker {worker_id} completed a turn. Use `observe_worker` to see its current state."),
+							Vec::new(),
+						)
+						.await;
+				}
 				continue;
 			}
-			let worker_id = envelope.session_id.clone();
-			// Only forward events that warrant a wake — not every
-			// streaming delta. `TurnComplete` (the worker finished
-			// its turn) is the one the ADR names as the primary
-			// wake signal; the orchestrator then calls
-			// `observe_worker` for a snapshot.
-			let packet = match &envelope.event {
-				CoderEvent::TurnComplete => Some(format!(
-					"Worker {worker_id} completed a turn. Use `observe_worker` to see its current state."
-				)),
-				_ => None,
-			};
-			if let Some(text) = packet {
-				let _ = handle.send_to(&orchestrator_id, text, Vec::new()).await;
+			// Not an attached worker. A **disconnected** one still
+			// earns exactly one final `TurnComplete` wake (ADR 0052):
+			// the disconnect command cuts the link without touching
+			// the worker's in-flight turn, and the orchestrator needs
+			// to hear that the worker left its fleet or it would keep
+			// waiting on it. `remove` drops the link entirely as part
+			// of the same check, so this fires once and everything
+			// else the disconnected worker emits stays silent.
+			if !matches!(envelope.event, CoderEvent::TurnComplete) {
+				continue;
 			}
+			let was_registered = state
+				.coordinator_workers
+				.write()
+				.await
+				.remove(&orchestrator_id, &worker_id);
+			if !was_registered {
+				continue;
+			}
+			let _ = handle
+				.send_to(
+					&orchestrator_id,
+					format!(
+						"Worker {worker_id} was disconnected by the user and its in-flight turn has now finished. \
+						 It is no longer attached to you: its updates won't reach you any more and your control \
+						 tools (steer / abort / commit / merge / respond) refuse it. Its session, branch, and \
+						 worktree are untouched — the user owns it from here. Don't wait on it; adjust your plan."
+					),
+					Vec::new(),
+				)
+				.await;
 		}
 	});
 }
@@ -6090,6 +6301,21 @@ async fn handle_observe_worker(state: &Arc<CoderState>, args: &Value) -> Result<
 	Ok(serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({ "error": "serialization failed" })))
 }
 
+/// Refuse a coordinator control tool targeting a worker the user
+/// disconnected (ADR 0052): once unhooked, the coordinator may no
+/// longer act on it. Sessions no coordinator spawned (or spawned and
+/// fully released after the final wake) sail through — nothing here
+/// gates a coordinator steering a session that was never its worker.
+async fn ensure_worker_still_attached(state: &Arc<CoderState>, tool: &str, worker_id: &str) -> Result<(), CoderError> {
+	if state.coordinator_workers.read().await.controls(worker_id) {
+		return Ok(());
+	}
+	Err(CoderError::invalid_args(
+		tool,
+		format!("worker `{worker_id}` was disconnected by the user — it is no longer attached to you; leave it alone"),
+	))
+}
+
 /// `steer_worker` — send a steering message to a worker by id.
 async fn handle_steer_worker(state: &Arc<CoderState>, args: &Value) -> Result<Value, CoderError> {
 	#[derive(serde::Deserialize)]
@@ -6102,6 +6328,7 @@ async fn handle_steer_worker(state: &Arc<CoderState>, args: &Value) -> Result<Va
 	if parsed.text.trim().is_empty() {
 		return Err(CoderError::invalid_args("steer_worker", "text must not be empty"));
 	}
+	ensure_worker_still_attached(state, "steer_worker", &parsed.worker_id).await?;
 	let handle = CoderHandle { state: state.clone() };
 	handle.send_to(&parsed.worker_id, parsed.text, Vec::new()).await?;
 	Ok(json!({ "status": "steered" }))
@@ -6115,6 +6342,7 @@ async fn handle_abort_worker(state: &Arc<CoderState>, args: &Value) -> Result<Va
 	}
 	let parsed: AbortArgs =
 		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("abort_worker", err.to_string()))?;
+	ensure_worker_still_attached(state, "abort_worker", &parsed.worker_id).await?;
 	let handle = CoderHandle { state: state.clone() };
 	handle.abort_session(&parsed.worker_id).await;
 	Ok(json!({ "status": "aborted" }))
@@ -6131,6 +6359,7 @@ async fn handle_respond_to_worker_prompt(state: &Arc<CoderState>, args: &Value) 
 	}
 	let parsed: RespondArgs = serde_json::from_value(args.clone())
 		.map_err(|err| CoderError::invalid_args("respond_to_worker_prompt", err.to_string()))?;
+	ensure_worker_still_attached(state, "respond_to_worker_prompt", &parsed.worker_id).await?;
 	// Find the worker's parked prompt call id. A worker has at most
 	// one pending `ask_user` at a time (the loop blocks on it).
 	let handle = CoderHandle { state: state.clone() };
@@ -6338,6 +6567,7 @@ async fn handle_commit_worker_changes(state: &Arc<CoderState>, args: &Value) -> 
 	}
 	let parsed: CommitArgs = serde_json::from_value(args.clone())
 		.map_err(|err| CoderError::invalid_args("commit_worker_changes", err.to_string()))?;
+	ensure_worker_still_attached(state, "commit_worker_changes", &parsed.worker_id).await?;
 	let Some((rt, _)) = state.runtime_for_session(&parsed.worker_id).await else {
 		return Err(CoderError::invalid_args(
 			"commit_worker_changes",
@@ -6400,6 +6630,7 @@ async fn handle_merge_worker_changes(state: &Arc<CoderState>, args: &Value) -> R
 	}
 	let parsed: MergeArgs = serde_json::from_value(args.clone())
 		.map_err(|err| CoderError::invalid_args("merge_worker_changes", err.to_string()))?;
+	ensure_worker_still_attached(state, "merge_worker_changes", &parsed.worker_id).await?;
 	let Some((rt, _)) = state.runtime_for_session(&parsed.worker_id).await else {
 		return Err(CoderError::invalid_args(
 			"merge_worker_changes",
@@ -6486,6 +6717,7 @@ async fn handle_discard_worker_worktree(
 	}
 	let parsed: DiscardArgs = serde_json::from_value(args.clone())
 		.map_err(|err| CoderError::invalid_args("discard_worker_worktree", err.to_string()))?;
+	ensure_worker_still_attached(state, "discard_worker_worktree", &parsed.worker_id).await?;
 	let Some((rt, _)) = state.runtime_for_session(&parsed.worker_id).await else {
 		return Err(CoderError::invalid_args(
 			"discard_worker_worktree",
@@ -8718,6 +8950,47 @@ mod tests {
 			// a worker — messaging it notifies nobody.
 			assert_eq!(reg.orchestrator_of("sess-ordinary"), None);
 			assert_eq!(reg.orchestrator_of("orch-1"), None);
+		}
+
+		#[test]
+		fn disconnect_unhooks_feeds_notifies_and_controls() {
+			// ADR 0052: an explicit disconnect — unlike a user
+			// message (ADR 0043) — cuts every channel.
+			let mut reg = CoordinatorRegistry::default();
+			reg.register("orch-1", "w-1");
+			assert!(reg.disconnect("orch-1", "w-1"));
+			assert!(!reg.feeds("orch-1", "w-1"));
+			assert_eq!(reg.orchestrator_of("w-1"), None);
+			assert!(!reg.controls("w-1"));
+			// …but the membership itself is still visible so the
+			// UI can offer the second-click abort, and a repeated
+			// disconnect reports "already cut".
+			assert!(reg.is_worker("w-1"));
+			assert_eq!(reg.owning_orchestrator_of("w-1"), Some("orch-1"));
+			assert!(!reg.disconnect("orch-1", "w-1"));
+		}
+
+		#[test]
+		fn disconnect_ignores_sessions_that_are_not_workers() {
+			let mut reg = CoordinatorRegistry::default();
+			reg.register("orch-1", "w-1");
+			assert!(!reg.disconnect("orch-1", "sess-ordinary"));
+			assert!(!reg.disconnect("orch-2", "w-1"));
+			assert!(reg.controls("sess-ordinary"));
+		}
+
+		#[test]
+		fn remove_after_disconnect_drops_all_memory_of_the_link() {
+			// The feeder removes the link once the final wake
+			// lands; afterwards a disconnect attempt finds nothing.
+			let mut reg = CoordinatorRegistry::default();
+			reg.register("orch-1", "w-1");
+			reg.disconnect("orch-1", "w-1");
+			assert!(reg.remove("orch-1", "w-1"));
+			assert!(!reg.is_worker("w-1"));
+			assert_eq!(reg.owning_orchestrator_of("w-1"), None);
+			assert!(reg.controls("w-1"));
+			assert!(!reg.remove("orch-1", "w-1"));
 		}
 	}
 
