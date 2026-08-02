@@ -108,21 +108,38 @@ impl LspSpawner {
 	/// `LspBinarySpec` carries the right argv so this layer
 	/// stays generic.
 	///
-	/// stdout / stderr are dropped — we only care about the
-	/// exit status. Any spawn failure (docker not installed,
-	/// container missing, binary missing) also returns `false`.
-	pub async fn probe(&self, bin: &str, probe_args: &[&str]) -> bool {
+	/// stdout / stderr are captured on failure so the broker can log
+	/// *why* the probe crashed (missing shared library, TS version
+	/// incompatibility, etc.). Any spawn failure (docker not installed,
+	/// container missing, binary missing) also returns `Err` with the
+	/// IO error string.
+	pub async fn probe(&self, bin: &str, probe_args: &[&str]) -> Result<bool, String> {
 		let bin_path = Path::new(bin);
 		let mut cmd = self.build_command(bin_path, probe_args);
 		cmd.stdin(Stdio::null());
-		cmd.stdout(Stdio::null());
-		cmd.stderr(Stdio::null());
+		cmd.stdout(Stdio::piped());
+		cmd.stderr(Stdio::piped());
 		cmd.kill_on_drop(true);
-		match cmd.status().await {
-			Ok(status) => status.success(),
+		match cmd.output().await {
+			Ok(output) => {
+				if output.status.success() {
+					Ok(true)
+				} else {
+					let stderr = String::from_utf8_lossy(&output.stderr);
+					let stdout = String::from_utf8_lossy(&output.stdout);
+					let detail = if !stderr.is_empty() {
+						stderr.to_string()
+					} else if !stdout.is_empty() {
+						stdout.to_string()
+					} else {
+						format!("exit code {}", output.status)
+					};
+					Err(detail)
+				}
+			}
 			Err(err) => {
 				tracing::debug!(bin = bin, error = %err, "lsp probe: spawn failed");
-				false
+				Err(err.to_string())
 			}
 		}
 	}
@@ -194,7 +211,7 @@ mod tests {
 	#[tokio::test]
 	async fn probe_returns_true_on_zero_exit() {
 		let spawner = LspSpawner::Local;
-		assert!(spawner.probe("/bin/echo", &["--version"]).await);
+		assert!(spawner.probe("/bin/echo", &["--version"]).await.unwrap());
 	}
 
 	/// `Local::probe` returns false when the binary doesn't
@@ -203,7 +220,10 @@ mod tests {
 	#[tokio::test]
 	async fn probe_returns_false_on_missing_bin() {
 		let spawner = LspSpawner::Local;
-		assert!(!spawner.probe("/definitely/not/a/binary/xyzzy", &["--version"]).await);
+		assert!(spawner
+			.probe("/definitely/not/a/binary/xyzzy", &["--version"])
+			.await
+			.is_err());
 	}
 
 	/// `false(1)` is POSIX-standard and exits non-zero; use it
@@ -213,7 +233,7 @@ mod tests {
 	#[tokio::test]
 	async fn probe_returns_false_on_non_zero_exit() {
 		let spawner = LspSpawner::Local;
-		assert!(!spawner.probe("/bin/false", &["--version"]).await);
+		assert!(spawner.probe("/bin/false", &["--version"]).await.is_err());
 	}
 
 	/// Probe argv flows through verbatim — regression guard for
@@ -227,7 +247,7 @@ mod tests {
 	async fn probe_uses_supplied_argv() {
 		let spawner = LspSpawner::Local;
 		// `/bin/true` ignores all args and exits zero.
-		assert!(spawner.probe("/bin/true", &["version"]).await);
-		assert!(spawner.probe("/bin/true", &[]).await);
+		assert!(spawner.probe("/bin/true", &["version"]).await.unwrap());
+		assert!(spawner.probe("/bin/true", &[]).await.unwrap());
 	}
 }

@@ -132,7 +132,10 @@ enum ServerSlot {
 /// fallback, the second should not.
 enum SpawnOutcome {
 	Ready(Arc<LspServer>),
-	Unavailable,
+	/// Binary was not found on this route (no `node_modules/.bin/svelteserver`, etc.)
+	BinaryNotFound,
+	/// Binary was found but the probe (`<bin> --version` or equivalent) crashed or exited non-zero.
+	ProbeFailed,
 	Err(LspClientError),
 }
 
@@ -367,13 +370,19 @@ impl LspBroker {
 					.error(&log_source, format!("spawn failed on primary route: {detail}"));
 				return Err(e);
 			}
-			SpawnOutcome::Unavailable => {
-				// Binary wasn't found or `--version` probe
-				// exited non-zero. Fall through to the host
+			SpawnOutcome::BinaryNotFound => {
+				// Binary wasn't found on this route. Fall through to the host
 				// fallback if one is configured.
 				self
 					.log_sink
 					.warn(&log_source, "binary not found on primary route (container)");
+			}
+			SpawnOutcome::ProbeFailed => {
+				// Binary was found but crashed on the probe. Fall through to the host
+				// fallback if one is configured.
+				self
+					.log_sink
+					.warn(&log_source, "probe failed on primary route (container)");
 			}
 		}
 
@@ -409,12 +418,17 @@ impl LspBroker {
 						.error(&log_source, format!("spawn failed on host fallback: {detail}"));
 					return Err(e);
 				}
-				SpawnOutcome::Unavailable => {
+				SpawnOutcome::BinaryNotFound => {
 					// Host fallback also missing the binary.
 					// Fall through to the NotAvailable pill.
 					self
 						.log_sink
 						.warn(&log_source, "binary not found on host fallback either");
+				}
+				SpawnOutcome::ProbeFailed => {
+					// Host fallback binary also crashed on probe.
+					// Fall through to the NotAvailable pill.
+					self.log_sink.warn(&log_source, "probe failed on host fallback too");
 				}
 			}
 		}
@@ -473,7 +487,7 @@ impl LspBroker {
 							spec.bin_name
 						),
 					);
-					return SpawnOutcome::Unavailable;
+					return SpawnOutcome::BinaryNotFound;
 				}
 			},
 			LspSpawner::DockerExec { .. } => match container_binary_path(spec, &route.translator) {
@@ -496,7 +510,7 @@ impl LspBroker {
 							spec.bin_name
 						),
 					);
-					return SpawnOutcome::Unavailable;
+					return SpawnOutcome::BinaryNotFound;
 				}
 			},
 		};
@@ -511,18 +525,20 @@ impl LspBroker {
 		// Argv is per-spec — most servers accept `--version`,
 		// gopls is the odd one out with subcommand syntax.
 		let bin_str = bin_path.to_string_lossy();
-		if !route.spawner.probe(&bin_str, spec.probe_args).await {
+		if let Err(detail) = route.spawner.probe(&bin_str, spec.probe_args).await {
 			tracing::info!(
 				bin = spec.bin_name,
 				lang = spec.language_id,
 				path = %bin_str,
 				probe_args = ?spec.probe_args,
+				error = %detail,
 				"lsp: probe failed on this route"
 			);
-			self
-				.log_sink
-				.warn(&log_source, format!("probe `{} {:?}` failed", bin_str, spec.probe_args));
-			return SpawnOutcome::Unavailable;
+			self.log_sink.warn(
+				&log_source,
+				format!("probe `{} {:?}` failed: {}", bin_str, spec.probe_args, detail),
+			);
+			return SpawnOutcome::ProbeFailed;
 		}
 
 		// Workspace folders the server should anchor on. Language
@@ -552,7 +568,7 @@ impl LspBroker {
 		.await
 		{
 			Ok(Some(server)) => SpawnOutcome::Ready(server),
-			Ok(None) => SpawnOutcome::Unavailable,
+			Ok(None) => SpawnOutcome::ProbeFailed,
 			Err(e) => {
 				tracing::warn!(error = %e, lang = spec.language_id, "lsp: spawn failed");
 				SpawnOutcome::Err(e)
