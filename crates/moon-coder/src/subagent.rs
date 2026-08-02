@@ -310,6 +310,12 @@ pub struct Subagent {
 	pub task: String,
 	pub system_prompt_override: Option<String>,
 	pub mode: CoderMode,
+	/// Whether this run was spawned with `detach: true` ([ADR
+	/// 0053]): the parent's tool call returns a handle immediately
+	/// and the run settles in the background, surfaced via the
+	/// detached registry + `task_collect` instead of a blocking
+	/// tool result. `false` for every synchronous `task` call.
+	pub detach: bool,
 	/// Folder the sub-agent's tools operate against. May differ
 	/// from `parent_folder` when the model passed an explicit
 	/// `folder` argument to `task`. Surfaced as `target_folder`
@@ -321,13 +327,24 @@ pub struct Subagent {
 /// dispatch. `result` is the only field the parent's model sees
 /// (as the tool's stringified return value); the others are
 /// metadata the UI uses to render the collapsed card / pop-out.
-#[derive(Debug, Clone)]
+///
+/// `Serialize` so a detached run ([ADR 0053]) can stash the
+/// finished report in the registry and have `task_collect`
+/// return it verbatim.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SubagentReport {
 	pub result: String,
 	pub tokens_used_estimate: u32,
 	pub sub_session_id: String,
+	#[serde(serialize_with = "serialize_mode_wire")]
 	pub mode: CoderMode,
 	pub iterations_used: u32,
+}
+
+/// `CoderMode` isn't `Serialize` (it's a dispatch-level enum, not
+/// a wire type); the report serialises it as its wire string.
+fn serialize_mode_wire<S: serde::Serializer>(mode: &CoderMode, s: S) -> Result<S::Ok, S::Error> {
+	s.serialize_str(mode.as_wire())
 }
 
 /// JSON tool definition for the `task` tool (delegation primitive
@@ -375,11 +392,59 @@ The sub-agent has no access to your conversation history — describe the task s
 				"system_prompt": {
 					"type": "string",
 					"description": "Optional override for the sub-agent's system prompt. Most callers should leave this empty and rely on the mode-default prompt."
+				},
+				"detach": {
+					"type": "boolean",
+					"description": "When true, the call returns immediately with a `subagent_id` handle instead of blocking on the report: the sub-agent runs in the background and you keep working. Its finish wakes you with a notice; fetch the report with `task_collect(subagent_id)` (optionally `wait_ms` to block until it settles, capped 60 s) and stop it early with `task_abort(subagent_id)`. Default false (synchronous). Prefer detach for slow, independent work you don't need the answer to before continuing — long test suites, background audits, anything you'd otherwise park the whole turn behind."
 				}
 			},
 			"required": ["task"]
 		}),
 	)
+}
+
+/// `task_collect` — fetch a detached sub-agent's report ([ADR
+/// 0053]). Lives outside `ToolRegistry::definitions()` alongside
+/// `task_tool_definition` so sub-agents never see it.
+pub fn task_collect_tool_definition() -> ToolDefinition {
+	ToolDefinition::function(
+			"task_collect",
+			"Fetch the report of a detached sub-agent (one spawned with `task({ ..., detach: true })`). Returns `{ status: \"done\", result, tokens_used_estimate, iterations_used }` once it settles, `{ status: \"error\", error }` on failure, or `{ status: \"running\" }` while it's still going. Pass `wait_ms` to block until it settles (capped at 60 s) instead of returning `running` immediately — use one `task_collect(id, wait_ms: 60000)` call per minute rather than busy-polling. The report is cached after the run settles, so a second collect returns instantly. Only ids your own session spawned (with `detach: true`) are collectable; a synchronous `task` call has no handle to collect.",
+			json!({
+				"type": "object",
+				"properties": {
+					"subagent_id": {
+						"type": "string",
+						"description": "The `subagent_id` a detached `task` call returned."
+					},
+					"wait_ms": {
+						"type": "integer",
+						"description": "Optional. Block up to this many milliseconds for the run to settle (capped at 60000). Omit to return immediately with the current status."
+					}
+				},
+				"required": ["subagent_id"]
+			}),
+		)
+}
+
+/// `task_abort` — cancel a running detached sub-agent ([ADR
+/// 0053]). Scoped to the one sub-agent; never touches the parent
+/// turn or sibling sub-agents.
+pub fn task_abort_tool_definition() -> ToolDefinition {
+	ToolDefinition::function(
+			"task_abort",
+			"Cancel a running detached sub-agent. Its partial work is discarded (the turn's format-on-save flush still runs for whatever it already wrote). Returns `{ status: \"aborted\" }` when it was running, `{ status: \"not_running\" }` when it had already settled (its report is still available via `task_collect`). Never affects your own turn or other sub-agents.",
+			json!({
+				"type": "object",
+				"properties": {
+					"subagent_id": {
+						"type": "string",
+						"description": "The `subagent_id` a detached `task` call returned."
+					}
+				},
+				"required": ["subagent_id"]
+			}),
+		)
 }
 
 /// Run a sub-agent to completion (or a budget cap, or
@@ -412,6 +477,7 @@ pub(crate) async fn run_subagent(
 		target_folder: spec.folder.folder.path.clone(),
 		mode: mode.as_wire().to_string(),
 		worktree_root: None,
+		detached: spec.detach,
 	});
 
 	// Mirror the task into the sub-agent's own transcript as a
@@ -567,6 +633,10 @@ pub(crate) async fn resume_subagent(
 		target_folder: spec.folder.folder.path.clone(),
 		mode: spec.mode.as_wire().to_string(),
 		worktree_root: None,
+		// A user-driven resume keeps the original spawn's detach
+		// semantics; the resume itself doesn't restamp the flag
+		// (`spec.detach` is false here by construction).
+		detached: spec.detach,
 	});
 	sink.send(wrap_inner(
 		&id,
@@ -1523,6 +1593,8 @@ pub fn build_subagent_spec(
 		.filter(|s| !s.is_empty())
 		.map(str::to_string);
 
+	let detach = args.get("detach").and_then(Value::as_bool).unwrap_or(false);
+
 	Ok(Subagent {
 		id: new_subagent_id(),
 		parent_session_id,
@@ -1531,6 +1603,7 @@ pub fn build_subagent_spec(
 		task,
 		system_prompt_override,
 		mode,
+		detach,
 		folder,
 	})
 }

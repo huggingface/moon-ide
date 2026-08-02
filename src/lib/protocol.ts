@@ -1711,6 +1711,12 @@ export type CoderEvent =
 			target_folder: string;
 			mode: SubagentMode;
 			worktree_root?: string | null;
+			/** ADR 0053 — `true` for a detached `task`: the parent's tool
+			 *  call returned a handle and the run settles in the
+			 *  background. Frontend badges the card so a background run
+			 *  reads differently from a blocking one. Absent (false) for
+			 *  synchronous spawns. */
+			detached?: boolean;
 	  }
 	| { kind: 'subagent_event'; subagent_id: string; inner: CoderEvent }
 	| { kind: 'subagent_finished'; subagent_id: string; tokens_used_estimate: number; was_error: boolean }

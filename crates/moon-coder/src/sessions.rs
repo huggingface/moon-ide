@@ -457,6 +457,7 @@ pub(crate) fn record_to_pi_wire(
 			target_folder,
 			mode,
 			worktree_root,
+			detached,
 		} => pi_message_envelope(
 			pi_custom_message(
 				CUSTOM_TYPE_SUBAGENT_SPAWNED,
@@ -466,6 +467,7 @@ pub(crate) fn record_to_pi_wire(
 					"target_folder": target_folder,
 					"mode": mode,
 					"worktree_root": worktree_root,
+					"detached": detached,
 				}),
 			),
 			timestamp_ms,
@@ -1132,6 +1134,7 @@ fn parse_pi_custom(msg: &serde_json::Value) -> Option<SessionRecord> {
 				.and_then(|v| v.as_str())
 				.filter(|s| !s.is_empty())
 				.map(|s| s.to_string()),
+			detached: details.get("detached").and_then(|v| v.as_bool()).unwrap_or(false),
 		}),
 		CUSTOM_TYPE_SUBAGENT_FINISHED => Some(SessionRecord::SubagentFinished {
 			subagent_id: details
@@ -1373,6 +1376,12 @@ pub enum SessionRecord {
 		/// (ADR 0030). Absent for `task` sub-agents.
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		worktree_root: Option<String>,
+		/// `true` for a detached `task` spawn ([ADR 0053]). Kept on
+		/// the record so a reloaded parent re-badges the card
+		/// "detached" without re-deriving it. Absent for synchronous
+		/// spawns.
+		#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+		detached: bool,
 	},
 	/// One sub-agent finished (success or error). Mirrors
 	/// [`crate::CoderEvent::SubagentFinished`] plus a
@@ -3308,6 +3317,7 @@ mod tests {
 				target_folder: "/workspace/api".into(),
 				mode: "agent".into(),
 				worktree_root: None,
+				detached: false,
 			},
 		)
 		.await
@@ -3333,12 +3343,14 @@ mod tests {
 				target_folder,
 				mode,
 				worktree_root,
+				detached,
 			} => {
 				assert_eq!(tool_call_id, "call-1");
 				assert_eq!(subagent_id, "sub-x");
 				assert_eq!(target_folder, "/workspace/api");
 				assert_eq!(mode, "agent");
 				assert_eq!(*worktree_root, None);
+				assert!(!*detached);
 			}
 			other => panic!("expected SubagentSpawned, got {other:?}"),
 		}

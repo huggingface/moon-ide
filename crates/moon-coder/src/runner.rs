@@ -139,6 +139,12 @@ struct CoderState {
 	/// `SessionRuntime`) so the feeder task can read it without
 	/// holding a session lock.
 	coordinator_workers: Arc<RwLock<CoordinatorRegistry>>,
+	/// Parent → detached-sub-agent registry ([ADR 0053]). Same
+	/// lifetime rationale as `coordinator_workers`: the finish
+	/// feeder and the collect/abort tools read it without holding
+	/// a session lock, and it's in-memory because a restart loses
+	/// the live runs anyway.
+	detached_tasks: Arc<RwLock<DetachedTaskRegistry>>,
 }
 
 /// In-memory orchestrator → worker links (ADR 0030). Not persisted:
@@ -257,6 +263,124 @@ impl CoordinatorRegistry {
 			.by_orchestrator
 			.values()
 			.any(|entry| entry.disconnected.contains(worker_id))
+	}
+}
+
+/// Whether a detached sub-agent run has settled, and how.
+/// `Aborted` is split from `Failed` so `task_collect` can say
+/// "you aborted it" instead of surfacing a generic error.
+#[derive(Debug, Clone)]
+enum DetachedFinish {
+	Done(crate::subagent::SubagentReport),
+	Failed(String),
+	Aborted,
+}
+
+/// One in-flight (or settled, cached) detached sub-agent run.
+/// `notify` fires exactly once when the run settles; `task_collect`'s
+/// `wait_ms` blocks on it instead of busy-polling.
+struct DetachedEntry {
+	cancel: CancellationToken,
+	notify: Arc<tokio::sync::Notify>,
+	finish: Mutex<Option<DetachedFinish>>,
+}
+
+/// In-memory parent → detached-sub-agent registry ([ADR 0053]).
+/// Maps each parent session id to the detached sub-agents it
+/// spawned, so the finish feeder can tell which `SubagentFinished`
+/// events belong to which parent, `task_collect` / `task_abort`
+/// can find a run by id, and the user-level abort can cascade to
+/// a session's live detached runs. Not persisted: a process
+/// restart loses the live runs the same way a coordinator's
+/// workers are lost (the sub-agent's JSONL stays on disk).
+#[derive(Default)]
+struct DetachedTaskRegistry {
+	/// Parent session id → its detached sub-agent ids (live or
+	/// settled-but-cached). The entry sets drive the feeder
+	/// subscription lifetime and the abort cascade.
+	by_parent: HashMap<String, HashSet<String>>,
+	/// Sub-agent id → its run entry. Lives past `settle` so a
+	/// later `task_collect` still returns the cached report.
+	entries: HashMap<String, Arc<DetachedEntry>>,
+}
+
+impl DetachedTaskRegistry {
+	/// Register a freshly-spawned detached run under its parent.
+	/// Returns the shared entry the spawned task settles into.
+	fn register(&mut self, parent_session_id: &str, subagent_id: &str, cancel: CancellationToken) -> Arc<DetachedEntry> {
+		let entry = Arc::new(DetachedEntry {
+			cancel,
+			notify: Arc::new(tokio::sync::Notify::new()),
+			finish: Mutex::new(None),
+		});
+		self
+			.by_parent
+			.entry(parent_session_id.to_string())
+			.or_default()
+			.insert(subagent_id.to_string());
+		self.entries.insert(subagent_id.to_string(), entry.clone());
+		entry
+	}
+
+	/// Whether `subagent_id` is a detached run of `parent_session_id`.
+	fn is_detached_of(&self, parent_session_id: &str, subagent_id: &str) -> bool {
+		self
+			.by_parent
+			.get(parent_session_id)
+			.is_some_and(|set| set.contains(subagent_id))
+	}
+
+	/// The run entry for `subagent_id`, if it's a registered
+	/// detached run (live or settled-cached). `task_collect` /
+	/// `task_abort` look runs up here; ids that were never detached
+	/// (or were lost to a restart) miss.
+	fn entry(&self, subagent_id: &str) -> Option<Arc<DetachedEntry>> {
+		self.entries.get(subagent_id).cloned()
+	}
+
+	/// Record a run's terminal state and wake any parked
+	/// `task_collect(wait_ms)`. The entry stays in `entries` (and
+	/// the parent's set) so a later collect returns the cached
+	/// report instantly.
+	async fn settle(entry: &DetachedEntry, finish: DetachedFinish) {
+		*entry.finish.lock().await = Some(finish);
+		entry.notify.notify_waiters();
+	}
+
+	/// All live cancel tokens for `parent_session_id`'s detached
+	/// runs — the user-level abort cascade cancels each. A run whose
+	/// token is already cancelled is harmlessly re-cancelled.
+	fn live_tokens_of(&self, parent_session_id: &str) -> Vec<CancellationToken> {
+		self
+			.by_parent
+			.get(parent_session_id)
+			.into_iter()
+			.flatten()
+			.filter_map(|id| self.entries.get(id))
+			.map(|entry| entry.cancel.clone())
+			.collect()
+	}
+
+	/// Drop every settled entry, keeping only runs whose `finish`
+	/// is still `None`. Housekeeping so a long-lived process
+	/// doesn't accumulate one map entry per detached run forever;
+	/// a settled run's *report* has already been delivered (or is
+	/// unreadable after this, which is fine — the transcript is on
+	/// disk).
+	async fn prune_settled(&mut self) {
+		let mut dead = Vec::new();
+		for (id, entry) in &self.entries {
+			if entry.finish.lock().await.is_some() {
+				dead.push(id.clone());
+			}
+		}
+		for id in dead {
+			self.entries.remove(&id);
+			for set in self.by_parent.values_mut() {
+				set.remove(&id);
+			}
+		}
+		self.by_parent.retain(|_, set| !set.is_empty());
 	}
 }
 
@@ -834,6 +958,7 @@ impl CoderHandle {
 				provider_keys,
 				hub_sync,
 				coordinator_workers: Arc::new(RwLock::new(CoordinatorRegistry::default())),
+				detached_tasks: Arc::new(RwLock::new(DetachedTaskRegistry::default())),
 			}),
 		})
 	}
@@ -2373,6 +2498,7 @@ impl CoderHandle {
 					ref target_folder,
 					ref mode,
 					ref worktree_root,
+					ref detached,
 				} => {
 					// The resume path refuses mid-turn (guard above), so
 					// no sub-agent can still be running here.
@@ -2384,6 +2510,7 @@ impl CoderHandle {
 						target_folder.clone(),
 						mode.clone(),
 						worktree_root.clone(),
+						*detached,
 						false,
 					)
 					.await;
@@ -2901,6 +3028,7 @@ impl CoderHandle {
 					ref target_folder,
 					ref mode,
 					ref worktree_root,
+					ref detached,
 				} => {
 					let still_running = live_subagent_ids.contains(subagent_id.as_str());
 					replay_subagent_spawned(
@@ -2911,6 +3039,7 @@ impl CoderHandle {
 						target_folder.clone(),
 						mode.clone(),
 						worktree_root.clone(),
+						*detached,
 						still_running,
 					)
 					.await;
@@ -3609,6 +3738,13 @@ impl CoderHandle {
 		let Some(rt) = fs.runtime(&id).await else {
 			return;
 		};
+		// Cascade to the session's detached sub-agents ([ADR 0053]):
+		// they run on their own root tokens precisely so a *turn*
+		// end doesn't kill them, but the user hitting "stop" means
+		// "stop everything", so we cancel each run's token here.
+		for token in self.state.detached_tasks.read().await.live_tokens_of(&id) {
+			token.cancel();
+		}
 		let turn = rt.turn.lock().await;
 		if let Some(token) = turn.cancel.as_ref() {
 			token.cancel();
@@ -3780,6 +3916,12 @@ impl CoderHandle {
 			task,
 			system_prompt_override: None,
 			mode,
+			// A user-driven resume re-runs a previously-detached or
+			// synchronous sub-agent; the resume itself always runs
+			// detached from the caller's perspective (the pop-out
+			// owns it), but the *original* detach flag is what the
+			// registry recorded at spawn, so we don't restamp here.
+			detach: false,
 			folder: target_entry,
 		};
 		// Events land in the parent session's UI bucket, same as
@@ -4088,6 +4230,10 @@ impl CoderHandle {
 		let Some((rt, _)) = self.state.runtime_for_session(session_id).await else {
 			return;
 		};
+		// Same detached cascade as `abort` ([ADR 0053]).
+		for token in self.state.detached_tasks.read().await.live_tokens_of(session_id) {
+			token.cancel();
+		}
 		let turn = rt.turn.lock().await;
 		if let Some(token) = turn.cancel.as_ref() {
 			token.cancel();
@@ -4936,6 +5082,11 @@ async fn run_turn(
 	tool_defs.extend(state.tools.terminal_definitions(&cx).await);
 	if mode.allows_task_tool() {
 		tool_defs.push(task_tool_definition());
+		// Detached-sub-agent companions ([ADR 0053]): advertised to
+		// the same `Agent` mode that sees `task`, so sub-agents and
+		// coordinators never see them.
+		tool_defs.push(crate::subagent::task_collect_tool_definition());
+		tool_defs.push(crate::subagent::task_abort_tool_definition());
 	}
 	if mode.allows_ask_user() {
 		tool_defs.push(ask_user_tool_definition());
@@ -5558,11 +5709,24 @@ async fn dispatch_tool_calls(
 	// sequential path, which refuses that one call and runs the
 	// rest. Losing parallelism on a broken batch is a fine price
 	// for keeping the refusal in exactly one place.
+	//
+	// A batch containing a `detach: true` call also falls through:
+	// detached runs return their handle immediately, so the
+	// batch's `join_all`-then-report shape doesn't apply to them —
+	// routing them through the sequential dispatch (where
+	// `handle_task` branches to the detached spawn) keeps exactly
+	// one detached path.
 	let homogeneous_subagent = calls.len() >= 2
 		&& calls.iter().all(|c| c.function.name == "task")
 		&& calls
 			.iter()
-			.all(|c| tool_args_or_refusal(&c.function, hit_output_cap).is_ok());
+			.all(|c| tool_args_or_refusal(&c.function, hit_output_cap).is_ok())
+		&& !calls.iter().any(|c| {
+			parse_tool_args(&c.function)
+				.get("detach")
+				.and_then(Value::as_bool)
+				.unwrap_or(false)
+		});
 	if homogeneous_subagent {
 		dispatch_subagent_batch(state, rt, sink, cx, cancel, calls).await
 	} else {
@@ -5596,6 +5760,11 @@ async fn dispatch_tool_calls(
 			let dispatched_at = std::time::Instant::now();
 			let outcome = if call.function.name == "task" {
 				handle_task(state, rt, sink, cx, cancel, &call.id, &args).await
+			} else if call.function.name == "task_collect" {
+				// Detached-sub-agent report fetch ([ADR 0053]).
+				handle_task_collect(state, rt, &args).await
+			} else if call.function.name == "task_abort" {
+				handle_task_abort(state, rt, &args).await
 			} else if call.function.name == "ask_user" {
 				// Bidirectional: parks a oneshot on the session's
 				// prompt registry and blocks the turn until the user
@@ -5801,6 +5970,13 @@ async fn handle_task(
 		&cx.folder,
 		&bound,
 	)?;
+	// Detached spawn ([ADR 0053]): register, spawn, return a
+	// handle. The sub-agent runs on its own root token; its finish
+	// wakes the parent via the feeder and its report is collected
+	// via `task_collect`. The synchronous path below is unchanged.
+	if spec.detach {
+		return handle_task_detached(state, sink, tool_call_id, spec).await;
+	}
 	// Persist the spawn into the **parent**'s JSONL right away
 	// (before the sub-agent runs) so a crash / kill mid-sub-agent
 	// still leaves a record the parent can replay. The on-disk
@@ -5815,6 +5991,7 @@ async fn handle_task(
 			target_folder: spec.folder.folder.path.clone(),
 			mode: spec.mode.as_wire().to_string(),
 			worktree_root: None,
+			detached: false,
 		},
 	)
 	.await;
@@ -5901,6 +6078,268 @@ async fn persist_parent_record(rt: &Arc<SessionRuntime>, record: SessionRecord) 
 	if let Err(err) = sessions::append_record(&dir, &header, &record).await {
 		tracing::warn!(?err, "failed to persist subagent record on parent session");
 	}
+}
+
+/// `task` with `detach: true` ([ADR 0053]). Registers the run,
+/// spawns it on a fresh root token, and returns a handle
+/// immediately — the parent keeps working. The finish feeder
+/// wakes the parent when the run settles; `task_collect` fetches
+/// the report; `task_abort` / the user-level abort cancel it.
+async fn handle_task_detached(
+	state: &Arc<CoderState>,
+	sink: &FolderEventSink,
+	tool_call_id: &str,
+	spec: crate::subagent::Subagent,
+) -> Result<Value, CoderError> {
+	let subagent_id = spec.id.clone();
+	let parent_session_id = spec.parent_session_id.clone();
+	// Fresh root token: the run must outlive the spawning turn.
+	// The user-level abort walks the registry and cancels this
+	// token directly, so "stop everything" still stops it.
+	let cancel = CancellationToken::new();
+	let entry = state
+		.detached_tasks
+		.write()
+		.await
+		.register(&parent_session_id, &subagent_id, cancel.clone());
+	// Persist the spawn into the parent's JSONL (same shape as the
+	// synchronous path) so the collapsed card + pop-out rebuild on
+	// reload, and the parent's `SubagentFinished` record lands when
+	// the run settles. Resolve the runtime by the parent's id.
+	if let Some((parent_rt, _)) = state.runtime_for_session(&parent_session_id).await {
+		persist_parent_record(
+			&parent_rt,
+			SessionRecord::SubagentSpawned {
+				tool_call_id: tool_call_id.to_string(),
+				subagent_id: subagent_id.clone(),
+				target_folder: spec.folder.folder.path.clone(),
+				mode: spec.mode.as_wire().to_string(),
+				worktree_root: None,
+				detached: true,
+			},
+		)
+		.await;
+	}
+	// First detached run for this parent spawns its finish feeder.
+	spawn_detached_finish_feeder(state.clone(), parent_session_id.clone());
+
+	let state_for_run = state.clone();
+	let sink_for_run = sink.clone();
+	let parent_session_id_for_run = parent_session_id.clone();
+	let subagent_id_for_run = subagent_id.clone();
+	tokio::spawn(async move {
+		let outcome = run_subagent(
+			&state_for_run.tools,
+			&state_for_run.inference,
+			&sink_for_run,
+			&state_for_run.coder_sessions_dir,
+			&state_for_run.models,
+			spec,
+			cancel,
+		)
+		.await;
+		let finish = match &outcome {
+			Ok(report) => DetachedFinish::Done(report.clone()),
+			Err(CoderError::Aborted) => DetachedFinish::Aborted,
+			Err(err) => DetachedFinish::Failed(err.to_string()),
+		};
+		DetachedTaskRegistry::settle(&entry, finish).await;
+		// Persist the finish into the parent's JSONL, mirroring the
+		// synchronous path so a reloaded parent settles the card
+		// without lazy-loading the sub-agent's JSONL.
+		if let Some((parent_rt, _)) = state_for_run.runtime_for_session(&parent_session_id_for_run).await {
+			let finished_record = match &outcome {
+				Ok(report) => SessionRecord::SubagentFinished {
+					subagent_id: report.sub_session_id.clone(),
+					tokens_used_estimate: report.tokens_used_estimate,
+					was_error: false,
+					result_preview: result_preview_from(&report.result),
+				},
+				Err(_) => SessionRecord::SubagentFinished {
+					subagent_id: subagent_id_for_run,
+					tokens_used_estimate: 0,
+					was_error: true,
+					result_preview: None,
+				},
+			};
+			persist_parent_record(&parent_rt, finished_record).await;
+		}
+	});
+	Ok(json!({
+		"detached": true,
+		"subagent_id": subagent_id,
+		"status": "running",
+	}))
+}
+
+/// `task_collect` — return a detached run's report, optionally
+/// blocking up to `wait_ms` for it to settle. Only the parent that
+/// spawned the run may collect it.
+async fn handle_task_collect(
+	state: &Arc<CoderState>,
+	rt: &Arc<SessionRuntime>,
+	args: &Value,
+) -> Result<Value, CoderError> {
+	#[derive(serde::Deserialize)]
+	struct CollectArgs {
+		subagent_id: String,
+		#[serde(default)]
+		wait_ms: Option<u64>,
+	}
+	let parsed: CollectArgs =
+		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("task_collect", err.to_string()))?;
+	let parent_session_id = rt.session.lock().await.header.id.clone();
+	let entry = {
+		let registry = state.detached_tasks.read().await;
+		if !registry.is_detached_of(&parent_session_id, &parsed.subagent_id) {
+			return Err(CoderError::invalid_args(
+				"task_collect",
+				format!(
+					"no detached sub-agent `{}` for this session — only ids your own `task({{ detach: true }})` calls returned are collectable (a synchronous `task` has no handle)",
+					parsed.subagent_id
+				),
+			));
+		}
+		registry.entry(&parsed.subagent_id)
+	};
+	let Some(entry) = entry else {
+		// Registered under the parent but no live entry — a
+		// restart dropped the in-memory run. Point the model at
+		// the on-disk transcript instead of hanging.
+		return Err(CoderError::invalid_args(
+			"task_collect",
+			format!(
+				"detached sub-agent `{}` is no longer running (the IDE restarted); its transcript is on disk under the parent session's sub-agent directory",
+				parsed.subagent_id
+			),
+		));
+	};
+	// Already settled → return the cached finish immediately.
+	if let Some(value) = detached_collect_value(&entry).await {
+		return Ok(value);
+	}
+	// Still running. Either report `running` now, or park on the
+	// notify until it settles / the wait cap elapses.
+	let wait_ms = parsed.wait_ms.unwrap_or(0).min(60_000);
+	if wait_ms > 0 {
+		let notified = entry.notify.notified();
+		tokio::pin!(notified);
+		// Enable the notification *before* the timeout race so a
+		// settle between the check above and here isn't lost.
+		notified.as_mut().enable();
+		let _ = tokio::time::timeout(std::time::Duration::from_millis(wait_ms), notified).await;
+		if let Some(value) = detached_collect_value(&entry).await {
+			return Ok(value);
+		}
+	}
+	Ok(json!({ "status": "running" }))
+}
+
+/// Map a settled [`DetachedEntry`] to the `task_collect` result
+/// payload, or `None` while it's still running.
+async fn detached_collect_value(entry: &DetachedEntry) -> Option<Value> {
+	match entry.finish.lock().await.clone() {
+		Some(DetachedFinish::Done(report)) => Some(json!({
+			"status": "done",
+			"result": report.result,
+			"sub_session_id": report.sub_session_id,
+			"tokens_used_estimate": report.tokens_used_estimate,
+			"mode": report.mode.as_wire(),
+			"iterations_used": report.iterations_used,
+		})),
+		Some(DetachedFinish::Failed(error)) => Some(json!({ "status": "error", "error": error })),
+		Some(DetachedFinish::Aborted) => Some(json!({ "status": "aborted" })),
+		None => None,
+	}
+}
+
+/// `task_abort` — cancel a running detached sub-agent's own token.
+/// Scoped to the one run; never touches the parent turn or its
+/// sibling sub-agents.
+async fn handle_task_abort(
+	state: &Arc<CoderState>,
+	rt: &Arc<SessionRuntime>,
+	args: &Value,
+) -> Result<Value, CoderError> {
+	#[derive(serde::Deserialize)]
+	struct AbortArgs {
+		subagent_id: String,
+	}
+	let parsed: AbortArgs =
+		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("task_abort", err.to_string()))?;
+	let parent_session_id = rt.session.lock().await.header.id.clone();
+	let registry = state.detached_tasks.read().await;
+	if !registry.is_detached_of(&parent_session_id, &parsed.subagent_id) {
+		return Err(CoderError::invalid_args(
+			"task_abort",
+			format!("no detached sub-agent `{}` for this session", parsed.subagent_id),
+		));
+	}
+	match registry.entry(&parsed.subagent_id) {
+		Some(entry) if entry.finish.lock().await.is_none() => {
+			entry.cancel.cancel();
+			Ok(json!({ "status": "aborted" }))
+		}
+		_ => Ok(json!({ "status": "not_running" })),
+	}
+}
+
+/// Per-parent background task that watches the event broadcast for
+/// `SubagentFinished` from this parent's detached sub-agents and
+/// injects a wake message into the parent's session ([ADR 0053]).
+/// The wake is a pointer, not the report — the parent calls
+/// `task_collect` for the content, preserving `task`'s
+/// context-preservation property. Exits when the broadcast closes.
+fn spawn_detached_finish_feeder(state: Arc<CoderState>, parent_session_id: String) {
+	// Spawn the feeder once per parent. A first detached spawn for
+	// a parent flips this flag; later spawns reuse the running
+	// feeder. Reuse the coordinator-workers pattern of "one
+	// feeder per orchestrator" rather than a feeder per run.
+	static FEEDERS: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+	let feeders = FEEDERS.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
+	if !feeders
+		.lock()
+		.expect("detached feeder registry poisoned")
+		.insert(parent_session_id.clone())
+	{
+		return;
+	}
+	let handle = CoderHandle { state: state.clone() };
+	let mut rx = handle.subscribe();
+	tokio::spawn(async move {
+		loop {
+			let recv = rx.recv().await;
+			let Ok(envelope) = recv else { continue };
+			// Only detached runs of *this* parent wake it.
+			let CoderEvent::SubagentFinished {
+				subagent_id, was_error, ..
+			} = &envelope.event
+			else {
+				continue;
+			};
+			let is_ours = state
+				.detached_tasks
+				.read()
+				.await
+				.is_detached_of(&parent_session_id, subagent_id);
+			if !is_ours {
+				continue;
+			}
+			// The report is cached under the same registry entry;
+			// `task_collect` returns it (or the error) verbatim.
+			let status = if *was_error { "error" } else { "done" };
+			let text = format!(
+				"Detached sub-agent {subagent_id} finished (status: {status}). Call `task_collect(\"{subagent_id}\")` to fetch its report, or ignore it if you no longer need the result."
+			);
+			// Best-effort: the parent may be gone (its session
+			// deleted). The report stays cached regardless.
+			let _ = handle.send_to(&parent_session_id, text, Vec::new()).await;
+			// Housekeeping: drop settled entries whose report has
+			// already been delivered so a long-lived process
+			// doesn't accumulate one map entry per detached run.
+			state.detached_tasks.write().await.prune_settled().await;
+		}
+	});
 }
 
 /// Apply a `todo_write` payload to the current session's todo
@@ -6180,6 +6619,9 @@ async fn handle_spawn_worker(
 				target_folder: target_folder.clone(),
 				mode: CoderMode::Agent.as_wire().to_string(),
 				worktree_root: summary.worktree_root.clone(),
+				// A coordinator worker is a top-level session, not a
+				// detached `task` run — the flag stays off.
+				detached: false,
 			},
 		)
 		.await;
@@ -6190,6 +6632,7 @@ async fn handle_spawn_worker(
 		target_folder,
 		mode: CoderMode::Agent.as_wire().to_string(),
 		worktree_root: summary.worktree_root.clone(),
+		detached: false,
 	});
 	// The worker's worktree just became a bound folder; the folder bar
 	// has no other way to learn about a bind it didn't initiate
@@ -8376,6 +8819,7 @@ async fn replay_subagent_spawned(
 	target_folder: String,
 	mode: String,
 	worktree_root: Option<String>,
+	detached: bool,
 	still_running: bool,
 ) {
 	out.push(CoderEvent::SubagentSpawned {
@@ -8384,6 +8828,7 @@ async fn replay_subagent_spawned(
 		target_folder,
 		mode,
 		worktree_root,
+		detached,
 	});
 
 	let loaded = match sessions::load(sub_dir, &subagent_id).await {
@@ -8991,6 +9436,78 @@ mod tests {
 			assert_eq!(reg.owning_orchestrator_of("w-1"), None);
 			assert!(reg.controls("w-1"));
 			assert!(!reg.remove("orch-1", "w-1"));
+		}
+	}
+
+	mod detached_task_registry {
+		use super::super::{DetachedFinish, DetachedTaskRegistry};
+		use tokio_util::sync::CancellationToken;
+
+		fn reg_with(parent: &str, sub: &str) -> (DetachedTaskRegistry, CancellationToken) {
+			let mut reg = DetachedTaskRegistry::default();
+			let cancel = CancellationToken::new();
+			reg.register(parent, sub, cancel.clone());
+			(reg, cancel)
+		}
+
+		#[test]
+		fn is_detached_of_scopes_ids_to_their_parent() {
+			let (reg, _) = reg_with("sess-a", "sub-1");
+			assert!(reg.is_detached_of("sess-a", "sub-1"));
+			assert!(!reg.is_detached_of("sess-b", "sub-1"));
+			assert!(!reg.is_detached_of("sess-a", "sub-other"));
+		}
+
+		#[test]
+		fn entry_round_trips_the_cancel_token() {
+			let (reg, cancel) = reg_with("sess-a", "sub-1");
+			let entry = reg.entry("sub-1").expect("entry registered");
+			entry.cancel.cancel();
+			assert!(cancel.is_cancelled());
+		}
+
+		#[tokio::test]
+		async fn settle_caches_the_finish_and_wakes_collect() {
+			let (reg, _) = reg_with("sess-a", "sub-1");
+			let entry = reg.entry("sub-1").expect("entry registered");
+			assert!(entry.finish.lock().await.is_none());
+			// Mirror the collect path: park + enable the listener
+			// *before* the settle lands, so the wake can't be lost.
+			let notified = entry.notify.notified();
+			tokio::pin!(notified);
+			notified.as_mut().enable();
+			DetachedTaskRegistry::settle(&entry, DetachedFinish::Aborted).await;
+			assert!(matches!(
+				entry.finish.lock().await.as_ref(),
+				Some(DetachedFinish::Aborted)
+			));
+			assert!(tokio::time::timeout(std::time::Duration::from_millis(50), notified)
+				.await
+				.is_ok());
+		}
+
+		#[test]
+		fn live_tokens_of_returns_only_the_parents_runs() {
+			let mut reg = DetachedTaskRegistry::default();
+			reg.register("sess-a", "sub-1", CancellationToken::new());
+			reg.register("sess-a", "sub-2", CancellationToken::new());
+			reg.register("sess-b", "sub-3", CancellationToken::new());
+			assert_eq!(reg.live_tokens_of("sess-a").len(), 2);
+			assert_eq!(reg.live_tokens_of("sess-b").len(), 1);
+			assert_eq!(reg.live_tokens_of("sess-none").len(), 0);
+		}
+
+		#[tokio::test]
+		async fn prune_settled_drops_finished_runs_keeps_live_ones() {
+			let mut reg = DetachedTaskRegistry::default();
+			reg.register("sess-a", "sub-live", CancellationToken::new());
+			let settled = reg.register("sess-a", "sub-done", CancellationToken::new());
+			DetachedTaskRegistry::settle(&settled, DetachedFinish::Failed("boom".into())).await;
+			reg.prune_settled().await;
+			assert!(reg.entry("sub-live").is_some());
+			assert!(reg.entry("sub-done").is_none());
+			assert!(reg.is_detached_of("sess-a", "sub-live"));
+			assert!(!reg.is_detached_of("sess-a", "sub-done"));
 		}
 	}
 

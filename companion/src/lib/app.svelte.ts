@@ -139,7 +139,15 @@ export type TranscriptRow =
 	| { kind: 'diff'; id: string; files: string[]; diff: string }
 	| { kind: 'tokens'; id: string; total: number; contextWindow: number }
 	| { kind: 'compaction'; id: string; summary: string; done: boolean }
-	| { kind: 'subagent'; id: string; subagentId: string; folder: string; finished: boolean };
+	| {
+			kind: 'subagent';
+			id: string;
+			subagentId: string;
+			folder: string;
+			finished: boolean;
+			/** ADR 0053 — a detached `task` runs in the background. */
+			detached: boolean;
+	  };
 
 /** One question in an ask_user tool call. */
 export type AskUserQuestion = {
@@ -1563,6 +1571,7 @@ class CompanionState {
 					subagentId: str(ev, 'subagent_id'),
 					folder: str(ev, 'target_folder'),
 					finished: false,
+					detached: bool(ev, 'detached'),
 				});
 				break;
 			case 'subagent_finished': {

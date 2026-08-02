@@ -2622,8 +2622,8 @@
 			 involving the parent agent). -->
 		{@const subId = coder.viewSubagentId}
 		{@const transcript = subId !== null ? (coder.subagentTranscripts.get(subId) ?? null) : null}
-		{@const subagentRunning =
-			transcript !== null && coder.subagentSummaries.get(transcript.toolCallId)?.status === 'running'}
+		{@const subagentSummary = transcript !== null ? (coder.subagentSummaries.get(transcript.toolCallId) ?? null) : null}
+		{@const subagentRunning = transcript !== null && subagentSummary?.status === 'running'}
 		<header class="session-bar">
 			<button
 				type="button"
@@ -2641,6 +2641,12 @@
 				<span class="subagent-mode" class:research={transcript.mode === 'research'} title="Sub-agent mode">
 					{transcript.mode}
 				</span>
+				{#if subagentSummary?.detached}
+					<span
+						class="subagent-detached"
+						title="Detached — running in the background; the parent collects the result via task_collect">detached</span
+					>
+				{/if}
 				{#if subId !== null}
 					<button
 						type="button"
@@ -3247,6 +3253,17 @@
 						<span class="subagent-mode" class:research={subagent.mode === 'research'}>
 							{subagent.mode}
 						</span>
+						{#if subagent.detached}
+							<!-- ADR 0053 — a detached `task` runs in the
+							     background and the parent collects it via
+							     `task_collect`; badge it so a background run
+							     reads differently from a blocking one. -->
+							<span
+								class="subagent-detached"
+								title="Detached — running in the background; the parent collects the result via task_collect"
+								>detached</span
+							>
+						{/if}
 						<span class="subagent-folder" title={subagent.targetFolder}>
 							{baseName(subagent.targetFolder)}
 						</span>
@@ -4543,6 +4560,22 @@
 	.subagent-mode.research {
 		background: var(--m-bg-3, var(--m-bg-2));
 		color: var(--m-fg-muted);
+	}
+	/* Detached pill (ADR 0053): outlines rather than fills so it
+	   reads as a modifier next to the filled mode pill, not a
+	   second mode. */
+	.subagent-detached {
+		display: inline-flex;
+		align-items: center;
+		padding: 1px 6px;
+		border-radius: 999px;
+		border: 1px solid var(--m-border);
+		color: var(--m-fg-muted);
+		font-size: 10px;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+		flex-shrink: 0;
 	}
 	.subagent-preview {
 		font-size: 12px;

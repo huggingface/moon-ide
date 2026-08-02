@@ -169,6 +169,11 @@ export type SubagentSummary = {
 	 *  [`CoderPanelState.openWorkerSession`] instead of the
 	 *  sub-agent pop-out view. */
 	worktreeRoot: string | null;
+	/** ADR 0053 — `true` for a detached `task`: the parent's tool
+	 *  call returned a handle and the run settles in the background.
+	 *  Drives a "detached" badge on the card so a background run
+	 *  reads differently from a blocking one. */
+	detached: boolean;
 };
 
 /** Full transcript for one sub-agent, populated incrementally
@@ -3528,6 +3533,10 @@ export class CoderPanelState {
 					tokensUsedEstimate: prev?.tokensUsedEstimate ?? 0,
 					subSessionId: prev?.subSessionId ?? null,
 					worktreeRoot: event.worktree_root ?? null,
+					// A re-emitted spawn (user-driven resume) keeps the
+					// original spawn's detach flag rather than
+					// resetting it.
+					detached: event.detached ?? prev?.detached ?? false,
 				};
 				summaries.set(event.tool_call_id, summary);
 				session.subagentSummaries = summaries;

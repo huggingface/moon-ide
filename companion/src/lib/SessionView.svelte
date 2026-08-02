@@ -846,7 +846,8 @@
 			{:else if row.kind === 'subagent'}
 				<div class="subagent" class:finished={row.finished}>
 					<span class="pip" class:live={!row.finished}></span>
-					Sub-agent {#if row.folder}in {row.folder}{/if}
+					Sub-agent {#if row.detached}<span class="detached">detached</span>{/if}
+					{#if row.folder}in {row.folder}{/if}
 					{#if row.finished}✓{:else}running…{/if}
 					<!-- A worker's subagent id is its session id; research
 					     sub-agents (task tool) have no session, so only
@@ -1354,6 +1355,14 @@
 		display: flex;
 		align-items: center;
 		gap: 0.4rem;
+	}
+	.subagent .detached {
+		font-size: 0.65rem;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		border: 1px solid var(--border);
+		border-radius: 999px;
+		padding: 0 0.35rem;
 	}
 	.composer {
 		display: flex;

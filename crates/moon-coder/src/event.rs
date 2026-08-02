@@ -297,6 +297,13 @@ pub enum CoderEvent {
 		/// sub-agent pop-out. Absent for `task` sub-agents.
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		worktree_root: Option<String>,
+		/// `true` when the spawn was a detached `task` ([ADR 0053])
+		/// — the parent's tool call returned a handle and the run
+		/// settles in the background. Frontend badges the card
+		/// "detached" so a background run reads differently from a
+		/// blocking one. Absent (false) for every synchronous spawn.
+		#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+		detached: bool,
 	},
 
 	/// One inner event from a sub-agent's runner. The frontend
