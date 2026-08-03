@@ -237,7 +237,11 @@ The right-side-of-the-folder-bar SCM panel:
   3-minute periodic loop (matches VSCode / Cursor's
   `git.autofetchPeriod` default), an initial fetch ~5s after
   startup, plus focus / folder-switch nudges throttled to a 30s
-  minimum. Fetch only moves remote-tracking refs, so the followup
+  minimum _per folder_ — a recent fetch of folder A must not
+  defer the immediate fetch when switching to folder B (a global
+  throttle made the folder-switch nudge a no-op whenever the
+  periodic tick had just run). Fetch only moves remote-tracking
+  refs, so the followup
   is just `refreshGitBranch` (cheap) — the SCM panel's "Sync
   Changes" button surfaces from the refreshed `gitBranch.behind`
   count without any other refresh fanout. Failures (offline,

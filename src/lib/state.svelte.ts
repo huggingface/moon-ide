@@ -2158,7 +2158,9 @@ class WorkspaceState {
 
 	private gitAutoFetchWired = false;
 	private gitAutoFetchInFlight = false;
-	private gitAutoFetchLastAt = 0;
+	/** Throttle keyed by folder: a fetch in folder A must not
+	 * suppress the immediate fetch when switching to folder B. */
+	private gitAutoFetchLastAtByFolder = new Map<string, number>();
 
 	/**
 	 * Periodic `git fetch` against the active folder so the SCM
@@ -2171,8 +2173,10 @@ class WorkspaceState {
 	 * - **Every 3 minutes** thereafter (matches VSCode / Cursor's
 	 *   `git.autofetchPeriod` default — hardcoded; flip to a
 	 *   setting when someone asks).
-	 * - **On window focus**, throttled so an alt-tab flurry doesn't
-	 *   spam fetches.
+	 * - **On window focus and folder switch**, throttled to a 30s
+	 *   minimum *per folder* so bursts don't spam fetches — but a
+	 *   recent fetch of folder A never delays the first fetch of
+	 *   the folder you just switched to.
 	 *
 	 * Best-effort: failures (offline, auth refused, 30s timeout
 	 * inside `git_fetch`) are silently swallowed — the user never
@@ -2326,18 +2330,24 @@ class WorkspaceState {
 		if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
 			return;
 		}
-		if (!this.activeFolder) {
+		const folderPath = this.activeFolder?.path;
+		if (!folderPath) {
 			return;
 		}
 		const now = Date.now();
-		// 30s minimum between fetches except for the periodic timer.
-		// Focus / folder-switch triggers are bursty by nature; the
-		// 3-minute periodic tick is the floor for "we definitely
-		// want a fresh fetch even if nothing else nudged us".
-		if (reason !== 'interval' && now - this.gitAutoFetchLastAt < 30_000) {
+		// 30s minimum between fetches of the *same folder*, except
+		// for the periodic timer. Focus / folder-switch triggers are
+		// bursty by nature; the 3-minute periodic tick is the floor
+		// for "we definitely want a fresh fetch even if nothing else
+		// nudged us". Keyed per folder: a tick that fetched folder A
+		// 10s ago must not defer the immediate fetch when switching
+		// to folder B (per the "fetch when I switch" intent), while
+		// ping-ponging A⇄B every 5s still holds each folder to its
+		// 30s minimum.
+		if (reason !== 'interval' && now - (this.gitAutoFetchLastAtByFolder.get(folderPath) ?? 0) < 30_000) {
 			return;
 		}
-		this.gitAutoFetchLastAt = now;
+		this.gitAutoFetchLastAtByFolder.set(folderPath, now);
 		this.gitAutoFetchInFlight = true;
 		// Snapshot HEAD before the fetch. A fetch itself only moves
 		// remote-tracking refs — local HEAD/index/worktree are
