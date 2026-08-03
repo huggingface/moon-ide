@@ -911,6 +911,12 @@ export type FolderSession = {
 	pr_scope: PrListScope;
 	/** SCM compare baseline — see `CompareBaseline`. */
 	compare_baseline: CompareBaseline;
+	/**
+	 * Hide whitespace-only changes in the merge surfaces. Missing
+	 * in sessions written by older builds; the frontend treats
+	 * `undefined` as `true` (the default-on lens).
+	 */
+	ignore_whitespace: boolean;
 	/** Local-first review-comment drafts for this folder (Phase 5.7). */
 	review_comments: ReviewComment[];
 	/** Per-file "Viewed" marks for this folder (Phase 5.7). */

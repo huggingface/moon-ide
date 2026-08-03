@@ -20,6 +20,12 @@ use crate::workspace::FolderOrigin;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+/// Serde default for fields that are true unless the user turned
+/// them off — `#[serde(default)]` alone would fill `false`.
+fn default_true() -> bool {
+	true
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 #[serde(rename_all = "lowercase")]
@@ -69,6 +75,14 @@ pub struct FolderSession {
 	/// "what's modified since the last commit". Persisted per
 	/// folder for the same reason as `pr_scope`.
 	pub compare_baseline: CompareBaseline,
+	/// Hide whitespace-only changes in the merge surfaces (review
+	/// tab, working-tree diff). Default-on: a fresh review is far
+	/// more often hurt by reindent churn (agent refactors,
+	/// formatter flips) than by missing a whitespace-only delta,
+	/// and the banner pill says when the lens is on. Persisted per
+	/// folder for the same reason as `compare_baseline`.
+	#[serde(default = "default_true")]
+	pub ignore_whitespace: bool,
 	/// Local-first review-comment drafts for this folder (Phase
 	/// 5.7). Persisted until published to a GitHub PR and then
 	/// cleared. `#[serde(default)]` on the struct fills an empty
@@ -104,6 +118,7 @@ impl Default for FolderSession {
 			focused_side: SplitSide::Left,
 			pr_scope: PrListScope::default(),
 			compare_baseline: CompareBaseline::default(),
+			ignore_whitespace: true,
 			review_comments: Vec::new(),
 			reviewed_files: Vec::new(),
 			origin: FolderOrigin::default(),

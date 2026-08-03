@@ -21,6 +21,7 @@
 	import { languageFor } from '../editor/language';
 	import { moonEditorTheme } from '../editor/theme';
 	import { diffPureChangeExtension } from '../editor/diffPureChange';
+	import { diffConfigIgnoringWhitespace } from '../editor/diffWhitespace';
 	import { diffGutterTintExtension } from '../editor/diffGutterTint';
 	import { diffCollapseContextExtension } from '../editor/diffCollapseContext';
 	import { filePathFacet } from '../editor/lsp';
@@ -71,6 +72,25 @@
 	let mounted = $state(false);
 	let loading = $state(false);
 	let buildToken = 0;
+	// Full-doc text currently rendered on each side. Tracked so the
+	// live-sync effects below can short-circuit when their reactive
+	// dependency fired for an unrelated path (or a re-save with no
+	// byte change) instead of diffing strings against the CM doc.
+	let currentBase: string | null = null;
+	let currentWorking: string | null = null;
+	// Promise chain serialising `loadWorking()` reads off the reactive
+	// effect below. Watcher bursts during an agent's multi-step edit
+	// can fire the effect several times before the first read
+	// resolves; unchained they'd dispatch out of order and a stale
+	// read could win. The last run always sees the freshest bytes,
+	// so intermediate skips are harmless.
+	let workingSync: Promise<void> = Promise.resolve();
+
+	// `DiffConfig` for the current toggle state: the plain raw diff,
+	// or the whitespace-skipping variant (see `diffWhitespace.ts`).
+	function currentDiffConfig() {
+		return { override: workspace.ignoreWhitespace ? diffConfigIgnoringWhitespace().override : rawDiff };
+	}
 	// One-shot promise that resolves once the underlying file has
 	// been attached as an `OpenFile`. Lazily created on the first
 	// keystroke (or first modifier-held hover, for goto-def) so an
@@ -281,6 +301,96 @@
 		const unit = ec.indent_style === 'tab' ? '\t' : ' '.repeat(Math.max(1, ec.indent_size));
 		return [EditorState.tabSize.of(Math.max(1, ec.tab_width)), indentUnit.of(unit)];
 	}
+
+	// Live base-side sync. The working tree moving under the section
+	// (agent edits, a pull) is covered by the effect below, but when
+	// the reviewed baseline itself moves — external `git commit` /
+	// `checkout` / fetch changing `HEAD` or the merge-base — the left
+	// pane has to follow or the diff goes stale. `headByPath` is only
+	// kept warm for open files, so this seeds a fetch per mounted
+	// section via `refreshHead` (cheap: one `git show` per baseline
+	// move, guarded by `baselineTick`) and renders the cached blob.
+	// Skipped when the section diffs against a pinned merge-base SHA:
+	// a commit doesn't move that ref, so there's nothing to chase.
+	$effect(() => {
+		if (!mounted || mergeBase !== null) {
+			return;
+		}
+		workspace.baselineTick;
+		void workspace.refreshHead(path);
+	});
+	$effect(() => {
+		const cached = workspace.headByPath.get(path);
+		if (!mounted || mergeBase !== null || cached === undefined) {
+			return;
+		}
+		const next = cached ?? '';
+		if (currentBase === next) {
+			return;
+		}
+		currentBase = next;
+		merge?.a.dispatch({ changes: { from: 0, to: merge.a.state.doc.length, insert: next } });
+	});
+
+	// Live working-side sync: the fs watcher reloads clean open
+	// buffers on external mutation (agent tools, formatter, terminal)
+	// and ReviewView attaches a backing buffer to every section at
+	// mount, so the file's `OpenFile.text` is the freshest in-memory
+	// view of the working tree. Mirror it into the right pane. Edits
+	// made *inside* the section dispatch their own doc change and
+	// just flow back through `updateText`; the `currentWorking`
+	// short-circuit keeps that loop from re-dispatching.
+	$effect(() => {
+		const open = workspace.openFiles.find((f) => f.path === path);
+		const text = open?.kind === 'text' && !open.isDeleted ? open.text : null;
+		if (!mounted || !editable || text === null || currentWorking === text) {
+			return;
+		}
+		currentWorking = text;
+		const m = merge;
+		if (!m) {
+			return;
+		}
+		m.b.dispatch({ changes: { from: 0, to: m.b.state.doc.length, insert: text } });
+	});
+
+	// Disk fallback for sections whose file has no open buffer (the
+	// attach above can fail when the file vanishes) and for rows the
+	// buffer route can't represent. Runs a `readFile` chained off the
+	// previous one so watcher bursts during a multi-step agent edit
+	// can't resolve out of order; the chain always lands on the
+	// freshest read.
+	$effect(() => {
+		workspace.baselineTick;
+		if (!mounted || !editable) {
+			return;
+		}
+		workingSync = workingSync.then(async () => {
+			if (workspace.openFiles.some((f) => f.path === path && f.kind === 'text')) {
+				return;
+			}
+			const text = await loadWorking();
+			if (!mounted || currentWorking === text) {
+				return;
+			}
+			currentWorking = text;
+			merge?.b.dispatch({ changes: { from: 0, to: merge.b.state.doc.length, insert: text } });
+		});
+	});
+
+	// Whitespace-toggle flip. `MergeView.reconfigure` only stashes
+	// the new `diffConfig` — chunks recompute lazily on the next doc
+	// dispatch — so a no-op B-side change nudges the rebuild right
+	// away. Docs, folds, and selections survive: no doc bytes change.
+	$effect(() => {
+		const ignore = workspace.ignoreWhitespace;
+		const m = merge;
+		if (!mounted || !m) {
+			return;
+		}
+		m.reconfigure({ diffConfig: ignore ? diffConfigIgnoringWhitespace() : { override: rawDiff } });
+		m.b.dispatch({ changes: { from: 0, insert: '' } });
+	});
 
 	// Live-sync the comment lists into each side's wiring when the
 	// store changes (create / edit / delete repaints the cards).
@@ -551,12 +661,11 @@
 			// 5` only folds runs of ≥5 unchanged lines so tiny
 			// gaps between adjacent hunks stay expanded.
 			collapseUnchanged: { margin: 3, minSize: 5 },
-			diffConfig: {
-				// See DiffView.svelte for the rationale: raw diff
-				// keeps highlights aligned to single change spans
-				// rather than fusing across short matched substrings.
-				override: rawDiff,
-			},
+			// See DiffView.svelte for the rationale: raw diff keeps
+			// highlights aligned to single change spans rather than
+			// fusing across short matched substrings. The whitespace
+			// toggle wraps that same base algorithm.
+			diffConfig: currentDiffConfig(),
 		});
 
 		detachHScrollSync = wireHorizontalScrollSync(merge.a.scrollDOM, merge.b.scrollDOM);
@@ -591,6 +700,11 @@
 
 		mounted = true;
 		loading = false;
+		// Seed the live-sync trackers with what's actually rendered so
+		// the effects don't re-dispatch identical content on their
+		// first reactive run after mount.
+		currentBase = base;
+		currentWorking = working;
 		// Settle any drifted comment hints once the diff is built.
 		persistReanchors();
 	}

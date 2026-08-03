@@ -247,6 +247,16 @@ class FolderState {
 	// from main". Persisted in `FolderSession.compare_baseline`.
 	compareBaseline = $state<CompareBaseline>('head');
 
+	// Hide whitespace-only changes in the merge surfaces (review
+	// tab, working-tree diff) for this folder. Default-on: a fresh
+	// review is far more often hurt by reindent churn (agent
+	// refactors, formatter flips) than by missing a whitespace-only
+	// delta, and the review banner pill says when the lens is on.
+	// Persisted per folder in `FolderSession.ignore_whitespace`,
+	// same reasoning as `compare_baseline` — a tab-formatted
+	// monorepo and a Python service want different defaults.
+	ignoreWhitespace = $state(true);
+
 	// Cached merge-base SHA when `compareBaseline === 'default'`
 	// and the diff actually applies (resolved default branch,
 	// HEAD off the default branch, merge-base exists). `null`
@@ -488,6 +498,15 @@ class WorkspaceState {
 	// would otherwise kick two parallel `git show` subprocesses
 	// against the same blob.
 	#headInFlight: Set<string> = new Set();
+	// Monotonic counter bumped on every git-status refresh (fs-watcher
+	// debounce, window focus, manual tree refresh, baseline flip).
+	// Mounted review sections subscribe to it as their "the world may
+	// have moved" signal: each bump re-validates the section's base
+	// blob (`refreshHead`) and working text (buffer / `readFile`)
+	// against what the merge panes currently render, so an agent or
+	// terminal editing files mid-review flows into the stacked diff
+	// without a remount.
+	baselineTick = $state(0);
 	// Per-language server state, keyed by LSP language id (`'typescript'`,
 	// later `'rust'` / `'svelte'` / …). Populated by `lsp:status`
 	// broker events. The status bar renders one pill per entry whose
@@ -1978,6 +1997,10 @@ class WorkspaceState {
 					// don't carry the field; trust whatever lands.
 					fs.prScope = folderSession.pr_scope ?? 'all';
 					fs.compareBaseline = folderSession.compare_baseline ?? 'head';
+					// Field added after the first builds that
+					// persisted sessions; `undefined` (older file)
+					// means the default-on lens.
+					fs.ignoreWhitespace = folderSession.ignore_whitespace ?? true;
 					// `#[serde(default)]` fills these as empty arrays for
 					// sessions written by older builds (Phase 5.7).
 					fs.reviewComments = folderSession.review_comments ?? [];
@@ -2417,6 +2440,7 @@ class WorkspaceState {
 						focused_side: fs.focusedSide,
 						pr_scope: fs.prScope,
 						compare_baseline: fs.compareBaseline,
+						ignore_whitespace: fs.ignoreWhitespace,
 						review_comments: fs.reviewComments,
 						reviewed_files: fs.reviewedFiles,
 						// Persist how the folder was bound so a worktree
@@ -3288,6 +3312,19 @@ class WorkspaceState {
 	}
 
 	/**
+	 * Active folder's whitespace lens for the merge surfaces,
+	 * surfaced as a derived alias so `ReviewSection` / `DiffView`
+	 * / the banner pill read `workspace.ignoreWhitespace` without
+	 * reaching into `FolderState`. Default-on when no folder is
+	 * bound (matches the `FolderState` default).
+	 */
+	get ignoreWhitespace(): boolean {
+		const active = this.workspace?.active_folder ?? null;
+		const fs = active === null ? null : this.folderStates.get(active);
+		return fs?.ignoreWhitespace ?? true;
+	}
+
+	/**
 	 * SHA of the merge-base with the default branch, when the
 	 * `'default'` baseline applies. `null` outside the active
 	 * folder, when the host returned `None` (no default branch /
@@ -3337,6 +3374,10 @@ class WorkspaceState {
 		// result under the new baseline. Re-fetched lazily on
 		// the next `refreshHead` for each open buffer.
 		this.headByPath = new Map();
+		// Wake review sections immediately — they hold their own
+		// copy of the base text and mustn't wait for the trailing
+		// `refreshGitStatus` round-trip to notice the flip.
+		this.baselineTick++;
 		this.persistAppState();
 		void this.refreshGitStatus(this.paths, null);
 	}
@@ -3390,6 +3431,11 @@ class WorkspaceState {
 	}
 
 	private async refreshGitStatus(paths: readonly string[], changedSubset: ReadonlySet<string> | null) {
+		// Wake every mounted review section: each refresh means either
+		// a working-tree mutation (fs-watcher debounce) or a possible
+		// baseline move (commit, checkout, fetch), and the sections
+		// re-read their own base / working text off this signal.
+		this.baselineTick++;
 		// Refresh the branch label opportunistically alongside the
 		// status fetch — `git symbolic-ref` is cheap and we want the
 		// SCM panel header to update when external `git checkout` /
@@ -4876,6 +4922,23 @@ class WorkspaceState {
 	toggleLineWrap() {
 		this.lineWrap = !this.lineWrap;
 		this.flash(this.lineWrap ? 'Line wrap on' : 'Line wrap off');
+	}
+
+	/** Flip whitespace-insensitive diffing for the active folder's
+	 *  merge surfaces, persisted in `FolderSession.ignore_whitespace`.
+	 *  `ReviewSection` / `DiffView` each have a `$effect` that reads
+	 *  this and reconfigures their MergeView's `diffConfig`, so the
+	 *  chunks recompute in place (docs, folds, and selections are
+	 *  preserved) instead of remounting the view. */
+	toggleIgnoreWhitespace() {
+		const active = this.workspace?.active_folder ?? null;
+		const fs = active === null ? null : this.folderStates.get(active);
+		if (!fs) {
+			return;
+		}
+		fs.ignoreWhitespace = !fs.ignoreWhitespace;
+		this.flash(fs.ignoreWhitespace ? 'Hiding whitespace-only changes' : 'Showing whitespace-only changes');
+		this.persistAppState();
 	}
 
 	/**

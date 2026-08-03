@@ -330,6 +330,11 @@ export const builtInCommands: Command[] = [
 		run: () => workspace.toggleLineWrap(),
 	},
 	{
+		id: 'diff.toggleIgnoreWhitespace',
+		title: 'Toggle Whitespace in Diffs',
+		run: () => workspace.toggleIgnoreWhitespace(),
+	},
+	{
 		id: 'editor.splitRight',
 		title: 'Split Editor Right',
 		// Same key handles both directions because `Ctrl+\` in App.svelte

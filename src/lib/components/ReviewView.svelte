@@ -241,6 +241,28 @@
 	const mergeBase: string | null = $derived(
 		workspace.compareBaseline === 'default' ? workspace.defaultBranchMergeBase : null,
 	);
+
+	// Keep a silent backing `OpenFile` attached for every file in the
+	// review. It's what makes external mutations show up live: the
+	// fs-watcher's git-status pass only reloads on-disk bytes into
+	// *open* buffers, and each section's live-sync effect then mirrors
+	// the buffer into its right pane. Without the attach, an agent
+	// editing files mid-review would flip the tree/SCM badges but
+	// leave the stacked diff frozen at its mount-time snapshot until
+	// the tab is reopened. Deleted rows have no working tree to track
+	// and are skipped; `ensureBackingBuffer` no-ops on files already
+	// open as real tabs. Backing buffers are kept (not dropped) when
+	// an entry leaves the list: the file is typically still open
+	// elsewhere or about to re-enter on the next status tick, and
+	// the normal tab-close GC owns the lifecycle.
+	$effect(() => {
+		for (const entry of entries) {
+			if (entry.status === 'deleted') {
+				continue;
+			}
+			void workspace.ensureBackingBuffer(entry.path);
+		}
+	});
 	// Banner label: "vs <branch>" in default-branch mode (matches
 	// the GitHub-style PR review framing); "vs HEAD" in
 	// working-tree mode (the equivalent of opening every changed
@@ -726,6 +748,16 @@
 		>
 			Files
 		</button>
+		<button
+			type="button"
+			class="ws"
+			class:active={workspace.ignoreWhitespace}
+			aria-pressed={workspace.ignoreWhitespace}
+			title="Hide whitespace-only changes (reindent churn) in every section — same lens as git diff -w"
+			onclick={() => workspace.toggleIgnoreWhitespace()}
+		>
+			{workspace.ignoreWhitespace ? 'Show whitespace' : 'Hide whitespace'}
+		</button>
 		<span class="counts">{entries.length} file{entries.length === 1 ? '' : 's'}</span>
 		{#if entries.length > 0}
 			<span class="progress" title="Files marked Viewed">{reviewedCount} / {entries.length} reviewed</span>
@@ -987,6 +1019,26 @@
 		cursor: not-allowed;
 	}
 	.files[aria-expanded='true'] {
+		border-color: var(--m-accent, #4ec9b0);
+		color: var(--m-accent, #4ec9b0);
+	}
+	/* Same pill shape as the Files button; `.active` mirrors the
+	   menu-open accent treatment so the on state reads at a glance. */
+	.ws {
+		align-self: center;
+		padding: 3px 10px;
+		background: var(--m-bg);
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		color: var(--m-fg);
+		font-size: 11px;
+		font-weight: 600;
+		cursor: pointer;
+	}
+	.ws:hover {
+		border-color: var(--m-fg-muted);
+	}
+	.ws.active {
 		border-color: var(--m-accent, #4ec9b0);
 		color: var(--m-accent, #4ec9b0);
 	}

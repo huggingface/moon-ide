@@ -31,6 +31,7 @@
 		offsetForLspPosition,
 	} from '../editor/lsp';
 	import { diffPureChangeExtension } from '../editor/diffPureChange';
+	import { diffConfigIgnoringWhitespace } from '../editor/diffWhitespace';
 	import { diffGutterTintExtension } from '../editor/diffGutterTint';
 	import { commentsForSide, reanchorComments, ReviewWiring } from '../editor/reviewComments';
 	import { blameExtension, blameFacet } from '../editor/blame';
@@ -629,7 +630,9 @@
 				// make the change obvious. If the unaligned edges
 				// become a problem we can re-introduce the word-
 				// alignment loop without the 3-char merge step.
-				override: rawDiff,
+				// The whitespace toggle wraps this same base
+				// algorithm — see `diffWhitespace.ts`.
+				override: workspace.ignoreWhitespace ? diffConfigIgnoringWhitespace().override : rawDiff,
 			},
 		});
 
@@ -877,6 +880,20 @@
 		const ext = wrap ? EditorView.lineWrapping : [];
 		m.a.dispatch({ effects: wrapA.reconfigure(ext) });
 		m.b.dispatch({ effects: wrapB.reconfigure(ext) });
+	});
+
+	// Whitespace-toggle flip. `MergeView.reconfigure` only stashes
+	// the new `diffConfig` — chunks recompute lazily on the next doc
+	// dispatch — so a no-op B-side change nudges the rebuild right
+	// away. Docs, folds, and selections survive: no doc bytes change.
+	$effect(() => {
+		const ignore = workspace.ignoreWhitespace;
+		const m = merge;
+		if (!m) {
+			return;
+		}
+		m.reconfigure({ diffConfig: { override: ignore ? diffConfigIgnoringWhitespace().override : rawDiff } });
+		m.b.dispatch({ changes: { from: 0, insert: '' } });
 	});
 
 	// LSP diagnostics: push the latest list for this path into the

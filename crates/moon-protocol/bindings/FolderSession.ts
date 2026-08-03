@@ -59,6 +59,15 @@ pr_scope: PrListScope,
  */
 compare_baseline: CompareBaseline, 
 /**
+ * Hide whitespace-only changes in the merge surfaces (review
+ * tab, working-tree diff). Default-on: a fresh review is far
+ * more often hurt by reindent churn (agent refactors,
+ * formatter flips) than by missing a whitespace-only delta,
+ * and the banner pill says when the lens is on. Persisted per
+ * folder for the same reason as `compare_baseline`.
+ */
+ignore_whitespace: boolean, 
+/**
  * Local-first review-comment drafts for this folder (Phase
  * 5.7). Persisted until published to a GitHub PR and then
  * cleared. `#[serde(default)]` on the struct fills an empty
