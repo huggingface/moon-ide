@@ -5,14 +5,15 @@
 //! `hydrate`/`refresh` entry points called from `WorkspaceState`
 //! and `App.svelte`.
 //!
-//! Phase 2.0 surface: poll on demand (workspace change + after
-//! every mutating action, plus a window-focus refresh wired in
-//! `wireRuntime`) and react to `container:state` events. No
-//! periodic poller — if the user runs `docker compose down`
-//! from a terminal while the IDE has focus, the IDE state stays
-//! stale until the next mutating action or focus blur/regain.
-//! That's an explicit 2.0 trade-off; 2.2 adds a docker-events
-//! watcher on the Rust side and the staleness window collapses.
+//! Freshness is event-driven: the backend's docker-events
+//! watcher (`container_events.rs`) tails the daemon for the
+//! workspace dev container and re-broadcasts `container:state`
+//! on any lifecycle change, so this store flips the moment the
+//! truth changes — whether the IDE drove it, a previous
+//! session's graceful `compose stop` landed mid-launch, or an
+//! external `docker stop` fired. The window-focus refresh in
+//! `wireRuntime` remains as a backstop for anything the watcher
+//! misses; there's no periodic poller.
 
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 

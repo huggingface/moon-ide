@@ -649,6 +649,15 @@ pub fn run() {
 			// per-folder `compose up`s, which try to attach
 			// it to each project network).
 			if matches!(mode, AppMode::Workspace { .. }) {
+				// Start the docker-events watcher for this workspace's
+				// dev container so the status pip (and terminal
+				// reconciliation downstream) tracks daemon-driven
+				// state changes — a previous session's `compose stop`
+				// landing mid-launch, an external `docker stop`, a
+				// daemon restart — not just IDE-initiated ones.
+				if let Some(id) = app.state::<AppState>().workspace_id() {
+					commands::container_events::watch_container_events(app.handle().clone(), id.to_owned());
+				}
 				let app_handle = app.handle().clone();
 				tauri::async_runtime::spawn(async move {
 					let state = app_handle.state::<AppState>();

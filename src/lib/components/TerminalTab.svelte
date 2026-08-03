@@ -528,21 +528,31 @@
 		<div class="error" role="alert">
 			Failed to open terminal: {openError}
 		</div>
-	{:else if closedReason === 'container_stopped' || closedReason === 'container_not_running'}
-		<!-- The environment died (Stop / Recreate / boot race);
-		     the shell is gone but the tab stays so the user can
-		     respawn it once the container is back. -->
+	{:else if closedReason !== null}
+		<!-- The shell is gone but the tab stays so the user can
+		     respawn it or close it deliberately — never vanish
+		     silently with the scrollback. The copy differs by
+		     whether we know the container was the cause. -->
+		{@const isContainerLoss = closedReason === 'container_stopped' || closedReason === 'container_not_running'}
+		{@const command = terminalStore.commandFor(tab.id)}
 		<div class="lost" role="status">
-			<div class="lost-title">Workspace container isn't running</div>
+			<div class="lost-title">{isContainerLoss ? "Workspace container isn't running" : 'Terminal exited'}</div>
 			<div class="lost-sub">
-				This terminal's shell exited with it. Respawn a fresh shell — the last command runs again and up-arrow walks the
-				same history.
-			</div>
-			<div class="lost-actions">
-				{#if containerRunning}
-					<button type="button" class="lost-btn" onclick={respawn}>Respawn terminal</button>
+				{#if isContainerLoss}
+					This terminal's shell exited with it. Respawn a fresh shell once the container is back — the last command is
+					prefilled, and up-arrow walks the same history.
 				{:else}
+					The shell exited. Respawn a fresh shell — the last command is prefilled, and up-arrow walks the same history.
+				{/if}
+			</div>
+			{#if command}
+				<div class="lost-cmd" title={command}>{command}</div>
+			{/if}
+			<div class="lost-actions">
+				{#if isContainerLoss && !containerRunning}
 					<button type="button" class="lost-btn" onclick={waitAndRespawn}>Respawn when running</button>
+				{:else}
+					<button type="button" class="lost-btn" onclick={respawn}>Respawn terminal</button>
 				{/if}
 				<button type="button" class="lost-btn subtle" onclick={closeThisTab}>Close tab</button>
 			</div>

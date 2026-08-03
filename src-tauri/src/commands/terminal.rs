@@ -323,6 +323,17 @@ const OUTPUT_SAMPLE_BYTES: usize = 8 * 1024;
 /// booting) is decided from the output alone and skips the daemon
 /// probe; every other container exit is decided by whether the
 /// container is still running afterwards.
+///
+/// `code: None` (a signal portable-pty couldn't translate, e.g.
+/// the SIGKILL a `docker stop` sends the `docker exec` child)
+/// yields `Unknown` — and the frontend deliberately does **not**
+/// auto-close on `Unknown`, because we can't distinguish a clean
+/// Ctrl+D from the environment dying. That ambiguity is exactly
+/// what hits on a quick IDE relaunch when the previous session's
+/// `compose stop` lands after the new process has already
+/// restored its terminals; auto-closing there made tabs vanish
+/// with their scrollback. Keeping the tab (respawn banner) is
+/// the safe default whenever the cause is in doubt.
 async fn classify_close(
 	container_name: &Option<String>,
 	code: Option<i32>,

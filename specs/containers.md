@@ -106,6 +106,24 @@ are TTL-cached (1 s) and single-flighted per project so concurrent
 callers serialise behind one `docker compose ps`
 ([ADR 0020](decisions/0020-container-status-cache.md)).
 
+The workspace shell additionally gets **event-driven** freshness:
+a docker-events watcher (`src-tauri/src/commands/container_events.rs`)
+tails `docker events` filtered to the `moon-ws-<id>-dev-1`
+container and re-broadcasts `container:state` on any lifecycle
+action (start/stop/die/pause/kill/destroy). This is what closes
+the daemon-driven staleness window polling can't see — a
+previous session's graceful `compose stop` landing seconds into
+a fresh launch, an external `docker stop`, a daemon restart.
+Without it the status pip keeps showing the last snapshot until
+a focus event or a click re-polls, which read as "pip green,
+then every container terminal dies at once." The pip's listener
+picks the event up like any IDE-initiated change, and the
+terminal store reconciles its open container tabs to the respawn
+banner off the same event (see
+[ADR 0050](decisions/0050-terminal-persistence-and-restart.md)).
+Per-folder projects stay poll-driven; only the workspace shell,
+whose state everything downstream keys on, is worth the watcher.
+
 ### Walk-through: moon-landing
 
 moon-landing's compose declares ten services. After binding it:

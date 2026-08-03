@@ -232,10 +232,16 @@ What 2.4 still adds on top:
   alternate shell services or per-folder shell routing.
 - Periodic / push-based status polling so a manual
   `docker compose stop` from the user's terminal updates
-  the UI without a focus-driven refresh. Today
-  per-folder snapshots come from the command response and
-  the docker events watcher (Phase 2.2) will close the
-  loop.
+  the UI without a focus-driven refresh. Per-folder
+  projects stay poll-driven. For the **workspace shell**
+  this is now closed by a docker-events watcher
+  (`container_events.rs`) that tails `docker events` for
+  the dev container and re-broadcasts `container:state`
+  on lifecycle changes — the pip and terminal
+  reconciliation track daemon-driven stops in near real
+  time (see `containers.md` § status freshness). A
+  per-folder watcher is the remaining piece, deferred
+  until the poll cadence actually hurts.
 
 Test plan: `0017-container-services-ui.md` (TBD; folds in
 the deltas above on top of `0012`).

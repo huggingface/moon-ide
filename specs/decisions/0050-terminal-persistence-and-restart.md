@@ -137,14 +137,33 @@ the `terminal:closed` event:
 | `container_shell_exited` | in-container shell exited, container still running | **closes itself**     |
 | `container_stopped`      | container not running afterwards (Stop/Recreate)   | stays, respawn banner |
 | `container_not_running`  | `docker exec` refused (container still booting)    | stays, respawn banner |
-| `unknown`                | portable-pty couldn't translate the exit           | **closes itself**     |
+| `unknown`                | exit code lost (signal the pty can't translate)    | stays, respawn banner |
 
-The split is the honest one: a shell that ends is done, and a
-dead tab strip was the old UX's main complaint — so Ctrl+D and
-`exit` now close the tab outright. But an environment loss is
-not the user's intent, so the tab stays and offers to respawn a
-fresh shell (with its recorded command replayed) once the
-container is back, or to wait for the container first.
+The split is the honest one: a shell that provably ended on its
+own (the container, if any, still up) is done — Ctrl+D and
+`exit` close the tab outright, and a dead tab strip was the old
+UX's main complaint. Everything ambiguous keeps the tab and
+offers to respawn a fresh shell (with its recorded command
+prefilled) — a terminal never just vanishes with its scrollback
+when the environment might have been the cause.
+
+`unknown` was briefly in the auto-close column and got pulled
+out: it fires when portable-pty loses the exit code, which is
+exactly what a `docker stop` does to the `docker exec` child
+(SIGKILL). On a quick IDE relaunch the previous session's
+graceful `compose stop` lands _after_ the new process has
+restored its terminals, killing them with no exit code — and
+auto-closing on `unknown` made those tabs disappear "by magic."
+Losing scrollback to a wrong auto-close is far worse than a tab
+the user closes by hand, so ambiguity now always keeps the tab.
+
+The frontend also reconciles open container tabs against
+`container:state` events: when the workspace container reports
+non-running (broadcast by the docker-events watcher the moment
+the daemon state changes, not on a poll), every live container
+tab flips to the respawn banner immediately instead of waiting
+for each close event to classify itself — and possibly race it
+into an ambiguous reason.
 
 Classification is two probes: a `docker exec` refusal is
 recognised from the child's own output (`Error response from

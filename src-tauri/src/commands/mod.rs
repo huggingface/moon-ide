@@ -4,6 +4,7 @@ pub mod coder;
 pub mod companion;
 pub mod compose_logs;
 pub mod container;
+pub mod container_events;
 pub mod editor_forward;
 pub mod editorconfig;
 pub mod fs;

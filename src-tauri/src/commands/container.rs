@@ -32,8 +32,9 @@ use crate::state::AppState;
 pub const CONTAINER_STATE_EVENT: &str = "container:state";
 
 /// Build the container workspace handle for this process's
-/// workspace from the current bound-folder set.
-async fn workspace_handle(state: &AppState) -> Result<ContainerWorkspace, MoonError> {
+/// workspace from the current bound-folder set. `pub(crate)` for
+/// the docker-events watcher (`container_events`).
+pub(crate) async fn workspace_handle(state: &AppState) -> Result<ContainerWorkspace, MoonError> {
 	let snapshot = state.workspaces.snapshot().await;
 	// Worktree-backed session folders (ADR 0028) are host-only — their
 	// tooling runs host-side, so they don't get a container bind mount.
