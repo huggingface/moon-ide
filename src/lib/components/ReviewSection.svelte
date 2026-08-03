@@ -92,15 +92,19 @@
 
 	// Theme + language compartments mirror DiffView's pattern so a
 	// theme toggle or language hot-swap reconfigures the live merge
-	// view instead of forcing a full rebuild. `ecB` is the right-
-	// side editorconfig compartment — only side B is editable, so
-	// indent / tab settings only matter for it.
+	// view instead of forcing a full rebuild. Editorconfig gets a
+	// compartment per side: side B needs it for editing (indent unit),
+	// but side A needs it just as much — `tabSize` also drives how a
+	// literal `\t` *renders*, so a tab-indented base blob at the CM
+	// default of 4 would sit at a different visual indent than the
+	// working tree at the repo's `indent_size`.
 	const langA = new Compartment();
 	const langB = new Compartment();
 	const themeA = new Compartment();
 	const themeB = new Compartment();
 	const wrapA = new Compartment();
 	const wrapB = new Compartment();
+	const ecA = new Compartment();
 	const ecB = new Compartment();
 
 	// Per-side review-comment controllers. Each owns its comment-list
@@ -256,16 +260,21 @@
 		merge.b.dispatch({ effects: wrapB.reconfigure(ext) });
 	});
 
-	// Live editorconfig reconfigure on side B. The compartment is
-	// only populated when the section is editable (see `build`),
-	// so the dispatch is a no-op for `deleted` rows whose right
-	// pane stays read-only.
+	// Live editorconfig reconfigure. Side A always gets it — the
+	// compartment is unconditional in `build` because `tabSize`
+	// drives tab rendering even in a read-only pane. Side B's
+	// compartment is only populated when the section is editable
+	// (see `build`), so its dispatch is a no-op for `deleted`
+	// rows whose right pane stays read-only.
 	$effect(() => {
 		const ec = workspace.editorConfigFor(path);
-		if (!merge || !editable) {
+		if (!merge) {
 			return;
 		}
-		merge.b.dispatch({ effects: ecB.reconfigure(editorConfigExtensions(ec)) });
+		merge.a.dispatch({ effects: ecA.reconfigure(editorConfigExtensions(ec)) });
+		if (editable) {
+			merge.b.dispatch({ effects: ecB.reconfigure(editorConfigExtensions(ec)) });
+		}
 	});
 
 	function editorConfigExtensions(ec: EditorConfig): Extension {
@@ -320,6 +329,7 @@
 		const readOnlyA: Extension[] = [EditorState.readOnly.of(true), EditorView.editable.of(false)];
 		const readOnlyB: Extension[] = editable ? [] : [EditorState.readOnly.of(true), EditorView.editable.of(false)];
 
+		const ec = workspace.editorConfigFor(path);
 		const sideA: Extension[] = [
 			lineNumbers(),
 			diffGutterTintExtension('a'),
@@ -332,6 +342,11 @@
 			bracketMatching(),
 			themeA.of(moonEditorTheme(workspace.effectiveTheme)),
 			langA.of(lang),
+			// Read-only doesn't mean editorconfig-free: `tabSize`
+			// controls the rendered width of a literal `\t`, so the
+			// base blob must render at the same width as the working
+			// tree or tab-indented lines misalign across the panes.
+			ecA.of(editorConfigExtensions(ec)),
 			wrapA.of(workspace.lineWrap ? EditorView.lineWrapping : []),
 			// Review comments on the base (deleted / old) side.
 			wiringA.extension(baseComments),
@@ -348,7 +363,6 @@
 		// LSP affordance wired here and it only attaches the buffer
 		// on the first modifier-held hover (see `maybeAttachForGoto`
 		// below) — most sections will never trigger it.
-		const ec = workspace.editorConfigFor(path);
 		const editingExtensions: Extension[] = editable
 			? [
 					highlightActiveLineGutter(),
