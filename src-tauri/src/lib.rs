@@ -199,7 +199,6 @@ pub fn run() {
 			commands::terminal::terminal_open,
 			commands::terminal::terminal_write,
 			commands::terminal::terminal_resize,
-			commands::terminal::terminal_rerun_command,
 			commands::terminal::terminal_close,
 			commands::lsp::lsp_open,
 			commands::lsp::lsp_update,

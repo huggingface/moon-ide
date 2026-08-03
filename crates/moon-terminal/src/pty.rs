@@ -102,16 +102,17 @@ impl Drop for PtySession {
 /// `next_output` channel begins yielding bytes as soon as the
 /// child writes anything.
 ///
-/// `command` (when `Some`) is typed into the fresh shell as if the
-/// user had typed it — restart of an exited tab, or session replay
-/// after an IDE relaunch. Delivery is a raw write after a short
-/// delay: the shell needs a moment to initialise readline before
-/// keystrokes land correctly, and writing bytes (rather than
-/// changing the spawned argv) is what makes the line land in the
-/// shell's *own* history, so an up-arrow afterwards walks the same
-/// session the command came from. Readline's bracketed-paste mode
-/// keeps an embedded newline from auto-executing mid-line — the
-/// trailing `\n` we append is what runs it.
+/// `command` (when `Some`) is prefilled at the fresh shell's
+/// prompt as if the user had typed it — but NOT executed: no
+/// trailing newline is sent, so the user reviews the command and
+/// presses Enter themselves. Used for restart of an exited tab
+/// and session replay after an IDE relaunch. Delivery is a raw
+/// write after a short delay (the shell needs a moment to
+/// initialise readline before keystrokes land correctly), wrapped
+/// in bracketed-paste markers so a multi-line command pastes
+/// literally instead of running at its first newline. Once the
+/// user runs it, the line lands in the shell's *own* history —
+/// something a `bash -c` spawn could never do.
 pub fn spawn(target: &TerminalTarget, cols: u16, rows: u16, command: Option<&str>) -> Result<PtySession, PtyError> {
 	let pty_system = native_pty_system();
 	let pair = pty_system
@@ -149,12 +150,18 @@ pub fn spawn(target: &TerminalTarget, cols: u16, rows: u16, command: Option<&str
 	let master = Arc::new(Mutex::new(pair.master));
 	let writer = Arc::new(Mutex::new(writer));
 
-	// Replay a restart / restore command into the fresh shell.
+	// Prefill a restart / restore command into the fresh shell.
 	// The write task needs its own handle on the master — the
 	// session's `writer` Arc moves into `PtySession` below.
 	if let Some(command) = command {
-		let mut bytes = command.as_bytes().to_vec();
-		bytes.push(b'\n');
+		// Bracketed paste: `\x1b[200~ … \x1b[201~` tells
+		// readline to insert the bytes literally, so a
+		// multi-line command doesn't execute at its first
+		// newline. No `\n` is appended — the command sits at
+		// the prompt until the user presses Enter.
+		let mut bytes = b"\x1b[200~".to_vec();
+		bytes.extend_from_slice(command.as_bytes());
+		bytes.extend_from_slice(b"\x1b[201~");
 		let writer = writer.clone();
 		tokio::spawn(async move {
 			// Shell readline init isn't instant; writing too

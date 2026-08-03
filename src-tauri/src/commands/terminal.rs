@@ -81,8 +81,9 @@ pub async fn terminal_open(
 	// Spawn the PTY synchronously so an immediate failure (bad
 	// shell path, missing container) surfaces as the open
 	// command's error rather than a silent close event later. A
-	// `command` in the request is typed into the fresh shell
-	// (restart / session replay) — see `moon_terminal::spawn`.
+	// `command` in the request is prefilled at the fresh shell's
+	// prompt (not executed — restart / session replay) — see
+	// `moon_terminal::spawn`.
 	let session = spawn(&target, request.cols, request.rows, request.command.as_deref())
 		.map_err(|e| MoonError::internal(e.to_string()))?;
 
@@ -153,39 +154,6 @@ pub async fn terminal_resize(
 		return Ok(());
 	};
 	let _ = handle.tx.try_send(TerminalCommand::Resize { cols, rows });
-	Ok(())
-}
-
-/// Clear the shell's current line and type `command` into it, as
-/// if the user had typed it. Distinct from `terminal_write` because
-/// the clear-then-type sequencing (Ctrl+C, wait for the fresh
-/// prompt, then the bytes) must not interleave with regular
-/// keystrokes — the supervisor owns it. Used by the session-replay
-/// path when a persisted terminal's shell turns out to have
-/// survived the container blip that triggered the replay.
-#[tauri::command]
-pub async fn terminal_rerun_command(
-	state: State<'_, AppState>,
-	stream_id: String,
-	command: String,
-) -> Result<(), MoonError> {
-	if command.is_empty() {
-		return Ok(());
-	}
-	let handle = state
-		.terminal_streams
-		.lock()
-		.await
-		.get(&stream_id)
-		.map(|h| h.tx.clone());
-	let Some(tx) = handle else {
-		return Ok(());
-	};
-	// `send().await`, not `try_send`: the channel holds the full
-	// clear-then-type payload as one item, and a keystroke burst
-	// filling all 256 slots right now would silently drop the
-	// replay otherwise.
-	let _ = tx.send(TerminalCommand::RerunCommand(command)).await;
 	Ok(())
 }
 
@@ -312,25 +280,6 @@ async fn supervise(
 					TerminalCommand::Resize { cols, rows } => {
 						if let Err(e) = session.resize(cols, rows).await {
 							tracing::warn!(stream_id = %stream_id, error = %e, "terminal resize failed");
-						}
-					}
-					TerminalCommand::RerunCommand(command) => {
-						// The readline line can hold a half-typed
-						// command the user hasn't run yet — clear it
-						// (Ctrl+C: SIGINT, fresh prompt) before
-						// typing the replacement, or the replay would
-						// append to whatever was sitting there. Then
-						// wait out the SIGINT → prompt round trip
-						// before the real bytes.
-						if let Err(e) = session.write(b"\x03").await {
-							tracing::warn!(stream_id = %stream_id, error = %e, "terminal ctrl-c write failed");
-							continue;
-						}
-						tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-						let mut bytes = command.into_bytes();
-						bytes.push(b'\n');
-						if let Err(e) = session.write(&bytes).await {
-							tracing::warn!(stream_id = %stream_id, error = %e, "terminal command replay write failed");
 						}
 					}
 				}

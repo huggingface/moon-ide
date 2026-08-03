@@ -72,7 +72,7 @@ use tokio::process::Command;
 
 use crate::compose::{
 	generate_compose, BoundMount, ComposeRender, ComposeRenderOptions, GhConfigMount, HostGhToken, HostGitIdentity,
-	MoonEditSocketMount, SshAgentForward, SshConfigMount,
+	MoonEditSocketMount, SshAgentForward, SshConfigMount, SshKnownHostsMount,
 };
 use crate::network::{connect_container_to_network, dev_container_name, project_default_network};
 use crate::port_forward::stop_forwards;
@@ -281,6 +281,7 @@ impl Workspace {
 		let mounts = self.bound_mounts();
 		let agent = detect_ssh_agent_forward();
 		let ssh_config = detect_host_ssh_config();
+		let ssh_known_hosts = detect_host_ssh_known_hosts();
 		let identity = detect_host_git_identity();
 		let gh_config = detect_host_gh_config();
 		let gh_token = detect_host_gh_token();
@@ -305,6 +306,7 @@ impl Workspace {
 			bound_mounts: &mounts,
 			ssh_agent: agent.as_ref(),
 			ssh_config: ssh_config.as_ref(),
+			ssh_known_hosts: ssh_known_hosts.as_ref(),
 			git_identity: identity.as_ref(),
 			gh_config: gh_config.as_ref(),
 			gh_token: gh_token.as_ref(),
@@ -782,6 +784,38 @@ pub(crate) fn detect_host_ssh_config() -> Option<SshConfigMount> {
 		return None;
 	}
 	Some(SshConfigMount { host_path: path })
+}
+
+/// Resolve the host's `~/.ssh/known_hosts` and bind-mount it into
+/// the dev container so an in-container `ssh` trusts every host
+/// the user already accepted on the host. The image's pre-seeded
+/// `/etc/ssh/ssh_known_hosts` only covers `github.com` /
+/// `gitlab.com`; without this mount, any other host (a `Host`
+/// alias from the forwarded config, a `ProxyJump` target, a
+/// private git host) dies with `Host key verification failed.`
+/// under non-interactive `docker exec` — exactly what the agent
+/// hits when it tries to `ssh` somewhere new.
+///
+/// Returns `None` when the file isn't there, matching
+/// [`detect_host_ssh_config`]'s "don't mount a non-existent
+/// source" rule (Docker would auto-create it as an empty
+/// directory and shadow the real file).
+///
+/// Read-only: the host owns the trust store. A host first seen
+/// *inside* the container still falls back to the prompt-based
+/// accept flow; this mount only needs to cover hosts the user
+/// already trusts on the host.
+pub(crate) fn detect_host_ssh_known_hosts() -> Option<SshKnownHostsMount> {
+	let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok()?;
+	let path = Utf8PathBuf::from(home).join(".ssh").join("known_hosts");
+	if !path.is_file() {
+		tracing::debug!(
+			%path,
+			"ssh known_hosts not found; skipping known_hosts pass-through into the container",
+		);
+		return None;
+	}
+	Some(SshKnownHostsMount { host_path: path })
 }
 
 /// Resolve the host's `gh` config directory and bind-mount it

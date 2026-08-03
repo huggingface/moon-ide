@@ -85,13 +85,15 @@ pub struct TerminalOpenRequest {
 	pub target: TerminalTarget,
 	pub cols: u16,
 	pub rows: u16,
-	/// Command to run inside the fresh shell right after spawn
-	/// (typed in as if the user had typed it). Used by "restart"
-	/// on an exited tab and by session replay on IDE launch — the
-	/// frontend seeds it from the shell-history line it captured
-	/// when the terminal was last used, so the restored terminal
-	/// lands with its previous command already run and the rest
-	/// of the session's history available via up-arrow.
+	/// Command to prefill at the fresh shell's prompt right after
+	/// spawn — typed in as if the user had typed it, but NOT
+	/// executed (no trailing newline is sent; the user reviews it
+	/// and presses Enter). Used by "restart" on an exited tab and
+	/// by session replay on IDE launch — the frontend seeds it
+	/// from the shell-history line it captured when the terminal
+	/// was last used. Once the user runs it, the line lands in
+	/// the shell's own history and up-arrow keeps walking the
+	/// same session.
 	#[serde(default)]
 	pub command: Option<String>,
 	/// Absolute **host** path of the bound folder this terminal is

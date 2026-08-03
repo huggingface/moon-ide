@@ -278,7 +278,6 @@ export const ipc = {
 		open: (request: TerminalOpenRequest) => invoke<string>('terminal_open', { request }),
 		write: (streamId: string, data: string) => invoke<void>('terminal_write', { streamId, data }),
 		resize: (streamId: string, cols: number, rows: number) => invoke<void>('terminal_resize', { streamId, cols, rows }),
-		rerunCommand: (streamId: string, command: string) => invoke<void>('terminal_rerun_command', { streamId, command }),
 		close: (streamId: string) => invoke<void>('terminal_close', { streamId }),
 	},
 	nextEdit: {

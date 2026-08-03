@@ -194,6 +194,40 @@ pub struct SshConfigMount {
 	pub host_path: Utf8PathBuf,
 }
 
+/// In-container path the host's `~/.ssh/known_hosts` is
+/// bind-mounted at, alongside the config. Pinned to the dev
+/// user's `~/.ssh/known_hosts` so the in-container `ssh` trusts
+/// the same hosts the user already trusted on the host.
+pub const SSH_KNOWN_HOSTS_CONTAINER_PATH: &str = "/home/dev/.ssh/known_hosts";
+
+/// Bind-mount of the host's `~/.ssh/known_hosts` into the dev
+/// container, read-only. The image pre-seeds
+/// `/etc/ssh/ssh_known_hosts` with only `github.com` /
+/// `gitlab.com`, so without this any other host the user connects
+/// to (`ssh europe`, a `ProxyJump` target, a private git host)
+/// dies on the host-key prompt under non-interactive `docker
+/// exec` — exactly the failure the agent hits. Forwarding the
+/// host's known_hosts extends that trust to every host the user
+/// already accepted on the host.
+///
+/// Read-only like the config: the host owns the file. A
+/// container-side `ssh-keyscan` / `accept-new` write would
+/// otherwise surprisingly mutate the host's trust store. A host
+/// first seen *inside* the container still falls back to the
+/// prompt-based accept flow (writable `~/.ssh/known_hosts`
+/// permitting) — this mount only needs to cover hosts the user
+/// already trusts.
+///
+/// Skipped by the lifecycle layer when the host file doesn't
+/// exist, matching `detect_host_ssh_config`'s "don't mount a
+/// non-existent source" rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshKnownHostsMount {
+	/// Absolute host-side path to the user's known_hosts file
+	/// (typically `~/.ssh/known_hosts`).
+	pub host_path: Utf8PathBuf,
+}
+
 /// In-container path the host's `gh` config is mounted at. We
 /// pin it to the `dev` user's `~/.config/gh` so the in-container
 /// `gh` finds the host's auth without needing
@@ -334,6 +368,10 @@ pub struct ComposeRenderOptions<'a> {
 	/// volume entirely — Host aliases and per-host options are
 	/// then unknown inside the container.
 	pub ssh_config: Option<&'a SshConfigMount>,
+	/// Optional `~/.ssh/known_hosts` bind mount. `None` skips the
+	/// volume entirely — the container then trusts only the
+	/// image's pre-seeded `github.com` / `gitlab.com` keys.
+	pub ssh_known_hosts: Option<&'a SshKnownHostsMount>,
 	/// Optional git identity carried over from the host. `None`
 	/// leaves the container's git unconfigured, so the first
 	/// commit prompts "Please tell me who you are" — a deliberate
@@ -410,6 +448,7 @@ pub fn generate_compose(options: ComposeRenderOptions<'_>) -> ComposeRender {
 	let _ = writeln!(yaml, "    volumes:");
 	let has_extra_mount = options.ssh_agent.is_some()
 		|| options.ssh_config.is_some()
+		|| options.ssh_known_hosts.is_some()
 		|| options.gh_config.is_some()
 		|| options.moon_edit_socket.is_some();
 	if options.bound_mounts.is_empty() && !has_extra_mount {
@@ -448,6 +487,18 @@ pub fn generate_compose(options: ComposeRenderOptions<'_>) -> ComposeRender {
 				"      - {host}:{container}:ro",
 				host = cfg.host_path.as_str(),
 				container = SSH_CONFIG_CONTAINER_PATH,
+			);
+		}
+		if let Some(kh) = options.ssh_known_hosts {
+			// Read-only by design — the host owns the trust
+			// store. Extends host-key trust beyond the image's
+			// pre-seeded github/gitlab keys to every host the
+			// user already accepted on the host.
+			let _ = writeln!(
+				yaml,
+				"      - {host}:{container}:ro",
+				host = kh.host_path.as_str(),
+				container = SSH_KNOWN_HOSTS_CONTAINER_PATH,
 			);
 		}
 		if let Some(gh) = options.gh_config {
@@ -542,6 +593,7 @@ mod tests {
 			bound_mounts: &[],
 			ssh_agent: None,
 			ssh_config: None,
+			ssh_known_hosts: None,
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
@@ -578,6 +630,7 @@ mod tests {
 			bound_mounts: &[],
 			ssh_agent: None,
 			ssh_config: None,
+			ssh_known_hosts: None,
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
@@ -599,6 +652,7 @@ mod tests {
 			bound_mounts: &mounts,
 			ssh_agent: None,
 			ssh_config: None,
+			ssh_known_hosts: None,
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
@@ -622,6 +676,7 @@ mod tests {
 			bound_mounts: &mounts,
 			ssh_agent: None,
 			ssh_config: None,
+			ssh_known_hosts: None,
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
@@ -642,6 +697,7 @@ mod tests {
 			bound_mounts: &[mount("/x", "x")],
 			ssh_agent: None,
 			ssh_config: None,
+			ssh_known_hosts: None,
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
@@ -659,6 +715,7 @@ mod tests {
 			bound_mounts: &[],
 			ssh_agent: None,
 			ssh_config: None,
+			ssh_known_hosts: None,
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
@@ -679,6 +736,7 @@ mod tests {
 			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
 			ssh_agent: Some(&agent),
 			ssh_config: None,
+			ssh_known_hosts: None,
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
@@ -710,6 +768,7 @@ mod tests {
 			bound_mounts: &[],
 			ssh_agent: Some(&agent),
 			ssh_config: None,
+			ssh_known_hosts: None,
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
@@ -738,6 +797,7 @@ mod tests {
 			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
 			ssh_agent: None,
 			ssh_config: None,
+			ssh_known_hosts: None,
 			git_identity: Some(&identity),
 			gh_config: None,
 			gh_token: None,
@@ -771,6 +831,7 @@ mod tests {
 			bound_mounts: &[],
 			ssh_agent: Some(&agent),
 			ssh_config: None,
+			ssh_known_hosts: None,
 			git_identity: Some(&identity),
 			gh_config: None,
 			gh_token: None,
@@ -800,6 +861,7 @@ mod tests {
 			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
 			ssh_agent: None,
 			ssh_config: Some(&cfg),
+			ssh_known_hosts: None,
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
@@ -831,6 +893,7 @@ mod tests {
 			bound_mounts: &[],
 			ssh_agent: None,
 			ssh_config: Some(&cfg),
+			ssh_known_hosts: None,
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
@@ -863,6 +926,7 @@ mod tests {
 			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
 			ssh_agent: Some(&agent),
 			ssh_config: Some(&cfg),
+			ssh_known_hosts: None,
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
@@ -880,6 +944,68 @@ mod tests {
 	}
 
 	#[test]
+	fn ssh_known_hosts_mount_renders_read_only_volume() {
+		let project = project();
+		let kh = SshKnownHostsMount {
+			host_path: Utf8PathBuf::from("/home/me/.ssh/known_hosts"),
+		};
+		let render = generate_compose(ComposeRenderOptions {
+			project: &project,
+			dev_image: "moon-base:dev",
+			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
+			ssh_agent: None,
+			ssh_config: None,
+			ssh_known_hosts: Some(&kh),
+			git_identity: None,
+			gh_config: None,
+			gh_token: None,
+			moon_edit_socket: None,
+		});
+
+		assert!(
+			render
+				.yaml
+				.contains("- /home/me/.ssh/known_hosts:/home/dev/.ssh/known_hosts:ro"),
+			"got:\n{}",
+			render.yaml,
+		);
+		// No environment block: known_hosts is a pure file mount,
+		// no env var carries with it.
+		assert!(!render.yaml.contains("    environment:"));
+	}
+
+	#[test]
+	fn ssh_config_and_known_hosts_coexist_in_volumes_block() {
+		// The realistic pairing: config for alias resolution,
+		// known_hosts for host-key trust beyond the pre-seeded
+		// github/gitlab keys.
+		let project = project();
+		let cfg = SshConfigMount {
+			host_path: Utf8PathBuf::from("/home/me/.ssh/config"),
+		};
+		let kh = SshKnownHostsMount {
+			host_path: Utf8PathBuf::from("/home/me/.ssh/known_hosts"),
+		};
+		let render = generate_compose(ComposeRenderOptions {
+			project: &project,
+			dev_image: "moon-base:dev",
+			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
+			ssh_agent: None,
+			ssh_config: Some(&cfg),
+			ssh_known_hosts: Some(&kh),
+			git_identity: None,
+			gh_config: None,
+			gh_token: None,
+			moon_edit_socket: None,
+		});
+
+		assert!(render.yaml.contains("- /home/me/.ssh/config:/home/dev/.ssh/config:ro"));
+		assert!(render
+			.yaml
+			.contains("- /home/me/.ssh/known_hosts:/home/dev/.ssh/known_hosts:ro"));
+	}
+
+	#[test]
 	fn gh_config_mount_renders_read_only_volume() {
 		let project = project();
 		let gh = GhConfigMount {
@@ -891,6 +1017,7 @@ mod tests {
 			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
 			ssh_agent: None,
 			ssh_config: None,
+			ssh_known_hosts: None,
 			git_identity: None,
 			gh_config: Some(&gh),
 			gh_token: None,
@@ -916,6 +1043,7 @@ mod tests {
 			bound_mounts: &[],
 			ssh_agent: None,
 			ssh_config: None,
+			ssh_known_hosts: None,
 			git_identity: None,
 			gh_config: Some(&gh),
 			gh_token: None,
@@ -942,6 +1070,7 @@ mod tests {
 			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
 			ssh_agent: None,
 			ssh_config: None,
+			ssh_known_hosts: None,
 			git_identity: None,
 			gh_config: None,
 			gh_token: Some(&token),
@@ -968,6 +1097,7 @@ mod tests {
 			bound_mounts: &[],
 			ssh_agent: None,
 			ssh_config: None,
+			ssh_known_hosts: None,
 			git_identity: None,
 			gh_config: None,
 			gh_token: Some(&token),
@@ -994,6 +1124,7 @@ mod tests {
 			bound_mounts: &[],
 			ssh_agent: None,
 			ssh_config: None,
+			ssh_known_hosts: None,
 			git_identity: Some(&identity),
 			gh_config: None,
 			gh_token: None,
@@ -1021,6 +1152,7 @@ mod tests {
 			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
 			ssh_agent: None,
 			ssh_config: None,
+			ssh_known_hosts: None,
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
@@ -1059,6 +1191,7 @@ mod tests {
 			bound_mounts: &[],
 			ssh_agent: None,
 			ssh_config: None,
+			ssh_known_hosts: None,
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,

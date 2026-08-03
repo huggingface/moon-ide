@@ -1134,11 +1134,14 @@ export type TerminalOpenRequest = {
 	target: TerminalTarget;
 	cols: number;
 	rows: number;
-	/** Command to type into the fresh shell right after spawn —
-	 * restart of an exited tab, or session replay on launch.
-	 * Delivered as keystrokes so the line lands in the shell's
-	 * own history (an up-arrow afterwards keeps walking the
-	 * same session). `null` for a bare prompt. */
+	/** Command to prefill at the fresh shell's prompt right
+	 * after spawn — NOT executed (no trailing newline; the
+	 * user reviews it and presses Enter). Restart of an
+	 * exited tab, or session replay on launch. Delivered as
+	 * keystrokes (bracketed-paste wrapped) so the line lands
+	 * in the shell's own history once run, and an up-arrow
+	 * afterwards keeps walking the same session. `null` for
+	 * a bare prompt. */
 	command?: string | null;
 	/** Absolute host path of the bound folder this terminal is
 	 * being opened for, so the backend can scope the coder's

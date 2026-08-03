@@ -522,6 +522,13 @@ first non-interactive `git fetch` doesn't die on the host-key
 prompt. The forward is re-evaluated on every `compose.yaml` write;
 starting an agent after the IDE is open requires a Rebuild.
 
+The dev user's `~/.ssh/` is created dev-owned at image build time,
+so the in-container `ssh` can write `~/.ssh/known_hosts` for hosts
+first seen inside the container. Without this the bind-mounted
+config's parent dir is auto-created `root:root` by Docker and every
+non-pre-seeded host fails with `Host key verification failed.`
+under non-interactive `docker exec`.
+
 Deferred: GPG agent forwarding; a UI toggle for the forward.
 
 ## SSH config forwarding
@@ -538,7 +545,16 @@ silently skipped by OpenSSH (falls back to the agent — what we
 want); `ProxyCommand` lines exec'ing host-only binaries won't work;
 `Include` of non-mounted paths is ignored; `ControlMaster`
 multiplexing is off (the mount parent isn't user-writable).
-Deferred: forwarding `known_hosts` beyond the pre-seeded defaults.
+
+The host's `~/.ssh/known_hosts` is forwarded the same way —
+read-only, skipped when absent — so the in-container `ssh` trusts
+every host the user already accepted on the host, not just the
+pre-seeded `github.com` / `gitlab.com`. This is what lets a
+non-interactive `ssh coyo` (or any custom `Host` alias) succeed
+under `docker exec` instead of dying on the host-key prompt. A host
+first seen _inside_ the container still falls back to the
+prompt-based accept flow; the mount only needs to cover hosts the
+user already trusts.
 
 ## Git author identity from the host
 

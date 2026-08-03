@@ -197,6 +197,17 @@ RUN groupadd --gid "${GID}" "${USERNAME}" \
  && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USERNAME}" \
  && chmod 0440 "/etc/sudoers.d/${USERNAME}"
 
+# Pre-create the dev user's `~/.ssh` owned by ${USERNAME}. moon-ide
+# bind-mounts the host's `~/.ssh/config` file (and optionally
+# `known_hosts`) into this directory; when the directory doesn't
+# exist in the image, Docker auto-creates it as `root:root` at
+# container start, which leaves the dev user unable to write
+# `~/.ssh/known_hosts` — so every non-pre-seeded host fails with
+# `Host key verification failed.` under non-interactive `docker
+# exec`. Making it dev-owned up front lets ssh persist accepted
+# host keys next to the read-only mounted config.
+RUN install -d -m 0700 -o "${USERNAME}" -g "${USERNAME}" "/home/${USERNAME}/.ssh"
+
 USER ${USERNAME}
 WORKDIR /home/${USERNAME}
 

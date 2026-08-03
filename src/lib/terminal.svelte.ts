@@ -221,7 +221,8 @@ class TerminalStore {
 	}
 
 	/** Replay the hydrated terminal tabs: spawn a fresh shell
-	 * per entry with its recorded command typed in. Container
+	 * per entry with its recorded command prefilled at the
+	 * prompt (not executed — the user presses Enter). Container
 	 * terminals wait for the workspace shell to reach `running`
 	 * (the launch-time auto-resume can take minutes on an image
 	 * pull); if it never does, the entries stay in
@@ -281,9 +282,9 @@ class TerminalStore {
 	 * coder's terminal-reading tools only ever see the terminals
 	 * of the project a session is working in — see ADR 0048.
 	 *
-	 * `command` (restart / session replay) is typed into the
-	 * fresh shell by the backend and seeded into the tab's
-	 * recorded history line.
+	 * `command` (restart / session replay) is prefilled at the
+	 * fresh shell's prompt by the backend (not executed) and
+	 * seeded into the tab's recorded history line.
 	 */
 	async open(
 		target: TerminalTarget,

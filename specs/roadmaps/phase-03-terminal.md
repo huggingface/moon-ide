@@ -95,22 +95,23 @@ What shipped after 3.0 (persistence & restart, ADR 0050):
   the terminal last ran, captured from the shell's own
   `PROMPT_COMMAND` hook) persists in
   `AppState.bottom_panel.terminals`. On launch each entry
-  re-spawns as a fresh shell with its command typed back in —
-  relaunching the IDE restores the full terminal setup.
-  Container entries wait for the auto-resume to reach
-  `running` first. See
+  re-spawns as a fresh shell with its command **prefilled at
+  the prompt** (not executed — the user presses Enter) —
+  relaunching the IDE restores the full terminal setup one
+  keystroke from running. Container entries wait for the
+  auto-resume to reach `running` first. See
   [ADR 0050](../decisions/0050-terminal-persistence-and-restart.md).
 - **Auto-close on shell exit / respawn on environment loss.**
   The supervisor classifies each close (`shell_exited`,
   `container_shell_exited`, `container_stopped`,
   `container_not_running`). Shell exits (Ctrl+D, `exit`, a
   finished command) close the tab outright; a container loss
-  keeps the tab and offers to respawn the shell (replaying
+  keeps the tab and offers to respawn the shell (prefilling
   its command) once the container is back.
 - **Restart.** An exited terminal's tab offers "Respawn",
   which opens a fresh PTY on the same target with the
-  recorded command typed in, keeping the tab's strip
-  position.
+  recorded command prefilled at the prompt, keeping the
+  tab's strip position.
 
 What still doesn't ship (and when to revisit):
 

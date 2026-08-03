@@ -44,12 +44,21 @@ project owns it, and the shell-history line it last ran.
 
 On launch, `WorkspaceState.restoreAppState` hands the list to
 the terminal store, which re-spawns each entry as a fresh shell
-and types `command` into it. The replayed command is what seeds
-the new shell's history, so an up-arrow afterwards keeps
-walking the same session the command came from. Container
-entries wait for the workspace shell to reach `running` (the
-launch-time auto-resume can take minutes on an image pull)
-rather than erroring out.
+and **prefills** `command` at the prompt — typed in as if the
+user had typed it, but not executed. The user reviews the
+command and presses Enter; once it runs, it lands in the new
+shell's history, so an up-arrow afterwards keeps walking the
+same session the command came from. Container entries wait for
+the workspace shell to reach `running` (the launch-time
+auto-resume can take minutes on an image pull) rather than
+erroring out.
+
+Prefill-not-execute is deliberate: an IDE that runs your dev
+servers (or worse, an arbitrary command the history happened to
+hold) on every launch is a surprise and a hazard — the command
+might be destructive in a context that no longer applies. A
+filled prompt is one keystroke away from running and zero
+keystrokes away from inspecting, which is the right default.
 
 This is a fresh shell with its last command re-run, **not**
 process persistence — the dev server actually died when the IDE
@@ -92,28 +101,29 @@ recorded command stays whatever the spawn/replay seeded —
 restart and persistence degrade to "replays the restore
 command", which is still correct, just not live-updating.
 
-### `command` is typed into the shell, never spawned as argv
+### `command` is prefilled as keystrokes — never executed, never spawned as argv
 
 Both the restore replay and the restart affordance deliver
-`command` as **keystrokes** after the shell is up, not as
-`bash -c <cmd>` on the spawn. Two reasons:
+`command` as **keystrokes** after the shell is up, with no
+trailing newline — it sits at the prompt unexecuted until the
+user presses Enter. Two reasons to use keystrokes rather than
+`bash -c <cmd>` on the spawn:
 
 - **History.** A `bash -c` command never enters the shell's
   history, so up-arrow after a restore would walk nothing. A
-  typed line lands in history like any other.
+  typed line, once run, lands in history like any other.
 - **Interactivity.** The recorded command is often a dev server
-  or a `cd` + something; running it as keystrokes in a real
-  interactive shell preserves job control (Ctrl+C, fg/bg)
-  exactly as if the user had typed it.
+  or a `cd` + something; typing it into a real interactive
+  shell preserves job control (Ctrl+C, fg/bg) exactly as if
+  the user had typed it.
 
 The write happens after a short delay (readline needs a moment
-to initialise) and relies on readline's bracketed-paste mode to
-keep any embedded newline from auto-executing mid-line — the
-trailing `\n` we append is what runs it. For the _restart_
-case, where a stale half-typed line might be sitting at the
-prompt, the supervisor clears the line with Ctrl+C before
-typing, and owns that clear-then-type sequencing so a racy
-frontend can't interleave the two writes.
+to initialise) and is wrapped in bracketed-paste markers
+(`\x1b[200~` / `\x1b[201~`) so a multi-line command pastes
+literally instead of running at its first newline. Because the
+replay always targets a freshly-spawned shell, its prompt is
+empty by construction — there's no stale half-typed line to
+clear, so no Ctrl+C dance is needed.
 
 ### Auto-close on shell exit; offer respawn on environment loss
 

@@ -107,6 +107,12 @@ the "polyglot toolchain" tradeoff we picked in ADR 0007.
   `docker exec` invocations would otherwise fail the host-key
   check. If a provider rotates keys between rebuilds, the
   prompt-based flow takes over until the next image rebuild.
+- **Dev-owned `~/.ssh/`** created at image build time. moon-ide
+  bind-mounts the host's `~/.ssh/config` (and `known_hosts`) into
+  it; pre-creating it dev-owned lets the in-container `ssh` write
+  `~/.ssh/known_hosts` for hosts first seen inside the container,
+  instead of dying on `Host key verification failed.` because
+  Docker auto-created the dir `root:root`.
 - **Non-root `dev` user** (uid 1000, gid 1000) with passwordless
   sudo. The uid lines up with the conventional first user on
   Debian/Ubuntu hosts; Docker Desktop for macOS handles the uid

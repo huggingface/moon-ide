@@ -124,17 +124,7 @@ pub struct TerminalStreamHandle {
 /// `PtySession`.
 pub enum TerminalCommand {
 	Write(Vec<u8>),
-	Resize {
-		cols: u16,
-		rows: u16,
-	},
-	/// Clear the readline line (Ctrl+C) and type the command as if
-	/// the user had typed it. Used when a terminal is restored with
-	/// a command but its shell outlived the restore (the container
-	/// never actually went down) — the supervisor owns the
-	/// Ctrl+C-then-type sequencing so a racy frontend can't
-	/// interleave the two writes.
-	RerunCommand(String),
+	Resize { cols: u16, rows: u16 },
 }
 
 impl AppState {
