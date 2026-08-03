@@ -204,6 +204,16 @@ impl McpManager {
 		self.connections.lock().await.remove(id);
 	}
 
+	/// Drop every live connection. Called when the session's bash
+	/// target flips (host ↔ container, ADR 0041): a cached
+	/// connection would otherwise keep serving calls from the
+	/// *previous* target's environment — a playwright browser in a
+	/// container the session no longer runs in. The next call
+	/// respawns on the fresh target.
+	pub async fn drop_all_connections(&self) {
+		self.connections.lock().await.clear();
+	}
+
 	async fn connection(
 		&self,
 		config: &McpServerConfig,
@@ -867,6 +877,74 @@ rl.on('line', (line) => {
 		assert!(err.to_string().contains("no such tool"), "got: {err}");
 
 		manager.drop_connection("fake").await;
+	}
+
+	/// A live connection answers calls without respawning
+	/// (playwright's browser session persists between calls), and
+	/// `drop_all_connections` — the host↔container toggle hook
+	/// (ADR 0041) — clears it so the next call respawns fresh.
+	#[tokio::test]
+	async fn cached_connection_reused_until_drop_all() {
+		if !std::process::Command::new("node")
+			.arg("--version")
+			.output()
+			.map(|o| o.status.success())
+			.unwrap_or(false)
+		{
+			eprintln!("skipping: node not on PATH");
+			return;
+		}
+		// The fake server reports its pid as an `echo_pid` tool
+		// result, so connection reuse vs. respawn is observable
+		// through calls — never by locking the manager's map
+		// (list_tools holds that lock across the spawn).
+		const PID_SERVER: &str = r#"
+const rl = require('readline').createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+	const msg = JSON.parse(line);
+	const reply = (result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }) + '\n');
+	if (msg.method === 'initialize') {
+		reply({ protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'pid', version: '1.0' } });
+	} else if (msg.method === 'tools/list') {
+		reply({ tools: [{ name: 'echo_pid', description: 'reports pid', inputSchema: { type: 'object' } }] });
+	} else if (msg.method === 'tools/call' && msg.params.name === 'echo_pid') {
+		reply({ content: [{ type: 'text', text: String(process.pid) }], isError: false });
+	}
+});
+"#;
+		let config = McpServerConfig {
+			id: "pid".into(),
+			label: "Pid".into(),
+			command: "node".into(),
+			args: vec!["-e".into(), PID_SERVER.into()],
+			..Default::default()
+		};
+		let spawn = McpSpawnTarget {
+			kind: McpSpawnKind::Host { cwd: "/tmp".into() },
+			roots: Vec::new(),
+			mounts: Vec::new(),
+		};
+		let manager = McpManager::default();
+		let cancel = CancellationToken::new();
+		let pid_of = async |manager: &McpManager| {
+			manager
+				.call_tool(&config, &spawn, "echo_pid", json!({}), &cancel)
+				.await
+				.expect("echo_pid")
+				.get("content")
+				.and_then(Value::as_str)
+				.map(str::to_owned)
+				.expect("pid text")
+		};
+
+		let first = pid_of(&manager).await;
+		let second = pid_of(&manager).await;
+		assert_eq!(first, second, "live connection must be reused");
+
+		manager.drop_all_connections().await;
+		let third = pid_of(&manager).await;
+		assert_ne!(first, third, "drop_all must force a respawn");
+		manager.drop_all_connections().await;
 	}
 
 	#[test]

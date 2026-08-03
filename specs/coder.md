@@ -602,8 +602,10 @@ the workspace has no enabled servers, and neither is mode-gated
   caps a request body at 5 MiB. See [ADR 0049](decisions/0049-image-payload-budget.md).
 - **Lifecycle**: spawned lazily on first use, kept alive across
   turns (a playwright browser session persists between calls),
-  killed on disable / remove / IDE exit, respawned on the next call
-  after a crash.
+  killed on disable / remove / IDE exit / a host↔container mode
+  toggle (ADR 0041 — the connection is bound to wherever it
+  spawned, so the flip respawns it on the new target), respawned
+  on the next call after a crash.
 - An MCP-level `isError` result throws, per the error model below.
 
 ### Error model

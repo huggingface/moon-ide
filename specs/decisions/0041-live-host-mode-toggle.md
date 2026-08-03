@@ -32,6 +32,21 @@ sees where each command actually ran regardless.
 Sub-agents keep their historical behaviour (always auto) — the
 override remains a top-level-session escape hatch, per ADR 0022.
 
+## Amendment 2026-08-02 — the toggle also reroutes MCP servers
+
+MCP servers resolve their spawn target from the same probe as `bash`
+(ADR 0033), so a fresh `mcp_call` after a flip already landed on the
+new target — but a **cached live connection didn't**: `McpManager`
+returns the alive connection without comparing targets, so a
+playwright browser spawned in the container kept answering host-mode
+calls. The toggle now drops every live MCP connection
+(`McpManager::drop_all_connections`); the next call respawns on the
+new target. Cost is a lost browser session mid-task — accepted,
+because silently driving a browser in the environment the user just
+switched away from is worse, and "an already-running command keeps
+the target it started with" never made sense for a persistent
+server the way it does for one `bash` invocation.
+
 ## Rejected alternative
 
 Re-snapshotting the header at each loop iteration — cheaper to write

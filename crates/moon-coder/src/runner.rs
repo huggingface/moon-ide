@@ -2077,6 +2077,13 @@ impl CoderHandle {
 		// rather than the next turn.
 		rt.force_host_bash
 			.store(force_host, std::sync::atomic::Ordering::Relaxed);
+		// MCP servers follow the bash target (ADR 0033). A live
+		// connection is bound to wherever it spawned, so it can't
+		// migrate — kill them all and let the next call respawn on
+		// the new target. Cost: a playwright browser session is
+		// lost mid-task. That's the toggle's semantics; silently
+		// driving a browser in the *old* environment is worse.
+		self.state.tools.mcp().drop_all_connections().await;
 		if let Some(dir) = session_dir {
 			if let Err(err) = sessions::rewrite_header(&dir, &header).await {
 				tracing::warn!(?err, "failed to persist bash_target_override header rewrite");
