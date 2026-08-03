@@ -662,6 +662,13 @@
 	let filesFilter = $state('');
 	let filesBtnEl: HTMLButtonElement | undefined = $state();
 	let filesInputEl: HTMLInputElement | undefined = $state();
+	// Viewport coordinates for the menu card, captured from the Files
+	// button's rect at open time. The menu is `position: fixed` (it
+	// sits in a full-viewport overlay to catch click-outside), so a
+	// static stylesheet offset can't know where the review tab's
+	// scroller lives — a hardcoded `left` lands inside the sidebar
+	// whenever the sidebar is wider than the offset.
+	let filesMenuPos = $state({ left: 16, top: 40 });
 
 	const filteredEntries: readonly { path: string; status: GitFileStatus }[] = $derived.by(() => {
 		const q = filesFilter.trim().toLowerCase();
@@ -673,6 +680,10 @@
 
 	function openFilesMenu() {
 		filesFilter = '';
+		if (filesBtnEl) {
+			const rect = filesBtnEl.getBoundingClientRect();
+			filesMenuPos = { left: Math.max(8, rect.left), top: rect.bottom + 4 };
+		}
 		filesMenuOpen = true;
 		// Focus the filter input once Svelte has mounted it.
 		void tick().then(() => {
@@ -795,6 +806,8 @@
 				aria-label="Jump to file"
 				aria-modal="false"
 				tabindex="-1"
+				style:left="{filesMenuPos.left}px"
+				style:top="{filesMenuPos.top}px"
 				onkeydown={onFilesMenuKeydown}
 				onclick={(e) => e.stopPropagation()}
 			>
@@ -1069,7 +1082,9 @@
 		cursor: not-allowed;
 	}
 	/* File-jump menu. Anchored under the Files button via a fixed
-	 * overlay; the card sits just below the banner. */
+	 * overlay; the card's `left` / `top` come from the button's rect
+	 * (inline style — see `openFilesMenu`), since a stylesheet offset
+	 * can't know where the review tab sits in the window. */
 	.files-overlay {
 		position: fixed;
 		inset: 0;
@@ -1077,8 +1092,6 @@
 	}
 	.files-menu {
 		position: fixed;
-		top: var(--m-review-banner-h, 35px);
-		left: 16px;
 		width: min(420px, calc(100vw - 32px));
 		max-height: min(60vh, 480px);
 		display: flex;
