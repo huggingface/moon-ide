@@ -32,15 +32,28 @@ back the same terminals with the same commands.
 
 ## Decision
 
-### Persist the recipe, not the PTY
+### Persist the recipe, not the PTY — and per-workspace
 
-`AppState.bottom_panel.terminals` is a list of
-`PersistedTerminal { target, folder, command }` — one per open
-terminal tab, in tab order, snapshotted on every persist tick.
-The PTY itself (the process, the scrollback) is gone with the
-IDE; what survives is the _recipe_ to make an equivalent
-terminal: where it runs (host cwd / container cwd), which
-project owns it, and the shell-history line it last ran.
+`WorkspaceSession.terminals` (in the per-workspace
+`session.json`) is a list of `PersistedTerminal { target,
+folder, command }` — one per open terminal tab, in tab order,
+snapshotted on every persist tick. The PTY itself (the process,
+the scrollback) is gone with the IDE; what survives is the
+_recipe_ to make an equivalent terminal: where it runs (host
+cwd / container cwd), which project owns it, and the
+shell-history line it last ran.
+
+Per-workspace scoping is load-bearing, not incidental. A
+`container` terminal names this workspace's `moon-ws-<id>-dev-1`
+and each `folder` belongs to this workspace's bound set, so the
+list has to live in `session.json` alongside the other
+per-workspace resource mappings (`forwarded_ports`,
+`compose_auto_resume`). It was briefly in the machine-global
+`state.json` (`AppState.bottom_panel.terminals`), which every
+workspace process shares — workspace A's terminals then
+restored into workspace B. Moving it to `session.json` is the
+fix; `AppState` keeps only the panel chrome (visibility +
+height).
 
 On launch, `WorkspaceState.restoreAppState` hands the list to
 the terminal store, which re-spawns each entry as a fresh shell

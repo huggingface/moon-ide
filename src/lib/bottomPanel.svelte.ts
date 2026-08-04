@@ -34,9 +34,10 @@
 //! running processes (`docker compose logs -f`, …) that don't
 //! survive a launch. Terminal tabs are the exception: the
 //! terminal store persists a restore recipe (target + folder +
-//! the shell-history line the terminal last ran) into
-//! `AppState.bottom_panel.terminals` and replays it on launch —
-//! see `terminal.svelte.ts` and ADR 0009's persistence section.
+//! the shell-history line the terminal last ran) into the
+//! per-workspace `session.json` (`WorkspaceSession.terminals`)
+//! and replays it on launch — see `terminal.svelte.ts` and ADR
+//! 0050.
 //!
 //! When launch finds the panel visible with no tabs and no
 //! persisted terminals (first run, or the last shutdown had the
@@ -164,10 +165,7 @@ class BottomPanelStore {
 		this.#height = clampHeight(state.height);
 	}
 
-	serialise(): Omit<BottomPanelAppState, 'terminals'> {
-		// The `terminals` slice is the terminal store's to write
-		// (`terminal.serialisePersisted`); the panel only owns the
-		// chrome. `WorkspaceState.persistAppState` merges the two.
+	serialise(): BottomPanelAppState {
 		return { visible: this.#visible, height: this.#height };
 	}
 

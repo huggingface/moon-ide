@@ -55,6 +55,10 @@ fn merge_frontend_session(existing: WorkspaceSession, frontend: WorkspaceSession
 	WorkspaceSession {
 		folders: frontend.folders,
 		active_folder_path: frontend.active_folder_path,
+		// `terminals` is frontend-owned like `folders`: the
+		// frontend snapshots the live tab list on every persist
+		// tick and is the only writer, so its payload wins.
+		terminals: frontend.terminals,
 		coder_provider_lock: existing.coder_provider_lock,
 		forwarded_ports: existing.forwarded_ports,
 		coder_hub_bucket: existing.coder_hub_bucket,
@@ -98,6 +102,7 @@ mod tests {
 				..Default::default()
 			}],
 			active_folder_path: Some(folder.into()),
+			terminals: Vec::new(),
 			coder_provider_lock: None,
 			forwarded_ports: Vec::new(),
 			coder_hub_bucket: None,
@@ -132,6 +137,7 @@ mod tests {
 				m.insert("/home/me/work".to_string(), true);
 				m
 			},
+			terminals: Vec::new(),
 		}
 	}
 

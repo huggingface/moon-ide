@@ -2,6 +2,7 @@
 import type { CoderMcpWorkspaceConfig } from "./CoderMcpWorkspaceConfig";
 import type { FolderSession } from "./FolderSession";
 import type { ForwardedPort } from "./ForwardedPort";
+import type { PersistedTerminal } from "./PersistedTerminal";
 
 /**
  * Persisted UI session for one workspace. Holds one
@@ -92,4 +93,21 @@ coder_mcp?: CoderMcpWorkspaceConfig,
  * what happens after a corrupt-session fallback, which is
  * the right safe default.
  */
-compose_auto_resume?: { [key in string]: boolean }, };
+compose_auto_resume?: { [key in string]: boolean }, 
+/**
+ * Terminal tabs to re-spawn on next launch, in tab order.
+ * Each entry is a *recipe* — target, owning folder, and the
+ * shell-history line the terminal last ran — not a live PTY
+ * (the process dies with the IDE). The frontend snapshots
+ * this on every persist tick and replays it on launch by
+ * spawning fresh shells with each command prefilled.
+ *
+ * Per-workspace by necessity: a `container` terminal names
+ * this workspace's `moon-ws-<id>-dev-1` and each `folder`
+ * belongs to this workspace's bound set. Keeping the list
+ * in `session.json` (not the machine-global `state.json`)
+ * is what stops workspace A's terminals from leaking into
+ * workspace B. See [ADR
+ * 0050](../../specs/decisions/0050-terminal-persistence-and-restart.md).
+ */
+terminals?: Array<PersistedTerminal>, };

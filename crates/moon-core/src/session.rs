@@ -89,6 +89,7 @@ mod tests {
 				..Default::default()
 			}],
 			active_folder_path: Some("/tmp/example".into()),
+			terminals: Vec::new(),
 			coder_provider_lock: None,
 			forwarded_ports: Vec::new(),
 			coder_hub_bucket: None,

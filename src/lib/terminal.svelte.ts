@@ -22,12 +22,12 @@
 //! see `bottomPanel.svelte.ts`): not the PTY, which dies with the
 //! IDE, but the recipe — target, owning folder, and the
 //! shell-history line the terminal last ran. `serialisePersisted`
-//! snapshots the list into `AppState.bottom_panel.terminals`;
+//! snapshots the list into the per-workspace
+//! `WorkspaceSession.terminals` (session.json — per-workspace, so
+//! one workspace's terminals never leak into another's);
 //! `hydratePersisted` + `restoreTerminals` replay it on launch by
-//! spawning fresh shells and typing the recorded command into each
-//! (which is also what seeds the new shell's history, so an
-//! up-arrow afterwards keeps walking the old session). See ADR
-//! 0009's "persistence" section.
+//! spawning fresh shells and prefilling the recorded command at
+//! each prompt. See ADR 0050.
 //!
 //! Why a writer registry instead of a buffer
 //! -----------------------------------------
@@ -190,9 +190,10 @@ class TerminalStore {
 		this.#commands.set(streamId, trimmed);
 	}
 
-	/** Snapshot of the restore list for `AppState.bottom_panel
-	 * .terminals`: one entry per open terminal tab, in tab
-	 * order, carrying its last-recorded history line. */
+	/** Snapshot of the restore list for
+	 * `WorkspaceSession.terminals`: one entry per open terminal
+	 * tab, in tab order, carrying its last-recorded history
+	 * line. */
 	serialisePersisted(): PersistedTerminal[] {
 		const out: PersistedTerminal[] = [];
 		for (const tab of bottomPanel.tabs) {

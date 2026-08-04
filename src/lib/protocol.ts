@@ -940,6 +940,22 @@ export type FolderSession = {
 export type WorkspaceSession = {
 	folders: FolderSession[];
 	active_folder_path: string | null;
+	/** Terminal tabs to re-spawn on next launch, in tab order.
+	 * Frontend-owned (snapshotted on every persist tick).
+	 * Per-workspace by necessity — a `container` target names
+	 * this workspace's `moon-ws-<id>-dev-1` — so it lives in
+	 * `session.json`, not the machine-global `state.json`. */
+	terminals: PersistedTerminal[];
+};
+
+/** One terminal tab's restore recipe. Mirrors
+ * `moon_protocol::session::PersistedTerminal`. */
+export type PersistedTerminal = {
+	target: TerminalTarget;
+	folder: string | null;
+	/** Shell-history line prefilled at the restored shell's
+	 * prompt (not executed). `null` when nothing was run. */
+	command: string | null;
 };
 
 /**
@@ -1080,27 +1096,15 @@ export type AppState = {
 	next_edit: NextEditAppState;
 };
 
-/** Bottom-panel chrome state. Log-stream tabs are intentionally
- * not persisted — they're tied to running compose log processes
- * that don't survive a launch. Terminal tabs are: target, owning
- * folder, and the shell-history line the terminal last ran, so a
- * relaunch can re-spawn the same terminals with their commands
- * replayed. Mirrors `moon_protocol::app_state::BottomPanelAppState`. */
+/** Bottom-panel chrome state — visibility + height only. Tab
+ * contents aren't persisted here: log streams back onto running
+ * processes that don't survive a launch, and terminal restore
+ * recipes are per-*workspace* (they live in `session.json`, see
+ * [`WorkspaceSession`]). Mirrors
+ * `moon_protocol::app_state::BottomPanelAppState`. */
 export type BottomPanelAppState = {
 	visible: boolean;
 	height: number;
-	terminals: PersistedTerminal[];
-};
-
-/** One terminal tab's restore recipe. Mirrors
- * `moon_protocol::app_state::PersistedTerminal`. */
-export type PersistedTerminal = {
-	target: TerminalTarget;
-	folder: string | null;
-	/** Shell-history line to replay into the fresh shell on
-	 * restore — what one up-arrow in the old shell would have
-	 * produced. `null` when nothing was ever run. */
-	command: string | null;
 };
 
 /** One line of streamed `docker compose logs` output. Mirrors
@@ -1194,7 +1198,7 @@ export const defaultAppState: AppState = {
 	workspaces: [],
 	theme: 'system',
 	slack: { active_bot: null, active_thread_ts: null },
-	bottom_panel: { visible: false, height: 240, terminals: [] },
+	bottom_panel: { visible: false, height: 240 },
 	right_panel: null,
 	coder: { last_session_by_folder: {} },
 	next_edit: {

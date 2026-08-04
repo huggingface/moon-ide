@@ -93,8 +93,8 @@ What shipped after 3.0 (persistence & restart, ADR 0050):
 - **Terminal persistence across IDE restart.** The terminal
   _recipe_ (target + owning folder + the shell-history line
   the terminal last ran, captured from the shell's own
-  `PROMPT_COMMAND` hook) persists in
-  `AppState.bottom_panel.terminals`. On launch each entry
+  `PROMPT_COMMAND` hook) persists in the per-workspace
+  `session.json` (`WorkspaceSession.terminals`). On launch each entry
   re-spawns as a fresh shell with its command **prefilled at
   the prompt** (not executed — the user presses Enter) —
   relaunching the IDE restores the full terminal setup one

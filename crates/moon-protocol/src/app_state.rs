@@ -21,7 +21,6 @@ use ts_rs::TS;
 use crate::coder_models::CoderProviderConfig;
 use crate::next_edit::NextEditAppState;
 use crate::slack::SlackBotProfile;
-use crate::terminal::TerminalTarget;
 use crate::theme::ThemeMode;
 use crate::workspace::WorkspaceMeta;
 
@@ -207,16 +206,15 @@ pub struct CoderAppState {
 
 /// Bottom-panel slice of [`AppState`].
 ///
-/// Log-stream and diagnostics tabs are intentionally not persisted:
-/// they're tied to running `docker compose logs -f` processes that
-/// don't survive a launch. **Terminal tabs are** — not the PTY (the
-/// process is gone with the IDE) but the recipe: target, owning
-/// folder, and the shell-history line the terminal last ran. On
-/// launch the frontend re-spawns each persisted terminal as a fresh
-/// shell and replays `command` into it, so "relaunch the IDE, get my
-/// three dev servers back" costs zero retyping. The recorded command
-/// is *sourced from the shell's own history*, so a follow-up up-arrow
-/// in the restored shell keeps walking the same session's history.
+/// Only chrome (visibility + height) lives here. Tab contents are
+/// deliberately not persisted in `AppState`: log streams are tied to
+/// running `docker compose logs -f` processes that don't survive a
+/// launch, and **terminal** restore recipes are per-*workspace* — a
+/// `container` terminal names `moon-ws-<id>-dev-1` and each folder
+/// belongs to one workspace's bound set — so they live in the
+/// per-workspace `session.json` (`WorkspaceSession::terminals`), not
+/// in this machine-global file. Putting them here leaked workspace
+/// A's terminals into workspace B.
 // See the note on [`AppState`] re: `deny_unknown_fields` and on-disk
 // state.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -231,31 +229,6 @@ pub struct BottomPanelAppState {
 	/// frontend so a saved 0 / huge value can't render the editor
 	/// invisible.
 	pub height: u32,
-	/// Terminal tabs to re-spawn on next launch, in tab order. Empty
-	/// on first run and whenever the last shutdown had no terminals
-	/// open — an empty list falls back to the "one default terminal"
-	/// auto-spawn in `WorkspaceState.restoreAppState`.
-	#[serde(default)]
-	pub terminals: Vec<PersistedTerminal>,
-}
-
-/// One terminal tab's restore recipe. See
-/// [`BottomPanelAppState::terminals`].
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct PersistedTerminal {
-	/// Where the shell runs (host + cwd, or container + cwd) — fixed
-	/// at open time, same identity the live tab carries.
-	pub target: TerminalTarget,
-	/// Bound folder the terminal was opened for (host path), or
-	/// `None` for a folder-less `$HOME` shell. Recorded so the
-	/// restored terminal registers under the same project for the
-	/// coder's `list_terminals` / `read_terminal` tools (ADR 0048).
-	pub folder: Option<String>,
-	/// The shell-history line recorded for this terminal — what the
-	/// user would get from one up-arrow in that shell. Replayed into
-	/// the fresh shell on restore. `None` when nothing was ever run.
-	pub command: Option<String>,
 }
 
 impl Default for BottomPanelAppState {
@@ -267,7 +240,6 @@ impl Default for BottomPanelAppState {
 			// lines of log output at the default editor font size on
 			// a typical 1080p screen, without crowding the editor.
 			height: 240,
-			terminals: Vec::new(),
 		}
 	}
 }

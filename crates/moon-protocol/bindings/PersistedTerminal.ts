@@ -3,7 +3,7 @@ import type { TerminalTarget } from "./TerminalTarget";
 
 /**
  * One terminal tab's restore recipe. See
- * [`BottomPanelAppState::terminals`].
+ * [`WorkspaceSession::terminals`].
  */
 export type PersistedTerminal = { 
 /**
@@ -20,7 +20,8 @@ target: TerminalTarget,
 folder: string | null, 
 /**
  * The shell-history line recorded for this terminal — what the
- * user would get from one up-arrow in that shell. Replayed into
- * the fresh shell on restore. `None` when nothing was ever run.
+ * user would get from one up-arrow in that shell. Prefilled at
+ * the restored shell's prompt (not executed). `None` when
+ * nothing was ever run.
  */
 command: string | null, };

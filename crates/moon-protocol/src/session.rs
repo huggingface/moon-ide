@@ -16,6 +16,7 @@ use crate::coder_models::CoderProviderLock;
 use crate::git::{CompareBaseline, PrListScope};
 use crate::ports::ForwardedPort;
 use crate::review::{ReviewComment, ReviewedFile};
+use crate::terminal::TerminalTarget;
 use crate::workspace::FolderOrigin;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -210,4 +211,40 @@ pub struct WorkspaceSession {
 	/// the right safe default.
 	#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
 	pub compose_auto_resume: BTreeMap<String, bool>,
+	/// Terminal tabs to re-spawn on next launch, in tab order.
+	/// Each entry is a *recipe* — target, owning folder, and the
+	/// shell-history line the terminal last ran — not a live PTY
+	/// (the process dies with the IDE). The frontend snapshots
+	/// this on every persist tick and replays it on launch by
+	/// spawning fresh shells with each command prefilled.
+	///
+	/// Per-workspace by necessity: a `container` terminal names
+	/// this workspace's `moon-ws-<id>-dev-1` and each `folder`
+	/// belongs to this workspace's bound set. Keeping the list
+	/// in `session.json` (not the machine-global `state.json`)
+	/// is what stops workspace A's terminals from leaking into
+	/// workspace B. See [ADR
+	/// 0050](../../specs/decisions/0050-terminal-persistence-and-restart.md).
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub terminals: Vec<PersistedTerminal>,
+}
+
+/// One terminal tab's restore recipe. See
+/// [`WorkspaceSession::terminals`].
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PersistedTerminal {
+	/// Where the shell runs (host + cwd, or container + cwd) — fixed
+	/// at open time, same identity the live tab carries.
+	pub target: TerminalTarget,
+	/// Bound folder the terminal was opened for (host path), or
+	/// `None` for a folder-less `$HOME` shell. Recorded so the
+	/// restored terminal registers under the same project for the
+	/// coder's `list_terminals` / `read_terminal` tools (ADR 0048).
+	pub folder: Option<String>,
+	/// The shell-history line recorded for this terminal — what the
+	/// user would get from one up-arrow in that shell. Prefilled at
+	/// the restored shell's prompt (not executed). `None` when
+	/// nothing was ever run.
+	pub command: Option<String>,
 }

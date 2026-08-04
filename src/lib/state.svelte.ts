@@ -1817,14 +1817,15 @@ class WorkspaceState {
 		slack.hydrate(state.slack);
 		// Same for the bottom panel — visibility and height. Log
 		// streams aren't persisted (they back onto running processes
-		// that don't survive a launch); terminal tabs are, via the
-		// terminal store's own slice. Bind the change handlers
-		// before hydrating so the first user interaction triggers a
-		// save.
+		// that don't survive a launch); terminal restore recipes
+		// are, but they're per-*workspace* and live in `session.json`
+		// (`session.terminals`), not the machine-global app state.
+		// Bind the change handlers before hydrating so the first
+		// user interaction triggers a save.
 		bottomPanel.bindOnChange(() => this.persistAppState());
 		bottomPanel.hydrate(state.bottom_panel);
 		terminal.bindOnChange(() => this.persistAppState());
-		terminal.hydratePersisted(state.bottom_panel.terminals ?? []);
+		terminal.hydratePersisted(session?.terminals ?? []);
 		// Bind Tauri push events + window-focus listener once the
 		// Tauri runtime is up. Idempotent — `wireRuntime` early-returns
 		// on subsequent calls (HMR-safe).
@@ -2463,6 +2464,11 @@ class WorkspaceState {
 			const session: WorkspaceSession = {
 				folders: folderSessions,
 				active_folder_path: ws?.active_folder ?? null,
+				// Terminal restore recipes are per-workspace, so they
+				// ride the session payload, not app state. The
+				// `session_save` merge keeps this frontend-owned
+				// field verbatim.
+				terminals: terminal.serialisePersisted(),
 			};
 			// `workspaces`, `slack`, `right_panel`, and `coder` are
 			// written through their own paths (Phase 7.2 bootstrap
@@ -2476,7 +2482,7 @@ class WorkspaceState {
 				workspaces: [],
 				theme: this.theme,
 				slack: { active_bot: null, active_thread_ts: null },
-				bottom_panel: { ...bottomPanel.serialise(), terminals: terminal.serialisePersisted() },
+				bottom_panel: bottomPanel.serialise(),
 				right_panel: null,
 				coder: { last_session_by_folder: {} },
 				next_edit: {
