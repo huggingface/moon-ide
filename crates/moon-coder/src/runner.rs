@@ -6652,10 +6652,15 @@ async fn handle_spawn_worker(
 	// branch name.
 	let parent_folder_for_note = parent_folder.clone();
 	let target_folder = summary.worktree_root.clone().unwrap_or(parent_folder);
-	// Seed the worker with the task prompt.
-	handle.send_to(&summary.id, task.to_string(), Vec::new()).await?;
-	// Register the worker under the orchestrator's session id so the
-	// events-as-messages feeder can filter the broadcast for it.
+	// Register the worker, persist the spawn record, and announce the
+	// `SubagentSpawned` **before** seeding the worker's first turn.
+	// That first `send_to` fires the worker's `SessionLoaded`
+	// (`persisted_records == 0`), and the frontend's "don't hijack the
+	// visible session for a coordinator-spawned worker" guard detects
+	// the worker by the `SubagentSpawned` already sitting in the
+	// coordinator's bucket. Emitting the spawn *after* `send_to` (the
+	// old order) raced that guard: the worker's `SessionLoaded` landed
+	// first, read as a plain open, and the panel jumped to the worker.
 	let orchestrator_id = sink.session_id.clone();
 	let spawn_feeder = state
 		.coordinator_workers
@@ -6695,6 +6700,19 @@ async fn handle_spawn_worker(
 		worktree_root: summary.worktree_root.clone(),
 		detached: false,
 	});
+	// Seed the worker with the task prompt. On failure, roll back the
+	// registration + spawn record so the coordinator isn't left holding
+	// a worker that never started — the emitted `SubagentSpawned` is a
+	// UI concern and is left (the card renders the seed error via the
+	// orchestrator's tool_result, which the turn emits on this `Err`).
+	if let Err(err) = handle.send_to(&summary.id, task.to_string(), Vec::new()).await {
+		state
+			.coordinator_workers
+			.write()
+			.await
+			.remove(&orchestrator_id, &summary.id);
+		return Err(err);
+	}
 	// The worker's worktree just became a bound folder; the folder bar
 	// has no other way to learn about a bind it didn't initiate
 	// (ADR 0044).
