@@ -2970,24 +2970,24 @@ fn has_literal_escape(find: &str) -> bool {
 /// stage — see [`find_backslash_collapsed`].
 fn unescape_literals(s: &str) -> String {
 	let mut out = String::with_capacity(s.len());
-	let mut bytes = s.bytes().peekable();
-	while let Some(b) = bytes.next() {
-		if b == b'\\' {
-			match bytes.peek() {
-				Some(b'n') => {
-					bytes.next();
+	let mut chars = s.chars().peekable();
+	while let Some(c) = chars.next() {
+		if c == '\\' {
+			match chars.peek() {
+				Some('n') => {
+					chars.next();
 					out.push('\n');
 					continue;
 				}
-				Some(b't') => {
-					bytes.next();
+				Some('t') => {
+					chars.next();
 					out.push('\t');
 					continue;
 				}
 				_ => {}
 			}
 		}
-		out.push(b as char);
+		out.push(c);
 	}
 	out
 }
@@ -3728,6 +3728,23 @@ mod tests {
 		assert_eq!(plan.mode, "fuzzy_unescape");
 		assert_eq!(&file[plan.start..plan.end], "a\n\tb");
 		assert_eq!(plan.replace_text, "x\n\ty");
+	}
+
+	#[test]
+	fn locate_edit_unescape_fallback_preserves_multibyte_chars() {
+		// Regression: the unescape stage used to walk `find` /
+		// `replace` byte-by-byte and push each byte as a `char`,
+		// which mangles any multi-byte UTF-8 scalar into mojibake
+		// (`é` → `Ã©`). A file with non-ASCII text that misses the
+		// exact match and falls through to `fuzzy_unescape` must
+		// keep its accents / CJK / emoji intact.
+		let file = "title: \"café ☕ 中文\"\nbody: \"olá\"\n";
+		let find = "title: \"café ☕ 中文\"\\nbody: \"olá\"";
+		let replace = "title: \"thé ☕ 中文\"\\nbody: \"olá\"";
+		let plan = locate_edit(file, find, replace, None, "src/i18n.ts").expect("unescape match");
+		assert_eq!(plan.mode, "fuzzy_unescape");
+		assert_eq!(&file[plan.start..plan.end], "title: \"café ☕ 中文\"\nbody: \"olá\"");
+		assert_eq!(plan.replace_text, "title: \"thé ☕ 中文\"\nbody: \"olá\"");
 	}
 
 	#[test]
