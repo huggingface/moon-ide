@@ -142,58 +142,61 @@
 
 	{#if app.scmStatus}
 		{@const scm = app.scmStatus}
-		{@const defaultBranch = scm.branch.default_branch_remote_ref?.split('/').slice(1).join('/') ?? null}
-		{@const onDefaultBranch = defaultBranch === null || scm.branch.name === defaultBranch}
+		{@const branch = scm.branch}
+		{@const defaultBranch = branch?.default_branch_remote_ref?.split('/').slice(1).join('/') ?? null}
+		{@const onDefaultBranch = !branch || defaultBranch === null || branch.name === defaultBranch}
 		<div class="card scm-card">
-			<div class="scm-head">
-				<span class="scm-branch">{scm.branch.name || 'detached HEAD'}</span>
-				{#if scm.branch.head_short_sha}
-					<span class="muted scm-sha">{scm.branch.head_short_sha}</span>
-				{/if}
-				{#if scm.branch.ahead > 0}
-					<span class="scm-ahead" title="Ahead of upstream">↑{scm.branch.ahead}</span>
-				{/if}
-				{#if scm.branch.behind > 0}
-					<span class="scm-behind" title="Behind upstream">↓{scm.branch.behind}</span>
-				{/if}
-				{#if scm.branch.ahead > 0 || scm.branch.behind > 0}
+			{#if branch}
+				<div class="scm-head">
+					<span class="scm-branch">{branch.name || 'detached HEAD'}</span>
+					{#if branch.head_short_sha}
+						<span class="muted scm-sha">{branch.head_short_sha}</span>
+					{/if}
+					{#if branch.ahead > 0}
+						<span class="scm-ahead" title="Ahead of upstream">↑{branch.ahead}</span>
+					{/if}
+					{#if branch.behind > 0}
+						<span class="scm-behind" title="Behind upstream">↓{branch.behind}</span>
+					{/if}
+					{#if branch.ahead > 0 || branch.behind > 0}
+						<button
+							class="ghost scm-sync-btn"
+							onclick={() => app.scmSync()}
+							disabled={app.scmBusy}
+							title={branch.ahead > 0 && branch.behind > 0
+								? `Pull ${branch.behind} and push ${branch.ahead} (rebase first)`
+								: branch.ahead > 0
+									? `Push ${branch.ahead} commit${branch.ahead === 1 ? '' : 's'}`
+									: `Pull ${branch.behind} commit${branch.behind === 1 ? '' : 's'}`}
+						>
+							{app.scmBusy ? 'Syncing…' : 'Sync'}
+						</button>
+					{/if}
+				</div>
+				{#if !onDefaultBranch && defaultBranch}
 					<button
-						class="ghost scm-sync-btn"
-						onclick={() => app.scmSync()}
-						disabled={app.scmBusy}
-						title={scm.branch.ahead > 0 && scm.branch.behind > 0
-							? `Pull ${scm.branch.behind} and push ${scm.branch.ahead} (rebase first)`
-							: scm.branch.ahead > 0
-								? `Push ${scm.branch.ahead} commit${scm.branch.ahead === 1 ? '' : 's'}`
-								: `Pull ${scm.branch.behind} commit${scm.branch.behind === 1 ? '' : 's'}`}
+						class="ghost scm-default-btn"
+						onclick={() => app.scmSwitchBranch(defaultBranch)}
+						disabled={app.scmBusy || scm.changes.total > 0}
+						title={scm.changes.total > 0
+							? 'Commit or discard the working-tree changes first'
+							: `Switch the working tree back to ${defaultBranch}`}
 					>
-						{app.scmBusy ? 'Syncing…' : 'Sync'}
+						⇄ Switch to {defaultBranch}
 					</button>
 				{/if}
-			</div>
-			{#if !onDefaultBranch && defaultBranch}
-				<button
-					class="ghost scm-default-btn"
-					onclick={() => app.scmSwitchBranch(defaultBranch)}
-					disabled={app.scmBusy || scm.changes.total > 0}
-					title={scm.changes.total > 0
-						? 'Commit or discard the working-tree changes first'
-						: `Switch the working tree back to ${defaultBranch}`}
-				>
-					⇄ Switch to {defaultBranch}
-				</button>
-			{/if}
-			{#if onDefaultBranch && scm.branch.previous_branch && scm.branch.previous_branch !== scm.branch.name}
-				<button
-					class="ghost scm-default-btn"
-					onclick={() => app.scmSwitchBranch(scm.branch.previous_branch!)}
-					disabled={app.scmBusy || scm.changes.total > 0}
-					title={scm.changes.total > 0
-						? 'Commit or discard the working-tree changes first'
-						: `Switch back to ${scm.branch.previous_branch}`}
-				>
-					⇄ Switch to {scm.branch.previous_branch}
-				</button>
+				{#if onDefaultBranch && branch.previous_branch && branch.previous_branch !== branch.name}
+					<button
+						class="ghost scm-default-btn"
+						onclick={() => app.scmSwitchBranch(branch.previous_branch!)}
+						disabled={app.scmBusy || scm.changes.total > 0}
+						title={scm.changes.total > 0
+							? 'Commit or discard the working-tree changes first'
+							: `Switch back to ${branch.previous_branch}`}
+					>
+						⇄ Switch to {branch.previous_branch}
+					</button>
+				{/if}
 			{/if}
 			{#if scm.changes.total > 0}
 				<div class="scm-changes">

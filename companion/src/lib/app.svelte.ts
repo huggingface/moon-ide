@@ -57,7 +57,11 @@ export type ProviderLock = { kind: 'hf' } | { kind: 'user'; id: string };
  * `fs_git_change_summary` / the coordinator's `workspace_scm_status`
  * tool fold: untracked → added, conflicted → modified). */
 type ScmStatus = {
-	branch: {
+	/** Optional on the wire: an older enrolled IDE, or a folder
+	 * whose SCM probe failed, can return a status with no `branch`
+	 * object. The card renders only when it's present (and `changes`
+	 * / `files` still apply for the commit list). */
+	branch?: {
 		name: string | null;
 		head_short_sha: string | null;
 		has_upstream: boolean;
@@ -804,7 +808,7 @@ class CompanionState {
 				{ folder: this.activeFolder },
 				this.activeIde,
 			);
-			if (this.scmStatus) {
+			if (this.scmStatus?.branch) {
 				this.scmStatus.branch.ahead = branch.ahead;
 				this.scmStatus.branch.behind = branch.behind;
 			}

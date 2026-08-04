@@ -17,5 +17,9 @@ export default defineConfig({
 		// phones, not the long tail of old browsers. es2024 is the
 		// highest the toolchain (TS 5.9 lib names) maps cleanly onto.
 		target: 'es2024',
+		// Ship sourcemaps: the PWA is team-internal, so the small size
+		// cost is worth real stack traces when the phone hits a bug
+		// (the alternative is squinting at a minified single chunk).
+		sourcemap: true,
 	},
 });
