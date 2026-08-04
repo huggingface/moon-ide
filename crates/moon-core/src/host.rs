@@ -9,9 +9,9 @@ use camino::{Utf8Path, Utf8PathBuf};
 use moon_protocol::editorconfig::EditorConfig;
 use moon_protocol::fs::{CollectPathsResult, DirEntry, EntryKind, ReadFileResult, StatResult, WriteFileResult};
 use moon_protocol::git::{
-	BranchDiffStatus, BranchList, BranchListEntry, BranchSwitchTarget, CommitDiff, CommitEntry, GitBranchInfo,
-	GitCommitResult, GitFileBlame, GitFileStatus, GitLineBlame, GitMergeState, GitPermalink, GitStatusEntry, GitWorktree,
-	PrListScope, PrListStatus,
+	BranchDiffStatus, BranchList, BranchListEntry, BranchSwitchTarget, CommitDiff, CommitEntry, GitBaseCheck,
+	GitBaseCheckFile, GitBranchInfo, GitCommitResult, GitFileBlame, GitFileStatus, GitLineBlame, GitMergeState,
+	GitPermalink, GitStatusEntry, GitWorktree, PrListScope, PrListStatus,
 };
 use moon_protocol::review::{PublishReviewRequest, PublishReviewResult, ReviewSide};
 use moon_protocol::{MoonError, MoonResult};
@@ -543,10 +543,12 @@ pub trait WorkspaceHost: Send + Sync {
 	/// fetches itself, matching the "merge means merge" contract
 	/// the button label sets up. Errors (conflicts, dirty tree,
 	/// unknown ref) propagate git's stderr verbatim — including
-	/// the `CONFLICT (content)` lines that the SCM panel uses to
-	/// shift into merge-in-progress mode after the call returns
-	/// (the panel then polls `git_merge_state`, which reads
-	/// `.git/MERGE_HEAD` directly).
+	/// the `CONFLICT (content)` lines. On a conflict the merge is
+	/// aborted before returning so the tree is left exactly as it
+	/// was (the same "sync either lands or restores the tree"
+	/// contract `git_pull` keeps); the caller surfaces the conflict
+	/// and the user resolves deliberately rather than inheriting a
+	/// checkout stranded mid-merge.
 	async fn git_merge_default_branch(&self, remote_ref: &str) -> MoonResult<()>;
 
 	/// Snapshot of the working tree's in-flight merge — whether
@@ -721,6 +723,34 @@ pub trait WorkspaceHost: Send + Sync {
 	///
 	/// `commit_sha` must pass `is_safe_rev` (HEAD or 40-char hex).
 	async fn git_diff_against(&self, commit_sha: &str, files: &[String]) -> MoonResult<String>;
+
+	/// Check how far the current branch has drifted behind the
+	/// repo's default branch, and whether its diff reverts work it
+	/// didn't write (ADR 0056 — stale-base tripwire). This is the
+	/// gate a coordinator runs before merging or PR-ing a worker's
+	/// branch: a worktree that sat on an old `origin/main` while
+	/// wave-1 PRs merged underneath it produces a diff that
+	/// *deletes* those merged files, and merging it silently
+	/// reverts them.
+	///
+	/// Runs `git fetch` first so `origin/main` is current (the
+	/// whole point is catching drift against the live default, not
+	/// a stale local ref), then:
+	/// - `default_branch_remote_ref` — the ref compared against
+	///   (e.g. `"origin/main"`).
+	/// - `behind_default` — commits the default has that HEAD
+	///   doesn't.
+	/// - `files` — every path in `git diff <ref>...HEAD`
+	///   (three-dot: changes the branch made relative to the
+	///   merge-base) with per-file deletions.
+	///
+	/// The caller cross-references `files` against the files the
+	/// worker actually touched: a path with `deletions > 0` that
+	/// the worker never edited is the revert tripwire. Read-only
+	/// apart from the fetch. `Ok(None)` when there's no default
+	/// remote ref (a local-only repo has nothing to drift from) or
+	/// not a repo / git unavailable.
+	async fn git_base_check(&self) -> MoonResult<Option<GitBaseCheck>>;
 
 	/// Clone a git repository to a host path (ADR 0030). Runs
 	/// `git clone <url> <dest>` on the host — not the container —
@@ -2203,11 +2233,27 @@ impl WorkspaceHost for LocalHost {
 		let remote_ref = remote_ref.to_owned();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
-			run_git_simple(
+			let result = run_git_simple(
 				&root,
 				&["merge", "--no-edit", &remote_ref],
 				&format!("git merge {remote_ref}"),
-			)
+			);
+			if result.is_err() {
+				// A conflicting merge leaves the tree in MERGE_HEAD
+				// state with conflict markers in the files — the same
+				// half-done mess `git_pull` avoids by aborting a
+				// conflicted rebase. The contract is "merge either
+				// lands or leaves the tree exactly as it was", so when
+				// a merge is in flight we abort it and let the caller
+				// resolve deliberately (the coordinator surfaces the
+				// conflict; the user resolves in a terminal) rather
+				// than stranding the checkout. Best-effort: a failed
+				// abort still surfaces the original merge error.
+				if root.join(".git").join("MERGE_HEAD").exists() {
+					let _ = run_git_simple(&root, &["merge", "--abort"], "git merge --abort");
+				}
+			}
+			result
 		})
 		.await
 		.map_err(|e| MoonError::Internal(format!("git_merge_default_branch join error: {e}")))?
@@ -2354,6 +2400,24 @@ impl WorkspaceHost for LocalHost {
 		})
 		.await
 		.map_err(|e| MoonError::Internal(format!("git_diff_against join error: {e}")))
+	}
+
+	async fn git_base_check(&self) -> MoonResult<Option<GitBaseCheck>> {
+		// The fetch is async (tokio `Command` + timeout), so take the
+		// lock across the whole probe: no concurrent commit can slide
+		// HEAD between the behind-count and the numstat, keeping the
+		// snapshot internally consistent.
+		let guard = self.git_lock().await;
+		let root = self.root.clone();
+		// Best-effort currency of origin/main. A failed fetch (offline,
+		// no remote, auth) downgrades to the local ref rather than
+		// failing the check — the drift signal is still useful, just
+		// measured against a possibly-stale ref.
+		let _ = run_git_fetch_quiet(&root).await;
+		let _guard = guard;
+		tokio::task::spawn_blocking(move || Ok(run_git_base_check(&root)))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_base_check join error: {e}")))?
 	}
 
 	async fn git_clone(&self, url: &str, dest: &Utf8Path) -> MoonResult<()> {
@@ -2653,6 +2717,57 @@ fn count_behind(root: &Utf8Path, remote_ref: &str) -> u32 {
 		.and_then(|o| String::from_utf8(o.stdout).ok())
 		.and_then(|s| s.trim().parse::<u32>().ok())
 		.unwrap_or(0)
+}
+
+/// `git diff <remote_ref>...HEAD --numstat` (three-dot) — the branch's
+/// own changes relative to the merge-base, as `(path, additions,
+/// deletions)` rows. Three-dot is the right lens for the revert
+/// tripwire: it shows what the *branch* did, so a file with deletions
+/// that the worker never touched means merging the branch would
+/// re-delete work that landed on the default after the branch's base.
+/// Empty on any failure (no merge-base, missing ref, git unavailable).
+fn run_git_base_numstat(root: &Utf8Path, remote_ref: &str) -> Vec<GitBaseCheckFile> {
+	use std::process::Command;
+
+	let out = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["diff", "--numstat", &format!("{remote_ref}...HEAD")])
+		.output()
+		.ok()
+		.filter(|o| o.status.success())
+		.and_then(|o| String::from_utf8(o.stdout).ok())
+		.unwrap_or_default();
+	let mut files = Vec::new();
+	for line in out.lines() {
+		let mut parts = line.split('\t');
+		let (Some(add), Some(del), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+			continue;
+		};
+		// Binary files report `-` for both counts; treat as 0/0 — they
+		// can't carry a line-deletion revert signal.
+		let additions = add.parse::<u32>().unwrap_or(0);
+		let deletions = del.parse::<u32>().unwrap_or(0);
+		files.push(GitBaseCheckFile {
+			path: path.to_owned(),
+			additions,
+			deletions,
+		});
+	}
+	files
+}
+
+/// Compose the base-check snapshot: resolve the default remote ref,
+/// count how far HEAD is behind it, and list the branch's three-dot
+/// numstat. Returns `None` when there's no default remote ref (a
+/// local-only repo has nothing to drift from).
+fn run_git_base_check(root: &Utf8Path) -> Option<GitBaseCheck> {
+	let remote_ref = resolve_default_remote_ref(root)?;
+	Some(GitBaseCheck {
+		behind_default: count_behind(root, &remote_ref),
+		files: run_git_base_numstat(root, &remote_ref),
+		default_branch_remote_ref: remote_ref,
+	})
 }
 
 /// Percent-encode a git branch name for use as a single path
@@ -9067,6 +9182,174 @@ mod tests {
 			"expected default_branch_behind to drop to 0 after merge, got {post:?}"
 		);
 		assert_eq!(post.name.as_deref(), Some("feature"));
+	}
+
+	/// A conflicting `git_merge_default_branch` must abort the merge
+	/// before returning, leaving the working tree (and `.git`) exactly
+	/// as it was — not stranded in MERGE_HEAD with conflict markers.
+	/// This is the same "sync either lands or restores the tree"
+	/// contract `git_pull` keeps.
+	#[tokio::test]
+	async fn git_merge_default_branch_aborts_on_conflict() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping merge-conflict test");
+			return;
+		};
+
+		let root = TempDir::new().unwrap();
+		let remote = root.path().join("remote.git");
+		let pusher = root.path().join("pusher");
+		let local = root.path().join("local");
+
+		run_git(&git, root.path(), &["init", "--bare", "-q", "-b", "main", "remote.git"]);
+		std::fs::create_dir_all(&pusher).unwrap();
+		run_git(&git, &pusher, &["init", "-q", "-b", "main"]);
+		run_git(&git, &pusher, &["config", "user.email", "p@example.com"]);
+		run_git(&git, &pusher, &["config", "user.name", "Pusher"]);
+		run_git(&git, &pusher, &["remote", "add", "origin", remote.to_str().unwrap()]);
+		std::fs::write(pusher.join("conflict.txt"), "base\n").unwrap();
+		run_git(&git, &pusher, &["add", "."]);
+		run_git(&git, &pusher, &["commit", "-q", "-m", "initial"]);
+		run_git(&git, &pusher, &["push", "-q", "-u", "origin", "main"]);
+
+		run_git(&git, root.path(), &["clone", "-q", remote.to_str().unwrap(), "local"]);
+		run_git(&git, &local, &["config", "user.email", "l@example.com"]);
+		run_git(&git, &local, &["config", "user.name", "Local"]);
+		// Local diverges on the same line the remote is about to change.
+		run_git(&git, &local, &["checkout", "-q", "-b", "feature"]);
+		std::fs::write(local.join("conflict.txt"), "local edit\n").unwrap();
+		run_git(&git, &local, &["commit", "-q", "-am", "local change"]);
+
+		// Remote advances on the same line → guaranteed content conflict.
+		std::fs::write(pusher.join("conflict.txt"), "remote edit\n").unwrap();
+		run_git(&git, &pusher, &["commit", "-q", "-am", "remote change"]);
+		run_git(&git, &pusher, &["push", "-q", "origin", "main"]);
+
+		let local_root = Utf8PathBuf::from_path_buf(local.canonicalize().unwrap()).unwrap();
+		LocalHost::new(local_root.clone()).git_fetch().await.unwrap();
+
+		let err = LocalHost::new(local_root.clone())
+			.git_merge_default_branch("origin/main")
+			.await
+			.expect_err("a content conflict must error");
+		// Don't assert on the message text — git localises it (`CONFLICT`
+		// vs `CONFLIT`…). The behavioural contract is what matters: the
+		// merge errored *and* was aborted.
+		let _ = err;
+
+		// The tree is restored: no MERGE_HEAD, no conflict markers, the
+		// local edit intact.
+		assert!(
+			!local.join(".git").join("MERGE_HEAD").exists(),
+			"merge must be aborted, not left in MERGE_HEAD"
+		);
+		let content = std::fs::read_to_string(local.join("conflict.txt")).unwrap();
+		assert_eq!(
+			content, "local edit\n",
+			"working tree must be restored, got: {content:?}"
+		);
+		// HEAD is untouched — still the local commit, not a merge.
+		let head = String::from_utf8_lossy(
+			&std::process::Command::new("git")
+				.arg("-C")
+				.arg(&local)
+				.args(["rev-parse", "--abbrev-ref", "HEAD"])
+				.output()
+				.unwrap()
+				.stdout,
+		)
+		.trim()
+		.to_owned();
+		assert_eq!(head, "feature");
+	}
+
+	/// The base check reports how far a branch has drifted behind the
+	/// default and lists its three-dot numstat — the raw material for
+	/// the stale-base revert tripwire (a file with deletions the worker
+	/// didn't write).
+	#[tokio::test]
+	async fn git_base_check_reports_drift_and_numstat() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping base-check test");
+			return;
+		};
+
+		let root = TempDir::new().unwrap();
+		let remote = root.path().join("remote.git");
+		let pusher = root.path().join("pusher");
+		let local = root.path().join("local");
+
+		run_git(&git, root.path(), &["init", "--bare", "-q", "-b", "main", "remote.git"]);
+		std::fs::create_dir_all(&pusher).unwrap();
+		run_git(&git, &pusher, &["init", "-q", "-b", "main"]);
+		run_git(&git, &pusher, &["config", "user.email", "p@example.com"]);
+		run_git(&git, &pusher, &["config", "user.name", "Pusher"]);
+		run_git(&git, &pusher, &["remote", "add", "origin", remote.to_str().unwrap()]);
+		std::fs::write(pusher.join("cap.ts"), "export const cap = 1;\n").unwrap();
+		std::fs::write(pusher.join("keep.ts"), "export const keep = 1;\n").unwrap();
+		run_git(&git, &pusher, &["add", "."]);
+		run_git(&git, &pusher, &["commit", "-q", "-m", "initial"]);
+		run_git(&git, &pusher, &["push", "-q", "-u", "origin", "main"]);
+
+		run_git(&git, root.path(), &["clone", "-q", remote.to_str().unwrap(), "local"]);
+		run_git(&git, &local, &["config", "user.email", "l@example.com"]);
+		run_git(&git, &local, &["config", "user.name", "Local"]);
+		// The worker branches off, then the default moves underneath it.
+		run_git(&git, &local, &["checkout", "-q", "-b", "moon/feat"]);
+
+		// Wave-1 lands on main: it edits `cap.ts` (which the worker did
+		// NOT touch) and adds a new file.
+		std::fs::write(pusher.join("cap.ts"), "export const cap = 2;\n").unwrap();
+		std::fs::write(pusher.join("wave1.ts"), "export const wave1 = true;\n").unwrap();
+		run_git(&git, &pusher, &["add", "."]);
+		run_git(&git, &pusher, &["commit", "-q", "-m", "wave 1"]);
+		run_git(&git, &pusher, &["push", "-q", "origin", "main"]);
+
+		// The worker makes its own change to `keep.ts` only.
+		std::fs::write(local.join("keep.ts"), "export const keep = 2;\n").unwrap();
+		run_git(&git, &local, &["commit", "-q", "-am", "worker change"]);
+
+		let local_root = Utf8PathBuf::from_path_buf(local.canonicalize().unwrap()).unwrap();
+		let check = LocalHost::new(local_root)
+			.git_base_check()
+			.await
+			.unwrap()
+			.expect("a repo with origin/main yields a check");
+
+		assert_eq!(check.default_branch_remote_ref, "origin/main");
+		assert_eq!(check.behind_default, 1, "the branch is one behind the moved default");
+		// The three-dot numstat shows only the branch's own change
+		// (`keep.ts`), not wave-1's files — those are on the default side
+		// of the merge-base.
+		let paths: Vec<&str> = check.files.iter().map(|f| f.path.as_str()).collect();
+		assert_eq!(
+			paths,
+			vec!["keep.ts"],
+			"three-dot diff is the branch's own change, got {paths:?}"
+		);
+		assert_eq!(check.files[0].additions, 1);
+		assert_eq!(check.files[0].deletions, 1);
+	}
+
+	/// A local-only repo (no default remote ref) has nothing to drift
+	/// from — the check collapses to `None` rather than inventing a base.
+	#[tokio::test]
+	async fn git_base_check_is_none_without_a_default_remote() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping base-check test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "l@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "Local"]);
+		std::fs::write(dir.path().join("a.txt"), "hi\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "initial"]);
+
+		let root = Utf8PathBuf::from_path_buf(dir.path().canonicalize().unwrap()).unwrap();
+		let check = LocalHost::new(root).git_base_check().await.unwrap();
+		assert!(check.is_none(), "no origin/main → no base to check, got {check:?}");
 	}
 
 	/// Reproduces the `gh pr checkout <N>` shape for a fork PR

@@ -46,8 +46,9 @@ use crate::models::{self, CoderModels, ResolvedProvider, SharedCoderModels};
 use crate::prompts::{ask_user_tool_definition, PromptOutcome, PromptResponse, QuestionAnswer};
 use crate::providers::{self, ProviderKeyring};
 use crate::sessions::{
-	self, current_time_ms, new_session_id, session_title_from_prompt, sessions_dir, subagent_session_dir,
-	BashTargetOverride, LoadedSession, SessionHeader, SessionRecord, SessionSummary, SESSION_SCHEMA_VERSION,
+	self, current_time_ms, new_named_session_id, new_session_id, session_title_from_prompt, sessions_dir,
+	subagent_session_dir, BashTargetOverride, LoadedSession, SessionHeader, SessionRecord, SessionSummary,
+	SESSION_SCHEMA_VERSION,
 };
 use crate::subagent::{build_subagent_spec, run_subagent, task_tool_definition};
 use crate::tools::{CoderMode, ToolContext, ToolRegistry};
@@ -202,6 +203,34 @@ impl CoordinatorRegistry {
 			.iter()
 			.find(|(_, entry)| entry.workers.contains(worker_id) && !entry.disconnected.contains(worker_id))
 			.map(|(orchestrator_id, _)| orchestrator_id.as_str())
+	}
+
+	/// All workers registered under `orchestrator_id`, each paired with
+	/// its attachment state (`true` = still attached, `false` =
+	/// disconnected but not yet fully released). Powers the
+	/// coordinator's `list_workers` tool and the fleet counts in its
+	/// wake messages. Order is unspecified (a `HashSet`); callers sort.
+	fn workers_of(&self, orchestrator_id: &str) -> Vec<(String, bool)> {
+		let Some(entry) = self.by_orchestrator.get(orchestrator_id) else {
+			return Vec::new();
+		};
+		entry
+			.workers
+			.iter()
+			.map(|w| (w.clone(), !entry.disconnected.contains(w)))
+			.collect()
+	}
+
+	/// Count of `orchestrator_id`'s workers that are still attached —
+	/// the "N workers still on your fleet" line in a wake message.
+	fn attached_count(&self, orchestrator_id: &str) -> usize {
+		self.by_orchestrator.get(orchestrator_id).map_or(0, |entry| {
+			entry
+				.workers
+				.iter()
+				.filter(|w| !entry.disconnected.contains(*w))
+				.count()
+		})
 	}
 
 	/// Mark `worker_id` disconnected from `orchestrator_id` (ADR
@@ -557,6 +586,13 @@ impl FolderEventSink {
 
 	pub(crate) fn folder(&self) -> &str {
 		&self.folder
+	}
+
+	/// The session this sink's events are stamped with. For a
+	/// coordinator session this is the orchestrator id its workers are
+	/// registered under — `list_workers` reads it to look up the fleet.
+	pub(crate) fn session_id(&self) -> &str {
+		&self.session_id
 	}
 }
 
@@ -2030,7 +2066,13 @@ impl CoderHandle {
 		// A pre-set title also suppresses the auto-rename — the
 		// coordinator already named this work.
 		if let Some(slug) = name_slug {
-			blank.header.title = slug;
+			blank.header.title = slug.clone();
+			// Embed the worker's name in the session id too, so a dispatch
+			// packet / `list_workers` row / sessions-dir `ls` reads
+			// `sess-fix-login-redirect-…` instead of an opaque timestamp id.
+			// The id stays unique (timestamp + random suffix) and remains
+			// the stable tool / registry key; the name is for readability.
+			blank.header.id = new_named_session_id(&slug);
 		}
 		blank.header.worktree_root = Some(wt_entry.folder.path.clone());
 		blank.header.worktree_branch = Some(branch);
@@ -4428,19 +4470,24 @@ impl CoderHandle {
 		let handle = CoderHandle {
 			state: self.state.clone(),
 		};
+		// Snapshot the worker's branch *before* the notice so the
+		// coordinator can re-plan from the handover instead of having to
+		// remember to audit a black-box branch (ADR 0056).
+		let snapshot = worker_branch_snapshot(&self.state, session_id).await;
+		let label = worker_label(&self.state, session_id).await;
 		// Detached — the click isn't blocked on the orchestrator's
 		// wake bookkeeping; failure (orchestrator unmounted /
 		// deleted) only costs the notice.
-		let session_id = session_id.to_string();
 		tokio::spawn(async move {
+			let state_line = snapshot.map(|s| format!(" Final state: {s}.")).unwrap_or_default();
 			let _ = handle
 				.send_to(
 					&orchestrator_id,
 					format!(
-						"Worker {session_id} was disconnected by the user. It is no longer attached to you: \
+						"Worker {label} was disconnected by the user. It is no longer attached to you: \
 						 its updates won't reach you any more and your control tools (steer / abort / commit / \
 						 merge / respond) refuse it. Its session, branch, and worktree are untouched — the user \
-						 owns it from here. Don't wait on it; adjust your plan."
+						 owns it from here. Don't wait on it; adjust your plan.{state_line}"
 					),
 					Vec::new(),
 				)
@@ -4448,6 +4495,60 @@ impl CoderHandle {
 		});
 		DisconnectWorkerOutcome::Disconnected
 	}
+}
+
+/// A short human label for a worker — its title, or the session id when
+/// there's no title yet. Used to make wake / disconnect messages read
+/// `fix-login-redirect` instead of an opaque `sess-…` id. Best-effort;
+/// falls back to the bare id.
+async fn worker_label(state: &Arc<CoderState>, worker_id: &str) -> String {
+	let Some((rt, _)) = state.runtime_for_session(worker_id).await else {
+		return worker_id.to_string();
+	};
+	let session = rt.session.lock().await;
+	let title = session.header.title.trim();
+	if title.is_empty() {
+		worker_id.to_string()
+	} else {
+		format!("`{title}` ({worker_id})")
+	}
+}
+
+/// A one-line git snapshot of a worker's branch for the disconnect
+/// notice (ADR 0056 — disconnected-worker audit). The handover used to
+/// tell the coordinator only "the user owns it now", leaving the branch
+/// a black box the coordinator had to remember to audit. Now the notice
+/// carries the state the coordinator needs to re-plan: branch, ahead /
+/// behind upstream, uncommitted files, and how far the branch has
+/// drifted behind the default. Best-effort — `None` when the folder or
+/// git is unavailable, and the notice goes out without it.
+async fn worker_branch_snapshot(state: &Arc<CoderState>, worker_id: &str) -> Option<String> {
+	let (rt, folder_path) = state.runtime_for_session(worker_id).await?;
+	// Prefer the worker's worktree over its session folder.
+	let routing_path = {
+		let session = rt.session.lock().await;
+		match session.header.worktree_root.clone() {
+			Some(root) if state.workspaces.folder_for_path(&root).await.is_some() => root,
+			_ => folder_path.to_string(),
+		}
+	};
+	let folder = state.workspaces.folder_for_path(&routing_path).await?;
+	let branch = folder.host.git_branch().await.unwrap_or_default();
+	let entries = folder.host.git_status_entries(&[]).await.unwrap_or_default();
+	let uncommitted = entries
+		.iter()
+		.filter(|e| !matches!(e.status, moon_protocol::git::GitFileStatus::Ignored))
+		.count();
+	let name = branch.name.as_deref().unwrap_or("(detached)");
+	let drift = if branch.default_branch_behind > 0 {
+		format!(", {} behind default", branch.default_branch_behind)
+	} else {
+		String::new()
+	};
+	Some(format!(
+		"branch `{name}` ({} ahead, {} behind upstream{drift}, {uncommitted} uncommitted file(s))",
+		branch.ahead, branch.behind,
+	))
 }
 
 /// Outcome of [`CoderHandle::disconnect_worker`] (ADR 0052).
@@ -5155,6 +5256,7 @@ async fn run_turn(
 	if mode == CoderMode::Coordinator {
 		tool_defs.push(crate::coordinator::spawn_worker_tool_definition());
 		tool_defs.push(crate::coordinator::observe_worker_tool_definition());
+		tool_defs.push(crate::coordinator::list_workers_tool_definition());
 		tool_defs.push(crate::coordinator::steer_worker_tool_definition());
 		tool_defs.push(crate::coordinator::abort_worker_tool_definition());
 		tool_defs.push(crate::coordinator::respond_to_worker_prompt_tool_definition());
@@ -5162,6 +5264,7 @@ async fn run_turn(
 		tool_defs.push(crate::coordinator::workspace_scm_status_tool_definition());
 		tool_defs.push(crate::coordinator::commit_worker_changes_tool_definition());
 		tool_defs.push(crate::coordinator::merge_worker_changes_tool_definition());
+		tool_defs.push(crate::coordinator::check_worker_base_tool_definition());
 		tool_defs.push(crate::coordinator::discard_worker_worktree_tool_definition());
 		tool_defs.push(crate::coordinator::clone_repo_tool_definition());
 		tool_defs.push(crate::coordinator::init_repo_tool_definition());
@@ -5849,6 +5952,8 @@ async fn dispatch_tool_calls(
 				handle_spawn_worker(state, sink, &call.id, &args).await
 			} else if call.function.name == "observe_worker" {
 				handle_observe_worker(state, &args).await
+			} else if call.function.name == "list_workers" {
+				handle_list_workers(state, sink, &args).await
 			} else if call.function.name == "steer_worker" {
 				handle_steer_worker(state, &args).await
 			} else if call.function.name == "abort_worker" {
@@ -5863,6 +5968,8 @@ async fn dispatch_tool_calls(
 				handle_commit_worker_changes(state, &args).await
 			} else if call.function.name == "merge_worker_changes" {
 				handle_merge_worker_changes(state, &args).await
+			} else if call.function.name == "check_worker_base" {
+				handle_check_worker_base(state, &args).await
 			} else if call.function.name == "discard_worker_worktree" {
 				handle_discard_worker_worktree(state, sink, &args).await
 			} else if call.function.name == "clone_repo" {
@@ -6760,10 +6867,18 @@ fn spawn_dispatch_feeder(state: Arc<CoderState>, orchestrator_id: String) {
 				// wake signal; the orchestrator then calls
 				// `observe_worker` for a snapshot.
 				if matches!(envelope.event, CoderEvent::TurnComplete) {
+					// Lead with the worker's name (not the opaque id) and carry
+					// the live fleet count so the coordinator knows how many
+					// workers are still going without polling.
+					let label = worker_label(&state, &worker_id).await;
+					let remaining = state.coordinator_workers.read().await.attached_count(&orchestrator_id);
 					let _ = handle
 						.send_to(
 							&orchestrator_id,
-							format!("Worker {worker_id} completed a turn. Use `observe_worker` to see its current state."),
+							format!(
+								"Worker {label} completed a turn. Use `observe_worker` to see its current state. \
+								 ({remaining} worker(s) still on your fleet — `list_workers` for the full picture.)"
+							),
 							Vec::new(),
 						)
 						.await;
@@ -6789,14 +6904,20 @@ fn spawn_dispatch_feeder(state: Arc<CoderState>, orchestrator_id: String) {
 			if !was_registered {
 				continue;
 			}
+			// Carry the branch snapshot so the coordinator can re-plan from
+			// the handover, not a black box (ADR 0056).
+			let snapshot = worker_branch_snapshot(&state, &worker_id).await;
+			let label = worker_label(&state, &worker_id).await;
+			let state_line = snapshot.map(|s| format!(" Final state: {s}.")).unwrap_or_default();
 			let _ = handle
 				.send_to(
 					&orchestrator_id,
 					format!(
-						"Worker {worker_id} was disconnected by the user and its in-flight turn has now finished. \
+						"Worker {label} was disconnected by the user and its in-flight turn has now finished. \
 						 It is no longer attached to you: its updates won't reach you any more and your control \
 						 tools (steer / abort / commit / merge / respond) refuse it. Its session, branch, and \
-						 worktree are untouched — the user owns it from here. Don't wait on it; adjust your plan."
+						 worktree are untouched — the user owns it from here. Don't wait on it; adjust your \
+						 plan.{state_line}"
 					),
 					Vec::new(),
 				)
@@ -6821,6 +6942,95 @@ async fn handle_observe_worker(state: &Arc<CoderState>, args: &Value) -> Result<
 		));
 	};
 	Ok(serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({ "error": "serialization failed" })))
+}
+
+/// `list_workers` — the coordinator's fleet inventory. Reads the
+/// orchestrator → worker registry (the source of truth the feeder also
+/// uses) and returns one `WorkerSnapshot` per registered worker plus an
+/// attached / disconnected count, so the coordinator can stay on top of
+/// its fleet from a single call instead of re-deriving it in `todo_write`
+/// / a scratchpad (which can drift from the real registry) or polling
+/// `observe_worker` per id. Running / idle / needs-input / attached state
+/// and the per-worker `behind_default` make the "re-triage every
+/// in-flight worker after a merge" loop one call.
+async fn handle_list_workers(
+	state: &Arc<CoderState>,
+	sink: &FolderEventSink,
+	args: &Value,
+) -> Result<Value, CoderError> {
+	#[derive(serde::Deserialize)]
+	struct ListArgs {
+		/// Include workers the user disconnected (still registered but
+		/// no longer driven). Default false — the live fleet.
+		#[serde(default)]
+		include_disconnected: bool,
+	}
+	let parsed: ListArgs =
+		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("list_workers", err.to_string()))?;
+	// The coordinator's own session id is the registry key. `sink` is the
+	// session the tool is running in, which *is* the orchestrator.
+	let orchestrator_id = sink.session_id().to_string();
+	let mut workers = state.coordinator_workers.read().await.workers_of(&orchestrator_id);
+	// Deterministic order for the model: attached first, then by id.
+	workers.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+	let handle = CoderHandle { state: state.clone() };
+	let mut rows = Vec::new();
+	let mut attached = 0usize;
+	let mut disconnected = 0usize;
+	for (worker_id, is_attached) in workers {
+		if is_attached {
+			attached += 1;
+		} else {
+			disconnected += 1;
+			if !parsed.include_disconnected {
+				continue;
+			}
+		}
+		let Some(snapshot) = handle.observe_session(&worker_id).await else {
+			// Unmounted (e.g. a restart dropped the runtime) — keep the
+			// row minimal rather than dropping the worker silently.
+			rows.push(json!({
+				"worker_id": worker_id,
+				"attached": is_attached,
+				"mounted": false,
+			}));
+			continue;
+		};
+		// Cheap staleness signal for the re-triage loop: how far behind
+		// the default branch this worker's base is. Best-effort.
+		let behind_default = worker_behind_default(state, &worker_id).await;
+		let mut row = serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({}));
+		row["worker_id"] = json!(worker_id);
+		row["attached"] = json!(is_attached);
+		row["mounted"] = json!(true);
+		if let Some(b) = behind_default {
+			row["behind_default"] = json!(b);
+		}
+		rows.push(row);
+	}
+	Ok(json!({
+		"orchestrator_id": orchestrator_id,
+		"attached": attached,
+		"disconnected": disconnected,
+		"workers": rows,
+	}))
+}
+
+/// How far a worker's branch is behind the repo's default branch
+/// (`default_branch_behind` from `git_branch`), for the fleet re-triage
+/// row. Best-effort: `None` when the folder / git is unavailable.
+async fn worker_behind_default(state: &Arc<CoderState>, worker_id: &str) -> Option<u32> {
+	let (rt, folder_path) = state.runtime_for_session(worker_id).await?;
+	let routing_path = {
+		let session = rt.session.lock().await;
+		match session.header.worktree_root.clone() {
+			Some(root) if state.workspaces.folder_for_path(&root).await.is_some() => root,
+			_ => folder_path.to_string(),
+		}
+	};
+	let folder = state.workspaces.folder_for_path(&routing_path).await?;
+	let branch = folder.host.git_branch().await.ok()?;
+	Some(branch.default_branch_behind)
 }
 
 /// Refuse a coordinator control tool targeting a worker the user
@@ -7057,21 +7267,134 @@ async fn handle_workspace_scm_status(
 		})
 		.collect();
 	Ok(json!({
-		"branch": {
-			"name": branch.name,
-			"head_short_sha": branch.head_short_sha,
-			"has_upstream": branch.has_upstream,
-			"ahead": branch.ahead,
-			"behind": branch.behind,
-			"default_branch_behind": branch.default_branch_behind,
+	"branch": {
+		"name": branch.name,
+		"head_short_sha": branch.head_short_sha,
+		"has_upstream": branch.has_upstream,
+		"ahead": branch.ahead,
+		"behind": branch.behind,
+		"default_branch_behind": branch.default_branch_behind,
+	},
+	"changes": {
+		"added": added,
+		"modified": modified,
+		"deleted": deleted,
+		"total": added + modified + deleted,
+	},
+	"files": files,
+	}))
+}
+
+/// `check_worker_base` — the rebase-before-merge / rebase-before-PR
+/// gate. Resolves the worker's worktree, runs the host's base check
+/// (fetch + behind-count + three-dot numstat vs the default branch),
+/// then cross-references the diff's deleted files against the files the
+/// worker actually touched (its last turn diff) to flag the stale-base
+/// revert tripwire: a file with deletions the worker didn't write means
+/// merging / PR-ing the branch would re-delete work that landed on the
+/// default after the branch's base.
+async fn handle_check_worker_base(state: &Arc<CoderState>, args: &Value) -> Result<Value, CoderError> {
+	#[derive(serde::Deserialize)]
+	struct CheckArgs {
+		worker_id: String,
+	}
+	let parsed: CheckArgs = serde_json::from_value(args.clone())
+		.map_err(|err| CoderError::invalid_args("check_worker_base", err.to_string()))?;
+	let Some((rt, _)) = state.runtime_for_session(&parsed.worker_id).await else {
+		return Err(CoderError::invalid_args(
+			"check_worker_base",
+			format!("no mounted session for worker_id `{}`", parsed.worker_id),
+		));
+	};
+	// Resolve the worker's worktree (falling back to its session folder
+	// for a non-worktree worker), and grab the files its last turn
+	// touched — the "did the worker write this?" reference set.
+	let (routing_path, worker_files) = {
+		let session = rt.session.lock().await;
+		let touched: HashSet<String> = session
+			.last_turn_diff
+			.as_ref()
+			.map(|(files, _)| files.iter().cloned().collect())
+			.unwrap_or_default();
+		let path = match session.header.worktree_root.clone() {
+			Some(root) if state.workspaces.folder_for_path(&root).await.is_some() => root,
+			_ => {
+				let Some((_, folder_path)) = state.runtime_for_session(&parsed.worker_id).await else {
+					return Err(CoderError::invalid_args(
+						"check_worker_base",
+						"could not resolve folder for worker",
+					));
+				};
+				folder_path.to_string()
+			}
+		};
+		(path, touched)
+	};
+	let Some(folder) = state.workspaces.folder_for_path(&routing_path).await else {
+		return Err(CoderError::invalid_args(
+			"check_worker_base",
+			format!("no bound folder for path `{routing_path}`"),
+		));
+	};
+	let Some(check) = folder.host.git_base_check().await? else {
+		return Ok(json!({
+			"has_base": false,
+			"note": "no default remote branch (local-only repo) — there's no origin/main to drift from",
+		}));
+	};
+	// The revert tripwire. A diff file with deletions the worker didn't
+	// touch is a revert candidate. Two caveats keep this honest:
+	// - `last_turn_diff` only covers the *latest* turn, so a worker that
+	//   legitimately edited a file several turns back reads as "didn't
+	//   touch it". We mark the verdict heuristic, not proof.
+	// - A file the worker *did* delete on purpose shows deletions on a
+	//   path it touched — correctly not flagged.
+	let touched_unknown = worker_files.is_empty();
+	let revert_suspects: Vec<Value> = check
+		.files
+		.iter()
+		.filter(|f| f.deletions > 0 && !worker_files.contains(&f.path))
+		.map(|f| {
+			json!({
+				"path": f.path,
+				"additions": f.additions,
+				"deletions": f.deletions,
+				"worker_touched": worker_files.contains(&f.path),
+			})
+		})
+		.collect();
+	let stale = check.behind_default > 0;
+	let flagged = !revert_suspects.is_empty();
+	let verdict = if flagged {
+		format!(
+				"STALE-BASE REVERT RISK: the branch is {} commit(s) behind {} and its diff deletes lines in {} file(s) the worker didn't write — merging or PR-ing it would re-delete work that merged after its base. Do NOT merge / PR as-is; steer the worker to rebase onto current {} first, then re-check.",
+				check.behind_default,
+				check.default_branch_remote_ref,
+				revert_suspects.len(),
+				check.default_branch_remote_ref,
+			)
+	} else if stale {
+		format!(
+				"Behind: the branch is {} commit(s) behind {} but its diff doesn't delete files the worker didn't write. Likely safe, but a rebase onto current {} keeps the history clean.",
+				check.behind_default, check.default_branch_remote_ref, check.default_branch_remote_ref,
+			)
+	} else {
+		"Fresh: the branch is up to date with the default branch; its diff touches only the worker's own changes. Safe to merge / PR.".to_string()
+	};
+	Ok(json!({
+		"has_base": true,
+		"default_branch_remote_ref": check.default_branch_remote_ref,
+		"behind_default": check.behind_default,
+		"stale": stale,
+		"revert_suspects": revert_suspects,
+		"flagged": flagged,
+		// Heuristic, not proof: based on the worker's *last* turn diff.
+		"verdict_basis": if touched_unknown {
+			"no worker turn-diff recorded — the revert check couldn't compare against the worker's touched files, so suspects are every deleted file in the diff"
+		} else {
+			"compared the diff's deleted files against the files the worker touched on its last turn"
 		},
-		"changes": {
-			"added": added,
-			"modified": modified,
-			"deleted": deleted,
-			"total": added + modified + deleted,
-		},
-		"files": files,
+		"verdict": verdict,
 	}))
 }
 
@@ -9458,6 +9781,39 @@ mod tests {
 			assert!(!reg.register("orch-1", "w-2"));
 			// A different orchestrator gets its own feeder.
 			assert!(reg.register("orch-2", "w-3"));
+		}
+
+		#[test]
+		fn workers_of_and_attached_count_track_disconnects() {
+			let mut reg = CoordinatorRegistry::default();
+			reg.register("orch-1", "w-1");
+			reg.register("orch-1", "w-2");
+			reg.register("orch-1", "w-3");
+			assert_eq!(reg.attached_count("orch-1"), 3);
+			assert_eq!(reg.workers_of("orch-1").len(), 3);
+			// An unknown orchestrator has an empty fleet.
+			assert_eq!(reg.attached_count("orch-x"), 0);
+			assert!(reg.workers_of("orch-x").is_empty());
+
+			// Disconnecting one drops it from the attached count but keeps
+			// it in the inventory, marked detached.
+			reg.disconnect("orch-1", "w-2");
+			assert_eq!(reg.attached_count("orch-1"), 2);
+			let mut workers = reg.workers_of("orch-1");
+			workers.sort();
+			assert_eq!(
+				workers,
+				vec![
+					("w-1".to_string(), true),
+					("w-2".to_string(), false),
+					("w-3".to_string(), true),
+				]
+			);
+
+			// Removing one (the feeder's final release) drops it entirely.
+			reg.remove("orch-1", "w-1");
+			assert_eq!(reg.attached_count("orch-1"), 1);
+			assert_eq!(reg.workers_of("orch-1").len(), 2);
 		}
 
 		#[test]

@@ -49,20 +49,24 @@ You are a **pure coordinator**: you cannot edit files. Your `write_file` / `edit
 
 A **worker** is a peer top-level coder session in its own git worktree, on its own branch. It is not a sub-agent: it doesn't block you, it doesn't return one string and die, and it isn't hidden under a tool row. It shows up in the sessions list like any session the user opened, and the user can open it mid-run.
 
+Each worker is **named** at spawn (`spawn_worker`'s `name`), and that name is everywhere you'll see it: its branch `moon/<name>`, its worktree directory, its session title, and its session id (`sess-<name>-…`). Your wake-ups and `list_workers` lead with the name, so you can tell workers apart at a glance — you never have to track an opaque id.
+
 The user can message a worker directly at any time. When that happens you get a notice quoting what they said (truncated). Nothing else changes — you keep the worker, its updates still reach you, and every control tool still works on it. Factor the message into what you do next; don't repeat it back to the worker.
 
-The user can also **disconnect** a worker from you with the panel's disconnect button. When that happens you get one final notice naming the worker (right away if it was idle, after its current turn if it was running). From then on the worker is theirs: its updates stop reaching you, your control tools (`steer_worker`, `abort_worker`, `respond_to_worker_prompt`, `commit_worker_changes`, `merge_worker_changes`, `discard_worker_worktree`) refuse it, and you must not wait on it or try to drive it — re-plan without it. Its session, branch, and worktree are untouched; the user is taking over.
+The user can also **disconnect** a worker from you with the panel's disconnect button. When that happens you get one final notice naming the worker (right away if it was idle, after its current turn if it was running) **plus a snapshot of its branch** (ahead / behind upstream, uncommitted files, drift behind the default) so you can re-plan from the handover, not a black box. From then on the worker is theirs: its updates stop reaching you, your control tools (`steer_worker`, `abort_worker`, `respond_to_worker_prompt`, `commit_worker_changes`, `merge_worker_changes`, `discard_worker_worktree`) refuse it, and you must not wait on it or try to drive it — re-plan without it. Its session, branch, and worktree are untouched; the user is taking over. The read-only tools (`observe_worker`, `review_worker_changes`, `workspace_scm_status`, `check_worker_base`) still work on it if you need one last look.
 
 You manage workers with:
 
 - `spawn_worker(task, name, base_branch?, folder?)` — create a worker in a fresh worktree on a new `moon/<name>` branch (or based on an existing branch when `base_branch` is given), seed it with a task prompt, and let it run. `name` is a short kebab-case name for the deliverable (`fix-login-redirect`) — it becomes the branch, the worktree directory, and the worker's session title in the panel, so name the work, never the worker (`worker-2` tells the user nothing). Returns a `worker_id` handle immediately — **it does not block**. The worker keeps running in the background. By default the worktree is created off the coordinator's own project; pass `folder` to target a different bound workspace folder (e.g. one you just created with `init_repo` or `clone_repo` — pass the `path` that tool returned). The folder must already be bound in the workspace.
 - `observe_worker(worker_id)` — fetch a compact snapshot of a worker's current state: its task, branch, turns-so-far, last assistant message, whether it's running / idle / needs input (a parked `ask_user`), and a **diff summary** (files changed + added/removed counts per file, not the full patch). Use this to check on a worker without reading its full transcript or flooding your context with patch text.
+- `list_workers(include_disconnected?)` — your whole fleet at a glance: one snapshot per worker (name, branch, running / idle / needs input, attached state, drift behind the default branch). This is ground truth from the same registry your wake-ups come from — prefer it over hand-maintaining worker state in `todo_write` or a scratchpad, which can drift. Use it to stay on top of the fleet and to drive the re-triage loop after a merge.
 - `review_worker_changes(worker_id, files?)` — pull the full per-turn diff for a worker, optionally scoped to specific files. Use this when `observe_worker`'s diff summary shows files you want to actually inspect. Don't call it on every observe — only when you need the detail.
 - `steer_worker(worker_id, text)` — send a steering message to a worker mid-turn, the same way a user steers you. Queued; delivered at the worker's next loop iteration top.
 - `abort_worker(worker_id)` — cancel a worker's in-flight turn.
 - `workspace_scm_status(worker_id?)` — get the SCM (git) status of a worker's worktree or the main folder: branch name, ahead/behind upstream, files changed (added / modified / deleted counts + per-file list). Read-only — use this to check whether a worker should commit before you steer it to the next task.
 - `commit_worker_changes(worker_id, message?)` — commit a worker's uncommitted changes (`git add -A` + `git commit`, same as the IDE's SCM panel). Pass `message` to set the commit subject; omit it to get an AI-suggested message from the diff. Use `workspace_scm_status` first to check whether there's anything to commit.
-- `merge_worker_changes(worker_id, base_branch?)` — merge a worker's branch into a base branch on the parent repo (defaults to `main`). Switches the parent to `base_branch`, then `git merge --no-edit <worker_branch>`. The worker's worktree and branch are left intact. Use `commit_worker_changes` first if the worker has uncommitted work. Use this for local repos without a PR flow; for repos with a remote, leave the branch for the user to PR instead.
+- `merge_worker_changes(worker_id, base_branch?)` — merge a worker's branch into a base branch on the parent repo (defaults to `main`). Switches the parent to `base_branch`, then `git merge --no-edit <worker_branch>`. The worker's worktree and branch are left intact. Use `commit_worker_changes` first if the worker has uncommitted work, and run `check_worker_base` first so you don't merge a stale-base revert. Use this for local repos without a PR flow; for repos with a remote, leave the branch for the user to PR instead.
+- `check_worker_base(worker_id)` — the rebase-before-merge / rebase-before-PR gate. Fetches, then reports how far the worker's branch is behind `origin/main` and whether its diff **reverts work it didn't write** (a file with deletions the worker never touched). Run this before `merge_worker_changes`, before opening / updating a PR, and on every in-flight worker after one of its siblings merges. If it flags a revert, don't merge / PR — steer the worker to rebase onto current `origin/main` first.
 - `discard_worker_worktree(worker_id, force?)` — remove a finished worker's checkout and unbind its folder, so it stops cluttering the user's project bar. The branch is kept. Do this once the work is landed (merged, or pushed for a PR); it refuses a running worker and, without `force`, one with uncommitted changes. Never remove a worktree with `bash` — the folder would stay bound and the user would be left cleaning it up by hand.
 - `clone_repo(url, path?)` — clone a git repository to a host path and add it as a workspace folder. Use this when a task requires a dependency repo or a fresh checkout that isn't already in the workspace. The clone runs on the host so the path is immediately available. Omit `path` to clone into a sibling of the active folder.
 - `init_repo(name)` — initialize a new git repository as a **sibling of your project folder** (same parent directory) and add it as a workspace folder. You pass a directory name, not a path — the location is fixed. Use this when a task needs a fresh project (scratch repo, new microservice, test harness). Pass the returned path to `spawn_worker`'s `folder` to put a worker in it.
@@ -88,6 +92,8 @@ You spawn **workers** (peer top-level sessions), not sub-agents. A worker *can* 
 ## Worktrees and branches
 
 Each worker runs in its own git worktree on its own branch — the branch is the deliverable, and `spawn_worker`'s `name` is what it's called (`moon/<name>`). That name is the user's handle on the worker: it titles the session row in the panel and labels the branch plus the worktree directory under `.worktrees/`, so pick one that describes the deliverable and don't reuse it across workers doing different work. `base_branch` lets you start a worker from an existing branch (e.g. a colleague's open-PR branch) instead of the default — useful for "continue this PR" tasks.
+
+**Bases go stale.** A worker's branch is created off `origin/main` at spawn time and only drifts further behind as you merge its siblings' PRs. A branch that's behind `origin/main` can produce a diff that *deletes* work it didn't write — merging it silently reverts those merged PRs. So: **before any merge or PR, run `check_worker_base`; and after one worker's PR merges, re-check every still-in-flight worker's base** and steer a rebase where it overlaps. Never land a branch `check_worker_base` flags as reverting.
 
 If you need to merge worker changes into your current branch, you can use `merge_worker_changes` to land the worker's committed work. Use `commit_worker_changes` first if the worker has uncommitted work. It depends on the task, sometimes you just want workers to make or update PRs.
 
@@ -137,6 +143,30 @@ pub fn spawn_worker_tool_definition() -> ToolDefinition {
 				}
 			},
 			"required": ["task", "name"]
+		}),
+	)
+}
+
+/// `list_workers` — the coordinator's fleet inventory: one snapshot per
+/// spawned worker (title, branch, running / idle / needs-input, attached
+/// state, how far behind the default branch its base is). Reads the same
+/// orchestrator → worker registry the dispatch feeder uses, so it's the
+/// ground truth the coordinator would otherwise hand-maintain in
+/// `todo_write` / a scratchpad (and could let drift). Use it to stay on
+/// top of the fleet and to drive the re-triage-every-worker loop after a
+/// merge.
+pub fn list_workers_tool_definition() -> ToolDefinition {
+	ToolDefinition::function(
+		"list_workers",
+		"List every worker you've spawned — your fleet's ground truth. Returns one snapshot per worker: its `worker_id`, title, branch, whether it's running / idle / needs input, whether it's still attached (or was disconnected by the user), and how far behind the default branch its base has drifted. Use this to see the whole fleet at a glance instead of polling `observe_worker` per id, and to drive the re-triage loop after one worker's PR merges (re-check every still-in-flight worker's base, steer a rebase where it overlaps). Reads the same registry your dispatch wake-ups come from, so it can't drift the way a hand-maintained todo list can.",
+		json!({
+			"type": "object",
+			"properties": {
+				"include_disconnected": {
+					"type": "boolean",
+					"description": "Also list workers the user disconnected (still registered but no longer driven by you). Default false — just your live fleet."
+				}
+			}
 		}),
 	)
 }
@@ -352,6 +382,29 @@ pub fn workspace_scm_status_tool_definition() -> ToolDefinition {
 	)
 }
 
+/// `check_worker_base` — the rebase-before-merge / rebase-before-PR
+/// gate. Reports how far a worker's branch has drifted behind the
+/// repo's default branch and flags the stale-base revert tripwire: a
+/// file with deletions the worker didn't write. Use this before
+/// `merge_worker_changes`, before opening / updating a PR, and after a
+/// wave-1 PR merges underneath an in-flight worker.
+pub fn check_worker_base_tool_definition() -> ToolDefinition {
+	ToolDefinition::function(
+		"check_worker_base",
+		"Check whether a worker's branch has drifted stale against the repo's default branch — the rebase-before-merge / rebase-before-PR gate. Fetches, then reports: how many commits behind `origin/main` the branch is, and whether its diff **reverts work it didn't write** (a file with deletions the worker never touched — the classic failure when a worktree sat on an old `origin/main` while earlier PRs merged underneath it, and merging it would silently delete that merged work). Run this **before** `merge_worker_changes` or before opening / updating a PR, and re-run it on every in-flight worker after one of its siblings merges. If it flags a revert, don't merge / PR — steer the worker to rebase onto current `origin/main` first. Read-only.",
+		json!({
+			"type": "object",
+			"properties": {
+				"worker_id": {
+					"type": "string",
+					"description": "The worker id returned by `spawn_worker`."
+				}
+			},
+			"required": ["worker_id"]
+		}),
+	)
+}
+
 /// `review_worker_changes` — pull the full per-turn diff for a worker,
 /// optionally scoped to specific files. Use this when `observe_worker`'s
 /// diff summary shows files you want to actually review. Returns the
@@ -411,6 +464,7 @@ mod tests {
 	fn tool_definitions_have_names() {
 		assert_eq!(spawn_worker_tool_definition().function.name, "spawn_worker");
 		assert_eq!(observe_worker_tool_definition().function.name, "observe_worker");
+		assert_eq!(list_workers_tool_definition().function.name, "list_workers");
 		assert_eq!(steer_worker_tool_definition().function.name, "steer_worker");
 		assert_eq!(abort_worker_tool_definition().function.name, "abort_worker");
 		assert_eq!(
@@ -433,6 +487,7 @@ mod tests {
 			merge_worker_changes_tool_definition().function.name,
 			"merge_worker_changes"
 		);
+		assert_eq!(check_worker_base_tool_definition().function.name, "check_worker_base");
 		assert_eq!(
 			discard_worker_worktree_tool_definition().function.name,
 			"discard_worker_worktree"
@@ -494,5 +549,12 @@ mod tests {
 		// the prompt names it and the refusal the tools will enforce.
 		assert!(COORDINATOR_SYSTEM_PROMPT.contains("disconnect"));
 		assert!(COORDINATOR_SYSTEM_PROMPT.contains("refuse"));
+		// The stale-base gate: the prompt names the tool and the
+		// rebase-before-merge / re-triage discipline.
+		assert!(COORDINATOR_SYSTEM_PROMPT.contains("check_worker_base"));
+		assert!(COORDINATOR_SYSTEM_PROMPT.contains("rebase"));
+		// Fleet awareness: the prompt points at `list_workers` as the
+		// ground-truth inventory and tells the coordinator workers are named.
+		assert!(COORDINATOR_SYSTEM_PROMPT.contains("list_workers"));
 	}
 }

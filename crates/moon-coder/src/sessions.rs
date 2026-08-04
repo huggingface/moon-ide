@@ -1660,6 +1660,44 @@ pub fn new_session_id() -> String {
 	format!("sess-{:013}-{:08x}", ts, random)
 }
 
+/// Generate a session id that embeds a human-readable `slug` — used for
+/// coordinator-spawned workers, whose branch / worktree / title already
+/// carry the worker's `name` (ADR 0042). The id becomes
+/// `sess-<slug>-<ts>-<rand>`, so a dispatch packet, a `list_workers`
+/// row, or a `ls` of the sessions directory reads
+/// `sess-fix-login-redirect-…` instead of an opaque `sess-<digits>-…`.
+///
+/// `slug` is expected to already be git-ref-safe (the worker branch slug
+/// is slugged to `[a-z0-9-]` at spawn); we re-sanitize defensively so a
+/// stray caller can't smuggle a path separator into the transcript
+/// filename. Uniqueness still comes from the timestamp + random suffix —
+/// the slug is a label, not a key, so two same-named workers get
+/// distinct ids. The id remains the stable tool / registry key; the
+/// embedded name is purely for human and LLM readability.
+pub fn new_named_session_id(slug: &str) -> String {
+	let ts = current_time_ms();
+	let random: u32 = rand_suffix();
+	let clean: String = slug
+		.chars()
+		.map(|c| {
+			if c.is_ascii_alphanumeric() || c == '-' {
+				c.to_ascii_lowercase()
+			} else {
+				'-'
+			}
+		})
+		.collect();
+	let clean = clean.trim_matches('-');
+	// Cap the label so the transcript filename stays reasonable; the id
+	// is a filename component.
+	let label: String = clean.chars().take(40).collect();
+	let label = label.trim_end_matches('-');
+	if label.is_empty() {
+		return new_session_id();
+	}
+	format!("sess-{label}-{ts:013}-{random:08x}")
+}
+
 /// Truncate a freshly-sent prompt into a title. We keep the first
 /// non-empty line, drop trailing whitespace, cap at ~60 chars on a
 /// word boundary. Doesn't try hard — the auto-rename pass replaces
@@ -2562,6 +2600,29 @@ mod tests {
 		assert!(validate_session_id("a/b").is_err());
 		assert!(validate_session_id("").is_err());
 		assert!(validate_session_id("sess-12345-abcdef").is_ok());
+	}
+
+	#[test]
+	fn named_session_id_embeds_a_sanitised_label() {
+		let id = new_named_session_id("fix-login-redirect");
+		assert!(id.starts_with("sess-fix-login-redirect-"), "got: {id}");
+		assert!(
+			validate_session_id(&id).is_ok(),
+			"named id must stay filename-safe: {id}"
+		);
+
+		// Path separators and unsafe chars are flattened, case lowered.
+		let id = new_named_session_id("Foo/Bar Baz");
+		assert!(!id.contains('/'), "no path separator survives: {id}");
+		assert!(validate_session_id(&id).is_ok(), "got: {id}");
+
+		// Same name still yields distinct ids (timestamp + random suffix).
+		assert_ne!(new_named_session_id("dup"), new_named_session_id("dup"));
+
+		// A slug that sanitises to nothing falls back to the plain id.
+		let fallback = new_named_session_id("///");
+		assert!(fallback.starts_with("sess-"), "got: {fallback}");
+		assert!(validate_session_id(&fallback).is_ok());
 	}
 
 	fn make_test_header(id: &str) -> SessionHeader {

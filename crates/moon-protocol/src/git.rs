@@ -689,3 +689,42 @@ pub struct GitMergeState {
 	/// commit button and powers the "N unresolved" hint.
 	pub unmerged_paths: Vec<String>,
 }
+
+/// One file in a branch's diff against the default branch
+/// (`git diff <ref>...HEAD --numstat`). The coordinator's base
+/// check cross-references these against the files a worker
+/// actually touched: a path with `deletions > 0` the worker never
+/// edited is the stale-base revert tripwire.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBaseCheckFile {
+	/// Workspace-relative path.
+	pub path: String,
+	/// Lines added on the branch side of the three-dot diff.
+	pub additions: u32,
+	/// Lines deleted on the branch side of the three-dot diff.
+	/// Non-zero on a file the worker didn't write means the diff
+	/// reverts work that merged after the branch's base.
+	pub deletions: u32,
+}
+
+/// How far a branch has drifted behind the repo's default branch,
+/// plus the files its diff touches — the coordinator's
+/// rebase-before-merge / rebase-before-PR gate (ADR 0056).
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBaseCheck {
+	/// The default-branch remote ref compared against, e.g.
+	/// `"origin/main"`.
+	pub default_branch_remote_ref: String,
+	/// Commits the default branch has that `HEAD` doesn't
+	/// (`git rev-list --count HEAD..<ref>`). Non-zero means the
+	/// branch is based on a stale default.
+	pub behind_default: u32,
+	/// Every path in `git diff <ref>...HEAD` (three-dot: the
+	/// branch's own changes relative to the merge-base) with
+	/// per-file addition/deletion counts.
+	pub files: Vec<GitBaseCheckFile>,
+}
