@@ -28,6 +28,9 @@
 //! - `coder_send` / `coder_abort` — session-targeted via an optional
 //!   `session_id` (the session the phone has open), falling back to
 //!   the active folder's visible session.
+//! - `coder_unqueue_steer` / `coder_drain_steer_now` — steer
+//!   management, session-targeted by a required `session_id` (the
+//!   desktop's `#[tauri::command]`s hit the visible session instead).
 //! - `coder_respond_to_prompt` — answer an `ask_user` tool call
 //!   (Phase 14; the companion can now fully attend a coordinator
 //!   session that raises a prompt).
@@ -201,6 +204,23 @@ impl BridgeRpcHandler for BridgeRpc {
 					None => self.coder.abort().await,
 				}
 				Ok(Value::Null)
+			}
+			// Un-queue a still-queued steer (pop it back toward the
+			// composer) or drive it now, session-targeted by id — the
+			// session the phone has open, which needn't be the
+			// desktop's visible one. Both resolve the runtime by id
+			// across all folders (mirroring `coder_send`). The desktop
+			// uses the visible-session variants; these are the
+			// companion's.
+			"coder_unqueue_steer" => {
+				let p: SteerParams = parse_params(params)?;
+				let popped = self.coder.unqueue_steer_in(&p.session_id, &p.id).await;
+				Ok(serde_json::json!({ "text": popped.map(|s| s.text) }))
+			}
+			"coder_drain_steer_now" => {
+				let p: SteerParams = parse_params(params)?;
+				let drained = self.coder.drain_steer_now_in(&p.session_id, &p.id).await;
+				Ok(serde_json::json!({ "drained": drained }))
 			}
 			"coder_rename_session" => {
 				let p: RenameSessionParams = parse_params(params)?;
@@ -549,6 +569,16 @@ struct RevertParams {
 }
 
 #[derive(serde::Deserialize)]
+struct SteerParams {
+	/// Session holding the queued steer (the one the phone has
+	/// open). Always required: unlike send/abort there's no
+	/// meaningful "visible session" fallback for the phone.
+	session_id: String,
+	/// The steer's `UserMessage::id` (its placeholder row id).
+	id: String,
+}
+
+#[derive(serde::Deserialize)]
 struct ScmCommitParams {
 	#[serde(default)]
 	message: String,
@@ -585,6 +615,8 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 	"coder_rename_session",
 	"coder_send",
 	"coder_abort",
+	"coder_unqueue_steer",
+	"coder_drain_steer_now",
 	"coder_new_session",
 	"coder_new_coordinator_session",
 	"coder_delete_session",

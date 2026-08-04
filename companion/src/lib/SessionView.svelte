@@ -60,6 +60,23 @@
 		await app.replayFromMessage(rowId);
 	}
 
+	// Queued-steer actions. Un-queue pops the message back into the
+	// composer for editing; go-now cancels the running turn so the
+	// steer drains immediately. The backend's events update the
+	// transcript for both.
+	async function unqueue(rowId: string): Promise<void> {
+		actionsFor = null;
+		const text = await app.unqueueSteer(rowId);
+		if (text !== null) {
+			draft = draft.trim() ? `${text} ${draft}` : text;
+		}
+	}
+
+	async function goNow(rowId: string): Promise<void> {
+		actionsFor = null;
+		await app.drainSteerNow(rowId);
+	}
+
 	// Per-question answer state for the active ask_user prompt.
 	// Map of questionId → { selected: Set<string>, freeText: string }
 	let answers = $state<Record<string, { selected: Set<string>; freeText: string }>>({});
@@ -702,7 +719,7 @@
 				<div
 					class="bubble user"
 					class:queued={row.queued}
-					class:actionable={!app.busy && !row.queued}
+					class:actionable={row.queued || !app.busy}
 					role="button"
 					tabindex="0"
 					onclick={() => toggleActions(row.id)}
@@ -716,7 +733,20 @@
 					{row.text}
 					{#if row.queued}<span class="queued-tag">queued</span>{/if}
 				</div>
-				{#if actionsFor === row.id && !app.busy && !row.queued}
+				{#if actionsFor === row.id && row.queued}
+					<div class="user-actions">
+						<button
+							class="ghost action-chip"
+							onclick={() => unqueue(row.id)}
+							title="Pop this queued message back into the composer to edit it">✎ Un-queue</button
+						>
+						<button
+							class="ghost action-chip"
+							onclick={() => goNow(row.id)}
+							title="Stop the current turn and run this message now">▶ Go now</button
+						>
+					</div>
+				{:else if actionsFor === row.id && !app.busy}
 					<div class="user-actions">
 						<button
 							class="ghost action-chip"

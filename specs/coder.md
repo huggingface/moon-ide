@@ -98,7 +98,8 @@ Three control surfaces:
   `session.messages` and in the JSONL (after the in-flight answer).
   The queued placeholder is thus purely provisional; the revert
   ordinal counts only non-queued user rows, so removal is
-  ordinal-neutral. An **un-queue** (`Ctrl+Up`) is the one case where
+  ordinal-neutral. An **un-queue** (`Ctrl+Up` on the desktop, an
+  "un-queue" chip on the companion) is the one case where
   `SteerDrained` is _not_ followed by a re-append — the message went
   back into the composer. Until drained, the queue lives on the
   session runtime, which outlives a session switch and a folder
@@ -112,7 +113,8 @@ Three control surfaces:
   flash, just the old thinking fading into the new turn. The affordance
   lives on the queued message in the transcript, not in the composer,
   so it targets the exact steer it's attached to (`coder_drain_steer_now`
-  by id). A stale click — the runner already drained the queue at its
+  by id on the desktop, `coder_drain_steer_now` over the bridge on the
+  companion). A stale click — the runner already drained the queue at its
   last iteration top — is a silent no-op. The loop-back mints a fresh
   `CancellationToken` for the drained turn: `CancellationToken` is
   one-shot, so the just-cancelled token can't be reused — the new

@@ -3782,6 +3782,27 @@ impl CoderHandle {
 		let Ok((rt, session_id, folder_path)) = self.state.active_visible_runtime().await else {
 			return false;
 		};
+		self.drain_steer_on(&rt, &session_id, &folder_path, id).await
+	}
+
+	/// Session-targeted [`Self::drain_steer_now`] (ADR 0030) — the
+	/// companion's "go now", which knows the session by id rather
+	/// than "the desktop's visible one". Resolves the runtime by id
+	/// across all folders, same as [`Self::send_to`], so a queued
+	/// steer on a background session drains too. `false` when no
+	/// mounted runtime matches.
+	pub async fn drain_steer_now_in(&self, session_id: &str, id: &str) -> bool {
+		let Some((rt, folder_path)) = self.state.runtime_for_session(session_id).await else {
+			return false;
+		};
+		self.drain_steer_on(&rt, session_id, &folder_path, id).await
+	}
+
+	/// Shared drain-now body: cancel the running turn so the spawn
+	/// loop drains the still-pending steer into a fresh turn
+	/// immediately. See [`Self::drain_steer_now`] for the full
+	/// contract.
+	async fn drain_steer_on(&self, rt: &Arc<SessionRuntime>, session_id: &str, folder_path: &Utf8Path, id: &str) -> bool {
 		// Confirm the id is a live pending steer before doing
 		// anything destructive. We just need existence here so a
 		// stale "go now" click (the runner already drained the
@@ -3836,6 +3857,30 @@ impl CoderHandle {
 	/// message went back into the composer rather than the chat.
 	pub async fn unqueue_steer(&self, id: &str) -> Option<UnqueuedSteer> {
 		let (rt, session_id, folder_path) = self.state.active_visible_runtime().await.ok()?;
+		self.unqueue_steer_on(&rt, &session_id, &folder_path, id).await
+	}
+
+	/// Session-targeted [`Self::unqueue_steer`] (ADR 0030) — the
+	/// companion's un-queue, which targets the session it has open
+	/// by id rather than the desktop's visible one. Resolves the
+	/// runtime by id across all folders, same as [`Self::send_to`].
+	/// `None` when no mounted runtime matches or the steer already
+	/// drained.
+	pub async fn unqueue_steer_in(&self, session_id: &str, id: &str) -> Option<UnqueuedSteer> {
+		let (rt, folder_path) = self.state.runtime_for_session(session_id).await?;
+		self.unqueue_steer_on(&rt, session_id, &folder_path, id).await
+	}
+
+	/// Shared un-queue body: pop the matching `PendingSteer`, emit
+	/// its `SteerDrained`, and hand the `(text, images)` back for
+	/// the composer. See [`Self::unqueue_steer`] for the contract.
+	async fn unqueue_steer_on(
+		&self,
+		rt: &Arc<SessionRuntime>,
+		session_id: &str,
+		folder_path: &Utf8Path,
+		id: &str,
+	) -> Option<UnqueuedSteer> {
 		let popped = {
 			let mut session = rt.session.lock().await;
 			pop_pending_steer(&mut session, id)?

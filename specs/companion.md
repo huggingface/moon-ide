@@ -224,7 +224,13 @@ max_events)`, which replays the slice ending just before that
   ordinal and prepends it. Session list / new reuse the existing
   `coder_*` commands. The composer keeps **send available while a
   turn runs** (the message queues as a steer, same as the desktop);
-  Stop is a separate smaller button. The session title is editable
+  Stop is a separate smaller button. A queued steer renders as a
+  muted "queued" bubble; tapping it reveals two chips — **un-queue**
+  (`coder_unqueue_steer`, pops it back into the composer to edit)
+  and **go now** (`coder_drain_steer_now`, cancels the running turn
+  so the steer drains immediately). Both are session-targeted by id
+  (the session the phone has open, not the desktop's visible one)
+  via the runner's `unqueue_steer_in` / `drain_steer_now_in`. The session title is editable
   inline from the header (`coder_rename_session`): the backend
   persists a `TitleUpdate` and broadcasts `session_title_updated`,
   so the desktop panel and every subscribed phone pick the new

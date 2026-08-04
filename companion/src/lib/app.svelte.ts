@@ -1204,6 +1204,53 @@ class CompanionState {
 		}
 	}
 
+	/** Un-queue a still-queued steer: pop it out of the backend's
+	 * pending-steer queue and return its text so the caller can seed
+	 * the composer ("edit before it lands"). The matching
+	 * `steer_drained` event removes the queued row over the event
+	 * channel. `null` when the steer already drained (too late) —
+	 * the caller leaves the draft alone. Session-targeted by id (the
+	 * session the phone has open), like send/abort. */
+	async unqueueSteer(rowId: string): Promise<string | null> {
+		if (!this.activeWorkspace || !this.activeSession) {
+			return null;
+		}
+		try {
+			const res = await this.#call<{ text: string | null }>(
+				this.activeWorkspace,
+				'coder_unqueue_steer',
+				{ session_id: this.activeSession, id: rowId },
+				this.activeIde,
+			);
+			return res.text;
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+			return null;
+		}
+	}
+
+	/** "Go now" on a queued steer: cancel the running turn so the
+	 * spawn loop drains this steer into a fresh turn immediately
+	 * instead of waiting for the current turn to settle. The backend
+	 * emits `steer_drained` + a fresh `user_message` over the event
+	 * channel, so the transcript updates itself. A stale tap (the
+	 * runner already drained it) is a silent no-op. */
+	async drainSteerNow(rowId: string): Promise<void> {
+		if (!this.activeWorkspace || !this.activeSession) {
+			return;
+		}
+		try {
+			await this.#call(
+				this.activeWorkspace,
+				'coder_drain_steer_now',
+				{ session_id: this.activeSession, id: rowId },
+				this.activeIde,
+			);
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
 	/** Respond to an ask_user prompt. */
 	async respondToPrompt(
 		callId: string,
