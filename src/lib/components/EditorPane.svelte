@@ -100,6 +100,9 @@
 	// `activeFile.path` is the synthetic `review://…` token in that
 	// mode, so we relax the path-equality check for the review
 	// surface and just trust that the section produced the selection.
+	// The commit view gets the same treatment: its sections publish
+	// selections under the real file path (see `CommitSection.svelte`)
+	// while the tab's path is the synthetic `commit://<sha>` token.
 	// The hint anchors to the pane's top-right corner, which lands
 	// over the right pane in diff mode and the top-right of the
 	// stacked sections in review mode.
@@ -115,7 +118,7 @@
 		if (view.kind === 'markdown') {
 			return false;
 		}
-		if (view.kind === 'review') {
+		if (view.kind === 'review' || view.kind === 'commit') {
 			return true;
 		}
 		return selection.path === file.path;

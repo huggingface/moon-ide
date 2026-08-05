@@ -1011,7 +1011,10 @@ auto-tail. Empty sessions surface a toast instead of a phantom tab.
   terminal can't be identified, and a since-closed terminal fails
   the read with the usual recovery hint).
 - `Ctrl+L` attaches the active editor selection (also works from
-  diff panes and review sections): inserts an inline
+  diff panes, review sections, and both sides of a commit diff —
+  the snippet text is captured verbatim, so quoting a historical
+  blob hands the model the right bytes even when the working tree
+  has moved on): inserts an inline
   `@path:start-end` token at the caret, adds a chip above the
   textarea, opens the panel, focuses the composer. Chips dedupe by
   `(path, range)`; every press still inserts a fresh inline token.

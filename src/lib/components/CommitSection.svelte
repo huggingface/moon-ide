@@ -109,6 +109,20 @@
 
 		const readOnly: Extension[] = [EditorState.readOnly.of(true), EditorView.editable.of(false)];
 
+		// Selection-publish hook so `Ctrl+L` can attach a highlighted
+		// range from the commit diff to the coder — same gesture as
+		// the regular editor / DiffView / ReviewSection. Unlike those
+		// surfaces, *both* panes here are historical blobs the user
+		// might legitimately quote (removed code lives only on the
+		// base side), so both sides publish. The attachment captures
+		// the text verbatim, so quoting a blob that no longer matches
+		// the working tree still hands the model the right bytes.
+		const selectionPublish = EditorView.updateListener.of((update) => {
+			if (update.selectionSet) {
+				publishCommitSelection(update.state);
+			}
+		});
+
 		const commonExts: Extension[] = [
 			lineNumbers(),
 			diffGutterTintExtension('a'),
@@ -125,6 +139,7 @@
 			themeA.of(moonEditorTheme(workspace.effectiveTheme)),
 			langA.of(lang),
 			wrapA.of(workspace.lineWrap ? EditorView.lineWrapping : []),
+			selectionPublish,
 			...readOnly,
 		];
 
@@ -140,6 +155,7 @@
 			themeB.of(moonEditorTheme(workspace.effectiveTheme)),
 			langB.of(lang),
 			wrapB.of(workspace.lineWrap ? EditorView.lineWrapping : []),
+			selectionPublish,
 			...readOnly,
 		];
 
@@ -192,6 +208,43 @@
 		void workspace.openFile(path, side);
 	}
 
+	/**
+	 * Mirror of `ReviewSection.svelte`'s `publishReviewSelection`
+	 * for the commit view's panes. Empty selections clear the
+	 * snapshot only when it's ours, so a sibling section's (or the
+	 * other pane's) fresh selection isn't stomped. Same off-by-one
+	 * snap when the drag ends at the start of a line the user
+	 * didn't actually mean to include.
+	 */
+	function publishCommitSelection(state: EditorState) {
+		const sel = state.selection.main;
+		if (sel.empty) {
+			clearOurSelection();
+			return;
+		}
+		const fromLine = state.doc.lineAt(sel.from);
+		const toLine = state.doc.lineAt(sel.to);
+		const effectiveToLineNumber =
+			sel.to === toLine.from && toLine.number > fromLine.number ? toLine.number - 1 : toLine.number;
+		const text = state.doc.sliceString(sel.from, sel.to);
+		workspace.setActiveSelection({
+			path,
+			startLine: fromLine.number,
+			endLine: effectiveToLineNumber,
+			text,
+		});
+	}
+
+	// Drop the workspace selection snapshot only when it belongs to
+	// this section's path — keeps a sibling section's selection
+	// alive when this one unmounts (lazy mount churn) or resets.
+	function clearOurSelection() {
+		const current = workspace.activeSelection;
+		if (current !== null && current.path === path) {
+			workspace.setActiveSelection(null);
+		}
+	}
+
 	onMount(() => {
 		registerSection(path, sectionEl ?? null);
 		if (eager) {
@@ -218,6 +271,7 @@
 				detachHScrollSync = null;
 				merge?.destroy();
 				merge = undefined;
+				clearOurSelection();
 			};
 		}
 		return () => {
@@ -227,6 +281,7 @@
 			detachHScrollSync = null;
 			merge?.destroy();
 			merge = undefined;
+			clearOurSelection();
 		};
 	});
 </script>
