@@ -76,8 +76,11 @@ type ScmStatus = {
 		 * default branch. */
 		previous_branch?: string | null;
 	};
-	changes: { added: number; modified: number; deleted: number; total: number };
-	files: { path: string; status: string }[];
+	/** Same wire-tolerance as `branch`: a partial payload from a
+	 * mismatched IDE build must hide the changes card, not crash
+	 * the view. */
+	changes?: { added: number; modified: number; deleted: number; total: number };
+	files?: { path: string; status: string }[];
 };
 
 /** Result of `workspace_scm_commit` (mirrors `GitCommitResult`). */

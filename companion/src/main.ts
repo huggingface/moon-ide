@@ -2,6 +2,13 @@ import { mount } from 'svelte';
 import App from './App.svelte';
 import './styles.css';
 
+// Version check: open the console (or `remote debugging → console`
+// on the phone) and compare against `git rev-parse --short HEAD` on
+// the deploying machine. Answers "did my deploy actually land?"
+// through the service-worker + browser cache layers.
+// eslint-disable-next-line no-console
+console.info(`[moon-companion] build ${__BUILD_INFO__}`);
+
 const target = document.getElementById('app');
 if (!target) {
 	throw new Error('missing #app mount point');

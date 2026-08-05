@@ -1,5 +1,24 @@
 import { defineConfig } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
+import { execSync } from 'node:child_process';
+
+/** Build stamp baked into the bundle (`__BUILD_INFO__`), logged on
+ * startup so a phone can verify which build it's actually running —
+ * service-worker + browser caches make "did my deploy land?" a real
+ * question. Best-effort: an environment without git still builds. */
+function buildInfo(): string {
+	let sha = 'unknown';
+	try {
+		sha = execSync('git rev-parse --short HEAD', { cwd: __dirname }).toString().trim();
+		const dirty = execSync('git status --porcelain', { cwd: __dirname }).toString().trim().length > 0;
+		if (dirty) {
+			sha += '-dirty';
+		}
+	} catch {
+		// No git (tarball build): keep 'unknown'.
+	}
+	return `${sha} ${new Date().toISOString()}`;
+}
 
 // The companion PWA is a separate Vite app from the desktop IDE
 // (root `vite.config.ts`). It builds to `companion/dist`, which
@@ -8,6 +27,9 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
 export default defineConfig({
 	root: __dirname,
 	plugins: [svelte()],
+	define: {
+		__BUILD_INFO__: JSON.stringify(buildInfo()),
+	},
 	build: {
 		outDir: 'dist',
 		emptyOutDir: true,

@@ -36,7 +36,7 @@
 	let committing = $state(false);
 
 	async function handleCommit(): Promise<void> {
-		if (!app.scmStatus || app.scmStatus.changes.total === 0) {
+		if (!app.scmStatus || (app.scmStatus.changes?.total ?? 0) === 0) {
 			return;
 		}
 		committing = true;
@@ -143,6 +143,10 @@
 	{#if app.scmStatus}
 		{@const scm = app.scmStatus}
 		{@const branch = scm.branch}
+		<!-- Wire-tolerant defaults (see ScmStatus): a partial payload
+		     from a mismatched IDE build renders as "No changes". -->
+		{@const changes = scm.changes ?? { added: 0, modified: 0, deleted: 0, total: 0 }}
+		{@const files = scm.files ?? []}
 		{@const defaultBranch = branch?.default_branch_remote_ref?.split('/').slice(1).join('/') ?? null}
 		{@const onDefaultBranch = !branch || defaultBranch === null || branch.name === defaultBranch}
 		<div class="card scm-card">
@@ -177,8 +181,8 @@
 					<button
 						class="ghost scm-default-btn"
 						onclick={() => app.scmSwitchBranch(defaultBranch)}
-						disabled={app.scmBusy || scm.changes.total > 0}
-						title={scm.changes.total > 0
+						disabled={app.scmBusy || changes.total > 0}
+						title={changes.total > 0
 							? 'Commit or discard the working-tree changes first'
 							: `Switch the working tree back to ${defaultBranch}`}
 					>
@@ -189,8 +193,8 @@
 					<button
 						class="ghost scm-default-btn"
 						onclick={() => app.scmSwitchBranch(branch.previous_branch!)}
-						disabled={app.scmBusy || scm.changes.total > 0}
-						title={scm.changes.total > 0
+						disabled={app.scmBusy || changes.total > 0}
+						title={changes.total > 0
 							? 'Commit or discard the working-tree changes first'
 							: `Switch back to ${branch.previous_branch}`}
 					>
@@ -198,17 +202,17 @@
 					</button>
 				{/if}
 			{/if}
-			{#if scm.changes.total > 0}
+			{#if changes.total > 0}
 				<div class="scm-changes">
-					{#if scm.changes.added > 0}<span class="scm-change added">+{scm.changes.added}</span>{/if}
-					{#if scm.changes.modified > 0}<span class="scm-change modified">~{scm.changes.modified}</span>{/if}
-					{#if scm.changes.deleted > 0}<span class="scm-change deleted">-{scm.changes.deleted}</span>{/if}
-					<span class="muted">{scm.changes.total} file{scm.changes.total !== 1 ? 's' : ''} changed</span>
+					{#if changes.added > 0}<span class="scm-change added">+{changes.added}</span>{/if}
+					{#if changes.modified > 0}<span class="scm-change modified">~{changes.modified}</span>{/if}
+					{#if changes.deleted > 0}<span class="scm-change deleted">-{changes.deleted}</span>{/if}
+					<span class="muted">{changes.total} file{changes.total !== 1 ? 's' : ''} changed</span>
 				</div>
 				<details class="scm-files">
 					<summary>Show files</summary>
 					<div class="scm-file-list">
-						{#each scm.files as f (f.path)}
+						{#each files as f (f.path)}
 							<div class="scm-file">
 								<span class="scm-file-status {f.status}">{f.status?.[0]?.toUpperCase()}</span>
 								<span class="scm-file-path">{f.path}</span>
