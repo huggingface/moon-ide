@@ -5483,7 +5483,7 @@ async fn run_turn(
 		// task so there's no real contention.
 		let stream_usage_state = std::sync::Mutex::new((0u32, std::time::Instant::now()));
 
-		let response = state
+		let mut response = state
 			.inference
 			.chat_completion_stream(&standard_model, &messages, &tool_defs, &cancel, |event| match event {
 				StreamEvent::ContentDelta { delta } => {
@@ -5536,6 +5536,11 @@ async fn run_turn(
 				StreamEvent::ToolCallDelta { .. } => {}
 			})
 			.await?;
+
+		// Uniquify before anything observes the response — events,
+		// history push, persistence, and dispatch must all agree
+		// on the remapped ids.
+		dedupe_response_tool_call_ids(&messages, &mut response.tool_calls);
 
 		// An assistant response with no text, no thinking, and no
 		// tool_calls is an empty shell — providers occasionally
@@ -5780,7 +5785,7 @@ done, what's still unfinished, and any uncertainty. If the user needs to take a 
 	let sink_for_cb = sink.clone();
 	let started = std::sync::atomic::AtomicBool::new(false);
 	let thinking_emitted = std::sync::atomic::AtomicBool::new(false);
-	let response = state
+	let mut response = state
 		.inference
 		.chat_completion_stream(&standard_model, &messages, &[], cancel, |event| match event {
 			StreamEvent::ContentDelta { delta } => {
@@ -5810,6 +5815,11 @@ done, what's still unfinished, and any uncertainty. If the user needs to take a 
 			}
 		})
 		.await?;
+
+	// Defensive: tools are disabled on this round-trip, so a
+	// response carrying calls at all is a provider bug — but
+	// keep ids session-unique before persisting either way.
+	dedupe_response_tool_call_ids(&messages, &mut response.tool_calls);
 
 	// Same empty-shell guard as the main loop: skip pushing /
 	// persisting / emitting an `End` for an Anthropic turn that
@@ -9387,6 +9397,52 @@ fn response_to_message(response: &AssistantResponse) -> ChatMessage {
 	}
 }
 
+/// Remap tool-call ids on a freshly streamed response that collide
+/// with an id already used earlier in the conversation. Some
+/// OpenAI-compat providers mint per-message ids (`bash:0`,
+/// `bash:1`, …, resetting every message; seen live from Kimi-K3
+/// via Baseten), but the whole pipeline — the panel reducer's
+/// upsert-by-id contract, orphan recovery, `rerun_tool_call`,
+/// `ask_user` prompt routing — treats the id as session-wide
+/// identity. A recycled id makes the new call invisible in the
+/// transcript (the upsert matches the old, already-finished row
+/// and drops the event) and its result silently overwrites the
+/// old row.
+///
+/// Must run before the response is observed anywhere: the events,
+/// the `messages` push, the persisted record, and the dispatch all
+/// have to agree on the remapped id. The pairing the provider sees
+/// on the next round-trip stays consistent because the assistant
+/// `tool_calls` entry and the tool result reference the same
+/// remapped id. No-op for providers with globally unique ids
+/// (Anthropic's `toolu_…`, OpenAI's `call_…`).
+pub(crate) fn dedupe_response_tool_call_ids(messages: &[ChatMessage], tool_calls: &mut [crate::inference::ToolCall]) {
+	if tool_calls.is_empty() {
+		return;
+	}
+	let mut used: std::collections::HashSet<String> = messages
+		.iter()
+		.filter_map(|m| match m {
+			ChatMessage::Assistant { tool_calls, .. } => Some(tool_calls.iter().map(|c| c.id.clone())),
+			_ => None,
+		})
+		.flatten()
+		.collect();
+	for call in tool_calls.iter_mut() {
+		let unique = sessions::unique_tool_call_id(&call.id, &used);
+		if unique != call.id {
+			tracing::debug!(
+				original = %call.id,
+				remapped = %unique,
+				tool = %call.function.name,
+				"provider recycled a tool-call id; remapping to keep ids session-unique"
+			);
+			call.id = unique.clone();
+		}
+		used.insert(unique);
+	}
+}
+
 /// True iff `response` has no text, no thinking, and no tool
 /// calls — an empty shell the provider returned when it bailed
 /// mid-stream or only emitted a usage chunk. Callers (the main
@@ -10617,6 +10673,83 @@ mod tests {
 		}];
 		assert!(pop_pending_steer(&mut session, "missing").is_none());
 		assert_eq!(session.pending_steers.len(), 1);
+	}
+
+	#[test]
+	fn dedupe_response_tool_call_ids_remaps_recycled_ids() {
+		// The Kimi-via-Baseten shape: the provider mints
+		// per-message ids (`bash:0`, `bash:1`, …) that reset
+		// every assistant message, so the second response's
+		// `bash:0` collides with the first's.
+		let messages = vec![ChatMessage::Assistant {
+			content: None,
+			thinking_blocks: Vec::new(),
+			tool_calls: vec![
+				crate::inference::ToolCall {
+					id: "bash:0".into(),
+					kind: "function".into(),
+					function: crate::inference::FunctionCall {
+						name: "bash".into(),
+						arguments: "{}".into(),
+					},
+				},
+				crate::inference::ToolCall {
+					id: "bash:1".into(),
+					kind: "function".into(),
+					function: crate::inference::FunctionCall {
+						name: "bash".into(),
+						arguments: "{}".into(),
+					},
+				},
+			],
+		}];
+		let mut fresh = vec![
+			crate::inference::ToolCall {
+				id: "bash:0".into(),
+				kind: "function".into(),
+				function: crate::inference::FunctionCall {
+					name: "bash".into(),
+					arguments: "{}".into(),
+				},
+			},
+			crate::inference::ToolCall {
+				id: "bash:1".into(),
+				kind: "function".into(),
+				function: crate::inference::FunctionCall {
+					name: "bash".into(),
+					arguments: "{}".into(),
+				},
+			},
+		];
+		dedupe_response_tool_call_ids(&messages, &mut fresh);
+		assert_eq!(fresh[0].id, "bash:0-dup2");
+		assert_eq!(fresh[1].id, "bash:1-dup2");
+	}
+
+	#[test]
+	fn dedupe_response_tool_call_ids_leaves_unique_ids_alone() {
+		let messages = vec![ChatMessage::Assistant {
+			content: None,
+			thinking_blocks: Vec::new(),
+			tool_calls: vec![crate::inference::ToolCall {
+				id: "call_1".into(),
+				kind: "function".into(),
+				function: crate::inference::FunctionCall {
+					name: "bash".into(),
+					arguments: "{}".into(),
+				},
+			}],
+		}];
+		let mut fresh = vec![crate::inference::ToolCall {
+			id: "call_2".into(),
+			kind: "function".into(),
+			function: crate::inference::FunctionCall {
+				name: "bash".into(),
+				arguments: "{}".into(),
+			},
+		}];
+		dedupe_response_tool_call_ids(&messages, &mut fresh);
+		assert_eq!(fresh[0].id, "call_2");
 	}
 
 	#[test]

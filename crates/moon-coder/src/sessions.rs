@@ -1486,6 +1486,65 @@ pub fn orphan_tool_call_ids(records: &[SessionRecord]) -> Vec<String> {
 	orphans
 }
 
+/// Rewrite provider-recycled tool-call ids so every id is unique
+/// across the whole record list. Some OpenAI-compat providers mint
+/// ids that are only unique *within one assistant message*
+/// (`bash:0`, `bash:1`, …, the counter resetting on every
+/// message; seen live from Kimi-K3 via Baseten). The transcript
+/// reducer, orphan recovery, and `find_recorded_tool_call` all
+/// treat the id as session-wide identity, so a recycled id makes
+/// every later call with it invisible in the panel (the reducer's
+/// upsert matches the old, already-finished row and drops the
+/// event) and ambiguous to id-keyed lookups.
+///
+/// Collisions get a `-dupN` suffix (alphanumeric-safe so
+/// Anthropic's id charset stays satisfied). `Tool` and
+/// `SubagentSpawned` records pair with the *latest* prior use of
+/// their original id, matching the live pairing order.
+pub fn dedupe_record_tool_call_ids(records: &mut [SessionRecord]) {
+	let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+	// original id → the unique id its latest occurrence was
+	// remapped to. Identity mapping entries are stored too so a
+	// `Tool` record's lookup is one probe either way.
+	let mut latest: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+	for record in records.iter_mut() {
+		match record {
+			SessionRecord::Assistant { tool_calls, .. } => {
+				for call in tool_calls.iter_mut() {
+					let unique = unique_tool_call_id(&call.id, &used);
+					used.insert(unique.clone());
+					latest.insert(std::mem::replace(&mut call.id, unique.clone()), unique);
+				}
+			}
+			SessionRecord::Tool { tool_call_id, .. } | SessionRecord::SubagentSpawned { tool_call_id, .. } => {
+				if let Some(mapped) = latest.get(tool_call_id) {
+					if mapped != tool_call_id {
+						mapped.clone_into(tool_call_id);
+					}
+				}
+			}
+			_ => {}
+		}
+	}
+}
+
+/// `id` itself when it's still free, otherwise the first
+/// `{id}-dupN` (N ≥ 2) not yet in `used`. Shared by the load-time
+/// record pass above and the runner's live-response pass.
+pub(crate) fn unique_tool_call_id(id: &str, used: &std::collections::HashSet<String>) -> String {
+	if !used.contains(id) {
+		return id.to_owned();
+	}
+	let mut n = 2usize;
+	loop {
+		let candidate = format!("{id}-dup{n}");
+		if !used.contains(&candidate) {
+			return candidate;
+		}
+		n += 1;
+	}
+}
+
 /// Of the orphaned tool-call ids from [`orphan_tool_call_ids`], return
 /// those that are `ask_user` calls — the only kind safe to re-dispatch
 /// across a process restart. Every other tool has side effects
@@ -2048,6 +2107,12 @@ pub async fn load(dir: &Utf8Path, id: &str) -> Result<LoadedSession, CoderError>
 			}
 		}
 	}
+	// Transcripts written while a provider was recycling
+	// tool-call ids (per-message `bash:0` counters) carry
+	// session-wide collisions; uniquify at the parse choke point
+	// so every consumer — replay, orphan recovery, resume,
+	// truncation rewrites — sees unambiguous ids.
+	dedupe_record_tool_call_ids(&mut records);
 	Ok(LoadedSession {
 		header,
 		records,
@@ -3639,6 +3704,157 @@ mod tests {
 				arguments: "{}".into(),
 			},
 		}
+	}
+
+	#[test]
+	fn dedupe_record_tool_call_ids_uniquifies_recycled_ids() {
+		// The Kimi-via-Baseten shape: per-message `bash:0` /
+		// `bash:1` counters, so the same id recurs across
+		// assistant records. Each later occurrence gets a
+		// suffix; each Tool record pairs with the latest prior
+		// use of its original id.
+		let mut records = vec![
+			SessionRecord::Assistant {
+				content: None,
+				thinking: None,
+				thinking_blocks: vec![],
+				tool_calls: vec![make_tool_call("bash:0", "bash"), make_tool_call("bash:1", "bash")],
+				model: None,
+				stop_reason: None,
+			},
+			SessionRecord::Tool {
+				tool_call_id: "bash:0".into(),
+				tool_name: "bash".into(),
+				content: "{}".into(),
+				duration_ms: None,
+				images: Vec::new(),
+			},
+			SessionRecord::Assistant {
+				content: None,
+				thinking: None,
+				thinking_blocks: vec![],
+				tool_calls: vec![make_tool_call("bash:0", "bash")],
+				model: None,
+				stop_reason: None,
+			},
+			SessionRecord::Tool {
+				tool_call_id: "bash:0".into(),
+				tool_name: "bash".into(),
+				content: "{}".into(),
+				duration_ms: None,
+				images: Vec::new(),
+			},
+		];
+		dedupe_record_tool_call_ids(&mut records);
+		let SessionRecord::Assistant { tool_calls: first, .. } = &records[0] else {
+			panic!()
+		};
+		assert_eq!(first[0].id, "bash:0");
+		assert_eq!(first[1].id, "bash:1");
+		let SessionRecord::Tool { tool_call_id, .. } = &records[1] else {
+			panic!()
+		};
+		assert_eq!(tool_call_id, "bash:0");
+		let SessionRecord::Assistant { tool_calls: second, .. } = &records[2] else {
+			panic!()
+		};
+		assert_eq!(second[0].id, "bash:0-dup2");
+		let SessionRecord::Tool { tool_call_id, .. } = &records[3] else {
+			panic!()
+		};
+		assert_eq!(tool_call_id, "bash:0-dup2");
+		// Post-dedupe, pairing is exact: the only orphan is
+		// `bash:1` (the second call of the first batch, whose
+		// result this fixture never includes). Pre-fix, both
+		// later `bash:0` occurrences silently shadowed the first.
+		assert_eq!(orphan_tool_call_ids(&records), vec!["bash:1".to_string()]);
+	}
+
+	#[test]
+	fn dedupe_record_tool_call_ids_leaves_unique_ids_alone() {
+		let mut records = vec![
+			SessionRecord::Assistant {
+				content: None,
+				thinking: None,
+				thinking_blocks: vec![],
+				tool_calls: vec![make_tool_call("call-a", "bash")],
+				model: None,
+				stop_reason: None,
+			},
+			SessionRecord::Tool {
+				tool_call_id: "call-a".into(),
+				tool_name: "bash".into(),
+				content: "{}".into(),
+				duration_ms: None,
+				images: Vec::new(),
+			},
+		];
+		dedupe_record_tool_call_ids(&mut records);
+		let SessionRecord::Assistant { tool_calls, .. } = &records[0] else {
+			panic!()
+		};
+		assert_eq!(tool_calls[0].id, "call-a");
+		let SessionRecord::Tool { tool_call_id, .. } = &records[1] else {
+			panic!()
+		};
+		assert_eq!(tool_call_id, "call-a");
+	}
+
+	#[test]
+	fn dedupe_record_tool_call_ids_remaps_subagent_spawned_reference() {
+		let mut records = vec![
+			SessionRecord::Assistant {
+				content: None,
+				thinking: None,
+				thinking_blocks: vec![],
+				tool_calls: vec![make_tool_call("task:0", "task")],
+				model: None,
+				stop_reason: None,
+			},
+			SessionRecord::SubagentSpawned {
+				tool_call_id: "task:0".into(),
+				subagent_id: "sub-1".into(),
+				target_folder: String::new(),
+				mode: "agent".into(),
+				worktree_root: None,
+				detached: false,
+			},
+			SessionRecord::Assistant {
+				content: None,
+				thinking: None,
+				thinking_blocks: vec![],
+				tool_calls: vec![make_tool_call("task:0", "task")],
+				model: None,
+				stop_reason: None,
+			},
+			SessionRecord::SubagentSpawned {
+				tool_call_id: "task:0".into(),
+				subagent_id: "sub-2".into(),
+				target_folder: String::new(),
+				mode: "agent".into(),
+				worktree_root: None,
+				detached: false,
+			},
+		];
+		dedupe_record_tool_call_ids(&mut records);
+		let SessionRecord::SubagentSpawned {
+			tool_call_id,
+			subagent_id,
+			..
+		} = &records[1]
+		else {
+			panic!()
+		};
+		assert_eq!((tool_call_id.as_str(), subagent_id.as_str()), ("task:0", "sub-1"));
+		let SessionRecord::SubagentSpawned {
+			tool_call_id,
+			subagent_id,
+			..
+		} = &records[3]
+		else {
+			panic!()
+		};
+		assert_eq!((tool_call_id.as_str(), subagent_id.as_str()), ("task:0-dup2", "sub-2"));
 	}
 
 	#[test]

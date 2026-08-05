@@ -873,6 +873,22 @@ trips the keyed `{#each}`'s `each_key_duplicate`, which kills the
 panel until a reload. Holds for the desktop panel, the sub-agent
 pop-out, and the phone companion.
 
+**Tool-call ids are unique per session, enforced by moon, not the
+provider.** Some OpenAI-compat providers mint ids that are only
+unique within one assistant message (`bash:0`, `bash:1`, …, the
+counter resetting every message — seen from Kimi-K3 via Baseten).
+Under the upsert contract a recycled id is catastrophic: a new call
+whose id matches an already-finished row is silently dropped, so the
+tool runs without ever appearing in the transcript, and its result
+overwrites the old row. The runner therefore remaps collisions on a
+fresh response to `{id}-dupN` (N ≥ 2) before anything observes them —
+events, `messages`, the persisted record, and dispatch all agree —
+and `sessions::load` applies the same remapping to old transcripts at
+parse time (each `Tool` / `SubagentSpawned` record re-pairs with the
+latest prior use of its original id, matching the live pairing
+order). The suffix is alphanumeric-safe so Anthropic's id charset
+stays satisfied.
+
 ### Revert, replay, and edit & resend
 
 Every user message row reveals three hover affordances:

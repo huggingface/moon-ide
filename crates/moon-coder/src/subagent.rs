@@ -927,7 +927,7 @@ async fn run_subagent_loop(
 		let id_for_subagent = id.clone();
 		let sink_for_cb = sink.clone();
 		let started = std::sync::atomic::AtomicBool::new(false);
-		let response = inference
+		let mut response = inference
 			.chat_completion_stream(&standard_model, &messages, &tool_defs, &cancel, |event| match event {
 				StreamEvent::ContentDelta { delta } => {
 					if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -962,6 +962,9 @@ async fn run_subagent_loop(
 				StreamEvent::ToolCallDelta { .. } => {}
 			})
 			.await?;
+		// Same recycled-id guard as the parent loop — must run
+		// before the response is pushed / persisted / dispatched.
+		crate::runner::dedupe_response_tool_call_ids(&messages, &mut response.tool_calls);
 		// Same empty-shell guard the parent runner uses — skip
 		// pushing / persisting / emitting `End` for an Anthropic
 		// turn that bailed mid-stream. See
