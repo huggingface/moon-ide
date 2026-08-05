@@ -536,7 +536,10 @@ async fn send_reply(stream: &mut UnixStream, reply: Reply) {
 	}
 }
 
-fn focus_main_window(app: &AppHandle) {
+/// Unminimize → show → focus the main window. Shared with the
+/// agent-status tray (`crate::agent_indicator`), which offers the
+/// same "bring me back" affordance from its menu.
+pub(crate) fn focus_main_window(app: &AppHandle) {
 	let Some(window) = app.get_webview_window("main") else {
 		return;
 	};

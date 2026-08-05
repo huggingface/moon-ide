@@ -14,6 +14,7 @@
 //! window of its own. See
 //! [specs/roadmaps/phase-07-multi-workspace.md].
 
+mod agent_indicator;
 mod bridge_rpc;
 mod commands;
 mod focus_socket;
@@ -97,6 +98,21 @@ pub fn run() {
 		// restores it on next launch. No code on our side — the
 		// plugin hooks into window creation and close events.
 		.plugin(tauri_plugin_window_state::Builder::new().build())
+		// Focus flips feed the agent-activity indicator: focusing
+		// the window acknowledges a green "agents finished" tray
+		// icon. `try_state` — the indicator only exists in
+		// workspace mode.
+		.on_window_event(|window, event| {
+			let tauri::WindowEvent::Focused(focused) = event else {
+				return;
+			};
+			if window.label() != "main" {
+				return;
+			}
+			if let Some(indicator) = window.app_handle().try_state::<std::sync::Arc<agent_indicator::AgentIndicator>>() {
+				indicator.set_focused(*focused);
+			}
+		})
 		.invoke_handler(tauri::generate_handler![
 			commands::workspace::workspace_open_local,
 			commands::workspace::workspace_remove_folder,
@@ -265,6 +281,7 @@ pub fn run() {
 			commands::coder::coder_retry_last_turn,
 			commands::coder::coder_rerun_tool_call,
 			commands::coder::coder_list_sessions,
+			commands::coder::coder_running_sessions,
 			commands::coder::coder_search_sessions,
 			commands::coder::coder_active_session,
 			commands::coder::coder_last_opened_session,
@@ -395,13 +412,18 @@ pub fn run() {
 			// icon (keyed on the sentinel id, no override) — same
 			// code path, no branching needed. Failures are logged
 			// and dropped inside `apply_workspace_icon`.
+			let override_color = loaded_state
+				.workspaces
+				.iter()
+				.find(|m| m.id == workspace_id)
+				.and_then(|m| m.color.clone());
 			if let Some(window) = app.get_webview_window("main") {
-				let override_color = loaded_state
-					.workspaces
-					.iter()
-					.find(|m| m.id == workspace_id)
-					.and_then(|m| m.color.clone());
-				window_icon::apply_workspace_icon(&window, &workspace_id, override_color.as_deref());
+				window_icon::apply_workspace_icon(
+					&window,
+					&workspace_id,
+					override_color.as_deref(),
+					window_icon::IconStatus::Plain,
+				);
 			}
 
 			// Build the shared client cell first, spawn the Slack
@@ -502,6 +524,20 @@ pub fn run() {
 			)
 			.map_err(|err| format!("could not init moon-coder: {err}"))?;
 			commands::coder::spawn_event_pump(app.handle().clone(), coder.clone());
+			// OS-level agent-activity indicator (transient tray
+			// icon + window-icon status dot + taskbar flash).
+			// Workspace mode only — preboot has no agents to
+			// report on. Managed so the window-event handler and
+			// `workspace_set_color` can reach it.
+			if matches!(mode, AppMode::Workspace { .. }) {
+				let indicator = agent_indicator::AgentIndicator::spawn(
+					app.handle(),
+					workspace_id.clone(),
+					override_color.clone(),
+					&coder,
+				);
+				app.manage(indicator);
+			}
 			// Best-effort prime of the per-model context-window cache for
 			// the active route, so the first turn after relaunch sizes
 			// the usage ring + auto-compaction trigger off authoritative

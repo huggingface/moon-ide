@@ -64,6 +64,16 @@ pub enum CoderEvent {
 	/// that was already streaming. Until then the flag tells the
 	/// UI `coder_unqueue_steer` can still pop it back into the
 	/// composer.
+	///
+	/// `from_coordinator: true` marks a message a **coordinator**
+	/// sent into one of its workers (`spawn_worker`'s seed task,
+	/// `steer_worker`) rather than something the human typed. The
+	/// UI badges these so a worker transcript distinguishes the
+	/// orchestrator's instructions from the user's own nudges
+	/// (ADR 0043 lets both land in the same session). Persisted on
+	/// the matching [`crate::sessions::SessionRecord::User`] so
+	/// replays keep the mark. Elided when `false` (the common
+	/// human-typed case).
 	UserMessage {
 		id: String,
 		text: String,
@@ -71,6 +81,8 @@ pub enum CoderEvent {
 		images: Vec<crate::inference::ImageAttachment>,
 		#[serde(default, skip_serializing_if = "std::ops::Not::not")]
 		queued: bool,
+		#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+		from_coordinator: bool,
 		/// Unix-ms creation time. Stamped `now` on a live turn and
 		/// carried verbatim from the persisted record on replay, so
 		/// a reopened session shows real per-message times. `None`

@@ -730,6 +730,9 @@
 						}
 					}}
 				>
+					{#if row.fromCoordinator}<span class="coordinator-tag" title="Sent by the coordinator, not by you"
+							>coordinator</span
+						>{/if}
 					{row.text}
 					{#if row.queued}<span class="queued-tag">queued</span>{/if}
 				</div>
@@ -1074,6 +1077,21 @@
 		font-size: 0.7rem;
 		margin-left: 0.3rem;
 		color: var(--fg-muted);
+	}
+	/* Coordinator-sent message into a worker — same pill language
+	   as the `coord` session badge so the reader can tell the
+	   orchestrator's instructions from their own. */
+	.coordinator-tag {
+		display: inline-block;
+		font-size: 0.65rem;
+		font-weight: 600;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+		padding: 0 0.4rem;
+		margin-right: 0.25rem;
+		border-radius: 999px;
+		background: color-mix(in srgb, var(--accent) 22%, transparent);
+		color: var(--accent);
 	}
 	.bubble.assistant {
 		background: var(--bg-elev);

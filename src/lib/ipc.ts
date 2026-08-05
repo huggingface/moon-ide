@@ -405,6 +405,7 @@ export const ipc = {
 		retryLastTurn: () => invoke<void>('coder_retry_last_turn'),
 		rerunToolCall: (toolCallId: string) => invoke<RerunToolOutcome>('coder_rerun_tool_call', { toolCallId }),
 		listSessions: () => invoke<CoderSessionSummary[]>('coder_list_sessions'),
+		runningSessions: () => invoke<string[]>('coder_running_sessions'),
 		searchSessions: (query: string) => invoke<string[]>('coder_search_sessions', { query }),
 		activeSession: () => invoke<CoderSessionSummary | null>('coder_active_session'),
 		lastOpenedSession: () => invoke<string | null>('coder_last_opened_session'),

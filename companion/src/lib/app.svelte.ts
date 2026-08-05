@@ -118,7 +118,7 @@ export type SessionSummary = {
 /** A rendered transcript row. The phone collapses the coder's
  * fine-grained event grammar into these visible kinds. */
 export type TranscriptRow =
-	| { kind: 'user'; id: string; text: string; queued: boolean }
+	| { kind: 'user'; id: string; text: string; queued: boolean; fromCoordinator: boolean }
 	| { kind: 'assistant'; id: string; text: string; thinking: string }
 	| {
 			kind: 'tool';
@@ -1434,6 +1434,7 @@ class CompanionState {
 					id: str(ev, 'id'),
 					text: str(ev, 'text'),
 					queued: bool(ev, 'queued'),
+					fromCoordinator: bool(ev, 'from_coordinator'),
 				});
 				break;
 			}

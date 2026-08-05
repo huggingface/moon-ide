@@ -1660,6 +1660,13 @@ export type CoderEvent =
 			 *  reopened session shows real per-message times. Absent
 			 *  for pre-timestamp sessions. */
 			created_at_ms?: number | null;
+			/** `true` when a coordinator sent this into one of its
+			 *  workers (`spawn_worker` seed / `steer_worker`) rather
+			 *  than the human typing it. The transcript badges these
+			 *  so the orchestrator's instructions read apart from the
+			 *  user's own messages. Absent/false for every
+			 *  human-typed message. */
+			from_coordinator?: boolean;
 	  }
 	/** A queued steer left the provisional queue (drained into the
 	 *  chat, unqueued back to the composer, or aborted away). Remove

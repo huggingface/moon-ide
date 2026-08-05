@@ -28,7 +28,7 @@ use std::sync::Arc;
 use camino::{Utf8Path, Utf8PathBuf};
 use moon_core::WorkspaceRegistry;
 use serde_json::Value;
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, watch, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::{Authenticator, DeviceCode, HfIdentity};
@@ -86,6 +86,16 @@ struct CoderState {
 	inference: InferenceClient,
 	tools: ToolRegistry,
 	events: broadcast::Sender<CoderEventEnvelope>,
+	/// Count of live turn loops across every session in the
+	/// process (visible sessions, worktree sessions, coordinator
+	/// workers — anything that goes through `spawn_turn_loop`).
+	/// The Tauri layer subscribes via
+	/// [`CoderHandle::watch_running_turns`] to drive the OS-level
+	/// "agent running / finished" indicator (tray icon + window
+	/// icon badge). Detached `task` sub-agents are deliberately
+	/// not counted — they're fire-and-forget helpers the parent
+	/// collects later, not something the user is waiting on.
+	running_turns: watch::Sender<usize>,
 	/// Per-folder session + turn state. Lazy-created on the first
 	/// command that targets a given folder; survives across
 	/// folder switches so background turns aren't interrupted.
@@ -701,6 +711,11 @@ struct PendingSteer {
 	/// Unix-ms queue time, replayed as the row's `created_at_ms`
 	/// so a reopen doesn't restamp the steer to "now".
 	queued_at_ms: i64,
+	/// Coordinator-originated steer (`steer_worker` into a busy
+	/// worker). Carried through the drain so both the queued and
+	/// the drained `UserMessage` events — and the persisted
+	/// record — keep the mark.
+	from_coordinator: bool,
 }
 
 impl Session {
@@ -972,6 +987,7 @@ impl CoderHandle {
 		let web = crate::web::WebClient::new()?;
 		let tools = ToolRegistry::new(workspaces.clone(), workspaces_dir.clone(), web, terminals);
 		let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+		let (running_turns, _) = watch::channel(0usize);
 		let folder_summaries = Arc::new(FolderSummaryService::new(folder_summaries_dir));
 		let hub_sync = crate::hub_sync::HubSync::new(
 			auth.clone(),
@@ -985,6 +1001,7 @@ impl CoderHandle {
 				inference,
 				tools,
 				events,
+				running_turns,
 				sessions_by_folder: Arc::new(RwLock::new(HashMap::new())),
 				workspaces,
 				workspaces_dir,
@@ -2781,7 +2798,7 @@ impl CoderHandle {
 		let mut last_todos: Vec<crate::TodoItem> = Vec::new();
 		for record in records {
 			match record {
-				SessionRecord::User { text, images } => {
+				SessionRecord::User { text, images, .. } => {
 					messages.push(ChatMessage::User {
 						content: text.clone(),
 						images: images.clone(),
@@ -3472,6 +3489,7 @@ impl CoderHandle {
 				images: steer.images,
 				queued: true,
 				created_at_ms: Some(steer.queued_at_ms),
+				from_coordinator: steer.from_coordinator,
 			});
 		}
 		replay_events.push(CoderEvent::TurnComplete);
@@ -3633,6 +3651,7 @@ impl CoderHandle {
 					text: text.clone(),
 					images: images.clone(),
 					queued_at_ms,
+					from_coordinator: false,
 				});
 				session.header.updated_at_ms = queued_at_ms;
 				drop(session);
@@ -3643,6 +3662,7 @@ impl CoderHandle {
 					images,
 					queued: true,
 					created_at_ms: Some(queued_at_ms),
+					from_coordinator: false,
 				});
 				return Ok(target);
 			}
@@ -3736,6 +3756,7 @@ impl CoderHandle {
 			let record = SessionRecord::User {
 				text: text.clone(),
 				images: images.clone(),
+				from_coordinator: false,
 			};
 			if let Err(err) = sessions::append_record(&dir, &header, &record).await {
 				tracing::warn!(error = %err, "failed to persist user message");
@@ -3752,6 +3773,7 @@ impl CoderHandle {
 			images: images.clone(),
 			queued: false,
 			created_at_ms: Some(current_time_ms()),
+			from_coordinator: false,
 		});
 
 		let state = self.state.clone();
@@ -4100,6 +4122,15 @@ impl CoderHandle {
 		self.state.events.subscribe()
 	}
 
+	/// Watch the number of live turn loops in this process. `0 → n`
+	/// means "some agent started", `n → 0` means "everything
+	/// settled". Consumed by the Tauri layer's OS-level activity
+	/// indicator; see the field doc on [`CoderState::running_turns`]
+	/// for what does and doesn't count.
+	pub fn watch_running_turns(&self) -> watch::Receiver<usize> {
+		self.state.running_turns.subscribe()
+	}
+
 	// ── Orchestrator-facing client surface (ADR 0030) ───────────
 	//
 	// By-id variants of the panel-driven methods. An orchestrator
@@ -4177,11 +4208,38 @@ impl CoderHandle {
 	/// Send a prompt to a specific session by id (ADR 0030). Unlike
 	/// `send` (which targets the active folder's visible session),
 	/// this resolves the runtime by id across all folders and seeds
-	/// it directly. Used by an orchestrator's `spawn_worker` /
-	/// `steer_worker` to drive a worker. If the worker's turn is
-	/// already running, the message is queued as a steer (same as a
-	/// user steering a visible session).
+	/// it directly. If the target's turn is already running, the
+	/// message is queued as a steer (same as a user steering a
+	/// visible session).
 	pub async fn send_to(&self, session_id: &str, text: String, images: Vec<ImageAttachment>) -> Result<(), CoderError> {
+		self.send_to_inner(session_id, text, images, false).await
+	}
+
+	/// [`Self::send_to`] for coordinator → worker traffic
+	/// (`spawn_worker`'s seed task, `steer_worker`). Identical
+	/// mechanics, but the emitted `UserMessage` and the persisted
+	/// record carry `from_coordinator: true` so the worker's
+	/// transcript badges the orchestrator's instructions apart
+	/// from anything the human typed (ADR 0043 lets both land in
+	/// the same session). Coordinator-*bound* traffic (dispatch
+	/// feeder wakes, user-message notices) stays on plain
+	/// `send_to` — those aren't the coordinator speaking.
+	pub async fn send_to_as_coordinator(
+		&self,
+		session_id: &str,
+		text: String,
+		images: Vec<ImageAttachment>,
+	) -> Result<(), CoderError> {
+		self.send_to_inner(session_id, text, images, true).await
+	}
+
+	async fn send_to_inner(
+		&self,
+		session_id: &str,
+		text: String,
+		images: Vec<ImageAttachment>,
+		from_coordinator: bool,
+	) -> Result<(), CoderError> {
 		let images = crate::images::reencode_all(images).await;
 		self.ensure_can_send().await?;
 		let Some((rt, folder_path)) = self.state.runtime_for_session(session_id).await else {
@@ -4207,6 +4265,7 @@ impl CoderHandle {
 					text: text.clone(),
 					images: images.clone(),
 					queued_at_ms,
+					from_coordinator,
 				});
 				session.header.updated_at_ms = queued_at_ms;
 				drop(session);
@@ -4221,6 +4280,7 @@ impl CoderHandle {
 					images,
 					queued: true,
 					created_at_ms: Some(queued_at_ms),
+					from_coordinator,
 				});
 				return Ok(());
 			}
@@ -4263,6 +4323,34 @@ impl CoderHandle {
 			folder_path.to_string(),
 			session_id.to_string(),
 		);
+		// Append the user message to in-memory chat history + the
+		// session JSONL, mirroring `send`'s persist path. Persisted
+		// **before** the `SessionListChanged` announce below: the
+		// frontend reacts to that event by re-reading the on-disk
+		// session list, and a worker whose seed record hadn't landed
+		// yet would be missing from the refreshed list (no row, no
+		// running pip) until some unrelated event refreshed it again.
+		{
+			let mut session = rt.session.lock().await;
+			session.messages.push(ChatMessage::User {
+				content: text.clone(),
+				images: images.clone(),
+			});
+			let header = session.header.clone();
+			let dir = session.session_dir.clone().expect("session_dir set above");
+			drop(session);
+			let record = SessionRecord::User {
+				text: text.clone(),
+				images: images.clone(),
+				from_coordinator,
+			};
+			if let Err(err) = sessions::append_record(&dir, &header, &record).await {
+				tracing::warn!(error = %err, "failed to persist worker seed message");
+			} else {
+				let mut session = rt.session.lock().await;
+				session.persisted_records = session.persisted_records.saturating_add(1);
+			}
+		}
 		if let Some(summary) = &summary_to_announce {
 			sink.send(CoderEvent::SessionLoaded {
 				id: summary.id.clone(),
@@ -4276,34 +4364,13 @@ impl CoderHandle {
 			});
 			sink.send(CoderEvent::SessionListChanged);
 		}
-		// Append the user message to in-memory chat history + the
-		// session JSONL, mirroring `send`'s persist path.
-		{
-			let mut session = rt.session.lock().await;
-			session.messages.push(ChatMessage::User {
-				content: text.clone(),
-				images: images.clone(),
-			});
-			let header = session.header.clone();
-			let dir = session.session_dir.clone().expect("session_dir set above");
-			drop(session);
-			let record = SessionRecord::User {
-				text: text.clone(),
-				images: images.clone(),
-			};
-			if let Err(err) = sessions::append_record(&dir, &header, &record).await {
-				tracing::warn!(error = %err, "failed to persist worker seed message");
-			} else {
-				let mut session = rt.session.lock().await;
-				session.persisted_records = session.persisted_records.saturating_add(1);
-			}
-		}
 		sink.send(CoderEvent::UserMessage {
 			id: new_message_id(),
 			text,
 			images,
 			queued: false,
 			created_at_ms: Some(current_time_ms()),
+			from_coordinator,
 		});
 		// Spawn the turn via the shared loop helper — same detached-task
 		// shape as `send`, so the worker gets the same steer-race
@@ -5074,6 +5141,10 @@ fn spawn_turn_loop(
 	resume_tool_calls: Option<Vec<crate::inference::ToolCall>>,
 ) {
 	tokio::spawn(async move {
+		// Scope-tied so every exit path (success, abort, error,
+		// steer-drain re-loop) decrements exactly once, even on
+		// panic.
+		let _running_guard = RunningTurnGuard::acquire(&state.running_turns);
 		// Loop wrapper closes the race between `run_turn` returning
 		// `Ok(())` and the spawn task clearing `turn.cancel`: a steer
 		// queued in that window lands in `pending_steers` but would
@@ -5169,6 +5240,29 @@ fn spawn_turn_loop(
 			spawn_auto_rename(state.clone(), rt_for_turn.clone(), sink_for_turn);
 		}
 	});
+}
+
+/// RAII increment/decrement on [`CoderState::running_turns`]. Held
+/// for the whole lifetime of a turn-loop task so the count survives
+/// steer-drain re-loops and drops exactly once no matter how the
+/// task exits.
+struct RunningTurnGuard {
+	counter: watch::Sender<usize>,
+}
+
+impl RunningTurnGuard {
+	fn acquire(counter: &watch::Sender<usize>) -> Self {
+		counter.send_modify(|n| *n += 1);
+		Self {
+			counter: counter.clone(),
+		}
+	}
+}
+
+impl Drop for RunningTurnGuard {
+	fn drop(&mut self) {
+		self.counter.send_modify(|n| *n = n.saturating_sub(1));
+	}
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5726,6 +5820,7 @@ async fn push_sentinel_user_message(rt: &Arc<SessionRuntime>, sink: &FolderEvent
 		let record = SessionRecord::User {
 			text: text.clone(),
 			images: Vec::new(),
+			from_coordinator: false,
 		};
 		if let Err(err) = sessions::append_record(&dir, &header, &record).await {
 			tracing::warn!(error = %err, "failed to persist sentinel user message");
@@ -5739,6 +5834,7 @@ async fn push_sentinel_user_message(rt: &Arc<SessionRuntime>, sink: &FolderEvent
 		text,
 		images: Vec::new(),
 		queued: false,
+		from_coordinator: false,
 		created_at_ms: Some(current_time_ms()),
 	});
 }
@@ -6822,7 +6918,10 @@ async fn handle_spawn_worker(
 	// a worker that never started — the emitted `SubagentSpawned` is a
 	// UI concern and is left (the card renders the seed error via the
 	// orchestrator's tool_result, which the turn emits on this `Err`).
-	if let Err(err) = handle.send_to(&summary.id, task.to_string(), Vec::new()).await {
+	if let Err(err) = handle
+		.send_to_as_coordinator(&summary.id, task.to_string(), Vec::new())
+		.await
+	{
 		state
 			.coordinator_workers
 			.write()
@@ -7072,7 +7171,9 @@ async fn handle_steer_worker(state: &Arc<CoderState>, args: &Value) -> Result<Va
 	}
 	ensure_worker_still_attached(state, "steer_worker", &parsed.worker_id).await?;
 	let handle = CoderHandle { state: state.clone() };
-	handle.send_to(&parsed.worker_id, parsed.text, Vec::new()).await?;
+	handle
+		.send_to_as_coordinator(&parsed.worker_id, parsed.text, Vec::new())
+		.await?;
 	Ok(json!({ "status": "steered" }))
 }
 
@@ -8511,6 +8612,7 @@ async fn drain_pending_steers(rt: &Arc<SessionRuntime>, sink: &FolderEventSink) 
 			images: steer.images.clone(),
 			queued: false,
 			created_at_ms: Some(current_time_ms()),
+			from_coordinator: steer.from_coordinator,
 		});
 	}
 	let Some(dir) = dir else {
@@ -8520,6 +8622,7 @@ async fn drain_pending_steers(rt: &Arc<SessionRuntime>, sink: &FolderEventSink) 
 		let record = SessionRecord::User {
 			text: steer.text,
 			images: steer.images,
+			from_coordinator: steer.from_coordinator,
 		};
 		if let Err(err) = sessions::append_record(&dir, &header, &record).await {
 			tracing::warn!(error = %err, "failed to persist steered user message");
@@ -9071,13 +9174,18 @@ fn sanitise_auto_title(raw: &str) -> String {
 /// instead of one-per-record.
 fn emit_replay_events(out: &mut Vec<CoderEvent>, record: SessionRecord, created_at_ms: i64) {
 	match record {
-		SessionRecord::User { text, images } => {
+		SessionRecord::User {
+			text,
+			images,
+			from_coordinator,
+		} => {
 			out.push(CoderEvent::UserMessage {
 				id: new_message_id(),
 				text,
 				images,
 				queued: false,
 				created_at_ms: Some(created_at_ms),
+				from_coordinator,
 			});
 		}
 		SessionRecord::Assistant {
@@ -9315,12 +9423,17 @@ async fn replay_subagent_spawned(
 /// chatter down on a long-running sub-agent.
 fn subagent_replay_inners(record: SessionRecord, created_at_ms: i64) -> Vec<CoderEvent> {
 	match record {
-		SessionRecord::User { text, images } => vec![CoderEvent::UserMessage {
+		SessionRecord::User {
+			text,
+			images,
+			from_coordinator,
+		} => vec![CoderEvent::UserMessage {
 			id: new_message_id(),
 			text,
 			images,
 			queued: false,
 			created_at_ms: Some(created_at_ms),
+			from_coordinator,
 		}],
 		SessionRecord::Assistant {
 			content,
@@ -10531,12 +10644,14 @@ mod tests {
 				text: "also do X".into(),
 				images: Vec::new(),
 				queued_at_ms: 0,
+				from_coordinator: false,
 			},
 			PendingSteer {
 				id: "steer-2".into(),
 				text: "and then Y".into(),
 				images: Vec::new(),
 				queued_at_ms: 0,
+				from_coordinator: false,
 			},
 		];
 		let rt = Arc::new(SessionRuntime::new(session));
@@ -10634,6 +10749,7 @@ mod tests {
 				text: "first".into(),
 				images: Vec::new(),
 				queued_at_ms: 0,
+				from_coordinator: false,
 			},
 			PendingSteer {
 				id: "b".into(),
@@ -10643,12 +10759,14 @@ mod tests {
 					mime: "image/png".into(),
 				}],
 				queued_at_ms: 0,
+				from_coordinator: false,
 			},
 			PendingSteer {
 				id: "c".into(),
 				text: "last".into(),
 				images: Vec::new(),
 				queued_at_ms: 0,
+				from_coordinator: false,
 			},
 		];
 
@@ -10670,6 +10788,7 @@ mod tests {
 			text: "first".into(),
 			images: Vec::new(),
 			queued_at_ms: 0,
+			from_coordinator: false,
 		}];
 		assert!(pop_pending_steer(&mut session, "missing").is_none());
 		assert_eq!(session.pending_steers.len(), 1);
@@ -10943,6 +11062,7 @@ mod tests {
 			&SessionRecord::User {
 				text: "read foo.rs".into(),
 				images: Vec::new(),
+				from_coordinator: false,
 			},
 		)
 		.await

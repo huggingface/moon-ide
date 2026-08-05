@@ -408,7 +408,21 @@ pub(crate) fn record_to_pi_wire(
 	timestamp_ms: i64,
 ) -> serde_json::Value {
 	match record {
-		SessionRecord::User { text, images } => pi_message_envelope(pi_user_message(text, images), timestamp_ms),
+		SessionRecord::User {
+			text,
+			images,
+			from_coordinator,
+		} => {
+			let mut msg = pi_user_message(text, images);
+			// Extra field pi viewers ignore; elided when false so
+			// ordinary transcripts stay byte-identical.
+			if *from_coordinator {
+				if let Some(obj) = msg.as_object_mut() {
+					obj.insert("fromCoordinator".into(), serde_json::json!(true));
+				}
+			}
+			pi_message_envelope(msg, timestamp_ms)
+		}
 		SessionRecord::Assistant {
 			content,
 			thinking,
@@ -902,10 +916,12 @@ pub(crate) fn pi_wire_to_records(value: &serde_json::Value) -> Vec<SessionRecord
 
 fn parse_pi_user(msg: &serde_json::Value) -> Option<SessionRecord> {
 	let content = msg.get("content")?;
+	let from_coordinator = msg.get("fromCoordinator").and_then(|v| v.as_bool()).unwrap_or(false);
 	if let Some(text) = content.as_str() {
 		return Some(SessionRecord::User {
 			text: text.to_string(),
 			images: Vec::new(),
+			from_coordinator,
 		});
 	}
 	let blocks = content.as_array()?;
@@ -937,6 +953,7 @@ fn parse_pi_user(msg: &serde_json::Value) -> Option<SessionRecord> {
 	Some(SessionRecord::User {
 		text: texts.join("\n"),
 		images,
+		from_coordinator,
 	})
 }
 
@@ -1209,6 +1226,14 @@ pub enum SessionRecord {
 		text: String,
 		#[serde(default, skip_serializing_if = "Vec::is_empty")]
 		images: Vec<crate::inference::ImageAttachment>,
+		/// `true` when a coordinator sent this into one of its
+		/// workers (`spawn_worker` seed / `steer_worker`) rather
+		/// than the human typing it. Mirrors
+		/// [`crate::event::CoderEvent::UserMessage::from_coordinator`];
+		/// elided when `false` so ordinary transcripts stay
+		/// byte-identical.
+		#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+		from_coordinator: bool,
 	},
 	/// One assistant turn completed. Carries the canonical full
 	/// content + reasoning trace + any tool calls the model
@@ -2384,7 +2409,7 @@ pub async fn truncate_before_user_record(
 	};
 
 	let (dropped_text, dropped_images) = match &records[cut] {
-		SessionRecord::User { text, images } => (text.clone(), images.clone()),
+		SessionRecord::User { text, images, .. } => (text.clone(), images.clone()),
 		// Unreachable: `cut` was chosen on a `User` match above.
 		_ => (String::new(), Vec::new()),
 	};
@@ -2725,6 +2750,7 @@ mod tests {
 			&SessionRecord::User {
 				text: "hi".into(),
 				images: Vec::new(),
+				from_coordinator: false,
 			},
 		)
 		.await
@@ -2805,6 +2831,7 @@ mod tests {
 			&SessionRecord::User {
 				text: "hi".into(),
 				images: Vec::new(),
+				from_coordinator: false,
 			},
 		)
 		.await
@@ -2837,6 +2864,7 @@ mod tests {
 			&SessionRecord::User {
 				text: "first".into(),
 				images: Vec::new(),
+				from_coordinator: false,
 			},
 		)
 		.await
@@ -2851,6 +2879,7 @@ mod tests {
 			&SessionRecord::User {
 				text: "second".into(),
 				images: Vec::new(),
+				from_coordinator: false,
 			},
 		)
 		.await
@@ -2895,6 +2924,7 @@ mod tests {
 			&SessionRecord::User {
 				text: "hi".into(),
 				images: Vec::new(),
+				from_coordinator: false,
 			},
 		)
 		.await
@@ -2926,6 +2956,7 @@ mod tests {
 			&SessionRecord::User {
 				text: "hello".into(),
 				images: Vec::new(),
+				from_coordinator: false,
 			},
 		)
 		.await
@@ -2941,10 +2972,43 @@ mod tests {
 
 		let loaded = load(&dir, "sess-user").await.unwrap();
 		match &loaded.records[0] {
-			SessionRecord::User { text, images } => {
+			SessionRecord::User { text, images, .. } => {
 				assert_eq!(text, "hello");
 				assert!(images.is_empty());
 			}
+			other => panic!("expected user record, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn coordinator_mark_round_trips_through_pi_wire() {
+		// A coordinator-sent worker message keeps its
+		// `from_coordinator` mark across persist + reload; an
+		// ordinary user line carries no extra field at all.
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let header = make_test_header("sess-coord");
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::User {
+				text: "fix the login redirect".into(),
+				images: Vec::new(),
+				from_coordinator: true,
+			},
+		)
+		.await
+		.unwrap();
+		let body = tokio::fs::read_to_string(session_path(&dir, "sess-coord").as_std_path())
+			.await
+			.unwrap();
+		let user_line = body.lines().nth(1).expect("user line present");
+		let parsed: serde_json::Value = serde_json::from_str(user_line).unwrap();
+		assert_eq!(parsed["message"]["fromCoordinator"], true);
+
+		let loaded = load(&dir, "sess-coord").await.unwrap();
+		match &loaded.records[0] {
+			SessionRecord::User { from_coordinator, .. } => assert!(*from_coordinator),
 			other => panic!("expected user record, got {other:?}"),
 		}
 	}
@@ -2969,6 +3033,7 @@ mod tests {
 					data_url: "data:image/png;base64,AAAA".into(),
 					mime: "image/png".into(),
 				}],
+				from_coordinator: false,
 			},
 		)
 		.await
@@ -2988,7 +3053,7 @@ mod tests {
 
 		let loaded = load(&dir, "sess-img").await.unwrap();
 		match &loaded.records[0] {
-			SessionRecord::User { text, images } => {
+			SessionRecord::User { text, images, .. } => {
 				assert_eq!(text, "look at this");
 				assert_eq!(images.len(), 1);
 				assert_eq!(images[0].data_url, "data:image/png;base64,AAAA");
@@ -3513,6 +3578,7 @@ mod tests {
 			&SessionRecord::User {
 				text: "hi".into(),
 				images: Vec::new(),
+				from_coordinator: false,
 			},
 		)
 		.await
@@ -3529,6 +3595,7 @@ mod tests {
 			&SessionRecord::User {
 				text: "do thing".into(),
 				images: Vec::new(),
+				from_coordinator: false,
 			},
 		)
 		.await
@@ -3556,6 +3623,7 @@ mod tests {
 			&SessionRecord::User {
 				text: "wire the Bridge RPC into the panel".into(),
 				images: Vec::new(),
+				from_coordinator: false,
 			},
 		)
 		.await
@@ -3568,6 +3636,7 @@ mod tests {
 			&SessionRecord::User {
 				text: "rename the folder bar".into(),
 				images: Vec::new(),
+				from_coordinator: false,
 			},
 		)
 		.await
@@ -3613,6 +3682,7 @@ mod tests {
 			&SessionRecord::User {
 				text: "hi".into(),
 				images: Vec::new(),
+				from_coordinator: false,
 			},
 		)
 		.await
@@ -3628,6 +3698,7 @@ mod tests {
 			&SessionRecord::User {
 				text: "x".into(),
 				images: Vec::new(),
+				from_coordinator: false,
 			},
 		)
 		.await
@@ -3863,6 +3934,7 @@ mod tests {
 			SessionRecord::User {
 				text: "hi".into(),
 				images: Vec::new(),
+				from_coordinator: false,
 			},
 			SessionRecord::Assistant {
 				content: None,
@@ -3893,6 +3965,7 @@ mod tests {
 			SessionRecord::User {
 				text: "go".into(),
 				images: Vec::new(),
+				from_coordinator: false,
 			},
 			SessionRecord::Assistant {
 				content: None,
@@ -3969,6 +4042,7 @@ mod tests {
 			SessionRecord::User {
 				text: "what time is it".into(),
 				images: Vec::new(),
+				from_coordinator: false,
 			},
 			SessionRecord::Assistant {
 				content: Some("I don't know".into()),
@@ -3993,6 +4067,7 @@ mod tests {
 			SessionRecord::User {
 				text: "ask me".into(),
 				images: Vec::new(),
+				from_coordinator: false,
 			},
 			SessionRecord::Assistant {
 				content: None,
@@ -4357,6 +4432,7 @@ mod tests {
 				&SessionRecord::User {
 					text: user.into(),
 					images: Vec::new(),
+					from_coordinator: false,
 				},
 			)
 			.await

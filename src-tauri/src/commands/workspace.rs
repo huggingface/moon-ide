@@ -333,8 +333,11 @@ pub async fn workspace_set_color(
 	.await??;
 
 	if Some(slug.as_str()) == state.workspace_id() {
-		if let Some(window) = app.get_webview_window("main") {
-			crate::window_icon::apply_workspace_icon(&window, &slug, next_color.as_deref());
+		// Route through the agent indicator so a repaint mid-run
+		// keeps the activity dot (and the tray icon follows the
+		// new colour too).
+		if let Some(indicator) = app.try_state::<std::sync::Arc<crate::agent_indicator::AgentIndicator>>() {
+			indicator.set_color(next_color.clone());
 		}
 	}
 	Ok(meta)

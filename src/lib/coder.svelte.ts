@@ -87,6 +87,12 @@ export type CoderRow =
 			 *  falls back to receive time for pre-timestamp
 			 *  sessions. */
 			createdAt: number;
+			/** `true` when a coordinator sent this message into one
+			 *  of its workers (`spawn_worker` seed / `steer_worker`)
+			 *  — the row header reads "Coordinator" instead of "You"
+			 *  so the orchestrator's instructions are visibly not the
+			 *  human's. */
+			fromCoordinator: boolean;
 	  }
 	| {
 			kind: 'assistant';
@@ -1859,6 +1865,26 @@ export class CoderPanelState {
 			// eslint-disable-next-line no-console
 			console.warn('coder: failed to list sessions', err);
 		}
+		// Reconcile the per-session "running" pips with the backend's
+		// authoritative set. The pips are otherwise purely
+		// event-driven (`user_message` lights them, `turn_complete`
+		// clears them), which misses turns already in flight before
+		// this webview started listening — a coordinator's workers
+		// spawned while the user was in another folder, an HMR
+		// reload, a lagged event pump. Positive-only: clearing is
+		// left to the live terminal events so a stale fetch racing
+		// an optimistic `send` can't blank a genuinely running pip.
+		try {
+			const running = await ipc.coder.runningSessions();
+			if (this.activeFolderPath !== path) {
+				return;
+			}
+			for (const id of running) {
+				this.sessionStateFor(path ?? NO_FOLDER_KEY, id).busy = true;
+			}
+		} catch {
+			// Best-effort seed; the event stream still drives the pips.
+		}
 	}
 
 	/** Open a persisted session by id. The backend emits
@@ -3184,6 +3210,7 @@ export class CoderPanelState {
 					images: event.images ?? [],
 					queued: event.queued ?? false,
 					createdAt: event.created_at_ms ?? Date.now(),
+					fromCoordinator: event.from_coordinator ?? false,
 				});
 				session.busy = true;
 				// Mirror the backend's `updated_at_ms` bump (every
@@ -3848,6 +3875,7 @@ function applyInnerEventToRows(rows: CoderRow[], event: CoderEvent): void {
 				images: event.images ?? [],
 				queued: event.queued ?? false,
 				createdAt: event.created_at_ms ?? Date.now(),
+				fromCoordinator: event.from_coordinator ?? false,
 			});
 			return;
 		case 'steer_drained': {

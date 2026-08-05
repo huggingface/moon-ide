@@ -23,6 +23,31 @@ const SIZE: u32 = 128;
 const MARGIN: f32 = 6.0;
 const CORNER_RADIUS: f32 = 22.0;
 
+/// Agent-activity overlay drawn in the icon's bottom-right corner.
+/// `Plain` is the base badge (no dot); `Running` / `Done` add an
+/// amber / green dot with a light ring so the state reads at
+/// taskbar and tray sizes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IconStatus {
+	Plain,
+	Running,
+	Done,
+}
+
+/// Dot geometry: centre + radii picked so the full ring stays
+/// inside the rounded square (corner circle centre is at
+/// `(100, 100)` with radius 22 for the current MARGIN/RADIUS).
+const DOT_CX: f32 = 94.0;
+const DOT_CY: f32 = 94.0;
+const DOT_R: f32 = 20.0;
+const DOT_RING: f32 = 6.0;
+
+/// Same light tone as the crescent so the ring reads as "cut out"
+/// of the badge rather than as a third colour.
+const RING_RGB: (u8, u8, u8) = (240, 245, 252);
+const RUNNING_RGB: (u8, u8, u8) = (255, 159, 10);
+const DONE_RGB: (u8, u8, u8) = (48, 209, 88);
+
 /// Build a 128×128 RGBA icon for `workspace_id`. The badge is a
 /// rounded square in a workspace-specific colour with a small
 /// off-centre white crescent on top — the crescent keeps a hint
@@ -37,7 +62,7 @@ const CORNER_RADIUS: f32 = 22.0;
 ///
 /// Returns row-major RGBA bytes ready to hand to `tauri::image::
 /// Image::new(&bytes, SIZE, SIZE)`.
-pub fn generate_workspace_icon(workspace_id: &str, override_color: Option<&str>) -> Vec<u8> {
+pub fn generate_workspace_icon(workspace_id: &str, override_color: Option<&str>, status: IconStatus) -> Vec<u8> {
 	let (r, g, b) = override_color
 		.and_then(parse_hex_colour)
 		.unwrap_or_else(|| workspace_colour(workspace_id));
@@ -87,7 +112,46 @@ pub fn generate_workspace_icon(workspace_id: &str, override_color: Option<&str>)
 			buf[idx + 3] = (coverage * 255.0).round().clamp(0.0, 255.0) as u8;
 		}
 	}
+	draw_status_dot(&mut buf, status);
 	buf
+}
+
+/// Composite the activity dot over the finished badge. The dot's
+/// full extent lies strictly inside the opaque part of the rounded
+/// square (see `DOT_*` docs), so plain RGB lerp against the
+/// existing pixel is correct — no alpha compositing needed. 1 px
+/// linear falloff on both circle edges stands in for AA.
+fn draw_status_dot(buf: &mut [u8], status: IconStatus) {
+	let (sr, sg, sb) = match status {
+		IconStatus::Plain => return,
+		IconStatus::Running => RUNNING_RGB,
+		IconStatus::Done => DONE_RGB,
+	};
+	let outer = DOT_R + DOT_RING;
+	let y0 = (DOT_CY - outer).floor().max(0.0) as u32;
+	let y1 = ((DOT_CY + outer).ceil() as u32).min(SIZE - 1);
+	let x0 = (DOT_CX - outer).floor().max(0.0) as u32;
+	let x1 = ((DOT_CX + outer).ceil() as u32).min(SIZE - 1);
+	for y in y0..=y1 {
+		for x in x0..=x1 {
+			let fx = x as f32 + 0.5;
+			let fy = y as f32 + 0.5;
+			let dist = (fx - DOT_CX).hypot(fy - DOT_CY);
+			let cov_outer = (outer - dist + 0.5).clamp(0.0, 1.0);
+			if cov_outer <= 0.0 {
+				continue;
+			}
+			let cov_inner = (DOT_R - dist + 0.5).clamp(0.0, 1.0);
+			let lerp = |a: u8, b: u8, t: f32| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+			let dr = lerp(RING_RGB.0, sr, cov_inner);
+			let dg = lerp(RING_RGB.1, sg, cov_inner);
+			let db = lerp(RING_RGB.2, sb, cov_inner);
+			let idx = ((y * SIZE + x) * 4) as usize;
+			buf[idx] = lerp(buf[idx], dr, cov_outer);
+			buf[idx + 1] = lerp(buf[idx + 1], dg, cov_outer);
+			buf[idx + 2] = lerp(buf[idx + 2], db, cov_outer);
+		}
+	}
 }
 
 /// Pixel dimensions of [`generate_workspace_icon`]'s output.
@@ -103,8 +167,9 @@ pub fn apply_workspace_icon<R: tauri::Runtime>(
 	window: &tauri::WebviewWindow<R>,
 	workspace_id: &str,
 	override_color: Option<&str>,
+	status: IconStatus,
 ) {
-	let rgba = generate_workspace_icon(workspace_id, override_color);
+	let rgba = generate_workspace_icon(workspace_id, override_color, status);
 	let image = tauri::image::Image::new(&rgba, ICON_SIZE, ICON_SIZE);
 	if let Err(err) = window.set_icon(image) {
 		tracing::warn!(error = %err, workspace_id = %workspace_id, "failed to set per-workspace window icon");
@@ -202,4 +267,47 @@ fn point_in_rounded_rect(x: f32, y: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: 
 	let cx = if x < x0 + r { x0 + r } else { x1 - r };
 	let cy = if y < y0 + r { y0 + r } else { y1 - r };
 	(x - cx).hypot(y - cy) <= r
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn pixel(buf: &[u8], x: u32, y: u32) -> (u8, u8, u8, u8) {
+		let idx = ((y * SIZE + x) * 4) as usize;
+		(buf[idx], buf[idx + 1], buf[idx + 2], buf[idx + 3])
+	}
+
+	#[test]
+	fn status_dot_paints_inside_the_opaque_badge() {
+		let plain = generate_workspace_icon("ws", None, IconStatus::Plain);
+		let running = generate_workspace_icon("ws", None, IconStatus::Running);
+		assert_ne!(plain, running, "running overlay must change the icon");
+
+		// Dot centre carries the status colour, fully opaque.
+		let (r, g, b, a) = pixel(&running, DOT_CX as u32, DOT_CY as u32);
+		assert_eq!((r, g, b), RUNNING_RGB);
+		assert_eq!(a, 255);
+
+		// The ring's farthest extents still sit on opaque badge
+		// pixels — the dot must never bleed into the transparent
+		// corner outside the rounded square.
+		let outer = (DOT_R + DOT_RING) as u32;
+		for (x, y) in [
+			(DOT_CX as u32 + outer, DOT_CY as u32),
+			(DOT_CX as u32, DOT_CY as u32 + outer),
+		] {
+			let (.., a) = pixel(&plain, x, y);
+			assert_eq!(a, 255, "badge must be opaque under the dot at ({x}, {y})");
+		}
+	}
+
+	#[test]
+	fn done_dot_differs_from_running() {
+		let running = generate_workspace_icon("ws", None, IconStatus::Running);
+		let done = generate_workspace_icon("ws", None, IconStatus::Done);
+		assert_ne!(running, done);
+		let idx = ((DOT_CY as u32 * SIZE + DOT_CX as u32) * 4) as usize;
+		assert_eq!((done[idx], done[idx + 1], done[idx + 2]), DONE_RGB);
+	}
 }

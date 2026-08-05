@@ -673,6 +673,15 @@ the desktop composer and the phone notify; coordinator
 traffic (`send_to`) doesn't. Viewing a worker, aborting it from the
 panel, and answering its `ask_user` card notify nobody.
 
+Because both the coordinator and the user can speak into the same
+worker session, coordinator-originated messages (`spawn_worker`'s
+seed task, `steer_worker`) carry `from_coordinator: true` on the
+`user_message` event and the persisted user record (an ignored
+`fromCoordinator` field on the pi wire), and the transcript badges
+them **coordinator** instead of **you** — on the desktop and the
+phone. Human-typed messages, sentinels, and coordinator-_bound_
+notices (feeder wakes) stay unmarked.
+
 The explicit counterpart is the session bar's **disconnect** button,
 shown only on a coordinator-spawned worker
 ([ADR 0052](decisions/0052-disconnect-worker-from-coordinator.md)):
@@ -725,6 +734,23 @@ Reopening a still-running session preserves these states: the replay
 batch's trailing `TurnComplete` terminator clears the pip, so `Replay`
 carries an `in_flight` flag and the frontend re-asserts **running** /
 **needs input** after applying the batch.
+
+The **running** pip is event-driven but reconciled against the
+backend: every sessions-list refresh also fetches
+`coder_running_sessions` (the ids with a turn in flight in the active
+folder) and asserts those pips on. Events alone miss turns that
+started before the panel was listening — a coordinator's workers
+spawned while the user was in another folder, a webview reload, a
+lagged event pump. The reconcile is positive-only; clearing stays
+with the live `turn_complete` / `aborted` / `error` events so a stale
+fetch can't blank a genuinely running pip. (The companion seeds from
+the same method.)
+
+The same running / finished signal also surfaces at the OS level —
+a status dot on the window icon, a transient tray icon, and a
+taskbar flash when a turn settles unfocused — driven by a backend
+count of live turn loops, not the frontend flags. See
+[ADR 0058](decisions/0058-agent-activity-indicator.md).
 
 ### On disk
 

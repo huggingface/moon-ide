@@ -2768,9 +2768,12 @@
 {#snippet rowMarkup(row: CoderRow, inParentTranscript: boolean)}
 	{#if row.kind === 'user'}
 		{@const parsed = parseUserPrompt(row.text)}
-		<div class="row user" class:queued={row.queued}>
+		<div class="row user" class:queued={row.queued} class:from-coordinator={row.fromCoordinator}>
 			<div class="row-label">
-				you{#if row.createdAt > 0}<time
+				{#if row.fromCoordinator}<span
+						class="coordinator-tag"
+						title="Sent by the coordinator that manages this worker, not by you">coordinator</span
+					>{:else}you{/if}{#if row.createdAt > 0}<time
 						class="row-time"
 						datetime={new Date(row.createdAt).toISOString()}
 						title={formatFullTimestamp(row.createdAt)}>{formatClock(row.createdAt)}</time
@@ -4193,6 +4196,23 @@
 		color: var(--m-fg-muted);
 		text-transform: none;
 		font-weight: 500;
+	}
+	/* Coordinator-sent message into a worker (ADR 0043 keeps the
+	   worker hooked up while the user can also message it, so the
+	   label distinguishes who is speaking). Accent pill in place
+	   of the "you" label, plus a faint accent tint on the bubble. */
+	.coordinator-tag {
+		padding: 1px 6px;
+		border-radius: 999px;
+		font-size: 9px;
+		font-weight: 600;
+		letter-spacing: 0.06em;
+		background: color-mix(in srgb, var(--m-accent) 22%, transparent);
+		color: var(--m-accent);
+	}
+	.row.user.from-coordinator .bubble {
+		background: color-mix(in srgb, var(--m-accent) 6%, transparent);
+		border-left: 2px solid color-mix(in srgb, var(--m-accent) 45%, var(--m-border));
 	}
 	.queued-go-now {
 		margin-left: 4px;

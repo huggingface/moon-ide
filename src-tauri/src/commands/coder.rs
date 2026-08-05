@@ -398,6 +398,18 @@ pub async fn coder_list_sessions(state: State<'_, AppState>) -> Result<Vec<Sessi
 	state.coder.list_sessions().await.map_err(MoonError::from)
 }
 
+/// Session ids in the active folder with a turn currently in
+/// flight. The panel reconciles its per-session "running" pips
+/// from this on every sessions-list refresh — the pips are
+/// otherwise purely event-driven, which misses turns that were
+/// already running before the panel hydrated (a coordinator's
+/// workers spawned while the user was elsewhere, a webview
+/// reload, a lagged event pump).
+#[tauri::command]
+pub async fn coder_running_sessions(state: State<'_, AppState>) -> Result<Vec<String>, MoonError> {
+	Ok(state.coder.running_sessions_in(None).await)
+}
+
 /// Search the active folder's persisted sessions for a
 /// case-insensitive substring across titles and transcript text
 /// (user prompts, assistant text/thinking, tool calls/results).

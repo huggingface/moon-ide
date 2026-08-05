@@ -204,6 +204,7 @@ pub(crate) fn queue_subagent_steer(subagent_id: &str, text: String) -> bool {
 			images: Vec::new(),
 			queued: true,
 			created_at_ms: Some(current_time_ms()),
+			from_coordinator: false,
 		},
 	));
 	true
@@ -493,6 +494,7 @@ pub(crate) async fn run_subagent(
 			images: Vec::new(),
 			queued: false,
 			created_at_ms: Some(current_time_ms()),
+			from_coordinator: false,
 		},
 	));
 
@@ -575,6 +577,7 @@ pub(crate) async fn run_subagent(
 		&SessionRecord::User {
 			text: spec.task.clone(),
 			images: Vec::new(),
+			from_coordinator: false,
 		},
 	)
 	.await;
@@ -646,6 +649,7 @@ pub(crate) async fn resume_subagent(
 			images: Vec::new(),
 			queued: false,
 			created_at_ms: Some(current_time_ms()),
+			from_coordinator: false,
 		},
 	));
 	messages.push(ChatMessage::user(follow_up.clone()));
@@ -655,6 +659,7 @@ pub(crate) async fn resume_subagent(
 		&SessionRecord::User {
 			text: follow_up,
 			images: Vec::new(),
+			from_coordinator: false,
 		},
 	)
 	.await;
@@ -853,6 +858,7 @@ async fn run_subagent_loop(
 				&SessionRecord::User {
 					text: steer.text.clone(),
 					images: Vec::new(),
+					from_coordinator: false,
 				},
 			)
 			.await;
@@ -865,6 +871,7 @@ async fn run_subagent_loop(
 					images: Vec::new(),
 					queued: false,
 					created_at_ms: Some(crate::sessions::current_time_ms()),
+					from_coordinator: false,
 				},
 			));
 		}
@@ -1054,6 +1061,7 @@ async fn run_subagent_loop(
 					&SessionRecord::User {
 						text: OUTPUT_CAP_CONTINUATION_PROMPT.to_owned(),
 						images: Vec::new(),
+						from_coordinator: false,
 					},
 				)
 				.await;
@@ -1252,6 +1260,7 @@ Do not call any more tools. Write a final response now using only what you've al
 		&SessionRecord::User {
 			text: sentinel.clone(),
 			images: Vec::new(),
+			from_coordinator: false,
 		},
 	)
 	.await;
@@ -1266,6 +1275,7 @@ Do not call any more tools. Write a final response now using only what you've al
 			images: Vec::new(),
 			queued: false,
 			created_at_ms: Some(current_time_ms()),
+			from_coordinator: false,
 		},
 	));
 
