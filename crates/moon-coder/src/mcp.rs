@@ -41,6 +41,16 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 /// bounded; a genuinely hung server shouldn't park a turn forever.
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The `@playwright/mcp` version the preset spawns. Pinned, not
+/// `@latest`: the server only launches the chromium revision its own
+/// playwright dependency expects, and moon-base pre-installs exactly
+/// that revision (`images/moon-base/Dockerfile` derives it from this
+/// same pin — keep the `PLAYWRIGHT_MCP_VERSION` ARG there in sync).
+/// `@latest` drifted a revision ahead within days of an image bake
+/// and every fresh container regressed to a 170 MB download or a
+/// hard "not installed" loop (ADR 0033).
+pub const PLAYWRIGHT_MCP_VERSION: &str = "0.0.79";
+
 /// The curated preset list. Bootstrap posture: playwright is the
 /// server the team actually asked for; further presets are added
 /// when someone needs them, not preemptively.
@@ -56,7 +66,7 @@ pub fn preset_servers() -> Vec<McpServerConfig> {
 		// every distro and not something a dev box should need.
 		args: vec![
 			"-y".into(),
-			"@playwright/mcp@latest".into(),
+			format!("@playwright/mcp@{PLAYWRIGHT_MCP_VERSION}"),
 			"--browser".into(),
 			"chromium".into(),
 			// The coder drives the browser via snapshots; a headed
@@ -71,8 +81,19 @@ pub fn preset_servers() -> Vec<McpServerConfig> {
 		// capability makes deterministic (see ADR 0033). The
 		// trade-off is a visible untracked dir in repos that don't
 		// ignore it.
+		//
+		// The screenshot guidance below exists because a session
+		// burned four tool calls hunting for a `filename` shot:
+		// playwright resolves a bare `filename` against the
+		// workspace root (not `.playwright-mcp/`), reports it as
+		// an anchorless `./name.png`, and only returns pixels
+		// inline when *it* names the file. Omitting `filename` is
+		// strictly better for the coder — no path to guess, no
+		// stray file in the repo.
 		description: "Browser automation via Playwright: navigate, click, type, take accessibility snapshots and \
-		              screenshots of real pages. Use it to exercise or debug a running web app."
+		              screenshots of real pages. Use it to exercise or debug a running web app. For screenshots, \
+		              omit `filename` — the image comes back inline; a supplied `filename` saves into the \
+		              workspace root (leaving a file you must clean up) and returns no pixels."
 			.into(),
 	}]
 }
@@ -729,6 +750,26 @@ mod tests {
 			command: "echo".into(),
 			..Default::default()
 		}
+	}
+
+	/// The moon-base image pre-installs the chromium revision the
+	/// preset's pinned `@playwright/mcp` expects; a drifted pin
+	/// regresses every fresh container to a 170 MB download or a
+	/// "not installed" loop. Parse the Dockerfile's ARG and hold
+	/// the two in lockstep.
+	#[test]
+	fn playwright_pin_matches_moon_base_dockerfile() {
+		let dockerfile = concat!(env!("CARGO_MANIFEST_DIR"), "/../../images/moon-base/Dockerfile");
+		let contents = std::fs::read_to_string(dockerfile).expect("moon-base Dockerfile readable");
+		let arg = contents
+			.lines()
+			.find_map(|line| line.trim().strip_prefix("ARG PLAYWRIGHT_MCP_VERSION="))
+			.expect("Dockerfile declares ARG PLAYWRIGHT_MCP_VERSION");
+		assert_eq!(
+			arg, PLAYWRIGHT_MCP_VERSION,
+			"images/moon-base/Dockerfile pins @playwright/mcp@{arg} but the preset spawns \
+			 @playwright/mcp@{PLAYWRIGHT_MCP_VERSION} — keep them in sync (see ADR 0033)"
+		);
 	}
 
 	#[test]

@@ -248,3 +248,34 @@ playwright@<that> install chromium`), so the pair can't drift
   npx-cache behaviour already means "latest" resolves per
   container, not per moon-ide release; a pin would add a third
   version source to reason about without stopping that.
+
+  **Superseded 2026-08-06** — `@latest` broke within five days:
+  0.0.79 shipped with a playwright expecting chromium rev 1237
+  while the image had baked 1232 from 0.0.78, and every fresh
+  container was back to the download-or-fail loop. The preset now
+  pins (`mcp.rs::PLAYWRIGHT_MCP_VERSION`), the Dockerfile derives
+  its browser install from the same pin (`ARG
+PLAYWRIGHT_MCP_VERSION`), and a unit test
+  (`playwright_pin_matches_moon_base_dockerfile`) holds the two in
+  lockstep. Bumping the server is now a one-constant change plus
+  an image rebuild — the "stale server" cost accepted above turned
+  out to be much cheaper than the weekly-breakage cost of `@latest`.
+
+## Amendment 2026-08-06 — screenshot `filename` guidance in the preset description
+
+A session burned four tool calls (one a 120 s `find /`) hunting for
+a screenshot it had just taken: `browser_take_screenshot` with a
+model-supplied `filename` saves against the workspace root — not
+`.playwright-mcp/`, where the auto-named artefacts go — reports it
+as an anchorless `./name.png`, returns no pixels inline (playwright
+only inlines images it names itself, see Amendment 2), and leaves
+an untracked file in the repo.
+
+Fixed with instructions, not mechanism: the playwright preset's
+model-facing description now says to omit `filename` (the image
+comes back inline; nothing lands in the repo). Rejected
+alternatives: rewriting relative paths in tool results (fragile
+markdown surgery, and the anchor genuinely differs per artefact
+kind); pinning `--output-dir` again (already rejected in Amendment
+3 — it would move model-named files but break the "lands exactly
+where the model asked" property for absolute paths).

@@ -550,14 +550,19 @@ the workspace has no enabled servers, and neither is mode-gated
 (same posture as `bash` — sub-agents get them too).
 
 - **Presets + customs.** One hardcoded preset: `playwright`
-  (`npx -y @playwright/mcp@latest --browser chromium --headless`
-  — pinned to Playwright's bundled Chromium so it doesn't require
-  real Google Chrome; headless because the coder drives via
-  snapshots, not a window on the dev's display). The browser's
-  system dependencies and a chromium revision (matched to the
-  MCP server's own playwright version) ship in moon-base — the
-  MCP server hard-gates launches on its own dep check, which no
+  (`npx -y @playwright/mcp@<pinned> --browser chromium --headless`
+  — version pinned in `mcp.rs::PLAYWRIGHT_MCP_VERSION`, bundled
+  Chromium so it doesn't require real Google Chrome; headless
+  because the coder drives via snapshots, not a window on the
+  dev's display). The browser's system dependencies and the
+  chromium revision that exact MCP version expects ship in
+  moon-base (a unit test keeps the two pins in sync) — the MCP
+  server hard-gates launches on its own dep check, which no
   user-space env fix can reach through `docker exec` (ADR 0033).
+  The preset's model-facing description tells the coder to omit
+  `filename` on screenshots: the image returns inline, while a
+  named file saves into the workspace root with no usable path
+  in the reply (ADR 0033, amendment 2026-08-06).
   Custom servers — label, command + args (stdio transport
   only), per-server env overrides, description — live per
   workspace on `WorkspaceSession.coder_mcp`, managed from the

@@ -388,11 +388,14 @@ RUN curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused \
 #    resolves to the `chrome-for-testing` channel alias, whose
 #    executable the registry looks up at *its* chromium revision —
 #    a browser installed by any other playwright version is
-#    invisible to it). So we ask npm for `@playwright/mcp@latest`'s
-#    playwright version and install with exactly that. The image's
-#    normal rebuild cadence keeps the pair current; a project
-#    pinning a different playwright keeps working — its revision
-#    just downloads on demand as before.
+#    invisible to it). So we ask npm for the pinned MCP version's
+#    playwright dependency and install with exactly that. The pin
+#    must match `PLAYWRIGHT_MCP_VERSION` in
+#    `crates/moon-coder/src/mcp.rs` (the preset spawns that exact
+#    version) — `@latest` drifted a chromium revision ahead within
+#    days of an image bake, silently invalidating the baked
+#    browser. A project pinning a different playwright keeps
+#    working — its revision just downloads on demand as before.
 USER root
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -420,8 +423,10 @@ RUN apt-get update \
         xvfb \
  && rm -rf /var/lib/apt/lists/*
 USER ${USERNAME}
-RUN PLAYWRIGHT_VERSION="$(npm view @playwright/mcp@latest dependencies.playwright)" \
- && echo "playwright MCP's playwright: ${PLAYWRIGHT_VERSION}" \
+# Keep in sync with PLAYWRIGHT_MCP_VERSION in crates/moon-coder/src/mcp.rs.
+ARG PLAYWRIGHT_MCP_VERSION=0.0.79
+RUN PLAYWRIGHT_VERSION="$(npm view "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" dependencies.playwright)" \
+ && echo "playwright MCP ${PLAYWRIGHT_MCP_VERSION} -> playwright ${PLAYWRIGHT_VERSION}" \
  && npx -y "playwright@${PLAYWRIGHT_VERSION}" install chromium
 
 # moon-edit — the in-container `$GIT_EDITOR` shim that forwards
