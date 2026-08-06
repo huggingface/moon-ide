@@ -53,6 +53,14 @@
 		if (workspace.focusedSide !== side) {
 			return;
 		}
+		// `focusedSide` tracks the last-focused editor pane, not where
+		// keyboard focus actually is — a Ctrl+F typed inside another
+		// region (coder panel, sidebar, terminal…) belongs to that
+		// surface's own find handling, not this preview's.
+		const host = event.target instanceof Element ? event.target.closest<HTMLElement>('[data-region]') : null;
+		if (host && host.dataset.region !== `editor-${side}`) {
+			return;
+		}
 		const ctrl = event.ctrlKey || event.metaKey;
 		if (ctrl && !event.shiftKey && !event.altKey && event.key.toLowerCase() === 'f') {
 			event.preventDefault();

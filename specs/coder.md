@@ -63,7 +63,12 @@ on first expand so a long tool-heavy session doesn't pay a
 grammar-load + highlight pass per row on initial paint (test plan
 0076). The transcript is windowed — only a slice of rows is in the
 DOM, growing on scroll-up and capped at 300 mounted rows (test plan
-0093 covers the mechanics). `Ctrl+F` only matches loaded rows.
+0093 covers the mechanics). `Ctrl+F` (with focus inside the panel)
+opens a find-in-transcript bar — CSS Custom Highlight API, same
+machinery as the markdown preview's find — that only matches loaded
+rows; Enter / Shift+Enter step through matches, Esc closes. Matches
+track the DOM, so streamed deltas and lazily mounted rows refresh
+the count without moving the user's position.
 
 Three control surfaces:
 

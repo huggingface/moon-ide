@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount, tick } from 'svelte';
+	import { onMount, tick, untrack } from 'svelte';
 	import { SvelteSet } from 'svelte/reactivity';
 	import { confirm } from '@tauri-apps/plugin-dialog';
 	import { readImage, writeText as clipboardWriteText } from '@tauri-apps/plugin-clipboard-manager';
@@ -160,6 +160,259 @@
 		};
 		window.addEventListener('keydown', onKey);
 		return () => window.removeEventListener('keydown', onKey);
+	});
+
+	// Find-in-transcript (Ctrl+F). Same approach as MarkdownView's
+	// find bar: the CSS Custom Highlight API paints matches without
+	// touching the rendered rows' DOM, so highlights never interfere
+	// with Svelte's ownership of the transcript markup. Matches only
+	// what's mounted — the transcript is windowed (spec: coder.md),
+	// so rows held out of the DOM by the render window don't match
+	// until the user loads them.
+	let panelEl = $state<HTMLDivElement | null>(null);
+	let findInputEl = $state<HTMLInputElement | null>(null);
+	let findOpen = $state(false);
+	let findQuery = $state('');
+	let findMatchIndex = $state(0);
+	let findMatchCount = $state(0);
+	const FIND_HL = 'moon-coder-find';
+	const FIND_HL_ACTIVE = 'moon-coder-find-active';
+	// Kept outside `$state` on purpose: Ranges are live DOM handles,
+	// not renderable state — prev/next only re-targets the active
+	// highlight from this list without recomputing all matches.
+	let findRanges: Range[] = [];
+
+	function highlightApiAvailable(): boolean {
+		return typeof CSS !== 'undefined' && 'highlights' in CSS && typeof Highlight !== 'undefined';
+	}
+
+	// Whichever transcript is currently rendered — the session view's
+	// or the sub-agent pop-out's. Only one exists at a time (the
+	// views are exclusive branches), so a class lookup is unambiguous.
+	function transcriptRoot(): HTMLElement | null {
+		return panelEl?.querySelector('.transcript') ?? null;
+	}
+
+	// Window-level so the shortcut works from the composer, the
+	// transcript (focusable via tabindex) and the find input itself.
+	// Gated on the event originating inside the panel (or a text
+	// selection anchored in it) so the editor's / markdown preview's
+	// own Ctrl+F handling keeps the keystroke everywhere else.
+	function onFindWindowKeydown(event: KeyboardEvent) {
+		const ctrl = event.ctrlKey || event.metaKey;
+		if (!ctrl || event.shiftKey || event.altKey || event.key.toLowerCase() !== 'f') {
+			return;
+		}
+		if (coder.view === 'list') {
+			return;
+		}
+		const target = event.target;
+		const targetInPanel = target instanceof Node && (panelEl?.contains(target) ?? false);
+		const anchor = window.getSelection()?.anchorNode ?? null;
+		const selectionInPanel = anchor !== null && (panelEl?.contains(anchor) ?? false);
+		if (!targetInPanel && !selectionInPanel) {
+			return;
+		}
+		event.preventDefault();
+		openFind();
+	}
+
+	function openFind() {
+		findOpen = true;
+		const selection = window.getSelection();
+		const selected = selection?.toString() ?? '';
+		if (selected !== '' && transcriptRoot()?.contains(selection?.anchorNode ?? null)) {
+			findQuery = selected;
+		}
+		// Wait for the input to mount, then focus + select so the
+		// user can immediately retype or hit Enter.
+		void tick().then(() => {
+			findInputEl?.focus();
+			findInputEl?.select();
+		});
+	}
+
+	function closeFind() {
+		findOpen = false;
+		findQuery = '';
+		findMatchIndex = 0;
+		findMatchCount = 0;
+		findRanges = [];
+		clearFindHighlights();
+		composer?.focus();
+	}
+
+	function clearFindHighlights() {
+		if (!highlightApiAvailable()) {
+			return;
+		}
+		CSS.highlights.delete(FIND_HL);
+		CSS.highlights.delete(FIND_HL_ACTIVE);
+	}
+
+	// Walk the transcript's text nodes and collect Ranges for every
+	// case-insensitive occurrence. Single-text-node matching only —
+	// same trade-off as MarkdownView (a query spanning an inline-tag
+	// boundary won't match; fine for transcript prose). `reset`
+	// distinguishes a fresh query (jump to the first hit) from a
+	// DOM-mutation refresh (keep the user's position, don't yank the
+	// scroll while an assistant message streams).
+	function computeFindMatches(reset: boolean) {
+		const prevIndex = findMatchIndex;
+		findRanges = [];
+		findMatchIndex = 0;
+		findMatchCount = 0;
+		clearFindHighlights();
+		const root = transcriptRoot();
+		if (root === null || findQuery === '' || !highlightApiAvailable()) {
+			return;
+		}
+		const needle = findQuery.toLowerCase();
+		const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+			acceptNode(node) {
+				if (!node.nodeValue || node.nodeValue.trim() === '') {
+					return NodeFilter.FILTER_REJECT;
+				}
+				return NodeFilter.FILTER_ACCEPT;
+			},
+		});
+		let current = walker.nextNode();
+		while (current) {
+			const text = current.nodeValue ?? '';
+			const lower = text.toLowerCase();
+			let from = 0;
+			while (from <= lower.length - needle.length) {
+				const hit = lower.indexOf(needle, from);
+				if (hit === -1) {
+					break;
+				}
+				const range = document.createRange();
+				range.setStart(current, hit);
+				range.setEnd(current, hit + needle.length);
+				findRanges.push(range);
+				from = hit + needle.length;
+			}
+			current = walker.nextNode();
+		}
+		findMatchCount = findRanges.length;
+		if (findMatchCount > 0) {
+			findMatchIndex = reset ? 1 : Math.min(Math.max(prevIndex, 1), findMatchCount);
+		}
+		paintFindHighlights();
+		if (reset) {
+			scrollToActiveFindMatch();
+		}
+	}
+
+	function paintFindHighlights() {
+		if (!highlightApiAvailable()) {
+			return;
+		}
+		if (findRanges.length === 0) {
+			clearFindHighlights();
+			return;
+		}
+		const active = findMatchIndex > 0 ? findRanges[findMatchIndex - 1] : null;
+		const rest = active ? findRanges.filter((_, i) => i !== findMatchIndex - 1) : findRanges;
+		CSS.highlights.set(FIND_HL, new Highlight(...rest));
+		if (active) {
+			CSS.highlights.set(FIND_HL_ACTIVE, new Highlight(active));
+		} else {
+			CSS.highlights.delete(FIND_HL_ACTIVE);
+		}
+	}
+
+	function scrollToActiveFindMatch() {
+		if (findMatchIndex === 0) {
+			return;
+		}
+		const range = findRanges[findMatchIndex - 1];
+		if (!range) {
+			return;
+		}
+		// Anchor the scroll on the match's parent element — `Range`
+		// has no `scrollIntoView` of its own.
+		range.startContainer.parentElement?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+	}
+
+	function stepFindMatch(delta: number) {
+		if (findMatchCount === 0) {
+			return;
+		}
+		// Wrap in both directions.
+		findMatchIndex = ((findMatchIndex - 1 + delta + findMatchCount) % findMatchCount) + 1;
+		paintFindHighlights();
+		scrollToActiveFindMatch();
+	}
+
+	function onFindInputKeydown(event: KeyboardEvent) {
+		if (event.key === 'Escape') {
+			event.preventDefault();
+			closeFind();
+			return;
+		}
+		if (event.key === 'Enter') {
+			event.preventDefault();
+			stepFindMatch(event.shiftKey ? -1 : 1);
+		}
+	}
+
+	// Live recompute on query change (and on open — `findOpen` is a
+	// dependency). One tick so a just-mounted bar sees the DOM.
+	$effect(() => {
+		void findQuery;
+		if (!findOpen) {
+			return;
+		}
+		void tick().then(() => computeFindMatches(true));
+	});
+
+	// Keep matches honest while the transcript changes under the bar
+	// (streaming deltas, window growth, lazy `visibleOnce` mounts,
+	// tool-row expansion). A MutationObserver instead of a reactive
+	// dependency on `coder.rows`: row content mutates deeply and the
+	// DOM is what we walk anyway. Debounced so a streaming reply
+	// costs one re-walk per pause, not one per delta; the refresh
+	// deliberately never scrolls.
+	$effect(() => {
+		if (!findOpen) {
+			return;
+		}
+		const root = transcriptRoot();
+		if (root === null) {
+			return;
+		}
+		let timer: number | undefined;
+		const observer = new MutationObserver(() => {
+			clearTimeout(timer);
+			timer = window.setTimeout(() => computeFindMatches(false), 150);
+		});
+		observer.observe(root, { childList: true, characterData: true, subtree: true });
+		return () => {
+			clearTimeout(timer);
+			observer.disconnect();
+		};
+	});
+
+	// A view or session swap replaces the transcript wholesale — the
+	// saved Ranges would point at detached nodes. Close rather than
+	// chase: a find is a within-this-transcript affair. `untrack`
+	// keeps `findOpen` itself out of the dependency set (otherwise
+	// opening the bar would immediately re-run this and close it).
+	$effect(() => {
+		void coder.view;
+		void coder.current.visibleSessionId;
+		void coder.viewSubagentId;
+		if (untrack(() => findOpen)) {
+			closeFind();
+		}
+	});
+
+	// Highlights are document-global; don't leak them past unmount.
+	$effect(() => {
+		return () => {
+			clearFindHighlights();
+		};
 	});
 
 	onMount(() => {
@@ -2016,7 +2269,9 @@
 	}
 </script>
 
-<div class="panel" data-region="coder">
+<svelte:window onkeydown={onFindWindowKeydown} />
+
+<div class="panel" data-region="coder" bind:this={panelEl}>
 	<header class="header">
 		<div class="title">
 			<span class="label">Coder</span>
@@ -2438,7 +2693,11 @@
 				<PlusIcon />
 			</button>
 		</header>
-		<div class="transcript" bind:this={scrollEl} onscroll={onTranscriptScroll}>
+		{@render findBar()}
+		<!-- tabindex so a click in the transcript parks focus here,
+		     keeping a follow-up Ctrl+F routed to this panel's find
+		     bar instead of falling through to another surface. -->
+		<div class="transcript" bind:this={scrollEl} onscroll={onTranscriptScroll} tabindex="-1">
 			{#if coder.rows.length === 0}
 				{#if visibleSessionSummary?.worktree_branch}
 					<p class="hint">
@@ -2671,7 +2930,8 @@
 				<span></span>
 			{/if}
 		</header>
-		<div class="transcript">
+		{@render findBar()}
+		<div class="transcript" tabindex="-1">
 			{#if transcript === null}
 				<p class="hint">Sub-agent transcript not available. Re-open the parent session to refresh.</p>
 			{:else if transcript.rows.length === 0}
@@ -2723,6 +2983,58 @@
 		<button type="button" class="lightbox-close" title="Close (Esc)" onclick={() => (lightboxUrl = null)}>×</button>
 	</div>
 {/if}
+
+<!-- Find-in-transcript bar, shared by the session view and the
+     sub-agent pop-out. Rendered in-flow between the header and the
+     transcript (the panel is narrow — a floating overlay would sit
+     on top of the very text it matches). -->
+{#snippet findBar()}
+	{#if findOpen}
+		<div class="find-bar" role="search">
+			<input
+				bind:this={findInputEl}
+				bind:value={findQuery}
+				type="text"
+				placeholder="Find in transcript"
+				aria-label="Find in transcript"
+				spellcheck="false"
+				onkeydown={onFindInputKeydown}
+			/>
+			<span class="find-count" aria-live="polite">
+				{#if findQuery === ''}
+					&nbsp;
+				{:else if findMatchCount === 0}
+					No results
+				{:else}
+					{findMatchIndex} / {findMatchCount}
+				{/if}
+			</span>
+			<button
+				type="button"
+				class="icon"
+				aria-label="Previous match"
+				title="Previous (Shift+Enter)"
+				onclick={() => stepFindMatch(-1)}
+				disabled={findMatchCount === 0}
+			>
+				&#8593;
+			</button>
+			<button
+				type="button"
+				class="icon"
+				aria-label="Next match"
+				title="Next (Enter)"
+				onclick={() => stepFindMatch(1)}
+				disabled={findMatchCount === 0}
+			>
+				&#8595;
+			</button>
+			<button type="button" class="icon find-close" aria-label="Close find" title="Close (Esc)" onclick={closeFind}>
+				&#215;
+			</button>
+		</div>
+	{/if}
+{/snippet}
 
 <!-- Row renderer extracted as a snippet so the parent's session
 	 transcript and the sub-agent pop-out can share it without
@@ -3947,6 +4259,49 @@
 		display: flex;
 		flex-direction: column;
 		gap: 12px;
+	}
+	/* Focusable only so clicks park keyboard focus here (Ctrl+F
+	   routing) — never a visible focus stop. */
+	.transcript:focus {
+		outline: none;
+	}
+	.find-bar {
+		flex-shrink: 0;
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		padding: 6px 10px;
+		border-bottom: 1px solid var(--m-border);
+		background: var(--m-bg-2);
+		font-size: 12px;
+	}
+	.find-bar input {
+		flex: 1;
+		min-width: 0;
+		padding: 3px 6px;
+		background: var(--m-bg-1);
+		color: var(--m-fg);
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		font: inherit;
+		outline: none;
+	}
+	.find-bar input:focus {
+		border-color: var(--m-accent);
+	}
+	.find-count {
+		flex-shrink: 0;
+		min-width: 58px;
+		text-align: center;
+		color: var(--m-fg-muted);
+		font-variant-numeric: tabular-nums;
+	}
+	.find-bar .icon:disabled {
+		opacity: 0.4;
+		cursor: default;
+	}
+	.find-close {
+		font-size: 15px;
 	}
 	.hint {
 		font-size: 12px;
