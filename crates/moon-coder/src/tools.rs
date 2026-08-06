@@ -686,7 +686,7 @@ const BG_MAX_TAIL_BYTES: usize = 64_000;
 
 /// Default + cap for `read_process`'s `wait_ms` parameter.
 const BG_DEFAULT_WAIT_MS: u64 = 0;
-const BG_MAX_WAIT_MS: u64 = 60_000;
+const BG_MAX_WAIT_MS: u64 = 600_000;
 
 /// Generate a host-side log file path for a background process.
 fn background_log_path(id: &str) -> PathBuf {
@@ -1090,7 +1090,7 @@ impl ToolRegistry {
 						},
 						"wait_ms": {
 							"type": "integer",
-							"description": "If > 0, block up to this many milliseconds waiting for the process to exit before returning. Capped at 60000 (60 seconds). Use this to avoid busy-polling: one `read_process(id, wait_ms=60000)` per minute is better than hundreds of instant polls. The call returns as soon as the process exits."
+							"description": "If > 0, block up to this many milliseconds waiting for the process to exit before returning. Capped at 600000 (10 minutes). Use this to avoid busy-polling: one `read_process(id, wait_ms=600000)` per ten minutes is better than hundreds of instant polls. The call returns as soon as the process exits."
 						},
 						"tail_bytes": {
 							"type": "integer",

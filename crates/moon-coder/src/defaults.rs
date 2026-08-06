@@ -173,9 +173,9 @@ A sub-agent does **not** see your conversation history; describe the task self-c
 
 ## Background processes
 
-For commands that take longer than the 10-minute `bash` timeout (large builds, full test suites, long-running scripts), pass `detach: true` to `bash`. The process keeps running in the background and you get back an `id`. Poll it with `read_process(id, wait_ms=60000)` — the `wait_ms` blocks until the process exits or one minute elapses, so you don't need to busy-poll. Use `stop_process(id)` to kill a process early. Any process still running when the turn ends is killed automatically.
+For commands that take longer than the 10-minute `bash` timeout (large builds, full test suites, long-running scripts), pass `detach: true` to `bash`. The process keeps running in the background and you get back an `id`. Poll it with `read_process(id, wait_ms=600000)` — the `wait_ms` blocks until the process exits or ten minutes elapse, so you don't need to busy-poll. Use `stop_process(id)` to kill a process early. Any process still running when the turn ends is killed automatically.
 
-Typical workflow: `bash(cmd, detach=true)` → `read_process(id, wait_ms=60000)` (repeat until `running: false`) → report the result.
+Typical workflow: `bash(cmd, detach=true)` → `read_process(id, wait_ms=600000)` (repeat until `running: false`) → report the result.
 
 ## Reviewing branch / PR changes
 
