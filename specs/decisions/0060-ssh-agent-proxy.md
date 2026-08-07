@@ -53,6 +53,17 @@ Two container-SSH failures hit in practice:
   stale when keys rotate; bind mounts track the host. (New `.pub`
   files still need a container recreate to appear — acceptable.)
 
+## Amendment (same day)
+
+The first cut unlinked-and-rebound the socket unconditionally at
+process start. With process-per-workspace (ADR 0014) that meant the
+_last started_ workspace process owned the proxy, and its exit killed
+agent forwarding for every surviving process/container. Now each
+process runs an adopt-or-takeover keeper: probe before unlink (a live
+sibling's socket is adopted, never yanked), and a periodic re-probe
+claims the path when the owner exits — the proxy lives as long as any
+IDE process does.
+
 ## Consequences
 
 - Users should point `IdentityFile` at the `.pub` (works identically

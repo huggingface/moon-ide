@@ -36,9 +36,18 @@ use tauri::{AppHandle, Manager};
 
 use crate::window_icon::{generate_workspace_icon, IconStatus, ICON_SIZE};
 
-/// Tray registration id — one per process, so a fixed string is
-/// unique within the app that owns it.
-const TRAY_ID: &str = "agent-status";
+/// Tray registration id. Must be unique **across processes**, not
+/// just within this app: on Linux the appindicator backend writes
+/// the icon pixels to a per-user shared path keyed by this id
+/// (`$XDG_RUNTIME_DIR/tray-icon/tray-icon-<id>-<counter>.png`) and
+/// unlinks the previous counter's file on every repaint — so two
+/// moon-ide processes with the same id overwrite each other's tray
+/// icons. The workspace slug disambiguates siblings; the pid covers
+/// the brief overlap while a workspace's previous owner is still
+/// tearing down.
+fn tray_id(workspace_id: &str) -> String {
+	format!("agent-status-{workspace_id}-{}", std::process::id())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
@@ -203,7 +212,7 @@ impl AgentIndicator {
 		let separator = PredefinedMenuItem::separator(&self.app)?;
 		let close_item = MenuItem::with_id(&self.app, "close", "Close window", true, None::<&str>)?;
 		let menu = Menu::with_items(&self.app, &[&focus_item, &separator, &close_item])?;
-		TrayIconBuilder::with_id(TRAY_ID)
+		TrayIconBuilder::with_id(tray_id(&self.workspace_id))
 			.icon(image)
 			.tooltip(tooltip)
 			.menu(&menu)

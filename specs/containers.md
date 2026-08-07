@@ -534,7 +534,9 @@ on Linux, the IDE's **agent proxy**
 ([ADR 0060](decisions/0060-ssh-agent-proxy.md)) — a stable socket at
 `<data>/moon-ide/ssh-agent/ssh-auth.sock` piping each connection to
 the live host agent, with its parent **directory** mounted (ADR 0026
-pattern) so host agent restarts never stale the mount. Fallback when
+pattern) so host agent restarts never stale the mount. Any of the
+concurrently-running workspace processes serves it; an
+adopt-or-takeover keeper reclaims the socket when the owner exits. Fallback when
 the proxy isn't running: `$SSH_AUTH_SOCK` bound directly, skipped
 with a warning when unset. The in-container path reuses Docker
 Desktop's convention on both platforms.
