@@ -159,6 +159,23 @@ there's no point fencing the relay's method surface (same threat
 model as the desktop — `coder.md` § Permissions). What the relay
 exposes is a scope decision, not a safety one.
 
+Two deliberate limits of the current shape, both tracked in README
+§ "Before wider release" and not built until someone shares a relay:
+
+- The scope is the **relay**, not the IDE — phone and IDE tokens are
+  relay-wide, so any paired phone can drive every enrolled IDE. A
+  shared relay needs phone tokens scoped to an allowed-IDE set
+  (default: the IDE that minted the pairing QR), enforced on every
+  routed frame.
+- The relay is **trusted**: it terminates TLS, sees plaintext
+  JSON-RPC, and nothing stops it originating commands to an enrolled
+  IDE. The release shape makes it a blind pipe: pairing mints a
+  device keypair, the phone signs every frame (nonce/counter against
+  replay), the IDE verifies against the pinned device key before
+  dispatching, and ideally the payloads are end-to-end encrypted
+  phone↔IDE — the relay's own tokens then only gate routing and
+  denial-of-service, not command authority.
+
 ## App form
 
 An **installable Svelte 5 + Vite PWA**, served by the bridge over
