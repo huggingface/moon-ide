@@ -26,7 +26,9 @@ suffixed with `: agent running` / `: agents finished` when a dot
 is up. The "Focus window" menu item (and left-click where the
 platform delivers it) now doubles as a per-workspace "bring me
 back" affordance, which is most of the point of keeping the icon
-around.
+around. The menu also carries "Close window" — the same exit path
+as closing the window (one window per process, so it exits the
+process and runs the `stop_all` teardown).
 
 ## Rejected alternatives
 

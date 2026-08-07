@@ -23,14 +23,14 @@
 //! per-window icons still flash.
 //!
 //! Linux tray caveat: appindicator-style trays deliver no
-//! left-click events, only menu activation, so the menu carries a
-//! "Focus window" item. The click handler is still installed for
-//! platforms that do deliver clicks.
+//! left-click events, only menu activation, so the menu carries
+//! "Focus window" and "Close window" items. The click handler is
+//! still installed for platforms that do deliver clicks.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tauri::menu::{Menu, MenuItem};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager};
 
@@ -200,16 +200,22 @@ impl AgentIndicator {
 
 	fn build_tray(&self, image: tauri::image::Image<'_>, tooltip: &str) -> tauri::Result<TrayIcon> {
 		let focus_item = MenuItem::with_id(&self.app, "focus", "Focus window", true, None::<&str>)?;
-		let menu = Menu::with_items(&self.app, &[&focus_item])?;
+		let separator = PredefinedMenuItem::separator(&self.app)?;
+		let close_item = MenuItem::with_id(&self.app, "close", "Close window", true, None::<&str>)?;
+		let menu = Menu::with_items(&self.app, &[&focus_item, &separator, &close_item])?;
 		TrayIconBuilder::with_id(TRAY_ID)
 			.icon(image)
 			.tooltip(tooltip)
 			.menu(&menu)
 			.show_menu_on_left_click(false)
-			.on_menu_event(|app, event| {
-				if event.id().as_ref() == "focus" {
-					crate::focus_socket::focus_main_window(app);
-				}
+			.on_menu_event(|app, event| match event.id().as_ref() {
+				"focus" => crate::focus_socket::focus_main_window(app),
+				// Same as the `window_close` command: with one
+				// window per process, closing the window means
+				// exiting — the `ExitRequested` hook runs the
+				// `stop_all` teardown.
+				"close" => app.exit(0),
+				_ => {}
 			})
 			.on_tray_icon_event(|tray, event| {
 				// Left-click focuses where the platform delivers
