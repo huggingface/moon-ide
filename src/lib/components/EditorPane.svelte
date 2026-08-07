@@ -3,6 +3,7 @@
 	import Editor from './Editor.svelte';
 	import DiffView from './DiffView.svelte';
 	import ImageView from './ImageView.svelte';
+	import VideoView from './VideoView.svelte';
 	import PdfView from './PdfView.svelte';
 	import MarkdownView from './MarkdownView.svelte';
 	import ReviewView from './ReviewView.svelte';
@@ -62,6 +63,9 @@
 		}
 		if (file.kind === 'pdf') {
 			return { path, file, kind: 'pdf' as const };
+		}
+		if (file.kind === 'video') {
+			return { path, file, kind: 'video' as const };
 		}
 		// Commit diff view: synthetic `commit://<sha>` buffer. Each
 		// commit gets its own tab; the view fetches the file list
@@ -217,6 +221,10 @@
 			     file's buffer. -->
 				{#key view.file.path}
 					<ImageView file={view.file} />
+				{/key}
+			{:else if view.file && view.kind === 'video'}
+				{#key view.file.path}
+					<VideoView file={view.file} />
 				{/key}
 			{:else if view.file && view.kind === 'commit'}
 				{#key view.file.path}

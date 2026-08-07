@@ -60,7 +60,7 @@ import { projectCompose } from './projectCompose.svelte';
 import { rightPanel } from './rightPanel.svelte';
 import { slack } from './slack.svelte';
 import { fingerprint, fingerprintEquals, type ContentFingerprint } from './util/hash';
-import { fileKindFor, type FileKind } from './util/fileKind';
+import { fileKindFor, isPreviewKind, type FileKind, type PreviewKind } from './util/fileKind';
 import { isMarkdownPath } from './util/markdown';
 import { isReviewPath, REVIEW_PATH } from './util/reviewPath';
 import { commitPath, isCommitPath, shaFromCommitPath } from './util/commitPath';
@@ -1943,10 +1943,7 @@ class WorkspaceState {
 					for (const path of unique) {
 						try {
 							const kind = fileKindFor(path);
-							const file =
-								kind === 'image' || kind === 'pdf'
-									? await this.loadPreviewFile(path, kind)
-									: await this.loadTextFile(path);
+							const file = isPreviewKind(kind) ? await this.loadPreviewFile(path, kind) : await this.loadTextFile(path);
 							if (file) {
 								loaded.push(file);
 							}
@@ -3559,12 +3556,12 @@ class WorkspaceState {
 		// this way means no buffer is blamed twice in one pass.
 		const gitStateMoved = changedSubset !== null && subsetTouchesGitState(changedSubset);
 		for (const file of this.openFiles) {
-			// Image / PDF previews carry no text, so the reload path
+			// Binary previews carry no text, so the reload path
 			// below can't see them. Bounce their byte source instead:
 			// only when the watcher named this exact file — the null-
 			// subset full sweep is for git-state moves (branch switch,
 			// commit) and binary rows aren't tracked there anyway.
-			if (file.kind === 'image' || file.kind === 'pdf') {
+			if (isPreviewKind(file.kind)) {
 				if (changedSubset !== null && changedSubset.has(file.path)) {
 					void this.refreshPreviewFile(file.path);
 				}
@@ -4745,8 +4742,7 @@ class WorkspaceState {
 		if (!existing) {
 			const kind = fileKindFor(path);
 			try {
-				const next =
-					kind === 'image' || kind === 'pdf' ? await this.loadPreviewFile(path, kind) : await this.loadTextFile(path);
+				const next = isPreviewKind(kind) ? await this.loadPreviewFile(path, kind) : await this.loadTextFile(path);
 				if (!next) {
 					return;
 				}
@@ -4831,7 +4827,7 @@ class WorkspaceState {
 			// container-only path (an agent's screenshot under
 			// `/tmp`, say).
 			const kind = fileKindFor(absolutePath);
-			if (kind === 'image' || kind === 'pdf') {
+			if (isPreviewKind(kind)) {
 				const external = await this.loadExternalPreviewFile(absolutePath, kind);
 				if (!external) {
 					return;
@@ -5046,10 +5042,12 @@ class WorkspaceState {
 	}
 
 	// Builds a read-only preview buffer for a binary file the webview can
-	// render directly from disk via the Tauri asset protocol (images, PDFs).
+	// render directly from disk via the Tauri asset protocol (images,
+	// PDFs, videos — the asset protocol answers Range requests, so
+	// `<video>` seeking works without buffering the whole file).
 	// The bytes never flow through `text`; the view component reads
 	// `previewUrl`.
-	private async loadPreviewFile(path: string, kind: 'image' | 'pdf'): Promise<OpenFile> {
+	private async loadPreviewFile(path: string, kind: PreviewKind): Promise<OpenFile> {
 		const absolute = await ipc.fs.absolutePath(path);
 		return {
 			path,
@@ -5068,7 +5066,7 @@ class WorkspaceState {
 		};
 	}
 
-	// Same read-only preview buffer for an image / PDF **outside**
+	// Same read-only preview buffer for a binary preview **outside**
 	// every bound folder. The asset protocol can't serve these (it
 	// resolves against the workspace root, and it only ever reads
 	// the host filesystem), so the bytes arrive inline as a `data:`
@@ -5076,7 +5074,7 @@ class WorkspaceState {
 	// and falls back to the workspace container for a path that
 	// only exists in there. `null` on failure, with the reason
 	// flashed.
-	private async loadExternalPreviewFile(absolutePath: string, kind: 'image' | 'pdf'): Promise<OpenFile | null> {
+	private async loadExternalPreviewFile(absolutePath: string, kind: PreviewKind): Promise<OpenFile | null> {
 		let dataUrl: string;
 		try {
 			dataUrl = await ipc.fs.readPreviewHost(absolutePath);
@@ -5102,20 +5100,20 @@ class WorkspaceState {
 	}
 
 	/**
-	 * Re-pull the bytes behind an open image / PDF buffer after the
+	 * Re-pull the bytes behind an open binary preview buffer after the
 	 * fs-watcher observed the file change. Preview buffers have no
 	 * dirty state (read-only), so unlike `reloadOpenFileFromDisk`
 	 * there's nothing to protect — always re-resolve. The webview
 	 * caches `asset:` responses per URL, so a changed file needs a
 	 * changed URL: `previewToken` rides as a dummy query param and
-	 * re-keys the view components (`ImageView` / `PdfView`), which
+	 * re-keys the view components (`ImageView` / `PdfView` / `VideoView`), which
 	 * rebuild their render against the fresh bytes. On error (file
 	 * deleted mid-preview, container down) we keep showing the stale
 	 * render — a toast per watched binary write would be noise.
 	 */
 	private async refreshPreviewFile(path: string) {
 		const current = this.openFiles.find((f) => f.path === path);
-		if (!current || (current.kind !== 'image' && current.kind !== 'pdf')) {
+		if (!current || !isPreviewKind(current.kind)) {
 			return;
 		}
 		const token = current.previewToken + 1;
@@ -6629,8 +6627,8 @@ class WorkspaceState {
 			this.flash('Open a folder before saving.');
 			return;
 		}
-		if (file.kind === 'image' || file.kind === 'pdf') {
-			// Image / PDF buffers are read-only previews; "Save As" would
+		if (isPreviewKind(file.kind)) {
+			// Binary preview buffers are read-only; "Save As" would
 			// need us to copy bytes through the host, which nobody has
 			// asked for yet. Refuse loudly rather than half-implement.
 			this.flash(`Save As is not supported for ${file.kind} files.`);

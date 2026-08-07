@@ -140,9 +140,9 @@ pub async fn fs_read_preview_host(state: State<'_, AppState>, path: String) -> R
 }
 
 /// Extension → MIME for the types the preview views render. Mirrors
-/// `src/lib/util/fileKind.ts`'s `IMAGE_EXTS` (plus `pdf`) — keep the
-/// two in step, or the frontend will route a file here that we then
-/// refuse.
+/// `src/lib/util/fileKind.ts`'s `IMAGE_EXTS` / `VIDEO_EXTS` (plus
+/// `pdf`) — keep the two in step, or the frontend will route a file
+/// here that we then refuse.
 fn preview_mime(path: &Utf8Path) -> Option<&'static str> {
 	let ext = path.extension()?.to_ascii_lowercase();
 	Some(match ext.as_str() {
@@ -155,6 +155,9 @@ fn preview_mime(path: &Utf8Path) -> Option<&'static str> {
 		"ico" => "image/x-icon",
 		"avif" => "image/avif",
 		"pdf" => "application/pdf",
+		"mp4" | "m4v" => "video/mp4",
+		"webm" => "video/webm",
+		"mov" => "video/quicktime",
 		_ => return None,
 	})
 }
@@ -675,6 +678,10 @@ mod tests {
 			("a.ico", "image/x-icon"),
 			("a.avif", "image/avif"),
 			("a.pdf", "application/pdf"),
+			("a.mp4", "video/mp4"),
+			("a.m4v", "video/mp4"),
+			("a.webm", "video/webm"),
+			("a.mov", "video/quicktime"),
 		] {
 			assert_eq!(
 				preview_mime(Utf8Path::new(name)),
@@ -688,7 +695,7 @@ mod tests {
 	fn preview_mime_is_case_insensitive_and_rejects_other_types() {
 		assert_eq!(preview_mime(Utf8Path::new("/tmp/Shot.PNG")), Some("image/png"));
 		assert_eq!(preview_mime(Utf8Path::new("a.rs")), None);
-		assert_eq!(preview_mime(Utf8Path::new("a.mp4")), None);
+		assert_eq!(preview_mime(Utf8Path::new("a.mkv")), None);
 		assert_eq!(preview_mime(Utf8Path::new("noext")), None);
 	}
 }
