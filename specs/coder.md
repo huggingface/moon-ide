@@ -1113,6 +1113,13 @@ Pasting images into the composer attaches them as thumbnail chips
 (`skip_serializing_if` empty, so old transcripts keep their shape)
 and replayed as clickable thumbnails.
 
+Video is deliberately unsupported: there is no portable wire format
+(Anthropic has no video block; the HF router chat-completion schema
+defines only `text` and `image_url` parts; `video_url` is a
+non-standard vendor extension). If a real need surfaces, the viable
+path is client-side frame extraction into ordinary image attachments,
+which the existing pipeline and byte budget already handle.
+
 ### Image byte budget
 
 Vision input is billed per tile, so images are cheap in tokens and
