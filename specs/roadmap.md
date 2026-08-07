@@ -188,3 +188,11 @@ The bridge can run remotely (a relay box on the VPN, a small always-on machine) 
 Architectural spec: [companion.md](companion.md) § "Remote / relay mode". Sub-phase work breakdown: [roadmaps/phase-14-remote-bridge.md](roadmaps/phase-14-remote-bridge.md). Decision: [ADR 0031 — remote / relay bridge topology](decisions/0031-remote-bridge-relay.md).
 
 **Acceptance** (per sub-phase): enrollment credential core + `enroll-code` CLI (14.0); bridge accepts enrolled IDEs over WSS + enrolled-IDEs management surface (14.1); relay routes `call`/`subscribe` to enrolled IDEs (14.2); IDE-side outbound WS client + enrollment UI (14.3); PWA grouped workspace switcher (14.4). Deferred (headless `moon-core` / moving the loop off the laptop, auto-forwarding IDE ports, mTLS, public-internet exposure) — see [`companion.md` § "What remote mode deliberately doesn't do"](companion.md#what-remote-mode-deliberately-doesnt-do).
+
+## Phase 15 — Headless enrolled IDE
+
+A remote dev box serves its workspaces to the phone with no desktop session: `moon-remote` is an enrolled IDE without a webview. The companion RPC dispatcher and the outbound relay client move from `src-tauri` into `crates/moon-remote`'s lib (one implementation, desktop links it); the binary adds `login` (HF device flow), `enroll`, `workspace-add`, and `serve --workspace <slug>`. The coder loop stays co-located with the filesystem; the relay still only relays.
+
+Architectural spec: [companion.md](companion.md) § "Headless enrolled IDE". Sub-phase work breakdown: [roadmaps/phase-15-headless-ide.md](roadmaps/phase-15-headless-ide.md). Decision: [ADR 0059 — headless enrolled IDE](decisions/0059-headless-enrolled-ide.md).
+
+**Acceptance**: shared lib extraction with desktop rewired (15.1); headless binary — login / enroll / workspace-add / serve with single-instance lock and phone-driven workspace launch (15.2); bridge stamps relayed events with their `(ide, workspace)` carrier and the phone filters (15.3). Deferred (local `moon-bridge` service from the headless socket, live `Register` refresh, containerised dev shells headless) — see the phase doc.

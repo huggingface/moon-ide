@@ -555,8 +555,16 @@ pub fn run() {
 			// Now that the coder + registry exist, spawn the focus
 			// listener with a bridge-RPC handler bound to them. See
 			// `crate::bridge_rpc` (Phase 13, mobile companion).
-			let bridge_rpc: std::sync::Arc<dyn focus_socket::BridgeRpcHandler> = std::sync::Arc::new(
-				bridge_rpc::BridgeRpc::new(coder.clone(), workspace_registry.clone(), app.handle().clone()),
+			let bridge_rpc: std::sync::Arc<dyn focus_socket::BridgeRpcHandler> = bridge_rpc::new_handler(
+				coder.clone(),
+				workspace_registry.clone(),
+				app.handle().clone(),
+				config_dir.clone(),
+				workspaces_dir.clone(),
+				match &mode {
+					AppMode::Workspace { .. } => Some(workspace_id.clone()),
+					_ => None,
+				},
 			);
 			// Manage the bridge_rpc in Tauri state so the remote-bridge
 			// client (Phase 14.3) can reach it via `companion_enroll` —

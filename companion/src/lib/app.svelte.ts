@@ -240,7 +240,11 @@ type HistoryWindow = {
 // per kind, rather than a closed union that would choke on unknown
 // variants.
 type RawEvent = { kind?: string; [key: string]: unknown };
-type CoderEventEnvelope = { folder?: string; session_id?: string; event?: RawEvent };
+/** `ide` / `workspace` are the carrier tags the bridge stamps onto
+ * relayed envelopes (empty `ide` = local carrier). Absent on frames
+ * from an older bridge and on locally-synthesised replay envelopes —
+ * both mean "don't filter". */
+type CoderEventEnvelope = { folder?: string; session_id?: string; event?: RawEvent; ide?: string; workspace?: string };
 
 function str(ev: RawEvent, key: string): string {
 	const v = ev[key];
@@ -1344,6 +1348,18 @@ class CompanionState {
 		const ev = envelope.event;
 		if (!ev) {
 			return;
+		}
+		// Cross-carrier filter: subscriptions accumulate for the
+		// socket's lifetime (previously-visited workspaces keep
+		// streaming), and folder paths / workspace slugs collide
+		// across hosts — so events tagged for a different IDE or
+		// workspace than the one the phone is looking at must not
+		// touch pips, attention dots or the transcript. Untagged
+		// envelopes (older bridge, local replay reduction) pass.
+		if (typeof envelope.ide === 'string' && this.activeWorkspace !== null) {
+			if (envelope.ide !== this.activeIde || envelope.workspace !== this.activeWorkspace) {
+				return;
+			}
 		}
 
 		// --- Per-session busy tracking (for the session list's

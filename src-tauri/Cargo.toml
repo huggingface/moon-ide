@@ -19,6 +19,7 @@ moon-coder = { workspace = true }
 moon-container = { workspace = true }
 moon-core = { workspace = true }
 moon-protocol = { workspace = true }
+moon-remote = { workspace = true }
 moon-slack = { workspace = true }
 moon-terminal = { workspace = true }
 

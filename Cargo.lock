@@ -3298,6 +3298,7 @@ dependencies = [
  "moon-container",
  "moon-core",
  "moon-protocol",
+ "moon-remote",
  "moon-slack",
  "moon-terminal",
  "notify",
@@ -3338,12 +3339,24 @@ name = "moon-remote"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "camino",
  "clap",
+ "dirs",
+ "futures-util",
+ "hostname",
+ "keyring",
+ "moon-coder",
  "moon-core",
  "moon-protocol",
+ "moon-terminal",
+ "serde",
+ "serde_json",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

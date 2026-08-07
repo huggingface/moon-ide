@@ -971,64 +971,32 @@ pub async fn coder_get_model_settings(state: State<'_, AppState>) -> Result<Code
 	get_model_settings_impl(&state).await
 }
 
-/// Body of [`coder_get_model_settings`], shared with the bridge RPC
-/// surface (`crate::bridge_rpc`) so the companion's provider screen
-/// reads the exact same shape the desktop picker does.
+/// The shared settings context for this process (dirs + workspace
+/// id). The bodies of the settings commands moved to
+/// `moon_remote::settings` so the headless binary serves the exact
+/// same behaviour; these helpers adapt `AppState` to it.
+fn settings_context(state: &AppState) -> moon_remote::settings::SettingsContext {
+	moon_remote::settings::SettingsContext {
+		config_dir: state.config_dir.clone(),
+		workspaces_dir: state.workspaces_dir.clone(),
+		workspace_id: state.workspace_id().map(str::to_owned),
+	}
+}
+
+/// Body of [`coder_get_model_settings`] — see `moon_remote::settings`.
 pub(crate) async fn get_model_settings_impl(state: &AppState) -> Result<CoderModelSettings, MoonError> {
-	let models = state.coder.current_models().await;
-	let provider_lock = workspace_provider_lock(state).await;
-	// Resolve before the fields move out of `models` below.
-	let resolved_standard_model = models.standard().to_owned();
-	Ok(CoderModelSettings {
-		standard_model: models.standard,
-		cheap_model: models.cheap,
-		bill_to: models.bill_to.unwrap_or_default(),
-		active_provider: models.active_provider,
-		providers: models.providers,
-		// Clone out of the `Arc<HashMap>`: the picker mutates
-		// the map locally and round-trips it back in
-		// `coder_set_model_settings`; sharing the `Arc` would
-		// risk a write through a stale clone.
-		context_window_overrides: (*models.context_window_overrides).clone(),
-		provider_lock,
-		resolved_standard_model,
-	})
+	moon_remote::settings::get_model_settings(&state.coder, &settings_context(state)).await
 }
 
-/// Read the per-workspace provider lock from `session.json` for
-/// the workspace this process owns. `None` for processes that
-/// haven't bound a workspace (preboot mode), and `None` on any
-/// I/O / parse failure (logged inside `core_session::load`). A
-/// missing file is normal — first launch never wrote one.
+/// Read the per-workspace provider lock (see `moon_remote::settings`).
 async fn workspace_provider_lock(state: &AppState) -> Option<CoderProviderLock> {
-	let id = state.workspace_id()?;
-	match core_session::load(&state.workspaces_dir, id).await {
-		Ok(session) => session.coder_provider_lock,
-		Err(err) => {
-			tracing::warn!(error = %err, "could not load session for provider-lock read");
-			None
-		}
-	}
+	moon_remote::settings::workspace_provider_lock(&settings_context(state)).await
 }
 
-/// Apply `lock` to this workspace's `session.json`. `Some(_)`
-/// replaces the existing lock; `None` clears it. No-ops in
-/// preboot mode (no workspace bound to the process). Updates the
-/// lock field in place; every other field on the session is
-/// preserved by load-then-save round-trip so we don't clobber
-/// folders / tabs / SCM filters that the frontend's
-/// `session_save` flow keeps current.
+/// Apply `lock` to this workspace's `session.json` (see
+/// `moon_remote::settings`).
 async fn write_workspace_provider_lock(state: &AppState, lock: Option<CoderProviderLock>) -> Result<(), MoonError> {
-	let Some(id) = state.workspace_id() else {
-		return Ok(());
-	};
-	let id = id.to_owned();
-	let mut session = core_session::load(&state.workspaces_dir, &id).await?;
-	if session.coder_provider_lock == lock {
-		return Ok(());
-	}
-	session.coder_provider_lock = lock;
-	core_session::save(&state.workspaces_dir, &id, &session).await
+	moon_remote::settings::write_workspace_provider_lock(&settings_context(state), lock).await
 }
 
 /// Persist + apply the new picker settings. Writes through
@@ -1066,74 +1034,7 @@ pub async fn coder_set_model_settings(
 /// picker (runner poke, per-workspace lock in `session.json`, global
 /// default in `state.json`).
 pub(crate) async fn set_model_settings_impl(state: &AppState, settings: CoderModelSettings) -> Result<(), MoonError> {
-	let bill_to = if settings.bill_to.is_empty() {
-		None
-	} else {
-		Some(settings.bill_to.clone())
-	};
-	let providers_for_runner = settings.providers.clone();
-	let active_for_runner = settings.active_provider.clone();
-	let overrides_for_runner = settings.context_window_overrides.clone();
-	let provider_lock = settings.provider_lock.clone();
-	state
-		.coder
-		.set_user_picks(settings.standard_model.clone(), settings.cheap_model.clone(), bill_to)
-		.await;
-	// Runner always gets the effective active provider (lock if
-	// pinned, else the global). The picker pre-resolved this onto
-	// `settings.active_provider`, so we forward verbatim.
-	state.coder.set_providers(providers_for_runner, active_for_runner).await;
-	state.coder.set_context_window_overrides(overrides_for_runner).await;
-
-	// Persist the per-workspace lock first. If this fails we
-	// haven't yet touched the global `state.json`, so the user
-	// retries against an unchanged baseline. (Reverse order
-	// would mean a transient session-write failure silently
-	// promoted a workspace pin to the global default.)
-	write_workspace_provider_lock(state, provider_lock.clone()).await?;
-
-	let lock_active_provider = match &provider_lock {
-		Some(CoderProviderLock::Hf) => Some(None),
-		Some(CoderProviderLock::User { id }) => Some(Some(id.clone())),
-		None => None,
-	};
-	app_state_store::mutate(&state.config_dir, move |s| {
-		s.coder.standard_model = settings.standard_model;
-		s.coder.cheap_model = settings.cheap_model;
-		s.coder.bill_to = settings.bill_to;
-		// Only the unlocked path writes back to the global
-		// active provider — locked saves keep the global frozen
-		// so other workspaces aren't dragged along. The runner
-		// already got the locked value through `set_providers`
-		// above; persistence here is purely about the next
-		// boot's global default for unlocked workspaces.
-		if lock_active_provider.is_none() {
-			s.coder.active_provider = settings.active_provider;
-		}
-		// Strip `has_api_key` before persisting — it's keyring-derived,
-		// not state, and surviving it on disk would let a hand-edited
-		// `state.json` claim a key is configured when the keyring is
-		// empty.
-		s.coder.providers = settings
-			.providers
-			.into_iter()
-			.map(|mut p| {
-				p.has_api_key = false;
-				p
-			})
-			.collect();
-		// Drop `0`-valued entries on persist: they're already
-		// treated as "no cap" at the runtime boundary, but
-		// keeping them on disk would litter `state.json` with
-		// inert rows after every `Clear` gesture.
-		s.coder.context_window_overrides = settings
-			.context_window_overrides
-			.into_iter()
-			.filter(|(_, v)| *v > 0)
-			.collect();
-	})
-	.await?;
-	Ok(())
+	moon_remote::settings::set_model_settings(&state.coder, &settings_context(state), settings).await
 }
 
 /// Fetch the HF router's `/v1/models` catalog for the picker's

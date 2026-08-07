@@ -276,6 +276,13 @@ struct PendingForward {
 	/// coder can be quiet for hours between events. Unused for
 	/// unary calls (they're removed on the first reply).
 	started: bool,
+	/// For streams: the `(ide, workspace)` carrier the stream was
+	/// opened against, stamped onto every relayed event envelope so
+	/// a phone holding several subscriptions can attribute each
+	/// event (the envelope itself only carries `folder` +
+	/// `session_id`, which collide across hosts). `None` for unary
+	/// calls — results don't need tagging.
+	origin: Option<(String, String)>,
 }
 
 /// A currently-connected enrolled IDE workspace process (Phase 14).
@@ -887,6 +894,10 @@ async fn handle_message(
 				// Mark the stream live so the startup timeout
 				// doesn't reap it (see `handle_subscribe`).
 				entry.started = true;
+				let event = match &entry.origin {
+					Some((ide, workspace)) => tag_event(event, ide, workspace),
+					None => event,
+				};
 				let _ = entry.phone_sink.try_send(ServerMessage::Event { event });
 			}
 		}
@@ -895,6 +906,20 @@ async fn handle_message(
 			pending.remove(&id);
 		}
 	}
+}
+
+/// Stamp the originating carrier onto a relayed event envelope so a
+/// phone holding subscriptions to several workspaces/IDEs can
+/// attribute each event — the `CoderEventEnvelope` itself only
+/// carries `folder` + `session_id`, and folder paths collide across
+/// hosts. `ide` is empty for local-carrier workspaces, matching the
+/// switcher's carrier ids. Non-object payloads pass through.
+fn tag_event(mut event: serde_json::Value, ide: &str, workspace: &str) -> serde_json::Value {
+	if let Some(obj) = event.as_object_mut() {
+		obj.insert("ide".into(), serde_json::Value::String(ide.to_owned()));
+		obj.insert("workspace".into(), serde_json::Value::String(workspace.to_owned()));
+	}
+	event
 }
 
 /// Start streaming `coder_events` from `workspace` to the phone.
@@ -918,8 +943,15 @@ async fn handle_subscribe(
 		// Local-carrier: subscribe over the Unix socket (unchanged).
 		let socket = crate::discovery::socket_path(&ctx.workspaces_dir, workspace);
 		let out = out.clone();
+		let workspace_owned = workspace.to_owned();
 		tokio::spawn(async move {
-			let forward = |event: serde_json::Value| -> bool { out.try_send(ServerMessage::Event { event }).is_ok() };
+			let forward = |event: serde_json::Value| -> bool {
+				out
+					.try_send(ServerMessage::Event {
+						event: tag_event(event, "", &workspace_owned),
+					})
+					.is_ok()
+			};
 			if let Err(err) = crate::relay::subscribe(&socket, "coder_events", forward).await {
 				let _ = out
 					.send(ServerMessage::Error {
@@ -959,6 +991,7 @@ async fn handle_subscribe(
 				phone_sink: out.clone(),
 				conn_id,
 				started: false,
+				origin: Some((ide.to_owned(), workspace.to_owned())),
 			},
 		);
 	}
@@ -1395,6 +1428,7 @@ async fn handle_call(
 				phone_sink: out.clone(),
 				conn_id,
 				started: false,
+				origin: None,
 			},
 		);
 	}

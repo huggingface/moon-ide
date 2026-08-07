@@ -484,15 +484,29 @@ new IDE code is the persistent WS client + the enrollment UI.
   relay on a public VPS behind an nginx TLS front, accepted because the
   token boundary (not the network) was always the load-bearing control.
 
+## Headless enrolled IDE (`moon-remote serve`)
+
+Shipped ([ADR 0059](decisions/0059-headless-enrolled-ide.md)): a
+remote dev box can serve its workspaces to the phone with no desktop
+session. `moon-remote` is an enrolled IDE without a webview — same
+relay protocol, same keyring/enrollment semantics, same companion RPC
+dispatcher (the desktop and the headless binary now share one
+implementation in `crates/moon-remote`'s lib). Setup on the box:
+`moon-remote login` (HF device flow) → `enroll --bridge --code` →
+`workspace-add --name --folder` → `serve --workspace <slug>`. Needs a
+Secret Service for the keyring (ADR 0035's `dbus-run-session` +
+`gnome-keyring-daemon` recipe). The phone sees the box as another IDE
+group in its switcher; relayed event envelopes carry `(ide,
+workspace)` carrier tags so multi-IDE fan-in can't cross-light pips.
+
 ## Cloud / always-on future
 
-The _next_ shape after relay mode — "I want to kick off work, close the
-laptop, and keep going from the phone" — would move the coder loop
-itself off the laptop: a cloud dev machine runs **headless `moon-core`**,
-and both the laptop UI and the phone are _attaching clients_ over the
-same JSON-RPC surface. Same schema, same channel framing; very likely
-the same daemon. `moon-bridge` and `moon-remote` would converge on one
-"headless core serving JSON-RPC over a channel" shape and may merge.
+The _next_ shape — "the loop survives with **no** IDE process at all,
+attachable from anywhere" — would make the headless core a standing
+daemon both the laptop UI and the phone attach to over the same
+JSON-RPC surface. `moon-remote serve` covers most of the practical
+ask (an always-on box runs the loop; phones drive it), but it is
+still one process per workspace whose in-flight turns die with it.
 
 This is **not** the relay-hub mode above. Relay hub (Phase 14) keeps the
 loop on the IDE and only forwards bytes; headless core moves the loop

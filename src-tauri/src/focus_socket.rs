@@ -402,29 +402,11 @@ async fn handle_connection(
 	}
 }
 
-/// Handler the focus listener calls for an `R` (RPC) request. The
-/// `src-tauri` side implements this against the coder + workspace
-/// registry; the focus-socket module stays decoupled from those
-/// types by going through this trait. Phase 13 (mobile companion).
-#[async_trait::async_trait]
-pub trait BridgeRpcHandler: Send + Sync {
-	/// Dispatch one method call. Returns the result JSON or an error
-	/// message; the listener wraps either into an
-	/// [`moon_protocol::focus_socket::RpcResponse`].
-	async fn dispatch(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String>;
-
-	/// Subscribe to an event stream for a `Subscribe` request. Returns
-	/// a receiver of JSON event payloads the listener forwards
-	/// one-per-line until the client disconnects, or an error string
-	/// if the method isn't a known stream. Implemented against the
-	/// coder's broadcast channel in `src-tauri`; the protocol crate
-	/// stays decoupled by trafficking in `serde_json::Value`.
-	async fn subscribe(
-		&self,
-		method: &str,
-		params: serde_json::Value,
-	) -> Result<tokio::sync::mpsc::Receiver<serde_json::Value>, String>;
-}
+/// Handler the focus listener calls for `R` (RPC) / `S` (subscribe)
+/// requests. Defined in `moon-remote` (shared with the relay client
+/// and the headless binary); re-exported so existing
+/// `focus_socket::BridgeRpcHandler` paths keep working.
+pub use moon_remote::rpc::BridgeRpcHandler;
 
 async fn handle_rpc_request(mut stream: UnixStream, rpc: Arc<dyn BridgeRpcHandler>, json: String) {
 	let request: moon_protocol::focus_socket::RpcRequest = match serde_json::from_str(&json) {
