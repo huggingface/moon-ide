@@ -1370,6 +1370,22 @@ async fn restore_session(
 						tracing::warn!(path = %path, parent = %parent_path, "skipping orphan worktree folder (parent not restored)");
 						continue;
 					}
+					// A checkout removed while the IDE was closed
+					// (`git worktree remove` in a terminal) would
+					// re-bind as a dead row the user can only
+					// dismiss by hand — skip it and forget the
+					// stale git metadata, which would otherwise
+					// refuse a later `git worktree add` at the same
+					// deterministic path (ADR 0063).
+					if !path.is_dir() {
+						tracing::warn!(path = %path, "skipping worktree folder whose checkout is gone from disk");
+						if let Some(parent) = state.workspaces.folder_for_path(parent_path).await {
+							if let Err(err) = parent.host.git_worktree_forget(&path).await {
+								tracing::warn!(error = %err, path = %path, "git worktree prune failed for a vanished checkout");
+							}
+						}
+						continue;
+					}
 					state
 						.workspaces
 						.add_worktree_folder(path.clone(), parent_path.clone(), branch.clone())

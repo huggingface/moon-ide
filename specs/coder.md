@@ -675,13 +675,18 @@ the one global cancel.
 A direct user message into a coordinator-spawned worker **notifies the
 coordinator and nothing more**
 ([ADR 0043](decisions/0043-user-message-notifies-coordinator.md)): the
-coordinator's session receives a dispatch notice naming the worker and
-quoting the message (truncated to 200 characters), on every such
-message. Nothing else changes: the worker stays hooked up, dispatch
-packets keep flowing, and every control tool keeps working on it. Both
-the desktop composer and the phone notify; coordinator
-traffic (`send_to`) doesn't. Viewing a worker, aborting it from the
-panel, and answering its `ask_user` card notify nobody.
+coordinator's session receives a notice naming the worker and quoting
+the message (truncated to 200 characters), on every such message. The
+notice **parks in the coordinator's steer queue and never wakes it**
+([ADR 0062](decisions/0062-parked-coordinator-notices.md)) — a running
+turn drains it at the next iteration boundary; an idle coordinator
+holds it (a queued row, with "go now" as the manual wake) until its
+next turn, typically the worker's own `TurnComplete` dispatch packet.
+Nothing else changes: the worker stays hooked up, dispatch packets
+keep flowing, and every control tool keeps working on it. Both the
+desktop composer and the phone notify; coordinator traffic (`send_to`)
+doesn't. Viewing a worker, aborting it from the panel, and answering
+its `ask_user` card notify nobody.
 
 Because both the coordinator and the user can speak into the same
 worker session, coordinator-originated messages (`spawn_worker`'s
@@ -1693,6 +1698,16 @@ A coordinator cleans up after its own workers with
 `discard_worker_worktree`, which does the same thing plus clears the
 worktree routing on the worker's session; it refuses a running worker
 and a dirty worktree (without `force`), and keeps the branch.
+
+Staleness is also **reconciled without a click**
+([ADR 0063](decisions/0063-stale-worktree-reconciliation.md)): at the
+end of every coder turn, a bound worktree folder whose checkout is
+gone from disk is forgotten, unbound, and announced via
+`WorkspaceFoldersChanged` — so a `git worktree remove` run through
+`bash` drops out of the project bar when the turn ends. Startup
+restore skips (and forgets) a persisted worktree folder whose
+checkout vanished while the IDE was closed, instead of re-binding a
+dead row.
 
 #### The worktree button is context-aware
 

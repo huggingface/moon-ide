@@ -650,7 +650,10 @@ struct Session {
 	/// the **last** record on disk.
 	todos: Vec<crate::TodoItem>,
 	/// User messages typed into the composer while a turn is
-	/// already running. The runner drains them into `messages`
+	/// already running — plus, on a coordinator session, parked
+	/// user-message notices ([`park_coordinator_notice`], ADR 0062),
+	/// which may be queued while the session is idle and wait here
+	/// for its next turn. The runner drains them into `messages`
 	/// (and persists each as a `SessionRecord::User`) at the top
 	/// of every `run_turn` iteration — i.e. after the previous
 	/// iteration's tool results have settled, before the next LLM
@@ -3878,6 +3881,31 @@ impl CoderHandle {
 				return false;
 			}
 		}
+		// An idle session can hold a parked coordinator notice
+		// (ADR 0062). "Go now" on one is a manual wake: claim the
+		// turn slot under the lock (so a racing `send` falls into
+		// its steer branch instead of double-spawning) and start a
+		// fresh turn — its first iteration top drains the queue and
+		// re-emits the row as a real `UserMessage`.
+		{
+			let mut turn = rt.turn.lock().await;
+			if turn.cancel.is_none() {
+				let cancel = CancellationToken::new();
+				turn.cancel = Some(cancel.clone());
+				drop(turn);
+				let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), session_id);
+				spawn_turn_loop(
+					self.state.clone(),
+					rt.clone(),
+					sink,
+					folder_path.to_owned(),
+					cancel,
+					false,
+					None,
+				);
+				return true;
+			}
+		}
 		// Skip any parked `ask_user` prompt so the tool returns
 		// and the turn reaches the cancellation point (the
 		// iteration boundary's `select!`).
@@ -4165,7 +4193,15 @@ impl CoderHandle {
 	/// keeps forwarding its events and every control tool keeps
 	/// working. The notice exists so the coordinator's next turn
 	/// accounts for an instruction it didn't issue instead of
-	/// contradicting it.
+	/// contradicting it — and it is **parked, not a wake**
+	/// (ADR 0062): it lands in the coordinator's steer queue, so a
+	/// running turn drains it at its next iteration boundary and an
+	/// idle coordinator holds it until whatever starts its next turn
+	/// (a dispatch-packet wake, a direct user message, "go now" on
+	/// the queued row). A nudge into a worker is information for the
+	/// coordinator's next decision, not worth a turn of its own —
+	/// the worker already has the instruction, and its
+	/// `TurnComplete` wake follows anyway.
 	async fn notify_coordinator_of_user_message(&self, session_id: &str, text: &str) {
 		let trimmed = text.trim();
 		if trimmed.is_empty() {
@@ -4187,22 +4223,17 @@ impl CoderHandle {
 			 work on it.",
 			truncate_for_notice(trimmed, USER_MESSAGE_NOTICE_MAX)
 		);
-		let handle = CoderHandle {
-			state: self.state.clone(),
+		// Failure (orchestrator unmounted / deleted) only costs the
+		// notice.
+		let Some((rt, folder_path)) = self.state.runtime_for_session(&orchestrator_id).await else {
+			tracing::warn!(
+				orchestrator_id = %orchestrator_id,
+				"coordinator unmounted; dropping user-message notice"
+			);
+			return;
 		};
-		// Detached so the user's send isn't blocked on the
-		// orchestrator's wake bookkeeping; failure (orchestrator
-		// unmounted / deleted) only costs the notice.
-		let orchestrator_id_for_log = orchestrator_id.clone();
-		tokio::spawn(async move {
-			if let Err(err) = handle.send_to(&orchestrator_id, notice, Vec::new()).await {
-				tracing::warn!(
-					?err,
-					orchestrator_id = %orchestrator_id_for_log,
-					"failed to notify coordinator of a user message to its worker"
-				);
-			}
-		});
+		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), orchestrator_id);
+		park_coordinator_notice(&rt, &sink, notice).await;
 	}
 
 	/// Send a prompt to a specific session by id (ADR 0030). Unlike
@@ -4221,9 +4252,10 @@ impl CoderHandle {
 	/// record carry `from_coordinator: true` so the worker's
 	/// transcript badges the orchestrator's instructions apart
 	/// from anything the human typed (ADR 0043 lets both land in
-	/// the same session). Coordinator-*bound* traffic (dispatch
-	/// feeder wakes, user-message notices) stays on plain
-	/// `send_to` — those aren't the coordinator speaking.
+	/// the same session). Coordinator-*bound* traffic isn't the
+	/// coordinator speaking: dispatch feeder wakes stay on plain
+	/// `send_to`, and user-message notices park in the steer queue
+	/// ([`park_coordinator_notice`], ADR 0062).
 	pub async fn send_to_as_coordinator(
 		&self,
 		session_id: &str,
@@ -5235,6 +5267,13 @@ fn spawn_turn_loop(
 					message: err.to_string(),
 				});
 			}
+		}
+		// A turn's `bash` can remove a worktree checkout behind the
+		// registry's back (ADR 0063) — reconcile on every exit path
+		// so the project bar drops dead rows at turn end instead of
+		// waiting for a manual unbind.
+		if !prune_missing_worktrees(&state).await.is_empty() {
+			sink_for_turn.send(CoderEvent::WorkspaceFoldersChanged);
 		}
 		if auto_rename_after {
 			spawn_auto_rename(state.clone(), rt_for_turn.clone(), sink_for_turn);
@@ -7747,6 +7786,47 @@ async fn handle_discard_worker_worktree(
 	}))
 }
 
+/// Unbind worktree folders whose checkout vanished from disk
+/// (ADR 0063). `git worktree remove` run outside the discard flows —
+/// a coordinator reaching for `bash` despite the prompt, the user in
+/// a terminal — deletes the checkout without telling the workspace
+/// registry, leaving a dead row in the project bar. This reconciles:
+/// one stat per bound worktree folder, and for each missing checkout
+/// it forgets the stale git metadata (best-effort, same rationale as
+/// the idempotent discard path in ADR 0044 — stale metadata refuses
+/// a later `git worktree add` at the same deterministic path),
+/// unbinds the folder, and clears the worktree routing on sessions
+/// that pointed there. Returns the pruned paths; the caller
+/// announces `WorkspaceFoldersChanged` when non-empty.
+async fn prune_missing_worktrees(state: &Arc<CoderState>) -> Vec<String> {
+	let mut pruned = Vec::new();
+	for entry in state.workspaces.folders().await {
+		let moon_protocol::workspace::FolderOrigin::Worktree { parent_path, .. } = &entry.folder.origin else {
+			continue;
+		};
+		let worktree_path = entry.folder.path.clone();
+		// Host-side stat is valid under either shell target:
+		// worktrees live under `<parent>/.worktrees/<slug>` and ride
+		// the parent's bind mount (ADR 0029).
+		if Utf8Path::new(&worktree_path).is_dir() {
+			continue;
+		}
+		if let Some(parent) = state.workspaces.folder_for_path(parent_path).await {
+			if let Err(err) = parent.host.git_worktree_forget(Utf8Path::new(&worktree_path)).await {
+				tracing::warn!(error = %err, worktree = %worktree_path, "git worktree prune failed for a vanished checkout");
+			}
+		}
+		if let Err(err) = state.workspaces.remove_folder(&worktree_path).await {
+			tracing::warn!(error = %err, worktree = %worktree_path, "failed to unbind a vanished worktree folder");
+			continue;
+		}
+		let handle = CoderHandle { state: state.clone() };
+		handle.clear_worktree_sessions(&worktree_path).await;
+		pruned.push(worktree_path);
+	}
+	pruned
+}
+
 /// AI-suggest a commit message from a diff patch, using the same
 /// cheap-model flow as `CoderHandle::suggest_commit_message` but
 /// accessible from a `&Arc<CoderState>`.
@@ -8574,6 +8654,40 @@ async fn read_personal_instructions(folder_root: &Utf8Path) -> Option<String> {
 /// turn that never gets to drain leaves the queue intact for
 /// garbage collection when the session itself is replaced
 /// (`load_session`, `clear_session`).
+/// Park a coordinator-bound notice in the coordinator's steer queue
+/// without ever starting a turn (ADR 0062). A running turn drains it
+/// at its next iteration top ([`drain_pending_steers`]) — same
+/// delivery as before; an idle coordinator keeps it queued, visible
+/// as a queued row with the usual "go now" / unqueue affordances,
+/// until its next wake (a worker's dispatch packet, a direct user
+/// message). Deliberately does **not** skip a parked `ask_user`
+/// prompt the way a real steer does: a notice is information, not an
+/// answer, and must not blow away a question the coordinator is
+/// waiting on.
+async fn park_coordinator_notice(rt: &Arc<SessionRuntime>, sink: &FolderEventSink, notice: String) {
+	let steer_id = new_message_id();
+	let queued_at_ms = current_time_ms();
+	{
+		let mut session = rt.session.lock().await;
+		session.pending_steers.push(PendingSteer {
+			id: steer_id.clone(),
+			text: notice.clone(),
+			images: Vec::new(),
+			queued_at_ms,
+			from_coordinator: false,
+		});
+		session.header.updated_at_ms = queued_at_ms;
+	}
+	sink.send(CoderEvent::UserMessage {
+		id: steer_id,
+		text: notice,
+		images: Vec::new(),
+		queued: true,
+		created_at_ms: Some(queued_at_ms),
+		from_coordinator: false,
+	});
+}
+
 async fn drain_pending_steers(rt: &Arc<SessionRuntime>, sink: &FolderEventSink) {
 	let (steers, dir, header) = {
 		let mut session = rt.session.lock().await;
@@ -10607,6 +10721,49 @@ mod tests {
 			worktree_branch: None,
 			committed_branch: None,
 		}
+	}
+
+	#[tokio::test]
+	async fn park_coordinator_notice_queues_without_starting_a_turn() {
+		// ADR 0062: a user-message notice into an idle coordinator
+		// parks in the steer queue — a queued `UserMessage` event,
+		// a `PendingSteer` entry, and **no** turn (the function has
+		// no spawn path; assert the queue + event shape and that
+		// the turn slot stays empty).
+		let header = header_for("sess-coord");
+		let mut session = Session::new_blank();
+		session.header = header;
+		let rt = Arc::new(SessionRuntime::new(session));
+
+		let (tx, mut rx) = broadcast::channel::<CoderEventEnvelope>(16);
+		let sink = FolderEventSink::new(tx, "/test/folder".to_string(), "sess-coord".to_string());
+		park_coordinator_notice(&rt, &sink, "the user said a thing".to_string()).await;
+
+		let session = rt.session.lock().await;
+		assert_eq!(session.pending_steers.len(), 1);
+		assert_eq!(session.pending_steers[0].text, "the user said a thing");
+		assert!(!session.pending_steers[0].from_coordinator);
+		drop(session);
+		assert!(rt.turn.lock().await.cancel.is_none());
+
+		let envelope = rx.try_recv().expect("one queued UserMessage event");
+		match envelope.event {
+			CoderEvent::UserMessage {
+				queued,
+				text,
+				from_coordinator,
+				..
+			} => {
+				assert!(queued);
+				assert_eq!(text, "the user said a thing");
+				assert!(!from_coordinator);
+			}
+			other => panic!("expected a queued UserMessage, got {other:?}"),
+		}
+		assert!(
+			rx.try_recv().is_err(),
+			"no further events — parking must not wake anything"
+		);
 	}
 
 	#[tokio::test]

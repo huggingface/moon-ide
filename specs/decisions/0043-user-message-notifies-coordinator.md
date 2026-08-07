@@ -2,7 +2,10 @@
 
 Date: 2026-07-28
 Status: accepted; implemented. Supersedes
-[ADR 0036](0036-worker-takeover.md) in full.
+[ADR 0036](0036-worker-takeover.md) in full. Delivery timing is
+superseded by [ADR 0062](0062-parked-coordinator-notices.md) — the
+notice parks in the coordinator's steer queue instead of waking an
+idle coordinator; the content decisions below stand.
 
 ## Context
 

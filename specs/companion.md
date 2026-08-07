@@ -221,10 +221,11 @@ requested surface:
   truncating title can't ellipsise it away — plus a
   coordinator-specific empty-state hint describing the delegation
   model. Workers are ordinary sessions in the per-
-  project list — opening one and sending a message feeds the
-  coordinator a notice quoting what you said and leaves the worker
-  hooked up ([ADR 0043](decisions/0043-user-message-notifies-coordinator.md)),
-  same as the desktop.
+  project list — opening one and sending a message parks a notice
+  quoting what you said in the coordinator's steer queue (delivered
+  with its next turn, [ADR 0043](decisions/0043-user-message-notifies-coordinator.md)
+  / [0062](decisions/0062-parked-coordinator-notices.md)) and leaves
+  the worker hooked up, same as the desktop.
 - **Review a worktree session vs the default branch.** A session
   driving a git worktree (ADR 0028) shows a `⇄` button in its
   header; it opens a full-screen review of that checkout against
