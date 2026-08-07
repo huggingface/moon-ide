@@ -94,10 +94,44 @@ pub struct BoundMount {
 /// already understands it Just Works inside the workspace shell.
 pub const SSH_AGENT_CONTAINER_PATH: &str = "/run/host-services/ssh-auth.sock";
 
+/// In-container directory the agent-proxy dir mounts at (ADR 0060).
+/// `SSH_AGENT_CONTAINER_PATH` lives inside it, so the in-container
+/// experience is identical on both mount shapes.
+pub const SSH_AGENT_CONTAINER_DIR: &str = "/run/host-services";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SshAgentForward {
-	/// Absolute host-side path to the SSH agent's unix socket.
-	pub host_socket: Utf8PathBuf,
+pub enum SshAgentForward {
+	/// File bind-mount of a host-managed stable socket. macOS's
+	/// Docker Desktop magic path, and the Linux fallback when the
+	/// IDE's agent proxy isn't running (raw `$SSH_AUTH_SOCK` —
+	/// goes stale if the host agent restarts; ADR 0060).
+	Socket {
+		/// Absolute host-side path to the SSH agent's unix socket.
+		host_socket: Utf8PathBuf,
+	},
+	/// Directory bind-mount of the IDE's ssh-agent proxy dir
+	/// (ADR 0060) — contains exactly one socket,
+	/// `ssh-auth.sock`, which the host IDE rebinds freely without
+	/// the container's mount going stale (ADR 0026 pattern).
+	ProxyDir {
+		/// Absolute host-side path of the proxy directory.
+		host_dir: Utf8PathBuf,
+	},
+}
+
+/// One `~/.ssh/*.pub` public key bind-mounted read-only into the
+/// container's `~/.ssh/` (ADR 0060). Lets `IdentityFile
+/// ~/.ssh/<key>.pub` + `IdentitiesOnly yes` select a specific agent
+/// key inside the container — the canonical fix for "the server
+/// rejects auth after the agent offers too many keys" — without any
+/// private material leaving the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshPublicKeyMount {
+	/// Absolute host-side path of the `.pub` file.
+	pub host_path: Utf8PathBuf,
+	/// File name (`id_ed25519.pub`, …) — the mount lands at
+	/// `/home/dev/.ssh/<file_name>`.
+	pub file_name: String,
 }
 
 /// In-container path the workspace's socket *directory* is
@@ -364,6 +398,9 @@ pub struct ComposeRenderOptions<'a> {
 	/// and environment block entirely (no `SSH_AUTH_SOCK` set
 	/// inside the container, no agent socket mounted).
 	pub ssh_agent: Option<&'a SshAgentForward>,
+	/// Host `~/.ssh/*.pub` public keys to bind read-only into the
+	/// container's `~/.ssh/` (ADR 0060).
+	pub ssh_public_keys: &'a [SshPublicKeyMount],
 	/// Optional `~/.ssh/config` bind mount. `None` skips the
 	/// volume entirely — Host aliases and per-host options are
 	/// then unknown inside the container.
@@ -447,6 +484,7 @@ pub fn generate_compose(options: ComposeRenderOptions<'_>) -> ComposeRender {
 	let _ = writeln!(yaml, "    working_dir: /workspace");
 	let _ = writeln!(yaml, "    volumes:");
 	let has_extra_mount = options.ssh_agent.is_some()
+		|| !options.ssh_public_keys.is_empty()
 		|| options.ssh_config.is_some()
 		|| options.ssh_known_hosts.is_some()
 		|| options.gh_config.is_some()
@@ -465,15 +503,39 @@ pub fn generate_compose(options: ComposeRenderOptions<'_>) -> ComposeRender {
 				name = mount.mount_name,
 			);
 		}
-		if let Some(agent) = options.ssh_agent {
-			// Bind the host's SSH agent socket so `git fetch`,
-			// `gh`, etc. inside the container reach the host's
-			// keys without copying any private material.
+		match options.ssh_agent {
+			// Bind the host's SSH agent so `git fetch`, `gh`, etc.
+			// inside the container reach the host's keys without
+			// copying any private material.
+			Some(SshAgentForward::Socket { host_socket }) => {
+				let _ = writeln!(
+					yaml,
+					"      - {host}:{container}",
+					host = host_socket.as_str(),
+					container = SSH_AGENT_CONTAINER_PATH,
+				);
+			}
+			// Directory mount (ADR 0060): the IDE's proxy rebinds
+			// the socket inside without the mount going stale.
+			Some(SshAgentForward::ProxyDir { host_dir }) => {
+				let _ = writeln!(
+					yaml,
+					"      - {host}:{container}",
+					host = host_dir.as_str(),
+					container = SSH_AGENT_CONTAINER_DIR,
+				);
+			}
+			None => {}
+		}
+		for key in options.ssh_public_keys {
+			// Read-only by design; public halves only (ADR 0060) —
+			// they let `IdentityFile`+`IdentitiesOnly` select agent
+			// keys, never authenticate by themselves.
 			let _ = writeln!(
 				yaml,
-				"      - {host}:{container}",
-				host = agent.host_socket.as_str(),
-				container = SSH_AGENT_CONTAINER_PATH,
+				"      - {host}:/home/dev/.ssh/{name}:ro",
+				host = key.host_path.as_str(),
+				name = key.file_name,
 			);
 		}
 		if let Some(cfg) = options.ssh_config {
@@ -592,6 +654,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[],
 			ssh_agent: None,
+			ssh_public_keys: &[],
 			ssh_config: None,
 			ssh_known_hosts: None,
 			git_identity: None,
@@ -629,6 +692,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[],
 			ssh_agent: None,
+			ssh_public_keys: &[],
 			ssh_config: None,
 			ssh_known_hosts: None,
 			git_identity: None,
@@ -651,6 +715,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &mounts,
 			ssh_agent: None,
+			ssh_public_keys: &[],
 			ssh_config: None,
 			ssh_known_hosts: None,
 			git_identity: None,
@@ -675,6 +740,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &mounts,
 			ssh_agent: None,
+			ssh_public_keys: &[],
 			ssh_config: None,
 			ssh_known_hosts: None,
 			git_identity: None,
@@ -696,6 +762,7 @@ mod tests {
 			dev_image: "huggingface/moon-base:0.1",
 			bound_mounts: &[mount("/x", "x")],
 			ssh_agent: None,
+			ssh_public_keys: &[],
 			ssh_config: None,
 			ssh_known_hosts: None,
 			git_identity: None,
@@ -714,6 +781,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[],
 			ssh_agent: None,
+			ssh_public_keys: &[],
 			ssh_config: None,
 			ssh_known_hosts: None,
 			git_identity: None,
@@ -727,7 +795,7 @@ mod tests {
 	#[test]
 	fn ssh_agent_forward_emits_volume_and_environment_block() {
 		let project = project();
-		let agent = SshAgentForward {
+		let agent = SshAgentForward::Socket {
 			host_socket: Utf8PathBuf::from("/tmp/ssh-XXXX/agent.42"),
 		};
 		let render = generate_compose(ComposeRenderOptions {
@@ -735,6 +803,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
 			ssh_agent: Some(&agent),
+			ssh_public_keys: &[],
 			ssh_config: None,
 			ssh_known_hosts: None,
 			git_identity: None,
@@ -754,12 +823,50 @@ mod tests {
 	}
 
 	#[test]
+	fn agent_proxy_dir_mounts_directory_and_pub_keys_mount_read_only() {
+		// ADR 0060: the proxy variant mounts the *directory* (so the
+		// host can rebind the socket inside without staling the
+		// mount) and `~/.ssh/*.pub` files ride along read-only.
+		let project = project();
+		let agent = SshAgentForward::ProxyDir {
+			host_dir: Utf8PathBuf::from("/home/me/.local/share/moon-ide/ssh-agent"),
+		};
+		let keys = [SshPublicKeyMount {
+			host_path: Utf8PathBuf::from("/home/me/.ssh/id_ed25519.pub"),
+			file_name: "id_ed25519.pub".into(),
+		}];
+		let render = generate_compose(ComposeRenderOptions {
+			project: &project,
+			dev_image: "moon-base:dev",
+			bound_mounts: &[],
+			ssh_agent: Some(&agent),
+			ssh_public_keys: &keys,
+			ssh_config: None,
+			ssh_known_hosts: None,
+			git_identity: None,
+			gh_config: None,
+			gh_token: None,
+			moon_edit_socket: None,
+		});
+		assert!(render
+			.yaml
+			.contains("- /home/me/.local/share/moon-ide/ssh-agent:/run/host-services"));
+		assert!(render
+			.yaml
+			.contains("- /home/me/.ssh/id_ed25519.pub:/home/dev/.ssh/id_ed25519.pub:ro"));
+		// The in-container env is identical to the file-mount shape.
+		assert!(render
+			.yaml
+			.contains("SSH_AUTH_SOCK: \"/run/host-services/ssh-auth.sock\""));
+	}
+
+	#[test]
 	fn ssh_agent_forward_renders_with_no_bound_folders() {
 		// Pre-opt-in shape: no folders bound yet but the agent
 		// is still available — the renderer must not regress to
 		// `volumes: []` and drop the agent mount.
 		let project = project();
-		let agent = SshAgentForward {
+		let agent = SshAgentForward::Socket {
 			host_socket: Utf8PathBuf::from("/run/user/1000/keyring/ssh"),
 		};
 		let render = generate_compose(ComposeRenderOptions {
@@ -767,6 +874,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[],
 			ssh_agent: Some(&agent),
+			ssh_public_keys: &[],
 			ssh_config: None,
 			ssh_known_hosts: None,
 			git_identity: None,
@@ -796,6 +904,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
 			ssh_agent: None,
+			ssh_public_keys: &[],
 			ssh_config: None,
 			ssh_known_hosts: None,
 			git_identity: Some(&identity),
@@ -818,7 +927,7 @@ mod tests {
 	#[test]
 	fn git_identity_and_ssh_agent_share_environment_block() {
 		let project = project();
-		let agent = SshAgentForward {
+		let agent = SshAgentForward::Socket {
 			host_socket: Utf8PathBuf::from("/run/user/1000/keyring/ssh"),
 		};
 		let identity = HostGitIdentity {
@@ -830,6 +939,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[],
 			ssh_agent: Some(&agent),
+			ssh_public_keys: &[],
 			ssh_config: None,
 			ssh_known_hosts: None,
 			git_identity: Some(&identity),
@@ -860,6 +970,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
 			ssh_agent: None,
+			ssh_public_keys: &[],
 			ssh_config: Some(&cfg),
 			ssh_known_hosts: None,
 			git_identity: None,
@@ -892,6 +1003,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[],
 			ssh_agent: None,
+			ssh_public_keys: &[],
 			ssh_config: Some(&cfg),
 			ssh_known_hosts: None,
 			git_identity: None,
@@ -914,7 +1026,7 @@ mod tests {
 		// with Host aliases in their `~/.ssh/config`. Agent
 		// handles auth; config handles alias resolution.
 		let project = project();
-		let agent = SshAgentForward {
+		let agent = SshAgentForward::Socket {
 			host_socket: Utf8PathBuf::from("/run/user/1000/keyring/ssh"),
 		};
 		let cfg = SshConfigMount {
@@ -925,6 +1037,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
 			ssh_agent: Some(&agent),
+			ssh_public_keys: &[],
 			ssh_config: Some(&cfg),
 			ssh_known_hosts: None,
 			git_identity: None,
@@ -954,6 +1067,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
 			ssh_agent: None,
+			ssh_public_keys: &[],
 			ssh_config: None,
 			ssh_known_hosts: Some(&kh),
 			git_identity: None,
@@ -991,6 +1105,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
 			ssh_agent: None,
+			ssh_public_keys: &[],
 			ssh_config: Some(&cfg),
 			ssh_known_hosts: Some(&kh),
 			git_identity: None,
@@ -1016,6 +1131,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
 			ssh_agent: None,
+			ssh_public_keys: &[],
 			ssh_config: None,
 			ssh_known_hosts: None,
 			git_identity: None,
@@ -1042,6 +1158,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[],
 			ssh_agent: None,
+			ssh_public_keys: &[],
 			ssh_config: None,
 			ssh_known_hosts: None,
 			git_identity: None,
@@ -1069,6 +1186,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
 			ssh_agent: None,
+			ssh_public_keys: &[],
 			ssh_config: None,
 			ssh_known_hosts: None,
 			git_identity: None,
@@ -1096,6 +1214,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[],
 			ssh_agent: None,
+			ssh_public_keys: &[],
 			ssh_config: None,
 			ssh_known_hosts: None,
 			git_identity: None,
@@ -1123,6 +1242,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[],
 			ssh_agent: None,
+			ssh_public_keys: &[],
 			ssh_config: None,
 			ssh_known_hosts: None,
 			git_identity: Some(&identity),
@@ -1151,6 +1271,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
 			ssh_agent: None,
+			ssh_public_keys: &[],
 			ssh_config: None,
 			ssh_known_hosts: None,
 			git_identity: None,
@@ -1190,6 +1311,7 @@ mod tests {
 			dev_image: "moon-base:dev",
 			bound_mounts: &[],
 			ssh_agent: None,
+			ssh_public_keys: &[],
 			ssh_config: None,
 			ssh_known_hosts: None,
 			git_identity: None,

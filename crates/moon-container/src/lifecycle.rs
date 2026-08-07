@@ -72,7 +72,7 @@ use tokio::process::Command;
 
 use crate::compose::{
 	generate_compose, BoundMount, ComposeRender, ComposeRenderOptions, GhConfigMount, HostGhToken, HostGitIdentity,
-	MoonEditSocketMount, SshAgentForward, SshConfigMount, SshKnownHostsMount,
+	MoonEditSocketMount, SshAgentForward, SshConfigMount, SshKnownHostsMount, SshPublicKeyMount,
 };
 use crate::network::{connect_container_to_network, dev_container_name, project_default_network};
 use crate::port_forward::stop_forwards;
@@ -280,6 +280,7 @@ impl Workspace {
 	pub fn render_compose(&self, dev_image: &str) -> ComposeRender {
 		let mounts = self.bound_mounts();
 		let agent = detect_ssh_agent_forward();
+		let ssh_public_keys = detect_host_ssh_public_keys();
 		let ssh_config = detect_host_ssh_config();
 		let ssh_known_hosts = detect_host_ssh_known_hosts();
 		let identity = detect_host_git_identity();
@@ -305,6 +306,7 @@ impl Workspace {
 			dev_image,
 			bound_mounts: &mounts,
 			ssh_agent: agent.as_ref(),
+			ssh_public_keys: &ssh_public_keys,
 			ssh_config: ssh_config.as_ref(),
 			ssh_known_hosts: ssh_known_hosts.as_ref(),
 			git_identity: identity.as_ref(),
@@ -701,10 +703,22 @@ fn mount_name_for(path: &Utf8Path) -> String {
 /// container") to pick it up.
 pub(crate) fn detect_ssh_agent_forward() -> Option<SshAgentForward> {
 	if cfg!(target_os = "macos") {
-		return Some(SshAgentForward {
+		return Some(SshAgentForward::Socket {
 			host_socket: Utf8PathBuf::from("/run/host-services/ssh-auth.sock"),
 		});
 	}
+	// Preferred (ADR 0060): the IDE's ssh-agent proxy — a stable
+	// directory whose socket the host process rebinds freely, so a
+	// host agent restart never leaves the container with a stale
+	// file mount.
+	if let Some(dir) = crate::agent_proxy::registered_dir() {
+		return Some(SshAgentForward::ProxyDir {
+			host_dir: dir.to_owned(),
+		});
+	}
+	// Fallback: bind `$SSH_AUTH_SOCK` directly (pre-ADR-0060
+	// behaviour, and what tests / non-IDE callers get). Goes stale
+	// when the host agent restarts — recreate the container.
 	let raw = match std::env::var("SSH_AUTH_SOCK") {
 		Ok(s) if !s.is_empty() => s,
 		_ => {
@@ -720,7 +734,38 @@ pub(crate) fn detect_ssh_agent_forward() -> Option<SshAgentForward> {
 		);
 		return None;
 	}
-	Some(SshAgentForward { host_socket: path })
+	Some(SshAgentForward::Socket { host_socket: path })
+}
+
+/// Enumerate the host's `~/.ssh/*.pub` public keys for read-only
+/// pass-through into the container (ADR 0060). Public halves only —
+/// they let `IdentityFile ~/.ssh/<key>.pub` + `IdentitiesOnly yes`
+/// select a specific agent key (the fix for servers rejecting auth
+/// after the agent offers too many keys) and never authenticate by
+/// themselves. Sorted for a stable compose.yaml.
+pub(crate) fn detect_host_ssh_public_keys() -> Vec<SshPublicKeyMount> {
+	let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) else {
+		return Vec::new();
+	};
+	let dir = Utf8PathBuf::from(home).join(".ssh");
+	let Ok(entries) = std::fs::read_dir(dir.as_std_path()) else {
+		return Vec::new();
+	};
+	let mut keys: Vec<SshPublicKeyMount> = entries
+		.filter_map(|e| e.ok())
+		.filter_map(|e| {
+			let name = e.file_name().into_string().ok()?;
+			if !name.ends_with(".pub") || !e.file_type().ok()?.is_file() {
+				return None;
+			}
+			Some(SshPublicKeyMount {
+				host_path: dir.join(&name),
+				file_name: name,
+			})
+		})
+		.collect();
+	keys.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+	keys
 }
 
 /// Read the host's `git config --global user.{name,email}` so we

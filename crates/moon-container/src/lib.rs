@@ -18,6 +18,7 @@
 //! The split between workspace shell and project services is the
 //! [2026-04-29 amendment to ADR 0007](../../../specs/decisions/0007-compose-and-moon-base.md#amendment-2026-04-29--workspace-shell-vs-project-services).
 
+pub mod agent_proxy;
 pub mod compose;
 pub mod discovery;
 pub mod lifecycle;
@@ -30,7 +31,7 @@ mod status_cache;
 
 pub use compose::{
 	generate_compose, BoundMount, ComposeRender, ComposeRenderOptions, MoonEditSocketMount, SshAgentForward,
-	MOON_EDIT_SOCKET_CONTAINER_PATH, MOON_EDIT_SOCKET_DIR_CONTAINER_PATH, SSH_AGENT_CONTAINER_PATH,
+	SshPublicKeyMount, MOON_EDIT_SOCKET_CONTAINER_PATH, MOON_EDIT_SOCKET_DIR_CONTAINER_PATH, SSH_AGENT_CONTAINER_PATH,
 };
 pub use discovery::{
 	discover_compose_files, discover_compose_files_for_folders, discover_root_compose, ComposeDiscovery,

@@ -530,9 +530,22 @@ enter the container.
 
 Host-side resolution: on macOS, Docker Desktop's magic
 `/run/host-services/ssh-auth.sock` path (emitted unconditionally);
-on Linux, `$SSH_AUTH_SOCK` from the IDE's environment, skipped with
-a warning when unset. The in-container path reuses Docker Desktop's
-convention on both platforms.
+on Linux, the IDE's **agent proxy**
+([ADR 0060](decisions/0060-ssh-agent-proxy.md)) — a stable socket at
+`<data>/moon-ide/ssh-agent/ssh-auth.sock` piping each connection to
+the live host agent, with its parent **directory** mounted (ADR 0026
+pattern) so host agent restarts never stale the mount. Fallback when
+the proxy isn't running: `$SSH_AUTH_SOCK` bound directly, skipped
+with a warning when unset. The in-container path reuses Docker
+Desktop's convention on both platforms.
+
+The host's `~/.ssh/*.pub` public keys also bind-mount read-only into
+the container's `~/.ssh/` (same ADR): write host config entries as
+`IdentityFile ~/.ssh/<key>.pub` + `IdentitiesOnly yes` and both host
+and container ssh offer exactly that key via the agent — the fix for
+servers that reject auth after the agent parades too many keys.
+Private keys never enter the container. New `.pub` files appear
+after a container recreate.
 
 `moon-base` ships `openssh-client` and pre-seeds
 `/etc/ssh/ssh_known_hosts` with `github.com` / `gitlab.com` so the

@@ -61,6 +61,7 @@ fn workspace_compose_is_dev_only_with_one_mount_per_folder() {
 		dev_image: "moon-base:dev",
 		bound_mounts: &mounts,
 		ssh_agent: None,
+		ssh_public_keys: &[],
 		ssh_config: None,
 		ssh_known_hosts: None,
 		git_identity: None,

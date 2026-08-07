@@ -344,6 +344,21 @@ pub fn run() {
 			let coder_sessions_dir = moon_ide_data.join("coder-sessions");
 			let folder_summaries_dir = moon_ide_data.join("folder-summaries");
 
+			// Host-side ssh-agent proxy (ADR 0060): a stable socket
+			// the workspace shell container mounts by directory, so
+			// host agent restarts never leave containers with a
+			// stale file bind-mount. Must be up before any compose
+			// render so `detect_ssh_agent_forward` prefers it.
+			// Linux only — macOS uses Docker Desktop's magic path.
+			if cfg!(target_os = "linux") {
+				let proxy_data_dir = moon_ide_data.clone();
+				tauri::async_runtime::block_on(async move {
+					if let Err(err) = moon_container::agent_proxy::spawn(&proxy_data_dir).await {
+						tracing::warn!(error = %err, "could not start ssh-agent proxy; falling back to direct socket mount");
+					}
+				});
+			}
+
 			// Wire the focus listener now that we have an
 			// `AppHandle`. Bound pre-Tauri to guarantee single
 			// instance even if app construction takes a beat.
