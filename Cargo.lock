@@ -3350,6 +3350,7 @@ dependencies = [
  "moon-core",
  "moon-protocol",
  "moon-terminal",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",

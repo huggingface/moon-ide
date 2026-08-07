@@ -89,6 +89,15 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
+	// Install the ring crypto provider as the process default before
+	// anything builds a rustls config — feature unification gives
+	// this binary both `ring` (tokio-tungstenite) and `aws-lc-rs`
+	// (via moon-coder's reqwest), and rustls refuses to auto-pick
+	// between two providers: the relay client's `connect_async`
+	// panics with "no process-level CryptoProvider" otherwise.
+	// Same fix as the desktop (`src-tauri/src/lib.rs`).
+	let _ = rustls::crypto::ring::default_provider().install_default();
+
 	tracing_subscriber::fmt()
 		.with_env_filter(
 			tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,moon_remote=debug".into()),
