@@ -225,6 +225,15 @@ requested surface:
   coordinator a notice quoting what you said and leaves the worker
   hooked up ([ADR 0043](decisions/0043-user-message-notifies-coordinator.md)),
   same as the desktop.
+- **Review a worktree session vs the default branch.** A session
+  driving a git worktree (ADR 0028) shows a `⇄` button in its
+  header; it opens a full-screen review of that checkout against
+  the default branch — `workspace_scm_review(folder)` composes
+  `git_default_branch_diff` (merge-base + file list, committed +
+  uncommitted, untracked excluded) with `git_diff_against`
+  (unified patch, 64 kB cap), and the phone renders per-file
+  collapsible diff sections. `base_ref: null` means "nothing to
+  review against" (on the default branch / detached / no remote).
 - **Run / steer coder sessions.** Subscribe to `coder:event`,
   render the transcript, `coder_send` (send / steer), `coder_abort`.
   Opening a session is **windowed** (`coder_open_session` with

@@ -343,6 +343,47 @@ impl BridgeRpcHandler for BridgeRpc {
 			// --- SCM (git) status + commit. Same host methods the
 			// desktop's SCM panel uses, exposed folder-targeted so
 			// the phone can inspect + commit any bound folder.
+			// Review a folder's work against the default branch: file
+			// list vs merge-base plus the unified patch (committed +
+			// uncommitted; untracked files excluded — same baseline
+			// the desktop's "vs main" review tab uses). The phone
+			// passes a worktree session's `worktree_root` as `folder`
+			// to review an isolated agent's work against main.
+			// `base_ref: null` when there's nothing to review against
+			// (on the default branch, detached HEAD, no remote).
+			"workspace_scm_review" => {
+				let p: FolderParams = parse_params(params)?;
+				let folder = self.resolve_folder(&p).await?;
+				let Some(status) = folder.host.git_default_branch_diff().await.map_err(|e| e.to_string())? else {
+					return Ok(serde_json::json!({ "base_ref": null }));
+				};
+				let paths: Vec<String> = status.entries.iter().map(|e| e.path.clone()).collect();
+				let diff = if paths.is_empty() {
+					String::new()
+				} else {
+					folder
+						.host
+						.git_diff_against(&status.merge_base, &paths)
+						.await
+						.map_err(|e| e.to_string())?
+				};
+				let files: Vec<Value> = status
+					.entries
+					.iter()
+					.map(|e| {
+						serde_json::json!({
+							"path": e.path,
+							"status": format!("{:?}", e.status).to_lowercase(),
+						})
+					})
+					.collect();
+				Ok(serde_json::json!({
+					"base_ref": status.default_branch_ref,
+					"merge_base": status.merge_base,
+					"files": files,
+					"diff": diff,
+				}))
+			}
 			"workspace_scm_status" => {
 				let p: FolderParams = parse_params(params)?;
 				let folder = self.resolve_folder(&p).await?;
@@ -656,6 +697,7 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 	"coder_set_model_settings",
 	"workspace_launch",
 	"workspace_scm_status",
+	"workspace_scm_review",
 	"workspace_scm_commit",
 	"workspace_scm_suggest_message",
 	"workspace_scm_sync",

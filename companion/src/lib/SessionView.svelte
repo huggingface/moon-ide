@@ -353,6 +353,29 @@
 	}
 
 	const title = $derived(app.sessions.find((s) => s.id === app.activeSession)?.title ?? '');
+	const activeSummary = $derived(app.sessions.find((s) => s.id === app.activeSession));
+	const worktreeRoot = $derived(activeSummary?.worktree_root ?? null);
+	const worktreeBranch = $derived(activeSummary?.worktree_branch ?? null);
+
+	/** Split a multi-file unified diff into per-file sections keyed
+	 * by the `b/<path>` of each `diff --git` header. */
+	function diffSections(diff: string): Map<string, string> {
+		const map = new Map<string, string>();
+		if (!diff) {
+			return map;
+		}
+		for (const part of diff.split(/^(?=diff --git )/m)) {
+			if (!part.startsWith('diff --git ')) {
+				continue;
+			}
+			const header = part.slice(0, part.indexOf('\n'));
+			const m = header.match(/ b\/(.+)$/);
+			if (m?.[1] !== undefined) {
+				map.set(m[1], part);
+			}
+		}
+		return map;
+	}
 	const isCoordinator = $derived(app.sessions.find((s) => s.id === app.activeSession)?.mode === 'coordinator');
 
 	// Title rename: tap the title to edit inline. The rename
@@ -639,6 +662,14 @@
 			<button class="session-title" title="Rename session" onclick={startRename}>
 				<strong>{title || 'Untitled session'}</strong>
 			</button>
+		{/if}
+		{#if worktreeRoot}
+			<button
+				class="ghost review-btn"
+				title="Review this agent's work against the default branch"
+				disabled={app.loadingReview}
+				onclick={() => void app.loadReview(worktreeRoot)}>⇄</button
+			>
 		{/if}
 		{#if app.busy}
 			<span class="pip live" title="Running"></span>
@@ -950,6 +981,50 @@
 		</button>
 	</div>
 </div>
+
+{#if app.review !== null}
+	{@const review = app.review}
+	{@const sections = diffSections(review.diff)}
+	<div class="review-overlay">
+		<div class="row review-head">
+			<button class="ghost back" onclick={() => app.closeReview()}>←</button>
+			<strong class="review-title">
+				{#if review.base_ref}
+					Review vs {review.base_ref}{#if worktreeBranch}&nbsp;<span class="muted">({worktreeBranch})</span>{/if}
+				{:else}
+					Review
+				{/if}
+			</strong>
+		</div>
+		<div class="review-body">
+			{#if review.base_ref === null}
+				<p class="muted">
+					Nothing to review against — this checkout is on the default branch (or has no remote default).
+				</p>
+			{:else if review.files.length === 0}
+				<p class="muted">No changes vs {review.base_ref}.</p>
+			{:else}
+				<p class="muted review-summary">
+					{review.files.length} file{review.files.length === 1 ? '' : 's'} changed (committed + uncommitted; untracked files
+					not shown)
+				</p>
+				{#each review.files as f (f.path)}
+					<details class="review-file">
+						<summary>
+							<span class="review-file-status {f.status}">{f.status[0]?.toUpperCase()}</span>
+							<span class="review-file-path">{f.path}</span>
+						</summary>
+						{#if sections.has(f.path)}
+							<pre class="diff-body">{sections.get(f.path)}</pre>
+						{:else}
+							<p class="muted review-nodiff">No text diff (binary, rename, or diff truncated at 64 kB).</p>
+						{/if}
+					</details>
+				{/each}
+			{/if}
+		</div>
+	</div>
+{/if}
 
 {#if lightboxUrl !== null}
 	<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
@@ -1458,6 +1533,87 @@
 	}
 	.send-btn:disabled {
 		opacity: 0.45;
+	}
+	.review-btn {
+		flex: none;
+		padding: 0.3rem 0.55rem;
+		font-size: 0.95rem;
+		line-height: 1;
+	}
+	.review-overlay {
+		position: fixed;
+		inset: 0;
+		z-index: 40;
+		display: flex;
+		flex-direction: column;
+		background: var(--bg);
+		padding: 0.75rem;
+		padding-top: calc(0.75rem + env(safe-area-inset-top));
+		gap: 0.5rem;
+	}
+	.review-head {
+		gap: 0.5rem;
+	}
+	.review-title {
+		flex: 1;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-size: 0.95rem;
+	}
+	.review-body {
+		flex: 1;
+		overflow-y: auto;
+		display: flex;
+		flex-direction: column;
+		gap: 0.4rem;
+	}
+	.review-summary {
+		margin: 0;
+		font-size: 0.75rem;
+	}
+	.review-file {
+		background: var(--bg-elev);
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		padding: 0.4rem 0.6rem;
+	}
+	.review-file summary {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		cursor: pointer;
+		font-size: 0.8rem;
+		font-family: var(--mono, monospace);
+	}
+	.review-file-path {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		direction: rtl;
+		text-align: left;
+	}
+	.review-file-status {
+		flex: none;
+		font-weight: 700;
+		font-size: 0.75rem;
+		width: 1.1em;
+	}
+	.review-file-status.added,
+	.review-file-status.untracked {
+		color: var(--ok);
+	}
+	.review-file-status.modified {
+		color: var(--accent);
+	}
+	.review-file-status.deleted {
+		color: var(--danger);
+	}
+	.review-nodiff {
+		margin: 0.4rem 0 0;
+		font-size: 0.75rem;
 	}
 	.empty-hint {
 		padding: 1rem 0.5rem;

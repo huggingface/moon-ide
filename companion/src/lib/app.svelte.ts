@@ -113,6 +113,13 @@ export type SessionSummary = {
 	id: string;
 	title: string;
 	updated_at_ms: number;
+	/** Absolute path of the git worktree this session drives
+	 * (ADR 0028); absent for a main-tree session. The review view
+	 * passes it as the `folder` target so an isolated agent's work
+	 * is diffed in its own checkout. */
+	worktree_root?: string | null;
+	/** Branch of that worktree (`moon/agent-…` / `moon/<name>`). */
+	worktree_branch?: string | null;
 	/** Top-level session mode (ADR 0030); absent for the default
 	 * `agent` mode, `"coordinator"` for an orchestrator session. */
 	mode?: string | null;
@@ -748,6 +755,48 @@ class CompanionState {
 		}
 	}
 
+	/** Branch review (vs the default branch) for the open session's
+	 * folder — `null` when closed. `base_ref === null` after a load
+	 * means "nothing to review against" (on the default branch,
+	 * detached HEAD, or no remote). */
+	review = $state<{
+		folder: string;
+		base_ref: string | null;
+		files: { path: string; status: string }[];
+		diff: string;
+	} | null>(null);
+	loadingReview = $state(false);
+
+	/** Fetch the review payload for `folder` (a worktree root or a
+	 * bound folder path) and open the review view. */
+	async loadReview(folder: string): Promise<void> {
+		if (!this.activeWorkspace || this.loadingReview) {
+			return;
+		}
+		this.loadingReview = true;
+		try {
+			const r = await this.#call<{
+				base_ref: string | null;
+				files?: { path: string; status: string }[];
+				diff?: string;
+			}>(this.activeWorkspace, 'workspace_scm_review', { folder }, this.activeIde);
+			this.review = {
+				folder,
+				base_ref: r.base_ref,
+				files: r.files ?? [],
+				diff: r.diff ?? '',
+			};
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		} finally {
+			this.loadingReview = false;
+		}
+	}
+
+	closeReview(): void {
+		this.review = null;
+	}
+
 	/** Ask the fast model for a one-line commit subject from the
 	 * active folder's `git diff HEAD`. Mirrors the desktop's
 	 * sparkle button. Returns the suggestion; the caller decides
@@ -1125,6 +1174,7 @@ class CompanionState {
 
 	closeSession(): void {
 		this.activeSession = null;
+		this.review = null;
 		this.rows = [];
 		this.busy = false;
 		this.awaitingInput = false;

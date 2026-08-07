@@ -55,11 +55,20 @@ pub fn registered_dir() -> Option<&'static Utf8Path> {
 /// sockets either accept immediately or are dead.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Start the proxy listener under `moon_data_dir` and register its
-/// directory for the compose layer. Idempotent-ish: a second call
-/// in the same process is a no-op returning `Ok`. Failures are
-/// returned rather than logged so the caller can decide how loud to
-/// be — a failed proxy degrades to the legacy direct-socket mount.
+/// How often each IDE process re-checks that *some* live listener
+/// serves the proxy socket. Process-per-workspace (ADR 0014) means
+/// several IDE processes run concurrently and any of them may exit
+/// at any time — whoever notices a dead socket first takes over.
+const KEEPER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Ensure the proxy socket is served, and register its directory for
+/// the compose layer. Multi-process safe: if a sibling IDE process
+/// already serves the socket we adopt it, and a keeper task
+/// periodically re-probes and takes over when the owner exits — so
+/// the proxy outlives any individual workspace process. Idempotent
+/// per process. Errors from the *first* claim attempt are returned
+/// (permissions, exotic platforms); later takeover failures only
+/// warn — the next tick retries.
 pub async fn spawn(moon_data_dir: &Utf8Path) -> std::io::Result<()> {
 	if PROXY_DIR.get().is_some() {
 		return Ok(());
@@ -67,16 +76,70 @@ pub async fn spawn(moon_data_dir: &Utf8Path) -> std::io::Result<()> {
 	let dir = moon_data_dir.join(PROXY_DIR_NAME);
 	tokio::fs::create_dir_all(dir.as_std_path()).await?;
 	let socket = dir.join(PROXY_SOCKET_NAME);
-	// Unlink any previous incarnation (crashed IDE). The directory
-	// mount is exactly what makes this rebind safe for running
-	// containers.
-	match tokio::fs::remove_file(socket.as_std_path()).await {
-		Ok(()) => {}
-		Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-		Err(err) => return Err(err),
+	if let Some(listener) = try_claim(&socket).await? {
+		spawn_accept_loop(listener, socket.clone());
 	}
-	let listener = tokio::net::UnixListener::bind(socket.as_std_path())?;
-	let own_socket = socket.clone();
+	let keeper_socket = socket.clone();
+	tokio::spawn(async move {
+		loop {
+			tokio::time::sleep(KEEPER_INTERVAL).await;
+			// A live listener (ours or a sibling's) answers the
+			// probe; nothing to do. A refused connect means the
+			// owner died — claim the path.
+			if probe(&keeper_socket).await {
+				continue;
+			}
+			match try_claim(&keeper_socket).await {
+				Ok(Some(listener)) => {
+					tracing::info!("ssh-agent proxy: took over the socket from an exited sibling");
+					spawn_accept_loop(listener, keeper_socket.clone());
+				}
+				Ok(None) => {} // a sibling won the race — fine
+				Err(err) => tracing::warn!(error = %err, "ssh-agent proxy: takeover failed; retrying"),
+			}
+		}
+	});
+	let _ = PROXY_DIR.set(dir);
+	Ok(())
+}
+
+/// Bind the proxy socket if nobody live owns it. `Ok(None)` when a
+/// live sibling serves it (adopt); probe-before-unlink so we never
+/// yank a working socket out from under a sibling process — the bug
+/// the first version of this module shipped with.
+async fn try_claim(socket: &Utf8Path) -> std::io::Result<Option<tokio::net::UnixListener>> {
+	match tokio::net::UnixListener::bind(socket.as_std_path()) {
+		Ok(listener) => Ok(Some(listener)),
+		Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+			if probe(socket).await {
+				return Ok(None);
+			}
+			match tokio::fs::remove_file(socket.as_std_path()).await {
+				Ok(()) => {}
+				Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+				Err(err) => return Err(err),
+			}
+			match tokio::net::UnixListener::bind(socket.as_std_path()) {
+				Ok(listener) => Ok(Some(listener)),
+				// Lost a takeover race to a sibling — treat as adopt.
+				Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => Ok(None),
+				Err(err) => Err(err),
+			}
+		}
+		Err(err) => Err(err),
+	}
+}
+
+/// Connect-probe: only a live listener accepts.
+async fn probe(socket: &Utf8Path) -> bool {
+	let connect = tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::UnixStream::connect(socket.as_std_path())).await;
+	matches!(connect, Ok(Ok(_)))
+}
+
+/// Serve one claimed listener. A superseded loop (its socket file
+/// replaced after a takeover race) just idles harmlessly — nothing
+/// can connect to an unlinked inode.
+fn spawn_accept_loop(listener: tokio::net::UnixListener, own_socket: Utf8PathBuf) {
 	tokio::spawn(async move {
 		loop {
 			let Ok((downstream, _)) = listener.accept().await else {
@@ -90,8 +153,6 @@ pub async fn spawn(moon_data_dir: &Utf8Path) -> std::io::Result<()> {
 			});
 		}
 	});
-	let _ = PROXY_DIR.set(dir);
-	Ok(())
 }
 
 /// Pipe one downstream (container) connection to the live host
@@ -152,6 +213,23 @@ fn candidate_sockets() -> Vec<Utf8PathBuf> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[tokio::test]
+	async fn try_claim_adopts_live_listener_and_takes_over_stale_socket() {
+		let tmp = tempfile::tempdir().expect("tempdir");
+		let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).expect("utf8 tempdir");
+		let socket = root.join("sock");
+
+		// Live sibling: adopt (None), and the sibling's socket must
+		// survive the call — probe-before-unlink.
+		let sibling = tokio::net::UnixListener::bind(socket.as_std_path()).expect("sibling bind");
+		assert!(try_claim(&socket).await.expect("claim vs live").is_none());
+		assert!(probe(&socket).await, "sibling socket must not be unlinked");
+		drop(sibling);
+
+		// Dead sibling (file left behind, nobody accepting): take over.
+		assert!(try_claim(&socket).await.expect("claim vs stale").is_some());
+	}
 
 	#[tokio::test]
 	async fn proxy_pipes_to_live_agent_and_survives_agent_restart() {
