@@ -662,16 +662,25 @@ pub fn run() {
 								live: m.id == workspace_id,
 							})
 							.collect::<Vec<_>>();
+					// `relay::spawn` calls `tokio::spawn`, which panics
+					// without a reactor — the setup hook runs on the main
+					// thread, so hop onto Tauri's async runtime (same
+					// pattern as `prime_context_windows` above). The
+					// handle is stored from inside the task.
+					let app_handle = app.handle().clone();
+					let rpc = rpc.inner().clone();
+					tauri::async_runtime::spawn(async move {
 						let handle = remote_bridge::spawn(
 							cred.bridge_url,
 							String::new(), // no code — the stored token authenticates
 							cred.ide_id,
 							"moon-ide".into(),
 							workspaces,
-							rpc.inner().clone(),
+							rpc,
 						);
-						let state: tauri::State<'_, AppState> = app.state();
-						*state.remote_bridge.blocking_lock() = Some(handle);
+						let state = app_handle.state::<AppState>();
+						*state.remote_bridge.lock().await = Some(handle);
+					});
 					}
 					Ok(None) => {}
 					Err(err) => tracing::warn!(error = %err, "could not read remote-bridge credential"),
