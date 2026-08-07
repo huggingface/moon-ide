@@ -99,9 +99,9 @@ pub fn run() {
 		// plugin hooks into window creation and close events.
 		.plugin(tauri_plugin_window_state::Builder::new().build())
 		// Focus flips feed the agent-activity indicator: focusing
-		// the window acknowledges a green "agents finished" tray
-		// icon. `try_state` — the indicator only exists in
-		// workspace mode.
+		// the window acknowledges a green "agents finished" dot
+		// on the tray icon. `try_state` — the indicator only
+		// exists in workspace mode.
 		.on_window_event(|window, event| {
 			let tauri::WindowEvent::Focused(focused) = event else {
 				return;
@@ -539,8 +539,9 @@ pub fn run() {
 			)
 			.map_err(|err| format!("could not init moon-coder: {err}"))?;
 			commands::coder::spawn_event_pump(app.handle().clone(), coder.clone());
-			// OS-level agent-activity indicator (transient tray
-			// icon + window-icon status dot + taskbar flash).
+			// OS-level agent-activity indicator (per-workspace
+			// tray icon + window-icon status dot + taskbar
+			// flash).
 			// Workspace mode only — preboot has no agents to
 			// report on. Managed so the window-event handler and
 			// `workspace_set_color` can reach it.

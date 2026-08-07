@@ -8,12 +8,13 @@
 //! - the window icon gets an amber (running) / green (finished)
 //!   dot on top of the workspace badge — visible in alt-tab and
 //!   ungrouped taskbars on X11;
-//! - a **transient** system-tray icon (StatusNotifierItem on
-//!   Linux) appears while agents run, flips green when the last
-//!   one settles unfocused, and disappears once the window is
-//!   focused again. No permanent tray presence: with several
-//!   workspaces open, an icon that only exists while there is
-//!   something to say *is* the notification.
+//! - a **permanent** system-tray icon (StatusNotifierItem on
+//!   Linux), one per workspace process, painted with the
+//!   workspace badge. It gains the same amber dot while agents
+//!   run, flips green when the last one settles unfocused, and
+//!   drops the dot once the window is focused again — but the
+//!   icon itself stays, doubling as a per-workspace "bring me
+//!   back" affordance (ADR 0061).
 //!
 //! A turn that settles while the window is already focused skips
 //! the "finished" state entirely — the user is watching the panel.
@@ -89,6 +90,9 @@ impl AgentIndicator {
 				for_task.on_running_count(count);
 			}
 		});
+		// The tray icon is permanent: show it right away in its
+		// idle (plain badge) state.
+		indicator.render();
 		indicator
 	}
 
@@ -165,16 +169,19 @@ impl AgentIndicator {
 			crate::window_icon::apply_workspace_icon(&window, &self.workspace_id, color.as_deref(), icon_status);
 		}
 		match status {
-			Status::Idle => self.remove_tray(),
-			Status::Running => self.show_tray(icon_status, color.as_deref(), "agent running"),
-			Status::Done => self.show_tray(icon_status, color.as_deref(), "agents finished"),
+			Status::Idle => self.show_tray(icon_status, color.as_deref(), None),
+			Status::Running => self.show_tray(icon_status, color.as_deref(), Some("agent running")),
+			Status::Done => self.show_tray(icon_status, color.as_deref(), Some("agents finished")),
 		}
 	}
 
-	fn show_tray(&self, icon_status: IconStatus, color: Option<&str>, verb: &str) {
+	fn show_tray(&self, icon_status: IconStatus, color: Option<&str>, verb: Option<&str>) {
 		let rgba = generate_workspace_icon(&self.workspace_id, color, icon_status);
 		let image = tauri::image::Image::new(&rgba, ICON_SIZE, ICON_SIZE);
-		let tooltip = format!("moon-ide — {}: {verb}", self.workspace_id);
+		let tooltip = match verb {
+			Some(verb) => format!("moon-ide — {}: {verb}", self.workspace_id),
+			None => format!("moon-ide — {}", self.workspace_id),
+		};
 		let mut tray = self.tray.lock().expect("agent indicator tray poisoned");
 		if let Some(existing) = tray.as_ref() {
 			if let Err(err) = existing.set_icon(Some(image)) {
@@ -217,24 +224,5 @@ impl AgentIndicator {
 				}
 			})
 			.build(&self.app)
-	}
-
-	fn remove_tray(&self) {
-		let Some(tray) = self.tray.lock().expect("agent indicator tray poisoned").take() else {
-			return;
-		};
-		// `build` registered the tray with the app's tray manager,
-		// so dropping our handle alone wouldn't tear down the OS
-		// icon — and the *final* drop of the inner GTK tray must
-		// happen on the main thread (tauri marshals method calls
-		// there, but not `Drop`). Ship both handles across.
-		let app = self.app.clone();
-		let result = self.app.run_on_main_thread(move || {
-			drop(app.remove_tray_by_id(TRAY_ID));
-			drop(tray);
-		});
-		if let Err(err) = result {
-			tracing::warn!(error = %err, "failed to remove agent-status tray icon");
-		}
 	}
 }

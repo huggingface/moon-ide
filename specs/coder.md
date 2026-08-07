@@ -757,10 +757,12 @@ fetch can't blank a genuinely running pip. (The companion seeds from
 the same method.)
 
 The same running / finished signal also surfaces at the OS level —
-a status dot on the window icon, a transient tray icon, and a
-taskbar flash when a turn settles unfocused — driven by a backend
-count of live turn loops, not the frontend flags. See
-[ADR 0058](decisions/0058-agent-activity-indicator.md).
+a status dot on the window icon and on the always-visible
+per-workspace tray icon, and a taskbar flash when a turn settles
+unfocused — driven by a backend count of live turn loops, not the
+frontend flags. See
+[ADR 0058](decisions/0058-agent-activity-indicator.md) and
+[ADR 0061](decisions/0061-persistent-tray-icon.md).
 
 ### On disk
 
