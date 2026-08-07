@@ -86,6 +86,21 @@ enum Command {
 		#[arg(long)]
 		workspace: String,
 	},
+	/// Show or set the model picks (`state.json`, same store the
+	/// desktop picker writes). Prints the current picks when no flag
+	/// is given. A running `serve` reads the picks at boot — restart
+	/// its unit after changing them.
+	Model {
+		/// Standard model slug, e.g. `moonshotai/Kimi-K3` or
+		/// `Qwen/Qwen3.5-397B-A17B:scaleway`. Empty string resets to
+		/// the built-in default.
+		#[arg(long)]
+		standard: Option<String>,
+		/// Cheap model slug (titles, summaries, commit messages).
+		/// Empty string resets to the built-in default.
+		#[arg(long)]
+		cheap: Option<String>,
+	},
 }
 
 fn main() -> anyhow::Result<()> {
@@ -111,6 +126,7 @@ fn main() -> anyhow::Result<()> {
 			Command::Enroll { bridge, code, label } => enroll(bridge, code, label).await,
 			Command::WorkspaceAdd { name, folder, slug } => workspace_add(name, folder, slug).await,
 			Command::Serve { workspace } => serve(workspace).await,
+			Command::Model { standard, cheap } => model(standard, cheap).await,
 		}
 	})
 }
@@ -444,6 +460,43 @@ async fn serve(slug: String) -> anyhow::Result<()> {
 			}
 		}
 	}
+}
+
+/// Show or persist the model picks. Writes the same `state.json`
+/// fields the desktop picker saves, so the two stay interchangeable;
+/// prints the effective values (empty = built-in default) either way.
+async fn model(standard: Option<String>, cheap: Option<String>) -> anyhow::Result<()> {
+	let config_dir = config_dir()?;
+	let state = app_state_store::mutate(&config_dir, move |s| {
+		if let Some(standard) = standard {
+			s.coder.standard_model = standard.trim().to_string();
+		}
+		if let Some(cheap) = cheap {
+			s.coder.cheap_model = cheap.trim().to_string();
+		}
+		s.clone()
+	})
+	.await?;
+	let show = |slug: &str, default: &str| {
+		if slug.is_empty() {
+			format!("{default} (default)")
+		} else {
+			slug.to_string()
+		}
+	};
+	println!(
+		"standard  {}",
+		show(
+			&state.coder.standard_model,
+			moon_coder::defaults::DEFAULT_STANDARD_MODEL
+		)
+	);
+	println!(
+		"cheap     {}",
+		show(&state.coder.cheap_model, moon_coder::defaults::DEFAULT_CHEAP_MODEL)
+	);
+	println!("(a running `moon-remote serve` picks these up on restart)");
+	Ok(())
 }
 
 /// Bind the per-workspace single-instance socket (same path +

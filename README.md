@@ -133,6 +133,29 @@ Notes:
 - The keyring backend needs a Secret Service even headless — run under `dbus-run-session` with an unlocked `gnome-keyring-daemon` (see the ADR).
 - Phone pairing QRs are minted on demand from any enrolled IDE's Companion panel; no relay restart needed.
 
+## Headless IDE (`moon-remote`)
+
+A remote machine can serve its workspaces to the companion with no desktop session ([ADR 0059](specs/decisions/0059-headless-enrolled-ide.md)): `moon-remote` is an enrolled IDE without a webview — same relay protocol, same keyring, same coder. First-time setup on the box:
+
+```bash
+cargo build --release -p moon-remote   # same glibc caveat as the relay
+scp target/release/moon-remote box:~/bin/
+
+# on the box
+moon-remote login                      # HF device flow: prints a URL + code
+moon-remote enroll --bridge wss://bridge.example.com --code XXXX-XXXX
+moon-remote workspace-add --name myproject --folder ~/code/myproject
+moon-remote model --standard moonshotai/Kimi-K3   # optional; empty = default
+moon-remote serve --workspace myproject
+```
+
+Notes:
+
+- Everything shares the desktop's dirs + keyring (`state.json`, per-workspace `session.json`, coder sessions), so a machine can flip between desktop and headless serving of the same workspaces — `model` edits the same picks as the desktop's picker, and a running `serve` re-reads them on restart.
+- A Secret Service must be reachable: on a desktop box, the login session's keyring (auto-login + an empty-password login keyring make reboots hands-off); on a server, the `dbus-run-session` + `gnome-keyring-daemon` recipe from ADR 0035.
+- For boot persistence, run `serve` from a `systemd --user` template unit (with `loginctl enable-linger`), e.g. `moon-remote@<workspace>.service` with `Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus` and `Restart=always`.
+- `workspace_launch` from the phone spawns a sibling `serve` process for stopped workspaces; a `workspace-add` while serving shows up on the phone after the unit restarts (Register refresh is a known gap).
+
 ## `moon-base` docker image
 
 Used for workspace containers, if not wanting to run dev processes on host machines.

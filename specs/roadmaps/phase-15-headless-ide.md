@@ -23,6 +23,9 @@ relay (`wss://` bridge, Phase 14).
   enrollment, credential in the keyring, `ide_id` = hostname.
 - `moon-remote workspace-add --name <n> --folder <abs path>` —
   catalog entry + folder binding, desktop-compatible.
+- `moon-remote model [--standard <slug>] [--cheap <slug>]` — show/set
+  the model picks in `state.json` (same store as the desktop picker);
+  a running `serve` re-reads on restart.
 - `moon-remote serve --workspace <slug>` — boot (state load, folder
   restore, models seed, `CoderHandle`), instance.sock single-instance
   lock, relay connect with the full catalog registered.

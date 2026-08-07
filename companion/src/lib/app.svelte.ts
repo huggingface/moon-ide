@@ -870,6 +870,33 @@ class CompanionState {
 		}
 	}
 
+	/** Set the standard model for the Hugging Face route (slug, e.g.
+	 * `moonshotai/Kimi-K3` or `owner/name:provider`). Round-trips the
+	 * whole settings payload, so the desktop picker and the runner
+	 * see it exactly like a desktop save. Empty resets to the
+	 * built-in default. HF route only — user providers carry their
+	 * model in their own config, which stays desktop-edited. */
+	async setStandardModel(slug: string): Promise<void> {
+		const settings = this.modelSettings;
+		if (!this.activeWorkspace || !settings) {
+			return;
+		}
+		this.savingProvider = true;
+		try {
+			const next: ModelSettings = { ...settings, standard_model: slug.trim() };
+			await this.#call(this.activeWorkspace, 'coder_set_model_settings', { settings: next }, this.activeIde);
+			this.modelSettings = next;
+			// Re-read so `resolved_standard_model` reflects the runner's
+			// fallback chain (e.g. an emptied slug resolving to the
+			// built-in default).
+			void this.#loadModelSettings();
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		} finally {
+			this.savingProvider = false;
+		}
+	}
+
 	/** Context-window cap for the current standard model, in
 	 * **thousands of tokens (k)**, or null when the catalog window is
 	 * used directly. Reads `context_window_overrides[resolved_standard_model]`

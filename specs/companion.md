@@ -319,7 +319,10 @@ max_events)`, which replays the slice ending just before that
   lock toggle, via `coder_get_model_settings` /
   `coder_set_model_settings` — the same read/write payload and
   semantics as the desktop picker (a locked save pins the workspace;
-  an unlocked save writes the global default). Provider CRUD and
+  an unlocked save writes the global default). On the HF route the
+  card also edits the **standard model slug** inline (tap the Model
+  row; empty resets to the built-in default) — free-text, no catalog
+  browser on the phone. Provider CRUD and
   API keys stay desktop-only. The same settings payload round-trips
   the **context-window cap** (`context_window_overrides`): tapping
   the session's token-usage widget expands an editor for the

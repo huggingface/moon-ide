@@ -26,6 +26,32 @@
 	/** Provider picker disclosure (collapsed by default). */
 	let providerOpen = $state(false);
 
+	/** Standard-model editor (HF route only): tap the model row to
+	 * edit the slug inline; Enter/Save persists via the same
+	 * settings payload the desktop picker writes. */
+	let editingModel = $state(false);
+	let modelDraft = $state('');
+
+	function startModelEdit(current: string): void {
+		modelDraft = current;
+		editingModel = true;
+	}
+
+	function saveModel(): void {
+		editingModel = false;
+		void app.setStandardModel(modelDraft);
+	}
+
+	function onModelKeydown(e: KeyboardEvent): void {
+		if (e.key === 'Enter') {
+			e.preventDefault();
+			saveModel();
+		} else if (e.key === 'Escape') {
+			e.preventDefault();
+			editingModel = false;
+		}
+	}
+
 	function pickProvider(id: string | null): void {
 		providerOpen = false;
 		void app.setProvider(id);
@@ -122,6 +148,34 @@
 						</button>
 					{/each}
 				</div>
+			{/if}
+			{#if activeId === null}
+				{@const modelSlug = settings.resolved_standard_model ?? ''}
+				{#if editingModel}
+					<div class="model-row">
+						<span class="muted">Model</span>
+						<!-- svelte-ignore a11y_autofocus -->
+						<input
+							class="model-input"
+							autofocus
+							bind:value={modelDraft}
+							onkeydown={onModelKeydown}
+							placeholder="owner/name[:provider] — empty = default"
+							spellcheck="false"
+							disabled={app.savingProvider}
+						/>
+						<button class="ghost" onclick={saveModel} disabled={app.savingProvider}>Save</button>
+					</div>
+				{:else}
+					<button
+						class="model-row model-row-btn"
+						title="Tap to change the model"
+						onclick={() => startModelEdit(modelSlug)}
+					>
+						<span class="muted">Model</span>
+						<span class="model-slug">{modelSlug || '(default)'}</span>
+					</button>
+				{/if}
 			{/if}
 			<label class="lock-row">
 				<input
@@ -386,6 +440,40 @@
 		gap: 0.5rem;
 		font-size: 0.85rem;
 		min-height: 28px;
+	}
+	.model-row {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		font-size: 0.85rem;
+		min-height: 28px;
+		width: 100%;
+	}
+	.model-row-btn {
+		background: none;
+		border: none;
+		padding: 0;
+		color: inherit;
+		text-align: left;
+		cursor: pointer;
+	}
+	.model-slug {
+		font-family: var(--mono, monospace);
+		font-size: 0.8rem;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.model-input {
+		flex: 1;
+		min-width: 0;
+		font-family: var(--mono, monospace);
+		font-size: 0.8rem;
+		background: var(--bg-elev-2);
+		color: var(--fg);
+		border: 1px solid var(--accent);
+		border-radius: var(--radius);
+		padding: 0.3rem 0.5rem;
 	}
 	.lock-row input {
 		width: auto;

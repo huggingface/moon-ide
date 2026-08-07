@@ -35,14 +35,14 @@ pub const HF_OAUTH_CLIENT_ID: &str = "7977dff4-917a-4cf9-a726-dd45e25faa5f";
 /// "not authorized" / "can_pay unknown" until the upgrade happens.
 pub const HF_OAUTH_SCOPES: &str = "inference-api contribute-repos read-billing";
 
-/// Default "standard" model — the everyday driver. Carried verbatim
-/// from the user's brief (see ADR 0010). Seed value the runner uses
-/// when [`crate::models::CoderModels::standard`] is empty (i.e. the
-/// user hasn't picked one in the settings popover). User-facing
-/// label is "standard" because the picker exposes the choice as
-/// "Standard model" vs "Cheap model" — `large` would imply a tier
-/// system we don't actually have.
-pub const DEFAULT_STANDARD_MODEL: &str = "Qwen/Qwen3.5-397B-A17B:scaleway";
+/// Default "standard" model — the everyday driver (see ADR 0010 for
+/// the naming; "standard" vs "cheap", not a tier system). Seed value
+/// the runner uses when [`crate::models::CoderModels::standard`] is
+/// empty (i.e. the user hasn't picked one in the settings popover).
+/// Unpinned (`:provider`-less) so the router picks the route; the
+/// tool-call-id dedupe (ADR 0057) already absorbs Kimi-via-Baseten's
+/// per-message id-reset quirk.
+pub const DEFAULT_STANDARD_MODEL: &str = "moonshotai/Kimi-K3";
 
 /// Default "cheap" model — used for auto-rename session titles,
 /// branch-name suggester, compaction summaries, folder summaries.
@@ -117,6 +117,7 @@ and do not apologise. If the remaining content is long, prioritise finishing the
 /// authoritative from then on.
 pub fn context_window_for(model_slug: &str) -> u32 {
 	const TABLE: &[(&str, u32)] = &[
+		("moonshotai/Kimi-K3", 1_000_000),
 		("Qwen/Qwen3.5-397B-A17B", 256_000),
 		("Qwen/Qwen3-Coder-30B-A3B-Instruct", 256_000),
 	];
