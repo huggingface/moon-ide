@@ -713,6 +713,13 @@ pub trait WorkspaceHost: Send + Sync {
 	/// Returns `Ok(None)` when not a repo or git is unavailable.
 	async fn git_snapshot_baseline(&self) -> MoonResult<Option<String>>;
 
+	/// Web base URL of the folder's `origin`/`upstream` remote
+	/// (e.g. `https://github.com/owner/repo`), or `None` when the
+	/// remote isn't a recognised host / not a repo. Powers `#123`
+	/// issue-reference autolinks in the companion's transcript and
+	/// anything else that wants a repo-relative web link.
+	async fn git_remote_web_url(&self) -> MoonResult<Option<String>>;
+
 	/// Diff the working tree against a baseline commit SHA, scoped to
 	/// a file list (the turn's format-queue entries — the files the
 	/// agent's `write_file` / `edit_file` tools touched). Runs
@@ -2382,6 +2389,14 @@ impl WorkspaceHost for LocalHost {
 		})
 		.await
 		.map_err(|e| MoonError::Internal(format!("git_snapshot_baseline join error: {e}")))
+	}
+
+	async fn git_remote_web_url(&self) -> MoonResult<Option<String>> {
+		let root = self.root.clone();
+		// Read-only `git config --get`; no repo lock needed.
+		tokio::task::spawn_blocking(move || remote_web_url(&root))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_remote_web_url join error: {e}")))
 	}
 
 	async fn git_diff_against(&self, commit_sha: &str, files: &[String]) -> MoonResult<String> {

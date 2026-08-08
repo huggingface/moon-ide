@@ -57,6 +57,10 @@ export type ProviderLock = { kind: 'hf' } | { kind: 'user'; id: string };
  * `fs_git_change_summary` / the coordinator's `workspace_scm_status`
  * tool fold: untracked → added, conflicted → modified). */
 type ScmStatus = {
+	/** Repo web base (e.g. `https://github.com/owner/repo`) from the
+	 * folder's origin/upstream remote; absent for unrecognised
+	 * hosts / older IDE builds. Drives `#123` transcript autolinks. */
+	remote_url?: string | null;
 	/** Optional on the wire: an older enrolled IDE, or a folder
 	 * whose SCM probe failed, can return a status with no `branch`
 	 * object. The card renders only when it's present (and `changes`
@@ -304,6 +308,78 @@ function parseAskUserArgs(args: unknown): AskUserQuestion[] {
 
 type Phase = 'connecting' | 'pairing' | 'ready' | 'error';
 
+/** One outbound prompt not yet confirmed by the backend's echoed
+ * `user_message`. Carries its own workspace/ide carrier so a resend
+ * after an app restart targets the right IDE regardless of what the
+ * phone is looking at. */
+export type PendingSend = {
+	id: string;
+	sessionId: string;
+	workspace: string;
+	ide: string;
+	text: string;
+	status: 'sending' | 'unconfirmed' | 'unsent';
+	/** Error message for the unconfirmed state. */
+	error?: string | undefined;
+};
+
+const PENDING_SENDS_KEY = 'moon-companion-pending-sends';
+
+/** Restore unconfirmed/unsent sends from localStorage so killing the
+ * PWA can't lose a message's text. Entries persisted mid-flight
+ * (`sending`) restore as `unconfirmed` — the RPC's fate is unknown,
+ * which is exactly what that state means. Parse failures restore
+ * nothing (no migrations pre-release). */
+function loadPendingSends(): PendingSend[] {
+	try {
+		const raw = localStorage.getItem(PENDING_SENDS_KEY);
+		if (!raw) {
+			return [];
+		}
+		const parsed: unknown = JSON.parse(raw);
+		if (!Array.isArray(parsed)) {
+			return [];
+		}
+		const out: PendingSend[] = [];
+		for (const item of parsed) {
+			const o = asRecord(item);
+			if (
+				o === null ||
+				typeof o.id !== 'string' ||
+				typeof o.sessionId !== 'string' ||
+				typeof o.workspace !== 'string' ||
+				typeof o.text !== 'string'
+			) {
+				continue;
+			}
+			out.push({
+				id: o.id,
+				sessionId: o.sessionId,
+				workspace: o.workspace,
+				ide: typeof o.ide === 'string' ? o.ide : '',
+				text: o.text,
+				status: o.status === 'unsent' ? 'unsent' : 'unconfirmed',
+			});
+		}
+		return out;
+	} catch {
+		return [];
+	}
+}
+
+/** Write-through persistence for the pending-send list. */
+function savePendingSends(list: PendingSend[]): void {
+	try {
+		if (list.length === 0) {
+			localStorage.removeItem(PENDING_SENDS_KEY);
+		} else {
+			localStorage.setItem(PENDING_SENDS_KEY, JSON.stringify(list));
+		}
+	} catch {
+		// Quota/private-mode failure: in-memory behaviour still works.
+	}
+}
+
 class CompanionState {
 	phase = $state<Phase>('connecting');
 	error = $state<string | null>(null);
@@ -338,6 +414,9 @@ class CompanionState {
 	savingProvider = $state(false);
 	/** SCM status for the active folder, or null while loading. */
 	scmStatus = $state<ScmStatus | null>(null);
+	/** Repo web base for the active folder (from `scmStatus`), kept
+	 * separately so transcript autolinks survive SCM reloads. */
+	repoUrl = $state<string | null>(null);
 	/** True while fetching SCM status. */
 	loadingScm = $state(false);
 	/** True while a commit is in flight. */
@@ -557,6 +636,13 @@ class CompanionState {
 			}
 			this.#ensureSubscribed(this.activeWorkspace, this.activeIde);
 			await this.#refreshSessions();
+			// Flush sends that never left the phone (`unsent`) — safe
+			// unconditionally: the transport rejected them before
+			// writing, so no double-send is possible. Timed-out
+			// (`unconfirmed`) entries stay manual.
+			for (const entry of this.pendingSends.filter((p) => p.status === 'unsent')) {
+				void this.resendPending(entry.id);
+			}
 			if (this.activeSession) {
 				// Re-open to replay whatever streamed while we were
 				// backgrounded. Best-effort: a fresh session that never
@@ -772,6 +858,7 @@ class CompanionState {
 				{ folder: this.activeFolder },
 				this.activeIde,
 			);
+			this.repoUrl = this.scmStatus.remote_url ?? null;
 		} catch {
 			this.scmStatus = null;
 		} finally {
@@ -826,18 +913,12 @@ class CompanionState {
 	 * `unconfirmed` after an error — which does NOT mean lost: a
 	 * bridge-side forward timeout (IDE asleep) resolves when the
 	 * IDE wakes and drains its socket, at which point the echoed
-	 * event reconciles the entry away. Kept per session so the text
-	 * is never lost to a scare: the row renders with copy/resend. */
-	pendingSends = $state<
-		{
-			id: string;
-			sessionId: string;
-			text: string;
-			status: 'sending' | 'unconfirmed';
-			/** Error message for the unconfirmed state. */
-			error?: string | undefined;
-		}[]
-	>([]);
+	 * event reconciles the entry away. `unsent` is the provably-
+	 * never-left-the-phone case (transport rejected before writing:
+	 * `not connected`) — safe to auto-resend on reconnect, which
+	 * `ensureConnected` does. Kept per session so the text is never
+	 * lost to a scare: the row renders with copy/resend. */
+	pendingSends = $state<PendingSend[]>(loadPendingSends());
 
 	/** Drop the pending entry matching an echoed user message —
 	 * called from the live `user_message` handler. Matches by
@@ -847,6 +928,7 @@ class CompanionState {
 		const idx = this.pendingSends.findIndex((p) => p.sessionId === sessionId && p.text === text);
 		if (idx >= 0) {
 			this.pendingSends = this.pendingSends.toSpliced(idx, 1);
+			savePendingSends(this.pendingSends);
 		}
 	}
 
@@ -860,23 +942,26 @@ class CompanionState {
 		}
 		entry.status = 'sending';
 		entry.error = undefined;
+		savePendingSends(this.pendingSends);
 		try {
-			this.busy = true;
-			await this.#call(
-				this.activeWorkspace,
-				'coder_send',
-				{ text: entry.text, session_id: entry.sessionId },
-				this.activeIde,
-			);
+			if (entry.sessionId === this.activeSession) {
+				this.busy = true;
+			}
+			await this.#call(entry.workspace, 'coder_send', { text: entry.text, session_id: entry.sessionId }, entry.ide);
 		} catch (e) {
-			this.busy = false;
-			entry.status = 'unconfirmed';
-			entry.error = e instanceof Error ? e.message : String(e);
+			if (entry.sessionId === this.activeSession) {
+				this.busy = false;
+			}
+			const msg = e instanceof Error ? e.message : String(e);
+			entry.status = msg === 'not connected' ? 'unsent' : 'unconfirmed';
+			entry.error = msg;
+			savePendingSends(this.pendingSends);
 		}
 	}
 
 	dismissPending(id: string): void {
 		this.pendingSends = this.pendingSends.filter((p) => p.id !== id);
+		savePendingSends(this.pendingSends);
 	}
 
 	/** Ask the fast model for a one-line commit subject from the
@@ -1293,13 +1378,16 @@ class CompanionState {
 		if (!this.activeWorkspace || !this.activeSession || !text.trim()) {
 			return;
 		}
-		const entry = {
+		const entry: PendingSend = {
 			id: `send-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
 			sessionId: this.activeSession,
+			workspace: this.activeWorkspace,
+			ide: this.activeIde,
 			text,
-			status: 'sending' as const,
+			status: 'sending',
 		};
 		this.pendingSends = [...this.pendingSends, entry];
+		savePendingSends(this.pendingSends);
 		try {
 			this.busy = true;
 			await this.#call(this.activeWorkspace, 'coder_send', { text, session_id: this.activeSession }, this.activeIde);
@@ -1312,8 +1400,13 @@ class CompanionState {
 			this.busy = false;
 			const target = this.pendingSends.find((p) => p.id === entry.id);
 			if (target) {
-				target.status = 'unconfirmed';
-				target.error = e instanceof Error ? e.message : String(e);
+				const msg = e instanceof Error ? e.message : String(e);
+				// `not connected` is thrown before anything hits the
+				// wire — the message provably never left the phone,
+				// so it's auto-resent on reconnect instead of asking.
+				target.status = msg === 'not connected' ? 'unsent' : 'unconfirmed';
+				target.error = msg;
+				savePendingSends(this.pendingSends);
 			}
 		}
 	}

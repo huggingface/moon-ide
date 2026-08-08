@@ -388,6 +388,10 @@ impl BridgeRpcHandler for BridgeRpc {
 				let p: FolderParams = parse_params(params)?;
 				let folder = self.resolve_folder(&p).await?;
 				let branch = folder.host.git_branch().await.unwrap_or_default();
+				// Repo web base (e.g. https://github.com/owner/repo) for
+				// the phone's `#123` transcript autolinks; absent when
+				// the remote isn't a recognised host.
+				let remote_url = folder.host.git_remote_web_url().await.ok().flatten();
 				let entries = folder.host.git_status_entries(&[]).await.unwrap_or_default();
 				// Fold untracked → added, conflicted → modified
 				// (same as `fs_git_change_summary` / the
@@ -414,6 +418,7 @@ impl BridgeRpcHandler for BridgeRpc {
 					}));
 				}
 				Ok(serde_json::json!({
+					"remote_url": remote_url,
 					"branch": {
 						"name": branch.name,
 						"head_short_sha": branch.head_short_sha,

@@ -15,8 +15,67 @@
 		return defaultLink(tokens, idx, options, env, self);
 	};
 
-	type Props = { text: string };
-	let { text }: Props = $props();
+	// Autolink GitHub-style issue/PR references (`#123`) in plain
+	// text to `<repoUrl>/issues/123` (GitHub redirects to /pull for
+	// PRs). Runs as a core rule over the parsed token stream, so it
+	// only touches `text` tokens — references inside existing
+	// markdown links or code spans/fences are left alone by
+	// construction. `repoUrl` rides in via the render env; no repo,
+	// no rule.
+	md.core.ruler.push('issue_refs', (state) => {
+		const repoUrl: unknown = (state.env as Record<string, unknown>).repoUrl;
+		if (typeof repoUrl !== 'string' || repoUrl.length === 0) {
+			return;
+		}
+		for (const block of state.tokens) {
+			if (block.type !== 'inline' || !block.children) {
+				continue;
+			}
+			let linkDepth = 0;
+			const out: (typeof block.children)[number][] = [];
+			for (const tok of block.children) {
+				if (tok.type === 'link_open') {
+					linkDepth++;
+				} else if (tok.type === 'link_close') {
+					linkDepth--;
+				}
+				if (tok.type !== 'text' || linkDepth > 0 || !/#\d+/.test(tok.content)) {
+					out.push(tok);
+					continue;
+				}
+				// Split on standalone `#123` (not `abc#123`, not `#123x`).
+				let rest = tok.content;
+				const re = /(^|[^\w#])#(\d+)(?![\w#])/;
+				let m = re.exec(rest);
+				while (m !== null) {
+					const before = rest.slice(0, m.index) + (m[1] ?? '');
+					if (before) {
+						const t = new state.Token('text', '', 0);
+						t.content = before;
+						out.push(t);
+					}
+					const open = new state.Token('link_open', 'a', 1);
+					open.attrSet('href', `${repoUrl}/issues/${m[2]}`);
+					out.push(open);
+					const label = new state.Token('text', '', 0);
+					label.content = `#${m[2]}`;
+					out.push(label);
+					out.push(new state.Token('link_close', 'a', -1));
+					rest = rest.slice(m.index + m[0].length);
+					m = re.exec(rest);
+				}
+				if (rest) {
+					const t = new state.Token('text', '', 0);
+					t.content = rest;
+					out.push(t);
+				}
+			}
+			block.children = out;
+		}
+	});
+
+	type Props = { text: string; repoUrl?: string | null };
+	let { text, repoUrl = null }: Props = $props();
 
 	// rAF-coalesced render: streaming deltas arrive faster than
 	// frames, and re-parsing + rewriting innerHTML per delta would
@@ -34,7 +93,7 @@
 		}
 		frame = requestAnimationFrame(() => {
 			frame = null;
-			html = md.render(pending);
+			html = md.render(pending, { repoUrl });
 		});
 	});
 

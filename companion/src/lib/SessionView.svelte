@@ -803,7 +803,7 @@
 					</details>
 				{/if}
 				{#if row.text}
-					<div class="bubble assistant"><Markdown text={row.text} /></div>
+					<div class="bubble assistant"><Markdown text={row.text} repoUrl={app.repoUrl} /></div>
 				{/if}
 			{:else if row.kind === 'tool'}
 				{@const body = toolBody(row.name, row.args, row.result)}
@@ -929,10 +929,19 @@
 			<button type="button" class="jump-latest" onclick={jumpToLatest}>Jump to latest ↓</button>
 		{/if}
 		{#each app.pendingSends.filter((ps) => ps.sessionId === app.activeSession) as ps (ps.id)}
-			<div class="pending-send" class:unconfirmed={ps.status === 'unconfirmed'}>
+			<div class="pending-send" class:unconfirmed={ps.status !== 'sending'}>
 				<div class="pending-text">{ps.text}</div>
 				{#if ps.status === 'sending'}
 					<div class="pending-status muted">Sending…</div>
+				{:else if ps.status === 'unsent'}
+					<div class="pending-status">
+						Not sent — no connection to the relay. It will be sent <strong>automatically</strong> when the connection is back.
+					</div>
+					<div class="pending-actions">
+						<button class="ghost" onclick={() => navigator.clipboard.writeText(ps.text)}>Copy</button>
+						<button class="ghost" onclick={() => void app.resendPending(ps.id)}>Send now</button>
+						<button class="ghost" onclick={() => app.dismissPending(ps.id)}>Dismiss</button>
+					</div>
 				{:else}
 					<div class="pending-status">
 						Delivery unconfirmed{#if ps.error}&nbsp;<span class="muted">({ps.error})</span>{/if} — the IDE may be asleep or

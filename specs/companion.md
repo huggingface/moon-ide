@@ -235,6 +235,12 @@ requested surface:
   (unified patch, 64 kB cap), and the phone renders per-file
   collapsible diff sections. `base_ref: null` means "nothing to
   review against" (on the default branch / detached / no remote).
+- **Issue-reference autolinks.** Assistant markdown linkifies
+  standalone `#123` to `<repo web url>/issues/123` (GitHub
+  redirects PRs), where the repo URL comes from the active folder's
+  origin/upstream remote (`remote_url` on `workspace_scm_status`,
+  via `WorkspaceHost::git_remote_web_url`). Token-stream rule, so
+  references inside existing links or code spans are untouched.
 - **Run / steer coder sessions.** Subscribe to `coder:event`,
   render the transcript, `coder_send` (send / steer), `coder_abort`.
   Opening a session is **windowed** (`coder_open_session` with
@@ -258,7 +264,14 @@ max_events)`, which replays the slice ending just before that
   unconfirmed" with copy / resend / dismiss — deliberately not a
   global error, because a timed-out forward frequently _does_
   arrive when the IDE wakes and drains its socket, at which point
-  the echo reconciles the row away. The workspace switcher's Start
+  the echo reconciles the row away. A `not connected` rejection
+  (thrown before anything hits the wire) is the distinct **unsent**
+  state instead: provably never left the phone, so it auto-resends
+  on reconnect — no double-send possible, no question asked.
+  Unresolved entries persist in `localStorage` (restored on launch;
+  mid-flight `sending` restores as `unconfirmed` since the RPC's
+  fate is unknown), each carrying its own workspace/ide carrier so
+  a post-restart resend targets the right IDE. The workspace switcher's Start
   button shows a disabled "Starting…" state and polls the listing
   until the launched workspace reports live. A queued steer renders as a
   muted "queued" bubble; tapping it reveals two chips — **un-queue**
