@@ -251,7 +251,16 @@ max_events)`, which replays the slice ending just before that
   ordinal and prepends it. Session list / new reuse the existing
   `coder_*` commands. The composer keeps **send available while a
   turn runs** (the message queues as a steer, same as the desktop);
-  Stop is a separate smaller button. A queued steer renders as a
+  Stop is a separate smaller button. Sends are **optimistic**: a
+  pending row renders immediately, confirmed away by the echoed
+  `user_message`. A failed RPC (typically the bridge's forward
+  timeout while the IDE host sleeps) flips the row to "delivery
+  unconfirmed" with copy / resend / dismiss — deliberately not a
+  global error, because a timed-out forward frequently _does_
+  arrive when the IDE wakes and drains its socket, at which point
+  the echo reconciles the row away. The workspace switcher's Start
+  button shows a disabled "Starting…" state and polls the listing
+  until the launched workspace reports live. A queued steer renders as a
   muted "queued" bubble; tapping it reveals two chips — **un-queue**
   (`coder_unqueue_steer`, pops it back into the composer to edit)
   and **go now** (`coder_drain_steer_now`, cancels the running turn

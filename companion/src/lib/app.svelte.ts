@@ -491,19 +491,43 @@ class CompanionState {
 	 * directly. For a remote-carrier workspace, the bridge forwards
 	 * to the owning enrolled IDE, which runs the same "focus or
 	 * spawn" path as the desktop's `window_open`. */
+	/** Workspaces with a launch in flight, keyed `ide\u0000id` —
+	 * drives the Start button's disabled/spinner state. An entry
+	 * stays until the refreshed listing reports the workspace live
+	 * (or the launch errors), so the button can't be double-tapped
+	 * while the new process boots. */
+	launching = $state<Set<string>>(new Set());
+
 	async launchWorkspace(workspace: string, ide = ''): Promise<void> {
 		if (!this.#socket || !this.connection) {
 			return;
 		}
+		const key = `${ide}\u0000${workspace}`;
+		if (this.launching.has(key)) {
+			return;
+		}
+		this.launching = new Set([...this.launching, key]);
 		this.error = null;
+		const clear = () => {
+			const next = new Set(this.launching);
+			next.delete(key);
+			this.launching = next;
+		};
 		try {
 			await this.#call(workspace, 'workspace_launch', { workspace_id: workspace }, ide);
-			// Poll the workspace list so the phone sees it go live.
-			// The new process takes a moment to bind its socket; a
-			// single re-fetch after a short delay catches it, and
-			// the user can pull-to-refresh if they're early.
-			setTimeout(() => void this.loadWorkspaces(), 1500);
+			// Poll the workspace list until the new process binds its
+			// socket and reports live (or give up after ~12 s and let
+			// pull-to-refresh take over).
+			for (let attempt = 0; attempt < 6; attempt++) {
+				await new Promise((r) => setTimeout(r, 2000));
+				await this.loadWorkspaces();
+				if (this.workspaces.some((w) => (w.ide ?? '') === ide && w.id === workspace && w.live)) {
+					break;
+				}
+			}
+			clear();
 		} catch (e) {
+			clear();
 			this.error = e instanceof Error ? e.message : String(e);
 		}
 	}
@@ -795,6 +819,64 @@ class CompanionState {
 
 	closeReview(): void {
 		this.review = null;
+	}
+
+	/** Outbound prompts not yet confirmed by the backend's echoed
+	 * `user_message` event. `sending` while the RPC is in flight;
+	 * `unconfirmed` after an error — which does NOT mean lost: a
+	 * bridge-side forward timeout (IDE asleep) resolves when the
+	 * IDE wakes and drains its socket, at which point the echoed
+	 * event reconciles the entry away. Kept per session so the text
+	 * is never lost to a scare: the row renders with copy/resend. */
+	pendingSends = $state<
+		{
+			id: string;
+			sessionId: string;
+			text: string;
+			status: 'sending' | 'unconfirmed';
+			/** Error message for the unconfirmed state. */
+			error?: string | undefined;
+		}[]
+	>([]);
+
+	/** Drop the pending entry matching an echoed user message —
+	 * called from the live `user_message` handler. Matches by
+	 * session + exact text (first hit), so late deliveries clear
+	 * their "unconfirmed" row whenever they land. */
+	#reconcilePendingSend(sessionId: string, text: string): void {
+		const idx = this.pendingSends.findIndex((p) => p.sessionId === sessionId && p.text === text);
+		if (idx >= 0) {
+			this.pendingSends = this.pendingSends.toSpliced(idx, 1);
+		}
+	}
+
+	/** Re-send an unconfirmed entry. The original may still arrive
+	 * (double-send is possible by design — the user decides); the
+	 * entry flips back to `sending` and reconciles on either echo. */
+	async resendPending(id: string): Promise<void> {
+		const entry = this.pendingSends.find((p) => p.id === id);
+		if (!entry || !this.activeWorkspace) {
+			return;
+		}
+		entry.status = 'sending';
+		entry.error = undefined;
+		try {
+			this.busy = true;
+			await this.#call(
+				this.activeWorkspace,
+				'coder_send',
+				{ text: entry.text, session_id: entry.sessionId },
+				this.activeIde,
+			);
+		} catch (e) {
+			this.busy = false;
+			entry.status = 'unconfirmed';
+			entry.error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
+	dismissPending(id: string): void {
+		this.pendingSends = this.pendingSends.filter((p) => p.id !== id);
 	}
 
 	/** Ask the fast model for a one-line commit subject from the
@@ -1211,12 +1293,28 @@ class CompanionState {
 		if (!this.activeWorkspace || !this.activeSession || !text.trim()) {
 			return;
 		}
+		const entry = {
+			id: `send-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+			sessionId: this.activeSession,
+			text,
+			status: 'sending' as const,
+		};
+		this.pendingSends = [...this.pendingSends, entry];
 		try {
 			this.busy = true;
 			await this.#call(this.activeWorkspace, 'coder_send', { text, session_id: this.activeSession }, this.activeIde);
 		} catch (e) {
+			// NOT necessarily lost: a bridge forward timeout (IDE
+			// asleep / offline) often completes when the IDE wakes —
+			// the echoed `user_message` then reconciles this entry
+			// away. Surface the state on the row itself instead of a
+			// scary global error.
 			this.busy = false;
-			this.error = e instanceof Error ? e.message : String(e);
+			const target = this.pendingSends.find((p) => p.id === entry.id);
+			if (target) {
+				target.status = 'unconfirmed';
+				target.error = e instanceof Error ? e.message : String(e);
+			}
 		}
 	}
 
@@ -1521,6 +1619,12 @@ class CompanionState {
 		const rows = this.#rowsOverride ?? this.rows;
 		switch (ev.kind) {
 			case 'user_message': {
+				// Confirmed delivery: clear any matching optimistic
+				// pending-send entry (incl. late arrivals after a
+				// forward timeout — the whole point of the row).
+				if (eventSid) {
+					this.#reconcilePendingSend(eventSid, str(ev, 'text'));
+				}
 				// A queued steer arrives as a provisional bubble; a
 				// drained one arrives as a fresh `queued: false` message
 				// (new id) appended at the bottom. Either way it's a

@@ -65,10 +65,13 @@
 							<span class="muted">{ws.live ? 'running' : 'stopped'} · {ws.id}</span>
 						</button>
 						{#if !ws.live}
+							{@const starting = app.launching.has(`${ws.ide ?? ''}\u0000${ws.id}`)}
 							<button
 								class="ghost launch-btn"
-								title="Start this workspace"
-								onclick={() => app.launchWorkspace(ws.id, ws.ide ?? '')}>Start</button
+								class:starting
+								title={starting ? 'Starting…' : 'Start this workspace'}
+								disabled={starting}
+								onclick={() => app.launchWorkspace(ws.id, ws.ide ?? '')}>{starting ? 'Starting…' : 'Start'}</button
 							>
 						{/if}
 					</div>
@@ -103,6 +106,15 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+	}
+	.launch-btn.starting {
+		opacity: 0.6;
+		animation: launch-pulse 1.2s ease-in-out infinite;
+	}
+	@keyframes launch-pulse {
+		50% {
+			opacity: 0.3;
+		}
 	}
 	.launch-btn {
 		flex: none;

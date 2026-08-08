@@ -928,6 +928,29 @@
 			</button>
 			<button type="button" class="jump-latest" onclick={jumpToLatest}>Jump to latest ↓</button>
 		{/if}
+		{#each app.pendingSends.filter((ps) => ps.sessionId === app.activeSession) as ps (ps.id)}
+			<div class="pending-send" class:unconfirmed={ps.status === 'unconfirmed'}>
+				<div class="pending-text">{ps.text}</div>
+				{#if ps.status === 'sending'}
+					<div class="pending-status muted">Sending…</div>
+				{:else}
+					<div class="pending-status">
+						Delivery unconfirmed{#if ps.error}&nbsp;<span class="muted">({ps.error})</span>{/if} — the IDE may be asleep or
+						offline. The message is <strong>not lost</strong>: it often still arrives when the IDE reconnects, and this
+						row disappears once it does.
+					</div>
+					<div class="pending-actions">
+						<button class="ghost" onclick={() => navigator.clipboard.writeText(ps.text)}>Copy</button>
+						<button
+							class="ghost"
+							title="Send again now (if the original also arrives, the coder gets it twice)"
+							onclick={() => void app.resendPending(ps.id)}>Resend</button
+						>
+						<button class="ghost" onclick={() => app.dismissPending(ps.id)}>Dismiss</button>
+					</div>
+				{/if}
+			</div>
+		{/each}
 		{#if app.rows.length === 0}
 			{#if isCoordinator}
 				<div class="empty-hint">
@@ -1533,6 +1556,36 @@
 	}
 	.send-btn:disabled {
 		opacity: 0.45;
+	}
+	.pending-send {
+		align-self: flex-end;
+		max-width: 88%;
+		background: var(--bg-elev);
+		border: 1px dashed var(--border);
+		border-radius: var(--radius);
+		padding: 0.5rem 0.7rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.35rem;
+	}
+	.pending-send.unconfirmed {
+		border-color: var(--accent);
+	}
+	.pending-text {
+		white-space: pre-wrap;
+		word-break: break-word;
+	}
+	.pending-status {
+		font-size: 0.75rem;
+		line-height: 1.35;
+	}
+	.pending-actions {
+		display: flex;
+		gap: 0.4rem;
+	}
+	.pending-actions .ghost {
+		padding: 0.25rem 0.6rem;
+		font-size: 0.8rem;
 	}
 	.review-btn {
 		flex: none;
