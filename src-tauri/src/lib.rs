@@ -148,6 +148,7 @@ pub fn run() {
 			commands::fs::fs_git_head_content,
 			commands::fs::fs_git_ref_content,
 			commands::fs::fs_git_default_branch_diff,
+			commands::fs::fs_git_remote_web_url,
 			commands::fs::fs_git_branch,
 			commands::fs::fs_git_commit,
 			commands::fs::fs_git_commit_on_new_branch,

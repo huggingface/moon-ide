@@ -53,6 +53,79 @@ import { extractFenceLanguages, highlightCode, loadHighlighters } from './editor
 // drop raw URLs into prose. Sharing the highlighter + link
 // renderer config below keeps the two surfaces visually identical
 // for everything else.
+// Repo web base (e.g. `https://github.com/owner/repo`) of the active
+// folder, set on folder switch by `state.svelte.ts`. Read by the
+// `issue_refs` rule below and folded into every cache key so cached
+// HTML never leaks another repo's links across a folder swap.
+let activeRepoUrl: string | null = null;
+
+/** Update the repo the `#123` autolinker targets (null disables). */
+export function setMarkdownRepoUrl(url: string | null): void {
+	activeRepoUrl = url;
+}
+
+/**
+ * Autolink standalone GitHub-style issue/PR references (`#123`) in
+ * plain text to `<repo>/issues/123` (GitHub redirects to /pull for
+ * PRs). Token-stream rule: only `text` tokens outside existing
+ * links are touched, so `[fixed #1](url)` and code spans keep their
+ * bytes. Applied to the linkified (chat) parser only — file/docs
+ * previews shouldn't invent links the author didn't write.
+ */
+function applyIssueRefRule(md: MarkdownIt): void {
+	md.core.ruler.push('issue_refs', (state) => {
+		const repoUrl = activeRepoUrl;
+		if (repoUrl === null || repoUrl.length === 0) {
+			return;
+		}
+		for (const block of state.tokens) {
+			if (block.type !== 'inline' || !block.children) {
+				continue;
+			}
+			let linkDepth = 0;
+			const out: MdToken[] = [];
+			for (const tok of block.children) {
+				if (tok.type === 'link_open') {
+					linkDepth++;
+				} else if (tok.type === 'link_close') {
+					linkDepth--;
+				}
+				if (tok.type !== 'text' || linkDepth > 0 || !/#\d+/.test(tok.content)) {
+					out.push(tok);
+					continue;
+				}
+				// Standalone `#123` only (not `abc#123`, `#123x`, `##9`).
+				let rest = tok.content;
+				const re = /(^|[^\w#])#(\d+)(?![\w#])/;
+				let m = re.exec(rest);
+				while (m !== null) {
+					const before = rest.slice(0, m.index) + (m[1] ?? '');
+					if (before) {
+						const t = new state.Token('text', '', 0);
+						t.content = before;
+						out.push(t);
+					}
+					const open = new state.Token('link_open', 'a', 1);
+					open.attrSet('href', `${repoUrl}/issues/${m[2]}`);
+					out.push(open);
+					const label = new state.Token('text', '', 0);
+					label.content = `#${m[2]}`;
+					out.push(label);
+					out.push(new state.Token('link_close', 'a', -1));
+					rest = rest.slice(m.index + m[0].length);
+					m = re.exec(rest);
+				}
+				if (rest) {
+					const t = new state.Token('text', '', 0);
+					t.content = rest;
+					out.push(t);
+				}
+			}
+			block.children = out;
+		}
+	});
+}
+
 function buildMarkdownIt(linkify: boolean): MarkdownIt {
 	const md = new MarkdownIt({
 		html: false,
@@ -70,6 +143,9 @@ function buildMarkdownIt(linkify: boolean): MarkdownIt {
 	applyFenceCopyRule(md);
 	applyHeadingAnchorRule(md);
 	applyInlineAnchorRule(md);
+	if (linkify) {
+		applyIssueRefRule(md);
+	}
 	return md;
 }
 
@@ -253,7 +329,7 @@ const markdownCache = new Map<string, string>();
 const MARKDOWN_CACHE_MAX = 500;
 
 function markdownCacheKey(source: string, linkify: boolean): string {
-	return (linkify ? 'L\x00' : '_\x00') + source;
+	return (linkify ? 'L\x00' : '_\x00') + (activeRepoUrl ?? '') + '\x00' + source;
 }
 
 /**
@@ -635,7 +711,7 @@ export async function renderMarkdownBlocks(
  * heading-anchor rule).
  */
 function renderBlock(tokens: MdToken[], sourceText: string, index: number, parser: MarkdownIt): MarkdownBlock {
-	const key = `${index}\x00${sourceText}`;
+	const key = `${index}\x00${activeRepoUrl ?? ''}\x00${sourceText}`;
 	const cached = blockHtmlCache.get(key);
 	if (cached !== undefined) {
 		return { key, html: cached };

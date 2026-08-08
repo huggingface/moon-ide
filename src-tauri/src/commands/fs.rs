@@ -432,6 +432,16 @@ pub async fn fs_git_default_branch_diff(state: State<'_, AppState>) -> Result<Op
 	entry.host.git_default_branch_diff().await
 }
 
+/// Web base URL of the active folder's origin/upstream remote
+/// (e.g. `https://github.com/owner/repo`), `None` for unrecognised
+/// hosts / non-repos. Powers `#123` issue-reference autolinks in
+/// the coder transcript's markdown.
+#[tauri::command]
+pub async fn fs_git_remote_web_url(state: State<'_, AppState>) -> Result<Option<String>, MoonError> {
+	let entry = state.workspaces.require_active_folder().await?;
+	entry.host.git_remote_web_url().await
+}
+
 /// Branch + HEAD info for the active folder's SCM panel header.
 /// All-`None` is the "no branch label" fallback (non-repo folder,
 /// detached HEAD with unreadable commit, etc.).

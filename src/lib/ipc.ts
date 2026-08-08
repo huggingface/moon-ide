@@ -180,6 +180,7 @@ export const ipc = {
 		gitHeadContent: (path: string) => invoke<string | null>('fs_git_head_content', { path }),
 		gitRefContent: (rev: string, path: string) => invoke<string | null>('fs_git_ref_content', { rev, path }),
 		gitDefaultBranchDiff: () => invoke<BranchDiffStatus | null>('fs_git_default_branch_diff'),
+		gitRemoteWebUrl: () => invoke<string | null>('fs_git_remote_web_url'),
 		gitBranch: () => invoke<GitBranchInfo>('fs_git_branch'),
 		gitCommit: (message: string, amend: boolean) => invoke<GitCommitResult>('fs_git_commit', { message, amend }),
 		gitCommitOnNewBranch: (branch: string, message: string) =>

@@ -4,6 +4,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { confirm, save as saveDialog } from '@tauri-apps/plugin-dialog';
 import { SvelteMap } from 'svelte/reactivity';
 import { ipc } from './ipc';
+import { setMarkdownRepoUrl } from './markdown';
 import {
 	DEFAULT_NEXT_EDIT_BASE_URL,
 	DEFAULT_NEXT_EDIT_HF_REPO,
@@ -1674,6 +1675,20 @@ class WorkspaceState {
 		const activeFolderChanged = previousActive !== snapshot.active_folder;
 		if (this.activeFolderState && (this.activeFolderState.paths.length === 0 || activeFolderChanged)) {
 			void this.loadPaths();
+		}
+		// Repoint the markdown `#123` autolinker at the new active
+		// folder's remote (best-effort; null disables the rule and
+		// the cache keys fold the URL in, so stale HTML can't leak
+		// across a folder swap).
+		if (activeFolderChanged) {
+			if (snapshot.active_folder === null) {
+				setMarkdownRepoUrl(null);
+			} else {
+				ipc.fs
+					.gitRemoteWebUrl()
+					.then((url) => setMarkdownRepoUrl(url))
+					.catch(() => setMarkdownRepoUrl(null));
+			}
 		}
 		// Warm the per-folder compose snapshot for every bound
 		// folder so the bars paint with real data on first frame
