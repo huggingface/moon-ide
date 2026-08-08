@@ -4452,6 +4452,25 @@ impl CoderHandle {
 		let session = rt.session.lock().await;
 		let running = rt.turn.lock().await.cancel.is_some();
 		let needs_input = rt.prompts.has_pending().await;
+		// The parked `ask_user`'s questions, recovered from the
+		// assistant message that raised it. The prompt registry only
+		// holds the call id + oneshot; the args (question ids, option
+		// ids) live on the transcript, and the coordinator needs them
+		// to key `respond_to_worker_prompt` answers.
+		let pending_prompt = if needs_input {
+			match rt.prompts.pending_call_id().await {
+				Some(call_id) => session.messages.iter().rev().find_map(|m| match m {
+					ChatMessage::Assistant { tool_calls, .. } => tool_calls
+						.iter()
+						.find(|c| c.id == call_id)
+						.and_then(|c| serde_json::from_str(&c.function.arguments).ok()),
+					_ => None,
+				}),
+				None => None,
+			}
+		} else {
+			None
+		};
 		let turns = session
 			.messages
 			.iter()
@@ -4480,6 +4499,7 @@ impl CoderHandle {
 			turns: turns as u32,
 			running,
 			needs_input,
+			pending_prompt,
 			last_assistant,
 			last_diff: session.last_turn_diff.as_ref().map(|(files, diff)| TurnDiffSummary {
 				files: files
@@ -4675,6 +4695,14 @@ pub enum DisconnectWorkerOutcome {
 /// message it doesn't own.
 const USER_MESSAGE_NOTICE_MAX: usize = 200;
 
+/// Character cap for the `ask_user` questions quoted in a worker's
+/// needs-input wake. Generous compared to [`USER_MESSAGE_NOTICE_MAX`]
+/// because the packet is the coordinator's only copy of the question
+/// ids and option ids it must key `respond_to_worker_prompt` answers
+/// by; a clipped packet still resolves via `observe_worker`'s
+/// `pending_prompt`.
+const WORKER_PROMPT_NOTICE_MAX: usize = 2000;
+
 /// Clamp `text` to `max` characters (not bytes — the cut must land on
 /// a char boundary), appending an ellipsis + the dropped-character
 /// count so the reader knows it's looking at a fragment.
@@ -4788,6 +4816,14 @@ pub struct WorkerSnapshot {
 	/// Whether the worker is parked on an `ask_user` prompt waiting
 	/// for an answer (from the orchestrator or the user).
 	pub needs_input: bool,
+	/// The parked `ask_user`'s arguments (its `questions` array with
+	/// ids and options) when `needs_input` — everything the
+	/// coordinator needs to build `respond_to_worker_prompt` answers
+	/// without reading the worker's transcript. `None` when nothing
+	/// is parked, or (defensively) when the raising call can't be
+	/// found on the transcript.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub pending_prompt: Option<serde_json::Value>,
 	/// The worker's most recent assistant message text. Empty when
 	/// the worker hasn't produced one yet.
 	pub last_assistant: String,
@@ -7013,23 +7049,49 @@ fn spawn_dispatch_feeder(state: Arc<CoderState>, orchestrator_id: String) {
 				// streaming delta. `TurnComplete` (the worker finished
 				// its turn) is the one the ADR names as the primary
 				// wake signal; the orchestrator then calls
-				// `observe_worker` for a snapshot.
-				if matches!(envelope.event, CoderEvent::TurnComplete) {
-					// Lead with the worker's name (not the opaque id) and carry
-					// the live fleet count so the coordinator knows how many
-					// workers are still going without polling.
-					let label = worker_label(&state, &worker_id).await;
-					let remaining = state.coordinator_workers.read().await.attached_count(&orchestrator_id);
-					let _ = handle
-						.send_to(
-							&orchestrator_id,
-							format!(
-								"Worker {label} completed a turn. Use `observe_worker` to see its current state. \
-								 ({remaining} worker(s) still on your fleet — `list_workers` for the full picture.)"
-							),
-							Vec::new(),
-						)
-						.await;
+				// `observe_worker` for a snapshot. A parked `ask_user`
+				// is the other (ADR 0030 names it too): the worker is
+				// blocked until someone answers, and without a wake the
+				// coordinator would only find out on a poll it has no
+				// reason to make — the user ends up answering by hand.
+				match &envelope.event {
+					CoderEvent::TurnComplete => {
+						// Lead with the worker's name (not the opaque id) and carry
+						// the live fleet count so the coordinator knows how many
+						// workers are still going without polling.
+						let label = worker_label(&state, &worker_id).await;
+						let remaining = state.coordinator_workers.read().await.attached_count(&orchestrator_id);
+						let _ = handle
+							.send_to(
+								&orchestrator_id,
+								format!(
+									"Worker {label} completed a turn. Use `observe_worker` to see its current state. \
+									 ({remaining} worker(s) still on your fleet — `list_workers` for the full picture.)"
+								),
+								Vec::new(),
+							)
+							.await;
+					}
+					CoderEvent::ToolCall { name, args, .. } if name == "ask_user" => {
+						// Carry the questions inline so the coordinator
+						// can answer straight away instead of spending a
+						// round-trip on `observe_worker` first.
+						let label = worker_label(&state, &worker_id).await;
+						let questions = truncate_for_notice(&args.to_string(), WORKER_PROMPT_NOTICE_MAX);
+						let _ = handle
+							.send_to(
+								&orchestrator_id,
+								format!(
+									"Worker {label} is paused on an `ask_user` prompt and waits for an answer:\n\
+									 {questions}\n\
+									 Answer it with `respond_to_worker_prompt` (answers keyed by question id), \
+									 or leave it for the user only if it is genuinely their call."
+								),
+								Vec::new(),
+							)
+							.await;
+					}
+					_ => {}
 				}
 				continue;
 			}

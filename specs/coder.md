@@ -682,6 +682,14 @@ notice **parks in the coordinator's steer queue and never wakes it**
 turn drains it at the next iteration boundary; an idle coordinator
 holds it (a queued row, with "go now" as the manual wake) until its
 next turn, typically the worker's own `TurnComplete` dispatch packet.
+
+Worker events, by contrast, **do wake** an idle coordinator (ADR
+0030's events-as-messages feeder): a worker's `TurnComplete`, and a
+worker parking an `ask_user` prompt. The needs-input packet quotes
+the questions (ids and options, capped) so the coordinator can
+`respond_to_worker_prompt` immediately; `observe_worker` /
+`list_workers` also carry the parked prompt's args as
+`pending_prompt` while `needs_input` is set.
 Nothing else changes: the worker stays hooked up, dispatch packets
 keep flowing, and every control tool keeps working on it. Both the
 desktop composer and the phone notify; coordinator traffic (`send_to`)

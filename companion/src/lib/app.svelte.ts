@@ -1926,12 +1926,28 @@ class CompanionState {
 		}
 	}
 
+	/** Issue-order stamp for [`#refreshSessions`] — several refreshes
+	 * can overlap (one `session_list_changed` per worker a coordinator
+	 * spawns) and responses can land out of order; a stale response
+	 * must not overwrite a newer list or freshly-spawned workers drop
+	 * off the session list until the next manual open. */
+	#refreshSessionsSeq = 0;
+
 	async #refreshSessions(): Promise<void> {
 		if (!this.activeWorkspace) {
 			return;
 		}
+		const folder = this.activeFolder;
+		const seq = ++this.#refreshSessionsSeq;
 		try {
-			this.sessions = await this.#loadSessions();
+			const list = await this.#loadSessions();
+			// Drop stale responses: a newer refresh was issued, or the
+			// phone switched project while this one was in flight —
+			// applying it would show the previous folder's list.
+			if (seq !== this.#refreshSessionsSeq || this.activeFolder !== folder) {
+				return;
+			}
+			this.sessions = list;
 		} catch {
 			// Silent — the list will refresh on next manual open.
 		}

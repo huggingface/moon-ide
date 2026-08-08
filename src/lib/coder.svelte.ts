@@ -1842,6 +1842,15 @@ export class CoderPanelState {
 		}
 	}
 
+	/** Issue-order stamp for [`refreshSessions`]. Several refreshes
+	 *  can be in flight at once — the backend emits one
+	 *  `session_list_changed` per worker a coordinator spawns, and
+	 *  each triggers a fetch — and their IPC responses can land out
+	 *  of order. Without the stamp a stale response overwrites a
+	 *  newer list, and freshly-spawned workers silently vanish from
+	 *  the sessions list until something else refreshes it. */
+	#refreshSessionsSeq = 0;
+
 	/** Refresh the persisted sessions list. Best-effort: a
 	 *  failure leaves the previous snapshot visible.
 	 *
@@ -1855,9 +1864,23 @@ export class CoderPanelState {
 	async refreshSessions(): Promise<void> {
 		const path = this.activeFolderPath;
 		const folder = this.current;
+		const seq = ++this.#refreshSessionsSeq;
 		try {
 			const list = await ipc.coder.listSessions();
 			if (this.activeFolderPath !== path) {
+				// The response belongs to the previous folder. Mark
+				// that bucket stale rather than leaving its
+				// pre-refresh cache in place: the change that
+				// triggered this refresh is already consumed, so a
+				// kept cache would render an outdated list on the
+				// next visit (`#selectSessionForActiveFolder` only
+				// refetches when `sessions === null`).
+				folder.sessions = null;
+				return;
+			}
+			if (seq !== this.#refreshSessionsSeq) {
+				// A newer refresh owns this bucket — its response
+				// includes at least everything this one saw.
 				return;
 			}
 			folder.sessions = list;
