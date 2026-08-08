@@ -86,14 +86,21 @@
 	let pending = '';
 	let frame: number | null = null;
 
+	let pendingRepoUrl: string | null = null;
 	$effect(() => {
 		pending = text;
+		// Read synchronously so the effect *tracks* repoUrl: the SCM
+		// status (and thus the repo URL) often resolves after a
+		// replayed transcript rendered, and without this dependency
+		// the already-rendered bubbles would never gain their #123
+		// links.
+		pendingRepoUrl = repoUrl;
 		if (frame !== null) {
 			return;
 		}
 		frame = requestAnimationFrame(() => {
 			frame = null;
-			html = md.render(pending, { repoUrl });
+			html = md.render(pending, { repoUrl: pendingRepoUrl });
 		});
 	});
 

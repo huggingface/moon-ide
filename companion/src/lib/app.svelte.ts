@@ -636,6 +636,10 @@ class CompanionState {
 			}
 			this.#ensureSubscribed(this.activeWorkspace, this.activeIde);
 			await this.#refreshSessions();
+			// Re-resolve SCM (and with it `repoUrl` for the #123
+			// autolinker) — a resume can land straight in a session
+			// without passing through the workspace view.
+			void this.loadScmStatus();
 			// Flush sends that never left the phone (`unsent`) — safe
 			// unconditionally: the transport rejected them before
 			// writing, so no double-send is possible. Timed-out

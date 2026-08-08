@@ -35,6 +35,18 @@
 		}
 	});
 
+	// Which assistant row briefly shows the "copied" check.
+	let copiedMd = $state<string | null>(null);
+	async function copyMarkdown(rowId: string, text: string): Promise<void> {
+		await navigator.clipboard.writeText(text);
+		copiedMd = rowId;
+		setTimeout(() => {
+			if (copiedMd === rowId) {
+				copiedMd = null;
+			}
+		}, 1500);
+	}
+
 	// Full-size preview target for a tool-returned image
 	// (screenshot, image-file read).
 	let lightboxUrl = $state<string | null>(null);
@@ -803,7 +815,12 @@
 					</details>
 				{/if}
 				{#if row.text}
-					<div class="bubble assistant"><Markdown text={row.text} repoUrl={app.repoUrl} /></div>
+					<div class="bubble assistant">
+						<button class="copy-md" title="Copy raw markdown" onclick={() => void copyMarkdown(row.id, row.text)}
+							>{copiedMd === row.id ? '✓' : '⧉'}</button
+						>
+						<Markdown text={row.text} repoUrl={app.repoUrl} />
+					</div>
 				{/if}
 			{:else if row.kind === 'tool'}
 				{@const body = toolBody(row.name, row.args, row.result)}
@@ -1565,6 +1582,25 @@
 	}
 	.send-btn:disabled {
 		opacity: 0.45;
+	}
+	.bubble.assistant {
+		position: relative;
+	}
+	.copy-md {
+		position: absolute;
+		top: 0.25rem;
+		right: 0.25rem;
+		padding: 0.1rem 0.4rem;
+		font-size: 0.8rem;
+		line-height: 1.2;
+		background: var(--bg-elev-2);
+		color: var(--fg-muted);
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		opacity: 0.55;
+	}
+	.copy-md:active {
+		opacity: 1;
 	}
 	.pending-send {
 		align-self: flex-end;
