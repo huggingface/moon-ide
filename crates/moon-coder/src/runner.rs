@@ -7295,6 +7295,82 @@ async fn handle_abort_worker(state: &Arc<CoderState>, args: &Value) -> Result<Va
 	Ok(json!({ "status": "aborted" }))
 }
 
+/// Convert `respond_to_worker_prompt`'s `answers` into the
+/// `PromptResponse` sequence shape. Accepts both the documented map
+/// form (question id → option id / custom string / array of either)
+/// and the raw `ask_user`-response array form. `prompt_args` is the
+/// parked `ask_user`'s arguments when recoverable from the worker's
+/// transcript — a map value matching one of the question's option
+/// ids becomes a `selected` entry, anything else lands in
+/// `free_text` (always readable by the worker either way).
+fn answers_to_prompt_response(answers: &Value, prompt_args: Option<&Value>) -> Result<Vec<QuestionAnswer>, String> {
+	if answers.is_array() {
+		return serde_json::from_value(answers.clone()).map_err(|e| e.to_string());
+	}
+	let Some(map) = answers.as_object() else {
+		return Err(
+			"`answers` must be a map of question id → answer (option id or custom text), \
+			 or an array of {question_id, selected, free_text}"
+				.into(),
+		);
+	};
+	// Option ids per question id, recovered from the parked
+	// `ask_user` args. Missing args degrade to everything-free-text.
+	let mut option_ids: std::collections::HashMap<&str, std::collections::HashSet<&str>> =
+		std::collections::HashMap::new();
+	if let Some(questions) = prompt_args.and_then(|a| a.get("questions")).and_then(|q| q.as_array()) {
+		for q in questions {
+			let Some(qid) = q.get("id").and_then(|v| v.as_str()) else {
+				continue;
+			};
+			let ids = q
+				.get("options")
+				.and_then(|o| o.as_array())
+				.map(|opts| {
+					opts
+						.iter()
+						.filter_map(|o| o.get("id").and_then(|v| v.as_str()))
+						.collect()
+				})
+				.unwrap_or_default();
+			option_ids.insert(qid, ids);
+		}
+	}
+	let mut out = Vec::new();
+	for (qid, value) in map {
+		let is_option = |s: &str| option_ids.get(qid.as_str()).is_some_and(|ids| ids.contains(s));
+		let mut selected = Vec::new();
+		let mut free = Vec::new();
+		let mut classify = |s: &str| {
+			if is_option(s) {
+				selected.push(s.to_string());
+			} else {
+				free.push(s.to_string());
+			}
+		};
+		match value {
+			Value::String(s) => classify(s),
+			Value::Array(items) => {
+				for item in items {
+					let Some(s) = item.as_str() else {
+						return Err(format!("answer array for `{qid}` must contain strings"));
+					};
+					classify(s);
+				}
+			}
+			Value::Bool(b) => free.push(b.to_string()),
+			Value::Number(n) => free.push(n.to_string()),
+			_ => return Err(format!("answer for `{qid}` must be a string or an array of strings")),
+		}
+		out.push(QuestionAnswer {
+			question_id: qid.clone(),
+			selected,
+			free_text: free.join("\n"),
+		});
+	}
+	Ok(out)
+}
+
 /// `respond_to_worker_prompt` — answer a worker's parked `ask_user`.
 /// Routes through the existing `respond_to_prompt` by-call-id scan
 /// (which already targets any session, not just the visible one).
@@ -7302,7 +7378,7 @@ async fn handle_respond_to_worker_prompt(state: &Arc<CoderState>, args: &Value) 
 	#[derive(serde::Deserialize)]
 	struct RespondArgs {
 		worker_id: String,
-		answers: Vec<QuestionAnswer>,
+		answers: Value,
 	}
 	let parsed: RespondArgs = serde_json::from_value(args.clone())
 		.map_err(|err| CoderError::invalid_args("respond_to_worker_prompt", err.to_string()))?;
@@ -7331,9 +7407,22 @@ async fn handle_respond_to_worker_prompt(state: &Arc<CoderState>, args: &Value) 
 		.pending_call_id()
 		.await
 		.ok_or_else(|| CoderError::invalid_args("respond_to_worker_prompt", "no pending prompt call id"))?;
-	let response = PromptResponse {
-		answers: parsed.answers,
+	// Recover the parked `ask_user`'s args (same transcript scan as
+	// `observe_session`) so map-form answers can tell option ids
+	// apart from free text.
+	let prompt_args = {
+		let session = rt.session.lock().await;
+		session.messages.iter().rev().find_map(|m| match m {
+			ChatMessage::Assistant { tool_calls, .. } => tool_calls
+				.iter()
+				.find(|c| c.id == call_id)
+				.and_then(|c| serde_json::from_str::<Value>(&c.function.arguments).ok()),
+			_ => None,
+		})
 	};
+	let answers = answers_to_prompt_response(&parsed.answers, prompt_args.as_ref())
+		.map_err(|err| CoderError::invalid_args("respond_to_worker_prompt", err))?;
+	let response = PromptResponse { answers };
 	let resolved = handle.respond_to_prompt(&call_id, response).await;
 	Ok(json!({ "status": if resolved { "answered" } else { "not_resolved" } }))
 }
@@ -10177,6 +10266,35 @@ pub(crate) fn new_message_id() -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn respond_answers_accepts_map_and_sequence_forms() {
+		let prompt_args = json!({
+			"questions": [
+				{ "id": "q1", "options": [{ "id": "yes" }, { "id": "no" }] },
+				{ "id": "q2", "allow_multiple": true, "options": [{ "id": "a" }, { "id": "b" }] },
+			]
+		});
+		// Map form: option id → selected, unknown string → free text,
+		// array → multi-select with mixed classification.
+		let answers = json!({ "q1": "yes", "q2": ["a", "also do the docs"] });
+		let mut got = answers_to_prompt_response(&answers, Some(&prompt_args)).unwrap();
+		got.sort_by(|x, y| x.question_id.cmp(&y.question_id));
+		assert_eq!(got[0].selected, vec!["yes"]);
+		assert!(got[0].free_text.is_empty());
+		assert_eq!(got[1].selected, vec!["a"]);
+		assert_eq!(got[1].free_text, "also do the docs");
+		// Unknown value with no recoverable prompt args → free text.
+		let got = answers_to_prompt_response(&json!({ "q1": "yes" }), None).unwrap();
+		assert!(got[0].selected.is_empty());
+		assert_eq!(got[0].free_text, "yes");
+		// Sequence form passes through untouched.
+		let seq = json!([{ "question_id": "q1", "selected": ["no"], "free_text": "" }]);
+		let got = answers_to_prompt_response(&seq, Some(&prompt_args)).unwrap();
+		assert_eq!(got[0].selected, vec!["no"]);
+		// Non-string array member is a hard error, not silent data loss.
+		assert!(answers_to_prompt_response(&json!({ "q1": [1] }), None).is_err());
+	}
 
 	#[test]
 	fn split_tool_images_extracts_the_convention_key() {

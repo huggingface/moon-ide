@@ -471,7 +471,7 @@ pub fn respond_to_worker_prompt_tool_definition() -> ToolDefinition {
 				},
 				"answers": {
 					"type": "object",
-					"description": "Map of question id → selected answer id (or a free-form string for a custom answer). Same shape as `ask_user`'s response `answers` field.",
+					"description": "Map of question id → answer. Each answer is an option id, a free-form string for a custom answer, or an array of those for a multi-select question. (The raw `ask_user`-response array form — `[{question_id, selected, free_text}]` — is also accepted.)",
 					"additionalProperties": {}
 				}
 			},
