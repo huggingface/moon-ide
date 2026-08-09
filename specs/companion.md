@@ -235,6 +235,13 @@ requested surface:
   (unified patch, 64 kB cap), and the phone renders per-file
   collapsible diff sections. `base_ref: null` means "nothing to
   review against" (on the default branch / detached / no remote).
+- **Hash routing.** The current view (workspace + optional session)
+  is mirrored into the URL hash (`#/w?ws=…&ide=…&s=…`) via
+  `replaceState` — a refresh restores the same page, and no history
+  entries pile up for the back button. Restore is best-effort with a
+  hard no-stuck rule: a workspace that fails to open falls back to
+  the list, a session that fails to replay falls back to its
+  workspace.
 - **Issue-reference autolinks.** Assistant markdown linkifies
   standalone `#123` to `<repo web url>/issues/123` (GitHub
   redirects PRs), where the repo URL comes from the active folder's

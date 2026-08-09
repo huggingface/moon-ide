@@ -23,6 +23,19 @@
 			window.removeEventListener('focus', onVisible);
 		};
 	});
+
+	// Mirror the current view into the URL hash so a refresh restores
+	// it (see `app.routeHash` / `#restoreRoute`). `replaceState`
+	// rather than assignment: no history entries, so the browser back
+	// button can't trap the user in a loop of stale views. Gated on
+	// `ready` so the pairing/error screens never clobber a route we
+	// still want to restore after a retry.
+	$effect(() => {
+		const hash = app.routeHash;
+		if (app.phase === 'ready' && location.hash !== hash) {
+			history.replaceState(null, '', hash);
+		}
+	});
 </script>
 
 {#if app.phase === 'connecting'}

@@ -380,6 +380,11 @@ function savePendingSends(list: PendingSend[]): void {
 	}
 }
 
+/** The hash present when the page loaded, captured before any
+ * reactive mirror of `routeHash` can overwrite it. `#restoreRoute`
+ * reads this, never the live `location.hash`. */
+const initialRouteHash = typeof location === 'undefined' ? '' : location.hash;
+
 class CompanionState {
 	phase = $state<Phase>('connecting');
 	error = $state<string | null>(null);
@@ -520,6 +525,63 @@ class CompanionState {
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
 			this.phase = 'error';
+			return;
+		}
+		await this.#restoreRoute();
+	}
+
+	/** The hash route describing the current view. Mirrored into
+	 * `location` by App.svelte so a refresh lands back here. */
+	get routeHash(): string {
+		if (!this.activeWorkspace) {
+			return '#/';
+		}
+		const params = new URLSearchParams();
+		params.set('ws', this.activeWorkspace);
+		if (this.activeIde) {
+			params.set('ide', this.activeIde);
+		}
+		if (this.activeWorkspaceName && this.activeWorkspaceName !== this.activeWorkspace) {
+			params.set('name', this.activeWorkspaceName);
+		}
+		if (this.activeSession) {
+			params.set('s', this.activeSession);
+		}
+		return `#/w?${params.toString()}`;
+	}
+
+	/** Re-open the view named by the URL hash captured at page load.
+	 * Best-effort: a workspace that fails to open falls back to the
+	 * list, a session that fails to replay falls back to its
+	 * workspace — a stale or garbled route must never wedge the app
+	 * on an unusable screen. */
+	async #restoreRoute(): Promise<void> {
+		// A retry-boot after a dropped connection keeps whatever view
+		// the user had navigated to in-memory; the page-load route is
+		// only for cold starts.
+		if (this.activeWorkspace) {
+			return;
+		}
+		if (!initialRouteHash.startsWith('#/w?')) {
+			return;
+		}
+		const params = new URLSearchParams(initialRouteHash.slice('#/w?'.length));
+		const ws = params.get('ws');
+		if (!ws) {
+			return;
+		}
+		await this.openWorkspace(ws, params.get('ide') ?? '', params.get('name') ?? '');
+		if (this.error) {
+			this.closeWorkspace();
+			return;
+		}
+		const session = params.get('s');
+		if (!session) {
+			return;
+		}
+		await this.openSession(session);
+		if (this.error) {
+			this.closeSession();
 		}
 	}
 
