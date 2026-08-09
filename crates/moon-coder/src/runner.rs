@@ -2662,8 +2662,21 @@ impl CoderHandle {
 	/// any mid-dispatch tool calls unpaired in `messages`, and the
 	/// providers reject a request with an unanswered `tool_use`.
 	pub async fn retry_last_turn(&self) -> Result<(), CoderError> {
+		let (_, session_id, _) = self.state.active_visible_runtime().await?;
+		self.retry_last_turn_in(&session_id).await
+	}
+
+	/// [`Self::retry_last_turn`] targeting a session by id — the
+	/// phone's retry affordance, which addresses sessions directly
+	/// rather than through "the visible one".
+	pub async fn retry_last_turn_in(&self, session_id: &str) -> Result<(), CoderError> {
 		self.ensure_can_send().await?;
-		let (rt, session_id, folder_path) = self.state.active_visible_runtime().await?;
+		let Some((rt, folder_path)) = self.state.runtime_for_session(session_id).await else {
+			return Err(CoderError::Internal(format!(
+				"no mounted runtime for session {session_id}"
+			)));
+		};
+		let session_id = session_id.to_string();
 		{
 			// Refuse mid-turn — same guard as `resume_from_assistant`.
 			let turn = rt.turn.lock().await;
@@ -3615,10 +3628,14 @@ impl CoderHandle {
 
 		// A direct user message into a coordinator-spawned worker
 		// **tells the coordinator** what the user said (ADR 0043) and
-		// changes nothing else — the worker stays hooked up. Runs
-		// before the steer branch so a mid-turn nudge notifies the
-		// same way a fresh prompt does.
-		self.notify_coordinator_of_user_message(&session_id, &text).await;
+		// changes nothing else — the worker stays hooked up. The
+		// turn probe mirrors the steer branch below so the notice's
+		// wording tracks delivery (queued vs seen); a race between
+		// the two probes only costs wording accuracy.
+		let target_turn_running = rt.turn.lock().await.cancel.is_some();
+		self
+			.notify_coordinator_of_user_message(&session_id, &text, target_turn_running)
+			.await;
 
 		// A second `send` while the **visible session's** turn is
 		// already in flight is a **steer**: queue the new user
@@ -4184,7 +4201,13 @@ impl CoderHandle {
 		text: String,
 		images: Vec<ImageAttachment>,
 	) -> Result<(), CoderError> {
-		self.notify_coordinator_of_user_message(session_id, &text).await;
+		// Same delivery-tracking probe as `send` — a mid-turn nudge
+		// is only queued worker-side, and the notice says so.
+		let queued = match self.state.runtime_for_session(session_id).await {
+			Some((rt, _)) => rt.turn.lock().await.cancel.is_some(),
+			None => false,
+		};
+		self.notify_coordinator_of_user_message(session_id, &text, queued).await;
 		self.send_to(session_id, text, images).await
 	}
 
@@ -4205,7 +4228,13 @@ impl CoderHandle {
 	/// coordinator's next decision, not worth a turn of its own —
 	/// the worker already has the instruction, and its
 	/// `TurnComplete` wake follows anyway.
-	async fn notify_coordinator_of_user_message(&self, session_id: &str, text: &str) {
+	///
+	/// `queued` tracks delivery truthfully: a message into a worker
+	/// whose turn is mid-flight only lands in its steer queue, and
+	/// the coordinator shouldn't reason as if the worker has already
+	/// seen it (it may not for a while — or ever, if the user pops
+	/// the queued row).
+	async fn notify_coordinator_of_user_message(&self, session_id: &str, text: &str, queued: bool) {
 		let trimmed = text.trim();
 		if trimmed.is_empty() {
 			return;
@@ -4220,12 +4249,22 @@ impl CoderHandle {
 		else {
 			return;
 		};
-		let notice = format!(
-			"The user sent worker {session_id} a message directly: \"{}\"\n\n\
-			 Nothing else changed — its updates keep reaching you and your control tools still \
-			 work on it.",
-			truncate_for_notice(trimmed, USER_MESSAGE_NOTICE_MAX)
-		);
+		let notice = if queued {
+			format!(
+				"The user queued a message for worker {session_id} (its turn is mid-flight; the worker \
+				 picks it up at its next iteration boundary — it has NOT seen it yet): \"{}\"\n\n\
+				 Nothing else changed — its updates keep reaching you and your control tools still \
+				 work on it.",
+				truncate_for_notice(trimmed, USER_MESSAGE_NOTICE_MAX)
+			)
+		} else {
+			format!(
+				"The user sent worker {session_id} a message directly: \"{}\"\n\n\
+				 Nothing else changed — its updates keep reaching you and your control tools still \
+				 work on it.",
+				truncate_for_notice(trimmed, USER_MESSAGE_NOTICE_MAX)
+			)
+		};
 		// Failure (orchestrator unmounted / deleted) only costs the
 		// notice.
 		let Some((rt, folder_path)) = self.state.runtime_for_session(&orchestrator_id).await else {

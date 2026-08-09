@@ -434,6 +434,11 @@ class CompanionState {
 	/** The session the user has opened on the phone, or null at the
 	 * session list. */
 	activeSession = $state<string | null>(null);
+	/** Message of a *trailing* turn error in the open session — the
+	 * retry affordance's gate, mirroring the desktop's "last row is
+	 * an error and the panel is idle" rule. Cleared by any later
+	 * transcript activity (a new turn ran past it). */
+	turnError = $state<string | null>(null);
 	/** Rendered transcript rows for the active session. */
 	rows = $state<TranscriptRow[]>([]);
 	/** True when the open session has older history on disk beyond
@@ -970,6 +975,31 @@ class CompanionState {
 		}
 	}
 
+	/** Re-run the round-trip that failed — the retry button on the
+	 * trailing-error bar. The error row stays put; the retry's
+	 * output appends below it, same as desktop. */
+	async retryLastTurn(): Promise<void> {
+		if (!this.activeWorkspace || !this.activeSession || this.busy) {
+			return;
+		}
+		const failed = this.turnError;
+		this.turnError = null;
+		this.error = null;
+		this.busy = true;
+		try {
+			await this.#call(
+				this.activeWorkspace,
+				'coder_retry_last_turn',
+				{ session_id: this.activeSession },
+				this.activeIde,
+			);
+		} catch (e) {
+			this.busy = false;
+			this.turnError = failed;
+			this.error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
 	closeReview(): void {
 		this.review = null;
 	}
@@ -1305,6 +1335,7 @@ class CompanionState {
 		this.activeSession = id;
 		this.rows = [];
 		this.busy = false;
+		this.turnError = null;
 		this.awaitingInput = false;
 		this.pendingPrompt = null;
 		this.hasMoreHistory = false;
@@ -1410,6 +1441,7 @@ class CompanionState {
 		this.review = null;
 		this.rows = [];
 		this.busy = false;
+		this.turnError = null;
 		this.awaitingInput = false;
 		this.pendingPrompt = null;
 		this.hasMoreHistory = false;
@@ -1778,6 +1810,7 @@ class CompanionState {
 		const rows = this.#rowsOverride ?? this.rows;
 		switch (ev.kind) {
 			case 'user_message': {
+				this.turnError = null;
 				// Confirmed delivery: clear any matching optimistic
 				// pending-send entry (incl. late arrivals after a
 				// forward timeout — the whole point of the row).
@@ -1809,6 +1842,7 @@ class CompanionState {
 				break;
 			}
 			case 'assistant_message_start':
+				this.turnError = null;
 				this.busy = true;
 				rows.push({ kind: 'assistant', id: str(ev, 'id'), text: '', thinking: '' });
 				break;
@@ -1891,9 +1925,11 @@ class CompanionState {
 				this.busy = false;
 				this.awaitingInput = false;
 				this.pendingPrompt = null;
+				this.turnError = null;
 				break;
 			case 'error':
 				this.busy = false;
+				this.turnError = str(ev, 'message') || 'coder error';
 				this.error = str(ev, 'message') || 'coder error';
 				break;
 			case 'session_loaded':

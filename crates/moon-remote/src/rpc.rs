@@ -237,6 +237,18 @@ impl BridgeRpcHandler for BridgeRpc {
 				}
 				Ok(Value::Null)
 			}
+			// Re-run the round-trip that failed — the phone's retry
+			// affordance on a trailing error. Session-targeted (the
+			// phone never means "the desktop's visible session").
+			"coder_retry_last_turn" => {
+				let p: RetryParams = parse_params(params)?;
+				self
+					.coder
+					.retry_last_turn_in(&p.session_id)
+					.await
+					.map_err(|e| e.to_string())?;
+				Ok(Value::Null)
+			}
 			// Un-queue a still-queued steer (pop it back toward the
 			// composer) or drive it now, session-targeted by id — the
 			// session the phone has open, which needn't be the
@@ -645,6 +657,11 @@ struct RevertParams {
 }
 
 #[derive(serde::Deserialize)]
+struct RetryParams {
+	session_id: String,
+}
+
+#[derive(serde::Deserialize)]
 struct SteerParams {
 	/// Session holding the queued steer (the one the phone has
 	/// open). Always required: unlike send/abort there's no
@@ -691,6 +708,7 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 	"coder_rename_session",
 	"coder_send",
 	"coder_abort",
+	"coder_retry_last_turn",
 	"coder_unqueue_steer",
 	"coder_drain_steer_now",
 	"coder_new_session",

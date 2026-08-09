@@ -999,6 +999,13 @@
 		{/if}
 	</div>
 
+	{#if app.turnError && !app.busy}
+		<div class="turn-error" role="alert">
+			<span class="turn-error-text">{app.turnError}</span>
+			<button class="turn-error-retry" onclick={() => void app.retryLastTurn()}>Retry</button>
+		</div>
+	{/if}
+
 	<div class="composer">
 		<textarea
 			bind:this={draftEl}
@@ -1604,6 +1611,36 @@
 	}
 	.copy-md:active {
 		opacity: 1;
+	}
+	.turn-error {
+		display: flex;
+		align-items: center;
+		gap: 0.6rem;
+		margin: 0 0.75rem 0.4rem;
+		padding: 0.45rem 0.6rem;
+		background: var(--bg-elev-2);
+		border: 1px solid var(--danger);
+		border-radius: var(--radius);
+	}
+	.turn-error-text {
+		flex: 1;
+		color: var(--danger);
+		font-size: 0.8rem;
+		word-break: break-word;
+		display: -webkit-box;
+		-webkit-line-clamp: 3;
+		-webkit-box-orient: vertical;
+		overflow: hidden;
+	}
+	.turn-error-retry {
+		flex-shrink: 0;
+		padding: 0.3rem 0.8rem;
+		background: var(--danger);
+		color: var(--bg);
+		border: none;
+		border-radius: 6px;
+		font-size: 0.85rem;
+		font-weight: 600;
 	}
 	.pending-send {
 		align-self: flex-end;

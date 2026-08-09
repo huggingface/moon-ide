@@ -235,6 +235,11 @@ requested surface:
   (unified patch, 64 kB cap), and the phone renders per-file
   collapsible diff sections. `base_ref: null` means "nothing to
   review against" (on the default branch / detached / no remote).
+- **Turn retry.** A trailing turn error shows a bar above the
+  composer with the message and a Retry button
+  (`coder_retry_last_turn`, session-targeted via
+  `Coder::retry_last_turn_in`) — same semantics as the desktop's
+  trailing-error retry: nothing truncated, output appends below.
 - **Hash routing.** The current view (workspace + optional session)
   is mirrored into the URL hash (`#/w?ws=…&ide=…&s=…`) via
   `replaceState` — a refresh restores the same page, and no history

@@ -677,6 +677,9 @@ coordinator and nothing more**
 ([ADR 0043](decisions/0043-user-message-notifies-coordinator.md)): the
 coordinator's session receives a notice naming the worker and quoting
 the message (truncated to 200 characters), on every such message. The
+notice's wording tracks delivery: a message into a worker whose turn
+is mid-flight is reported as _queued_ (the worker has not seen it
+yet), not as delivered. The
 notice **parks in the coordinator's steer queue and never wakes it**
 ([ADR 0062](decisions/0062-parked-coordinator-notices.md)) — a running
 turn drains it at the next iteration boundary; an idle coordinator
