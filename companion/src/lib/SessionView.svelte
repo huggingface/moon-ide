@@ -225,6 +225,8 @@
 				return 'merge worker changes';
 			case 'discard_worker_worktree':
 				return 'discard worker worktree';
+			case 'retire_worker':
+				return 'retire worker';
 			case 'review_worker_changes':
 				return 'review worker changes';
 			case 'respond_to_worker_prompt':
@@ -245,6 +247,7 @@
 		'merge_worker_changes',
 		'review_worker_changes',
 		'respond_to_worker_prompt',
+		'retire_worker',
 		'workspace_scm_status',
 	]);
 

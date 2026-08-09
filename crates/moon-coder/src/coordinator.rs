@@ -67,7 +67,8 @@ You manage workers with:
 - `commit_worker_changes(worker_id, message?)` — commit a worker's uncommitted changes (`git add -A` + `git commit`, same as the IDE's SCM panel). Pass `message` to set the commit subject; omit it to get an AI-suggested message from the diff. Use `workspace_scm_status` first to check whether there's anything to commit.
 - `merge_worker_changes(worker_id, base_branch?)` — merge a worker's branch into a base branch on the parent repo (defaults to `main`). Switches the parent to `base_branch`, then `git merge --no-edit <worker_branch>`. The worker's worktree and branch are left intact. Use `commit_worker_changes` first if the worker has uncommitted work, and run `check_worker_base` first so you don't merge a stale-base revert. Use this for local repos without a PR flow; for repos with a remote, leave the branch for the user to PR instead.
 - `check_worker_base(worker_id)` — the rebase-before-merge / rebase-before-PR gate. Fetches, then reports how far the worker's branch is behind `origin/main` and whether its diff **reverts work it didn't write** (a file with deletions the worker never touched). Run this before `merge_worker_changes`, before opening / updating a PR, and on every in-flight worker after one of its siblings merges. If it flags a revert, don't merge / PR — steer the worker to rebase onto current `origin/main` first.
-- `discard_worker_worktree(worker_id, force?)` — remove a finished worker's checkout and unbind its folder, so it stops cluttering the user's project bar. The branch is kept. Do this once the work is landed (merged, or pushed for a PR); it refuses a running worker and, without `force`, one with uncommitted changes. Never remove a worktree with `bash` — the folder would stay bound and the user would be left cleaning it up by hand.
+- `discard_worker_worktree(worker_id, force?)` — remove a finished worker's checkout and unbind its folder, so it stops cluttering the user's project bar. The branch is kept. Do this once the work is landed (merged, or pushed for a PR); it refuses a running worker and, without `force`, one with uncommitted changes. A worktree that's already gone is a clean no-op, not an error. Never remove a worktree with `bash` — the folder would stay bound and the user would be left cleaning it up by hand.
+- `retire_worker(worker_id)` — drop a fully-done worker from your fleet once its work is landed and its worktree discarded. Its session, transcript, and branch are untouched; it just stops showing in `list_workers` and stops waking you. Retire landed workers as you go so the fleet list stays a live picture instead of a graveyard.
 - `clone_repo(url, path?)` — clone a git repository to a host path and add it as a workspace folder. Use this when a task requires a dependency repo or a fresh checkout that isn't already in the workspace. The clone runs on the host so the path is immediately available. Omit `path` to clone into a sibling of the active folder.
 - `init_repo(name)` — initialize a new git repository as a **sibling of your project folder** (same parent directory) and add it as a workspace folder. You pass a directory name, not a path — the location is fixed. Use this when a task needs a fresh project (scratch repo, new microservice, test harness). Pass the returned path to `spawn_worker`'s `folder` to put a worker in it.
 - `respond_to_worker_prompt(worker_id, answers)` — answer a worker's parked `ask_user` prompt. A worker that needs a decision from you raises `ask_user`; you see it via `observe_worker` and answer it with this tool.
@@ -361,6 +362,29 @@ pub fn discard_worker_worktree_tool_definition() -> ToolDefinition {
 	)
 }
 
+/// `retire_worker` — drop a finished worker from the coordinator's
+/// fleet registry (ADR 0064). The session, its transcript, and its
+/// branch are untouched; the worker just stops appearing in
+/// `list_workers` and stops waking the coordinator. Without this a
+/// long-running coordinator's fleet grows monotonically — every
+/// landed worker lingers as an idle row forever.
+pub fn retire_worker_tool_definition() -> ToolDefinition {
+	ToolDefinition::function(
+		"retire_worker",
+		"Retire a finished worker from your fleet: it stops appearing in `list_workers` and stops waking you. Its session, transcript, and branch are untouched — this is bookkeeping, not deletion. Use it once a worker's work is fully landed (merged or PR'd) and its worktree is discarded, so `list_workers` stays a live picture of the fleet instead of accumulating done workers. Refuses a worker whose turn is running (abort it first) or whose worktree is still bound (`discard_worker_worktree` first). After retiring, the control tools no longer treat the session as your worker.",
+		json!({
+			"type": "object",
+			"properties": {
+				"worker_id": {
+					"type": "string",
+					"description": "The worker id returned by `spawn_worker`."
+				}
+			},
+			"required": ["worker_id"]
+		}),
+	)
+}
+
 /// `workspace_scm_status` — read-only SCM state for a worker's
 /// worktree (or the main folder). Composes branch info, file change
 /// counts, and the file list into one compact snapshot so the
@@ -488,6 +512,7 @@ mod tests {
 			"merge_worker_changes"
 		);
 		assert_eq!(check_worker_base_tool_definition().function.name, "check_worker_base");
+		assert_eq!(retire_worker_tool_definition().function.name, "retire_worker");
 		assert_eq!(
 			discard_worker_worktree_tool_definition().function.name,
 			"discard_worker_worktree"
@@ -520,6 +545,14 @@ mod tests {
 		let params = discard_worker_worktree_tool_definition().function.parameters;
 		assert!(params["properties"]["worker_id"].is_object());
 		assert_eq!(params["properties"]["force"]["type"], "boolean");
+		let required: Vec<String> = serde_json::from_value(params["required"].clone()).unwrap();
+		assert_eq!(required, vec!["worker_id".to_string()]);
+	}
+
+	#[test]
+	fn retire_worker_requires_a_worker() {
+		let params = retire_worker_tool_definition().function.parameters;
+		assert!(params["properties"]["worker_id"].is_object());
 		let required: Vec<String> = serde_json::from_value(params["required"].clone()).unwrap();
 		assert_eq!(required, vec!["worker_id".to_string()]);
 	}

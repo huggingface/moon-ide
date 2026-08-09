@@ -1711,7 +1711,14 @@ before, so a dirty-tree refusal still drives the force re-confirm.
 A coordinator cleans up after its own workers with
 `discard_worker_worktree`, which does the same thing plus clears the
 worktree routing on the worker's session; it refuses a running worker
-and a dirty worktree (without `force`), and keeps the branch.
+and a dirty worktree (without `force`), and keeps the branch. It is
+idempotent too ([ADR 0064](decisions/0064-worker-retirement.md)): a
+checkout that's already gone — merged-and-removed, reconciled away, or
+discarded twice — is an `already_gone` no-op, never an error. Once a
+worker's work is landed and its worktree discarded, the coordinator
+drops it from its fleet with `retire_worker` (same ADR): the worker
+leaves `list_workers` and stops waking the coordinator, while its
+session, transcript, and branch stay untouched.
 
 Staleness is also **reconciled without a click**
 ([ADR 0063](decisions/0063-stale-worktree-reconciliation.md)): at the

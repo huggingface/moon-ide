@@ -1665,6 +1665,7 @@
 			case 'commit_worker_changes':
 			case 'merge_worker_changes':
 			case 'discard_worker_worktree':
+			case 'retire_worker':
 			case 'respond_to_worker_prompt': {
 				return typeof o.worker_id === 'string' ? firstLine(o.worker_id) : null;
 			}

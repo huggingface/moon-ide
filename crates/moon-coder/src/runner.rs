@@ -5435,6 +5435,7 @@ async fn run_turn(
 		tool_defs.push(crate::coordinator::merge_worker_changes_tool_definition());
 		tool_defs.push(crate::coordinator::check_worker_base_tool_definition());
 		tool_defs.push(crate::coordinator::discard_worker_worktree_tool_definition());
+		tool_defs.push(crate::coordinator::retire_worker_tool_definition());
 		tool_defs.push(crate::coordinator::clone_repo_tool_definition());
 		tool_defs.push(crate::coordinator::init_repo_tool_definition());
 	}
@@ -6153,6 +6154,8 @@ async fn dispatch_tool_calls(
 				handle_check_worker_base(state, &args).await
 			} else if call.function.name == "discard_worker_worktree" {
 				handle_discard_worker_worktree(state, sink, &args).await
+			} else if call.function.name == "retire_worker" {
+				handle_retire_worker(state, sink, &args).await
 			} else if call.function.name == "clone_repo" {
 				handle_clone_repo(state, sink, &args).await
 			} else if call.function.name == "init_repo" {
@@ -7775,7 +7778,7 @@ async fn handle_discard_worker_worktree(
 	let parsed: DiscardArgs = serde_json::from_value(args.clone())
 		.map_err(|err| CoderError::invalid_args("discard_worker_worktree", err.to_string()))?;
 	ensure_worker_still_attached(state, "discard_worker_worktree", &parsed.worker_id).await?;
-	let Some((rt, _)) = state.runtime_for_session(&parsed.worker_id).await else {
+	let Some((rt, worker_folder)) = state.runtime_for_session(&parsed.worker_id).await else {
 		return Err(CoderError::invalid_args(
 			"discard_worker_worktree",
 			format!("no mounted session for worker_id `{}`", parsed.worker_id),
@@ -7799,17 +7802,39 @@ async fn handle_discard_worker_worktree(
 			session.header.worktree_branch.clone(),
 		)
 	};
+	// Idempotent (ADR 0064): a worker whose checkout is already gone
+	// — merged-and-removed, auto-reconciled after an out-of-band
+	// `git worktree remove` (ADR 0063), or discarded once before —
+	// has nothing left to do. Erroring here left coordinators with
+	// workers they could never finish cleaning up.
 	let Some(worktree_path) = worktree_root else {
-		return Err(CoderError::invalid_args(
-			"discard_worker_worktree",
-			"worker has no worktree_root — there is no checkout to discard",
-		));
+		return Ok(json!({
+			"status": "already_gone",
+			"note": "the worker has no worktree checkout anymore — nothing to discard; its session and branch are untouched",
+		}));
 	};
 	let Some(wt_entry) = state.workspaces.folder_for_path(&worktree_path).await else {
-		return Err(CoderError::invalid_args(
-			"discard_worker_worktree",
-			format!("worktree folder `{worktree_path}` is not bound"),
-		));
+		// The header still points at a checkout the workspace no
+		// longer binds (removed out-of-band before the end-of-turn
+		// reconciliation caught it). Forget any stale git metadata —
+		// it would refuse a later `git worktree add` at the same
+		// deterministic path — then clear the stale routing so the
+		// session drives the parent tree, and report the same no-op
+		// success as the no-root case. The worker's session is filed
+		// under the worktree's parent project, so that folder's host
+		// runs the prune.
+		if let Some(parent) = state.workspaces.folder_for_path(worker_folder.as_str()).await {
+			if let Err(err) = parent.host.git_worktree_forget(Utf8Path::new(&worktree_path)).await {
+				tracing::warn!(error = %err, worktree = %worktree_path, "git worktree prune failed for an unbound checkout");
+			}
+		}
+		let handle = CoderHandle { state: state.clone() };
+		handle.clear_worktree_sessions(&worktree_path).await;
+		return Ok(json!({
+			"status": "already_gone",
+			"worktree_path": worktree_path,
+			"note": "the worktree folder was already unbound — cleared the worker's stale routing; its session and branch are untouched",
+		}));
 	};
 	let moon_protocol::workspace::FolderOrigin::Worktree { parent_path, .. } = wt_entry.folder.origin.clone() else {
 		return Err(CoderError::invalid_args(
@@ -7845,6 +7870,76 @@ async fn handle_discard_worker_worktree(
 		"worktree_path": worktree_path,
 		"branch": worktree_branch,
 		"note": "the branch is kept; the worker's session now runs against the parent project",
+	}))
+}
+
+/// `retire_worker` — drop a fully-done worker from the coordinator's
+/// fleet registry (ADR 0064). Pure bookkeeping: the session, its
+/// transcript, and its branch are untouched; the registry link is
+/// removed so `list_workers` stops listing it, the feeder stops
+/// forwarding its events, and the control tools stop treating it as
+/// this coordinator's worker. Refuses a running worker (abort first)
+/// and one whose worktree is still bound (`discard_worker_worktree`
+/// first) so retirement can't strand an in-flight turn or an orphan
+/// folder the coordinator no longer has tools to clean up. A
+/// disconnected worker may be retired — that only drops the
+/// coordinator's own bookkeeping for a session the user already owns.
+async fn handle_retire_worker(
+	state: &Arc<CoderState>,
+	sink: &FolderEventSink,
+	args: &Value,
+) -> Result<Value, CoderError> {
+	#[derive(serde::Deserialize)]
+	struct RetireArgs {
+		worker_id: String,
+	}
+	let parsed: RetireArgs =
+		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("retire_worker", err.to_string()))?;
+	let orchestrator_id = sink.session_id().to_string();
+	let owning = state
+		.coordinator_workers
+		.read()
+		.await
+		.owning_orchestrator_of(&parsed.worker_id)
+		.map(str::to_string);
+	if owning.as_deref() != Some(orchestrator_id.as_str()) {
+		return Err(CoderError::invalid_args(
+			"retire_worker",
+			format!("`{}` is not a worker of this coordinator", parsed.worker_id),
+		));
+	}
+	if let Some((rt, _)) = state.runtime_for_session(&parsed.worker_id).await {
+		if rt.turn.lock().await.cancel.is_some() {
+			return Err(CoderError::invalid_args(
+				"retire_worker",
+				format!(
+					"worker `{}` has a turn in flight — wait for it to finish or `abort_worker` first",
+					parsed.worker_id
+				),
+			));
+		}
+		let worktree_root = rt.session.lock().await.header.worktree_root.clone();
+		if let Some(root) = worktree_root {
+			if state.workspaces.folder_for_path(&root).await.is_some() {
+				return Err(CoderError::invalid_args(
+					"retire_worker",
+					format!(
+						"worker `{}` still has a bound worktree at `{root}` — land its work and `discard_worker_worktree` first",
+						parsed.worker_id
+					),
+				));
+			}
+		}
+	}
+	state
+		.coordinator_workers
+		.write()
+		.await
+		.remove(&orchestrator_id, &parsed.worker_id);
+	Ok(json!({
+		"status": "retired",
+		"worker_id": parsed.worker_id,
+		"note": "the worker left your fleet; its session, transcript, and branch are untouched",
 	}))
 }
 
