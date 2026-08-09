@@ -1470,7 +1470,10 @@ The lifecycle surface:
   user-level abort (Esc) cascades to a session's live detached runs.
 - **Handles are in-memory.** A restart loses live runs (their JSONLs
   stay on disk); `task_collect` on a lost id says so rather than
-  hanging. A detached run outlives its spawning turn, so it flushes
+  hanging. A settled run's report stays collectable (repeatably) until
+  the parent session is deleted — the wake is only a pointer, and the
+  parent may not reach its `task_collect` until several turns later.
+  A detached run outlives its spawning turn, so it flushes
   its own format-on-save queue when it settles (as a user-resumed
   sub-agent already does).
 

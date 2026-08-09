@@ -400,26 +400,25 @@ impl DetachedTaskRegistry {
 			.collect()
 	}
 
-	/// Drop every settled entry, keeping only runs whose `finish`
-	/// is still `None`. Housekeeping so a long-lived process
-	/// doesn't accumulate one map entry per detached run forever;
-	/// a settled run's *report* has already been delivered (or is
-	/// unreadable after this, which is fine — the transcript is on
-	/// disk).
-	async fn prune_settled(&mut self) {
-		let mut dead = Vec::new();
-		for (id, entry) in &self.entries {
-			if entry.finish.lock().await.is_some() {
-				dead.push(id.clone());
+	/// Drop every entry of `parent_session_id`'s detached runs,
+	/// cancelling any still-live ones. Called when the parent
+	/// session is deleted — nothing can collect a report once the
+	/// parent is gone, and this bound (entries live as long as
+	/// their parent session) is what keeps a long-lived process
+	/// from accumulating one map entry per detached run forever.
+	/// Settled entries must NOT be pruned any earlier: the finish
+	/// wake is a pointer, not the report, and the parent may only
+	/// get around to `task_collect` several turns later.
+	fn prune_parent(&mut self, parent_session_id: &str) {
+		let Some(ids) = self.by_parent.remove(parent_session_id) else {
+			return;
+		};
+		for id in ids {
+			if let Some(entry) = self.entries.remove(&id) {
+				// Harmless on settled runs; stops live ones.
+				entry.cancel.cancel();
 			}
 		}
-		for id in dead {
-			self.entries.remove(&id);
-			for set in self.by_parent.values_mut() {
-				set.remove(&id);
-			}
-		}
-		self.by_parent.retain(|_, set| !set.is_empty());
 	}
 }
 
@@ -3567,6 +3566,10 @@ impl CoderHandle {
 				token.cancel();
 			}
 		}
+		// Tear down the session's detached sub-agents ([ADR 0053]):
+		// cancel live runs and drop cached reports — nothing can
+		// collect them once the parent session is gone.
+		self.state.detached_tasks.write().await.prune_parent(&id);
 		// Clear the visible pointer if it was this session — the
 		// frontend's deletion handler is responsible for picking
 		// a successor (open another row from the list or
@@ -6541,27 +6544,22 @@ async fn handle_task_collect(
 	let parsed: CollectArgs =
 		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("task_collect", err.to_string()))?;
 	let parent_session_id = rt.session.lock().await.header.id.clone();
+	// `register` / `prune_parent` keep `by_parent` and `entries` in
+	// lockstep, so an ownership hit implies a live entry — one miss
+	// branch covers both "never yours" and "lost to a restart".
 	let entry = {
 		let registry = state.detached_tasks.read().await;
-		if !registry.is_detached_of(&parent_session_id, &parsed.subagent_id) {
-			return Err(CoderError::invalid_args(
-				"task_collect",
-				format!(
-					"no detached sub-agent `{}` for this session — only ids your own `task({{ detach: true }})` calls returned are collectable (a synchronous `task` has no handle)",
-					parsed.subagent_id
-				),
-			));
+		if registry.is_detached_of(&parent_session_id, &parsed.subagent_id) {
+			registry.entry(&parsed.subagent_id)
+		} else {
+			None
 		}
-		registry.entry(&parsed.subagent_id)
 	};
 	let Some(entry) = entry else {
-		// Registered under the parent but no live entry — a
-		// restart dropped the in-memory run. Point the model at
-		// the on-disk transcript instead of hanging.
 		return Err(CoderError::invalid_args(
 			"task_collect",
 			format!(
-				"detached sub-agent `{}` is no longer running (the IDE restarted); its transcript is on disk under the parent session's sub-agent directory",
+				"no detached sub-agent `{}` for this session — either the id is not one this session's `task({{ detach: true }})` calls returned (a synchronous `task` has no handle), or the in-memory handle was lost to an IDE restart; a finished run's transcript is on disk under the parent session's sub-agent directory",
 				parsed.subagent_id
 			),
 		));
@@ -6684,12 +6682,13 @@ fn spawn_detached_finish_feeder(state: Arc<CoderState>, parent_session_id: Strin
 				"Detached sub-agent {subagent_id} finished (status: {status}). Call `task_collect(\"{subagent_id}\")` to fetch its report, or ignore it if you no longer need the result."
 			);
 			// Best-effort: the parent may be gone (its session
-			// deleted). The report stays cached regardless.
+			// deleted). The wake is a pointer, not the report —
+			// the cached entry must survive it, because the parent
+			// is typically mid-turn here and only reaches its
+			// `task_collect` one or more LLM round-trips later.
+			// Entries are pruned when the parent session is
+			// deleted, not before.
 			let _ = handle.send_to(&parent_session_id, text, Vec::new()).await;
-			// Housekeeping: drop settled entries whose report has
-			// already been delivered so a long-lived process
-			// doesn't accumulate one map entry per detached run.
-			state.detached_tasks.write().await.prune_settled().await;
 		}
 	});
 }
@@ -10505,17 +10504,37 @@ mod tests {
 			assert_eq!(reg.live_tokens_of("sess-none").len(), 0);
 		}
 
+		/// Regression: the finish feeder used to prune settled
+		/// entries right after sending the wake, so the parent's
+		/// later `task_collect` found nothing. The report must
+		/// stay collectable until the parent session is deleted.
 		#[tokio::test]
-		async fn prune_settled_drops_finished_runs_keeps_live_ones() {
+		async fn settled_runs_stay_collectable_until_the_parent_is_pruned() {
 			let mut reg = DetachedTaskRegistry::default();
-			reg.register("sess-a", "sub-live", CancellationToken::new());
 			let settled = reg.register("sess-a", "sub-done", CancellationToken::new());
 			DetachedTaskRegistry::settle(&settled, DetachedFinish::Failed("boom".into())).await;
-			reg.prune_settled().await;
-			assert!(reg.entry("sub-live").is_some());
-			assert!(reg.entry("sub-done").is_none());
-			assert!(reg.is_detached_of("sess-a", "sub-live"));
+			assert!(reg.is_detached_of("sess-a", "sub-done"));
+			assert!(reg.entry("sub-done").is_some());
+			reg.prune_parent("sess-a");
 			assert!(!reg.is_detached_of("sess-a", "sub-done"));
+			assert!(reg.entry("sub-done").is_none());
+		}
+
+		#[test]
+		fn prune_parent_cancels_live_runs_and_spares_other_parents() {
+			let mut reg = DetachedTaskRegistry::default();
+			let live_a = CancellationToken::new();
+			let live_b = CancellationToken::new();
+			reg.register("sess-a", "sub-1", live_a.clone());
+			reg.register("sess-b", "sub-2", live_b.clone());
+			reg.prune_parent("sess-a");
+			assert!(live_a.is_cancelled());
+			assert!(reg.entry("sub-1").is_none());
+			assert!(!live_b.is_cancelled());
+			assert!(reg.is_detached_of("sess-b", "sub-2"));
+			// Idempotent on an unknown / already-pruned parent.
+			reg.prune_parent("sess-a");
+			reg.prune_parent("sess-none");
 		}
 	}
 
