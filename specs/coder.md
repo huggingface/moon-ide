@@ -686,6 +686,14 @@ turn drains it at the next iteration boundary; an idle coordinator
 holds it (a queued row, with "go now" as the manual wake) until its
 next turn, typically the worker's own `TurnComplete` dispatch packet.
 
+The links survive restarts
+([ADR 0065](decisions/0065-restart-resilient-worker-links.md)): the
+worker's header carries its orchestrator id, the coordinator's JSONL
+carries the fleet (spawn records with a worktree, minus
+`WorkerDetached` records appended on disconnect / retire / spawn
+rollback), and a coordinator's cold remount re-registers the fleet,
+respawns the dispatch feeder, and quietly remounts surviving workers.
+
 Worker events, by contrast, **do wake** an idle coordinator (ADR
 0030's events-as-messages feeder): a worker's `TurnComplete`, and a
 worker parking an `ask_user` prompt. The needs-input packet quotes

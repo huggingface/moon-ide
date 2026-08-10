@@ -746,6 +746,9 @@ impl Session {
 			header: SessionHeader {
 				schema: SESSION_SCHEMA_VERSION,
 				id: new_session_id(),
+				// Stamped post-create by `handle_spawn_worker` for
+				// coordinator workers; every other session stays None.
+				orchestrator_session_id: None,
 				// Bound at first-persistence time by `Coder::send`
 				// once we know which workspace folder the session
 				// is attached to. Left blank here so the freshly-
@@ -2813,6 +2816,7 @@ impl CoderHandle {
 		let mut last_todos: Vec<crate::TodoItem> = Vec::new();
 		for record in records {
 			match record {
+				SessionRecord::WorkerDetached { .. } => {}
 				SessionRecord::User { text, images, .. } => {
 					messages.push(ChatMessage::User {
 						content: text.clone(),
@@ -3167,6 +3171,15 @@ impl CoderHandle {
 	/// the full record list still drives the runtime rebuild, so
 	/// the mounted session's `messages` stay complete for the next
 	/// turn. `None` replays everything (the desktop's behaviour).
+	/// Type-erased [`Self::open_session_impl`] for the fleet-rebuild
+	/// task (ADR 0065), which remounts workers from *inside* an
+	/// `open_session_impl` call — boxing breaks the recursive opaque-
+	/// future cycle that otherwise makes the future's `Send`-ness
+	/// unprovable.
+	fn open_session_boxed(&self, folder: String, id: String) -> BoxedOpenSession<'_> {
+		Box::pin(async move { self.open_session_impl(Some(folder.as_str()), id, false, None).await })
+	}
+
 	async fn open_session_impl(
 		&self,
 		folder: Option<&str>,
@@ -3195,6 +3208,14 @@ impl CoderHandle {
 			records,
 			record_timestamps,
 		} = sessions::load(&dir, &id).await?;
+		// ADR 0065: fold the on-disk fleet for a coordinator remount
+		// (below).
+		let is_coordinator = CoderMode::from_top_level_wire(header.mode.as_deref()) == CoderMode::Coordinator;
+		let worker_fleet: Vec<String> = if is_coordinator {
+			fold_worker_fleet(&records)
+		} else {
+			Vec::new()
+		};
 
 		let RebuiltMessages {
 			mut messages,
@@ -3349,6 +3370,51 @@ impl CoderHandle {
 		}
 		if focus {
 			fs.set_visible(id.clone()).await;
+		}
+
+		// ADR 0065: the in-memory fleet registry and dispatch feeder
+		// die with the process. A coordinator's cold remount rebuilds
+		// both from its own records, then quietly remounts surviving
+		// workers in the background so its control tools (and the
+		// feeder's event filter) work without each worker needing a
+		// UI open first. Idempotent: `register` is set-insert, the
+		// feeder spawn is guarded, and a live process re-opening the
+		// session takes the already-mounted fast path above.
+		if !already_mounted && is_coordinator && !worker_fleet.is_empty() {
+			let mut spawn_feeder = false;
+			{
+				let mut registry = self.state.coordinator_workers.write().await;
+				for worker in &worker_fleet {
+					spawn_feeder |= registry.register(&id, worker);
+				}
+			}
+			if spawn_feeder {
+				spawn_dispatch_feeder(self.state.clone(), id.clone());
+			}
+			let state = self.state.clone();
+			let orchestrator_id = id.clone();
+			let folder = folder_path.clone();
+			let fleet = worker_fleet.clone();
+			tokio::spawn(async move {
+				let handle = CoderHandle { state };
+				for worker in fleet {
+					if handle.state.runtime_for_session(&worker).await.is_some() {
+						continue;
+					}
+					if let Err(err) = handle.open_session_boxed(folder.to_string(), worker.clone()).await {
+						// Deleted / unloadable worker session: drop it
+						// from the fleet rather than leaving a ghost the
+						// coordinator can list but never reach.
+						tracing::warn!(?err, worker = %worker, "fleet rebuild: worker remount failed; unregistering");
+						handle
+							.state
+							.coordinator_workers
+							.write()
+							.await
+							.remove(&orchestrator_id, &worker);
+					}
+				}
+			});
 		}
 
 		// Tell the panel to clear + reload, then fan out the
@@ -4239,15 +4305,43 @@ impl CoderHandle {
 		if trimmed.is_empty() {
 			return;
 		}
-		let Some(orchestrator_id) = self
+		let registered = self
 			.state
 			.coordinator_workers
 			.read()
 			.await
 			.orchestrator_of(session_id)
-			.map(str::to_string)
-		else {
-			return;
+			.map(str::to_string);
+		let orchestrator_id = match registered {
+			Some(id) => id,
+			// Restart fallback (ADR 0065): the registry died with the
+			// process, but the worker's header carries the link.
+			// Quietly remount the coordinator — its cold mount
+			// rebuilds the fleet (or proves this worker detached) —
+			// then re-consult the registry, which now reflects any
+			// persisted `WorkerDetached`.
+			None => {
+				let Some((worker_rt, worker_folder)) = self.state.runtime_for_session(session_id).await else {
+					return;
+				};
+				let Some(orch) = worker_rt.session.lock().await.header.orchestrator_session_id.clone() else {
+					return;
+				};
+				if self.state.runtime_for_session(&orch).await.is_none() {
+					let _ = self.open_session_boxed(worker_folder.to_string(), orch.clone()).await;
+				}
+				match self
+					.state
+					.coordinator_workers
+					.read()
+					.await
+					.orchestrator_of(session_id)
+					.map(str::to_string)
+				{
+					Some(id) => id,
+					None => return,
+				}
+			}
 		};
 		let notice = if queued {
 			format!(
@@ -4611,10 +4705,19 @@ impl CoderHandle {
 			token.cancel();
 			return DisconnectWorkerOutcome::Aborted;
 		}
-		// First click: the link is cut. If the worker is idle it
-		// will never emit the `TurnComplete` the feeder uses to
-		// deliver the final wake, so notify the orchestrator now and
-		// drop the link entirely.
+		// First click: the link is cut. Persist it (ADR 0065) so a
+		// restart-time fleet rebuild doesn't resurrect the worker —
+		// the worker's folder doubles as the coordinator's (same
+		// coder root) for the remount hint.
+		let folder_hint = self
+			.state
+			.runtime_for_session(session_id)
+			.await
+			.map(|(_, folder)| folder.to_string());
+		persist_worker_detached(&self.state, &orchestrator_id, session_id, folder_hint.as_deref()).await;
+		// If the worker is idle it will never emit the `TurnComplete`
+		// the feeder uses to deliver the final wake, so notify the
+		// orchestrator now and drop the link entirely.
 		let running = match self.state.runtime_for_session(session_id).await {
 			Some((rt, _)) => rt.turn.lock().await.cancel.is_some(),
 			None => false,
@@ -6474,6 +6577,80 @@ async fn persist_parent_record(rt: &Arc<SessionRuntime>, record: SessionRecord) 
 	}
 }
 
+/// Return shape of [`CoderHandle::open_session_boxed`]: the boxed
+/// (type-erased) `open_session_impl` future. See that method's doc
+/// for why the erasure exists.
+type BoxedOpenSession<'a> = std::pin::Pin<
+	Box<
+		dyn std::future::Future<Output = Result<(SessionSummary, Option<(Vec<CoderEvent>, bool, bool)>), CoderError>>
+			+ Send
+			+ 'a,
+	>,
+>;
+
+/// Fold a coordinator's records into its surviving fleet (ADR 0065):
+/// a worker is a `SubagentSpawned` carrying a `worktree_root` (`task`
+/// sub-agents never have one); a later `WorkerDetached` removes it.
+/// Order-preserving and duplicate-free.
+fn fold_worker_fleet(records: &[SessionRecord]) -> Vec<String> {
+	let mut fleet: Vec<String> = Vec::new();
+	for record in records {
+		match record {
+			SessionRecord::SubagentSpawned {
+				subagent_id,
+				worktree_root: Some(_),
+				..
+			} => {
+				if !fleet.contains(subagent_id) {
+					fleet.push(subagent_id.clone());
+				}
+			}
+			SessionRecord::WorkerDetached { worker_id } => {
+				fleet.retain(|w| w != worker_id);
+			}
+			_ => {}
+		}
+	}
+	fleet
+}
+
+/// Append a [`SessionRecord::WorkerDetached`] to the coordinator's
+/// JSONL (ADR 0065) so a restart-time fleet rebuild doesn't
+/// resurrect the link. Best-effort: an unmounted coordinator is
+/// quietly remounted first when the caller can name its folder;
+/// failure logs at warn and costs only rebuild accuracy after the
+/// *next* restart.
+async fn persist_worker_detached(
+	state: &Arc<CoderState>,
+	orchestrator_id: &str,
+	worker_id: &str,
+	folder_hint: Option<&str>,
+) {
+	if state.runtime_for_session(orchestrator_id).await.is_none() {
+		if let Some(folder) = folder_hint {
+			let handle = CoderHandle { state: state.clone() };
+			let _ = handle
+				.open_session_boxed(folder.to_string(), orchestrator_id.to_string())
+				.await;
+		}
+	}
+	let Some((rt, _)) = state.runtime_for_session(orchestrator_id).await else {
+		tracing::warn!(
+			orchestrator_id,
+			worker_id,
+			"coordinator unmounted; worker detach not persisted"
+		);
+		return;
+	};
+	persist_parent_record(
+		&rt,
+		SessionRecord::WorkerDetached {
+			worker_id: worker_id.to_string(),
+		},
+	)
+	.await;
+}
+
 /// `task` with `detach: true` ([ADR 0053]). Registers the run,
 /// spawns it on a fresh root token, and returns a handle
 /// immediately — the parent keeps working. The finish feeder
@@ -6991,6 +7168,13 @@ async fn handle_spawn_worker(
 	// old order) raced that guard: the worker's `SessionLoaded` landed
 	// first, read as a plain open, and the panel jumped to the worker.
 	let orchestrator_id = sink.session_id.clone();
+	// Stamp the reverse link (ADR 0065) before the seed send persists
+	// the header: a restarted process re-links the fleet from disk,
+	// and this field is the worker-side half (the coordinator side
+	// rebuilds from its own spawn/detach records).
+	if let Some((worker_rt, _)) = state.runtime_for_session(&summary.id).await {
+		worker_rt.session.lock().await.header.orchestrator_session_id = Some(orchestrator_id.clone());
+	}
 	let spawn_feeder = state
 		.coordinator_workers
 		.write()
@@ -7043,6 +7227,9 @@ async fn handle_spawn_worker(
 			.write()
 			.await
 			.remove(&orchestrator_id, &summary.id);
+		// The spawn record is already on disk; without a matching
+		// detach a restart would resurrect this never-started worker.
+		persist_worker_detached(state, &orchestrator_id, &summary.id, None).await;
 		return Err(err);
 	}
 	// The worker's worktree just became a bound folder; the folder bar
@@ -8063,6 +8250,9 @@ async fn handle_retire_worker(
 		.write()
 		.await
 		.remove(&orchestrator_id, &parsed.worker_id);
+	// Persist (ADR 0065): without this a restart-time fleet rebuild
+	// would re-register the retired worker.
+	persist_worker_detached(state, &orchestrator_id, &parsed.worker_id, Some(sink.folder.as_str())).await;
 	Ok(json!({
 		"status": "retired",
 		"worker_id": parsed.worker_id,
@@ -9572,6 +9762,8 @@ fn sanitise_auto_title(raw: &str) -> String {
 /// instead of one-per-record.
 fn emit_replay_events(out: &mut Vec<CoderEvent>, record: SessionRecord, created_at_ms: i64) {
 	match record {
+		// Fleet bookkeeping (ADR 0065) — nothing to render.
+		SessionRecord::WorkerDetached { .. } => {}
 		SessionRecord::User {
 			text,
 			images,
@@ -9821,6 +10013,7 @@ async fn replay_subagent_spawned(
 /// chatter down on a long-running sub-agent.
 fn subagent_replay_inners(record: SessionRecord, created_at_ms: i64) -> Vec<CoderEvent> {
 	match record {
+		SessionRecord::WorkerDetached { .. } => Vec::new(),
 		SessionRecord::User {
 			text,
 			images,
@@ -10304,6 +10497,33 @@ pub(crate) fn new_message_id() -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn fold_worker_fleet_tracks_spawns_and_detaches() {
+		let spawn = |id: &str, worktree: Option<&str>| SessionRecord::SubagentSpawned {
+			tool_call_id: "c".into(),
+			subagent_id: id.into(),
+			target_folder: "/f".into(),
+			mode: "agent".into(),
+			worktree_root: worktree.map(str::to_string),
+			detached: false,
+		};
+		let records = vec![
+			spawn("w-1", Some("/f/.worktrees/a")),
+			// `task` sub-agent: no worktree, never part of the fleet.
+			spawn("sub-1", None),
+			spawn("w-2", Some("/f/.worktrees/b")),
+			SessionRecord::WorkerDetached {
+				worker_id: "w-1".into(),
+			},
+		];
+		assert_eq!(fold_worker_fleet(&records), vec!["w-2".to_string()]);
+		// A detach with no matching spawn is a no-op.
+		let only_detach = vec![SessionRecord::WorkerDetached {
+			worker_id: "w-9".into(),
+		}];
+		assert!(fold_worker_fleet(&only_detach).is_empty());
+	}
 
 	#[test]
 	fn respond_answers_accepts_map_and_sequence_forms() {
@@ -11039,6 +11259,7 @@ mod tests {
 		SessionHeader {
 			schema: SESSION_SCHEMA_VERSION,
 			id: id.into(),
+			orchestrator_session_id: None,
 			cwd: "/tmp/steer-test".into(),
 			title: "steer test".into(),
 			created_at_ms: 1,

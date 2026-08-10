@@ -533,6 +533,8 @@ pub(crate) async fn run_subagent(
 	let header = SessionHeader {
 		schema: SESSION_SCHEMA_VERSION,
 		id: id.clone(),
+		// `task` sub-agents have a parent, not an orchestrator.
+		orchestrator_session_id: None,
 		// Sub-agents operate against their target folder; that's
 		// the `cwd` the pi viewer should show for this trace.
 		// Sub-agents that fall back to the parent's folder still

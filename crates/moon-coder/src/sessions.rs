@@ -155,6 +155,14 @@ pub struct SessionHeader {
 	/// and for sub-agent sessions that targeted the same folder as
 	/// their parent.
 	pub subagent_target_folder: Option<String>,
+	/// Coordinator session that spawned this worker (ADR 0030 /
+	/// ADR 0065). Persisted so a process restart can re-link the
+	/// fleet: the in-memory registry + dispatch feeder die with the
+	/// process, and this field lets a remounted worker find its
+	/// orchestrator again (the orchestrator side rebuilds from its
+	/// own `SubagentSpawned` / `WorkerDetached` records). `None`
+	/// for every non-worker session.
+	pub orchestrator_session_id: Option<String>,
 	/// Per-session escape hatch for where the coder's `bash` /
 	/// shell tools run. `None` is the default ("auto"): `bash`
 	/// routes to the workspace shell container when it's running,
@@ -246,6 +254,7 @@ const CUSTOM_TYPE_SUBAGENT_FINISHED: &str = "moon_subagent_finished";
 const CUSTOM_TYPE_USAGE: &str = "moon_usage";
 const CUSTOM_TYPE_ERROR: &str = "moon_error";
 const CUSTOM_TYPE_TURN_DIFF: &str = "moon_turn_diff";
+const CUSTOM_TYPE_WORKER_DETACHED: &str = "moon_worker_detached";
 
 impl Serialize for SessionHeader {
 	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -277,6 +286,9 @@ impl Serialize for SessionHeader {
 		}
 		if let Some(v) = &self.subagent_target_folder {
 			map.serialize_entry("subagent_target_folder", v)?;
+		}
+		if let Some(v) = &self.orchestrator_session_id {
+			map.serialize_entry("orchestrator_session_id", v)?;
 		}
 		if let Some(v) = &self.bash_target_override {
 			map.serialize_entry("bash_target_override", v.as_wire())?;
@@ -329,6 +341,8 @@ impl<'de> Deserialize<'de> for SessionHeader {
 			#[serde(default)]
 			subagent_target_folder: Option<String>,
 			#[serde(default)]
+			orchestrator_session_id: Option<String>,
+			#[serde(default)]
 			bash_target_override: Option<String>,
 			#[serde(default)]
 			worktree_root: Option<String>,
@@ -351,6 +365,7 @@ impl<'de> Deserialize<'de> for SessionHeader {
 			subagent_mode: raw.subagent_mode,
 			mode: raw.mode,
 			subagent_target_folder: raw.subagent_target_folder,
+			orchestrator_session_id: raw.orchestrator_session_id,
 			bash_target_override: raw
 				.bash_target_override
 				.as_deref()
@@ -483,6 +498,13 @@ pub(crate) fn record_to_pi_wire(
 					"worktree_root": worktree_root,
 					"detached": detached,
 				}),
+			),
+			timestamp_ms,
+		),
+		SessionRecord::WorkerDetached { worker_id } => pi_message_envelope(
+			pi_custom_message(
+				CUSTOM_TYPE_WORKER_DETACHED,
+				serde_json::json!({ "worker_id": worker_id }),
 			),
 			timestamp_ms,
 		),
@@ -1153,6 +1175,13 @@ fn parse_pi_custom(msg: &serde_json::Value) -> Option<SessionRecord> {
 				.map(|s| s.to_string()),
 			detached: details.get("detached").and_then(|v| v.as_bool()).unwrap_or(false),
 		}),
+		CUSTOM_TYPE_WORKER_DETACHED => Some(SessionRecord::WorkerDetached {
+			worker_id: details
+				.get("worker_id")
+				.and_then(|v| v.as_str())
+				.unwrap_or_default()
+				.to_string(),
+		}),
 		CUSTOM_TYPE_SUBAGENT_FINISHED => Some(SessionRecord::SubagentFinished {
 			subagent_id: details
 				.get("subagent_id")
@@ -1408,6 +1437,13 @@ pub enum SessionRecord {
 		#[serde(default, skip_serializing_if = "std::ops::Not::not")]
 		detached: bool,
 	},
+	/// A coordinator worker left this orchestrator's fleet
+	/// (ADR 0065): explicit user disconnect (ADR 0052), a
+	/// `retire_worker`, or a spawn whose seed send failed and was
+	/// rolled back. Appended to the **coordinator's** JSONL so a
+	/// restart-time fleet rebuild (fold of `SubagentSpawned` with a
+	/// `worktree_root` minus these) doesn't resurrect the link.
+	WorkerDetached { worker_id: String },
 	/// One sub-agent finished (success or error). Mirrors
 	/// [`crate::CoderEvent::SubagentFinished`] plus a
 	/// `result_preview` field so the collapsed card on the
@@ -2719,6 +2755,7 @@ mod tests {
 		SessionHeader {
 			schema: SESSION_SCHEMA_VERSION,
 			id: id.into(),
+			orchestrator_session_id: None,
 			cwd: "/tmp/test".into(),
 			title: format!("{id} title"),
 			created_at_ms: 1_700_000_000_000,
@@ -3492,6 +3529,34 @@ mod tests {
 			}
 			other => panic!("expected Tool, got {other:?}"),
 		}
+	}
+
+	#[tokio::test]
+	async fn worker_detached_and_orchestrator_link_round_trip() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let mut header = make_test_header("sess-worker");
+		header.orchestrator_session_id = Some("sess-coordinator".into());
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::WorkerDetached {
+				worker_id: "w-1".into(),
+			},
+		)
+		.await
+		.unwrap();
+		let loaded = load(&dir, "sess-worker").await.unwrap();
+		// The header field survives the round trip (ADR 0065)…
+		assert_eq!(
+			loaded.header.orchestrator_session_id.as_deref(),
+			Some("sess-coordinator")
+		);
+		// …and so does the detach record.
+		assert!(matches!(
+			loaded.records.as_slice(),
+			[SessionRecord::WorkerDetached { worker_id }] if worker_id == "w-1"
+		));
 	}
 
 	#[tokio::test]
