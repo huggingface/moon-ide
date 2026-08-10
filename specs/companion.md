@@ -241,7 +241,8 @@ requested surface:
   `Coder::retry_last_turn_in`) — same semantics as the desktop's
   trailing-error retry: nothing truncated, output appends below.
 - **Hash routing.** The current view (workspace + optional session)
-  is mirrored into the URL hash (`#/w?ws=…&ide=…&s=…`) via
+  is mirrored into the URL hash (`#/w?ws=…&ide=…&f=…&s=…`, `f` the
+  active project folder) via
   `replaceState` — a refresh restores the same page, and no history
   entries pile up for the back button. Restore is best-effort with a
   hard no-stuck rule: a workspace that fails to open falls back to

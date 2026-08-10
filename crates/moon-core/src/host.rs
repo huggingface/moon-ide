@@ -6059,26 +6059,72 @@ fn run_git_permalink(root: &Utf8Path, rel: &Utf8Path, start_line: u32, end_line:
 }
 
 fn remote_web_url(root: &Utf8Path) -> Option<String> {
-	use std::process::Command;
-
 	for candidate in ["origin", "upstream"] {
-		let raw = Command::new("git")
-			.arg("-C")
-			.arg(root.as_std_path())
-			.args(["config", "--get"])
-			.arg(format!("remote.{candidate}.url"))
-			.output()
-			.ok()
-			.filter(|o| o.status.success())
-			.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-			.filter(|s| !s.is_empty());
-		if let Some(url) = raw {
+		if let Some(url) = git_config_remote_url(root, candidate) {
 			if let Some(web) = normalize_remote_url(&url) {
 				return Some(web);
 			}
 			// Remote exists but isn't a supported host; keep looking
 			// — the repo may have a GitHub upstream behind a custom
 			// origin.
+		}
+	}
+	None
+}
+
+/// Read `remote.<name>.url` straight from the repo's config file,
+/// **without invoking git**: the URL is plain file data, and the
+/// host's git binary can be older than the repo. Concretely, the dev
+/// container's git ≥ 2.48 writes `extensions.relativeWorktrees` into
+/// the parent repo config when a worker worktree is created, after
+/// which a 2.43 host git refuses to open the repo at all — even for
+/// `git config --get`. Handles the worktree case too: a `.git`
+/// *file* is a `gitdir:` pointer, and a linked worktree's config
+/// lives in the common dir named by its `commondir` file.
+fn git_config_remote_url(root: &Utf8Path, remote: &str) -> Option<String> {
+	let git_path = root.join(".git");
+	let config_path = if git_path.is_file() {
+		let pointer = std::fs::read_to_string(&git_path).ok()?;
+		let gitdir = pointer.strip_prefix("gitdir:")?.trim();
+		let gitdir = if Utf8Path::new(gitdir).is_absolute() {
+			Utf8PathBuf::from(gitdir)
+		} else {
+			root.join(gitdir)
+		};
+		let common = match std::fs::read_to_string(gitdir.join("commondir")) {
+			Ok(rel) => gitdir.join(rel.trim()),
+			Err(_) => gitdir,
+		};
+		common.join("config")
+	} else {
+		git_path.join("config")
+	};
+	parse_git_config_remote_url(&std::fs::read_to_string(config_path).ok()?, remote)
+}
+
+/// Minimal INI walk for the one key we need. Not a general git
+/// config parser: no includes, no quoting/escape handling beyond
+/// git's own literal section headers — `git remote add` writes
+/// exactly `[remote "name"]` and `\turl = <raw url>`.
+fn parse_git_config_remote_url(config: &str, remote: &str) -> Option<String> {
+	let header = format!("[remote \"{remote}\"]");
+	let mut in_section = false;
+	for line in config.lines() {
+		let line = line.trim();
+		if line.starts_with('[') {
+			in_section = line == header;
+			continue;
+		}
+		if !in_section {
+			continue;
+		}
+		if let Some(rest) = line.strip_prefix("url") {
+			if let Some(value) = rest.trim_start().strip_prefix('=') {
+				let value = value.trim();
+				if !value.is_empty() {
+					return Some(value.to_string());
+				}
+			}
 		}
 	}
 	None
@@ -7599,6 +7645,35 @@ mod tests {
 		let lines = ["head", "head", "first", "second", "tail"];
 		let fp = super::review_fingerprint("first\nsecond");
 		assert_eq!(super::resolve_anchor_in(&lines, 1, 2, &fp), Some((3, 4)));
+	}
+
+	#[test]
+	fn parse_git_config_remote_url_finds_the_right_section() {
+		let config = "[core]\n\
+			\trepositoryformatversion = 1\n\
+			[extensions]\n\
+			\trelativeworktrees = true\n\
+			[remote \"origin\"]\n\
+			\turl = git@github.com:moon/ide.git\n\
+			\tfetch = +refs/heads/*:refs/remotes/origin/*\n\
+			[remote \"upstream\"]\n\
+			\turl = https://github.com/moon/upstream.git\n\
+			[branch \"main\"]\n\
+			\tremote = origin\n";
+		assert_eq!(
+			super::parse_git_config_remote_url(config, "origin"),
+			Some("git@github.com:moon/ide.git".into()),
+		);
+		assert_eq!(
+			super::parse_git_config_remote_url(config, "upstream"),
+			Some("https://github.com/moon/upstream.git".into()),
+		);
+		assert_eq!(super::parse_git_config_remote_url(config, "fork"), None);
+		// A `url` key outside any remote section must not match.
+		assert_eq!(
+			super::parse_git_config_remote_url("[core]\n\turl = x\n", "origin"),
+			None
+		);
 	}
 
 	#[test]

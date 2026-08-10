@@ -549,6 +549,9 @@ class CompanionState {
 		if (this.activeWorkspaceName && this.activeWorkspaceName !== this.activeWorkspace) {
 			params.set('name', this.activeWorkspaceName);
 		}
+		if (this.activeFolder) {
+			params.set('f', this.activeFolder);
+		}
 		if (this.activeSession) {
 			params.set('s', this.activeSession);
 		}
@@ -579,6 +582,14 @@ class CompanionState {
 		if (this.error) {
 			this.closeWorkspace();
 			return;
+		}
+		// Restore the project (bound folder) the user was on —
+		// `openWorkspace` defaults to the desktop's active folder,
+		// which may be a different project. Unknown folder (unbound
+		// since) → keep the default rather than failing the restore.
+		const folder = params.get('f');
+		if (folder && folder !== this.activeFolder && this.folders.some((f) => f.path === folder)) {
+			await this.openFolder(folder);
 		}
 		const session = params.get('s');
 		if (!session) {
@@ -921,19 +932,35 @@ class CompanionState {
 		if (!this.activeWorkspace || !this.activeFolder) {
 			return;
 		}
+		// Pin the request's folder: rapid project switches overlap
+		// these calls, and a slow response for the *previous* folder
+		// must not clobber the current one's status / repoUrl (the
+		// `#123` autolinker would point at the wrong repo — or lose
+		// its links entirely).
+		const folder = this.activeFolder;
 		this.loadingScm = true;
 		try {
-			this.scmStatus = await this.#call<ScmStatus>(
+			const status = await this.#call<ScmStatus>(
 				this.activeWorkspace,
 				'workspace_scm_status',
-				{ folder: this.activeFolder },
+				{ folder },
 				this.activeIde,
 			);
-			this.repoUrl = this.scmStatus.remote_url ?? null;
+			if (this.activeFolder !== folder) {
+				return;
+			}
+			this.scmStatus = status;
+			this.repoUrl = status.remote_url ?? null;
 		} catch {
+			if (this.activeFolder !== folder) {
+				return;
+			}
 			this.scmStatus = null;
+			this.repoUrl = null;
 		} finally {
-			this.loadingScm = false;
+			if (this.activeFolder === folder) {
+				this.loadingScm = false;
+			}
 		}
 	}
 
