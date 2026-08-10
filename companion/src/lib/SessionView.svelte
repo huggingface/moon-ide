@@ -110,6 +110,18 @@
 			e.preventDefault();
 			void send();
 		}
+		// ArrowUp on an empty composer (no modifiers) pulls the most
+		// recent queued steer back into the draft for editing — same
+		// gesture as the desktop composer. Only fires when something
+		// is actually queued, so a plain empty composer keeps the
+		// textarea's default no-op.
+		if (e.key === 'ArrowUp' && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey && draft.length === 0) {
+			const queued = app.rows.findLast((r) => r.kind === 'user' && r.queued);
+			if (queued !== undefined) {
+				e.preventDefault();
+				void unqueue(queued.id);
+			}
+		}
 	}
 
 	function toggleOption(qId: string, optId: string, multi: boolean): void {
