@@ -254,6 +254,12 @@ requested surface:
   origin/upstream remote (`remote_url` on `workspace_scm_status`,
   via `WorkspaceHost::git_remote_web_url`). Token-stream rule, so
   references inside existing links or code spans are untouched.
+  The repo URL is cached per folder in `localStorage` and seeded on
+  folder open, so links render instantly (and offline); the live
+  fetch retries with backoff on slow connections and refreshes the
+  cache. Precondition visibility: the SCM card shows the resolved
+  link base, and the session view shows a dashed "links off" row
+  with a retry button when no repo URL is known.
 - **Run / steer coder sessions.** Subscribe to `coder:event`,
   render the transcript, `coder_send` (send / steer), `coder_abort`.
   Opening a session is **windowed** (`coder_open_session` with

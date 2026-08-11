@@ -325,6 +325,27 @@ export type PendingSend = {
 
 const PENDING_SENDS_KEY = 'moon-companion-pending-sends';
 
+/** Per-folder repo web URLs (`workspace|folder` → url), persisted so
+ * `#123` autolinks render instantly from cache on reopen — even on a
+ * connection too slow for the live `workspace_scm_status` round-trip.
+ * Remotes essentially never move; the live fetch refreshes the entry
+ * in the background when it does succeed. */
+const REPO_URLS_KEY = 'moon-companion-repo-urls';
+
+function loadRepoUrlCache(): Record<string, string> {
+	try {
+		const raw = localStorage.getItem(REPO_URLS_KEY);
+		const parsed: unknown = raw ? JSON.parse(raw) : {};
+		if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+			// eslint-disable-next-line typescript-eslint/no-unsafe-type-assertion
+			return parsed as Record<string, string>;
+		}
+	} catch {
+		// Corrupt cache: start over.
+	}
+	return {};
+}
+
 /** Restore unconfirmed/unsent sends from localStorage so killing the
  * PWA can't lose a message's text. Entries persisted mid-flight
  * (`sending`) restore as `unconfirmed` — the RPC's fate is unknown,
@@ -420,8 +441,20 @@ class CompanionState {
 	/** SCM status for the active folder, or null while loading. */
 	scmStatus = $state<ScmStatus | null>(null);
 	/** Repo web base for the active folder (from `scmStatus`), kept
-	 * separately so transcript autolinks survive SCM reloads. */
+	 * separately so transcript autolinks survive SCM reloads. Seeded
+	 * from the persisted cache the moment a folder is targeted;
+	 * refreshed (and re-cached) whenever `loadScmStatus` succeeds. */
 	repoUrl = $state<string | null>(null);
+	#repoUrlCache: Record<string, string> = loadRepoUrlCache();
+
+	#repoUrlKey(folder: string): string {
+		return `${this.activeWorkspace ?? ''}|${folder}`;
+	}
+
+	/** Point `repoUrl` at the cached entry for `folder` (or null). */
+	#seedRepoUrl(folder: string | null): void {
+		this.repoUrl = folder ? (this.#repoUrlCache[this.#repoUrlKey(folder)] ?? null) : null;
+	}
 	/** True while fetching SCM status. */
 	loadingScm = $state(false);
 	/** True while a commit is in flight. */
@@ -629,6 +662,7 @@ class CompanionState {
 		this.coderStatus = null;
 		this.modelSettings = null;
 		this.scmStatus = null;
+		this.repoUrl = null;
 		this.sessions = [];
 		this.busySessions = new Set();
 		this.folderAttention = new Set();
@@ -798,6 +832,7 @@ class CompanionState {
 			// to the first project.
 			const active = this.folders.find((f) => f.path === snap.active_folder);
 			this.activeFolder = active?.path ?? this.folders[0]?.path ?? null;
+			this.#seedRepoUrl(this.activeFolder);
 			this.coderStatus = await this.#call<CoderStatus>(workspace, 'coder_status', {}, ide);
 			// Subscribe to the event stream immediately so the
 			// session list's running pips light up without having
@@ -823,6 +858,7 @@ class CompanionState {
 			return;
 		}
 		this.activeFolder = path;
+		this.#seedRepoUrl(path);
 		this.closeSession();
 		this.sessions = [];
 		this.scmStatus = null;
@@ -868,6 +904,7 @@ class CompanionState {
 		this.activeIde = '';
 		this.folders = [];
 		this.activeFolder = null;
+		this.repoUrl = null;
 		this.coderStatus = null;
 		this.modelSettings = null;
 		this.scmStatus = null;
@@ -938,37 +975,70 @@ class CompanionState {
 	/** Fetch the active folder's SCM status (branch + changed
 	 * files). Best-effort: an IDE build that predates the method
 	 * leaves the card hidden. */
+	#scmGeneration = 0;
+
 	async loadScmStatus(): Promise<void> {
 		if (!this.activeWorkspace || !this.activeFolder) {
 			return;
 		}
-		// Pin the request's folder: rapid project switches overlap
-		// these calls, and a slow response for the *previous* folder
-		// must not clobber the current one's status / repoUrl (the
-		// `#123` autolinker would point at the wrong repo — or lose
-		// its links entirely).
+		// Pin the request's folder AND generation: rapid project
+		// switches (or overlapping retries) must not let a slow
+		// response for a superseded request clobber the current
+		// folder's status / repoUrl (the `#123` autolinker would
+		// point at the wrong repo — or lose its links entirely).
 		const folder = this.activeFolder;
+		const generation = ++this.#scmGeneration;
+		const superseded = (): boolean => generation !== this.#scmGeneration || this.activeFolder !== folder;
 		this.loadingScm = true;
 		try {
-			const status = await this.#call<ScmStatus>(
-				this.activeWorkspace,
-				'workspace_scm_status',
-				{ folder },
-				this.activeIde,
-			);
-			if (this.activeFolder !== folder) {
-				return;
+			// Retry with backoff: on a slow connection the first
+			// attempt right after resume routinely times out, and a
+			// one-shot fetch left the links dead until the next
+			// folder switch.
+			for (const delayMs of [0, 1500, 5000]) {
+				if (delayMs > 0) {
+					await new Promise((r) => setTimeout(r, delayMs));
+				}
+				if (superseded()) {
+					return;
+				}
+				try {
+					const status = await this.#call<ScmStatus>(
+						this.activeWorkspace,
+						'workspace_scm_status',
+						{ folder },
+						this.activeIde,
+					);
+					if (superseded()) {
+						return;
+					}
+					this.scmStatus = status;
+					const url = status.remote_url ?? null;
+					this.repoUrl = url;
+					const key = this.#repoUrlKey(folder);
+					if (url) {
+						this.#repoUrlCache[key] = url;
+					} else {
+						delete this.#repoUrlCache[key];
+					}
+					try {
+						localStorage.setItem(REPO_URLS_KEY, JSON.stringify(this.#repoUrlCache));
+					} catch {
+						// Quota / private mode: cache is best-effort.
+					}
+					return;
+				} catch {
+					// Fall through to the next attempt.
+				}
 			}
-			this.scmStatus = status;
-			this.repoUrl = status.remote_url ?? null;
-		} catch {
-			if (this.activeFolder !== folder) {
-				return;
+			// Every attempt failed: drop the live SCM card but keep
+			// whatever `repoUrl` the cache seeded — a stale link base
+			// beats none, and remotes essentially never move.
+			if (!superseded()) {
+				this.scmStatus = null;
 			}
-			this.scmStatus = null;
-			this.repoUrl = null;
 		} finally {
-			if (this.activeFolder === folder) {
+			if (generation === this.#scmGeneration && this.activeFolder === folder) {
 				this.loadingScm = false;
 			}
 		}

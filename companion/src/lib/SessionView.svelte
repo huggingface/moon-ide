@@ -1011,6 +1011,19 @@
 		{/if}
 	</div>
 
+	{#if !app.repoUrl}
+		<!-- Precondition debug for #123 autolinks (they need the repo's
+		     remote URL from workspace_scm_status): visible only when
+		     unmet, with a manual retry — "why aren't my links
+		     rendering" should be answerable from the phone. -->
+		<div class="link-debug">
+			<span>#123 links off — repo URL {app.loadingScm ? 'loading…' : 'not loaded'}</span>
+			{#if !app.loadingScm}
+				<button class="link-debug-retry" onclick={() => void app.loadScmStatus()}>retry</button>
+			{/if}
+		</div>
+	{/if}
+
 	{#if app.turnError && !app.busy}
 		<div class="turn-error" role="alert">
 			<span class="turn-error-text">{app.turnError}</span>
@@ -1623,6 +1636,27 @@
 	}
 	.copy-md:active {
 		opacity: 1;
+	}
+	.link-debug {
+		display: flex;
+		align-items: center;
+		gap: 0.6rem;
+		margin: 0 0.75rem 0.3rem;
+		padding: 0.25rem 0.6rem;
+		font-size: 0.72rem;
+		color: var(--fg-muted);
+		background: var(--bg-elev-1);
+		border: 1px dashed var(--border);
+		border-radius: var(--radius);
+	}
+	.link-debug-retry {
+		padding: 0.1rem 0.5rem;
+		font-size: 0.72rem;
+		background: none;
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		color: var(--fg-muted);
+		min-height: 0;
 	}
 	.turn-error {
 		display: flex;

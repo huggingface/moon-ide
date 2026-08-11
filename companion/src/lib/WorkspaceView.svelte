@@ -487,6 +487,13 @@
 		gap: 0.4rem;
 		padding: 0.6rem 0.8rem;
 	}
+	.scm-remote {
+		font-size: 0.7rem;
+		margin-top: 0.15rem;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
 	.scm-head {
 		display: flex;
 		align-items: center;
