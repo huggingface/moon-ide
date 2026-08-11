@@ -8078,6 +8078,56 @@ async fn handle_merge_worker_changes(state: &Arc<CoderState>, args: &Value) -> R
 /// command, and shares its idempotence: a checkout that's already gone
 /// from disk is forgotten (stale git metadata pruned) rather than
 /// erroring.
+/// Normalise a fleet tool's target list: `worker_id` (one) and/or
+/// `worker_ids` (several), deduplicated in order. Erroring on an
+/// empty set keeps "forgot both fields" a loud arg failure instead
+/// of a silent no-op.
+fn parse_worker_ids(tool: &str, args: &Value) -> Result<Vec<String>, CoderError> {
+	#[derive(serde::Deserialize)]
+	struct IdArgs {
+		#[serde(default)]
+		worker_id: Option<String>,
+		#[serde(default)]
+		worker_ids: Vec<String>,
+	}
+	let parsed: IdArgs =
+		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args(tool, err.to_string()))?;
+	let mut ids: Vec<String> = Vec::new();
+	for id in parsed.worker_id.into_iter().chain(parsed.worker_ids) {
+		if !id.is_empty() && !ids.contains(&id) {
+			ids.push(id);
+		}
+	}
+	if ids.is_empty() {
+		return Err(CoderError::invalid_args(
+			tool,
+			"provide `worker_id` or a non-empty `worker_ids`",
+		));
+	}
+	Ok(ids)
+}
+
+/// Fold per-worker outcomes for a multi-target fleet tool: each
+/// entry is the worker's result stamped with its `worker_id`, or a
+/// `{worker_id, error}` row — one bad id doesn't fail the batch.
+/// (Single-target calls skip this and return the bare result, the
+/// historic shape.)
+fn fold_worker_results(results: Vec<(String, Result<Value, CoderError>)>) -> Value {
+	let rows: Vec<Value> = results
+		.into_iter()
+		.map(|(id, outcome)| match outcome {
+			Ok(mut value) => {
+				if let Some(map) = value.as_object_mut() {
+					map.insert("worker_id".into(), json!(id));
+				}
+				value
+			}
+			Err(err) => json!({ "worker_id": id, "error": err.to_string() }),
+		})
+		.collect();
+	json!({ "results": rows })
+}
+
 async fn handle_discard_worker_worktree(
 	state: &Arc<CoderState>,
 	sink: &FolderEventSink,
@@ -8085,17 +8135,65 @@ async fn handle_discard_worker_worktree(
 ) -> Result<Value, CoderError> {
 	#[derive(serde::Deserialize)]
 	struct DiscardArgs {
-		worker_id: String,
 		#[serde(default)]
 		force: bool,
+		#[serde(default)]
+		retire: bool,
 	}
 	let parsed: DiscardArgs = serde_json::from_value(args.clone())
 		.map_err(|err| CoderError::invalid_args("discard_worker_worktree", err.to_string()))?;
-	ensure_worker_still_attached(state, "discard_worker_worktree", &parsed.worker_id).await?;
-	let Some((rt, worker_folder)) = state.runtime_for_session(&parsed.worker_id).await else {
+	let ids = parse_worker_ids("discard_worker_worktree", args)?;
+	// `retire: true` folds the follow-up `retire_worker` into the
+	// same call — discard first (retire refuses a bound worktree),
+	// then drop the fleet link. A retire refusal (e.g. the turn
+	// started between the two steps) reports on the result instead
+	// of erroring the already-done discard.
+	let discard_and_retire = |result: &mut Result<Value, CoderError>,
+	                          retire_outcome: Option<Result<Value, CoderError>>| {
+		let (Ok(value), Some(outcome)) = (result, retire_outcome) else {
+			return;
+		};
+		let Some(map) = value.as_object_mut() else {
+			return;
+		};
+		match outcome {
+			Ok(_) => {
+				map.insert("retired".into(), json!(true));
+			}
+			Err(err) => {
+				map.insert("retire_error".into(), json!(err.to_string()));
+			}
+		}
+	};
+	let single = ids.len() == 1;
+	let mut results: Vec<(String, Result<Value, CoderError>)> = Vec::new();
+	for worker_id in ids {
+		let mut result = discard_one_worker_worktree(state, sink, &worker_id, parsed.force).await;
+		let retire_outcome = if parsed.retire && result.is_ok() {
+			Some(retire_one_worker(state, sink, &worker_id).await)
+		} else {
+			None
+		};
+		discard_and_retire(&mut result, retire_outcome);
+		results.push((worker_id, result));
+	}
+	if single {
+		return results.remove(0).1;
+	}
+	Ok(fold_worker_results(results))
+}
+
+async fn discard_one_worker_worktree(
+	state: &Arc<CoderState>,
+	sink: &FolderEventSink,
+	worker_id: &str,
+	force: bool,
+) -> Result<Value, CoderError> {
+	ensure_worker_still_attached(state, "discard_worker_worktree", worker_id).await?;
+	let Some((rt, worker_folder)) = state.runtime_for_session(worker_id).await else {
 		return Err(CoderError::invalid_args(
 			"discard_worker_worktree",
-			format!("no mounted session for worker_id `{}`", parsed.worker_id),
+			format!("no mounted session for worker_id `{worker_id}`"),
 		));
 	};
 	// Never yank a checkout out from under a running turn — the
@@ -8103,10 +8201,7 @@ async fn handle_discard_worker_worktree(
 	if rt.turn.lock().await.cancel.is_some() {
 		return Err(CoderError::invalid_args(
 			"discard_worker_worktree",
-			format!(
-				"worker `{}` has a turn in flight — wait for it to finish or `abort_worker` first",
-				parsed.worker_id
-			),
+			format!("worker `{worker_id}` has a turn in flight — wait for it to finish or `abort_worker` first"),
 		));
 	}
 	let (worktree_root, worktree_branch) = {
@@ -8168,7 +8263,7 @@ async fn handle_discard_worker_worktree(
 				tracing::warn!(error = %err, worktree = %worktree_path, "git worktree prune failed for an already-removed checkout");
 			}
 		} else {
-			parent.host.git_worktree_remove(path, parsed.force).await?;
+			parent.host.git_worktree_remove(path, force).await?;
 		}
 	}
 	state.workspaces.remove_folder(&worktree_path).await?;
@@ -8203,33 +8298,42 @@ async fn handle_retire_worker(
 	sink: &FolderEventSink,
 	args: &Value,
 ) -> Result<Value, CoderError> {
-	#[derive(serde::Deserialize)]
-	struct RetireArgs {
-		worker_id: String,
+	let ids = parse_worker_ids("retire_worker", args)?;
+	let single = ids.len() == 1;
+	let mut results: Vec<(String, Result<Value, CoderError>)> = Vec::new();
+	for worker_id in ids {
+		let result = retire_one_worker(state, sink, &worker_id).await;
+		results.push((worker_id, result));
 	}
-	let parsed: RetireArgs =
-		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("retire_worker", err.to_string()))?;
+	if single {
+		return results.remove(0).1;
+	}
+	Ok(fold_worker_results(results))
+}
+
+async fn retire_one_worker(
+	state: &Arc<CoderState>,
+	sink: &FolderEventSink,
+	worker_id: &str,
+) -> Result<Value, CoderError> {
 	let orchestrator_id = sink.session_id().to_string();
 	let owning = state
 		.coordinator_workers
 		.read()
 		.await
-		.owning_orchestrator_of(&parsed.worker_id)
+		.owning_orchestrator_of(worker_id)
 		.map(str::to_string);
 	if owning.as_deref() != Some(orchestrator_id.as_str()) {
 		return Err(CoderError::invalid_args(
 			"retire_worker",
-			format!("`{}` is not a worker of this coordinator", parsed.worker_id),
+			format!("`{worker_id}` is not a worker of this coordinator"),
 		));
 	}
-	if let Some((rt, _)) = state.runtime_for_session(&parsed.worker_id).await {
+	if let Some((rt, _)) = state.runtime_for_session(worker_id).await {
 		if rt.turn.lock().await.cancel.is_some() {
 			return Err(CoderError::invalid_args(
 				"retire_worker",
-				format!(
-					"worker `{}` has a turn in flight — wait for it to finish or `abort_worker` first",
-					parsed.worker_id
-				),
+				format!("worker `{worker_id}` has a turn in flight — wait for it to finish or `abort_worker` first"),
 			));
 		}
 		let worktree_root = rt.session.lock().await.header.worktree_root.clone();
@@ -8238,8 +8342,7 @@ async fn handle_retire_worker(
 				return Err(CoderError::invalid_args(
 					"retire_worker",
 					format!(
-						"worker `{}` still has a bound worktree at `{root}` — land its work and `discard_worker_worktree` first",
-						parsed.worker_id
+						"worker `{worker_id}` still has a bound worktree at `{root}` — land its work and `discard_worker_worktree` first"
 					),
 				));
 			}
@@ -8249,13 +8352,13 @@ async fn handle_retire_worker(
 		.coordinator_workers
 		.write()
 		.await
-		.remove(&orchestrator_id, &parsed.worker_id);
+		.remove(&orchestrator_id, worker_id);
 	// Persist (ADR 0065): without this a restart-time fleet rebuild
 	// would re-register the retired worker.
-	persist_worker_detached(state, &orchestrator_id, &parsed.worker_id, Some(sink.folder.as_str())).await;
+	persist_worker_detached(state, &orchestrator_id, worker_id, Some(sink.folder.as_str())).await;
 	Ok(json!({
 		"status": "retired",
-		"worker_id": parsed.worker_id,
+		"worker_id": worker_id,
 		"note": "the worker left your fleet; its session, transcript, and branch are untouched",
 	}))
 }
@@ -10497,6 +10600,33 @@ pub(crate) fn new_message_id() -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn parse_worker_ids_accepts_single_multiple_and_both() {
+		let one = parse_worker_ids("t", &json!({ "worker_id": "w-1" })).unwrap();
+		assert_eq!(one, vec!["w-1"]);
+		let many = parse_worker_ids("t", &json!({ "worker_ids": ["w-1", "w-2", "w-1"] })).unwrap();
+		assert_eq!(many, vec!["w-1", "w-2"]);
+		// Both fields merge (worker_id first), deduplicated.
+		let both = parse_worker_ids("t", &json!({ "worker_id": "w-2", "worker_ids": ["w-1", "w-2"] })).unwrap();
+		assert_eq!(both, vec!["w-2", "w-1"]);
+		// Neither, or only empties, is a loud arg error.
+		assert!(parse_worker_ids("t", &json!({})).is_err());
+		assert!(parse_worker_ids("t", &json!({ "worker_ids": [] })).is_err());
+	}
+
+	#[test]
+	fn fold_worker_results_stamps_ids_and_keeps_errors() {
+		let folded = fold_worker_results(vec![
+			("w-1".into(), Ok(json!({ "status": "retired" }))),
+			("w-2".into(), Err(CoderError::invalid_args("t", "nope"))),
+		]);
+		let rows = folded["results"].as_array().unwrap();
+		assert_eq!(rows[0]["worker_id"], "w-1");
+		assert_eq!(rows[0]["status"], "retired");
+		assert_eq!(rows[1]["worker_id"], "w-2");
+		assert!(rows[1]["error"].as_str().unwrap().contains("nope"));
+	}
 
 	#[test]
 	fn fold_worker_fleet_tracks_spawns_and_detaches() {

@@ -1732,7 +1732,10 @@ discarded twice — is an `already_gone` no-op, never an error. Once a
 worker's work is landed and its worktree discarded, the coordinator
 drops it from its fleet with `retire_worker` (same ADR): the worker
 leaves `list_workers` and stops waking the coordinator, while its
-session, transcript, and branch stay untouched.
+session, transcript, and branch stay untouched. The usual pair
+collapses to one call: `discard_worker_worktree` takes
+`retire: true`, and both tools take `worker_ids` for batch cleanup
+(per-worker results; one failure doesn't stop the rest).
 
 Staleness is also **reconciled without a click**
 ([ADR 0063](decisions/0063-stale-worktree-reconciliation.md)): at the

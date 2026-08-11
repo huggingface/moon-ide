@@ -344,20 +344,28 @@ pub fn merge_worker_changes_tool_definition() -> ToolDefinition {
 pub fn discard_worker_worktree_tool_definition() -> ToolDefinition {
 	ToolDefinition::function(
 		"discard_worker_worktree",
-		"Remove a finished worker's git worktree and unbind its folder from the workspace, cleaning it out of the user's project bar. **The branch is kept** — it's the deliverable, still there to PR or merge. Use this once a worker's work is landed (merged, or committed and pushed for a PR) and the checkout is no longer needed. Refuses while the worker's turn is running (abort it first) and refuses a worktree with uncommitted changes unless `force` is set — commit or merge first rather than forcing, or you'll throw the worker's work away. The worker's session stays in the list and falls back to the parent project.",
+		"Remove a finished worker's git worktree and unbind its folder from the workspace, cleaning it out of the user's project bar. **The branch is kept** — it's the deliverable, still there to PR or merge. Use this once a worker's work is landed (merged, or committed and pushed for a PR) and the checkout is no longer needed. Refuses while the worker's turn is running (abort it first) and refuses a worktree with uncommitted changes unless `force` is set — commit or merge first rather than forcing, or you'll throw the worker's work away. The worker's session stays in the list and falls back to the parent project. Set `retire: true` to also retire the worker from your fleet in the same call (the usual cleanup pair); pass `worker_ids` to clean up several finished workers at once.",
 		json!({
 			"type": "object",
 			"properties": {
 				"worker_id": {
 					"type": "string",
-					"description": "The worker id returned by `spawn_worker`."
+					"description": "The worker id returned by `spawn_worker`. Provide this or `worker_ids`."
+				},
+				"worker_ids": {
+					"type": "array",
+					"items": { "type": "string" },
+					"description": "Several worker ids to discard in one call. Each reports its own result; one failure doesn't stop the rest."
 				},
 				"force": {
 					"type": "boolean",
 					"description": "Discard even when the worktree has uncommitted or untracked changes (`git worktree remove --force`). Those changes are lost. Default false — prefer `commit_worker_changes` first."
+				},
+				"retire": {
+					"type": "boolean",
+					"description": "Also retire the worker(s) from your fleet after a successful discard — same effect as a follow-up `retire_worker`, without the second call. Default false."
 				}
-			},
-			"required": ["worker_id"]
+			}
 		}),
 	)
 }
@@ -371,16 +379,20 @@ pub fn discard_worker_worktree_tool_definition() -> ToolDefinition {
 pub fn retire_worker_tool_definition() -> ToolDefinition {
 	ToolDefinition::function(
 		"retire_worker",
-		"Retire a finished worker from your fleet: it stops appearing in `list_workers` and stops waking you. Its session, transcript, and branch are untouched — this is bookkeeping, not deletion. Use it once a worker's work is fully landed (merged or PR'd) and its worktree is discarded, so `list_workers` stays a live picture of the fleet instead of accumulating done workers. Refuses a worker whose turn is running (abort it first) or whose worktree is still bound (`discard_worker_worktree` first). After retiring, the control tools no longer treat the session as your worker.",
+		"Retire a finished worker from your fleet: it stops appearing in `list_workers` and stops waking you. Its session, transcript, and branch are untouched — this is bookkeeping, not deletion. Use it once a worker's work is fully landed (merged or PR'd) and its worktree is discarded, so `list_workers` stays a live picture of the fleet instead of accumulating done workers. Refuses a worker whose turn is running (abort it first) or whose worktree is still bound (`discard_worker_worktree` first — or use its `retire: true` flag to do both in one call). Pass `worker_ids` to retire several at once. After retiring, the control tools no longer treat the session as your worker.",
 		json!({
 			"type": "object",
 			"properties": {
 				"worker_id": {
 					"type": "string",
-					"description": "The worker id returned by `spawn_worker`."
+					"description": "The worker id returned by `spawn_worker`. Provide this or `worker_ids`."
+				},
+				"worker_ids": {
+					"type": "array",
+					"items": { "type": "string" },
+					"description": "Several worker ids to retire in one call. Each reports its own result; one failure doesn't stop the rest."
 				}
-			},
-			"required": ["worker_id"]
+			}
 		}),
 	)
 }
