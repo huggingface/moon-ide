@@ -471,6 +471,12 @@ struct ChatCompletionRequest<'a> {
 	tools: &'a [ToolDefinition],
 	#[serde(skip_serializing_if = "Option::is_none")]
 	tool_choice: Option<&'static str>,
+	/// Caller-supplied output ceiling. Normally absent — providers
+	/// apply their own defaults — and only set by callers that must
+	/// prove `input + output ≤ window` up front (the in-session
+	/// compaction summary).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	max_tokens: Option<u32>,
 	/// `true` requests SSE deltas. The router enforces "completions
 	/// without tool calls return a single delta" so we get the same
 	/// shape either way; just buffered when streaming is off.
@@ -1194,6 +1200,7 @@ impl InferenceClient {
 			messages: build_wire_messages(messages, &cache_indexes),
 			tools,
 			tool_choice: if tools.is_empty() { None } else { Some("auto") },
+			max_tokens: None,
 			stream: false,
 			stream_options: None,
 		};
@@ -1251,11 +1258,19 @@ impl InferenceClient {
 	/// triggers one retry. SSE consumption itself is wrapped in
 	/// `tokio::select!` against `cancel` so an Esc-abort drops the
 	/// connection without waiting for the next chunk.
+	///
+	/// `max_tokens` optionally caps the reply length. `None` keeps
+	/// each provider path's default (Anthropic's per-model ceiling;
+	/// nothing sent on the OpenAI shape). Callers whose prompt sits
+	/// close to the context window pass `Some` so `input +
+	/// max_tokens` provably fits — Anthropic rejects the request
+	/// otherwise.
 	pub async fn chat_completion_stream<F>(
 		&self,
 		model: &str,
 		messages: &[ChatMessage],
 		tools: &[ToolDefinition],
+		max_tokens: Option<u32>,
 		cancel: &tokio_util::sync::CancellationToken,
 		mut on_event: F,
 	) -> Result<AssistantResponse, CoderError>
@@ -1264,8 +1279,10 @@ impl InferenceClient {
 	{
 		let route = self.resolve_route_or_abort(cancel).await?;
 		if route.kind == RouteKind::Anthropic {
-			return crate::anthropic::chat_completion_stream(&self.http, &route, model, messages, tools, cancel, on_event)
-				.await;
+			return crate::anthropic::chat_completion_stream(
+				&self.http, &route, model, messages, tools, max_tokens, cancel, on_event,
+			)
+			.await;
 		}
 		let mut route = route;
 		let endpoint = format!("{}/chat/completions", route.base_url);
@@ -1275,6 +1292,7 @@ impl InferenceClient {
 			messages: build_wire_messages(messages, &cache_indexes),
 			tools,
 			tool_choice: if tools.is_empty() { None } else { Some("auto") },
+			max_tokens,
 			stream: true,
 			// `include_usage: true` makes the provider emit a final
 			// SSE chunk with the round-trip's `prompt_tokens` /

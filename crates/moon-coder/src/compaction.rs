@@ -42,11 +42,29 @@
 //!   right before each LLM round-trip.
 //! - Threshold is hardcoded today ([`COMPACT_THRESHOLD`]); per
 //!   AGENTS.md "hardcode first, configure later".
+//!
+//! Two summarisation strategies (ADR 0067):
+//! - **In-session** (preferred): append one summarise instruction to
+//!   the live conversation and let the driver model write the summary
+//!   itself. The request is byte-identical to the session's previous
+//!   round-trip up to the appended message — same model, same system
+//!   prompt, same tools, same image elisions — so the provider's
+//!   prompt cache covers the whole prefix and the call costs seconds,
+//!   not minutes. The interaction is never persisted; only the
+//!   resulting `Compaction` record is.
+//! - **Chunked out-of-band** (fallback): render the prefix to text
+//!   and summarise it in window-sized chunks with a merge pass. Full
+//!   cache miss and sequential calls, but it's the only path that
+//!   works when the prompt already exceeds the window (e.g. a huge
+//!   session reopened after the trigger was disarmed) or when the
+//!   in-session call fails.
+
+use std::collections::HashSet;
 
 use tokio_util::sync::CancellationToken;
 
 use crate::event::CoderEvent;
-use crate::inference::{ChatMessage, InferenceClient, StreamEvent, TokenUsage};
+use crate::inference::{ChatMessage, InferenceClient, StreamEvent, TokenUsage, ToolDefinition};
 use crate::models::CoderModels;
 use crate::runner::{estimate_prompt_tokens, FolderEventSink};
 
@@ -91,6 +109,27 @@ user; write in third-person past tense (\"the user asked\", \"the assistant edit
 that aren't in the prefix. Do not include the entire transcript verbatim. Aim for somewhere between 4,000 and \
 16,000 tokens of output — long enough to be useful, short enough not to dominate the next round-trip's window.";
 
+/// The summarise instruction appended to the live conversation for
+/// the in-session path. Mirrors [`SUMMARY_SYSTEM_PROMPT`] but is
+/// addressed to the driver model mid-session, so it also has to
+/// forbid tool calls (the request carries the session's normal tool
+/// definitions — dropping them would invalidate the provider's
+/// prompt cache for the whole prefix, which is the point of this
+/// path; so would flipping `tool_choice`, which Anthropic documents
+/// as invalidating the messages cache).
+const IN_SESSION_SUMMARY_PROMPT: &str = "\
+[Internal compaction request from the IDE — not written by the user.] This session is close to the model's context \
+window, so everything before the most recent turns is about to be replaced by a summary; write that summary now. \
+Produce a single dense markdown summary covering, in this order: (1) the user's overall intent and any explicit goals \
+stated, (2) major decisions made and their rationale, (3) every file or symbol touched and what changed, (4) tools \
+that were used and what they returned (collapse repeated reads/greps into a single line), (5) the current state of \
+the work — what is in progress, what was just attempted, and any errors or warnings still outstanding, (6) anything \
+that must be remembered to do next and constraints already accepted. Write in third-person past tense (\"the user \
+asked\", \"the assistant edited\"). Do not address the user. Do not invent details that aren't in the conversation. \
+Do not call any tools — reply with the summary as plain text only. The most recent turns will be kept verbatim \
+alongside the summary, so prioritise the earlier parts of the conversation. Aim for somewhere between 4,000 and \
+16,000 tokens of output.";
+
 /// Outcome of one [`compact_if_needed`] call. The summary +
 /// `messages_compacted` are what the caller persists into the
 /// session JSONL as a [`crate::sessions::SessionRecord::Compaction`]
@@ -111,9 +150,18 @@ pub(crate) struct CompactionApplied {
 
 /// Inspect the last reported token usage; if the next prompt is
 /// likely to cross [`COMPACT_THRESHOLD`] of the context window,
-/// run a standard-model summary call and replace the older prefix
-/// of `messages` with a synthetic [`ChatMessage::System`] holding
-/// that summary.
+/// obtain a summary of the older history and replace the older
+/// prefix of `messages` with a synthetic [`ChatMessage::System`]
+/// holding it. The summary comes from the in-session path when the
+/// prompt still fits the window (cache-hot, single call), falling
+/// back to the chunked out-of-band path otherwise — see the module
+/// docs.
+///
+/// `tools` and `elided_images` must be the exact tool definitions
+/// and image-elision set the session's round-trips use: the
+/// in-session call replays them verbatim so its request shares a
+/// byte-identical prefix with the previous round-trip and hits the
+/// provider's prompt cache.
 ///
 /// Returns `Some` when compaction actually ran (and `messages`
 /// was mutated) — the caller is responsible for persisting the
@@ -127,13 +175,16 @@ pub(crate) struct CompactionApplied {
 /// callers. When `Some(id)`, every emitted [`CoderEvent`] is
 /// wrapped in [`CoderEvent::SubagentEvent`] so the frontend
 /// routes the compaction row to the matching sub-agent card.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn compact_if_needed(
 	inference: &InferenceClient,
 	sink: &FolderEventSink,
 	subagent_id_for_wrap: Option<&str>,
 	models: &CoderModels,
+	tools: &[ToolDefinition],
 	last_usage: Option<&TokenUsage>,
 	messages: &mut Vec<ChatMessage>,
+	elided_images: &HashSet<u64>,
 	cancel: &CancellationToken,
 ) -> Option<CompactionApplied> {
 	let usage = last_usage?;
@@ -212,7 +263,38 @@ pub(crate) async fn compact_if_needed(
 		);
 	};
 
-	let summary = match summarise_prefix(inference, models, older, &progress, cancel).await {
+	// In-session first: the driver model summarises its own live
+	// conversation, riding the provider's prompt cache. Only
+	// possible while the prompt still fits the window with room
+	// for the summary output; a prompt already past the window
+	// (reopened giant session, one enormous tool result) goes
+	// straight to the chunked fallback.
+	let in_session = match in_session_summary_max_tokens(usage.prompt_tokens, context) {
+		Some(max_out) => {
+			progress(0, 1, 0);
+			let on_tokens = |tokens: u32| progress(0, 1, tokens);
+			summarise_in_session(
+				inference,
+				models,
+				messages,
+				tools,
+				elided_images,
+				max_out,
+				&on_tokens,
+				cancel,
+			)
+			.await
+		}
+		None => None,
+	};
+	let summary = match in_session {
+		Some(s) if !s.trim().is_empty() => Some(s),
+		// An abort mid-summary surfaces as a failed call; don't
+		// burn the chunked path's round-trips on a dead turn.
+		_ if cancel.is_cancelled() => None,
+		_ => summarise_prefix(inference, models, older, &progress, cancel).await,
+	};
+	let summary = match summary {
 		Some(s) if !s.trim().is_empty() => s,
 		_ => {
 			// Either every summary call failed, or the model came
@@ -286,6 +368,105 @@ pub(crate) fn apply_summary_to_messages(messages: &mut Vec<ChatMessage>, cutoff:
 /// model's window with margin to spare.
 fn estimate_tokens(s: &str) -> usize {
 	s.len() / 4
+}
+
+/// Estimated tokens the appended [`IN_SESSION_SUMMARY_PROMPT`] adds
+/// to the in-session call, plus slop for the anchored prompt
+/// estimate undershooting the provider's real tokenizer count.
+const IN_SESSION_PROMPT_SLOP_TOKENS: u32 = 2_000;
+
+/// Smallest output budget worth attempting the in-session path
+/// with. Below this the summary of a near-window-sized session
+/// would be too cramped to be useful (and on thinking models the
+/// reasoning eats into the same budget); take the chunked path
+/// and its bigger allowance instead.
+const IN_SESSION_MIN_SUMMARY_TOKENS: u32 = 8_000;
+
+/// Output ceiling for the in-session summary call. Matches the
+/// large-model per-turn ceiling in the Anthropic client; the
+/// summary targets 4–16k tokens and adaptive-thinking models burn
+/// part of the budget reasoning.
+const IN_SESSION_MAX_SUMMARY_TOKENS: u32 = 32_000;
+
+/// Output-token budget for the in-session summary call, or `None`
+/// when the current prompt leaves too little window headroom for
+/// it — the request must fit `prompt + instruction + output`
+/// inside the context window or the provider rejects it outright
+/// (Anthropic validates `input + max_tokens ≤ window`).
+fn in_session_summary_max_tokens(prompt_tokens: u32, context_window: u32) -> Option<u32> {
+	let usable = context_window
+		.saturating_sub(prompt_tokens)
+		.saturating_sub(IN_SESSION_PROMPT_SLOP_TOKENS);
+	if usable < IN_SESSION_MIN_SUMMARY_TOKENS {
+		return None;
+	}
+	Some(usable.min(IN_SESSION_MAX_SUMMARY_TOKENS))
+}
+
+/// One in-session summary call: the session's own messages, tools,
+/// and image elisions, plus one appended user instruction — a
+/// request whose prefix is byte-identical to the session's previous
+/// round-trip, so the provider's prompt cache absorbs it. The
+/// response is taken as the summary; the interaction itself is
+/// never persisted or echoed back into the history.
+///
+/// Returns `None` on transport error, an empty reply, or a reply
+/// that ignored the instruction and called a tool — the caller
+/// falls back to the chunked out-of-band path.
+#[allow(clippy::too_many_arguments)]
+async fn summarise_in_session(
+	inference: &InferenceClient,
+	models: &CoderModels,
+	messages: &[ChatMessage],
+	tools: &[ToolDefinition],
+	elided_images: &HashSet<u64>,
+	max_summary_tokens: u32,
+	on_tokens: &(dyn Fn(u32) + Send + Sync),
+	cancel: &CancellationToken,
+) -> Option<String> {
+	let mut call = messages.to_vec();
+	// Replay the session's image elisions so the wire prefix
+	// matches the previous round-trip's byte-for-byte — images are
+	// part of the provider's cache key, and un-elided copies could
+	// also blow the payload budget the elision exists to respect.
+	crate::images::apply_elision(&mut call, elided_images);
+	call.push(ChatMessage::user(IN_SESSION_SUMMARY_PROMPT));
+
+	let mut bytes = 0usize;
+	let mut last_reported = 0u32;
+	let result = inference
+		.chat_completion_stream(
+			models.standard(),
+			&call,
+			tools,
+			Some(max_summary_tokens),
+			cancel,
+			|ev| {
+				if let StreamEvent::ContentDelta { delta } = ev {
+					bytes += delta.len();
+					let tokens = (bytes / 4) as u32;
+					if tokens >= last_reported + TOKEN_REPORT_STEP {
+						last_reported = tokens;
+						on_tokens(tokens);
+					}
+				}
+			},
+		)
+		.await;
+	let response = match result {
+		Ok(r) => r,
+		Err(err) => {
+			tracing::warn!(error = %err, "in-session compaction summary failed; falling back to chunked summarisation");
+			return None;
+		}
+	};
+	if !response.tool_calls.is_empty() {
+		tracing::warn!(
+			"in-session compaction summary ignored the no-tools instruction; falling back to chunked summarisation"
+		);
+		return None;
+	}
+	response.content
 }
 
 /// Fraction of the standard model's context window a single summary
@@ -482,7 +663,7 @@ async fn summarise_once(
 	let mut bytes = 0usize;
 	let mut last_reported = 0u32;
 	let result = inference
-		.chat_completion_stream(models.standard(), &call, &[], cancel, |ev| {
+		.chat_completion_stream(models.standard(), &call, &[], None, cancel, |ev| {
 			if let StreamEvent::ContentDelta { delta } = ev {
 				bytes += delta.len();
 				let tokens = (bytes / 4) as u32;
@@ -703,6 +884,21 @@ mod tests {
 			assert!(s.is_char_boundary(b), "byte {b} is not a char boundary");
 			assert!(b <= max);
 		}
+	}
+
+	#[test]
+	fn in_session_budget_covers_the_normal_trigger_band() {
+		// 200k window, trigger at 160k: the in-session path must be
+		// eligible at the typical fire point, capped at the output
+		// ceiling.
+		assert_eq!(in_session_summary_max_tokens(161_000, 200_000), Some(32_000));
+		// Deep past the trigger the budget shrinks with the
+		// remaining headroom…
+		assert_eq!(in_session_summary_max_tokens(185_000, 200_000), Some(13_000));
+		// …until there isn't room for a useful summary.
+		assert_eq!(in_session_summary_max_tokens(191_000, 200_000), None);
+		// A prompt already past the window can never take this path.
+		assert_eq!(in_session_summary_max_tokens(210_000, 200_000), None);
 	}
 
 	#[test]

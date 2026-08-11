@@ -576,12 +576,20 @@ pub(crate) async fn chat_completion(
 /// [`InferenceClient::chat_completion_stream`]: `on_event` fires
 /// for every parsed delta as bytes arrive, and the assembled
 /// [`AssistantResponse`] returns once the stream ends.
+///
+/// `max_tokens` overrides the per-model default ceiling, clamped
+/// to it — Anthropic 400s on requests above a model's hard output
+/// cap, and separately on `input + max_tokens` exceeding the
+/// context window, which is exactly what near-window callers (the
+/// in-session compaction summary) use the override to avoid.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn chat_completion_stream<F>(
 	http: &reqwest::Client,
 	route: &ResolvedRoute,
 	model: &str,
 	messages: &[ChatMessage],
 	tools: &[ToolDefinition],
+	max_tokens: Option<u32>,
 	cancel: &tokio_util::sync::CancellationToken,
 	mut on_event: F,
 ) -> Result<AssistantResponse, CoderError>
@@ -600,7 +608,7 @@ where
 		.collect();
 	let body = Request {
 		model,
-		max_tokens: max_tokens_for(model),
+		max_tokens: max_tokens.map_or_else(|| max_tokens_for(model), |m| m.min(max_tokens_for(model))),
 		system: translated.system,
 		messages: translated.messages,
 		tools: tool_views,

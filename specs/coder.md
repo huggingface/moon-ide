@@ -1304,17 +1304,27 @@ sending:
 
 1. Keep the most recent 6 user turns (`RECENT_USER_TURNS_KEPT`); the
    oldest of those is the cut point.
-2. Summarise the prefix with the **standard model** (intent,
-   decisions, files touched, state, next steps). The prefix is
-   **chunked** so no single summary call exceeds the standard
-   model's own window — chunked summaries are merged with a final
-   pass, recursing if needed. Per-chunk failures are tolerated; the
-   pass only gives up if every call fails. (The standard model is
-   used, not the cheap model, because the cheap model's actual
-   per-route context window can be smaller than the standard
-   model's — the catalog's max-across-providers lookup overestimates
-   the cheap model's limit, which 400'd the summary call every
-   turn and made compaction a silent no-op.)
+2. Obtain the summary (intent, decisions, files touched, state,
+   next steps) — **in-session first** (ADR 0067): one summarise
+   instruction is appended to the live conversation and the driver
+   model answers it, with the request byte-identical to the
+   previous round-trip up to that instruction (same model, system
+   prompt, tools, image elisions) so the provider's prompt cache
+   covers the whole prefix. The interaction is never persisted.
+   Taken only while `prompt + instruction + summary output`
+   provably fits the window (the call passes an explicit
+   `max_tokens` sized to the remaining headroom). Otherwise — or
+   when the in-session call errors, replies empty, or calls a tool
+   despite the instruction — fall back to the **chunked
+   out-of-band** pass: render the prefix to text and summarise it
+   with the standard model in window-sized chunks, merging with a
+   final pass, recursing if needed. Per-chunk failures are
+   tolerated; the pass only gives up if every call fails. (The
+   standard model is used, not the cheap model, because the cheap
+   model's actual per-route context window can be smaller than the
+   standard model's — the catalog's max-across-providers lookup
+   overestimates the cheap model's limit, which 400'd the summary
+   call every turn and made compaction a silent no-op.)
 3. Replace the prefix with one synthetic system message carrying the
    summary at `messages[1]` (the composed system prompt at
    `messages[0]` is recomposed fresh every turn anyway).

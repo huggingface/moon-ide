@@ -5660,15 +5660,20 @@ async fn run_turn(
 		// otherwise replay re-inflates the full pre-compaction
 		// transcript and the next turn instantly trips the
 		// provider's context-length cap.
-		let last_usage = rt.session.lock().await.last_usage;
+		let (last_usage, elided_images) = {
+			let session = rt.session.lock().await;
+			(session.last_usage, session.elided_images.clone())
+		};
 		let mut messages = rt.session.lock().await.messages.clone();
 		let compaction = crate::compaction::compact_if_needed(
 			&state.inference,
 			sink,
 			None,
 			&models,
+			&tool_defs,
 			last_usage.as_ref(),
 			&mut messages,
+			&elided_images,
 			&cancel,
 		)
 		.await;
@@ -5810,56 +5815,63 @@ async fn run_turn(
 
 		let mut response = state
 			.inference
-			.chat_completion_stream(&standard_model, &messages, &tool_defs, &cancel, |event| match event {
-				StreamEvent::ContentDelta { delta } => {
-					if !content_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
-						sink_for_cb.send(CoderEvent::AssistantMessageStart { id: id_for_cb.clone() });
+			.chat_completion_stream(
+				&standard_model,
+				&messages,
+				&tool_defs,
+				None,
+				&cancel,
+				|event| match event {
+					StreamEvent::ContentDelta { delta } => {
+						if !content_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+							sink_for_cb.send(CoderEvent::AssistantMessageStart { id: id_for_cb.clone() });
+						}
+						sink_for_cb.send(CoderEvent::AssistantMessageDelta {
+							id: id_for_cb.clone(),
+							delta: delta.to_string(),
+						});
+						maybe_emit_stream_usage(
+							&sink_for_cb,
+							&stream_usage_state,
+							STREAM_USAGE_THROTTLE,
+							delta.len(),
+							prompt_estimate,
+							context_window,
+						);
 					}
-					sink_for_cb.send(CoderEvent::AssistantMessageDelta {
-						id: id_for_cb.clone(),
-						delta: delta.to_string(),
-					});
-					maybe_emit_stream_usage(
-						&sink_for_cb,
-						&stream_usage_state,
-						STREAM_USAGE_THROTTLE,
-						delta.len(),
-						prompt_estimate,
-						context_window,
-					);
-				}
-				StreamEvent::ThinkingDelta { delta } => {
-					// Thinking arrives before content on every
-					// reasoning-model provider we know of. Fire
-					// `AssistantMessageStart` on the first thinking
-					// delta too — that way the panel inserts the
-					// row early, the user sees the thinking block
-					// land, and content streams into the same row
-					// when it eventually arrives.
-					if !content_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
-						sink_for_cb.send(CoderEvent::AssistantMessageStart { id: id_for_cb.clone() });
+					StreamEvent::ThinkingDelta { delta } => {
+						// Thinking arrives before content on every
+						// reasoning-model provider we know of. Fire
+						// `AssistantMessageStart` on the first thinking
+						// delta too — that way the panel inserts the
+						// row early, the user sees the thinking block
+						// land, and content streams into the same row
+						// when it eventually arrives.
+						if !content_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+							sink_for_cb.send(CoderEvent::AssistantMessageStart { id: id_for_cb.clone() });
+						}
+						thinking_emitted.store(true, std::sync::atomic::Ordering::Relaxed);
+						sink_for_cb.send(CoderEvent::AssistantThinkingDelta {
+							id: id_for_cb.clone(),
+							delta: delta.to_string(),
+						});
+						maybe_emit_stream_usage(
+							&sink_for_cb,
+							&stream_usage_state,
+							STREAM_USAGE_THROTTLE,
+							delta.len(),
+							prompt_estimate,
+							context_window,
+						);
 					}
-					thinking_emitted.store(true, std::sync::atomic::Ordering::Relaxed);
-					sink_for_cb.send(CoderEvent::AssistantThinkingDelta {
-						id: id_for_cb.clone(),
-						delta: delta.to_string(),
-					});
-					maybe_emit_stream_usage(
-						&sink_for_cb,
-						&stream_usage_state,
-						STREAM_USAGE_THROTTLE,
-						delta.len(),
-						prompt_estimate,
-						context_window,
-					);
-				}
-				// Tool-call deltas are intentionally not surfaced.
-				// The runner buffers them inside the inference
-				// client and dispatches once the whole call is
-				// assembled — partial JSON arguments aren't
-				// useful to render.
-				StreamEvent::ToolCallDelta { .. } => {}
-			})
+					// Tool-call deltas are intentionally not surfaced.
+					// The runner buffers them inside the inference
+					// client and dispatches once the whole call is
+					// assembled — partial JSON arguments aren't
+					// useful to render.
+					StreamEvent::ToolCallDelta { .. } => {}
+				},
+			)
 			.await?;
 
 		// Uniquify before anything observes the response — events,
@@ -6114,7 +6126,7 @@ done, what's still unfinished, and any uncertainty. If the user needs to take a 
 	let thinking_emitted = std::sync::atomic::AtomicBool::new(false);
 	let mut response = state
 		.inference
-		.chat_completion_stream(&standard_model, &messages, &[], cancel, |event| match event {
+		.chat_completion_stream(&standard_model, &messages, &[], None, cancel, |event| match event {
 			StreamEvent::ContentDelta { delta } => {
 				if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
 					sink_for_cb.send(CoderEvent::AssistantMessageStart { id: id_for_cb.clone() });

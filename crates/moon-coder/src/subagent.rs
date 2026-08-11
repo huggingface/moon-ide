@@ -896,13 +896,18 @@ async fn run_subagent_loop(
 		// JSONL alongside the parent path, so a future "reopen
 		// sub-agent transcript" feature replays into the same
 		// compacted shape instead of re-inflating the prefix.
+		// Sub-agents don't run the image-elision budget, so an empty
+		// set reproduces their previous round-trips' wire shape.
+		let no_elisions = std::collections::HashSet::new();
 		let compaction_outcome = compaction::compact_if_needed(
 			inference,
 			sink,
 			Some(&id),
 			&models,
+			&tool_defs,
 			last_usage.as_ref(),
 			&mut messages,
+			&no_elisions,
 			&cancel,
 		)
 		.await;
@@ -937,39 +942,46 @@ async fn run_subagent_loop(
 		let sink_for_cb = sink.clone();
 		let started = std::sync::atomic::AtomicBool::new(false);
 		let mut response = inference
-			.chat_completion_stream(&standard_model, &messages, &tool_defs, &cancel, |event| match event {
-				StreamEvent::ContentDelta { delta } => {
-					if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+			.chat_completion_stream(
+				&standard_model,
+				&messages,
+				&tool_defs,
+				None,
+				&cancel,
+				|event| match event {
+					StreamEvent::ContentDelta { delta } => {
+						if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+							sink_for_cb.send(wrap_inner(
+								&id_for_subagent,
+								CoderEvent::AssistantMessageStart { id: id_for_cb.clone() },
+							));
+						}
 						sink_for_cb.send(wrap_inner(
 							&id_for_subagent,
-							CoderEvent::AssistantMessageStart { id: id_for_cb.clone() },
+							CoderEvent::AssistantMessageDelta {
+								id: id_for_cb.clone(),
+								delta: delta.to_string(),
+							},
 						));
 					}
-					sink_for_cb.send(wrap_inner(
-						&id_for_subagent,
-						CoderEvent::AssistantMessageDelta {
-							id: id_for_cb.clone(),
-							delta: delta.to_string(),
-						},
-					));
-				}
-				StreamEvent::ThinkingDelta { delta } => {
-					if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+					StreamEvent::ThinkingDelta { delta } => {
+						if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+							sink_for_cb.send(wrap_inner(
+								&id_for_subagent,
+								CoderEvent::AssistantMessageStart { id: id_for_cb.clone() },
+							));
+						}
 						sink_for_cb.send(wrap_inner(
 							&id_for_subagent,
-							CoderEvent::AssistantMessageStart { id: id_for_cb.clone() },
+							CoderEvent::AssistantThinkingDelta {
+								id: id_for_cb.clone(),
+								delta: delta.to_string(),
+							},
 						));
 					}
-					sink_for_cb.send(wrap_inner(
-						&id_for_subagent,
-						CoderEvent::AssistantThinkingDelta {
-							id: id_for_cb.clone(),
-							delta: delta.to_string(),
-						},
-					));
-				}
-				StreamEvent::ToolCallDelta { .. } => {}
-			})
+					StreamEvent::ToolCallDelta { .. } => {}
+				},
+			)
 			.await?;
 		// Same recycled-id guard as the parent loop — must run
 		// before the response is pushed / persisted / dispatched.
@@ -1287,7 +1299,7 @@ Do not call any more tools. Write a final response now using only what you've al
 	let sink_for_cb = sink.clone();
 	let started = std::sync::atomic::AtomicBool::new(false);
 	let response = inference
-		.chat_completion_stream(standard_model, messages, &[], cancel, |event| match event {
+		.chat_completion_stream(standard_model, messages, &[], None, cancel, |event| match event {
 			StreamEvent::ContentDelta { delta } => {
 				if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
 					sink_for_cb.send(wrap_inner(
