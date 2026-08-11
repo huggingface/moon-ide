@@ -1839,7 +1839,7 @@ Tauri commands in `src-tauri/src/commands/coder.rs`:
 | `coder_open_session(id?)`                               | Load `id`, or create a new session; returns the active id                                                     |
 | `coder_delete_session(id)`                              | Removes JSONL (+ sub-agent subdir)                                                                            |
 | `coder_session_jsonl_path(id)`                          | Resolves a session id (parent or sub-agent) to its on-disk path; powers "open trace"                          |
-| `coder_send(text, mode)`                                | Routes to the loop (`send` / `steer` / `follow_up`)                                                           |
+| `coder_send(text, images, session_id?)`                 | Send / steer, targeted at the composer's session id (ADR 0066); `null` falls back to the visible session      |
 | `coder_abort()`                                         | Cancels the visible session's in-flight turn                                                                  |
 | `coder_continue_subagent(subagent_id, text)`            | Steers a running sub-agent, or resumes a finished one with a follow-up; `false` when nothing to continue      |
 | `coder_abort_subagent(subagent_id)`                     | Cancels one sub-agent's own token; parent turn and siblings unaffected                                        |

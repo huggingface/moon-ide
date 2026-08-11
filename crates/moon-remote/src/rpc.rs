@@ -204,11 +204,13 @@ impl BridgeRpcHandler for BridgeRpc {
 				// the coordinator hears about it (ADR 0043) exactly as
 				// it would for a desktop message.
 				match p.session_id {
-					Some(sid) => self
-						.coder
-						.send_to_as_user(&sid, p.text, Vec::new())
-						.await
-						.map_err(|e| e.to_string())?,
+					Some(sid) => {
+						self
+							.coder
+							.send_to_as_user(&sid, p.text, Vec::new())
+							.await
+							.map_err(|e| e.to_string())?;
+					}
 					None => {
 						self.coder.send(p.text, Vec::new()).await.map_err(|e| e.to_string())?;
 					}

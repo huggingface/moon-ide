@@ -386,7 +386,8 @@ export const ipc = {
 		startDeviceFlow: () => invoke<DeviceCode>('coder_start_device_flow'),
 		pollDeviceCode: (code: DeviceCode) => invoke<HfIdentity>('coder_poll_device_code', { code }),
 		signOut: () => invoke<void>('coder_sign_out'),
-		send: (text: string, images: ImageAttachmentPayload[] = []) => invoke<void>('coder_send', { text, images }),
+		send: (text: string, images: ImageAttachmentPayload[] = [], sessionId: string | null = null) =>
+			invoke<void>('coder_send', { text, images, sessionId }),
 		suggestBranchName: (message: string) => invoke<string>('coder_suggest_branch_name', { message }),
 		suggestCommitMessage: (message: string) => invoke<string>('coder_suggest_commit_message', { message }),
 		suggestTerminalCommand: (request: string, targetKind: string, cwd: string) =>

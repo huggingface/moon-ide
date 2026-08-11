@@ -4254,19 +4254,21 @@ impl CoderHandle {
 	// has foregrounded. The visible-session methods above stay
 	// unchanged for the UI path.
 
-	/// [`Self::send_to`] for a message the **user** typed (the phone's
-	/// composer, which targets a session by id rather than "the
-	/// visible one"). Identical except that it also tells the
-	/// coordinator when the target is one of its workers (ADR 0043) —
-	/// the desktop's `send` does the same. Coordinator-originated
-	/// traffic uses plain `send_to`, which stays silent: a coordinator
-	/// doesn't need to be told what it just said.
+	/// [`Self::send_to`] for a message the **user** typed (the desktop
+	/// composer and the phone's, both of which target a session by id
+	/// rather than "the visible one" — ADR 0066). Identical except
+	/// that it also tells the coordinator when the target is one of
+	/// its workers (ADR 0043). Coordinator-originated traffic uses
+	/// plain `send_to`, which stays silent: a coordinator doesn't
+	/// need to be told what it just said. Returns the resolved
+	/// [`SendTarget`] so the desktop command can persist the
+	/// last-opened-session pointer, same as [`Self::send`].
 	pub async fn send_to_as_user(
 		&self,
 		session_id: &str,
 		text: String,
 		images: Vec<ImageAttachment>,
-	) -> Result<(), CoderError> {
+	) -> Result<SendTarget, CoderError> {
 		// Same delivery-tracking probe as `send` — a mid-turn nudge
 		// is only queued worker-side, and the notice says so.
 		let queued = match self.state.runtime_for_session(session_id).await {
@@ -4274,7 +4276,7 @@ impl CoderHandle {
 			None => false,
 		};
 		self.notify_coordinator_of_user_message(session_id, &text, queued).await;
-		self.send_to(session_id, text, images).await
+		self.send_to_inner(session_id, text, images, false).await
 	}
 
 	/// Tell the coordinator that the user just messaged one of its
@@ -4379,7 +4381,7 @@ impl CoderHandle {
 	/// message is queued as a steer (same as a user steering a
 	/// visible session).
 	pub async fn send_to(&self, session_id: &str, text: String, images: Vec<ImageAttachment>) -> Result<(), CoderError> {
-		self.send_to_inner(session_id, text, images, false).await
+		self.send_to_inner(session_id, text, images, false).await.map(|_| ())
 	}
 
 	/// [`Self::send_to`] for coordinator → worker traffic
@@ -4398,7 +4400,7 @@ impl CoderHandle {
 		text: String,
 		images: Vec<ImageAttachment>,
 	) -> Result<(), CoderError> {
-		self.send_to_inner(session_id, text, images, true).await
+		self.send_to_inner(session_id, text, images, true).await.map(|_| ())
 	}
 
 	async fn send_to_inner(
@@ -4407,7 +4409,7 @@ impl CoderHandle {
 		text: String,
 		images: Vec<ImageAttachment>,
 		from_coordinator: bool,
-	) -> Result<(), CoderError> {
+	) -> Result<SendTarget, CoderError> {
 		let images = crate::images::reencode_all(images).await;
 		self.ensure_can_send().await?;
 		let Some((rt, folder_path)) = self.state.runtime_for_session(session_id).await else {
@@ -4416,6 +4418,14 @@ impl CoderHandle {
 			)));
 		};
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
+		// Snapshot the resolved target (mirrors `send`) so callers
+		// can persist the last-opened-session pointer against the
+		// folder that actually received the message.
+		let target = SendTarget {
+			coder_root: folder_path.to_string(),
+			worktree_root: rt.session.lock().await.header.worktree_root.clone(),
+			session_id: session_id.to_string(),
+		};
 		// Steer-vs-spawn branch mirrors `send`. A worker whose turn
 		// is in flight gets the message queued as a steer.
 		{
@@ -4450,7 +4460,7 @@ impl CoderHandle {
 					created_at_ms: Some(queued_at_ms),
 					from_coordinator,
 				});
-				return Ok(());
+				return Ok(target);
 			}
 		}
 		let cancel = CancellationToken::new();
@@ -4558,7 +4568,7 @@ impl CoderHandle {
 			auto_rename_after,
 			None,
 		);
-		Ok(())
+		Ok(target)
 	}
 
 	/// Abort a specific session's in-flight turn by id (ADR 0030).

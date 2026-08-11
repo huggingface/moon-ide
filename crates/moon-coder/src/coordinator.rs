@@ -553,20 +553,23 @@ mod tests {
 	}
 
 	#[test]
-	fn discard_worker_worktree_requires_a_worker_and_defaults_to_no_force() {
+	fn discard_worker_worktree_takes_single_or_batch_ids_and_defaults_to_no_force() {
 		let params = discard_worker_worktree_tool_definition().function.parameters;
+		// `worker_id` or `worker_ids` — either is acceptable, so
+		// neither is schema-required (the handler validates).
 		assert!(params["properties"]["worker_id"].is_object());
+		assert!(params["properties"]["worker_ids"].is_object());
+		assert!(params["required"].is_null());
 		assert_eq!(params["properties"]["force"]["type"], "boolean");
-		let required: Vec<String> = serde_json::from_value(params["required"].clone()).unwrap();
-		assert_eq!(required, vec!["worker_id".to_string()]);
+		assert_eq!(params["properties"]["retire"]["type"], "boolean");
 	}
 
 	#[test]
-	fn retire_worker_requires_a_worker() {
+	fn retire_worker_takes_single_or_batch_ids() {
 		let params = retire_worker_tool_definition().function.parameters;
 		assert!(params["properties"]["worker_id"].is_object());
-		let required: Vec<String> = serde_json::from_value(params["required"].clone()).unwrap();
-		assert_eq!(required, vec!["worker_id".to_string()]);
+		assert!(params["properties"]["worker_ids"].is_object());
+		assert!(params["required"].is_null());
 	}
 
 	#[test]

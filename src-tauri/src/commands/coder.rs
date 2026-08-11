@@ -131,13 +131,27 @@ pub async fn coder_sign_out(state: State<'_, AppState>) -> Result<(), MoonError>
 /// `persist_last_session` is a cheap no-op when the pointer
 /// already matches, so we don't bother gating it on "is the
 /// pointer stale".
+///
+/// `session_id` is the session the panel's composer is bound to
+/// (ADR 0066). Routing by id — instead of "the backend's visible
+/// session" — closes the window where a send races an in-flight
+/// `coder_open_session` (the backend pointer still names the
+/// previous session while the panel already shows the new one) and
+/// the persistent desync a *failed* open leaves behind. `None` (no
+/// visible session yet — fresh folder) falls back to the visible-
+/// session resolution, which mints a blank session on first use.
 #[tauri::command]
 pub async fn coder_send(
 	state: State<'_, AppState>,
 	text: String,
 	images: Vec<ImageAttachment>,
+	session_id: Option<String>,
 ) -> Result<(), MoonError> {
-	let target = state.coder.send(text, images).await.map_err(MoonError::from)?;
+	let target = match session_id {
+		Some(id) => state.coder.send_to_as_user(&id, text, images).await,
+		None => state.coder.send(text, images).await,
+	}
+	.map_err(MoonError::from)?;
 	persist_last_session(&state.config_dir, target.pointer_key(), Some(target.session_id.clone())).await;
 	Ok(())
 }

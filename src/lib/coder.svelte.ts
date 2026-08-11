@@ -2662,6 +2662,15 @@ export class CoderPanelState {
 			data_url: img.dataUrl,
 			mime: img.mime,
 		}));
+		// Target the session this composer is bound to *right now*
+		// (ADR 0066). Routing by id backend-side means the message
+		// can't land in whichever session the backend's visible
+		// pointer still names — e.g. while an `openSession` replay
+		// is in flight, or after one failed. `null` (no visible
+		// session yet) falls back to the backend's visible-session
+		// resolution, which mints a blank session on first use.
+		const folderKey = this.activeFolderPath ?? NO_FOLDER_KEY;
+		const sessionId = this.current.visibleSessionId;
 		this.draft = '';
 		this.clearAttachments();
 		// Optimistic flip — the `user_message` event lands within
@@ -2670,11 +2679,14 @@ export class CoderPanelState {
 		// a steer (already busy) it's a no-op.
 		this.busy = true;
 		try {
-			await ipc.coder.send(payload, images);
+			await ipc.coder.send(payload, images, sessionId);
 		} catch (err) {
-			this.busy = false;
-			this.rows = [
-				...this.rows,
+			// Land the error in the bucket the send targeted, not
+			// whichever session is visible once the IPC settles.
+			const bucket = sessionId === null ? this.currentSession : this.sessionStateFor(folderKey, sessionId);
+			bucket.busy = false;
+			bucket.rows = [
+				...bucket.rows,
 				{
 					kind: 'error',
 					id: `local-${Date.now()}`,
