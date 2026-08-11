@@ -157,6 +157,13 @@ Notes:
 - For boot persistence, run `serve` from a `systemd --user` template unit (with `loginctl enable-linger`), e.g. `moon-remote@<workspace>.service` with `Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus` and `Restart=always`.
 - `workspace_launch` from the phone spawns a sibling `serve` process for stopped workspaces; a `workspace-add` while serving shows up on the phone after the unit restarts (Register refresh is a known gap).
 
+Workspace management is CLI-first: `workspace-add` binds a folder,
+`workspace-remove-folder` unbinds one, `mcp --workspace <slug>
+[--enable playwright]` lists / toggles MCP servers, and `model`
+sets the model picks. All of these edit the same per-workspace state
+the desktop writes; stop the workspace's `serve` before mutating and
+restart it after.
+
 ## `moon-base` docker image
 
 Used for workspace containers, if not wanting to run dev processes on host machines.

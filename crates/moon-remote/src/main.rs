@@ -86,6 +86,35 @@ enum Command {
 		#[arg(long)]
 		workspace: String,
 	},
+	/// Unbind a project folder from a workspace (`session.json`).
+	/// The inverse of `workspace-add`'s bind; sessions and the
+	/// folder's files are untouched. **Stop the workspace's `serve`
+	/// first** — a running instance rewrites `session.json` and
+	/// would clobber this edit.
+	WorkspaceRemoveFolder {
+		/// Workspace slug.
+		#[arg(long)]
+		workspace: String,
+		/// Absolute path of the bound folder to remove.
+		#[arg(long)]
+		folder: Utf8PathBuf,
+	},
+	/// List or toggle MCP servers for a workspace (`session.json`,
+	/// same store the desktop settings panel writes). No flags =
+	/// list. **Stop the workspace's `serve` before toggling** — a
+	/// running instance rewrites `session.json` and would clobber
+	/// this edit; it reads the config back at next boot.
+	Mcp {
+		/// Workspace slug.
+		#[arg(long)]
+		workspace: String,
+		/// Server id to enable (e.g. `playwright`).
+		#[arg(long)]
+		enable: Option<String>,
+		/// Server id to disable.
+		#[arg(long)]
+		disable: Option<String>,
+	},
 	/// Show or set the model picks (`state.json`, same store the
 	/// desktop picker writes). Prints the current picks when no flag
 	/// is given. A running `serve` reads the picks at boot — restart
@@ -125,7 +154,13 @@ fn main() -> anyhow::Result<()> {
 			Command::Login => login().await,
 			Command::Enroll { bridge, code, label } => enroll(bridge, code, label).await,
 			Command::WorkspaceAdd { name, folder, slug } => workspace_add(name, folder, slug).await,
+			Command::WorkspaceRemoveFolder { workspace, folder } => workspace_remove_folder(workspace, folder).await,
 			Command::Serve { workspace } => serve(workspace).await,
+			Command::Mcp {
+				workspace,
+				enable,
+				disable,
+			} => mcp(workspace, enable, disable).await,
 			Command::Model { standard, cheap } => model(standard, cheap).await,
 		}
 	})
@@ -277,6 +312,94 @@ async fn workspace_add(name: String, folder: Utf8PathBuf, slug: Option<String>) 
 	session.active_folder_path = Some(folder.to_string());
 	core_session::save(&workspaces_dir, &slug, &session).await?;
 	println!("Workspace `{slug}` ready with folder {folder}. Run `moon-remote serve --workspace {slug}`.");
+	Ok(())
+}
+
+/// Unbind one folder from a workspace's `session.json`. Worktree
+/// folders whose parent is the removed folder are left alone — they
+/// belong to coordinator workers and get cleaned up through
+/// `discard_worker_worktree`.
+async fn workspace_remove_folder(workspace: String, folder: Utf8PathBuf) -> anyhow::Result<()> {
+	moon_protocol::workspace::validate_workspace_id(&workspace)?;
+	let (_, workspaces_dir) = data_dirs()?;
+	let mut session = core_session::load(&workspaces_dir, &workspace)
+		.await
+		.map_err(|e| anyhow::anyhow!("no session state for workspace `{workspace}`: {e}"))?;
+	let before = session.folders.len();
+	session.folders.retain(|f| f.folder_path != folder.as_str());
+	anyhow::ensure!(
+		session.folders.len() < before,
+		"`{folder}` is not a bound folder of `{workspace}` (bound: {})",
+		session
+			.folders
+			.iter()
+			.map(|f| f.folder_path.as_str())
+			.collect::<Vec<_>>()
+			.join(", ")
+	);
+	if session.active_folder_path.as_deref() == Some(folder.as_str()) {
+		session.active_folder_path = session.folders.first().map(|f| f.folder_path.clone());
+	}
+	core_session::save(&workspaces_dir, &workspace, &session).await?;
+	println!(
+		"Removed {folder} from `{workspace}` ({} folder(s) remain).",
+		session.folders.len()
+	);
+	println!(
+		"(if the workspace's `serve` was running, restart it — and note it may have clobbered this edit on shutdown)"
+	);
+	Ok(())
+}
+
+/// List / toggle MCP servers in a workspace's `session.json` —
+/// headless twin of the desktop's MCP settings panel. Toggling
+/// mirrors `coder_mcp_set_enabled`'s rules: the id must be a preset
+/// or an existing custom entry.
+async fn mcp(workspace: String, enable: Option<String>, disable: Option<String>) -> anyhow::Result<()> {
+	moon_protocol::workspace::validate_workspace_id(&workspace)?;
+	let (_, workspaces_dir) = data_dirs()?;
+	let mut session = core_session::load(&workspaces_dir, &workspace)
+		.await
+		.map_err(|e| anyhow::anyhow!("no session state for workspace `{workspace}`: {e}"))?;
+	let mut changed = false;
+	for (id, want) in [(enable, true), (disable, false)] {
+		let Some(id) = id else {
+			continue;
+		};
+		let known = moon_coder::mcp::server_rows(&session.coder_mcp);
+		anyhow::ensure!(
+			known.iter().any(|row| row.config.id == id),
+			"unknown MCP server `{id}` (known: {})",
+			known
+				.iter()
+				.map(|r| r.config.id.as_str())
+				.collect::<Vec<_>>()
+				.join(", ")
+		);
+		let currently = session.coder_mcp.enabled.iter().any(|e| e == &id);
+		if want && !currently {
+			session.coder_mcp.enabled.push(id);
+			changed = true;
+		} else if !want && currently {
+			session.coder_mcp.enabled.retain(|e| e != &id);
+			changed = true;
+		}
+	}
+	if changed {
+		core_session::save(&workspaces_dir, &workspace, &session).await?;
+	}
+	for row in moon_coder::mcp::server_rows(&session.coder_mcp) {
+		let mark = if session.coder_mcp.enabled.iter().any(|e| e == &row.config.id) {
+			"enabled "
+		} else {
+			"disabled"
+		};
+		let kind = if row.preset { "preset" } else { "custom" };
+		println!("{mark}  {:<12} ({kind})  {}", row.config.id, row.config.description);
+	}
+	if changed {
+		println!("(restart the workspace's `serve` to pick this up — and only toggle while it's stopped)");
+	}
 	Ok(())
 }
 
