@@ -694,13 +694,26 @@ class CompanionState {
 	 * calls this on resume). Re-opens the socket, re-subscribes the
 	 * event stream, and re-syncs the screen the user was on. */
 	async ensureConnected(): Promise<void> {
-		if (this.phase !== 'ready' || !this.connection || this.#reconnecting) {
+		if (this.phase !== 'ready' || !this.connection) {
 			return;
 		}
 		if (this.#socket?.isOpen()) {
 			return;
 		}
-		this.#reconnecting = true;
+		// Concurrent callers (visibility handler + a user send) share
+		// one reconnect instead of the latecomer no-oping and then
+		// failing its call on the still-closed socket.
+		this.#reconnectPromise ??= this.#reconnectInner().finally(() => {
+			this.#reconnectPromise = null;
+		});
+		return this.#reconnectPromise;
+	}
+	#reconnectPromise: Promise<void> | null = null;
+
+	async #reconnectInner(): Promise<void> {
+		if (!this.connection) {
+			return;
+		}
 		try {
 			const socket = new BridgeSocket(this.connection.url);
 			await socket.open();
@@ -739,11 +752,8 @@ class CompanionState {
 			}
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
-		} finally {
-			this.#reconnecting = false;
 		}
 	}
-	#reconnecting = false;
 
 	async #call<T>(workspace: string, method: string, params: unknown = {}, ide = ''): Promise<T> {
 		if (!this.#socket || !this.connection) {
@@ -1514,6 +1524,14 @@ class CompanionState {
 		this.pendingSends = [...this.pendingSends, entry];
 		savePendingSends(this.pendingSends);
 		try {
+			// A silently-dead socket (backgrounded PWA, network blip)
+			// reconnects here instead of failing the send and making
+			// the user refresh + re-tap. The entry is already parked
+			// as `sending`, so the reconnect's own unsent-flush can't
+			// double-send it.
+			if (!this.#socket?.isOpen()) {
+				await this.ensureConnected();
+			}
 			this.busy = true;
 			await this.#call(this.activeWorkspace, 'coder_send', { text, session_id: this.activeSession }, this.activeIde);
 		} catch (e) {
@@ -1952,12 +1970,25 @@ class CompanionState {
 				this.busy = false;
 				this.awaitingInput = false;
 				this.pendingPrompt = null;
-				this.turnError = null;
+				// A *replayed* turn_complete is always the synthetic
+				// batch terminator (real completions are never
+				// persisted as records) — it must not clear a
+				// trailing error's retry bar. Mid-history errors are
+				// cleared by the replayed user_message that follows
+				// them instead.
+				if (!fromReplay) {
+					this.turnError = null;
+				}
 				break;
 			case 'error':
 				this.busy = false;
 				this.turnError = str(ev, 'message') || 'coder error';
-				this.error = str(ev, 'message') || 'coder error';
+				// Only a live failure pops the toast; a replayed one
+				// restores the retry bar without re-alerting on every
+				// open.
+				if (!fromReplay) {
+					this.error = str(ev, 'message') || 'coder error';
+				}
 				break;
 			case 'session_loaded':
 				// Update the session title in the list if it changed.
