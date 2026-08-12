@@ -28,7 +28,10 @@ Persist both halves of the link and rebuild lazily on remount:
   the folded fleet, respawn the dispatch feeder, then quietly remount
   surviving workers in the background (observe-mode, no focus steal);
   a worker whose JSONL is gone is unregistered instead of becoming a
-  ghost. A user message into a worker whose registry link is missing
+  ghost. Remounts resolve each session's folder by scanning the bound
+  folders' sessions dirs — cross-project workers (`spawn_worker`'s
+  `folder` arg) file their JSONL under _their_ project, not the
+  coordinator's, and assuming one dir dropped them from the fleet. A user message into a worker whose registry link is missing
   falls back to the worker's header field and quietly remounts the
   coordinator first — which runs the same rebuild.
 

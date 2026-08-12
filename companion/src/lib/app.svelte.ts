@@ -1038,6 +1038,12 @@ class CompanionState {
 			}
 			await this.#call(this.activeWorkspace, 'coder_set_model_settings', { settings: next }, this.activeIde);
 			this.modelSettings = next;
+			// Re-read: `resolved_standard_model` is server-derived
+			// from the runner's live route, and the context-cap
+			// editor keys its override by it — without this refresh
+			// a provider switch left the cap editing the *previous*
+			// provider's model.
+			await this.#loadModelSettings();
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
 		} finally {

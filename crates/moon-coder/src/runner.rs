@@ -3401,7 +3401,16 @@ impl CoderHandle {
 					if handle.state.runtime_for_session(&worker).await.is_some() {
 						continue;
 					}
-					if let Err(err) = handle.open_session_boxed(folder.to_string(), worker.clone()).await {
+					// Cross-project workers live under their own
+					// project's sessions dir — resolve it rather than
+					// assuming the coordinator's.
+					let worker_folder = find_session_folder(&handle.state, &worker)
+						.await
+						.unwrap_or_else(|| folder.clone());
+					if let Err(err) = handle
+						.open_session_boxed(worker_folder.to_string(), worker.clone())
+						.await
+					{
 						// Deleted / unloadable worker session: drop it
 						// from the fleet rather than leaving a ghost the
 						// coordinator can list but never reach.
@@ -4339,7 +4348,10 @@ impl CoderHandle {
 					return;
 				};
 				if self.state.runtime_for_session(&orch).await.is_none() {
-					let _ = self.open_session_boxed(worker_folder.to_string(), orch.clone()).await;
+					let orch_folder = find_session_folder(&self.state, &orch)
+						.await
+						.unwrap_or_else(|| worker_folder.clone());
+					let _ = self.open_session_boxed(orch_folder.to_string(), orch.clone()).await;
 				}
 				match self
 					.state
@@ -6621,6 +6633,23 @@ type BoxedOpenSession<'a> = std::pin::Pin<
 			+ 'a,
 	>,
 >;
+
+/// Locate the bound folder whose sessions dir holds `session_id`'s
+/// JSONL (ADR 0065). Cross-project workers (`spawn_worker`'s
+/// `folder` arg) file their transcripts under *their* parent
+/// project, not the coordinator's — restart-time remounts must not
+/// assume a single dir, or cross-project fleet members get dropped
+/// as "deleted" on rebuild.
+async fn find_session_folder(state: &Arc<CoderState>, session_id: &str) -> Option<Utf8PathBuf> {
+	for entry in state.workspaces.folders().await {
+		let folder = Utf8PathBuf::from(&entry.folder.path);
+		let dir = sessions_dir(&state.coder_sessions_dir, &folder);
+		if dir.join(format!("{session_id}.jsonl")).is_file() {
+			return Some(folder);
+		}
+	}
+	None
+}
 
 /// Fold a coordinator's records into its surviving fleet (ADR 0065):
 /// a worker is a `SubagentSpawned` carrying a `worktree_root` (`task`
