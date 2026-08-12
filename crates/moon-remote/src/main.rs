@@ -527,6 +527,56 @@ async fn serve(slug: String) -> anyhow::Result<()> {
 	.map_err(|err| anyhow::anyhow!("could not init moon-coder: {err}"))?;
 	coder.spawn_prime_context_windows();
 
+	// Persist folder binds/unbinds as they happen. The desktop's
+	// frontend saves session state continuously, but headless has no
+	// frontend — without this, folders a coordinator binds at
+	// runtime (`clone_repo`, `init_repo`, worker worktrees) evaporate
+	// on restart. `WorkspaceFoldersChanged` fires on every such
+	// mutation; the reconcile keeps existing per-folder UI fields
+	// (open tabs, etc.) for folders that survive.
+	{
+		let mut events = coder.subscribe();
+		let registry = registry.clone();
+		let workspaces_dir = workspaces_dir.clone();
+		let slug = slug.clone();
+		tokio::spawn(async move {
+			loop {
+				match events.recv().await {
+					Ok(envelope) => {
+						if !matches!(envelope.event, moon_coder::CoderEvent::WorkspaceFoldersChanged) {
+							continue;
+						}
+						let snapshot = registry.snapshot().await;
+						let mut session = core_session::load(&workspaces_dir, &slug).await.unwrap_or_default();
+						session.folders = snapshot
+							.folders
+							.iter()
+							.map(|f| {
+								let mut entry = session
+									.folders
+									.iter()
+									.find(|e| e.folder_path == f.path)
+									.cloned()
+									.unwrap_or_else(|| moon_protocol::session::FolderSession {
+										folder_path: f.path.clone(),
+										..Default::default()
+									});
+								entry.origin = f.origin.clone();
+								entry
+							})
+							.collect();
+						session.active_folder_path = snapshot.active_folder.clone();
+						if let Err(err) = core_session::save(&workspaces_dir, &slug, &session).await {
+							tracing::warn!(error = %err, "failed to persist folder change to session.json");
+						}
+					}
+					Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+					Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+				}
+			}
+		});
+	}
+
 	let rpc: Arc<dyn moon_remote::rpc::BridgeRpcHandler> = Arc::new(BridgeRpc::new(
 		coder.clone(),
 		registry.clone(),

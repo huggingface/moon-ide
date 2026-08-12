@@ -575,6 +575,12 @@ Secret Service for the keyring (ADR 0035's `dbus-run-session` +
 `gnome-keyring-daemon` recipe). The phone sees the box as another IDE
 group in its switcher; relayed event envelopes carry `(ide,
 workspace)` carrier tags so multi-IDE fan-in can't cross-light pips.
+Folder binds made at runtime (a coordinator's `clone_repo` /
+`init_repo`, worker worktrees, the phone's remove-project) persist to
+`session.json` off `WorkspaceFoldersChanged` — the desktop's frontend
+does this saving continuously, headless has no frontend, so `serve`
+runs its own reconcile task; without it those binds evaporated on
+restart.
 
 ## Cloud / always-on future
 
