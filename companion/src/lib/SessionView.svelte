@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { tick } from 'svelte';
 	import { app, type AskUserQuestion } from './app.svelte';
+	import { diffSections } from './diff';
 	import Markdown from './Markdown.svelte';
 
 	let draft = $state('');
@@ -405,23 +406,6 @@
 
 	/** Split a multi-file unified diff into per-file sections keyed
 	 * by the `b/<path>` of each `diff --git` header. */
-	function diffSections(diff: string): Map<string, string> {
-		const map = new Map<string, string>();
-		if (!diff) {
-			return map;
-		}
-		for (const part of diff.split(/^(?=diff --git )/m)) {
-			if (!part.startsWith('diff --git ')) {
-				continue;
-			}
-			const header = part.slice(0, part.indexOf('\n'));
-			const m = header.match(/ b\/(.+)$/);
-			if (m?.[1] !== undefined) {
-				map.set(m[1], part);
-			}
-		}
-		return map;
-	}
 	const isCoordinator = $derived(app.sessions.find((s) => s.id === app.activeSession)?.mode === 'coordinator');
 
 	// Title rename: tap the title to edit inline. The rename

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { diffSections } from './diff';
 	// Project management mode: chips flip from "switch" to "remove"
 	// targets, with a type-the-name confirm dialog (removal is
 	// mirrored on the desktop, so friction is deliberate).
@@ -78,6 +79,15 @@
 		void app.setProvider(id);
 	}
 
+	/** Which file the changes overlay should auto-expand (null =
+	 * all collapsed; set when the user tapped a specific file row). */
+	let changesFocusFile = $state<string | null>(null);
+
+	async function openChanges(file: string | null): Promise<void> {
+		changesFocusFile = file;
+		await app.loadWorkingDiff();
+	}
+
 	/** Commit composer state. */
 	let commitMsg = $state('');
 	let committing = $state(false);
@@ -147,6 +157,49 @@
 				title={manageProjects ? 'Done managing projects' : 'Remove a project from this workspace'}
 				onclick={() => (manageProjects = !manageProjects)}>{manageProjects ? 'done' : '✎'}</button
 			>
+		</div>
+	{/if}
+
+	{#if app.workingDiff !== null}
+		{@const sections = diffSections(app.workingDiff)}
+		{@const changedFiles = app.scmStatus?.files ?? []}
+		<div class="review-overlay">
+			<div class="row review-head">
+				<button class="ghost back" onclick={() => app.closeWorkingDiff()}>←</button>
+				<strong class="review-title">Uncommitted changes</strong>
+				<button
+					class="ghost scm-refresh"
+					title="Refresh"
+					disabled={app.loadingWorkingDiff}
+					onclick={() => {
+						void app.loadScmStatus();
+						void app.loadWorkingDiff();
+					}}>⟳</button
+				>
+			</div>
+			<div class="review-body">
+				{#if changedFiles.length === 0}
+					<p class="muted">Working tree is clean.</p>
+				{:else}
+					<p class="muted review-summary">
+						{changedFiles.length} file{changedFiles.length === 1 ? '' : 's'} changed vs HEAD (untracked included; diff truncated
+						at 64 kB)
+					</p>
+					{#each changedFiles as f (f.path)}
+						<details class="review-file" open={f.path === changesFocusFile}>
+							<summary>
+								<span class="review-file-status {f.status}">{f.status?.[0]?.toUpperCase()}</span>
+								<span class="review-file-path">{f.path}</span>
+							</summary>
+							{#if sections.has(f.path)}
+								<pre class="diff-body">{sections.get(f.path)}</pre>
+							{:else}
+								<p class="muted review-nodiff">No text diff (binary, rename, or diff truncated).</p>
+							{/if}
+						</details>
+					{/each}
+				{/if}
+			</div>
 		</div>
 	{/if}
 
@@ -265,6 +318,12 @@
 			{#if branch}
 				<div class="scm-head">
 					<span class="scm-branch">{branch.name || 'detached HEAD'}</span>
+					<button
+						class="ghost scm-refresh"
+						title="Refresh git status"
+						disabled={app.loadingScm}
+						onclick={() => void app.loadScmStatus()}>{app.loadingScm ? '…' : '⟳'}</button
+					>
 					{#if branch.head_short_sha}
 						<span class="muted scm-sha">{branch.head_short_sha}</span>
 					{/if}
@@ -325,13 +384,16 @@
 					<summary>Show files</summary>
 					<div class="scm-file-list">
 						{#each files as f (f.path)}
-							<div class="scm-file">
+							<button class="scm-file" onclick={() => void openChanges(f.path)}>
 								<span class="scm-file-status {f.status}">{f.status?.[0]?.toUpperCase()}</span>
 								<span class="scm-file-path">{f.path}</span>
-							</div>
+							</button>
 						{/each}
 					</div>
 				</details>
+				<button class="ghost scm-view-changes" disabled={app.loadingWorkingDiff} onclick={() => void openChanges(null)}
+					>{app.loadingWorkingDiff ? 'Loading diff…' : 'View changes'}</button
+				>
 				<div class="scm-commit">
 					<textarea
 						bind:value={commitMsg}
@@ -544,6 +606,90 @@
 		flex-direction: column;
 		gap: 0.4rem;
 		padding: 0.6rem 0.8rem;
+	}
+	.scm-refresh {
+		flex-shrink: 0;
+		font-size: 0.85rem;
+		padding: 0.15rem 0.5rem;
+		min-height: 0;
+	}
+	.scm-view-changes {
+		font-size: 0.78rem;
+		padding: 0.25rem 0.6rem;
+		margin-top: 0.3rem;
+	}
+	.scm-file {
+		display: flex;
+		gap: 0.4rem;
+		align-items: baseline;
+		background: none;
+		border: none;
+		padding: 0.15rem 0;
+		width: 100%;
+		text-align: left;
+		min-height: 0;
+	}
+	.review-overlay {
+		position: fixed;
+		inset: 0;
+		background: var(--bg);
+		z-index: 15;
+		display: flex;
+		flex-direction: column;
+		padding: 0.75rem;
+		gap: 0.5rem;
+	}
+	.review-head {
+		gap: 0.5rem;
+	}
+	.review-title {
+		flex: 1;
+	}
+	.review-body {
+		flex: 1;
+		overflow-y: auto;
+		min-height: 0;
+	}
+	.review-summary {
+		font-size: 0.75rem;
+	}
+	.review-file {
+		margin-bottom: 0.35rem;
+	}
+	.review-file summary {
+		display: flex;
+		gap: 0.4rem;
+		align-items: baseline;
+		cursor: pointer;
+		padding: 0.3rem 0;
+	}
+	.review-file-status {
+		font-weight: 700;
+		font-size: 0.75rem;
+	}
+	.review-file-status.added {
+		color: var(--ok, #4caf50);
+	}
+	.review-file-status.deleted {
+		color: var(--danger);
+	}
+	.review-file-path {
+		font-size: 0.8rem;
+		word-break: break-all;
+	}
+	.review-nodiff {
+		font-size: 0.75rem;
+		padding-left: 1rem;
+	}
+	.diff-body {
+		font-size: 0.68rem;
+		line-height: 1.35;
+		overflow-x: auto;
+		background: var(--bg-elev-1);
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		padding: 0.5rem;
+		white-space: pre;
 	}
 	.manage-projects {
 		flex-shrink: 0;

@@ -1135,6 +1135,36 @@ class CompanionState {
 		}
 	}
 
+	/** Working-tree diff for the active folder (vs HEAD, untracked
+	 * synthesised in, 64 kB cap) — the SCM card's "view changes"
+	 * overlay. Null = closed. */
+	workingDiff = $state<string | null>(null);
+	loadingWorkingDiff = $state(false);
+
+	async loadWorkingDiff(): Promise<void> {
+		if (!this.activeWorkspace || !this.activeFolder || this.loadingWorkingDiff) {
+			return;
+		}
+		this.loadingWorkingDiff = true;
+		try {
+			const result = await this.#call<{ diff: string }>(
+				this.activeWorkspace,
+				'workspace_scm_diff',
+				{ folder: this.activeFolder },
+				this.activeIde,
+			);
+			this.workingDiff = result.diff;
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		} finally {
+			this.loadingWorkingDiff = false;
+		}
+	}
+
+	closeWorkingDiff(): void {
+		this.workingDiff = null;
+	}
+
 	closeReview(): void {
 		this.review = null;
 	}

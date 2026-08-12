@@ -240,6 +240,11 @@ requested surface:
   (`coder_retry_last_turn`, session-targeted via
   `Coder::retry_last_turn_in`) — same semantics as the desktop's
   trailing-error retry: nothing truncated, output appends below.
+- **Working-tree changes.** The SCM card gets a manual refresh
+  button, tappable file rows, and a "View changes" overlay: per-file
+  collapsible unified diffs from `workspace_scm_diff`
+  (`git_diff_patch` — vs HEAD, untracked synthesised in, 64 kB cap),
+  auto-expanding the tapped file.
 - **Project management.** The projects row's edit toggle flips chips
   into remove targets; removal (`workspace_remove_folder`, refused
   for worktree folders) requires typing the project name — the

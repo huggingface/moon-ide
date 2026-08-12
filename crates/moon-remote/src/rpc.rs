@@ -419,6 +419,15 @@ impl BridgeRpcHandler for BridgeRpc {
 			// to review an isolated agent's work against main.
 			// `base_ref: null` when there's nothing to review against
 			// (on the default branch, detached HEAD, no remote).
+			// Working-tree diff (vs HEAD, untracked synthesised in,
+			// 64 kB cap) — the phone's "view changes" overlay on the
+			// SCM card. Read-only.
+			"workspace_scm_diff" => {
+				let p: FolderParams = parse_params(params)?;
+				let folder = self.resolve_folder(&p).await?;
+				let diff = folder.host.git_diff_patch().await.map_err(|e| e.to_string())?;
+				Ok(serde_json::json!({ "diff": diff }))
+			}
 			"workspace_scm_review" => {
 				let p: FolderParams = parse_params(params)?;
 				let folder = self.resolve_folder(&p).await?;
@@ -786,6 +795,7 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 	"workspace_launch",
 	"workspace_scm_status",
 	"workspace_scm_review",
+	"workspace_scm_diff",
 	"workspace_scm_commit",
 	"workspace_scm_suggest_message",
 	"workspace_scm_sync",
