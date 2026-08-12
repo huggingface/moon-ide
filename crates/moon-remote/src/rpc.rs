@@ -159,6 +159,60 @@ impl BridgeRpcHandler for BridgeRpc {
 				let snapshot = self.workspaces.snapshot().await;
 				to_value(&snapshot)
 			}
+			// Unbind a project folder from the workspace — the phone's
+			// remove-project affordance. Shared state: this removes it
+			// from the desktop's folder bar too (announced via
+			// `WorkspaceFoldersChanged`). Files on disk are untouched.
+			// Worktree folders are refused — their lifecycle belongs
+			// to the worker discard flow (ADR 0044).
+			"workspace_remove_folder" => {
+				let p: FolderPathParams = parse_params(params)?;
+				let entry = self
+					.workspaces
+					.folder_for_path(&p.folder)
+					.await
+					.ok_or_else(|| format!("no bound folder at `{}`", p.folder))?;
+				if matches!(
+					entry.folder.origin,
+					moon_protocol::workspace::FolderOrigin::Worktree { .. }
+				) {
+					return Err("this is a worker worktree — discard it through the worker flow instead of unbinding".into());
+				}
+				self
+					.workspaces
+					.remove_folder(&p.folder)
+					.await
+					.map_err(|e| e.to_string())?;
+				let snapshot = self.workspaces.snapshot().await;
+				// Persist: the registry is in-memory; mirror the removal
+				// (and the possibly-moved active pointer) into
+				// `session.json` so the next boot doesn't re-bind it.
+				if let Some(id) = self.settings.workspace_id.as_deref() {
+					match moon_core::session::load(&self.settings.workspaces_dir, id).await {
+						Ok(mut session) => {
+							session.folders.retain(|f| {
+								if f.folder_path == p.folder {
+									return false;
+								}
+								!matches!(
+									&f.origin,
+									moon_protocol::workspace::FolderOrigin::Worktree { parent_path, .. }
+										if parent_path == &p.folder
+								)
+							});
+							session.active_folder_path = snapshot.active_folder.clone();
+							if let Err(err) = moon_core::session::save(&self.settings.workspaces_dir, id, &session).await {
+								tracing::warn!(?err, "failed to persist folder removal to session.json");
+							}
+						}
+						Err(err) => {
+							tracing::warn!(?err, "failed to load session.json for folder removal");
+						}
+					}
+				}
+				self.coder.announce_workspace_folders_changed(&p.folder);
+				to_value(&snapshot)
+			}
 			// --- Mutating: session commands. Folder-targeted — an
 			// optional `folder` param (a bound folder's path from
 			// `workspace_snapshot`) scopes the command to that
@@ -571,6 +625,14 @@ struct FolderParams {
 	folder: Option<String>,
 }
 
+/// Params for methods that *require* a folder path (no active-folder
+/// fallback — unbinding "whatever is active" from a phone would be
+/// an accident magnet).
+#[derive(serde::Deserialize)]
+struct FolderPathParams {
+	folder: String,
+}
+
 #[derive(serde::Deserialize)]
 struct OpenSessionParams {
 	id: String,
@@ -705,6 +767,7 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 	"coder_running_sessions",
 	"coder_active_session",
 	"workspace_snapshot",
+	"workspace_remove_folder",
 	"coder_open_session",
 	"coder_session_history_older",
 	"coder_rename_session",

@@ -1,4 +1,25 @@
 <script lang="ts">
+	// Project management mode: chips flip from "switch" to "remove"
+	// targets, with a type-the-name confirm dialog (removal is
+	// mirrored on the desktop, so friction is deliberate).
+	let manageProjects = $state(false);
+	let removeTarget = $state<{ path: string; name: string } | null>(null);
+	let removeConfirm = $state('');
+
+	function openRemoveDialog(path: string, name: string): void {
+		removeTarget = { path, name };
+		removeConfirm = '';
+	}
+
+	async function confirmRemove(): Promise<void> {
+		const target = removeTarget;
+		if (!target || removeConfirm !== target.name) {
+			return;
+		}
+		removeTarget = null;
+		manageProjects = false;
+		await app.removeFolder(target.path);
+	}
 	import { app } from './app.svelte';
 
 	function relativeTime(ms: number): string {
@@ -107,10 +128,12 @@
 				<button
 					class="project-chip"
 					class:active={f.path === app.activeFolder}
+					class:removing={manageProjects}
 					role="tab"
 					aria-selected={f.path === app.activeFolder}
-					onclick={() => app.openFolder(f.path)}
+					onclick={() => (manageProjects ? openRemoveDialog(f.path, f.name) : app.openFolder(f.path))}
 				>
+					{#if manageProjects}<span class="chip-x">✕</span>{/if}
 					{f.name}
 					{#if app.busyFolders.has(f.path)}
 						<span class="pip live" title="An agent is running here"></span>
@@ -119,6 +142,41 @@
 					{/if}
 				</button>
 			{/each}
+			<button
+				class="ghost manage-projects"
+				title={manageProjects ? 'Done managing projects' : 'Remove a project from this workspace'}
+				onclick={() => (manageProjects = !manageProjects)}>{manageProjects ? 'done' : '✎'}</button
+			>
+		</div>
+	{/if}
+
+	{#if removeTarget}
+		<div class="remove-overlay" role="dialog" aria-modal="true" aria-label="Remove project">
+			<div class="card remove-card">
+				<h3>Remove project</h3>
+				<p>
+					This unbinds <strong>{removeTarget.name}</strong> from the workspace
+					<strong>everywhere — the desktop's folder bar loses it too</strong> (same shared workspace state). Files on disk
+					are untouched; re-open the folder to bring it back.
+				</p>
+				<p>Type <code>{removeTarget.name}</code> to confirm:</p>
+				<!-- svelte-ignore a11y_autofocus -->
+				<input
+					class="remove-input"
+					autofocus
+					autocomplete="off"
+					autocapitalize="off"
+					spellcheck="false"
+					bind:value={removeConfirm}
+					placeholder={removeTarget.name}
+				/>
+				<div class="remove-actions">
+					<button class="ghost" onclick={() => (removeTarget = null)}>Cancel</button>
+					<button class="remove-btn" disabled={removeConfirm !== removeTarget.name} onclick={() => void confirmRemove()}
+						>Remove</button
+					>
+				</div>
+			</div>
 		</div>
 	{/if}
 
@@ -486,6 +544,57 @@
 		flex-direction: column;
 		gap: 0.4rem;
 		padding: 0.6rem 0.8rem;
+	}
+	.manage-projects {
+		flex-shrink: 0;
+		font-size: 0.75rem;
+		padding: 0.2rem 0.5rem;
+	}
+	.project-chip.removing {
+		border-style: dashed;
+	}
+	.chip-x {
+		color: var(--danger);
+		margin-right: 0.25rem;
+	}
+	.remove-overlay {
+		position: fixed;
+		inset: 0;
+		background: rgb(0 0 0 / 55%);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		z-index: 20;
+		padding: 1rem;
+	}
+	.remove-card {
+		max-width: 26rem;
+		width: 100%;
+	}
+	.remove-card p {
+		font-size: 0.85rem;
+		line-height: 1.4;
+	}
+	.remove-input {
+		width: 100%;
+		box-sizing: border-box;
+	}
+	.remove-actions {
+		display: flex;
+		justify-content: flex-end;
+		gap: 0.6rem;
+		margin-top: 0.75rem;
+	}
+	.remove-btn {
+		background: var(--danger);
+		color: var(--bg);
+		border: none;
+		border-radius: 6px;
+		padding: 0.4rem 0.9rem;
+		font-weight: 600;
+	}
+	.remove-btn:disabled {
+		opacity: 0.4;
 	}
 	.scm-remote {
 		font-size: 0.7rem;

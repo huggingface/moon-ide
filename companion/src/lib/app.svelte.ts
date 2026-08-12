@@ -156,7 +156,18 @@ export type TranscriptRow =
 	  }
 	| { kind: 'diff'; id: string; files: string[]; diff: string }
 	| { kind: 'tokens'; id: string; total: number; contextWindow: number }
-	| { kind: 'compaction'; id: string; summary: string; done: boolean }
+	| {
+			kind: 'compaction';
+			id: string;
+			summary: string;
+			done: boolean;
+			/** Live progress (CompactionProgress heartbeats): chunked-
+			 * pass counters and the ≈token count of summary text
+			 * streamed so far. Zero until the first heartbeat. */
+			chunksDone: number;
+			chunksTotal: number;
+			summaryTokens: number;
+	  }
 	| {
 			kind: 'subagent';
 			id: string;
@@ -892,6 +903,23 @@ class CompanionState {
 			{ folder: this.activeFolder },
 			this.activeIde,
 		);
+	}
+
+	/** Unbind a project folder from the workspace — mirrored on the
+	 * IDE side (desktop folder bar included), which is why the UI
+	 * gates it behind type-to-confirm. Files on disk are untouched.
+	 * On success the workspace view reloads wholesale so folders,
+	 * sessions, and SCM state all reflect the removal. */
+	async removeFolder(path: string): Promise<void> {
+		if (!this.activeWorkspace) {
+			return;
+		}
+		try {
+			await this.#call(this.activeWorkspace, 'workspace_remove_folder', { folder: path }, this.activeIde);
+			await this.openWorkspace(this.activeWorkspace, this.activeIde, this.activeWorkspaceName);
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		}
 	}
 
 	/** Back out of the active workspace to the switcher. Refreshes
@@ -2118,8 +2146,20 @@ class CompanionState {
 					id: nextRowId('comp'),
 					summary: '',
 					done: false,
+					chunksDone: 0,
+					chunksTotal: 0,
+					summaryTokens: 0,
 				});
 				break;
+			case 'compaction_progress': {
+				const row = rows.findLast((r) => r.kind === 'compaction' && !r.done);
+				if (row && row.kind === 'compaction') {
+					row.chunksDone = num(ev, 'chunks_done');
+					row.chunksTotal = num(ev, 'chunks_total');
+					row.summaryTokens = num(ev, 'summary_tokens');
+				}
+				break;
+			}
 			case 'compaction_complete': {
 				const summary = str(ev, 'summary');
 				const row = rows.findLast((r) => r.kind === 'compaction' && !r.done);

@@ -4232,6 +4232,15 @@ impl CoderHandle {
 		rt.prompts.resolve(call_id, PromptOutcome::Answered(response)).await
 	}
 
+	/// Broadcast `WorkspaceFoldersChanged` outside a coder turn — the
+	/// bridge's folder-management RPC uses this so every attached UI
+	/// (the desktop folder bar, other phones) refreshes its snapshot
+	/// after a bind/unbind it didn't initiate.
+	pub fn announce_workspace_folders_changed(&self, folder: &str) {
+		let sink = FolderEventSink::new(self.state.events.clone(), folder.to_string(), String::new());
+		sink.send(CoderEvent::WorkspaceFoldersChanged);
+	}
+
 	pub fn subscribe(&self) -> broadcast::Receiver<CoderEventEnvelope> {
 		self.state.events.subscribe()
 	}

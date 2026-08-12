@@ -240,6 +240,12 @@ requested surface:
   (`coder_retry_last_turn`, session-targeted via
   `Coder::retry_last_turn_in`) — same semantics as the desktop's
   trailing-error retry: nothing truncated, output appends below.
+- **Project management.** The projects row's edit toggle flips chips
+  into remove targets; removal (`workspace_remove_folder`, refused
+  for worktree folders) requires typing the project name — the
+  workspace state is shared, so the desktop's folder bar loses the
+  project too. `session.json` is updated so the unbind survives a
+  restart, and `WorkspaceFoldersChanged` refreshes every attached UI.
 - **Hash routing.** The current view (workspace + optional session)
   is mirrored into the URL hash (`#/w?ws=…&ide=…&f=…&s=…`, `f` the
   active project folder) via

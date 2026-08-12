@@ -72,6 +72,25 @@
 		await app.replayFromMessage(rowId);
 	}
 
+	// Same live-progress label as the desktop's compaction row:
+	// chunk counters when the pass split the prefix, plus the ≈token
+	// count of summary text streamed so far.
+	function compactionProgress(row: { chunksDone: number; chunksTotal: number; summaryTokens: number }): string {
+		const parts: string[] = [];
+		if (row.chunksTotal > 1) {
+			parts.push(
+				row.chunksDone >= row.chunksTotal
+					? 'merging part summaries'
+					: `part ${row.chunksDone + 1} of ${row.chunksTotal}`,
+			);
+		}
+		if (row.summaryTokens > 0) {
+			const tokens = row.summaryTokens >= 1000 ? `${(row.summaryTokens / 1000).toFixed(1)}k` : `${row.summaryTokens}`;
+			parts.push(`≈${tokens} tokens written`);
+		}
+		return parts.length > 0 ? ` (${parts.join(', ')})` : '';
+	}
+
 	// Queued-steer actions. Un-queue pops the message back into the
 	// composer for editing; go-now cancels the running turn so the
 	// steer drains immediately. The backend's events update the
@@ -936,7 +955,7 @@
 							<div class="muted">{row.summary}</div>
 						</details>
 					{:else}
-						<span class="muted">Compacting context…</span>
+						<span class="muted">Compacting context…{compactionProgress(row)}</span>
 					{/if}
 				</div>
 			{:else if row.kind === 'subagent'}
