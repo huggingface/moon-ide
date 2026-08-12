@@ -263,6 +263,28 @@ pub fn clone_repo_tool_definition() -> ToolDefinition {
 /// Takes a directory `name`, not a path — new projects belong next
 /// to the projects the user already works in, not at arbitrary
 /// filesystem locations (a model given a free path picks `/tmp`).
+/// `add_folder` — bind an existing sibling directory as a workspace
+/// folder. The already-on-disk counterpart of `clone_repo` /
+/// `init_repo`: same sibling-only posture (the model names a
+/// directory next to its project; it never picks an arbitrary host
+/// path).
+pub fn add_folder_tool_definition() -> ToolDefinition {
+	ToolDefinition::function(
+		"add_folder",
+		"Bind an existing repository/directory that is a **sibling of your project folder** (same parent directory) as a workspace folder. The already-on-disk counterpart of `clone_repo` / `init_repo` — use it when the repo is already checked out locally (e.g. cloned in an earlier session) instead of re-cloning. Pass `name` = the sibling directory's name. Returns the folder's path and name; pass that path to `spawn_worker`'s `folder` to put a worker in it. Idempotent: binding an already-bound folder just returns it.",
+		json!({
+			"type": "object",
+			"properties": {
+				"name": {
+					"type": "string",
+					"description": "The sibling directory's name (a single path component, e.g. `gaia-project`)."
+				}
+			},
+			"required": ["name"]
+		}),
+	)
+}
+
 pub fn init_repo_tool_definition() -> ToolDefinition {
 	ToolDefinition::function(
 		"init_repo",
@@ -531,6 +553,7 @@ mod tests {
 		);
 		assert_eq!(clone_repo_tool_definition().function.name, "clone_repo");
 		assert_eq!(init_repo_tool_definition().function.name, "init_repo");
+		assert_eq!(add_folder_tool_definition().function.name, "add_folder");
 	}
 
 	#[test]

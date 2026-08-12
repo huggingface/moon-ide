@@ -977,6 +977,54 @@ class CompanionState {
 	 * the new pick — same semantics as the desktop picker, where a
 	 * locked save interprets `active_provider` as the lock's value
 	 * and leaves the global default untouched. */
+	/** Probe-then-add a user provider (OpenRouter / Anthropic /
+	 * custom OpenAI-compat) with its API key, then activate it.
+	 * The probe surfaces the upstream failure verbatim ("401
+	 * Unauthorized", DNS, …) before anything is persisted. */
+	async addProvider(fields: {
+		kind: 'open_router' | 'anthropic' | 'custom';
+		label: string;
+		baseUrl: string;
+		apiKey: string;
+		standardModel: string;
+		cheapModel: string;
+	}): Promise<boolean> {
+		if (!this.activeWorkspace) {
+			return false;
+		}
+		this.savingProvider = true;
+		try {
+			await this.#call(
+				this.activeWorkspace,
+				'coder_probe_provider',
+				{ base_url: fields.baseUrl, api_key: fields.apiKey, kind: fields.kind },
+				this.activeIde,
+			);
+			const result = await this.#call<{ id: string; settings: ModelSettings }>(
+				this.activeWorkspace,
+				'coder_add_provider',
+				{
+					label: fields.label,
+					kind: fields.kind,
+					base_url: fields.baseUrl,
+					api_key: fields.apiKey,
+					standard_model: fields.standardModel,
+					cheap_model: fields.cheapModel,
+				},
+				this.activeIde,
+			);
+			this.modelSettings = result.settings;
+			this.savingProvider = false;
+			// Activate what we just added — that's why the user is here.
+			await this.setProvider(result.id);
+			return true;
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+			this.savingProvider = false;
+			return false;
+		}
+	}
+
 	async setProvider(id: string | null): Promise<void> {
 		const settings = this.modelSettings;
 		if (!this.activeWorkspace || !settings) {
@@ -2111,10 +2159,12 @@ class CompanionState {
 			case 'error':
 				this.busy = false;
 				this.turnError = str(ev, 'message') || 'coder error';
-				// Only a live failure pops the toast; a replayed one
-				// restores the retry bar without re-alerting on every
-				// open.
-				if (!fromReplay) {
+				// The inline retry bar above the composer carries the
+				// message (with the retry affordance) — doubling it
+				// with the toast was just noise. The toast only covers
+				// the no-open-session case, where the bar can't
+				// render; replayed errors never toast.
+				if (!fromReplay && !this.activeSession) {
 					this.error = str(ev, 'message') || 'coder error';
 				}
 				break;

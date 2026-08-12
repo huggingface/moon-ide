@@ -401,6 +401,43 @@ impl BridgeRpcHandler for BridgeRpc {
 				launcher.launch(&p.workspace_id).await?;
 				Ok(Value::Null)
 			}
+			// Probe a provider endpoint/key before committing — the
+			// phone's add-provider form surfaces the upstream failure
+			// verbatim ("401 Unauthorized", DNS, …).
+			"coder_probe_provider" => {
+				let p: ProbeProviderParams = parse_params(params)?;
+				let key = if p.api_key.is_empty() {
+					None
+				} else {
+					Some(p.api_key.as_str())
+				};
+				let result = self
+					.coder
+					.probe_provider(&p.base_url, p.kind, key)
+					.await
+					.map_err(|e| e.to_string())?;
+				to_value(&result)
+			}
+			// Add a user provider (with API key) and make it available
+			// to the picker — the phone's "add provider" flow. Returns
+			// the new provider's id plus the refreshed settings.
+			"coder_add_provider" => {
+				let p: AddProviderParams = parse_params(params)?;
+				let id = self.coder.new_provider_id();
+				let config = moon_protocol::coder_models::CoderProviderConfig {
+					id: id.clone(),
+					label: p.label,
+					kind: p.kind,
+					base_url: p.base_url,
+					standard_model: p.standard_model,
+					cheap_model: p.cheap_model,
+					has_api_key: false,
+				};
+				let settings = crate::settings::add_provider(&self.coder, &self.settings, config, &p.api_key)
+					.await
+					.map_err(|e| e.to_string())?;
+				Ok(serde_json::json!({ "id": id, "settings": settings }))
+			}
 			"coder_set_model_settings" => {
 				let p: SetModelSettingsParams = parse_params(params)?;
 				crate::settings::set_model_settings(&self.coder, &self.settings, p.settings)
@@ -634,6 +671,29 @@ struct FolderParams {
 	folder: Option<String>,
 }
 
+#[derive(serde::Deserialize)]
+struct ProbeProviderParams {
+	base_url: String,
+	#[serde(default)]
+	api_key: String,
+	#[serde(default)]
+	kind: moon_protocol::coder_models::ProviderKind,
+}
+
+#[derive(serde::Deserialize)]
+struct AddProviderParams {
+	label: String,
+	#[serde(default)]
+	kind: moon_protocol::coder_models::ProviderKind,
+	base_url: String,
+	#[serde(default)]
+	api_key: String,
+	#[serde(default)]
+	standard_model: String,
+	#[serde(default)]
+	cheap_model: String,
+}
+
 /// Params for methods that *require* a folder path (no active-folder
 /// fallback — unbinding "whatever is active" from a phone would be
 /// an accident magnet).
@@ -792,6 +852,8 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 	"coder_revert_to_message",
 	"coder_get_model_settings",
 	"coder_set_model_settings",
+	"coder_probe_provider",
+	"coder_add_provider",
 	"workspace_launch",
 	"workspace_scm_status",
 	"workspace_scm_review",

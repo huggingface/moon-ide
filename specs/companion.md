@@ -247,6 +247,14 @@ requested surface:
   (`coder_retry_last_turn`, session-targeted via
   `Coder::retry_last_turn_in`) — same semantics as the desktop's
   trailing-error retry: nothing truncated, output appends below.
+- **Provider management.** The provider card's "+ Add provider"
+  form adds a user provider (OpenRouter / Anthropic / custom
+  OpenAI-compat presets) with its API key from the phone:
+  `coder_probe_provider` validates the endpoint+key first (upstream
+  error verbatim), `coder_add_provider` persists (key in the IDE
+  host's keyring, config in `state.json` via the shared
+  `settings::add_provider`) and returns the refreshed settings; the
+  new provider is auto-activated.
 - **Working-tree changes.** The SCM card gets a manual refresh
   button, tappable file rows, and a "View changes" overlay: per-file
   collapsible unified diffs from `workspace_scm_diff`

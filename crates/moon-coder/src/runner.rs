@@ -5602,6 +5602,7 @@ async fn run_turn(
 		tool_defs.push(crate::coordinator::retire_worker_tool_definition());
 		tool_defs.push(crate::coordinator::clone_repo_tool_definition());
 		tool_defs.push(crate::coordinator::init_repo_tool_definition());
+		tool_defs.push(crate::coordinator::add_folder_tool_definition());
 	}
 	// Compose a fresh system prompt and overwrite the session's
 	// `messages[0]`: the base prompt plus a "Bound folders"
@@ -6336,6 +6337,8 @@ async fn dispatch_tool_calls(
 				handle_clone_repo(state, sink, &args).await
 			} else if call.function.name == "init_repo" {
 				handle_init_repo(state, sink, &args).await
+			} else if call.function.name == "add_folder" {
+				handle_add_folder(state, sink, &args).await
 			} else {
 				state.tools.dispatch(&call.function.name, &args, cx, cancel).await
 			};
@@ -8612,6 +8615,60 @@ fn sibling_dest(coordinator_folder: &Utf8Path, name: &str) -> Utf8PathBuf {
 		.map(Utf8Path::to_path_buf)
 		.unwrap_or_else(|| coordinator_folder.to_path_buf())
 		.join(name)
+}
+
+/// `add_folder` — bind an existing sibling directory as a workspace
+/// folder (the already-on-disk counterpart of `clone_repo` /
+/// `init_repo`). Sibling-only by construction: the model supplies a
+/// single directory name, and the destination is derived from the
+/// coordinator's own folder — never an arbitrary host path.
+async fn handle_add_folder(state: &Arc<CoderState>, sink: &FolderEventSink, args: &Value) -> Result<Value, CoderError> {
+	#[derive(serde::Deserialize)]
+	struct AddArgs {
+		name: String,
+	}
+	let parsed: AddArgs =
+		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("add_folder", err.to_string()))?;
+	let name = parsed.name.trim();
+	if !is_valid_repo_name(name) {
+		return Err(CoderError::invalid_args(
+			"add_folder",
+			"name must be a single directory name (letters, digits, `-`, `_`, `.`; not starting with `.` or `-`)",
+		));
+	}
+	let folder_path = Utf8PathBuf::from(sink.folder());
+	let dest = sibling_dest(&folder_path, name);
+	// Host-side stat is valid regardless of shell target: bound
+	// folders live on the host filesystem (ADR 0029).
+	if !dest.is_dir() {
+		return Err(CoderError::invalid_args(
+			"add_folder",
+			format!("`{dest}` is not an existing directory — `clone_repo` or `init_repo` create new ones"),
+		));
+	}
+	// Idempotent: an already-bound folder just reports itself.
+	if let Some(existing) = state.workspaces.folder_for_path(dest.as_str()).await {
+		return Ok(json!({
+			"status": "already_bound",
+			"path": existing.folder.path,
+			"name": existing.folder.name,
+		}));
+	}
+	let entry = state
+		.workspaces
+		.add_folder(dest)
+		.await
+		.map_err(|err| CoderError::Internal(format!("add_folder failed: {err}")))?;
+	// The folder bar has no other way to learn about a bind it didn't
+	// initiate (ADR 0044); headless persistence rides the same event.
+	sink.send(CoderEvent::WorkspaceFoldersChanged);
+	let mut result = json!({
+		"status": "bound",
+		"path": entry.folder.path,
+		"name": entry.folder.name,
+	});
+	attach_container_mount_note(state, &entry.folder.path, &mut result).await;
+	Ok(result)
 }
 
 /// `init_repo` — initialize a new git repo as a sibling of the

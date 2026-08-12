@@ -11,7 +11,7 @@ use camino::Utf8PathBuf;
 use moon_coder::CoderHandle;
 use moon_core::app_state as app_state_store;
 use moon_core::session as core_session;
-use moon_protocol::coder_models::{CoderModelSettings, CoderProviderLock};
+use moon_protocol::coder_models::{CoderModelSettings, CoderProviderConfig, CoderProviderLock};
 use moon_protocol::MoonError;
 
 /// Where this process persists settings: the global `state.json`
@@ -56,6 +56,46 @@ pub async fn write_workspace_provider_lock(
 	}
 	session.coder_provider_lock = lock;
 	core_session::save(&ctx.workspaces_dir, id, &session).await
+}
+
+/// Add (or update) a user provider and its API key, then push the
+/// refreshed list into the live runner — the headless twin of the
+/// desktop's `coder_save_provider` + `coder_set_provider_api_key`
+/// pair, fused so the phone's "add provider" is one round-trip.
+/// Returns the updated settings for the caller to repaint from.
+pub async fn add_provider(
+	coder: &CoderHandle,
+	ctx: &SettingsContext,
+	mut config: CoderProviderConfig,
+	api_key: &str,
+) -> Result<CoderModelSettings, MoonError> {
+	// Key first: even if the state write fails, a stored key for an
+	// unknown id is harmless; the reverse (entry with `has_api_key`
+	// implied but no key) 401s every call.
+	if !api_key.is_empty() {
+		coder.set_provider_api_key(&config.id, api_key)?;
+	}
+	// `has_api_key` is keyring-derived; never trust the caller.
+	config.has_api_key = false;
+	let cfg = config.clone();
+	let (providers, global_active) = app_state_store::mutate(&ctx.config_dir, move |s| {
+		if let Some(existing) = s.coder.providers.iter_mut().find(|p| p.id == cfg.id) {
+			*existing = cfg;
+		} else {
+			s.coder.providers.push(cfg);
+		}
+		(s.coder.providers.clone(), s.coder.active_provider.clone())
+	})
+	.await?;
+	// A pinned workspace's effective provider isn't the global
+	// `active` — same lock resolution as the desktop's save path.
+	let effective_active = match workspace_provider_lock(ctx).await {
+		Some(CoderProviderLock::Hf) => None,
+		Some(CoderProviderLock::User { id }) => Some(id),
+		None => global_active,
+	};
+	coder.set_providers(providers, effective_active).await;
+	get_model_settings(coder, ctx).await
 }
 
 /// Current model/provider settings: the runner's live view plus the

@@ -79,6 +79,53 @@
 		void app.setProvider(id);
 	}
 
+	// Add-provider form. Kind presets pre-fill the endpoint; the
+	// base URL stays editable only for custom entries.
+	let addingProvider = $state(false);
+	let apKind = $state<'open_router' | 'anthropic' | 'custom'>('open_router');
+	let apLabel = $state('OpenRouter');
+	let apBaseUrl = $state('https://openrouter.ai/api/v1');
+	let apKey = $state('');
+	let apModel = $state('');
+	let apCheapModel = $state('');
+
+	const AP_PRESETS = {
+		open_router: { label: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1' },
+		anthropic: { label: 'Anthropic', baseUrl: 'https://api.anthropic.com' },
+		custom: { label: '', baseUrl: '' },
+	} as const;
+
+	function pickApKind(kind: 'open_router' | 'anthropic' | 'custom'): void {
+		apKind = kind;
+		apLabel = AP_PRESETS[kind].label;
+		apBaseUrl = AP_PRESETS[kind].baseUrl;
+	}
+
+	const apReady = $derived(
+		apLabel.trim() !== '' && apBaseUrl.trim() !== '' && apKey.trim() !== '' && apModel.trim() !== '',
+	);
+
+	async function submitProvider(): Promise<void> {
+		if (!apReady || app.savingProvider) {
+			return;
+		}
+		const ok = await app.addProvider({
+			kind: apKind,
+			label: apLabel.trim(),
+			baseUrl: apBaseUrl.trim(),
+			apiKey: apKey.trim(),
+			standardModel: apModel.trim(),
+			cheapModel: apCheapModel.trim(),
+		});
+		if (ok) {
+			addingProvider = false;
+			providerOpen = false;
+			apKey = '';
+			apModel = '';
+			apCheapModel = '';
+		}
+	}
+
 	/** Which file the changes overlay should auto-expand (null =
 	 * all collapsed; set when the user tapped a specific file row). */
 	let changesFocusFile = $state<string | null>(null);
@@ -258,7 +305,64 @@
 							{p.label || p.id}
 						</button>
 					{/each}
+					<button class="provider-option add-provider" onclick={() => (addingProvider = !addingProvider)}>
+						{addingProvider ? '− Cancel' : '+ Add provider…'}
+					</button>
 				</div>
+				{#if addingProvider}
+					<div class="ap-form">
+						<div class="ap-kinds">
+							{#each [['open_router', 'OpenRouter'], ['anthropic', 'Anthropic'], ['custom', 'Custom']] as [kind, label] (kind)}
+								<button
+									class="ap-kind"
+									class:selected={apKind === kind}
+									onclick={() => pickApKind(kind as 'open_router' | 'anthropic' | 'custom')}>{label}</button
+								>
+							{/each}
+						</div>
+						{#if apKind === 'custom'}
+							<input class="ap-input" bind:value={apLabel} placeholder="Label" spellcheck="false" />
+							<input
+								class="ap-input"
+								bind:value={apBaseUrl}
+								placeholder="Base URL (OpenAI-compat /v1 root)"
+								spellcheck="false"
+								autocapitalize="off"
+							/>
+						{/if}
+						<input
+							class="ap-input"
+							bind:value={apKey}
+							placeholder="API key"
+							type="password"
+							autocomplete="off"
+							spellcheck="false"
+						/>
+						<input
+							class="ap-input"
+							bind:value={apModel}
+							placeholder={apKind === 'anthropic'
+								? 'Model (e.g. claude-sonnet-4-5)'
+								: 'Model (e.g. anthropic/claude-sonnet-4.5)'}
+							spellcheck="false"
+							autocapitalize="off"
+						/>
+						<input
+							class="ap-input"
+							bind:value={apCheapModel}
+							placeholder="Cheap model (optional — titles, summaries)"
+							spellcheck="false"
+							autocapitalize="off"
+						/>
+						<button
+							class="primary ap-submit"
+							disabled={!apReady || app.savingProvider}
+							onclick={() => void submitProvider()}
+						>
+							{app.savingProvider ? 'Checking…' : 'Probe & add'}
+						</button>
+					</div>
+				{/if}
 			{/if}
 			{#if activeId === null}
 				{@const modelSlug = settings.resolved_standard_model ?? ''}
@@ -606,6 +710,41 @@
 		flex-direction: column;
 		gap: 0.4rem;
 		padding: 0.6rem 0.8rem;
+	}
+	.add-provider {
+		color: var(--fg-muted);
+	}
+	.ap-form {
+		display: flex;
+		flex-direction: column;
+		gap: 0.45rem;
+		padding: 0.5rem 0 0.2rem;
+	}
+	.ap-kinds {
+		display: flex;
+		gap: 0.4rem;
+	}
+	.ap-kind {
+		flex: 1;
+		padding: 0.3rem 0;
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		background: none;
+		color: var(--fg-muted);
+		font-size: 0.8rem;
+	}
+	.ap-kind.selected {
+		border-color: var(--accent, #7aa2f7);
+		color: var(--fg);
+	}
+	.ap-input {
+		width: 100%;
+		box-sizing: border-box;
+		font-size: 0.85rem;
+	}
+	.ap-submit {
+		align-self: flex-end;
+		padding: 0.35rem 0.9rem;
 	}
 	.scm-refresh {
 		flex-shrink: 0;
