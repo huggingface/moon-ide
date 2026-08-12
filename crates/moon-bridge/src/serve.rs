@@ -75,6 +75,14 @@ enum ClientMessage {
 		params: serde_json::Value,
 		#[serde(default)]
 		ide: String,
+		/// Phone-side correlation id, echoed back on the matching
+		/// `Result`/`Error`. Forwarded replies come back in the
+		/// IDE's *completion* order, not request order — without
+		/// this the phone's reply matching mis-delivers every
+		/// response the moment two calls overlap. Optional so
+		/// pre-id phones keep their FIFO behaviour.
+		#[serde(default)]
+		call_id: Option<u64>,
 	},
 	/// Subscribe to a workspace's `coder:event` stream. The bridge
 	/// pushes `ServerMessage::Event` frames until the connection drops.
@@ -137,12 +145,23 @@ enum ServerMessage {
 	/// The workspace list (reply to `workspaces`).
 	Workspaces { workspaces: serde_json::Value },
 	/// A `call` result (the relayed method's `ok` payload).
-	Result { value: serde_json::Value },
+	/// `call_id` echoes the phone's correlation id when it sent one.
+	Result {
+		value: serde_json::Value,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		call_id: Option<u64>,
+	},
 	/// One pushed event from a `subscribe` stream (a CoderEventEnvelope).
 	Event { event: serde_json::Value },
 	/// Anything went wrong — bad code, bad token, relay failure,
-	/// malformed frame. `message` is human-readable.
-	Error { message: String },
+	/// malformed frame. `message` is human-readable. `call_id`
+	/// echoes the phone's correlation id when the failure belongs
+	/// to a specific `call`; bridge-level failures leave it unset.
+	Error {
+		message: String,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		call_id: Option<u64>,
+	},
 	/// A fresh phone-pairing payload (reply to `PairCode`, Phase
 	/// 14.5). `payload` is the compact JSON the QR encodes; `url` /
 	/// `code` / `fingerprint` are unpacked for type-in fallback
@@ -265,6 +284,9 @@ struct PendingForward {
 	/// Sink to push the reply/event back to the phone that issued the
 	/// original `call`/`subscribe`.
 	phone_sink: tokio::sync::mpsc::Sender<ServerMessage>,
+	/// The phone's correlation id for this call (echoed on the
+	/// reply). `None` for pre-id phones and subscribe streams.
+	phone_call_id: Option<u64>,
 	/// The IDE connection this forward was sent to (key of
 	/// `live_ides`). Used by the disconnect sweep (when an IDE's WS
 	/// drops, all its in-flight forwards are reaped and the phones
@@ -774,6 +796,7 @@ async fn handle_conn(
 					let _ = entry
 						.phone_sink
 						.send(ServerMessage::Error {
+							call_id: entry.phone_call_id,
 							message: format!("IDE `{ide_id}` disconnected mid-call"),
 						})
 						.await;
@@ -794,6 +817,7 @@ async fn handle_conn(
 					let _ = entry
 						.phone_sink
 						.send(ServerMessage::Error {
+							call_id: None,
 							message: format!("IDE `{ide_id}` disconnected mid-stream"),
 						})
 						.await;
@@ -818,6 +842,7 @@ async fn handle_message(
 		Err(err) => {
 			let _ = out
 				.send(ServerMessage::Error {
+					call_id: None,
 					message: format!("malformed message: {err}"),
 				})
 				.await;
@@ -851,8 +876,9 @@ async fn handle_message(
 			method,
 			params,
 			ide,
+			call_id,
 		} => {
-			handle_call(Arc::clone(ctx), &token, &workspace, &method, params, &ide, out).await;
+			handle_call(Arc::clone(ctx), &token, &workspace, &method, params, &ide, call_id, out).await;
 		}
 		ClientMessage::Subscribe { token, workspace, ide } => {
 			handle_subscribe(ctx, &token, &workspace, &ide, out).await;
@@ -879,13 +905,25 @@ async fn handle_message(
 		ClientMessage::ForwardResult { id, ok } => {
 			let mut pending = ctx.pending_forwards.lock().await;
 			if let Some(entry) = pending.remove(&id) {
-				let _ = entry.phone_sink.send(ServerMessage::Result { value: ok }).await;
+				let _ = entry
+					.phone_sink
+					.send(ServerMessage::Result {
+						call_id: entry.phone_call_id,
+						value: ok,
+					})
+					.await;
 			}
 		}
 		ClientMessage::ForwardError { id, message } => {
 			let mut pending = ctx.pending_forwards.lock().await;
 			if let Some(entry) = pending.remove(&id) {
-				let _ = entry.phone_sink.send(ServerMessage::Error { message }).await;
+				let _ = entry
+					.phone_sink
+					.send(ServerMessage::Error {
+						call_id: entry.phone_call_id,
+						message,
+					})
+					.await;
 			}
 		}
 		ClientMessage::ForwardEvent { id, event } => {
@@ -955,6 +993,7 @@ async fn handle_subscribe(
 			if let Err(err) = crate::relay::subscribe(&socket, "coder_events", forward).await {
 				let _ = out
 					.send(ServerMessage::Error {
+						call_id: None,
 						message: format!("event stream ended: {err}"),
 					})
 					.await;
@@ -974,6 +1013,7 @@ async fn handle_subscribe(
 				drop(live);
 				let _ = out
 					.send(ServerMessage::Error {
+						call_id: None,
 						message: format!("IDE `{ide}` has no connected workspace `{workspace}` — it may have been closed"),
 					})
 					.await;
@@ -989,6 +1029,7 @@ async fn handle_subscribe(
 			id,
 			PendingForward {
 				phone_sink: out.clone(),
+				phone_call_id: None,
 				conn_id,
 				started: false,
 				origin: Some((ide.to_owned(), workspace.to_owned())),
@@ -1011,6 +1052,7 @@ async fn handle_subscribe(
 		ctx.pending_streams.lock().await.remove(&id);
 		let _ = out
 			.send(ServerMessage::Error {
+				call_id: None,
 				message: format!("IDE `{ide}` connection lost mid-forward"),
 			})
 			.await;
@@ -1035,6 +1077,7 @@ async fn handle_subscribe(
 				let _ = entry
 					.phone_sink
 					.send(ServerMessage::Error {
+						call_id: None,
 						message: "forwarded stream timed out".into(),
 					})
 					.await;
@@ -1052,9 +1095,11 @@ fn check_token(ctx: &ServeCtx, token: &str) -> Result<(), ServerMessage> {
 	match ctx.devices.device_for_token(token) {
 		Ok(Some(_)) => Ok(()),
 		Ok(None) => Err(ServerMessage::Error {
+			call_id: None,
 			message: "unknown device token; pair this device first".into(),
 		}),
 		Err(err) => Err(ServerMessage::Error {
+			call_id: None,
 			message: format!("token check failed: {err}"),
 		}),
 	}
@@ -1068,6 +1113,7 @@ async fn handle_workspaces(ctx: &ServeCtx, token: &str) -> ServerMessage {
 		Ok(dir) => dir,
 		Err(err) => {
 			return ServerMessage::Error {
+				call_id: None,
 				message: format!("could not resolve config dir: {err}"),
 			}
 		}
@@ -1090,6 +1136,7 @@ async fn handle_workspaces(ctx: &ServeCtx, token: &str) -> ServerMessage {
 			.collect(),
 		Err(err) => {
 			return ServerMessage::Error {
+				call_id: None,
 				message: format!("discovery failed: {err}"),
 			}
 		}
@@ -1154,12 +1201,14 @@ async fn handle_pair(ctx: &ServeCtx, code: &str, label: &str) -> ServerMessage {
 	let Some(session) = guard.as_mut() else {
 		tracing::warn!("pair attempt while pairing is closed");
 		return ServerMessage::Error {
+			call_id: None,
 			message: "pairing is closed; ask the desktop to start a new pairing".into(),
 		};
 	};
 	if let Err(err) = session.verify_and_consume(code) {
 		tracing::warn!(error = %err, "pair attempt rejected");
 		return ServerMessage::Error {
+			call_id: None,
 			message: err.to_string(),
 		};
 	}
@@ -1177,6 +1226,7 @@ async fn handle_pair(ctx: &ServeCtx, code: &str, label: &str) -> ServerMessage {
 			}
 		}
 		Err(err) => ServerMessage::Error {
+			call_id: None,
 			message: format!("could not store device: {err}"),
 		},
 	}
@@ -1192,12 +1242,14 @@ async fn handle_enroll(ctx: &ServeCtx, code: &str, label: &str, ide_id: &str) ->
 	let Some(session) = guard.as_mut() else {
 		tracing::warn!(%ide_id, "enroll attempt while enrollment is closed");
 		return ServerMessage::Error {
+			call_id: None,
 			message: "enrollment is closed; ask the operator to issue a new enrollment code".into(),
 		};
 	};
 	if let Err(err) = session.verify_and_consume(code) {
 		tracing::warn!(%ide_id, error = %err, "enroll attempt rejected");
 		return ServerMessage::Error {
+			call_id: None,
 			message: err.to_string(),
 		};
 	}
@@ -1215,6 +1267,7 @@ async fn handle_enroll(ctx: &ServeCtx, code: &str, label: &str, ide_id: &str) ->
 			}
 		}
 		Err(err) => ServerMessage::Error {
+			call_id: None,
 			message: format!("could not store IDE: {err}"),
 		},
 	}
@@ -1248,6 +1301,7 @@ async fn handle_register(
 	);
 	tracing::info!(ide_id = %ide.id, conn_id, "IDE registered workspaces");
 	ServerMessage::Result {
+		call_id: None,
 		value: serde_json::json!({
 			"registered": true,
 			"connected_phones": ctx.connected_phones.load(std::sync::atomic::Ordering::Relaxed),
@@ -1319,14 +1373,17 @@ fn check_ide_token(ctx: &ServeCtx, token: &str) -> Result<EnrolledIde, ServerMes
 	match ctx.ides.ide_for_token(token) {
 		Ok(Some(ide)) => Ok(ide),
 		Ok(None) => Err(ServerMessage::Error {
+			call_id: None,
 			message: "unknown IDE token; enroll this IDE first".into(),
 		}),
 		Err(err) => Err(ServerMessage::Error {
+			call_id: None,
 			message: format!("IDE token check failed: {err}"),
 		}),
 	}
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_call(
 	ctx: Arc<ServeCtx>,
 	token: &str,
@@ -1334,9 +1391,16 @@ async fn handle_call(
 	method: &str,
 	params: serde_json::Value,
 	ide: &str,
+	call_id: Option<u64>,
 	out: &tokio::sync::mpsc::Sender<ServerMessage>,
 ) {
 	if let Err(reply) = check_token(&ctx, token) {
+		// Stamp the correlation id so the phone routes the failure
+		// to the right caller instead of its FIFO fallback.
+		let reply = match reply {
+			ServerMessage::Error { message, .. } => ServerMessage::Error { message, call_id },
+			other => other,
+		};
 		let _ = out.send(reply).await;
 		return;
 	}
@@ -1353,12 +1417,13 @@ async fn handle_call(
 			Ok(()) => {
 				let _ = out
 					.send(ServerMessage::Result {
+						call_id,
 						value: serde_json::json!({ "launched": true }),
 					})
 					.await;
 			}
 			Err(message) => {
-				let _ = out.send(ServerMessage::Error { message }).await;
+				let _ = out.send(ServerMessage::Error { call_id, message }).await;
 			}
 		}
 		return;
@@ -1374,6 +1439,7 @@ async fn handle_call(
 			Err(err) => {
 				let _ = out
 					.send(ServerMessage::Error {
+						call_id,
 						message: err.to_string(),
 					})
 					.await;
@@ -1381,9 +1447,13 @@ async fn handle_call(
 			}
 		};
 		let reply = if let Some(error) = resp.error {
-			ServerMessage::Error { message: error }
+			ServerMessage::Error {
+				call_id,
+				message: error,
+			}
 		} else {
 			ServerMessage::Result {
+				call_id,
 				value: resp.ok.unwrap_or(serde_json::Value::Null),
 			}
 		};
@@ -1411,6 +1481,7 @@ async fn handle_call(
 				drop(live);
 				let _ = out
 					.send(ServerMessage::Error {
+						call_id,
 						message: format!("IDE `{ide}` has no connected workspace `{workspace}` — it may have been closed"),
 					})
 					.await;
@@ -1426,6 +1497,7 @@ async fn handle_call(
 			id,
 			PendingForward {
 				phone_sink: out.clone(),
+				phone_call_id: call_id,
 				conn_id,
 				started: false,
 				origin: None,
@@ -1452,6 +1524,7 @@ async fn handle_call(
 		ctx.pending_forwards.lock().await.remove(&id);
 		let _ = out
 			.send(ServerMessage::Error {
+				call_id,
 				message: format!("IDE `{ide}` connection lost mid-forward"),
 			})
 			.await;
@@ -1473,6 +1546,7 @@ async fn handle_call(
 			let _ = entry
 				.phone_sink
 				.send(ServerMessage::Error {
+					call_id,
 					message: "forwarded call timed out".into(),
 				})
 				.await;

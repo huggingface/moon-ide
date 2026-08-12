@@ -36,3 +36,4 @@ companion/dist/
 
 # svelte-fast-check generated tsx/tsconfig cache (check:svelte / check:companion).
 .fast-check/
+/target-*

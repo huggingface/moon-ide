@@ -89,6 +89,13 @@ and event grammar the in-process Tauri surface and the planned
 (invariant 4); the companion does not get a hand-maintained mobile
 schema.
 
+Phone `call` frames carry a `call_id` the bridge echoes on the
+matching `result`/`error`: forwarded calls run concurrently on the
+IDE and reply in completion order, so the phone matches replies by
+id (id-less frames — pair, workspaces, pre-id bridges — fall back to
+the FIFO queue). Without this, any two overlapping calls could swap
+payloads.
+
 Bridge ↔ workspace-process hop: the **`moon-remote` JSON-RPC
 framing**, not a bespoke `instance.sock` relay verb set. The
 `instance.sock` enumeration is the _discovery_ mechanism only

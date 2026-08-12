@@ -23,9 +23,9 @@ export type Connection = {
 type ServerMessage =
 	| { type: 'paired'; device_id: string; token: string }
 	| { type: 'workspaces'; workspaces: unknown }
-	| { type: 'result'; value: unknown }
+	| { type: 'result'; value: unknown; call_id?: number }
 	| { type: 'event'; event: unknown }
-	| { type: 'error'; message: string };
+	| { type: 'error'; message: string; call_id?: number };
 
 export class BridgeError extends Error {}
 
@@ -60,7 +60,17 @@ export function clearConnection(): void {
  */
 export class BridgeSocket {
 	#ws: WebSocket | null = null;
+	/** FIFO reply queue for id-less requests (pair / workspaces —
+	 * the bridge answers those inline, in order). */
 	#pending: Array<{ resolve: (m: ServerMessage) => void; reject: (e: Error) => void }> = [];
+	/** Id-keyed waiters for `call` requests. Forwarded calls run
+	 * concurrently on the IDE and reply in *completion* order —
+	 * FIFO matching mis-delivered every reply the moment two calls
+	 * overlapped (the "SCM card missing after refresh" class of
+	 * bug). The bridge echoes `call_id`; matching by it makes reply
+	 * order irrelevant. */
+	#pendingCalls = new Map<number, { resolve: (m: ServerMessage) => void; reject: (e: Error) => void }>();
+	#nextCallId = 1;
 	#onEvent: ((event: unknown) => void) | null = null;
 	readonly url: string;
 
@@ -86,6 +96,10 @@ export class BridgeSocket {
 					p.reject(err);
 				}
 				this.#pending = [];
+				for (const p of this.#pendingCalls.values()) {
+					p.reject(err);
+				}
+				this.#pendingCalls.clear();
 			});
 			ws.addEventListener('message', (ev) => {
 				let msg: ServerMessage;
@@ -103,6 +117,16 @@ export class BridgeSocket {
 				// handler rather than consuming a pending reply.
 				if (msg.type === 'event') {
 					this.#onEvent?.(msg.event);
+					return;
+				}
+				// Correlated replies (calls) resolve by id; everything
+				// else falls back to the FIFO queue. An id we no longer
+				// track (reply raced the close-reject) is dropped rather
+				// than mis-fed to a FIFO waiter.
+				if ((msg.type === 'result' || msg.type === 'error') && typeof msg.call_id === 'number') {
+					const waiter = this.#pendingCalls.get(msg.call_id);
+					this.#pendingCalls.delete(msg.call_id);
+					waiter?.resolve(msg);
 					return;
 				}
 				this.#pending.shift()?.resolve(msg);
@@ -130,6 +154,23 @@ export class BridgeSocket {
 		return new Promise((resolve, reject) => {
 			this.#pending.push({ resolve, reject });
 			ws.send(JSON.stringify(payload));
+		});
+	}
+
+	/** `#send` for `call` requests: attaches a correlation id and
+	 * parks the waiter in the id-keyed map. Old bridges that don't
+	 * echo `call_id` never resolve these — their replies land in
+	 * the FIFO path, which has no waiter, so the caller hits the
+	 * bridge's own timeout error instead of a mismatched payload. */
+	#sendCall(payload: Record<string, unknown>): Promise<ServerMessage> {
+		const ws = this.#ws;
+		if (!ws || ws.readyState !== WebSocket.OPEN) {
+			return Promise.reject(new BridgeError('not connected'));
+		}
+		const callId = this.#nextCallId++;
+		return new Promise((resolve, reject) => {
+			this.#pendingCalls.set(callId, { resolve, reject });
+			ws.send(JSON.stringify({ ...payload, call_id: callId }));
 		});
 	}
 
@@ -181,7 +222,7 @@ export class BridgeSocket {
 		params: unknown = {},
 		ide = '',
 	): Promise<T> {
-		const reply = await this.#send({ type: 'call', token, workspace, method, params, ide });
+		const reply = await this.#sendCall({ type: 'call', token, workspace, method, params, ide });
 		if (reply.type === 'error') {
 			throw new BridgeError(reply.message);
 		}
