@@ -1394,6 +1394,11 @@ class CompanionState {
 			const next: ModelSettings = { ...settings, provider_lock: lock };
 			await this.#call(this.activeWorkspace, 'coder_set_model_settings', { settings: next }, this.activeIde);
 			this.modelSettings = next;
+			// Re-read: the lock changes the *effective* route (it
+			// beats the global active provider), so the server-derived
+			// `resolved_standard_model` — the context-cap editor's
+			// key — may flip with it.
+			await this.#loadModelSettings();
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
 		} finally {
@@ -1417,10 +1422,11 @@ class CompanionState {
 			const next: ModelSettings = { ...settings, standard_model: slug.trim() };
 			await this.#call(this.activeWorkspace, 'coder_set_model_settings', { settings: next }, this.activeIde);
 			this.modelSettings = next;
-			// Re-read so `resolved_standard_model` reflects the runner's
-			// fallback chain (e.g. an emptied slug resolving to the
-			// built-in default).
-			void this.#loadModelSettings();
+			// Re-read (awaited — the cap editor may open immediately
+			// after) so `resolved_standard_model` reflects the
+			// runner's fallback chain (e.g. an emptied slug resolving
+			// to the built-in default).
+			await this.#loadModelSettings();
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
 		} finally {
