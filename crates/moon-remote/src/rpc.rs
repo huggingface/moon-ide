@@ -89,7 +89,18 @@ pub struct BridgeRpc {
 	workspaces: Arc<WorkspaceRegistry>,
 	settings: SettingsContext,
 	launcher: Option<Arc<dyn WorkspaceLauncher>>,
+	/// Per-folder `git fetch` throttle for the phone's SCM surface:
+	/// a status request (fired on every project switch / manual
+	/// refresh) triggers a *background* fetch at most once per
+	/// [`FETCH_THROTTLE`], so ahead/behind counts track the remote
+	/// without a fetch storm.
+	last_fetch: tokio::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
 }
+
+/// Minimum spacing between phone-triggered background fetches per
+/// folder. Hardcoded (scope discipline): five minutes keeps counts
+/// honest without hammering the remote from a bouncy phone.
+const FETCH_THROTTLE: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl BridgeRpc {
 	pub fn new(
@@ -103,7 +114,30 @@ impl BridgeRpc {
 			workspaces,
 			settings,
 			launcher,
+			last_fetch: tokio::sync::Mutex::new(std::collections::HashMap::new()),
 		}
+	}
+
+	/// Spawn a background `git fetch` for `entry` unless one ran in
+	/// the last [`FETCH_THROTTLE`]. Fire-and-forget: the *next*
+	/// status read shows the updated ahead/behind; failures
+	/// (offline, auth) log at debug and cost nothing.
+	async fn maybe_fetch(&self, entry: &Arc<moon_core::workspace::WorkspaceFolderEntry>) {
+		let path = entry.folder.path.clone();
+		{
+			let mut last = self.last_fetch.lock().await;
+			let due = last.get(&path).is_none_or(|at| at.elapsed() >= FETCH_THROTTLE);
+			if !due {
+				return;
+			}
+			last.insert(path.clone(), std::time::Instant::now());
+		}
+		let host = entry.host.clone();
+		tokio::spawn(async move {
+			if let Err(err) = host.git_fetch().await {
+				tracing::debug!(error = %err, folder = %path, "background git fetch failed");
+			}
+		});
 	}
 
 	/// Resolve a bound folder by path (when the phone passes one) or
@@ -501,6 +535,10 @@ impl BridgeRpcHandler for BridgeRpc {
 			"workspace_scm_status" => {
 				let p: FolderParams = parse_params(params)?;
 				let folder = self.resolve_folder(&p).await?;
+				// Throttled background fetch so ahead/behind track the
+				// remote — a project switch on the phone is the natural
+				// "am I current?" moment.
+				self.maybe_fetch(&folder).await;
 				let branch = folder.host.git_branch().await.unwrap_or_default();
 				// Repo web base (e.g. https://github.com/owner/repo) for
 				// the phone's `#123` transcript autolinks; absent when
@@ -608,6 +646,17 @@ impl BridgeRpcHandler for BridgeRpc {
 			"workspace_scm_sync" => {
 				let p: FolderParams = parse_params(params)?;
 				let folder = self.resolve_folder(&p).await?;
+				// Fetch first (inline, not throttled): the pull/push
+				// decision below is only as good as the freshness of
+				// the ahead/behind counts, and a sync click is an
+				// explicit "talk to the remote" gesture.
+				{
+					let mut last = self.last_fetch.lock().await;
+					last.insert(folder.folder.path.clone(), std::time::Instant::now());
+				}
+				if let Err(err) = folder.host.git_fetch().await {
+					tracing::debug!(error = %err, "pre-sync git fetch failed; proceeding with cached counts");
+				}
 				// Same logic as the desktop's `sync()`: if behind,
 				// pull (rebase) first; if ahead (or diverged after
 				// the pull), push. A diverged branch only pulls on

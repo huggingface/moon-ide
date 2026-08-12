@@ -247,6 +247,11 @@ requested surface:
   (`coder_retry_last_turn`, session-targeted via
   `Coder::retry_last_turn_in`) — same semantics as the desktop's
   trailing-error retry: nothing truncated, output appends below.
+- **Remote freshness.** A phone `workspace_scm_status` triggers a
+  throttled background `git fetch` (once per 5 min per folder) so
+  ahead/behind counts track the remote — a project switch is the
+  natural "am I current?" moment. The Sync button fetches inline
+  first, so its pull/push decision never runs on stale counts.
 - **Provider management.** The provider card's "+ Add provider"
   form adds a user provider (OpenRouter / Anthropic / custom
   OpenAI-compat presets) with its API key from the phone:
