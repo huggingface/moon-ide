@@ -55,5 +55,12 @@ cheap_model: string,
  * editing the key goes through `coder_set_provider_api_key`.
  * Deserialised as `false` when the field is missing so
  * inbound shapes from the frontend don't have to set it.
+ * Request-payload cap for this provider, in MB (1000-multiples).
+ * Drives the image wire budget: when the outgoing request's
+ * image attachments would push past ~85 % of this, the oldest
+ * screenshots are elided from the wire copy (ADR 0049) —
+ * nothing is deleted from the session. `None` = uncapped
+ * (locally-hosted endpoints don't care). The HF route has a
+ * built-in cap and ignores this field.
  */
-has_api_key: boolean, };
+payload_cap_mb?: number | null, has_api_key: boolean, };

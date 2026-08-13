@@ -934,7 +934,28 @@ impl InferenceClient {
 	/// round-trip just to read a number.
 	pub(crate) async fn image_wire_budget(&self) -> Option<crate::images::ImageWireBudget> {
 		let snapshot = self.models.read().await.clone();
-		matches!(snapshot.resolve_route(), ResolvedProvider::HuggingFace).then_some(crate::images::HF_IMAGE_WIRE_BUDGET)
+		let provider_id = match snapshot.resolve_route() {
+			ResolvedProvider::HuggingFace => return Some(crate::images::HF_IMAGE_WIRE_BUDGET),
+			ResolvedProvider::Custom { id, .. }
+			| ResolvedProvider::OpenRouter { id, .. }
+			| ResolvedProvider::Anthropic { id, .. } => id,
+		};
+		// User providers: budget only when the user configured a
+		// payload cap (local endpoints don't care). Ceiling at 85 %
+		// of the cap leaves headroom for the text part of the
+		// request; floor at half the ceiling gives the same
+		// hysteresis shape as the HF budget.
+		let cap_mb = snapshot
+			.providers
+			.iter()
+			.find(|p| p.id == provider_id)?
+			.payload_cap_mb?;
+		let ceiling = (cap_mb as usize).saturating_mul(1_000_000) * 85 / 100;
+		Some(crate::images::ImageWireBudget {
+			ceiling,
+			floor: ceiling / 2,
+			max_count: 50,
+		})
 	}
 
 	/// Cancel-aware wrapper around [`resolve_route_for_request`].

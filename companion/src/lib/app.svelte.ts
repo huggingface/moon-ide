@@ -988,6 +988,9 @@ class CompanionState {
 		apiKey: string;
 		standardModel: string;
 		cheapModel: string;
+		/** Request-payload cap in MB; images are elided from the
+		 * wire past ~85 % of it. Null = uncapped. */
+		payloadCapMb: number | null;
 	}): Promise<boolean> {
 		if (!this.activeWorkspace) {
 			return false;
@@ -1010,6 +1013,7 @@ class CompanionState {
 					api_key: fields.apiKey,
 					standard_model: fields.standardModel,
 					cheap_model: fields.cheapModel,
+					payload_cap_mb: fields.payloadCapMb,
 				},
 				this.activeIde,
 			);

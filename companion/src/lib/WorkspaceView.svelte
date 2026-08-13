@@ -88,6 +88,7 @@
 	let apKey = $state('');
 	let apModel = $state('');
 	let apCheapModel = $state('');
+	let apPayloadCap = $state('');
 
 	const AP_PRESETS = {
 		open_router: { label: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1' },
@@ -109,6 +110,7 @@
 		if (!apReady || app.savingProvider) {
 			return;
 		}
+		const capMb = parseInt(apPayloadCap, 10);
 		const ok = await app.addProvider({
 			kind: apKind,
 			label: apLabel.trim(),
@@ -116,6 +118,7 @@
 			apiKey: apKey.trim(),
 			standardModel: apModel.trim(),
 			cheapModel: apCheapModel.trim(),
+			payloadCapMb: Number.isFinite(capMb) && capMb > 0 ? capMb : null,
 		});
 		if (ok) {
 			addingProvider = false;
@@ -123,6 +126,7 @@
 			apKey = '';
 			apModel = '';
 			apCheapModel = '';
+			apPayloadCap = '';
 		}
 	}
 
@@ -353,6 +357,13 @@
 							placeholder="Cheap model (optional — titles, summaries)"
 							spellcheck="false"
 							autocapitalize="off"
+						/>
+						<input
+							class="ap-input"
+							bind:value={apPayloadCap}
+							placeholder="Payload cap MB (optional — elides old screenshots)"
+							inputmode="numeric"
+							spellcheck="false"
 						/>
 						<button
 							class="primary ap-submit"

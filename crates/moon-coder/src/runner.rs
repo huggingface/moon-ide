@@ -5682,11 +5682,29 @@ async fn run_turn(
 		// otherwise replay re-inflates the full pre-compaction
 		// transcript and the next turn instantly trips the
 		// provider's context-length cap.
-		let (last_usage, elided_images) = {
-			let session = rt.session.lock().await;
-			(session.last_usage, session.elided_images.clone())
-		};
+		let last_usage = rt.session.lock().await.last_usage;
 		let mut messages = rt.session.lock().await.messages.clone();
+		// Image budget planning runs *before* compaction (ADR 0049):
+		// compaction's in-session summary call replays the elision
+		// set, and marking fresh screenshots only after compaction
+		// let its summary request ship them un-elided — a session
+		// that crossed both the token threshold and the image budget
+		// in the same iteration 413'd inside compaction before the
+		// budget could ever run, and every retry died the same way.
+		if let Some(budget) = state.inference.image_wire_budget().await {
+			let mut session = rt.session.lock().await;
+			let mut marked = std::mem::take(&mut session.elided_images);
+			let newly = crate::images::plan_elision(&messages, budget, &mut marked);
+			if newly > 0 {
+				tracing::info!(
+					newly,
+					total = marked.len(),
+					"image payload over budget; dropping the oldest attachments from the prompt"
+				);
+			}
+			session.elided_images = marked;
+		}
+		let elided_images = rt.session.lock().await.elided_images.clone();
 		let compaction = crate::compaction::compact_if_needed(
 			&state.inference,
 			sink,
@@ -5738,29 +5756,11 @@ async fn run_turn(
 			}
 		}
 
-		// Image budget (ADR 0049). Screenshots are cheap in tokens
-		// and expensive in bytes, so compaction — which triggers on
-		// the token count — never sees them coming. This trims the
-		// oldest attachments off the *wire copy* once they pile up;
-		// `session.messages` keeps them all, so the panel and a
-		// later reload are unaffected.
-		if let Some(budget) = state.inference.image_wire_budget().await {
-			let elided = {
-				let mut session = rt.session.lock().await;
-				let mut marked = std::mem::take(&mut session.elided_images);
-				let newly = crate::images::plan_elision(&messages, budget, &mut marked);
-				if newly > 0 {
-					tracing::info!(
-						newly,
-						total = marked.len(),
-						"image payload over budget; dropping the oldest attachments from the prompt"
-					);
-				}
-				session.elided_images = marked;
-				session.elided_images.clone()
-			};
-			crate::images::apply_elision(&mut messages, &elided);
-		}
+		// Apply the image elisions planned above (before compaction)
+		// to the wire copy. `session.messages` keeps every
+		// attachment — the panel and a later reload are unaffected
+		// (ADR 0049).
+		crate::images::apply_elision(&mut messages, &elided_images);
 
 		// Resume-from-checkpoint: on the first iteration only,
 		// re-dispatch the kept Assistant's pre-existing tool calls

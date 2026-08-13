@@ -293,6 +293,16 @@ pub struct CoderProviderConfig {
 	/// editing the key goes through `coder_set_provider_api_key`.
 	/// Deserialised as `false` when the field is missing so
 	/// inbound shapes from the frontend don't have to set it.
+	/// Request-payload cap for this provider, in MB (1000-multiples).
+	/// Drives the image wire budget: when the outgoing request's
+	/// image attachments would push past ~85 % of this, the oldest
+	/// screenshots are elided from the wire copy (ADR 0049) —
+	/// nothing is deleted from the session. `None` = uncapped
+	/// (locally-hosted endpoints don't care). The HF route has a
+	/// built-in cap and ignores this field.
+	#[serde(default)]
+	#[ts(optional, type = "number | null")]
+	pub payload_cap_mb: Option<u32>,
 	#[serde(default)]
 	pub has_api_key: bool,
 }

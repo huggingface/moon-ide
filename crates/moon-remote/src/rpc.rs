@@ -465,6 +465,7 @@ impl BridgeRpcHandler for BridgeRpc {
 					base_url: p.base_url,
 					standard_model: p.standard_model,
 					cheap_model: p.cheap_model,
+					payload_cap_mb: p.payload_cap_mb,
 					has_api_key: false,
 				};
 				let settings = crate::settings::add_provider(&self.coder, &self.settings, config, &p.api_key)
@@ -741,6 +742,8 @@ struct AddProviderParams {
 	standard_model: String,
 	#[serde(default)]
 	cheap_model: String,
+	#[serde(default)]
+	payload_cap_mb: Option<u32>,
 }
 
 /// Params for methods that *require* a folder path (no active-folder
