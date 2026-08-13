@@ -1666,11 +1666,22 @@ class CompanionState {
 	}
 
 	closeSession(): void {
+		const hadSession = this.activeSession !== null;
 		this.activeSession = null;
 		this.review = null;
 		this.rows = [];
 		this.busy = false;
 		this.turnError = null;
+		// Returning to the workspace view after time inside a session:
+		// the list is stale by then (renames, coordinator-spawned
+		// workers, updated_at ordering) — refresh it in the
+		// background, along with the SCM card the session's commits
+		// may have changed. Guarded so the teardown callers
+		// (closeWorkspace, unpair) with no workspace left don't fire.
+		if (hadSession && this.activeWorkspace) {
+			void this.#refreshSessions();
+			void this.loadScmStatus();
+		}
 		this.awaitingInput = false;
 		this.pendingPrompt = null;
 		this.hasMoreHistory = false;
