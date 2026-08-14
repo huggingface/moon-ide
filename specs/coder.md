@@ -619,6 +619,12 @@ the workspace has no enabled servers, and neither is mode-gated
   `prompt_tokens_details.cached_tokens` folds into
   `cache_read_input_tokens`, so the usage surfaces (desktop ring,
   companion ⚡ indicator) show the cached share on HF routes too.
+  HF-route requests carry `X-HF-Session-Id` (a UUID derived from the
+  session/sub-agent id, task-local-scoped around each turn) so the
+  router pins fireworks-ai's replica-local prompt cache per session
+  (`x-session-affinity`); other providers ignore it. Verified live:
+  fireworks-ai and zai-org report and hit their caches, baseten
+  caches some models but not others, scaleway reports nothing.
 - **Lifecycle**: spawned lazily on first use, kept alive across
   turns (a playwright browser session persists between calls),
   killed on disable / remove / IDE exit / a host↔container mode

@@ -2251,6 +2251,11 @@ class CompanionState {
 				const ctx = num(ev, 'context_window');
 				const promptTokens = num(ev, 'prompt_tokens');
 				const cacheRead = num(ev, 'cache_read_tokens');
+				// Estimate events (bytes/4 fallback between provider
+				// reports) hardcode the cache fields to 0 — updating
+				// from them makes the ⚡ indicator flicker mid-turn.
+				// Keep the last provider-reported split instead.
+				const isEstimate = str(ev, 'source') === 'estimate';
 				if (total > 0) {
 					// Update the existing tokens row in place rather
 					// than appending a new one each time — the coder
@@ -2260,8 +2265,10 @@ class CompanionState {
 					if (existing && existing.kind === 'tokens') {
 						existing.total = total;
 						existing.contextWindow = ctx;
-						existing.promptTokens = promptTokens;
-						existing.cacheRead = cacheRead;
+						if (!isEstimate) {
+							existing.promptTokens = promptTokens;
+							existing.cacheRead = cacheRead;
+						}
 					} else {
 						rows.push({
 							kind: 'tokens',

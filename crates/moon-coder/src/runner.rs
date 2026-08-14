@@ -5384,7 +5384,8 @@ fn spawn_turn_loop(
 	auto_rename_after: bool,
 	resume_tool_calls: Option<Vec<crate::inference::ToolCall>>,
 ) {
-	tokio::spawn(async move {
+	let session_hint = sink_for_turn.session_id.clone();
+	tokio::spawn(crate::inference::SESSION_HINT.scope(session_hint, async move {
 		// Scope-tied so every exit path (success, abort, error,
 		// steer-drain re-loop) decrements exactly once, even on
 		// panic.
@@ -5490,7 +5491,7 @@ fn spawn_turn_loop(
 		if auto_rename_after {
 			spawn_auto_rename(state.clone(), rt_for_turn.clone(), sink_for_turn);
 		}
-	});
+	}));
 }
 
 /// RAII increment/decrement on [`CoderState::running_turns`]. Held

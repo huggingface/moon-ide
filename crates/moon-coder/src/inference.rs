@@ -503,6 +503,44 @@ pub struct ChatCompletionResponse {
 	pub usage: Option<TokenUsage>,
 }
 
+tokio::task_local! {
+	/// Session id of the turn driving the current inference call.
+	/// Scoped by `spawn_turn_loop` (and the sub-agent runner) around
+	/// the whole turn future, so every request it makes — main
+	/// round-trips, compaction summaries, retries — carries the same
+	/// identity. Hashed into an `X-HF-Session-Id` UUID on HF-route
+	/// requests: the router turns it into fireworks-ai's
+	/// `x-session-affinity` so a session's prompt cache pins to one
+	/// replica (concurrent sessions each pin their own instead of
+	/// all riding the requester-id fallback).
+	pub static SESSION_HINT: String;
+}
+
+/// Deterministic RFC-shaped UUID from the scoped session hint.
+/// The router validates with `z.uuid()`, so the version/variant
+/// nibbles are forced to `4`/`8`. `None` outside a turn scope
+/// (title passes, probes) — the router then falls back to the
+/// requester id, which is fine for one-off calls.
+fn session_affinity_uuid() -> Option<String> {
+	let hint = SESSION_HINT.try_with(|s| s.clone()).ok()?;
+	use std::hash::{Hash, Hasher};
+	let mut h1 = std::collections::hash_map::DefaultHasher::new();
+	hint.hash(&mut h1);
+	let mut h2 = std::collections::hash_map::DefaultHasher::new();
+	(0xa5a5_5a5au32, &hint).hash(&mut h2);
+	let mut hex = format!("{:016x}{:016x}", h1.finish(), h2.finish());
+	hex.replace_range(12..13, "4");
+	hex.replace_range(16..17, "8");
+	Some(format!(
+		"{}-{}-{}-{}-{}",
+		&hex[0..8],
+		&hex[8..12],
+		&hex[12..16],
+		&hex[16..20],
+		&hex[20..32]
+	))
+}
+
 /// OpenAI-compatible usage report. `prompt_tokens` is the
 /// load-bearing field for the project: it tells us *exactly* how
 /// much of the model's context window the next round-trip will
@@ -1412,6 +1450,11 @@ impl InferenceClient {
 		if let Some(org) = route.bill_to.as_deref() {
 			builder = builder.header(BILL_TO_HEADER, org);
 		}
+		if route.kind == RouteKind::HuggingFace {
+			if let Some(sid) = session_affinity_uuid() {
+				builder = builder.header(SESSION_ID_HEADER, sid);
+			}
+		}
 		let send = builder.send();
 		tokio::select! {
 			biased;
@@ -1442,6 +1485,11 @@ impl InferenceClient {
 		if let Some(org) = route.bill_to.as_deref() {
 			builder = builder.header(BILL_TO_HEADER, org);
 		}
+		if route.kind == RouteKind::HuggingFace {
+			if let Some(sid) = session_affinity_uuid() {
+				builder = builder.header(SESSION_ID_HEADER, sid);
+			}
+		}
 		let send = builder.send();
 		tokio::select! {
 			biased;
@@ -1455,6 +1503,11 @@ impl InferenceClient {
 /// case-insensitive on the way out but we keep the docs' casing for
 /// grep-ability against moon-landing's `Middlewares.ts`.
 const BILL_TO_HEADER: &str = "x-hf-bill-to";
+
+/// Router-side prompt-cache affinity hint (must parse as a UUID or
+/// the router ignores it) — see `session_affinity_uuid`. Casing per
+/// moon-landing's `CustomHttpHeaders.ts`.
+const SESSION_ID_HEADER: &str = "X-HF-Session-Id";
 
 /// One parsed delta, handed to the streaming caller's callback as
 /// bytes arrive. Borrowed strings keep the hot path allocation-free
@@ -2025,6 +2078,28 @@ mod provider_catalog {
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn session_affinity_uuid_is_rfc_shaped_and_deterministic() {
+		let scope = super::SESSION_HINT.scope("sess-abc123".to_string(), async {
+			let a = super::session_affinity_uuid().unwrap();
+			let b = super::session_affinity_uuid().unwrap();
+			assert_eq!(a, b);
+			// 8-4-4-4-12, version 4, variant 8 — the router's
+			// z.uuid() must accept it or the hint is silently
+			// dropped.
+			let parts: Vec<&str> = a.split('-').collect();
+			assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), vec![8, 4, 4, 4, 12]);
+			assert!(parts[2].starts_with('4'));
+			assert!(parts[3].starts_with('8'));
+		});
+		tokio::runtime::Builder::new_current_thread()
+			.build()
+			.unwrap()
+			.block_on(scope);
+		// Outside any scope: no hint, no header.
+		assert!(super::session_affinity_uuid().is_none());
+	}
+
 	#[test]
 	fn openai_style_cached_tokens_fold_into_cache_read() {
 		// The HF router (OpenAI wire shape) reports the cached share

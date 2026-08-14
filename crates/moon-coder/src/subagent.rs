@@ -749,20 +749,29 @@ async fn run_subagent_wrapped(
 	// the sub-agent ended.
 	let background = Arc::new(crate::tools::BackgroundProcessRegistry::default());
 
-	let outcome = run_subagent_loop(
-		tools,
-		inference,
-		sink,
-		models,
-		spec,
-		&session_dir,
-		&header,
-		state,
-		cancel,
-		format_queue.clone(),
-		background.clone(),
-	)
-	.await;
+	// Scoped per sub-agent id, not inherited from the parent turn:
+	// each sub-agent has its own stable prompt prefix, so pinning it
+	// to its own fireworks replica (via `X-HF-Session-Id`) gets its
+	// cache hits without competing with the parent's. Also covers
+	// detached sub-agents, which run outside the parent's task scope.
+	let outcome = crate::inference::SESSION_HINT
+		.scope(
+			id.clone(),
+			run_subagent_loop(
+				tools,
+				inference,
+				sink,
+				models,
+				spec,
+				&session_dir,
+				&header,
+				state,
+				cancel,
+				format_queue.clone(),
+				background.clone(),
+			),
+		)
+		.await;
 
 	// Flush before announcing the finish so by the time the
 	// parent's transcript shows `SubagentFinished` the files are
