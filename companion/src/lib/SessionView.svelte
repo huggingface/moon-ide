@@ -113,13 +113,79 @@
 	// Map of questionId → { selected: Set<string>, freeText: string }
 	let answers = $state<Record<string, { selected: Set<string>; freeText: string }>>({});
 
-	async function send(): Promise<void> {
-		const text = draft.trim();
-		if (!text) {
+	// Image attachments for the next send. Two entry paths: paste
+	// (desktop browsers) and the 📷 button (mobile: opens the photo
+	// library / camera via the file input). Client-side downscale to
+	// ≤1600px + webp/jpeg keeps a phone photo from shipping 8 MB of
+	// base64 over the relay — the runner re-encodes again on ingest.
+	let attachments = $state<{ data_url: string; mime: string }[]>([]);
+	let fileInput = $state<HTMLInputElement | undefined>();
+
+	async function addImageBlob(blob: Blob): Promise<void> {
+		try {
+			const bitmap = await createImageBitmap(blob);
+			const maxDim = 1600;
+			const scale = Math.min(1, maxDim / Math.max(bitmap.width, bitmap.height));
+			const canvas = document.createElement('canvas');
+			canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+			canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+			canvas.getContext('2d')?.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+			bitmap.close();
+			// Prefer webp; Safari may silently fall back to png from
+			// toDataURL('image/webp'), so detect via the emitted mime.
+			let dataUrl = canvas.toDataURL('image/webp', 0.85);
+			if (!dataUrl.startsWith('data:image/webp')) {
+				dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+			}
+			const mime = dataUrl.slice(5, dataUrl.indexOf(';'));
+			attachments = [...attachments, { data_url: dataUrl, mime }];
+		} catch {
+			// Undecodable file (not an image, corrupt): skip silently.
+		}
+	}
+
+	function onPaste(e: ClipboardEvent): void {
+		const items = e.clipboardData?.items;
+		if (!items) {
 			return;
 		}
+		for (const item of items) {
+			if (item.kind === 'file' && item.type.startsWith('image/')) {
+				const blob = item.getAsFile();
+				if (blob) {
+					e.preventDefault();
+					void addImageBlob(blob);
+				}
+			}
+		}
+	}
+
+	async function onFilesPicked(): Promise<void> {
+		const files = fileInput?.files;
+		if (!files) {
+			return;
+		}
+		for (const file of files) {
+			await addImageBlob(file);
+		}
+		if (fileInput) {
+			fileInput.value = '';
+		}
+	}
+
+	function removeAttachment(index: number): void {
+		attachments = attachments.toSpliced(index, 1);
+	}
+
+	async function send(): Promise<void> {
+		const text = draft.trim();
+		if (!text && attachments.length === 0) {
+			return;
+		}
+		const images = attachments;
 		draft = '';
-		await app.sendPrompt(text);
+		attachments = [];
+		await app.sendPrompt(text || 'See attached image(s).', images);
 	}
 
 	function onKeydown(e: KeyboardEvent): void {
@@ -795,6 +861,21 @@
 							>coordinator</span
 						>{/if}
 					{row.text}
+					{#if row.images.length > 0}
+						<div class="bubble-images">
+							{#each row.images as url, i (i)}
+								<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
+								<img
+									src={url}
+									alt="attachment {i + 1}"
+									onclick={(e) => {
+										e.stopPropagation();
+										lightboxUrl = url;
+									}}
+								/>
+							{/each}
+						</div>
+					{/if}
 					{#if row.queued}<span class="queued-tag">queued</span>{/if}
 				</div>
 				{#if actionsFor === row.id && row.queued}
@@ -1034,11 +1115,34 @@
 		</div>
 	{/if}
 
+	{#if attachments.length > 0}
+		<div class="attach-row">
+			{#each attachments as att, i (att.data_url)}
+				<div class="attach-chip">
+					<img src={att.data_url} alt="attachment {i + 1}" />
+					<button class="attach-x" title="Remove image" onclick={() => removeAttachment(i)}>✕</button>
+				</div>
+			{/each}
+		</div>
+	{/if}
+
 	<div class="composer">
+		<input
+			bind:this={fileInput}
+			type="file"
+			accept="image/*"
+			multiple
+			class="attach-input"
+			onchange={() => void onFilesPicked()}
+		/>
+		<button class="attach-btn" title="Attach images" aria-label="Attach images" onclick={() => fileInput?.click()}
+			>📷</button
+		>
 		<textarea
 			bind:this={draftEl}
 			bind:value={draft}
 			onkeydown={onKeydown}
+			onpaste={onPaste}
 			placeholder={isCoordinator ? 'Describe a goal for the coordinator' : 'Message the coder'}
 			rows="1"
 		></textarea>
@@ -1234,6 +1338,19 @@
 		padding: 0.25rem 0.6rem;
 		border: 1px solid var(--border);
 		border-radius: 999px;
+	}
+	.bubble-images {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.4rem;
+		margin-top: 0.4rem;
+	}
+	.bubble-images img {
+		max-height: 120px;
+		max-width: 45%;
+		border-radius: 6px;
+		border: 1px solid var(--border);
+		cursor: zoom-in;
 	}
 	.queued-tag {
 		font-size: 0.7rem;
@@ -1639,6 +1756,50 @@
 	}
 	.copy-md:active {
 		opacity: 1;
+	}
+	.attach-row {
+		display: flex;
+		gap: 0.5rem;
+		margin: 0 0.75rem 0.3rem;
+		overflow-x: auto;
+	}
+	.attach-chip {
+		position: relative;
+		flex: none;
+	}
+	.attach-chip img {
+		height: 56px;
+		width: auto;
+		border-radius: 6px;
+		border: 1px solid var(--border);
+		display: block;
+	}
+	.attach-x {
+		position: absolute;
+		top: -6px;
+		right: -6px;
+		width: 20px;
+		height: 20px;
+		min-height: 0;
+		padding: 0;
+		border-radius: 50%;
+		background: var(--bg-elev-2);
+		border: 1px solid var(--border);
+		color: var(--danger);
+		font-size: 0.65rem;
+		line-height: 1;
+	}
+	.attach-input {
+		display: none;
+	}
+	.attach-btn {
+		flex: none;
+		background: none;
+		border: none;
+		font-size: 1.1rem;
+		padding: 0.4rem 0.3rem;
+		min-height: 0;
+		align-self: flex-end;
 	}
 	.link-debug {
 		display: flex;

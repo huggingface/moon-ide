@@ -132,7 +132,16 @@ export type SessionSummary = {
 /** A rendered transcript row. The phone collapses the coder's
  * fine-grained event grammar into these visible kinds. */
 export type TranscriptRow =
-	| { kind: 'user'; id: string; text: string; queued: boolean; fromCoordinator: boolean }
+	| {
+			kind: 'user';
+			id: string;
+			text: string;
+			queued: boolean;
+			fromCoordinator: boolean;
+			/** Attached images as data URLs — rendered as thumbnails in
+			 * the bubble (tap opens the lightbox). */
+			images: string[];
+	  }
 	| { kind: 'assistant'; id: string; text: string; thinking: string }
 	| {
 			kind: 'tool';
@@ -1712,8 +1721,8 @@ class CompanionState {
 	/** Send a prompt to the session the phone has open. Targeted by
 	 * `session_id` so it can't land in whatever session the desktop
 	 * happens to have visible. */
-	async sendPrompt(text: string): Promise<void> {
-		if (!this.activeWorkspace || !this.activeSession || !text.trim()) {
+	async sendPrompt(text: string, images: { data_url: string; mime: string }[] = []): Promise<void> {
+		if (!this.activeWorkspace || !this.activeSession || (!text.trim() && images.length === 0)) {
 			return;
 		}
 		const entry: PendingSend = {
@@ -1736,7 +1745,16 @@ class CompanionState {
 				await this.ensureConnected();
 			}
 			this.busy = true;
-			await this.#call(this.activeWorkspace, 'coder_send', { text, session_id: this.activeSession }, this.activeIde);
+			// Images ride the same frame. They're deliberately NOT part
+			// of the pending-send persistence — base64 payloads would
+			// blow the localStorage quota; a failed send keeps the
+			// text resendable and drops the attachments.
+			await this.#call(
+				this.activeWorkspace,
+				'coder_send',
+				{ text, session_id: this.activeSession, images },
+				this.activeIde,
+			);
 		} catch (e) {
 			// NOT necessarily lost: a bridge forward timeout (IDE
 			// asleep / offline) often completes when the IDE wakes —
@@ -2059,6 +2077,18 @@ class CompanionState {
 		switch (ev.kind) {
 			case 'user_message': {
 				this.turnError = null;
+				const evImages = ev['images'];
+				const images: string[] = Array.isArray(evImages)
+					? evImages
+							.map((img: unknown) => {
+								if (img === null || typeof img !== 'object' || !('data_url' in img)) {
+									return '';
+								}
+								const url: unknown = img.data_url;
+								return typeof url === 'string' ? url : '';
+							})
+							.filter((url) => url.startsWith('data:image'))
+					: [];
 				// Confirmed delivery: clear any matching optimistic
 				// pending-send entry (incl. late arrivals after a
 				// forward timeout — the whole point of the row).
@@ -2075,6 +2105,7 @@ class CompanionState {
 					text: str(ev, 'text'),
 					queued: bool(ev, 'queued'),
 					fromCoordinator: bool(ev, 'from_coordinator'),
+					images,
 				});
 				break;
 			}

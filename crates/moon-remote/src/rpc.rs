@@ -284,7 +284,6 @@ impl BridgeRpcHandler for BridgeRpc {
 			}
 			"coder_send" => {
 				let p: SendParams = parse_params(params)?;
-				// Images aren't part of the phone composer yet.
 				// `session_id` (the session the phone has open) routes
 				// via `send_to_as_user` so the message can't land in
 				// whatever session the desktop happens to have visible
@@ -295,12 +294,12 @@ impl BridgeRpcHandler for BridgeRpc {
 					Some(sid) => {
 						self
 							.coder
-							.send_to_as_user(&sid, p.text, Vec::new())
+							.send_to_as_user(&sid, p.text, p.images)
 							.await
 							.map_err(|e| e.to_string())?;
 					}
 					None => {
-						self.coder.send(p.text, Vec::new()).await.map_err(|e| e.to_string())?;
+						self.coder.send(p.text, p.images).await.map_err(|e| e.to_string())?;
 					}
 				}
 				Ok(Value::Null)
@@ -795,6 +794,11 @@ struct SendParams {
 	/// active folder's visible session.
 	#[serde(default)]
 	session_id: Option<String>,
+	/// Pasted / attached images from the phone composer, in the
+	/// runner's `{data_url, mime}` shape. The runner re-encodes to
+	/// webp on ingest, same as the desktop path.
+	#[serde(default)]
+	images: Vec<moon_coder::ImageAttachment>,
 }
 
 #[derive(serde::Deserialize)]

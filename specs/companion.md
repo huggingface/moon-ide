@@ -291,6 +291,16 @@ requested surface:
   cache. Precondition visibility: the SCM card shows the resolved
   link base, and the session view shows a dashed "links off" row
   with a retry button when no repo URL is known.
+- **Image attachments.** The composer takes images two ways: paste
+  (desktop browsers) and a 📷 button (mobile: photo library /
+  camera via a file input). Client-side downscale to ≤1600 px +
+  webp (jpeg fallback on Safari) before the base64 rides
+  `coder_send`'s `images` field; the runner re-encodes on ingest as
+  usual. Thumbnails with remove buttons above the composer; sent
+  user bubbles render the images inline (tap opens the lightbox),
+  live and on replay. Attachments are not part of the
+  pending-send persistence (localStorage quota) — a failed send
+  keeps the text, drops the images.
 - **Run / steer coder sessions.** Subscribe to `coder:event`,
   render the transcript, `coder_send` (send / steer), `coder_abort`.
   Opening a session is **windowed** (`coder_open_session` with
