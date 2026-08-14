@@ -641,6 +641,8 @@ struct Session {
 	/// compact before sending. `None` until the very first
 	/// response lands.
 	last_usage: Option<TokenUsage>,
+	/// See [`SessionCacheStats`]. Reset only with the session.
+	cache_stats: SessionCacheStats,
 	/// In-memory todo list maintained by the agent's `todo_write`
 	/// tool. Survives compaction (the messages prefix gets
 	/// folded; the plan does not) and is reset only when the user
@@ -784,6 +786,7 @@ impl Session {
 			persisted_records: 0,
 			auto_rename_pending: false,
 			last_usage: None,
+			cache_stats: SessionCacheStats::default(),
 			todos: Vec::new(),
 			pending_steers: Vec::new(),
 			last_turn_diff: None,
@@ -1384,9 +1387,12 @@ impl CoderHandle {
 				.map(|(id, rt)| (id.clone(), rt.clone()))
 				.collect();
 			for (session_id, rt) in runtimes {
-				let usage = match rt.session.lock().await.last_usage {
-					Some(u) => u,
-					None => continue,
+				let (usage, cache_stats) = {
+					let session = rt.session.lock().await;
+					match session.last_usage {
+						Some(u) => (u, session.cache_stats),
+						None => continue,
+					}
 				};
 				let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), session_id);
 				sink.send(CoderEvent::TokenUsage {
@@ -1397,6 +1403,8 @@ impl CoderHandle {
 					source: TokenUsageSource::Provider,
 					cache_read_tokens: usage.cache_read_input_tokens,
 					cache_creation_tokens: usage.cache_creation_input_tokens,
+					session_cache_hits: cache_stats.hits,
+					session_requests: cache_stats.requests,
 				});
 			}
 		}
@@ -2523,6 +2531,7 @@ impl CoderHandle {
 			messages,
 			last_usage,
 			last_todos,
+			cache_stats,
 		} = Self::rebuild_messages_from_records(&records);
 
 		// Mutate the existing runtime in place. We keep the same
@@ -2532,6 +2541,7 @@ impl CoderHandle {
 			let mut session = rt.session.lock().await;
 			session.messages = messages;
 			session.last_usage = last_usage;
+			session.cache_stats = cache_stats;
 			session.todos = last_todos;
 			session.persisted_records = records.len() as u32;
 			session.header.updated_at_ms = current_time_ms();
@@ -2814,6 +2824,7 @@ impl CoderHandle {
 		}];
 		let mut last_usage: Option<TokenUsage> = None;
 		let mut last_todos: Vec<crate::TodoItem> = Vec::new();
+		let mut cache_stats = SessionCacheStats::default();
 		for record in records {
 			match record {
 				SessionRecord::WorkerDetached { .. } => {}
@@ -2858,13 +2869,15 @@ impl CoderHandle {
 					cache_read_input_tokens,
 					cache_creation_input_tokens,
 				} => {
-					last_usage = Some(TokenUsage {
+					let usage = TokenUsage {
 						prompt_tokens: *prompt_tokens,
 						completion_tokens: *completion_tokens,
 						total_tokens: *total_tokens,
 						cache_read_input_tokens: *cache_read_input_tokens,
 						cache_creation_input_tokens: *cache_creation_input_tokens,
-					});
+					};
+					cache_stats.record(&usage);
+					last_usage = Some(usage);
 				}
 				SessionRecord::TodosUpdate { todos } => {
 					last_todos = todos.clone();
@@ -2887,6 +2900,7 @@ impl CoderHandle {
 			messages,
 			last_usage,
 			last_todos,
+			cache_stats,
 		}
 	}
 
@@ -3221,6 +3235,7 @@ impl CoderHandle {
 			mut messages,
 			last_usage,
 			last_todos,
+			cache_stats,
 		} = Self::rebuild_messages_from_records(&records);
 		// Orphan tool calls = Assistant tool_calls that never got
 		// a matching `Tool` record (user stopped mid-tool, IDE
@@ -3360,6 +3375,7 @@ impl CoderHandle {
 				// compaction-before-send guard on the very next
 				// prompt.
 				last_usage,
+				cache_stats,
 				todos: last_todos,
 				pending_steers: Vec::new(),
 				last_turn_diff: None,
@@ -3531,6 +3547,8 @@ impl CoderHandle {
 			source: restore_source,
 			cache_read_tokens: restore_cache_read,
 			cache_creation_tokens: restore_cache_creation,
+			session_cache_hits: cache_stats.hits,
+			session_requests: cache_stats.requests,
 		});
 		// Clear the busy state on the frontend. Replayed `UserMessage`
 		// events flip `coder.busy = true` (mirroring the live-turn
@@ -4150,6 +4168,7 @@ impl CoderHandle {
 			mut messages,
 			last_usage,
 			last_todos,
+			cache_stats: _,
 		} = Self::rebuild_messages_from_records(&records);
 		// The rebuild seeds the parent's system prompt; swap in the
 		// sub-agent's own (mode + target folder + original task).
@@ -5066,6 +5085,28 @@ struct RebuiltMessages {
 	messages: Vec<ChatMessage>,
 	last_usage: Option<TokenUsage>,
 	last_todos: Vec<crate::TodoItem>,
+	cache_stats: SessionCacheStats,
+}
+
+/// Session-lifetime prompt-cache scoreboard: `hits` counts
+/// provider-reported round-trips whose `cache_read > 0`,
+/// `requests` counts all provider-reported round-trips. Estimate
+/// fallbacks don't move either counter. Rebuilt from persisted
+/// `Usage` records on reopen, so the numbers survive restarts and
+/// work retroactively on old sessions.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SessionCacheStats {
+	pub(crate) hits: u32,
+	pub(crate) requests: u32,
+}
+
+impl SessionCacheStats {
+	fn record(&mut self, usage: &TokenUsage) {
+		self.requests += 1;
+		if usage.cache_read_input_tokens > 0 {
+			self.hits += 1;
+		}
+	}
 }
 
 /// Where a [`Coder::send`] actually landed, resolved when the send
@@ -5683,7 +5724,10 @@ async fn run_turn(
 		// otherwise replay re-inflates the full pre-compaction
 		// transcript and the next turn instantly trips the
 		// provider's context-length cap.
-		let last_usage = rt.session.lock().await.last_usage;
+		let (last_usage, cache_stats_snapshot) = {
+			let session = rt.session.lock().await;
+			(session.last_usage, session.cache_stats)
+		};
 		let mut messages = rt.session.lock().await.messages.clone();
 		// Image budget planning runs *before* compaction (ADR 0049):
 		// compaction's in-session summary call replays the elision
@@ -5828,6 +5872,8 @@ async fn run_turn(
 			source: TokenUsageSource::Estimate,
 			cache_read_tokens: 0,
 			cache_creation_tokens: 0,
+			session_cache_hits: cache_stats_snapshot.hits,
+			session_requests: cache_stats_snapshot.requests,
 		});
 		// `Mutex` rather than `Cell` because the future the
 		// closure participates in is required to be `Send` —
@@ -5860,6 +5906,7 @@ async fn run_turn(
 							delta.len(),
 							prompt_estimate,
 							context_window,
+							cache_stats_snapshot,
 						);
 					}
 					StreamEvent::ThinkingDelta { delta } => {
@@ -5885,6 +5932,7 @@ async fn run_turn(
 							delta.len(),
 							prompt_estimate,
 							context_window,
+							cache_stats_snapshot,
 						);
 					}
 					// Tool-call deltas are intentionally not surfaced.
@@ -5928,6 +5976,9 @@ async fn run_turn(
 			// when missing so the threshold check still has a
 			// number to compare against.
 			let mut session = rt.session.lock().await;
+			if let Some(u) = response.usage {
+				session.cache_stats.record(&u);
+			}
 			session.last_usage = Some(response.usage.unwrap_or_else(|| {
 				let prompt = estimate_prompt_tokens(&messages);
 				let completion = estimate_completion_tokens(&response);
@@ -5957,7 +6008,8 @@ async fn run_turn(
 		// numbers are exact; falls back to a bytes/4 estimate when
 		// the provider didn't emit a streaming usage chunk so the
 		// ring still moves on every turn.
-		emit_token_usage(sink, &models, &standard_model, &messages, &response);
+		let cache_stats_now = rt.session.lock().await.cache_stats;
+		emit_token_usage(sink, &models, &standard_model, &messages, &response, cache_stats_now);
 
 		// Always emit `End` *if* we ever started a bubble and the
 		// final response actually carries something to render;
@@ -6201,11 +6253,24 @@ done, what's still unfinished, and any uncertainty. If the user needs to take a 
 		});
 	}
 
+	let cache_stats_now = {
+		let mut session = rt.session.lock().await;
+		if let Some(u) = response.usage {
+			session.cache_stats.record(&u);
+		}
+		if !response_is_empty {
+			session.messages.push(response_to_message(&response));
+		}
+		session.cache_stats
+	};
 	if !response_is_empty {
-		rt.session.lock().await.messages.push(response_to_message(&response));
 		persist_assistant_record(rt, &response, Some(pi_model)).await;
 	}
-	emit_token_usage(sink, &models, &standard_model, &messages, &response);
+	// Persist the usage record here too — this path's round-trip
+	// must fold into the session cache scoreboard on reopen just
+	// like the main loop's.
+	persist_usage_record(rt, &response).await;
+	emit_token_usage(sink, &models, &standard_model, &messages, &response, cache_stats_now);
 
 	Ok(())
 }
@@ -10413,6 +10478,7 @@ pub(crate) fn emit_token_usage(
 	model_slug: &str,
 	messages: &[ChatMessage],
 	response: &AssistantResponse,
+	cache_stats: SessionCacheStats,
 ) {
 	let context_window = models.context_window(model_slug);
 	let (prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_creation_tokens, source) =
@@ -10446,6 +10512,8 @@ pub(crate) fn emit_token_usage(
 		source,
 		cache_read_tokens,
 		cache_creation_tokens,
+		session_cache_hits: cache_stats.hits,
+		session_requests: cache_stats.requests,
 	});
 }
 
@@ -10463,6 +10531,7 @@ fn maybe_emit_stream_usage(
 	delta_len: usize,
 	prompt_estimate: u32,
 	context_window: u32,
+	cache_stats: SessionCacheStats,
 ) {
 	let len = u32::try_from(delta_len).unwrap_or(u32::MAX);
 	let now = std::time::Instant::now();
@@ -10490,6 +10559,8 @@ fn maybe_emit_stream_usage(
 		source: TokenUsageSource::Estimate,
 		cache_read_tokens: 0,
 		cache_creation_tokens: 0,
+		session_cache_hits: cache_stats.hits,
+		session_requests: cache_stats.requests,
 	});
 }
 

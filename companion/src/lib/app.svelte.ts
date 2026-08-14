@@ -164,7 +164,16 @@ export type TranscriptRow =
 			answered: boolean;
 	  }
 	| { kind: 'diff'; id: string; files: string[]; diff: string }
-	| { kind: 'tokens'; id: string; total: number; contextWindow: number; promptTokens: number; cacheRead: number }
+	| {
+			kind: 'tokens';
+			id: string;
+			total: number;
+			contextWindow: number;
+			promptTokens: number;
+			cacheRead: number;
+			sessionHits: number;
+			sessionReqs: number;
+	  }
 	| {
 			kind: 'compaction';
 			id: string;
@@ -518,7 +527,7 @@ class CompanionState {
 	 * from the transcript's tokens row (updated in place by the
 	 * `token_usage` event handler). The SessionView renders this in
 	 * a sticky bar so it stays visible during streaming. */
-	get tokenUsage(): { total: number; contextWindow: number; pct: number; cachedPct: number } | null {
+	get tokenUsage(): { total: number; contextWindow: number; pct: number; cacheScore: string | null } | null {
 		const row = this.rows.findLast((r) => r.kind === 'tokens');
 		if (!row || row.kind !== 'tokens' || row.total === 0) {
 			return null;
@@ -527,11 +536,10 @@ class CompanionState {
 			total: row.total,
 			contextWindow: row.contextWindow,
 			pct: row.contextWindow > 0 ? Math.round((row.total / row.contextWindow) * 100) : 0,
-			// Share of the prompt served from the provider's cache
-			// on the last round-trip — the "am I getting cached?"
-			// tell for HF/OpenRouter/Anthropic routes. 0 when the
-			// provider doesn't report it.
-			cachedPct: row.promptTokens > 0 ? Math.round((row.cacheRead / row.promptTokens) * 100) : 0,
+			// Session-lifetime scoreboard: provider round-trips that
+			// hit the prompt cache out of all made — "is caching
+			// working for this session?", not just the last request.
+			cacheScore: row.sessionReqs > 0 ? `${row.sessionHits}/${row.sessionReqs}` : null,
 		};
 	}
 
@@ -2254,8 +2262,12 @@ class CompanionState {
 				// Estimate events (bytes/4 fallback between provider
 				// reports) hardcode the cache fields to 0 — updating
 				// from them makes the ⚡ indicator flicker mid-turn.
-				// Keep the last provider-reported split instead.
+				// Keep the last provider-reported split instead. The
+				// session scoreboard is monotonic and rides every
+				// event, so it updates unconditionally.
 				const isEstimate = str(ev, 'source') === 'estimate';
+				const sessionHits = num(ev, 'session_cache_hits');
+				const sessionReqs = num(ev, 'session_requests');
 				if (total > 0) {
 					// Update the existing tokens row in place rather
 					// than appending a new one each time — the coder
@@ -2265,6 +2277,8 @@ class CompanionState {
 					if (existing && existing.kind === 'tokens') {
 						existing.total = total;
 						existing.contextWindow = ctx;
+						existing.sessionHits = sessionHits;
+						existing.sessionReqs = sessionReqs;
 						if (!isEstimate) {
 							existing.promptTokens = promptTokens;
 							existing.cacheRead = cacheRead;
@@ -2276,6 +2290,8 @@ class CompanionState {
 							total,
 							promptTokens,
 							cacheRead,
+							sessionHits,
+							sessionReqs,
 							contextWindow: ctx,
 						});
 					}

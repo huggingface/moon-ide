@@ -617,8 +617,15 @@ the workspace has no enabled servers, and neither is mode-gated
   128k for models that ship 1M); the unknown-model cold-start
   fallback is 256k. Cache visibility: OpenAI-style
   `prompt_tokens_details.cached_tokens` folds into
-  `cache_read_input_tokens`, so the usage surfaces (desktop ring,
-  companion ⚡ indicator) show the cached share on HF routes too.
+  `cache_read_input_tokens`, so cache reporting works on HF routes too.
+  The `token_usage` event also carries a session-lifetime scoreboard
+  (`session_cache_hits` / `session_requests`: provider-reported
+  round-trips that hit the cache out of all made, folded from
+  persisted `Usage` records on reopen, bumped live) — the desktop
+  ring and companion token bar render it as `⚡hits/requests`, so
+  "is caching working for this session?" doesn't depend on the last
+  request alone. Sub-agent inner usage events carry `0/0` (no
+  scoreboard).
   HF-route requests carry `X-HF-Session-Id` (a UUID derived from the
   session/sub-agent id, task-local-scoped around each turn) so the
   router pins fireworks-ai's replica-local prompt cache per session

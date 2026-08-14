@@ -1769,6 +1769,15 @@ export type CoderEvent =
 			 */
 			cache_read_tokens: number;
 			cache_creation_tokens: number;
+			/**
+			 * Session-lifetime cache scoreboard: provider-reported
+			 * round-trips that hit the prompt cache out of all
+			 * provider-reported round-trips. Folded from persisted
+			 * usage records on reopen, bumped live. Both `0` when
+			 * nothing provider-reported happened yet.
+			 */
+			session_cache_hits: number;
+			session_requests: number;
 	  }
 	| { kind: 'compaction_started'; messages_compacted: number }
 	| { kind: 'compaction_progress'; chunks_done: number; chunks_total: number; summary_tokens: number }

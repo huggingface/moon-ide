@@ -788,8 +788,8 @@
 					<div class="token-fill" style="width: {Math.min(100, usage.pct)}%"></div>
 				</div>
 				<span class="token-detail"
-					>{usage.total.toLocaleString()} / {usage.contextWindow.toLocaleString()}{#if usage.cachedPct > 0}
-						· ⚡{usage.cachedPct}% cached{/if}</span
+					>{usage.total.toLocaleString()} / {usage.contextWindow.toLocaleString()}{#if usage.cacheScore}
+						· ⚡{usage.cacheScore} cached{/if}</span
 				>
 			</button>
 			{#if capOpen}

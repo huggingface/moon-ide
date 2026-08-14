@@ -1435,6 +1435,10 @@ fn emit_subagent_token_usage(
 			source,
 			cache_read_tokens,
 			cache_creation_tokens,
+			// Sub-agent pop-outs don't track a session scoreboard;
+			// 0/0 renders as "no data" on both frontends.
+			session_cache_hits: 0,
+			session_requests: 0,
 		},
 	));
 }

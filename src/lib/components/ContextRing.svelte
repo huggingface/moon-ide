@@ -45,15 +45,17 @@
 	// dasharray was in user units (≈ 47 at size 18); a 1 %
 	// ratio came out as a 0.47-unit dash that the round-cap
 	// geometry effectively erased.
-	// At-a-glance cache tell: the share of the last prompt served
-	// from the provider's cache. Rendered as a tiny ⚡ next to the
-	// ring (tooltip carries the exact split) — "am I getting
-	// cached?" shouldn't require a hover.
-	const cachedPct = $derived.by(() => {
-		if (!usage || usage.prompt <= 0 || usage.cacheReadTokens <= 0) {
-			return 0;
+	// At-a-glance cache tell: session-lifetime hit rate — how many
+	// provider round-trips hit the prompt cache out of all made.
+	// Rendered as a tiny ⚡hits/requests next to the ring (tooltip
+	// carries the last request's token split) — "is caching
+	// working?" shouldn't require a hover or depend on the last
+	// request alone.
+	const cacheScore = $derived.by(() => {
+		if (!usage || usage.sessionRequests <= 0) {
+			return null;
 		}
-		return Math.round((usage.cacheReadTokens / usage.prompt) * 100);
+		return `${usage.sessionCacheHits}/${usage.sessionRequests}`;
 	});
 
 	const stroke = $derived(Math.max(2, Math.round(size * 0.18)));
@@ -111,7 +113,10 @@
 			if (usage.cacheCreationTokens > 0) {
 				parts.push(`${formatKilo(usage.cacheCreationTokens)} written (+25%)`);
 			}
-			lines.push(`cache: ${parts.join(' · ')}`);
+			lines.push(`cache (last request): ${parts.join(' · ')}`);
+		}
+		if (usage.sessionRequests > 0) {
+			lines.push(`cache hits this session: ${usage.sessionCacheHits} of ${usage.sessionRequests} requests`);
 		}
 		if (compaction?.phase === 'running') {
 			const progress = compactionProgressLabel(compaction);
@@ -165,8 +170,8 @@
 			/>
 		{/if}
 	</svg>
-	{#if cachedPct > 0}
-		<span class="cache-tell" aria-hidden="true">⚡{cachedPct}%</span>
+	{#if cacheScore}
+		<span class="cache-tell" aria-hidden="true">⚡{cacheScore}</span>
 	{/if}
 </span>
 

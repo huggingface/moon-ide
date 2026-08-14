@@ -382,6 +382,16 @@ pub enum CoderEvent {
 		total_tokens: u32,
 		context_window: u32,
 		source: TokenUsageSource,
+		/// Session-lifetime cache scoreboard: how many provider-
+		/// reported round-trips hit the prompt cache
+		/// (`cache_read > 0`) out of how many were made. Folded
+		/// from persisted `Usage` records on reopen, bumped live —
+		/// answers "is caching working for this session?" without
+		/// depending on the last request alone. Both `0` when the
+		/// session has no provider-reported round-trips yet (and on
+		/// sub-agent inner events, which don't track it).
+		session_cache_hits: u32,
+		session_requests: u32,
 		#[serde(default)]
 		cache_read_tokens: u32,
 		#[serde(default)]

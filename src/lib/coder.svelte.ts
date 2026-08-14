@@ -544,6 +544,12 @@ export type TokenUsageState = {
 	 *  billed. */
 	cacheReadTokens: number;
 	cacheCreationTokens: number;
+	/** Session-lifetime scoreboard: provider round-trips that hit
+	 *  the cache out of all provider round-trips. Drives the ⚡
+	 *  glyph next to the ring — "is caching working here at all?"
+	 *  across the whole session, not just the last request. */
+	sessionCacheHits: number;
+	sessionRequests: number;
 };
 
 /**
@@ -3722,6 +3728,8 @@ export class CoderPanelState {
 					source: event.source,
 					cacheReadTokens: event.cache_read_tokens,
 					cacheCreationTokens: event.cache_creation_tokens,
+					sessionCacheHits: event.session_cache_hits,
+					sessionRequests: event.session_requests,
 				};
 				return;
 			case 'compaction_started':
