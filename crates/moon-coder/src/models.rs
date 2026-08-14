@@ -317,21 +317,23 @@ impl CoderModels {
 	/// opened once (HF-only — user providers don't populate the
 	/// catalog).
 	///
-	/// User-set caps from
-	/// [`Self::context_window_overrides`] clamp the result with
-	/// `min(catalog, override)`. Lookup tries the full slug then
-	/// the suffix-stripped base — same precedence as the catalog
-	/// lookup, so a cap entered against `Qwen/...:scaleway`
-	/// applies to that slug only while a cap on the bare id
-	/// applies to every `:provider` flavour. Caps strictly
-	/// below `1` collapse to no cap (defensive against the
-	/// frontend persisting a `0` from a cleared input).
+	/// A user-set override from
+	/// [`Self::context_window_overrides`] is **authoritative** — it
+	/// can raise past the catalog as well as cap below it. Routers
+	/// routinely under-advertise (128k listed for models that ship
+	/// 1M), and the old `min(catalog, override)` made a wrong
+	/// catalog value impossible to correct from the UI. Lookup
+	/// tries the full slug then the suffix-stripped base — same
+	/// precedence as the catalog lookup, so an override entered
+	/// against `Qwen/...:scaleway` applies to that slug only while
+	/// one on the bare id applies to every `:provider` flavour.
+	/// Values strictly below `1` collapse to no override
+	/// (defensive against the frontend persisting a `0` from a
+	/// cleared input).
 	pub fn context_window(&self, slug: &str) -> u32 {
-		let actual = self.catalog_context_window(slug);
-		let cap = self.cap_for(slug).filter(|c| *c > 0);
-		match cap {
-			Some(c) => actual.min(c),
-			None => actual,
+		match self.cap_for(slug).filter(|c| *c > 0) {
+			Some(c) => c,
+			None => self.catalog_context_window(slug),
 		}
 	}
 
@@ -507,7 +509,7 @@ mod tests {
 	}
 
 	#[test]
-	fn user_cap_above_catalog_does_not_inflate_window() {
+	fn user_override_is_authoritative_in_both_directions() {
 		let mut models = CoderModels::default();
 		let mut cache = HashMap::new();
 		cache.insert("openai/gpt-4o-mini".to_owned(), 128_000u32);
@@ -516,9 +518,16 @@ mod tests {
 		caps.insert("openai/gpt-4o-mini".to_owned(), 1_000_000u32);
 		models.context_window_overrides = Arc::new(caps);
 
-		// `min(128k, 1M)` — capping above catalog is a no-op,
-		// not a window inflation.
-		assert_eq!(models.context_window("openai/gpt-4o-mini"), 128_000);
+		// An override *raises* past a stale/under-advertised catalog
+		// value (routers list 128k for models that ship 1M) — the
+		// old `min()` semantics made that impossible to correct.
+		assert_eq!(models.context_window("openai/gpt-4o-mini"), 1_000_000);
+
+		// …and still caps below the catalog.
+		let mut caps = HashMap::new();
+		caps.insert("openai/gpt-4o-mini".to_owned(), 64_000u32);
+		models.context_window_overrides = Arc::new(caps);
+		assert_eq!(models.context_window("openai/gpt-4o-mini"), 64_000);
 	}
 
 	#[test]

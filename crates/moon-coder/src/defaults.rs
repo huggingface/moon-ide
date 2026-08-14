@@ -128,9 +128,13 @@ pub fn context_window_for(model_slug: &str) -> u32 {
 	}
 	tracing::warn!(
 		model = model_slug,
-		"no context_window entry and router catalog not yet fetched; defaulting to 128k"
+		"no context_window entry and router catalog not yet fetched; defaulting to 256k"
 	);
-	128_000
+	// 256k, not the older 128k: current frontier models ship 256k–1M
+	// windows, and a too-small default fires compaction absurdly
+	// early. Still just a cold-start fallback — the router catalog
+	// (or a user override) takes over as soon as either exists.
+	256_000
 }
 
 /// Phase-6.2 system prompt. A real version that pulls in `AGENTS.md`

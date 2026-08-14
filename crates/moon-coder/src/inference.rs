@@ -517,21 +517,62 @@ pub struct ChatCompletionResponse {
 /// `cache_read_input_tokens` says "X of those were served from
 /// cache at the 90 % discount" and `cache_creation_input_tokens`
 /// says "Y of those were written to cache at a 25 % surcharge".
-/// Default `0` for every non-Anthropic provider (they don't emit
-/// the fields) and for Anthropic requests that didn't hit any
-/// cache yet.
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+/// Default `0` for providers that don't emit the fields and for
+/// requests that didn't hit any cache yet.
+///
+/// OpenAI-compatible routers (the HF router included) report the
+/// cached share as `prompt_tokens_details.cached_tokens` instead;
+/// the deserializer folds that into `cache_read_input_tokens` when
+/// the Anthropic-style field is absent, so "is my prompt cached?"
+/// reads the same everywhere downstream (usage ring, companion).
+#[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct TokenUsage {
-	#[serde(default)]
 	pub prompt_tokens: u32,
-	#[serde(default)]
 	pub completion_tokens: u32,
-	#[serde(default)]
 	pub total_tokens: u32,
-	#[serde(default)]
 	pub cache_read_input_tokens: u32,
-	#[serde(default)]
 	pub cache_creation_input_tokens: u32,
+}
+
+impl<'de> Deserialize<'de> for TokenUsage {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		#[derive(Default, Deserialize)]
+		struct Details {
+			#[serde(default)]
+			cached_tokens: u32,
+		}
+		#[derive(Deserialize)]
+		struct Raw {
+			#[serde(default)]
+			prompt_tokens: u32,
+			#[serde(default)]
+			completion_tokens: u32,
+			#[serde(default)]
+			total_tokens: u32,
+			#[serde(default)]
+			cache_read_input_tokens: u32,
+			#[serde(default)]
+			cache_creation_input_tokens: u32,
+			#[serde(default)]
+			prompt_tokens_details: Option<Details>,
+		}
+		let raw = Raw::deserialize(deserializer)?;
+		let openai_cached = raw.prompt_tokens_details.unwrap_or_default().cached_tokens;
+		Ok(TokenUsage {
+			prompt_tokens: raw.prompt_tokens,
+			completion_tokens: raw.completion_tokens,
+			total_tokens: raw.total_tokens,
+			cache_read_input_tokens: if raw.cache_read_input_tokens > 0 {
+				raw.cache_read_input_tokens
+			} else {
+				openai_cached
+			},
+			cache_creation_input_tokens: raw.cache_creation_input_tokens,
+		})
+	}
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1984,6 +2025,20 @@ mod provider_catalog {
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn openai_style_cached_tokens_fold_into_cache_read() {
+		// The HF router (OpenAI wire shape) reports the cached share
+		// under `prompt_tokens_details` — folded into the Anthropic-
+		// style field so downstream reads one place.
+		let raw = r#"{"prompt_tokens":4000,"completion_tokens":200,"total_tokens":4200,"prompt_tokens_details":{"cached_tokens":3210}}"#;
+		let usage: super::TokenUsage = serde_json::from_str(raw).unwrap();
+		assert_eq!(usage.cache_read_input_tokens, 3210);
+		// Anthropic-style field wins when both are present.
+		let both = r#"{"prompt_tokens":10,"cache_read_input_tokens":7,"prompt_tokens_details":{"cached_tokens":3}}"#;
+		let usage: super::TokenUsage = serde_json::from_str(both).unwrap();
+		assert_eq!(usage.cache_read_input_tokens, 7);
+	}
+
 	use super::*;
 
 	#[test]
@@ -2406,6 +2461,8 @@ mod tests {
 		// markers. We have to parse them or the breakdown goes
 		// silently to zero in the tooltip.
 		let raw = r#"{"prompt_tokens":4000,"completion_tokens":200,"total_tokens":4200,"cache_read_input_tokens":3500,"cache_creation_input_tokens":480}"#;
+		// (OpenAI-style `prompt_tokens_details.cached_tokens` is
+		// covered by `openai_style_cached_tokens_fold_into_cache_read`.)
 		let usage: TokenUsage = serde_json::from_str(raw).unwrap();
 		assert_eq!(usage.prompt_tokens, 4000);
 		assert_eq!(usage.cache_read_input_tokens, 3500);

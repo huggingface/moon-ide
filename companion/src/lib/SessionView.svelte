@@ -787,7 +787,10 @@
 				<div class="token-meter">
 					<div class="token-fill" style="width: {Math.min(100, usage.pct)}%"></div>
 				</div>
-				<span class="token-detail">{usage.total.toLocaleString()} / {usage.contextWindow.toLocaleString()}</span>
+				<span class="token-detail"
+					>{usage.total.toLocaleString()} / {usage.contextWindow.toLocaleString()}{#if usage.cachedPct > 0}
+						· ⚡{usage.cachedPct}% cached{/if}</span
+				>
 			</button>
 			{#if capOpen}
 				{@const ctx = app.contextCap}
@@ -913,7 +916,7 @@
 						<div class="thinking-body">{row.thinking}</div>
 					</details>
 				{/if}
-				{#if row.text}
+				{#if row.text.trim()}
 					<div class="bubble assistant">
 						<button class="copy-md" title="Copy raw markdown" onclick={() => void copyMarkdown(row.id, row.text)}
 							>{copiedMd === row.id ? '✓' : '⧉'}</button

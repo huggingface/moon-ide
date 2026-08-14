@@ -45,6 +45,17 @@
 	// dasharray was in user units (≈ 47 at size 18); a 1 %
 	// ratio came out as a 0.47-unit dash that the round-cap
 	// geometry effectively erased.
+	// At-a-glance cache tell: the share of the last prompt served
+	// from the provider's cache. Rendered as a tiny ⚡ next to the
+	// ring (tooltip carries the exact split) — "am I getting
+	// cached?" shouldn't require a hover.
+	const cachedPct = $derived.by(() => {
+		if (!usage || usage.prompt <= 0 || usage.cacheReadTokens <= 0) {
+			return 0;
+		}
+		return Math.round((usage.cacheReadTokens / usage.prompt) * 100);
+	});
+
 	const stroke = $derived(Math.max(2, Math.round(size * 0.18)));
 	const radius = $derived((size - stroke) / 2);
 	// Clamp the visible arc to at least 6 % of the ring whenever
@@ -154,6 +165,9 @@
 			/>
 		{/if}
 	</svg>
+	{#if cachedPct > 0}
+		<span class="cache-tell" aria-hidden="true">⚡{cachedPct}%</span>
+	{/if}
 </span>
 
 <style>
@@ -163,6 +177,13 @@
 		justify-content: center;
 		flex-shrink: 0;
 		line-height: 0;
+		gap: 2px;
+	}
+	.cache-tell {
+		font-size: 9px;
+		line-height: 1;
+		color: var(--m-fg-muted, #9aa3b9);
+		white-space: nowrap;
 	}
 	.track {
 		opacity: 0.18;

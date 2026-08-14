@@ -164,7 +164,7 @@ export type TranscriptRow =
 			answered: boolean;
 	  }
 	| { kind: 'diff'; id: string; files: string[]; diff: string }
-	| { kind: 'tokens'; id: string; total: number; contextWindow: number }
+	| { kind: 'tokens'; id: string; total: number; contextWindow: number; promptTokens: number; cacheRead: number }
 	| {
 			kind: 'compaction';
 			id: string;
@@ -518,7 +518,7 @@ class CompanionState {
 	 * from the transcript's tokens row (updated in place by the
 	 * `token_usage` event handler). The SessionView renders this in
 	 * a sticky bar so it stays visible during streaming. */
-	get tokenUsage(): { total: number; contextWindow: number; pct: number } | null {
+	get tokenUsage(): { total: number; contextWindow: number; pct: number; cachedPct: number } | null {
 		const row = this.rows.findLast((r) => r.kind === 'tokens');
 		if (!row || row.kind !== 'tokens' || row.total === 0) {
 			return null;
@@ -527,6 +527,11 @@ class CompanionState {
 			total: row.total,
 			contextWindow: row.contextWindow,
 			pct: row.contextWindow > 0 ? Math.round((row.total / row.contextWindow) * 100) : 0,
+			// Share of the prompt served from the provider's cache
+			// on the last round-trip — the "am I getting cached?"
+			// tell for HF/OpenRouter/Anthropic routes. 0 when the
+			// provider doesn't report it.
+			cachedPct: row.promptTokens > 0 ? Math.round((row.cacheRead / row.promptTokens) * 100) : 0,
 		};
 	}
 
@@ -2244,6 +2249,8 @@ class CompanionState {
 			case 'token_usage': {
 				const total = num(ev, 'total_tokens');
 				const ctx = num(ev, 'context_window');
+				const promptTokens = num(ev, 'prompt_tokens');
+				const cacheRead = num(ev, 'cache_read_tokens');
 				if (total > 0) {
 					// Update the existing tokens row in place rather
 					// than appending a new one each time — the coder
@@ -2253,11 +2260,15 @@ class CompanionState {
 					if (existing && existing.kind === 'tokens') {
 						existing.total = total;
 						existing.contextWindow = ctx;
+						existing.promptTokens = promptTokens;
+						existing.cacheRead = cacheRead;
 					} else {
 						rows.push({
 							kind: 'tokens',
 							id: nextRowId('tok'),
 							total,
+							promptTokens,
+							cacheRead,
 							contextWindow: ctx,
 						});
 					}

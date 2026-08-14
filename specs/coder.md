@@ -612,6 +612,13 @@ the workspace has no enabled servers, and neither is mode-gated
   subsequent round-trip. An image is re-sent for the rest of the
   session, so its bytes are paid once per turn, and the HF router
   caps a request body at 5 MiB. See [ADR 0049](decisions/0049-image-payload-budget.md).
+  A user context-window override is **authoritative** (raises past a
+  stale catalog value as well as capping below it — routers list
+  128k for models that ship 1M); the unknown-model cold-start
+  fallback is 256k. Cache visibility: OpenAI-style
+  `prompt_tokens_details.cached_tokens` folds into
+  `cache_read_input_tokens`, so the usage surfaces (desktop ring,
+  companion ⚡ indicator) show the cached share on HF routes too.
 - **Lifecycle**: spawned lazily on first use, kept alive across
   turns (a playwright browser session persists between calls),
   killed on disable / remove / IDE exit / a host↔container mode
