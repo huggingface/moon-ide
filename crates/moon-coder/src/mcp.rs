@@ -199,7 +199,7 @@ impl McpManager {
 		let result = self
 			.request(&conn, config, "tools/call", params, CALL_TIMEOUT, cancel)
 			.await?;
-		let text = spawn.host_paths(&render_content(&result, images_ok));
+		let text = cap_result_text(spawn.host_paths(&render_content(&result, images_ok)));
 		if result.get("isError").and_then(Value::as_bool).unwrap_or(false) {
 			return Err(CoderError::tool_failed("mcp_call", text));
 		}
@@ -652,6 +652,36 @@ impl McpConnection {
 /// context window.
 const IMAGE_MAX_BASE64_CHARS: usize = 2_000_000;
 
+/// Hard cap on the text projection of one `tools/call` result.
+/// Built-in tools each bound their own output (`bash` 64 kB,
+/// `read_file` / `web_fetch` 200 kB), but an MCP server can return
+/// anything — one 331 kB `browser_run_code_unsafe` dump once pinned
+/// a session's compaction keep-window above the compact threshold,
+/// wedging it into a compaction-per-turn loop. Only the text leg is
+/// capped; image blocks ride the typed `images` path and are never
+/// touched.
+const RESULT_TEXT_MAX_BYTES: usize = 100_000;
+
+/// Truncate an oversized result text at a char boundary and append
+/// a note telling the model how much was cut and how to get the
+/// rest, so it iterates with a narrower query instead of assuming
+/// it saw everything.
+fn cap_result_text(text: String) -> String {
+	if text.len() <= RESULT_TEXT_MAX_BYTES {
+		return text;
+	}
+	let mut cut = RESULT_TEXT_MAX_BYTES;
+	while cut > 0 && !text.is_char_boundary(cut) {
+		cut -= 1;
+	}
+	let total = text.len();
+	let mut out = text[..cut].to_string();
+	out.push_str(&format!(
+		"\n[mcp result truncated — {total} bytes total, first {cut} kept; narrow the query (filter, paginate, or aggregate server-side) and call again if you need the rest]"
+	));
+	out
+}
+
 /// Flatten a `tools/call` result's content blocks to the text the
 /// model reads. Text blocks pass through; image blocks become a
 /// one-line placeholder — the pixels themselves ride separately
@@ -1025,6 +1055,26 @@ rl.on('line', (line) => {
 		let text = render_content(&result, false);
 		assert!(text.contains("image not attached"));
 		assert!(text.contains("does not accept image input"));
+	}
+
+	#[test]
+	fn cap_result_text_passes_small_results_through() {
+		let text = "a".repeat(RESULT_TEXT_MAX_BYTES);
+		assert_eq!(cap_result_text(text.clone()), text);
+	}
+
+	#[test]
+	fn cap_result_text_truncates_at_char_boundary_with_note() {
+		// Multi-byte char straddling the cap: the cut must land on
+		// a boundary, not panic mid-codepoint.
+		let mut text = "a".repeat(RESULT_TEXT_MAX_BYTES - 1);
+		text.push('é');
+		text.push_str(&"z".repeat(50_000));
+		let out = cap_result_text(text.clone());
+		assert!(out.len() < text.len());
+		assert!(out.contains("[mcp result truncated"));
+		assert!(out.contains(&format!("{} bytes total", text.len())));
+		assert!(!out.contains('z'));
 	}
 
 	#[tokio::test]

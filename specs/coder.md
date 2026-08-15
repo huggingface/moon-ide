@@ -607,6 +607,14 @@ the workspace has no enabled servers, and neither is mode-gated
   pixels. The panel and companion render them as thumbnails with
   a full-size lightbox; JSON fallback views strip the `images`
   key so the base64 never dumps into a `<pre>`.
+- **Result text is capped at 100 kB** (`mcp.rs::RESULT_TEXT_MAX_BYTES`),
+  with a truncation note telling the model the total size and to
+  narrow the query. Built-in tools bound their own output, but an
+  MCP server can return anything, and one unbounded dump inside
+  the compaction keep-window can wedge a session into a
+  compaction-per-turn loop (a 331 kB `browser_run_code_unsafe`
+  result did exactly that). Image blocks are exempt — they ride
+  the typed `images` path, never the text projection.
 - **Captured PNGs are re-encoded to lossless WebP** before they
   enter the history — same pixels, ~40% fewer bytes on every
   subsequent round-trip. An image is re-sent for the rest of the
