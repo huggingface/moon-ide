@@ -1166,6 +1166,36 @@ non-standard vendor extension). If a real need surfaces, the viable
 path is client-side frame extraction into ordinary image attachments,
 which the existing pipeline and byte budget already handle.
 
+### Non-vision models
+
+Some models take no image input (DeepSeek, most Qwen text models);
+the HF router 400s the entire request when an `image_url` block
+reaches one. Capability is detected from the catalogs
+(`architecture.input_modalities` on the HF router and OpenRouter —
+model-level, no per-provider granularity; hardcoded `true` for
+Anthropic; unknown for vLLM/Ollama/LiteLLM) and cached per slug in
+`CoderModels::vision` alongside `context_windows`. Unknown is
+treated as vision-capable everywhere — wrongly stripping pixels
+from a capable model is worse than an explainable provider error.
+See [ADR 0069](decisions/0069-non-vision-models.md).
+
+Behaviour when the active model is known non-vision:
+
+- **Wire strip, history intact.** At request-encode time every
+  image block degrades to a
+  `[image omitted: the active model does not accept image input]`
+  text block. The session's stored attachments are untouched, so a
+  session with screenshots in history survives a switch to a
+  text-only model and restores the pixels on switching back.
+- **Tools say so up front.** `read_file` on an image errors instead
+  of attaching pixels; MCP `image` result blocks render as a
+  "not attached" note pointing at text alternatives (e.g. an
+  accessibility snapshot instead of a screenshot).
+- **UI.** The picker badges known non-vision models ("no vision",
+  not filtered — they're legitimate picks); the composer refuses
+  image pastes with a reason when
+  `CoderModelSettings.resolved_standard_supports_images` is `false`.
+
 ### Image byte budget
 
 Vision input is billed per tile, so images are cheap in tokens and

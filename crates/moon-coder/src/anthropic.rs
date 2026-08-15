@@ -1192,6 +1192,9 @@ pub async fn list_models(
 			context_length: m.max_input_tokens,
 			pricing_in_per_million: None,
 			pricing_out_per_million: None,
+			// The catalog doesn't advertise modalities, but every
+			// current Claude is vision-capable.
+			supports_image_input: Some(true),
 			description: None,
 		})
 		.collect();
@@ -1703,6 +1706,7 @@ mod tests {
 				context_length: m.max_input_tokens,
 				pricing_in_per_million: None,
 				pricing_out_per_million: None,
+				supports_image_input: Some(true),
 				description: None,
 			})
 			.collect();

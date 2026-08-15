@@ -52,6 +52,15 @@ pricing_in_per_million?: number | null,
  */
 pricing_out_per_million?: number | null, 
 /**
+ * Whether the model accepts image input. `Some` when the
+ * server advertises modalities (OpenRouter's
+ * `architecture.input_modalities`; hardcoded `true` for
+ * Anthropic, where every current Claude is vision-capable);
+ * `None` for servers that don't say (vLLM, Ollama, LiteLLM),
+ * which consumers treat as "assume yes".
+ */
+supports_image_input?: boolean | null, 
+/**
  * Short description when the server provides one. Capped to
  * the first ~200 chars at the parse boundary so a server
  * that ships a multi-paragraph README per model doesn't blow

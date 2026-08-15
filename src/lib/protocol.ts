@@ -1974,6 +1974,13 @@ export type CoderModelSettings = {
 	 *  HF pick → hardcoded default). Read-only: filled by the
 	 *  runner on read, ignored on write. */
 	resolved_standard_model: string;
+	/** Whether `resolved_standard_model` accepts image input, per
+	 *  the runner's catalog-derived vision map. Read-only, filled
+	 *  on read. `null`/missing = unknown (catalog not primed, or
+	 *  the provider doesn't advertise modalities) — the composer
+	 *  allows attaching then; the runner strips at the wire if it
+	 *  later learns better. */
+	resolved_standard_supports_images?: boolean | null;
 };
 
 /** Per-workspace lock on the coder's active provider. Mirrors
@@ -2024,6 +2031,13 @@ export type ProviderModelSummary = {
 	context_length?: number | null;
 	pricing_in_per_million?: number | null;
 	pricing_out_per_million?: number | null;
+	/**
+	 * Whether the model accepts image input. `Some` when the server
+	 * advertises modalities (OpenRouter) or the backend knows
+	 * (Anthropic → always true); `null`/missing = unknown, treated
+	 * as "assume yes".
+	 */
+	supports_image_input?: boolean | null;
 	description?: string | null;
 };
 
@@ -2038,6 +2052,13 @@ export type RouterModel = {
 	id: string;
 	owned_by: string;
 	supports_tools_anywhere: boolean;
+	/**
+	 * Whether the model accepts image input, from the router's
+	 * `architecture.input_modalities`. Model-level (no per-provider
+	 * granularity); `null`/missing = unknown, treated as "assume
+	 * yes".
+	 */
+	supports_image_input?: boolean | null;
 	providers: RouterProvider[];
 };
 

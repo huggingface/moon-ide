@@ -35,6 +35,15 @@ owned_by: string,
  */
 supports_tools_anywhere: boolean, 
 /**
+ * Whether the model accepts image input, per the router's
+ * `architecture.input_modalities`. Model-level — the router
+ * doesn't expose per-provider modality info. `None` when the
+ * catalog entry didn't carry the field; consumers treat that
+ * as "assume yes" (wrongly stripping images from a capable
+ * model is worse than an explainable provider error).
+ */
+supports_image_input?: boolean | null, 
+/**
  * Provider routes. Each entry corresponds to one of the
  * `:provider` suffixes the router accepts. The router's
  * "most-popular first" ordering is preserved here too.

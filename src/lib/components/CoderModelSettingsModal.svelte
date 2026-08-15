@@ -1413,6 +1413,14 @@
 													)} per M
 												</span>
 											{/if}
+											{#if row.supports_image_input === false}
+												<span
+													class="no-vision"
+													title="No image input — screenshots and pasted images won't reach this model"
+												>
+													no vision
+												</span>
+											{/if}
 											{#if row.owned_by}
 												<span class="flat-owner">{row.owned_by}</span>
 											{/if}
@@ -1446,6 +1454,14 @@
 									{#if !model.supports_tools_anywhere}
 										<span class="no-tools" title="No provider exposes tool calls — won't work as the standard model">
 											no tools
+										</span>
+									{/if}
+									{#if model.supports_image_input === false}
+										<span
+											class="no-vision"
+											title="No image input — screenshots and pasted images won't reach this model"
+										>
+											no vision
 										</span>
 									{/if}
 									<span class="model-summary">
@@ -1979,7 +1995,8 @@
 		color: var(--m-fg);
 		flex-shrink: 0;
 	}
-	.no-tools {
+	.no-tools,
+	.no-vision {
 		font-size: 9.5px;
 		color: var(--m-warning, #f0b86e);
 		text-transform: uppercase;

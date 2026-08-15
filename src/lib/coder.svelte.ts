@@ -1731,6 +1731,13 @@ export class CoderPanelState {
 		if (blob.size === 0) {
 			return { ok: false, reason: 'empty image' };
 		}
+		// Only refuse on a *known* non-vision model; unknown (catalog
+		// not primed) stays permissive — the runner strips at the
+		// wire as the real guard.
+		if (this.modelSettings?.resolved_standard_supports_images === false) {
+			const model = this.currentModelName || 'the active model';
+			return { ok: false, reason: `${model} does not accept image input` };
+		}
 		if (blob.size > CoderPanelState.IMAGE_MAX_BYTES) {
 			const limitMb = Math.round(CoderPanelState.IMAGE_MAX_BYTES / 1_000_000);
 			return { ok: false, reason: `image is ${formatBytes(blob.size)}; cap is ${limitMb} MB` };

@@ -94,6 +94,14 @@ pub struct CoderModels {
 	/// the whole [`CoderModels`] for snapshot reads a pointer copy
 	/// regardless of catalog size (~1k entries).
 	pub context_windows: Arc<HashMap<String, u32>>,
+	/// Model-id → image-input-support cache, populated from the
+	/// same catalog fetches as [`context_windows`](Self::context_windows)
+	/// (HF: `architecture.input_modalities`; OpenRouter: same
+	/// field; Anthropic: hardcoded `true`). Absent slug = unknown
+	/// — the wire encoder treats that as "supports images" because
+	/// wrongly stripping pixels from a capable model is worse than
+	/// an explainable provider error.
+	pub vision: Arc<HashMap<String, bool>>,
 	/// User-set per-slug context-window caps. Mirrors
 	/// [`moon_protocol::app_state::CoderAppState::context_window_overrides`]
 	/// at runtime. [`Self::context_window`] applies the cap with
@@ -112,6 +120,7 @@ impl Default for CoderModels {
 			providers: Vec::new(),
 			active_provider: None,
 			context_windows: Arc::new(HashMap::new()),
+			vision: Arc::new(HashMap::new()),
 			context_window_overrides: Arc::new(HashMap::new()),
 		}
 	}
@@ -366,6 +375,37 @@ impl CoderModels {
 		}
 		None
 	}
+
+	/// Whether `slug` accepts image input, per the catalog-derived
+	/// [`vision`](Self::vision) map. `None` = unknown (catalog not
+	/// primed, or the provider doesn't advertise modalities);
+	/// callers that have to decide treat unknown as "yes". Same
+	/// full-slug-then-suffix-stripped lookup as
+	/// [`context_window`](Self::context_window).
+	pub fn supports_images(&self, slug: &str) -> Option<bool> {
+		if let Some(&v) = self.vision.get(slug) {
+			return Some(v);
+		}
+		let base = strip_provider_suffix(slug);
+		if base != slug {
+			if let Some(&v) = self.vision.get(base) {
+				return Some(v);
+			}
+		}
+		None
+	}
+
+	/// [`supports_images`](Self::supports_images) for the active
+	/// standard model, short-circuiting the Anthropic route to
+	/// `Some(true)` — every current Claude is vision-capable and
+	/// Anthropic's catalog doesn't advertise modalities, so the
+	/// map alone would report unknown there.
+	pub fn standard_supports_images(&self) -> Option<bool> {
+		if matches!(self.resolve_route(), ResolvedProvider::Anthropic { .. }) {
+			return Some(true);
+		}
+		self.supports_images(self.standard())
+	}
 }
 
 /// Drop the `:provider` / `:fastest` / `:cheapest` / `:preferred`
@@ -414,6 +454,42 @@ pub fn context_windows_from_provider_catalog(catalog: &[ProviderModelSummary]) -
 /// catalog-fetch site so a route flip in the picker doesn't
 /// erase the previous route's windows.
 pub fn merge_context_windows(base: &HashMap<String, u32>, incoming: HashMap<String, u32>) -> Arc<HashMap<String, u32>> {
+	merge_slug_map(base, incoming)
+}
+
+/// Distill a catalog's image-input flags into the slug→vision map
+/// [`CoderModels::vision`] holds. Slugs whose catalog entry didn't
+/// advertise modalities are left out — absent means unknown, and
+/// unknown must stay distinguishable from `false`.
+pub fn vision_from_catalog(catalog: &[RouterModel]) -> HashMap<String, bool> {
+	let mut out = HashMap::with_capacity(catalog.len());
+	for m in catalog {
+		if let Some(v) = m.supports_image_input {
+			out.insert(m.id.clone(), v);
+		}
+	}
+	out
+}
+
+/// Same as [`vision_from_catalog`] but for a flat user-provider
+/// catalog (OpenRouter, Anthropic, …).
+pub fn vision_from_provider_catalog(catalog: &[ProviderModelSummary]) -> HashMap<String, bool> {
+	let mut out = HashMap::new();
+	for m in catalog {
+		if let Some(v) = m.supports_image_input {
+			out.insert(m.id.clone(), v);
+		}
+	}
+	out
+}
+
+/// Merge `incoming` slug→vision pairs into `base` — same semantics
+/// as [`merge_context_windows`].
+pub fn merge_vision(base: &HashMap<String, bool>, incoming: HashMap<String, bool>) -> Arc<HashMap<String, bool>> {
+	merge_slug_map(base, incoming)
+}
+
+fn merge_slug_map<V: Clone>(base: &HashMap<String, V>, incoming: HashMap<String, V>) -> Arc<HashMap<String, V>> {
 	if base.is_empty() {
 		return Arc::new(incoming);
 	}
@@ -447,6 +523,7 @@ mod tests {
 			context_length: ctx,
 			pricing_in_per_million: None,
 			pricing_out_per_million: None,
+			supports_image_input: None,
 			description: None,
 		}
 	}
@@ -476,6 +553,37 @@ mod tests {
 		assert_eq!(merged.get("Qwen/Qwen3.5-397B-A17B"), Some(&256_000));
 		assert_eq!(merged.get("anthropic/claude-opus-4"), Some(&1_000_000));
 		assert_eq!(merged.get("openai/gpt-4.1"), Some(&1_000_000));
+	}
+
+	#[test]
+	fn supports_images_lookup_strips_provider_suffix_and_reports_unknown() {
+		let mut models = CoderModels::default();
+		let mut cache = HashMap::new();
+		cache.insert("deepseek-ai/DeepSeek-V3".to_owned(), false);
+		cache.insert("Qwen/Qwen3-VL".to_owned(), true);
+		models.vision = Arc::new(cache);
+
+		assert_eq!(models.supports_images("deepseek-ai/DeepSeek-V3"), Some(false));
+		// `:provider`-suffixed slug falls back to the bare id —
+		// vision is model-level on the router.
+		assert_eq!(models.supports_images("deepseek-ai/DeepSeek-V3:novita"), Some(false));
+		assert_eq!(models.supports_images("Qwen/Qwen3-VL:fastest"), Some(true));
+		// Not in the catalog → unknown, not false.
+		assert_eq!(models.supports_images("mystery/model"), None);
+	}
+
+	#[test]
+	fn vision_from_provider_catalog_keeps_unknown_out_of_the_map() {
+		let mut vision_model = provider_summary("qwen2.5-vl", None);
+		vision_model.supports_image_input = Some(true);
+		let mut text_model = provider_summary("deepseek-chat", None);
+		text_model.supports_image_input = Some(false);
+		let unknown = provider_summary("llama3.2", None);
+
+		let map = vision_from_provider_catalog(&[vision_model, text_model, unknown]);
+		assert_eq!(map.get("qwen2.5-vl"), Some(&true));
+		assert_eq!(map.get("deepseek-chat"), Some(&false));
+		assert!(!map.contains_key("llama3.2"));
 	}
 
 	#[test]

@@ -49,6 +49,15 @@ pub struct RouterModel {
 	/// cheap call sites (auto-rename, branch-name suggester,
 	/// compaction summary) don't use tools.
 	pub supports_tools_anywhere: bool,
+	/// Whether the model accepts image input, per the router's
+	/// `architecture.input_modalities`. Model-level — the router
+	/// doesn't expose per-provider modality info. `None` when the
+	/// catalog entry didn't carry the field; consumers treat that
+	/// as "assume yes" (wrongly stripping images from a capable
+	/// model is worse than an explainable provider error).
+	#[serde(default)]
+	#[ts(optional, type = "boolean | null")]
+	pub supports_image_input: Option<bool>,
 	/// Provider routes. Each entry corresponds to one of the
 	/// `:provider` suffixes the router accepts. The router's
 	/// "most-popular first" ordering is preserved here too.
@@ -206,6 +215,16 @@ pub struct CoderModelSettings {
 	/// ignored on write.
 	#[serde(default)]
 	pub resolved_standard_model: String,
+	/// Whether [`resolved_standard_model`](Self::resolved_standard_model)
+	/// accepts image input, per the runner's catalog-derived vision
+	/// map. Read-only, filled on read like `resolved_standard_model`.
+	/// `None` = unknown (catalog not primed yet, or the provider
+	/// doesn't advertise modalities) — the composer allows attaching
+	/// in that case and the runner strips at the wire if it later
+	/// learns better.
+	#[serde(default)]
+	#[ts(optional, type = "boolean | null")]
+	pub resolved_standard_supports_images: Option<bool>,
 }
 
 /// Wire-protocol shape of one user-added provider. Three flavours:
@@ -404,6 +423,15 @@ pub struct ProviderModelSummary {
 	#[serde(default)]
 	#[ts(optional, type = "number | null")]
 	pub pricing_out_per_million: Option<f64>,
+	/// Whether the model accepts image input. `Some` when the
+	/// server advertises modalities (OpenRouter's
+	/// `architecture.input_modalities`; hardcoded `true` for
+	/// Anthropic, where every current Claude is vision-capable);
+	/// `None` for servers that don't say (vLLM, Ollama, LiteLLM),
+	/// which consumers treat as "assume yes".
+	#[serde(default)]
+	#[ts(optional, type = "boolean | null")]
+	pub supports_image_input: Option<bool>,
 	/// Short description when the server provides one. Capped to
 	/// the first ~200 chars at the parse boundary so a server
 	/// that ships a multi-paragraph README per model doesn't blow

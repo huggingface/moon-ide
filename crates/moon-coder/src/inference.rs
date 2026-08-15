@@ -289,13 +289,30 @@ impl CacheControl {
 	const EPHEMERAL: Self = Self { kind: "ephemeral" };
 }
 
+/// Text block substituted for each image attachment when the
+/// active model doesn't accept image input. Emitted in place so
+/// the model knows pixels existed at that position (and the user's
+/// transcript history keeps the real attachment — switching back
+/// to a vision model restores them on the next round-trip).
+const IMAGE_OMITTED_NOTE: &str = "[image omitted: the active model does not accept image input]";
+
 /// Build the wire message list from a slice of [`ChatMessage`]s,
 /// optionally attaching `cache_control: ephemeral` to the
 /// indexes listed in `cached_indexes`. Pass an empty slice to
 /// keep the original string-content shape — that's what every
 /// non-Anthropic round-trip does, so we keep the cheap path
 /// cheap.
-fn build_wire_messages<'a>(messages: &'a [ChatMessage], cached_indexes: &[usize]) -> Vec<WireMessage<'a>> {
+///
+/// `images_ok = false` strips every image attachment down to
+/// [`IMAGE_OMITTED_NOTE`] — the guard that keeps a session with
+/// screenshots in its history usable after a switch to a
+/// text-only model (the HF router 400s the whole request
+/// otherwise).
+fn build_wire_messages<'a>(
+	messages: &'a [ChatMessage],
+	cached_indexes: &[usize],
+	images_ok: bool,
+) -> Vec<WireMessage<'a>> {
 	let mut out = Vec::with_capacity(messages.len());
 	for (idx, msg) in messages.iter().enumerate() {
 		let cache_here = cached_indexes.contains(&idx);
@@ -304,7 +321,7 @@ fn build_wire_messages<'a>(messages: &'a [ChatMessage], cached_indexes: &[usize]
 				content: wire_text_content(content, cache_here),
 			},
 			ChatMessage::User { content, images } => WireMessage::User {
-				content: wire_user_content(content, images, cache_here),
+				content: wire_user_content(content, images, cache_here, images_ok),
 			},
 			ChatMessage::Assistant {
 				content, tool_calls, ..
@@ -325,7 +342,7 @@ fn build_wire_messages<'a>(messages: &'a [ChatMessage], cached_indexes: &[usize]
 				images,
 			} => WireMessage::Tool {
 				tool_call_id,
-				content: wire_tool_content(content, images, cache_here),
+				content: wire_tool_content(content, images, cache_here, images_ok),
 			},
 		};
 		out.push(wire);
@@ -351,7 +368,12 @@ fn wire_text_content(content: &str, cache_here: bool) -> WireContent<'_> {
 /// types `tool` content as string-only, but OpenRouter and the
 /// other OpenAI-compat routers we run through accept (and
 /// vision models consume) content-part arrays there.
-fn wire_tool_content<'a>(content: &'a str, images: &'a [ImageAttachment], cache_here: bool) -> WireContent<'a> {
+fn wire_tool_content<'a>(
+	content: &'a str,
+	images: &'a [ImageAttachment],
+	cache_here: bool,
+	images_ok: bool,
+) -> WireContent<'a> {
 	if images.is_empty() {
 		return wire_text_content(content, cache_here);
 	}
@@ -360,11 +382,7 @@ fn wire_tool_content<'a>(content: &'a str, images: &'a [ImageAttachment], cache_
 		text: content,
 		cache_control: cache_here.then_some(CacheControl::EPHEMERAL),
 	});
-	for img in images {
-		blocks.push(WireBlock::ImageUrl {
-			image_url: WireImageUrl { url: &img.data_url },
-		});
-	}
+	push_image_blocks(&mut blocks, images, images_ok);
 	WireContent::Blocks(blocks)
 }
 
@@ -373,7 +391,12 @@ fn wire_tool_content<'a>(content: &'a str, images: &'a [ImageAttachment], cache_
 /// marker to apply. The text block always lands first; images
 /// follow in attachment order. `cache_control` rides on the text
 /// block so the cache write captures the prose half of the turn.
-fn wire_user_content<'a>(content: &'a str, images: &'a [ImageAttachment], cache_here: bool) -> WireContent<'a> {
+fn wire_user_content<'a>(
+	content: &'a str,
+	images: &'a [ImageAttachment],
+	cache_here: bool,
+	images_ok: bool,
+) -> WireContent<'a> {
 	if images.is_empty() {
 		return wire_text_content(content, cache_here);
 	}
@@ -382,12 +405,27 @@ fn wire_user_content<'a>(content: &'a str, images: &'a [ImageAttachment], cache_
 		text: content,
 		cache_control: cache_here.then_some(CacheControl::EPHEMERAL),
 	});
-	for img in images {
-		blocks.push(WireBlock::ImageUrl {
-			image_url: WireImageUrl { url: &img.data_url },
-		});
-	}
+	push_image_blocks(&mut blocks, images, images_ok);
 	WireContent::Blocks(blocks)
+}
+
+/// One `image_url` block per attachment when the model takes
+/// images; one [`IMAGE_OMITTED_NOTE`] text block per attachment
+/// when it doesn't (per attachment, not one summary note, so the
+/// model can still count what it isn't seeing).
+fn push_image_blocks<'a>(blocks: &mut Vec<WireBlock<'a>>, images: &'a [ImageAttachment], images_ok: bool) {
+	for img in images {
+		if images_ok {
+			blocks.push(WireBlock::ImageUrl {
+				image_url: WireImageUrl { url: &img.data_url },
+			});
+		} else {
+			blocks.push(WireBlock::Text {
+				text: IMAGE_OMITTED_NOTE,
+				cache_control: None,
+			});
+		}
+	}
 }
 
 /// Build the error for a failed round-trip, and for the two
@@ -1057,6 +1095,18 @@ impl InferenceClient {
 		}
 	}
 
+	/// Whether `model` accepts image input, per the catalog-derived
+	/// vision map ([`CoderModels::supports_images`]). Unknown →
+	/// `true`: wrongly stripping pixels from a capable model is
+	/// worse than an explainable provider error. Consulted once per
+	/// round-trip on the OpenAI-compat path only — the Anthropic
+	/// branch never strips (every current Claude is vision-capable).
+	///
+	/// [`CoderModels::supports_images`]: crate::models::CoderModels::supports_images
+	async fn images_supported(&self, model: &str) -> bool {
+		self.models.read().await.supports_images(model).unwrap_or(true)
+	}
+
 	/// Cancel-aware wrapper around [`Authenticator::refresh_now`],
 	/// used on the 401-retry path. Same rationale as
 	/// [`resolve_route_or_abort`]: the refresh round trip is a bare
@@ -1116,7 +1166,14 @@ impl InferenceClient {
 			#[serde(default)]
 			owned_by: String,
 			#[serde(default)]
+			architecture: Option<RawArchitecture>,
+			#[serde(default)]
 			providers: Vec<RawProvider>,
+		}
+		#[derive(Deserialize)]
+		struct RawArchitecture {
+			#[serde(default)]
+			input_modalities: Vec<String>,
 		}
 		#[derive(Deserialize)]
 		struct RawProvider {
@@ -1157,10 +1214,16 @@ impl InferenceClient {
 				})
 				.collect();
 			let supports_tools_anywhere = providers.iter().any(|p| p.supports_tools);
+			// Vision is model-level on the router: `architecture`
+			// carries `input_modalities`, the per-provider entries
+			// don't. Absent architecture → `None` (unknown), which
+			// downstream treats as "assume yes".
+			let supports_image_input = m.architecture.map(|a| a.input_modalities.iter().any(|m| m == "image"));
 			out.push(RouterModel {
 				id: m.id,
 				owned_by: m.owned_by,
 				supports_tools_anywhere,
+				supports_image_input,
 				providers,
 			});
 		}
@@ -1295,9 +1358,10 @@ impl InferenceClient {
 		let mut route = route;
 		let endpoint = format!("{}/chat/completions", route.base_url);
 		let cache_indexes = cache_breakpoint_indexes(messages, &route, model);
+		let images_ok = self.images_supported(model).await;
 		let body = ChatCompletionRequest {
 			model,
-			messages: build_wire_messages(messages, &cache_indexes),
+			messages: build_wire_messages(messages, &cache_indexes, images_ok),
 			tools,
 			tool_choice: if tools.is_empty() { None } else { Some("auto") },
 			max_tokens: None,
@@ -1387,9 +1451,10 @@ impl InferenceClient {
 		let mut route = route;
 		let endpoint = format!("{}/chat/completions", route.base_url);
 		let cache_indexes = cache_breakpoint_indexes(messages, &route, model);
+		let images_ok = self.images_supported(model).await;
 		let body = ChatCompletionRequest {
 			model,
-			messages: build_wire_messages(messages, &cache_indexes),
+			messages: build_wire_messages(messages, &cache_indexes, images_ok),
 			tools,
 			tool_choice: if tools.is_empty() { None } else { Some("auto") },
 			max_tokens,
@@ -1925,6 +1990,17 @@ mod provider_catalog {
 		input_cost_per_million_tokens: Option<f64>,
 		#[serde(default)]
 		output_cost_per_million_tokens: Option<f64>,
+		/// OpenRouter shape: `{ input_modalities: ["text","image"], … }`.
+		/// Absent on vLLM / Ollama / LiteLLM — vision stays unknown
+		/// there.
+		#[serde(default)]
+		architecture: Option<RawArchitecture>,
+	}
+
+	#[derive(Deserialize)]
+	pub(super) struct RawArchitecture {
+		#[serde(default)]
+		input_modalities: Vec<String>,
 	}
 
 	#[derive(Deserialize)]
@@ -2001,6 +2077,9 @@ mod provider_catalog {
 				out
 			}
 		});
+		let supports_image_input = raw
+			.architecture
+			.map(|a| a.input_modalities.iter().any(|m| m == "image"));
 		ProviderModelSummary {
 			id: raw.id,
 			owned_by: raw.owned_by,
@@ -2008,6 +2087,7 @@ mod provider_catalog {
 			context_length,
 			pricing_in_per_million,
 			pricing_out_per_million,
+			supports_image_input,
 			description: description.filter(|s| !s.is_empty()),
 		}
 	}
@@ -2024,6 +2104,7 @@ mod provider_catalog {
 					"name": "Anthropic: Claude 3.5 Sonnet",
 					"context_length": 200000,
 					"pricing": {"prompt": "0.000003", "completion": "0.000015"},
+					"architecture": {"input_modalities": ["text", "image"], "output_modalities": ["text"]},
 					"description": "Anthropic's flagship..."
 				}]
 			}"#;
@@ -2034,6 +2115,20 @@ mod provider_catalog {
 			assert_eq!(row.context_length, Some(200_000));
 			assert!((row.pricing_in_per_million.unwrap() - 3.0).abs() < 1e-9);
 			assert!((row.pricing_out_per_million.unwrap() - 15.0).abs() < 1e-9);
+			assert_eq!(row.supports_image_input, Some(true));
+		}
+
+		#[test]
+		fn text_only_modalities_report_no_image_input() {
+			let raw = r#"{
+				"data": [{
+					"id": "deepseek/deepseek-chat",
+					"architecture": {"input_modalities": ["text"]}
+				}]
+			}"#;
+			let parsed: ListBody = serde_json::from_str(raw).unwrap();
+			let row = flatten(parsed.data.into_iter().next().unwrap());
+			assert_eq!(row.supports_image_input, Some(false));
 		}
 
 		#[test]
@@ -2047,6 +2142,8 @@ mod provider_catalog {
 			assert_eq!(row.owned_by.as_deref(), Some("library"));
 			assert!(row.pricing_in_per_million.is_none());
 			assert!(row.context_length.is_none());
+			// No `architecture` → vision unknown, not false.
+			assert!(row.supports_image_input.is_none());
 		}
 
 		#[test]
@@ -2425,7 +2522,7 @@ mod tests {
 				images: Vec::new(),
 			},
 		];
-		let wire = build_wire_messages(&messages, &[]);
+		let wire = build_wire_messages(&messages, &[], true);
 		let json = serde_json::to_string(&wire).unwrap();
 		assert!(json.contains(r#"{"role":"system","content":"sys"}"#));
 		assert!(json.contains(r#"{"role":"user","content":"hi"}"#));
@@ -2449,7 +2546,7 @@ mod tests {
 		];
 		// Mark system + tool (typical 2-breakpoint placement for
 		// an in-flight turn). User in between stays string-form.
-		let wire = build_wire_messages(&messages, &[0, 2]);
+		let wire = build_wire_messages(&messages, &[0, 2], true);
 		let json = serde_json::to_string(&wire).unwrap();
 		assert!(json
 			.contains(r#"{"role":"system","content":[{"type":"text","text":"sys","cache_control":{"type":"ephemeral"}}]}"#));
@@ -2472,7 +2569,7 @@ mod tests {
 				mime: "image/png".into(),
 			}],
 		}];
-		let wire = build_wire_messages(&messages, &[]);
+		let wire = build_wire_messages(&messages, &[], true);
 		let json = serde_json::to_string(&wire).unwrap();
 		assert!(json.contains(
 			r#""role":"tool","tool_call_id":"call_1","content":[{"type":"text","text":"[image file — image/png, attached]"},{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD"}}]"#
@@ -2491,7 +2588,7 @@ mod tests {
 				}],
 			},
 		];
-		let wire = build_wire_messages(&messages, &[]);
+		let wire = build_wire_messages(&messages, &[], true);
 		let json = serde_json::to_string(&wire).unwrap();
 		assert!(json.contains(r#"{"role":"system","content":"sys"}"#));
 		assert!(json.contains(
@@ -2508,10 +2605,41 @@ mod tests {
 				mime: "image/jpeg".into(),
 			}],
 		}];
-		let wire = build_wire_messages(&messages, &[0]);
+		let wire = build_wire_messages(&messages, &[0], true);
 		let json = serde_json::to_string(&wire).unwrap();
 		assert!(json.contains(r#""type":"text","text":"hi","cache_control":{"type":"ephemeral"}"#));
 		assert!(json.contains(r#""type":"image_url","image_url":{"url":"data:image/jpeg;base64,BBBB"}"#));
+	}
+
+	#[test]
+	fn wire_strips_images_to_text_notes_for_non_vision_models() {
+		// A session with screenshots in history must stay usable
+		// after switching to a text-only model: every image block
+		// (user attachment or tool result) degrades to the omission
+		// note instead of 400-ing the whole request.
+		let messages = vec![
+			ChatMessage::User {
+				content: "look".into(),
+				images: vec![ImageAttachment {
+					data_url: "data:image/png;base64,AAAA".into(),
+					mime: "image/png".into(),
+				}],
+			},
+			ChatMessage::Tool {
+				tool_call_id: "c1".into(),
+				content: "screenshot taken".into(),
+				images: vec![ImageAttachment {
+					data_url: "data:image/webp;base64,BBBB".into(),
+					mime: "image/webp".into(),
+				}],
+			},
+		];
+		let wire = build_wire_messages(&messages, &[], false);
+		let json = serde_json::to_string(&wire).unwrap();
+		assert!(!json.contains("image_url"));
+		assert!(!json.contains("AAAA"));
+		assert!(!json.contains("BBBB"));
+		assert_eq!(json.matches(IMAGE_OMITTED_NOTE).count(), 2);
 	}
 
 	#[test]
@@ -2524,7 +2652,7 @@ mod tests {
 			content: "hi".into(),
 			images: Vec::new(),
 		}];
-		let wire = build_wire_messages(&messages, &[]);
+		let wire = build_wire_messages(&messages, &[], true);
 		let json = serde_json::to_string(&wire).unwrap();
 		assert_eq!(json, r#"[{"role":"user","content":"hi"}]"#);
 	}

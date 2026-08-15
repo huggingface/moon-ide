@@ -181,6 +181,10 @@ impl McpManager {
 	/// thrown [`CoderError`] carrying the server's content — the
 	/// tool-error convention the loop already feeds back to the
 	/// model as `isError: true`.
+	/// `images_ok` gates the typed-image path: `false` (active model
+	/// takes no image input) renders image blocks as "not attached"
+	/// notes steering the model toward text alternatives, and skips
+	/// the attachment collection entirely.
 	pub async fn call_tool(
 		&self,
 		config: &McpServerConfig,
@@ -188,17 +192,22 @@ impl McpManager {
 		tool: &str,
 		args: Value,
 		cancel: &CancellationToken,
+		images_ok: bool,
 	) -> Result<Value, CoderError> {
 		let conn = self.connection(config, spawn, cancel).await?;
 		let params = json!({ "name": tool, "arguments": args });
 		let result = self
 			.request(&conn, config, "tools/call", params, CALL_TIMEOUT, cancel)
 			.await?;
-		let text = spawn.host_paths(&render_content(&result));
+		let text = spawn.host_paths(&render_content(&result, images_ok));
 		if result.get("isError").and_then(Value::as_bool).unwrap_or(false) {
 			return Err(CoderError::tool_failed("mcp_call", text));
 		}
-		let images = collect_images(&result).await;
+		let images = if images_ok {
+			collect_images(&result).await
+		} else {
+			Vec::new()
+		};
 		let mut out = json!({
 			"server": config.id,
 			"tool": tool,
@@ -646,9 +655,12 @@ const IMAGE_MAX_BASE64_CHARS: usize = 2_000_000;
 /// Flatten a `tools/call` result's content blocks to the text the
 /// model reads. Text blocks pass through; image blocks become a
 /// one-line placeholder — the pixels themselves ride separately
-/// (see [`collect_images`]); audio / resource blocks stay
-/// placeholders.
-fn render_content(result: &Value) -> String {
+/// (see [`collect_images`]) when `images_ok`, or not at all when
+/// the active model takes no image input (the placeholder then
+/// says so and points at text alternatives, e.g. playwright's
+/// accessibility snapshot instead of a screenshot); audio /
+/// resource blocks stay placeholders.
+fn render_content(result: &Value, images_ok: bool) -> String {
 	let Some(blocks) = result.get("content").and_then(Value::as_array) else {
 		return result.to_string();
 	};
@@ -662,7 +674,14 @@ fn render_content(result: &Value) -> String {
 			Some("image") => {
 				let mime = block.get("mimeType").and_then(Value::as_str).unwrap_or("image");
 				let bytes = block.get("data").and_then(Value::as_str).map(str::len).unwrap_or(0);
-				out.push_str(&format!("[{mime} image attached — ~{} kB]", bytes / 1000));
+				if images_ok {
+					out.push_str(&format!("[{mime} image attached — ~{} kB]", bytes / 1000));
+				} else {
+					out.push_str(&format!(
+						"[{mime} image not attached — the active model does not accept image input; use a text \
+						 alternative (e.g. an accessibility snapshot instead of a screenshot)]"
+					));
+				}
 			}
 			Some("resource") | Some("resource_link") => {
 				out.push_str(&format!(
@@ -894,7 +913,7 @@ rl.on('line', (line) => {
 		assert_eq!(tools[0].get("name").and_then(Value::as_str), Some("echo"));
 
 		let result = manager
-			.call_tool(&config, &spawn, "echo", json!({ "text": "hi" }), &cancel)
+			.call_tool(&config, &spawn, "echo", json!({ "text": "hi" }), &cancel, true)
 			.await
 			.expect("tools/call");
 		assert_eq!(result.get("content").and_then(Value::as_str), Some("echo: hi"));
@@ -903,7 +922,7 @@ rl.on('line', (line) => {
 		// folders, in order, and its unsupported request got a
 		// JSON-RPC "method not found" instead of hanging.
 		let roots = manager
-			.call_tool(&config, &spawn, "echo_roots", json!({}), &cancel)
+			.call_tool(&config, &spawn, "echo_roots", json!({}), &cancel, true)
 			.await
 			.expect("tools/call echo_roots");
 		assert_eq!(
@@ -912,7 +931,7 @@ rl.on('line', (line) => {
 		);
 
 		let err = manager
-			.call_tool(&config, &spawn, "nope", json!({}), &cancel)
+			.call_tool(&config, &spawn, "nope", json!({}), &cancel, true)
 			.await
 			.expect_err("isError result throws");
 		assert!(err.to_string().contains("no such tool"), "got: {err}");
@@ -969,7 +988,7 @@ rl.on('line', (line) => {
 		let cancel = CancellationToken::new();
 		let pid_of = async |manager: &McpManager| {
 			manager
-				.call_tool(&config, &spawn, "echo_pid", json!({}), &cancel)
+				.call_tool(&config, &spawn, "echo_pid", json!({}), &cancel, true)
 				.await
 				.expect("echo_pid")
 				.get("content")
@@ -996,9 +1015,16 @@ rl.on('line', (line) => {
 				{ "type": "image", "mimeType": "image/png", "data": "AAAA" },
 			]
 		});
-		let text = render_content(&result);
+		let text = render_content(&result, true);
 		assert!(text.starts_with("hello\n["));
 		assert!(text.contains("image/png"));
+		assert!(text.contains("image attached"));
+
+		// Same blocks for a text-only model: the placeholder flips
+		// to a "not attached" note steering toward text sources.
+		let text = render_content(&result, false);
+		assert!(text.contains("image not attached"));
+		assert!(text.contains("does not accept image input"));
 	}
 
 	#[tokio::test]

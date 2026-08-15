@@ -993,7 +993,13 @@ impl CoderHandle {
 		let models = models::shared(initial_models);
 		let inference = InferenceClient::new(auth.clone(), models.clone(), provider_keys.clone())?;
 		let web = crate::web::WebClient::new()?;
-		let tools = ToolRegistry::new(workspaces.clone(), workspaces_dir.clone(), web, terminals);
+		let tools = ToolRegistry::new(
+			workspaces.clone(),
+			workspaces_dir.clone(),
+			web,
+			terminals,
+			models.clone(),
+		);
 		let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 		let (running_turns, _) = watch::channel(0usize);
 		let folder_summaries = Arc::new(FolderSummaryService::new(folder_summaries_dir));
@@ -1304,15 +1310,20 @@ impl CoderHandle {
 		});
 	}
 
+	/// Warm the catalog-derived caches ([`CoderModels::context_windows`]
+	/// and [`CoderModels::vision`]) for the active route without
+	/// waiting for the picker to open.
 	pub async fn prime_context_windows(&self) {
 		let route = self.state.models.read().await.resolve_route();
 		match route {
 			ResolvedProvider::HuggingFace => match self.state.inference.list_hf_models().await {
 				Ok(catalog) => {
 					let windows = models::context_windows_from_catalog(&catalog);
+					let vision = models::vision_from_catalog(&catalog);
 					{
 						let mut m = self.state.models.write().await;
 						m.context_windows = models::merge_context_windows(&m.context_windows, windows);
+						m.vision = models::merge_vision(&m.vision, vision);
 					}
 					self.refresh_token_usage_windows().await;
 				}
@@ -1434,8 +1445,10 @@ impl CoderHandle {
 	pub async fn list_models(&self) -> Result<Vec<moon_protocol::coder_models::RouterModel>, CoderError> {
 		let catalog = self.state.inference.list_hf_models().await?;
 		let windows = models::context_windows_from_catalog(&catalog);
+		let vision = models::vision_from_catalog(&catalog);
 		let mut m = self.state.models.write().await;
 		m.context_windows = models::merge_context_windows(&m.context_windows, windows);
+		m.vision = models::merge_vision(&m.vision, vision);
 		Ok(catalog)
 	}
 
@@ -1474,9 +1487,11 @@ impl CoderHandle {
 			.list_provider_models(&base_url, api_key.as_deref(), kind)
 			.await?;
 		let windows = models::context_windows_from_provider_catalog(&catalog);
-		if !windows.is_empty() {
+		let vision = models::vision_from_provider_catalog(&catalog);
+		if !windows.is_empty() || !vision.is_empty() {
 			let mut m = self.state.models.write().await;
 			m.context_windows = models::merge_context_windows(&m.context_windows, windows);
+			m.vision = models::merge_vision(&m.vision, vision);
 		}
 		Ok(catalog)
 	}

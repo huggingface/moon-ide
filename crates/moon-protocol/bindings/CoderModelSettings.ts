@@ -62,4 +62,14 @@ provider_lock?: CoderProviderLock | null,
  * am I talking to" without duplicating the fallback logic;
  * ignored on write.
  */
-resolved_standard_model: string, };
+resolved_standard_model: string, 
+/**
+ * Whether [`resolved_standard_model`](Self::resolved_standard_model)
+ * accepts image input, per the runner's catalog-derived vision
+ * map. Read-only, filled on read like `resolved_standard_model`.
+ * `None` = unknown (catalog not primed yet, or the provider
+ * doesn't advertise modalities) — the composer allows attaching
+ * in that case and the runner strips at the wire if it later
+ * learns better.
+ */
+resolved_standard_supports_images?: boolean | null, };

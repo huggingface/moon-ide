@@ -759,6 +759,11 @@ pub struct ToolRegistry {
 	/// `list_terminals` / `read_terminal` see exactly what the user
 	/// sees (ADR 0048).
 	terminals: Arc<TerminalRegistry>,
+	/// Live model picks + catalog-derived capability caches. Tools
+	/// consult this at dispatch time (not turn start) so a mid-turn
+	/// model swap changes what the *next* image-producing tool call
+	/// does — same freshness discipline as the inference client.
+	models: crate::models::SharedCoderModels,
 }
 
 impl ToolRegistry {
@@ -767,6 +772,7 @@ impl ToolRegistry {
 		workspaces_dir: Utf8PathBuf,
 		web: WebClient,
 		terminals: Arc<TerminalRegistry>,
+		models: crate::models::SharedCoderModels,
 	) -> Self {
 		Self {
 			workspaces,
@@ -774,7 +780,17 @@ impl ToolRegistry {
 			web,
 			mcp: Arc::new(McpManager::default()),
 			terminals,
+			models,
 		}
+	}
+
+	/// Whether the active standard model accepts image input —
+	/// unknown counts as yes. Gates the image-producing tool
+	/// paths (`read_file` on an image, MCP image blocks) so a
+	/// text-only model gets an explanation instead of pixels it
+	/// can't see (which the wire encoder would strip anyway).
+	async fn images_supported(&self) -> bool {
+		self.models.read().await.standard_supports_images().unwrap_or(true)
 	}
 
 	/// Shared [`McpManager`]. Exposed so the Tauri command layer
@@ -1560,9 +1576,10 @@ impl ToolRegistry {
 		let server = self.mcp_enabled_server("mcp_call", &parsed.server).await?;
 		let spawn = self.mcp_spawn_target(cx).await;
 		let call_args = if parsed.args.is_null() { json!({}) } else { parsed.args };
+		let images_ok = self.images_supported().await;
 		self
 			.mcp
-			.call_tool(&server, &spawn, &parsed.tool, call_args, cancel)
+			.call_tool(&server, &spawn, &parsed.tool, call_args, cancel, images_ok)
 			.await
 	}
 
@@ -1647,13 +1664,22 @@ impl ToolRegistry {
 			ResolvedTarget::OutOfWorkspace { abs_path } => self.oow_read_file(abs_path, cx).await?,
 		};
 		if result.is_binary {
-			// Image files aren't an error: the model is
-			// vision-capable, so return the pixels as a typed
-			// image attachment (the runner's `images`
-			// convention) — reading back a playwright screenshot
-			// is the case this exists for. Other binaries keep
-			// the old hard error.
+			// Image files aren't an error when the model can see:
+			// return the pixels as a typed image attachment (the
+			// runner's `images` convention) — reading back a
+			// playwright screenshot is the case this exists for.
+			// A text-only model gets a hard error naming the cause
+			// instead, so it can adapt (describe the file path to
+			// the user, fall back to text alternatives) rather than
+			// believing it received a screenshot. Other binaries
+			// keep the old hard error.
 			if let Some(mime) = image_mime_for(&parsed.path) {
+				if !self.images_supported().await {
+					return Err(CoderError::tool_failed(
+						"read_file",
+						"image file, but the active model does not accept image input — work from text sources instead",
+					));
+				}
 				return self.read_image_result(&resolved, &parsed.path, mime, cx).await;
 			}
 			return Err(CoderError::tool_failed("read_file", "binary file"));
@@ -4132,7 +4158,13 @@ mod tests {
 			}
 			let terminals = Arc::new(TerminalRegistry::default());
 			let web = crate::web::WebClient::new().expect("web client builds in tests");
-			let tools = ToolRegistry::new(workspaces.clone(), Utf8PathBuf::from("/tmp"), web, terminals.clone());
+			let tools = ToolRegistry::new(
+				workspaces.clone(),
+				Utf8PathBuf::from("/tmp"),
+				web,
+				terminals.clone(),
+				crate::models::shared(crate::models::CoderModels::default()),
+			);
 			(paths, dirs, terminals, tools)
 		}
 
@@ -4240,7 +4272,13 @@ mod tests {
 			}
 			let workspaces_dir = Utf8PathBuf::from(paths[0].parent().unwrap_or(camino::Utf8Path::new("/tmp")));
 			let web = crate::web::WebClient::new().expect("web client builds in tests");
-			let tool_registry = ToolRegistry::new(registry.clone(), workspaces_dir, web, Arc::default());
+			let tool_registry = ToolRegistry::new(
+				registry.clone(),
+				workspaces_dir,
+				web,
+				Arc::default(),
+				crate::models::shared(crate::models::CoderModels::default()),
+			);
 			(registry, tool_registry)
 		}
 
@@ -4375,7 +4413,13 @@ mod tests {
 				.unwrap();
 			let workspaces_dir = Utf8PathBuf::from(parent_path.parent().unwrap());
 			let web = crate::web::WebClient::new().expect("web client builds in tests");
-			let tools = ToolRegistry::new(registry.clone(), workspaces_dir, web, Arc::default());
+			let tools = ToolRegistry::new(
+				registry.clone(),
+				workspaces_dir,
+				web,
+				Arc::default(),
+				crate::models::shared(crate::models::CoderModels::default()),
+			);
 			(registry, tools, parent)
 		}
 

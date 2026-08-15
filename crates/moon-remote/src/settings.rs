@@ -106,6 +106,7 @@ pub async fn get_model_settings(coder: &CoderHandle, ctx: &SettingsContext) -> R
 	let provider_lock = workspace_provider_lock(ctx).await;
 	// Resolve before the fields move out of `models` below.
 	let resolved_standard_model = models.standard().to_owned();
+	let resolved_standard_supports_images = models.standard_supports_images();
 	Ok(CoderModelSettings {
 		standard_model: models.standard,
 		cheap_model: models.cheap,
@@ -118,6 +119,7 @@ pub async fn get_model_settings(coder: &CoderHandle, ctx: &SettingsContext) -> R
 		context_window_overrides: (*models.context_window_overrides).clone(),
 		provider_lock,
 		resolved_standard_model,
+		resolved_standard_supports_images,
 	})
 }
 
