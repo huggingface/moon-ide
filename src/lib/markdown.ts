@@ -7,8 +7,10 @@ import DOMPurify from 'dompurify';
 // and `number` indexes the element type.
 type MdToken = ReturnType<typeof md.parse>[number];
 import { parse as parseYaml } from 'yaml';
+import { convertFileSrc } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { extractFenceLanguages, highlightCode, loadHighlighters } from './editor/highlightCode';
+import { ipc } from './ipc';
 
 // Markdown rendering pipeline. Intentionally narrow: we want a
 // preview that's safe to drop into `innerHTML`, not a full GitHub-
@@ -931,4 +933,76 @@ export function resolveMarkdownLink(currentPath: string, href: string): string |
 		return null;
 	}
 	return resolved.join('/');
+}
+
+/**
+ * Rewrite relative `<img src>` attributes in rendered markdown HTML
+ * to URLs the webview can actually load. A relative `src` would
+ * otherwise resolve against the app shell's origin and 404; here it
+ * resolves against the markdown file's own directory (same rules as
+ * `resolveMarkdownLink`, so `/foo.png` means workspace-root) and is
+ * swapped for a Tauri asset-protocol URL — the same streaming path
+ * `ImageView` uses for binary preview buffers.
+ *
+ * Runs on the *sanitised* HTML, per file, after the shared
+ * `renderMarkdown` cache: the cache is keyed by source text only,
+ * and two files in different directories with identical source must
+ * not share resolved image URLs.
+ *
+ * Absolute URLs (`https://…`, `data:…`) are left alone — DOMPurify
+ * already vetted their schemes. Unresolvable links (escape the
+ * workspace via `..`, bad `%`-encoding) and IPC failures keep the
+ * original `src`; the image shows as broken with its alt text, which
+ * is more honest than silently dropping it.
+ *
+ * `toUrl` is injectable for tests; production callers use the
+ * default (host `absolute_path` → `convertFileSrc`).
+ */
+export async function resolveMarkdownImages(
+	html: string,
+	currentPath: string,
+	toUrl: (workspacePath: string) => Promise<string | null> = workspaceImageUrl,
+): Promise<string> {
+	if (!html.includes('<img')) {
+		return html;
+	}
+	const doc = new DOMParser().parseFromString(html, 'text/html');
+	const images = Array.from(doc.querySelectorAll('img[src]'));
+	const rewrites = await Promise.all(
+		images.map(async (img) => {
+			const src = img.getAttribute('src') ?? '';
+			// `//host/path` is protocol-relative, not workspace-relative —
+			// skip it along with fully-absolute URLs.
+			if (src === '' || src.startsWith('//') || isAbsoluteUrl(src)) {
+				return false;
+			}
+			const workspacePath = resolveMarkdownLink(currentPath, src);
+			if (!workspacePath) {
+				return false;
+			}
+			const url = await toUrl(workspacePath);
+			if (!url) {
+				return false;
+			}
+			img.setAttribute('src', url);
+			return true;
+		}),
+	);
+	if (!rewrites.includes(true)) {
+		return html;
+	}
+	return doc.body.innerHTML;
+}
+
+async function workspaceImageUrl(workspacePath: string): Promise<string | null> {
+	try {
+		const absolute = await ipc.fs.absolutePath(workspacePath);
+		return convertFileSrc(absolute);
+	} catch {
+		return null;
+	}
+}
+
+function isAbsoluteUrl(value: string): boolean {
+	return URL.canParse(value);
 }

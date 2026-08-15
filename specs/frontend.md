@@ -113,6 +113,10 @@ Different jobs, different tools:
 
 The split matters because Pierre Diffs is display-only — forcing it to also edit would either duplicate CM's work or give us a second inferior editor. Keeping CM for every editable surface keeps "what works in the main editor" identical to "what works in the conflict editor".
 
+### Markdown preview images
+
+`MarkdownView.svelte` resolves relative `<img src>` in the rendered preview against the markdown file's own directory (`/foo.png` = workspace root, same rules as relative links) and rewrites them to asset-protocol URLs — the same streaming path the binary viewers use. The rewrite happens per file _after_ the shared render cache, which is keyed by source text only and must not leak resolved URLs across directories. Absolute `http(s)`/`data:` srcs pass through untouched; unresolvable ones (escape the root via `..`) stay as-is and render as broken images with their alt text. Untitled buffers skip resolution (no directory to resolve against).
+
 ### Binary file viewers
 
 `util/fileKind.ts` maps a path to a `FileKind` (`text` / `image` / `pdf` / `video`); anything not recognised as a previewable binary is `text`. All binary kinds open as **read-only preview buffers**: `OpenFile.text` stays empty, the bytes never round-trip through the editor, and the buffer carries a `previewUrl` (`convertFileSrc(absolutePath)` — a Tauri asset-protocol URL that streams the on-disk bytes through the active host). All the `kind === 'text'` guards (LSP `didOpen`, blame, HEAD seed, format-on-save, Save As) naturally skip them. Save As is refused with a toast — copying bytes through the host is unimplemented until someone asks.

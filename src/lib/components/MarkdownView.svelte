@@ -1,6 +1,12 @@
 <script lang="ts">
 	import { tick } from 'svelte';
-	import { handleMarkdownCopyClick, openExternalMarkdownLink, renderMarkdown, resolveMarkdownLink } from '../markdown';
+	import {
+		handleMarkdownCopyClick,
+		openExternalMarkdownLink,
+		renderMarkdown,
+		resolveMarkdownImages,
+		resolveMarkdownLink,
+	} from '../markdown';
 	import { isUntitledPath, workspace, type OpenFile, type SplitSide } from '../state.svelte';
 
 	type Props = { file: OpenFile; side: SplitSide };
@@ -16,8 +22,17 @@
 	$effect(() => {
 		let stale = false;
 		const source = file.text;
+		const path = file.path;
 		void (async () => {
-			const rendered = await renderMarkdown(source);
+			let rendered = await renderMarkdown(source);
+			// Relative image srcs are resolved per file, *after* the
+			// shared render cache — the cache is keyed by source text
+			// only and must not leak one file's resolved URLs into
+			// another directory's preview. Untitled buffers have no
+			// directory to resolve against.
+			if (!isUntitledPath(path)) {
+				rendered = await resolveMarkdownImages(rendered, path);
+			}
 			if (!stale) {
 				html = rendered;
 			}
