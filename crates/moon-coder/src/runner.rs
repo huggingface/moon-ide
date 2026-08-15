@@ -2132,6 +2132,52 @@ impl CoderHandle {
 		Ok((summary, workspace))
 	}
 
+	/// Mint a worker session that runs **in place** — directly
+	/// against an existing bound folder, with no worktree and no
+	/// branch of its own (`spawn_worker` with `worktree: false`,
+	/// ADR 0070). The session is filed under the folder's coder
+	/// root exactly like a worktree worker's would be; when the
+	/// target folder *is* a worktree (a follow-up worker inside an
+	/// existing worker's checkout), the worktree routing header is
+	/// stamped so tools route there. Agent-driven only — the
+	/// visible session is never touched.
+	async fn create_in_place_worker_session(
+		&self,
+		name: &str,
+		parent_folder: &str,
+		mode: CoderMode,
+	) -> Result<SessionSummary, CoderError> {
+		let parent = self
+			.state
+			.workspaces
+			.folder_for_path(parent_folder)
+			.await
+			.ok_or_else(|| CoderError::Internal(format!("no bound folder at `{parent_folder}`")))?;
+		let slug = worker_branch_slug(name).ok_or_else(|| {
+			CoderError::invalid_args(
+				"spawn_worker",
+				"name must contain at least one letter or digit — it becomes the worker's session title",
+			)
+		})?;
+		let root = self.state.coder_root_of(parent.clone()).await;
+		let fs = self.state.folder_session_for(Utf8Path::new(&root.folder.path)).await;
+		let mut blank = Session::new_blank_with_mode(mode);
+		// Same naming discipline as a worktree worker (ADR 0042):
+		// title + readable session id from the name; a pre-set
+		// title suppresses the auto-rename.
+		blank.header.title = slug.clone();
+		blank.header.id = new_named_session_id(&slug);
+		if let moon_protocol::workspace::FolderOrigin::Worktree { branch, .. } = &parent.folder.origin {
+			blank.header.worktree_root = Some(parent.folder.path.clone());
+			blank.header.worktree_branch = Some(branch.clone());
+		}
+		let summary = blank.summary();
+		let id = blank.header.id.clone();
+		let rt = Arc::new(SessionRuntime::new(blank));
+		fs.insert_runtime(id, rt).await;
+		Ok(summary)
+	}
+
 	/// Set the per-session bash-target override for the **visible
 	/// session** under the active folder. `force_host = true` pins
 	/// this session's `bash` + format-on-save subprocesses to the
@@ -2594,6 +2640,7 @@ impl CoderHandle {
 					ref target_folder,
 					ref mode,
 					ref worktree_root,
+					ref worker,
 					ref detached,
 				} => {
 					// The resume path refuses mid-turn (guard above), so
@@ -2606,6 +2653,7 @@ impl CoderHandle {
 						target_folder.clone(),
 						mode.clone(),
 						worktree_root.clone(),
+						*worker,
 						*detached,
 						false,
 					)
@@ -3142,6 +3190,7 @@ impl CoderHandle {
 					ref target_folder,
 					ref mode,
 					ref worktree_root,
+					ref worker,
 					ref detached,
 				} => {
 					let still_running = live_subagent_ids.contains(subagent_id.as_str());
@@ -3153,6 +3202,7 @@ impl CoderHandle {
 						target_folder.clone(),
 						mode.clone(),
 						worktree_root.clone(),
+						*worker,
 						*detached,
 						still_running,
 					)
@@ -6615,6 +6665,7 @@ async fn handle_task(
 			target_folder: spec.folder.folder.path.clone(),
 			mode: spec.mode.as_wire().to_string(),
 			worktree_root: None,
+			worker: false,
 			detached: false,
 		},
 	)
@@ -6733,8 +6784,10 @@ async fn find_session_folder(state: &Arc<CoderState>, session_id: &str) -> Optio
 }
 
 /// Fold a coordinator's records into its surviving fleet (ADR 0065):
-/// a worker is a `SubagentSpawned` carrying a `worktree_root` (`task`
-/// sub-agents never have one); a later `WorkerDetached` removes it.
+/// a worker is a `SubagentSpawned` carrying `worker: true` (`task`
+/// sub-agents never do); a later `WorkerDetached` removes it. The
+/// old discriminator (`worktree_root.is_some()`) broke once in-place
+/// workers existed — they have no worktree (ADR 0070).
 /// Order-preserving and duplicate-free.
 fn fold_worker_fleet(records: &[SessionRecord]) -> Vec<String> {
 	let mut fleet: Vec<String> = Vec::new();
@@ -6742,7 +6795,7 @@ fn fold_worker_fleet(records: &[SessionRecord]) -> Vec<String> {
 		match record {
 			SessionRecord::SubagentSpawned {
 				subagent_id,
-				worktree_root: Some(_),
+				worker: true,
 				..
 			} => {
 				if !fleet.contains(subagent_id) {
@@ -6830,6 +6883,7 @@ async fn handle_task_detached(
 				target_folder: spec.folder.folder.path.clone(),
 				mode: spec.mode.as_wire().to_string(),
 				worktree_root: None,
+				worker: false,
 				detached: true,
 			},
 		)
@@ -7240,12 +7294,25 @@ async fn handle_spawn_worker(
 		base_branch: Option<String>,
 		#[serde(default)]
 		folder: Option<String>,
+		#[serde(default)]
+		worktree: Option<bool>,
 	}
 	let parsed: SpawnWorkerArgs =
 		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("spawn_worker", err.to_string()))?;
 	let task = parsed.task.trim();
 	if task.is_empty() {
 		return Err(CoderError::invalid_args("spawn_worker", "task must not be empty"));
+	}
+	let use_worktree = parsed.worktree.unwrap_or(true);
+	// An in-place worker runs on whatever branch the shared tree
+	// has checked out — switching it to `base_branch` would yank
+	// the tree out from under the user (and any sibling in-place
+	// worker). Refuse the combination instead of guessing.
+	if !use_worktree && parsed.base_branch.is_some() {
+		return Err(CoderError::invalid_args(
+			"spawn_worker",
+			"base_branch requires a worktree — an in-place worker (worktree: false) works on the branch the folder already has checked out",
+		));
 	}
 	// The name becomes the branch / worktree / session chip (ADR
 	// 0042), so reject one that slugs to nothing rather than
@@ -7284,18 +7351,26 @@ async fn handle_spawn_worker(
 		}
 		None => sink.folder().to_string(),
 	};
-	// Mint the worker as an ordinary `Agent` session in a worktree.
-	// A sub-orchestrator would pass `Coordinator` here, but that's a
-	// later-scale concern; v1 workers are plain agents.
+	// Mint the worker as an ordinary `Agent` session — in a worktree
+	// (the default) or in place against the target folder itself
+	// (ADR 0070). A sub-orchestrator would pass `Coordinator` here,
+	// but that's a later-scale concern; v1 workers are plain agents.
 	let handle = CoderHandle { state: state.clone() };
-	let (summary, _workspace) = handle
-		.create_worktree_session(
-			parsed.base_branch,
-			Some(parsed.name),
-			CoderMode::Agent,
-			Some(parent_folder.clone()),
-		)
-		.await?;
+	let summary = if use_worktree {
+		handle
+			.create_worktree_session(
+				parsed.base_branch,
+				Some(parsed.name),
+				CoderMode::Agent,
+				Some(parent_folder.clone()),
+			)
+			.await?
+			.0
+	} else {
+		handle
+			.create_in_place_worker_session(&parsed.name, &parent_folder, CoderMode::Agent)
+			.await?
+	};
 	// `target_folder` is the worktree path the worker operates
 	// against — the same shape `SubagentSpawned.target_folder`
 	// carries for `task` sub-agents (their folder path), not the
@@ -7342,6 +7417,9 @@ async fn handle_spawn_worker(
 				target_folder: target_folder.clone(),
 				mode: CoderMode::Agent.as_wire().to_string(),
 				worktree_root: summary.worktree_root.clone(),
+				// The fleet-rebuild discriminator (ADR 0070) — an
+				// in-place worker has no worktree_root to fold on.
+				worker: true,
 				// A coordinator worker is a top-level session, not a
 				// detached `task` run — the flag stays off.
 				detached: false,
@@ -7355,6 +7433,7 @@ async fn handle_spawn_worker(
 		target_folder,
 		mode: CoderMode::Agent.as_wire().to_string(),
 		worktree_root: summary.worktree_root.clone(),
+		worker: true,
 		detached: false,
 	});
 	// Seed the worker with the task prompt. On failure, roll back the
@@ -7378,14 +7457,25 @@ async fn handle_spawn_worker(
 	}
 	// The worker's worktree just became a bound folder; the folder bar
 	// has no other way to learn about a bind it didn't initiate
-	// (ADR 0044).
-	sink.send(CoderEvent::WorkspaceFoldersChanged);
+	// (ADR 0044). An in-place worker binds nothing — skip the poke.
+	if use_worktree {
+		sink.send(CoderEvent::WorkspaceFoldersChanged);
+	}
 	let mut result = json!({
 		"worker_id": summary.id,
 		"branch": summary.worktree_branch,
 		"worktree_path": summary.worktree_root,
 		"title": summary.title,
 	});
+	if !use_worktree {
+		// Make the shared-tree situation explicit in the tool result
+		// so the coordinator doesn't reason as if the worker had an
+		// isolated checkout.
+		result.as_object_mut().expect("spawn result object").insert(
+			"in_place".into(),
+			json!("worker runs directly in the folder's checked-out tree — its edits and commits land on the current branch, alongside any other session working there"),
+		);
+	}
 	// The worktree rides its parent folder's bind mount — if the
 	// running container doesn't mount the parent (a repo created via
 	// `init_repo` / `clone_repo` after the container came up), tell
@@ -8165,7 +8255,7 @@ async fn handle_merge_worker_changes(state: &Arc<CoderState>, args: &Value) -> R
 	let Some(worktree_path) = worktree_root else {
 		return Err(CoderError::invalid_args(
 			"merge_worker_changes",
-			"worker has no worktree_root — cannot merge a non-worktree session",
+			"worker has no worktree — an in-place worker's commits land directly on the folder's checked-out branch, so there is nothing to merge",
 		));
 	};
 	let Some(branch) = worktree_branch else {
@@ -10241,6 +10331,7 @@ async fn replay_subagent_spawned(
 	target_folder: String,
 	mode: String,
 	worktree_root: Option<String>,
+	worker: bool,
 	detached: bool,
 	still_running: bool,
 ) {
@@ -10250,6 +10341,7 @@ async fn replay_subagent_spawned(
 		target_folder,
 		mode,
 		worktree_root,
+		worker,
 		detached,
 	});
 
@@ -10830,24 +10922,27 @@ mod tests {
 
 	#[test]
 	fn fold_worker_fleet_tracks_spawns_and_detaches() {
-		let spawn = |id: &str, worktree: Option<&str>| SessionRecord::SubagentSpawned {
+		let spawn = |id: &str, worker: bool, worktree: Option<&str>| SessionRecord::SubagentSpawned {
 			tool_call_id: "c".into(),
 			subagent_id: id.into(),
 			target_folder: "/f".into(),
 			mode: "agent".into(),
 			worktree_root: worktree.map(str::to_string),
+			worker,
 			detached: false,
 		};
 		let records = vec![
-			spawn("w-1", Some("/f/.worktrees/a")),
-			// `task` sub-agent: no worktree, never part of the fleet.
-			spawn("sub-1", None),
-			spawn("w-2", Some("/f/.worktrees/b")),
+			spawn("w-1", true, Some("/f/.worktrees/a")),
+			// `task` sub-agent: never part of the fleet.
+			spawn("sub-1", false, None),
+			spawn("w-2", true, Some("/f/.worktrees/b")),
+			// In-place worker (ADR 0070): no worktree, still fleet.
+			spawn("w-3", true, None),
 			SessionRecord::WorkerDetached {
 				worker_id: "w-1".into(),
 			},
 		];
-		assert_eq!(fold_worker_fleet(&records), vec!["w-2".to_string()]);
+		assert_eq!(fold_worker_fleet(&records), vec!["w-2".to_string(), "w-3".to_string()]);
 		// A detach with no matching spawn is a no-op.
 		let only_detach = vec![SessionRecord::WorkerDetached {
 			worker_id: "w-9".into(),

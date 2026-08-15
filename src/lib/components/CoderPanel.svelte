@@ -3541,11 +3541,11 @@
 					class:done={subagent.status === 'done'}
 					class:running={subagent.status === 'running'}
 					class:err={subagent.status === 'error'}
-					title={subagent.worktreeRoot !== null
+					title={subagent.worker
 						? `Open worker session (${subagent.targetFolder})`
 						: `Open sub-agent transcript (${subagent.targetFolder})`}
 					onclick={() => {
-						if (subagent.worktreeRoot !== null) {
+						if (subagent.worker) {
 							void coder.openWorkerSession(subagent.worktreeRoot, subagent.id);
 						} else {
 							coder.openSubagent(subagent.id);
@@ -3590,7 +3590,7 @@
 							<span class="subagent-tokens placeholder">…</span>
 						{/if}
 						<span class="subagent-open">
-							{subagent.worktreeRoot !== null ? 'Open session →' : 'Open transcript →'}
+							{subagent.worker ? 'Open session →' : 'Open transcript →'}
 						</span>
 					</div>
 				</button>

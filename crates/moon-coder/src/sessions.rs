@@ -486,6 +486,7 @@ pub(crate) fn record_to_pi_wire(
 			target_folder,
 			mode,
 			worktree_root,
+			worker,
 			detached,
 		} => pi_message_envelope(
 			pi_custom_message(
@@ -496,6 +497,7 @@ pub(crate) fn record_to_pi_wire(
 					"target_folder": target_folder,
 					"mode": mode,
 					"worktree_root": worktree_root,
+					"worker": worker,
 					"detached": detached,
 				}),
 			),
@@ -1173,6 +1175,7 @@ fn parse_pi_custom(msg: &serde_json::Value) -> Option<SessionRecord> {
 				.and_then(|v| v.as_str())
 				.filter(|s| !s.is_empty())
 				.map(|s| s.to_string()),
+			worker: details.get("worker").and_then(|v| v.as_bool()).unwrap_or(false),
 			detached: details.get("detached").and_then(|v| v.as_bool()).unwrap_or(false),
 		}),
 		CUSTOM_TYPE_WORKER_DETACHED => Some(SessionRecord::WorkerDetached {
@@ -1426,10 +1429,17 @@ pub enum SessionRecord {
 		subagent_id: String,
 		target_folder: String,
 		mode: String,
-		/// Worktree folder path for a coordinator-spawned worker
-		/// (ADR 0030). Absent for `task` sub-agents.
+		/// Worktree folder path when the spawned entity runs in its
+		/// own worktree. Absent for `task` sub-agents and in-place
+		/// workers (`spawn_worker` with `worktree: false`).
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		worktree_root: Option<String>,
+		/// `true` for a coordinator worker (`spawn_worker`). The
+		/// restart-time fleet rebuild folds on this flag — not on
+		/// `worktree_root.is_some()`, which in-place workers lack
+		/// (ADR 0070, superseding ADR 0065's discriminator note).
+		#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+		worker: bool,
 		/// `true` for a detached `task` spawn ([ADR 0053]). Kept on
 		/// the record so a reloaded parent re-badges the card
 		/// "detached" without re-deriving it. Absent for synchronous
@@ -3573,6 +3583,10 @@ mod tests {
 				target_folder: "/workspace/api".into(),
 				mode: "agent".into(),
 				worktree_root: None,
+				// In-place worker shape (ADR 0070): the flag — not a
+				// worktree_root — must survive the pi round-trip, or
+				// the fleet rebuild loses the worker on restart.
+				worker: true,
 				detached: false,
 			},
 		)
@@ -3599,6 +3613,7 @@ mod tests {
 				target_folder,
 				mode,
 				worktree_root,
+				worker,
 				detached,
 			} => {
 				assert_eq!(tool_call_id, "call-1");
@@ -3606,6 +3621,7 @@ mod tests {
 				assert_eq!(target_folder, "/workspace/api");
 				assert_eq!(mode, "agent");
 				assert_eq!(*worktree_root, None);
+				assert!(*worker);
 				assert!(!*detached);
 			}
 			other => panic!("expected SubagentSpawned, got {other:?}"),
@@ -3953,6 +3969,7 @@ mod tests {
 				target_folder: String::new(),
 				mode: "agent".into(),
 				worktree_root: None,
+				worker: false,
 				detached: false,
 			},
 			SessionRecord::Assistant {
@@ -3969,6 +3986,7 @@ mod tests {
 				target_folder: String::new(),
 				mode: "agent".into(),
 				worktree_root: None,
+				worker: false,
 				detached: false,
 			},
 		];

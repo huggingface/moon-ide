@@ -37,9 +37,7 @@ use crate::inference::ToolDefinition;
 pub fn ask_user_tool_definition() -> ToolDefinition {
 	ToolDefinition::function(
 		"ask_user",
-		"Pause and ask the user one or more multiple-choice questions, then wait for their answer before continuing. \
-\
-Be terse. A brief lead-in message before the call is fine (the user reads it), but don't dump a long analysis and don't repeat that lead-in inside the question. Each question is one short sentence; each option label is a short phrase (a few words), not a paragraph. You can ask several questions at once; each gets its own set of options. The user can always type a custom free-form answer, and can skip the whole prompt by sending a normal message instead — you'll get a `skipped` result, so read their next message and continue.",
+		"Pause and ask the user one or more multiple-choice questions, then wait for their answer before continuing. Each question is one short sentence; each option label is a short phrase, not a paragraph. The user can always type a custom free-form answer, and can skip the whole prompt by sending a normal message instead — you'll get a `skipped` result, so read their next message and continue.",
 		json!({
 			"type": "object",
 			"properties": {

@@ -1106,7 +1106,7 @@ impl ToolRegistry {
 						},
 						"wait_ms": {
 							"type": "integer",
-							"description": "If > 0, block up to this many milliseconds waiting for the process to exit before returning. Capped at 600000 (10 minutes). Use this to avoid busy-polling: one `read_process(id, wait_ms=600000)` per ten minutes is better than hundreds of instant polls. The call returns as soon as the process exits."
+							"description": "If > 0, block up to this many milliseconds waiting for the process to exit before returning (capped at 600000 = 10 minutes). One `read_process(id, wait_ms=600000)` per ten minutes beats hundreds of instant polls."
 						},
 						"tail_bytes": {
 							"type": "integer",
@@ -1150,7 +1150,7 @@ impl ToolRegistry {
 			),
 			ToolDefinition::function(
 				"edit_file",
-				"Replace a substring in a file. `find` is whitespace-tolerant (indent shifts and interior whitespace runs forgiven) and must be unique unless `occurrence` is given. Empty `replace` deletes. Bytes the file holds between your edits in a turn are exactly what `write_file` / `edit_file` wrote — for files in a bound folder the format-on-save chain runs once per touched file at the end of the turn.",
+				"Replace a substring in a file. `find` is whitespace-tolerant (indent shifts and interior whitespace runs forgiven) and must be unique unless `occurrence` is given. Empty `replace` deletes. Format-on-save runs once per touched file at the end of the turn, so mid-turn the file holds exactly the bytes you wrote.",
 				json!({
 					"type": "object",
 					"properties": {

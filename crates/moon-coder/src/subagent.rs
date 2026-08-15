@@ -362,16 +362,7 @@ fn serialize_mode_wire<S: serde::Serializer>(mode: &CoderMode, s: S) -> Result<S
 pub fn task_tool_definition() -> ToolDefinition {
 	ToolDefinition::function(
 		"task",
-		"Delegate a self-contained task to a sub-agent and get back a single summarised string. Sub-agents run in their own context with their own LLM round-trips — you spend tokens on the task description and the final summary, not on every intermediate read or edit. \
-\
-Reach for this when one of these applies: \
-**(1) context preservation** — when the inputs are large but the answer is small (`grep`-then-read sweeps, \"is feature X already implemented?\", \"find every callsite of Y\", \"summarise this folder\"), spawning a sub-agent keeps the noisy tool output out of your own transcript. Your synthesis turn stays focused on the question, not the rummaging. \
-**(2) parallelism** — multiple `task` calls in one assistant message run concurrently (capped at 4), so an N-way investigation finishes in one round-trip instead of N. Use this when sub-tasks are independent. \
-**(3) scoped delegation** — when you want a fresh agent to take ownership of a self-contained piece of work (\"port this client to the new endpoints\", \"investigate why these tests fail\") without your own session's prior context biasing the approach. \
-\
-For mechanically related cross-folder work (you know exactly what to change in folder B because of work you just did in folder A), you do **not** need a sub-agent — your own tools accept any currently-bound folder's path directly (the Bound folders section above lists them). Sub-agents are for *delegation*, not for *access*. \
-\
-Mode: `\"research\"` (recommended for investigations) gets `read_file`, `list_dir`, `grep`, and `bash` for inspection commands (`git log`, `git diff`, `cargo check`, `pytest --collect-only`, …) but is instructed not to mutate anything. `\"agent\"` (default) is the full toolkit — same capabilities as you have, including edits. \
+		"Delegate a self-contained task to a sub-agent and get back a single summarised string. Sub-agents run in their own context — you spend tokens on the task description and the final summary, not on every intermediate read or edit. See \"When to use sub-agents\" in your instructions for when to reach for this (context preservation, parallelism, scoped delegation); it is for *delegation*, not for *access* — your own tools already reach every bound folder. \
 \
 The sub-agent has no access to your conversation history — describe the task self-containedly. Sub-agents cannot spawn further sub-agents.",
 		json!({
@@ -396,7 +387,7 @@ The sub-agent has no access to your conversation history — describe the task s
 				},
 				"detach": {
 					"type": "boolean",
-					"description": "When true, the call returns immediately with a `subagent_id` handle instead of blocking on the report: the sub-agent runs in the background and you keep working. Its finish wakes you with a notice; fetch the report with `task_collect(subagent_id)` (optionally `wait_ms` to block until it settles, capped 60 s) and stop it early with `task_abort(subagent_id)`. Default false (synchronous). Prefer detach for slow, independent work you don't need the answer to before continuing — long test suites, background audits, anything you'd otherwise park the whole turn behind."
+					"description": "When true, the call returns immediately with a `subagent_id` handle instead of blocking on the report: the sub-agent runs in the background, its finish wakes you with a notice, and you fetch the report with `task_collect(subagent_id)` (or stop it with `task_abort`). Default false (synchronous). Prefer detach for slow, independent work you don't need the answer to before continuing — long test suites, background audits."
 				}
 			},
 			"required": ["task"]
@@ -410,7 +401,7 @@ The sub-agent has no access to your conversation history — describe the task s
 pub fn task_collect_tool_definition() -> ToolDefinition {
 	ToolDefinition::function(
 			"task_collect",
-			"Fetch the report of a detached sub-agent (one spawned with `task({ ..., detach: true })`). Returns `{ status: \"done\", result, tokens_used_estimate, iterations_used }` once it settles, `{ status: \"error\", error }` on failure, or `{ status: \"running\" }` while it's still going. Pass `wait_ms` to block until it settles (capped at 60 s) instead of returning `running` immediately — use one `task_collect(id, wait_ms: 60000)` call per minute rather than busy-polling. The report is cached after the run settles, so a second collect returns instantly. Only ids your own session spawned (with `detach: true`) are collectable; a synchronous `task` call has no handle to collect.",
+			"Fetch the report of a detached sub-agent (one spawned with `task({ ..., detach: true })`). Returns `{ status: \"done\", result, tokens_used_estimate, iterations_used }` once it settles, `{ status: \"error\", error }` on failure, or `{ status: \"running\" }` while it's still going. Pass `wait_ms` to block until it settles (capped at 60 s) instead of busy-polling. Only ids your own session spawned with `detach: true` are collectable.",
 			json!({
 				"type": "object",
 				"properties": {
@@ -478,6 +469,7 @@ pub(crate) async fn run_subagent(
 		target_folder: spec.folder.folder.path.clone(),
 		mode: mode.as_wire().to_string(),
 		worktree_root: None,
+		worker: false,
 		detached: spec.detach,
 	});
 
@@ -638,6 +630,7 @@ pub(crate) async fn resume_subagent(
 		target_folder: spec.folder.folder.path.clone(),
 		mode: spec.mode.as_wire().to_string(),
 		worktree_root: None,
+		worker: false,
 		// A user-driven resume keeps the original spawn's detach
 		// semantics; the resume itself doesn't restamp the flag
 		// (`spec.detach` is false here by construction).

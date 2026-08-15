@@ -169,14 +169,18 @@ export type SubagentSummary = {
 	resultPreview: string | null;
 	tokensUsedEstimate: number;
 	subSessionId: string | null;
-	/** The worktree folder path for a coordinator-spawned worker
-	 *  (ADR 0030). `null` for a `task` sub-agent (sub-agents don't
-	 *  have a worktree — `targetFolder` is the folder they operate
-	 *  against). When set, the sub-agent card's "Open" button
-	 *  navigates to the worker's session via
-	 *  [`CoderPanelState.openWorkerSession`] instead of the
-	 *  sub-agent pop-out view. */
+	/** The worktree folder path for a worktree-backed worker
+	 *  (ADR 0030). `null` for a `task` sub-agent and for an
+	 *  in-place worker (ADR 0070) — `targetFolder` is the folder
+	 *  they operate against. When set, opening the worker's
+	 *  session also switches the panel to the worktree folder. */
 	worktreeRoot: string | null;
+	/** `true` for a coordinator-spawned worker (`spawn_worker`) —
+	 *  the card's "Open" navigates to the worker's top-level
+	 *  session via [`CoderPanelState.openWorkerSession`] instead
+	 *  of the sub-agent pop-out. Not derivable from
+	 *  `worktreeRoot`: in-place workers have none. */
+	worker: boolean;
 	/** ADR 0053 — `true` for a detached `task`: the parent's tool
 	 *  call returned a handle and the run settles in the background.
 	 *  Drives a "detached" badge on the card so a background run
@@ -3616,6 +3620,7 @@ export class CoderPanelState {
 					tokensUsedEstimate: prev?.tokensUsedEstimate ?? 0,
 					subSessionId: prev?.subSessionId ?? null,
 					worktreeRoot: event.worktree_root ?? null,
+					worker: event.worker ?? prev?.worker ?? false,
 					// A re-emitted spawn (user-driven resume) keeps the
 					// original spawn's detach flag rather than
 					// resetting it.

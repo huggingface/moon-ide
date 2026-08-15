@@ -1740,6 +1740,12 @@ export type CoderEvent =
 			target_folder: string;
 			mode: SubagentMode;
 			worktree_root?: string | null;
+			/** `true` for a coordinator-spawned worker (`spawn_worker`) —
+			 *  a real top-level session the card navigates to instead of
+			 *  the sub-agent pop-out. The discriminator; `worktree_root`
+			 *  no longer implies it, since in-place workers (ADR 0070)
+			 *  have no worktree. Absent (false) for `task` sub-agents. */
+			worker?: boolean;
 			/** ADR 0053 — `true` for a detached `task`: the parent's tool
 			 *  call returned a handle and the run settles in the
 			 *  background. Frontend badges the card so a background run

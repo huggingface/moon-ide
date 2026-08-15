@@ -309,13 +309,22 @@ pub enum CoderEvent {
 		subagent_id: String,
 		target_folder: String,
 		mode: String,
-		/// Set when the spawned entity is a coordinator worker
-		/// (ADR 0030 `spawn_worker`) — carries the worktree folder
-		/// path so the frontend can navigate to the worker's
-		/// session (a real top-level session) instead of the
-		/// sub-agent pop-out. Absent for `task` sub-agents.
+		/// Worktree folder path when the spawned entity runs in its
+		/// own worktree (the default for coordinator workers) — the
+		/// frontend switches folders to it on navigation. Absent
+		/// for `task` sub-agents and for in-place workers
+		/// (`spawn_worker` with `worktree: false`).
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		worktree_root: Option<String>,
+		/// `true` when the spawned entity is a coordinator worker
+		/// (`spawn_worker`) — a real top-level session the frontend
+		/// navigates to instead of the sub-agent pop-out. This is
+		/// the worker discriminator; `worktree_root.is_some()` no
+		/// longer implies it now that workers can run in-place
+		/// without a worktree (ADR 0070). Absent (false) for `task`
+		/// sub-agents.
+		#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+		worker: bool,
 		/// `true` when the spawn was a detached `task` ([ADR 0053])
 		/// — the parent's tool call returned a handle and the run
 		/// settles in the background. Frontend badges the card

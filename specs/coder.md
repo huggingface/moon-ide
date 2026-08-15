@@ -687,7 +687,18 @@ cannot redirect tool calls. This includes the coordinator tools
 (ADR 0030): `spawn_worker` creates the worktree off and files the
 worker under the **coordinator's own project** by default, or under a
 different bound folder when `folder` is passed (e.g. one created by
-`init_repo` / `clone_repo`). `clone_repo` / `init_repo` /
+`init_repo` / `clone_repo`). With `worktree: false` the worker runs
+**in place** instead ([ADR 0070](decisions/0070-in-place-workers.md)):
+no worktree, no branch — the session drives the target folder's own
+checkout (uncommitted state included), so its edits and commits land
+on the currently checked-out branch alongside anything else working
+there. `base_branch` is refused in-place (switching the shared tree's
+branch under the user), `merge_worker_changes` refuses (nothing to
+merge), `discard_worker_worktree` is the usual no-op, and passing an
+existing worker's worktree as `folder` puts a second worker inside
+that same checkout. The shared-tree race is accepted — the
+coordinator opts in explicitly and is told the tree is shared.
+`clone_repo` / `init_repo` /
 `workspace_scm_status` anchor to the coordinator's own folder too.
 `abort` targets the active folder's visible session only; sign-out is
 the one global cancel.
@@ -709,7 +720,8 @@ next turn, typically the worker's own `TurnComplete` dispatch packet.
 The links survive restarts
 ([ADR 0065](decisions/0065-restart-resilient-worker-links.md)): the
 worker's header carries its orchestrator id, the coordinator's JSONL
-carries the fleet (spawn records with a worktree, minus
+carries the fleet (spawn records flagged `worker: true` — not
+`worktree_root`, which in-place workers lack (ADR 0070) — minus
 `WorkerDetached` records appended on disconnect / retire / spawn
 rollback), and a coordinator's cold remount re-registers the fleet,
 respawns the dispatch feeder, and quietly remounts surviving workers.
