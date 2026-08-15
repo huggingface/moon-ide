@@ -7966,6 +7966,69 @@ mod tests {
 			.unwrap();
 	}
 
+	/// A half-gone checkout (ADR 0068): an out-of-band removal stripped
+	/// the `.git` link and the metadata but ignored leftovers kept the
+	/// directory alive. `git worktree remove` fails "is not a working
+	/// tree" with or without `--force`, so `discard_checkout` must
+	/// refuse without force and delete the leftovers with it.
+	#[tokio::test]
+	async fn discard_checkout_handles_stale_leftovers() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping stale-leftovers test");
+			return;
+		};
+		if !relative_worktrees_supported() {
+			eprintln!("git < 2.48 (no relative worktrees) — skipping stale-leftovers test");
+			return;
+		}
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		std::fs::write(dir.path().join("README.md"), "hi\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "initial"]);
+		let wt_path = Utf8PathBuf::from_path_buf(dir.path().join(".worktrees").join("moon-stale")).unwrap();
+		host(&dir)
+			.git_worktree_add(&wt_path, WorktreeBranch::New("moon/stale".into()))
+			.await
+			.unwrap();
+
+		// Simulate the out-of-band half-removal: `.git` link gone,
+		// metadata pruned, an ignored leftover keeping the dir alive.
+		std::fs::create_dir_all(wt_path.join("node_modules").as_std_path()).unwrap();
+		std::fs::write(wt_path.join("node_modules").join("x.js"), "leftover\n").unwrap();
+		std::fs::remove_file(wt_path.join(".git").as_std_path()).unwrap();
+		run_git(&git, dir.path(), &["worktree", "unlock", wt_path.as_str()]);
+		run_git(&git, dir.path(), &["worktree", "prune", "--expire=now"]);
+		assert_eq!(
+			crate::worktree::checkout_state(&wt_path),
+			crate::worktree::CheckoutState::StaleLeftovers
+		);
+
+		// Without force: refused, leftovers untouched — the UI's
+		// force re-confirm has something real to gate.
+		let h = host(&dir);
+		assert!(crate::worktree::discard_checkout(&h, &wt_path, &wt_path, false)
+			.await
+			.is_err());
+		assert!(wt_path.is_dir(), "leftovers survive a non-forced discard");
+
+		// With force: leftovers deleted, branch kept, path reusable.
+		crate::worktree::discard_checkout(&h, &wt_path, &wt_path, true)
+			.await
+			.unwrap();
+		assert!(!wt_path.exists(), "leftover directory deleted");
+		assert!(
+			h.git_local_branches().await.unwrap().iter().any(|b| b == "moon/stale"),
+			"branch kept"
+		);
+		host(&dir)
+			.git_worktree_add(&wt_path, WorktreeBranch::Existing("moon/stale".into()))
+			.await
+			.unwrap();
+	}
+
 	#[tokio::test]
 	async fn git_worktree_add_checks_out_existing_branch() {
 		let Some(git) = which_git() else {

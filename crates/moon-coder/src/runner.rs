@@ -8381,19 +8381,15 @@ async fn discard_one_worker_worktree(
 		));
 	};
 	// The checkout lives on the host under `<parent>/.worktrees/<slug>`
-	// (ADR 0029) even when the workspace runs in a container, so a
-	// host-side `is_dir` is a valid liveness test; `git_worktree_remove`
-	// translates the path for whichever shell target the parent runs on.
-	let checkout_gone = !Utf8Path::new(&worktree_path).is_dir();
+	// (ADR 0029) even when the workspace runs in a container, so
+	// `discard_checkout`'s host-side liveness test is valid under
+	// either shell target; `git_worktree_remove` translates the path
+	// for whichever target the parent runs on. Live / gone /
+	// stale-leftover checkouts all discard (ADR 0044 / ADR 0068) —
+	// leftovers need `force`, like a dirty tree.
 	if let Some(parent) = state.workspaces.folder_for_path(&parent_path).await {
 		let path = Utf8Path::new(&worktree_path);
-		if checkout_gone {
-			if let Err(err) = parent.host.git_worktree_forget(path).await {
-				tracing::warn!(error = %err, worktree = %worktree_path, "git worktree prune failed for an already-removed checkout");
-			}
-		} else {
-			parent.host.git_worktree_remove(path, force).await?;
-		}
+		moon_core::worktree::discard_checkout(parent.host.as_ref(), path, path, force).await?;
 	}
 	state.workspaces.remove_folder(&worktree_path).await?;
 	// Sessions that routed to the checkout drive the parent's main

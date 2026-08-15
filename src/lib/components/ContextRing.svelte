@@ -130,12 +130,18 @@
 	});
 </script>
 
+<!-- Height is pinned to the ring diameter but width is left to
+	the content: the span also holds the ⚡hits/requests cache
+	tell, and a hard `width: {size}px` made that text overflow
+	the box — anything rendered to the right (the mid-turn
+	"stop" button) then painted on top of it, so the ring and
+	the cache score never showed together during a turn. -->
 <span
 	class="ring tone-{tone}"
 	class:pulse={compaction?.phase === 'running'}
 	title={tooltip}
 	aria-label={tooltip}
-	style="width: {size}px; height: {size}px;"
+	style="height: {size}px;"
 >
 	<svg
 		xmlns="http://www.w3.org/2000/svg"

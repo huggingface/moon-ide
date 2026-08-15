@@ -563,7 +563,9 @@ pub async fn coder_new_worktree_session(
 /// disk — an agent ran `git worktree remove` in a shell, someone
 /// `rm -rf`'d it — there is nothing to remove, so this forgets the
 /// stale git metadata and unbinds without erroring. Closing a folder
-/// row must always make the row go away.
+/// row must always make the row go away. A half-gone checkout (git
+/// forgot it but ignored leftovers like `node_modules` survived) is
+/// refused without `force` and deleted with it (ADR 0068).
 #[tauri::command]
 pub async fn coder_discard_worktree(
 	state: State<'_, AppState>,
@@ -583,9 +585,11 @@ pub async fn coder_discard_worktree(
 
 	// The checkout always lives on the host under
 	// `<parent>/.worktrees/<slug>` (ADR 0029) and is bind-mounted into
-	// the container, so a host-side `is_dir` is a valid liveness test
-	// under either shell target.
-	let checkout_gone = !camino::Utf8Path::new(&path).is_dir();
+	// the container, so `discard_checkout`'s host-side liveness test
+	// is valid under either shell target. It splits live / gone /
+	// stale-leftover checkouts (ADR 0044 / ADR 0068), so a checkout
+	// git already forgot still discards instead of erroring forever.
+	let host_path = camino::Utf8Path::new(&path);
 	match state.workspaces.folder_for_path(&parent_path).await {
 		Some(parent) => {
 			// `git worktree remove` runs against the parent repo on its
@@ -595,12 +599,12 @@ pub async fn coder_discard_worktree(
 			// path when the workspace runs in a container, the host path
 			// otherwise.
 			let remove_path = if crate::commands::container::workspace_container_running(&state).await {
-				moon_core::worktree::worktree_container_path(camino::Utf8Path::new(&parent_path), camino::Utf8Path::new(&path))
+				moon_core::worktree::worktree_container_path(camino::Utf8Path::new(&parent_path), host_path)
 					.unwrap_or_else(|| camino::Utf8PathBuf::from(&path))
 			} else {
 				camino::Utf8PathBuf::from(&path)
 			};
-			forget_or_remove_worktree(parent.host.as_ref(), &remove_path, force, checkout_gone).await?;
+			moon_core::worktree::discard_checkout(parent.host.as_ref(), host_path, &remove_path, force).await?;
 		}
 		None => {
 			// Orphan worktree — its parent was removed from the workspace
@@ -612,35 +616,12 @@ pub async fn coder_discard_worktree(
 			let parent_root = camino::Utf8PathBuf::from(&parent_path);
 			if parent_root.is_dir() {
 				let host = moon_core::host::LocalHost::new(parent_root);
-				forget_or_remove_worktree(&host, camino::Utf8Path::new(&path), force, checkout_gone).await?;
+				moon_core::worktree::discard_checkout(&host, host_path, host_path, force).await?;
 			}
 		}
 	}
 	state.workspaces.remove_folder(&path).await?;
 	Ok(state.workspaces.snapshot().await)
-}
-
-/// `git worktree remove` a live checkout, or forget the stale
-/// metadata of one that's already gone (ADR 0044). Splitting on
-/// "does the checkout still exist" keeps a genuine refusal (dirty
-/// tree without `force`, a lock we couldn't drop) an error while
-/// making the already-removed case a no-op — the git-level failure
-/// text for the latter ("is not a working tree") is useless to a
-/// user who just wants the row gone.
-async fn forget_or_remove_worktree(
-	host: &dyn moon_core::host::WorkspaceHost,
-	path: &camino::Utf8Path,
-	force: bool,
-	checkout_gone: bool,
-) -> Result<(), MoonError> {
-	if !checkout_gone {
-		return host.git_worktree_remove(path, force).await;
-	}
-	if let Err(err) = host.git_worktree_forget(path).await {
-		// Housekeeping, not a gate: the folder still unbinds.
-		tracing::warn!(error = %err, worktree = %path, "git worktree prune failed for an already-removed checkout");
-	}
-	Ok(())
 }
 
 /// Merge a worktree's branch into `base_branch` on the parent repo,

@@ -6,7 +6,6 @@
 	import { openUrl } from '@tauri-apps/plugin-opener';
 	import { coder, compactionProgressLabel, type CoderRow } from '../coder.svelte';
 	import { frontendLog } from '../logs.svelte';
-	import { slack } from '../slack.svelte';
 	import { workspace } from '../state.svelte';
 	import CoderConnectModal from './CoderConnectModal.svelte';
 	import CoderMarkdown from './CoderMarkdown.svelte';
@@ -27,7 +26,6 @@
 	import TerminalTargetIcon from './TerminalTargetIcon.svelte';
 	import ContextRing from './ContextRing.svelte';
 	import CoderTodoPill from './CoderTodoPill.svelte';
-	import ChatBubbleIcon from './icons/ChatBubbleIcon.svelte';
 	import SettingsIcon from './icons/SettingsIcon.svelte';
 	import SignOutIcon from './icons/SignOutIcon.svelte';
 	import PlusIcon from './icons/PlusIcon.svelte';
@@ -2360,18 +2358,7 @@
 			{#if coder.busy}
 				<button type="button" class="stop" title="Stop turn (Esc)" onclick={() => coder.abort()}>stop</button>
 			{/if}
-			<!-- Swap the right-side slot from coder to chat. Same
-				 affordance the chat panel has in the other
-				 direction. -->
-			<button
-				type="button"
-				class="icon"
-				title="Switch to Chat"
-				aria-label="Switch to Chat"
-				onclick={() => slack.togglePanel()}
-			>
-				<ChatBubbleIcon />
-			</button>
+
 			{#if coder.signedIn}
 				<button
 					type="button"

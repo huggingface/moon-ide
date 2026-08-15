@@ -1759,6 +1759,12 @@ worktree remove` in a shell, someone `rm -rf`'d it — closing the row
 forgets the stale git metadata (unlock + `git worktree prune`) and
 unbinds without erroring. A checkout that's still there behaves as
 before, so a dirty-tree refusal still drives the force re-confirm.
+A **half-gone** checkout — git already forgot it but ignored
+leftovers (`node_modules`, build output) kept the directory alive,
+where `git worktree remove` fails "is not a working tree" with or
+without `--force` — is refused without force and deleted with it
+([ADR 0068](decisions/0068-stale-worktree-leftovers.md)), so the row
+can always be closed.
 A coordinator cleans up after its own workers with
 `discard_worker_worktree`, which does the same thing plus clears the
 worktree routing on the worker's session; it refuses a running worker
