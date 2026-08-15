@@ -47,6 +47,79 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// instead.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// 429 rate-limit backoff: retries sleep 2 s doubling per attempt up
+/// to a 2 min ceiling (2, 4, 8, 16, 32, 64, 120), then the 429
+/// surfaces to the caller like any other HTTP error. A numeric
+/// `Retry-After` from the provider wins over the schedule when it
+/// asks for a longer wait, clamped to the same ceiling.
+const RATE_LIMIT_MAX_RETRIES: u32 = 7;
+const RATE_LIMIT_BACKOFF_CAP: Duration = Duration::from_secs(120);
+
+fn rate_limit_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
+	let backoff = Duration::from_secs(2u64 << attempt.min(6));
+	retry_after
+		.map_or(backoff, |ra| ra.max(backoff))
+		.min(RATE_LIMIT_BACKOFF_CAP)
+}
+
+/// Numeric-seconds `Retry-After` header, when present. The
+/// http-date form is rare on inference providers and not worth a
+/// date parser — an unparseable value just falls back to the
+/// exponential schedule.
+fn retry_after_of(response: &reqwest::Response) -> Option<Duration> {
+	let raw = response.headers().get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+	raw.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
+/// Send `builder`, retrying on 429 with [`rate_limit_delay`]'s
+/// exponential backoff. Cancel-aware in both phases: the in-flight
+/// request and the backoff sleep each race the cancel token, so Esc
+/// aborts a rate-limited turn immediately instead of after the wait.
+///
+/// Every chat-completion request body we build is plain JSON, so
+/// `try_clone` always succeeds; the `None` arm is a defensive
+/// single-shot for a hypothetical streaming body that can't be
+/// replayed.
+pub(crate) async fn send_with_rate_limit_retry(
+	endpoint: &str,
+	builder: reqwest::RequestBuilder,
+	cancel: &tokio_util::sync::CancellationToken,
+) -> Result<reqwest::Response, CoderError> {
+	let mut attempt: u32 = 0;
+	loop {
+		let Some(this_try) = builder.try_clone() else {
+			let send = builder.send();
+			return tokio::select! {
+				biased;
+				_ = cancel.cancelled() => Err(CoderError::Aborted),
+				resp = send => resp.map_err(CoderError::from),
+			};
+		};
+		let send = this_try.send();
+		let response = tokio::select! {
+			biased;
+			_ = cancel.cancelled() => return Err(CoderError::Aborted),
+			resp = send => resp.map_err(CoderError::from)?,
+		};
+		if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS || attempt >= RATE_LIMIT_MAX_RETRIES {
+			return Ok(response);
+		}
+		let delay = rate_limit_delay(attempt, retry_after_of(&response));
+		attempt += 1;
+		tracing::warn!(
+			endpoint,
+			attempt,
+			delay_s = delay.as_secs(),
+			"provider returned 429; backing off before retrying"
+		);
+		tokio::select! {
+			biased;
+			_ = cancel.cancelled() => return Err(CoderError::Aborted),
+			_ = tokio::time::sleep(delay) => {}
+		}
+	}
+}
+
 /// Some providers (DeepInfra at least) serialize "this chunk has no
 /// tool calls" as `tool_calls: null` instead of just omitting the
 /// field. Serde's `#[serde(default)]` covers *missing*, not
@@ -1344,6 +1417,9 @@ impl InferenceClient {
 	///
 	/// Custom providers: 401 is surfaced verbatim. There's no
 	/// refresh token; the user has to fix the key in the picker.
+	///
+	/// Every route retries 429s with exponential backoff before the
+	/// error surfaces — see [`send_with_rate_limit_retry`].
 	pub async fn chat_completion(
 		&self,
 		model: &str,
@@ -1520,12 +1596,7 @@ impl InferenceClient {
 				builder = builder.header(SESSION_ID_HEADER, sid);
 			}
 		}
-		let send = builder.send();
-		tokio::select! {
-			biased;
-			_ = cancel.cancelled() => Err(CoderError::Aborted),
-			resp = send => resp.map_err(CoderError::from),
-		}
+		send_with_rate_limit_retry(endpoint, builder, cancel).await
 	}
 
 	async fn send_once_stream(
@@ -1555,12 +1626,7 @@ impl InferenceClient {
 				builder = builder.header(SESSION_ID_HEADER, sid);
 			}
 		}
-		let send = builder.send();
-		tokio::select! {
-			biased;
-			_ = cancel.cancelled() => Err(CoderError::Aborted),
-			resp = send => resp.map_err(CoderError::from),
-		}
+		send_with_rate_limit_retry(endpoint, builder, cancel).await
 	}
 }
 
@@ -2678,6 +2744,22 @@ mod tests {
 		let usage: TokenUsage = serde_json::from_str(raw).unwrap();
 		assert_eq!(usage.cache_read_input_tokens, 0);
 		assert_eq!(usage.cache_creation_input_tokens, 0);
+	}
+
+	#[test]
+	fn rate_limit_delay_doubles_from_2s_and_caps_at_2min() {
+		use std::time::Duration;
+		let schedule: Vec<u64> = (0..RATE_LIMIT_MAX_RETRIES)
+			.map(|attempt| rate_limit_delay(attempt, None).as_secs())
+			.collect();
+		assert_eq!(schedule, vec![2, 4, 8, 16, 32, 64, 120]);
+		// A longer provider-requested wait wins over the schedule…
+		assert_eq!(rate_limit_delay(0, Some(Duration::from_secs(30))).as_secs(), 30);
+		// …a shorter one doesn't shrink the backoff…
+		assert_eq!(rate_limit_delay(3, Some(Duration::from_secs(1))).as_secs(), 16);
+		// …and nothing exceeds the 2 min ceiling.
+		assert_eq!(rate_limit_delay(0, Some(Duration::from_secs(900))).as_secs(), 120);
+		assert_eq!(rate_limit_delay(60, None).as_secs(), 120);
 	}
 
 	#[test]

@@ -251,7 +251,10 @@ user provider sets `active_provider = Some(id)`; `X-HF-Bill-To` is
 suppressed off the wire when one is active. API keys live in the
 keyring (`account=coder-provider:<id>`) and never round-trip through
 the model-settings read. The 401-refresh behaviour stays HF-only — a
-user provider that 401s surfaces the error.
+user provider that 401s surfaces the error. 429s are retried on every
+route with exponential backoff (2 s doubling to a 2 min ceiling,
+honouring a longer numeric `Retry-After`) before surfacing; the wait
+is cancel-aware so Esc still aborts immediately.
 
 `kind` discriminates the wire shape:
 
@@ -1951,16 +1954,17 @@ Push events: `coder:event` (every loop event, envelope-wrapped),
 
 ## Failure modes
 
-| Scenario                                     | UI behaviour                                                                                     |
-| -------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| User has no HF token                         | "Sign in with Hugging Face" empty state                                                          |
-| Device-flow polling expires                  | Modal shows "code expired, retry"                                                                |
-| Token rejected by `/whoami-v2` after refresh | Toast + return to empty state; keyring cleared                                                   |
-| `router.huggingface.co` 5xx                  | Streaming surfaces an error; "Retry" button performs a `continue()` against the existing context |
-| Tool throws                                  | LLM gets `isError: true` + the message; loop continues                                           |
-| Bucket creation 4xx (e.g. quota)             | Sync marked delayed; sessions stay local                                                         |
-| `hf-xet` upload partial-fail                 | Retry on next sync; per-row icon flips red with error tooltip                                    |
-| Network down                                 | Streaming aborts; same retry surface as 5xx                                                      |
+| Scenario                                     | UI behaviour                                                                                      |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| User has no HF token                         | "Sign in with Hugging Face" empty state                                                           |
+| Device-flow polling expires                  | Modal shows "code expired, retry"                                                                 |
+| Token rejected by `/whoami-v2` after refresh | Toast + return to empty state; keyring cleared                                                    |
+| `router.huggingface.co` 5xx                  | Streaming surfaces an error; "Retry" button performs a `continue()` against the existing context  |
+| Provider 429 (rate limit)                    | Retried in place with exponential backoff (2 s → 2 min); surfaces like a 5xx once retries run out |
+| Tool throws                                  | LLM gets `isError: true` + the message; loop continues                                            |
+| Bucket creation 4xx (e.g. quota)             | Sync marked delayed; sessions stay local                                                          |
+| `hf-xet` upload partial-fail                 | Retry on next sync; per-row icon flips red with error tooltip                                     |
+| Network down                                 | Streaming aborts; same retry surface as 5xx                                                       |
 
 ## Out of scope (explicitly)
 

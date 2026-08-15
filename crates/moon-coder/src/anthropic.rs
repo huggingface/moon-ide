@@ -40,8 +40,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{request_id_of, CoderError};
 use crate::inference::{
-	extract_data_lines, find_event_boundary, truncate_for_log, AssistantResponse, ChatMessage, FunctionCall,
-	ResolvedRoute, StreamEvent, ThinkingBlock, TokenUsage, ToolCall, ToolDefinition,
+	extract_data_lines, find_event_boundary, send_with_rate_limit_retry, truncate_for_log, AssistantResponse,
+	ChatMessage, FunctionCall, ResolvedRoute, StreamEvent, ThinkingBlock, TokenUsage, ToolCall, ToolDefinition,
 };
 use moon_protocol::coder_models::{ProviderModelSummary, ProviderProbeResult};
 
@@ -544,17 +544,12 @@ pub(crate) async fn chat_completion(
 		stream: false,
 	};
 
-	let send = http
+	let builder = http
 		.post(&endpoint)
 		.header(API_KEY_HEADER, route.auth_token.as_deref().unwrap_or_default())
 		.header(VERSION_HEADER, ANTHROPIC_VERSION)
-		.json(&body)
-		.send();
-	let response = tokio::select! {
-		biased;
-		_ = cancel.cancelled() => return Err(CoderError::Aborted),
-		resp = send => resp.map_err(CoderError::from)?,
-	};
+		.json(&body);
+	let response = send_with_rate_limit_retry(&endpoint, builder, cancel).await?;
 
 	let status = response.status();
 	let request_id = request_id_of(&response);
@@ -616,18 +611,13 @@ where
 		stream: true,
 	};
 
-	let send = http
+	let builder = http
 		.post(&endpoint)
 		.header(API_KEY_HEADER, route.auth_token.as_deref().unwrap_or_default())
 		.header(VERSION_HEADER, ANTHROPIC_VERSION)
 		.header("accept", "text/event-stream")
-		.json(&body)
-		.send();
-	let response = tokio::select! {
-		biased;
-		_ = cancel.cancelled() => return Err(CoderError::Aborted),
-		resp = send => resp.map_err(CoderError::from)?,
-	};
+		.json(&body);
+	let response = send_with_rate_limit_retry(&endpoint, builder, cancel).await?;
 
 	let status = response.status();
 	if !status.is_success() {
