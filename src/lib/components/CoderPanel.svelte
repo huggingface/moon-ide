@@ -1733,7 +1733,20 @@
 	// formatting clamps to one decimal so 4.2s reads cleanly even
 	// when the underlying tick lands at 4.247s.
 	let nowTick = $state(Date.now());
-	const hasRunningTool = $derived(coder.rows.some((row) => row.kind === 'tool' && !row.hasResult));
+	// The pop-out's rows must be scanned too: a detached or resumed
+	// sub-agent runs while the parent transcript is idle, and gating
+	// the ticker on the parent alone froze every elapsed label in the
+	// pop-out at 0ms.
+	const hasRunningTool = $derived.by(() => {
+		if (coder.rows.some((row) => row.kind === 'tool' && !row.hasResult)) {
+			return true;
+		}
+		if (coder.view !== 'subagent' || coder.viewSubagentId === null) {
+			return false;
+		}
+		const transcript = coder.subagentTranscripts.get(coder.viewSubagentId);
+		return transcript?.rows.some((row) => row.kind === 'tool' && !row.hasResult) ?? false;
+	});
 
 	// Precomputed set of mid-turn assistant row IDs — rows that have at
 	// least one tool row after them before the next user row. These are

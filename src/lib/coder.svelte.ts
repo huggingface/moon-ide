@@ -189,12 +189,13 @@ export type SubagentSummary = {
 };
 
 /** Full transcript for one sub-agent, populated incrementally
- *  from `subagent_event` arrivals. The pop-out view (`view ===
+ *  from `subagent_event` arrivals (live) or the sub-agent JSONL
+ *  replay on session reopen. The pop-out view (`view ===
  *  'subagent'`) renders these rows with the same components the
- *  parent transcript uses. In-memory only — closing + reopening
- *  the parent session today does not reload prior sub-agent
- *  transcripts from disk (lands when the sub-agent JSONL replay
- *  hits the frontend). */
+ *  parent transcript uses. Buckets are created as `$state`
+ *  proxies in the `subagent_spawned` reducer — the containing
+ *  Map is not deep-proxied, so reactivity rides on the bucket
+ *  itself. */
 export type SubagentTranscript = {
 	id: string;
 	toolCallId: string;
@@ -3631,32 +3632,40 @@ export class CoderPanelState {
 
 				const transcripts = new Map(session.subagentTranscripts);
 				const existing = transcripts.get(event.subagent_id);
-				transcripts.set(
-					event.subagent_id,
-					existing ?? {
+				if (!existing) {
+					// `$state` here is load-bearing: the containing Map is
+					// not deep-proxied by Svelte (only plain objects and
+					// arrays are), so without proxying the bucket itself,
+					// in-place row mutations — `tool_result` flipping
+					// `hasResult`, streaming deltas appending text — would
+					// never repaint the pop-out. The keyed `{#each}` skips
+					// same-reference items, so the Map churn alone doesn't
+					// cover mutations to existing rows.
+					const fresh = $state<SubagentTranscript>({
 						id: event.subagent_id,
 						toolCallId: event.tool_call_id,
 						mode: event.mode,
 						targetFolder: event.target_folder,
 						rows: [],
-					},
-				);
+					});
+					transcripts.set(event.subagent_id, fresh);
+				}
 				session.subagentTranscripts = transcripts;
 				return;
 			}
 			case 'subagent_event': {
-				const transcripts = new Map(session.subagentTranscripts);
-				const existing = transcripts.get(event.subagent_id);
+				const existing = session.subagentTranscripts.get(event.subagent_id);
 				if (!existing) {
 					return;
 				}
+				// The bucket is a `$state` proxy (see `subagent_spawned`),
+				// so in-place row pushes and mutations notify the pop-out
+				// directly — no Map churn needed here. Cloning the entry
+				// per event (the previous approach) also silently dropped
+				// updates: the keyed `{#each}` skips same-reference rows,
+				// so a `tool_result` mutating an already-painted row never
+				// repainted it.
 				applyInnerEventToRows(existing.rows, event.inner);
-				// `applyInnerEventToRows` mutated `existing.rows` in
-				// place; reassign the Map entry (same array ref) so the
-				// `$state` Map field notifies and the sub-agent view
-				// re-renders.
-				transcripts.set(event.subagent_id, { ...existing });
-				session.subagentTranscripts = transcripts;
 				// Live-update the collapsed card's token footer so the
 				// user sees the sub-agent's cost climb as it runs,
 				// instead of jumping from `~0 tok` to the final
@@ -3725,9 +3734,11 @@ export class CoderPanelState {
 						}
 						cleanedRows.push(row);
 					}
-					const transcripts = new Map(session.subagentTranscripts);
-					transcripts.set(event.subagent_id, { ...transcript, rows: cleanedRows });
-					session.subagentTranscripts = transcripts;
+					// Assign through the bucket's `$state` proxy (don't
+					// replace the Map entry with a plain spread) so the
+					// transcript stays deeply reactive for a later
+					// user-driven resume.
+					transcript.rows = cleanedRows;
 				}
 				return;
 			}
