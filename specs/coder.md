@@ -652,6 +652,12 @@ the workspace has no enabled servers, and neither is mode-gated
   buffer — parallel sub-agent spawns append `SubagentSpawned` to
   the parent's file concurrently and used to tear lines
   (`}{`-joins) that the reader then skipped with a warn.
+- **Steer chronology on turn start.** A send that _starts_ a turn
+  drains any parked steers (e.g. worker-message notices on an idle
+  coordinator, ADR 0062) into the history _before_ its own prompt,
+  so the model, the JSONL, and both UIs see true arrival order —
+  previously the loop-top drain appended older messages after the
+  newer prompt.
   HF-route requests carry `X-HF-Session-Id` (a UUID derived from the
   session/sub-agent id, task-local-scoped around each turn) so the
   router pins fireworks-ai's replica-local prompt cache per session

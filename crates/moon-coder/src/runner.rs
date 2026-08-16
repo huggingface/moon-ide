@@ -3918,6 +3918,14 @@ impl CoderHandle {
 			sink.send(CoderEvent::SessionListChanged);
 		}
 
+		// Older queued steers drain *before* the fresh prompt.
+		// Notices parked while no turn was running (worker-message
+		// notices on an idle coordinator, ADR 0062) are older than
+		// this send; without this the loop-top drain would append
+		// them *after* it, so the model, the JSONL, and the
+		// transcript would all show the newer message first.
+		drain_pending_steers(&rt, &sink).await;
+
 		// Append the user message to in-memory chat history + the
 		// session JSONL. The disk write is best-effort: a failure
 		// only loses the user's prompt from the saved transcript,
@@ -4606,6 +4614,9 @@ impl CoderHandle {
 			folder_path.to_string(),
 			session_id.to_string(),
 		);
+		// Chronology: older parked steers land before this message —
+		// same reasoning as the identical call in `send`.
+		drain_pending_steers(&rt, &sink).await;
 		// Append the user message to in-memory chat history + the
 		// session JSONL, mirroring `send`'s persist path. Persisted
 		// **before** the `SessionListChanged` announce below: the
