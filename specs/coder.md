@@ -637,6 +637,21 @@ the workspace has no enabled servers, and neither is mode-gated
   "is caching working for this session?" doesn't depend on the last
   request alone. Sub-agent inner usage events carry `0/0` (no
   scoreboard).
+- **Output budget + cap continuations.** The turn and sub-agent
+  loops send an explicit `max_tokens` (8,192) instead of riding the
+  provider default — some HF deployments default to 2,048, which
+  reasoning models burn entirely on thinking and then loop through
+  continuations without ever answering. On a `length` stop the
+  runner injects a continuation sentinel (max 3); when the cut
+  response was thinking-only, the sentinel quotes the tail of the
+  lost reasoning (reasoning is not replayed to the model outside
+  the native Anthropic path, so "continue where you stopped" is
+  otherwise impossible).
+- **JSONL append integrity.** Appends to a session file are
+  serialized per-path and written record+newline in a single
+  buffer — parallel sub-agent spawns append `SubagentSpawned` to
+  the parent's file concurrently and used to tear lines
+  (`}{`-joins) that the reader then skipped with a warn.
   HF-route requests carry `X-HF-Session-Id` (a UUID derived from the
   session/sub-agent id, task-local-scoped around each turn) so the
   router pins fireworks-ai's replica-local prompt cache per session

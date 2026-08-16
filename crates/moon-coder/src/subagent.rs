@@ -948,7 +948,7 @@ async fn run_subagent_loop(
 				&standard_model,
 				&messages,
 				&tool_defs,
-				None,
+				Some(crate::defaults::TURN_MAX_OUTPUT_TOKENS),
 				&cancel,
 				|event| match event {
 					StreamEvent::ContentDelta { delta } => {

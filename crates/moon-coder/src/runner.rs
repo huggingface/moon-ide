@@ -5953,7 +5953,7 @@ async fn run_turn(
 				&standard_model,
 				&messages,
 				&tool_defs,
-				None,
+				Some(crate::defaults::TURN_MAX_OUTPUT_TOKENS),
 				&cancel,
 				|event| match event {
 					StreamEvent::ContentDelta { delta } => {
@@ -6130,16 +6130,32 @@ async fn run_turn(
 			// The provider cut the answer off at the output-token
 			// ceiling — what we have is a fragment, not a final
 			// message. Ask for the rest instead of ending the turn
-			// mid-sentence. The partial is already in `messages`
-			// (and on disk), so the model sees its own tail and
-			// resumes from it.
+			// mid-sentence. For a *content* truncation the partial
+			// is already in `messages` (and on disk), so the model
+			// sees its own tail and resumes from it. A *thinking-
+			// only* truncation is different: reasoning is not
+			// replayed to the model, so it has no memory of the cut
+			// thread — quote the tail of it in the sentinel or the
+			// model re-derives from scratch and hits the cap again.
 			if response.hit_output_cap() && output_cap_continuations < OUTPUT_CAP_CONTINUATIONS {
 				output_cap_continuations += 1;
+				let content_is_empty = response.content.as_deref().map(str::trim).unwrap_or("").is_empty();
+				let prompt = if content_is_empty {
+					let tail = response
+						.thinking
+						.as_deref()
+						.map(|t| tail_chars(t, 2_000))
+						.unwrap_or_default();
+					crate::defaults::output_cap_thinking_continuation_prompt(tail)
+				} else {
+					OUTPUT_CAP_CONTINUATION_PROMPT.to_owned()
+				};
 				tracing::warn!(
 					continuation = output_cap_continuations,
+					thinking_only = content_is_empty,
 					"assistant message hit the output-token ceiling; asking the model to continue"
 				);
-				push_sentinel_user_message(rt, sink, OUTPUT_CAP_CONTINUATION_PROMPT.to_owned()).await;
+				push_sentinel_user_message(rt, sink, prompt).await;
 				continue;
 			}
 			// Final assistant message of the turn — unless the user
@@ -6190,6 +6206,16 @@ async fn run_turn(
 /// stopped calling tools, or why one answer arrived in two bubbles.
 /// Persistence is best-effort; a write failure logs and the turn
 /// carries on with the in-memory history.
+/// Last `n` chars of `s`, char-boundary safe. Used to quote the
+/// tail of a truncated reasoning trace into the continuation
+/// sentinel without blowing up the prompt.
+fn tail_chars(s: &str, n: usize) -> &str {
+	match s.char_indices().rev().nth(n.saturating_sub(1)) {
+		Some((idx, _)) => &s[idx..],
+		None => s,
+	}
+}
+
 async fn push_sentinel_user_message(rt: &Arc<SessionRuntime>, sink: &FolderEventSink, text: String) {
 	{
 		let mut session = rt.session.lock().await;
@@ -6266,33 +6292,40 @@ done, what's still unfinished, and any uncertainty. If the user needs to take a 
 	let thinking_emitted = std::sync::atomic::AtomicBool::new(false);
 	let mut response = state
 		.inference
-		.chat_completion_stream(&standard_model, &messages, &[], None, cancel, |event| match event {
-			StreamEvent::ContentDelta { delta } => {
-				if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
-					sink_for_cb.send(CoderEvent::AssistantMessageStart { id: id_for_cb.clone() });
+		.chat_completion_stream(
+			&standard_model,
+			&messages,
+			&[],
+			Some(crate::defaults::TURN_MAX_OUTPUT_TOKENS),
+			cancel,
+			|event| match event {
+				StreamEvent::ContentDelta { delta } => {
+					if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+						sink_for_cb.send(CoderEvent::AssistantMessageStart { id: id_for_cb.clone() });
+					}
+					sink_for_cb.send(CoderEvent::AssistantMessageDelta {
+						id: id_for_cb.clone(),
+						delta: delta.to_string(),
+					});
 				}
-				sink_for_cb.send(CoderEvent::AssistantMessageDelta {
-					id: id_for_cb.clone(),
-					delta: delta.to_string(),
-				});
-			}
-			StreamEvent::ThinkingDelta { delta } => {
-				if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
-					sink_for_cb.send(CoderEvent::AssistantMessageStart { id: id_for_cb.clone() });
+				StreamEvent::ThinkingDelta { delta } => {
+					if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+						sink_for_cb.send(CoderEvent::AssistantMessageStart { id: id_for_cb.clone() });
+					}
+					thinking_emitted.store(true, std::sync::atomic::Ordering::Relaxed);
+					sink_for_cb.send(CoderEvent::AssistantThinkingDelta {
+						id: id_for_cb.clone(),
+						delta: delta.to_string(),
+					});
 				}
-				thinking_emitted.store(true, std::sync::atomic::Ordering::Relaxed);
-				sink_for_cb.send(CoderEvent::AssistantThinkingDelta {
-					id: id_for_cb.clone(),
-					delta: delta.to_string(),
-				});
-			}
-			StreamEvent::ToolCallDelta { .. } => {
-				// Tools were disabled in the request; if the model
-				// still emits a tool-call delta we silently drop it.
-				// The dispatcher won't run anything since we won't
-				// loop again.
-			}
-		})
+				StreamEvent::ToolCallDelta { .. } => {
+					// Tools were disabled in the request; if the model
+					// still emits a tool-call delta we silently drop it.
+					// The dispatcher won't run anything since we won't
+					// loop again.
+				}
+			},
+		)
 		.await?;
 
 	// Defensive: tools are disabled on this round-trip, so a
@@ -10918,6 +10951,15 @@ mod tests {
 		assert_eq!(rows[0]["status"], "retired");
 		assert_eq!(rows[1]["worker_id"], "w-2");
 		assert!(rows[1]["error"].as_str().unwrap().contains("nope"));
+	}
+
+	#[test]
+	fn tail_chars_is_boundary_safe() {
+		assert_eq!(super::tail_chars("hello", 2), "lo");
+		assert_eq!(super::tail_chars("hello", 99), "hello");
+		// Multi-byte: never split a char.
+		assert_eq!(super::tail_chars("héllo", 5), "héllo");
+		assert_eq!(super::tail_chars("aé", 1), "é");
 	}
 
 	#[test]

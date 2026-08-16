@@ -90,10 +90,40 @@ pub const OUTPUT_CAP_CONTINUATIONS: usize = 3;
 /// rendered like any other user turn, same posture as the
 /// tool-budget wrap-up sentinel: the transcript should make it
 /// obvious why an answer arrived in two bubbles.
+/// Explicit per-request output-token budget for the main turn
+/// loop (and the sub-agent loop). Sent as `max_tokens` so the
+/// provider's default ceiling doesn't apply: several HF-router
+/// deployments default to 2,048, which reasoning models burn
+/// entirely on thinking — the turn then loops through
+/// output-cap continuations without ever producing an answer
+/// (observed live with Kimi-K3: three consecutive ~2k-token
+/// thinking-only responses, all `stop=length`). 8,192 is 4x that
+/// observed default while staying under every serving stack's
+/// completion ceiling; the continuation path still catches the
+/// rare genuinely-longer answer.
+pub const TURN_MAX_OUTPUT_TOKENS: u32 = 8_192;
+
 pub const OUTPUT_CAP_CONTINUATION_PROMPT: &str =
 	"[Your previous message hit the output-token limit and was cut off mid-sentence. \
 Continue it from exactly where it stopped — do not restart, do not repeat what you already wrote, \
 and do not apologise. If the remaining content is long, prioritise finishing the substance over formatting.]";
+
+/// Variant of the continuation sentinel for responses cut off
+/// while still *reasoning* — no content was produced, and (outside
+/// the native Anthropic path) reasoning is not replayed to the
+/// model, so "continue where you stopped" would be impossible: the
+/// model has zero memory of the cut thinking and re-derives from
+/// scratch, hitting the cap again. Quoting the tail of the lost
+/// reasoning gives it a real thread to pick up.
+pub fn output_cap_thinking_continuation_prompt(thinking_tail: &str) -> String {
+	format!(
+		"[Your previous response hit the output-token limit while you were still reasoning - \
+no answer was produced, and that reasoning is NOT preserved in the conversation. \
+The tail of it is quoted below so you don't have to re-derive everything. \
+Pick up from that point, keep any further reasoning brief, and produce the actual \
+answer or tool calls now.]\n\n[tail of your cut-off reasoning]\n{thinking_tail}"
+	)
+}
 
 /// Per-model context-window size in tokens. Drives the in-panel
 /// usage ring and the auto-compaction threshold.

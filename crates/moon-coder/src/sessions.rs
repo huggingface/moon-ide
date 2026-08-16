@@ -2224,8 +2224,28 @@ fn now_ms() -> i64 {
 		.unwrap_or(0)
 }
 
+/// Per-file append serialization. Concurrent appends to the same
+/// session JSONL are real: a parallel sub-agent batch persists one
+/// `SubagentSpawned` record per sub-agent into the *parent's* file
+/// from separate tasks, racing each other (and the parent turn's
+/// own appends). Unserialized, the record body and its trailing
+/// newline interleave across writers and produce `}{`-joined lines
+/// plus stray blank lines that the reader then skips with a warn —
+/// observed live. The map grows one entry per session file touched
+/// per process lifetime, which is bounded and small.
+fn append_lock_for(path: &Utf8Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+	use std::collections::HashMap;
+	use std::sync::{Arc, Mutex, OnceLock};
+	static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+	let map = LOCKS.get_or_init(Mutex::default);
+	let mut guard = map.lock().expect("session append lock map poisoned");
+	guard.entry(path.to_string()).or_default().clone()
+}
+
 pub async fn append_record(dir: &Utf8Path, header: &SessionHeader, record: &SessionRecord) -> Result<(), CoderError> {
 	let path = session_path(dir, &header.id);
+	let lock = append_lock_for(&path);
+	let _append_guard = lock.lock().await;
 	if let Some(parent) = path.parent() {
 		tokio::fs::create_dir_all(parent.as_std_path())
 			.await
@@ -2246,15 +2266,18 @@ pub async fn append_record(dir: &Utf8Path, header: &SessionHeader, record: &Sess
 		.open(path.as_std_path())
 		.await
 		.map_err(CoderError::from)?;
+	// One buffer, one write: even with the per-file lock, keeping
+	// the record and its newline in a single `write_all` means a
+	// crash or racing writer can never tear a line in half.
+	let mut buf = String::new();
 	if !exists {
-		let header_line = serde_json::to_string(header).map_err(CoderError::from)?;
-		file.write_all(header_line.as_bytes()).await.map_err(CoderError::from)?;
-		file.write_all(b"\n").await.map_err(CoderError::from)?;
+		buf.push_str(&serde_json::to_string(header).map_err(CoderError::from)?);
+		buf.push('\n');
 	}
 	let wire = record_to_pi_wire(record, header, now_ms());
-	let body_line = serde_json::to_string(&wire).map_err(CoderError::from)?;
-	file.write_all(body_line.as_bytes()).await.map_err(CoderError::from)?;
-	file.write_all(b"\n").await.map_err(CoderError::from)?;
+	buf.push_str(&serde_json::to_string(&wire).map_err(CoderError::from)?);
+	buf.push('\n');
+	file.write_all(buf.as_bytes()).await.map_err(CoderError::from)?;
 	file.flush().await.map_err(CoderError::from)?;
 	Ok(())
 }
@@ -2273,6 +2296,11 @@ pub async fn append_record(dir: &Utf8Path, header: &SessionHeader, record: &Sess
 /// body lines are byte-preserved.
 pub async fn rewrite_header(dir: &Utf8Path, header: &SessionHeader) -> Result<(), CoderError> {
 	let path = session_path(dir, &header.id);
+	// Full read-modify-write: must hold the same per-file lock as
+	// `append_record` or a concurrent append lands between the read
+	// and the write and silently vanishes.
+	let lock = append_lock_for(&path);
+	let _append_guard = lock.lock().await;
 	if !tokio::fs::try_exists(path.as_std_path()).await.unwrap_or(false) {
 		return Ok(());
 	}
