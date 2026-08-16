@@ -52,6 +52,8 @@
 //!   top) and resumes a finished one with a follow-up (history
 //!   rebuilt from its JSONL, fresh detached loop, parent agent not
 //!   involved). See [`queue_subagent_steer`] / [`resume_subagent`].
+//!   The parent agent rides the same channel for its *detached*
+//!   runs via the `task_steer` tool (ADR 0071).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -152,6 +154,11 @@ fn kick_off_subagent_fetch(folder: &Arc<WorkspaceFolderEntry>) {
 struct QueuedSubagentSteer {
 	id: String,
 	text: String,
+	/// `true` when the steer came from the supervising agent (the
+	/// parent's `task_steer` tool) rather than the user's pop-out
+	/// composer. Rides the existing `from_coordinator` wire flag so
+	/// the transcript tags the row as agent-sent, not user-sent.
+	from_coordinator: bool,
 }
 
 /// Live steer channel for one running sub-agent. An entry exists
@@ -183,10 +190,12 @@ fn subagent_steer_registry() -> &'static Mutex<HashMap<String, SubagentSteerChan
 /// Queue a mid-flight steer against a running sub-agent. Emits the
 /// queued `UserMessage` row into the sub-agent's transcript
 /// immediately; the text reaches the model at the top of the
-/// sub-agent's next iteration. Returns `false` when the sub-agent
-/// isn't running (finished, aborted, or unknown id) — the message
-/// is not delivered and the caller should keep it.
-pub(crate) fn queue_subagent_steer(subagent_id: &str, text: String) -> bool {
+/// sub-agent's next iteration. `from_coordinator` marks steers sent
+/// by the supervising agent (`task_steer`) rather than the user's
+/// pop-out composer. Returns `false` when the sub-agent isn't
+/// running (finished, aborted, or unknown id) — the message is not
+/// delivered and the caller should keep it.
+pub(crate) fn queue_subagent_steer(subagent_id: &str, text: String, from_coordinator: bool) -> bool {
 	let mut registry = subagent_steer_registry().lock().expect("steer registry poisoned");
 	let Some(channel) = registry.get_mut(subagent_id) else {
 		return false;
@@ -195,6 +204,7 @@ pub(crate) fn queue_subagent_steer(subagent_id: &str, text: String) -> bool {
 	channel.queue.push(QueuedSubagentSteer {
 		id: steer_id.clone(),
 		text: text.clone(),
+		from_coordinator,
 	});
 	channel.sink.send(wrap_inner(
 		subagent_id,
@@ -204,7 +214,7 @@ pub(crate) fn queue_subagent_steer(subagent_id: &str, text: String) -> bool {
 			images: Vec::new(),
 			queued: true,
 			created_at_ms: Some(current_time_ms()),
-			from_coordinator: false,
+			from_coordinator,
 		},
 	));
 	true
@@ -239,7 +249,7 @@ pub(crate) fn claim_subagent_for_resume(
 	let mut registry = subagent_steer_registry().lock().expect("steer registry poisoned");
 	if registry.contains_key(subagent_id) {
 		drop(registry);
-		queue_subagent_steer(subagent_id, text.to_string());
+		queue_subagent_steer(subagent_id, text.to_string(), false);
 		return None;
 	}
 	let cancel = CancellationToken::new();
@@ -387,7 +397,7 @@ The sub-agent has no access to your conversation history — describe the task s
 				},
 				"detach": {
 					"type": "boolean",
-					"description": "When true, the call returns immediately with a `subagent_id` handle instead of blocking on the report: the sub-agent runs in the background, its finish wakes you with a notice, and you fetch the report with `task_collect(subagent_id)` (or stop it with `task_abort`). Default false (synchronous). Prefer detach for slow, independent work you don't need the answer to before continuing — long test suites, background audits."
+					"description": "When true, the call returns immediately with a `subagent_id` handle instead of blocking on the report: the sub-agent runs in the background, its finish wakes you with a notice, and you fetch the report with `task_collect(subagent_id)` (steer it mid-run with `task_steer`, or stop it with `task_abort`). Default false (synchronous). Prefer detach for slow, independent work you don't need the answer to before continuing — long test suites, background audits."
 				}
 			},
 			"required": ["task"]
@@ -415,6 +425,33 @@ pub fn task_collect_tool_definition() -> ToolDefinition {
 					}
 				},
 				"required": ["subagent_id"]
+			}),
+		)
+}
+
+/// `task_steer` — queue a steering message into a running detached
+/// sub-agent (ADR 0071). Rides the same steer channel as the
+/// pop-out composer, so delivery semantics are identical: queued
+/// now, drained at the top of the sub-agent's next iteration.
+/// Advertised alongside `task_collect` / `task_abort` to `Agent`
+/// mode only.
+pub fn task_steer_tool_definition() -> ToolDefinition {
+	ToolDefinition::function(
+			"task_steer",
+			"Send a steering message to a running detached sub-agent (one spawned with `task({ ..., detach: true })`). The message is queued and delivered at the top of the sub-agent's next iteration — the same way a user steers a session. Use it to redirect a run that's drifting, narrow or extend its scope, or feed it something you just learned; don't use it to poll (use `task_collect` with `wait_ms` for that). Returns `{ status: \"steered\" }`, or `{ status: \"not_running\" }` when the run already settled (collect its report instead). Only ids your own session spawned with `detach: true` can be steered.",
+			json!({
+				"type": "object",
+				"properties": {
+					"subagent_id": {
+						"type": "string",
+						"description": "The `subagent_id` a detached `task` call returned."
+					},
+					"text": {
+						"type": "string",
+						"description": "The steering message. Self-contained — the sub-agent doesn't see your conversation history."
+					}
+				},
+				"required": ["subagent_id", "text"]
 			}),
 		)
 }
@@ -862,7 +899,7 @@ async fn run_subagent_loop(
 				&SessionRecord::User {
 					text: steer.text.clone(),
 					images: Vec::new(),
-					from_coordinator: false,
+					from_coordinator: steer.from_coordinator,
 				},
 			)
 			.await;
@@ -875,7 +912,7 @@ async fn run_subagent_loop(
 					images: Vec::new(),
 					queued: false,
 					created_at_ms: Some(crate::sessions::current_time_ms()),
-					from_coordinator: false,
+					from_coordinator: steer.from_coordinator,
 				},
 			));
 		}
@@ -1855,39 +1892,51 @@ mod tests {
 		let sink = FolderEventSink::new(sender, "/folder", "sess-parent");
 
 		// Unknown id → rejected, nothing emitted.
-		assert!(!queue_subagent_steer("sub-nope", "hello".into()));
+		assert!(!queue_subagent_steer("sub-nope", "hello".into(), false));
 
 		register_subagent_steer_channel("sub-steer-test", sink, CancellationToken::new());
 		assert!(!has_queued_subagent_steers("sub-steer-test"));
-		assert!(queue_subagent_steer("sub-steer-test", "first".into()));
-		assert!(queue_subagent_steer("sub-steer-test", "second".into()));
+		assert!(queue_subagent_steer("sub-steer-test", "first".into(), false));
+		assert!(queue_subagent_steer("sub-steer-test", "second".into(), true));
 		assert!(has_queued_subagent_steers("sub-steer-test"));
 
-		// Queue-time emission: one wrapped queued UserMessage per steer.
-		for expected in ["first", "second"] {
+		// Queue-time emission: one wrapped queued UserMessage per
+		// steer, carrying the sender flag (user vs parent agent).
+		for (expected, expected_from_coordinator) in [("first", false), ("second", true)] {
 			let envelope = receiver.try_recv().unwrap();
 			let CoderEvent::SubagentEvent { subagent_id, inner } = envelope.event else {
 				panic!("expected SubagentEvent");
 			};
 			assert_eq!(subagent_id, "sub-steer-test");
-			let CoderEvent::UserMessage { text, queued, .. } = *inner else {
+			let CoderEvent::UserMessage {
+				text,
+				queued,
+				from_coordinator,
+				..
+			} = *inner
+			else {
 				panic!("expected wrapped UserMessage");
 			};
 			assert_eq!(text, expected);
 			assert!(queued);
+			assert_eq!(from_coordinator, expected_from_coordinator);
 		}
 
-		// Drain preserves queue order and empties the channel.
+		// Drain preserves queue order (and the sender flag) and
+		// empties the channel.
 		let drained = take_queued_subagent_steers("sub-steer-test");
 		assert_eq!(
-			drained.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
-			vec!["first", "second"]
+			drained
+				.iter()
+				.map(|s| (s.text.as_str(), s.from_coordinator))
+				.collect::<Vec<_>>(),
+			vec![("first", false), ("second", true)]
 		);
 		assert!(!has_queued_subagent_steers("sub-steer-test"));
 
 		// After the run settles, the channel is gone and steers bounce.
 		unregister_subagent_steer_channel("sub-steer-test");
-		assert!(!queue_subagent_steer("sub-steer-test", "too late".into()));
+		assert!(!queue_subagent_steer("sub-steer-test", "too late".into(), false));
 
 		// Resume claim: no channel → registers one and hands back
 		// its token; a raced second claim queues a steer instead.

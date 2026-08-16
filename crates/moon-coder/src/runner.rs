@@ -4190,7 +4190,7 @@ impl CoderHandle {
 	/// id, or no JSONL on disk); the panel keeps the draft.
 	pub async fn continue_subagent(&self, subagent_id: &str, text: String) -> Result<bool, CoderError> {
 		// Fast path: still running → steer.
-		if crate::subagent::queue_subagent_steer(subagent_id, text.clone()) {
+		if crate::subagent::queue_subagent_steer(subagent_id, text.clone(), false) {
 			return Ok(true);
 		}
 		sessions::validate_session_id(subagent_id)?;
@@ -5711,6 +5711,7 @@ async fn run_turn(
 		// the same `Agent` mode that sees `task`, so sub-agents and
 		// coordinators never see them.
 		tool_defs.push(crate::subagent::task_collect_tool_definition());
+		tool_defs.push(crate::subagent::task_steer_tool_definition());
 		tool_defs.push(crate::subagent::task_abort_tool_definition());
 	}
 	if mode.allows_ask_user() {
@@ -6473,6 +6474,8 @@ async fn dispatch_tool_calls(
 			} else if call.function.name == "task_collect" {
 				// Detached-sub-agent report fetch ([ADR 0053]).
 				handle_task_collect(state, rt, &args).await
+			} else if call.function.name == "task_steer" {
+				handle_task_steer(state, rt, &args).await
 			} else if call.function.name == "task_abort" {
 				handle_task_abort(state, rt, &args).await
 			} else if call.function.name == "ask_user" {
@@ -6985,6 +6988,33 @@ async fn handle_task_detached(
 	}))
 }
 
+/// Resolve `subagent_id` to one of the calling session's detached
+/// runs ([ADR 0053]) — the shared ownership gate of `task_collect` /
+/// `task_steer` / `task_abort`. `register` / `prune_parent` keep
+/// `by_parent` and `entries` in lockstep, so an ownership hit
+/// implies a live entry — one miss branch covers both "never yours"
+/// and "lost to a restart".
+async fn own_detached_entry(
+	state: &Arc<CoderState>,
+	rt: &Arc<SessionRuntime>,
+	tool: &str,
+	subagent_id: &str,
+) -> Result<Arc<DetachedEntry>, CoderError> {
+	let parent_session_id = rt.session.lock().await.header.id.clone();
+	let registry = state.detached_tasks.read().await;
+	if registry.is_detached_of(&parent_session_id, subagent_id) {
+		if let Some(entry) = registry.entry(subagent_id) {
+			return Ok(entry);
+		}
+	}
+	Err(CoderError::invalid_args(
+		tool,
+		format!(
+			"no detached sub-agent `{subagent_id}` for this session — either the id is not one this session's `task({{ detach: true }})` calls returned (a synchronous `task` has no handle), or the in-memory handle was lost to an IDE restart; a finished run's transcript is on disk under the parent session's sub-agent directory"
+		),
+	))
+}
+
 /// `task_collect` — return a detached run's report, optionally
 /// blocking up to `wait_ms` for it to settle. Only the parent that
 /// spawned the run may collect it.
@@ -7001,27 +7031,7 @@ async fn handle_task_collect(
 	}
 	let parsed: CollectArgs =
 		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("task_collect", err.to_string()))?;
-	let parent_session_id = rt.session.lock().await.header.id.clone();
-	// `register` / `prune_parent` keep `by_parent` and `entries` in
-	// lockstep, so an ownership hit implies a live entry — one miss
-	// branch covers both "never yours" and "lost to a restart".
-	let entry = {
-		let registry = state.detached_tasks.read().await;
-		if registry.is_detached_of(&parent_session_id, &parsed.subagent_id) {
-			registry.entry(&parsed.subagent_id)
-		} else {
-			None
-		}
-	};
-	let Some(entry) = entry else {
-		return Err(CoderError::invalid_args(
-			"task_collect",
-			format!(
-				"no detached sub-agent `{}` for this session — either the id is not one this session's `task({{ detach: true }})` calls returned (a synchronous `task` has no handle), or the in-memory handle was lost to an IDE restart; a finished run's transcript is on disk under the parent session's sub-agent directory",
-				parsed.subagent_id
-			),
-		));
-	};
+	let entry = own_detached_entry(state, rt, "task_collect", &parsed.subagent_id).await?;
 	// Already settled → return the cached finish immediately.
 	if let Some(value) = detached_collect_value(&entry).await {
 		return Ok(value);
@@ -7061,6 +7071,39 @@ async fn detached_collect_value(entry: &DetachedEntry) -> Option<Value> {
 	}
 }
 
+/// `task_steer` — queue a steering message into a running detached
+/// sub-agent (ADR 0071). Rides the pop-out composer's steer channel
+/// ([`crate::subagent::queue_subagent_steer`]), tagged
+/// `from_coordinator` so the transcript shows the row as agent-sent.
+/// Only the parent that spawned the run may steer it, mirroring
+/// `task_collect` / `task_abort` ownership.
+async fn handle_task_steer(
+	state: &Arc<CoderState>,
+	rt: &Arc<SessionRuntime>,
+	args: &Value,
+) -> Result<Value, CoderError> {
+	#[derive(serde::Deserialize)]
+	struct SteerArgs {
+		subagent_id: String,
+		text: String,
+	}
+	let parsed: SteerArgs =
+		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("task_steer", err.to_string()))?;
+	if parsed.text.trim().is_empty() {
+		return Err(CoderError::invalid_args("task_steer", "text must not be empty"));
+	}
+	own_detached_entry(state, rt, "task_steer", &parsed.subagent_id).await?;
+	// The steer channel exists exactly while the run's loop is
+	// live, so a queue miss means the run already settled.
+	if !crate::subagent::queue_subagent_steer(&parsed.subagent_id, parsed.text, true) {
+		return Ok(json!({
+			"status": "not_running",
+			"hint": "the run already settled; call `task_collect` for its report",
+		}));
+	}
+	Ok(json!({ "status": "steered" }))
+}
+
 /// `task_abort` — cancel a running detached sub-agent's own token.
 /// Scoped to the one run; never touches the parent turn or its
 /// sibling sub-agents.
@@ -7075,21 +7118,12 @@ async fn handle_task_abort(
 	}
 	let parsed: AbortArgs =
 		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("task_abort", err.to_string()))?;
-	let parent_session_id = rt.session.lock().await.header.id.clone();
-	let registry = state.detached_tasks.read().await;
-	if !registry.is_detached_of(&parent_session_id, &parsed.subagent_id) {
-		return Err(CoderError::invalid_args(
-			"task_abort",
-			format!("no detached sub-agent `{}` for this session", parsed.subagent_id),
-		));
+	let entry = own_detached_entry(state, rt, "task_abort", &parsed.subagent_id).await?;
+	if entry.finish.lock().await.is_some() {
+		return Ok(json!({ "status": "not_running" }));
 	}
-	match registry.entry(&parsed.subagent_id) {
-		Some(entry) if entry.finish.lock().await.is_none() => {
-			entry.cancel.cancel();
-			Ok(json!({ "status": "aborted" }))
-		}
-		_ => Ok(json!({ "status": "not_running" })),
-	}
+	entry.cancel.cancel();
+	Ok(json!({ "status": "aborted" }))
 }
 
 /// Per-parent background task that watches the event broadcast for
