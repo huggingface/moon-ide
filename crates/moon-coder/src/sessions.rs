@@ -1684,6 +1684,15 @@ pub struct SessionSummary {
 	/// header's `mode` field (which elides the same way).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub mode: Option<String>,
+	/// True when the newest *conversational* record is a persisted
+	/// turn error (`moon_error`) — i.e. the session's last turn
+	/// failed and nothing has been said since. Lets the sessions
+	/// list badge failed sessions so the user knows which ones to
+	/// retry (a coordinator fleet especially: workers that died on
+	/// a rate limit look identical to finished ones otherwise).
+	/// Cleared implicitly by any later user/assistant/tool record.
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub last_error: bool,
 }
 
 /// Full load: header + every record in order. Used when the user
@@ -2085,6 +2094,7 @@ pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError>
 		)
 	})?;
 	let mut line = String::new();
+	let mut last_error = false;
 	loop {
 		line.clear();
 		let read = reader.read_line(&mut line).await.map_err(CoderError::from)?;
@@ -2099,8 +2109,21 @@ pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError>
 			continue;
 		};
 		for record in pi_wire_to_records(&value) {
-			if let SessionRecord::TitleUpdate { title } = record {
-				header.title = title;
+			match record {
+				SessionRecord::TitleUpdate { title } => {
+					header.title = title;
+				}
+				SessionRecord::Error { .. } => {
+					last_error = true;
+				}
+				// Conversation moved on — the error is history.
+				SessionRecord::User { .. }
+				| SessionRecord::Assistant { .. }
+				| SessionRecord::Tool { .. }
+				| SessionRecord::Compaction { .. } => {
+					last_error = false;
+				}
+				_ => {}
 			}
 		}
 	}
@@ -2113,6 +2136,7 @@ pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError>
 		worktree_branch: header.worktree_branch,
 		committed_branch: header.committed_branch,
 		mode: header.mode,
+		last_error,
 	})
 }
 
@@ -4668,6 +4692,7 @@ mod tests {
 				worktree_branch: None,
 				committed_branch: None,
 				mode: coord.mode.clone(),
+				last_error: false,
 			};
 			let json = serde_json::to_string(&summary).unwrap();
 			assert!(json.contains("\"mode\":\"coordinator\""));
@@ -4681,6 +4706,7 @@ mod tests {
 				worktree_branch: None,
 				committed_branch: None,
 				mode: None,
+				last_error: false,
 			};
 			let json = serde_json::to_string(&agent_summary).unwrap();
 			assert!(!json.contains("\"mode\""));

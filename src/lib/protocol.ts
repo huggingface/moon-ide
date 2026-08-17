@@ -1920,6 +1920,14 @@ export type CoderSessionSummary = {
 	 * header's `mode` field.
 	 */
 	mode?: string | null;
+	/**
+	 * True when the session's newest conversational record is a
+	 * persisted turn error — the last turn failed and nothing has
+	 * been said since. Lets the sessions list badge failed sessions
+	 * (esp. coordinator workers) so the user knows which to retry.
+	 * Absent when false.
+	 */
+	last_error?: boolean;
 };
 
 /**

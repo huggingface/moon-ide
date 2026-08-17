@@ -719,3 +719,10 @@ Prose, not commitments — revisit when someone asks:
   that fails at the transport level (not connected / connection
   closed / call timed out) tears the socket down, reconnects, and
   retries once before surfacing an error.
+- **Failed-session badges**: `SessionSummary.last_error` is true when
+  the newest conversational record is a persisted turn error (folded
+  during the summary scan, so it survives restarts and applies to
+  worker sessions a coordinator spawned). The session list shows a
+  red `!` in place of the idle pip — which sessions need a retry is
+  visible at a glance. Kept live between refreshes by the error /
+  user_message event stream.

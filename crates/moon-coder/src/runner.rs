@@ -804,6 +804,7 @@ impl Session {
 			worktree_branch: self.header.worktree_branch.clone(),
 			committed_branch: self.header.committed_branch.clone(),
 			mode: self.header.mode.clone(),
+			last_error: false,
 		}
 	}
 }
@@ -3127,6 +3128,7 @@ impl CoderHandle {
 			worktree_branch: header.worktree_branch,
 			committed_branch: header.committed_branch,
 			mode: header.mode,
+			last_error: false,
 		})
 	}
 
@@ -3381,6 +3383,7 @@ impl CoderHandle {
 			worktree_branch: header.worktree_branch.clone(),
 			committed_branch: header.committed_branch.clone(),
 			mode: header.mode.clone(),
+			last_error: false,
 		};
 		// Snapshot what the panel needs for the restore-time
 		// usage hint *before* the move into `Session`. We prefer

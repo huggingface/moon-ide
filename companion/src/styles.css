@@ -135,6 +135,18 @@ a {
 	gap: 0.2rem;
 }
 
+/* Failed-last-turn badge: replaces the idle pip with a red "!" so
+   the list telegraphs which sessions need a retry (coordinator
+   fleets especially). */
+.pip.failed {
+	background: none;
+	color: var(--danger, #e5484d);
+	font-weight: 700;
+	font-size: 0.85rem;
+	line-height: 1;
+	width: auto;
+	height: auto;
+}
 .pip {
 	display: inline-block;
 	width: 8px;

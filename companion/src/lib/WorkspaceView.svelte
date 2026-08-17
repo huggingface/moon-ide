@@ -563,6 +563,8 @@
 					</button>
 					{#if app.busySessions.has(s.id)}
 						<span class="pip live" title="Running"></span>
+					{:else if s.last_error}
+						<span class="pip failed" title="Last turn failed — open to retry">!</span>
 					{:else}
 						<span class="pip" title="Idle"></span>
 					{/if}

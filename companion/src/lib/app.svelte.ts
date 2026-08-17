@@ -127,6 +127,10 @@ export type SessionSummary = {
 	/** Top-level session mode (ADR 0030); absent for the default
 	 * `agent` mode, `"coordinator"` for an orchestrator session. */
 	mode?: string | null;
+	/** True when the session's last conversational record is a
+	 * persisted turn error — badge it in the list so the user
+	 * knows which sessions (esp. coordinator workers) to retry. */
+	last_error?: boolean;
 };
 
 /** A rendered transcript row. The phone collapses the coder's
@@ -143,7 +147,7 @@ export type TranscriptRow =
 			images: string[];
 			/** Wall-clock ms when the message landed — hover/long-press
 			 * tooltip, mirroring the desktop transcript. */
-			at?: number;
+			at?: number | undefined;
 	  }
 	| { kind: 'assistant'; id: string; text: string; thinking: string; at?: number }
 	| {
@@ -1979,6 +1983,16 @@ class CompanionState {
 	/** Reduce a coder event envelope onto the transcript rows. */
 	/** Toggle a session's busy state in the `busySessions` set.
 	 * Replaces the set so Svelte reactivity fires. */
+	/** Flip a session's failed-last-turn badge in the list, live —
+	 * the authoritative value still comes from the backend scan on
+	 * the next session-list fetch. */
+	#markSessionError(sid: string, failed: boolean): void {
+		const row = this.sessions.find((x) => x.id === sid);
+		if (row && Boolean(row.last_error) !== failed) {
+			row.last_error = failed;
+		}
+	}
+
 	#markBusy(sid: string, busy: boolean): void {
 		const next = new Set(this.busySessions);
 		if (busy) {
@@ -2068,7 +2082,13 @@ class CompanionState {
 			} else if (!fromReplay && ev.kind === 'user_message') {
 				this.#markBusy(eventSid, true);
 				this.#sessionFolder.set(eventSid, eventFolder);
+				// A fresh live message clears the row's stale
+				// failed-turn badge without waiting for a refetch.
+				this.#markSessionError(eventSid, false);
 			} else if (!fromReplay && (ev.kind === 'turn_complete' || ev.kind === 'aborted' || ev.kind === 'error')) {
+				if (ev.kind === 'error') {
+					this.#markSessionError(eventSid, true);
+				}
 				// `!fromReplay`: every windowed replay ends with a
 				// synthetic terminator (the busy-reset for settled
 				// sessions), which would flip a genuinely-running
