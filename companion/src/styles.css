@@ -147,6 +147,17 @@ a {
 	width: auto;
 	height: auto;
 }
+/* Interrupted-turn badge: amber sibling of `.failed` — the turn
+   died (restart/stop) rather than erroring; open to relaunch. */
+.pip.interrupted {
+	background: none;
+	color: var(--warn, #d4a017);
+	font-weight: 700;
+	font-size: 0.85rem;
+	line-height: 1;
+	width: auto;
+	height: auto;
+}
 .pip {
 	display: inline-block;
 	width: 8px;

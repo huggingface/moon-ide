@@ -551,7 +551,25 @@
 		<div class="list">
 			{#each app.sessions as s (s.id)}
 				<div class="card list-item session-row">
-					<button class="list-item-main" onclick={() => app.openSession(s.id)}>
+					<button
+						class="list-item-main"
+						onclick={(e) => {
+							// Ctrl/Cmd-click (and middle-click via auxclick
+							// below): open the session in a fresh browser
+							// tab through its hash route, desktop-browser
+							// style, leaving this tab where it is.
+							if (e.ctrlKey || e.metaKey) {
+								window.open(app.sessionRouteHash(s.id), '_blank');
+								return;
+							}
+							app.openSession(s.id);
+						}}
+						onauxclick={(e) => {
+							if (e.button === 1) {
+								window.open(app.sessionRouteHash(s.id), '_blank');
+							}
+						}}
+					>
 						<span class="title-line">
 							{#if s.mode === 'coordinator'}<span
 									class="badge"
@@ -565,6 +583,8 @@
 						<span class="pip live" title="Running"></span>
 					{:else if s.last_error}
 						<span class="pip failed" title="Last turn failed — open to retry">!</span>
+					{:else if s.interrupted}
+						<span class="pip interrupted" title="Turn never finished (restart/stop) — open to relaunch">!</span>
 					{:else}
 						<span class="pip" title="Idle"></span>
 					{/if}

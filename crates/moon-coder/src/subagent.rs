@@ -819,6 +819,11 @@ async fn run_subagent_wrapped(
 	}
 	// Kill + reap any detached processes the sub-agent left running.
 	background.cleanup().await;
+	// Reap the sub-agent's MCP server instances immediately — its
+	// keyed slot (SESSION_HINT = sub-agent id) has no further
+	// turns coming, so there's nothing to keep a browser warm for.
+	// A detached resume respawns fresh on first use.
+	tools.mcp().drop_session_connections(&id).await;
 	unregister_subagent_steer_channel(&id);
 
 	let was_error = outcome.is_err();

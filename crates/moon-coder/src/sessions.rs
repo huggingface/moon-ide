@@ -1693,6 +1693,17 @@ pub struct SessionSummary {
 	/// Cleared implicitly by any later user/assistant/tool record.
 	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
 	pub last_error: bool,
+	/// True when the newest conversational record leaves the turn
+	/// unfinished — a `User` with no answer, an `Assistant` whose
+	/// tool calls never got results, or a `Tool` result with no
+	/// follow-up response. That's the on-disk shape of a turn
+	/// killed by a restart (or a user abort). Paired with the
+	/// retry endpoint it powers "relaunch interrupted sessions":
+	/// the list badges them and opening one offers a retry. The
+	/// runner clears this for sessions whose turn is *currently
+	/// running* — a live turn writes the same partial shapes.
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub interrupted: bool,
 }
 
 /// Full load: header + every record in order. Used when the user
@@ -2095,6 +2106,7 @@ pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError>
 	})?;
 	let mut line = String::new();
 	let mut last_error = false;
+	let mut interrupted = false;
 	loop {
 		line.clear();
 		let read = reader.read_line(&mut line).await.map_err(CoderError::from)?;
@@ -2115,12 +2127,27 @@ pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError>
 				}
 				SessionRecord::Error { .. } => {
 					last_error = true;
+					// A persisted error is a *settled* end state —
+					// surfaced via `last_error`, not both flags.
+					interrupted = false;
 				}
-				// Conversation moved on — the error is history.
-				SessionRecord::User { .. }
-				| SessionRecord::Assistant { .. }
-				| SessionRecord::Tool { .. }
-				| SessionRecord::Compaction { .. } => {
+				SessionRecord::User { .. } => {
+					last_error = false;
+					interrupted = true;
+				}
+				SessionRecord::Assistant { ref tool_calls, .. } => {
+					last_error = false;
+					// Tool calls pending → the turn expected to
+					// continue; a plain answer settles it.
+					interrupted = !tool_calls.is_empty();
+				}
+				SessionRecord::Tool { .. } => {
+					last_error = false;
+					// Result landed but the follow-up round-trip
+					// never did.
+					interrupted = true;
+				}
+				SessionRecord::Compaction { .. } => {
 					last_error = false;
 				}
 				_ => {}
@@ -2137,6 +2164,7 @@ pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError>
 		committed_branch: header.committed_branch,
 		mode: header.mode,
 		last_error,
+		interrupted,
 	})
 }
 
@@ -4693,6 +4721,7 @@ mod tests {
 				committed_branch: None,
 				mode: coord.mode.clone(),
 				last_error: false,
+				interrupted: false,
 			};
 			let json = serde_json::to_string(&summary).unwrap();
 			assert!(json.contains("\"mode\":\"coordinator\""));
@@ -4707,6 +4736,7 @@ mod tests {
 				committed_branch: None,
 				mode: None,
 				last_error: false,
+				interrupted: false,
 			};
 			let json = serde_json::to_string(&agent_summary).unwrap();
 			assert!(!json.contains("\"mode\""));

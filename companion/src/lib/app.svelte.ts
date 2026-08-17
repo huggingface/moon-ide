@@ -131,6 +131,10 @@ export type SessionSummary = {
 	 * persisted turn error — badge it in the list so the user
 	 * knows which sessions (esp. coordinator workers) to retry. */
 	last_error?: boolean;
+	/** True when the last turn never finished (killed by a restart
+	 * or an abort) and the session's turn isn't currently running.
+	 * Badge + relaunch affordance. */
+	interrupted?: boolean;
 };
 
 /** A rendered transcript row. The phone collapses the coder's
@@ -641,6 +645,28 @@ class CompanionState {
 		if (this.activeSession) {
 			params.set('s', this.activeSession);
 		}
+		return `#/w?${params.toString()}`;
+	}
+
+	/** Route hash for a specific session in the current workspace/
+	 * folder — powers ctrl/cmd-click "open in new tab" on session
+	 * rows without navigating this tab. */
+	sessionRouteHash(sessionId: string): string {
+		if (!this.activeWorkspace) {
+			return '#/';
+		}
+		const params = new URLSearchParams();
+		params.set('ws', this.activeWorkspace);
+		if (this.activeIde) {
+			params.set('ide', this.activeIde);
+		}
+		if (this.activeWorkspaceName && this.activeWorkspaceName !== this.activeWorkspace) {
+			params.set('name', this.activeWorkspaceName);
+		}
+		if (this.activeFolder) {
+			params.set('f', this.activeFolder);
+		}
+		params.set('s', sessionId);
 		return `#/w?${params.toString()}`;
 	}
 
@@ -1221,6 +1247,12 @@ class CompanionState {
 		this.turnError = null;
 		this.error = null;
 		this.busy = true;
+		// Light the session-list pip immediately: a retry re-runs
+		// the turn without emitting a fresh `user_message`, so the
+		// event-driven busy tracking would otherwise leave the row
+		// grey until the next list refresh.
+		const retriedSession = this.activeSession;
+		this.#markBusy(retriedSession, true);
 		try {
 			await this.#call(
 				this.activeWorkspace,
@@ -1230,6 +1262,7 @@ class CompanionState {
 			);
 		} catch (e) {
 			this.busy = false;
+			this.#markBusy(retriedSession, false);
 			this.turnError = failed;
 			this.error = e instanceof Error ? e.message : String(e);
 		}
@@ -1616,6 +1649,15 @@ class CompanionState {
 		try {
 			this.#ensureSubscribed(this.activeWorkspace, this.activeIde);
 			await this.#openAndReplay(id);
+			// A session that died mid-turn (restart, abort) gets the
+			// same retry bar an errored one does — the transcript
+			// alone makes it look like the agent just stopped. Only
+			// when nothing is running: a replay of an in-flight
+			// session assert `busy` and the bar hides on that.
+			const meta = this.sessions.find((x) => x.id === id);
+			if (meta?.interrupted && !this.busy && !this.turnError) {
+				this.turnError = 'This turn never finished (interrupted by a restart or stop) — retry to relaunch it.';
+			}
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
 		}
@@ -2079,7 +2121,10 @@ class CompanionState {
 			if (ev.kind === 'replay' && bool(ev, 'in_flight')) {
 				this.#markBusy(eventSid, true);
 				this.#sessionFolder.set(eventSid, eventFolder);
-			} else if (!fromReplay && ev.kind === 'user_message') {
+			} else if (!fromReplay && (ev.kind === 'user_message' || ev.kind === 'assistant_message_start')) {
+				// `assistant_message_start` covers turn starts that
+				// don't emit a user message (retry-last-turn, resume
+				// paths) — any live assistant activity means running.
 				this.#markBusy(eventSid, true);
 				this.#sessionFolder.set(eventSid, eventFolder);
 				// A fresh live message clears the row's stale

@@ -74,6 +74,14 @@ pub fn preset_servers() -> Vec<McpServerConfig> {
 			// and the server runs in the (display-less) workspace
 			// container.
 			"--headless".into(),
+			// In-memory profile. Without this the server locks a
+			// shared persistent profile dir and the *second*
+			// concurrent instance (per-session isolation spawns one
+			// per running agent) dies with "browser already in
+			// use". Costs persisted logins across sessions, which
+			// nothing relied on; state still persists across calls
+			// within a session because the instance stays alive.
+			"--isolated".into(),
 		],
 		env: Default::default(),
 		// No `--output-dir`: artefacts land in the server's own
@@ -136,14 +144,32 @@ pub fn enabled_servers(config: &CoderMcpWorkspaceConfig) -> Vec<McpServerConfig>
 		.collect()
 }
 
-/// Owns the live connections, keyed by server id. Connections are
-/// spawned lazily on first use and kept alive across turns — that's
-/// deliberate: playwright's value is a browser session that persists
-/// between `mcp_call`s. Children die with the IDE (`kill_on_drop`)
-/// or when the user disables the server.
+/// Owns the live connections, keyed by server id **plus the session
+/// driving the call**. Connections are spawned lazily on first use
+/// and kept alive across turns — that's deliberate: playwright's
+/// value is a browser session that persists between `mcp_call`s.
+/// The per-session dimension exists because a coordinator fleet
+/// runs turns in parallel: sharing one playwright process meant
+/// every worker fought over the same browser's "current tab" (tab
+/// switches are global state, so even disciplined per-agent tab
+/// usage races). Each session now gets its own server instance —
+/// its own browser. The session comes from the turn-scoped
+/// [`crate::inference::SESSION_HINT`] task-local; calls outside a
+/// turn (settings probes) fall back to a shared per-server slot.
+/// Children die with the IDE (`kill_on_drop`), when the user
+/// disables the server, or when the session's worker is retired.
 #[derive(Default)]
 pub struct McpManager {
 	connections: Mutex<HashMap<String, Arc<McpConnection>>>,
+}
+
+/// Composite connection key. `\u{1}` can't appear in a server id
+/// (ids are slug-validated) so the two dimensions can't collide.
+fn connection_key(server_id: &str) -> String {
+	let session = crate::inference::SESSION_HINT
+		.try_with(|s| s.clone())
+		.unwrap_or_default();
+	format!("{server_id}\u{1}{session}")
 }
 
 impl McpManager {
@@ -226,12 +252,30 @@ impl McpManager {
 		Ok(out)
 	}
 
-	/// Drop (and thereby kill) a server's connection, if any. Called
-	/// when the user disables or removes the server; also the
-	/// recovery path after a request-level failure so the next call
-	/// respawns fresh.
+	/// Drop (and thereby kill) a server's connections — every
+	/// session's instance of it. Called when the user disables or
+	/// removes the server; also the recovery path after a
+	/// request-level failure so the next call respawns fresh (the
+	/// failure path only kills the failing session's instance via
+	/// the composite key it just used, but a full sweep is fine —
+	/// respawn is lazy and cheap relative to a wedged server).
 	pub async fn drop_connection(&self, id: &str) {
-		self.connections.lock().await.remove(id);
+		self
+			.connections
+			.lock()
+			.await
+			.retain(|key, _| key.split('\u{1}').next() != Some(id));
+	}
+
+	/// Drop the connections a specific session owns (all servers).
+	/// Called when a worker is retired / a session is deleted so
+	/// its headless browsers don't outlive it.
+	pub async fn drop_session_connections(&self, session_id: &str) {
+		self
+			.connections
+			.lock()
+			.await
+			.retain(|key, _| key.split('\u{1}').nth(1) != Some(session_id));
 	}
 
 	/// Drop every live connection. Called when the session's bash
@@ -250,12 +294,13 @@ impl McpManager {
 		spawn: &McpSpawnTarget,
 		cancel: &CancellationToken,
 	) -> Result<Arc<McpConnection>, CoderError> {
+		let key = connection_key(&config.id);
 		let mut connections = self.connections.lock().await;
-		if let Some(existing) = connections.get(&config.id) {
+		if let Some(existing) = connections.get(&key) {
 			if existing.alive() {
 				return Ok(existing.clone());
 			}
-			connections.remove(&config.id);
+			connections.remove(&key);
 		}
 		let conn = Arc::new(McpConnection::spawn(config, spawn)?);
 		// Handshake while holding the map lock: serialises
@@ -286,7 +331,7 @@ impl McpManager {
 				)
 			})?;
 		conn.notify("notifications/initialized", json!({})).await?;
-		connections.insert(config.id.clone(), conn.clone());
+		connections.insert(key, conn.clone());
 		Ok(conn)
 	}
 
@@ -790,6 +835,24 @@ pub fn validate_custom(config: &McpServerConfig) -> Result<(), CoderError> {
 
 #[cfg(test)]
 mod tests {
+	#[tokio::test]
+	async fn connection_keys_are_per_session() {
+		let in_a = crate::inference::SESSION_HINT
+			.scope("sess-a".to_string(), async { super::connection_key("playwright") })
+			.await;
+		let in_b = crate::inference::SESSION_HINT
+			.scope("sess-b".to_string(), async { super::connection_key("playwright") })
+			.await;
+		let outside = super::connection_key("playwright");
+		assert_ne!(in_a, in_b);
+		assert_ne!(in_a, outside);
+		// Same session, same key — the browser persists across calls.
+		let again = crate::inference::SESSION_HINT
+			.scope("sess-a".to_string(), async { super::connection_key("playwright") })
+			.await;
+		assert_eq!(in_a, again);
+	}
+
 	use super::*;
 
 	fn custom(id: &str) -> McpServerConfig {

@@ -668,7 +668,16 @@ the workspace has no enabled servers, and neither is mode-gated
   fireworks-ai and zai-org report and hit their caches, baseten
   caches some models but not others, scaleway reports nothing.
 - **Lifecycle**: spawned lazily on first use, kept alive across
-  turns (a playwright browser session persists between calls),
+  turns (a playwright browser session persists between calls) and
+  are keyed per **server × session**: parallel agents (coordinator
+  fleets) each get their own server instance — one shared playwright
+  meant every worker fought over the same browser's current tab. The
+  playwright preset runs `--isolated` so concurrent instances don't
+  contend on a persistent profile lock. Instances are reaped on
+  worker retire / session delete, when a sub-agent's loop settles,
+  and by an idle-grace reaper at turn end (10 min with no new turn —
+  interactive browser back-and-forth keeps its page; abandoned
+  standalone sessions don't leak a chromium),
   killed on disable / remove / IDE exit / a host↔container mode
   toggle (ADR 0041 — the connection is bound to wherever it
   spawned, so the flip respawns it on the new target), respawned

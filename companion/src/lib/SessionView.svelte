@@ -985,7 +985,23 @@
 						</div>
 					{/if}
 					{#if workerId}
-						<button class="ghost worker-link" onclick={() => app.openSession(workerId)}> → Open worker session </button>
+						<button
+							class="ghost worker-link"
+							onclick={(e) => {
+								if (e.ctrlKey || e.metaKey) {
+									window.open(app.sessionRouteHash(workerId), '_blank');
+									return;
+								}
+								app.openSession(workerId);
+							}}
+							onauxclick={(e) => {
+								if (e.button === 1) {
+									window.open(app.sessionRouteHash(workerId), '_blank');
+								}
+							}}
+						>
+							→ Open worker session
+						</button>
 					{/if}
 				</details>
 			{:else if row.kind === 'ask_user'}
@@ -1060,7 +1076,21 @@
 					     sub-agents (task tool) have no session, so only
 					     link when the id resolves in the session list. -->
 					{#if app.sessions.some((s) => s.id === row.subagentId)}
-						<button class="ghost worker-link" onclick={() => app.openSession(row.subagentId)}>open →</button>
+						<button
+							class="ghost worker-link"
+							onclick={(e) => {
+								if (e.ctrlKey || e.metaKey) {
+									window.open(app.sessionRouteHash(row.subagentId), '_blank');
+									return;
+								}
+								app.openSession(row.subagentId);
+							}}
+							onauxclick={(e) => {
+								if (e.button === 1) {
+									window.open(app.sessionRouteHash(row.subagentId), '_blank');
+								}
+							}}>open →</button
+						>
 					{/if}
 				</div>
 			{/if}

@@ -2471,6 +2471,7 @@
 							{@const isRunning = !isAwaitingInput && coder.current.isSessionRunning(session.id)}
 							{@const isFinished = !isAwaitingInput && !isRunning && coder.current.isSessionAttention(session.id)}
 							{@const isFailed = !isAwaitingInput && !isRunning && Boolean(session.last_error)}
+							{@const isInterrupted = !isAwaitingInput && !isRunning && !isFailed && Boolean(session.interrupted)}
 							<li
 								class="session-row"
 								class:active={isVisible}
@@ -2488,9 +2489,11 @@
 											? 'Session is running — click to follow'
 											: isFailed
 												? 'Last turn failed — open to retry'
-												: isFinished
-													? 'Finished while you were away — click to open'
-													: 'Open session'}
+												: isInterrupted
+													? 'Turn never finished (restart/stop) — open to relaunch'
+													: isFinished
+														? 'Finished while you were away — click to open'
+														: 'Open session'}
 								>
 									<div class="session-title">
 										{#if isAwaitingInput}
@@ -2499,6 +2502,8 @@
 											<span class="running-dot" aria-hidden="true"></span>
 										{:else if isFailed}
 											<span class="failed-dot" aria-hidden="true">!</span>
+										{:else if isInterrupted}
+											<span class="interrupted-dot" aria-hidden="true">!</span>
 										{:else if isFinished}
 											<span class="finished-dot" aria-hidden="true"></span>
 										{/if}
@@ -2521,6 +2526,9 @@
 											<span class="session-meta-sep">·</span>
 										{:else if isFailed}
 											<span class="failed-label">last turn failed</span>
+											<span class="session-meta-sep">·</span>
+										{:else if isInterrupted}
+											<span class="interrupted-label">interrupted</span>
 											<span class="session-meta-sep">·</span>
 										{:else if isFinished}
 											<span class="finished-label">finished</span>
@@ -4156,6 +4164,18 @@
 	}
 	.failed-label {
 		color: var(--m-danger, #c62828);
+		font-weight: 500;
+	}
+	/* Interrupted turn (restart/stop): amber sibling of failed. */
+	.interrupted-dot {
+		flex-shrink: 0;
+		color: var(--m-warning, #d4a017);
+		font-weight: 700;
+		font-size: 12px;
+		line-height: 1;
+	}
+	.interrupted-label {
+		color: var(--m-warning, #d4a017);
 		font-weight: 500;
 	}
 	.session-row-action {

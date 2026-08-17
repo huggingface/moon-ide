@@ -1928,6 +1928,12 @@ export type CoderSessionSummary = {
 	 * Absent when false.
 	 */
 	last_error?: boolean;
+	/**
+	 * True when the last turn never finished (killed by a restart or
+	 * an abort) and the session's turn isn't currently running —
+	 * badge + relaunch affordance. Absent when false.
+	 */
+	interrupted?: boolean;
 };
 
 /**

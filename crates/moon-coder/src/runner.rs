@@ -805,6 +805,7 @@ impl Session {
 			committed_branch: self.header.committed_branch.clone(),
 			mode: self.header.mode.clone(),
 			last_error: false,
+			interrupted: false,
 		}
 	}
 }
@@ -1852,7 +1853,22 @@ impl CoderHandle {
 			},
 		};
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_root);
-		sessions::list_sessions(&dir).await
+		let mut summaries = sessions::list_sessions(&dir).await?;
+		// A live turn writes the same partial record shapes the
+		// `interrupted` fold keys on — clear the flag for sessions
+		// whose turn is running right now, so the badge means
+		// "died mid-turn", never "working".
+		for summary in &mut summaries {
+			if !summary.interrupted {
+				continue;
+			}
+			if let Some((rt, _)) = self.state.runtime_for_session(&summary.id).await {
+				if rt.turn.lock().await.cancel.is_some() {
+					summary.interrupted = false;
+				}
+			}
+		}
+		Ok(summaries)
 	}
 
 	/// Search the active folder's on-disk sessions for a
@@ -3129,6 +3145,7 @@ impl CoderHandle {
 			committed_branch: header.committed_branch,
 			mode: header.mode,
 			last_error: false,
+			interrupted: false,
 		})
 	}
 
@@ -3384,6 +3401,7 @@ impl CoderHandle {
 			committed_branch: header.committed_branch.clone(),
 			mode: header.mode.clone(),
 			last_error: false,
+			interrupted: false,
 		};
 		// Snapshot what the panel needs for the restore-time
 		// usage hint *before* the move into `Session`. We prefer
@@ -3732,6 +3750,9 @@ impl CoderHandle {
 		let (fs, folder_path) = self.state.folder_session_or_active(folder).await?;
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
 		sessions::delete(&dir, &id).await?;
+		// Reap any MCP server instances (headless browsers) the
+		// session owned.
+		self.state.tools.mcp().drop_session_connections(&id).await;
 		// Drop the runtime entry (and cancel its in-flight turn,
 		// if any). Other sessions in the same folder keep running.
 		let removed = fs.runtimes.write().await.remove(&id);
@@ -5611,8 +5632,36 @@ fn spawn_turn_loop(
 		if auto_rename_after {
 			spawn_auto_rename(state.clone(), rt_for_turn.clone(), sink_for_turn);
 		}
+		// Idle-grace MCP reaper: kill this session's MCP server
+		// instances (headless browsers, per-session since the
+		// tab-fight fix) if no new turn starts within the grace
+		// window. Anchored at turn end rather than a periodic
+		// sweep: active back-and-forth keeps the browser (and the
+		// page the user is iterating on), abandoned standalone
+		// sessions get cleaned instead of leaking a chromium until
+		// process exit. Workers get this too, on top of the
+		// immediate reap at retire.
+		let reaper_session = rt_for_turn.session.lock().await.header.id.clone();
+		tokio::spawn(async move {
+			tokio::time::sleep(MCP_IDLE_GRACE).await;
+			// A newer turn is running (or just started): its own
+			// end will schedule a fresh reaper. Racing the check
+			// against a turn that starts a moment later is
+			// harmless - the next MCP call just respawns.
+			if rt_for_turn.turn.lock().await.cancel.is_some() {
+				return;
+			}
+			state.tools.mcp().drop_session_connections(&reaper_session).await;
+		});
 	}));
 }
+
+/// How long a session's MCP server instances survive after its
+/// last turn ends. Long enough that "open the page" / "now click
+/// X" conversations keep their browser between prompts; short
+/// enough that walked-away-from sessions don't park a headless
+/// chromium until process exit.
+const MCP_IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// RAII increment/decrement on [`CoderState::running_turns`]. Held
 /// for the whole lifetime of a turn-loop task so the count survives
@@ -8670,6 +8719,10 @@ async fn retire_one_worker(
 		.remove(&orchestrator_id, worker_id);
 	// Persist (ADR 0065): without this a restart-time fleet rebuild
 	// would re-register the retired worker.
+	// Kill the worker's MCP server instances (its headless
+	// browser, per-session since the tab-fight fix) — a retired
+	// worker's chromium shouldn't idle until process restart.
+	state.tools.mcp().drop_session_connections(worker_id).await;
 	persist_worker_detached(state, &orchestrator_id, worker_id, Some(sink.folder.as_str())).await;
 	Ok(json!({
 		"status": "retired",

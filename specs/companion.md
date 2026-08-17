@@ -728,3 +728,15 @@ Prose, not commitments — revisit when someone asks:
   user_message event stream. The desktop session list renders the
   same flag (red `!` dot + "last turn failed" meta label, below
   awaiting-input/running in precedence).
+- **Ctrl/Cmd-click + middle-click open in a new tab**: session rows
+  and → open-worker links build a per-session hash route
+  (`sessionRouteHash`) and `window.open` it, desktop-browser style;
+  plain click keeps in-tab SPA navigation.
+- **Relaunch interrupted sessions**: `SessionSummary.interrupted` is
+  true when the newest conversational record leaves the turn
+  unfinished (user message with no answer, assistant with pending
+  tool calls, tool result with no follow-up) — the on-disk shape of
+  a restart-kill or stop. The runner clears it for currently-running
+  turns. Both lists badge it (amber `!`); opening one on the phone
+  surfaces the retry bar ("turn never finished — retry to relaunch"),
+  which drives `coder_retry_last_turn`.
