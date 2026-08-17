@@ -639,7 +639,9 @@ the workspace has no enabled servers, and neither is mode-gated
   request alone. Sub-agent inner usage events carry `0/0` (no
   scoreboard).
 - **Output budget + cap continuations.** The turn and sub-agent
-  loops send an explicit `max_tokens` (8,192) instead of riding the
+  loops send an explicit `max_tokens` — min(32k, window − prompt −
+  slop), mirroring the in-session compaction summary's budget —
+  instead of riding the
   provider default — some HF deployments default to 2,048, which
   reasoning models burn entirely on thinking and then loop through
   continuations without ever answering. On a `length` stop the

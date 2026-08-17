@@ -980,12 +980,16 @@ async fn run_subagent_loop(
 		let id_for_subagent = id.clone();
 		let sink_for_cb = sink.clone();
 		let started = std::sync::atomic::AtomicBool::new(false);
+		let output_budget = crate::defaults::turn_output_budget(
+			crate::runner::estimate_prompt_tokens(&messages),
+			models.context_window(&standard_model),
+		);
 		let mut response = inference
 			.chat_completion_stream(
 				&standard_model,
 				&messages,
 				&tool_defs,
-				Some(crate::defaults::TURN_MAX_OUTPUT_TOKENS),
+				output_budget,
 				&cancel,
 				|event| match event {
 					StreamEvent::ContentDelta { delta } => {

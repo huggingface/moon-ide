@@ -90,18 +90,42 @@ pub const OUTPUT_CAP_CONTINUATIONS: usize = 3;
 /// rendered like any other user turn, same posture as the
 /// tool-budget wrap-up sentinel: the transcript should make it
 /// obvious why an answer arrived in two bubbles.
-/// Explicit per-request output-token budget for the main turn
-/// loop (and the sub-agent loop). Sent as `max_tokens` so the
-/// provider's default ceiling doesn't apply: several HF-router
-/// deployments default to 2,048, which reasoning models burn
-/// entirely on thinking — the turn then loops through
-/// output-cap continuations without ever producing an answer
-/// (observed live with Kimi-K3: three consecutive ~2k-token
-/// thinking-only responses, all `stop=length`). 8,192 is 4x that
-/// observed default while staying under every serving stack's
-/// completion ceiling; the continuation path still catches the
-/// rare genuinely-longer answer.
-pub const TURN_MAX_OUTPUT_TOKENS: u32 = 8_192;
+/// Output-token ceiling for the main turn loop (and the sub-agent
+/// loop). Sent as `max_tokens` so the provider's default ceiling
+/// doesn't apply: several HF-router deployments default to 2,048,
+/// which reasoning models burn entirely on thinking — the turn
+/// then loops through output-cap continuations without ever
+/// producing an answer (observed live with Kimi-K3: three
+/// consecutive ~2k-token thinking-only responses, all
+/// `stop=length`). 32k matches what the in-session compaction
+/// summary already requests (`IN_SESSION_MAX_SUMMARY_TOKENS`), so
+/// it's proven-accepted on the routes we use; the compaction
+/// trigger's 20% headroom guarantees room for it on every window
+/// ≥160k, and [`turn_output_budget`] clamps it on smaller ones.
+pub const TURN_MAX_OUTPUT_TOKENS: u32 = 32_000;
+
+/// Estimate slack subtracted from the remaining window before
+/// sizing the output budget — same posture as compaction's
+/// `IN_SESSION_PROMPT_SLOP_TOKENS`.
+const TURN_OUTPUT_SLOP_TOKENS: u32 = 2_000;
+
+/// Per-request `max_tokens` for a turn round-trip:
+/// `min(32k, window - prompt - slop)`. Strict providers validate
+/// `input + max_tokens ≤ window` (Anthropic does; some vLLM
+/// deployments 400), so a flat ceiling would reject prompts deep
+/// into small windows. `None` when the window has no meaningful
+/// room left — let the provider's own limiter deal with the
+/// degenerate case rather than sending a tiny cap that would
+/// guarantee a truncated answer.
+pub fn turn_output_budget(prompt_tokens: u32, context_window: u32) -> Option<u32> {
+	let usable = context_window
+		.saturating_sub(prompt_tokens)
+		.saturating_sub(TURN_OUTPUT_SLOP_TOKENS);
+	if usable < 1_024 {
+		return None;
+	}
+	Some(usable.min(TURN_MAX_OUTPUT_TOKENS))
+}
 
 pub const OUTPUT_CAP_CONTINUATION_PROMPT: &str =
 	"[Your previous message hit the output-token limit and was cut off mid-sentence. \
@@ -240,3 +264,16 @@ Don't use `ask_user` for things you could resolve by reading files, and don't us
 
 Be concise. Do not narrate what each tool call is for; the UI already shows the call to the user.
 "#;
+
+#[cfg(test)]
+mod tests {
+	#[test]
+	fn turn_output_budget_clamps_to_window() {
+		// Wide-open window: full 32k ceiling.
+		assert_eq!(super::turn_output_budget(100_000, 1_000_000), Some(32_000));
+		// Deep into a small window: clamped to what fits.
+		assert_eq!(super::turn_output_budget(100_000, 128_000), Some(26_000));
+		// Degenerate: no meaningful room — omit the cap entirely.
+		assert_eq!(super::turn_output_budget(126_000, 128_000), None);
+	}
+}

@@ -5965,7 +5965,7 @@ async fn run_turn(
 				&standard_model,
 				&messages,
 				&tool_defs,
-				Some(crate::defaults::TURN_MAX_OUTPUT_TOKENS),
+				crate::defaults::turn_output_budget(prompt_estimate, context_window),
 				&cancel,
 				|event| match event {
 					StreamEvent::ContentDelta { delta } => {
@@ -6302,13 +6302,17 @@ done, what's still unfinished, and any uncertainty. If the user needs to take a 
 	let sink_for_cb = sink.clone();
 	let started = std::sync::atomic::AtomicBool::new(false);
 	let thinking_emitted = std::sync::atomic::AtomicBool::new(false);
+	let output_budget = crate::defaults::turn_output_budget(
+		estimate_prompt_tokens(&messages),
+		models.context_window(&standard_model),
+	);
 	let mut response = state
 		.inference
 		.chat_completion_stream(
 			&standard_model,
 			&messages,
 			&[],
-			Some(crate::defaults::TURN_MAX_OUTPUT_TOKENS),
+			output_budget,
 			cancel,
 			|event| match event {
 				StreamEvent::ContentDelta { delta } => {
