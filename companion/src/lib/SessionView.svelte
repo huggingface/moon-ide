@@ -878,8 +878,16 @@
 				>
 					{#if row.fromCoordinator}<span class="coordinator-tag" title="Sent by the coordinator, not by you"
 							>coordinator</span
-						>{/if}
-					{row.text}
+						>
+						<!-- Coordinator instructions are agent-authored prose —
+						     headings, lists, code fences — so render them like an
+						     assistant bubble instead of raw text. Human-typed
+						     messages stay plain: markdown-mangling something the
+						     user literally typed (e.g. a *glob*) would be worse. -->
+						<Markdown text={row.text} repoUrl={app.repoUrl} />
+					{:else}
+						{row.text}
+					{/if}
 					{#if row.images.length > 0}
 						<div class="bubble-images">
 							{#each row.images as url, i (i)}
