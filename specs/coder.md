@@ -650,12 +650,14 @@ the workspace has no enabled servers, and neither is mode-gated
   lost reasoning (reasoning is not replayed to the model outside
   the native Anthropic path, so "continue where you stopped" is
   otherwise impossible).
-- **Model rotation on rate limits.** A user-authored fallback chain
+- **Model rotation on transient errors.** A user-authored fallback chain
   (`CoderModelSettings.rotation`, persisted in `state.json`; edited
   via the companion provider card's "Fallbacks" row or
   `moon-remote model --rotation "a,b,c"`): full wire slugs — any
   models, any `:provider` flavors — tried in order when a request's
-  429 backoff schedule is exhausted, one quick retry each. First
+  transient-status backoff schedule (429 and the 502/503/504
+  gateway/overload class; plain 500s deliberately don't retry) is
+  exhausted, one quick retry each. First
   _successful_ response wins; a fallback failing for another reason
   (bad slug, wrong route) is skipped. Explicit rather than derived
   from catalog siblings: the user knows which providers they trust.

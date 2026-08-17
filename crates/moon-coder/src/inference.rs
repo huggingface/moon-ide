@@ -47,11 +47,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// instead.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// 429 rate-limit backoff: retries sleep 2 s doubling per attempt up
-/// to a 2 min ceiling (2, 4, 8, 16, 32, 64, 120), then the 429
-/// surfaces to the caller like any other HTTP error. A numeric
-/// `Retry-After` from the provider wins over the schedule when it
-/// asks for a longer wait, clamped to the same ceiling.
+/// Transient-status backoff (429 rate limits plus the 502/503/504
+/// gateway/overload class): retries sleep 2 s doubling per attempt
+/// up to a 2 min ceiling (2, 4, 8, 16, 32, 64, 120), then the
+/// status surfaces to the caller like any other HTTP error. A
+/// numeric `Retry-After` from the provider wins over the schedule
+/// when it asks for a longer wait, clamped to the same ceiling.
+/// Plain 500s deliberately don't retry — they're as often a
+/// deterministic bug (a request the provider can't serve) as a
+/// blip, and burning the whole ladder on one wastes minutes.
 pub(crate) const RATE_LIMIT_MAX_RETRIES: u32 = 7;
 
 /// Retries each *rotated* sibling flavor gets after the pinned
@@ -60,6 +64,15 @@ pub(crate) const RATE_LIMIT_MAX_RETRIES: u32 = 7;
 /// stays snappy.
 pub(crate) const ROTATION_MAX_RETRIES: u32 = 1;
 const RATE_LIMIT_BACKOFF_CAP: Duration = Duration::from_secs(120);
+
+/// Statuses worth the backoff ladder — and, once it's exhausted,
+/// model rotation. See the module doc above `RATE_LIMIT_MAX_RETRIES`.
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+	status == reqwest::StatusCode::TOO_MANY_REQUESTS
+		|| status == reqwest::StatusCode::BAD_GATEWAY
+		|| status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+		|| status == reqwest::StatusCode::GATEWAY_TIMEOUT
+}
 
 fn rate_limit_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
 	let backoff = Duration::from_secs(2u64 << attempt.min(6));
@@ -108,16 +121,17 @@ pub(crate) async fn send_with_rate_limit_retry(
 			_ = cancel.cancelled() => return Err(CoderError::Aborted),
 			resp = send => resp.map_err(CoderError::from)?,
 		};
-		if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS || attempt >= max_retries {
+		if !is_transient_status(response.status()) || attempt >= max_retries {
 			return Ok(response);
 		}
 		let delay = rate_limit_delay(attempt, retry_after_of(&response));
 		attempt += 1;
 		tracing::warn!(
 			endpoint,
+			status = %response.status(),
 			attempt,
 			delay_s = delay.as_secs(),
-			"provider returned 429; backing off before retrying"
+			"provider returned a transient error; backing off before retrying"
 		);
 		tokio::select! {
 			biased;
@@ -1627,8 +1641,9 @@ impl InferenceClient {
 		builder
 	}
 
-	/// One send with the full 429 backoff — and, when the model is
-	/// still throttled after the whole schedule, **rotation**: the
+	/// One send with the full transient-status backoff (429/502/503/
+	/// 504) — and, when the model is still failing after the whole
+	/// schedule, **rotation**: the
 	/// same request is retried against the user-configured fallback
 	/// chain ([`CoderModels::rotation`] — full wire slugs, any
 	/// models or `:provider` flavors), each with a single quick
@@ -1637,7 +1652,7 @@ impl InferenceClient {
 	/// skipped rather than surfaced. Rotation is per-request — the
 	/// user's picked slug is untouched, and the next round-trip
 	/// starts from it again (that provider holds the session's
-	/// prompt cache). If the whole chain fails, the original 429
+	/// prompt cache). If the whole chain fails, the original error
 	/// surfaces exactly as before.
 	async fn dispatch(
 		&self,
@@ -1649,7 +1664,7 @@ impl InferenceClient {
 	) -> Result<reqwest::Response, CoderError> {
 		let builder = self.request_builder(endpoint, route, streaming).json(body);
 		let response = send_with_rate_limit_retry(endpoint, builder, RATE_LIMIT_MAX_RETRIES, cancel).await?;
-		if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+		if !is_transient_status(response.status()) {
 			return Ok(response);
 		}
 		let candidates = { self.models.read().await.rotation_candidates(body.model) };
@@ -1662,8 +1677,9 @@ impl InferenceClient {
 		for fallback in candidates {
 			tracing::warn!(
 				model = body.model,
+				status = %response.status(),
 				rotated_to = %fallback,
-				"429 persisted through backoff; rotating to fallback model"
+				"transient error persisted through backoff; rotating to fallback model"
 			);
 			wire["model"] = serde_json::Value::String(fallback.clone());
 			let builder = self.request_builder(endpoint, route, streaming).json(&wire);
