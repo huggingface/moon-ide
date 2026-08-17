@@ -740,3 +740,7 @@ Prose, not commitments — revisit when someone asks:
   turns. Both lists badge it (amber `!`); opening one on the phone
   surfaces the retry bar ("turn never finished — retry to relaunch"),
   which drives `coder_retry_last_turn`.
+- **Rotation editor**: the provider card's Fallbacks row expands to
+  a per-slug list with up/down reorder and remove buttons plus an
+  append field; every action persists immediately through
+  `coder_set_model_settings`.

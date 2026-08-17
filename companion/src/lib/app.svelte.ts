@@ -110,6 +110,9 @@ export type ModelSettings = {
 	 * applied) — the model the usage ring / cap editor targets.
 	 * Read-only on the wire. */
 	resolved_standard_model?: string;
+	/** Rate-limit fallback chain: wire slugs tried in order when a
+	 * request's 429 backoff is exhausted. Empty = no rotation. */
+	rotation?: string[];
 	[key: string]: unknown;
 };
 
@@ -1491,6 +1494,26 @@ class CompanionState {
 	 * see it exactly like a desktop save. Empty resets to the
 	 * built-in default. HF route only — user providers carry their
 	 * model in their own config, which stays desktop-edited. */
+	/** Commit the rate-limit fallback chain (comma list in the UI). */
+	async setRotation(slugs: string[]): Promise<void> {
+		const settings = this.modelSettings;
+		if (!this.activeWorkspace || !settings) {
+			return;
+		}
+		this.savingProvider = true;
+		try {
+			const rotation = slugs.map((m) => m.trim()).filter((m) => m.length > 0);
+			const next: ModelSettings = { ...settings, rotation };
+			await this.#call(this.activeWorkspace, 'coder_set_model_settings', { settings: next }, this.activeIde);
+			this.modelSettings = next;
+			await this.#loadModelSettings();
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		} finally {
+			this.savingProvider = false;
+		}
+	}
+
 	async setStandardModel(slug: string): Promise<void> {
 		const settings = this.modelSettings;
 		if (!this.activeWorkspace || !settings) {

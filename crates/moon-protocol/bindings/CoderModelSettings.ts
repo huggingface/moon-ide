@@ -40,6 +40,13 @@ export type CoderModelSettings = { standard_model: string, cheap_model: string, 
  */
 context_window_overrides: { [key in string]: number }, 
 /**
+ * User-authored rate-limit fallback chain: full wire slugs
+ * (any models, any `:provider` flavors) tried in order when a
+ * request's 429 backoff schedule is exhausted. Per-request
+ * only — the picked model is untouched. Empty = no rotation.
+ */
+rotation: Array<string>, 
+/**
  * Per-workspace lock on the active provider. `None` means
  * "no lock; this workspace follows the global
  * `active_provider`". `Some(_)` means "this workspace is

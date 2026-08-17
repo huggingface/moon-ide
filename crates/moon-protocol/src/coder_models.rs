@@ -192,6 +192,12 @@ pub struct CoderModelSettings {
 	/// the same way they respect the actual window.
 	#[serde(default)]
 	pub context_window_overrides: std::collections::HashMap<String, u32>,
+	/// User-authored rate-limit fallback chain: full wire slugs
+	/// (any models, any `:provider` flavors) tried in order when a
+	/// request's 429 backoff schedule is exhausted. Per-request
+	/// only — the picked model is untouched. Empty = no rotation.
+	#[serde(default)]
+	pub rotation: Vec<String>,
 	/// Per-workspace lock on the active provider. `None` means
 	/// "no lock; this workspace follows the global
 	/// `active_provider`". `Some(_)` means "this workspace is

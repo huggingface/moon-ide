@@ -109,6 +109,13 @@ pub struct CoderModels {
 	/// auto-compaction threshold both respect "this model is
 	/// better at 250k even though it advertises 1M".
 	pub context_window_overrides: Arc<HashMap<String, u32>>,
+	/// User-authored rate-limit fallback chain (full wire slugs, any
+	/// models/flavors, tried in order). Deliberately explicit
+	/// rather than auto-derived from the router catalog's sibling
+	/// flavors: the user knows which providers they trust with a
+	/// given task (context window, caching, quality all differ).
+	/// Empty = no rotation.
+	pub rotation: Arc<Vec<String>>,
 }
 
 impl Default for CoderModels {
@@ -122,6 +129,7 @@ impl Default for CoderModels {
 			context_windows: Arc::new(HashMap::new()),
 			vision: Arc::new(HashMap::new()),
 			context_window_overrides: Arc::new(HashMap::new()),
+			rotation: Arc::new(Vec::new()),
 		}
 	}
 }
@@ -339,6 +347,25 @@ impl CoderModels {
 	/// Values strictly below `1` collapse to no override
 	/// (defensive against the frontend persisting a `0` from a
 	/// cleared input).
+	/// Fallback slugs to try when `wire_model`'s rate-limit backoff
+	/// is exhausted: the user's rotation list, minus the model that
+	/// just failed. When the failed model is itself in the list the
+	/// order starts *after* it and wraps — chain semantics, so a
+	/// list of `[a, b, c]` under pressure on `b` tries `c` then
+	/// `a`. Empty list = no rotation.
+	pub fn rotation_candidates(&self, wire_model: &str) -> Vec<String> {
+		let list = &self.rotation;
+		if list.is_empty() {
+			return Vec::new();
+		}
+		let start = list.iter().position(|m| m == wire_model).map_or(0, |i| i + 1);
+		(0..list.len())
+			.map(|k| &list[(start + k) % list.len()])
+			.filter(|m| m.as_str() != wire_model)
+			.cloned()
+			.collect()
+	}
+
 	pub fn context_window(&self, slug: &str) -> u32 {
 		match self.cap_for(slug).filter(|c| *c > 0) {
 			Some(c) => c,
@@ -614,6 +641,40 @@ mod tests {
 		assert_eq!(models.context_window("anthropic/claude-opus-4:fastest"), 250_000);
 		// Different model: no cap, no clamp.
 		assert_eq!(models.context_window("Qwen/Qwen3.5-397B-A17B"), 256_000);
+	}
+
+	#[test]
+	fn rotation_candidates_follow_the_user_list() {
+		let models = CoderModels {
+			rotation: Arc::new(vec![
+				"moonshotai/Kimi-K3:baseten".to_owned(),
+				"moonshotai/Kimi-K3:together".to_owned(),
+				"deepseek-ai/DeepSeek-V4-Pro-0813:fireworks-ai".to_owned(),
+			]),
+			..CoderModels::default()
+		};
+
+		// Failed model in the list: start after it, wrap, exclude it.
+		assert_eq!(
+			models.rotation_candidates("moonshotai/Kimi-K3:together"),
+			vec![
+				"deepseek-ai/DeepSeek-V4-Pro-0813:fireworks-ai",
+				"moonshotai/Kimi-K3:baseten"
+			]
+		);
+		// Failed model not in the list: full list in order.
+		assert_eq!(
+			models.rotation_candidates("zai-org/GLM-5"),
+			vec![
+				"moonshotai/Kimi-K3:baseten",
+				"moonshotai/Kimi-K3:together",
+				"deepseek-ai/DeepSeek-V4-Pro-0813:fireworks-ai"
+			]
+		);
+		// No list: no rotation.
+		assert!(CoderModels::default()
+			.rotation_candidates("moonshotai/Kimi-K3")
+			.is_empty());
 	}
 
 	#[test]

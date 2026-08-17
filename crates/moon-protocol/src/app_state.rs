@@ -202,6 +202,10 @@ pub struct CoderAppState {
 	/// be more surprising than helpful.
 	#[serde(default)]
 	pub context_window_overrides: std::collections::HashMap<String, u32>,
+	/// Rate-limit fallback chain — see
+	/// [`crate::coder_models::CoderModelSettings::rotation`].
+	#[serde(default)]
+	pub rotation: Vec<String>,
 }
 
 /// Bottom-panel slice of [`AppState`].

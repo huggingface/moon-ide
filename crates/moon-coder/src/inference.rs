@@ -52,7 +52,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// surfaces to the caller like any other HTTP error. A numeric
 /// `Retry-After` from the provider wins over the schedule when it
 /// asks for a longer wait, clamped to the same ceiling.
-const RATE_LIMIT_MAX_RETRIES: u32 = 7;
+pub(crate) const RATE_LIMIT_MAX_RETRIES: u32 = 7;
+
+/// Retries each *rotated* sibling flavor gets after the pinned
+/// flavor exhausted the full schedule — one quick 2 s backoff, not
+/// another multi-minute ladder, so rotating through 3-4 siblings
+/// stays snappy.
+pub(crate) const ROTATION_MAX_RETRIES: u32 = 1;
 const RATE_LIMIT_BACKOFF_CAP: Duration = Duration::from_secs(120);
 
 fn rate_limit_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
@@ -83,6 +89,7 @@ fn retry_after_of(response: &reqwest::Response) -> Option<Duration> {
 pub(crate) async fn send_with_rate_limit_retry(
 	endpoint: &str,
 	builder: reqwest::RequestBuilder,
+	max_retries: u32,
 	cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<reqwest::Response, CoderError> {
 	let mut attempt: u32 = 0;
@@ -101,7 +108,7 @@ pub(crate) async fn send_with_rate_limit_retry(
 			_ = cancel.cancelled() => return Err(CoderError::Aborted),
 			resp = send => resp.map_err(CoderError::from)?,
 		};
-		if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS || attempt >= RATE_LIMIT_MAX_RETRIES {
+		if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS || attempt >= max_retries {
 			return Ok(response);
 		}
 		let delay = rate_limit_delay(attempt, retry_after_of(&response));
@@ -1580,23 +1587,7 @@ impl InferenceClient {
 		body: &ChatCompletionRequest<'_>,
 		cancel: &tokio_util::sync::CancellationToken,
 	) -> Result<reqwest::Response, CoderError> {
-		// Non-streaming: cap the whole round trip so a provider that
-		// accepts the request then stalls can't park the turn. Streaming
-		// sends skip this (see `send_once_stream`) — long generations are
-		// legitimate and bounded by the cancel token instead.
-		let mut builder = self.http.post(endpoint).json(body).timeout(REQUEST_TIMEOUT);
-		if let Some(token) = route.auth_token.as_deref() {
-			builder = builder.bearer_auth(token);
-		}
-		if let Some(org) = route.bill_to.as_deref() {
-			builder = builder.header(BILL_TO_HEADER, org);
-		}
-		if route.kind == RouteKind::HuggingFace {
-			if let Some(sid) = session_affinity_uuid() {
-				builder = builder.header(SESSION_ID_HEADER, sid);
-			}
-		}
-		send_with_rate_limit_retry(endpoint, builder, cancel).await
+		self.dispatch(endpoint, route, body, false, cancel).await
 	}
 
 	async fn send_once_stream(
@@ -1606,15 +1597,22 @@ impl InferenceClient {
 		body: &ChatCompletionRequest<'_>,
 		cancel: &tokio_util::sync::CancellationToken,
 	) -> Result<reqwest::Response, CoderError> {
-		// Same shape as `send_once`; a separate method exists only to
-		// mirror it — no header difference today *except* the
-		// explicit `accept: text/event-stream` to nudge providers
-		// that default to JSON.
-		let mut builder = self
-			.http
-			.post(endpoint)
-			.header("accept", "text/event-stream")
-			.json(body);
+		self.dispatch(endpoint, route, body, true, cancel).await
+	}
+
+	/// Header + timeout assembly shared by first sends and rotated
+	/// retries. Non-streaming requests cap the whole round trip so
+	/// a provider that accepts then stalls can't park the turn;
+	/// streaming sends skip the timeout (long generations are
+	/// legitimate, bounded by the cancel token) and add the
+	/// `accept: text/event-stream` nudge instead.
+	fn request_builder(&self, endpoint: &str, route: &ResolvedRoute, streaming: bool) -> reqwest::RequestBuilder {
+		let mut builder = self.http.post(endpoint);
+		builder = if streaming {
+			builder.header("accept", "text/event-stream")
+		} else {
+			builder.timeout(REQUEST_TIMEOUT)
+		};
 		if let Some(token) = route.auth_token.as_deref() {
 			builder = builder.bearer_auth(token);
 		}
@@ -1626,7 +1624,60 @@ impl InferenceClient {
 				builder = builder.header(SESSION_ID_HEADER, sid);
 			}
 		}
-		send_with_rate_limit_retry(endpoint, builder, cancel).await
+		builder
+	}
+
+	/// One send with the full 429 backoff — and, when the model is
+	/// still throttled after the whole schedule, **rotation**: the
+	/// same request is retried against the user-configured fallback
+	/// chain ([`CoderModels::rotation`] — full wire slugs, any
+	/// models or `:provider` flavors), each with a single quick
+	/// retry. First *successful* response wins; a fallback that
+	/// errors for any other reason (wrong route, bad slug) is
+	/// skipped rather than surfaced. Rotation is per-request — the
+	/// user's picked slug is untouched, and the next round-trip
+	/// starts from it again (that provider holds the session's
+	/// prompt cache). If the whole chain fails, the original 429
+	/// surfaces exactly as before.
+	async fn dispatch(
+		&self,
+		endpoint: &str,
+		route: &ResolvedRoute,
+		body: &ChatCompletionRequest<'_>,
+		streaming: bool,
+		cancel: &tokio_util::sync::CancellationToken,
+	) -> Result<reqwest::Response, CoderError> {
+		let builder = self.request_builder(endpoint, route, streaming).json(body);
+		let response = send_with_rate_limit_retry(endpoint, builder, RATE_LIMIT_MAX_RETRIES, cancel).await?;
+		if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+			return Ok(response);
+		}
+		let candidates = { self.models.read().await.rotation_candidates(body.model) };
+		if candidates.is_empty() {
+			return Ok(response);
+		}
+		let Ok(mut wire) = serde_json::to_value(body) else {
+			return Ok(response);
+		};
+		for fallback in candidates {
+			tracing::warn!(
+				model = body.model,
+				rotated_to = %fallback,
+				"429 persisted through backoff; rotating to fallback model"
+			);
+			wire["model"] = serde_json::Value::String(fallback.clone());
+			let builder = self.request_builder(endpoint, route, streaming).json(&wire);
+			let resp = send_with_rate_limit_retry(endpoint, builder, ROTATION_MAX_RETRIES, cancel).await?;
+			if resp.status().is_success() {
+				return Ok(resp);
+			}
+			tracing::warn!(
+				rotated_to = %fallback,
+				status = %resp.status(),
+				"rotation fallback failed; trying next"
+			);
+		}
+		Ok(response)
 	}
 }
 

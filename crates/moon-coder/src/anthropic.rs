@@ -549,7 +549,8 @@ pub(crate) async fn chat_completion(
 		.header(API_KEY_HEADER, route.auth_token.as_deref().unwrap_or_default())
 		.header(VERSION_HEADER, ANTHROPIC_VERSION)
 		.json(&body);
-	let response = send_with_rate_limit_retry(&endpoint, builder, cancel).await?;
+	let response =
+		send_with_rate_limit_retry(&endpoint, builder, crate::inference::RATE_LIMIT_MAX_RETRIES, cancel).await?;
 
 	let status = response.status();
 	let request_id = request_id_of(&response);
@@ -617,7 +618,8 @@ where
 		.header(VERSION_HEADER, ANTHROPIC_VERSION)
 		.header("accept", "text/event-stream")
 		.json(&body);
-	let response = send_with_rate_limit_retry(&endpoint, builder, cancel).await?;
+	let response =
+		send_with_rate_limit_retry(&endpoint, builder, crate::inference::RATE_LIMIT_MAX_RETRIES, cancel).await?;
 
 	let status = response.status();
 	if !status.is_success() {

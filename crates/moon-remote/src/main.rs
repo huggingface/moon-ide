@@ -129,6 +129,13 @@ enum Command {
 		/// Empty string resets to the built-in default.
 		#[arg(long)]
 		cheap: Option<String>,
+		/// Rate-limit fallback chain: comma-separated wire slugs
+		/// tried in order when a request's 429 backoff is
+		/// exhausted (e.g. `moonshotai/Kimi-K3:together,\
+		/// deepseek-ai/DeepSeek-V4-Pro-0813:fireworks-ai`). Empty
+		/// string clears the chain.
+		#[arg(long)]
+		rotation: Option<String>,
 	},
 }
 
@@ -161,7 +168,11 @@ fn main() -> anyhow::Result<()> {
 				enable,
 				disable,
 			} => mcp(workspace, enable, disable).await,
-			Command::Model { standard, cheap } => model(standard, cheap).await,
+			Command::Model {
+				standard,
+				cheap,
+				rotation,
+			} => model(standard, cheap, rotation).await,
 		}
 	})
 }
@@ -512,6 +523,7 @@ async fn serve(slug: String) -> anyhow::Result<()> {
 		providers: loaded_state.coder.providers.clone(),
 		active_provider: effective_active_provider,
 		context_window_overrides: Arc::new(loaded_state.coder.context_window_overrides.clone()),
+		rotation: Arc::new(loaded_state.coder.rotation.clone()),
 		..moon_coder::CoderModels::default()
 	};
 
@@ -638,7 +650,7 @@ async fn serve(slug: String) -> anyhow::Result<()> {
 /// Show or persist the model picks. Writes the same `state.json`
 /// fields the desktop picker saves, so the two stay interchangeable;
 /// prints the effective values (empty = built-in default) either way.
-async fn model(standard: Option<String>, cheap: Option<String>) -> anyhow::Result<()> {
+async fn model(standard: Option<String>, cheap: Option<String>, rotation: Option<String>) -> anyhow::Result<()> {
 	let config_dir = config_dir()?;
 	let state = app_state_store::mutate(&config_dir, move |s| {
 		if let Some(standard) = standard {
@@ -646,6 +658,14 @@ async fn model(standard: Option<String>, cheap: Option<String>) -> anyhow::Resul
 		}
 		if let Some(cheap) = cheap {
 			s.coder.cheap_model = cheap.trim().to_string();
+		}
+		if let Some(rotation) = rotation {
+			s.coder.rotation = rotation
+				.split(',')
+				.map(str::trim)
+				.filter(|m| !m.is_empty())
+				.map(str::to_owned)
+				.collect();
 		}
 		s.clone()
 	})
@@ -668,6 +688,11 @@ async fn model(standard: Option<String>, cheap: Option<String>) -> anyhow::Resul
 		"cheap     {}",
 		show(&state.coder.cheap_model, moon_coder::defaults::DEFAULT_CHEAP_MODEL)
 	);
+	if state.coder.rotation.is_empty() {
+		println!("rotation  (none)");
+	} else {
+		println!("rotation  {}", state.coder.rotation.join(" -> "));
+	}
 	println!("(a running `moon-remote serve` picks these up on restart)");
 	Ok(())
 }

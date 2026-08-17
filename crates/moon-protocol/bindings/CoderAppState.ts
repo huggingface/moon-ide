@@ -96,4 +96,9 @@ active_provider: string | null,
  * trivial and dropping live entries on a model swap would
  * be more surprising than helpful.
  */
-context_window_overrides: { [key in string]: number }, };
+context_window_overrides: { [key in string]: number }, 
+/**
+ * Rate-limit fallback chain — see
+ * [`crate::coder_models::CoderModelSettings::rotation`].
+ */
+rotation: Array<string>, };

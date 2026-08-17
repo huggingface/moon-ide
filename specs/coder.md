@@ -650,6 +650,20 @@ the workspace has no enabled servers, and neither is mode-gated
   lost reasoning (reasoning is not replayed to the model outside
   the native Anthropic path, so "continue where you stopped" is
   otherwise impossible).
+- **Model rotation on rate limits.** A user-authored fallback chain
+  (`CoderModelSettings.rotation`, persisted in `state.json`; edited
+  via the companion provider card's "Fallbacks" row or
+  `moon-remote model --rotation "a,b,c"`): full wire slugs — any
+  models, any `:provider` flavors — tried in order when a request's
+  429 backoff schedule is exhausted, one quick retry each. First
+  _successful_ response wins; a fallback failing for another reason
+  (bad slug, wrong route) is skipped. Explicit rather than derived
+  from catalog siblings: the user knows which providers they trust.
+  When the failed model is itself in the chain the order starts
+  after it and wraps. Per-request only: the pick is untouched and
+  the next round-trip starts from it again (that provider holds the
+  session's prompt cache). If the whole chain fails, the original
+  429 surfaces as before.
 - **JSONL append integrity.** Appends to a session file are
   serialized per-path and written record+newline in a single
   buffer — parallel sub-agent spawns append `SubagentSpawned` to

@@ -1160,6 +1160,20 @@ impl CoderHandle {
 		self.refresh_token_usage_windows().await;
 	}
 
+	/// Replace the rate-limit rotation chain (see
+	/// [`CoderModels::rotation`]). Empty and whitespace-only slugs
+	/// are dropped at this boundary so a sloppy comma list can't
+	/// produce a fallback to model "".
+	pub async fn set_rotation(&self, rotation: Vec<String>) {
+		let cleaned: Vec<String> = rotation
+			.into_iter()
+			.map(|s| s.trim().to_owned())
+			.filter(|s| !s.is_empty())
+			.collect();
+		let mut m = self.state.models.write().await;
+		m.rotation = std::sync::Arc::new(cleaned);
+	}
+
 	/// Replace the user-added providers list + the active
 	/// selection in one go. The caller (Tauri command) has
 	/// already persisted the same shape to `state.json`; this

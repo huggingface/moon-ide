@@ -117,6 +117,7 @@ pub async fn get_model_settings(coder: &CoderHandle, ctx: &SettingsContext) -> R
 		// locally and round-trips it back through the set path;
 		// sharing the `Arc` would risk a write through a stale clone.
 		context_window_overrides: (*models.context_window_overrides).clone(),
+		rotation: (*models.rotation).clone(),
 		provider_lock,
 		resolved_standard_model,
 		resolved_standard_supports_images,
@@ -151,6 +152,7 @@ pub async fn set_model_settings(
 	// `settings.active_provider`, so we forward verbatim.
 	coder.set_providers(providers_for_runner, active_for_runner).await;
 	coder.set_context_window_overrides(overrides_for_runner).await;
+	coder.set_rotation(settings.rotation.clone()).await;
 
 	write_workspace_provider_lock(ctx, provider_lock.clone()).await?;
 
@@ -185,6 +187,13 @@ pub async fn set_model_settings(
 			.context_window_overrides
 			.into_iter()
 			.filter(|(_, v)| *v > 0)
+			.collect();
+		// Same trim posture as the runner boundary.
+		s.coder.rotation = settings
+			.rotation
+			.into_iter()
+			.map(|m| m.trim().to_owned())
+			.filter(|m| !m.is_empty())
 			.collect();
 	})
 	.await?;

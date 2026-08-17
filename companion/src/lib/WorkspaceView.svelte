@@ -59,6 +59,33 @@
 		editingModel = true;
 	}
 
+	let editingRotation = $state(false);
+	let rotationAddDraft = $state('');
+
+	/** Move the fallback at `i` by `delta` and persist. */
+	function moveFallback(current: string[], i: number, delta: number): void {
+		const j = i + delta;
+		if (j < 0 || j >= current.length) {
+			return;
+		}
+		const next = [...current];
+		[next[i], next[j]] = [next[j] as string, next[i] as string];
+		void app.setRotation(next);
+	}
+
+	function removeFallback(current: string[], i: number): void {
+		void app.setRotation(current.toSpliced(i, 1));
+	}
+
+	function addFallback(current: string[]): void {
+		const slug = rotationAddDraft.trim();
+		if (!slug) {
+			return;
+		}
+		rotationAddDraft = '';
+		void app.setRotation([...current, slug]);
+	}
+
 	function saveModel(): void {
 		editingModel = false;
 		void app.setStandardModel(modelDraft);
@@ -402,6 +429,68 @@
 						<span class="model-slug">{modelSlug || '(default)'}</span>
 					</button>
 				{/if}
+				{@const rotation = settings.rotation ?? []}
+				{#if editingRotation}
+					<div class="rotation-editor">
+						<div class="model-row">
+							<span class="muted">Fallbacks</span>
+							<button class="ghost" onclick={() => (editingRotation = false)}>Done</button>
+						</div>
+						{#each rotation as slug, i (slug + i)}
+							<div class="rotation-row">
+								<span class="model-slug">{slug}</span>
+								<button
+									class="ghost rot-btn"
+									title="Try earlier"
+									disabled={app.savingProvider || i === 0}
+									onclick={() => moveFallback(rotation, i, -1)}>↑</button
+								>
+								<button
+									class="ghost rot-btn"
+									title="Try later"
+									disabled={app.savingProvider || i === rotation.length - 1}
+									onclick={() => moveFallback(rotation, i, 1)}>↓</button
+								>
+								<button
+									class="ghost rot-btn danger"
+									title="Remove from the chain"
+									disabled={app.savingProvider}
+									onclick={() => removeFallback(rotation, i)}>✕</button
+								>
+							</div>
+						{/each}
+						<div class="rotation-row">
+							<input
+								class="model-input"
+								bind:value={rotationAddDraft}
+								onkeydown={(e) => {
+									if (e.key === 'Enter') {
+										addFallback(rotation);
+									} else if (e.key === 'Escape') {
+										editingRotation = false;
+									}
+								}}
+								placeholder="owner/name[:provider] to append"
+								spellcheck="false"
+								disabled={app.savingProvider}
+							/>
+							<button
+								class="ghost"
+								onclick={() => addFallback(rotation)}
+								disabled={app.savingProvider || !rotationAddDraft.trim()}>Add</button
+							>
+						</div>
+					</div>
+				{:else}
+					<button
+						class="model-row model-row-btn"
+						title="Models tried in order when the active one stays rate-limited through backoff"
+						onclick={() => (editingRotation = true)}
+					>
+						<span class="muted">Fallbacks</span>
+						<span class="model-slug">{rotation.length > 0 ? rotation.join(' → ') : '(none)'}</span>
+					</button>
+				{/if}
 			{/if}
 			<label class="lock-row">
 				<input
@@ -720,6 +809,28 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+	}
+	.rotation-editor {
+		display: flex;
+		flex-direction: column;
+		gap: 0.35rem;
+	}
+	.rotation-row {
+		display: flex;
+		align-items: center;
+		gap: 0.35rem;
+	}
+	.rotation-row .model-slug {
+		flex: 1;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.rot-btn {
+		padding: 0.15rem 0.5rem;
+	}
+	.rot-btn.danger {
+		color: var(--danger, #e5484d);
 	}
 	.model-input {
 		flex: 1;
