@@ -141,8 +141,11 @@ export type TranscriptRow =
 			/** Attached images as data URLs — rendered as thumbnails in
 			 * the bubble (tap opens the lightbox). */
 			images: string[];
+			/** Wall-clock ms when the message landed — hover/long-press
+			 * tooltip, mirroring the desktop transcript. */
+			at?: number;
 	  }
-	| { kind: 'assistant'; id: string; text: string; thinking: string }
+	| { kind: 'assistant'; id: string; text: string; thinking: string; at?: number }
 	| {
 			kind: 'tool';
 			id: string;
@@ -285,6 +288,19 @@ type RawEvent = { kind?: string; [key: string]: unknown };
  * from an older bridge and on locally-synthesised replay envelopes —
  * both mean "don't filter". */
 type CoderEventEnvelope = { folder?: string; session_id?: string; event?: RawEvent; ide?: string; workspace?: string };
+
+/** Errors thrown by the socket layer itself (vs. real replies from
+ * the IDE). These mean "the message may never have left the phone /
+ * the pipe died" — safe to tear down the socket and retry once. */
+function isTransportError(e: unknown): boolean {
+	const msg = e instanceof Error ? e.message : String(e);
+	return (
+		msg === 'not connected' ||
+		msg === 'connection closed' ||
+		msg === 'call timed out' ||
+		msg.startsWith('could not connect')
+	);
+}
 
 function str(ev: RawEvent, key: string): string {
 	const v = ev[key];
@@ -1762,12 +1778,23 @@ class CompanionState {
 			// of the pending-send persistence — base64 payloads would
 			// blow the localStorage quota; a failed send keeps the
 			// text resendable and drops the attachments.
-			await this.#call(
-				this.activeWorkspace,
-				'coder_send',
-				{ text, session_id: this.activeSession, images },
-				this.activeIde,
-			);
+			const params = { text, session_id: this.activeSession, images };
+			try {
+				await this.#call(this.activeWorkspace, 'coder_send', params, this.activeIde);
+			} catch (e) {
+				// Transport-level failures (zombie socket, timed-out
+				// call, connection dropped mid-flight) get one
+				// automatic teardown-reconnect-retry instead of
+				// bouncing the user to a manual refresh. Anything
+				// else (a real error from the IDE) surfaces as-is.
+				if (!isTransportError(e)) {
+					throw e;
+				}
+				this.#socket?.close();
+				this.#socket = null;
+				await this.ensureConnected();
+				await this.#call(this.activeWorkspace, 'coder_send', params, this.activeIde);
+			}
 		} catch (e) {
 			// NOT necessarily lost: a bridge forward timeout (IDE
 			// asleep / offline) often completes when the IDE wakes —
@@ -2041,7 +2068,13 @@ class CompanionState {
 			} else if (!fromReplay && ev.kind === 'user_message') {
 				this.#markBusy(eventSid, true);
 				this.#sessionFolder.set(eventSid, eventFolder);
-			} else if (ev.kind === 'turn_complete' || ev.kind === 'aborted' || ev.kind === 'error') {
+			} else if (!fromReplay && (ev.kind === 'turn_complete' || ev.kind === 'aborted' || ev.kind === 'error')) {
+				// `!fromReplay`: every windowed replay ends with a
+				// synthetic terminator (the busy-reset for settled
+				// sessions), which would flip a genuinely-running
+				// session's pip off right after the batch's
+				// `in_flight` lit it — opening a running session and
+				// backing out showed it grey until the next refresh.
 				this.#markBusy(eventSid, false);
 				// A live turn_complete in a folder the phone isn't
 				// looking at lights that project chip's "finished"
@@ -2119,6 +2152,7 @@ class CompanionState {
 					queued: bool(ev, 'queued'),
 					fromCoordinator: bool(ev, 'from_coordinator'),
 					images,
+					at: num(ev, 'created_at_ms') || undefined,
 				});
 				break;
 			}
@@ -2136,7 +2170,7 @@ class CompanionState {
 			case 'assistant_message_start':
 				this.turnError = null;
 				this.busy = true;
-				rows.push({ kind: 'assistant', id: str(ev, 'id'), text: '', thinking: '' });
+				rows.push({ kind: 'assistant', id: str(ev, 'id'), text: '', thinking: '', at: Date.now() });
 				break;
 			case 'assistant_message_delta':
 				this.#appendAssistant(str(ev, 'id'), str(ev, 'delta'), '');
@@ -2145,7 +2179,7 @@ class CompanionState {
 				this.#appendAssistant('', '', str(ev, 'delta'));
 				break;
 			case 'assistant_message_end':
-				this.#setAssistant(str(ev, 'id'), str(ev, 'text'), str(ev, 'thinking'));
+				this.#setAssistant(str(ev, 'id'), str(ev, 'text'), str(ev, 'thinking'), num(ev, 'created_at_ms') || undefined);
 				break;
 			case 'tool_call': {
 				const name = str(ev, 'name');
@@ -2418,13 +2452,16 @@ class CompanionState {
 		}
 	}
 
-	#setAssistant(id: string, text: string, thinking: string): void {
+	#setAssistant(id: string, text: string, thinking: string, at?: number): void {
 		const rows = this.#rowsOverride ?? this.rows;
 		const row = rows.find((r) => r.kind === 'assistant' && r.id === id);
 		if (row && row.kind === 'assistant') {
 			row.text = text;
 			if (thinking) {
 				row.thinking = thinking;
+			}
+			if (at) {
+				row.at = at;
 			}
 		}
 	}

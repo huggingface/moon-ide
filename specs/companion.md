@@ -703,3 +703,19 @@ Prose, not commitments — revisit when someone asks:
 --advertise-url`).
 - [`coder.md`](coder.md) — the coder surface the phone renders;
   device-flow + keyring patterns the pairing flow mirrors.
+
+## Reliability + polish (round N)
+
+- **Bubble timestamps**: user and assistant bubbles carry a `title`
+  tooltip with the message's wall-clock time (time-only today, date +
+  time otherwise) — parity with the desktop transcript's hover.
+- **Running-pip consistency**: replayed terminator events no longer
+  flip a session's busy pip off; only live terminators do, and replay
+  asserts running state via the batch's `in_flight` flag. Previously
+  opening a running session and backing out greyed its pip until the
+  next list refresh.
+- **Send resilience**: RPC calls carry a 30s client-side deadline (a
+  zombie-OPEN socket otherwise parks the waiter forever), and a send
+  that fails at the transport level (not connected / connection
+  closed / call timed out) tears the socket down, reconnects, and
+  retries once before surfacing an error.

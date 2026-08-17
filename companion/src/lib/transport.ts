@@ -169,7 +169,28 @@ export class BridgeSocket {
 		}
 		const callId = this.#nextCallId++;
 		return new Promise((resolve, reject) => {
-			this.#pendingCalls.set(callId, { resolve, reject });
+			// Client-side deadline: a zombie-OPEN socket (phone
+			// radio slept, TCP dead underneath) accepts the send
+			// and then nothing ever comes back — without this the
+			// waiter parks forever and the UI looks hung until the
+			// OS finally notices the dead connection. The bridge's
+			// own forward timeout is shorter, so a live socket
+			// always answers (result or error) well within this.
+			const deadline = setTimeout(() => {
+				if (this.#pendingCalls.delete(callId)) {
+					reject(new BridgeError('call timed out'));
+				}
+			}, 30_000);
+			this.#pendingCalls.set(callId, {
+				resolve: (m) => {
+					clearTimeout(deadline);
+					resolve(m);
+				},
+				reject: (e) => {
+					clearTimeout(deadline);
+					reject(e);
+				},
+			});
 			ws.send(JSON.stringify({ ...payload, call_id: callId }));
 		});
 	}

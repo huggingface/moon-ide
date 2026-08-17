@@ -56,6 +56,21 @@
 	// showing. Tap a user bubble to toggle; any action clears it.
 	let actionsFor = $state<string | null>(null);
 
+	/** Tooltip timestamp for a bubble, mirroring the desktop: time
+	 * only for today, date + time otherwise. Hover on desktop
+	 * browsers, long-press on mobile ones that surface titles. */
+	function whenTitle(at?: number): string | undefined {
+		if (!at) {
+			return undefined;
+		}
+		const d = new Date(at);
+		const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+		if (d.toDateString() === new Date().toDateString()) {
+			return time;
+		}
+		return `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${time}`;
+	}
+
 	function toggleActions(rowId: string): void {
 		actionsFor = actionsFor === rowId ? null : rowId;
 	}
@@ -850,6 +865,7 @@
 					class="bubble user"
 					class:queued={row.queued}
 					class:actionable={row.queued || !app.busy}
+					title={whenTitle(row.at)}
 					role="button"
 					tabindex="0"
 					onclick={() => toggleActions(row.id)}
@@ -917,7 +933,7 @@
 					</details>
 				{/if}
 				{#if row.text.trim()}
-					<div class="bubble assistant">
+					<div class="bubble assistant" title={whenTitle(row.at)}>
 						<button class="copy-md" title="Copy raw markdown" onclick={() => void copyMarkdown(row.id, row.text)}
 							>{copiedMd === row.id ? '✓' : '⧉'}</button
 						>
