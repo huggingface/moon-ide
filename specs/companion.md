@@ -725,4 +725,6 @@ Prose, not commitments — revisit when someone asks:
   worker sessions a coordinator spawned). The session list shows a
   red `!` in place of the idle pip — which sessions need a retry is
   visible at a glance. Kept live between refreshes by the error /
-  user_message event stream.
+  user_message event stream. The desktop session list renders the
+  same flag (red `!` dot + "last turn failed" meta label, below
+  awaiting-input/running in precedence).

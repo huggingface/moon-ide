@@ -2470,6 +2470,7 @@
 							{@const isAwaitingInput = coder.current.isSessionAwaitingInput(session.id)}
 							{@const isRunning = !isAwaitingInput && coder.current.isSessionRunning(session.id)}
 							{@const isFinished = !isAwaitingInput && !isRunning && coder.current.isSessionAttention(session.id)}
+							{@const isFailed = !isAwaitingInput && !isRunning && Boolean(session.last_error)}
 							<li
 								class="session-row"
 								class:active={isVisible}
@@ -2485,15 +2486,19 @@
 										? 'Agent needs your input — click to answer'
 										: isRunning
 											? 'Session is running — click to follow'
-											: isFinished
-												? 'Finished while you were away — click to open'
-												: 'Open session'}
+											: isFailed
+												? 'Last turn failed — open to retry'
+												: isFinished
+													? 'Finished while you were away — click to open'
+													: 'Open session'}
 								>
 									<div class="session-title">
 										{#if isAwaitingInput}
 											<span class="awaiting-dot" aria-hidden="true"></span>
 										{:else if isRunning}
 											<span class="running-dot" aria-hidden="true"></span>
+										{:else if isFailed}
+											<span class="failed-dot" aria-hidden="true">!</span>
 										{:else if isFinished}
 											<span class="finished-dot" aria-hidden="true"></span>
 										{/if}
@@ -2513,6 +2518,9 @@
 											<span class="session-meta-sep">·</span>
 										{:else if isRunning}
 											<span class="running-label">running…</span>
+											<span class="session-meta-sep">·</span>
+										{:else if isFailed}
+											<span class="failed-label">last turn failed</span>
 											<span class="session-meta-sep">·</span>
 										{:else if isFinished}
 											<span class="finished-label">finished</span>
@@ -4136,6 +4144,19 @@
 		height: 8px;
 		border-radius: 50%;
 		background: var(--m-warning);
+	}
+	/* Failed-last-turn tell: red "!" so a coordinator fleet's dead
+	   workers stand out from finished ones at a glance. */
+	.failed-dot {
+		flex-shrink: 0;
+		color: var(--m-danger, #c62828);
+		font-weight: 700;
+		font-size: 12px;
+		line-height: 1;
+	}
+	.failed-label {
+		color: var(--m-danger, #c62828);
+		font-weight: 500;
 	}
 	.session-row-action {
 		opacity: 0;
