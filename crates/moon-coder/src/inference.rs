@@ -260,8 +260,11 @@ pub enum ChatMessage {
 		tool_call_id: String,
 		content: String,
 		/// Images the tool returned (a `read_file` on a PNG, a
-		/// playwright screenshot block). Same wire treatment as
-		/// user-attached images; empty for virtually every call.
+		/// playwright screenshot block). On the OpenAI-compat wire
+		/// these are hoisted into a synthetic user message after the
+		/// tool run — strict providers type `tool` content as
+		/// string-only (see [`build_wire_messages`]). Empty for
+		/// virtually every call.
 		#[serde(default, skip_serializing_if = "Vec::is_empty")]
 		images: Vec<ImageAttachment>,
 	},
@@ -390,12 +393,25 @@ impl CacheControl {
 /// to a vision model restores them on the next round-trip).
 const IMAGE_OMITTED_NOTE: &str = "[image omitted: the active model does not accept image input]";
 
+/// Text block that opens the synthetic user message carrying
+/// tool-result images (see [`build_wire_messages`]).
+const TOOL_IMAGES_PREAMBLE: &str = "[image(s) attached from the preceding tool result(s)]";
+
 /// Build the wire message list from a slice of [`ChatMessage`]s,
 /// optionally attaching `cache_control: ephemeral` to the
 /// indexes listed in `cached_indexes`. Pass an empty slice to
 /// keep the original string-content shape — that's what every
 /// non-Anthropic round-trip does, so we keep the cheap path
 /// cheap.
+///
+/// Tool messages always keep string content (or a single
+/// cache-marked text block) on this wire: OpenAI's schema types
+/// `tool` content as string-only and strict providers enforce it
+/// (deepinfra behind the HF router 422s a content-parts array
+/// there). Images a tool returned are hoisted into one synthetic
+/// user message emitted after the contiguous run of tool
+/// messages, so parallel tool results stay adjacent to their
+/// assistant turn. See ADR 0072.
 ///
 /// `images_ok = false` strips every image attachment down to
 /// [`IMAGE_OMITTED_NOTE`] — the guard that keeps a session with
@@ -408,7 +424,11 @@ fn build_wire_messages<'a>(
 	images_ok: bool,
 ) -> Vec<WireMessage<'a>> {
 	let mut out = Vec::with_capacity(messages.len());
+	let mut pending_tool_images: Vec<&'a ImageAttachment> = Vec::new();
 	for (idx, msg) in messages.iter().enumerate() {
+		if !matches!(msg, ChatMessage::Tool { .. }) {
+			flush_tool_images(&mut out, &mut pending_tool_images, images_ok);
+		}
 		let cache_here = cached_indexes.contains(&idx);
 		let wire = match msg {
 			ChatMessage::System { content } => WireMessage::System {
@@ -434,14 +454,49 @@ fn build_wire_messages<'a>(
 				tool_call_id,
 				content,
 				images,
-			} => WireMessage::Tool {
-				tool_call_id,
-				content: wire_tool_content(content, images, cache_here, images_ok),
-			},
+			} => {
+				pending_tool_images.extend(images.iter());
+				WireMessage::Tool {
+					tool_call_id,
+					content: wire_text_content(content, cache_here),
+				}
+			}
 		};
 		out.push(wire);
 	}
+	flush_tool_images(&mut out, &mut pending_tool_images, images_ok);
 	out
+}
+
+/// Emit the synthetic user message carrying the images collected
+/// from the contiguous tool run that just ended: a preamble text
+/// block, then one block per image ([`push_image_blocks`] shape).
+/// No-op when the run had no images, which is virtually every
+/// call — the wire body is then byte-for-byte what it always was.
+fn flush_tool_images<'a>(out: &mut Vec<WireMessage<'a>>, pending: &mut Vec<&'a ImageAttachment>, images_ok: bool) {
+	if pending.is_empty() {
+		return;
+	}
+	let mut blocks: Vec<WireBlock<'a>> = Vec::with_capacity(pending.len() + 1);
+	blocks.push(WireBlock::Text {
+		text: TOOL_IMAGES_PREAMBLE,
+		cache_control: None,
+	});
+	for img in pending.drain(..) {
+		if images_ok {
+			blocks.push(WireBlock::ImageUrl {
+				image_url: WireImageUrl { url: &img.data_url },
+			});
+		} else {
+			blocks.push(WireBlock::Text {
+				text: IMAGE_OMITTED_NOTE,
+				cache_control: None,
+			});
+		}
+	}
+	out.push(WireMessage::User {
+		content: WireContent::Blocks(blocks),
+	});
 }
 
 fn wire_text_content(content: &str, cache_here: bool) -> WireContent<'_> {
@@ -452,32 +507,6 @@ fn wire_text_content(content: &str, cache_here: bool) -> WireContent<'_> {
 		text: content,
 		cache_control: Some(CacheControl::EPHEMERAL),
 	}])
-}
-
-/// Build the wire content for a Tool message: the plain string
-/// (or single cache-marked text block) unless the tool returned
-/// images, in which case the text block is followed by one
-/// `image_url` block per image — the same blocks shape user
-/// attachments use. Strictly, OpenAI's chat-completions schema
-/// types `tool` content as string-only, but OpenRouter and the
-/// other OpenAI-compat routers we run through accept (and
-/// vision models consume) content-part arrays there.
-fn wire_tool_content<'a>(
-	content: &'a str,
-	images: &'a [ImageAttachment],
-	cache_here: bool,
-	images_ok: bool,
-) -> WireContent<'a> {
-	if images.is_empty() {
-		return wire_text_content(content, cache_here);
-	}
-	let mut blocks: Vec<WireBlock<'a>> = Vec::with_capacity(images.len() + 1);
-	blocks.push(WireBlock::Text {
-		text: content,
-		cache_control: cache_here.then_some(CacheControl::EPHEMERAL),
-	});
-	push_image_blocks(&mut blocks, images, images_ok);
-	WireContent::Blocks(blocks)
 }
 
 /// Build the wire content for a User message, hoisting into the
@@ -2778,7 +2807,11 @@ mod tests {
 	}
 
 	#[test]
-	fn wire_tool_with_images_emits_text_then_image_url_blocks() {
+	fn wire_tool_with_images_hoists_them_into_a_user_message() {
+		// Strict OpenAI-compat backends (deepinfra behind the HF
+		// router) 422 a content-parts array on a `tool` message —
+		// tool content must stay a string; pixels ride in a
+		// synthetic user message right after the tool run.
 		let messages = vec![ChatMessage::Tool {
 			tool_call_id: "call_1".into(),
 			content: "[image file — image/png, attached]".into(),
@@ -2789,9 +2822,40 @@ mod tests {
 		}];
 		let wire = build_wire_messages(&messages, &[], true);
 		let json = serde_json::to_string(&wire).unwrap();
-		assert!(json.contains(
-			r#""role":"tool","tool_call_id":"call_1","content":[{"type":"text","text":"[image file — image/png, attached]"},{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD"}}]"#
-		));
+		assert!(json.contains(r#"{"role":"tool","tool_call_id":"call_1","content":"[image file — image/png, attached]"}"#));
+		assert!(json.contains(&format!(
+			r#"{{"role":"user","content":[{{"type":"text","text":"{TOOL_IMAGES_PREAMBLE}"}},{{"type":"image_url","image_url":{{"url":"data:image/png;base64,QUJD"}}}}]}}"#
+		)));
+	}
+
+	#[test]
+	fn wire_parallel_tool_images_hoist_after_the_whole_run() {
+		// Two tool results answering one assistant turn: the
+		// synthetic user message must come after both, never
+		// between them — OpenAI-compat validators require tool
+		// messages to directly follow the tool-calling assistant.
+		let tool = |id: &str, url: &str| ChatMessage::Tool {
+			tool_call_id: id.into(),
+			content: "ok".into(),
+			images: vec![ImageAttachment {
+				data_url: url.into(),
+				mime: "image/png".into(),
+			}],
+		};
+		let messages = vec![
+			tool("c1", "data:image/png;base64,AAAA"),
+			tool("c2", "data:image/png;base64,BBBB"),
+			ChatMessage::user("next"),
+		];
+		let wire = build_wire_messages(&messages, &[], true);
+		let json = serde_json::to_string(&wire).unwrap();
+		let hoisted = json.find(TOOL_IMAGES_PREAMBLE).unwrap();
+		assert!(json.find(r#""tool_call_id":"c1""#).unwrap() < hoisted);
+		assert!(json.find(r#""tool_call_id":"c2""#).unwrap() < hoisted);
+		assert!(hoisted < json.find(r#""content":"next""#).unwrap());
+		// Both images land in the single hoisted message.
+		assert_eq!(json.matches(TOOL_IMAGES_PREAMBLE).count(), 1);
+		assert!(json.contains("AAAA") && json.contains("BBBB"));
 	}
 
 	#[test]
@@ -2858,6 +2922,9 @@ mod tests {
 		assert!(!json.contains("AAAA"));
 		assert!(!json.contains("BBBB"));
 		assert_eq!(json.matches(IMAGE_OMITTED_NOTE).count(), 2);
+		// The tool message itself stays string-content; its omission
+		// note rides in the hoisted user message.
+		assert!(json.contains(r#"{"role":"tool","tool_call_id":"c1","content":"screenshot taken"}"#));
 	}
 
 	#[test]

@@ -605,7 +605,11 @@ the workspace has no enabled servers, and neither is mode-gated
   jpg / gif / webp, ≤ 3 MB) both reach the model as typed image
   blocks: the tool result's `"images"` key leaves the JSON text
   projection and is re-attached per provider (Anthropic nested
-  `tool_result` blocks; OpenAI-compat `image_url` parts). Images
+  `tool_result` blocks; on the OpenAI-compat wire, `image_url`
+  parts in a synthetic user message emitted after the tool run —
+  `tool` content stays string-only because strict backends 422 a
+  content-parts array there, see
+  [ADR 0072](decisions/0072-tool-image-hoisting.md)). Images
   persist as pi `image` content blocks so reopened sessions
   re-send them; compaction shows the summary model a count, not
   pixels. The panel and companion render them as thumbnails with
