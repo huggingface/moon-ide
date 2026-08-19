@@ -1787,6 +1787,36 @@
 		return last?.kind === 'error' ? last.id : null;
 	});
 
+	// Relaunch bar for a session whose last turn never finished
+	// (killed by a restart or a stop) — mirrors the companion's
+	// retry bar. Keyed off the list summary's `interrupted` flag,
+	// which is derived from disk and can go stale the moment a
+	// turn runs here, so it's dismissed locally as soon as any
+	// turn starts (or the button is clicked) and never re-shown
+	// for this visible session. The trailing-error retry button
+	// wins when both would apply.
+	let relaunchDismissedFor = $state<string | null>(null);
+	$effect(() => {
+		if (coder.busy && coder.current.visibleSessionId) {
+			relaunchDismissedFor = coder.current.visibleSessionId;
+		}
+	});
+	const showRelaunchBar = $derived.by(() => {
+		const id = coder.current.visibleSessionId;
+		if (!id || coder.busy || retryableErrorRowId !== null) {
+			return false;
+		}
+		if (relaunchDismissedFor === id) {
+			return false;
+		}
+		return Boolean(visibleSessionSummary?.interrupted) && visibleSessionSummary?.id === id;
+	});
+
+	function relaunchInterrupted(): void {
+		relaunchDismissedFor = coder.current.visibleSessionId;
+		coder.retryLastTurn();
+	}
+
 	// Lazy tool-body rendering. Tool rows render collapsed by
 	// default, but a `<details>` keeps its slotted children mounted
 	// even while closed — so without this gate every `ToolBody*`
@@ -2750,6 +2780,17 @@
 			{#each windowedRows as row (row.id)}
 				{@render rowMarkup(row, true)}
 			{/each}
+			{#if showRelaunchBar}
+				<div class="relaunch-bar" role="status">
+					<span>This turn never finished (interrupted by a restart or stop).</span>
+					<button
+						type="button"
+						class="error-retry"
+						title="Re-run the turn from where it left off. Everything above is kept."
+						onclick={relaunchInterrupted}>relaunch</button
+					>
+				</div>
+			{/if}
 			{#if hiddenBelow > 0}
 				<!-- Newer rows clipped off the bottom by a detached
 					 (slid) window. In-flow pill at the end of the
@@ -4625,6 +4666,17 @@
 		&:hover {
 			color: var(--m-fg);
 		}
+	}
+	.relaunch-bar {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		margin: 6px 0;
+		padding: 6px 10px;
+		border: 1px solid var(--m-warning, #d4a017);
+		border-radius: 6px;
+		color: var(--m-warning, #d4a017);
+		font-size: 12px;
 	}
 	.error-retry {
 		margin-left: 6px;

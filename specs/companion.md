@@ -739,7 +739,10 @@ Prose, not commitments — revisit when someone asks:
   a restart-kill or stop. The runner clears it for currently-running
   turns. Both lists badge it (amber `!`); opening one on the phone
   surfaces the retry bar ("turn never finished — retry to relaunch"),
-  which drives `coder_retry_last_turn`.
+  which drives `coder_retry_last_turn`. The desktop shows the same
+  affordance: an amber relaunch bar at the transcript tail (hidden
+  while a turn runs, dismissed for the session once any turn
+  starts; the trailing-error retry button wins when both apply).
 - **Rotation editor**: the provider card's Fallbacks row expands to
   a per-slug list with up/down reorder and remove buttons plus an
   append field; every action persists immediately through

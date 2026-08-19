@@ -523,6 +523,7 @@ pub fn run() {
 				providers: loaded_state.coder.providers.clone(),
 				active_provider: effective_active_provider,
 				context_window_overrides: std::sync::Arc::new(loaded_state.coder.context_window_overrides.clone()),
+				rotation: std::sync::Arc::new(loaded_state.coder.rotation.clone()),
 				..moon_coder::CoderModels::default()
 			};
 			// Shared with the coder so its `list_terminals` /
